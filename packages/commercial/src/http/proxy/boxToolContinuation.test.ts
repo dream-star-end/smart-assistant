@@ -64,7 +64,11 @@ const echoHash = createHash("sha256").update(JSON.stringify({
 
 function fixture(kind: "tool" | "final", failComplete = false,
   trailing = false, omitEcho = false, largeEcho = false, native = false,
-  cliVersion: string | null = "2.1.280", claimVersion: string | null = "2.1.280",
+  cliVersion: string | null = "2.1.280",
+  // OCV5-328: hidden calls of the owner's message and the CLI's own answers
+  hidden: { rejected?: Array<{ id: string; name: string }>;
+    beforeEcho?: unknown[]; afterEcho?: unknown[] } = {},
+  claimVersion: string | null = "2.1.280",
   // OCV5-368: replaces the round's model records and its expected billed output
   override?: { records: unknown[]; outputTokens: number }) {
   const sequence: string[] = [], emitted: string[] = [];
@@ -83,10 +87,12 @@ function fixture(kind: "tool" | "final", failComplete = false,
       inputHash: "f".repeat(64) }],
     results: [{ modelToolUseId: "toolu_prior_a", content: [{ type: "text", text: resultText }],
       isError: false, contentHash: currentHash }],
+    ...(hidden.rejected ? { rejectedToolUses: hidden.rejected } : {}),
     ...(native ? { nativeSessionId: "12345678-1234-4123-8123-123456789abc",
       nativeCliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`,
       ...(claimVersion === null ? {} : { nativeCliVersion: claimVersion }) } : {}) };
-  const bytes = Buffer.concat([raw([...(omitEcho ? [] : [currentEcho]),
+  const bytes = Buffer.concat([raw([...(hidden.beforeEcho ?? []),
+    ...(omitEcho ? [] : [currentEcho]), ...(hidden.afterEcho ?? []),
     ...(override?.records ?? (kind === "tool" ? toolRecords : finalRecords))]),
     ...(trailing ? [Buffer.from("not-json-after-result\n")] : [])]);
   const proof = { runNonce: claim.runNonce, leaseEpoch: claim.leaseEpoch,
@@ -527,11 +533,11 @@ test("a final tool round labels its native pointer with the build that wrote the
   const previous = process.env.OC_BOX_FAST_NATIVE;
   process.env.OC_BOX_FAST_NATIVE = "1";
   try {
-    const same = fixture("final", false, false, false, false, true, "2.1.288", "2.1.288");
+    const same = fixture("final", false, false, false, false, true, "2.1.288", {}, "2.1.288");
     const result = await runBoxToolContinuation(same.input, same.deps);
     assert.equal(result.kind === "final" && result.nativePointer?.cliVersion, "2.1.288");
     for (const [installed, wrote] of [["2.1.288", "2.1.280"], ["2.1.280", "2.1.288"], ["2.1.288", null]] as const) {
-      const f = fixture("final", false, false, false, false, true, installed, wrote);
+      const f = fixture("final", false, false, false, false, true, installed, {}, wrote);
       const upgraded = await runBoxToolContinuation(f.input, f.deps);
       assert.equal(upgraded.kind, "final");
       assert.equal(upgraded.kind === "final" && upgraded.nativePointer, undefined,
@@ -571,6 +577,60 @@ test("OCV5-313 a rejected result echo is journaled as continuation_echo_rejected
     "continuation_unknown"]);
 });
 
+// OCV5-328 (#27da48a8): the owner's message also called tools the run does not
+// expose. Claude Code answers those itself once the exposed call has its
+// result, so its answers sit next to the published-result echo.
+const hiddenName = "mcp__openclaude-memory__delegate_task";
+const cliNoSuchTool = (toolUseId: string, name = hiddenName) => ({ type: "user",
+  message: { role: "user", content: [{ type: "tool_result", tool_use_id: toolUseId, is_error: true,
+    content: `<tool_use_error>Error: No such tool available: ${name}</tool_use_error>` }] } });
+const rejected = [{ id: "toolu_hidden_1", name: hiddenName }, { id: "toolu_hidden_2", name: hiddenName }];
+const withHidden = (kind: "tool" | "final", hidden: Parameters<typeof fixture>[7]) =>
+  fixture(kind, false, false, false, false, false, "2.1.280", hidden);
+
+test("OCV5-328 a round continues past the CLI's own answers to hidden calls", async () => {
+  const answers = [cliNoSuchTool("toolu_hidden_1"), cliNoSuchTool("toolu_hidden_2")];
+  for (const kind of ["tool", "final"] as const) {
+    for (const order of [{ afterEcho: answers }, { beforeEcho: answers },
+      { beforeEcho: [answers[0]], afterEcho: [answers[1]] }]) {
+      const f = withHidden(kind, { rejected, ...order });
+      const result = await runBoxToolContinuation(f.input, f.deps);
+      assert.equal(result.kind, kind === "tool" ? "tool_handoff" : "final");
+      assert.ok(f.emitted.at(-1)?.includes("event: message_stop"));
+      assert.ok(!f.emitted.join("").includes("No such tool"), "the answers never reach the client");
+      assert.equal(f.sequence.includes("unknown"), false);
+    }
+  }
+});
+
+test("OCV5-328 a missing, foreign or altered answer to a hidden call fails closed", async () => {
+  const run = async (hidden: Parameters<typeof fixture>[7]) => {
+    const f = withHidden("final", hidden);
+    const phases: string[] = [];
+    let failure: unknown;
+    try { await runBoxToolContinuation(f.input, { ...f.deps,
+      journal: { ...(f.deps.journal as object),
+        markUnknown: async (input: { phase: string }) => { phases.push(input.phase); } } as never }); }
+    catch (error) { failure = error; }
+    return { message: failure instanceof Error ? failure.message : "no error", phases,
+      emitted: f.emitted.join("") };
+  };
+  // the model message arrives although one hidden call has no answer yet
+  const missing = await run({ rejected, afterEcho: [cliNoSuchTool("toolu_hidden_1")] });
+  assert.equal(missing.message, "BOX_TOOL_CLI_ERROR_MISSING");
+  assert.deepEqual(missing.phases, ["continuation_stream_rejected"]);
+  assert.equal(missing.emitted, "", "nothing of the next message was forwarded");
+  // an answer for a call this claim does not know is still an unbound echo
+  const foreign = await run({ afterEcho: [cliNoSuchTool("toolu_hidden_1")] });
+  assert.equal(foreign.message, "BOX_TOOL_ECHO_ID_INVALID");
+  assert.deepEqual(foreign.phases, ["continuation_echo_rejected"]);
+  // anything but Claude Code's exact unknown-tool error for that call
+  const altered = await run({ rejected: [rejected[0]!],
+    afterEcho: [cliNoSuchTool("toolu_hidden_1", "Bash")] });
+  assert.equal(altered.message, "BOX_TOOL_CLI_ERROR_INVALID");
+  assert.deepEqual(altered.phases, ["continuation_stream_rejected"]);
+});
+
 // OCV5-368, live 2026-10-10 (commercial #8bbb12ed): the final message of a
 // continued round hit max_tokens on thinking; Claude Code resumed it itself and
 // wrote the answer, but the resume turn was rejected as an in-model compaction.
@@ -595,7 +655,7 @@ const cutRecords = [
 
 test("OCV5-368 a final cut at max_tokens and resumed by the CLI is delivered and billed once", async () => {
   for (const native of [false, true]) {
-    const f = fixture("final", false, false, false, false, native, "2.1.280", "2.1.280",
+    const f = fixture("final", false, false, false, false, native, "2.1.280", {}, "2.1.280",
       { records: [...cutRecords, ...finalRecords], outputTokens: 7 });
     const result = await runBoxToolContinuation(f.input, f.deps);
     assert.equal(result.kind, "final");

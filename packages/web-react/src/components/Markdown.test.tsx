@@ -22,8 +22,12 @@ describe("Markdown fallback", () => {
     expect(iframe?.getAttribute("sandbox") || "").not.toContain("allow-same-origin");
     expect(iframe?.getAttribute("referrerpolicy")).toBe("no-referrer");
     expect(iframe?.getAttribute("srcdoc")).toContain("<style>body{color:red}</style>");
+    // 兜底也带 CSP(chunk 加载失败时它就是唯一的预览),并放在模型代码之前。
+    const srcdoc = iframe?.getAttribute("srcdoc") ?? "";
+    expect(srcdoc).toContain("Content-Security-Policy");
+    expect(srcdoc.indexOf("Content-Security-Policy")).toBeLessThan(srcdoc.indexOf("<style>body{color:red}</style>"));
     expect(container.textContent).toContain("说明");
-    expect(container.textContent).toContain("HTML 预览");
+    expect(container.textContent).toContain("交互内容 · 沙盒运行");
     expect(container.textContent).not.toContain("body{color:red}");
   });
 
@@ -32,8 +36,7 @@ describe("Markdown fallback", () => {
     const { container } = render(<Markdown live>{text}</Markdown>);
 
     expect(container.querySelector("iframe")).toBeNull();
-    expect(container.textContent).toContain("HTML 预览(生成中)");
-    expect(container.textContent).toContain("生成完成后显示 HTML 预览");
+    expect(container.textContent).toContain("正在生成交互内容");
     expect(container.textContent).not.toContain("body{color:red}");
   });
 
@@ -45,14 +48,14 @@ describe("Markdown fallback", () => {
     expect(container.textContent).toContain("tracker.test");
   });
 
-  // M-14:兜底头部此前用 bg-background / bg-muted/40 / text-muted-foreground,三者都不在 styles.css
-  // 的 @theme 里 → chunk 未到达时无底色、文字色继承。
-  test("HTML 预览兜底只用本仓存在的 token", () => {
+  // M-14:兜底此前用 bg-background / bg-muted/40 / text-muted-foreground,三者都不在 styles.css 的 @theme 里。
+  // 现在与 HtmlEmbed 同一外观(无标题栏),仍只用本仓 token。
+  test("HTML 预览兜底只用本仓存在的 token,且没有标题栏", () => {
     const text = "```htmlpreview\n<div>hi</div>\n```";
     const { container } = render(<Markdown>{text}</Markdown>);
-    const header = container.querySelector(".not-prose > div");
-    expect(header).toHaveClass("bg-hover", "text-muted");
-    expect(header?.parentElement).toHaveClass("bg-surface");
+    expect(container.querySelector(".oc-embed")).toBeTruthy();
+    expect(container.querySelector(".oc-embed-bar")).toHaveClass("text-faint");
+    expect(container.textContent).not.toContain("HTML 预览");
     for (const legacy of ["bg-background", "bg-muted/40", "text-muted-foreground"]) {
       expect(container.querySelector(`.${legacy.replace("/", "\\/")}`)).toBeNull();
     }

@@ -6,7 +6,10 @@
  *   2. 软删只标 deleted_at,不删磁盘文件;
  *   3. 每项目(含未分组 NULL) 500 上限;
  *   4. 同 (user_id, project_id, source, digest) 未删行去重,digest 空则用 container_path;
- *   5. 恶意 url / containerPath 被拒。
+ *   5. 恶意 url / containerPath 被拒;
+ *   6. 跨项目搜索(Cmd+K):name/excerpt 子串,按用户隔离,LIKE 通配符转义。
+ *   7. 带字节副本的产出按源路径出版本:同内容不出新版本,内容变了出新版本,
+ *      list 每个源路径只回最新版本并带 versionCount,listProjectAssetVersions 列全部版本。
  *
  * Run: npx tsx --test packages/storage/src/__tests__/projectAssets.test.ts
  */
@@ -27,9 +30,13 @@ const {
   getSessionsDb,
   listPinnedProjectAssetsForChatProject,
   listPinnedProjectAssetsForSession,
+  patchClientSessionMeta,
+  listProjectAssetVersions,
   listProjectAssets,
   parseProjectAssetContainerPath,
   parseProjectAssetUrl,
+  searchProjectAssets,
+  searchChatProjectAssets,
   updateProjectAsset,
   upsertClientSession,
 } = await import('../sessionsDb.js')
@@ -392,5 +399,353 @@ describe('project_assets CRUD', () => {
     assert.equal(renamed.asset.name, 'new')
     assert.equal(renamed.asset.pinned, true)
     assert.equal(renamed.asset.projectId, proj.project.id)
+  })
+})
+
+describe('searchProjectAssets (Cmd+K cross-project search)', () => {
+  beforeEach(clearTables)
+
+  const digest = (c: string) => c.repeat(64)
+
+  it('searches name and excerpt across all projects and ungrouped, newest first', async () => {
+    const p1 = await createChatProject(USER, { name: 'P1' })
+    const p2 = await createChatProject(USER, { name: 'P2' })
+    assert.ok(p1.ok && p2.ok)
+    if (!p1.ok || !p2.ok) return
+    const db = await getSessionsDb()
+    const mk = async (name: string, d: string, projectId: string | null, extra: Record<string, unknown> = {}) => {
+      const r = await createProjectAsset(USER, { source: 'upload', name, url: MEDIA_URL(digest(d)), projectId, ...extra })
+      assert.equal(r.ok, true)
+      return r.ok ? r.asset : null
+    }
+    const a = await mk('Weekly-Report.md', 'a', p1.project.id)
+    const b = await mk('9月周报.xlsx', 'b', p2.project.id)
+    const c = await mk('notes.txt', 'c', null, { excerpt: '这是本周 WEEKLY 汇总' })
+    await mk('unrelated.pdf', 'd', null)
+    // Deterministic ordering: a oldest, c newest.
+    db.prepare('UPDATE project_assets SET created_at = ? WHERE id = ?').run(1000, a!.id)
+    db.prepare('UPDATE project_assets SET created_at = ? WHERE id = ?').run(2000, b!.id)
+    db.prepare('UPDATE project_assets SET created_at = ? WHERE id = ?').run(3000, c!.id)
+
+    const weekly = await searchProjectAssets(USER, { q: 'weekly' })
+    assert.deepEqual(weekly.map((x) => x.name), ['notes.txt', 'Weekly-Report.md'], 'case-insensitive, name or excerpt')
+    assert.deepEqual((await searchProjectAssets(USER, { q: '周报' })).map((x) => x.projectId), [p2.project.id])
+    assert.deepEqual(await searchProjectAssets(USER, { q: '   ' }), [])
+    assert.equal((await searchProjectAssets(USER, { q: '.', limit: 2 })).length, 2)
+    assert.equal((await searchProjectAssets(USER, { q: '.', limit: 999 })).length, 4)
+  })
+
+  it('is isolated per user and skips soft-deleted rows', async () => {
+    const mine = await createProjectAsset(USER, { source: 'upload', name: 'secret-plan.md', url: MEDIA_URL(DIGEST_A) })
+    const gone = await createProjectAsset(USER, { source: 'upload', name: 'secret-old.md', url: MEDIA_URL(DIGEST_B) })
+    assert.ok(mine.ok && gone.ok)
+    if (!gone.ok) return
+    await deleteProjectAsset(USER, gone.asset.id)
+    assert.deepEqual((await searchProjectAssets(USER, { q: 'secret' })).map((x) => x.name), ['secret-plan.md'])
+    assert.deepEqual(await searchProjectAssets(OTHER, { q: 'secret' }), [])
+  })
+
+  it('escapes LIKE wildcards % _ and backslash', async () => {
+    await createProjectAsset(USER, { source: 'upload', name: '100%_done.md', url: MEDIA_URL(DIGEST_A) })
+    await createProjectAsset(USER, { source: 'upload', name: '100xxdone.md', url: MEDIA_URL(DIGEST_B) })
+    await createProjectAsset(USER, { source: 'upload', name: 'a\\b.txt', url: MEDIA_URL('c'.repeat(64)) })
+    assert.deepEqual((await searchProjectAssets(USER, { q: '%_' })).map((x) => x.name), ['100%_done.md'])
+    assert.deepEqual((await searchProjectAssets(USER, { q: '0_d' })).map((x) => x.name), [])
+    assert.deepEqual((await searchProjectAssets(USER, { q: '%' })).map((x) => x.name), ['100%_done.md'])
+    assert.deepEqual((await searchProjectAssets(USER, { q: 'a\\b' })).map((x) => x.name), ['a\\b.txt'])
+  })
+
+  it('an output with several versions shows once, as its latest version', async () => {
+    const out = (digest: string) => ({
+      source: 'output',
+      name: 'weekly-report.md',
+      containerPath: '/home/agent/.openclaude/generated/weekly-report.md',
+      digest,
+      url: MEDIA_URL(digest, 'md'),
+    })
+    await createProjectAsset(USER, out(DIGEST_A))
+    const v2 = await createProjectAsset(USER, out(DIGEST_B))
+    assert.ok(v2.ok)
+    if (!v2.ok) return
+    assert.deepEqual((await searchProjectAssets(USER, { q: 'weekly-report' })).map((x) => x.id), [v2.asset.id])
+  })
+
+  it('filters by source', async () => {
+    await createProjectAsset(USER, { source: 'upload', name: 'report-in.md', url: MEDIA_URL(DIGEST_A) })
+    await createProjectAsset(USER, {
+      source: 'output',
+      name: 'report-out.md',
+      containerPath: '/home/agent/.openclaude/generated/report-out.md',
+    })
+    assert.deepEqual((await searchProjectAssets(USER, { q: 'report', source: 'output' })).map((x) => x.name), ['report-out.md'])
+    assert.deepEqual((await searchProjectAssets(USER, { q: 'report', source: 'upload' })).map((x) => x.name), ['report-in.md'])
+    assert.equal((await searchProjectAssets(USER, { q: 'report' })).length, 2)
+  })
+})
+
+describe('project_assets 产出物版本', () => {
+  beforeEach(clearTables)
+
+  const REPORT = '/home/agent/.openclaude/generated/report.md'
+  const output = (digest: string | null, extra: Record<string, unknown> = {}) => ({
+    source: 'output',
+    name: 'report.md',
+    containerPath: REPORT,
+    ...(digest ? { digest, url: MEDIA_URL(digest, 'md') } : {}),
+    ...extra,
+  })
+
+  it('同源路径:同内容复用,内容变了出新版本,两版都可下载', async () => {
+    const v1 = await createProjectAsset(USER, output(DIGEST_A))
+    const again = await createProjectAsset(USER, output(DIGEST_A))
+    const v2 = await createProjectAsset(USER, output(DIGEST_B))
+    assert.equal(v1.ok && again.ok && v2.ok, true)
+    if (!v1.ok || !again.ok || !v2.ok) return
+    assert.equal(again.created, false)
+    assert.equal(again.asset.id, v1.asset.id)
+    assert.equal(v2.created, true)
+    assert.notEqual(v2.asset.id, v1.asset.id)
+    assert.ok(v2.asset.createdAt > v1.asset.createdAt, '新版本严格晚于旧版本')
+    assert.equal(v2.asset.containerPath, REPORT)
+    assert.equal(v2.asset.url, MEDIA_URL(DIGEST_B, 'md'))
+
+    const listed = await listProjectAssets(USER, { projectId: null })
+    assert.equal(listed.length, 1)
+    assert.equal(listed[0]?.id, v2.asset.id)
+    assert.equal(listed[0]?.versionCount, 2)
+
+    const versions = await listProjectAssetVersions(USER, v1.asset.id)
+    assert.deepEqual(versions?.map((a) => a.digest), [DIGEST_B, DIGEST_A])
+    assert.deepEqual(versions?.map((a) => a.url), [MEDIA_URL(DIGEST_B, 'md'), MEDIA_URL(DIGEST_A, 'md')])
+  })
+
+  it('A→B→A 出第三个版本;用旧版本再登记一次 = 恢复为最新', async () => {
+    const v1 = await createProjectAsset(USER, output(DIGEST_A))
+    const v2 = await createProjectAsset(USER, output(DIGEST_B))
+    const v3 = await createProjectAsset(USER, output(DIGEST_A))
+    assert.equal(v1.ok && v2.ok && v3.ok, true)
+    if (!v1.ok || !v2.ok || !v3.ok) return
+    assert.equal(v3.created, true)
+    assert.notEqual(v3.asset.id, v1.asset.id)
+    const listed = await listProjectAssets(USER, { projectId: null })
+    assert.equal(listed[0]?.id, v3.asset.id)
+    assert.equal(listed[0]?.versionCount, 3)
+    // 再登记一次最新的内容不再出版本。
+    const same = await createProjectAsset(USER, output(DIGEST_A))
+    assert.equal(same.ok && same.created, false)
+  })
+
+  it('旧容器只报路径:与以前一样按 container_path 复用', async () => {
+    const legacy = await createProjectAsset(USER, output(null))
+    const legacyAgain = await createProjectAsset(USER, output(null))
+    assert.equal(legacy.ok && legacyAgain.ok, true)
+    if (!legacy.ok || !legacyAgain.ok) return
+    assert.equal(legacyAgain.asset.id, legacy.asset.id)
+    assert.equal(legacy.asset.digest, null)
+    // 之后的新容器带字节副本:无 digest 的旧行算 v1,新内容是 v2。
+    const v2 = await createProjectAsset(USER, output(DIGEST_A))
+    assert.equal(v2.ok && v2.created, true)
+    // 旧容器再报一次同路径:仍复用,不出版本。
+    const legacyLater = await createProjectAsset(USER, output(null))
+    assert.equal(legacyLater.ok && legacyLater.created, false)
+    const listed = await listProjectAssets(USER, { projectId: null })
+    assert.equal(listed.length, 1)
+    assert.equal(listed[0]?.versionCount, 2)
+  })
+
+  it('上传去重不变:同 digest 不同名仍复用;上传不按路径折叠', async () => {
+    const a = await createProjectAsset(USER, { source: 'upload', name: 'a.md', url: MEDIA_URL(DIGEST_A, 'md') })
+    const b = await createProjectAsset(USER, { source: 'upload', name: 'b.md', url: MEDIA_URL(DIGEST_A, 'md') })
+    const c = await createProjectAsset(USER, { source: 'upload', name: 'c.md', url: MEDIA_URL(DIGEST_B, 'md') })
+    assert.equal(a.ok && b.ok && c.ok, true)
+    if (!a.ok || !b.ok || !c.ok) return
+    assert.equal(b.asset.id, a.asset.id)
+    const listed = await listProjectAssets(USER, { projectId: null })
+    assert.equal(listed.length, 2)
+    assert.ok(listed.every((x) => x.versionCount === undefined))
+    // 产出与上传同 digest 互不复用。
+    const out = await createProjectAsset(USER, output(DIGEST_A))
+    assert.equal(out.ok && out.created, true)
+  })
+
+  it('版本按项目与租户隔离;删掉最新版后上一版成为列表里的那一条', async () => {
+    const proj = await createChatProject(USER, { name: 'V' })
+    assert.equal(proj.ok, true)
+    if (!proj.ok) return
+    const inProj = await createProjectAsset(USER, output(DIGEST_A, { projectId: proj.project.id }))
+    const ungrouped = await createProjectAsset(USER, output(DIGEST_B))
+    const other = await createProjectAsset(OTHER, output(DIGEST_B))
+    assert.equal(inProj.ok && ungrouped.ok && other.ok, true)
+    if (!inProj.ok || !ungrouped.ok || !other.ok) return
+    assert.equal(inProj.created && ungrouped.created && other.created, true)
+    assert.equal((await listProjectAssetVersions(USER, inProj.asset.id))?.length, 1)
+    assert.equal(await listProjectAssetVersions(USER, other.asset.id), null)
+    assert.equal(await listProjectAssetVersions(OTHER, inProj.asset.id), null)
+
+    const v2 = await createProjectAsset(USER, output(DIGEST_B, { projectId: proj.project.id }))
+    assert.equal(v2.ok && v2.created, true)
+    if (!v2.ok) return
+    await deleteProjectAsset(USER, v2.asset.id)
+    const listed = await listProjectAssets(USER, { projectId: proj.project.id })
+    assert.equal(listed.length, 1)
+    assert.equal(listed[0]?.id, inProj.asset.id)
+    assert.equal(listed[0]?.versionCount, undefined)
+  })
+
+  it('重放:旧登记(capturedAt 不晚于最新版本)返回已有旧版本,不出假版本', async () => {
+    const v1 = await createProjectAsset(USER, output(DIGEST_A, { capturedAt: 1_000 }))
+    const v2 = await createProjectAsset(USER, output(DIGEST_B, { capturedAt: Date.now() }))
+    assert.equal(v1.ok && v2.ok && v2.created, true)
+    if (!v1.ok || !v2.ok) return
+    // A 的响应丢了,队列补发同一份登记。
+    const replay = await createProjectAsset(USER, output(DIGEST_A, { capturedAt: 1_000 }))
+    assert.equal(replay.ok, true)
+    if (!replay.ok) return
+    assert.equal(replay.created, false)
+    assert.equal(replay.asset.id, v1.asset.id)
+    const listed = await listProjectAssets(USER, { projectId: null })
+    assert.equal(listed[0]?.id, v2.asset.id)
+    assert.equal(listed[0]?.versionCount, 2)
+  })
+
+  it('真的写回旧内容(capturedAt 晚于最新版本)仍出新版本;不带 capturedAt 只比最新版本', async () => {
+    const v1 = await createProjectAsset(USER, output(DIGEST_A, { capturedAt: 1_000 }))
+    const v2 = await createProjectAsset(USER, output(DIGEST_B, { capturedAt: 2_000 }))
+    assert.equal(v1.ok && v2.ok, true)
+    if (!v1.ok || !v2.ok) return
+    const rewrite = await createProjectAsset(USER, output(DIGEST_A, { capturedAt: v2.asset.createdAt + 5_000 }))
+    assert.equal(rewrite.ok && rewrite.created, true)
+    const v4 = await createProjectAsset(USER, output(DIGEST_B))
+    assert.equal(v4.ok && v4.created, true, '旧容器/恢复:没有 capturedAt,只比最新版本')
+    assert.equal((await listProjectAssets(USER, { projectId: null }))[0]?.versionCount, 4)
+    const bad = await createProjectAsset(USER, output(DIGEST_A, { capturedAt: -1 }))
+    assert.equal(bad.ok, false)
+    if (!bad.ok) assert.equal(bad.error, 'invalid_captured_at')
+  })
+
+  it('补发队列晚到的登记不会把之后真实写回的旧内容判成重放(版本按文件写成的时间记)', async () => {
+    // A 写于 1000 并登记;B 写于 2000 但登记失败进了补发队列;3000 又真实写回 A。
+    // 下一次归集先补发 B,再登记当前的 A:A 必须是新的最新版本。
+    const a1 = await createProjectAsset(USER, output(DIGEST_A, { capturedAt: 1_000 }))
+    const b = await createProjectAsset(USER, output(DIGEST_B, { capturedAt: 2_000 }))
+    assert.equal(a1.ok && b.ok && b.created, true)
+    if (!b.ok) return
+    assert.equal(b.asset.createdAt, 2_000, '版本时间是文件写成的时间,不是登记时间')
+    const a2 = await createProjectAsset(USER, output(DIGEST_A, { capturedAt: 3_000 }))
+    assert.equal(a2.ok && a2.created, true)
+    const listed = await listProjectAssets(USER, { projectId: null })
+    assert.equal(listed[0]?.digest, DIGEST_A)
+    assert.equal(listed[0]?.versionCount, 3)
+    // capturedAt 在未来的被压到现在,不会排到真正更新的版本之后去。
+    const future = await createProjectAsset(USER, output(DIGEST_B, { capturedAt: Date.now() + 86_400_000 }))
+    assert.equal(future.ok && future.created, true)
+    if (future.ok) assert.ok(future.asset.createdAt <= Date.now())
+  })
+
+  it('常用只挂在最新版本:新版本继承 pinned,旧版本取消;恢复同样继承', async () => {
+    const proj = await createChatProject(USER, { name: 'Pins' })
+    assert.equal(proj.ok, true)
+    if (!proj.ok) return
+    const pid = proj.project.id
+    const v1 = await createProjectAsset(USER, output(DIGEST_A, { projectId: pid }))
+    assert.equal(v1.ok, true)
+    if (!v1.ok) return
+    await updateProjectAsset(USER, v1.asset.id, { pinned: true })
+    const v2 = await createProjectAsset(USER, output(DIGEST_B, { projectId: pid }))
+    assert.equal(v2.ok, true)
+    if (!v2.ok) return
+    assert.equal(v2.asset.pinned, true)
+    const versions = await listProjectAssetVersions(USER, v2.asset.id)
+    assert.deepEqual(versions?.map((v) => v.pinned), [true, false])
+    const pinned = await listPinnedProjectAssetsForChatProject(USER, pid)
+    assert.deepEqual(pinned.assets.map((a) => a.id), [v2.asset.id])
+    // 恢复 = 用旧 digest 再登记(不带 capturedAt):也继承常用。
+    const restored = await createProjectAsset(USER, output(DIGEST_A, { projectId: pid }))
+    assert.equal(restored.ok && restored.created && restored.asset.pinned, true)
+    if (!restored.ok) return
+    assert.deepEqual((await listPinnedProjectAssetsForChatProject(USER, pid)).assets.map((a) => a.id), [restored.asset.id])
+  })
+
+  it('旧数据里旧版本仍 pinned、最新版本未 pinned:注入查询不注入旧版本', async () => {
+    const proj = await createChatProject(USER, { name: 'Stale' })
+    assert.equal(proj.ok, true)
+    if (!proj.ok) return
+    const pid = proj.project.id
+    await upsertClientSession(baseSession('sess-stale'))
+    await patchClientSessionMeta('sess-stale', USER, { projectId: pid })
+    const v1 = await createProjectAsset(USER, output(DIGEST_A, { projectId: pid }))
+    const v2 = await createProjectAsset(USER, output(DIGEST_B, { projectId: pid }))
+    const up = await createProjectAsset(USER, { source: 'upload', name: 'u.md', url: MEDIA_URL(DIGEST_A, 'md'), projectId: pid })
+    assert.equal(v1.ok && v2.ok && up.ok, true)
+    if (!v1.ok || !v2.ok || !up.ok) return
+    const db = await getSessionsDb()
+    db.prepare('UPDATE project_assets SET pinned = 1 WHERE id IN (?, ?)').run(v1.asset.id, up.asset.id)
+    assert.deepEqual((await listPinnedProjectAssetsForChatProject(USER, pid)).assets.map((a) => a.id), [up.asset.id])
+    assert.deepEqual((await listPinnedProjectAssetsForSession('sess-stale')).map((a) => a.id), [up.asset.id])
+    await updateProjectAsset(USER, v2.asset.id, { pinned: true })
+    const ids = (await listPinnedProjectAssetsForChatProject(USER, pid)).assets.map((a) => a.id).sort()
+    assert.deepEqual(ids, [up.asset.id, v2.asset.id].sort())
+  })
+})
+
+describe('searchChatProjectAssets(project_search)', () => {
+  beforeEach(clearTables)
+
+  const hex = (c: string) => c.repeat(64)
+
+  it('只搜指定项目、未删、本租户;名称与摘录都命中;source/limit/转义', async () => {
+    const a = await createChatProject(USER, { name: 'A' })
+    const b = await createChatProject(USER, { name: 'B' })
+    assert.equal(a.ok && b.ok, true)
+    if (!a.ok || !b.ok) return
+    const pa = a.project.id
+    const pb = b.project.id
+    await createProjectAsset(USER, { source: 'upload', name: '合同.pdf', url: MEDIA_URL(hex('1')), projectId: pa, excerpt: '付款期限三十日' })
+    await createProjectAsset(USER, { source: 'upload', name: '付款说明.md', url: MEDIA_URL(hex('2'), 'md'), projectId: pa })
+    await createProjectAsset(USER, {
+      source: 'output',
+      name: 'plan.md',
+      containerPath: '/home/agent/.openclaude/generated/plan.md',
+      projectId: pa,
+      excerpt: '付款节点',
+    })
+    await createProjectAsset(USER, { source: 'upload', name: '别的项目付款.pdf', url: MEDIA_URL(hex('3')), projectId: pb })
+    await createProjectAsset(USER, { source: 'upload', name: '未分组付款.pdf', url: MEDIA_URL(hex('4')) })
+    const gone = await createProjectAsset(USER, { source: 'upload', name: '已删付款.pdf', url: MEDIA_URL(hex('5')), projectId: pa })
+    if (gone.ok) await deleteProjectAsset(USER, gone.asset.id)
+    await createProjectAsset(USER, { source: 'upload', name: '100%_x.txt', url: MEDIA_URL(hex('6'), 'txt'), projectId: pa })
+
+    const hits = await searchChatProjectAssets(USER, pa, { q: '付款' })
+    assert.deepEqual(new Set(hits.map((h) => h.name)), new Set(['合同.pdf', '付款说明.md', 'plan.md']))
+    assert.ok(hits.every((h) => h.projectId === pa))
+
+    assert.deepEqual((await searchChatProjectAssets(USER, pa, { q: '付款', source: 'output' })).map((h) => h.name), ['plan.md'])
+    assert.equal((await searchChatProjectAssets(USER, pa, { q: '付款', limit: 1 })).length, 1)
+    assert.equal((await searchChatProjectAssets(USER, pa, { q: '付款', limit: 999 })).length, 3)
+    assert.deepEqual((await searchChatProjectAssets(USER, pa, { q: '%_' })).map((h) => h.name), ['100%_x.txt'])
+    assert.equal((await searchChatProjectAssets(USER, pa, { q: '%' })).length, 1, '% is literal')
+    assert.deepEqual(await searchChatProjectAssets(USER, pa, { q: '   ' }), [])
+    assert.deepEqual(await searchChatProjectAssets(OTHER, pa, { q: '付款' }), [], 'other tenant sees nothing')
+    assert.deepEqual(await searchChatProjectAssets(USER, '', { q: '付款' }), [])
+  })
+
+  it('产出物只搜最新版本:旧版本的摘录不再命中', async () => {
+    const p = await createChatProject(USER, { name: 'V' })
+    assert.equal(p.ok, true)
+    if (!p.ok) return
+    const REPORT = '/home/agent/.openclaude/generated/report.md'
+    const v1 = await createProjectAsset(USER, {
+      source: 'output', name: 'report.md', containerPath: REPORT, projectId: p.project.id,
+      digest: DIGEST_A, url: MEDIA_URL(DIGEST_A, 'md'), excerpt: '旧版独有词',
+    })
+    const v2 = await createProjectAsset(USER, {
+      source: 'output', name: 'report.md', containerPath: REPORT, projectId: p.project.id,
+      digest: DIGEST_B, url: MEDIA_URL(DIGEST_B, 'md'), excerpt: '新版内容',
+    })
+    assert.equal(v1.ok && v2.ok && v2.created, true)
+    assert.deepEqual(await searchChatProjectAssets(USER, p.project.id, { q: '旧版独有词' }), [])
+    const latest = await searchChatProjectAssets(USER, p.project.id, { q: 'report' })
+    assert.equal(latest.length, 1)
+    assert.equal(latest[0]?.digest, DIGEST_B)
   })
 })

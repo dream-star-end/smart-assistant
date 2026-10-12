@@ -123,3 +123,16 @@ describe("PreferencesPatchSchema", () => {
     assert.equal(PreferencesPatchSchema.safeParse({ auto_dream_enabled: "true" }).success, false);
   });
 });
+
+describe("intelligent_ui(OCV5-361)", () => {
+  test("full schema 接受 boolean,拒绝其它类型", () => {
+    assert.equal(PreferencesSchema.safeParse({ intelligent_ui: false }).success, true);
+    assert.equal(PreferencesSchema.safeParse({ intelligent_ui: "off" }).success, false);
+  });
+  test("patch 接受 true/false/null(null = 删除,回到默认开)", () => {
+    for (const v of [true, false, null]) {
+      assert.equal(PreferencesPatchSchema.safeParse({ intelligent_ui: v }).success, true, String(v));
+    }
+    assert.equal(PreferencesPatchSchema.safeParse({ intelligent_ui: 1 }).success, false);
+  });
+});

@@ -9,11 +9,9 @@
  */
 import {
   AlertTriangle,
-  AppWindow,
   Archive,
   BookOpen,
   Bot,
-  Camera,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
@@ -26,9 +24,7 @@ import {
   FileOutput,
   Globe,
   Image as ImageIcon,
-  Keyboard,
   Mic,
-  MousePointer2,
   Music,
   Package,
   Quote,
@@ -38,9 +34,12 @@ import {
   Video,
   XCircle,
 } from "lucide-react";
+import { BrowserStepCard } from "./BrowserStepCard";
+import { browserStepOf } from "./browserSteps";
 import { type ReactNode, useEffect, useState } from "react";
 import type { EvidenceManifest } from "@openclaude/protocol/research";
 import { shouldShowDelegateRunning } from "../../lib/chat/ocMemoryCli";
+import { PRODUCT_CAPABILITIES } from "../../lib/productCapabilities";
 import { cn } from "../../lib/utils";
 import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, useSignedSrc } from "../chat/media";
 import { ClaimList, CoverageBadge, GatesRow, LiteratureLibraryPanel } from "../chat/researchEvidence";
@@ -60,6 +59,9 @@ import {
   stripExternalEnvelope,
   unwrapCursorShellEnvelope,
 } from "./shellEnvelope";
+import { type WebSearchHit, parseWebSearchResults } from "./webSearchHits";
+
+export { type WebSearchHit, parseWebSearchResults };
 
 // ── 解析助手 ────────────────────────────────────────────────────────────────
 
@@ -271,54 +273,57 @@ function LiteratureCard({ data, partial }: { data: Record<string, unknown>; part
   const sources = recArr<LitSource>(data.sources);
   const warnings = asArr(data.warnings).map((w) => asStr(w)).filter(Boolean);
   if (sources.length === 0 && warnings.length === 0) return null;
+  // 「联网调研」能力的真实 UI 落点：对话里的文献检索结果卡（管理中心「文献」分区已下线，OCV5-360）。
   return (
-    <CardShell
-      icon={<BookOpen className="size-4" />}
-      title="文献检索"
-      subtitle={partial ? `已加载 ${sources.length} 篇` : `${sources.length} 篇`}
-    >
-      {sources.length > 0 && (
-        <ul className="flex flex-col divide-y divide-border">
-          {sources.slice(0, 50).map((s, i) => {
-            const meta = [authorsLine(s.authors), s.year ? String(s.year) : "", asStr(s.venue)]
-              .filter(Boolean)
-              .join(" · ");
-            const doi = asStr(s.doi);
-            const arxiv = asStr(s.arxivId);
-            const oaUrl = asStr(s.oa?.url);
-            return (
-              <li key={s.id || `${i}`} className="py-2 first:pt-0 last:pb-0">
-                <div className="text-[13px] leading-snug text-fg">{asStr(s.title) || "(无标题)"}</div>
-                {meta && <div className="mt-0.5 text-xs text-faint">{meta}</div>}
-                <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                  {s.retracted === true && (
-                    <Chip tone="danger">
-                      <AlertTriangle className="size-2.5" />
-                      已撤稿
-                    </Chip>
-                  )}
-                  {s.oa?.isOA && oaUrl && (
-                    <Chip href={oaUrl} tone="ok">
-                      开放获取
-                    </Chip>
-                  )}
-                  {doi && <Chip href={`https://doi.org/${encodeURIComponent(doi)}`}>DOI</Chip>}
-                  {arxiv && <Chip href={`https://arxiv.org/abs/${encodeURIComponent(arxiv)}`}>arXiv</Chip>}
-                  {typeof s.citationCount === "number" && <Chip>被引 {s.citationCount}</Chip>}
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-      )}
-      {warnings.length > 0 && (
-        <div className="mt-2 flex items-start gap-1.5 text-xs text-warning">
-          <AlertTriangle className="mt-0.5 size-3 shrink-0" />
-          <span>部分来源暂不可用:{warnings.join(";")}</span>
-        </div>
-      )}
-      {partial && <PartialNote shown={sources.length} />}
-    </CardShell>
+    <div className="contents" data-product-feature={PRODUCT_CAPABILITIES.research.id}>
+      <CardShell
+        icon={<BookOpen className="size-4" />}
+        title="文献检索"
+        subtitle={partial ? `已加载 ${sources.length} 篇` : `${sources.length} 篇`}
+      >
+        {sources.length > 0 && (
+          <ul className="flex flex-col divide-y divide-border">
+            {sources.slice(0, 50).map((s, i) => {
+              const meta = [authorsLine(s.authors), s.year ? String(s.year) : "", asStr(s.venue)]
+                .filter(Boolean)
+                .join(" · ");
+              const doi = asStr(s.doi);
+              const arxiv = asStr(s.arxivId);
+              const oaUrl = asStr(s.oa?.url);
+              return (
+                <li key={s.id || `${i}`} className="py-2 first:pt-0 last:pb-0">
+                  <div className="text-[13px] leading-snug text-fg">{asStr(s.title) || "(无标题)"}</div>
+                  {meta && <div className="mt-0.5 text-xs text-faint">{meta}</div>}
+                  <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                    {s.retracted === true && (
+                      <Chip tone="danger">
+                        <AlertTriangle className="size-2.5" />
+                        已撤稿
+                      </Chip>
+                    )}
+                    {s.oa?.isOA && oaUrl && (
+                      <Chip href={oaUrl} tone="ok">
+                        开放获取
+                      </Chip>
+                    )}
+                    {doi && <Chip href={`https://doi.org/${encodeURIComponent(doi)}`}>DOI</Chip>}
+                    {arxiv && <Chip href={`https://arxiv.org/abs/${encodeURIComponent(arxiv)}`}>arXiv</Chip>}
+                    {typeof s.citationCount === "number" && <Chip>被引 {s.citationCount}</Chip>}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        {warnings.length > 0 && (
+          <div className="mt-2 flex items-start gap-1.5 text-xs text-warning">
+            <AlertTriangle className="mt-0.5 size-3 shrink-0" />
+            <span>部分来源暂不可用:{warnings.join(";")}</span>
+          </div>
+        )}
+        {partial && <PartialNote shown={sources.length} />}
+      </CardShell>
+    </div>
   );
 }
 
@@ -860,7 +865,7 @@ function MarketCard({ tool }: { tool: ToolLike }) {
   }
   if (items.length === 0) return null;
   return (
-    <CardShell icon={<Package className="size-4" />} title="技能市场" subtitle={`${items.length} 项`}>
+    <CardShell icon={<Package className="size-4" />} title="AI 市场" subtitle={`${items.length} 项`}>
       <MarketItems items={items} />
     </CardShell>
   );
@@ -919,30 +924,6 @@ function domainOf(url: string): string | undefined {
   } catch {
     return undefined;
   }
-}
-
-export interface WebSearchHit {
-  title: string;
-  url: string;
-  snippet?: string;
-}
-
-// 后端 WebSearchTool 把结果拼成 `  - [title](url): snippet` 行(见 minimaxAdapter/
-// WebSearchTool.mapToolResultToToolResultBlockParam)。逐行解析,非结果行(标题/REMINDER)
-// 自然不匹配。纯函数:解析失败/空/畸形 → [](卡片据此回落通用文本块,UX 铁律)。
-const WEB_SEARCH_LINE = /^\s*-\s+\[(.+?)\]\(([^)]+)\)(?::\s*(.*))?$/;
-
-export function parseWebSearchResults(text: string | null | undefined): WebSearchHit[] {
-  if (!text) return [];
-  const hits: WebSearchHit[] = [];
-  for (const line of text.split("\n")) {
-    const m = WEB_SEARCH_LINE.exec(line);
-    if (!m) continue;
-    const url = (m[2] ?? "").trim();
-    if (!url) continue;
-    hits.push({ title: (m[1] ?? "").trim(), url, snippet: m[3]?.trim() || undefined });
-  }
-  return hits;
 }
 
 /** WebSearch 结果 → 来源列表富卡;解析不出结果 → null(调用方回落通用 OutputBlock)。 */
@@ -1478,113 +1459,12 @@ function MinimaxCliCard({ command, tool }: { command: string; tool: ToolLike }):
 }
 
 // ── oc-browser(浏览器操作)──────────────────────────────────────────────────────
+// OCV5-374:解析与卡片都在 browserSteps.ts / BrowserStepCard.tsx(MCP browser_* 共用同一张卡)。
 
-const BROWSER_ACTIONS: Record<string, { icon: ReactNode; title: string }> = {
-  open: { icon: <Globe className="size-4" />, title: "打开网页" },
-  goto: { icon: <Globe className="size-4" />, title: "打开网页" },
-  snapshot: { icon: <AppWindow className="size-4" />, title: "页面快照" },
-  find: { icon: <Search className="size-4" />, title: "查找页面" },
-  click: { icon: <MousePointer2 className="size-4" />, title: "点击" },
-  dblclick: { icon: <MousePointer2 className="size-4" />, title: "双击" },
-  fill: { icon: <Keyboard className="size-4" />, title: "输入文本" },
-  type: { icon: <Keyboard className="size-4" />, title: "输入文本" },
-  press: { icon: <Keyboard className="size-4" />, title: "按键" },
-  screenshot: { icon: <Camera className="size-4" />, title: "截图" },
-  "go-back": { icon: <Globe className="size-4" />, title: "返回上一页" },
-  reload: { icon: <Globe className="size-4" />, title: "刷新网页" },
-  close: { icon: <XCircle className="size-4" />, title: "关闭浏览器" },
-};
-
-/** 命令里全部 oc-browser <verb>(复合命令 `open … && oc-browser snapshot` 按出现顺序全识别;
- *  只收已登记动作,一个都不认 → 空数组,调用方回落)。 */
-function browserSubcommands(command: string): string[] {
-  const verbs: string[] = [];
-  for (const m of command.matchAll(/oc-browser\s+([a-z-]+)/gi)) {
-    const verb = (m[1] ?? "").toLowerCase();
-    if (BROWSER_ACTIONS[verb]) verbs.push(verb);
-  }
-  return verbs;
-}
-
-function browserArgs(command: string, verb: string): string[] {
-  const match = new RegExp(`oc-browser\\s+${verb.replace("-", "\\-")}\\b([^\\n;&|]*)`, "i").exec(command);
-  if (!match) return [];
-  return [...(match[1] ?? "").matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map(
-    (token) => token[1] ?? token[2] ?? token[3] ?? "",
-  );
-}
-
-/** 从文本里找容器绝对图片路径(截图落盘路径),用于截图预览。 */
-function findImagePath(text: string | null): string | null {
-  if (!text) return null;
-  const m = /\/[^\s"'<>]+\.(?:png|jpe?g|webp)/i.exec(text);
-  return m ? m[0] : null;
-}
-
-/** Playwright CLI 成功输出里的页面标题(`- Page Title: …` 行);无 → ""。 */
-function pageTitleOf(text: string | null): string {
-  if (!text) return "";
-  const m = /^\s*-?\s*Page Title:\s*(.+)$/im.exec(text);
-  return m ? m[1].trim() : "";
-}
-
-/** 失败输出的首个 Error 行(剥掉 "### Error" 这类 markdown 标头);全无 → 首个非空非标头行。 */
-function firstErrorLine(text: string | null): string {
-  if (!text) return "";
-  const lines = text.split(/\r?\n/).map((l) => l.trim());
-  const hit = lines.find((l) => l && !/^#{1,6}\s/.test(l) && /\berror\b/i.test(l));
-  return hit ?? lines.find((l) => l && !/^#{1,6}\s/.test(l)) ?? "";
-}
-
-/** oc-browser <verb…> → 动作序列 + URL/元素/文本 + 结果状态;截图产物缩略图;失败给出首个
- *  Error 行(danger)+ 完整输出折叠。成功的 open/goto 从输出提取 Page Title。 */
-function BrowserCliCard({ command, tool }: { command: string; tool: ToolLike }): ReactNode | null {
-  const subs = browserSubcommands(command);
-  if (subs.length === 0) return null;
-  const out = outputText(tool);
-  const error = !!tool.error || /^(?:#{1,6}\s*)?Error\b/im.test(out ?? "");
-  const reason = error ? firstErrorLine(out) : "";
-  const navigationVerb = subs.find((sub) => sub === "open" || sub === "goto" || sub === "tab-new");
-  const url = navigationVerb ? (browserArgs(command, navigationVerb)[0] ?? "") : "";
-  const elementVerb = subs.find((sub) => sub === "click" || sub === "dblclick" || sub === "fill");
-  const elementRef = elementVerb ? (browserArgs(command, elementVerb)[0] ?? "") : "";
-  const fillArgs = subs.includes("fill") ? browserArgs(command, "fill") : [];
-  const typeArgs = subs.includes("type") ? browserArgs(command, "type") : [];
-  const text = fillArgs[1] ?? typeArgs[0] ?? "";
-  const key = subs.includes("press") ? (browserArgs(command, "press")[0] ?? "") : "";
-  const shot =
-    !error && subs.includes("screenshot")
-      ? safeArtifactSrc(parseCommandFlag(command, "filename")) || findImagePath(out)
-      : null;
-  const pageTitle = !error && navigationVerb ? pageTitleOf(out) : "";
-  const domain = url ? domainOf(url) : undefined;
-  return (
-    <CardShell
-      icon={BROWSER_ACTIONS[subs[0]].icon}
-      title={subs.map((s) => BROWSER_ACTIONS[s].title).join(" · ")}
-    >
-      {reason && <div className="mt-1 break-words text-xs text-danger">{reason.slice(0, 200)}</div>}
-      {pageTitle && <div className="mt-1.5 text-[13px] leading-snug text-fg">{pageTitle}</div>}
-      {url && (
-        <div className="mt-1.5">
-          <Chip href={url}>{domain ?? url}</Chip>
-        </div>
-      )}
-      {elementRef && <div className="mt-1.5 text-[13px] leading-snug text-fg">元素 {elementRef}</div>}
-      {text && <div className="mt-1 text-[13px] leading-snug text-fg">输入:{text}</div>}
-      {key && <div className="mt-1 text-[13px] leading-snug text-fg">按键:{key}</div>}
-      {shot && (
-        <div className="mt-2">
-          <SignedImg src={shot} alt="页面截图" className="max-h-56 rounded-md border border-border" />
-        </div>
-      )}
-      {error ? (
-        <OutputDetails text={out} label="错误详情" />
-      ) : (
-        subs.includes("snapshot") && <OutputDetails text={out} label="查看页面快照" />
-      )}
-    </CardShell>
-  );
+function OcBrowserCard({ command, tool }: { command: string; tool: ToolLike }): ReactNode | null {
+  const step = browserStepOf(tool, command);
+  // 没登记的动词:交给 GenericOcCard 兜底(不泄漏命令),不画一张空的浏览器卡。
+  return step && step.actions.length > 0 ? <BrowserStepCard step={step} tool={tool} /> : null;
 }
 
 // ── 注册表 + 分派入口(单一权威:键 = OcCli,与 meta.OC_TOOLS 对齐)──────────────
@@ -1641,7 +1521,7 @@ const OC_BODY_CARDS: Partial<Record<OcCli, (command: string, tool: ToolLike) => 
   "oc-memory": (c, t) => MemoryCliCard({ command: c, tool: t }),
   "oc-minimax": (c, t) => MinimaxCliCard({ command: c, tool: t }),
   mmx: (c, t) => MinimaxCliCard({ command: c, tool: t }),
-  "oc-browser": (c, t) => BrowserCliCard({ command: c, tool: t }),
+  "oc-browser": (c, t) => OcBrowserCard({ command: c, tool: t }),
   // 应用连接器:输出含 confirmation_required 触发对象 → 写操作确认卡(human-in-the-loop);
   // 其余输出(list/读操作)→ null 兜底 GenericOcCard。实现在 connectorCards.tsx。
   "oc-connect": (_c, t) => connectorToolCard(t, { embedded: true }),

@@ -119,7 +119,7 @@ export type TutorialTopic = {
 export const TUTORIAL_TOPICS = {
   "chat-basics": {
     featureId: "chat-basics",
-    contentVersion: 9,
+    contentVersion: 10,
     intro:
       "从简不是只回答一句话的聊天框，而是能持续执行任务的工作区。你可以像给同事派活一样说明目标、材料、限制和交付格式；过程中会看到思考、工具、进度与阶段结果，有时还会出现可点击的选择卡。任务结束后还能继续追问或让它修改。",
     outcome: "把一个模糊想法变成可核验、可继续迭代的完整交付。",
@@ -147,7 +147,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "用反馈完成最后一公里",
-        body: "对结果指出具体问题，或使用重新生成、继续、点赞/点踩，让下一轮更贴近预期。",
+        body: "对结果指出具体问题，或用回复下方的动作行和「⋯」更多操作里的重新生成、继续、点赞/点踩，让下一轮更贴近预期。",
       },
     ],
     tips: [
@@ -397,9 +397,9 @@ export const TUTORIAL_TOPICS = {
   },
   "web-research": {
     featureId: "web-research",
-    contentVersion: 3,
+    contentVersion: 5,
     intro:
-      "智能体可以搜索公开网页、提取页面与文档、检索论文并整理引用。文献库用于保存你主动上传并完成解析的研究资料；回答中的来源卡片可打开核对，适合需要时效性和证据链的任务。",
+      "智能体可以搜索公开网页、提取页面与文档、检索论文并整理引用。检索到的论文会以文献检索卡片出现在对话里，回答中的来源卡片可打开核对，适合需要时效性和证据链的任务。",
     outcome: "得到带来源、能回查的调研结论，而不是只有一段无法验证的概括。",
     scenarios: [
       "行业与竞品调研",
@@ -420,8 +420,8 @@ export const TUTORIAL_TOPICS = {
         body: "打开引用卡片核对最关键的数字和结论，不把搜索摘要直接当最终事实。",
       },
       {
-        title: "沉淀到文献库",
-        body: "把会反复使用的论文或资料上传到管理中心 → 文献，后续研究可继续引用。",
+        title: "把资料带进对话",
+        body: "会反复使用的论文或资料，直接作为附件上传到对话里，让它在此基础上继续检索和引用。",
       },
     ],
     tips: [
@@ -600,7 +600,7 @@ export const TUTORIAL_TOPICS = {
   },
   agents: {
     featureId: "agents",
-    contentVersion: 5,
+    contentVersion: 6,
     intro:
       "智能体是一套长期稳定的角色、工作方式和专用能力。新任务可从侧栏“新建会话”右侧箭头先选助手；已有任务可点击顶栏当前助手名称切换。每个会话记录自己的智能体归属，重新打开时会恢复。",
     outcome: "把专业任务交给更懂该领域、带有合适工具和流程的助手。",
@@ -616,7 +616,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "按任务而不是名字选择",
-        body: "查看能力说明、所需工具和适用场景；日常混合任务可继续用全能助手。带「Plugin 待授权」或「能力待修复」徽章的智能体暂时选不了：卡片会写明原因（如“有 N 项插件待授权，完成授权后即可使用”），点击这张卡片或右下角的「去授权」/「去处理」按钮即可前往授权或修复所需能力，处理完回来就能选用。",
+        body: "查看能力说明、所需工具和适用场景；日常混合任务可继续用全能助手。带「插件待授权」或「能力待修复」徽章的智能体暂时选不了：卡片会写明原因（如“有 N 项插件待授权，完成授权后即可使用”），点击这张卡片或右下角的「去授权」/「去处理」按钮即可前往授权或修复所需能力，处理完回来就能选用。",
       },
       {
         title: "核对角色后再下达任务",
@@ -709,14 +709,14 @@ export const TUTORIAL_TOPICS = {
   },
   "memory-auto-dream": {
     featureId: "memory-auto-dream",
-    contentVersion: 8,
+    contentVersion: 10,
     intro:
-      "长期记忆按智能体隔离保存稳定信息。新版 Auto-Dream 使用 MiniMax M3，在你明确同意后结合 V5 平台能力和技能，全面审计相关会话、操作与日志，并提出记忆、设置、技能、规则、Agent、插件和定时任务等优化建议。",
-    outcome: "不只整理记忆，而是在保留用户控制权的前提下持续优化整个智能体工作环境。",
+      "长期记忆按智能体隔离保存稳定信息，例如你的职业、沟通偏好和项目背景，后续会话会自动参考。你可以在管理中心 → 记忆按类型查看、编辑和删除条目；后台整理出新的记忆时，那里还会出现 Auto-Dream 梦境报告。",
+    outcome: "让智能体记住真正长期有用的信息，并由你随时核对和修正。",
     scenarios: [
       "记住职业与沟通偏好",
-      "发现设置、技能或规则与实际用法不匹配",
-      "识别应新增插件、定时任务或平台能力的重复需求",
+      "保存项目背景与关键约定",
+      "清理过期或互相冲突的旧信息",
     ],
     steps: [
       {
@@ -732,16 +732,15 @@ export const TUTORIAL_TOPICS = {
         body: "信息变化时直接编辑或删除旧条目，避免新旧事实冲突。",
       },
       {
-        title: "开启并审阅全面优化",
-        body: "先确认数据范围、计费和匿名平台发现上报方式，再到管理中心 → 优化逐项查看 Diff；内容和设置经你确认才应用，平台发现仅上报去内容、去身份的分类与计数。",
+        title: "查看梦境报告",
+        body: "有整理结果时，管理中心 → 记忆顶部会出现 Auto-Dream 梦境报告，列出变化的条目，点开即可核对或修改。",
       },
     ],
     tips: [
       "只记长期稳定、未来会复用的信息。",
-      "建议冲突时先重新审计，不要覆盖审计后由你手动修改的内容。",
+      "信息变化时及时更新，避免新旧说法同时存在。",
     ],
     cautions: [
-      "全面审计按 MiniMax M3 实际用量计费；执行环境禁用工具和网络。",
       "不要把密码、密钥、身份证号等秘密写进长期记忆。",
     ],
     example:
@@ -751,7 +750,7 @@ export const TUTORIAL_TOPICS = {
   },
   "schedules-reminders": {
     featureId: "schedules-reminders",
-    contentVersion: 4,
+    contentVersion: 6,
     intro:
       "定时任务让智能体在未来某个时间自动执行提示词，并把结果送到网页对话或其他已配置通道。既支持一次性提醒，也支持工作日、每周、每月等周期计划；管理中心可暂停、编辑和删除。",
     outcome: "把重复的信息整理、提醒和例行检查交给系统自动完成。",
@@ -771,7 +770,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "在管理中心维护",
-        body: "查看下一次执行时间，按需暂停、修改或删除任务；Auto-Dream 根据重复需求提出的调整也必须先看完整配置差异并确认。",
+        body: "查看下一次执行时间，按需暂停、修改或删除任务。",
       },
     ],
     tips: [
@@ -788,7 +787,7 @@ export const TUTORIAL_TOPICS = {
   },
   "skills-training": {
     featureId: "skills-training",
-    contentVersion: 4,
+    contentVersion: 6,
     intro:
       "技能是一套在特定场景自动启用的可复用工作流程，包含说明、参考资料、脚本和评测用例。管理中心可查看市场安装和个人自建的技能，编辑自己的技能，运行评测，并让训练流程基于失败案例提出改进草稿。",
     outcome: "把一次成功做法固化成稳定流程，并用评测防止后续修改退化。",
@@ -812,7 +811,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "审阅训练草稿",
-        body: "AI 训练和 Auto-Dream 全面审计都只生成技能候选改动；结合真实使用比较完整 Diff、留下评论并确认后再合并。",
+        body: "AI 训练只生成技能候选改动；结合真实使用比较完整 Diff、留下评论并确认后再合并。",
       },
     ],
     tips: [
@@ -827,7 +826,7 @@ export const TUTORIAL_TOPICS = {
   },
   connectors: {
     featureId: "connectors",
-    contentVersion: 4,
+    contentVersion: 5,
     intro:
       "插件让智能体在获得授权后读取或写入外部服务。市场负责发现、审核和安装；管理中心只负责账号与授权。除 Notion、飞书、GitHub 和声明式 HTTP 插件外，知识星球支持微信扫码登录及只读内容检索。",
     outcome: "让 AI 在真实业务系统里查数据和执行动作，而不靠手工搬运。",
@@ -835,7 +834,7 @@ export const TUTORIAL_TOPICS = {
       "读取 Notion 或飞书文档",
       "在 GitHub 上协作开发",
       "检索知识星球的主题、评论、动态、标签、专栏与打卡内容",
-      "调用已审核的业务 API 插件",
+      "调用已审核的业务插件",
     ],
     steps: [
       {
@@ -872,7 +871,7 @@ export const TUTORIAL_TOPICS = {
   },
   "marketplace-discovery": {
     featureId: "marketplace-discovery",
-    contentVersion: 3,
+    contentVersion: 4,
     intro:
       "AI 市场汇集三类能力：技能沉淀可复用的方法与流程；智能体组合模型、人设、工具权限和依赖；插件提供可安装、可授权、可审计的外部能力。当前插件分类先支持声明式 HTTP API。",
     outcome: "按任务快速加装专业能力，而不把所有功能塞进一个助手。",
@@ -888,7 +887,7 @@ export const TUTORIAL_TOPICS = {
       },
       {
         title: "安装后完成配置",
-        body: "技能可分配给智能体；智能体会出现在选择器；API 连接插件安装后还需到管理中心绑定账号。",
+        body: "技能可分配给智能体；智能体会出现在选择器；插件安装后还需到管理中心绑定账号。",
       },
       {
         title: "定期更新与清理",
@@ -907,11 +906,11 @@ export const TUTORIAL_TOPICS = {
   },
   "marketplace-publishing": {
     featureId: "marketplace-publishing",
-    contentVersion: 3,
+    contentVersion: 4,
     intro:
       "你可以把自己的技能、智能体或插件发布到公共市场。发布页支持由 AI 在对话中生成结构化确认单；提交后自动审核，高风险或不确定内容转人工，状态变化会在市场内实时显示。当前插件发布支持声明式 HTTP API。",
     outcome: "把可复用能力版本化、接受审核，并分享给市场用户。",
-    scenarios: ["发布通用技能", "分享专业智能体", "封装受控 API 连接插件"],
+    scenarios: ["发布通用技能", "分享专业智能体", "封装受控插件"],
     steps: [
       {
         title: "先准备真实可用版本",
@@ -935,7 +934,7 @@ export const TUTORIAL_TOPICS = {
       "版本号和变更说明要能让已安装用户判断是否更新。",
     ],
     cautions: [
-      "不得发布密钥、个人数据、侵权内容或能绕过权限的脚本；API 插件只能声明允许的固定域名和动作。",
+      "不得发布密钥、个人数据、侵权内容或能绕过权限的脚本；插件只能声明允许的固定域名和动作。",
     ],
     media: "marketplace-publishing",
     related: ["skills-training", "connectors", "marketplace-discovery"],
@@ -975,14 +974,14 @@ export const TUTORIAL_TOPICS = {
   },
   preferences: {
     featureId: "preferences",
-    contentVersion: 2,
+    contentVersion: 4,
     intro:
-      "设置 → 偏好集中管理浅色/深色主题、默认模型、默认思考深度、通知方式和 Auto-Dream 开关。主题会立即生效，账户偏好会保存到服务端并在其他设备继承。",
-    outcome: "让每个新会话从符合你习惯的外观、模型和自动化配置开始。",
+      "设置 → 偏好集中管理浅色/深色主题、默认模型、默认思考深度、本设备的发送键与字号，以及通知方式。主题会立即生效，账户偏好会保存到服务端并在其他设备继承。",
+    outcome: "让每个新会话从符合你习惯的外观、模型和输入方式开始。",
     scenarios: [
       "固定默认模型与思考档",
       "切换深色或跟随系统",
-      "管理通知和 Auto-Dream",
+      "调整发送键、字号和通知",
     ],
     steps: [
       {
@@ -998,8 +997,8 @@ export const TUTORIAL_TOPICS = {
         body: "主题即时切换；只打开真正需要的通知渠道，避免重复提醒。",
       },
       {
-        title: "按需开启 Auto-Dream",
-        body: "符合套餐条件时可开启自动复盘；随后到记忆中心审阅梦境报告。",
+        title: "调整本设备输入",
+        body: "在“输入”里选择 Enter 或组合键发送、默认或大字号；这两项只对当前设备生效。",
       },
     ],
     tips: [

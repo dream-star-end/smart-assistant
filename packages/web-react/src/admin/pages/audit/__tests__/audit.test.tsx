@@ -277,8 +277,8 @@ describe("AuditPage", () => {
     expect(screen.getByText("NO_OUTPUT")).toBeTruthy();
     expect(screen.getAllByText("IMAGE_UPSTREAM_RATE_LIMITED").length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText("workspace_timeout")).toBeTruthy();
-    expect(screen.getByText("问题卡")).toBeTruthy();
-    expect(screen.getByText("近窗没有问题卡事件。")).toBeTruthy();
+    expect(await screen.findByText("问题卡")).toBeTruthy();
+    expect(await screen.findByText("近窗没有问题卡事件。")).toBeTruthy();
   });
 
   for (const deferred of [false, true]) test(deferred ? "问题卡静态标题不代表数据就绪，延迟响应后仍渲染全部漏斗与裁决" : "问题卡区块有数据时渲染漏斗与裁决", async () => {
@@ -369,7 +369,7 @@ describe("AuditPage", () => {
     fireEvent.click(screen.getByRole("tab", { name: "产品摩擦" }));
 
     expect(await screen.findByText("问题卡")).toBeTruthy();
-    expect(screen.getByText("近窗没有问题卡事件。")).toBeTruthy();
+    expect(await screen.findByText("近窗没有问题卡事件。")).toBeTruthy();
     expect(screen.getByText("暂无裁决")).toBeTruthy();
     expect(screen.getByText("暂无任务")).toBeTruthy();
     expect(screen.getByText("暂无占位")).toBeTruthy();

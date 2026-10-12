@@ -1,7 +1,9 @@
 import type { LucideIcon } from 'lucide-react'
 import type { ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { cn } from '../../lib/utils'
 import { Card } from './Card'
+import { useHeaderSlot, useQuiet } from './Quiet'
 
 /**
  * 面板统一头部：标题 + 可选说明 + 可选右侧操作。管理中心/市场各分区共用，
@@ -21,8 +23,34 @@ export function PanelHeader({
   hint?: string
   action?: ReactNode
 }) {
+  const quiet = useQuiet()
+  const slot = useHeaderSlot()
+  if (quiet) {
+    // 安静表面(管理中心):壳体提供了上下文行插槽时(OCV5-362 起两个断点都提供),导航已写明
+    // 当前分区 —— 与设置中心一样不再放页面大标题,标题 + 说明只留给读屏,右侧操作 portal 进上下文行。
+    // 没有插槽(单独渲染的面板)时退回可见的标题行。
+    if (slot) {
+      return (
+        <div data-panel-header="" className="sr-only">
+          <h3>{title}</h3>
+          {hint && <p>{hint}</p>}
+          {action && createPortal(<div className="flex min-w-0 items-center gap-1">{action}</div>, slot)}
+        </div>
+      )
+    }
+    return (
+      <div data-panel-header="" className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3 px-4 pb-4 pt-2">
+        <div className="min-w-0 flex-1 basis-64">
+          <h3 className="text-title font-semibold text-fg">{title}</h3>
+          {hint && <p className="mt-0.5 max-w-[60ch] text-caption text-muted">{hint}</p>}
+        </div>
+        {action && <div className="flex shrink-0 items-center gap-2">{action}</div>}
+      </div>
+    )
+  }
   return (
-    <div className="flex items-start justify-between gap-3 px-4 py-3">
+    // data-panel-header:给外壳按作用域调排版的钩子(管理中心把它当页面标题),本身不带样式。
+    <div data-panel-header="" className="flex items-start justify-between gap-3 px-4 py-3">
       <div className="min-w-0">
         <h3 className="text-title font-semibold text-fg">{title}</h3>
         {hint && <p className="mt-0.5 text-caption text-muted">{hint}</p>}
@@ -59,6 +87,16 @@ export function Panel({
   className?: string
   bodyClassName?: string
 }) {
+  const quiet = useQuiet()
+  if (quiet) {
+    return (
+      <section className={className}>
+        <PanelHeader title={title} hint={hint} action={action} />
+        <div className={cn('px-4 pb-4', bodyClassName)}>{children}</div>
+        {footer && <div className="border-t border-border px-4 py-3">{footer}</div>}
+      </section>
+    )
+  }
   return (
     <Card className={className}>
       <PanelHeader title={title} hint={hint} action={action} />
@@ -85,6 +123,21 @@ export function EmptyState({
   hint?: string
   action?: ReactNode
 }) {
+  const quiet = useQuiet()
+  if (quiet) {
+    // 安静表面的空态:不放「图标方块 + 一句话」的模板,也不放虚线骨架(第 4 轮:手机上它读起来
+    // 像「还在加载」)。左对齐的标题 + 说明 + 行动按钮,与列表行同一条左缘。
+    // icon 参数保留(调用方契约不变),此形态下不渲染。
+    return (
+      <div data-empty-state="" className="px-4 py-2">
+        <div className="pt-2 md:pt-4">
+          <p className="text-[14px] font-semibold leading-5 text-fg">{title}</p>
+          {hint && <p className="mt-1 max-w-[46ch] text-body text-muted">{hint}</p>}
+          {action && <div className="mt-4 flex flex-wrap items-center gap-2">{action}</div>}
+        </div>
+      </div>
+    )
+  }
   return (
     <div className="flex flex-col items-center gap-2.5 px-5 py-12 text-center">
       <span className="flex size-11 items-center justify-center rounded-xl bg-accent-soft text-accent">

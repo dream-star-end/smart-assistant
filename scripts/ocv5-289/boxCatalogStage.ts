@@ -21,7 +21,7 @@ const MODEL = "box-api-claude-opus-5-5";
 const SOURCE = "claude-opus-5-5";
 const UID = 3n;
 const VERSION = { model_id: MODEL, engine: "ccb", provider_id: "box_cli",
-  upstream_model_id: SOURCE, context_window: 200_000,
+  upstream_model_id: SOURCE, context_window: 1_000_000,
   capability_profile: { supports_vision: false,
     reasoning: { supported: [], codex_model_default: null },
     ccb: { capability_zero: true, supports_thinking: false } } } as const;

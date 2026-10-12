@@ -113,7 +113,7 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       assert.equal(await desktop.page.getByText("summarize-stock.mjs").count(), 0, "tool stays folded");
       assert.equal(await desktop.page.getByText("paper.pdf").count(), 0, "pdf execution log is not a deliverable");
       await desktop.page.getByText("看板已经做好").waitFor();
-      await desktop.page.getByTitle("HTML 沙盒预览").waitFor();
+      await desktop.page.getByTitle("交互内容", { exact: true }).waitFor();
       await desktop.page.getByText(/inventory-board-north-south/).waitFor();
       const meta = desktop.page.getByTestId("assistant-meta").filter({ hasText: "2023-11-15" });
       await meta.waitFor();

@@ -255,3 +255,18 @@ test("when the only login is out of quota the request still reaches it, so the u
     stored(21n, "default")]);
   for (const uid of uids.slice(0, 20)) assert.equal((await g.launch(uid)).accountId, 21n, "a usable Box always wins");
 });
+
+test("the interactive route gets the Box exec endpoint itself, through the same checks, with no login scheduling", async () => {
+  // Every login benched: the interactive route still reaches the Box (its login is chosen separately).
+  const f = fixture([20n], [stored(20n, "default", { cooldownUntil: new Date(now + 86_400_000), healthUpdatedAt: new Date(now), lastReason: "login_required" })]);
+  const target = await f.resolver.resolve({ ...f.args(3n), allowWakeIfHibernated: true, interactiveExecTarget: true });
+  assert.equal(target.accountId, 20n);
+  assert.deepEqual(target.execTarget, { execUrl: "https://box20.example.cursorvm.com/agent.v1.ControlService/Exec",
+    execToken: "t", networkToken: "n" });
+  await target.dispose?.();
+  // Model traffic never carries the endpoint out.
+  const g = fixture([20n], [stored(20n, "default")]);
+  const model = await g.resolver.resolve(g.args(3n));
+  assert.equal(model.execTarget, undefined);
+  await model.dispose?.();
+});

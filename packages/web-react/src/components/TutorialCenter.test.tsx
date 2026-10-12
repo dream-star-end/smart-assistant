@@ -12,6 +12,15 @@ import { api } from "../lib/api";
 import { TUTORIAL_PENDING_CAPTURE_LABEL, TUTORIAL_SCENARIO_PATHS } from "../lib/tutorialJourneys";
 import { SIGNATURE_WORKS } from "../lib/tutorialSignatureWorks";
 import { TutorialCenter } from "./TutorialCenter";
+import { prefetchMarkdownImpl } from "./Markdown";
+import { loadBeforeAll } from "../test/moduleLoad";
+import { preloadToolBody } from "./tool/lazyToolBody";
+
+// 渲染工具卡展开体的断言要等懒加载的 tool bodies;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(preloadToolBody);
+
+// 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(prefetchMarkdownImpl);
 
 afterEach(() => {
   cleanup();

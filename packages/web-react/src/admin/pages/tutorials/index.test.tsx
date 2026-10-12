@@ -4,6 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { adminApi } from '../../../lib/api/admin'
 import type { CommunityTutorialPending } from '../../../lib/types'
 import TutorialReviewPage from './index'
+import { prefetchMarkdownImpl } from '../../../components/Markdown'
+import { loadBeforeAll } from '../../../test/moduleLoad'
+
+// 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(prefetchMarkdownImpl)
 
 const pending: CommunityTutorialPending = {
   id: '9',
@@ -42,7 +47,9 @@ describe('TutorialReviewPage', () => {
 
     expect(await screen.findByRole('heading', { name: pending.title })).toBeInTheDocument()
     expect(screen.getByText(/先复现问题，再做最小修改/)).toBeInTheDocument()
-    expect(screen.getByText(/!\[追踪图\]\(https:\/\/tracker\.test\/pixel\.png\)/)).toBeInTheDocument()
+    // 投稿里的外链图不加载(blockImages):富文本渲染里只剩「[追踪图]」字样、没有 <img>。此前断言的是
+    // 原始 Markdown 源码,只在懒加载占位里出现,图片拦截其实没被测到(OCV5-373 follow-up)。
+    expect(screen.getByText('[追踪图]')).toBeInTheDocument()
     expect(document.querySelector('img')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: '审核通过并上线' }))
 

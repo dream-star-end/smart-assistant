@@ -436,19 +436,19 @@ const ROWS: Record<string, Row> = {
   PLUGIN_RUNTIME_UNAVAILABLE: {
     retrySafe: 'yes',
     requiresReauth: false,
-    message: 'Plugin 授权服务暂不可用',
+    message: '插件授权服务暂不可用',
     nextAction: '请稍后重试；若持续失败请联系管理员',
   },
   PLUGIN_SETUP_FAILED: {
     retrySafe: 'yes',
     requiresReauth: false,
-    message: 'Plugin 授权未完成',
+    message: '插件授权未完成',
     nextAction: '请重新扫码授权',
   },
   NOT_INSTALLED: {
     retrySafe: 'no',
     requiresReauth: false,
-    message: '尚未安装该 Plugin',
+    message: '尚未安装该插件',
     nextAction: '请先从 AI 市场安装或更新微博插件',
   },
   SETUP_ACTIVE: {
@@ -460,7 +460,7 @@ const ROWS: Record<string, Row> = {
   ACCOUNT_ALREADY_EXISTS: {
     retrySafe: 'no',
     requiresReauth: false,
-    message: '该 Plugin 账号已授权',
+    message: '该插件账号已授权',
     nextAction: '无需重复绑定。若动作仍失败，引导用户重新扫码刷新会话',
   },
   SETUP_NOT_FOUND: {

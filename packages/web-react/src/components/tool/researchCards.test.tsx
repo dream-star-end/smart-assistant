@@ -42,6 +42,14 @@ describe("researchToolCard 分派", () => {
     expect(screen.getByText(/crossref 暂不可用/)).toBeInTheDocument();
   });
 
+  test("文献检索卡是「联网调研」能力的教程落点(data-product-feature=web-research)", () => {
+    const node = researchToolCard('oc-lit search "transformer"', tool({ output: LIT_JSON }));
+    const { container } = render(<div>{node}</div>);
+    const marker = container.querySelector('[data-product-feature="web-research"]');
+    expect(marker).not.toBeNull();
+    expect(marker).toHaveTextContent("Attention Is All You Need");
+  });
+
   test("env 前缀 / 绝对路径命令仍命中", () => {
     expect(
       researchToolCard("FOO=1 oc-lit snowball 10.x", tool({ output: LIT_JSON })),
@@ -388,13 +396,13 @@ describe("其余 oc-* 卡片", () => {
     expect(container.querySelector("a")).toBeNull(); // 不安全 src → 无下载/预览链接
   });
 
-  test("oc-market search → 技能市场卡(数组输出)", () => {
+  test("oc-market search → AI 市场卡(数组输出)", () => {
     const out = JSON.stringify([
       { slug: "research-assistant", name: "科研助手", kind: "agent", description: "端到端科研" },
       { slug: "pptx", name: "PPTX", kind: "skill", description: "做幻灯" },
     ]);
     render(<div>{researchToolCard("oc-market search 科研", tool({ output: out }))}</div>);
-    expect(screen.getByText("技能市场")).toBeInTheDocument();
+    expect(screen.getByText("AI 市场")).toBeInTheDocument();
     expect(screen.getByText("科研助手")).toBeInTheDocument();
     expect(screen.getByText("智能体")).toBeInTheDocument();
   });
@@ -718,7 +726,7 @@ describe("4 个新专属卡", () => {
     expect(screen.getByText(/任务号 abc123/)).toBeInTheDocument();
   });
 
-  test("oc-browser open → 打开网页语义正文(URL 链接,无原始 stdout)", () => {
+  test("oc-browser open → 浏览器卡:地址栏链接,无原始 stdout", () => {
     const { container } = render(
       <div>
         {researchToolCard(
@@ -728,10 +736,12 @@ describe("4 个新专属卡", () => {
       </div>,
     );
     expect(screen.getByText("打开网页")).toBeInTheDocument();
-    const urlChip = container.querySelector('a[href="https://example.com"]');
-    expect(urlChip).not.toBeNull();
-    // a11y-B tools#1:Chip 链接桌面 20px 高,hover:none 下要撑到 44px 命中(ui-preview 无该卡场景,类名即契约)。
-    expect(urlChip?.className).toContain("[@media(hover:none)]:min-h-11");
+    const address = container.querySelector('a[href="https://example.com"]');
+    expect(address).not.toBeNull();
+    expect(address).toHaveAttribute("target", "_blank");
+    expect(address?.textContent).toContain("example.com");
+    // a11y-B tools#1:地址栏链接桌面紧凑,hover:none 下要撑到 44px 命中(类名即契约)。
+    expect(address?.className).toContain("[@media(hover:none)]:min-h-11");
     // open 不展示原始 a11y dump。
     expect(container.textContent).not.toContain("huge a11y tree");
   });
@@ -752,7 +762,7 @@ describe("4 个新专属卡", () => {
   });
 });
 
-describe("BrowserCliCard 复合命令 + 失败原因", () => {
+describe("浏览器卡(OCV5-374) 复合命令 + 失败原因", () => {
   // 官方 Playwright CLI 成功输出形状(open 后的 markdown)。
   const PLAYWRIGHT_OK = [
     "### Ran Playwright code",
@@ -772,7 +782,7 @@ describe("BrowserCliCard 复合命令 + 失败原因", () => {
     "Run oc-browser open to start the browser session.",
   ].join("\n");
 
-  test("open && snapshot 复合命令 → 动作序列标题 + 快照折叠", () => {
+  test("open && snapshot 复合命令 → 动作序列 + 快照折叠", () => {
     const { container } = render(
       <div>
         {researchToolCard(
@@ -781,8 +791,10 @@ describe("BrowserCliCard 复合命令 + 失败原因", () => {
         )}
       </div>,
     );
-    expect(screen.getByText("打开网页 · 页面快照")).toBeInTheDocument();
-    expect(container.querySelector('a[href="https://example.com"]')).not.toBeNull();
+    const trail = screen.getByTestId("browser-actions");
+    expect([...trail.querySelectorAll("li")].map((li) => li.textContent)).toEqual(["打开网页", "读取页面"]);
+    // 地址栏用输出里的最终 Page URL(带尾斜杠),不是命令里写的地址。
+    expect(container.querySelector('a[href="https://example.com/"]')).not.toBeNull();
     // 任一 verb 为 snapshot → 快照折叠区可见。
     expect(screen.getByText("查看页面快照")).toBeInTheDocument();
   });

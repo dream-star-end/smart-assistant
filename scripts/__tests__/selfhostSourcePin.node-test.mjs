@@ -52,7 +52,7 @@ test('production static gate rejects legacy mixed source and wrong pinned candid
 });
 test('actual cmd_deploy passes captured A through lease master runtime payload expected after HEAD B',t=>{
  const f=fixture(t);f.git('checkout','-q',f.A);writeFileSync(join(f.dir,'env'),'');symlinkSync(f.repo,join(f.dir,'live'));
- const source=[fn(d,'cmd_deploy'),expected(),fn(m,'build_master_release'),fn(d,'build_platform_bundle').replace('build_platform_bundle()','production_platform_bundle()')].join('\n');
+ const source=[fn(d,'cmd_deploy'),fn(d,'start_runtime_release_bg'),fn(d,'collect_runtime_release_bg'),expected(),fn(m,'build_master_release'),fn(d,'build_platform_bundle').replace('build_platform_bundle()','production_platform_bundle()')].join('\n');
  const body=[platformStubs,'DRY=1; ALLOW_DIRTY=0; PLATFORM_FROM_HEAD=1','V5_ENV="$TEST_ROOT/env"; MASTER_LIVE_LINK="$TEST_ROOT/live"; MASTER_RELEASES_ROOT="$TEST_ROOT/releases"',
  'preflight_common() { :; }; explain_dirty_semantics() { :; }; ensure_selfhost_env_keys() { :; }',
  'docker() { :; }; ensure_node_modules() { :; }; install_aux_units() { :; }; refresh_ccb_proxy_path() { :; }; ensure_model_authority() { :; }',

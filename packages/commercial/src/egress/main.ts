@@ -66,7 +66,13 @@ import { createBoxReplayReader, createBoxReplayRecoveryWriter,
 import { findCompletedBoxReplay } from "../http/proxy/boxReplayCompleted.js";
 import { observeBoxToolUnknown } from "../http/proxy/boxToolUnknownObserver.js";
 import { observeBoxTextUnknown } from "../http/proxy/boxTextUnknownObserver.js";
-import { createProductionBoxAccountResolver } from "../http/proxy/boxAccountResolver.js";
+import { createProductionBoxAccountResolver, productionBoxProfileHealth } from "../http/proxy/boxAccountResolver.js";
+import { listBoxProfiles } from "../http/proxy/boxClaudeProfileStore.js";
+import { BoxInteractiveLogins } from "../http/proxy/boxInteractiveLogins.js";
+import { boxInteractiveMasterRoute, isBoxInteractiveMasterPath, makeBoxLoginHandler } from "../http/proxy/boxLoginHandler.js";
+import { BOX_API_RESOLVE_MODEL } from "../http/proxy/boxApiResolveModel.js";
+import { boxExecTargetEntitlement } from "../cursor/access.js";
+import { getAccount } from "../account-pool/store.js";
 import { BoxUserStopCoordinator } from "../http/proxy/boxUserStopCoordinator.js";
 import { BoxCliVersionGate, gateBoxLaunchResolver } from "../http/proxy/boxCliVersion.js";
 import { makeBoxUserStopHandler } from "../http/proxy/boxUserStopHandler.js";
@@ -458,6 +464,39 @@ export async function startEgress(): Promise<void> {
     coordinator: boxStopCoordinator });
   const boxIdleProofHandler = makeBoxIdleProofHandler({ identity: identityStrategy,
     journal: boxStopJournal, readCapsule: boxReplayReader });
+  // Which Box login an interactive session (box-claude-*) launches under, and what its turns
+  // reported: the admin's selection plus the login health this process shares with the Box
+  // model route. Independent of OC_BOX_MODEL_API: interactive sessions exist without that route.
+  // OCV5-380: built only where OC_BOX_INTERACTIVE_MASTER=1 (selfhost); elsewhere all three paths 404.
+  const boxLoginHandler = boxInteractiveMasterRoute(process.env, () => makeBoxLoginHandler({ identity: identityStrategy,
+    logins: new BoxInteractiveLogins({
+      accountActive: async (id) => {
+        const row = await getAccount(id);
+        return row?.provider === "cursor" && row.status === "active";
+      },
+      list: (ids) => listBoxProfiles(ids),
+      health: productionBoxProfileHealth(),
+    }),
+    // The Box exec endpoint for an interactive session, from the account's own credential and egress
+    // (the model route's resolver), for a uid entitled to the owner's Cursor accounts. No Sand relay.
+    execTargets: async (uid) => {
+      const entitlement = boxExecTargetEntitlement(uid);
+      if (entitlement !== "entitled") return { kind: entitlement };
+      const abort = new AbortController();
+      const timer = setTimeout(() => abort.abort(), 60_000);
+      try {
+        const target = await boxStopResolver.resolve({ uid, sessionId: null, requestId: `box-exec-target-${uid}`,
+          upstreamModel: BOX_API_RESOLVE_MODEL, signal: abort.signal, allowWakeIfHibernated: true,
+          interactiveExecTarget: true });
+        try {
+          if (!target.execTarget) return { kind: "unavailable" };
+          return { kind: "target", accountId: target.accountId, ...target.execTarget };
+        } finally { await target.dispose?.(); }
+      } catch (err) {
+        log.warn("box_exec_target_unavailable", { code: (err as { code?: string }).code ?? "unknown" });
+        return { kind: "unavailable" };
+      } finally { clearTimeout(timer); }
+    } }));
   const boxStopCleanupTimer = setInterval(() => {
     void boxStopCoordinator.retryFailedLocal().catch(() =>
       log.error("box_stop_local_cleanup_failed"));
@@ -594,6 +633,19 @@ export async function startEgress(): Promise<void> {
           res.statusCode = 503;
           res.setHeader("Content-Type", "application/json");
           res.end(JSON.stringify({ status: "pending", reason: "unavailable" }));
+        } else try { res.destroy(); } catch { /* */ }
+      });
+      return;
+    }
+    if (isBoxInteractiveMasterPath(path)) {
+      Promise.resolve(boxLoginHandler(req, res, {
+        hostUuid: selfHostUuid, boundIp: peerIp,
+      })).catch((err) => {
+        log.error("box_login_handler_threw", { err: (err as Error).message });
+        if (!res.headersSent && !res.destroyed) {
+          res.statusCode = 503;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ error: "BOX_LOGIN_STORE_UNAVAILABLE" }));
         } else try { res.destroy(); } catch { /* */ }
       });
       return;

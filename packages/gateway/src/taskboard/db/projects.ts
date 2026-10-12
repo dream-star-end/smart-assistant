@@ -76,9 +76,9 @@ export interface UpdateProjectInput {
   archivedAt?: number | null
 }
 
-export function createProject(db: TaskboardDb, input: CreateProjectInput): Project {
+export function createProject(db: TaskboardDb, input: CreateProjectInput & { id?: string }): Project {
   const now = nowMs()
-  const id = newId()
+  const id = input.id ?? newId()
   const key = normalizeProjectKey(input.key)
   db.prepare(
     `INSERT INTO tb_project (

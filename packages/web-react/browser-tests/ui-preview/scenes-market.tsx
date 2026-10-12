@@ -7,7 +7,7 @@
  *
  * 只读预览:所有写操作(安装/卸载/审核/发布)返回中性成功值,不改变场景数据。
  */
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { MarketplaceCenter } from '../../src/components/MarketplaceCenter'
 import { DetailModal } from '../../src/components/marketplace/DetailModal'
 import { FeaturedPanel } from '../../src/components/marketplace/FeaturedPanel'
@@ -1293,17 +1293,18 @@ function Market({
   kind?: 'skill' | 'agent' | 'connector'
   isAdmin?: boolean
 }) {
+  const [activeTab, setActiveTab] = useState(tab)
   return (
     <MarketplaceCenter
       open
-      tab={tab}
+      tab={activeTab}
       auth={auth}
       isAdmin={isAdmin}
       initialBrowseKind={kind}
       onCreateInChat={() => {}}
       onAskAiInChat={() => {}}
       onOpenConnectors={() => {}}
-      onTabChange={() => {}}
+      onTabChange={setActiveTab}
       onClose={() => {}}
     />
   )
@@ -1472,6 +1473,24 @@ export const marketScenes: Scene[] = [
   },
 
   // —— 发布 ——
+  {
+    id: 'market-publish-long-skills',
+    label: '发布 · 317 个技能与长说明（生产形态回归）',
+    group: '市场',
+    viewports: ['desktop', 'mobile'],
+    api: {
+      ...publishApi([]),
+      listSkills: ok(Array.from({ length: 317 }, (_, i) => ({
+        name: i === 316 ? 'target-import-skill' : `skill-${i}-${'long-identifier-'.repeat(8)}`,
+        description: '用于审查真实业务中的复杂技能。必须核对上下文、权限、恢复与计费边界。'.repeat(8) + 'UNBROKENTEXT'.repeat(30),
+        writable: true,
+        tags: ['办公', '回归'],
+      }))),
+      getSkill: ok({ body: '# 长列表导入正文', files: [] }),
+      getSkillEvals: ok(null),
+    },
+    render: () => <Market tab="publish" />,
+  },
   {
     id: 'market-publish',
     label: '发布 · 技能表单（尚无发布记录）',

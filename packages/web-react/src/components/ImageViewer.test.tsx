@@ -147,6 +147,28 @@ describe('ImageViewer 全屏查看器', () => {
     expect(screen.queryByRole('heading', { name: '调整大小' })).not.toBeInTheDocument()
   })
 
+  test('提示的 1.8s 定时器:新提示取代旧的,卸载时清掉,不在组件拆除后回写(OCV5-373)', () => {
+    const setSpy = vi.spyOn(window, 'setTimeout')
+    const clearSpy = vi.spyOn(window, 'clearTimeout')
+    const noticeTimers = () =>
+      setSpy.mock.calls.flatMap((call, i) =>
+        call[1] === 1800 ? [setSpy.mock.results[i]?.value] : [],
+      )
+    const cleared = () => clearSpy.mock.calls.map((call) => call[0])
+    const { unmount } = render(<Harness />)
+    fireEvent.click(screen.getByRole('button', { name: '评论' }))
+    fireEvent.click(screen.getByRole('button', { name: '调整大小' }))
+    expect(screen.getByText('当前模型不支持调整大小')).toBeInTheDocument()
+    const [first, second] = noticeTimers()
+    expect(noticeTimers()).toHaveLength(2)
+    // 旧提示的定时器作废,否则它会提前收掉新提示。
+    expect(cleared()).toContain(first)
+    expect(cleared()).not.toContain(second)
+    unmount()
+    // 卸载后不留定时器:全量测试里它曾在 jsdom 拆除后触发 setState → window is not defined。
+    expect(cleared()).toContain(second)
+  })
+
   test('只读外链查看器保留 no-referrer 且不暴露写交互', () => {
     render(
       <Harness

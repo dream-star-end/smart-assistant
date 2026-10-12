@@ -1,20 +1,23 @@
 /** Direct timeline cards: process cursor, deferred exact record, runtime event. */
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
 import { messageSignature } from "../../lib/chat/render";
 import { MessageRenderer } from "../MessageRenderer";
 import type { CardCallbacks } from "./cards";
 import { ResponseRatingProvider } from "./ResponseRating";
+import { loadBeforeAll } from "../../test/moduleLoad";
+import { preloadToolBody } from "../tool/lazyToolBody";
+
+// 渲染工具卡展开体的断言要等懒加载的 tool bodies;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(preloadToolBody);
 
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
-beforeAll(async () => {
-  await import("../MarkdownImpl");
-});
+loadBeforeAll(() => import("../MarkdownImpl"));
 
 function renderMsg(message: ChatMessage, cb: CardCallbacks = {}) {
   return render(
@@ -203,7 +206,8 @@ describe("deferred oversized immutable record", () => {
     );
     expect(await screen.findByText("真实完整最终回答")).toBeInTheDocument();
     expect(screen.getByLabelText("消耗 1234 积分")).toBeInTheDocument();
-    expect(screen.getByText("这条回复怎么样?")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "点赞" })).toBeInTheDocument();
+    expect(screen.queryByText("这条回复怎么样?")).toBeNull();
 
     const waived = { ...locator, usage: { costCredits: "1234", waived: true } };
     view.rerender(

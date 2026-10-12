@@ -87,6 +87,7 @@ import {
 } from './askUserClient.js'
 import { type ReminderJobView, formatReminderList } from './reminderFormat.js'
 import { rejectClientAssignedResumeIds, resolveReminderResume } from './reminderResume.js'
+import { handleProjectSearch, shouldListProjectSearch } from './projectFileSearch.js'
 import { filterSkillEvalTools, isSkillEvalBlockedTool } from './skillEvalToolPolicy.js'
 // Tool 定义(TOOLS / SKILL_PROPOSE_TOOL)抽到 ./toolDefs.ts(纯数据模块,无副作用),
 // 让「TOOLS ↔ toolNames.ts」锁步单测能直接 import 校验,而不触发本入口模块顶层的
@@ -226,6 +227,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   if (!shouldListPresentTaskApproval(DELEGATION_DEPTH)) {
     base = base.filter((t) => t.name !== 'present_task_approval')
   }
+  // P5a: project_search only when OC_P5_PROJECT_SEARCH + OC_PROJECT_CONTEXT are on.
+  if (!shouldListProjectSearch()) {
+    base = base.filter((t) => t.name !== 'project_search')
+  }
   base = filterListedDelegateTools(base, ENGINE_ID)
   return { tools: filterSkillEvalTools(base, SKILL_EVAL_MODE) }
 })
@@ -293,6 +298,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleTaskGet(args as any)
       case 'task_approve':
         return await handleTaskApprove(args as any)
+      case 'project_search':
+        return await handleProjectSearch(args as any)
       case 'ask_user':
         return await handleAskUser(args as any)
       case 'present_options': {

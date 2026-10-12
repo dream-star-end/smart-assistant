@@ -20,6 +20,7 @@ import { isBoxApiModel } from '@openclaude/protocol'
 import { EventEmitter } from 'node:events'
 import { TURN_LEASE_RENEW_AFTER_MS, type GoalStateSnapshot, type JobTerminal } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
+import type { IntelligentUiApplied } from '../promptSlots.js'
 import { CcbMessageParser, type TurnResult } from '../ccbMessageParser.js'
 import { CREDIT_EXHAUSTED_DETAIL, CreditBudgetGuard } from '../creditExhaustion.js'
 import type { ExecutionTarget } from '../remoteTarget.js'
@@ -856,6 +857,11 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
 
   get effortLevel(): string | undefined {
     return this.runner.effortLevel
+  }
+
+  /** Intelligent UI(OCV5-361):spawn 时系统提示是否含组件协议(sessionManager 判断开关切换是否需重启)。 */
+  get promptIntelligentUi(): IntelligentUiApplied | undefined {
+    return (this.runner as { promptIntelligentUi?: IntelligentUiApplied }).promptIntelligentUi
   }
 
   setTraceId(traceId: string | undefined): void {

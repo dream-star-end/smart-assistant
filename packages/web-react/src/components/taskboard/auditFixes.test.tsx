@@ -5,7 +5,7 @@
 import '@testing-library/jest-dom/vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import type { ComponentProps, ReactNode } from 'react'
-import { afterEach, beforeAll, describe, expect, test, vi } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { ProjectScopeProvider } from '../../hooks/useProjectScope'
 import { api } from '../../lib/api'
 import { createMemoryAuthSession } from '../../lib/authSession'
@@ -30,6 +30,7 @@ import { TicketCard } from './TicketCard'
 import { TicketDrawer } from './TicketDrawer'
 import { LIST_QUERY_DEBOUNCE_MS, TicketListView, countActiveFilters } from './TicketListView'
 import { WeeklyReportView } from './WeeklyReportView'
+import { loadBeforeAll } from '../../test/moduleLoad'
 
 afterEach(() => {
   cleanup()
@@ -40,9 +41,7 @@ afterEach(() => {
   history.replaceState({}, '', '/')
 })
 
-beforeAll(async () => {
-  await import('../MarkdownImpl')
-})
+loadBeforeAll(() => import('../MarkdownImpl'))
 
 const auth = createMemoryAuthSession(() => {}, 'tok-audit')
 

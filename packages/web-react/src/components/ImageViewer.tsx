@@ -307,10 +307,23 @@ export function ImageViewer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, initialMode])
 
+  // 提示定时器只留一个:新提示作废旧的,卸载时清掉。漏清的定时器会在组件(测试里是整个
+  // jsdom)拆除后回写 state(OCV5-373)。
+  const noticeTimerRef = useRef<number | null>(null)
   const flash = useCallback((text: string) => {
     setNotice(text)
-    window.setTimeout(() => setNotice((cur) => (cur === text ? null : cur)), 1800)
+    if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current)
+    noticeTimerRef.current = window.setTimeout(() => {
+      noticeTimerRef.current = null
+      setNotice((cur) => (cur === text ? null : cur))
+    }, 1800)
   }, [])
+  useEffect(
+    () => () => {
+      if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current)
+    },
+    [],
+  )
 
   // pending 只消费同一 generation 的原图 Blob。首帧 idle / loading 都复用 Viewer 已启动的
   // fetch；关闭、换图、旧请求迟到一律因 key/open 不匹配被清掉,不产生下载。

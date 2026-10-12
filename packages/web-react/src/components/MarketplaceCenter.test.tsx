@@ -5,6 +5,11 @@ import type { AuthSession, MarketplaceMyPublish } from "../lib/types";
 import { createMemoryAuthSession } from "../lib/authSession";
 import { expectAriaControlsResolvable } from "../test/ariaControls";
 import { ToastProvider } from "./ui";
+import { prefetchMarkdownImpl } from "./Markdown";
+import { loadBeforeAll } from "../test/moduleLoad";
+
+// 断言渲染后的 Markdown 正文要等懒加载的 MarkdownImpl;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(prefetchMarkdownImpl);
 
 const monitor = vi.hoisted(() => ({
   emit: null as null | ((transition: { previousStatus: "pending"; publish: MarketplaceMyPublish }) => void),
@@ -154,7 +159,7 @@ test("目录 revision 变化会刷新跨客户端市场和发布状态", () => {
   // tab ↔ 面板的 aria 关联(读屏能从 tab 跳到对应面板)
   expect(screen.getByRole("tabpanel")).toHaveAttribute("aria-labelledby", "marketplace-tab-browse");
   expect(screen.getByRole("heading", { name: "AI 市场" }).parentElement).toHaveClass("min-w-0");
-  expect(screen.getByRole("dialog")).toHaveClass("oc-center-dialog", "h-[min(85vh,46rem)]", "h-[min(85dvh,46rem)]");
+  expect(screen.getByRole("dialog")).toHaveClass("oc-center-dialog", "marketplace-window");
   expect(screen.getByRole("dialog")).not.toHaveClass("top-1/2");
 });
 
@@ -179,7 +184,7 @@ test("连接器旧 kind 在产品层显示为插件；通过通知 CTA 实时刷
   expect(screen.getByTestId("browse-props")).toHaveTextContent("skill|0|none");
 
   act(() => monitor.emit?.({ previousStatus: "pending", publish: publish("approved") }));
-  expect(screen.getByText("API 连接插件已实时上架")).toBeInTheDocument();
+  expect(screen.getByText("插件已实时上架")).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "在市场查看" }));
 
   expect(onTabChange).toHaveBeenCalledWith("browse");
@@ -202,7 +207,7 @@ test("拒绝通知如实展示理由，并可进入我的发布", () => {
   );
 
   act(() => monitor.emit?.({ previousStatus: "pending", publish: publish("rejected") }));
-  expect(screen.getByText("API 连接插件未通过审核")).toBeInTheDocument();
+  expect(screen.getByText("插件未通过审核")).toBeInTheDocument();
   expect(screen.getByText(/固定域名声明不完整/)).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "查看我的发布" }));
   expect(onTabChange).toHaveBeenCalledWith("publish");
@@ -299,6 +304,6 @@ test("发布通知:留在滚动区外、多条时给剩余计数、可逐条关�
   expect(screen.getByRole("tabpanel")).not.toContainElement(remaining);
 
   fireEvent.click(screen.getByRole("button", { name: "关闭提示" }));
-  expect(screen.getByText("API 连接插件未通过审核")).toBeInTheDocument();
+  expect(screen.getByText("插件未通过审核")).toBeInTheDocument();
   expect(screen.queryByText("还有 1 条")).not.toBeInTheDocument();
 });

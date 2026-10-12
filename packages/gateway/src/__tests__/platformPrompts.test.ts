@@ -388,6 +388,22 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     assert.ok(prompt.includes('present_task_approval'))
     assert.ok(prompt.includes('不要让用户去打开任务面板'))
   })
+  it('htmlpreview 无缝嵌入的写法(主题变量、套件类、CDN、文件桥)覆盖常驻 prompt、四份基线与平台 skill', () => {
+    const sources = {
+      prompt: _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK,
+      agents: readFileSync('packages/commercial/agent-sandbox/ccb-baseline/AGENTS.md', 'utf8'),
+      agentsAdmin: readFileSync('packages/commercial/agent-sandbox/ccb-baseline/AGENTS.admin.md', 'utf8'),
+      skill: readFileSync('packages/commercial/agent-sandbox/ccb-baseline/skills/platform-capabilities/SKILL.md', 'utf8'),
+      codex: readFileSync('packages/commercial/agent-sandbox/platform-runtime/prompts/codex-preamble.md', 'utf8'),
+    }
+    for (const [name, source] of Object.entries(sources)) {
+      for (const needle of ['var(--oc-fg)', '.oc-pills', 'cdn.jsdelivr.net', 'data-oc-src', 'ocFile(', 'data-oc-download']) {
+        assert.ok(source.includes(needle), `${name} 缺无缝嵌入写法: ${needle}`)
+      }
+    }
+    // 技能模板不再写死深色底板(无缝嵌入后会变成一块突兀的色块)。
+    assert.ok(!sources.skill.includes('background: #0f172a'))
+  })
   it('原生容器网站预览 SOP 覆盖常驻 prompt、Codex 基线与平台 skill', () => {
     const sources = {
       prompt: _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK,

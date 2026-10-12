@@ -110,6 +110,9 @@ const MIGRATION_0240 = path.resolve(here, "../db/migrations/0240_client_session_
 const MIGRATION_0241 = path.resolve(here, "../db/migrations/0241_raise_last_read_watermark.sql");
 const MIGRATION_0243 = path.resolve(here, "../db/migrations/0243_live_unit_checkpoints.sql");
 const MIGRATION_0246_CHAT_PROJECT = path.resolve(here, "../db/migrations/0246_chat_project_board_bind.sql");
+const MIGRATION_0237_PROJECT_ASSETS = path.resolve(here, "../db/migrations/0237_project_assets.sql");
+// OCV5-380 (selfhost P2): archive / pin / template / delete manifest on chat_projects.
+const MIGRATION_0302_CHAT_PROJECT_WORKSPACE = path.resolve(here, "../db/migrations/0302_chat_project_workspace.sql");
 
 let pool: Pool;
 let backend: PgSessionsBackend;
@@ -255,6 +258,9 @@ before(async () => {
   await pool.query(await readFile(MIGRATION_0241, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0243, { encoding: "utf8" }));
   await pool.query(await readFile(MIGRATION_0246_CHAT_PROJECT, { encoding: "utf8" }));
+  // OCV5-380: deleting a project also unlinks its assets (restorable for 30 days), so the suite needs them.
+  await pool.query(await readFile(MIGRATION_0237_PROJECT_ASSETS, { encoding: "utf8" }));
+  await pool.query(await readFile(MIGRATION_0302_CHAT_PROJECT_WORKSPACE, { encoding: "utf8" }));
   await pool.query(`
     CREATE TABLE agent_containers (
       id BIGSERIAL PRIMARY KEY,

@@ -56,7 +56,7 @@ function missingTable(error: unknown): boolean {
   return (error as { code?: unknown } | null)?.code === "42P01";
 }
 
-/** False in an edition/database without the 0299 table (the personal edition ships no commercial migrations). */
+/** False in a database without the table (commercial migration 0299, personal 0303), e.g. before the migration ran. */
 export async function boxProfilesAvailable(): Promise<boolean> {
   const r = await query<{ t: string | null }>("SELECT to_regclass('public.box_claude_profiles')::text AS t");
   return r.rows[0]?.t !== null && r.rows[0]?.t !== undefined;

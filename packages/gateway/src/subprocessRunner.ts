@@ -1,5 +1,9 @@
 import { BOX_API_MODELS, isBoxApiModel } from '@openclaude/protocol'
-import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
+import {
+  identityCompatEnvironment,
+  isProjectSearchEnabled,
+  type IdentityCompatRuntimeContext,
+} from '@openclaude/storage'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
@@ -31,7 +35,7 @@ import { decideEngineCwd, resolveDesktopWorkspaceDir } from './engineCwd.js'
 import { relocateCcbJsonlToCwd } from './engine/ccbTranscriptRelocate.js'
 import { persistRunContextSnapshot } from './runContextPersist.js'
 import { projectCcbMcpAvailability } from './ccbMcpAvailability.js'
-import { buildPromptContext } from './promptSlots.js'
+import { buildPromptContext, type IntelligentUiApplied } from './promptSlots.js'
 import { resolveMcpMemoryLaunch } from './mcpMemoryEntry.js'
 import type { ExecutionTarget } from './remoteTarget.js'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
@@ -916,6 +920,9 @@ export interface SubprocessRunnerOpts {
     /** 0257 — `session` slots carry a Cursor account session token (Sand-only). */
     credentialKind: 'api_key' | 'session'
     machineId: string | null
+    /** OCV5-378: an interactive Box session (box-claude-*) whose Box comes from the master; minted by the
+     * gateway (masterBoxCredentialSelection), names no key or account, carries no credential. */
+    masterBox?: true
   }
   /** Agent-loop implementation. Omitted follows `resolveCcbHarness` (CCB
    * unless `OC_CCB_OFFICIAL_CC=1`). Official-cc is either Cursor Sand
@@ -1464,6 +1471,9 @@ export class SubprocessRunner extends EventEmitter {
   /** Stable path inherited by MCP + Bash; contents are re-minted every turn. */
   private delegateContextFile: string | null = null
   private platformGoal: GoalStateSnapshot | null = null
+  /** Intelligent UI(OCV5-361):本次 spawn 的 extra-prompt 里 INTELLIGENT_UI 段的指纹(没有 = false)。
+   *  undefined = 还没组装过 / 组装失败;sessionManager 用它判断开关切换后是否需要重启。 */
+  private _promptIntelligentUi: IntelligentUiApplied | undefined = undefined
   /** Exact stock-CLI abort result observed for the current process. Official
    * Claude Code exits 1 after emitting it; that is an expected recycle, not a
    * process crash. Reset on every spawn. */
@@ -1523,6 +1533,10 @@ export class SubprocessRunner extends EventEmitter {
    *  before deciding whether to recycle the subprocess). */
   get effortLevel(): string | undefined {
     return this.opts.effortLevel
+  }
+
+  get promptIntelligentUi(): IntelligentUiApplied | undefined {
+    return this._promptIntelligentUi
   }
 
   /** Update effort level. Caller is responsible for restarting the subprocess
@@ -2676,6 +2690,7 @@ export class SubprocessRunner extends EventEmitter {
       mcpLaunch,
       skillEvalMode: this.opts.skillEvalMode,
       skillTrainRunId: this.opts.skillTrainRunId,
+      projectSearchEnabled: isProjectSearchEnabled(process.env),
     })
 
     // (Marketplace skills/agents are reconciled deterministically in
@@ -2684,6 +2699,7 @@ export class SubprocessRunner extends EventEmitter {
     //  a background sync on startup. All call the same idempotent reconcile.)
 
     // Build merged extra system prompt via structured prompt slots
+    this._promptIntelligentUi = undefined
     try {
       const promptResult = await buildPromptContext({
         agentId: this.opts.agentId,
@@ -2721,6 +2737,7 @@ export class SubprocessRunner extends EventEmitter {
         cwdSource: cwdDecision.source,
         sessionRepoOverlay: cwdDecision.sessionRepoOverlay,
       })
+      this._promptIntelligentUi = promptResult.intelligentUi ?? false
       const goalPrompt = renderCcbGoalPrompt(this.platformGoal)
       const mergedPrompt = [promptResult.content, goalPrompt].filter(Boolean).join('\n\n')
       if (mergedPrompt) {
@@ -2799,6 +2816,11 @@ export class SubprocessRunner extends EventEmitter {
           OC_AGENT_ID: this.opts.agentId,
           ...identityCompatEnvironment(this.opts.identityCompat),
             ...(this.opts.projectId ? { OPENCLAUDE_PROJECT_ID: this.opts.projectId } : {}),
+            // P5a: project_search is listed only when both flags are on; pass them
+            // explicitly so the MCP list matches the prompt's tool projection.
+            ...(isProjectSearchEnabled(process.env)
+              ? { OC_PROJECT_CONTEXT: '1', OC_P5_PROJECT_SEARCH: '1' }
+              : {}),
             // 2026-04-22: 只在 host 进程里确实 set 了 OPENCLAUDE_HOME 时才向下传 —— 空串
             // 会被 mcp-memory 的 paths.ts 当成"有值",与 `??` 语义冲突,让所有 memory/skill
             // 路径退化为相对 cwd 的路径,跨容器串。v3 容器由 entrypoint.ts 显式注入

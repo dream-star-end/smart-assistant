@@ -54,7 +54,7 @@ import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { mkdir as fsMkdir, chown as fsChown, chmod as fsChmod } from "node:fs/promises";
 import { basename as pathBasename, isAbsolute as pathIsAbsolute, join as pathJoin, normalize as pathNormalize } from "node:path";
 import type { Pool, PoolClient } from "pg";
-import { OPENCLAUDE_CONTAINER_GATEWAY_PORT } from "@openclaude/protocol";
+import { OPENCLAUDE_CONTAINER_GATEWAY_PORT, serverFeatureContainerEnv } from "@openclaude/protocol";
 import type { ContainerService, ContainerSpec } from "../compute-pool/containerService.js";
 import {
   RUNTIME_CHANNEL_LABEL_KEY,
@@ -584,6 +584,9 @@ export const DELEGATE_KNOB_CONTAINER_ENV_KEYS = [
   "OC_DELEGATE_CURSOR_MCP_WAIT",
   "OC_CURSOR_SAND_OFFICIAL_CC",
   "OC_CURSOR_SAND_BOX_CC",
+  // OCV5-380: box-claude-* needs the master's interactive route too (cursorBoxCcEnabled). Forwarded
+  // only when set; commercial never sets it, so commercial containers keep their env unchanged.
+  "OC_BOX_INTERACTIVE_MASTER",
   "OC_CCB_OFFICIAL_CC",
 ] as const;
 
@@ -2874,6 +2877,12 @@ export async function provisionV3Container(
     if (process.env.OC_PROJECT_CONTEXT === "1") {
       env.push("OC_PROJECT_CONTEXT=1");
     }
+    // P5a project_search tool + adaptive pinned-files budget. Same selective
+    // injection: unset → container keeps today's PROJECT slot and lists no tool.
+    // The container only honours it while OC_PROJECT_CONTEXT is on.
+    if (["1", "true", "yes", "on"].includes((process.env.OC_P5_PROJECT_SEARCH ?? "").trim().toLowerCase())) {
+      env.push("OC_P5_PROJECT_SEARCH=1");
+    }
     // R3.0 research workspace (课题): flag is judged on both sides — master
     // (workspaceFlag.ts) and the container CLIs (ocResearchClient.ts read
     // process.env). Without this line the container never sees the flag and
@@ -2883,6 +2892,10 @@ export async function provisionV3Container(
     if (process.env.OC_RESEARCH_WORKSPACE === "1") {
       env.push("OC_RESEARCH_WORKSPACE=1");
     }
+    // P5 web-UI flags (OC_P5_CHIPS, OC_P5_RECIPE_SCHEDULE, OC_P5_UNFILED_SUGGEST):
+    // same selective injection, master accepts 1/true/yes/on and forwards =1.
+    // The container serves them to the browser at GET /api/features.
+    env.push(...serverFeatureContainerEnv(process.env));
     for (const key of [
       "OC_LOCAL_OBSERVABILITY_RETENTION",
       "OC_LOCAL_EVENT_RETENTION_DAYS",

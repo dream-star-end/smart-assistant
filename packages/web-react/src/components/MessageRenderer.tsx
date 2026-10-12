@@ -1009,6 +1009,32 @@ function discloseProcess(items: LeafRenderItem[], messages: ChatMessage[], final
   return out;
 }
 
+/**
+ * OCV5-367: where a process shell's step timings start and end. The row just
+ * before the shell (the user's message, or a mid-turn reply) ends where the
+ * first step's clock starts; the row just after it (the answer) starts where a
+ * last step with no recorded end stops. A following user row is a new turn and
+ * never closes this one.
+ */
+function processTimeBounds(
+  items: readonly RenderItem[],
+  process: RenderItem,
+): { startedAt: number | null; endedAt: number | null } {
+  const index = items.indexOf(process);
+  const time = (value: unknown) =>
+    typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+  const before = index > 0 ? itemRows(items[index - 1]!).at(-1) : undefined;
+  const after = index >= 0 && index + 1 < items.length ? itemRows(items[index + 1]!)[0] : undefined;
+  return {
+    startedAt: before && !before._liveUnit ? time(before.completedAt) ?? time(before.ts) : null,
+    endedAt: after && after.role !== "user" && !after._liveUnit ? time(after.ts) : null,
+  };
+}
+
+function itemRows(item: RenderItem): ChatMessage[] {
+  return item.kind === "process" ? item.members : itemMessages(item);
+}
+
 function tapeRenderPageKey(message: ChatMessage | undefined): string {
   if (!message) return "";
   if (message._historyPageKey) return message._historyPageKey;
@@ -2630,6 +2656,7 @@ export function MessageList({
       // closed once it has finished. A click stores true or false and is not
       // reset when tokens arrive or the turn completes.
       const open = sections.some(sectionHit) || (explicit === undefined ? it.active : explicit);
+      const bounds = processTimeBounds(renderItems, it);
       return (
         <ProcessDisclosure
           sections={sections}
@@ -2649,6 +2676,8 @@ export function MessageList({
           olderSteps={olderLiveStepsKey === it.key ? olderLiveStepsControl : null}
           startedAt={it.active ? turnActivity?.startedAt ?? null : null}
           lastFrameAt={it.active ? turnActivity?.lastFrameAt ?? null : null}
+          turnStartedAt={it.active ? turnActivity?.startedAt ?? bounds.startedAt : bounds.startedAt}
+          turnEndedAt={bounds.endedAt}
         />
       );
     }

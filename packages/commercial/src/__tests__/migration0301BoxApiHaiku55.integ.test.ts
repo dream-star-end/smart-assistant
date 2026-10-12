@@ -71,7 +71,8 @@ describe("0301 prepares Claude Haiku 5.5 on the commercial Box model route witho
     await resetAndMigrateBefore("0301");
     const before = await others();
     assert.equal((await query("SELECT 1 FROM model_catalog WHERE model_id=$1", [MODEL])).rowCount, 0);
-    assert.deepEqual((await runMigrations()).applied, ["0301_commercial_box_api_haiku_5_5"]);
+    // 0302 (chat_projects columns, OCV5-380) follows 0301 in the chain and touches no catalog row.
+    assert.deepEqual((await runMigrations()).applied, ["0301_commercial_box_api_haiku_5_5", "0302_chat_project_workspace"]);
     assert.deepEqual(await others(), before);
     assert.equal((await prepared()).state, "staged");
   });

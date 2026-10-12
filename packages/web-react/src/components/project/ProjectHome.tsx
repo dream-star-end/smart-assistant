@@ -1,0 +1,1194 @@
+import {
+  ArrowRight,
+  ArrowUp,
+  Brain,
+  CalendarDays,
+  ChevronRight,
+  Clock3,
+  Download,
+  FolderOpen,
+  Menu,
+  MessageSquare,
+  MoreHorizontal,
+  PanelLeft,
+  Pencil,
+  Pin,
+  Plus,
+  RotateCcw,
+  Search,
+  Settings2,
+  Sparkles,
+  SquareKanban,
+  Trash2,
+  Upload,
+  type LucideIcon,
+} from "lucide-react";
+import {
+  type KeyboardEvent,
+  type ReactNode,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import type { ProjectTab } from "../../hooks/useAppRoute";
+import { api } from "../../lib/api";
+import { formatBytes } from "../../lib/chat/download";
+import { useProjectAssets } from "../../hooks/useProjectAssets";
+import { useProjectScope } from "../../hooks/useProjectScope";
+import { PROJECT_COLORS } from "../../lib/projectColors";
+import type { AuthSession, ChatProject, ProjectAsset, Session } from "../../lib/types";
+import { cn } from "../../lib/utils";
+import { ProjectAssetsPanel } from "../ProjectAssetsPanel";
+import { useSignedDownload } from "../chat/media";
+import { ProjectFolderBrowser } from "./ProjectFolderBrowser";
+import { OutputRow, OutputViewer } from "./OutputViewer";
+import { ScheduledRecipeChips } from "./ScheduledRecipes";
+import {
+  Alert,
+  Badge,
+  Button,
+  Card,
+  Chip,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  EmptyState,
+  IconButton,
+  Input,
+  ListGroup,
+  Modal,
+  Skeleton,
+  Spinner,
+  Tabs,
+  TimeAgo,
+  useConfirm,
+  usePrompt,
+  useToast,
+} from "../ui";
+import {
+  OUTPUT_KIND_LABELS,
+  type OutputKind,
+  PROJECT_RECIPES,
+  filterSessionsByTitle,
+  outputKind,
+  outputsOf,
+  pinnedOf,
+  projectSessionsOf,
+  projectSummary,
+  type ActivityCron,
+  type ActivityItem,
+  type ActivityTicket,
+  mergeActivity,
+} from "./projectHomeModel";
+
+export type ProjectHomeProps = {
+  project: ChatProject;
+  tab: ProjectTab;
+  onTabChange: (tab: ProjectTab) => void;
+  /** App 的会话列表（全部）；主页自己按 projectId 过滤。 */
+  sessions: Session[];
+  demo: boolean;
+  auth: AuthSession | null;
+  authSession: AuthSession;
+  /** 在本项目开新会话并把 text 作为第一条消息发送。 */
+  onStart: (text: string) => void;
+  /** 在本项目开一个空白新会话（不发送）。 */
+  onNewSession: () => void;
+  onOpenSession: (sessionId: string) => void;
+  onOpenSettings: () => void;
+  onRename: () => void;
+  onDelete: () => void;
+  onOpenMobileNav: () => void;
+  /**
+   * 拉取已归档会话（与侧栏「已归档」展开同一个加载，幂等）。默认列表不含归档，
+   * 「会话」页签与产出的来源会话要用到它们。
+   */
+  onLoadArchived?: () => void;
+  loadingArchived?: boolean;
+  sidebarCollapsed?: boolean;
+  onExpandSidebar?: () => void;
+  /**
+   * 项目的看板/记忆/技能/定时任务在各自的页面里,按本项目的范围打开。
+   * onPrepareBoard 确保本项目的看板已在容器里建好(首次用时创建);成功后本组件把
+   * 项目范围切到这块看板,再由 onShowSurface 打开对应页面。不传则不显示入口。
+   */
+  onPrepareBoard?: () => Promise<boolean>;
+  onShowSurface?: (surface: ProjectSurface) => void;
+  /** P5c（OC_P5_RECIPE_SCHEDULE）：快捷开始旁出现「定时」快捷任务。需要看板入口（上面两个）。 */
+  recipeSchedule?: boolean;
+};
+
+export type ProjectSurface = "board" | "memory" | "skills" | "cron";
+/** 图标与管理中心 / 侧栏同一套（同一分区处处同一个图形）。hint 只在宽容器里显示。 */
+const SURFACES: Array<{ id: ProjectSurface; label: string; hint: string; icon: LucideIcon }> = [
+  { id: "board", label: "看板", hint: "任务与进度", icon: SquareKanban },
+  { id: "memory", label: "记忆", hint: "项目记住的事", icon: Brain },
+  { id: "skills", label: "技能", hint: "项目专用技能", icon: Sparkles },
+  { id: "cron", label: "定时任务", hint: "按时自动运行", icon: Clock3 },
+];
+
+const OVERVIEW_SESSION_LIMIT = 5;
+const OVERVIEW_OUTPUT_LIMIT = 6;
+
+/**
+ * 项目主页（`/p/<id>[/<tab>]`）：一个项目的所有东西在一处 —— 开始新会话、最近会话、
+ * 项目指令、常用文件、产出。只用已有接口（会话列表来自 App、资产来自 useProjectAssets）。
+ * App 懒加载本组件（首屏预算），demo 模式下资产为空、上传走本地。
+ */
+export function ProjectHome(props: ProjectHomeProps) {
+  const {
+    project,
+    tab,
+    onTabChange,
+    sessions,
+    demo,
+    auth,
+    authSession,
+    onStart,
+    onNewSession,
+    onOpenSession,
+    onOpenSettings,
+    onRename,
+    onDelete,
+    onOpenMobileNav,
+    onLoadArchived,
+    loadingArchived = false,
+    sidebarCollapsed,
+    onPrepareBoard,
+    onShowSurface,
+    onExpandSidebar,
+    recipeSchedule = false,
+  } = props;
+
+  const [confirmDialog, confirmEl] = useConfirm();
+  // 项目文件夹里「加入常用」后重挂文件面板，让它重拉列表。
+  const [filesPanelKey, setFilesPanelKey] = useState(0);
+  const [promptText, promptEl] = usePrompt();
+  const assetsState = useProjectAssets({
+    projectId: project.id,
+    demo,
+    auth,
+    authSession,
+    confirmDialog,
+    promptText,
+    // 「文件」页签由 ProjectAssetsPanel 自带一份；这里只为概览 / 产出拉。
+    enabled: tab !== "files",
+  });
+  const { assets, loading: assetsLoading, error: assetsError, reload: reloadAssets } = assetsState;
+  const assetsReady = !assetsLoading && !assetsError;
+
+  // 从「文件」页签回来时重拉：那边的上传 / 设为常用不经过本实例。
+  const prevTabRef = useRef(tab);
+  useEffect(() => {
+    if (prevTabRef.current === "files" && tab !== "files") reloadAssets();
+    prevTabRef.current = tab;
+  }, [tab, reloadAssets]);
+
+  const projectSessions = useMemo(
+    () => projectSessionsOf(sessions, project.id),
+    [sessions, project.id],
+  );
+  const allProjectSessions = useMemo(
+    () => projectSessionsOf(sessions, project.id, true),
+    [sessions, project.id],
+  );
+  const titleById = useMemo(
+    () => new Map(sessions.map((s) => [s.id, s.title || "新对话"])),
+    [sessions],
+  );
+  const outputs = useMemo(() => outputsOf(assets), [assets]);
+  // 产出查看器与版本历史挂在主页这一层：概览和产出页签共用，查看器里也能跳到版本历史。
+  const [viewing, setViewing] = useState<ProjectAsset | null>(null);
+  const [historyFor, setHistoryFor] = useState<ProjectAsset | null>(null);
+
+  // 「会话」页签要列全（含归档），产出要能找到来源会话：需要时触发已归档会话加载。
+  const outputsMissSource = outputs.some((a) => a.sessionId && !titleById.has(a.sessionId));
+  const needsArchived = tab === "chats" || outputsMissSource;
+  const loadArchivedRef = useRef(onLoadArchived);
+  loadArchivedRef.current = onLoadArchived;
+  useEffect(() => {
+    if (needsArchived) loadArchivedRef.current?.();
+  }, [needsArchived]);
+  const surfaces = useSurfaceOpener(project.boardProjectId, onPrepareBoard, onShowSurface);
+  const boardActivity = useProjectActivity(project.boardProjectId, authSession, !demo && tab === "overview");
+  const activity = useMemo(
+    () =>
+      mergeActivity({
+        sessions: projectSessions,
+        tickets: boardActivity.tickets,
+        cron: boardActivity.cron,
+        limit: OVERVIEW_SESSION_LIMIT,
+      }),
+    [projectSessions, boardActivity],
+  );
+  const pinned = useMemo(() => pinnedOf(assets), [assets]);
+  const lastSession = projectSessions[0];
+  const swatch = PROJECT_COLORS.find((c) => c.key === project.color);
+  const instructions = project.instructions?.trim() ?? "";
+
+  const summary = projectSummary({
+    hasInstructions: instructions.length > 0,
+    pinnedCount: assetsReady ? pinned.length : null,
+    sessionCount: projectSessions.length,
+  });
+
+  const tabItems = [
+    { value: "overview", label: "概览" },
+    {
+      value: "chats",
+      label: (
+        <>
+          会话
+          {projectSessions.length > 0 && (
+            <span className="ml-1 tabular-nums text-faint">{projectSessions.length}</span>
+          )}
+        </>
+      ),
+    },
+    { value: "files", label: "文件" },
+    {
+      value: "outputs",
+      label: (
+        <>
+          产出
+          {assetsReady && outputs.length > 0 && (
+            <span className="ml-1 tabular-nums text-faint">{outputs.length}</span>
+          )}
+        </>
+      ),
+    },
+  ];
+
+  return (
+    <div data-testid="project-home" className="flex h-full min-h-0 flex-col bg-bg">
+      {confirmEl}
+      {promptEl}
+      <header className="flex shrink-0 items-center gap-2 px-3 pb-2 header-safe-t md:h-14 md:px-4 md:pb-0">
+        <IconButton
+          onClick={onOpenMobileNav}
+          aria-label="打开菜单"
+          shape="square"
+          className="md:hidden"
+        >
+          <Menu size={18} />
+        </IconButton>
+        {sidebarCollapsed && onExpandSidebar && (
+          <IconButton
+            onClick={onExpandSidebar}
+            aria-label="展开侧栏"
+            shape="square"
+            className="hidden md:inline-flex"
+          >
+            <PanelLeft size={18} />
+          </IconButton>
+        )}
+        <span className="text-meta text-muted">项目</span>
+      </header>
+
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+        <div className="@container mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 pb-10 pt-1 md:px-5 md:pt-4">
+          {/* 标题行：颜色点 · 名称 · ⋯ */}
+          <div className="flex min-w-0 flex-col gap-1">
+            <div className="flex min-w-0 items-center gap-2">
+              {swatch ? (
+                <span aria-hidden className={cn("size-3 shrink-0 rounded-full", swatch.dotClass)} />
+              ) : (
+                <FolderOpen size={18} aria-hidden className="shrink-0 text-faint" />
+              )}
+              <h1 className="min-w-0 truncate text-title font-semibold md:text-xl">{project.name}</h1>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <IconButton aria-label={`项目 ${project.name} 更多`} size="sm" shape="square">
+                    <MoreHorizontal size={16} />
+                  </IconButton>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="w-44">
+                  <DropdownMenuItem onSelect={onOpenSettings}>
+                    <Settings2 size={14} className="shrink-0 text-muted" />
+                    项目设置
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={onRename}>
+                    <Pencil size={14} className="shrink-0 text-muted" />
+                    重命名
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem destructive onSelect={onDelete}>
+                    <Trash2 size={14} className="shrink-0" />
+                    删除
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
+            <p data-testid="project-home-summary" className="text-meta text-muted">
+              {summary}
+            </p>
+          </div>
+
+          <StartBox projectName={project.name} onStart={onStart} />
+
+          <div className="no-scrollbar -mx-4 flex gap-2 overflow-x-auto px-4 md:mx-0 md:flex-wrap md:px-0">
+            {PROJECT_RECIPES.map((r) => (
+              <Chip key={r.key} onClick={() => onStart(r.prompt)}>
+                {r.key === "progress" ? (
+                  <Sparkles size={13} aria-hidden />
+                ) : (
+                  <CalendarDays size={13} aria-hidden />
+                )}
+                {r.label}
+              </Chip>
+            ))}
+            {recipeSchedule && !demo && project.boardProjectId && onPrepareBoard && surfaces.open && (
+              <ScheduledRecipeChips
+                boardProjectId={project.boardProjectId}
+                authSession={authSession}
+                onPrepareBoard={onPrepareBoard}
+                onOpenCron={() => void surfaces.open?.("cron")}
+              />
+            )}
+            {lastSession && (
+              <Chip
+                onClick={() => onOpenSession(lastSession.id)}
+                title={lastSession.title || "新对话"}
+                className="max-w-[18rem]"
+              >
+                <RotateCcw size={13} aria-hidden />
+                <span className="min-w-0 truncate">继续上次：{lastSession.title || "新对话"}</span>
+              </Chip>
+            )}
+          </div>
+
+          {surfaces.open && <ProjectSurfaceLinks open={surfaces.open} opening={surfaces.opening} />}
+
+          <div className="flex min-w-0 items-center gap-2 border-b border-border pb-2">
+            <div className="min-w-0 flex-1">
+              <Tabs
+                aria-label="项目页签"
+                value={tab}
+                onValueChange={(v) => onTabChange(v as ProjectTab)}
+                items={tabItems}
+                idBase="project-home"
+              />
+            </div>
+            <Button variant="ghost" size="sm" onClick={onOpenSettings} className="shrink-0">
+              <Settings2 size={14} aria-hidden />
+              设置
+            </Button>
+          </div>
+
+          <div id={`project-home-panel-${tab}`} role="tabpanel" aria-labelledby={`project-home-tab-${tab}`}>
+            {tab === "overview" && (
+              <OverviewTab
+                sessions={projectSessions}
+                activity={activity}
+                onOpenSurface={surfaces.open ? (surface) => void surfaces.open?.(surface) : undefined}
+                instructions={instructions}
+                pinned={pinned}
+                outputs={outputs}
+                assetsLoading={assetsLoading}
+                assetsError={assetsError}
+                onReloadAssets={reloadAssets}
+                titleById={titleById}
+                onOpenSession={onOpenSession}
+                onOpenOutput={setViewing}
+                onOpenSettings={onOpenSettings}
+                onTabChange={onTabChange}
+              />
+            )}
+            {tab === "chats" && (
+              <ChatsTab
+                sessions={allProjectSessions}
+                loadingArchived={loadingArchived}
+                onOpenSession={onOpenSession}
+                onNewSession={onNewSession}
+              />
+            )}
+            {tab === "files" && (
+              <div className="flex min-w-0 flex-col gap-4">
+                <ProjectAssetsPanel
+                  key={filesPanelKey}
+                  projectId={project.id}
+                  demo={demo}
+                  auth={auth}
+                  authSession={authSession}
+                  sessions={sessions}
+                  onOpenSession={onOpenSession}
+                />
+                {!demo && project.boardProjectId && (
+                  <ProjectFolderBrowser
+                    chatProjectId={project.id}
+                    boardProjectId={project.boardProjectId}
+                    authSession={authSession}
+                    onPinned={() => setFilesPanelKey((k) => k + 1)}
+                  />
+                )}
+              </div>
+            )}
+            {tab === "outputs" && (
+              <OutputsTab
+                outputs={outputs}
+                loading={assetsLoading}
+                error={assetsError}
+                onReload={reloadAssets}
+                titleById={titleById}
+                onOpenOutput={setViewing}
+              />
+            )}
+          </div>
+          {viewing && (
+            <OutputViewer
+              key={viewing.id}
+              asset={viewing}
+              sourceTitle={viewing.sessionId ? titleById.get(viewing.sessionId) : undefined}
+              onClose={() => setViewing(null)}
+              onOpenSession={onOpenSession}
+              onShowVersions={setHistoryFor}
+            />
+          )}
+          {historyFor && (
+            <OutputVersionsDialog
+              asset={historyFor}
+              demo={demo}
+              authSession={authSession}
+              onClose={() => setHistoryFor(null)}
+              onRestored={reloadAssets}
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** 「在「项目」里开始…」：Enter 发送（Shift+Enter 换行，输入法组字中不发）。 */
+function StartBox({ projectName, onStart }: { projectName: string; onStart: (text: string) => void }) {
+  const [text, setText] = useState("");
+  const submit = () => {
+    const t = text.trim();
+    if (!t) return;
+    onStart(t);
+    setText("");
+  };
+  const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key !== "Enter" || e.shiftKey || e.nativeEvent.isComposing) return;
+    e.preventDefault();
+    submit();
+  };
+  return (
+    <form
+      className="flex items-end gap-2 rounded-2xl border border-border bg-surface p-3 shadow-soft focus-within:border-border-strong"
+      onSubmit={(e) => {
+        e.preventDefault();
+        submit();
+      }}
+    >
+      <textarea
+        aria-label={`在「${projectName}」里开始`}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={onKeyDown}
+        rows={2}
+        placeholder={`在「${projectName}」里开始…`}
+        className="min-h-12 flex-1 resize-none bg-transparent text-base leading-relaxed text-fg outline-none placeholder:text-faint md:text-sm"
+      />
+      <IconButton
+        type="submit"
+        aria-label="开始新会话"
+        variant="solid"
+        disabled={!text.trim()}
+        className="shrink-0"
+      >
+        <ArrowUp size={18} />
+      </IconButton>
+    </form>
+  );
+}
+
+function SectionCard({
+  title,
+  action,
+  children,
+  testId,
+}: {
+  title: string;
+  action?: ReactNode;
+  children: ReactNode;
+  testId?: string;
+}) {
+  return (
+    <Card padding="md" className="flex min-w-0 flex-col gap-3" data-testid={testId}>
+      <div className="flex items-center justify-between gap-2">
+        <h2 className="text-section font-semibold text-fg">{title}</h2>
+        {action}
+      </div>
+      {children}
+    </Card>
+  );
+}
+
+function LinkAction({ onClick, children }: { onClick: () => void; children: ReactNode }) {
+  return (
+    <Button variant="link" size="sm" onClick={onClick} className="h-auto px-0 [@media(hover:none)]:min-h-11">
+      {children}
+    </Button>
+  );
+}
+
+function SessionLine({
+  session,
+  onOpen,
+  showPreview = false,
+}: {
+  session: Session;
+  onOpen: (id: string) => void;
+  showPreview?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onOpen(session.id)}
+      className="flex w-full min-w-0 items-center gap-3 rounded-md px-2 py-2 text-left outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
+    >
+      <MessageSquare size={14} aria-hidden className="shrink-0 text-faint" />
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="truncate text-body text-fg">{session.title || "新对话"}</span>
+        {showPreview && session.lastMessagePreview && (
+          <span className="truncate text-caption text-muted">{session.lastMessagePreview}</span>
+        )}
+      </span>
+      {session.archived && <Badge size="sm">已归档</Badge>}
+      <TimeAgo
+        value={session.lastAt ?? session.updatedAt}
+        className="shrink-0 text-caption text-faint"
+      />
+    </button>
+  );
+}
+
+function AssetsError({ error, onReload }: { error: string; onReload: () => void }) {
+  return (
+    <Alert
+      tone="danger"
+      action={
+        <Button size="sm" variant="secondary" onClick={onReload}>
+          重试
+        </Button>
+      }
+    >
+      {error}
+    </Alert>
+  );
+}
+
+function OverviewTab({
+  sessions,
+  activity,
+  onOpenSurface,
+  instructions,
+  pinned,
+  outputs,
+  assetsLoading,
+  assetsError,
+  onReloadAssets,
+  titleById,
+  onOpenSession,
+  onOpenOutput,
+  onOpenSettings,
+  onTabChange,
+}: {
+  sessions: Session[];
+  /** 会话 + 看板任务 + 定时任务合并后的最近活动（无看板时只有会话）。 */
+  activity: ActivityItem[];
+  onOpenSurface?: (surface: ProjectSurface) => void;
+  instructions: string;
+  pinned: ProjectAsset[];
+  outputs: ProjectAsset[];
+  assetsLoading: boolean;
+  assetsError: string | null;
+  onReloadAssets: () => void;
+  titleById: Map<string, string>;
+  onOpenSession: (id: string) => void;
+  onOpenOutput: (asset: ProjectAsset) => void;
+  onOpenSettings: () => void;
+  onTabChange: (tab: ProjectTab) => void;
+}) {
+  const recent = activity;
+  const latestOutputs = outputs.slice(0, OVERVIEW_OUTPUT_LIMIT);
+  return (
+    <div className="grid min-w-0 gap-4 @2xl:grid-cols-2">
+      <SectionCard
+        title="最近活动"
+        testId="project-home-recent"
+        action={
+          sessions.length > OVERVIEW_SESSION_LIMIT ? (
+            <LinkAction onClick={() => onTabChange("chats")}>
+              全部 {sessions.length}
+              <ArrowRight size={13} aria-hidden />
+            </LinkAction>
+          ) : undefined
+        }
+      >
+        {recent.length === 0 ? (
+          <p className="text-meta text-muted">
+            还没有会话。在上面的输入框说点什么，或点一个快捷开始。
+          </p>
+        ) : (
+          <div className="-mx-2 flex flex-col">
+            {recent.map((item) =>
+              item.kind === "chat" ? (
+                <SessionLine key={`chat-${item.id}`} session={item.session} onOpen={onOpenSession} />
+              ) : (
+                <ActivityLine
+                  key={`${item.kind}-${item.id}`}
+                  item={item}
+                  onOpen={onOpenSurface ? () => onOpenSurface(item.kind === "ticket" ? "board" : "cron") : undefined}
+                />
+              ),
+            )}
+          </div>
+        )}
+      </SectionCard>
+
+      <SectionCard
+        title="项目指令"
+        testId="project-home-instructions"
+        action={<LinkAction onClick={onOpenSettings}>{instructions ? "编辑" : "添加"}</LinkAction>}
+      >
+        {instructions ? (
+          <>
+            <p className="line-clamp-4 whitespace-pre-wrap rounded-lg bg-hover px-3 py-2 text-body text-fg">
+              {instructions}
+            </p>
+            <p className="text-caption text-faint">这个项目里的所有会话都会遵守这些指令。</p>
+          </>
+        ) : (
+          <p className="text-meta text-muted">
+            还没有项目指令。写下这个项目的背景、偏好和要求，项目里的所有会话都会遵守。
+          </p>
+        )}
+      </SectionCard>
+
+      <SectionCard
+        title="常用文件"
+        testId="project-home-pinned"
+        action={
+          <LinkAction onClick={() => onTabChange("files")}>
+            管理
+            <ArrowRight size={13} aria-hidden />
+          </LinkAction>
+        }
+      >
+        {assetsError ? (
+          <AssetsError error={assetsError} onReload={onReloadAssets} />
+        ) : assetsLoading ? (
+          <Skeleton className="h-8 w-2/3" />
+        ) : pinned.length === 0 ? (
+          <div className="flex flex-col items-start gap-2">
+            <p className="text-meta text-muted">
+              还没有常用文件。在「文件」里上传资料并设为常用，项目里的所有会话都会参考它们。
+            </p>
+            <Button size="sm" variant="secondary" onClick={() => onTabChange("files")}>
+              <Upload size={14} aria-hidden />
+              上传文件
+            </Button>
+          </div>
+        ) : (
+          <div className="flex flex-wrap gap-2">
+            {pinned.map((a) => (
+              <span
+                key={a.id}
+                title={a.name}
+                className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-meta text-fg"
+              >
+                <Pin size={12} aria-hidden className="shrink-0 text-warning" />
+                <span className="min-w-0 truncate">{a.name}</span>
+              </span>
+            ))}
+          </div>
+        )}
+      </SectionCard>
+
+      <SectionCard
+        title="最新产出"
+        testId="project-home-outputs"
+        action={
+          outputs.length > 0 ? (
+            <LinkAction onClick={() => onTabChange("outputs")}>
+              全部 {outputs.length}
+              <ArrowRight size={13} aria-hidden />
+            </LinkAction>
+          ) : undefined
+        }
+      >
+        {assetsError ? (
+          <AssetsError error={assetsError} onReload={onReloadAssets} />
+        ) : assetsLoading ? (
+          <Skeleton className="h-16 w-full" />
+        ) : latestOutputs.length === 0 ? (
+          <p className="text-meta text-muted">
+            还没有产出。智能体在这个项目的会话里生成的文件会出现在这里。
+          </p>
+        ) : (
+          <div className="-mx-2 flex flex-col">
+            {latestOutputs.map((a) => (
+              <OutputRow
+                key={a.id}
+                asset={a}
+                sourceTitle={a.sessionId ? titleById.get(a.sessionId) : undefined}
+                onOpen={onOpenOutput}
+                compact
+              />
+            ))}
+          </div>
+        )}
+      </SectionCard>
+    </div>
+  );
+}
+
+/**
+ * 一个产出的版本历史（新→旧）：每版的时间、大小、下载。每一版都是登记时复制下来的
+ * 不可变副本，源文件后来被覆盖或删除也能下载。「恢复」把旧版本的字节再登记成最新
+ * 版本，已有版本一个都不动。
+ */
+function OutputVersionsDialog({
+  asset,
+  demo,
+  authSession,
+  onClose,
+  onRestored,
+}: {
+  asset: ProjectAsset;
+  demo: boolean;
+  authSession: AuthSession;
+  onClose: () => void;
+  onRestored: () => void;
+}) {
+  const toast = useToast();
+  const [versions, setVersions] = useState<ProjectAsset[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [restoring, setRestoring] = useState<string | null>(null);
+  const [nonce, setNonce] = useState(0);
+
+  useEffect(() => {
+    if (demo) {
+      setVersions([asset]);
+      return;
+    }
+    let alive = true;
+    setError(null);
+    api
+      .listProjectAssetVersions(authSession, asset.id)
+      .then((list) => alive && setVersions(list))
+      .catch((e: unknown) => alive && setError(e instanceof Error ? e.message : String(e)));
+    return () => {
+      alive = false;
+    };
+  }, [asset, demo, authSession, nonce]);
+
+  const restore = async (v: ProjectAsset) => {
+    setRestoring(v.id);
+    try {
+      await api.restoreProjectAssetVersion(authSession, v.id);
+      toast("已把这一版恢复为最新版本", "success");
+      setNonce((n) => n + 1);
+      onRestored();
+    } catch (e) {
+      toast(`恢复失败：${e instanceof Error ? e.message : String(e)}`, "error");
+    } finally {
+      setRestoring(null);
+    }
+  };
+
+  return (
+    <Modal
+      open
+      onOpenChange={(o) => !o && onClose()}
+      title={`${asset.name} 的版本`}
+      description="每一版都单独保存，源文件之后被覆盖或删除也能下载。恢复会把旧版本另存为最新一版。"
+      size="md"
+    >
+      <div data-testid="output-versions" className="flex flex-col">
+        {error ? (
+          <Alert tone="danger">版本加载失败：{error}</Alert>
+        ) : versions === null ? (
+          <div className="flex items-center justify-center gap-2 py-8 text-meta text-muted">
+            <Spinner size={14} />
+            正在加载版本…
+          </div>
+        ) : (
+          <ol className="-mx-2 flex flex-col">
+            {versions.map((v, i) => (
+              <OutputVersionRow
+                key={v.id}
+                version={v}
+                label={`v${versions.length - i}`}
+                latest={i === 0}
+                restoring={restoring === v.id}
+                restoreDisabled={restoring !== null || demo}
+                onRestore={() => void restore(v)}
+              />
+            ))}
+          </ol>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+function OutputVersionRow({
+  version,
+  label,
+  latest,
+  restoring,
+  restoreDisabled,
+  onRestore,
+}: {
+  version: ProjectAsset;
+  label: string;
+  latest: boolean;
+  restoring: boolean;
+  restoreDisabled: boolean;
+  onRestore: () => void;
+}) {
+  // 版本优先用自己的不可变副本（url）；没有副本的旧登记只能取源路径上的当前文件。
+  const src = version.url || version.containerPath;
+  const { state, start, cancel } = useSignedDownload(src, version.name);
+  return (
+    <li
+      data-testid="output-version"
+      data-version-id={version.id}
+      className="flex min-h-11 items-center gap-2 rounded-md px-2 py-1.5 hover:bg-hover"
+    >
+      <span className="w-9 shrink-0 tabular-nums text-meta font-medium text-fg">{label}</span>
+      <span className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 text-caption text-muted">
+        <TimeAgo value={version.createdAt} />
+        <span>{formatBytes(version.sizeBytes) || "大小未知"}</span>
+        {latest && <Badge size="sm" tone="accent">最新</Badge>}
+        {!version.url && <span className="text-faint">未单独保存</span>}
+      </span>
+      {!latest && version.url && (
+        <Button size="sm" variant="ghost" className="shrink-0 px-2" disabled={restoreDisabled} onClick={onRestore}>
+          {restoring ? <Spinner size={12} /> : <RotateCcw size={13} aria-hidden />}
+          恢复
+        </Button>
+      )}
+      <IconButton
+        aria-label={state.phase === "downloading" ? "取消下载" : `下载 ${label}`}
+        variant="muted"
+        size="sm"
+        shape="square"
+        disabled={!src}
+        onClick={() => (state.phase === "downloading" ? cancel() : void start())}
+      >
+        {state.phase === "downloading" ? <Spinner size={14} /> : <Download size={15} />}
+      </IconButton>
+    </li>
+  );
+}
+
+function ChatsTab({
+  sessions,
+  loadingArchived,
+  onOpenSession,
+  onNewSession,
+}: {
+  sessions: Session[];
+  loadingArchived: boolean;
+  onOpenSession: (id: string) => void;
+  onNewSession: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const shown = useMemo(() => filterSessionsByTitle(sessions, query), [sessions, query]);
+  if (sessions.length === 0 && loadingArchived) {
+    return (
+      <div data-testid="project-chats-loading" className="flex items-center justify-center gap-2 py-12 text-meta text-muted">
+        <Spinner size={14} />
+        正在加载会话…
+      </div>
+    );
+  }
+  if (sessions.length === 0) {
+    return (
+      <EmptyState
+        icon={MessageSquare}
+        title="这个项目还没有会话"
+        hint="在上面的输入框开始第一个会话，项目指令和常用文件会自动带上。"
+        action={
+          <Button size="sm" variant="secondary" onClick={onNewSession}>
+            <Plus size={14} aria-hidden />
+            新建会话
+          </Button>
+        }
+      />
+    );
+  }
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center gap-2">
+        <div className="relative min-w-0 flex-1">
+          <Search
+            size={14}
+            aria-hidden
+            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-faint"
+          />
+          <Input
+            type="search"
+            aria-label="按标题筛选会话"
+            placeholder="按标题筛选"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            className="pl-8"
+          />
+        </div>
+        <Button size="sm" variant="secondary" onClick={onNewSession} className="shrink-0">
+          <Plus size={14} aria-hidden />
+          新建会话
+        </Button>
+      </div>
+      {loadingArchived && (
+        <p className="flex items-center gap-2 px-2 text-caption text-muted">
+          <Spinner size={12} />
+          正在加载已归档会话…
+        </p>
+      )}
+      {shown.length === 0 ? (
+        <p className="px-2 py-6 text-center text-meta text-muted">没有标题匹配「{query.trim()}」的会话</p>
+      ) : (
+        <div className="-mx-2 flex flex-col">
+          {shown.map((s) => (
+            <SessionLine key={s.id} session={s} onOpen={onOpenSession} showPreview />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const KIND_ORDER: OutputKind[] = ["doc", "image", "table", "code", "other"];
+
+function OutputsTab({
+  outputs,
+  loading,
+  error,
+  onReload,
+  titleById,
+  onOpenOutput,
+}: {
+  outputs: ProjectAsset[];
+  loading: boolean;
+  error: string | null;
+  onReload: () => void;
+  titleById: Map<string, string>;
+  onOpenOutput: (asset: ProjectAsset) => void;
+}) {
+  const [kind, setKind] = useState<OutputKind | "all">("all");
+  const counts = useMemo(() => {
+    const c: Record<OutputKind, number> = { doc: 0, image: 0, table: 0, code: 0, other: 0 };
+    for (const a of outputs) c[outputKind(a)] += 1;
+    return c;
+  }, [outputs]);
+  const shown = useMemo(
+    () => (kind === "all" ? outputs : outputs.filter((a) => outputKind(a) === kind)),
+    [outputs, kind],
+  );
+  if (error) return <AssetsError error={error} onReload={onReload} />;
+  if (loading) {
+    return (
+      <div className="flex flex-col gap-2">
+        {[0, 1, 2].map((i) => (
+          <Skeleton key={i} className="h-16 w-full" />
+        ))}
+      </div>
+    );
+  }
+  if (outputs.length === 0) {
+    return (
+      <EmptyState
+        icon={Sparkles}
+        title="还没有产出"
+        hint="在这个项目的会话里让智能体写文档、做表格或生成图片，产出的文件会自动收在这里。"
+      />
+    );
+  }
+  return (
+    <div className="flex flex-col gap-3">
+      <div
+        role="group"
+        aria-label="按类型筛选产出"
+        className="no-scrollbar -mx-4 flex gap-2 overflow-x-auto px-4 md:mx-0 md:flex-wrap md:px-0"
+      >
+        <Chip selected={kind === "all"} onClick={() => setKind("all")}>
+          全部 {outputs.length}
+        </Chip>
+        {KIND_ORDER.filter((k) => counts[k] > 0).map((k) => (
+          <Chip key={k} selected={kind === k} onClick={() => setKind(k)}>
+            {OUTPUT_KIND_LABELS[k]} {counts[k]}
+          </Chip>
+        ))}
+      </div>
+      {shown.length === 0 ? (
+        <p className="px-2 py-6 text-center text-meta text-muted">没有这类产出</p>
+      ) : (
+        // 安静表面的分组列表：一个容器 + 行间发丝线，整行可点开查看器（不是一格一张大卡）。
+        <ListGroup data-testid="project-outputs-list">
+          {shown.map((a) => (
+            <li key={a.id} className="oc-list-row" data-interactive>
+              <OutputRow
+                asset={a}
+                sourceTitle={a.sessionId ? titleById.get(a.sessionId) : undefined}
+                onOpen={onOpenOutput}
+              />
+            </li>
+          ))}
+        </ListGroup>
+      )}
+    </div>
+  );
+}
+
+/** 按本项目的看板范围打开看板/记忆/技能/定时任务。入口链接和「最近活动」共用。 */
+function useSurfaceOpener(
+  boardProjectId: string | null | undefined,
+  onPrepareBoard: (() => Promise<boolean>) | undefined,
+  onShowSurface: ((surface: ProjectSurface) => void) | undefined,
+): { open: ((surface: ProjectSurface) => Promise<void>) | null; opening: ProjectSurface | null } {
+  const scope = useProjectScope();
+  const toast = useToast();
+  const [opening, setOpening] = useState<ProjectSurface | null>(null);
+  if (!boardProjectId || !onPrepareBoard || !onShowSurface) return { open: null, opening };
+  const open = async (surface: ProjectSurface) => {
+    setOpening(surface);
+    try {
+      if (!(await onPrepareBoard())) return;
+      // Only switch scope once the refreshed list really has this board; otherwise the
+      // token would resolve to 全部项目 and the page would show other projects' data.
+      const boards = await scope.refreshWorkProjects();
+      if (!boards.some((b) => b.id === boardProjectId)) {
+        toast("项目看板暂时没有加载出来，请稍后再试", "error");
+        return;
+      }
+      scope.setToken(boardProjectId);
+      onShowSurface(surface);
+    } finally {
+      setOpening(null);
+    }
+  };
+  return { open, opening };
+}
+
+/**
+ * 项目里的看板 / 记忆 / 技能 / 定时任务入口。安静表面（管理中心第 3 轮）的写法：
+ * 一个小号分组标题 + 一个 10px 圆角容器，格与格之间是发丝线（gap-px 透出底色），
+ * 每格 = 图标 + 名称（宽容器再带一行说明）+ ›。窄屏两列两行、宽容器一行四格；
+ * 每格最小 48px 高（≥44px 触控靶）。和上面的快捷开始药丸拉开一段距离，层级靠标题与留白。
+ */
+function ProjectSurfaceLinks({
+  open,
+  opening,
+}: {
+  open: (surface: ProjectSurface) => Promise<void>;
+  opening: ProjectSurface | null;
+}) {
+  const id = useId();
+  return (
+    <nav aria-labelledby={`${id}-title`} className="mt-2 flex flex-col gap-2" data-testid="project-surface-links">
+      <h2 id={`${id}-title`} className="text-meta font-medium text-faint">
+        项目空间
+      </h2>
+      <ul className="grid grid-cols-2 gap-px overflow-hidden rounded-[10px] border border-border bg-border @2xl:grid-cols-4">
+        {SURFACES.map((s) => {
+          const Icon = s.icon;
+          const busy = opening === s.id;
+          return (
+            <li key={s.id} className="flex bg-surface">
+              <button
+                type="button"
+                onClick={() => void open(s.id)}
+                aria-label={s.label}
+                aria-describedby={`${id}-${s.id}`}
+                aria-busy={busy || undefined}
+                data-surface={s.id}
+                className="group flex min-h-12 w-full min-w-0 items-center gap-2.5 px-3.5 py-2.5 text-left outline-none transition-colors duration-100 hover:bg-hover focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+              >
+                <Icon size={16} strokeWidth={1.75} aria-hidden className="shrink-0 text-muted" />
+                <span className="flex min-w-0 flex-1 flex-col">
+                  <span className="truncate text-body font-medium text-fg">{s.label}</span>
+                  <span id={`${id}-${s.id}`} className="hidden truncate text-meta text-faint @md:block">
+                    {s.hint}
+                  </span>
+                </span>
+                {busy ? (
+                  <Spinner size={13} />
+                ) : (
+                  <ChevronRight
+                    size={15}
+                    strokeWidth={1.75}
+                    aria-hidden
+                    className="shrink-0 text-faint transition-colors group-hover:text-muted"
+                  />
+                )}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </nav>
+  );
+}
+
+/**
+ * 项目的看板任务与定时任务（主页「最近活动」用）。只读已有接口；失败不打扰，只显示会话。
+ * lib/taskboard 动态引入，不进首屏。
+ */
+function useProjectActivity(
+  boardProjectId: string | null | undefined,
+  authSession: AuthSession,
+  enabled: boolean,
+): { tickets: ActivityTicket[]; cron: ActivityCron[] } {
+  const [data, setData] = useState<{ tickets: ActivityTicket[]; cron: ActivityCron[] }>({ tickets: [], cron: [] });
+  useEffect(() => {
+    if (!enabled || !boardProjectId) {
+      setData({ tickets: [], cron: [] });
+      return;
+    }
+    let alive = true;
+    void (async () => {
+      const [tickets, cron] = await Promise.all([
+        import("../../lib/taskboard")
+          .then(({ taskboardApi }) => taskboardApi.listTickets(authSession, { projectId: boardProjectId }))
+          .then((page) => (page.items ?? []) as unknown as ActivityTicket[])
+          .catch(() => [] as ActivityTicket[]),
+        api.listCron(authSession, { boardProjectId }).then((jobs) => jobs as unknown as ActivityCron[]).catch(() => [] as ActivityCron[]),
+      ]);
+      if (alive) setData({ tickets, cron });
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [boardProjectId, authSession, enabled]);
+  return data;
+}
+
+function ActivityLine({ item, onOpen }: { item: Exclude<ActivityItem, { kind: "chat" }>; onOpen?: () => void }) {
+  const tag = item.kind === "ticket" ? "任务" : "定时";
+  const tone = item.kind === "ticket" ? "bg-[#fdf2f8] text-[#be185d]" : "bg-[#fff7ed] text-[#c2410c]";
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      disabled={!onOpen}
+      data-testid={`activity-${item.kind}`}
+      className="flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left hover:bg-hover disabled:cursor-default disabled:hover:bg-transparent"
+    >
+      <span className={cn("shrink-0 rounded px-1.5 py-0.5 text-caption", tone)}>{tag}</span>
+      <span className="min-w-0 flex-1 truncate text-body">
+        {item.kind === "ticket" ? `${item.identifier} ${item.title}` : item.title}
+      </span>
+      <TimeAgo className="shrink-0 text-caption text-faint" value={item.at} />
+    </button>
+  );
+}

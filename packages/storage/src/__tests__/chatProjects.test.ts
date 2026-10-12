@@ -21,8 +21,12 @@ process.env.OPENCLAUDE_HOME = testHome
 const {
   CHAT_PROJECT_PER_USER_LIMIT,
   createChatProject,
+  createProjectAsset,
   deleteChatProject,
   deleteClientSession,
+  listDeletedChatProjects,
+  listProjectAssets,
+  restoreChatProject,
   getClientSession,
   getSessionsDb,
   listChatProjects,
@@ -78,7 +82,7 @@ describe('chat_projects CRUD', () => {
     assert.equal(ok.project.boardProjectId, null)
   })
 
-  it('1:1 board_project_id bind, unbind, cross-user isolation', async () => {
+  it('1:1 board_project_id bind is permanent; cross-user isolation', async () => {
     const a = await createChatProject(USER, { name: 'A' })
     const b = await createChatProject(USER, { name: 'B' })
     const other = await createChatProject(OTHER, { name: 'X' })
@@ -94,15 +98,20 @@ describe('chat_projects CRUD', () => {
     if (!conflict.ok) assert.equal(conflict.error, 'board_project_bound')
     const otherBind = await updateChatProject(OTHER, other.project.id, { boardProjectId: board })
     assert.equal(otherBind.ok, true)
+    // Memory, skills, cron and billing hang off the board id: no unbind, no rebind.
     const unbind = await updateChatProject(USER, a.project.id, { boardProjectId: null })
-    assert.equal(unbind.ok, true)
-    if (unbind.ok) assert.equal(unbind.project.boardProjectId, null)
+    assert.equal(unbind.ok, false)
+    if (!unbind.ok) assert.equal(unbind.error, 'board_project_bound')
+    const rebind = await updateChatProject(USER, a.project.id, { boardProjectId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' })
+    assert.equal(rebind.ok, false)
+    const same = await updateChatProject(USER, a.project.id, { boardProjectId: board })
+    assert.equal(same.ok, true)
     const invalid = await updateChatProject(USER, b.project.id, { boardProjectId: 'not-a-uuid' })
     assert.equal(invalid.ok, false)
     if (!invalid.ok) assert.equal(invalid.error, 'invalid_board_project_id')
   })
 
-  it('bound updates do not write instructions to PG; unbind restores PG authority', async () => {
+  it('bound updates do not write instructions to PG (PROJECT.md is the authority)', async () => {
     const created = await createChatProject(USER, { name: 'BoundIns', instructions: 'pg-seed' })
     assert.equal(created.ok, true)
     if (!created.ok) return
@@ -112,12 +121,41 @@ describe('chat_projects CRUD', () => {
     const skipped = await updateChatProject(USER, created.project.id, { instructions: 'should-not-land' })
     assert.equal(skipped.ok, true)
     if (skipped.ok) assert.equal(skipped.project.instructions, 'pg-seed')
-    const unbound = await updateChatProject(USER, created.project.id, { boardProjectId: null })
-    assert.equal(unbound.ok, true)
-    if (unbound.ok) assert.equal(unbound.project.instructions, 'pg-seed')
-    const after = await updateChatProject(USER, created.project.id, { instructions: 'pg-after-unbind' })
-    assert.equal(after.ok, true)
-    if (after.ok) assert.equal(after.project.instructions, 'pg-after-unbind')
+  })
+
+  it('project layer on: a new project reserves its board id; research default never does', async () => {
+    const reserved = await createChatProject(USER, { name: 'Reserved', reserveBoard: true, template: 'research' })
+    assert.equal(reserved.ok, true)
+    if (!reserved.ok) return
+    assert.match(reserved.project.boardProjectId ?? '', /^[0-9a-f-]{36}$/)
+    assert.equal(reserved.project.template, 'research')
+    const plain = await createChatProject(USER, { name: 'Plain' })
+    assert.equal(plain.ok && plain.project.boardProjectId, null)
+    const research = await createChatProject(USER, { name: 'Lib', isResearchDefault: true, reserveBoard: true })
+    assert.equal(research.ok && research.project.boardProjectId, null)
+    const bad = await createChatProject(USER, { name: 'Bad', template: 'novel' })
+    assert.equal(bad.ok, false)
+    if (!bad.ok) assert.equal(bad.error, 'invalid_template')
+  })
+
+  it('archive and pin are reversible flags; a repeat keeps the first timestamp', async () => {
+    const created = await createChatProject(USER, { name: 'Flags' })
+    assert.equal(created.ok, true)
+    if (!created.ok) return
+    const archived = await updateChatProject(USER, created.project.id, { archived: true, pinned: true })
+    assert.equal(archived.ok, true)
+    if (!archived.ok) return
+    assert.ok(archived.project.archivedAt && archived.project.pinnedAt)
+    const again = await updateChatProject(USER, created.project.id, { archived: true })
+    assert.equal(again.ok && again.project.archivedAt, archived.project.archivedAt)
+    const restored = await updateChatProject(USER, created.project.id, { archived: false, pinned: false })
+    assert.equal(restored.ok && restored.project.archivedAt, null)
+    assert.equal(restored.ok && restored.project.pinnedAt, null)
+    const bad = await updateChatProject(USER, created.project.id, { archived: 'yes' })
+    assert.equal(bad.ok, false)
+    if (!bad.ok) assert.equal(bad.error, 'invalid_flag')
+    const listed = (await listChatProjects(USER)).find((p) => p.id === created.project.id)
+    assert.equal(listed?.archivedAt, null)
   })
 
   it('list 按 sort_order ASC, created_at ASC;sessionCount 只计未删会话', async () => {
@@ -138,6 +176,56 @@ describe('chat_projects CRUD', () => {
     assert.equal(list[0]?.sessionCount, 1)
     assert.equal(list[1]?.sessionCount, 0)
     assert.equal((await listChatProjects(OTHER)).length, 0)
+  })
+
+  it('delete keeps a manifest; restore relinks what is still ungrouped and returns the paused cron jobs', async () => {
+    const created = await createChatProject(USER, { name: 'Restorable' })
+    const other = await createChatProject(USER, { name: 'Elsewhere' })
+    assert.equal(created.ok && other.ok, true)
+    if (!created.ok || !other.ok) return
+    const pid = created.project.id
+    await upsertClientSession(baseSession('sess-r1'))
+    await upsertClientSession(baseSession('sess-r2'))
+    await patchClientSessionMeta('sess-r1', USER, { projectId: pid })
+    await patchClientSessionMeta('sess-r2', USER, { projectId: pid })
+    const asset = await createProjectAsset(USER, {
+      projectId: pid, source: 'upload', name: 'a.md', url: `/api/media/${'a'.repeat(64)}.md`,
+    })
+    assert.equal(asset.ok, true)
+    const del = await deleteChatProject(USER, pid, { pausedCronJobIds: ['job-1'] })
+    assert.equal(del.ok, true)
+    assert.equal((await listProjectAssets(USER, { projectId: null })).some((a) => a.name === 'a.md'), true)
+    const deleted = await listDeletedChatProjects(USER)
+    assert.equal(deleted.find((d) => d.id === pid)?.sessionCount, 2)
+    // The user files one chat elsewhere meanwhile; restore must not pull it back.
+    await patchClientSessionMeta('sess-r2', USER, { projectId: other.project.id })
+    const restored = await restoreChatProject(USER, pid)
+    assert.equal(restored.ok, true)
+    if (!restored.ok) return
+    assert.deepEqual(restored.pausedCronJobIds, ['job-1'])
+    assert.equal(restored.relinkedSessions, 1)
+    assert.deepEqual(restored.relinkedSessionIds, ['sess-r1'])
+    assert.equal(restored.relinkedAssets, 1)
+    const { sessions } = await listClientSessions(USER)
+    assert.equal(sessions.find((x) => x.id === 'sess-r1')?.projectId, pid)
+    assert.equal(sessions.find((x) => x.id === 'sess-r2')?.projectId, other.project.id)
+    assert.equal((await listDeletedChatProjects(USER)).some((d) => d.id === pid), false)
+    const again = await restoreChatProject(USER, pid)
+    assert.equal(again.ok, false)
+  })
+
+  it('restore after the window is refused; another user cannot restore', async () => {
+    const created = await createChatProject(USER, { name: 'Old' })
+    assert.equal(created.ok, true)
+    if (!created.ok) return
+    await deleteChatProject(USER, created.project.id)
+    const foreign = await restoreChatProject(OTHER, created.project.id)
+    assert.equal(foreign.ok, false)
+    const db = await getSessionsDb()
+    db.prepare('UPDATE chat_projects SET deleted_at = ? WHERE id = ?').run(Date.now() - 31 * 86400000, created.project.id)
+    const late = await restoreChatProject(USER, created.project.id)
+    assert.equal(late.ok, false)
+    if (!late.ok) assert.equal(late.error, 'expired')
   })
 
   it('他人 PATCH/DELETE 项目 → not_found,不误写', async () => {

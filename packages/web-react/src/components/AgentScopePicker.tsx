@@ -1,5 +1,6 @@
 import { Badge, Button } from "./ui";
 import type { MarketplaceMyAgent } from "../lib/types";
+import { cn } from "../lib/utils";
 
 const DEFAULT_SCOPE = ["main"];
 
@@ -56,6 +57,7 @@ export function AgentScopePicker({
   disabled,
   title = "适用智能体",
   hint = "至少选择一个；未选择时默认全能助手。",
+  bare,
 }: {
   agents: MarketplaceMyAgent[];
   selectedIds: string[];
@@ -63,6 +65,8 @@ export function AgentScopePicker({
   disabled?: boolean;
   title?: string;
   hint?: string;
+  /** 不画外框、标题与说明上下排(放进侧栏 / 已有分区的场景,如技能工作台信息栏)。 */
+  bare?: boolean;
 }) {
   const selected = new Set(normalizeAgentScope(selectedIds));
   // 选中但已不在列表里的 id(已卸载 / 脏数据):此前以原始 id + 🤖 伪装成可点选项混在真实智能体里
@@ -88,12 +92,19 @@ export function AgentScopePicker({
     commit(next);
   };
   return (
-    <div className="space-y-2 rounded-xl border border-border bg-surface/60 p-3">
+    <div className={cn(bare ? "space-y-2" : "space-y-2 rounded-xl border border-border bg-surface/60 p-3")}>
       {/* 标题与提示在窄屏上下堆叠,不再把标题挤成两行(C-35)。 */}
-      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between sm:gap-2">
-        <div className="text-sm font-medium text-fg">{title}</div>
-        <div className="text-xs text-muted">{hint}</div>
-      </div>
+      {bare ? (
+        <div className="flex flex-col gap-0.5">
+          <div className="text-meta font-medium text-muted">{title}</div>
+          <div className="text-caption text-faint">{hint}</div>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between sm:gap-2">
+          <div className="text-sm font-medium text-fg">{title}</div>
+          <div className="text-xs text-muted">{hint}</div>
+        </div>
+      )}
       <div className="flex flex-wrap gap-2">
         {agents.map((agent) => {
           const active = selected.has(agent.id);

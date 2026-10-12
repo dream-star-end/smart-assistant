@@ -63,7 +63,7 @@ export function remoteClaudeArgs(argv: readonly string[]): string[] {
  * dash applies a foreground redirect to itself while the command runs, so the
  * launch shell is a reader too and goes with its Claude; callers remove the
  * fifo. TERM first; KILL whatever still reads the fifo two seconds later. */
-const BOX_CC_REAP_FUNCTION = [
+export const BOX_CC_REAP_FUNCTION = [
   'reap() {',
   '  pids=""',
   '  for d in /proc/[0-9]*; do',
@@ -144,6 +144,8 @@ export interface BoxCcControl {
   remoteClaude: string
   fifo: string
   cwd: string
+  /** Cursor account (decimal id) whose Box logins the master chooses from. Absent: default login. */
+  accountId?: string
 }
 
 const BOX_CC_PATH = '/home/box/.local/bin:/home/box/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'

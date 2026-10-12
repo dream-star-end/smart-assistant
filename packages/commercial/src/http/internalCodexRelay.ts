@@ -386,6 +386,21 @@ function copyResponseHeaders(from: Headers, res: ServerResponse): void {
   })
 }
 
+/** relay_fetch_failed 的安全诊断字段:错误名 + node/undici 系统 code(含 cause),不含 message。 */
+export function relayErrorShape(err: unknown): { errorName?: string; errorCode?: string; causeCode?: string } {
+  if (!(err instanceof Error)) return {};
+  const pick = (v: unknown): string | undefined =>
+    typeof v === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(v) ? v : undefined;
+  const code = pick((err as { code?: unknown }).code);
+  const cause = (err as { cause?: unknown }).cause;
+  const causeCode = cause && typeof cause === 'object' ? pick((cause as { code?: unknown }).code) : undefined;
+  return {
+    errorName: pick(err.name),
+    ...(code ? { errorCode: code } : {}),
+    ...(causeCode ? { causeCode } : {}),
+  };
+}
+
 export function isRelayCredentialFailureStatus(status: number): boolean {
   return status >= 500 || status === 401 || status === 403 || status === 429
 }
@@ -1568,6 +1583,8 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
       relayLog.warn('relay_fetch_failed', {
         errorClass: failureClass,
         failureCode: isImageRequest ? stableFailureCode : 'RELAY_FAILED',
+        // OCV5-365:只带错误名和系统 code(超时/重置/TLS 等),不带 message、body 或 header。
+        ...relayErrorShape(err),
       })
       if (routeContext) {
         void markCredentialFailure(routeContext.credential.id, `relay_${failureClass}`).catch(() => {})

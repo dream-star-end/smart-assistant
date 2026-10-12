@@ -96,7 +96,7 @@ export function prepareConnectorPublish(
   const slug = typeof spec.id === 'string' ? spec.id : ''
   if (!SLUG_RE.test(slug)) return reject(400, 'BAD_SLUG', 'spec.id 须为小写字母数字连字符(2-64)')
   if (!spec.identity || typeof spec.identity !== 'object' || Array.isArray(spec.identity))
-    return reject(422, 'IDENTITY_REQUIRED', '连接器必须声明 identity probe 才能绑定账号')
+    return reject(422, 'IDENTITY_REQUIRED', '插件必须声明 identity probe 才能绑定账号')
 
   const proposedSecurityDecision = body.securityDecision
   let compiled: ReturnType<typeof compileSpec>
@@ -121,7 +121,7 @@ export function prepareConnectorPublish(
     return reject(
       422,
       'PLATFORM_OAUTH_RESERVED',
-      '社区 OAuth2 连接器必须使用 BYOA；平台代管应用仅限官方预装连接器',
+      '社区 OAuth2 插件必须使用 BYOA；平台代管应用仅限官方预装插件',
     )
   }
 
@@ -133,7 +133,7 @@ export function prepareConnectorPublish(
         .map((x) => x.trim())
         .filter(Boolean)
         .slice(0, 20)
-    : ['连接器']
+    : ['插件']
 
   let humanMeta: HumanMeta
   try {
@@ -146,7 +146,7 @@ export function prepareConnectorPublish(
   const rawArtifact = canonicalBytes(specInput).toString('utf8')
   const scan = scanSkillArtifact({ name, description, tags, body: rawArtifact })
   if (scan.blocked)
-    return reject(422, 'SCAN_BLOCKED', '连接器声明被静态安全扫描拦截,请修正后重试', scan.flags)
+    return reject(422, 'SCAN_BLOCKED', '插件声明被静态安全扫描拦截,请修正后重试', scan.flags)
   const metaScan = scanSkillArtifact({
     name,
     description: '',

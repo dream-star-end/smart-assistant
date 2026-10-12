@@ -18,7 +18,11 @@ export function loadCursorSandInstaller() {
 import base64,hashlib,json,pathlib,subprocess,os
 data=base64.b64decode(${JSON.stringify(installer.toString("base64"))},validate=True)
 assert hashlib.sha256(data).hexdigest()==${JSON.stringify(installerHash)},'installer hash mismatch'
-p=pathlib.Path('/home/box/sand-host/.installer-${args.nonce}.py')
+ds=('/opt/sand/sand-host','/home/box/sand-host')
+c=os.path.realpath('/proc/${args.hostPid}/cwd')
+d=next((x for x in ds if os.path.isdir(x) and not os.path.islink(x) and os.path.realpath(x)==c),None) or next((x for x in ds if os.path.isdir(x) and not os.path.islink(x)),None)
+assert d,'sand host directory missing'
+p=pathlib.Path(d)/'.installer-${args.nonce}.py'
 if p.exists():
  assert not p.is_symlink() and p.read_bytes()==data,'existing installer mismatch'
 else:

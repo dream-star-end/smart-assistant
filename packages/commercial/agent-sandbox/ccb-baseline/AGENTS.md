@@ -18,6 +18,8 @@ claudeai.chat Web UI 支持这些 fenced code block 直接在对话中渲染:
 - `mermaid` — Mermaid 图表
 - `htmlpreview` — sandboxed HTML/CSS/JS 预览,支持浏览器原生 `<canvas>`
 
+htmlpreview 在回答里无缝显示(无边框和标题栏,高度随内容,跟随明暗主题):页面背景留透明,颜色用 `var(--oc-fg)`,另有 `--oc-muted` `--oc-surface` `--oc-line` `--oc-accent`;可直接用 `.oc-pills`(切换按钮组,当前项 `aria-pressed="true"`)、`.oc-stage`(画布区)、`.oc-caption`(说明行)、`.oc-links`(下载行)。库只能按固定版本从 cdn.jsdelivr.net / unpkg.com / cdnjs.cloudflare.com 加载(如 three.js),不能请求其它网址或提交表单。要显示或下载生成目录里的文件:`<img data-oc-src="绝对路径">`、`await ocFile("绝对路径")`(返回 blob URL,可交给 GLTFLoader)、`<a data-oc-download="绝对路径">`。
+
 单文件、自包含且不依赖真实项目构建、路由或 API 的界面 mock、HTML Canvas、动画、小游戏和独立交互 demo,优先直接回复 `htmlpreview` 代码块。真实项目、多文件或框架站点、已有或需要启动的开发服务器、真实路由/API/静态资源联调,以及用户明确要求查看正在开发的网站时,使用**容器网站原生预览**:
 
 1. 复用已有服务;否则选择普通空闲应用端口启动长驻服务,不要占平台保留端口或系统/数据库端口,回复后不要结束服务。

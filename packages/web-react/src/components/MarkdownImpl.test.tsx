@@ -254,6 +254,12 @@ describe('MarkdownImpl signMedia 路径卡片', () => {
     expect(screen.queryByRole('button', { name: '复制' })).toBeNull()
   })
 
+  test('生成目录里的 .html 路径 → 无缝嵌入外壳 + 仍保留下载卡(取到内容前只有下载卡)', () => {
+    render(<MarkdownImpl signMedia>{'户型模型:`/home/agent/.openclaude/generated/house.html`'}</MarkdownImpl>)
+    expect(screen.getByText('house.html')).toBeInTheDocument()
+    expect(document.querySelector('iframe')).toBeNull()
+  })
+
   test('fenced 含路径以外正文 → 仍是代码块', () => {
     const source = ['```', '/home/agent/.openclaude/generated/report.docx', 'echo hi', '```'].join('\n')
     const { container } = render(<MarkdownImpl signMedia>{source}</MarkdownImpl>)
@@ -271,4 +277,31 @@ test('容器 loopback 链接显示预览标识且不交给浏览器新标签页'
   expect(anchor).toHaveAttribute('data-product-feature', 'container-web-preview')
   expect(anchor).not.toHaveAttribute('target')
   expect(anchor).toHaveTextContent('容器预览')
+})
+
+describe('MarkdownImpl autoDetectCode', () => {
+  test('autoDetectCode=false：无语言代码块不做语言探测（大围栏不触发同步高亮）', () => {
+    const big = '```\n' + 'a'.repeat(50_000) + '\n```'
+    const started = performance.now()
+    const { container } = render(<MarkdownImpl readOnly autoDetectCode={false}>{big}</MarkdownImpl>)
+    expect(container.querySelector('.hljs')).toBeNull()
+    expect(container.textContent).toContain('a'.repeat(1000))
+    expect(performance.now() - started).toBeLessThan(5000)
+    cleanup()
+    // 缩进代码块同理。
+    const { container: c2 } = render(
+      <MarkdownImpl readOnly autoDetectCode={false}>{'说明\n\n    const x = 1;\n    let y = 2;'}</MarkdownImpl>,
+    )
+    expect(c2.querySelector('.hljs')).toBeNull()
+  })
+
+  test('缺省仍自动探测（聊天正文行为不变）；标了语言的块照常高亮', () => {
+    const { container } = render(<MarkdownImpl>{'```\nconst x = 1;\nlet y = 2;\n```'}</MarkdownImpl>)
+    expect(container.querySelector('.hljs')).not.toBeNull()
+    cleanup()
+    const { container: c2 } = render(
+      <MarkdownImpl readOnly autoDetectCode={false}>{'```ts\nconst x: number = 1;\n```'}</MarkdownImpl>,
+    )
+    expect(c2.querySelector('.hljs')).not.toBeNull()
+  })
 })

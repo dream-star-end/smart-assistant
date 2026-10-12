@@ -1,6 +1,7 @@
 import { isMarketplaceCategoryId, marketplaceCategoryLabel } from '@openclaude/protocol'
 import {
   Activity,
+  Sparkles,
   ArrowUpCircle,
   Download,
   FileQuestion,
@@ -270,7 +271,7 @@ function AgentManifestView({
                   key={`${capability.kind}:${capability.slug}`}
                   tone={state?.status === 'ready' ? 'success' : stateLabel ? 'warning' : 'neutral'}
                 >
-                  {capability.kind === 'plugin' ? 'Plugin' : 'Skill'} · {capability.slug}
+                  {capability.kind === 'plugin' ? '插件' : '技能'} · {capability.slug}
                   {capability.optional ? ' · 可选' : ' · 必需'}
                   {stateLabel ? ` · ${stateLabel}` : ''}
                 </Badge>
@@ -613,7 +614,7 @@ export function DetailModal({
             onClick: () => onOpenConnectors(pendingConnector ?? detail.slug),
           }
         : isAgent && installNeedsAuthorization
-          ? { label: '管理 Plugin 账号', onClick: () => onOpenConnectors() }
+          ? { label: '管理插件账号', onClick: () => onOpenConnectors() }
           : null
       : null
 
@@ -621,7 +622,7 @@ export function DetailModal({
     lastAction === 'scope'
       ? '归属已更新'
       : isAgent && installNeedsAuthorization
-        ? `${lastAction === 'update' ? '更新' : '安装'}完成 · Plugin 待授权`
+        ? `${lastAction === 'update' ? '更新' : '安装'}完成 · 插件待授权`
         : lastAction === 'update'
           ? '更新成功'
           : '安装成功'
@@ -708,7 +709,8 @@ export function DetailModal({
       // 全站信息密度最高的弹层之一(富介绍 + 徽章行 + 双栏 manifest + 代码块),
       // 与同为「浏览并选择」的 AgentPicker 对齐到 lg(max-w-2xl)。
       size="lg"
-      title={detail?.name ?? '市场详情'}
+      className="marketplace-detail"
+      title={<span className="marketplace-detail-title"><span aria-hidden="true"><Sparkles size={24} strokeWidth={1.5} /></span>{detail?.name ?? '市场详情'}</span>}
       description={detail ? `${detail.slug} · v${detail.version}` : undefined}
       footer={
         // 单个 flex item 拿满宽后可在内部分两行:第一行是就近的失败提示,第二行才是动作组。
@@ -775,7 +777,7 @@ export function DetailModal({
                 lastAction === 'scope'
                   ? '已更新归属'
                   : isAgent && installNeedsAuthorization
-                    ? `${lastAction === 'update' ? '更新' : '安装'}完成，仍有 Plugin 待授权`
+                    ? `${lastAction === 'update' ? '更新' : '安装'}完成，仍有插件待授权`
                     : lastAction === 'update'
                       ? '已更新'
                       : '已安装'
@@ -787,12 +789,12 @@ export function DetailModal({
                     ? `现在由 ${scopeLabels.join('、')} 使用，下一次会话生效。`
                     : '已从所有智能体上移除，技能仍保留在能力库中。'
                   : detail.kind === 'connector'
-                    ? 'API 连接插件已加入你的能力库，请到管理中心绑定应用账号。'
+                    ? '插件已加入你的能力库，请到管理中心绑定应用账号。'
                     : isAgent
                       ? installNeedsAuthorization
                         ? installResult?.ready
-                          ? `智能体已经可用；另有 ${installNeedsAuthorizationCount} 项可选 Plugin 可在绑定账号后启用。`
-                          : `智能体与能力已安装；完成 ${installNeedsAuthorizationCount} 项必需 Plugin 的账号授权后即可使用。`
+                          ? `智能体已经可用；另有 ${installNeedsAuthorizationCount} 项可选插件可在绑定账号后启用。`
+                          : `智能体与能力已安装；完成 ${installNeedsAuthorizationCount} 项必需插件的账号授权后即可使用。`
                         : `智能体与 ${installedCapabilityCount} 项能力已完整安装，可在智能体选择器中切换。`
                       : '将在你的下一次会话中对 AI 可用。'}
               </span>
@@ -811,21 +813,21 @@ export function DetailModal({
                 tone="warning"
                 title={
                   detail.capabilityReadiness.ready
-                    ? '该智能体可用，仍有可选 Plugin 待授权'
+                    ? '该智能体可用，仍有可选插件待授权'
                     : '该智能体尚未完全就绪'
                 }
                 action={
                   detailNeedsAuthorization && onOpenConnectors ? (
                     <Button size="sm" variant="secondary" onClick={() => onOpenConnectors()}>
-                      管理 Plugin 账号
+                      管理插件账号
                     </Button>
                   ) : undefined
                 }
               >
                 {detailNeedsAuthorization
                   ? detail.capabilityReadiness.ready
-                    ? `有 ${detail.capabilityReadiness.needsAuthorization.length} 个可选 Plugin 等待账号授权，不影响当前智能体使用。`
-                    : `有 ${detail.capabilityReadiness.needsAuthorization.length} 个必需 Plugin 等待账号授权。`
+                    ? `有 ${detail.capabilityReadiness.needsAuthorization.length} 个可选插件等待账号授权，不影响当前智能体使用。`
+                    : `有 ${detail.capabilityReadiness.needsAuthorization.length} 个必需插件等待账号授权。`
                   : hasRepairableRequiredCapability
                     ? '存在未安装或版本失效的必需能力，可重新安装整包修复。'
                     : '必需能力已被下架或撤销，需等待平台恢复或发布者更新。'}
@@ -837,7 +839,7 @@ export function DetailModal({
             </Alert>
           )}
           {isPreinstalledConnector && (
-            <Alert tone="info" title="官方预装 API 插件">
+            <Alert tone="info" title="官方预装插件">
               无需安装；可直接到管理中心绑定你的应用账号。
             </Alert>
           )}
@@ -863,7 +865,7 @@ export function DetailModal({
 
           {/* ① 身份与信任 + 真实使用信号:驱动「装不装」的东西必须紧贴标题,不能压在长介绍之后。
               色彩预算按语义分配:身份/信任 success、分类 info、标签与统计一律 neutral。 */}
-          <div className="flex flex-col gap-1.5">
+          <div className="marketplace-detail-facts flex flex-col gap-1.5">
             <div className="flex flex-wrap items-center gap-1.5">
               {isPreset && (
                 <Badge tone="success">
@@ -874,7 +876,7 @@ export function DetailModal({
               {isPreinstalledConnector ? (
                 <Badge tone="success">
                   <ShieldCheck size={12} aria-hidden="true" />
-                  官方 API 插件 · 已预装
+                  官方插件 · 已预装
                 </Badge>
               ) : detail.official ? (
                 <Badge tone="success">
@@ -1001,7 +1003,7 @@ export function DetailModal({
             </Section>
           ) : detail.kind === 'connector' ? (
             <Section>
-              <SectionTitle className="mb-1.5">API 插件 · 平台已签安全范围</SectionTitle>
+              <SectionTitle className="mb-1.5">插件 · 平台已签安全范围</SectionTitle>
               <div
                 className={cn(
                   cardVariants({ padding: 'sm', tone: 'sunken' }),

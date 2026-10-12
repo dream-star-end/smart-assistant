@@ -25,6 +25,7 @@ export const SKILL_EVAL_BLOCKED_TOOL_NAMES = [
   'present_task_approval',
   'ask_user',
   'present_options',
+  'project_search',
 ] as const satisfies readonly MemoryMcpToolName[]
 
 const blocked = new Set<string>(SKILL_EVAL_BLOCKED_TOOL_NAMES)

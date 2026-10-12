@@ -26,6 +26,7 @@ describe('automatic turn recovery policy', () => {
       'bad_sequence', // requires exact sync before any new dispatch
       'codex_turn_busy', // another turn owns the session; FIFO lifecycle owns it
       'codex_billing', // billing admission result is not a model continuation proof
+      'project_context_unavailable', // held before dispatch until the master answers; user retries
     ])
     const actual = Object.entries(TURN_ERROR_TAXONOMY)
       .filter(([, semantics]) =>

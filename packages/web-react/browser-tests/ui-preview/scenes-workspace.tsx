@@ -102,7 +102,6 @@ export const workspaceScenes: Scene[] = [
         theme="light"
         onClose={() => {}}
         onSetTheme={() => {}}
-        onOpenMemory={() => {}}
         initialSection="about"
       />
     ),

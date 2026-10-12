@@ -12,6 +12,7 @@ import {
 import { type ReactNode, useCallback, useEffect, useState } from 'react'
 import { api, apiErrorMessage } from '../../lib/api'
 import { updateAvailable } from '../../lib/marketplace'
+import { usePluginDirectory } from '../../lib/usePluginDirectory'
 import type {
   AuthSession,
   MarketplaceCapabilityReadiness,
@@ -88,7 +89,7 @@ export function agentReadinessSummary(readiness: MarketplaceCapabilityReadiness 
 } {
   if (!readiness) return { badge: null, caption: null }
   const items = readiness.requirements
-  if (items.length === 0) return { badge: null, caption: '不依赖额外 Skill / Plugin' }
+  if (items.length === 0) return { badge: null, caption: '不依赖额外的技能 / 插件' }
   const readyCount = items.filter((i) => i.status === 'ready').length
   const caption = `${readyCount}/${items.length} 项组合能力就绪`
   const onlyAuth = (list: typeof items) => list.every((i) => i.status === 'needs_authorization')
@@ -98,8 +99,8 @@ export function agentReadinessSummary(readiness: MarketplaceCapabilityReadiness 
     return {
       badge: {
         tone: 'warning',
-        text: `必需能力已就绪 · ${optionalPending.length} 项可选 ${
-          onlyAuth(optionalPending) ? 'Plugin 待授权' : '能力未就绪'
+        text: `必需能力已就绪 · ${optionalPending.length} 项可选${
+          onlyAuth(optionalPending) ? '插件待授权' : '能力未就绪'
         }`,
       },
       caption,
@@ -111,7 +112,7 @@ export function agentReadinessSummary(readiness: MarketplaceCapabilityReadiness 
     badge: {
       tone: 'warning',
       text: requiredPending.length > 0 && onlyAuth(requiredPending)
-        ? `${n} 项必需 Plugin 待授权`
+        ? `${n} 项必需插件待授权`
         : `${n} 项必需能力未就绪`,
     },
     caption,
@@ -176,6 +177,9 @@ export function InstalledPanel({
   const skillRows = rows?.filter((r) => r.kind === 'skill') ?? []
   const connectorRows = rows?.filter((r) => r.kind === 'connector') ?? []
   const isEmpty = !rows || rows.length === 0
+  // 插件行的状态与管理中心同一判据（OCV5-379）；目录读不到时不显示状态，行照常渲染。
+  const pluginDirectory = usePluginDirectory(auth, connectorRows.length > 0, reload)
+  const pluginState = (slug: string) => pluginDirectory?.find((e) => e.slug === slug) ?? null
 
   useEffect(() => {
     let alive = true
@@ -320,6 +324,7 @@ export function InstalledPanel({
     return (
       <li key={r.slug}>
         <CardRow
+          className="marketplace-installed-row"
           icon={<KindChip kind={r.kind} revoked={revoked} />}
           title={r.name}
           meta={
@@ -368,7 +373,7 @@ export function InstalledPanel({
                 )}
                 {showAuthorize && onOpenConnectors && (
                   <Button variant="secondary" size="sm" onClick={() => onOpenConnectors()}>
-                    授权 Plugin
+                    授权插件
                   </Button>
                 )}
                 {showScope && (
@@ -401,7 +406,8 @@ export function InstalledPanel({
   }
 
   return (
-    <div className="flex flex-col">
+    <div className="marketplace-library flex flex-col">
+      <header className="marketplace-page-heading"><span className="marketplace-eyebrow">YOUR COLLECTION</span><h2>我的能力库</h2><p>管理已安装的工具，让每一项能力各就其位。</p></header>
       <Modal
         open={pendingUninstall !== null}
         onOpenChange={(open) => {
@@ -417,7 +423,7 @@ export function InstalledPanel({
         }
         description={
           pendingUninstall?.isAgent
-            ? '智能体会被移除；仅由它自动带来的 Skill 会退出。Plugin 会保留到你主动卸载。'
+            ? '智能体会被移除；仅由它自动带来的技能会退出。插件会保留到你主动卸载。'
             : '卸载后将不再可用；其他智能体对它的依赖会明确显示为未就绪。'
         }
         footer={
@@ -518,7 +524,7 @@ export function InstalledPanel({
       ) : err && !rows ? null : isEmpty ? (
         <EmptyState
           icon={PackageOpen}
-          title="还没有安装任何技能或智能体"
+          title="还没有安装任何技能、智能体或插件"
           hint="去市场发现别人沉淀好的能力，一键安装即可使用。"
           action={
             <Button variant="secondary" size="sm" onClick={onGoBrowse}>
@@ -541,7 +547,7 @@ export function InstalledPanel({
           {connectorRows.length > 0 && (
             // 只读镜像:绑定账号/更新/卸载的权威在管理中心,这里不重复提供,免得两处争权威。
             <Group
-              title={`API 连接插件（${connectorRows.length}）`}
+              title={`插件（${connectorRows.length}）`}
               hint="在管理中心统一绑定账号、更新与卸载。"
               action={
                 onOpenConnectors ? (
@@ -551,15 +557,23 @@ export function InstalledPanel({
                 ) : undefined
               }
             >
-              {connectorRows.map((r) => (
+              {connectorRows.map((r) => {
+                const state = pluginState(r.slug)
+                return (
                 <li key={r.slug}>
                   <CardRow
+          className="marketplace-installed-row"
                     icon={<KindChip kind="connector" revoked={r.listingState === 'revoked'} />}
                     title={r.name}
                     meta={
                       <>
                         <Badge tone="neutral">v{r.version}</Badge>
                         {r.listingState === 'revoked' && <Badge tone="warning">已被下架</Badge>}
+                        {state && (
+                          <Badge tone={state.tone} data-testid="plugin-state">
+                            {state.stateLabel}
+                          </Badge>
+                        )}
                         <span className="text-meta text-faint">
                           安装于 <TimeAgo value={r.installedAt} />
                         </span>
@@ -573,13 +587,14 @@ export function InstalledPanel({
                           variant="secondary"
                           onClick={() => onOpenConnectors(r.slug)}
                         >
-                          去绑定
+                          {state && state.state !== 'needs-connect' ? '管理账号' : '去绑定'}
                         </Button>
                       ) : undefined
                     }
                   />
                 </li>
-              ))}
+                )
+              })}
             </Group>
           )}
         </div>

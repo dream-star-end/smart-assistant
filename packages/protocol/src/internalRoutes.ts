@@ -67,6 +67,10 @@ export const SKILL_FEEDBACK_PATH = '/internal/v3/marketplace/skill-feedback'
 export const SKILL_SHADOW_PATH = '/internal/v3/skill-shadow'
 export const PLATFORM_PROMPT_SLOTS_PATH = '/internal/v3/platform-prompt-slots'
 export const PROJECT_CONTEXT_PATH = '/internal/v3/project-context'
+/** Container → master: register turn outputs as project assets in the master sessions backend. */
+export const PROJECT_ASSETS_REGISTER_PATH = '/internal/v3/project-assets'
+/** Container → master: project_search over the current run's project files (P5a). */
+export const PROJECT_SEARCH_PATH = '/internal/v3/project-search'
 export const CRON_INDEX_PATH = '/internal/v3/cron-index'
 export const CRON_ORIGIN_INJECT_PATH = '/internal/v3/cron-origin-inject'
 export const INBOX_POST_PATH = '/internal/v3/inbox-post'
@@ -106,6 +110,8 @@ export const DELEGATE_END_CUTOVER_PATH = '/internal/v3/delegate-end-cutover'
 // ── v3 容器 gateway loopback 本地面(容器内工具→gateway,不出容器边界)────────
 export const MARKETPLACE_LOCAL_RELAY_PREFIX = '/internal/v3/marketplace/agent-local'
 export const SKILL_LOCAL_RELAY_PREFIX = '/internal/v3/skill-local'
+/** project_search MCP tool → this container's gateway (loopback + gateway token), then master. */
+export const PROJECT_SEARCH_LOCAL_PATH = '/internal/v3/project-search-local'
 
 export type InternalRoutePlane = 'v3' | 'v5'
 export type InternalRouteMatch = 'exact' | 'prefix'
@@ -322,6 +328,18 @@ export const INTERNAL_ROUTES = [
     sources: ['gateway/src/projectContextRuntime.ts', 'commercial/src/http/internalProjectContext.ts'],
   },
   {
+    path: PROJECT_ASSETS_REGISTER_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/projectAssetCollector.ts', 'commercial/src/http/internalProjectAssets.ts'],
+  },
+  {
+    path: PROJECT_SEARCH_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/projectSearchLocal.ts', 'commercial/src/http/internalProjectSearch.ts'],
+  },
+  {
     path: CRON_INDEX_PATH,
     match: 'exact',
     plane: 'v3',
@@ -533,6 +551,12 @@ export const INTERNAL_ROUTES = [
     match: 'prefix',
     plane: 'v3',
     sources: ['gateway/src/ocSkillLocalRelay.ts'],
+  },
+  {
+    path: PROJECT_SEARCH_LOCAL_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/projectSearchLocal.ts', 'mcp-memory/src/projectFileSearch.ts'],
   },
 ] as const satisfies readonly InternalRouteEntry[]
 

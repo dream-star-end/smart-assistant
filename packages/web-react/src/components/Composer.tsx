@@ -16,13 +16,25 @@ import {
   Target,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode, type SetStateAction } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+  type SetStateAction,
+} from "react";
 import { useVoiceInput } from "../hooks/useVoiceInput";
 import { useComposerDraft } from "../hooks/useComposerDraft";
 import { apiErrorMessage } from "../lib/api";
 import { appUpdate } from "../lib/appUpdate";
 import { BRAND } from "../lib/brand";
 import { clearDraft, draftExceedsStorage } from "../lib/composerDraft";
+import { completionFor, type InputPrediction } from "../lib/inputCompletion";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { useImageEditActions } from "./chat/imageEditActions";
 import { GoalDialog, STATUS_LABEL, goalNearBudget, visibleGoalOf, type GoalSetInput } from "./GoalDialog";
@@ -60,6 +72,11 @@ type Attach = {
 // 附件件数上限:与后端 gateway 帧准入共用 protocol 单一权威常量,消除历史上前端 8 / 后端 5
 // 的漂移(用户挂 6-8 个上传成功却被后端拒)。
 const MAX_ATTACH = MAX_ATTACHMENTS_PER_MESSAGE;
+
+// 输入预测的浅色字浮层:有预测时才加载,不进首屏包(OCV5-375)。只是提示,加载失败(发版后的
+// 旧标签页取不到旧 chunk)就不显示,不走 ChunkErrorBoundary 的整页「刷新」接管。
+const NoPrediction: typeof import("./ComposerPrediction").default = () => null;
+const ComposerPrediction = lazy(() => import("./ComposerPrediction").catch(() => ({ default: NoPrediction })));
 
 function mediaKindOf(mime: string): MediaRef["kind"] {
   if (mime.startsWith("image/")) return "image";
@@ -173,6 +190,8 @@ export function Composer({
   lastUserText,
   draftKey,
   goalOpenRequest,
+  projectSlot,
+  prediction,
 }: {
   /** 发送：当前正文 + 可选已上传媒体 + 可选精确引用快照。 */
   onSend: (text: string, media?: MediaRef[], replyTo?: MessageReplyQuote) => void;
@@ -217,6 +236,11 @@ export function Composer({
   draftKey?: string;
   /** 外部请求打开目标对话框：nonce 变化即打开（与 prefill 同模式）。 */
   goalOpenRequest?: number;
+  /** 项目标识(ComposerProjectPill)。sm+ 在工具行,窄屏在底栏(与仓库入口同排)。 */
+  projectSlot?: ReactNode;
+  /** 输入预测(lib/inputCompletion):空输入框显示 next(直接点发送就发出),输入中按 candidates 补全;Tab / → 填入。
+   *  省略或 null = 关闭(设置里关掉、demo)。 */
+  prediction?: InputPrediction | null;
 }) {
   // 图片编辑入口收口到 ImageEditActionsContext 单一权威(与聊天内图同源门控),
   // 不再经 App→Composer prop 平行下传 onAnnotateImage/reason(消除并行机制)。
@@ -276,6 +300,47 @@ export function Composer({
   const fileInputId = useId();
   // 已创建的 object URL 集合：卸载时统一 revoke（state 闭包在 cleanup 里是 stale，靠 ref 兜底）。
   const objectUrlsRef = useRef<Set<string>>(new Set());
+
+  // 输入预测(OCV5-375):浅色字叠在正文后面,不进 value。
+  // 输入法组字中、光标不在末尾、生成中(整句预测属于上一条回答)时不显示;Esc 收起本条整句预测。
+  // 整句预测(空输入框)直接点发送就发出去;带附件或引用时不显示,免得发送按钮的含义说不清。
+  // 打字后的补全只是提示,发送只发已输入的部分。
+  const [ghostShown, setGhostShown] = useState<{ rest: string; px: number } | null>(null);
+  const predictionHintId = useId();
+  const [composing, setComposing] = useState(false);
+  const [caretAtEnd, setCaretAtEnd] = useState(true);
+  const [dismissedPrediction, setDismissedPrediction] = useState<string | null>(null);
+  const nextPrediction = prediction?.next?.text ?? null;
+  const ghostRest =
+    !prediction || disabled || composing || (value !== "" && !caretAtEnd)
+      ? null
+      : value === ""
+        ? !busy && attachments.length === 0 && !replyTo && nextPrediction && nextPrediction !== dismissedPrediction
+          ? nextPrediction
+          : null
+        : completionFor(value, prediction.candidates);
+  // 只有浮层真的显示出来的那句才发(浮层是懒加载的,加载失败时什么都不显示,也就不能发)。
+  const sendablePrediction = value === "" && ghostRest && ghostShown?.rest === ghostRest ? ghostRest : null;
+  // 值没变就不调 setState(连「返回原值」的更新也不排):浮层的报告可能落在 commit 阶段,
+  // 白排的同步更新会被 React 记成嵌套更新(#185)。
+  const ghostShownRef = useRef(ghostShown);
+  const onPredictionShown = useCallback((rest: string, px: number) => {
+    const prev = ghostShownRef.current;
+    if (prev && prev.rest === rest && prev.px === px) return;
+    ghostShownRef.current = { rest, px };
+    setGhostShown(ghostShownRef.current);
+  }, []);
+  const acceptPrediction = () => {
+    if (!ghostRest) return;
+    const next = value + ghostRest;
+    setValue(next);
+    requestAnimationFrame(() => {
+      const el = ref.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(next.length, next.length);
+    });
+  };
 
   // 版本握手 busy 探针:有未发送草稿/附件 → 软刷新推迟。正文草稿按 draftKey 写入
   // sessionStorage,但附件/引用仍只在内存,reload 会丢。
@@ -375,8 +440,9 @@ export function Composer({
     const el = ref.current;
     if (!el) return;
     el.style.height = "0px";
-    el.style.height = Math.min(el.scrollHeight, 240) + "px";
-  }, [value]);
+    // 整句预测比空输入框长时会折行:按浅色字的高度撑开,别压到下面的工具行上。
+    el.style.height = Math.min(Math.max(el.scrollHeight, ghostRest && ghostShown?.rest === ghostRest ? ghostShown.px : 0), 240) + "px";
+  }, [value, ghostRest, ghostShown]);
 
   const uploading = attachments.some((a) => a.status === "uploading");
   const attachFailed = attachments.some((a) => a.status === "error");
@@ -384,7 +450,8 @@ export function Composer({
     .filter((a) => a.status === "done" && a.media)
     .map((a) => a.media as MediaRef);
   // error 与 uploading 同等拦截：失败附件不得被静默丢掉后把正文发出去。
-  const canSend = (value.trim().length > 0 || doneMedia.length > 0) && !uploading && !attachFailed;
+  const canSend =
+    (value.trim().length > 0 || doneMedia.length > 0 || !!sendablePrediction) && !uploading && !attachFailed;
   // 草稿超过 sessionStorage 上限后只留内存、刷新即丢,此前没有任何预警(C-21)。
   const draftVolatile = !!draftKey && draftExceedsStorage(value);
 
@@ -408,12 +475,19 @@ export function Composer({
     [revoke],
   );
 
-  const submit = () => {
+  // sendPrediction:只有发送按钮传 true。键盘 Enter 在空输入框里不发预测(防误发,先 Tab 填入再 Enter)。
+  const submit = (sendPrediction = false) => {
     // 生成中(busy)不再拒发:发送经 WS service 的"排队"路径(status=queued),本轮结束自动
     // 发出(对标 ChatGPT/Claude),用户不再干等。并轨安全由 service 侧保证——排队项只在
     // 本会话 _sendingInFlight 清除后才真正下发,绝不 mid-turn 并发送(见 socket.dispatchPayload)。
     if (disabled || !canSend) return;
-    onSend(value.trim(), doneMedia.length ? doneMedia : undefined, replyTo ?? undefined);
+    // 空输入框(没有附件、没有引用)时 canSend 只可能来自正在显示的整句预测:按钮发出这句。
+    const typed = value.trim().length > 0 || doneMedia.length > 0;
+    if (!typed && !sendPrediction) return;
+    const text = typed ? value.trim() : (sendablePrediction ?? "").trim();
+    onSend(text, doneMedia.length ? doneMedia : undefined, replyTo ?? undefined);
+    // 发出去的预测本地立刻作废:value 本来就是空的,不作废的话在父层换掉 prediction 之前再点一次会重复发送。
+    if (!typed && sendablePrediction) setDismissedPrediction(sendablePrediction);
     setValue("");
     if (draftKey) clearDraft(draftKey);
     for (const a of attachments) revoke(a.previewUrl);
@@ -623,7 +697,7 @@ export function Composer({
           data-product-entry-scope="composer-primary"
           data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
         >
-          <div className="flex px-1" data-testid="composer-input-row">
+          <div className="relative flex px-1" data-testid="composer-input-row">
             <textarea
               data-product-feature={PRODUCT_CAPABILITIES.chatBasics.id}
               ref={ref}
@@ -631,7 +705,17 @@ export function Composer({
               value={value}
               disabled={disabled}
               aria-label="消息输入框"
-              onChange={(e) => setValue(e.target.value)}
+              aria-describedby={ghostRest ? predictionHintId : undefined}
+              onChange={(e) => {
+                setValue(e.target.value);
+                setCaretAtEnd(e.target.selectionEnd === e.target.value.length);
+              }}
+              onSelect={(e) => {
+                const el = e.currentTarget;
+                setCaretAtEnd(el.selectionStart === el.selectionEnd && el.selectionEnd === el.value.length);
+              }}
+              onCompositionStart={() => setComposing(true)}
+              onCompositionEnd={() => setComposing(false)}
               onPaste={(e) => {
                 if (!onUpload) return;
                 const images = clipboardImages(e.clipboardData);
@@ -640,6 +724,20 @@ export function Composer({
                 void onFiles(images);
               }}
               onKeyDown={(e) => {
+                // 采用预测:Tab,或光标在末尾时按 →。没有预测时 Tab 照常移动焦点。
+                if (
+                  ghostRest &&
+                  (e.key === "Tab" || e.key === "ArrowRight") &&
+                  !e.nativeEvent.isComposing &&
+                  !e.shiftKey &&
+                  !e.altKey &&
+                  !e.ctrlKey &&
+                  !e.metaKey
+                ) {
+                  e.preventDefault();
+                  acceptPrediction();
+                  return;
+                }
                 if (e.key === "ArrowUp" && value === "" && !e.nativeEvent.isComposing && lastUserText) {
                   e.preventDefault();
                   setValue(lastUserText);
@@ -658,6 +756,12 @@ export function Composer({
                   onCancelReply();
                   return;
                 }
+                // Esc 收起整句预测(不在生成中才会显示,不和全局「停止生成」抢键)。
+                if (e.key === "Escape" && value === "" && ghostRest && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  setDismissedPrediction(ghostRest);
+                  return;
+                }
                 if (e.key === "Enter" && !e.nativeEvent.isComposing) {
                   // 粗指针(移动/触屏):Enter=换行,发送交给按钮 —— 否则无法输入多段消息。
                   if (coarsePointer) return;
@@ -670,12 +774,23 @@ export function Composer({
                 }
               }}
               enterKeyHint={coarsePointer ? "enter" : "send"}
-              placeholder={placeholder}
+              placeholder={value === "" && ghostRest ? "" : placeholder}
               className={cn(
                 "max-h-[240px] min-h-[24px] w-full flex-1 resize-none bg-transparent py-1.5 leading-relaxed text-fg outline-none placeholder:text-faint disabled:opacity-50",
                 fontSize === "large" ? "text-[17.5px]" : "text-[16px]",
               )}
             />
+            {ghostRest && (
+              <Suspense fallback={null}>
+                <ComposerPrediction
+                  value={value}
+                  rest={ghostRest}
+                  large={fontSize === "large"}
+                  hintId={predictionHintId}
+                  onShown={onPredictionShown}
+                />
+              </Suspense>
+            )}
           </div>
           <div className="mt-1 flex items-center gap-1.5" data-testid="composer-tool-row">
             {/* file input 用 sr-only(视觉隐藏但非 display:none)+ tabindex=-1,配合工具条
@@ -797,6 +912,11 @@ export function Composer({
             {/* GitHub 仓库入口在 sm+ 并入工具行左侧(与附件/「+」同组,少一层视觉层级)。
                 390px 下 5 个 44px 按钮(含生成中的「排队发送」)加未绑定态不可截断的「关联 GitHub 仓库」会撑爆一行
                 (after 截图实测 pill 压在排队键上),窄屏仍放在外壳下方的底栏(见下)。 */}
+            {projectSlot && (
+              <span className="hidden min-w-0 items-center sm:flex" data-testid="composer-project-slot">
+                {projectSlot}
+              </span>
+            )}
             {onOpenRepo && (
               <span className="hidden min-w-0 items-center sm:flex" data-testid="composer-repo-slot">
                 <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />
@@ -877,6 +997,7 @@ export function Composer({
                 type="button"
                 data-product-control
                 aria-label={stopping ? "正在停止" : busy ? "停止" : "发送"}
+                aria-describedby={!busy && sendablePrediction ? predictionHintId : undefined}
                 title={
                   attachFailed
                     ? "有附件上传失败，请重试或移除后再发送"
@@ -884,14 +1005,16 @@ export function Composer({
                       ? "附件上传中"
                       : busy && !stopping
                         ? "停止生成"
-                        : undefined
+                        : sendablePrediction
+                          ? "发送这句预测"
+                          : undefined
                 }
                 onClick={() => {
                   if (busy) {
                     if (!stopping) onStop?.();
                     return;
                   }
-                  submit();
+                  submit(true);
                 }}
                 disabled={stopping || (!canSend && !busy) || disabled}
                 className={cn(
@@ -916,9 +1039,13 @@ export function Composer({
         </div>
       </div>
       {/* 窄屏底栏:GitHub 仓库入口(sm+ 已并入工具行,这里只在 <sm 渲染)。 */}
-      {onOpenRepo && (
-        <div className="flex min-h-[30px] items-center px-1.5 py-1.5 sm:hidden" data-testid="composer-repo-slot-mobile">
-          <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />
+      {(onOpenRepo || projectSlot) && (
+        <div
+          className="flex min-h-[30px] min-w-0 items-center gap-2 px-1.5 py-1.5 sm:hidden"
+          data-testid="composer-repo-slot-mobile"
+        >
+          {projectSlot}
+          {onOpenRepo && <RepoPill selection={repoSelection ?? null} onClick={onOpenRepo} />}
         </div>
       )}
       {/* 语音状态(录音/转写/错误)常驻 live region(C-19):容器随 voiceEnabled 常在、内容变化才被读屏播报;

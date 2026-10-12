@@ -46,6 +46,7 @@ export function SessionRow({
   onDelete,
   onTogglePin,
   onMoveToProject,
+  onCreateProjectFromSession,
   onArchive,
   onMarkRead,
   unread,
@@ -55,6 +56,7 @@ export function SessionRow({
   onEnterMultiSelect,
   allowDrag,
   highlightQuery,
+  projectHint,
 }: {
   session: Session;
   active: boolean;
@@ -70,6 +72,7 @@ export function SessionRow({
   onDelete: (s: Session) => void;
   onTogglePin?: (s: Session) => void;
   onMoveToProject?: (s: Session, projectId: string | null) => void;
+  onCreateProjectFromSession?: (s: Session) => void;
   onArchive?: (s: Session) => void;
   onMarkRead?: (id: string) => void;
   unread?: boolean;
@@ -80,6 +83,8 @@ export function SessionRow({
   allowDrag: boolean;
   /** 搜索态：标题里的命中词与消息命中一样用 <mark> 标出（S-11）。 */
   highlightQuery?: string;
+  /** 搜索结果里显示会话所在项目(平时由分组表达,搜索结果是平铺的)。 */
+  projectHint?: string;
 }) {
   const live = liveTerminal?.(s.id);
   const running = isSidebarSessionRunning(s, { isSending, liveTerminal });
@@ -220,6 +225,11 @@ export function SessionRow({
               title
             )}
           </span>
+          {projectHint && (
+            <span data-testid="session-row-project" className="ml-1.5 max-w-[45%] shrink-0 truncate text-caption text-faint">
+              {projectHint}
+            </span>
+          )}
         </button>
         {/* 尾部槽：用时与「更多」叠放在同一位置。桌面悬停 / 键盘聚焦 / 菜单打开时用时淡出、「更多」淡入，
             标题不再常年被一个隐形的 24px 按钮挤掉宽度。触屏只在当前会话常显「更多」，
@@ -299,7 +309,7 @@ export function SessionRow({
                     移动到项目
                   </DropdownMenuSubTrigger>
                   <DropdownMenuSubContent className="w-44">
-                    {projects.length === 0 && (
+                    {projects.length === 0 && !onCreateProjectFromSession && (
                       <DropdownMenuItem disabled>还没有项目</DropdownMenuItem>
                     )}
                     {projects.map((p) => (
@@ -316,6 +326,14 @@ export function SessionRow({
                         <DropdownMenuSeparator />
                         <DropdownMenuItem onSelect={() => onMoveToProject(s, null)}>
                           移出项目
+                        </DropdownMenuItem>
+                      </>
+                    )}
+                    {onCreateProjectFromSession && (
+                      <>
+                        {(projects.length > 0 || s.projectId) && <DropdownMenuSeparator />}
+                        <DropdownMenuItem onSelect={() => onCreateProjectFromSession(s)}>
+                          新建项目并移入…
                         </DropdownMenuItem>
                       </>
                     )}

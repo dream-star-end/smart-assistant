@@ -41,6 +41,8 @@ export interface InternalProjectContextBody {
   name: string | null;
   /** PG/sqlite instructions. Bound runtime must not treat this as SoT. */
   instructions: string | null;
+  /** Creation template; the container uses it for a new board's default workspace. */
+  template: string | null;
   pinnedAssets: ProjectAsset[];
   assetsRevision: number;
 }
@@ -75,6 +77,7 @@ function emptyBody(userId: string): InternalProjectContextBody {
     boardProjectId: null,
     name: null,
     instructions: null,
+    template: null,
     pinnedAssets: [],
     assetsRevision: 0,
   };
@@ -157,6 +160,7 @@ export function makeInternalProjectContextHandler(
           boardProjectId: bind.boardProjectId,
           name: bind.name,
           instructions: bind.instructions,
+          template: bind.template ?? null,
           pinnedAssets: pinned.assets,
           assetsRevision: pinned.revision || assetsRevision(pinned.assets),
         }

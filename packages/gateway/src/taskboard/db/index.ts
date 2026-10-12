@@ -27,6 +27,7 @@ import { ensureSettingsRow } from './settings.js'
 
 export * from './schema.js'
 export * from './projects.js'
+export * from './ensureProject.js'
 export * from './tickets.js'
 export * from './pipelines.js'
 export * from './runs.js'

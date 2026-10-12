@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { App } from './App'
@@ -7,6 +7,29 @@ import { ChatSocket } from './lib/chat/socket'
 import { ToastProvider } from './components/ui'
 import { byteCacheKey, imageByteCache } from './lib/chat/imageBytes'
 import { setAuthHint } from './lib/authHint'
+import { prefetchMarkdownImpl } from './components/Markdown'
+import { loadBeforeAll } from './test/moduleLoad'
+import { preloadToolBody } from './components/tool/lazyToolBody'
+
+// 渲染工具卡展开体的断言要等懒加载的 tool bodies;先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(preloadToolBody)
+
+// App 首屏后会在空闲期预取这些懒块(prefetchLazyCentersOnIdle);在用例窗口之外先取好,
+// 冷加载就不计进某一个用例的 15s / findBy 5s(src/test/moduleLoad.ts)。
+loadBeforeAll(() =>
+  Promise.all([
+    prefetchMarkdownImpl(),
+    import('./components/Landing'),
+    import('./components/SettingsCenter'),
+    import('./components/ManageCenter'),
+    import('./components/MarketplaceCenter'),
+    import('./components/OrgCenter'),
+    import('./components/TutorialCenter'),
+    import('./components/MediaTaskCenter'),
+    import('./components/ImageViewer'),
+    import('./components/taskboard/TaskboardView'),
+  ]),
+)
 
 // ---------------------------------------------------------------------------
 // v5 商业版前端骨架（P2）测试
@@ -663,7 +686,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     const modelTrigger = screen.getByRole('button', { name: '选择对话模型' })
     fireEvent.pointerDown(modelTrigger, { button: 0, pointerType: 'mouse' })
     await screen.findAllByRole('menuitem')
-    // 2026-09-05 selfhost: Terra/Luna live in the collapsed "更多 GPT 模型" group.
+    // Commercial still serves the GPT-5.6 families: Terra/Luna live in the collapsed "更多 GPT 模型"
+    // group (selfhost retired them in 573b7c88b, so its copy of this case has no group to open).
     const collapsed = document.querySelector('[data-collapsed-group]')
     expect(collapsed).toBeTruthy()
     if (collapsed) fireEvent.click(collapsed)
@@ -709,6 +733,8 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
       model: 'gpt-5.6-terra',
       text: '先设目标再执行',
     }))
+    // fc1219307 (INC-20260923-QUEUE-ABOVE-COMPOSER): a prompt the socket has not started yet is
+    // listed above the composer, not in the transcript. jsdom has no live socket, so it waits there.
     if (!navigate) {
       await waitFor(() => expect(screen.getAllByTestId('queued-send-row')).toHaveLength(1))
       expect(screen.getByTestId('queued-send-row').querySelector('p')?.textContent).toBe('先设目标再执行')
@@ -1089,9 +1115,9 @@ describe('Aurora v5 skeleton — demo mode (no network)', () => {
     expect(noFetch).not.toHaveBeenCalled()
   })
 
-  // shell 审计 S-01:⌘K 原先无条件打开移动端抽屉(Sheet 带 md:hidden)。桌面断点下抽屉不可见,
-  // 但 Radix 模态照常把 <body> 设成 pointer-events:none —— 整页点死且看不见任何弹层。
-  test('⌘K 桌面视口:只展开内联侧栏并聚焦搜索框,不打开移动抽屉(S-01)', async () => {
+  // P4: ⌘K opens the quick-switch palette (lazy chunk) instead of focusing the sidebar search.
+  // Desktop: no mobile drawer may open (shell S-01: a hidden Radix modal would freeze the page).
+  test('⌘K 桌面视口:打开快速跳转面板,再按一次关闭,不打开移动抽屉', async () => {
     window.history.replaceState({}, '', '/?demo=1')
     vi.stubGlobal('fetch', vi.fn(() => { throw new Error('demo mode must not hit the network') }) as unknown as typeof fetch)
     const realMatchMedia = window.matchMedia
@@ -1100,25 +1126,68 @@ describe('Aurora v5 skeleton — demo mode (no network)', () => {
     try {
       render(<App />)
       fireEvent.keyDown(window, { key: 'k', metaKey: true })
-      await waitFor(() => expect(screen.getByLabelText('搜索标题或消息')).toHaveFocus())
+      const input = await screen.findByRole('combobox', { name: '搜索与跳转' })
+      await waitFor(() => expect(input).toHaveFocus())
       expect(screen.queryByRole('dialog', { name: '会话导航' })).toBeNull()
-      expect(document.body.style.pointerEvents).not.toBe('none')
+      fireEvent.keyDown(input, { key: 'k', ctrlKey: true })
+      await waitFor(() => expect(screen.queryByTestId('command-palette')).toBeNull())
     } finally {
       window.matchMedia = realMatchMedia
     }
   })
 
-  test('⌘K 窄屏视口:仍打开会话导航抽屉(抽屉里有自己的搜索框)', async () => {
+  test('⌘K 键盘直达:输入会话标题,Enter 打开该会话', async () => {
+    window.history.replaceState({}, '', '/?demo=1')
+    vi.stubGlobal('fetch', vi.fn(() => { throw new Error('demo mode must not hit the network') }) as unknown as typeof fetch)
+    render(<App />)
+    const title = '锂金属负极枝晶抑制机理综述'
+    expect(screen.getAllByRole('button', { name: title }).some((b) => b.getAttribute('aria-current') === 'true')).toBe(false)
+    fireEvent.keyDown(window, { key: 'k', metaKey: true })
+    const input = await screen.findByRole('combobox', { name: '搜索与跳转' })
+    fireEvent.change(input, { target: { value: '锂金属' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(screen.queryByTestId('command-palette')).toBeNull())
+    await waitFor(() =>
+      expect(screen.getAllByRole('button', { name: title }).some((b) => b.getAttribute('aria-current') === 'true')).toBe(true),
+    )
+  })
+
+  // P1 项目主页:点侧栏项目名进主页;主页开始框在该项目开新会话并只发送一次首条消息。
+  test('项目主页:侧栏项目名打开主页,开始框发出的首条消息只发一次并回到对话', async () => {
+    window.history.replaceState({}, '', '/?demo=1')
+    vi.stubGlobal('fetch', vi.fn(() => { throw new Error('demo mode must not hit the network') }) as unknown as typeof fetch)
+    render(<App />)
+    fireEvent.click(screen.getAllByRole('button', { name: '新建项目' })[0])
+    fireEvent.change(await screen.findByPlaceholderText('例如：博士论文第三章'), { target: { value: '论文综述' } })
+    fireEvent.click(screen.getByRole('button', { name: '创建并开始' }))
+    const open = await screen.findByRole('button', { name: '论文综述' })
+    fireEvent.click(open)
+    expect(await screen.findByTestId('project-home')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1, name: '论文综述' })).toBeInTheDocument()
+
+    const box = await screen.findByRole('textbox', { name: '在「论文综述」里开始' })
+    fireEvent.change(box, { target: { value: '整理文献清单' } })
+    fireEvent.keyDown(box, { key: 'Enter' })
+    await waitFor(() => expect(screen.queryByTestId('project-home')).toBeNull())
+    await waitFor(
+      () => expect(screen.getAllByText(/收到，关于「整理文献清单」/)).toHaveLength(1),
+      { timeout: 8000 },
+    )
+    // 等回放结束后再确认没有第二次发送。
+    await new Promise((r) => setTimeout(r, 300))
+    expect(screen.getAllByText(/收到，关于「整理文献清单」/)).toHaveLength(1)
+  }, 20000)
+
+  test('窄屏:抽屉里的搜索与跳转按钮关闭抽屉并打开全屏面板', async () => {
     window.history.replaceState({}, '', '/?demo=1')
     vi.stubGlobal('fetch', vi.fn(() => { throw new Error('demo mode must not hit the network') }) as unknown as typeof fetch)
     // setup.ts 的 matchMedia 桩恒 matches=false → 视为 <md
     render(<App />)
-    expect(screen.queryByRole('dialog', { name: '会话导航' })).toBeNull()
-    fireEvent.keyDown(window, { key: 'k', metaKey: true })
+    fireEvent.click(screen.getAllByRole('button', { name: /^打开菜单/ })[0])
     const drawer = await screen.findByRole('dialog', { name: '会话导航' })
-    expect(drawer).toBeInTheDocument()
-    // jsdom 没有布局,两份侧栏(内联 + 抽屉)都在 DOM 里;抽屉里必须有搜索框可供聚焦逻辑挑选
-    expect(drawer.querySelector('[data-sidebar-search]')).not.toBeNull()
+    fireEvent.click(within(drawer).getByRole('button', { name: '搜索与跳转（项目、会话、文件）' }))
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '会话导航' })).toBeNull())
+    expect(await screen.findByTestId('command-palette')).toBeInTheDocument()
   })
 })
 
@@ -1739,6 +1808,44 @@ describe('Aurora v5 — P7 最小路由', () => {
     sessionStorage.removeItem('oc_v5_pending_case')
   }, 30000)
 
+  test('首页输入框写下的任务：登录后带入输入框且不自动发送（OCV5-342）', async () => {
+    sessionStorage.removeItem('oc_v5_pending_case')
+    fetchMock = routedFetch()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+
+    render(
+      <ToastProvider>
+        <App />
+      </ToastProvider>,
+    )
+    const input = await screen.findByLabelText('描述你想完成的任务', {}, { timeout: 15000 })
+    fireEvent.change(input, { target: { value: '  帮我写一份产品发布会的演讲稿  ' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    // 「免费开始」落到注册表单;任务已按案例同一个 pending 键暂存
+    await waitFor(() => expect(screen.getByRole('button', { name: /创建账号/ })).toBeInTheDocument())
+    const pending = JSON.parse(sessionStorage.getItem('oc_v5_pending_case') || 'null') as {
+      source?: string
+      starterPrompt?: string
+    } | null
+    expect(pending).toEqual({ source: 'landing', starterPrompt: '帮我写一份产品发布会的演讲稿' })
+
+    // 已有账号:注册表单「返回登录」改走登录(与注册成功后进入工作区是同一个消费点)
+    fireEvent.click(screen.getByRole('button', { name: '返回登录' }))
+    fireEvent.change(screen.getByLabelText('邮箱'), { target: { value: 'a@b.com' } })
+    fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'password123' } })
+    const submit = screen.getByRole('button', { name: '登录' })
+    await waitFor(() => expect(submit).not.toBeDisabled())
+    await act(async () => {
+      fireEvent.click(submit)
+    })
+    await waitFor(() => expect(sessionStorage.getItem('oc_v5_pending_case')).toBeNull(), {
+      timeout: 15000,
+    })
+    const box = await screen.findByPlaceholderText('和「全能助手」对话…', {}, { timeout: 15000 })
+    expect(box).toHaveValue('帮我写一份产品发布会的演讲稿')
+    expect(screen.getByText('已带入你在首页写下的任务，不会自动发送')).toBeInTheDocument()
+  }, 30000)
+
   test('教程 CTA 联动真实功能：反馈教程直达设置·反馈，且不会自动提交', async () => {
     await preloadLazyPanels()
     window.history.replaceState({}, '', '/?panel=help&topic=feedback-support')
@@ -1894,4 +2001,83 @@ describe('Aurora v5 — desktop enroll 特判', () => {
     await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
     expect(screen.queryByRole('heading', { name: '确认这台电脑' })).not.toBeInTheDocument()
   })
+})
+
+describe('Aurora v5 — 项目主页(P1 review)', () => {
+  const PROJECTS = { projects: [{ id: 'p1', name: '论文综述', sortOrder: 0, createdAt: 1, updatedAt: 1, sessionCount: 0 }] }
+  function withProjects(list: Promise<ReturnType<typeof okJson>> | ReturnType<typeof okJson> = okJson(PROJECTS)) {
+    const base = routedFetchTwoSessions()
+    return vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url).includes('/api/chat-projects')) return list
+      return (base as unknown as (url: string, init?: RequestInit) => Promise<unknown>)(url, init)
+    }) as unknown as FetchMock
+  }
+
+  test('开始框的首条消息用新会话的默认模型，不沿用刚才会话的模型', async () => {
+    const sendSpy = vi.spyOn(ChatSocket.prototype, 'sendMessage')
+    fetchMock = withProjects()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    render(<App />)
+    await waitFor(() => expect(screen.getByText('历史会话甲')).toBeInTheDocument())
+    await act(async () => {
+      fireEvent.click(screen.getByText('历史会话甲'))
+    })
+    await waitFor(() => expect(screen.getByText('历史答复正文')).toBeInTheDocument())
+
+    // 当前会话换到 Terra(B)；全局默认仍是首个模型 Sol(A)。
+    const trigger = screen.getAllByRole('button', { name: '选择对话模型' })[0]
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    await screen.findAllByRole('menuitem')
+    // Commercial keeps Terra in the collapsed "更多 GPT 模型" group (selfhost retired the family).
+    const collapsedGroup = document.querySelector('[data-collapsed-group]')
+    expect(collapsedGroup).toBeTruthy()
+    if (collapsedGroup) fireEvent.click(collapsedGroup)
+    const terra = (await screen.findAllByRole('menuitem')).find((item) => item.textContent?.includes('GPT-5.6-Terra'))
+    await act(async () => {
+      fireEvent.click(terra!)
+    })
+    const direct = screen.queryByRole('button', { name: '直接切换' })
+    if (direct) await act(async () => { fireEvent.click(direct) })
+    await waitFor(() => expect(trigger.textContent).toContain('GPT-5.6-Terra'))
+
+    fireEvent.click(await screen.findByRole('button', { name: '论文综述' }))
+    const box = await screen.findByRole('textbox', { name: '在「论文综述」里开始' })
+    fireEvent.change(box, { target: { value: '整理文献清单' } })
+    await act(async () => {
+      fireEvent.keyDown(box, { key: 'Enter' })
+    })
+    await waitFor(() => expect(sendSpy).toHaveBeenCalledTimes(1))
+    expect(sendSpy).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-5.6-sol', text: '整理文献清单' }))
+    expect(sendSpy.mock.calls[0]![0]).not.toHaveProperty('sessId', 'webhist01')
+    await act(async () => { await new Promise((r) => setTimeout(r, 100)) })
+    expect(sendSpy).toHaveBeenCalledTimes(1)
+  }, 30000)
+
+  test('boot /p/<id> 列表迟到前点新建：保持空白草稿，不被项目主页抢回', async () => {
+    window.history.replaceState({}, '', '/p/p1')
+    let resolveList!: (value: ReturnType<typeof okJson>) => void
+    const list = new Promise<ReturnType<typeof okJson>>((resolve) => { resolveList = resolve })
+    fetchMock = withProjects(list)
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    render(<App />)
+    fireEvent.click((await screen.findAllByRole('button', { name: /新建会话/ }))[0])
+    await waitFor(() => expect(window.location.pathname).toBe('/'))
+    await act(async () => {
+      resolveList(okJson(PROJECTS))
+      await list
+    })
+    await waitFor(() => expect(screen.getByRole('button', { name: '论文综述' })).toBeInTheDocument())
+    expect(screen.queryByTestId('project-home')).toBeNull()
+    expect(window.location.pathname).toBe('/')
+  }, 30000)
+
+  test('boot /p/<id>：列表到达后打开项目主页并保留 URL', async () => {
+    window.history.replaceState({}, '', '/p/p1/chats')
+    fetchMock = withProjects()
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    render(<App />)
+    expect(await screen.findByTestId('project-home')).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: /会话/ })).toHaveAttribute('aria-selected', 'true')
+    expect(window.location.pathname).toBe('/p/p1/chats')
+  }, 30000)
 })

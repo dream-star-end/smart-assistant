@@ -182,19 +182,20 @@ describe("useChatProjects reorderProjects 串行写入", () => {
   });
 });
 
-describe("useChatProjects onCreated", () => {
-  test("创建成功后 onCreated 收到 created", async () => {
+describe("useChatProjects createProject", () => {
+  test("一步创建：名称、指令、颜色一起提交，返回服务端记录并替换乐观行", async () => {
     const created: ChatProject = {
       id: "p-real",
       name: "新项目",
+      instructions: "用学术中文",
+      color: "info",
       sortOrder: 0,
       createdAt: 1,
       updatedAt: 1,
       sessionCount: 0,
     };
     vi.spyOn(api, "listChatProjects").mockResolvedValue([]);
-    vi.spyOn(api, "createChatProject").mockResolvedValue(created);
-    const onCreated = vi.fn();
+    const createSpy = vi.spyOn(api, "createChatProject").mockResolvedValue(created);
     const auth = createMemoryAuthSession(() => {}, "tok");
     const { result } = renderHook(() =>
       useChatProjects({
@@ -202,21 +203,45 @@ describe("useChatProjects onCreated", () => {
         auth,
         authSession: auth,
         userId: "u1",
-        promptText: async () => "新项目",
+        promptText: async () => null,
         confirmDialog: async () => true,
-        onCreated,
       }),
     );
     await waitFor(() => expect(api.listChatProjects).toHaveBeenCalled());
+    let got: ChatProject | null = null;
     await act(async () => {
-      await result.current.createProjectPrompt();
+      got = await result.current.createProject({ name: " 新项目 ", instructions: " 用学术中文 ", color: "info" });
     });
-    expect(onCreated).toHaveBeenCalledTimes(1);
-    expect(onCreated).toHaveBeenCalledWith(created);
+    expect(createSpy).toHaveBeenCalledWith(auth, { name: "新项目", instructions: "用学术中文", color: "info" });
+    expect(got).toEqual(created);
+    expect(result.current.projects.map((p) => p.id)).toEqual(["p-real"]);
   });
 
-  test("demo 分支创建不调用 onCreated", async () => {
-    const onCreated = vi.fn();
+  test("失败时撤回乐观行并返回 null", async () => {
+    vi.spyOn(api, "listChatProjects").mockResolvedValue([]);
+    vi.spyOn(api, "createChatProject").mockRejectedValue(new Error("boom"));
+    const auth = createMemoryAuthSession(() => {}, "tok");
+    const { result } = renderHook(() =>
+      useChatProjects({
+        demo: false,
+        auth,
+        authSession: auth,
+        userId: "u1",
+        promptText: async () => null,
+        confirmDialog: async () => true,
+      }),
+    );
+    await waitFor(() => expect(api.listChatProjects).toHaveBeenCalled());
+    let got: ChatProject | null = { id: "x" } as ChatProject;
+    await act(async () => {
+      got = await result.current.createProject({ name: "坏项目" });
+    });
+    expect(got).toBeNull();
+    expect(result.current.projects).toEqual([]);
+  });
+
+  test("demo 分支只建本地记录，不调接口", async () => {
+    const createSpy = vi.spyOn(api, "createChatProject");
     const auth = createMemoryAuthSession(() => {}, "tok");
     const { result } = renderHook(() =>
       useChatProjects({
@@ -224,14 +249,106 @@ describe("useChatProjects onCreated", () => {
         auth,
         authSession: auth,
         userId: "u1",
-        promptText: async () => "演示项目",
+        promptText: async () => null,
         confirmDialog: async () => true,
-        onCreated,
       }),
     );
+    let got: ChatProject | null = null;
     await act(async () => {
-      await result.current.createProjectPrompt();
+      got = await result.current.createProject({ name: "演示项目" });
     });
-    expect(onCreated).not.toHaveBeenCalled();
+    expect(createSpy).not.toHaveBeenCalled();
+    expect((got as ChatProject | null)?.name).toBe("演示项目");
+  });
+});
+
+describe("useChatProjects archive / pin / fenced delete / restore", () => {
+  function setup(projects: ChatProject[]) {
+    vi.spyOn(api, "listChatProjects").mockResolvedValue(projects);
+    const auth = createMemoryAuthSession(() => {}, "tok");
+    const restored: Array<[string, string[]]> = [];
+    const hook = renderHook(
+      () =>
+        useChatProjects({
+          demo: false,
+          auth,
+          authSession: auth,
+          userId: "u1",
+          promptText: async () => null,
+          confirmDialog: async () => true,
+          onUngroupProjectSessions: () => ["s1"],
+          onRestoreProjectSessions: (pid, ids) => void restored.push([pid, ids]),
+        }),
+      { wrapper: ToastProvider },
+    );
+    return { ...hook, restored };
+  }
+  const bound: ChatProject = { ...proj("p-bound"), boardProjectId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" };
+
+  test("delete pauses the project's cron and archives its board before deleting, and offers undo", async () => {
+    const order: string[] = [];
+    vi.spyOn(api, "listCron").mockResolvedValue([{ id: "j1", enabled: true }, { id: "j2", enabled: false }] as never);
+    vi.spyOn(api, "updateCron").mockImplementation(async (_a, id, patch) => {
+      order.push(`cron ${id} ${(patch as { enabled: boolean }).enabled}`);
+      return { ok: true } as never;
+    });
+    const tb = await import("../lib/taskboard");
+    vi.spyOn(tb.taskboardApi, "getProject").mockResolvedValue({ archivedAt: null } as never);
+    vi.spyOn(tb.taskboardApi, "patchProject").mockImplementation(async (_a, _id, body) => {
+      order.push(`board ${body.archivedAt ? "archived" : "open"}`);
+      return { ok: true } as never;
+    });
+    const del = vi.spyOn(api, "deleteChatProject").mockImplementation(async (_a, _id, paused) => {
+      order.push(`delete ${(paused ?? []).join(",")}`);
+    });
+    const { result } = setup([bound]);
+    await waitFor(() => expect(result.current.projects).toHaveLength(1));
+    await act(async () => {
+      await result.current.deleteProjectConfirm(bound);
+    });
+    expect(order).toEqual(["cron j1 false", "board archived", "delete j1"]);
+    expect(del).toHaveBeenCalledTimes(1);
+    expect(result.current.projects).toEqual([]);
+    expect(await screen.findByRole("button", { name: "撤销" })).toBeTruthy();
+  });
+
+  test("restore brings the project back, re-files exactly the re-linked chats and resumes the paused cron", async () => {
+    vi.spyOn(api, "restoreChatProject").mockResolvedValue({
+      project: bound,
+      pausedCronJobIds: ["j1"],
+      relinkedSessionIds: ["s1"],
+    });
+    const cron = vi.spyOn(api, "updateCron").mockResolvedValue({ ok: true } as never);
+    const tb = await import("../lib/taskboard");
+    vi.spyOn(tb.taskboardApi, "patchProject").mockResolvedValue({ ok: true } as never);
+    const { result, restored } = setup([]);
+    await waitFor(() => expect(api.listChatProjects).toHaveBeenCalled());
+    let ok = false;
+    await act(async () => {
+      ok = await result.current.restoreProject("p-bound");
+    });
+    expect(ok).toBe(true);
+    expect(result.current.projects.map((p) => p.id)).toEqual(["p-bound"]);
+    expect(restored).toEqual([["p-bound", ["s1"]]]);
+    expect(cron).toHaveBeenCalledWith(expect.anything(), "j1", { enabled: true });
+  });
+
+  test("archive and pin update the list; a failed archive rolls back", async () => {
+    const tb = await import("../lib/taskboard");
+    vi.spyOn(tb.taskboardApi, "getProject").mockResolvedValue({ archivedAt: null } as never);
+    vi.spyOn(tb.taskboardApi, "patchProject").mockResolvedValue({ ok: true } as never);
+    vi.spyOn(api, "patchChatProject")
+      .mockResolvedValueOnce({ ...bound, pinnedAt: 5 })
+      .mockRejectedValueOnce(new Error("500"));
+    const { result } = setup([bound]);
+    await waitFor(() => expect(result.current.projects).toHaveLength(1));
+    await act(async () => {
+      await result.current.setProjectPinned(bound, true);
+    });
+    expect(result.current.projects[0]?.pinnedAt).toBe(5);
+    await act(async () => {
+      await result.current.setProjectArchived(bound, true);
+    });
+    expect(result.current.projects[0]?.archivedAt ?? null).toBe(null);
   });
 });

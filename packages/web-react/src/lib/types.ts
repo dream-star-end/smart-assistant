@@ -111,7 +111,15 @@ export type ChatProject = {
   updatedAt: number;
   sessionCount: number;
   boardProjectId?: string | null;
+  /** Archived: hidden from the main list, cron fenced via its archived board. */
+  archivedAt?: number | null;
+  /** Pinned projects are listed first. */
+  pinnedAt?: number | null;
+  template?: "blank" | "repo" | "research" | "writing" | null;
 };
+
+/** GET /api/chat-projects?deleted=1 — restorable for 30 days. */
+export type DeletedChatProject = { id: string; name: string; deletedAt: number; sessionCount: number };
 
 /**
  * 聊天项目资产（用户上传的参考资料 + 会话产出物）。
@@ -128,10 +136,14 @@ export type ProjectAsset = {
   containerPath: string | null;
   mime: string | null;
   sizeBytes: number | null;
+  /** 内容 sha256。产出物的每个版本都带它和 url（指向那一版不可变的副本）。 */
+  digest?: string | null;
   excerpt: string | null;
   pinned: boolean;
   createdAt: number;
   updatedAt: number;
+  /** 只在列表里、且同一源路径有多个版本时出现：列表只给最新一版，这里是版本总数。 */
+  versionCount?: number;
 };
 
 /** POST /api/project-assets 请求体。`size` 对应资源字节数（响应字段是 `sizeBytes`）。 */
@@ -925,7 +937,8 @@ export type MediaSignResult = {
   expMs: number;
 };
 
-// ─── 用户文献库(research_documents,master 直存;ManageCenter「文献库」tab) ──
+// ─── 用户文献库(research_documents,master 直存)。管理中心「文献」分区已下线(OCV5-360),
+//     类型与 api.listResearchLibrary 等方法保留以便回滚恢复,后端路由与数据未动。 ──
 
 /** 文献库单篇(GET /api/me/research/library 的 documents 项)。 */
 export type ResearchLibraryDoc = {

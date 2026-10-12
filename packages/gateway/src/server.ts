@@ -1,6 +1,11 @@
 import { freezeGrokExecutionDescriptor } from '@openclaude/protocol'
 import { fetchIdentityCompatProjection, resolveRuntimeExecutionAgent } from '@openclaude/storage'
+import { handleChatProjectsHttp } from './routes/chatProjects.js'
+import type { GatewayHttpIo } from './routes/httpIo.js'
+import { handleProjectAssetsHttp } from './routes/projectAssets.js'
+import { saveUserSkill } from './userSkillWrite.js'
 import { resolveIdentityCompat, assertIdentityCompatReady } from '@openclaude/protocol'
+import { readServerFeatures } from '@openclaude/protocol'
 import { createHash, randomBytes, createHmac, timingSafeEqual } from 'node:crypto'
 import {
   constants as fsConstants,
@@ -136,7 +141,7 @@ import {
 } from './promptQueueCoordinator.js'
 import type { AgentSession, PromptQueueExecutionFence } from './sessionManager.js'
 import { resolveChatRunWorkspace } from './projectWorkspace.js'
-import { createRunContextDescriptor } from './runContextPersist.js'
+import { createRunContextDescriptor, webchatRunId } from './runContextPersist.js'
 import {
   HttpPromptQueueClient,
   readPromptQueueClientConfig,
@@ -212,25 +217,6 @@ import {
   SESSION_SEARCH_LIMIT_DEFAULT,
   SESSION_SEARCH_LIMIT_MAX,
   SESSION_LIST_LIMIT_MAX,
-  listChatProjects,
-  createChatProject,
-  updateChatProject,
-  deleteChatProject,
-  parseChatProjectName,
-  parseChatProjectOptionalText,
-  parseChatProjectSortOrder,
-  CHAT_PROJECT_COLOR_MAX,
-  CHAT_PROJECT_INSTRUCTIONS_MAX,
-  listProjectAssets,
-  createProjectAsset,
-  updateProjectAsset,
-  deleteProjectAsset,
-  parseProjectAssetName,
-  parseProjectAssetSource,
-  parseProjectAssetUrl,
-  parseProjectAssetOptionalContainerPath,
-  parseProjectAssetProjectId,
-  PROJECT_ASSET_PER_PROJECT_LIMIT,
   recordAutoDreamSuccessfulSession,
   listUnclaimedSessions,
   claimSession,
@@ -422,7 +408,6 @@ import { sendV3QqProactive, readV3QqProactiveConfig } from './v3QqProactive.js'
 import { postInboxMessage, postInboxMessageDurable } from './v3InboxPost.js'
 import { postInboxAlert, postInboxAlertDurable } from './v3InboxAlert.js'
 import { parseDocument } from './documentParser.js'
-import { tryExtractProjectAssetExcerpt } from './projectAssetCollector.js'
 import {
   makeDelegateProgressBlock,
   makeDelegateUsageProgressBlock,
@@ -599,6 +584,7 @@ import {
   decideSkillLocalRelay,
   SKILL_LOCAL_RELAY_PREFIX,
 } from './ocSkillLocalRelay.js'
+import { handleProjectSearchLocal, PROJECT_SEARCH_LOCAL_PATH } from './projectSearchLocal.js'
 import {
   startToolFailureReporter,
   type ToolFailureReporter,
@@ -2465,6 +2451,12 @@ export function attachPermissionSnapshotIfMissing<T extends {
 
 export class Gateway {
   private wss!: WebSocketServer
+  /** Bound helpers for the route modules in routes/ (OCV5-376 P2). */
+  private readonly httpIo: GatewayHttpIo = {
+    sendJson: (res, code, body) => this.sendJson(res, code, body),
+    readBody: (req, maxBytes) => this.readBody(req, maxBytes),
+    getUserId: (req) => this.getUserId(req),
+  }
   private httpServer!: ReturnType<typeof createServer>
   private router: Router
   private sessions: SessionManager
@@ -4119,6 +4111,21 @@ export class Gateway {
       return
     }
 
+    // project_search MCP tool (P5a): loopback-only + the raw gateway token (no JWT,
+    // no bridge bypass). Not an /api/* path, so the browser proxy never reaches it.
+    if (url.pathname === PROJECT_SEARCH_LOCAL_PATH) {
+      const authorized = checkToken(this.extractToken(req), this.deps.config.gateway.accessToken)
+      handleProjectSearchLocal({
+        method: req.method ?? 'GET',
+        url: req.url ?? '/',
+        remoteAddress: req.socket.remoteAddress,
+        authorized,
+      })
+        .then((r) => this.sendJson(res, r.status, r.body))
+        .catch((err) => this.sendInternalError(res, err))
+      return
+    }
+
     // ── Multi-user login (no auth required, rate-limited) ──
     if (url.pathname === '/api/auth/login' && req.method === 'POST') {
       // Use socket address only — X-Forwarded-For is client-spoofable; cloudflared connects locally
@@ -4909,292 +4916,11 @@ export class Gateway {
       return
     }
     // 侧栏聊天项目(与 /api/board/projects 看板无关)。浏览器直打 gateway,与 /api/sessions/list 同平面。
-    if (url.pathname === '/api/chat-projects') {
-      const userId = this.getUserId(req)
-      if (req.method === 'GET') {
-        listChatProjects(userId)
-          .then((projects) => this.sendJson(res, 200, { projects }))
-          .catch(() => this.sendJson(res, 500, { error: 'list failed' }))
-        return
-      }
-      if (req.method === 'POST') {
-        ;(async () => {
-          let data: { name?: unknown; instructions?: unknown; color?: unknown }
-          try {
-            data = JSON.parse(await this.readBody(req, 16 * 1024))
-          } catch {
-            this.sendJson(res, 400, { error: 'invalid JSON' })
-            return
-          }
-          if (parseChatProjectName(data.name) === null) {
-            this.sendJson(res, 400, { error: 'name required (1-60 chars)' })
-            return
-          }
-          const instructions = parseChatProjectOptionalText(data.instructions, CHAT_PROJECT_INSTRUCTIONS_MAX)
-          if ('invalid' in instructions) {
-            this.sendJson(res, 400, { error: 'instructions invalid (max 4000 chars)' })
-            return
-          }
-          const color = parseChatProjectOptionalText(data.color, CHAT_PROJECT_COLOR_MAX)
-          if ('invalid' in color) {
-            this.sendJson(res, 400, { error: 'color invalid (max 24 chars)' })
-            return
-          }
-          const result = await createChatProject(userId, data)
-          if (!result.ok) {
-            if (result.error === 'limit_exceeded') {
-              this.sendJson(res, 400, { error: 'project limit exceeded (max 100)' })
-              return
-            }
-            this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
-            return
-          }
-          this.sendJson(res, 200, { project: result.project })
-        })().catch(() => this.sendJson(res, 500, { error: 'create failed' }))
-        return
-      }
-      this.sendJson(res, 405, { error: 'method not allowed' })
-      return
-    }
-    const chatProjectMatch = url.pathname.match(/^\/api\/chat-projects\/([a-zA-Z0-9_-]{8,64})$/)
-    if (chatProjectMatch) {
-      const projectId = chatProjectMatch[1]
-      const userId = this.getUserId(req)
-      if (req.method === 'PATCH') {
-        ;(async () => {
-          let data: {
-            name?: unknown
-            instructions?: unknown
-            color?: unknown
-            sortOrder?: unknown
-            boardProjectId?: unknown
-          }
-          try {
-            data = JSON.parse(await this.readBody(req, 16 * 1024))
-          } catch {
-            this.sendJson(res, 400, { error: 'invalid JSON' })
-            return
-          }
-          const hasName = data.name !== undefined
-          const hasInstructions = data.instructions !== undefined
-          const hasColor = data.color !== undefined
-          const hasSort = data.sortOrder !== undefined
-          const hasBoard = data.boardProjectId !== undefined
-          if (!hasName && !hasInstructions && !hasColor && !hasSort && !hasBoard) {
-            this.sendJson(res, 400, { error: 'name, instructions, color, sortOrder or boardProjectId required' })
-            return
-          }
-          if (hasName && parseChatProjectName(data.name) === null) {
-            this.sendJson(res, 400, { error: 'name required (1-60 chars)' })
-            return
-          }
-          if (hasInstructions) {
-            const instructions = parseChatProjectOptionalText(data.instructions, CHAT_PROJECT_INSTRUCTIONS_MAX)
-            if ('invalid' in instructions) {
-              this.sendJson(res, 400, { error: 'instructions invalid (max 4000 chars)' })
-              return
-            }
-          }
-          if (hasColor) {
-            const color = parseChatProjectOptionalText(data.color, CHAT_PROJECT_COLOR_MAX)
-            if ('invalid' in color) {
-              this.sendJson(res, 400, { error: 'color invalid (max 24 chars)' })
-              return
-            }
-          }
-          if (hasSort && parseChatProjectSortOrder(data.sortOrder) === null) {
-            this.sendJson(res, 400, { error: 'sortOrder must be an integer' })
-            return
-          }
-          const result = await updateChatProject(userId, projectId, data)
-          if (!result.ok) {
-            if (result.error === 'not_found') {
-              this.sendJson(res, 404, { error: 'not found' })
-              return
-            }
-            if (result.error === 'board_project_bound') {
-              this.sendJson(res, 409, { error: 'board project already bound', code: 'board_project_bound' })
-              return
-            }
-            this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
-            return
-          }
-          this.sendJson(res, 200, { project: result.project })
-        })().catch(() => this.sendJson(res, 500, { error: 'patch failed' }))
-        return
-      }
-      if (req.method === 'DELETE') {
-        deleteChatProject(userId, projectId)
-          .then((result) => result.ok
-            ? this.sendJson(res, 200, { ok: true })
-            : this.sendJson(res, 404, { error: 'not found' }))
-          .catch(() => this.sendJson(res, 500, { error: 'delete failed' }))
-        return
-      }
-      this.sendJson(res, 405, { error: 'method not allowed' })
-      return
-    }
+    // 路由本体在 routes/chatProjects.ts(OCV5-376 P2,原样搬出)。
+    if (handleChatProjectsHttp(this.httpIo, req, res, url)) return
     // 聊天项目资产(上传参考资料 + 会话产出物索引)。浏览器直打 gateway,与 /api/chat-projects 同平面。
-    if (url.pathname === '/api/project-assets') {
-      const userId = this.getUserId(req)
-      if (req.method === 'GET') {
-        const rawProjectId = url.searchParams.get('projectId')
-        const projectId = rawProjectId === null || rawProjectId === '' || rawProjectId === 'none'
-          ? null
-          : rawProjectId
-        if (projectId !== null && (projectId.length < 8 || projectId.length > 64)) {
-          this.sendJson(res, 400, { error: 'invalid projectId' })
-          return
-        }
-        listProjectAssets(userId, { projectId })
-          .then((assets) => this.sendJson(res, 200, { assets }))
-          .catch(() => this.sendJson(res, 500, { error: 'list failed' }))
-        return
-      }
-      if (req.method === 'POST') {
-        ;(async () => {
-          let data: {
-            projectId?: unknown
-            source?: unknown
-            sessionId?: unknown
-            name?: unknown
-            url?: unknown
-            containerPath?: unknown
-            mime?: unknown
-            size?: unknown
-            digest?: unknown
-          }
-          try {
-            data = JSON.parse(await this.readBody(req, 16 * 1024))
-          } catch {
-            this.sendJson(res, 400, { error: 'invalid JSON' })
-            return
-          }
-          if (parseProjectAssetName(data.name) === null) {
-            this.sendJson(res, 400, { error: 'name required (1-200 chars)' })
-            return
-          }
-          if (parseProjectAssetSource(data.source) === null) {
-            this.sendJson(res, 400, { error: "source must be 'upload' or 'output'" })
-            return
-          }
-          const urlField = parseProjectAssetUrl(data.url)
-          if ('invalid' in urlField) {
-            this.sendJson(res, 400, { error: 'invalid url' })
-            return
-          }
-          const containerPath = parseProjectAssetOptionalContainerPath(data.containerPath)
-          if ('invalid' in containerPath) {
-            this.sendJson(res, 400, { error: 'invalid containerPath' })
-            return
-          }
-          if (!urlField.present && !containerPath.present) {
-            this.sendJson(res, 400, { error: 'url or containerPath required' })
-            return
-          }
-          let excerpt: string | null = null
-          try {
-            excerpt = await tryExtractProjectAssetExcerpt({
-              source: typeof data.source === 'string' ? data.source : '',
-              mime: typeof data.mime === 'string' ? data.mime : null,
-              url: urlField.present ? urlField.value : null,
-              containerPath: containerPath.present ? containerPath.value : null,
-              name: typeof data.name === 'string' ? data.name : null,
-            })
-          } catch {
-            excerpt = null
-          }
-          const result = await createProjectAsset(userId, { ...data, excerpt })
-          if (!result.ok) {
-            if (result.error === 'limit_exceeded') {
-              this.sendJson(res, 400, { error: `asset limit exceeded (max ${PROJECT_ASSET_PER_PROJECT_LIMIT})` })
-              return
-            }
-            if (result.error === 'project_not_found') {
-              this.sendJson(res, 404, { error: 'project not found' })
-              return
-            }
-            this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
-            return
-          }
-          this.sendJson(res, 200, {
-            asset: result.asset,
-            created: result.created,
-            reused: !result.created,
-          })
-        })().catch(() => this.sendJson(res, 500, { error: 'create failed' }))
-        return
-      }
-      this.sendJson(res, 405, { error: 'method not allowed' })
-      return
-    }
-    const projectAssetMatch = url.pathname.match(/^\/api\/project-assets\/([a-zA-Z0-9_-]{8,64})$/)
-    if (projectAssetMatch) {
-      const assetId = projectAssetMatch[1]
-      const userId = this.getUserId(req)
-      if (req.method === 'PATCH') {
-        ;(async () => {
-          let data: { pinned?: unknown; name?: unknown; projectId?: unknown }
-          try {
-            data = JSON.parse(await this.readBody(req, 16 * 1024))
-          } catch {
-            this.sendJson(res, 400, { error: 'invalid JSON' })
-            return
-          }
-          const hasPinned = data.pinned !== undefined
-          const hasName = data.name !== undefined
-          const hasProject = data.projectId !== undefined
-          if (!hasPinned && !hasName && !hasProject) {
-            this.sendJson(res, 400, { error: 'pinned, name or projectId required' })
-            return
-          }
-          if (hasName && parseProjectAssetName(data.name) === null) {
-            this.sendJson(res, 400, { error: 'name required (1-200 chars)' })
-            return
-          }
-          if (hasPinned && typeof data.pinned !== 'boolean') {
-            this.sendJson(res, 400, { error: 'pinned must be boolean' })
-            return
-          }
-          if (hasProject) {
-            const projectId = parseProjectAssetProjectId(data.projectId)
-            if ('invalid' in projectId) {
-              this.sendJson(res, 400, { error: 'invalid projectId' })
-              return
-            }
-          }
-          const result = await updateProjectAsset(userId, assetId, data)
-          if (!result.ok) {
-            if (result.error === 'not_found') {
-              this.sendJson(res, 404, { error: 'not found' })
-              return
-            }
-            if (result.error === 'project_not_found') {
-              this.sendJson(res, 404, { error: 'project not found' })
-              return
-            }
-            if (result.error === 'limit_exceeded') {
-              this.sendJson(res, 400, { error: `asset limit exceeded (max ${PROJECT_ASSET_PER_PROJECT_LIMIT})` })
-              return
-            }
-            this.sendJson(res, 400, { error: result.error.replace(/_/g, ' ') })
-            return
-          }
-          this.sendJson(res, 200, { asset: result.asset })
-        })().catch(() => this.sendJson(res, 500, { error: 'patch failed' }))
-        return
-      }
-      if (req.method === 'DELETE') {
-        deleteProjectAsset(userId, assetId)
-          .then((result) => result.ok
-            ? this.sendJson(res, 200, { ok: true })
-            : this.sendJson(res, 404, { error: 'not found' }))
-          .catch(() => this.sendJson(res, 500, { error: 'delete failed' }))
-        return
-      }
-      this.sendJson(res, 405, { error: 'method not allowed' })
-      return
-    }
+    // 路由本体在 routes/projectAssets.ts(OCV5-376 P2,原样搬出)。
+    if (handleProjectAssetsHttp(this.httpIo, req, res, url)) return
     // ── Session migration (must be before clientSessMatch regex which would capture "unclaimed"/"claim") ──
     if (url.pathname === '/api/sessions/unclaimed' && req.method === 'GET') {
       listUnclaimedSessions()
@@ -5964,6 +5690,13 @@ export class Gateway {
         return
       }
     }
+    // Server-side feature flags for the web UI (env predicates, see protocol/serverFeatures).
+    // Its own route because /api/config stays host-only: the master proxies only this one.
+    if (url.pathname === '/api/features') {
+      if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+      this.sendJson(res, 200, { features: readServerFeatures(process.env) })
+      return
+    }
     if (url.pathname === '/api/config') {
       res.writeHead(200, { 'Content-Type': 'application/json' })
       const activeMcps: Array<{ id: string; label?: string; provider?: string; tools?: string[] }> =
@@ -5989,6 +5722,7 @@ export class Gateway {
           provider: activeProvider,
           auth: authInfo,
           mcpServers: activeMcps,
+          features: readServerFeatures(process.env),
         }),
       )
       return
@@ -6376,6 +6110,9 @@ export class Gateway {
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/board$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/context$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/context\/preview$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/ensure$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/workspace$/) ||
+      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/workspace\/file$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)$/) ||
       url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)\/(promote|reject|deprecate)$/) ||
@@ -9296,6 +9033,7 @@ export class Gateway {
         body?: string
         tags?: string[]
         agentIds?: unknown
+        createOnly?: unknown
       }>(req)
       const hasDescription = Object.prototype.hasOwnProperty.call(body, 'description')
       const hasBody = Object.prototype.hasOwnProperty.call(body, 'body')
@@ -9313,12 +9051,23 @@ export class Gateway {
         this.sendJson(res, 200, { ok: true })
         return
       }
-      const r = await store.save(
-        { name: skillName, description: body.description ?? '', tags: body.tags },
-        body.body ?? '',
-        agentIds ? { agentIds } : undefined,
+      // `createOnly: true` in the body: 412 when the skill already exists
+      // (checked and written under one per-name lock; see userSkillWrite.ts).
+      // A body field, not If-None-Match: the master's container proxy forwards
+      // only a fixed header set.
+      const outcome = await saveUserSkill(
+        store,
+        {
+          name: skillName,
+          description: body.description ?? '',
+          tags: body.tags,
+          body: body.body ?? '',
+          ...(agentIds ? { agentIds } : {}),
+        },
+        { createOnly: body.createOnly === true },
       )
-      if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
+      if (outcome.status === 'exists') return this.sendError(res, 412, 'skill already exists')
+      if (!outcome.ok) return this.sendError(res, 400, outcome.error ?? 'save failed')
       this.sendJson(res, 200, { ok: true })
       return
     }
@@ -20689,8 +20438,30 @@ export class Gateway {
       sessionId: frame.peer.id,
       ...(cronBoardOverride ? { boardProjectId: cronBoardOverride } : {}),
     })
+    if (chatWorkspace.unavailable) {
+      // The master could not tell us this session's project. Running anyway
+      // would drop its instructions, files and cwd without anyone noticing,
+      // so the turn is held before anything is spawned or billed.
+      this.log.warn('project context unavailable; turn held', {
+        sessionKey,
+        reason: chatWorkspace.unavailable,
+        traceId: turnTraceId,
+      })
+      const heldFrames = _earlyRejectErrorFrames({
+        sessionKey,
+        channel: frame.channel,
+        peer: frame.peer,
+        userId: activeUserId,
+        traceId: turnTraceId,
+        code: 'project_context_unavailable',
+        message: '项目信息暂时没有加载出来，这一轮还没有开始，也不会计费。请稍后用下方按钮重新发送。',
+        legacyErrorText: '[error] PROJECT_CONTEXT_UNAVAILABLE',
+      })
+      for (const f of heldFrames) this.deliver(f, adapter)
+      return
+    }
     const webchatRunContext = createRunContextDescriptor({
-      runId: `webchat:${frame.peer.id}`,
+      runId: webchatRunId(frame.peer.id, turnTraceId),
       boardProjectId: chatWorkspace.projectId,
       channel: frame.channel,
       agentId: effectiveAgent.id,
@@ -21350,6 +21121,7 @@ export class Gateway {
           : imageEditJobId,
         traceId: turnTraceId,
         model: 'gpt-image-2',
+        ...(chatWorkspace.chatProjectId !== undefined ? { chatProjectId: chatWorkspace.chatProjectId } : {}),
       }, externalQueueReservation)
       const delivered = {
         type: 'outbound.message' as const,
@@ -22191,6 +21963,7 @@ export class Gateway {
       ...(Object.prototype.hasOwnProperty.call(frame, '_goalState')
         ? { platformGoal: frame._goalState ?? null }
         : {}),
+      ...(chatWorkspace.chatProjectId !== undefined ? { turnChatProjectId: chatWorkspace.chatProjectId } : {}),
       // 模型权威批次 §4 —— bridge turn 的上游请求凭据。
       //
       // descriptor 是**验签产物**(_consumeAuthority → attachTurnAuthority),它原样保留了
@@ -22434,6 +22207,7 @@ export class Gateway {
               : imageEditJobId ?? externalQueueReservation.turnKey.slice(0, 32),
             traceId: turnTraceId,
             model: 'gpt-image-2',
+            ...(chatWorkspace.chatProjectId !== undefined ? { chatProjectId: chatWorkspace.chatProjectId } : {}),
           }, externalQueueReservation)
         } catch (err) {
           externalQueueError ??= err
@@ -24045,7 +23819,7 @@ const KNOWN_ROUTES = [
   '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
   '/api/runs', '/api/sessions', '/api/sessions/list', '/api/sessions/search', '/api/sessions/batch',
   '/api/sessions/read-all',
-  '/api/chat-projects', '/api/project-assets', '/api/config', '/api/agents', '/api/collaboration-config', '/api/search',
+  '/api/chat-projects', '/api/project-assets', '/api/config', '/api/features', '/api/agents', '/api/collaboration-config', '/api/search',
   '/api/cron', '/api/cron/channels', '/api/board', '/api/board/projects', '/api/board/tickets',
   '/api/board/pipelines', '/api/board/agents', '/api/board/settings',
   '/api/board/stats/cost', '/api/board/templates', '/api/board/reports/weekly',
@@ -24070,10 +23844,16 @@ function normalizePath(p: string): string {
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/([a-z]+)/, '/api/agents/:id/$1')
     .replace(/\/api\/agents\/[a-zA-Z0-9_-]+/, '/api/agents/:id')
     .replace(/\/api\/cron\/[a-zA-Z0-9_-]+/, '/api/cron/:id')
+    .replace(/\/api\/chat-projects\/[a-zA-Z0-9_-]+\/restore/, '/api/chat-projects/:id/restore')
     .replace(/\/api\/chat-projects\/[a-zA-Z0-9_-]+/, '/api/chat-projects/:id')
+    .replace(/\/api\/project-assets\/[a-zA-Z0-9_-]+\/versions/, '/api/project-assets/:id/versions')
+    .replace(/\/api\/project-assets\/[a-zA-Z0-9_-]+\/restore/, '/api/project-assets/:id/restore')
     .replace(/\/api\/project-assets\/[a-zA-Z0-9_-]+/, '/api/project-assets/:id')
     .replace(/\/api\/board\/projects\/[^/]+\/board/, '/api/board/projects/:id/board')
     .replace(/\/api\/board\/projects\/[^/]+\/context\/preview/, '/api/board/projects/:id/context/preview')
+    .replace(/\/api\/board\/projects\/[^/]+\/ensure/, '/api/board/projects/:id/ensure')
+    .replace(/\/api\/board\/projects\/[^/]+\/workspace\/file/, '/api/board/projects/:id/workspace/file')
+    .replace(/\/api\/board\/projects\/[^/]+\/workspace$/, '/api/board/projects/:id/workspace')
     .replace(/\/api\/board\/projects\/[^/]+\/context/, '/api/board/projects/:id/context')
     .replace(
       /\/api\/board\/projects\/[^/]+\/memories\/[^/]+\/[a-z]+/,

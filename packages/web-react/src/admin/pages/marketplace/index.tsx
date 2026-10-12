@@ -219,7 +219,7 @@ export default function MarketplacePage() {
   return (
     <div className="flex flex-col gap-5">
       <PageHeader title={meta.title} desc={meta.desc} />
-      <Tabs value={tab} onValueChange={setTab} items={TAB_ITEMS} aria-label="技能市场分区" />
+      <Tabs value={tab} onValueChange={setTab} items={TAB_ITEMS} aria-label="AI 市场分区" />
       <div className="overflow-hidden rounded-xl border border-border bg-surface">
         {tab === "review" && <ReviewPanel auth={adminSession} />}
         {tab === "featured" && <FeaturedPanel auth={adminSession} />}

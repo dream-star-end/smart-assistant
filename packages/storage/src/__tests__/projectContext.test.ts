@@ -146,6 +146,99 @@ describe('PROJECT.md CAS (B2 single authority)', () => {
   })
 })
 
+const { readFile: rf, readdir } = await import('node:fs/promises')
+const { paths } = await import('../paths.js')
+
+describe('B4 instructions seed never overwrites', () => {
+
+  it('a hand-edited PROJECT.md with a stale hash is preserved, not replaced by the seed', async () => {
+    const id = '55555555-5555-4555-8555-555555555555'
+    const first = await writeProjectInstructions(id, 'canonical', 0)
+    assert.equal(first.ok, true)
+    await writeFile(paths.projectInstructionsFile(id), 'edited by hand\n', 'utf8')
+    const seeded = await seedProjectInstructionsIfEmpty(id, 'stale pg text')
+    assert.equal(seeded.instructions, null)
+    assert.equal(seeded.instructionsFileStatus, 'mismatch')
+    assert.equal(await rf(paths.projectInstructionsFile(id), 'utf8'), 'edited by hand\n')
+    const conflict = seeded.meta.instructionsConflict
+    assert.ok(conflict)
+    assert.equal(await rf(join(paths.projectDir(id), conflict.file), 'utf8'), 'edited by hand\n')
+    // Re-running the seed (e.g. every turn) preserves the same bytes once.
+    await seedProjectInstructionsIfEmpty(id, 'stale pg text')
+    const copies = (await readdir(paths.projectDir(id))).filter((f) => f.startsWith('PROJECT.conflict-'))
+    assert.equal(copies.length, 1)
+  })
+
+  it('a human save over a mismatched file keeps a copy of the old bytes first', async () => {
+    const id = '66666666-6666-4666-8666-666666666666'
+    const first = await writeProjectInstructions(id, 'canonical', 0)
+    assert.equal(first.ok, true)
+    await writeFile(paths.projectInstructionsFile(id), 'agent wrote this\n', 'utf8')
+    const saved = await writeProjectInstructions(id, 'new human text', 1)
+    assert.equal(saved.ok, true)
+    if (!saved.ok) return
+    assert.equal(saved.snapshot.instructions, 'new human text')
+    const conflict = saved.snapshot.meta.instructionsConflict
+    assert.ok(conflict)
+    assert.equal(await rf(join(paths.projectDir(id), conflict.file), 'utf8'), 'agent wrote this\n')
+  })
+
+  it('a deliberate clear is never refilled by a stale PG mirror', async () => {
+    const id = '77777777-7777-4777-8777-777777777777'
+    const seeded = await seedProjectInstructionsIfEmpty(id, 'from chat')
+    assert.equal(seeded.instructions, 'from chat')
+    const cleared = await writeProjectInstructions(id, null, seeded.version)
+    assert.equal(cleared.ok, true)
+    if (!cleared.ok) return
+    assert.equal(cleared.snapshot.meta.instructionsState, 'cleared')
+    // Next turn: the PG mirror still has the old text.
+    const next = await seedProjectInstructionsIfEmpty(id, 'from chat')
+    assert.equal(next.instructions, null)
+    assert.equal(next.meta.instructionsState, 'cleared')
+  })
+
+  it('pre-B4 meta derives its state: hash means set, seed without hash means cleared', async () => {
+    const setId = '88888888-8888-4888-8888-888888888888'
+    const clearedId = '99999999-9999-4999-8999-999999999999'
+    const ok = await writeProjectInstructions(setId, 'legacy', 0)
+    assert.equal(ok.ok, true)
+    const metaFile = paths.projectMeta(setId)
+    const legacy = JSON.parse(await rf(metaFile, 'utf8'))
+    delete legacy.instructionsState
+    await writeFile(metaFile, JSON.stringify(legacy), 'utf8')
+    assert.equal((await loadProjectContext(setId)).meta.instructionsState, 'set')
+
+    await (await import('node:fs/promises')).mkdir(paths.projectDir(clearedId), { recursive: true })
+    await writeFile(
+      paths.projectMeta(clearedId),
+      JSON.stringify({
+        schemaVersion: 1,
+        version: 2,
+        instructionsSha256: null,
+        contentManifest: { schemaVersion: 1, projectMdSha256: null, skills: [] },
+        instructionsSeed: { from: 'chat_project', at: 1 },
+      }),
+      'utf8',
+    )
+    const legacyCleared = await seedProjectInstructionsIfEmpty(clearedId, 'from chat')
+    assert.equal(legacyCleared.instructions, null)
+    assert.equal(legacyCleared.meta.instructionsState, 'cleared')
+  })
+
+  it('a seed racing a human write cannot overwrite it (checked under the lock)', async () => {
+    const id = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    const before = await loadProjectContext(id)
+    assert.equal(before.meta.instructionsState, 'never')
+    const human = await writeProjectInstructions(id, 'human first', before.version)
+    assert.equal(human.ok, true)
+    // A seed computed from the pre-write snapshot must be refused.
+    const late = await writeProjectInstructions(id, 'seed', before.version + 1, { seedFromChat: true })
+    assert.equal(late.ok, false)
+    if (!late.ok) assert.equal(late.error, 'not_seedable')
+    assert.equal((await loadProjectContext(id)).instructions, 'human first')
+  })
+})
+
 describe('cwd allowlist (B3)', () => {
   it('rejects project data root and symlink escape', async () => {
     const ws = join(testHome, 'workspace')

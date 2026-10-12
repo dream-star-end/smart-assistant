@@ -1,10 +1,7 @@
 import {
   CalendarCheck,
-  CheckCircle2,
   ChevronRight,
   Clock,
-  PauseCircle,
-  Pencil,
   Plus,
   RotateCcw,
   Trash2,
@@ -34,21 +31,21 @@ import type { AuthSession, CronJob } from "../../lib/types";
 import { cn } from "../../lib/utils";
 import {
   Alert,
-  Badge,
   Button,
   Card,
   EmptyState,
   Field,
-  IconButton,
   Input,
+  ListGroup,
+  ListRow,
   ListSkeleton,
   PanelHeader,
   Select,
+  StatusDot,
   Switch,
   Textarea,
   TimeAgo,
   Toolbar,
-  Tooltip,
   useConfirm,
   useToast,
 } from "../ui";
@@ -153,6 +150,9 @@ const QUICK_PRESETS: { chip: string; seed: FormSeed }[] = [
  */
 type JobStatus = "active" | "paused" | "done";
 
+/** MetaLine 的同款样式(MetaLine 渲染 <div>,行在 <button> 里只能放短语内容,故用 <span> 复刻)。 */
+const META_CLASS = "oc-meta flex min-w-0 items-center gap-x-1.5 gap-y-0.5 text-meta tabular-nums text-faint";
+
 function jobStatus(job: CronJob): JobStatus {
   if (job.enabled !== false) return "active";
   // 一次性任务触发后由后端自动停用（cron.ts）：跑过 = 已完成，不是被人按停的。
@@ -161,13 +161,10 @@ function jobStatus(job: CronJob): JobStatus {
 }
 
 const STATUS_META = {
-  active: { label: "启用中", tone: "success", icon: Clock, chip: "bg-success-soft text-success" },
-  paused: { label: "已停用", tone: "neutral", icon: PauseCircle, chip: "bg-hover text-faint" },
-  done: { label: "已完成", tone: "accent", icon: CheckCircle2, chip: "bg-accent-soft text-accent" },
-} as const satisfies Record<
-  JobStatus,
-  { label: string; tone: "success" | "neutral" | "accent"; icon: typeof Clock; chip: string }
->;
+  active: { label: "启用中", tone: "success" },
+  paused: { label: "已停用", tone: "neutral" },
+  done: { label: "已完成", tone: "accent" },
+} as const satisfies Record<JobStatus, { label: string; tone: "success" | "neutral" | "accent" }>;
 
 function jobTitle(job: CronJob): string {
   return job.label || job.prompt || "未命名任务";
@@ -203,7 +200,13 @@ function NextRunMeta({ nextRunAt }: { nextRunAt: string | number | null | undefi
     );
   }
   if (desc.kind === "overdue") {
-    return <span className="text-warning">{desc.label}</span>;
+    // 语义色只给圆点,文字保持弱化色(规格 §5:状态 = 圆点 + 文字)。
+    return (
+      <span data-cron-overdue="" className="inline-flex items-center gap-1.5 text-muted">
+        <StatusDot tone="warning" />
+        {desc.label}
+      </span>
+    );
   }
   if (desc.kind === "soon") {
     return (
@@ -492,79 +495,66 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
   const renderJob = (job: CronJob) => {
     const status = jobStatus(job);
     const meta = STATUS_META[status];
-    const StatusIcon = meta.icon;
     const title = jobTitle(job);
     const name = shortTitle(title);
     const rowBusy = pending.includes(job.id);
     const human = job.schedule ? cronHuman(job.schedule) : "";
-    // 翻得出中文就只显示中文，裸 cron 收进 Tooltip；翻不出来时原串本身才是唯一信息。
-    const translated = !!human && human !== job.schedule;
+    // 翻得出中文就只显示中文;翻不出来时原串本身才是唯一信息,原样显示(不再用等宽字体)。
+    const descId = `cron-row-${job.id}-desc`;
+    const editing = editingId === job.id;
     return (
-      <li key={job.id}>
-        <Card
-          padding="none"
-          tone={status === "active" ? "default" : "sunken"}
-          className={cn("overflow-hidden", job.id === highlightId && "animate-in")}
-        >
-          <div className="flex flex-wrap items-start gap-x-3 gap-y-2 px-3.5 py-3">
-            <span
-              aria-hidden="true"
-              className={cn(
-                "mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-lg",
-                meta.chip,
-              )}
-            >
-              <StatusIcon size={15} />
-            </span>
-            <div className="flex min-w-0 flex-1 basis-48 flex-col gap-1">
-              <div className="flex min-w-0 items-center gap-2">
-                <span className="truncate text-section font-medium text-fg">{title}</span>
-                <Badge tone={meta.tone} size="sm">
+      // OCV5-360 第 4 轮:整行(开关以外)是一个点按目标 → 展开编辑表单;唯一的行内控件是右侧开关
+      //(已完成的一次性任务换成「再跑一次」)。铅笔 / 垃圾桶按钮簇取消,删除进编辑表单底部。
+      <ListRow
+        key={job.id}
+        data-interactive=""
+        className={cn("p-0", job.id === highlightId && "animate-in")}
+      >
+        <div className="flex items-start">
+          <button
+            type="button"
+            onClick={() => startEdit(job)}
+            aria-expanded={editing}
+            aria-label={`编辑「${name}」`}
+            aria-describedby={descId}
+            className="min-w-0 flex-1 py-3 pl-4 pr-3 text-left outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+          >
+            <span id={descId} className="flex min-w-0 flex-col gap-0.5">
+              {/* 一级:标题 + 状态(圆点 + 文字)。停用 / 已完成的标题降为弱化色。 */}
+              <span className="flex min-w-0 items-center gap-2">
+                <span
+                  className={cn(
+                    "min-w-0 truncate text-[14px] font-medium leading-5",
+                    status === "active" ? "text-fg" : "text-muted",
+                  )}
+                >
+                  {title}
+                </span>
+                <span data-cron-status="" className="inline-flex shrink-0 items-center gap-1.5 text-meta text-muted">
+                  <StatusDot tone={meta.tone} />
                   {meta.label}
-                </Badge>
-              </div>
-              {/* 二级：这个任务什么时候跑 —— 一眼要看到的就这一行。 */}
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-meta text-fg">
-                {human &&
-                  (translated ? (
-                    // 触发器必须可聚焦、原始表达式必须进可访问名：Tooltip 只对鼠标悬停开口，
-                    // 键盘用户靠焦点触发，读屏用户直接从 aria-label 里听到 cron 原串。
-                    <Tooltip content={`Cron：${job.schedule}`}>
-                      <span
-                        // role=note:可聚焦却无角色的 span 读屏只念一段文字、不知道这是什么
-                        //(t-762 manage#3);note 表明它是附注而非可操作控件。触屏补 44px 命中高。
-                        role="note"
-                        // biome-ignore lint/a11y/noNoninteractiveTabindex: Tooltip 触发器需可聚焦（WCAG 1.4.13）
-                        tabIndex={0}
-                        aria-label={`${human}，Cron 表达式 ${job.schedule}`}
-                        className="inline-flex cursor-default items-center rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring [@media(hover:none)]:min-h-11"
-                      >
-                        {human}
-                      </span>
-                    </Tooltip>
-                  ) : (
-                    <code className="font-mono">{human}</code>
-                  ))}
-                {status === "active" ? <NextRunMeta nextRunAt={job.nextRunAt} /> : null}
-              </div>
-              {/* 三级：属性与历史。 */}
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-caption text-faint">
-                {job.oneshot && status !== "done" && <Badge size="sm">一次性</Badge>}
-                {job.heartbeat && (
-                  <Badge size="sm" tone="neutral">
-                    心跳探针
-                  </Badge>
-                )}
-                {job.resume === "origin-session" && (
-                  <Badge size="sm" tone="accent">
-                    续跑本对话
-                  </Badge>
-                )}
-                {job.deliver && (
-                  <Badge size="sm" tone="accent">
-                    {deliverLabel(job.deliver)}
-                  </Badge>
-                )}
+                </span>
+              </span>
+              {/* 二级:什么时候跑。翻得出中文只显示中文(裸 cron 是实现细节,进编辑表单)。 */}
+              <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-body tabular-nums text-fg">
+                {human && <span>{human}</span>}
+                {status === "active" ? (
+                  <span className="text-meta">
+                    <NextRunMeta nextRunAt={job.nextRunAt} />
+                  </span>
+                ) : null}
+              </span>
+              {job.label && job.prompt && job.prompt !== job.label && (
+                <span data-cron-desc="" className="mt-0.5 line-clamp-2 max-w-[62ch] text-body text-muted">
+                  {job.prompt}
+                </span>
+              )}
+              {/* 三级:属性与历史 —— 一条弱化元信息行,纯文字,项之间自动「·」分隔。 */}
+              <span className={cn(META_CLASS, "mt-0.5 flex-wrap")}>
+                {job.oneshot && status !== "done" && <span>一次性</span>}
+                {job.heartbeat && <span>心跳探针</span>}
+                {job.resume === "origin-session" && <span>续跑本对话</span>}
+                {job.deliver && <span>{deliverLabel(job.deliver)}</span>}
                 {job.lastRunAt ? (
                   <span>
                     上次 <TimeAgo value={job.lastRunAt} />
@@ -572,68 +562,49 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
                 ) : (
                   <span>尚未执行过</span>
                 )}
-              </div>
-              {job.label && job.prompt && job.prompt !== job.label && (
-                <p className="line-clamp-2 text-meta text-muted">{job.prompt}</p>
-              )}
-            </div>
-            <div className="flex shrink-0 items-center gap-2 max-sm:w-full max-sm:justify-end">
-              {status === "done" ? (
-                // 已完成的一次性任务：把开关拨回去毫无意义（那个时刻已经过去），
-                // 给一条真出口 —— 打开编辑表单并切到「某时一次」，选个新时间即可重跑。
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => startEdit(job, { mode: "once", at: "" })}
-                >
-                  <RotateCcw size={13} />
-                  再跑一次
-                </Button>
-              ) : (
-                <Switch
-                  checked={status === "active"}
-                  disabled={rowBusy}
-                  onCheckedChange={() => toggle(job)}
-                  aria-label={`启用「${name}」`}
-                />
-              )}
-              <IconButton
+              </span>
+            </span>
+          </button>
+          {/* 唯一的行内控件:右对齐,与标题行垂直居中(44px 高的盒子中线 = 标题行中线)。 */}
+          <div className="mt-0.5 flex min-h-11 shrink-0 items-center pr-4">
+            {status === "done" ? (
+              // 已完成的一次性任务:把开关拨回去毫无意义(那个时刻已经过去),
+              // 给一条真出口 —— 打开编辑表单并切到「某时一次」,选个新时间即可重跑。
+              <Button
+                variant="ghost"
                 size="sm"
-                shape="square"
-                variant="muted"
-                aria-label={`编辑「${name}」`}
-                onClick={() => startEdit(job)}
-                className={cn(editingId === job.id && "bg-accent-soft text-accent")}
+                className="-mr-2 gap-1.5 px-2 font-normal text-muted hover:text-fg"
+                onClick={() => startEdit(job, { mode: "once", at: "" })}
               >
-                <Pencil size={14} />
-              </IconButton>
-              <IconButton
-                size="sm"
-                shape="square"
-                variant="danger"
-                aria-label={`删除「${name}」`}
+                <RotateCcw size={14} strokeWidth={1.75} aria-hidden="true" />
+                再跑一次
+              </Button>
+            ) : (
+              <Switch
+                checked={status === "active"}
                 disabled={rowBusy}
-                onClick={() => remove(job)}
-              >
-                <Trash2 size={14} />
-              </IconButton>
-            </div>
-          </div>
-          {editingId === job.id && (
-            <div className="border-t border-border">
-              <CronForm
-                key={`edit-${job.id}-${formNonce}`}
-                auth={auth}
-                job={job}
-                seed={editSeed}
-                deliverSelect={deliverSelect}
-                onCancel={() => setEditingId(null)}
-                onSaved={(saved) => saved && handleUpdated(saved)}
+                onCheckedChange={() => toggle(job)}
+                aria-label={`启用「${name}」`}
               />
-            </div>
-          )}
-        </Card>
-      </li>
+            )}
+          </div>
+        </div>
+        {editing && (
+          <div className="border-t border-border bg-bg/60">
+            <CronForm
+              key={`edit-${job.id}-${formNonce}`}
+              auth={auth}
+              job={job}
+              seed={editSeed}
+              deliverSelect={deliverSelect}
+              onCancel={() => setEditingId(null)}
+              onSaved={(saved) => saved && handleUpdated(saved)}
+              onDelete={() => remove(job)}
+              deleteDisabled={rowBusy}
+            />
+          </div>
+        )}
+      </ListRow>
     );
   };
 
@@ -646,11 +617,18 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
         action={
           cronBlocked ? undefined : (
             <Button
-              variant="secondary"
+              // 紧凑的次级按钮(窄屏 portal 进上下文行右侧);空态里已有「创建第一个定时任务」主按钮,
+              // 页头不再放第二个同权重的黑按钮。
+              variant="ghost"
               size="sm"
+              className="gap-1.5 px-2.5"
               onClick={() => (creating ? setCreating(false) : startCreate())}
             >
-              {creating ? <X size={14} /> : <Plus size={14} />}
+              {creating ? (
+                <X size={14} strokeWidth={1.75} aria-hidden="true" />
+              ) : (
+                <Plus size={14} strokeWidth={1.75} aria-hidden="true" />
+              )}
               {creating ? "取消" : "新建"}
             </Button>
           )
@@ -671,8 +649,8 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
       )}
 
       {!cronBlocked && creating && (
-        <div className="px-4 pb-3">
-          <Card tone="sunken">
+        <div className="px-4 pb-5">
+          <Card tone="sunken" className="border-0">
             <CronForm
               key={`create-${formNonce}`}
               auth={auth}
@@ -711,18 +689,20 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
           title="还没有定时任务"
           hint="到点让智能体自动跑一件事，并把结果推给你。也可以在对话里直接说「每天 9 点推送…」。"
           action={
-            <div className="flex flex-col items-center gap-2.5">
+            <div className="flex flex-col items-start gap-3">
               <Button variant="primary" size="sm" onClick={() => startCreate()}>
-                <Plus size={14} />
+                <Plus size={14} strokeWidth={1.75} />
                 创建第一个定时任务
               </Button>
-              <div className="flex flex-wrap justify-center gap-1.5">
+              {/* 预设:安静的次级按钮,一行排开,与标题同一左缘。 */}
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="mr-1 text-meta text-faint">或从常用开始</span>
                 {QUICK_PRESETS.map((p) => (
                   <Button
                     key={p.chip}
-                    variant="subtle"
+                    variant="secondary"
                     size="sm"
-                    shape="pill"
+                    className="font-normal"
                     onClick={() => startCreate(p.seed)}
                   >
                     {p.chip}
@@ -736,47 +716,58 @@ export function CronPanel({ auth }: { auth: AuthSession }) {
         <>
           {total > 8 && (
             <Toolbar
-              count={filtered.length}
               search={query}
               onSearchChange={setQuery}
               searchPlaceholder="搜索任务标题 / 指令"
               debounceMs={150}
+              sticky={false}
+              // 安静表面:不画吸顶色带与底边线;计数是搜索框右侧的弱化等宽数字。
+              className="border-b-0 bg-transparent px-4 pb-4 pt-0"
+              actions={
+                <span className="text-meta tabular-nums text-faint">{filtered.length} 个任务</span>
+              }
             />
           )}
-          {/* 有工具条时才补上顶部留白;没有时由 PanelHeader 的 py-3 提供节奏。 */}
-          <ul className={cn("flex flex-col gap-2 px-4 pb-4", total > 8 && "pt-3")}>
+          <div className="flex flex-col gap-6 px-4 pb-4">
             {filtered.length === 0 ? (
-              <li className="flex flex-col items-center gap-2 py-8 text-meta text-muted">
-                <span>没有匹配「{query.trim()}」的任务</span>
+              <div className="flex flex-col items-start gap-3 py-2">
+                <p className="text-body text-muted">没有匹配「{query.trim()}」的任务</p>
                 <Button variant="secondary" size="sm" onClick={() => setQuery("")}>
                   清除筛选
                 </Button>
-              </li>
+              </div>
             ) : (
               <>
-                {activeJobs.map(renderJob)}
+                {/* overflow-visible:编辑表单的保存条在窄屏要吸底(overflow-hidden 的祖先会让 sticky 失效);
+                    圆角由行自己的 first/last 圆角补齐。 */}
+                {activeJobs.length > 0 && <ListGroup className="overflow-visible">{activeJobs.map(renderJob)}</ListGroup>}
                 {restJobs.length > 0 && (
-                  <li>
+                  <section>
+                    {/* 折叠分组的组头即开关:与 GroupHeading 同字号,计数弱化等宽。 */}
                     <Button
                       variant="ghost"
                       size="sm"
-                      className="w-full justify-start gap-1.5 px-2 text-faint"
+                      className="-ml-2 gap-1.5 px-2 text-[14px] font-semibold text-fg"
                       aria-expanded={restOpen}
                       onClick={() => setShowRest((v) => !v)}
                     >
                       <ChevronRight
                         size={14}
+                        strokeWidth={1.75}
                         aria-hidden="true"
-                        className={cn("transition-transform", restOpen && "rotate-90")}
+                        className={cn(
+                          "text-faint transition-transform duration-150 motion-reduce:transition-none",
+                          restOpen && "rotate-90",
+                        )}
                       />
-                      已停用 / 已完成 · {restJobs.length}
+                      已停用 / 已完成 <span className="font-normal tabular-nums text-faint">· {restJobs.length}</span>
                     </Button>
-                  </li>
+                    {restOpen && <ListGroup className="mt-2 overflow-visible">{restJobs.map(renderJob)}</ListGroup>}
+                  </section>
                 )}
-                {restOpen && restJobs.map(renderJob)}
               </>
             )}
-          </ul>
+          </div>
         </>
       )}
     </div>
@@ -799,6 +790,8 @@ function CronForm({
   deliverSelect,
   onCancel,
   onSaved,
+  onDelete,
+  deleteDisabled,
 }: {
   auth: AuthSession;
   job?: CronJob;
@@ -807,6 +800,9 @@ function CronForm({
   onCancel: () => void;
   /** 创建时后端可能不回显 job（此时给 null，由调用方走后台对账补齐）。 */
   onSaved: (saved: CronJob | null) => void;
+  /** 编辑态的删除入口(OCV5-360:删除从行内挪进编辑表单底部,危险操作在左、保存在右)。 */
+  onDelete?: () => void;
+  deleteDisabled?: boolean;
 }) {
   const editing = !!job;
   const preset = editing ? scheduleToPreset(job?.schedule) : null;
@@ -930,8 +926,9 @@ function CronForm({
     <form onSubmit={submit} className="flex flex-col gap-3 px-4 py-3.5">
       {/* 飞行中锁住输入：否则用户在请求途中改了字段，不知道存进去的是哪一版。 */}
       <fieldset disabled={busy} className="flex min-w-0 flex-col gap-3">
-        <div className="flex flex-wrap items-start gap-3">
-          <Field label="时间" className="w-36">
+        {/* 窄屏两列网格(360px 下不横向溢出、控件等宽对齐);≥sm 回到按内容取宽的一行。 */}
+        <div data-cron-schedule-fields="" className="grid grid-cols-2 items-start gap-3 sm:flex sm:flex-wrap">
+          <Field label="时间" className="min-w-0 sm:w-36">
             <Select
               value={mode}
               onValueChange={(v) => setMode(v as ScheduleMode)}
@@ -940,7 +937,7 @@ function CronForm({
             />
           </Field>
           {(mode === "daily" || mode === "weekly") && (
-            <Field label="几点" className="w-32" error={scheduleError}>
+            <Field label="几点" className="min-w-0 sm:w-32" error={scheduleError}>
               <Input
                 type="time"
                 inputSize="sm"
@@ -950,7 +947,7 @@ function CronForm({
             </Field>
           )}
           {mode === "weekly" && (
-            <Field label="星期" className="w-32">
+            <Field label="星期" className="min-w-0 sm:w-32">
               <Select
                 value={String(weekday)}
                 onValueChange={(v) => setWeekday(Number(v))}
@@ -960,7 +957,7 @@ function CronForm({
             </Field>
           )}
           {mode === "after" && (
-            <Field label="分钟后" className="w-28" error={scheduleError}>
+            <Field label="分钟后" className="min-w-0 sm:w-28" error={scheduleError}>
               <Input
                 type="number"
                 min={1}
@@ -971,7 +968,7 @@ function CronForm({
             </Field>
           )}
           {mode === "once" && (
-            <Field label="日期时间" className="w-52" error={scheduleError}>
+            <Field label="日期时间" className="col-span-2 min-w-0 sm:w-52" error={scheduleError}>
               <Input
                 type="datetime-local"
                 inputSize="sm"
@@ -986,7 +983,7 @@ function CronForm({
             <>
               <Field
                 label="Cron 表达式"
-                className="w-44"
+                className="min-w-0 sm:w-44"
                 hint="分 时 日 月 周"
                 error={scheduleError}
               >
@@ -1130,8 +1127,24 @@ function CronForm({
         </Alert>
       )}
 
-      <div className="flex items-center justify-end gap-2">
-        <Button variant="ghost" size="sm" onClick={onCancel} disabled={busy}>
+      {/* 操作条:窄屏吸在滚动区底部(长表单里保存键始终可见),≥md 回到表单末尾的普通一行。 */}
+      <div
+        data-cron-form-actions=""
+        className="flex items-center gap-2 max-md:sticky max-md:bottom-0 max-md:z-[1] max-md:-mx-4 max-md:-mb-3.5 max-md:border-t max-md:border-border max-md:bg-surface max-md:px-4 max-md:py-2"
+      >
+        {editing && onDelete && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onDelete}
+            disabled={busy || deleteDisabled}
+            className="-ml-2 gap-1.5 px-2 font-normal text-danger hover:bg-danger-soft"
+          >
+            <Trash2 size={14} strokeWidth={1.75} aria-hidden="true" />
+            删除任务
+          </Button>
+        )}
+        <Button variant="ghost" size="sm" onClick={onCancel} disabled={busy} className="ml-auto">
           取消
         </Button>
         <Button type="submit" variant="primary" size="sm" loading={busy} disabled={!canSubmit}>

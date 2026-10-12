@@ -2,12 +2,15 @@ import type { CursorContextTier } from "@openclaude/protocol";
 import {
   Bell,
   ChevronDown,
-  Download,
+  FolderOpen,
   Menu,
   MoreHorizontal,
   PanelLeft,
+  PanelRight,
+  PanelRightClose,
   PenSquare,
   Search,
+  Share2,
   ShieldCheck,
   Users,
   Wallet,
@@ -68,10 +71,13 @@ export function ChatHeader({
   onOpenMobileNav,
   onOpenInbox,
   onOpenFind,
-  onExport,
+  onShare,
+  onTogglePane,
+  paneOpen = false,
   unreadCount,
   sessionUnreadCount,
   projectBreadcrumb,
+  projectSuggestion,
   onOpenProjectScope,
 }: {
   agent: Agent;
@@ -120,13 +126,18 @@ export function ChatHeader({
   onOpenInbox?: () => void;
   /** 打开会话内查找条（省略则不渲染查找键，如 demo）。按钮常驻，不随查找条开关挂卸载。 */
   onOpenFind?: () => void;
-  /** 导出会话为 Markdown（省略则不渲染，如 demo）。窄屏隐藏以免挤顶栏。 */
-  onExport?: () => void;
+  /** 打开「分享会话」(长图 + 文字,OCV5-369;省略则不渲染,如 demo)。窄屏收进「更多操作」菜单。 */
+  onShare?: () => void;
+  /** 开合详情面板(右侧第三栏)。省略则不渲染(demo / 空会话 / 任务看板)。手机上入口在过程摘要行。 */
+  onTogglePane?: () => void;
+  paneOpen?: boolean;
   /** 站内信未读数（>0 显红点，>99 显 99+）。 */
   unreadCount?: number;
   /** 会话未读数（侧栏折叠/移动抽屉入口角标）。与站内信 unreadCount 并存、语义不同。 */
   sessionUnreadCount?: number;
   projectBreadcrumb?: { chatName?: string | null; workName?: string | null } | null;
+  /** 未分类会话的项目建议（P5，开关控制）。只提示，移入由用户点。 */
+  projectSuggestion?: { name: string; onAccept: () => void; onDismiss: () => void } | null;
   onOpenProjectScope?: () => void;
 }) {
   const low = credits != null && (credits.trim().startsWith("-") || /^-?0+$/.test(credits.trim()));
@@ -205,17 +216,46 @@ export function ChatHeader({
         </span>
         <ChevronDown size={15} className="hidden shrink-0 text-faint sm:block" />
       </button>
-      {projectBreadcrumb && (projectBreadcrumb.chatName || projectBreadcrumb.workName) ? (
+      {projectBreadcrumb?.chatName ? (
+        // 所在项目:窄屏也显示(截断),点开项目本身,而不是管理中心。
         <button
           type="button"
           data-testid="chat-project-breadcrumb"
           data-product-control="project-breadcrumb"
           onClick={onOpenProjectScope}
-          className="hidden min-w-0 max-w-[14rem] truncate rounded-lg px-2 py-1 text-caption text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:inline-block"
-          title={[projectBreadcrumb.workName, projectBreadcrumb.chatName].filter(Boolean).join(" / ")}
+          aria-label={`所在项目：${projectBreadcrumb.chatName}，点击打开项目`}
+          className="inline-flex min-h-11 min-w-0 max-w-[7rem] shrink items-center gap-1 rounded-lg px-1.5 text-caption text-muted outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:min-h-0 sm:max-w-[14rem] sm:px-2 sm:py-1"
+          title={`所在项目：${projectBreadcrumb.chatName}`}
         >
-          {[projectBreadcrumb.workName, projectBreadcrumb.chatName].filter(Boolean).join(" / ")}
+          <FolderOpen size={13} aria-hidden className="shrink-0" />
+          <span className="truncate">{projectBreadcrumb.chatName}</span>
         </button>
+      ) : projectSuggestion ? (
+        <span
+          data-testid="chat-project-suggestion"
+          className="inline-flex min-w-0 max-w-[11rem] shrink items-center gap-0.5 rounded-lg border border-dashed border-border text-caption text-muted sm:max-w-[18rem]"
+        >
+          <button
+            type="button"
+            onClick={projectSuggestion.onAccept}
+            data-product-control="project-suggestion-accept"
+            aria-label={`移入项目「${projectSuggestion.name}」`}
+            title={`这个会话可能属于「${projectSuggestion.name}」，点一下移入`}
+            className="inline-flex min-h-11 min-w-0 items-center gap-1 rounded-lg px-1.5 outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:min-h-0 sm:py-1"
+          >
+            <FolderOpen size={13} aria-hidden className="shrink-0" />
+            <span className="truncate">移入「{projectSuggestion.name}」?</span>
+          </button>
+          <button
+            type="button"
+            onClick={projectSuggestion.onDismiss}
+            data-product-control="project-suggestion-dismiss"
+            aria-label="不用移入"
+            className="inline-flex min-h-11 shrink-0 items-center rounded-lg px-1.5 outline-none hover:bg-hover hover:text-fg focus-visible:ring-2 focus-visible:ring-ring sm:min-h-0 sm:py-1"
+          >
+            不用
+          </button>
+        </span>
       ) : null}
       {(teamModeActive || advisorModeActive || (models && onSelectModel)) && (
         <div className="order-last flex min-w-0 basis-full items-center gap-1 sm:order-none sm:flex-1 sm:basis-auto" data-testid="chat-model-row">
@@ -337,20 +377,20 @@ export function ChatHeader({
             <Search size={18} />
           </IconButton>
         )}
-        {onExport && (
+        {onShare && (
           <IconButton
             data-product-control
-            onClick={onExport}
-            aria-label="导出会话"
-            title="导出会话"
+            onClick={onShare}
+            aria-label="分享会话"
+            title="分享会话"
             shape="square"
             className="hidden sm:flex"
           >
-            <Download size={18} />
+            <Share2 size={18} />
           </IconButton>
         )}
-        {/* 窄屏没有位置放独立导出键:并入「更多」菜单承接,功能按视口降级而不是消失(C-12)。 */}
-        {onExport && (
+        {/* 窄屏没有位置放独立分享键:并入「更多」菜单承接,功能按视口降级而不是消失(C-12)。 */}
+        {onShare && (
           <div className="sm:hidden">
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -359,9 +399,9 @@ export function ChatHeader({
                 </IconButton>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
-                <DropdownMenuItem data-product-control onSelect={onExport}>
-                  <Download size={16} className="shrink-0 text-muted" />
-                  <span className="flex-1">导出会话</span>
+                <DropdownMenuItem data-product-control onSelect={onShare}>
+                  <Share2 size={16} className="shrink-0 text-muted" />
+                  <span className="flex-1">分享</span>
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -392,6 +432,20 @@ export function ChatHeader({
             {/* 窄屏只留图标（点击进设置看余额），省出空间避免顶栏溢出/主题被裁。 */}
             <span className="hidden sm:inline">{formatCredits(credits)}</span>
           </button>
+        )}
+        {onTogglePane && (
+          <IconButton
+            data-product-control
+            data-testid="detail-pane-toggle"
+            onClick={onTogglePane}
+            aria-label="详情面板"
+            aria-pressed={paneOpen}
+            title={`${paneOpen ? "收起" : "打开"}详情面板：步骤、改动、计划 (${modKeyLabel()}\\)`}
+            shape="square"
+            className="hidden sm:flex"
+          >
+            {paneOpen ? <PanelRightClose size={18} /> : <PanelRight size={18} />}
+          </IconButton>
         )}
       </div>
     </header>

@@ -71,6 +71,7 @@ import type {
   PutSessionInput,
   PutSessionResult,
   ChatProject,
+  DeletedChatProject,
   CreateProjectAssetInput,
   PatchProjectAssetInput,
   ProjectAsset,
@@ -2405,6 +2406,8 @@ export const api = {
       color?: string | null;
       sortOrder?: number;
       boardProjectId?: string | null;
+      archived?: boolean;
+      pinned?: boolean;
     },
   ): Promise<ChatProject> =>
     jsonOrThrow<{ project: ChatProject }>(
@@ -2418,16 +2421,43 @@ export const api = {
       ),
     ).then((b) => b.project),
 
-  deleteChatProject: (a: AuthSession, id: string): Promise<void> =>
+  /** pausedCronJobIds: jobs the client paused before deleting; kept for a restore. */
+  deleteChatProject: (a: AuthSession, id: string, pausedCronJobIds?: string[]): Promise<void> =>
     jsonOrThrow<{ ok: true }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/chat-projects/${encodeURIComponent(id)}`, {
           method: "DELETE",
           credentials: "include",
-          headers: bearerHeaders(t),
+          headers: bearerHeaders(t, pausedCronJobIds !== undefined),
+          ...(pausedCronJobIds !== undefined ? { body: JSON.stringify({ pausedCronJobIds }) } : {}),
         }),
       ),
     ).then(() => undefined),
+
+  listDeletedChatProjects: (a: AuthSession): Promise<DeletedChatProject[]> =>
+    jsonOrThrow<{ projects: DeletedChatProject[] }>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/chat-projects?deleted=1", { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => b.projects || []),
+
+  restoreChatProject: (
+    a: AuthSession,
+    id: string,
+  ): Promise<{ project: ChatProject; pausedCronJobIds: string[]; relinkedSessionIds: string[] }> =>
+    jsonOrThrow<{ project: ChatProject; pausedCronJobIds?: string[]; relinkedSessionIds?: string[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/chat-projects/${encodeURIComponent(id)}/restore`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => ({
+      project: b.project,
+      pausedCronJobIds: b.pausedCronJobIds ?? [],
+      relinkedSessionIds: b.relinkedSessionIds ?? [],
+    })),
 
   // ── 项目资产（侧栏项目下聚合上传资料 + 会话产出）──
 
@@ -2442,6 +2472,30 @@ export const api = {
     return jsonOrThrow<{ assets: ProjectAsset[] }>(
       callWithRefresh(a, (t) =>
         fetch(`/api/project-assets?${q}`, { credentials: "include", headers: bearerHeaders(t) }),
+      ),
+    ).then((b) => b.assets || []);
+  },
+
+  /**
+   * Ctrl/⌘K: search the caller's files and outputs across all projects (and
+   * ungrouped) by name/excerpt, newest first. Server caps `limit` at 50.
+   */
+  searchProjectAssets: (
+    a: AuthSession,
+    q: string,
+    opts?: { source?: "upload" | "output"; limit?: number; signal?: AbortSignal },
+  ): Promise<ProjectAsset[]> => {
+    const params = new URLSearchParams();
+    params.set("q", q);
+    if (opts?.source) params.set("source", opts.source);
+    if (opts?.limit) params.set("limit", String(opts.limit));
+    return jsonOrThrow<{ assets: ProjectAsset[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/project-assets?${params.toString()}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+          signal: opts?.signal,
+        }),
       ),
     ).then((b) => b.assets || []);
   },
@@ -2473,6 +2527,35 @@ export const api = {
         }),
       ),
     ).then(unwrapProjectAsset),
+
+  /** 产出物同一源路径的全部版本，新→旧。上传或单版本产出只回它自己。 */
+  listProjectAssetVersions: (a: AuthSession, assetId: string): Promise<ProjectAsset[]> =>
+    jsonOrThrow<{ versions: ProjectAsset[] }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/project-assets/${encodeURIComponent(assetId)}/versions`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ).then((b) => b.versions || []),
+
+  /**
+   * 把某个旧版本恢复成最新版本：服务端用它的字节再登记一个新版本，已有版本不动。
+   * `created=false` 表示它本来就是最新版本。
+   */
+  restoreProjectAssetVersion: (
+    a: AuthSession,
+    assetId: string,
+  ): Promise<{ asset: ProjectAsset; created: boolean }> =>
+    jsonOrThrow<{ asset: ProjectAsset; created: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/project-assets/${encodeURIComponent(assetId)}/restore`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
 
   /** DELETE 约定 204 / 空体；200+JSON 也收。 */
   deleteProjectAsset: (a: AuthSession, assetId: string): Promise<void> =>
@@ -2509,8 +2592,13 @@ export const api = {
     opts?: { maxRetries?: number; signal?: AbortSignal },
   ): Promise<{ url: string; digest?: string; size?: number; mimeType?: string }> {
     const maxRetries = opts?.maxRetries ?? 5;
+    // The file belongs to the identity that started the upload. callWithRefresh
+    // snapshots the epoch per call, so without this pin a 503 retry after a
+    // logout/account switch would send the file with the next account's token.
+    const startEpoch = a.snapshot().epoch;
     for (let attempt = 0; ; attempt++) {
       if (opts?.signal?.aborted) throw new DOMException("aborted", "AbortError");
+      if (a.snapshot().epoch !== startEpoch) throw new AuthEpochStaleError();
       const res = await callWithRefresh(a, (t) =>
         fetch("/api/uploads", {
           method: "POST",
@@ -2905,6 +2993,8 @@ export const api = {
       ),
     ),
 
+  // Auto‑Dream 全面优化:前端调用方(管理中心「优化」分区 / 侧栏待确认计数)已下线(OCV5-360);
+  // 方法保留以便回滚恢复,后端路由与状态文件未动。
   getAutoDreamOptimizer: (a: AuthSession, agentId: string) =>
     jsonOrThrow<AutoDreamOptimizerState>(
       callWithRefresh(a, (t) =>
@@ -3077,7 +3167,8 @@ export const api = {
       ),
     ),
 
-  /** 文献库列表(GET /api/me/research/library,master 直存,非容器代理)。 */
+  /** 文献库列表(GET /api/me/research/library,master 直存,非容器代理)。
+   *  前端调用方(管理中心「文献」分区)已下线(OCV5-360);方法保留以便回滚恢复。 */
   listResearchLibrary: (a: AuthSession) =>
     jsonOrThrow<{ documents: ResearchLibraryDoc[] }>(
       callWithRefresh(a, (t) =>
@@ -3157,6 +3248,19 @@ export const api = {
           credentials: "include",
           headers: bearerHeaders(t, true),
           body: JSON.stringify(body),
+        }),
+      ),
+    ),
+
+  /** 新建技能，同名已存在时服务端拒绝（PUT body createOnly，412 → ApiError.status 412）。 */
+  createSkill: (a: AuthSession, name: string, body: { description?: string; body?: string; tags?: string[] }) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/skills/${encodeURIComponent(name)}`, {
+          method: "PUT",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ ...body, createOnly: true }),
         }),
       ),
     ),

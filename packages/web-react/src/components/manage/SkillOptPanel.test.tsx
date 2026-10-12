@@ -218,6 +218,19 @@ describe("SkillEvalSection AI 生成用例", () => {
     expect(screen.getByRole("button", { name: /保存用例/ })).toBeEnabled();
   });
 
+  test("空用例态只有两个出口(AI 生成 / 手动添加),不挂灰掉的「保存用例」「运行评测」(OCV5-362)", async () => {
+    vi.spyOn(api, "getSkillEvals").mockResolvedValue(evalsResp([]));
+    render(<SkillEvalSection auth={auth} skillName="academic-translate" rates={null} />);
+    expect(await screen.findByRole("button", { name: /AI 生成用例/ })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: /运行评测/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /保存用例/ })).not.toBeInTheDocument();
+    // 手动添加 → 出现一条空用例,用例工具条(含保存 / 运行)随之出现。
+    fireEvent.click(screen.getByRole("button", { name: /手动添加/ }));
+    expect(await screen.findByRole("button", { name: /保存用例/ })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /运行评测/ })).toBeInTheDocument();
+    expect(screen.getByLabelText("用例 1 的 ID")).toHaveValue("case-1");
+  });
+
   test("已有用例态:次级「补充生成」→ 追加到现有用例;不显示空态主按钮", async () => {
     vi.spyOn(api, "getSkillEvals").mockResolvedValue(
       evalsResp([{ id: "case-1", prompt: "已有任务", assertions: ["断言"] }]),

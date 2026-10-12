@@ -3,6 +3,11 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, test } from "vitest";
 import { MediaSignProvider } from "./chat/media";
 import { ToolCard } from "./ToolCard";
+import { preloadToolBody } from "./tool/lazyToolBody";
+import { loadBeforeAll } from "../test/moduleLoad";
+
+// These tests assert expanded tool bodies synchronously, so the lazy chunk must be loaded first.
+loadBeforeAll(preloadToolBody);
 
 afterEach(cleanup);
 
@@ -329,7 +334,7 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(screen.getByText("任务B")).toBeInTheDocument();
   });
 
-  test("MCP browser_navigate：标签 + URL 链接", () => {
+  test("MCP browser_navigate：标签 + 浏览器卡地址栏链接", () => {
     render(
       <ToolCard
         message={{
@@ -341,8 +346,9 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     );
     expect(screen.getByText("打开网页")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button"));
-    const link = screen.getByRole("link", { name: "https://example.com" });
+    const link = screen.getByTestId("browser-address");
     expect(link).toHaveAttribute("href", "https://example.com");
+    expect(link).toHaveTextContent("example.com");
   });
 
   test("未知 MCP server → generic kv-list 兜底", () => {
@@ -432,7 +438,8 @@ describe("ToolCard 二级分派 + 状态 (P5)", () => {
     expect(header).toHaveClass("px-3", "py-2");
     fireEvent.click(header);
     expect(screen.getAllByText("点击页面").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText(/元素 e12/).length).toBeGreaterThanOrEqual(1);
+    // 浏览器卡的动作序列:动作 + 目标元素。
+    expect(screen.getByTestId("browser-actions")).toHaveTextContent("点击e12");
     expect(screen.queryByText(/oc-browser click/)).not.toBeInTheDocument();
   });
 
@@ -1646,7 +1653,7 @@ describe("T-02/T-03:Cursor shell 信封的表头摘要与展开体", () => {
         }}
       />,
     );
-    const header = screen.getByRole("button", { name: /调用应用连接/ });
+    const header = screen.getByRole("button", { name: /调用插件/ });
     expect(header).toHaveAccessibleName(/待确认/);
     expect(header.textContent).not.toContain("oc_connect");
     expect(header.textContent).not.toContain("confirmation_required");
@@ -1721,6 +1728,19 @@ describe("T-08:卡内文字型操作在触屏下有 44px 命中面积", () => {
     // 摘要键中文化:output_mode 不再直显 files_with_matches
     expect(document.body.textContent).toContain("匹配的文件");
     expect(document.body.textContent).not.toContain("files_with_matches");
+  });
+});
+
+describe("INC-20261002-TOOL-HIT-TARGET 工具卡表头的命中面积", () => {
+  // 292f59093 曾把表头降到 min-h-10(40px),真浏览器 T13 的 44px 指针/键盘命中契约随之失效;
+  // a492e45d 改回 min-h-11。这里在 jsdom 层先锁住 class,不必等真浏览器门。
+  test("工具卡表头默认至少 44px 高(min-h-11),不是 40px", () => {
+    render(
+      <ToolCard message={{ toolName: "Bash", inputJson: { command: "pwd" }, _completed: true, output: "/home" }} />,
+    );
+    const header = screen.getByRole("button", { name: "终端 pwd 完成" });
+    expect(header.className).toMatch(/(^|\s)min-h-11(\s|$)/);
+    expect(header.className).not.toMatch(/(^|\s)min-h-10(\s|$)/);
   });
 });
 

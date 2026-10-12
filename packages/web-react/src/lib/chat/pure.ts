@@ -780,6 +780,8 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   session_persist_unavailable: "消息已保留在本机，但暂时未能安全送达。请点下方“重试”原样发送。",
   session_deleted: "这个会话已被删除。请新建会话继续；在这里重试不会把它找回来。从回收站恢复后即可正常发送。",
   durable_dispatch_unavailable: "本轮派发未能接入执行通道，已中断。请点击重试。",
+  // 精确「重试」与兜底「重新尝试」都可能出现(看原消息是否带 _routing),文案不点名按钮。
+  project_context_unavailable: "这个会话所在项目的指令和文件暂时没有加载出来，本轮还没有开始，也不会计费。请稍后用下方按钮重新发送。",
   stopped: "本轮生成已停止。",
   user_cancelled: "本轮已取消。",
   runner_crashed: "执行环境意外中断，你的消息已保留，请重试。",
@@ -791,8 +793,12 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   phantom_turn: "任务未能产生有效回复，本轮未扣费。",
   turn_limit: "任务达到运行上限，系统已中断，本轮不收费。",
   // ── 模型权威 gate 拒帧(方案 §4 R3-m12)──
+  // 拒帧可能发生在回合中途(egress 每请求 fence):停止前已完成的调用已经照常计费,只有被拒的
+  // 这一次不计费 —— 文案不能说整轮不计费(2026-10-06 一轮 22 次调用 275 积分后被拒,卡片却写
+  // 「不计费」)。该码 retryable:false,卡片只会落到「重新尝试」兜底按钮,不会出精确「重试」,
+  // 所以按钮名也按实际写。
   model_config_changed_retry_turn:
-    "平台的模型配置刚刚更新，本轮已停止（不计费）。你的消息没有丢：点它下方的「重试」即可原样重发。",
+    "平台的模型配置刚刚更新，本轮在这里停止。停止前已完成的调用照常计费，被拒的这一次不计费。你的消息没有丢：点「重新尝试」即可原样重发。",
   // 同一码覆盖：上游满载且明说换模型、grok 路由过期、provider 未配置、catalog 下架（errorClassify OCV5-252）。
   // 文案不能只说「已下架/未开通」——满载是最常见来源，那样写会误导用户以为模型被撤了。
   model_not_available: "这个模型暂时接不了这条请求（可能是上游满载，也可能已下架或未对你的账号开通），请在上方切换一个模型后重发。",

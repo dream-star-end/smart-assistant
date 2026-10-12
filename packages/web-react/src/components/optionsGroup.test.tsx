@@ -12,6 +12,11 @@ import {
   isOptionsGrouped,
 } from "./optionsGroup";
 import { ChatInteractionContext } from "./tool/context";
+import { prefetchMarkdownImpl } from "./Markdown";
+import { loadBeforeAll } from "../test/moduleLoad";
+
+// 经真 Markdown 渲染后断言:懒加载的 MarkdownImpl 先在用例窗口外取好(src/test/moduleLoad.ts)。
+loadBeforeAll(prefetchMarkdownImpl);
 
 const q1 = JSON.stringify({ question: "风格?", options: [{ label: "正式" }, { label: "轻松" }] });
 const q2 = JSON.stringify({ question: "输出?", multi: true, options: [{ label: "要点" }, { label: "全文" }] });

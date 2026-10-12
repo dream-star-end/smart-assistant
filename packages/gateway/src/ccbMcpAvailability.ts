@@ -18,6 +18,8 @@ export type CcbMcpAvailabilityInput = {
   mcpLaunch: unknown | null
   skillEvalMode?: boolean
   skillTrainRunId?: string
+  /** OC_P5_PROJECT_SEARCH (with project context): project_search is listed only then. */
+  projectSearchEnabled?: boolean
 }
 
 /**
@@ -46,6 +48,7 @@ export const CCB_SKILL_EVAL_HIDDEN_PLATFORM_TOOLS = [
   'present_task_approval',
   'ask_user',
   'present_options',
+  'project_search',
 ] as const
 
 const SKILL_TRAIN_HIDDEN_PLATFORM_TOOLS = ['skill_save', 'skill_delete'] as const
@@ -60,6 +63,7 @@ export function projectCcbMcpAvailability(input: CcbMcpAvailabilityInput): strin
     if (input.skillTrainRunId) {
       for (const name of SKILL_TRAIN_HIDDEN_PLATFORM_TOOLS) platform.delete(name)
     }
+    if (!input.projectSearchEnabled) platform.delete('project_search')
   }
   const names = new Set<string>(input.configuredTools)
   for (const name of platform) names.add(name)

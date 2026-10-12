@@ -202,7 +202,10 @@ export function Tabs({
       aria-orientation="horizontal"
       onScroll={syncEdge}
       style={maskStyle}
-      className={cn(tabListVariants({ layout }), className)}
+      className={cn(
+        tabListVariants({ layout }),
+        className,
+      )}
     >
       {items.map((it, i) => {
         const active = it.value === value;
@@ -223,7 +226,9 @@ export function Tabs({
             tabIndex={active ? 0 : -1}
             onClick={() => onValueChange(it.value)}
             onKeyDown={(e) => onKeyDown(e, i)}
-            className={cn(tabVariants({ layout, active }))}
+            className={cn(
+              tabVariants({ layout, active }),
+            )}
           >
             {/* 宫格模式下列宽固定,需要一个可截断的块级容器承载省略号;
                 scroll 模式保持原样直接渲染 label,DOM 与改造前一致。 */}

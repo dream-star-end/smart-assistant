@@ -63,17 +63,18 @@ export function CaseShowroom({ onSelect, onRun, actionLabel, activeWorkId, onAct
   return (
     <section className="mx-auto max-w-6xl px-4 pb-10 pt-8 sm:px-8 sm:pt-12">
       <SignatureGallery onSelect={(work) => { setRestoreFocusWorkId(work.id); setWorkId(work.id) }} restoreFocusWorkId={restoreFocusWorkId} />
-      <h2 className="text-[24px] font-semibold tracking-tight text-fg">还有这些，能直接用在工作里。</h2>
-      <p className="mt-2 text-meta text-muted">从真实数据到可核对的结果。继续探索这些公开数据实作。</p>
+      <p className="text-micro font-semibold uppercase tracking-[0.16em] text-accent">Public data · 公开数据实作</p>
+      <h2 className="mt-2 text-balance text-[26px] font-semibold tracking-[-0.025em] text-fg sm:text-[32px]">还有这些，能直接用在工作里。</h2>
+      <p className="mt-2.5 max-w-2xl text-body leading-6 text-muted">从真实数据到可核对的结果。继续探索这些公开数据实作。</p>
       <div className="mt-9 grid gap-6 lg:grid-cols-2">
-        {TUTORIAL_SHOWCASES.map((item) => <article key={item.caseId} className="overflow-hidden rounded-3xl border border-border bg-surface shadow-sm">
+        {TUTORIAL_SHOWCASES.map((item) => <article key={item.caseId} className="tut-card overflow-hidden rounded-[28px] border border-border bg-surface shadow-sm">
           <ResultCover item={item} />
           <div className="p-5 sm:p-6">
             <p className="text-caption font-semibold text-accent">{item.category}</p>
-            <h2 className="mt-2 text-balance text-[22px] font-semibold leading-8 tracking-tight text-fg">{item.title}</h2>
+            <h2 className="mt-2 text-balance text-[22px] font-semibold leading-8 tracking-[-0.02em] text-fg">{item.title}</h2>
             <p className="mt-3 text-meta leading-6 text-muted">{item.lead}</p>
             <div className="mt-5 flex flex-wrap items-center gap-3">
-              <Button variant="primary" onClick={() => onSelect(item.caseId)} aria-label={'查看成果：' + item.title}>查看成果 <ArrowRight size={15} /></Button>
+              <Button variant="primary" shape="pill" onClick={() => onSelect(item.caseId)} aria-label={'查看成果：' + item.title}>查看成果 <ArrowRight size={15} /></Button>
               {onRun && <Button variant="ghost" onClick={() => onRun(showcaseTask(item))} aria-label={'做一个我的版本：' + item.title}>{actionLabel === '登录后试用' ? '登录后做我的版本' : '做一个我的版本'}</Button>}
             </div>
           </div>

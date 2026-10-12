@@ -9,9 +9,9 @@
  * 而不是验证功能。
  *
  * 时间字段的确定性约定：
- *   - 走 relativeTime() 的字段（记忆 mtimeMs / 梦境 finishedAt / 审计 lastSuccessAt）
+ *   - 走 relativeTime() 的字段（记忆 mtimeMs / 梦境 finishedAt）
  *     一律用「相对 now 的固定偏移」，这样每次跑出来的文案恒定（"3 天前"）。
- *   - 走 toLocaleString() 的绝对时间（cron nextRunAt / 文献 createdAt）用固定 ISO，
+ *   - 走 toLocaleString() 的绝对时间（cron nextRunAt）用固定 ISO，
  *     渲染结果本身就是稳定的绝对日期。
  */
 import type { ReactNode } from "react";
@@ -27,14 +27,12 @@ import type {
   PluginManagementResponse,
 } from "../../src/lib/connectors";
 import type {
-  AutoDreamOptimizerState,
   AutoDreamReportResponse,
   CronJob,
   MarketplaceMyAgent,
   MemoryDocResponse,
   MemoryIndexResponse,
   PublicModel,
-  ResearchLibraryDoc,
   SkillSummary,
 } from "../../src/lib/types";
 
@@ -153,145 +151,6 @@ function shell(tab: ManageTab): ReactNode {
     />
   );
 }
-
-// ── 全面优化（Auto-Dream 审计） ──────────────────────────────────────────────
-
-const OPTIMIZER_STATE: AutoDreamOptimizerState = {
-  schemaVersion: 2,
-  status: "success",
-  runId: "run_0f1d5851c9",
-  startedAt: agoIso(2 * DAY + 40 * MIN),
-  finishedAt: agoIso(2 * DAY),
-  lastSuccessAt: agoIso(2 * DAY),
-  sessionsReviewed: 137,
-  pagesReviewed: 42,
-  summary:
-    "本周共审计 137 个会话。你在「小红书母婴号」相关任务上重复交代了三次「医疗内容必须带权威源与免责声明」，建议固化为长期记忆；另外发现两条已失效的定时任务和一个从未被调用过的技能，可以清理以减少上下文开销。",
-  proposals: [
-    {
-      id: "prop_mem_muying_disclaimer",
-      fingerprint: "fp_a91c",
-      category: "memory",
-      action: "memory.upsert",
-      title: "把「母婴医疗内容必须附权威源 + 免责声明」固化为长期记忆",
-      reason:
-        "近 30 天内你在 6 个不同会话里重复交代了同一条约束（3 次是在产出被退回后补充的）。固化后智能体在起草母婴科普时会默认带上权威来源与免责声明，不必每次重申。",
-      targetId: "memory/xhs-muying-account.md",
-      before:
-        "---\nname: 小红书母婴号运营手册\ndescription: momo 号的选题、排版与发布节奏\ntype: project\n---\n\n每日 20:00（北京时间）自动发布，队列低于 3 条时补货。",
-      after:
-        "---\nname: 小红书母婴号运营手册\ndescription: momo 号的选题、排版、发布节奏与医疗内容合规红线\ntype: project\n---\n\n每日 20:00（北京时间）自动发布，队列低于 3 条时补货。\n\n## 医疗内容红线\n- 涉及用药、喂养量、发育指标的结论必须给出权威源（WHO / 中华医学会 / 国家卫健委）。\n- 每篇结尾附「本文不构成医疗建议，具体请遵医嘱」。",
-      beforeFingerprint: "fp_before_a91c",
-      state: "pending",
-      createdAt: agoIso(2 * DAY),
-    },
-    {
-      id: "prop_sched_cleanup",
-      fingerprint: "fp_b22e",
-      category: "schedule",
-      action: "schedule.delete",
-      title: "清理两条连续 14 天失败的定时任务",
-      reason:
-        "「旧站点巡检」与「v3 备份校验」自 7 月 12 日起每次触发都失败（目标服务已下线），继续保留只会产生噪音告警。",
-      targetId: "cron/cron_legacy_probe",
-      before: '{"id":"cron_legacy_probe","schedule":"*/30 * * * *","enabled":true}',
-      after: "（删除）",
-      beforeFingerprint: "fp_before_b22e",
-      state: "pending",
-      createdAt: agoIso(2 * DAY),
-    },
-    {
-      id: "prop_profile_tone",
-      fingerprint: "fp_c73d",
-      category: "profile",
-      action: "profile.update",
-      title: "更新用户画像中的沟通偏好：默认中文、先给结论",
-      reason: "你在 21 次会话里显式要求「先给结论再展开」，当前画像里没有这条。",
-      targetId: "user.md",
-      before: "## 沟通偏好\n- 默认中文回复。",
-      after:
-        "## 沟通偏好\n- 默认中文回复。\n- 先给结论 / 建议，再展开论证；长回答需要带小标题。\n- 涉及架构决策时要给方案对比与显式权衡，不要只报最小改动。",
-      beforeFingerprint: "fp_before_c73d",
-      state: "conflict",
-      createdAt: agoIso(2 * DAY),
-      error: "用户画像在生成建议后被改动过，应用前请确认最新内容。",
-    },
-    {
-      id: "prop_plugin_install",
-      fingerprint: "fp_d10a",
-      category: "plugin",
-      action: "plugin.install",
-      title: "建议安装「知识星球」插件以自动同步长图发布",
-      reason:
-        "你在 4 个会话里手工描述了「把这张长图发到星球」的流程；市场已有官方插件可直接完成该动作。",
-      targetId: "marketplace/knowledge-planet",
-      before: "",
-      after: "",
-      beforeFingerprint: "fp_before_d10a",
-      state: "pending",
-      createdAt: agoIso(2 * DAY),
-    },
-    {
-      id: "prop_skill_applied",
-      fingerprint: "fp_e55b",
-      category: "skill",
-      action: "skill.update",
-      title: "为 zsxq-publish 技能补充「发布前必须校验字数计数器」步骤",
-      reason: "两次发布因超字数被截断。",
-      targetId: "skills/zsxq-publish",
-      before: "1. 扫码登录\n2. 发主题带图",
-      after: "1. 扫码登录\n2. 校验字数计数器\n3. 发主题带图",
-      beforeFingerprint: "fp_before_e55b",
-      state: "applied",
-      createdAt: agoIso(9 * DAY),
-      appliedAt: agoIso(9 * DAY),
-    },
-    {
-      id: "prop_setting_dismissed",
-      fingerprint: "fp_f01c",
-      category: "setting",
-      action: "setting.update",
-      title: "建议把默认思考深度调到 high",
-      reason: "近期复杂任务的一次通过率偏低。",
-      targetId: "settings/effort",
-      before: "medium",
-      after: "high",
-      beforeFingerprint: "fp_before_f01c",
-      state: "dismissed",
-      createdAt: agoIso(12 * DAY),
-    },
-  ],
-};
-
-const OPTIMIZER_EMPTY: AutoDreamOptimizerState = {
-  schemaVersion: 2,
-  status: "idle",
-  sessionsReviewed: 0,
-  pagesReviewed: 0,
-  proposals: [],
-};
-
-const OPTIMIZER_RUNNING: AutoDreamOptimizerState & { progress: Record<string, unknown> } = {
-  schemaVersion: 2,
-  status: "running",
-  runId: "run_2c88fa17b0",
-  startedAt: agoIso(6 * MIN),
-  lastSuccessAt: agoIso(7 * DAY),
-  sessionsReviewed: 118,
-  pagesReviewed: 31,
-  proposals: OPTIMIZER_STATE.proposals.slice(4),
-  progress: {
-    stage: "mapping",
-    sessionsTotal: 214,
-    evidencePagesTotal: 48,
-    evidencePagesReviewed: 19,
-    mapBatchesTotal: 12,
-    mapBatchesCompleted: 5,
-    reducePagesTotal: 0,
-    reducePagesCompleted: 0,
-    synthesisPagesCompleted: 0,
-  },
-};
 
 // ── 记忆（memdir 文件列表 + 用户画像） ───────────────────────────────────────
 
@@ -640,52 +499,6 @@ const skillDetails: ApiMockTable = {
   }),
   deleteSkill: ok({ ok: true }),
   getSkillEvals: ok({ evals: { version: 1, cases: [] } }),
-};
-
-// ── 文献库 ──────────────────────────────────────────────────────────────────
-
-const LIBRARY_DOCS: ResearchLibraryDoc[] = [
-  {
-    docId: "doc_9f21ae04b2d17c3388e1",
-    title: "婴幼儿喂养指南（2025 修订版）· 中华医学会儿科学分会",
-    lang: "zh",
-    spanCount: 412,
-    createdAt: "2026-07-21T10:24:00+08:00",
-  },
-  {
-    docId: "doc_3b7c55a1e9004fd2210b",
-    title: "Attention Is All You Need",
-    lang: "en",
-    spanCount: 96,
-    createdAt: "2026-07-19T22:07:00+08:00",
-  },
-  {
-    docId: "doc_c0790a60d4415b8877ff",
-    title:
-      "面向大规模多智能体系统的可观测性实践：从 turn tape 到跨进程因果链的一致性重建（内部技术白皮书 v2）",
-    lang: "zh",
-    spanCount: 1287,
-    createdAt: "2026-07-16T09:41:00+08:00",
-  },
-  {
-    docId: "doc_f01c2288aa9b431d7e60",
-    title: null,
-    lang: "other",
-    spanCount: 8,
-    createdAt: "2026-07-14T17:53:00+08:00",
-  },
-  {
-    docId: "doc_a91c7731bd0e4f229c45",
-    title: "WHO Guideline on Complementary Feeding of Infants and Young Children 6–23 Months",
-    lang: "en",
-    spanCount: 638,
-    createdAt: "2026-07-11T08:16:00+08:00",
-  },
-];
-
-const libraryWrites: ApiMockTable = {
-  deleteResearchDoc: ok({ ok: true }),
-  uploadResearchDoc: ok({ docId: "doc_new", title: "新入库文档", lang: "zh", spanCount: 24 }),
 };
 
 // ── 插件账号（连接器 + 运行时 Plugin） ───────────────────────────────────────
@@ -1105,53 +918,6 @@ const connectorWrites: ApiMockTable = {
 // ── 场景 ────────────────────────────────────────────────────────────────────
 
 export const manageScenes: Scene[] = [
-  // ── 全面优化 ──
-  {
-    id: "manage-optimization",
-    label: "全面优化 · 有待确认建议",
-    group: "管理中心",
-    api: {
-      ...BASE,
-      getAutoDreamOptimizer: ok(OPTIMIZER_STATE),
-      runAutoDreamOptimizer: ok(OPTIMIZER_STATE),
-      cancelAutoDreamOptimizer: ok(OPTIMIZER_STATE),
-      mutateAutoDreamProposal: ok(OPTIMIZER_STATE),
-    },
-    render: () => shell("optimization"),
-  },
-  {
-    id: "manage-optimization-empty",
-    label: "全面优化 · 空态（暂无建议）",
-    group: "管理中心",
-    api: {
-      ...BASE,
-      getAutoDreamOptimizer: ok(OPTIMIZER_EMPTY),
-      runAutoDreamOptimizer: ok(OPTIMIZER_EMPTY),
-    },
-    render: () => shell("optimization"),
-  },
-  {
-    id: "manage-optimization-running",
-    label: "全面优化 · 审计进行中（进度条）",
-    group: "管理中心",
-    api: {
-      ...BASE,
-      getAutoDreamOptimizer: ok(OPTIMIZER_RUNNING),
-      cancelAutoDreamOptimizer: ok(OPTIMIZER_RUNNING),
-    },
-    render: () => shell("optimization"),
-  },
-  {
-    id: "manage-optimization-error",
-    label: "全面优化 · 加载失败",
-    group: "管理中心",
-    api: {
-      ...BASE,
-      getAutoDreamOptimizer: fail(500, "优化报告服务暂时不可用，请稍后重试。"),
-    },
-    render: () => shell("optimization"),
-  },
-
   // ── 记忆 ──
   {
     id: "manage-memory",
@@ -1280,29 +1046,6 @@ export const manageScenes: Scene[] = [
       getPluginManagement: ok({ catalog: [], accounts: [] } as PluginManagementResponse),
     },
     render: () => shell("connectors"),
-  },
-
-  // ── 文献库 ──
-  {
-    id: "manage-library",
-    label: "文献库 · 有数据（中英混合、长标题、无标题）",
-    group: "管理中心",
-    api: { ...BASE, ...libraryWrites, listResearchLibrary: ok(LIBRARY_DOCS) },
-    render: () => shell("library"),
-  },
-  {
-    id: "manage-library-empty",
-    label: "文献库 · 空态",
-    group: "管理中心",
-    api: { ...BASE, ...libraryWrites, listResearchLibrary: ok([] as ResearchLibraryDoc[]) },
-    render: () => shell("library"),
-  },
-  {
-    id: "manage-library-error",
-    label: "文献库 · 加载失败（带重试）",
-    group: "管理中心",
-    api: { ...BASE, listResearchLibrary: fail(500, "加载文献库失败，请稍后重试。") },
-    render: () => shell("library"),
   },
 
   // ── 切 Tab 加载态 ──

@@ -223,8 +223,10 @@ export type ChatMessage = {
   text: string;
   /** 创建时间（client mint）。*/
   ts: number;
-  /** turn 结束/最后内容到达时刻。*/
+  /** turn 结束/最后内容到达时刻。tool 行 = 结果到达浏览器的时刻(OCV5-367 步骤耗时)。*/
   completedAt?: number;
+  /** tool 行:工具执行时长(ms),turn tape 持久化(ts=arrivedAt,ts+durationMs≈结果时刻)。*/
+  durationMs?: number | null;
   /** Browser-only first-text commit probe. Created only by the live WS path,
    * consumed after the corresponding assistant DOM has committed, and never persisted. */
   _firstTextPaintProbe?: {

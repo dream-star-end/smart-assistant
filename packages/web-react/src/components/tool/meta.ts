@@ -144,10 +144,10 @@ export const OC_TOOLS = {
   mmx: { icon: Sparkles, label: "媒体生成", tone: "accent" },
   // 应用连接器(webdav/imap/notion/github/feishu):body 专属卡含写操作确认卡
   // (connectorCards.tsx,human-in-the-loop 安全关键)。
-  "oc-connect": { icon: Plug, label: "应用连接", tone: "accent" },
+  "oc-connect": { icon: Plug, label: "插件", tone: "accent" },
   // 市场 Plugin(知识星球/微博等)沿用同一服务端确认账本与确认卡；CLI stdout 只提供
   // 不透明 confirmation id，卡片内容仍由后端权威详情铸造。
-  "oc-plugin": { icon: Plug, label: "市场插件", tone: "accent" },
+  "oc-plugin": { icon: Plug, label: "插件", tone: "accent" },
 } satisfies Record<string, ToolMeta>;
 
 /** oc-* CLI 名的联合类型(= OC_TOOLS 的键)。body 卡注册表以它为键,保证不会给未登记的
@@ -277,6 +277,7 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:task_get": { icon: FileText, label: "查看任务单" },
   "openclaude-memory:task_approve": { icon: ListChecks, label: "批准任务单" },
   "openclaude-memory:present_task_approval": { icon: ShieldCheck, label: "任务审批卡" },
+  "openclaude-memory:project_search": { icon: Search, label: "搜索项目文件" },
   // codex 内建 MCP 资源清单(op 无摘要,空态即全部信息)。
   "codex:list_mcp_resources": { icon: Boxes, label: "MCP 资源列表" },
   "codex:list_mcp_resource_templates": { icon: Layers, label: "MCP 资源模板" },
@@ -406,17 +407,17 @@ function ocCommandMeta(cli: OcCli, command: string): ToolMeta {
   }
   if (cli === "oc-plugin") {
     const labels: Record<string, string> = {
-      list: "可用市场插件",
-      catalog: "搜索市场插件",
-      call: "调用市场插件",
+      list: "可用插件",
+      catalog: "搜索插件",
+      call: "调用插件",
     };
     return labels[op] ? { ...base, label: labels[op] } : base;
   }
   if (cli === "oc-connect") {
     const labels: Record<string, string> = {
-      list: "已连接应用",
-      catalog: "搜索应用连接",
-      call: "调用应用连接",
+      list: "已连接插件",
+      catalog: "可连接的插件",
+      call: "调用插件",
     };
     return labels[op] ? { ...base, label: labels[op] } : base;
   }
@@ -712,7 +713,7 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
       return `${tgt}${title}`.trim();
     }
     if (op === "skill_view" || op === "skill_delete" || op === "skill_save") return asStr(input.name);
-    if (op === "skill_search") return asStr(input.query);
+    if (op === "skill_search" || op === "project_search") return asStr(input.query);
     if (op === "ask_gpt55_codex") return (asStr(input.goal) || asStr(input.context)).slice(0, 60);
     if (op === "task_create") return asStr(input.title);
     if (op === "task_update" || op === "task_comment" || op === "task_get" || op === "task_approve" || op === "present_task_approval") {

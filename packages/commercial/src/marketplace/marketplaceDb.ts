@@ -80,11 +80,11 @@ async function loadVerifiedMarketplacePlugin(
 function marketplacePluginType(kind: ArtifactKind, value: unknown): MarketplacePluginType | null {
   if (kind === 'connector') {
     if (!isMarketplacePluginType(value))
-      throw new MarketplaceError('KIND_MISMATCH', 'connector listing 缺少合法 Plugin 子类型')
+      throw new MarketplaceError('KIND_MISMATCH', '插件 listing 缺少合法子类型')
     return value
   }
   if (value != null)
-    throw new MarketplaceError('KIND_MISMATCH', `${kind} listing 不能声明 Plugin 子类型`)
+    throw new MarketplaceError('KIND_MISMATCH', `${kind} listing 不能声明插件子类型`)
   return null
 }
 
@@ -591,7 +591,7 @@ async function publishSkillVersionInternal(
   )
     throw new MarketplaceError(
       'SLUG_OWNED_BY_OTHER',
-      `slug "${input.slug}" 为平台官方 Plugin 保留，不能发布`,
+      `slug "${input.slug}" 为平台官方插件保留，不能发布`,
     )
   return tx(async (c) => {
     await query(
@@ -629,7 +629,7 @@ async function publishSkillVersionInternal(
     if (marketplacePluginType(row.kind as ArtifactKind, row.plugin_type) !== pluginType)
       throw new MarketplaceError(
         'KIND_MISMATCH',
-        `slug "${input.slug}" 已是其它 Plugin 子类型，不能改写`,
+        `slug "${input.slug}" 已是其它插件子类型，不能改写`,
       )
     await validateCapabilityRequirements(c, requirements, row.org_id)
 
@@ -1757,7 +1757,7 @@ async function verifyLockedInstallTarget(
   if (!marketplaceConnectorsEnabled())
     throw new MarketplaceError('NOT_INSTALLABLE', 'connector 类市场仅在 v5 可用')
   if (isDefaultConnectorSlug(version.slug) && opts.allowPreinstalledConnector !== true)
-    throw new MarketplaceError('NOT_INSTALLABLE', '官方默认连接器已预装，无需安装')
+    throw new MarketplaceError('NOT_INSTALLABLE', '官方预装插件，无需安装')
   if (
     version.securityReviewState !== 'security_approved' ||
     !isAcceptedFunctionalVerificationState(version.functionalVerifyState) ||
@@ -2650,7 +2650,7 @@ export async function getInstallableVersionTarget(
     if (!marketplaceConnectorsEnabled())
       throw new MarketplaceError('NOT_INSTALLABLE', 'connector 类市场仅在 v5 可用')
     if (isDefaultConnectorSlug(row.slug))
-      throw new MarketplaceError('NOT_INSTALLABLE', '官方默认连接器已预装，无需安装')
+      throw new MarketplaceError('NOT_INSTALLABLE', '官方预装插件，无需安装')
     if (
       row.security_review_state !== 'security_approved' ||
       !isAcceptedFunctionalVerificationState(row.functional_verify_state) ||
@@ -2828,7 +2828,7 @@ export async function recordUninstall(
       if (!marketplaceConnectorsEnabled())
         throw new MarketplaceError('NOT_INSTALLABLE', 'connector 类市场仅在 v5 可用')
       if (isDefaultConnectorSlug(slug))
-        throw new MarketplaceError('NOT_INSTALLABLE', '官方默认连接器不可卸载')
+        throw new MarketplaceError('NOT_INSTALLABLE', '官方预装插件不可卸载')
     }
 
     const install = await query<{ id: string }>(
@@ -2850,7 +2850,7 @@ export async function recordUninstall(
         c,
       )
       if ((bindings.rowCount ?? 0) > 0)
-        throw new MarketplaceError('INSTALL_CONFLICT', '请先在管理中心解绑该连接器的全部账号')
+        throw new MarketplaceError('INSTALL_CONFLICT', '请先在「管理中心 → 插件」解绑该插件的全部账号')
     }
     await query(
       `UPDATE marketplace_installs

@@ -214,7 +214,7 @@ export function suggestSlug(name: string): string {
  * 现场对比适配度并在用户确认后安装。**不 autoSend**——预填后发送权仍在用户。
  */
 export function marketAskAiPrefill(q: string): string {
-  return `我想要:${q}\n请用 oc-market 在技能市场帮我找最适配的技能或智能体,对比它们的分类、适用场景和近期使用情况,给出推荐理由;经我确认后再安装。`
+  return `我想要:${q}\n请用 oc-market 在 AI 市场帮我找最适配的技能或智能体,对比它们的分类、适用场景和近期使用情况,给出推荐理由;经我确认后再安装。`
 }
 
 /**

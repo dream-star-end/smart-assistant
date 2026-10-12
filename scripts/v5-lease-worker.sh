@@ -460,6 +460,30 @@ SQL
 }
 
 # ---------- main ----------
+# 宿主侧 oc-task 评论队列(scripts/v5-task-host.sh):容器被 idle sweep 回收期间排队的评论,
+# 容器回来后按序送达。只在队列里有条目时启动,而且以 transient unit 启动:
+#   · 独立 cgroup —— 不会在本 oneshot tick 结束时被一并杀掉;
+#   · 不继承本进程的 fd(包括 acquire_singleton 的 worker 锁)—— 不会挡住下一个 tick;
+#   · 输出进 journal(journalctl -u openclaude-v5-oc-task-spool-flush),不另起无界日志;
+#   · 同名 unit 还在跑时 systemd-run 直接失败 = 同一时刻只有一个 flush;RuntimeMaxSec 兜底。
+# 启动失败一律忽略,worker 本 tick 不等它、不受它影响。
+TASK_SPOOL_DIR="${OC_V5_TASK_SPOOL_DIR:-/var/lib/openclaude-v5-selfhost/oc-task-spool}"
+flush_task_spool() {
+  local host_task
+  host_task="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/v5-task-host.sh"
+  [[ -x "$host_task" ]] || return 0
+  find "$TASK_SPOOL_DIR/q" "$TASK_SPOOL_DIR/inflight" -maxdepth 1 -type f -name '*.json' -print -quit 2>/dev/null \
+    | grep -q . || return 0
+  command -v systemd-run >/dev/null 2>&1 || return 0
+  # transient unit 不继承调用方环境:spool 目录与 PATH 显式传入。
+  systemd-run --quiet --collect --unit=openclaude-v5-oc-task-spool-flush \
+    --property=RuntimeMaxSec=300 \
+    --setenv=OC_V5_TASK_SPOOL_DIR="$TASK_SPOOL_DIR" \
+    --setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    "$host_task" flush --quiet </dev/null >/dev/null 2>&1 || true
+  return 0
+}
+
 main() {
   lease_need_tool sqlite3; lease_need_tool git; lease_need_tool jq; lease_need_tool flock
   acquire_singleton
@@ -469,5 +493,6 @@ main() {
   settle_rides
   dispatch_train
   deliver_outbox
+  flush_task_spool
 }
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
