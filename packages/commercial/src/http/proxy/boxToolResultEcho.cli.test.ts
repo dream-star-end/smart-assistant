@@ -119,6 +119,14 @@ test("OCV5-313 the CLI's own image source note is the only extra block an image 
   const loginNote = (dir: string) => ({ type: "text", text: `[Image: source: /home/box/${dir}/projects/-tmp-ocv5-289-run-c70754d7282dca8db4733fd4/b6df2535-b7de-499a-bbb9-cb501631c640/tool-results/mcp-ocbridge-blob-1791817516.png]` });
   await ok(expected([image]), echoOf([apiImage(data), loginNote(".claude-account2")]));
   await ok(expected([caption, image]), echoOf([caption, apiImage(data), loginNote(".claude-b")]));
+  // and no "." / ".." path segment can walk out of <project>/<session>/tool-results/ (Codex r2)
+  for (const text of [
+    "[Image: source: /home/box/.claude-account2/projects/../b6df2535-b7de-499a-bbb9-cb501631c640/tool-results/a.png]",
+    "[Image: source: /home/box/.claude/projects/./b6df2535-b7de-499a-bbb9-cb501631c640/tool-results/a.png]",
+    "[Image: source: /home/box/.claude/projects/p/b6df2535-b7de-499a-bbb9-cb501631c640/tool-results/..]",
+  ]) {
+    reject(expected([image]), echoOf([apiImage(data), { type: "text", text }]));
+  }
   for (const dir of [".claude-default", ".claude-", ".claude-Account2", ".claude-account2/..", ".claudeaccount2",
     ".claude-account2/x", "x/.claude-account2", `.claude-${"a".repeat(33)}`]) {
     reject(expected([image]), echoOf([apiImage(data), loginNote(dir)]));

@@ -38,7 +38,8 @@ const CLI_PERSIST_THRESHOLD_CHARS = 50_000;
  * login name follows the admin selection rule ([a-z0-9][a-z0-9-]{0,31}); the default login has no suffix,
  * so .claude-default is not a config dir and is refused. */
 const IMAGE_SOURCE_NOTE = new RegExp(String.raw`^\[Image: source: /home/box/\.claude(?:-(?!default/)[a-z0-9][a-z0-9-]{0,31})?/projects/`
-  + String.raw`[A-Za-z0-9._-]{1,256}/[A-Za-z0-9-]{1,64}/tool-results/[A-Za-z0-9._-]{1,128}\]$`);
+  // No "." / ".." segment: the note must name a file inside <project>/<session>/tool-results/.
+  + String.raw`(?!\.{1,2}/)[A-Za-z0-9._-]{1,256}/[A-Za-z0-9-]{1,64}/tool-results/(?!\.{1,2}\])[A-Za-z0-9._-]{1,128}\]$`);
 
 /** The echo is the published blocks, in order, plus the CLI's own image source
  * notes. A published block is always matched first; a note is only an extra
