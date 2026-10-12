@@ -94,7 +94,7 @@ test("a tool step decodes as one handoff before the tool returns", async () => {
   // The tool decoder takes the step's usage from message_delta too, and refuses a zero start without it.
   const missing = lines.map((line) => {
     const record = JSON.parse(line);
-    if (record.type === "stream_event" && record.event.type === "message_delta") delete record.event.usage.input_tokens;
+    if (record.type === "stream_event" && record.event.type === "message_delta") Reflect.deleteProperty(record.event.usage, "input_tokens");
     return JSON.stringify(record);
   });
   const refuses = new BoxCliToolHandoffDecoder(MODEL, catalog);
@@ -158,7 +158,7 @@ test("usage at stop: the forwarded SSE bills the real usage; a zero start withou
   // An all-zero start whose message_delta does not carry the input usage is not accepted (SSE and tool decoders).
   const lines = (await textTurn()).map((line) => {
     const record = JSON.parse(line);
-    if (record.type === "stream_event" && record.event.type === "message_delta") delete record.event.usage.input_tokens;
+    if (record.type === "stream_event" && record.event.type === "message_delta") Reflect.deleteProperty(record.event.usage, "input_tokens");
     return JSON.stringify(record);
   });
   const bad = createBoxCliSseDecoder(MODEL);
