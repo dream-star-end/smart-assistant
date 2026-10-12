@@ -91,6 +91,9 @@ test("an interactive-runner plan runs the staged oc-box host on the same argv wi
   assert.ok(toolPlan.run.args.includes("--allowedTools") && !toolPlan.run.args.includes("--disallowedTools"));
   assert.equal(toolPlan.assetManifest.split(",").length, 4);
   assert.ok(!toolPlan.run.args.some((arg) => printOnly.has(arg)));
+  // Step-by-step staging (fast path off) stages the host on its own, like each helper.
+  for (const plan of [interactive, toolPlan]) assert.equal(plan.stageInteractiveHost?.args[3], hostPath);
+  assert.equal(print.stageInteractiveHost, undefined);
   assert.throws(() => makeBoxTextPlan({ ...input, interactiveHost: { ...host, modSha256: "nope" } }), /BOX_TEXT_PLAN_INVALID/);
 });
 

@@ -40,6 +40,8 @@ export interface BoxTextPlan {
   readonly nativePreflight?: BoxCcExecRequest;
   /** OCV5-378: the staged interactive host, when this run's model uses that runner. */
   readonly interactiveHost?: { readonly asset: Buffer; readonly path: string; readonly hash: string };
+  /** Its own stage request, for callers that stage helpers one by one (fast path off). */
+  readonly stageInteractiveHost?: BoxCcExecRequest;
   readonly supervisorHash: string;
   readonly keeperHash: string;
   readonly snapshotHash: string | null;
@@ -322,7 +324,8 @@ export function makeBoxTextPlan(input: {
   const nativePreflight = input.nativeResume ? makeBoxNativeFileInspect({
     cliCwd: input.nativeResume.cliCwd, nativeSessionId: input.nativeResume.sessionId,
     expectedSha256: input.nativeResume.expectedSha256, ensureCwd: true }) : undefined;
-  return { ...(interactiveHost ? { interactiveHost } : {}),
+  return { ...(interactiveHost ? { interactiveHost,
+    stageInteractiveHost: makeBoxAssetStage(interactiveHost.asset, interactiveHost.path).request } : {}),
     cwd, cliCwd, nativePersistence, proofDir, runNonce, leaseEpoch,
     sessionId: mapped.sessionId, expectedModel: input.upstreamModel,
     stageSupervisor, stageKeeper, stageAssets: assetBatch.request,

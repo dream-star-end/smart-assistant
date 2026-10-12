@@ -359,6 +359,12 @@ export class BoxTextFetch {
           if (keeper.stdout.trim() !== plan.keeperHash) {
             throw new BoxTextFetchError("BOX_KEEPER_STAGE_INVALID");
           }
+          if (plan.stageInteractiveHost && plan.interactiveHost) {
+            const host = await exec(plan.stageInteractiveHost, 20_000);
+            if (host.stdout.trim() !== plan.interactiveHost.hash) {
+              throw new BoxTextFetchError("BOX_INTERACTIVE_HOST_STAGE_INVALID");
+            }
+          }
           if (detached) {
             const runner = await exec(detached.stageDetachedRunner, 20_000);
             if (runner.stdout.trim() !== detached.detachedRunnerHash) {

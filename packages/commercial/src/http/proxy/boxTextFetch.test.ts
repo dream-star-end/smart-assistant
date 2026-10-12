@@ -61,7 +61,8 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
   resolverThrow?: boolean; onDispose?: () => void; holdModel?: boolean;
   badAssetManifest?: boolean; writeMessage?: boolean; detached?: boolean;
   cleanupClaimedElsewhere?: boolean; consumeBudgetAtWrite?: boolean;
-  parallel?: boolean; capacityWaitMs?: number } = {}) {
+  parallel?: boolean; capacityWaitMs?: number; interactive?: boolean } = {}) {
+  const launches: BoxCcExecRequest[] = [];
   let now = 1000, active = 0, maxActive = 0;
   let releaseModel = (): void => {};
   let proofDir = "", leaseEpoch = "";
@@ -82,13 +83,14 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
     const isSupervisor = request.args[3]?.startsWith("/tmp/ocv5-289-v2-supervisor-");
     const isKeeper = request.args[3]?.startsWith("/tmp/ocv5-289-v2-keeper-");
     const isRunner = request.args[3]?.startsWith("/tmp/ocv5-289-v2-detached-runner-");
+    const isHost = request.args[3]?.startsWith("/tmp/ocv5-289-v2-interactive-host-");
     const isCleanup = request.args[2]?.includes("print('clean')");
     const isProof = request.args[2]?.includes("terminal.json");
     const isBatch = request.args[2]?.includes("print('staged:'+str(len(steps)))");
     const phase = isSpoolRead ? "spool-read" : isModel ? "model"
       : isSupervisor ? "supervisor"
       : isKeeper ? "keeper" : isCleanup ? "cleanup" : isProof ? "proof"
-        : isRunner ? "runner"
+        : isRunner ? "runner" : isHost ? "host"
         : isBatch ? "batch-stage" : "stage";
     stages.push(phase);
     active--;
@@ -101,6 +103,7 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
       throw new TypeError("getReader locked before terminal frame");
     }
     if (isModel) {
+      launches.push(request);
       proofDir = request.args[request.args.indexOf("--proof-dir") + 1] ?? "";
       leaseEpoch = request.args[request.args.indexOf("--lease-epoch") + 1] ?? "";
       assert.equal(request.environment.CLAUDE_CODE_MAX_OUTPUT_TOKENS, "256");
@@ -131,7 +134,7 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
       return ok(JSON.stringify({ data: bytes.toString("base64"),
         offset: offset + bytes.length }));
     }
-    if (isSupervisor || isKeeper || isRunner) return ok(opts.badAssetManifest && request.args.length > 7
+    if (isSupervisor || isKeeper || isRunner || isHost) return ok(opts.badAssetManifest && request.args.length > 7
       ? "bad" : Array.from({ length: (request.args.length - 3) / 4 },
         (_, i) => request.args[5 + i * 4]).join(","));
     if (isBatch) {
@@ -146,6 +149,8 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
   const service = new BoxTextFetch({ supervisorAsset: Buffer.from("#!/usr/bin/python3\nprint('fixture')\n"),
     keeperAsset: Buffer.from("#!/usr/bin/python3\nprint('keeper fixture')\n"),
     ...(opts.detached ? { detachedRunnerAsset: Buffer.from("#!/usr/bin/python3\nprint('runner fixture')\n") } : {}),
+    ...(opts.interactive ? { interactiveHost: { host: Buffer.from("#!/usr/bin/python3\nprint('host fixture')\n"),
+      modFiles: "{}", modSha256: "c".repeat(64) } } : {}),
     registry,
     journal: { admit: async (identity) => { journalCalls.push("admit");
         if (opts.writeMessage) assert.equal(identity.replayRequired, true);
@@ -173,7 +178,8 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
       return { version: 1 as const, ...identity, bytes: 100,
         sha256: "a".repeat(64) };
     } } : {}),
-    maxOutputTokensForModel: (value) => value === model || value === canonicalAlias ? 128_000 : null,
+    maxOutputTokensForModel: (value) => value === model || value === canonicalAlias
+      || value === "box-claude-opus-5-5" ? 128_000 : null,
     resolveTarget: async () => {
       if (opts.resolverThrow) throw new Error("raw credential detail must not leak");
       return { accountId: 20n, exec: runner, dispose: opts.onDispose };
@@ -184,7 +190,7 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
     },
     now: () => now, budgetMs: 600_000,
     capacityWaitMs: opts.capacityWaitMs ?? 0 });
-  return { service, registry, stages, unknowns, journalCalls,
+  return { service, registry, stages, unknowns, journalCalls, launches,
     setCleanupDone: () => { cleanupDone = true; },
     getJournalUsage: () => journalUsage, getJournalPointer: () => journalPointer,
     getMaxActive: () => maxActive,
@@ -722,4 +728,32 @@ test("real fetch close failure stays owned and recovers through public identity 
     sessionId: "session-289", accountId: 20n });
   assert.equal(calls, 2);
   assert.deepEqual(f.registry.counts(3n, 20n), { user: 0, account: 0 });
+});
+
+for (const fast of ["0", "1"]) test(`box-claude-* launch the staged interactive host, never claude -p (fast path ${fast})`, async () => {
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = fast;
+  const interactive = { ...input, canonicalModel: "box-claude-opus-5-5",
+    canonicalBody: { ...body, model: "box-claude-opus-5-5" } };
+  try {
+    const f = fixture({ interactive: true });
+    const response = await f.service.fetch(interactive);
+    assert.ok((await response.text()).includes("event: message_stop"));
+    // Step by step the host is its own stage before the launch; batched it rides with the others.
+    if (fast === "0") assert.ok(f.stages.indexOf("host") >= 0 && f.stages.indexOf("host") < f.stages.indexOf("model"));
+    else assert.equal(f.stages.filter((phase) => phase === "host").length, 0);
+    assert.equal(f.launches.length, 1);
+    const args = f.launches[0]!.args;
+    const cli = args.slice(args.indexOf("--") + 1);
+    assert.deepEqual(cli.slice(0, 2), ["/usr/bin/python3", "-I"]);
+    assert.match(cli[2]!, /^\/tmp\/ocv5-289-v2-interactive-host-[0-9a-f]{16}\.py$/);
+    assert.ok(!cli.includes("-p"));
+    // Without the host the same model is refused before anything runs on the Box.
+    const bare = fixture();
+    await assert.rejects(bare.service.fetch(interactive), /BOX_INTERACTIVE_HOST_UNAVAILABLE/);
+    assert.deepEqual(bare.stages, []);
+  } finally {
+    if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
+  }
 });

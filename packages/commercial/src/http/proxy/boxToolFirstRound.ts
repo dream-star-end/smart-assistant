@@ -410,6 +410,8 @@ export async function runBoxToolFirstRound(input: {
           ["keeper", plan.stageKeeper, plan.keeperHash],
           ["virtual_mcp", plan.stageVirtualMcp, plan.virtualMcpHash],
           ["detached_runner", plan.stageDetachedRunner, plan.detachedRunnerHash],
+          ...(plan.stageInteractiveHost && plan.interactiveHost
+            ? [["interactive_host", plan.stageInteractiveHost, plan.interactiveHost.hash] as const] : []),
         ] as const) {
           stageLabel = label;
           const staged = await run(request);
