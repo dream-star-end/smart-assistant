@@ -84,7 +84,7 @@ import {
 import { PermissionToolReopenContext, ToolCardSlot } from "./chat/toolCardSlot";
 import { reopenPermissionUi } from "../lib/chat/permissionPopupCoordinator";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
-import { currentTurnStartIndex, turnFinalAssistantFlags } from "./chat/turnSegment";
+import { currentTurnStartIndex, turnFinalAssistantFlags, turnRatingFlags } from "./chat/turnSegment";
 import {
   captureVisibleVirtualRowAnchor,
   correctedScrollTop,
@@ -2201,6 +2201,8 @@ export function MessageList({
       .filter((message) => message.role === "user")
       .map((message) => message.id),
   );
+  // OCV5-390: also the lineage for the turn's single answer / action row (turnSegment): the control
+  // user rows that link a recovery or 从断点继续 child to its source are filtered out of the rendered list.
   const recoveryParents = new Map(
     safeMessages
       .filter(
@@ -2440,7 +2442,7 @@ export function MessageList({
   let ratingFinal: boolean[] = [];
   let renderItems: RenderItem[] = [];
   try {
-    ratingFinal = turnFinalAssistantFlags(renderableMessages);
+    ratingFinal = turnFinalAssistantFlags(renderableMessages, recoveryParents);
     renderItems = coalesceTeam(renderableMessages, 0, sending, liveTurnUsage);
   } catch {
     ratingFinal = renderableMessages.map(() => false);
@@ -2452,6 +2454,8 @@ export function MessageList({
     }));
   }
   if (processDisclosure) renderItems = discloseProcess(renderItems as LeafRenderItem[], renderableMessages, ratingFinal, sending);
+  // OCV5-390: the action row follows the answer, minus turns that ended on an error.
+  const actionRowFinal = turnRatingFlags(renderableMessages, ratingFinal, recoveryParents);
   itemCountRef.current = renderItems.length;
   const itemKey = renderItemKey;
   // Production scroll surfaces freeze a start index on first content so streaming
@@ -2716,7 +2720,7 @@ export function MessageList({
         </MessageBoundary>
       );
     }
-    const turnFinalAssistant = ratingFinal[it.idx] ?? false;
+    const turnFinalAssistant = actionRowFinal[it.idx] ?? false;
     const failurePresentedBelow =
       it.m.role === "user" && presentedErrorTurnIds.has(it.m.id);
     const rowId = it.m._timelineUnitKey ?? it.m.id;

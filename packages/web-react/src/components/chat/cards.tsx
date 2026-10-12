@@ -1285,7 +1285,10 @@ export function AssistantCard({
             存到项目、时间 · 积分 · 请求ID 都收进「更多」菜单(桌面 hover 时 meta 另在行尾淡显)。
             没有动作条可挂的行(空正文的错误 / 静默卡)仍把 meta 常显在这里,否则积分无处可看。 */}
         {(() => {
-          const showActions = !live && !hasError && !!msg.text && !isSyntheticEmptyNotice;
+          // OCV5-390: copy / more sit with the rating — once per turn, on its final answer. Text the
+          // model wrote before a tool, or before the error the turn ended on, carries no action row.
+          const showActions = !live && !hasError && !!msg.text && !isSyntheticEmptyNotice &&
+            (ctx.turnFinalAssistant ?? ctx.isLast ?? true);
           const showMinimalActions = !live && hasError && !!presentedError?.bodyText;
           // 中断轮仍要露出 requestId / 积分：这是 server usage 上的持久字段，
           // 刷新后跟 server-wins 回显，不能因为 stopped 就整行藏掉。
