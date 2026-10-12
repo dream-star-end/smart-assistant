@@ -1372,7 +1372,7 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/turnActivity.test.tsx",
-          "assertion": "retrying → 滚动旧 max 也统一为「模型繁忙，正在重试中（n/10）」"
+          "assertion": "OCV5-390: retrying → only the neutral in-progress line, no busy wording, counter or warning colour"
         },
         {
           "layer": "browser",
@@ -6813,6 +6813,24 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-continuation.ts",
           "assertion": "every Box run sets CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0 and the interactive host passes it to the CLI"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261012-BOX-CC2-IMAGE-SOURCE-NOTE",
+      "occurredAt": "2026-10-12",
+      "severity": "P1",
+      "symptom": "个人版 cc2（account2）上读图片的回合中断：Box CLI 给图片工具结果加的来源说明写在自己的配置目录 /home/box/.claude-account2/projects/…，egress 回显校验只认 /home/box/.claude/projects/，判 BOX_TOOL_ECHO_CONTENT_MISMATCH（continuation_echo_rejected，0 积分）并停止该轮，CCB 非流式回落再得 409 BOX_REPLAY_NOT_FOUND；界面先出「任务执行失败」再「模型繁忙，正在重试中（1/10）」，恢复后过程里留「任务执行失败 · 本轮已继续」。OCV5-387 把 cc2 设为首选后，每次读图都先失败一次（2026-10-12 23:05 CST 起，uid 3，egress 90f7bfee…，网关 trace daf47543…）。修复：来源说明接受 /home/box/.claude(-<login>)?/projects/；续轮发布工具结果不再调度登录（noLaunch，不再 pick cc1）；可自动重试的错误不出红卡、恢复后不留痕迹、重试期间只显示中性进行中状态。",
+      "rootFixCommit": "bac88458",
+      "coverageCommits": [
+        "f0711f91",
+        "4da601a9"
+      ],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-continuation.ts",
+          "assertion": "an image echo from a run under another login (cc2, .claude-account2) is accepted; a foreign directory is refused"
         }
       ]
     }
