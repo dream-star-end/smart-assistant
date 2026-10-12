@@ -142,9 +142,9 @@ describe("协议文案", () => {
     for (const name of advertised) assert.ok(known.has(name), `prompt advertises unknown icon ${name}`);
   });
 
-  test("测验类走 quiz 组件:组件能做的事不改用 htmlpreview,且声明优先于平台的 htmlpreview 段落", () => {
+  test("测验类走 quiz 组件:组件能做的事不改用 htmlpreview(平台 htmlpreview 段落同样这样写,OCV5-382)", () => {
     assert.match(INTELLIGENT_UI_PROMPT, /测验、知识问答[^\n]*一律用 ui 组件[^\n]*不要为它们另做 htmlpreview/);
-    assert.match(INTELLIGENT_UI_PROMPT, /以本段为准/);
+    assert.doesNotMatch(INTELLIGENT_UI_PROMPT, /以本段为准/);
     assert.match(INTELLIGENT_UI_PROMPT, /- quiz:[^\n]*出题考考大家/);
     assert.doesNotMatch(INTELLIGENT_UI_PROMPT, /小工具或小游戏用/);
   });
