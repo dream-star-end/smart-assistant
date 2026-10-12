@@ -98,17 +98,17 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(screen.getByText("等待你确认后继续")).toBeTruthy();
   });
 
-  test("retrying → 滚动旧 max 也统一为「模型繁忙，正在重试中（n/10）」", () => {
+  test("OCV5-390: retrying → only the neutral in-progress line, no busy wording, counter or warning colour", () => {
     renderTA({
       startedAt: Date.now(),
       turnStatus: { kind: "retrying", attempt: 2, max: 3, retryAt: Date.now() + 4500 },
     });
     const node = screen.getByLabelText("生成中");
     const t = node.textContent ?? "";
-    expect(t).toContain("模型繁忙，正在重试中（2/10）");
-    expect(t).not.toContain("后重试");
-    // 软提示走 warning 色(text-warning),不是红卡。
-    expect(node.className).toContain("text-warning");
+    expect(t).toContain("仍在处理中…");
+    expect(t).not.toMatch(/模型繁忙|重试|\d+\/10|后重试/);
+    expect(node.className).toContain("text-muted");
+    expect(node.className).not.toContain("text-warning");
   });
 
   test("连接恢复与 Stop 复用活动行，不冒充模型重试", () => {

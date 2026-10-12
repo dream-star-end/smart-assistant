@@ -60,6 +60,73 @@ export function currentTurnSettled(messages: ChatMessage[]): boolean {
   return false;
 }
 
+/** OCV5-390: one visible turn = the user's message plus every automatic recovery / 从断点继续 child
+ * under it (their control user rows are hidden). Maps a row's owner id to that turn's root id. */
+export function turnRecoveryParents(messages: readonly ChatMessage[]): Map<string, string> {
+  const parentOf = new Map<string, string>();
+  for (const m of messages) {
+    if (m?.role !== "user" || typeof m._recoveryOfClientMessageId !== "string" || !m._recoveryOfClientMessageId) {
+      continue;
+    }
+    // A user row's own id is its client message id; rows that carry both get both keys.
+    for (const id of [m.id, m._clientMessageId]) {
+      if (typeof id === "string" && id) parentOf.set(id, m._recoveryOfClientMessageId);
+    }
+  }
+  return parentOf;
+}
+
+/** Resolve an owner id to its visible turn. `parents` comes from the full message list: the recovery
+ * control user rows are filtered out before rendering, so the rendered rows cannot rebuild it. */
+export function turnLineageRoot(messages: readonly ChatMessage[],
+  parents?: ReadonlyMap<string, string>): (id: string) => string {
+  const parentOf = parents ?? turnRecoveryParents(messages);
+  return (id: string): string => {
+    let current = id;
+    for (let hops = 0; hops < 64; hops++) {
+      const parent = parentOf.get(current);
+      if (!parent || parent === current) break;
+      current = parent;
+    }
+    return current;
+  };
+}
+
+/**
+ * OCV5-390: the action row (copy / like / dislike / more) sits once per turn, on its final answer
+ * (turnFinalAssistantFlags). A turn that ended on an error has none: the text before that error is
+ * often the line the model wrote before a tool, and the error card carries its own minimal row.
+ * Layout (which text is the answer) stays with turnFinalAssistantFlags.
+ */
+export function turnRatingFlags(messages: readonly ChatMessage[], finals: readonly boolean[],
+  parents?: ReadonlyMap<string, string>): boolean[] {
+  const rootOf = turnLineageRoot(messages, parents);
+  const flags = finals.slice();
+  const finalOf = new Map<string, number>();
+  finals.forEach((isFinal, i) => {
+    const id = messages[i]?._clientMessageId;
+    if (isFinal && typeof id === "string" && id) finalOf.set(rootOf(id), i);
+  });
+  // Order between two rows of one turn: the durable sequence when both have one, else array order.
+  const later = (a: number, b: number): boolean => {
+    const sa = messages[a]?._orderSeq;
+    const sb = messages[b]?._orderSeq;
+    if (typeof sa === "number" && typeof sb === "number" && sa > 0 && sb > 0 && sa !== sb) return sa > sb;
+    return a > b;
+  };
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    // The turn ended on a failure: an assistant error row, or the dispatch-terminal status record the
+    // master writes when the turn never ran to completion (Codex r1).
+    const failure = !!m && !!m._errorCode
+      && (m.role === "assistant" || (m._turnStatusRecord === true && m._dispatchTerminal === true));
+    if (!failure || typeof m._clientMessageId !== "string" || !m._clientMessageId) continue;
+    const at = finalOf.get(rootOf(m._clientMessageId));
+    if (at !== undefined && later(i, at)) flags[at] = false;
+  }
+  return flags;
+}
+
 /**
  * 每条消息是否为其**所在轮次的末条 assistant 正文** —— 评价反馈行(ResponseRatingCard)
  * 唯一可见位。返回按 messages 下标对齐的布尔数组;非「轮末条 assistant 正文」行恒 false。
@@ -74,7 +141,8 @@ export function currentTurnSettled(messages: ChatMessage[]): boolean {
  * 每轮各自的末条都被标记(**不是**"全会话末条"):翻历史会话时每轮末条仍可补评;而一轮内模型
  * 产出的多段中间文本回复不再各自带一行"这条回复怎么样?",消除噪音(boss 07-11)。
  */
-export function turnFinalAssistantFlags(messages: ChatMessage[]): boolean[] {
+export function turnFinalAssistantFlags(messages: ChatMessage[],
+  parents?: ReadonlyMap<string, string>): boolean[] {
   const flags = new Array<boolean>(messages.length).fill(false);
   const isBody = (m: ChatMessage | undefined): boolean =>
     !!m &&
@@ -96,6 +164,7 @@ export function turnFinalAssistantFlags(messages: ChatMessage[]): boolean[] {
     a[0] > b[0] ||
     (a[0] === b[0] && (a[1] > b[1] || (a[1] === b[1] && a[2] > b[2])));
 
+  const rootOf = turnLineageRoot(messages, parents);
   // Durable/live rows carry the exact user message id that owns their turn.
   // Grouping on it is independent of a temporarily polluted array order.
   const grouped = new Map<string, { index: number; tuple: [number, number, number] }>();
@@ -103,9 +172,10 @@ export function turnFinalAssistantFlags(messages: ChatMessage[]): boolean[] {
     const message = messages[i];
     if (!isBody(message) || typeof message._clientMessageId !== "string" || !message._clientMessageId) continue;
     const tuple = orderTuple(message, i);
-    const previous = grouped.get(message._clientMessageId);
+    const owner = rootOf(message._clientMessageId);
+    const previous = grouped.get(owner);
     if (!previous || tupleAfter(tuple, previous.tuple)) {
-      grouped.set(message._clientMessageId, { index: i, tuple });
+      grouped.set(owner, { index: i, tuple });
     }
   }
   for (const winner of grouped.values()) flags[winner.index] = true;

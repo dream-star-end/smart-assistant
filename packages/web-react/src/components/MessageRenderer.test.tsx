@@ -4162,3 +4162,69 @@ test("frozen rejection already in original message appears only once", () => {
   expect(screen.getByText("首次错误标题").closest("[role=alert]")).toHaveClass("bg-danger-soft");
   expect(screen.getAllByRole("button", { name: "重新尝试" })).toHaveLength(1);
 });
+
+describe("OCV5-390: one action row per turn, on its final answer", () => {
+  const user = mk("user", { id: "u-img", text: "看看这两张截图", status: "replied" });
+  const child = (automatic: boolean) => mk("user", {
+    id: "u-img-r1", text: "RECOVERY_CONTROL_ROW", _recoveryOfClientMessageId: user.id,
+    _automaticRecovery: automatic, ...(automatic ? { _isAutoRetry: true } : { _recoveryMode: "checkpoint" as const }),
+  });
+  const attempt1 = [
+    mk("assistant", { id: "a1-pre-tool", text: "我先看一下截图。", _clientMessageId: user.id, ts: 2000 }),
+    mk("tool", { id: "a1-read", toolName: "Read", inputJson: { file_path: "a.png" }, _completed: true, output: "ok",
+      _clientMessageId: user.id, ts: 2001 }),
+    mk("assistant", { id: "a1-error", _clientMessageId: user.id, _errorCode: "engine_error", ts: 2002 }),
+  ];
+  const attempt2 = (ending: "answer" | "error") => [
+    mk("assistant", { id: "a2-pre-tool", text: "我看一下手机亮色这张。", _clientMessageId: "u-img-r1", ts: 3000 }),
+    mk("tool", { id: "a2-read", toolName: "Read", inputJson: { file_path: "b.png" }, _completed: true, output: "ok",
+      _clientMessageId: "u-img-r1", ts: 3001 }),
+    ending === "answer"
+      ? mk("assistant", { id: "a2-final", text: "两张截图都看完了：布局一致。", _clientMessageId: "u-img-r1", ts: 3002 })
+      : mk("assistant", { id: "a2-error", _clientMessageId: "u-img-r1", _errorCode: "engine_error", ts: 3002 }),
+  ];
+  const renderTurn = (messages: ChatMessage[]) => render(
+    <MessageList messages={messages} sending={false} cb={{ onRetrySend: vi.fn() }} onRespondPermission={() => {}} />);
+
+  for (const automatic of [true, false]) {
+    test(`${automatic ? "automatic retry" : "从断点继续"}: exactly one copy / more row, under the final answer only`, () => {
+      renderTurn([user, ...attempt1, child(automatic), ...attempt2("answer")]);
+      expect(screen.queryByText("RECOVERY_CONTROL_ROW")).toBeNull();
+      // the user bubble keeps its own copy button; the assistant rows of the turn get one row in total
+      const copies = screen.getAllByRole("button", { name: "复制" })
+        .filter((b) => b.closest("[data-testid=user-row]") === null);
+      expect(copies).toHaveLength(1);
+      expect(screen.getAllByRole("button", { name: "更多操作" })
+        .filter((b) => b.closest("[data-testid=user-row]") === null)).toHaveLength(1);
+      const footer = copies[0]!.closest("[data-testid=assistant-footer]");
+      expect(footer?.parentElement?.textContent ?? "").toContain("两张截图都看完了");
+    });
+  }
+
+  test("a turn that ended on a dispatch-terminal status record: no copy / more row on its text", () => {
+    renderTurn([user,
+      mk("assistant", { id: "a-check", text: "我先检查。", _clientMessageId: user.id, ts: 2000 }),
+      mk("system", { id: "turn-status:u-img", text: "", _turnStatusRecord: true, _dispatchTerminal: true,
+        _errorCode: "dispatch_lost", _clientMessageId: user.id, ts: 2001 })]);
+    expect(screen.queryAllByRole("button", { name: "复制" })
+      .filter((b) => b.closest("[data-testid=assistant-footer]") !== null)).toHaveLength(0);
+  });
+
+  test("a 从断点继续 control row whose client message id differs from its row id still joins the turn (Codex r2)", () => {
+    renderTurn([user,
+      mk("assistant", { id: "a-look", text: "我先看截图", _clientMessageId: user.id, ts: 2000 }),
+      mk("user", { id: "row-r", text: "CONTROL_ROW", _clientMessageId: "u-r", _recoveryOfClientMessageId: user.id,
+        _recoveryMode: "checkpoint", _automaticRecovery: false, ts: 2001 }),
+      mk("assistant", { id: "a-final", text: "最终答案", _clientMessageId: "u-r", ts: 2002 })]);
+    expect(screen.queryAllByRole("button", { name: "复制" })
+      .filter((b) => b.closest("[data-testid=assistant-footer]") !== null)).toHaveLength(1);
+  });
+
+  test("a turn whose retries end on an error: no copy / more row on any text before it", () => {
+    renderTurn([user, ...attempt1, child(true), ...attempt2("error")]);
+    expect(screen.queryAllByRole("button", { name: "复制" })
+      .filter((b) => b.closest("[data-testid=user-row]") === null)).toHaveLength(0);
+    expect(screen.queryAllByRole("button", { name: "更多操作" })
+      .filter((b) => b.closest("[data-testid=user-row]") === null)).toHaveLength(0);
+  });
+});

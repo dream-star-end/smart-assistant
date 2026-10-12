@@ -54,8 +54,10 @@ function fixture(options: { ambiguousWrite?: boolean; wrongAccount?: boolean } =
   const journal = { claimToolResume: async () => { sequence.push("claim"); return claim; },
     markUnknown: async () => { sequence.push("unknown"); } };
   const deps = { journal: journal as never,
-    resolveTarget: async (args: { requiredAccountId: bigint }) => {
+    resolveTarget: async (args: { requiredAccountId: bigint; noLaunch?: boolean }) => {
       sequence.push("resolve"); assert.equal(args.requiredAccountId, 20n);
+      // OCV5-390: publishing to the live run schedules no login
+      assert.equal(args.noLaunch, true);
       return target as never;
     },
     retainUnknownTarget: () => { retained = true; sequence.push("retain"); },

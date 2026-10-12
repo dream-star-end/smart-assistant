@@ -47,6 +47,7 @@ const COMPACTION_BINDING = "[ocv5-296-compaction] PASS — trusted boundary plus
 const SYSTEM_SOURCE = ["boxMessagesMapper.ts", "boxTextPlan.ts"] as const;
 const FRESH_PROJECT_BINDING = "[ocv5-384-fresh-native-project] PASS — a fresh native session stages its owner-0700 project directory and cleanup never receives it";
 const RESTAGE_BINDING = "[ocv5-384-restage-context] PASS — a re-staged conversation keeps the native context records after the first user message";
+const LOGIN_IMAGE_NOTE_BINDING = "[ocv5-390-login-image-note] PASS — an image echo from a run under another login (cc2, .claude-account2) is accepted; a foreign directory is refused";
 const MCP_AUTO_BACKGROUND_BINDING = "[ocv5-386-mcp-auto-background] PASS — every Box run sets CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0 and the interactive host passes it to the CLI";
 const SYSTEM_HEADER_BINDING = "[ocv5-381-system-header] PASS — billing header block dropped before --system-prompt-file, OpenClaude system text kept";
 const IMAGE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.png", import.meta.url)));
@@ -69,6 +70,8 @@ type Api = {
   context: (body: Record<string, unknown>, completedToolTail?: boolean) => string;
   fingerprint: (uid: bigint, body: Record<string, unknown>) => { replayFingerprint: string };
   echoAccept: (id: string, hash: string, raw: unknown) => void;
+  /** OCV5-390: the live path's verifier, which also holds the published content (CLI rewrites). */
+  echoAcceptContent: (id: string, hash: string, content: unknown[], raw: unknown) => Promise<void>;
   publishImage: (row: PublishedMatch) => PublishedFile;
   classify: (body: Record<string, unknown>) => { classification: string; rejectCode: string | null };
   projectAuthority: (kind: unknown, authorityTurnId: unknown) => { kind: string };
@@ -287,6 +290,13 @@ async function load(): Promise<Api> {
       const verifier = new resultEcho.BoxToolResultEcho([{ modelToolUseId: id,
         contentHash: hash, isError: false }]);
       verifier.accept(raw);
+      verifier.assertComplete();
+    },
+    echoAcceptContent: async (id: string, hash: string, content: unknown[], raw: unknown) => {
+      const verifier = new resultEcho.BoxToolResultEcho([{ modelToolUseId: id,
+        contentHash: hash, isError: false, content }]);
+      verifier.accept(raw);
+      await verifier.verifyDeferred();
       verifier.assertComplete();
     },
     classify: prepared.classifyBoxContinuation,
@@ -1054,6 +1064,29 @@ async function proveNoMcpAutoBackground(): Promise<void> {
     fail("MCP_AUTO_BACKGROUND_HOST_PASS");
   }
 }
+/** OCV5-390: the CLI adds a note naming a saved image under its own config directory. A run under
+ * another login (cc2: CLAUDE_CONFIG_DIR=/home/box/.claude-account2) is a valid echo; a directory that is
+ * not a Claude config dir of the Box user is still refused. Live path verifier (content in hand). */
+async function proveLoginImageNote(api: Api): Promise<void> {
+  const { png } = imageFixture();
+  const image = { type: "image", source: { type: "base64", media_type: "image/png", data: png } };
+  const published = [{ type: "image", data: png, mimeType: "image/png" }];
+  const hash = createHash("sha256").update(JSON.stringify({ content: published, isError: false })).digest("hex");
+  const echo = (dir: string) => ({ type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: SEALED_ID, content: [image, { type: "text",
+      text: `[Image: source: /home/box/${dir}/projects/-tmp-ocv5-289-run-${"c".repeat(24)}/b6df2535-b7de-499a-bbb9-cb501631c640/tool-results/mcp-ocbridge-blob-1.png]` }] }] } });
+  for (const dir of [".claude", ".claude-account2"]) {
+    try { await api.echoAcceptContent(SEALED_ID, hash, published, echo(dir)); }
+    catch { fail(dir === ".claude" ? "IMAGE_NOTE_DEFAULT_LOGIN" : "IMAGE_NOTE_OTHER_LOGIN"); }
+  }
+  let refused = false;
+  for (const foreign of [".claudeX", ".claude-default"]) {
+    refused = false;
+    try { await api.echoAcceptContent(SEALED_ID, hash, published, echo(foreign)); }
+    catch (error) { refused = (error as { code?: string }).code === "BOX_TOOL_ECHO_CONTENT_MISMATCH"; }
+    if (!refused) fail("IMAGE_NOTE_FOREIGN_DIR");
+  }
+}
 async function workerMain(expectSha: string): Promise<void> {
   const token = process.env.OC_B1_WORKER_TOKEN ?? "";
   const tokenFile = process.env.OC_B1_WORKER_TOKEN_FILE ?? "";
@@ -1086,6 +1119,8 @@ async function workerMain(expectSha: string): Promise<void> {
   const after = digest();
   if (!isDeepStrictEqual(before, after)) fail("MANIFEST_DRIFT_AFTER_LOAD");
   checks(api);
+  await proveLoginImageNote(api);
+  if (!LOGIN_IMAGE_NOTE_BINDING.startsWith("[ocv5-390-login-image-note] PASS")) fail("LOGIN_IMAGE_NOTE_BINDING");
   await provePublisher();
   const end = digest();
   if (!isDeepStrictEqual(before, end)) fail("MANIFEST_DRIFT_FINAL");

@@ -921,7 +921,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T29 自动重试统一显示模型繁忙与共享 n/10 进度"
+          "assertion": "T29 自动重试只显示中性的进行中状态（无模型繁忙、无 n/10）；重试成功保持实时可见"
         }
       ],
       "coverageCommits": []
@@ -946,7 +946,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T29 自动重试统一显示模型繁忙与共享 n/10 进度；重试成功保持实时可见"
+          "assertion": "T29 自动重试只显示中性的进行中状态（无模型繁忙、无 n/10）；重试成功保持实时可见"
         },
         {
           "layer": "integration",
@@ -1283,7 +1283,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T29 自动重试统一显示模型繁忙与共享 n/10 进度；重试成功保持实时可见"
+          "assertion": "T29 自动重试只显示中性的进行中状态（无模型繁忙、无 n/10）；重试成功保持实时可见"
         }
       ]
     },
@@ -1400,7 +1400,7 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/turnActivity.test.tsx",
-          "assertion": "retrying → 滚动旧 max 也统一为「模型繁忙，正在重试中（n/10）」"
+          "assertion": "OCV5-390: retrying → only the neutral in-progress line, no busy wording, counter or warning colour"
         },
         {
           "layer": "browser",
@@ -7301,6 +7301,49 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-continuation.ts",
           "assertion": "every Box run sets CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0 and the interactive host passes it to the CLI"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261012-BOX-CC2-IMAGE-SOURCE-NOTE",
+      "occurredAt": "2026-10-12",
+      "severity": "P1",
+      "symptom": "个人版 cc2（account2）上读图片的回合中断：Box CLI 给图片工具结果加的来源说明写在自己的配置目录 /home/box/.claude-account2/projects/…，egress 回显校验只认 /home/box/.claude/projects/，判 BOX_TOOL_ECHO_CONTENT_MISMATCH（continuation_echo_rejected，0 积分）并停止该轮，CCB 非流式回落再得 409 BOX_REPLAY_NOT_FOUND；界面先出「任务执行失败」再「模型繁忙，正在重试中（1/10）」，恢复后过程里留「任务执行失败 · 本轮已继续」。OCV5-387 把 cc2 设为首选后，每次读图都先失败一次（2026-10-12 23:05 CST 起，uid 3，egress 90f7bfee…，网关 trace daf47543…）。修复：来源说明接受 /home/box/.claude(-<login>)?/projects/；续轮发布工具结果不再调度登录（noLaunch，不再 pick cc1）；可自动重试的错误不出红卡、恢复后不留痕迹、重试期间只显示中性进行中状态。",
+      "rootFixCommit": "bac88458",
+      "coverageCommits": [
+        "f0711f91",
+        "4da601a9",
+        "02d78f62",
+        "1dd2997d"
+      ],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-continuation.ts",
+          "assertion": "an image echo from a run under another login (cc2, .claude-account2) is accepted; a foreign directory is refused"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261012-TURN-DUPLICATE-ACTION-ROW",
+      "occurredAt": "2026-10-12",
+      "severity": "P2",
+      "symptom": "个人版 uid 3 会话 webmv5du86xlxxbud（2026-10-12 23:05–23:28 CST）：同一轮里复制/点赞/点踩/更多这排操作栏出现两次，挂在模型调用工具前写的过程文字上。原因：自动恢复子轮（控制 user 行被隐藏）被当作独立一轮，原轮与子轮各选一条「末条正文」，且选末条时跳过错误行。修复：按可见轮（含自动恢复与从断点继续的血缘）只选一条回答；以错误收尾的轮次不给正文挂操作栏；复制/更多与评价同一门控；桌面与移动端共用组件。",
+      "rootFixCommit": "d0d19d57",
+      "coverageCommits": [
+        "2a9481fa",
+        "c21e248d"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageRenderer.test.tsx",
+          "assertion": "a turn whose retries end on an error: no copy / more row on any text before it"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/action-row.node-test.mjs",
+          "assertion": "INC-20261012-TURN-DUPLICATE-ACTION-ROW: real App shows one action row per turn, under its final answer only"
         }
       ]
     }

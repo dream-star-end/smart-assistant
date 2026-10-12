@@ -12,7 +12,7 @@ import { resolveAccountEgressDispatcher, type EgressResolution } from "../../acc
 import { CursorSandProvisionClient, SandProvisionError, sandPrincipal } from "../../account-pool/cursorSandProvision.js";
 import { cursorSelectableAccounts, selectCursorAccount } from "../../account-pool/cursorAccountSelection.js";
 import { BoxExecTransport, BoxExecTransportError } from "./boxExecTransport.js";
-import { BOX_DEFAULT_PROFILE, boxProfileKey } from "./boxClaudeProfile.js";
+import { BOX_DEFAULT_PROFILE, boxProfileKey, isBoxLaunchRequest } from "./boxClaudeProfile.js";
 import { listBoxProfiles, writeBoxProfileHealth, type BoxProfileRow } from "./boxClaudeProfileStore.js";
 import { BoxProfileHealth } from "./boxProfileHealth.js";
 import { BOX_PROFILE_GUARD_REFUSED, makeBoxProfileGuard } from "./boxProfileDiscovery.js";
@@ -36,6 +36,17 @@ export type BoxLoginScope = "default" | "all";
 export const BOX_CHAT_SWITCH_AT = 0.95;
 const CHAT_LOGIN_TTL_MS = 24 * 3_600_000;
 const CHAT_LOGIN_MAX = 10_000;
+
+/** A no-launch target: every request is passed through except a Claude CLI launch, which no login was
+ * scheduled for. */
+export function refuseBoxLaunch<T extends Pick<BoxExecTransport, "run">>(inner: T): Pick<BoxExecTransport, "run"> {
+  return {
+    run(request, opts) {
+      if (isBoxLaunchRequest(request)) return Promise.reject(new BoxAccountResolverError("BOX_TARGET_NO_LAUNCH"));
+      return inner.run(request, opts);
+    },
+  };
+}
 
 export class BoxAccountResolverError extends Error {
   /** Safe cause tag (error name and provision code only, never a message). */
@@ -313,6 +324,10 @@ export class BoxAccountResolver {
      * the same credential, identity and egress checks, and hand the endpoint out (`execTarget`). No login
      * scheduling here: the interactive route asks for its login separately (BoxInteractiveLogins). */
     interactiveExecTarget?: boolean;
+    /** The target only reaches runs that already exist (publishing tool results to a live run, reading
+     * its spool): no login is scheduled, so an unrelated login's health or selection cannot block it
+     * and nothing is logged as a pick; a CLI launch through it is refused (OCV5-390). */
+    noLaunch?: boolean;
     /** Logins this launch may use; `default` when absent (BoxLoginScope). */
     loginScope?: BoxLoginScope;
     /** The chat this launch belongs to (its CLI session id): it stays on the login it last ran on. */
@@ -344,6 +359,10 @@ export class BoxAccountResolver {
      * the same credential, identity and egress checks, and hand the endpoint out (`execTarget`). No login
      * scheduling here: the interactive route asks for its login separately (BoxInteractiveLogins). */
     interactiveExecTarget?: boolean;
+    /** The target only reaches runs that already exist (publishing tool results to a live run, reading
+     * its spool): no login is scheduled, so an unrelated login's health or selection cannot block it
+     * and nothing is logged as a pick; a CLI launch through it is refused (OCV5-390). */
+    noLaunch?: boolean;
     loginScope?: BoxLoginScope; stickyKey?: string }, refused: ReadonlySet<string>): Promise<BoxResolvedTarget> {
     if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
     const now = this.deps.now ?? Date.now;
@@ -354,6 +373,7 @@ export class BoxAccountResolver {
     // Cleanup, stop and observer paths pin an account and do not launch (they never wake a Box): a benched
     // or refused login must not stop them from reaching the Box to clean up.
     const inspectOnly = args.adminProbe === true || args.interactiveExecTarget === true
+      || args.noLaunch === true
       || (args.requiredAccountId !== undefined && args.allowWakeIfHibernated !== true);
     const choice = this.deps.profiles && !inspectOnly
       ? await this.chooseLogin(rows, args, now(), refused) : "legacy";
@@ -461,9 +481,10 @@ export class BoxAccountResolver {
       if (this.deps.profiles && !inspectOnly && profile !== BOX_DEFAULT_PROFILE) {
         await this.guardLogin(transport, accountId, profile, args.signal);
       }
-      const exec = this.deps.profiles
+      const scoped = this.deps.profiles
         ? scopeBoxExecToProfile(transport, { key: boxProfileKey(accountId, profile), profile,
           health: this.deps.profiles.health }) : transport;
+      const exec = args.noLaunch === true ? refuseBoxLaunch(scoped) : scoped;
       const owned = owner;
       handedOff = true;
       return { accountId, exec, profile, ...(owned ? { dispose: () => owned.close() } : {}),

@@ -11,7 +11,6 @@
  * 语义一致、不再各写一份三个点。
  */
 import { useEffect, useRef, useState } from "react";
-import { AUTOMATIC_TURN_RETRY_MAX } from "@openclaude/protocol";
 import type { TodoItem } from "./PinnedTaskTracker";
 import {
   isRetryingTurnStatus,
@@ -110,7 +109,9 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
     text = "正在停止…";
     cls = "stopping";
   } else if (retry) {
-    text = `模型繁忙，正在重试中（${retry.attempt}/${AUTOMATIC_TURN_RETRY_MAX}）`;
+    // OCV5-390: a retry in progress is still just work in progress for the user; no "busy", no counter.
+    // The failure card appears only when the retries are used up.
+    text = "仍在处理中…";
     cls = "retrying";
   } else if (
     (recoveryKind === "waiting-service" || recoveryKind === "retrying") &&
@@ -156,7 +157,7 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
 
   return (
     <div
-      className={cn("flex items-center gap-2 py-1 text-body", retry ? "text-warning" : "text-muted", cls)}
+      className={cn("flex items-center gap-2 py-1 text-body text-muted", cls)}
       aria-label="生成中"
       aria-live="polite"
     >
