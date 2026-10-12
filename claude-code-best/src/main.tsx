@@ -6,6 +6,7 @@
 //    key) in parallel — isRemoteManagedSettingsEligible() otherwise reads them
 //    sequentially via sync spawn inside applySafeConfigEnvironmentVariables()
 //    (~65ms on every macOS startup)
+import { registerOpenClaudeAppendPrompt } from './utils/openclaudePromptLayout.js';
 import { profileCheckpoint, profileReport } from './utils/startupProfiler.js';
 
 // eslint-disable-next-line custom-rules/no-top-level-side-effects
@@ -1827,6 +1828,11 @@ async function run(): Promise<CommanderCommand> {
           process.exit(1);
         }
       }
+
+      // OCV5-383: OpenClaude static-first layout. The default system prompt
+      // carries the static half; each assembly site keeps the whole file when
+      // its base is anything else (custom prompt, agent, coordinator).
+      registerOpenClaudeAppendPrompt(appendSystemPrompt);
 
       // Add teammate-specific system prompt addendum for tmux teammates
       if (

@@ -1103,6 +1103,15 @@ export function ccbOfficialCcEnabled(env: NodeJS.ProcessEnv = process.env): bool
 
 /** Explicit `opts.harness` wins; otherwise `OC_CCB_OFFICIAL_CC=1` selects the
  * stock CLI. Default remains CCB. */
+/** OCV5-383: only CCB (not official Claude Code, not the Box-resident CLI)
+ *  understands the static-first extra-prompt layout. */
+export function usesStaticFirstPromptLayout(
+  harness: ReturnType<typeof resolveCcbHarness>,
+  boxResidentCc: boolean | undefined,
+): boolean {
+  return harness === 'ccb' && !boxResidentCc
+}
+
 export function resolveCcbHarness(
   optsHarness: 'ccb' | 'official-cc' | undefined,
   env: NodeJS.ProcessEnv = process.env,
@@ -1931,6 +1940,11 @@ export class SubprocessRunner extends EventEmitter {
           // agent 侧读写走 openclaude-memory MCP 的 reminder 工具族(list/create/
           // update/delete,同一 /api/cron)。
           CLAUDE_CODE_DISABLE_CRON: '1',
+          // OCV5-383: CCB places the static half of extra-prompt.md before its own
+          // per-session sections (see buildPromptContext cacheLayout). Same gate as below.
+          OPENCLAUDE_PROMPT_LAYOUT: usesStaticFirstPromptLayout(harness, this.opts.boxResidentCc)
+            ? '2'
+            : '',
           ...(harness === 'official-cc'
             ? { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' }
             : {}),
@@ -2717,6 +2731,9 @@ export class SubprocessRunner extends EventEmitter {
         skillEvalDraft: this.opts.skillEvalDraft,
         sessionId: this.opts.sessionId,
         projectId: this.opts.projectId,
+        cacheLayout: usesStaticFirstPromptLayout(resolveCcbHarness(this.opts.harness), this.opts.boxResidentCc)
+          ? 'static-first'
+          : 'legacy',
       })
       const cwdDecision = decideEngineCwd({
         agentBaseDir: this.opts.agentBaseDir,

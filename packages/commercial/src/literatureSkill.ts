@@ -142,3 +142,24 @@ export function renderLiteratureSkillContent(cfg: LiteratureSkillConfig): string
     "- 你已经能基于自身知识自信回答,且用户没要求「查最新文献」。",
   ].join("\n");
 }
+
+/**
+ * OCV5-382: what the SKILLS_LITERATURE slot sends now. The full DeepXiv
+ * instructions above live in the baseline `oc-lit` skill, between the
+ * DEEPXIV_SECTION markers (rendered from renderLiteratureSkillContent with the
+ * default size, guarded by a parity test), so the ~1.7k tokens load only when a
+ * model needs them. `oc-lit` is the preferred literature tool; the old full slot
+ * kept steering models to this legacy arXiv-only path instead.
+ */
+export const LITERATURE_SKILL_POINTER = [
+  "# 平台技能: 文献检索",
+  "",
+  "查文献先 `skill_view(\"oc-lit\")`,用多源检索 `oc-lit`。需要 arXiv 全文 RAG 摘要时用平台 DeepXiv 接口,它的调用方法、鉴权与 token 安全规则在同一技能的「DeepXiv」一节,不要凭记忆拼接口或请求头。",
+].join("\n");
+
+/** Section markers and default config for the DeepXiv text inside oc-lit/SKILL.md. */
+export const DEEPXIV_SECTION_START = "<!-- deepxiv:start (rendered from literatureSkill.ts) -->";
+export const DEEPXIV_SECTION_END = "<!-- deepxiv:end -->";
+export const DEEPXIV_SKILL_RENDER_CONFIG: LiteratureSkillConfig = {
+  enabled: true, token_set: true, default_size: 10,
+};

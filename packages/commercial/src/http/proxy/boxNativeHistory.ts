@@ -4,6 +4,8 @@
 import type { ProxyBody } from "./shared.js";
 import { deriveBoxContextHash, hashBoxAssistantContent } from "./boxCallFingerprint.js";
 import { normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
+import { boxPromptLayoutOf } from "./boxMessagesMapper.js";
+import type { BOX_PROMPT_LAYOUT_STATIC_FIRST } from "./boxNativePointer.js";
 
 export interface BoxNativeHistoryBasis {
   readonly contextHashBeforeFinal: string;
@@ -62,4 +64,10 @@ export function explainBoxNativeHistory(nextBody: ProxyBody,
     if (hashBoxAssistantContent(assistantBlocks) !== basis.assistantContentHash) return "assistant";
     return "ok";
   } catch { return "error"; }
+}
+
+/** OCV5-383: the pointer field recording the layout the transcript was staged with. */
+export function withPromptLayout(body: ProxyBody): { promptLayout?: typeof BOX_PROMPT_LAYOUT_STATIC_FIRST } {
+  const layout = boxPromptLayoutOf(body);
+  return layout ? { promptLayout: layout } : {};
 }

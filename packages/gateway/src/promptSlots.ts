@@ -90,13 +90,14 @@ import type { FrozenProjectContextDigests } from './runContextPersist.js'
 const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 
 你是 OpenClaude 平台上的 AI 助手,用户通过 Web 浏览器与你交互。
-你运行在服务器本机上(不需要 SSH 连接自己,直接执行 Bash 命令即可)。
+你在用户专属的容器里运行,直接执行 Bash 命令即可(不需要 SSH 连接自己)。
 
 ## 多媒体与文件
 
-发送文件给用户: 必须先保存到平台生成目录再回复**绝对路径**;商业版容器优先使用 \`/home/agent/.openclaude/generated/\`,个人版/宿主机通常是 \`/root/.openclaude/generated/\`。不要用 \`/tmp\` 临时目录,不要用 \`![]()\` 语法。
+发送文件给用户: 必须先保存到平台生成目录 \`/home/agent/.openclaude/generated/\` 再回复**绝对路径**。不要用 \`/tmp\` 临时目录,不要用 \`![]()\` 语法。
 详细规则见 \`skill_view("platform-capabilities")\`。
 
+<!-- oc-channel:wechat:start -->
 ## 微信通道操作技能
 
 如果当前对话来自微信,或用户要求在微信里收发文件、图片、视频、语音/音频、附件,按以下规则操作:
@@ -107,10 +108,11 @@ const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 - 安全文件名只能匹配 \`[A-Za-z0-9._@+=,-]{1,180}\`,最长 180 字符;不要使用子目录、\`..\`、URL 编码、软链接、\`/tmp\` 或任意系统路径。
 - 可发送的常见扩展名:图片 \`png/jpg/jpeg/gif/webp\`;视频 \`mp4/mov/m4v/webm\`;语音/音频 \`mp3/wav/ogg/oga/silk/amr\`;文件 \`pdf/txt/md/csv/json/docx/xlsx/pptx/zip/tar/gz\`。
 - 用户说“随便发我一个文件”时,先生成一个小的 \`txt\` 或 \`md\` 文件到 generated 目录,再在最终回复给出路径;在路径出现前不要声称已经发给用户。
+<!-- oc-channel:wechat:end -->
 
 ## 界面预览:内联 \`htmlpreview\` 与容器网站原生预览
 
-单文件、自包含且不依赖真实项目构建、路由或 API 的界面 mock、HTML Canvas、动画、小游戏和独立交互 demo,优先直接输出 fenced \`htmlpreview\` 代码块。真实项目、多文件或框架站点、已有或需要启动的开发服务器、真实路由/API/静态资源联调,以及用户明确要求查看正在开发的网站时,改用**容器网站原生预览**。
+单文件、自包含且不依赖真实项目构建、路由或 API 的界面 mock、HTML Canvas、动画和实时操作的小游戏,优先直接输出 fenced \`htmlpreview\` 代码块;测验、计算器、表单、清单、对比这类有现成 \`ui\` 组件(见「交互式回答」)的交互,用组件,不另做网页。真实项目、多文件或框架站点、已有或需要启动的开发服务器、真实路由/API/静态资源联调,以及用户明确要求查看正在开发的网站时,改用**容器网站原生预览**。
 
 htmlpreview 在回答里无缝显示(无边框和标题栏,高度随内容,跟随明暗主题):页面背景留透明,颜色用 \`var(--oc-fg)\`,另有 \`--oc-muted\` \`--oc-surface\` \`--oc-line\` \`--oc-accent\`;可直接用 \`.oc-pills\`(切换按钮组,当前项 \`aria-pressed="true"\`)、\`.oc-stage\`(画布区)、\`.oc-caption\`(说明行)、\`.oc-links\`(下载行)。库只能按固定版本从 cdn.jsdelivr.net / unpkg.com / cdnjs.cloudflare.com 加载(如 three.js),不能请求其它网址或提交表单。要显示或下载生成目录里的文件:\`<img data-oc-src="绝对路径">\`、\`await ocFile("绝对路径")\`(返回 blob URL,可交给 GLTFLoader)、\`<a data-oc-download="绝对路径">\`。
 
@@ -123,9 +125,15 @@ htmlpreview 在回答里无缝显示(无边框和标题栏,高度随内容,跟�
 
 详细模板见 \`skill_view("platform-capabilities")\`。
 需要用户在 Web 对话中对少数选项做决定时,按当前引擎选择提问通道:
+<!-- oc-engine:ccb:start -->
 - CCB: 调用原生 \`AskUserQuestion\` 并等待回答;不要输出 fenced \`options\` 代码块,也不要在普通正文里模拟选择卡。
+<!-- oc-engine:ccb:end -->
+<!-- oc-engine:codex:start -->
 - Codex: 调用原生 \`request_user_input\` 并等待回答;不要输出 fenced \`options\` 代码块,也不要在普通正文里模拟选择卡。
+<!-- oc-engine:codex:end -->
+<!-- oc-engine:cursor:start -->
 - Cursor: 优先调用 MCP \`present_options\`(一次一题,一条回复最多 4 次;工具立刻返回,卡面由适配器注入)。工具列表没有它时,才在正文输出 fenced \`options\` 代码块(语言标记必须是 \`options\`),块内是单个合法 JSON 对象,字段为 \`question?: string\`、\`multi?: boolean\`(仅 \`=== true\` 时多选)、\`options: Array<{label: string, desc?: string}>\`(1–12 项,超过 12 项整块解析失败)。一条回复最多 4 个 options 块;同一条回复里的多块会聚合成一次提交。闭围栏必须独占一行,后面不能再有任何字符,写完立刻换行。贴完立刻结束本回合,options 块之后不要再写正文;多个 options 块之间用空行分隔。用户点选后会作为下一条普通用户消息到达。禁止调用 Cursor 原生 ask 工具(会被托管运行时立即跳过、用户永远看不到),也不要再调用 MCP \`ask_user\`。
+<!-- oc-engine:cursor:end -->
 若当前工具列表没有专用提问工具(如子 agent),用普通文字列出编号选项并结束本轮回复,由用户下一条消息作答。
 
 ## 需要用户决策时
@@ -141,8 +149,12 @@ htmlpreview 在回答里无缝显示(无边框和标题栏,高度随内容,跟�
 
 即使未开启团队模式,只要系统列出了可协作 agent,也可以按收益机会式委派:
 - \`send_to_agent(agentId, message)\`:真正后台交给另一个 agent。立刻返回,请结束本回合;子任务完成后系统会把结论注入本对话并叫醒你。需要同步拿结果 → delegate_task。
+<!-- oc-engine:ccb,codex:start -->
 - CCB/Codex 同步委派走 MCP \`delegate_task(goal, agentId?, model?, context?, effort?, allowSelf?)\`;并行走 \`delegate_tasks(tasks)\`。工具会阻塞到子任务结束。
+<!-- oc-engine:ccb,codex:end -->
+<!-- oc-engine:cursor:start -->
 - Cursor 同步委派走 Bash \`oc-memory delegate --goal "..." [--agent-id ID] [--model SLUG] [--allow-self]\`;并行就在同一回合并发多条。CLI 每段前台等待会在 Cursor 约 60 分钟改挂前安全返回;若 stdout 报 \`status=running jobId=...\`,立即运行 \`oc-memory delegate-wait <jobId>\` 继续原任务,不要重新委派,不要使用 Cursor \`TaskOutput\`。不要用 MCP \`delegate_task\` / \`delegate_tasks\`(Cursor \`tools/call\` 60 秒硬超时)。质量审查用 \`oc-memory request-review --draft "..."\`。
+<!-- oc-engine:cursor:end -->
 
 委派参数契约(先看清再调,不要靠报错试出来):
 1. 唯一必填字段是 \`goal\`(任务描述);字段名不是 task/message/prompt。
@@ -170,23 +182,12 @@ htmlpreview 在回答里无缝显示(无边框和标题栏,高度随内容,跟�
 安全边界:不要绕过 CAPTCHA、Cloudflare、登录墙或站点反爬;返回 blocked/error 时如实说明受阻,改用官方 API、用户上传文件或用户提供的数据源。输出标明来源 URL/时间/路径,不要把网页抓取当高风险事实的唯一依据。
 <!-- oc-baseline-restrict:end -->
 
-## 工具效率与失败自愈
+## 工具效率
 
 在**不减少验证、不省略用户要求、不降低结果质量**的前提下:
 - 多个互不依赖的读取、搜索或状态检查应在一次工具调用里批量执行;有先后依赖的步骤仍按顺序执行,不要为省调用而并错流程。
-- 同一个工具以完全相同输入连续失败 2 次后,不要原样无限重试,也不要因此停止任务。先读错误信息,再改变参数、工具或路径继续完成;只有确实需要用户输入时才提问。
 - 登录二维码/验证码/一次性链接失效或用户要求刷新时,必须重新获取最新页面或截图,用文件修改时间或哈希确认不是旧文件,随后立刻把新文件放到 generated 目录并在回复中给出路径;禁止复用旧二维码或只口头说“已刷新”。
 
-## 效率契约
-
-开工前先定改动档位,拿不准按低一档起步:
-- **T0** 配置/catalog:只跑相关单测 + smoke,禁止全量门与 \`--with-dist\`
-- **T1** 单包代码:单包 typecheck + 单包测试
-- **T2** 跨包/协议/迁移:才走完整列车
-
-等待一律后台化:禁止 \`sleep >= 60\`、禁止前台 \`--watch\`(如 \`gh pr checks --watch\` / \`gh run watch\`)、禁止 \`while true\` 心跳;长任务后台跑并回看日志,CI 在跑时继续做别的事。
-读代码用原生 \`Read\`/\`Grep\`/\`Glob\`,能不用 \`host cat/rg\` 就不用;多条探活必须合并进一次调用。
-单 turn 超过 80 次工具调用或 30 分钟就拆分交付。用户说「验一下」时只验不修,要不要修由用户决定。
 `
 
 /** `# Memory` 常驻指令段;{{MEMORY_DIR}}/{{MEMORY_MD}}/{{USER_MD}} 由
@@ -298,6 +299,13 @@ export interface PromptSlotContext {
    * false = 整段不注入。
    */
   delegateModelCatalog?: DelegateModelSectionInput | null | false
+  /**
+   * OCV5-383: 'static-first' puts the slots that are the same for every session
+   * first and the per-user/per-session ones after PROMPT_SESSION_CONTEXT_MARKER,
+   * so provider prompt caches can share the static prefix across sessions. Only the
+   * CCB runner sets it (CCB moves the static half before its own dynamic sections).
+   */
+  cacheLayout?: 'static-first' | 'legacy'
   /**
    * A4 identity-compat assets: the master-resolver-validated profile resolved
    * into local assets by resolveIdentityCompatAssets() at a safe boundary.
@@ -708,7 +716,62 @@ function renderDelegateModelSectionForCtx(ctx: PromptSlotContext): string | null
   }
 }
 
+type PromptEngine = 'ccb' | 'codex' | 'cursor'
+
+/** OCV5-382: the engine whose tool rules apply; null keeps every engine's lines. */
+function promptEngineOf(provider: string | undefined): PromptEngine | null {
+  if (provider === 'cursor') return 'cursor'
+  if (provider === 'codex' || provider === 'codex-native') return 'codex'
+  if (provider === 'ccb' || provider === 'claude-subscription') return 'ccb'
+  return null
+}
+
+/** OCV5-382: 'webchat' drops the WeChat-only rules; anything else keeps them. */
+function promptChannelOf(sessionKey: string | undefined): 'webchat' | null {
+  return sessionKey && isWebchatSessionKey(sessionKey) ? 'webchat' : null
+}
+
+/**
+ * OCV5-382: platform text marks engine- and channel-specific rules with
+ * <!-- oc-engine:<a,b>:start/end --> and <!-- oc-channel:wechat:start/end -->.
+ * Keep the blocks that apply (all of them when the engine/channel is unknown)
+ * and drop the marker lines.
+ */
+export function selectPromptBlocks(
+  text: string,
+  engine: PromptEngine | null,
+  channel: 'webchat' | null,
+): string {
+  return text
+    .replace(
+      /<!-- oc-engine:([a-z,]+):start -->\n([\s\S]*?)<!-- oc-engine:\1:end -->\n/g,
+      (_all, engines: string, body: string) =>
+        engine === null || engines.split(',').includes(engine) ? body : '',
+    )
+    .replace(
+      /<!-- oc-channel:wechat:start -->\n([\s\S]*?)<!-- oc-channel:wechat:end -->\n\n?/g,
+      (_all, body: string) => (channel === 'webchat' ? '' : `${body}\n`),
+    )
+}
+
+function syncDelegateLine(engine: PromptEngine | null): string {
+  if (engine === 'cursor') {
+    return '**同步**: Bash `oc-memory delegate --goal "..."`,返回 `status=running` 时立即用 `oc-memory delegate-wait <jobId>` 续等,不用 Cursor `TaskOutput`。'
+  }
+  if (engine === 'ccb' || engine === 'codex') return '**同步**: MCP `delegate_task`。'
+  return '**同步**: CCB/Codex 用 MCP `delegate_task`; Cursor 用 Bash `oc-memory delegate --goal "..."`,返回 `status=running` 时立即用 `oc-memory delegate-wait <jobId>` 续等,不用 Cursor `TaskOutput`。'
+}
+
 export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlot> {
+  const parts = await buildAgentsSlotParts(ctx)
+  return { name: 'AGENTS', content: [parts.header, ...parts.dynamic, ...parts.tips].join('\n') }
+}
+
+/** AGENTS as static text (platform capabilities header, per-model tips) plus
+ *  the per-user lines (collaborator roster, delegate models). OCV5-383. */
+async function buildAgentsSlotParts(
+  ctx: PromptSlotContext,
+): Promise<{ header: string; dynamic: string[]; tips: string[] }> {
   const provider = ctx.provider
   // 识图从 openclaude-vision MCP 迁到 oc-vision CLI(baseline skill)后,是否提示识图
   // 不再看"MCP 工具是否注入"(那个值已恒 false),而看**平台是否认定该模型需要识图兜底**。
@@ -740,7 +803,8 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
         ? WECHAT_VISION_HINT_CLI
         : WECHAT_VISION_HINT_READ_THEN_CLI,
   )
-  const lines = [staticHeader]
+  const lines = [selectPromptBlocks(staticHeader, promptEngineOf(provider), promptChannelOf(ctx.sessionKey))]
+  const dynamic: string[] = []
 
   // Dynamically inject available agents list
   try {
@@ -752,11 +816,11 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
       includeMain: true,
     })
     if (otherAgents.length > 0) {
-      lines.push('')
-      lines.push('## 多 Agent 协作')
-      lines.push('')
-      lines.push(`你当前是 \`${ctx.agentId}\`。系统中还有以下 agent 可以协作:`)
-      lines.push('')
+      dynamic.push('')
+      dynamic.push('## 多 Agent 协作')
+      dynamic.push('')
+      dynamic.push(`你当前是 \`${ctx.agentId}\`。系统中还有以下 agent 可以协作:`)
+      dynamic.push('')
       for (const a of otherAgents) {
         const name = a.displayName || a.id
         const model = a.model
@@ -777,16 +841,14 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
             if (capLines[0]) capability = ` — ${capLines[0].slice(0, 80)}`
           }
         } catch {}
-        lines.push(`- **${name}** (\`${a.id}\`) [${model}, ${provider}]${capability}`)
+        dynamic.push(`- **${name}** (\`${a.id}\`) [${model}, ${provider}]${capability}`)
       }
-      lines.push('')
-      lines.push(
+      dynamic.push('')
+      dynamic.push(
         '**异步**: `send_to_agent(agentId, message)` — 真正后台,立刻返回;完成后系统注入本对话并叫醒你。',
       )
-      lines.push(
-        '**同步**: CCB/Codex 用 MCP `delegate_task`; Cursor 用 Bash `oc-memory delegate --goal "..."`,返回 `status=running` 时立即用 `oc-memory delegate-wait <jobId>` 续等,不用 Cursor `TaskOutput`。',
-      )
-      lines.push(
+      dynamic.push(syncDelegateLine(promptEngineOf(provider)))
+      dynamic.push(
         '选择 agent 时考虑其模型和能力特长。需要同步拿结果继续处理 → 同步委派;可以先结束本回合、等系统回调 → send_to_agent。',
       )
     }
@@ -797,8 +859,8 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   // 提示而非静默消失。测试可通过 ctx.delegateModelCatalog 直接注入。
   const delegateModelSection = renderDelegateModelSectionForCtx(ctx)
   if (delegateModelSection) {
-    lines.push('')
-    lines.push(delegateModelSection)
+    dynamic.push('')
+    dynamic.push(delegateModelSection)
   }
 
   // Provider-specific tips
@@ -845,7 +907,7 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     )
   }
 
-  return { name: 'AGENTS', content: lines.join('\n') }
+  return { header: lines[0]!, dynamic, tips: lines.slice(1) }
 }
 
 /** Cursor L0 compact SKILLS: retrieval contract only. No count, no top-15. 132B utf8. */
@@ -954,13 +1016,23 @@ function renderMemoryInstructions(args: { memoryDir: string; memoryMd: string; u
 }
 
 export async function buildMemorySlot(ctx: PromptSlotContext): Promise<PromptSlot> {
+  const parts = await buildMemorySlotParts(ctx)
+  return parts.index
+    ? { name: 'MEMORY', content: `${parts.instructions}\n\n${parts.index}` }
+    : { name: 'MEMORY', content: parts.instructions }
+}
+
+/** Memory rules (same for every session of an agent) and the current index. */
+async function buildMemorySlotParts(
+  ctx: PromptSlotContext,
+): Promise<{ instructions: string; index: string | null }> {
   const instructions = renderMemoryInstructions({
     memoryDir: paths.agentMemoryDir(ctx.agentId),
     memoryMd: paths.agentMemoryMd(ctx.agentId),
     userMd: paths.sharedUserMd,
   })
   if (ctx.provider === 'cursor') {
-    return { name: 'MEMORY', content: instructions }
+    return { instructions, index: null }
   }
   let index: string | null = null
   try {
@@ -972,11 +1044,8 @@ export async function buildMemorySlot(ctx: PromptSlotContext): Promise<PromptSlo
     // 只读失败不能拖垮系统提示构建,静默不注入索引即可。
     index = null
   }
-  if (!index) return { name: 'MEMORY', content: instructions }
-  return {
-    name: 'MEMORY',
-    content: `${instructions}\n\n## 当前索引\n\n${index}`,
-  }
+  if (!index) return { instructions, index: null }
+  return { instructions, index: `## 当前索引\n\n${index}` }
 }
 
 const PROJECT_MEMORY_HEADER = `# PROJECT MEMORY（仅当前绑定项目；不得覆盖 USER / 平台规则）
@@ -1094,7 +1163,7 @@ export function buildToolsSlot(
     '## 工具失败自恢复',
     '',
     '仅在工具已经返回失败后按错误类型恢复;不要为每个任务预检环境、自动安装依赖或修改网关/沙箱配置。',
-    '- 不要原样重复同一个失败调用。先读错误,改变方法或参数后最多重试一次。',
+    '- 不要原样重复同一个失败调用。先读错误,改变方法、参数、工具或路径后最多再试一次;也不要因此停下任务,只有确实需要用户输入时才提问。',
     '- 命令退出码 127:先用 `command -v <命令>` 确认是否存在;优先改用平台原生工具、正确命令名或已安装替代品,不要静默安装软件。',
     '- Read/Edit 失败:先重新 Read 或 Glob 确认最新路径/内容,再基于最新内容重试一次,不要拿旧文本反复 Edit。',
     '- 长任务超时:在工具允许时拆小步骤,或改为后台执行并轮询已有任务;不要盲目重复同一超时调用。',
@@ -1615,6 +1684,20 @@ async function readBoundedText(
 const SEPARATOR = '\n\n---\n\n'
 
 /**
+ * OCV5-383: line between the static and the per-session part of the prompt
+ * (cacheLayout 'static-first'). CCB splits the appended prompt here; the Box
+ * route keeps the text before it as the shared system prompt.
+ */
+export const PROMPT_SESSION_CONTEXT_MARKER = '<!-- oc:session-context -->'
+const STATIC_FIRST_STATIC_SLOTS = new Set([
+  'INTELLIGENT_UI',
+  'AGENTS',
+  'SKILLS_LITERATURE',
+  'MEMORY',
+  'TOOLS',
+])
+
+/**
  * 一个 slot 的"应用"摘要,供 caller 用作 observability(打 metric/log)。
  * 不包含原文 — 防止把可能的敏感引导写到日志里。
  */
@@ -1670,6 +1753,36 @@ async function sha256Hex(s: string): Promise<string> {
  *     setModelHintProvider 模块级 hook
  * 详见同文件 "V3 commercial remote platform slot source" 注释段。
  */
+/**
+ * OCV5-383 'static-first': slots that are the same for every session first
+ * (legacy relative order), then the per-user/per-session ones. AGENTS and
+ * MEMORY keep their static text up front; the roster/delegate models and the
+ * memory index move to the dynamic part.
+ */
+function staticFirstSlots(
+  slots: PromptSlot[],
+  agents: { header: string; dynamic: string[]; tips: string[] },
+  memory: { instructions: string; index: string | null },
+): { slots: PromptSlot[]; staticCount: number } {
+  const staticPart: PromptSlot[] = []
+  const dynamicPart: PromptSlot[] = []
+  for (const slot of slots) {
+    if (slot.name === 'AGENTS') {
+      staticPart.push({ name: 'AGENTS', content: [agents.header, ...agents.tips].join('\n') })
+      const roster = agents.dynamic.join('\n').trim()
+      if (roster) dynamicPart.push({ name: 'AGENTS_DYNAMIC', content: roster })
+    } else if (slot.name === 'MEMORY') {
+      staticPart.push({ name: 'MEMORY', content: memory.instructions })
+      if (memory.index) dynamicPart.push({ name: 'MEMORY_INDEX', content: memory.index })
+    } else if (STATIC_FIRST_STATIC_SLOTS.has(slot.name)) {
+      staticPart.push(slot)
+    } else {
+      dynamicPart.push(slot)
+    }
+  }
+  return { slots: [...staticPart, ...dynamicPart], staticCount: staticPart.length }
+}
+
 export async function buildPromptContext(ctx: PromptSlotContext): Promise<PromptContextResult> {
   const slots: PromptSlot[] = []
   let resolved = ctx.projectContext
@@ -1740,8 +1853,11 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   const iuiInsertAt = slots.length
 
   // Layer 2: Semi-static capabilities
-  const agents = await buildAgentsSlot(ctx)
-  slots.push(agents)
+  const agentsParts = await buildAgentsSlotParts(ctx)
+  slots.push({
+    name: 'AGENTS',
+    content: [agentsParts.header, ...agentsParts.dynamic, ...agentsParts.tips].join('\n'),
+  })
 
   const skills = await buildSkillsSlot(ctx)
   if (skills) slots.push(skills)
@@ -1798,8 +1914,13 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   // Layer 3: Dynamic context
   // MEMORY 段常驻(memdir 范式):指令段不依赖存量,故 buildMemorySlot 恒返 slot;
   // 有效索引行才拼接「当前索引」,空库/全被 scan 剔除时不加空壳。
-  const memory = await buildMemorySlot(ctx)
-  slots.push(memory)
+  const memoryParts = await buildMemorySlotParts(ctx)
+  slots.push({
+    name: 'MEMORY',
+    content: memoryParts.index
+      ? `${memoryParts.instructions}\n\n${memoryParts.index}`
+      : memoryParts.instructions,
+  })
 
   const projectMemory = await buildProjectMemorySlot(ctx)
   if (projectMemory) slots.push(projectMemory)
@@ -1839,11 +1960,22 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   const repo = buildRepoSlot(ctx)
   if (repo) slots.push(repo)
 
-  const effectiveSlots = slots.map((slot) => ({
+  const ordered =
+    ctx.cacheLayout === 'static-first'
+      ? staticFirstSlots(slots, agentsParts, memoryParts)
+      : { slots, staticCount: -1 }
+  const effectiveSlots = ordered.slots.map((slot) => ({
     ...slot,
     content: sanitizeUnavailableMcpClaims(slot.content, ctx.availableMcpTools),
   }))
-  let content = effectiveSlots.map((s) => s.content).join(SEPARATOR)
+  let content =
+    ordered.staticCount < 0
+      ? effectiveSlots.map((s) => s.content).join(SEPARATOR)
+      : [
+          ...effectiveSlots.slice(0, ordered.staticCount).map((s) => s.content),
+          PROMPT_SESSION_CONTEXT_MARKER,
+          ...effectiveSlots.slice(ordered.staticCount).map((s) => s.content),
+        ].join(SEPARATOR)
   if (resolvePromptUserRole(ctx) === 'admin') {
     content = stripBaselineRestrictions(content)
   }

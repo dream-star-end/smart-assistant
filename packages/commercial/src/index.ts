@@ -82,7 +82,7 @@ import {
   getPhase6AccountUuidEnforce,
   getSessionPinMode,
 } from "./admin/runtimeFlags.js";
-import { renderLiteratureSkillContent } from "./literatureSkill.js";
+import { LITERATURE_SKILL_POINTER } from "./literatureSkill.js";
 import {
   estimateMaxCost,
   InsufficientCreditsError,
@@ -1608,7 +1608,7 @@ export async function registerCommercial(
       if (!cfg.enabled || !cfg.token_set) return null;
       return {
         name: "SKILLS_LITERATURE",
-        content: renderLiteratureSkillContent(cfg),
+        content: LITERATURE_SKILL_POINTER,
       };
     } catch (err) {
       // 单行 DB 读失败就跳过 slot,不要让 master DB 闪断拖垮容器系统 prompt 构建。

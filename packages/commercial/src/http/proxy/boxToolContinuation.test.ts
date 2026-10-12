@@ -70,7 +70,9 @@ function fixture(kind: "tool" | "final", failComplete = false,
     beforeEcho?: unknown[]; afterEcho?: unknown[] } = {},
   claimVersion: string | null = "2.1.280",
   // OCV5-368: replaces the round's model records and its expected billed output
-  override?: { records: unknown[]; outputTokens: number }) {
+  override?: { records: unknown[]; outputTokens: number },
+  // OCV5-383: layout the first round staged the native transcript with
+  claimLayout?: "static-first-v1") {
   const sequence: string[] = [], emitted: string[] = [];
   const resultText = largeEcho ? "x".repeat(1_100_000) : localResult;
   const currentEcho = largeEcho ? { type: "user", message: { role: "user", content: [
@@ -90,7 +92,8 @@ function fixture(kind: "tool" | "final", failComplete = false,
     ...(hidden.rejected ? { rejectedToolUses: hidden.rejected } : {}),
     ...(native ? { nativeSessionId: "12345678-1234-4123-8123-123456789abc",
       nativeCliCwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`,
-      ...(claimVersion === null ? {} : { nativeCliVersion: claimVersion }) } : {}) };
+      ...(claimVersion === null ? {} : { nativeCliVersion: claimVersion }),
+      ...(claimLayout ? { nativePromptLayout: claimLayout } : {}) } : {}) };
   const bytes = Buffer.concat([raw([...(hidden.beforeEcho ?? []),
     ...(omitEcho ? [] : [currentEcho]), ...(hidden.afterEcho ?? []),
     ...(override?.records ?? (kind === "tool" ? toolRecords : finalRecords))]),
@@ -210,6 +213,29 @@ test("native final tool round publishes transcript pointer after durable usage",
     assert.ok(f.sequence.indexOf("native-attach") < f.sequence.lastIndexOf("emit"));
   } finally {
     if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
+    else process.env.OC_BOX_FAST_NATIVE = previous;
+  }
+});
+
+test("OCV5-383: the native pointer keeps the layout the chain was staged with, not this request's", async () => {
+  const previous = process.env.OC_BOX_FAST_NATIVE;
+  process.env.OC_BOX_FAST_NATIVE = "1";
+  try {
+    const marked = "STATIC\n\n---\n\n<!-- oc:session-context -->\n\n---\n\nuid=3";
+    // first round ran on an egress without the layout: the marker now on the
+    // request must not relabel that transcript
+    const legacy = fixture("final", false, false, false, false, true);
+    const legacyResult = await runBoxToolContinuation(
+      { ...legacy.input, canonicalBody: { ...legacy.input.canonicalBody, system: marked } }, legacy.deps);
+    assert.equal(legacyResult.kind === "final" && legacyResult.nativePointer !== undefined, true);
+    assert.equal(legacyResult.kind === "final" && legacyResult.nativePointer?.promptLayout, undefined);
+    const staged = fixture("final", false, false, false, false, true, "2.1.280", {}, "2.1.280",
+      undefined, "static-first-v1");
+    const stagedResult = await runBoxToolContinuation(staged.input, staged.deps);
+    assert.equal(stagedResult.kind === "final" && stagedResult.nativePointer?.promptLayout,
+      "static-first-v1");
+  } finally {
+    if (previous === undefined) Reflect.deleteProperty(process.env, "OC_BOX_FAST_NATIVE");
     else process.env.OC_BOX_FAST_NATIVE = previous;
   }
 });
