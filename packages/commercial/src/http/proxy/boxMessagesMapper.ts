@@ -255,6 +255,9 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
    * previous assistant's tool calls (a tool exchange whose live Box owner is
    * gone, e.g. a recovered dispatch). */
   resumeToolResults?: boolean;
+  /** OCV5-384: context records of the session's previous native transcript, staged right
+   * after the first user message where the CLI keeps them (see boxTranscriptAttachments). */
+  stagedAttachments?: readonly Record<string, unknown>[];
 }): BoxCliSyntheticTurn {
   if (!/^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/.test(args.cwd)
     || args.cliVersion !== "2.1.280") {
@@ -364,19 +367,30 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
 
   const timestamp = new Date().toISOString();
   let parentUuid: string | null = null;
-  const records = staged.map((message) => {
+  let pendingAttachments = args.stagedAttachments ?? [];
+  const records: Record<string, unknown>[] = [];
+  for (const message of staged) {
     const uuid = randomUUID();
     const base = { parentUuid, isSidechain: false, type: message.role, uuid,
       timestamp, cwd: args.cwd, sessionId, version: args.cliVersion };
     parentUuid = uuid;
-    return message.role === "user"
+    records.push(message.role === "user"
       ? { ...base, message: { role: "user", content: message.content } }
       : { ...base, message: { id: `msg_${uuid.replaceAll("-", "")}`, type: "message",
         role: "assistant", model: semantic.model, content: message.content,
         stop_reason: blocks(message.content).some((block) => block.type === "tool_use")
           ? "tool_use" : "end_turn",
-        usage: { input_tokens: 0, output_tokens: 0 } } };
-  });
+        usage: { input_tokens: 0, output_tokens: 0 } } });
+    if (message.role === "user" && pendingAttachments.length > 0) {
+      for (const record of pendingAttachments) {
+        const recordUuid = randomUUID();
+        records.push({ ...record, parentUuid, uuid: recordUuid, sessionId, cwd: args.cwd,
+          isSidechain: false, ...("session_id" in record ? { session_id: sessionId } : {}) });
+        parentUuid = recordUuid;
+      }
+      pendingAttachments = [];
+    }
+  }
   return {
     sessionId,
     snapshotJsonl: records.length ? records.map((record) => JSON.stringify(record)).join("\n") + "\n" : "",

@@ -1,6 +1,7 @@
 /** First paid Box tool round on the existing OpenClaude Messages path.
  * Off-route until the complete cross-HTTP resume/terminal coordinator passes
  * real Box acceptance. The remote CLI never executes OpenClaude tools. */
+import { makeBoxTranscriptAttachmentsRead, parseBoxTranscriptAttachments } from "./boxTranscriptAttachments.js";
 import { isDeepStrictEqual } from "node:util";
 import { deriveBoxCallFingerprint, deriveBoxContextHash } from "./boxCallFingerprint.js";
 import { makeBoxDetachedToolPlan, type BoxDetachedToolPlan } from "./boxDetachedToolPlan.js";
@@ -56,7 +57,7 @@ type Journal = Pick<BoxDurableJournal, "admit" |
   "markPrestartStopped" | "recordPrelaunchControl" | "armGuardedLaunch" |
   "markGuardedPrestartStopped" | "markUnknown" | "recordToolHandoff" | "complete">
   & Partial<Pick<BoxDurableJournal, "findNativeCandidate" | "attachNativePointer"
-    | "markFirstRoundRejectedStream">>;
+    | "markFirstRoundRejectedStream" | "findNativeTranscriptSources">>;
 
 /** Decoder rejections that are a deterministic property of this stream (not a
  * transport or service failure) and may be stopped and settled explicitly. */
@@ -361,6 +362,48 @@ export async function runBoxToolFirstRound(input: {
           deps.onNativeDecision?.({ requestId: input.requestId, decision: "miss",
             reason: "preflight", cliVersion: String(target.cliVersion) });
         }
+      }
+    }
+    // OCV5-384: a re-staged conversation carries the context records of the session's previous
+    // native transcript after its first user message, where that transcript has them, so the
+    // request keeps the cached prefix (the CLI would otherwise render them after the newest
+    // message). Any failure keeps the plain re-stage.
+    if (!nativeClaim && nativeEnabled && plan.snapshotHash !== null
+      && boxCliNativeResumeVerified(target.cliVersion) && fingerprint.sessionId
+      && deps.journal.findNativeTranscriptSources) {
+      try {
+        const sources = await race(deps.journal.findNativeTranscriptSources({ uid: input.uid,
+          sessionId: fingerprint.sessionId, currentRequestId: input.requestId,
+          canonicalModel: input.canonicalModel }));
+        let records: Record<string, unknown>[] | null = null;
+        for (const source of sources) {
+          if (source.cliVersion !== target.cliVersion) continue;
+          try {
+            const read = await run(makeBoxTranscriptAttachmentsRead(source), 10_000);
+            records = parseBoxTranscriptAttachments(read.stdout);
+          } catch (error) {
+            if (signal.aborted || error instanceof BoxToolFirstRoundError
+              && error.code === "BOX_TOOL_ABORTED") throw error;
+            records = null; // this transcript is gone or unreadable: try the next one
+          }
+          if (records && records.length > 0) break;
+        }
+        if (records && records.length > 0) {
+          plan = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel, ...runner,
+            maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
+            keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
+            detachedRunnerAsset: deps.detachedRunnerAsset,
+            runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+            nativePersistence: nativeEnabled, toolAliasMode: deps.toolAliasMode,
+            ...(input.resumeToolResults ? { resumeToolResults: true } : {}),
+            stagedAttachments: records });
+          deps.onNativeDecision?.({ requestId: input.requestId, decision: "miss",
+            reason: "restage_attachments", cliVersion: String(target.cliVersion) });
+        }
+      } catch (error) {
+        if (signal.aborted || error instanceof BoxToolFirstRoundError
+          && error.code === "BOX_TOOL_ABORTED") throw error;
+        /* Optional: the plain re-stage is always valid. */
       }
     }
     // OCV5-301: the same session's previous turn may still be settling.

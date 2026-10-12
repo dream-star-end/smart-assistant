@@ -33,6 +33,8 @@ export function makeBoxDetachedToolPlan(input: {
   toolAliasMode?: BoxMcpAliasMode;
   /** OCV5-378: run through the interactive host (see makeBoxTextPlan). */
   interactiveHost?: BoxInteractiveHostAsset;
+  /** OCV5-384: see makeBoxTextPlan. */
+  stagedAttachments?: readonly Record<string, unknown>[];
 }): BoxDetachedToolPlan {
   const { detachedRunnerAsset, ...toolInput } = input;
   const base = makeBoxToolPlan(toolInput);

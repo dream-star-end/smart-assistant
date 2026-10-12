@@ -266,3 +266,16 @@ test("model output cap is exact and rejects unsupported values before staging", 
     maxOutputTokensLimit: 8192 }),
   (error: unknown) => error instanceof BoxTextPlanError && error.code === "BOX_MAX_TOKENS_UNSUPPORTED");
 });
+
+test("OCV5-384: a fresh native session gets an owner-0700 project directory before launch", () => {
+  const input = { body: body([user("first")]), upstreamModel: "claude-opus-5", supervisorAsset: supervisor,
+    keeperAsset: keeper, maxOutputTokensLimit: 128_000, runNonce: "c".repeat(24), leaseEpoch: "d".repeat(32) };
+  const project = `/home/box/.claude/projects/-tmp-ocv5-289-run-${"c".repeat(24)}`;
+  const fresh = makeBoxTextPlan({ ...input, nativePersistence: true });
+  assert.equal(fresh.snapshotHash, null);
+  assert.equal(fresh.stageInputs[0]?.args[4], project, "INIT creates the project directory");
+  assert.equal(fresh.cleanup.args[4], "", "cleanup never receives the transcript's directory");
+  assert.equal(fresh.discardNativeCleanup?.args[4], "", "a discard never removes it either");
+  const plain = makeBoxTextPlan(input);
+  assert.equal(plain.stageInputs[0]?.args[4], "", "without native persistence nothing changes");
+});
