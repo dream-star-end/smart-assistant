@@ -21,6 +21,14 @@ import { V3_CCB_BASELINE_SKILL_NAMES } from '../agent-sandbox/v3supervisor.js'
 const here = dirname(fileURLToPath(import.meta.url))
 const skillsDir = join(here, '..', '..', 'agent-sandbox', 'ccb-baseline', 'skills')
 const platformBinDir = join(here, '..', '..', 'agent-sandbox', 'platform-runtime', 'bin')
+const entrypointTs = join(here, '..', '..', 'agent-sandbox', 'platform-runtime', 'entrypoint', 'entrypoint.ts')
+
+/** entrypoint 在容器启动时链进 ~/.local/bin 与 /usr/local/bin 的平台 CLI（login shell 会重置 PATH，不在这里就找不到）。 */
+function platformLinkedClis(): string[] {
+  const m = /const PLATFORM_LINKED_CLIS = \[([\s\S]*?)\] as const/.exec(readFileSync(entrypointTs, 'utf8'))
+  assert.ok(m, 'PLATFORM_LINKED_CLIS not found in entrypoint.ts')
+  return [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1])
+}
 
 describe('ccb-baseline skills ↔ manifest', () => {
   it('the shipped skills/ dir matches V3_CCB_BASELINE_SKILL_NAMES exactly', () => {
@@ -77,6 +85,8 @@ describe('ccb-baseline skills ↔ manifest', () => {
         const shim = join(platformBinDir, `${b.name}.sh`)
         assert.ok(existsSync(shim), `${name}: bin ${b.name} has no platform shim ${shim}`)
         assert.match(readFileSync(shim, 'utf8'), new RegExp(`plugin-exec" ${name} ${b.name} "\\$@"`))
+        // 只放进 bundle 不够：Agent 的 Bash 是 login shell，PATH 里没有 bundle/bin（OCV5-383 上线验收发现 ths: command not found）。
+        assert.ok(platformLinkedClis().includes(b.name), `${name}: bin ${b.name} must be listed in entrypoint PLATFORM_LINKED_CLIS so the Agent's shell can find it`)
       }
       for (const d of m.components.data) assert.ok(existsSync(join(skillsDir, name, d.path)), `${name}: data ${d.path} missing`)
     }

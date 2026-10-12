@@ -30,6 +30,8 @@ ccb-baseline/skills/<name>/
 exec "$(dirname "$(readlink -f "$0")")/plugin-exec" <插件名> <命令名> "$@"
 ```
 
+再把命令名加进 `platform-runtime/entrypoint/entrypoint.ts` 的 `PLATFORM_LINKED_CLIS`。Agent 的 Bash 是 login shell，会重置 PATH，只有链进 `~/.local/bin` 和 `/usr/local/bin` 的命令才找得到；`ccbBaselineSkills.test.ts` 会检查这一项。
+
 `plugin-exec` 依次做三件事：
 
 1. 读清单，确认命令入口在插件目录内；
