@@ -4201,6 +4201,15 @@ describe("OCV5-390: one action row per turn, on its final answer", () => {
     });
   }
 
+  test("a turn that ended on a dispatch-terminal status record: no copy / more row on its text", () => {
+    renderTurn([user,
+      mk("assistant", { id: "a-check", text: "我先检查。", _clientMessageId: user.id, ts: 2000 }),
+      mk("system", { id: "turn-status:u-img", text: "", _turnStatusRecord: true, _dispatchTerminal: true,
+        _errorCode: "dispatch_lost", _clientMessageId: user.id, ts: 2001 })]);
+    expect(screen.queryAllByRole("button", { name: "复制" })
+      .filter((b) => b.closest("[data-testid=assistant-footer]") !== null)).toHaveLength(0);
+  });
+
   test("a turn whose retries end on an error: no copy / more row on any text before it", () => {
     renderTurn([user, ...attempt1, child(true), ...attempt2("error")]);
     expect(screen.queryAllByRole("button", { name: "复制" })

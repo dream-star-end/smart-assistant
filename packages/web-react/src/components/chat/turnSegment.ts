@@ -109,14 +109,18 @@ export function turnRatingFlags(messages: readonly ChatMessage[], finals: readon
   });
   // Order between two rows of one turn: the durable sequence when both have one, else array order.
   const later = (a: number, b: number): boolean => {
-    const sa = messages[a]?._orderSeq, sb = messages[b]?._orderSeq;
+    const sa = messages[a]?._orderSeq;
+    const sb = messages[b]?._orderSeq;
     if (typeof sa === "number" && typeof sb === "number" && sa > 0 && sb > 0 && sa !== sb) return sa > sb;
     return a > b;
   };
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
-    if (!m || m.role !== "assistant" || !m._errorCode || typeof m._clientMessageId !== "string"
-      || !m._clientMessageId) continue;
+    // The turn ended on a failure: an assistant error row, or the dispatch-terminal status record the
+    // master writes when the turn never ran to completion (Codex r1).
+    const failure = !!m && !!m._errorCode
+      && (m.role === "assistant" || (m._turnStatusRecord === true && m._dispatchTerminal === true));
+    if (!failure || typeof m._clientMessageId !== "string" || !m._clientMessageId) continue;
     const at = finalOf.get(rootOf(m._clientMessageId));
     if (at !== undefined && later(i, at)) flags[at] = false;
   }
