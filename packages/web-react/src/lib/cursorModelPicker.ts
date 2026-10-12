@@ -72,6 +72,17 @@ export function cursorDefFor(modelId: string | null | undefined): CursorEngineMo
   return cursorModelById(modelId)
 }
 
+/** The Cursor picker entry for a catalog row: only a row the catalog routes to the Cursor engine is a
+ * Cursor family (its levels are separate ids). OCV5-378: box-claude-* run on the Box model route
+ * (engine ccb) and take the platform effort picker. A row without an engine (legacy projection)
+ * keeps the static list. */
+export function cursorPickerDef(
+  model: { id: string; engine?: string } | null | undefined,
+): CursorEngineModel | undefined {
+  if (!model || (model.engine !== undefined && model.engine !== 'cursor')) return undefined
+  return cursorModelById(model.id)
+}
+
 export function modelCostLabel(model: { cost_x?: number } | undefined): string | undefined {
   const raw = model?.cost_x
   return formatCostX(typeof raw === 'number' ? raw : undefined)
@@ -175,7 +186,7 @@ export function modelPickerRows(
       })
       continue
     }
-    const cursor = cursorModelById(model.id)
+    const cursor = cursorPickerDef(model)
     if (cursor) {
       if (seenCursor.has(cursor.family)) continue
       seenCursor.add(cursor.family)
@@ -184,7 +195,7 @@ export function modelPickerRows(
         row: {
           family: cursor.family,
           label: cursor.familyLabel,
-          members: models.filter((item) => cursorModelById(item.id)?.family === cursor.family),
+          members: models.filter((item) => cursorPickerDef(item)?.family === cursor.family),
         },
       })
       continue
