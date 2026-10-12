@@ -8,7 +8,7 @@
  *
  * Inert unless OC_BRIDGE_DIR is set (the host sets it for product sessions). */
 import type { Register } from 'claude-code'
-import { StreamJson, textOfUserContent, type PrintStep, type StepChunk } from './frames.ts'
+import { StreamJson, textOfUserContent, type StepChunk } from './frames.ts'
 
 // Tools a person must answer. Route B shows them in web through can_use_tool
 // even under bypassPermissions; here the bridge answers them the same way.
@@ -33,19 +33,19 @@ export const register: Register = (on) => {
   /** Interrupts the tap saw; the session.start loop that owns `$` runs them. */
   const aborts: string[] = []
   /** Print mode (OC_BRIDGE_MODE=print, set by the host for the Box model route): the session speaks
-   * `claude -p`'s exact stream-json, a step at a time (see StreamJson.printStep). */
+   * `claude -p`'s exact stream-json, streamed as each step runs (see StreamJson.printStart). */
   let print = false
   let printInit: { tools: string[]; mcp_servers: { name: string; status: string }[] } = { tools: [], mcp_servers: [] }
   let initSent = false
-  /** The main-loop step being collected, until its usage is known. */
-  let printing: { step: PrintStep; flushed: boolean } | null = null
-  /** Lines that arrive while a step is held; they follow it, as on `-p`. */
+  /** The main-loop step being streamed, until its stop chunk (StreamJson.printStart..printStop). */
+  let printing: { stopped: boolean } | null = null
+  /** Non-response rows (tool results) that arrive before the step stops; they follow it, as on `-p`. */
   const held: string[] = []
-  const flushPrint = (stop: { stopReason: string | null; usage: any }): void => {
-    if (!printing || printing.flushed) return
-    printing.flushed = true
+  const stopPrint = (stop: { stopReason: string | null; usage: any }): void => {
+    if (!printing || printing.stopped) return
+    printing.stopped = true
     lastStopReason = stop.stopReason ?? null
-    send(sj.printStep(printing.step, stop))
+    send(sj.printStop(stop))
     if (held.length > 0) send(held.splice(0))
   }
 
@@ -210,8 +210,9 @@ export const register: Register = (on) => {
 
   on('turn.step', async function* ($, e, next) {
     if (print && !e.agentId) {
-      const step: PrintStep = { turnId: e.turnId, index: e.index, model: e.model, chunks: [], rows: [] }
-      printing = { step, flushed: false }
+      printing = { stopped: false }
+      // The client learns at once that the model is working, as from -p's own message_start.
+      send(sj.printStart({ turnId: e.turnId, index: e.index, model: e.model }))
       const stream = next(e) as AsyncGenerator<StepChunk, any>
       let result: any
       for (;;) {
@@ -222,11 +223,11 @@ export const register: Register = (on) => {
         }
         const c = item.value as StepChunk
         // The stop chunk carries the step's usage and comes before a pending tool returns.
-        if (c.kind === 'stop') flushPrint({ stopReason: (c as any).stopReason ?? null, usage: (c as any).usage ?? null })
-        else if (!printing.flushed) step.chunks.push(c)
+        if (c.kind === 'stop') stopPrint({ stopReason: (c as any).stopReason ?? null, usage: (c as any).usage ?? null })
+        else if (!printing.stopped) send(sj.printChunk(c))
         yield item.value as any
       }
-      flushPrint({ stopReason: result?.stopReason ?? null, usage: result?.usage ?? null })
+      stopPrint({ stopReason: result?.stopReason ?? null, usage: result?.usage ?? null })
       printing = null
       return result
     }
@@ -254,8 +255,8 @@ export const register: Register = (on) => {
     }
     const stored = await next(e)
     const row = { door: e.door, uuid: e.uuid, agentId: e.agentId, message: stored?.message ?? e.message } as any
-    if (print && printing && !printing.flushed && !e.agentId) {
-      if (e.door === 'response' && row.message?.type === 'assistant') printing.step.rows.push(row)
+    if (print && printing && !printing.stopped && !e.agentId) {
+      if (e.door === 'response' && row.message?.type === 'assistant') send(sj.printRow(row))
       else held.push(...sj.row(row))
       return stored
     }
