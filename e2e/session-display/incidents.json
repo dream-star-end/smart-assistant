@@ -6758,6 +6758,30 @@
           "assertion": "a just-finished run keeps its native pointer: cleanup waits until the pointer is attached"
         }
       ]
+    },
+    {
+      "id": "INC-20261012-BOX-RESTAGE-CONTEXT-POSITION",
+      "occurredAt": "2026-10-12",
+      "severity": "P1",
+      "symptom": "Box 路线不能原生 resume 而重建合成 transcript 时（上一轮失败、无 pointer、历史校验不符等），合成 transcript 里没有 CLI 原本放在首条 user 消息之后的上下文记录（environment/model/token 预算/date，交互模式为 session_context/date/credential_org），CLI 改在最新消息后重新渲染，请求从首条消息之后就与缓存前缀分叉，后面整段历史按缓存写价重写（商业 10-11 一个长会话约 2.7k 积分）。修复：重建时从同会话、同 CLI 版本的较早 native transcript（先最早、再最新）读出这些记录，放在首条 user 消息之后；离线抓包证实请求与原生续接逐字相同到当前 user 消息，只在尾部多一条 Environment update。",
+      "rootFixCommit": "ff0a4415",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
+          "assertion": "stages the session's native context records right after the first user message"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
+          "assertion": "OCV5-384: a re-staged conversation carries the session's native context records"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-continuation.ts",
+          "assertion": "[ocv5-384-restage-context] PASS — a re-staged conversation keeps the native context records after the first user message"
+        }
+      ]
     }
   ]
 }
