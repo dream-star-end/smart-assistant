@@ -51,14 +51,14 @@
       "sourceHash": "1d3854c895bd96ecc70bc1e2a371eecec8f64df383281e60895eb252bd83e1f5"
     },
     "connectors": {
-      "contentHash": "b5cc47b301e03481c43fc9a2d60e69d085413df3e8665a889865be8314853076",
-      "contentVersion": 5,
+      "contentHash": "60d53be82da147122f4fef4ea5028d7e02e59148ab15b9454ee7aa933f45a874",
+      "contentVersion": 6,
       "entryIdentityHash": "3133475439e0b890626c1e7026c495f4b6097dedd172cb43cd973aea3109cd5d",
       "mediaHash": "21341baac82984bc62506d5c70f5a2b428aaea3a4392681430539d5f40fd21dc",
       "mediaKey": "connectors",
       "mediaVersion": 3,
       "registryHash": "fafe8ad06497a2f7e70f9e75ee0a3ea4e975a92d56c6d7e6d205292dfbd6d4d4",
-      "sourceHash": "41240c31a3fda8e04bd288fd429085b48482a90b6ec26501276d5241742fd56f"
+      "sourceHash": "08f8ae4b2d8ce433da838acb3eeae1951f9d4a1d72112b0f2b3e8b85b1667509"
     },
     "container-web-preview": {
       "contentHash": "ca686071086113580f85631621baadf2bb19a870cc9cdbf56128acae0995ff33",
