@@ -1,92 +1,25 @@
 /**
- * Intelligent UI 文字类组件(OCV5-361 第三轮):来源、大纲 / 思维导图、成稿。
+ * Intelligent UI 文字类组件(OCV5-361 第三轮):来源(普通 Markdown,不画卡片)、大纲 / 思维导图、成稿。
  */
-import { Check, ChevronRight, Copy, ExternalLink, Icon } from "lucide-react";
+import { Check, ChevronRight, Copy, Icon } from "lucide-react";
 import { useMemo, useState } from "react";
 import { cn } from "../../lib/utils";
 import { countWords, diffText } from "./diff";
 import { uiIcon } from "./icons";
 import type { DraftSpec, OutlineNode, OutlineSpec, SourcesSpec } from "./schema";
-import { Frame, Inline, Segmented, useCopiedFlag } from "./shell";
+import { BodyMarkdown, Frame, Inline, Segmented, useCopiedFlag } from "./shell";
 import { specToMarkdown } from "./toMarkdown";
 
 type BlockProps<S> = { spec: S; notes: string[]; streaming: boolean; nested?: boolean };
 
-/** 站点名 → 固定的色调(同一站点每次同色),六种和方块网格共用。 */
-function toneOf(s: string): number {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
-  return Math.abs(h) % 6;
-}
+// ── 来源:旧消息与同花顺插件仍产出 sources,渲染成普通 Markdown ──────────
 
-// ── 来源 ──────────────────────────────────────────────────────────────
-
-const SOURCES_FOLD = 6;
-
-export function SourcesBlock({ spec, notes, streaming, nested }: BlockProps<SourcesSpec>) {
-  const [all, setAll] = useState(false);
-  const fold = !streaming && spec.items.length > SOURCES_FOLD + 1;
-  const shown = fold && !all ? spec.items.slice(0, SOURCES_FOLD - 1) : spec.items;
+// 套普通 .oc-iui(不是 .oc-iui-card):同花顺工具卡不在 .prose 里,靠 .oc-iui .oc-iui-body ol 恢复列表编号。
+export function SourcesBlock({ spec }: BlockProps<SourcesSpec>) {
   return (
-    <Frame
-      kind="sources"
-      title={spec.title ?? "参考来源"}
-      subtitle={spec.subtitle}
-      notes={notes}
-      streaming={streaming}
-      nested={nested}
-      copyText={() => specToMarkdown(spec)}
-    >
-      <ol className="oc-iui-sources">
-        {shown.map((s, i) => {
-          const site = s.site ?? s.title;
-          const body = (
-            <>
-              <span className="oc-iui-source-num" aria-hidden>
-                {i + 1}
-              </span>
-              <span className="oc-iui-source-main">
-                <span className="oc-iui-source-title">
-                  <span>{s.title}</span>
-                  {s.url && <ExternalLink size={13} aria-hidden className="oc-iui-source-ext" />}
-                </span>
-                {(s.site || s.date) && (
-                  <span className="oc-iui-source-meta">
-                    <span className={cn("oc-iui-source-avatar", `is-tone-${toneOf(site)}`)} aria-hidden>
-                      {Array.from(site)[0]?.toUpperCase()}
-                    </span>
-                    {[s.site, s.date].filter(Boolean).join(" · ")}
-                  </span>
-                )}
-                {s.note && (
-                  <span className="oc-iui-source-note">
-                    <Inline text={s.note} />
-                  </span>
-                )}
-              </span>
-            </>
-          );
-          return (
-            <li key={`${i}:${s.url ?? s.title}`}>
-              {s.url ? (
-                <a className="oc-iui-source is-link" href={s.url} target="_blank" rel="noreferrer noopener" aria-label={`${i + 1}. ${s.title}${s.site ? `(${s.site})` : ""},在新标签页打开`}>
-                  {body}
-                </a>
-              ) : (
-                <div className="oc-iui-source">{body}</div>
-              )}
-            </li>
-          );
-        })}
-      </ol>
-      {fold && (
-        <div className="oc-iui-more">
-          <button type="button" className="oc-iui-disclosure" aria-expanded={all} onClick={() => setAll((v) => !v)}>
-            {all ? "收起" : `显示全部 ${spec.items.length} 个来源`}
-          </button>
-        </div>
-      )}
-    </Frame>
+    <div className="oc-iui">
+      <BodyMarkdown text={specToMarkdown(spec)} />
+    </div>
   );
 }
 

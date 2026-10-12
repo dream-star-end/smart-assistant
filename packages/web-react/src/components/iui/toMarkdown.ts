@@ -298,7 +298,7 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
       ].join("\n");
     case "sources":
       return [
-        ...heading(spec.title ?? "来源", spec.subtitle),
+        ...heading(spec.title ?? "参考来源", spec.subtitle),
         ...spec.items.map((s, i) => {
           const name = s.url ? `[${s.title}](${s.url})` : s.title;
           const meta = [s.site !== s.title ? s.site : undefined, s.date].filter(Boolean).join(" · ");

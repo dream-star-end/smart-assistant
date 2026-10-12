@@ -122,8 +122,13 @@ describe("协议文案", () => {
     assert.ok(cliOnly.size >= 4, `parsed market types: ${[...cliOnly].join(",")}`);
     const types = all.filter((t) => !cliOnly.has(t));
     assert.ok(types.length >= 10, `parsed types: ${types.join(",")}`);
-    for (const t of types) assert.match(INTELLIGENT_UI_PROMPT, new RegExp(`"type":"${t}"`), t);
-    for (const t of cliOnly) assert.doesNotMatch(INTELLIGENT_UI_PROMPT, new RegExp(`"type":"${t}"`), t);
+    // sources 只在前端兼容旧消息和同花顺插件输出,不对模型宣传(OCV5-389)。
+    const frontendOnly = new Set(["sources"]);
+    for (const t of types) {
+      if (frontendOnly.has(t)) continue;
+      assert.match(INTELLIGENT_UI_PROMPT, new RegExp(`"type":"${t}"`), t);
+    }
+    for (const t of [...cliOnly, ...frontendOnly]) assert.doesNotMatch(INTELLIGENT_UI_PROMPT, new RegExp(`"type":"${t}"`), t);
     const advertised = [...INTELLIGENT_UI_PROMPT.matchAll(/"type":"([a-z_]+)"/g)].map((m) => m[1]!);
     for (const t of advertised) assert.ok(types.includes(t), `prompt advertises unknown type ${t}`);
   });
@@ -156,7 +161,7 @@ describe("协议文案", () => {
     assert.doesNotMatch(INTELLIGENT_UI_PROMPT, /小工具或小游戏用/);
   });
   test("第三轮:来源只用真实链接、成稿与大纲的用法写明、表格说明筛选与下载", () => {
-    assert.match(INTELLIGENT_UI_PROMPT, /- sources:[^\n]*本轮工具真实返回或用户给出[^\n]*绝不编造链接/);
+    assert.match(INTELLIGENT_UI_PROMPT, /普通 Markdown 写参考来源[^\n]*不要用 ui 组件[^\n]*本轮工具真实返回或用户给出[^\n]*绝不编造链接/);
     assert.match(INTELLIGENT_UI_PROMPT, /- draft:[^\n]*original[^\n]*修改对比/);
     assert.match(INTELLIGENT_UI_PROMPT, /层级结构\(大纲、思维导图、组织架构\)用 outline/);
     assert.match(INTELLIGENT_UI_PROMPT, /- table:[^\n]*可下载 CSV,行多时可筛选/);
