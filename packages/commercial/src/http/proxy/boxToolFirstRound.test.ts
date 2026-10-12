@@ -934,6 +934,18 @@ test("OCV5-313 an unread CLI version never looks up, claims or records a native 
       reason: "build", cliVersion: "2.1.288" }], "the miss says why, without content");
     assert.equal(staleResult.kind, "final");
     assert.equal(stale.admittedNative, null, "no native claim across CLI builds");
+    // OCV5-383: a transcript staged with the other prompt layout is a miss too
+    const legacyPointer = result.kind === "final" ? result.nativePointer : undefined;
+    assert.ok(legacyPointer);
+    assert.equal(legacyPointer!.promptLayout, undefined, "a request without the marker records no layout");
+    const crossLayout = fixture({ directFinal: true, nativeCandidate: { ownerRequestId: "native-owner",
+      pointer: { ...legacyPointer!, promptLayout: "static-first-v1" } } });
+    const layoutDecisions: unknown[] = [];
+    await runBoxToolFirstRound(crossLayout.input,
+      { ...crossLayout.deps, onNativeDecision: (info) => { layoutDecisions.push(info); } });
+    assert.deepEqual(layoutDecisions, [{ requestId: crossLayout.input.requestId, decision: "miss",
+      reason: "layout", cliVersion: "2.1.280" }]);
+    assert.equal(crossLayout.admittedNative, null, "no native claim across prompt layouts");
   } finally {
     if (previous === undefined) delete process.env.OC_BOX_FAST_NATIVE;
     else process.env.OC_BOX_FAST_NATIVE = previous;

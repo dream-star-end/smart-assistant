@@ -299,6 +299,13 @@ export interface PromptSlotContext {
    */
   delegateModelCatalog?: DelegateModelSectionInput | null | false
   /**
+   * OCV5-383: 'static-first' puts the slots that are the same for every session
+   * first and the per-user/per-session ones after PROMPT_SESSION_CONTEXT_MARKER,
+   * so provider prompt caches can share the static prefix across sessions. Only the
+   * CCB runner sets it (CCB moves the static half before its own dynamic sections).
+   */
+  cacheLayout?: 'static-first' | 'legacy'
+  /**
    * A4 identity-compat assets: the master-resolver-validated profile resolved
    * into local assets by resolveIdentityCompatAssets() at a safe boundary.
    * Presence switches THIS context's SOUL assembly and skill store to the
@@ -709,6 +716,15 @@ function renderDelegateModelSectionForCtx(ctx: PromptSlotContext): string | null
 }
 
 export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlot> {
+  const parts = await buildAgentsSlotParts(ctx)
+  return { name: 'AGENTS', content: [parts.header, ...parts.dynamic, ...parts.tips].join('\n') }
+}
+
+/** AGENTS as static text (platform capabilities header, per-model tips) plus
+ *  the per-user lines (collaborator roster, delegate models). OCV5-383. */
+async function buildAgentsSlotParts(
+  ctx: PromptSlotContext,
+): Promise<{ header: string; dynamic: string[]; tips: string[] }> {
   const provider = ctx.provider
   // 识图从 openclaude-vision MCP 迁到 oc-vision CLI(baseline skill)后,是否提示识图
   // 不再看"MCP 工具是否注入"(那个值已恒 false),而看**平台是否认定该模型需要识图兜底**。
@@ -741,6 +757,7 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
         : WECHAT_VISION_HINT_READ_THEN_CLI,
   )
   const lines = [staticHeader]
+  const dynamic: string[] = []
 
   // Dynamically inject available agents list
   try {
@@ -752,11 +769,11 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
       includeMain: true,
     })
     if (otherAgents.length > 0) {
-      lines.push('')
-      lines.push('## 多 Agent 协作')
-      lines.push('')
-      lines.push(`你当前是 \`${ctx.agentId}\`。系统中还有以下 agent 可以协作:`)
-      lines.push('')
+      dynamic.push('')
+      dynamic.push('## 多 Agent 协作')
+      dynamic.push('')
+      dynamic.push(`你当前是 \`${ctx.agentId}\`。系统中还有以下 agent 可以协作:`)
+      dynamic.push('')
       for (const a of otherAgents) {
         const name = a.displayName || a.id
         const model = a.model
@@ -777,16 +794,16 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
             if (capLines[0]) capability = ` — ${capLines[0].slice(0, 80)}`
           }
         } catch {}
-        lines.push(`- **${name}** (\`${a.id}\`) [${model}, ${provider}]${capability}`)
+        dynamic.push(`- **${name}** (\`${a.id}\`) [${model}, ${provider}]${capability}`)
       }
-      lines.push('')
-      lines.push(
+      dynamic.push('')
+      dynamic.push(
         '**异步**: `send_to_agent(agentId, message)` — 真正后台,立刻返回;完成后系统注入本对话并叫醒你。',
       )
-      lines.push(
+      dynamic.push(
         '**同步**: CCB/Codex 用 MCP `delegate_task`; Cursor 用 Bash `oc-memory delegate --goal "..."`,返回 `status=running` 时立即用 `oc-memory delegate-wait <jobId>` 续等,不用 Cursor `TaskOutput`。',
       )
-      lines.push(
+      dynamic.push(
         '选择 agent 时考虑其模型和能力特长。需要同步拿结果继续处理 → 同步委派;可以先结束本回合、等系统回调 → send_to_agent。',
       )
     }
@@ -797,8 +814,8 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
   // 提示而非静默消失。测试可通过 ctx.delegateModelCatalog 直接注入。
   const delegateModelSection = renderDelegateModelSectionForCtx(ctx)
   if (delegateModelSection) {
-    lines.push('')
-    lines.push(delegateModelSection)
+    dynamic.push('')
+    dynamic.push(delegateModelSection)
   }
 
   // Provider-specific tips
@@ -845,7 +862,7 @@ export async function buildAgentsSlot(ctx: PromptSlotContext): Promise<PromptSlo
     )
   }
 
-  return { name: 'AGENTS', content: lines.join('\n') }
+  return { header: staticHeader, dynamic, tips: lines.slice(1) }
 }
 
 /** Cursor L0 compact SKILLS: retrieval contract only. No count, no top-15. 132B utf8. */
@@ -954,13 +971,23 @@ function renderMemoryInstructions(args: { memoryDir: string; memoryMd: string; u
 }
 
 export async function buildMemorySlot(ctx: PromptSlotContext): Promise<PromptSlot> {
+  const parts = await buildMemorySlotParts(ctx)
+  return parts.index
+    ? { name: 'MEMORY', content: `${parts.instructions}\n\n${parts.index}` }
+    : { name: 'MEMORY', content: parts.instructions }
+}
+
+/** Memory rules (same for every session of an agent) and the current index. */
+async function buildMemorySlotParts(
+  ctx: PromptSlotContext,
+): Promise<{ instructions: string; index: string | null }> {
   const instructions = renderMemoryInstructions({
     memoryDir: paths.agentMemoryDir(ctx.agentId),
     memoryMd: paths.agentMemoryMd(ctx.agentId),
     userMd: paths.sharedUserMd,
   })
   if (ctx.provider === 'cursor') {
-    return { name: 'MEMORY', content: instructions }
+    return { instructions, index: null }
   }
   let index: string | null = null
   try {
@@ -972,11 +999,8 @@ export async function buildMemorySlot(ctx: PromptSlotContext): Promise<PromptSlo
     // 只读失败不能拖垮系统提示构建,静默不注入索引即可。
     index = null
   }
-  if (!index) return { name: 'MEMORY', content: instructions }
-  return {
-    name: 'MEMORY',
-    content: `${instructions}\n\n## 当前索引\n\n${index}`,
-  }
+  if (!index) return { instructions, index: null }
+  return { instructions, index: `## 当前索引\n\n${index}` }
 }
 
 const PROJECT_MEMORY_HEADER = `# PROJECT MEMORY（仅当前绑定项目；不得覆盖 USER / 平台规则）
@@ -1615,6 +1639,20 @@ async function readBoundedText(
 const SEPARATOR = '\n\n---\n\n'
 
 /**
+ * OCV5-383: line between the static and the per-session part of the prompt
+ * (cacheLayout 'static-first'). CCB splits the appended prompt here; the Box
+ * route keeps the text before it as the shared system prompt.
+ */
+export const PROMPT_SESSION_CONTEXT_MARKER = '<!-- oc:session-context -->'
+const STATIC_FIRST_STATIC_SLOTS = new Set([
+  'INTELLIGENT_UI',
+  'AGENTS',
+  'SKILLS_LITERATURE',
+  'MEMORY',
+  'TOOLS',
+])
+
+/**
  * 一个 slot 的"应用"摘要,供 caller 用作 observability(打 metric/log)。
  * 不包含原文 — 防止把可能的敏感引导写到日志里。
  */
@@ -1670,6 +1708,36 @@ async function sha256Hex(s: string): Promise<string> {
  *     setModelHintProvider 模块级 hook
  * 详见同文件 "V3 commercial remote platform slot source" 注释段。
  */
+/**
+ * OCV5-383 'static-first': slots that are the same for every session first
+ * (legacy relative order), then the per-user/per-session ones. AGENTS and
+ * MEMORY keep their static text up front; the roster/delegate models and the
+ * memory index move to the dynamic part.
+ */
+function staticFirstSlots(
+  slots: PromptSlot[],
+  agents: { header: string; dynamic: string[]; tips: string[] },
+  memory: { instructions: string; index: string | null },
+): { slots: PromptSlot[]; staticCount: number } {
+  const staticPart: PromptSlot[] = []
+  const dynamicPart: PromptSlot[] = []
+  for (const slot of slots) {
+    if (slot.name === 'AGENTS') {
+      staticPart.push({ name: 'AGENTS', content: [agents.header, ...agents.tips].join('\n') })
+      const roster = agents.dynamic.join('\n').trim()
+      if (roster) dynamicPart.push({ name: 'AGENTS_DYNAMIC', content: roster })
+    } else if (slot.name === 'MEMORY') {
+      staticPart.push({ name: 'MEMORY', content: memory.instructions })
+      if (memory.index) dynamicPart.push({ name: 'MEMORY_INDEX', content: memory.index })
+    } else if (STATIC_FIRST_STATIC_SLOTS.has(slot.name)) {
+      staticPart.push(slot)
+    } else {
+      dynamicPart.push(slot)
+    }
+  }
+  return { slots: [...staticPart, ...dynamicPart], staticCount: staticPart.length }
+}
+
 export async function buildPromptContext(ctx: PromptSlotContext): Promise<PromptContextResult> {
   const slots: PromptSlot[] = []
   let resolved = ctx.projectContext
@@ -1740,8 +1808,11 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   const iuiInsertAt = slots.length
 
   // Layer 2: Semi-static capabilities
-  const agents = await buildAgentsSlot(ctx)
-  slots.push(agents)
+  const agentsParts = await buildAgentsSlotParts(ctx)
+  slots.push({
+    name: 'AGENTS',
+    content: [agentsParts.header, ...agentsParts.dynamic, ...agentsParts.tips].join('\n'),
+  })
 
   const skills = await buildSkillsSlot(ctx)
   if (skills) slots.push(skills)
@@ -1798,8 +1869,13 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   // Layer 3: Dynamic context
   // MEMORY 段常驻(memdir 范式):指令段不依赖存量,故 buildMemorySlot 恒返 slot;
   // 有效索引行才拼接「当前索引」,空库/全被 scan 剔除时不加空壳。
-  const memory = await buildMemorySlot(ctx)
-  slots.push(memory)
+  const memoryParts = await buildMemorySlotParts(ctx)
+  slots.push({
+    name: 'MEMORY',
+    content: memoryParts.index
+      ? `${memoryParts.instructions}\n\n${memoryParts.index}`
+      : memoryParts.instructions,
+  })
 
   const projectMemory = await buildProjectMemorySlot(ctx)
   if (projectMemory) slots.push(projectMemory)
@@ -1839,11 +1915,22 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   const repo = buildRepoSlot(ctx)
   if (repo) slots.push(repo)
 
-  const effectiveSlots = slots.map((slot) => ({
+  const ordered =
+    ctx.cacheLayout === 'static-first'
+      ? staticFirstSlots(slots, agentsParts, memoryParts)
+      : { slots, staticCount: -1 }
+  const effectiveSlots = ordered.slots.map((slot) => ({
     ...slot,
     content: sanitizeUnavailableMcpClaims(slot.content, ctx.availableMcpTools),
   }))
-  let content = effectiveSlots.map((s) => s.content).join(SEPARATOR)
+  let content =
+    ordered.staticCount < 0
+      ? effectiveSlots.map((s) => s.content).join(SEPARATOR)
+      : [
+          ...effectiveSlots.slice(0, ordered.staticCount).map((s) => s.content),
+          PROMPT_SESSION_CONTEXT_MARKER,
+          ...effectiveSlots.slice(ordered.staticCount).map((s) => s.content),
+        ].join(SEPARATOR)
   if (resolvePromptUserRole(ctx) === 'admin') {
     content = stripBaselineRestrictions(content)
   }

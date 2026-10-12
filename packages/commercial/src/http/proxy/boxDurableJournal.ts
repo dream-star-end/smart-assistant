@@ -31,7 +31,7 @@ import { authorityFromJournalCtx, consumePrepared, isContinuationConflict,
   type AuthorityProjection, type PreparedContinuation,
   type PreparedConsumption } from "./boxPreparedContinuation.js";
 import { parseBoxPrelaunchBootstrap, type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
-import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
+import { parseBoxNativePointer, type BoxNativePointer, BOX_PROMPT_LAYOUT_STATIC_FIRST } from "./boxNativePointer.js";
 import { parseBoxReplayMessagePointer,
   type BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
 import { BOX_MCP_TOOL_NAME, boxCatalogMatching } from "./boxToolCatalog.js";
@@ -112,7 +112,9 @@ export interface BoxJournalAdmission {
   /** First native invocation mints an opaque Claude UUID in its own run cwd. */
   nativeStart?: { sessionId: string; cliCwd: string;
     /** The build that writes the transcript; absent where native resume is unverified. */
-    cliVersion?: BoxNativePointer["cliVersion"] };
+    cliVersion?: BoxNativePointer["cliVersion"];
+    /** OCV5-383: the prompt layout this run stages the transcript with. */
+    promptLayout?: BoxNativePointer["promptLayout"] };
 }
 export interface BoxNativeCandidate {
   readonly ownerRequestId: string;
@@ -136,6 +138,8 @@ export interface BoxToolResumeClaim {
   readonly nativeCliCwd?: string;
   /** The build that wrote the native transcript; absent for chains admitted before it was recorded. */
   readonly nativeCliVersion?: BoxNativePointer["cliVersion"];
+  /** OCV5-383: layout the transcript was staged with; absent = legacy (or unrecorded). */
+  readonly nativePromptLayout?: BoxNativePointer["promptLayout"];
 }
 export type BoxResumeDecision =
   | { readonly kind: "new_claim"; readonly claim: BoxToolResumeClaim }
@@ -390,7 +394,9 @@ function goodId(input: BoxJournalAdmission): void {
       || !UUID_V4.test(input.nativeStart.sessionId)
       || input.nativeStart.cliCwd !== `/tmp/ocv5-289-run-${input.runNonce}`
       || (input.nativeStart.cliVersion !== undefined
-        && !/^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/.test(input.nativeStart.cliVersion))))
+        && !/^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/.test(input.nativeStart.cliVersion))
+      || (input.nativeStart.promptLayout !== undefined
+        && input.nativeStart.promptLayout !== BOX_PROMPT_LAYOUT_STATIC_FIRST)))
     || !/^(?:box-(?:api-)?)?claude-[a-z0-9-]{3,64}$/.test(input.model)) {
     throw new BoxDurableJournalError("BOX_JOURNAL_IDENTITY_INVALID");
   }
@@ -1248,10 +1254,13 @@ export class BoxDurableJournal implements BoxJournalPort {
         ...(native ? { boxNativeOwnerRequestId: native.ownerRequestId,
           boxNativeSessionId: native.pointer.nativeSessionId,
           boxNativeCliCwd: native.pointer.cliCwd,
-          boxNativeCliVersion: native.pointer.cliVersion } : {}),
+          boxNativeCliVersion: native.pointer.cliVersion,
+          ...(native.pointer.promptLayout ? { boxNativePromptLayout: native.pointer.promptLayout } : {}) } : {}),
         ...(input.nativeStart ? { boxNativeSessionId: input.nativeStart.sessionId,
           boxNativeCliCwd: input.nativeStart.cliCwd,
-          ...(input.nativeStart.cliVersion ? { boxNativeCliVersion: input.nativeStart.cliVersion } : {}) } : {}) };
+          ...(input.nativeStart.cliVersion ? { boxNativeCliVersion: input.nativeStart.cliVersion } : {}),
+          ...(input.nativeStart.promptLayout
+            ? { boxNativePromptLayout: input.nativeStart.promptLayout } : {}) } : {}) };
       const updated = await client.query<{ ctx: Record<string, unknown> }>(
         `UPDATE request_finalize_journal
             SET ctx = ctx || $4::jsonb, updated_at = NOW()
@@ -2037,6 +2046,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       const nativeCliVersion = typeof ctx.boxNativeCliVersion === "string"
         && /^[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}$/.test(ctx.boxNativeCliVersion)
         ? ctx.boxNativeCliVersion : undefined;
+      const nativePromptLayout = ctx.boxNativePromptLayout === BOX_PROMPT_LAYOUT_STATIC_FIRST
+        ? BOX_PROMPT_LAYOUT_STATIC_FIRST : undefined;
       if (ctx.model !== input.canonicalModel
         || ctx.boxInvocationMode !== "detached_tool"
         || typeof ctx.boxAccountId !== "string" || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
@@ -2180,7 +2191,8 @@ export class BoxDurableJournal implements BoxJournalPort {
              ...(nativeSessionId === undefined ? {} : {
                boxNativeSessionId: nativeSessionId,
                boxNativeCliCwd: nativeCliCwd,
-               ...(nativeCliVersion ? { boxNativeCliVersion: nativeCliVersion } : {}) }) })]);
+               ...(nativeCliVersion ? { boxNativeCliVersion: nativeCliVersion } : {}),
+               ...(nativePromptLayout ? { boxNativePromptLayout: nativePromptLayout } : {}) }) })]);
       const linkedCtx = linked.rows[0]?.ctx;
       const basis = parseBoxBillingContext(linkedCtx?.boxBillingContext);
       if (linked.rowCount !== 1 || !basis || basis.turnKey !== fingerprint.turnKey
@@ -2200,7 +2212,8 @@ export class BoxDurableJournal implements BoxJournalPort {
          ...(nativeSessionId === undefined ? {} : {
            nativeSessionId: nativeSessionId as string,
            nativeCliCwd: nativeCliCwd as string,
-           ...(nativeCliVersion ? { nativeCliVersion } : {}) }) };
+           ...(nativeCliVersion ? { nativeCliVersion } : {}),
+           ...(nativePromptLayout ? { nativePromptLayout } : {}) }) };
     } finally {
       if (!committed) await client.query("ROLLBACK").catch(() => {});
       client.release();
