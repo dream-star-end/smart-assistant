@@ -58,7 +58,7 @@ import {
 } from "../http/anthropicProxy.js";
 import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProviderMeta.js";
 import { BoxTextFetch } from "../http/proxy/boxTextFetch.js";
-import type { BoxInteractiveHostAsset } from "../http/proxy/boxTextPlan.js";
+import { boxInteractiveRunnerEnabled, type BoxInteractiveHostAsset } from "../http/proxy/boxTextPlan.js";
 import { loadBoxBridgeMod } from "@openclaude/gateway";
 import { BoxToolFetch } from "../http/proxy/boxToolFetch.js";
 import { BoxInvocationRegistry } from "../http/proxy/boxInvocationRegistry.js";
@@ -335,10 +335,12 @@ export async function startEgress(): Promise<void> {
     (args: Parameters<typeof boxResolver.resolve>[0]) => boxResolver.resolve(args),
     boxCliGate) : null;
   // OCV5-378: models with BoxApiRunner "interactive" (box-claude-*) run through the oc-box host in
-  // print mode. Loaded once like the other Box helpers; without it those models are refused
+  // print mode. Loaded once like the other Box helpers, and only where the installation turned the
+  // interactive runner on (boxInteractiveRunnerEnabled); without it those models are refused
   // (BOX_INTERACTIVE_HOST_UNAVAILABLE) and every `claude -p` model is unaffected.
   let boxInteractiveHost: BoxInteractiveHostAsset | undefined;
-  if (boxResolver) {
+  if (boxResolver && !boxInteractiveRunnerEnabled()) log.info("box_interactive_runner_off");
+  if (boxResolver && boxInteractiveRunnerEnabled()) {
     try {
       const mod = loadBoxBridgeMod(join(process.cwd(), "packages/gateway/box-bridge-mod"));
       boxInteractiveHost = { host: Buffer.from(mod.hostPy, "utf8"),

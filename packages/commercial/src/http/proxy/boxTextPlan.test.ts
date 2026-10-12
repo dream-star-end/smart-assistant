@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { readFileSync, unlinkSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { makeBoxTextPlan, makeBoxAssetsStage, BoxTextPlanError, boxRunnerLoginScope,
-  boxRunnerPlanInput } from "./boxTextPlan.js";
+  boxInteractiveRunnerEnabled, boxRunnerPlanInput } from "./boxTextPlan.js";
 import { makeBoxToolPlan } from "./boxToolPlan.js";
 import {
   PROXY_BYTE_BUDGET_BOX_NATIVE_V1,
@@ -280,4 +280,13 @@ test("OCV5-384: a fresh native session gets an owner-0700 project directory befo
   assert.equal(fresh.discardNativeCleanup?.args[4], "", "a discard never removes it either");
   const plain = makeBoxTextPlan(input);
   assert.equal(plain.stageInputs[0]?.args[4], "", "without native persistence nothing changes");
+});
+
+test("the interactive runner is off unless the installation sets OC_BOX_INTERACTIVE_RUNNER=1 (OCV5-388)", () => {
+  assert.equal(boxInteractiveRunnerEnabled({}), false);
+  assert.equal(boxInteractiveRunnerEnabled({ OC_BOX_INTERACTIVE_RUNNER: "true" }), false);
+  assert.equal(boxInteractiveRunnerEnabled({ OC_BOX_INTERACTIVE_RUNNER: "1" }), true);
+  // Off means the egress loads no host, and then every interactive model is refused.
+  assert.throws(() => boxRunnerPlanInput("box-claude-opus-5-5", undefined), /BOX_INTERACTIVE_HOST_UNAVAILABLE/);
+  assert.deepEqual(boxRunnerPlanInput("box-api-claude-opus-5-5", undefined), {});
 });
