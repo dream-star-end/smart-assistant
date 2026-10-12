@@ -53,6 +53,7 @@ const demoManifest = (over: Record<string, unknown> = {}) => ({
   ...over,
 })
 const DEMO_PY = 'import sys, json\nprint(json.dumps({"argv": sys.argv[1:]}))\n'
+const ENV_PY = 'import os, json\nprint(json.dumps({k: os.environ.get(k) for k in ("NO_PROXY", "no_proxy", "HTTPS_PROXY")}))\n'
 
 describe('plugin-exec', () => {
   let tmp: string
@@ -66,6 +67,15 @@ describe('plugin-exec', () => {
     tmp = mkdtempSync(join(tmpdir(), 'plugin-exec-'))
     skills = join(tmp, 'skills')
     plugin(skills, demoManifest(), { 'scripts/demo.py': DEMO_PY })
+    plugin(
+      skills,
+      demoManifest({
+        name: 'netdemo',
+        components: { bin: [{ name: 'netdemo', entry: 'scripts/env.py', interpreter: 'python3' }] },
+        permissions: { network: ['https://d.10jqka.com.cn', 'http://upass.10jqka.com.cn', 'https://d.10jqka.com.cn'] },
+      }),
+      { 'scripts/env.py': ENV_PY },
+    )
     plugin(skills, demoManifest({ name: 'escape', components: { bin: [{ name: 'escape', entry: 'scripts/../../x.py', interpreter: 'python3' }] } }))
     plugin(skills, demoManifest({ name: 'bash', components: { bin: [{ name: 'bash', entry: 'scripts/x.sh', interpreter: 'bash' }] } }), { 'scripts/x.sh': 'echo hi' })
     // 目录叫 mismatch，清单里却写 demo：启动器按目录找插件，名字对不上必须拒绝。
@@ -107,6 +117,25 @@ describe('plugin-exec', () => {
     assert.equal(hits.length, 1)
     assert.equal(hits[0].auth, 'Bearer container-token')
     assert.deepEqual(JSON.parse(hits[0].body), { slug: 'demo' })
+  })
+
+  it('有代理时：插件声明的来源并进 NO_PROXY（保留原有项、去重），代理本身不动；状态查询不走代理', async () => {
+    enabled = true
+    hits.length = 0
+    // 代理指向一个不存在的端口：状态查询若走了代理就会失败（fail-open 不报错，但 hits 不会增加）。
+    const r = await run(['netdemo', 'netdemo'], env(freshHome(), { HTTPS_PROXY: 'http://127.0.0.1:9', NO_PROXY: '172.31.0.1,localhost' }))
+    assert.equal(r.code, 0, r.stderr)
+    const got = JSON.parse(r.stdout)
+    assert.equal(got.HTTPS_PROXY, 'http://127.0.0.1:9')
+    assert.equal(got.NO_PROXY, '172.31.0.1,localhost,d.10jqka.com.cn,upass.10jqka.com.cn')
+    assert.equal(got.no_proxy, got.NO_PROXY)
+    assert.equal(hits.length, 1, 'state lookup must reach master directly, not through HTTPS_PROXY')
+  })
+
+  it('没有代理时：不改 NO_PROXY', async () => {
+    const r = await run(['netdemo', 'netdemo'], env(freshHome()))
+    assert.equal(r.code, 0, r.stderr)
+    assert.equal(JSON.parse(r.stdout).NO_PROXY, null)
   })
 
   it('停用：退出码 3，stderr 一行中文提示去哪里打开，不执行插件', async () => {

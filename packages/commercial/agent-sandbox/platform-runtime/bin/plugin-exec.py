@@ -11,6 +11,9 @@
      结果缓存 15 秒）。停用 → stderr 一行 JSON 错误、退出码 3；查询失败 → 按启用处理（开关是偏好，不是安全边界，
      网络抖动不能让插件不可用）。
   3. exec python3 -I <entry> 参数...（-I：不加载用户 site-packages / PYTHON* 环境，插件只用标准库）。
+     Agent 的 shell 带着平台给 Claude Code 设的 HTTPS_PROXY（海外出口）。插件在 permissions.network 里声明的
+     来源加进 NO_PROXY，直接从容器出网：国内行情站经海外出口常被断开（OCV5-383 上线验收：经代理 0/10，直连 10/10）。
+     其余地址照旧走代理；查启用状态是平台内部调用，从不走代理。
 """
 import json
 import os
@@ -18,6 +21,7 @@ import re
 import shutil
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 SKILLS_ROOT = os.environ.get("OC_PLUGIN_SKILLS_ROOT", "/run/oc/claude-config/skills")
@@ -57,6 +61,35 @@ def load_bin(plugin, name):
                 die(EXIT_BROKEN, f"插件「{plugin}」的命令 {name} 指向的文件不存在或在插件目录外")
             return manifest, path, interp
     die(EXIT_BROKEN, f"插件「{plugin}」没有声明命令 {name}")
+
+
+HOST_RE = re.compile(r"^[a-z0-9.-]{1,253}$")
+PROXY_KEYS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")
+
+
+def direct_hosts(manifest):
+    """plugin.json permissions.network 里声明的来源 → 主机名（校验器已保证是 http(s) 来源，这里再过一遍）。"""
+    hosts = []
+    for origin in (manifest.get("permissions") or {}).get("network") or []:
+        if not isinstance(origin, str):
+            continue
+        u = urllib.parse.urlsplit(origin)
+        host = (u.hostname or "").lower()
+        if u.scheme in ("http", "https") and HOST_RE.match(host) and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def child_env(manifest, environ=None):
+    """插件进程的环境：设了代理时，把插件声明的主机并进 NO_PROXY / no_proxy（保留原有项）。"""
+    env = dict(os.environ if environ is None else environ)
+    hosts = direct_hosts(manifest)
+    if not hosts or not any(env.get(k) for k in PROXY_KEYS):
+        return env
+    current = [h.strip() for h in (env.get("NO_PROXY") or env.get("no_proxy") or "").split(",") if h.strip()]
+    merged = ",".join(current + [h for h in hosts if h not in current])
+    env["NO_PROXY"] = env["no_proxy"] = merged
+    return env
 
 
 def endpoint():
@@ -108,7 +141,8 @@ def enabled(plugin):
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        # 平台内部调用：不经 Agent 环境里的任何代理。
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=3) as resp:
             body = json.loads(resp.read().decode("utf-8") or "{}")
     except Exception:  # noqa: BLE001 —— 任何失败都按启用处理
         return None
@@ -137,7 +171,7 @@ def main(argv):
     exe = shutil.which(interp)
     if not exe:
         die(EXIT_BROKEN, f"容器里没有 {interp}，插件「{plugin}」无法运行")
-    os.execv(exe, [exe, "-I", path, *args])
+    os.execve(exe, [exe, "-I", path, *args], child_env(manifest))
 
 
 if __name__ == "__main__":
