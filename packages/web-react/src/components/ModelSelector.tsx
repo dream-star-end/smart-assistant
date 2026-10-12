@@ -10,7 +10,6 @@ import {
   contextFamilyByModelId,
   cursorFamilySupportsContextTier,
   cursorFamilySupportsFast,
-  cursorModelById,
 } from '@openclaude/protocol'
 import { AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Loader2, Lock, Users } from 'lucide-react'
 import { type ReactNode, useEffect, useState } from 'react'
@@ -23,6 +22,7 @@ import {
   GROK_BUILD_MODEL_ID,
   cursorFamilyHasFast,
   cursorFamilyHasStandard,
+  cursorPickerDef,
   grokBuildFastSelected,
   isGrokBuildCatalogId,
   isModelDegraded,
@@ -223,7 +223,7 @@ function triggerLabel(
 ): string {
   const selected = models.find((m) => m.id === selectedId)
   if (selected) {
-    const cursor = cursorModelById(selected.id)
+    const cursor = cursorPickerDef(selected)
     if (cursor) return cursor.familyLabel
     const context = contextFamilyByModelId(selected.id)
     if (context) return context.familyLabel
@@ -284,7 +284,7 @@ export function ModelSelector({
   onOpenChange?: (open: boolean) => void
 }) {
   const selected = models.find((m) => m.id === selectedId)
-  const selectedCursor = cursorModelById(selectedId)
+  const selectedCursor = cursorPickerDef(models.find((m) => m.id === selectedId) ?? (selectedId ? { id: selectedId } : null))
   const selectedContext = contextFamilyByModelId(selectedId)
   const selectedDegraded = selected ? isDegraded(selected) : false
   const hasAlternatives = models.some((m) => !isDegraded(m) && m.id !== selectedId)
@@ -382,7 +382,7 @@ export function ModelSelector({
     selectedCursor != null &&
     selectedCursor.family !== 'auto' &&
     cursorFamilySupportsFast(selectedCursor.family) &&
-    cursorMembers.some((member) => cursorModelById(member.id)?.fast)
+    cursorMembers.some((member) => cursorPickerDef(member)?.fast)
   const showGrokFast =
     isGrokBuildCatalogId(selectedId) &&
     models.some((model) => model.id === GROK_BUILD_MODEL_ID) &&
