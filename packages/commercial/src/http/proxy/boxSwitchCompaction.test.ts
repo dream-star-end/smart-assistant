@@ -11,6 +11,7 @@ import {
   boxSwitchBoundary,
   boxSwitchPrefixDigest,
   prepareBoxSwitch,
+  relabelBoxSwitchSession,
   renderBoxSwitchTranscript,
   sseText,
   type BoxSwitchDeps,
@@ -221,4 +222,15 @@ test("a failed or unaffordable compaction leaves the full context and charges no
   const e = body(chat(40));
   assert.deepEqual(await prepareBoxSwitch(empty.deps, empty.input(e)), { kind: "skipped", reason: "compaction_empty" });
   assert.equal((e.messages as unknown[]).length, 81, "an empty summary is billed (the call ran) but not used");
+});
+
+test("the compaction row is relabelled to the chat's final session id, and only that row", async () => {
+  const seen: Array<{ sql: string; params: unknown[] }> = [];
+  const pool = { query: async (sql: string, params: unknown[]) => { seen.push({ sql, params });
+    return { rowCount: 1, rows: [] }; } };
+  assert.equal(await relabelBoxSwitchSession(pool as never, { uid: 3n,
+    billingRequestId: "req-1-switch-compact", sessionId: "g385chat" }), true);
+  assert.match(seen[0]!.sql, /UPDATE usage_records SET session_id = \$3\s+WHERE user_id = \$1 AND request_id = \$2/);
+  assert.deepEqual(seen[0]!.params, ["3", "req-1-switch-compact", "g385chat"]);
+  assert.doesNotMatch(seen[0]!.sql, /cost|credit|ledger|journal/i, "statistics only");
 });

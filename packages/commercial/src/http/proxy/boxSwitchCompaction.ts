@@ -131,7 +131,7 @@ This conversation moved to another Box login. Everything before this message was
 ${summary.trim()}
 </summary>
 
-The complete earlier conversation is still in this session's Claude Code transcript, the file ${cliSessionId}.jsonl in a project folder under the Claude config directory (in an OpenClaude container: /run/oc/claude-config/projects/*/${cliSessionId}.jsonl). When you need a detail the summary does not have, Grep that file before answering. Do not guess.
+The complete earlier conversation is still in this session's Claude Code transcript, the file ${cliSessionId}.jsonl in a project folder under the Claude config directory (in an OpenClaude container: /run/oc/claude-config/projects/*/${cliSessionId}.jsonl). When you need a detail the summary does not have, search that file with the Grep tool and a specific pattern before answering (each line is one long JSON record). Do not guess.
 </system-reminder>`;
 }
 
@@ -218,6 +218,18 @@ export function sseText(raw: string): string {
     } catch { /* not JSON: ignore */ }
   }
   return text;
+}
+
+/** The compaction runs before the request's dispatch identity is known, so its usage row first
+ * carries the container's session id. Once the proxy has the final (server-owned) session id it
+ * relabels that one row, so per-session usage counts the compaction with its chat. Statistics
+ * only: cost, ledger and journal are untouched. */
+export async function relabelBoxSwitchSession(pool: Pick<Pool, "query">, input: { uid: bigint;
+  billingRequestId: string; sessionId: string }): Promise<boolean> {
+  const updated = await pool.query(`UPDATE usage_records SET session_id = $3
+     WHERE user_id = $1 AND request_id = $2 AND session_id IS DISTINCT FROM $3`,
+  [input.uid.toString(), input.billingRequestId, input.sessionId]);
+  return updated.rowCount === 1;
 }
 
 export interface BoxSwitchDeps {

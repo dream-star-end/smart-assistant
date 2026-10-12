@@ -125,7 +125,7 @@ import { waitForBoxReplay } from "./boxReplayWait.js";
 import { boxRequestTailShape, prepareBoxContinuation, type PreparedContinuation } from "./boxPreparedContinuation.js";
 import { BoxDurableJournalError } from "./boxDurableJournal.js";
 import { BOX_INTERNAL_ENDPOINT, isBoxRouteModelName } from "./upstream.js";
-import { prepareBoxSwitch } from "./boxSwitchCompaction.js";
+import { prepareBoxSwitch, relabelBoxSwitchSession, type BoxSwitchOutcome } from "./boxSwitchCompaction.js";
 import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js";
 import { recordUserImpactBestEffort } from "../../selfheal/userImpact.js";
 
@@ -916,11 +916,12 @@ export function makeAnthropicProxyHandler(
       // A chat whose login is at its switch line continues on the next login from a Haiku
       // compaction (its own billed request), not from a full cache rewrite. Applied before the
       // replay lookup so a retry and every later request of the chat see the same body.
+      let switchCompaction: (BoxSwitchOutcome & { kind: "compacted" }) | null = null;
       if (route.kind === "box" && gate && deps.boxModel?.switchCompaction) {
         const switchAbort = new AbortController();
         const onSwitchClose = (): void => { if (!res.writableEnded) switchAbort.abort(); };
         res.once("close", onSwitchClose);
-        let switched: Awaited<ReturnType<typeof prepareBoxSwitch>>;
+        let switched: BoxSwitchOutcome;
         try {
           switched = await runWithVerifiedProxyByteBudget(byteBudget, () => prepareBoxSwitch({
             ...deps.boxModel!.switchCompaction!, pgPool: deps.pgPool,
@@ -935,6 +936,7 @@ export function makeAnthropicProxyHandler(
             signal: switchAbort.signal }));
         } finally { res.off("close", onSwitchClose); }
         if (switched.kind === "compacted") {
+          switchCompaction = switched;
           userLog.info("proxy_box_switch_compacted", { billingRequestId: switched.billingRequestId,
             credits: switched.credits, tokensBefore: switched.tokensBefore, tokensAfter: switched.tokensAfter });
         }
@@ -1606,6 +1608,10 @@ export function makeAnthropicProxyHandler(
       // Dispatch identity is server-owned and therefore wins over container metadata for billing
       // attribution.  This also makes lease-only verification evidence join the exact session.
       if (dispatchIdentity !== null) sessionId = dispatchIdentity.sessionId;
+      if (switchCompaction && sessionId) {
+        await relabelBoxSwitchSession(deps.pgPool, { uid, billingRequestId: switchCompaction.billingRequestId,
+          sessionId }).catch((err: unknown) => userLog.warn("proxy_box_switch_relabel_failed", { err: errSummary(err) }));
+      }
 
       // 8) 写 inflight journal(必须先于 fetch — 进程在 fetch 时 crash 也有线索)
       //
