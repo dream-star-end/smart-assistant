@@ -50,7 +50,7 @@ import {
   type ContainerIdentityRepo,
 } from "../auth/containerIdentity.js";
 import { getLiteratureSkillConfig } from "../admin/literatureConfig.js";
-import { renderLiteratureSkillContent } from "../literatureSkill.js";
+import { LITERATURE_SKILL_POINTER } from "../literatureSkill.js";
 import type { PricingCache } from "../billing/pricing.js";
 import type { CatalogSource } from "./internalModelCatalog.js";
 import { INTELLIGENT_UI_SLOT_NAME, resolveIntelligentUiSlot } from "../intelligentUi/index.js";
@@ -212,7 +212,7 @@ export function makePlatformPromptSlotsHandler(
       if (cfg.enabled && cfg.token_set) {
         slots.push({
           name: "SKILLS_LITERATURE",
-          content: renderLiteratureSkillContent(cfg),
+          content: LITERATURE_SKILL_POINTER,
         });
       }
     } catch (err) {
