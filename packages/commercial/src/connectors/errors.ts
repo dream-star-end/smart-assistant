@@ -42,6 +42,8 @@ export type ConnectorErrorCode =
   | 'CONFIRMATION_ALREADY_FINALIZED'
   | 'REVISION_MISMATCH'
   | 'WRITE_DISABLED'
+  /** 用户在 管理中心 → 插件 把这个插件停用了（OCV5-383）。 */
+  | 'PLUGIN_DISABLED'
   // OAuth
   | 'OAUTH_STATE_MISMATCH'
   | 'OAUTH_EXCHANGE_FAILED'
@@ -90,6 +92,7 @@ function defaultHttpStatus(code: ConnectorRpcErrorCode): number {
     case 'CONFIRMATION_ALREADY_FINALIZED':
     case 'REVISION_MISMATCH':
     case 'WRITE_DISABLED':
+    case 'PLUGIN_DISABLED':
     case 'ACCOUNT_ALREADY_LINKED':
     case 'CONNECTOR_NOT_INSTALLED':
       return 409

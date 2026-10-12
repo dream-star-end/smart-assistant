@@ -44,6 +44,7 @@ import {
 } from './review.js'
 import { WEIBO_PLUGIN_SLUG } from './weiboContract.js'
 import { ZHIHU_PLUGIN_SLUG } from './zhihuContract.js'
+import type { PluginEnablement } from './enablement.js'
 import { managedPluginWritePolicy, managedPluginWritePreapprovalPolicy } from './writePolicy.js'
 
 export class PluginRuntimeFacadeError extends Error {
@@ -56,6 +57,7 @@ export class PluginRuntimeFacadeError extends Error {
     | 'TARGET_STALE'
     | 'WRITE_DISABLED'
     | 'WRITE_REQUIRES_CONFIRMATION'
+    | 'PLUGIN_DISABLED'
 
   constructor(code: PluginRuntimeFacadeError['code'], message: string = code) {
     super(message)
@@ -309,6 +311,12 @@ export class PluginRuntimeFacade {
       resolver?: DnsResolver
       env?: NodeJS.ProcessEnv
       knowledgePlanetMedia?: KnowledgePlanetMediaDeps
+      /**
+       * 插件启用开关（OCV5-383，管理中心 → 插件）。生产装配传 `{ disabledSet: disabledPluginSet }`；省略 = 不检查（旧测试）。
+       * 收口在 loadManagedTarget：call / proposeWrite / executeConfirmedWrite / 知识星球自动回复都经过它；
+       * catalog（Agent 可调用目录）隐藏已停用插件。管理视图（management）不隐藏：用户要能看到并重新打开。
+       */
+      pluginEnablement?: PluginEnablement
     } = {},
   ) {
     this.pool = opts.pool ?? getPool()
@@ -340,6 +348,8 @@ export class PluginRuntimeFacade {
     )
     if (verified.pluginType !== 'managed-browser' || verified.slug !== row.provider)
       throw new PluginRuntimeFacadeError('TARGET_NOT_FOUND', 'Plugin account subtype mismatch')
+    if ((await this.opts.pluginEnablement?.disabledSet(userId))?.has(verified.slug))
+      throw new PluginRuntimeFacadeError('PLUGIN_DISABLED', `Plugin ${verified.slug} is disabled by the user`)
     if (!this.browser.supportsContract(verified.contract))
       throw new PluginRuntimeFacadeError(
         'RUNTIME_UNAVAILABLE',
@@ -469,7 +479,9 @@ export class PluginRuntimeFacade {
   }
 
   async catalog(userId: number, query?: string): Promise<RuntimePluginCatalogEntry[]> {
-    const rows = await this.installedCurrentCatalog(userId, query)
+    const installed = await this.installedCurrentCatalog(userId, query)
+    const disabled = (await this.opts.pluginEnablement?.disabledSet(userId)) ?? null
+    const rows = disabled ? installed.filter((row) => !disabled.has(row.slug)) : installed
     const verified = await listVerifiedRuntimePluginContracts(
       rows.map((row) => Number(row.id)),
       this.pool,

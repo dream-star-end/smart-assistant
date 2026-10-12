@@ -18,6 +18,7 @@ import { loadKmsKey, zeroBuffer } from '../crypto/keys.js'
 import { getPool } from '../db/index.js'
 import { tx } from '../db/queries.js'
 import { OPENCODE_GO_UPSTREAM_ENDPOINT, openCodeGoAuthHeaders } from '../http/proxy/shared.js'
+import { disabledPluginSet } from './enablement.js'
 import { KNOWLEDGE_PLANET_AUTOMATION_DISCLAIMER_VERSION } from './knowledgePlanetAutomation.js'
 import { KNOWLEDGE_PLANET_PLUGIN_SLUG } from './knowledgePlanetContract.js'
 import type { PluginRuntimeFacade } from './runtime.js'
@@ -316,6 +317,17 @@ async function claimNextRule(pool: Pool): Promise<RuleClaim | null> {
     const writeBlockReason = await manualWriteBlockReason(client, row.connection_id, row.user_id)
     if (writeBlockReason) {
       await pauseAccountLocked(client, row.connection_id, row.user_id, writeBlockReason)
+      return null
+    }
+    // 用户在 管理中心 → 插件 停用了知识星球（OCV5-383）：本轮不跑，5 分钟后再看。
+    // 不暂停、不改规则 —— 重新启用后自动恢复；运行时门面（loadManagedTarget）另有一道兜底。
+    if ((await disabledPluginSet(row.user_id)).has(KNOWLEDGE_PLANET_PLUGIN_SLUG)) {
+      await client.query(
+        `UPDATE plugin_automation_rules
+            SET next_run_at = GREATEST(next_run_at, now() + interval '5 minutes'), updated_at = now()
+          WHERE id = $1::uuid AND deleted_at IS NULL`,
+        [row.id],
+      )
       return null
     }
     const token = randomUUID()

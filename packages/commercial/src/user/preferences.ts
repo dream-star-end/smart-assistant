@@ -24,6 +24,7 @@
  *   hotkeys         : Record<string, string>(最多 32 条,key/value <= 64 chars)
  *   intelligent_ui  : boolean —— 个人版交互式回答(OCV5-361);缺省视为开,false = 关
  *   input_prediction: boolean —— 个人版输入预测(OCV5-375);缺省视为开,false = 关
+ *   disabled_plugins: string[] —— 已停用的插件 slug(OCV5-383,管理中心 → 插件的启用开关);缺省 = 全部启用
  *
  * 不做的:
  *   - 不做 etag / If-Match 乐观锁(MVP 只返当前快照,前端"最后写入赢"够用)
@@ -44,6 +45,11 @@ const hotkeysSchema = z
   .refine((o) => Object.keys(o).length <= 32, {
     message: "too many hotkeys (max 32)",
   });
+/** 插件 slug(v1 provider id / 声明式 slug / 运行时插件 slug / 本机插件名)。去重后最多 200 个。 */
+const disabledPluginsSchema = z
+  .array(z.string().regex(/^[a-z0-9][a-z0-9_-]{0,63}$/, "invalid plugin slug"))
+  .max(200)
+  .refine((a) => new Set(a).size === a.length, { message: "duplicate plugin slug" });
 
 /**
  * 全字段 schema(GET 返回 / 内部表示)。所有字段都是可选 — DB 默认行不存在时为空对象。
@@ -63,6 +69,7 @@ export const PreferencesSchema = z
     hotkeys: hotkeysSchema.optional(),
     intelligent_ui: z.boolean().optional(),
     input_prediction: z.boolean().optional(),
+    disabled_plugins: disabledPluginsSchema.optional(),
   })
   .strict();
 export type Preferences = z.infer<typeof PreferencesSchema>;
@@ -86,6 +93,7 @@ export const PreferencesPatchSchema = z
     hotkeys: hotkeysSchema.nullable().optional(),
     intelligent_ui: z.boolean().nullable().optional(),
     input_prediction: z.boolean().nullable().optional(),
+    disabled_plugins: disabledPluginsSchema.nullable().optional(),
   })
   .strict();
 export type PreferencesPatch = z.infer<typeof PreferencesPatchSchema>;
