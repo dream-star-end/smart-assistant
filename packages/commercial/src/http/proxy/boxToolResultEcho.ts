@@ -33,7 +33,10 @@ const CLI_PREVIEW_BYTES = 2000;
  * (toolResultStorage.contentSize) exceeds min(MCP 100k, default 50k). */
 const CLI_PERSIST_THRESHOLD_CHARS = 50_000;
 
-const IMAGE_SOURCE_NOTE = new RegExp(String.raw`^\[Image: source: /home/box/\.claude/projects/`
+/** OCV5-390: the CLI names the file under its own config directory, so a run under a non-default login
+ * (CLAUDE_CONFIG_DIR=/home/box/.claude-<login>, e.g. cc2's .claude-account2) writes that prefix. The
+ * login name follows the admin selection rule (default | [a-z0-9][a-z0-9-]{0,31}). */
+const IMAGE_SOURCE_NOTE = new RegExp(String.raw`^\[Image: source: /home/box/\.claude(?:-[a-z0-9][a-z0-9-]{0,31})?/projects/`
   + String.raw`[A-Za-z0-9._-]{1,256}/[A-Za-z0-9-]{1,64}/tool-results/[A-Za-z0-9._-]{1,128}\]$`);
 
 /** The echo is the published blocks, in order, plus the CLI's own image source

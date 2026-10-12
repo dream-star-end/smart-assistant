@@ -115,6 +115,16 @@ test("OCV5-313 the CLI's own image source note is the only extra block an image 
     "[Image: source: /home/box/.claude/projects/p/s/tool-results/a\r.png]"]) {
     reject(expected([image]), echoOf([apiImage(data), { type: "text", text }]));
   }
+  // OCV5-390: a run under another login (cc2) names its own config directory; look-alikes are refused
+  const loginNote = (dir: string) => ({ type: "text", text:
+    `[Image: source: /home/box/${dir}/projects/-tmp-ocv5-289-run-c70754d7282dca8db4733fd4/`
+    + `b6df2535-b7de-499a-bbb9-cb501631c640/tool-results/mcp-ocbridge-blob-1791817516.png]` });
+  await ok(expected([image]), echoOf([apiImage(data), loginNote(".claude-account2")]));
+  await ok(expected([caption, image]), echoOf([caption, apiImage(data), loginNote(".claude-b")]));
+  for (const dir of [".claude-", ".claude-Account2", ".claude-account2/..", ".claudeaccount2",
+    ".claude-account2/x", "x/.claude-account2", `.claude-${"a".repeat(33)}`]) {
+    reject(expected([image]), echoOf([apiImage(data), loginNote(dir)]));
+  }
   // a published text shaped like a note is content, not a removable note
   const lookalike = { type: "text" as const, text: note("x.png").text };
   await ok(expected([image, lookalike]), echoOf([apiImage(data), lookalike, note("a.png")]));
