@@ -45,6 +45,7 @@ const COMPACTION_SOURCE = ["boxCliSse.ts"] as const;
 const COMPACTION_BINDING = "[ocv5-296-compaction] PASS — trusted boundary plus synthetic summary is not an echo";
 /** OCV5-381: module that writes the Box `--system-prompt-file` text. */
 const SYSTEM_SOURCE = ["boxMessagesMapper.ts"] as const;
+const RESTAGE_BINDING = "[ocv5-384-restage-context] PASS — a re-staged conversation keeps the native context records after the first user message";
 const SYSTEM_HEADER_BINDING = "[ocv5-381-system-header] PASS — billing header block dropped before --system-prompt-file, OpenClaude system text kept";
 const IMAGE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.png", import.meta.url)));
 const ORACLE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.oracle.json", import.meta.url)));
@@ -996,6 +997,26 @@ async function proveSystemHeader(): Promise<void> {
     fail("SYSTEM_HEADER_DROP");
   }
 }
+/** OCV5-384: a re-staged conversation keeps the session's native context records (copied from
+ * its native transcript) right after the first user message, where native resume has them. */
+async function proveRestageContext(): Promise<void> {
+  const mapper = await import(pathToFileURL(join(PROXY, SYSTEM_SOURCE[0])).href) as {
+    compileBoxCliSyntheticTurn: (body: Record<string, unknown>, args: { cwd: string; cliVersion: string;
+      stagedAttachments?: readonly Record<string, unknown>[] }) => { snapshotJsonl: string; sessionId: string };
+  };
+  const records = [{ type: "attachment", attachment: { type: "environment", snapshot: { workingDirectory: "/x" } } },
+    { type: "attachment", attachment: { type: "date", date: "2026-10-12" } }];
+  const out = mapper.compileBoxCliSyntheticTurn({ model: "claude-opus-5-5", max_tokens: 64,
+    messages: [{ role: "user", content: "q1" }, { role: "assistant", content: [{ type: "text", text: "a1" }] },
+      { role: "user", content: "q2" }] }, { cwd: publishDir, cliVersion: "2.1.280", stagedAttachments: records });
+  const staged = out.snapshotJsonl.trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+  const kinds = staged.map((r) => r.type === "attachment" ? (r.attachment as { type: string }).type : String(r.type));
+  if (kinds.join(",") !== "user,environment,date,assistant"
+    || staged.some((r, i) => i > 0 && r.parentUuid !== staged[i - 1]!.uuid)
+    || staged.some((r) => r.sessionId !== out.sessionId)) {
+    fail("RESTAGE_CONTEXT_POSITION");
+  }
+}
 async function workerMain(expectSha: string): Promise<void> {
   const token = process.env.OC_B1_WORKER_TOKEN ?? "";
   const tokenFile = process.env.OC_B1_WORKER_TOKEN_FILE ?? "";
@@ -1017,6 +1038,8 @@ async function workerMain(expectSha: string): Promise<void> {
   await proveCompactionConsumer();
   if (!COMPACTION_BINDING.startsWith("[ocv5-296-compaction] PASS")) fail("COMPACTION_BINDING");
   await proveSystemHeader();
+  await proveRestageContext();
+  if (!RESTAGE_BINDING.startsWith("[ocv5-384-restage-context] PASS")) fail("RESTAGE_BINDING");
   if (!SYSTEM_HEADER_BINDING.startsWith("[ocv5-381-system-header] PASS")) fail("SYSTEM_HEADER_BINDING");
   const api = await load();
   const after = digest();

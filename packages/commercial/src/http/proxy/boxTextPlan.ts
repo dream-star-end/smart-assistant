@@ -185,6 +185,8 @@ export function makeBoxTextPlan(input: {
   systemSuffix?: string;
   /** OCV5-378: run through the interactive host (models with BoxApiRunner "interactive"). */
   interactiveHost?: BoxInteractiveHostAsset;
+  /** OCV5-384: see compileBoxCliSyntheticTurn. Ignored on native resume (nothing is staged). */
+  stagedAttachments?: readonly Record<string, unknown>[];
 }): BoxTextPlan {
   const unsupported = validateBoxTextRequest(input.body,
     input.resumeToolResults ? { resumeToolResults: true } : {});
@@ -237,7 +239,9 @@ export function makeBoxTextPlan(input: {
   const mapped = compileBoxCliSyntheticTurn({ ...input.body, model: input.upstreamModel },
     { cwd, cliVersion: "2.1.280", sessionId: input.nativeResume?.sessionId,
       toolAliases: input.toolAliases ?? new Map(),
-      ...(input.resumeToolResults ? { resumeToolResults: true } : {}) });
+      ...(input.resumeToolResults ? { resumeToolResults: true } : {}),
+      ...(input.stagedAttachments?.length && !input.nativeResume
+        ? { stagedAttachments: input.stagedAttachments } : {}) });
   const supervisorHash = sha(input.supervisorAsset);
   const supervisorPath = `/tmp/ocv5-289-v2-supervisor-${supervisorHash.slice(0, 16)}.py`;
   const keeperHash = sha(input.keeperAsset);

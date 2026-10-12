@@ -59,6 +59,8 @@ export function makeBoxToolPlan(input: {
   toolAliasMode?: BoxMcpAliasMode;
   /** OCV5-378: run through the interactive host (see makeBoxTextPlan). */
   interactiveHost?: BoxInteractiveHostAsset;
+  /** OCV5-384: see makeBoxTextPlan. */
+  stagedAttachments?: readonly Record<string, unknown>[];
 }): BoxToolPlan {
   const choice = input.body.tool_choice;
   if (choice !== undefined && (choice === null || typeof choice !== "object"
@@ -85,7 +87,8 @@ export function makeBoxToolPlan(input: {
        nativePersistence: input.nativePersistence, nativeResume: input.nativeResume,
        toolAliases: catalog.boxNameByClientName,
        systemSuffix: boxToolAliasNotice(catalog),
-       ...(input.interactiveHost ? { interactiveHost: input.interactiveHost } : {}) });
+       ...(input.interactiveHost ? { interactiveHost: input.interactiveHost } : {}),
+       ...(input.stagedAttachments ? { stagedAttachments: input.stagedAttachments } : {}) });
   const virtualMcpHash = createHash("sha256").update(input.virtualMcpAsset).digest("hex");
   const virtualMcpPath = `/tmp/ocv5-289-v2-box-virtual-mcp-${virtualMcpHash.slice(0, 16)}.py`;
   const stageVirtualMcp = makeBoxAssetStage(input.virtualMcpAsset, virtualMcpPath).request;
