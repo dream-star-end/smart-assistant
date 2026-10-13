@@ -627,19 +627,20 @@ write_watch_status() {
   suppression="$(sanitize_status_token "$suppression")"
   path="$(status_path)"
   dir="$(dirname -- "$path")"
-  mkdir -p -- "$dir"
+  mkdir -p -- "$dir" || return 1
   lock="${dir}/.watch-status.lock"
   now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   (
-    flock -w 5 9
-    tmp="$(mktemp "${dir}/.watch-status.XXXXXX")"
+    flock -w 5 9 || exit 1
+    tmp="$(mktemp "${dir}/.watch-status.XXXXXX")" || exit 1
+    trap 'rm -f -- "$tmp"' EXIT
     {
       printf 'recovery_armed=%s\n' "$armed"
       printf 'suppression_reason=%s\n' "$suppression"
       printf 'observation_executed=%s\n' "$observed"
       printf 'health=%s\n' "$health"
       printf 'checked_at=%s\n' "$now"
-    } >"$tmp"
+    } >"$tmp" || exit 1
     grep -q '^recovery_armed=' "$tmp" \
       && grep -q '^suppression_reason=' "$tmp" \
       && grep -q '^observation_executed=' "$tmp" \
@@ -647,8 +648,8 @@ write_watch_status() {
       && grep -q '^checked_at=' "$tmp" \
       && ! grep -q 'healthy' "$tmp" \
       || { rm -f -- "$tmp"; exit 1; }
-    chmod 0640 "$tmp" 2>/dev/null || chmod 0644 "$tmp"
-    mv -T -- "$tmp" "$path"
+    chmod 0640 "$tmp" || exit 1
+    mv -T -- "$tmp" "$path" || exit 1
   ) 9>"$lock"
 }
 
@@ -662,10 +663,10 @@ notify_watch_state() {
   [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=21600
   path="$(notify_state_path)"
   dir="$(dirname -- "$path")"
-  mkdir -p -- "$dir"
+  mkdir -p -- "$dir" || return 1
   lock="${dir}/.watch-notify.lock"
   (
-    flock -w 5 9
+    flock -w 5 9 || exit 1
     last_fp=""
     last_at=0
     if [[ -f "$path" && ! -L "$path" ]]; then
@@ -686,18 +687,19 @@ notify_watch_state() {
     if (( should == 0 )); then
       exit 0
     fi
-    wlog "watch-status recovery_armed=${armed} suppression_reason=${suppression:-none} observation_executed=${observed} health=${health}"
-    tmp="$(mktemp "${dir}/.watch-notify.XXXXXX")"
+    wlog "watch-status recovery_armed=${armed} suppression_reason=${suppression:-none} observation_executed=${observed} health=${health}" || exit 1
+    tmp="$(mktemp "${dir}/.watch-notify.XXXXXX")" || exit 1
+    trap 'rm -f -- "$tmp"' EXIT
     {
       printf 'fingerprint=%s\n' "$fp"
       printf 'notified_at=%s\n' "$now"
-    } >"$tmp"
-    mv -T -- "$tmp" "$path"
+    } >"$tmp" || exit 1
+    mv -T -- "$tmp" "$path" || exit 1
   ) 9>"$lock"
 }
 
 emit_watch_status() {
-  write_watch_status "$1" "$2" "$3" "$4"
+  write_watch_status "$1" "$2" "$3" "$4" || return 1
   notify_watch_state "$1" "$2" "$3" "$4"
 }
 
