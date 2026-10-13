@@ -107,7 +107,11 @@ deliver_wecom() { # <record-json>  0 ok / 1 failed / 3 not configured
   [[ "$(jq -r '.errcode // -1' <<<"$resp" 2>/dev/null)" == 0 ]]
 }
 
-urldecode() { local s="${1//+/ }"; printf '%b' "${s//%/\\x}"; }
+# 只解 %XX(与 libpq 一致:URI 里的 + 是字面量);先转义已有反斜杠,%b 不会把它当转义序列。
+urldecode() {
+  local s="${1//\\/\\\\}"
+  printf '%b' "${s//%/\\x}"
+}
 
 # postgres://user:pass@host:port/db[?sslmode=…] → libpq 环境变量。只在调用它的子 shell 里导出。
 pg_env_from_url() { # <url>

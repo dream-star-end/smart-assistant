@@ -27,8 +27,13 @@ setup() {
   cat >"$C/bin/curl" <<'S'
 #!/usr/bin/env bash
 printf 'curl %s\n' "$*" >>"$TRACE"
-while (($#)); do [[ "$1" == -K ]] && cat "$2" >>"$CURL_CONF"; shift; done
-cat >/dev/null
+body_stdin=0
+while (($#)); do
+  [[ "$1" == -K ]] && cat "$2" >>"$CURL_CONF"
+  [[ "$1" == --data-binary && "${2:-}" == @- ]] && body_stdin=1
+  shift
+done
+if ((body_stdin)); then cat >/dev/null; fi
 [[ "${CURL_RC:-0}" == 0 ]] || exit "$CURL_RC"
 printf '%s' "${CURL_RESP:-}"
 S
@@ -36,7 +41,7 @@ S
 #!/usr/bin/env bash
 printf 'psql %s\n' "$*" >>"$TRACE"
 printf 'host=%s port=%s user=%s db=%s password=%s\n' "${PGHOST:-}" "${PGPORT:-}" "${PGUSER:-}" "${PGDATABASE:-}" \
-  "$([[ -n "${PGPASSWORD:-}" ]] && echo set || echo unset)" >>"$PSQL_ENV"
+  "$([[ "${PGPASSWORD:-}" == "${EXPECT_PGPASS:-}" ]] && echo match || echo mismatch)" >>"$PSQL_ENV"
 cat >"$PSQL_IN"
 sleep "${PSQL_SLEEP:-0}"
 exit "${PSQL_RC:-0}"
@@ -46,15 +51,17 @@ S
   export WATCH_ALERT_CONF="$C/etc/alert.env" WATCH_ALERT_DB_ENV="$C/etc/db.env" WATCH_ALERT_STATE_DIR="$C/state"
   export WATCH_LOG="$C/watch.log" WATCH_LIVE="$C/live" WATCH_ALERT_WECOM_URL="http://127.0.0.1:9/wecom"
   unset WATCH_ALERT_MODE WATCH_ALERT_INBOX_UID || true
-  printf 'DATABASE_URL=postgres://fixture_user:fixture%%40pw@127.0.0.1:9/fixture_db?sslmode=disable\n' >"$WATCH_ALERT_DB_ENV"
+  # 口令含 %40(→@)、字面 +、字面反斜杠:与 libpq 的解析一致才算对(review r2)。
+  printf '%s\n' 'DATABASE_URL=postgres://fixture_user:fix%40p+w\x41@127.0.0.1:9/fixture_db?sslmode=disable' >"$WATCH_ALERT_DB_ENV"
+  export EXPECT_PGPASS='fix@p+w\x41'
   printf -- '-- fanout fixture\nSELECT 1;\n' >"$C/live/scripts/v5-alert-fanout.sql"
 }
 conf() { printf '%s\n' "$@" >"$WATCH_ALERT_CONF"; chmod 0600 "$WATCH_ALERT_CONF"; }
-send() { set +e; OUT="$(bash "$ALERT" "$@" 2>&1)"; EC=$?; set -e; }
-nfiles() { find "$1" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l; }
+send() { set +e; OUT="$(bash "$ALERT" "$@" 2>&1 </dev/null)"; EC=$?; set -e; }
+nfiles() { { find "$1" -maxdepth 1 -name '*.json' 2>/dev/null || true; } | wc -l; }
 secret_leaked() { grep -rqF "$KEY" "$WATCH_LOG" "$C/state" 2>/dev/null; }
 # argv 里不能出现企微 key、库连接串或口令(review r1:ps 可见)。
-argv_leaked() { grep -qF -e "$KEY" -e 'postgres://' -e 'fixture@pw' -e 'fixture%40pw' "$TRACE"; }
+argv_leaked() { grep -qF -e "$KEY" -e 'postgres://' -e 'fix@p+w' -e 'fix%40p+w' "$TRACE"; }
 
 # A1 默认 dry:不调 curl / psql,只落演练 JSON(0600)与日志。
 setup a1
@@ -95,7 +102,7 @@ queued="$(nfiles "$C/state/alert-spool")"; calls_before="$(wc -l <"$TRACE")"
 send --flush
 if [[ "$EC" == 0 && "$queued" == 1 && "$calls_before" == 0 && "$(nfiles "$C/state/alert-spool")" == 0 ]] \
   && grep -qF "?key=$KEY" "$CURL_CONF" && grep -q '^psql ' "$TRACE" && ! argv_leaked \
-  && grep -q 'host=127.0.0.1 port=9 user=fixture_user db=fixture_db password=set' "$PSQL_ENV" \
+  && grep -q 'host=127.0.0.1 port=9 user=fixture_user db=fixture_db password=match' "$PSQL_ENV" \
   && grep -q -- '-v uid=3 ' "$TRACE" && grep -q "selfhost-watch:rollback_failed" "$TRACE" && grep -q '\\i .*v5-alert-fanout.sql' "$PSQL_IN" \
   && grep -q "INSERT INTO inbox_messages" "$PSQL_IN" && [[ "$(grep -c 'SENT channel=' "$WATCH_LOG")" == 2 ]] && ! secret_leaked; then
   ok "A5 live enqueues first, flush sends wecom + inbox(uid 3)+outbox; secrets never in argv/log"
@@ -167,7 +174,7 @@ export PSQL_SLEEP=30 WATCH_ALERT_DB_TIMEOUT_SEC=2 WATCH_ALERT_FLUSH_BUDGET_SEC=1
 t0=$SECONDS; send --event rollback_start --severity critical --message x; t_enq=$((SECONDS - t0))
 send --event tier1_skipped --severity warning --message y
 t0=$SECONDS; send --flush; t_flush=$((SECONDS - t0))
-left="$(cat "$C"/state/alert-spool/*.json 2>/dev/null | jq -sc 'map(.pending) | sort')"
+left="$({ cat "$C"/state/alert-spool/*.json 2>/dev/null || true; } | jq -sc 'map(.pending) | sort')"
 if [[ "$t_enq" -le 1 && "$t_flush" -le 6 && "$(nfiles "$C/state/alert-spool")" == 2 && "$left" == *'["db"]'* ]] && grep -q 'FLUSH 预算' "$WATCH_LOG"; then
   ok "A18 blocked db: enqueue instant, flush bounded, records kept"
 else bad "A18 enq=${t_enq}s flush=${t_flush}s left=$left"; fi
@@ -187,7 +194,7 @@ wsetup() {
   mkdir -p "$C/run" "$C/inst" "$C/rel"
   cp -- "$WATCH" "$WATCH_INSTALLED_BIN"
 }
-tick() { set +e; bash "$WATCH" --once >/dev/null 2>&1; TEC=$?; set -e; }
+tick() { set +e; bash "$WATCH" --once >/dev/null 2>&1 </dev/null; TEC=$?; set -e; }
 events() { { jq -r .event "$C"/state/alert-dry/*.json 2>/dev/null || true; } | sort | tr '\n' ' '; }
 
 # A13 停用期间变红 → disarmed_red(warning);转绿 → recovered(info)。
@@ -214,8 +221,8 @@ export WATCH_STUB_MASTER=ok
 
 # A16 --rearm 成功 → rearmed(info);被拒 → rearm_refused(warning)。
 wsetup a16; printf 'reason=deps-pg\n' >"$WATCH_DISARM"
-export WATCH_STUB_MASTER=down; set +e; bash "$WATCH" --rearm >/dev/null 2>&1; set -e
-export WATCH_STUB_MASTER=ok; set +e; bash "$WATCH" --rearm >/dev/null 2>&1; r=$?; set -e
+export WATCH_STUB_MASTER=down; set +e; bash "$WATCH" --rearm >/dev/null 2>&1 </dev/null; set -e
+export WATCH_STUB_MASTER=ok; set +e; bash "$WATCH" --rearm >/dev/null 2>&1 </dev/null; r=$?; set -e
 if [[ "$r" == 0 && "$(events)" == *rearm_refused* && "$(events)" == *rearmed* ]]; then ok "A16 rearm refused/ok alerts"; else bad "A16 r=$r [$(events)]"; fi
 
 # A17 未接入告警(无 WATCH_ALERT_BIN、安装目录无 alert.sh):看护不调用告警,行为不变。
