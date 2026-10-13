@@ -1464,9 +1464,12 @@ figure.oc-iui, .oc-iui { margin: 12px 0 20px; font-size: 14.5px; line-height: 1.
 :is([data-testid="assistant-row"], [data-testid="process-stage"]) .oc-iui-card:not([data-iui="calculator"], [data-iui="form"], [data-iui="quiz"], [data-iui="draft"], [data-iui="recipe"], [data-iui="route"], [data-iui="quote"], [data-iui="kline"], [data-iui="intraday"], [data-iui="stocklist"]) { margin-inline: -16px; }
 /* 操作类:浅色调面板 */
 .oc-iui-card:is([data-iui="calculator"], [data-iui="form"], [data-iui="quiz"], [data-iui="draft"], [data-iui="recipe"], [data-iui="route"], [data-iui="quote"], [data-iui="kline"], [data-iui="intraday"], [data-iui="stocklist"]) {
-  --iui-surface: var(--iui-panel-in); --iui-sunken: var(--iui-panel-in);
+  /* 面板里的控件画在 --iui-panel-in 上;--iui-sunken 比它深一档,控件的悬停/按下态才看得出来。 */
+  --iui-surface: var(--iui-panel-in); --iui-sunken: color-mix(in srgb, var(--fg) 5%, var(--iui-panel-in));
   border-radius: 20px; background: var(--iui-panel); box-shadow: inset 0 0 0 1px var(--iui-panel-ring); overflow: hidden;
 }
+/* 面板内的分区(计算器输入区、菜谱步骤、成稿纸面)反衬为 --iui-panel-in,不跟着 --iui-sunken 变深。 */
+.oc-iui-card:is([data-iui="calculator"], [data-iui="form"], [data-iui="quiz"], [data-iui="draft"], [data-iui="recipe"], [data-iui="route"], [data-iui="quote"], [data-iui="kline"], [data-iui="intraday"], [data-iui="stocklist"]) :is(.oc-iui-calc-inputs, .oc-iui-recipe-steps, .oc-iui-draft-paper) { background: var(--iui-panel-in); }
 .oc-iui-bare { border: 0; background: transparent; }
 .oc-iui-nested { margin: 0; }
 .oc-iui-card, .oc-iui-bare, .oc-iui-nested { animation: oc-iui-in 0.32s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
