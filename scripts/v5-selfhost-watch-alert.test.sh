@@ -21,18 +21,24 @@ KEY="k3y-$(date +%s%N)-secret"
 setup() {
   C="$BASE/$1"
   mkdir -p "$C/bin" "$C/etc" "$C/state" "$C/live/scripts"
-  export TRACE="$C/trace" PSQL_IN="$C/psql.in" CURL_RC=0 CURL_RESP='{"errcode":0}' PSQL_RC=0
+  export TRACE="$C/trace" PSQL_IN="$C/psql.in" CURL_CONF="$C/curl.conf" PSQL_ENV="$C/psql.env" \
+    CURL_RC=0 CURL_RESP='{"errcode":0}' PSQL_RC=0 PSQL_SLEEP=0
   : >"$TRACE"
   cat >"$C/bin/curl" <<'S'
 #!/usr/bin/env bash
 printf 'curl %s\n' "$*" >>"$TRACE"
+while (($#)); do [[ "$1" == -K ]] && cat "$2" >>"$CURL_CONF"; shift; done
+cat >/dev/null
 [[ "${CURL_RC:-0}" == 0 ]] || exit "$CURL_RC"
 printf '%s' "${CURL_RESP:-}"
 S
   cat >"$C/bin/psql" <<'S'
 #!/usr/bin/env bash
 printf 'psql %s\n' "$*" >>"$TRACE"
+printf 'host=%s port=%s user=%s db=%s password=%s\n' "${PGHOST:-}" "${PGPORT:-}" "${PGUSER:-}" "${PGDATABASE:-}" \
+  "$([[ -n "${PGPASSWORD:-}" ]] && echo set || echo unset)" >>"$PSQL_ENV"
 cat >"$PSQL_IN"
+sleep "${PSQL_SLEEP:-0}"
 exit "${PSQL_RC:-0}"
 S
   chmod 0755 "$C/bin/curl" "$C/bin/psql"
@@ -40,13 +46,15 @@ S
   export WATCH_ALERT_CONF="$C/etc/alert.env" WATCH_ALERT_DB_ENV="$C/etc/db.env" WATCH_ALERT_STATE_DIR="$C/state"
   export WATCH_LOG="$C/watch.log" WATCH_LIVE="$C/live" WATCH_ALERT_WECOM_URL="http://127.0.0.1:9/wecom"
   unset WATCH_ALERT_MODE WATCH_ALERT_INBOX_UID || true
-  printf 'DATABASE_URL=postgres://fixture-only@127.0.0.1:9/x\n' >"$WATCH_ALERT_DB_ENV"
+  printf 'DATABASE_URL=postgres://fixture_user:fixture%%40pw@127.0.0.1:9/fixture_db?sslmode=disable\n' >"$WATCH_ALERT_DB_ENV"
   printf -- '-- fanout fixture\nSELECT 1;\n' >"$C/live/scripts/v5-alert-fanout.sql"
 }
 conf() { printf '%s\n' "$@" >"$WATCH_ALERT_CONF"; chmod 0600 "$WATCH_ALERT_CONF"; }
 send() { set +e; OUT="$(bash "$ALERT" "$@" 2>&1)"; EC=$?; set -e; }
 nfiles() { find "$1" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l; }
 secret_leaked() { grep -rqF "$KEY" "$WATCH_LOG" "$C/state" 2>/dev/null; }
+# argv 里不能出现企微 key、库连接串或口令(review r1:ps 可见)。
+argv_leaked() { grep -qF -e "$KEY" -e 'postgres://' -e 'fixture@pw' -e 'fixture%40pw' "$TRACE"; }
 
 # A1 默认 dry:不调 curl / psql,只落演练 JSON(0600)与日志。
 setup a1
@@ -83,10 +91,14 @@ else bad "A4"; fi
 # A5 live 两通道都成功:无 spool;站内信给 uid 3、带 fanout;key 不进日志。
 setup a5; conf "WATCH_ALERT_MODE=live" "WATCH_ALERT_WECOM_KEY=$KEY"
 send --event rollback_failed --severity critical --message "两级兜底仍红"
-if [[ "$EC" == 0 && "$(nfiles "$C/state/alert-spool")" == 0 ]] && grep -q "^curl .*key=$KEY" "$TRACE" && grep -q '^psql ' "$TRACE" \
+queued="$(nfiles "$C/state/alert-spool")"; calls_before="$(wc -l <"$TRACE")"
+send --flush
+if [[ "$EC" == 0 && "$queued" == 1 && "$calls_before" == 0 && "$(nfiles "$C/state/alert-spool")" == 0 ]] \
+  && grep -qF "?key=$KEY" "$CURL_CONF" && grep -q '^psql ' "$TRACE" && ! argv_leaked \
+  && grep -q 'host=127.0.0.1 port=9 user=fixture_user db=fixture_db password=set' "$PSQL_ENV" \
   && grep -q -- '-v uid=3 ' "$TRACE" && grep -q "selfhost-watch:rollback_failed" "$TRACE" && grep -q '\\i .*v5-alert-fanout.sql' "$PSQL_IN" \
   && grep -q "INSERT INTO inbox_messages" "$PSQL_IN" && [[ "$(grep -c 'SENT channel=' "$WATCH_LOG")" == 2 ]] && ! secret_leaked; then
-  ok "A5 live sends wecom + inbox(uid 3)+outbox in one transaction; key never logged"
+  ok "A5 live enqueues first, flush sends wecom + inbox(uid 3)+outbox; secrets never in argv/log"
 else bad "A5 trace=$(cut -c1-120 "$TRACE" | tr '\n' ' ') log=$(tr '\n' ' ' <"$WATCH_LOG" | cut -c1-200)"; fi
 
 # A6 live,企微失败:落 spool(pending=wecom);恢复后 --flush 送达并清掉。
@@ -94,19 +106,23 @@ setup a6; conf "WATCH_ALERT_MODE=live" "WATCH_ALERT_WECOM_KEY=$KEY"
 export CURL_RC=7
 send --event tier2_restored --severity critical --message x
 s="$(find "$C/state/alert-spool" -maxdepth 1 -name '*.json' | head -n1)"
-p1="$(jq -c .pending "$s" 2>/dev/null || echo none)"
+p0="$(jq -c '[.pending, .attempts]' "$s" 2>/dev/null || echo none)"
+send --flush
+p1="$(jq -c '[.pending, .attempts]' "$s" 2>/dev/null || echo none)"
 send --flush
 p2="$(jq -c '[.pending, .attempts]' "$s" 2>/dev/null || echo none)"
 export CURL_RC=0
 send --flush
-if [[ "$p1" == '["wecom"]' && "$p2" == '[["wecom"],2]' && "$(nfiles "$C/state/alert-spool")" == 0 && "$(stat -c %a "$C/state/alert-spool")" == 700 ]] && ! secret_leaked; then
+if [[ "$p0" == '[["wecom","db"],0]' && "$p1" == '[["wecom"],1]' && "$p2" == '[["wecom"],2]' \
+  && "$(nfiles "$C/state/alert-spool")" == 0 && "$(stat -c %a "$C/state/alert-spool")" == 700 ]] && ! secret_leaked; then
   ok "A6 failed wecom spools, flush retries and clears"
-else bad "A6 p1=$p1 p2=$p2 left=$(nfiles "$C/state/alert-spool")"; fi
+else bad "A6 p0=$p0 p1=$p1 p2=$p2 left=$(nfiles "$C/state/alert-spool")"; fi
 
 # A7 live,企微回 errcode≠0 也算失败;库失败独立入 pending。
 setup a7; conf "WATCH_ALERT_MODE=live" "WATCH_ALERT_WECOM_KEY=$KEY"
 export CURL_RESP='{"errcode":93000,"errmsg":"invalid webhook url"}' PSQL_RC=2
 send --event fail_loud --severity critical --message x
+send --flush
 s="$(find "$C/state/alert-spool" -maxdepth 1 -name '*.json' | head -n1)"
 if [[ "$EC" == 0 && "$(jq -c .pending "$s" 2>/dev/null)" == '["wecom","db"]' ]]; then ok "A7 errcode!=0 and db failure both pending"; else bad "A7 $(cat "$s" 2>/dev/null)"; fi
 
@@ -121,6 +137,7 @@ unset WATCH_ALERT_MAX_ATTEMPTS; export CURL_RESP='{"errcode":0}' PSQL_RC=0
 # A9 live 未配置任何通道:SKIP 不入 spool。
 setup a9; conf "WATCH_ALERT_MODE=live"; rm -f "$WATCH_ALERT_DB_ENV"
 send --event fail_loud --severity critical --message x
+send --flush
 if [[ "$EC" == 0 && "$(nfiles "$C/state/alert-spool")" == 0 && "$(grep -c 'SKIP channel=' "$WATCH_LOG")" == 2 ]]; then ok "A9 unconfigured channels skip, no spool"; else bad "A9"; fi
 
 # A10 旧接口:systemd OnFailure 传单元名。
@@ -141,7 +158,20 @@ if [[ "$e1" == 2 && "$e2" == 2 && "$e3" == 2 && "$(nfiles "$C/state/alert-dry")"
 # A12 收件人可配,但非数字回落 3,不会落到 uid 1。
 setup a12; conf "WATCH_ALERT_MODE=live" "WATCH_ALERT_INBOX_UID=abc"
 send --event fail_loud --severity critical --message x
+send --flush
 if grep -q -- '-v uid=3 ' "$TRACE" && ! grep -q -- '-v uid=1 ' "$TRACE"; then ok "A12 invalid inbox uid falls back to 3"; else bad "A12 $(cat "$TRACE")"; fi
+
+# A18 库卡住:入队立即返回;flush 受逐通道超时与总预算约束,记录留在 spool 待下一拍。
+setup a18; conf "WATCH_ALERT_MODE=live" "WATCH_ALERT_WECOM_KEY=$KEY"
+export PSQL_SLEEP=30 WATCH_ALERT_DB_TIMEOUT_SEC=2 WATCH_ALERT_FLUSH_BUDGET_SEC=1
+t0=$SECONDS; send --event rollback_start --severity critical --message x; t_enq=$((SECONDS - t0))
+send --event tier1_skipped --severity warning --message y
+t0=$SECONDS; send --flush; t_flush=$((SECONDS - t0))
+left="$(cat "$C"/state/alert-spool/*.json 2>/dev/null | jq -sc 'map(.pending) | sort')"
+if [[ "$t_enq" -le 1 && "$t_flush" -le 6 && "$(nfiles "$C/state/alert-spool")" == 2 && "$left" == *'["db"]'* ]] && grep -q 'FLUSH 预算' "$WATCH_LOG"; then
+  ok "A18 blocked db: enqueue instant, flush bounded, records kept"
+else bad "A18 enq=${t_enq}s flush=${t_flush}s left=$left"; fi
+unset WATCH_ALERT_DB_TIMEOUT_SEC WATCH_ALERT_FLUSH_BUDGET_SEC; export PSQL_SLEEP=0
 
 # ── 接入看护 ─────────────────────────────────────────────────────────────
 wsetup() {
@@ -192,6 +222,15 @@ if [[ "$r" == 0 && "$(events)" == *rearm_refused* && "$(events)" == *rearmed* ]]
 wsetup a17; unset WATCH_ALERT_BIN; printf 'reason=deps-pg\n' >"$WATCH_DISARM"; export WATCH_STUB_MASTER=down; tick
 if [[ "$TEC" == 0 && "$(nfiles "$C/state/alert-dry")" == 0 ]] && ! grep -q 'watch-alert' "$WATCH_LOG"; then ok "A17 no alert script → no alert calls"; else bad "A17"; fi
 export WATCH_STUB_MASTER=ok
+
+# A19 live 且库卡住:看护仍按时走完两级兜底、写停用标记,告警留在 spool(review r1)。
+wsetup a19; conf "WATCH_ALERT_MODE=live" "WATCH_ALERT_WECOM_KEY=$KEY"
+export PSQL_SLEEP=30 WATCH_ALERT_DB_TIMEOUT_SEC=2 WATCH_ALERT_FLUSH_BUDGET_SEC=3 WATCH_STUB_MASTER=down
+t0=$SECONDS; tick; e1=$TEC; tick; e2=$TEC; dt=$((SECONDS - t0))
+if [[ "$e2" == 1 && -e "$WATCH_DISARM" && "$dt" -le 25 ]] && grep -q '两级兜底仍红' "$WATCH_LOG" && [[ "$(nfiles "$C/state/alert-spool")" -ge 1 ]] && ! argv_leaked; then
+  ok "A19 blocked alert db cannot stall the watch (${dt}s, disarm written, alerts spooled)"
+else bad "A19 e1=$e1 e2=$e2 dt=${dt}s disarm=$([[ -e "$WATCH_DISARM" ]] && echo y || echo n) spool=$(nfiles "$C/state/alert-spool")"; fi
+unset WATCH_ALERT_DB_TIMEOUT_SEC WATCH_ALERT_FLUSH_BUDGET_SEC; export PSQL_SLEEP=0 WATCH_STUB_MASTER=ok
 
 echo "ALERT_CASES pass=$pass fail=$fail"
 (( fail == 0 )) && echo ALERT_TEST_ALL_PASS

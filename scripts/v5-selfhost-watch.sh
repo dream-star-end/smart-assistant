@@ -572,7 +572,8 @@ watch_alert() { # <critical|warning|info> <event> <message>
   local bin
   bin="$(watch_alert_bin)"
   [[ -n "$bin" && -x "$bin" ]] || return 0
-  if ! WATCH_LOG="$WATCH_LOG" WATCH_LIVE="$WATCH_LIVE" timeout 30 "$bin" \
+  # 只入队(写 spool / 演练记录,毫秒级、不连网);投递在本拍结束的 watch_alert_flush。
+  if ! WATCH_LOG="$WATCH_LOG" WATCH_LIVE="$WATCH_LIVE" timeout 10 "$bin" \
     --event "$2" --severity "$1" --message "$3" >/dev/null 2>&1; then
     wlog "WARN 告警脚本返回非 0 event=$2" || true
   fi
@@ -583,7 +584,8 @@ watch_alert_flush() {
   local bin
   bin="$(watch_alert_bin)"
   [[ -n "$bin" && -x "$bin" ]] || return 0
-  if ! WATCH_LOG="$WATCH_LOG" WATCH_LIVE="$WATCH_LIVE" timeout 60 "$bin" --flush >/dev/null 2>&1; then
+  # alert.sh 自己有 20s 总预算与逐通道超时;这里的 timeout 只兜底。
+  if ! WATCH_LOG="$WATCH_LOG" WATCH_LIVE="$WATCH_LIVE" timeout 30 "$bin" --flush >/dev/null 2>&1; then
     wlog "WARN 告警补投失败" || true
   fi
   return 0
@@ -760,7 +762,6 @@ observe_while_suppressed() {
 watch_once() {
   local count reason loud
   WATCH_LAST_MASTER_BODY=""
-  watch_alert_flush
 
   if recovery_marker_present || manual_recovery_present; then
     observe_while_suppressed
@@ -1146,8 +1147,10 @@ main() {
   case "${1:-}" in
     -h|--help) usage_watch; exit 0 ;;
     --selftest) watch_selftest ;;
-    --once|"") watch_once ;;
-    --rearm) watch_rearm ;;
+    # 本拍(含 set -e 中断)结束时投递已入队告警;保留原退出码。不用 `|| rc=$?`,
+    # 那会让 watch_once 内部的 set -e 全部失效。
+    --once|"") trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; watch_once ;;
+    --rearm) trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; watch_rearm ;;
     *)
       echo "未知参数: $1" >&2
       usage_watch >&2

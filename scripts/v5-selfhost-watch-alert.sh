@@ -9,9 +9,12 @@
 # 模式 WATCH_ALERT_MODE(告警配置文件或环境变量,默认 dry):
 #   off  只写看护日志
 #   dry  写看护日志 + 把「本会发出的告警」存成 JSON(alert-dry/),不连网、不写库
-#   live 企微群机器人 webhook(带外,不依赖 master / PG)+ 站内信与 admin_alert_outbox(同一事务);
-#        任一通道失败落 alert-spool/,下一拍 --flush 重投,有次数与时效上限,失败不静默也不阻塞看护。
-# 密钥:企微 key 只从 root 0600 配置文件按 KEY=VALUE 解析(不 source),日志只记指纹,绝不打印。
+#   live 先把告警原子写入 alert-spool/(毫秒级,不连网),再由 --flush 投递:企微群机器人 webhook
+#        (带外,不依赖 master / PG)+ 站内信与 admin_alert_outbox(同一事务)。--flush 有总预算,
+#        每个通道单独超时;中途被杀记录仍在 spool,下一拍重投(至少一次,outbox 按 dedupe_key 去重)。
+#        超过次数 / 时效上限转 dead。看护每拍结束时 --flush;OnFailure 旧接口入队后立即 --flush。
+# 密钥:企微 key 只从 root 0600 配置文件按 KEY=VALUE 解析(不 source),经 curl -K 的 fd 传入;
+#      库口令拆成 libpq 环境变量(仅本进程可读)。两者都不进 argv、日志、spool。
 # 退出码:0 已处理(含已落 spool);2 用法错误。投递失败不返回非 0,避免 OnFailure 递归。
 set -uo pipefail
 
@@ -25,6 +28,8 @@ ALERT_DRY_KEEP="${WATCH_ALERT_DRY_KEEP:-200}"
 ALERT_MAX_ATTEMPTS="${WATCH_ALERT_MAX_ATTEMPTS:-50}"
 ALERT_MAX_AGE_SEC="${WATCH_ALERT_MAX_AGE_SEC:-86400}"
 ALERT_FLUSH_BATCH="${WATCH_ALERT_FLUSH_BATCH:-20}"
+ALERT_FLUSH_BUDGET_SEC="${WATCH_ALERT_FLUSH_BUDGET_SEC:-20}"
+ALERT_DB_TIMEOUT_SEC="${WATCH_ALERT_DB_TIMEOUT_SEC:-10}"
 SPOOL="$ALERT_STATE_DIR/alert-spool"
 DEAD="$ALERT_STATE_DIR/alert-spool/dead"
 DRYDIR="$ALERT_STATE_DIR/alert-dry"
@@ -95,10 +100,27 @@ deliver_wecom() { # <record-json>  0 ok / 1 failed / 3 not configured
   local rec="$1" body resp
   [[ -n "$WECOM_KEY" ]] || return 3
   body="$(jq -nc --arg c "$(render_md "$rec")" '{msgtype:"markdown", markdown:{content:$c}}')"
-  # URL 含 key:只传给 curl,不进日志、不进错误输出。
-  resp="$(curl -fsS --max-time 5 -H 'Content-Type: application/json' -d "$body" \
-    "${ALERT_WECOM_URL}?key=${WECOM_KEY}" 2>/dev/null)" || return 1
+  # 含 key 的 URL 经 -K 从进程替换的 fd 读入,argv 里只有 /dev/fd/N;正文走 stdin。
+  resp="$(curl -fsS --connect-timeout 3 --max-time 5 -H 'Content-Type: application/json' \
+    --data-binary @- -K <(printf 'url = "%s?key=%s"\n' "$ALERT_WECOM_URL" "$WECOM_KEY") \
+    <<<"$body" 2>/dev/null)" || return 1
   [[ "$(jq -r '.errcode // -1' <<<"$resp" 2>/dev/null)" == 0 ]]
+}
+
+urldecode() { local s="${1//+/ }"; printf '%b' "${s//%/\\x}"; }
+
+# postgres://user:pass@host:port/db[?sslmode=…] → libpq 环境变量。只在调用它的子 shell 里导出。
+pg_env_from_url() { # <url>
+  local re='^postgres(ql)?://([^:@/]*)(:([^@/]*))?@([^:/?]+)(:([0-9]+))?/([^?]+)(\?(.*))?$' q
+  [[ "$1" =~ $re ]] || return 1
+  export PGUSER PGPASSWORD PGHOST PGPORT PGDATABASE
+  PGUSER="$(urldecode "${BASH_REMATCH[2]}")"
+  PGPASSWORD="$(urldecode "${BASH_REMATCH[4]}")"
+  PGHOST="${BASH_REMATCH[5]}"
+  PGPORT="${BASH_REMATCH[7]:-5432}"
+  PGDATABASE="$(urldecode "${BASH_REMATCH[8]}")"
+  q="${BASH_REMATCH[10]}"
+  if [[ "$q" =~ (^|&)sslmode=([a-z-]+) ]]; then export PGSSLMODE="${BASH_REMATCH[2]}"; fi
 }
 
 deliver_db() { # <record-json>  站内信 + admin_alert_outbox 同一事务。0 ok / 1 failed / 3 not configured
@@ -113,16 +135,19 @@ deliver_db() { # <record-json>  站内信 + admin_alert_outbox 同一事务。0 
 VALUES ('user', :'uid'::bigint, left(:'title', 200), left(:'body', 16000), :'level', :'uid'::bigint, 'operations', left(:'thread', 160), 'selfhost-watch');"
     if [[ -f "$fanout" ]]; then printf '\\i %s\n' "$fanout"; fi
     printf '%s\n' 'COMMIT;'
-  } | psql "$dburl" -X -q -v ON_ERROR_STOP=1 \
+  } | (
+    pg_env_from_url "$dburl" || exit 1
+    PGCONNECT_TIMEOUT=5 PGOPTIONS='-c statement_timeout=5000' timeout "$ALERT_DB_TIMEOUT_SEC" \
+      psql -X -q -v ON_ERROR_STOP=1 \
     -v uid="$INBOX_UID" -v level="$level" \
     -v title="$(jq -r .title <<<"$rec")" -v body="$(render_md "$rec")" \
     -v thread="selfhost-watch:$(jq -r '.event' <<<"$rec" | tr -cd 'a-z0-9_-')" \
     -v event_type="selfhost.watch.$(jq -r '.event' <<<"$rec" | tr -cd 'a-z0-9_-')" \
     -v severity="$(jq -r .severity <<<"$rec")" \
     -v dedupe_key="selfhost-watch:$(jq -r .id <<<"$rec")" \
-    -v body_plain="$(jq -r .message <<<"$rec")" \
     -v payload="$(jq -c '{source:"selfhost-watch", event, severity, host, live}' <<<"$rec")" \
-    >/dev/null 2>&1 || return 1
+    >/dev/null 2>&1
+  ) || return 1
 }
 
 # 依次尝试 pending 里的通道;返回剩余未送达的通道 JSON 数组。
@@ -169,20 +194,27 @@ do_send() { # <event> <severity> <message> <live>
       return 0
       ;;
   esac
-  left="$(try_channels "$rec" '["wecom","db"]')"
-  if [[ "$left" != '[]' ]]; then
-    rec="$(jq -c --argjson p "$left" '.pending=$p | .attempts=1' <<<"$rec")"
-    spool_write "$rec" && alog "SPOOL id=$(jq -r .id <<<"$rec") pending=$(jq -r '.pending|join(",")' <<<"$rec")"
+  # live:先落盘(不连网),投递交给 --flush。进程在投递中被杀也不丢。
+  rec="$(jq -c '.pending=["wecom","db"] | .attempts=0' <<<"$rec")"
+  if spool_write "$rec"; then
+    alog "QUEUED id=$(jq -r .id <<<"$rec")"
+  else
+    alog "WARN 写 spool 失败,本条只留在日志 event=$1"
   fi
 }
 
 do_flush() {
   [[ "$ALERT_MODE" == live ]] || return 0
   [[ -d "$SPOOL" ]] || return 0
-  local f rec age left n=0 now
+  local f rec age left n=0 now start
   now="$(date +%s)"
+  start="$now"
   for f in $(ls -1tr "$SPOOL"/*.json 2>/dev/null); do
     ((n >= ALERT_FLUSH_BATCH)) && break
+    if (($(date +%s) - start >= ALERT_FLUSH_BUDGET_SEC)); then
+      alog "FLUSH 预算 ${ALERT_FLUSH_BUDGET_SEC}s 用尽,剩余下一拍再投"
+      break
+    fi
     n=$((n + 1))
     rec="$(cat "$f" 2>/dev/null)" || continue
     age=$((now - $(stat -c %Y "$f")))
@@ -227,7 +259,8 @@ main() {
       ;;
     '' | -*) echo "用法: alert.sh --event E --severity critical|warning|info --message M [--live REL] | --flush | --status | <failed-unit>" >&2; return 2 ;;
     *)
-      # systemd OnFailure 旧接口:看护单元本身非 0 退出。
+      # systemd OnFailure 旧接口:看护单元本身非 0 退出。入队后立即投递(不在看护的时间预算里)。
+      FLUSH_AFTER=1
       event=watch_unit_failed
       severity=critical
       message="看护单元 $(printf '%s' "$1" | tr -cd 'A-Za-z0-9@._-') 非 0 退出。查: journalctl -u $(printf '%s' "$1" | tr -cd 'A-Za-z0-9@._-') -n 50"
@@ -237,6 +270,7 @@ main() {
   [[ -n "$event" && -n "$message" ]] && severity_ok "$severity" || { echo "缺 event/message 或 severity 非法" >&2; return 2; }
   [[ -n "$live" ]] || live="$(readlink -f "$ALERT_LIVE_LINK" 2>/dev/null || echo unknown)"
   with_lock do_send "$event" "$severity" "$message" "$live"
+  if [[ "${FLUSH_AFTER:-0}" == 1 ]]; then with_lock do_flush; fi
   return 0
 }
 
