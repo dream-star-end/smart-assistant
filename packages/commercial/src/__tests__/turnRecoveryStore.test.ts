@@ -6,10 +6,12 @@ import {
   claimDueRecoveryJobs,
   forwardRecoveryUnderRootFence,
   markRecoveryContainerReceipt,
+  pauseRecoveryForRefusal,
   pauseSilentRecoveryLineage,
   releaseRecoveryForTransportWait,
   settleRecoveryJobForTape,
 } from '../dispatch/turnRecoveryStore.js'
+import { _recoveryRefusalAction } from '../ws/userChatBridge.js'
 
 function fakePool(
   route: (sql: string, params: unknown[]) => { rows?: unknown[]; rowCount?: number },
@@ -73,6 +75,41 @@ describe('Master automatic recovery scheduler store', () => {
     assert.equal(params[0], 'job-1')
     assert.equal(params[2], 12)
     assert.equal(params[3], 300_000)
+  })
+
+  test('OCV5-391: a refused replay pauses its job under the same lease fence instead of re-queuing', async () => {
+    let sql = ''
+    let params: unknown[] = []
+    const pool = fakePool((actual, p) => {
+      sql = actual
+      params = p
+      return { rowCount: 1 }
+    })
+    const paused = await pauseRecoveryForRefusal(pool, { jobId: 'job-1', leaseOwner: 'master-a', leaseEpoch: 12 },
+      'UNAUTHORIZED_MODEL')
+    assert.equal(paused, true)
+    assert.match(sql, /SET status='paused',pause_reason=\$4,terminal_outcome='interrupted'/)
+    assert.match(sql, /WHERE job_id=\$1 AND status='leased' AND lease_owner=\$2 AND lease_epoch=\$3/)
+    assert.doesNotMatch(sql, /transport_wait_attempt|status='queued'/)
+    assert.deepEqual(params, ['job-1', 'master-a', 12, 'refused:UNAUTHORIZED_MODEL'])
+    await pauseRecoveryForRefusal(pool, { jobId: 'job-1', leaseOwner: 'master-a', leaseEpoch: 12 },
+      'recovery_conflict:source not latest/"x"')
+    assert.equal(params[3], 'refused:recovery_conflict:source_not_latest__x_')
+    const lost = await pauseRecoveryForRefusal(fakePool(() => ({ rowCount: 0 })),
+      { jobId: 'job-1', leaseOwner: 'master-a', leaseEpoch: 12 }, 'UNAUTHORIZED_MODEL')
+    assert.equal(lost, false, 'a lease another scheduler took over is left alone')
+  })
+
+  test('OCV5-391: policy refusals stop a recovery job, transient ones wait for the next attempt', () => {
+    // Production: a 2026-08-09 job on the retired kimi-k3-ark re-queued every 5 min for 2 months.
+    for (const code of ['UNAUTHORIZED_MODEL', 'MODEL_NOT_AVAILABLE', 'ERR_INSUFFICIENT_CREDITS',
+      'UNRESOLVED_AGENT_MODEL', 'AGENT_NOT_FOUND', 'ERR_FRAME_TOO_BIG']) {
+      assert.equal(_recoveryRefusalAction(code), 'pause', code)
+    }
+    for (const code of ['CURSOR_UNAVAILABLE', 'ZCODE_UNAVAILABLE', 'DISPATCH_PREPARATION_TIMEOUT',
+      'DURABLE_DISPATCH_UNAVAILABLE', 'EXECUTION_OWNER_BUSY', 'ERR_BACKPRESSURE', 'ERR_INTERNAL']) {
+      assert.equal(_recoveryRefusalAction(code), 'requeue', code)
+    }
   })
 
   test('settleRecoveryJobForTape parses RETURNING terminal rows', async () => {
