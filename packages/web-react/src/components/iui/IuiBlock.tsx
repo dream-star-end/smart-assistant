@@ -14,6 +14,7 @@ import { KvBlock, ProgressBlock, RouteBlock } from "./InfoBlocks";
 import { FormBlock, QuizBlock, RecipeBlock } from "./InteractiveBlocks";
 import { IntradayBlock, KlineBlock, QuoteBlock, StockListBlock } from "./MarketBlocks";
 import { CardsBlock, GalleryBlock, SwatchesBlock, TilesBlock } from "./MediaBlocks";
+import { FeishuDocBlock, FeishuEventsBlock, WeiboHotBlock, WeiboPostsBlock, ZhihuAnswersBlock, ZhihuHotBlock } from "./PluginBlocks";
 import { TableBlock } from "./TableBlock";
 import { DraftBlock, OutlineBlock, SourcesBlock } from "./TextBlocks";
 import {
@@ -117,6 +118,18 @@ export function renderSpec(spec: IuiSpec, notes: string[], streaming: boolean, r
       return <IntradayBlock spec={spec} {...p} />;
     case "stocklist":
       return <StockListBlock spec={spec} {...p} />;
+    case "weibo_posts":
+      return <WeiboPostsBlock spec={spec} {...p} />;
+    case "weibo_hot":
+      return <WeiboHotBlock spec={spec} {...p} />;
+    case "zhihu_hot":
+      return <ZhihuHotBlock spec={spec} {...p} />;
+    case "zhihu_answers":
+      return <ZhihuAnswersBlock spec={spec} {...p} />;
+    case "feishu_events":
+      return <FeishuEventsBlock spec={spec} {...p} />;
+    case "feishu_doc":
+      return <FeishuDocBlock spec={spec} {...p} />;
   }
 }
 
@@ -172,6 +185,15 @@ function hasContent(spec: IuiSpec): boolean {
       return spec.rows.length > 0;
     case "intraday":
       return spec.points.length > 0;
+    case "weibo_posts":
+    case "weibo_hot":
+    case "zhihu_hot":
+    case "feishu_events":
+      return spec.items.length > 0;
+    case "zhihu_answers":
+      return spec.items.length > 0 || !!spec.question;
+    case "feishu_doc":
+      return spec.title.length > 0;
   }
 }
 
