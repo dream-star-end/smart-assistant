@@ -199,6 +199,12 @@
       "reason": "Antigravity relay prefix was a raw /internal/v5 literal missing from the internal route registry; only the commercial-unit contract test failed during the OCV5-411 two-tree sync. Engine is hidden and fail-closed, no user-visible behaviour, billing or data change.",
       "approvedBy": "user 2026-10-14 要求在个人版正规修复内部路由注册表登记 (OCV5-415, cc3-sync 反馈)",
       "expiresAt": "2026-11-13"
+    },
+    {
+      "commit": "6fda2cdf1a509994fe80811bc776e15f76c3a600",
+      "reason": "Antigravity relay prefix was a raw /internal/v5 literal missing from the internal route registry; only the commercial-unit contract test failed during the OCV5-411 two-tree sync. Engine is hidden and fail-closed, no user-visible behaviour, billing or data change. Commercial cherry-pick -x of selfhost 1f4e95be5 (same patch); mirrors that waiver.",
+      "approvedBy": "user 2026-10-14 要求在个人版正规修复内部路由注册表登记 (OCV5-415, cc3-sync 反馈)",
+      "expiresAt": "2026-11-13"
     }
   ]
 }
