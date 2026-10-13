@@ -45,6 +45,9 @@ WATCH_SKIP_ACTIONS="${WATCH_SKIP_ACTIONS:-0}"
 WATCH_STATUS="${WATCH_STATUS:-}"
 WATCH_NOTIFY_STATE="${WATCH_NOTIFY_STATE:-}"
 WATCH_NOTIFY_COOLDOWN_SEC="${WATCH_NOTIFY_COOLDOWN_SEC:-21600}"
+WATCH_INSTALLED_BIN="${WATCH_INSTALLED_BIN:-/opt/openclaude/v5-selfhost-watch/watch.sh}"
+WATCH_REARM_CHECKS="${WATCH_REARM_CHECKS:-3}"
+WATCH_REARM_INTERVAL_SEC="${WATCH_REARM_INTERVAL_SEC:-5}"
 
 wlog() {
   local msg
@@ -806,6 +809,86 @@ watch_once() {
   return 1
 }
 
+# OCV5-404:人工显式重新武装。只把停用标记改名归档(留证据),不删、不重启、不回切。
+# 任一前置条件不满足就拒绝,停用标记与失败计数都不动。归档后下一拍 timer 按武装路径检查。
+rearm_refuse() {
+  wlog "rearm 拒绝: $*"
+  printf 'REARM_REFUSED %s\n' "$*" >&2
+}
+
+# healthz 带 deps 时 pg 必须是 ok。08-18 停用的原因就是 deps-pg。
+master_deps_pg_ok() {
+  local body="${WATCH_LAST_MASTER_BODY:-${WATCH_STUB_MASTER_BODY:-}}" pg
+  [[ -n "$body" ]] || return 1
+  echo "$body" | jq -e 'has("deps")' >/dev/null 2>&1 || return 0
+  pg="$(echo "$body" | jq -er '.deps.pg // empty' 2>/dev/null || true)"
+  [[ "$pg" == "ok" ]]
+}
+
+rearm_preconditions() {
+  local i checks="$WATCH_REARM_CHECKS" interval="$WATCH_REARM_INTERVAL_SEC" self_sha inst_sha
+  [[ "$checks" =~ ^[1-9][0-9]*$ ]] || checks=3
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=5
+  if [[ ! -f "$WATCH_DISARM" || -L "$WATCH_DISARM" ]]; then
+    rearm_refuse "停用标记不是普通文件: $WATCH_DISARM"; return 1
+  fi
+  if is_true_dry; then
+    rearm_refuse "WATCH_DRY=1,重新武装不会恢复自动回滚"; return 1
+  fi
+  if [[ ! -f "$WATCH_INSTALLED_BIN" ]]; then
+    rearm_refuse "缺已安装副本 $WATCH_INSTALLED_BIN"; return 1
+  fi
+  self_sha="$(sha256sum <"${BASH_SOURCE[0]}")"
+  inst_sha="$(sha256sum <"$WATCH_INSTALLED_BIN")"
+  if [[ "$self_sha" != "$inst_sha" ]]; then
+    rearm_refuse "已安装副本与本脚本不一致,先安装再武装"; return 1
+  fi
+  if manual_recovery_present; then
+    rearm_refuse "manual-recovery 存在,先走应急恢复"; return 1
+  fi
+  for ((i = 1; i <= checks; i++)); do
+    if lock_is_live_exemption; then rearm_refuse "发布锁活"; return 1; fi
+    if maint_is_live_exemption; then rearm_refuse "维护窗口未到期"; return 1; fi
+    if in_cutover_grace; then rearm_refuse "cutover grace 未到期"; return 1; fi
+    WATCH_LAST_MASTER_BODY=""
+    if ! compound_green; then rearm_refuse "复合健康红(第 $i/$checks 次)"; return 1; fi
+    if ! master_deps_pg_ok; then rearm_refuse "healthz deps.pg 不是 ok(第 $i/$checks 次)"; return 1; fi
+    if (( i < checks && interval > 0 )); then sleep "$interval"; fi
+  done
+}
+
+watch_rearm() {
+  local lockfile archived rc
+  if [[ ! -e "$WATCH_DISARM" && ! -L "$WATCH_DISARM" ]]; then
+    wlog "rearm: 无停用标记,看护已武装"
+    echo "REARM_NOOP"
+    return 0
+  fi
+  rearm_preconditions || return 1
+  # 清零在归档之前:武装后的第一拍不能接着旧计数直接到阈值。停用期间计数不被使用。
+  write_fail_count 0
+  mkdir -p -- "$WATCH_RUN_DIR"
+  lockfile="${WATCH_RUN_DIR}/.watch-rearm.lock"
+  rc=0
+  archived="$(
+    exec 9>"$lockfile" || exit 3
+    flock -n 9 || exit 3
+    [[ -f "$WATCH_DISARM" && ! -L "$WATCH_DISARM" ]] || exit 4
+    dst="${WATCH_DISARM}.rearmed-$(date -u +%Y%m%dT%H%M%SZ)"
+    [[ ! -e "$dst" && ! -L "$dst" ]] || exit 5
+    mv -T -- "$WATCH_DISARM" "$dst" || exit 1
+    [[ ! -e "$WATCH_DISARM" && -f "$dst" ]] || exit 1
+    printf '%s\n' "$dst"
+  )" || rc=$?
+  if (( rc != 0 )); then
+    rearm_refuse "归档停用标记失败 rc=$rc"
+    return 1
+  fi
+  emit_watch_status true "" true green || wlog "WARN rearm 后状态文件写入失败"
+  wlog "rearm: 已重新武装,停用标记归档到 $archived"
+  echo "REARM_OK archived=$archived"
+}
+
 watch_selftest() {
   local base
   base="$(mktemp -d /tmp/v5-selfhost-watch-selftest.XXXXXX)"
@@ -977,7 +1060,7 @@ watch_selftest() {
 
 usage_watch() {
   cat <<'EOF'
-用法: watch.sh [--once|--selftest]
+用法: watch.sh [--once|--selftest|--rearm]
   默认同 --once。WATCH_DRY=1(watch.env)时只记日志不真回切。
   切到真模式: 把 /opt/openclaude/v5-selfhost-watch/watch.env 里 WATCH_DRY=1 改成 0
   然后: systemctl daemon-reload && systemctl enable --now openclaude-v5-selfhost-watch.timer
@@ -985,6 +1068,8 @@ usage_watch() {
   状态文件分开写 recovery_armed、suppression_reason、observation_executed、health、checked_at。
   recovery_armed=false 不是 healthy。安装须同目录临时文件校验后 mv -T，见
   scripts/v5-selfhost-watch-install.md。禁止删除 watch-disarmed。
+  重新武装只用 --rearm(OCV5-404):在已安装副本上执行,要求无活锁/维护/grace、无 manual-recovery、
+  连续 WATCH_REARM_CHECKS 次复合健康绿且 deps.pg=ok;通过后把标记改名归档,不删除。
 EOF
 }
 
@@ -993,6 +1078,7 @@ main() {
     -h|--help) usage_watch; exit 0 ;;
     --selftest) watch_selftest ;;
     --once|"") watch_once ;;
+    --rearm) watch_rearm ;;
     *)
       echo "未知参数: $1" >&2
       usage_watch >&2
