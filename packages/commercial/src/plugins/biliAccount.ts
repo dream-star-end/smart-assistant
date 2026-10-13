@@ -81,6 +81,16 @@ const WORKER_EXPIRY_LABEL = 'com.openclaude.plugin.expires_at_ms'
 const WORKER_BOOT_LABEL = 'com.openclaude.plugin.boot_id'
 const WORKER_SESSION_LABEL = 'com.openclaude.plugin.session_id'
 const WORKER_DIGEST_LABEL = 'com.openclaude.plugin.worker_digest'
+/**
+ * Broker / worker roots (shared by master wiring and the seed script). The broker socket path is
+ * `<root>/<36-char invocation id>/tls.sock` and must stay ≤ 100 bytes (browserBroker.ts), so a
+ * root may be at most 54 bytes; these keep a margin.
+ */
+export const BILI_ACCOUNT_BROKER_ROOT = '/run/openclaude-v5/plugin-browser-brokers-bili'
+export const BILI_ACCOUNT_WORKER_ROOT = '/var/lib/openclaude-v5/plugin-workers-bili-account'
+export const BILI_ACCOUNT_SEED_BROKER_ROOT = '/run/openclaude-v5/bili-seed-brokers'
+export const BILI_ACCOUNT_SEED_WORKER_ROOT = '/var/lib/openclaude-v5/plugin-workers-bili-seed'
+
 /** 只读动作都是几次页面内请求,给 3 分钟上限,远低于 Weibo 写操作用的 570 秒。 */
 const ACTION_SESSION_MS = 180_000
 

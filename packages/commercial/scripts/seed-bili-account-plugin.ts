@@ -24,8 +24,8 @@ import {
   BILI_ACCOUNT_SEED_CLI_USAGE,
   biliAccountSmokeActionIds,
   findApprovedBiliAccountPlugin,
-  requireCleanLogin,
   parseBiliAccountSeedCliArgs,
+  requireCleanLogin,
   seedBiliAccountPlugin,
 } from '../src/marketplace/seedBiliAccountPlugin.js'
 import {
@@ -34,6 +34,8 @@ import {
 } from '../src/plugins/accounts.js'
 import {
   BILI_ACCOUNT_PLUGIN_CONTRACT,
+  BILI_ACCOUNT_SEED_BROKER_ROOT,
+  BILI_ACCOUNT_SEED_WORKER_ROOT,
   BiliAccountDockerService,
   COMPILED_BILI_ACCOUNT_PLUGIN,
   createBiliAccountRuntimeRegistries,
@@ -161,18 +163,20 @@ async function smoke(
 }
 
 async function verifyAndSeed(
-  userId: number,
+  userId: number | null,
   qrOut: string,
   subtitleBvid: string | null,
 ): Promise<void> {
-  const user = await query<{ status: string }>('SELECT status FROM users WHERE id = $1', [userId])
-  if (user.rows[0]?.status !== 'active') throw new Error('verification user is not active')
+  if (userId !== null) {
+    const user = await query<{ status: string }>('SELECT status FROM users WHERE id = $1', [userId])
+    if (user.rows[0]?.status !== 'active') throw new Error('verification user is not active')
+  }
   const docker = dockerClient()
   const imageId = exactImageId()
   const service = new BiliAccountDockerService(docker, {
     imageId,
-    workerRoot: '/var/lib/openclaude-v5/plugin-workers-bili-account-seed',
-    brokerRoot: '/run/openclaude-v5/plugin-browser-brokers-bili-account-seed',
+    workerRoot: BILI_ACCOUNT_SEED_WORKER_ROOT,
+    brokerRoot: BILI_ACCOUNT_SEED_BROKER_ROOT,
     expectedOwnerUid: 0,
     socketUid: 1000,
     socketGid: 1000,
@@ -183,6 +187,11 @@ async function verifyAndSeed(
     await rm(qrOut, { force: true })
     const { storageState, summary } = await smoke(service, scanned, subtitleBvid)
     log({ step: 'smoke-passed', ...summary })
+    // --verify-only:到此为止(上架前检查),不发布、不安装、不绑定,登录状态随进程丢弃。
+    if (userId === null) {
+      log({ step: 'verify-only-done', seeded: false })
+      return
+    }
     const seeded = await seedBiliAccountPlugin({ functionalVerified: true })
     log({ step: 'seeded', versionId: seeded.versionId, published: seeded.published })
     await installApprovedVersion({ userId, versionId: seeded.versionId })
@@ -211,6 +220,7 @@ async function main(): Promise<number> {
   }
   try {
     if (cli.mode === 'advisory-status') await advisoryStatus()
+    else if (cli.mode === 'verify-only') await verifyAndSeed(null, cli.qrOut, cli.subtitleBvid)
     else await verifyAndSeed(cli.userId, cli.qrOut, cli.subtitleBvid)
     return 0
   } catch (error) {

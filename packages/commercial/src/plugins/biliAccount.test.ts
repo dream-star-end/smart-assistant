@@ -12,10 +12,12 @@ import {
   requireCleanLogin,
 } from '../marketplace/seedBiliAccountPlugin.js'
 import {
+  BILI_ACCOUNT_BROKER_ROOT,
   BILI_ACCOUNT_LOGIN_ORIGINS,
   BILI_ACCOUNT_PLUGIN_CONTRACT,
   BILI_ACCOUNT_PLUGIN_SLUG,
   BILI_ACCOUNT_PLUGIN_VERSION,
+  BILI_ACCOUNT_SEED_BROKER_ROOT,
   COMPILED_BILI_ACCOUNT_PLUGIN,
   classifyBiliAccountSetupPin,
   decodeBiliAccountWorkerFramesForTest,
@@ -599,6 +601,12 @@ describe('bili-account protocol, codes, logs, seed CLI', () => {
       null,
     )
     assert.equal(sanitizeBiliAccountWorkerLogLine('not json'), null)
+  })
+
+  test('broker socket paths fit the 100-byte limit for master and seed roots', () => {
+    const invocation = '00000000-0000-0000-0000-000000000000'
+    for (const root of [BILI_ACCOUNT_BROKER_ROOT, BILI_ACCOUNT_SEED_BROKER_ROOT])
+      assert.ok(Buffer.byteLength(`${root}/${invocation}/tls.sock`) <= 100, root)
   })
 
   test('worker resources stay within the Weibo envelope', () => {

@@ -141,27 +141,33 @@ export function requireCleanLogin<T>(input: {
 }
 
 export const BILI_ACCOUNT_SEED_CLI_USAGE =
-  'usage: seed-bili-account-plugin.ts --advisory-status | --verify-and-seed-user=ID --qr-out=/root/<file>.png [--subtitle-bvid=BV…]'
+  'usage: seed-bili-account-plugin.ts --advisory-status | (--verify-only | --verify-and-seed-user=ID) --qr-out=/root/<file>.png [--subtitle-bvid=BV…]'
 
 export type BiliAccountSeedCli =
   | { mode: 'advisory-status' }
+  /** 真实扫码 + 逐动作实测,不写库、不上架(上架前检查)。 */
+  | { mode: 'verify-only'; qrOut: string; subtitleBvid: string | null }
   | { mode: 'verify-and-seed'; userId: number; qrOut: string; subtitleBvid: string | null }
 
 export function parseBiliAccountSeedCliArgs(argv: readonly string[]): BiliAccountSeedCli {
   if (argv.length === 1 && argv[0] === '--advisory-status') return { mode: 'advisory-status' }
   let userId: number | null = null
+  let verifyOnly = false
   let qrOut: string | null = null
   let subtitleBvid: string | null = null
   for (const arg of argv) {
     const user = /^--verify-and-seed-user=(\d{1,16})$/.exec(arg)
     const qr = /^--qr-out=(\/root\/[A-Za-z0-9._-]{1,64}\.png)$/.exec(arg)
     const bvid = /^--subtitle-bvid=(BV[0-9A-Za-z]{10})$/.exec(arg)
-    if (user && userId === null) userId = Number(user[1])
-    else if (qr && qrOut === null) qrOut = qr[1]!
+    if (user && userId === null && !verifyOnly) userId = Number(user[1])
+    else if (arg === '--verify-only' && !verifyOnly && userId === null) verifyOnly = true
+    else if (qr && qrOut === null && !qr[1]!.includes('..')) qrOut = qr[1]!
     else if (bvid && subtitleBvid === null) subtitleBvid = bvid[1]!
     else throw new Error(BILI_ACCOUNT_SEED_CLI_USAGE)
   }
-  if (userId === null || !Number.isSafeInteger(userId) || userId <= 0 || qrOut === null)
+  if (qrOut === null) throw new Error(BILI_ACCOUNT_SEED_CLI_USAGE)
+  if (verifyOnly) return { mode: 'verify-only', qrOut, subtitleBvid }
+  if (userId === null || !Number.isSafeInteger(userId) || userId <= 0)
     throw new Error(BILI_ACCOUNT_SEED_CLI_USAGE)
   return { mode: 'verify-and-seed', userId, qrOut, subtitleBvid }
 }

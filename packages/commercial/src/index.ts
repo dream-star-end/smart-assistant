@@ -554,7 +554,12 @@ import { WeiboDockerService, createWeiboRuntimeRegistries } from './plugins/weib
 import { WeiboSetupManager } from './plugins/weiboSetup.js'
 import { ZhihuDockerService, createZhihuRuntimeRegistries } from './plugins/zhihu.js'
 import { ZhihuSetupManager } from './plugins/zhihuSetup.js'
-import { BiliAccountDockerService, createBiliAccountRuntimeRegistries } from './plugins/biliAccount.js'
+import {
+  BILI_ACCOUNT_BROKER_ROOT,
+  BILI_ACCOUNT_WORKER_ROOT,
+  BiliAccountDockerService,
+  createBiliAccountRuntimeRegistries,
+} from './plugins/biliAccount.js'
 import { BiliAccountSetupManager } from './plugins/biliAccountSetup.js'
 import { seedDefaultConnectors } from './connectors/declarativeSeed.js'
 import { startConnectorSweeper } from './connectors/sweeper.js'
@@ -1703,8 +1708,8 @@ export async function registerCommercial(
     // OCV5-402: read-only Bilibili account Plugin (market only). Smaller worker cap (2) than Weibo.
     biliAccountService = new BiliAccountDockerService(pluginDocker, {
       imageId: cfg.OC_RUNTIME_IMAGE_ID,
-      workerRoot: '/var/lib/openclaude-v5/plugin-workers-bili-account',
-      brokerRoot: '/run/openclaude-v5/plugin-browser-brokers-bili-account',
+      workerRoot: BILI_ACCOUNT_WORKER_ROOT,
+      brokerRoot: BILI_ACCOUNT_BROKER_ROOT,
       expectedOwnerUid: 0,
       socketUid: 1000,
       socketGid: 1000,
