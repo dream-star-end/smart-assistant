@@ -125,6 +125,12 @@ export const KIND_ICON_SOURCES = {
   kline: "chart-column",
   intraday: "chart-column",
   stocklist: "table-2",
+  weibo_posts: "layout-list",
+  weibo_hot: "flame",
+  zhihu_hot: "flame",
+  zhihu_answers: "users",
+  feishu_events: "calendar",
+  feishu_doc: "book-open",
 } as const satisfies Record<string, LucideName>;
 
 /** 组件内部控件用、别处没有引过的图标(同样走生成的形状数据,不进首屏)。 */
