@@ -66,8 +66,9 @@ MIN_FORBIDDEN_RELATIVE_PATHS=()
 # Serving predecessor compatibility only: pre-admin/taskboard releases may lack
 # the two admin prompt variants and the cursor/taskboard skills; releases built
 # before the SSH skill landed may lack that skill too; serving releases before
-# the 2026-09-05 sync (2887d6d4b) may lack multi-model-review. New releases
-# remain exact-manifest strict.
+# the 2026-09-05 sync (2887d6d4b) may lack multi-model-review; serving releases
+# before the OCV5-388 sync (da13df566) may lack the 同花顺 plugin skill ths. New
+# releases remain exact-manifest strict.
 ALLOW_LEGACY_BASELINE_GAPS=0
 
 die() {
@@ -160,7 +161,7 @@ assert_structure() { # <baseline-dir>
     # Serving releases before 2026-09-05 sync (2887d6d4b) have no
     # multi-model-review in baseline; legacy mode allows only that extra gap.
     # New releases remain exact-manifest strict.
-    for skill in cursor-cli manage-taskboard ssh multi-model-review; do
+    for skill in cursor-cli manage-taskboard ssh multi-model-review ths; do
       if [[ ! -e "$root/skills/$skill" ]]; then
         skills_expected="$(grep -vx "$skill" <<<"$skills_expected")"
       fi
@@ -178,7 +179,7 @@ assert_structure() { # <baseline-dir>
   for skill in "${EXPECTED_SKILLS[@]}"; do
     if [[ "$ALLOW_LEGACY_BASELINE_GAPS" == 1 && ! -e "$root/skills/$skill" ]]; then
       case "$skill" in
-        cursor-cli|manage-taskboard|ssh|multi-model-review) continue ;;
+        cursor-cli|manage-taskboard|ssh|multi-model-review|ths) continue ;;
       esac
     fi
     assert_skill_inner "$root" "$skill"
