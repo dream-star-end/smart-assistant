@@ -2,13 +2,14 @@
 
 > 2026-10-13 · 外机 cc3 · 范围：V5 个人版（feat/v5-selfhost @ fe489dedf）。只上 AI 市场、不预装；商业版不动。
 > 用户 12:10 CST：「把 B 站插件适配到个人版……公开接口部分用 declarative-http，要处理 wbi 签名和风控；字幕、收藏、历史这些需要登录的功能，用 managed-browser 扫码登录，参考现有知乎和微博插件的做法。cookie 是敏感凭据，绝不能打印。智能 UI 组件要配齐……必须遵守按需加载规则……先写 FINDINGS，再实现，按连接器审查流程发布成带版本号的市场条目。」
+> 修订（同日 13:4x）：补测签名校验——普通 view 412、wbi/view 不签也 200、search 错签返回空结果；风控改用现有错误码。
 > 方法：只读走读源码（文件:行号见下，路径相对 `packages/commercial/src/`，另注明的除外）；从 v5-dev（与个人版 master 同一出口 IP，马来西亚机房段）用标准库脚本直接探测 B 站公开接口，不带任何登录态。
 
 ## 一句话结论
 
 参考插件（dream-star-end/agent-plugins@1ea1f55 `bili/`，MIT）是一个在本机跑的 Python CLI，凭据存在 `~/.bili_auth.json`。照搬到平台有三处接不上：
 
-1. **declarative-http 目前做不了 B 站公开接口**：没有免凭据模式；没有请求签名钩子（builtin 白名单是空集合）；只认 JSON 响应（弹幕是 deflate 压缩的 XML）。从机房 IP 不签名调 `x/web-interface/view` 直接 **412**，签了 WBI 的 `x/web-interface/wbi/view` 是 **200**，所以签名不是锦上添花，详情接口没有它就不通。
+1. **declarative-http 目前做不了 B 站公开接口**：没有免凭据模式；没有请求签名钩子（builtin 白名单是空集合）；只认 JSON 响应（弹幕是 deflate 压缩的 XML）。从机房 IP 调普通 `x/web-interface/view` 直接 **412**，详情只能走 WBI 接口族 `x/web-interface/wbi/view`（200）；搜索接口带错误签名时返回 code 0 但**结果为空**（实测 101 字节），说明签名在服务端被校验。WBI 签名是 B 站网页前端的标准做法，不是锦上添花。
 2. **一个市场条目只能是一种运行时**（`plugin_type` 按 listing 固定），所以「公开接口走 declarative-http、登录功能走 managed-browser」必须是**两个条目**。
 3. **市场插件条目带不了自己的 SKILL.md**，Agent 只能从动作描述和基线技能 `app-connectors` 学用法；按需加载的组件登记机制（OCV5-393）也挂在基线技能目录上。
 
@@ -34,9 +35,9 @@
 | `x/web-interface/nav`（取 WBI 密钥） | 200，code -101（未登录，但 `wbi_img` 照给） | — | 否 | |
 | `x/frontend/finger/spi`（取 buvid3/4） | 200 | — | 否 | |
 | `x/web-interface/view?bvid=` | **412** | **412** | — | 机房 IP 风控 |
-| `x/web-interface/wbi/view`（签名） | — | **200 code 0**，5.5KB | **是** | 详情只能走这个 |
+| `x/web-interface/wbi/view`（签名） | — | **200 code 0**，5.5KB | 按前端签（本次实测不签也 200，可能随风控收紧） | 详情只能走这个 |
 | `x/web-interface/view/detail` | — | 412 | — | |
-| `x/web-interface/wbi/search/type` | 200 | 200，约 29KB | 现在不签也过，按官方前端签 | |
+| `x/web-interface/wbi/search/type` | 200 | 200，约 29KB | **是**：错误签名返回 code 0 但结果为空（101 字节） | |
 | `x/web-interface/ranking/v2?rid=&type=all` | 200 | 200，**160–177KB** | 否 | 原始体大，需投影 |
 | `x/web-interface/popular` | 200 | 200 | 否 | |
 | `x/v2/reply/wbi/main`（签名） / `x/v2/reply/main` | — | 200 / 200 | 用签名版 | |
@@ -51,7 +52,7 @@
 | # | 缺口 | 证据 | 对 bili 的影响 |
 |---|---|---|---|
 | D1 | 没有免凭据模式：`AuthMode` 七种都要凭据；执行引擎只解析 static-token / oauth2 / token-exchange；市场自助发布还强制 identity probe | `spec/types.ts:187-195`、`engine/tokenEngine.ts:135-172`、`marketplace/publishConnectorPipeline.ts:98-99,110-126`、`engine/bind.ts:181-185` | 公开接口没法绑定，也就没法调用（RPC 按连接行调度，`connectors/rpc.ts:893-915`） |
-| D2 | 没有请求签名：`requestTransform / operation / resultTransform` schema 收、但 `BUILTIN_ALLOWLIST = new Set()`，任何引用编译期 `BUILTIN_NOT_ALLOWED`；编译结果 `ExecAction` 也不带这些字段 | `spec/compiler.ts:52-58,646-650,676-683` | 算不了 `wts` + `w_rid`，详情 412 |
+| D2 | 没有请求签名：`requestTransform / operation / resultTransform` schema 收、但 `BUILTIN_ALLOWLIST = new Set()`，任何引用编译期 `BUILTIN_NOT_ALLOWED`；编译结果 `ExecAction` 也不带这些字段 | `spec/compiler.ts:52-58,646-650,676-683` | 算不了 `wts` + `w_rid`，搜索结果为空 |
 | D3 | 不能串联请求（先 nav 取密钥 / 先 spi 取 buvid） | 只有 token-exchange 一种链，产物是凭据槽 | 同上 |
 | D4 | 只收 JSON：非 2xx 不读体；2xx 体 ≤4MB 且必须 `JSON.parse` 成功 | `engine/driver.ts:234-248`、`connectors/providers/shared.ts:144-245` | 弹幕 XML 不可用 |
 | D5 | 结果按 result schema 投影，≤256KB、深度 ≤8、数组 ≤200 | `engine/driver.ts:73-105` | 排行原始体 177KB 没问题，投影后很小；深度够用（`data.list[].owner.name` 为 4 层） |
@@ -66,7 +67,7 @@
    - `bilibili-dm-xml`（resultTransform）：仅对声明了它的动作放开「非 JSON 体」——raw deflate / gzip 解压（解压后 ≤4MB 上限）、只认 `<d p="…">文本</d>` 的正则解析（不引 XML 解析器、不解实体以外的任何东西），输出 `{cid, total, items:[{t, text, sentAt}]}`，再走正常的 result 投影。
    - 编译：`ExecAction` 带上 `requestTransform/resultTransform`，`COMPILER_VERSION` 1→2（契约哈希随之变化；已签的旧契约照旧按 v1 校验，不受影响——实现时用测试钉住）。
    - **只有平台能用**：自助发布（网页 / `oc-market`）遇到任何 builtin 一律拒（新增错误码 `BUILTIN_PLATFORM_ONLY`），AI 审查提示写明 builtin 的语义；只有官方 seed 走的路径可以带。
-3. **风控处理**：固定桌面 UA + `Referer: https://www.bilibili.com/`；`-352/-412/-799`、HTTP 412 统一映射为 `UPSTREAM_RISK_CONTROL`（中文提示「B 站风控拦截，稍后再试」），并让 `bilibili-wbi` 作废缓存的 buvid/密钥后**最多重试一次**；保留现有每连接并发 2 的闸，不加重试风暴。
+3. **风控处理**：固定桌面 UA + `Referer: https://www.bilibili.com/`；`-352/-412/-799`、HTTP 412 统一映射为现有错误码 `UPSTREAM_RATE_LIMITED`（中文提示「上游风控拦截，请稍后再试」，不新增错误码，CLI 与前端的既有映射直接可用），并让 `bilibili-wbi` 作废缓存的 buvid/密钥后**最多重试一次**；保留现有每连接并发 2 的闸，不加重试风暴。
 
 ### 3.2 公开条目 `bili` 的动作（全部只读）
 
