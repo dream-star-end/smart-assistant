@@ -149,10 +149,33 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
     }
 
     async function frameInView(page, locator, name) {
-      await locator.waitFor();
-      const visible = await locator.evaluate((el) => {
+      // OCV5-409: when a turn settles, its live timeline row is replaced by the persisted row. CI caught
+      // the matched node already detached (connected:false, chain ending in chat-timeline-row-live), so
+      // a detached match is re-resolved a few times; a connected node outside the list still fails.
+      let visible;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        await locator.waitFor();
+        visible = await locator.evaluate(measureFrame);
+        if (!(visible.reason === "missing" && visible.connected === false)) break;
+        await page.waitForTimeout(100);
+      }
+      assert.ok(visible.ok, `${name} not in view: ${JSON.stringify(visible)}`);
+      evidence.frames.push({ name, ...visible });
+      return visible;
+    }
+
+    function measureFrame(el) {
         const scroller = el.closest(".chat-scroll-area");
-        if (!(scroller instanceof HTMLElement) || !(el instanceof HTMLElement)) return { ok: false, reason: "missing" };
+        if (!(scroller instanceof HTMLElement) || !(el instanceof HTMLElement)) {
+          const chain = [];
+          for (let n = el; n && chain.length < 14; n = n.parentElement) {
+            const id = n.id ? `#${n.id}` : "";
+            const testId = n.getAttribute?.("data-testid") ? `[${n.getAttribute("data-testid")}]` : "";
+            const classes = String(n.className || "").split(/\s+/).slice(0, 3).join(".");
+            chain.push(`${n.tagName.toLowerCase()}${id}${testId}.${classes}`);
+          }
+          return { ok: false, reason: "missing", connected: el.isConnected, scrollers: document.querySelectorAll(".chat-scroll-area").length, chain };
+        }
         const view = scroller.getBoundingClientRect();
         const row = el.getBoundingClientRect();
         scroller.scrollTop += row.top - view.top - 28;
@@ -167,10 +190,6 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
           viewBottom: Math.round(box.bottom),
           text: (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 90),
         };
-      });
-      assert.ok(visible.ok, `${name} not in view: ${JSON.stringify(visible)}`);
-      evidence.frames.push({ name, ...visible });
-      return visible;
     }
 
     async function shotFramed(page, locator, name) {
@@ -436,7 +455,15 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.ok(afterTokens.gap > 300, `new tokens pulled back to the bottom: ${JSON.stringify(afterTokens)}`);
       assert.ok(afterTokens.top < scrolled.top + 80, `viewport moved toward the bottom ${scrolled.top} -> ${afterTokens.top}`);
       const liveToggle = desktop.page.getByTestId("process-toggle").last();
-      assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "active process hid the current step");
+      // OCV5-409: read "still active" and "expanded" in one DOM snapshot. A separate read after the
+      // stream had already finished saw the by-design collapse of a finished turn and failed. While
+      // the turn is active the step must stay open (unchanged); the finished state is asserted below.
+      const liveState = await desktop.page.evaluate(() => ({
+        active: !!document.querySelector("[data-process-active=true]"),
+        expanded: [...document.querySelectorAll("[data-testid=process-toggle]")].at(-1)?.getAttribute("aria-expanded") ?? null,
+      }));
+      evidence.liveToggle = liveState;
+      if (liveState.active) assert.equal(liveState.expanded, "true", "active process hid the current step");
       await desktop.page.getByText("南仓预警已补进看板").waitFor();
       const liveStagePlacement = await desktop.page.evaluate(() => {
         const textIn = (selector, needle) => [...document.querySelectorAll(selector)].some((el) => el.textContent?.includes(needle));
@@ -446,16 +473,20 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
           previousOpen: textIn("[data-testid=process-stage]", "冻结库存仍然不进看板"),
           previousFolded: textIn("[data-testid=process-stage-toggle]", "冻结库存仍然不进看板"),
           active: document.querySelector("[data-process-active=true]") ? "true" : "false",
+          // OCV5-409: same snapshot as `active`, so a turn that finished in between cannot be read as collapsed-while-live.
+          expanded: [...document.querySelectorAll("[data-testid=process-toggle]")].at(-1)?.getAttribute("aria-expanded") ?? null,
         };
       });
       if (liveStagePlacement.answerInProcess) {
         assert.equal(liveStagePlacement.previousOpen, true, `previous stage unmounted after the answer started: ${JSON.stringify(liveStagePlacement)}`);
-        assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "process collapsed while tokens arrived");
+        if (liveStagePlacement.active === "true") {
+          assert.equal(liveStagePlacement.expanded, "true", "process collapsed while tokens arrived");
+        }
       } else {
         assert.equal(liveStagePlacement.answerOutside, true, `streaming answer left both the work area and the answer card: ${JSON.stringify(liveStagePlacement)}`);
         if (liveStagePlacement.active === "true") {
           assert.equal(liveStagePlacement.previousOpen, true, `stage collapsed after the answer left the shell: ${JSON.stringify(liveStagePlacement)}`);
-          assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "process collapsed while tokens arrived");
+          assert.equal(liveStagePlacement.expanded, "true", "process collapsed while tokens arrived");
         }
       }
       await desktop.page.getByTestId("scroll-to-bottom").click();
@@ -486,7 +517,10 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       }));
       assert.equal(pureChrome.inProcess, false, "plain chat grew a process shell");
       assert.equal(pureChrome.avatar, false, "plain chat answer still has an avatar");
-      await shotFramed(desktop.page, pureAnswer, "ocv5-265-avatar-polish-pure");
+      // OCV5-409: frame the copy inside the message list. The page-wide match could resolve, for a
+      // moment, to a node outside .chat-scroll-area (reason "missing" in CI); the chrome checks above
+      // already ran on the page-wide match and are unchanged.
+      await shotFramed(desktop.page, desktop.page.locator(".chat-scroll-area").getByText("还在。可售合计 128，南仓预警已经分开标出。"), "ocv5-265-avatar-polish-pure");
       await desktop.page.getByRole("button", { name: "发送" }).waitFor();
 
       async function fixtureStep() {

@@ -193,6 +193,18 @@
       "reason": "The approved general-assistant@1.0.0 preset pinned glm-5.3-zai while the code said auto under the same version; the seed refused it on every start. Version bump + hash-pinning test.",
       "approvedBy": "operator 2026-10-11 「这个按建议让cc3改，改的过程有啥问题都顺手修下」(OCV5-376)",
       "expiresAt": "2026-11-08"
+    },
+    {
+      "commit": "1f4e95be548610b2e99ff3d82eb36c3cc55ddf9a",
+      "reason": "Antigravity relay prefix was a raw /internal/v5 literal missing from the internal route registry; only the commercial-unit contract test failed during the OCV5-411 two-tree sync. Engine is hidden and fail-closed, no user-visible behaviour, billing or data change.",
+      "approvedBy": "user 2026-10-14 要求在个人版正规修复内部路由注册表登记 (OCV5-415, cc3-sync 反馈)",
+      "expiresAt": "2026-11-13"
+    },
+    {
+      "commit": "6fda2cdf1a509994fe80811bc776e15f76c3a600",
+      "reason": "Antigravity relay prefix was a raw /internal/v5 literal missing from the internal route registry; only the commercial-unit contract test failed during the OCV5-411 two-tree sync. Engine is hidden and fail-closed, no user-visible behaviour, billing or data change. Commercial cherry-pick -x of selfhost 1f4e95be5 (same patch); mirrors that waiver.",
+      "approvedBy": "user 2026-10-14 要求在个人版正规修复内部路由注册表登记 (OCV5-415, cc3-sync 反馈)",
+      "expiresAt": "2026-11-13"
     }
   ]
 }

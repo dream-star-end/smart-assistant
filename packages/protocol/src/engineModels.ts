@@ -291,6 +291,76 @@ export function zcodeTransportModelId(modelId: string | undefined): string | und
 }
 
 /**
+ * Official Google Antigravity CLI (`agy`/`antigravity`) engine (OCV5-415).
+ *
+ * Hidden and experimental: no catalog row, no relay wiring yet. Everything
+ * below was read from the pinned 1.3.4 linux-x64 binary with a fake key and a
+ * loopback mock (docs/ocv5-415-antigravity-cli.md), not from secondary docs.
+ *
+ * - `cliFamily` + effort → the exact `agy models` id passed to `--model`
+ *   (e.g. `gemini-3.1-pro-high`). The CLI's own `--effort` flag is not used:
+ *   with a family id it silently picks the maximum thinking budget.
+ * - `upstreamModels` are the Gemini API model names the CLI actually requests
+ *   for that family. A relay must accept only these plus
+ *   ANTIGRAVITY_AUX_UPSTREAM_MODELS and bill every call it forwards.
+ */
+export const ANTIGRAVITY_CLI_VERSION = '1.3.4'
+/** Title generation call the CLI makes on every new conversation. It is NOT
+ * included in the CLI's own `result.usage`, so CLI usage alone under-bills. */
+export const ANTIGRAVITY_AUX_UPSTREAM_MODELS = ['gemini-3.1-flash-lite-preview'] as const
+export const ANTIGRAVITY_ENGINE_MODELS = [
+  {
+    id: 'antigravity-gemini-3.1-pro',
+    displayName: 'Gemini 3.1 Pro (Antigravity)',
+    cliFamily: 'gemini-3.1-pro',
+    efforts: ['low', 'high'],
+    defaultEffort: 'high',
+    upstreamModels: ['gemini-3.1-pro-preview', 'gemini-3.1-pro-preview-customtools'],
+    experimental: true,
+  },
+  {
+    id: 'antigravity-gemini-3.8-flash',
+    displayName: 'Gemini 3.8 Flash (Antigravity)',
+    cliFamily: 'gemini-3.8-flash',
+    efforts: ['low', 'medium', 'high'],
+    defaultEffort: 'medium',
+    upstreamModels: ['gemini-3.8-flash'],
+    experimental: true,
+  },
+] as const
+
+export const ANTIGRAVITY_ENGINE_MODEL_IDS = ANTIGRAVITY_ENGINE_MODELS.map((m) => m.id)
+export type AntigravityEngineModelId = (typeof ANTIGRAVITY_ENGINE_MODELS)[number]['id']
+export const DEFAULT_ANTIGRAVITY_ENGINE_MODEL: AntigravityEngineModelId = ANTIGRAVITY_ENGINE_MODELS[0].id
+
+export function isAntigravityEngineModel(modelId: string | null | undefined): boolean {
+  return (
+    typeof modelId === 'string' &&
+    (ANTIGRAVITY_ENGINE_MODEL_IDS as readonly string[]).includes(modelId)
+  )
+}
+
+/** Exact `--model` value for a canonical id. Unknown efforts fall back to the
+ * model default; unknown models return undefined (callers fail closed). */
+export function antigravityCliModelId(
+  modelId: string | undefined,
+  effort: string | undefined,
+): string | undefined {
+  const entry = ANTIGRAVITY_ENGINE_MODELS.find((m) => m.id === modelId)
+  if (!entry) return undefined
+  const efforts = entry.efforts as readonly string[]
+  const level = effort && efforts.includes(effort) ? effort : entry.defaultEffort
+  return `${entry.cliFamily}-${level}`
+}
+
+/** Upstream Gemini model names a relay may forward for this canonical id. */
+export function antigravityAllowedUpstreamModels(modelId: string | undefined): readonly string[] {
+  const entry = ANTIGRAVITY_ENGINE_MODELS.find((m) => m.id === modelId)
+  if (!entry) return []
+  return [...entry.upstreamModels, ...ANTIGRAVITY_AUX_UPSTREAM_MODELS]
+}
+
+/**
  * Pinned official Cursor Agent CLI model allowlist.
  *
  * `id` is the OpenClaude-facing canonical model. `upstreamModel` is either the
@@ -1529,6 +1599,11 @@ export function modelReasoningPolicy(modelId: string): ModelReasoningPolicy {
 
   if (isZcodeEngineModel(modelId)) {
     return { supported: [], codexModelDefault: null }
+  }
+
+  const antigravity = ANTIGRAVITY_ENGINE_MODELS.find((m) => m.id === modelId)
+  if (antigravity) {
+    return { supported: antigravity.efforts, codexModelDefault: null }
   }
 
   const provider = findRouteProviderForModel(modelId)

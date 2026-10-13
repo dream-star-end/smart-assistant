@@ -7389,6 +7389,25 @@
           "assertion": "bili-account subtitle reads the hdslb CDN without cookies (real Chromium)"
         }
       ]
+    },
+    {
+      "id": "INC-20261014-SELFHOST-C3-GROK-REFUSAL",
+      "occurredAt": "2026-10-13",
+      "severity": "P2",
+      "symptom": "个人版发布门 C3（OCV5-405 加的同会话两轮续聊）间歇失败：列车 tr-20261013T154627Z-88bedd725341、tr-20261013T180914Z-8b903c187017 报 \"Continuation turn did not recall the first turn's code\"，阻塞当晚多张票上线。canary c:765 的会话 webmv6vjd21rhc6ye / webmv70jgcra9qd6m 显示 grok-build 把第一轮「请记住暗号 X。本轮请只回答数字2」判为 prompt injection canary，拒绝记住也拒绝复述；上下文完好（通过的会话 webmv6zrfe1ddgcr0 第二轮答出暗号）。修复：提示词改为登记采购单编号 PO-<code>，第二轮询问编号；门禁判定不变。",
+      "rootFixCommit": "40842e86",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5UserContract.test.ts",
+          "assertion": "continuation code is random letters+digits and only the first prompt carries it"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/user-contract.node-test.mjs",
+          "assertion": "INC-20261014-SELFHOST-C3-GROK-REFUSAL: turn 1 registers a PO-<code> order number and turn 2 recalls it"
+        }
+      ]
     }
   ]
 }

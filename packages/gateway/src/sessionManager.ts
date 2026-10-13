@@ -144,6 +144,7 @@ import {
   usableCursorResumeId,
 } from './engine/cursorAdapter.js'
 import './engine/zcodeAdapter.js'
+import './engine/antigravityAdapter.js'
 import {
   RESUME_HISTORY_MAX,
   pickResumableId,
@@ -757,7 +758,8 @@ export function pickIdleTimeoutMs(
     engineId === 'codex' ||
     engineId === 'grok' ||
     engineId === 'cursor' ||
-    engineId === 'zcode'
+    engineId === 'zcode' ||
+    engineId === 'antigravity'
   ) {
     return IDLE_TIMEOUT_TOOL_MS
   }
@@ -3730,6 +3732,7 @@ export class SessionManager {
     if (tag === 'grok') return 'grok'
     if (tag === 'cursor') return 'cursor'
     if (tag === 'zcode') return 'zcode'
+    if (tag === 'antigravity') return 'antigravity'
     return SessionManager.CCB_PROVIDER_TAG
   }
 
@@ -3975,7 +3978,7 @@ export class SessionManager {
      */
     executionAuthority?: {
       canonicalModel: string
-      engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
+      engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity'
       source?: 'bridge_signed' | 'local_catalog'
     }
     /**
