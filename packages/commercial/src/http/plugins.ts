@@ -8,6 +8,8 @@ import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetu
 import { localPluginsForUser } from '../plugins/localPlugins.js'
 import { KnowledgePlanetSetupError } from '../plugins/knowledgePlanetSetup.js'
 import type { PluginRuntimeFacade } from '../plugins/runtime.js'
+import type { BiliAccountSetupManager } from '../plugins/biliAccountSetup.js'
+import { BiliAccountSetupError } from '../plugins/biliAccountSetup.js'
 import { PluginRuntimeFacadeError } from '../plugins/runtime.js'
 import { resolvePluginErrorGuidance } from '../plugins/pluginErrorGuidance.js'
 import type { WeiboSetupManager } from '../plugins/weiboSetup.js'
@@ -23,6 +25,7 @@ export interface PluginHttpDeps {
   knowledgePlanetSetup?: KnowledgePlanetSetupManager
   weiboSetup?: WeiboSetupManager
   zhihuSetup?: ZhihuSetupManager
+  biliAccountSetup?: BiliAccountSetupManager
   knowledgePlanetAutomation?: KnowledgePlanetAutomationService
 }
 
@@ -33,8 +36,12 @@ function userIdFrom(value: string): number {
   return id
 }
 
-type ManagedSetupProvider = 'knowledge-planet' | 'weibo' | 'zhihu'
-type ManagedSetupManager = KnowledgePlanetSetupManager | WeiboSetupManager | ZhihuSetupManager
+type ManagedSetupProvider = 'knowledge-planet' | 'weibo' | 'zhihu' | 'bili-account'
+type ManagedSetupManager =
+  | KnowledgePlanetSetupManager
+  | WeiboSetupManager
+  | ZhihuSetupManager
+  | BiliAccountSetupManager
 
 function setupManager(
   deps: CommercialHttpDeps & PluginHttpDeps,
@@ -50,6 +57,10 @@ function setupManager(
 ): ZhihuSetupManager
 function setupManager(
   deps: CommercialHttpDeps & PluginHttpDeps,
+  provider: 'bili-account',
+): BiliAccountSetupManager
+function setupManager(
+  deps: CommercialHttpDeps & PluginHttpDeps,
   provider: ManagedSetupProvider,
 ): ManagedSetupManager
 function setupManager(
@@ -61,7 +72,9 @@ function setupManager(
       ? deps.knowledgePlanetSetup
       : provider === 'weibo'
         ? deps.weiboSetup
-        : deps.zhihuSetup
+        : provider === 'zhihu'
+          ? deps.zhihuSetup
+          : deps.biliAccountSetup
   if (!manager) throw pluginHttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
   return manager
 }
@@ -120,7 +133,8 @@ function mapSetupError(error: unknown): never {
   if (
     !(error instanceof KnowledgePlanetSetupError) &&
     !(error instanceof WeiboSetupError) &&
-    !(error instanceof ZhihuSetupError)
+    !(error instanceof ZhihuSetupError) &&
+    !(error instanceof BiliAccountSetupError)
   )
     throw error
   switch (error.code) {
@@ -188,7 +202,9 @@ function setupMatch(
   path: string,
 ): { provider: ManagedSetupProvider; sessionId: string; qr: boolean } | null {
   const match =
-    /^\/api\/plugins\/(knowledge-planet|weibo|zhihu)\/setup\/([0-9a-f-]{36})(\/qr)?$/.exec(path)
+    /^\/api\/plugins\/(knowledge-planet|weibo|zhihu|bili-account)\/setup\/([0-9a-f-]{36})(\/qr)?$/.exec(
+      path,
+    )
   return match
     ? {
         provider: match[1] as ManagedSetupProvider,
@@ -221,7 +237,7 @@ export async function dispatchPluginsRoute(
     return
   }
 
-  const setupRoot = /^\/api\/plugins\/(knowledge-planet|weibo|zhihu)\/setup$/.exec(path)
+  const setupRoot = /^\/api\/plugins\/(knowledge-planet|weibo|zhihu|bili-account)\/setup$/.exec(path)
   if (method === 'POST' && setupRoot) {
     const raw = await readJsonBody(req, 1024)
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
@@ -250,7 +266,13 @@ export async function dispatchPluginsRoute(
                 body.acceptTerms === true,
                 body.accountId as string | undefined,
               )
-            : await setupManager(deps, provider).start(userId, body.acceptTerms === true)
+            : provider === 'bili-account'
+              ? await setupManager(deps, provider).start(
+                  userId,
+                  body.acceptTerms === true,
+                  body.accountId as string | undefined,
+                )
+              : await setupManager(deps, provider).start(userId, body.acceptTerms === true)
       sendJson(res, 201, setup)
       return
     } catch (error) {

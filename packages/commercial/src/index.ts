@@ -554,6 +554,8 @@ import { WeiboDockerService, createWeiboRuntimeRegistries } from './plugins/weib
 import { WeiboSetupManager } from './plugins/weiboSetup.js'
 import { ZhihuDockerService, createZhihuRuntimeRegistries } from './plugins/zhihu.js'
 import { ZhihuSetupManager } from './plugins/zhihuSetup.js'
+import { BiliAccountDockerService, createBiliAccountRuntimeRegistries } from './plugins/biliAccount.js'
+import { BiliAccountSetupManager } from './plugins/biliAccountSetup.js'
 import { seedDefaultConnectors } from './connectors/declarativeSeed.js'
 import { startConnectorSweeper } from './connectors/sweeper.js'
 import {
@@ -1666,6 +1668,8 @@ export async function registerCommercial(
   let weiboSetup: WeiboSetupManager | undefined
   let zhihuService: ZhihuDockerService | undefined
   let zhihuSetup: ZhihuSetupManager | undefined
+  let biliAccountService: BiliAccountDockerService | undefined
+  let biliAccountSetup: BiliAccountSetupManager | undefined
   let knowledgePlanetAutomation: KnowledgePlanetAutomationService | undefined
   let pluginFacade: PluginRuntimeFacade
   if (runtimeChannel === 'v5' && cfg.OC_RUNTIME_IMAGE_ID) {
@@ -1696,19 +1700,31 @@ export async function registerCommercial(
       socketUid: 1000,
       socketGid: 1000,
     })
+    // OCV5-402: read-only Bilibili account Plugin (market only). Smaller worker cap (2) than Weibo.
+    biliAccountService = new BiliAccountDockerService(pluginDocker, {
+      imageId: cfg.OC_RUNTIME_IMAGE_ID,
+      workerRoot: '/var/lib/openclaude-v5/plugin-workers-bili-account',
+      brokerRoot: '/run/openclaude-v5/plugin-browser-brokers-bili-account',
+      expectedOwnerUid: 0,
+      socketUid: 1000,
+      socketGid: 1000,
+    })
     const knowledgePlanetRegistries = createKnowledgePlanetRuntimeRegistries(knowledgePlanetService)
     const weiboRegistries = createWeiboRuntimeRegistries(weiboService)
     const zhihuRegistries = createZhihuRuntimeRegistries(zhihuService)
+    const biliAccountRegistries = createBiliAccountRuntimeRegistries(biliAccountService)
     const browserRuntime = new ManagedBrowserRuntime({
       drivers: new Map([
         ...knowledgePlanetRegistries.drivers,
         ...weiboRegistries.drivers,
         ...zhihuRegistries.drivers,
+        ...biliAccountRegistries.drivers,
       ]),
       launchers: new Map([
         ...knowledgePlanetRegistries.launchers,
         ...weiboRegistries.launchers,
         ...zhihuRegistries.launchers,
+        ...biliAccountRegistries.launchers,
       ]),
       profileRoot: '/var/lib/openclaude-v5/plugin-browser-profiles',
       expectedOwnerUid: 0,
@@ -1727,6 +1743,10 @@ export async function registerCommercial(
       isAgentReady: (contract) => browserRuntime.supportsContract(contract),
     })
     zhihuSetup = new ZhihuSetupManager(zhihuService, {
+      redis,
+      isAgentReady: (contract) => browserRuntime.supportsContract(contract),
+    })
+    biliAccountSetup = new BiliAccountSetupManager(biliAccountService, {
       redis,
       isAgentReady: (contract) => browserRuntime.supportsContract(contract),
     })
@@ -4288,6 +4308,7 @@ export async function registerCommercial(
     knowledgePlanetSetup,
     weiboSetup,
     zhihuSetup,
+    biliAccountSetup,
     knowledgePlanetAutomation,
     mailer,
     redis: wrapIoredis(redis),
@@ -7028,6 +7049,7 @@ export async function registerCommercial(
           knowledgePlanetSetup?.closeAndDrain(),
           weiboSetup?.closeAndDrain(),
           zhihuSetup?.closeAndDrain(),
+          biliAccountSetup?.closeAndDrain(),
         ])
       } catch {
         /* ignore */
