@@ -198,6 +198,7 @@ import {
   forwardRecoveryUnderRootFence,
   markRecoveryContainerReceipt,
   releaseRecoveryPreReceipt,
+  pauseRecoveryForRefusal,
   releaseRecoveryForTransportWait,
   type ClaimedRecoveryJob,
 } from "../dispatch/turnRecoveryStore.js";
@@ -539,6 +540,13 @@ function promptQueueDispositionForCode(
   return /^(?:ERR_INSUFFICIENT_CREDITS|INSUFFICIENT_CREDITS|MODEL_NOT_AVAILABLE|UNAUTHORIZED_MODEL|UNRESOLVED_AGENT_MODEL|AGENT_NOT_FOUND|INVALID_|ERR_FRAME_TOO_BIG)/.test(code)
     ? "user_action_required"
     : "retryable";
+}
+
+/** OCV5-391: what a refused scheduler replay does with its recovery job. A refusal the user has
+ * to act on (retired or unauthorized model, credits, agent, invalid input) never succeeds by
+ * waiting, so the job stops; anything else waits for the next attempt. */
+export function _recoveryRefusalAction(code: string): "pause" | "requeue" {
+  return promptQueueDispositionForCode(code) === "user_action_required" ? "pause" : "requeue";
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -4708,6 +4716,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 clientMessageId,
                 reason: admit.reason,
               });
+              // OCV5-391: the lineage never becomes valid later; stop the scheduler's job.
+              if (recoveryJob && deps.pgPool) {
+                void pauseRecoveryForRefusal(deps.pgPool, recoveryJob, `recovery_conflict:${admit.reason}`)
+                  .catch(() => {});
+              }
               sendRecoverySkippedAck(admit.reason);
               return null;
             case "session_busy":
@@ -4949,7 +4962,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       let promptQueueFallbackTimer: ReturnType<typeof setTimeout> | null = null;
       const rejectPromptQueueDispatch = (reasonCode: string): void => {
         if (recoveryJob && deps.pgPool) {
-          void releaseRecoveryForTransportWait(deps.pgPool, recoveryJob).catch(() => {});
+          // OCV5-391: a policy refusal (UNAUTHORIZED_MODEL for a retired model, credits, …)
+          // stops the recovery job; only transient refusals wait for the next attempt.
+          void (_recoveryRefusalAction(reasonCode) === "pause"
+            ? pauseRecoveryForRefusal(deps.pgPool, recoveryJob, reasonCode)
+            : releaseRecoveryForTransportWait(deps.pgPool, recoveryJob)).catch(() => {});
         }
         if (!dispatchRequest || promptQueueResolved) return;
         promptQueueResolved = true;

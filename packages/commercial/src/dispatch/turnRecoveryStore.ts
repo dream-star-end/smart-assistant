@@ -326,6 +326,27 @@ export async function releaseRecoveryForTransportWait(
   return result.rowCount === 1
 }
 
+/** OCV5-391: a definitive refusal of a scheduler replay (model not authorized or retired, no
+ * credits, agent gone, a recovery lineage conflict) can never succeed by waiting. The job stops
+ * (`paused`, reason `refused:<code>`) instead of returning to the queue every five minutes for
+ * as long as the user keeps a page open. Only transport failures go back to the queue. */
+export async function pauseRecoveryForRefusal(
+  pool: Pool,
+  job: Pick<ClaimedRecoveryJob, 'jobId' | 'leaseOwner' | 'leaseEpoch'>,
+  reason: string,
+): Promise<boolean> {
+  const pauseReason = `refused:${reason}`.replace(/[^A-Za-z0-9_:.-]/g, '_').slice(0, 96)
+  const result = await pool.query(
+    `UPDATE turn_recovery_jobs
+        SET status='paused',pause_reason=$4,terminal_outcome='interrupted',
+            lease_owner=NULL,lease_until=NULL,updated_at=NOW()
+      WHERE job_id=$1 AND status='leased' AND lease_owner=$2 AND lease_epoch=$3
+        AND dispatch_id IS NULL`,
+    [job.jobId, job.leaseOwner, job.leaseEpoch, pauseReason],
+  )
+  return result.rowCount === 1
+}
+
 /** Atomically unwind scheduler ownership after a send-unknown failure before
  * the container's durable receipt. The dispatch row/id/attempt/request hash
  * deliberately remain intact: takeover reuses that exact envelope, and the
