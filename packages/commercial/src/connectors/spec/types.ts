@@ -124,6 +124,10 @@ export const RequestSpec = Type.Object(
     // 静态请求头(非凭据):如 Notion-Version / Accept / X-GitHub-Api-Version。值为可打印 ASCII、
     // 无 CRLF;名字禁 Authorization/Host/Content-Type(编译器强制,凭据/SSRF/编码保留头不可被覆盖)。
     staticHeaders: Type.Optional(Type.Record(HeaderName, Type.String({ maxLength: 512 }))),
+    // 静态 query(非凭据,OCV5-402):上游要求的固定参数,如 B 站 `type=all`、`search_type=video`。
+    // 与 staticHeaders 同为审签字面量(签进 contract);名字不得与 `query` 重复(编译器强制),
+    // 值为可打印字符、无控制符。
+    staticQuery: Type.Optional(Type.Record(QueryName, Type.String({ maxLength: 512 }))),
   },
   strict,
 )
@@ -182,9 +186,15 @@ export const TokenOutputs = Type.Object(
 )
 export type TokenOutputsT = Static<typeof TokenOutputs>
 
-// ─── authMode(§3 七种) ─────────────────────────────────────────────────────
+// ─── authMode(§3 七种 + none) ──────────────────────────────────────────────
 
+/**
+ * `none`(OCV5-402):公开接口,无任何用户凭据 —— 无 placement、无 bind 字段、无 identity probe。
+ * 只给平台官方工件用(loadVerifiedContract / 审核时按 `isOfficialConnectorArtifact` 精确 pin 收口;
+ * 社区发布管线显式拒)。连接行仍然存在(空凭据袋),以复用停用开关、并发闸与审计。
+ */
 export const AuthMode = Type.Union([
+  Type.Literal('none'),
   Type.Literal('static-token'),
   Type.Literal('oauth2-auth-code'),
   Type.Literal('token-exchange'),
@@ -382,6 +392,9 @@ const Oauth1aAuth = Type.Object(
   strict,
 )
 
+/** 公开接口:没有任何凭据配置(OCV5-402)。 */
+const NoneAuth = Type.Object({}, strict)
+
 /** 协议适配器:origin/host 用户 bind 时冻结(§1.2 user-bound);无 HTTP placement。 */
 const ImapSmtpAuth = Type.Object({}, strict)
 const WebdavBasicAuth = Type.Object({}, strict)
@@ -403,6 +416,7 @@ export type TokenAcquisitionT = Static<typeof TokenAcquisition>
 
 /** authMode → 该模式权威 auth schema(编译器逐字段校验用)。 */
 export const AUTH_SCHEMAS: Record<AuthModeValue, TObject> = {
+  none: NoneAuth,
   'static-token': StaticTokenAuth,
   'oauth2-auth-code': Oauth2Auth,
   'token-exchange': TokenExchangeAuth,
@@ -463,6 +477,7 @@ export const ConnectorSpec = Type.Object(
     authMode: AuthMode,
     // 放宽为 Union;权威校验 = 编译器 AUTH_SCHEMAS[authMode]。
     auth: Type.Union([
+      NoneAuth,
       StaticTokenAuth,
       Oauth2Auth,
       TokenExchangeAuth,
@@ -514,6 +529,12 @@ export const ExecAction = Type.Object(
     params: JsonSchemaObject,
     result: JsonSchemaObject,
     apiCredentialPlacements: Type.Array(ApiCredentialPlacement, { maxItems: 8 }),
+    /**
+     * 平台 builtin(OCV5-402,切片②):只在声明了它的 action 上出现,随 contract 一起签名。
+     * 旧契约没有这两个字段,形状与 hash 不变。具体实现与白名单见 `connectors/builtins/`。
+     */
+    requestTransform: Type.Optional(BuiltinId),
+    resultTransform: Type.Optional(BuiltinId),
   },
   strict,
 )
@@ -579,6 +600,7 @@ export type ConnectorSpecErrorCode =
   | 'RESERVED_HEADER'
   | 'BAD_PLACEMENT'
   | 'BUILTIN_NOT_ALLOWED'
+  | 'BUILTIN_PLATFORM_ONLY'
   | 'PIPELINE_INVALID'
   | 'PIPELINE_CYCLE'
   | 'SLOT_UNKNOWN'

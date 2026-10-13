@@ -23,6 +23,7 @@
  * "SSRF 失败 = 零凭据外泄"成立,无需在 SSRF 与注入之间再插一次 DNS 解析。
  */
 
+import { requestBuiltin, resultBuiltin } from '../builtins/runtime.js'
 import { ConnectorError, toConnectorError } from '../errors.js'
 import { type DnsResolver, pinnedHttpsFetch } from '../outboundPolicy.js'
 import {
@@ -208,44 +209,72 @@ export async function engineHttpRequest(input: EngineHttpRequestInput): Promise<
       )
     }
 
-    // ③+④ 注入凭据(仅 origin 匹配后到达)。upload 受众永不带凭据。
-    const injected =
-      credentialAudience === 'upload'
-        ? toUnauthenticatedRequest(plan)
-        : injectCredentials(plan, action.apiCredentialPlacements, resolvedCreds)
-    if (injected.sensitiveValues.length > 0) secrets = [...secrets, ...injected.sensitiveValues]
+    // 平台 builtin(OCV5-402,签进 contract;只有官方工件能载入到这里)。
+    const reqBuiltin =
+      action.requestTransform !== undefined ? requestBuiltin(action.requestTransform) : undefined
+    const resBuiltin =
+      action.resultTransform !== undefined ? resultBuiltin(action.resultTransform) : undefined
+    // 风控(412 / 业务码)时作废缓存的签名材料重试一次;只对 read 生效,写操作绝不自动重发。
+    const maxAttempts = reqBuiltin !== undefined && action.effect === 'read' ? 2 : 1
 
-    // ⑤ SSRF + 发送:复用 pinnedHttpsFetch(全 DNS 校验 + IP 钉死 + redirect:error + 超时)。
-    let res: Response
-    try {
-      res = await pinnedHttpsFetch(
-        new URL(injected.targetUrl),
-        {
-          method: injected.method,
-          headers: injected.headers,
-          ...(injected.body !== undefined ? { body: injected.body } : {}),
-        },
-        { resolver: deps.resolver, fetchImpl: deps.fetchImpl },
-      )
-    } catch (err) {
-      throw mapFetchFailure(err, DRIVER_TAG)
-    }
+    let raw: unknown
+    for (let attempt = 1; ; attempt += 1) {
+      const sendPlan = reqBuiltin !== undefined ? await reqBuiltin.prepare(plan, deps) : plan
+      if (sendPlan.origin !== plan.origin || sendPlan.method !== plan.method)
+        throw new ConnectorError('OUTBOUND_BLOCKED', 'builtin must not change origin or method')
 
-    // ⑥ 响应:非 2xx 吞 body(绝不读 → 上游 body 里的 token 结构上进不来)。
-    if (!res.ok) {
-      await res.body?.cancel().catch(() => {})
-      throw mapUpstreamStatus(res.status, DRIVER_TAG)
+      // ③+④ 注入凭据(仅 origin 匹配后到达)。upload 受众永不带凭据。
+      const injected =
+        credentialAudience === 'upload'
+          ? toUnauthenticatedRequest(sendPlan)
+          : injectCredentials(sendPlan, action.apiCredentialPlacements, resolvedCreds)
+      if (injected.sensitiveValues.length > 0) secrets = [...secrets, ...injected.sensitiveValues]
+
+      // ⑤ SSRF + 发送:复用 pinnedHttpsFetch(全 DNS 校验 + IP 钉死 + redirect:error + 超时)。
+      let res: Response
+      try {
+        res = await pinnedHttpsFetch(
+          new URL(injected.targetUrl),
+          {
+            method: injected.method,
+            headers: injected.headers,
+            ...(injected.body !== undefined ? { body: injected.body } : {}),
+          },
+          { resolver: deps.resolver, fetchImpl: deps.fetchImpl },
+        )
+      } catch (err) {
+        throw mapFetchFailure(err, DRIVER_TAG)
+      }
+
+      // ⑥ 响应:非 2xx 吞 body(绝不读 → 上游 body 里的 token 结构上进不来)。
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {})
+        if (reqBuiltin?.isRiskStatus(res.status)) {
+          reqBuiltin.invalidate(plan.origin)
+          if (attempt < maxAttempts) continue
+          throw new ConnectorError('UPSTREAM_RATE_LIMITED', '上游风控拦截,请稍后再试')
+        }
+        throw mapUpstreamStatus(res.status, DRIVER_TAG)
+      }
+      raw =
+        resBuiltin !== undefined
+          ? await resBuiltin.read(res, DRIVER_TAG)
+          : await readBoundedJson(res, MAX_UPSTREAM_JSON_BYTES, DRIVER_TAG)
+      if (reqBuiltin?.isRiskBlocked(raw)) {
+        reqBuiltin.invalidate(plan.origin)
+        if (attempt < maxAttempts) continue
+        throw new ConnectorError('UPSTREAM_RATE_LIMITED', '上游风控拦截,请稍后再试')
+      }
+      log?.('engine.request.ok', { action: action.id, status: res.status, attempt })
+      break
     }
-    const raw = await readBoundedJson(res, MAX_UPSTREAM_JSON_BYTES, DRIVER_TAG)
 
     // 结果 allowlist 剥字段(白名单外字段丢弃)+ 硬限(256KB/深8/数组200)。
     const cleaned = projectResultAllowlist(action.result, raw)
     enforceResultLimits(cleaned)
 
     // ⑦ 全链脱敏返回值(上游若把 token 回显进白名单字段,也抹掉)。
-    const safeResult = redactDeep(cleaned, secrets)
-    log?.('engine.request.ok', { action: action.id, status: res.status })
-    return safeResult
+    return redactDeep(cleaned, secrets)
   } catch (err) {
     const ce = err instanceof ConnectorError ? err : toConnectorError(err)
     const safe = redactError(ce, secrets)

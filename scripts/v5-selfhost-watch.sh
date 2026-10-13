@@ -41,6 +41,13 @@ WATCH_STUB_PG="${WATCH_STUB_PG:-}"
 WATCH_STUB_REDIS="${WATCH_STUB_REDIS:-}"
 WATCH_STUB_DOCKER="${WATCH_STUB_DOCKER:-}"
 WATCH_SKIP_ACTIONS="${WATCH_SKIP_ACTIONS:-0}"
+# 空字符串表示调用时再落到 $WATCH_RUN_DIR，避免 source 阶段绑死宿主 /run。
+WATCH_STATUS="${WATCH_STATUS:-}"
+WATCH_NOTIFY_STATE="${WATCH_NOTIFY_STATE:-}"
+WATCH_NOTIFY_COOLDOWN_SEC="${WATCH_NOTIFY_COOLDOWN_SEC:-21600}"
+WATCH_INSTALLED_BIN="${WATCH_INSTALLED_BIN:-/opt/openclaude/v5-selfhost-watch/watch.sh}"
+WATCH_REARM_CHECKS="${WATCH_REARM_CHECKS:-3}"
+WATCH_REARM_INTERVAL_SEC="${WATCH_REARM_INTERVAL_SEC:-5}"
 
 wlog() {
   local msg
@@ -548,34 +555,196 @@ compound_green() {
     && probe_egress
 }
 
+# 状态文件与通知只描述许可、是否真的探针、健康三件事。禁止写成 healthy。
+status_path() {
+  if [[ -n "${WATCH_STATUS:-}" ]]; then
+    printf '%s\n' "$WATCH_STATUS"
+  else
+    printf '%s\n' "${WATCH_RUN_DIR}/watch-status"
+  fi
+}
+
+notify_state_path() {
+  if [[ -n "${WATCH_NOTIFY_STATE:-}" ]]; then
+    printf '%s\n' "$WATCH_NOTIFY_STATE"
+  else
+    printf '%s\n' "${WATCH_RUN_DIR}/watch-notify-state"
+  fi
+}
+
+sanitize_status_token() {
+  local s="$1"
+  # 连字符放在字符类末尾，避免 tr 把 +- 当成区间吃掉 deps-pg。
+  s="$(printf '%s' "$s" | tr -cd 'A-Za-z0-9._:,+-')"
+  printf '%s' "${s:0:160}"
+}
+
+recovery_marker_present() {
+  [[ -e "$WATCH_DISARM" ]]
+}
+
+manual_recovery_present() {
+  [[ -e "$WATCH_MANUAL_RECOVERY" ]]
+}
+
+suppression_reason_from_files() {
+  local out="" raw
+  if recovery_marker_present; then
+    raw=""
+    if [[ -f "$WATCH_DISARM" && ! -L "$WATCH_DISARM" ]]; then
+      raw="$(parse_kv_file "$WATCH_DISARM" reason || true)"
+    fi
+    raw="$(sanitize_status_token "${raw:-present}")"
+    out="marker:${raw:-present}"
+  fi
+  if manual_recovery_present; then
+    raw=""
+    if [[ -f "$WATCH_MANUAL_RECOVERY" && ! -L "$WATCH_MANUAL_RECOVERY" ]]; then
+      raw="$(parse_kv_file "$WATCH_MANUAL_RECOVERY" reason || true)"
+    fi
+    raw="$(sanitize_status_token "${raw:-present}")"
+    if [[ -n "$out" ]]; then
+      out="${out},manual:${raw:-present}"
+    else
+      out="manual:${raw:-present}"
+    fi
+  fi
+  printf '%s\n' "$out"
+}
+
+write_watch_status() {
+  local armed="$1" suppression="$2" observed="$3" health="$4"
+  local path dir lock tmp now
+  case "$armed" in
+    true|false) ;;
+    *) return 1 ;;
+  esac
+  case "$observed" in
+    true|false) ;;
+    *) return 1 ;;
+  esac
+  case "$health" in
+    green|red|unobserved) ;;
+    *) return 1 ;;
+  esac
+  suppression="$(sanitize_status_token "$suppression")"
+  path="$(status_path)"
+  dir="$(dirname -- "$path")"
+  mkdir -p -- "$dir" || return 1
+  lock="${dir}/.watch-status.lock"
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  (
+    flock -w 5 9 || exit 1
+    tmp="$(mktemp "${dir}/.watch-status.XXXXXX")" || exit 1
+    trap 'rm -f -- "$tmp"' EXIT
+    {
+      printf 'recovery_armed=%s\n' "$armed"
+      printf 'suppression_reason=%s\n' "$suppression"
+      printf 'observation_executed=%s\n' "$observed"
+      printf 'health=%s\n' "$health"
+      printf 'checked_at=%s\n' "$now"
+    } >"$tmp" || exit 1
+    grep -q '^recovery_armed=' "$tmp" \
+      && grep -q '^suppression_reason=' "$tmp" \
+      && grep -q '^observation_executed=' "$tmp" \
+      && grep -q '^health=' "$tmp" \
+      && grep -q '^checked_at=' "$tmp" \
+      && ! grep -q 'healthy' "$tmp" \
+      || { rm -f -- "$tmp"; exit 1; }
+    chmod 0640 "$tmp" || exit 1
+    mv -T -- "$tmp" "$path" || exit 1
+  ) 9>"$lock"
+}
+
+notify_watch_state() {
+  local armed="$1" suppression="$2" observed="$3" health="$4"
+  local path dir lock fp now last_fp last_at cooldown age should tmp
+  suppression="$(sanitize_status_token "$suppression")"
+  fp="${armed}|${suppression}|${observed}|${health}"
+  now="$(watch_now)"
+  cooldown="${WATCH_NOTIFY_COOLDOWN_SEC:-21600}"
+  [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=21600
+  path="$(notify_state_path)"
+  dir="$(dirname -- "$path")"
+  mkdir -p -- "$dir" || return 1
+  lock="${dir}/.watch-notify.lock"
+  (
+    flock -w 5 9 || exit 1
+    last_fp=""
+    last_at=0
+    if [[ -f "$path" && ! -L "$path" ]]; then
+      last_fp="$(parse_kv_file "$path" fingerprint || true)"
+      last_at="$(parse_kv_file "$path" notified_at || true)"
+    fi
+    should=0
+    if [[ "$fp" != "$last_fp" ]]; then
+      should=1
+    elif [[ "$last_at" =~ ^[0-9]+$ ]]; then
+      age=$(( now - last_at ))
+      if (( age >= cooldown )); then
+        should=1
+      fi
+    else
+      should=1
+    fi
+    if (( should == 0 )); then
+      exit 0
+    fi
+    wlog "watch-status recovery_armed=${armed} suppression_reason=${suppression:-none} observation_executed=${observed} health=${health}" || exit 1
+    tmp="$(mktemp "${dir}/.watch-notify.XXXXXX")" || exit 1
+    trap 'rm -f -- "$tmp"' EXIT
+    {
+      printf 'fingerprint=%s\n' "$fp"
+      printf 'notified_at=%s\n' "$now"
+    } >"$tmp" || exit 1
+    mv -T -- "$tmp" "$path" || exit 1
+  ) 9>"$lock"
+}
+
+emit_watch_status() {
+  write_watch_status "$1" "$2" "$3" "$4" || return 1
+  notify_watch_state "$1" "$2" "$3" "$4"
+}
+
+# 标记或人工恢复文件存在：只读探针，不累计失败，不清理标记，不进入 tier。
+# 正常写完状态后返回 0。disabled 不是 healthy，健康只出现在 health= 字段。
+observe_while_suppressed() {
+  local health=red suppression
+  if compound_green; then
+    health=green
+  fi
+  suppression="$(suppression_reason_from_files)"
+  emit_watch_status false "$suppression" true "$health"
+}
+
 watch_once() {
   local count reason loud
   WATCH_LAST_MASTER_BODY=""
 
-  if [[ -f "$WATCH_DISARM" ]]; then
-    wlog "disarmed 标记存在,退出"
-    return 0
-  fi
-  if [[ -f "$WATCH_MANUAL_RECOVERY" ]]; then
-    wlog "manual-recovery-required 存在,拒绝自动回切"
-    return 0
+  if recovery_marker_present || manual_recovery_present; then
+    observe_while_suppressed
+    return
   fi
   if lock_is_live_exemption; then
     wlog "发布锁活且未过期,退出"
+    emit_watch_status true deploy-lock false unobserved || true
     return 0
   fi
   if maint_is_live_exemption; then
     wlog "维护窗口未到期,退出"
+    emit_watch_status true maint false unobserved || true
     return 0
   fi
   if in_cutover_grace; then
     wlog "cutover grace 未到期(绝对 until,不看 ActiveEnterTimestamp),退出"
+    emit_watch_status true grace false unobserved || true
     return 0
   fi
 
   if compound_green; then
     write_fail_count 0
     wlog "复合健康绿,清失败计数"
+    emit_watch_status true "" true green || true
     return 0
   fi
 
@@ -583,6 +752,7 @@ watch_once() {
     wlog "FAIL-LOUD class=$loud 不自动回切"
     write_manual_recovery "$loud"
     write_disarm "$loud"
+    emit_watch_status false "$(suppression_reason_from_files)" true red || true
     return 0
   fi
 
@@ -592,6 +762,7 @@ watch_once() {
   wlog "复合健康红 count=$count/$WATCH_FAIL_THRESHOLD master_unit=$(unit_is_active "$WATCH_MASTER_UNIT" && echo active || echo down) egress_unit=$(unit_is_active "$WATCH_EGRESS_UNIT" && echo active || echo down)"
 
   if (( count < WATCH_FAIL_THRESHOLD )); then
+    emit_watch_status true "" true red || true
     return 0
   fi
 
@@ -602,10 +773,12 @@ watch_once() {
       if [[ "$WATCH_SKIP_ACTIONS" == 1 ]] || is_true_dry || compound_green; then
         if is_true_dry || [[ "$WATCH_SKIP_ACTIONS" == 1 ]]; then
           wlog "tier1 dry 不计为转绿,不冻结(避免把演练当恢复)"
+          emit_watch_status true "" true red || true
           return 0
         fi
         write_fail_count 0
         wlog "tier1 成功且转绿,冻结计数"
+        emit_watch_status true "" true green || true
         return 0
       fi
       wlog "tier1 回切后仍红,进入 tier2"
@@ -618,11 +791,13 @@ watch_once() {
     sleep 3
     if [[ "$WATCH_SKIP_ACTIONS" == 1 ]] || is_true_dry; then
       wlog "tier2 dry 完成"
+      emit_watch_status true "" true red || true
       return 0
     fi
     if compound_green; then
       write_fail_count 0
       wlog "tier2 成功且转绿,冻结计数"
+      emit_watch_status true "" true green || true
       return 0
     fi
   fi
@@ -630,7 +805,105 @@ watch_once() {
   write_manual_recovery "tier1+tier2-failed"
   write_disarm "tier1+tier2-failed"
   wlog "两级兜底仍红,已 disarm。需要人工跑应急恢复脚本。"
+  emit_watch_status false "$(suppression_reason_from_files)" true red || true
   return 1
+}
+
+# OCV5-404:人工显式重新武装。只把停用标记改名归档(留证据),不删、不重启、不回切。
+# 整个检查与归档都持有 selfhost 发布锁(deploy.lock 的 flock):期间不会有 --deploy 开始,
+# 也不会有第二个 --rearm。任一条件不满足就拒绝,停用标记与失败计数都不动。
+rearm_refuse() {
+  wlog "rearm 拒绝: $*"
+  printf 'REARM_REFUSED %s\n' "$*" >&2
+}
+
+# 08-18 停用的原因就是 deps-pg:healthz 必须明确给出 deps.pg=ok,缺字段也算没确认。
+master_deps_pg_ok() {
+  local body="${WATCH_LAST_MASTER_BODY:-${WATCH_STUB_MASTER_BODY:-}}" pg
+  [[ -n "$body" ]] || return 1
+  pg="$(echo "$body" | jq -er '.deps.pg // empty' 2>/dev/null || true)"
+  [[ "$pg" == "ok" ]]
+}
+
+rearm_preconditions() {
+  local i checks="$WATCH_REARM_CHECKS" interval="$WATCH_REARM_INTERVAL_SEC" self_sha inst_sha
+  [[ "$checks" =~ ^[1-9][0-9]*$ ]] || checks=3
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=5
+  if is_true_dry; then
+    rearm_refuse "WATCH_DRY=1,重新武装不会恢复自动回滚"; return 1
+  fi
+  if [[ ! -f "$WATCH_INSTALLED_BIN" ]]; then
+    rearm_refuse "缺已安装副本 $WATCH_INSTALLED_BIN"; return 1
+  fi
+  self_sha="$(sha256sum <"${BASH_SOURCE[0]}")"
+  inst_sha="$(sha256sum <"$WATCH_INSTALLED_BIN")"
+  if [[ "$self_sha" != "$inst_sha" ]]; then
+    rearm_refuse "已安装副本与本脚本不一致,先安装再武装"; return 1
+  fi
+  for ((i = 1; i <= checks; i++)); do
+    if [[ ! -f "$WATCH_DISARM" || -L "$WATCH_DISARM" ]]; then
+      rearm_refuse "停用标记不是普通文件: $WATCH_DISARM"; return 1
+    fi
+    if manual_recovery_present; then rearm_refuse "manual-recovery 存在,先走应急恢复"; return 1; fi
+    if lock_is_live_exemption; then rearm_refuse "发布锁活"; return 1; fi
+    if maint_is_live_exemption; then rearm_refuse "维护窗口未到期"; return 1; fi
+    if in_cutover_grace; then rearm_refuse "cutover grace 未到期"; return 1; fi
+    WATCH_LAST_MASTER_BODY=""
+    if ! compound_green; then rearm_refuse "复合健康红(第 $i/$checks 次)"; return 1; fi
+    if ! master_deps_pg_ok; then rearm_refuse "healthz 未确认 deps.pg=ok(第 $i/$checks 次)"; return 1; fi
+    if (( i < checks && interval > 0 )); then sleep "$interval"; fi
+  done
+  # 最后一次探针之后、归档之前再看一遍人为标记。
+  if [[ ! -f "$WATCH_DISARM" || -L "$WATCH_DISARM" ]]; then
+    rearm_refuse "停用标记不是普通文件: $WATCH_DISARM"; return 1
+  fi
+  if manual_recovery_present; then rearm_refuse "manual-recovery 存在,先走应急恢复"; return 1; fi
+  if maint_is_live_exemption; then rearm_refuse "维护窗口未到期"; return 1; fi
+  if in_cutover_grace; then rearm_refuse "cutover grace 未到期"; return 1; fi
+}
+
+watch_rearm() {
+  local old_count dst
+  if [[ ! -e "$WATCH_DISARM" && ! -L "$WATCH_DISARM" ]]; then
+    wlog "rearm: 无停用标记,看护已武装"
+    echo "REARM_NOOP"
+    return 0
+  fi
+  mkdir -p -- "$(dirname -- "$WATCH_LOCK")"
+  if [[ ! -e "$WATCH_LOCK" && ! -L "$WATCH_LOCK" ]]; then
+    # 与 deploy 的锁准备一致:root 0600 普通文件。已存在则不动(noclobber)。
+    ( umask 077; set -C; : >"$WATCH_LOCK" ) 2>/dev/null || true
+  fi
+  if [[ ! -f "$WATCH_LOCK" || -L "$WATCH_LOCK" ]]; then
+    rearm_refuse "发布锁文件不是普通文件: $WATCH_LOCK"; return 1
+  fi
+  # <> 不截断;锁文件不承载数据。deploy 拿不到锁会每 POLL 秒重试,不会失败。
+  exec 8<>"$WATCH_LOCK" || { rearm_refuse "无法打开发布锁 $WATCH_LOCK"; return 1; }
+  if ! flock -n 8; then
+    exec 8<&-
+    rearm_refuse "发布锁被占用(有 --deploy 或另一个 --rearm 在跑)"; return 1
+  fi
+  if ! rearm_preconditions; then
+    exec 8<&-
+    return 1
+  fi
+  # 计数在锁内、全部检查通过之后才清;归档失败就恢复原值,拒绝时计数不变。
+  old_count="$(read_fail_count)"
+  dst="${WATCH_DISARM}.rearmed-$(date -u +%Y%m%dT%H%M%SZ)"
+  if [[ -e "$dst" || -L "$dst" ]]; then
+    exec 8<&-
+    rearm_refuse "归档目标已存在: $dst"; return 1
+  fi
+  write_fail_count 0
+  if ! mv -T -- "$WATCH_DISARM" "$dst" || [[ -e "$WATCH_DISARM" || ! -f "$dst" ]]; then
+    write_fail_count "$old_count"
+    exec 8<&-
+    rearm_refuse "归档停用标记失败,失败计数已恢复为 $old_count"; return 1
+  fi
+  emit_watch_status true "" true green || wlog "WARN rearm 后状态文件写入失败"
+  wlog "rearm: 已重新武装,停用标记归档到 $dst"
+  exec 8<&-
+  echo "REARM_OK archived=$dst"
 }
 
 watch_selftest() {
@@ -641,6 +914,9 @@ watch_selftest() {
   export WATCH_DRY=0
   export WATCH_SKIP_ACTIONS=1
   export WATCH_LOG="$base/watch.log"
+  export WATCH_STATUS="$base/run/watch-status"
+  export WATCH_NOTIFY_STATE="$base/run/watch-notify-state"
+  export WATCH_NOTIFY_COOLDOWN_SEC=21600
   export WATCH_RUN_DIR="$base/run"
   export WATCH_LOCK="$base/run/deploy.lock"
   export WATCH_MAINT="$base/run/planned-maintenance"
@@ -801,10 +1077,16 @@ watch_selftest() {
 
 usage_watch() {
   cat <<'EOF'
-用法: watch.sh [--once|--selftest]
+用法: watch.sh [--once|--selftest|--rearm]
   默认同 --once。WATCH_DRY=1(watch.env)时只记日志不真回切。
   切到真模式: 把 /opt/openclaude/v5-selfhost-watch/watch.env 里 WATCH_DRY=1 改成 0
   然后: systemctl daemon-reload && systemctl enable --now openclaude-v5-selfhost-watch.timer
+  停用标记或 manual-recovery 存在时仍做只读探针并以 0 退出。
+  状态文件分开写 recovery_armed、suppression_reason、observation_executed、health、checked_at。
+  recovery_armed=false 不是 healthy。安装须同目录临时文件校验后 mv -T，见
+  scripts/v5-selfhost-watch-install.md。禁止删除 watch-disarmed。
+  重新武装只用 --rearm(OCV5-404):在已安装副本上执行,要求无活锁/维护/grace、无 manual-recovery、
+  连续 WATCH_REARM_CHECKS 次复合健康绿且 deps.pg=ok;通过后把标记改名归档,不删除。
 EOF
 }
 
@@ -813,6 +1095,7 @@ main() {
     -h|--help) usage_watch; exit 0 ;;
     --selftest) watch_selftest ;;
     --once|"") watch_once ;;
+    --rearm) watch_rearm ;;
     *)
       echo "未知参数: $1" >&2
       usage_watch >&2

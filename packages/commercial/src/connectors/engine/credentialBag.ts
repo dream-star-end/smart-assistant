@@ -67,6 +67,9 @@ function exchangeSources(contract: ExecContractT): string[] {
  */
 export function requiredBindSources(contract: ExecContractT): string[] {
   switch (contract.authMode) {
+    case 'none':
+      // 公开接口(OCV5-402):什么都不填。
+      return []
     case 'static-token':
       return ['access_token']
     case 'oauth2-auth-code':
@@ -101,6 +104,8 @@ export interface StoredBagSources {
  */
 export function storedBagSources(contract: ExecContractT): StoredBagSources {
   switch (contract.authMode) {
+    case 'none':
+      return { required: [], optional: [] }
     case 'static-token':
       return { required: ['access_token'], optional: [] }
     case 'token-exchange':
@@ -164,6 +169,8 @@ export function bagToResolvedCredentials(
   bag: DeclarativeSecretBag,
 ): ResolvedCredentials {
   switch (authMode) {
+    case 'none':
+      return {}
     case 'static-token':
       return { accessToken: bag.access_token }
     case 'oauth2-auth-code':

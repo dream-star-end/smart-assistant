@@ -32,7 +32,8 @@ const CLASSIFY_SAMPLES: Array<{ input: string; code: string }> = [
   { input: '402 INSUFFICIENT_CREDITS: balance=1 required=9', code: 'insufficient_credits' },
   { input: '429 Too Many Requests', code: 'rate_limited' },
   { input: 'model is overloaded', code: 'model_capacity' },
-  { input: 'Selected model is at capacity. Please try a different model.', code: 'model_not_available' },
+  { input: 'Selected model is at capacity. Please try a different model.', code: 'model_capacity' },
+  { input: 'This model has been retired. Please try a different model.', code: 'model_not_available' },
   { input: 'Anthropic returned 502 Bad Gateway', code: 'upstream_failed' },
   {
     input: "prompt is too long: ran out of room in the model's context window",

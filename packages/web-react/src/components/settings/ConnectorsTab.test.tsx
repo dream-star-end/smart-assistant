@@ -2915,3 +2915,81 @@ describe("ConnectorsTab 一级列表 + 详情页（OCV5-383）", () => {
     expect(consumed).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("ConnectorsTab 公开接口插件（OCV5-402：authMode none，如 B 站公开数据）", () => {
+  const publicContract = () =>
+    declEntry({
+      versionId: 402,
+      slug: "bili",
+      label: "哔哩哔哩",
+      description: "B 站公开数据（免登录、只读）",
+      authMode: "none",
+      requiredBindSources: [],
+    });
+
+  test("未启用：卡片按钮叫「启用」，弹层不要任何凭据和备注名，提交空 secrets", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    const contract = publicContract();
+    mockedDeclManagement.mockResolvedValue({
+      connectors: [
+        managementEntry({ slug: "bili", label: "哔哩哔哩", description: contract.description, contract }),
+      ],
+      connections: [],
+    });
+    mockedDeclBind.mockResolvedValue({ connection: { id: "b1", rebound: false, accountHint: "公开接口" } });
+    render(<ConnectorsTab auth={auth} />);
+
+    const card = await openPlugin("哔哩哔哩");
+    expect(within(card).queryByRole("button", { name: "绑定" })).not.toBeInTheDocument();
+    fireEvent.click(within(card).getByRole("button", { name: "启用" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("启用 哔哩哔哩")).toBeInTheDocument();
+    expect(within(dialog).getByText(/无需登录，也不用填写任何凭据/)).toBeInTheDocument();
+    expect(within(dialog).queryByLabelText(/备注名/)).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("textbox")).not.toBeInTheDocument();
+    const submit = within(dialog).getByRole("button", { name: "启用" });
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+
+    await waitFor(() =>
+      expect(mockedDeclBind).toHaveBeenCalledWith(auth, {
+        versionId: 402,
+        secrets: {},
+        displayName: undefined,
+      }),
+    );
+    expect(mockedDeclOauthStart).not.toHaveBeenCalled();
+  });
+
+  test("已启用：状态「已启用」，不再出现「添加账号」", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    const contract = publicContract();
+    mockedDeclManagement.mockResolvedValue({
+      connectors: [
+        managementEntry({
+          slug: "bili",
+          label: "哔哩哔哩",
+          description: contract.description,
+          connectionCount: 1,
+          contract,
+        }),
+      ],
+      connections: [
+        {
+          id: "b1",
+          slug: "bili",
+          displayName: "哔哩哔哩",
+          connectorVersionId: "402",
+          accountHint: "公开接口",
+          createdAt: "2026-10-13T00:00:00.000Z",
+        },
+      ],
+    });
+    render(<ConnectorsTab auth={auth} />);
+
+    const card = await openPlugin("哔哩哔哩");
+    expect(within(card).getByText("已启用")).toBeInTheDocument();
+    expect(within(card).queryByRole("button", { name: "添加账号" })).not.toBeInTheDocument();
+    expect(within(card).queryByRole("button", { name: "启用" })).not.toBeInTheDocument();
+  });
+});

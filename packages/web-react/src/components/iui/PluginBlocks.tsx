@@ -30,7 +30,7 @@ type BlockProps<S> = { spec: S; notes: string[]; streaming: boolean; nested?: bo
 const COLLAPSED = 10;
 const LONG_TEXT = 140;
 
-function ExtLink({ href, className, children }: { href?: string; className?: string; children: ReactNode }) {
+export function ExtLink({ href, className, children }: { href?: string; className?: string; children: ReactNode }) {
   if (!href) return <span className={className}>{children}</span>;
   return (
     <a className={cn("oc-plg-link", className)} href={href} target="_blank" rel="noopener noreferrer">
@@ -39,7 +39,7 @@ function ExtLink({ href, className, children }: { href?: string; className?: str
   );
 }
 
-function Counts({ items }: { items: [string, number | undefined][] }) {
+export function Counts({ items }: { items: [string, number | undefined][] }) {
   const shown = items.filter(([, v]) => v !== undefined);
   if (shown.length === 0) return null;
   return (
@@ -53,7 +53,7 @@ function Counts({ items }: { items: [string, number | undefined][] }) {
   );
 }
 
-function FoldText({ text, className }: { text: string; className?: string }) {
+export function FoldText({ text, className }: { text: string; className?: string }) {
   const [open, setOpen] = useState(false);
   const long = text.length > LONG_TEXT;
   return (
@@ -68,7 +68,7 @@ function FoldText({ text, className }: { text: string; className?: string }) {
   );
 }
 
-function MoreButton({ total, expanded, unit, onToggle }: { total: number; expanded: boolean; unit: string; onToggle: () => void }) {
+export function MoreButton({ total, expanded, unit, onToggle }: { total: number; expanded: boolean; unit: string; onToggle: () => void }) {
   if (total <= COLLAPSED) return null;
   return (
     <button type="button" className="oc-mkt-more" onClick={onToggle} aria-expanded={expanded}>

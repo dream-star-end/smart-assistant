@@ -115,6 +115,19 @@ export function prepareConnectorPublish(
       )
     throw e
   }
+  // 社区发布永远不能用公开接口模式或平台 builtin(OCV5-402);官方工件走 seed,不经这里。
+  if (compiled.execContract.authMode === 'none')
+    return reject(
+      422,
+      'AUTH_MODE_UNSUPPORTED',
+      '当前市场自助发布仅支持 static-token、token-exchange 与 oauth2-auth-code',
+    )
+  if (
+    compiled.execContract.actions.some(
+      (a) => a.requestTransform !== undefined || a.resultTransform !== undefined,
+    )
+  )
+    return reject(422, 'BUILTIN_PLATFORM_ONLY', '平台内置变换(builtin)只供官方插件使用')
   if (
     compiled.execContract.authMode === 'oauth2-auth-code' &&
     compiled.execContract.oauth2?.clientProvisioning !== 'byoa'

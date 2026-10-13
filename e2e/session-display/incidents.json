@@ -6858,6 +6858,49 @@
           "assertion": "INC-20261012-TURN-DUPLICATE-ACTION-ROW: real App shows one action row per turn, under its final answer only"
         }
       ]
+    },
+    {
+      "id": "INC-20261013-CODEX-CAPACITY-NOT-AVAILABLE",
+      "occurredAt": "2026-10-13",
+      "severity": "P1",
+      "symptom": "商业 uid 4 会话 webmv6evixkgn33mp（gpt-6.1-sol，2026-10-13 16:28 CST，派单 2e11133a）回合末出现「模型暂不可用」卡，要求用户切换模型。上游原文是 Codex 的容量满载 \"Selected model is at capacity. Please try a different model.\"，属瞬时容量错误；OCV5-252 的 /try a different model/i 把它判成 model_not_available（不可重试），跳过了 model_capacity 的有界无感重试和自动恢复。两边生产自 10-02/10-05 起所有同文案行都被如此误判（商业仅 10-13 就 5 条）。",
+      "rootFixCommit": "f1adc83d",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/errorClassify.test.ts",
+          "assertion": "OCV5-407: Codex at-capacity + try a different model is model_capacity (bare + JSON wrap)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/errorClassify.test.ts",
+          "assertion": "model_not_available: try a different model without capacity wording stays deterministic"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-session-unavailable-rootfix.ts",
+          "assertion": "[codex-capacity-retry] PASS — INC-20261013-CODEX-CAPACITY-NOT-AVAILABLE executed at-capacity classify and 3-attempt silent retry on throw and resolved shapes"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261013-BILI-SUBTITLE-CDN-CORS",
+      "occurredAt": "2026-10-13",
+      "severity": "P2",
+      "symptom": "个人版 rel-6c6c45d33 上 bili-account 正式 seed（21:05 CST 真人扫码）登录成功后 smoke 失败：B 站账号插件读取失败。worker 用 credentials:'include' 在 www.bilibili.com 页内读字幕文件，而 aisubtitle/i0.hdslb.com 返回 Access-Control-Allow-Origin: *，浏览器拒绝带凭据的跨域响应；有字幕的视频 subtitle 动作全部失败。未上架、无用户受影响。",
+      "rootFixCommit": "e9a375b2",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/biliAccount.test.ts",
+          "assertion": "subtitle: picks the requested language, reads the allow-listed subtitle CDN without cookies, caps lines"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/bili-subtitle-cors.node-test.mjs",
+          "assertion": "bili-account subtitle reads the hdslb CDN without cookies (real Chromium)"
+        }
+      ]
     }
   ]
 }

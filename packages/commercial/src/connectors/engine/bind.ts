@@ -48,6 +48,65 @@ function pointerScalar(root: unknown, pointer: string, what: string): string {
   throw new ConnectorError('UPSTREAM_ERROR', `identity ${what} missing in probe result`)
 }
 
+/** 公开接口(authMode none,OCV5-402):没有账号可探测,每个用户一条固定身份的连接。 */
+function publicIdentity(slug: string): { accountKey: string; rowMeta: Record<string, unknown> } {
+  return {
+    accountKey: computeAccountKey(`${slug}:public`),
+    rowMeta: { account_hint: '公开接口' },
+  }
+}
+
+/** 跑签进契约的 identity probe,派生账号身份(有凭据的 authMode)。 */
+async function probeIdentity(
+  input: BindWithBagInput,
+  contract: VerifiedContract['contract'],
+  slug: string,
+): Promise<{ accountKey: string; rowMeta: Record<string, unknown> }> {
+  const identity: ConnectorIdentityT | undefined = contract.identity
+  if (identity === undefined)
+    throw new ConnectorError('BAD_REQUEST', 'connector declares no identity probe')
+
+  // ② 解析出可注入 API 的凭据(client_secret/refresh_token 结构上进不了 ResolvedCredentials)。
+  //    bind 无 connectionId → token-exchange 换一次仅供探针,不落缓存。
+  const resolvedCreds = await resolveApiCredentials({ contract, bag: input.bag, deps: input.deps })
+
+  // ③ identityProbe:跑 probe read action(编译期已保证存在且 read)。
+  const probe: ExecActionT | undefined = contract.actions.find(
+    (a) => a.id === identity.probeActionId,
+  )
+  if (probe === undefined)
+    throw new ConnectorError('INTERNAL', 'identity probe action missing from contract')
+  const targetOrigin = soleApiOrigin(contract)
+  const probeResult = await engineHttpRequest({
+    contract,
+    action: probe,
+    credentialAudience: 'api',
+    targetOrigin,
+    resolvedCreds,
+    params: {},
+    deps: input.deps,
+  })
+
+  // ③' 上游用 2xx 报失败(JSON-RPC error / MCP isError)时,声明的 failurePointers 命中即判凭据被拒:
+  //     在派生身份与落库之前失败,已有连接不被替换。
+  for (const pointer of identity.failurePointers ?? []) {
+    const flagged = resolveResultPointer(probeResult, pointer)
+    if (flagged !== undefined && flagged !== null && flagged !== false)
+      throw new ConnectorError('UPSTREAM_AUTH_FAILED', 'identity probe reported a failure')
+  }
+
+  // ④ 从 allowlist 投影后的结果派生账号身份 → account_key(命名空间加 slug 防跨 connector 撞)。
+  const accountId = pointerScalar(probeResult, identity.accountKeyPointer, 'accountKey')
+  const accountKey = computeAccountKey(`${slug}:${accountId}`)
+  const rowMeta: Record<string, unknown> = {}
+  if (identity.accountHintPointer !== undefined) {
+    const hintRaw = resolveResultPointer(probeResult, identity.accountHintPointer)
+    if (typeof hintRaw === 'string' && hintRaw.length > 0)
+      rowMeta.account_hint = hintRaw.slice(0, 120)
+  }
+  return { accountKey, rowMeta }
+}
+
 export interface BindDeclarativeResult {
   connectionId: string
   rebound: boolean
@@ -89,52 +148,14 @@ export async function bindWithBag(
   // 事务还会在统一锁域内做最后一次复核，分别封住外部副作用和落库 TOCTOU。
   await assertConnectorBindEntitlement(input.userId, meta.versionId, pool)
 
-  const identity: ConnectorIdentityT | undefined = contract.identity
-  if (identity === undefined)
-    throw new ConnectorError('BAD_REQUEST', 'connector declares no identity probe')
-
   // ① 即将落库的袋必须恰是执行期期待的形状(执行期 decryptBagFromRow 用同一权威复校验)。
   const stored = storedBagSources(contract)
   validateSecretBag(input.bag, stored.required, stored.optional)
 
-  // ② 解析出可注入 API 的凭据(client_secret/refresh_token 结构上进不了 ResolvedCredentials)。
-  //    bind 无 connectionId → token-exchange 换一次仅供探针,不落缓存。
-  const resolvedCreds = await resolveApiCredentials({ contract, bag: input.bag, deps: input.deps })
-
-  // ③ identityProbe:跑 probe read action(编译期已保证存在且 read)。
-  const probe: ExecActionT | undefined = contract.actions.find(
-    (a) => a.id === identity.probeActionId,
-  )
-  if (probe === undefined)
-    throw new ConnectorError('INTERNAL', 'identity probe action missing from contract')
-  const targetOrigin = soleApiOrigin(contract)
-  const probeResult = await engineHttpRequest({
-    contract,
-    action: probe,
-    credentialAudience: 'api',
-    targetOrigin,
-    resolvedCreds,
-    params: {},
-    deps: input.deps,
-  })
-
-  // ③' 上游用 2xx 报失败(JSON-RPC error / MCP isError)时,声明的 failurePointers 命中即判凭据被拒:
-  //     在派生身份与落库之前失败,已有连接不被替换。
-  for (const pointer of identity.failurePointers ?? []) {
-    const flagged = resolveResultPointer(probeResult, pointer)
-    if (flagged !== undefined && flagged !== null && flagged !== false)
-      throw new ConnectorError('UPSTREAM_AUTH_FAILED', 'identity probe reported a failure')
-  }
-
-  // ④ 从 allowlist 投影后的结果派生账号身份 → account_key(命名空间加 slug 防跨 connector 撞)。
-  const accountId = pointerScalar(probeResult, identity.accountKeyPointer, 'accountKey')
-  const accountKey = computeAccountKey(`${meta.slug}:${accountId}`)
-  const rowMeta: Record<string, unknown> = {}
-  if (identity.accountHintPointer !== undefined) {
-    const hintRaw = resolveResultPointer(probeResult, identity.accountHintPointer)
-    if (typeof hintRaw === 'string' && hintRaw.length > 0)
-      rowMeta.account_hint = hintRaw.slice(0, 120)
-  }
+  const { accountKey, rowMeta } =
+    contract.authMode === 'none'
+      ? publicIdentity(meta.slug)
+      : await probeIdentity(input, contract, meta.slug)
   // token 过期时刻走**这一条 meta 通路**(与 account_hint 同处),不在 SQL 里散写。
   if (input.tokenExpiresAt !== undefined)
     rowMeta[META_TOKEN_EXPIRES_AT] = input.tokenExpiresAt.toISOString()

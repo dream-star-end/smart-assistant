@@ -2248,6 +2248,50 @@ figure.oc-iui, .oc-iui { margin: 12px 0 20px; font-size: 14.5px; line-height: 1.
   .oc-plg-event-time { width: 74px; font-size: 12.5px; }
   .oc-plg-post, .oc-plg-answer { padding: 12px; }
 }
+/* OCV5-402 · 哔哩哔哩插件组件（BiliBlocks.tsx）。强调色只用在名次、链接、标签与密度峰值上。 */
+.oc-plg.is-bili { --plg-accent: #c4386b; }
+.dark .oc-plg.is-bili { --plg-accent: #ff8fb5; }
+.oc-bili-list { list-style: none; margin: 0; padding: 4px 0 6px; }
+.oc-bili-row { display: flex; align-items: flex-start; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--iui-line); }
+.oc-bili-row:last-child { border-bottom: 0; }
+.oc-bili-list.is-rank .oc-plg-rank { margin-top: 2px; }
+.oc-bili-cover { position: relative; flex-shrink: 0; width: 136px; aspect-ratio: 16 / 10; border-radius: 8px; overflow: hidden; background: var(--iui-sunken); }
+.oc-bili-cover .oc-iui-media { display: block; width: 100%; height: 100%; }
+.oc-bili-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.oc-bili-cover.is-hero { width: 100%; max-width: 320px; }
+.oc-bili-duration { position: absolute; right: 4px; bottom: 4px; padding: 0 5px; border-radius: 4px; font-size: 11px; line-height: 18px; color: #fff; background: rgb(0 0 0 / 0.62); }
+.oc-bili-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.oc-bili-title { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; font-size: 14px; line-height: 1.5; font-weight: 600; color: var(--fg); overflow-wrap: anywhere; }
+.oc-bili-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.oc-bili-when { display: inline; }
+.oc-bili-hero { display: flex; flex-wrap: wrap; gap: 12px 14px; padding: 14px 16px 10px; }
+.oc-bili-hero-main { flex: 1 1 220px; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.oc-bili-hero-title { font-size: 15.5px; font-weight: 650; line-height: 1.45; color: var(--fg); overflow-wrap: anywhere; }
+.oc-bili-hero-main .oc-plg-open { margin-left: 0; margin-top: 4px; }
+.oc-bili-stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 1px; margin: 0 16px 10px; border: 1px solid var(--iui-line); border-radius: 10px; overflow: hidden; background: var(--iui-line); }
+.oc-bili-stats > div { padding: 8px 10px; background: var(--surface, var(--bg)); }
+.oc-bili-stats dt { font-size: 12px; color: var(--muted); }
+.oc-bili-stats dd { margin: 2px 0 0; font-size: 15px; font-weight: 650; color: var(--fg); }
+.oc-bili-desc { padding: 0 16px 8px; }
+.oc-bili-pages { list-style: none; margin: 0; padding: 0 16px 8px; }
+.oc-bili-pages li { display: flex; gap: 10px; align-items: baseline; padding: 6px 0; border-top: 1px solid var(--iui-line); font-size: 13.5px; }
+.oc-bili-part { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--fg); }
+.oc-bili-level { margin-left: 4px; padding: 0 4px; border-radius: 4px; font-size: 10.5px; font-weight: 700; color: var(--plg-accent); border: 1px solid color-mix(in srgb, var(--plg-accent) 45%, transparent); }
+.oc-bili-foot-link { display: flex; padding: 4px 16px 12px; }
+.oc-bili-density-wrap { padding: 12px 16px 6px; }
+.oc-bili-density { display: flex; align-items: flex-end; gap: 1px; height: 72px; }
+.oc-bili-bar { flex: 1; min-width: 1px; border-radius: 2px 2px 0 0; background: color-mix(in srgb, var(--plg-accent) 38%, transparent); }
+.oc-bili-bar.is-peak { background: var(--plg-accent); }
+.oc-bili-axis { display: flex; justify-content: space-between; gap: 8px; margin-top: 4px; }
+.oc-bili-peak { color: var(--plg-accent); font-weight: 600; }
+.oc-bili-lines { list-style: none; margin: 0; padding: 4px 16px 8px; }
+.oc-bili-lines li { display: flex; gap: 10px; align-items: baseline; padding: 5px 0; border-bottom: 1px solid var(--iui-line); font-size: 13.5px; line-height: 1.6; color: var(--fg); overflow-wrap: anywhere; }
+.oc-bili-lines li:last-child { border-bottom: 0; }
+.oc-bili-lines .oc-plg-meta { display: inline; flex-shrink: 0; min-width: 40px; }
+@media (max-width: 480px) {
+  .oc-bili-cover { width: 112px; }
+  .oc-bili-row { padding: 10px 12px; gap: 8px; }
+}
 
 .oc-mkt-chart { padding: 2px 12px 12px; }
 .oc-mkt-readout { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; min-height: 22px; margin-bottom: 4px; font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }

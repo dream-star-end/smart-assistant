@@ -15,6 +15,7 @@
  */
 
 import { Value } from '@sinclair/typebox/value'
+import { type BuiltinKind, builtinMeta } from '../builtins/registry.js'
 import { normalizeHttpsOrigin } from '../outboundPolicy.js'
 import { canonicalSha256Hex } from './canonical.js'
 import {
@@ -44,18 +45,58 @@ const TOKEN_EXCHANGE_SOURCES: ReadonlySet<string> = new Set([
   'client_secret',
 ])
 
-/** 编译器语义版本(改任何编译规则/输出结构必须 bump → 新 exec_contract_hash)。 */
-export const COMPILER_VERSION = 1
+/**
+ * 编译器语义版本(改任何编译规则/输出结构必须 bump → 新 exec_contract_hash)。
+ * 2(OCV5-402):authMode none、request.staticQuery、builtin 层(ExecAction 可带
+ * requestTransform/resultTransform)。不用这些新能力的 spec 编译产物与 v1 逐字节相同。
+ */
+export const COMPILER_VERSION = 2
 /** auth 契约语义版本(三表 pin;换 auth 语义须 bump)。 */
 export const AUTH_CONTRACT_VERSION = 1
 /** credentialPipeline 最大深度(有界 DAG,§3.4)。 */
 const MAX_PIPELINE_DEPTH = 4
 
 /**
- * slice① 无内置 builtin 注册表 → 任何 transform/operation 引用一律 fail-closed。
- * 白名单随 builtin 层(切片②)落地时收口(RFC §5)。
+ * builtin 白名单 = `builtins/registry.ts`(切片②,OCV5-402)。requestTransform / resultTransform
+ * 必须引用对应类别的 builtin,且契约 apiOrigins ⊆ 该 builtin 允许的 origin;operation 仍无任何
+ * builtin,一律 fail-closed。「只有平台官方工件能用」在审核/载入期按工件 hash 收口(见 registry 注释)。
  */
-const BUILTIN_ALLOWLIST: ReadonlySet<string> = new Set()
+function validateBuiltins(
+  a: ConnectorSpecT['actions'][number],
+  apiOrigins: readonly string[],
+): void {
+  if (a.operation !== undefined)
+    throw new ConnectorSpecError('BUILTIN_NOT_ALLOWED', `builtin '${a.operation}' not in allowlist`)
+  const refs: Array<[string | undefined, BuiltinKind]> = [
+    [a.requestTransform, 'request'],
+    [a.resultTransform, 'result'],
+  ]
+  for (const [id, kind] of refs) {
+    if (id === undefined) continue
+    const meta = builtinMeta(id)
+    if (meta === undefined || meta.kind !== kind)
+      throw new ConnectorSpecError('BUILTIN_NOT_ALLOWED', `builtin '${id}' not in allowlist`)
+    if (apiOrigins.length === 0 || apiOrigins.some((o) => !meta.origins.includes(o)))
+      throw new ConnectorSpecError(
+        'BUILTIN_NOT_ALLOWED',
+        `builtin '${id}' not allowed for the reviewed api origins`,
+      )
+  }
+}
+
+/** 静态 query:名字不得与 params 映射的 query 重复;值禁控制符(OCV5-402)。 */
+function validateStaticQuery(req: ConnectorSpecT['actions'][number]['request']): void {
+  if (req.staticQuery === undefined) return
+  for (const [name, value] of Object.entries(req.staticQuery)) {
+    if (POLLUTION_KEYS.has(name))
+      throw new ConnectorSpecError('POLLUTION_KEY', `forbidden static query '${name}'`)
+    if (req.query !== undefined && Object.hasOwn(req.query, name))
+      throw new ConnectorSpecError('BAD_PATH_TEMPLATE', `static query '${name}' duplicates query`)
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: block CRLF/control in query value
+    if (/[\x00-\x1f\x7f]/.test(value))
+      throw new ConnectorSpecError('BAD_PATH_TEMPLATE', `static query '${name}' has control char`)
+  }
+}
 
 const RESERVED_HEADERS: ReadonlySet<string> = new Set(['authorization', 'host'])
 
@@ -534,6 +575,14 @@ export function compileSpec(rawSpec: unknown, securityDecision: unknown): Compil
   if (spec.originMode === 'fixed-reviewed' && PROTOCOL_AUTH_MODES.has(spec.authMode))
     throw new ConnectorSpecError('ORIGIN_MODE_MISMATCH', 'protocol adapter must be user-bound')
 
+  // none(公开接口):没有凭据,也就没有凭据流水线和账号身份可言(OCV5-402)。
+  if (spec.authMode === 'none') {
+    if (spec.credentialPipeline.nodes.length > 0)
+      throw new ConnectorSpecError('PIPELINE_INVALID', 'authMode none has no credential pipeline')
+    if (spec.identity !== undefined)
+      throw new ConnectorSpecError('IDENTITY_INVALID', 'authMode none declares no identity probe')
+  }
+
   // ② spec_hash
   const specHash = canonicalSha256Hex(spec)
 
@@ -643,13 +692,10 @@ export function compileSpec(rawSpec: unknown, securityDecision: unknown): Compil
 
   // 逐 action
   const execActions = spec.actions.map((a) => {
-    // builtin 引用一律 fail-closed(slice① 无 builtin 层)。
-    for (const b of [a.requestTransform, a.operation, a.resultTransform]) {
-      if (b !== undefined && !BUILTIN_ALLOWLIST.has(b))
-        throw new ConnectorSpecError('BUILTIN_NOT_ALLOWED', `builtin '${b}' not in allowlist`)
-    }
+    validateBuiltins(a, audience.apiOrigins)
     validatePath(a.request.pathTemplate, a.params)
     validateStaticHeaders(a.request.staticHeaders)
+    validateStaticQuery(a.request)
     // usesSlot 必须存在 + api audience + 该 slot 的 authMode 与 connector authMode 一致(§3.4,P1-5④)。
     if (a.usesSlot !== undefined) {
       const node = slotById.get(a.usesSlot)
@@ -677,6 +723,8 @@ export function compileSpec(rawSpec: unknown, securityDecision: unknown): Compil
       params: a.params,
       result: a.result,
       apiCredentialPlacements: placements,
+      ...(a.requestTransform !== undefined ? { requestTransform: a.requestTransform } : {}),
+      ...(a.resultTransform !== undefined ? { resultTransform: a.resultTransform } : {}),
     }
   })
 

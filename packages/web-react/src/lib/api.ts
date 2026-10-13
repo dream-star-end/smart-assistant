@@ -4399,6 +4399,54 @@ export const api = {
       ),
     ),
 
+  // OCV5-402: 哔哩哔哩账号插件(只读,扫码登录)。与知乎同一组接口形状。
+  startBiliAccountSetup: (a: AuthSession, accountId?: string): Promise<KnowledgePlanetSetupView> =>
+    jsonOrThrow<KnowledgePlanetSetupView>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/plugins/bili-account/setup", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ acceptTerms: true, ...(accountId ? { accountId } : {}) }),
+        }),
+      ),
+    ),
+
+  getBiliAccountSetup: (a: AuthSession, sessionId: string): Promise<KnowledgePlanetSetupView> =>
+    jsonOrThrow<KnowledgePlanetSetupView>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/bili-account/setup/${encodeURIComponent(sessionId)}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  async getBiliAccountSetupQr(a: AuthSession, sessionId: string): Promise<Blob> {
+    const res = await callWithRefresh(a, (t) =>
+      fetch(`/api/plugins/bili-account/setup/${encodeURIComponent(sessionId)}/qr`, {
+        credentials: "include",
+        headers: { ...bearerHeaders(t), Accept: "image/png" },
+      }),
+    );
+    assertAuthResponseCurrent(res);
+    if (!res.ok) await throwApi(res);
+    const blob = await res.blob();
+    assertAuthResponseCurrent(res);
+    return blob;
+  },
+
+  cancelBiliAccountSetup: (a: AuthSession, sessionId: string): Promise<KnowledgePlanetSetupView> =>
+    jsonOrThrow<KnowledgePlanetSetupView>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/bili-account/setup/${encodeURIComponent(sessionId)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
   revokePluginAccount: (a: AuthSession, id: string): Promise<void> =>
     jsonOrThrow<unknown>(
       callWithRefresh(a, (t) =>

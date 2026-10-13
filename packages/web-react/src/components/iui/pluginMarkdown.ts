@@ -19,7 +19,7 @@ export function mdText(s: string): string {
 
 const URL_ESCAPES: Record<string, string> = { "(": "%28", ")": "%29", "<": "%3C", ">": "%3E" };
 
-function mdUrl(u: string): string {
+export function mdUrl(u: string): string {
   // encodeURIComponent 不编码括号，所以显式映射。
   return u.replace(/[()<>]/g, (c) => URL_ESCAPES[c]!).replace(/\s/g, (c) => encodeURIComponent(c));
 }

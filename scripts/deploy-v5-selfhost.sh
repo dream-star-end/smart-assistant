@@ -161,6 +161,9 @@ die() {
 # shellcheck disable=SC1091
 source "$MASTER_RELEASE_LIB"
 BOOT_SCRIPT_DIR="${BOOT_SCRIPT_DIR:-${BREAKGLASS_ROOT}/boot}"
+# 看护 timer 执行的是这个安装目录里的 watch.sh,不是 release(OCV5-404)。
+V5_WATCH_DIR="${V5_WATCH_DIR:-/opt/openclaude/v5-selfhost-watch}"
+V5_WATCH_RUN_STATUS="${V5_WATCH_RUN_STATUS:-/run/openclaude-v5-selfhost/watch-status}"
 
 log() { echo "$*"; }
 
@@ -1219,6 +1222,69 @@ sync_boot_scripts_from() {
   rm -rf -- "$tmp"
 }
 
+# OCV5-404:08-18 装上的 watch.sh 一直没被替换,9 月的双槽改动从没到过宿主,停用后也没人发现。
+# committed 之后从新 live 原子同步:同目录临时文件,内容一致且语法通过才 mv -T。
+# 只换 watch.sh;watch.env、alert.sh、停用标记一律不动,重新武装只走人工 watch.sh --rearm。
+watch_install_state() { # <release-root> → same|drift|missing-src|not-installed
+  local src="$1/scripts/v5-selfhost-watch.sh" dst="$V5_WATCH_DIR/watch.sh"
+  if [[ ! -f "$src" || -L "$src" ]]; then echo missing-src; return 0; fi
+  if [[ ! -f "$dst" ]]; then echo not-installed; return 0; fi
+  if cmp -s -- "$src" "$dst"; then echo same; else echo drift; fi
+}
+
+sync_watch_from() { # <release-root>  失败只 return 1,已安装副本保持原样
+  local rel="$1" src="$1/scripts/v5-selfhost-watch.sh" dst="$V5_WATCH_DIR/watch.sh" tmp
+  case "$(watch_install_state "$rel")" in
+    same) log "  ✓ 看护已是本 release 版本 ($(sha256sum <"$dst" | cut -c1-12))"; return 0 ;;
+    not-installed) log "  ⚠ 本机未安装看护($dst 不存在),不同步"; return 0 ;;
+    missing-src) log "  ⚠ 看护同步跳过: release 缺 $src"; return 1 ;;
+  esac
+  if [[ "$DRY" == 1 ]]; then
+    log "  [dry-run] 原子安装 $src → $dst(不动 watch.env / alert.sh / 停用标记)"
+    return 0
+  fi
+  if ! bash -n -- "$src"; then
+    log "  ⚠ 看护同步拒绝: $src 语法检查失败,已安装副本未变"
+    return 1
+  fi
+  tmp="$(mktemp -- "$V5_WATCH_DIR/watch.sh.XXXXXX")" || { log "  ⚠ 看护同步失败: 无法建临时文件"; return 1; }
+  if ! { cp -- "$src" "$tmp" && cmp -s -- "$src" "$tmp" && bash -n -- "$tmp" \
+      && chmod 0755 -- "$tmp" && mv -T -- "$tmp" "$dst"; }; then
+    rm -f -- "$tmp"
+    log "  ⚠ 看护同步失败,已安装副本未变"
+    return 1
+  fi
+  log "  ✓ 看护已同步 → $dst ($(sha256sum <"$dst" | cut -c1-12), from $rel)"
+}
+
+# --status / --smoke 用:安装副本对 live、停用标记、看护最近一次状态。
+watch_summary() { # <live-root-or-empty>
+  local live_root="$1" state="no-live" marker="absent" st="$V5_WATCH_RUN_STATUS" armed health checked
+  [[ -n "$live_root" ]] && state="$(watch_install_state "$live_root")"
+  if [[ -e "$V5_WATCH_DIR/watch-disarmed" ]]; then
+    marker="present($(sed -n 's/^reason=//p' "$V5_WATCH_DIR/watch-disarmed" 2>/dev/null | head -n1 | tr -cd 'A-Za-z0-9._:,+-'))"
+  fi
+  armed="$(sed -n 's/^recovery_armed=//p' "$st" 2>/dev/null | head -n1)"
+  health="$(sed -n 's/^health=//p' "$st" 2>/dev/null | head -n1)"
+  checked="$(sed -n 's/^checked_at=//p' "$st" 2>/dev/null | head -n1)"
+  echo "install=$state disarm=$marker recovery_armed=${armed:-?} health=${health:-?} checked_at=${checked:-?}"
+}
+
+assert_watch_matches_live() { # <live-root>
+  local live_root="$1" state
+  if [[ -z "$live_root" ]]; then
+    log "  ⚠ 看护比对跳过: 无 live release"
+    return 0
+  fi
+  state="$(watch_install_state "$live_root")"
+  case "$state" in
+    same) log "  ✓ 看护安装副本 = live release 版本 ($(watch_summary "$live_root"))" ;;
+    not-installed) log "  ⚠ 本机未安装看护($V5_WATCH_DIR/watch.sh 不存在)" ;;
+    *) die "看护安装副本与 live release 不一致(state=$state)。timer 执行的是 $V5_WATCH_DIR/watch.sh,不是 release。
+  补救: 按 scripts/v5-selfhost-watch-install.md 原子安装,或重跑 --deploy(committed 后会同步)。" ;;
+  esac
+}
+
 # 优先当前 live;尚未翻转时用工作树(仅 bootstrap)。
 sync_boot_scripts_best_effort() {
   local live_root=""
@@ -1941,6 +2007,7 @@ cmd_smoke() {
   assert_ssh_rule_before_drop
   assert_personal_alive
   log "  ✓ 个人版 $PERSONAL_UNIT 仍 active 且 :$PERSONAL_PORT 仍 200"
+  assert_watch_matches_live "$live_root"
   log "✓ smoke 通过"
 }
 
@@ -1986,6 +2053,7 @@ cmd_status() {
   else
     log "  .complete:   MISSING"
   fi
+  log "  watch:       $(watch_summary "${live_now:-}")"
   if [[ -f "$V5_ENV" ]]; then
     log "  OC_SESSIONS_STORE=$(oc_hotcfg_env_get "$V5_ENV" OC_SESSIONS_STORE)"
   fi
@@ -2785,6 +2853,8 @@ cmd_cutover() {
     || die "disarm 失败: committed marker 未确认写入。smoke 已通过,拒绝报告成功。"
   persist_selfhost_model_authority_cutover "$rel"
   sync_boot_scripts_from "$rel"
+  sync_watch_from "$rel" \
+    || cutover_clog "  ⚠ 看护同步失败(仅告警,不回滚;--smoke 会因看护漂移失败)"
   # 收尾 GC(镜像 deploy-v5.sh gc_releases/oc_hotcfg_gc 同款:仅告警,不回滚)。
   # master release:引用感知 v5-release-gc.sh,keep 3(OCV5-376:当前 + 上一个 + 一个回滚点;根盘曾 96%,
   # <8GiB 时发布拒绝构建);live/.prev-release/unit cwd/

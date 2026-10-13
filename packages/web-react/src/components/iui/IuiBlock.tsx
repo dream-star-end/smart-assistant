@@ -14,6 +14,7 @@ import { KvBlock, ProgressBlock, RouteBlock } from "./InfoBlocks";
 import { FormBlock, QuizBlock, RecipeBlock } from "./InteractiveBlocks";
 import { IntradayBlock, KlineBlock, QuoteBlock, StockListBlock } from "./MarketBlocks";
 import { CardsBlock, GalleryBlock, SwatchesBlock, TilesBlock } from "./MediaBlocks";
+import { BiliCommentsBlock, BiliDanmakuBlock, BiliRankBlock, BiliSubtitleBlock, BiliVideoBlock, BiliVideosBlock } from "./BiliBlocks";
 import { FeishuDocBlock, FeishuEventsBlock, WeiboHotBlock, WeiboPostsBlock, ZhihuAnswersBlock, ZhihuHotBlock } from "./PluginBlocks";
 import { TableBlock } from "./TableBlock";
 import { DraftBlock, OutlineBlock, SourcesBlock } from "./TextBlocks";
@@ -130,6 +131,18 @@ export function renderSpec(spec: IuiSpec, notes: string[], streaming: boolean, r
       return <FeishuEventsBlock spec={spec} {...p} />;
     case "feishu_doc":
       return <FeishuDocBlock spec={spec} {...p} />;
+    case "bili_videos":
+      return <BiliVideosBlock spec={spec} {...p} />;
+    case "bili_rank":
+      return <BiliRankBlock spec={spec} {...p} />;
+    case "bili_video":
+      return <BiliVideoBlock spec={spec} {...p} />;
+    case "bili_comments":
+      return <BiliCommentsBlock spec={spec} {...p} />;
+    case "bili_danmaku":
+      return <BiliDanmakuBlock spec={spec} {...p} />;
+    case "bili_subtitle":
+      return <BiliSubtitleBlock spec={spec} {...p} />;
   }
 }
 
@@ -194,6 +207,16 @@ function hasContent(spec: IuiSpec): boolean {
       return spec.items.length > 0 || !!spec.question;
     case "feishu_doc":
       return spec.title.length > 0;
+    case "bili_videos":
+    case "bili_rank":
+    case "bili_comments":
+      return spec.items.length > 0;
+    case "bili_video":
+      return spec.title.length > 0;
+    case "bili_danmaku":
+      return spec.items.length > 0 || spec.density.length > 0;
+    case "bili_subtitle":
+      return spec.lines.length > 0;
   }
 }
 

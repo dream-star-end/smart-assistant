@@ -8,6 +8,7 @@ import {
   type DeclarativeCatalogEntry,
   bindFieldMeta,
   isOauthAuthMode,
+  isPublicAuthMode,
 } from '../../../lib/connectors'
 import type { AuthSession } from '../../../lib/types'
 import { Alert, Button, Field, Input, Modal } from '../../ui'
@@ -214,6 +215,8 @@ export function DeclarativeBindDialog({
   }, [entry?.versionId])
 
   const isOauth = entry != null && isOauthAuthMode(entry.authMode)
+  // 公开接口（OCV5-402）：没有凭据、没有账号，弹层只是确认「启用」。
+  const isPublic = entry != null && isPublicAuthMode(entry.authMode)
   // 平台已注册 OAuth App → 用户零填写，一键授权（读后端显式字段，不从空数组反推）。
   const isPlatformOauth = isOauth && entry.clientProvisioning === 'platform'
   const sources = entry?.requiredBindSources ?? []
@@ -249,7 +252,9 @@ export function DeclarativeBindDialog({
       })
       onBound()
     } catch (e) {
-      setErr(errText(e, isOauth ? '发起授权失败，请重试' : '绑定失败，请重试'))
+      setErr(
+        errText(e, isOauth ? '发起授权失败，请重试' : isPublic ? '启用失败，请重试' : '绑定失败，请重试'),
+      )
       setSubmitting(false)
     }
   }
@@ -258,9 +263,11 @@ export function DeclarativeBindDialog({
     <Modal
       open={entry != null}
       onOpenChange={(o) => !o && onClose()}
-      title={entry ? `绑定 ${entry.label}` : undefined}
+      title={entry ? `${isPublic ? '启用' : '绑定'} ${entry.label}` : undefined}
       description={
-        isPlatformOauth
+        isPublic
+          ? '公开接口，无需登录，也不用填写任何凭据。启用后助手就能用它查询公开数据。'
+          : isPlatformOauth
           ? '无需填写任何凭据，点击前往授权即可完成绑定。'
           : isOauth
             ? '填写你的自建应用凭据，前往授权后即可完成绑定。'
@@ -279,7 +286,7 @@ export function DeclarativeBindDialog({
               disabled={missingRequired}
               onClick={() => void submit()}
             >
-              {isOauth ? '前往授权' : '绑定'}
+              {isOauth ? '前往授权' : isPublic ? '启用' : '绑定'}
             </Button>
           </>
         )
@@ -308,14 +315,16 @@ export function DeclarativeBindDialog({
             )
           })}
 
-          <Field label="备注名（可选）">
-            <Input
-              value={displayName}
-              maxLength={64}
-              placeholder="如：工作账号"
-              onChange={(e) => setDisplayName(e.target.value)}
-            />
-          </Field>
+          {!isPublic && (
+            <Field label="备注名（可选）">
+              <Input
+                value={displayName}
+                maxLength={64}
+                placeholder="如：工作账号"
+                onChange={(e) => setDisplayName(e.target.value)}
+              />
+            </Field>
+          )}
         </div>
       )}
     </Modal>

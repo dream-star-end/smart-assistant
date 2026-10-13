@@ -322,6 +322,14 @@ export function isOauthAuthMode(authMode: string): boolean {
   return authMode === "oauth2-auth-code";
 }
 
+/**
+ * 公开接口插件（authMode none，OCV5-402，如 B 站公开数据）：没有账号、不填任何凭据，
+ * 「绑定」在界面上叫「启用」，每个用户只有一条固定的连接。单一权威，同 isOauthAuthMode。
+ */
+export function isPublicAuthMode(authMode: string | null | undefined): boolean {
+  return authMode === "none";
+}
+
 /** bind 表单单个字段的展示元数据（source → label/输入类型/占位符）。 */
 export type BindFieldMeta = { label: string; type: "text" | "password"; placeholder?: string };
 
@@ -481,6 +489,12 @@ const CONNECTOR_ERROR_TEXT: Record<string, string> = {
   WEIBO_WORKER_INCOMPLETE: '微博工作器未正常结束，请先核对是否已发出',
   ZHIHU_ACTION_FAILED: '知乎操作失败。若已授权仍反复失败，请重新扫码绑定',
   ZHIHU_UPSTREAM_CHALLENGE: '知乎触发了风控或安全验证，请本人完成验证后再试',
+  BILI_ACCOUNT_ACTION_FAILED: 'B 站账号插件读取失败。若反复失败，请重新扫码登录',
+  BILI_ACCOUNT_UPSTREAM_CHALLENGE: 'B 站触发了风控验证，请稍后再试',
+  BILI_ACCOUNT_LOGIN_UNSUPPORTED: 'B 站返回的登录凭据无法安全保存，本次登录未生效',
+  BILI_ACCOUNT_WORKER_BUSY: 'B 站账号插件正忙，请稍后重试',
+  BILI_ACCOUNT_WORKER_DEADLINE: 'B 站账号插件执行超时，请稍后重试',
+  BILI_ACCOUNT_WORKER_INCOMPLETE: 'B 站账号插件未正常结束，请稍后重试',
   ZHIHU_WRITE_COMPOSER: '知乎编辑器未就绪，本次未发送',
   ZHIHU_WRITE_COMPOSER_EDITOR: '知乎编辑器无法填写，本次未发送',
   ZHIHU_WRITE_COMPOSER_READBACK: '知乎正文校验失败，本次未发送',

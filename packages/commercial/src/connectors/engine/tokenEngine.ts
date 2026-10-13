@@ -132,6 +132,7 @@ export async function resolveApiCredentials(
   input: ResolveApiCredentialsInput,
 ): Promise<ResolvedCredentials> {
   const { contract, bag, deps } = input
+  if (contract.authMode === 'none') return bagToResolvedCredentials('none', bag)
   if (contract.authMode === 'static-token') {
     return bagToResolvedCredentials('static-token', bag)
   }

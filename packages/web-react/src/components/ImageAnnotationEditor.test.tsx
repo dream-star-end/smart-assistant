@@ -319,7 +319,7 @@ describe('桌面鼠标画笔路径(需求 §1)', () => {
   })
 
   test('画完 + 填描述 → 桌面 Enter 提交(Shift+Enter 不提交)', async () => {
-    stubCanvasPipeline({ selection: true })
+    const ctx = stubCanvasPipeline({ selection: true })
     const onSubmit = vi.fn(async () => {})
     render(<EditorHarness onSubmit={onSubmit} />)
     const canvas = await waitFor(() => {
@@ -327,6 +327,9 @@ describe('桌面鼠标画笔路径(需求 §1)', () => {
       if (!c) throw new Error('canvas 未就绪')
       return c as HTMLCanvasElement
     })
+    // 图片解码、源图归一化都完成(画布已画上原图)后才落笔;否则这一笔落在尚未就绪的 mask 上被丢弃,
+    // 永远凑不出 canSubmit(CI 慢 tick 下复现过,见 OCV5-402)。
+    await waitFor(() => expect(ctx.drawImage).toHaveBeenCalled())
     const ta = screen.getByLabelText('希望怎样修改')
     fireEvent.change(ta, { target: { value: '把杯子改成玻璃材质' } })
     // 落一笔(mask 有选区,getImageData alpha>0 → selectionPresent)
@@ -335,7 +338,9 @@ describe('桌面鼠标画笔路径(需求 §1)', () => {
 
     // 等历史序列化结算(historyPending→false)→「发送」可用(canSubmit)。
     const send = screen.getByRole('button', { name: /发送/ })
-    await waitFor(() => expect(send).toBeEnabled())
+    // 「发送」用 aria-disabled 表达可用性(disabled 会吞点击,见组件注释);toBeEnabled 只看 disabled
+    // 属性、恒为真,等不到真正就绪,所以等 aria-disabled="false"。
+    await waitFor(() => expect(send).toHaveAttribute('aria-disabled', 'false'))
 
     // Shift+Enter 不提交
     fireEvent.keyDown(ta, { key: 'Enter', shiftKey: true })
