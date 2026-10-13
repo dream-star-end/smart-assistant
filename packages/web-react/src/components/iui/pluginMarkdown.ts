@@ -7,9 +7,14 @@
  */
 import { type HotItem, type PluginSpec, countText, endText, groupEventsByDay, hm, isCancelled } from "./pluginSchema";
 
-/** CommonMark 允许反斜杠转义任意 ASCII 标点；把会改变结构的那些都转义。 */
+/**
+ * CommonMark 允许反斜杠转义任意 ASCII 标点；把会改变结构的那些都转义。
+ * 例外：方括号写成 HTML 实体、圆括号不转义——聊天渲染会把 \\( \\) \\[ \\] 当成公式定界符
+ * （mathDelimiters.ts），方括号转义后也就组不成链接，圆括号单独出现不构成任何结构。
+ * $ 也转义：remark-math 会把一对 $ 当成行内公式。
+ */
 export function mdText(s: string): string {
-  return s.replace(/[\\`*_{}[\]()<>#+\-.!|~=:]/g, "\\$&");
+  return s.replace(/[\\`*_{}<>#+\-.!|~=:$]/g, "\\$&").replace(/\[/g, "&#91;").replace(/\]/g, "&#93;");
 }
 
 const URL_ESCAPES: Record<string, string> = { "(": "%28", ")": "%29", "<": "%3C", ">": "%3E" };

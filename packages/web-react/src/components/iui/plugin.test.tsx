@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { PLUGIN_UI_COMPONENTS, pluginUiTypes } from "@openclaude/protocol";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test } from "vitest";
+import { normalizeMathDelimiters } from "../mathDelimiters";
 import { IuiBlock } from "./IuiBlock";
 import { parseUiBlock } from "./parse";
 import { countText, groupEventsByDay } from "./pluginSchema";
@@ -197,6 +198,16 @@ describe("Markdown（复制 / 导出 / 组件关闭时）", () => {
     expect(md).toContain("(https://weibo.com/1/x%28y%29)");
     const html = uiFencesToMarkdown(`前言\n\`\`\`ui\n${ui({ type: "weibo_posts", items: [{ text: evil }] })}\n\`\`\`\n`);
     expect(html).not.toMatch(/^\s*(>\s*)*```/m);
+  });
+
+  test("正文里的括号、方括号和 $ 不会被当成公式（Codex r2）", () => {
+    const md = specToMarkdown(spec({ type: "weibo_posts", items: [{ text: "费用(含税)100元，[注]价格 $5 到 $8" }] }).spec);
+    expect(md).toContain("费用(含税)100元");
+    expect(md).not.toMatch(/\\[([\]]/);
+    expect(md).not.toMatch(/(^|[^\\])\$/m);
+    expect(normalizeMathDelimiters(md)).toBe(md);
+    render(<IuiBlock code={ui({ type: "weibo_posts", items: [{ text: "费用(含税)100元" }] })} />);
+    expect(screen.getByText("费用(含税)100元")).toBeInTheDocument();
   });
 
   test("跨天的日程写出结束日期，不把多日日程显示成当天", () => {
