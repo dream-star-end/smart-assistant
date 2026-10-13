@@ -690,6 +690,8 @@ export type UsageLedgerRow = {
   delta: string;
   balance_after: string;
   reason: string;
+  /** 0304 OCV5-392: 'auto_dream' = memory consolidation. */
+  workload?: string | null;
   ref_type: string | null;
   ref_id: string | null;
   memo: string | null;

@@ -129,7 +129,7 @@ export interface FinalizeContext {
    * 旧容器镜像 / 普通 chat)与 0104 之前的落库行为完全一致。
    * 只做归因展示,不参与扣费判定 / 调度 / 限流。
    */
-  mode?: "chat" | "delegate";
+  mode?: "chat" | "delegate" | "auto_dream";
   parentSessionId?: string | null;
   delegateAgentId?: string | null;
   /** Stable lossless tape locators. When a real debit happens they are
@@ -766,7 +766,7 @@ export async function settleUsageAndLedger(
      * mode CHECK 约束允许 ('chat','agent','delegate');'agent' 是 v3 legacy 值,
      * 本函数不产出。
      */
-    mode?: "chat" | "delegate";
+    mode?: "chat" | "delegate" | "auto_dream";
     parentSessionId?: string | null;
     delegateAgentId?: string | null;
     /** Stable logical tape locators. Optional only for rolling compatibility
@@ -864,13 +864,14 @@ export async function settleUsageAndLedger(
            turn_key, parent_turn_key, dispatch_id, attempt_no,
            verification_run_id, would_have_cost_credits,
            board_project_id, board_project_source, board_project_captured_at,
-           api_key_id)
+           api_key_id, workload)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14, $15, $16,
-                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+                 $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
          RETURNING id::text AS id`,
         [
           args.userId.toString(),
-          args.mode ?? "chat",
+          // OCV5-392: Auto-Dream is a chat call by mode; the workload column (0304) tells it apart.
+          args.mode === "auto_dream" ? "chat" : (args.mode ?? "chat"),
           // accountId === null → SQL NULL(deepseek 路径)
           args.accountId === null ? null : args.accountId.toString(),
           args.model,
@@ -904,6 +905,7 @@ export async function settleUsageAndLedger(
           attribution.capturedAt,
           // 0277 外接 API key 归因(非 API key 路径 NULL)。
           args.apiKeyId === null || args.apiKeyId === undefined ? null : args.apiKeyId.toString(),
+          args.mode === "auto_dream" ? "auto_dream" : null,
         ],
       );
       usageId = BigInt(ins.rows[0]!.id);
@@ -947,6 +949,8 @@ export async function settleUsageAndLedger(
         userId: args.userId,
         amount: settledCostCredits,
         reason: "chat",
+        // OCV5-392: memory consolidation debits carry workload='auto_dream' (0304).
+        workload: args.mode === "auto_dream" ? "auto_dream" : null,
         ref: { type: "usage_record", id: usageId.toString() },
         memo: `cost=${settledCostCredits}`,
         // billing_enabled=false 的成员:打戳但个人桶付(不传 orgId)。org 非 active 时

@@ -8,7 +8,7 @@ import { parseVerificationSponsorshipSnapshot,
 export interface BoxBillingContextV1 {
   v: 1;
   sessionId: string | null;
-  mode: "chat" | "delegate";
+  mode: "chat" | "delegate" | "auto_dream";
   parentSessionId: string | null;
   delegateAgentId: string | null;
   turnKey: string;
@@ -54,7 +54,7 @@ export function parseBoxBillingContext(raw: unknown): Pick<FinalizeContext,
   const maybeText = (v: unknown, max: number): v is string | null =>
     v === null || (typeof v === "string" && v.length > 0 && v.length <= max);
   if (x.v !== 1 || !maybeText(x.sessionId, 256)
-    || (x.mode !== "chat" && x.mode !== "delegate")
+    || (x.mode !== "chat" && x.mode !== "delegate" && x.mode !== "auto_dream")
     || !maybeText(x.parentSessionId, 256) || !maybeText(x.delegateAgentId, 128)
     || typeof x.turnKey !== "string" || !/^[a-f0-9]{64}$/.test(x.turnKey)
     || (x.parentTurnKey !== null && (typeof x.parentTurnKey !== "string"

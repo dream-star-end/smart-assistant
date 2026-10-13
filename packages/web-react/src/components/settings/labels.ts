@@ -29,7 +29,12 @@ export function ledgerReasonLabel(reason: string): string {
  * 面向用户的流水类型展示(审计 SET-16):未知 reason 不再把后端枚举原文当标题砸给用户,
  * 显示「其他」并把原值放进 `raw`(调用方挂到 title / 次级文案),可观测性不丢。
  */
-export function ledgerReasonView(reason: string): { label: string; raw: string | null } {
+export function ledgerReasonView(
+  reason: string,
+  workload?: string | null,
+): { label: string; raw: string | null } {
+  // 0304 OCV5-392: memory consolidation is billed as chat but tagged workload='auto_dream'.
+  if (workload === "auto_dream") return { label: "记忆整理", raw: null };
   const known = LEDGER_REASON_LABEL[reason];
   return known ? { label: known, raw: null } : { label: "其他", raw: reason };
 }

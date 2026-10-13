@@ -175,7 +175,8 @@
     "0292_gpt61_sol_retire_gpt6_sol",
     "0300_box_claude_haiku_5_5",
     "0302_chat_project_workspace",
-    "0303_box_claude_profiles"
+    "0303_box_claude_profiles",
+    "0304_billing_workload_column"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

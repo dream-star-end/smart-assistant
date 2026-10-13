@@ -46,6 +46,7 @@ type LedgerRow = {
   delta: string;
   balance_after: string;
   reason: string;
+  workload?: string | null;
   channel: string | null;
   model: string | null;
   memo: string | null;
@@ -275,7 +276,12 @@ export default function LedgerPage() {
     {
       key: "reason",
       title: "reason",
-      render: (r) => <Badge tone="neutral">{LEDGER_REASON_LABELS[r.reason] ?? r.reason}</Badge>,
+      render: (r) => (
+        <>
+          <Badge tone="neutral">{LEDGER_REASON_LABELS[r.reason] ?? r.reason}</Badge>
+          {r.workload === "auto_dream" ? <Badge tone="neutral">记忆整理</Badge> : null}
+        </>
+      ),
     },
     {
       key: "channel",

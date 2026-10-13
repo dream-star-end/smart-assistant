@@ -528,7 +528,7 @@ export function AccountTab({
             <ul className="flex flex-col gap-0.5">
               {rows.map((r) => {
                 const neg = r.delta.trim().startsWith("-");
-                const reason = ledgerReasonView(r.reason);
+                const reason = ledgerReasonView(r.reason, r.workload);
                 return (
                   <li
                     key={r.id}
