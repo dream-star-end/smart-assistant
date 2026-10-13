@@ -6,7 +6,7 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import type { BoxCcExecRequest } from "@openclaude/gateway";
-import { boxApiRunnerFor } from "@openclaude/protocol";
+import { type BoxApiRunner, boxApiRunnerFor } from "@openclaude/protocol";
 import { currentVerifiedProxyByteBudget, type ProxyBody } from "./shared.js";
 import { compileBoxCliSyntheticTurn } from "./boxMessagesMapper.js";
 import { validateBoxTextRequest } from "./boxRequestGate.js";
@@ -70,17 +70,28 @@ export function boxInteractiveRunnerEnabled(env: NodeJS.ProcessEnv = process.env
   return env.OC_BOX_INTERACTIVE_RUNNER === "1";
 }
 
-export function boxRunnerPlanInput(canonicalModel: string, host: BoxInteractiveHostAsset | undefined):
-  { interactiveHost?: BoxInteractiveHostAsset } {
-  if (boxApiRunnerFor(canonicalModel) !== "interactive") return {};
+/** OCV5-388: an installation can run the `claude -p` models (box-api-*) interactively too, keeping
+ * their ids, prices and chats: OC_BOX_API_RUNNER=interactive together with OC_BOX_INTERACTIVE_RUNNER=1
+ * (commercial). Unset, or without the interactive runner: each model runs as the catalog says. */
+export function boxRunnerFor(canonicalModel: string, env: NodeJS.ProcessEnv = process.env): BoxApiRunner | undefined {
+  const runner = boxApiRunnerFor(canonicalModel);
+  if (runner === "print" && env.OC_BOX_API_RUNNER === "interactive" && boxInteractiveRunnerEnabled(env)) {
+    return "interactive";
+  }
+  return runner;
+}
+
+export function boxRunnerPlanInput(canonicalModel: string, host: BoxInteractiveHostAsset | undefined,
+  env: NodeJS.ProcessEnv = process.env): { interactiveHost?: BoxInteractiveHostAsset } {
+  if (boxRunnerFor(canonicalModel, env) !== "interactive") return {};
   if (!host) throw new BoxTextPlanError("BOX_INTERACTIVE_HOST_UNAVAILABLE");
   return { interactiveHost: host };
 }
 
 /** Logins a canonical model's launch may use: every enabled login for an interactive runner,
  * the default login of each account for `claude -p` (BoxLoginScope). */
-export function boxRunnerLoginScope(canonicalModel: string): "default" | "all" {
-  return boxApiRunnerFor(canonicalModel) === "interactive" ? "all" : "default";
+export function boxRunnerLoginScope(canonicalModel: string, env: NodeJS.ProcessEnv = process.env): "default" | "all" {
+  return boxRunnerFor(canonicalModel, env) === "interactive" ? "all" : "default";
 }
 
 const MODEL = "/home/box/.local/bin/claude";
