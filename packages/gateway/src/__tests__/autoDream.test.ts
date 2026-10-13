@@ -14,6 +14,7 @@ const {
   AutoDreamStructuredOutputCollector,
   MAX_AUTO_DREAM_RUN_MS,
   formatAutoDreamReceipt,
+  renderAutoDreamExcerpt,
   isAutoDreamSuccessfulTurn,
   projectAutoDreamPublicStatus,
   validateProposal,
@@ -30,6 +31,7 @@ const memory = {
   rendered: [{ file: 'existing.md', content: 'old' }],
   versions: new Map([['existing.md', 'abc123']]),
   metadata: new Map([['existing.md', { type: 'project' as const }]]),
+  index: [{ file: 'existing.md', type: 'project', name: 'existing', description: 'old' }],
 }
 
 const valid = () =>
@@ -94,6 +96,41 @@ describe('validateProposal', () => {
     const result = validateProposal(JSON.stringify(proposal), memory)
     assert.match(result.upserts[0]?.body ?? '', /```ts/)
     assert.equal(AUTO_DREAM_PROPOSAL_JSON_SCHEMA.additionalProperties, false)
+  })
+
+  it('asks the model for no deletes because the apply path is ADD-only', () => {
+    assert.equal(AUTO_DREAM_PROPOSAL_JSON_SCHEMA.properties.deletes.maxItems, 0)
+  })
+})
+
+describe('renderAutoDreamExcerpt', () => {
+  it('keeps what the user said when the assistant replies are long', () => {
+    const text = renderAutoDreamExcerpt(
+      [
+        { role: 'user', content: '以后回答一律用简体中文，先给结论。' },
+        { role: 'assistant', content: `开头${'长'.repeat(20_000)}结尾` },
+        { role: 'user', content: '记住：我们的发布窗口是周四。' },
+        { role: 'assistant', content: '好的。' },
+      ],
+      5_000,
+    )
+    assert.ok(text.includes('以后回答一律用简体中文，先给结论。'))
+    assert.ok(text.includes('记住：我们的发布窗口是周四。'))
+    assert.ok(text.includes('开头'))
+    assert.ok(text.includes('结尾'))
+    assert.ok(text.length < 1_200)
+  })
+
+  it('drops the oldest whole turns first when the session is over budget', () => {
+    const turns = Array.from({ length: 10 }, (_, i) => ({
+      role: i % 2 === 0 ? 'user' : 'assistant',
+      content: `第${i}轮${'字'.repeat(300)}`,
+    }))
+    const text = renderAutoDreamExcerpt(turns, 1_000)
+    assert.ok(text.length <= 1_000)
+    assert.ok(text.includes('第9轮'))
+    assert.ok(!text.includes('第0轮'))
+    assert.ok(text.startsWith('User: ') || text.startsWith('Assistant: '))
   })
 })
 
@@ -396,7 +433,19 @@ describe('AutoDreamService cadence', () => {
       } as never,
       runModel: async (input) => {
         prompt = input.prompt
-        return JSON.stringify({ upserts: [], deletes: [], summary: 'noop' })
+        return JSON.stringify({
+          upserts: [
+            {
+              file,
+              name: '覆盖尝试',
+              description: '模型试图改写一个没见过正文的文件',
+              type: 'project',
+              body: 'replaced',
+            },
+          ],
+          deletes: [],
+          summary: 'noop',
+        })
       },
     })
     await service.maybeSchedule({
@@ -407,7 +456,17 @@ describe('AutoDreamService cadence', () => {
       userText: '成功',
       assistantText: '完成',
     })
-    assert.ok(!prompt.includes(file))
+    // The body never reaches the model; the name is listed only in the index
+    // (for duplicate detection) and a create targeting it is refused.
+    assert.ok(!prompt.includes('x'.repeat(100)))
+    const block = (tag: string) =>
+      prompt.slice(prompt.indexOf(`\n<${tag}>\n`), prompt.indexOf(`\n</${tag}>`))
+    const current = block('current_memory_json')
+    assert.ok(current.length > 0)
+    assert.ok(!current.includes(file))
+    const index = block('memory_index_json')
+    assert.ok(index.includes(file))
+    assert.ok(!(await readFile(paths.agentMemoryFile(agentId, file), 'utf8')).includes('replaced'))
     assert.equal(
       (await readFile(paths.agentMemoryFile(agentId, file), 'utf8')).includes('x'.repeat(100)),
       true,
@@ -616,14 +675,8 @@ describe('AutoDreamService cadence', () => {
     )
     assert.deepEqual(publicStatus.lastReport?.updated, [])
     assert.deepEqual(publicStatus.lastReport?.deleted, [])
-    assert.match(
-      await readFile(paths.agentMemoryFile(agentId, 'keep.md'), 'utf8'),
-      /原正文/,
-    )
-    assert.match(
-      await readFile(paths.agentMemoryFile(agentId, 'obsolete.md'), 'utf8'),
-      /旧正文/,
-    )
+    assert.match(await readFile(paths.agentMemoryFile(agentId, 'keep.md'), 'utf8'), /原正文/)
+    assert.match(await readFile(paths.agentMemoryFile(agentId, 'obsolete.md'), 'utf8'), /旧正文/)
     const created = await readFile(paths.agentMemoryFile(agentId, 'new-project.md'), 'utf8')
     assert.match(created, /source: auto/)
     assert.match(created, /expires: 2026-08-13/)
@@ -981,7 +1034,9 @@ describe('Auto-Dream public report projection and receipt', () => {
       deleted: [],
     })
     assert.equal(receipt.title, 'Auto‑Dream 梦境报告')
-    assert.match(receipt.bodyMd, /新增 1 条、更新 0 条、清理 0 条/)
+    assert.match(receipt.bodyMd, /新增 1 条记忆。自动新增的记忆保留 30 天/)
+    assert.ok(!receipt.bodyMd.includes('更新 0 条'))
+    assert.ok(!receipt.bodyMd.includes('清理 0 条'))
     assert.match(receipt.bodyMd, /new\\_pref/)
     assert.ok(!receipt.bodyMd.toLowerCase().includes('model'))
 

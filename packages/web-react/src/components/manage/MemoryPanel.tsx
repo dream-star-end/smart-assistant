@@ -14,6 +14,7 @@ import type {
   MemoryIndexResponse,
   MemoryUsageDashboard,
 } from "../../lib/types";
+import { type AutoDreamFeatureView, extractAutoDreamFeature } from "../../lib/modelPreferences";
 import { cn } from "../../lib/utils";
 import { AgentProjectPreview } from "./AgentProjectPreview";
 import { IdentityManual, useIdentityManualAuthority } from "./IdentityManual";
@@ -908,6 +909,8 @@ function CoreMemorySection({ auth, agentId }: { auth: AuthSession; agentId: stri
           空记忆因此只剩一个空态(第 4 轮 §7)。占位只在列表已经出来、梦境还在路上时给:
           列表还在加载时它自己的骨架已经说明"在加载",再叠一块骨架只会多一次跳动;
           空记忆时占位会落在空态上方,读起来像第二个空态。 */}
+      <AutoDreamToggleRow auth={auth} onChanged={reload} />
+
       {dreamLoading ? (
         !loading && files.length > 0 ? (
           <Skeleton data-testid="dream-placeholder" className="h-[88px] rounded-[10px]" />
@@ -1101,6 +1104,77 @@ function Disclosure({
   );
 }
 
+/** 自动新增记忆的保留天数（storage AUTO_MEMORY_TTL_DAYS）。 */
+const AUTO_MEMORY_TTL_DAYS = 30;
+
+/**
+ * 自动整理记忆开关（OCV5-392）：只新增的后台整理（legacy_memory_v1）。
+ * 只给能用的账号（订阅够、模型在线）和已经开着的账号显示；读偏好失败时不渲染，
+ * 不阻断记忆列表。开 = 同时收回遗留的「全面优化」授权（后端 normalizeAutoDreamPreferencePatch）。
+ */
+function AutoDreamToggleRow({ auth, onChanged }: { auth: AuthSession; onChanged: () => void }) {
+  const [feature, setFeature] = useState<AutoDreamFeatureView | null>(null);
+  const [saving, setSaving] = useState(false);
+  const toast = useToast();
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .getPreferences(auth)
+      .then((snap) => {
+        if (alive) setFeature(extractAutoDreamFeature(snap));
+      })
+      .catch(() => {
+        if (alive) setFeature(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [auth]);
+
+  if (!feature) return null;
+  const on = feature.legacy_enabled === true;
+  if (!on && !(feature.eligible && feature.available)) return null;
+
+  return (
+    <section
+      aria-label="自动整理记忆"
+      className="flex items-start justify-between gap-4 rounded-xl border border-border bg-surface px-4 py-3.5 shadow-soft"
+    >
+      <div className="min-w-0">
+        <h4 className="text-[14px] font-semibold leading-5 text-fg">自动整理记忆</h4>
+        <p className="mt-1 max-w-[68ch] text-body text-muted">
+          每 {feature.min_interval_hours} 小时最多一次，累计 {feature.min_new_sessions}{" "}
+          个新会话后，在后台从近期对话里提炼值得长期保留的信息。只新增，不改、不删已有记忆；自动新增的记忆保留{" "}
+          {AUTO_MEMORY_TTL_DAYS} 天。按实际用量扣积分。
+        </p>
+        {on && !feature.effective && (
+          <p className="mt-1 text-meta text-warning">当前暂不可用，整理已安全暂停。</p>
+        )}
+      </div>
+      <Switch
+        aria-label="自动整理记忆"
+        className="mt-0.5"
+        checked={on}
+        disabled={saving}
+        onCheckedChange={async (checked) => {
+          setSaving(true);
+          try {
+            const snap = await api.patchPreferences(auth, { auto_dream_enabled: checked });
+            setFeature(extractAutoDreamFeature(snap));
+            toast(checked ? "已开启自动整理记忆" : "已关闭自动整理记忆", "success");
+            onChanged();
+          } catch (e) {
+            toast(apiErrorMessage(e, checked ? "开启失败" : "关闭失败"), "error");
+          } finally {
+            setSaving(false);
+          }
+        }}
+      />
+    </section>
+  );
+}
+
 /** 变化动词:安静表面下是定宽的弱化文字列(不再是三种颜色的药丸),标题列因此纵向对齐。 */
 const DREAM_ACTION_META: Record<AutoDreamMemoryChange["action"], { label: string }> = {
   created: { label: "新增" },
@@ -1233,6 +1307,14 @@ function AutoDreamReportCard({
   );
 }
 
+/** 自动整理只会新增；更新/清理只在旧报告里真有时才出现，不再固定写「更新 0 条、清理 0 条」。 */
+function dreamChangeSentence(report: AutoDreamLastReport): string {
+  const parts = [`新增 ${report.created.length} 条`];
+  if (report.updated.length > 0) parts.push(`更新 ${report.updated.length} 条`);
+  if (report.deleted.length > 0) parts.push(`清理 ${report.deleted.length} 条`);
+  return `已${parts.join("、")}记忆。`;
+}
+
 function DreamReportResult({ report, total }: { report: AutoDreamLastReport; total: number }) {
   if (report.status === "failed") {
     const outcome = report.summary === "整理被中断，无法确认记忆是否发生变化，请查看记忆列表。"
@@ -1250,7 +1332,7 @@ function DreamReportResult({ report, total }: { report: AutoDreamLastReport; tot
       <p className="mt-1 text-body text-fg">
         {total === 0
           ? "已完成检查，没有发现值得长期保存的新信息。"
-          : `已新增 ${report.created.length} 条、更新 ${report.updated.length} 条、清理 ${report.deleted.length} 条记忆。`}
+          : dreamChangeSentence(report)}
       </p>
       {report.summary?.trim() && (
         <p className="mt-1 line-clamp-2 max-w-[68ch] text-body text-muted">{report.summary}</p>
