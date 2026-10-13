@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# OCV5-410 看护告警行为测试。curl / psql 用 PATH 替身,所有路径在临时目录,不连网、不写库、不碰宿主。
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ALERT="${ALERT_BIN_UNDER_TEST:-$DIR/v5-selfhost-watch-alert.sh}"
+WATCH="${WATCH_BIN:-$DIR/v5-selfhost-watch.sh}"
+for b in "$ALERT" "$WATCH"; do
+  case "$(readlink -f "$b")" in /opt/openclaude/v5-selfhost-watch/*) echo "REFUSE: 不测已安装副本" >&2; exit 2 ;; esac
+done
+
+pass=0
+fail=0
+ok() { pass=$((pass + 1)); echo "PASS $*"; }
+bad() { fail=$((fail + 1)); echo "FAIL $*"; }
+
+BASE="$(mktemp -d /tmp/v5-watch-alert.XXXXXX)"
+trap 'rm -rf "$BASE"' EXIT
+KEY="k3y-$(date +%s%N)-secret"
+
+setup() {
+  C="$BASE/$1"
+  mkdir -p "$C/bin" "$C/etc" "$C/state" "$C/live/scripts"
+  export TRACE="$C/trace" PSQL_IN="$C/psql.in" CURL_RC=0 CURL_RESP='{"errcode":0}' PSQL_RC=0
+  : >"$TRACE"
+  cat >"$C/bin/curl" <<'S'
+#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >>"$TRACE"
+[[ "${CURL_RC:-0}" == 0 ]] || exit "$CURL_RC"
+printf '%s' "${CURL_RESP:-}"
+S
+  cat >"$C/bin/psql" <<'S'
+#!/usr/bin/env bash
+printf 'psql %s\n' "$*" >>"$TRACE"
+cat >"$PSQL_IN"
+exit "${PSQL_RC:-0}"
+S
+  chmod 0755 "$C/bin/curl" "$C/bin/psql"
+  export PATH="$C/bin:/usr/bin:/bin"
+  export WATCH_ALERT_CONF="$C/etc/alert.env" WATCH_ALERT_DB_ENV="$C/etc/db.env" WATCH_ALERT_STATE_DIR="$C/state"
+  export WATCH_LOG="$C/watch.log" WATCH_LIVE="$C/live" WATCH_ALERT_WECOM_URL="http://127.0.0.1:9/wecom"
+  unset WATCH_ALERT_MODE WATCH_ALERT_INBOX_UID || true
+  printf 'DATABASE_URL=postgres://fixture-only@127.0.0.1:9/x\n' >"$WATCH_ALERT_DB_ENV"
+  printf -- '-- fanout fixture\nSELECT 1;\n' >"$C/live/scripts/v5-alert-fanout.sql"
+}
+conf() { printf '%s\n' "$@" >"$WATCH_ALERT_CONF"; chmod 0600 "$WATCH_ALERT_CONF"; }
+send() { set +e; OUT="$(bash "$ALERT" "$@" 2>&1)"; EC=$?; set -e; }
+nfiles() { find "$1" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l; }
+secret_leaked() { grep -rqF "$KEY" "$WATCH_LOG" "$C/state" 2>/dev/null; }
+
+# A1 默认 dry:不调 curl / psql,只落演练 JSON(0600)与日志。
+setup a1
+send --event tier1_rolled_back --severity critical --message "回切了"
+f="$(find "$C/state/alert-dry" -name '*.json' | head -n1)"
+if [[ "$EC" == 0 && ! -s "$TRACE" && -n "$f" && "$(stat -c %a "$f")" == 600 && "$(stat -c %a "$C/state")" == 700 ]] \
+  && [[ "$(jq -r '.dry, .event, .severity, .would.wecom, .would.inbox_uid' "$f" | tr '\n' ' ')" == "true tier1_rolled_back critical not-configured 3 " ]] \
+  && grep -q 'watch-alert CRITICAL event=tier1_rolled_back mode=dry' "$WATCH_LOG"; then
+  ok "A1 default dry: no network/db, dry record 0600"
+else bad "A1 ec=$EC trace=$(cat "$TRACE") out=$OUT"; fi
+
+# A2 dry + key:只记指纹,key 不进日志 / 演练记录。
+setup a2; conf "WATCH_ALERT_WECOM_KEY=$KEY"
+send --event fail_loud --severity critical --message x
+fp="$(printf '%s' "$KEY" | sha256sum | cut -c1-8)"
+if [[ "$EC" == 0 && ! -s "$TRACE" ]] && jq -e --arg w "key:$fp" '.would.wecom==$w' "$C"/state/alert-dry/*.json >/dev/null && ! secret_leaked; then
+  ok "A2 dry with key records fingerprint only"
+else bad "A2 ec=$EC"; fi
+
+# A3 配置文件权限不是 600:不用其中的 key。
+setup a3; conf "WATCH_ALERT_WECOM_KEY=$KEY" "WATCH_ALERT_MODE=live"; chmod 0644 "$WATCH_ALERT_CONF"
+send --event fail_loud --severity critical --message x
+if [[ "$EC" == 0 ]] && ! grep -q '^curl' "$TRACE" && grep -q '权限 644' "$WATCH_LOG" && ! secret_leaked; then
+  ok "A3 world-readable config key is ignored"
+else bad "A3 trace=$(cat "$TRACE")"; fi
+
+# A4 off:只写日志。
+setup a4; conf "WATCH_ALERT_MODE=off"
+send --event fail_loud --severity critical --message x
+if [[ "$EC" == 0 && ! -s "$TRACE" && "$(nfiles "$C/state/alert-dry")" == 0 && "$(nfiles "$C/state/alert-spool")" == 0 ]] && grep -q 'mode=off' "$WATCH_LOG"; then
+  ok "A4 off only logs"
+else bad "A4"; fi
+
+# A5 live 两通道都成功:无 spool;站内信给 uid 3、带 fanout;key 不进日志。
+setup a5; conf "WATCH_ALERT_MODE=live" "WATCH_ALERT_WECOM_KEY=$KEY"
+send --event rollback_failed --severity critical --message "两级兜底仍红"
+if [[ "$EC" == 0 && "$(nfiles "$C/state/alert-spool")" == 0 ]] && grep -q "^curl .*key=$KEY" "$TRACE" && grep -q '^psql ' "$TRACE" \
+  && grep -q -- '-v uid=3 ' "$TRACE" && grep -q "selfhost-watch:rollback_failed" "$TRACE" && grep -q '\\i .*v5-alert-fanout.sql' "$PSQL_IN" \
+  && grep -q "INSERT INTO inbox_messages" "$PSQL_IN" && [[ "$(grep -c 'SENT channel=' "$WATCH_LOG")" == 2 ]] && ! secret_leaked; then
+  ok "A5 live sends wecom + inbox(uid 3)+outbox in one transaction; key never logged"
+else bad "A5 trace=$(cut -c1-120 "$TRACE" | tr '\n' ' ') log=$(tr '\n' ' ' <"$WATCH_LOG" | cut -c1-200)"; fi
+
+# A6 live,企微失败:落 spool(pending=wecom);恢复后 --flush 送达并清掉。
+setup a6; conf "WATCH_ALERT_MODE=live" "WATCH_ALERT_WECOM_KEY=$KEY"
+export CURL_RC=7
+send --event tier2_restored --severity critical --message x
+s="$(find "$C/state/alert-spool" -maxdepth 1 -name '*.json' | head -n1)"
+p1="$(jq -c .pending "$s" 2>/dev/null || echo none)"
+send --flush
+p2="$(jq -c '[.pending, .attempts]' "$s" 2>/dev/null || echo none)"
+export CURL_RC=0
+send --flush
+if [[ "$p1" == '["wecom"]' && "$p2" == '[["wecom"],2]' && "$(nfiles "$C/state/alert-spool")" == 0 && "$(stat -c %a "$C/state/alert-spool")" == 700 ]] && ! secret_leaked; then
+  ok "A6 failed wecom spools, flush retries and clears"
+else bad "A6 p1=$p1 p2=$p2 left=$(nfiles "$C/state/alert-spool")"; fi
+
+# A7 live,企微回 errcode≠0 也算失败;库失败独立入 pending。
+setup a7; conf "WATCH_ALERT_MODE=live" "WATCH_ALERT_WECOM_KEY=$KEY"
+export CURL_RESP='{"errcode":93000,"errmsg":"invalid webhook url"}' PSQL_RC=2
+send --event fail_loud --severity critical --message x
+s="$(find "$C/state/alert-spool" -maxdepth 1 -name '*.json' | head -n1)"
+if [[ "$EC" == 0 && "$(jq -c .pending "$s" 2>/dev/null)" == '["wecom","db"]' ]]; then ok "A7 errcode!=0 and db failure both pending"; else bad "A7 $(cat "$s" 2>/dev/null)"; fi
+
+# A8 超过重投上限:转 dead,不再重投。
+export WATCH_ALERT_MAX_ATTEMPTS=2
+send --flush; send --flush
+if [[ "$(nfiles "$C/state/alert-spool")" == 0 && "$(nfiles "$C/state/alert-spool/dead")" == 1 ]] && grep -q 'DEAD id=' "$WATCH_LOG"; then
+  ok "A8 exhausted retries move to dead"
+else bad "A8 spool=$(nfiles "$C/state/alert-spool") dead=$(nfiles "$C/state/alert-spool/dead")"; fi
+unset WATCH_ALERT_MAX_ATTEMPTS; export CURL_RESP='{"errcode":0}' PSQL_RC=0
+
+# A9 live 未配置任何通道:SKIP 不入 spool。
+setup a9; conf "WATCH_ALERT_MODE=live"; rm -f "$WATCH_ALERT_DB_ENV"
+send --event fail_loud --severity critical --message x
+if [[ "$EC" == 0 && "$(nfiles "$C/state/alert-spool")" == 0 && "$(grep -c 'SKIP channel=' "$WATCH_LOG")" == 2 ]]; then ok "A9 unconfigured channels skip, no spool"; else bad "A9"; fi
+
+# A10 旧接口:systemd OnFailure 传单元名。
+setup a10
+send openclaude-v5-selfhost-watch.service
+if [[ "$EC" == 0 ]] && jq -e '.event=="watch_unit_failed" and .severity=="critical" and (.message|test("openclaude-v5-selfhost-watch.service"))' "$C"/state/alert-dry/*.json >/dev/null; then
+  ok "A10 legacy positional unit maps to watch_unit_failed"
+else bad "A10 $OUT"; fi
+
+# A11 参数错误:退出 2,不写记录。
+setup a11
+send --event x --severity bogus --message m; e1=$EC
+send --event x --severity info; e2=$EC
+send; e3=$EC
+send --status; st="$OUT"
+if [[ "$e1" == 2 && "$e2" == 2 && "$e3" == 2 && "$(nfiles "$C/state/alert-dry")" == 0 && "$st" == mode=dry* ]]; then ok "A11 usage errors exit 2; --status works"; else bad "A11 $e1 $e2 $e3 $st"; fi
+
+# A12 收件人可配,但非数字回落 3,不会落到 uid 1。
+setup a12; conf "WATCH_ALERT_MODE=live" "WATCH_ALERT_INBOX_UID=abc"
+send --event fail_loud --severity critical --message x
+if grep -q -- '-v uid=3 ' "$TRACE" && ! grep -q -- '-v uid=1 ' "$TRACE"; then ok "A12 invalid inbox uid falls back to 3"; else bad "A12 $(cat "$TRACE")"; fi
+
+# ── 接入看护 ─────────────────────────────────────────────────────────────
+wsetup() {
+  setup "$1"
+  export WATCH_ALERT_BIN="$ALERT" WATCH_RUN_DIR="$C/run" WATCH_STATUS="$C/run/watch-status" WATCH_NOTIFY_STATE="$C/run/notify"
+  export WATCH_DISARM="$C/inst/watch-disarmed" WATCH_MANUAL_RECOVERY="$C/rel/.manual-recovery-required" WATCH_MAINT="$C/run/maint"
+  export WATCH_GRACE="$C/run/grace" WATCH_LOCK="$C/run/deploy.lock" WATCH_FAIL_COUNT="$C/run/fail-count"
+  export WATCH_RELEASES_ROOT="$C/rel" WATCH_RESTORE=/bin/false WATCH_BACKUP_CURRENT="$C/backup" WATCH_INSTALLED_BIN="$C/inst/watch.sh"
+  export WATCH_DRY=0 WATCH_SKIP_ACTIONS=1 WATCH_FAIL_THRESHOLD=2 WATCH_NOTIFY_COOLDOWN_SEC=86400 WATCH_REARM_INTERVAL_SEC=0
+  export WATCH_STUB_UNIT_MASTER=active WATCH_STUB_UNIT_EGRESS=active WATCH_STUB_MASTER=ok WATCH_STUB_EGRESS=ok
+  export WATCH_STUB_MASTER_BODY='{"ok":true,"deps":{"pg":"ok"}}' WATCH_STUB_PG=ok WATCH_STUB_REDIS=ok WATCH_STUB_DOCKER=ok
+  unset WATCH_STUB_FAIL_LOUD || true
+  mkdir -p "$C/run" "$C/inst" "$C/rel"
+  cp -- "$WATCH" "$WATCH_INSTALLED_BIN"
+}
+tick() { set +e; bash "$WATCH" --once >/dev/null 2>&1; TEC=$?; set -e; }
+events() { { jq -r .event "$C"/state/alert-dry/*.json 2>/dev/null || true; } | sort | tr '\n' ' '; }
+
+# A13 停用期间变红 → disarmed_red(warning);转绿 → recovered(info)。
+wsetup a13; printf 'reason=deps-pg\n' >"$WATCH_DISARM"
+export WATCH_STUB_MASTER=down; tick; t1=$TEC
+export WATCH_STUB_MASTER=ok; tick; t2=$TEC
+if [[ "$t1" == 0 && "$t2" == 0 && "$(events)" == "disarmed_red recovered " ]]; then ok "A13 disarmed red then recovery alert"; else bad "A13 $t1 $t2 [$(events)]"; fi
+
+# A14 FAIL-LOUD → fail_loud;武装后达到阈值 → rollback_start。
+wsetup a14; export WATCH_STUB_MASTER=down WATCH_STUB_FAIL_LOUD=schema; tick
+ev14="$(events)"
+wsetup a14b; export WATCH_STUB_MASTER=down; tick; tick
+ev14b="$(events)"
+if [[ "$ev14" == "fail_loud " && "$ev14b" == "rollback_failed rollback_start tier1_skipped " ]]; then ok "A14 fail_loud and rollback_start alerts"; else bad "A14 [$ev14] [$ev14b]"; fi
+export WATCH_STUB_MASTER=ok
+
+# A15 告警脚本出错不改变看护退出码与判定。
+wsetup a15; printf '#!/bin/sh\nexit 9\n' >"$C/bad-alert"; chmod 0755 "$C/bad-alert"; export WATCH_ALERT_BIN="$C/bad-alert"
+printf 'reason=deps-pg\n' >"$WATCH_DISARM"; export WATCH_STUB_MASTER=down; tick
+if [[ "$TEC" == 0 ]] && grep -q 'WARN 告警脚本返回非 0 event=disarmed_red' "$WATCH_LOG" && grep -q '^health=red' "$WATCH_STATUS"; then
+  ok "A15 failing alert script does not change watch outcome"
+else bad "A15 ec=$TEC"; fi
+export WATCH_STUB_MASTER=ok
+
+# A16 --rearm 成功 → rearmed(info);被拒 → rearm_refused(warning)。
+wsetup a16; printf 'reason=deps-pg\n' >"$WATCH_DISARM"
+export WATCH_STUB_MASTER=down; set +e; bash "$WATCH" --rearm >/dev/null 2>&1; set -e
+export WATCH_STUB_MASTER=ok; set +e; bash "$WATCH" --rearm >/dev/null 2>&1; r=$?; set -e
+if [[ "$r" == 0 && "$(events)" == *rearm_refused* && "$(events)" == *rearmed* ]]; then ok "A16 rearm refused/ok alerts"; else bad "A16 r=$r [$(events)]"; fi
+
+# A17 未接入告警(无 WATCH_ALERT_BIN、安装目录无 alert.sh):看护不调用告警,行为不变。
+wsetup a17; unset WATCH_ALERT_BIN; printf 'reason=deps-pg\n' >"$WATCH_DISARM"; export WATCH_STUB_MASTER=down; tick
+if [[ "$TEC" == 0 && "$(nfiles "$C/state/alert-dry")" == 0 ]] && ! grep -q 'watch-alert' "$WATCH_LOG"; then ok "A17 no alert script → no alert calls"; else bad "A17"; fi
+export WATCH_STUB_MASTER=ok
+
+echo "ALERT_CASES pass=$pass fail=$fail"
+(( fail == 0 )) && echo ALERT_TEST_ALL_PASS
+(( fail == 0 ))
