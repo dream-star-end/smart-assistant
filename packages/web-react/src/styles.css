@@ -1383,7 +1383,10 @@ body {
 [data-font-size="large"] .prose { font-size: 17px; }
 
 /* ── Intelligent UI(OCV5-361):回答内嵌组件 ──
-   第二轮视觉:浮起卡片(极淡描边 + 两层柔和阴影 + 圆角 16)代替 1px 灰框;卡内分区用浅灰填充面;
+   外框分层(OCV5-416,替代第二轮的白底浮起卡片):只看的组件(表格/图表/指标/步骤/时间线/分段标签/插件列表…)
+   不画卡片,透明底、无阴影,在对话里和正文左对齐;要操作或自成一体的(计算器/表单/测验/成稿/菜谱/路线/行情)
+   放进无阴影的浅色调面板,面板里的输入控件和分区反衬为 --iui-panel-in。对比卡、建议用面板色。层次靠色阶,不靠阴影。
+   卡内分区用浅灰填充面;
    标题区带类型徽章;关键数字大号;分段控件 = 轨道 + 滑块;图表渐变与平滑曲线;完成时淡入。
    只用主题 token,浅/深各一组色;触屏命中 ≥44px;「减弱动效」下关闭全部动效。
    选择器以 .oc-iui 起头,和 .prose 的同名元素规则冲突时用两级类名压过(.prose x 只有 0,1,1)。 */
@@ -1402,6 +1405,9 @@ body {
   --iui-shadow: 0 1px 2px rgb(20 18 40 / 0.04), 0 10px 28px -14px rgb(20 18 40 / 0.16);
   --iui-shadow-lift: 0 2px 4px rgb(20 18 40 / 0.05), 0 16px 36px -16px rgb(20 18 40 / 0.22);
   --iui-thumb: #ffffff;
+  --iui-panel: color-mix(in srgb, var(--fg) 3.4%, var(--bg));
+  --iui-panel-in: var(--surface);
+  --iui-panel-ring: transparent;
   --iui-t-green-bg: #e2f2df;
   --iui-t-green-fg: #2c6627;
   --iui-t-amber-bg: #f6e9d4;
@@ -1429,6 +1435,9 @@ body {
   --iui-shadow: inset 0 1px 0 rgb(255 255 255 / 0.035), 0 10px 28px -14px rgb(0 0 0 / 0.7);
   --iui-shadow-lift: inset 0 1px 0 rgb(255 255 255 / 0.05), 0 16px 36px -16px rgb(0 0 0 / 0.8);
   --iui-thumb: color-mix(in srgb, var(--fg) 16%, var(--surface));
+  --iui-panel: color-mix(in srgb, var(--fg) 5%, var(--bg));
+  --iui-panel-in: color-mix(in srgb, var(--fg) 9%, var(--bg));
+  --iui-panel-ring: rgb(255 255 255 / 0.05);
   --iui-t-green-bg: #1b2c1d;
   --iui-t-green-fg: #a6dca0;
   --iui-t-amber-bg: #30251a;
@@ -1449,7 +1458,15 @@ figure.oc-iui, .oc-iui { margin: 12px 0 20px; font-size: 14.5px; line-height: 1.
 .oc-iui ul, .oc-iui ol { margin: 0; padding: 0; list-style: none; }
 .oc-iui li { margin: 0; }
 .oc-iui a { border-bottom: 0; }
-.oc-iui-card { position: relative; border-radius: 16px; background: var(--iui-surface); box-shadow: 0 0 0 1px var(--iui-ring), var(--iui-shadow); overflow: hidden; }
+/* 展示类:无外框。吸顶表头等需要实底的地方取页面底色。对话时间线(列表根 px-5)里左右外扩 16px,
+   卡内 16px 的内边距正好和正文对齐;其它位置(管理端、市场、工具卡)不外扩,避免出界。 */
+.oc-iui-card { --iui-surface: var(--bg); position: relative; border-radius: 0; background: transparent; }
+:is([data-testid="assistant-row"], [data-testid="process-stage"]) .oc-iui-card:not([data-iui="calculator"], [data-iui="form"], [data-iui="quiz"], [data-iui="draft"], [data-iui="recipe"], [data-iui="route"], [data-iui="quote"], [data-iui="kline"], [data-iui="intraday"], [data-iui="stocklist"]) { margin-inline: -16px; }
+/* 操作类:浅色调面板 */
+.oc-iui-card:is([data-iui="calculator"], [data-iui="form"], [data-iui="quiz"], [data-iui="draft"], [data-iui="recipe"], [data-iui="route"], [data-iui="quote"], [data-iui="kline"], [data-iui="intraday"], [data-iui="stocklist"]) {
+  --iui-surface: var(--iui-panel-in); --iui-sunken: var(--iui-panel-in);
+  border-radius: 20px; background: var(--iui-panel); box-shadow: inset 0 0 0 1px var(--iui-panel-ring); overflow: hidden;
+}
 .oc-iui-bare { border: 0; background: transparent; }
 .oc-iui-nested { margin: 0; }
 .oc-iui-card, .oc-iui-bare, .oc-iui-nested { animation: oc-iui-in 0.32s cubic-bezier(0.2, 0.7, 0.2, 1) both; }
@@ -1466,7 +1483,7 @@ figure.oc-iui, .oc-iui { margin: 12px 0 20px; font-size: 14.5px; line-height: 1.
 .oc-iui-title { font-size: 15.5px; font-weight: 650; line-height: 1.45; letter-spacing: -0.006em; color: var(--fg); min-width: 0; text-wrap: balance; }
 .oc-iui-subtitle { margin-top: 1px !important; font-size: 13px; line-height: 1.5; color: var(--muted); }
 .oc-iui-actions { display: flex; align-items: center; gap: 4px; flex-shrink: 0; margin-top: -2px; margin-left: auto; }
-.oc-iui-foot { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; margin-top: 2px; padding: 10px 12px 12px 16px; border-top: 1px solid var(--iui-line); font-size: 12.5px; line-height: 1.5; color: var(--faint); }
+.oc-iui-foot { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; margin-top: 2px; padding: 4px 12px 12px 16px; font-size: 12.5px; line-height: 1.5; color: var(--faint); }
 .oc-iui-bare > .oc-iui-foot { padding: 8px 0 0; border-top: 0; }
 .oc-iui-foot-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .oc-iui .oc-iui-foot-text a { color: var(--muted); }
@@ -1603,8 +1620,8 @@ figure.oc-iui, .oc-iui { margin: 12px 0 20px; font-size: 14.5px; line-height: 1.
   .oc-iui-compare.is-scroll::-webkit-scrollbar { display: none; }
   .oc-iui-compare.is-scroll > .oc-iui-compare-card { flex: 0 0 80%; scroll-snap-align: start; }
 }
-.oc-iui-compare-card { position: relative; display: flex; flex-direction: column; gap: 10px; border-radius: 16px; background: var(--iui-surface); box-shadow: 0 0 0 1px var(--iui-ring), var(--iui-shadow); padding: 16px; min-width: 0; transition: box-shadow 0.2s, transform 0.2s; }
-.oc-iui-compare-card.is-recommended { box-shadow: 0 0 0 1.5px var(--accent), var(--iui-shadow-lift); }
+.oc-iui-compare-card { position: relative; display: flex; flex-direction: column; gap: 10px; border-radius: 16px; background: var(--iui-panel); box-shadow: inset 0 0 0 1px var(--iui-panel-ring); padding: 16px; min-width: 0; transition: box-shadow 0.2s, transform 0.2s; }
+.oc-iui-compare-card.is-recommended { background: color-mix(in srgb, var(--accent) 5%, var(--bg)); box-shadow: inset 0 0 0 1.5px var(--accent); }
 .oc-iui-compare-media { margin: -16px -16px 2px; height: 132px; }
 .oc-iui-compare-card header { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
 .oc-iui .oc-iui-compare-card h4 { margin: 0; word-break: normal; overflow-wrap: break-word; font-size: 16px; font-weight: 650; line-height: 1.35; color: var(--fg); letter-spacing: -0.01em; }
@@ -1671,10 +1688,10 @@ figure.oc-iui, .oc-iui { margin: 12px 0 20px; font-size: 14.5px; line-height: 1.
 /* 后续建议:和消息操作行拉开距离,是胶囊文字按钮 */
 .oc-iui-suggestions-frame { margin-top: 16px; }
 .oc-iui-suggestions { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px; }
-.oc-iui-suggestion { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; min-height: 36px; padding: 7px 12px 7px 15px; border-radius: 999px; background: var(--iui-surface); box-shadow: 0 0 0 1px var(--iui-ring), 0 1px 2px rgb(0 0 0 / 0.03); font-size: 14px; line-height: 1.4; color: var(--fg); text-align: left; outline: none; transition: background-color 0.15s, box-shadow 0.15s, transform 0.12s; }
+.oc-iui-suggestion { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; min-height: 36px; padding: 7px 12px 7px 15px; border-radius: 999px; background: var(--iui-panel); box-shadow: inset 0 0 0 1px var(--iui-panel-ring); font-size: 14px; line-height: 1.4; color: var(--fg); text-align: left; outline: none; transition: background-color 0.15s, box-shadow 0.15s, transform 0.12s; }
 @media (hover: none) { .oc-iui-suggestion { min-height: 44px; } }
 .oc-iui-suggestion svg { flex-shrink: 0; color: var(--faint); transition: transform 0.15s, color 0.15s; }
-.oc-iui-suggestion:hover:not(:disabled) { background: var(--iui-sunken); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent); }
+.oc-iui-suggestion:hover:not(:disabled) { background: color-mix(in srgb, var(--fg) 6%, var(--bg)); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent); }
 .oc-iui-suggestion:hover:not(:disabled) svg { color: var(--accent); transform: translate(1px, -1px); }
 .oc-iui-suggestion:active:not(:disabled) { transform: scale(0.985); }
 .oc-iui-suggestion:focus-visible { box-shadow: 0 0 0 2px var(--ring); }
@@ -1707,7 +1724,7 @@ figure.oc-iui, .oc-iui { margin: 12px 0 20px; font-size: 14.5px; line-height: 1.
 .oc-iui-calc-list dd { margin: 0; color: var(--fg); font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
 .oc-iui-calc-list dd.is-up { color: var(--success); }
 .oc-iui-calc-list dd.is-down { color: var(--danger); }
-.oc-iui-calc-inputs { display: grid; grid-template-columns: 1fr; gap: 16px 20px; padding: 16px; background: var(--iui-sunken); border-top: 1px solid var(--iui-line); }
+.oc-iui-calc-inputs { display: grid; grid-template-columns: 1fr; gap: 16px 20px; margin: 0 8px; padding: 16px; border-radius: 14px; background: var(--iui-sunken); }
 @media (min-width: 640px) { .oc-iui-calc-inputs { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .oc-iui-field { display: flex; flex-direction: column; gap: 8px; min-width: 0; margin: 0; padding: 0; border: 0; }
 .oc-iui-field-row { flex-direction: row; align-items: center; justify-content: space-between; }
@@ -1740,7 +1757,7 @@ figure.oc-iui, .oc-iui { margin: 12px 0 20px; font-size: 14.5px; line-height: 1.
 .oc-iui-switch[aria-checked="true"] { background: var(--accent); }
 .oc-iui-switch[aria-checked="true"] > span { transform: translateX(18px); }
 .oc-iui-switch:focus-visible { box-shadow: 0 0 0 2px var(--ring); }
-.oc-iui-calc-basis { border-top: 1px solid var(--iui-line); padding: 4px 8px; }
+.oc-iui-calc-basis { padding: 4px 8px; }
 .oc-iui-nested .oc-iui-calc-basis { padding-bottom: 0; }
 .oc-iui-disclosure { display: inline-flex; align-items: center; gap: 4px; min-height: 34px; padding: 0 8px; border-radius: 999px; font-size: 12.5px; color: var(--muted); outline: none; }
 @media (hover: none) { .oc-iui-disclosure { min-height: 44px; } }
@@ -1836,7 +1853,7 @@ figure.oc-iui, .oc-iui { margin: 12px 0 20px; font-size: 14.5px; line-height: 1.
 .oc-iui-ingredient-note { font-size: 12px; color: var(--faint); }
 .oc-iui-ingredient-amount { flex-shrink: 0; font-weight: 650; color: var(--fg); font-variant-numeric: tabular-nums; transition: color 0.3s; }
 .oc-iui-ingredient-amount.is-changed { color: var(--accent); }
-.oc-iui .oc-iui-recipe-steps { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; padding: 14px 16px 16px; background: var(--iui-sunken); border-top: 1px solid var(--iui-line); }
+.oc-iui .oc-iui-recipe-steps { display: flex; flex-direction: column; gap: 10px; margin: 6px 8px 8px; padding: 14px 16px 16px; border-radius: 14px; background: var(--iui-sunken); }
 .oc-iui-recipe-steps > li { display: flex; gap: 12px; }
 
 /* 小测验 */
