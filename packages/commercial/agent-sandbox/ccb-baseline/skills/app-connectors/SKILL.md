@@ -35,6 +35,10 @@ oc-connect catalog notion        # 关键词搜索
 # 列出已绑定连接 + 每个连接可用的 actions(含 readOnly 标记)。未绑定时会输出引导文案。
 oc-connect list
 
+# 动作多或不确定参数时，按需查看某个 action 的完整说明与参数结构(JSON Schema)，再调用。
+oc-connect describe gnss-x               # 只列这个插件的 actions(一行摘要)
+oc-connect describe gnss-x gpst_utc      # 完整说明 + 参数名/类型/必填项
+
 # 调用一个 action:params 走 stdin(JSON)
 echo '{"path":"/"}' | oc-connect call webdav list_dir
 
@@ -170,6 +174,21 @@ echo '{}' | oc-plugin call knowledge-planet create_topic --confirm <确认码>
 用户没绑定对应 API 应用时，引导到 管理中心 → 插件；知识星球或微博未安装时先引导到 AI 市场安装，
 安装后分别使用微信或微博客户端扫码授权。二维码在对话框内看不到时，引导用户打开界面提供的独立
 网页链接；不要把临时二维码图片当永久链接。不要空转重试，也不要索要 cookie/token。
+
+## 市场 API 插件(以 GNSS-X 地学工具为例)
+
+用户从 AI 市场安装并在「管理中心 → 插件」填好 Token 后，`oc-connect list` 才会出现 `gnss-x`。
+它提供 60 个只读的地学计算/查询 action(时间系统、坐标、轨道、电离层、空间天气、大气、重力、
+海洋、GNSS、测量平差、电波传播)，action 名就是 GNSS-X 的工具名。
+
+- 先 `oc-connect describe gnss-x <action>` 看参数，再 `echo '<JSON>' | oc-connect call gnss-x <action>`；
+  矩阵、剖面、坐标对象等复杂输入按说明以 **JSON 字符串**传。
+- 结果是 JSON-RPC 外壳：数据在 `result`(通常是 `result.content[].text`)；出现 `error` 就如实转告。
+- `UPSTREAM_AUTH_FAILED`(HTTP 401)或 `error.code=-32001`：Token 无效、被撤销或该工具配额用完。
+  请用户到 https://mcp.gnss-x.ac.cn 「用户」页检查 Token 和剩余配额，必要时在「管理中心 → 插件」
+  重新填写；不要自动重试。用户还没有 Token 时，说明需要他本人去该网站注册并领取，平台不代领。
+- `RESULT_TOO_LARGE`：缩小时间/高度范围、增大步长或减少条数后重试。
+- 每次调用都消耗用户在 GNSS-X 的配额，只调用回答问题所需的 action，不要批量试探。
 
 ## 工具调用纪律(重要)
 

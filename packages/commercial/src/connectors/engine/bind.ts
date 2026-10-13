@@ -118,6 +118,14 @@ export async function bindWithBag(
     deps: input.deps,
   })
 
+  // ③' 上游用 2xx 报失败(JSON-RPC error / MCP isError)时,声明的 failurePointers 命中即判凭据被拒:
+  //     在派生身份与落库之前失败,已有连接不被替换。
+  for (const pointer of identity.failurePointers ?? []) {
+    const flagged = resolveResultPointer(probeResult, pointer)
+    if (flagged !== undefined && flagged !== null && flagged !== false)
+      throw new ConnectorError('UPSTREAM_AUTH_FAILED', 'identity probe reported a failure')
+  }
+
   // ④ 从 allowlist 投影后的结果派生账号身份 → account_key(命名空间加 slug 防跨 connector 撞)。
   const accountId = pointerScalar(probeResult, identity.accountKeyPointer, 'accountKey')
   const accountKey = computeAccountKey(`${meta.slug}:${accountId}`)
