@@ -39,6 +39,7 @@
 | `x/web-interface/view/detail` | — | 412 | — | |
 | `x/web-interface/wbi/search/type` | 200 | 200，约 29KB | **是**：错误签名返回 code 0 但结果为空（101 字节） | |
 | `x/web-interface/ranking/v2?rid=&type=all` | 200 | 200，**160–177KB** | 否 | 原始体大，需投影 |
+| ↳ 14:5x 复测 | **-352** | **-352** | 签名 + dm_img 指纹参数仍 -352 | 当天收紧；改用仍在更新的 `x/web-interface/ranking?rid=&day=3&type=1&arc_type=0`（200，100 条，榜首约 3 天内发布） |
 | `x/web-interface/popular` | 200 | 200 | 否 | |
 | `x/v2/reply/wbi/main`（签名） / `x/v2/reply/main` | — | 200 / 200 | 用签名版 | |
 | `x/v1/dm/list.so?oid=<cid>` | — | 200 `text/xml`，raw deflate | 否 | **非 JSON** |
@@ -75,7 +76,7 @@
 |---|---|---|---|
 | `search` | `wbi/search/type`（search_type=video） | keyword, order(totalrank/click/pubdate/dm/stow), page | bvid、标题（去 `<em>`：在结果投影后由前端/Agent 处理，见 §6.3）、UP、播放、弹幕、时长、发布时间、封面 |
 | `video` | `wbi/view` | bvid 或 aid | 标题、UP、七项统计、分 P（cid）、简介、发布时间、封面 |
-| `rank` | `ranking/v2` | rid（0=全站） | 排行列表 |
+| `rank` | `ranking`（近 3 天；`ranking/v2` 当天起对机房 IP -352） | rid（0=全站） | 排行列表（扁平字段 author / play / video_review） |
 | `popular` | `popular` | ps, pn | 热门列表 |
 | `comments` | `v2/reply/wbi/main` | oid(aid), mode(3 热门 / 2 最新), next | 评论（用户、点赞、回复数、正文、时间） |
 | `danmaku` | `v1/dm/list.so` | cid | 弹幕（时间轴、正文、发送时间） |

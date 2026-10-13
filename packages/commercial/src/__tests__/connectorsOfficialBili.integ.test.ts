@@ -73,7 +73,7 @@ function upstream(path: string): { status: number; body: string | Buffer; type?:
       return { status: 200, body: SPI }
     case '/x/web-interface/popular':
       return { status: 200, body: JSON.stringify({ code: 0, data: { list: [ARCHIVE] } }) }
-    case '/x/web-interface/ranking/v2':
+    case '/x/web-interface/ranking':
       return { status: 200, body: JSON.stringify({ code: 0, data: { list: [ARCHIVE] } }) }
     case '/x/web-interface/wbi/search/type':
       return {

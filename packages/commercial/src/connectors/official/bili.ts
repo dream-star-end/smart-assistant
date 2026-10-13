@@ -59,7 +59,6 @@ const archiveItem = {
         like: int,
       },
     },
-    score: num,
   },
 } as const
 
@@ -194,14 +193,15 @@ export const biliConnectorSpec: ConnectorSpecT = {
     {
       id: 'rank',
       description:
-        '排行榜(最多 100 条)。参数:rid 分区号可选(不填或 0 = 全站;如 1 动画、3 音乐、4 游戏、36 知识、188 科技)。' +
-        '结果 data.list[]:aid、bvid、title、pic、duration(秒)、pubdate、tname、owner{mid,name}、' +
-        'stat{view,danmaku,reply,favorite,coin,share,like}、score(综合分,可能缺失)。名次 = 数组下标 + 1。',
+        '排行榜(近 3 天,最多 100 条)。参数:rid 分区号可选(不填或 0 = 全站;如 1 动画、3 音乐、4 游戏、36 知识、188 科技)。' +
+        '结果 data.list[]:aid(字符串)、bvid、title、pic、author(UP 名)、mid、play(播放)、video_review(弹幕)、coins、' +
+        'duration("分:秒")。名次 = 数组下标 + 1。',
       request: {
         method: 'GET',
-        pathTemplate: '/x/web-interface/ranking/v2',
+        // ranking/v2 自 2026-10-13 起对机房 IP 返回 -352(签名、指纹参数都无效),这里用仍在更新的 ranking。
+        pathTemplate: '/x/web-interface/ranking',
         query: { rid: '/params/rid' },
-        staticQuery: { type: 'all' },
+        staticQuery: { day: '3', type: '1', arc_type: '0' },
         staticHeaders: { ...BILI_HEADERS },
       },
       params: {
@@ -212,14 +212,36 @@ export const biliConnectorSpec: ConnectorSpecT = {
       result: envelope({
         type: 'object',
         additionalProperties: false,
-        properties: { note: str, list: { type: 'array', items: archiveItem } },
+        properties: {
+          note: str,
+          list: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                aid: str,
+                bvid: str,
+                title: str,
+                pic: str,
+                author: str,
+                mid: int,
+                play: int,
+                video_review: int,
+                coins: int,
+                duration: str,
+              },
+            },
+          },
+        },
       }),
     },
     {
       id: 'popular',
       description:
         '当前热门视频。参数:ps 每页条数(1-50,默认 20)、pn 页码(默认 1)。' +
-        '结果 data.list[] 字段同 rank;data.no_more 表示没有下一页。',
+        '结果 data.list[]:aid、bvid、title、pic、duration(秒)、pubdate、tname、owner{mid,name}、' +
+        'stat{view,danmaku,reply,favorite,coin,share,like};data.no_more 表示没有下一页。',
       request: {
         method: 'GET',
         pathTemplate: '/x/web-interface/popular',

@@ -7,7 +7,7 @@
   {"type":"bili_videos","title"?,"items":[{"bvid","title","pic"?,"author"?,"owner"?:{"name"},"play"?,"stat"?:{"view","danmaku"},"video_review"?,"duration"?,"pubdate"?,"progress"?,"view_at"?,"fav_time"?}]}
   最多 30 条；search 的 title 带 <em> 高亮也可原样照抄。
 - bili_rank：排行榜（rank 的 data.list，名次按顺序）。
-  {"type":"bili_rank","title"?,"items":[{"bvid","title","pic"?,"owner":{"name"},"stat":{"view"},"score"?}]}
+  {"type":"bili_rank","title"?,"items":[{"bvid","title","pic"?,"author","play","video_review"?,"duration"?}]}
 - bili_video：单个视频详情（video 的 data）。
   {"type":"bili_video","bvid","title","pic"?,"owner":{"name"},"desc"?,"duration"?,"pubdate"?,"tname"?,"stat":{…七项},"pages"?:[{"page","part","duration"}]}
 - bili_comments：评论（comments 的 data）。
@@ -21,5 +21,5 @@
 
 示例：
 ```ui
-{"type":"bili_rank","title":"全站排行","items":[{"bvid":"BV1xx411c7mD","title":"示例视频","owner":{"name":"某UP"},"stat":{"view":1203456},"score":98765}]}
+{"type":"bili_rank","title":"全站排行","items":[{"bvid":"BV1xx411c7mD","title":"示例视频","author":"某UP","play":1203456,"video_review":3456,"duration":"12:34"}]}
 ```
