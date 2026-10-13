@@ -22,7 +22,9 @@ ticket   list [--project-id ID] [--status S] [--type T] [--priority P] [--assign
                 [--severity S] [--labels a,b] [--assignee A] [--blocked-reason R]
          claim <idOrIdent> --expected-version N [--owner agent:<id>]
          advance <idOrIdent> --expected-version N [--summary TEXT] [--output-md MD] [--run-id ID]
-         block <idOrIdent> --expected-version N --reason TEXT
+         block <idOrIdent> --expected-version N --reason TEXT [--evidence LINK]
+         done <idOrIdent> --expected-version N --reason TEXT --evidence LINK
+              agent 关单必须给理由与证据链接(PR、提交、日志路径等),写入审计;重开只能由人
          comment <idOrIdent> --body MD [--run-id ID]
 relation add <fromIdOrIdent> --to <toIdOrIdent> --kind parent|blocks|related
          remove <relationId>

@@ -96,6 +96,7 @@ import {
 } from './db/tickets.js'
 import { buildWeeklyReport, currentWeekPeriod, periodFromIsoWeek } from './db/weeklyReport.js'
 import {
+  TICKET_STATUS_LABEL,
   type Actor,
   type AuthorKind,
   GUARDRAIL_DEFAULTS,
@@ -540,6 +541,51 @@ function recordActivity(
   toValue?: string | null,
 ): void {
   createActivity(db, { ticketId, actor, actorId, action, field, fromValue, toValue })
+}
+
+// OCV5-414:agent 关单 / 受阻的审计。一条 activity(action=close_audit|block_audit,
+// to_value 为 JSON:谁、从哪个状态、理由、证据)+ 一条同作者的可见评论,与状态变更同一事务。
+const AUDIT_REASON_MAX = 2000
+const AUDIT_EVIDENCE_MAX = 4000
+
+function auditText(v: unknown, field: string, max: number): string | null {
+  const text = asString(v)?.trim()
+  if (!text) return null
+  if (text.length > max) throw new TaskboardValidationError(`${field} 超过 ${max} 字符`)
+  return text
+}
+
+function recordAudit(
+  db: TaskboardDb,
+  ticket: Ticket,
+  actor: Actor,
+  actorId: string,
+  action: 'close_audit' | 'block_audit',
+  to: 'done' | 'blocked',
+  reason: string | null,
+  evidence: string | null,
+): void {
+  const payload = { actorId, from: ticket.status, to, reason, evidence }
+  createActivity(db, {
+    ticketId: ticket.id,
+    actor,
+    actorId,
+    action,
+    field: 'audit',
+    fromValue: ticket.status,
+    toValue: JSON.stringify(payload),
+  })
+  const title = to === 'done' ? '关单' : '标记受阻'
+  createComment(db, {
+    ticketId: ticket.id,
+    authorKind: actor,
+    author: actorId,
+    body: [
+      `**${title}（${actorId}）**：${TICKET_STATUS_LABEL[ticket.status]} → ${TICKET_STATUS_LABEL[to]}`,
+      `- 理由：${reason ?? '（未填）'}`,
+      `- 证据：${evidence ?? '（未填）'}`,
+    ].join('\n'),
+  })
 }
 
 function mapHttpError(res: ServerResponse, err: unknown): boolean {
@@ -2102,8 +2148,9 @@ function handleBlock(
   ticket: Ticket,
 ): void {
   const expectedVersion = requireExpectedVersion(body)
-  const reason = asString(body.reason)
-  if (!reason || !reason.trim()) throw new TaskboardValidationError('reason is required')
+  const reason = auditText(body.reason, 'reason', AUDIT_REASON_MAX)
+  if (!reason) throw new TaskboardValidationError('reason is required')
+  const evidence = auditText(body.evidence, 'evidence', AUDIT_EVIDENCE_MAX)
   const stage = currentStage(db, ticket)
   assertTransition({
     from: ticket.status,
@@ -2111,21 +2158,20 @@ function handleBlock(
     actor,
     autoClose: stage?.autoClose,
     stageOnSuccess: stage?.onSuccess,
+    audit: { reason, evidence },
   })
-  const updated = updateTicket(db, ticket.id, expectedVersion, {
-    status: 'blocked',
-    blockedReason: reason,
-  })
-  recordActivity(
-    db,
-    ticket.id,
-    actor,
-    actorIdOf(actor, asString(body.owner), stage?.agentId),
-    'status_changed',
-    'status',
-    ticket.status,
-    'blocked',
-  )
+  const actorId = actorIdOf(actor, asString(body.owner), stage?.agentId)
+  const updated = db.transaction(() => {
+    const next = updateTicket(db, ticket.id, expectedVersion, {
+      status: 'blocked',
+      blockedReason: reason,
+    })
+    recordActivity(db, ticket.id, actor, actorId, 'status_changed', 'status', ticket.status, 'blocked')
+    if (actor !== 'human') {
+      recordAudit(db, ticket, actor, actorId, 'block_audit', 'blocked', reason, evidence)
+    }
+    return next
+  })()
   sendJson(res, 200, { ok: true, ticket: updated })
 }
 
@@ -2237,26 +2283,32 @@ function handleDone(
 ): void {
   const expectedVersion = requireExpectedVersion(body)
   const stage = currentStage(db, ticket)
+  const reason = auditText(body.reason, 'reason', AUDIT_REASON_MAX)
+  const evidence = auditText(body.evidence, 'evidence', AUDIT_EVIDENCE_MAX)
+  if (actor === 'agent' && !stage?.autoClose && (!reason || !evidence)) {
+    throw new TaskboardValidationError(
+      'agent 关单必须同时提供 reason（关单理由）与 evidence（证据链接），会写入审计记录',
+    )
+  }
   assertTransition({
     from: ticket.status,
     to: 'done',
     actor,
     autoClose: stage?.autoClose ?? false,
+    audit: { reason, evidence },
   })
-  const updated = updateTicket(db, ticket.id, expectedVersion, {
-    status: 'done',
-    closedAt: Date.now(),
-  })
-  recordActivity(
-    db,
-    ticket.id,
-    actor,
-    actorIdOf(actor),
-    'status_changed',
-    'status',
-    ticket.status,
-    'done',
-  )
+  const actorId = actorIdOf(actor, asString(body.owner), stage?.agentId)
+  const updated = db.transaction(() => {
+    const next = updateTicket(db, ticket.id, expectedVersion, {
+      status: 'done',
+      closedAt: Date.now(),
+    })
+    recordActivity(db, ticket.id, actor, actorId, 'status_changed', 'status', ticket.status, 'done')
+    if (actor !== 'human' || reason || evidence) {
+      recordAudit(db, ticket, actor, actorId, 'close_audit', 'done', reason, evidence)
+    }
+    return next
+  })()
   sendJson(res, 200, { ok: true, ticket: updated })
 }
 

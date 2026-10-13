@@ -507,12 +507,18 @@ export class PatrolEngine {
           skipped += this.recordSkip(db, ticket, stage, 'concurrency_full') ? 1 : 0
           continue
         }
-        let claimed: TicketRun
+        let claimed: TicketRun | null
         try {
           claimed = this.claimTicket(db, ticket, stage, now)
         } catch (err) {
           this.slots.release()
           this.log('taskboard claim failed', { ticketId: ticket.id, err: String(err) })
+          continue
+        }
+        if (!claimed) {
+          // 列表快照之后单据已被关闭 / 受阻 / 改动:不建 run、不占 lease(OCV5-414)。
+          this.slots.release()
+          this.log('taskboard claim skipped: ticket changed since listing', { ticketId: ticket.id })
           continue
         }
         started += 1
@@ -621,36 +627,51 @@ export class PatrolEngine {
     ticket: Ticket,
     stage: PipelineStage,
     now: number,
-  ): TicketRun {
+  ): TicketRun | null {
     const owner = stage.agentId ? `agent:${stage.agentId}` : 'agent:taskboard'
-    assertTransition({
-      from: ticket.status,
-      to: 'running',
-      actor: 'agent',
-      hasLease: true,
-      autoClose: stage.autoClose,
-    })
     const ttlMs = alignedLeaseTtlMs(stage.timeoutSec, this.leaseTtlMs, this.leaseRenewIntervalMs)
-    const run = acquireLease(db, ticket.id, stage.id, owner, ttlMs, {
-      agentId: stage.agentId,
-      trigger: 'patrol',
-      now,
-    })
-    const agentId = run.agentId ?? stage.agentId ?? 'unidentified'
-    const sessionKey = buildPatrolSessionKey(agentId, ticket.id, stage.id, run.id)
-    const withKey = updateRun(db, run.id, { sessionKey })
-    updateTicket(db, ticket.id, ticket.version, { status: 'running' })
-    recordActivity(
-      db,
-      ticket.id,
-      'agent',
-      owner,
-      'status_changed',
-      'status',
-      ticket.status,
-      'running',
-    )
-    return withKey
+    // 认领在一个 immediate 事务里重读单据:列表快照之后被关单 / 受阻 / 改版本就放弃,
+    // lease、run 与 running 状态要么一起落库,要么都不落(OCV5-414)。
+    return db
+      .transaction((): TicketRun | null => {
+        const current = getTicket(db, ticket.id)
+        if (
+          !current ||
+          current.status !== 'ready' ||
+          current.version !== ticket.version ||
+          current.stageId !== stage.id
+        ) {
+          return null
+        }
+        assertTransition({
+          from: current.status,
+          to: 'running',
+          actor: 'agent',
+          hasLease: true,
+          autoClose: stage.autoClose,
+        })
+        const run = acquireLease(db, current.id, stage.id, owner, ttlMs, {
+          agentId: stage.agentId,
+          trigger: 'patrol',
+          now,
+        })
+        const agentId = run.agentId ?? stage.agentId ?? 'unidentified'
+        const sessionKey = buildPatrolSessionKey(agentId, current.id, stage.id, run.id)
+        const withKey = updateRun(db, run.id, { sessionKey })
+        updateTicket(db, current.id, current.version, { status: 'running' })
+        recordActivity(
+          db,
+          current.id,
+          'agent',
+          owner,
+          'status_changed',
+          'status',
+          current.status,
+          'running',
+        )
+        return withKey
+      })
+      .immediate()
   }
 
   private async runClaimed(
@@ -714,6 +735,39 @@ export class PatrolEngine {
         ok: false,
         output: '',
         error: err instanceof Error ? err.message : String(err),
+      })
+      return
+    }
+
+    // 准备上下文是异步的:这段时间里单据可能被人或 agent 关单 / 受阻。不再是 running 就
+    // 以 skipped(ticket_closed)结算本 run,不启动 agent(OCV5-414)。
+    const live = getTicket(db, ticket.id)
+    if (!live || live.status !== 'running') {
+      const at = this.nowFn()
+      if (owner) {
+        settleLeaseRun(
+          db,
+          run.id,
+          owner,
+          {
+            status: 'skipped',
+            skipReason: 'ticket_closed',
+            summary: `单据已${live ? live.status : '删除'},未启动 agent`,
+            outputMd: null,
+            error: null,
+            finishedAt: at,
+            durationMs: run.startedAt != null ? at - run.startedAt : null,
+            tokensIn: null,
+            tokensOut: null,
+            costUsd: null,
+          },
+          at,
+        )
+      }
+      this.log('taskboard run not dispatched: ticket no longer running', {
+        ticketId: ticket.id,
+        runId: run.id,
+        status: live?.status ?? 'missing',
       })
       return
     }

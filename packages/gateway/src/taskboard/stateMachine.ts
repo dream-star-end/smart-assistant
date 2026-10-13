@@ -9,6 +9,9 @@
 // 坑:
 //   1. Actor 含 system,给熔断/循环护栏用。system 不能认领(ready→running 必须是
 //      持有 lease 的 agent),也不能关单(除非 stage 显式 auto_close)、不能取消。
+//      agent 关单(OCV5-414,用户 2026-10-13 决定):stage 未 auto_close 时必须同时给
+//      关单理由与证据链接(input.audit),由 HTTP 层落审计;缺一即 audit_required。
+//      agent 受阻(ready/waiting_human → blocked)必须给理由。重开与取消仍只属于人。
 //   2. autoClose 由调用方作为上下文传入(真值是 PipelineStage.autoClose,已进冻结
 //      契约)。本模块不臆造「最后一站 + !requireHumanAck = 自动关单」——那种推断在
 //      流水线被改序后会静默失效。
@@ -43,6 +46,7 @@ export const TRANSITION_DENIED_CODES = [
   'lease_required',
   'on_success_required',
   'auto_close_required',
+  'audit_required',
   'terminal_locked',
 ] as const
 export type TransitionDeniedCode = (typeof TRANSITION_DENIED_CODES)[number]
@@ -61,6 +65,8 @@ export interface TransitionInput {
   hasLease?: boolean
   /** 当前 stage 是否显式配置了自动关单。缺省视为 false。 */
   autoClose?: boolean
+  /** agent 关单 / 受阻时的审计材料(OCV5-414)。只看是否非空,落库由 HTTP 层负责。 */
+  audit?: { reason?: string | null; evidence?: string | null }
 }
 
 export interface TransitionRule {
@@ -75,6 +81,10 @@ export interface TransitionRule {
   requireOnSuccess?: readonly OnSuccessAction[]
   /** agent/system 走这条必须 autoClose。human 随时可关单。 */
   requireAutoClose?: boolean
+  /** 未 autoClose 时 agent 仍可走,但必须给理由 + 证据(audit)。system 不适用。 */
+  agentMayCloseWithAudit?: boolean
+  /** agent 走这条必须给理由(audit.reason)。 */
+  requireReasonForAgent?: boolean
 }
 
 // ── 转移表(机器可读,测试与前端共用这一份) ─────────────────────────────────
@@ -86,6 +96,7 @@ function closeRule(from: TicketStatus): TransitionRule {
     actors: ['human', 'agent', 'system'],
     label: '标记完成',
     requireAutoClose: true,
+    agentMayCloseWithAudit: true,
   }
 }
 
@@ -117,7 +128,13 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
     requireLeaseForAgent: true,
   },
   { from: 'ready', to: 'waiting_human', actors: ['human'], label: '改为待确认' },
-  { from: 'ready', to: 'blocked', actors: ['human', 'system'], label: '标记受阻' },
+  {
+    from: 'ready',
+    to: 'blocked',
+    actors: ['human', 'agent', 'system'],
+    label: '标记受阻',
+    requireReasonForAgent: true,
+  },
   { from: 'ready', to: 'backlog', actors: ['human'], label: '撤回批准' },
   closeRule('ready'),
   cancelRule('ready'),
@@ -149,7 +166,13 @@ export const TRANSITION_TABLE: readonly TransitionRule[] = [
   // waiting_human:等人拍板
   { from: 'waiting_human', to: 'ready', actors: ['human'], label: '打回重做' },
   { from: 'waiting_human', to: 'running', actors: ['human'], label: '确认并继续' },
-  { from: 'waiting_human', to: 'blocked', actors: ['human'], label: '标记受阻' },
+  {
+    from: 'waiting_human',
+    to: 'blocked',
+    actors: ['human', 'agent'],
+    label: '标记受阻',
+    requireReasonForAgent: true,
+  },
   { from: 'waiting_human', to: 'backlog', actors: ['human'], label: '退回立项' },
   closeRule('waiting_human'),
   cancelRule('waiting_human'),
@@ -177,6 +200,10 @@ for (const rule of TRANSITION_TABLE) {
 
 function statusName(s: TicketStatus): string {
   return `${TICKET_STATUS_LABEL[s]}(${s})`
+}
+
+function hasText(v: string | null | undefined): boolean {
+  return typeof v === 'string' && v.trim().length > 0
 }
 
 function deny(code: TransitionDeniedCode, reason: string): TransitionVerdict {
@@ -245,10 +272,23 @@ export function canTransition(input: TransitionInput): TransitionVerdict {
   }
 
   if (rule.requireAutoClose && actor !== 'human' && !input.autoClose) {
-    return deny(
-      'auto_close_required',
-      '完成状态只有人能给。AI 不能把单据标为完成（除非本阶段显式配置了 auto_close）。',
-    )
+    if (actor === 'agent' && rule.agentMayCloseWithAudit) {
+      if (!hasText(input.audit?.reason) || !hasText(input.audit?.evidence)) {
+        return deny(
+          'audit_required',
+          'agent 关单必须同时给出关单理由（reason）与证据链接（evidence），会写入审计记录。',
+        )
+      }
+    } else {
+      return deny(
+        'auto_close_required',
+        '系统角色不能把单据标为完成（除非本阶段显式配置了 auto_close）。',
+      )
+    }
+  }
+
+  if (rule.requireReasonForAgent && actor === 'agent' && !hasText(input.audit?.reason)) {
+    return deny('audit_required', `agent 把单据转到${statusName(to)}必须给出理由（reason）。`)
   }
 
   return { ok: true }
