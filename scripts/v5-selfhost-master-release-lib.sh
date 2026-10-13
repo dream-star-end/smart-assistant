@@ -779,7 +779,8 @@ build_master_release() {
   mlog "  selfhost watch selftest + disarm-observe / lock / rearm behavior @ pinned staging"
   local watch_t watch_log
   for watch_t in v5-selfhost-watch-selftest.sh v5-selfhost-watch-disarm-observe.test.sh \
-      v5-selfhost-watch-lock.test.sh v5-selfhost-watch-rearm.test.sh v5-selfhost-watch-sync.test.sh; do
+      v5-selfhost-watch-lock.test.sh v5-selfhost-watch-rearm.test.sh v5-selfhost-watch-sync.test.sh \
+      v5-selfhost-watch-alert.test.sh; do
     watch_log="$MASTER_GATE_TMPDIR/${watch_t}.log"
     if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash "scripts/$watch_t" >"$watch_log" 2>&1 ); then
       tail -n 20 "$watch_log" >&2 || true

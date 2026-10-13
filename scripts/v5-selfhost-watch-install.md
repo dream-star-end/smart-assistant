@@ -66,3 +66,17 @@ timer 实际执行的是安装目录里的 `watch.sh`，不是 git 工作树。
 
 下一拍 timer 按武装路径检查，日志应出现 `复合健康绿,清失败计数`。
 
+## 告警（OCV5-410）
+
+`alert.sh`（仓库 `scripts/v5-selfhost-watch-alert.sh`）随部署与 `watch.sh` 一起同步。看护在回切、FAIL-LOUD、两级兜底失败、停用期间变红 / 恢复、`--rearm` 时调用它；systemd 的 `OnFailure` 仍以 `alert.sh <unit>` 调用。
+
+模式由 root 0600 文件 `/etc/openclaude/selfhost-watch-alert.env` 的 `WATCH_ALERT_MODE` 决定，**默认 dry**：
+
+- `off`：只写看护日志。
+- `dry`：写看护日志，并把本会发出的告警存为 `/var/lib/openclaude-v5-selfhost-watch/alert-dry/*.json`（最近 200 条），不连网、不写库。
+- `live`：企微群机器人 webhook（`WATCH_ALERT_WECOM_KEY`，带外，不依赖 master / PG）+ 站内信（`WATCH_ALERT_INBOX_UID`，默认 3）与 `admin_alert_outbox`（同一事务）。任一通道失败写 `alert-spool/`，下一拍重投；超过 50 次或 24 小时转 `alert-spool/dead/`。
+
+配置文件只按 `KEY=VALUE` 解析，不执行；权限不是 600/400 时不使用其中的 key。日志只记 key 指纹。`alert.sh --status` 显示模式、通道、积压；`deploy-v5-selfhost.sh --status` 的 `watch:` 行也带这一段。
+
+切 live 前须用户：建企微群机器人并写 key、确认收件人 uid、同意先发一条带「测试」字样的消息。
+

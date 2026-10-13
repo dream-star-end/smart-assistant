@@ -1224,37 +1224,60 @@ sync_boot_scripts_from() {
 
 # OCV5-404:08-18 装上的 watch.sh 一直没被替换,9 月的双槽改动从没到过宿主,停用后也没人发现。
 # committed 之后从新 live 原子同步:同目录临时文件,内容一致且语法通过才 mv -T。
-# 只换 watch.sh;watch.env、alert.sh、停用标记一律不动,重新武装只走人工 watch.sh --rearm。
+# OCV5-410 起 alert.sh 同样随 release 同步(仓库 scripts/v5-selfhost-watch-alert.sh)。
+# watch.env、告警配置 /etc/openclaude/selfhost-watch-alert.env、停用标记一律不动,
+# 重新武装只走人工 watch.sh --rearm。
+WATCH_SYNC_FILES=("v5-selfhost-watch.sh:watch.sh" "v5-selfhost-watch-alert.sh:alert.sh")
+
 watch_install_state() { # <release-root> → same|drift|missing-src|not-installed
-  local src="$1/scripts/v5-selfhost-watch.sh" dst="$V5_WATCH_DIR/watch.sh"
-  if [[ ! -f "$src" || -L "$src" ]]; then echo missing-src; return 0; fi
-  if [[ ! -f "$dst" ]]; then echo not-installed; return 0; fi
-  if cmp -s -- "$src" "$dst"; then echo same; else echo drift; fi
+  local rel="$1" pair src dst state=same
+  [[ -f "$V5_WATCH_DIR/watch.sh" ]] || { echo not-installed; return 0; }
+  for pair in "${WATCH_SYNC_FILES[@]}"; do
+    src="$rel/scripts/${pair%%:*}"
+    dst="$V5_WATCH_DIR/${pair##*:}"
+    if [[ ! -f "$src" || -L "$src" ]]; then echo missing-src; return 0; fi
+    if [[ ! -f "$dst" ]] || ! cmp -s -- "$src" "$dst"; then state=drift; fi
+  done
+  echo "$state"
 }
 
-sync_watch_from() { # <release-root>  失败只 return 1,已安装副本保持原样
-  local rel="$1" src="$1/scripts/v5-selfhost-watch.sh" dst="$V5_WATCH_DIR/watch.sh" tmp
-  case "$(watch_install_state "$rel")" in
-    same) log "  ✓ 看护已是本 release 版本 ($(sha256sum <"$dst" | cut -c1-12))"; return 0 ;;
-    not-installed) log "  ⚠ 本机未安装看护($dst 不存在),不同步"; return 0 ;;
-    missing-src) log "  ⚠ 看护同步跳过: release 缺 $src"; return 1 ;;
-  esac
-  if [[ "$DRY" == 1 ]]; then
-    log "  [dry-run] 原子安装 $src → $dst(不动 watch.env / alert.sh / 停用标记)"
-    return 0
-  fi
+install_watch_file() { # <src> <dst>  同目录临时文件 + cmp + bash -n + mv -T;失败不动 dst
+  local src="$1" dst="$2" tmp
+  if [[ -f "$dst" ]] && cmp -s -- "$src" "$dst"; then return 0; fi
   if ! bash -n -- "$src"; then
-    log "  ⚠ 看护同步拒绝: $src 语法检查失败,已安装副本未变"
+    log "  ⚠ 看护同步拒绝: $src 语法检查失败,$dst 未变"
     return 1
   fi
-  tmp="$(mktemp -- "$V5_WATCH_DIR/watch.sh.XXXXXX")" || { log "  ⚠ 看护同步失败: 无法建临时文件"; return 1; }
+  tmp="$(mktemp -- "$V5_WATCH_DIR/$(basename -- "$dst").XXXXXX")" || { log "  ⚠ 看护同步失败: 无法建临时文件"; return 1; }
   if ! { cp -- "$src" "$tmp" && cmp -s -- "$src" "$tmp" && bash -n -- "$tmp" \
       && chmod 0755 -- "$tmp" && mv -T -- "$tmp" "$dst"; }; then
     rm -f -- "$tmp"
-    log "  ⚠ 看护同步失败,已安装副本未变"
+    log "  ⚠ 看护同步失败,$dst 未变"
     return 1
   fi
-  log "  ✓ 看护已同步 → $dst ($(sha256sum <"$dst" | cut -c1-12), from $rel)"
+}
+
+sync_watch_from() { # <release-root>  失败只 return 1,已安装副本保持原样
+  local rel="$1" pair rc=0
+  case "$(watch_install_state "$rel")" in
+    same) log "  ✓ 看护已是本 release 版本 ($(sha256sum <"$V5_WATCH_DIR/watch.sh" | cut -c1-12))"; return 0 ;;
+    not-installed) log "  ⚠ 本机未安装看护($V5_WATCH_DIR/watch.sh 不存在),不同步"; return 0 ;;
+    missing-src) log "  ⚠ 看护同步跳过: release 缺看护脚本"; return 1 ;;
+  esac
+  if [[ "$DRY" == 1 ]]; then
+    log "  [dry-run] 原子安装 watch.sh / alert.sh → $V5_WATCH_DIR(不动 watch.env / 告警配置 / 停用标记)"
+    return 0
+  fi
+  # alert.sh 先装:新 watch.sh 依赖它的参数;反过来旧 watch.sh 不调用 alert.sh,先换无害。
+  for pair in "${WATCH_SYNC_FILES[@]}"; do
+    [[ "${pair##*:}" == alert.sh ]] || continue
+    install_watch_file "$rel/scripts/${pair%%:*}" "$V5_WATCH_DIR/alert.sh" || rc=1
+  done
+  if ((rc == 0)); then
+    install_watch_file "$rel/scripts/v5-selfhost-watch.sh" "$V5_WATCH_DIR/watch.sh" || rc=1
+  fi
+  if ((rc != 0)); then return 1; fi
+  log "  ✓ 看护已同步 → $V5_WATCH_DIR watch.sh $(sha256sum <"$V5_WATCH_DIR/watch.sh" | cut -c1-12) alert.sh $(sha256sum <"$V5_WATCH_DIR/alert.sh" | cut -c1-12) (from $rel)"
 }
 
 # --status / --smoke 用:安装副本对 live、停用标记、看护最近一次状态。
@@ -1267,7 +1290,16 @@ watch_summary() { # <live-root-or-empty>
   armed="$(sed -n 's/^recovery_armed=//p' "$st" 2>/dev/null | head -n1)"
   health="$(sed -n 's/^health=//p' "$st" 2>/dev/null | head -n1)"
   checked="$(sed -n 's/^checked_at=//p' "$st" 2>/dev/null | head -n1)"
-  echo "install=$state disarm=$marker recovery_armed=${armed:-?} health=${health:-?} checked_at=${checked:-?}"
+  local alert="absent"
+  # 旧 alert.sh 把任何参数当单元名写一行假告警,只对带 OCV5-410 标识的新版调 --status。
+  if [[ -f "$V5_WATCH_DIR/alert.sh" ]]; then
+    alert="legacy"
+    if [[ -x "$V5_WATCH_DIR/alert.sh" ]] && grep -q 'OCV5-410' "$V5_WATCH_DIR/alert.sh" 2>/dev/null; then
+      alert="$(timeout 10 "$V5_WATCH_DIR/alert.sh" --status 2>/dev/null | head -n1 | tr ' ' ',' || true)"
+      [[ -n "$alert" ]] || alert="status-unavailable"
+    fi
+  fi
+  echo "install=$state disarm=$marker recovery_armed=${armed:-?} health=${health:-?} checked_at=${checked:-?} alert=${alert}"
 }
 
 assert_watch_matches_live() { # <live-root>

@@ -48,6 +48,9 @@ WATCH_NOTIFY_COOLDOWN_SEC="${WATCH_NOTIFY_COOLDOWN_SEC:-21600}"
 WATCH_INSTALLED_BIN="${WATCH_INSTALLED_BIN:-/opt/openclaude/v5-selfhost-watch/watch.sh}"
 WATCH_REARM_CHECKS="${WATCH_REARM_CHECKS:-3}"
 WATCH_REARM_INTERVAL_SEC="${WATCH_REARM_INTERVAL_SEC:-5}"
+# OCV5-410:告警脚本。显式 WATCH_ALERT_BIN,或安装目录里有可执行 alert.sh 才调用;
+# 仓库里跑的看护测试没有 alert.sh,不会去写宿主状态目录。
+WATCH_ALERT_BIN="${WATCH_ALERT_BIN:-}"
 
 wlog() {
   local msg
@@ -555,6 +558,39 @@ compound_green() {
     && probe_egress
 }
 
+# 告警(OCV5-410):永远 best-effort、永远 return 0,不能让告警问题改变看护的判定或退出码。
+watch_alert_bin() {
+  if [[ -n "${WATCH_ALERT_BIN:-}" ]]; then
+    printf '%s\n' "$WATCH_ALERT_BIN"
+  elif [[ -x "${WATCH_SCRIPT_DIR}/alert.sh" ]]; then
+    printf '%s\n' "${WATCH_SCRIPT_DIR}/alert.sh"
+  fi
+  return 0
+}
+
+watch_alert() { # <critical|warning|info> <event> <message>
+  local bin
+  bin="$(watch_alert_bin)"
+  [[ -n "$bin" && -x "$bin" ]] || return 0
+  # 只入队(写 spool / 演练记录,毫秒级、不连网);投递在本拍结束的 watch_alert_flush。
+  if ! WATCH_LOG="$WATCH_LOG" WATCH_LIVE="$WATCH_LIVE" timeout 10 "$bin" \
+    --event "$2" --severity "$1" --message "$3" >/dev/null 2>&1; then
+    wlog "WARN 告警脚本返回非 0 event=$2" || true
+  fi
+  return 0
+}
+
+watch_alert_flush() {
+  local bin
+  bin="$(watch_alert_bin)"
+  [[ -n "$bin" && -x "$bin" ]] || return 0
+  # alert.sh 自己有 20s 总预算与逐通道超时;这里的 timeout 只兜底。
+  if ! WATCH_LOG="$WATCH_LOG" WATCH_LIVE="$WATCH_LIVE" timeout 30 "$bin" --flush >/dev/null 2>&1; then
+    wlog "WARN 告警补投失败" || true
+  fi
+  return 0
+}
+
 # 状态文件与通知只描述许可、是否真的探针、健康三件事。禁止写成 healthy。
 status_path() {
   if [[ -n "${WATCH_STATUS:-}" ]]; then
@@ -691,6 +727,12 @@ notify_watch_state() {
       exit 0
     fi
     wlog "watch-status recovery_armed=${armed} suppression_reason=${suppression:-none} observation_executed=${observed} health=${health}" || exit 1
+    # 本拍刚由 FAIL-LOUD / 两级兜底失败转为停用:已有专门告警,这里不重复报。
+    if [[ "$armed" == false && "$observed" == true && "$health" == red && "${WATCH_DISARM_ALERTED:-0}" != 1 ]]; then
+      watch_alert warning disarmed_red "自动回滚处于停用（${suppression:-none}），只读巡检发现复合健康红。自动回滚不会动作，需要人工处理。下一步：查 healthz 与 journalctl -u ${WATCH_MASTER_UNIT}；恢复后 watch.sh --rearm。"
+    elif [[ "$health" == green && "$last_fp" == *"|red" ]]; then
+      watch_alert info recovered "复合健康已恢复为绿（recovery_armed=${armed}）。"
+    fi
     tmp="$(mktemp "${dir}/.watch-notify.XXXXXX")" || exit 1
     trap 'rm -f -- "$tmp"' EXIT
     {
@@ -752,7 +794,9 @@ watch_once() {
     wlog "FAIL-LOUD class=$loud 不自动回切"
     write_manual_recovery "$loud"
     write_disarm "$loud"
+    WATCH_DISARM_ALERTED=1
     emit_watch_status false "$(suppression_reason_from_files)" true red || true
+    watch_alert critical fail_loud "FAIL-LOUD class=${loud}：不自动回切，已写停用标记与 manual-recovery，自动回滚停用。下一步：按 class 排查（deps-pg / schema / env / external-*），恢复后走应急恢复收尾，再 watch.sh --rearm。"
     return 0
   fi
 
@@ -767,6 +811,7 @@ watch_once() {
   fi
 
   wlog "达到阈值,进入两级兜底"
+  watch_alert critical rollback_start "复合健康连续红 ${count}/${WATCH_FAIL_THRESHOLD}，开始两级兜底（tier1 回切上一份 release → tier2 恢复 unit）$(is_true_dry && echo '（WATCH_DRY 演练）')。"
   if prev_release_is_valid; then
     if tier1_rollback; then
       sleep 3
@@ -778,13 +823,16 @@ watch_once() {
         fi
         write_fail_count 0
         wlog "tier1 成功且转绿,冻结计数"
+        watch_alert critical tier1_rolled_back "tier1 已回切到上一份 release 并恢复复合健康绿。当前 live=$(readlink -f "$WATCH_LIVE" 2>/dev/null || echo unknown)。下一步：查出问题的那次发布。"
         emit_watch_status true "" true green || true
         return 0
       fi
       wlog "tier1 回切后仍红,进入 tier2"
+      watch_alert critical tier1_still_red "tier1 回切后复合健康仍红，进入 tier2（恢复 worktree unit）。"
     fi
   else
     wlog "无上一份合法 release,跳过 tier1 直接 tier2"
+    watch_alert warning tier1_skipped "没有上一份合法 release，跳过 tier1，直接 tier2。"
   fi
 
   if tier2_restore_units; then
@@ -797,6 +845,7 @@ watch_once() {
     if compound_green; then
       write_fail_count 0
       wlog "tier2 成功且转绿,冻结计数"
+      watch_alert critical tier2_restored "tier2 已恢复 worktree unit 并转绿。下一步：确认 live 指向与 unit 来源，排查原因。"
       emit_watch_status true "" true green || true
       return 0
     fi
@@ -805,6 +854,8 @@ watch_once() {
   write_manual_recovery "tier1+tier2-failed"
   write_disarm "tier1+tier2-failed"
   wlog "两级兜底仍红,已 disarm。需要人工跑应急恢复脚本。"
+  WATCH_DISARM_ALERTED=1
+  watch_alert critical rollback_failed "两级兜底后仍红，已停用自动回滚（watch-disarmed + manual-recovery）。立即人工处理：scripts/v5-selfhost-restore-worktree-units.sh，确认健康后 watch.sh --rearm。"
   emit_watch_status false "$(suppression_reason_from_files)" true red || true
   return 1
 }
@@ -815,6 +866,7 @@ watch_once() {
 rearm_refuse() {
   wlog "rearm 拒绝: $*"
   printf 'REARM_REFUSED %s\n' "$*" >&2
+  watch_alert warning rearm_refused "watch.sh --rearm 被拒绝：$*"
 }
 
 # 08-18 停用的原因就是 deps-pg:healthz 必须明确给出 deps.pg=ok,缺字段也算没确认。
@@ -902,6 +954,7 @@ watch_rearm() {
   fi
   emit_watch_status true "" true green || wlog "WARN rearm 后状态文件写入失败"
   wlog "rearm: 已重新武装,停用标记归档到 $dst"
+  watch_alert info rearmed "已重新武装自动回滚，停用标记归档到 ${dst}。"
   exec 8<&-
   echo "REARM_OK archived=$dst"
 }
@@ -1094,8 +1147,10 @@ main() {
   case "${1:-}" in
     -h|--help) usage_watch; exit 0 ;;
     --selftest) watch_selftest ;;
-    --once|"") watch_once ;;
-    --rearm) watch_rearm ;;
+    # 本拍(含 set -e 中断)结束时投递已入队告警;保留原退出码。不用 `|| rc=$?`,
+    # 那会让 watch_once 内部的 set -e 全部失效。
+    --once|"") trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; watch_once ;;
+    --rearm) trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; watch_rearm ;;
     *)
       echo "未知参数: $1" >&2
       usage_watch >&2
