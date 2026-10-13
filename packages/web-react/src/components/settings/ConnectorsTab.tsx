@@ -1,7 +1,7 @@
 import { Plug, Store } from 'lucide-react'
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../../lib/api'
-import { type ConnectorConnection, type ConnectorProvider, type ConnectorsResponse, type DeclarativeCatalogEntry, type DeclarativeConnection, type DeclarativeManagementConnector, type DeclarativeManagementResponse, type LocalPlugin, type PluginManagementResponse, type RuntimePluginAccount, type RuntimePluginCatalogEntry, connectorCapabilityLabel, declarativeCapabilityLabel, disabledPluginsOf, enabledPluginsOf } from '../../lib/connectors'
+import { type ConnectorConnection, type ConnectorProvider, type ConnectorsResponse, type DeclarativeCatalogEntry, type DeclarativeConnection, type DeclarativeManagementConnector, type DeclarativeManagementResponse, type LocalPlugin, type PluginManagementResponse, type RuntimePluginAccount, type RuntimePluginCatalogEntry, connectorCapabilityLabel, declarativeCapabilityLabel, disabledPluginsOf, enabledPluginsOf, isPublicAuthMode } from '../../lib/connectors'
 import type { AuthSession } from '../../lib/types'
 import { Alert, Button, EmptyState, ListSkeleton, PanelHeader, useConfirm, useToast } from '../ui'
 import { managedPluginProvider } from '../../lib/managedPluginProviders'
