@@ -16,6 +16,14 @@ tags: [connectors, plugins, email, webdav, notion, github, feishu, calendar, zsx
 API 插件写操作必须逐次确认；受管浏览器插件以 `oc-plugin list` 显示的写入模式为准：
 `逐次确认`会展示确认卡，`账号免逐次确认`会直接执行。**不要再口头问一次“要我执行吗”**。
 
+## 结果展示：插件专属组件（按需读取）
+
+微博、知乎、飞书各有专属的展示组件，定义不在系统提示里。在网页对话里要展示其中某个插件的结果时，
+先用 Read 读本技能目录下对应的定义文件，每个对话读一次即可，然后按定义写 ```ui 块：
+微博 `references/ui-weibo.md`，知乎 `references/ui-zhihu.md`，飞书 `references/ui-feishu.md`。
+本技能目录就是加载时给出的 Base directory，通常是 `/run/oc/claude-config/skills/app-connectors`。
+没有 Intelligent UI 协议时（例如微信、定时任务）不要读这些文件，也不要写这些块。
+
 ## 用法
 
 ```bash
