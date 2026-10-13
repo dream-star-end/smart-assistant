@@ -2,7 +2,9 @@
 
 本文件只说明安装。实现回合不执行这里的命令，不替换宿主 `/opt/openclaude/v5-selfhost-watch/watch.sh`，不删除 `watch-disarmed`。
 
-timer 实际执行的是安装目录里的 `watch.sh`，不是 git 工作树。`scripts/deploy-v5-selfhost.sh` 不复制这支脚本，合入或发版不会自动换掉它。
+timer 实际执行的是安装目录里的 `watch.sh`，不是 git 工作树。
+
+从 OCV5-404 起，`scripts/deploy-v5-selfhost.sh --deploy` 在 committed 之后会从新 live release 原子同步 `watch.sh`（同目录临时文件，内容一致且 `bash -n` 通过才 `mv -T`），只换这一支脚本，`watch.env`、`alert.sh`、停用标记都不动。同步失败只告警不回滚；`--smoke` 会因看护漂移失败，`--status` 的 `watch:` 行显示 `install=same|drift`。下面的手工步骤只在同步失败或首次安装时用。
 
 ## 不要做的事
 
@@ -47,3 +49,20 @@ timer 实际执行的是安装目录里的 `watch.sh`，不是 git 工作树。`
 标记的 inode / mtime / 大小 / sha256 在安装前后必须一致（上面的 `test "$before" = "$after"`）。alert.sh 这次不用换：观察成功退出 0，不会每 30 秒触发 `OnFailure`。
 
 下一拍 timer（约 30 秒，AccuracySec 5 秒）会执行新文件。装完后只读核对状态文件：`recovery_armed=false`，`observation_executed=true`，`health` 为 `green` 或 `red`，`checked_at` 有值。日志里不能把 `recovery_armed=false` 写成 healthy。
+
+## 重新武装（OCV5-404）
+
+停用标记只能用已安装副本的 `--rearm` 解除，不要 `rm`：
+
+```bash
+/opt/openclaude/v5-selfhost-watch/watch.sh --rearm
+```
+
+整个检查和归档都持有 selfhost 发布锁（`/run/openclaude-v5-selfhost/deploy.lock` 的 flock）：期间不会有 `--deploy` 开始（deploy 拿不到锁会排队重试），也不会有第二个 `--rearm`。锁被占用就直接拒绝。
+
+它要求：`WATCH_DRY=0`；已安装副本就是正在执行的这份；连续 `WATCH_REARM_CHECKS`（默认 3，间隔 `WATCH_REARM_INTERVAL_SEC` 默认 5 秒）次都满足——标记是普通文件、没有 manual-recovery、没有活的发布锁 holder / 维护窗口 / cutover grace、复合健康绿、healthz 明确给出 `deps.pg=ok`（缺字段也拒绝）；最后一次探针后、归档前再查一遍标记、manual-recovery、维护和 grace。任一不满足打印 `REARM_REFUSED <原因>` 并退出 1，标记和失败计数都不动。
+
+全部通过后在锁内把失败计数清零，再把标记改名为 `watch-disarmed.rearmed-<UTC>` 留作证据；改名失败就把计数恢复原值并拒绝。成功时状态文件写 `recovery_armed=true`，打印 `REARM_OK archived=<路径>`。
+
+下一拍 timer 按武装路径检查，日志应出现 `复合健康绿,清失败计数`。
+

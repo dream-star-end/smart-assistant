@@ -48,8 +48,9 @@ usage() {
   恢复完成后请人工收尾看护状态(本脚本不自动清):
     rm -f /run/openclaude-v5-selfhost/cutover-grace-until \
           /run/openclaude-v5-selfhost/health-fail-count \
-          /opt/openclaude/openclaude-v5-selfhost-releases/.manual-recovery-required \
-          /opt/openclaude/v5-selfhost-watch/watch-disarmed
+          /opt/openclaude/openclaude-v5-selfhost-releases/.manual-recovery-required
+    /opt/openclaude/v5-selfhost-watch/watch.sh --rearm
+  不要直接 rm watch-disarmed:--rearm 会先核对复合健康、发布锁和安装副本,再把标记归档(OCV5-404)。
 EOF
 }
 
@@ -273,7 +274,7 @@ fi
 
 health_unconfirmed() {
   log "✗ unit 已恢复但健康未确认 backup=$BACKUP_REAL"
-  log "人工收尾: rm -f /run/openclaude-v5-selfhost/cutover-grace-until /run/openclaude-v5-selfhost/health-fail-count /opt/openclaude/openclaude-v5-selfhost-releases/.manual-recovery-required /opt/openclaude/v5-selfhost-watch/watch-disarmed"
+  log "人工收尾: 先确认健康,再 rm -f /run/openclaude-v5-selfhost/cutover-grace-until /run/openclaude-v5-selfhost/health-fail-count /opt/openclaude/openclaude-v5-selfhost-releases/.manual-recovery-required;然后 /opt/openclaude/v5-selfhost-watch/watch.sh --rearm(不要直接 rm watch-disarmed)"
   exit 1
 }
 
@@ -319,4 +320,4 @@ fi
 log "✓ egress-health ok"
 
 log "✓ restore-worktree-units 完成 backup=$BACKUP_REAL"
-log "人工收尾(本次不自动做): rm -f /run/openclaude-v5-selfhost/cutover-grace-until /run/openclaude-v5-selfhost/health-fail-count /opt/openclaude/openclaude-v5-selfhost-releases/.manual-recovery-required /opt/openclaude/v5-selfhost-watch/watch-disarmed"
+log "人工收尾(本次不自动做): rm -f /run/openclaude-v5-selfhost/cutover-grace-until /run/openclaude-v5-selfhost/health-fail-count /opt/openclaude/openclaude-v5-selfhost-releases/.manual-recovery-required;然后 /opt/openclaude/v5-selfhost-watch/watch.sh --rearm(不要直接 rm watch-disarmed)"
