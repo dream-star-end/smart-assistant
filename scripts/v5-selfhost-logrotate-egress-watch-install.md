@@ -32,9 +32,13 @@ bash scripts/v5-selfhost-logrotate-egress-watch-install.sh --root "$root"
 rm -rf -- "$root"
 ```
 
-`--check-host-readonly` 只扫描 `/etc/logrotate.conf` 和 `/etc/logrotate.d` 里这两条精确路径，并用私有 state 跑 `logrotate -d /etc/logrotate.conf`。它不使用 `-f`。`DUPLICATE_EGRESS` 或 `DUPLICATE_WATCH` 不是 0 就停。`LIVE_DRY_RUN` 必须是 0。
+`--check-host-readonly` 先统计 `/etc/logrotate.conf` 和 `/etc/logrotate.d` 里这两条精确路径的裸 token，再用私有 state 做一次合并的 `logrotate -d`：同一条命令同时纳入现有 `/etc/logrotate.conf` 和候选片段。这不是“先扫一遍、再单独 `-d` 候选”或“再单独 `-d` 现网配置”，两次分开的 `-d` 不能当作合并验证。带引号的路径和能覆盖这两条日志的通配，只有合并进同一次 dry-run 才会被 logrotate 报成 `duplicate log entry`。`DUPLICATE_EGRESS` 或 `DUPLICATE_WATCH` 不是 0 就停。`LIVE_DRY_RUN` 必须是 0。它不使用 `-f`，也不写 `/etc`。
 
-宿主上真正放入 `/etc` 时按同一顺序手工做。`include /etc/logrotate.d` 会读点文件、`.old` 和 `.tmp`，但跳过以 `~` 结尾以及 `.bak`、`.disabled`、`.rpmnew`、`.rpmsave`。所以临时文件必须放在目标目录里且以 `~` 结尾，校验后再 `mv -T`；备份不要放在 `/etc/logrotate.d` 里面。logrotate 会忽略 include 目录里属主不是 root 的文件，临时文件要 `chown root:root`，不能只改权限位。
+`--root` 在第一次 `mkdir`、`chmod` 或复制备份之前检查目标目录和备份目录的每一级。父目录若是指向外部的符号链接，脚本退出 2 并打印 `REFUSE_ESCAPE`，不会在链接目标里创建 `logrotate.d`。合并 dry-run 用的是候选的私有副本，失败时不留下 `~` 文件，已有目标的内容不变。
+
+宿主上真正放入 `/etc` 时按同一顺序手工做。`include /etc/logrotate.d` 会读点文件、`.old` 和 `.tmp`，但跳过以 `~` 结尾以及 `.bak`、`.disabled`、`.rpmnew`、`.rpmsave`。所以临时文件必须放在目标目录里且以 `~` 结尾；备份不要放在 `/etc/logrotate.d` 里面。logrotate 会忽略 include 目录里属主不是 root 的文件，参与合并的文件要 `chown root:root`，不能只改权限位。
+
+合并视图必须同时看见“除正在替换的目标文件以外的现有片段”和候选。只对临时文件做 `logrotate -d` 看不到引号和通配。若目标已经存在，不能再让 `/etc/logrotate.conf` 的 `include /etc/logrotate.d` 把旧文件和候选一起算进去，否则重装会被报成自己跟自己重复。失败就删掉临时文件，不执行 `mv -T`。
 
 ```bash
 name=openclaude-v5-selfhost-egress-watch
@@ -42,20 +46,54 @@ dest=/etc/logrotate.d/$name
 src=deploy/v5-selfhost/logrotate.d/$name
 bash scripts/v5-selfhost-logrotate-egress-watch-install.sh --check-host-readonly
 install -d -m 0755 /var/backups/openclaude-v5-selfhost-logrotate
-if [[ -f $dest ]]; then
+if [[ -f $dest && ! -L $dest ]]; then
   cp -a -- "$dest" "/var/backups/openclaude-v5-selfhost-logrotate/$name.$(date -u +%Y%m%dT%H%M%SZ)"
 fi
 tmp=$(mktemp --suffix '~' -p /etc/logrotate.d "${name}.XXXXXX")
 cp -a -- "$src" "$tmp"
 chown root:root "$tmp"
 chmod 644 "$tmp"
+stage=$(mktemp -d)
+parent=$(mktemp)
 state=$(mktemp)
-if ! logrotate -d -s "$state" "$tmp"; then
-  rm -f -- "$tmp" "$state"
-  echo "syntax failed; destination not replaced" >&2
+fail_closed() {
+  rm -f -- "$tmp" "$parent" "$state"
+  rm -rf -- "$stage"
+  echo "combined dry-run failed; destination not replaced" >&2
   exit 1
+}
+for f in /etc/logrotate.d/*; do
+  [[ -f $f && ! -L $f ]] || continue
+  base=$(basename -- "$f")
+  [[ $base == "$name" ]] && continue
+  case $base in
+    *~|*.bak|*.disabled|*.rpmnew|*.rpmsave) continue ;;
+  esac
+  cp -a -- "$f" "$stage/$base"
+  chown root:root "$stage/$base"
+  chmod 644 "$stage/$base"
+done
+python3 - "$stage/00-existing.conf" <<'PY'
+import os, sys
+dest = "/etc/logrotate.d"
+out = sys.argv[1]
+kept = []
+for raw in open("/etc/logrotate.conf", encoding="utf-8", errors="replace"):
+    code = raw.split("#", 1)[0].strip()
+    parts = code.split()
+    if len(parts) >= 2 and parts[0] == "include" and os.path.realpath(parts[1]) == os.path.realpath(dest):
+        continue
+    kept.append(raw)
+open(out, "w", encoding="utf-8").writelines(kept)
+PY
+chown root:root "$stage/00-existing.conf" "$parent" "$tmp"
+chmod 644 "$stage/00-existing.conf" "$parent" "$tmp"
+printf 'include %s\ninclude %s\n' "$stage" "$tmp" >"$parent"
+if ! logrotate -d -s "$state" "$parent"; then
+  fail_closed
 fi
-rm -f -- "$state"
+rm -f -- "$parent" "$state"
+rm -rf -- "$stage"
 sha256sum "$tmp" "$dest" 2>/dev/null || sha256sum "$tmp"
 mv -T -- "$tmp" "$dest"
 sha256sum "$dest"

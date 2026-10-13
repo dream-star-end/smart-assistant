@@ -20,7 +20,9 @@ usage:
       --config <file> --state <file> --fixture-root <dir>
 
 --root / and any destination that resolves to /etc/logrotate.d are refused.
---fixture-rotate is the only logrotate -f entry point; it refuses real log paths.
+--fixture-rotate is the only logrotate -f entry point. It allows only the
+directives used by the dedicated tests, and refuses include, scripts, and
+real log paths. Path checks run before any mkdir, chmod, or copy.
 EOF
 }
 
@@ -148,16 +150,117 @@ for root in roots:
 PY
 }
 
-logrotate_debug() {
-  local conf="$1"
-  local state rc
+# Read-only merged check. Returns 0, 3 (duplicate log entry), 2 (escape), or 1.
+# scope "host" is one logrotate -d of /etc/logrotate.conf plus the candidate.
+# A rehearsal root stages sibling snippets except the file being replaced, and
+# drops logrotate.conf's include of that directory so reinstall is not a
+# self-duplicate. The candidate must already be a private copy.
+combined_debug() {
+  local candidate="$1"
+  local scope="$2"
+  local state parent stage err rc python_rc
   state="$(mktemp)"
+  parent="$(mktemp)"
+  err="$(mktemp)"
+  stage=""
+  if [[ "$scope" == "host" ]]; then
+    printf 'include /etc/logrotate.conf\ninclude %s\n' "$candidate" >"$parent"
+  else
+    stage="$(mktemp -d)"
+    set +e
+    python3 - "$scope" "$stage" "$DEST_NAME" >"$err" 2>&1 <<'PY'
+import os, shutil, sys
+root, stage, dest_name = sys.argv[1:]
+skip_suffix = ("~", ".bak", ".disabled", ".rpmnew", ".rpmsave")
+dest_dir = os.path.join(root, "etc", "logrotate.d")
+conf = os.path.join(root, "etc", "logrotate.conf")
+if os.path.islink(dest_dir) or os.path.islink(conf):
+    raise SystemExit("REFUSE_ESCAPE")
+if os.path.isdir(dest_dir):
+    for name in sorted(os.listdir(dest_dir)):
+        if name == dest_name or name.endswith(skip_suffix):
+            continue
+        src = os.path.join(dest_dir, name)
+        if os.path.islink(src):
+            raise SystemExit("REFUSE_ESCAPE")
+        if os.path.isfile(src):
+            shutil.copy(src, os.path.join(stage, name))
+if os.path.isfile(conf):
+    kept = []
+    for raw in open(conf, encoding="utf-8", errors="replace"):
+        code = raw.split("#", 1)[0].strip()
+        parts = code.split()
+        if len(parts) >= 2 and parts[0] == "include" and os.path.realpath(parts[1]) == os.path.realpath(dest_dir):
+            continue
+        kept.append(raw)
+    open(os.path.join(stage, "00-existing.conf"), "w", encoding="utf-8").writelines(kept)
+PY
+    python_rc=$?
+    set -e
+    if [[ "$python_rc" -ne 0 ]]; then
+      cat "$err" >&2
+      if grep -q 'REFUSE_ESCAPE' "$err"; then
+        rm -rf -- "$stage"
+        rm -f -- "$state" "$parent" "$err"
+        printf 'REFUSE_ESCAPE\n' >&2
+        return 2
+      fi
+      rm -rf -- "$stage"
+      rm -f -- "$state" "$parent" "$err"
+      return 1
+    fi
+    find "$stage" -type f -exec chown root:root {} + -exec chmod 644 {} +
+    printf 'include %s\ninclude %s\n' "$stage" "$candidate" >"$parent"
+  fi
+  chown root:root "$parent" "$candidate"
+  chmod 644 "$parent" "$candidate"
   set +e
-  logrotate -d -s "$state" "$conf" >/dev/null
+  logrotate -d -s "$state" "$parent" >"$err" 2>&1
   rc=$?
   set -e
-  rm -f -- "$state"
-  [[ "$rc" -eq 0 ]]
+  if [[ "$rc" -ne 0 ]]; then
+    cat "$err" >&2
+    if grep -q 'duplicate log entry' "$err"; then
+      rc=3
+    else
+      rc=1
+    fi
+  fi
+  if [[ -n "$stage" ]]; then
+    rm -rf -- "$stage"
+  fi
+  rm -f -- "$state" "$parent" "$err"
+  return "$rc"
+}
+
+path_stays_inside() {
+  local path="$1"
+  local cursor real
+  case "$path" in
+    "$root_real"|"$root_real"/*) ;;
+    *)
+      printf 'REFUSE_ESCAPE\n' >&2
+      exit 2
+      ;;
+  esac
+  cursor="$path"
+  while [[ "$cursor" != "$root_real" && "$cursor" != "/" ]]; do
+    if [[ -L "$cursor" ]]; then
+      printf 'REFUSE_ESCAPE\n' >&2
+      exit 2
+    fi
+    if [[ -e "$cursor" ]]; then
+      real="$(realpath -- "$cursor")"
+      case "$real" in
+        "$root_real"|"$root_real"/*) ;;
+        *)
+          printf 'REFUSE_ESCAPE\n' >&2
+          exit 2
+          ;;
+      esac
+    fi
+    cursor="$(dirname -- "$cursor")"
+  done
 }
 
 mode=""
@@ -219,12 +322,13 @@ if [[ "$mode" == "check" ]]; then
   fi
   printf 'DUPLICATE_EGRESS=%s\n' "$egress_n"
   printf 'DUPLICATE_WATCH=%s\n' "$watch_n"
-  state="$(mktemp)"
-  set +e
-  logrotate -d -s "$state" /etc/logrotate.conf >/dev/null
-  dry_rc=$?
-  set -e
-  rm -f -- "$state"
+  cand="$(mktemp)"
+  cp -a -- "$DEFAULT_TEMPLATE" "$cand"
+  chown root:root "$cand"
+  chmod 644 "$cand"
+  dry_rc=0
+  combined_debug "$cand" host || dry_rc=$?
+  rm -f -- "$cand"
   printf 'LIVE_DRY_RUN=%s\n' "$dry_rc"
   if [[ "$egress_n" != "0" || "$watch_n" != "0" ]]; then
     exit 4
@@ -243,8 +347,12 @@ if [[ "$mode" == "fixture" ]]; then
     *) die "FIXTURE_ROOT_NOT_TMP" ;;
   esac
   python3 - "$fix_config" "$fix_state" "$root_real" "$PATH_EGRESS" "$PATH_WATCH" <<'PY'
-import os, sys
+import os, shlex, sys
 conf, state, root, egress, watch = sys.argv[1:]
+allowed = {
+    "su", "daily", "maxsize", "rotate", "compress", "delaycompress",
+    "missingok", "notifempty", "copytruncate", "create",
+}
 forbidden = (
     egress,
     watch,
@@ -253,37 +361,66 @@ forbidden = (
     "/etc/logrotate.d",
     "/var/lib/logrotate/status",
 )
-def under(path):
+
+def boundary(path, label):
+    cursor = os.path.abspath(path)
+    while True:
+        if os.path.islink(cursor):
+            raise SystemExit("REFUSE_ESCAPE " + label)
+        if cursor == root or cursor == "/":
+            break
+        parent = os.path.dirname(cursor)
+        if parent == cursor:
+            break
+        cursor = parent
     real = os.path.realpath(path)
-    return real == root or real.startswith(root + os.sep)
-if not under(conf):
+    if real != root and not real.startswith(root + os.sep):
+        raise SystemExit("REFUSE_REAL_PATH " + label)
+
+boundary(conf, "conf")
+boundary(state, "state")
+if not os.path.isfile(conf):
     raise SystemExit("REFUSE_REAL_PATH conf")
-state_dir = os.path.dirname(os.path.abspath(state))
-if not under(state_dir):
-    raise SystemExit("REFUSE_REAL_PATH state")
 text = open(conf, encoding="utf-8").read()
 for item in forbidden:
     if item in text:
         raise SystemExit("REFUSE_REAL_PATH " + item)
 paths = []
 for raw in text.splitlines():
-    line = raw.split("#", 1)[0].strip()
-    if not line:
+    code = raw.split("#", 1)[0].strip()
+    if not code:
         continue
-    if "{" in line:
-        line = line.split("{", 1)[0].strip()
-    for tok in line.split():
+    try:
+        tokens = shlex.split(code, posix=True)
+    except ValueError:
+        raise SystemExit("REFUSE_DIRECTIVE quote")
+    if not tokens:
+        continue
+    if tokens[-1] == "{":
+        tokens = tokens[:-1]
+    if not tokens or tokens in (["{"], ["}"]):
+        continue
+    if all(tok.startswith("/") for tok in tokens):
+        for tok in tokens:
+            if any(ch in tok for ch in "*?["):
+                raise SystemExit("REFUSE_REAL_PATH glob")
+            boundary(tok, tok)
+        paths.extend(tokens)
+        continue
+    word = tokens[0]
+    if word == "include":
+        raise SystemExit("REFUSE_INCLUDE")
+    if word not in allowed:
+        raise SystemExit("REFUSE_DIRECTIVE " + word)
+    for tok in tokens[1:]:
         if tok.startswith("/"):
-            paths.append(tok)
+            if any(ch in tok for ch in "*?["):
+                raise SystemExit("REFUSE_REAL_PATH glob")
+            boundary(tok, tok)
 if not paths:
     raise SystemExit("REFUSE_REAL_PATH no-paths")
-for tok in paths:
-    if any(ch in tok for ch in "*?["):
-        raise SystemExit("REFUSE_REAL_PATH glob")
-    if not under(tok):
-        raise SystemExit("REFUSE_REAL_PATH " + tok)
 PY
-  # Private state only. The config was proven to name nothing outside the fixture.
+  # Private state only. Include, scripts, and outside paths were refused above.
   logrotate -f -s "$fix_state" "$fix_config" >/dev/null
   printf 'FIXTURE_ROTATED=1\n'
   exit 0
@@ -308,9 +445,20 @@ esac
 
 validate_template "$template"
 dest_dir="$root_real/etc/logrotate.d"
-mkdir -p -- "$dest_dir"
-chmod 755 "$dest_dir"
-dest_dir_real="$(realpath "$dest_dir")"
+bak_dir="$root_real/var/backups/openclaude-v5-selfhost-logrotate"
+# Boundary before the first mkdir, chmod, or copy. A symlink parent must not
+# receive logrotate.d or the backup directory.
+path_stays_inside "$dest_dir"
+path_stays_inside "$bak_dir"
+if [[ -L "$dest_dir" || -L "$bak_dir" || -L "$dest_dir/$DEST_NAME" ]]; then
+  printf 'REFUSE_ESCAPE\n' >&2
+  exit 2
+fi
+if [[ -d "$dest_dir" ]]; then
+  dest_dir_real="$(realpath -- "$dest_dir")"
+else
+  dest_dir_real="$dest_dir"
+fi
 if [[ "$dest_dir_real" == "/etc/logrotate.d" ]]; then
   printf 'REFUSE_LIVE_LOGROTATE_D\n' >&2
   exit 2
@@ -325,30 +473,83 @@ esac
 
 dest="$dest_dir_real/$DEST_NAME"
 exclude=""
-if [[ -e "$dest" ]]; then
-  exclude="$(realpath "$dest")"
+if [[ -e "$dest" && ! -L "$dest" ]]; then
+  exclude="$(realpath -- "$dest")"
+elif [[ -L "$dest" ]]; then
+  printf 'REFUSE_ESCAPE\n' >&2
+  exit 2
 fi
 scan_roots=()
-if [[ -f "$root_real/etc/logrotate.conf" ]]; then
+if [[ -f "$root_real/etc/logrotate.conf" && ! -L "$root_real/etc/logrotate.conf" ]]; then
   scan_roots+=("$root_real/etc/logrotate.conf")
 fi
-scan_roots+=("$dest_dir_real")
-hits="$(scan_duplicates "$exclude" "${scan_roots[@]}")"
+if [[ -d "$dest_dir_real" && ! -L "$dest_dir_real" ]]; then
+  scan_roots+=("$dest_dir_real")
+fi
+hits=""
+if [[ "${#scan_roots[@]}" -gt 0 ]]; then
+  hits="$(scan_duplicates "$exclude" "${scan_roots[@]}")"
+fi
 if [[ -n "$hits" ]]; then
   printf '%s\n' "$hits" >&2
   printf 'DUPLICATE\n' >&2
   exit 3
 fi
 
+cand="$(mktemp)"
+cp -a -- "$template" "$cand"
+chown root:root "$cand"
+chmod 644 "$cand"
+combined_rc=0
+combined_debug "$cand" "$root_real" || combined_rc=$?
+rm -f -- "$cand"
+case "$combined_rc" in
+  0) ;;
+  2) exit 2 ;;
+  3)
+    printf 'DUPLICATE\n' >&2
+    exit 3
+    ;;
+  *)
+    printf 'COMBINED_FAIL\n' >&2
+    exit 1
+    ;;
+esac
+
 sha_before="none"
 backup="none"
 if [[ -f "$dest" && ! -L "$dest" ]]; then
-  bak_dir="$root_real/var/backups/openclaude-v5-selfhost-logrotate"
   mkdir -p -- "$bak_dir"
-  backup="$bak_dir/${DEST_NAME}.$(date -u +%Y%m%dT%H%M%SZ)"
+  path_stays_inside "$bak_dir"
+  bak_real="$(realpath -- "$bak_dir")"
+  case "$bak_real" in
+    "$root_real"/*) ;;
+    *)
+      printf 'REFUSE_ESCAPE\n' >&2
+      exit 2
+      ;;
+  esac
+  backup="$bak_real/${DEST_NAME}.$(date -u +%Y%m%dT%H%M%SZ)"
   cp -a -- "$dest" "$backup"
   sha_before="$(sha256sum "$dest" | awk 'NR==1 {print $1}')"
 fi
+
+mkdir -p -- "$dest_dir"
+path_stays_inside "$dest_dir"
+dest_dir_real="$(realpath -- "$dest_dir")"
+if [[ "$dest_dir_real" == "/etc/logrotate.d" ]]; then
+  printf 'REFUSE_LIVE_LOGROTATE_D\n' >&2
+  exit 2
+fi
+case "$dest_dir_real" in
+  "$root_real"/*) ;;
+  *)
+    printf 'REFUSE_ESCAPE\n' >&2
+    exit 2
+    ;;
+esac
+chmod 755 "$dest_dir_real"
+dest="$dest_dir_real/$DEST_NAME"
 
 tmp="$(mktemp --suffix '~' -p "$dest_dir_real" "${DEST_NAME}.XXXXXX")"
 trap 'rm -f -- "$tmp"' EXIT
@@ -366,10 +567,6 @@ if [[ -n "${OC_LOGROTATE_PAUSE_FILE:-}" ]]; then
       exit 1
     fi
   done
-fi
-if ! logrotate_debug "$tmp"; then
-  printf 'SYNTAX_FAIL\n' >&2
-  exit 1
 fi
 sha_after="$(sha256sum "$tmp" | awk 'NR==1 {print $1}')"
 mv -T -- "$tmp" "$dest"

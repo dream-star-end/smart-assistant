@@ -204,6 +204,70 @@ else
   cat "$T/dup.err" >&2 || true
 fi
 
+qroot="$(mktemp -d "$T/qdup.XXXXXX")"
+mkdir -p -- "$qroot/etc/logrotate.d"
+qfile="$qroot/etc/logrotate.d/existing"
+cat >"$qfile" <<'EOF'
+"/var/log/openclaude-v5-selfhost-egress.log" {
+    su root adm
+    missingok
+}
+EOF
+printf 'include %s\n' "$qroot/etc/logrotate.d" >"$qroot/etc/logrotate.conf"
+qsha="$(sha256sum "$qfile" | awk 'NR==1 {print $1}')"
+run_rc "$T/qdup" "$INSTALL" --root "$qroot" --template "$TEMPLATE"
+if [[ "$(cat "$T/qdup.rc")" == "3" ]] \
+  && grep -qx '^DUPLICATE$' "$T/qdup.err" \
+  && [[ ! -e "$qroot/etc/logrotate.d/$DEST_NAME" ]] \
+  && [[ -z "$(find "$qroot" -name '*~' -print)" ]] \
+  && [[ "$(sha256sum "$qfile" | awk 'NR==1 {print $1}')" == "$qsha" ]]; then
+  ok "quoted duplicate rejected and the existing rule was not replaced"
+  behavior quoted_duplicate_rejected 1
+else
+  bad "quoted duplicate was installed rc=$(cat "$T/qdup.rc")"
+  cat "$T/qdup.out" "$T/qdup.err" >&2 || true
+fi
+
+groot="$(mktemp -d "$T/gdup.XXXXXX")"
+mkdir -p -- "$groot/etc/logrotate.d"
+gfile="$groot/etc/logrotate.d/existing"
+cat >"$gfile" <<'EOF'
+/var/log/openclaude-v5-selfhost-*.log {
+    su root adm
+    missingok
+}
+EOF
+gsha="$(sha256sum "$gfile" | awk 'NR==1 {print $1}')"
+run_rc "$T/gdup" "$INSTALL" --root "$groot" --template "$TEMPLATE"
+if [[ "$(cat "$T/gdup.rc")" == "3" ]] \
+  && grep -qx '^DUPLICATE$' "$T/gdup.err" \
+  && [[ ! -e "$groot/etc/logrotate.d/$DEST_NAME" ]] \
+  && [[ -z "$(find "$groot" -name '*~' -print)" ]] \
+  && [[ "$(sha256sum "$gfile" | awk 'NR==1 {print $1}')" == "$gsha" ]]; then
+  ok "overlapping glob rejected and the existing rule was not replaced"
+  behavior glob_duplicate_rejected 1
+else
+  bad "glob duplicate was installed rc=$(cat "$T/gdup.rc")"
+  cat "$T/gdup.out" "$T/gdup.err" >&2 || true
+fi
+
+sroot="$(mktemp -d "$T/slink.XXXXXX")"
+elsewhere="$(mktemp -d "$T/elsewhere.XXXXXX")"
+ln -s "$elsewhere" "$sroot/etc"
+run_rc "$T/slink" "$INSTALL" --root "$sroot" --template "$TEMPLATE"
+if [[ "$(cat "$T/slink.rc")" == "2" ]] \
+  && grep -q 'REFUSE_ESCAPE' "$T/slink.err" \
+  && [[ ! -e "$elsewhere/logrotate.d" ]] \
+  && [[ ! -d "$sroot/var" ]] \
+  && [[ -z "$(find "$sroot" "$elsewhere" -name '*~' -print)" ]]; then
+  ok "symlink parent was refused before any directory was created outside"
+  behavior symlink_parent_no_write 1
+else
+  bad "symlink parent wrote outside or was not refused rc=$(cat "$T/slink.rc")"
+  cat "$T/slink.out" "$T/slink.err" >&2 || true
+  ls -ld "$elsewhere" "$elsewhere/logrotate.d" "$sroot/etc" >&2 || true
+fi
+
 ok_root="$(mktemp -d "$T/ok.XXXXXX")"
 run_rc "$T/inst" "$INSTALL" --root "$ok_root" --template "$TEMPLATE"
 inst_dest="$ok_root/etc/logrotate.d/$DEST_NAME"
@@ -528,6 +592,70 @@ if [[ "$(cat "$T/badforce.rc")" != "0" ]] \
 else
   bad "real egress path was not refused"
   cat "$T/badforce.err" >&2 || true
+fi
+
+outside_log="$(mktemp "$T/outside-log.XXXXXX")"
+printf 'OUTSIDE\n' >"$outside_log"
+outside_bytes="$(stat -c %s "$outside_log")"
+nest="$(mktemp -d "$T/nest.XXXXXX")"
+printf 'INSIDE\n' >"$nest/inside.log"
+cat >"$nest/nested.conf" <<EOF
+$outside_log {
+    su root adm
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+cat >"$nest/main.conf" <<EOF
+$nest/inside.log {
+    su root adm
+    daily
+    missingok
+    notifempty
+    copytruncate
+}
+include $nest/nested.conf
+EOF
+chmod 644 "$nest/main.conf" "$nest/nested.conf"
+run_rc "$T/nest" "$INSTALL" --fixture-rotate --config "$nest/main.conf" --state "$nest/state" --fixture-root "$nest"
+if [[ "$(cat "$T/nest.rc")" != "0" ]] \
+  && grep -q 'REFUSE_INCLUDE' "$T/nest.err" \
+  && [[ ! -e "$nest/state" ]] \
+  && [[ ! -e "$outside_log.1" ]] \
+  && [[ "$(stat -c %s "$outside_log")" == "$outside_bytes" ]] \
+  && [[ "$(cat "$outside_log")" == "OUTSIDE" ]]; then
+  ok "nested include was refused before logrotate and the outside log stayed intact"
+  behavior nested_include_rejected 1
+else
+  bad "nested include escaped or was not refused rc=$(cat "$T/nest.rc")"
+  cat "$T/nest.err" >&2 || true
+  ls -l "$nest" "$outside_log" "$outside_log.1" >&2 || true
+fi
+
+state_fix="$(mktemp -d "$T/statefix.XXXXXX")"
+state_target="$T/state-target-must-not-exist"
+printf 'KEEP\n' >"$state_fix/a.log"
+cat >"$state_fix/a.conf" <<EOF
+$state_fix/a.log {
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+ln -s "$state_target" "$state_fix/state"
+chmod 644 "$state_fix/a.conf"
+run_rc "$T/statefix" "$INSTALL" --fixture-rotate --config "$state_fix/a.conf" --state "$state_fix/state" --fixture-root "$state_fix"
+if [[ "$(cat "$T/statefix.rc")" != "0" ]] \
+  && grep -q 'REFUSE_ESCAPE' "$T/statefix.err" \
+  && [[ ! -e "$state_target" ]] \
+  && [[ ! -e "$state_fix/a.log.1" ]]; then
+  ok "state symlink was refused before logrotate created the outside target"
+  behavior state_symlink_no_write 1
+else
+  bad "state symlink was followed rc=$(cat "$T/statefix.rc")"
+  cat "$T/statefix.err" >&2 || true
+  ls -l "$state_target" "$state_fix" >&2 || true
 fi
 
 snap_live "$T/live.after"
