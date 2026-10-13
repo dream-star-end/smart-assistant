@@ -153,7 +153,13 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       const visible = await locator.evaluate((el) => {
         const scroller = el.closest(".chat-scroll-area");
         if (!(scroller instanceof HTMLElement) || !(el instanceof HTMLElement)) {
-          const chain = []; for (let n = el; n && chain.length < 14; n = n.parentElement) chain.push(`${n.tagName.toLowerCase()}${n.id ? "#" + n.id : ""}${n.getAttribute?.("data-testid") ? "[" + n.getAttribute("data-testid") + "]" : ""}.${String(n.className || "").split(/\s+/).slice(0, 3).join(".")}`);
+          const chain = [];
+          for (let n = el; n && chain.length < 14; n = n.parentElement) {
+            const id = n.id ? `#${n.id}` : "";
+            const testId = n.getAttribute?.("data-testid") ? `[${n.getAttribute("data-testid")}]` : "";
+            const classes = String(n.className || "").split(/\s+/).slice(0, 3).join(".");
+            chain.push(`${n.tagName.toLowerCase()}${id}${testId}.${classes}`);
+          }
           return { ok: false, reason: "missing", connected: el.isConnected, scrollers: document.querySelectorAll(".chat-scroll-area").length, chain };
         }
         const view = scroller.getBoundingClientRect();
