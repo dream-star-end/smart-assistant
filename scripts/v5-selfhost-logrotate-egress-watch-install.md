@@ -38,7 +38,7 @@ rm -rf -- "$root"
 
 宿主上真正放入 `/etc` 时按同一顺序手工做。`include /etc/logrotate.d` 会读点文件、`.old` 和 `.tmp`，但跳过以 `~` 结尾以及 `.bak`、`.disabled`、`.rpmnew`、`.rpmsave`。所以临时文件必须放在目标目录里且以 `~` 结尾；备份不要放在 `/etc/logrotate.d` 里面。logrotate 会忽略 include 目录里属主不是 root 的文件，参与合并的文件要 `chown root:root`，不能只改权限位。
 
-合并视图必须同时看见“除正在替换的目标文件以外的现有片段”和候选。只对临时文件做 `logrotate -d` 看不到引号和通配。若目标已经存在，不能再让 `/etc/logrotate.conf` 的 `include /etc/logrotate.d` 把旧文件和候选一起算进去，否则重装会被报成自己跟自己重复。失败就删掉临时文件，不执行 `mv -T`。
+合并视图必须同时看见“除正在替换的目标文件以外的现有片段”和候选。只对临时文件做 `logrotate -d` 看不到引号和通配。若目标已经存在，不能再让 `/etc/logrotate.conf` 的 `include /etc/logrotate.d` 把旧文件和候选一起算进去，否则重装会被报成自己跟自己重复。顶层配置另放独立临时文件，不能写进片段目录（现有片段也可能叫 00-existing.conf）。失败就删掉临时文件，不执行 `mv -T`。
 
 ```bash
 name=openclaude-v5-selfhost-egress-watch
@@ -55,9 +55,10 @@ chown root:root "$tmp"
 chmod 644 "$tmp"
 stage=$(mktemp -d)
 parent=$(mktemp)
+existing=$(mktemp)
 state=$(mktemp)
 fail_closed() {
-  rm -f -- "$tmp" "$parent" "$state"
+  rm -f -- "$tmp" "$parent" "$existing" "$state"
   rm -rf -- "$stage"
   echo "combined dry-run failed; destination not replaced" >&2
   exit 1
@@ -73,7 +74,7 @@ for f in /etc/logrotate.d/*; do
   chown root:root "$stage/$base"
   chmod 644 "$stage/$base"
 done
-python3 - "$stage/00-existing.conf" <<'PY'
+python3 - "$existing" <<'PY'
 import os, sys
 dest = "/etc/logrotate.d"
 out = sys.argv[1]
@@ -86,13 +87,13 @@ for raw in open("/etc/logrotate.conf", encoding="utf-8", errors="replace"):
     kept.append(raw)
 open(out, "w", encoding="utf-8").writelines(kept)
 PY
-chown root:root "$stage/00-existing.conf" "$parent" "$tmp"
-chmod 644 "$stage/00-existing.conf" "$parent" "$tmp"
-printf 'include %s\ninclude %s\n' "$stage" "$tmp" >"$parent"
+chown root:root "$existing" "$parent" "$tmp"
+chmod 644 "$existing" "$parent" "$tmp"
+printf 'include %s\ninclude %s\ninclude %s\n' "$existing" "$stage" "$tmp" >"$parent"
 if ! logrotate -d -s "$state" "$parent"; then
   fail_closed
 fi
-rm -f -- "$parent" "$state"
+rm -f -- "$parent" "$existing" "$state"
 rm -rf -- "$stage"
 sha256sum "$tmp" "$dest" 2>/dev/null || sha256sum "$tmp"
 mv -T -- "$tmp" "$dest"

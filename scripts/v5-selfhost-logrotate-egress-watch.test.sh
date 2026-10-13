@@ -228,6 +228,30 @@ else
   cat "$T/qdup.out" "$T/qdup.err" >&2 || true
 fi
 
+collision_root="$(mktemp -d "$T/collision_dup.XXXXXX")"
+mkdir -p -- "$collision_root/etc/logrotate.d"
+collision_file="$collision_root/etc/logrotate.d/00-existing.conf"
+cat >"$collision_file" <<'EOF'
+"/var/log/openclaude-v5-selfhost-egress.log" {
+    su root adm
+    missingok
+}
+EOF
+printf 'include %s\n' "$collision_root/etc/logrotate.d" >"$collision_root/etc/logrotate.conf"
+collision_sha="$(sha256sum "$collision_file" | awk 'NR==1 {print $1}')"
+run_rc "$T/collision_dup" "$INSTALL" --root "$collision_root" --template "$TEMPLATE"
+if [[ "$(cat "$T/collision_dup.rc")" == "3" ]] \
+  && grep -qx '^DUPLICATE$' "$T/collision_dup.err" \
+  && [[ ! -e "$collision_root/etc/logrotate.d/$DEST_NAME" ]] \
+  && [[ -z "$(find "$collision_root" -name '*~' -print)" ]] \
+  && [[ "$(sha256sum "$collision_file" | awk 'NR==1 {print $1}')" == "$collision_sha" ]]; then
+  ok "same-name 00-existing.conf quoted duplicate rejected and the existing rule was not replaced"
+  behavior same_name_duplicate_rejected 1
+else
+  bad "same-name 00-existing.conf quoted duplicate was installed rc=$(cat "$T/collision_dup.rc")"
+  cat "$T/collision_dup.out" "$T/collision_dup.err" >&2 || true
+fi
+
 groot="$(mktemp -d "$T/gdup.XXXXXX")"
 mkdir -p -- "$groot/etc/logrotate.d"
 gfile="$groot/etc/logrotate.d/existing"

@@ -158,19 +158,20 @@ PY
 combined_debug() {
   local candidate="$1"
   local scope="$2"
-  local state parent stage err rc python_rc
+  local state parent stage existing err rc python_rc
   state="$(mktemp)"
   parent="$(mktemp)"
   err="$(mktemp)"
+  existing="$(mktemp)"
   stage=""
   if [[ "$scope" == "host" ]]; then
     printf 'include /etc/logrotate.conf\ninclude %s\n' "$candidate" >"$parent"
   else
     stage="$(mktemp -d)"
     set +e
-    python3 - "$scope" "$stage" "$DEST_NAME" >"$err" 2>&1 <<'PY'
+    python3 - "$scope" "$stage" "$DEST_NAME" "$existing" >"$err" 2>&1 <<'PY'
 import os, shutil, sys
-root, stage, dest_name = sys.argv[1:]
+root, stage, dest_name, existing = sys.argv[1:]
 skip_suffix = ("~", ".bak", ".disabled", ".rpmnew", ".rpmsave")
 dest_dir = os.path.join(root, "etc", "logrotate.d")
 conf = os.path.join(root, "etc", "logrotate.conf")
@@ -193,7 +194,7 @@ if os.path.isfile(conf):
         if len(parts) >= 2 and parts[0] == "include" and os.path.realpath(parts[1]) == os.path.realpath(dest_dir):
             continue
         kept.append(raw)
-    open(os.path.join(stage, "00-existing.conf"), "w", encoding="utf-8").writelines(kept)
+    open(existing, "w", encoding="utf-8").writelines(kept)
 PY
     python_rc=$?
     set -e
@@ -201,19 +202,20 @@ PY
       cat "$err" >&2
       if grep -q 'REFUSE_ESCAPE' "$err"; then
         rm -rf -- "$stage"
-        rm -f -- "$state" "$parent" "$err"
+        rm -f -- "$state" "$parent" "$existing" "$err"
         printf 'REFUSE_ESCAPE\n' >&2
         return 2
       fi
       rm -rf -- "$stage"
-      rm -f -- "$state" "$parent" "$err"
+      rm -f -- "$state" "$parent" "$existing" "$err"
       return 1
     fi
     find "$stage" -type f -exec chown root:root {} + -exec chmod 644 {} +
-    printf 'include %s\ninclude %s\n' "$stage" "$candidate" >"$parent"
+    # Keep top-level defaults separate: no filename can overwrite a copied snippet.
+    printf 'include %s\ninclude %s\ninclude %s\n' "$existing" "$stage" "$candidate" >"$parent"
   fi
-  chown root:root "$parent" "$candidate"
-  chmod 644 "$parent" "$candidate"
+  chown root:root "$parent" "$candidate" "$existing"
+  chmod 644 "$parent" "$candidate" "$existing"
   set +e
   logrotate -d -s "$state" "$parent" >"$err" 2>&1
   rc=$?
@@ -229,7 +231,7 @@ PY
   if [[ -n "$stage" ]]; then
     rm -rf -- "$stage"
   fi
-  rm -f -- "$state" "$parent" "$err"
+  rm -f -- "$state" "$parent" "$existing" "$err"
   return "$rc"
 }
 
