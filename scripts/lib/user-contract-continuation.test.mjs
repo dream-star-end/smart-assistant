@@ -53,9 +53,9 @@ async function fixture() {
       const f = JSON.parse(String(raw));
       if (f.type !== "inbound.message") return;
       const reply = (text, extra = {}) => ws.send(JSON.stringify({ type: "outbound.message", isFinal: true, peer: f.peer, clientMessageId: f.clientMessageId, text, ...extra }));
-      const given = /暗号 ([A-Z0-9]{8})/.exec(f.content.text);
+      const given = /编号是 PO-([A-Z0-9]{8})/.exec(f.content.text);
       if (given) { code = given[1]; reply("2"); return; }
-      reply(mode === "forget" ? "我不知道之前的内容" : `暗号是 ${code}`);
+      reply(mode === "forget" ? "我不知道之前的内容" : `编号是 PO-${code}`);
       if (mode === "error1") ws.send(JSON.stringify({ type: "outbound.error", peer: f.peer, clientMessageId: "m1", error: "late" }));
     });
   });

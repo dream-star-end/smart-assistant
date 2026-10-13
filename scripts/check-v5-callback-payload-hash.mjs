@@ -132,7 +132,12 @@ async function supervise() {
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);
   try {
-    child = spawn('bash', [join(root, 'scripts/test-mutex.sh'), 'commercial',
+    // Own lock, not the shared `commercial` one (OCV5-412): the four OCV5-187 cases use port-0
+    // servers, a private HOME and no DATABASE_URL/REDIS_URL, so they share nothing with the
+    // octest PG suites. On the shared lock a session's local commercial run (up to its 3600s
+    // watchdog) starved this gate: tr-20261013T122517Z waited the full 1800s and failed with exit 3.
+    // test-mutex still serialises concurrent proof runs and owns process-group cleanup.
+    child = spawn('bash', [join(root, 'scripts/test-mutex.sh'), 'commercial-proof',
       // The mutex's fd-9 exec redirects its stderr to /dev/null. Keep worker
       // loader/assertion diagnostics on the inherited stdout pipe instead.
       `${quote(process.execPath)} --import tsx ${quote(fileURLToPath(import.meta.url))} --worker 2>&1`], {
