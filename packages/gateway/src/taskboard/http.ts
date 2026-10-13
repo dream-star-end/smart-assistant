@@ -555,17 +555,54 @@ function auditText(v: unknown, field: string, max: number): string | null {
   return text
 }
 
+// 审计身份:actor(human/agent/system)由服务端鉴权决定,可信;agent 的具体 id 服务端拿不到
+// 可信来源(token 不带 agentId),只能记「自报」并标明来源。agent 自报 user:* 一律拒绝,
+// 不能在审计里冒充人(OCV5-414 review r1)。
+type AuditIdentitySource = 'server_human' | 'client_owner' | 'stage_agent' | 'process_env' | 'unidentified' | 'system'
+interface AuditIdentity {
+  actorId: string
+  source: AuditIdentitySource
+  claimedOwner: string | null
+}
+
+function auditIdentity(actor: Actor, body: Record<string, unknown>, stageAgentId?: string | null): AuditIdentity {
+  const claimed = asString(body.owner)?.trim() || null
+  if (actor === 'human') return { actorId: HUMAN_ACTOR_ID, source: 'server_human', claimedOwner: claimed }
+  if (actor === 'system') return { actorId: 'system', source: 'system', claimedOwner: claimed }
+  if (claimed && !claimed.startsWith('agent:') && claimed.includes(':')) {
+    throw new TaskboardValidationError('agent 只能以 agent:<id> 署名,不能用 user:* 等其他身份')
+  }
+  const actorId = actorIdOf(actor, claimed, stageAgentId)
+  const source: AuditIdentitySource = claimed
+    ? 'client_owner'
+    : stageAgentId?.trim()
+      ? 'stage_agent'
+      : actorId === 'agent:unidentified'
+        ? 'unidentified'
+        : 'process_env'
+  return { actorId, source, claimedOwner: claimed }
+}
+
 function recordAudit(
   db: TaskboardDb,
   ticket: Ticket,
   actor: Actor,
-  actorId: string,
+  who: AuditIdentity,
   action: 'close_audit' | 'block_audit',
   to: 'done' | 'blocked',
   reason: string | null,
   evidence: string | null,
 ): void {
-  const payload = { actorId, from: ticket.status, to, reason, evidence }
+  const actorId = who.actorId
+  const payload = {
+    actor,
+    actorId,
+    identitySource: who.source,
+    from: ticket.status,
+    to,
+    reason,
+    evidence,
+  }
   createActivity(db, {
     ticketId: ticket.id,
     actor,
@@ -581,7 +618,7 @@ function recordAudit(
     authorKind: actor,
     author: actorId,
     body: [
-      `**${title}（${actorId}）**：${TICKET_STATUS_LABEL[ticket.status]} → ${TICKET_STATUS_LABEL[to]}`,
+      `**${title}（${actor}${actor === 'agent' ? `，${who.source === 'client_owner' ? '自报身份' : '身份'} ${actorId}` : ` ${actorId}`}）**：${TICKET_STATUS_LABEL[ticket.status]} → ${TICKET_STATUS_LABEL[to]}`,
       `- 理由：${reason ?? '（未填）'}`,
       `- 证据：${evidence ?? '（未填）'}`,
     ].join('\n'),
@@ -2160,7 +2197,8 @@ function handleBlock(
     stageOnSuccess: stage?.onSuccess,
     audit: { reason, evidence },
   })
-  const actorId = actorIdOf(actor, asString(body.owner), stage?.agentId)
+  const who = auditIdentity(actor, body, stage?.agentId)
+  const actorId = who.actorId
   const updated = db.transaction(() => {
     const next = updateTicket(db, ticket.id, expectedVersion, {
       status: 'blocked',
@@ -2168,7 +2206,7 @@ function handleBlock(
     })
     recordActivity(db, ticket.id, actor, actorId, 'status_changed', 'status', ticket.status, 'blocked')
     if (actor !== 'human') {
-      recordAudit(db, ticket, actor, actorId, 'block_audit', 'blocked', reason, evidence)
+      recordAudit(db, ticket, actor, who, 'block_audit', 'blocked', reason, evidence)
     }
     return next
   })()
@@ -2297,7 +2335,8 @@ function handleDone(
     autoClose: stage?.autoClose ?? false,
     audit: { reason, evidence },
   })
-  const actorId = actorIdOf(actor, asString(body.owner), stage?.agentId)
+  const who = auditIdentity(actor, body, stage?.agentId)
+  const actorId = who.actorId
   const updated = db.transaction(() => {
     const next = updateTicket(db, ticket.id, expectedVersion, {
       status: 'done',
@@ -2305,7 +2344,7 @@ function handleDone(
     })
     recordActivity(db, ticket.id, actor, actorId, 'status_changed', 'status', ticket.status, 'done')
     if (actor !== 'human' || reason || evidence) {
-      recordAudit(db, ticket, actor, actorId, 'close_audit', 'done', reason, evidence)
+      recordAudit(db, ticket, actor, who, 'close_audit', 'done', reason, evidence)
     }
     return next
   })()

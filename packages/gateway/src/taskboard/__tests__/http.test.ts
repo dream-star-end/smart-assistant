@@ -266,6 +266,35 @@ describe('状态机越权 403', () => {
       })
       assert.equal(bare.status, 400, JSON.stringify(bare.body))
       assert.match(String(bare.body.error), /reason.*evidence/)
+      // review r1:agent 自报 user:* 不能在审计里冒充人。
+      const spoof = await call(base, 'POST', `/api/board/tickets/${ticketId}/done`, {
+        expectedVersion: version,
+        owner: 'user:default',
+        reason: '已上线',
+        evidence: 'https://example.invalid/pr/1',
+      })
+      assert.equal(spoof.status, 400, JSON.stringify(spoof.body))
+      for (const owner of ['human', 'user:default ', 'system:x']) {
+        const r = await call(base, 'POST', `/api/board/tickets/${ticketId}/done`, {
+          expectedVersion: version,
+          owner,
+          reason: '已上线',
+          evidence: 'https://example.invalid/pr/1',
+        })
+        if (owner === 'human') {
+          // 无前缀的名字按 agent:<name> 记,不会变成人。
+          assert.equal(r.status, 200, JSON.stringify(r.body))
+          const t = r.body.ticket as { version: number }
+          const a = listActivities(db, ticketId, { limit: 50, offset: 0 }).find((x) => x.action === 'close_audit')
+          assert.equal(a?.actorId, 'agent:human')
+          assert.equal(a?.actor, 'agent')
+          // 复原成 ready 继续后面的断言(测试直写库,不走权限)。
+          updateTicket(db, ticketId, t.version, { status: 'ready', closedAt: null })
+          version = t.version + 1
+          continue
+        }
+        assert.equal(r.status, 400, `${owner}: ${JSON.stringify(r.body)}`)
+      }
       const reasonOnly = await call(base, 'POST', `/api/board/tickets/${ticketId}/done`, {
         expectedVersion: version,
         reason: '已上线',
@@ -290,23 +319,25 @@ describe('状态机越权 403', () => {
       assert.ok(closed.closedAt && closed.closedAt > 0)
 
       const acts = listActivities(db, ticketId, { limit: 50, offset: 0 })
-      const audit = acts.find((a) => a.action === 'close_audit')
+      const audit = acts.filter((a) => a.action === 'close_audit').at(-1)
       assert.ok(audit, JSON.stringify(acts))
       assert.equal(audit.actor, 'agent')
       assert.equal(audit.actorId, 'agent:main')
       assert.equal(audit.fromValue, 'ready')
       const payload = JSON.parse(audit.toValue ?? '{}')
       assert.deepEqual(payload, {
+        actor: 'agent',
         actorId: 'agent:main',
+        identitySource: 'client_owner',
         from: 'ready',
         to: 'done',
         reason: '已上线并核验',
         evidence: 'https://example.invalid/pr/693 $H/CONTINUE.md',
       })
-      const statusAct = acts.find((a) => a.action === 'status_changed' && a.toValue === 'done')
+      const statusAct = acts.filter((a) => a.action === 'status_changed' && a.toValue === 'done').at(-1)
       assert.equal(statusAct?.actorId, 'agent:main')
       const comments = listComments(db, ticketId, { limit: 50, offset: 0 })
-      const note = comments.find((c) => c.body.includes('关单（agent:main）'))
+      const note = comments.find((c) => c.body.includes('关单（agent，自报身份 agent:main）'))
       assert.ok(note, JSON.stringify(comments))
       assert.equal(note.authorKind, 'agent')
       assert.match(note.body, /理由：已上线并核验/)
