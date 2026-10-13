@@ -6816,6 +6816,12 @@ wait_for_master_healthz_ready() { # <port>
 }
 
 # ───────────────────────── smoke:健康 + 隔离断言 ─────────────────────────
+# OCV5-391/411: egress serves from the legacy unit or from one of the blue-green slots
+# (openclaude-v5-egress@{A,B}); after the slot migration the legacy unit is inactive by design.
+egress_serving_unit_active() {
+  ssh "$KL_HOST" "systemctl is-active --quiet openclaude-v5-egress.service || systemctl is-active --quiet openclaude-v5-egress@A.service || systemctl is-active --quiet openclaude-v5-egress@B.service"
+}
+
 smoke() {
   # V5_PORT/smoke 参数化(RFC D5;$1=探测端口,默认 A 的 18790)。finalize 后 candidate 已成 leader,
   # 用其端口跑本 smoke 即验证"新 active 完整健康+leader 形态"。
@@ -6929,8 +6935,8 @@ smoke() {
   split="$(ssh "$KL_HOST" "test -r '$V5_ENV' && grep -E '^OC_EGRESS_SPLIT=' '$V5_ENV' | tail -n 1 | cut -d= -f2-")" \
     || { echo "✗ 读取 $V5_ENV 的 OC_EGRESS_SPLIT 失败(env 文件缺失或 ssh 异常)" >&2; return 1; }
   if [[ "$split" == "1" ]]; then
-    ssh "$KL_HOST" "systemctl is-active --quiet openclaude-v5-egress" \
-      || { echo "✗ OC_EGRESS_SPLIT=1 但 openclaude-v5-egress 非 active —— 容器 LLM 流量无人监听" >&2; return 1; }
+    egress_serving_unit_active \
+      || { echo "✗ OC_EGRESS_SPLIT=1 但 openclaude-v5-egress 及 @A/@B 槽均非 active —— 容器 LLM 流量无人监听" >&2; return 1; }
     local eg; eg="$(ssh "$KL_HOST" "curl -fsS --max-time 5 http://172.31.0.1:18892/internal/v5/egress-health" 2>/dev/null || true)"
     echo "  egress-health: $eg"
     echo "$eg" | grep -q '"role":"egress"' || { echo "✗ egress 进程不健康(18892 无响应或非 egress)" >&2; return 1; }

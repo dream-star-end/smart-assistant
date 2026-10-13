@@ -198,3 +198,45 @@ describe('v5-egress-slots.sh (OCV5-391)', () => {
     assert.ok(restoreB > r.calls.indexOf('systemctl start openclaude-v5-egress.service'), r.calls.join('\n'))
   })
 })
+
+describe('deploy-v5.sh master smoke accepts a serving egress slot (OCV5-411)', () => {
+  const deploy = path.join(root, 'scripts/deploy-v5.sh')
+  // Real failure 2026-10-13 15:59Z: the first --egress deploy migrated legacy → slot A, then the
+  // master smoke still asked `systemctl is-active openclaude-v5-egress` and compensated a good release.
+  const probe = async (active: string[]) => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-egress-smoke-'))
+    dirs.push(dir)
+    await writeFile(path.join(dir, 'systemctl'),
+      '#!/usr/bin/env bash\n[ "$1" = is-active ] && [ "$2" = --quiet ] || exit 3\n' +
+      'for u in $ACTIVE_UNITS; do [ "$u" = "$3" ] && exit 0; done\nexit 3\n')
+    await chmod(path.join(dir, 'systemctl'), 0o755)
+    return spawnSync('bash', ['-c', [
+      'set -uo pipefail',
+      'export V5_DEPLOY_SOURCE_ONLY=1',
+      `source '${deploy}'`,
+      'KL_HOST=fake',
+      'ssh() { shift; bash -c "$1"; }',
+      'egress_serving_unit_active',
+    ].join('\n')], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', PATH: `${dir}:${process.env.PATH}`, ACTIVE_UNITS: active.join(' ') },
+    })
+  }
+
+  test('legacy unit, slot A or slot B serving passes; nothing serving fails', async () => {
+    assert.equal((await probe(['openclaude-v5-egress.service'])).status, 0)
+    assert.equal((await probe(['openclaude-v5-egress@A.service'])).status, 0)
+    assert.equal((await probe(['openclaude-v5-egress@B.service'])).status, 0)
+    assert.notEqual((await probe([])).status, 0)
+    assert.notEqual((await probe(['openclaude-v5-egress@A.socket'])).status, 0)
+  })
+
+  test('smoke uses the slot-aware check, not the legacy unit alone', async () => {
+    const source = await readFile(deploy, 'utf8')
+    const start = source.indexOf('\nsmoke() {')
+    const body = source.slice(start, source.indexOf('\n}\n', start))
+    assert.ok(start >= 0 && body.includes('egress_serving_unit_active'), 'smoke must call egress_serving_unit_active')
+    assert.equal(body.includes('is-active --quiet openclaude-v5-egress"'), false)
+  })
+})
