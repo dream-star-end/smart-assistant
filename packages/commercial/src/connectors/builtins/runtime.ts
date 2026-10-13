@@ -378,6 +378,38 @@ export function parseDanmakuXml(xml: string): {
   }
 }
 
+/**
+ * 只有真正的弹幕文档才算成功(Codex r1 P1):上游在 200 里返回 JSON 错误(压缩或不压缩)、HTML 错误页或
+ * 别的东西时,一律报错,绝不当成「0 条弹幕」返回 code 0。弹幕文档 = `<i>` 根 + `<chatid>数字</chatid>`。
+ */
+export function assertDanmakuDocument(text: string, providerTag: string): void {
+  const head = text.trimStart()
+  if (head.startsWith('{')) {
+    let code: unknown
+    try {
+      code = (JSON.parse(head) as { code?: unknown }).code
+    } catch {
+      code = undefined
+    }
+    if (typeof code === 'number' && RISK_CODES.has(code))
+      throw new ConnectorError('UPSTREAM_RATE_LIMITED', '上游风控拦截,请稍后再试')
+    if (code === -404)
+      throw new ConnectorError('UPSTREAM_NOT_FOUND', `${providerTag} danmaku not found`)
+    throw new ConnectorError(
+      'UPSTREAM_ERROR',
+      `${providerTag} danmaku upstream error${typeof code === 'number' ? ` (code ${code})` : ''}`,
+    )
+  }
+  if (
+    !/<i[\s>]/.test(head.slice(0, 4096)) ||
+    !/<chatid>\d{1,20}<\/chatid>/.test(head.slice(0, 4096))
+  )
+    throw new ConnectorError(
+      'UPSTREAM_ERROR',
+      `${providerTag} upstream returned no danmaku document`,
+    )
+}
+
 const bilibiliDmXml: ResultBuiltinImpl = {
   async read(res, providerTag) {
     const buf = await readBoundedBody(res, DM_COMPRESSED_MAX_BYTES, providerTag)
@@ -389,7 +421,9 @@ const bilibiliDmXml: ResultBuiltinImpl = {
         throw new ConnectorError('RESULT_TOO_LARGE', 'danmaku payload exceeds cap')
       throw new ConnectorError('UPSTREAM_ERROR', `${providerTag} danmaku payload undecodable`)
     }
-    return { code: 0, ...parseDanmakuXml(xmlBuf.toString('utf8')) }
+    const text = xmlBuf.toString('utf8')
+    assertDanmakuDocument(text, providerTag)
+    return { code: 0, ...parseDanmakuXml(text) }
   },
 }
 

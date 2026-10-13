@@ -108,7 +108,7 @@ const BILI_LIVE_PLAN: LivePlan = async (run) => {
   const dm = asRecord(await run('danmaku', { cid: vd.cid }))
   check(
     'danmaku',
-    dm.code === 0 && typeof dm.total === 'number' && arrLen(dm.density) >= 0,
+    dm.code === 0 && dm.cid === vd.cid && typeof dm.total === 'number' && arrLen(dm.density) >= 0,
     `code=${dm.code} total=${String(dm.total)} n=${arrLen(dm.items)}`,
   )
   return checks

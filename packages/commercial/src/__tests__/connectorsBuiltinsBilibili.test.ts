@@ -50,6 +50,7 @@ import {
   type ExecContractT,
 } from '../connectors/spec/types.js'
 import { prepareConnectorPublish } from '../marketplace/publishConnectorPipeline.js'
+import { seedOfficialMarketConnector } from '../marketplace/seedOfficialConnectors.js'
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -479,6 +480,61 @@ describe('engine driver with bilibili builtins (local upstream)', () => {
     assert.equal(up.requests.filter((r) => r.path === '/x/web-interface/wbi/search/type').length, 0)
   })
 
+  test('官方 seed 实测(dry-run):全部动作真实返回才通过;弹幕返回 HTML 错误页则不通过(Codex r1 P1)', async () => {
+    const archive = {
+      aid: 170001,
+      bvid: 'BV17x411w7KC',
+      title: 't',
+      owner: { name: 'u' },
+      stat: { view: 1 },
+    }
+    const ok = (path: string, dm: { status: number; body: string | Buffer; type?: string }) => {
+      switch (path) {
+        case '/x/web-interface/nav':
+          return { status: 200, body: NAV_BODY }
+        case '/x/frontend/finger/spi':
+          return { status: 200, body: SPI_BODY }
+        case '/x/web-interface/popular':
+        case '/x/web-interface/ranking/v2':
+          return { status: 200, body: JSON.stringify({ code: 0, data: { list: [archive] } }) }
+        case '/x/web-interface/wbi/search/type':
+          return { status: 200, body: JSON.stringify({ code: 0, data: { result: [archive] } }) }
+        case '/x/web-interface/wbi/view':
+          return {
+            status: 200,
+            body: JSON.stringify({ code: 0, data: { ...archive, cid: 279786 } }),
+          }
+        case '/x/v2/reply/wbi/main':
+          return { status: 200, body: JSON.stringify({ code: 0, data: { replies: [] } }) }
+        case '/x/v1/dm/list.so':
+          return dm
+        default:
+          return { status: 404, body: '{}' }
+      }
+    }
+    up.handler = (req) =>
+      ok(req.path, {
+        status: 200,
+        type: 'text/xml',
+        body: deflateRawSync(Buffer.from('<i><chatid>279786</chatid></i>')),
+      })
+    const good = await seedOfficialMarketConnector({
+      slug: 'bili',
+      dryRun: true,
+      deps: deps(up.port),
+    })
+    assert.equal(good.outcome, 'dry-run')
+    assert.ok(good.live.every((c) => c.ok))
+
+    __resetBilibiliWbiCacheForTests()
+    up.handler = (req) =>
+      ok(req.path, { status: 200, type: 'text/html', body: '<!doctype html><title>error</title>' })
+    await assert.rejects(
+      seedOfficialMarketConnector({ slug: 'bili', dryRun: true, deps: deps(up.port) }),
+      /danmaku/,
+    )
+  })
+
   test('rank / popular 不签名,只带静态 query', async () => {
     up.handler = () => ({ status: 200, body: JSON.stringify({ code: 0, data: { list: [] } }) })
     await run('rank', { rid: 36 })
@@ -517,13 +573,40 @@ describe('bilibili-dm-xml parsing', () => {
   }
 
   test('gzip / 明文都能读;非法实体与控制符被去掉', async () => {
-    const xml = '<i><d p="1,1,25,1,1700000000">a&#0;b&#x1F600;c&bogus;</d></i>'
+    const xml = '<i><chatid>1</chatid><d p="1,1,25,1,1700000000">a&#0;b&#x1F600;c&bogus;</d></i>'
     for (const body of [gzipSync(Buffer.from(xml)), Buffer.from(xml)]) {
       const out = (await resultBuiltin('bilibili-dm-xml').read(respond(body), 't')) as {
         items: Array<{ text: string }>
       }
       assert.equal(out.items[0]?.text, 'ab😀c&bogus;')
     }
+  })
+
+  test('200 里不是弹幕文档(JSON 错误 / 风控 / HTML / 空 XML)一律报错,绝不当成 0 条弹幕(Codex r1 P1)', async () => {
+    const cases: Array<[Buffer, string]> = [
+      [deflateRawSync(Buffer.from('{"code":-400,"message":"请求错误"}')), 'UPSTREAM_ERROR'],
+      [Buffer.from('{"code":-404,"message":"啥都木有"}'), 'UPSTREAM_ERROR'],
+      [
+        deflateRawSync(Buffer.from('{"code":-412,"message":"请求被拦截"}')),
+        'UPSTREAM_RATE_LIMITED',
+      ],
+      [deflateRawSync(Buffer.from('{"code":-404,"message":"啥都木有"}')), 'UPSTREAM_NOT_FOUND'],
+      [Buffer.from('<!doctype html><html><body>error</body></html>'), 'UPSTREAM_ERROR'],
+      [deflateRawSync(Buffer.from('<?xml version="1.0"?><i></i>')), 'UPSTREAM_ERROR'],
+    ]
+    for (const [body, code] of cases) {
+      await assert.rejects(
+        resultBuiltin('bilibili-dm-xml').read(respond(body), 't'),
+        (e: unknown) => e instanceof ConnectorError && e.code === code,
+        code,
+      )
+    }
+    // 真弹幕文档、只是 0 条:合法,返回 total 0。
+    const empty = (await resultBuiltin('bilibili-dm-xml').read(
+      respond(deflateRawSync(Buffer.from('<i><chatid>7</chatid></i>'))),
+      't',
+    )) as { code: number; cid: number; total: number }
+    assert.deepEqual([empty.code, empty.cid, empty.total], [0, 7, 0])
   })
 
   test('超过 200 条按时间均匀抽样,density 覆盖全程', () => {
