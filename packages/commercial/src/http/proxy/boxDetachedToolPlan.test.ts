@@ -120,9 +120,14 @@ test("native detached keep and discard both remove dynamic private tool files", 
       keeperAsset: read("box_keeper.py"), virtualMcpAsset: read("box_virtual_mcp.py"),
       detachedRunnerAsset: read("box_detached_runner.py"), nativePersistence: true,
       runNonce: randomBytes(12).toString("hex") });
+    // OCV5-384: a fresh native run's INIT also creates its Box project directory. That path
+    // only exists on the Box (boxTextPlan.test.ts covers it); this test is about the run dir.
+    const project = `/home/box/.claude/projects/${plan.cwd.replaceAll("/", "-")}`;
+    const init = plan.stageInputs.find((step) => step.args.length === 5 && step.args[3] === plan.cwd);
+    assert.equal(init?.args[4], project);
     try {
       for (const step of plan.stageInputs) {
-        const staged = run(step);
+        const staged = run(step === init ? { ...step, args: [...step.args.slice(0, 4), ""] } : step);
         assert.equal(staged.status, 0, staged.stderr);
       }
       for (const name of ["stdout.jsonl", "stderr.log", "pending.toolu_abc.json",

@@ -22,6 +22,7 @@
  * OC_EGRESS_SECRET,任一缺失拒启(比"静默半配跑起来"好排查)。
  */
 
+import { BoxSwitchStore, boxSwitchCompactionEnabled } from "../http/proxy/boxSwitchCompaction.js";
 import { boxApiModelById } from "@openclaude/protocol";
 import { createServer as createHttpServer } from "node:http";
 import { randomUUID } from "node:crypto";
@@ -57,6 +58,8 @@ import {
 } from "../http/anthropicProxy.js";
 import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProviderMeta.js";
 import { BoxTextFetch } from "../http/proxy/boxTextFetch.js";
+import { boxInteractiveRunnerEnabled, type BoxInteractiveHostAsset } from "../http/proxy/boxTextPlan.js";
+import { loadBoxBridgeMod } from "@openclaude/gateway";
 import { BoxToolFetch } from "../http/proxy/boxToolFetch.js";
 import { BoxInvocationRegistry } from "../http/proxy/boxInvocationRegistry.js";
 import { resolveBoxCapacityPolicy } from "../http/proxy/boxCapacityPolicy.js";
@@ -333,10 +336,26 @@ export async function startEgress(): Promise<void> {
   const resolveBoxLaunch = boxResolver ? gateBoxLaunchResolver(
     (args: Parameters<typeof boxResolver.resolve>[0]) => boxResolver.resolve(args),
     boxCliGate) : null;
+  // OCV5-378: models with BoxApiRunner "interactive" (box-claude-*) run through the oc-box host in
+  // print mode. Loaded once like the other Box helpers, and only where the installation turned the
+  // interactive runner on (boxInteractiveRunnerEnabled); without it those models are refused
+  // (BOX_INTERACTIVE_HOST_UNAVAILABLE) and every `claude -p` model is unaffected.
+  let boxInteractiveHost: BoxInteractiveHostAsset | undefined;
+  if (boxResolver && !boxInteractiveRunnerEnabled()) log.info("box_interactive_runner_off");
+  if (boxResolver && boxInteractiveRunnerEnabled()) {
+    try {
+      const mod = loadBoxBridgeMod(join(process.cwd(), "packages/gateway/box-bridge-mod"));
+      boxInteractiveHost = { host: Buffer.from(mod.hostPy, "utf8"),
+        modFiles: JSON.stringify(mod.files), modSha256: mod.sha256 };
+    } catch {
+      log.error("box_interactive_host_unavailable");
+    }
+  }
   const boxTextModel = boxResolver && boxJournal ? new BoxTextFetch({
     supervisorAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_supervisor.py")),
     keeperAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_keeper.py")),
     detachedRunnerAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_detached_runner.py")),
+    ...(boxInteractiveHost ? { interactiveHost: boxInteractiveHost } : {}),
     registry: new BoxInvocationRegistry({ maxPerUser: boxCapacity.maxRunsPerUser,
       maxPerAccount: boxCapacity.maxRunsPerAccount, leaseMs: 900_000 }),
     journal: boxJournal,
@@ -356,6 +375,7 @@ export async function startEgress(): Promise<void> {
       keeperAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_keeper.py")),
       virtualMcpAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_virtual_mcp.py")),
       detachedRunnerAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_detached_runner.py")),
+      ...(boxInteractiveHost ? { interactiveHost: boxInteractiveHost } : {}),
       // OCV5-300: the CLI sees mcp__ocbridge__<client name> (Bash, Read, …)
       // like native Claude Code; older opaque chains still bind via
       // boxCatalogMatching.
@@ -376,6 +396,10 @@ export async function startEgress(): Promise<void> {
     }) : undefined;
   const boxModel = boxTextModel ? {
     toolBridgeReady: boxToolModel !== undefined,
+    // A running chat that must leave its login is compacted by Haiku before it moves (opt-in).
+    ...(boxResolver && boxSwitchCompactionEnabled() ? { switchCompaction: { store: new BoxSwitchStore(),
+      chatMustMove: (uid: bigint, stickyKey: string) => boxResolver.chatMustMove(uid, stickyKey),
+      fetch: (args: Parameters<BoxTextFetch["fetch"]>[0]) => boxTextModel.fetch(args) } } : {}),
     fetch: (args: Parameters<BoxTextFetch["fetch"]>[0] & {
       prepared?: PreparedContinuation;
     }) => {

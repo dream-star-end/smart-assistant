@@ -84,7 +84,7 @@ import {
 import { PermissionToolReopenContext, ToolCardSlot } from "./chat/toolCardSlot";
 import { reopenPermissionUi } from "../lib/chat/permissionPopupCoordinator";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
-import { currentTurnStartIndex, turnFinalAssistantFlags } from "./chat/turnSegment";
+import { currentTurnStartIndex, turnFinalAssistantFlags, turnRatingFlags, turnRecoveryParents } from "./chat/turnSegment";
 import {
   captureVisibleVirtualRowAnchor,
   correctedScrollTop,
@@ -2201,6 +2201,10 @@ export function MessageList({
       .filter((message) => message.role === "user")
       .map((message) => message.id),
   );
+  // OCV5-390: lineage for the turn's single answer / action row (turnSegment). The control user rows that
+  // link a recovery or 从断点继续 child to its source are filtered out of the rendered list, so it is taken
+  // from the full list here, keyed by both the row id and its client message id (they can differ).
+  const turnLineageParents = turnRecoveryParents(safeMessages);
   const recoveryParents = new Map(
     safeMessages
       .filter(
@@ -2440,7 +2444,7 @@ export function MessageList({
   let ratingFinal: boolean[] = [];
   let renderItems: RenderItem[] = [];
   try {
-    ratingFinal = turnFinalAssistantFlags(renderableMessages);
+    ratingFinal = turnFinalAssistantFlags(renderableMessages, turnLineageParents);
     renderItems = coalesceTeam(renderableMessages, 0, sending, liveTurnUsage);
   } catch {
     ratingFinal = renderableMessages.map(() => false);
@@ -2452,6 +2456,8 @@ export function MessageList({
     }));
   }
   if (processDisclosure) renderItems = discloseProcess(renderItems as LeafRenderItem[], renderableMessages, ratingFinal, sending);
+  // OCV5-390: the action row follows the answer, minus turns that ended on an error.
+  const actionRowFinal = turnRatingFlags(renderableMessages, ratingFinal, turnLineageParents);
   itemCountRef.current = renderItems.length;
   const itemKey = renderItemKey;
   // Production scroll surfaces freeze a start index on first content so streaming
@@ -2716,7 +2722,7 @@ export function MessageList({
         </MessageBoundary>
       );
     }
-    const turnFinalAssistant = ratingFinal[it.idx] ?? false;
+    const turnFinalAssistant = actionRowFinal[it.idx] ?? false;
     const failurePresentedBelow =
       it.m.role === "user" && presentedErrorTurnIds.has(it.m.id);
     const rowId = it.m._timelineUnitKey ?? it.m.id;

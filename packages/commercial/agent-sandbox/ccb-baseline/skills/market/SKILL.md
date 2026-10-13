@@ -90,7 +90,7 @@ oc-market publish-agent --slug my-agent --name "写作助手" --version 1.0.0 \
 - `--skill-deps` / `--plugin-deps`:缺失时智能体不能安装的必需能力。
 - `--optional-skill-deps` / `--optional-plugin-deps`:不可用时跳过、不阻断安装的增强能力。
 - 安装返回 `installedCapabilities`、`skippedOptional`、`needsAuthorization`、`ready`;有
-  `needsAuthorization` 时引导用户去**管理中心 → 插件账号**完成授权,不要重复安装。
+  `needsAuthorization` 时引导用户去**管理中心 → 插件**完成授权,不要重复安装。
 
 ## 商品信息纪律(发布 / 推荐都要遵守)
 

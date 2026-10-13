@@ -510,6 +510,10 @@ await page.route("**/api/tutorials**", (route, request) => {
 });
 await page.route("**/api/plugins/**", (route, request) => {
   const url = new URL(request.url());
+  // 本机插件清单（OCV5-383）：本 harness 不带基线插件。
+  if (url.pathname === "/api/plugins/local" && request.method() === "GET") {
+    return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ plugins: [] }) });
+  }
   if (url.pathname === "/api/plugins/management" && request.method() === "GET") {
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({
       catalog: [{
@@ -552,6 +556,9 @@ await page.route("**/api/plugins/**", (route, request) => {
   }
   return route.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: { code: "NOT_FOUND" } }) });
 });
+// 插件启用开关读偏好（OCV5-383）：全部启用。
+await page.route("**/api/me/preferences", (route) =>
+  route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ prefs: {} }) }));
 await page.route(harnessUrl, (route) => route.fulfill({
   status: 200,
   contentType: "text/html",
@@ -2664,6 +2671,8 @@ screenshotPage = page;
 
 await check("T33 当前微博账号重新扫码登录不会先解绑旧连接", async () => {
   const connectors = page.locator("#connectors-root");
+  // 一级列表只有开关（OCV5-383）：账号在点进「微博」后的详情页里。
+  await connectors.getByRole("button", { name: /^微博：.*打开设置$/ }).click({ timeout: 3000 });
   await connectors.getByText("我的微博").waitFor({ state: "visible", timeout: 3000 });
   // 健康账号的「重新扫码登录」收在账号行的「⋯」里（管理中心 f3ae9bad5），行面上不再有按钮。
   if (await connectors.getByRole("button", { name: "重新扫码登录" }).count() !== 0) {
@@ -2821,17 +2830,21 @@ await mobilePaymentContext.close();
 await wechatPaymentContext.close();
 screenshotPage = page;
 
-await check("T29 自动重试统一显示模型繁忙与共享 n/10 进度；重试成功保持实时可见", async () => {
+await check("T29 自动重试只显示中性的进行中状态（无模型繁忙、无 n/10）；重试成功保持实时可见", async () => {
   const cmid = await page.evaluate(() => window.__replayDrive.openTurn());
   if (typeof cmid !== "string" || !cmid.startsWith("m-")) {
     throw new Error(`重试证明轮未铸出 clientMessageId: ${JSON.stringify(cmid)}`);
   }
   await waitForReplay((state) => state.sending, "重试证明轮没有进入真实发送态");
   await page.evaluate(() => window.__replayDrive.pushRetryStatus());
-  await replayRoot.getByText("模型繁忙，正在重试中（2/10）", { exact: true }).waitFor({
+  await replayRoot.getByText("仍在处理中…", { exact: true }).waitFor({
     state: "visible",
     timeout: 3000,
   });
+  // OCV5-390: a retry is not the user's business — no busy wording, no attempt counter, no red card.
+  if (await replayRoot.getByText(/模型繁忙|正在重试中|\d+\/10/).count()) {
+    throw new Error("自动重试期间仍显示模型繁忙或重试计数");
+  }
   if (await replayRoot.getByText(replayMarkers.retryControl, { exact: true }).count()) {
     throw new Error("自动恢复控制 user 行重新显示为聊天气泡");
   }

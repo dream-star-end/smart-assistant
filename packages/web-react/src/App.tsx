@@ -4589,6 +4589,12 @@ export function App() {
               setManageOpen(false);
               openMarketplace("browse", kind);
             }}
+            onAskInChat={(text) => {
+              // 与市场「在对话中试用」同构：关管理中心 → 新会话 → 预填输入框；不自动发送。
+              setManageOpen(false);
+              newSession();
+              setComposerPrefill({ text, nonce: Date.now() });
+            }}
             // 「怎么用」：openTutorial 自己会先收起管理中心，避免两层弹层叠加。
             onOpenHelp={(featureId) => openTutorial(featureId)}
             onRequireLogin={() => {

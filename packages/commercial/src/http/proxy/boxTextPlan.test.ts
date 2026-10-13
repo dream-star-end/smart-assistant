@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync, unlinkSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
-import { makeBoxTextPlan, makeBoxAssetsStage, BoxTextPlanError } from "./boxTextPlan.js";
+import { makeBoxTextPlan, makeBoxAssetsStage, BoxTextPlanError, boxRunnerLoginScope,
+  boxInteractiveRunnerEnabled, boxRunnerFor, boxRunnerPlanInput } from "./boxTextPlan.js";
 import { makeBoxToolPlan } from "./boxToolPlan.js";
 import {
   PROXY_BYTE_BUDGET_BOX_NATIVE_V1,
@@ -20,7 +21,7 @@ const body = (messages: unknown[]): ProxyBody => ({ model: "box-api-claude-opus-
 const user = (text: string) => ({ role: "user", content: [{ type: "text", text }] });
 
 test("batched immutable assets keep per-file verification and save remote round trips", () => {
-  const assets = (["supervisor", "keeper", "box-virtual-mcp", "detached-runner"] as const)
+  const assets = (["supervisor", "keeper", "box-virtual-mcp", "detached-runner", "interactive-host"] as const)
     .map((name) => {
       const asset = Buffer.from(`print('${randomBytes(12).toString("hex")}')\n`);
       const hash = createHash("sha256").update(asset).digest("hex");
@@ -48,6 +49,65 @@ test("batched immutable assets keep per-file verification and save remote round 
       }
     }
   }
+});
+
+test("an interactive-runner plan runs the staged oc-box host on the same argv without its --print-only flags", () => {
+  const host = { host: Buffer.from("print('host')\n"), modFiles: JSON.stringify({ "hooks/hooks.json": "e30=" }),
+    modSha256: "c".repeat(64) };
+  const hostPath = `/tmp/ocv5-289-v2-interactive-host-${createHash("sha256").update(host.host).digest("hex").slice(0, 16)}.py`;
+  const input = { body: body([user("hi")]), upstreamModel: "claude-haiku-5-5", supervisorAsset: supervisor,
+    keeperAsset: keeper, maxOutputTokensLimit: 128_000, runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32) };
+  // The synthetic session id is random per plan; everything else is fixed by the input.
+  const fixed = (args: readonly string[]) => args.map((arg) => /^[0-9a-f]{8}-[0-9a-f-]{27}$/.test(arg) ? "ID" : arg);
+  const print = makeBoxTextPlan(input);
+  const interactive = makeBoxTextPlan({ ...input, interactiveHost: host });
+  const at = print.run.args.indexOf("--");
+  const hostAt = interactive.run.args.indexOf("--");
+  assert.deepEqual(fixed(interactive.run.args.slice(0, hostAt)), fixed(print.run.args.slice(0, at)));
+  assert.deepEqual(interactive.run.args.slice(hostAt + 1, hostAt + 4), ["/usr/bin/python3", "-I", hostPath]);
+  const printOnly = new Set(["-p", "--include-partial-messages", "--verbose", "--no-session-persistence",
+    "--input-format", "--output-format", "stream-json"]);
+  assert.deepEqual(fixed(interactive.run.args.slice(hostAt + 4)),
+    fixed(print.run.args.slice(at + 1).filter((arg) => !printOnly.has(arg))));
+  assert.equal(print.run.args[at + 1], "/home/box/.local/bin/claude");
+  assert.equal(print.run.args[at + 2], "-p");
+  // Nothing the Box runs for an interactive model carries `-p`.
+  assert.ok(!interactive.run.args.some((arg) => printOnly.has(arg)));
+  assert.ok(print.run.args.includes("--no-session-persistence"));
+  assert.equal(interactive.run.environment.OC_BOX_NO_SESSION_PERSISTENCE, "1");
+  assert.deepEqual({ mode: interactive.run.environment.OC_BOX_HOST_MODE, files: interactive.run.environment.OC_BOX_MOD_FILES,
+    sha: interactive.run.environment.OC_BOX_MOD_SHA256 }, { mode: "print", files: host.modFiles, sha: host.modSha256 });
+  assert.equal(print.run.environment.OC_BOX_HOST_MODE, undefined);
+  // OCV5-386: an interactive CLI would background a >120 s tool call and answer with its own text.
+  for (const plan of [print, interactive]) assert.equal(plan.run.environment.CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS, "0");
+  assert.deepEqual(interactive.interactiveHost?.path, hostPath);
+  assert.equal(print.interactiveHost, undefined);
+  assert.equal(interactive.assetManifest.split(",").length, 3);
+  assert.equal(print.assetManifest.split(",").length, 2);
+  // The tool plan keeps its own argv edits and stages the host beside the virtual MCP.
+  const tools = [{ name: "Bash", description: "x", input_schema: { type: "object", properties: {} } }];
+  const toolPlan = makeBoxToolPlan({ ...input, body: { ...input.body, tools } as ProxyBody,
+    virtualMcpAsset: Buffer.from("print('mcp')\n"), interactiveHost: host });
+  const toolAt = toolPlan.run.args.indexOf("--");
+  assert.deepEqual(toolPlan.run.args.slice(toolAt + 1, toolAt + 4), ["/usr/bin/python3", "-I", hostPath]);
+  assert.ok(toolPlan.run.args.includes("--allowedTools") && !toolPlan.run.args.includes("--disallowedTools"));
+  assert.equal(toolPlan.assetManifest.split(",").length, 4);
+  assert.ok(!toolPlan.run.args.some((arg) => printOnly.has(arg)));
+  // Step-by-step staging (fast path off) stages the host on its own, like each helper.
+  for (const plan of [interactive, toolPlan]) assert.equal(plan.stageInteractiveHost?.args[3], hostPath);
+  assert.equal(print.stageInteractiveHost, undefined);
+  assert.throws(() => makeBoxTextPlan({ ...input, interactiveHost: { ...host, modSha256: "nope" } }), /BOX_TEXT_PLAN_INVALID/);
+});
+
+test("box-claude-* never runs as claude -p: without the host it is refused; its launches may use every login", () => {
+  const host = { host: Buffer.from("x"), modFiles: "{}", modSha256: "c".repeat(64) };
+  assert.deepEqual(boxRunnerPlanInput("box-claude-haiku-5-5", host), { interactiveHost: host });
+  assert.throws(() => boxRunnerPlanInput("box-claude-haiku-5-5", undefined), /BOX_INTERACTIVE_HOST_UNAVAILABLE/);
+  assert.deepEqual(boxRunnerPlanInput("box-api-claude-haiku-5-5", host), {});
+  assert.deepEqual(boxRunnerPlanInput("box-api-claude-haiku-5-5", undefined), {});
+  assert.equal(boxRunnerLoginScope("box-claude-opus-5-5"), "all");
+  assert.equal(boxRunnerLoginScope("box-api-claude-opus-5-5"), "default");
+  assert.equal(boxRunnerLoginScope("cursor-auto"), "default");
 });
 
 test("first text request stages only files and carries no prompt/system on Claude argv", () => {
@@ -207,4 +267,47 @@ test("model output cap is exact and rejects unsupported values before staging", 
     upstreamModel: "claude-opus-5", supervisorAsset: supervisor, keeperAsset: keeper,
     maxOutputTokensLimit: 8192 }),
   (error: unknown) => error instanceof BoxTextPlanError && error.code === "BOX_MAX_TOKENS_UNSUPPORTED");
+});
+
+test("OCV5-384: a fresh native session gets an owner-0700 project directory before launch", () => {
+  const input = { body: body([user("first")]), upstreamModel: "claude-opus-5", supervisorAsset: supervisor,
+    keeperAsset: keeper, maxOutputTokensLimit: 128_000, runNonce: "c".repeat(24), leaseEpoch: "d".repeat(32) };
+  const project = `/home/box/.claude/projects/-tmp-ocv5-289-run-${"c".repeat(24)}`;
+  const fresh = makeBoxTextPlan({ ...input, nativePersistence: true });
+  assert.equal(fresh.snapshotHash, null);
+  assert.equal(fresh.stageInputs[0]?.args[4], project, "INIT creates the project directory");
+  assert.equal(fresh.cleanup.args[4], "", "cleanup never receives the transcript's directory");
+  assert.equal(fresh.discardNativeCleanup?.args[4], "", "a discard never removes it either");
+  const plain = makeBoxTextPlan(input);
+  assert.equal(plain.stageInputs[0]?.args[4], "", "without native persistence nothing changes");
+});
+
+test("OC_BOX_API_RUNNER=interactive runs the box-api-* models interactively on every login, only with the runner on (OCV5-388)", () => {
+  const host = { host: Buffer.from("x"), modFiles: "{}", modSha256: "c".repeat(64) };
+  const on = { OC_BOX_INTERACTIVE_RUNNER: "1", OC_BOX_API_RUNNER: "interactive" };
+  for (const id of ["box-api-claude-opus-5-5", "box-api-claude-sonnet-5-5", "box-api-claude-haiku-5-5"]) {
+    assert.equal(boxRunnerFor(id, on), "interactive");
+    assert.deepEqual(boxRunnerPlanInput(id, host, on), { interactiveHost: host });
+    assert.throws(() => boxRunnerPlanInput(id, undefined, on), /BOX_INTERACTIVE_HOST_UNAVAILABLE/);
+    assert.equal(boxRunnerLoginScope(id, on), "all");
+    // Unset, another value, or the runner off: the catalog decides (claude -p, default login).
+    for (const env of [{}, { OC_BOX_API_RUNNER: "interactive" }, { ...on, OC_BOX_API_RUNNER: "1" },
+      { ...on, OC_BOX_INTERACTIVE_RUNNER: "0" }]) {
+      assert.equal(boxRunnerFor(id, env), "print");
+      assert.deepEqual(boxRunnerPlanInput(id, undefined, env), {});
+      assert.equal(boxRunnerLoginScope(id, env), "default");
+    }
+  }
+  assert.equal(boxRunnerFor("box-claude-opus-5-5", {}), "interactive");
+  assert.equal(boxRunnerFor("cursor-auto", on), undefined);
+  assert.equal(boxRunnerLoginScope("cursor-auto", on), "default");
+});
+
+test("the interactive runner is off unless the installation sets OC_BOX_INTERACTIVE_RUNNER=1 (OCV5-388)", () => {
+  assert.equal(boxInteractiveRunnerEnabled({}), false);
+  assert.equal(boxInteractiveRunnerEnabled({ OC_BOX_INTERACTIVE_RUNNER: "true" }), false);
+  assert.equal(boxInteractiveRunnerEnabled({ OC_BOX_INTERACTIVE_RUNNER: "1" }), true);
+  // Off means the egress loads no host, and then every interactive model is refused.
+  assert.throws(() => boxRunnerPlanInput("box-claude-opus-5-5", undefined), /BOX_INTERACTIVE_HOST_UNAVAILABLE/);
+  assert.deepEqual(boxRunnerPlanInput("box-api-claude-opus-5-5", undefined), {});
 });

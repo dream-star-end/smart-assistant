@@ -272,7 +272,10 @@ describe("MessageList Manus 过程披露", () => {
     );
     fireEvent.click(screen.getByTestId("process-toggle"));
     const card = screen.getByTestId("process-card");
-    expect(within(card).getByTestId("recovered-error-note")).toBeInTheDocument();
+    // OCV5-390: an automatically retried error the turn got past leaves nothing behind.
+    expect(within(card).queryByTestId("recovered-error-note")).toBeNull();
+    expect(card.textContent ?? "").not.toMatch(/任务执行失败|本轮已继续|出错了/);
+    expect(within(card).queryByRole("alert")).toBeNull();
     for (const name of [/重试/, /重新尝试/, /切换模型/, /从断点继续/]) {
       expect(within(card).queryByRole("button", { name })).toBeNull();
     }

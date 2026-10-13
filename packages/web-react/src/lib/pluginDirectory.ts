@@ -5,6 +5,7 @@ import type {
   DeclarativeCatalogEntry,
   DeclarativeManagementConnector,
   DeclarativeManagementResponse,
+  LocalPlugin,
   PluginManagementResponse,
   RuntimePluginAccount,
   RuntimePluginCatalogEntry,
@@ -102,7 +103,8 @@ export function unifyProviders(
 }
 
 /** 插件整体状态（市场卡片 / 已安装行的徽标）。 */
-export type PluginState = 'connected' | 'needs-connect' | 'attention'
+/** ready = 不需要账号、可直接用（本机插件）；disabled = 用户在 管理中心 → 插件 停用了。 */
+export type PluginState = 'connected' | 'needs-connect' | 'attention' | 'ready' | 'disabled'
 
 export type PluginEntry = {
   slug: string
@@ -110,19 +112,26 @@ export type PluginEntry = {
   description: string
   /** builtin = 平台预装（v1 provider 或声明式 installation=default），没有市场安装 / 卸载。 */
   origin: 'builtin' | 'market'
-  runtime: 'api' | 'browser'
+  /** api = API 插件；browser = 浏览器插件；cli = 本机插件（在你的容器里运行的命令）。 */
+  runtime: 'api' | 'browser' | 'cli'
   accountCount: number
   state: PluginState
   /** 徽标文案：已连接 N 个账号 / 未连接 / 需重新授权 / 需先更新 / 当前不可用。 */
   stateLabel: string
   tone: 'success' | 'warning' | 'danger' | 'neutral'
   updateAvailable: boolean
+  /** AI 市场分类（本机插件清单里自带）。 */
+  category?: string
 }
 
 export type PluginDirectoryInput = {
   v1?: ConnectorsResponse | null
   declarative?: DeclarativeManagementResponse | null
   runtime?: PluginManagementResponse | null
+  /** 本机插件（/api/plugins/local）。 */
+  local?: readonly LocalPlugin[] | null
+  /** 已停用的插件 slug（偏好 disabled_plugins）；命中的条目状态改为「已停用」。 */
+  disabled?: ReadonlySet<string> | null
 }
 
 const connectedLabel = (n: number) => (n > 1 ? `已连接 ${n} 个账号` : '已连接')
@@ -218,7 +227,28 @@ export function buildPluginDirectory(input: PluginDirectoryInput): PluginEntry[]
         : []
     entries.push(apiEntry(u, [...decl, ...v1]))
   }
-  return entries
+  for (const p of input.local ?? []) {
+    if (seen.has(p.name)) continue
+    seen.add(p.name)
+    entries.push({
+      slug: p.name,
+      label: p.displayName,
+      description: p.description,
+      origin: 'builtin',
+      runtime: 'cli',
+      accountCount: 0,
+      state: 'ready',
+      stateLabel: '可直接使用',
+      tone: 'success',
+      updateAvailable: false,
+      ...(p.category ? { category: p.category } : {}),
+    })
+  }
+  const disabled = input.disabled
+  if (!disabled || disabled.size === 0) return entries
+  return entries.map((e) =>
+    disabled.has(e.slug) ? { ...e, state: 'disabled' as const, stateLabel: '已停用', tone: 'neutral' as const } : e,
+  )
 }
 
 /** 关键词是否命中插件（名称 / slug / 说明，大小写不敏感）—— 市场搜索态并入内置插件用。 */

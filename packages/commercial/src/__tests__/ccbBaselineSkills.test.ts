@@ -8,17 +8,27 @@
  * Run: npx tsx --test packages/commercial/src/__tests__/ccbBaselineSkills.test.ts
  */
 import * as assert from 'node:assert/strict'
-import { readFileSync, readdirSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it } from 'node:test'
 
+import { formatPluginManifestErrors, parsePluginManifest } from '@openclaude/protocol'
 import { parseSkillEvalsJson } from '@openclaude/storage'
 
 import { V3_CCB_BASELINE_SKILL_NAMES } from '../agent-sandbox/v3supervisor.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const skillsDir = join(here, '..', '..', 'agent-sandbox', 'ccb-baseline', 'skills')
+const platformBinDir = join(here, '..', '..', 'agent-sandbox', 'platform-runtime', 'bin')
+const entrypointTs = join(here, '..', '..', 'agent-sandbox', 'platform-runtime', 'entrypoint', 'entrypoint.ts')
+
+/** entrypoint 在容器启动时链进 ~/.local/bin 与 /usr/local/bin 的平台 CLI（login shell 会重置 PATH，不在这里就找不到）。 */
+function platformLinkedClis(): string[] {
+  const m = /const PLATFORM_LINKED_CLIS = \[([\s\S]*?)\] as const/.exec(readFileSync(entrypointTs, 'utf8'))
+  assert.ok(m, 'PLATFORM_LINKED_CLIS not found in entrypoint.ts')
+  return [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1])
+}
 
 describe('ccb-baseline skills ↔ manifest', () => {
   it('the shipped skills/ dir matches V3_CCB_BASELINE_SKILL_NAMES exactly', () => {
@@ -34,15 +44,15 @@ describe('ccb-baseline skills ↔ manifest', () => {
     )
   })
 
-  it('every skill dir contains SKILL.md plus only allowed extras (evals/, references/, scripts/)', () => {
-    const allowed = new Set(['SKILL.md', 'evals', 'references', 'scripts'])
+  it('every skill dir contains SKILL.md plus only allowed extras (plugin.json, evals/, references/, scripts/)', () => {
+    const allowed = new Set(['SKILL.md', 'plugin.json', 'evals', 'references', 'scripts'])
     for (const name of V3_CCB_BASELINE_SKILL_NAMES) {
       const entries = readdirSync(join(skillsDir, name)).sort()
       assert.ok(entries.includes('SKILL.md'), `skill ${name} missing SKILL.md`)
       for (const entry of entries) {
         assert.ok(
           allowed.has(entry),
-          `skill ${name} has undeclared entry ${entry}; allowed: SKILL.md, evals/, references/, scripts/`,
+          `skill ${name} has undeclared entry ${entry}; allowed: SKILL.md, plugin.json, evals/, references/, scripts/`,
         )
       }
       if (entries.includes('evals')) {
@@ -54,6 +64,33 @@ describe('ccb-baseline skills ↔ manifest', () => {
         )
       }
     }
+  })
+
+  it('every shipped plugin.json is a valid openclaude-plugin/1 manifest whose files exist (OCV5-383)', () => {
+    let seen = 0
+    for (const name of V3_CCB_BASELINE_SKILL_NAMES) {
+      const manifestPath = join(skillsDir, name, 'plugin.json')
+      if (!existsSync(manifestPath)) continue
+      seen += 1
+      assert.ok(statSync(manifestPath).size <= 64 * 1024, `skill ${name}/plugin.json is larger than 64KB`)
+      const parsed = parsePluginManifest(JSON.parse(readFileSync(manifestPath, 'utf8')))
+      assert.ok(parsed.ok, `skill ${name}/plugin.json invalid:\n${parsed.ok ? '' : formatPluginManifestErrors(parsed.errors)}`)
+      if (!parsed.ok) continue
+      const m = parsed.manifest
+      assert.equal(m.name, name, `plugin.json name must equal its directory (${name}); the container launcher looks it up by directory`)
+      for (const s of m.components.skills) assert.ok(existsSync(join(skillsDir, name, s.path)), `${name}: skills path ${s.path} missing`)
+      for (const b of m.components.bin) {
+        assert.ok(existsSync(join(skillsDir, name, b.entry)), `${name}: bin ${b.name} entry ${b.entry} missing`)
+        // 每个 bin 都要有平台 shim（platform-runtime/bin/<name>.sh → PATH 上的 <name>），且经 plugin-exec 启动。
+        const shim = join(platformBinDir, `${b.name}.sh`)
+        assert.ok(existsSync(shim), `${name}: bin ${b.name} has no platform shim ${shim}`)
+        assert.match(readFileSync(shim, 'utf8'), new RegExp(`plugin-exec" ${name} ${b.name} "\\$@"`))
+        // 只放进 bundle 不够：Agent 的 Bash 是 login shell，PATH 里没有 bundle/bin（OCV5-383 上线验收发现 ths: command not found）。
+        assert.ok(platformLinkedClis().includes(b.name), `${name}: bin ${b.name} must be listed in entrypoint PLATFORM_LINKED_CLIS so the Agent's shell can find it`)
+      }
+      for (const d of m.components.data) assert.ok(existsSync(join(skillsDir, name, d.path)), `${name}: data ${d.path} missing`)
+    }
+    assert.ok(seen >= 1, 'expected at least one baseline plugin (ths)')
   })
 
   it('every shipped evals.json parses under the platform schema (bad JSON fail-closes provisioning review)', () => {

@@ -25,13 +25,21 @@ type EchoBlock = { type: "text"; text: string } | { type: "image"; data: string;
  * image. Only those notes may be extra; every published block must still be
  * echoed byte for byte and in order. */
 const EMPTY_MARKER = /^\(mcp__ocbridge__[A-Za-z0-9_-]{1,48} completed with no output\)$/;
+/** OCV5-386: Claude Code's own text when it moved an MCP tool call to the background. The Box
+ * runs with that disabled; if it ever appears the round still stops, under its own code. */
+const CLI_BACKGROUNDED = /^MCP tool "[^"\n]{1,120}" (?:is still running after \d+s|was moved to the background)/;
 const CLI_PREVIEW_BYTES = 2000;
 /** Claude Code persists an MCP result only when the summed text length
  * (toolResultStorage.contentSize) exceeds min(MCP 100k, default 50k). */
 const CLI_PERSIST_THRESHOLD_CHARS = 50_000;
 
-const IMAGE_SOURCE_NOTE = new RegExp(String.raw`^\[Image: source: /home/box/\.claude/projects/`
-  + String.raw`[A-Za-z0-9._-]{1,256}/[A-Za-z0-9-]{1,64}/tool-results/[A-Za-z0-9._-]{1,128}\]$`);
+/** OCV5-390: the CLI names the file under its own config directory, so a run under a non-default login
+ * (CLAUDE_CONFIG_DIR=/home/box/.claude-<login>, e.g. cc2's .claude-account2) writes that prefix. The
+ * login name follows the admin selection rule ([a-z0-9][a-z0-9-]{0,31}); the default login has no suffix,
+ * so .claude-default is not a config dir and is refused. */
+const IMAGE_SOURCE_NOTE = new RegExp(String.raw`^\[Image: source: /home/box/\.claude(?:-(?!default/)[a-z0-9][a-z0-9-]{0,31})?/projects/`
+  // No "." / ".." segment: the note must name a file inside <project>/<session>/tool-results/.
+  + String.raw`(?!\.{1,2}/)[A-Za-z0-9._-]{1,256}/[A-Za-z0-9-]{1,64}/tool-results/(?!\.{1,2}\])[A-Za-z0-9._-]{1,128}\]$`);
 
 /** The echo is the published blocks, in order, plus the CLI's own image source
  * notes. A published block is always matched first; a note is only an extra
@@ -192,6 +200,10 @@ export class BoxToolResultEcho {
       const expected = this.expected.get(id)!;
       if (isError !== expected.isError || (hash !== expected.contentHash && (!expected.content
         || !possibleCliRewrite(normalized as EchoBlock[], expected.content as EchoBlock[])))) {
+        const first = normalized[0] as EchoBlock | undefined;
+        if (first?.type === "text" && CLI_BACKGROUNDED.test(first.text)) {
+          throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CLI_BACKGROUNDED");
+        }
         throw new BoxToolResultEchoError("BOX_TOOL_ECHO_CONTENT_MISMATCH");
       }
       // OCV5-302: a possible CLI rewrite of known published content is

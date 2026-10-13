@@ -82,7 +82,7 @@ import {
   getPhase6AccountUuidEnforce,
   getSessionPinMode,
 } from "./admin/runtimeFlags.js";
-import { renderLiteratureSkillContent } from "./literatureSkill.js";
+import { LITERATURE_SKILL_POINTER } from "./literatureSkill.js";
 import {
   estimateMaxCost,
   InsufficientCreditsError,
@@ -540,6 +540,7 @@ import {
   makeConnectorsRpcHandler,
   type ConnectorsRpcHandler,
 } from './connectors/rpc.js'
+import { PREFS_PLUGIN_ENABLEMENT } from './plugins/enablement.js'
 import { PluginRuntimeFacade } from './plugins/runtime.js'
 import { ManagedBrowserRuntime } from './plugins/browserRuntime.js'
 import {
@@ -1607,7 +1608,7 @@ export async function registerCommercial(
       if (!cfg.enabled || !cfg.token_set) return null;
       return {
         name: "SKILLS_LITERATURE",
-        content: renderLiteratureSkillContent(cfg),
+        content: LITERATURE_SKILL_POINTER,
       };
     } catch (err) {
       // 单行 DB 读失败就跳过 slot,不要让 master DB 闪断拖垮容器系统 prompt 构建。
@@ -1716,6 +1717,7 @@ export async function registerCommercial(
       redis,
       browserRuntime,
       knowledgePlanetMedia: knowledgePlanetMediaDeps,
+      pluginEnablement: PREFS_PLUGIN_ENABLEMENT,
     })
     knowledgePlanetSetup = new KnowledgePlanetSetupManager(knowledgePlanetService, {
       isAgentReady: (contract) => browserRuntime.supportsContract(contract),
@@ -1730,7 +1732,7 @@ export async function registerCommercial(
     })
     knowledgePlanetAutomation = new KnowledgePlanetAutomationService(pluginFacade)
   } else {
-    pluginFacade = new PluginRuntimeFacade({ redis })
+    pluginFacade = new PluginRuntimeFacade({ redis, pluginEnablement: PREFS_PLUGIN_ENABLEMENT })
   }
 
   // T-53: 装配 agent 运行时(image + seccomp + rpc dir + lifecycle scheduler)。
@@ -2326,6 +2328,8 @@ export async function registerCommercial(
         identityRepo,
         redis,
         pluginFacade,
+        // 管理中心 → 插件 的启用开关在容器侧生效（OCV5-383）。
+        pluginEnablement: PREFS_PLUGIN_ENABLEMENT,
       })
       // /v3/research/* — 科研 agent 能力 proxy(oc-lit 多源检索 + oc-cite 引用门禁)。
       // 同款 verifyContainerIdentity 双因子;平台 secret(S2/Unpaywall 等)留 master;

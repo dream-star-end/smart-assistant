@@ -1,14 +1,15 @@
 import { Plug, Store } from 'lucide-react'
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../../lib/api'
-import { type ConnectorConnection, type ConnectorProvider, type ConnectorsResponse, type DeclarativeCatalogEntry, type DeclarativeConnection, type DeclarativeManagementConnector, type DeclarativeManagementResponse, type PluginManagementResponse, type RuntimePluginAccount, type RuntimePluginCatalogEntry, connectorCapabilityLabel, declarativeCapabilityLabel } from '../../lib/connectors'
+import { type ConnectorConnection, type ConnectorProvider, type ConnectorsResponse, type DeclarativeCatalogEntry, type DeclarativeConnection, type DeclarativeManagementConnector, type DeclarativeManagementResponse, type LocalPlugin, type PluginManagementResponse, type RuntimePluginAccount, type RuntimePluginCatalogEntry, connectorCapabilityLabel, declarativeCapabilityLabel, disabledPluginsOf, enabledPluginsOf } from '../../lib/connectors'
 import type { AuthSession } from '../../lib/types'
 import { Alert, Button, EmptyState, ListSkeleton, PanelHeader, useConfirm, useToast } from '../ui'
 import { managedPluginProvider } from '../../lib/managedPluginProviders'
-import { pluginAccountState, type UnifiedProvider, unifyProviders } from '../../lib/pluginDirectory'
+import { buildPluginDirectory, pluginAccountState, type UnifiedProvider, unifyProviders } from '../../lib/pluginDirectory'
 import { BindDialog, DeclarativeBindDialog } from './plugins/BindDialogs'
 import { ManagedBrowserSetupDialog } from './plugins/ManagedBrowserSetupDialog'
 import { ConnectionRow, ProviderCard } from './plugins/ProviderCard'
+import { DisabledNote, LocalPluginDetail, PluginDetailBar, PluginRow, type PluginRowModel } from './plugins/PluginList'
 import { RuntimePluginCard } from './plugins/RuntimePluginCard'
 import { type CardNotice, type UnifiedConnection, errText } from './plugins/shared'
 
@@ -28,11 +29,14 @@ export function ConnectorsTab({
   onOpenMarketplace,
   autoAuthorizePluginSlug,
   onAutoAuthorizeConsumed,
+  onAskInChat,
 }: {
   auth: AuthSession;
   onOpenMarketplace?: () => void;
   autoAuthorizePluginSlug?: string | null;
   onAutoAuthorizeConsumed?: () => void;
+  /** 在新对话里预填一句话（本机插件详情页「可以这样用」「在对话中登录」）。 */
+  onAskInChat?: (text: string) => void;
 }) {
   const [data, setData] = useState<ConnectorsResponse | null>(null)
   const [declConnections, setDeclConnections] = useState<DeclarativeConnection[]>([])
@@ -51,6 +55,21 @@ export function ConnectorsTab({
   const [bindDeclFor, setBindDeclFor] = useState<DeclarativeCatalogEntry | null>(null)
   const [setupRuntimeFor, setSetupRuntimeFor] = useState<RuntimePluginCatalogEntry | null>(null)
   const [setupRuntimeAccountId, setSetupRuntimeAccountId] = useState<string | null>(null)
+  /** 本机插件（随平台基线下发，如同花顺行情）。读失败降级为空，不影响其余插件。 */
+  const [localPlugins, setLocalPlugins] = useState<LocalPlugin[]>([])
+  /** 已停用的插件（偏好 disabled_plugins）；开关乐观更新，失败回滚。 */
+  const [storedDisabled, setStoredDisabled] = useState<ReadonlySet<string>>(new Set())
+  /** 用户打开过的默认关闭插件（偏好 enabled_plugins，OCV5-388）。 */
+  const [optedIn, setOptedIn] = useState<ReadonlySet<string>>(new Set())
+  /** 显示用：偏好里停用的 + 默认关闭且没打开过的。默认关闭不写进 disabled_plugins。 */
+  const disabled = useMemo(() => {
+    const out = new Set(storedDisabled)
+    for (const p of localPlugins) if (p.defaultEnabled === false && !optedIn.has(p.name)) out.add(p.name)
+    return out
+  }, [storedDisabled, optedIn, localPlugins])
+  const [toggling, setToggling] = useState<string | null>(null)
+  /** 当前打开的插件详情（null = 一级列表）。OCV5-383：一级只留启用开关，设置都在详情里。 */
+  const [selected, setSelected] = useState<string | null>(null)
   const [confirm, confirmEl] = useConfirm()
   const toast = useToast()
   const noticeFor = useCallback(
@@ -78,9 +97,15 @@ export function ConnectorsTab({
       if (alive) setDegraded(true)
       return { catalog: [], accounts: [] }
     })
-    Promise.all([api.getConnectors(auth), managementP, runtimeP])
-      .then(([d, managed, runtime]) => {
+    // 本机插件与启用状态是叠加信息：读失败不报错、不降级提示（列表照常，开关按「全部启用」显示）。
+    const localP = api.getLocalPlugins(auth).catch(() => ({ plugins: [] as LocalPlugin[] }))
+    const prefsP = api.getPreferences(auth).catch(() => null)
+    Promise.all([api.getConnectors(auth), managementP, runtimeP, localP, prefsP])
+      .then(([d, managed, runtime, local, prefs]) => {
         if (!alive) return
+        setLocalPlugins(Array.isArray(local?.plugins) ? local.plugins : [])
+        setStoredDisabled(new Set(disabledPluginsOf(prefs)))
+        setOptedIn(new Set(enabledPluginsOf(prefs)))
         setData(d)
         setManagement(managed.connectors)
         setDeclConnections(managed.connections)
@@ -174,6 +199,12 @@ export function ConnectorsTab({
 
   useEffect(() => {
     if (loading || !autoAuthorizePluginSlug) return
+    // 定位到的插件直接打开它的详情页（提示 / 绑定弹层都在详情里）。
+    setSelected(autoAuthorizePluginSlug)
+    if (localPlugins.some((p) => p.name === autoAuthorizePluginSlug)) {
+      onAutoAuthorizeConsumed?.()
+      return
+    }
     const plugin = runtimeCatalog.find((item) => item.slug === autoAuthorizePluginSlug)
     const account = runtimeAccounts.find(
       (item) => item.provider === autoAuthorizePluginSlug && item.executable,
@@ -252,6 +283,7 @@ export function ConnectorsTab({
   }, [
     autoAuthorizePluginSlug,
     declConnsBySlug,
+    localPlugins,
     loading,
     onAutoAuthorizeConsumed,
     runtimeAccounts,
@@ -507,7 +539,77 @@ export function ConnectorsTab({
   const connectedCards = allCards.filter((c) => c.connected).sort((a, b) => b.broken - a.broken)
   const availableCards = allCards.filter((c) => !c.connected)
   // 只有两组都非空才出组标题 —— 单组时标题是纯噪音。
-  const grouped = connectedCards.length > 0 && availableCards.length > 0
+  const grouped = connectedCards.length + localPlugins.length > 0 && availableCards.length > 0
+
+  // 一级列表每行的状态与 AI 市场同一判据（OCV5-379 插件目录）。
+  const directory = useMemo(
+    () =>
+      new Map(
+        buildPluginDirectory({
+          v1: data,
+          declarative: { connectors: management, connections: declConnections },
+          runtime: { catalog: runtimeCatalog, accounts: runtimeAccounts },
+          local: localPlugins,
+        }).map((e) => [e.slug, e]),
+      ),
+    [data, management, declConnections, runtimeCatalog, runtimeAccounts, localPlugins],
+  )
+  const rowOf = (key: string): PluginRowModel => {
+    const e = directory.get(key)
+    return {
+      key,
+      label: e?.label ?? localPlugins.find((p) => p.name === key)?.displayName ?? key,
+      status: e?.stateLabel ?? '',
+      tone: e?.tone ?? 'neutral',
+      runtime: e?.runtime ?? 'api',
+      enabled: !disabled.has(key),
+    }
+  }
+
+  /** 启用开关：乐观更新，PATCH 偏好失败就回滚并提示。 */
+  const setEnabled = async (key: string, label: string, enabled: boolean) => {
+    const prev = storedDisabled
+    const prevOptedIn = optedIn
+    const next = new Set(prev)
+    if (enabled) next.delete(key)
+    else next.add(key)
+    // 默认关闭的插件：打开 = 记进 enabled_plugins，关掉 = 移出（OCV5-388）。
+    const defaultOff = localPlugins.some((p) => p.name === key && p.defaultEnabled === false)
+    const nextOptedIn = new Set(prevOptedIn)
+    if (enabled) nextOptedIn.add(key)
+    else nextOptedIn.delete(key)
+    setStoredDisabled(next)
+    if (defaultOff) setOptedIn(nextOptedIn)
+    setToggling(key)
+    try {
+      await api.patchPreferences(auth, {
+        disabled_plugins: [...next].sort(),
+        ...(defaultOff ? { enabled_plugins: [...nextOptedIn].sort() } : {}),
+      })
+      toast(enabled ? `已启用「${label}」` : `已停用「${label}」，助手暂时不会调用它`, 'success')
+    } catch (e) {
+      setStoredDisabled(prev)
+      setOptedIn(prevOptedIn)
+      toast(errText(e, enabled ? '启用失败，请重试' : '停用失败，请重试'), 'error')
+    } finally {
+      setToggling(null)
+    }
+  }
+
+  const renderRow = (key: string) => {
+    const row = rowOf(key)
+    return (
+      <PluginRow
+        key={key}
+        row={row}
+        busy={toggling === key}
+        onOpen={() => setSelected(key)}
+        onToggle={(on) => void setEnabled(key, row.label, on)}
+      />
+    )
+  }
+  const selectedCard = selected ? allCards.find((c) => c.key === selected) : undefined
+  const selectedLocal = selected ? localPlugins.find((p) => p.name === selected) : undefined
 
   const renderCard = (card: CatalogCard) => {
     if (card.kind !== 'plugin') return renderProviderCard(card)
@@ -601,13 +703,84 @@ export function ConnectorsTab({
     )
   }
 
+  const dialogs = (
+    <>
+      <BindDialog
+        auth={auth}
+        provider={bindFor}
+        onClose={() => setBindFor(null)}
+        onBound={() => {
+          setBindFor(null);
+          reload();
+        }}
+      />
+      <DeclarativeBindDialog
+        auth={auth}
+        entry={bindDeclFor}
+        onClose={() => setBindDeclFor(null)}
+        onBound={() => {
+          setBindDeclFor(null);
+          reload();
+        }}
+      />
+      <ManagedBrowserSetupDialog
+        key={`${setupRuntimeFor?.versionId ?? 'closed'}:${setupRuntimeAccountId ?? 'new'}`}
+        auth={auth}
+        plugin={setupRuntimeFor}
+        relinkAccountId={setupRuntimeAccountId}
+        onClose={() => {
+          setSetupRuntimeFor(null)
+          setSetupRuntimeAccountId(null)
+        }}
+        onBound={(agentReady) => {
+          setErr(null)
+          const label = setupRuntimeFor?.label ?? '插件'
+          // 授权结果落在**那张卡片上**：弹层关掉后用户回到列表，提示就在他刚授权的那张卡里。
+          if (setupRuntimeFor)
+            setCardNotice({
+              slug: setupRuntimeFor.slug,
+              tone: 'success',
+              text: setupRuntimeAccountId
+                ? `${label}登录已更新；为保护新账号，写入能力和免逐次确认均已关闭，可按需重新开启。`
+                : agentReady
+                  ? `${label}账号已授权，Agent 现在可以直接读取相关内容；写入能力默认关闭。`
+                  : `${label}登录信息已加密保存；系统完成插件升级后会自动启用。`,
+            })
+          reload()
+        }}
+      />
+      {confirmEl}
+    </>
+  )
+
+  if (selected && !loading && (selectedCard || selectedLocal)) {
+    const row = rowOf(selected)
+    return (
+      <div className="flex flex-col px-4 pb-4 pt-3" data-testid="plugin-detail">
+        <PluginDetailBar
+          row={row}
+          busy={toggling === selected}
+          onBack={() => setSelected(null)}
+          onToggle={(on) => void setEnabled(selected, row.label, on)}
+        />
+        {!row.enabled && <DisabledNote label={row.label} />}
+        {selectedLocal ? (
+          <LocalPluginDetail plugin={selectedLocal} onAskInChat={onAskInChat} />
+        ) : (
+          selectedCard && renderCard(selectedCard)
+        )}
+        {dialogs}
+      </div>
+    )
+  }
+
   return (
     <div className="flex flex-col">
       {/* 「插件」是唯一对用户的名词（与分区名一致）。窄屏标题/说明只留给读屏，
           「添加」portal 进上下文行右侧；它是本分区唯一的头部动作。 */}
       <PanelHeader
         title="插件"
-        hint="绑定账号后，助手就能在对话中使用它们；写入默认逐次确认。"
+        hint="打开开关就能在对话里用；点插件进入设置（账号、权限、各项开关）。"
         action={
           onOpenMarketplace && (
             <Button size="sm" variant="ghost" onClick={onOpenMarketplace} aria-label="添加插件">
@@ -661,9 +834,12 @@ export function ConnectorsTab({
           <>
             {/* 每个插件是一段「标题 + 说明 + 元信息 + 它的账号列表」，段与段之间一条发丝线；
                 不再是「每个插件一张卡、卡里再套账号卡」。两组都非空时才出组标题。 */}
-            {connectedCards.length > 0 && (
-              <ConnectorGroup label={grouped ? '已连接' : undefined} count={connectedCards.length}>
-                {connectedCards.map(renderCard)}
+            {/* OCV5-383：一级列表每个插件一行「图标 + 名称 + 状态 + 启用开关」，点行进入详情。
+                已连接与本机插件（不用账号）在前，未连接在后；两组都非空时才出组标题。 */}
+            {connectedCards.length + localPlugins.length > 0 && (
+              <ConnectorGroup label={grouped ? '已连接' : undefined} count={connectedCards.length + localPlugins.length}>
+                {connectedCards.map((c) => renderRow(c.key))}
+                {localPlugins.map((p) => renderRow(p.name))}
               </ConnectorGroup>
             )}
             {availableCards.length > 0 && (
@@ -672,10 +848,10 @@ export function ConnectorsTab({
                 count={availableCards.length}
                 className={grouped ? 'mt-6' : undefined}
               >
-                {availableCards.map(renderCard)}
+                {availableCards.map((c) => renderRow(c.key))}
               </ConnectorGroup>
             )}
-            {!err && allCards.length === 0 && (
+            {!err && allCards.length + localPlugins.length === 0 && (
               <div className="-mx-4">
                 <EmptyState
                   icon={Plug}
@@ -695,51 +871,7 @@ export function ConnectorsTab({
         )}
       </div>
 
-      <BindDialog
-        auth={auth}
-        provider={bindFor}
-        onClose={() => setBindFor(null)}
-        onBound={() => {
-          setBindFor(null);
-          reload();
-        }}
-      />
-      <DeclarativeBindDialog
-        auth={auth}
-        entry={bindDeclFor}
-        onClose={() => setBindDeclFor(null)}
-        onBound={() => {
-          setBindDeclFor(null);
-          reload();
-        }}
-      />
-      <ManagedBrowserSetupDialog
-        key={`${setupRuntimeFor?.versionId ?? 'closed'}:${setupRuntimeAccountId ?? 'new'}`}
-        auth={auth}
-        plugin={setupRuntimeFor}
-        relinkAccountId={setupRuntimeAccountId}
-        onClose={() => {
-          setSetupRuntimeFor(null)
-          setSetupRuntimeAccountId(null)
-        }}
-        onBound={(agentReady) => {
-          setErr(null)
-          const label = setupRuntimeFor?.label ?? '插件'
-          // 授权结果落在**那张卡片上**：弹层关掉后用户回到列表，提示就在他刚授权的那张卡里。
-          if (setupRuntimeFor)
-            setCardNotice({
-              slug: setupRuntimeFor.slug,
-              tone: 'success',
-              text: setupRuntimeAccountId
-                ? `${label}登录已更新；为保护新账号，写入能力和免逐次确认均已关闭，可按需重新开启。`
-                : agentReady
-                  ? `${label}账号已授权，Agent 现在可以直接读取相关内容；写入能力默认关闭。`
-                  : `${label}登录信息已加密保存；系统完成插件升级后会自动启用。`,
-            })
-          reload()
-        }}
-      />
-      {confirmEl}
+      {dialogs}
     </div>
   );
 }
@@ -764,7 +896,7 @@ function ConnectorGroup({
           <span className="tabular-nums">{count}</span>
         </h4>
       )}
-      <div className="flex flex-col">{children}</div>
+      <ul className="flex flex-col">{children}</ul>
     </div>
   )
 }

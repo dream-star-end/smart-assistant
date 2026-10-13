@@ -12,6 +12,7 @@ import { CalculatorBlock } from "./CalculatorBlock";
 import { ChartBlock } from "./ChartBlock";
 import { KvBlock, ProgressBlock, RouteBlock } from "./InfoBlocks";
 import { FormBlock, QuizBlock, RecipeBlock } from "./InteractiveBlocks";
+import { IntradayBlock, KlineBlock, QuoteBlock, StockListBlock } from "./MarketBlocks";
 import { CardsBlock, GalleryBlock, SwatchesBlock, TilesBlock } from "./MediaBlocks";
 import { TableBlock } from "./TableBlock";
 import { DraftBlock, OutlineBlock, SourcesBlock } from "./TextBlocks";
@@ -31,7 +32,7 @@ import { BodyMarkdown, Skeleton } from "./shell";
 import { specToMarkdown } from "./toMarkdown";
 
 /** 这些组件要等内容完整才渲染(交互依赖完整数据);流式期间显示骨架。 */
-const WAIT_FOR_COMPLETE = new Set(["calculator", "choice", "suggestions", "callout", "quiz", "form", "recipe"]);
+const WAIT_FOR_COMPLETE = new Set(["calculator", "choice", "suggestions", "callout", "quiz", "form", "recipe", "kline", "intraday"]);
 
 export class BlockBoundary extends Component<{ fallback: ReactNode; children: ReactNode; resetKey: string }, { failed: boolean; key: string }> {
   state = { failed: false, key: this.props.resetKey };
@@ -108,6 +109,14 @@ export function renderSpec(spec: IuiSpec, notes: string[], streaming: boolean, r
       return <OutlineBlock spec={spec} {...p} />;
     case "draft":
       return <DraftBlock spec={spec} {...p} />;
+    case "quote":
+      return <QuoteBlock spec={spec} {...p} />;
+    case "kline":
+      return <KlineBlock spec={spec} {...p} />;
+    case "intraday":
+      return <IntradayBlock spec={spec} {...p} />;
+    case "stocklist":
+      return <StockListBlock spec={spec} {...p} />;
   }
 }
 
@@ -156,6 +165,13 @@ function hasContent(spec: IuiSpec): boolean {
       return spec.items.length > 0;
     case "draft":
       return spec.variants.length > 0;
+    case "quote":
+    case "stocklist":
+      return spec.items.length > 0;
+    case "kline":
+      return spec.rows.length > 0;
+    case "intraday":
+      return spec.points.length > 0;
   }
 }
 

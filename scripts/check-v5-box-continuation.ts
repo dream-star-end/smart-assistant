@@ -43,6 +43,13 @@ const DYNAMIC_PRODUCT = ["boxToolResumePublish.ts", "boxToolInputHash.ts"] as co
 /** Direct runtime module for the OCV5-296 compact carrier. No oracle or graph edit. */
 const COMPACTION_SOURCE = ["boxCliSse.ts"] as const;
 const COMPACTION_BINDING = "[ocv5-296-compaction] PASS — trusted boundary plus synthetic summary is not an echo";
+/** OCV5-381: module that writes the Box `--system-prompt-file` text. */
+const SYSTEM_SOURCE = ["boxMessagesMapper.ts", "boxTextPlan.ts"] as const;
+const FRESH_PROJECT_BINDING = "[ocv5-384-fresh-native-project] PASS — a fresh native session stages its owner-0700 project directory and cleanup never receives it";
+const RESTAGE_BINDING = "[ocv5-384-restage-context] PASS — a re-staged conversation keeps the native context records after the first user message";
+const LOGIN_IMAGE_NOTE_BINDING = "[ocv5-390-login-image-note] PASS — an image echo from a run under another login (cc2, .claude-account2) is accepted; a foreign directory is refused";
+const MCP_AUTO_BACKGROUND_BINDING = "[ocv5-386-mcp-auto-background] PASS — every Box run sets CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0 and the interactive host passes it to the CLI";
+const SYSTEM_HEADER_BINDING = "[ocv5-381-system-header] PASS — billing header block dropped before --system-prompt-file, OpenClaude system text kept";
 const IMAGE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.png", import.meta.url)));
 const ORACLE_FILE = realpathSync(fileURLToPath(new URL("./check-v5-box-continuation-859.oracle.json", import.meta.url)));
 const SEALED_IMAGE_SHA = "a9491d8d9cb458b11d4ac6c5fc4b5c2d4d370a1d9b6f7960cc5dffae678538a0";
@@ -63,6 +70,8 @@ type Api = {
   context: (body: Record<string, unknown>, completedToolTail?: boolean) => string;
   fingerprint: (uid: bigint, body: Record<string, unknown>) => { replayFingerprint: string };
   echoAccept: (id: string, hash: string, raw: unknown) => void;
+  /** OCV5-390: the live path's verifier, which also holds the published content (CLI rewrites). */
+  echoAcceptContent: (id: string, hash: string, content: unknown[], raw: unknown) => Promise<void>;
   publishImage: (row: PublishedMatch) => PublishedFile;
   classify: (body: Record<string, unknown>) => { classification: string; rejectCode: string | null };
   projectAuthority: (kind: unknown, authorityTurnId: unknown) => { kind: string };
@@ -170,7 +179,7 @@ function resolveLocal(fromFile: string, spec: string): string | null {
   return null;
 }
 function digest(): Digest {
-  const pending = [...ENTRIES, ...DYNAMIC_PRODUCT, ...COMPACTION_SOURCE]
+  const pending = [...ENTRIES, ...DYNAMIC_PRODUCT, ...COMPACTION_SOURCE, ...SYSTEM_SOURCE]
     .map((name) => realpathSync(join(PROXY, name)));
   const seen = new Set<string>();
   const files = new Set<string>([SELF, FIXTURE, LOADER, IMAGE_FILE, ORACLE_FILE]);
@@ -281,6 +290,13 @@ async function load(): Promise<Api> {
       const verifier = new resultEcho.BoxToolResultEcho([{ modelToolUseId: id,
         contentHash: hash, isError: false }]);
       verifier.accept(raw);
+      verifier.assertComplete();
+    },
+    echoAcceptContent: async (id: string, hash: string, content: unknown[], raw: unknown) => {
+      const verifier = new resultEcho.BoxToolResultEcho([{ modelToolUseId: id,
+        contentHash: hash, isError: false, content }]);
+      verifier.accept(raw);
+      await verifier.verifyDeferred();
       verifier.assertComplete();
     },
     classify: prepared.classifyBoxContinuation,
@@ -974,6 +990,103 @@ async function proveCompactionConsumer(): Promise<void> {
     if (!(error instanceof sse.BoxCliSseError) || error.code !== "BOX_CLI_COMPACT_PHASE") throw error;
   }
 }
+/** The Box CLI drops a system prompt whose first block starts with
+ * `x-anthropic-billing-header`; CCB always sends that block first. */
+async function proveSystemHeader(): Promise<void> {
+  const mapper = await import(pathToFileURL(join(PROXY, SYSTEM_SOURCE[0])).href) as {
+    compileBoxCliSyntheticTurn: (body: Record<string, unknown>, args: { cwd: string; cliVersion: string }) =>
+      { systemPrompt: string };
+  };
+  const header = "x-anthropic-billing-header: cc_version=2.1.296.gate; cc_entrypoint=sdk-cli;";
+  const marker = "OCV5-381 platform slot marker";
+  const out = mapper.compileBoxCliSyntheticTurn({ model: "claude-opus-5-5", max_tokens: 64,
+    system: [{ type: "text", text: header },
+      { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+      { type: "text", text: marker }],
+    messages: [{ role: "user", content: "probe" }] }, { cwd: publishDir, cliVersion: "2.1.280" });
+  if (out.systemPrompt.startsWith("x-anthropic-billing-header")
+    || out.systemPrompt.includes(header) || !out.systemPrompt.endsWith(marker)) {
+    fail("SYSTEM_HEADER_DROP");
+  }
+}
+/** OCV5-384: a re-staged conversation keeps the session's native context records (copied from
+ * its native transcript) right after the first user message, where native resume has them. */
+async function proveRestageContext(): Promise<void> {
+  const mapper = await import(pathToFileURL(join(PROXY, SYSTEM_SOURCE[0])).href) as {
+    compileBoxCliSyntheticTurn: (body: Record<string, unknown>, args: { cwd: string; cliVersion: string;
+      stagedAttachments?: readonly Record<string, unknown>[] }) => { snapshotJsonl: string; sessionId: string };
+  };
+  const records = [{ type: "attachment", attachment: { type: "environment", snapshot: { workingDirectory: "/x" } } },
+    { type: "attachment", attachment: { type: "date", date: "2026-10-12" } }];
+  const out = mapper.compileBoxCliSyntheticTurn({ model: "claude-opus-5-5", max_tokens: 64,
+    messages: [{ role: "user", content: "q1" }, { role: "assistant", content: [{ type: "text", text: "a1" }] },
+      { role: "user", content: "q2" }] }, { cwd: publishDir, cliVersion: "2.1.280", stagedAttachments: records });
+  const staged = out.snapshotJsonl.trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+  const kinds = staged.map((r) => r.type === "attachment" ? (r.attachment as { type: string }).type : String(r.type));
+  if (kinds.join(",") !== "user,environment,date,assistant"
+    || staged.some((r, i) => i > 0 && r.parentUuid !== staged[i - 1]!.uuid)
+    || staged.some((r) => r.sessionId !== out.sessionId)) {
+    fail("RESTAGE_CONTEXT_POSITION");
+  }
+}
+/** OCV5-384: interactive Claude Code creates a new project directory 0755, which the native
+ * transcript inspection refuses, so a fresh session never got a native pointer. */
+async function proveFreshNativeProject(): Promise<void> {
+  const plans = await import(pathToFileURL(join(PROXY, SYSTEM_SOURCE[1])).href) as {
+    makeBoxTextPlan: (input: Record<string, unknown>) => { stageInputs: { args: string[] }[];
+      cleanup: { args: string[] }; discardNativeCleanup?: { args: string[] } };
+  };
+  const nonce = "c".repeat(24);
+  const plan = plans.makeBoxTextPlan({ body: { model: "box-api-claude-opus-5-5", max_tokens: 64, stream: true,
+    messages: [{ role: "user", content: [{ type: "text", text: "first" }] }] },
+    upstreamModel: "claude-opus-5-5", supervisorAsset: Buffer.from("s"), keeperAsset: Buffer.from("k"),
+    maxOutputTokensLimit: 64, runNonce: nonce, leaseEpoch: "d".repeat(32), nativePersistence: true });
+  if (plan.stageInputs[0]?.args[4] !== `/home/box/.claude/projects/-tmp-ocv5-289-run-${nonce}`
+    || plan.cleanup.args[4] !== "" || plan.discardNativeCleanup?.args[4] !== "") {
+    fail("FRESH_NATIVE_PROJECT");
+  }
+}
+/** OCV5-386: an interactive Claude Code moves an MCP tool call to the background after 120 s and
+ * answers with its own text, which the echo check rejects (the round stops). Every Box run must
+ * disable that, and the interactive host must hand the setting to the CLI. */
+async function proveNoMcpAutoBackground(): Promise<void> {
+  const plans = await import(pathToFileURL(join(PROXY, SYSTEM_SOURCE[1])).href) as {
+    makeBoxTextPlan: (input: Record<string, unknown>) => { run: { environment: Record<string, string> } };
+  };
+  const plan = plans.makeBoxTextPlan({ body: { model: "box-api-claude-opus-5-5", max_tokens: 64, stream: true,
+    messages: [{ role: "user", content: [{ type: "text", text: "first" }] }] },
+    upstreamModel: "claude-opus-5-5", supervisorAsset: Buffer.from("s"), keeperAsset: Buffer.from("k"),
+    maxOutputTokensLimit: 64, runNonce: "e".repeat(24), leaseEpoch: "f".repeat(32) });
+  if (plan.run.environment.CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS !== "0") fail("MCP_AUTO_BACKGROUND_ENV");
+  const host = readFileSync(join(CANDIDATE, "packages/gateway/box-bridge-mod/host.py"), "utf8");
+  const pass = /^PASS_ENV = re\.compile\(r'(.+)'\)$/m.exec(host)?.[1];
+  if (!pass || !new RegExp(`^(?:${pass})$`).test("CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS")) {
+    fail("MCP_AUTO_BACKGROUND_HOST_PASS");
+  }
+}
+/** OCV5-390: the CLI adds a note naming a saved image under its own config directory. A run under
+ * another login (cc2: CLAUDE_CONFIG_DIR=/home/box/.claude-account2) is a valid echo; a directory that is
+ * not a Claude config dir of the Box user is still refused. Live path verifier (content in hand). */
+async function proveLoginImageNote(api: Api): Promise<void> {
+  const { png } = imageFixture();
+  const image = { type: "image", source: { type: "base64", media_type: "image/png", data: png } };
+  const published = [{ type: "image", data: png, mimeType: "image/png" }];
+  const hash = createHash("sha256").update(JSON.stringify({ content: published, isError: false })).digest("hex");
+  const echo = (dir: string) => ({ type: "user", message: { role: "user", content: [{
+    type: "tool_result", tool_use_id: SEALED_ID, content: [image, { type: "text",
+      text: `[Image: source: /home/box/${dir}/projects/-tmp-ocv5-289-run-${"c".repeat(24)}/b6df2535-b7de-499a-bbb9-cb501631c640/tool-results/mcp-ocbridge-blob-1.png]` }] }] } });
+  for (const dir of [".claude", ".claude-account2"]) {
+    try { await api.echoAcceptContent(SEALED_ID, hash, published, echo(dir)); }
+    catch { fail(dir === ".claude" ? "IMAGE_NOTE_DEFAULT_LOGIN" : "IMAGE_NOTE_OTHER_LOGIN"); }
+  }
+  let refused = false;
+  for (const foreign of [".claudeX", ".claude-default"]) {
+    refused = false;
+    try { await api.echoAcceptContent(SEALED_ID, hash, published, echo(foreign)); }
+    catch (error) { refused = (error as { code?: string }).code === "BOX_TOOL_ECHO_CONTENT_MISMATCH"; }
+    if (!refused) fail("IMAGE_NOTE_FOREIGN_DIR");
+  }
+}
 async function workerMain(expectSha: string): Promise<void> {
   const token = process.env.OC_B1_WORKER_TOKEN ?? "";
   const tokenFile = process.env.OC_B1_WORKER_TOKEN_FILE ?? "";
@@ -994,10 +1107,20 @@ async function workerMain(expectSha: string): Promise<void> {
   const before = digest();
   await proveCompactionConsumer();
   if (!COMPACTION_BINDING.startsWith("[ocv5-296-compaction] PASS")) fail("COMPACTION_BINDING");
+  await proveSystemHeader();
+  await proveRestageContext();
+  await proveFreshNativeProject();
+  await proveNoMcpAutoBackground();
+  if (!MCP_AUTO_BACKGROUND_BINDING.startsWith("[ocv5-386-mcp-auto-background] PASS")) fail("MCP_AUTO_BACKGROUND_BINDING");
+  if (!FRESH_PROJECT_BINDING.startsWith("[ocv5-384-fresh-native-project] PASS")) fail("FRESH_PROJECT_BINDING");
+  if (!RESTAGE_BINDING.startsWith("[ocv5-384-restage-context] PASS")) fail("RESTAGE_BINDING");
+  if (!SYSTEM_HEADER_BINDING.startsWith("[ocv5-381-system-header] PASS")) fail("SYSTEM_HEADER_BINDING");
   const api = await load();
   const after = digest();
   if (!isDeepStrictEqual(before, after)) fail("MANIFEST_DRIFT_AFTER_LOAD");
   checks(api);
+  await proveLoginImageNote(api);
+  if (!LOGIN_IMAGE_NOTE_BINDING.startsWith("[ocv5-390-login-image-note] PASS")) fail("LOGIN_IMAGE_NOTE_BINDING");
   await provePublisher();
   const end = digest();
   if (!isDeepStrictEqual(before, end)) fail("MANIFEST_DRIFT_FINAL");

@@ -42,7 +42,8 @@ export async function publishBoxToolResume(input: {
     prepared?: PreparedContinuation }) => Promise<BoxResumeDecision> };
   resolveTarget: (args: { uid: bigint; sessionId: string | null;
     requestId: string; upstreamModel: string; requiredAccountId: bigint;
-    signal: AbortSignal }) => Promise<BoxResolvedTarget>;
+    /** Publishing to a live run launches nothing: no login is scheduled (OCV5-390). */
+    noLaunch: true; signal: AbortSignal }) => Promise<BoxResolvedTarget>;
   retainUnknownTarget: (handle: { target: BoxResolvedTarget;
     claim: BoxToolResumeClaim; uid: bigint; requestId: string }) => void;
   onUnknown: (args: { uid: bigint; accountId: bigint; requestId: string;
@@ -125,7 +126,7 @@ export async function publishBoxToolResume(input: {
     const pendingTarget = deps.resolveTarget({ uid: input.uid,
       sessionId: input.sessionId, requestId: input.requestId,
       upstreamModel: input.upstreamModel,
-      requiredAccountId: claim.accountId, signal });
+      requiredAccountId: claim.accountId, noLaunch: true, signal });
     let resolverLost = false;
     let completedTarget: BoxResolvedTarget | null = null;
     let lateRetained = false;

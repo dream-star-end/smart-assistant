@@ -94,3 +94,23 @@ test("ranking is deterministic and ignores load and utilization (weights stay st
   const b = rankBoxProfiles(three({ "1:b": { loginLoad: 9, utilization: 0.9 } }), "42").map(label);
   assert.deepEqual(a, b);
 });
+
+test("defaultFirst: every user starts on the default login; the others only take its spill (OCV5-387)", () => {
+  const policy = { ...BOX_PROFILE_POLICY, defaultFirst: true };
+  const pair = (over: Record<string, Partial<BoxProfileCandidate>> = {}) => [
+    cand(25n, "default", { isDefault: false, ...over.default }),
+    cand(25n, "account2", { isDefault: true, ...over.account2 })];
+  for (const u of users) {
+    assert.equal(label(pickBoxProfile({ candidates: pair(), affinityKey: u, policy })?.candidate), "25:account2");
+  }
+  for (const over of [{ account2: { utilization: 0.95 } }, { account2: { cooldownActive: true } },
+    { account2: { loginLoad: BOX_PROFILE_POLICY.loginSpillLoad } }]) {
+    const pick = pickBoxProfile({ candidates: pair(over), affinityKey: users[0]!, policy });
+    assert.equal(label(pick?.candidate), "25:default", JSON.stringify(over));
+    // A benched login is not ranked at all, so the backup is then the user's top choice.
+    if (!("cooldownActive" in over.account2)) assert.notEqual(pick?.reason, "affinity");
+  }
+  // Without the switch the default is only weighted: some users still land on the other login.
+  const spread = new Set(users.map((u) => label(pickBoxProfile({ candidates: pair(), affinityKey: u })?.candidate)));
+  assert.deepEqual([...spread].sort(), ["25:account2", "25:default"]);
+});

@@ -34,6 +34,7 @@ export function makeBoxDetachedTextPlan(input: Parameters<typeof makeBoxTextPlan
     { asset: input.supervisorAsset, path: text.stageSupervisor.args[3]! },
     { asset: input.keeperAsset, path: text.stageKeeper.args[3]! },
     { asset: detachedRunnerAsset, path: access.runnerPath },
+    ...(text.interactiveHost ? [{ asset: text.interactiveHost.asset, path: text.interactiveHost.path }] : []),
   ]);
   if (text.run.args[0] !== "-I") {
     throw new Error("BOX_DETACHED_PYTHON_ISOLATION_MISSING");

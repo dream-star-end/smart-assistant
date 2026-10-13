@@ -4,6 +4,7 @@
  * tool_result is deliberately rejected: an in-flight tool call must be
  * delivered to the *same live CLI/MCP rendezvous*, not a resumed process.
  */
+import { BOX_PROMPT_LAYOUT_STATIC_FIRST } from "./boxNativePointer.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { ProxyBody } from "./shared.js";
 import { BoxCacheAnnotationError, normalizeBoxSemanticBody,
@@ -26,8 +27,60 @@ function blocks(content: unknown): Block[] {
     && typeof (item as { type?: unknown }).type === "string");
 }
 
+/** OCV5-381: CCB sends `x-anthropic-billing-header: …` as system block 0.
+ * The Box CLI reads `--system-prompt-file` as one block, sees that prefix and
+ * discards the whole file as an attribution header, so every OpenClaude
+ * instruction after it was lost. Drop the header; keep everything else. */
+const BILLING_HEADER_PREFIX = "x-anthropic-billing-header";
+
+function withoutBillingHeader(text: string): string {
+  if (!text.startsWith(BILLING_HEADER_PREFIX)) return text;
+  const newline = text.indexOf("\n");
+  return newline < 0 ? "" : text.slice(newline + 1).replace(/^\n+/, "");
+}
+
+/** OCV5-383: OpenClaude marks where the per-session part of its system prompt
+ * starts (gateway promptSlots cacheLayout 'static-first'). The text before it is
+ * the same for every session, so it alone becomes the Box system prompt and the
+ * Box CLI can read it from cache across sessions; the rest rides in the first
+ * user message, where Claude Code keeps its own per-session context too. */
+export const BOX_SESSION_CONTEXT_MARKER = "<!-- oc:session-context -->";
+
+/** OCV5-383: the prompt layout a request will be staged with. */
+export function boxPromptLayoutOf(body: ProxyBody): typeof BOX_PROMPT_LAYOUT_STATIC_FIRST | null {
+  const parts: unknown[] = [body.system];
+  if (Array.isArray(body.messages)) {
+    for (const message of body.messages) {
+      if (message && typeof message === "object" && (message as { role?: unknown }).role === "system") {
+        parts.push((message as { content?: unknown }).content);
+      }
+    }
+  }
+  for (const part of parts) {
+    if (part === undefined) continue;
+    try {
+      if (systemText(part).includes(BOX_SESSION_CONTEXT_MARKER)) return BOX_PROMPT_LAYOUT_STATIC_FIRST;
+    } catch { /* shape errors surface from compileBoxCliSyntheticTurn */ }
+  }
+  return null;
+}
+
+function splitSessionContext(prompt: string): { system: string; context: string | null } {
+  const at = prompt.indexOf(BOX_SESSION_CONTEXT_MARKER);
+  if (at < 0) return { system: prompt, context: null };
+  const context = prompt.slice(at + BOX_SESSION_CONTEXT_MARKER.length).replace(/^\s*(?:---\s*)?/, "").trim();
+  return { system: prompt.slice(0, at).replace(/\s*(?:---\s*)?$/, "").trimEnd(),
+    context: context || null };
+}
+
+function withSessionContext(content: unknown, context: string): unknown[] {
+  const reminder = { type: "text", text: `<system-reminder>\n${context}\n</system-reminder>` };
+  if (typeof content === "string") return [reminder, { type: "text", text: content }];
+  return [reminder, ...(Array.isArray(content) ? content : [])];
+}
+
 function systemText(content: unknown): string {
-  if (typeof content === "string") return content;
+  if (typeof content === "string") return withoutBillingHeader(content);
   if (!Array.isArray(content)) throw new BoxMessagesShapeError("BOX_SYSTEM_UNSUPPORTED");
   return content.map((part) => {
     if (part === null || typeof part !== "object" || Array.isArray(part)
@@ -35,8 +88,8 @@ function systemText(content: unknown): string {
       || typeof (part as { text?: unknown }).text !== "string") {
       throw new BoxMessagesShapeError("BOX_SYSTEM_UNSUPPORTED");
     }
-    return (part as { text: string }).text;
-  }).join("\n\n");
+    return withoutBillingHeader((part as { text: string }).text);
+  }).filter(Boolean).join("\n\n");
 }
 
 /** OCV5-337: completed history written by another model (e.g. k3 `tool_…`,
@@ -202,6 +255,9 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
    * previous assistant's tool calls (a tool exchange whose live Box owner is
    * gone, e.g. a recovered dispatch). */
   resumeToolResults?: boolean;
+  /** OCV5-384: context records of the session's previous native transcript, staged right
+   * after the first user message where the CLI keeps them (see boxTranscriptAttachments). */
+  stagedAttachments?: readonly Record<string, unknown>[];
 }): BoxCliSyntheticTurn {
   if (!/^\/tmp\/ocv5-289-run-[a-f0-9]{24}$/.test(args.cwd)
     || args.cliVersion !== "2.1.280") {
@@ -300,27 +356,45 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
     }
   }
   if (pending.size) throw new BoxMessagesShapeError("BOX_PENDING_TOOL_REQUIRES_LIVE_INVOCATION");
-  const staged = args.toolAliases ? aliasHistory(history, args.toolAliases) : history;
+  const aliased = args.toolAliases ? aliasHistory(history, args.toolAliases) : history;
+  const split = splitSessionContext(promptParts.filter(Boolean).join("\n\n"));
+  const staged = split.context && aliased[0]?.role === "user"
+    ? [{ ...aliased[0], content: withSessionContext(aliased[0].content, split.context) },
+      ...aliased.slice(1)]
+    : aliased;
+  const currentContent = split.context && staged === aliased
+    ? withSessionContext(current.content, split.context) : current.content;
 
   const timestamp = new Date().toISOString();
   let parentUuid: string | null = null;
-  const records = staged.map((message) => {
+  let pendingAttachments = args.stagedAttachments ?? [];
+  const records: Record<string, unknown>[] = [];
+  for (const message of staged) {
     const uuid = randomUUID();
     const base = { parentUuid, isSidechain: false, type: message.role, uuid,
       timestamp, cwd: args.cwd, sessionId, version: args.cliVersion };
     parentUuid = uuid;
-    return message.role === "user"
+    records.push(message.role === "user"
       ? { ...base, message: { role: "user", content: message.content } }
       : { ...base, message: { id: `msg_${uuid.replaceAll("-", "")}`, type: "message",
         role: "assistant", model: semantic.model, content: message.content,
         stop_reason: blocks(message.content).some((block) => block.type === "tool_use")
           ? "tool_use" : "end_turn",
-        usage: { input_tokens: 0, output_tokens: 0 } } };
-  });
+        usage: { input_tokens: 0, output_tokens: 0 } } });
+    if (message.role === "user" && pendingAttachments.length > 0) {
+      for (const record of pendingAttachments) {
+        const recordUuid = randomUUID();
+        records.push({ ...record, parentUuid, uuid: recordUuid, sessionId, cwd: args.cwd,
+          isSidechain: false, ...("session_id" in record ? { session_id: sessionId } : {}) });
+        parentUuid = recordUuid;
+      }
+      pendingAttachments = [];
+    }
+  }
   return {
     sessionId,
     snapshotJsonl: records.length ? records.map((record) => JSON.stringify(record)).join("\n") + "\n" : "",
-    stdinJsonl: JSON.stringify({ type: "user", message: { role: "user", content: current.content } }) + "\n",
-    systemPrompt: promptParts.filter(Boolean).join("\n\n"),
+    stdinJsonl: JSON.stringify({ type: "user", message: { role: "user", content: currentContent } }) + "\n",
+    systemPrompt: split.system,
   };
 }

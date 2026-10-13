@@ -1,0 +1,85 @@
+{
+  "commands": [
+    {
+      "name": "quote",
+      "usage": "ths quote <code...> [--raw]",
+      "desc": "实时行情快照：现价/涨跌幅/量额/换手/涨跌停/市值 + order_book 买一卖一与委比（仅一档）"
+    },
+    {
+      "name": "kline",
+      "usage": "ths kline <code> [--period day|week|month|60m|30m|15m|5m] [--count N]",
+      "desc": "K线（前复权，输出含 adjust=forward）"
+    },
+    {
+      "name": "intraday",
+      "usage": "ths intraday <code>",
+      "desc": "当日 1 分钟分时"
+    },
+    {
+      "name": "indicators",
+      "usage": "ths indicators <code> [--period day] [--count N]",
+      "desc": "技术指标：MA5/10/20/60、MACD、RSI14、KDJ、BOLL（本地计算，基于前复权K线）"
+    },
+    {
+      "name": "search",
+      "usage": "ths search <关键词>",
+      "desc": "按名称/代码找股"
+    },
+    {
+      "name": "screen",
+      "usage": "ths screen \"<自然语言条件>\" [--limit N]",
+      "desc": "问财 NLP 自然语言选股"
+    },
+    {
+      "name": "news",
+      "usage": "ths news [--source cjzx|hk|hgt|whfx|global] [--limit N]",
+      "desc": "财经资讯 RSS"
+    },
+    {
+      "name": "f10",
+      "usage": "ths f10 <code> [--deep] [--all]",
+      "desc": "F10 摘要；--deep 附财报三表核心指标（近4期，含同比 yoy_pct）+十大股东；--all 附全量科目"
+    },
+    {
+      "name": "rank",
+      "usage": "ths rank [--by change|fall|amount|turnover|volume|fund|fundout] [--limit N]",
+      "desc": "全市场排行（近似榜单）；fund/fundout 为主力资金名单版，无金额数值"
+    },
+    {
+      "name": "lhb",
+      "usage": "ths lhb [--limit N]",
+      "desc": "龙虎榜名单（最近交易日；无上榜原因/营业部明细）"
+    },
+    {
+      "name": "sector",
+      "usage": "ths sector list|quote|stocks [板块名|代码] [--type industry|concept] [--limit N] [--refresh]",
+      "desc": "板块列表（95行业+431概念）/板块指数行情/成分股"
+    },
+    {
+      "name": "watchlist",
+      "usage": "ths watchlist list|add|remove|sync|push [code]",
+      "desc": "本地自选（list 带行情）；sync 云→本地合并、push 本地→云（需登录）"
+    },
+    {
+      "name": "login",
+      "usage": "ths login send-code --phone N [--captcha-x X] | verify --code C | status | logout",
+      "desc": "同花顺短信登录（滑块验证码需看图定位；凭据存 ~/.ths_auth.json，约30天）"
+    },
+    {
+      "name": "events",
+      "usage": "ths events <code> [--limit N]",
+      "desc": "公司大事·近期重要事件（股东大会/业绩披露/回购/分红/解禁等，来自 F10 event 页）"
+    },
+    {
+      "name": "doctor",
+      "usage": "ths doctor",
+      "desc": "通道健康检查（行情/K线/问财/资讯/F10/板块/登录），有关键项失败时退出码 1"
+    },
+    {
+      "name": "commands",
+      "usage": "ths commands",
+      "desc": "本能力清单（机器可读）"
+    }
+  ],
+  "conventions": "默认 JSON 输出；--table 切表格；错误为 stderr 的 {\"error\": ...} 且退出码 1；非交易时段返回最近收盘，先看 status/update_time"
+}

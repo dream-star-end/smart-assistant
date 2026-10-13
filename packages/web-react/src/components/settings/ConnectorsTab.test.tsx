@@ -74,6 +74,10 @@ vi.mock("../../lib/api", async (importOriginal) => {
       createKnowledgePlanetAutomationRule: vi.fn(),
       patchKnowledgePlanetAutomationRule: vi.fn(),
       deleteKnowledgePlanetAutomationRule: vi.fn(),
+      // OCV5-383：本机插件目录 + 启用开关（偏好 disabled_plugins）
+      getLocalPlugins: vi.fn(),
+      getPreferences: vi.fn(),
+      patchPreferences: vi.fn(),
     },
   };
 });
@@ -122,6 +126,8 @@ const mockedDeleteKnowledgePlanetRule = vi.mocked(api.deleteKnowledgePlanetAutom
 afterEach(cleanup);
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(api.getLocalPlugins).mockResolvedValue({ plugins: [] })
+  vi.mocked(api.getPreferences).mockResolvedValue({ prefs: {} })
   // 声明式默认降级为空（现有 v1 用例不受第二套后端影响）；声明式用例各自 override。
   mockedDeclCatalog.mockResolvedValue({ connectors: [] })
   mockedDeclConnections.mockResolvedValue({ connections: [] })
@@ -417,11 +423,41 @@ function weiboWriteControl(
   }
 }
 
-/** 定位某 provider 目录段的容器（label 文本 → 最近的插件段 section）。 */
+const escapeRe = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** 当前屏上某插件的设置卡片（详情页里）；不在屏上返回 undefined。 */
+function cardOnScreen(label: string): HTMLElement | undefined {
+  return screen
+    .queryAllByText(label)
+    .map((n) => n.closest("[data-connector-card]"))
+    .find((n): n is HTMLElement => n instanceof HTMLElement);
+}
+
+/**
+ * 定位某插件的设置卡片。OCV5-383 起一级列表只有「名称 + 状态 + 启用开关」，设置都在点进去的详情页里：
+ * 卡片不在屏上时先（必要时返回列表）点开这个插件。
+ */
 function providerCard(label: string): HTMLElement {
-  const el = screen.getByText(label).closest("[data-connector-card]");
-  expect(el).not.toBeNull();
+  let el = cardOnScreen(label);
+  if (!el) {
+    const back = screen.queryByRole("button", { name: "返回插件列表" });
+    if (back) fireEvent.click(back);
+    const row = screen.queryByRole("button", { name: new RegExp(`^${escapeRe(label)}：`) });
+    if (row) fireEvent.click(row);
+    el = cardOnScreen(label);
+  }
+  expect(el).toBeTruthy();
   return el as HTMLElement;
+}
+
+/** 等列表加载出这个插件，再点进它的详情页（OCV5-383）。 */
+async function openPlugin(label: string): Promise<HTMLElement> {
+  if (!cardOnScreen(label)) {
+    const back = screen.queryByRole("button", { name: "返回插件列表" });
+    if (back) fireEvent.click(back);
+    fireEvent.click(await screen.findByRole("button", { name: new RegExp(`^${escapeRe(label)}：`) }));
+  }
+  return providerCard(label);
 }
 
 /** 账号行「⋯」（改名 / 重新登录 / 解绑都在这里）的触发器名。 */
@@ -449,14 +485,18 @@ describe("ConnectorsTab 目录渲染", () => {
     render(<ConnectorsTab auth={auth} />);
 
     expect(await screen.findByText("WebDAV 网盘")).toBeInTheDocument();
+    // OCV5-383：一级列表每个插件一行「名称 + 状态 + 启用开关」，说明与能力标注在详情页里。
     for (const p of PROVIDERS) {
-      expect(screen.getByText(p.label)).toBeInTheDocument();
-      expect(screen.getByText(p.description)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: `${p.label}：未连接，打开设置` })).toBeInTheDocument();
+      expect(screen.getByRole("switch", { name: `启用「${p.label}」` })).toBeChecked();
+      expect(screen.queryByText(p.description)).not.toBeInTheDocument();
     }
-    // github 标「只读」,其余标「可读写」
-    expect(within(providerCard("GitHub")).getByText("只读")).toBeInTheDocument();
-    expect(within(providerCard("邮箱")).getByText("可读写")).toBeInTheDocument();
-    expect(screen.getAllByText("可读写")).toHaveLength(4);
+    for (const p of PROVIDERS) {
+      const card = providerCard(p.label);
+      expect(within(card).getByText(p.description)).toBeInTheDocument();
+      // github 标「只读」,其余标「可读写」
+      expect(within(card).getByText(p.id === "github" ? "只读" : "可读写")).toBeInTheDocument();
+    }
   });
 
   test("已绑多账号:同 provider 多行,显示 displayName/accountHint/绑定状态", async () => {
@@ -464,6 +504,7 @@ describe("ConnectorsTab 目录渲染", () => {
       catalog([conn(), conn({ id: "12", displayName: "", accountHint: "b***@163.com" })]),
     );
     render(<ConnectorsTab auth={auth} />);
+    await openPlugin('邮箱')
 
     expect(await screen.findByText("工作邮箱")).toBeInTheDocument();
     const card = providerCard("邮箱");
@@ -481,6 +522,7 @@ describe("ConnectorsTab 目录渲染", () => {
       catalog([conn({ status: "error", lastErrorCode: "RELINK_REQUIRED" })]),
     );
     render(<ConnectorsTab auth={auth} />);
+    await openPlugin('邮箱')
 
     expect(await screen.findByText("需要重新绑定")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "重新绑定" })).toBeInTheDocument();
@@ -492,6 +534,7 @@ describe("ConnectorsTab 目录渲染", () => {
       catalog([conn({ status: "error", lastErrorCode: "INVALID_CREDENTIALS" })]),
     );
     render(<ConnectorsTab auth={auth} />);
+    await openPlugin('邮箱')
 
     expect(await screen.findByText("凭据校验失败，请检查账号或授权码后重试")).toBeInTheDocument();
     expect(screen.queryByText("INVALID_CREDENTIALS")).not.toBeInTheDocument();
@@ -502,7 +545,7 @@ describe("ConnectorsTab 表单驱动绑定", () => {
   test("imap:formFields 生成表单,password 字段用密码框,顶部有引导链接", async () => {
     mockedGetConnectors.mockResolvedValue(catalog());
     render(<ConnectorsTab auth={auth} />);
-    await screen.findByText("邮箱");
+    await openPlugin("邮箱");
 
     fireEvent.click(within(providerCard("邮箱")).getByRole("button", { name: "绑定" }));
     const dialog = await screen.findByRole("dialog");
@@ -522,7 +565,7 @@ describe("ConnectorsTab 表单驱动绑定", () => {
     mockedGetConnectors.mockResolvedValue(catalog());
     mockedBind.mockResolvedValue({ connection: conn() });
     render(<ConnectorsTab auth={auth} />);
-    await screen.findByText("邮箱");
+    await openPlugin("邮箱");
 
     fireEvent.click(within(providerCard("邮箱")).getByRole("button", { name: "绑定" }));
     const dialog = await screen.findByRole("dialog");
@@ -551,7 +594,7 @@ describe("ConnectorsTab 表单驱动绑定", () => {
       new ApiError({ status: 400, message: "raw upstream", code: "INVALID_CREDENTIALS" }),
     );
     render(<ConnectorsTab auth={auth} />);
-    await screen.findByText("Notion");
+    await openPlugin("Notion");
 
     fireEvent.click(within(providerCard("Notion")).getByRole("button", { name: "绑定" }));
     const dialog = await screen.findByRole("dialog");
@@ -572,7 +615,7 @@ describe("ConnectorsTab 表单驱动绑定", () => {
     // 返回后组件整页跳转;jsdom 不实现导航,仅断言 API 入参
     mockedOAuthStart.mockResolvedValue({ authorizeUrl: "https://open.feishu.cn/authorize?x=1" });
     render(<ConnectorsTab auth={auth} />);
-    await screen.findByText("飞书");
+    await openPlugin("飞书");
 
     fireEvent.click(within(providerCard("飞书")).getByRole("button", { name: "绑定" }));
     const dialog = await screen.findByRole("dialog");
@@ -596,7 +639,7 @@ describe("ConnectorsTab 表单驱动绑定", () => {
       state: "s",
     });
     render(<ConnectorsTab auth={auth} />);
-    await screen.findByText("GitHub");
+    await openPlugin("GitHub");
 
     fireEvent.click(within(providerCard("GitHub")).getByRole("button", { name: "绑定" }));
     await waitFor(() => expect(mockedGithubStart).toHaveBeenCalledWith(auth));
@@ -609,6 +652,7 @@ describe("ConnectorsTab 已绑管理", () => {
     mockedGetConnectors.mockResolvedValue(catalog([conn()]));
     mockedDelete.mockResolvedValue(undefined);
     render(<ConnectorsTab auth={auth} />);
+    await openPlugin("邮箱");
     await screen.findByText("工作邮箱");
 
     await chooseMenuItem(screen.getByRole("button", { name: ACCOUNT_MENU }), "解绑");
@@ -626,6 +670,7 @@ describe("ConnectorsTab 已绑管理", () => {
     mockedGetConnectors.mockResolvedValue(catalog([conn()]));
     mockedRename.mockResolvedValue(undefined);
     render(<ConnectorsTab auth={auth} />);
+    await openPlugin("邮箱");
     await screen.findByText("工作邮箱");
 
     await chooseMenuItem(screen.getByRole("button", { name: ACCOUNT_MENU }), "编辑备注名");
@@ -667,7 +712,7 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     });
     render(<ConnectorsTab auth={auth} />);
 
-    await screen.findByText("Linear");
+    await openPlugin("Linear");
     const card = providerCard("Linear");
     // 「可更新」是一行元信息里的安静词；动作本身在「⋯」里，带上目标版本。
     expect(within(card).getByText("可更新")).toBeInTheDocument();
@@ -690,7 +735,7 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     mockedUninstallMarketplace.mockResolvedValue({ ok: true });
     render(<ConnectorsTab auth={auth} />);
 
-    await screen.findByText("Linear");
+    await openPlugin("Linear");
     expect(within(providerCard("Linear")).queryByRole("button", { name: "卸载" })).not.toBeInTheDocument();
     await chooseMenuItem(
       within(providerCard("Linear")).getByRole("button", { name: "Linear的更多操作" }),
@@ -708,6 +753,7 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     mockedGetConnectors.mockResolvedValue(catalog());
     mockedDeclCatalog.mockResolvedValue({ connectors: [declEntry()] });
     render(<ConnectorsTab auth={auth} />);
+    await openPlugin('Linear')
 
     expect(await screen.findByText("Linear")).toBeInTheDocument();
     expect(screen.getByText("声明式：检索与创建 Linear issue")).toBeInTheDocument();
@@ -722,7 +768,7 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     });
     render(<ConnectorsTab auth={auth} />);
 
-    await screen.findByText("Linear");
+    await openPlugin("Linear");
     expect(within(providerCard("Linear")).getByText("可读写")).toBeInTheDocument();
   });
 
@@ -794,7 +840,7 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     });
     mockedDeclBind.mockResolvedValue({ connection: { id: "d1", rebound: false } });
     render(<ConnectorsTab auth={auth} />);
-    await screen.findByText("Linear");
+    await openPlugin("Linear");
 
     fireEvent.click(within(providerCard("Linear")).getByRole("button", { name: "绑定" }));
     const dialog = await screen.findByRole("dialog");
@@ -837,7 +883,7 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
       ],
     });
     render(<ConnectorsTab auth={auth} />);
-    await screen.findByText("Linear");
+    await openPlugin("Linear");
 
     fireEvent.click(within(providerCard("Linear")).getByRole("button", { name: "绑定" }));
     const dialog = await screen.findByRole("dialog");
@@ -871,7 +917,7 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
       authorizeUrl: "https://linear.app/oauth/authorize?x=1",
     });
     render(<ConnectorsTab auth={auth} />);
-    await screen.findByText("Linear");
+    await openPlugin("Linear");
 
     fireEvent.click(within(providerCard("Linear")).getByRole("button", { name: "绑定" }));
     const dialog = await screen.findByRole("dialog");
@@ -910,7 +956,7 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     });
     mockedDeclOauthStart.mockResolvedValue({ authorizeUrl: "https://linear.app/oauth/authorize" });
     render(<ConnectorsTab auth={auth} />);
-    await screen.findByText("Linear");
+    await openPlugin("Linear");
 
     fireEvent.click(within(providerCard("Linear")).getByRole("button", { name: "绑定" }));
     const dialog = await screen.findByRole("dialog");
@@ -949,7 +995,7 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
       new ApiError({ status: 503, message: "raw internal", code: "CONNECTOR_UNAVAILABLE" }),
     );
     render(<ConnectorsTab auth={auth} />);
-    await screen.findByText("Linear");
+    await openPlugin("Linear");
 
     fireEvent.click(within(providerCard("Linear")).getByRole("button", { name: "绑定" }));
     const dialog = await screen.findByRole("dialog");
@@ -982,6 +1028,7 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     });
     mockedDeclUnbind.mockResolvedValue(undefined);
     render(<ConnectorsTab auth={auth} />);
+    await openPlugin('Linear')
     await screen.findByText("我的 Linear");
 
     const card = providerCard("Linear");
@@ -1007,7 +1054,7 @@ describe("ConnectorsTab 声明式连接器（统一界面）", () => {
     mockedGetConnectors.mockResolvedValue(catalog());
     mockedDeclCatalog.mockResolvedValue({ connectors: [declEntry()] });
     render(<ConnectorsTab auth={auth} />);
-    await screen.findByText("WebDAV 网盘");
+    await openPlugin("WebDAV 网盘");
 
     fireEvent.click(within(providerCard("WebDAV 网盘")).getByRole("button", { name: "绑定" }));
     const dialog = await screen.findByRole("dialog");
@@ -1061,7 +1108,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     })
     render(<ConnectorsTab auth={auth} />)
 
-    await screen.findByText('知识星球')
+    await openPlugin('知识星球')
     const card = providerCard('知识星球')
     expect(within(card).getByText('可更新')).toBeInTheDocument()
     await chooseMenuItem(
@@ -1100,6 +1147,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       ],
     })
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('知识星球')
 
     await screen.findByText('旧版知识星球')
     const card = providerCard('知识星球')
@@ -1141,6 +1189,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       ],
     })
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('知识星球')
 
     await screen.findByText('过期的知识星球账号')
     const card = providerCard('知识星球')
@@ -1157,7 +1206,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     mockedUninstallMarketplace.mockResolvedValue({ ok: true })
     render(<ConnectorsTab auth={auth} />)
 
-    await screen.findByText('知识星球')
+    await openPlugin('知识星球')
     await chooseMenuItem(
       within(providerCard('知识星球')).getByRole('button', { name: '知识星球的更多操作' }),
       '卸载',
@@ -1196,7 +1245,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectUrl })
 
     render(<ConnectorsTab auth={auth} />)
-    await screen.findByText('知识星球')
+    await openPlugin('知识星球')
     expect(within(providerCard('知识星球')).getByText('隔离运行')).toBeInTheDocument()
     fireEvent.click(within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }))
     const dialog = await screen.findByRole('dialog')
@@ -1246,7 +1295,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
 
     render(<ConnectorsTab auth={auth} />)
-    await screen.findByText('微博')
+    await openPlugin('微博')
     fireEvent.click(within(providerCard('微博')).getByRole('button', { name: '微博扫码授权' }))
     const dialog = await screen.findByRole('dialog')
     expect(within(dialog).getByText('授权微博')).toBeInTheDocument()
@@ -1298,6 +1347,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     mockedWeiboStatus.mockImplementation(() => new Promise(() => {}))
 
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('微博');
     await screen.findByText('我的微博')
     // 健康账号的「重新扫码登录」不占行面，收在账号「⋯」里。
     expect(
@@ -1352,6 +1402,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     })
 
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('微博');
     await screen.findByText('我的微博')
     // 登录失效时修复动作直接在账号行上（不必进「⋯」）。
     fireEvent.click(
@@ -1385,7 +1436,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     })
 
     const { unmount } = render(<ConnectorsTab auth={auth} />)
-    await screen.findByText('微博')
+    await openPlugin('微博')
     fireEvent.click(within(providerCard('微博')).getByRole('button', { name: '微博扫码授权' }))
     let dialog = await screen.findByRole('dialog')
     fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
@@ -1408,7 +1459,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     })
 
     render(<ConnectorsTab auth={auth} />)
-    await screen.findByText('微博')
+    await openPlugin('微博')
     fireEvent.click(within(providerCard('微博')).getByRole('button', { name: '微博扫码授权' }))
     dialog = await screen.findByRole('dialog')
     fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
@@ -1443,7 +1494,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
 
     render(<ConnectorsTab auth={auth} />)
-    await screen.findByText('知乎')
+    await openPlugin('知乎')
     fireEvent.click(within(providerCard('知乎')).getByRole('button', { name: '知乎扫码授权' }))
     const dialog = await screen.findByRole('dialog')
     expect(within(dialog).getByText('授权知乎')).toBeInTheDocument()
@@ -1495,6 +1546,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     mockedZhihuStatus.mockImplementation(() => new Promise(() => {}))
 
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('知乎')
     await screen.findByText('我的知乎')
     await chooseMenuItem(
       within(providerCard('知乎')).getByRole('button', { name: ACCOUNT_MENU }),
@@ -1528,7 +1580,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     })
 
     const { unmount } = render(<ConnectorsTab auth={auth} />)
-    await screen.findByText('知乎')
+    await openPlugin('知乎')
     fireEvent.click(within(providerCard('知乎')).getByRole('button', { name: '知乎扫码授权' }))
     let dialog = await screen.findByRole('dialog')
     fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
@@ -1551,7 +1603,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     })
 
     render(<ConnectorsTab auth={auth} />)
-    await screen.findByText('知乎')
+    await openPlugin('知乎')
     fireEvent.click(within(providerCard('知乎')).getByRole('button', { name: '知乎扫码授权' }))
     dialog = await screen.findByRole('dialog')
     fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
@@ -1585,7 +1637,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectUrl })
 
     render(<ConnectorsTab auth={auth} />)
-    await screen.findByText('知识星球')
+    await openPlugin('知识星球')
     fireEvent.click(within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }))
     const dialog = await screen.findByRole('dialog')
     fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
@@ -1639,7 +1691,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     })
 
     render(<ConnectorsTab auth={auth} />)
-    await screen.findByText('知识星球')
+    await openPlugin('知识星球')
     fireEvent.click(within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }))
     fireEvent.click(
       within(await screen.findByRole('dialog')).getByRole('button', {
@@ -1691,7 +1743,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       })
 
     render(<ConnectorsTab auth={auth} />)
-    await screen.findByText('知识星球')
+    await openPlugin('知识星球')
     fireEvent.click(within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }))
     const dialog = await screen.findByRole('dialog')
     fireEvent.click(within(dialog).getByRole('button', { name: '同意并生成二维码' }))
@@ -1739,7 +1791,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     )
 
     render(<ConnectorsTab auth={auth} />)
-    await screen.findByText('知识星球')
+    await openPlugin('知识星球')
     fireEvent.click(within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }))
     fireEvent.click(
       within(await screen.findByRole('dialog')).getByRole('button', {
@@ -1774,6 +1826,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     })
     mockedPluginRevoke.mockResolvedValue(undefined)
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('知识星球')
 
     await screen.findByText('微信扫码账号')
     const card = providerCard('知识星球')
@@ -1816,6 +1869,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     mockedSetPluginWriteAccess.mockResolvedValue(enabledControl)
 
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('知识星球')
     const writeSwitch = await screen.findByRole('switch', {
       name: '我的知识星球写入能力',
     })
@@ -1884,6 +1938,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     mockedSetPluginWritePreapproval.mockResolvedValue(enabled)
 
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('知识星球')
     const preapprovalSwitch = await screen.findByRole('switch', {
       name: '免确认账号免逐次确认',
     })
@@ -1946,6 +2001,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       .mockResolvedValueOnce(base)
 
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('微博')
     expect(
       await screen.findByText('开启后，Agent 直接执行写入，不展示确认卡；默认关闭。'),
     ).toBeInTheDocument()
@@ -2010,6 +2066,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     mockedPluginManagement.mockResolvedValue({ catalog: [weiboPlugin()], accounts: [account] })
 
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('微博')
 
     expect(await screen.findByText('写入条款已更新，需重新同意')).toBeInTheDocument()
     expect(screen.getByText('免确认条款已更新，需重新同意后才会生效。')).toBeInTheDocument()
@@ -2039,6 +2096,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     )
 
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('知识星球')
     const writeSwitch = await screen.findByRole('switch', {
       name: '失败探针账号写入能力',
     })
@@ -2084,6 +2142,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     )
 
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('知识星球')
     const writeSwitch = await screen.findByRole('switch', { name: '发布账号写入能力' })
     expect(writeSwitch).toBeChecked()
     fireEvent.click(writeSwitch)
@@ -2148,6 +2207,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
       })
 
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('知识星球')
     // 自动回复子系统已从账号行外提到贴底 Sheet：账号行只留摘要 +「配置」入口。
     fireEvent.click(await screen.findByRole('button', { name: '配置' }))
     const automationSwitch = await screen.findByRole('switch', {
@@ -2240,6 +2300,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     mockedCreateKnowledgePlanetRulesBatch.mockResolvedValue([rule, secondRule])
 
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('知识星球')
     fireEvent.click(await screen.findByRole('button', { name: '配置' }))
     fireEvent.click(await screen.findByRole('button', { name: '添加规则' }))
     const dialog = await screen.findByRole('dialog')
@@ -2349,6 +2410,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     })
 
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('知识星球')
     fireEvent.click(await screen.findByRole('button', { name: '配置' }))
     fireEvent.click(await screen.findByRole('button', { name: '编辑' }))
     let dialog = await screen.findByRole('dialog')
@@ -2442,7 +2504,7 @@ describe('ConnectorsTab 通用 Plugin 账号', () => {
     mockedPluginRevoke.mockResolvedValue(undefined)
 
     render(<ConnectorsTab auth={auth} />)
-    await screen.findByText('知识星球')
+    await openPlugin('知识星球')
     fireEvent.click(within(providerCard('知识星球')).getByRole('button', { name: '微信扫码授权' }))
     fireEvent.click(
       within(await screen.findByRole('dialog')).getByRole('button', {
@@ -2507,7 +2569,7 @@ describe('ConnectorsTab 承接 manage 审计（M-20 目录降级可见 · M-21 �
     unmount()
     mockedPluginManagement.mockResolvedValue({ catalog: [], accounts: [] })
     render(<ConnectorsTab auth={auth} />)
-    await screen.findByText('WebDAV 网盘')
+    await openPlugin('WebDAV 网盘')
     expect(screen.queryByTestId('connectors-degraded')).not.toBeInTheDocument()
     warn.mockRestore()
   })
@@ -2544,6 +2606,7 @@ describe('ConnectorsTab 承接 manage 审计（M-20 目录降级可见 · M-21 �
         <ConnectorsTab auth={auth} />
       </ToastProvider>,
     )
+    await openPlugin('邮箱');
     await screen.findByText('工作邮箱')
 
     await chooseMenuItem(screen.getByRole('button', { name: ACCOUNT_MENU }), '编辑备注名')
@@ -2559,6 +2622,7 @@ describe('ConnectorsTab 承接 manage 审计（M-20 目录降级可见 · M-21 �
   test('备注名未改动时失焦只收起编辑框,不发请求', async () => {
     mockedGetConnectors.mockResolvedValue(catalog([conn()]))
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('邮箱');
     await screen.findByText('工作邮箱')
 
     await chooseMenuItem(screen.getByRole('button', { name: ACCOUNT_MENU }), '编辑备注名')
@@ -2571,6 +2635,7 @@ describe('ConnectorsTab 承接 manage 审计（M-20 目录降级可见 · M-21 �
   test('点「取消」不提交:mousedown 让路后的 blur 不调 renameConnector,恢复原名', async () => {
     mockedGetConnectors.mockResolvedValue(catalog([conn()]))
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('邮箱');
     await screen.findByText('工作邮箱')
 
     await chooseMenuItem(screen.getByRole('button', { name: ACCOUNT_MENU }), '编辑备注名')
@@ -2591,6 +2656,7 @@ describe('ConnectorsTab 承接 manage 审计（M-20 目录降级可见 · M-21 �
     mockedGetConnectors.mockResolvedValue(catalog([conn()]))
     mockedRename.mockResolvedValue(undefined)
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('邮箱');
     await screen.findByText('工作邮箱')
 
     await chooseMenuItem(screen.getByRole('button', { name: ACCOUNT_MENU }), '编辑备注名')
@@ -2622,7 +2688,7 @@ describe('ConnectorsTab 第 4 轮行语法（OCV5-360）', () => {
     mockedGetConnectors.mockResolvedValue(catalog())
     mockedPluginManagement.mockResolvedValue({ catalog: [knowledgePlanetPlugin()], accounts: [] })
     render(<ConnectorsTab auth={auth} />)
-    await screen.findByText('知识星球')
+    await openPlugin('知识星球')
 
     const card = providerCard('知识星球')
     const description = card.querySelector('[data-connector-description]')
@@ -2640,7 +2706,7 @@ describe('ConnectorsTab 第 4 轮行语法（OCV5-360）', () => {
       accounts: [],
     })
     render(<ConnectorsTab auth={auth} />)
-    await screen.findByText('知识星球')
+    await openPlugin('知识星球')
     const card = providerCard('知识星球')
 
     expect(within(card).queryByRole('button', { name: /^更新|^卸载/ })).not.toBeInTheDocument()
@@ -2671,6 +2737,7 @@ describe('ConnectorsTab 第 4 轮行语法（OCV5-360）', () => {
       ],
     })
     render(<ConnectorsTab auth={auth} />)
+    await openPlugin('知识星球')
     await screen.findByText('我的知识星球')
     const row = document.querySelector('[data-plugin-account="901"]') as HTMLElement
 
@@ -2719,5 +2786,168 @@ describe("ConnectorsTab 定位 API 插件（OCV5-379：AI 市场 / 已安装页�
     const notice = await screen.findByText("点「绑定」即可连接GitHub账号。");
     expect(providerCard("GitHub")).toContainElement(notice);
     expect(mockedGithubStart).not.toHaveBeenCalled();
+  });
+});
+
+
+// ── OCV5-383：一级列表只留启用开关，设置进详情页；本机插件 ─────────────────────
+
+const THS_PLUGIN = {
+  schema: "openclaude-plugin/1" as const,
+  name: "ths",
+  version: "1.0.0",
+  displayName: "同花顺行情",
+  description: "查询 A 股行情、K 线、分时、选股、板块、排行。数据来自同花顺公开 Web 接口，只读。",
+  author: { name: "ths-plugin contributors" },
+  license: "MIT",
+  homepage: "https://github.com/dream-star-end/ths-plugin",
+  tags: ["股票"],
+  useCases: ["查一只或几只股票的实时行情和盘口", "看日 K、周 K 或分钟 K 线和当天分时走势"],
+  components: {
+    skills: [{ path: "SKILL.md" }],
+    bin: [{ name: "ths", entry: "scripts/ths.py", interpreter: "python3" as const, description: "同花顺行情命令行" }],
+    data: [{ path: "references/sectors.json", description: "526 个板块注册表" }],
+  },
+  auth: {
+    mode: "none" as const,
+    login: { optional: true, kind: "sms-code" as const, description: "同步云自选需要短信登录。", start: "帮我登录同花顺，同步云自选" },
+  },
+  permissions: { network: ["https://d.10jqka.com.cn"], writes: [], userInteraction: ["sms-code" as const] },
+  disclaimer: { version: 1, text: "数据来自同花顺未公开的 Web 接口，仅供个人学习研究。" },
+  compat: { python: ">=3.8" },
+  enabled: true,
+};
+
+describe("ConnectorsTab 一级列表 + 详情页（OCV5-383）", () => {
+  test("一级列表每行只有名称、状态与启用开关；点行进入详情、返回回到列表", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog([conn()]));
+    render(<ConnectorsTab auth={auth} />);
+
+    const row = await screen.findByRole("button", { name: "邮箱：已连接，打开设置" });
+    // 账号与操作不在一级列表上
+    expect(screen.queryByText("工作邮箱")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "添加账号" })).not.toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "启用「邮箱」" })).toBeChecked();
+
+    fireEvent.click(row);
+    expect(screen.getByTestId("plugin-detail")).toBeInTheDocument();
+    expect(screen.getByText("工作邮箱")).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "启用「邮箱」" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "返回插件列表" }));
+    expect(screen.queryByTestId("plugin-detail")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "邮箱：已连接，打开设置" })).toBeInTheDocument();
+  });
+
+  test("关掉开关 → PATCH 偏好 disabled_plugins，行状态变「已停用」；再打开就恢复", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    vi.mocked(api.patchPreferences).mockResolvedValue({ prefs: {} });
+    render(
+      <ToastProvider>
+        <ConnectorsTab auth={auth} />
+      </ToastProvider>,
+    );
+    const sw = await screen.findByRole("switch", { name: "启用「WebDAV 网盘」" });
+    fireEvent.click(sw);
+    await waitFor(() =>
+      expect(api.patchPreferences).toHaveBeenCalledWith(auth, { disabled_plugins: ["webdav"] }),
+    );
+    expect(screen.getByRole("switch", { name: "启用「WebDAV 网盘」" })).not.toBeChecked();
+    expect(screen.getByRole("button", { name: /^WebDAV 网盘：/ })).toHaveTextContent("已停用");
+    expect(await screen.findByText(/已停用「WebDAV 网盘」/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("switch", { name: "启用「WebDAV 网盘」" }));
+    await waitFor(() => expect(api.patchPreferences).toHaveBeenLastCalledWith(auth, { disabled_plugins: [] }));
+    expect(screen.getByRole("switch", { name: "启用「WebDAV 网盘」" })).toBeChecked();
+  });
+
+  test("保存失败时开关回滚并提示（不乐观谎报）", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    vi.mocked(api.patchPreferences).mockRejectedValue(new ApiError({ status: 500, code: "INTERNAL", message: "boom" }));
+    render(
+      <ToastProvider>
+        <ConnectorsTab auth={auth} />
+      </ToastProvider>,
+    );
+    fireEvent.click(await screen.findByRole("switch", { name: "启用「邮箱」" }));
+    await waitFor(() => expect(screen.getByRole("switch", { name: "启用「邮箱」" })).toBeChecked());
+    expect(await screen.findByText("服务暂时不可用，请稍后重试")).toBeInTheDocument();
+  });
+
+  test("偏好里已停用的插件：行显示「已停用」，详情页给出说明且设置仍可用", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog([conn()]));
+    vi.mocked(api.getPreferences).mockResolvedValue({ prefs: { disabled_plugins: ["imap"] } });
+    render(<ConnectorsTab auth={auth} />);
+    const row = await screen.findByRole("button", { name: /^邮箱：/ });
+    expect(row).toHaveTextContent("已停用");
+    fireEvent.click(row);
+    expect(screen.getByRole("status")).toHaveTextContent("「邮箱」已停用");
+    expect(screen.getByText("工作邮箱")).toBeInTheDocument();
+  });
+
+  test("本机插件（同花顺）：列表里「可直接使用」，详情页列出能做什么、组成、会访问的网站，并能在对话中登录", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    vi.mocked(api.getLocalPlugins).mockResolvedValue({ plugins: [THS_PLUGIN] });
+    const onAskInChat = vi.fn();
+    render(<ConnectorsTab auth={auth} onAskInChat={onAskInChat} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "同花顺行情：可直接使用，打开设置" }));
+    const card = providerCard("同花顺行情");
+    expect(within(card).getByText(/在你自己的容器里运行/)).toBeInTheDocument();
+    expect(within(card).getByText("d.10jqka.com.cn")).toBeInTheDocument();
+    expect(within(card).getByText("ths")).toBeInTheDocument();
+    expect(within(card).getByText(/仅供个人学习研究/)).toBeInTheDocument();
+
+    fireEvent.click(within(card).getByRole("button", { name: "查一只或几只股票的实时行情和盘口" }));
+    expect(onAskInChat).toHaveBeenLastCalledWith("查一只或几只股票的实时行情和盘口");
+    fireEvent.click(within(card).getByRole("button", { name: "在对话中登录" }));
+    expect(onAskInChat).toHaveBeenLastCalledWith("帮我登录同花顺，同步云自选");
+  });
+
+  test("默认关闭的本机插件（商业版同花顺，OCV5-388）：显示关闭；打开写 enabled_plugins，默认关闭不写进 disabled_plugins", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    vi.mocked(api.getLocalPlugins).mockResolvedValue({
+      plugins: [{ ...THS_PLUGIN, enabled: false, defaultEnabled: false }],
+    });
+    vi.mocked(api.patchPreferences).mockResolvedValue({ prefs: {} } as never);
+    render(
+      <ToastProvider>
+        <ConnectorsTab auth={auth} />
+      </ToastProvider>,
+    );
+    const ths = await screen.findByRole("switch", { name: "启用「同花顺行情」" });
+    expect(ths).not.toBeChecked();
+
+    // 停用别的插件：只写用户自己的选择，不把默认关闭的同花顺写进 disabled_plugins。
+    fireEvent.click(screen.getByRole("switch", { name: "启用「邮箱」" }));
+    await waitFor(() => expect(api.patchPreferences).toHaveBeenLastCalledWith(auth, { disabled_plugins: ["imap"] }));
+
+    fireEvent.click(ths);
+    await waitFor(() =>
+      expect(api.patchPreferences).toHaveBeenLastCalledWith(auth, {
+        disabled_plugins: ["imap"],
+        enabled_plugins: ["ths"],
+      }),
+    );
+    expect(screen.getByRole("switch", { name: "启用「同花顺行情」" })).toBeChecked();
+
+    fireEvent.click(screen.getByRole("switch", { name: "启用「同花顺行情」" }));
+    await waitFor(() =>
+      expect(api.patchPreferences).toHaveBeenLastCalledWith(auth, {
+        disabled_plugins: ["imap", "ths"],
+        enabled_plugins: [],
+      }),
+    );
+    expect(screen.getByRole("switch", { name: "启用「同花顺行情」" })).not.toBeChecked();
+  });
+
+  test("从 AI 市场跳过来定位本机插件：直接打开它的详情页", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    vi.mocked(api.getLocalPlugins).mockResolvedValue({ plugins: [THS_PLUGIN] });
+    const consumed = vi.fn();
+    render(<ConnectorsTab auth={auth} autoAuthorizePluginSlug="ths" onAutoAuthorizeConsumed={consumed} />);
+    expect(await screen.findByTestId("plugin-detail")).toBeInTheDocument();
+    expect(screen.getByText("同花顺行情")).toBeInTheDocument();
+    expect(consumed).toHaveBeenCalledTimes(1);
   });
 });

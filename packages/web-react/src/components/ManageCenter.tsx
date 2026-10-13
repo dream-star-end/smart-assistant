@@ -58,6 +58,7 @@ export function ManageCenter({
   onTabChange,
   onClose,
   onOpenMarketplace,
+  onAskInChat,
   onOpenHelp,
   onRequireLogin,
 }: {
@@ -80,6 +81,8 @@ export function ManageCenter({
   onOpenMarketplace?: (kind: 'skill' | 'connector') => void
   /** 「怎么用」：打开对应功能的教程。省略则不渲染帮助入口。 */
   onOpenHelp?: (featureId: ProductFeatureId) => void
+  /** 关闭管理中心 → 新对话 → 输入框预填（插件详情页「可以这样用」「在对话中登录」，OCV5-383）。 */
+  onAskInChat?: (text: string) => void
   /** 未登录态 CTA：关闭本壳并把用户送到登录页。省略则空态只剩说明。 */
   onRequireLogin?: () => void
 }) {
@@ -250,6 +253,7 @@ export function ManageCenter({
                             onOpenMarketplace={onOpenMarketplace && (() => onOpenMarketplace('connector'))}
                             autoAuthorizePluginSlug={autoAuthorizePluginSlug}
                             onAutoAuthorizeConsumed={onAutoAuthorizeConsumed}
+                            onAskInChat={onAskInChat}
                           />
                         </div>
                       )}

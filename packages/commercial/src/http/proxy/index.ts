@@ -124,7 +124,8 @@ import { validateBoxRequest } from "./boxRequestGate.js";
 import { waitForBoxReplay } from "./boxReplayWait.js";
 import { boxRequestTailShape, prepareBoxContinuation, type PreparedContinuation } from "./boxPreparedContinuation.js";
 import { BoxDurableJournalError } from "./boxDurableJournal.js";
-import { BOX_INTERNAL_ENDPOINT } from "./upstream.js";
+import { BOX_INTERNAL_ENDPOINT, isBoxRouteModelName } from "./upstream.js";
+import { prepareBoxSwitch, relabelBoxSwitchSession, type BoxSwitchOutcome } from "./boxSwitchCompaction.js";
 import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js";
 import { recordUserImpactBestEffort } from "../../selfheal/userImpact.js";
 
@@ -520,12 +521,12 @@ export function makeAnthropicProxyHandler(
         throw err;
       }
 
-      // `box-api-` 前缀不是放行。它只让可能走受信 Box 的请求先活过 legacy
+      // `box-api-` / `box-claude-` 前缀不是放行。它只让可能走受信 Box 的请求先活过 legacy
       // 8/16,好把签名和 catalog 路由判完。判完仍不是 Box / 无能力 / 未就绪
       // 的,下面会按 legacy 拒绝。其它模型在进 gate 前就受原预算。
       const deferLegacyUntilVerifiedBox = deps.modelCatalog != null
         && deps.modelAuthorityEnforce === true
-        && body.model.startsWith("box-api-");
+        && isBoxRouteModelName(body.model);
       const rejectOverBudget = (budget: typeof PROXY_BYTE_BUDGET_LEGACY): boolean => {
         try {
           enforceVerifiedProxyBudget(body, rawBodyBytes, budget);
@@ -545,7 +546,7 @@ export function makeAnthropicProxyHandler(
       // A non-streaming request is never a fresh paid model dispatch. Only
       // Box can use it to retrieve the exact prior round; reject it before
       // Cursor external (which branches off ahead of the regular provider).
-      if (body.stream === false && !body.model.startsWith("box-api-")) {
+      if (body.stream === false && !isBoxRouteModelName(body.model)) {
         incrAnthropicProxyReject("bad_body");
         sendJsonError(res, 400, "BAD_BODY", "invalid request body", requestId);
         return;
@@ -911,6 +912,35 @@ export function makeAnthropicProxyHandler(
           ? await passClassRate(boxRateCfg, boxFallbackLimiter, "box")
           : await passClassRate(generalRateCfg, generalFallbackLimiter, "general");
         if (!passed) return;
+      }
+      // A chat whose login is at its switch line continues on the next login from a Haiku
+      // compaction (its own billed request), not from a full cache rewrite. Applied before the
+      // replay lookup so a retry and every later request of the chat see the same body.
+      let switchCompaction: (BoxSwitchOutcome & { kind: "compacted" }) | null = null;
+      if (route.kind === "box" && gate && deps.boxModel?.switchCompaction) {
+        const switchAbort = new AbortController();
+        const onSwitchClose = (): void => { if (!res.writableEnded) switchAbort.abort(); };
+        res.once("close", onSwitchClose);
+        let switched: BoxSwitchOutcome;
+        try {
+          switched = await runWithVerifiedProxyByteBudget(byteBudget, () => prepareBoxSwitch({
+            ...deps.boxModel!.switchCompaction!, pgPool: deps.pgPool,
+            preCheckRedis: deps.preCheckRedis, scheduler: deps.scheduler,
+            endpoint: BOX_INTERNAL_ENDPOINT, log: userLog,
+          }, { uid, containerId: containerIdBig, requestId, body, snapshot: gate.snapshot,
+            deniedModelIds: gate.deniedModelIds,
+            sessionId: extractUsageAttribution(body.metadata).sessionId,
+            authority: { executionRevision: gate.executionRevision,
+              projectionRevision: gate.projectionRevision, securityEpoch: gate.securityEpoch,
+              kind: gate.authorityKind },
+            signal: switchAbort.signal }));
+        } finally { res.off("close", onSwitchClose); }
+        if (switched.kind === "compacted") {
+          switchCompaction = switched;
+          userLog.info("proxy_box_switch_compacted", { billingRequestId: switched.billingRequestId,
+            credits: switched.credits, tokensBefore: switched.tokensBefore, tokensAfter: switched.tokensAfter });
+        }
+        if (switchAbort.signal.aborted) return;
       }
       // Same-round replay is a read-only path before account selection,
       // preCheck, the generic inflight journal and the SSE finalizer. A
@@ -1578,6 +1608,10 @@ export function makeAnthropicProxyHandler(
       // Dispatch identity is server-owned and therefore wins over container metadata for billing
       // attribution.  This also makes lease-only verification evidence join the exact session.
       if (dispatchIdentity !== null) sessionId = dispatchIdentity.sessionId;
+      if (switchCompaction && sessionId) {
+        await relabelBoxSwitchSession(deps.pgPool, { uid, billingRequestId: switchCompaction.billingRequestId,
+          sessionId }).catch((err: unknown) => userLog.warn("proxy_box_switch_relabel_failed", { err: errSummary(err) }));
+      }
 
       // 8) 写 inflight journal(必须先于 fetch — 进程在 fetch 时 crash 也有线索)
       //

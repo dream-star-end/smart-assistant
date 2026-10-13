@@ -1,6 +1,7 @@
 /** First paid Box tool round on the existing OpenClaude Messages path.
  * Off-route until the complete cross-HTTP resume/terminal coordinator passes
  * real Box acceptance. The remote CLI never executes OpenClaude tools. */
+import { makeBoxTranscriptAttachmentsRead, parseBoxTranscriptAttachments } from "./boxTranscriptAttachments.js";
 import { isDeepStrictEqual } from "node:util";
 import { deriveBoxCallFingerprint, deriveBoxContextHash } from "./boxCallFingerprint.js";
 import { makeBoxDetachedToolPlan, type BoxDetachedToolPlan } from "./boxDetachedToolPlan.js";
@@ -24,7 +25,9 @@ import { guardBoxPrivateStage, makeBoxPrelaunchBootstrap,
   makeBoxPrelaunchCleanup, makeBoxPrelaunchInit, parseBoxPrelaunchBootstrap,
   type BoxPrelaunchReceipt } from "./boxPrelaunchControl.js";
 import { randomBytes } from "node:crypto";
-import { explainBoxNativeHistory } from "./boxNativeHistory.js";
+import { explainBoxNativeHistory, withPromptLayout } from "./boxNativeHistory.js";
+import { boxPromptLayoutOf } from "./boxMessagesMapper.js";
+import { boxRunnerLoginScope, boxRunnerPlanInput, type BoxInteractiveHostAsset } from "./boxTextPlan.js";
 import { makeBoxNativeFileInspect, parseBoxNativeFileEvidence } from "./boxNativeFile.js";
 import { parseBoxNativePointer, type BoxNativePointer } from "./boxNativePointer.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
@@ -54,7 +57,7 @@ type Journal = Pick<BoxDurableJournal, "admit" |
   "markPrestartStopped" | "recordPrelaunchControl" | "armGuardedLaunch" |
   "markGuardedPrestartStopped" | "markUnknown" | "recordToolHandoff" | "complete">
   & Partial<Pick<BoxDurableJournal, "findNativeCandidate" | "attachNativePointer"
-    | "markFirstRoundRejectedStream">>;
+    | "markFirstRoundRejectedStream" | "findNativeTranscriptSources">>;
 
 /** Decoder rejections that are a deterministic property of this stream (not a
  * transport or service failure) and may be stopped and settled explicitly. */
@@ -90,6 +93,8 @@ export async function runBoxToolFirstRound(input: {
   keeperAsset: Buffer;
   virtualMcpAsset: Buffer;
   detachedRunnerAsset: Buffer;
+  /** OCV5-378: required for models with BoxApiRunner "interactive". */
+  interactiveHost?: BoxInteractiveHostAsset;
   /** OCV5-301 bounded wait for a held session/account slot (default 45s). */
   capacityWaitMs?: number;
   /** OCV5-300: production passes "natural" so the CLI sees client names. */
@@ -98,7 +103,8 @@ export async function runBoxToolFirstRound(input: {
   writeMessage?: BoxReplayMessageWriter;
   maxOutputTokensForModel: (model: string) => number | null;
   resolveTarget: (args: { uid: bigint; sessionId: string | null; requestId: string;
-    upstreamModel: string; signal: AbortSignal }) => Promise<BoxResolvedTarget>;
+    upstreamModel: string; signal: AbortSignal;
+    loginScope?: "default" | "all"; stickyKey?: string }) => Promise<BoxResolvedTarget>;
   onUnknown: (args: { uid: bigint; accountId: bigint; requestId: string;
     phase: string }) => Promise<void>;
   /** Retain the local target until remote proof or explicit operator recovery. */
@@ -156,7 +162,8 @@ export async function runBoxToolFirstRound(input: {
     throw new BoxToolFirstRoundError("BOX_TOOL_FETCH_BINDING_INVALID");
   }
   const nativeEnabled = boxFastPathEnabled();
-  let plan = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
+  const runner = boxRunnerPlanInput(input.canonicalModel, deps.interactiveHost);
+  let plan = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel, ...runner,
     maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
     keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
     detachedRunnerAsset: deps.detachedRunnerAsset,
@@ -281,7 +288,8 @@ export async function runBoxToolFirstRound(input: {
   try {
     if (signal.aborted) throw new BoxToolFirstRoundError("BOX_TOOL_ABORTED");
     const pendingTarget = deps.resolveTarget({ uid: input.uid, sessionId: input.sessionId,
-      requestId: input.requestId, upstreamModel: input.upstreamModel, signal });
+      requestId: input.requestId, upstreamModel: input.upstreamModel, signal,
+      loginScope: boxRunnerLoginScope(input.canonicalModel), stickyKey: fingerprint.sessionId });
     let resolutionAbandoned = false;
     let completedTarget: BoxResolvedTarget | null = null;
     void pendingTarget.then((late) => {
@@ -325,11 +333,14 @@ export async function runBoxToolFirstRound(input: {
         // a transcript written by another CLI build is not resumed (cache miss)
         : candidate.pointer.cliVersion !== target.cliVersion ? "build"
         : !pointerCatalog ? "catalog"
+        // OCV5-383: a transcript staged with the other prompt layout would lose
+        // (or duplicate) the per-session context on resume.
+        : (candidate.pointer.promptLayout ?? null) !== boxPromptLayoutOf(input.canonicalBody) ? "layout"
         : explainBoxNativeHistory(input.canonicalBody, candidate.pointer);
       deps.onNativeDecision?.({ requestId: input.requestId, decision: miss === "ok" ? "resume" : "miss",
         reason: miss, cliVersion: String(target.cliVersion) });
       if (candidate && pointerCatalog && miss === "ok") {
-        const warm = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel,
+        const warm = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel, ...runner,
           maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
           keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
           detachedRunnerAsset: deps.detachedRunnerAsset,
@@ -358,6 +369,48 @@ export async function runBoxToolFirstRound(input: {
         }
       }
     }
+    // OCV5-384: a re-staged conversation carries the context records of the session's previous
+    // native transcript after its first user message, where that transcript has them, so the
+    // request keeps the cached prefix (the CLI would otherwise render them after the newest
+    // message). Any failure keeps the plain re-stage.
+    if (!nativeClaim && nativeEnabled && plan.snapshotHash !== null
+      && boxCliNativeResumeVerified(target.cliVersion) && fingerprint.sessionId
+      && deps.journal.findNativeTranscriptSources) {
+      try {
+        const sources = await race(deps.journal.findNativeTranscriptSources({ uid: input.uid,
+          sessionId: fingerprint.sessionId, currentRequestId: input.requestId,
+          canonicalModel: input.canonicalModel }));
+        let records: Record<string, unknown>[] | null = null;
+        for (const source of sources) {
+          if (source.cliVersion !== target.cliVersion) continue;
+          try {
+            const read = await run(makeBoxTranscriptAttachmentsRead(source), 10_000);
+            records = parseBoxTranscriptAttachments(read.stdout);
+          } catch (error) {
+            if (signal.aborted || error instanceof BoxToolFirstRoundError
+              && error.code === "BOX_TOOL_ABORTED") throw error;
+            records = null; // this transcript is gone or unreadable: try the next one
+          }
+          if (records && records.length > 0) break;
+        }
+        if (records && records.length > 0) {
+          plan = makeBoxDetachedToolPlan({ body, upstreamModel: input.upstreamModel, ...runner,
+            maxOutputTokensLimit: cap, supervisorAsset: deps.supervisorAsset,
+            keeperAsset: deps.keeperAsset, virtualMcpAsset: deps.virtualMcpAsset,
+            detachedRunnerAsset: deps.detachedRunnerAsset,
+            runNonce: plan.runNonce, leaseEpoch: plan.leaseEpoch,
+            nativePersistence: nativeEnabled, toolAliasMode: deps.toolAliasMode,
+            ...(input.resumeToolResults ? { resumeToolResults: true } : {}),
+            stagedAttachments: records });
+          deps.onNativeDecision?.({ requestId: input.requestId, decision: "miss",
+            reason: "restage_attachments", cliVersion: String(target.cliVersion) });
+        }
+      } catch (error) {
+        if (signal.aborted || error instanceof BoxToolFirstRoundError
+          && error.code === "BOX_TOOL_ABORTED") throw error;
+        /* Optional: the plain re-stage is always valid. */
+      }
+    }
     // OCV5-301: the same session's previous turn may still be settling.
     const admitAccountId = target.accountId;
     const admitInput = () => ({
@@ -371,7 +424,7 @@ export async function runBoxToolFirstRound(input: {
       catalogHash: plan.catalog.bindingSha256,
       ...(nativeClaim ? { nativeClaim }
         : nativeEnabled ? { nativeStart: { sessionId: plan.sessionId,
-          cliCwd: plan.cliCwd,
+          cliCwd: plan.cliCwd, ...withPromptLayout(input.canonicalBody),
           ...(boxCliNativeResumeVerified(launchCliVersion)
             ? { cliVersion: launchCliVersion } : {}) } } : {}) });
     const pendingAdmission = waitingForBoxCapacity(async () => {
@@ -409,6 +462,8 @@ export async function runBoxToolFirstRound(input: {
           ["keeper", plan.stageKeeper, plan.keeperHash],
           ["virtual_mcp", plan.stageVirtualMcp, plan.virtualMcpHash],
           ["detached_runner", plan.stageDetachedRunner, plan.detachedRunnerHash],
+          ...(plan.stageInteractiveHost && plan.interactiveHost
+            ? [["interactive_host", plan.stageInteractiveHost, plan.interactiveHost.hash] as const] : []),
         ] as const) {
           stageLabel = label;
           const staged = await run(request);
@@ -553,7 +608,8 @@ export async function runBoxToolFirstRound(input: {
               contextHashBeforeFinal: contextHash,
               assistantContentHash: final.assistantContentHash,
               catalogHash: plan.catalog.bindingSha256,
-              expiresAtMs: Date.now() + 7 * 24 * 60 * 60 * 1000 });
+              expiresAtMs: Date.now() + 7 * 24 * 60 * 60 * 1000,
+              ...withPromptLayout(input.canonicalBody) });
             if (candidate && await deps.journal.attachNativePointer({
               requestId: input.requestId, uid: input.uid,
               accountId: target.accountId, proof, pointer: candidate })) {

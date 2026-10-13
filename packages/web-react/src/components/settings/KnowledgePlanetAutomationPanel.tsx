@@ -78,6 +78,7 @@ const REASON: Record<string, string> = {
   RULE_DELETED: '规则已删除',
   MANUAL_WRITE_DISABLED: '手动写入能力已关闭',
   ACCOUNT_UNAVAILABLE: '插件账号不可用，已自动停用',
+  PLUGIN_DISABLED: '插件已停用，暂不自动回复（打开插件开关后自动恢复）',
   CONSENT_OUTDATED: '免责声明版本已更新，请重新确认后启用',
   RELINK_REQUIRED: '登录已失效',
   DISPATCH_UNKNOWN: '发送结果不明确，已自动停用',

@@ -52,6 +52,7 @@ import { listDeclarativeCatalog } from './engine/catalog.js'
 import type { EngineHttpDeps } from './engine/driver.js'
 import { executeDeclarativeAction, loadContractForConnection } from './engine/execute.js'
 import { executeDeclarativeWrite, proposeDeclarativeWrite } from './engine/write.js'
+import type { PluginEnablement } from '../plugins/enablement.js'
 import { ConnectorError, toConnectorError } from './errors.js'
 import { beginExecute, finalizeExecute, proposeWrite, writeFinalizeStatus } from './ledger.js'
 import type { DnsResolver } from './outboundPolicy.js'
@@ -77,6 +78,8 @@ export const PLUGINS_RPC_PREFIX = '/v3/plugins/'
 const LIST_PATH = '/v3/connectors/list'
 const CALL_PATH = '/v3/connectors/call'
 const CATALOG_PATH = '/v3/connectors/catalog'
+/** 容器 CLI 插件（plugin-exec）问「这个插件启用了吗」（OCV5-383）。 */
+const PLUGIN_STATE_PATH = '/v3/plugins/state'
 const PLUGIN_LIST_PATH = '/v3/plugins/list'
 const PLUGIN_CALL_PATH = '/v3/plugins/call'
 const PLUGIN_CATALOG_PATH = '/v3/plugins/catalog'
@@ -239,6 +242,13 @@ async function checkRedisWindow(
 
 // ─── handler ─────────────────────────────────────────────────────────────
 
+const EMPTY_SET: ReadonlySet<string> = new Set()
+
+async function assertPluginEnabled(deps: ConnectorsRpcDeps, userId: number, slug: string): Promise<void> {
+  if ((await deps.pluginEnablement?.disabledSet(userId))?.has(slug))
+    throw new ConnectorError('PLUGIN_DISABLED', 'Plugin is disabled by the user')
+}
+
 type RpcLog = (
   level: 'info' | 'warn' | 'error',
   msg: string,
@@ -247,6 +257,11 @@ type RpcLog = (
 
 export interface ConnectorsRpcDeps {
   identityRepo: ContainerIdentityRepo
+  /**
+   * 插件启用开关（OCV5-383，管理中心 → 插件）。生产装配传 PREFS_PLUGIN_ENABLEMENT；省略 = 不检查（旧测试）。
+   * list / catalog 隐藏已停用插件；call（含确认执行）对已停用插件返回 PLUGIN_DISABLED。
+   */
+  pluginEnablement?: PluginEnablement
   redis?: ConnectorRedis | null
   pool?: Pool
   resolver?: DnsResolver
@@ -356,9 +371,19 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
     const userId = identity.userId
 
     try {
+      if (path === PLUGIN_STATE_PATH) {
+        const body = await readBoundedJsonBody(req, MAX_LIST_BODY_BYTES)
+        const slug = (body as { slug?: unknown } | null)?.slug
+        if (typeof slug !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(slug))
+          throw new ConnectorError('BAD_REQUEST', 'slug required')
+        const disabled = await deps.pluginEnablement?.disabledSet(userId)
+        sendEnvelope(res, { kind: 'state', slug, enabled: !disabled?.has(slug) })
+        return
+      }
       if (path === LIST_PATH || path === PLUGIN_LIST_PATH) {
         await readBoundedJsonBody(req, MAX_LIST_BODY_BYTES) // drain(CLI 发空 {})
-        await handleList(res, userId, pool, path === PLUGIN_LIST_PATH, deps.pluginFacade)
+        const disabled = (await deps.pluginEnablement?.disabledSet(userId)) ?? EMPTY_SET
+        await handleList(res, userId, pool, path === PLUGIN_LIST_PATH, deps.pluginFacade, disabled)
         return
       }
       if (path === CALL_PATH || path === PLUGIN_CALL_PATH) {
@@ -386,6 +411,7 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
           query,
           path === PLUGIN_CATALOG_PATH,
           deps.pluginFacade,
+          (await deps.pluginEnablement?.disabledSet(userId)) ?? EMPTY_SET,
         )
         return
       }
@@ -414,6 +440,7 @@ async function handleList(
   pool: Pool,
   pluginSurface = false,
   pluginFacade?: Pick<PluginRuntimeFacade, 'list'>,
+  disabled: ReadonlySet<string> = EMPTY_SET,
 ): Promise<void> {
   // 声明式连接:动作由 pin 的 contract 派生(readOnly = effect==='read')。
   const declConns = await listDeclarativeConnections(userId, pool)
@@ -480,16 +507,18 @@ async function handleList(
       })),
     })
   }
+  // 已停用的插件不出现在 Agent 可调用的列表里（OCV5-383）。
+  const enabledConnections = connections.filter((c) => !disabled.has(String(c.provider)))
   if (!pluginSurface) {
-    sendEnvelope(res, { connections })
+    sendEnvelope(res, { connections: enabledConnections })
     return
   }
-  const runtimePlugins: RuntimePluginTargetEntry[] = pluginFacade
-    ? await pluginFacade.list(userId)
-    : []
+  const runtimePlugins: RuntimePluginTargetEntry[] = (pluginFacade ? await pluginFacade.list(userId) : []).filter(
+    (p) => !disabled.has(p.provider),
+  )
   sendEnvelope(res, {
     plugins: [
-      ...connections.map((connection) => ({
+      ...enabledConnections.map((connection) => ({
         ...connection,
         pluginType: 'declarative-http' as const,
       })),
@@ -512,8 +541,11 @@ async function handleCatalog(
   query?: string,
   pluginSurface = false,
   pluginFacade?: Pick<PluginRuntimeFacade, 'catalog'>,
+  disabled: ReadonlySet<string> = EMPTY_SET,
 ): Promise<void> {
-  const connectors = await listDeclarativeCatalog(pool, userId, query ? { query } : {})
+  const connectors = (await listDeclarativeCatalog(pool, userId, query ? { query } : {})).filter(
+    (c) => !disabled.has(c.slug),
+  )
   const declarative = connectors.map((c) => ({
     slug: c.slug,
     label: c.label,
@@ -820,6 +852,8 @@ async function handleCall(
           throw new ConnectorError('BAD_REQUEST', 'Plugin call is invalid')
         if (code === 'WRITE_DISABLED')
           throw new ConnectorError('WRITE_DISABLED', 'Plugin writes are disabled')
+        if (code === 'PLUGIN_DISABLED')
+          throw new ConnectorError('PLUGIN_DISABLED', 'Plugin is disabled by the user')
         if (code === 'WRITE_REQUIRES_CONFIRMATION')
           throw new ConnectorError('BAD_REQUEST', 'Plugin write confirmation is required')
         if (typeof code === 'string' && isPluginPassthroughErrorCode(code)) {
@@ -840,6 +874,7 @@ async function handleCall(
 
   // ── github 虚拟连接(只读) ──
   if (body.connectionId === GITHUB_VIRTUAL_CONNECTION_ID) {
+    await assertPluginEnabled(rt.deps, who.userId, 'github')
     const decl = requireAction('github', requireBodyAction(body.action))
     if (!decl.readOnly) throw new ConnectorError('ACTION_UNKNOWN', 'github adapter is read-only')
     if (!rt.limiter.check(who.containerId, rt.now())) {
@@ -862,6 +897,7 @@ async function handleCall(
   // 靠 pin 列区分;声明式 slug 可能与 v1 provider 名撞,但本查询只命中 connector_version_id 非空行)。
   const declRow = await getDeclarativeConnection(body.connectionId, who.userId, pool)
   if (declRow) {
+    await assertPluginEnabled(rt.deps, who.userId, declRow.provider)
     await assertNotRevoking(rt.deps.redis, declRow.id)
     await handleDeclarativeCall(res, who, body, rt, pool, declRow)
     return
@@ -878,6 +914,8 @@ async function handleCall(
     }
     throw new ConnectorError('CONNECTION_NOT_FOUND', 'no such connection')
   }
+  // 停用检查在 beginExecute 之前：已停用插件的待确认写入不会被执行（账本行留到过期）。
+  await assertPluginEnabled(rt.deps, who.userId, row.provider)
   await assertNotRevoking(rt.deps.redis, row.id)
 
   // ── 写操作,带 confirmId:执行 ──
