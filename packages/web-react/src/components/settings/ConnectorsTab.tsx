@@ -1,7 +1,7 @@
 import { Plug, Store } from 'lucide-react'
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../../lib/api'
-import { type ConnectorConnection, type ConnectorProvider, type ConnectorsResponse, type DeclarativeCatalogEntry, type DeclarativeConnection, type DeclarativeManagementConnector, type DeclarativeManagementResponse, type LocalPlugin, type PluginManagementResponse, type RuntimePluginAccount, type RuntimePluginCatalogEntry, connectorCapabilityLabel, declarativeCapabilityLabel, disabledPluginsOf, isPublicAuthMode } from '../../lib/connectors'
+import { type ConnectorConnection, type ConnectorProvider, type ConnectorsResponse, type DeclarativeCatalogEntry, type DeclarativeConnection, type DeclarativeManagementConnector, type DeclarativeManagementResponse, type LocalPlugin, type PluginManagementResponse, type RuntimePluginAccount, type RuntimePluginCatalogEntry, connectorCapabilityLabel, declarativeCapabilityLabel, disabledPluginsOf, enabledPluginsOf, isPublicAuthMode } from '../../lib/connectors'
 import type { AuthSession } from '../../lib/types'
 import { Alert, Button, EmptyState, ListSkeleton, PanelHeader, useConfirm, useToast } from '../ui'
 import { managedPluginProvider } from '../../lib/managedPluginProviders'
@@ -58,7 +58,15 @@ export function ConnectorsTab({
   /** 本机插件（随平台基线下发，如同花顺行情）。读失败降级为空，不影响其余插件。 */
   const [localPlugins, setLocalPlugins] = useState<LocalPlugin[]>([])
   /** 已停用的插件（偏好 disabled_plugins）；开关乐观更新，失败回滚。 */
-  const [disabled, setDisabled] = useState<ReadonlySet<string>>(new Set())
+  const [storedDisabled, setStoredDisabled] = useState<ReadonlySet<string>>(new Set())
+  /** 用户打开过的默认关闭插件（偏好 enabled_plugins，OCV5-388）。 */
+  const [optedIn, setOptedIn] = useState<ReadonlySet<string>>(new Set())
+  /** 显示用：偏好里停用的 + 默认关闭且没打开过的。默认关闭不写进 disabled_plugins。 */
+  const disabled = useMemo(() => {
+    const out = new Set(storedDisabled)
+    for (const p of localPlugins) if (p.defaultEnabled === false && !optedIn.has(p.name)) out.add(p.name)
+    return out
+  }, [storedDisabled, optedIn, localPlugins])
   const [toggling, setToggling] = useState<string | null>(null)
   /** 当前打开的插件详情（null = 一级列表）。OCV5-383：一级只留启用开关，设置都在详情里。 */
   const [selected, setSelected] = useState<string | null>(null)
@@ -96,7 +104,8 @@ export function ConnectorsTab({
       .then(([d, managed, runtime, local, prefs]) => {
         if (!alive) return
         setLocalPlugins(Array.isArray(local?.plugins) ? local.plugins : [])
-        setDisabled(new Set(disabledPluginsOf(prefs)))
+        setStoredDisabled(new Set(disabledPluginsOf(prefs)))
+        setOptedIn(new Set(enabledPluginsOf(prefs)))
         setData(d)
         setManagement(managed.connectors)
         setDeclConnections(managed.connections)
@@ -564,17 +573,28 @@ export function ConnectorsTab({
 
   /** 启用开关：乐观更新，PATCH 偏好失败就回滚并提示。 */
   const setEnabled = async (key: string, label: string, enabled: boolean) => {
-    const prev = disabled
+    const prev = storedDisabled
+    const prevOptedIn = optedIn
     const next = new Set(prev)
     if (enabled) next.delete(key)
     else next.add(key)
-    setDisabled(next)
+    // 默认关闭的插件：打开 = 记进 enabled_plugins，关掉 = 移出（OCV5-388）。
+    const defaultOff = localPlugins.some((p) => p.name === key && p.defaultEnabled === false)
+    const nextOptedIn = new Set(prevOptedIn)
+    if (enabled) nextOptedIn.add(key)
+    else nextOptedIn.delete(key)
+    setStoredDisabled(next)
+    if (defaultOff) setOptedIn(nextOptedIn)
     setToggling(key)
     try {
-      await api.patchPreferences(auth, { disabled_plugins: [...next].sort() })
+      await api.patchPreferences(auth, {
+        disabled_plugins: [...next].sort(),
+        ...(defaultOff ? { enabled_plugins: [...nextOptedIn].sort() } : {}),
+      })
       toast(enabled ? `已启用「${label}」` : `已停用「${label}」，助手暂时不会调用它`, 'success')
     } catch (e) {
-      setDisabled(prev)
+      setStoredDisabled(prev)
+      setOptedIn(prevOptedIn)
       toast(errText(e, enabled ? '启用失败，请重试' : '停用失败，请重试'), 'error')
     } finally {
       setToggling(null)

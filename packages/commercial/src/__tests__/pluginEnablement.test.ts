@@ -12,7 +12,7 @@ import { EventEmitter } from 'node:events'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { describe, test } from 'node:test'
 import { makeConnectorsRpcHandler } from '../connectors/rpc.js'
-import type { PluginEnablement } from '../plugins/enablement.js'
+import { type PluginEnablement, defaultOffPlugins, effectiveDisabledPlugins } from '../plugins/enablement.js'
 import { PluginRuntimeFacadeError } from '../plugins/runtime.js'
 import { PreferencesPatchSchema, PreferencesSchema } from '../user/preferences.js'
 
@@ -92,6 +92,36 @@ describe('偏好 disabled_plugins', () => {
     assert.equal(PreferencesPatchSchema.safeParse({ disabled_plugins: ['ths', 'ths'] }).success, false)
     const many = Array.from({ length: 201 }, (_, i) => `p${i}`)
     assert.equal(PreferencesPatchSchema.safeParse({ disabled_plugins: many }).success, false)
+  })
+})
+
+describe('默认关闭的插件（OCV5-388，env OC_PLUGINS_DEFAULT_OFF）', () => {
+  test('env 未设置 = 没有默认关闭的插件；非法 slug 忽略', () => {
+    assert.deepEqual([...defaultOffPlugins({})], [])
+    assert.deepEqual([...defaultOffPlugins({ OC_PLUGINS_DEFAULT_OFF: '' })], [])
+    assert.deepEqual([...defaultOffPlugins({ OC_PLUGINS_DEFAULT_OFF: ' ths , ../x,THS,zhihu' })], ['ths', 'zhihu'])
+  })
+  test('没打开过 = 停用；打开过 = 启用；用户自己停用的照旧停用', () => {
+    const off = new Set(['ths'])
+    assert.deepEqual([...effectiveDisabledPlugins({}, off)], ['ths'])
+    assert.deepEqual([...effectiveDisabledPlugins({ enabled_plugins: ['ths'] }, off)], [])
+    assert.deepEqual([...effectiveDisabledPlugins({ disabled_plugins: ['imap'] }, off)].sort(), ['imap', 'ths'])
+    assert.deepEqual(
+      [...effectiveDisabledPlugins({ disabled_plugins: ['ths'], enabled_plugins: ['ths'] }, off)],
+      ['ths'],
+    )
+  })
+  test('没有默认关闭的插件时与原来一样：只看 disabled_plugins', () => {
+    assert.deepEqual([...effectiveDisabledPlugins({ disabled_plugins: ['imap'], enabled_plugins: ['ths'] }, new Set())], [
+      'imap',
+    ])
+  })
+  test('偏好 enabled_plugins 与 disabled_plugins 同样校验', () => {
+    assert.ok(PreferencesPatchSchema.safeParse({ enabled_plugins: ['ths'] }).success)
+    assert.ok(PreferencesPatchSchema.safeParse({ enabled_plugins: null }).success)
+    assert.ok(PreferencesSchema.safeParse({ enabled_plugins: ['ths'], disabled_plugins: [] }).success)
+    assert.equal(PreferencesPatchSchema.safeParse({ enabled_plugins: ['THS'] }).success, false)
+    assert.equal(PreferencesPatchSchema.safeParse({ enabled_plugins: ['ths', 'ths'] }).success, false)
   })
 })
 

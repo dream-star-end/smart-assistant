@@ -1,0 +1,2 @@
+error: agent executor error: generating and executing: Error 404, Message: mock, Status: , Details: []
+AGY_ERROR: {"short_error":"agent executor error: generating and executing: Error 404, Message: mock, Status: , Details: []","status":"NOT_FOUND","error_code":404,"code_kind":"http","retryable":false,"error_id":"62abde37-2d45-45df-bacc-378d7f838d71-1"}

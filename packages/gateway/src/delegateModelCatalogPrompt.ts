@@ -20,13 +20,14 @@ const CURSOR_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 type CursorEffort = (typeof CURSOR_EFFORTS)[number]
 const EFFORT_ORDER = new Map<string, number>(CURSOR_EFFORTS.map((e, i) => [e, i]))
 
-const ENGINE_ORDER: readonly LocalCatalogModel['engine'][] = ['ccb', 'codex', 'grok', 'cursor', 'zcode']
+const ENGINE_ORDER: readonly LocalCatalogModel['engine'][] = ['ccb', 'codex', 'grok', 'cursor', 'zcode', 'antigravity']
 const ENGINE_LABEL: Record<LocalCatalogModel['engine'], string> = {
   ccb: 'CCB',
   codex: 'Codex',
   grok: 'Grok',
   cursor: 'Cursor',
   zcode: 'ZCode',
+  antigravity: 'Antigravity',
 }
 
 export interface DelegateModelSectionInput {

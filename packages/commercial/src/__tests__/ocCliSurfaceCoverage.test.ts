@@ -162,6 +162,7 @@ const connectDeps = {
   transport: async (op: string) => {
     if (op === 'list') return { connections: [{ id: 'c1', provider: 'demo' }] }
     if (op === 'catalog') return { connectors: [] }
+    if (op === 'describe') return { kind: 'describe', readOnly: true, description: 'demo read', params: {} }
     return { kind: 'result', result: { ok: true } }
   },
 }
@@ -272,6 +273,7 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     list: connectProbe(['list']),
     catalog: connectProbe(['catalog']),
     call: connectProbe(['call', 'demo', 'read', '--account', 'c1']),
+    describe: connectProbe(['describe', 'demo', 'read', '--account', 'c1']),
   },
   'oc-diagram': {
     render: scriptProbe('oc-diagram.sh', ['--help'], { code: 0, stdout: /oc-diagram/ }),
@@ -519,6 +521,12 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     list: connectProbe(['list'], true),
     catalog: connectProbe(['catalog'], true),
     call: connectProbe(['call', 'demo', 'read', '--account', 'p1'], true),
+    // The dispatcher is shared with oc-connect; describe exists only on the connectors surface.
+    describe: async () => {
+      const result = await runOcPluginCli(['describe', 'demo'], pluginDeps)
+      assert.notEqual(result.exitCode, 0, 'oc-plugin describe unexpectedly succeeded')
+      assert.match(result.stderr, /unknown command 'describe'/)
+    },
   },
   'oc-poster': {
     render: tsFailureProbe('packages/gateway/src/ocPosterCli.ts', [], /usage: oc-poster/),

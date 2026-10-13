@@ -25,6 +25,7 @@
  *   intelligent_ui  : boolean —— 个人版交互式回答(OCV5-361);缺省视为开,false = 关
  *   input_prediction: boolean —— 个人版输入预测(OCV5-375);缺省视为开,false = 关
  *   disabled_plugins: string[] —— 已停用的插件 slug(OCV5-383,管理中心 → 插件的启用开关);缺省 = 全部启用
+ *   enabled_plugins : string[] —— 用户打开过的默认关闭插件 slug(OCV5-388,env OC_PLUGINS_DEFAULT_OFF)
  *
  * 不做的:
  *   - 不做 etag / If-Match 乐观锁(MVP 只返当前快照,前端"最后写入赢"够用)
@@ -70,6 +71,7 @@ export const PreferencesSchema = z
     intelligent_ui: z.boolean().optional(),
     input_prediction: z.boolean().optional(),
     disabled_plugins: disabledPluginsSchema.optional(),
+    enabled_plugins: disabledPluginsSchema.optional(),
   })
   .strict();
 export type Preferences = z.infer<typeof PreferencesSchema>;
@@ -94,6 +96,7 @@ export const PreferencesPatchSchema = z
     intelligent_ui: z.boolean().nullable().optional(),
     input_prediction: z.boolean().nullable().optional(),
     disabled_plugins: disabledPluginsSchema.nullable().optional(),
+    enabled_plugins: disabledPluginsSchema.nullable().optional(),
   })
   .strict();
 export type PreferencesPatch = z.infer<typeof PreferencesPatchSchema>;
