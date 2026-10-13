@@ -72,10 +72,15 @@ function workerHarness() {
 }
 
 /** Fake Playwright page: `evaluate(fn, { url })` answers from a URL → response table. */
-function fakePage(table: Record<string, { status?: number; body: unknown }>, seen: string[] = []) {
+function fakePage(
+  table: Record<string, { status?: number; body: unknown }>,
+  seen: string[] = [],
+  credentials: Record<string, string> = {},
+) {
   return {
-    async evaluate(_fn: unknown, input: { url: string; max: number }) {
+    async evaluate(_fn: unknown, input: { url: string; max: number; credentials: string }) {
       seen.push(input.url)
+      credentials[input.url] = input.credentials
       const key = Object.keys(table).find((prefix) => input.url.startsWith(prefix))
       if (!key) return { status: 404, text: '', tooLarge: false }
       const hit = table[key]!
@@ -237,7 +242,10 @@ describe('official Bilibili account Plugin', () => {
   test('worker source: a branch per action, same-site in-page reads only, no Node request client', () => {
     for (const action of BILI_ACCOUNT_PLUGIN_CONTRACT.actions)
       assert.ok(BILI_ACCOUNT_WORKER_SOURCE.includes(`input.actionId === '${action.id}'`), action.id)
-    assert.match(BILI_ACCOUNT_WORKER_SOURCE, /credentials: 'include'/)
+    // API reads carry the session; only the signed subtitle CDN file is fetched without cookies.
+    assert.match(BILI_ACCOUNT_WORKER_SOURCE, /async function apiGet\(page, url, credentials = 'include'\)/)
+    assert.deepEqual(BILI_ACCOUNT_WORKER_SOURCE.match(/'omit'/g), ["'omit'"])
+    assert.match(BILI_ACCOUNT_WORKER_SOURCE, /apiGet\(page, subtitleUrl, 'omit'\)/)
     assert.match(BILI_ACCOUNT_WORKER_SOURCE, /robots\.txt/)
     assert.doesNotMatch(
       BILI_ACCOUNT_WORKER_SOURCE,
@@ -363,13 +371,14 @@ describe('bili-account worker behaviour (compiled from the pinned source)', () =
     }
   })
 
-  test('subtitle: picks the requested language, only fetches allow-listed subtitle hosts, caps lines', async () => {
+  test('subtitle: picks the requested language, reads the allow-listed subtitle CDN without cookies, caps lines', async () => {
     const seen: string[] = []
     const lines = Array.from({ length: 700 }, (_, i) => ({
       from: i,
       to: i + 1,
       content: `第${i}句`,
     }))
+    const creds: Record<string, string> = {}
     const page = fakePage(
       {
         [`${API}/x/web-interface/nav`]: NAV_OK,
@@ -398,6 +407,7 @@ describe('bili-account worker behaviour (compiled from the pinned source)', () =
         'https://aisubtitle.hdslb.com/bfs/b.json': { body: { body: lines } },
       },
       seen,
+      creds,
     )
     const out = (await worker.actionRead(page, {
       actionId: 'subtitle',
@@ -408,6 +418,12 @@ describe('bili-account worker behaviour (compiled from the pinned source)', () =
     assert.equal((out.lines as unknown[]).length, 600)
     assert.equal(out.truncated, true)
     assert.ok(seen.some((url) => url.startsWith(`${API}/x/player/v2?bvid=BV1xx411c7mD&cid=222`)))
+    // hdslb serves subtitle files with `Access-Control-Allow-Origin: *`; a credentialed fetch is
+    // blocked by the browser (live seed 2026-10-13 failed this way), so the CDN read omits cookies.
+    assert.equal(creds['https://aisubtitle.hdslb.com/bfs/b.json'], 'omit')
+    for (const [url, mode] of Object.entries(creds)) {
+      if (url.startsWith(API)) assert.equal(mode, 'include', url)
+    }
     const subtitle = BILI_ACCOUNT_PLUGIN_CONTRACT.actions.find((a) => a.id === 'subtitle')!
     assert.doesNotThrow(() => validateRuntimePluginJson(subtitle.result, out, 'result'))
 

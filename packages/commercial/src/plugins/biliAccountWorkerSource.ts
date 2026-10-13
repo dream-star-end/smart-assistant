@@ -5,7 +5,9 @@
  * (weiboWorkerSource.ts). No Playwright request client and no Node-side cookie replay:
  * actions open https://www.bilibili.com/robots.txt (light, same site) and call the read-only
  * api.bilibili.com endpoints with `fetch(..., { credentials: 'include' })` inside that page,
- * the way the Weibo worker calls its own ajax endpoints. Login screenshots the official QR code
+ * the way the Weibo worker calls its own ajax endpoints. Subtitle files on the hdslb CDN are
+ * signed URLs served with `Access-Control-Allow-Origin: *`, which browsers refuse for credentialed
+ * fetches, so those are fetched with `credentials: 'omit'` (no cookie leaves for the CDN). Login screenshots the official QR code
  * on passport.bilibili.com and proves the session with the nav endpoint before returning state.
  * Risk-control answers (-352 / -412 / -799, HTTP 412) stop immediately; no retry, no bypass.
  */
@@ -198,14 +200,14 @@ async function openSitePage(context) {
   return page;
 }
 /** One same-site read through the page (cookies stay inside the browser). */
-async function apiGet(page, url) {
+async function apiGet(page, url, credentials = 'include') {
   const response = await page.evaluate(async (input) => {
     try {
-      const res = await fetch(input.url, { method: 'GET', credentials: 'include', headers: { Accept: 'application/json' } });
+      const res = await fetch(input.url, { method: 'GET', credentials: input.credentials, headers: { Accept: 'application/json' } });
       const text = await res.text();
       return { status: res.status, text: text.length > input.max ? '' : text, tooLarge: text.length > input.max };
     } catch (error) { return { status: 0, text: '', tooLarge: false }; }
-  }, { url, max: MAX_API_TEXT });
+  }, { url, max: MAX_API_TEXT, credentials });
   if (response.status === 412) throw new Error('UPSTREAM_CHALLENGE');
   if (response.status < 200 || response.status >= 300 || response.tooLarge) throw new Error('WORKER_FAILED');
   let json;
@@ -305,7 +307,7 @@ async function actionRead(page, input) {
     const chosen = subs.find((s) => wanted && String(s.lan || '').startsWith(wanted)) || subs[0];
     const subtitleUrl = httpsUrl(chosen.subtitle_url);
     if (!subtitleUrl || !SUBTITLE_HOSTS.has(new URL(subtitleUrl).hostname)) throw new Error('WORKER_FAILED');
-    const body = await apiGet(page, subtitleUrl);
+    const body = await apiGet(page, subtitleUrl, 'omit');
     const rows = Array.isArray(body && body.body) ? body.body : [];
     const lines = [];
     for (const row of rows) {
