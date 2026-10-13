@@ -10,9 +10,10 @@ import { readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { type PluginManifest, formatPluginManifestErrors, parsePluginManifest } from '@openclaude/protocol'
 import { DEFAULT_V3_CCB_BASELINE_DIR, V3_CCB_BASELINE_SKILL_NAMES } from '../agent-sandbox/v3supervisor.js'
-import { disabledPluginSet } from './enablement.js'
+import { defaultOffPlugins, disabledPluginSet } from './enablement.js'
 
-export type LocalPlugin = PluginManifest & { enabled: boolean }
+/** defaultEnabled = false：默认关闭（env OC_PLUGINS_DEFAULT_OFF），用户打开时插件页要同时写 enabled_plugins。 */
+export type LocalPlugin = PluginManifest & { enabled: boolean; defaultEnabled: boolean }
 
 type CacheEntry = { mtimeMs: number; size: number; manifest: PluginManifest | null }
 const cache = new Map<string, CacheEntry>()
@@ -59,5 +60,10 @@ export async function localPluginsForUser(
   baselineDir?: string,
 ): Promise<LocalPlugin[]> {
   const disabled = await disabledPluginSet(userId)
-  return loadLocalPluginManifests(baselineDir).map((m) => ({ ...m, enabled: !disabled.has(m.name) }))
+  const defaultOff = defaultOffPlugins()
+  return loadLocalPluginManifests(baselineDir).map((m) => ({
+    ...m,
+    enabled: !disabled.has(m.name),
+    defaultEnabled: !defaultOff.has(m.name),
+  }))
 }

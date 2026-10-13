@@ -2904,6 +2904,43 @@ describe("ConnectorsTab 一级列表 + 详情页（OCV5-383）", () => {
     expect(onAskInChat).toHaveBeenLastCalledWith("帮我登录同花顺，同步云自选");
   });
 
+  test("默认关闭的本机插件（商业版同花顺，OCV5-388）：显示关闭；打开写 enabled_plugins，默认关闭不写进 disabled_plugins", async () => {
+    mockedGetConnectors.mockResolvedValue(catalog());
+    vi.mocked(api.getLocalPlugins).mockResolvedValue({
+      plugins: [{ ...THS_PLUGIN, enabled: false, defaultEnabled: false }],
+    });
+    vi.mocked(api.patchPreferences).mockResolvedValue({ prefs: {} } as never);
+    render(
+      <ToastProvider>
+        <ConnectorsTab auth={auth} />
+      </ToastProvider>,
+    );
+    const ths = await screen.findByRole("switch", { name: "启用「同花顺行情」" });
+    expect(ths).not.toBeChecked();
+
+    // 停用别的插件：只写用户自己的选择，不把默认关闭的同花顺写进 disabled_plugins。
+    fireEvent.click(screen.getByRole("switch", { name: "启用「邮箱」" }));
+    await waitFor(() => expect(api.patchPreferences).toHaveBeenLastCalledWith(auth, { disabled_plugins: ["imap"] }));
+
+    fireEvent.click(ths);
+    await waitFor(() =>
+      expect(api.patchPreferences).toHaveBeenLastCalledWith(auth, {
+        disabled_plugins: ["imap"],
+        enabled_plugins: ["ths"],
+      }),
+    );
+    expect(screen.getByRole("switch", { name: "启用「同花顺行情」" })).toBeChecked();
+
+    fireEvent.click(screen.getByRole("switch", { name: "启用「同花顺行情」" }));
+    await waitFor(() =>
+      expect(api.patchPreferences).toHaveBeenLastCalledWith(auth, {
+        disabled_plugins: ["imap", "ths"],
+        enabled_plugins: [],
+      }),
+    );
+    expect(screen.getByRole("switch", { name: "启用「同花顺行情」" })).not.toBeChecked();
+  });
+
   test("从 AI 市场跳过来定位本机插件：直接打开它的详情页", async () => {
     mockedGetConnectors.mockResolvedValue(catalog());
     vi.mocked(api.getLocalPlugins).mockResolvedValue({ plugins: [THS_PLUGIN] });

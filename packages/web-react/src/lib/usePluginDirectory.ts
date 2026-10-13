@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from './api'
-import { disabledPluginsOf } from './connectors'
+import { effectiveDisabledOf } from './connectors'
 import { buildPluginDirectory, type PluginEntry } from './pluginDirectory'
 import type { AuthSession } from './types'
 
@@ -39,7 +39,7 @@ export function usePluginDirectory(
       soft(() => api.getPreferences(auth)),
     ]).then(([v1, declarative, runtime, local, prefs]) => {
       if (!alive) return
-      const disabled = new Set(disabledPluginsOf(prefs))
+      const disabled = effectiveDisabledOf(prefs, local?.plugins)
       setEntries(
         failures >= 5
           ? null
