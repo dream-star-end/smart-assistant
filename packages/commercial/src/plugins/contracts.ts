@@ -415,6 +415,34 @@ function matchesSchema(schema: Record<string, unknown>, value: unknown): boolean
   }
 }
 
+const DECIMAL_INTEGER_STRING = /^-?(?:0|[1-9]\d{0,15})$/
+
+/**
+ * Agents often send numeric ids as JSON strings ("80084770"). For read calls, rewrite only
+ * top-level properties the signed schema declares `type: 'integer'` whose value is a plain
+ * decimal safe-integer string. Everything else is returned untouched and still goes through
+ * validateRuntimePluginJson, so bounds, enums and unknown keys are enforced as before.
+ */
+export function coerceIntegerStringParams(
+  schema: Record<string, unknown>,
+  params: Record<string, unknown>,
+): Record<string, unknown> {
+  if (params === null || typeof params !== 'object' || Array.isArray(params)) return params
+  if (schema.type !== 'object' || !schema.properties || typeof schema.properties !== 'object')
+    return params
+  const properties = schema.properties as Record<string, Record<string, unknown>>
+  let coerced: Record<string, unknown> | null = null
+  for (const [key, value] of Object.entries(params)) {
+    if (typeof value !== 'string' || !Object.hasOwn(properties, key)) continue
+    if (properties[key]?.type !== 'integer' || !DECIMAL_INTEGER_STRING.test(value)) continue
+    const parsed = Number(value)
+    if (!Number.isSafeInteger(parsed)) continue
+    coerced ??= { ...params }
+    coerced[key] = parsed
+  }
+  return coerced ?? params
+}
+
 export function validateRuntimePluginJson(
   schema: Record<string, unknown>,
   value: unknown,
