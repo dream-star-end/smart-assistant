@@ -335,35 +335,6 @@ describe("settleUsageAndLedger (integ)", () => {
     assert.equal(ur.rows[0].cost_credits, "300");
   });
 
-  test("auto_dream (OCV5-392): same debit, labelled auto_dream on usage and ledger", async (t) => {
-    if (skipIfNoPg(t)) return;
-    const uid = await createUser("dream@example.com", 1000n);
-    const result = await settleUsageAndLedger(getPool(), {
-      userId: uid,
-      accountId: null,
-      requestId: "req-dream-1",
-      model: "deepseek-v4-flash",
-      usage: makeUsage(),
-      snapshotJson: SNAPSHOT_JSON,
-      costCredits: 4n,
-      status: "success",
-      sessionId: "sess-dream",
-      mode: "auto_dream",
-    });
-    assert.equal(result.debitedCredits, 4n);
-    assert.equal(result.balanceAfter, 996n);
-    const ur = await query<{ mode: string; cost_credits: string }>(
-      "SELECT mode, cost_credits::text AS cost_credits FROM usage_records WHERE id=$1",
-      [result.usageId.toString()],
-    );
-    assert.deepEqual(ur.rows[0], { mode: "auto_dream", cost_credits: "4" });
-    const led = await query<{ reason: string; delta: string; ref_id: string }>(
-      "SELECT reason, delta::text AS delta, ref_id FROM credit_ledger WHERE user_id=$1",
-      [uid.toString()],
-    );
-    assert.deepEqual(led.rows, [{ reason: "auto_dream", delta: "-4", ref_id: result.usageId.toString() }]);
-  });
-
   test("lossless locator is committed atomically with the real ledger debit", async (t) => {
     if (skipIfNoPg(t)) return;
     const uid = await createUser("lossless-cost@example.com", 1000n);

@@ -165,7 +165,7 @@ export async function settleBoxReplayBeforeDelivery(pool: Pool, input: {
   const found = await pool.query<{ expected: string; debited: string }>(
     `SELECT ur.cost_credits::text AS expected,
         COALESCE((SELECT SUM(-cl.delta) FROM credit_ledger cl
-          WHERE cl.user_id=ur.user_id AND cl.reason IN ('chat','auto_dream')
+          WHERE cl.user_id=ur.user_id AND cl.reason='chat'
             AND cl.ref_type='usage_record' AND cl.ref_id=ur.id::text
             AND cl.delta<0),0)::text AS debited
        FROM request_finalize_journal rfj

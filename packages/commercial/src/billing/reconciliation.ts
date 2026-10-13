@@ -148,7 +148,7 @@ export async function scanBillingReconciliation(
          FROM credit_ledger cl
         WHERE cl.ref_type = 'usage_record'
           AND cl.ref_id ~ '^[1-9][0-9]*$'
-          AND cl.reason IN ('chat', 'agent_chat', 'auto_dream')
+          AND cl.reason IN ('chat', 'agent_chat')
           AND cl.delta < 0
         GROUP BY cl.user_id, cl.ref_id
      ), usage_gap AS (
@@ -219,7 +219,7 @@ export async function scanBillingReconciliation(
            ON cl.user_id = ur.user_id
           AND cl.ref_type = 'usage_record'
           AND cl.ref_id = ur.id::text
-        WHERE cl.reason IN ('chat', 'agent_chat', 'auto_dream')
+        WHERE cl.reason IN ('chat', 'agent_chat')
           AND cl.delta < 0
         GROUP BY cl.user_id, cl.ref_id
      ), clamps AS (

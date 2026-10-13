@@ -26,7 +26,6 @@ const LEDGER_REASONS = [
   "refund",
   "admin_adjust",
   "promotion",
-  "auto_dream",
 ] as const;
 type LedgerReason = (typeof LEDGER_REASONS)[number];
 const LEDGER_REASON_LABELS: Record<string, string> = {
@@ -37,7 +36,6 @@ const LEDGER_REASON_LABELS: Record<string, string> = {
   refund: "退款",
   admin_adjust: "管理员调整",
   promotion: "活动赠送",
-  auto_dream: "记忆整理",
 };
 const LEDGER_CHANNEL_LABELS: Record<string, string> = { web: "网页", wechat: "微信" };
 const PAGE_SIZE = 50;

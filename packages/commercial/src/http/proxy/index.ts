@@ -105,7 +105,6 @@ import {
   estimateInputTokens,
   estimateContextInputTokens,
   estimateMaxCostBothSides,
-  applyWorkloadMode,
   extractUsageAttribution,
   stripUsageAttributionKeys,
   readBoundedJsonMeasured,
@@ -1514,8 +1513,7 @@ export function makeAnthropicProxyHandler(
       // rolling-lease renewal can prove that this signed authorityTurnId was
       // actually used by this immutable turnKey. Prompt/response content is
       // never written to the journal.
-      const ccWorkload = extractCcWorkload(body.system);
-      const attribution = applyWorkloadMode(extractUsageAttribution(body.metadata), ccWorkload);
+      const attribution = extractUsageAttribution(body.metadata);
       let sessionId = attribution.sessionId;
 
       // 0170 durable-turn dispatch 身份(RFC-v5-durable-turn-dispatch §3 CCB 段 / §7 项 10)。
@@ -1662,7 +1660,7 @@ export function makeAnthropicProxyHandler(
             gate,
             dispatchIdentity,
             turnKey: attribution.turnKey ?? undefined,
-            workload: ccWorkload,
+            workload: extractCcWorkload(body.system),
           }), ...(route.kind === "box" ? {
             boxInvocationRecovery: "v1",
             billingPricing: serializeBillingPricing(pricing),

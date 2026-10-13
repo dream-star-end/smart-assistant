@@ -129,7 +129,7 @@ export interface FinalizeContext {
    * 旧容器镜像 / 普通 chat)与 0104 之前的落库行为完全一致。
    * 只做归因展示,不参与扣费判定 / 调度 / 限流。
    */
-  mode?: "chat" | "delegate" | "auto_dream";
+  mode?: "chat" | "delegate";
   parentSessionId?: string | null;
   delegateAgentId?: string | null;
   /** Stable lossless tape locators. When a real debit happens they are
@@ -766,7 +766,7 @@ export async function settleUsageAndLedger(
      * mode CHECK 约束允许 ('chat','agent','delegate');'agent' 是 v3 legacy 值,
      * 本函数不产出。
      */
-    mode?: "chat" | "delegate" | "auto_dream";
+    mode?: "chat" | "delegate";
     parentSessionId?: string | null;
     delegateAgentId?: string | null;
     /** Stable logical tape locators. Optional only for rolling compatibility
@@ -946,8 +946,7 @@ export async function settleUsageAndLedger(
       const spend = await spendTwoBucket(client, {
         userId: args.userId,
         amount: settledCostCredits,
-        // OCV5-392: memory consolidation is its own ledger reason (0304).
-        reason: args.mode === "auto_dream" ? "auto_dream" : "chat",
+        reason: "chat",
         ref: { type: "usage_record", id: usageId.toString() },
         memo: `cost=${settledCostCredits}`,
         // billing_enabled=false 的成员:打戳但个人桶付(不传 orgId)。org 非 active 时

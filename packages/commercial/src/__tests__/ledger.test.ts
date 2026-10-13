@@ -44,13 +44,11 @@ describe("LEDGER_REASONS (schema sync check)", () => {
       "pack",
       // 0131 codex 原生生图按张计费
       "image_generation",
-      // 0304 OCV5-392 记忆整理(Auto-Dream)
-      "auto_dream",
     ]) {
       assert.ok(LEDGER_REASONS.includes(r as (typeof LEDGER_REASONS)[number]));
     }
-    // 不允许悄悄加东西而忘了同步 0002_init_billing.sql + 后续约束迁移（0077 +1, 0096 +3, 0131 +1, 0304 +1）。
-    assert.equal(LEDGER_REASONS.length, 13);
+    // 不允许悄悄加东西而忘了同步 0002_init_billing.sql + 后续约束迁移（0077 +1, 0096 +3, 0131 +1）。
+    assert.equal(LEDGER_REASONS.length, 12);
   });
 });
 
