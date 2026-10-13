@@ -575,7 +575,7 @@ describe('engine driver with bilibili builtins (local upstream)', () => {
 
 describe('bilibili-dm-xml parsing', () => {
   function respond(body: Buffer): Response {
-    return new Response(body, { status: 200 })
+    return new Response(new Uint8Array(body), { status: 200 })
   }
 
   test('gzip / 明文都能读;非法实体与控制符被去掉', async () => {
