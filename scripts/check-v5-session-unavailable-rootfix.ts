@@ -1032,3 +1032,37 @@ console.log(JSON.stringify({ contractId: 'A-external-FS-relay', source: aSource,
   result: 'existing runTapProof verified all 28 fixed leaves exactly once, child exit0, zero skip/todo/fail',
   boundary: 'real FS/scanner/shortwrite and relay cancel/error evidence; no PG or retry claim' }));
 console.log('[cursor-external-billing] PASS — exact 28 no-PG FS/relay leaves; ledger/restart/retry verified separately in PR-2');
+
+// OCV5-407: Codex "Selected model is at capacity. Please try a different model."
+// is a capacity burst. It must classify as model_capacity and get the bounded
+// silent retry (3 attempts) on both delivery shapes; only wording without any
+// capacity word stays model_not_available (1 attempt, switch-model card).
+const CODEX_CAPACITY_CLASSIFY_LEAVES = [
+  'OCV5-407: Codex at-capacity + try a different model is model_capacity (bare + JSON wrap)',
+  'OCV5-407: any capacity word keeps try a different model on model_capacity',
+] as const
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ['packages/gateway/src/__tests__/errorClassify.test.ts'],
+  expected: CODEX_CAPACITY_CLASSIFY_LEAVES,
+  label: 'codex-capacity-classify',
+  timeoutMs: 120_000,
+  namePattern: 'OCV5-407',
+  leafIndent: 4,
+})
+const CODEX_CAPACITY_RETRY_LEAVES = [
+  'model_capacity: 两种投递形态都恰好 3 次尝试',
+  'model_not_available: 两种投递形态都恰好 1 次尝试',
+] as const
+await runTapProof({
+  fromRoot: candidateRoot,
+  files: ['packages/gateway/src/__tests__/terminalErrorSurfaceMatrix.test.ts'],
+  expected: CODEX_CAPACITY_RETRY_LEAVES,
+  label: 'codex-capacity-retry',
+  timeoutMs: 120_000,
+  namePattern: '^(model_capacity|model_not_available): ',
+  leafIndent: 4,
+})
+console.log(
+  '[codex-capacity-retry] PASS — INC-20261013-CODEX-CAPACITY-NOT-AVAILABLE executed at-capacity classify and 3-attempt silent retry on throw and resolved shapes',
+)
