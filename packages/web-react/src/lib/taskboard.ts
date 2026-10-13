@@ -135,6 +135,7 @@ export const RUN_SKIP_REASONS = [
   'loop_guard',
   'patrol_disabled',
   'idle_backoff',
+  'ticket_closed',
 ] as const
 export type RunSkipReason = (typeof RUN_SKIP_REASONS)[number]
 
@@ -883,6 +884,7 @@ export const RUN_SKIP_REASON_LABEL: Record<RunSkipReason, string> = {
   loop_guard: '同阶段循环次数过多',
   patrol_disabled: '巡检已暂停',
   idle_backoff: '空转降频中',
+  ticket_closed: '派活前单据已关闭或受阻',
 }
 
 const ACTIVITY_ACTION_LABEL: Record<string, string> = {

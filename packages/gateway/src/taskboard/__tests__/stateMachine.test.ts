@@ -91,16 +91,70 @@ describe('重点:AI 不能给 done、不能自动批准积压', () => {
     if (!v.ok) assert.equal(v.code, 'actor_denied')
   })
 
-  it('agent 不能把任意非终态标为 done', () => {
+  // OCV5-414:agent 可关单,但未 autoClose 时必须同时给理由与证据(审计)。
+  it('agent 关单必须同时给理由与证据，缺一即 audit_required', () => {
     for (const from of TICKET_STATUSES) {
       if (from === 'done') continue
-      const v = canTransition({ from, to: 'done', actor: 'agent' })
-      assert.equal(v.ok, false, `agent 不该从 ${from} 关单`)
-      if (!v.ok && from !== 'canceled') {
-        assert.equal(v.code, 'auto_close_required')
-        assert.match(v.reason, /只有人能给/)
+      const bare = canTransition({ from, to: 'done', actor: 'agent' })
+      const reasonOnly = canTransition({ from, to: 'done', actor: 'agent', audit: { reason: '已上线' } })
+      const blank = canTransition({
+        from,
+        to: 'done',
+        actor: 'agent',
+        audit: { reason: '  ', evidence: '  ' },
+      })
+      const full = canTransition({
+        from,
+        to: 'done',
+        actor: 'agent',
+        audit: { reason: '已上线并核验', evidence: 'https://example.invalid/pr/1' },
+      })
+      if (from === 'canceled') {
+        for (const v of [bare, full]) {
+          assert.equal(v.ok, false)
+          if (!v.ok) assert.equal(v.code, 'terminal_locked')
+        }
+        continue
       }
+      for (const v of [bare, reasonOnly, blank]) {
+        assert.equal(v.ok, false, `agent 不带完整审计不该从 ${from} 关单`)
+        if (!v.ok) assert.equal(v.code, 'audit_required')
+      }
+      assert.equal(full.ok, true, `agent 带审计应能从 ${from} 关单`)
     }
+  })
+
+  it('system 关单仍只认 autoClose，审计材料不能替代', () => {
+    const v = canTransition({
+      from: 'running',
+      to: 'done',
+      actor: 'system',
+      audit: { reason: 'x', evidence: 'y' },
+    })
+    assert.equal(v.ok, false)
+    if (!v.ok) assert.equal(v.code, 'auto_close_required')
+  })
+
+  it('agent 不能重开、不能取消（仍只属于人）', () => {
+    for (const from of ['done', 'canceled'] as const) {
+      const v = canTransition({ from, to: 'ready', actor: 'agent', audit: { reason: 'x', evidence: 'y' } })
+      assert.equal(v.ok, false)
+      if (!v.ok) assert.equal(v.code, 'actor_denied')
+    }
+    const c = canTransition({ from: 'ready', to: 'canceled', actor: 'agent', audit: { reason: 'x', evidence: 'y' } })
+    assert.equal(c.ok, false)
+    if (!c.ok) assert.equal(c.code, 'actor_denied')
+  })
+
+  it('agent 可把待执行 / 等我确认标为受阻，但必须给理由', () => {
+    for (const from of ['ready', 'waiting_human'] as const) {
+      const bare = canTransition({ from, to: 'blocked', actor: 'agent' })
+      assert.equal(bare.ok, false)
+      if (!bare.ok) assert.equal(bare.code, 'audit_required')
+      assert.equal(canTransition({ from, to: 'blocked', actor: 'agent', audit: { reason: '已上线待人工完成' } }).ok, true)
+    }
+    // 原有 running→blocked(巡检失败路径)不受影响,无需理由。
+    assert.equal(canTransition({ from: 'running', to: 'blocked', actor: 'agent' }).ok, true)
   })
 
   it('agent 配了 autoClose 才能关单', () => {

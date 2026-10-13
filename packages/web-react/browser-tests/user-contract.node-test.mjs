@@ -139,7 +139,7 @@ for (const cost of ['dry', 'live'])
       ws.on('message', (raw) => {
         const f = JSON.parse(String(raw))
         calls.push(f)
-        const planted = /暗号 ([A-Z]{4}[0-9]{4})/.exec(f.content.text)
+        const planted = /编号是 PO-([A-Z]{4}[0-9]{4})/.exec(f.content.text)
         if (planted) codes.set(f.peer.id, planted[1])
         ws.send(
           JSON.stringify({
@@ -147,7 +147,7 @@ for (const cost of ['dry', 'live'])
             peer: f.peer,
             clientMessageId: f.clientMessageId,
             isFinal: true,
-            text: planted ? '2' : `暗号是 ${codes.get(f.peer.id) ?? '未知'}`,
+            text: planted ? '收到' : `编号是 PO-${codes.get(f.peer.id) ?? '未知'}`,
           }),
         )
       }),
@@ -188,6 +188,12 @@ for (const cost of ['dry', 'live'])
         assert.equal(calls[2].peer.id, calls[3].peer.id)
         assert.notEqual(calls[0].peer.id, calls[2].peer.id)
         assert.equal((output.match(/# continuation model=\S+ turns=2 same_session=ok recall=ok/g) ?? []).length, 2, output)
+        // The fake backend plants only on the neutral order-number wording; a reverted
+        // "暗号" prompt would never be planted and the recall above would go red.
+        assert.ok(
+          calls.some((f) => /编号是 PO-[A-Z]{4}[0-9]{4}/.test(f.content.text)),
+          'INC-20261014-SELFHOST-C3-GROK-REFUSAL: turn 1 registers a PO-<code> order number and turn 2 recalls it',
+        )
       }
       console.log(`# synthetic-${cost} ${output.match(/# timings_ms .*/)?.[0]}`)
     } finally {

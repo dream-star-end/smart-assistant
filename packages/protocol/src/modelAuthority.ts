@@ -93,7 +93,7 @@ export type JsonValue =
   | readonly JsonValue[]
   | { readonly [key: string]: JsonValue }
 
-export type ModelAuthorityEngine = 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
+export type ModelAuthorityEngine = 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity'
 
 /** Signed Box context-owner token. Absent means the server did not issue it. */
 export const BOX_NATIVE_CONTEXT_OWNER = 'box-native-v1' as const
@@ -891,7 +891,7 @@ function modelList(o: Record<string, unknown>, key: string): readonly string[] {
 
 function engine(o: Record<string, unknown>, key: string): ModelAuthorityEngine {
   const v = o[key]
-  if (v !== 'ccb' && v !== 'codex' && v !== 'grok' && v !== 'cursor' && v !== 'zcode') {
+  if (v !== 'ccb' && v !== 'codex' && v !== 'grok' && v !== 'cursor' && v !== 'zcode' && v !== 'antigravity') {
     throw new ModelAuthorityError('BadShape', `field ${key}: unknown engine ${String(v)}`)
   }
   return v

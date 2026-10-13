@@ -47,6 +47,10 @@ import {
   GROK_ENGINE_MODELS,
   ZCODE_ENGINE_MODEL_IDS,
   ZCODE_HOSTED_PERMISSION_MODE,
+  ANTIGRAVITY_ENGINE_MODEL_IDS,
+  antigravityAllowedUpstreamModels,
+  antigravityCliModelId,
+  isAntigravityEngineModel,
 } from '../engineModels.js'
 
 describe('GPT-5.6 / GPT-6 engine model authority', () => {
@@ -555,5 +559,41 @@ describe('Cursor context tier (300k default / 1M opt-in, turn-level execution ax
     assert.equal(projectContextWindowForCursorTier('cursor-auto', 1_000_000, '300k'), 1_000_000)
     assert.equal(projectContextWindowForCursorTier('kimi-k3', 1_048_576, '300k'), 1_048_576)
     assert.equal(projectContextWindowForCursorTier('gpt-5.6-sol', 400_000, '1m'), 400_000)
+  })
+})
+
+describe('Antigravity CLI engine model authority (OCV5-415)', () => {
+  test('canonical ids stay separate from the 1.3.4 `agy models` ids and upstream names', () => {
+    assert.deepEqual(ANTIGRAVITY_ENGINE_MODEL_IDS, ['antigravity-gemini-3.1-pro', 'antigravity-gemini-3.8-flash'])
+    assert.equal(isAntigravityEngineModel('antigravity-gemini-3.1-pro'), true)
+    assert.equal(isAntigravityEngineModel('gemini-3.1-pro-high'), false)
+    assert.equal(isAntigravityEngineModel('gemini-3.8-flash'), false)
+    assert.equal(isAntigravityEngineModel('cursor-gemini-3.8-flash'), false)
+  })
+
+  test('effort maps to an exact CLI id; unknown effort falls back to the model default', () => {
+    assert.equal(antigravityCliModelId('antigravity-gemini-3.1-pro', 'low'), 'gemini-3.1-pro-low')
+    assert.equal(antigravityCliModelId('antigravity-gemini-3.1-pro', 'high'), 'gemini-3.1-pro-high')
+    assert.equal(antigravityCliModelId('antigravity-gemini-3.1-pro', 'medium'), 'gemini-3.1-pro-high')
+    assert.equal(antigravityCliModelId('antigravity-gemini-3.1-pro', undefined), 'gemini-3.1-pro-high')
+    assert.equal(antigravityCliModelId('antigravity-gemini-3.8-flash', 'xhigh'), 'gemini-3.8-flash-medium')
+    assert.equal(antigravityCliModelId('antigravity-gemini-3.8-flash', 'low'), 'gemini-3.8-flash-low')
+    assert.equal(antigravityCliModelId('gemini-3.8-flash-high', 'high'), undefined)
+    assert.equal(antigravityCliModelId(undefined, 'high'), undefined)
+    assert.deepEqual(modelReasoningPolicy('antigravity-gemini-3.1-pro').supported, ['low', 'high'])
+    assert.deepEqual(modelReasoningPolicy('antigravity-gemini-3.8-flash').supported, ['low', 'medium', 'high'])
+  })
+
+  test('relay allowlist includes the title-generation model and nothing else foreign', () => {
+    assert.deepEqual(antigravityAllowedUpstreamModels('antigravity-gemini-3.8-flash'), [
+      'gemini-3.8-flash',
+      'gemini-3.1-flash-lite-preview',
+    ])
+    assert.deepEqual(antigravityAllowedUpstreamModels('antigravity-gemini-3.1-pro'), [
+      'gemini-3.1-pro-preview',
+      'gemini-3.1-pro-preview-customtools',
+      'gemini-3.1-flash-lite-preview',
+    ])
+    assert.deepEqual(antigravityAllowedUpstreamModels('gemini-3.1-pro-preview'), [])
   })
 })

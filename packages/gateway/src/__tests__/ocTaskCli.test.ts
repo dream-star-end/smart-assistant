@@ -165,6 +165,51 @@ describe('planTaskCommand', () => {
     }
   })
 
+  // OCV5-414:agent 关单走 ticket done,理由与证据缺一即 usage(不发请求)。
+  test('ticket done requires reason and evidence; block forwards optional evidence', () => {
+    for (const argv of [
+      ['ticket', 'done', 'OCV5-1', '--expected-version', '3'],
+      ['ticket', 'done', 'OCV5-1', '--expected-version', '3', '--reason', 'shipped'],
+      ['ticket', 'done', 'OCV5-1', '--expected-version', '3', '--evidence', 'https://x/pr/1'],
+      ['ticket', 'done', 'OCV5-1', '--reason', 'shipped', '--evidence', 'https://x/pr/1'],
+    ]) {
+      assert.equal(planTaskCommand(argv, {}).kind, 'usage', argv.join(' '))
+    }
+    const done = planTaskCommand(
+      [
+        'ticket',
+        'done',
+        'OCV5-1',
+        '--expected-version',
+        '3',
+        '--reason',
+        'shipped and verified',
+        '--evidence',
+        'https://x/pr/1',
+        '--owner',
+        'agent:main',
+      ],
+      {},
+    )
+    assert.deepEqual(done, {
+      kind: 'request',
+      method: 'POST',
+      path: '/tickets/OCV5-1/done',
+      body: {
+        expectedVersion: 3,
+        reason: 'shipped and verified',
+        evidence: 'https://x/pr/1',
+        owner: 'agent:main',
+      },
+    })
+    const block = planTaskCommand(
+      ['ticket', 'block', 'OCV5-1', '--expected-version', '4', '--reason', 'r', '--evidence', 'e'],
+      {},
+    )
+    assert.equal(block.kind, 'request')
+    if (block.kind === 'request') assert.deepEqual(block.body, { expectedVersion: 4, reason: 'r', evidence: 'e' })
+  })
+
   test('ticket update / claim / advance / block / comment require expectedVersion where needed', () => {
     assert.equal(planTaskCommand(['ticket', 'update', 'OCV5-1']).kind, 'usage')
     const upd = planTaskCommand(
