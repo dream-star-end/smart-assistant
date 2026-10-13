@@ -141,6 +141,17 @@ describe('v5-egress-slots.sh (OCV5-391)', () => {
     assert.ok(stopLegacy >= 0 && withdrawA > stopLegacy && startLegacy > withdrawA, r.calls.join('\n'))
   })
 
+  test('legacy with both slots active (killed flip) settles the older slot first, so a failed legacy can restore it (Codex r3 P1)', async () => {
+    const r = await run({ active: ['openclaude-v5-egress@A.service', 'openclaude-v5-egress@B.service'],
+      ts: { 'openclaude-v5-egress@A.service': 100, 'openclaude-v5-egress@B.service': 200 },
+      failStart: ['openclaude-v5-egress.service'] }, 'legacy')
+    assert.notEqual(r.status, 0)
+    assert.match(r.stderr, /closing the older slot A first[\s\S]*legacy egress failed to start; slot A restored and serving/)
+    const settleA = r.calls.indexOf('systemctl stop openclaude-v5-egress@A.service')
+    const termB = r.calls.indexOf('systemctl stop --no-block openclaude-v5-egress@B.service')
+    assert.ok(settleA >= 0 && termB > settleA, r.calls.join('\n'))
+  })
+
   test('refuses to flip without templates or tcp_migrate_req=1', async () => {
     const noTpl = await run({ active: ['openclaude-v5-egress.service'], templates: false }, 'flip')
     assert.notEqual(noTpl.status, 0); assert.match(noTpl.stderr, /slot templates not installed/)

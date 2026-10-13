@@ -83,14 +83,9 @@ assert_no_orphan_listener() {
   (( n >= 1 )) || die "no parsable listener on :$PORT"
 }
 
-legacy_inflight() { curl -fsS --max-time 3 "$STATS" 2>/dev/null | jq -r '.inflight.total_current // empty' 2>/dev/null || true; }
-
-cmd_flip() {
-  local predrain="${1:-600}" cur="" target new_sock new_svc old_sock old_svc st left i migrated=0
-  [[ "$predrain" =~ ^[0-9]+$ ]] || die "predrain must be seconds"
-  [[ -f "/etc/systemd/system/$SVC_TPL" && -f "/etc/systemd/system/$SOCK_TPL" ]] || die "slot templates not installed"
-  [[ "$(sysctl -n net.ipv4.tcp_migrate_req 2>/dev/null || echo 0)" == 1 ]] || die "tcp_migrate_req is not 1"
-  # Both slots active (an earlier flip was killed half way): stop the older one first.
+# Both slots active (an earlier flip was killed half way): stop the older one completely while
+# the newer keeps serving, so exactly one slot serves and the other is free to start again.
+settle_both_active() {
   if [[ "$(state "$(unit A service)")" == active && "$(state "$(unit B service)")" == active ]]; then
     local ta tb older
     ta="$(systemctl show -p ActiveEnterTimestampMonotonic --value "$(unit A service)")"
@@ -100,6 +95,16 @@ cmd_flip() {
     systemctl stop --job-mode=ignore-dependencies "$(unit "$older" socket)"
     systemctl stop "$(unit "$older" service)"
   fi
+}
+
+legacy_inflight() { curl -fsS --max-time 3 "$STATS" 2>/dev/null | jq -r '.inflight.total_current // empty' 2>/dev/null || true; }
+
+cmd_flip() {
+  local predrain="${1:-600}" cur="" target new_sock new_svc old_sock old_svc st left i migrated=0
+  [[ "$predrain" =~ ^[0-9]+$ ]] || die "predrain must be seconds"
+  [[ -f "/etc/systemd/system/$SVC_TPL" && -f "/etc/systemd/system/$SOCK_TPL" ]] || die "slot templates not installed"
+  [[ "$(sysctl -n net.ipv4.tcp_migrate_req 2>/dev/null || echo 0)" == 1 ]] || die "tcp_migrate_req is not 1"
+  settle_both_active
   if [[ "$(state "$(unit A service)")" == active ]]; then cur=A; target=B
   elif [[ "$(state "$(unit B service)")" == active ]]; then cur=B; target=A
   else target=A; fi
@@ -163,6 +168,8 @@ port_free() { ! ss -Hltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; }
 # If legacy does not come up, put an idle slot back so :$PORT is never left closed.
 cmd_legacy() {
   local s i restore=""
+  # Codex r3 P1: never drain both slots at once, or a failed legacy start has nothing to restore.
+  settle_both_active
   for s in A B; do
     systemctl stop --job-mode=ignore-dependencies "$(unit "$s" socket)" 2>/dev/null || true
   done
