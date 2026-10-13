@@ -24,6 +24,7 @@ import {
   BILI_ACCOUNT_SEED_CLI_USAGE,
   biliAccountSmokeActionIds,
   findApprovedBiliAccountPlugin,
+  requireCleanLogin,
   parseBiliAccountSeedCliArgs,
   seedBiliAccountPlugin,
 } from '../src/marketplace/seedBiliAccountPlugin.js'
@@ -104,11 +105,11 @@ async function scanLogin(
       failure = code
     },
   })
-  await handle.done.catch((error) => {
-    failure ??= error instanceof Error ? error.message.slice(0, 80) : 'WORKER_FAILED'
+  let doneError: unknown = null
+  await handle.done.catch((error: unknown) => {
+    doneError = error ?? new Error('WORKER_FAILED')
   })
-  if (!state) throw new Error(`login did not complete: ${failure ?? 'no state'}`)
-  return state
+  return requireCleanLogin({ state, failure, doneError })
 }
 
 async function smoke(

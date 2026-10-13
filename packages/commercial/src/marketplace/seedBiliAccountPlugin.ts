@@ -124,6 +124,22 @@ export function biliAccountSmokeActionIds(): string[] {
   return ids
 }
 
+/**
+ * 登录 worker 必须干净结束(Codex r1 P1):worker 的完成检查(协议、退出码、容器清理)失败时,即便之前
+ * 已经收到 authenticated 状态也不能继续实测和上架。返回唯一可用的登录状态,否则抛错。
+ */
+export function requireCleanLogin<T>(input: {
+  state: T | null
+  failure: string | null
+  doneError: unknown
+}): T {
+  if (input.doneError !== undefined && input.doneError !== null)
+    throw new Error('login worker did not finish cleanly')
+  if (input.failure !== null) throw new Error(`login did not complete: ${input.failure}`)
+  if (input.state === null) throw new Error('login did not complete: no state')
+  return input.state
+}
+
 export const BILI_ACCOUNT_SEED_CLI_USAGE =
   'usage: seed-bili-account-plugin.ts --advisory-status | --verify-and-seed-user=ID --qr-out=/root/<file>.png [--subtitle-bvid=BV…]'
 

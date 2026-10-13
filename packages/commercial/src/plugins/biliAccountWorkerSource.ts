@@ -408,7 +408,11 @@ async function proveSelf(context) {
   const page = await openSitePage(context).catch(() => null);
   if (!page) return null;
   try { return (await requireSelf(page)).mid; }
-  catch { return null; }
+  catch (error) {
+    // 风控即停(Codex r1 P1):登录后 nav 被风控时不再每 5 秒重探,直接以 UPSTREAM_CHALLENGE 结束登录。
+    if (failureCode(error) === 'UPSTREAM_CHALLENGE') throw error;
+    return null;
+  }
   finally { await page.close().catch(() => {}); }
 }
 async function runLogin(input, relay) {

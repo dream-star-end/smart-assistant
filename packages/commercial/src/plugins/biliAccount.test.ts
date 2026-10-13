@@ -9,6 +9,7 @@ import { describe, test } from 'node:test'
 import {
   biliAccountSmokeActionIds,
   parseBiliAccountSeedCliArgs,
+  requireCleanLogin,
 } from '../marketplace/seedBiliAccountPlugin.js'
 import {
   BILI_ACCOUNT_LOGIN_ORIGINS,
@@ -460,7 +461,83 @@ describe('bili-account worker behaviour (compiled from the pinned source)', () =
   })
 })
 
+/** Compile proveSelf (login session proof) together with the helpers it uses, from the pinned source. */
+function proveSelfHarness() {
+  const src = BILI_ACCOUNT_WORKER_SOURCE
+  const helpers = src.slice(src.indexOf('function failureCode'), src.indexOf('function emitStep'))
+  const reads = src.slice(
+    src.indexOf('function cleanText'),
+    src.indexOf('async function actionRead'),
+  )
+  const prove = src.slice(
+    src.indexOf('async function proveSelf'),
+    src.indexOf('async function runLogin'),
+  )
+  assert.ok(helpers.length > 0 && reads.length > 0 && prove.length > 0)
+  return new Function(
+    `'use strict';
+     const MAX_API_TEXT = 900 * 1024;
+     const RISK_CODES = new Set([-352, -412, -799]);
+     const FAILURE_CODES = new Set(['WORKER_FAILED', 'LOGIN_EXPIRED', 'UPSTREAM_CHALLENGE', 'LOGIN_STATE_UNSUPPORTED']);
+     ${helpers}${reads}${prove}
+     return { proveSelf };`,
+  )() as { proveSelf(context: unknown): Promise<number | null> }
+}
+
+describe('bili-account login proof (Codex r1 P1)', () => {
+  const { proveSelf } = proveSelfHarness()
+  const contextWith = (
+    table: Record<string, { status?: number; body: unknown }>,
+    seen: string[],
+  ) => ({
+    async newPage() {
+      return { ...fakePage(table, seen), async goto() {}, async close() {} }
+    },
+  })
+
+  test('risk control during the login proof stops the login instead of re-probing', async () => {
+    for (const nav of [{ body: { code: -352 } }, { status: 412, body: {} }]) {
+      const seen: string[] = []
+      await assert.rejects(
+        proveSelf(contextWith({ [`${API}/x/web-interface/nav`]: nav }, seen)),
+        /UPSTREAM_CHALLENGE/,
+      )
+      assert.equal(seen.length, 1)
+    }
+  })
+
+  test('not logged in yet → null (keep waiting for the scan); logged in → mid', async () => {
+    assert.equal(
+      await proveSelf(
+        contextWith({ [`${API}/x/web-interface/nav`]: { body: { code: -101 } } }, []),
+      ),
+      null,
+    )
+    assert.equal(
+      await proveSelf(contextWith({ [`${API}/x/web-interface/nav`]: NAV_OK }, [])),
+      12345,
+    )
+  })
+})
+
 describe('bili-account protocol, codes, logs, seed CLI', () => {
+  test('seed only continues after a clean login worker exit (Codex r1 P1)', () => {
+    const state = { cookies: [], origins: [] }
+    assert.equal(requireCleanLogin({ state, failure: null, doneError: null }), state)
+    assert.throws(
+      () => requireCleanLogin({ state, failure: null, doneError: new Error('PROTOCOL') }),
+      /did not finish cleanly/,
+    )
+    assert.throws(
+      () => requireCleanLogin({ state: null, failure: 'LOGIN_EXPIRED', doneError: null }),
+      /LOGIN_EXPIRED/,
+    )
+    assert.throws(
+      () => requireCleanLogin({ state: null, failure: null, doneError: null }),
+      /no state/,
+    )
+  })
+
   test('frames: ready + terminal decode; write-fence frames are protocol errors', () => {
     assert.deepEqual(
       decodeBiliAccountWorkerFramesForTest(
