@@ -20,6 +20,7 @@ import { Value } from '@sinclair/typebox/value'
 import type { Pool } from 'pg'
 import { type QueryRunner, tx } from '../../db/queries.js'
 import { isDefaultConnectorArtifact } from '../defaults/index.js'
+import { contractNeedsOfficialArtifact, isOfficialConnectorArtifact } from '../official/index.js'
 import { canonicalSha256Hex } from './canonical.js'
 import { COMPILER_VERSION, compileSpec } from './compiler.js'
 import {
@@ -145,6 +146,15 @@ export async function securityApproveWithRunner(
   // spec.id 必须 == listing.slug(防挂靠他人 slug)。
   if ((rawSpec as { id?: unknown }).id !== row.slug)
     throw new ConnectorSpecError('SPEC_ID_MISMATCH', 'spec.id != listing slug')
+  // authMode none / builtin 只对平台官方工件的精确 hash 开放(OCV5-402):签名前收口。
+  if (
+    contractNeedsOfficialArtifact(compiled.execContract) &&
+    !isOfficialConnectorArtifact(row.slug, row.artifact_hash)
+  )
+    throw new ConnectorSpecError(
+      'BUILTIN_PLATFORM_ONLY',
+      'authMode none and builtins are reserved for an exact official connector artifact',
+    )
 
   const sig = signLegacyConnectorContract(
     {
@@ -430,6 +440,15 @@ function verifyStoredContractRow(
       'platform-managed OAuth is reserved for an exact built-in connector artifact',
     )
   }
+  // 载入期再收口一次(OCV5-402):库里即便有人绕过审核写进了用 none / builtin 的契约,也执行不了。
+  if (
+    contractNeedsOfficialArtifact(execContract as ExecContractT) &&
+    !isOfficialConnectorArtifact(row.slug, row.artifact_hash)
+  )
+    throw new ConnectorSpecError(
+      'BUILTIN_PLATFORM_ONLY',
+      'authMode none and builtins are reserved for an exact official connector artifact',
+    )
 
   const recomputedHash = canonicalSha256Hex(execContract)
   const storedHashHex = Buffer.from(row.exec_contract_hash).toString('hex')

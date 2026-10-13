@@ -9,6 +9,11 @@ import {
   marketplaceReviewSource,
 } from '@openclaude/protocol'
 import { isDefaultConnectorArtifact, isDefaultConnectorSlug } from '../connectors/defaults/index.js'
+import {
+  OFFICIAL_MARKET_CONNECTORS,
+  OFFICIAL_MARKET_CONNECTOR_SLUGS,
+  isOfficialConnectorArtifact,
+} from '../connectors/official/index.js'
 import { projectSignedConnectorContract } from '../connectors/spec/projection.js'
 import {
   isAcceptedFunctionalVerificationState,
@@ -586,7 +591,12 @@ async function publishSkillVersionInternal(
     throw new MarketplaceError('VERSION_NOT_FOUND', 'missing artifact content')
   if (
     isDefaultConnectorSlug(input.slug) ||
-    ([KNOWLEDGE_PLANET_PLUGIN_SLUG, WEIBO_PLUGIN_SLUG, ZHIHU_PLUGIN_SLUG].includes(input.slug) &&
+    ([
+      KNOWLEDGE_PLANET_PLUGIN_SLUG,
+      WEIBO_PLUGIN_SLUG,
+      ZHIHU_PLUGIN_SLUG,
+      ...OFFICIAL_MARKET_CONNECTOR_SLUGS,
+    ].includes(input.slug) &&
       !allowOfficialKnowledgePlanetSeed)
   )
     throw new MarketplaceError(
@@ -760,6 +770,31 @@ export async function publishOfficialZhihuVersion(
     throw new MarketplaceError(
       'ARTIFACT_MISMATCH',
       'Zhihu platform seed identity does not match the pinned artifact',
+    )
+  return publishSkillVersionInternal(input, true)
+}
+
+/**
+ * Narrow platform-seed bypass for the exact version-controlled official market connectors
+ * (`connectors/official/`, OCV5-402: `bili`). Slug, version, artifact hash and plugin type
+ * must all match the code constant; the version enters review as pending without AI queueing.
+ */
+export async function publishOfficialMarketConnectorVersion(
+  input: PublishInput,
+): Promise<{ versionId: string }> {
+  const official = OFFICIAL_MARKET_CONNECTORS.find((c) => c.slug === input.slug)
+  if (
+    official === undefined ||
+    input.version !== official.version ||
+    input.kind !== 'connector' ||
+    input.pluginType !== 'declarative-http' ||
+    !isOfficialConnectorArtifact(input.slug, input.artifactHash) ||
+    input.submittedBy !== input.ownerUserId ||
+    input.queueAiReview !== false
+  )
+    throw new MarketplaceError(
+      'ARTIFACT_MISMATCH',
+      'official connector seed identity does not match the pinned artifact',
     )
   return publishSkillVersionInternal(input, true)
 }

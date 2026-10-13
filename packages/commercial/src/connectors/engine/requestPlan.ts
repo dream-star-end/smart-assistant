@@ -235,6 +235,16 @@ export function buildRequestPlan(
     }
   }
 
+  // 静态 query(审签字面量,OCV5-402):编译期已保证不与 params 映射重名;运行期再拒控制符。
+  if (req.staticQuery) {
+    for (const [name, value] of Object.entries(req.staticQuery)) {
+      if (POLLUTION_KEYS.has(name)) continue
+      assertNoControlChars(name)
+      assertNoControlChars(value)
+      query.push([name, value])
+    }
+  }
+
   const targetUrl = composeUrl(origin, path, query)
 
   const headers: Record<string, string> = {}
