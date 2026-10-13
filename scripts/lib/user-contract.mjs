@@ -1,6 +1,6 @@
 // Pure contract policy: importing this module never starts a browser or reads secrets.
 export const TOTAL_TIMEOUT = 240_000;
-export const CASES = ["C1 cold UI login without auth hint", "C2 collapsed model reaches outbound request", "C3 one model per engine"];
+export const CASES = ["C1 cold UI login without auth hint", "C2 collapsed model reaches outbound request", "C3 one model per engine, two turns in one session"];
 export function parseModels(value = "grok-build,deepseek-v4-flash") {
   const models = value.split(",").map((x) => x.trim());
   if (!models.length || models.some((x) => !/^[a-zA-Z0-9._-]+$/.test(x)) || new Set(models).size !== models.length) throw new Error("Invalid/duplicate contract models");
@@ -42,6 +42,34 @@ export function turnEvidence(frames, sent) {
   const error = own.some((f) => f.error || ["outbound.error", "outbound.turn_error", "error"].includes(f.type));
   const complete = own.some((f) => f.type === "outbound.message" && f.isFinal === true);
   return { error, complete };
+}
+// Continuation (OCV5-405): a first turn that only works in isolation is not a
+// working chat. Turn 2 must recall a random code that appears only in turn 1,
+// in the same session (same peer), so a lost or rebuilt context fails the gate.
+const CODE_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+export function continuationCode(randomInt = (n) => crypto.getRandomValues(new Uint32Array(1))[0] % n) {
+  let code = "";
+  for (let i = 0; i < 4; i++) code += CODE_LETTERS[randomInt(CODE_LETTERS.length)];
+  for (let i = 0; i < 4; i++) code += String(randomInt(10));
+  return code;
+}
+export function continuationPrompts(code) {
+  if (!/^[A-Z]{4}[0-9]{4}$/.test(code)) throw new Error("Invalid continuation code");
+  const id = crypto.randomUUID();
+  return {
+    first: `R2-${id} 请记住暗号 ${code}。本轮请只回答数字2，不使用工具。`,
+    second: `R2-${id}-2 上一轮我让你记住的暗号是什么？请只回答暗号本身，不使用工具。`,
+  };
+}
+export function assertSameSession(first, second) {
+  if (!first?.peer?.id || first.peer.id !== second?.peer?.id) throw new Error("Continuation turn left the first turn's session");
+  if (!second.clientMessageId || first.clientMessageId === second.clientMessageId) throw new Error("Continuation turn reused the first message id");
+}
+export function assertContinuationAnswer(text, code) {
+  // Models may wrap the code in quotes, markdown or a short sentence. The code
+  // itself must appear intact as one token; nothing else is accepted.
+  const tokens = String(text ?? "").toUpperCase().match(/[A-Z0-9]+/g) ?? [];
+  if (!tokens.includes(code)) throw new Error("Continuation turn did not recall the first turn's code");
 }
 export function tapResult(ok, n, name, ms, error) {
   const clean = (s) => String(s).replace(/[\r\n]+/g, " ");

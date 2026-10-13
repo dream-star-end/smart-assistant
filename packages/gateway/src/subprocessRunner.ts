@@ -1426,6 +1426,40 @@ function readStderrBufCap(): number {
 }
 const MAX_STDERR_BUF_BYTES = readStderrBufCap()
 
+/** Logged stderr tail, cut only after redaction. */
+const CRASH_STDERR_TAIL_CHARS = 2000
+/** Raw stderr kept per process generation for the crash log. */
+const CRASH_STDERR_RAW_CHARS = 8000
+
+/**
+ * Append to the raw tail without ever splitting a line: when the buffer is
+ * trimmed, drop the cut line entirely so a credential's marker (`TOKEN=`) can
+ * never be separated from its value before redaction runs.
+ */
+export function appendCrashStderrTail(tail: string, chunk: string): string {
+  const next = tail + chunk
+  if (next.length <= CRASH_STDERR_RAW_CHARS) return next
+  const cut = next.slice(-CRASH_STDERR_RAW_CHARS)
+  const nl = cut.indexOf('\n')
+  return nl === -1 ? '' : cut.slice(nl + 1)
+}
+
+/**
+ * A crash log carries the child's last stderr lines so a one-shot failure
+ * (e.g. the hermetic Auto-Dream turn) can be diagnosed. stderr is operational
+ * output, but scrub anything credential-shaped before it reaches the log.
+ */
+export function redactCrashStderrTail(raw: string): string {
+  return raw
+    .replace(/\bbearer\s+[^\s"',;]+/gi, 'Bearer [redacted]')
+    .replace(/(authorization|bearer|api[_-]?key|token|secret|password|cookie)(["'\s:=]+)[^\s"',;]+/gi, '$1$2[redacted]')
+    .replace(/\b(sk|pk|rk)-[A-Za-z0-9_-]{8,}/g, '[redacted]')
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9._-]+/g, '[redacted]')
+    // Long opaque runs (keys, hex digests). `/` stays out so file paths survive.
+    .replace(/\b[A-Za-z0-9+_-]{40,}={0,2}/g, '[redacted]')
+    .slice(-CRASH_STDERR_TAIL_CHARS)
+}
+
 export class SubprocessRunner extends EventEmitter {
   private proc: ChildProcessWithoutNullStreams | null = null
   /** 本 turn 解析后的 descriptor；首次 spawn 也必须看到，不能等 stdin 才补。 */
@@ -1437,6 +1471,8 @@ export class SubprocessRunner extends EventEmitter {
   private stdoutBuf = ''
   /** Running byte count for stderr within a single "line" window — caps runaway stderr. */
   private stderrBufBytes = 0
+  /** Whole-line raw stderr tail of this generation, for the crash log only. */
+  private stderrTail = ''
   private currentSessionId: string | null = null
   /**
    * Count of `_oc_telemetry` lines silently dropped because their `session_id`
@@ -1670,6 +1706,7 @@ export class SubprocessRunner extends EventEmitter {
     this.overflowKilled = false
     this.stdoutBuf = ''
     this.stderrBufBytes = 0
+    this.stderrTail = ''
 
     // Wrap the entire setup in try/catch so ANY pre-spawn failure (config
     // resolution, buildLearningContext, backend.spawn, …) records a crash and
@@ -2090,6 +2127,7 @@ export class SubprocessRunner extends EventEmitter {
     proc.stderr.on('data', (chunk: string) => {
       if (this.proc !== proc) return
       this.lastActivityAt = Date.now() // stderr activity also counts as "alive"
+      this.stderrTail = appendCrashStderrTail(this.stderrTail, chunk)
       this.stderrBufBytes += Buffer.byteLength(chunk, 'utf8')
       // If stderr goes pathological (single burst > cap), kill to avoid RSS
       // blow-up from downstream listeners that might buffer all of it.
@@ -2138,7 +2176,7 @@ export class SubprocessRunner extends EventEmitter {
       })
       const crashed = !this.shuttingDown && !expectedOfficialAbortExit
       if (crashed && !skipCrashLoop) {
-        this._recordCrash()
+        this._recordCrash({ code, signal })
       } else {
         // Keep `shuttingDown` true until the stdout-drained `close` boundary.
         // A descendant can retain the pipe after the direct child exits; if
@@ -2176,7 +2214,7 @@ export class SubprocessRunner extends EventEmitter {
       // Any failure between backoff-gate-pass and spawn-succeeded is a "start
       // failed" crash. Record it so the gate fires on the next call.
       this.starting = false
-      this._recordCrash()
+      this._recordCrash({ startError: err instanceof Error ? err.message : String(err) })
       throw err
     }
   }
@@ -2189,7 +2227,9 @@ export class SubprocessRunner extends EventEmitter {
    * 1s, third → 2s, … up to 30s. Counters reset on graceful shutdown (see
    * exit handler) or when the previous run was stable for STABLE_UPTIME_MS.
    */
-  private _recordCrash(): void {
+  private _recordCrash(
+    detail: { code?: number | null; signal?: NodeJS.Signals | null; startError?: string } = {},
+  ): void {
     const now = Date.now()
     // If we had a long-lived stable run before this crash, don't punish it —
     // reset the counter so an isolated crash after hours of uptime starts
@@ -2216,6 +2256,10 @@ export class SubprocessRunner extends EventEmitter {
       sessionKey: this.opts.sessionKey,
       consecutiveCrashes: this._consecutiveCrashes,
       backoffMs: backoff,
+      ...(detail.code !== undefined ? { exitCode: detail.code } : {}),
+      ...(detail.signal ? { signal: detail.signal } : {}),
+      ...(detail.startError ? { startError: redactCrashStderrTail(detail.startError).slice(0, 500) } : {}),
+      ...(this.stderrTail ? { stderrTail: redactCrashStderrTail(this.stderrTail) } : {}),
     })
   }
 
