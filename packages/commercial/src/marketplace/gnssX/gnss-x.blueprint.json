@@ -1,0 +1,4836 @@
+{
+  "format": "plugin-blueprint-v1",
+  "slug": "gnss-x",
+  "name": "GNSS-X 地学工具",
+  "description": "GNSS-X（AtomicXpert）地学专家工具：时间系统、坐标框架、轨道、电离层、空间天气、大气、重力、海洋、GNSS、测量平差与电波传播共 60 个只读计算/查询工具。 需要用户自己在 https://mcp.gnss-x.ac.cn 注册账号并领取 Token，再到 管理中心 → 插件 填写；每次调用消耗 GNSS-X 对应工具的配额。 用法：先 oc-connect describe gnss-x <工具名> 看参数，再把 JSON 参数从 stdin 传给 oc-connect call gnss-x <工具名>。 Token 无效、被撤销或该工具配额用完时，上游返回 HTTP 401（JSON-RPC 错误码 -32001），这里显示为 UPSTREAM_AUTH_FAILED；结果里出现 error.code=-32001 也是同一原因。请提示用户到 https://mcp.gnss-x.ac.cn 「用户」页检查 Token 和各工具剩余配额，必要时在 管理中心 → 插件 重新填写 Token；不要自动重试。 单次结果上限 256KB（数组最多 200 项、嵌套最多 8 层），超出会报 RESULT_TOO_LARGE：缩小时间/高度范围、增大步长或减少条数后重试。",
+  "version": "1.0.0",
+  "category": "research-academic",
+  "useCases": [
+    "把 UTC 时间换算成 GPS 周和周内秒，或查询闰秒与恒星时",
+    "查询全球电离层 vTEC、Kp/Dst 地磁指数和太阳风参数",
+    "计算测站卫星可见时段、DOP 与对流层/电离层延迟",
+    "做 UTM/高斯投影、七参数基准转换和水准网平差"
+  ],
+  "outcomeExamples": [
+    "给它 2026-10-13T00:00:00Z → 得到 GPS 周、周内秒和 MJD",
+    "给它测站经纬度和时间段 → 得到 GPS 卫星过顶时段与 PDOP"
+  ],
+  "humanMd": "## 使用前准备：需要你自己注册并领取 Token\n\n1. 打开 https://mcp.gnss-x.ac.cn 注册账号（站点可能需要人工审核，有邀请码可即时通过）。\n2. 登录后在「用户」页添加一个 LLM 密钥（GNSS-X 领取 Token 时要求绑定），再点「领取 Token」。\n3. 在本平台「管理中心 → 插件」安装并打开 GNSS-X 地学工具，把 Token 填进去。Token 只保存在平台服务端，不会进入 AI 的运行环境。\n\n本插件由第三方服务 GNSS-X（AtomicXpert）提供计算与数据，平台不提供或代领 Token。\n\n## 收录的 60 个工具（全部只读）\n\n### 时间系统（5）\n- `time`：多格式时间查询与灵活时间运算，支持 ISO、UTC、简化儒略日 MJD、GPST（GPS 周 + 周内秒）等多种时间系统的输入与输出。\n- `gpst_utc`：GPS 时（GPST）与协调世界时（UTC）互转，含 GPS 周/周内秒。\n- `leap_seconds`：闰秒表只读查询（TAI-UTC，依据 IERS Bulletin C）。\n- `timezone`：IANA 时区换算与 UTC 偏移（系统 tzdata，确定性）。\n- `sidereal`：恒星时计算（IAU 1982 格林尼治恒星时 GMST）。\n\n### 大地测量与坐标框架（8）\n- `coor`：多坐标系统转换与相对位置计算工具，严格依赖提供的 params 进行输入，不新增任何额外参数或隐含配置。\n- `geodesic`：在 WGS84 参考椭球上解算大地线（Vincenty 1975 算法，亚毫米精度）。\n- `ellipsoid`：参考椭球参数与卯酉圈/子午圈曲率半径查询。\n- `eop_query`：查询地球定向参数 EOP（IERS EOP 20 C04，只读）。\n- `helmert`：Bursa-Wolf 七参数基准转换与 Helmert 二维四参数平面转换（确定性，无 IO）。\n- `map_projection`：UTM 与 Gauss-Krüger 横轴墨卡托正反算（确定性，WGS84/CGCS2000 同椭球）。\n- `eci_ecef`：地心惯性系（ECI）与地心地固系（ECEF）坐标互转（确定性，可复用 EOP）。\n- `station_epoch`：测站坐标历元归算（确定性）。\n\n### 天文与轨道（8）\n- `satellite`：卫星相关工具，基于现有输入参数计算导航卫星与低轨 LEO 卫星的轨道、GNSS-LEO 掩星事件及地面站可见性。\n- `sun_moon`：太阳/月亮视位置与月相（低精度 Meeus 算法，观测规划用）。\n- `orbit`：卫星轨道 TLE 编目与星下点传播（只读，教学/演示精度）。\n- `space_object`：按 NORAD 编目号查询在轨太空目标（CelesTrak 权威编目，只读）。\n- `site_visibility`：任意测站的卫星可见性/过顶时段（TLE，确定性）。\n- `drag_acceleration`：大气阻力减速度。\n- `orbit_decay_rate`：近圆轨道衰减率。\n- `orbit_lifetime`：轨道寿命量级估计。\n\n### 电离层（7）\n- `tec_query`：查询全球 vTEC（垂直总电子含量，TECU，只读）。\n- `vtec_map`：全球 vTEC 图概览与剖面（WHU GIM，只读）。\n- `stec_query`：斜向电子总含量 sTEC 与电离层定位时延（只读）。\n- `ionosonde`：全球电离层测高仪数据（foF2/NmF2 等，只读）。\n- `nequick_vtec`：NeQuick2（ITU-R P.531 / NeQuickJRC 1.0.0）垂直电子总含量 vTEC。\n- `nequick_stec`：NeQuick2（ITU-R P.531 / NeQuickJRC 1.0.0）斜向电子总含量 sTEC。\n- `klobuchar`：GPS 广播电离层延迟模型（ICD-GPS-200，确定性）。\n\n### 空间天气（3）\n- `kp_index`：太阳活动指数（Kp/Ap/F10.7/太阳黑子/地磁扰动，只读）。\n- `dst_index`：地磁 Dst 指数（Kyoto WDC 实时，只读）。\n- `solar_wind`：太阳风参数（DSCOVR L1，只读）。\n\n### 大气与气象（9）\n- `pressure_altitude`：国际标准大气（ISA）气压高度换算。\n- `typhoon`：CMA 台风报文（路径/强度/风圈，只读）。\n- `high_impact_weather`：由垂直探空计算高影响天气（强对流）指数（确定性、离线）。\n- `cira_profile`：CIRA-72 经验大气廓线（月纬向平均，0–120 km）。\n- `msis_density`：NRLMSIS 上层大气（热层）总质量密度与温度。\n- `msis_profile`：NRLMSIS 热层大气廓线（高度网格）。\n- `atmo_refractivity`：大气无线电折射率（ITU-R P.453-14，确定性）。\n- `troposphere_delay`：对流层延迟（Saastamoinen 1972，确定性）。\n- `pwv`：由 GNSS 湿延迟反演可降水量 PWV（Bevis et al. 1994，确定性）。\n\n### 掩星反演（3）\n- `bending_angle`：球对称大气 Abel 正演弯曲角（确定性）。\n- `abel_inversion`：由弯曲角剖面反演大气折射率（Fjeldbo et al. 1971，确定性）。\n- `dry_temperature`：由折射率剖面做干空气静力/理想气体反演（确定性）。\n\n### 重力场（5）\n- `normal_gravity`：椭球面/高程处正常重力（Somigliana 闭合公式，确定性）。\n- `gravity_correction`：自由空气与布格改正（确定性）。\n- `eotvos_correction`：厄特弗斯（Eötvös）改正（运动平台重力测量，确定性）。\n- `isostasy`：Airy / Pratt 均衡模型（确定性）。\n- `gravity_field`：球谐重力场势（4π 完全归一化，确定性）。\n\n### 海洋（2）\n- `sound_speed`：海水声速计算（Chen-Millero 1977 / Mackenzie 1981）。\n- `seawater_density`：海水密度计算（UNESCO EOS-80，Fofonoff & Millard 1983）。\n\n### GNSS 信号与几何（2）\n- `gnss_frequency`：GNSS 信号频点与波长查询（确定性）。\n- `dop`：卫星几何精度因子 DOP（确定性）。\n\n### 测量平差（4）\n- `adjustment_gauss_markov`：间接平差（Gauss-Markov 最小二乘），解 x = (AᵀPA)⁻¹AᵀPl。\n- `leveling_adjust`：水准网间接平差，求解各未知点高程并给出残差与 σ0。\n- `traverse_closure`：导线计算与闭合差分配（Bowditch 比例法）。\n- `qc_outliers`：粗差探测（Baarda 数据探测法 / 三倍中误差）。\n\n### 电波传播（4）\n- `rain_attenuation`：降雨衰减（ITU-R P.838-3 比衰减 + P.618 路径）。\n- `gaseous_attenuation`：大气气体比衰减（ITU-R P.676 简化 Annex 2）。\n- `link_budget`：链路预算（标准链路方程，结合 ITU-R P.525）。\n- `radio_horizon`：无线电地平与第一菲涅尔区净空。\n\n## 未收录\n\n- 绘图类 20 个（UML、流程图、架构图等，由 GNSS-X 站内 LLM 出图）\n- `databox_weather`：任务要求不收；还需另配云遥 DataBox 密钥\n- `databox_sounding`：任务要求不收；还需另配云遥 DataBox 密钥\n- `satellite_news`：资讯检索，返回第三方新闻原文（不可信文本），不是地学计算\n- `satellite_news_report`：资讯日报，同上\n- `satellite_news_brief`：资讯速览，同上\n- `satellite_news_stats`：资讯统计，同上\n- `nequick_gim`：全球格网输出，常超出单次结果上限\n- `unit_convert`：单位换算，模型可直接准确完成\n- `angle_convert`：角度换算，模型可直接准确完成\n- `dew_point`：单个闭式公式（Magnus），模型可直接计算\n- `wind_chill`：单个闭式公式，与地学定位无关\n- `heat_index`：单个闭式公式，与地学定位无关\n- `ballistic_coefficient`：B=Cd·A/m，drag_acceleration 等已接受 cd/area/mass\n- `free_space_loss`：FSPL 单式，link_budget 已包含\n- `error_budget`：各项均方根合成，模型可直接计算\n- `seawater_freezing`：单个多项式，使用面窄\n- `impact_parameter`：直线几何，不含大气折射，模型可直接计算\n- `chapman_profile`：合成教学剖面，非观测数据\n- `atmosphere_compare`：模型对比，cira_profile / msis_profile 可分别得到\n- `scale_height_profile`：标高剖面，cira_profile 已覆盖主要用途\n- `cira_refractivity`：与 atmo_refractivity（atmosphere=cira）重复\n- `msis_composition`：msis_density / msis_profile 已覆盖主要用途\n\n## 配额与限制\n\n- 每次调用消耗 GNSS-X 对应工具的配额，剩余次数可在 GNSS-X「用户」页查看；绑定时会调用一次 `time` 校验 Token。\n- 单次结果上限 256KB（数组最多 200 项、嵌套最多 8 层），超出会报 RESULT_TOO_LARGE：缩小时间/高度范围、增大步长或减少条数后重试。\n- 每个账号只绑定一个 GNSS-X Token；重新填写会替换旧的。\n\n## 常见问题\n\n- **提示 Token 无效或配额用完**（HTTP 401 / 错误码 -32001）：到 GNSS-X「用户」页确认 Token 仍有效、对应工具还有剩余配额；需要时在「管理中心 → 插件」重新填写 Token。",
+  "tags": [
+    "GNSS",
+    "地学",
+    "电离层",
+    "空间天气",
+    "测绘",
+    "轨道",
+    "API插件"
+  ],
+  "visibility": "public",
+  "apiOrigin": "https://mcp.gnss-x.ac.cn",
+  "auth": {
+    "mode": "static-token",
+    "placement": {
+      "type": "bearer"
+    }
+  },
+  "identity": {
+    "actionId": "time",
+    "accountKeyPointer": "/jsonrpc"
+  },
+  "actions": [
+    {
+      "id": "time",
+      "description": "多格式时间查询与灵活时间运算，支持 ISO、UTC、简化儒略日 MJD、GPST（GPS 周 + 周内秒）等多种时间系统的输入与输出。\n\n参数：\n- format（string，可选）：输出时间格式。支持 iso（ISO字符串）、utc（UTC字符串）、mjd（儒略日）、gpst（GPS周+周内秒）、all（全部格式）\n- base_time（string，对象请传 JSON 字符串，可选）：基准时间。支持 ISO 字符串、UTC 字符串、MJD 数值/字符串、GPST 对象{week,seconds}，留空为当前时间\n- delta_days（number，可选）：对基准时间加减的天数（可为负）\n- delta_hours（number，可选）：对基准时间加减的小时数（可为负）\n- delta_seconds（number，可选）：对基准时间加减的秒数（可为负）\n\n说明：\n多格式时间查询与灵活时间运算，支持 ISO、UTC、简化儒略日 MJD、GPST（GPS 周 + 周内秒）等多种时间系统的输入与输出。\n\n功能说明：\n  • 支持的时间格式输入与输出：iso（ISO 8601 字符串）、utc（UTC 字符串）、mjd（简化儒略日数值）、gpst（GPS 周与周内秒）、all（全部格式）。\n  • 基准时间支持：可以提供 ISO 字符串、UTC 字符串、简化儒略日 MJD 数值或字符串、GPST 对象 GPS周与周内秒；若未提供 base_time，则使用当前时间作为基准。\n  • 时间运算：可对基准时间进行天数、小时、秒的加减运算，参数 delta_days、delta_hours、delta_seconds 可任意组合，支持负值。\n  • 适用场景：导航、天文、GNSS、遥感等需要时间标准转换与推算的场景。\n\n输入参数说明（严格按 params）：\n  • format (string, optional)：输出时间格式，可选值 iso、utc、mjd、gpst、all；若未指定，默认返回实现决定的格式或全部格式。\n  • base_time (string, optional)：基准时间，支持 ISO 字符串、UTC 字符串、MJD 数值或字符串、GPST 对象（示例格式见下）；留空表示使用当前时间。\n  • delta_days (number, optional)：对基准时间加减的天数，可为负值。\n  • delta_hours (number, optional)：对基准时间加减的小时数，可为负值。\n  • delta_seconds (number, optional)：对基准时间加减的秒数，可为负值。\n\n输出约定与示例：\n  • 若 format=iso 或 format=all，返回 ISO 8601 字符串，例如 2024-06-10T00:00:00Z。\n  • 若 format=utc 或 format=all，返回 UTC 字符串，例如 2024-06-10 00:00:00 UTC。\n  • 若 format=mjd 或 format=all，返回儒略日数值，例如 59400.0。\n  • 若 format=gpst 或 format=all，返回对象形式，例如 {\"week\": 2291, \"seconds\": 345600.0}。\n  • 返回结果 JSON 可包含 warnings 与 errors 字段，用于说明解析问题或非法输入等。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "time",
+          "arguments": {
+            "format": "$format",
+            "base_time": "$base_time",
+            "delta_days": "$delta_days",
+            "delta_hours": "$delta_hours",
+            "delta_seconds": "$delta_seconds"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "format": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "base_time": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "delta_days": {
+            "type": "number"
+          },
+          "delta_hours": {
+            "type": "number"
+          },
+          "delta_seconds": {
+            "type": "number"
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "gpst_utc",
+      "description": "GPS 时（GPST）与协调世界时（UTC）互转，含 GPS 周/周内秒。\n\n参数：\n- operation（string，必填）：操作：utc_to_gpst / gpst_to_utc / offset\n- time（string，可选）：ISO8601 时间字符串（utc_to_gpst 为 UTC；gpst_to_utc 为 GPST）\n- week（number，可选）：GPS 周 WN（gpst_to_utc 可用 week+tow 代替 time）\n- tow（number，可选）：周内秒 TOW（与 week 配合）\n\n说明：\nGPS 时（GPST）与协调世界时（UTC）互转，含 GPS 周/周内秒。\n\n• utc_to_gpst：给定 UTC 时间，返回 GPST、GPS 周 WN、周内秒 TOW、TAI-UTC 与 GPST-UTC 偏移。\n• gpst_to_utc：给定 GPST 时间（或 week+tow），返回 UTC。\n• offset：返回当前 TAI-UTC 与 GPST-UTC 偏移（不随时间变化，除非新闰秒）。\n\n闰秒表依据 IERS Bulletin C（2017-01-01 起 TAI-UTC=37s）。时间用 ISO8601 字符串。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "gpst_utc",
+          "arguments": {
+            "operation": "$operation",
+            "time": "$time",
+            "week": "$week",
+            "tow": "$tow"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "time": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "week": {
+            "type": "number"
+          },
+          "tow": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "operation"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "leap_seconds",
+      "description": "闰秒表只读查询（TAI-UTC，依据 IERS Bulletin C）。\n\n参数：\n- operation（string，必填）：操作：table（完整表）或 at（某时刻的 TAI-UTC）\n- time（string，可选）：UTC 时间 ISO8601（operation=at 必填）\n\n说明：\n闰秒表只读查询（TAI-UTC，依据 IERS Bulletin C）。\n\n• operation=table：返回 1972 年以来的完整闰秒表。\n• operation=at：给定 UTC 时间，返回该时刻生效的 TAI-UTC 秒数。\n\n当前自 2017-01-01 起 TAI-UTC=37s；IERS Bulletin C 72（2026-07-06）确认 2026 年底无新闰秒。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "leap_seconds",
+          "arguments": {
+            "operation": "$operation",
+            "time": "$time"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "time": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "operation"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "timezone",
+      "description": "IANA 时区换算与 UTC 偏移（系统 tzdata，确定性）。\n\n参数：\n- operation（string，必填）：操作：convert / offset / zones\n- tz（string，可选）：目标 IANA 时区（convert/offset 用），如 Asia/Shanghai\n- time（string，可选）：UTC 时间 ISO8601；留空为当前时间\n- query（string，可选）：时区搜索关键字（zones 用）\n\n说明：\nIANA 时区换算与 UTC 偏移（系统 tzdata，确定性）。\n\n• convert：给定 UTC 时间与目标时区，返回该时区当地时间与 UTC 偏移。\n• offset：给定 IANA 时区与（可选）UTC 时间，返回该时区当时的 UTC 偏移（含夏令时）。\n• zones：按关键字模糊搜索可用的 IANA 时区标识（如 Asia）。\n\n时间输入统一按 UTC 处理；用 ISO8601 字符串。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "timezone",
+          "arguments": {
+            "operation": "$operation",
+            "tz": "$tz",
+            "time": "$time",
+            "query": "$query"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "tz": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "time": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "query": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "operation"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "sidereal",
+      "description": "恒星时计算（IAU 1982 格林尼治恒星时 GMST）。\n\n参数：\n- time（string，可选）：UTC 时间，ISO8601 字符串如 '2024-06-10T00:00:00'；留空为当前时间\n- lon（number，可选）：观测点东经（十进制度），用于计算地方恒星时 LAST\n\n说明：\n恒星时计算（IAU 1982 格林尼治恒星时 GMST）。\n\n给定 UTC 时间与（可选）东经，返回儒略日 JD、简化儒略日 MJD、格林尼治恒星时 GMST、以及地方恒星时 LAST（= GMST + 经度/15）。\n恒星时用于把赤经转换为时角，进而求观测目标的方位/高度角。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "sidereal",
+          "arguments": {
+            "time": "$time",
+            "lon": "$lon"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "time": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "lon": {
+            "type": "number"
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "coor",
+      "description": "多坐标系统转换与相对位置计算工具，严格依赖提供的 params 进行输入，不新增任何额外参数或隐含配置。\n\n参数：\n- input_type（string，必填）：输入坐标类型。可选：cartesian（XYZ），spherical（r,theta,phi），wgs84（lon,lat,h）\n- input_value（string，对象请传 JSON 字符串，必填）：输入坐标值。json结构示例：cartesian: {\"x\":..., \"y\":..., \"z\":...}；spherical: {\"r\":..., \"theta\":..., \"phi\":...}；wgs84: {\"lon\":..., \"lat\":..., \"h\":...}\n- output_type（string，可选）：期望输出坐标类型。可选：cartesian, spherical, wgs84。默认与input_type相同。\n- ref_point（string，对象请传 JSON 字符串，可选）：参考点坐标。json结构同input_value。用于ENU、差分、距离等相对计算。\n- operation（string，必填）：操作类型。可选：convert（坐标转换）、diff（坐标差分）、distance（距离与方位计算）、enu（ENU坐标计算）\n\n说明：\n多坐标系统转换与相对位置计算工具，严格依赖提供的 params 进行输入，不新增任何额外参数或隐含配置。\n\n功能概览：\n• 坐标格式互转：支持笛卡尔 cartesian (XYZ)、球坐标 spherical (r, theta, phi) 与 WGS84 地理坐标 wgs84 (lon, lat, h) 之间的相互转换。 \n• 相对位置描述：支持以指定参考点计算 ENU 东-北-天 坐标、XYZ 差分 dX-dY-dZ、以及方向与距离表示。 \n• 距离与方向计算：计算两点间的空间距离、方位角 azimuth、高度角 elevation 等常用量。 \n• 参考点支持：当进行 enu 或 diff 或 distance 操作时，可通过 ref_point 提供参考点坐标进行相对计算。\n\n输入参数约定（严格按 params）：\n• input_type (string, required)：输入坐标类型，枚举值 cartesian、spherical、wgs84。 \n• input_value (string, required)：输入坐标值，请以 JSON 字符串形式提供。范例格式：\n- cartesian: {\"x\": 123.45, \"y\": 678.90, \"z\": 10.11}\n- spherical: {\"r\": 6800.0, \"theta\": 1.2345, \"phi\": 0.9876}\n- wgs84: {\"lon\": 116.391, \"lat\": 39.9075, \"h\": 100.0}\n注意：JSON 内键名与数值请使用双引号，且数值为数字类型。 \n\n• output_type (string, optional)：期望输出坐标类型，枚举值 cartesian、spherical、wgs84。若未提供则预设与 input_type 相同。 \n• ref_point (string, optional)：参考点坐标，JSON 结构同 input_value，仅在需要相对计算时使用（enu、diff、distance）。 \n• operation (string, required)：操作类型，枚举值 convert、diff、distance、enu，功能含义如下：\n- convert：坐标系之间的数值转换，返回目标坐标类型的值。 \n- diff：计算两点坐标差分（以 input_value 为第一点，ref_point 为第二点）；若 ref_point 未提供则返回错误。 \n- distance：计算两点间距离与方向量（以 input_value 为第一点，ref_point 为第二点）；返回距离、方位角、仰角等；若 ref_point 未提供则返回错误。 \n- enu：以 ref_point 为参考点，计算 input_value 在 ENU 东-北-天 坐标下的分量；若 ref_point 未提供则返回错误。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "coor",
+          "arguments": {
+            "input_type": "$input_type",
+            "input_value": "$input_value",
+            "output_type": "$output_type",
+            "ref_point": "$ref_point",
+            "operation": "$operation"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "input_type": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "input_value": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "output_type": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "ref_point": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "input_type",
+          "input_value",
+          "operation"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "geodesic",
+      "description": "在 WGS84 参考椭球上解算大地线（Vincenty 1975 算法，亚毫米精度）。\n\n参数：\n- operation（string，必填）：解算类型：inverse（两点求距离/方位）或 direct（起点+方位+距离求终点）\n- lat1（number，必填）：起点纬度（十进制度，北纬为正）\n- lon1（number，必填）：起点经度（十进制度，东经为正）\n- lat2（number，可选）：终点纬度（inverse 必填）\n- lon2（number，可选）：终点经度（inverse 必填）\n- azi1（number，可选）：起点正方位角（度，direct 必填）\n- s12（number，可选）：大地线长度（米，direct 必填）\n\n说明：\n在 WGS84 参考椭球上解算大地线（Vincenty 1975 算法，亚毫米精度）。\n\n• operation=inverse：给定两点的纬度/经度，返回大地线长度 s12（米）、起点正方位角 azi1、终点反方位角 azi2（度）。\n• operation=direct：给定起点纬度/经度、正方位角 azi1（度）与大地线长度 s12（米），返回终点纬度/经度与反方位角 azi2。\n\n角度单位均为十进制度（东经/北纬为正），距离单位为米。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "geodesic",
+          "arguments": {
+            "operation": "$operation",
+            "lat1": "$lat1",
+            "lon1": "$lon1",
+            "lat2": "$lat2",
+            "lon2": "$lon2",
+            "azi1": "$azi1",
+            "s12": "$s12"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "lat1": {
+            "type": "number"
+          },
+          "lon1": {
+            "type": "number"
+          },
+          "lat2": {
+            "type": "number"
+          },
+          "lon2": {
+            "type": "number"
+          },
+          "azi1": {
+            "type": "number"
+          },
+          "s12": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "operation",
+          "lat1",
+          "lon1"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "ellipsoid",
+      "description": "参考椭球参数与卯酉圈/子午圈曲率半径查询。\n\n参数：\n- operation（string，必填）：操作：params（椭球参数）或 radii（曲率半径）\n- ellipsoid（string，可选）：参考椭球名：WGS84/GRS80/CGCS2000/PZ90/Clarke1866\n- lat（number，可选）：大地纬度（十进制度，radii 必填）\n\n说明：\n参考椭球参数与卯酉圈/子午圈曲率半径查询。\n\n• operation=params：返回指定参考椭球的半长轴 a、半短轴 b、扁率 f、1/f 与第一偏心率平方 e2。\n• operation=radii：给定大地纬度，返回卯酉圈曲率半径 N、子午圈曲率半径 M 与平均曲率半径 R_mean。\n\n支持椭球：WGS84、GRS80、CGCS2000、PZ90、Clarke1866；长度单位为米。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "ellipsoid",
+          "arguments": {
+            "operation": "$operation",
+            "ellipsoid": "$ellipsoid",
+            "lat": "$lat"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "ellipsoid": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "lat": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "operation"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "eop_query",
+      "description": "查询地球定向参数 EOP（IERS EOP 20 C04，只读）。\n\n参数：\n- operation（string，可选）：latest（默认）/ series / at\n- limit（number，可选）：series 模式返回的最大天数（默认 30）\n- date（string，可选）：at 模式：ISO 日期（YYYY-MM-DD）或 MJD 整数\n\n说明：\n查询地球定向参数 EOP（IERS EOP 20 C04，只读）。\n\n读取 gnss-x-web 的 CelesTrak EOP 日序列，返回极移 (x,y)、UT1-UTC、日长 LOD、章动 (dPsi,dEpsilon)、dX/dY 与 TAI-UTC 闰秒 DAT。\noperation：latest（最新，含预报）/ series（最近 N 天）/ at（按日期或 MJD 就近查询）。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "eop_query",
+          "arguments": {
+            "operation": "$operation",
+            "limit": "$limit",
+            "date": "$date"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "limit": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 200
+          },
+          "date": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "helmert",
+      "description": "Bursa-Wolf 七参数基准转换与 Helmert 二维四参数平面转换（确定性，无 IO）。\n\n参数：\n- operation（string，必填）：apply（正算）/ solve（反算）\n- dim（string，可选）：维数：3（三维七参数，默认）/ 2（二维四参数）\n- points（string，必填）：JSON 字符串：apply={\"source\":[...],\"params\":{...}；solve={\"source\":[...],\"target\":[...]}\n- params（string，可选）：apply 可选：把转换参数作为顶层 JSON 传入（等价于 points.params）\n\n说明：\nBursa-Wolf 七参数基准转换与 Helmert 二维四参数平面转换（确定性，无 IO）。\n\n• operation=apply：按给定参数把源坐标正算到目标基准。3D 参数为 tx/ty/tz（米）、rx/ry/rz（角秒）、scale_ppm（百万分之一）；2D 使用 tx/ty、rz（绕 Z 轴旋转，角秒）与 scale_ppm。\n• operation=solve：由控制点对（源→目标）用线性化最小二乘反算参数；3D 至少 3 对、2D 至少 2 对，并返回残差与 RMS。\n\npoints 传入 JSON 字符串（也接受已解析数组/对象）：apply 为 {\"source\":[[...],...],\"params\":{...}；solve 为 {\"source\":[[...],...],\"target\":[[...],...]}。3D 坐标为 [x,y,z]，2D 为 [x,y]，单位与输入一致（通常为米）。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "helmert",
+          "arguments": {
+            "operation": "$operation",
+            "dim": "$dim",
+            "points": "$points",
+            "params": "$params"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "dim": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "points": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "params": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "operation",
+          "points"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "map_projection",
+      "description": "UTM 与 Gauss-Krüger 横轴墨卡托正反算（确定性，WGS84/CGCS2000 同椭球）。\n\n参数：\n- operation（string，必填）：fwd（正算，经纬度→平面）/ inv（反算，平面→经纬度）\n- system（string，可选）：投影系统：utm（默认）/ gauss_kruger\n- lat_deg（number，可选）：纬度（十进制度，北纬为正，fwd 必填）\n- lon_deg（number，可选）：经度（十进制度，东经为正，fwd 必填）\n- easting_m（number，可选）：东坐标（米，inv 必填）\n- northing_m（number，可选）：北坐标（米，inv 必填）\n- zone（number，可选）：UTM 带号 1..60（缺省由经度推定）；Gauss-Krüger 可选带号\n- central_meridian_deg（number，可选）：中央经线（十进制度，可选，优先于 zone 推算）\n- zone_width_deg（number，可选）：Gauss-Krüger 带宽（度，默认 6）\n- ellipsoid（string，可选）：参考椭球：wgs84（默认）/ cgcs2000（a、f 相同）\n\n说明：\nUTM 与 Gauss-Krüger 横轴墨卡托正反算（确定性，WGS84/CGCS2000 同椭球）。\n\n• operation=fwd：由 lat_deg/lon_deg（十进制度）算 easting_m/northing_m（米）。UTM 缺省按经度推 1..60 带、中央经线 zone*6-183，k0=0.9996、东偏 500000 m、南半球北偏 10000000 m；Gauss-Krüger k0=1.0、东偏 500000 m，中央经线由 zone_width_deg（默认 6）或 central_meridian_deg 给出。\n• operation=inv：由 easting_m/northing_m 反算 lat_deg/lon_deg；需提供 zone 或 central_meridian_deg。\n\n椭球 ellipsoid=wgs84|cgcs2000：二者 a=6378137、f=1/298.257223563 相同。角度为十进制度，距离为米。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "map_projection",
+          "arguments": {
+            "operation": "$operation",
+            "system": "$system",
+            "lat_deg": "$lat_deg",
+            "lon_deg": "$lon_deg",
+            "easting_m": "$easting_m",
+            "northing_m": "$northing_m",
+            "zone": "$zone",
+            "central_meridian_deg": "$central_meridian_deg",
+            "zone_width_deg": "$zone_width_deg",
+            "ellipsoid": "$ellipsoid"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "system": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "lat_deg": {
+            "type": "number"
+          },
+          "lon_deg": {
+            "type": "number"
+          },
+          "easting_m": {
+            "type": "number"
+          },
+          "northing_m": {
+            "type": "number"
+          },
+          "zone": {
+            "type": "number"
+          },
+          "central_meridian_deg": {
+            "type": "number"
+          },
+          "zone_width_deg": {
+            "type": "number"
+          },
+          "ellipsoid": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "operation"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "eci_ecef",
+      "description": "地心惯性系（ECI）与地心地固系（ECEF）坐标互转（确定性，可复用 EOP）。\n\n参数：\n- direction（string，必填）：转换方向：ecef2eci / eci2ecef\n- position_km（string，必填）：位置矢量 [x,y,z]（千米），JSON 字符串或数组\n- time（string，必填）：UTC 时刻（ISO8601，如 2024-01-01T00:00:00Z）\n- frame（string，可选）：旋转角：gmst（默认）/ gast\n- use_polar_motion（string，可选）：是否叠加极移改正：\"true\"/\"false\"（默认 false）\n\n说明：\n地心惯性系（ECI）与地心地固系（ECEF）坐标互转（确定性，可复用 EOP）。\n\n• direction=ecef2eci / eci2ecef：方向（必填）。\n• frame=gmst（默认）/ gast：绕 Z 轴旋转角取格林尼治平/真恒星时；gast 需 EOP 的 Δψ，缺 EOP 时自动退回 GMST 并置 eop_available=false（不报错）。\n• use_polar_motion=true 且 EOP 可用时叠加极移小角度改正（x_p 绕 Y、y_p 绕 X）。\n\nposition_km 为 JSON 字符串（或数组）[x,y,z]，单位千米；time 为 ISO8601 时刻（UTC）；输出 output_km 单位千米。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "eci_ecef",
+          "arguments": {
+            "direction": "$direction",
+            "position_km": "$position_km",
+            "time": "$time",
+            "frame": "$frame",
+            "use_polar_motion": "$use_polar_motion"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "direction": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "position_km": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "time": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "frame": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "use_polar_motion": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "direction",
+          "position_km",
+          "time"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "station_epoch",
+      "description": "测站坐标历元归算（确定性）。\n\n参数：\n- position（string，必填）：位置 [x,y,z]（米）JSON 字符串或数组/对象\n- velocity（string，必填）：速度 [vx,vy,vz]（米/年）JSON 字符串或数组/对象\n- from_epoch（string，可选）：起始历元 ISO 日期（默认 2000-01-01）\n- to_epoch（string，必填）：目标历元 ISO 日期（必填）\n\n说明：\n测站坐标历元归算（确定性）。按线性速度模型 X(t)=X0+V·(t-t0) 把站坐标从 from_epoch 归算到 to_epoch。\n\n• position：位置矢量 [x,y,z]（米），或 {\"x\":..,\"y\":..,\"z\":..}。\n• velocity：速度矢量 [vx,vy,vz]（米/年）。\n• from_epoch（默认 2000-01-01）、to_epoch（必填）为 ISO 日期；Δt 按 365.25 天/年折算为十进制年。\n\nposition/velocity 均为 JSON 字符串（也接受已解析数组/对象）；位移与范数单位为米。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "station_epoch",
+          "arguments": {
+            "position": "$position",
+            "velocity": "$velocity",
+            "from_epoch": "$from_epoch",
+            "to_epoch": "$to_epoch"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "position": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "velocity": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "from_epoch": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "to_epoch": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "position",
+          "velocity",
+          "to_epoch"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "satellite",
+      "description": "卫星相关工具，基于现有输入参数计算导航卫星与低轨 LEO 卫星的轨道、GNSS-LEO 掩星事件及地面站可见性。\n\n参数：\n- start_time（string，必填）：起始时间，ISO8601格式字符串，如'2024-06-10T00:00:00'\n- end_time（string，必填）：结束时间，ISO8601格式字符串，如'2024-06-10T01:00:00'\n- function_type（string，可选）：功能类型。可选：orbits（轨道计算）、events（掩星事件）、visibility（可见性事件）、all（全部功能）\n- nav_satellites（string，可选）：导航卫星筛选，多个卫星名称用逗号分隔，如'G01,G02,C01'。如果整个字符串等于'All'则选择全部导航卫星；不提供或提供空字符串则忽略所有导航卫星\n- leo_satellites（string，可选）：低轨卫星筛选，多个卫星名称用逗号分隔，如'C2E1,FY3D'。如果整个字符串等于'All'则选择全部低轨卫星；不提供或提供空字符串则忽略所有低轨卫星\n- ground_stations（string，可选）：地面站筛选，多个地面站名称用逗号分隔，如'Beijing,Shanghai'。如果整个字符串等于'All'则选择全部地面站；不提供或提供空字符串则忽略所有地面站\n\n说明：\n卫星相关工具，基于现有输入参数计算导航卫星与低轨 LEO 卫星的轨道、GNSS-LEO 掩星事件及地面站可见性。\n\n功能说明：\n• orbits：返回所选卫星在给定时间区间内的轨道时序数据（位置/速度）。 \n• events：返回所选卫星在给定时间区间内的掩星、掩月或掩太阳事件列表，基于几何遮挡判定。 \n• visibility：返回所选卫星与指定地面站在给定时间区间内的可见性时间段与关键信息。 \n• all：同时执行 orbits、events、visibility，返回包含对应顶级键的 JSON。\n\n输入参数约定（严格按 params）：\n• start_time (string, required)：ISO8601 格式起始时间，例如 \"2024-06-10T00:00:00\"。 \n• end_time   (string, required)：ISO8601 格式结束时间，例如 \"2024-06-10T01:00:00\"。 \n• function_type (string, optional)：功能类型，枚举值 [\"orbits\",\"events\",\"visibility\",\"all\"]。 \n• nav_satellites (string, optional)：导航卫星筛选，多个以逗号分隔，例如 \"G01,G02,C01\"；若字符串精确等于 \"All\" 则选择全部导航卫星；未提供或为空字符串则不包含任何导航卫星。 \n• leo_satellites (string, optional)：低轨卫星筛选，多个以逗号分隔，例如 \"C2E1,FY3D\"；若字符串精确等于 \"All\" 则选择全部低轨卫星；未提供或为空字符串则不包含任何 LEO。 \n• ground_stations (string, optional)：地面站筛选，多个以逗号分隔，例如 \"Sanya,Qitaihe,Kashi\"；若字符串精确等于 \"All\" 则选择全部地面站；未提供或为空字符串则不包含任何地面站。\n\n输出约定（JSON）：时间采用 ISO8601 字符串；角度单位为度 deg，位置单位为米 m。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "satellite",
+          "arguments": {
+            "start_time": "$start_time",
+            "end_time": "$end_time",
+            "function_type": "$function_type",
+            "nav_satellites": "$nav_satellites",
+            "leo_satellites": "$leo_satellites",
+            "ground_stations": "$ground_stations"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "start_time": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "end_time": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "function_type": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "nav_satellites": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "leo_satellites": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "ground_stations": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "start_time",
+          "end_time"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "sun_moon",
+      "description": "太阳/月亮视位置与月相（低精度 Meeus 算法，观测规划用）。\n\n参数：\n- time（string，可选）：UTC 时间，ISO8601 字符串；留空为当前时间\n- lat（number，必填）：观测点纬度（十进制度）\n- lon（number，必填）：观测点东经（十进制度）\n- body（string，可选）：目标天体：sun / moon / both\n\n说明：\n太阳/月亮视位置与月相（低精度 Meeus 算法，观测规划用）。\n\n给定 UTC 时间与观测点纬度/经度，返回：\n• 太阳：赤经 ra、赤纬 dec、地平高度 alt、方位 az。\n• 月亮：赤经/赤纬、地平高度/方位、地心距离、月龄 age_days、亮面比例 illumination、相位名称 phase。\n\n精度：太阳 ~0.01°；月亮 ~0.5°（足够用于观测规划，非高精度历表）。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "sun_moon",
+          "arguments": {
+            "time": "$time",
+            "lat": "$lat",
+            "lon": "$lon",
+            "body": "$body"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "time": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "lat": {
+            "type": "number"
+          },
+          "lon": {
+            "type": "number"
+          },
+          "body": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "lat",
+          "lon"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "orbit",
+      "description": "卫星轨道 TLE 编目与星下点传播（只读，教学/演示精度）。\n\n参数：\n- operation（string，可选）：catalog（默认）/ tle / propagate\n- constellation（string，可选）：星座：gps（默认）/ glo / gal / bds / gnss / cygnss\n- satnum（number，可选）：tle/propagate 模式：NORAD 卫星编号\n- time（string，可选）：propagate 模式：ISO 8601 时间（可选，默认当前）\n\n说明：\n卫星轨道 TLE 编目与星下点传播（只读，教学/演示精度）。\n\n读取 gnss-x-web 的星座 TLE 编目（data/orbit/）。\n• catalog：列出某星座卫星（名称/NORAD/历元/根数）。\n• tle：返回某卫星原始 TLE 与解析根数。\n• propagate：J2 长期摄动开普勒传播，返回某时刻星下点经纬度与高度。\n注意：采用确定性 J2 简化模型（非 SGP4），且编目历元可能非实时，仅供教学/粗精度演示。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "orbit",
+          "arguments": {
+            "operation": "$operation",
+            "constellation": "$constellation",
+            "satnum": "$satnum",
+            "time": "$time"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "constellation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "satnum": {
+            "type": "number"
+          },
+          "time": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "space_object",
+      "description": "按 NORAD 编目号查询在轨太空目标（CelesTrak 权威编目，只读）。\n\n参数：\n- operation（string，可选）：操作：lookup（默认）/ gp / propagate / search / group\n- norad_id（number，可选）：NORAD 编目号（支持 6/9 位，如 25544、100534）\n- name（string，可选）：目标名称或其片段（search / gp 用，大小写不敏感）\n- group（string，可选）：CelesTrak 分组名（group 用，如 stations / gps-ops / active）\n- intdes（string，可选）：国际编号（如 1998-067A）\n- special（string，可选）：CelesTrak 特殊数据集（如 GPZ、GPZ-PLUS、DECAYING）\n- time（string，可选）：propagate 模式：ISO 8601 时刻（默认当前 UTC）\n- limit（number，可选）：search/group 返回条数上限（默认 25，最大 500）\n- format（string，可选）：GP 数据格式：CSV（默认，体积最小）/ JSON\n- refresh（boolean，可选）：绕过缓存强制重取（默认 false；CelesTrak 每 2 h 才更新，慎用）\n- allow_network（boolean，可选）：是否允许联网（默认 true；false 时只用镜像/缓存）\n\n说明：\n按 NORAD 编目号查询在轨太空目标（CelesTrak 权威编目，只读）。\n\n数据源：CelesTrak GP 根数（OMM 关键字，默认 CSV）与 SATCAT 编目记录，直连 https://celestrak.org（.com 会 301 并计入其错误预算）。\n\noperation 支持：\n• lookup（默认）：按 norad_id 返回目标识别 + SATCAT 元数据 + GP 根数与派生轨道量（周期/近远地点/轨道类型）。\n• gp：返回原始 GP/OMM 根数（可按 norad_id / name / group / intdes / special 查询）。\n• propagate：按 norad_id 用 SGP4（WGS-72）传播到指定时刻，返回 TEME 位置速度与 WGS84 星下点。\n• search：按名称片段检索（返回精简列表 + limit 截断）。\n• group：按 CelesTrak 分组名检索（如 stations、gps-ops、active；返回精简列表）。\n\n重要限制：\n• TLE 格式无法表示 5 位以上编目号（2026-07-11 起新编目对象均为 6 位），因此默认使用 OMM（CSV/JSON），本工具的 propagate 使用 SGP4 而非 TLE。\n• CelesTrak 的 GP 数据每 2 小时才更新一次，且对同一分组的重复下载会返回 HTTP 403；本工具缓存 ≥2 小时、遇任何 4xx/5xx 立即停止且**不重试**（请勿循环调用）。\n• 复杂/大批量编目请改用 group + limit，避免整包下载。\n本工具需要出网：如部署隔离，可用 CELESTRAK_OFFLINE=1 + 本地镜像（$GNSS_X_DATA_ROOT/data/orbit/celestrak/）离线运行。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "space_object",
+          "arguments": {
+            "operation": "$operation",
+            "norad_id": "$norad_id",
+            "name": "$name",
+            "group": "$group",
+            "intdes": "$intdes",
+            "special": "$special",
+            "time": "$time",
+            "limit": "$limit",
+            "format": "$format",
+            "refresh": "$refresh",
+            "allow_network": "$allow_network"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "norad_id": {
+            "type": "number"
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "group": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "intdes": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "special": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "time": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "limit": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 200
+          },
+          "format": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "refresh": {
+            "type": "boolean"
+          },
+          "allow_network": {
+            "type": "boolean"
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "site_visibility",
+      "description": "任意测站的卫星可见性/过顶时段（TLE，确定性）。\n\n参数：\n- lat_deg（number，必填）：测站纬度（十进制度）\n- lon_deg（number，必填）：测站经度（十进制度）\n- height_m（number，必填）：测站大地高（m）\n- constellation（string，必填）：星座：gps/glo/gal/bds/gnss/cygnss\n- start_time（string，必填）：起始时刻（ISO 8601，UTC）\n- end_time（string，必填）：结束时刻（ISO 8601，UTC）\n- step_s（number，可选）：采样步长（s，默认 60）\n- mask_deg（number，可选）：截止高度角（度，默认 5）\n- satnum（number，可选）：仅统计指定 NORAD 卫星编号（可选）\n\n说明：\n任意测站的卫星可见性/过顶时段（TLE，确定性）。\n\n读取 gnss-x-web 星座 TLE 编目，按给定时间步长解算各卫星相对测站的方位角/仰角/斜距，\n并检出仰角≥截止高度的连续过顶时段（pass）。\n• constellation：gps/glo/gal/bds/gnss/cygnss。\n• start_time/end_time：ISO 8601；step_s 采样步长（s，默认 60）；mask_deg 截止高度角（°，默认 5）。\n• satnum：仅统计指定 NORAD 编号。\n说明：采用 J2 长期摄动开普勒传播（非 SGP4），编目历元可能非实时，仅供教学/粗精度可见性评估。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "site_visibility",
+          "arguments": {
+            "lat_deg": "$lat_deg",
+            "lon_deg": "$lon_deg",
+            "height_m": "$height_m",
+            "constellation": "$constellation",
+            "start_time": "$start_time",
+            "end_time": "$end_time",
+            "step_s": "$step_s",
+            "mask_deg": "$mask_deg",
+            "satnum": "$satnum"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "lat_deg": {
+            "type": "number"
+          },
+          "lon_deg": {
+            "type": "number"
+          },
+          "height_m": {
+            "type": "number"
+          },
+          "constellation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "start_time": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "end_time": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "step_s": {
+            "type": "number",
+            "minimum": 1
+          },
+          "mask_deg": {
+            "type": "number"
+          },
+          "satnum": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "lat_deg",
+          "lon_deg",
+          "height_m",
+          "constellation",
+          "start_time",
+          "end_time"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "drag_acceleration",
+      "description": "大气阻力减速度。\n\n参数：\n- altitude_km（number，必填）：轨道高度（km，近圆）\n- ballistic_coefficient_m2_kg（number，可选）：弹道系数 B（m²/kg，需 > 0），与 cd/area_m2/mass_kg 二选一\n- cd（number，可选）：阻力系数 Cd（无量纲，与 B 二选一）\n- area_m2（number，可选）：迎风面积 A（m²，与 B 二选一）\n- mass_kg（number，可选）：质量 m（kg，与 B 二选一）\n- inclination_deg（number，可选）：轨道倾角 i（°，默认 90）\n- include_atmosphere_rotation（boolean，可选）：是否计入大气共转（默认 true）\n- density_kg_m3（number，可选）：大气密度 ρ（kg/m³），给出则直接用（离线）\n- datetime（string，可选）：时刻（ISO-8601），未给出 density_kg_m3 时必填\n- f107（number，可选）：F10.7 太阳射电流量（sfu，可选）\n- f107a（number，可选）：F10.7 81 天均值（sfu，可选）\n- ap（number，可选）：Ap 地磁指数（可选）\n- version（string，可选）：NRLMSIS 版本：0 / 2.0 / 2.1（默认 2.1）\n- allow_network_fetch（boolean，可选）：是否允许联网获取驱动量（默认 true）\n\n说明：\n大气阻力减速度。\n\n给定轨道高度（km）与弹道系数 B（m²/kg；或由 cd、area_m2、mass_kg 换算），按近圆假设计算：\n• v_orb = √(μ/a)，v_atm = ω_E·a·cos(i)，v_rel = v_orb − v_atm（m/s）；\n• 动压 q = 0.5·ρ·v_rel²（Pa），减速度 a = q·B（m/s²）。\n\n密度 ρ（kg/m³）：可直接给出 density_kg_m3；否则需给出 datetime，并调用 NRLMSIS 取赤道/本初子午线（0°N, 0°E）单点密度。太阳/地磁驱动 f107、f107a、ap 可显式给出（离线确定性），缺失时按 allow_network_fetch 联网获取。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "drag_acceleration",
+          "arguments": {
+            "altitude_km": "$altitude_km",
+            "ballistic_coefficient_m2_kg": "$ballistic_coefficient_m2_kg",
+            "cd": "$cd",
+            "area_m2": "$area_m2",
+            "mass_kg": "$mass_kg",
+            "inclination_deg": "$inclination_deg",
+            "include_atmosphere_rotation": "$include_atmosphere_rotation",
+            "density_kg_m3": "$density_kg_m3",
+            "datetime": "$datetime",
+            "f107": "$f107",
+            "f107a": "$f107a",
+            "ap": "$ap",
+            "version": "$version",
+            "allow_network_fetch": "$allow_network_fetch"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "altitude_km": {
+            "type": "number"
+          },
+          "ballistic_coefficient_m2_kg": {
+            "type": "number"
+          },
+          "cd": {
+            "type": "number"
+          },
+          "area_m2": {
+            "type": "number"
+          },
+          "mass_kg": {
+            "type": "number"
+          },
+          "inclination_deg": {
+            "type": "number"
+          },
+          "include_atmosphere_rotation": {
+            "type": "boolean"
+          },
+          "density_kg_m3": {
+            "type": "number"
+          },
+          "datetime": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "f107": {
+            "type": "number"
+          },
+          "f107a": {
+            "type": "number"
+          },
+          "ap": {
+            "type": "number"
+          },
+          "version": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "allow_network_fetch": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "altitude_km"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "orbit_decay_rate",
+      "description": "近圆轨道衰减率。\n\n参数：\n- altitude_km（number，必填）：轨道高度（km，近圆）\n- ballistic_coefficient_m2_kg（number，可选）：弹道系数 B（m²/kg，需 > 0），与 cd/area_m2/mass_kg 二选一\n- cd（number，可选）：阻力系数 Cd（无量纲，与 B 二选一）\n- area_m2（number，可选）：迎风面积 A（m²，与 B 二选一）\n- mass_kg（number，可选）：质量 m（kg，与 B 二选一）\n- density_kg_m3（number，可选）：大气密度 ρ（kg/m³），给出则直接用（离线）\n- datetime（string，可选）：时刻（ISO-8601），未给出 density_kg_m3 时必填\n- orbit_averaged（boolean，可选）：是否沿轨道多点平均密度（默认 false）\n- inclination_deg（number，可选）：轨道倾角 i（°，默认 51.6）\n- include_atmosphere_rotation（boolean，可选）：是否按 v_rel 计入大气共转（默认 false；true 时衰减率约小 8% @400 km/51.6°）\n- f107（number，可选）：F10.7 太阳射电流量（sfu，可选）\n- f107a（number，可选）：F10.7 81 天均值（sfu，可选）\n- ap（number，可选）：Ap 地磁指数（可选）\n- version（string，可选）：NRLMSIS 版本：0 / 2.0 / 2.1（默认 2.1）\n- allow_network_fetch（boolean，可选）：是否允许联网获取驱动量（默认 true）\n\n说明：\n近圆轨道衰减率。\n\n给定轨道高度（km）与弹道系数 B（m²/kg；或由 cd、area_m2、mass_kg 换算），计算：\n• da/dt = −ρ·B·√(μ·a)（m/s），等价高度衰减率 daltitude/dt；\n• dT/dt = (3T/2a)·(da/dt)，dn/dt = −(3n/2a)·(da/dt)。\n\n上述为经典一阶结果（Vallado/King-Hele，取惯性圆轨道速度 v=√(μ/a)），与 orbit_lifetime 的积分口径一致，并对应解析寿命估计 t≈H/(ρ·B·√(μ·a))。drag_acceleration 默认使用相对大气速度 v_rel（计入共转，400 km/51.6° 时比 v 小约 4%，衰减率小约 8%）；若需与该口径一致，置 include_atmosphere_rotation=true，此时 da/dt 乘以 (v_rel/v_orb)²，并在 inertial_factor 中回显。\n\n密度 ρ（kg/m³）：可直接给出 density_kg_m3；否则需给出 datetime。orbit_averaged=true 时沿轨道多点平均 NRLMSIS 密度（需倾角），否则取赤道/本初子午线（0°N, 0°E）单点密度。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "orbit_decay_rate",
+          "arguments": {
+            "altitude_km": "$altitude_km",
+            "ballistic_coefficient_m2_kg": "$ballistic_coefficient_m2_kg",
+            "cd": "$cd",
+            "area_m2": "$area_m2",
+            "mass_kg": "$mass_kg",
+            "density_kg_m3": "$density_kg_m3",
+            "datetime": "$datetime",
+            "orbit_averaged": "$orbit_averaged",
+            "inclination_deg": "$inclination_deg",
+            "include_atmosphere_rotation": "$include_atmosphere_rotation",
+            "f107": "$f107",
+            "f107a": "$f107a",
+            "ap": "$ap",
+            "version": "$version",
+            "allow_network_fetch": "$allow_network_fetch"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "altitude_km": {
+            "type": "number"
+          },
+          "ballistic_coefficient_m2_kg": {
+            "type": "number"
+          },
+          "cd": {
+            "type": "number"
+          },
+          "area_m2": {
+            "type": "number"
+          },
+          "mass_kg": {
+            "type": "number"
+          },
+          "density_kg_m3": {
+            "type": "number"
+          },
+          "datetime": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "orbit_averaged": {
+            "type": "boolean"
+          },
+          "inclination_deg": {
+            "type": "number"
+          },
+          "include_atmosphere_rotation": {
+            "type": "boolean"
+          },
+          "f107": {
+            "type": "number"
+          },
+          "f107a": {
+            "type": "number"
+          },
+          "ap": {
+            "type": "number"
+          },
+          "version": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "allow_network_fetch": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "altitude_km"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "orbit_lifetime",
+      "description": "轨道寿命量级估计。\n\n参数：\n- datetime（string，必填）：起始时刻（ISO-8601 字符串，必填）\n- altitude_km（number，必填）：初始高度（km，需 > decay_altitude_km）\n- ballistic_coefficient_m2_kg（number，可选）：弹道系数 B（m²/kg，需 > 0），与 cd/area_m2/mass_kg 二选一\n- cd（number，可选）：阻力系数 Cd（无量纲，与 B 二选一）\n- area_m2（number，可选）：迎风面积 A（m²，与 B 二选一）\n- mass_kg（number，可选）：质量 m（kg，与 B 二选一）\n- inclination_deg（number，可选）：轨道倾角 i（°，默认 51.6）\n- decay_altitude_km（number，可选）：再入判据高度（km，默认 120）\n- step_days（number，可选）：积分步长（天，默认 1.0，需 > 0）\n- max_days（number，可选）：积分上限（天，默认 36500）\n- f107（number，可选）：F10.7 太阳射电流量（sfu，可选）\n- f107a（number，可选）：F10.7 81 天均值（sfu，可选）\n- ap（number，可选）：Ap 地磁指数（可选）\n- version（string，可选）：NRLMSIS 版本：0 / 2.0 / 2.1（默认 2.1）\n- allow_network_fetch（boolean，可选）：是否允许联网获取驱动量（默认 true）\n\n说明：\n轨道寿命量级估计。\n\n给定 datetime、初始高度（km）与弹道系数 B（m²/kg；或由 cd、area_m2、mass_kg 换算），以 step_days 为步长前向积分 drag 衰减（da/dt = −ρ·B·√(μ·a)，每步沿轨道多点平均 NRLMSIS 密度、驱动量恒定），直到高度降至 decay_altitude_km（默认 120 km）或达到 max_days（默认 36500 天）。\n\n返回 lifetime_days / lifetime_years、高度-密度曲线 curve 与 assumptions。结果为量级估计，非精密定轨预报。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "orbit_lifetime",
+          "arguments": {
+            "datetime": "$datetime",
+            "altitude_km": "$altitude_km",
+            "ballistic_coefficient_m2_kg": "$ballistic_coefficient_m2_kg",
+            "cd": "$cd",
+            "area_m2": "$area_m2",
+            "mass_kg": "$mass_kg",
+            "inclination_deg": "$inclination_deg",
+            "decay_altitude_km": "$decay_altitude_km",
+            "step_days": "$step_days",
+            "max_days": "$max_days",
+            "f107": "$f107",
+            "f107a": "$f107a",
+            "ap": "$ap",
+            "version": "$version",
+            "allow_network_fetch": "$allow_network_fetch"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "datetime": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "altitude_km": {
+            "type": "number"
+          },
+          "ballistic_coefficient_m2_kg": {
+            "type": "number"
+          },
+          "cd": {
+            "type": "number"
+          },
+          "area_m2": {
+            "type": "number"
+          },
+          "mass_kg": {
+            "type": "number"
+          },
+          "inclination_deg": {
+            "type": "number"
+          },
+          "decay_altitude_km": {
+            "type": "number"
+          },
+          "step_days": {
+            "type": "number",
+            "minimum": 0.01
+          },
+          "max_days": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 36500
+          },
+          "f107": {
+            "type": "number"
+          },
+          "f107a": {
+            "type": "number"
+          },
+          "ap": {
+            "type": "number"
+          },
+          "version": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "allow_network_fetch": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "datetime",
+          "altitude_km"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "tec_query",
+      "description": "查询全球 vTEC（垂直总电子含量，TECU，只读）。\n\n参数：\n- lat（number，必填）：目标纬度（十进制度，-87.5~87.5）\n- lon（number，必填）：目标经度（十进制度，-180~180）\n- time（string，可选）：ISO 8601 时间（可选，默认最新帧）\n\n说明：\n查询全球 vTEC（垂直总电子含量，TECU，只读）。\n\n数据源为 gnss-x-web 预计算的 WHU RT-GIMAS 实时 IONEX 网格（71×73，5 分钟步长）。\n给定 (lat, lon) 与可选 ISO 时间，返回双线性插值的 vTEC；time 缺省取最新帧。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "tec_query",
+          "arguments": {
+            "lat": "$lat",
+            "lon": "$lon",
+            "time": "$time"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "lat": {
+            "type": "number"
+          },
+          "lon": {
+            "type": "number"
+          },
+          "time": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "lat",
+          "lon"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "vtec_map",
+      "description": "全球 vTEC 图概览与剖面（WHU GIM，只读）。\n\n参数：\n- operation（string，可选）：summary（默认）/ profile\n- lat（number，可选）：profile：固定纬度（提取经度剖面）\n- lon（number，可选）：profile：固定经度（提取纬度剖面）\n- time（string，可选）：ISO 8601 时间（可选，默认最新帧）\n\n说明：\n全球 vTEC 图概览与剖面（WHU GIM，只读）。\n\n• summary：返回最新帧全局统计（max/median）与 24h 时间范围。\n• profile：固定纬度（传 lat）提取经度剖面，或固定经度（传 lon）提取纬度剖面。\ntime 缺省取最新帧。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "vtec_map",
+          "arguments": {
+            "operation": "$operation",
+            "lat": "$lat",
+            "lon": "$lon",
+            "time": "$time"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "lat": {
+            "type": "number"
+          },
+          "lon": {
+            "type": "number"
+          },
+          "time": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "stec_query",
+      "description": "斜向电子总含量 sTEC 与电离层定位时延（只读）。\n\n参数：\n- operation（string，可选）：point（默认）/ series\n- lat（number，必填）：接收机纬度（十进制度，-90~90）\n- lon（number，必填）：接收机经度（十进制度，-180~180）\n- elev（number，必填）：卫星高度角（度，0~90）\n- az（number，可选）：卫星方位角（度，0~360，缺省 180 即正南）\n- time（string，可选）：ISO 8601 时间（可选，默认最新帧）\n- band（string，可选）：GNSS 频点：l1（默认）/ l2 / l5 / e1 / e5a / b1i / b3i\n- frequency_mhz（number，可选）：自定义载波频率（MHz，覆盖 band）\n\n说明：\n斜向电子总含量 sTEC 与电离层定位时延（只读）。\n\n基于 gnss-x-web WHU GIM 全球 vTEC 网格，用薄壳模型（壳高 450 km）将接收机处的垂直 TEC 映射为给定高度角/方位角方向上的斜向 TEC，并按载波频率换算一阶电离层群延迟（伪距，米/纳秒）与相位超前（载波，米/纳秒）。\n• operation=point：返回某时 IPP、vTEC、映射因子、sTEC 与延迟。\n• operation=series：返回滚动 24h 的 sTEC 序列（elev/az 固定）。\nband 可选 l1/l2/l5/e1/e5a/b1i/b3i，或直接用 frequency_mhz 指定频率。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "stec_query",
+          "arguments": {
+            "operation": "$operation",
+            "lat": "$lat",
+            "lon": "$lon",
+            "elev": "$elev",
+            "az": "$az",
+            "time": "$time",
+            "band": "$band",
+            "frequency_mhz": "$frequency_mhz"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "lat": {
+            "type": "number"
+          },
+          "lon": {
+            "type": "number"
+          },
+          "elev": {
+            "type": "number"
+          },
+          "az": {
+            "type": "number"
+          },
+          "time": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "band": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "frequency_mhz": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "lat",
+          "lon",
+          "elev"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "ionosonde",
+      "description": "全球电离层测高仪数据（foF2/NmF2 等，只读）。\n\n参数：\n- operation（string，可选）：stations（默认）/ summary / series / snapshot / history\n- parameter（string，可选）：series 模式的参数：fof2（默认）/ hmf2 / tec / foe / mufd；history 模式：fof2 / hmf2 / foe / foes / mufd / b0 / fof1 / fbes / foea / fop / fxi / hmf1 / hme / yf2 / yf1 / ye / b1\n- station（string，可选）：history 模式：测站 ID（如 AT138），必填\n- days（integer，可选）：history 模式：返回最近 N 天（1-30，默认 7）\n- bin_minutes（integer，可选）：history 模式：降采样间隔（分钟）：5（默认，原始采样）/ 15 / 30 / 60\n- time（string，可选）：snapshot 模式：ISO 8601 时间（可选，默认最新）\n\n说明：\n全球电离层测高仪数据（foF2/NmF2 等，只读）。\n\n读取 gnss-x-web 汇总的全球测高仪网，支持：\n• stations：返回测站列表与经纬度、参数定义。\n• summary：返回各参数全球统计（mean/median/min/max）与昼夜对比。\n• series：返回某参数全球中位数时序（fof2/hmf2/tec/foe/mufd）。\n• snapshot：返回某时刻全站参数快照（含经纬度，便于绘制地图）。\n• history：返回某测站、某参数最近 N 天的历史序列（读取逐日原始 is 数据，5 分钟采样可降采样）。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "ionosonde",
+          "arguments": {
+            "operation": "$operation",
+            "parameter": "$parameter",
+            "station": "$station",
+            "days": "$days",
+            "bin_minutes": "$bin_minutes",
+            "time": "$time"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "parameter": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "station": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "days": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 30
+          },
+          "bin_minutes": {
+            "type": "integer",
+            "enum": [
+              5,
+              15,
+              30,
+              60
+            ]
+          },
+          "time": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "nequick_vtec",
+      "description": "NeQuick2（ITU-R P.531 / NeQuickJRC 1.0.0）垂直电子总含量 vTEC。\n\n参数：\n- datetime（string，必填）：UTC 时刻（ISO-8601，如 2025-03-21T12:00:00Z）\n- latitude_deg（number，必填）：纬度（°，-90~90，北正）\n- longitude_deg（number，必填）：经度（°，-180~180，东正）\n- az（number，可选）：常数有效电离水平 Az（0~400，与 coefficients 互斥）\n- coefficients（string，可选）：MODIP 系数 a0,a1,a2（逗号/分号分隔或 [..]，与 az 互斥）\n- solar_source（string，可选）：太阳活动查表来源：auto（默认；本地参数文件 → spaceweather 数据源）/ local（仅本地 ../data）/ online（仅 spaceweather）/ none（不查表，用 NeQuick 默认）\n- f107（number，可选）：显式 F10.7（sfu）→ Az=F10.7（与 coefficients/az/r12 互斥）\n- r12（number，可选）：显式 12 月平滑太阳黑子数 R12 → Az（与 coefficients/az/f107 互斥）\n\n说明：\nNeQuick2（ITU-R P.531 / NeQuickJRC 1.0.0）垂直电子总含量 vTEC。\n\n给定 UTC 时刻与地面点经纬度，返回垂直 TEC（TECU，1 TECU = 1e16 el/m²）及驱动信息。\n\n驱动机制：NeQuick2 由 Galileo 型有效电离水平系数 (a0,a1,a2) 驱动，Az = a0 + a1·MODIP + a2·MODIP²（MODIP 为改进磁倾纬度，Az 截断至 [0,400]；三系数全零时取模型默认 Az=63.7）。\n• coefficients：显式三系数（字符串，如 \"236.831641,-0.39362878,0.00402826613\" 或 \"[236.831641,-0.39362878,0.00402826613]\"，逗号或分号分隔）；\n• az：常数有效电离水平（0–400），等价于 (az,0,0)，Az 全球一致；\n• f107：显式 F10.7（sfu），ICD 指出 Az 等价于气候学 NeQuick 的 F10.7，故 Az=f107；\n• r12：显式 12 月平滑太阳黑子数，AzR 等价于 R12，取 ICD 式(19) 反变换；\n• coefficients/az/f107/r12 四者互斥；\n• solar_source：查表来源 auto（默认，本地 ../data 参数文件 → spaceweather）/ local / online / none；查表未命中则回退 NeQuick2 默认 Az=63.7。\n本包不含 CCIR/ITU-R 系数图：系数须由调用方提供，或由本工具按实测太阳活动反演 Az（结果在 solar 字段给出文件与 sha256 溯源）。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "nequick_vtec",
+          "arguments": {
+            "datetime": "$datetime",
+            "latitude_deg": "$latitude_deg",
+            "longitude_deg": "$longitude_deg",
+            "az": "$az",
+            "coefficients": "$coefficients",
+            "solar_source": "$solar_source",
+            "f107": "$f107",
+            "r12": "$r12"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "datetime": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "latitude_deg": {
+            "type": "number"
+          },
+          "longitude_deg": {
+            "type": "number"
+          },
+          "az": {
+            "type": "number"
+          },
+          "coefficients": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "solar_source": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "f107": {
+            "type": "number"
+          },
+          "r12": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "datetime",
+          "latitude_deg",
+          "longitude_deg"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "nequick_stec",
+      "description": "NeQuick2（ITU-R P.531 / NeQuickJRC 1.0.0）斜向电子总含量 sTEC。\n\n参数：\n- datetime（string，必填）：UTC 时刻（ISO-8601，如 2025-03-21T12:00:00Z）\n- station_longitude_deg（number，必填）：测站经度（°，-180~180，东正）\n- station_latitude_deg（number，必填）：测站纬度（°，-90~90，北正）\n- station_altitude_m（number，必填）：测站高度（米，≥0）\n- satellite_longitude_deg（number，必填）：卫星经度（°，-180~180，东正）\n- satellite_latitude_deg（number，必填）：卫星纬度（°，-90~90，北正）\n- satellite_altitude_m（number，必填）：卫星高度（米，须大于测站高度）\n- az（number，可选）：常数有效电离水平 Az（0~400，与 coefficients 互斥）\n- coefficients（string，可选）：MODIP 系数 a0,a1,a2（逗号/分号分隔或 [..]，与 az 互斥）\n- solar_source（string，可选）：太阳活动查表来源：auto（默认；本地参数文件 → spaceweather 数据源）/ local（仅本地 ../data）/ online（仅 spaceweather）/ none（不查表，用 NeQuick 默认）\n- f107（number，可选）：显式 F10.7（sfu）→ Az=F10.7（与 coefficients/az/r12 互斥）\n- r12（number，可选）：显式 12 月平滑太阳黑子数 R12 → Az（与 coefficients/az/f107 互斥）\n\n说明：\nNeQuick2（ITU-R P.531 / NeQuickJRC 1.0.0）斜向电子总含量 sTEC。\n\n给定 UTC 时刻、测站与卫星的经纬度/高度，返回测站—卫星射线路径上的斜向 TEC（TECU，1 TECU = 1e16 el/m²）及卫星星下点垂直 TEC、倾斜因子（obliquity）。\n\n高度单位为米（metre）：station_altitude_m、satellite_altitude_m，且卫星高度须大于测站高度。\n\n用途：GNSS 电离层延迟的一阶改正——群延迟 Δρ = 40.3·STEC/f²（SI：f 为载波频率 Hz，STEC 转为 el/m²），L1（1575.42 MHz）时 1 TECU ≈ 0.162 m。\n\n驱动机制同 nequick_vtec：由 (a0,a1,a2) 定义 Az = a0 + a1·MODIP + a2·MODIP²（截断 [0,400]，全零 → Az=63.7）；coefficients/az/f107/r12 四者互斥，均不提供时按 solar_source 查表（默认 auto：本地 ../data 参数文件 → spaceweather 数据源），查表未命中则回退 NeQuick2 默认 Az=63.7。本包不含 CCIR 系数图：系数须由调用方提供，或由本工具按实测太阳活动反演 Az。结果在 solar 字段给出文件与 sha256 溯源。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "nequick_stec",
+          "arguments": {
+            "datetime": "$datetime",
+            "station_longitude_deg": "$station_longitude_deg",
+            "station_latitude_deg": "$station_latitude_deg",
+            "station_altitude_m": "$station_altitude_m",
+            "satellite_longitude_deg": "$satellite_longitude_deg",
+            "satellite_latitude_deg": "$satellite_latitude_deg",
+            "satellite_altitude_m": "$satellite_altitude_m",
+            "az": "$az",
+            "coefficients": "$coefficients",
+            "solar_source": "$solar_source",
+            "f107": "$f107",
+            "r12": "$r12"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "datetime": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "station_longitude_deg": {
+            "type": "number"
+          },
+          "station_latitude_deg": {
+            "type": "number"
+          },
+          "station_altitude_m": {
+            "type": "number"
+          },
+          "satellite_longitude_deg": {
+            "type": "number"
+          },
+          "satellite_latitude_deg": {
+            "type": "number"
+          },
+          "satellite_altitude_m": {
+            "type": "number"
+          },
+          "az": {
+            "type": "number"
+          },
+          "coefficients": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "solar_source": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "f107": {
+            "type": "number"
+          },
+          "r12": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "datetime",
+          "station_longitude_deg",
+          "station_latitude_deg",
+          "station_altitude_m",
+          "satellite_longitude_deg",
+          "satellite_latitude_deg",
+          "satellite_altitude_m"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "klobuchar",
+      "description": "GPS 广播电离层延迟模型（ICD-GPS-200，确定性）。\n\n参数：\n- lat_deg（number，必填）：测站纬度（十进制度）\n- lon_deg（number，必填）：测站经度（十进制度）\n- azimuth_deg（number，必填）：卫星方位角（度，自北顺时针）\n- elevation_deg（number，必填）：卫星仰角（度，[0,90]）\n- gpst_seconds_of_week（number，必填）：GPST 周内秒（s，[0,604800)）\n- alpha（string，可选）：4 元 alpha 系数（JSON 数组或逗号分隔字符串，可选，默认 ICD 值）\n- beta（string，可选）：4 元 beta 系数（JSON 数组或逗号分隔字符串，可选，默认 ICD 值）\n\n说明：\nGPS 广播电离层延迟模型（ICD-GPS-200，确定性）。\n\n由测站位置、方位角/仰角与 GPST 周内秒，计算 L1 电离层斜路径延迟（m/ns）与穿刺点位置。\n• 输入角度均以度为单位；GPST 周内秒为 [0, 604800)。\n• alpha/beta 为 4 元系数，可用 JSON 数组字符串（如 \"[1e-8,1e-8,0,0]\"）或逗号分隔字符串；省略时用 ICD 默认值。\n• 输出含 L1 延迟、TECU、幅度/周期、倾斜因子 F 与穿刺点（IPP）/地磁纬度。\n说明：广播模型为经验近似，仅反映电离层主延迟，不含更高阶项与实时扰动。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "klobuchar",
+          "arguments": {
+            "lat_deg": "$lat_deg",
+            "lon_deg": "$lon_deg",
+            "azimuth_deg": "$azimuth_deg",
+            "elevation_deg": "$elevation_deg",
+            "gpst_seconds_of_week": "$gpst_seconds_of_week",
+            "alpha": "$alpha",
+            "beta": "$beta"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "lat_deg": {
+            "type": "number"
+          },
+          "lon_deg": {
+            "type": "number"
+          },
+          "azimuth_deg": {
+            "type": "number"
+          },
+          "elevation_deg": {
+            "type": "number"
+          },
+          "gpst_seconds_of_week": {
+            "type": "number"
+          },
+          "alpha": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "beta": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "lat_deg",
+          "lon_deg",
+          "azimuth_deg",
+          "elevation_deg",
+          "gpst_seconds_of_week"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "kp_index",
+      "description": "太阳活动指数（Kp/Ap/F10.7/太阳黑子/地磁扰动，只读）。\n\n参数：\n- operation（string，可选）：latest（默认）/ series\n- index（string，可选）：指数：kp（默认）/ ap / f107 / isn / cp\n- limit（number，可选）：series 模式返回的最大点数（默认 24）\n\n说明：\n太阳活动指数（Kp/Ap/F10.7/太阳黑子/地磁扰动，只读）。\n\n读取 gnss-x-web 的 chart_series，支持 index=kp（3小时）/ ap / f107 / isn / cp。\nKp 分类：quiet(<4) / active(4-5) / minor_storm(5-6) / moderate_storm(6-7) / strong_storm(≥7)。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "kp_index",
+          "arguments": {
+            "operation": "$operation",
+            "index": "$index",
+            "limit": "$limit"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "index": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "limit": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 200
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "dst_index",
+      "description": "地磁 Dst 指数（Kyoto WDC 实时，只读）。\n\n参数：\n- operation（string，可选）：latest（默认）/ series\n- limit（number，可选）：series 模式返回的最大点数（默认 24）\n\n说明：\n地磁 Dst 指数（Kyoto WDC 实时，只读）。\n\n读取 gnss-x-web 的 dst-kyoto 小时序列，返回最新值/分类或最近 N 小时序列。\n分类：quiet(>-20) / disturbed(>-50) / moderate_storm(>-100) / intense_storm(>-200) / super_storm(≤-200) nT。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "dst_index",
+          "arguments": {
+            "operation": "$operation",
+            "limit": "$limit"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "limit": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 200
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "solar_wind",
+      "description": "太阳风参数（DSCOVR L1，只读）。\n\n参数：\n- operation（string，可选）：latest（默认）/ series\n- limit（number，可选）：series 模式返回的最大点数（默认 10）\n\n说明：\n太阳风参数（DSCOVR L1，只读）。\n\n读取 gnss-x-web 的 1 分钟太阳风磁场/等离子体数据，返回 Bt/Bz/速度/密度/温度/phi 的最新值或最近 N 点序列。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "solar_wind",
+          "arguments": {
+            "operation": "$operation",
+            "limit": "$limit"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "limit": {
+            "type": "number",
+            "minimum": 1,
+            "maximum": 200
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "pressure_altitude",
+      "description": "国际标准大气（ISA）气压高度换算。\n\n参数：\n- operation（string，必填）：操作：altitude_from_pressure / pressure_from_altitude\n- pressure_hpa（number，可选）：气压（hPa，altitude_from_pressure 用）\n- altitude_m（number，可选）：高度（米，pressure_from_altitude 用）\n\n说明：\n国际标准大气（ISA）气压高度换算。\n\n• altitude_from_pressure：给定气压（hPa），返回标准大气高度（米）。\n• pressure_from_altitude：给定高度（米），返回标准大气压（hPa）。\n\n适用对流层（0–11 km），公式：P=P0·(T/T0)^(gM/RL)。超出范围返回估计并标注。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "pressure_altitude",
+          "arguments": {
+            "operation": "$operation",
+            "pressure_hpa": "$pressure_hpa",
+            "altitude_m": "$altitude_m"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "pressure_hpa": {
+            "type": "number"
+          },
+          "altitude_m": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "operation"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "typhoon",
+      "description": "CMA 台风报文（路径/强度/风圈，只读）。\n\n参数：\n- operation（string，可选）：list（默认）/ track\n- storm_id（string，可选）：track 模式：台风编号（如 2410）\n\n说明：\nCMA 台风报文（路径/强度/风圈，只读）。\n\n读取 gnss-x-web 的 CMA 主观预报报文（data/atm/storms/<编号>.txt）。\n• list：列出可用台风编号。\n• track：返回某台风最新报文（当前位置/强度/移向移速/风圈）+ 未来 P+12h..P+120h 预报路径。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "typhoon",
+          "arguments": {
+            "operation": "$operation",
+            "storm_id": "$storm_id"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "storm_id": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "high_impact_weather",
+      "description": "由垂直探空计算高影响天气（强对流）指数（确定性、离线）。\n\n参数：\n- sounding（string，必填）：探空层次数组（JSON 字符串或数组），每层 pressure_hpa/temperature_c/dewpoint_c/height_m/wind_speed_mps/wind_dir_deg\n- station_height_m（number，可选）：测站海拔（m ASL，仅用于 0 ℃ 层的 ASL 折算）\n- li_start_pressure_hpa（number，可选）：LI/CAPE 的起始层气压（默认地面）\n- max_wind_layer_m（number，可选）：最大风/大风判据的高度层（默认 5000 m AGL）\n- shear_deep_layer_m（number，可选）：深层切变层顶（默认 6000 m AGL，用于 BRN）\n- shear_low_layer_m（number，可选）：低层切变层顶（默认 500 m AGL，用于 BRN）\n- include_levels（boolean，可选）：是否回显规范化后的层次（含重建高度，默认 true）\n\n说明：\n由垂直探空计算高影响天气（强对流）指数（确定性、离线）。\n\n输入 sounding：层次数组（或 JSON 字符串），每层字段\n  pressure_hpa（必填；别名 p/pressure）、temperature_c（必填；t）、\n  dewpoint_c（推荐；td/dewpoint，缺省则该层参与的指数记 null）、\n  height_m（可选；缺省时按静力方程自地面 0 m AGL 重建）、\n  wind_speed_mps + wind_dir_deg（可选；测风层最大风与 BRN 需要）。\nheight_m 语义为**地面以上高度（AGL）**；station_height_m 仅用于把 0 ℃ 层\n同时折算为海拔（ASL），不参与垂直积分。\n\n输出指数：\n• 稳定度：沙氏指数 SI、抬升指数 LI、最佳抬升指数 BLI、K 指数、修正 K 指数 MK、全总指数 TT。\n• 强天气威胁指数 SWEAT（含各分项与零化条件）。\n• 冰雹指数：0 ℃ 层高度 ZHT（AGL/ASL）与 1524–3658 m、2134–3353 m 统计带判据。\n• 能量与切变：CAPE、CIN、LFC/EL、LCL，0–6 km 与 0–500 m 密度加权平均风、\n  体扫切变 Δu 与粗里查逊数 BRN。\n• 大风/雷暴大风判据：0–5 km 最大风 >20 m/s。\n\n确定性保证：纯解析计算，无网络、无隐式气候值；缺露点/风场时对应指数返回 null，\n并在 unavailable 中给出原因，绝不臆造数值。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "high_impact_weather",
+          "arguments": {
+            "sounding": "$sounding",
+            "station_height_m": "$station_height_m",
+            "li_start_pressure_hpa": "$li_start_pressure_hpa",
+            "max_wind_layer_m": "$max_wind_layer_m",
+            "shear_deep_layer_m": "$shear_deep_layer_m",
+            "shear_low_layer_m": "$shear_low_layer_m",
+            "include_levels": "$include_levels"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sounding": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "station_height_m": {
+            "type": "number"
+          },
+          "li_start_pressure_hpa": {
+            "type": "number"
+          },
+          "max_wind_layer_m": {
+            "type": "number"
+          },
+          "shear_deep_layer_m": {
+            "type": "number"
+          },
+          "shear_low_layer_m": {
+            "type": "number"
+          },
+          "include_levels": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "sounding"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "cira_profile",
+      "description": "CIRA-72 经验大气廓线（月纬向平均，0–120 km）。\n\n参数：\n- month（number，必填）：月份（1–12 的整数）\n- latitude_deg（number，必填）：纬度（°，-90–90，北正）\n- height_km（number，可选）：单一高度（km），与 height_range_km 二选一\n- height_range_km（string，可选）：高度范围：\"[h0,h1]\" 或 \"h0,h1\"（km，0–120），与 height_km 二选一\n- step_km（number，可选）：height_range_km 的高度步长（km，默认 1.0）\n- month_mode（string，可选）：月份插值方式：nearest / linear（默认 nearest）\n\n说明：\nCIRA-72 经验大气廓线（月纬向平均，0–120 km）。\n\n给定 month（1–12 整数）与 latitude_deg（-90–90°，北正）后，二选一：\n• height_km：返回该高度的温度(K)、气压(hPa)、密度(kg/m³)、比湿(g/kg)、标高(km)；\n• height_range_km（如 \"[0,20]\" 或 \"0,20\"，km）+ step_km（默认 1.0）：返回高度廓线。\nmonth_mode：nearest（默认）或 linear（相邻月对数插值）。\n\n依据 COSPAR CIRA-72 月纬向平均气候值：温度/气压 0–120 km，比湿仅 0–15 km；密度由理想气体状态方程导出。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "cira_profile",
+          "arguments": {
+            "month": "$month",
+            "latitude_deg": "$latitude_deg",
+            "height_km": "$height_km",
+            "height_range_km": "$height_range_km",
+            "step_km": "$step_km",
+            "month_mode": "$month_mode"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "month": {
+            "type": "number"
+          },
+          "latitude_deg": {
+            "type": "number"
+          },
+          "height_km": {
+            "type": "number"
+          },
+          "height_range_km": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "step_km": {
+            "type": "number",
+            "minimum": 0.1
+          },
+          "month_mode": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "month",
+          "latitude_deg"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "msis_density",
+      "description": "NRLMSIS 上层大气（热层）总质量密度与温度。\n\n参数：\n- datetime（string，必填）：UTC 时刻（ISO-8601，如 2024-06-10T12:00:00Z）\n- latitude_deg（number，必填）：纬度（°，-90–90，北正）\n- longitude_deg（number，必填）：经度（°，-180–180，东正）\n- altitude_km（number，可选）：单一高度（km，0–1000），与 height_range_km 二选一\n- height_range_km（string，可选）：高度范围：\"[h0,h1]\" 或 \"h0,h1\"（km，0–1000），与 altitude_km 二选一\n- step_km（number，可选）：height_range_km 的高度步长（km，默认 1.0）\n- f107（number，可选）：F10.7 太阳射电流量（10⁻²² W·m⁻²·Hz⁻¹），缺省时自动获取\n- f107a（number，可选）：F10.7 81 天滑动平均（10⁻²² W·m⁻²·Hz⁻¹），缺省时自动获取\n- ap（number，可选）：地磁 Ap 标量（7 个索引取同值），缺省时自动获取\n- ap_values（string，可选）：7 个地磁 Ap 指数，如 \"9,3,4,3,2,4.625,9.5\"；给出时优先于 ap\n- version（string，可选）：模型版本：2.1 / 2.0（NRLMSIS）或 0（NRLMSISE-00，默认 2.1）\n- allow_network_fetch（boolean，可选）：驱动量缺省时是否允许联网自动获取历史值（默认 true）\n\n说明：\nNRLMSIS 上层大气（热层）总质量密度与温度。\n\n模型来源：pymsis 封装的 NRLMSIS 2.0/2.1（默认 2.1）与 NRLMSISE-00（version=\"0\"），有效高度域 0–1000 km。\n• altitude_km（km）：单点，返回密度(kg/m³)、温度(K)、气压(hPa) 及驱动量；\n• height_range_km（\"[h0,h1]\" 或 \"h0,h1\"，km，0–1000）+ step_km（默认 1.0）：返回逐层密度/温度/气压廓线（层数上限 500）。\naltitude_km 与 height_range_km 只能给出一个。\n\n空间天气驱动量：f107 / f107a（10⁻²² W·m⁻²·Hz⁻¹）与 ap（7 个三小时地磁指数，可用 ap_values 字符串给出）；显式给出即为离线确定性结果，缺省时允许联网（allow_network_fetch=true）经 CelesTrak 自动获取历史值。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "msis_density",
+          "arguments": {
+            "datetime": "$datetime",
+            "latitude_deg": "$latitude_deg",
+            "longitude_deg": "$longitude_deg",
+            "altitude_km": "$altitude_km",
+            "height_range_km": "$height_range_km",
+            "step_km": "$step_km",
+            "f107": "$f107",
+            "f107a": "$f107a",
+            "ap": "$ap",
+            "ap_values": "$ap_values",
+            "version": "$version",
+            "allow_network_fetch": "$allow_network_fetch"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "datetime": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "latitude_deg": {
+            "type": "number"
+          },
+          "longitude_deg": {
+            "type": "number"
+          },
+          "altitude_km": {
+            "type": "number"
+          },
+          "height_range_km": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "step_km": {
+            "type": "number",
+            "minimum": 0.1
+          },
+          "f107": {
+            "type": "number"
+          },
+          "f107a": {
+            "type": "number"
+          },
+          "ap": {
+            "type": "number"
+          },
+          "ap_values": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "version": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "allow_network_fetch": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "datetime",
+          "latitude_deg",
+          "longitude_deg"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "msis_profile",
+      "description": "NRLMSIS 热层大气廓线（高度网格）。\n\n参数：\n- datetime（string，必填）：UTC 时刻（ISO-8601，如 2024-06-10T12:00:00Z）\n- latitude_deg（number，必填）：纬度（°，-90–90，北正）\n- longitude_deg（number，必填）：经度（°，-180–180，东正）\n- height_range_km（string，必填）：高度范围：\"[h0,h1]\" 或 \"h0,h1\"（km，0–1000）\n- step_km（number，可选）：高度步长（km，默认 1.0）\n- f107（number，可选）：F10.7 太阳射电流量（10⁻²² W·m⁻²·Hz⁻¹），缺省时自动获取\n- f107a（number，可选）：F10.7 81 天滑动平均（10⁻²² W·m⁻²·Hz⁻¹），缺省时自动获取\n- ap（number，可选）：地磁 Ap 标量（7 个索引取同值），缺省时自动获取\n- ap_values（string，可选）：7 个地磁 Ap 指数，如 \"9,3,4,3,2,4.625,9.5\"；给出时优先于 ap\n- version（string，可选）：模型版本：2.1 / 2.0（NRLMSIS）或 0（NRLMSISE-00，默认 2.1）\n- allow_network_fetch（boolean，可选）：驱动量缺省时是否允许联网自动获取历史值（默认 true）\n\n说明：\nNRLMSIS 热层大气廓线（高度网格）。\n\n模型来源：pymsis 封装的 NRLMSIS 2.0/2.1（默认 2.1）与 NRLMSISE-00（version=\"0\"），有效高度域 0–1000 km。\n给定 UTC 时刻、纬度、经度与 height_range_km（\"[h0,h1]\" 或 \"h0,h1\"，km，0–1000）及 step_km（默认 1.0），返回逐层温度(K)、密度(kg/m³)、气压(hPa)、平均摩尔质量(g/mol) 与 9 种成分数密度（cm⁻³，未定义成分为 null）。层数上限 500。\n\n空间天气驱动量 f107 / f107a（10⁻²² W·m⁻²·Hz⁻¹）与 ap（7 个三小时地磁指数，可用 ap_values 字符串给出）显式给出即为离线确定性结果；缺省时允许联网（allow_network_fetch=true）经 CelesTrak 自动获取历史值。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "msis_profile",
+          "arguments": {
+            "datetime": "$datetime",
+            "latitude_deg": "$latitude_deg",
+            "longitude_deg": "$longitude_deg",
+            "height_range_km": "$height_range_km",
+            "step_km": "$step_km",
+            "f107": "$f107",
+            "f107a": "$f107a",
+            "ap": "$ap",
+            "ap_values": "$ap_values",
+            "version": "$version",
+            "allow_network_fetch": "$allow_network_fetch"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "datetime": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "latitude_deg": {
+            "type": "number"
+          },
+          "longitude_deg": {
+            "type": "number"
+          },
+          "height_range_km": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "step_km": {
+            "type": "number",
+            "minimum": 0.1
+          },
+          "f107": {
+            "type": "number"
+          },
+          "f107a": {
+            "type": "number"
+          },
+          "ap": {
+            "type": "number"
+          },
+          "ap_values": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "version": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "allow_network_fetch": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "datetime",
+          "latitude_deg",
+          "longitude_deg",
+          "height_range_km"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "atmo_refractivity",
+      "description": "大气无线电折射率（ITU-R P.453-14，确定性）。\n\n参数：\n- pressure_hpa（number，可选）：总气压（hPa，仅 manual 模式使用）\n- temp_c（number，可选）：气温（°C，仅 manual 模式使用）\n- relative_humidity_pct（number，可选）：相对湿度（%，仅 manual，与水汽压二选一）\n- water_vapor_hpa（number，可选）：水汽分压（hPa，仅 manual，与相对湿度二选一）\n- atmosphere（string，可选）：背景大气：cira（默认，CIRA-72）| isa | manual\n- month（number，可选）：月份 1–12（仅 cira，默认 1）\n- latitude_deg（number，可选）：纬度（°，仅 cira，默认 0）\n- height_km（number，可选）：高度（km，仅 cira/isa，默认 0）\n- month_mode（string，可选）：月份插值：nearest（默认）| linear（仅 cira）\n\n说明：\n大气无线电折射率（ITU-R P.453-14，确定性）。\n\n背景大气由 atmosphere 选择，默认 cira（CIRA-72 经验大气，覆盖 0–120 km）：\n  · cira（默认）：由 CIRA-72 按 month/latitude_deg/height_km（month_mode = nearest|linear）取温度/气压/比湿并计算折射率；此时 pressure_hpa/temp_c/relative_humidity_pct/water_vapor_hpa 全部被忽略。120 km 以上为 CIRA 顶部的指数外延，输出 extrapolated=true（后续接入 MSIS）。\n  · isa：由 height_km 按 ISA 对流层模式推 T/P（0–11 km，干空气 e=0）。\n  · manual：使用显式给定的 pressure_hpa/temp_c 与 relative_humidity_pct 或 water_vapor_hpa。\n\n输出折射率 N、干项 N_dry、湿项 N_wet 与折射指数 n = 1+N×10⁻⁶；精确式（eq.6）：N = 77.6·P/T − 5.6·e/T + 3.75×10⁵·e/T²；另附简化式（eq.7）对照。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "atmo_refractivity",
+          "arguments": {
+            "pressure_hpa": "$pressure_hpa",
+            "temp_c": "$temp_c",
+            "relative_humidity_pct": "$relative_humidity_pct",
+            "water_vapor_hpa": "$water_vapor_hpa",
+            "atmosphere": "$atmosphere",
+            "month": "$month",
+            "latitude_deg": "$latitude_deg",
+            "height_km": "$height_km",
+            "month_mode": "$month_mode"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "pressure_hpa": {
+            "type": "number"
+          },
+          "temp_c": {
+            "type": "number"
+          },
+          "relative_humidity_pct": {
+            "type": "number"
+          },
+          "water_vapor_hpa": {
+            "type": "number"
+          },
+          "atmosphere": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "month": {
+            "type": "number"
+          },
+          "latitude_deg": {
+            "type": "number"
+          },
+          "height_km": {
+            "type": "number"
+          },
+          "month_mode": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "troposphere_delay",
+      "description": "对流层延迟（Saastamoinen 1972，确定性）。\n\n参数：\n- lat_deg（number，必填）：测站纬度（十进制度）\n- pressure_hpa（number，必填）：地面气压（hPa）\n- temp_c（number，必填）：地面温度（°C）\n- rh_pct（number，可选）：相对湿度（%，默认 50）\n- height_m（number，可选）：测站大地高（m，默认 0）\n- elevation_deg（number，可选）：卫星仰角（度，(0,90]，默认 90）\n- mapping（string，可选）：映射函数：simple（默认）/ saastamoinen\n\n说明：\n对流层延迟（Saastamoinen 1972，确定性）。\n\n由地面气压/温度/湿度计算天顶静力学延迟 ZHD、天顶湿延迟 ZWD 与总延迟 ZTD（m），\n并按映射函数 m(E) 换算到斜路径（slant = m·ZTD）。\n• 饱和水汽压采用 Magnus 式：e_s=6.112·exp(17.62·T_c/(243.12+T_c))，e=RH/100·e_s。\n• ZHD=0.0022768·P/(1-0.00266·cos2φ-0.00028·H)，单位：P(hPa)、H(km)、φ(deg)。\n• ZWD=0.0022768·(1255/T+0.05)·e，T=temp_c+273.15(K)。\n• mapping：simple=1/sin(E)；saastamoinen=1/(sin(E)+0.0032/(tan(E)+0.017))。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "troposphere_delay",
+          "arguments": {
+            "lat_deg": "$lat_deg",
+            "pressure_hpa": "$pressure_hpa",
+            "temp_c": "$temp_c",
+            "rh_pct": "$rh_pct",
+            "height_m": "$height_m",
+            "elevation_deg": "$elevation_deg",
+            "mapping": "$mapping"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "lat_deg": {
+            "type": "number"
+          },
+          "pressure_hpa": {
+            "type": "number"
+          },
+          "temp_c": {
+            "type": "number"
+          },
+          "rh_pct": {
+            "type": "number"
+          },
+          "height_m": {
+            "type": "number"
+          },
+          "elevation_deg": {
+            "type": "number"
+          },
+          "mapping": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "lat_deg",
+          "pressure_hpa",
+          "temp_c"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "pwv",
+      "description": "由 GNSS 湿延迟反演可降水量 PWV（Bevis et al. 1994，确定性）。\n\n参数：\n- temp_c（number，必填）：地表温度（°C，用于估计 Tm）\n- zwd_m（number，可选）：天顶湿延迟（m，与 ztd_m 二选一）\n- ztd_m（number，可选）：天顶总延迟（m，需配合 pressure_hpa）\n- pressure_hpa（number，可选）：地面气压（hPa，给 ztd_m 时必需）\n- lat_deg（number，可选）：测站纬度（给 ztd_m 时用于 ZHD，默认 45）\n- height_m（number，可选）：测站大地高（m，默认 0）\n- tm_k（number，可选）：加权平均温度 Tm（K，可选，缺省由 temp_c 估计）\n\n说明：\n由 GNSS 湿延迟反演可降水量 PWV（Bevis et al. 1994，确定性）。\n\n给定天顶湿延迟 ZWD 或天顶总延迟 ZTD，计算大气可降水量（mm）。\n• 若给 ztd_m，需同时给 pressure_hpa，并按 Saastamoinen 公式扣除 ZHD 得到 ZWD。\n• 转换系数 Π=1e-6·ρ_w·R_v·(k2'+k3/Tm)，常数 k2'=0.221、k3=3.739e3 K、ρ_w=1000、R_v=461.5。\n• Tm 缺省由地表温度估计：Tm=70.2+0.72·(temp_c+273.15)（K）。\n• PWV_m=ZWD/Π；PWV_mm=PWV_m×1000。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "pwv",
+          "arguments": {
+            "temp_c": "$temp_c",
+            "zwd_m": "$zwd_m",
+            "ztd_m": "$ztd_m",
+            "pressure_hpa": "$pressure_hpa",
+            "lat_deg": "$lat_deg",
+            "height_m": "$height_m",
+            "tm_k": "$tm_k"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "temp_c": {
+            "type": "number"
+          },
+          "zwd_m": {
+            "type": "number"
+          },
+          "ztd_m": {
+            "type": "number"
+          },
+          "pressure_hpa": {
+            "type": "number"
+          },
+          "lat_deg": {
+            "type": "number"
+          },
+          "height_m": {
+            "type": "number"
+          },
+          "tm_k": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "temp_c"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "bending_angle",
+      "description": "球对称大气 Abel 正演弯曲角（确定性）。\n\n参数：\n- tangent_height_km（number，必填）：切点高度（km）\n- n0（number，可选）：地表折射率 N₀（N-units，默认 315；仅 exponential）\n- scale_height_km（number，可选）：尺度高 H（km，默认 7.35；仅 exponential）\n- r_earth_km（number，可选）：地球半径（km，默认 6371）\n- atmosphere（string，可选）：背景大气：cira（默认，CIRA-72）| exponential\n- month（number，可选）：月份 1–12（仅 cira，默认 1）\n- latitude_deg（number，可选）：纬度（°，仅 cira，默认 0）\n- month_mode（string，可选）：月份插值：nearest（默认）| linear（仅 cira）\n\n说明：\n球对称大气 Abel 正演弯曲角（确定性）。\n\n背景大气由 atmosphere 选择，默认 cira（CIRA-72 经验大气）：\n  · cira（默认）：由 CIRA-72 按 month/latitude_deg（month_mode = nearest|linear）在稠密高度网格上构建 N(h)（0.1 km 至 30 km、0.5 km 至 120 km，120 km 以上用 CIRA 顶部指数外延），再以通用 Abel 正演 α(a) = −2a·∫(dn/dr)/√(r²−a²)dr 数值积分求切点弯曲角。输出含 atmosphere/source/month/latitude_deg 与 n_profile_levels。\n  · exponential：球对称指数剖面 N(h)=N₀·e^(−h/H) 的闭式渐近解，使用 n0/scale_height_km。\n\n返回弯曲角 α（rad/mrad/deg）、碰撞参数 a=R_E+h_t（n≈1）与切点折射率。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "bending_angle",
+          "arguments": {
+            "tangent_height_km": "$tangent_height_km",
+            "n0": "$n0",
+            "scale_height_km": "$scale_height_km",
+            "r_earth_km": "$r_earth_km",
+            "atmosphere": "$atmosphere",
+            "month": "$month",
+            "latitude_deg": "$latitude_deg",
+            "month_mode": "$month_mode"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "tangent_height_km": {
+            "type": "number"
+          },
+          "n0": {
+            "type": "number"
+          },
+          "scale_height_km": {
+            "type": "number"
+          },
+          "r_earth_km": {
+            "type": "number"
+          },
+          "atmosphere": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "month": {
+            "type": "number"
+          },
+          "latitude_deg": {
+            "type": "number"
+          },
+          "month_mode": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "tangent_height_km"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "abel_inversion",
+      "description": "由弯曲角剖面反演大气折射率（Fjeldbo et al. 1971，确定性）。\n\n参数：\n- bending_profile（string，必填）：弯曲角剖面：JSON 字符串或数组 [{\"a_km\",\"alpha_rad\"}, ...]\n- r_earth_km（number，可选）：地球半径（km，默认 6371）\n- n_steps（number，可选）：Simpson 积分区间数（默认 200，偶数化）\n- top_km（number，可选）：积分上限 a_max（km，默认取剖面最大 a_km）\n\n说明：\n由弯曲角剖面反演大气折射率（Fjeldbo et al. 1971，确定性）。\n\n对每个碰撞参数 a：ln n(a) = (1/π)∫_a^{a_max} α(x)/√(x²−a²) dx；以 x=a·cosh u 消去可积奇点（dx/√(x²−a²)=du）后用复合 Simpson 积分；α(x) 按 x 分段线性插值，表外取最近端点。返回 n、N=(n−1)×10⁶ 与高度。\nbending_profile 支持 JSON 字符串或已解析数组，形如 [{\"a_km\":..,\"alpha_rad\":..}, ...] 或 [[a,α], ...]；a_km 需严格递增且至少 5 个点。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "abel_inversion",
+          "arguments": {
+            "bending_profile": "$bending_profile",
+            "r_earth_km": "$r_earth_km",
+            "n_steps": "$n_steps",
+            "top_km": "$top_km"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "bending_profile": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "r_earth_km": {
+            "type": "number"
+          },
+          "n_steps": {
+            "type": "number"
+          },
+          "top_km": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "bending_profile"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "dry_temperature",
+      "description": "由折射率剖面做干空气静力/理想气体反演（确定性）。\n\n参数：\n- refractivity_profile（string，必填）：折射率剖面：JSON 字符串或数组 [{\"height_km\",\"N\"}, ...]\n- top_pressure_hpa（number，必填）：剖面顶端气压（hPa，必填）\n- gravity_mps2（number，可选）：重力加速度（m/s²，默认 9.80665）\n- mean_molar_mass_kg_mol（number，可选）：干空气平均摩尔质量（kg/mol，默认 0.0289644）\n\n说明：\n由折射率剖面做干空气静力/理想气体反演（确定性）。\n\nN = 77.6·P/T（P 单位 hPa）⇒ P_hPa = N·T/77.6；干空气密度 ρ = 100·M·N/(77.6·R) [kg/m³]。自剖面顶端向下做静力积分 P(h) = P_top + g·∫_h^{h_top} ρ dh′（高度取米，梯形积分，结果除以 100 得 hPa），再由 T(h) = 77.6·P(h)/N(h) 求温度。\nrefractivity_profile 支持 JSON 字符串或已解析数组，形如 [{\"height_km\":..,\"N\":..}, ...] 或 [[h,N], ...]，自上而下或自下而上均可（内部按高度排序）。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "dry_temperature",
+          "arguments": {
+            "refractivity_profile": "$refractivity_profile",
+            "top_pressure_hpa": "$top_pressure_hpa",
+            "gravity_mps2": "$gravity_mps2",
+            "mean_molar_mass_kg_mol": "$mean_molar_mass_kg_mol"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "refractivity_profile": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "top_pressure_hpa": {
+            "type": "number"
+          },
+          "gravity_mps2": {
+            "type": "number"
+          },
+          "mean_molar_mass_kg_mol": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "refractivity_profile",
+          "top_pressure_hpa"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "normal_gravity",
+      "description": "椭球面/高程处正常重力（Somigliana 闭合公式，确定性）。\n\n参数：\n- latitude_deg（number，必填）：大地纬度（十进制度，-90~90）\n- ellipsoid（string，可选）：椭球：WGS84 / GRS80\n- height_m（number，可选）：椭球高（米，默认 0）\n\n说明：\n椭球面/高程处正常重力（Somigliana 闭合公式，确定性）。\n\n给定大地纬度（°）与椭球（WGS84/GRS80），返回正常重力（m/s² 与 mGal）。\nheight_m 可选，含 Heiskanen-Moritz 高程改正（截断到 h²，适用于 -1~20 km）。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "normal_gravity",
+          "arguments": {
+            "latitude_deg": "$latitude_deg",
+            "ellipsoid": "$ellipsoid",
+            "height_m": "$height_m"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "latitude_deg": {
+            "type": "number"
+          },
+          "ellipsoid": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "height_m": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "latitude_deg"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "gravity_correction",
+      "description": "自由空气与布格改正（确定性）。\n\n参数：\n- operation（string，必填）：free_air / bouguer / both\n- height_m（number，必填）：高程（米，向上为正）\n- density_gcm3（number，可选）：布格改正岩石密度（g/cm³，默认 2.67）\n\n说明：\n自由空气与布格改正（确定性）。\n\n• free_air：δg_FA = 0.3086·h（mGal，h 单位米，向上重力减小）。\n• bouguer：δg_B = 2π·G·ρ·h ≈ 0.04193·ρ(g/cm³)·h（无限平板，默认 ρ=2.67 g/cm³）。\n• both：同时返回两项与布格异常基础量。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "gravity_correction",
+          "arguments": {
+            "operation": "$operation",
+            "height_m": "$height_m",
+            "density_gcm3": "$density_gcm3"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "height_m": {
+            "type": "number"
+          },
+          "density_gcm3": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "operation",
+          "height_m"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "eotvos_correction",
+      "description": "厄特弗斯（Eötvös）改正（运动平台重力测量，确定性）。\n\n参数：\n- speed_kmh（number，必填）：平台速度（km/h，>=0）\n- heading_deg（number，必填）：航向（°，自正北顺时针，0=北 90=东）\n- latitude_deg（number，必填）：大地纬度（°，-90~90）\n- r_earth_km（number，可选）：地球半径（km，默认 6371.0）\n\n说明：\n厄特弗斯（Eötvös）改正（运动平台重力测量，确定性）。\n\n精确物理形式（V = speed_kmh/3.6，单位 m/s；Ω = 7.292115e-5 rad/s）：\n• 科里奥利（东西向）项 E_cor = 2·Ω·V·cosφ·sinA；\n• 离心项 E_cen = V²/R；\n• 合计 E = E_cor + E_cen，统一换算为 mGal（×1e5）。\n航向 heading_deg 为自正北顺时针量取（东向分量 = V·sinA）；正号 E 表示将其加到观测重力中以消除平台运动影响。\n对比用的经典经验式使用「节(knots)」为速度单位：\nclassical = 7.5·V_knots·cosφ·sinA + 0.0042·V_knots²（V_knots = speed_kmh/1.852）。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "eotvos_correction",
+          "arguments": {
+            "speed_kmh": "$speed_kmh",
+            "heading_deg": "$heading_deg",
+            "latitude_deg": "$latitude_deg",
+            "r_earth_km": "$r_earth_km"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "speed_kmh": {
+            "type": "number"
+          },
+          "heading_deg": {
+            "type": "number"
+          },
+          "latitude_deg": {
+            "type": "number"
+          },
+          "r_earth_km": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "speed_kmh",
+          "heading_deg",
+          "latitude_deg"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "isostasy",
+      "description": "Airy / Pratt 均衡模型（确定性）。\n\n参数：\n- model（string，必填）：模型：airy / pratt\n- elevation_m（number，必填）：地形高程（米，海面以下为负）\n- crust_density_gcm3（number，可选）：地壳密度（g/cm³，默认 2.67，Airy）\n- mantle_density_gcm3（number，可选）：地幔密度（g/cm³，默认 3.27，Airy）\n- normal_crust_thickness_km（number，可选）：正常地壳厚度（km，默认 30.0，Airy）\n- compensation_depth_km（number，可选）：补偿深度（km，默认 100.0，Pratt）\n- reference_density_gcm3（number，可选）：参考密度（g/cm³，默认 2.67，Pratt）\n\n说明：\nAiry / Pratt 均衡模型（确定性）。\n\n• airy：山根 r = h·ρc/(ρm−ρc)（m），莫霍面深度 = 正常地壳厚度 + r/1000；要求 ρm > ρc，负地形（海洋）得到负山根（反山根）。\n• pratt：以补偿深度 D 的等压为条件 ρ = ρ0·D/(D+h)，并返回密度亏损；要求 D + h > 0。\n密度单位 g/cm³，长度单位 m/km。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "isostasy",
+          "arguments": {
+            "model": "$model",
+            "elevation_m": "$elevation_m",
+            "crust_density_gcm3": "$crust_density_gcm3",
+            "mantle_density_gcm3": "$mantle_density_gcm3",
+            "normal_crust_thickness_km": "$normal_crust_thickness_km",
+            "compensation_depth_km": "$compensation_depth_km",
+            "reference_density_gcm3": "$reference_density_gcm3"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "model": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "elevation_m": {
+            "type": "number"
+          },
+          "crust_density_gcm3": {
+            "type": "number"
+          },
+          "mantle_density_gcm3": {
+            "type": "number"
+          },
+          "normal_crust_thickness_km": {
+            "type": "number"
+          },
+          "compensation_depth_km": {
+            "type": "number"
+          },
+          "reference_density_gcm3": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "model",
+          "elevation_m"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "gravity_field",
+      "description": "球谐重力场势（4π 完全归一化，确定性）。\n\n参数：\n- coefficients（string，必填）：球谐系数（JSON 字符串 / 列表 / 对象）\n- gm_km3s2（number，必填）：地心引力常数 GM（km³/s²，如 398600.4418）\n- r_ref_km（number，必填）：参考半径 R（km，如 6378.137）\n- lat_deg（number，必填）：地心纬度（°，-90~90）\n- lon_deg（number，必填）：经度（°）\n- height_km（number，可选）：大地高（km，默认 0）\n- max_degree（number，可选）：阶数上限（可选，用于截断）\n- gamma_mps2（number，可选）：Bruns 用正常重力（m/s²，可选覆盖）\n\n说明：\n球谐重力场势（4π 完全归一化，确定性）。\n\nV = (GM/r)·Σ_{n=0..N}(R/r)^n·Σ_{m=0..n}(C̄nm·cos mλ + S̄nm·sin mλ)·P̄nm(sinφ)。\n• coefficients：JSON 字符串（也接受已解析对象），支持 [{\"n\":2,\"m\":0,\"C\":..,\"S\":..},...] 或 [[n,m,C,S],...]；\n• P̄nm 采用大地测量 4π 完全归一化（无 Condon-Shortley 相位，P̄00=1，P̄11=√3·cosφ）；\n• lat_deg 按「地心纬度」解释；\n• 导数 g_r、g 由中心有限差分（r 步长 1 m，φ/λ 步长 1e-5°）得到，非解析导数；\n• 扰动势 T = V − GM/r，Bruns 大地水准面起伏 N = T/γ（γ 缺省用 Somigliana 正常重力）。\n内部以 SI（m、m²/s²）计算导数以保证 g 单位为 m/s²；J2 恒等式在校验时于 km²/s² 下核对。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "gravity_field",
+          "arguments": {
+            "coefficients": "$coefficients",
+            "gm_km3s2": "$gm_km3s2",
+            "r_ref_km": "$r_ref_km",
+            "lat_deg": "$lat_deg",
+            "lon_deg": "$lon_deg",
+            "height_km": "$height_km",
+            "max_degree": "$max_degree",
+            "gamma_mps2": "$gamma_mps2"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "coefficients": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "gm_km3s2": {
+            "type": "number"
+          },
+          "r_ref_km": {
+            "type": "number"
+          },
+          "lat_deg": {
+            "type": "number"
+          },
+          "lon_deg": {
+            "type": "number"
+          },
+          "height_km": {
+            "type": "number"
+          },
+          "max_degree": {
+            "type": "number"
+          },
+          "gamma_mps2": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "coefficients",
+          "gm_km3s2",
+          "r_ref_km",
+          "lat_deg",
+          "lon_deg"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "sound_speed",
+      "description": "海水声速计算（Chen-Millero 1977 / Mackenzie 1981）。\n\n参数：\n- salinity_psu（number，必填）：实用盐度（PSU，PSS-78，0–45）\n- temp_c（number，必填）：温度（°C，ITS-90）\n- pressure_dbar（number，必填）：压力（dbar，1 dbar≈1 m 水深）\n- method（string，可选）：方法：chen_millero（默认）/ mackenzie\n- latitude_deg（number，可选）：纬度（十进制度，仅 mackenzie 深度换算用）\n\n说明：\n海水声速计算（Chen-Millero 1977 / Mackenzie 1981）。\n\n• chen_millero：UNESCO 标准（Wong-Zhu 1995 ITS-90 系数），输入盐度/温度/压力(dbar)。\n• mackenzie：九项深度式，输入盐度/温度/压力（自动按纬度换算为深度）。\n\n输出声速（m/s）与所用方法、压力/近似深度。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "sound_speed",
+          "arguments": {
+            "salinity_psu": "$salinity_psu",
+            "temp_c": "$temp_c",
+            "pressure_dbar": "$pressure_dbar",
+            "method": "$method",
+            "latitude_deg": "$latitude_deg"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "salinity_psu": {
+            "type": "number"
+          },
+          "temp_c": {
+            "type": "number"
+          },
+          "pressure_dbar": {
+            "type": "number"
+          },
+          "method": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "latitude_deg": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "salinity_psu",
+          "temp_c",
+          "pressure_dbar"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "seawater_density",
+      "description": "海水密度计算（UNESCO EOS-80，Fofonoff & Millard 1983）。\n\n参数：\n- salinity_psu（number，必填）：实用盐度（PSU，0–45）\n- temp_c（number，必填）：温度（°C）\n- pressure_dbar（number，必填）：压力（dbar）\n\n说明：\n海水密度计算（UNESCO EOS-80，Fofonoff & Millard 1983）。\n\n给定实用盐度（PSU）、温度（°C）与压力（dbar），返回原位密度（kg/m³）。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "seawater_density",
+          "arguments": {
+            "salinity_psu": "$salinity_psu",
+            "temp_c": "$temp_c",
+            "pressure_dbar": "$pressure_dbar"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "salinity_psu": {
+            "type": "number"
+          },
+          "temp_c": {
+            "type": "number"
+          },
+          "pressure_dbar": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "salinity_psu",
+          "temp_c",
+          "pressure_dbar"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "gnss_frequency",
+      "description": "GNSS 信号频点与波长查询（确定性）。\n\n参数：\n- system（string，可选）：卫星系统：gps/galileo/glonass/beidou/qzss/sbas（可选，省略返回全部）\n- band（string，可选）：频点名称（如 L1/E1/E5a/B1I/B2a/B3I/E6/L2/L5），大小写不敏感（可选）\n\n说明：\nGNSS 信号频点与波长查询（确定性）。\n\n给出各卫星导航系统信号的中心频率（MHz）、载波波长（m，λ=c/f）与多址方式。\n• system：限定系统（galileo/gps/glonass/beidou/qzss/sbas），省略则返回全部。\n• band：限定频点（如 L1/E5a/B1I），省略则返回该系统全部频点。\nGLONASS 为 FDMA，表中为 k=0 频道（L1 1602.0、L2 1246.0 MHz）；\n其余系统为 CDMA。GPS L1 额外给出 C/A 码码率 1.023 Mcps。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "gnss_frequency",
+          "arguments": {
+            "system": "$system",
+            "band": "$band"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "system": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "band": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "dop",
+      "description": "卫星几何精度因子 DOP（确定性）。\n\n参数：\n- az_el（string，可选）：卫星方位角/仰角：JSON 数组字符串或列表，如 [{\"az\":30,\"el\":45},...]\n- lat_deg（number，可选）：测站纬度（无 az_el 时用 TLE 解算所需）\n- lon_deg（number，可选）：测站经度（无 az_el 时用 TLE 解算所需）\n- height_m（number，可选）：测站大地高（m，默认 0）\n- constellation（string，可选）：星座：gps/glo/gal/bds/gnss/cygnss（无 az_el 时用）\n- time（string，可选）：ISO 8601 时刻（无 az_el 时用，默认当前）\n\n说明：\n卫星几何精度因子 DOP（确定性）。\n\n由卫星视线向量构造几何矩阵 G（每行 [-cosE·sinA, -cosE·cosA, -sinE, 1]），\nQ=inv(Gᵀ·G)，输出 GDOP/PDOP/HDOP/VDOP/TDOP（ECEF 本地坐标系）。\n• az_el：首选，直接给出各卫星方位角/仰角，JSON 数组字符串（如 [{\"az\":30,\"el\":45}]）或列表。\n• 或给出 lat_deg/lon_deg/height_m + constellation + time，由 TLE 计算各卫星 az/el（J2 简化传播）。\n至少需 4 颗卫星；几何退化（如全部同仰角）时不可解算。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "dop",
+          "arguments": {
+            "az_el": "$az_el",
+            "lat_deg": "$lat_deg",
+            "lon_deg": "$lon_deg",
+            "height_m": "$height_m",
+            "constellation": "$constellation",
+            "time": "$time"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "az_el": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "lat_deg": {
+            "type": "number"
+          },
+          "lon_deg": {
+            "type": "number"
+          },
+          "height_m": {
+            "type": "number"
+          },
+          "constellation": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "time": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        }
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "adjustment_gauss_markov",
+      "description": "间接平差（Gauss-Markov 最小二乘），解 x = (AᵀPA)⁻¹AᵀPl。\n\n参数：\n- A（string，必填）：设计矩阵 n×u，JSON 字符串（行列表，如 \"[[1,0],[0,1]]\"）\n- l（string，必填）：观测向量，长度 n，JSON 字符串\n- P（string，可选）：权矩阵 n×n，JSON 字符串；缺省为单位权\n- parameter_names（string，可选）：长度 u 的参数名列表，JSON 字符串（用于输出标注）\n\n说明：\n间接平差（Gauss-Markov 最小二乘），解 x = (AᵀPA)⁻¹AᵀPl。\n\n• A：n×u 设计（系数）矩阵，JSON 字符串（行列表）。\n• l：长度 n 的观测向量，JSON 字符串。\n• P：n×n 权矩阵，JSON 字符串；缺省为单位权。\n• 残差符号约定：v = A·x − l（计算值 − 观测值）。\n• 单位权中误差 σ0 = sqrt(vᵀPv/(n−u))，无多余观测时为 null。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "adjustment_gauss_markov",
+          "arguments": {
+            "A": "$A",
+            "l": "$l",
+            "P": "$P",
+            "parameter_names": "$parameter_names"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "A": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "l": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "P": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "parameter_names": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "A",
+          "l"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "leveling_adjust",
+      "description": "水准网间接平差，求解各未知点高程并给出残差与 σ0。\n\n参数：\n- observations（string，必填）：观测列表 JSON 字符串（from/to/dh_m/sigma_mm）\n- fixed_points（string，可选）：已知点高程 JSON 字符串，如 {\"A\":100.000}\n- node_order（string，可选）：全部节点名 JSON 字符串；缺省由观测推导\n\n说明：\n水准网间接平差，求解各未知点高程并给出残差与 σ0。\n\n• observations：JSON 字符串，元素形如 {\"from\":\"A\",\"to\":\"B\",\"dh_m\":1.000,\"sigma_mm\":1.0}，dh 为从 from 到 to 的高差（H_to − H_from，单位 m），sigma 缺省 1.0 mm。\n• fixed_points：JSON 字符串 {\"A\":100.000}，已知点高程（m）。\n• node_order：JSON 字符串，显式节点名列表（缺省由观测推导）。\n• 权取 p = 1/σ_mm²（mm 尺度），故 σ0 单位为 mm。\n• 残差约定 v = 调整值 − 观测值（mm），misclosure = −v。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "leveling_adjust",
+          "arguments": {
+            "observations": "$observations",
+            "fixed_points": "$fixed_points",
+            "node_order": "$node_order"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "observations": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "fixed_points": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "node_order": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "observations"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "traverse_closure",
+      "description": "导线计算与闭合差分配（Bowditch 比例法）。\n\n参数：\n- start_easting_m（number，必填）：起点 E 坐标（m）\n- start_northing_m（number，必填）：起点 N 坐标（m）\n- start_azimuth_deg（number，必填）：首边方位角（度，自北顺时针）\n- angles（string，必填）：转折角列表 JSON 字符串（数值或 {turning,direction}）\n- distances（string，必填）：边长列表（m）JSON 字符串\n- closed（string，可选）：true（闭合，默认）/ false（开放）\n\n说明：\n导线计算与闭合差分配（Bowditch 比例法）。\n\n• 起始点 (start_easting_m, start_northing_m) 与首边方位角 start_azimuth_deg（自北顺时针，度）。\n• angles：JSON 字符串，各站转折角（度）。元素可为数值（默认右转）或对象 {\"turning\":90,\"direction\":\"right\"}；direction∈{left,right}，下一方位角 = 上一方位角 ± 转折角（right 取 +，left 取 −）。\n• distances：JSON 字符串，各边水平距离（m），长度须等于 angles。\n• closed：\"true\"（默认，闭合/环形导线）或 \"false\"（开放导线）。\n• 闭合导线按边长比例（Bowditch/罗盘法则）分配坐标闭合差 dx、dy。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "traverse_closure",
+          "arguments": {
+            "start_easting_m": "$start_easting_m",
+            "start_northing_m": "$start_northing_m",
+            "start_azimuth_deg": "$start_azimuth_deg",
+            "angles": "$angles",
+            "distances": "$distances",
+            "closed": "$closed"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "start_easting_m": {
+            "type": "number"
+          },
+          "start_northing_m": {
+            "type": "number"
+          },
+          "start_azimuth_deg": {
+            "type": "number"
+          },
+          "angles": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "distances": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "closed": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "start_easting_m",
+          "start_northing_m",
+          "start_azimuth_deg",
+          "angles",
+          "distances"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "qc_outliers",
+      "description": "粗差探测（Baarda 数据探测法 / 三倍中误差）。\n\n参数：\n- residuals（string，必填）：残差列表 JSON 字符串\n- sigma0（number，必填）：单位权中误差 σ0（数值，>0）\n- weights（string，可选）：权列表 JSON 字符串；缺省全 1.0\n- alpha（number，可选）：显著性水平（默认 0.001）\n- method（string，可选）：baarda（默认）/ three_sigma\n\n说明：\n粗差探测（Baarda 数据探测法 / 三倍中误差）。\n\n• residuals：JSON 字符串，残差列表（与 σ0 同单位）。\n• sigma0：单位权中误差（数值）。\n• weights：JSON 字符串，各残差权列表；缺省全为 1.0。\n• Baarda 统计量 w_i = |v_i| / (σ0·√q_ii)，q_ii 缺省取 1/weight_i；\n  临界值 c = Φ⁻¹(1 − α/2)（正态分位数）。\n• method=three_sigma 时 c=3.0，统计量 = |v_i|/σ0。\n• 判定 |statistic| > c 即为粗差。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "qc_outliers",
+          "arguments": {
+            "residuals": "$residuals",
+            "sigma0": "$sigma0",
+            "weights": "$weights",
+            "alpha": "$alpha",
+            "method": "$method"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "residuals": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "sigma0": {
+            "type": "number"
+          },
+          "weights": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "alpha": {
+            "type": "number"
+          },
+          "method": {
+            "type": "string",
+            "maxLength": 65536
+          }
+        },
+        "required": [
+          "residuals",
+          "sigma0"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "rain_attenuation",
+      "description": "降雨衰减（ITU-R P.838-3 比衰减 + P.618 路径）。\n\n参数：\n- frequency_ghz（number，必填）：频率（GHz，>0）\n- rain_rate_001（number，必填）：降雨率 R0.01（mm/h，>0）\n- elevation_deg（number，必填）：仰角（度，>0）\n- polarization（string，可选）：极化：horizontal（默认）/ vertical / circular\n- p_pct（number，可选）：时间百分比 p（%，默认 0.01，范围 0.001–5）\n- polarization_tilt_deg（number，可选）：极化倾斜角 τ（度，给出时对水平/垂直用一般倾斜式；默认 45）\n- latitude_deg（number，可选）：纬度（十进制度，仅 p<1% 纬度修正用，默认 45）\n\n说明：\n降雨衰减（ITU-R P.838-3 比衰减 + P.618 路径）。\n\n比衰减 γR = k·R0.01^α（dB/km），其中 (k, α) 取自 P.838-3 标准表格，在 log10(f) 上对数线性插值；极化支持 horizontal（默认）/ vertical / circular，或给出 polarization_tilt_deg 使用一般极化倾斜式。\n• R0.01：年平均 0.01% 时间超过的降雨率（mm/h）。\n• 有效路径：L_R = 35·exp(-0.015·R0.01)（km），r = 1/(1 + 0.78√(L_R·γR/f) − 0.38(1 − e^(−2L_R)))。\n• A_001 = γR·L_E；当 p_pct ≠ 0.01 时按 P.618 时间比例换算 A_p（0.001%–5%）。\n• latitude_deg 仅用于 p<1% 时的 β 纬度修正（默认 45）。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "rain_attenuation",
+          "arguments": {
+            "frequency_ghz": "$frequency_ghz",
+            "rain_rate_001": "$rain_rate_001",
+            "elevation_deg": "$elevation_deg",
+            "polarization": "$polarization",
+            "p_pct": "$p_pct",
+            "polarization_tilt_deg": "$polarization_tilt_deg",
+            "latitude_deg": "$latitude_deg"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "frequency_ghz": {
+            "type": "number"
+          },
+          "rain_rate_001": {
+            "type": "number"
+          },
+          "elevation_deg": {
+            "type": "number"
+          },
+          "polarization": {
+            "type": "string",
+            "maxLength": 65536
+          },
+          "p_pct": {
+            "type": "number"
+          },
+          "polarization_tilt_deg": {
+            "type": "number"
+          },
+          "latitude_deg": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "frequency_ghz",
+          "rain_rate_001",
+          "elevation_deg"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "gaseous_attenuation",
+      "description": "大气气体比衰减（ITU-R P.676 简化 Annex 2）。\n\n参数：\n- frequency_ghz（number，必填）：频率（GHz，>0）\n- pressure_hpa（number，可选）：大气压（hPa，默认 1013.25）\n- temp_c（number，可选）：气温（°C，默认 15）\n- rh_pct（number，可选）：相对湿度（%，0–100，默认 50）\n\n说明：\n大气气体比衰减（ITU-R P.676 简化 Annex 2）。\n\n返回干空气（氧气）γ0、水汽 γw 与总比衰减（dB/km），并给出水汽密度 ρ。\n• 输入：frequency_ghz（GHz，>0）、pressure_hpa（默认 1013.25）、temp_c（默认 15）、rh_pct（相对湿度 %，默认 50）。\n• ρ = 216.7·e/T（g/m³），饱和水汽压用 Magnus 式 es = 6.112·exp(17.62t/(243.12+t))。\n• 22.235 GHz 与 183.31 GHz 水汽线、54 GHz 氧线附近衰减显著增大。\n注意：为简化近似式，输出附带 caveat 字段说明适用范围。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "gaseous_attenuation",
+          "arguments": {
+            "frequency_ghz": "$frequency_ghz",
+            "pressure_hpa": "$pressure_hpa",
+            "temp_c": "$temp_c",
+            "rh_pct": "$rh_pct"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "frequency_ghz": {
+            "type": "number"
+          },
+          "pressure_hpa": {
+            "type": "number"
+          },
+          "temp_c": {
+            "type": "number"
+          },
+          "rh_pct": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "frequency_ghz"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "link_budget",
+      "description": "链路预算（标准链路方程，结合 ITU-R P.525）。\n\n参数：\n- tx_power_dbw（number，可选）：发射功率（dBW）；与 tx_power_w 二选一\n- tx_power_w（number，可选）：发射功率（W）；未给 tx_power_dbw 时使用\n- tx_gain_dbi（number，必填）：发射天线增益（dBi）\n- rx_gain_dbi（number，必填）：接收天线增益（dBi）\n- frequency_mhz（number，必填）：频率（MHz，>0）\n- distance_km（number，必填）：距离（km，>0）\n- tx_loss_db（number，可选）：发射端损耗（dB，默认 0）\n- rx_loss_db（number，可选）：接收端损耗（dB，默认 0）\n- atmospheric_loss_db（number，可选）：大气损耗（dB，默认 0）\n- noise_temp_k（number，可选）：系统噪声温度（K，默认 290）\n- bit_rate_bps（number，可选）：比特率（bit/s，用于 Eb/N0）\n- bandwidth_hz（number，可选）：带宽（Hz，用于 C/N）\n\n说明：\n链路预算（标准链路方程，结合 ITU-R P.525）。\n\n• EIRP = P_tx + G_tx − L_tx（dBW）。\n• P_rx = EIRP + G_rx − L_rx − FSPL − L_atm（dBW）。\n• G/T = G_rx − 10log10(T)（dB/K）；C/N0 = P_rx + 228.6 − 10log10(T)（dBHz）。\n• 给定 bandwidth_hz 时 C/N = C/N0 − 10log10(B)；给定 bit_rate_bps 时 Eb/N0 = C/N0 − 10log10(Rb)。\n输入发射功率二选一：tx_power_dbw（dBW）或 tx_power_w（W，自动 10log10 转换）。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "link_budget",
+          "arguments": {
+            "tx_power_dbw": "$tx_power_dbw",
+            "tx_power_w": "$tx_power_w",
+            "tx_gain_dbi": "$tx_gain_dbi",
+            "rx_gain_dbi": "$rx_gain_dbi",
+            "frequency_mhz": "$frequency_mhz",
+            "distance_km": "$distance_km",
+            "tx_loss_db": "$tx_loss_db",
+            "rx_loss_db": "$rx_loss_db",
+            "atmospheric_loss_db": "$atmospheric_loss_db",
+            "noise_temp_k": "$noise_temp_k",
+            "bit_rate_bps": "$bit_rate_bps",
+            "bandwidth_hz": "$bandwidth_hz"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "tx_power_dbw": {
+            "type": "number"
+          },
+          "tx_power_w": {
+            "type": "number"
+          },
+          "tx_gain_dbi": {
+            "type": "number"
+          },
+          "rx_gain_dbi": {
+            "type": "number"
+          },
+          "frequency_mhz": {
+            "type": "number"
+          },
+          "distance_km": {
+            "type": "number"
+          },
+          "tx_loss_db": {
+            "type": "number"
+          },
+          "rx_loss_db": {
+            "type": "number"
+          },
+          "atmospheric_loss_db": {
+            "type": "number"
+          },
+          "noise_temp_k": {
+            "type": "number"
+          },
+          "bit_rate_bps": {
+            "type": "number"
+          },
+          "bandwidth_hz": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "tx_gain_dbi",
+          "rx_gain_dbi",
+          "frequency_mhz",
+          "distance_km"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    },
+    {
+      "id": "radio_horizon",
+      "description": "无线电地平与第一菲涅尔区净空。\n\n参数：\n- h1_m（number，必填）：发射/一端天线高度（m，>0）\n- h2_m（number，可选）：另一端天线高度（m，>0，可选）\n- frequency_mhz（number，可选）：频率（MHz，默认 1000）\n- k_factor（number，可选）：等效地球半径系数 k（默认 4/3）\n- distance_km（number，可选）：实际路径长度（km，用于菲涅尔/净空）\n- obstacle_height_m（number，可选）：中点障碍物高度（m，用于净空比）\n\n说明：\n无线电地平与第一菲涅尔区净空。\n\n• 等效地球半径 Re = 6371·k（km，k 默认 4/3）。\n• 单端地平距离 d = √(2·Re·h/1000)（km，h 以 m 计）；给出 h2_m 时取两端之和。\n• 给出 distance_km 时，按中点 d1=d2=d/2 计算第一菲涅尔半径 r1 = √(λ·d1·d2/d)。\n• 再给出 obstacle_height_m 时，净空 = (h1+h2)/2 − 障碍高度，净空比 = 净空/r1（≥0.6 视为良好）。\n输入频率用于计算波长 λ = c/f。",
+      "method": "POST",
+      "path": "/rpc",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+          "name": "radio_horizon",
+          "arguments": {
+            "h1_m": "$h1_m",
+            "h2_m": "$h2_m",
+            "frequency_mhz": "$frequency_mhz",
+            "k_factor": "$k_factor",
+            "distance_km": "$distance_km",
+            "obstacle_height_m": "$obstacle_height_m"
+          }
+        }
+      },
+      "params": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "h1_m": {
+            "type": "number"
+          },
+          "h2_m": {
+            "type": "number"
+          },
+          "frequency_mhz": {
+            "type": "number"
+          },
+          "k_factor": {
+            "type": "number"
+          },
+          "distance_km": {
+            "type": "number"
+          },
+          "obstacle_height_m": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "h1_m"
+        ]
+      },
+      "result": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "jsonrpc": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "result": {
+            "type": "object"
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      },
+      "effect": "read"
+    }
+  ]
+}
