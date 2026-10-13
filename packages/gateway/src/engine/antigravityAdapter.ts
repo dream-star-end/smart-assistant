@@ -28,6 +28,7 @@ import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import type { Readable, Writable } from 'node:stream'
 import { existsSync, readFileSync } from 'node:fs'
 import {
+  ANTIGRAVITY_RELAY_PREFIX,
   antigravityCliModelId,
   TOOL_FAILED_EMPTY_SENTINEL,
   type GoalStateSnapshot,
@@ -57,7 +58,7 @@ import { antigravityProductToolInput, antigravityProductToolName, antigravityToo
 const log = createLogger({ module: 'antigravityAdapter' })
 
 const ROUTE_TOKEN_RE = /^[0-9a-f]{64}$/
-export const ANTIGRAVITY_RELAY_PATH_PREFIX = '/internal/v5/antigravity-relay/route/'
+export const ANTIGRAVITY_RELAY_PATH_PREFIX = `${ANTIGRAVITY_RELAY_PREFIX}/route/`
 /** 350 KB stdin prompts were verified; a 1.1 MB one made 1.3.4 report
  * SUCCESS with an empty response. Stay well under the verified size. */
 export const ANTIGRAVITY_MAX_PROMPT_BYTES = 300 * 1024
