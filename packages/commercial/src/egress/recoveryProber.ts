@@ -10,7 +10,17 @@
  *     → scheduler 既有恢复数学直接接管(默认 60s 周期 + 5min 恢复窗 → 上游恢复后
  *     最迟约 5-6 分钟自动转 healthy);
  *   - 探活非 2xx / 网络错误 → **不写样本**(缺成功样本 = 不恢复,判定与写失败样本
- *     完全等价),失败细节进 egress 日志 recovery_probe_failed(status/error/model)。
+ *     完全等价)。401/402 也不会被本器标成健康。
+ *
+ * 确定性终态(HTTP 401/402/403,以及 defaultProbeRequest 已用尽候选后的 400/404)
+ * 按 provider 做进程内慢退避:连续同一状态 5min → 15min → 60min,不短于已配置
+ * interval(interval 本身夹在 [15s, 1h])。429/408/5xx、网络错误和未知状态保持原
+ * 周期,并清掉慢类连续计数;换成另一种慢类状态也从 5min 重新计数。nextProbeAt 从
+ * 这次结果实际返回的时刻起算。成功则清除慢退避,之后仍按原周期积累成功样本。
+ * 退避是进程内状态,重启后的首轮探活照常发;这不是跨重启持久隔离。
+ *
+ * timer 与启动首轮遵守退避。只有显式 runNow() 绕过时间,仍遵守 auto+degraded、
+ * 已知静态 provider 与 key 过滤,并与在飞 tick 共用同一个 Promise。
  *
  * 与 latencyProber 的口径**故意不同**:后者是 transport 语义(GET,任何 HTTP 响应都算
  * ok),不能用于恢复判定 —— 否则 ark 型 429 容量错误会被 transport 探活误判恢复,造成
@@ -21,23 +31,23 @@
  *   ② 零编号风险:不新增迁移就不与任何在途迁移支(0246-0250)产生 apply 顺序纠缠。
  *
  * 纪律(对齐 latencyProber):
- * - 只在 degraded+auto 期间探测(forced 模式尊重管理员;转 healthy 即停)→ 稳态零成本,
- *   每 tick 每 provider 至多 1 次终态探活。
+ * - 只在 degraded+auto 期间探测(forced 模式尊重管理员;转 healthy 即停)→ 稳态零成本。
+ *   慢退避期间不发探活网络、不写成功样本、不逐 tick 打印 skip。
  * - 出口策略与真实流量同源:STATIC_PROVIDER_META.egress direct → directEgressDispatcher
  *   直连,否则全局代理 —— 测别的路径没有运维意义。
  * - 鉴权头风格照 protocol spec(bearer 缺省;opencodego/moonshot/bailian x-api-key)。
- * - 任何失败只 warn 不冒泡,绝不影响在飞 LLM 流主职。
+ * - 任何失败只 warn 不冒泡,绝不影响在飞 LLM 流主职。日志不得带 key、key 指纹或请求正文。
  *
  * 探活模型字面量:inboundModelIds 逐个尝试(经 upstreamModelForRequest 精确改写、去重);
  * 400/404 视为该字面量可能已被上游退役 → 换下一个,其余非 2xx(401/429/5xx)与网络错误
  * 直接定性失败。不读 catalog,保持本器与 catalog epoch 解耦;字面量全退役表现为持续
- * 探活失败(仅日志),届时调整 inbound 顺序即可。
+ * 探活失败(仅日志),届时调整 inbound 顺序即可。调度层只看这次调用的终态结果。
  *
  * env:OC_PROVIDER_HEALTH_RECOVERY_PROBE_DISABLED=1 关;
  *      OC_PROVIDER_HEALTH_RECOVERY_PROBE_INTERVAL_MS 调周期(缺省 60s,夹 [15s, 1h])。
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { request } from "undici";
 import {
   STATIC_KEY_PROVIDERS,
@@ -51,6 +61,19 @@ import { recordProviderProbeSuccess as _recordSuccess } from "../http/proxy/prov
 
 const PROBE_TIMEOUT_MS = 30_000;
 const PROBE_MAX_TOKENS = 512;
+const SLOW_BACKOFF_MS = [5 * 60_000, 15 * 60_000, 60 * 60_000] as const;
+const SLOW_STATUSES = new Set([400, 401, 402, 403, 404]);
+const OMITTED_LOG_FIELDS = new Set([
+  "body",
+  "requestBody",
+  "headers",
+  "authorization",
+  "apiKey",
+  "api_key",
+  "key",
+  "fingerprint",
+  "keyFingerprint",
+]);
 
 export interface RecoveryProbeResult {
   ok: boolean;
@@ -62,7 +85,7 @@ export interface RecoveryProbeResult {
 
 export interface RecoveryProberHandle {
   stop(): void;
-  /** 手动跑一轮(测试/运维用);上轮未结束时复用同一 in-flight promise。 */
+  /** 手动跑一轮(测试/运维用);上轮未结束时复用同一 in-flight promise。绕过时间退避,不绕过许可。 */
   runNow(): Promise<void>;
 }
 
@@ -76,6 +99,15 @@ interface RecoveryProberDeps {
   probeRequest?: RecoveryProbeRequest;
   /** 只记成功样本;失败由日志承载(缺成功样本=不恢复,判定等价)。 */
   recordSuccess?: (providerId: string, model: string) => void;
+}
+
+/** 进程内、按 provider。不写入 DB,重启即丢。 */
+interface ProbePace {
+  keyMark: string;
+  slowStatus: number | null;
+  slowCount: number;
+  nextProbeAt: number;
+  suppressedTicks: number;
 }
 
 function probeCandidates(spec: StaticKeyProviderSpec): string[] {
@@ -132,7 +164,7 @@ async function defaultProbeRequest(
       statusCode = res.statusCode;
       await res.body.dump().catch(() => {});
       // 真实推理成功(2xx)才背书恢复;401/429/5xx 直接定性失败;400/404 可能只是该
-      // model 字面量退役 → 换下一个候选。
+      // model 字面量退役 → 换下一个候选。调度层的慢退避只看这里返回的终态。
       if (res.statusCode >= 200 && res.statusCode < 300) {
         return { ok: true, statusCode, error: null, model };
       }
@@ -140,11 +172,64 @@ async function defaultProbeRequest(
         return { ok: false, statusCode, error, model };
       }
     } catch (err) {
-      error = String((err as Error)?.message ?? err).slice(0, 200);
+      // 先抹掉本次 key / 指纹再截断,避免截断把密钥切成无法整段匹配的碎片。
+      error = redactProbeError(String((err as Error)?.message ?? err), key).slice(0, 200);
       return { ok: false, statusCode: null, error, model };
     }
   }
   return { ok: false, statusCode, error, model };
+}
+
+function keyMark(key: string): string {
+  return createHash("sha256").update(key).digest("hex");
+}
+
+function redactProbeError(input: string, key: string): string {
+  if (key.length < 8) return input;
+  const digest = keyMark(key);
+  return input
+    .split(digest)
+    .join("[redacted]")
+    .split(key)
+    .join("[redacted]")
+    .split(digest.slice(0, 16))
+    .join("[redacted]");
+}
+
+function slowBackoffMs(consecutive: number, intervalMs: number): number {
+  const step =
+    consecutive <= 1 ? SLOW_BACKOFF_MS[0] : consecutive === 2 ? SLOW_BACKOFF_MS[1] : SLOW_BACKOFF_MS[2];
+  // interval 已夹到 ≤1h,所以结果不会长于 1h,也不会短于调用方配置的周期。
+  return Math.max(step, intervalMs);
+}
+
+function redactString(input: string, secretList: readonly string[]): string {
+  let redacted = input;
+  for (const secret of secretList) {
+    if (secret.length < 8 || !redacted.includes(secret)) continue;
+    redacted = redacted.split(secret).join("[redacted]");
+  }
+  return redacted;
+}
+
+function sanitize(value: unknown, secretList: readonly string[], seen = new WeakSet<object>()): unknown {
+  if (typeof value === "string") return redactString(value, secretList);
+  if (value == null || typeof value === "number" || typeof value === "boolean") return value;
+  if (typeof value !== "object") return redactString(String(value), secretList);
+  if (seen.has(value)) return "[circular]";
+  seen.add(value);
+  if (Array.isArray(value)) return value.map((item) => sanitize(item, secretList, seen));
+  const out: Record<string, unknown> = {};
+  for (const [field, inner] of Object.entries(value)) {
+    if (OMITTED_LOG_FIELDS.has(field)) continue;
+    out[field] = sanitize(inner, secretList, seen);
+  }
+  return out;
+}
+
+function errorText(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  return String(err);
 }
 
 export function startRecoveryProber(
@@ -171,48 +256,145 @@ export function startRecoveryProber(
   const probeRequest = opts._deps?.probeRequest ?? defaultProbeRequest;
   const recordSuccess = opts._deps?.recordSuccess ?? _recordSuccess;
   const log = opts.log;
+  const knownKeys = new Set<string>();
 
   const byId = new Map<string, StaticKeyProviderSpec>(
     STATIC_KEY_PROVIDERS.map((p) => [p.id, p]),
   );
+  const pace = new Map<string, ProbePace>();
 
   let stopped = false;
   let inflight: Promise<void> | null = null;
 
-  async function runTick(): Promise<void> {
-    const r = await q<{ provider_id: string; health_status: string | null; health_mode: string }>(
-      "SELECT provider_id, health_status, health_mode FROM provider_ops",
-    );
-    for (const row of r.rows) {
-      if (stopped) return;
-      // 过滤在代码而非 SQL:单测可注入任意 ops 行;全表 ≤9 行,无谓再压查询。
-      if (row.health_mode !== "auto" || row.health_status !== "degraded") continue;
-      const spec = byId.get(row.provider_id);
-      if (!spec) continue; // 非静态 provider(account-pool 体系)不在本系统治理面
-      const key = opts.staticProviderKeys[spec.id];
-      if (!key) continue; // 缺 key 无法探活:保持降级(与 proxy not_configured 拒绝口径一致)
-      const res = await probeRequest(spec, key);
-      if (res.ok) {
-        recordSuccess(spec.id, res.model);
-        log.info("recovery_probe_ok", { provider: spec.id, status: res.statusCode, model: res.model });
-      } else {
-        log.warn("recovery_probe_failed", {
-          provider: spec.id,
-          status: res.statusCode,
-          error: res.error,
-          model: res.model,
-        });
-      }
+  function noteKeys(): void {
+    for (const value of Object.values(opts.staticProviderKeys)) {
+      if (typeof value === "string" && value.length >= 8) knownKeys.add(value);
     }
   }
 
-  function scheduleTick(): Promise<void> {
-    if (inflight) return inflight; // in-flight guard:极端超时一轮可 9×30s,防 tick 重叠
-    inflight = runTick()
-      .catch((err: unknown) => {
-        log.warn("recovery_prober_tick_failed", {
-          err: String((err as Error)?.message ?? err),
+  function secrets(): string[] {
+    noteKeys();
+    const out: string[] = [];
+    for (const key of knownKeys) {
+      const digest = keyMark(key);
+      out.push(key, digest, digest.slice(0, 16));
+    }
+    // 先抹完整指纹,再抹 16 位前缀,避免前缀替换把完整哈希切碎后泄漏剩余部分。
+    out.sort((a, b) => b.length - a.length);
+    return out;
+  }
+
+  function logWarn(msg: string, extra: Record<string, unknown>): void {
+    log.warn(msg, sanitize(extra, secrets()) as Record<string, unknown>);
+  }
+
+  function logInfo(msg: string, extra: Record<string, unknown>): void {
+    log.info(msg, sanitize(extra, secrets()) as Record<string, unknown>);
+  }
+
+  function remember(
+    providerId: string,
+    mark: string,
+    slowStatus: number | null,
+    slowCount: number,
+    finishedAt: number,
+    backoffMs: number,
+  ): number {
+    const nextProbeAt = finishedAt + backoffMs;
+    pace.set(providerId, {
+      keyMark: mark,
+      slowStatus,
+      slowCount,
+      nextProbeAt,
+      suppressedTicks: 0,
+    });
+    return nextProbeAt;
+  }
+
+  async function runTick(bypassWait: boolean): Promise<void> {
+    noteKeys();
+    const r = await q<{ provider_id: string; health_status: string | null; health_mode: string }>(
+      "SELECT provider_id, health_status, health_mode FROM provider_ops",
+    );
+    const present = new Set<string>();
+    for (const row of r.rows) {
+      if (byId.has(row.provider_id)) present.add(row.provider_id);
+    }
+    for (const id of [...pace.keys()]) {
+      if (!present.has(id)) pace.delete(id);
+    }
+
+    for (const row of r.rows) {
+      if (stopped) return;
+      // 过滤在代码而非 SQL:单测可注入任意 ops 行;全表 ≤9 行,无谓再压查询。
+      const spec = byId.get(row.provider_id);
+      if (!spec) continue; // 非静态 provider(account-pool 体系)不在本系统治理面
+      const eligible = row.health_mode === "auto" && row.health_status === "degraded";
+      const key = opts.staticProviderKeys[spec.id];
+      if (!eligible || !key) {
+        // 已观测到 healthy / forced / 缺 key:清掉退避。没看见的 DB 往返不在这里处理。
+        pace.delete(spec.id);
+        continue;
+      }
+      const mark = keyMark(key);
+      let st = pace.get(spec.id);
+      if (st && st.keyMark !== mark) {
+        pace.delete(spec.id);
+        st = undefined;
+      }
+      if (!bypassWait && st && Date.now() < st.nextProbeAt) {
+        st.suppressedTicks += 1;
+        continue;
+      }
+      const suppressed = st?.suppressedTicks ?? 0;
+      const res = await probeRequest(spec, key);
+      const finishedAt = Date.now();
+      if (res.ok) {
+        const nextProbeAt = remember(spec.id, mark, null, 0, finishedAt, intervalMs);
+        recordSuccess(spec.id, res.model);
+        logInfo("recovery_probe_ok", {
+          provider: spec.id,
+          status: res.statusCode,
+          model: res.model,
+          suppressedTicks: suppressed,
+          nextProbeAt,
+          backoffMs: intervalMs,
+          at: finishedAt,
         });
+        continue;
+      }
+      const status = res.statusCode;
+      const slow = status != null && SLOW_STATUSES.has(status);
+      let slowStatus: number | null = null;
+      let slowCount = 0;
+      let backoffMs = intervalMs;
+      if (slow && status != null) {
+        // 同一 HTTP 状态才沿 5/15/60 累加;换成另一种慢状态从 1 重新计数。
+        slowCount = st && st.slowStatus === status ? st.slowCount + 1 : 1;
+        slowStatus = status;
+        backoffMs = slowBackoffMs(slowCount, intervalMs);
+      }
+      const nextProbeAt = remember(spec.id, mark, slowStatus, slowCount, finishedAt, backoffMs);
+      logWarn("recovery_probe_failed", {
+        provider: spec.id,
+        status,
+        error: res.error,
+        model: res.model,
+        failureClass: slow ? "slow" : "transient",
+        consecutive: slowCount,
+        nextProbeAt,
+        backoffMs,
+        suppressedTicks: suppressed,
+        at: finishedAt,
+      });
+    }
+  }
+
+  function scheduleTick(bypassWait: boolean): Promise<void> {
+    if (inflight) return inflight; // in-flight guard:极端超时一轮可 9×30s,防 tick 重叠;手动也不另起一条
+    inflight = runTick(bypassWait)
+      .catch((err: unknown) => {
+        logWarn("recovery_prober_tick_failed", { err: errorText(err) });
       })
       .finally(() => {
         inflight = null;
@@ -221,10 +403,10 @@ export function startRecoveryProber(
   }
 
   const timer = setInterval(() => {
-    if (!stopped) void scheduleTick();
+    if (!stopped) void scheduleTick(false);
   }, intervalMs);
   timer.unref?.();
-  void scheduleTick(); // runOnStart:部署后处于降级中的 provider 立即开始积累恢复证据
+  void scheduleTick(false); // runOnStart:无退避记录时立即探;已有退避则遵守,不走手动强制
 
   log.info("recovery_prober_started", { intervalMs, providers: STATIC_KEY_PROVIDERS.length });
   return {
@@ -232,6 +414,6 @@ export function startRecoveryProber(
       stopped = true;
       clearInterval(timer);
     },
-    runNow: scheduleTick,
+    runNow: () => scheduleTick(true),
   };
 }
