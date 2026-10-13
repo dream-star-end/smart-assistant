@@ -111,6 +111,7 @@ describe('GNSS-X blueprint generation', () => {
     assert.deepEqual(prepared.permissionSummary.identity, {
       probeActionId: 'time',
       accountKeyPointer: '/result/content/0/type',
+      failurePointers: ['/error', '/result/isError'],
     })
   })
 
@@ -344,22 +345,40 @@ describe('GNSS-X through the connector engine (mock upstream)', () => {
     assert.match(String(buildGnssXBlueprint(snapshot).description), /-32001.*检查 Token 和各工具剩余配额/)
   })
 
-  test('identity probe only yields an account key from a successful response', async () => {
-    const pointer = '/result/content/0/type'
+  test('identity probe: failure pointers flag both 2xx error forms; success yields the key', async () => {
+    const identity = compiled().identity!
+    const flagged = (result: unknown) =>
+      (identity.failurePointers ?? []).some((pointer) => {
+        const v = resolveResultPointer(result, pointer)
+        return v !== undefined && v !== null && v !== false
+      })
     reply = () => ({
       status: 200,
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32001, message: 'quota' } }),
     })
-    assert.equal(resolveResultPointer(await call('time', {}), pointer), undefined)
+    const rpcError = await call('time', {})
+    assert.equal(flagged(rpcError), true)
+    assert.equal(resolveResultPointer(rpcError, identity.accountKeyPointer), undefined)
     reply = () => ({
       status: 200,
       body: JSON.stringify({
         jsonrpc: '2.0',
         id: 1,
-        result: { content: [{ type: 'text', text: '2025-10-13T00:00:00Z' }] },
+        result: { isError: true, content: [{ type: 'text', text: 'Token quota exhausted' }] },
       }),
     })
-    assert.equal(resolveResultPointer(await call('time', {}), pointer), 'text')
+    assert.equal(flagged(await call('time', {})), true)
+    reply = () => ({
+      status: 200,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        result: { isError: false, content: [{ type: 'text', text: '2025-10-13T00:00:00Z' }] },
+      }),
+    })
+    const ok = await call('time', {})
+    assert.equal(flagged(ok), false)
+    assert.equal(resolveResultPointer(ok, identity.accountKeyPointer), 'text')
   })
 
   test('HTTP 200 carrying error -32001 reaches the agent as result.error', async () => {
@@ -399,6 +418,8 @@ describe('GNSS-X through the connector engine (mock upstream)', () => {
       longitude_deg: 114,
       height_range_km: '[100,1000]',
     }), isCode('RESULT_TOO_LARGE'))
-    assert.match(connectorRpcErrorEnvelope('RESULT_TOO_LARGE').nextAction, /增大步长/)
+    assert.match(connectorRpcErrorEnvelope('RESULT_TOO_LARGE').nextAction, /缩小查询范围/)
+    // GNSS-X 自己的说明给出具体上限和步长建议。
+    assert.match(String(buildGnssXBlueprint(snapshot).description), /256KB.*增大步长/)
   })
 })

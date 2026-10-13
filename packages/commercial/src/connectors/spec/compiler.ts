@@ -697,6 +697,7 @@ export function compileSpec(rawSpec: unknown, securityDecision: unknown): Compil
     assertResultPointer(spec.identity.accountKeyPointer)
     if (spec.identity.accountHintPointer !== undefined)
       assertResultPointer(spec.identity.accountHintPointer)
+    for (const pointer of spec.identity.failurePointers ?? []) assertResultPointer(pointer)
   }
 
   // ⑤ 组装 ExecContract + hash

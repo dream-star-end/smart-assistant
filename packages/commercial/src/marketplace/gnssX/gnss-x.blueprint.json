@@ -35,7 +35,11 @@
   },
   "identity": {
     "actionId": "time",
-    "accountKeyPointer": "/result/content/0/type"
+    "accountKeyPointer": "/result/content/0/type",
+    "failurePointers": [
+      "/error",
+      "/result/isError"
+    ]
   },
   "actions": [
     {

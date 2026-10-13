@@ -279,8 +279,8 @@ const READ_AUTH_EXACT: Record<string, Exact> = {
     retrySafe: 'no',
     requiresReauth: false,
     sideEffect: 'none',
-    nextAction: '缩小时间或空间范围、增大步长或减少条数后重试，不要原样重放',
-    message: '结果超过单次上限（256KB / 数组 200 项 / 嵌套 8 层）',
+    nextAction: '缩小查询范围、减少条数或分批读取后重试，不要原样重放',
+    message: '结果超过单次返回上限',
   },
   WRITE_DISABLED: {
     retrySafe: 'no',

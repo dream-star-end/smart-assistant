@@ -41,6 +41,8 @@ export const GNSS_X_IDENTITY_ACTION = 'time'
  * 只有一个 GNSS-X 连接。成功响应的形状以真实 Token 冒烟为准。
  */
 export const GNSS_X_IDENTITY_POINTER = '/result/content/0/type'
+/** 探针结果里出现这些字段（JSON-RPC error 或 MCP isError=true）即判 Token 被拒，绑定失败。 */
+export const GNSS_X_IDENTITY_FAILURE_POINTERS = ['/error', '/result/isError']
 
 /** 上游 20 个绘图工具（复用 GNSS-X 站内 LLM 出图）。任务要求一律不收。 */
 export const GNSS_X_DRAWING_TOOLS = [
@@ -426,7 +428,11 @@ export function buildGnssXBlueprint(
     visibility: 'public',
     apiOrigin: GNSS_X_API_ORIGIN,
     auth: { mode: 'static-token', placement: options.tokenPlacement ?? GNSS_X_TOKEN_PLACEMENT },
-    identity: { actionId: GNSS_X_IDENTITY_ACTION, accountKeyPointer: GNSS_X_IDENTITY_POINTER },
+    identity: {
+      actionId: GNSS_X_IDENTITY_ACTION,
+      accountKeyPointer: GNSS_X_IDENTITY_POINTER,
+      failurePointers: GNSS_X_IDENTITY_FAILURE_POINTERS,
+    },
     actions: selected.map((name) => buildAction(byName.get(name)!)),
   }
 }

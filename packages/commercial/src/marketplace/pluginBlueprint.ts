@@ -530,7 +530,11 @@ export function compilePluginBlueprint(input: unknown): Record<string, unknown> 
   }
 
   const identity = object(raw.identity, 'blueprint.identity')
-  exactKeys(identity, ['actionId', 'accountKeyPointer', 'accountHintPointer'], 'blueprint.identity')
+  exactKeys(
+    identity,
+    ['actionId', 'accountKeyPointer', 'accountHintPointer', 'failurePointers'],
+    'blueprint.identity',
+  )
   const identityAction = string(identity.actionId, 'blueprint.identity.actionId', 1, 64)
   if (!seen.has(identityAction)) invalid('blueprint.identity.actionId must name an action')
   const accountKeyPointer = string(
@@ -549,6 +553,12 @@ export function compilePluginBlueprint(input: unknown): Record<string, unknown> 
     (accountHintPointer && !POINTER_RE.test(accountHintPointer))
   )
     invalid('blueprint identity pointers must be JSON pointers')
+  const failurePointers =
+    identity.failurePointers === undefined
+      ? undefined
+      : stringList(identity.failurePointers, 'blueprint.identity.failurePointers', 1, 4, 256)
+  if (failurePointers?.some((pointer) => !POINTER_RE.test(pointer)))
+    invalid('blueprint identity pointers must be JSON pointers')
 
   return {
     kind: 'connector',
@@ -565,6 +575,7 @@ export function compilePluginBlueprint(input: unknown): Record<string, unknown> 
         probeActionId: identityAction,
         accountKeyPointer,
         ...(accountHintPointer ? { accountHintPointer } : {}),
+        ...(failurePointers ? { failurePointers } : {}),
       },
       actions,
     },

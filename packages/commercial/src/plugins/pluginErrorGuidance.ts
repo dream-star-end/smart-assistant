@@ -536,8 +536,8 @@ const ROWS: Record<string, Row> = {
   RESULT_TOO_LARGE: {
     retrySafe: 'no',
     requiresReauth: false,
-    message: '结果超过单次上限（256KB / 数组 200 项 / 嵌套 8 层）',
-    nextAction: '缩小时间或空间范围、增大步长或减少条数后重试，不要原样重放',
+    message: '结果超过单次返回上限',
+    nextAction: '缩小查询范围、减少条数或分批读取后重试，不要原样重放',
   },
   PLUGIN_DISABLED: {
     retrySafe: 'no',
