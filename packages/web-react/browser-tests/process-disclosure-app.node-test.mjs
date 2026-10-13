@@ -149,8 +149,22 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
     }
 
     async function frameInView(page, locator, name) {
-      await locator.waitFor();
-      const visible = await locator.evaluate((el) => {
+      // OCV5-409: when a turn settles, its live timeline row is replaced by the persisted row. CI caught
+      // the matched node already detached (connected:false, chain ending in chat-timeline-row-live), so
+      // a detached match is re-resolved a few times; a connected node outside the list still fails.
+      let visible;
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        await locator.waitFor();
+        visible = await locator.evaluate(measureFrame);
+        if (!(visible.reason === "missing" && visible.connected === false)) break;
+        await page.waitForTimeout(100);
+      }
+      assert.ok(visible.ok, `${name} not in view: ${JSON.stringify(visible)}`);
+      evidence.frames.push({ name, ...visible });
+      return visible;
+    }
+
+    function measureFrame(el) {
         const scroller = el.closest(".chat-scroll-area");
         if (!(scroller instanceof HTMLElement) || !(el instanceof HTMLElement)) {
           const chain = [];
@@ -176,10 +190,6 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
           viewBottom: Math.round(box.bottom),
           text: (el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 90),
         };
-      });
-      assert.ok(visible.ok, `${name} not in view: ${JSON.stringify(visible)}`);
-      evidence.frames.push({ name, ...visible });
-      return visible;
     }
 
     async function shotFramed(page, locator, name) {
