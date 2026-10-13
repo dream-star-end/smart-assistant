@@ -12,6 +12,8 @@ import {
   completeSettlementJob,
   failOrRequeueMaterializationJob,
   failOrRequeueSettlementJob,
+  isolateLeasedMaterializationJob,
+  isPermanentTapeInputError,
   renewMaterializationLease,
   type MaterializationJob,
   type SettlementJob,
@@ -62,7 +64,15 @@ export function startTapeJobScheduler(deps: TapeJobSchedulerDeps): TapeJobSchedu
         if (!done) onError(new Error(`materialization complete lost fencing ${job.jobId}`));
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        await failOrRequeueMaterializationJob(deps.pool, job, message);
+        if (isPermanentTapeInputError(err)) {
+          try {
+            await isolateLeasedMaterializationJob(deps.pool, job, message);
+          } catch (writeErr) {
+            onError(writeErr);
+          }
+        } else {
+          await failOrRequeueMaterializationJob(deps.pool, job, message);
+        }
         onError(err);
       }
     }

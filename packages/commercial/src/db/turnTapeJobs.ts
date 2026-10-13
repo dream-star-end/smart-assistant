@@ -15,6 +15,14 @@ export const BACKOFF_BASE_MS = 5_000;
 export const BACKOFF_MAX_MS = 5 * 60_000;
 export const SETTLEMENT_COLD_BACKOFF_MS = 60 * 60_000;
 export const AWAITING_MATERIALIZATION = "awaiting_materialization";
+/** Audit prefix only. Claim still keys off next_attempt_at, not this text. */
+export const PERMANENT_TAPE_INPUT_PREFIX = "oc-tape-permanent:";
+
+export function isPermanentTapeInputError(err: unknown): boolean {
+  return !!err
+    && typeof err === "object"
+    && (err as { permanentTapeInput?: unknown }).permanentTapeInput === true;
+}
 
 export function jobBackoffMs(attempt: number): number {
   if (attempt <= 1) return BACKOFF_BASE_MS;
@@ -348,6 +356,98 @@ export async function failOrRequeueMaterializationJob(
     [job.jobId, job.leaseOwner, job.leaseEpoch, error.slice(0, 2000), jobBackoffMs(job.attempt)],
   );
   return (result.rowCount ?? 0) === 1 ? "requeued" : "lost";
+}
+
+/** Park a leased job at next_attempt_at=infinity. Job CAS and tape header commit together. */
+export async function isolateLeasedMaterializationJob(
+  pool: Pool,
+  job: MaterializationJob,
+  reason: string,
+): Promise<"isolated" | "lost"> {
+  const message = `${PERMANENT_TAPE_INPUT_PREFIX}${reason}`.slice(0, 2000);
+  const client = await pool.connect();
+  let begun = false;
+  try {
+    await client.query("BEGIN");
+    begun = true;
+    const result = await client.query(
+      `UPDATE turn_tape_materialization_jobs
+          SET status='failed', last_error=$4,
+              next_attempt_at='infinity'::timestamptz,
+              updated_at=NOW()
+        WHERE job_id=$1 AND lease_owner=$2 AND lease_epoch=$3 AND status='leased'`,
+      [job.jobId, job.leaseOwner, job.leaseEpoch, message],
+    );
+    if ((result.rowCount ?? 0) !== 1) {
+      await client.query("ROLLBACK");
+      begun = false;
+      return "lost";
+    }
+    const header = await client.query(
+      `UPDATE client_session_turn_tapes
+          SET materialization_status='failed',
+              materialization_attempts=$4,
+              materialization_error=$5
+        WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
+      [job.sessionId, job.userId, job.tapeId, job.attempt, message],
+    );
+    if ((header.rowCount ?? 0) !== 1) {
+      throw new Error(`tape header isolate updated ${header.rowCount ?? 0} rows`);
+    }
+    await client.query("COMMIT");
+    begun = false;
+    return "isolated";
+  } catch (err) {
+    if (begun) {
+      await client.query("ROLLBACK");
+      begun = false;
+    }
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Explicit un-park. Only a failed job sitting at infinity moves back to queued.
+ * attempt and last_error stay. Blank reason is rejected before any SQL.
+ * Not called by the scheduler.
+ */
+export async function releaseParkedMaterializationJob(
+  q: Queryable,
+  input: { jobId: string; reason: string },
+): Promise<number> {
+  if (!input.reason.trim()) throw new Error("release reason is required");
+  // Status filters do not wait on a concurrent updater whose committed row
+  // still looks leased. Lock the job id first so recovery shares that row lock.
+  const ownsClient = typeof (q as { release?: unknown }).release !== "function";
+  const client = ownsClient ? await (q as Pool).connect() : q;
+  let begun = false;
+  try {
+    await client.query("BEGIN");
+    begun = true;
+    await client.query(
+      `SELECT job_id FROM turn_tape_materialization_jobs WHERE job_id=$1 FOR UPDATE`,
+      [input.jobId],
+    );
+    const result = await client.query(
+      `UPDATE turn_tape_materialization_jobs
+          SET status='queued', next_attempt_at=NOW(),
+              lease_owner=NULL, lease_until=NULL, updated_at=NOW()
+        WHERE job_id=$1
+          AND status='failed'
+          AND next_attempt_at='infinity'::timestamptz`,
+      [input.jobId],
+    );
+    await client.query("COMMIT");
+    begun = false;
+    return result.rowCount ?? 0;
+  } catch (err) {
+    if (begun) await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    if (ownsClient) (client as PoolClient).release();
+  }
 }
 
 export async function completeSettlementJob(

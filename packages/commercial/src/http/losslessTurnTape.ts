@@ -516,9 +516,10 @@ export function parseLosslessTurnPayload(raw: unknown): LosslessTurnPayload {
         billing.parentSessionId !== sessionId ||
         (continuationOfTurnKey !== undefined && billing.parentTurnKey !== groupBillingOwnerTurnKey)
       ) {
-        throw new Error(
+        // OCV5-396: predicate unchanged. Only this locator throw is permanent.
+        throw Object.assign(new Error(
           `turn tape payload.agentGroups[${groupIndex}].engineBillings[${billingIndex}] parent locator is invalid`,
-        );
+        ), { permanentTapeInput: true });
       }
       if (!billing.delegateAgentId) {
         throw new Error(
