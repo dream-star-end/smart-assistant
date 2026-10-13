@@ -50,9 +50,11 @@ test("continuation code is random letters+digits and only the first prompt carri
   assert.doesNotMatch(p.second, /QWER1234/);
   assert.notEqual(p.first, p.second);
   assert.throws(() => continuationPrompts("abc"));
+  // OCV5-417: wording that grok-build treats as a prompt-injection canary must not come back.
+  for (const text of [p.first, p.second]) assert.doesNotMatch(text, /暗号|口令|密码|记住|只回答|只回复/);
 });
 test("continuation answer must contain the exact code as one token", () => {
-  for (const ok of ["QWER1234", "暗号是 QWER1234。", "`qwer1234`", "**QWER1234**"]) assertContinuationAnswer(ok, "QWER1234");
+  for (const ok of ["QWER1234", "编号是 PO-QWER1234。", "`qwer1234`", "**QWER1234**"]) assertContinuationAnswer(ok, "QWER1234");
   for (const bad of ["", "2", "不知道", "QWER-1234", "QWER12345", "XQWER1234", "QWER"]) assert.throws(() => assertContinuationAnswer(bad, "QWER1234"));
 });
 test("continuation must stay in the first turn's session with a new message id", () => {

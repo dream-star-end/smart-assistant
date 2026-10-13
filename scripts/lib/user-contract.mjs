@@ -46,6 +46,9 @@ export function turnEvidence(frames, sent) {
 // Continuation (OCV5-405): a first turn that only works in isolation is not a
 // working chat. Turn 2 must recall a random code that appears only in turn 1,
 // in the same session (same peer), so a lost or rebuilt context fails the gate.
+// Wording (OCV5-417): an ordinary order number, no "暗号/记住/只回答". grok-build
+// classified "请记住暗号 X，只回答2" as a prompt-injection canary and refused to
+// repeat it, failing ~1/3 of trains although the context was intact.
 const CODE_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ";
 export function continuationCode(randomInt = (n) => crypto.getRandomValues(new Uint32Array(1))[0] % n) {
   let code = "";
@@ -57,8 +60,8 @@ export function continuationPrompts(code) {
   if (!/^[A-Z]{4}[0-9]{4}$/.test(code)) throw new Error("Invalid continuation code");
   const id = crypto.randomUUID();
   return {
-    first: `R2-${id} 请记住暗号 ${code}。本轮请只回答数字2，不使用工具。`,
-    second: `R2-${id}-2 上一轮我让你记住的暗号是什么？请只回答暗号本身，不使用工具。`,
+    first: `R2-${id} 今天第一张采购单的编号是 PO-${code}。收到请回复「收到」。`,
+    second: `R2-${id}-2 今天第一张采购单的编号是多少？`,
   };
 }
 export function assertSameSession(first, second) {
