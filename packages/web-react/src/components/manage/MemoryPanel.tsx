@@ -184,8 +184,17 @@ export function MemoryPanel({
   );
 }
 
+const WRITE_OPERATION_NAMES = new Set([
+  "core_write",
+  "core_update",
+  "core_delete",
+  "profile_write",
+  "archival_add",
+  "archival_delete",
+  "auto_add",
+]);
+
 const OPERATION_LABELS: Record<string, string> = {
-  index_injected: "索引注入",
   core_search: "核心检索",
   core_read: "正文读取",
   core_write: "新增核心记忆",
@@ -525,9 +534,22 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
   const retrievals = value?.byOperation.filter((row) =>
     ["core_search", "session_search", "archival_search"].includes(row.operation),
   ) ?? [];
+  const visibleOperations = value?.byOperation.filter(
+    (row) => row.operation !== "index_injected" && !WRITE_OPERATION_NAMES.has(row.operation),
+  ) ?? [];
   const retrievalEvents = retrievals.reduce((sum, row) => sum + row.events, 0);
   const hitEvents = retrievals.reduce((sum, row) => sum + row.hits, 0);
   const hitRate = retrievalEvents > 0 ? Math.round((hitEvents / retrievalEvents) * 100) : 0;
+  const writeSources = value?.writeSources ?? {
+    uiUserSaves: 0,
+    autoDreamWrites: 0,
+    unattributedWrites: 0,
+  };
+  const legacyIndex = value?.legacyUnverifiedIndexVisibility ?? 0;
+  const hasWriteSources =
+    writeSources.uiUserSaves > 0 ||
+    writeSources.autoDreamWrites > 0 ||
+    writeSources.unattributedWrites > 0;
 
   return (
     <div className="flex flex-col gap-6 px-4 pb-6 pt-5">
@@ -535,7 +557,7 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
         <SectionHeading
           className="min-w-0 flex-1 pb-0"
           title="记忆在会话里如何被使用"
-          hint="按记忆被检索、写入和注入的真实记录统计。"
+          hint="已确认操作只含检索、读取，以及来源明确的页面保存和自动整理。索引是否交给模型这里不提供。"
           hideHintOnMobile
         />
         {/* 时间范围是视图内的行内值,不是一只灰色下拉框。 */}
@@ -567,21 +589,32 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
       )}
       {loading ? (
         <ListSkeleton rows={4} />
-      ) : err ? null : !value || !totals || totals.events === 0 ? (
+      ) : err ? null : !value || !totals || (totals.events === 0 && legacyIndex === 0 && !hasWriteSources) ? (
         <div className="-mx-4">
           <EmptyState
             icon={BarChart3}
-            title="还没有可统计的记忆操作"
-            hint="后续检索、写入和索引注入会自动出现在这里。"
+            title="还没有已确认的记忆操作"
+            hint="检索、读取、页面保存和自动整理会出现在这里。索引是否交给模型目前不提供，因为缺少引擎接受回执。"
           />
+          <p data-testid="index-delivery" className="px-4 text-body text-muted">
+            索引实际交付不提供：当前缺少引擎接受回执。
+          </p>
         </div>
       ) : (
         <>
+          <p data-testid="index-delivery" className="text-body text-muted">
+            索引实际交付不提供：当前缺少引擎接受回执。
+          </p>
+          {legacyIndex > 0 && (
+            <p data-testid="legacy-index-visibility" className="text-body text-muted">
+              另有 {legacyIndex} 条旧的索引事件，只代表当时库非空这种未核实可见性，不是确认使用，也不能回填。
+            </p>
+          )}
           {totals.freshnessGaps > 0 && (
             // 警告是一行带圆点的彩色文字,不是一块着色的框。
-            <p className="flex items-start gap-2 text-body text-warning">
+            <p data-testid="freshness-shadow" className="flex items-start gap-2 text-body text-warning">
               <span aria-hidden="true" className="mt-[7px] size-1.5 shrink-0 rounded-full bg-warning" />
-              发现 {totals.freshnessGaps} 次“询问当前状态但仅使用历史记忆、未见实时证据”的影子风险。
+              发现 {totals.freshnessGaps} 次新鲜度影子信号。窗口里可能同时有旧的库可见性、文件变化和自动写入，只能当作影子风险，不能补成使用记录或交付记录。
             </p>
           )}
 
@@ -589,9 +622,9 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
           <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border bg-border lg:grid-cols-4">
             {[
               ["使用会话", totals.sessions],
-              ["记忆操作", totals.events],
+              ["已确认操作", totals.confirmedOperations],
               ["检索命中率", `${hitRate}%`],
-              ["新鲜度风险", totals.freshnessGaps],
+              ["影子信号", totals.freshnessGaps],
             ].map(([label, metric]) => (
               <div key={String(label)} className="flex flex-col gap-1 bg-surface px-4 py-3">
                 <dt className="text-meta text-faint">{label}</dt>
@@ -602,29 +635,60 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
             ))}
           </dl>
 
-          <section aria-label="按操作">
-            <SectionHeading title="按操作" count={value.byOperation.length} />
-            <ListGroup>
-              {value.byOperation.map((row) => (
-                <ListRow
-                  key={`${row.operation}:${row.memoryType}`}
-                  className="grid grid-cols-[1fr_auto] items-center gap-4"
-                >
-                  <div className="min-w-0">
-                    <div className="truncate text-[14px] font-medium leading-5 text-fg">
-                      {OPERATION_LABELS[row.operation] ?? row.operation}
+          {hasWriteSources && (
+            <section aria-label="写入来源">
+              <SectionHeading title="写入来源" />
+              <ListGroup>
+                {writeSources.uiUserSaves > 0 && (
+                  <ListRow>
+                    <div className="text-[14px] font-medium leading-5 text-fg">
+                      用户在页面保存 {writeSources.uiUserSaves} 次（不是这个会话里的助手写的）
                     </div>
-                    <MetaLine className="mt-0.5">
-                      <span>{row.sessions} 个会话</span>
-                      <span>p50 {row.p50Ms}ms</span>
-                      <span>p95 {row.p95Ms}ms</span>
-                    </MetaLine>
-                  </div>
-                  <div className="text-right text-body tabular-nums text-fg">{row.events} 次</div>
-                </ListRow>
-              ))}
-            </ListGroup>
-          </section>
+                  </ListRow>
+                )}
+                {writeSources.autoDreamWrites > 0 && (
+                  <ListRow>
+                    <div className="text-[14px] font-medium leading-5 text-fg">
+                      自动整理写入 {writeSources.autoDreamWrites} 次（不是这个会话里的助手写的）
+                    </div>
+                  </ListRow>
+                )}
+                {writeSources.unattributedWrites > 0 && (
+                  <ListRow>
+                    <div className="text-[14px] font-medium leading-5 text-fg">
+                      未归因写入 {writeSources.unattributedWrites} 次（快照或来源不清楚，不能算某个助手写的）
+                    </div>
+                  </ListRow>
+                )}
+              </ListGroup>
+            </section>
+          )}
+
+          {visibleOperations.length > 0 && (
+            <section aria-label="按操作">
+              <SectionHeading title="按操作" count={visibleOperations.length} />
+              <ListGroup>
+                {visibleOperations.map((row) => (
+                  <ListRow
+                    key={`${row.operation}:${row.memoryType}`}
+                    className="grid grid-cols-[1fr_auto] items-center gap-4"
+                  >
+                    <div className="min-w-0">
+                      <div className="truncate text-[14px] font-medium leading-5 text-fg">
+                        {OPERATION_LABELS[row.operation] ?? row.operation}
+                      </div>
+                      <MetaLine className="mt-0.5">
+                        <span>{row.sessions} 个会话</span>
+                        <span>p50 {row.p50Ms}ms</span>
+                        <span>p95 {row.p95Ms}ms</span>
+                      </MetaLine>
+                    </div>
+                    <div className="text-right text-body tabular-nums text-fg">{row.events} 次</div>
+                  </ListRow>
+                ))}
+              </ListGroup>
+            </section>
+          )}
 
           <section aria-label="最近会话">
             <SectionHeading title="最近会话" />
@@ -636,10 +700,12 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
                     <TimeAgo value={row.lastAt} className="shrink-0 text-meta tabular-nums text-faint" />
                   </div>
                   <MetaLine className="mt-0.5">
-                    <span>{row.events} 次操作</span>
+                    <span>{row.events} 次已确认操作</span>
                     <span>{row.searches} 次检索</span>
-                    <span>{row.writes} 次写入</span>
-                    {row.freshnessGaps > 0 && <span className="text-warning">{row.freshnessGaps} 次新鲜度风险</span>}
+                    {row.uiUserSaves > 0 && <span>页面保存 {row.uiUserSaves}</span>}
+                    {row.autoDreamWrites > 0 && <span>自动整理 {row.autoDreamWrites}</span>}
+                    {row.unattributedWrites > 0 && <span>未归因 {row.unattributedWrites}</span>}
+                    {row.freshnessGaps > 0 && <span className="text-warning">{row.freshnessGaps} 次影子信号</span>}
                   </MetaLine>
                 </ListRow>
               ))}

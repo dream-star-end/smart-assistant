@@ -459,13 +459,17 @@ describe("MemoryPanel · 使用情况", () => {
     mockIndex([]);
     vi.spyOn(api, "getMemoryUsage").mockResolvedValue({
       window: { days: 30, from: new Date(0).toISOString(), to: new Date().toISOString() },
-      totals: { events: 8, sessions: 3, hits: 3, noMatch: 1, errors: 0, denied: 0, freshnessGaps: 1 },
+      totals: { events: 8, confirmedOperations: 8, sessions: 3, hits: 3, noMatch: 1, errors: 0, denied: 0, freshnessGaps: 1 },
+      indexDelivery: { status: "unavailable", reason: "missing_engine_acceptance_receipt" },
+      legacyUnverifiedIndexVisibility: 0,
+      writeSources: { uiUserSaves: 0, autoDreamWrites: 0, unattributedWrites: 0 },
+      freshnessSignal: { kind: "mixed_shadow", provesUsage: false, provesDelivery: false, provesWrongAnswer: false },
       byOperation: [
         { operation: "core_search", memoryType: "core", events: 4, sessions: 2, hits: 3, noMatch: 1, p50Ms: 120, p95Ms: 850 },
         { operation: "core_update", memoryType: "core", events: 4, sessions: 2, hits: 0, noMatch: 0, p50Ms: 8, p95Ms: 15 },
       ],
       recentSessions: [
-        { sessionKey: "agent:main:webchat:dm:s1", title: "检查当前部署版本", lastAt: Date.now(), events: 5, searches: 3, writes: 2, freshnessGaps: 1 },
+        { sessionKey: "agent:main:webchat:dm:s1", title: "检查当前部署版本", lastAt: Date.now(), events: 5, searches: 3, uiUserSaves: 0, autoDreamWrites: 0, unattributedWrites: 0, freshnessGaps: 1 },
       ],
     });
 
@@ -479,6 +483,77 @@ describe("MemoryPanel · 使用情况", () => {
     expect(screen.getByText("检查当前部署版本")).toBeInTheDocument();
     expect(screen.getByText(/发现 1 次/)).toBeInTheDocument();
     expect(api.getMemoryUsage).toHaveBeenCalledWith(auth, "main", 30);
+  });
+
+  test("索引缺测写成不提供，旧索引和快照不能显示成确认使用或 0 次注入", async () => {
+    mockIndex([]);
+    vi.spyOn(api, "getMemoryUsage").mockResolvedValue({
+      window: { days: 30, from: new Date(0).toISOString(), to: new Date().toISOString() },
+      totals: {
+        events: 12,
+        confirmedOperations: 2,
+        sessions: 1,
+        hits: 1,
+        noMatch: 1,
+        errors: 0,
+        denied: 0,
+        freshnessGaps: 2,
+      },
+      indexDelivery: { status: "unavailable", reason: "missing_engine_acceptance_receipt" },
+      legacyUnverifiedIndexVisibility: 4,
+      writeSources: { uiUserSaves: 1, autoDreamWrites: 1, unattributedWrites: 3 },
+      freshnessSignal: {
+        kind: "mixed_shadow",
+        provesUsage: false,
+        provesDelivery: false,
+        provesWrongAnswer: false,
+      },
+      byOperation: [
+        { operation: "index_injected", memoryType: "system", events: 4, sessions: 1, hits: 0, noMatch: 0, p50Ms: 1, p95Ms: 2 },
+        { operation: "core_search", memoryType: "core", events: 1, sessions: 1, hits: 1, noMatch: 0, p50Ms: 10, p95Ms: 10 },
+        { operation: "archival_search", memoryType: "archival", events: 1, sessions: 1, hits: 0, noMatch: 1, p50Ms: 12, p95Ms: 12 },
+        { operation: "core_write", memoryType: "core", events: 6, sessions: 1, hits: 0, noMatch: 0, p50Ms: 4, p95Ms: 4 },
+      ],
+      recentSessions: [
+        {
+          sessionKey: "agent:main:webchat:dm:s1",
+          title: "检查当前部署版本",
+          lastAt: Date.now(),
+          events: 2,
+          searches: 2,
+          uiUserSaves: 1,
+          autoDreamWrites: 1,
+          unattributedWrites: 3,
+          freshnessGaps: 2,
+        },
+      ],
+    });
+
+    renderPanel();
+    fireEvent.click(screen.getByRole("tab", { name: "用量" }));
+
+    expect(await screen.findByText(/发现 2 次/)).toBeInTheDocument();
+    expect(screen.queryByText(/仅使用历史记忆/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/错误回答/)).not.toBeInTheDocument();
+    expect(screen.queryByText("索引注入")).not.toBeInTheDocument();
+
+    const delivery = await screen.findByTestId("index-delivery");
+    expect(delivery).toHaveTextContent("不提供");
+    expect(delivery).toHaveTextContent("缺少引擎接受回执");
+    expect(delivery.textContent ?? "").not.toMatch(/0|没注入|未注入|索引注入/);
+    expect(screen.queryByText("索引注入")).not.toBeInTheDocument();
+    expect(screen.getByTestId("legacy-index-visibility")).toHaveTextContent("未核实可见性");
+    expect(screen.getByTestId("legacy-index-visibility")).toHaveTextContent("4");
+    expect(screen.getByTestId("freshness-shadow").textContent ?? "").toMatch(/影子/);
+    expect(screen.getByTestId("freshness-shadow").textContent ?? "").not.toMatch(
+      /仅使用历史记忆|错误回答|索引确实在提示/,
+    );
+    expect(screen.getByText("50%")).toBeInTheDocument();
+    expect(screen.getByText(/用户在页面保存/)).toBeInTheDocument();
+    expect(screen.getByText(/自动整理写入/)).toBeInTheDocument();
+    expect(screen.getByText(/未归因写入/)).toBeInTheDocument();
+    expect(screen.queryByText(/次写入/)).not.toBeInTheDocument();
+    expect(screen.queryByText("新增核心记忆")).not.toBeInTheDocument();
   });
 });
 
@@ -894,7 +969,11 @@ describe("MemoryPanel · 读失败不再与空态并排", () => {
       .mockRejectedValueOnce(new ApiError({ status: 500, message: "统计服务暂不可用", requestId: "r1" }))
       .mockResolvedValueOnce({
         window: { days: 30, from: new Date(0).toISOString(), to: new Date().toISOString() },
-        totals: { events: 2, sessions: 1, hits: 1, noMatch: 0, errors: 0, denied: 0, freshnessGaps: 0 },
+        totals: { events: 2, confirmedOperations: 2, sessions: 1, hits: 1, noMatch: 0, errors: 0, denied: 0, freshnessGaps: 0 },
+        indexDelivery: { status: "unavailable", reason: "missing_engine_acceptance_receipt" },
+        legacyUnverifiedIndexVisibility: 0,
+        writeSources: { uiUserSaves: 0, autoDreamWrites: 0, unattributedWrites: 0 },
+        freshnessSignal: { kind: "mixed_shadow", provesUsage: false, provesDelivery: false, provesWrongAnswer: false },
         byOperation: [
           { operation: "core_search", memoryType: "core", events: 2, sessions: 1, hits: 1, noMatch: 0, p50Ms: 10, p95Ms: 20 },
         ],
@@ -915,7 +994,11 @@ describe("MemoryPanel · 读失败不再与空态并排", () => {
     mockIndex([]);
     vi.spyOn(api, "getMemoryUsage").mockResolvedValue({
       window: { days: 30, from: new Date(0).toISOString(), to: new Date().toISOString() },
-      totals: { events: 2, sessions: 1, hits: 1, noMatch: 0, errors: 0, denied: 0, freshnessGaps: 0 },
+      totals: { events: 2, confirmedOperations: 2, sessions: 1, hits: 1, noMatch: 0, errors: 0, denied: 0, freshnessGaps: 0 },
+      indexDelivery: { status: "unavailable", reason: "missing_engine_acceptance_receipt" },
+      legacyUnverifiedIndexVisibility: 0,
+      writeSources: { uiUserSaves: 0, autoDreamWrites: 0, unattributedWrites: 0 },
+      freshnessSignal: { kind: "mixed_shadow", provesUsage: false, provesDelivery: false, provesWrongAnswer: false },
       byOperation: [],
       recentSessions: [],
     });

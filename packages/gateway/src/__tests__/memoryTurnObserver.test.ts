@@ -14,7 +14,9 @@ const {
   isCurrentEvidenceTool,
   recordSnapshotDiff,
 } = await import('../memoryTurnObserver.js')
-const { MemoryDir, closeSessionsDb, getSessionsDb } = await import('@openclaude/storage')
+const { MemoryDir, closeSessionsDb, getSessionsDb, recordMemoryUsageEvent } = await import(
+  '@openclaude/storage'
+)
 
 describe('memory freshness evidence classifier', () => {
   test('accepts authoritative live checks', () => {
@@ -112,10 +114,17 @@ describe('turn_snapshot shared memory dir attribution', () => {
       assert.equal(metadata.source, 'turn_snapshot')
       assert.equal(metadata.shared, true)
       assert.equal(metadata.attribution, 'ambiguous')
+      assert.equal(metadata.writer, undefined)
     }
+    const used = db
+      .prepare(
+        `SELECT memory_used FROM memory_turn_context WHERE session_key=? AND turn_index=1`,
+      )
+      .get(sessionKey) as { memory_used: number }
+    assert.equal(used.memory_used, 0)
   })
 
-  test('recordSnapshotDiff keeps literal attribution when memory dir is not a symlink', async () => {
+  test('recordSnapshotDiff marks a private memory dir as attribution unknown and does not use memory', async () => {
     const soloDir = join(TEST_HOME, 'agents', 'solo', 'memory')
     mkdirSync(soloDir, { recursive: true })
     writeFileSync(join(soloDir, 'alpha.md'), 'before')
@@ -141,7 +150,103 @@ describe('turn_snapshot shared memory dir attribution', () => {
     for (const row of rows) {
       assert.equal(row.outcome, 'success')
       const metadata = JSON.parse(row.metadata_json) as Record<string, unknown>
-      assert.deepEqual(metadata, { source: 'turn_snapshot' })
+      assert.equal(metadata.source, 'turn_snapshot')
+      assert.equal(metadata.attribution, 'unknown')
+      assert.equal(metadata.writer, undefined)
+      assert.equal(metadata.shared, undefined)
     }
+    const reasons = db
+      .prepare(
+        `SELECT policy_reason FROM memory_usage_events
+          WHERE session_key=? AND operation IN ('core_write','core_update','core_delete','profile_write')`,
+      )
+      .all(sessionKey) as Array<{ policy_reason: string | null }>
+    assert.ok(reasons.length >= 1)
+    for (const row of reasons) assert.equal(row.policy_reason, 'snapshot_unattributed')
+    const used = db
+      .prepare(
+        `SELECT memory_used FROM memory_turn_context WHERE session_key=? AND turn_index=1`,
+      )
+      .get(sessionKey) as { memory_used: number }
+    assert.equal(used.memory_used, 0)
+  })
+})
+
+describe('non-empty core is not an injection receipt', () => {
+  test('beginTracking does not emit index_injected or mark the turn used; real read and search still do', async () => {
+    const agentId = 'visible-core'
+    const dir = join(TEST_HOME, 'agents', agentId, 'memory')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'notes.md'), 'slug-body-not-telemetry')
+
+    const sessionKey = 'agent:visible-core:webchat:dm:nonempty-core'
+    await beginMemoryTurnTracking({
+      sessionKey,
+      turnIndex: 7,
+      agentId,
+      userText: '当前服务是不是已经上线了',
+    })
+
+    const db = await getSessionsDb()
+    const injected = db
+      .prepare(
+        `SELECT event_id, metadata_json FROM memory_usage_events
+          WHERE session_key=? AND operation='index_injected'`,
+      )
+      .all(sessionKey) as Array<{ event_id: string; metadata_json: string }>
+    assert.equal(injected.length, 0)
+    const afterBegin = db
+      .prepare(
+        `SELECT memory_used FROM memory_turn_context WHERE session_key=? AND turn_index=7`,
+      )
+      .get(sessionKey) as { memory_used: number }
+    assert.equal(afterBegin.memory_used, 0)
+
+    await recordMemoryUsageEvent({
+      eventId: 'visible-core-search',
+      agentId,
+      sessionKey,
+      turnIndex: 7,
+      operation: 'core_search',
+      memoryType: 'core',
+      outcome: 'hit',
+      resultCount: 1,
+    })
+    await recordMemoryUsageEvent({
+      eventId: 'visible-core-read',
+      agentId,
+      sessionKey,
+      turnIndex: 7,
+      operation: 'core_read',
+      memoryType: 'core',
+      outcome: 'success',
+      metadata: { source: 'native_read_tool' },
+    })
+
+    const real = db
+      .prepare(
+        `SELECT operation, metadata_json FROM memory_usage_events
+          WHERE session_key=? AND operation IN ('core_search','core_read')
+          ORDER BY operation`,
+      )
+      .all(sessionKey) as Array<{ operation: string; metadata_json: string }>
+    assert.deepEqual(
+      real.map((row) => row.operation),
+      ['core_read', 'core_search'],
+    )
+    assert.equal(JSON.stringify(real).includes('slug-body-not-telemetry'), false)
+    const afterReal = db
+      .prepare(
+        `SELECT memory_used FROM memory_turn_context WHERE session_key=? AND turn_index=7`,
+      )
+      .get(sessionKey) as { memory_used: number }
+    assert.equal(afterReal.memory_used, 1)
+    const stillNoIndex = db
+      .prepare(
+        `SELECT COUNT(*) AS value FROM memory_usage_events
+          WHERE session_key=? AND operation='index_injected'`,
+      )
+      .get(sessionKey) as { value: number }
+    assert.equal(stillNoIndex.value, 0)
   })
 })

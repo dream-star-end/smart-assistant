@@ -23,7 +23,7 @@ const sharedDirLoggedAgents = new Set<string>()
 function turnSnapshotMetadata(shared: boolean): Record<string, unknown> {
   return shared
     ? { source: 'turn_snapshot', shared: true, attribution: 'ambiguous' }
-    : { source: 'turn_snapshot' }
+    : { source: 'turn_snapshot', attribution: 'unknown' }
 }
 
 function logSharedMemoryDirOnce(
@@ -104,21 +104,6 @@ export async function beginMemoryTurnTracking(input: {
     if (typeof oldest !== 'string') break
     activeSnapshots.delete(oldest)
   }
-  // A non-empty Core library is visible through the per-runner MEMORY slot.
-  // Record turn visibility explicitly so a model that answers from the injected
-  // index without calling core-search still participates in freshness-gap shadowing.
-  if (snapshot.core.size > 0) {
-    await recordMemoryUsageEvent({
-      agentId: input.agentId,
-      sessionKey: input.sessionKey,
-      turnIndex: input.turnIndex,
-      operation: 'index_injected',
-      memoryType: 'system',
-      outcome: 'success',
-      resultCount: snapshot.core.size,
-      metadata: { source: 'turn_visibility' },
-    })
-  }
 }
 
 export async function recordSnapshotDiff(
@@ -141,6 +126,8 @@ export async function recordSnapshotDiff(
       memoryType: 'core',
       outcome: 'success',
       topMatchKey: file,
+      policyReason: 'snapshot_unattributed',
+      affectsMemoryUsed: false,
       metadata,
     })
   }
@@ -154,6 +141,8 @@ export async function recordSnapshotDiff(
       memoryType: 'core',
       outcome: 'success',
       topMatchKey: file,
+      policyReason: 'snapshot_unattributed',
+      affectsMemoryUsed: false,
       metadata,
     })
   }
@@ -165,6 +154,8 @@ export async function recordSnapshotDiff(
       operation: 'profile_write',
       memoryType: 'profile',
       outcome: 'success',
+      policyReason: 'snapshot_unattributed',
+      affectsMemoryUsed: false,
       metadata,
     })
   }

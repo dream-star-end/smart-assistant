@@ -1051,16 +1051,39 @@ export type MemoryIndexResponse = {
   version?: string;
 };
 
+export type MemoryWriteSources = {
+  uiUserSaves: number;
+  autoDreamWrites: number;
+  unattributedWrites: number;
+};
+
+/** 索引是否交给模型没有回执。这不是次数，不能当成 0。 */
+export type MemoryIndexDelivery = {
+  status: "unavailable";
+  reason: "missing_engine_acceptance_receipt";
+};
+
 export type MemoryUsageDashboard = {
   window: { days: number; from: string; to: string };
   totals: {
+    /** 窗口内原始行数，含未核实历史。不是已确认使用。 */
     events: number;
+    confirmedOperations: number;
     sessions: number;
     hits: number;
     noMatch: number;
     errors: number;
     denied: number;
     freshnessGaps: number;
+  };
+  indexDelivery: MemoryIndexDelivery;
+  legacyUnverifiedIndexVisibility: number;
+  writeSources: MemoryWriteSources;
+  freshnessSignal: {
+    kind: "mixed_shadow";
+    provesUsage: false;
+    provesDelivery: false;
+    provesWrongAnswer: false;
   };
   byOperation: Array<{
     operation: string;
@@ -1078,7 +1101,9 @@ export type MemoryUsageDashboard = {
     lastAt: number;
     events: number;
     searches: number;
-    writes: number;
+    uiUserSaves: number;
+    autoDreamWrites: number;
+    unattributedWrites: number;
     freshnessGaps: number;
   }>;
 };

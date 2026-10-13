@@ -38,6 +38,8 @@ export interface MemoryUsageEventInput {
   query?: string | null
   topMatchKey?: string | null
   metadata?: Record<string, unknown>
+  /** Snapshot diffs are file-stamp observations, not proof the turn used memory. */
+  affectsMemoryUsed?: boolean
 }
 
 export interface MemoryUsageEventRow {
@@ -205,7 +207,7 @@ export async function recordMemoryUsageEvent(input: MemoryUsageEventInput): Prom
       topMatchHash,
       JSON.stringify(input.metadata ?? {}),
     )
-    if (sessionKey && turnIndex != null) {
+    if (input.affectsMemoryUsed !== false && sessionKey && turnIndex != null) {
       db.prepare(`
         UPDATE memory_turn_context
            SET memory_used=1
@@ -372,16 +374,39 @@ export async function markMemoryUsageEventsReported(
   })()
 }
 
+export interface MemoryWriteSources {
+  uiUserSaves: number
+  autoDreamWrites: number
+  unattributedWrites: number
+}
+
+/** Engine acceptance of the memory index is not measured. Never a count. */
+export interface MemoryIndexDelivery {
+  status: 'unavailable'
+  reason: 'missing_engine_acceptance_receipt'
+}
+
 export interface MemoryUsageDashboard {
   window: { days: number; from: string; to: string }
   totals: {
+    /** Every stored row in the window, including unverified history. Not confirmed use. */
     events: number
+    confirmedOperations: number
     sessions: number
     hits: number
     noMatch: number
     errors: number
     denied: number
     freshnessGaps: number
+  }
+  indexDelivery: MemoryIndexDelivery
+  legacyUnverifiedIndexVisibility: number
+  writeSources: MemoryWriteSources
+  freshnessSignal: {
+    kind: 'mixed_shadow'
+    provesUsage: false
+    provesDelivery: false
+    provesWrongAnswer: false
   }
   byOperation: Array<{
     operation: string
@@ -399,9 +424,63 @@ export interface MemoryUsageDashboard {
     lastAt: number
     events: number
     searches: number
-    writes: number
+    uiUserSaves: number
+    autoDreamWrites: number
+    unattributedWrites: number
     freshnessGaps: number
   }>
+}
+
+const SEARCH_OPERATIONS = new Set(['core_search', 'session_search', 'archival_search'])
+const WRITE_OPERATIONS = new Set([
+  'core_write',
+  'core_update',
+  'core_delete',
+  'profile_write',
+  'archival_add',
+  'archival_delete',
+  'auto_add',
+])
+
+type WriteSourceKind = 'ui_user_save' | 'auto_dream' | 'unattributed'
+
+function readUsageMetadata(row: Record<string, unknown>): Record<string, unknown> {
+  const raw = row.metadata_json
+  if (typeof raw !== 'string' || !raw.trim()) return {}
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    return parsed as Record<string, unknown>
+  } catch {
+    return {}
+  }
+}
+
+/** Successful writes only. Known sources are ui and auto_dream; everything else is unattributed. */
+function classifySuccessfulWrite(row: Record<string, unknown>): WriteSourceKind | null {
+  if (!WRITE_OPERATIONS.has(String(row.operation)) || row.outcome !== 'success') return null
+  const metadata = readUsageMetadata(row)
+  const source = typeof metadata.source === 'string' ? metadata.source : ''
+  const attribution = typeof metadata.attribution === 'string' ? metadata.attribution : ''
+  if (
+    !source ||
+    source === 'turn_snapshot' ||
+    attribution === 'ambiguous' ||
+    attribution === 'unknown'
+  ) {
+    return 'unattributed'
+  }
+  if (source === 'ui') return 'ui_user_save'
+  if (source === 'auto_dream') return 'auto_dream'
+  return 'unattributed'
+}
+
+function isConfirmedMemoryOperation(row: Record<string, unknown>): boolean {
+  if (String(row.operation) === 'index_injected') return false
+  const write = classifySuccessfulWrite(row)
+  if (write === 'ui_user_save' || write === 'auto_dream') return true
+  if (write === 'unattributed') return false
+  return !WRITE_OPERATIONS.has(String(row.operation))
 }
 
 function percentile(values: number[], p: number): number {
@@ -432,41 +511,107 @@ export async function getMemoryUsageDashboard(input: {
      WHERE agent_id=? AND created_at>=? AND freshness_gap=1
   `)
     .get(input.agentId, from) as { value: number }
-  const sessions = new Set(
-    rows.flatMap((row) => (row.session_key == null ? [] : [String(row.session_key)])),
-  )
+  const nonIndex = rows.filter((row) => String(row.operation) !== 'index_injected')
+  const confirmed = rows.filter((row) => isConfirmedMemoryOperation(row))
+  const operationRows = confirmed.filter((row) => classifySuccessfulWrite(row) == null)
   const groups = new Map<string, Array<Record<string, unknown>>>()
-  for (const row of rows) {
+  for (const row of operationRows) {
     const key = `${String(row.operation)}\u0000${String(row.memory_type)}`
     const bucket = groups.get(key)
     if (bucket) bucket.push(row)
     else groups.set(key, [row])
   }
-  const recent = db
+  const writeSources: MemoryWriteSources = {
+    uiUserSaves: 0,
+    autoDreamWrites: 0,
+    unattributedWrites: 0,
+  }
+  for (const row of rows) {
+    const kind = classifySuccessfulWrite(row)
+    if (kind === 'ui_user_save') writeSources.uiUserSaves += 1
+    else if (kind === 'auto_dream') writeSources.autoDreamWrites += 1
+    else if (kind === 'unattributed') writeSources.unattributedWrites += 1
+  }
+  const titles = new Map<string, string>()
+  const titleRows = db
     .prepare(`
-    SELECT e.session_key,COALESCE(m.title,'未命名会话') AS title,MAX(e.timestamp) AS last_at,
-           COUNT(*) AS events,
-           SUM(CASE WHEN e.operation IN ('core_search','session_search','archival_search') THEN 1 ELSE 0 END) AS searches,
-           SUM(CASE WHEN e.operation IN ('core_write','core_update','core_delete','profile_write','archival_add','archival_delete','auto_add') THEN 1 ELSE 0 END) AS writes,
-           COUNT(DISTINCT CASE WHEN e.freshness_gap=1 THEN e.turn_index END) AS freshness_gaps
-      FROM memory_usage_events e
- LEFT JOIN sessions_meta m ON m.id=e.session_key
-     WHERE e.agent_id=? AND e.timestamp>=? AND e.session_key IS NOT NULL
-     GROUP BY e.session_key,m.title
-     ORDER BY last_at DESC
-     LIMIT 50
+    SELECT m.id AS session_key, m.title AS title
+      FROM sessions_meta m
+     WHERE m.id IN (
+       SELECT DISTINCT session_key FROM memory_usage_events
+        WHERE agent_id=? AND timestamp>=? AND session_key IS NOT NULL
+     )
   `)
-    .all(input.agentId, from) as Array<Record<string, unknown>>
+    .all(input.agentId, from) as Array<{ session_key: string; title: string | null }>
+  for (const row of titleRows) {
+    if (row.title) titles.set(String(row.session_key), String(row.title))
+  }
+  const sessions = new Map<
+    string,
+    {
+      lastAt: number
+      events: number
+      searches: number
+      uiUserSaves: number
+      autoDreamWrites: number
+      unattributedWrites: number
+      freshnessTurns: Set<number>
+    }
+  >()
+  for (const row of rows) {
+    if (row.session_key == null) continue
+    const sessionKey = String(row.session_key)
+    let bucket = sessions.get(sessionKey)
+    if (!bucket) {
+      bucket = {
+        lastAt: 0,
+        events: 0,
+        searches: 0,
+        uiUserSaves: 0,
+        autoDreamWrites: 0,
+        unattributedWrites: 0,
+        freshnessTurns: new Set<number>(),
+      }
+      sessions.set(sessionKey, bucket)
+    }
+    const timestamp = Number(row.timestamp)
+    if (timestamp > bucket.lastAt) bucket.lastAt = timestamp
+    if (isConfirmedMemoryOperation(row)) bucket.events += 1
+    if (SEARCH_OPERATIONS.has(String(row.operation))) bucket.searches += 1
+    const kind = classifySuccessfulWrite(row)
+    if (kind === 'ui_user_save') bucket.uiUserSaves += 1
+    else if (kind === 'auto_dream') bucket.autoDreamWrites += 1
+    else if (kind === 'unattributed') bucket.unattributedWrites += 1
+    if (Number(row.freshness_gap) === 1 && row.turn_index != null) {
+      bucket.freshnessTurns.add(Number(row.turn_index))
+    }
+  }
   return {
     window: { days, from: new Date(from).toISOString(), to: new Date(now).toISOString() },
     totals: {
       events: rows.length,
-      sessions: sessions.size,
-      hits: rows.filter((row) => row.outcome === 'hit').length,
-      noMatch: rows.filter((row) => row.outcome === 'no_match').length,
-      errors: rows.filter((row) => row.outcome === 'error').length,
-      denied: rows.filter((row) => row.outcome === 'denied').length,
+      confirmedOperations: confirmed.length,
+      sessions: new Set(
+        confirmed.flatMap((row) => (row.session_key == null ? [] : [String(row.session_key)])),
+      ).size,
+      hits: nonIndex.filter((row) => row.outcome === 'hit').length,
+      noMatch: nonIndex.filter((row) => row.outcome === 'no_match').length,
+      errors: nonIndex.filter((row) => row.outcome === 'error').length,
+      denied: nonIndex.filter((row) => row.outcome === 'denied').length,
       freshnessGaps: Number(freshness.value),
+    },
+    indexDelivery: {
+      status: 'unavailable',
+      reason: 'missing_engine_acceptance_receipt',
+    },
+    legacyUnverifiedIndexVisibility: rows.filter((row) => String(row.operation) === 'index_injected')
+      .length,
+    writeSources,
+    freshnessSignal: {
+      kind: 'mixed_shadow',
+      provesUsage: false,
+      provesDelivery: false,
+      provesWrongAnswer: false,
     },
     byOperation: [...groups.values()]
       .map((bucket) => {
@@ -485,15 +630,20 @@ export async function getMemoryUsageDashboard(input: {
         }
       })
       .sort((a, b) => b.events - a.events || a.operation.localeCompare(b.operation)),
-    recentSessions: recent.map((row) => ({
-      sessionKey: String(row.session_key),
-      title: String(row.title),
-      lastAt: Number(row.last_at),
-      events: Number(row.events),
-      searches: Number(row.searches),
-      writes: Number(row.writes),
-      freshnessGaps: Number(row.freshness_gaps),
-    })),
+    recentSessions: [...sessions.entries()]
+      .sort((a, b) => b[1].lastAt - a[1].lastAt || a[0].localeCompare(b[0]))
+      .slice(0, 50)
+      .map(([sessionKey, bucket]) => ({
+        sessionKey,
+        title: titles.get(sessionKey) || '未命名会话',
+        lastAt: bucket.lastAt,
+        events: bucket.events,
+        searches: bucket.searches,
+        uiUserSaves: bucket.uiUserSaves,
+        autoDreamWrites: bucket.autoDreamWrites,
+        unattributedWrites: bucket.unattributedWrites,
+        freshnessGaps: bucket.freshnessTurns.size,
+      })),
   }
 }
 
