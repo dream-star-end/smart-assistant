@@ -8,6 +8,7 @@ import { isNextBlockCode } from "../../lib/inputPrediction";
 import { computeOutputs } from "./formula";
 import { marketToMarkdown } from "./marketMarkdown";
 import { parseUiBlock } from "./parse";
+import { pluginToMarkdown } from "./pluginMarkdown";
 import type { CalcFormat, CalculatorSpec, Cell, IuiSpec, OutlineNode, TableSpec } from "./schema";
 import { validateSpec } from "./schema";
 
@@ -323,6 +324,13 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
     case "intraday":
     case "stocklist":
       return marketToMarkdown(spec);
+    case "weibo_posts":
+    case "weibo_hot":
+    case "zhihu_hot":
+    case "zhihu_answers":
+    case "feishu_events":
+    case "feishu_doc":
+      return pluginToMarkdown(spec);
   }
 }
 

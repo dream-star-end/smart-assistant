@@ -100,7 +100,10 @@ export async function getAutoDreamFeature(
     telemetry_ready: optimizerEnabled ? readiness?.ready ?? false : null,
     telemetry_blockers: optimizerEnabled ? readiness?.blockers ?? ['telemetry_unavailable'] : [],
     minimum_plan_code: AUTO_DREAM_MINIMUM_PLAN_CODE,
-    min_interval_hours: AUTO_DREAM_OPTIMIZER_MIN_INTERVAL_HOURS,
+    // Report the cadence of the mode that would actually run.
+    min_interval_hours: optimizerEnabled
+      ? AUTO_DREAM_OPTIMIZER_MIN_INTERVAL_HOURS
+      : AUTO_DREAM_LEGACY_MIN_INTERVAL_HOURS,
     min_new_sessions: AUTO_DREAM_MIN_NEW_SESSIONS,
   }
 }

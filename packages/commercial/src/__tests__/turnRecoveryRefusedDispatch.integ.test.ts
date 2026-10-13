@@ -6,7 +6,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { Pool } from 'pg'
-import { pauseRecoveryJobsForRefusedDispatches } from '../dispatch/turnRecoveryStore.js'
+import {
+  pauseRecoveryForRefusal,
+  pauseRecoveryJobsForRefusedDispatches,
+  pauseRecoveryPreReceipt,
+  releaseRecoveryPreReceipt,
+} from '../dispatch/turnRecoveryStore.js'
 
 const url = process.env.TEST_DATABASE_URL
 test('a forwarded recovery job whose dispatch ended not_accepted is paused, nothing else',
@@ -37,5 +42,60 @@ test('a forwarded recovery job whose dispatch ended not_accepted is paused, noth
       { job_id: 'sent', status: 'sent', pause_reason: null, terminal_outcome: null },
     ])
     assert.equal(await pauseRecoveryJobsForRefusedDispatches(q as never), 0, 'idempotent')
+  } finally { client.release(); await pool.end() }
+})
+
+// OCV5-391 (commercial uid 4, 2026-10-13): a recovery job for the retired kimi-k3-ark was
+// refused (UNAUTHORIZED_MODEL) and re-queued every 5 minutes for two months. A definitive
+// refusal now pauses the job: unbound under its lease fence, bound together with its dispatch.
+test('a refused recovery job pauses (with its admitted dispatch when bound); fences hold; release still re-queues',
+  { skip: !url }, async () => {
+  const pool = new Pool({ connectionString: url, max: 1 })
+  const client = await pool.connect()
+  try {
+    await client.query(`CREATE TEMP TABLE turn_dispatches (dispatch_id uuid PRIMARY KEY, status text NOT NULL,
+      outcome text, failure_code text, owner_id text, lease_epoch bigint NOT NULL, lease_until timestamptz,
+      terminal_at timestamptz, last_attempt_at timestamptz)`)
+    await client.query(`CREATE TEMP TABLE turn_recovery_jobs (job_id text PRIMARY KEY, status text NOT NULL,
+      lease_owner text, lease_epoch bigint NOT NULL, lease_until timestamptz, dispatch_id uuid,
+      pause_reason text, terminal_outcome text, transport_wait_attempt integer NOT NULL DEFAULT 0,
+      next_attempt_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now())`)
+    const d = (n: number) => `00000000-0000-4000-8000-00000000000${n}`
+    await client.query(`INSERT INTO turn_dispatches (dispatch_id,status,owner_id,lease_epoch) VALUES
+      ($1,'admitted','bridge-1',3), ($2,'admitted','bridge-1',3), ($3,'admitted','bridge-1',3)`, [d(1), d(2), d(3)])
+    await client.query(`INSERT INTO turn_recovery_jobs (job_id,status,lease_owner,lease_epoch,dispatch_id) VALUES
+      ('unbound','leased','master-a',7,NULL), ('unbound-stale','leased','master-a',8,NULL),
+      ('bound','leased','master-a',7,$1), ('bound-wrong-owner','leased','master-a',7,$2),
+      ('bound-transient','leased','master-a',7,$3)`, [d(1), d(2), d(3)])
+    const db = client as never
+    const job = (jobId: string) => ({ jobId, leaseOwner: 'master-a', leaseEpoch: 7, transportWaitAttempt: 0 })
+
+    assert.equal(await pauseRecoveryForRefusal(db, job('unbound'), 'UNAUTHORIZED_MODEL'), true)
+    assert.equal(await pauseRecoveryForRefusal(db, job('unbound-stale'), 'UNAUTHORIZED_MODEL'), false, 'lost lease')
+    assert.equal(await pauseRecoveryForRefusal(db, job('bound'), 'MODEL_NOT_AVAILABLE'), false,
+      'a bound job is left to the pre-forward exit')
+    assert.equal(await pauseRecoveryPreReceipt(db, { job: job('bound'), dispatchId: d(1), dispatchOwner: 'bridge-1',
+      dispatchLeaseEpoch: 3, reason: 'MODEL_NOT_AVAILABLE' }), true)
+    assert.equal(await pauseRecoveryPreReceipt(db, { job: job('bound-wrong-owner'), dispatchId: d(2),
+      dispatchOwner: 'bridge-2', dispatchLeaseEpoch: 3, reason: 'MODEL_NOT_AVAILABLE' }), false, 'dispatch fence')
+    assert.equal(await releaseRecoveryPreReceipt(db, { job: job('bound-transient'), dispatchId: d(3),
+      dispatchOwner: 'bridge-1', dispatchLeaseEpoch: 3 }), true)
+
+    const jobs = await client.query(`SELECT job_id,status,pause_reason,terminal_outcome,transport_wait_attempt
+      FROM turn_recovery_jobs ORDER BY job_id`)
+    assert.deepEqual(jobs.rows, [
+      { job_id: 'bound', status: 'paused', pause_reason: 'refused:MODEL_NOT_AVAILABLE', terminal_outcome: 'interrupted', transport_wait_attempt: 0 },
+      { job_id: 'bound-transient', status: 'queued', pause_reason: null, terminal_outcome: null, transport_wait_attempt: 1 },
+      { job_id: 'bound-wrong-owner', status: 'leased', pause_reason: null, terminal_outcome: null, transport_wait_attempt: 0 },
+      { job_id: 'unbound', status: 'paused', pause_reason: 'refused:UNAUTHORIZED_MODEL', terminal_outcome: 'interrupted', transport_wait_attempt: 0 },
+      { job_id: 'unbound-stale', status: 'leased', pause_reason: null, terminal_outcome: null, transport_wait_attempt: 0 },
+    ])
+    const dispatches = await client.query(`SELECT dispatch_id::text AS id,status,outcome,failure_code,
+      terminal_at IS NOT NULL AS ended FROM turn_dispatches ORDER BY dispatch_id`)
+    assert.deepEqual(dispatches.rows, [
+      { id: d(1), status: 'terminal', outcome: 'not_accepted', failure_code: 'refused:MODEL_NOT_AVAILABLE', ended: true },
+      { id: d(2), status: 'admitted', outcome: null, failure_code: null, ended: false },
+      { id: d(3), status: 'admitted', outcome: null, failure_code: null, ended: false },
+    ])
   } finally { client.release(); await pool.end() }
 })
