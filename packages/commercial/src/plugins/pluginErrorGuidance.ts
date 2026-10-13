@@ -512,6 +512,32 @@ const ROWS: Record<string, Row> = {
     message: '请求参数无效',
     nextAction: '请修正参数后重试，不要原样重放',
   },
+  // API 插件（声明式 HTTP）：参数不合签名的参数结构、上游拒绝凭据、上游限流、结果超过平台硬限。
+  VALIDATION_FAILED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '参数不符合该操作的参数结构',
+    nextAction: '先用 oc-connect describe <插件> <操作> 查看参数名、类型和必填项，修正后再调用',
+  },
+  UPSTREAM_AUTH_FAILED: {
+    retrySafe: 'after_reauth',
+    requiresReauth: true,
+    message: '插件服务拒绝了凭据（HTTP 401/403）：Token 无效、已撤销或配额已用完',
+    nextAction:
+      '请提示用户到该插件的服务网站检查 Token 是否有效、配额是否用完，必要时在 管理中心 → 插件 重新填写 Token；不要自动重试',
+  },
+  UPSTREAM_RATE_LIMITED: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: '插件服务限流（HTTP 429）',
+    nextAction: '稍后再试，不要立即连打；持续出现时提示用户检查该插件的配额',
+  },
+  RESULT_TOO_LARGE: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '结果超过单次上限（256KB / 数组 200 项 / 嵌套 8 层）',
+    nextAction: '缩小时间或空间范围、增大步长或减少条数后重试，不要原样重放',
+  },
   PLUGIN_DISABLED: {
     retrySafe: 'no',
     requiresReauth: false,
