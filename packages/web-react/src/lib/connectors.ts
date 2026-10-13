@@ -322,6 +322,14 @@ export function isOauthAuthMode(authMode: string): boolean {
   return authMode === "oauth2-auth-code";
 }
 
+/**
+ * 公开接口插件（authMode none，OCV5-402，如 B 站公开数据）：没有账号、不填任何凭据，
+ * 「绑定」在界面上叫「启用」，每个用户只有一条固定的连接。单一权威，同 isOauthAuthMode。
+ */
+export function isPublicAuthMode(authMode: string | null | undefined): boolean {
+  return authMode === "none";
+}
+
 /** bind 表单单个字段的展示元数据（source → label/输入类型/占位符）。 */
 export type BindFieldMeta = { label: string; type: "text" | "password"; placeholder?: string };
 

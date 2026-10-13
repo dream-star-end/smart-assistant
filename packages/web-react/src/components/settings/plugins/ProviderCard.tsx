@@ -6,6 +6,7 @@ import {
   type DeclarativeManagementConnector,
   connectorErrorText,
   connectorNeedsRelink,
+  isPublicAuthMode,
 } from '../../../lib/connectors'
 import {
   Alert,
@@ -78,6 +79,8 @@ export function ProviderCard({
     }
   }
   const broken = connections.filter((c) => c.status === 'error').length
+  // 公开接口插件（OCV5-402）：没有账号的概念，一条连接 = 已启用，不能再「添加账号」。
+  const isPublic = isPublicAuthMode(management?.contract?.authMode)
   const orphanInstall = management?.installation === 'orphan'
   const unavailable = management != null && !management.available
   const meta: ReactNode[] = [capabilityLabel]
@@ -94,7 +97,7 @@ export function ProviderCard({
       : connections.length > 0
         ? broken > 0
           ? { tone: 'warning', text: `${broken} 个账号需重新绑定` }
-          : { tone: 'success', text: `已绑定 ${connections.length} 个账号` }
+          : { tone: 'success', text: isPublic ? '已启用' : `已绑定 ${connections.length} 个账号` }
         : null
   const canUpdate = Boolean(management?.updateAvailable && onUpdate)
   const canUninstall = management?.installation === 'marketplace' && onUninstallMarket != null
@@ -114,9 +117,9 @@ export function ProviderCard({
                 <Store size={14} strokeWidth={1.75} aria-hidden="true" /> 去市场安装
               </Button>
             ) : undefined
-          ) : (
+          ) : isPublic && connections.length > 0 ? undefined : (
             <Button variant="secondary" size="sm" onClick={onBind}>
-              {connections.length > 0 ? '添加账号' : '绑定'}
+              {isPublic ? '启用' : connections.length > 0 ? '添加账号' : '绑定'}
             </Button>
           )
         }
