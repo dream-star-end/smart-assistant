@@ -512,7 +512,8 @@ const ROWS: Record<string, Row> = {
     message: '请求参数无效',
     nextAction: '请修正参数后重试，不要原样重放',
   },
-  // API 插件（声明式 HTTP）：参数不合签名的参数结构、上游拒绝凭据、上游限流、结果超过平台硬限。
+  // API 插件 / 连接器：参数不合签名的参数结构、上游拒绝凭据（401/403、IMAP 登录失败、换 token 失败等）、
+  // 上游限流、结果超过平台硬限。措辞不假设具体鉴权方式；某个插件专属的说明写在它自己的说明里。
   VALIDATION_FAILED: {
     retrySafe: 'no',
     requiresReauth: false,
@@ -522,9 +523,9 @@ const ROWS: Record<string, Row> = {
   UPSTREAM_AUTH_FAILED: {
     retrySafe: 'after_reauth',
     requiresReauth: true,
-    message: '插件服务拒绝了凭据（HTTP 401/403）：Token 无效、已撤销或配额已用完',
+    message: '插件服务拒绝了凭据：凭据无效、已过期或被撤销，或额度/配额已用完',
     nextAction:
-      '请提示用户到该插件的服务网站检查 Token 是否有效、配额是否用完，必要时在 管理中心 → 插件 重新填写 Token；不要自动重试',
+      '请提示用户检查该插件的凭据（Token、授权或账号密码）是否有效、额度或配额是否用完，必要时到 管理中心 → 插件 重新绑定或填写；不要自动重试',
   },
   UPSTREAM_RATE_LIMITED: {
     retrySafe: 'yes',

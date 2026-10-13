@@ -13,6 +13,7 @@ import { fetch as undiciFetch } from 'undici'
 import { DEFAULT_CONNECTORS, isDefaultConnectorSlug } from '../connectors/defaults/index.js'
 import { type EngineHttpDeps, engineHttpRequest } from '../connectors/engine/driver.js'
 import { validateDeclarativeParams } from '../connectors/engine/params.js'
+import { resolveResultPointer } from '../connectors/engine/pointer.js'
 import { ConnectorError } from '../connectors/errors.js'
 import type { DnsResolver } from '../connectors/outboundPolicy.js'
 import { compileSpec } from '../connectors/spec/compiler.js'
@@ -109,7 +110,7 @@ describe('GNSS-X blueprint generation', () => {
     )
     assert.deepEqual(prepared.permissionSummary.identity, {
       probeActionId: 'time',
-      accountKeyPointer: '/jsonrpc',
+      accountKeyPointer: '/result/content/0/type',
     })
   })
 
@@ -335,10 +336,30 @@ describe('GNSS-X through the connector engine (mock upstream)', () => {
     })
     const envelope = connectorRpcErrorEnvelope('UPSTREAM_AUTH_FAILED')
     assert.equal(envelope.requiresReauth, true)
-    assert.match(envelope.message, /Token/)
     assert.match(envelope.message, /配额/)
-    assert.match(envelope.nextAction, /检查 Token 是否有效、配额是否用完/)
+    assert.match(envelope.nextAction, /Token/)
+    assert.match(envelope.nextAction, /配额是否用完/)
     assert.match(envelope.nextAction, /管理中心 → 插件/)
+    // GNSS-X 自己的说明再点明 401 / -32001 = Token 或配额。
+    assert.match(String(buildGnssXBlueprint(snapshot).description), /-32001.*检查 Token 和各工具剩余配额/)
+  })
+
+  test('identity probe only yields an account key from a successful response', async () => {
+    const pointer = '/result/content/0/type'
+    reply = () => ({
+      status: 200,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32001, message: 'quota' } }),
+    })
+    assert.equal(resolveResultPointer(await call('time', {}), pointer), undefined)
+    reply = () => ({
+      status: 200,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        result: { content: [{ type: 'text', text: '2025-10-13T00:00:00Z' }] },
+      }),
+    })
+    assert.equal(resolveResultPointer(await call('time', {}), pointer), 'text')
   })
 
   test('HTTP 200 carrying error -32001 reaches the agent as result.error', async () => {

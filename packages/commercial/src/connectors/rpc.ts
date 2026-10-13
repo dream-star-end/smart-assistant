@@ -473,6 +473,7 @@ async function handleList(
       displayName: c.displayName || c.slug,
       accountHint: typeof c.meta.account_hint === 'string' ? c.meta.account_hint : '',
       status: 'active',
+      descriptionsByAuthor: true,
       actions,
     })
   }
@@ -584,12 +585,16 @@ async function handleCatalog(
 
 const ACTION_SUMMARY_MAX = 80
 
-/** list 里每个声明式动作只给说明的第一行(动作多时不把整份说明塞进上下文)。 */
+/**
+ * list 里每个声明式动作只给说明的第一行(动作多时不把整份说明塞进上下文)。说明是插件作者写的:
+ * 控制/格式字符一律换成空格,保证它只占一行、不能伪造别的输出行;连接上另带 descriptionsByAuthor
+ * 让 CLI 标明来源。
+ */
 function actionSummary(description: string | undefined): string {
   const line =
     description
       ?.split('\n')
-      .map((part) => part.trim())
+      .map((part) => part.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ').replace(/\s+/g, ' ').trim())
       .find(Boolean) ?? ''
   return line.length > ACTION_SUMMARY_MAX ? `${line.slice(0, ACTION_SUMMARY_MAX - 1)}…` : line
 }

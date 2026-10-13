@@ -35,7 +35,7 @@
   },
   "identity": {
     "actionId": "time",
-    "accountKeyPointer": "/jsonrpc"
+    "accountKeyPointer": "/result/content/0/type"
   },
   "actions": [
     {

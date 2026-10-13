@@ -265,8 +265,8 @@ const READ_AUTH_EXACT: Record<string, Exact> = {
     requiresReauth: true,
     sideEffect: 'none',
     nextAction:
-      '请提示用户到该插件的服务网站检查 Token 是否有效、配额是否用完，必要时在 管理中心 → 插件 重新填写 Token；不要自动重试',
-    message: '插件服务拒绝了凭据（HTTP 401/403）：Token 无效、已撤销或配额已用完',
+      '请提示用户检查该插件的凭据（Token、授权或账号密码）是否有效、额度或配额是否用完，必要时到 管理中心 → 插件 重新绑定或填写；不要自动重试',
+    message: '插件服务拒绝了凭据：凭据无效、已过期或被撤销，或额度/配额已用完',
   },
   UPSTREAM_RATE_LIMITED: {
     retrySafe: 'yes',

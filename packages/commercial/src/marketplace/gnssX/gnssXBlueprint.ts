@@ -35,6 +35,12 @@ export type GnssXTokenPlacement =
 
 /** 绑定时的身份探测：调用一次 time（消耗 1 次 time 配额），401 即 Token 无效。 */
 export const GNSS_X_IDENTITY_ACTION = 'time'
+/**
+ * 账号键只能取成功响应里才有的字段：HTTP 200 带 JSON-RPC error（如 -32001）时这里取不到值，
+ * 绑定失败，不会用被拒的 Token 替换已有连接。GNSS-X 没有账号接口，取到的是常量，所以每个用户
+ * 只有一个 GNSS-X 连接。成功响应的形状以真实 Token 冒烟为准。
+ */
+export const GNSS_X_IDENTITY_POINTER = '/result/content/0/type'
 
 /** 上游 20 个绘图工具（复用 GNSS-X 站内 LLM 出图）。任务要求一律不收。 */
 export const GNSS_X_DRAWING_TOOLS = [
@@ -420,7 +426,7 @@ export function buildGnssXBlueprint(
     visibility: 'public',
     apiOrigin: GNSS_X_API_ORIGIN,
     auth: { mode: 'static-token', placement: options.tokenPlacement ?? GNSS_X_TOKEN_PLACEMENT },
-    identity: { actionId: GNSS_X_IDENTITY_ACTION, accountKeyPointer: '/jsonrpc' },
+    identity: { actionId: GNSS_X_IDENTITY_ACTION, accountKeyPointer: GNSS_X_IDENTITY_POINTER },
     actions: selected.map((name) => buildAction(byName.get(name)!)),
   }
 }

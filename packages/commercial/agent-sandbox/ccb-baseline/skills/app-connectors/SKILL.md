@@ -1,6 +1,6 @@
 ---
 name: app-connectors
-description: 用 `oc-connect` 与 `oc-plugin` 访问用户绑定的第三方应用和已安装插件：邮件、WebDAV、Notion、GitHub、飞书、知识星球、微博和知乎，以及从市场安装的 API 插件(如 GNSS-X 地学计算)；支持微博消息、私信、搜索、关系、收藏及受控写入。用户要访问这些外部应用或已安装插件时使用。
+description: 用 `oc-connect` 与 `oc-plugin` 访问用户绑定的第三方应用和已安装插件：邮件、WebDAV、Notion、GitHub、飞书、知识星球、微博和知乎；支持微博消息、私信、搜索、关系、收藏及受控写入。用户要访问这些外部应用时使用。
 tags: [connectors, plugins, email, webdav, notion, github, feishu, calendar, zsxq, knowledge-planet, weibo, zhihu, social]
 ---
 
