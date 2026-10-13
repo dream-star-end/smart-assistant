@@ -95,12 +95,10 @@ export async function getAutoDreamFeature(
     optimizer_enabled: optimizerEnabled,
     legacy_enabled: enabled,
     effective:
-      eligible &&
-      available &&
-      (enabled || optimizerEnabled) &&
-      (!optimizerEnabled || readiness?.ready === true),
-    telemetry_ready: optimizerEnabled ? (readiness?.ready ?? false) : null,
-    telemetry_blockers: optimizerEnabled ? (readiness?.blockers ?? ['telemetry_unavailable']) : [],
+      eligible && available && (enabled || optimizerEnabled)
+      && (!optimizerEnabled || readiness?.ready === true),
+    telemetry_ready: optimizerEnabled ? readiness?.ready ?? false : null,
+    telemetry_blockers: optimizerEnabled ? readiness?.blockers ?? ['telemetry_unavailable'] : [],
     minimum_plan_code: AUTO_DREAM_MINIMUM_PLAN_CODE,
     // Report the cadence of the mode that would actually run.
     min_interval_hours: optimizerEnabled
@@ -125,9 +123,7 @@ export type AutoDreamPolicy =
       }
     }
 
-export async function getAutoDreamPolicy(
-  userId: bigint | number | string,
-): Promise<AutoDreamPolicy> {
+export async function getAutoDreamPolicy(userId: bigint | number | string): Promise<AutoDreamPolicy> {
   const { getPreferences } = await import('./preferences.js')
   const snap = await getPreferences(String(userId))
   const optimizerEnabled = snap.prefs.auto_optimizer_enabled === true
@@ -158,11 +154,8 @@ export async function getAutoDreamPolicy(
   if (optimizerEnabled) {
     const { listInstalled } = await import('../marketplace/marketplaceDb.js')
     const installed = await listInstalled(Number(userId))
-    const {
-      auto_dream_enabled: _legacy,
-      auto_optimizer_enabled: _optimizer,
-      ...preferences
-    } = snap.prefs
+    const { auto_dream_enabled: _legacy, auto_optimizer_enabled: _optimizer, ...preferences } =
+      snap.prefs
     auditContext = {
       preferences,
       installedPlugins: installed.map((row) => ({ slug: row.slug, kind: row.kind })),

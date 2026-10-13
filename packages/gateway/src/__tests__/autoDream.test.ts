@@ -675,8 +675,14 @@ describe('AutoDreamService cadence', () => {
     )
     assert.deepEqual(publicStatus.lastReport?.updated, [])
     assert.deepEqual(publicStatus.lastReport?.deleted, [])
-    assert.match(await readFile(paths.agentMemoryFile(agentId, 'keep.md'), 'utf8'), /原正文/)
-    assert.match(await readFile(paths.agentMemoryFile(agentId, 'obsolete.md'), 'utf8'), /旧正文/)
+    assert.match(
+      await readFile(paths.agentMemoryFile(agentId, 'keep.md'), 'utf8'),
+      /原正文/,
+    )
+    assert.match(
+      await readFile(paths.agentMemoryFile(agentId, 'obsolete.md'), 'utf8'),
+      /旧正文/,
+    )
     const created = await readFile(paths.agentMemoryFile(agentId, 'new-project.md'), 'utf8')
     assert.match(created, /source: auto/)
     assert.match(created, /expires: 2026-08-13/)

@@ -349,7 +349,9 @@ export class AutoDreamService {
   /** Identity-bound container API projection; stale paid attempts converge to a visible failure. */
   async getPublicStatus(agentId: string): Promise<AutoDreamPublicStatus> {
     await this.reconcileStaleRun(agentId)
-    const status = projectAutoDreamPublicStatus(await readState(paths.agentAutoDreamState(agentId)))
+    const status = projectAutoDreamPublicStatus(
+      await readState(paths.agentAutoDreamState(agentId)),
+    )
     const policy = await this.policyClient.get()
     return policy.enabled ? { ...status, mode: policy.mode } : status
   }
@@ -564,19 +566,15 @@ export class AutoDreamService {
             throw new Error(`AUTO_DREAM_MEMORY_ADD_ONLY_FAILED:${result.reason}:${result.error}`)
           appliedCreates = planned.filter((row) => result.created.includes(row.file))
         }
-        await Promise.all(
-          appliedCreates.map((row) =>
-            recordMemoryUsageEvent({
-              agentId: trigger.agentId,
-              sessionKey: trigger.sessionKey,
-              operation: 'auto_add',
-              memoryType: 'core',
-              outcome: 'success',
-              topMatchKey: row.file,
-              metadata: { source: 'auto_dream' },
-            }).catch(() => {}),
-          ),
-        )
+        await Promise.all(appliedCreates.map((row) => recordMemoryUsageEvent({
+          agentId: trigger.agentId,
+          sessionKey: trigger.sessionKey,
+          operation: 'auto_add',
+          memoryType: 'core',
+          outcome: 'success',
+          topMatchKey: row.file,
+          metadata: { source: 'auto_dream' },
+        }).catch(() => {})))
       } catch (err) {
         applyError = err
       }
@@ -768,10 +766,9 @@ export class AutoDreamService {
           continue
         }
       }
-      const strong =
-        projectId && isProjectContextEnabled()
-          ? { hit: false as const }
-          : await this.hasStrongCoreHit({ agentId, query: topic, today })
+      const strong = projectId && isProjectContextEnabled()
+        ? { hit: false as const }
+        : await this.hasStrongCoreHit({ agentId, query: topic, today })
       if (strong.hit) {
         this.log('auto_memory_write_skipped_strong_hit', {
           agentId,
