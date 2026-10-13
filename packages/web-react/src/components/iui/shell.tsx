@@ -435,6 +435,12 @@ const SKELETON_HEIGHT: Record<string, number> = {
   sources: 200,
   outline: 240,
   draft: 240,
+  weibo_posts: 320,
+  weibo_hot: 300,
+  zhihu_hot: 300,
+  zhihu_answers: 320,
+  feishu_events: 220,
+  feishu_doc: 180,
 };
 
 export function Skeleton({ kind }: { kind?: string }) {
