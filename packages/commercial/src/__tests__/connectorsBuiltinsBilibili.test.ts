@@ -221,7 +221,11 @@ describe('compiler: builtin layer, staticQuery, authMode none', () => {
     assert.ok(execContract.actions.every((a) => a.apiCredentialPlacements.length === 0))
     assert.equal(action(execContract, 'search').requestTransform, 'bilibili-wbi')
     assert.equal(action(execContract, 'danmaku').resultTransform, 'bilibili-dm-xml')
-    assert.deepEqual(action(execContract, 'rank').request.staticQuery, { type: 'all' })
+    assert.deepEqual(action(execContract, 'rank').request.staticQuery, {
+      day: '3',
+      type: '1',
+      arc_type: '0',
+    })
     assert.equal(Object.hasOwn(action(execContract, 'rank'), 'requestTransform'), false)
   })
 
@@ -495,7 +499,7 @@ describe('engine driver with bilibili builtins (local upstream)', () => {
         case '/x/frontend/finger/spi':
           return { status: 200, body: SPI_BODY }
         case '/x/web-interface/popular':
-        case '/x/web-interface/ranking/v2':
+        case '/x/web-interface/ranking':
           return { status: 200, body: JSON.stringify({ code: 0, data: { list: [archive] } }) }
         case '/x/web-interface/wbi/search/type':
           return { status: 200, body: JSON.stringify({ code: 0, data: { result: [archive] } }) }
@@ -539,7 +543,9 @@ describe('engine driver with bilibili builtins (local upstream)', () => {
     up.handler = () => ({ status: 200, body: JSON.stringify({ code: 0, data: { list: [] } }) })
     await run('rank', { rid: 36 })
     assert.equal(up.requests.length, 1)
-    assert.equal(up.requests[0]?.query.get('type'), 'all')
+    assert.equal(up.requests[0]?.path, '/x/web-interface/ranking')
+    assert.equal(up.requests[0]?.query.get('day'), '3')
+    assert.equal(up.requests[0]?.query.get('type'), '1')
     assert.equal(up.requests[0]?.query.get('rid'), '36')
     assert.equal(up.requests[0]?.query.has('w_rid'), false)
   })
@@ -593,6 +599,19 @@ describe('bilibili-dm-xml parsing', () => {
       [deflateRawSync(Buffer.from('{"code":-404,"message":"啥都木有"}')), 'UPSTREAM_NOT_FOUND'],
       [Buffer.from('<!doctype html><html><body>error</body></html>'), 'UPSTREAM_ERROR'],
       [deflateRawSync(Buffer.from('<?xml version="1.0"?><i></i>')), 'UPSTREAM_ERROR'],
+      // Codex r2 P1:截断(根没闭合 / 条目残缺)也不算成功。
+      [
+        deflateRawSync(
+          Buffer.from('<i><chatid>279786</chatid><d p="12.5,1,25,16777215,1700000000">'),
+        ),
+        'UPSTREAM_ERROR',
+      ],
+      [
+        deflateRawSync(
+          Buffer.from('<i><chatid>279786</chatid><d p="1,1,25,1,1">a</d><d p="2,1">b</i>'),
+        ),
+        'UPSTREAM_ERROR',
+      ],
     ]
     for (const [body, code] of cases) {
       await assert.rejects(

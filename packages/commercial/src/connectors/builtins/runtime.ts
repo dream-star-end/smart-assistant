@@ -317,6 +317,9 @@ function decodeXmlText(s: string): string {
   )
 }
 
+/** 一条完整的弹幕条目(解析与完整性校验共用,形状只此一份)。 */
+const DM_ITEM_RE = /<d p="([^"]{1,256})">([^<]{0,2000})<\/d>/g
+
 export interface DanmakuItem {
   t: number
   text: string
@@ -334,7 +337,7 @@ export function parseDanmakuXml(xml: string): {
 } {
   const chat = /<chatid>(\d{1,20})<\/chatid>/.exec(xml)
   const all: DanmakuItem[] = []
-  for (const m of xml.matchAll(/<d p="([^"]{1,256})">([^<]{0,2000})<\/d>/g)) {
+  for (const m of xml.matchAll(DM_ITEM_RE)) {
     const fields = (m[1] ?? '').split(',')
     const t = Number(fields[0])
     if (!Number.isFinite(t) || t < 0) continue
@@ -408,6 +411,14 @@ export function assertDanmakuDocument(text: string, providerTag: string): void {
       'UPSTREAM_ERROR',
       `${providerTag} upstream returned no danmaku document`,
     )
+  // 截断 / 残缺的文档同样不算成功(Codex r2 P1):根元素必须闭合,每个 <d 开头的条目都必须是完整的
+  // `<d p="…">文本</d>`(与 parseDanmakuXml 用同一个形状),否则视为上游返回不完整。
+  if (!/<\/i>\s*$/.test(head))
+    throw new ConnectorError('UPSTREAM_ERROR', `${providerTag} danmaku document is truncated`)
+  const opened = head.match(/<d[\s>]/g)?.length ?? 0
+  const complete = head.match(DM_ITEM_RE)?.length ?? 0
+  if (opened !== complete)
+    throw new ConnectorError('UPSTREAM_ERROR', `${providerTag} danmaku document is malformed`)
 }
 
 const bilibiliDmXml: ResultBuiltinImpl = {
