@@ -38,7 +38,7 @@ import {
   isAnyCursorSandResumeId,
 } from './cursorAdapter.js'
 
-export type ResumeArtifactEngine = 'ccb' | 'cursor' | 'codex' | 'grok' | 'zcode'
+export type ResumeArtifactEngine = 'ccb' | 'cursor' | 'codex' | 'grok' | 'zcode' | 'antigravity'
 
 export interface ResumeArtifactContext {
   /** `$CLAUDE_CONFIG_DIR`; CCB / Cursor Sand JSONL lives under `<dir>/projects/*`. */
@@ -200,6 +200,18 @@ export function zcodeSessionArtifact(
   return 'unknown'
 }
 
+/** Antigravity keeps one SQLite file per conversation under the stable CLI
+ * HOME that antigravityPlatform.ts pins (`<OPENCLAUDE_HOME>/antigravity-cli/home`). */
+export function antigravitySessionArtifact(
+  conversationId: string,
+  openclaudeHome: string,
+): ResumeArtifactProbe | 'unknown' | null {
+  if (!UUID_RE.test(conversationId)) return 'unknown'
+  return nonEmptyFile(
+    join(openclaudeHome, 'antigravity-cli', 'home', '.gemini', 'antigravity-cli', 'conversations', `${conversationId}.db`),
+  )
+}
+
 /**
  * Probe a resume id for the engine. Returns `exists:true` for unknown/unprobeable
  * cases (conservative), and `exists:false` only when we positively looked at the
@@ -245,6 +257,9 @@ export function probeResumeArtifact(
       break
     case 'zcode':
       r = zcodeSessionArtifact(resumeId, openclaudeHome)
+      break
+    case 'antigravity':
+      r = antigravitySessionArtifact(resumeId, openclaudeHome)
       break
     default:
       r = 'unknown'

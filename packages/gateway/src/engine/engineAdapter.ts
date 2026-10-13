@@ -48,7 +48,7 @@ export interface EngineCapabilities {
    *  'engine-reported' = runner 上报 billing 帧 → master bridge settle(codex)。 */
   billingMode: 'proxy' | 'engine-reported' | 'external'
   supportsEffort: boolean
-  resumeKind: 'ccb-session' | 'codex-thread' | 'grok-session' | 'cursor-session' | 'zcode-session'
+  resumeKind: 'ccb-session' | 'codex-thread' | 'grok-session' | 'cursor-session' | 'zcode-session' | 'antigravity-session'
   needsServerRequestId: boolean
   /** Native engines retain provider-owned state across turns. Stateless
    * engines must receive a bounded master-history replay on every turn. */
@@ -206,7 +206,7 @@ export interface EngineTurnRun {
  * M0 保持与 SubprocessRunner 同名同语义,后续底座各自实现或声明不支持。
  */
 export interface EngineAdapter extends EventEmitter {
-  readonly engineId: string // 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode'
+  readonly engineId: string // 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity'
   readonly capabilities: EngineCapabilities
 
   // ── lifecycle ──
