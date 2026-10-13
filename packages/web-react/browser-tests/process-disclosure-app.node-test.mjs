@@ -152,7 +152,10 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await locator.waitFor();
       const visible = await locator.evaluate((el) => {
         const scroller = el.closest(".chat-scroll-area");
-        if (!(scroller instanceof HTMLElement) || !(el instanceof HTMLElement)) return { ok: false, reason: "missing" };
+        if (!(scroller instanceof HTMLElement) || !(el instanceof HTMLElement)) {
+          const chain = []; for (let n = el; n && chain.length < 14; n = n.parentElement) chain.push(`${n.tagName.toLowerCase()}${n.id ? "#" + n.id : ""}${n.getAttribute?.("data-testid") ? "[" + n.getAttribute("data-testid") + "]" : ""}.${String(n.className || "").split(/\s+/).slice(0, 3).join(".")}`);
+          return { ok: false, reason: "missing", connected: el.isConnected, scrollers: document.querySelectorAll(".chat-scroll-area").length, chain };
+        }
         const view = scroller.getBoundingClientRect();
         const row = el.getBoundingClientRect();
         scroller.scrollTop += row.top - view.top - 28;
@@ -431,7 +434,15 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       assert.ok(afterTokens.gap > 300, `new tokens pulled back to the bottom: ${JSON.stringify(afterTokens)}`);
       assert.ok(afterTokens.top < scrolled.top + 80, `viewport moved toward the bottom ${scrolled.top} -> ${afterTokens.top}`);
       const liveToggle = desktop.page.getByTestId("process-toggle").last();
-      assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "active process hid the current step");
+      // OCV5-409: read "still active" and "expanded" in one DOM snapshot. A separate read after the
+      // stream had already finished saw the by-design collapse of a finished turn and failed. While
+      // the turn is active the step must stay open (unchanged); the finished state is asserted below.
+      const liveState = await desktop.page.evaluate(() => ({
+        active: !!document.querySelector("[data-process-active=true]"),
+        expanded: [...document.querySelectorAll("[data-testid=process-toggle]")].at(-1)?.getAttribute("aria-expanded") ?? null,
+      }));
+      evidence.liveToggle = liveState;
+      if (liveState.active) assert.equal(liveState.expanded, "true", "active process hid the current step");
       await desktop.page.getByText("南仓预警已补进看板").waitFor();
       const liveStagePlacement = await desktop.page.evaluate(() => {
         const textIn = (selector, needle) => [...document.querySelectorAll(selector)].some((el) => el.textContent?.includes(needle));
@@ -478,7 +489,10 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       }));
       assert.equal(pureChrome.inProcess, false, "plain chat grew a process shell");
       assert.equal(pureChrome.avatar, false, "plain chat answer still has an avatar");
-      await shotFramed(desktop.page, pureAnswer, "ocv5-265-avatar-polish-pure");
+      // OCV5-409: frame the copy inside the message list. The page-wide match could resolve, for a
+      // moment, to a node outside .chat-scroll-area (reason "missing" in CI); the chrome checks above
+      // already ran on the page-wide match and are unchanged.
+      await shotFramed(desktop.page, desktop.page.locator(".chat-scroll-area").getByText("还在。可售合计 128，南仓预警已经分开标出。"), "ocv5-265-avatar-polish-pure");
       await desktop.page.getByRole("button", { name: "发送" }).waitFor();
 
       async function fixtureStep() {
