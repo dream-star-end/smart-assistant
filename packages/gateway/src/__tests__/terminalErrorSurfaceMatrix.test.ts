@@ -85,16 +85,18 @@ const SCENARIOS: readonly Scenario[] = [
   },
   {
     code: 'model_capacity',
-    sample: 'model is overloaded',
+    // OCV5-407: the real Codex text. It also says "try a different model",
+    // which used to send it to model_not_available (no retry, red card).
+    sample: 'Selected model is at capacity. Please try a different model.',
     attempts: 3,
     persistEngineClass: false,
     why: '#229 本体仍自动重试容量故障;同类连续 3 次后熔断并引导换引擎',
   },
   {
     code: 'model_not_available',
-    sample: 'Selected model is at capacity. Please try a different model.',
+    sample: 'This model has been retired. Please try a different model.',
     attempts: 1,
-    why: '原文明示换模型,同模型自动重试永远不会成功,不进 TRANSIENT_RETRY_ERROR_CODES',
+    why: '原文明示换模型且无容量语义,同模型自动重试永远不会成功,不进 TRANSIENT_RETRY_ERROR_CODES(容量文案见 model_capacity,OCV5-407)',
   },
   {
     code: 'upstream_failed',
