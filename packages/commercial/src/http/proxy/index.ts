@@ -246,15 +246,39 @@ function observeCatalogShadow(
   }
 }
 
+/** CCB `--workload <tag>` tags (`cron`, `auto-dream`) use this alphabet. */
+const CC_WORKLOAD_RE = /(?:^|[\s;:])cc_workload=([a-z0-9_-]{1,32});/;
+
+/**
+ * OCV5-392: background CCB work (`--workload auto-dream`, `cron`) puts
+ * `cc_workload=<tag>;` into the `x-anthropic-billing-header` line that CCB sends
+ * as system block 0. Read it from that first line only, so billing can tell an
+ * Auto-Dream call from a chat turn. It is a label on the caller's own journal
+ * row, never an input to pricing or admission.
+ */
+export function extractCcWorkload(system: unknown): string | null {
+  let first: unknown = system;
+  if (Array.isArray(system)) {
+    const block = system[0] as { type?: unknown; text?: unknown } | undefined;
+    first = block && block.type === "text" ? block.text : null;
+  }
+  if (typeof first !== "string" || !first.startsWith("x-anthropic-billing-header")) return null;
+  const line = first.split("\n", 1)[0] ?? "";
+  return CC_WORKLOAD_RE.exec(line)?.[1] ?? null;
+}
+
 export function buildProxyJournalCtxJson(args: {
   runtimeKind?: "docker" | "desktop";
   gate: ModelAuthorityDecision | null;
   dispatchIdentity?: { dispatchId: string; attemptNo: number } | null;
   turnKey?: string;
+  /** CCB billing-header workload tag (extractCcWorkload); omitted when absent. */
+  workload?: string | null;
 }): Record<string, unknown> | undefined {
   const dispatchIdentity = args.dispatchIdentity ?? null;
   const gate = args.gate;
   const base: Record<string, unknown> = {};
+  if (args.workload) base.workload = args.workload;
   if (args.runtimeKind) {
     base.source = "ccb_proxy";
     base.runtimeKind = args.runtimeKind;
@@ -271,6 +295,7 @@ export function buildProxyJournalCtxJson(args: {
     billingRevision: gate.snapshot.billingRevision,
     securityEpoch: gate.securityEpoch.toString(),
     source: "ccb_proxy",
+    ...(args.workload ? { workload: args.workload } : {}),
     ...(args.runtimeKind ? { runtimeKind: args.runtimeKind } : {}),
     ...(dispatchIdentity
       ? { dispatchId: dispatchIdentity.dispatchId, attemptNo: dispatchIdentity.attemptNo }
@@ -1635,6 +1660,7 @@ export function makeAnthropicProxyHandler(
             gate,
             dispatchIdentity,
             turnKey: attribution.turnKey ?? undefined,
+            workload: extractCcWorkload(body.system),
           }), ...(route.kind === "box" ? {
             boxInvocationRecovery: "v1",
             billingPricing: serializeBillingPricing(pricing),
