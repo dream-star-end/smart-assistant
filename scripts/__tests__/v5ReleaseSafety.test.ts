@@ -4026,7 +4026,13 @@ describe('v5 release safety lanes', () => {
     assert.match(egressActivate, /wait_for_egress_release_ready "\$prev" 0 30/)
     assert.doesNotMatch(egressActivate, /run "sleep 3"/)
     assert.match(deployBody, /egress_prev_release="\$CAPTURED_EGRESS_PREDECESSOR"/)
-    assert.match(deployBody, /current_egress_cwd=.*systemctl show -p MainPID/)
+    // OCV5-391: the serving egress is the legacy unit or a blue-green slot; every cwd read and
+    // activation goes through scripts/v5-egress-slots.sh (active / install / flip / legacy).
+    assert.match(deployBody, /current_egress_cwd="\$\(egress_running_cwd\)"/)
+    assert.match(source, /egress_running_cwd\(\) \{\n {2}egress_slots_remote active /)
+    assert.match(egressActivate, /egress_slots_remote install "\$reldir" && egress_slots_remote flip "\$EGRESS_SLOT_PREDRAIN_SEC"/)
+    assert.match(egressActivate, /egress_slots_remote legacy/)
+    assert.match(egressActivate, /V5_EGRESS_SLOT_SERVICE_TPL/)
     assert.match(deployBody, /current_egress_cwd" == "\$egress_prev_release/)
     assert.match(deployBody, /activate_egress_release "\$BUILT_RELEASE" "\$egress_prev_release"/)
     assert.doesNotMatch(deployBody, /systemctl restart openclaude-v5-egress/)
@@ -4640,7 +4646,7 @@ describe('v5 release safety lanes', () => {
   test('authority enable is fail-closed: egress enforces before master starts signing', async () => {
     const source = await readFile(deploy, 'utf8')
     const body = source.match(/enable_model_authority\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
-    const egressRestart = body.indexOf("systemctl restart '$V5_EGRESS_UNIT'")
+    const egressRestart = body.indexOf('egress_restart_in_place')
     const enforceProbe = body.indexOf('wait_for_model_authority_egress_ready true')
     const masterRestart = body.indexOf("systemctl restart '$ACTIVE_UNIT'")
     assert.ok(egressRestart >= 0, 'enable must restart egress')
@@ -5045,11 +5051,37 @@ describe('v5 release safety lanes', () => {
       'env:OC_MODEL_AUTHORITY=0',
       "ssh:fake-v5 systemctl restart 'openclaude-v5.service'",
       'master-ready:0/0/-',
-      "ssh:fake-v5 systemctl restart 'openclaude-v5-egress.service'",
+      // OCV5-391: egress restart in place = a slot flip when the templates are installed.
+      "ssh:fake-v5 test -f '/etc/systemd/system/openclaude-v5-egress@.service'",
+      'ssh:fake-v5 bash -s -- flip 600',
       'egress-ready:false',
       'smoke',
     ]
     assert.deepEqual(order, expected)
+  })
+
+  test('OCV5-391: egress restart in place flips slots when installed, else restarts the legacy unit', async () => {
+    const run = (slotsInstalled: boolean) => {
+      const body = [
+        'set -u',
+        'export V5_DEPLOY_SOURCE_ONLY=1',
+        `source '${deploy}'`,
+        `ssh() { printf 'ssh:%s\\n' "$*"; if [[ "$*" == *"test -f"* ]]; then return ${slotsInstalled ? 0 : 1}; fi; return 0; }`,
+        'egress_restart_in_place',
+      ].join('\n')
+      return spawnSync('bash', ['-c', body], {
+        cwd: root, encoding: 'utf8', input: '',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1', KL_HOST: 'fake-v5' },
+      })
+    }
+    const slots = run(true)
+    assert.equal(slots.status, 0, slots.stderr)
+    assert.match(slots.stdout, /ssh:fake-v5 bash -s -- flip 600/)
+    assert.doesNotMatch(slots.stdout, /systemctl restart/)
+    const legacy = run(false)
+    assert.equal(legacy.status, 0, legacy.stderr)
+    assert.match(legacy.stdout, /ssh:fake-v5 systemctl restart 'openclaude-v5-egress.service'/)
+    assert.doesNotMatch(legacy.stdout, /flip/)
   })
 
   test('authority rollback short-circuits safely on env/master/census/smoke failures', async () => {
@@ -5090,7 +5122,7 @@ describe('v5 release safety lanes', () => {
       'assert_no_rollout_in_progress() { return 0; }',
       'remote_env_get() { printf "%s\\n" "$authority_flag"; }',
       'remote_env_set() { record "env:$1=$2"; [[ "$1" == "$MODEL_AUTHORITY_FLAG_KEY" ]] && authority_flag="$2"; return 0; }',
-      'ssh() { record "ssh:$*"; if [[ "$*" == *"restart \'$V5_EGRESS_UNIT\'"* && "$egress_fail" == 1 ]]; then return 1; fi; return 0; }',
+      'ssh() { record "ssh:$*"; if [[ ( "$*" == *"restart \'$V5_EGRESS_UNIT\'"* || "$*" == *"bash -s -- flip"* ) && "$egress_fail" == 1 ]]; then return 1; fi; return 0; }',
       'wait_for_model_authority_master_ready() { record "master-ready:$2/$3/$4"; [[ "$authority_flag" == "$2" ]]; }',
       'run_model_authority_container_rollback() { record census; return 0; }',
       'wait_for_model_authority_egress_ready() { record "egress-ready:$1"; return 0; }',
