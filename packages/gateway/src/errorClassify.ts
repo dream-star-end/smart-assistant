@@ -46,6 +46,9 @@ export interface DelegateOutputError {
   detail: string
 }
 
+/** 模型容量满载词族 —— model_capacity 规则与 OCV5-407 的排除条件共用同一份源。 */
+const CAPACITY_LEXICON = String.raw`at capacity|capacity.{0,40}(?:limit|exceed|full)|overloaded|model.{0,20}busy|\b529\b`
+
 const PATTERNS: Array<{
   re: RegExp
   code: Exclude<ClassifiedErrorCode, 'unknown'>
@@ -132,14 +135,20 @@ const PATTERNS: Array<{
     message: '这条请求无法被模型处理，请调整内容后重试',
   },
   // Deterministic config/route failures: retrying the same target never
-  // succeeds. Must beat both the capacity lexicon below (`try a different
-  // model` used to land on retryable model_capacity) and the generic
-  // 5xx/upstream rule (503 MOONSHOT_NOT_CONFIGURED; `grok route expired`
-  // can also contain incidental `\b5\d{2}\b` hits from token counts).
-  // Reuse taxonomy model_not_available (retryable:false, cta:switch_model)
-  // rather than inventing a new class.
+  // succeeds. Must beat the generic 5xx/upstream rule (503
+  // MOONSHOT_NOT_CONFIGURED; `grok route expired` can also contain incidental
+  // `\b5\d{2}\b` hits from token counts). Reuse taxonomy model_not_available
+  // (retryable:false, cta:switch_model) rather than inventing a new class.
+  //
+  // OCV5-407: `try a different model` is only deterministic when the provider
+  // says nothing about capacity. Codex's only production text with that
+  // phrase is `Selected model is at capacity. Please try a different model.`
+  // (every such row on both editions, 2026-09-05 → 2026-10-13); it is a
+  // transient capacity burst, and as model_not_available it skipped the
+  // bounded silent retry and showed a 「模型暂不可用」 card. Any capacity word
+  // (the lexicon below) hands the text to model_capacity.
   {
-    re: /try a different model/i,
+    re: new RegExp(String.raw`^(?![\s\S]*(?:${CAPACITY_LEXICON}))[\s\S]*try a different model`, 'i'),
     code: 'model_not_available',
     message: '当前模型不可用，请切换模型后再试',
   },
@@ -162,10 +171,10 @@ const PATTERNS: Array<{
   // 审计 R1:裸 `529` 归容量档(Anthropic 529 = overloaded,是容量语义而非泛上游
   // 故障)。它必须在此(upstream 之前)显式命中,否则会被下面的通用 `\b5\d{2}\b`
   // 吞成 upstream_failed。词族之外单列 `\b529\b`,与词族 OR 平级。
-  // `try a different model` is NOT in this lexicon: that branch is a
-  // same-target-never-succeeds failure handled above.
+  // A capacity text that also says `try a different model` lands here, not on
+  // the deterministic rule above (OCV5-407).
   {
-    re: /at capacity|capacity.{0,40}(?:limit|exceed|full)|overloaded|model.{0,20}busy|\b529\b/i,
+    re: new RegExp(CAPACITY_LEXICON, 'i'),
     code: 'model_capacity',
     message: '模型繁忙，请稍后重试或切换模型',
   },
