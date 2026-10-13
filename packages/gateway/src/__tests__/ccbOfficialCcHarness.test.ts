@@ -71,6 +71,22 @@ describe('OC_CCB_OFFICIAL_CC flag', () => {
     assert.equal((on as unknown as { authorityEngine: string }).authorityEngine, 'ccb')
   })
 
+  it('hermetic sessions stay on CCB when the flag is on (OCV5-392)', () => {
+    process.env.OC_CCB_OFFICIAL_CC = '1'
+    const hermetic = new CcbAdapter({ hermeticNoTools: true } as never, {
+      on() { return this },
+    } as never)
+    assert.equal((hermetic as unknown as { harness: string }).harness, 'ccb')
+    const explicit = new CcbAdapter({ hermeticNoTools: true, harness: 'official-cc' } as never, {
+      on() { return this },
+    } as never)
+    assert.equal((explicit as unknown as { harness: string }).harness, 'ccb')
+    const normal = new CcbAdapter({} as never, {
+      on() { return this },
+    } as never)
+    assert.equal((normal as unknown as { harness: string }).harness, 'official-cc')
+  })
+
   it('official-cc preheat does not spawn or --resume without a master dispatch', async () => {
     process.env.OC_CCB_OFFICIAL_CC = '1'
     let starts = 0
