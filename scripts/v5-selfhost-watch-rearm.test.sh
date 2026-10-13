@@ -60,7 +60,8 @@ rearm
 arch="$(find "$C/inst" -maxdepth 1 -name 'watch-disarmed.rearmed-*' | head -n1)"
 if [[ "$EC" == 0 && "$OUT" == *REARM_OK* && ! -e "$WATCH_DISARM" && -n "$arch" && "$(cat "$arch")" == reason=deps-pg \
   && "$(cat "$WATCH_FAIL_COUNT")" == 0 && "$(grep '^recovery_armed=' "$WATCH_STATUS")" == recovery_armed=true \
-  && "$(grep '^health=' "$WATCH_STATUS")" == health=green ]] && grep -q 'rearm: 已重新武装' "$WATCH_LOG"; then
+  && "$(grep '^health=' "$WATCH_STATUS")" == health=green && "$(stat -c %a "$WATCH_LOCK")" == 600 ]] \
+  && grep -q 'rearm: 已重新武装' "$WATCH_LOG"; then
   ok "R1 green rearm archives marker, resets count, status armed"
 else
   bad "R1 ec=$EC out=$OUT"
@@ -116,6 +117,47 @@ if [[ "$oks" == 1 && "$(archives)" == 1 && ! -e "$WATCH_DISARM" ]]; then
   ok "R13 concurrent rearm archives exactly once"
 else
   bad "R13 oks=$oks archives=$(archives)"
+fi
+
+setup r14; WATCH_STUB_MASTER_BODY='{"ok":true}'; rearm; assert_refused "R14 healthz without deps.pg" "deps.pg"
+
+setup r15
+: >"$WATCH_LOCK"; chmod 0600 "$WATCH_LOCK"
+exec 7<>"$WATCH_LOCK"; flock 7
+rearm; assert_refused "R15 deploy lock held by another process" "发布锁被占用"
+flock -u 7; exec 7<&-
+
+setup r16; export WATCH_REARM_INTERVAL_SEC=1
+( sleep 0.5; printf 'reason=schema\n' >"$WATCH_MANUAL_RECOVERY" ) &
+rearm; wait
+rm -f -- "$WATCH_MANUAL_RECOVERY"; export WATCH_REARM_INTERVAL_SEC=0
+assert_refused "R16 manual-recovery appearing mid-check" "manual-recovery"
+
+# --rearm 运行期间 deploy 拿不到发布锁(deploy 用 flock -n 轮询)。
+setup r17; export WATCH_REARM_INTERVAL_SEC=1
+: >"$WATCH_LOCK"; chmod 0600 "$WATCH_LOCK"
+( bash "$BIN" --rearm >"$C/out" 2>&1 ) &
+rp=$!
+sleep 0.6
+if flock -n "$WATCH_LOCK" true; then during=free; else during=held; fi
+wait "$rp"
+if flock -n "$WATCH_LOCK" true; then after=free; else after=held; fi
+export WATCH_REARM_INTERVAL_SEC=0
+if [[ "$during" == held && "$after" == free ]] && grep -q REARM_OK "$C/out"; then
+  ok "R17 deploy lock held for the whole rearm, released after"
+else
+  bad "R17 during=$during after=$after out=$(tr '\n' ' ' <"$C/out" | cut -c1-200)"
+fi
+
+# 归档失败:计数恢复原值,标记不变。
+setup r18
+mkdir -p "$C/bin"
+printf '#!/bin/sh\nexit 1\n' >"$C/bin/mv"; chmod 0755 "$C/bin/mv"
+set +e; OUT="$(PATH="$C/bin:$PATH" bash "$BIN" --rearm 2>&1)"; EC=$?; set -e
+if [[ "$EC" == 1 && "$OUT" == *REARM_REFUSED*归档* && "$(marker_id)" == "$MARK_ID" && "$(cat "$WATCH_FAIL_COUNT")" == 4 && "$(archives)" == 0 ]]; then
+  ok "R18 failed archive restores the fail count"
+else
+  bad "R18 ec=$EC count=$(cat "$WATCH_FAIL_COUNT") out=$(printf '%s' "$OUT" | tr '\n' ' ' | cut -c1-200)"
 fi
 
 echo "REARM_CASES pass=$pass fail=$fail"

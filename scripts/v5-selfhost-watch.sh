@@ -810,17 +810,17 @@ watch_once() {
 }
 
 # OCV5-404:人工显式重新武装。只把停用标记改名归档(留证据),不删、不重启、不回切。
-# 任一前置条件不满足就拒绝,停用标记与失败计数都不动。归档后下一拍 timer 按武装路径检查。
+# 整个检查与归档都持有 selfhost 发布锁(deploy.lock 的 flock):期间不会有 --deploy 开始,
+# 也不会有第二个 --rearm。任一条件不满足就拒绝,停用标记与失败计数都不动。
 rearm_refuse() {
   wlog "rearm 拒绝: $*"
   printf 'REARM_REFUSED %s\n' "$*" >&2
 }
 
-# healthz 带 deps 时 pg 必须是 ok。08-18 停用的原因就是 deps-pg。
+# 08-18 停用的原因就是 deps-pg:healthz 必须明确给出 deps.pg=ok,缺字段也算没确认。
 master_deps_pg_ok() {
   local body="${WATCH_LAST_MASTER_BODY:-${WATCH_STUB_MASTER_BODY:-}}" pg
   [[ -n "$body" ]] || return 1
-  echo "$body" | jq -e 'has("deps")' >/dev/null 2>&1 || return 0
   pg="$(echo "$body" | jq -er '.deps.pg // empty' 2>/dev/null || true)"
   [[ "$pg" == "ok" ]]
 }
@@ -829,9 +829,6 @@ rearm_preconditions() {
   local i checks="$WATCH_REARM_CHECKS" interval="$WATCH_REARM_INTERVAL_SEC" self_sha inst_sha
   [[ "$checks" =~ ^[1-9][0-9]*$ ]] || checks=3
   [[ "$interval" =~ ^[0-9]+$ ]] || interval=5
-  if [[ ! -f "$WATCH_DISARM" || -L "$WATCH_DISARM" ]]; then
-    rearm_refuse "停用标记不是普通文件: $WATCH_DISARM"; return 1
-  fi
   if is_true_dry; then
     rearm_refuse "WATCH_DRY=1,重新武装不会恢复自动回滚"; return 1
   fi
@@ -843,50 +840,70 @@ rearm_preconditions() {
   if [[ "$self_sha" != "$inst_sha" ]]; then
     rearm_refuse "已安装副本与本脚本不一致,先安装再武装"; return 1
   fi
-  if manual_recovery_present; then
-    rearm_refuse "manual-recovery 存在,先走应急恢复"; return 1
-  fi
   for ((i = 1; i <= checks; i++)); do
+    if [[ ! -f "$WATCH_DISARM" || -L "$WATCH_DISARM" ]]; then
+      rearm_refuse "停用标记不是普通文件: $WATCH_DISARM"; return 1
+    fi
+    if manual_recovery_present; then rearm_refuse "manual-recovery 存在,先走应急恢复"; return 1; fi
     if lock_is_live_exemption; then rearm_refuse "发布锁活"; return 1; fi
     if maint_is_live_exemption; then rearm_refuse "维护窗口未到期"; return 1; fi
     if in_cutover_grace; then rearm_refuse "cutover grace 未到期"; return 1; fi
     WATCH_LAST_MASTER_BODY=""
     if ! compound_green; then rearm_refuse "复合健康红(第 $i/$checks 次)"; return 1; fi
-    if ! master_deps_pg_ok; then rearm_refuse "healthz deps.pg 不是 ok(第 $i/$checks 次)"; return 1; fi
+    if ! master_deps_pg_ok; then rearm_refuse "healthz 未确认 deps.pg=ok(第 $i/$checks 次)"; return 1; fi
     if (( i < checks && interval > 0 )); then sleep "$interval"; fi
   done
+  # 最后一次探针之后、归档之前再看一遍人为标记。
+  if [[ ! -f "$WATCH_DISARM" || -L "$WATCH_DISARM" ]]; then
+    rearm_refuse "停用标记不是普通文件: $WATCH_DISARM"; return 1
+  fi
+  if manual_recovery_present; then rearm_refuse "manual-recovery 存在,先走应急恢复"; return 1; fi
+  if maint_is_live_exemption; then rearm_refuse "维护窗口未到期"; return 1; fi
+  if in_cutover_grace; then rearm_refuse "cutover grace 未到期"; return 1; fi
 }
 
 watch_rearm() {
-  local lockfile archived rc
+  local old_count dst
   if [[ ! -e "$WATCH_DISARM" && ! -L "$WATCH_DISARM" ]]; then
     wlog "rearm: 无停用标记,看护已武装"
     echo "REARM_NOOP"
     return 0
   fi
-  rearm_preconditions || return 1
-  # 清零在归档之前:武装后的第一拍不能接着旧计数直接到阈值。停用期间计数不被使用。
-  write_fail_count 0
-  mkdir -p -- "$WATCH_RUN_DIR"
-  lockfile="${WATCH_RUN_DIR}/.watch-rearm.lock"
-  rc=0
-  archived="$(
-    exec 9>"$lockfile" || exit 3
-    flock -n 9 || exit 3
-    [[ -f "$WATCH_DISARM" && ! -L "$WATCH_DISARM" ]] || exit 4
-    dst="${WATCH_DISARM}.rearmed-$(date -u +%Y%m%dT%H%M%SZ)"
-    [[ ! -e "$dst" && ! -L "$dst" ]] || exit 5
-    mv -T -- "$WATCH_DISARM" "$dst" || exit 1
-    [[ ! -e "$WATCH_DISARM" && -f "$dst" ]] || exit 1
-    printf '%s\n' "$dst"
-  )" || rc=$?
-  if (( rc != 0 )); then
-    rearm_refuse "归档停用标记失败 rc=$rc"
+  mkdir -p -- "$(dirname -- "$WATCH_LOCK")"
+  if [[ ! -e "$WATCH_LOCK" && ! -L "$WATCH_LOCK" ]]; then
+    # 与 deploy 的锁准备一致:root 0600 普通文件。已存在则不动(noclobber)。
+    ( umask 077; set -C; : >"$WATCH_LOCK" ) 2>/dev/null || true
+  fi
+  if [[ ! -f "$WATCH_LOCK" || -L "$WATCH_LOCK" ]]; then
+    rearm_refuse "发布锁文件不是普通文件: $WATCH_LOCK"; return 1
+  fi
+  # <> 不截断;锁文件不承载数据。deploy 拿不到锁会每 POLL 秒重试,不会失败。
+  exec 8<>"$WATCH_LOCK" || { rearm_refuse "无法打开发布锁 $WATCH_LOCK"; return 1; }
+  if ! flock -n 8; then
+    exec 8<&-
+    rearm_refuse "发布锁被占用(有 --deploy 或另一个 --rearm 在跑)"; return 1
+  fi
+  if ! rearm_preconditions; then
+    exec 8<&-
     return 1
   fi
+  # 计数在锁内、全部检查通过之后才清;归档失败就恢复原值,拒绝时计数不变。
+  old_count="$(read_fail_count)"
+  dst="${WATCH_DISARM}.rearmed-$(date -u +%Y%m%dT%H%M%SZ)"
+  if [[ -e "$dst" || -L "$dst" ]]; then
+    exec 8<&-
+    rearm_refuse "归档目标已存在: $dst"; return 1
+  fi
+  write_fail_count 0
+  if ! mv -T -- "$WATCH_DISARM" "$dst" || [[ -e "$WATCH_DISARM" || ! -f "$dst" ]]; then
+    write_fail_count "$old_count"
+    exec 8<&-
+    rearm_refuse "归档停用标记失败,失败计数已恢复为 $old_count"; return 1
+  fi
   emit_watch_status true "" true green || wlog "WARN rearm 后状态文件写入失败"
-  wlog "rearm: 已重新武装,停用标记归档到 $archived"
-  echo "REARM_OK archived=$archived"
+  wlog "rearm: 已重新武装,停用标记归档到 $dst"
+  exec 8<&-
+  echo "REARM_OK archived=$dst"
 }
 
 watch_selftest() {

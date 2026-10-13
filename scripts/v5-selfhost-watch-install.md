@@ -58,7 +58,11 @@ timer 实际执行的是安装目录里的 `watch.sh`，不是 git 工作树。
 /opt/openclaude/v5-selfhost-watch/watch.sh --rearm
 ```
 
-它要求：标记是普通文件；`WATCH_DRY=0`；已安装副本就是正在执行的这份；没有 manual-recovery；没有活的发布锁、维护窗口、cutover grace；连续 `WATCH_REARM_CHECKS`（默认 3，间隔 `WATCH_REARM_INTERVAL_SEC` 默认 5 秒）次复合健康绿且 healthz `deps.pg=ok`。任一不满足打印 `REARM_REFUSED <原因>` 并退出 1，标记和失败计数都不动。
+整个检查和归档都持有 selfhost 发布锁（`/run/openclaude-v5-selfhost/deploy.lock` 的 flock）：期间不会有 `--deploy` 开始（deploy 拿不到锁会排队重试），也不会有第二个 `--rearm`。锁被占用就直接拒绝。
 
-通过后先把失败计数清零，再把标记改名为 `watch-disarmed.rearmed-<UTC>` 留作证据，状态文件写 `recovery_armed=true`，打印 `REARM_OK archived=<路径>`。下一拍 timer 按武装路径检查，日志应出现 `复合健康绿,清失败计数`。
+它要求：`WATCH_DRY=0`；已安装副本就是正在执行的这份；连续 `WATCH_REARM_CHECKS`（默认 3，间隔 `WATCH_REARM_INTERVAL_SEC` 默认 5 秒）次都满足——标记是普通文件、没有 manual-recovery、没有活的发布锁 holder / 维护窗口 / cutover grace、复合健康绿、healthz 明确给出 `deps.pg=ok`（缺字段也拒绝）；最后一次探针后、归档前再查一遍标记、manual-recovery、维护和 grace。任一不满足打印 `REARM_REFUSED <原因>` 并退出 1，标记和失败计数都不动。
+
+全部通过后在锁内把失败计数清零，再把标记改名为 `watch-disarmed.rearmed-<UTC>` 留作证据；改名失败就把计数恢复原值并拒绝。成功时状态文件写 `recovery_armed=true`，打印 `REARM_OK archived=<路径>`。
+
+下一拍 timer 按武装路径检查，日志应出现 `复合健康绿,清失败计数`。
 
