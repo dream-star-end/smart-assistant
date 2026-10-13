@@ -184,14 +184,11 @@ export function MemoryPanel({
   );
 }
 
-const WRITE_OPERATION_NAMES = new Set([
-  "core_write",
-  "core_update",
-  "core_delete",
-  "profile_write",
-  "archival_add",
-  "archival_delete",
-  "auto_add",
+const RETRIEVAL_OR_READ_NAMES = new Set([
+  "core_search",
+  "session_search",
+  "archival_search",
+  "core_read",
 ]);
 
 const OPERATION_LABELS: Record<string, string> = {
@@ -534,8 +531,8 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
   const retrievals = value?.byOperation.filter((row) =>
     ["core_search", "session_search", "archival_search"].includes(row.operation),
   ) ?? [];
-  const visibleOperations = value?.byOperation.filter(
-    (row) => row.operation !== "index_injected" && !WRITE_OPERATION_NAMES.has(row.operation),
+  const visibleOperations = value?.byOperation.filter((row) =>
+    RETRIEVAL_OR_READ_NAMES.has(row.operation),
   ) ?? [];
   const retrievalEvents = retrievals.reduce((sum, row) => sum + row.events, 0);
   const hitEvents = retrievals.reduce((sum, row) => sum + row.hits, 0);
@@ -557,7 +554,7 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
         <SectionHeading
           className="min-w-0 flex-1 pb-0"
           title="记忆在会话里如何被使用"
-          hint="已确认操作只含检索、读取，以及来源明确的页面保存和自动整理。索引是否交给模型这里不提供。"
+          hint="已确认操作只含检索、读取，以及来源明确的页面保存和自动整理。检索/读取会话不含只做了页面保存或自动整理的会话。索引是否交给模型这里不提供。"
           hideHintOnMobile
         />
         {/* 时间范围是视图内的行内值,不是一只灰色下拉框。 */}
@@ -621,7 +618,7 @@ function MemoryUsageSection({ auth, agentId }: { auth: AuthSession; agentId: str
           {/* 四个指标是一条分格的统计带(一个容器 + 发丝分隔),不是四张下沉小卡。 */}
           <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border bg-border lg:grid-cols-4">
             {[
-              ["使用会话", totals.sessions],
+              ["检索/读取会话", totals.sessions],
               ["已确认操作", totals.confirmedOperations],
               ["检索命中率", `${hitRate}%`],
               ["影子信号", totals.freshnessGaps],

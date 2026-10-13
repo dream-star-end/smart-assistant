@@ -392,6 +392,7 @@ export interface MemoryUsageDashboard {
     /** Every stored row in the window, including unverified history. Not confirmed use. */
     events: number
     confirmedOperations: number
+    /** Sessions with a known search or read. UI-only and auto-only sessions are excluded. */
     sessions: number
     hits: number
     noMatch: number
@@ -432,6 +433,12 @@ export interface MemoryUsageDashboard {
 }
 
 const SEARCH_OPERATIONS = new Set(['core_search', 'session_search', 'archival_search'])
+const RETRIEVAL_OR_READ_OPERATIONS = new Set([
+  'core_search',
+  'session_search',
+  'archival_search',
+  'core_read',
+])
 const WRITE_OPERATIONS = new Set([
   'core_write',
   'core_update',
@@ -475,12 +482,15 @@ function classifySuccessfulWrite(row: Record<string, unknown>): WriteSourceKind 
   return 'unattributed'
 }
 
+function isRetrievalOrRead(row: Record<string, unknown>): boolean {
+  return RETRIEVAL_OR_READ_OPERATIONS.has(String(row.operation))
+}
+
+/** Known searches/reads, including failed attempts, plus successful ui and auto_dream writes. */
 function isConfirmedMemoryOperation(row: Record<string, unknown>): boolean {
-  if (String(row.operation) === 'index_injected') return false
+  if (isRetrievalOrRead(row)) return true
   const write = classifySuccessfulWrite(row)
-  if (write === 'ui_user_save' || write === 'auto_dream') return true
-  if (write === 'unattributed') return false
-  return !WRITE_OPERATIONS.has(String(row.operation))
+  return write === 'ui_user_save' || write === 'auto_dream'
 }
 
 function percentile(values: number[], p: number): number {
@@ -513,7 +523,8 @@ export async function getMemoryUsageDashboard(input: {
     .get(input.agentId, from) as { value: number }
   const nonIndex = rows.filter((row) => String(row.operation) !== 'index_injected')
   const confirmed = rows.filter((row) => isConfirmedMemoryOperation(row))
-  const operationRows = confirmed.filter((row) => classifySuccessfulWrite(row) == null)
+  const retrievalRows = rows.filter((row) => isRetrievalOrRead(row))
+  const operationRows = retrievalRows
   const groups = new Map<string, Array<Record<string, unknown>>>()
   for (const row of operationRows) {
     const key = `${String(row.operation)}\u0000${String(row.memory_type)}`
@@ -592,7 +603,7 @@ export async function getMemoryUsageDashboard(input: {
       events: rows.length,
       confirmedOperations: confirmed.length,
       sessions: new Set(
-        confirmed.flatMap((row) => (row.session_key == null ? [] : [String(row.session_key)])),
+        retrievalRows.flatMap((row) => (row.session_key == null ? [] : [String(row.session_key)])),
       ).size,
       hits: nonIndex.filter((row) => row.outcome === 'hit').length,
       noMatch: nonIndex.filter((row) => row.outcome === 'no_match').length,

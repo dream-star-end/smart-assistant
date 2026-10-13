@@ -1069,6 +1069,7 @@ export type MemoryUsageDashboard = {
     /** 窗口内原始行数，含未核实历史。不是已确认使用。 */
     events: number;
     confirmedOperations: number;
+    /** 发生过检索或读取的会话。只做页面保存或自动整理的会话不算。 */
     sessions: number;
     hits: number;
     noMatch: number;

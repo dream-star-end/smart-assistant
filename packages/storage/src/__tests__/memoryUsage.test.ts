@@ -283,4 +283,185 @@ describe('memory usage observability', () => {
     assert.equal(JSON.stringify(dashboard).includes('RAW_QUERY_SENTINEL'), false)
     assert.equal(JSON.stringify(dashboard).includes('slug-body'), false)
   })
+
+  test('auto-dream-only bound session is not a retrieval session', async () => {
+    const agentId = 'metric-auto-only'
+    const sessionKey = 'agent:metric-auto-only:webchat:dm:dream'
+    await memory.recordMemoryUsageEvent({
+      agentId,
+      sessionKey,
+      operation: 'auto_add',
+      memoryType: 'core',
+      outcome: 'success',
+      topMatchKey: 'notes.md',
+      metadata: { source: 'auto_dream' },
+    })
+    const dashboard = await memory.getMemoryUsageDashboard({ agentId, days: 30 })
+    assert.equal(dashboard.totals.events, 1)
+    assert.equal(dashboard.totals.confirmedOperations, 1)
+    assert.equal(dashboard.totals.sessions, 0)
+    assert.equal(dashboard.writeSources.autoDreamWrites, 1)
+    assert.equal(dashboard.writeSources.uiUserSaves, 0)
+    assert.equal(dashboard.byOperation.length, 0)
+    assert.equal(dashboard.recentSessions.length, 1)
+    assert.equal(dashboard.recentSessions[0]!.events, 1)
+    assert.equal(dashboard.recentSessions[0]!.searches, 0)
+    assert.equal(dashboard.recentSessions[0]!.autoDreamWrites, 1)
+    assert.equal(dashboard.recentSessions[0]!.uiUserSaves, 0)
+  })
+
+  test('ui-save-only bound session is not a retrieval session', async () => {
+    const agentId = 'metric-ui-only'
+    const sessionKey = 'agent:metric-ui-only:webchat:dm:save'
+    await memory.recordMemoryUsageEvent({
+      agentId,
+      sessionKey,
+      operation: 'core_write',
+      memoryType: 'core',
+      outcome: 'success',
+      topMatchKey: 'notes.md',
+      metadata: { source: 'ui' },
+    })
+    const dashboard = await memory.getMemoryUsageDashboard({ agentId, days: 30 })
+    assert.equal(dashboard.totals.events, 1)
+    assert.equal(dashboard.totals.confirmedOperations, 1)
+    assert.equal(dashboard.totals.sessions, 0)
+    assert.equal(dashboard.writeSources.uiUserSaves, 1)
+    assert.equal(dashboard.writeSources.autoDreamWrites, 0)
+    assert.equal(dashboard.byOperation.length, 0)
+    assert.equal(dashboard.recentSessions.length, 1)
+    assert.equal(dashboard.recentSessions[0]!.events, 1)
+    assert.equal(dashboard.recentSessions[0]!.searches, 0)
+    assert.equal(dashboard.recentSessions[0]!.uiUserSaves, 1)
+    assert.equal(dashboard.recentSessions[0]!.autoDreamWrites, 0)
+  })
+
+  test('auto_refuse and auto_skip stay raw rows and are not confirmed use', async () => {
+    const agentId = 'metric-refuse-skip'
+    const sessionKey = 'agent:metric-refuse-skip:webchat:dm:dream'
+    await memory.recordMemoryUsageEvent({
+      agentId,
+      sessionKey,
+      operation: 'auto_refuse',
+      memoryType: 'core',
+      outcome: 'skipped',
+      topMatchKey: 'user.md',
+      metadata: { reason: 'delete_forbidden' },
+    })
+    await memory.recordMemoryUsageEvent({
+      agentId,
+      sessionKey,
+      operation: 'auto_skip',
+      memoryType: 'core',
+      outcome: 'skipped',
+      query: 'topic already known',
+      topMatchKey: 'notes.md',
+      metadata: { reason: 'strong_hit' },
+    })
+    const dashboard = await memory.getMemoryUsageDashboard({ agentId, days: 30 })
+    assert.equal(dashboard.totals.events, 2)
+    assert.equal(dashboard.totals.confirmedOperations, 0)
+    assert.equal(dashboard.totals.sessions, 0)
+    assert.equal(dashboard.totals.hits, 0)
+    assert.equal(dashboard.totals.noMatch, 0)
+    assert.equal(dashboard.totals.errors, 0)
+    assert.equal(dashboard.totals.denied, 0)
+    assert.equal(dashboard.writeSources.autoDreamWrites, 0)
+    assert.equal(dashboard.writeSources.uiUserSaves, 0)
+    assert.equal(dashboard.byOperation.length, 0)
+    assert.equal(dashboard.recentSessions.length, 1)
+    assert.equal(dashboard.recentSessions[0]!.events, 0)
+    assert.equal(dashboard.recentSessions[0]!.searches, 0)
+    assert.equal(dashboard.recentSessions[0]!.autoDreamWrites, 0)
+  })
+
+  test('retrieval failures stay attempts and write-only sessions do not raise the session count', async () => {
+    const agentId = 'metric-mixed-sessions'
+    const readSession = 'agent:metric-mixed-sessions:webchat:dm:read'
+    const autoSession = 'agent:metric-mixed-sessions:webchat:dm:auto'
+    const uiSession = 'agent:metric-mixed-sessions:webchat:dm:ui'
+    const skipSession = 'agent:metric-mixed-sessions:webchat:dm:skip'
+    await memory.recordMemoryUsageEvent({
+      agentId,
+      sessionKey: readSession,
+      operation: 'core_search',
+      memoryType: 'core',
+      outcome: 'hit',
+      resultCount: 1,
+    })
+    await memory.recordMemoryUsageEvent({
+      agentId,
+      sessionKey: readSession,
+      operation: 'core_read',
+      memoryType: 'core',
+      outcome: 'error',
+    })
+    await memory.recordMemoryUsageEvent({
+      agentId,
+      sessionKey: readSession,
+      operation: 'archival_search',
+      memoryType: 'archival',
+      outcome: 'denied',
+    })
+    await memory.recordMemoryUsageEvent({
+      agentId,
+      sessionKey: autoSession,
+      operation: 'auto_add',
+      memoryType: 'core',
+      outcome: 'success',
+      metadata: { source: 'auto_dream' },
+    })
+    await memory.recordMemoryUsageEvent({
+      agentId,
+      sessionKey: uiSession,
+      operation: 'core_write',
+      memoryType: 'core',
+      outcome: 'success',
+      metadata: { source: 'ui' },
+    })
+    await memory.recordMemoryUsageEvent({
+      agentId,
+      sessionKey: skipSession,
+      operation: 'auto_refuse',
+      memoryType: 'core',
+      outcome: 'skipped',
+      metadata: { reason: 'exists' },
+    })
+    await memory.recordMemoryUsageEvent({
+      agentId,
+      sessionKey: skipSession,
+      operation: 'auto_skip',
+      memoryType: 'core',
+      outcome: 'skipped',
+      metadata: { reason: 'strong_hit' },
+    })
+    const dashboard = await memory.getMemoryUsageDashboard({ agentId, days: 30 })
+    assert.equal(dashboard.totals.events, 7)
+    assert.equal(dashboard.totals.confirmedOperations, 5)
+    assert.equal(dashboard.totals.sessions, 1)
+    assert.equal(dashboard.totals.hits, 1)
+    assert.equal(dashboard.totals.noMatch, 0)
+    assert.equal(dashboard.totals.errors, 1)
+    assert.equal(dashboard.totals.denied, 1)
+    assert.deepEqual(
+      dashboard.byOperation.map((row) => row.operation).sort(),
+      ['archival_search', 'core_read', 'core_search'],
+    )
+    const read = dashboard.recentSessions.find((row) => row.sessionKey === readSession)
+    const auto = dashboard.recentSessions.find((row) => row.sessionKey === autoSession)
+    const ui = dashboard.recentSessions.find((row) => row.sessionKey === uiSession)
+    const skip = dashboard.recentSessions.find((row) => row.sessionKey === skipSession)
+    assert.equal(read?.events, 3)
+    assert.equal(read?.searches, 2)
+    assert.equal(auto?.events, 1)
+    assert.equal(auto?.searches, 0)
+    assert.equal(auto?.autoDreamWrites, 1)
+    assert.equal(ui?.events, 1)
+    assert.equal(ui?.searches, 0)
+    assert.equal(ui?.uiUserSaves, 1)
+    assert.equal(skip?.events, 0)
+    assert.equal(skip?.searches, 0)
+    assert.equal(skip?.autoDreamWrites, 0)
+    assert.equal(skip?.uiUserSaves, 0)
+  })
 })

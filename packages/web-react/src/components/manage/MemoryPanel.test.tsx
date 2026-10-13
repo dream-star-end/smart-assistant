@@ -555,6 +555,167 @@ describe("MemoryPanel · 使用情况", () => {
     expect(screen.queryByText(/次写入/)).not.toBeInTheDocument();
     expect(screen.queryByText("新增核心记忆")).not.toBeInTheDocument();
   });
+
+  function statValue(label: string) {
+    const dt = screen.getByText(label);
+    return dt.nextElementSibling?.textContent ?? "";
+  }
+
+  function frozenUsage(overrides: Record<string, unknown>) {
+    return {
+      window: { days: 30, from: new Date(0).toISOString(), to: new Date().toISOString() },
+      indexDelivery: { status: "unavailable" as const, reason: "missing_engine_acceptance_receipt" as const },
+      legacyUnverifiedIndexVisibility: 0,
+      freshnessSignal: {
+        kind: "mixed_shadow" as const,
+        provesUsage: false as const,
+        provesDelivery: false as const,
+        provesWrongAnswer: false as const,
+      },
+      ...overrides,
+    };
+  }
+
+  test("仅自动整理写入不把绑定会话显示成检索/读取会话", async () => {
+    mockIndex([]);
+    vi.spyOn(api, "getMemoryUsage").mockResolvedValue(
+      frozenUsage({
+        totals: { events: 1, confirmedOperations: 1, sessions: 0, hits: 0, noMatch: 0, errors: 0, denied: 0, freshnessGaps: 0 },
+        writeSources: { uiUserSaves: 0, autoDreamWrites: 1, unattributedWrites: 0 },
+        byOperation: [],
+        recentSessions: [
+          {
+            sessionKey: "agent:metric-auto-only:webchat:dm:dream",
+            title: "未命名会话",
+            lastAt: Date.now(),
+            events: 1,
+            searches: 0,
+            uiUserSaves: 0,
+            autoDreamWrites: 1,
+            unattributedWrites: 0,
+            freshnessGaps: 0,
+          },
+        ],
+      }) as never,
+    );
+    renderPanel();
+    fireEvent.click(screen.getByRole("tab", { name: "用量" }));
+    expect(await screen.findByText("检索/读取会话")).toBeInTheDocument();
+    expect(screen.queryByText("使用会话")).not.toBeInTheDocument();
+    expect(statValue("检索/读取会话")).toBe("0");
+    expect(statValue("已确认操作")).toBe("1");
+    expect(screen.getByText(/自动整理写入 1 次/)).toBeInTheDocument();
+    expect(screen.getByText("自动整理 1")).toBeInTheDocument();
+  });
+
+  test("仅页面保存不把绑定会话显示成检索/读取会话", async () => {
+    mockIndex([]);
+    vi.spyOn(api, "getMemoryUsage").mockResolvedValue(
+      frozenUsage({
+        totals: { events: 1, confirmedOperations: 1, sessions: 0, hits: 0, noMatch: 0, errors: 0, denied: 0, freshnessGaps: 0 },
+        writeSources: { uiUserSaves: 1, autoDreamWrites: 0, unattributedWrites: 0 },
+        byOperation: [],
+        recentSessions: [
+          {
+            sessionKey: "agent:metric-ui-only:webchat:dm:save",
+            title: "未命名会话",
+            lastAt: Date.now(),
+            events: 1,
+            searches: 0,
+            uiUserSaves: 1,
+            autoDreamWrites: 0,
+            unattributedWrites: 0,
+            freshnessGaps: 0,
+          },
+        ],
+      }) as never,
+    );
+    renderPanel();
+    fireEvent.click(screen.getByRole("tab", { name: "用量" }));
+    expect(await screen.findByText("检索/读取会话")).toBeInTheDocument();
+    expect(screen.queryByText("使用会话")).not.toBeInTheDocument();
+    expect(statValue("检索/读取会话")).toBe("0");
+    expect(statValue("已确认操作")).toBe("1");
+    expect(screen.getByText(/用户在页面保存 1 次/)).toBeInTheDocument();
+    expect(screen.getByText("页面保存 1")).toBeInTheDocument();
+  });
+
+  test("拒绝和跳过即使出现在旧的按操作列表里也不算检索/读取或已确认操作", async () => {
+    mockIndex([]);
+    vi.spyOn(api, "getMemoryUsage").mockResolvedValue(
+      frozenUsage({
+        totals: { events: 2, confirmedOperations: 0, sessions: 0, hits: 0, noMatch: 0, errors: 0, denied: 0, freshnessGaps: 0 },
+        writeSources: { uiUserSaves: 0, autoDreamWrites: 0, unattributedWrites: 0 },
+        byOperation: [
+          { operation: "auto_refuse", memoryType: "core", events: 1, sessions: 1, hits: 0, noMatch: 0, p50Ms: 1, p95Ms: 1 },
+          { operation: "auto_skip", memoryType: "core", events: 1, sessions: 1, hits: 0, noMatch: 0, p50Ms: 1, p95Ms: 1 },
+        ],
+        recentSessions: [
+          {
+            sessionKey: "agent:metric-refuse-skip:webchat:dm:dream",
+            title: "未命名会话",
+            lastAt: Date.now(),
+            events: 0,
+            searches: 0,
+            uiUserSaves: 0,
+            autoDreamWrites: 0,
+            unattributedWrites: 0,
+            freshnessGaps: 0,
+          },
+        ],
+      }) as never,
+    );
+    renderPanel();
+    fireEvent.click(screen.getByRole("tab", { name: "用量" }));
+    expect(await screen.findByText("检索/读取会话")).toBeInTheDocument();
+    expect(statValue("检索/读取会话")).toBe("0");
+    expect(statValue("已确认操作")).toBe("0");
+    expect(screen.queryByText("自动记忆拒绝")).not.toBeInTheDocument();
+    expect(screen.queryByText("自动记忆跳过")).not.toBeInTheDocument();
+    expect(screen.queryByText("使用会话")).not.toBeInTheDocument();
+  });
+
+  test("混合检索读取失败仍展示为操作，写入独占会话不抬高检索/读取会话数", async () => {
+    mockIndex([]);
+    vi.spyOn(api, "getMemoryUsage").mockResolvedValue(
+      frozenUsage({
+        totals: { events: 7, confirmedOperations: 5, sessions: 1, hits: 1, noMatch: 0, errors: 1, denied: 1, freshnessGaps: 0 },
+        writeSources: { uiUserSaves: 1, autoDreamWrites: 1, unattributedWrites: 0 },
+        byOperation: [
+          { operation: "core_search", memoryType: "core", events: 1, sessions: 1, hits: 1, noMatch: 0, p50Ms: 5, p95Ms: 5 },
+          { operation: "core_read", memoryType: "core", events: 1, sessions: 1, hits: 0, noMatch: 0, p50Ms: 5, p95Ms: 5 },
+          { operation: "archival_search", memoryType: "archival", events: 1, sessions: 1, hits: 0, noMatch: 0, p50Ms: 5, p95Ms: 5 },
+          { operation: "auto_refuse", memoryType: "core", events: 1, sessions: 1, hits: 0, noMatch: 0, p50Ms: 1, p95Ms: 1 },
+        ],
+        recentSessions: [
+          {
+            sessionKey: "agent:metric-mixed-sessions:webchat:dm:read",
+            title: "读过的会话",
+            lastAt: Date.now(),
+            events: 3,
+            searches: 2,
+            uiUserSaves: 0,
+            autoDreamWrites: 0,
+            unattributedWrites: 0,
+            freshnessGaps: 0,
+          },
+        ],
+      }) as never,
+    );
+    renderPanel();
+    fireEvent.click(screen.getByRole("tab", { name: "用量" }));
+    expect(await screen.findByText("检索/读取会话")).toBeInTheDocument();
+    expect(statValue("检索/读取会话")).toBe("1");
+    expect(statValue("已确认操作")).toBe("5");
+    expect(screen.getByText("核心检索")).toBeInTheDocument();
+    expect(screen.getByText("正文读取")).toBeInTheDocument();
+    expect(screen.getByText("归档检索")).toBeInTheDocument();
+    expect(screen.queryByText("自动记忆拒绝")).not.toBeInTheDocument();
+    expect(screen.getByText(/用户在页面保存 1 次/)).toBeInTheDocument();
+    expect(screen.getByText(/自动整理写入 1 次/)).toBeInTheDocument();
+    expect(screen.getByText("读过的会话")).toBeInTheDocument();
+    expect(screen.queryByText("使用会话")).not.toBeInTheDocument();
+  });
 });
 
 describe("MemoryPanel · 单文件查看/编辑", () => {
@@ -1004,7 +1165,7 @@ describe("MemoryPanel · 读失败不再与空态并排", () => {
     });
     const { container } = renderPanel();
     fireEvent.click(screen.getByRole("tab", { name: "用量" }));
-    await screen.findByText("使用会话");
+    await screen.findByText("检索/读取会话");
     // 这三个类名在 styles.css 里没有定义（Tailwind v4 不会生成 CSS），出现即回归。
     expect(container.innerHTML).not.toMatch(/text-body-sm|text-foreground|bg-surface-subtle/);
   });
