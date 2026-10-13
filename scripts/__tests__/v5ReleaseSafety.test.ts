@@ -5060,6 +5060,33 @@ describe('v5 release safety lanes', () => {
     assert.deepEqual(order, expected)
   })
 
+  test('OCV5-391: model-authority egress readiness follows the serving slot after migration (Codex r1 P1)', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-slot-')); dirs.push(dir)
+    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    const w = async (name: string, body: string) => {
+      await writeFile(path.join(bin, name), `#!/bin/bash\n${body}\n`); await chmod(path.join(bin, name), 0o755)
+    }
+    // ssh runs the streamed remote script locally; legacy inactive, slot B active with a live pid.
+    await w('ssh', 'shift; [[ "$1" == bash ]] && { shift; exec bash "$@"; }; exec bash -c "$*"')
+    await w('systemctl', `case "$*" in
+  "is-active openclaude-v5-egress@B.service") echo active ;;
+  is-active*) echo inactive; exit 3 ;;
+  *MainPID*openclaude-v5-egress@B.service) echo "$LIVE_PID" ;;
+  *MainPID*) echo 0 ;;
+  *ActiveEnterTimestampMonotonic*) echo 5 ;;
+esac`)
+    await w('curl', 'echo \'{"ok":true,"role":"egress","modelAuthority":{"enforced":true}}\'')
+    const body = [
+      'set -u', 'export V5_DEPLOY_SOURCE_ONLY=1', `source '${deploy}'`,
+      'model_authority_egress_ready_once true 2 && echo READY || echo NOT_READY',
+      'echo "unit-state=$MODEL_AUTHORITY_EGRESS_LAST_STATE_AFTER pid=$MODEL_AUTHORITY_EGRESS_LAST_PID_AFTER"',
+    ].join('\n')
+    const res = spawnSync('bash', ['-c', body], { cwd: root, encoding: 'utf8',
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, ALLOW_ANY_BRANCH: '1', KL_HOST: 'fake-v5', LIVE_PID: String(process.pid) } })
+    assert.match(res.stdout, /READY\nunit-state=active pid=\d+/, res.stdout + res.stderr)
+    assert.doesNotMatch(res.stdout, /NOT_READY/)
+  })
+
   test('OCV5-391: egress restart in place flips slots when installed, else restarts the legacy unit', async () => {
     const run = (slotsInstalled: boolean) => {
       const body = [

@@ -5330,6 +5330,15 @@ model_authority_egress_ready_once() { # <true|false> <request-timeout-seconds>
     "$V5_EGRESS_UNIT" "$request_timeout" <<'REMOTE'
 set +e
 unit="$1"; request_timeout="$2"
+# OCV5-391: after the slot migration the serving egress is the newest active slot.
+if [[ "$(systemctl is-active "$unit" 2>/dev/null)" != active ]]; then
+  best_t=-1
+  for c in openclaude-v5-egress@A.service openclaude-v5-egress@B.service; do
+    [[ "$(systemctl is-active "$c" 2>/dev/null)" == active ]] || continue
+    t="$(systemctl show -p ActiveEnterTimestampMonotonic --value "$c" 2>/dev/null || echo 0)"
+    (( ${t:-0} > best_t )) && { unit="$c"; best_t=${t:-0}; }
+  done
+fi
 state_before="$(systemctl is-active "$unit" 2>/dev/null || true)"
 pid_before="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
 health=""

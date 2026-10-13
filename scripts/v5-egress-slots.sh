@@ -86,7 +86,7 @@ assert_no_orphan_listener() {
 legacy_inflight() { curl -fsS --max-time 3 "$STATS" 2>/dev/null | jq -r '.inflight.total_current // empty' 2>/dev/null || true; }
 
 cmd_flip() {
-  local predrain="${1:-600}" cur="" target new_sock new_svc old_sock old_svc st left i
+  local predrain="${1:-600}" cur="" target new_sock new_svc old_sock old_svc st left i migrated=0
   [[ "$predrain" =~ ^[0-9]+$ ]] || die "predrain must be seconds"
   [[ -f "/etc/systemd/system/$SVC_TPL" && -f "/etc/systemd/system/$SOCK_TPL" ]] || die "slot templates not installed"
   [[ "$(sysctl -n net.ipv4.tcp_migrate_req 2>/dev/null || echo 0)" == 1 ]] || die "tcp_migrate_req is not 1"
@@ -117,6 +117,7 @@ cmd_flip() {
     echo "  egress-slots: migrating legacy → slot $target (stopping $LEGACY, in-flight=${left:-?})" >&2
     systemctl stop "$LEGACY"
     systemctl disable "$LEGACY" >/dev/null 2>&1 || true
+    migrated=1
   fi
   st="$(state "$new_svc")"
   if [[ "$st" == deactivating ]]; then
@@ -129,6 +130,13 @@ cmd_flip() {
     tail -n 40 /var/log/openclaude-v5-egress.log >&2 || true
     systemctl stop --job-mode=ignore-dependencies "$new_sock" 2>/dev/null || true
     systemctl stop "$new_svc" 2>/dev/null || true
+    if (( migrated )); then
+      # The legacy unit was stopped for this migration: bring it back, never leave :$PORT closed.
+      systemctl enable "$LEGACY" >/dev/null 2>&1 || true
+      systemctl start "$LEGACY" && wait_shared_port \
+        || die "slot $target failed to start and the legacy unit did not come back: :$PORT may be closed"
+      die "slot $target failed to start; legacy unit restored and serving"
+    fi
     die "slot $target failed to start; ${cur:+slot $cur still serving}"
   fi
   wait_shared_port || die "shared port not reachable after slot $target started"
