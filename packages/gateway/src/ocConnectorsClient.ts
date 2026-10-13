@@ -22,7 +22,7 @@ export const CONNECTOR_BAD_RESPONSE = 'CONNECTOR_BAD_RESPONSE'
 export const CONNECTOR_NO_MASTER_BASE = 'CONNECTOR_NO_MASTER_BASE'
 export const CONNECTOR_NO_CONTAINER_TOKEN = 'CONNECTOR_NO_CONTAINER_TOKEN'
 
-export type ConnectorOp = 'list' | 'call' | 'catalog'
+export type ConnectorOp = 'list' | 'call' | 'catalog' | 'describe'
 export type ConnectorRpcSurface = 'connectors' | 'plugins'
 
 /** 传输层错误:message 只承载稳定码 + 可安全展示的非敏感细节(如 HTTP 状态数)。 */

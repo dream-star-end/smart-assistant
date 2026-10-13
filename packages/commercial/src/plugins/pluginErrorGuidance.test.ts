@@ -253,6 +253,35 @@ const READ_AUTH_EXACT: Record<string, Exact> = {
     sideEffect: 'none',
     nextAction: '请修正参数后重试，不要原样重放',
   },
+  VALIDATION_FAILED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    sideEffect: 'none',
+    nextAction: '先用 oc-connect describe <插件> <操作> 查看参数名、类型和必填项，修正后再调用',
+    message: '参数不符合该操作的参数结构',
+  },
+  UPSTREAM_AUTH_FAILED: {
+    retrySafe: 'after_reauth',
+    requiresReauth: true,
+    sideEffect: 'none',
+    nextAction:
+      '请提示用户检查该插件的凭据（Token、授权或账号密码）是否有效、额度或配额是否用完，必要时到 管理中心 → 插件 重新绑定或填写；不要自动重试',
+    message: '插件服务拒绝了凭据：凭据无效、已过期或被撤销，或额度/配额已用完',
+  },
+  UPSTREAM_RATE_LIMITED: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    sideEffect: 'none',
+    nextAction: '稍后再试，不要立即连打；持续出现时提示用户检查该插件的配额',
+    message: '插件服务限流（HTTP 429）',
+  },
+  RESULT_TOO_LARGE: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    sideEffect: 'none',
+    nextAction: '缩小查询范围、减少条数或分批读取后重试，不要原样重放',
+    message: '结果超过单次返回上限',
+  },
   WRITE_DISABLED: {
     retrySafe: 'no',
     requiresReauth: false,

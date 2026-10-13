@@ -250,7 +250,7 @@ async function mkUser(role: 'user' | 'admin' = 'user'): Promise<number> {
 }
 
 /** 建 listing+version 并 securityApprove → 返回可绑定的 versionId + 本地编译产物。 */
-async function approvedConnector(): Promise<{
+async function approvedConnector(opts: { failurePointers?: string[] } = {}): Promise<{
   versionId: number
   slug: string
   specHash: string
@@ -259,6 +259,12 @@ async function approvedConnector(): Promise<{
   seq += 1
   const slug = `notion-${seq}-${Date.now() % 1_000_000}`
   const spec = notionSpec(slug)
+  if (opts.failurePointers) {
+    // OCV5-401:探针结果须保留 error 字段,failurePointers 才看得到。
+    const actions = spec.actions as Array<{ id: string; result: { properties: Record<string, unknown> } }>
+    actions.find((a) => a.id === 'whoami')!.result.properties.error = { type: 'object' }
+    ;(spec.identity as Record<string, unknown>).failurePointers = opts.failurePointers
+  }
   const author = await mkUser()
   const reviewer = await mkUser('admin')
   const raw = JSON.stringify(spec)
@@ -569,6 +575,66 @@ describe('声明式首垂直 static-token+Notion', () => {
         [user],
       )
       assert.equal(cnt.rows[0]!.n, '0')
+    } finally {
+      await server.close()
+    }
+  })
+
+  test('identity.failurePointers:2xx 里报错 → UPSTREAM_AUTH_FAILED,不落库也不替换已有连接 (OCV5-401)', async (t) => {
+    if (skipIfNoDb(t)) return
+    const server = await startServer()
+    try {
+      const conn = await approvedConnector({ failurePointers: ['/error'] })
+      const user = await mkUser()
+      const deps: EngineHttpDeps = { resolver: okResolver(), fetchImpl: localFetch(server.port) }
+      const failing = () => ({
+        status: 200,
+        body: JSON.stringify({ bot_id: 'bot-abc', error: { code: -32001, message: 'quota' } }),
+      })
+      server.setHandler(failing)
+      await assert.rejects(
+        bindDeclarativeConnector(
+          { userId: user, connectorVersionId: conn.versionId, secrets: { access_token: TOKEN }, deps },
+          getPool(),
+        ),
+        isConnErr('UPSTREAM_AUTH_FAILED'),
+      )
+      const none = await query<{ n: string }>(
+        'SELECT count(*)::text AS n FROM connections WHERE user_id = $1',
+        [user],
+      )
+      assert.equal(none.rows[0]!.n, '0')
+
+      server.setHandler(identityHandler())
+      const good = await bindDeclarativeConnector(
+        { userId: user, connectorVersionId: conn.versionId, secrets: { access_token: TOKEN }, deps },
+        getPool(),
+      )
+      const before = await connectionRow(good.connectionId)
+      server.setHandler(failing)
+      await assert.rejects(
+        bindDeclarativeConnector(
+          {
+            userId: user,
+            connectorVersionId: conn.versionId,
+            secrets: { access_token: `${TOKEN}-rejected` },
+            deps,
+          },
+          getPool(),
+        ),
+        isConnErr('UPSTREAM_AUTH_FAILED'),
+      )
+      const active = await query<{ id: string }>(
+        'SELECT id::text AS id FROM connections WHERE user_id = $1 AND revoked_at IS NULL',
+        [user],
+      )
+      assert.deepEqual(
+        active.rows.map((r) => r.id),
+        [good.connectionId],
+      )
+      const after = await connectionRow(good.connectionId)
+      assert.equal(after?.has_secret, true)
+      assert.deepEqual(after?.secret_enc, before?.secret_enc, 'stored credential unchanged')
     } finally {
       await server.close()
     }
