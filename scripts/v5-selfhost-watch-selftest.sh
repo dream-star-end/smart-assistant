@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
-# 看护判定逻辑自测入口。优先跑固定目录副本(与线上一致)。
+# 看护判定逻辑自测入口。默认测仓库候选脚本，不测已安装的旧副本。
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -x /opt/openclaude/v5-selfhost-watch/watch.sh ]]; then
-  exec /opt/openclaude/v5-selfhost-watch/watch.sh --selftest
+BIN="${WATCH_BIN:-$DIR/v5-selfhost-watch.sh}"
+case "$BIN" in
+  /opt/openclaude/v5-selfhost-watch/watch.sh)
+    echo "REFUSE: 不测已安装副本 $BIN" >&2
+    exit 2
+    ;;
+esac
+if [[ ! -f "$BIN" ]]; then
+  echo "REFUSE: 候选脚本不存在 $BIN" >&2
+  exit 2
 fi
-exec "$DIR/v5-selfhost-watch.sh" --selftest
+exec "$BIN" --selftest
