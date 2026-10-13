@@ -44,6 +44,9 @@ export function boxSwitchCompactionEnabled(env: NodeJS.ProcessEnv = process.env)
 }
 
 export const BOX_SWITCH_COMPACT_MODEL = "box-claude-haiku-5-5";
+/** OCV5-388: the Haiku rows a compaction may run on, first available wins (selfhost has
+ * box-claude-haiku-5-5, commercial box-api-claude-haiku-5-5; same upstream model and prices). */
+export const BOX_SWITCH_COMPACT_MODELS: readonly string[] = [BOX_SWITCH_COMPACT_MODEL, "box-api-claude-haiku-5-5"];
 /** Below this the whole conversation costs less to rewrite on the new login than to compact. */
 export const BOX_SWITCH_COMPACT_MIN_TOKENS = 30_000;
 export const BOX_SWITCH_COMPACT_MAX_OUTPUT = 8_000;
@@ -203,8 +206,9 @@ function derivedHex(...parts: string[]): string {
   return createHash("sha256").update(parts.join("\0")).digest("hex");
 }
 
-export function boxSwitchCompactionBody(transcript: string, ids: { sessionId: string; turnKey: string }): ProxyBody {
-  return { model: BOX_SWITCH_COMPACT_MODEL, max_tokens: BOX_SWITCH_COMPACT_MAX_OUTPUT, stream: true,
+export function boxSwitchCompactionBody(transcript: string, ids: { sessionId: string; turnKey: string },
+  model: string = BOX_SWITCH_COMPACT_MODEL): ProxyBody {
+  return { model, max_tokens: BOX_SWITCH_COMPACT_MAX_OUTPUT, stream: true,
     system: COMPACT_SYSTEM,
     messages: [{ role: "user", content: [{ type: "text",
       text: `<transcript>\n${transcript}\n</transcript>\n\n${COMPACT_INSTRUCTIONS}` }] }],
@@ -310,18 +314,22 @@ export async function prepareBoxSwitch(deps: BoxSwitchDeps, input: BoxSwitchInpu
   const boundary = offset + local;
   if (existing && applied && boundary <= existing.boundary) return skip("already_compacted");
 
-  const model = BOX_SWITCH_COMPACT_MODEL;
-  const descriptor = input.snapshot.resolve(model);
-  const pricing = input.snapshot.billingPricingFor(model);
-  if (!descriptor || descriptor.providerId !== "box_cli" || !pricing
-    || input.deniedModelIds.has(model)) return skip("model_unavailable");
+  const usable = (id: string) => {
+    const descriptor = input.snapshot.resolve(id);
+    const pricing = input.snapshot.billingPricingFor(id);
+    return descriptor && descriptor.providerId === "box_cli" && pricing && !input.deniedModelIds.has(id)
+      ? { model: id, descriptor, pricing } : null;
+  };
+  const pick = BOX_SWITCH_COMPACT_MODELS.map(usable).find((m) => m !== null);
+  if (!pick) return skip("model_unavailable");
+  const { model, descriptor, pricing } = pick;
   const upstreamModel = descriptor.upstreamModelId ?? model;
 
   const billingRequestId = `${input.requestId}-switch-compact`;
   const turnKey = derivedHex("box-switch-compact", input.uid.toString(), cliSessionId, String(boundary));
   const compactSessionId = `${cliSessionId}.switch`;
   const transcript = renderBoxSwitchTranscript(current, local);
-  const compactBody = boxSwitchCompactionBody(transcript, { sessionId: compactSessionId, turnKey });
+  const compactBody = boxSwitchCompactionBody(transcript, { sessionId: compactSessionId, turnKey }, model);
   const started = Date.now();
   let pre: Awaited<ReturnType<typeof preCheckWithCost>>;
   try {

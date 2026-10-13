@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { readFileSync, unlinkSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { makeBoxTextPlan, makeBoxAssetsStage, BoxTextPlanError, boxRunnerLoginScope,
-  boxInteractiveRunnerEnabled, boxRunnerPlanInput } from "./boxTextPlan.js";
+  boxInteractiveRunnerEnabled, boxRunnerFor, boxRunnerPlanInput } from "./boxTextPlan.js";
 import { makeBoxToolPlan } from "./boxToolPlan.js";
 import {
   PROXY_BYTE_BUDGET_BOX_NATIVE_V1,
@@ -280,6 +280,27 @@ test("OCV5-384: a fresh native session gets an owner-0700 project directory befo
   assert.equal(fresh.discardNativeCleanup?.args[4], "", "a discard never removes it either");
   const plain = makeBoxTextPlan(input);
   assert.equal(plain.stageInputs[0]?.args[4], "", "without native persistence nothing changes");
+});
+
+test("OC_BOX_API_RUNNER=interactive runs the box-api-* models interactively on every login, only with the runner on (OCV5-388)", () => {
+  const host = { host: Buffer.from("x"), modFiles: "{}", modSha256: "c".repeat(64) };
+  const on = { OC_BOX_INTERACTIVE_RUNNER: "1", OC_BOX_API_RUNNER: "interactive" };
+  for (const id of ["box-api-claude-opus-5-5", "box-api-claude-sonnet-5-5", "box-api-claude-haiku-5-5"]) {
+    assert.equal(boxRunnerFor(id, on), "interactive");
+    assert.deepEqual(boxRunnerPlanInput(id, host, on), { interactiveHost: host });
+    assert.throws(() => boxRunnerPlanInput(id, undefined, on), /BOX_INTERACTIVE_HOST_UNAVAILABLE/);
+    assert.equal(boxRunnerLoginScope(id, on), "all");
+    // Unset, another value, or the runner off: the catalog decides (claude -p, default login).
+    for (const env of [{}, { OC_BOX_API_RUNNER: "interactive" }, { ...on, OC_BOX_API_RUNNER: "1" },
+      { ...on, OC_BOX_INTERACTIVE_RUNNER: "0" }]) {
+      assert.equal(boxRunnerFor(id, env), "print");
+      assert.deepEqual(boxRunnerPlanInput(id, undefined, env), {});
+      assert.equal(boxRunnerLoginScope(id, env), "default");
+    }
+  }
+  assert.equal(boxRunnerFor("box-claude-opus-5-5", {}), "interactive");
+  assert.equal(boxRunnerFor("cursor-auto", on), undefined);
+  assert.equal(boxRunnerLoginScope("cursor-auto", on), "default");
 });
 
 test("the interactive runner is off unless the installation sets OC_BOX_INTERACTIVE_RUNNER=1 (OCV5-388)", () => {

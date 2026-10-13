@@ -103,14 +103,16 @@ test("sseText collects only text deltas", () => {
   assert.equal(sseText(raw), "Hello");
 });
 
-function harness(over: { mustMove?: boolean; summary?: string; fail?: boolean; insufficient?: boolean } = {}) {
-  const pricing = { model_id: BOX_SWITCH_COMPACT_MODEL, display_name: "Haiku", input_per_mtok: 100n,
+function harness(over: { mustMove?: boolean; summary?: string; fail?: boolean; insufficient?: boolean;
+  compactModel?: string } = {}) {
+  const compactModel = over.compactModel ?? BOX_SWITCH_COMPACT_MODEL;
+  const pricing = { model_id: compactModel, display_name: "Haiku", input_per_mtok: 100n,
     output_per_mtok: 500n, cache_read_per_mtok: 10n, cache_write_per_mtok: 125n, multiplier: "1.000",
     enabled: true } as unknown as ModelPricing;
   const snapshot = {
-    resolve: (m: string) => m === BOX_SWITCH_COMPACT_MODEL
+    resolve: (m: string) => m === compactModel
       ? { providerId: "box_cli", upstreamModelId: "claude-haiku-5-5" } : null,
-    billingPricingFor: (m: string) => m === BOX_SWITCH_COMPACT_MODEL ? pricing : null,
+    billingPricingFor: (m: string) => m === compactModel ? pricing : null,
   } as unknown as ModelCatalogSnapshot;
   const calls: Array<Record<string, unknown>> = [];
   const journal: Array<Record<string, unknown>> = [];
@@ -200,6 +202,22 @@ test("nothing happens while the login has quota left, for short chats or mid too
   const mid = body(chat(40, { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: "ok" }] }));
   assert.deepEqual(await prepareBoxSwitch(tool.deps, tool.input(mid)), { kind: "skipped", reason: "not_turn_start" });
   for (const h of [short, tool]) assert.equal(h.calls.length, 0);
+});
+
+test("an installation without box-claude-haiku-5-5 compacts on box-api-claude-haiku-5-5 and bills that row (OCV5-388)", async () => {
+  const h = harness({ compactModel: "box-api-claude-haiku-5-5" });
+  const out = await prepareBoxSwitch(h.deps, h.input(body(chat(40))));
+  assert.equal(out.kind, "compacted");
+  const call = h.calls[0]! as { canonicalModel: string; canonicalBody: ProxyBody; init: { body: string } };
+  assert.equal(call.canonicalModel, "box-api-claude-haiku-5-5");
+  assert.equal(call.canonicalBody.model, "box-api-claude-haiku-5-5");
+  assert.equal(JSON.parse(call.init.body).model, "claude-haiku-5-5");
+  assert.equal(h.journal[0]!.model, "box-api-claude-haiku-5-5");
+  assert.deepEqual(h.settled, ["commit:box-api-claude-haiku-5-5:final"]);
+  const none = harness({ compactModel: "box-api-claude-opus-5-5" });
+  assert.deepEqual(await prepareBoxSwitch(none.deps, none.input(body(chat(40)))),
+    { kind: "skipped", reason: "model_unavailable" });
+  assert.equal(none.calls.length, 0);
 });
 
 test("a Haiku chat is compacted the same way (operator plan: every switch compacts)", async () => {
