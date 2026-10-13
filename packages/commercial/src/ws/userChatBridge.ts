@@ -199,6 +199,7 @@ import {
   markRecoveryContainerReceipt,
   releaseRecoveryPreReceipt,
   pauseRecoveryForRefusal,
+  pauseRecoveryPreReceipt,
   releaseRecoveryForTransportWait,
   type ClaimedRecoveryJob,
 } from "../dispatch/turnRecoveryStore.js";
@@ -4025,6 +4026,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
      *  「加速」——socket OPEN ≠ 前端已 durable 落地该终态(帧可能在途丢、页面已切走)。durable 的
      *  「已告知」唯一由 reconciler 在权威终态事务内置真(§2.3 ③)。绝不用瞬态 socket 态推断
      *  client_notified,否则 fail-visible(I1)会因误判「已通知」而不再补发终态。 */
+    /** OCV5-391: recovery jobs this connection refused for good (job id:lease epoch → code). A refusal
+     * is usually decided before the pre-forward failure exit runs; that exit then pauses the job
+     * (and ends its dispatch) instead of re-queuing it. */
+    const refusedRecoveryJobs = new Map<string, string>();
     const failDispatchPreForward = (
       record: AdmittedDispatch | undefined,
       failureCode: string,
@@ -4040,12 +4045,19 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       dropAdmittedDispatch(record.clientMessageId);
       if (!pool) return;
       if (record.recoveryJob) {
-        void releaseRecoveryPreReceipt(pool, {
+        const refusalKey = `${record.recoveryJob.jobId}:${record.recoveryJob.leaseEpoch}`;
+        const refusal = refusedRecoveryJobs.get(refusalKey)
+          ?? (_recoveryRefusalAction(failureCode) === "pause" ? failureCode : undefined);
+        refusedRecoveryJobs.delete(refusalKey);
+        const fenced = {
           job: record.recoveryJob,
           dispatchId: record.dispatchId,
           dispatchOwner: record.leaseOwnerId,
           dispatchLeaseEpoch: record.leaseEpoch,
-        }).catch(() => {});
+        };
+        void (refusal !== undefined
+          ? pauseRecoveryPreReceipt(pool, { ...fenced, reason: refusal })
+          : releaseRecoveryPreReceipt(pool, fenced)).catch(() => {});
         return;
       }
       void casToTerminal(pool, {
@@ -4964,7 +4976,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         if (recoveryJob && deps.pgPool) {
           // OCV5-391: a policy refusal (UNAUTHORIZED_MODEL for a retired model, credits, …)
           // stops the recovery job; only transient refusals wait for the next attempt.
-          void (_recoveryRefusalAction(reasonCode) === "pause"
+          const pause = _recoveryRefusalAction(reasonCode) === "pause";
+          // A job already bound to a dispatch is not touched here (dispatch_id fence); the
+          // pre-forward failure exit reads this mark and pauses it with its dispatch.
+          if (pause) refusedRecoveryJobs.set(`${recoveryJob.jobId}:${recoveryJob.leaseEpoch}`, reasonCode);
+          void (pause
             ? pauseRecoveryForRefusal(deps.pgPool, recoveryJob, reasonCode)
             : releaseRecoveryForTransportWait(deps.pgPool, recoveryJob)).catch(() => {});
         }
