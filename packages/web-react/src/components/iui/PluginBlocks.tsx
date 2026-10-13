@@ -17,6 +17,7 @@ import {
   type ZhihuAnswersSpec,
   type ZhihuHotSpec,
   countText,
+  endText,
   groupEventsByDay,
   hm,
   isCancelled,
@@ -102,7 +103,7 @@ function Post({ p }: { p: WeiboPost }) {
       {p.images.length > 0 && (
         <div className={cn("oc-plg-images", p.images.length === 1 && "is-single")}>
           {p.images.map((src, i) => (
-            <Media key={`${src}:${i}`} src={src} alt={`${name} 的配图 ${i + 1}`} className="oc-plg-image" />
+            <Media key={src} src={src} alt={`${name} 的配图 ${i + 1}`} className="oc-plg-image" />
           ))}
         </div>
       )}
@@ -318,7 +319,7 @@ export function FeishuEventsBlock({ spec, notes, streaming, nested }: BlockProps
                   <li key={`${e.startTime}:${i}`} className={cn("oc-plg-event", cancelled && "is-cancelled")}>
                     <span className="oc-plg-event-time tabular-nums">
                       {hm(e.startTime)}
-                      {e.endTime && <span className="oc-plg-meta"> – {hm(e.endTime)}</span>}
+                      {e.endTime && <span className="oc-plg-meta"> – {endText(e.startTime, e.endTime)}</span>}
                     </span>
                     <span className="oc-plg-event-bar" aria-hidden />
                     <span className="min-w-0">

@@ -158,7 +158,7 @@ export function weiboPosts(raw: Record<string, unknown>, ctx: Ctx): WeiboPostsSp
     const images: string[] = [];
     for (const im of list(o.images)) {
       const u = link(typeof im === "string" ? im : obj(im)?.url);
-      if (u) images.push(u);
+      if (u && !images.includes(u)) images.push(u);
     }
     if (images.length > PLUGIN_LIMITS.postImages) ctx.notes.push(`每条最多显示 ${PLUGIN_LIMITS.postImages} 张图`);
     items.push({
@@ -343,6 +343,14 @@ export function groupEventsByDay(items: readonly FeishuEvent[]): { day: string; 
 export function hm(iso: string): string {
   const d = new Date(iso);
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** 结束时间：与开始在同一天只写时分；跨天写上日期（「10月15日 11:00」），不把多日日程显示成当天。 */
+export function endText(startIso: string, endIso: string): string {
+  const s = new Date(startIso);
+  const e = new Date(endIso);
+  const sameDay = s.getFullYear() === e.getFullYear() && s.getMonth() === e.getMonth() && s.getDate() === e.getDate();
+  return sameDay ? hm(endIso) : `${e.getMonth() + 1}月${e.getDate()}日 ${hm(endIso)}`;
 }
 
 export function isCancelled(status: string | undefined): boolean {

@@ -1,18 +1,34 @@
 /**
  * 插件专属组件（OCV5-393）→ Markdown：复制、导出、组件关闭或渲染失败时用。
+ *
+ * 这些组件的文字来自第三方（微博正文、知乎回答、飞书文档……），转 Markdown 时**一律转义**：
+ * 原文里的 ``` 围栏、HTML 标签、链接写法都只能显示成文字，不能变成可执行的 htmlpreview / mermaid 块或链接。
+ * 链接地址已由 schema 限定为 http(s) 且不含空白；这里再把括号和尖括号编码掉，不让它截断 Markdown 链接。
  */
-import { type HotItem, type PluginSpec, countText, groupEventsByDay, hm, isCancelled } from "./pluginSchema";
+import { type HotItem, type PluginSpec, countText, endText, groupEventsByDay, hm, isCancelled } from "./pluginSchema";
+
+/** CommonMark 允许反斜杠转义任意 ASCII 标点；把会改变结构的那些都转义。 */
+export function mdText(s: string): string {
+  return s.replace(/[\\`*_{}[\]()<>#+\-.!|~=:]/g, "\\$&");
+}
+
+const URL_ESCAPES: Record<string, string> = { "(": "%28", ")": "%29", "<": "%3C", ">": "%3E" };
+
+function mdUrl(u: string): string {
+  // encodeURIComponent 不编码括号，所以显式映射。
+  return u.replace(/[()<>]/g, (c) => URL_ESCAPES[c]!).replace(/\s/g, (c) => encodeURIComponent(c));
+}
 
 function head(title: string | undefined, subtitle: string | undefined): string[] {
-  return [...(title ? [`**${title}**`] : []), ...(subtitle ? [subtitle] : []), ...(title || subtitle ? [""] : [])];
+  return [...(title ? [`**${mdText(title)}**`] : []), ...(subtitle ? [mdText(subtitle)] : []), ...(title || subtitle ? [""] : [])];
 }
 
 function foot(source: string | undefined, note: string | undefined): string[] {
-  return [...(note ? ["", `> ${note}`] : []), ...(source ? ["", `来源:${source}`] : [])];
+  return [...(note ? ["", `> ${mdText(note)}`] : []), ...(source ? ["", `来源:${mdText(source)}`] : [])];
 }
 
 function linked(text: string, url: string | undefined): string {
-  return url ? `[${text}](${url})` : text;
+  return url ? `[${mdText(text)}](${mdUrl(url)})` : mdText(text);
 }
 
 function counts(items: [string, number | undefined][]): string {
@@ -24,13 +40,13 @@ function counts(items: [string, number | undefined][]): string {
 
 function hotLines(items: HotItem[], unit: string): string[] {
   return items.map((h) => {
-    const extra = [h.label, h.hotValue !== undefined ? `${countText(h.hotValue)}${unit}` : undefined].filter(Boolean).join(" · ");
-    return `${h.rank}. ${linked(h.title, h.url)}${extra ? `(${extra})` : ""}${h.excerpt ? ` —— ${h.excerpt}` : ""}`;
+    const extra = [h.label ? mdText(h.label) : undefined, h.hotValue !== undefined ? `${countText(h.hotValue)}${unit}` : undefined].filter(Boolean).join(" · ");
+    return `${h.rank}. ${linked(h.title, h.url)}${extra ? `(${extra})` : ""}${h.excerpt ? ` —— ${mdText(h.excerpt)}` : ""}`;
   });
 }
 
 function quoteLines(text: string): string[] {
-  return text.split("\n").map((l) => `> ${l}`);
+  return text.split("\n").map((l) => `> ${mdText(l)}`);
 }
 
 export function pluginToMarkdown(spec: PluginSpec): string {
@@ -45,9 +61,9 @@ export function pluginToMarkdown(spec: PluginSpec): string {
             ["赞", p.likeCount],
           ]);
           return [
-            `**${p.authorName ?? "微博用户"}**${p.createdAt ? ` · ${p.createdAt}` : ""}`,
+            `**${mdText(p.authorName ?? "微博用户")}**${p.createdAt ? ` · ${mdText(p.createdAt)}` : ""}`,
             ...quoteLines(p.text),
-            ...p.images.map((src, i) => `![配图 ${i + 1}](${src})`),
+            ...p.images.map((src, i) => `![配图 ${i + 1}](${mdUrl(src)})`),
             ...(meta || p.url ? [[meta, p.url ? linked("原文", p.url) : ""].filter(Boolean).join(" · ")] : []),
             "",
           ];
@@ -62,33 +78,22 @@ export function pluginToMarkdown(spec: PluginSpec): string {
       return [...head(spec.title ?? "知乎热榜", spec.subtitle), ...hotLines(spec.items, " 热度"), ...foot(spec.source, spec.note)].join("\n");
     case "zhihu_answers": {
       const q = spec.question;
+      const qMeta = q
+        ? counts([
+            ["回答", q.answerCount],
+            ["关注", q.followerCount],
+          ])
+        : "";
       return [
         ...head(spec.title, spec.subtitle),
-        ...(q
-          ? [
-              `**${linked(q.title, q.url)}**`,
-              ...(q.detail ? [q.detail] : []),
-              ...(counts([
-                ["回答", q.answerCount],
-                ["关注", q.followerCount],
-              ])
-                ? [
-                    counts([
-                      ["回答", q.answerCount],
-                      ["关注", q.followerCount],
-                    ]),
-                  ]
-                : []),
-              "",
-            ]
-          : []),
+        ...(q ? [`**${linked(q.title, q.url)}**`, ...(q.detail ? [mdText(q.detail)] : []), ...(qMeta ? [qMeta] : []), ""] : []),
         ...spec.items.flatMap((a) => {
           const meta = counts([
             ["赞同", a.voteCount],
             ["评论", a.commentCount],
           ]);
           return [
-            `**${a.authorName ?? "匿名用户"}**${a.headline ? ` · ${a.headline}` : ""}`,
+            `**${mdText(a.authorName ?? "匿名用户")}**${a.headline ? ` · ${mdText(a.headline)}` : ""}`,
             ...quoteLines(a.excerpt),
             ...(meta || a.url ? [[meta, a.url ? linked("阅读全文", a.url) : ""].filter(Boolean).join(" · ")] : []),
             "",
@@ -106,7 +111,7 @@ export function pluginToMarkdown(spec: PluginSpec): string {
           `**${g.day}**`,
           ...g.items.map(
             (e) =>
-              `- ${hm(e.startTime)}${e.endTime ? `–${hm(e.endTime)}` : ""} ${e.summary}${isCancelled(e.status) ? "(已取消)" : ""}${e.location ? ` · ${e.location}` : ""}`,
+              `- ${hm(e.startTime)}${e.endTime ? `–${endText(e.startTime, e.endTime)}` : ""} ${mdText(e.summary)}${isCancelled(e.status) ? "(已取消)" : ""}${e.location ? ` · ${mdText(e.location)}` : ""}`,
           ),
           "",
         ]),
@@ -117,10 +122,10 @@ export function pluginToMarkdown(spec: PluginSpec): string {
     case "feishu_doc":
       return [
         `**${linked(spec.title, spec.url)}**`,
-        ...(spec.subtitle ? [spec.subtitle] : []),
-        ...(spec.updatedAt ? [`更新于 ${spec.updatedAt}`] : []),
+        ...(spec.subtitle ? [mdText(spec.subtitle)] : []),
+        ...(spec.updatedAt ? [`更新于 ${mdText(spec.updatedAt)}`] : []),
         "",
-        ...spec.points.map((p) => `- ${p}`),
+        ...spec.points.map((p) => `- ${mdText(p)}`),
         ...(spec.excerpt ? ["", ...quoteLines(spec.excerpt)] : []),
         ...foot(spec.source, spec.note),
       ]

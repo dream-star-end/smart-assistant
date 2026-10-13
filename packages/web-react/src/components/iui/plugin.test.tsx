@@ -16,7 +16,7 @@ import { IuiBlock } from "./IuiBlock";
 import { parseUiBlock } from "./parse";
 import { countText, groupEventsByDay } from "./pluginSchema";
 import { IUI_TYPES, validateSpec } from "./schema";
-import { specToMarkdown } from "./toMarkdown";
+import { specToMarkdown, uiFencesToMarkdown } from "./toMarkdown";
 
 afterEach(cleanup);
 
@@ -176,11 +176,40 @@ describe("飞书", () => {
 
 describe("Markdown（复制 / 导出 / 组件关闭时）", () => {
   test("各插件组件都能转成可读的 Markdown", () => {
-    expect(specToMarkdown(spec(POSTS).spec)).toMatch(/\*\*示例博主\*\* · 10-13 09:12[\s\S]*转发 7 · 评论 321 · 赞 1\.2万 · \[原文\]/);
+    expect(specToMarkdown(spec(POSTS).spec)).toMatch(/\*\*示例博主\*\* · 10\\-13 09\\:12[\s\S]*转发 7 · 评论 321 · 赞 1\.2万 · \[原文\]/);
     expect(specToMarkdown(spec({ type: "weibo_hot", items: [{ rank: 1, keyword: "话题", hotValue: 20000, label: "热", url: "https://s.weibo.com/x" }] }).spec)).toContain(
       "1. [话题](https://s.weibo.com/x)(热 · 2万)",
     );
     expect(specToMarkdown(spec({ type: "feishu_doc", title: "文档", points: ["要点"] }).spec)).toBe("**文档**\n\n- 要点");
+  });
+
+  test("第三方正文不能借 Markdown 降级变成可执行块、HTML 或链接（关闭智能 UI 时走这条路）", () => {
+    const evil = "看这个\n```htmlpreview\n<script>ocFile(\"/home/agent/.openclaude/generated/report.csv\")</script>\n```\n[点我](javascript:alert(1))\n标题\n===";
+    const md = [
+      specToMarkdown(spec({ type: "weibo_posts", items: [{ authorName: "a`b<i>", text: evil, url: "https://weibo.com/1/x(y)" }] }).spec),
+      specToMarkdown(spec({ type: "zhihu_answers", question: { title: "<img src=x onerror=alert(1)>" }, items: [{ excerpt: evil }] }).spec),
+      specToMarkdown(spec({ type: "feishu_doc", title: "```js", points: ["<b>x</b>", "[a](b)"], excerpt: evil }).spec),
+      specToMarkdown(spec({ type: "weibo_hot", items: [{ rank: 1, keyword: "```htmlpreview", label: "<b>" }] }).spec),
+    ].join("\n");
+    // 每个反引号、左尖括号、方括号都带着转义反斜杠（行首的「> 」是引用块标记，不算）；链接地址里的括号被编码，不会截断链接。
+    expect(md).not.toMatch(/(^|[^\\])[`<]/m);
+    expect(md).not.toMatch(/(^|[^\\])\[点我\]/);
+    expect(md).toContain("(https://weibo.com/1/x%28y%29)");
+    const html = uiFencesToMarkdown(`前言\n\`\`\`ui\n${ui({ type: "weibo_posts", items: [{ text: evil }] })}\n\`\`\`\n`);
+    expect(html).not.toMatch(/^\s*(>\s*)*```/m);
+  });
+
+  test("跨天的日程写出结束日期，不把多日日程显示成当天", () => {
+    const raw = { type: "feishu_events", items: [{ summary: "外出培训", startTime: "2026-10-13T02:00:00.000Z", endTime: "2026-10-15T03:00:00.000Z" }] };
+    const v = spec(raw);
+    if (v.spec.type !== "feishu_events") throw new Error(v.spec.type);
+    const end = new Date("2026-10-15T03:00:00.000Z");
+    const endLabel = `${end.getMonth() + 1}月${end.getDate()}日`;
+    expect(specToMarkdown(v.spec)).toContain(endLabel);
+    render(<IuiBlock code={ui(raw)} />);
+    expect(screen.getByText(new RegExp(endLabel))).toBeInTheDocument();
+    const same = spec({ type: "feishu_events", items: [{ summary: "短会", startTime: "2026-10-13T02:00:00.000Z", endTime: "2026-10-13T02:30:00.000Z" }] });
+    expect(specToMarkdown(same.spec)).not.toMatch(/–\d+月/);
   });
 
   test("计数显示", () => {
