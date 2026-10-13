@@ -104,3 +104,5 @@ timer 实际执行的是安装目录里的 `watch.sh`，不是 git 工作树。
 - 现场：cutover 日志路径写在告警正文与列车 evidence_json 里。
 
 收尾：修好后 push 新 tip 并搭车前滚；或按 runbook 人工回到 `.prev-release`。`deploy-v5-selfhost.sh --status` 的 `gate-fail:` 行显示当前策略、survivor phase 与维护窗口。
+
+宿主现状（2026-10-14 起）：策略文件已按用户确认写成 `OC_V5_SELFHOST_ON_GATE_FAIL=stay`，窗口用默认 2 小时。首次上线后用 `OC_V5_SELFHOST_GATE_FAIL_DRILL_SHA` 演练过一次门禁失败，演练行已删除。要恢复旧行为，把该行改成 `rollback` 或删掉文件。
