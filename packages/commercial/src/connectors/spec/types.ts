@@ -455,12 +455,15 @@ export type ConnectorActionSpecT = Static<typeof ConnectorActionSpec>
  * 的作者声明(单一权威):bind 服务执行 probeActionId 这个 read action → 从结果按
  * accountKeyPointer 取稳定账号标识(computeAccountKey 输入,唯一索引/重绑依赖它),
  * 按 accountHintPointer(可选)取展示 hint。probeActionId 必须是已声明的 read action。
+ * failurePointers(可选):上游用 2xx 报失败的接口(如 JSON-RPC `error`、MCP `result.isError`),
+ * 探针结果里这些字段取到 null/false 以外的值即视为凭据被拒 → bind 失败、不落库、不替换已有连接。
  */
 export const ConnectorIdentity = Type.Object(
   {
     probeActionId: ActionId,
     accountKeyPointer: ResultPointer,
     accountHintPointer: Type.Optional(ResultPointer),
+    failurePointers: Type.Optional(Type.Array(ResultPointer, { minItems: 1, maxItems: 4 })),
   },
   strict,
 )

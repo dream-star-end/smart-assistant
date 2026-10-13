@@ -361,6 +361,60 @@ describe('声明式连接器 · 容器 RPC', () => {
         // whoami/retrieve_page 是 read。
         for (const a of notion!.actions as Array<{ id: string; readOnly: boolean }>)
           if (a.id === 'retrieve_page') assert.equal(a.readOnly, true)
+        // OCV5-401:声明式动作带说明第一行(取自已校验 hash 的工件),不再是空串。
+        const retrieve = (notion!.actions as Array<{ id: string; description: string }>).find(
+          (a) => a.id === 'retrieve_page',
+        )
+        assert.equal(retrieve?.description, '按 pageId 检索一个页面。')
+      }
+
+      // ── DESCRIBE(OCV5-401:按需取完整说明 + 已签名参数结构,不发上游请求)──
+      {
+        const before = server.requests.length
+        const m = mockRes()
+        await handler(
+          mockReq('/v3/connectors/describe', token, {
+            connectionId: bind.connectionId,
+            action: 'retrieve_page',
+          }),
+          m.res,
+          ctx,
+        )
+        const { env } = m.parsed()
+        assert.equal(env.kind, 'describe')
+        assert.equal(env.provider, 'notion')
+        assert.equal(env.readOnly, true)
+        assert.equal(env.description, '按 pageId 检索一个页面。')
+        assert.deepEqual((env.params as { required?: string[] }).required, ['pageId'])
+        assert.equal(server.requests.length, before, 'describe must not call upstream')
+
+        const unknown = mockRes()
+        await handler(
+          mockReq('/v3/connectors/describe', token, {
+            connectionId: bind.connectionId,
+            action: 'nope',
+          }),
+          unknown.res,
+          ctx,
+        )
+        assert.equal(unknown.parsed().env.code, 'ACTION_UNKNOWN')
+
+        const otherUser = await mkUser()
+        const otherSecret = randomBytes(32).toString('hex')
+        const otherHandler = makeConnectorsRpcHandler({
+          identityRepo: memRepo(containerId + 1, otherUser, hashSecret(otherSecret)),
+          redis: null,
+        })
+        const cross = mockRes()
+        await otherHandler(
+          mockReq('/v3/connectors/describe', `oc-v3.${containerId + 1}.${otherSecret}`, {
+            connectionId: bind.connectionId,
+            action: 'retrieve_page',
+          }),
+          cross.res,
+          ctx,
+        )
+        assert.equal(cross.parsed().env.code, 'CONNECTION_NOT_FOUND')
       }
 
       // ── CALL read ──

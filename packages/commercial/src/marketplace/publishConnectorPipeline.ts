@@ -65,6 +65,7 @@ export interface ConnectorPublishPrepared {
       probeActionId: string
       accountKeyPointer: string
       accountHintPointer?: string
+      failurePointers?: string[]
     } | null
   }
 }

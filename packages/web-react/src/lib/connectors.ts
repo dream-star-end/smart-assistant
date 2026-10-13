@@ -446,7 +446,8 @@ const CONNECTOR_ERROR_TEXT: Record<string, string> = {
   UNSUPPORTED_PROVIDER: "暂不支持该应用",
   NOT_FOUND: "连接不存在或已解绑",
   // 声明式引擎（/api/connectors/declarative/* 经 HttpError 抛的 code）
-  UPSTREAM_AUTH_FAILED: '应用凭据校验失败，请检查后重试',
+  // 上游拒绝凭据（401/403、IMAP 登录失败、换 token 失败，或探针在 2xx 里报错）；措辞不假设鉴权方式。
+  UPSTREAM_AUTH_FAILED: '凭据校验失败：请检查 Token / 凭据是否有效、额度或配额是否用完后重试',
   IDENTITY_INVALID: '账号身份校验失败，请稍后重试',
   BAD_REQUEST: '请求参数有误，请检查后重试',
   CONNECTION_NOT_FOUND: '连接不存在或已解绑',
