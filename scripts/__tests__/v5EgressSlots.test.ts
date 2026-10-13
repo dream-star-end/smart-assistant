@@ -39,6 +39,7 @@ interface World {
   ssOwner?: 'node' | 'systemd'
   templates?: boolean
   migrate?: string           // tcp_migrate_req value
+  failStart?: string[]       // units whose start fails
 }
 
 async function run(world: World, ...args: string[]) {
@@ -54,12 +55,15 @@ async function run(world: World, ...args: string[]) {
 echo "systemctl $*" >> '${log}'
 S='${state}'
 case "$1" in
-  is-active) [[ -f "$S/$2" ]] && { cat "$S/$2"; exit 0; } || { echo inactive; exit 3; } ;;
+  is-active) [[ -f "$S/$2" ]] && { cat "$S/$2"; [[ "$(cat "$S/$2")" == active ]]; exit $?; } || { echo inactive; exit 3; } ;;
   show) u="\${@: -1}"; case "$*" in
     *ActiveEnterTimestampMonotonic*) node -e 'const t=require("${dir}/ts.json"); console.log(t[process.argv[1]]??0)' "$u" ;;
     *MainPID*) [[ -f "$S/$u" ]] && echo $$ || echo 0 ;; esac ;;
-  start) for u in "\${@:2}"; do echo active > "$S/$u"; done ;;
-  stop) for u in "$@"; do [[ "$u" == -* || "$u" == stop ]] && continue; rm -f "$S/$u"; done ;;
+  start) for u in "\${@:2}"; do case " ${(world.failStart ?? []).join(' ')} " in *" $u "*) exit 1 ;; esac; echo active > "$S/$u"; done ;;
+  stop) nb=0; [[ " $* " == *" --no-block "* ]] && nb=1
+    for u in "$@"; do [[ "$u" == -* || "$u" == stop ]] && continue
+      # systemd: a --no-block stop of a service leaves it deactivating while it drains.
+      if (( nb )) && [[ "$u" == *.service ]]; then echo deactivating > "$S/$u"; else rm -f "$S/$u"; fi; done ;;
   *) : ;;
 esac`)
   await sh('curl', `
@@ -167,7 +171,19 @@ describe('v5-egress-slots.sh (OCV5-391)', () => {
     const l = await run({ active: ['openclaude-v5-egress@A.service', 'openclaude-v5-egress@A.socket'] }, 'legacy')
     assert.equal(l.status, 0, l.stderr)
     const closeA = l.calls.indexOf('systemctl stop --job-mode=ignore-dependencies openclaude-v5-egress@A.socket')
-    const legacyOn = l.calls.indexOf('systemctl enable --now openclaude-v5-egress.service')
-    assert.ok(closeA >= 0 && legacyOn > closeA, l.calls.join('\n'))
+    const termA = l.calls.indexOf('systemctl stop --no-block openclaude-v5-egress@A.service')
+    const legacyOn = l.calls.indexOf('systemctl start openclaude-v5-egress.service')
+    assert.ok(closeA >= 0 && termA > closeA && legacyOn > termA, l.calls.join('\n'))
+    // Codex r2 P1: the legacy unit must not wait for the slot's drain (no blocking slot stop).
+    assert.equal(l.calls.includes('systemctl stop openclaude-v5-egress@A.service'), false, l.calls.join('\n'))
+  })
+
+  test('legacy that fails to start puts an idle slot back instead of leaving the port closed (Codex r2 P1)', async () => {
+    const r = await run({ active: ['openclaude-v5-egress@A.service', 'openclaude-v5-egress@A.socket'],
+      failStart: ['openclaude-v5-egress.service'] }, 'legacy')
+    assert.notEqual(r.status, 0)
+    assert.match(r.stderr, /legacy egress failed to start; slot B restored and serving/)
+    const restoreB = r.calls.indexOf('systemctl start openclaude-v5-egress@B.socket')
+    assert.ok(restoreB > r.calls.indexOf('systemctl start openclaude-v5-egress.service'), r.calls.join('\n'))
   })
 })

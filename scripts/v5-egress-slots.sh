@@ -154,19 +154,41 @@ cmd_flip() {
   echo "  ✓ egress-slots: serving from slot $target${cur:+, slot $cur draining in background}"
 }
 
+port_free() { ! ss -Hltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; }
+
+# Back to the legacy single unit (rollback to a release without slot templates). The legacy
+# unit binds the port without SO_REUSEPORT, so it can only start once the slots' listeners are
+# gone: close the slot .sockets, SIGTERM the slot services without blocking (the egress closes
+# its listener at once and drains in the background), wait only for the port, start legacy.
+# If legacy does not come up, put an idle slot back so :$PORT is never left closed.
 cmd_legacy() {
-  local s
+  local s i restore=""
   for s in A B; do
     systemctl stop --job-mode=ignore-dependencies "$(unit "$s" socket)" 2>/dev/null || true
   done
   for s in A B; do
-    systemctl stop "$(unit "$s" service)" 2>/dev/null || true
+    [[ "$(state "$(unit "$s" service)")" == active ]] && systemctl stop --no-block "$(unit "$s" service)"
     systemctl disable "$(unit "$s" socket)" "$(unit "$s" service)" >/dev/null 2>&1 || true
   done
-  systemctl enable --now "$LEGACY"
-  systemctl restart "$LEGACY"
-  wait_shared_port || die "legacy egress did not open :$PORT"
-  echo "  ✓ egress-slots: legacy single unit serving"
+  for i in $(seq 1 30); do port_free && break; sleep 1; done
+  port_free || echo "  egress-slots: :$PORT still held after 30s; starting legacy anyway" >&2
+  systemctl enable "$LEGACY" >/dev/null 2>&1 || true
+  if [[ "$(state "$LEGACY")" == active ]] && systemctl restart "$LEGACY" && wait_shared_port; then
+    echo "  ✓ egress-slots: legacy single unit serving"; return 0
+  fi
+  if [[ "$(state "$LEGACY")" != active ]] && systemctl start "$LEGACY" && wait_shared_port; then
+    echo "  ✓ egress-slots: legacy single unit serving (slots draining in the background)"; return 0
+  fi
+  # Legacy failed: bring back a slot that is not still draining.
+  for s in A B; do [[ "$(state "$(unit "$s" service)")" == inactive ]] && { restore="$s"; break; }; done
+  if [[ -n "$restore" ]]; then
+    systemctl stop "$LEGACY" 2>/dev/null || true
+    systemctl start "$(unit "$restore" socket)" && systemctl start "$(unit "$restore" service)" \
+      && wait_slot_ready "$restore" && wait_shared_port \
+      && { systemctl enable "$(unit "$restore" socket)" "$(unit "$restore" service)" >/dev/null 2>&1 || true
+           die "legacy egress failed to start; slot $restore restored and serving"; }
+  fi
+  die "legacy egress failed to start and no slot could be restored: :$PORT may be closed"
 }
 
 case "${1:-}" in

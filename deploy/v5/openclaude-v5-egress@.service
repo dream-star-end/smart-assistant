@@ -1,12 +1,12 @@
 # OCV5-391 (commercial): egress slot %i. Same release pointer, env and drain budget as the legacy
-# openclaude-v5-egress.service, which it Conflicts= with. ExecStart is node itself (not npx) so
-# LISTEN_PID matches the process that adopts the socket.
+# openclaude-v5-egress.service. ExecStart is node itself (not npx) so LISTEN_PID matches the process
+# that adopts the socket. No Conflicts= with the legacy unit here (only on the .socket): a rollback
+# to the legacy unit must not wait for a slot's drain; scripts/v5-egress-slots.sh orders the two.
 [Unit]
 Description=OpenClaude v5 Egress Proxy (LLM upstream plane, slot %i)
 After=network.target postgresql.service redis-server.service docker.service openclaude-v5-egress@%i.socket
 Wants=postgresql.service redis-server.service
 Requires=openclaude-v5-egress@%i.socket
-Conflicts=openclaude-v5-egress.service
 
 [Service]
 Type=simple
