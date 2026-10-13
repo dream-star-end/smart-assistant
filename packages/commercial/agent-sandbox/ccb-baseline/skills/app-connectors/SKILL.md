@@ -165,7 +165,7 @@ echo '{}' | oc-plugin call knowledge-planet create_topic --confirm <确认码>
 
 两个插件都只在 AI 市场，用户没装时先引导去安装：
 - `bili`：公开数据，免登录、只读。安装后在 管理中心 → 插件 点「启用」。`oc-connect call bili <action>`：
-  search / video / rank / popular / comments / danmaku。评论要 aid、弹幕要 cid，先调 video 拿；参数写在 `oc-connect list` 的动作说明里。
+  search / video / rank / popular / comments / danmaku。评论要 aid、弹幕要 cid，先调 video 拿；参数看 `oc-connect describe bili <action>`。
 - `bili-account`：字幕、收藏夹、观看历史，要用 B 站 App 扫码登录（同微博的扫码流程）。用 `oc-plugin call bili-account <action>`。
 - 报 UPSTREAM_RATE_LIMITED（B 站风控）时如实告诉用户稍后再试，不要连续重试，也不要索要 cookie。
 
