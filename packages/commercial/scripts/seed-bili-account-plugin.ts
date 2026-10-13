@@ -128,13 +128,20 @@ async function smoke(
   const summary: Record<string, string> = {}
   const covered = new Set<string>()
   const run = async (actionId: string, params: Record<string, unknown>) => {
-    const executed = await runtime.runReadAction({
-      contract: BILI_ACCOUNT_PLUGIN_CONTRACT,
-      storageState,
-      actionId,
-      params,
-      signal: new AbortController().signal,
-    })
+    // 失败时记下是哪个动作(只记动作名和错误码,不记参数和登录态)。
+    const executed = await runtime
+      .runReadAction({
+        contract: BILI_ACCOUNT_PLUGIN_CONTRACT,
+        storageState,
+        actionId,
+        params,
+        signal: new AbortController().signal,
+      })
+      .catch((error: unknown) => {
+        const code = (error as { code?: unknown } | null)?.code
+        log({ step: 'smoke-failed', action: actionId, code: typeof code === 'string' ? code : null })
+        throw error
+      })
     storageState = executed.storageState
     covered.add(actionId)
     return executed.result as Record<string, unknown>

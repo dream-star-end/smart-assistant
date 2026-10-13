@@ -6882,6 +6882,25 @@
           "assertion": "[codex-capacity-retry] PASS — INC-20261013-CODEX-CAPACITY-NOT-AVAILABLE executed at-capacity classify and 3-attempt silent retry on throw and resolved shapes"
         }
       ]
+    },
+    {
+      "id": "INC-20261013-BILI-SUBTITLE-CDN-CORS",
+      "occurredAt": "2026-10-13",
+      "severity": "P2",
+      "symptom": "个人版 rel-6c6c45d33 上 bili-account 正式 seed（21:05 CST 真人扫码）登录成功后 smoke 失败：B 站账号插件读取失败。worker 用 credentials:'include' 在 www.bilibili.com 页内读字幕文件，而 aisubtitle/i0.hdslb.com 返回 Access-Control-Allow-Origin: *，浏览器拒绝带凭据的跨域响应；有字幕的视频 subtitle 动作全部失败。未上架、无用户受影响。",
+      "rootFixCommit": "e9a375b2",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/plugins/biliAccount.test.ts",
+          "assertion": "subtitle: picks the requested language, reads the allow-listed subtitle CDN without cookies, caps lines"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/bili-subtitle-cors.node-test.mjs",
+          "assertion": "bili-account subtitle reads the hdslb CDN without cookies (real Chromium)"
+        }
+      ]
     }
   ]
 }
