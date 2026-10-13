@@ -42,7 +42,11 @@ export interface ExecuteDeclarativeInput {
 export async function loadContractForConnection(
   row: DeclarativeConnectionRow,
   pool: Pool,
-): Promise<{ contract: ExecContractT; execContractHash: string }> {
+): Promise<{
+  contract: ExecContractT
+  execContractHash: string
+  actionDescriptions: Readonly<Record<string, string>>
+}> {
   const versionId = Number(row.connector_version_id)
   if (!Number.isInteger(versionId))
     throw new ConnectorError('RELINK_REQUIRED', 'connection has no pinned version')
@@ -60,7 +64,11 @@ export async function loadContractForConnection(
     ) {
       throw new ConnectorError('RELINK_REQUIRED', 'connection contract pins drifted')
     }
-    return { contract: meta.contract, execContractHash: meta.execContractHash }
+    return {
+      contract: meta.contract,
+      execContractHash: meta.execContractHash,
+      actionDescriptions: meta.actionDescriptions ?? {},
+    }
   } catch (e) {
     if (e instanceof ConnectorError) throw e
     if (e instanceof ConnectorSpecError)

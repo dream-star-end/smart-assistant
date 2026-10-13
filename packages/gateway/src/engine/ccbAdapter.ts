@@ -66,7 +66,7 @@ const log = createLogger({ module: 'ccbAdapter' })
 // paths; the rest catch status-code / revoke / org-disabled phrasings that
 // don't necessarily include a /login prompt.
 const AUTH_KEYWORDS_RE =
-  /authenticat|credentials|401|unauthorized|run \/login|token (?:has been )?revoked|invalid api key|organization has been disabled/i
+  /authenticat|credentials|\b401\b|unauthorized|run \/login|token (?:has been )?revoked|invalid api key|organization has been disabled/i
 // CCB's exact error prefix when API auth fails — safe to match even without isError flag.
 const AUTH_ERROR_PREFIX_RE = /^Failed to authenticate\b/
 const MODEL_AUTHORITY_INVALID_RE = /\bMODEL_AUTHORITY_INVALID\b/
