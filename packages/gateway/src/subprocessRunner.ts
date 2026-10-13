@@ -1426,8 +1426,23 @@ function readStderrBufCap(): number {
 }
 const MAX_STDERR_BUF_BYTES = readStderrBufCap()
 
-/** Bounded stderr tail kept per process generation, logged only on a crash. */
+/** Logged stderr tail, cut only after redaction. */
 const CRASH_STDERR_TAIL_CHARS = 2000
+/** Raw stderr kept per process generation for the crash log. */
+const CRASH_STDERR_RAW_CHARS = 8000
+
+/**
+ * Append to the raw tail without ever splitting a line: when the buffer is
+ * trimmed, drop the cut line entirely so a credential's marker (`TOKEN=`) can
+ * never be separated from its value before redaction runs.
+ */
+export function appendCrashStderrTail(tail: string, chunk: string): string {
+  const next = tail + chunk
+  if (next.length <= CRASH_STDERR_RAW_CHARS) return next
+  const cut = next.slice(-CRASH_STDERR_RAW_CHARS)
+  const nl = cut.indexOf('\n')
+  return nl === -1 ? '' : cut.slice(nl + 1)
+}
 
 /**
  * A crash log carries the child's last stderr lines so a one-shot failure
@@ -1456,7 +1471,7 @@ export class SubprocessRunner extends EventEmitter {
   private stdoutBuf = ''
   /** Running byte count for stderr within a single "line" window — caps runaway stderr. */
   private stderrBufBytes = 0
-  /** Last CRASH_STDERR_TAIL_CHARS of this generation's stderr, for the crash log only. */
+  /** Whole-line raw stderr tail of this generation, for the crash log only. */
   private stderrTail = ''
   private currentSessionId: string | null = null
   /**
@@ -2112,7 +2127,7 @@ export class SubprocessRunner extends EventEmitter {
     proc.stderr.on('data', (chunk: string) => {
       if (this.proc !== proc) return
       this.lastActivityAt = Date.now() // stderr activity also counts as "alive"
-      this.stderrTail = (this.stderrTail + chunk).slice(-CRASH_STDERR_TAIL_CHARS)
+      this.stderrTail = appendCrashStderrTail(this.stderrTail, chunk)
       this.stderrBufBytes += Buffer.byteLength(chunk, 'utf8')
       // If stderr goes pathological (single burst > cap), kill to avoid RSS
       // blow-up from downstream listeners that might buffer all of it.
