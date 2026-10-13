@@ -521,6 +521,12 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     list: connectProbe(['list'], true),
     catalog: connectProbe(['catalog'], true),
     call: connectProbe(['call', 'demo', 'read', '--account', 'p1'], true),
+    // The dispatcher is shared with oc-connect; describe exists only on the connectors surface.
+    describe: async () => {
+      const result = await runOcPluginCli(['describe', 'demo'], pluginDeps)
+      assert.notEqual(result.exitCode, 0, 'oc-plugin describe unexpectedly succeeded')
+      assert.match(result.stderr, /unknown command 'describe'/)
+    },
   },
   'oc-poster': {
     render: tsFailureProbe('packages/gateway/src/ocPosterCli.ts', [], /usage: oc-poster/),
