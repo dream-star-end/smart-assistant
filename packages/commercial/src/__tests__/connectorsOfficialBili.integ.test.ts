@@ -14,6 +14,7 @@ import { after, before, beforeEach, describe, test } from 'node:test'
 import { fetch as undiciFetch } from 'undici'
 
 process.env.OPENCLAUDE_KMS_KEY = randomBytes(32).toString('base64')
+process.env.OC_RUNTIME_CHANNEL = 'v5'
 
 import { __resetBilibiliWbiCacheForTests } from '../connectors/builtins/runtime.js'
 import { ensureConnectorSeedPrincipals } from '../connectors/declarativeSeed.js'
@@ -283,7 +284,14 @@ describe('official market connector bili', () => {
       { userId: user, connectorVersionId: Number(versionId), secrets: {}, deps: deps() },
       getPool(),
     )
-    assert.equal(rebound.connectionId, bound.connectionId)
+    // 再次启用 = 撤销旧行换新行(同一 account_key),任何时候只有一条活跃连接。
+    assert.equal(rebound.rebound, true)
+    const active = await query<{ n: string }>(
+      `SELECT count(*)::text AS n FROM connections
+        WHERE user_id = $1 AND provider = 'bili' AND revoked_at IS NULL`,
+      [user],
+    )
+    assert.equal(active.rows[0]!.n, '1')
 
     // 免填绑定不接受任何凭据字段。
     await assert.rejects(
@@ -300,7 +308,7 @@ describe('official market connector bili', () => {
 
     const out = (await executeDeclarativeAction(
       {
-        connectionId: bound.connectionId,
+        connectionId: rebound.connectionId,
         userId: user,
         actionId: 'video',
         params: { bvid: 'BV17x411w7KC' },
