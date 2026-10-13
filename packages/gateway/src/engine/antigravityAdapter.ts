@@ -64,6 +64,11 @@ export const ANTIGRAVITY_MAX_PROMPT_BYTES = 300 * 1024
 const SHUTDOWN_GRACE_DEFAULT_MS = 3_000
 const SHUTDOWN_FINAL_DRAIN_DEFAULT_MS = 3_000
 const KEEPALIVE_INTERVAL_MS = 30_000
+/** After `result`, wait this long for the process to exit so trailing
+ * stderr (soft-deny / empty-run notices) is read before the turn settles. */
+const RESULT_SETTLE_MS = 5_000
+
+let timingTestHooks: { keepaliveMs?: number; resultSettleMs?: number } | null = null
 const STDERR_MAX_CHARS = 64 * 1024
 const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 /** 1.3.4 without usable credentials prints an OAuth URL and blocks for 60 s. */
@@ -103,6 +108,9 @@ interface TurnContext {
   stderr: string
   conversationId: string | null
   sawResult: boolean
+  pendingResult: Record<string, unknown> | null
+  resultTimer: NodeJS.Timeout | null
+  keepalive: NodeJS.Timeout | null
   sawOutput: boolean
   terminal: boolean
   procClosed: boolean
@@ -219,7 +227,6 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   private currentTarget: ExecutionTarget = { kind: 'local' }
   private traceId: string | undefined
   private drain: Promise<void> = Promise.resolve()
-  private keepaliveTimer: NodeJS.Timeout | null = null
   private platformGoal: GoalStateSnapshot | null = null
   lastActivityAt = 0
 
@@ -264,6 +271,9 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       stderr: '',
       conversationId: null,
       sawResult: false,
+      pendingResult: null,
+      resultTimer: null,
+      keepalive: null,
       sawOutput: false,
       terminal: false,
       procClosed: false,
@@ -405,7 +415,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     })
     ctx.proc = proc
     this.emit('spawn', { resumed: spec.args.includes('--conversation'), argv: [...spec.args] })
-    this.ensureKeepalive()
+    this.ensureKeepalive(ctx)
     proc.stdin.on('error', () => { /* EPIPE after an early exit is reported via close */ })
     proc.stdin.write(spec.line)
 
@@ -435,23 +445,22 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       }
     })
     proc.once('error', (err) => {
-      this.stopKeepalive()
+      this.stopKeepalive(ctx)
       this.cleanupLaunch(ctx)
       if (ctx.abandoned) return
       if (!ctx.terminal) this.finishError(ctx, String(err))
       this.emit('error', err)
     })
     proc.once('close', (code, signal) => {
-      this.stopKeepalive()
+      this.stopKeepalive(ctx)
       this.cleanupLaunch(ctx)
       if (ctx.abandoned) return
       ctx.procClosed = true
       if (stdoutBuffer.trim()) this.handleLine(ctx, stdoutBuffer.trim())
+      if (ctx.pendingResult) this.settleResult(ctx)
       ctx.resolveDrain?.()
       ctx.resolveDrain = null
       const crashed = !ctx.interrupted && code !== 0
-      // No result line: the conversation db may hold a half-written turn.
-      if (!ctx.sawResult) this.nativeId = null
       if (!ctx.terminal) {
         const detail = ctx.errorDetail || ctx.stderr.trim() || `antigravity exited with code ${String(code)}`
         this.finishError(ctx, detail)
@@ -689,8 +698,23 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private handleResult(ctx: TurnContext, result: Record<string, unknown>): void {
+    if (ctx.sawResult) return
     ctx.sawResult = true
+    ctx.pendingResult = result
     try { ctx.proc?.stdin.end() } catch { /* already closed */ }
+    // Settle on process close (all stderr read) or after a bounded wait.
+    ctx.resultTimer = setTimeout(() => { this.settleResult(ctx) }, timingTestHooks?.resultSettleMs ?? RESULT_SETTLE_MS)
+    ctx.resultTimer.unref()
+  }
+
+  private settleResult(ctx: TurnContext): void {
+    const result = ctx.pendingResult
+    if (!result || ctx.terminal || ctx.abandoned) return
+    ctx.pendingResult = null
+    if (ctx.resultTimer) {
+      clearTimeout(ctx.resultTimer)
+      ctx.resultTimer = null
+    }
     const status = asText(result.status)
     const id = asText(result.conversation_id)
     if (CONVERSATION_ID_RE.test(id)) ctx.conversationId = id
@@ -701,21 +725,22 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     if (status === 'SUCCESS' && ctx.errorDetail === null) {
       // 1.3.4 reports SUCCESS for runs that produced nothing (oversized input)
       // and for headless soft-denied tools. Both are failures for the user.
-      if (SOFT_DENY_RE.test(ctx.stderr)) {
-        ctx.errorDetail = `ANTIGRAVITY_TOOL_DENIED: ${ctx.stderr.trim().slice(0, 500)}`
+      const denied = Array.isArray(result.denied_actions) ? result.denied_actions : []
+      if (denied.length > 0 || SOFT_DENY_RE.test(ctx.stderr)) {
+        const actions = denied.map((d) => asText(recordOf(d)?.action) || asText(d)).filter(Boolean)
+        ctx.errorDetail = `ANTIGRAVITY_TOOL_DENIED: ${actions.length > 0 ? actions.join(',') : ctx.stderr.trim().slice(0, 500)}`
       } else if (!ctx.sawOutput && !asText(result.response)) {
         ctx.errorDetail = EMPTY_RUN_RE.test(ctx.stderr)
           ? `ANTIGRAVITY_EMPTY_RUN: ${ctx.stderr.trim().slice(0, 500)}`
           : 'ANTIGRAVITY_EMPTY_RUN: CLI reported success with no output'
       }
     }
-    const committed = !ctx.interrupted && ctx.errorDetail === null && ctx.conversationId !== null
-    if (committed) {
+    // Commit only a conversation whose turn landed. On failure or cancel the
+    // last committed id stays: SessionManager's resume map still holds it and
+    // decides history replay from it, so the adapter must not diverge.
+    if (!ctx.interrupted && ctx.errorDetail === null && ctx.conversationId !== null) {
       this.nativeId = ctx.conversationId
       this.emit('session_id', ctx.conversationId)
-    } else if (!this.nativeId || ctx.interrupted) {
-      // Never pin later turns to a conversation whose last turn did not land.
-      this.nativeId = null
     }
     this.finish(ctx, typeof result.num_turns === 'number' ? count(result.num_turns) : 1)
   }
@@ -732,7 +757,11 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private finish(ctx: TurnContext, numTurns: number): void {
-    this.stopKeepalive()
+    this.stopKeepalive(ctx)
+    if (ctx.resultTimer) {
+      clearTimeout(ctx.resultTimer)
+      ctx.resultTimer = null
+    }
     if (ctx.terminal) return
     ctx.terminal = true
     if (ctx.interrupted && ctx.errorDetail === null) ctx.errorDetail = 'Antigravity turn cancelled'
@@ -770,7 +799,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private forceEnd(ctx: TurnContext): void {
-    this.stopKeepalive()
+    this.stopKeepalive(ctx)
     if (ctx.terminal) return
     ctx.terminal = true
     ctx.resolveSummary(null)
@@ -783,26 +812,27 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     cleanupAntigravityLaunch(projection)
   }
 
-  private ensureKeepalive(): void {
-    if (this.keepaliveTimer) return
+  /** Per-turn timer: an earlier turn's late `close` must not stop the
+   * liveness signal of the turn that replaced it. */
+  private ensureKeepalive(ctx: TurnContext): void {
+    if (ctx.keepalive) return
     // The CLI can think for minutes with no stdout; a live process keeps the
     // session's idle watchdog from killing it.
-    this.keepaliveTimer = setInterval(() => {
-      const ctx = this.active
-      if (!ctx || ctx.terminal || ctx.abandoned || !ctx.proc || ctx.proc.exitCode !== null) {
-        this.stopKeepalive()
+    ctx.keepalive = setInterval(() => {
+      if (this.active !== ctx || ctx.terminal || ctx.abandoned || !ctx.proc || ctx.proc.exitCode !== null) {
+        this.stopKeepalive(ctx)
         return
       }
       this.lastActivityAt = Date.now()
       this.emit('activity')
-    }, KEEPALIVE_INTERVAL_MS)
-    this.keepaliveTimer.unref()
+    }, timingTestHooks?.keepaliveMs ?? KEEPALIVE_INTERVAL_MS)
+    ctx.keepalive.unref()
   }
 
-  private stopKeepalive(): void {
-    if (!this.keepaliveTimer) return
-    clearInterval(this.keepaliveTimer)
-    this.keepaliveTimer = null
+  private stopKeepalive(ctx: TurnContext): void {
+    if (!ctx.keepalive) return
+    clearInterval(ctx.keepalive)
+    ctx.keepalive = null
   }
 
   interrupt(): boolean {
@@ -850,9 +880,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     proc: ChildProcessByStdio<Writable, Readable, Readable> | null,
     detail: string,
   ): void {
-    this.stopKeepalive()
+    this.stopKeepalive(ctx)
     this.cleanupLaunch(ctx)
-    if (!ctx.sawResult) this.nativeId = null
     ctx.abandoned = true
     if (proc) detachChildStdio(proc)
     if (!ctx.terminal) this.finishError(ctx, detail)
@@ -898,6 +927,9 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 export const _internals = {
   promptText,
   assemblePrompt,
+  setTimingTestHooks(hooks: { keepaliveMs?: number; resultSettleMs?: number } | null): void {
+    timingTestHooks = hooks
+  },
 }
 
 registerEngine('antigravity', (opts) => new AntigravityAdapter(opts))

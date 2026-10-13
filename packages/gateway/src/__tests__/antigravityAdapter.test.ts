@@ -19,6 +19,7 @@ import type { OpenClaudeConfig } from '@openclaude/storage'
 import {
   ANTIGRAVITY_MAX_PROMPT_BYTES,
   AntigravityAdapter,
+  _internals,
   validateAntigravityRoute,
 } from '../engine/antigravityAdapter.js'
 import { antigravityProductToolInput, antigravityProductToolName } from '../engine/antigravityToolNormalize.js'
@@ -67,7 +68,7 @@ process.stdin.on('data', (chunk) => {
   input += chunk
   if (input.includes('\\n')) replay()
 })
-process.stdin.on('end', () => process.exit(0))
+process.stdin.on('end', () => setTimeout(() => process.exit(0), Number(process.env.FAKE_AGY_EXIT_DELAY_MS || 0)))
 `
 
 function config(): OpenClaudeConfig {
@@ -105,6 +106,7 @@ async function harness(opts: Partial<EngineCreateOpts> = {}): Promise<Harness> {
   set('GOOGLE_API_KEY', 'must-not-leak-either')
   set('FAKE_AGY_STDERR', undefined)
   set('FAKE_AGY_HANG', undefined)
+  set('FAKE_AGY_EXIT_DELAY_MS', undefined)
   const adapter = new AntigravityAdapter({
     sessionKey: 'agent:main:webchat:dm:agy-test',
     agentId: 'main',
@@ -131,10 +133,10 @@ async function harness(opts: Partial<EngineCreateOpts> = {}): Promise<Harness> {
 
 async function runTurn(
   h: Harness,
-  fixture: string,
+  fixture: string,  // name under FIXTURES, or an absolute path
   extra: { stderr?: string; input?: string } = {},
 ): Promise<{ summary: TurnSummary | null; events: EngineEvent[]; sessionIds: string[] }> {
-  process.env.FAKE_AGY_FIXTURE = path.join(FIXTURES, fixture)
+  process.env.FAKE_AGY_FIXTURE = path.isAbsolute(fixture) ? fixture : path.join(FIXTURES, fixture)
   if (extra.stderr) {
     const file = path.join(h.dir, 'stderr.txt')
     await writeFile(file, extra.stderr)
@@ -315,6 +317,73 @@ describe('AntigravityAdapter', () => {
       assert.match(summary?.errorDetail ?? '', /ANTIGRAVITY_TOOL_DENIED/)
       assert.equal(h.adapter.nativeSessionId, null)
     } finally {
+      await h.restore()
+    }
+  })
+
+  test('soft-deny is detected from result.denied_actions even before stderr arrives', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute({ baseUrl: BASE_URL, routeToken: TOKEN })
+      const { summary, sessionIds } = await runTurn(h, 'tool-softdeny.ndjson')
+      assert.equal(summary?.isError, true)
+      assert.match(summary?.errorDetail ?? '', /ANTIGRAVITY_TOOL_DENIED: command/)
+      assert.deepEqual(sessionIds, [])
+      assert.equal(h.adapter.nativeSessionId, null)
+    } finally {
+      await h.restore()
+    }
+  })
+
+  test('a cancelled resumed turn keeps the committed conversation id (matches the resume map)', async () => {
+    const prior = '4187c78c-e96d-4840-8c1c-3de86f92ddd9'
+    const h = await harness({ resumeSessionId: prior })
+    try {
+      h.adapter.setAntigravityRoute({ baseUrl: BASE_URL, routeToken: TOKEN })
+      const canceled = (await readFile(path.join(FIXTURES, 'resume.ndjson'), 'utf8')).replace('"status":"SUCCESS"', '"status":"CANCELED"')
+      const file = path.join(h.dir, 'resume-canceled.ndjson')
+      await writeFile(file, canceled)
+      const { summary, sessionIds } = await runTurn(h, file)
+      assert.equal(summary?.isError, true)
+      assert.equal(summary?.stopReason, 'interrupted')
+      assert.deepEqual(sessionIds, [])
+      assert.equal(h.adapter.nativeSessionId, prior)
+    } finally {
+      await h.restore()
+    }
+  })
+
+  test('a late close of the previous turn does not stop the next turn keepalive', async () => {
+    _internals.setTimingTestHooks({ keepaliveMs: 20, resultSettleMs: 30 })
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute({ baseUrl: BASE_URL, routeToken: TOKEN })
+      process.env.FAKE_AGY_EXIT_DELAY_MS = '400'
+      const first = await runTurn(h, 'tool-success.ndjson')
+      assert.equal(first.summary?.isError, false)
+      // Turn 1 settled on the timer; its process is still alive for ~400 ms.
+      Reflect.deleteProperty(process.env, 'FAKE_AGY_EXIT_DELAY_MS')
+      process.env.FAKE_AGY_HANG = '1'
+      process.env.FAKE_AGY_FIXTURE = path.join(FIXTURES, 'tool-success.ndjson')
+      const run = h.adapter.submitTurn({
+        input: 'second',
+        requestId: 'c'.repeat(32),
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      await new Promise((resolve) => setTimeout(resolve, 600))
+      let ticks = 0
+      const onActivity = (): void => { ticks += 1 }
+      h.adapter.on('activity', onActivity)
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      h.adapter.off('activity', onActivity)
+      assert.ok(ticks >= 3, `turn 2 keepalive must survive turn 1 close (ticks=${ticks})`)
+      await h.adapter.shutdown()
+      await run.summary
+    } finally {
+      _internals.setTimingTestHooks(null)
       await h.restore()
     }
   })
