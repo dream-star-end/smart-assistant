@@ -558,11 +558,24 @@ export const OC_ATTR_PARENT_TURN_KEY = "oc_parent_turn_key";
  */
 export interface UsageAttribution {
   sessionId: string | null;
-  mode: "chat" | "delegate";
+  mode: "chat" | "delegate" | "auto_dream";
   parentSessionId: string | null;
   delegateAgentId: string | null;
   turnKey: string | null;
   parentTurnKey: string | null;
+}
+
+/**
+ * OCV5-392: a chat-attributed request carrying CCB's `cc_workload=auto-dream` tag
+ * (extractCcWorkload) is background memory consolidation, billed as
+ * usage_records.mode / credit_ledger.reason 'auto_dream'. Delegate attribution wins:
+ * it already names a parent session and agent. Only the label changes; the amount
+ * and admission are the same as a chat call.
+ */
+export function applyWorkloadMode(attribution: UsageAttribution, workload: string | null): UsageAttribution {
+  return attribution.mode === "chat" && workload === "auto-dream"
+    ? { ...attribution, mode: "auto_dream" }
+    : attribution;
 }
 
 const CHAT_ATTRIBUTION: Omit<UsageAttribution, "sessionId"> = {

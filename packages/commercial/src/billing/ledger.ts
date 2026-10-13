@@ -47,6 +47,8 @@ export const LEDGER_REASONS = [
   "subscription",
   "subscription_expire",
   "pack",
+  // 0304 OCV5-392: background memory consolidation (Auto-Dream).
+  "auto_dream",
 ] as const;
 export type LedgerReason = (typeof LEDGER_REASONS)[number];
 
