@@ -1,7 +1,7 @@
 ---
 name: skill-management
 description: "如何创建、查看、更新和删除 skills — 自我进化的核心机制"
-version: "1.0.0"
+version: "1.0.1"
 tags: [system, meta, learning]
 related_skills: [memory-management, platform-capabilities]
 priority: 4
@@ -52,7 +52,7 @@ skill_save(
 ## 查看和使用 skill
 
 - `skill_search(query, limit=5)` — 按名称、描述、tags、related_skills 搜索相关 skills。只返回 metadata,适合先找候选。
-- `skill_list()` — 列出所有 skills(名称+描述)。每次会话开始时,所有 skill 的名称和描述已在你的 system prompt 中。
+- `skill_list()` — 列出当前 agent 可见的完整有效目录(名称+描述)。常驻提示中的菜单可能按预算截取；菜单未展示不等于技能不存在，优先 `skill_search`，需要全目录时再 list。
 - `skill_view(name)` — 加载完整内容。当你要执行一个与已有 skill 相关的任务时,先 view 获取完整指令。
 
 ## 更新 skill
@@ -73,45 +73,26 @@ skill_save(
 - 名词开头表示知识类: `minimax-api-quirks`, `css-grid-patterns`
 - 以 `system-` 前缀标记平台内置 skill(不要删除这些)
 
-## 两套 skill 来源(skill_list/skill_view 会统一合并展示)
+## 有效来源与写入归属
 
-容器里有**两套存储**,但 MCP 工具会按 baseline-wins 规则合并给你看:
+`skill_list` / `skill_view` 返回的是**当前 agent 的有效视图**，不是把磁盘所有目录直接相加。
+平台、agent seed、项目、共享库、agent 私有库和已安装 hub 可参与覆盖；
+平台基线优先，同名按当前作用域去重。不要单凭目录同名就判定冲突或删除副本。
 
-### 1. 平台基线 skill(只读,权威)
+### 平台 / seed / 项目 / hub
 
-claudeai.chat 容器启动时,平台通过 kernel ro bind mount 把一批基线 skill 挂进
-`/run/oc/claude-config/skills/`(整目录只读,EROFS)。这些是:
+- 平台基线通常位于 `/run/oc/claude-config/skills/`，只读；工具输出标 `[source: platform]`。
+- agent seed、项目冻结技能和 marketplace hub 各受其来源、作用域和权限约束。
+- `source=user` 不是“当前 agent 可以覆盖所有来源”的承诺；编辑和删除必须由工具检查当前归属。
+- 不得直接编辑只读挂载，也不能用同名用户文件覆盖基线。维护平台技能应修改平台源码中的权威文件并走正式发布；普通用户请求则反馈给平台维护者，不造一个近重复技能冒充已修复。
 
-- `system-info` — 容器环境/能力/守则自述
-- `memory-management` — 记忆系统使用指南
-- `platform-capabilities` — 多媒体和内联富内容
-- `scheduled-tasks` — 定时任务创建方法
-- `skill-management` — 本文件
-- `skill-search` — 如何搜索和发现合适 skill
-- `document-writing` — 常见文档写作/导出流程
-- `manage-taskboard` — 任务面板认领/推进铁律(`oc-task` + MCP `task_*`)
+### 用户自建技能
 
-这批 skill 在 `skill_list` 输出里标 `source=platform`,在 `skill_view` 输出顶部
-也带 `[source: platform]` 标记。**只读**:`skill_save` 传相同 name 会被拒绝
-(错误文案里写 "reserved for platform baseline skill"),`skill_delete` 传基线
-名字也会被拒。同时 Claude Code(CCB)启动时还会从 `$CLAUDE_CONFIG_DIR/skills/`
-自动扫到这批 skill 进系统 prompt,所以你启动起来就能感知它们的存在。
-
-### 2. 用户自建 skill(可读写)
-
-`skill_save` 写到 `/home/agent/.openclaude/agents/<agentId>/skills/`(named volume,
-跨容器重启保留)。`skill_list` 里标 `source=user`,`skill_view` 顶部带
-`[source: user]` 标记。
-
-### baseline-wins 语义
-
-- **读路径**(list / view):平台基线优先 —— 如果用户目录里碰巧有同名 skill 残留
-  (比如历史版本写过),会被基线遮蔽,不会出现在 list 输出,view 也只返回基线内容。
-- **清理路径**(delete):对被 shadow 的用户残件调用 `skill_delete(<baseline_name>)`
-  会清掉用户这一份(note 提示"platform baseline remains"),基线本身仍然保留、仍然
-  可见。纯粹基线 skill(用户目录里没同名)delete 会直接被拒。
-- **写路径**(save):命中基线名字直接被拒。想要"改基线"的想法是违规的,
-  写一个不同名的 skill 或者向平台团队反馈需求。
+- 默认全能 agent（当前为 main）的 `skill_save` 写入用户共享库：`/home/agent/.openclaude/skills/<name>/`。
+- 专业 agent 的共享库视图只读；其自建技能写入该 agent 的私有技能目录，通常为 `/home/agent/.openclaude/agents/<agentId>/skills/`；兼容身份按注册的私有命名空间定位。
+- 默认全能 agent 还聚合其它 agent 的私有技能；专业 agent 按授权范围读取共享技能和自己的私有技能。因此 list 数量不应直接等于某一个目录的文件数。
+- 存储位于持久化卷，但写权限与共享范围仍由当前 SkillStore 决定；使用 `skill_save` / `skill_delete`，不要绕过工具直接改其它 agent 的私有副本。
+- 对同名副本或被平台遮蔽的残件，先核清有效来源与所属写层；删除工具如允许清理用户残件，也不会删除平台基线。被拒绝时不要换路径强删。
 
 ## 对话内训练优化 / 生成评测用例(oc-skill)
 

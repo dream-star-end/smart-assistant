@@ -1,7 +1,7 @@
 ---
 name: memory-management
 description: "按需检索并维护 Core、Recall 与 Archival 长期记忆，避免跨项目污染和重复写入"
-version: "3.1.0"
+version: "3.1.1"
 tags: [system, meta, learning]
 related_skills: [skill-management]
 priority: 6
@@ -11,10 +11,10 @@ priority: 6
 
 ## 默认原则
 
-- Core 的 `MEMORY.md` 索引和正文**不会自动进入新会话**。
+- Core **索引与正文分开处理**：非 Cursor 路径可按预算注入 `MEMORY.md` 索引；Cursor 的平台 MEMORY slot 不注入索引。以本轮实际提示为准，不能仅凭磁盘上有记忆就认定已注入。正文不随索引全量预加载，按需检索后读取。
 - 仅当缺少某项具体的存量用户事实、决定或偏好就无法准确完成当前任务，或用户明确表示连续性时，才运行：
   `oc-memory core-search "<具体主题>" [--limit N] [--offset N]`
-- 当前请求信息已经自足时直接回答；不因主题相似或“可能有用”搜索记忆。Core 不预加载，无关查询返回 No match。
+- 当前请求信息已经自足时直接回答；不因主题相似或“可能有用”搜索记忆。索引可见不等于正文已读，也不构成扩大检索范围的理由；无关查询返回 No match。
 - 搜索结果只是有界 excerpt；需要完整内容时，按返回的绝对路径用 `Read` 的 offset/limit 分段读取。
 - 用户说“忽略历史/从头开始”时，本轮不搜索、不采用、不提及记忆。
 - 当前消息和当前可验证事实优先；旧记忆不得覆盖新证据。
@@ -51,7 +51,7 @@ type: user | feedback | project | reference
 <!-- oc-user-always:end -->
 ```
 
-不要制造多对、嵌套或残缺标记；畸形标记会 fail-closed，整块不注入。
+不要制造多对、嵌套或残缺标记；畸形标记会 fail-closed，整块不注入。当前 always block 注入上限为 4,000 个 JavaScript 字符；写入前核对长度并留余量，禁止把必要授权边界留在截断区。精简只去冗余，不得弱化用户规则；长篇背景放按需记忆或技能。
 
 ## Recall 与 Archival
 
