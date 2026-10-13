@@ -21,6 +21,7 @@ import {
   isIntelligentUiServerEnabled,
   resolveIntelligentUiSlot,
 } from "../intelligentUi/index.js";
+import { pluginUiTypes } from "@openclaude/protocol";
 
 describe("总开关 OC_INTELLIGENT_UI", () => {
   test("缺省与常见真值 → 启用", () => {
@@ -115,11 +116,12 @@ describe("协议文案", () => {
     const schema = readFileSync(resolve(here, "../../../web-react/src/components/iui/schema.ts"), "utf8");
     const block = /export const IUI_TYPES[^=]*=\s*\[([\s\S]*?)\]/.exec(schema)?.[1] ?? "";
     const all = [...block.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]!);
-    // OCV5-383: the market blocks (quote / kline / intraday / stocklist) only ever come verbatim from
-    // the 同花顺 CLI's `--ui` output, never from the model, so the model prompt must not offer them.
-    const market = readFileSync(resolve(here, "../../../web-react/src/components/iui/marketSchema.ts"), "utf8");
-    const cliOnly = new Set([...market.matchAll(/type: "([a-z_]+)"/g)].map((m) => m[1]!));
-    assert.ok(cliOnly.size >= 4, `parsed market types: ${[...cliOnly].join(",")}`);
+    // OCV5-383 / OCV5-393: plugin-only components (同花顺 market blocks printed by its CLI; 微博 / 知乎 / 飞书
+    // blocks defined in each plugin's references/ui-*.md) reach the model only with the plugin, never via
+    // this every-turn prompt. The registry says which types those are (pluginUiOnDemand.test.ts guards it).
+    const cliOnly = new Set(pluginUiTypes());
+    assert.ok(cliOnly.size >= 10, `registered plugin types: ${[...cliOnly].join(",")}`);
+    for (const t of ["quote", "kline", "intraday", "stocklist"]) assert.ok(cliOnly.has(t), t);
     const types = all.filter((t) => !cliOnly.has(t));
     assert.ok(types.length >= 10, `parsed types: ${types.join(",")}`);
     // sources 只在前端兼容旧消息和同花顺插件输出,不对模型宣传(OCV5-389)。

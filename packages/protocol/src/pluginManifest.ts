@@ -5,7 +5,8 @@
  * 写在一处，取代过去分散在 ConnectorSpec / SecurityDecision / 发布封套 / blueprint / 运行时工件里的
  * 多套写法（问题清单见 docs/plugin-authoring.md 与 OCV5-383 FINDINGS）。
  *
- * 本版真正接通的组件：skills（SKILL.md）、bin（容器内命令，经平台启动器上 PATH）、data（随包数据）。
+ * 本版真正接通的组件：skills（SKILL.md）、bin（容器内命令，经平台启动器上 PATH）、data（随包数据）、
+ * ui（插件专属的 Intelligent UI 组件，OCV5-393：定义只在加载插件时进上下文，见 pluginUi.ts）。
  * http（声明式 API）与 browser（受管浏览器）先在 schema 里占位：写了会得到明确的「暂不支持」错误，
  * 仍走现有发布流程。
  *
@@ -25,6 +26,8 @@ const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/
 const ORIGIN_RE = /^https?:\/\/(?:\*\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?::\d{1,5})?$/
 /** 包内相对路径：不以 / 开头，不含 .. 段、反斜杠、空段。 */
 const REL_PATH_RE = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\/\/)[A-Za-z0-9._\-/]+$/
+/** 组件类型名：小写字母开头，小写字母 / 数字 / 下划线（与前端 IUI_TYPES 同形）。 */
+const UI_TYPE_RE = /^[a-z][a-z0-9_]{1,31}$/
 
 export const PLUGIN_INTERPRETERS = ['python3'] as const
 export type PluginInterpreter = (typeof PLUGIN_INTERPRETERS)[number]
@@ -49,6 +52,11 @@ export type PluginManifest = {
     skills: { path: string }[]
     bin: { name: string; entry: string; interpreter: PluginInterpreter; description?: string }[]
     data: { path: string; description?: string }[]
+    /**
+     * 插件专属组件（OCV5-393）。`path`：定义文件（references/ui-<名字>.md，模型按它写组件，只在用到插件时读）；
+     * `emit: "cli"`：组件由插件命令直接打印，模型原样转贴，不需要定义文件。二者必须且只能写一个。
+     */
+    ui: ({ types: string[]; path: string } | { types: string[]; emit: 'cli' })[]
   }
   auth: {
     mode: PluginAuthMode
@@ -190,14 +198,14 @@ export function parsePluginManifest(raw: unknown): PluginManifestResult {
   const useCases = c.strList(raw, 'useCases', 'useCases', 4, 4, 120)
 
   // components
-  const components: PluginManifest['components'] = { skills: [], bin: [], data: [] }
+  const components: PluginManifest['components'] = { skills: [], bin: [], data: [], ui: [] }
   if (!isObj(raw.components)) c.add('components', '缺少组成：至少要有 skills 或 bin')
   else {
     const comp = raw.components
     for (const k of ['http', 'browser']) {
       if (k in comp) c.add(`components.${k}`, `${k} 组件在 openclaude-plugin/1 里暂不支持；API / 浏览器插件请先用 AI 市场「发布插件」流程`)
     }
-    c.keys(comp, ['skills', 'bin', 'data', 'http', 'browser'], 'components')
+    c.keys(comp, ['skills', 'bin', 'data', 'ui', 'http', 'browser'], 'components')
     c.arr(comp, 'skills', 'components.skills', 8).forEach((s, i) => {
       const p = `components.skills[${i}]`
       if (!isObj(s)) return c.add(p, '应为 {"path": "SKILL.md"}')
@@ -230,6 +238,33 @@ export function parsePluginManifest(raw: unknown): PluginManifestResult {
       const path = relPath(c, d.path, `${p}.path`, 'references/')
       const desc = c.str(d, 'description', `${p}.description`, 2, 200, false)
       if (path) components.data.push({ path, ...(desc ? { description: desc } : {}) })
+    })
+    const uiTypes = new Set<string>()
+    c.arr(comp, 'ui', 'components.ui', 4).forEach((u, i) => {
+      const p = `components.ui[${i}]`
+      if (!isObj(u)) return c.add(p, '应为 {"types": [...], "path": "references/ui-<插件>.md"} 或 {"types": [...], "emit": "cli"}')
+      c.keys(u, ['types', 'path', 'emit'], p)
+      const types: string[] = []
+      if (!Array.isArray(u.types) || u.types.length === 0 || u.types.length > 16) c.add(`${p}.types`, '应为 1–16 个组件类型名')
+      else
+        u.types.forEach((t, j) => {
+          if (typeof t !== 'string' || !UI_TYPE_RE.test(t)) return c.add(`${p}.types[${j}]`, '类型名只能用小写字母、数字和下划线，以字母开头，2–32 位')
+          if (uiTypes.has(t)) return c.add(`${p}.types[${j}]`, `组件类型 ${t} 重复`)
+          uiTypes.add(t)
+          types.push(t)
+        })
+      const hasPath = u.path !== undefined
+      const hasEmit = u.emit !== undefined
+      if (hasPath === hasEmit) return c.add(p, '必须且只能写 path（定义文件）或 "emit": "cli"（由插件命令打印）之一')
+      if (hasEmit) {
+        if (u.emit !== 'cli') return c.add(`${p}.emit`, '只支持 "cli"')
+        if (types.length > 0) components.ui.push({ types, emit: 'cli' })
+        return
+      }
+      const path = relPath(c, u.path, `${p}.path`, 'references/')
+      // 定义文件不能是 SKILL.md：SKILL.md 在加载技能时整份进上下文，定义要等真正展示这个插件的结果时才读。
+      if (path && !/^references\/ui-[a-z0-9-]+\.md$/.test(path)) c.add(`${p}.path`, '定义文件应为 references/ui-<名字>.md')
+      else if (path && types.length > 0) components.ui.push({ types, path })
     })
     if (components.skills.length === 0 && components.bin.length === 0 && isObj(raw.components))
       c.add('components', '至少要有一个 skills 或 bin 组件')

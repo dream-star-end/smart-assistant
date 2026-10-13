@@ -2807,6 +2807,7 @@ const THS_PLUGIN = {
     skills: [{ path: "SKILL.md" }],
     bin: [{ name: "ths", entry: "scripts/ths.py", interpreter: "python3" as const, description: "同花顺行情命令行" }],
     data: [{ path: "references/sectors.json", description: "526 个板块注册表" }],
+    ui: [{ types: ["quote", "kline", "intraday", "stocklist"], emit: "cli" as const }],
   },
   auth: {
     mode: "none" as const,
