@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
 import { signJwt } from '../../auth.js'
+import { listActivities } from '../db/activity.js'
 import { listComments } from '../db/comments.js'
 import { type TaskboardDb, openTaskboardDb } from '../db/index.js'
 import { listPipelines, listStages } from '../db/pipelines.js'
@@ -241,7 +242,7 @@ describe('建项目自动 seed / 建单挂默认流水线', () => {
 })
 
 describe('状态机越权 403', () => {
-  it('agent 调 POST …/done → 403;积压可走 /ready 批准但不能关单', async () => {
+  it('agent 调 POST …/done:缺审计 400;带理由与证据 200 并落审计;不能重开', async () => {
     const db = freshDb()
     let ticketId = ''
     let version = 0
@@ -260,12 +261,133 @@ describe('状态机越权 403', () => {
       assert.equal((ready.body.ticket as { approvedBy: string }).approvedBy, 'agent:main')
       version = (ready.body.ticket as { version: number }).version
 
-      const done = await call(base, 'POST', `/api/board/tickets/${ticketId}/done`, {
+      const bare = await call(base, 'POST', `/api/board/tickets/${ticketId}/done`, {
         expectedVersion: version,
       })
-      assert.equal(done.status, 403, JSON.stringify(done.body))
-      assert.equal(done.body.error, 'forbidden')
-      assert.equal(done.body.code, 'forbidden')
+      assert.equal(bare.status, 400, JSON.stringify(bare.body))
+      assert.match(String(bare.body.error), /reason.*evidence/)
+      // review r1:agent 自报 user:* 不能在审计里冒充人。
+      const spoof = await call(base, 'POST', `/api/board/tickets/${ticketId}/done`, {
+        expectedVersion: version,
+        owner: 'user:default',
+        reason: '已上线',
+        evidence: 'https://example.invalid/pr/1',
+      })
+      assert.equal(spoof.status, 400, JSON.stringify(spoof.body))
+      for (const owner of ['human', 'user:default ', 'system:x']) {
+        const r = await call(base, 'POST', `/api/board/tickets/${ticketId}/done`, {
+          expectedVersion: version,
+          owner,
+          reason: '已上线',
+          evidence: 'https://example.invalid/pr/1',
+        })
+        if (owner === 'human') {
+          // 无前缀的名字按 agent:<name> 记,不会变成人。
+          assert.equal(r.status, 200, JSON.stringify(r.body))
+          const t = r.body.ticket as { version: number }
+          const a = listActivities(db, ticketId, { limit: 50, offset: 0 }).find((x) => x.action === 'close_audit')
+          assert.equal(a?.actorId, 'agent:human')
+          assert.equal(a?.actor, 'agent')
+          // 复原成 ready 继续后面的断言(测试直写库,不走权限)。
+          updateTicket(db, ticketId, t.version, { status: 'ready', closedAt: null })
+          version = t.version + 1
+          continue
+        }
+        assert.equal(r.status, 400, `${owner}: ${JSON.stringify(r.body)}`)
+      }
+      const reasonOnly = await call(base, 'POST', `/api/board/tickets/${ticketId}/done`, {
+        expectedVersion: version,
+        reason: '已上线',
+      })
+      assert.equal(reasonOnly.status, 400, JSON.stringify(reasonOnly.body))
+      const tooLong = await call(base, 'POST', `/api/board/tickets/${ticketId}/done`, {
+        expectedVersion: version,
+        reason: 'x'.repeat(2001),
+        evidence: 'https://example.invalid/pr/1',
+      })
+      assert.equal(tooLong.status, 400, JSON.stringify(tooLong.body))
+
+      const done = await call(base, 'POST', `/api/board/tickets/${ticketId}/done`, {
+        expectedVersion: version,
+        owner: 'agent:main',
+        reason: '已上线并核验',
+        evidence: 'https://example.invalid/pr/693 $H/CONTINUE.md',
+      })
+      assert.equal(done.status, 200, JSON.stringify(done.body))
+      const closed = done.body.ticket as { status: string; closedAt: number | null; version: number }
+      assert.equal(closed.status, 'done')
+      assert.ok(closed.closedAt && closed.closedAt > 0)
+
+      const acts = listActivities(db, ticketId, { limit: 50, offset: 0 })
+      const audit = acts.filter((a) => a.action === 'close_audit').at(-1)
+      assert.ok(audit, JSON.stringify(acts))
+      assert.equal(audit.actor, 'agent')
+      assert.equal(audit.actorId, 'agent:main')
+      assert.equal(audit.fromValue, 'ready')
+      const payload = JSON.parse(audit.toValue ?? '{}')
+      assert.deepEqual(payload, {
+        actor: 'agent',
+        actorId: 'agent:main',
+        identitySource: 'client_owner',
+        from: 'ready',
+        to: 'done',
+        reason: '已上线并核验',
+        evidence: 'https://example.invalid/pr/693 $H/CONTINUE.md',
+      })
+      const statusAct = acts.filter((a) => a.action === 'status_changed' && a.toValue === 'done').at(-1)
+      assert.equal(statusAct?.actorId, 'agent:main')
+      const comments = listComments(db, ticketId, { limit: 50, offset: 0 })
+      const note = comments.find((c) => c.body.includes('关单（agent，自报身份 agent:main）'))
+      assert.ok(note, JSON.stringify(comments))
+      assert.equal(note.authorKind, 'agent')
+      assert.match(note.body, /理由：已上线并核验/)
+      assert.match(note.body, /证据：https:\/\/example\.invalid\/pr\/693/)
+
+      // 重开(done→ready)仍只属于人:agent 走 /ready 也被状态机拒绝。
+      const reopen = await call(base, 'POST', `/api/board/tickets/${ticketId}/ready`, {
+        expectedVersion: closed.version,
+        owner: 'agent:main',
+      })
+      assert.equal(reopen.status, 403, JSON.stringify(reopen.body))
+    })
+    db.close()
+  })
+
+  it('agent 把待执行标为受阻:必须给理由;落 block_audit', async () => {
+    const db = freshDb()
+    let ticketId = ''
+    let version = 0
+    await withServer(humanCtx(db), async (base) => {
+      const seeded = await seedProject(base)
+      ticketId = seeded.ticket.id as string
+      version = seeded.ticket.version as number
+    })
+    await withServer(agentCtx(db), async (base) => {
+      const ready = await call(base, 'POST', `/api/board/tickets/${ticketId}/ready`, {
+        expectedVersion: version,
+        owner: 'agent:main',
+      })
+      assert.equal(ready.status, 200, JSON.stringify(ready.body))
+      version = (ready.body.ticket as { version: number }).version
+      const bare = await call(base, 'POST', `/api/board/tickets/${ticketId}/block`, {
+        expectedVersion: version,
+      })
+      assert.equal(bare.status, 400, JSON.stringify(bare.body))
+      const blocked = await call(base, 'POST', `/api/board/tickets/${ticketId}/block`, {
+        expectedVersion: version,
+        owner: 'agent:main',
+        reason: '已上线待人工完成',
+        evidence: 'https://example.invalid/pr/699',
+      })
+      assert.equal(blocked.status, 200, JSON.stringify(blocked.body))
+      const t = blocked.body.ticket as { status: string; blockedReason: string }
+      assert.equal(t.status, 'blocked')
+      assert.equal(t.blockedReason, '已上线待人工完成')
+      const audit = listActivities(db, ticketId, { limit: 50, offset: 0 }).find(
+        (a) => a.action === 'block_audit',
+      )
+      assert.ok(audit)
+      assert.equal(JSON.parse(audit.toValue ?? '{}').evidence, 'https://example.invalid/pr/699')
     })
     db.close()
   })
@@ -382,7 +504,7 @@ describe('actor 判定', () => {
     )
   })
 
-  it('不信 body.actor:agent 自称 human 仍 403', async () => {
+  it('不信 body.actor:agent 自称 human,取消仍 403、关单仍要审计', async () => {
     const db = freshDb()
     let ident = ''
     let version = 0
@@ -392,12 +514,17 @@ describe('actor 判定', () => {
       version = seeded.ticket.version as number
     })
     await withServer(agentCtx(db), async (base) => {
-      const res = await call(base, 'POST', `/api/board/tickets/${ident}/done`, {
+      const cancel = await call(base, 'POST', `/api/board/tickets/${ident}/cancel`, {
         expectedVersion: version,
         actor: 'human',
       })
-      assert.equal(res.status, 403)
-      assert.equal(res.body.code, 'forbidden')
+      assert.equal(cancel.status, 403)
+      assert.equal(cancel.body.code, 'forbidden')
+      const done = await call(base, 'POST', `/api/board/tickets/${ident}/done`, {
+        expectedVersion: version,
+        actor: 'human',
+      })
+      assert.equal(done.status, 400, JSON.stringify(done.body))
     })
     db.close()
   })

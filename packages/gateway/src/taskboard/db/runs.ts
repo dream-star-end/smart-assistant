@@ -138,7 +138,9 @@ export interface UpdateRunPatch {
 }
 
 export interface SettleLeaseRunPatch {
-  status: 'succeeded' | 'failed' | 'timeout'
+  status: 'succeeded' | 'failed' | 'timeout' | 'skipped'
+  /** 仅 status=skipped 时有意义;其余结算写 NULL。 */
+  skipReason?: RunSkipReason | null
   summary: string | null
   outputMd: string | null
   error: string | null
@@ -435,6 +437,7 @@ export function settleLeaseRun(
        tokens_out = @tokensOut,
        cost_usd = @costUsd,
        cost_imprecise = @costImprecise,
+       skip_reason = @skipReason,
        lease_owner = NULL,
        lease_expires_at = NULL
      WHERE id = @runId
@@ -447,6 +450,7 @@ export function settleLeaseRun(
     owner,
     now,
     ...patch,
+    skipReason: patch.skipReason ?? null,
     costImprecise: bindCostImprecise(patch.costImprecise),
   })
   return result.changes === 1 ? getRun(db, runId) : null

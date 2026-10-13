@@ -245,8 +245,16 @@ async function nextBusinessFrame(fc: { next: () => Promise<string> }): Promise<R
   }
 }
 
+/**
+ * 等容器侧 ws 连上的上限。只是“等它发生”的预算,不是断言:所有调用方都在等一个必然到来的连接,
+ * 没有任何用例断言“不会连”。1s 在发布门并行构建时不够(OCV5-405 首趟列车
+ * tr-20261013T073654Z:「session_deleted persist」1.2s 处报 no container connection,单独复跑 5/5 通过),
+ * 放宽到 10s 只影响真坏时的失败速度。
+ */
+const CONTAINER_CONNECT_WAIT_MS = 10_000;
+
 /** 等下一条容器侧 ws 连接(按时间顺序;不复用已有的)。 */
-function waitNextContainerSocket(rig: TestRig, timeoutMs = 1000): Promise<WebSocket> {
+function waitNextContainerSocket(rig: TestRig, timeoutMs = CONTAINER_CONNECT_WAIT_MS): Promise<WebSocket> {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("no container connection")), timeoutMs);
     rig.containerWss.once("connection", (ws) => {
@@ -1566,7 +1574,7 @@ describe("userChatBridge — tunnel routing (regression)", () => {
 
       // 等容器 ws 真连上(说明 tunnel 工厂返回的 ws 确实在跑)
       await new Promise<void>((r, j) => {
-        const t = setTimeout(() => j(new Error("container never connected")), 1500);
+        const t = setTimeout(() => j(new Error("container never connected")), CONTAINER_CONNECT_WAIT_MS);
         containerWss.once("connection", () => { clearTimeout(t); r(); });
       });
       // 发一帧验证整条链通
