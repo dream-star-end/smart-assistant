@@ -617,14 +617,33 @@ export function isConfirmExpired(expiresAt: string, nowMs: number = Date.now()):
 
 // ── 本机插件与启用开关（OCV5-383） ───────────────────────────────────────────
 
-/** 本机插件：随平台基线下发、在你的容器里运行（plugin.json openclaude-plugin/1）。 */
-export type LocalPlugin = PluginManifest & { enabled: boolean };
+/**
+ * 本机插件：随平台基线下发、在你的容器里运行（plugin.json openclaude-plugin/1）。
+ * defaultEnabled = false：默认关闭（OCV5-388），打开时要同时记进偏好 enabled_plugins。
+ */
+export type LocalPlugin = PluginManifest & { enabled: boolean; defaultEnabled?: boolean };
 
-/** 偏好快照（`/api/me/preferences` 的 {prefs} 或平铺）里的已停用插件 slug。 */
-export function disabledPluginsOf(snap: unknown): string[] {
+function prefsSlugList(snap: unknown, key: "disabled_plugins" | "enabled_plugins"): string[] {
   if (!snap || typeof snap !== "object") return [];
   const obj = snap as Record<string, unknown>;
   const prefs = (obj.prefs && typeof obj.prefs === "object" ? obj.prefs : obj) as Record<string, unknown>;
-  const list = prefs.disabled_plugins;
+  const list = prefs[key];
   return Array.isArray(list) ? list.filter((s): s is string => typeof s === "string") : [];
+}
+
+/** 偏好快照（`/api/me/preferences` 的 {prefs} 或平铺）里的已停用插件 slug。 */
+export function disabledPluginsOf(snap: unknown): string[] {
+  return prefsSlugList(snap, "disabled_plugins");
+}
+
+/** 偏好快照里用户打开过的默认关闭插件 slug。 */
+export function enabledPluginsOf(snap: unknown): string[] {
+  return prefsSlugList(snap, "enabled_plugins");
+}
+
+/** 插件页显示用的停用集合：偏好里停用的 + 服务端算出未启用的本机插件（含默认关闭、没打开过的）。 */
+export function effectiveDisabledOf(snap: unknown, local: readonly LocalPlugin[] | null | undefined): Set<string> {
+  const out = new Set(disabledPluginsOf(snap));
+  for (const p of local ?? []) if (p.enabled === false) out.add(p.name);
+  return out;
 }
