@@ -225,10 +225,15 @@ export function ConnectorsTab({
           ? (declConnsBySlug.get(providerCard.slug)?.length ?? 0)
           : 0)
       if (count > 0) {
+        const isPublic =
+          providerCard.system === 'declarative' &&
+          isPublicAuthMode(providerCard.management.contract?.authMode)
         setCardNotice({
           slug: providerCard.slug,
           tone: 'success',
-          text: `${providerCard.label}已连接 ${count} 个账号；需要再绑一个时点「绑定」。`,
+          text: isPublic
+            ? `${providerCard.label}已启用，可以直接让助手使用。`
+            : `${providerCard.label}已连接 ${count} 个账号；需要再绑一个时点「绑定」。`,
         })
         return
       }

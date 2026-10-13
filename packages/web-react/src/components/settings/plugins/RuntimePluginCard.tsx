@@ -65,7 +65,7 @@ export function RuntimePluginCard({
 }) {
   const qrProvider = managedPluginProvider(plugin.slug)
   const canSelfAuthorize =
-    ['knowledge-planet', 'weibo', 'zhihu'].includes(plugin.slug) && plugin.installedCurrent
+    ['knowledge-planet', 'weibo', 'zhihu', 'bili-account'].includes(plugin.slug) && plugin.installedCurrent
   const authorizeLabel = qrProvider.authorizeLabel
   const writeCount = plugin.actions.filter((action) => !action.readOnly).length
   const [consentAccount, setConsentAccount] = useState<RuntimePluginAccount | null>(null)

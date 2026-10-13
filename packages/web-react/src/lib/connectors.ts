@@ -322,6 +322,14 @@ export function isOauthAuthMode(authMode: string): boolean {
   return authMode === "oauth2-auth-code";
 }
 
+/**
+ * 公开接口插件（authMode none，OCV5-402，如 B 站公开数据）：没有账号、不填任何凭据，
+ * 「绑定」在界面上叫「启用」，每个用户只有一条固定的连接。单一权威，同 isOauthAuthMode。
+ */
+export function isPublicAuthMode(authMode: string | null | undefined): boolean {
+  return authMode === "none";
+}
+
 /** bind 表单单个字段的展示元数据（source → label/输入类型/占位符）。 */
 export type BindFieldMeta = { label: string; type: "text" | "password"; placeholder?: string };
 
@@ -438,7 +446,8 @@ const CONNECTOR_ERROR_TEXT: Record<string, string> = {
   UNSUPPORTED_PROVIDER: "暂不支持该应用",
   NOT_FOUND: "连接不存在或已解绑",
   // 声明式引擎（/api/connectors/declarative/* 经 HttpError 抛的 code）
-  UPSTREAM_AUTH_FAILED: '应用凭据校验失败，请检查后重试',
+  // 上游拒绝凭据（401/403、IMAP 登录失败、换 token 失败，或探针在 2xx 里报错）；措辞不假设鉴权方式。
+  UPSTREAM_AUTH_FAILED: '凭据校验失败：请检查 Token / 凭据是否有效、额度或配额是否用完后重试',
   IDENTITY_INVALID: '账号身份校验失败，请稍后重试',
   BAD_REQUEST: '请求参数有误，请检查后重试',
   CONNECTION_NOT_FOUND: '连接不存在或已解绑',
@@ -480,6 +489,12 @@ const CONNECTOR_ERROR_TEXT: Record<string, string> = {
   WEIBO_WORKER_INCOMPLETE: '微博工作器未正常结束，请先核对是否已发出',
   ZHIHU_ACTION_FAILED: '知乎操作失败。若已授权仍反复失败，请重新扫码绑定',
   ZHIHU_UPSTREAM_CHALLENGE: '知乎触发了风控或安全验证，请本人完成验证后再试',
+  BILI_ACCOUNT_ACTION_FAILED: 'B 站账号插件读取失败。若反复失败，请重新扫码登录',
+  BILI_ACCOUNT_UPSTREAM_CHALLENGE: 'B 站触发了风控验证，请稍后再试',
+  BILI_ACCOUNT_LOGIN_UNSUPPORTED: 'B 站返回的登录凭据无法安全保存，本次登录未生效',
+  BILI_ACCOUNT_WORKER_BUSY: 'B 站账号插件正忙，请稍后重试',
+  BILI_ACCOUNT_WORKER_DEADLINE: 'B 站账号插件执行超时，请稍后重试',
+  BILI_ACCOUNT_WORKER_INCOMPLETE: 'B 站账号插件未正常结束，请稍后重试',
   ZHIHU_WRITE_COMPOSER: '知乎编辑器未就绪，本次未发送',
   ZHIHU_WRITE_COMPOSER_EDITOR: '知乎编辑器无法填写，本次未发送',
   ZHIHU_WRITE_COMPOSER_READBACK: '知乎正文校验失败，本次未发送',

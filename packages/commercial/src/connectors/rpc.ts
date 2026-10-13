@@ -78,6 +78,8 @@ export const PLUGINS_RPC_PREFIX = '/v3/plugins/'
 const LIST_PATH = '/v3/connectors/list'
 const CALL_PATH = '/v3/connectors/call'
 const CATALOG_PATH = '/v3/connectors/catalog'
+/** 按需取一个动作的完整说明 + 已签名参数结构(oc-connect describe;list 只给一行摘要)。 */
+const DESCRIBE_PATH = '/v3/connectors/describe'
 /** 容器 CLI 插件（plugin-exec）问「这个插件启用了吗」（OCV5-383）。 */
 const PLUGIN_STATE_PATH = '/v3/plugins/state'
 const PLUGIN_LIST_PATH = '/v3/plugins/list'
@@ -396,6 +398,11 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
         })
         return
       }
+      if (path === DESCRIBE_PATH) {
+        const body = parseDescribeBody(await readBoundedJsonBody(req, MAX_LIST_BODY_BYTES))
+        await handleDescribe(res, userId, pool, deps, body)
+        return
+      }
       if (path === CATALOG_PATH || path === PLUGIN_CATALOG_PATH) {
         const body = await readBoundedJsonBody(req, MAX_LIST_BODY_BYTES)
         const query =
@@ -453,7 +460,7 @@ async function handleList(
         const meta = await loadVerifiedContractWithMeta(Number(c.connectorVersionId), pool)
         actions = meta.contract.actions.map((a) => ({
           id: a.id,
-          description: '',
+          description: actionSummary(meta.actionDescriptions?.[a.id]),
           readOnly: a.effect === 'read',
         }))
       }
@@ -466,6 +473,7 @@ async function handleList(
       displayName: c.displayName || c.slug,
       accountHint: typeof c.meta.account_hint === 'string' ? c.meta.account_hint : '',
       status: 'active',
+      descriptionsByAuthor: true,
       actions,
     })
   }
@@ -570,6 +578,101 @@ async function handleCatalog(
       })),
       ...runtimePlugins,
     ],
+  })
+}
+
+// ─── describe ────────────────────────────────────────────────────────────
+
+const ACTION_SUMMARY_MAX = 80
+
+/**
+ * list 里每个声明式动作只给说明的第一行(动作多时不把整份说明塞进上下文)。说明是插件作者写的:
+ * 控制/格式字符一律换成空格,保证它只占一行、不能伪造别的输出行;连接上另带 descriptionsByAuthor
+ * 让 CLI 标明来源。
+ */
+function actionSummary(description: string | undefined): string {
+  const line =
+    description
+      ?.split('\n')
+      .map((part) => part.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ').replace(/\s+/g, ' ').trim())
+      .find(Boolean) ?? ''
+  return line.length > ACTION_SUMMARY_MAX ? `${line.slice(0, ACTION_SUMMARY_MAX - 1)}…` : line
+}
+
+interface DescribeBody {
+  connectionId: string
+  action: string
+}
+
+function parseDescribeBody(raw: unknown): DescribeBody {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
+    throw new ConnectorError('BAD_REQUEST', 'describe body must be an object')
+  const b = raw as Record<string, unknown>
+  if (
+    typeof b.connectionId !== 'string' ||
+    b.connectionId.length === 0 ||
+    b.connectionId.length > 32
+  )
+    throw new ConnectorError('BAD_REQUEST', 'connectionId required')
+  if (typeof b.action !== 'string' || !/^[a-z0-9_]{1,64}$/.test(b.action))
+    throw new ConnectorError('BAD_REQUEST', 'action invalid')
+  return { connectionId: b.connectionId, action: b.action }
+}
+
+/**
+ * 只读:返回动作说明与参数结构,不发上游请求。声明式连接取 pin 的已签名 contract(与 call 同一
+ * 套 entitlement / pin 校验,失效即 RELINK_REQUIRED);v1 / github 取平台内置注册表。
+ */
+async function handleDescribe(
+  res: ServerResponse,
+  userId: number,
+  pool: Pool,
+  deps: ConnectorsRpcDeps,
+  body: DescribeBody,
+): Promise<void> {
+  if (body.connectionId === GITHUB_VIRTUAL_CONNECTION_ID) {
+    await assertPluginEnabled(deps, userId, 'github')
+    const decl = requireAction('github', body.action)
+    sendEnvelope(res, {
+      kind: 'describe',
+      provider: 'github',
+      action: decl.id,
+      readOnly: decl.readOnly,
+      description: decl.description,
+      params: decl.params,
+    })
+    return
+  }
+  if (!/^\d{1,19}$/.test(body.connectionId))
+    throw new ConnectorError('CONNECTION_NOT_FOUND', 'malformed connection id')
+  const declRow = await getDeclarativeConnection(body.connectionId, userId, pool)
+  if (declRow) {
+    await assertPluginEnabled(deps, userId, declRow.provider)
+    const { contract, actionDescriptions } = await loadContractForConnection(declRow, pool)
+    const action = contract.actions.find((a) => a.id === body.action)
+    if (action === undefined)
+      throw new ConnectorError('ACTION_UNKNOWN', `unknown action ${body.action}`)
+    sendEnvelope(res, {
+      kind: 'describe',
+      provider: declRow.provider,
+      action: action.id,
+      readOnly: action.effect === 'read',
+      description: actionDescriptions[action.id] ?? '',
+      params: action.params,
+    })
+    return
+  }
+  const row = await getActiveConnection(body.connectionId, userId, pool)
+  if (!row) throw new ConnectorError('CONNECTION_NOT_FOUND', 'connection not found')
+  await assertPluginEnabled(deps, userId, row.provider)
+  const decl = requireAction(row.provider, body.action)
+  sendEnvelope(res, {
+    kind: 'describe',
+    provider: row.provider,
+    action: decl.id,
+    readOnly: decl.readOnly,
+    description: decl.description,
+    params: decl.params,
   })
 }
 

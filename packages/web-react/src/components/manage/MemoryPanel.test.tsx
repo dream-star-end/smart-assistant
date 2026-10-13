@@ -34,6 +34,8 @@ function renderPanel(ui: ReactElement = <MemoryPanel auth={auth} agentId="main" 
 /** 造核心记忆索引响应（GET .../memory/memory）。 */
 function mockIndex(files: Partial<MemoryFileMeta>[], text = "<!-- oc-memdir-index v1 -->") {
   if (!vi.isMockFunction(api.getAutoDreamReport)) mockDream();
+  if (!vi.isMockFunction(api.getPreferences))
+    vi.spyOn(api, "getPreferences").mockRejectedValue(new Error("offline"));
   return vi.spyOn(api, "getMemoryIndex").mockResolvedValue({
     kind: "index",
     text,
@@ -451,6 +453,97 @@ describe("MemoryPanel · 核心记忆文件列表", () => {
     expect(box).toHaveClass("border-transparent", "bg-hover");
     // 新建按钮窄屏只露「新建」，可访问名仍完整
     expect(screen.getByRole("button", { name: "新建记忆" })).toBeInTheDocument();
+  });
+});
+
+function autoDreamFeature(over: Record<string, unknown> = {}) {
+  return {
+    prefs: {},
+    features: {
+      auto_dream: {
+        eligible: true,
+        available: true,
+        enabled: false,
+        optimizer_enabled: false,
+        legacy_enabled: false,
+        effective: false,
+        telemetry_ready: null,
+        telemetry_blockers: [],
+        minimum_plan_code: "max",
+        min_interval_hours: 24,
+        min_new_sessions: 5,
+        ...over,
+      },
+    },
+  };
+}
+
+describe("MemoryPanel · 自动整理记忆开关（OCV5-392）", () => {
+  test("可用账号看到关着的开关、节奏和只新增说明，打开即写 auto_dream_enabled", async () => {
+    vi.spyOn(api, "getPreferences").mockResolvedValue(autoDreamFeature());
+    const patch = vi
+      .spyOn(api, "patchPreferences")
+      .mockResolvedValue(autoDreamFeature({ enabled: true, legacy_enabled: true, effective: true }));
+    mockIndex([{ file: "a.md", name: "甲" }]);
+
+    renderPanel();
+
+    const row = await screen.findByRole("region", { name: "自动整理记忆" });
+    expect(row).toHaveTextContent("每 24 小时最多一次，累计 5 个新会话后");
+    expect(row).toHaveTextContent("只新增，不改、不删已有记忆");
+    const sw = within(row).getByRole("switch", { name: "自动整理记忆" });
+    expect(sw).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(sw);
+    await waitFor(() => expect(patch).toHaveBeenCalledWith(auth, { auto_dream_enabled: true }));
+    await waitFor(() => expect(sw).toHaveAttribute("aria-checked", "true"));
+  });
+
+  test("已开启的账号可以一键关闭", async () => {
+    vi.spyOn(api, "getPreferences").mockResolvedValue(
+      autoDreamFeature({ enabled: true, legacy_enabled: true, effective: true }),
+    );
+    const patch = vi.spyOn(api, "patchPreferences").mockResolvedValue(autoDreamFeature());
+    mockIndex([{ file: "a.md", name: "甲" }]);
+
+    renderPanel();
+
+    const sw = await screen.findByRole("switch", { name: "自动整理记忆" });
+    expect(sw).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(sw);
+    await waitFor(() => expect(patch).toHaveBeenCalledWith(auth, { auto_dream_enabled: false }));
+  });
+
+  test("订阅不够且没开着时不显示开关；读偏好失败也不影响记忆列表", async () => {
+    vi.spyOn(api, "getPreferences").mockResolvedValue(autoDreamFeature({ eligible: false }));
+    mockIndex([{ file: "a.md", name: "甲" }]);
+
+    renderPanel();
+
+    expect(await screen.findByText("甲")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "自动整理记忆" })).not.toBeInTheDocument();
+  });
+
+  test("只新增的报告不再写「更新 0 条、清理 0 条」", async () => {
+    mockDream({
+      status: "success",
+      pendingSessions: 0,
+      lastReport: {
+        status: "success",
+        finishedAt: new Date(Date.now() - 60_000).toISOString(),
+        sessionsReviewed: 5,
+        summary: "新增一条偏好",
+        created: [{ file: "created.md", action: "created", type: "user" }],
+        updated: [],
+        deleted: [],
+      },
+    });
+    mockIndex([{ file: "created.md", name: "新偏好", type: "user" }]);
+
+    renderPanel();
+
+    const report = await screen.findByRole("region", { name: "Auto-Dream 梦境报告" });
+    expect(within(report).getByText("已新增 1 条记忆。")).toBeInTheDocument();
+    expect(report).not.toHaveTextContent("更新 0 条");
   });
 });
 

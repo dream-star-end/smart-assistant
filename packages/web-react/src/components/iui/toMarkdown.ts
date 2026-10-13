@@ -5,9 +5,11 @@
  * 输出是普通 GFM(表格、列表、引用),任何 Markdown 阅读器都能读。
  */
 import { isNextBlockCode } from "../../lib/inputPrediction";
+import { biliToMarkdown } from "./biliMarkdown";
 import { computeOutputs } from "./formula";
 import { marketToMarkdown } from "./marketMarkdown";
 import { parseUiBlock } from "./parse";
+import { pluginToMarkdown } from "./pluginMarkdown";
 import type { CalcFormat, CalculatorSpec, Cell, IuiSpec, OutlineNode, TableSpec } from "./schema";
 import { validateSpec } from "./schema";
 
@@ -298,7 +300,7 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
       ].join("\n");
     case "sources":
       return [
-        ...heading(spec.title ?? "来源", spec.subtitle),
+        ...heading(spec.title ?? "参考来源", spec.subtitle),
         ...spec.items.map((s, i) => {
           const name = s.url ? `[${s.title}](${s.url})` : s.title;
           const meta = [s.site !== s.title ? s.site : undefined, s.date].filter(Boolean).join(" · ");
@@ -323,6 +325,20 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
     case "intraday":
     case "stocklist":
       return marketToMarkdown(spec);
+    case "weibo_posts":
+    case "weibo_hot":
+    case "zhihu_hot":
+    case "zhihu_answers":
+    case "feishu_events":
+    case "feishu_doc":
+      return pluginToMarkdown(spec);
+    case "bili_videos":
+    case "bili_rank":
+    case "bili_video":
+    case "bili_comments":
+    case "bili_danmaku":
+    case "bili_subtitle":
+      return biliToMarkdown(spec);
   }
 }
 

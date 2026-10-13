@@ -114,6 +114,7 @@ import type { PluginRuntimeFacade } from '../plugins/runtime.js'
 import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetup.js'
 import type { WeiboSetupManager } from '../plugins/weiboSetup.js'
 import type { ZhihuSetupManager } from '../plugins/zhihuSetup.js'
+import type { BiliAccountSetupManager } from '../plugins/biliAccountSetup.js'
 import type { KnowledgePlanetAutomationService } from '../plugins/knowledgePlanetAutomation.js'
 import type { GoalStateService } from '../goal/goalStateService.js'
 import type { MediaGenerationService } from '../media-generation/service.js'
@@ -140,6 +141,8 @@ export interface CommercialHttpDeps {
   weiboSetup?: WeiboSetupManager
   /** Short-lived managed login coordinator for the official Zhihu Plugin. */
   zhihuSetup?: ZhihuSetupManager
+  /** Short-lived managed login coordinator for the official Bilibili account Plugin (OCV5-402). */
+  biliAccountSetup?: BiliAccountSetupManager
   /** Separate high-risk control/rules for official Knowledge Planet unattended replies. */
   knowledgePlanetAutomation?: KnowledgePlanetAutomationService
   mailer: Mailer

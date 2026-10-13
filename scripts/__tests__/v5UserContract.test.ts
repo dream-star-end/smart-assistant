@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { parseModels, parseOptions, turnPolicy, engineMatrix, tapResult, assertOutbound, turnEvidence } from "../lib/user-contract.mjs";
+import { parseModels, parseOptions, turnPolicy, engineMatrix, tapResult, assertOutbound, turnEvidence, continuationCode, continuationPrompts, assertSameSession, assertContinuationAnswer } from "../lib/user-contract.mjs";
 const catalog = [{ id: "grok-build", engine: "grok" }, { id: "deepseek-v4-flash", engine: "ccb" }];
 test("contract options default dry and reject malformed modes/origins", () => {
   assert.equal(parseOptions({}).cost, "dry");
@@ -40,6 +40,27 @@ test("completion requires exact peer/message and errors trump final", () => {
   assert.deepEqual(turnEvidence([{ ...final, clientMessageId: "other" }], sent), { complete: false, error: false });
   assert.deepEqual(turnEvidence([final], sent), { complete: true, error: false });
   assert.deepEqual(turnEvidence([final, { ...final, type: "outbound.error" }], sent), { complete: true, error: true });
+});
+test("continuation code is random letters+digits and only the first prompt carries it", () => {
+  const codes = new Set(Array.from({ length: 200 }, () => continuationCode()));
+  assert.ok(codes.size > 195);
+  for (const c of codes) assert.match(c, /^[A-HJ-NP-Z]{4}[0-9]{4}$/);
+  const p = continuationPrompts("QWER1234");
+  assert.match(p.first, /QWER1234/);
+  assert.doesNotMatch(p.second, /QWER1234/);
+  assert.notEqual(p.first, p.second);
+  assert.throws(() => continuationPrompts("abc"));
+});
+test("continuation answer must contain the exact code as one token", () => {
+  for (const ok of ["QWER1234", "暗号是 QWER1234。", "`qwer1234`", "**QWER1234**"]) assertContinuationAnswer(ok, "QWER1234");
+  for (const bad of ["", "2", "不知道", "QWER-1234", "QWER12345", "XQWER1234", "QWER"]) assert.throws(() => assertContinuationAnswer(bad, "QWER1234"));
+});
+test("continuation must stay in the first turn's session with a new message id", () => {
+  const a = { peer: { id: "p1" }, clientMessageId: "m1" };
+  assertSameSession(a, { peer: { id: "p1" }, clientMessageId: "m2" });
+  assert.throws(() => assertSameSession(a, { peer: { id: "p2" }, clientMessageId: "m2" }));
+  assert.throws(() => assertSameSession(a, { peer: { id: "p1" }, clientMessageId: "m1" }));
+  assert.throws(() => assertSameSession({ peer: {} }, { peer: {}, clientMessageId: "m2" }));
 });
 const deploy = readFileSync(new URL("../deploy-v5-selfhost.sh", import.meta.url), "utf8");
 function shellFunction(name: string) {

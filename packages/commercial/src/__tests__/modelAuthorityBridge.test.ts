@@ -211,6 +211,7 @@ interface Rig {
   /** 签发边界 epoch 直读的返回值(测试可中途改,模拟 admin 安全写)。 */
   epochAtSign: { value: bigint; fail?: boolean };
   receiptCasCalls: Array<{ dispatchId: string; leaseEpoch: number }>;
+  traceWrites: Array<{ sql: string; params: unknown[] }>;
   deferredPoolErrors: Error[];
   dispatchValidationErrors: Error[];
 }
@@ -266,6 +267,7 @@ async function startRig(opts: {
   const epochAtSign: { value: bigint; fail?: boolean } = { value: 12n };
   const keyIdsMode = opts.keyIds ?? "real";
   const receiptCasCalls: Array<{ dispatchId: string; leaseEpoch: number }> = [];
+  const traceWrites: Array<{ sql: string; params: unknown[] }> = [];
   const deferredPoolErrors: Error[] = [];
   const dispatchValidationErrors: Error[] = [];
   let admittedForAuthorityBinding: TurnDispatchRow | null = null;
@@ -298,7 +300,10 @@ async function startRig(opts: {
           }
           if (/SELECT status FROM users WHERE id/.test(sql)) return { rows: [] };
           if (/FROM github_session_workspaces/.test(sql)) return { rows: [] };
-          if (/(INSERT INTO|UPDATE) turn_traces/.test(sql)) return { rows: [], rowCount: 0 };
+          if (/(INSERT INTO|UPDATE) turn_traces/.test(sql)) {
+            traceWrites.push({ sql, params });
+            return { rows: [], rowCount: 1 };
+          }
           if (/UPDATE turn_dispatches/.test(sql) && /SET status = 'accepted'/.test(sql)) {
             try {
               const d = admittedForAuthorityBinding;
@@ -571,6 +576,7 @@ async function startRig(opts: {
     census,
     epochAtSign,
     receiptCasCalls,
+    traceWrites,
     deferredPoolErrors,
     dispatchValidationErrors,
   };
@@ -1234,6 +1240,17 @@ describe("OCV5-187 admitted callback content is immutable across the real WS bri
         assert.equal(frames[0].model, "glm-5.2");
         assert.equal(admissions[0]!.requestHash, computeDispatchRequestHash({ text: sample.text }));
         assert.equal(rig.receiptCasCalls.length, 1);
+        // OCV5-403: the cron-origin turn's trace row is linked to its dispatch.
+        const traceInsert = rig.traceWrites.find((w) => /INSERT INTO turn_traces/.test(w.sql));
+        assert.ok(traceInsert, "the cron-origin turn records a trace row");
+        await waitFor(() => rig.traceWrites.some((w) =>
+          /UPDATE turn_traces/.test(w.sql) && /SET dispatch_id = COALESCE/.test(w.sql)));
+        const backfill = rig.traceWrites.filter((w) =>
+          /UPDATE turn_traces/.test(w.sql) && /SET dispatch_id = COALESCE/.test(w.sql));
+        assert.equal(backfill.length, 1, "exactly one dispatch backfill");
+        assert.deepEqual(backfill[0]!.params, [
+          traceInsert.params[0], admissions[0]!.dispatchId, admissions[0]!.billingRequestId,
+        ]);
         assert.deepEqual(rig.deferredPoolErrors, []);
       } finally {
         client?.terminate();
@@ -1431,6 +1448,10 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
       }));
       await waitFor(() => rig.receiptCasCalls.length === 1);
       assert.equal(rig.receiptCasCalls[0]?.dispatchId, dispatchId);
+      // OCV5-403: a browser turn is linked once, by the post-admission backfill, to its own dispatch.
+      const backfills = rig.traceWrites.filter((w) => /SET dispatch_id = COALESCE/.test(w.sql));
+      assert.equal(backfills.length, 1);
+      assert.equal(backfills[0]!.params[1], dispatchId);
       ws.close();
     } finally {
       await stopRig(rig);

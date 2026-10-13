@@ -12,7 +12,7 @@ import type { AuthSession } from './types'
  * 未登记的 slug 回落到知识星球（与改造前 `managedQrProvider` 的兜底一致：知识星球是最早的
  * 受管浏览器插件，其余 slug 都是后来显式加的分支）。
  */
-export type ManagedQrProvider = 'knowledge-planet' | 'weibo' | 'zhihu'
+export type ManagedQrProvider = 'knowledge-planet' | 'weibo' | 'zhihu' | 'bili-account'
 
 export type ManagedPluginProvider = {
   slug: ManagedQrProvider
@@ -66,6 +66,25 @@ const MANAGED_PLUGIN_PROVIDERS: Record<ManagedQrProvider, ManagedPluginProvider>
     qr: (auth, sessionId) => api.getZhihuSetupQr(auth, sessionId),
     cancel: (auth, sessionId) => api.cancelZhihuSetup(auth, sessionId),
   },
+  // OCV5-402: 只读;字幕、收藏夹、观看历史。
+  'bili-account': {
+    slug: 'bili-account',
+    label: '哔哩哔哩账号',
+    scanner: '哔哩哔哩 App',
+    qrAlt: '哔哩哔哩登录二维码',
+    authorizeLabel: 'B 站扫码授权',
+    qrRelink: true,
+    challengeCodes: ['BILI_ACCOUNT_UPSTREAM_CHALLENGE', 'BILI_ACCOUNT_LOGIN_UNSUPPORTED'],
+    challengeText:
+      'B 站触发了风控验证或返回了无法安全保存的登录凭据，本次授权已安全停止。请稍后再试；若反复出现，请联系管理员。',
+    start: (auth, relinkAccountId) =>
+      relinkAccountId
+        ? api.startBiliAccountSetup(auth, relinkAccountId)
+        : api.startBiliAccountSetup(auth),
+    get: (auth, sessionId) => api.getBiliAccountSetup(auth, sessionId),
+    qr: (auth, sessionId) => api.getBiliAccountSetupQr(auth, sessionId),
+    cancel: (auth, sessionId) => api.cancelBiliAccountSetup(auth, sessionId),
+  },
   'knowledge-planet': {
     slug: 'knowledge-planet',
     label: '知识星球',
@@ -84,7 +103,8 @@ const MANAGED_PLUGIN_PROVIDERS: Record<ManagedQrProvider, ManagedPluginProvider>
 }
 
 export function managedPluginProvider(slug: string | undefined): ManagedPluginProvider {
-  if (slug === 'weibo' || slug === 'zhihu') return MANAGED_PLUGIN_PROVIDERS[slug]
+  if (slug === 'weibo' || slug === 'zhihu' || slug === 'bili-account')
+    return MANAGED_PLUGIN_PROVIDERS[slug]
   return MANAGED_PLUGIN_PROVIDERS['knowledge-planet']
 }
 

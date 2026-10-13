@@ -415,7 +415,10 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   /** @param runnerOverride 测试注入结构等价 fake(生产恒为内部构造的 SubprocessRunner)。 */
   constructor(opts: EngineCreateOpts, runnerOverride?: SubprocessRunner) {
     super()
-    this.harness = resolveCcbHarness(opts.harness)
+    // Hermetic one-shots (Auto-Dream, advisor) only run on CCB: the stock CLI
+    // refuses them (OFFICIAL_CC_REQUIRES_LOCAL_NON_HERMETIC), so OC_CCB_OFFICIAL_CC
+    // must not move them off CCB.
+    this.harness = opts.hermeticNoTools ? 'ccb' : resolveCcbHarness(opts.harness)
     this.authorityEngine = opts.authorityEngine ?? 'ccb'
     this.runner = runnerOverride ?? new SubprocessRunner({ ...opts, harness: this.harness })
     // 常驻 stdout 路由(每 session 恰一个,替代旧 per-turn 'message' 闭包链)。

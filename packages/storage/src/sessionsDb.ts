@@ -920,10 +920,18 @@ export async function scanAutoDreamSuccessfulSessions(opts: {
   channels: readonly string[]
   afterSeq?: number
   limit?: number
+  /**
+   * 'oldest' (default) pages sessions by their first success in the window.
+   * 'newest' returns the most recently active sessions first, so a bounded
+   * prompt snapshot reads recent conversations instead of the start of a long
+   * backlog. The returned throughSeq (the window upper bound) is the same.
+   */
+  order?: 'oldest' | 'newest'
 }): Promise<{ sessions: AutoDreamSuccessfulSession[]; throughSeq: number }> {
   const channels = [...new Set(opts.channels.filter(Boolean))]
   if (channels.length === 0) return { sessions: [], throughSeq: Math.max(0, opts.afterSeq ?? 0) }
   const limit = Math.max(1, Math.min(100, Math.floor(opts.limit ?? 32)))
+  const newest = opts.order === 'newest'
   const afterSeq = Math.max(0, Math.floor(opts.afterSeq ?? 0))
   const db = await getSessionsDb()
   const placeholders = channels.map(() => '?').join(',')
@@ -937,7 +945,7 @@ export async function scanAutoDreamSuccessfulSessions(opts: {
   if (throughSeq <= afterSeq) return { sessions: [], throughSeq }
   const rows = db.prepare(
     `WITH first_events AS (
-       SELECT session_id, MIN(seq) AS seq
+       SELECT session_id, ${newest ? 'MAX' : 'MIN'}(seq) AS seq
          FROM auto_dream_success_events
         WHERE agent_id = ?
           AND channel IN (${placeholders})
@@ -948,7 +956,7 @@ export async function scanAutoDreamSuccessfulSessions(opts: {
      SELECT e.seq, e.session_id, e.agent_id, e.channel, e.completed_at
        FROM first_events f
        JOIN auto_dream_success_events e ON e.seq = f.seq
-      ORDER BY e.seq ASC
+      ORDER BY e.seq ${newest ? 'DESC' : 'ASC'}
       LIMIT ?`,
   ).all(
     opts.agentId,
