@@ -77,7 +77,7 @@ test("deploy gate missing credential fails closed without executing node", () =>
   assert.match(out, /rc=1/); assert.doesNotMatch(out, /NODE_MUST_NOT_RUN/);
 });
 test("new gate is within forward smoke before smoked and absent from rollback", () => {
-  assert.match(shellFunction("cutover_smoke_against_release"), /user_contract_gate \|\| return 1/);
+  assert.match(shellFunction("cutover_smoke_against_release"), /user_contract_gate \|\| \{ cutover_fail "[^"]+"; return 1; \}/);
   assert.doesNotMatch(shellFunction("cutover_smoke_healthz_only"), /user_contract_gate/);
   assert.doesNotMatch(shellFunction("cmd_smoke"), /user_contract_gate/);
   const fn = shellFunction("user_contract_gate");

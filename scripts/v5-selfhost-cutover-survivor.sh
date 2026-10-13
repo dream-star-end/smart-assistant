@@ -91,6 +91,12 @@ phase_health_may_skip_restore() {
   esac
 }
 
+# OCV5-418:门禁失败且策略 stay 时 cutover 落的终态。新版已在跑,只是门禁没过;
+# 用户选择留在新版排查,所以健康红也不恢复(维护窗口过期后由看护按自己的规则处理)。
+phase_is_kept_failed() {
+  [[ "$1" == kept-failed ]]
+}
+
 parse_state() {
   local key="$1"
   [[ -f "$SURVIVOR_STATE" && ! -L "$SURVIVOR_STATE" ]] || return 1
@@ -227,6 +233,10 @@ maybe_restore() {
     return 0
   fi
   phase="$(parse_state phase || true)"
+  if phase_is_kept_failed "$phase"; then
+    log "phase=kept-failed(门禁失败,按策略留在新版),不恢复"
+    return 0
+  fi
   # 2026-08-29 11:21: timeout 在 phase=symlink-flipped + 人工已恢复 live 健康时
   # 仍「无视健康」装 Aug18 工作树 unit。健康且 WD=live rel → 只报警不动手。
   if compound_health_green && master_cwd_is_live_rel; then
@@ -305,6 +315,21 @@ disarm() {
   systemctl stop openclaude-v5-selfhost-cutover-timeout.timer 2>/dev/null || true
   systemctl stop openclaude-v5-selfhost-cutover-timeout.service 2>/dev/null || true
   log "已解除武装"
+}
+
+# 门禁失败留在新版:不写 committed marker(本班没有通过),只停 watch/timeout。
+# phase 必须已是 kept-failed;万一 timer 没停住,maybe_restore 也按该 phase 不恢复。
+disarm_kept() {
+  local phase
+  phase="$(parse_state phase || true)"
+  if ! phase_is_kept_failed "$phase"; then
+    log "phase=${phase:-none} 不是 kept-failed,拒绝 --disarm-kept"
+    return 1
+  fi
+  systemctl stop openclaude-v5-selfhost-cutover-watch.service 2>/dev/null || true
+  systemctl stop openclaude-v5-selfhost-cutover-timeout.timer 2>/dev/null || true
+  systemctl stop openclaude-v5-selfhost-cutover-timeout.service 2>/dev/null || true
+  log "已解除武装(kept-failed,未写 committed marker)"
 }
 
 selftest() {
@@ -449,16 +474,57 @@ selftest() {
   echo "PASS survivor: --disarm 写失败可被 cutover 察觉 rc=$rc"
   rmdir -- "$base/committed" 2>/dev/null || rm -rf -- "$base/committed"
 
+  echo "===== survivor 场景: phase=kept-failed + 不健康 + 非 live WD → 不恢复 ====="
+  rm -f -- "$base/restored" "$base/committed"
+  export SURVIVOR_HEALTH_CMD='false'
+  export SURVIVOR_LIVE_WD_CMD='false'
+  write_state 999999999 "$base/backup" kept-failed
+  rc=0
+  "$0" --watch >"$base/watch-kept.log" 2>&1 || rc=$?
+  cat "$base/watch-kept.log"
+  if [[ -f "$base/restored" ]]; then
+    echo "FAIL kept-failed 仍恢复"
+    return 1
+  fi
+  grep -q 'kept-failed' "$base/watch-kept.log"
+  rc=0
+  "$0" --recover >"$base/recover-kept.log" 2>&1 || rc=$?
+  if [[ -f "$base/restored" || "$rc" -ne 0 ]]; then
+    echo "FAIL kept-failed 下 --recover 恢复或非 0 rc=$rc"
+    return 1
+  fi
+  echo "PASS survivor: kept-failed 健康红也不恢复(--watch/--recover)"
+
+  echo "===== survivor 场景: --disarm-kept 只认 kept-failed,且不写 committed marker ====="
+  write_state 999999999 "$base/backup" symlink-flipped
+  rc=0
+  "$0" --disarm-kept >"$base/disarm-kept-refuse.log" 2>&1 || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    echo "FAIL --disarm-kept 在 phase=symlink-flipped 时返回 0"
+    return 1
+  fi
+  write_state 999999999 "$base/backup" kept-failed
+  rc=0
+  "$0" --disarm-kept >"$base/disarm-kept.log" 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 || -e "$base/committed" ]]; then
+    echo "FAIL --disarm-kept rc=$rc 或写了 committed marker"
+    cat "$base/disarm-kept.log"
+    return 1
+  fi
+  [[ "$(parse_state phase)" == kept-failed ]] || { echo "FAIL --disarm-kept 改写了 phase"; return 1; }
+  echo "PASS survivor: --disarm-kept 拒绝非 kept-failed;接受时保留 phase 且不写 marker"
+
   echo "SURVIVOR_SELFTEST_ALL_PASS"
 }
 
 usage() {
   cat <<'EOF'
-用法: cutover-survivor.sh --watch|--recover|--arm PID BACKUP|--disarm|--selftest|--set-phase PHASE
+用法: cutover-survivor.sh --watch|--recover|--arm PID BACKUP|--disarm|--disarm-kept|--selftest|--set-phase PHASE
   --watch      监视 executor;消失后按 phase 决定是否二级恢复
   --recover    超时/OnFailure 入口:与 --watch 相同的 phase-aware 恢复判定
   --arm        写 state 并用 systemd-run 武装 watch+timeout(仅 cutover 真窗口)
   --disarm     原子 fsync 写 committed marker;写失败必须非 0
+  --disarm-kept  phase=kept-failed(门禁失败留在新版)时停 watch/timeout,不写 committed marker
   --set-phase  把已武装 state 的 phase 原子落盘(覆盖第一个 unit 前必须先写 mutated)
   --selftest   假 phase + 故意 kill 模拟 executor,不碰真 unit
 EOF
@@ -472,6 +538,7 @@ case "${1:-}" in
     arm_via_systemd "$2" "$3"
     ;;
   --disarm) disarm ;;
+  --disarm-kept) disarm_kept ;;
   --set-phase)
     [[ $# -ge 2 ]] || { usage >&2; exit 2; }
     set_phase "$2"
