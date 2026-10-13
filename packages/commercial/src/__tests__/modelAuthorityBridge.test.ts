@@ -1448,6 +1448,10 @@ describe("bridge B10 — dispatch 路径 legacy-completed dedup 先于受理", (
       }));
       await waitFor(() => rig.receiptCasCalls.length === 1);
       assert.equal(rig.receiptCasCalls[0]?.dispatchId, dispatchId);
+      // OCV5-403: a browser turn is linked once, by the post-admission backfill, to its own dispatch.
+      const backfills = rig.traceWrites.filter((w) => /SET dispatch_id = COALESCE/.test(w.sql));
+      assert.equal(backfills.length, 1);
+      assert.equal(backfills[0]!.params[1], dispatchId);
       ws.close();
     } finally {
       await stopRig(rig);

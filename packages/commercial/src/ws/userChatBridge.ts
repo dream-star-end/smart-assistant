@@ -4365,11 +4365,18 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ensureDispatchHeartbeat();
         }
       }
-      // OCV5-403: cron-origin / prompt-queue / recovery dispatches are admitted
-      // before this frame's trace row is written, and the admission block below
-      // is skipped for them, so the "admitted" backfill never runs. Link the
-      // trace here (display-only columns, COALESCE, fire-and-forget, warn only).
-      if (admittedThisFrame !== null && traceId !== null) {
+      // OCV5-403: cron-origin and prompt-queue dispatches are admitted before
+      // this frame's trace row is written, and the admission block below is
+      // skipped for them (persistUserRow=false), so the "admitted" backfill never
+      // runs. Link the trace here (display-only columns, COALESCE, fire-and-forget,
+      // warn only). Browser frames keep their post-admission backfill: a record
+      // found only by clientMessageId may belong to another session.
+      if (
+        !persistUserRow &&
+        admittedThisFrame !== null &&
+        traceId !== null &&
+        admittedThisFrame.record.sessionId === peerId
+      ) {
         updateTurnTraceDispatch(deps.pgPool, (msg, fields) => turnLog?.warn(msg, fields), {
           traceId,
           dispatchId: admittedThisFrame.record.dispatchId,
