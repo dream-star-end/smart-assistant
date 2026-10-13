@@ -619,4 +619,79 @@ describe("recovery prober slow backoff", { concurrency: false }, () => {
     assert.equal(recorded.length, 1);
     assert.equal(recorded[0]?.model, "after-throw");
   });
+
+  test("200/429/网络耗时 1 秒仍按 timer 每 60 秒探,不因结束时间跳拍", async () => {
+    const cases: Array<{ label: string; status: number | null; ok: boolean; error: string | null }> = [
+      { label: "200", status: 200, ok: true, error: null },
+      { label: "429", status: 429, ok: false, error: null },
+      { label: "network", status: null, ok: false, error: "ECONNRESET" },
+    ];
+    for (const item of cases) {
+      for (const handle of handles) handle.stop();
+      handles.length = 0;
+      calls.length = 0;
+      events.length = 0;
+      recorded.length = 0;
+      unexpected = 0;
+      mock.timers.reset();
+      mock.timers.enable({ apis: ["setInterval", "Date", "setTimeout"] });
+      state.rows = [degraded("minimax")];
+      state.keys = { minimax: MINIMAX_KEY, ark: ARK_KEY };
+      start(async (spec) => {
+        calls.push({ t: Date.now(), id: spec.id });
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        return result(item.status, item.ok, item.error, `${item.label}-model`);
+      });
+      await settle();
+      assert.equal(calls.length, 1, item.label);
+      mock.timers.tick(1000);
+      await settle();
+      assert.equal(Date.now(), 1000, item.label);
+      assert.equal(calls.length, 1, item.label);
+      mock.timers.tick(MIN - 1000);
+      await settle();
+      assert.equal(Date.now(), MIN, item.label);
+      assert.deepEqual(
+        calls.map((call) => call.t),
+        [0, MIN],
+        item.label,
+      );
+      const logged = item.ok
+        ? events.filter((event) => event.msg === "recovery_probe_ok")
+        : failureLogs();
+      assert.equal(logged[0]?.extra?.at, 1000, item.label);
+      assert.equal(logged[0]?.extra?.nextProbeAt, MIN, item.label);
+      assert.equal(logged[0]?.extra?.backoffMs, MIN - 1000, item.label);
+      if (item.ok) {
+        // 第二发刚起步,样本要等它返回;第一发已经在 t=1s 写入。
+        assert.equal(recorded.length, 1, item.label);
+        assert.equal(recorded[0]?.model, "200-model");
+      } else {
+        assert.equal(recorded.length, 0, item.label);
+        assert.equal(logged.length, 1, item.label);
+        assert.equal(logged[0]?.extra?.failureClass, "transient", item.label);
+        assert.equal(logged[0]?.extra?.consecutive, 0, item.label);
+      }
+      mock.timers.tick(1000);
+      await settle();
+      if (item.ok) {
+        assert.equal(recorded.length, 2, item.label);
+      } else {
+        assert.equal(recorded.length, 0, item.label);
+        const second = failureLogs()[1];
+        assert.equal(second?.extra?.failureClass, "transient", item.label);
+        assert.equal(second?.extra?.at, MIN + 1000, item.label);
+        assert.equal(second?.extra?.nextProbeAt, 2 * MIN, item.label);
+        assert.equal(second?.extra?.consecutive, 0, item.label);
+      }
+      mock.timers.tick(MIN - 1000);
+      await settle();
+      assert.deepEqual(
+        calls.map((call) => call.t),
+        [0, MIN, 2 * MIN],
+        item.label,
+      );
+      assert.equal(unexpected, 0, item.label);
+    }
+  });
 });

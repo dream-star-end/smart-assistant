@@ -14,9 +14,11 @@
  *
  * 确定性终态(HTTP 401/402/403,以及 defaultProbeRequest 已用尽候选后的 400/404)
  * 按 provider 做进程内慢退避:连续同一状态 5min → 15min → 60min,不短于已配置
- * interval(interval 本身夹在 [15s, 1h])。429/408/5xx、网络错误和未知状态保持原
- * 周期,并清掉慢类连续计数;换成另一种慢类状态也从 5min 重新计数。nextProbeAt 从
- * 这次结果实际返回的时刻起算。成功则清除慢退避,之后仍按原周期积累成功样本。
+ * interval(interval 本身夹在 [15s, 1h])。只有这类结果才用时间门。429/408/5xx、
+ * 网络错误和未知状态保持原周期,并清掉慢类连续计数和时间阻塞;换成另一种慢类状态
+ * 也从 5min 重新计数。慢类的 nextProbeAt 从这次结果实际返回的时刻起算。成功或
+ * 瞬态不再把「结束时刻 + interval」当成阻塞:下一拍仍由既有 timer 与 in-flight
+ * 决定,日志里的 nextProbeAt 是下一档 timer,短耗时不会把 60s 周期拖成 120s。
  * 退避是进程内状态,重启后的首轮探活照常发;这不是跨重启持久隔离。
  *
  * timer 与启动首轮遵守退避。只有显式 runNow() 绕过时间,仍遵守 auto+degraded、
@@ -262,9 +264,19 @@ export function startRecoveryProber(
     STATIC_KEY_PROVIDERS.map((p) => [p.id, p]),
   );
   const pace = new Map<string, ProbePace>();
+  // setInterval 与这次取值在同一同步段,相位就是 timer 的起点。
+  const startedAt = Date.now();
 
   let stopped = false;
   let inflight: Promise<void> | null = null;
+
+  function nextOpenSlot(finishedAt: number): number {
+    const elapsed = finishedAt - startedAt;
+    if (elapsed <= 0) return startedAt + intervalMs;
+    const remainder = elapsed % intervalMs;
+    if (remainder === 0) return finishedAt + intervalMs;
+    return finishedAt + (intervalMs - remainder);
+  }
 
   function noteKeys(): void {
     for (const value of Object.values(opts.staticProviderKeys)) {
@@ -311,6 +323,22 @@ export function startRecoveryProber(
     return nextProbeAt;
   }
 
+  function rememberOpen(
+    providerId: string,
+    mark: string,
+    finishedAt: number,
+  ): { nextProbeAt: number; backoffMs: number } {
+    const nextProbeAt = nextOpenSlot(finishedAt);
+    pace.set(providerId, {
+      keyMark: mark,
+      slowStatus: null,
+      slowCount: 0,
+      nextProbeAt,
+      suppressedTicks: 0,
+    });
+    return { nextProbeAt, backoffMs: nextProbeAt - finishedAt };
+  }
+
   async function runTick(bypassWait: boolean): Promise<void> {
     noteKeys();
     const r = await q<{ provider_id: string; health_status: string | null; health_mode: string }>(
@@ -342,7 +370,8 @@ export function startRecoveryProber(
         pace.delete(spec.id);
         st = undefined;
       }
-      if (!bypassWait && st && Date.now() < st.nextProbeAt) {
+      // 时间门只挡慢类。成功/瞬态的 nextProbeAt 只是下一档 timer,不在这里跳拍。
+      if (!bypassWait && st?.slowStatus != null && Date.now() < st.nextProbeAt) {
         st.suppressedTicks += 1;
         continue;
       }
@@ -350,31 +379,41 @@ export function startRecoveryProber(
       const res = await probeRequest(spec, key);
       const finishedAt = Date.now();
       if (res.ok) {
-        const nextProbeAt = remember(spec.id, mark, null, 0, finishedAt, intervalMs);
+        const open = rememberOpen(spec.id, mark, finishedAt);
         recordSuccess(spec.id, res.model);
         logInfo("recovery_probe_ok", {
           provider: spec.id,
           status: res.statusCode,
           model: res.model,
           suppressedTicks: suppressed,
-          nextProbeAt,
-          backoffMs: intervalMs,
+          nextProbeAt: open.nextProbeAt,
+          backoffMs: open.backoffMs,
           at: finishedAt,
         });
         continue;
       }
       const status = res.statusCode;
       const slow = status != null && SLOW_STATUSES.has(status);
-      let slowStatus: number | null = null;
-      let slowCount = 0;
-      let backoffMs = intervalMs;
-      if (slow && status != null) {
-        // 同一 HTTP 状态才沿 5/15/60 累加;换成另一种慢状态从 1 重新计数。
-        slowCount = st && st.slowStatus === status ? st.slowCount + 1 : 1;
-        slowStatus = status;
-        backoffMs = slowBackoffMs(slowCount, intervalMs);
+      if (!slow) {
+        const open = rememberOpen(spec.id, mark, finishedAt);
+        logWarn("recovery_probe_failed", {
+          provider: spec.id,
+          status,
+          error: res.error,
+          model: res.model,
+          failureClass: "transient",
+          consecutive: 0,
+          nextProbeAt: open.nextProbeAt,
+          backoffMs: open.backoffMs,
+          suppressedTicks: suppressed,
+          at: finishedAt,
+        });
+        continue;
       }
-      const nextProbeAt = remember(spec.id, mark, slowStatus, slowCount, finishedAt, backoffMs);
+      // 同一 HTTP 状态才沿 5/15/60 累加;换成另一种慢状态从 1 重新计数。
+      const slowCount = st && st.slowStatus === status ? st.slowCount + 1 : 1;
+      const backoffMs = slowBackoffMs(slowCount, intervalMs);
+      const nextProbeAt = remember(spec.id, mark, status, slowCount, finishedAt, backoffMs);
       logWarn("recovery_probe_failed", {
         provider: spec.id,
         status,
