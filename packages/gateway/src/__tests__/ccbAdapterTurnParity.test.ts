@@ -407,6 +407,26 @@ describe("CcbAdapter turn parity", () => {
     assert.equal(summary?.errorKind, "auth");
   });
 
+  test("OCV5-391: a 500 whose request id happens to contain 401 is not an auth error", async () => {
+    // Production 2026-10-13 03:26Z: an upstream outage's 500 carried request_id
+    // 2974fcb14f233ec9667e57cb571a3401; the bare /401/ keyword turned it into
+    // AUTH_ERROR ("认证状态异常") and stopped the transient retry.
+    const { adapter, runner } = makeAdapter();
+    const turn = beginTurn(adapter, []);
+    const raw = 'API Error: 500 {"error":{"code":"INTERNAL","message":"internal error"},"request_id":"2974fcb14f233ec9667e57cb571a3401"}';
+    runner.msg({ type: "assistant", error: "unknown", message: { content: [{ type: "text", text: raw }] } });
+    runner.msg(resultRow({ is_error: true, total_cost_usd: 0, usage: {} }));
+    const summary = await turn.summary;
+    assert.equal(summary?.isError, true);
+    assert.equal(summary?.errorKind, "other");
+
+    const real = makeAdapter();
+    const realTurn = beginTurn(real.adapter, []);
+    real.runner.msg({ type: "assistant", error: "auth", message: { content: [{ type: "text", text: "API Error: 401 Unauthenticated" }] } });
+    real.runner.msg(resultRow({ is_error: true, total_cost_usd: 0, usage: {} }));
+    assert.equal((await realTurn.summary)?.errorKind, "auth");
+  });
+
   test("MODEL_AUTHORITY_INVALID 先于泛 403/auth 分类，且不泄露原始 JSON", async () => {
     const { adapter, runner } = makeAdapter();
     const events: EngineEvent[] = [];
