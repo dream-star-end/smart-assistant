@@ -1,7 +1,7 @@
 import { Plug, Store } from 'lucide-react'
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../../lib/api'
-import { type ConnectorConnection, type ConnectorProvider, type ConnectorsResponse, type DeclarativeCatalogEntry, type DeclarativeConnection, type DeclarativeManagementConnector, type DeclarativeManagementResponse, type LocalPlugin, type PluginManagementResponse, type RuntimePluginAccount, type RuntimePluginCatalogEntry, connectorCapabilityLabel, declarativeCapabilityLabel, disabledPluginsOf, enabledPluginsOf } from '../../lib/connectors'
+import { type ConnectorConnection, type ConnectorProvider, type ConnectorsResponse, type DeclarativeCatalogEntry, type DeclarativeConnection, type DeclarativeManagementConnector, type DeclarativeManagementResponse, type LocalPlugin, type PluginManagementResponse, type RuntimePluginAccount, type RuntimePluginCatalogEntry, connectorCapabilityLabel, declarativeCapabilityLabel, disabledPluginsOf, enabledPluginsOf, isPublicAuthMode } from '../../lib/connectors'
 import type { AuthSession } from '../../lib/types'
 import { Alert, Button, EmptyState, ListSkeleton, PanelHeader, useConfirm, useToast } from '../ui'
 import { managedPluginProvider } from '../../lib/managedPluginProviders'
@@ -225,10 +225,15 @@ export function ConnectorsTab({
           ? (declConnsBySlug.get(providerCard.slug)?.length ?? 0)
           : 0)
       if (count > 0) {
+        const isPublic =
+          providerCard.system === 'declarative' &&
+          isPublicAuthMode(providerCard.management.contract?.authMode)
         setCardNotice({
           slug: providerCard.slug,
           tone: 'success',
-          text: `${providerCard.label}已连接 ${count} 个账号；需要再绑一个时点「绑定」。`,
+          text: isPublic
+            ? `${providerCard.label}已启用，可以直接让助手使用。`
+            : `${providerCard.label}已连接 ${count} 个账号；需要再绑一个时点「绑定」。`,
         })
         return
       }

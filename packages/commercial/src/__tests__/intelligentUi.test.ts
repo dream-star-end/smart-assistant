@@ -21,6 +21,7 @@ import {
   isIntelligentUiServerEnabled,
   resolveIntelligentUiSlot,
 } from "../intelligentUi/index.js";
+import { pluginUiTypes } from "@openclaude/protocol";
 
 describe("总开关 OC_INTELLIGENT_UI", () => {
   test("缺省与常见真值 → 启用", () => {
@@ -115,15 +116,21 @@ describe("协议文案", () => {
     const schema = readFileSync(resolve(here, "../../../web-react/src/components/iui/schema.ts"), "utf8");
     const block = /export const IUI_TYPES[^=]*=\s*\[([\s\S]*?)\]/.exec(schema)?.[1] ?? "";
     const all = [...block.matchAll(/"([a-z_]+)"/g)].map((m) => m[1]!);
-    // OCV5-383: the market blocks (quote / kline / intraday / stocklist) only ever come verbatim from
-    // the 同花顺 CLI's `--ui` output, never from the model, so the model prompt must not offer them.
-    const market = readFileSync(resolve(here, "../../../web-react/src/components/iui/marketSchema.ts"), "utf8");
-    const cliOnly = new Set([...market.matchAll(/type: "([a-z_]+)"/g)].map((m) => m[1]!));
-    assert.ok(cliOnly.size >= 4, `parsed market types: ${[...cliOnly].join(",")}`);
+    // OCV5-383 / OCV5-393: plugin-only components (同花顺 market blocks printed by its CLI; 微博 / 知乎 / 飞书
+    // blocks defined in each plugin's references/ui-*.md) reach the model only with the plugin, never via
+    // this every-turn prompt. The registry says which types those are (pluginUiOnDemand.test.ts guards it).
+    const cliOnly = new Set(pluginUiTypes());
+    assert.ok(cliOnly.size >= 10, `registered plugin types: ${[...cliOnly].join(",")}`);
+    for (const t of ["quote", "kline", "intraday", "stocklist"]) assert.ok(cliOnly.has(t), t);
     const types = all.filter((t) => !cliOnly.has(t));
     assert.ok(types.length >= 10, `parsed types: ${types.join(",")}`);
-    for (const t of types) assert.match(INTELLIGENT_UI_PROMPT, new RegExp(`"type":"${t}"`), t);
-    for (const t of cliOnly) assert.doesNotMatch(INTELLIGENT_UI_PROMPT, new RegExp(`"type":"${t}"`), t);
+    // sources 只在前端兼容旧消息和同花顺插件输出,不对模型宣传(OCV5-389)。
+    const frontendOnly = new Set(["sources"]);
+    for (const t of types) {
+      if (frontendOnly.has(t)) continue;
+      assert.match(INTELLIGENT_UI_PROMPT, new RegExp(`"type":"${t}"`), t);
+    }
+    for (const t of [...cliOnly, ...frontendOnly]) assert.doesNotMatch(INTELLIGENT_UI_PROMPT, new RegExp(`"type":"${t}"`), t);
     const advertised = [...INTELLIGENT_UI_PROMPT.matchAll(/"type":"([a-z_]+)"/g)].map((m) => m[1]!);
     for (const t of advertised) assert.ok(types.includes(t), `prompt advertises unknown type ${t}`);
   });
@@ -156,7 +163,7 @@ describe("协议文案", () => {
     assert.doesNotMatch(INTELLIGENT_UI_PROMPT, /小工具或小游戏用/);
   });
   test("第三轮:来源只用真实链接、成稿与大纲的用法写明、表格说明筛选与下载", () => {
-    assert.match(INTELLIGENT_UI_PROMPT, /- sources:[^\n]*本轮工具真实返回或用户给出[^\n]*绝不编造链接/);
+    assert.match(INTELLIGENT_UI_PROMPT, /普通 Markdown 写参考来源[^\n]*不要用 ui 组件[^\n]*本轮工具真实返回或用户给出[^\n]*绝不编造链接/);
     assert.match(INTELLIGENT_UI_PROMPT, /- draft:[^\n]*original[^\n]*修改对比/);
     assert.match(INTELLIGENT_UI_PROMPT, /层级结构\(大纲、思维导图、组织架构\)用 outline/);
     assert.match(INTELLIGENT_UI_PROMPT, /- table:[^\n]*可下载 CSV,行多时可筛选/);

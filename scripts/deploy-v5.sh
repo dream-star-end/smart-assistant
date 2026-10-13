@@ -92,6 +92,10 @@ V5_BASELINE_PORT_GUARD_SERVICE="openclaude-v5-baseline-port-guard.service"
 # overrides 无条件 OC_EGRESS_SPLIT=1,unit 缺失 → master 以 split 模式起但 18892
 # 无人监听,容器 LLM 流量全挂(新机 bootstrap 曾踩此雷)。
 V5_EGRESS_UNIT="openclaude-v5-egress.service"
+# OCV5-391: egress blue-green slots (openclaude-v5-egress@{A,B}.socket/.service, one shared
+# SO_REUSEPORT listener). scripts/v5-egress-slots.sh runs the flip on the production host.
+V5_EGRESS_SLOT_SERVICE_TPL="openclaude-v5-egress@.service"
+EGRESS_SLOT_PREDRAIN_SEC="${EGRESS_SLOT_PREDRAIN_SEC:-600}"
 # 全局 egress 独立 release 指针。它不能跟随 A/B candidate 自动切换；只有显式
 # --egress 才原子翻转到本次 release，避免 P3 stable=B 时仍从 slot A 跑旧代码。
 V5_EGRESS_SRC="/opt/openclaude/openclaude-v5-egress"
@@ -1269,7 +1273,9 @@ jq -e '.ok == true and .channel == "v5"' <<<"$body" >/dev/null 2>&1 && healthy+=
 # turn_failures 是窗口聚合检查(v5-monitor.sh):部署窗内 turn 瞬断是预期行为,无条件静默。
 healthy+=(turn_failures)
 if [[ "$include_egress" == 1 ]]; then
-  systemctl is-active --quiet openclaude-v5-egress.service 2>/dev/null && healthy+=(svc_egress)
+  { systemctl is-active --quiet openclaude-v5-egress.service 2>/dev/null \
+    || systemctl is-active --quiet openclaude-v5-egress@A.service 2>/dev/null \
+    || systemctl is-active --quiet openclaude-v5-egress@B.service 2>/dev/null; } && healthy+=(svc_egress)
   body="$(curl -fsS --max-time 5 'http://172.31.0.1:18892/internal/v5/egress-health' 2>/dev/null || true)"
   jq -e '.ok == true and .role == "egress"' <<<"$body" >/dev/null 2>&1 && healthy+=(http_egress)
 fi
@@ -3127,7 +3133,7 @@ capture_trusted_egress_predecessor() { # [explicit-release-dir，仅供 hermetic
   local current="${1:-}" probe kind source short built artifact full
   [[ "$DRY" == 1 ]] && return 0
   if [[ -z "$current" ]]; then
-    current="$(ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true)"
+    current="$(egress_running_cwd)"
   fi
   [[ -n "$current" ]] || { echo "✗ 无法在 mutation 前捕获 egress predecessor" >&2; return 1; }
   probe="$(release_marker_probe "$current")" || {
@@ -5324,6 +5330,15 @@ model_authority_egress_ready_once() { # <true|false> <request-timeout-seconds>
     "$V5_EGRESS_UNIT" "$request_timeout" <<'REMOTE'
 set +e
 unit="$1"; request_timeout="$2"
+# OCV5-391: after the slot migration the serving egress is the newest active slot.
+if [[ "$(systemctl is-active "$unit" 2>/dev/null)" != active ]]; then
+  best_t=-1
+  for c in openclaude-v5-egress@A.service openclaude-v5-egress@B.service; do
+    [[ "$(systemctl is-active "$c" 2>/dev/null)" == active ]] || continue
+    t="$(systemctl show -p ActiveEnterTimestampMonotonic --value "$c" 2>/dev/null || echo 0)"
+    (( ${t:-0} > best_t )) && { unit="$c"; best_t=${t:-0}; }
+  done
+fi
 state_before="$(systemctl is-active "$unit" 2>/dev/null || true)"
 pid_before="$(systemctl show -p MainPID --value "$unit" 2>/dev/null || true)"
 health=""
@@ -5404,7 +5419,7 @@ model_authority_rollback_diagnostics() { # <reason>
   echo "FATAL:模型权威回滚未完成:$reason" >&2
   echo "  安全态可能仍为 flag=1 + egress enforce=true；不要手工只关一面。" >&2
   echo "  修复故障后原命令重跑:scripts/deploy-v5.sh --disable-model-authority" >&2
-  ssh "$KL_HOST" "systemctl --no-pager --full status '$ACTIVE_UNIT' '$V5_EGRESS_UNIT' 2>&1 | tail -n 50" >&2 || true
+  ssh "$KL_HOST" "systemctl --no-pager --full status '$ACTIVE_UNIT' '$V5_EGRESS_UNIT' openclaude-v5-egress@A.service openclaude-v5-egress@B.service 2>&1 | tail -n 60" >&2 || true
 }
 
 # 步骤 4 的统一回滚闭环。关键顺序：
@@ -5441,7 +5456,7 @@ rollback_model_authority_before_cutover() { # <reason>
     wait_for_model_authority_master_ready "$ACTIVE_UNIT" 0 0 - 60 \
       || { model_authority_rollback_diagnostics "active master legacy 未就绪 flag=0/provision=0"; return 1; }
   fi
-  ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'" \
+  egress_restart_in_place \
     || { model_authority_rollback_diagnostics "egress 后撤重启失败"; return 1; }
   wait_for_model_authority_egress_ready false 60 \
     || { model_authority_rollback_diagnostics "egress 未活体确认 enforce=false"; return 1; }
@@ -5455,7 +5470,7 @@ rollback_model_authority_before_cutover() { # <reason>
 rollback_model_authority_egress_only() {
   require_mutation_lease_for_compensation "model-authority-egress-rollback" || exit 86
   remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 0 || return 1
-  ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'" || return 1
+  egress_restart_in_place || return 1
   wait_for_model_authority_egress_ready false 60
 }
 
@@ -5480,7 +5495,7 @@ enable_model_authority() {
     exit 1
   fi
   echo "── 先重启 egress 并确认 enforce=true(允许短暂 fail-closed,禁止新 master+旧 egress fail-open)──"
-  if ! ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'"; then
+  if ! egress_restart_in_place; then
     rollback_model_authority_egress_only \
       || { model_authority_rollback_diagnostics "egress enable 失败后的窄补偿未确认"; exit 1; }
     echo "✗ egress 重启失败,已窄补偿为 flag=0/enforce=false" >&2
@@ -7059,11 +7074,39 @@ EGRESS_READY_LAST_STATE=""; EGRESS_READY_LAST_PID=""; EGRESS_READY_LAST_CWD=""; 
 # egress 冷启动会先加载 pricing/catalog/host identity，再 bind 18892；固定 sleep 会在宿主
 # 抖动时把“尚未 ready”误判成坏 release。单次探针把 systemd/PID/cwd/health 绑在同一轮，
 # 整个 SSH+curl transport 由本地 timeout 钉死，供下面绝对截止轮询消费。
+# OCV5-391: run scripts/v5-egress-slots.sh on the production host (streamed, like the baseline guard).
+egress_slots_remote() { # <active|install <rel>|flip [predrain-sec]|legacy>
+  local a q args=""
+  for a in "$@"; do printf -v q '%q' "$a"; args+=" $q"; done
+  ssh "$KL_HOST" "bash -s --$args" < "$SCRIPT_DIR/v5-egress-slots.sh"
+}
+
+# Release dir of the egress process serving new connections (legacy unit or active slot).
+egress_running_cwd() {
+  egress_slots_remote active 2>/dev/null | awk 'NR == 1 { print $3 }'
+}
+
+# Restart the serving egress on the same release (env change): a slot flip when the slot
+# templates are installed, else the legacy unit's restart.
+egress_restart_in_place() {
+  if ssh "$KL_HOST" "test -f '/etc/systemd/system/$V5_EGRESS_SLOT_SERVICE_TPL'"; then
+    egress_slots_remote flip "$EGRESS_SLOT_PREDRAIN_SEC"
+  else
+    ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'"
+  fi
+}
+
 egress_release_ready_once() { # <expected-release> <require-authority-cap:0|1> <request-timeout-seconds>
   local expected="$1" require_cap="$2" request_timeout="${3:-2}" raw health_b64
   raw="$(timeout --signal=KILL "${request_timeout}s" ssh "$KL_HOST" "set +e
-    state=\$(systemctl is-active '$V5_EGRESS_UNIT' 2>/dev/null || true)
-    pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || true)
+    u='$V5_EGRESS_UNIT'; best_t=-1
+    for c in '$V5_EGRESS_UNIT' openclaude-v5-egress@A.service openclaude-v5-egress@B.service; do
+      [[ \"\$(systemctl is-active \"\$c\" 2>/dev/null)\" == active ]] || continue
+      t=\$(systemctl show -p ActiveEnterTimestampMonotonic --value \"\$c\" 2>/dev/null || echo 0)
+      (( \${t:-0} > best_t )) && { u=\"\$c\"; best_t=\${t:-0}; }
+    done
+    state=\$(systemctl is-active \"\$u\" 2>/dev/null || true)
+    pid=\$(systemctl show -p MainPID --value \"\$u\" 2>/dev/null || true)
     cwd=''
     if [[ \"\$pid\" =~ ^[1-9][0-9]*\$ ]]; then cwd=\$(readlink -f \"/proc/\$pid/cwd\" 2>/dev/null || true); fi
     hz=\$(curl -fsS --max-time '$request_timeout' http://172.31.0.1:18892/internal/v5/egress-health 2>/dev/null || true)
@@ -8223,48 +8266,59 @@ weibo_plugin_finish_or_seed() { # <release> <previous> <hotcfg:0|1> <egress-swit
 }
 
 activate_egress_release() {
-  local reldir="$1" prev="$2" tmplink="$V5_EGRESS_SRC.newlink.$$" caps running_cwd require_cap=0
+  local reldir="$1" prev="$2" tmplink="$V5_EGRESS_SRC.newlink.$$" caps running_cwd require_cap=0 slots=0
   if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] egress 独立指针 $V5_EGRESS_SRC:$prev→$reldir;安装目标 unit→restart→health/cwd；失败回切"
+    echo "  [dry-run] egress 独立指针 $V5_EGRESS_SRC:$prev→$reldir;目标 release 带双槽模板 → 起空闲槽→私有健康→关旧槽 listener→旧槽后台 drain(无模板 → legacy 单 unit restart);health/cwd;失败回切"
     return 0
   fi
   assert_release_marker "$reldir" egress || return 1
   assert_release_marker "$prev" egress || return 1
-  running_cwd="$(ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true)"
+  running_cwd="$(egress_running_cwd)"
   [[ "$running_cwd" == "$prev" ]] || {
     echo "✗ egress 激活前进程 cwd 已漂移(expected=$prev actual=${running_cwd:-<none>})" >&2; return 1;
   }
   ssh "$KL_HOST" "test -f '$reldir/deploy/v5/$V5_EGRESS_UNIT'" || {
     echo "✗ egress 目标 release 不完整或缺 unit:$reldir" >&2; return 1;
   }
+  # OCV5-391: a release that ships the slot templates is served by a slot flip (no window in
+  # which the shared port is closed); an older release (rollback) goes back to the legacy unit.
+  ssh "$KL_HOST" "test -f '$reldir/deploy/v5/$V5_EGRESS_SLOT_SERVICE_TPL'" && slots=1
   if ! ssh "$KL_HOST" "set -Eeuo pipefail
     rm -f '$tmplink'
     ln -s '$reldir' '$tmplink'
     mv -T '$tmplink' '$V5_EGRESS_SRC'
     install -m 0644 '$reldir/deploy/v5/$V5_EGRESS_UNIT' '/etc/systemd/system/$V5_EGRESS_UNIT'
-    systemctl daemon-reload
-    systemctl restart '$V5_EGRESS_UNIT'"; then
-    echo "✗ egress 新 release 安装/restart 失败，尝试回切 $prev" >&2
-  else
+    systemctl daemon-reload"; then
+    echo "✗ egress 指针/unit 安装失败，尝试回切 $prev" >&2
+  elif { if (( slots )); then
+           egress_slots_remote install "$reldir" && egress_slots_remote flip "$EGRESS_SLOT_PREDRAIN_SEC"
+         else
+           egress_slots_remote legacy
+         fi; }; then
     caps="$(release_declared_caps "$reldir" 2>/dev/null || true)"
     caps_contain "$caps" "$MODEL_AUTHORITY_EGRESS_CAP" && require_cap=1
     if wait_for_egress_release_ready "$reldir" "$require_cap" 30; then
-      echo "  ✓ egress 已从独立指针运行目标 release:$reldir"
+      echo "  ✓ egress 已从独立指针运行目标 release:$reldir$( (( slots )) && echo '(双槽翻转)')"
       return 0
     fi
     echo "✗ egress 新 release 活体/进程 cwd/capability 未就绪，尝试回切 $prev" >&2
+  else
+    echo "✗ egress 新 release 启动失败（双槽:新槽未就绪时旧槽仍在服务），尝试回切 $prev" >&2
   fi
 
-  # 新 unit 的 WorkingDirectory 是稳定独立指针，所以回切只需原子翻回旧 release；
-  # 不必恢复旧 unit 文件（旧代码仍由同一个 ExecStart 入口启动）。
+  # 新 unit 的 WorkingDirectory 是稳定独立指针，所以回切先原子翻回旧 release。
+  # 旧进程仍在服务时(新槽没起来)指针翻回即可；否则在旧 release 上再翻一次槽(或 legacy restart)。
   require_mutation_lease_for_compensation "egress-release-compensation" || exit 86
   if ssh "$KL_HOST" "set -Eeuo pipefail
     rm -f '$tmplink'
     ln -s '$prev' '$tmplink'
     mv -T '$tmplink' '$V5_EGRESS_SRC'
-    systemctl daemon-reload
-    systemctl restart '$V5_EGRESS_UNIT'"; then
-    if wait_for_egress_release_ready "$prev" 0 30; then
+    systemctl daemon-reload"; then
+    if [[ "$(egress_running_cwd)" == "$prev" ]] && wait_for_egress_release_ready "$prev" 0 30; then
+      echo "  ✓ egress 仍由旧 release 服务，指针已回切:$prev" >&2
+      return 1
+    fi
+    if egress_restart_in_place && wait_for_egress_release_ready "$prev" 0 60; then
       echo "  ✓ egress 已回切旧 release:$prev" >&2
       return 1
     fi
@@ -8299,7 +8353,7 @@ deploy() {
     # 必须在 master symlink 翻转前钉住旧 egress 真正 cwd；active=A 时翻转后再读会丢回退点。
     egress_prev_release="$CAPTURED_EGRESS_PREDECESSOR"
     local current_egress_cwd
-    current_egress_cwd="$(ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true)"
+    current_egress_cwd="$(egress_running_cwd)"
     [[ -n "$egress_prev_release" && "$current_egress_cwd" == "$egress_prev_release" ]] \
       && assert_release_marker "$egress_prev_release" egress || {
       echo "✗ --egress 起手无法钉住完整旧 egress cwd:$egress_prev_release；拒绝先改 master" >&2; exit 1;
@@ -10099,7 +10153,7 @@ SQL
 }
 
 current_egress_release() {
-  ssh "$KL_HOST" "pid=\$(systemctl show -p MainPID --value '$V5_EGRESS_UNIT' 2>/dev/null || echo 0); test \"\${pid:-0}\" -gt 0 && readlink -f /proc/\$pid/cwd" 2>/dev/null || true
+  egress_running_cwd
 }
 
 # ── egress surface gate(2026-09-04 INC:cursor 子 agent 409 VERIFICATION_SPONSORSHIP_CONFLICT)──

@@ -9,8 +9,11 @@
 
 import { needsSignedSrc } from "../../lib/chat/media";
 import { MARKET_ALIASES, MARKET_VALIDATORS, type MarketSpec } from "./marketSchema";
+import { BILI_ALIASES, BILI_VALIDATORS, type BiliSpec } from "./biliSchema";
+import { PLUGIN_ALIASES, PLUGIN_VALIDATORS, type PluginSpec } from "./pluginSchema";
 
 export type { IntradaySpec, KlineSpec, MarketSpec, QuoteSpec, StockListSpec } from "./marketSchema";
+export type { FeishuDocSpec, FeishuEventsSpec, PluginSpec, WeiboHotSpec, WeiboPostsSpec, ZhihuAnswersSpec, ZhihuHotSpec } from "./pluginSchema";
 
 export type Cell = string | number | null;
 
@@ -240,7 +243,9 @@ export type IuiSpec =
   | KvSpec
   | FormSpec
   | RouteSpec
-  | MarketSpec;
+  | MarketSpec
+  | PluginSpec
+  | BiliSpec;
 
 export type IuiType = IuiSpec["type"];
 
@@ -273,6 +278,20 @@ export const IUI_TYPES: readonly IuiType[] = [
   "kline",
   "intraday",
   "stocklist",
+  // OCV5-393: plugin-only components; their definitions reach the model only with the plugin (pluginSchema.ts).
+  "weibo_posts",
+  "weibo_hot",
+  "zhihu_hot",
+  "zhihu_answers",
+  "feishu_events",
+  "feishu_doc",
+  // OCV5-402: 哔哩哔哩插件组件（biliSchema.ts），同样只随插件进上下文。
+  "bili_videos",
+  "bili_rank",
+  "bili_video",
+  "bili_comments",
+  "bili_danmaku",
+  "bili_subtitle",
 ];
 
 export type ValidateResult =
@@ -1181,6 +1200,8 @@ const VALIDATORS: Record<IuiType, (raw: Record<string, unknown>, ctx: Ctx) => Iu
   outline,
   draft,
   ...MARKET_VALIDATORS,
+  ...PLUGIN_VALIDATORS,
+  ...BILI_VALIDATORS,
 };
 
 /** 常见别名(模型偶尔写成其它名字)。 */
@@ -1225,6 +1246,8 @@ const TYPE_ALIASES: Record<string, IuiType> = {
   email: "draft",
   copy: "draft",
   ...MARKET_ALIASES,
+  ...PLUGIN_ALIASES,
+  ...BILI_ALIASES,
 };
 
 export function resolveType(raw: unknown): IuiType | null {

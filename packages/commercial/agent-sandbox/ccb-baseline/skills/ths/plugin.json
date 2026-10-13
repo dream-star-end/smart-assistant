@@ -25,7 +25,8 @@
         "description": "同花顺行情命令行；默认输出 JSON，加 --ui 输出智能 UI 组件块"
       }
     ],
-    "data": [{ "path": "references/sectors.json", "description": "526 个行业与概念板块注册表" }]
+    "data": [{ "path": "references/sectors.json", "description": "526 个行业与概念板块注册表" }],
+    "ui": [{ "types": ["quote", "kline", "intraday", "stocklist"], "emit": "cli" }]
   },
   "auth": {
     "mode": "none",

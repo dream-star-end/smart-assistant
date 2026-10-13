@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 import { launchJourneyBrowser } from "./lib/journey-browser.mjs";
 import { CASES, TOTAL_TIMEOUT, parseOptions, engineMatrix, tapResult } from "./lib/user-contract.mjs";
-import { coldUiLogin, newSession, installTurnProbe, selectJourneyModel, sendContractTurn, contractEvidenceBase } from "./lib/user-contract-browser.mjs";
+import { coldUiLogin, newSession, installTurnProbe, selectJourneyModel, sendContractTurn, runContinuationTurns, contractEvidenceBase } from "./lib/user-contract-browser.mjs";
 let browser, page, current = 0, stepStart = performance.now();
 const timings = [];
 console.log("TAP version 13\n1..3");
@@ -63,7 +63,7 @@ try {
       await newSession(page);
       await selectJourneyModel(page, id);
       console.log(`# route model=${id} engine=${engine} cost=${options.cost}`);
-      await sendContractTurn(page, probe, { model: id, engine, catalog: latest, cost: options.cost });
+      await runContinuationTurns(page, probe, { model: id, engine, catalog: latest, cost: options.cost });
     }
   });
   console.log(`# timings_ms ${JSON.stringify(timings.map(Math.round))}`);

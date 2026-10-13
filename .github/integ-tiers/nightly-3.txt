@@ -4,6 +4,7 @@
 # max-minutes: 30
 packages/commercial/src/__tests__/connectorsDeclarativeVertical.integ.test.ts
 packages/commercial/src/__tests__/connectorsMarketplace.integ.test.ts
+packages/commercial/src/__tests__/connectorsOfficialBili.integ.test.ts
 packages/commercial/src/__tests__/connectorsOauth2Flow.integ.test.ts
 packages/commercial/src/__tests__/connectorsPlatformOauth.integ.test.ts
 packages/commercial/src/__tests__/connectorsRpcDeclarative.integ.test.ts

@@ -246,8 +246,33 @@ describe('classifyRunError', () => {
     }
   })
 
-  it('model_not_available: provider says try a different model (bare + JSON wrap)', () => {
+  it('OCV5-407: Codex at-capacity + try a different model is model_capacity (bare + JSON wrap)', () => {
+    // Exact production text (commercial uid 4, dispatch 2e11133a, 2026-10-13).
     const bare = 'Selected model is at capacity. Please try a different model.'
+    const wrapped = JSON.stringify({
+      subtype: 'error_during_execution',
+      result: bare,
+    })
+    for (const raw of [bare, wrapped, `[turn failed: ${bare}]`]) {
+      const r = classifyRunError(raw)
+      assert.equal(r.code, 'model_capacity', raw)
+      assert.equal(r.message, '模型繁忙，请稍后重试或切换模型')
+    }
+  })
+
+  it('OCV5-407: any capacity word keeps try a different model on model_capacity', () => {
+    for (const raw of [
+      'The model is overloaded. Please try a different model.',
+      'API Error: 529 Please try a different model',
+      'Model is busy right now, try a different model.',
+      'Capacity limit exceeded; try a different model.',
+    ]) {
+      assert.equal(classifyRunError(raw).code, 'model_capacity', raw)
+    }
+  })
+
+  it('model_not_available: try a different model without capacity wording stays deterministic', () => {
+    const bare = 'This model has been retired. Please try a different model.'
     const wrapped = JSON.stringify({
       subtype: 'error_during_execution',
       result: bare,

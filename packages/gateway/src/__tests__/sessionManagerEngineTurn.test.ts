@@ -659,8 +659,10 @@ describe("crash/interrupt partial persistence", () => {
       const events: SessionStreamEvent[] = [];
       const runner = new FakeCcbRunner((r) => setImmediate(() => r.result({
         is_error: true, subtype: "error_during_execution",
-        // Real CCB result has raw text only, not a forged conflicting class.
-        result: "Selected model is at capacity. Please try a different model.",
+        // Real CCB result has raw text only, not a forged conflicting class. OCV5-407: the
+        // Codex at-capacity wording is a capacity retry now (covered by the capacity tests
+        // below); "try a different model" without capacity wording stays deterministic.
+        result: "This model is not available for this account. Please try a different model.",
       })));
       const session = makeSession(runner, { channel: "webchat", userId: "user-1" } as Partial<AgentSession>);
       await sm.submit(session, "finish task", (event) => events.push(event));

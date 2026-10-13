@@ -9,6 +9,11 @@ import {
   marketplaceReviewSource,
 } from '@openclaude/protocol'
 import { isDefaultConnectorArtifact, isDefaultConnectorSlug } from '../connectors/defaults/index.js'
+import {
+  OFFICIAL_MARKET_CONNECTORS,
+  OFFICIAL_MARKET_CONNECTOR_SLUGS,
+  isOfficialConnectorArtifact,
+} from '../connectors/official/index.js'
 import { projectSignedConnectorContract } from '../connectors/spec/projection.js'
 import {
   isAcceptedFunctionalVerificationState,
@@ -41,6 +46,12 @@ import {
   ZHIHU_PLUGIN_VERSION,
   isOfficialZhihuPluginIdentity,
 } from '../plugins/zhihuContract.js'
+import {
+  BILI_ACCOUNT_PLUGIN_SLUG,
+  BILI_ACCOUNT_PLUGIN_VERSION,
+  COMPILED_BILI_ACCOUNT_PLUGIN,
+  isOfficialBiliAccountPluginIdentity,
+} from '../plugins/biliAccountContract.js'
 import {
   lockMarketplaceListing,
   lockMarketplaceMutationSet,
@@ -586,7 +597,13 @@ async function publishSkillVersionInternal(
     throw new MarketplaceError('VERSION_NOT_FOUND', 'missing artifact content')
   if (
     isDefaultConnectorSlug(input.slug) ||
-    ([KNOWLEDGE_PLANET_PLUGIN_SLUG, WEIBO_PLUGIN_SLUG, ZHIHU_PLUGIN_SLUG].includes(input.slug) &&
+    ([
+      KNOWLEDGE_PLANET_PLUGIN_SLUG,
+      WEIBO_PLUGIN_SLUG,
+      ZHIHU_PLUGIN_SLUG,
+      BILI_ACCOUNT_PLUGIN_SLUG,
+      ...OFFICIAL_MARKET_CONNECTOR_SLUGS,
+    ].includes(input.slug) &&
       !allowOfficialKnowledgePlanetSeed)
   )
     throw new MarketplaceError(
@@ -760,6 +777,51 @@ export async function publishOfficialZhihuVersion(
     throw new MarketplaceError(
       'ARTIFACT_MISMATCH',
       'Zhihu platform seed identity does not match the pinned artifact',
+    )
+  return publishSkillVersionInternal(input, true)
+}
+
+/** Narrow platform-seed bypass for the exact version-controlled Bilibili account artifact (OCV5-402). */
+export async function publishOfficialBiliAccountVersion(
+  input: PublishInput,
+): Promise<{ versionId: string }> {
+  if (
+    input.slug !== BILI_ACCOUNT_PLUGIN_SLUG ||
+    input.version !== BILI_ACCOUNT_PLUGIN_VERSION ||
+    input.kind !== 'connector' ||
+    input.pluginType !== 'managed-browser' ||
+    input.artifactHash !== COMPILED_BILI_ACCOUNT_PLUGIN.artifactHash ||
+    input.submittedBy !== input.ownerUserId ||
+    input.queueAiReview !== false
+  )
+    throw new MarketplaceError(
+      'ARTIFACT_MISMATCH',
+      'Bilibili account platform seed identity does not match the pinned artifact',
+    )
+  return publishSkillVersionInternal(input, true)
+}
+
+/**
+ * Narrow platform-seed bypass for the exact version-controlled official market connectors
+ * (`connectors/official/`, OCV5-402: `bili`). Slug, version, artifact hash and plugin type
+ * must all match the code constant; the version enters review as pending without AI queueing.
+ */
+export async function publishOfficialMarketConnectorVersion(
+  input: PublishInput,
+): Promise<{ versionId: string }> {
+  const official = OFFICIAL_MARKET_CONNECTORS.find((c) => c.slug === input.slug)
+  if (
+    official === undefined ||
+    input.version !== official.version ||
+    input.kind !== 'connector' ||
+    input.pluginType !== 'declarative-http' ||
+    !isOfficialConnectorArtifact(input.slug, input.artifactHash) ||
+    input.submittedBy !== input.ownerUserId ||
+    input.queueAiReview !== false
+  )
+    throw new MarketplaceError(
+      'ARTIFACT_MISMATCH',
+      'official connector seed identity does not match the pinned artifact',
     )
   return publishSkillVersionInternal(input, true)
 }
@@ -1454,6 +1516,13 @@ export async function listApprovedForSearch(
           artifactHash: x.artifact_hash,
           execContractHash: verifiedRuntime?.execContractHash ?? null,
           reviewSource: x.review_source,
+        }) ||
+        isOfficialBiliAccountPluginIdentity({
+          slug: x.slug,
+          pluginType: x.plugin_type,
+          artifactHash: x.artifact_hash,
+          execContractHash: verifiedRuntime?.execContractHash ?? null,
+          reviewSource: x.review_source,
         }))
     out.push({
       versionId: x.id,
@@ -1705,6 +1774,13 @@ export async function getListingDetail(
               reviewSource: x.review_source,
             }) ||
             isOfficialZhihuPluginIdentity({
+              slug: x.slug,
+              pluginType: x.plugin_type,
+              artifactHash: x.artifact_hash,
+              execContractHash: verifiedRuntimeExecContractHash,
+              reviewSource: x.review_source,
+            }) ||
+            isOfficialBiliAccountPluginIdentity({
               slug: x.slug,
               pluginType: x.plugin_type,
               artifactHash: x.artifact_hash,

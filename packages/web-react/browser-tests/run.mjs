@@ -2147,8 +2147,20 @@ await check("T68 390px 触屏:助手一击复制原文，更多菜单默认关�
   // Clipboard is Chromium's real API; neither writeText nor the formatter is stubbed.
   await mobileContext.grantPermissions(["clipboard-read", "clipboard-write"], { origin: "http://127.0.0.1" });
   const wideAssistant = mobilePage.getByTestId("assistant-row").filter({ hasText: "MOBILE_ASSISTANT_TAIL_MARKER" });
-  if (!(await wideAssistant.getByRole("button", { name: "复制", exact: true }).last().isVisible())) {
-    throw new Error("之前完成态宽内容助手行的一击复制入口消失");
+  // 等到可见再判（OCV5-408）：上面刚收起用户行、授予剪贴板权限，CI 慢时这一行的动作区可能还在重渲染，
+  // 瞬时 isVisible() 会偶发判为不可见。仍要求 3s 内可见，超时就是真回归，并带上该行按钮现状。
+  const wideCopy = wideAssistant.getByRole("button", { name: "复制", exact: true }).last();
+  try {
+    await wideCopy.waitFor({ state: "visible", timeout: 3000 });
+  } catch {
+    const actions = await wideAssistant
+      .evaluate((node) =>
+        [...node.querySelectorAll("button")]
+          .map((b) => `${b.getAttribute("aria-label") ?? b.textContent?.trim()}:${b.checkVisibility() ? "visible" : "hidden"}`)
+          .join(", "),
+      )
+      .catch((e) => `row unavailable: ${e.message}`);
+    throw new Error(`之前完成态宽内容助手行的一击复制入口消失(3s 内未出现;该行按钮:${actions})`);
   }
   const assistantRow = mobilePage.getByTestId("assistant-row").filter({ hasText: "MOBILE-ASSISTANT-COPY-FIXTURE" });
   const assistantCopy = assistantRow.getByRole("button", { name: "复制", exact: true });

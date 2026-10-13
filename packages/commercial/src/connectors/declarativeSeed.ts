@@ -60,10 +60,21 @@ export interface SeedResult {
   skipped: string[]
 }
 
-export async function seedDefaultConnectors(pool: Pool = getPool()): Promise<SeedResult> {
+/**
+ * 连接器 seed 的两个系统主体(作者 / 审核员,author≠reviewer)。官方市场连接器 seed
+ * (`marketplace/seedOfficialConnectors.ts`,OCV5-402)复用同一对主体,不另造信任旁路。
+ */
+export async function ensureConnectorSeedPrincipals(
+  pool: Pool = getPool(),
+): Promise<{ author: number; reviewer: number }> {
   assertFlavorIdentity()
   const author = await ensureSystemUser(SEED_AUTHOR_EMAIL, 'user', pool)
   const reviewer = await ensureSystemUser(SEED_REVIEWER_EMAIL, 'admin', pool)
+  return { author, reviewer }
+}
+
+export async function seedDefaultConnectors(pool: Pool = getPool()): Promise<SeedResult> {
+  const { author, reviewer } = await ensureConnectorSeedPrincipals(pool)
   const seeded: string[] = []
   const skipped: string[] = []
 

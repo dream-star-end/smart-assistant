@@ -260,6 +260,7 @@ function git(args: string[]): string {
 }
 
 // 假 ssh:只回答 deploy-v5.sh egress surface gate 的两次只读查询(egress 进程 cwd、release sourceCommit)。
+// OCV5-391:egress 进程 cwd 经 scripts/v5-egress-slots.sh active 读取(legacy 或双槽之一)。
 function preflightFixture(egressSha: string): {
   env: NodeJS.ProcessEnv
   queue: (args: string[]) => ReturnType<typeof spawnSync>
@@ -272,7 +273,7 @@ function preflightFixture(egressSha: string): {
     path.join(bin, 'ssh'),
     `#!/usr/bin/env bash
 case "$*" in
-  *MainPID*) printf '%s\\n' /opt/openclaude/openclaude-v5-releases/rel-egress-fixture ;;
+  *"bash -s -- active"*) printf '%s\\n' 'openclaude-v5-egress@A.service 4242 /opt/openclaude/openclaude-v5-releases/rel-egress-fixture' ;;
   *sourceCommit*) printf '%s\\n' "$FAKE_EGRESS_SHA" ;;
   *) exit 97 ;;
 esac

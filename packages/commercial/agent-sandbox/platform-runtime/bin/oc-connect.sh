@@ -16,6 +16,7 @@ Commands:
   list                                    列出已绑定的插件账号与可用操作
   catalog [query]                         列出可绑定的插件(可选关键词搜索)
   call <provider> <action> [options]      调用某连接的操作(params 从 stdin 读 JSON)
+  describe <provider> [<action>]          查看操作列表,或某个操作的完整说明与参数结构
 
 Options (call):
   --account <connectionId>   指定连接(同一 provider 有多个连接时必填)

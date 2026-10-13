@@ -5,6 +5,7 @@
  * are appended next to the existing `code`. Unknown codes keep the historical
  * CONNECTION_ERROR fallback; messages never include pin/hash/DNS internals.
  */
+import { BILI_ACCOUNT_FAILURE_CODES } from './biliAccountObservability.js'
 import { WEIBO_WRITE_FAILURE_CODES } from './weiboWriteObservability.js'
 import { ZHIHU_WRITE_FAILURE_CODES } from './zhihuWriteObservability.js'
 
@@ -39,6 +40,7 @@ export const UNKNOWN_WRITE_NEXT_ACTION =
 export const PLUGIN_PASSTHROUGH_ERROR_CODES = [
   ...WEIBO_WRITE_FAILURE_CODES,
   ...ZHIHU_WRITE_FAILURE_CODES,
+  ...BILI_ACCOUNT_FAILURE_CODES,
   'LOGIN_EXPIRED',
   'LOGIN_EXPIRED_ACCOUNT',
   'PRECONDITION_CHANGED',
@@ -433,6 +435,43 @@ const ROWS: Record<string, Row> = {
     message: '知乎工作器未正常结束',
     nextAction: '工作器未完成且未发送，可稍后重试',
   },
+  // OCV5-402 · 哔哩哔哩账号插件(只读,没有写副作用)。
+  BILI_ACCOUNT_ACTION_FAILED: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: 'B 站账号插件读取失败',
+    nextAction: '可以再试一次;仍失败时引导用户在 管理中心 → 插件 重新扫码登录 B 站',
+  },
+  BILI_ACCOUNT_UPSTREAM_CHALLENGE: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: 'B 站触发了风控验证,无法自动继续',
+    nextAction: '如实告诉用户稍后再试,不要自动重试,也不要索要 cookie',
+  },
+  BILI_ACCOUNT_LOGIN_UNSUPPORTED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: 'B 站返回的登录凭据无法安全保存,本次登录未生效',
+    nextAction: '告诉用户这是平台侧限制,不要反复扫码;请联系管理员',
+  },
+  BILI_ACCOUNT_WORKER_BUSY: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: 'B 站账号插件正忙',
+    nextAction: '请稍后重试',
+  },
+  BILI_ACCOUNT_WORKER_DEADLINE: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: 'B 站账号插件执行超时',
+    nextAction: '只读操作,可稍后重试',
+  },
+  BILI_ACCOUNT_WORKER_INCOMPLETE: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: 'B 站账号插件未正常结束',
+    nextAction: '只读操作,可稍后重试',
+  },
   PLUGIN_RUNTIME_UNAVAILABLE: {
     retrySafe: 'yes',
     requiresReauth: false,
@@ -512,6 +551,33 @@ const ROWS: Record<string, Row> = {
     message: '请求参数无效',
     nextAction: '请修正参数后重试，不要原样重放',
   },
+  // API 插件 / 连接器：参数不合签名的参数结构、上游拒绝凭据（401/403、IMAP 登录失败、换 token 失败等）、
+  // 上游限流、结果超过平台硬限。措辞不假设具体鉴权方式；某个插件专属的说明写在它自己的说明里。
+  VALIDATION_FAILED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '参数不符合该操作的参数结构',
+    nextAction: '先用 oc-connect describe <插件> <操作> 查看参数名、类型和必填项，修正后再调用',
+  },
+  UPSTREAM_AUTH_FAILED: {
+    retrySafe: 'after_reauth',
+    requiresReauth: true,
+    message: '插件服务拒绝了凭据：凭据无效、已过期或被撤销，或额度/配额已用完',
+    nextAction:
+      '请提示用户检查该插件的凭据（Token、授权或账号密码）是否有效、额度或配额是否用完，必要时到 管理中心 → 插件 重新绑定或填写；不要自动重试',
+  },
+  UPSTREAM_RATE_LIMITED: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: '插件服务限流（HTTP 429）',
+    nextAction: '稍后再试，不要立即连打；持续出现时提示用户检查该插件的配额',
+  },
+  RESULT_TOO_LARGE: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '结果超过单次返回上限',
+    nextAction: '缩小查询范围、减少条数或分批读取后重试，不要原样重放',
+  },
   PLUGIN_DISABLED: {
     retrySafe: 'no',
     requiresReauth: false,
@@ -564,6 +630,10 @@ export function weiboRuntimePublicMessage(code: string): string {
 }
 
 export function zhihuRuntimePublicMessage(code: string): string {
+  return resolvePluginErrorGuidance({ code }).message
+}
+
+export function biliAccountRuntimePublicMessage(code: string): string {
   return resolvePluginErrorGuidance({ code }).message
 }
 

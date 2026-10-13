@@ -1,20 +1,28 @@
 ---
 name: app-connectors
-description: 用 `oc-connect` 与 `oc-plugin` 访问用户绑定的第三方应用和已安装插件：邮件、WebDAV、Notion、GitHub、飞书、知识星球、微博和知乎；支持微博消息、私信、搜索、关系、收藏及受控写入。用户要访问这些外部应用时使用。
-tags: [connectors, plugins, email, webdav, notion, github, feishu, calendar, zsxq, knowledge-planet, weibo, zhihu, social]
+description: 用 `oc-connect` 与 `oc-plugin` 访问用户绑定的第三方应用和已安装插件：邮件、WebDAV、Notion、GitHub、飞书、知识星球、微博、知乎和 B 站；支持微博消息、私信、搜索、关系、收藏及受控写入。用户要访问这些外部应用时使用。
+tags: [connectors, plugins, email, webdav, notion, github, feishu, calendar, zsxq, knowledge-planet, weibo, zhihu, bilibili, social]
 ---
 
 # app-connectors 插件(CLI)
 
 访问用户在管理中心绑定的第三方账号。对用户一律把这些统称为「插件」，绑定 / 授权入口是「管理中心 → 插件」
 （不要换成别的叫法，界面上只有「插件」）。平台在服务端托管全部凭据与浏览器登录状态：
-- API 插件（邮箱、WebDAV、Notion、GitHub、飞书）用 `oc-connect`；
-- 浏览器插件（知识星球、微博、知乎）用 `oc-plugin`。
+- API 插件（邮箱、WebDAV、Notion、GitHub、飞书、B 站公开数据 bili）用 `oc-connect`；
+- 浏览器插件（知识星球、微博、知乎、B 站账号 bili-account）用 `oc-plugin`。
 
 **不要让用户提供账号 ID 或手工挑 action**：先自行执行 `list` 发现能力；同一 provider/插件
 只有一个可用账号时直接调用。仅在多个账号必须消歧、未安装或未授权时才请用户介入。
 API 插件写操作必须逐次确认；受管浏览器插件以 `oc-plugin list` 显示的写入模式为准：
 `逐次确认`会展示确认卡，`账号免逐次确认`会直接执行。**不要再口头问一次“要我执行吗”**。
+
+## 结果展示：插件专属组件（按需读取）
+
+微博、知乎、飞书各有专属的展示组件，定义不在系统提示里。在网页对话里要展示其中某个插件的结果时，
+先用 Read 读本技能目录下对应的定义文件，每个对话读一次即可，然后按定义写 ```ui 块：
+微博 `references/ui-weibo.md`，知乎 `references/ui-zhihu.md`，飞书 `references/ui-feishu.md`，B 站 `references/ui-bili.md`。
+本技能目录就是加载时给出的 Base directory，通常是 `/run/oc/claude-config/skills/app-connectors`。
+没有 Intelligent UI 协议时（例如微信、定时任务）不要读这些文件，也不要写这些块。
 
 ## 用法
 
@@ -26,6 +34,10 @@ oc-connect catalog notion        # 关键词搜索
 
 # 列出已绑定连接 + 每个连接可用的 actions(含 readOnly 标记)。未绑定时会输出引导文案。
 oc-connect list
+
+# 动作多或不确定参数时，按需查看某个 action 的完整说明与参数结构(JSON Schema)，再调用。
+oc-connect describe gnss-x               # 只列这个插件的 actions(一行摘要)
+oc-connect describe gnss-x gpst_utc      # 完整说明 + 参数名/类型/必填项
 
 # 调用一个 action:params 走 stdin(JSON)
 echo '{"path":"/"}' | oc-connect call webdav list_dir
@@ -149,6 +161,14 @@ echo '{}' | oc-plugin call knowledge-planet create_topic --confirm <确认码>
 6. 返回 `in_progress`=已在执行别催;`replay`=该确认码已执行过,**不要**再原样重发一单。
    尤其 `replay.status=unknown` 表示可能已经写入：先让用户到知识星球核实，绝不自动重试。
 
+### B 站（哔哩哔哩）
+
+两个插件都只在 AI 市场，用户没装时先引导去安装：
+- `bili`：公开数据，免登录、只读。安装后在 管理中心 → 插件 点「启用」。`oc-connect call bili <action>`：
+  search / video / rank / popular / comments / danmaku。评论要 aid、弹幕要 cid，先调 video 拿；参数看 `oc-connect describe bili <action>`。
+- `bili-account`：字幕、收藏夹、观看历史，要用 B 站 App 扫码登录（同微博的扫码流程）。用 `oc-plugin call bili-account <action>`。
+- 报 UPSTREAM_RATE_LIMITED（B 站风控）时如实告诉用户稍后再试，不要连续重试，也不要索要 cookie。
+
 ## 各 provider 一览
 
 | provider | 读 | 写(需确认) |
@@ -162,6 +182,21 @@ echo '{}' | oc-plugin call knowledge-planet create_topic --confirm <确认码>
 用户没绑定对应 API 应用时，引导到 管理中心 → 插件；知识星球或微博未安装时先引导到 AI 市场安装，
 安装后分别使用微信或微博客户端扫码授权。二维码在对话框内看不到时，引导用户打开界面提供的独立
 网页链接；不要把临时二维码图片当永久链接。不要空转重试，也不要索要 cookie/token。
+
+## 市场 API 插件(以 GNSS-X 地学工具为例)
+
+用户从 AI 市场安装并在「管理中心 → 插件」填好 Token 后，`oc-connect list` 才会出现 `gnss-x`。
+它提供 60 个只读的地学计算/查询 action(时间系统、坐标、轨道、电离层、空间天气、大气、重力、
+海洋、GNSS、测量平差、电波传播)，action 名就是 GNSS-X 的工具名。
+
+- 先 `oc-connect describe gnss-x <action>` 看参数，再 `echo '<JSON>' | oc-connect call gnss-x <action>`；
+  矩阵、剖面、坐标对象等复杂输入按说明以 **JSON 字符串**传。
+- 结果是 JSON-RPC 外壳：数据在 `result`(通常是 `result.content[].text`)；出现 `error` 就如实转告。
+- `UPSTREAM_AUTH_FAILED`(HTTP 401)或 `error.code=-32001`：Token 无效、被撤销或该工具配额用完。
+  请用户到 https://mcp.gnss-x.ac.cn 「用户」页检查 Token 和剩余配额，必要时在「管理中心 → 插件」
+  重新填写；不要自动重试。用户还没有 Token 时，说明需要他本人去该网站注册并领取，平台不代领。
+- `RESULT_TOO_LARGE`：缩小时间/高度范围、增大步长或减少条数后重试。
+- 每次调用都消耗用户在 GNSS-X 的配额，只调用回答问题所需的 action，不要批量试探。
 
 ## 工具调用纪律(重要)
 

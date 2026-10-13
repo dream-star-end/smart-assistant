@@ -20,6 +20,7 @@ import { Value } from '@sinclair/typebox/value'
 import type { Pool } from 'pg'
 import { type QueryRunner, tx } from '../../db/queries.js'
 import { isDefaultConnectorArtifact } from '../defaults/index.js'
+import { contractNeedsOfficialArtifact, isOfficialConnectorArtifact } from '../official/index.js'
 import { canonicalSha256Hex } from './canonical.js'
 import { COMPILER_VERSION, compileSpec } from './compiler.js'
 import {
@@ -145,6 +146,15 @@ export async function securityApproveWithRunner(
   // spec.id 必须 == listing.slug(防挂靠他人 slug)。
   if ((rawSpec as { id?: unknown }).id !== row.slug)
     throw new ConnectorSpecError('SPEC_ID_MISMATCH', 'spec.id != listing slug')
+  // authMode none / builtin 只对平台官方工件的精确 hash 开放(OCV5-402):签名前收口。
+  if (
+    contractNeedsOfficialArtifact(compiled.execContract) &&
+    !isOfficialConnectorArtifact(row.slug, row.artifact_hash)
+  )
+    throw new ConnectorSpecError(
+      'BUILTIN_PLATFORM_ONLY',
+      'authMode none and builtins are reserved for an exact official connector artifact',
+    )
 
   const sig = signLegacyConnectorContract(
     {
@@ -325,6 +335,29 @@ export interface VerifiedContract {
   execContractHash: string
   authContractVersion: number
   pluginType: 'declarative-http'
+  /**
+   * 作者写的动作说明(键=action id),取自已过 artifact_hash 校验的原始工件,只含 contract 里有的
+   * action。给 Agent 按需查看(oc-connect describe);不参与执行。
+   */
+  actionDescriptions?: Readonly<Record<string, string>>
+}
+
+/** 从已校验 hash 的原始 ConnectorSpec 工件里取 contract 动作的说明;形状不对的条目跳过。 */
+function actionDescriptionsOf(
+  rawArtifact: unknown,
+  contract: ExecContractT,
+): Record<string, string> {
+  const ids = new Set(contract.actions.map((action) => action.id))
+  const out: Record<string, string> = Object.create(null)
+  const actions = (rawArtifact as { actions?: unknown } | null)?.actions
+  if (!Array.isArray(actions)) return out
+  for (const action of actions) {
+    const id = (action as { id?: unknown } | null)?.id
+    const description = (action as { description?: unknown } | null)?.description
+    if (typeof id === 'string' && ids.has(id) && typeof description === 'string')
+      out[id] = description
+  }
+  return out
 }
 
 interface StoredContractRow {
@@ -430,6 +463,15 @@ function verifyStoredContractRow(
       'platform-managed OAuth is reserved for an exact built-in connector artifact',
     )
   }
+  // 载入期再收口一次(OCV5-402):库里即便有人绕过审核写进了用 none / builtin 的契约,也执行不了。
+  if (
+    contractNeedsOfficialArtifact(execContract as ExecContractT) &&
+    !isOfficialConnectorArtifact(row.slug, row.artifact_hash)
+  )
+    throw new ConnectorSpecError(
+      'BUILTIN_PLATFORM_ONLY',
+      'authMode none and builtins are reserved for an exact official connector artifact',
+    )
 
   const recomputedHash = canonicalSha256Hex(execContract)
   const storedHashHex = Buffer.from(row.exec_contract_hash).toString('hex')
@@ -467,6 +509,7 @@ function verifyStoredContractRow(
     execContractHash: recomputedHash,
     authContractVersion: (execContract as ExecContractT).auth_contract_version,
     pluginType: row.plugin_type,
+    actionDescriptions: actionDescriptionsOf(rawArtifact, execContract as ExecContractT),
   }
 }
 

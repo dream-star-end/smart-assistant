@@ -160,6 +160,31 @@ describe('agent Plugin blueprint compiler', () => {
     }
   })
 
+  test('identity.failurePointers 原样签进 spec 与权限摘要；非 JSON pointer 被拒', () => {
+    const compiled = compilePluginBlueprint(
+      blueprint({
+        identity: { actionId: 'whoami', accountKeyPointer: '/id', failurePointers: ['/error'] },
+      }),
+    )
+    assert.deepEqual((compiled.spec as { identity: unknown }).identity, {
+      probeActionId: 'whoami',
+      accountKeyPointer: '/id',
+      failurePointers: ['/error'],
+    })
+    const prepared = prepareConnectorPublish(compiled)
+    assert.equal(prepared.ok, true)
+    if (prepared.ok)
+      assert.deepEqual(prepared.permissionSummary.identity?.failurePointers, ['/error'])
+    for (const failurePointers of [['error'], [], ['/a', '/b', '/c', '/d', '/e']])
+      assert.throws(
+        () =>
+          compilePluginBlueprint(
+            blueprint({ identity: { actionId: 'whoami', accountKeyPointer: '/id', failurePointers } }),
+          ),
+        (error: unknown) => error instanceof PluginBlueprintError,
+      )
+  })
+
   test('拒绝未知字段、未声明参数引用和非固定 origin；不接受任何凭据值字段', () => {
     for (const bad of [
       blueprint({ token: 'secret' }),

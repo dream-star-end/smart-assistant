@@ -170,20 +170,22 @@ describe("diff", () => {
 });
 
 describe("render · round 3", () => {
-  it("sources number each link, open it in a new tab without a referrer, fold long lists", () => {
+  it("sources render every item as Markdown, link the titled ones in a new tab without a referrer, and do not fold or use a card", () => {
     const items = Array.from({ length: 9 }, (_, i) => ({ title: `来源 ${i + 1}`, url: `https://s${i}.example.com/p`, date: "2026-10" }));
     items[2] = { title: "内部纪要", url: undefined as unknown as string, date: "2026-09" };
-    render(<IuiBlock code={j({ type: "sources", items })} />);
+    const { container } = render(<IuiBlock code={j({ type: "sources", items })} />);
     expect(screen.getByText("参考来源")).toBeInTheDocument();
-    const first = screen.getByRole("link", { name: /^1\. 来源 1\W*s0\.example\.com\W*在新标签页打开$/ });
+    const first = screen.getByRole("link", { name: "来源 1" });
     expect(first).toHaveAttribute("href", "https://s0.example.com/p");
+    // BodyMarkdown 外链:target=_blank,rel 只有 noreferrer(没有 noopener)。
     expect(first).toHaveAttribute("target", "_blank");
-    expect(first).toHaveAttribute("rel", "noreferrer noopener");
-    expect(screen.getByText("内部纪要").closest("a")).toBeNull();
-    // 9 个来源:先显示 5 个,展开看全部
-    expect(screen.getAllByRole("listitem")).toHaveLength(5);
-    fireEvent.click(screen.getByRole("button", { name: "显示全部 9 个来源" }));
+    expect(first).toHaveAttribute("rel", "noreferrer");
+    expect(screen.getByText(/内部纪要/).closest("a")).toBeNull();
     expect(screen.getAllByRole("listitem")).toHaveLength(9);
+    expect(screen.queryByRole("button", { name: /显示全部/ })).toBeNull();
+    expect(container.querySelector(".oc-iui-source-num")).toBeNull();
+    // Frame 根节点是 figure.oc-iui.oc-iui-card;普通 Markdown 不再套这层卡片。
+    expect(container.querySelector(".oc-iui-card")).toBeNull();
   });
 
   it("outline expands and collapses branches, can expand everything and switch to a mind map", () => {
