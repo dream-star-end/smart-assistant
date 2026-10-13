@@ -144,6 +144,10 @@ describe('oc-connect list', () => {
     assert.match(r.stdout, /id: 11/)
     assert.match(r.stdout, /list_dir\s+\[只读\]\s+列目录/)
     assert.match(r.stdout, /put_file\s+\[写·需确认\]\s+上传文件/)
+    assert.match(
+      r.stdout.trimEnd().split('\n').at(-1) ?? '',
+      /^提示：浏览器插件（.*bili-account.*）不在 oc-connect 中，用 oc-plugin list 查看并用 oc-plugin call 调用。$/,
+    )
   })
 
   test('empty connections → 引导文案', async () => {
@@ -152,7 +156,7 @@ describe('oc-connect list', () => {
     assert.equal(r.exitCode, 0)
     assert.equal(
       r.stdout,
-      '当前未绑定任何插件账号。请告知用户前往 管理中心 → 插件 绑定后重试。\n',
+      '当前未绑定任何 API 插件账号。浏览器插件（微博、知乎、知识星球、B 站账号 bili-account 等）不在 oc-connect 中，用 oc-plugin list 查看并用 oc-plugin call 调用。两处都没有时，请告知用户前往 管理中心 → 插件 绑定后重试。\n',
     )
   })
 })
@@ -258,6 +262,7 @@ describe('oc-connect call — account resolution', () => {
     const r = await runOcConnectCli(['call', 'notion', 'search'], deps)
     assert.equal(r.exitCode, 1)
     assert.match(r.stderr, /未找到 provider=notion 的已绑定账号/)
+    assert.match(r.stderr, /用 oc-plugin list 查看/)
     assert.match(r.stderr, /管理中心 → 插件/)
   })
 

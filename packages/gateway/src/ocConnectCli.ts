@@ -62,20 +62,27 @@ interface CliSurface {
   catalogTitle: string
   catalogBindHint: string
   missingAccountHint: string
+  /** Appended to a non-empty list. Agents that only run oc-connect must still find browser Plugins. */
+  listFooter?: string
 }
+
+/** Browser Plugins live only on the oc-plugin surface; oc-connect points there instead of to rebinding. */
+const BROWSER_PLUGIN_POINTER =
+  '浏览器插件（微博、知乎、知识星球、B 站账号 bili-account 等）不在 oc-connect 中，用 oc-plugin list 查看并用 oc-plugin call 调用。'
 
 const CONNECTOR_SURFACE: CliSurface = {
   program: 'oc-connect',
   rpcSurface: 'connectors',
   listKey: 'connections',
   catalogKey: 'connectors',
-  emptyListText: '当前未绑定任何插件账号。请告知用户前往 管理中心 → 插件 绑定后重试。',
+  emptyListText: `当前未绑定任何 API 插件账号。${BROWSER_PLUGIN_POINTER}两处都没有时，请告知用户前往 管理中心 → 插件 绑定后重试。`,
   emptyCatalogText: '暂无可用的插件。',
   listTitle: '已绑定的插件账号:',
   catalogTitle: '可绑定的插件:',
   catalogBindHint:
     '（绑定需用户在 管理中心 → 插件 中填写凭据;凭据永不进入容器,你无法代为绑定,只能引导用户。）',
-  missingAccountHint: '请告知用户前往 管理中心 → 插件 绑定后重试。',
+  missingAccountHint: `${BROWSER_PLUGIN_POINTER}两处都没有时，请告知用户前往 管理中心 → 插件 绑定后重试。`,
+  listFooter: `提示：${BROWSER_PLUGIN_POINTER}`,
 }
 
 const PLUGIN_SURFACE: CliSurface = {
@@ -294,6 +301,7 @@ function formatConnections(connections: any[], surface: CliSurface): string {
     }
     lines.push('')
   }
+  if (surface.listFooter) lines.push(surface.listFooter)
   return lines.join('\n').replace(/\n+$/, '')
 }
 
@@ -354,7 +362,7 @@ async function resolveConnection(
   if (matches.length === 0) {
     const message =
       ctx.surface.rpcSurface === 'connectors'
-        ? `oc-connect: 未找到 provider=${provider} 的已绑定账号。请告知用户前往 管理中心 → 插件 绑定后重试。\n`
+        ? `oc-connect: 未找到 provider=${provider} 的已绑定账号。${ctx.surface.missingAccountHint}\n`
         : `oc-plugin: 未找到 provider=${provider} 的可用目标。${ctx.surface.missingAccountHint}\n`
     return { error: { exitCode: 1, stdout: '', stderr: message } }
   }

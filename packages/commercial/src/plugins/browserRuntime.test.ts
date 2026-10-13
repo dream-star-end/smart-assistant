@@ -17,7 +17,7 @@ import {
   makeManagedBrowserRequestGuard,
   resolveManagedBrowserPins,
 } from './browserRuntime.js'
-import type { ManagedBrowserPluginContractV1 } from './contracts.js'
+import { type ManagedBrowserPluginContractV1, RuntimePluginContractError } from './contracts.js'
 
 const contract: ManagedBrowserPluginContractV1 = {
   schemaVersion: 1,
@@ -312,6 +312,58 @@ describe('managed-browser Plugin runtime', () => {
     assert.ok(f.profile)
     const { lstat } = await import('node:fs/promises')
     assert.equal(await lstat(f.profile).catch(() => null), null)
+  })
+
+  test('read entry converts decimal-string ids for integer params; the write runner stays strict', async () => {
+    const idParams = {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        folderId: { type: 'integer', minimum: 1 },
+        bvid: { type: 'string', maxLength: 20 },
+      },
+      required: ['folderId'],
+    }
+    const idContract: ManagedBrowserPluginContractV1 = {
+      ...contract,
+      actions: [
+        { ...contract.actions[0]!, params: idParams },
+        { ...contract.actions[0]!, id: 'write', effect: 'write', params: idParams },
+      ],
+    }
+    const seen: Array<Record<string, unknown>> = []
+    const f = await fixture({
+      execute: async (args) => {
+        seen.push(args.params)
+        return { ok: true }
+      },
+    })
+    const call = (actionId: string, params: Record<string, unknown>) =>
+      f.runtime[actionId === 'write' ? 'runAction' : 'runReadAction']({
+        contract: idContract,
+        storageState,
+        actionId,
+        params,
+        signal: new AbortController().signal,
+      })
+    const input = { folderId: '80084770', bvid: '123' }
+    await call('read', input)
+    assert.deepEqual(seen, [{ folderId: 80084770, bvid: '123' }])
+    assert.deepEqual(input, { folderId: '80084770', bvid: '123' })
+    for (const folderId of ['0', '1.5', '007', ' 8', '99999999999999999', 'abc']) {
+      await assert.rejects(
+        call('read', { folderId }),
+        (error: unknown) =>
+          error instanceof RuntimePluginContractError && error.code === 'INVALID_PARAMS',
+        folderId,
+      )
+    }
+    await assert.rejects(
+      call('write', { folderId: '80084770' }),
+      (error: unknown) =>
+        error instanceof RuntimePluginContractError && error.code === 'INVALID_PARAMS',
+    )
+    assert.equal(seen.length, 1)
   })
 
   test('read-only entry point rejects writes while the internal action runner accepts a signed POST write', async () => {

@@ -5,6 +5,7 @@ import {
   REQUIRED_BROWSER_FORBIDDEN_CHANNELS,
   RUNTIME_PLUGIN_ARTIFACT_MAX_BYTES,
   RuntimePluginContractError,
+  coerceIntegerStringParams,
   compileRuntimePluginArtifact,
   validateRuntimePluginJson,
 } from './contracts.js'
@@ -321,5 +322,38 @@ describe('runtime Plugin contracts', () => {
         }),
       /array exceeds the item limit/,
     )
+  })
+})
+
+describe('coerceIntegerStringParams', () => {
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      folderId: { type: 'integer', minimum: 1 },
+      ratio: { type: 'number' },
+      bvid: { type: 'string' },
+      ids: { type: 'array', items: { type: 'integer' } },
+    },
+  }
+
+  test('rewrites only top-level integer properties holding a plain decimal safe integer', () => {
+    assert.deepEqual(coerceIntegerStringParams(schema, { folderId: '80084770', bvid: '42' }), {
+      folderId: 80084770,
+      bvid: '42',
+    })
+    assert.deepEqual(coerceIntegerStringParams(schema, { folderId: '-3' }), { folderId: -3 })
+    for (const value of ['007', '1.0', '1e3', ' 1', '0x10', '', '12345678901234567', '9007199254740993'])
+      assert.deepEqual(coerceIntegerStringParams(schema, { folderId: value }), { folderId: value }, value)
+  })
+
+  test('leaves number, string, array and undeclared keys alone and never mutates or copies needlessly', () => {
+    const untouched = { ratio: '1', ids: ['1'], extra: '5', folderId: 7 }
+    assert.equal(coerceIntegerStringParams(schema, untouched), untouched)
+    const input = { folderId: '9' }
+    const output = coerceIntegerStringParams(schema, input)
+    assert.notEqual(output, input)
+    assert.deepEqual(input, { folderId: '9' })
+    assert.equal(coerceIntegerStringParams({ type: 'string' }, input), input)
   })
 })
