@@ -54,6 +54,15 @@ export const PLUGIN_UI_COMPONENTS: readonly PluginUiComponentSet[] = Object.free
     types: ['zhihu_answers', 'zhihu_hot'],
   },
   {
+    // OCV5-402：公开数据（bili）与登录数据（bili-account）共用一套组件、一份定义文件。
+    plugin: 'bili',
+    displayName: '哔哩哔哩',
+    author: 'model',
+    skill: 'app-connectors',
+    doc: 'references/ui-bili.md',
+    types: ['bili_videos', 'bili_rank', 'bili_video', 'bili_comments', 'bili_danmaku', 'bili_subtitle'],
+  },
+  {
     plugin: 'feishu',
     displayName: '飞书',
     author: 'model',

@@ -441,6 +441,12 @@ const SKELETON_HEIGHT: Record<string, number> = {
   zhihu_answers: 320,
   feishu_events: 220,
   feishu_doc: 180,
+  bili_videos: 320,
+  bili_rank: 320,
+  bili_video: 300,
+  bili_comments: 320,
+  bili_danmaku: 260,
+  bili_subtitle: 300,
 };
 
 export function Skeleton({ kind }: { kind?: string }) {

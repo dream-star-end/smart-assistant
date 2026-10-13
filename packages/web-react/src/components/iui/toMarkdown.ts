@@ -5,6 +5,7 @@
  * 输出是普通 GFM(表格、列表、引用),任何 Markdown 阅读器都能读。
  */
 import { isNextBlockCode } from "../../lib/inputPrediction";
+import { biliToMarkdown } from "./biliMarkdown";
 import { computeOutputs } from "./formula";
 import { marketToMarkdown } from "./marketMarkdown";
 import { parseUiBlock } from "./parse";
@@ -331,6 +332,13 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
     case "feishu_events":
     case "feishu_doc":
       return pluginToMarkdown(spec);
+    case "bili_videos":
+    case "bili_rank":
+    case "bili_video":
+    case "bili_comments":
+    case "bili_danmaku":
+    case "bili_subtitle":
+      return biliToMarkdown(spec);
   }
 }
 

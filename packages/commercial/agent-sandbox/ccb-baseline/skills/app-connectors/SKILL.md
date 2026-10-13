@@ -1,15 +1,15 @@
 ---
 name: app-connectors
-description: 用 `oc-connect` 与 `oc-plugin` 访问用户绑定的第三方应用和已安装插件：邮件、WebDAV、Notion、GitHub、飞书、知识星球、微博和知乎；支持微博消息、私信、搜索、关系、收藏及受控写入。用户要访问这些外部应用时使用。
-tags: [connectors, plugins, email, webdav, notion, github, feishu, calendar, zsxq, knowledge-planet, weibo, zhihu, social]
+description: 用 `oc-connect` 与 `oc-plugin` 访问用户绑定的第三方应用和已安装插件：邮件、WebDAV、Notion、GitHub、飞书、知识星球、微博、知乎和 B 站；支持微博消息、私信、搜索、关系、收藏及受控写入。用户要访问这些外部应用时使用。
+tags: [connectors, plugins, email, webdav, notion, github, feishu, calendar, zsxq, knowledge-planet, weibo, zhihu, bilibili, social]
 ---
 
 # app-connectors 插件(CLI)
 
 访问用户在管理中心绑定的第三方账号。对用户一律把这些统称为「插件」，绑定 / 授权入口是「管理中心 → 插件」
 （不要换成别的叫法，界面上只有「插件」）。平台在服务端托管全部凭据与浏览器登录状态：
-- API 插件（邮箱、WebDAV、Notion、GitHub、飞书）用 `oc-connect`；
-- 浏览器插件（知识星球、微博、知乎）用 `oc-plugin`。
+- API 插件（邮箱、WebDAV、Notion、GitHub、飞书、B 站公开数据 bili）用 `oc-connect`；
+- 浏览器插件（知识星球、微博、知乎、B 站账号 bili-account）用 `oc-plugin`。
 
 **不要让用户提供账号 ID 或手工挑 action**：先自行执行 `list` 发现能力；同一 provider/插件
 只有一个可用账号时直接调用。仅在多个账号必须消歧、未安装或未授权时才请用户介入。
@@ -20,7 +20,7 @@ API 插件写操作必须逐次确认；受管浏览器插件以 `oc-plugin list
 
 微博、知乎、飞书各有专属的展示组件，定义不在系统提示里。在网页对话里要展示其中某个插件的结果时，
 先用 Read 读本技能目录下对应的定义文件，每个对话读一次即可，然后按定义写 ```ui 块：
-微博 `references/ui-weibo.md`，知乎 `references/ui-zhihu.md`，飞书 `references/ui-feishu.md`。
+微博 `references/ui-weibo.md`，知乎 `references/ui-zhihu.md`，飞书 `references/ui-feishu.md`，B 站 `references/ui-bili.md`。
 本技能目录就是加载时给出的 Base directory，通常是 `/run/oc/claude-config/skills/app-connectors`。
 没有 Intelligent UI 协议时（例如微信、定时任务）不要读这些文件，也不要写这些块。
 
@@ -156,6 +156,14 @@ echo '{}' | oc-plugin call knowledge-planet create_topic --confirm <确认码>
 5. 确认窗口 10 分钟;过期/被拒绝就如实告知用户,需要时重新发起。
 6. 返回 `in_progress`=已在执行别催;`replay`=该确认码已执行过,**不要**再原样重发一单。
    尤其 `replay.status=unknown` 表示可能已经写入：先让用户到知识星球核实，绝不自动重试。
+
+### B 站（哔哩哔哩）
+
+两个插件都只在 AI 市场，用户没装时先引导去安装：
+- `bili`：公开数据，免登录、只读。安装后在 管理中心 → 插件 点「启用」。`oc-connect call bili <action>`：
+  search / video / rank / popular / comments / danmaku。评论要 aid、弹幕要 cid，先调 video 拿；参数写在 `oc-connect list` 的动作说明里。
+- `bili-account`：字幕、收藏夹、观看历史，要用 B 站 App 扫码登录（同微博的扫码流程）。用 `oc-plugin call bili-account <action>`。
+- 报 UPSTREAM_RATE_LIMITED（B 站风控）时如实告诉用户稍后再试，不要连续重试，也不要索要 cookie。
 
 ## 各 provider 一览
 
