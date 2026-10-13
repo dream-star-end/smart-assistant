@@ -425,6 +425,10 @@ export class AutoDreamService {
         channels: [...USER_CHANNELS],
         afterSeq,
         limit: 100,
+        // The excerpt budget only fits a few sessions: read the latest ones.
+        // A long backlog (e.g. the first run after opt-in) is still closed by
+        // throughSeq, so old sessions are not re-queued forever.
+        order: 'newest',
       })
       recentSessions = page.sessions
       // The prompt snapshot is intentionally bounded, but a successful run

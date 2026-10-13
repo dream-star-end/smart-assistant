@@ -1165,3 +1165,47 @@ describe('auto memory write contract', () => {
     }
   })
 })
+
+describe('scanAutoDreamSuccessfulSessions order', () => {
+  it('newest-first returns the most recently active sessions and the same window bound', async () => {
+    const agentId = 'newest-first-agent'
+    const at = Date.UTC(2026, 9, 13, 4, 0, 0)
+    let last = 0
+    for (let i = 1; i <= 10; i++) {
+      last = await recordAutoDreamSuccessfulSession({
+        agentId,
+        sessionId: `session-${i}`,
+        channel: 'webchat',
+        completedAt: at + i * 1_000,
+      })
+    }
+    // An old session that is active again counts as recent.
+    last = await recordAutoDreamSuccessfulSession({
+      agentId,
+      sessionId: 'session-2',
+      channel: 'webchat',
+      completedAt: at + 20_000,
+    })
+    const newest = await scanAutoDreamSuccessfulSessions({
+      agentId,
+      channels: ['webchat'],
+      limit: 3,
+      order: 'newest',
+    })
+    assert.deepEqual(
+      newest.sessions.map((row) => row.id),
+      ['session-2', 'session-10', 'session-9'],
+    )
+    assert.equal(newest.throughSeq, last)
+    const oldest = await scanAutoDreamSuccessfulSessions({
+      agentId,
+      channels: ['webchat'],
+      limit: 3,
+    })
+    assert.deepEqual(
+      oldest.sessions.map((row) => row.id),
+      ['session-1', 'session-2', 'session-3'],
+    )
+    assert.equal(oldest.throughSeq, last)
+  })
+})
