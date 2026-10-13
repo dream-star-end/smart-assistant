@@ -51,7 +51,7 @@ const { WebSocketServer } = createRequire(import.meta.url)('ws')
 const fixtureHtml = `<!doctype html><body><div id="app"><button id="login">登录</button></div>
 <script>
 const app=document.querySelector('#app');let model='glm-5.3',peer=0,ws;
-document.querySelector('#login').onclick=()=>{app.innerHTML='<form><input type="email"><input type="password"><button>登录</button></form>';document.querySelector('form').onsubmit=async(e)=>{e.preventDefault();if(localStorage.getItem('oc_auth_hint'))throw Error('unexpected hint');await fetch('/api/auth/login',{method:'POST',body:'{}'});localStorage.setItem('oc_auth_hint','1');await fetch('/api/public/models');ws=new WebSocket('ws://'+location.host+'/ws/user-chat-bridge');ws.onmessage=(e)=>{const f=JSON.parse(e.data);if(f.type==='outbound.message'){document.querySelector('#answer').innerHTML='<div data-testid="assistant-row"><div class="prose">2</div></div>'}};app.innerHTML='<button id="new">新建会话</button><div id="chat"></div>';document.querySelector('#new').onclick=newSession;};};
+document.querySelector('#login').onclick=()=>{app.innerHTML='<form><input type="email"><input type="password"><button>登录</button></form>';document.querySelector('form').onsubmit=async(e)=>{e.preventDefault();if(localStorage.getItem('oc_auth_hint'))throw Error('unexpected hint');await fetch('/api/auth/login',{method:'POST',body:'{}'});localStorage.setItem('oc_auth_hint','1');await fetch('/api/public/models');ws=new WebSocket('ws://'+location.host+'/ws/user-chat-bridge');ws.onmessage=(e)=>{const f=JSON.parse(e.data);if(f.type==='outbound.message'){const row=document.createElement('div');row.dataset.testid='assistant-row';row.innerHTML='<div class="prose"></div>';row.firstChild.textContent=f.text;document.querySelector('#answer').append(row)}};app.innerHTML='<button id="new">新建会话</button><div id="chat"></div>';document.querySelector('#new').onclick=newSession;};};
 function newSession(){peer++;document.querySelector('#chat').innerHTML='<button aria-label="选择对话模型" id="model">'+model+'</button><div id="menu"></div><textarea></textarea><button aria-label="发送" id="send">发送</button><div id="answer"></div>';document.querySelector('#model').onclick=()=>{document.querySelector('#menu').innerHTML='<div role="menu"><button data-model-id="gpt-6-luna">gpt-6-luna</button><button data-model-id="grok-build">grok-build</button><button data-model-id="deepseek-v4-flash">deepseek-v4-flash</button></div>';bindModels();};document.querySelector('#send').onclick=async()=>{await fetch('/api/sessions/'+peer,{method:'PUT',body:JSON.stringify({modelId:model})});const f={type:'inbound.message',peer:{id:String(peer)},clientMessageId:crypto.randomUUID(),model,content:{text:document.querySelector('textarea').value}};if(ws.readyState!==1)await new Promise(r=>ws.addEventListener('open',r,{once:true}));ws.send(JSON.stringify(f));};}
 function bindModels(){for(const b of document.querySelectorAll('[data-model-id]'))b.onclick=()=>{model=b.dataset.modelId;document.querySelector('#model').textContent=model;document.querySelector('#menu').innerHTML='';};}
 </script>`
@@ -80,17 +80,22 @@ for (const cost of ['dry', 'live'])
       else res.end(fixtureHtml)
     })
     const wss = new WebSocketServer({ server })
+    // Per-session memory like a real backend: the C3 continuation turn (OCV5-405) must
+    // recall the code planted in the first turn of the same peer.
+    const codes = new Map()
     wss.on('connection', (ws) =>
       ws.on('message', (raw) => {
         const f = JSON.parse(String(raw))
         calls.push(f)
+        const planted = /暗号 ([A-Z]{4}[0-9]{4})/.exec(f.content.text)
+        if (planted) codes.set(f.peer.id, planted[1])
         ws.send(
           JSON.stringify({
             type: 'outbound.message',
             peer: f.peer,
             clientMessageId: f.clientMessageId,
             isFinal: true,
-            text: '2',
+            text: planted ? '2' : `暗号是 ${codes.get(f.peer.id) ?? '未知'}`,
           }),
         )
       }),
@@ -121,8 +126,15 @@ for (const cost of ['dry', 'live'])
       assert.match(output, /# timings_ms \[\d+,\d+,\d+\]/)
       assert.deepEqual(
         calls.map((f) => f.model),
-        cost === 'dry' ? [] : ['grok-build', 'deepseek-v4-flash'],
+        cost === 'dry' ? [] : ['grok-build', 'grok-build', 'deepseek-v4-flash', 'deepseek-v4-flash'],
       )
+      if (cost === 'live') {
+        // Each model's two turns share one session; the two models use different sessions.
+        assert.equal(calls[0].peer.id, calls[1].peer.id)
+        assert.equal(calls[2].peer.id, calls[3].peer.id)
+        assert.notEqual(calls[0].peer.id, calls[2].peer.id)
+        assert.equal((output.match(/# continuation model=\S+ turns=2 same_session=ok recall=ok/g) ?? []).length, 2, output)
+      }
       console.log(`# synthetic-${cost} ${output.match(/# timings_ms .*/)?.[0]}`)
     } finally {
       for (const ws of wss.clients) ws.terminate()
