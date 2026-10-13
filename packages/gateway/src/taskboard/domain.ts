@@ -129,6 +129,8 @@ export const RUN_SKIP_REASONS = [
   'patrol_disabled',
   /** 连续空转触发降频,本轮不到重试点。与 outside_window 区分,便于解释「为什么变慢了」。 */
   'idle_backoff',
+  /** 认领后、启动 agent 前单据已被关闭 / 受阻(OCV5-414),本 run 不派活。 */
+  'ticket_closed',
 ] as const
 export type RunSkipReason = (typeof RUN_SKIP_REASONS)[number]
 

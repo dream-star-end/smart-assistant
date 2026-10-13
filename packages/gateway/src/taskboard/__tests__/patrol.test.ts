@@ -918,3 +918,96 @@ it('OCV5-179 backfill precision stays bound to its amount source', () => {
   assert.equal(mergeRunUsage({ ...known, costUsd: null, costImprecise: true }, { tokensIn: null, tokensOut: null, costUsd: 9 }).costImprecise, null)
   assert.equal(mergeRunUsage({ ...known, costUsd: null }, { tokensIn: null, tokensOut: null, costUsd: 9, costImprecise: true }).costImprecise, true)
 })
+
+// OCV5-414:agent 现在可以关单 / 标受阻。巡检在列表快照之后、认领之前、启动 agent 之前
+// 任何一刻看到单据已不在可执行状态,都不能再派活,也不能留下占位的 lease。
+describe('已关单不派活', () => {
+  it('列表之后、认领之前被关单:不建 run、不占 lease、不调 delegate、槽位归还', async () => {
+    const db = freshDb()
+    const { ticket } = seedReadyAi(db)
+    class ClosingSlots extends PatrolSlotCounter {
+      override tryAcquire(): boolean {
+        const t = getTicket(db, ticket.id)
+        if (t?.status === 'ready') {
+          updateTicket(db, t.id, t.version, { status: 'done', closedAt: WORK.getTime() })
+        }
+        return super.tryAcquire()
+      }
+    }
+    const slots = new ClosingSlots(2)
+    let ran = 0
+    const eng = engine(
+      db,
+      async () => {
+        ran += 1
+        return { ok: true, output: 'should not run' }
+      },
+      { slots },
+    )
+    const report = await eng.tick(WORK)
+    assert.equal(ran, 0)
+    assert.equal(report.started, 0, JSON.stringify(report))
+    assert.equal(slots.getActive(), 0)
+    assert.equal(getTicket(db, ticket.id)?.status, 'done')
+    const leased = listRuns(db, { ticketId: ticket.id }).items.filter((r) => r.status !== 'skipped')
+    assert.equal(leased.length, 0, JSON.stringify(leased))
+    await eng.tick(WORK)
+    assert.equal(ran, 0)
+    db.close()
+  })
+
+  it('认领后、启动 agent 前被关单:run 以 skipped(ticket_closed) 结算并释放 lease,不调 delegate', async () => {
+    const db = freshDb()
+    const { ticket, stage } = seedReadyAi(db)
+    const run = acquireLease(db, ticket.id, stage.id, 'agent:taskboard', 50 * 60 * 1000, {
+      agentId: stage.agentId,
+      trigger: 'patrol',
+      now: WORK.getTime(),
+    })
+    const ready = getTicket(db, ticket.id)
+    assert.ok(ready)
+    const running = updateTicket(db, ready.id, ready.version, { status: 'running' })
+    updateTicket(db, running.id, running.version, { status: 'done', closedAt: WORK.getTime() })
+    let ran = 0
+    const eng = engine(db, async () => {
+      ran += 1
+      return { ok: true, output: 'should not run' }
+    })
+    const runClaimed = (
+      eng as unknown as {
+        runClaimed: (...args: unknown[]) => Promise<void>
+      }
+    ).runClaimed.bind(eng)
+    await runClaimed(db, getTicket(db, ticket.id), stage, getRun(db, run.id), getSettings(db))
+    assert.equal(ran, 0)
+    const settled = getRun(db, run.id)
+    assert.equal(settled?.status, 'skipped')
+    assert.equal(settled?.skipReason, 'ticket_closed')
+    assert.equal(settled?.leaseOwner, null)
+    assert.equal(getTicket(db, ticket.id)?.status, 'done')
+    db.close()
+  })
+
+  it('已关单上的 lease 过期回收后单据仍是 done,下一轮也不派活', async () => {
+    const db = freshDb()
+    const { ticket, stage } = seedReadyAi(db)
+    acquireLease(db, ticket.id, stage.id, 'agent:taskboard', 1000, {
+      agentId: stage.agentId,
+      trigger: 'patrol',
+      now: WORK.getTime() - 10_000,
+    })
+    const ready = getTicket(db, ticket.id)
+    assert.ok(ready)
+    const running = updateTicket(db, ready.id, ready.version, { status: 'running' })
+    updateTicket(db, running.id, running.version, { status: 'done', closedAt: WORK.getTime() })
+    let ran = 0
+    const eng = engine(db, async () => {
+      ran += 1
+      return { ok: true, output: 'should not run' }
+    })
+    await eng.tick(WORK)
+    assert.equal(ran, 0)
+    assert.equal(getTicket(db, ticket.id)?.status, 'done')
+    db.close()
+  })
+})

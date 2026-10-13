@@ -48,7 +48,9 @@ ticket   list [--project-id ID] [--status S] [--type T] [--priority P] [--assign
          claim <idOrIdent> --expected-version N [--owner agent:<id>]
          approve <idOrIdent> --expected-version N [--owner agent:<id>]
          advance <idOrIdent> --expected-version N [--summary TEXT] [--output-md MD] [--run-id ID]
-         block <idOrIdent> --expected-version N --reason TEXT
+         block <idOrIdent> --expected-version N --reason TEXT [--evidence LINK]
+         done <idOrIdent> --expected-version N --reason TEXT --evidence LINK
+              agent 关单必须给理由与证据链接(PR、提交、日志路径等),写入审计;重开只能由人
          comment <idOrIdent> --body MD [--run-id ID]
 relation add <fromIdOrIdent> --to <toIdOrIdent> --kind parent|blocks|related
          remove <relationId>
@@ -378,9 +380,26 @@ function planTicket(
         return usage('ticket block <idOrIdent> --expected-version N --reason TEXT')
       }
       const body: Record<string, unknown> = { expectedVersion: ver.value, reason }
+      const evidence = optionalFlag(flags, 'evidence')
+      if (evidence) body.evidence = evidence
       const owner = ambientAgentOwner(env)
       if (owner) body.owner = owner
       return request('POST', `/tickets/${encodeSeg(id)}/block`, { body })
+    }
+    case 'done': {
+      const id = positional[0]
+      const ver = requireIntFlag(flags, 'expected-version')
+      const reason = optionalFlag(flags, 'reason')
+      const evidence = optionalFlag(flags, 'evidence')
+      if (!id || !ver.ok || !reason || !evidence) {
+        return usage(
+          'ticket done <idOrIdent> --expected-version N --reason TEXT --evidence LINK',
+        )
+      }
+      const body: Record<string, unknown> = { expectedVersion: ver.value, reason, evidence }
+      const owner = optionalFlag(flags, 'owner') ?? ambientAgentOwner(env)
+      if (owner) body.owner = owner
+      return request('POST', `/tickets/${encodeSeg(id)}/done`, { body })
     }
     case 'comment': {
       const id = positional[0]
@@ -394,7 +413,7 @@ function planTicket(
       return request('POST', `/tickets/${encodeSeg(id)}/comment`, { body })
     }
     default:
-      return usage('ticket list|get|create|update|claim|approve|advance|block|comment')
+      return usage('ticket list|get|create|update|claim|approve|advance|block|done|comment')
   }
 }
 
