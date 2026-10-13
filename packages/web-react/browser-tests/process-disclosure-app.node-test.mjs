@@ -458,16 +458,20 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
           previousOpen: textIn("[data-testid=process-stage]", "冻结库存仍然不进看板"),
           previousFolded: textIn("[data-testid=process-stage-toggle]", "冻结库存仍然不进看板"),
           active: document.querySelector("[data-process-active=true]") ? "true" : "false",
+          // OCV5-409: same snapshot as `active`, so a turn that finished in between cannot be read as collapsed-while-live.
+          expanded: [...document.querySelectorAll("[data-testid=process-toggle]")].at(-1)?.getAttribute("aria-expanded") ?? null,
         };
       });
       if (liveStagePlacement.answerInProcess) {
         assert.equal(liveStagePlacement.previousOpen, true, `previous stage unmounted after the answer started: ${JSON.stringify(liveStagePlacement)}`);
-        assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "process collapsed while tokens arrived");
+        if (liveStagePlacement.active === "true") {
+          assert.equal(liveStagePlacement.expanded, "true", "process collapsed while tokens arrived");
+        }
       } else {
         assert.equal(liveStagePlacement.answerOutside, true, `streaming answer left both the work area and the answer card: ${JSON.stringify(liveStagePlacement)}`);
         if (liveStagePlacement.active === "true") {
           assert.equal(liveStagePlacement.previousOpen, true, `stage collapsed after the answer left the shell: ${JSON.stringify(liveStagePlacement)}`);
-          assert.equal(await liveToggle.getAttribute("aria-expanded"), "true", "process collapsed while tokens arrived");
+          assert.equal(liveStagePlacement.expanded, "true", "process collapsed while tokens arrived");
         }
       }
       await desktop.page.getByTestId("scroll-to-bottom").click();
