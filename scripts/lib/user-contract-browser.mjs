@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { selectJourneyModel } from "./journey-browser.mjs";
-import { assertOutbound, parseFrame, turnEvidence, turnPolicy } from "./user-contract.mjs";
+import { assertOutbound, parseFrame, turnEvidence, turnPolicy, continuationCode, continuationPrompts, assertSameSession, assertContinuationAnswer } from "./user-contract.mjs";
 
 export async function coldUiLogin(page, options, password) {
   // A fresh context has no cookies, IndexedDB or service workers. Clear web storage
@@ -90,8 +90,7 @@ export async function installTurnProbe(context, base, cost) {
   return probe;
 }
 
-export async function sendContractTurn(page, probe, { model, engine, catalog, cost, requireHttpModel = false }) {
-  const text = `R2-${crypto.randomUUID()} 请只回答数字2，不使用工具。`;
+export async function sendContractTurn(page, probe, { model, engine, catalog, cost, requireHttpModel = false, text = `R2-${crypto.randomUUID()} 请只回答数字2，不使用工具。` }) {
   if (turnPolicy(cost).forward) probe.liveTexts.add(text);
   const rowsBefore = await page.getByTestId("assistant-row").count();
   await page.locator("textarea").first().fill(text);
@@ -103,7 +102,7 @@ export async function sendContractTurn(page, probe, { model, engine, catalog, co
   if (requireHttpModel) {
     await waitUntil(() => probe.writes.some((w) => w.peer === sent.peer.id && w.body?.modelId === model), 20_000, "Session HTTP body.modelId mismatch");
   }
-  if (!turnPolicy(cost).waitForCompletion) return;
+  if (!turnPolicy(cost).waitForCompletion) return { sent };
   await waitUntil(() => {
     const evidence = turnEvidence(probe.received, sent);
     if (evidence.error) throw new Error("Exact turn returned an error");
@@ -115,6 +114,39 @@ export async function sendContractTurn(page, probe, { model, engine, catalog, co
     timeline: () => turnTimeline(probe.received, sent),
   });
   if (await page.getByTestId("assistant-row").last().locator('[role="alert"]').count() || await page.getByText(/发送失败|消息暂未安全送达/).count()) throw new Error("Turn finished with a failure card");
+  return { sent };
+}
+// C3 per model (OCV5-405): turn 1 carries a random code, turn 2 in the same
+// session must give it back. Dry mode never forwards, so there is nothing to
+// continue from; that is reported, not counted as a continuation pass.
+export async function runContinuationTurns(page, probe, turn, log = console.log) {
+  const code = continuationCode();
+  const prompts = continuationPrompts(code);
+  const first = await sendContractTurn(page, probe, { ...turn, text: prompts.first });
+  if (!turnPolicy(turn.cost).waitForCompletion) {
+    log(`# continuation model=${turn.model} not executed (cost=${turn.cost})`);
+    return { executed: false };
+  }
+  const second = await sendContractTurn(page, probe, { ...turn, text: prompts.second });
+  assertSameSession(first.sent, second.sent);
+  assertContinuationAnswer(await lastAssistantText(page), code);
+  await assertSessionClean(page, probe, [first.sent, second.sent]);
+  log(`# continuation model=${turn.model} turns=2 same_session=ok recall=ok`);
+  return { executed: true };
+}
+// Text the user actually sees in the newest assistant row (timeline projection,
+// so CCB answers that only reach the tape are included).
+export async function lastAssistantText(page) {
+  return (await page.getByTestId("assistant-row").last().locator(".prose").textContent())?.trim() ?? "";
+}
+// Retryable failures must stay invisible: after both turns no row of the session
+// may carry a failure card, and no earlier turn may have turned into an error.
+export async function assertSessionClean(page, probe, sentFrames) {
+  if (await page.locator('[data-testid="assistant-row"] [role="alert"]').count() || await page.getByText(/发送失败|消息暂未安全送达/).count()) throw new Error("Session shows a failure card after the continuation turn");
+  for (const sent of sentFrames) {
+    const evidence = turnEvidence(probe.received, sent);
+    if (evidence.error || !evidence.complete) throw new Error(`Session turn lost completion or returned an error (complete=${evidence.complete}, error=${evidence.error})`);
+  }
 }
 // ── UI 收尾等待(2026-10-08 冒烟健壮性)──
 // 进入这里时,后端已经给出本轮权威完成证据:服务器对这条消息(同 peer + clientMessageId)发出
