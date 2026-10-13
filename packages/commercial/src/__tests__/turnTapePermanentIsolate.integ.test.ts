@@ -560,10 +560,11 @@ describe("materialization isolation", { concurrency: false }, () => {
       seenSleep = again.rows[0]!.n > 0;
     }
     assert.equal(seenSleep, true, "isolate transaction did not reach the header lock hold");
-    const locker = await pool.connect();
+    const locker = new Pool({ connectionString: TEST_DB_URL, max: 1,
+      options: `-c search_path=${SCHEMA} -c lock_timeout=500ms`,
+    });
     let releaseCode = "";
     try {
-      await locker.query("SET lock_timeout = '500ms'");
       await releaseParkedMaterializationJob(locker, {
         jobId: held.job_id,
         reason: "must wait for the open isolate",
@@ -571,7 +572,7 @@ describe("materialization isolation", { concurrency: false }, () => {
     } catch (err) {
       releaseCode = (err as { code?: string }).code ?? "";
     } finally {
-      locker.release();
+      await locker.end();
     }
     const claimed = await claimDueMaterializationJobs(pool, { ownerId: "owner-racer", limit: 1 });
     assert.equal(releaseCode, "55P03");
@@ -606,4 +607,30 @@ describe("materialization isolation", { concurrency: false }, () => {
     assert.equal((await jobOf("s-race", tapeId)).status, "complete");
     assert.equal((await headerOf("s-race", tapeId)).materialization_error, "sentinel");
   });
+});
+
+test("release rejects caller PoolClient without committing its transaction", async () => {
+  await shelveExisting();
+  const tapeId = "c".repeat(64);
+  await seedTape("s-client", tapeId);
+  await pool.query(`INSERT INTO turn_tape_materialization_jobs
+    (session_id,user_id,tape_id,status,attempt,next_attempt_at)
+    VALUES ('s-client','c:396',$1,'failed',957,'infinity')`, [tapeId]);
+  const job = await jobOf("s-client", tapeId);
+  const client = await pool.connect();
+  let rejected = "";
+  try {
+    await client.query("BEGIN");
+    await client.query("INSERT INTO oc_test_control (name,value) VALUES ('outer-sentinel','1')");
+    try {
+      await releaseParkedMaterializationJob(client as unknown as Pool, {jobId: job.job_id, reason: "caller transaction must remain open"});
+    } catch (err) { rejected = String((err as Error).message); }
+    await client.query("ROLLBACK");
+  } finally { client.release(); }
+  const n = (await pool.query<{n:number}>("SELECT count(*)::int AS n FROM oc_test_control WHERE name='outer-sentinel'")).rows[0]!.n;
+  console.log(`caller-transaction sentinel-after-rollback=${n} job=${(await jobOf("s-client",tapeId)).status}`);
+  assert.match(rejected, /requires a Pool/);
+  assert.equal(n, 0);
+  assert.equal((await jobOf("s-client",tapeId)).status, "failed");
+  assert.equal((await jobOf("s-client",tapeId)).is_infinity, true);
 });

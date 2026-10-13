@@ -411,17 +411,23 @@ export async function isolateLeasedMaterializationJob(
 /**
  * Explicit un-park. Only a failed job sitting at infinity moves back to queued.
  * attempt and last_error stay. Blank reason is rejected before any SQL.
+ * Caller records jobId, reason and approval in its operations ticket before invoking.
+ * This helper preserves last_error; the reason argument is not an audit log.
+ * Pool only: owns its transaction, never commits a caller transaction.
  * Not called by the scheduler.
  */
 export async function releaseParkedMaterializationJob(
-  q: Queryable,
+  pool: Pool,
   input: { jobId: string; reason: string },
 ): Promise<number> {
   if (!input.reason.trim()) throw new Error("release reason is required");
   // Status filters do not wait on a concurrent updater whose committed row
   // still looks leased. Lock the job id first so recovery shares that row lock.
-  const ownsClient = typeof (q as { release?: unknown }).release !== "function";
-  const client = ownsClient ? await (q as Pool).connect() : q;
+  if (typeof (pool as unknown as { release?: unknown }).release === "function"
+    || typeof pool.connect !== "function") {
+    throw new Error("releaseParkedMaterializationJob requires a Pool, not a caller PoolClient");
+  }
+  const client = await pool.connect();
   let begun = false;
   try {
     await client.query("BEGIN");
@@ -446,7 +452,7 @@ export async function releaseParkedMaterializationJob(
     if (begun) await client.query("ROLLBACK");
     throw err;
   } finally {
-    if (ownsClient) (client as PoolClient).release();
+    client.release();
   }
 }
 
