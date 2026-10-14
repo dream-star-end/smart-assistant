@@ -158,6 +158,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'deepseek-v4-flash',
       'qwen3.7-max',
       'qwen3.7-plus',
+      'gemini-4-argon-contributor',
     ])
     assert.deepEqual([...getStaticProvider('kimi').inboundModelIds], ['kimi-k2.7-code'])
     assert.deepEqual([...getStaticProvider('ark-k3').inboundModelIds], ['kimi-k3-ark'])
@@ -177,6 +178,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'deepseek-v4-flash',
       'qwen3.7-max',
       'qwen3.7-plus',
+      'gemini-4-argon-contributor',
       'kimi-k2.7-code',
       'kimi-k3-ark',
       'kimi-k3',
@@ -518,4 +520,15 @@ describe('staticKeyProviders — snapshot 漂移守护(protocol-owned)', () => {
       )
     }
   })
+})
+
+// Google-only upstream is selected by commercial's trusted transport marker.
+it('Gemini Go is exact, canonical, text-only and does not change the legacy endpoint', () => {
+  const p = getStaticProvider('opencodego')
+  assert.equal(p.matchesRoute('GEMINI-4-ARGON-CONTRIBUTOR'), true)
+  assert.equal(p.matchesRoute('gemini-4-argon'), false)
+  assert.equal(p.canonicalizeForPricing('GEMINI-4-ARGON-CONTRIBUTOR'), 'gemini-4-argon-contributor')
+  assert.equal(p.upstreamModelForRequest?.('GEMINI-4-ARGON-CONTRIBUTOR'), 'gemini-4-argon-contributor')
+  assert.equal(p.supportsVision, false)
+  assert.equal(p.upstreamEndpoint, 'https://opencode.ai/zen/go/v1/messages')
 })

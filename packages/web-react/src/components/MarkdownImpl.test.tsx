@@ -2,6 +2,7 @@ import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, test } from 'vitest'
 import MarkdownImpl from './MarkdownImpl'
+import { cachedCodeLanguage } from '../lib/codeLanguageDetect'
 
 afterEach(cleanup)
 
@@ -303,5 +304,113 @@ describe('MarkdownImpl autoDetectCode', () => {
       <MarkdownImpl readOnly autoDetectCode={false}>{'```ts\nconst x: number = 1;\n```'}</MarkdownImpl>,
     )
     expect(c2.querySelector('.hljs')).not.toBeNull()
+  })
+})
+
+// OCV5-421: 共享的高亮实例 + 常见语言内的自动探测。
+describe('MarkdownImpl 代码高亮(OCV5-421)', () => {
+  const py = '```\nimport os\n\ndef main():\n    for name in os.listdir("."):\n        print(name)\n```'
+
+  test('无标注的常见语言代码仍被探测并高亮,重复渲染结果一致', () => {
+    for (let i = 0; i < 3; i++) {
+      const { container, unmount } = render(<MarkdownImpl>{py}</MarkdownImpl>)
+      // CodeBlock 外层 <code class="font-mono"> 包着带高亮类名的 span。
+      const code = container.querySelector('pre code > span')!
+      expect(code.className).toContain('language-python')
+      expect(code.querySelector('.hljs-keyword')).not.toBeNull()
+      unmount()
+    }
+  })
+
+  test('有标注的语言照常高亮(不受探测子集限制)', () => {
+    const { container } = render(<MarkdownImpl>{'```kotlin\nfun main() { val x = 1 }\n```'}</MarkdownImpl>)
+    expect(container.querySelector('pre code > span')!.className).toContain('hljs')
+    expect(container.querySelector('pre .hljs-keyword')).not.toBeNull()
+  })
+
+  test('autoDetectCode=false 时无标注块不探测(流式尾段)', () => {
+    const { container } = render(<MarkdownImpl autoDetectCode={false}>{py}</MarkdownImpl>)
+    expect(container.querySelector('pre code > span')!.className).not.toContain('language-python')
+  })
+
+  // OCV5-422: 探测结果按代码原文缓存;第二次起直接按记住的语言高亮,输出必须与第一次逐字一致。
+  test('同一段无标注代码再次渲染(走探测缓存)与首次渲染的 DOM 完全相同', () => {
+    const unique = `ocv5-422-${Math.random().toString(36).slice(2)}`
+    const code = `\`\`\`\nimport os\n\ndef ${unique.replace(/-/g, '_')}():\n    return [os.sep for _ in range(3)]\n\`\`\``
+    const first = render(<MarkdownImpl>{code}</MarkdownImpl>)
+    const html = first.container.innerHTML
+    expect(first.container.querySelector('pre code > span')!.className).toContain('language-python')
+    first.unmount()
+    for (let i = 0; i < 2; i++) {
+      const again = render(<MarkdownImpl>{code}</MarkdownImpl>)
+      expect(again.container.innerHTML).toBe(html)
+      again.unmount()
+    }
+  })
+
+  test('探测不出语言的块:缓存后仍只有 hljs、没有语言类,正文原样', () => {
+    const unique = Math.random().toString(36).slice(2)
+    const code = `\`\`\`\n┌──┐ ${unique}\n│  │\n└──┘\n\`\`\``
+    const first = render(<MarkdownImpl>{code}</MarkdownImpl>)
+    const html = first.container.innerHTML
+    const span = first.container.querySelector('pre code > span')!
+    expect(span.className).toContain('hljs')
+    expect(span.className).not.toContain('language-')
+    first.unmount()
+    const again = render(<MarkdownImpl>{code}</MarkdownImpl>)
+    expect(again.container.innerHTML).toBe(html)
+    expect(again.container.textContent).toContain(unique)
+  })
+
+  test('大块无标注代码不在渲染里同步探测:先按纯文本代码块显示,探测完再上色', async () => {
+    const unique = Math.random().toString(36).slice(2).replace(/[0-9]/g, 'x')
+    const body = Array.from({ length: 50 }, (_, i) => `def handler_${unique}_${i}(event):\n    return [item for item in event if item]`).join('\n')
+    const { container } = render(<MarkdownImpl>{`\`\`\`\n${body}\n\`\`\``}</MarkdownImpl>)
+    const code = () => container.querySelector('pre code > span')!
+    expect(code().className).not.toContain('hljs')
+    expect(code().textContent).toContain(`handler_${unique}_49`)
+    await waitFor(() => expect(code().className).toContain('language-python'), { timeout: 10_000 })
+    expect(container.querySelector('pre .hljs-keyword')).not.toBeNull()
+    expect(code().textContent).toContain(`handler_${unique}_49`)
+  })
+
+  // OCV5-422: 代码块后面紧跟表格时,它一直在流式尾段里(表格行不是切段点),以前要等生成结束才开始探测。
+  test('流式尾段里已写完的大块无标注代码在后台预先探测;生成结束那次渲染直接上色', async () => {
+    const unique = Math.random().toString(36).slice(2).replace(/[0-9]/g, 'y')
+    const body = Array.from({ length: 50 }, (_, i) => `def fetch_${unique}_${i}(url):\n    return [line for line in open(url) if line]`).join('\n')
+    const text = `\`\`\`\n${body}\n\`\`\`\n\n| 项 | 值 |\n|---|---|\n| a | 1 |`
+    const live = render(<MarkdownImpl live autoDetectCode={false}>{text}</MarkdownImpl>)
+    expect(live.container.querySelector('pre code > span')!.className).not.toContain('hljs')
+    await waitFor(() => expect(cachedCodeLanguage(`${body}\n`)).toBe('python'), { timeout: 10_000 })
+    expect(live.container.querySelector('pre code > span')!.className).not.toContain('hljs') // 预取不改流式中的渲染
+    live.rerender(<MarkdownImpl>{text}</MarkdownImpl>)
+    expect(live.container.querySelector('pre code > span')!.className).toContain('language-python') // 同一次渲染即上色
+  })
+
+  test('流式尾段以代码块结尾(可能还没闭合)时不预取探测', async () => {
+    const unique = Math.random().toString(36).slice(2).replace(/[0-9]/g, 'z')
+    const body = Array.from({ length: 50 }, (_, i) => `def open_${unique}_${i}(url):\n    return [line for line in open(url) if line]`).join('\n')
+    render(<MarkdownImpl live autoDetectCode={false}>{`说明：\n\n\`\`\`\n${body}`}</MarkdownImpl>)
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    expect(cachedCodeLanguage(`${body}\n`)).toBeUndefined()
+  })
+
+  test('流式中未闭合的 $$ 不渲染半截公式,显示「公式生成中…」', () => {
+    const { container } = render(<MarkdownImpl live>{'推导：\n\n$$\n\\frac{a}{'}</MarkdownImpl>)
+    expect(container.querySelector('.katex-error')).toBeNull()
+    expect(screen.getByText('公式生成中…')).toBeInTheDocument()
+  })
+
+  test('表格单元格里独立的 <br> 变成换行,其它原始 HTML 仍转义', () => {
+    const { container } = render(<MarkdownImpl>{'| a | b |\n|---|---|\n| 第一行<br>第二行 | <b>x</b> |'}</MarkdownImpl>)
+    expect(container.querySelector('td br')).not.toBeNull()
+    expect(container.querySelector('td b')).toBeNull()
+  })
+
+  test('脚注锚点在当前页跳转,外链仍开新标签', () => {
+    const { container } = render(<MarkdownImpl>{'结论[^1]，见 [官网](https://example.com)\n\n[^1]: 来源'}</MarkdownImpl>)
+    for (const a of container.querySelectorAll('a[href^="#"]')) expect(a).not.toHaveAttribute('target')
+    expect(container.querySelector('a[href="https://example.com"]')).toHaveAttribute('target', '_blank')
+    expect(container.querySelector('[node]')).toBeNull()
   })
 })

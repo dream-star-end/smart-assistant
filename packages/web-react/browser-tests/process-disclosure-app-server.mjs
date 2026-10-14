@@ -628,7 +628,8 @@ export function startPreviewServer(assetDir, options = {}) {
         pendingWarningFinals.set(key, { resolve });
         warningFinal = promise;
       }
-      void playTurn(send, store, sessId, clientMessageId, text, nextSeq, warningFinal).catch((error) => {
+      // options.playTurn: perf scripts (ocv5-421/app-perf.mjs) stream their own answer; tests use the story.
+      void (options.playTurn ?? playTurn)(send, store, sessId, clientMessageId, text, nextSeq, warningFinal).catch((error) => {
         send({
           type: "outbound.error",
           sessionKey: sessionKey(sessId),

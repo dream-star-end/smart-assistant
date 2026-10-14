@@ -750,13 +750,40 @@ function hasCjk(s: string): boolean {
  * fetch 网络层失败（断网/DNS/CORS/被拦截）：浏览器/undici 抛 TypeError
  * （"Failed to fetch" / "NetworkError…" / "fetch failed" / "Load failed"），非 ApiError。
  */
-function isNetworkError(err: unknown): boolean {
+export function isNetworkError(err: unknown): boolean {
   return (
     err instanceof TypeError &&
     /failed to fetch|fetch failed|networkerror|load failed|network request failed/i.test(
       err.message,
     )
   );
+}
+
+/**
+ * 读请求的瞬时失败(OCV5-421):断网 / 弱网下的 fetch 失败、5xx、408、429。这类失败自动重试几次,
+ * 用户看不到;4xx(权限、不存在、参数)立即如实报告。
+ */
+export function isTransientReadError(err: unknown): boolean {
+  if (isNetworkError(err)) return true;
+  if (!(err instanceof ApiError)) return false;
+  return err.status >= 500 || err.status === 408 || err.status === 429;
+}
+
+/** 静默重试读请求:瞬时失败按 delays 退避重试,`stillWanted()` 为假(换会话 / 被新请求取代)即停。 */
+export async function retryTransientRead<T>(
+  run: () => Promise<T>,
+  stillWanted: () => boolean,
+  delays: readonly number[] = [1000, 3000, 8000],
+): Promise<T> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await run();
+    } catch (err) {
+      if (attempt >= delays.length || !isTransientReadError(err) || !stillWanted()) throw err;
+      await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+      if (!stillWanted()) throw err;
+    }
+  }
 }
 
 /** 启动恢复可重试错误：网络/解析异常，以及 401、限流和服务端故障。 */

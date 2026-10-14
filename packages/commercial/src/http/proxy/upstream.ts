@@ -339,6 +339,8 @@ export interface PreparedUpstreamSession {
   readonly personaTimezone: string | null;
   /** 上游 URL;OAuth = `deps.upstreamEndpoint ?? DEFAULT`;静态 = `spec.upstreamEndpoint` */
   readonly endpoint: string;
+  /** Exact, trusted static-provider transport selection, never a client flag. */
+  readonly transport?: "gemini-go";
   /**
    * **转发给上游的 model 名**(模型权威批次 §1.3)。
    *
@@ -543,6 +545,8 @@ function makeStaticKeyUpstream(
     pinnedUserId: null,
     personaTimezone: null,
     endpoint: spec.upstreamEndpoint,
+    ...(spec.id === "opencodego" && upstreamModel.toLowerCase() === "gemini-4-argon-contributor"
+      ? { transport: "gemini-go" as const } : {}),
     upstreamModel,
     dispatcher,
     shouldUpdateQuotaFromResponse: false,

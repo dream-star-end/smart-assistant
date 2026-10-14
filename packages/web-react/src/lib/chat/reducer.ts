@@ -736,10 +736,21 @@ function frameSeqAlreadyApplied(message: ChatMessage, frameSeq?: number): boolea
   return message._appliedFrameSeqs?.[frameSeq] === true;
 }
 
+/** Per-row replay fence size. Replays only re-deliver recent frames, while a long answer adds one
+ * key per delta and the row is persisted with it (OCV5-421: 10k+ keys cloned on every save). */
+const APPLIED_FRAME_SEQ_KEEP = 512;
+
 function noteAppliedFrameSeq(message: ChatMessage, frameSeq?: number): void {
   if (!(typeof frameSeq === "number" && Number.isSafeInteger(frameSeq) && frameSeq > 0)) return;
   if (!message._appliedFrameSeqs) message._appliedFrameSeqs = {};
   message._appliedFrameSeqs[frameSeq] = true;
+  const keys = Object.keys(message._appliedFrameSeqs);
+  if (keys.length > APPLIED_FRAME_SEQ_KEEP * 2) {
+    // Integer keys iterate ascending: keep the newest half.
+    const kept: Record<number, true> = {};
+    for (const key of keys.slice(-APPLIED_FRAME_SEQ_KEEP)) kept[Number(key)] = true;
+    message._appliedFrameSeqs = kept;
+  }
 }
 
 function matchesDelegateProgress(groupMsg: ChatMessage, progress: ChatMessage): boolean {
@@ -2367,6 +2378,8 @@ export function applyOutboundMessage(
       }
       if (m.role === "tool" && typeof m._completed === "boolean" && !m._completed && !m.error && !m._background) {
         m._completed = true;
+        // OCV5-421: 停止 / 中断收尾时这一步没拿到任何结果,它没跑完 —— 显示「已取消」而不是绿勾「完成」。
+        if ((frame.meta?.interrupted || suppressLegacyErrorText) && !m.output && !m.bashTail) m.cancelled = true;
       }
       // agent-group / delegate-progress：turn 收尾仍未完成 → 标完成。turn 已结束就不该再
       // "运行中/子智能体启动中…"(委托帧 runId 绑定缺位时会卡住,这里兜底收口)。
@@ -2550,6 +2563,21 @@ export type DeferredTerminalErrorPaint = {
   traceId?: string;
 };
 
+/**
+ * 终态错误收尾(OCV5-421):本轮还在「运行中」的工具不会再有结果帧(legacy `error` 之后没有 final,
+ * 只有下一轮 final 才会顺手扫掉),于是红卡下面一直转圈。按本轮归属把它们标成已取消。
+ * 后台委派(_background)照旧等子任务自己的终态。
+ */
+function settleOrphanTools(sess: ChatSession, ownerId: string | undefined): void {
+  for (const m of sess.messages) {
+    if (m.role !== "tool" || m._completed !== false || m.error || m._background) continue;
+    if (isImmutableTapeViewportRow(m)) continue;
+    if (ownerId && m._turnOwnerId && m._turnOwnerId !== ownerId) continue;
+    m._completed = true;
+    if (!m.output && !m.bashTail) m.cancelled = true;
+  }
+}
+
 function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint, userCancelled: boolean): void {
   const silent = isSilentTurnErrorCode(paint.normalized);
   const keepQuietStopLine = paint.normalized === "stopped" || paint.normalized === "user_cancelled";
@@ -2576,6 +2604,7 @@ function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint
     ? sess._activeClientMessageId === paint.clientMessageId
     : true; // rolling compatibility for old gateways
   if (ownsActiveTurn) {
+    settleOrphanTools(sess, paint.clientMessageId ?? sess._activeClientMessageId);
     sess._sendingInFlight = false;
     sess._activeClientMessageId = undefined;
     clearTurnTiming(sess);

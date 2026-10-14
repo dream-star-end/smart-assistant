@@ -30,6 +30,7 @@ describe('oc-plugin shared CLI surface', () => {
     assert.match(list.stdout, /可调用的插件/)
     assert.match(list.stdout, /local-reader/)
     assert.match(list.stdout, /plugin:51/)
+    assert.doesNotMatch(list.stdout, /不在 oc-connect 中/)
   })
 
   test('shows managed account write mode so the Agent does not invent a second confirmation', async () => {

@@ -136,6 +136,15 @@ LEASE_LIB="$SCRIPT_DIR/v5-lease-lib.sh"
 # 三面制品之前 fail-closed;规则与 check-v5-incident-regressions.ts 逐条对齐(有单测交叉对拍)。
 # 豁免只给真·止血:OC_V5_SKIP_TRAILER_GATE=1(会打 ⚠ 并写进 deploy 日志,不静默)。
 FIX_TRAILER_GATE="$SCRIPT_DIR/check-v5-fix-trailers.sh"
+# OCV5-418 门禁失败策略(只个人版):rollback(默认)= 现有补偿;stay = 新版已切换且在跑时
+# 门禁/冒烟失败不回滚,留在新版排查(用户 2026-10-14 02:54:个人版只有本人在用)。
+# 取值顺序:环境变量 > 策略文件(KEY=VALUE 解析,不 source;须本用户所有、组/他人不可写)。
+SELFHOST_POLICY_FILE="${OC_V5_SELFHOST_POLICY_FILE:-/etc/openclaude/selfhost-deploy-policy.env}"
+V5_WATCH_MAINT="${V5_WATCH_MAINT:-/run/openclaude-v5-selfhost/planned-maintenance}"
+CUTOVER_GATE_FAILED=""
+CUTOVER_LAST_FAIL=""
+CUTOVER_KEPT_FAILED_REL=""
+CUTOVER_RECOVERY_REQUIRED=0
 
 # 本实例专属发布锁。禁止复用:
 #   /var/lock/oc-v5-deploy.lock                      V5 商业版生产(deploy-v5.sh / 发布队列 / 自愈)
@@ -352,6 +361,14 @@ else:
 PY
 }
 
+# /proc/<pid>/stat 第 22 字段(starttime)。必须读持锁的 deploy 进程本身($$):
+# 以前在 python3 -c 里读 os.getpid(),拿到的是 python 子进程,看护比对永远不匹配,
+# 发布锁豁免从未生效(OCV5-418)。comm 可含空格/括号,从最后一个 ) 往后数。
+proc_starttime_of() { # <pid>
+  python3 -c 'import sys
+t=open("/proc/%d/stat"%int(sys.argv[1])).read(); print(t[t.rfind(")")+2:].split()[19])' "$1"
+}
+
 # fd 8 排他 flock:进程退出/被杀时内核释放,不手删锁文件。
 # OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1 表示本进程链已持锁(内层跳过,防将来 $0 自调用把自己锁死)。
 acquire_selfhost_deploy_lock() {
@@ -392,9 +409,7 @@ acquire_selfhost_deploy_lock() {
     done
   fi
   SELFHOST_DEPLOY_LOCK_HOLDER="${lock}.holder"
-  starttime="$(python3 -c 'import os,sys
-p="/proc/%d/stat"%os.getpid()
-t=open(p).read(); rest=t[t.rfind(")")+2:].split(); print(rest[19])')" \
+  starttime="$(proc_starttime_of "$$")" \
     || die "无法读取 /proc/$$/stat starttime(看护靠它防 PID reuse)"
   [[ "$starttime" =~ ^[0-9]+$ ]] || die "starttime 非法: $starttime"
   holder_line="$(printf 'pid=%s user=%s tree=%s started=%s starttime=%s\n' \
@@ -1502,11 +1517,17 @@ lease_train_finish() { # <committed|failed> <reason>
   LEASE_TRAIN_ACTIVE=0
   local st="$1" reason="$2" rel="" ev
   if [[ "$st" == failed ]]; then
-    # 已动 unit 但未 committed → 交给 survivor,并要人工确认;不自动重发
+    # 本班已动 unit 但未 committed(被 SIGTERM/die 打断在中途)→ 交给 survivor,并要人工确认;不自动重发。
+    # 只看本班:没动过 unit 时 state 里是上一班留下的 phase,不能据此判(OCV5-420)。
     local phase=""
-    [[ -f "${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" ]] && \
-      phase="$(jq -er '.phase // empty' "${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" 2>/dev/null || true)"
-    case "${phase:-}" in ''|armed|pre-install|pre-mutation|smoked|committed) ;; *) st=recovery_required ;; esac
+    if [[ "${CUTOVER_MUTATED:-0}" == 1 ]]; then
+      phase="$(survivor_state_phase)"
+      # kept-failed(OCV5-418)是有意留在新版的确定性失败,不是需人工恢复的半截 mutation。
+      case "${phase:-}" in armed|pre-install|pre-mutation|smoked|committed|kept-failed) ;; *) st=recovery_required ;; esac
+    fi
+    # 补偿本身失败:survivor --disarm 会把 phase 写成 committed,所以单独带标记(OCV5-420)。
+    [[ "${CUTOVER_RECOVERY_REQUIRED:-0}" == 1 ]] && st=recovery_required
+    rel="${CUTOVER_KEPT_FAILED_REL:-}"
   else
     rel="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
   fi
@@ -1517,9 +1538,31 @@ UPDATE train SET status='$st', reason='$(lease_q "$reason")', rel_path=$( [[ -n 
        evidence_json='$(lease_q "$ev")', finished_at='$(lease_now)', updated_at='$(lease_now)'
  WHERE id='$LEASE_TRAIN_ID' AND status NOT IN ('committed','failed');
 $(lease_event_sql "$LEASE_TRAIN_ID" "train-$st" "deploy:$$" "$reason")
+$( [[ "$st" == recovery_required ]] && lease_train_alert_sql "$LEASE_TRAIN_ID" "$reason (phase=${phase:-?} cutover_log=${CUTOVER_LOG:-?})" )
 COMMIT;
 SQL
   echo "  🎫 lease train $LEASE_TRAIN_ID → $st"
+  if [[ "$st" == recovery_required ]]; then
+    deploy_alert deploy_recovery_required "$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)" \
+      "个人版列车 $LEASE_TRAIN_ID 未完成也未干净回滚(phase=${phase:-?}),已标 recovery_required,发车暂停。现场:${CUTOVER_LOG:-?}。autorecover 接管:现场稳定绿后自动结束本班并重跑,否则退避兜底,仍失败自动开工单派给 AI。"
+  fi
+}
+
+# survivor state 是 KEY=VALUE(phase=…);兼容旧 JSON。读不到返回空。
+survivor_state_phase() {
+  local f="${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" p=""
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+  p="$(sed -n 's/^phase=//p' "$f" 2>/dev/null | head -n1)"
+  [[ -n "$p" ]] || p="$(jq -er '.phase // empty' "$f" 2>/dev/null || true)"
+  printf '%s' "$p"
+}
+
+# 与 worker enqueue_train_alert 同一落点:最近一条在途 ride 的工单,没有则 log。只输出 SQL,随终态同事务。
+lease_train_alert_sql() { # <train_id> <reason>
+  local tk
+  tk="$(lease_sql "SELECT ticket_ref FROM lease WHERE resource='deploy:selfhost' AND status='registered' AND ticket_ref IS NOT NULL ORDER BY seq DESC LIMIT 1;" 2>/dev/null || true)"
+  lease_outbox_sql "train:$1:recovery_required" "$1" train_alert "$( [[ -n "$tk" ]] && echo ticket || echo log )" "${tk:--}" \
+    "$(lease_body_train_alert "$1" recovery_required "$2")"
 }
 
 lease_train_on_exit() {
@@ -1925,7 +1968,9 @@ activate_tuple_joint() { # <master-rel> <prev-master-or-none>
   restart_cmd="$(egress_then_master_restart_cmd)"
   # 正向 smoke 比新 rel dist;saga 回滚时 lib 置 HOTCFG_SAGA_ROLLING_BACK=1,
   # 只验旧现场 healthz(不得拿新 dist 比已回滚的旧进程)。
-  smoke_cmd="if [[ \"\${HOTCFG_SAGA_ROLLING_BACK:-}\" == 1 ]]; then cutover_smoke_healthz_only; else cutover_smoke_against_release $(printf '%q' "$master_rel"); fi"
+  # 正向走 cutover_gate_against_release:policy=stay 时门禁失败返回 0 并置 CUTOVER_GATE_FAILED,
+  # saga 因此保留新运行面(lib 不改,商业版不受影响),cmd_cutover 随后走 cutover_keep_failed。
+  smoke_cmd="if [[ \"\${HOTCFG_SAGA_ROLLING_BACK:-}\" == 1 ]]; then cutover_smoke_healthz_only; else cutover_gate_against_release $(printf '%q' "$master_rel"); fi"
   prev_arg="$prev_master"
   if [[ "$prev_arg" == "none" || "$prev_arg" == "NONE" ]]; then
     prev_arg=""
@@ -2086,6 +2131,7 @@ cmd_status() {
     log "  .complete:   MISSING"
   fi
   log "  watch:       $(watch_summary "${live_now:-}")"
+  log "  gate-fail:   policy=$(gate_fail_policy 2>/dev/null) survivor-phase=$(sed -n 's/^phase=//p' "${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" 2>/dev/null | head -n1 || true) maint=$(sed -n 's/^until=//p' "$V5_WATCH_MAINT" 2>/dev/null | head -n1 || true)"
   if [[ -f "$V5_ENV" ]]; then
     log "  OC_SESSIONS_STORE=$(oc_hotcfg_env_get "$V5_ENV" OC_SESSIONS_STORE)"
   fi
@@ -2242,6 +2288,7 @@ cutover_clog() {
 
 # 预期由调用方处理失败:只 return,绝不 exit/die。
 cutover_fail() {
+  CUTOVER_LAST_FAIL="$*"
   cutover_clog "✗ $*"
   return 1
 }
@@ -2299,7 +2346,7 @@ cutover_smoke_against_release() { # <rel>
     cutover_clog "  ✓ egress 双槽拓扑一致:active=$want"
   fi
   # Must pass before either branch persists phase=smoked (survivor invariant).
-  user_contract_gate || return 1
+  user_contract_gate || { cutover_fail "cutover smoke: 用户契约门禁(C1–C3)失败"; return 1; }
 }
 
 cutover_smoke_healthz_only() {
@@ -2440,6 +2487,149 @@ cutover_compensate() { # <reason>
   cutover_rollback_inplace "${CUTOVER_REL:-}" "${CUTOVER_BACKUP:-missing}" || rb_rc=$?
   # 无论补偿成败都必须解除幸存者布防,否则 timeout 会在健康 live 上再装陈旧备份。
   cutover_disarm_survivor || cutover_clog "补偿后 disarm 失败(不掩盖补偿结果 rc=$rb_rc)"
+  if [[ "$rb_rc" != 0 ]]; then
+    # disarm 已把 phase 写成 committed;改落 compensate-failed,worker 才不会把现网当 committed 去结算搭车。
+    CUTOVER_RECOVERY_REQUIRED=1
+    cutover_persist_phase compensate-failed \
+      || cutover_clog "  ⚠ 无法落盘 phase=compensate-failed(列车仍记 recovery_required)"
+  fi
+  return 1
+}
+
+# ── OCV5-418 门禁失败留在新版(stay)────────────────────────────────────────
+# 只覆盖「新 release 已切换、restart 成功」之后的正向门禁:healthz 收敛、GET / oc-build、
+# egress、C1–C3。安装 / 迁移 / 翻转 / restart 失败时新版可能根本没起来,照旧补偿。
+
+selfhost_policy_get() { # <key> → 值(可为空)。告警走 stderr,stdout 只给值。
+  local k="$1" v f="$SELFHOST_POLICY_FILE" mode
+  v="${!k:-}"
+  if [[ -z "$v" && -f "$f" && ! -L "$f" ]]; then
+    mode="$(stat -c '%a' -- "$f" 2>/dev/null || echo 777)"
+    if [[ "$(stat -c '%u' -- "$f" 2>/dev/null)" == "$(id -u)" ]] && (( (8#$mode & 8#022) == 0 )); then
+      v="$(sed -n "s/^${k}=//p" "$f" | tail -n1 | tr -d "\"'[:space:]")"
+    else
+      cutover_clog "  ⚠ 策略文件 $f 不是本用户所有或组/他人可写,忽略" >&2
+    fi
+  fi
+  printf '%s' "$v"
+}
+
+gate_fail_policy() { # → rollback|stay;非法值按 rollback(保持旧行为)
+  local p
+  p="$(selfhost_policy_get OC_V5_SELFHOST_ON_GATE_FAIL)"
+  case "$p" in
+    stay) printf 'stay' ;;
+    rollback | '') printf 'rollback' ;;
+    *)
+      cutover_clog "  ⚠ OC_V5_SELFHOST_ON_GATE_FAIL=$(printf '%s' "$p" | tr -cd 'a-z_-' | cut -c1-20) 非法,按 rollback" >&2
+      printf 'rollback'
+      ;;
+  esac
+}
+
+stay_window_sec() { # 维护窗口秒数,默认 2h(用户 2026-10-14 03:15 确认)
+  local w
+  w="$(selfhost_policy_get OC_V5_SELFHOST_STAY_WINDOW_SEC)"
+  [[ "$w" =~ ^[1-9][0-9]{1,5}$ ]] || w=7200
+  printf '%s' "$w"
+}
+
+# 演练:策略文件写明精确 40 位 sourceCommit 时,真实门禁跑完且通过后仍判失败一次。
+# 绑定精确 SHA,下一班(不同 SHA)自动失效;不能用来跳过任何门禁。
+gate_fail_drill_armed() { # <rel>
+  local want sha
+  want="$(selfhost_policy_get OC_V5_SELFHOST_GATE_FAIL_DRILL_SHA)"
+  [[ "$want" =~ ^[0-9a-f]{40}$ ]] || return 1
+  sha="$(jq -er '.sourceCommit' "$1/.complete" 2>/dev/null || true)"
+  [[ "$sha" == "$want" ]]
+}
+
+cutover_gate_against_release() { # <rel>
+  local rel="$1" rc=0
+  CUTOVER_GATE_FAILED=""
+  CUTOVER_LAST_FAIL=""
+  cutover_smoke_against_release "$rel" || rc=$?
+  if [[ "$rc" == 0 ]] && gate_fail_drill_armed "$rel"; then
+    cutover_fail "门禁失败演练:策略文件指定本 sourceCommit,真实门禁已通过,按演练判失败" || true
+    rc=99
+  fi
+  [[ "$rc" == 0 ]] && return 0
+  if [[ "$(gate_fail_policy)" == stay ]]; then
+    if [[ "$rc" == 99 ]]; then CUTOVER_GATE_FAILED="drill"; else CUTOVER_GATE_FAILED="smoke"; fi
+    cutover_clog "  ⚠ 门禁失败 policy=stay:不回滚运行面,保留 $rel 现场(${CUTOVER_GATE_FAILED}: ${CUTOVER_LAST_FAIL:-?})"
+    return 0
+  fi
+  return "$rc"
+}
+
+write_stay_maintenance() { # <rel> <until-epoch>;已有更晚的窗口则保留
+  local rel="$1" until_ts="$2" cur tmp
+  if [[ -f "$V5_WATCH_MAINT" && ! -L "$V5_WATCH_MAINT" ]]; then
+    cur="$(sed -n 's/^until=\([0-9][0-9]*\)$/\1/p' "$V5_WATCH_MAINT" | head -n1)"
+    if [[ "$cur" =~ ^[0-9]+$ ]] && (( cur >= until_ts )); then
+      cutover_clog "  · 已有更晚的维护窗口 until=$cur,保留"
+      return 0
+    fi
+  fi
+  [[ -L "$V5_WATCH_MAINT" ]] && { cutover_clog "  ✗ 维护标记是符号链接,拒绝写 $V5_WATCH_MAINT"; return 1; }
+  mkdir -p -- "$(dirname -- "$V5_WATCH_MAINT")" || return 1
+  tmp="$V5_WATCH_MAINT.tmp.$$"
+  printf 'until=%s\nsource=deploy-gate-fail-stay\nrel=%s\nwritten=%s\n' \
+    "$until_ts" "$rel" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$tmp" \
+    && mv -f -- "$tmp" "$V5_WATCH_MAINT" || { rm -f -- "$tmp"; return 1; }
+}
+
+# 下一班 committed 时撤掉本机制写的维护窗口(人工写的不动)。
+clear_stay_maintenance() {
+  [[ -f "$V5_WATCH_MAINT" && ! -L "$V5_WATCH_MAINT" ]] || return 0
+  grep -qx 'source=deploy-gate-fail-stay' "$V5_WATCH_MAINT" || return 0
+  rm -f -- "$V5_WATCH_MAINT" && cutover_clog "  ✓ 已撤销上一班 stay 留下的维护窗口"
+}
+
+deploy_alert() { # <event> <rel> <message>;critical,只入队+补投,失败不影响结果
+  local bin="$V5_WATCH_DIR/alert.sh"
+  if [[ ! -x "$bin" ]]; then
+    cutover_clog "  ⚠ 缺 $bin,未发 $1 告警"
+    return 0
+  fi
+  timeout 10 "$bin" --event "$1" --severity critical --live "$2" --message "$3" >/dev/null 2>&1 \
+    || cutover_clog "  ⚠ 告警入队失败 event=$1"
+  timeout 30 "$bin" --flush >/dev/null 2>&1 || cutover_clog "  ⚠ 告警补投失败(下一拍看护会重投)"
+  return 0
+}
+
+# stay 收尾:不补偿、不写不可逆 model authority marker、不 GC、不同步看护/开机脚本;
+# survivor 落 kept-failed 后解除;写维护窗口挡看护回切;列车记 failed;发 critical 告警。
+# kept-failed 落盘失败则退回原补偿(survivor 仍按旧 phase 判定,不能留半截状态)。
+cutover_keep_failed() { # <rel>
+  local rel="$1" win until_ts reason
+  CUTOVER_KEPT_FAILED_REL="$rel"
+  cutover_clog "══ 门禁失败,按 OC_V5_SELFHOST_ON_GATE_FAIL=stay 留在新版 $rel ══"
+  if ! cutover_persist_phase kept-failed; then
+    CUTOVER_KEPT_FAILED_REL=""
+    cutover_clog "  ✗ 无法落盘 phase=kept-failed,退回原补偿路径"
+    cutover_compensate "persist-phase-kept-failed"
+    return 1
+  fi
+  if [[ "${CUTOVER_SURVIVOR_ARMED:-0}" == 1 ]]; then
+    if bash "$(cutover_survivor_script)" --disarm-kept; then
+      CUTOVER_SURVIVOR_ARMED=0
+    else
+      cutover_clog "  ⚠ survivor --disarm-kept 失败;phase=kept-failed 时 survivor 也不会恢复"
+    fi
+  fi
+  win="$(stay_window_sec)"
+  until_ts=$(( $(date +%s) + win ))
+  if write_stay_maintenance "$rel" "$until_ts"; then
+    cutover_clog "  ✓ 看护维护窗口 ${win}s(until=$until_ts):窗口内看护不回切,过期后恢复保护"
+  else
+    cutover_clog "  ⚠ 维护窗口写入失败:看护 grace 过后若复合健康红会按阈值回切"
+  fi
+  reason="gate-failed-kept-live=$rel gate=${CUTOVER_GATE_FAILED:-?} detail=${CUTOVER_LAST_FAIL:-?}"
+  lease_train_finish failed "$reason"
+  deploy_alert deploy_gate_failed_kept "$rel" "个人版门禁失败,按 stay 策略留在新版 ${rel##*/}。失败项:${CUTOVER_LAST_FAIL:-?}。维护窗口 ${win}s 内看护不回切。现场:${CUTOVER_LOG:-?}。下一步:修好后发新列车前滚;要回上一版按 runbook 人工回滚(.prev-release 未改)。"
+  cutover_clog "  现场保留:cutover 日志 ${CUTOVER_LOG:-?};未跑 release GC;.prev-release 仍指向上一版"
+  cutover_clog "✗ --cutover 门禁失败(已留在新版 $rel):$reason"
   return 1
 }
 
@@ -2833,6 +3023,10 @@ cmd_cutover() {
         cutover_compensate "joint-activate"
         return 1
       fi
+      if [[ -n "$CUTOVER_GATE_FAILED" ]]; then
+        cutover_keep_failed "$rel"
+        return 1
+      fi
       cutover_persist_phase_or_compensate "restarted" "restarted" || return 1
       cutover_persist_phase_or_compensate "smoked" "smoked" || return 1
     fi
@@ -2855,8 +3049,12 @@ cmd_cutover() {
       cutover_clog "  [dry-run] curl 127.0.0.1:${V5_PORT}/ 比对 oc-build=$expected_build"
       cutover_clog "  [dry-run] curl ${V5_EGRESS_BIND}:${V5_EGRESS_PORT}/internal/v5/egress-health"
     else
-      if ! cutover_smoke_against_release "$rel"; then
+      if ! cutover_gate_against_release "$rel"; then
         cutover_compensate "smoke"
+        return 1
+      fi
+      if [[ -n "$CUTOVER_GATE_FAILED" ]]; then
+        cutover_keep_failed "$rel"
         return 1
       fi
       cutover_persist_phase_or_compensate "smoked" "smoked" || return 1
@@ -2871,6 +3069,7 @@ cmd_cutover() {
     cutover_clog "  [dry-run] 一级: canonicalize prev + 路径在 releases 根 + 复算 digest; restart/smoke 任一失败立刻降二级"
     cutover_clog "  [dry-run] 二级: 应急脚本原子恢复备份 unit + daemon-reload + restart + 复合健康硬门"
     cutover_clog "  [dry-run] 回滚后再失败 → 写 $MASTER_RELEASES_ROOT/.manual-recovery-required 并大声退出"
+    cutover_clog "  [dry-run] 门禁失败策略 OC_V5_SELFHOST_ON_GATE_FAIL=$(gate_fail_policy)(stay: restart 后门禁失败不回滚,phase=kept-failed + 维护窗口 $(stay_window_sec)s + 列车 failed + critical 告警)"
     cutover_clog "  [dry-run] 成功路径 --disarm 必须确认 durable committed marker;失败不报告 cutover 成功"
   fi
 
@@ -2883,6 +3082,7 @@ cmd_cutover() {
     || die "无法持久化 phase=committed。smoke 已通过,拒绝报告成功(survivor 仍可能误恢复)。"
   cutover_disarm_survivor \
     || die "disarm 失败: committed marker 未确认写入。smoke 已通过,拒绝报告成功。"
+  clear_stay_maintenance || cutover_clog "  ⚠ 撤销 stay 维护窗口失败(到期后看护自动忽略)"
   persist_selfhost_model_authority_cutover "$rel"
   sync_boot_scripts_from "$rel"
   sync_watch_from "$rel" \

@@ -15,6 +15,7 @@ import "katex/dist/katex.min.css";
 import {
   Children,
   isValidElement,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -33,7 +34,13 @@ import { IuiBlock } from "./iui/IuiBlock";
 import { uiFencesToMarkdown } from "./iui/toMarkdown";
 import { useIntelligentUiEnabled } from "../lib/intelligentUi";
 import type { MarkdownProps } from "./Markdown";
-import { normalizeMathDelimiters } from "./mathDelimiters";
+import { normalizeMathDelimiters, unclosedDisplayMathStart } from "./mathDelimiters";
+import {
+  cachedCodeLanguage,
+  detectCodeLanguageLater,
+  detectCodeLanguageNow,
+  SYNC_DETECT_MAX_CHARS,
+} from "../lib/codeLanguageDetect";
 
 /** 从(可能被 highlight 包成 span 的)code children 递归还原纯源码文本 —— mermaid/html 富块要原文。 */
 function nodeText(node: ReactNode): string {
@@ -172,8 +179,12 @@ function rehypeEmbedMedia() {
 /** 单元格不拆词:`.prose{word-break:break-word}` 会把 `MessageRenderer.tsx` / 「风险」这类标识符在任意
  *  位置拆行,把宽表硬压进 390px 容器,横滑区形同虚设。keep-all 让 CJK 只在标点/空格处换行、拉丁词
  *  整词换行;表头一律不折行 —— 放不下的宽表按 min-content 撑出容器,落进 .markdown-table-region 横滑。 */
+//  OCV5-421:但单元格里的链接 / 行内代码是不可拆的长串(URL、长标识符),keep-all 下会把一列撑到上千
+//  像素,同表其它列被挤出视口。只对它们放开 overflow-wrap:anywhere(它参与 min-content 计算),
+//  中文词与普通拉丁词仍保持整词。
 const TABLE_CELL_CLASS =
-  "[&_td]:[word-break:keep-all] [&_td]:[overflow-wrap:normal] [&_th]:[word-break:keep-all] [&_th]:whitespace-nowrap";
+  "[&_td]:[word-break:keep-all] [&_td]:[overflow-wrap:normal] [&_th]:[word-break:keep-all] [&_th]:whitespace-nowrap " +
+  "[&_td_a]:[overflow-wrap:anywhere] [&_td_code]:[overflow-wrap:anywhere] [&_td_code]:[word-break:break-all]";
 
 function MarkdownTable({ children, className, ...props }: ComponentPropsWithoutRef<"table">) {
   const regionRef = useRef<HTMLElement>(null);
@@ -292,6 +303,21 @@ function rehypeLiveCaret() {
   };
 }
 
+/** 模型常在表格单元格里写 `<br>` 换行;未启用 rehype-raw 时它会按字面显示。只把**独立的**
+ *  `<br>` / `<br/>` raw 节点换成真正的 br 元素,其它原始 HTML 仍按文本转义(OCV5-421)。 */
+function rehypeBareBreaks() {
+  const walk = (node: HastNode): void => {
+    node.children?.forEach((child, i) => {
+      if (child.type === "raw" && /^<br\s*\/?>$/i.test((child.value ?? "").trim())) {
+        node.children![i] = { type: "element", tagName: "br", properties: {}, children: [] };
+      } else {
+        walk(child);
+      }
+    });
+  };
+  return (tree: HastNode) => walk(tree);
+}
+
 function hasMarkdownImage(children: ReactNode): boolean {
   return Children.toArray(children).some((child) => {
     if (!isValidElement<{ node?: { tagName?: string }; children?: ReactNode }>(child)) return false;
@@ -307,11 +333,33 @@ export default function MarkdownImpl({
   readOnly,
   blockImages,
   autoDetectCode = true,
+  bare,
 }: MarkdownProps) {
   // `live` 只被 HtmlPreview 读:走 ref 而不进 useMemo 依赖,否则流式结束(live→false)那一次
   // 重建 components 就把所有富块(OptionsBlock 的点选、HtmlPreview 的 iframe)整个重挂载。
   const liveRef = useRef(live);
   liveRef.current = live;
+  // 大块无标注代码的语言在渲染外分片探测(OCV5-422,lib/codeLanguageDetect);探测完重渲一次上色。
+  const [, setDetectedCount] = useState(0);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  // 本实例自己记住探测结论:全局缓存即使把它逐出,重渲时也不会再次进入「待探测」而循环。
+  const detectedRef = useRef(new Map<string, string | null>());
+  const onPendingDetect = useCallback((text: string) => {
+    void detectCodeLanguageLater(text).then((language) => {
+      detectedRef.current.set(text, language);
+      if (mountedRef.current) setDetectedCount((count) => count + 1);
+    });
+  }, []);
+  const knownLanguage = useCallback((text: string) => detectedRef.current.get(text), []);
+  const prefetchDetect = useCallback((text: string) => {
+    void detectCodeLanguageLater(text);
+  }, []);
   // Intelligent UI 开关:关闭(或服务端总开关关闭)时把 ```ui 围栏整段换成等价 Markdown 再渲染。
   const iuiEnabled = useIntelligentUiEnabled();
   // components 里的渲染器是「组件类型」:每次渲染都造新函数 = React 视为新类型 → 富块子树
@@ -358,8 +406,10 @@ export default function MarkdownImpl({
                   ),
               }
             : {}),
-          code({ className, children, ...props }) {
-            const lang = /language-(\w+)/.exec(className || "")?.[1];
+          code({ className, children, node: _node, ...props }) {
+            // \S+ 保留 c++ / c# / objective-c 原名作标签;富块分派按小写比较(```UI / ```Mermaid)。
+            const label = /language-(\S+)/.exec(className || "")?.[1];
+            const lang = label?.toLowerCase();
             const isBlock = className?.includes("language-") || String(children).includes("\n");
             if (isBlock) {
               // 富块:mermaid 流程图 / html 沙盒预览(取原文,绕开 highlight 的 span 包裹)。
@@ -373,7 +423,7 @@ export default function MarkdownImpl({
               if (!readOnly && (lang === "html" || lang === "htmlpreview"))
                 return <HtmlPreview code={nodeText(children).replace(/\n$/, "")} live={liveRef.current} />;
               return (
-                <CodeBlock language={lang}>
+                <CodeBlock language={label} live={liveRef.current} lineCount={countLines(children)}>
                   <span className={className} {...props}>
                     {children}
                   </span>
@@ -386,7 +436,7 @@ export default function MarkdownImpl({
               </code>
             );
           },
-          a: ({ children, href, ...props }) => {
+          a: ({ children, href, node: _node, ...props }) => {
             const containerLocal = typeof href === "string" && isContainerPreviewUrl(href);
             // 只读站内信中的链接图片把灯箱与原链接拆成两个同级动作，避免格式包装下仍出现
             // <a><button /></a> 非法嵌套和一次点击双重导航，同时不丢原链接功能。
@@ -429,6 +479,14 @@ export default function MarkdownImpl({
                 </a>
               );
             }
+            // 页内锚点(GFM 脚注 #user-content-fn-1 / 返回 ↩)在当前页跳转,不开新标签页。
+            if (typeof href === "string" && href.startsWith("#")) {
+              return (
+                <a {...props} href={href}>
+                  {children}
+                </a>
+              );
+            }
             return (
               <a {...props} href={href} target="_blank" rel="noreferrer">
                 {children}
@@ -438,15 +496,27 @@ export default function MarkdownImpl({
     }),
     [signMedia, blockImages, readOnly],
   );
-  return (
-    <div className="prose">
+  let source = typeof children === "string" ? children : "";
+  // 流式中未闭合的 $$:截掉半截公式,块后给一行静默占位(OCV5-421)。
+  const heldMath = live && typeof children === "string" ? unclosedDisplayMathStart(children) : -1;
+  if (heldMath >= 0) source = source.slice(0, heldMath);
+  const body = (
+    <>
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[
+          rehypeBareBreaks,
           // detect=false 时没标语言的块不做同步语言探测（大文件预览防卡死，见 MarkdownProps.autoDetectCode）。
-          [rehypeHighlight, { detect: autoDetectCode, ignoreMissing: true }],
+          [rehypeHighlightShared, {
+            detect: autoDetectCode,
+            onPendingDetect,
+            knownLanguage,
+            // 只在流式尾段预取(项目文件预览等主动关探测的场景不探测)。
+            prefetchDetect: live && !autoDetectCode ? prefetchDetect : undefined,
+          }],
           // 数学公式：$..$ / $$..$$ → KaTeX 渲染(remarkMath 解析 + rehypeKatex 出 HTML)。
-          [rehypeKatex, { strict: false, throwOnError: false }],
+          // errorColor 跟随主题 token(KaTeX 默认 #cc0000 在暗色底上对比度不足)。
+          [rehypeKatex, { strict: false, throwOnError: false, errorColor: "var(--danger)" }],
           // 仅在 signMedia(助手正文)启用：把媒体路径行内码转成可签名媒体节点。
           ...(signMedia && !readOnly ? [rehypeEmbedMedia] : []),
           // 流式光标内联到最后一个文本块末尾(最后执行,看到的是最终树)。
@@ -455,9 +525,136 @@ export default function MarkdownImpl({
         components={components}
       >
         {typeof children === "string"
-          ? normalizeMathDelimiters(iuiEnabled ? children : uiFencesToMarkdown(children, !!live))
+          ? normalizeMathDelimiters(iuiEnabled ? source : uiFencesToMarkdown(source, !!live))
           : children}
       </ReactMarkdown>
-    </div>
+      {heldMath >= 0 && (
+        <p className="text-meta text-faint" data-math-pending="true">
+          公式生成中…
+        </p>
+      )}
+    </>
   );
+  return bare ? body : <div className="prose">{body}</div>;
+}
+
+/**
+ * rehype-highlight 每次被挂进处理器都会 `createLowlight(common)`:新建一个 highlight.js 实例,
+ * 用到的语法全部重新编译。react-markdown 每次渲染都重建处理器,于是每个 delta、每次重渲都要
+ * 重新编译语法(OCV5-421 实测是流式时的头号开销)。返回的转换函数只闭包了 lowlight,无每次运行的
+ * 状态,按配置缓存复用即可。
+ */
+const highlightTransformers = new Map<string, ReturnType<typeof rehypeHighlight>>();
+function sharedHighlight(options: Parameters<typeof rehypeHighlight>[0]) {
+  const key = JSON.stringify(options ?? {});
+  let transformer = highlightTransformers.get(key);
+  if (!transformer) {
+    transformer = rehypeHighlight(options);
+    highlightTransformers.set(key, transformer);
+  }
+  return transformer;
+}
+
+type HighlightOptions = {
+  detect?: boolean;
+  onPendingDetect?: (text: string) => void;
+  /** 调用方已拿到的探测结论(优先于全局缓存)。 */
+  knownLanguage?: (text: string) => string | null | undefined;
+  /**
+   * 不探测时(流式尾段)仍为已写完的大块无标注代码提前在后台探测,只进缓存、不改本次渲染;生成结束那一次渲染
+   * 直接命中缓存上色。尾段最后一个节点可能是还没闭合的围栏,不预取。
+   */
+  prefetchDetect?: (text: string) => void;
+};
+
+/**
+ * 高亮插件。有标注的代码块照常交给 rehype-highlight;无标注的块(detect 开时)由 lib/codeLanguageDetect 定语言
+ * (OCV5-422):已知或小块 → 按该语言高亮一次,与 rehype-highlight 自带探测选中该语言时的输出相同(类名 hljs、
+ * language-x);都不像(null)→ 借 plaintext 跳过探测,再还原成「自动探测无结果」的样子(只加 hljs,正文原样);
+ * 大块且还没探测过 → 本次按不探测渲染(与流式尾段相同的纯文本代码块),交给 onPendingDetect 分片探测,结果出来后
+ * 调用方重渲一次上色。attacher 每次渲染都会被调用(react-markdown 每次重建处理器),所以回调按本次渲染闭包。
+ */
+function rehypeHighlightShared({ detect = false, onPendingDetect, knownLanguage, prefetchDetect }: HighlightOptions = {}) {
+  const base = sharedHighlight({ detect: false });
+  if (!detect && prefetchDetect) {
+    return (tree: Parameters<typeof base>[0], file: Parameters<typeof base>[1]) => {
+      const root = tree as unknown as HastNode;
+      const tail = lastTextNode(root);
+      for (const node of unlabelledCodeBlocks(root)) {
+        if (tail && containsNode(node, tail)) continue; // 正文以它结尾:可能还没闭合
+        const text = hastText(node);
+        if (text.length > SYNC_DETECT_MAX_CHARS && cachedCodeLanguage(text) === undefined) prefetchDetect(text);
+      }
+      base(tree, file);
+    };
+  }
+  if (!detect) return base;
+  return (tree: Parameters<typeof base>[0], file: Parameters<typeof base>[1]) => {
+    const blocks = unlabelledCodeBlocks(tree as unknown as HastNode).map((node) => {
+      const text = hastText(node);
+      const classes = codeClassNames(node) ?? [];
+      let language = knownLanguage?.(text);
+      if (language === undefined) language = cachedCodeLanguage(text);
+      if (language === undefined && text.length <= SYNC_DETECT_MAX_CHARS) language = detectCodeLanguageNow(text);
+      if (language === undefined) onPendingDetect?.(text);
+      node.properties = { ...node.properties, className: [...classes, `language-${language ?? "plaintext"}`] };
+      return { node, language, classes, children: node.children };
+    });
+    base(tree, file);
+    for (const block of blocks) {
+      if (typeof block.language === "string") continue;
+      block.node.children = block.children;
+      block.node.properties = {
+        ...block.node.properties,
+        className: block.language === null ? ["hljs", ...block.classes.filter((name) => name !== "hljs")] : block.classes,
+      };
+    }
+  };
+}
+
+/** 文档顺序上最后一个非空白文本节点。 */
+function lastTextNode(node: HastNode): HastNode | null {
+  if (node.type === "text") return (node.value ?? "").trim() ? node : null;
+  const children = node.children ?? [];
+  for (let i = children.length - 1; i >= 0; i--) {
+    const found = lastTextNode(children[i]!);
+    if (found) return found;
+  }
+  return null;
+}
+
+function containsNode(root: HastNode, target: HastNode): boolean {
+  return root === target || (root.children ?? []).some((child) => containsNode(child, target));
+}
+
+function codeClassNames(node: HastNode): unknown[] | null {
+  const list = node.properties?.className;
+  return Array.isArray(list) ? list : null;
+}
+
+function hasLanguageClass(node: HastNode): boolean {
+  return (codeClassNames(node) ?? []).some((value) => {
+    const name = String(value);
+    return name === "no-highlight" || name === "nohighlight" || name.startsWith("lang-") || name.startsWith("language-");
+  });
+}
+
+function unlabelledCodeBlocks(tree: HastNode): HastNode[] {
+  const found: HastNode[] = [];
+  const walk = (node: HastNode, parent: HastNode | null) => {
+    if (node.type === "element" && node.tagName === "code" && parent?.type === "element" && parent.tagName === "pre") {
+      if (!hasLanguageClass(node)) found.push(node);
+    }
+    for (const child of node.children ?? []) walk(child, node);
+  };
+  walk(tree, null);
+  return found;
+}
+
+/** 代码块行数(highlight 之后 children 是 span 树,取原文数换行)。 */
+function countLines(children: ReactNode): number {
+  const text = nodeText(children).replace(/\n$/, "");
+  let n = 1;
+  for (let i = text.indexOf("\n"); i >= 0; i = text.indexOf("\n", i + 1)) n++;
+  return n;
 }

@@ -272,6 +272,8 @@ export type ChatMessage = {
   _continuationOfTurnKey?: string;
   // ── user ──
   status?: UserMsgStatus;
+  /** 用户自己点停止取消的待发消息(OCV5-421):仍可重发,但显示中性「发送已取消」而不是红色「发送失败」。 */
+  _sendCancelled?: boolean;
   _media?: MediaRef[];
   /** Full local retry payload; hidden source/mask never enter cloud user-message persistence. */
   _retryMedia?: MediaRef[];
@@ -491,6 +493,8 @@ export type ChatMessage = {
   /** Exact structured tool result before any text-oriented rendering. */
   outputJson?: unknown;
   error?: boolean;
+  /** 本轮被停止 / 中断时还没拿到结果的工具:中性「已取消」,不是「完成」也不再转圈(OCV5-421)。 */
+  cancelled?: boolean;
   bashTail?: BashTail;
 
   // ── agent-group ──

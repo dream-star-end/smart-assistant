@@ -776,11 +776,15 @@ build_master_release() {
   fi
   # OCV5-404:committed 后会把本 release 的 watch.sh 装到宿主,所以它的判定逻辑与停用/重新武装
   # 行为必须先在 pinned staging 上过一遍。测试只写 mktemp 目录,不碰宿主标记与安装副本。
-  mlog "  selfhost watch selftest + disarm-observe / lock / rearm behavior @ pinned staging"
+  # OCV5-418:门禁失败 stay 路径(survivor kept-failed / 维护窗口 / 列车 failed / 告警)同样先在 staging 跑。
+  # OCV5-420:中途退出 / 补偿失败的列车终态(recovery_required、不结算搭车)同样先在 staging 跑。
+  # OCV5-420 二期:autorecover(不等人,自动恢复/重跑/升级派 AI)与 watch.sh --auto-recover 同样先在 staging 跑。
+  mlog "  selfhost watch selftest + disarm-observe / lock / rearm / gate-fail-stay behavior @ pinned staging"
   local watch_t watch_log
   for watch_t in v5-selfhost-watch-selftest.sh v5-selfhost-watch-disarm-observe.test.sh \
       v5-selfhost-watch-lock.test.sh v5-selfhost-watch-rearm.test.sh v5-selfhost-watch-sync.test.sh \
-      v5-selfhost-watch-alert.test.sh; do
+      v5-selfhost-watch-alert.test.sh v5-selfhost-gate-fail-stay.test.sh \
+      v5-selfhost-train-recovery.test.sh v5-selfhost-watch-autorecover.test.sh v5-selfhost-autorecover.test.sh; do
     watch_log="$MASTER_GATE_TMPDIR/${watch_t}.log"
     if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash "scripts/$watch_t" >"$watch_log" 2>&1 ); then
       tail -n 20 "$watch_log" >&2 || true

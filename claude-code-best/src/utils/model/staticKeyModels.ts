@@ -93,7 +93,7 @@ export function isZaiGlm53Model(model: string): boolean {
  *  provider；Qwen3.7 保留历史 plumbing 但由 DB catalog 下线。 */
 export function isOpencodeGoModel(model: string): boolean {
   const m = model.trim().toLowerCase()
-  return m === 'deepseek-v4-flash-opencode-go' || m === 'qwen3.7-max' || m === 'qwen3.7-plus'
+  return m === 'deepseek-v4-flash-opencode-go' || m === 'qwen3.7-max' || m === 'qwen3.7-plus' || m === 'gemini-4-argon-contributor'
 }
 
 /** 只识别 OpenCode Go 的历史 Qwen 子集。 */

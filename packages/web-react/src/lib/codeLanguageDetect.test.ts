@@ -1,0 +1,56 @@
+import { describe, expect, test } from "vitest";
+import {
+  cachedCodeLanguage,
+  DETECT_SAMPLE_CHARS,
+  detectCodeLanguageLater,
+  detectCodeLanguageNow,
+} from "./codeLanguageDetect";
+
+// OCV5-422: 无标注代码的语言探测按原文缓存,大块分片探测;两条路径结论一致。
+const unique = () => Math.random().toString(36).slice(2);
+
+describe("codeLanguageDetect", () => {
+  test("同步探测:常见语言认得出,都不像时为 null,结果按原文缓存", () => {
+    const py = `import os\n\ndef main_${unique()}():\n    for name in os.listdir("."):\n        print(name)\n`;
+    expect(cachedCodeLanguage(py)).toBeUndefined();
+    expect(detectCodeLanguageNow(py)).toBe("python");
+    expect(cachedCodeLanguage(py)).toBe("python");
+    const box = `┌──┐ ${unique()}\n│  │\n└──┘\n`;
+    expect(detectCodeLanguageNow(box)).toBeNull();
+    expect(cachedCodeLanguage(box)).toBeNull();
+  });
+
+  test("超长块只按开头取样探测(耗时有上限);结论按整块原文缓存", async () => {
+    // 开头的 python 几乎填满样本(样本在 DETECT_SAMPLE_CHARS 内的最后一个换行处截断)。
+    const head = Array.from({ length: 44 }, (_, i) => `def step_${i}_${unique().replace(/[0-9]/g, "x")}(rows):\n    return [r for r in rows if r]`).join("\n");
+    // 开头之后是 8KB 的非 python 文本(单看它不是 python);只看开头样本,结论仍是 python。
+    const tail = `\n${"SELECT id, name, total FROM orders WHERE total > 100 ORDER BY id DESC;\n".repeat(200)}`;
+    const text = head + tail;
+    expect(head.length).toBeLessThan(DETECT_SAMPLE_CHARS);
+    expect(head.length).toBeGreaterThan(DETECT_SAMPLE_CHARS - 200);
+    expect(detectCodeLanguageNow(`${tail.trim()}-- ${unique()}`)).not.toBe("python");
+    expect(await detectCodeLanguageLater(text)).toBe("python");
+    expect(cachedCodeLanguage(text)).toBe("python");
+  });
+
+  // Codex r1 P1: 超长块的结论以前不缓存,探测完重渲又探测一遍,无限循环。
+  test("超长块(> 200,000 字符)的结论同样缓存,重渲不会再次探测", async () => {
+    const huge = `${"value = compute(value) + 1\n".repeat(9000)}# ${unique()}`;
+    expect(huge.length).toBeGreaterThan(200_000);
+    const first = await detectCodeLanguageLater(huge);
+    expect(cachedCodeLanguage(huge)).toBe(first);
+    expect(cachedCodeLanguage(`${huge} `)).toBeUndefined();
+  });
+
+  test("分片探测与同步探测结论一致;并发请求共用一次探测,中途让出主线程", async () => {
+    const js = Array.from({ length: 60 }, (_, i) => `const f${i} = (a, b) => a.map((x) => x * ${i} + b).filter(Boolean); // ${unique()}`).join("\n");
+    const twin = `${js}\n`;
+    let yielded = false;
+    setTimeout(() => { yielded = true; }, 0);
+    const [a, b] = await Promise.all([detectCodeLanguageLater(js), detectCodeLanguageLater(js)]);
+    expect(yielded).toBe(true);
+    expect(a).toBe(b);
+    expect(cachedCodeLanguage(js)).toBe(a);
+    expect(detectCodeLanguageNow(twin)).toBe(a);
+  });
+});

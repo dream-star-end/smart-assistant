@@ -177,8 +177,25 @@ function evidenceKeyForLocator(raw: string): string | null {
   return cleaned ? `img:${cleaned}` : null;
 }
 
+/**
+ * OCV5-422: the timeline asks for every assistant row's keys on each streamed notify (fold decisions,
+ * deliverable rows). The result only depends on the text, so it is cached by text; finished rows hit.
+ * A streaming row's text is new on every delta, so the cache is simply dropped when it grows past the cap.
+ */
+const ARTIFACT_KEYS_CACHE_MAX = 2000;
+const artifactKeysCache = new Map<string, readonly string[]>();
+
 /** Stable keys for a real preview, image, or generated file. Tool names are not keys. */
-export function artifactEvidenceKeys(text: string): string[] {
+export function artifactEvidenceKeys(text: string): readonly string[] {
+  const cached = artifactKeysCache.get(text);
+  if (cached) return cached;
+  const keys = computeArtifactEvidenceKeys(text);
+  if (artifactKeysCache.size >= ARTIFACT_KEYS_CACHE_MAX) artifactKeysCache.clear();
+  artifactKeysCache.set(text, keys);
+  return keys;
+}
+
+function computeArtifactEvidenceKeys(text: string): readonly string[] {
   MD_IMAGE_RE.lastIndex = 0;
   GENERATED_PATH_RE.lastIndex = 0;
   const keys = htmlEvidenceKeys(text);
@@ -190,7 +207,7 @@ export function artifactEvidenceKeys(text: string): string[] {
     const key = generatedFileKey(match[0]);
     if (key) keys.push(key);
   }
-  return dedupe(keys);
+  return Object.freeze(dedupe(keys));
 }
 
 /** Preview, image, or generated-file assistant rows stay beside the answer. */

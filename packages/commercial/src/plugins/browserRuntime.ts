@@ -16,6 +16,7 @@ import { type BrowserStorageStateV1, validateBrowserStorageState } from './accou
 import {
   type ManagedBrowserPluginContractV1,
   REQUIRED_BROWSER_FORBIDDEN_CHANNELS,
+  coerceIntegerStringParams,
   validateRuntimePluginJson,
 } from './contracts.js'
 
@@ -512,6 +513,7 @@ export class ManagedBrowserRuntime {
         'ACTION_NOT_FOUND',
         'managed-browser read action not found',
       )
-    return this.runAction(args)
+    // Reads only: write params reach runAction exactly as sealed into their confirmation.
+    return this.runAction({ ...args, params: coerceIntegerStringParams(action.params, args.params) })
   }
 }
