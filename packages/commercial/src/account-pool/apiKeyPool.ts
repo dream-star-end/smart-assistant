@@ -90,6 +90,9 @@ async function loadSnapshot(): Promise<SecretRow[]> {
 
 async function rows(): Promise<SecretRow[]> {
   if (snapshot && Date.now() - snapshot.at < SNAPSHOT_TTL_MS) return snapshot.rows
+  // at === 0 means a member changed state (admin disable, cooldown, new key): the
+  // cached rows are known to be out of date and must not be used for selection.
+  const invalidated = snapshot !== null && snapshot.at === 0
   if (!loading) {
     loading = loadSnapshot().finally(() => {
       loading = null
@@ -98,8 +101,19 @@ async function rows(): Promise<SecretRow[]> {
   try {
     return await loading
   } catch {
-    // DB hiccup: keep serving the last snapshot rather than failing every request.
-    return snapshot?.rows ?? []
+    // Plain TTL expiry + DB hiccup: keep serving the last snapshot. After an explicit
+    // state change, fail closed (no selectable rows → pool_unavailable) so a key that
+    // was just disabled or cooled can never be picked from stale data.
+    return invalidated ? [] : (snapshot?.rows ?? [])
+  }
+}
+
+/** Apply a known state change to the cached row right away (selection and config gate). */
+function patchCachedStatus(id: string, status: SecretRow['status']): void {
+  if (!snapshot) return
+  snapshot = {
+    at: 0,
+    rows: snapshot.rows.map((r) => (r.id === id ? { ...r, status, cooldown_until: status === 'active' ? null : r.cooldown_until } : r)),
   }
 }
 
@@ -207,7 +221,12 @@ export async function reportApiKeyOutcome(memberId: string, outcome: PoolOutcome
       outcome.kind === 'upstream_error' && /^http_5\d\d$/.test(outcome.detail ?? '')
         ? { kind: 'network', detail: outcome.detail }
         : outcome
-    if (await applyTableMemberOutcome(API_KEY_MEMBERS, memberId, effective)) invalidateApiKeyPoolCache()
+    if (await applyTableMemberOutcome(API_KEY_MEMBERS, memberId, effective)) {
+      // Any transition the policy writes here takes the member out of 'active'
+      // (success never changes status), so drop it from selection immediately.
+      if (effective.kind !== 'success') patchCachedStatus(memberId, 'cooldown')
+      invalidateApiKeyPoolCache()
+    }
   } catch (err) {
     // eslint-disable-next-line no-console -- reporting must never break the request path
     console.warn('[apiKeyPool] report failed:', (err as Error)?.message ?? err)
@@ -294,6 +313,7 @@ export async function setApiKeyAdminStatus(id: string, status: 'active' | 'disab
          WHERE id = $1 RETURNING ${MEMBER_COLUMNS}`,
     [id],
   )
+  if (res.rows[0]) patchCachedStatus(id, res.rows[0].status)
   invalidateApiKeyPoolCache()
   return res.rows[0] ?? null
 }
