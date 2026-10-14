@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/run"
+# OCV5-420:测试夹具不得触发宿主上的自动恢复动作。
+export OC_V5_AUTORECOVER=off
 export OC_V5_LEASE_DB="$T/lease.db" OC_V5_LEASE_LOCK="$T/run/db.lock"
 export OC_V5_LEASE_CALLBACK_SECRET_FILE="$T/secret.env"
 export OC_V5_LEASE_CALLBACK_URL=http://127.0.0.1:18894/internal/v3/lease-callback

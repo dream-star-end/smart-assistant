@@ -796,7 +796,7 @@ watch_once() {
     write_disarm "$loud"
     WATCH_DISARM_ALERTED=1
     emit_watch_status false "$(suppression_reason_from_files)" true red || true
-    watch_alert critical fail_loud "FAIL-LOUD class=${loud}：不自动回切，已写停用标记与 manual-recovery，自动回滚停用。下一步：按 class 排查（deps-pg / schema / env / external-*），恢复后走应急恢复收尾，再 watch.sh --rearm。"
+    watch_alert critical fail_loud "FAIL-LOUD class=${loud}：不自动回切，已写停用标记与 manual-recovery。lease worker 的 autorecover 接管：依赖/现场恢复后稳定绿即自动归档标记并恢复保护；超时自动开工单派给 AI。"
     return 0
   fi
 
@@ -853,9 +853,9 @@ watch_once() {
 
   write_manual_recovery "tier1+tier2-failed"
   write_disarm "tier1+tier2-failed"
-  wlog "两级兜底仍红,已 disarm。需要人工跑应急恢复脚本。"
+  wlog "两级兜底仍红,已 disarm。autorecover 接管(退避重试兜底,仍失败自动开工单派给 AI)。"
   WATCH_DISARM_ALERTED=1
-  watch_alert critical rollback_failed "两级兜底后仍红，已停用自动回滚（watch-disarmed + manual-recovery）。立即人工处理：scripts/v5-selfhost-restore-worktree-units.sh，确认健康后 watch.sh --rearm。"
+  watch_alert critical rollback_failed "两级兜底后仍红，已停用本看护的自动回滚（watch-disarmed + manual-recovery）。lease worker 的 autorecover 接管：退避重试两级兜底，稳定绿后自动归档标记；仍失败自动开工单派给 AI。"
   emit_watch_status false "$(suppression_reason_from_files)" true red || true
   return 1
 }
@@ -957,6 +957,90 @@ watch_rearm() {
   watch_alert info rearmed "已重新武装自动回滚，停用标记归档到 ${dst}。"
   exec 8<&-
   echo "REARM_OK archived=$dst"
+}
+
+# OCV5-420:纯 AI 项目,没人会来跑 --rearm 或应急恢复。lease worker 的 autorecover 调本模式:
+# 持发布锁;连续 WATCH_REARM_CHECKS 次复合健康绿且 deps.pg=ok → 归档 manual-recovery 与停用标记
+# (看护恢复全部保护);仍红 → 外部依赖 / schema / env 类不回切(回切救不了,等依赖或修代码),
+# 其余走与阈值路径相同的两级兜底(tier1 回上一份 release → tier2 恢复备份 unit)。
+# --probe-only 只探测、只在绿时清标记,不动现场(兜底次数用完后的周期探测)。
+# 退出码:0 绿(标记已清);1 仍红;3 外部依赖/需修代码类,未回切;75 现在不能动(锁/窗口/演练模式)。
+watch_autoclear_markers() { # <how>
+  local how="$1" ts dst cleared=""
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  if [[ -f "$WATCH_MANUAL_RECOVERY" && ! -L "$WATCH_MANUAL_RECOVERY" ]]; then
+    dst="${WATCH_MANUAL_RECOVERY}.autocleared-$ts"
+    if mv -T -- "$WATCH_MANUAL_RECOVERY" "$dst"; then cleared="$cleared manual-recovery"; fi
+  fi
+  if [[ -f "$WATCH_DISARM" && ! -L "$WATCH_DISARM" ]]; then
+    write_fail_count 0
+    dst="${WATCH_DISARM}.autorearmed-$ts"
+    if mv -T -- "$WATCH_DISARM" "$dst"; then cleared="$cleared disarm"; fi
+  fi
+  if manual_recovery_present || recovery_marker_present; then
+    wlog "autorecover: 标记未能全部归档(可能是符号链接)"
+    return 1
+  fi
+  emit_watch_status true "" true green || true
+  if [[ -n "$cleared" ]]; then
+    wlog "autorecover: $how,已归档:$cleared"
+    watch_alert info autorecovered "自动恢复：${how}，已归档${cleared}，看护恢复自动回滚保护。live=$(readlink -f "$WATCH_LIVE" 2>/dev/null || echo unknown)"
+  fi
+  return 0
+}
+
+watch_stable_green() {
+  local i checks="$WATCH_REARM_CHECKS" interval="$WATCH_REARM_INTERVAL_SEC"
+  [[ "$checks" =~ ^[1-9][0-9]*$ ]] || checks=3
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=5
+  for ((i = 1; i <= checks; i++)); do
+    WATCH_LAST_MASTER_BODY=""
+    compound_green || return 1
+    master_deps_pg_ok || return 1
+    if (( i < checks && interval > 0 )); then sleep "$interval"; fi
+  done
+}
+
+watch_auto_recover() { # [--probe-only]
+  local probe_only=0 loud tier=""
+  [[ "${1:-}" == --probe-only ]] && probe_only=1
+  if is_true_dry; then echo "AUTORECOVER_SKIP dry"; return 75; fi
+  mkdir -p -- "$(dirname -- "$WATCH_LOCK")"
+  if [[ ! -e "$WATCH_LOCK" && ! -L "$WATCH_LOCK" ]]; then
+    ( umask 077; set -C; : >"$WATCH_LOCK" ) 2>/dev/null || true
+  fi
+  [[ -f "$WATCH_LOCK" && ! -L "$WATCH_LOCK" ]] || { echo "AUTORECOVER_SKIP lockfile"; return 75; }
+  exec 8<>"$WATCH_LOCK" || { echo "AUTORECOVER_SKIP lockfile"; return 75; }
+  if ! flock -n 8; then exec 8<&-; echo "AUTORECOVER_SKIP lock"; return 75; fi
+  if maint_is_live_exemption || in_cutover_grace; then
+    exec 8<&-; echo "AUTORECOVER_SKIP window"; return 75
+  fi
+  if watch_stable_green; then
+    watch_autoclear_markers "复合健康稳定绿" || { exec 8<&-; echo "AUTORECOVER_STILL_RED markers"; return 1; }
+    exec 8<&-; echo "AUTORECOVER_GREEN"; return 0
+  fi
+  if loud="$(classify_fail_loud)"; then
+    wlog "autorecover: 红但属 $loud,回切救不了,不动现场"
+    exec 8<&-; echo "AUTORECOVER_WAIT class=$loud"; return 3
+  fi
+  if [[ "$probe_only" == 1 ]]; then
+    exec 8<&-; echo "AUTORECOVER_STILL_RED probe-only"; return 1
+  fi
+  wlog "autorecover: 复合健康红,执行两级兜底"
+  if prev_release_is_valid && tier1_rollback; then
+    sleep 3
+    watch_stable_green && tier=tier1
+  fi
+  if [[ -z "$tier" ]] && tier2_restore_units; then
+    sleep 3
+    watch_stable_green && tier=tier2
+  fi
+  if [[ -n "$tier" ]]; then
+    watch_autoclear_markers "$tier 恢复后稳定绿" || { exec 8<&-; echo "AUTORECOVER_STILL_RED markers"; return 1; }
+    exec 8<&-; echo "AUTORECOVER_RESTORED $tier"; return 0
+  fi
+  emit_watch_status false "$(suppression_reason_from_files)" true red || true
+  exec 8<&-; echo "AUTORECOVER_STILL_RED"; return 1
 }
 
 watch_selftest() {
@@ -1130,7 +1214,7 @@ watch_selftest() {
 
 usage_watch() {
   cat <<'EOF'
-用法: watch.sh [--once|--selftest|--rearm]
+用法: watch.sh [--once|--selftest|--rearm|--auto-recover [--probe-only]]
   默认同 --once。WATCH_DRY=1(watch.env)时只记日志不真回切。
   切到真模式: 把 /opt/openclaude/v5-selfhost-watch/watch.env 里 WATCH_DRY=1 改成 0
   然后: systemctl daemon-reload && systemctl enable --now openclaude-v5-selfhost-watch.timer
@@ -1140,6 +1224,8 @@ usage_watch() {
   scripts/v5-selfhost-watch-install.md。禁止删除 watch-disarmed。
   重新武装只用 --rearm(OCV5-404):在已安装副本上执行,要求无活锁/维护/grace、无 manual-recovery、
   连续 WATCH_REARM_CHECKS 次复合健康绿且 deps.pg=ok;通过后把标记改名归档,不删除。
+  --auto-recover(OCV5-420)由 lease worker 的 autorecover 调用:稳定绿则归档 manual-recovery 与
+  停用标记;红则(非外部依赖/schema/env 类)走两级兜底。退出 0 绿 / 1 仍红 / 3 不回切类 / 75 现在不能动。
 EOF
 }
 
@@ -1151,6 +1237,7 @@ main() {
     # 那会让 watch_once 内部的 set -e 全部失效。
     --once|"") trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; watch_once ;;
     --rearm) trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; watch_rearm ;;
+    --auto-recover) trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; watch_auto_recover "${2:-}" ;;
     *)
       echo "未知参数: $1" >&2
       usage_watch >&2
@@ -1160,5 +1247,5 @@ main() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  main "${1:-}"
+  main "${1:-}" "${2:-}"
 fi

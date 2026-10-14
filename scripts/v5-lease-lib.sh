@@ -273,7 +273,7 @@ lease_body_failed() { # <lease_id> <reason> <evidence>
 🎫 lease $1(deploy:selfhost/ride)失败
 - 原因: $2
 - 证据: $3
-下一步:读证据判断是列车本身失败(可重新 register 搭下一班)还是需人工恢复(train recovery_required,禁止自动重发)。
+下一步:读证据判断是列车本身失败(修复后 push 新 tip 再 register)还是现场问题(train recovery_required 由 autorecover 自动恢复、重跑,超限会开工单派给 AI)。
 EOF
 }
 
@@ -289,7 +289,7 @@ lease_body_train_alert() { # <train_id> <status> <reason>
   cat <<EOF
 🚨 train $1 进入 $2
 - 原因: $3
-- 发车已暂停(open train 占位)。人工确认 survivor 状态后:\`oc-lease train resolve --id $1 --as committed|failed --reason ...\`
+- 发车暂停(open train 占位)。autorecover(OCV5-420)确认现场稳定绿后自动结束本班并重跑;兜底失败或超时自动开工单派给 AI。无需人工。
 EOF
 }
 

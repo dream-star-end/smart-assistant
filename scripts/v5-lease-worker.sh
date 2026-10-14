@@ -4,6 +4,7 @@
 # 每 tick 严格顺序(design-v2 §3.2):
 #   1 单例 flock(双 worker 防线)
 #   2 train 对账:非终态 train 无活 executor → 按 survivor 证据结算 / recovery_required
+#   2b autorecover(OCV5-420):recovery_required / manual-recovery / 看护停用 → 自动恢复,不等人
 #   3 过期:granted 超 ack/heartbeat 且执行器确认退出 → revoked;ride 超 6h → 面板告警(不过期)
 #   4 结算:live committed sha ⊇ want_sha → satisfied(同事务写 outbox)
 #   5 发车:仅剩余 ride、无 open train、锁可取 → 固定 target_sha 起一班 deploy(锁 fd 继承给执行器)
@@ -15,6 +16,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/v5-lease-lib.sh
 source "$SCRIPT_DIR/v5-lease-lib.sh"
+# OCV5-420:recovery_required / manual-recovery / 看护停用不再等人,由 autorecover 接管。
+# shellcheck source=scripts/v5-selfhost-autorecover.sh
+source "$SCRIPT_DIR/v5-selfhost-autorecover.sh"
 
 WORKER_LOCK="${OC_V5_LEASE_WORKER_LOCK:-/run/openclaude-v5-selfhost/lease-worker.lock}"
 WORKER_LOG_DIR="${OC_V5_LEASE_LOG_DIR:-/opt/openclaude/tmp/lease-trains}"
@@ -74,8 +78,8 @@ reconcile_trains() {
     elif live_sha="$(lease_live_committed_sha)"; then
       finish_train "$id" failed "执行器退出;live committed 但 sourceCommit=${live_sha:0:12} ≠ target ${target:0:12}(本班未上线)" "$ev"
     else
-      # survivor 处于未提交 mutation,或 live 不可读 → 需人工
-      finish_train "$id" recovery_required "执行器退出且 survivor 非 committed(uncommitted mutation / 宿主重启丢证据)。禁止自动重发。" "$ev"
+      # survivor 处于未提交 mutation,或 live 不可读 → recovery_required,由 autorecover 接管
+      finish_train "$id" recovery_required "执行器退出且 survivor 非 committed(uncommitted mutation / 宿主重启丢证据)。暂停发车,autorecover 确认现场稳定绿后自动结束并重跑。" "$ev"
       enqueue_train_alert "$id" recovery_required "执行器 pid=${pid:-?} 已退;survivor 证据 $ev"
     fi
   done <<<"$rows"
@@ -489,6 +493,8 @@ main() {
   acquire_singleton
   lease_init_db
   reconcile_trains
+  # 失败只记日志:自动恢复出错不能挡住结算、发车与投递。
+  autorecover_tick || wlog "autorecover tick 异常(下 tick 重试)"
   expire_and_alert
   settle_rides
   dispatch_train
