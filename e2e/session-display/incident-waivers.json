@@ -205,6 +205,12 @@
       "reason": "OCV5-423 Gemini Go bridge rejected CCB role:system messages locally (400). Model was admin-only and staged/disabled again; no user-visible model or default changed.",
       "approvedBy": "user 2026-10-15 要求 cc 接手 OCV5-423 查明并修好 Gemini 400（cc3 antigravity 会话）",
       "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "332954cc5ee1276cefbe027a9d62c13b6a4517bd",
+      "reason": "OCV5-423 Gemini Go bridge rejected Claude Code's server web_search tool locally (400) on the admin-only gemini-4 model; owner-only impact, fixed the same night.",
+      "approvedBy": "user 2026-10-15 要求查根因并修复 Gemini 4 网页搜索 400（cc3 antigravity 会话）",
+      "expiresAt": "2026-11-14"
     }
   ]
 }
