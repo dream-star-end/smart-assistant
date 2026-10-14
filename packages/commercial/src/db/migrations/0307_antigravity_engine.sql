@@ -1,4 +1,4 @@
--- 0305 OCV5-415 P2: official Google Antigravity CLI engine (selfhost).
+-- 0307 OCV5-415 P2: official Google Antigravity CLI engine (selfhost).
 --
 -- Deploy with OC_V5_ALLOW_BREAKING_MIGRATION=1: widening the model_catalog
 -- engine CHECK drops and re-adds that one constraint (same pattern as
@@ -19,7 +19,7 @@
 -- 4. Staged catalog rows + disabled pricing rows. Flash is public, the
 --    Claude / GPT-OSS models are admin-only. Activation is the normal admin
 --    catalog path after deploy (fn_model_catalog_guard: born staged).
--- Rollback: db/rollbacks/0305_antigravity_engine.sql.
+-- Rollback: db/rollbacks/0307_antigravity_engine.sql.
 
 DO $$ DECLARE c RECORD; BEGIN
   FOR c IN SELECT conname FROM pg_constraint WHERE conrelid='model_catalog'::regclass AND contype='c' AND pg_get_constraintdef(oid) LIKE '%engine%' AND pg_get_constraintdef(oid) LIKE '%ccb%' LOOP

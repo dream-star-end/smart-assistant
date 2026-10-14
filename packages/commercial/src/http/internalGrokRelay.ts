@@ -84,7 +84,7 @@ export function classifyGrokRelayStatus(status: number): GrokRelayOutcome {
  * counter-only recorder.
  */
 export function makeGrokRelayHealthRecorder(deps: {
-  health: Pick<AccountHealthTracker, 'onSuccess' | 'onFailure'>
+  health: Pick<AccountHealthTracker, 'onSuccess' | 'onFailure' | 'applyOutcome'>
   query?: typeof query
 }): (accountId: bigint, statusCode: number) => Promise<void> {
   const q = deps.query ?? query
@@ -111,6 +111,16 @@ export function makeGrokRelayHealthRecorder(deps: {
           WHERE id = $1 AND provider = 'grok'`,
         [String(accountId)],
       )
+    }
+    // OCV5-424:429 / 402 交共享策略立即冷却(rate_limited 指数退避 / quota 1h 后半开),
+    // 不再等 3 连败;401/403 仍按 3 连败计(401 先强制下次刷新 token,通常自愈)。
+    if (statusCode === 429 || statusCode === 402) {
+      await deps.health.applyOutcome(
+        accountId,
+        statusCode === 429 ? { kind: 'rate_limited', retryAfterMs: null } : { kind: 'quota_exhausted', resetAt: null },
+        { errorMsg: `grok_http_${statusCode}` },
+      )
+      return
     }
     await deps.health.onFailure(accountId, `grok_http_${statusCode}`)
   }

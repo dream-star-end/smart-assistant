@@ -27,7 +27,7 @@
  *   - 本模块只做 "从 active 池子挑一个 account" 这一件事。
  */
 
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID } from 'node:crypto'
 import type { PoolClient, QueryResultRow } from 'pg'
 import { AeadError } from '../crypto/aead.js'
 import { loadKmsKey } from '../crypto/keys.js'
@@ -35,6 +35,8 @@ import { getPool } from '../db/index.js'
 import { query } from '../db/queries.js'
 import type { AccountHealthTracker } from './health.js'
 import { activePoolWhere } from './poolCandidates.js'
+import type { PoolOutcome } from './policy/outcome.js'
+import { defaultHash, wrhScore } from './policy/select.js'
 import { hoursUntil, quotaHeadroom, resetProximityFactor } from './poolWeight.js'
 import {
   type AccountPlan,
@@ -42,8 +44,10 @@ import {
   type AccountRecoveryHint,
   getTokenForUse,
   readAccountRecoveryHint,
-  updateAccount,
 } from './store.js'
+
+/** OCV5-424:无 reset 时间的配额占用超过此小时数未刷新即视为陈旧(7d 窗口按 ×28)。 */
+export const STALE_QUOTA_HOURS = 6
 
 export const ERR_ACCOUNT_POOL_UNAVAILABLE = 'ERR_ACCOUNT_POOL_UNAVAILABLE'
 export const ERR_ACCOUNT_POOL_BUSY = 'ERR_ACCOUNT_POOL_BUSY'
@@ -496,7 +500,11 @@ export interface PickResult {
  */
 export type ReleaseResult =
   | { kind: 'success' }
-  | { kind: 'failure'; error?: string | null }
+  /**
+   * OCV5-424:`outcome` 给出已分类的失败(429/配额/认证…),交共享 policy/decide;
+   * 缺省按未分类上游失败(upstream_error,3 连败冷却)处理,与旧行为一致。
+   */
+  | { kind: 'failure'; error?: string | null; outcome?: PoolOutcome | null }
   | { kind: 'transient_network'; error?: string | null }
   | { kind: 'client_error'; error?: string | null }
 
@@ -587,11 +595,8 @@ export interface CandidateRow extends QueryResultRow {
   persona: import('./persona.js').Persona | null
 }
 
-/** 默认哈希:SHA-256,截前 8B 作 64-bit 无符号整数。 */
-export function defaultHash(s: string): bigint {
-  const h = createHash('sha256').update(s).digest()
-  return h.readBigUInt64BE(0)
-}
+/** 默认哈希:SHA-256,截前 8B 作 64-bit 无符号整数。OCV5-424:与各服务池共用 policy/select。 */
+export { defaultHash }
 
 /** 用于把 64-bit 哈希映射到 (0,1) 开区间(避免 ln(0)/ln(1) 极端值)。 */
 const TWO_64 = 2n ** 64n
@@ -741,15 +746,9 @@ export function pickWRH(
   let bestScore = Number.POSITIVE_INFINITY
   for (let i = 0; i < candidates.length; i += 1) {
     const c = candidates[i]
-    const h = hash(`${key}:${c.id}`)
-    // u ∈ (0, 1):加 0.5 保证既不 0 也不 1,避免 ln 极端值
-    // 用 53-bit 安全映射 — Number(2^64-1) 会舍入到 2^64 让 u=1,违背开区间承诺
-    const h53 = Number(BigInt.asUintN(64, h) >> 11n)
-    const u = (h53 + 0.5) / 2 ** 53
-    const w = computeAccountWeight(c, now)
-    // score 越小越优:w 越大 ⇒ 期望 score 越小(选中概率正比 w)。
-    // 同样 u(给定 key+id 确定),w 越大 ⇒ score 越小,故 argmin 优先 w 大者。
-    const score = -Math.log(u) / w
+    // OCV5-424:score 计算与各服务池共用 policy/select.wrhScore(同一 53-bit 映射,
+    // argmin 优先 weight 大者)。
+    const score = wrhScore(key, c.id, computeAccountWeight(c, now), hash)
     if (score < bestScore) {
       bestScore = score
       bestIdx = i
@@ -1295,8 +1294,12 @@ export class AccountScheduler {
     where.push(
       // 过窗陈旧占用不再踢出(INC-20260920-CLAUDE-QUOTA-RESET-STALE)。
       // resets_at IS NULL → `<= NOW()` 为 unknown,OR 不成立,仍按 pct 剔除。
-      `(quota_5h_pct IS NULL OR quota_5h_pct < $${pctIdx} OR quota_5h_resets_at <= NOW())`,
-      `(quota_7d_pct IS NULL OR quota_7d_pct < $${pctIdx} OR quota_7d_resets_at <= NOW())`,
+      // OCV5-424:resets_at 为空且占用数据已超过 STALE_QUOTA_HOURS 未刷新(最长窗口 5h 早已滚动)
+      // 视为陈旧,不再永久剔除;权重仍按 pct 压到 0.05,只在别无可选时承接。
+      `(quota_5h_pct IS NULL OR quota_5h_pct < $${pctIdx} OR quota_5h_resets_at <= NOW()
+        OR (quota_5h_resets_at IS NULL AND quota_updated_at < NOW() - INTERVAL '${STALE_QUOTA_HOURS} hours'))`,
+      `(quota_7d_pct IS NULL OR quota_7d_pct < $${pctIdx} OR quota_7d_resets_at <= NOW()
+        OR (quota_7d_resets_at IS NULL AND quota_updated_at < NOW() - INTERVAL '${STALE_QUOTA_HOURS * 28} hours'))`,
       `(grok_credit_usage_pct IS NULL OR grok_credit_usage_pct < $${pctIdx} OR grok_credit_period_end IS NULL OR grok_credit_period_end <= NOW())`,
     )
     const res = await query<CandidateRow>(
@@ -1370,17 +1373,15 @@ export class AccountScheduler {
       } catch (err) {
         this.releaseSlot(chosen.id, slotId)
         if (err instanceof AeadError) {
-          // 密文坏 —— 隔离这个账号(异步 disable 不阻塞 pick 路径),从候选剔除继续选
-          void updateAccount(
-            chosen.id,
-            {
-              status: 'disabled',
-              last_error: `AEAD decryption failed at pick(): ${err.message}`.slice(0, 500),
-            },
-            this.keyFn,
-          ).catch(() => {
-            /* best-effort;下一轮 pick 的 SELECT status='active' 也会自然排除 */
-          })
+          // 密文坏 —— 隔离这个账号(异步,不阻塞 pick 路径),从候选剔除继续选。
+          // OCV5-424:不再写 disabled,交共享策略进 credential 冷却,到期自动探测解密。
+          void this.health
+            .applyOutcome(chosen.id, { kind: 'credential_corrupt', detail: 'aead_pick' }, {
+              errorMsg: `AEAD decryption failed at pick(): ${err.message}`.slice(0, 500),
+            })
+            .catch(() => {
+              /* best-effort;下一轮 pick 的 SELECT status='active' 也会自然排除 */
+            })
           quarantined += 1
           pool = pool.filter((c) => c.id !== chosen.id)
           continue
@@ -1495,14 +1496,11 @@ export class AccountScheduler {
     } catch (err) {
       this.releaseSlot(chosen.id, slotId)
       if (err instanceof AeadError) {
-        void updateAccount(
-          chosen.id,
-          {
-            status: 'disabled',
-            last_error: `AEAD decryption failed at pickPinnedAccount(): ${err.message}`.slice(0, 500),
-          },
-          this.keyFn,
-        ).catch(() => {})
+        void this.health
+          .applyOutcome(chosen.id, { kind: 'credential_corrupt', detail: 'aead_pin' }, {
+            errorMsg: `AEAD decryption failed at pickPinnedAccount(): ${err.message}`.slice(0, 500),
+          })
+          .catch(() => {})
         return null
       }
       throw err
@@ -1709,7 +1707,12 @@ export class AccountScheduler {
     if (input.result.kind === 'success') {
       await this.health.onSuccess(input.account_id)
     } else if (input.result.kind === 'failure') {
-      await this.health.onFailure(input.account_id, input.result.error ?? null)
+      const outcome = input.result.outcome
+      if (outcome && outcome.kind !== 'success') {
+        await this.health.applyOutcome(input.account_id, outcome, { errorMsg: input.result.error ?? null })
+      } else {
+        await this.health.onFailure(input.account_id, input.result.error ?? null)
+      }
     }
     // transient_network / client_error:已释放 slot,但不扣健康分(见 ReleaseResult 注释)
   }

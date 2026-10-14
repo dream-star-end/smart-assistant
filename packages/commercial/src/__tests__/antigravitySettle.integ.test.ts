@@ -1,5 +1,5 @@
 /**
- * OCV5-415 P2 billing on real PG: migration 0305 + relay usage rows + the
+ * OCV5-415 P2 billing on real PG: migration 0307 + relay usage rows + the
  * durable turn claim (Codex r1 P1: a reconnected bridge must still settle).
  *
  * REQUIRE_TEST_DB=1 bash scripts/test-mutex.sh commercial \
@@ -20,7 +20,7 @@ import { query } from '../db/queries.js'
 import { recordAntigravityRelayUsage } from '../http/internalAntigravityRelay.js'
 import { useDedicatedTestDatabase } from './helpers/db.js'
 
-const db = useDedicatedTestDatabase('antigravity_settle_0305_test')
+const db = useDedicatedTestDatabase('antigravity_settle_0307_test')
 const MODEL = 'antigravity-gemini-3.8-flash'
 const PRICING = {
   model_id: MODEL,
@@ -81,7 +81,7 @@ async function turnStatus(requestId: string): Promise<string | undefined> {
   return r.rows[0]?.status
 }
 
-describe('0305 antigravity engine schema', () => {
+describe('0307 antigravity engine schema', () => {
   test('engine CHECK accepts antigravity; catalog rows are staged, pricing disabled, claude/gpt-oss admin-only', async (t) => {
     if (db.skipIfUnavailable(t)) return
     const rows = await query<{

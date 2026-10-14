@@ -96,7 +96,7 @@
 
 数据流：
 
-1. **账号**：`gemini_oauth_accounts`（0305），refresh/access token 用 `loadKmsKey` AES-GCM 加密。接入走管理接口 `POST /api/admin/antigravity-accounts/auth/start|complete`（PKCE，与 CLI 同一个同意页），或运维脚本 `packages/commercial/scripts/antigravity-import-account.ts`（导入宿主机上已登录 CLI 的 token 文件）。client secret 是 1.3.4 二进制内嵌的 installed-app secret，放在 master/egress env `OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET`。
+1. **账号**：`gemini_oauth_accounts`（0307），refresh/access token 用 `loadKmsKey` AES-GCM 加密。接入走管理接口 `POST /api/admin/antigravity-accounts/auth/start|complete`（PKCE，与 CLI 同一个同意页），或运维脚本 `packages/commercial/scripts/antigravity-import-account.ts`（导入宿主机上已登录 CLI 的 token 文件）。client secret 是 1.3.4 二进制内嵌的 installed-app secret，放在 master/egress env `OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET`。
 2. **准入**（master，userChatBridge）：authority 必须是 `antigravity` 引擎 → 余额 > 0 → 选账号 → 签受限令牌 → 签 route（Redis，只存 token 的 sha256；绑定容器/用户/requestId/模型/账号/准入预算）→ 帧里带 `__oc_antigravity_route {baseUrl, routeToken, accessToken, accessTokenExpiresAt, idToken?}`，客户端同名字段一律剥掉。
 3. **容器**（gateway）：`_buildSafeAntigravityRouteOverride` 逐字段校验 → adapter 把受限令牌写进本次 HOME 的 token 文件（0600，refresh_token 为空），设 `CLOUD_CODE_URL=<route>`。CLI 的请求打到 gateway 的 loopback relay，去掉 CLI 的 Authorization / x-goog-api-key / cookie，换成容器 token 转给 master/egress。
 4. **relay**（`internalAntigravityRelay`，master 与 egress 都挂）：校验容器身份和 route；只放行 CLI 实际调用的 8 个方法；生成调用只放行该模型的 CLI id 和标题模型；按已计量费用 ≥ 准入预算时拒绝新调用（402）；注入账号全权限令牌转给 daily-cloudcode-pa；流结束前把 `usageMetadata` 写进 `antigravity_relay_usage`。
@@ -109,7 +109,7 @@
 - 回合结束前桥断开（浏览器关闭、master 重启），relay 已记的用量不会结算，路由也只在清理时失效。与 zcode 现状相同；补一个按 `antigravity_relay_usage` 找未结算 requestId 的对账任务列为后续。
 - 一个回合内所有调用（含标题）按回合模型的价格计。
 - 受限令牌在容器里可被 yolo 工具读到，只能读账号的邮箱和头像；CLI 在回合中途若重新做资格检查且令牌已过期（签发时保证 ≥20 分钟余量），回合会以认证失败结束。
-- 迁移 0305 扩 `model_catalog` 的 engine CHECK（先 DROP 再 ADD），按个人版迁移门属于破坏性 DDL，发布需要 `OC_V5_ALLOW_BREAKING_MIGRATION=1` 或发布前人工 apply，并需要用户批准。
+- 迁移 0307 扩 `model_catalog` 的 engine CHECK（先 DROP 再 ADD），按个人版迁移门属于破坏性 DDL，发布需要 `OC_V5_ALLOW_BREAKING_MIGRATION=1` 或发布前人工 apply，并需要用户批准。
 
 ## 8. 证据
 

@@ -32,6 +32,7 @@
  *     debitedCredits/balanceAfter 退化为 null(无法重算)
  */
 
+import { readPoolOutcome, type PoolOutcome } from "../account-pool/policy/outcome.js";
 import { isBoxApiModel } from "@openclaude/protocol";
 import { randomUUID } from "node:crypto";
 import type { Pool } from "pg";
@@ -615,6 +616,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
     runner: () => Promise<FinalizeOutcome>,
     schedulerResult: "success" | "failure" | "client_error",
     schedulerErrMsg: string | null,
+    schedulerOutcome: PoolOutcome | null = null,
   ): Promise<FinalizeOutcome> {
     if (done) return done;
     if (inflight) return inflight;
@@ -646,7 +648,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
                 ? { kind: "success" }
                 : schedulerResult === "client_error"
                   ? { kind: "client_error", error: schedulerErrMsg }
-                  : { kind: "failure", error: schedulerErrMsg };
+                  : { kind: "failure", error: schedulerErrMsg, outcome: schedulerOutcome };
             await deps.scheduler.release({
               account_id: ctx.accountId,
               slotId: ctx.slotId,
@@ -668,7 +670,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
   return {
     commit: (obs) => runFinalizeAndRelease(() => runCommit(obs), "success", null),
     fail: (obs, err, failureCode) =>
-      runFinalizeAndRelease(() => runAbort(obs, err, failureCode), "failure", errMessageShort(err)),
+      runFinalizeAndRelease(() => runAbort(obs, err, failureCode), "failure", errMessageShort(err), readPoolOutcome(err)),
     failClient: (obs, err, failureCode) =>
       runFinalizeAndRelease(() => runAbort(obs, err, failureCode), "client_error", errMessageShort(err)),
   };

@@ -1,6 +1,6 @@
 /**
  * Google AI subscription accounts (consumer OAuth) behind the Antigravity
- * relay (OCV5-415 P2). Storage: gemini_oauth_accounts (0305).
+ * relay (OCV5-415 P2). Storage: gemini_oauth_accounts (0307).
  *
  * Two kinds of access token come out of one stored refresh token:
  *   - full scope (cloud-platform, …): only the relay uses it, injected into

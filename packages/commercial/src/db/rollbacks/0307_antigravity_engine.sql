@@ -1,5 +1,5 @@
--- Rollback for 0305_antigravity_engine (OCV5-415 P2).
--- Re-release code older than 0305 first. Refuses if any Antigravity model was
+-- Rollback for 0307_antigravity_engine (OCV5-415 P2).
+-- Re-release code older than 0307 first. Refuses if any Antigravity model was
 -- activated (retire it through the admin catalog path instead) or if relay
 -- usage was recorded (that is billing evidence; keep it).
 -- The widened engine CHECK stays: older code never writes 'antigravity'.
@@ -7,10 +7,10 @@ BEGIN;
 LOCK TABLE schema_migrations IN SHARE ROW EXCLUSIVE MODE;
 DO $$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version = '0305_antigravity_engine') THEN
-    RAISE EXCEPTION '0305_antigravity_engine is not applied';
+  IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version = '0307_antigravity_engine') THEN
+    RAISE EXCEPTION '0307_antigravity_engine is not applied';
   END IF;
-  IF EXISTS (SELECT 1 FROM schema_migrations WHERE version > '0305_antigravity_engine') THEN
+  IF EXISTS (SELECT 1 FROM schema_migrations WHERE version > '0307_antigravity_engine') THEN
     RAISE EXCEPTION 'a later migration is applied; roll that back first';
   END IF;
   IF EXISTS (SELECT 1 FROM model_catalog WHERE engine = 'antigravity' AND state <> 'staged') THEN
@@ -27,5 +27,5 @@ DELETE FROM model_catalog WHERE engine = 'antigravity' AND state = 'staged';
 DROP TABLE antigravity_turns;
 DROP TABLE antigravity_relay_usage;
 DROP TABLE gemini_oauth_accounts;
-DELETE FROM schema_migrations WHERE version = '0305_antigravity_engine';
+DELETE FROM schema_migrations WHERE version = '0307_antigravity_engine';
 COMMIT;

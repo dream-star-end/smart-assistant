@@ -83,7 +83,19 @@ after(async () => {
 
 beforeEach(async () => {
   if (!pgAvailable) return
-  await query('TRUNCATE TABLE usage_records, claude_accounts RESTART IDENTITY CASCADE')
+  // The previous test's fire-and-forget writes (refresh event / alert inbox) can still be
+  // landing while TRUNCATE ... CASCADE takes its locks; retry a deadlock instead of failing
+  // the next test's hook (OCV5-424: the cooldown path does a little more DB work, which
+  // made this existing race show up).
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await query('TRUNCATE TABLE usage_records, claude_accounts RESTART IDENTITY CASCADE')
+      return
+    } catch (err) {
+      if ((err as { code?: string }).code !== '40P01' || attempt >= 4) throw err
+      await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)))
+    }
+  }
 })
 
 function skipIfNoDb(t: { skip: (reason: string) => void }): boolean {
@@ -327,7 +339,10 @@ describe('refreshAccountToken — 成功路径', () => {
   })
 })
 
-describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
+// OCV5-424:refresh 被明确拒绝不再写 status='disabled'(那需要人工救),而是进共享策略的
+// auth 冷却(cooldown_reason='auth',到期由恢复 actor 探测)。下列断言随之从 disabled 改为
+// cooldown + reason=auth;不禁用网络抖动的断言保持不变。
+describe('refreshAccountToken — 失败路径(auth 冷却 + 抛)', () => {
   test('账号不存在 → account_not_found(不试图禁用,因为就没有)', async (t) => {
     if (skipIfNoDb(t)) return
     await assert.rejects(
@@ -337,7 +352,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
     )
   })
 
-  test('无 refresh_token → 禁用 + 抛 no_refresh_token', async (t) => {
+  test('无 refresh_token → auth 冷却 + 抛 no_refresh_token', async (t) => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       { runtime_channel: 'v3', label: 'nr', plan: 'pro', token: 'T', egress_proxy_id: await insertTestEgressProxy(KEY) },
@@ -349,7 +364,8 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
         err instanceof RefreshError && (err as RefreshError).code === 'no_refresh_token',
     )
     const row = await getAccount(a.id)
-    assert.equal(row!.status, 'disabled')
+    assert.equal(row!.status, 'cooldown')
+    assert.equal((await query<{ r: string }>('SELECT cooldown_reason AS r FROM claude_accounts WHERE id = $1', [String(row!.id)])).rows[0]?.r, 'auth')
     assert.match(row!.last_error ?? '', /refresh_no_token/)
   })
 
@@ -385,7 +401,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
     assert.equal(row!.status, 'active', 'transient 5xx 不 disable')
   })
 
-  test('HTTP 400 → http_error 禁用(明确拒绝)', async (t) => {
+  test('HTTP 400 → http_error auth 冷却(明确拒绝)', async (t) => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
@@ -412,11 +428,12 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
       },
     )
     const row = await getAccount(a.id)
-    assert.equal(row!.status, 'disabled')
+    assert.equal(row!.status, 'cooldown')
+    assert.equal((await query<{ r: string }>('SELECT cooldown_reason AS r FROM claude_accounts WHERE id = $1', [String(row!.id)])).rows[0]?.r, 'auth')
     assert.match(row!.last_error ?? '', /refresh_http_400/)
   })
 
-  test('HTTP 2xx 但非 JSON → bad_response + 禁用', async (t) => {
+  test('HTTP 2xx 但非 JSON → bad_response + auth 冷却', async (t) => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
@@ -439,10 +456,11 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
         err instanceof RefreshError && (err as RefreshError).code === 'bad_response',
     )
     const row = await getAccount(a.id)
-    assert.equal(row!.status, 'disabled')
+    assert.equal(row!.status, 'cooldown')
+    assert.equal((await query<{ r: string }>('SELECT cooldown_reason AS r FROM claude_accounts WHERE id = $1', [String(row!.id)])).rows[0]?.r, 'auth')
   })
 
-  test('HTTP 2xx JSON 但缺 access_token → bad_response + 禁用', async (t) => {
+  test('HTTP 2xx JSON 但缺 access_token → bad_response + auth 冷却', async (t) => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
@@ -465,7 +483,8 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
         err instanceof RefreshError && (err as RefreshError).code === 'bad_response',
     )
     const row = await getAccount(a.id)
-    assert.equal(row!.status, 'disabled')
+    assert.equal(row!.status, 'cooldown')
+    assert.equal((await query<{ r: string }>('SELECT cooldown_reason AS r FROM claude_accounts WHERE id = $1', [String(row!.id)])).rows[0]?.r, 'auth')
   })
 
   test('network 抛 → network_transient,**不**禁用账号(代理/网络抖动可恢复)', async (t) => {
@@ -501,7 +520,7 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
     assert.equal(row!.status, 'active')
   })
 
-  test('health.manualDisable 注入时走 health 路径;Redis 计数器也被清', async (t) => {
+  test('health 注入时走 health.applyOutcome 路径;连续失败计数被清', async (t) => {
     if (skipIfNoDb(t)) return
     const a = await createAccount(
       {
@@ -531,10 +550,11 @@ describe('refreshAccountToken — 失败路径(禁用 + 抛)', () => {
       RefreshError,
     )
     const row = await getAccount(a.id)
-    assert.equal(row!.status, 'disabled')
-    // health 模块应该清理过 redis
+    assert.equal(row!.status, 'cooldown')
+    assert.equal((await query<{ r: string }>('SELECT cooldown_reason AS r FROM claude_accounts WHERE id = $1', [String(row!.id)])).rows[0]?.r, 'auth')
+    // 共享策略:auth 冷却清连续失败计数,health 缓存写成冷却后的分数(80−20)
     assert.equal(await redis.get(`acct:fail:${a.id}`), null)
-    assert.equal(await redis.get(`acct:health:${a.id}`), null)
+    assert.equal(await redis.get(`acct:health:${a.id}`), '80')
   })
 })
 

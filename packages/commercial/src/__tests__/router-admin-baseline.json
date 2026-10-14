@@ -474,6 +474,24 @@
     "handler": "handleAdminBoxClaudeProfilesSelect"
   },
   {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/pools",
+    "handler": "handleAdminPoolsList"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/pools/keys",
+    "handler": "handleAdminPoolKeyCreate"
+  },
+  {
+    "method": "PATCH",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/pools/keys/",
+    "handler": "handleAdminPoolKeyPatch"
+  },
+  {
     "method": "POST",
     "pathKind": "pathPrefix",
     "pathValue": "/api/admin/accounts/",
