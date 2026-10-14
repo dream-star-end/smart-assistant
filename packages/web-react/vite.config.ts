@@ -6,6 +6,7 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { forbiddenTaskboardEntryImports } from "./src/lib/forbidTaskboardEntryImport";
 import { describeFirstScreenBudget, firstScreenBudgetReport } from "./src/lib/firstScreenBudget";
+import { deferEntryStylesheets } from "./src/lib/nonBlockingCss";
 
 /**
  * 前端构建身份(版本握手单一权威):对最终 index.html(资产标签已注入)取
@@ -37,6 +38,29 @@ function ocBuildMeta(): Plugin {
           "</head>",
           `  <meta name="oc-build" content="${id}">\n  </head>`,
         );
+      },
+    },
+  };
+}
+
+/**
+ * OCV5-422 慢网首屏:index.html 的入口样式表改为非阻塞(preload + 脚本插入),样式就绪前由内联占位顶着,
+ * main.tsx 等样式就绪再挂载 React(防无样式闪屏)。纯函数与说明见 src/lib/nonBlockingCss。
+ * 必须排在 ocBuildMeta 之前:构建身份按最终 html 取哈希。
+ */
+function nonBlockingEntryCss(): Plugin {
+  return {
+    name: "non-blocking-entry-css",
+    apply: "build",
+    transformIndexHtml: {
+      order: "post",
+      handler(html, ctx) {
+        if (ctx.path !== "/index.html") return;
+        const deferred = deferEntryStylesheets(html);
+        if (deferred.hrefs.length === 0) {
+          throw new Error("non-blocking-entry-css: index.html 里没有入口样式表 link,构建产物结构变了?");
+        }
+        return deferred.html;
       },
     },
   };
@@ -132,7 +156,7 @@ function firstScreenBudget(): Plugin {
 
 export default defineConfig(() => {
   return {
-    plugins: [react(), tailwindcss(), ocBuildMeta(), forbidTaskboardEntryImport(), firstScreenBudget()],
+    plugins: [react(), tailwindcss(), nonBlockingEntryCss(), ocBuildMeta(), forbidTaskboardEntryImport(), firstScreenBudget()],
     server: {
       host: "127.0.0.1",
       port: 5174,
