@@ -33,6 +33,15 @@ describe("codeLanguageDetect", () => {
     expect(cachedCodeLanguage(text)).toBe("python");
   });
 
+  // Codex r1 P1: 超长块的结论以前不缓存,探测完重渲又探测一遍,无限循环。
+  test("超长块(> 200,000 字符)的结论同样缓存,重渲不会再次探测", async () => {
+    const huge = `${"value = compute(value) + 1\n".repeat(9000)}# ${unique()}`;
+    expect(huge.length).toBeGreaterThan(200_000);
+    const first = await detectCodeLanguageLater(huge);
+    expect(cachedCodeLanguage(huge)).toBe(first);
+    expect(cachedCodeLanguage(`${huge} `)).toBeUndefined();
+  });
+
   test("分片探测与同步探测结论一致;并发请求共用一次探测,中途让出主线程", async () => {
     const js = Array.from({ length: 60 }, (_, i) => `const f${i} = (a, b) => a.map((x) => x * ${i} + b).filter(Boolean); // ${unique()}`).join("\n");
     const twin = `${js}\n`;

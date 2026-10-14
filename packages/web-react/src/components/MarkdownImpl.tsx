@@ -348,11 +348,15 @@ export default function MarkdownImpl({
       mountedRef.current = false;
     };
   }, []);
+  // 本实例自己记住探测结论:全局缓存即使把它逐出,重渲时也不会再次进入「待探测」而循环。
+  const detectedRef = useRef(new Map<string, string | null>());
   const onPendingDetect = useCallback((text: string) => {
-    void detectCodeLanguageLater(text).then(() => {
+    void detectCodeLanguageLater(text).then((language) => {
+      detectedRef.current.set(text, language);
       if (mountedRef.current) setDetectedCount((count) => count + 1);
     });
   }, []);
+  const knownLanguage = useCallback((text: string) => detectedRef.current.get(text), []);
   // Intelligent UI 开关:关闭(或服务端总开关关闭)时把 ```ui 围栏整段换成等价 Markdown 再渲染。
   const iuiEnabled = useIntelligentUiEnabled();
   // components 里的渲染器是「组件类型」:每次渲染都造新函数 = React 视为新类型 → 富块子树
@@ -500,7 +504,7 @@ export default function MarkdownImpl({
         rehypePlugins={[
           rehypeBareBreaks,
           // detect=false 时没标语言的块不做同步语言探测（大文件预览防卡死，见 MarkdownProps.autoDetectCode）。
-          [rehypeHighlightShared, { detect: autoDetectCode, onPendingDetect }],
+          [rehypeHighlightShared, { detect: autoDetectCode, onPendingDetect, knownLanguage }],
           // 数学公式：$..$ / $$..$$ → KaTeX 渲染(remarkMath 解析 + rehypeKatex 出 HTML)。
           // errorColor 跟随主题 token(KaTeX 默认 #cc0000 在暗色底上对比度不足)。
           [rehypeKatex, { strict: false, throwOnError: false, errorColor: "var(--danger)" }],
@@ -542,7 +546,12 @@ function sharedHighlight(options: Parameters<typeof rehypeHighlight>[0]) {
   return transformer;
 }
 
-type HighlightOptions = { detect?: boolean; onPendingDetect?: (text: string) => void };
+type HighlightOptions = {
+  detect?: boolean;
+  onPendingDetect?: (text: string) => void;
+  /** 调用方已拿到的探测结论(优先于全局缓存)。 */
+  knownLanguage?: (text: string) => string | null | undefined;
+};
 
 /**
  * 高亮插件。有标注的代码块照常交给 rehype-highlight;无标注的块(detect 开时)由 lib/codeLanguageDetect 定语言
@@ -551,14 +560,15 @@ type HighlightOptions = { detect?: boolean; onPendingDetect?: (text: string) => 
  * 大块且还没探测过 → 本次按不探测渲染(与流式尾段相同的纯文本代码块),交给 onPendingDetect 分片探测,结果出来后
  * 调用方重渲一次上色。attacher 每次渲染都会被调用(react-markdown 每次重建处理器),所以回调按本次渲染闭包。
  */
-function rehypeHighlightShared({ detect = false, onPendingDetect }: HighlightOptions = {}) {
+function rehypeHighlightShared({ detect = false, onPendingDetect, knownLanguage }: HighlightOptions = {}) {
   const base = sharedHighlight({ detect: false });
   if (!detect) return base;
   return (tree: Parameters<typeof base>[0], file: Parameters<typeof base>[1]) => {
     const blocks = unlabelledCodeBlocks(tree as unknown as HastNode).map((node) => {
       const text = hastText(node);
       const classes = codeClassNames(node) ?? [];
-      let language = cachedCodeLanguage(text);
+      let language = knownLanguage?.(text);
+      if (language === undefined) language = cachedCodeLanguage(text);
       if (language === undefined && text.length <= SYNC_DETECT_MAX_CHARS) language = detectCodeLanguageNow(text);
       if (language === undefined) onPendingDetect?.(text);
       node.properties = { ...node.properties, className: [...classes, `language-${language ?? "plaintext"}`] };
