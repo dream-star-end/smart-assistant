@@ -46,12 +46,29 @@ export function decodeGeminiToolId(id: string): Obj {
   return e
 }
 
+function systemParts(v: unknown): Obj[] {
+  return blocks(v).map((b) => {
+    if (b.type !== 'text' || typeof b.text !== 'string')
+      throw new Error('unsupported Gemini system content')
+    return { text: b.text }
+  })
+}
+
 export function anthropicToGemini(body: Obj): Obj {
   const contents: Obj[] = []
   const calls = new Map<string, { name: string; nativeId?: string }>()
+  // CCB sends platform context as role:"system" messages inside `messages`
+  // (OCV5-423 live 400: every real platform turn carried one). Google has no
+  // system role in contents, so they join systemInstruction in order, after
+  // the top-level system — the same folding boxMessagesMapper applies.
+  const inlineSystem: Obj[] = []
   if (!Array.isArray(body.messages)) throw new Error('Gemini requires messages')
   for (const raw of body.messages) {
     const m = obj(raw)
+    if (m.role === 'system') {
+      inlineSystem.push(...systemParts(m.content))
+      continue
+    }
     if (m.role !== 'user' && m.role !== 'assistant')
       throw new Error('unsupported Gemini message role')
     const parts: Obj[] = []
@@ -108,14 +125,8 @@ export function anthropicToGemini(body: Obj): Obj {
   if (typeof body.top_p === 'number') generationConfig.topP = body.top_p
   if (Array.isArray(body.stop_sequences)) generationConfig.stopSequences = body.stop_sequences
   const result: Obj = { contents, generationConfig }
-  if (body.system !== undefined) {
-    const parts = blocks(body.system).map((b) => {
-      if (b.type !== 'text' || typeof b.text !== 'string')
-        throw new Error('unsupported Gemini system content')
-      return { text: b.text }
-    })
-    if (parts.length) result.systemInstruction = { parts }
-  }
+  const system = [...(body.system === undefined ? [] : systemParts(body.system)), ...inlineSystem]
+  if (system.length) result.systemInstruction = { parts: system }
   if (Array.isArray(body.tools) && body.tools.length) {
     result.tools = [
       {
