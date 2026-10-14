@@ -228,10 +228,13 @@ describe("deferred oversized immutable record", () => {
     expect(screen.queryByLabelText("消耗 1234 积分")).toBeNull();
   });
 
-  test("transient failure offers retry instead of a permanent placeholder", async () => {
-    const onFetchTapeRecordPayload = vi.fn()
-      .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce([{
+  // OCV5-421: 弱网下一次失败先静默重试,用户看不到报错;连续失败用尽后才给「点击重试」。
+  test("a single transient failure is retried silently, without a retry button", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const onFetchTapeRecordPayload = vi.fn()
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce([{
         id: "srv-tool-large",
         role: "tool",
         text: "恢复后的真实输出",
@@ -240,11 +243,43 @@ describe("deferred oversized immutable record", () => {
         toolName: "Bash",
         _completed: true,
       } satisfies ChatMessage]);
-    renderMsg(deferred, { onFetchTapeRecordPayload });
-    const retry = await screen.findByRole("button", { name: "真实记录加载失败，点击重试" });
-    fireEvent.click(retry);
-    await waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(screen.getByText("终端")).toBeInTheDocument());
+      renderMsg(deferred, { onFetchTapeRecordPayload });
+      await vi.waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalledTimes(1));
+      expect(screen.queryByRole("button", { name: /点击重试/ })).toBeNull();
+      await act(async () => { await vi.advanceTimersByTimeAsync(1600); });
+      await vi.waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(screen.getByText("终端")).toBeInTheDocument());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("repeated failures end in a retry button instead of a permanent placeholder", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const onFetchTapeRecordPayload = vi.fn()
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce([{
+        id: "srv-tool-large",
+        role: "tool",
+        text: "恢复后的真实输出",
+        output: "恢复后的真实输出",
+        ts: 1000,
+        toolName: "Bash",
+        _completed: true,
+      } satisfies ChatMessage]);
+      renderMsg(deferred, { onFetchTapeRecordPayload });
+      await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
+      const retry = await screen.findByRole("button", { name: "真实记录加载失败，点击重试" });
+      expect(onFetchTapeRecordPayload).toHaveBeenCalledTimes(3);
+      fireEvent.click(retry);
+      await vi.waitFor(() => expect(onFetchTapeRecordPayload).toHaveBeenCalledTimes(4));
+      await vi.waitFor(() => expect(screen.getByText("终端")).toBeInTheDocument());
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   test("unmount outside virtual-scroll overscan cancels its payload subscription", async () => {
