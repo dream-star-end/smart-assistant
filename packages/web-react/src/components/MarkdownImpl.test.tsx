@@ -332,6 +332,47 @@ describe('MarkdownImpl 代码高亮(OCV5-421)', () => {
     expect(container.querySelector('pre code > span')!.className).not.toContain('language-python')
   })
 
+  // OCV5-422: 探测结果按代码原文缓存;第二次起直接按记住的语言高亮,输出必须与第一次逐字一致。
+  test('同一段无标注代码再次渲染(走探测缓存)与首次渲染的 DOM 完全相同', () => {
+    const unique = `ocv5-422-${Math.random().toString(36).slice(2)}`
+    const code = `\`\`\`\nimport os\n\ndef ${unique.replace(/-/g, '_')}():\n    return [os.sep for _ in range(3)]\n\`\`\``
+    const first = render(<MarkdownImpl>{code}</MarkdownImpl>)
+    const html = first.container.innerHTML
+    expect(first.container.querySelector('pre code > span')!.className).toContain('language-python')
+    first.unmount()
+    for (let i = 0; i < 2; i++) {
+      const again = render(<MarkdownImpl>{code}</MarkdownImpl>)
+      expect(again.container.innerHTML).toBe(html)
+      again.unmount()
+    }
+  })
+
+  test('探测不出语言的块:缓存后仍只有 hljs、没有语言类,正文原样', () => {
+    const unique = Math.random().toString(36).slice(2)
+    const code = `\`\`\`\n┌──┐ ${unique}\n│  │\n└──┘\n\`\`\``
+    const first = render(<MarkdownImpl>{code}</MarkdownImpl>)
+    const html = first.container.innerHTML
+    const span = first.container.querySelector('pre code > span')!
+    expect(span.className).toContain('hljs')
+    expect(span.className).not.toContain('language-')
+    first.unmount()
+    const again = render(<MarkdownImpl>{code}</MarkdownImpl>)
+    expect(again.container.innerHTML).toBe(html)
+    expect(again.container.textContent).toContain(unique)
+  })
+
+  test('大块无标注代码不在渲染里同步探测:先按纯文本代码块显示,探测完再上色', async () => {
+    const unique = Math.random().toString(36).slice(2).replace(/[0-9]/g, 'x')
+    const body = Array.from({ length: 50 }, (_, i) => `def handler_${unique}_${i}(event):\n    return [item for item in event if item]`).join('\n')
+    const { container } = render(<MarkdownImpl>{`\`\`\`\n${body}\n\`\`\``}</MarkdownImpl>)
+    const code = () => container.querySelector('pre code > span')!
+    expect(code().className).not.toContain('hljs')
+    expect(code().textContent).toContain(`handler_${unique}_49`)
+    await waitFor(() => expect(code().className).toContain('language-python'), { timeout: 10_000 })
+    expect(container.querySelector('pre .hljs-keyword')).not.toBeNull()
+    expect(code().textContent).toContain(`handler_${unique}_49`)
+  })
+
   test('流式中未闭合的 $$ 不渲染半截公式,显示「公式生成中…」', () => {
     const { container } = render(<MarkdownImpl live>{'推导：\n\n$$\n\\frac{a}{'}</MarkdownImpl>)
     expect(container.querySelector('.katex-error')).toBeNull()

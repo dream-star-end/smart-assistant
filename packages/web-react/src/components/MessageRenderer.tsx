@@ -2901,8 +2901,14 @@ export function MessageList({
     findMatchesList.length === 0
       ? -1
       : Math.min(Math.max(0, findCursor), findMatchesList.length - 1);
-  const findLookup = findLookupItems(renderItems);
+  // OCV5-422: 查找条关闭时不建查找索引;打开时按 key 建一次表,行内命中判断不再逐行扫全表。
+  const findLookup = find ? findLookupItems(renderItems) : [];
   const findCurrentTarget = findCurrent >= 0 ? locateFindMatch(findLookup, findMatchesList[findCurrent]) : null;
+  const findHitRowKeys = new Set(
+    findHitKeys.size > 0
+      ? findLookup.filter((entry) => entry.memberKeys.some((member) => findHitKeys.has(member))).map((entry) => entry.key)
+      : [],
+  );
   const jumpTo = (match: FindMatch) => {
     const follow = followBottomRef;
     const scroller = scrollParent;
@@ -3064,7 +3070,7 @@ export function MessageList({
       {paintedItems.map((item, paintedIndex) => {
         const key = itemKey(item);
         const findCurrentHere = findCurrentTarget?.renderKey === key;
-        const findRowHit = findLookup.some((entry) => entry.key === key && entry.memberKeys.some((member) => findHitKeys.has(member)));
+        const findRowHit = findHitRowKeys.has(key);
         const eagerMedia = eagerMediaKeysRef.current?.has(key) === true;
         const visibleIndex = paintStart + paintedIndex;
         const liveRow =

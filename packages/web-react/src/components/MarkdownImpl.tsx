@@ -15,6 +15,7 @@ import "katex/dist/katex.min.css";
 import {
   Children,
   isValidElement,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -34,6 +35,12 @@ import { uiFencesToMarkdown } from "./iui/toMarkdown";
 import { useIntelligentUiEnabled } from "../lib/intelligentUi";
 import type { MarkdownProps } from "./Markdown";
 import { normalizeMathDelimiters, unclosedDisplayMathStart } from "./mathDelimiters";
+import {
+  cachedCodeLanguage,
+  detectCodeLanguageLater,
+  detectCodeLanguageNow,
+  SYNC_DETECT_MAX_CHARS,
+} from "../lib/codeLanguageDetect";
 
 /** 从(可能被 highlight 包成 span 的)code children 递归还原纯源码文本 —— mermaid/html 富块要原文。 */
 function nodeText(node: ReactNode): string {
@@ -332,6 +339,20 @@ export default function MarkdownImpl({
   // 重建 components 就把所有富块(OptionsBlock 的点选、HtmlPreview 的 iframe)整个重挂载。
   const liveRef = useRef(live);
   liveRef.current = live;
+  // 大块无标注代码的语言在渲染外分片探测(OCV5-422,lib/codeLanguageDetect);探测完重渲一次上色。
+  const [, setDetectedCount] = useState(0);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const onPendingDetect = useCallback((text: string) => {
+    void detectCodeLanguageLater(text).then(() => {
+      if (mountedRef.current) setDetectedCount((count) => count + 1);
+    });
+  }, []);
   // Intelligent UI 开关:关闭(或服务端总开关关闭)时把 ```ui 围栏整段换成等价 Markdown 再渲染。
   const iuiEnabled = useIntelligentUiEnabled();
   // components 里的渲染器是「组件类型」:每次渲染都造新函数 = React 视为新类型 → 富块子树
@@ -479,7 +500,7 @@ export default function MarkdownImpl({
         rehypePlugins={[
           rehypeBareBreaks,
           // detect=false 时没标语言的块不做同步语言探测（大文件预览防卡死，见 MarkdownProps.autoDetectCode）。
-          [rehypeHighlightShared, { detect: autoDetectCode, ignoreMissing: true, subset: AUTO_DETECT_LANGUAGES }],
+          [rehypeHighlightShared, { detect: autoDetectCode, onPendingDetect }],
           // 数学公式：$..$ / $$..$$ → KaTeX 渲染(remarkMath 解析 + rehypeKatex 出 HTML)。
           // errorColor 跟随主题 token(KaTeX 默认 #cc0000 在暗色底上对比度不足)。
           [rehypeKatex, { strict: false, throwOnError: false, errorColor: "var(--danger)" }],
@@ -508,10 +529,10 @@ export default function MarkdownImpl({
  * rehype-highlight 每次被挂进处理器都会 `createLowlight(common)`:新建一个 highlight.js 实例,
  * 用到的语法全部重新编译。react-markdown 每次渲染都重建处理器,于是每个 delta、每次重渲都要
  * 重新编译语法(OCV5-421 实测是流式时的头号开销)。返回的转换函数只闭包了 lowlight,无每次运行的
- * 状态,按配置缓存复用即可(只有 detect 开 / 关两种)。
+ * 状态,按配置缓存复用即可。
  */
 const highlightTransformers = new Map<string, ReturnType<typeof rehypeHighlight>>();
-function rehypeHighlightShared(options: Parameters<typeof rehypeHighlight>[0]) {
+function sharedHighlight(options: Parameters<typeof rehypeHighlight>[0]) {
   const key = JSON.stringify(options ?? {});
   let transformer = highlightTransformers.get(key);
   if (!transformer) {
@@ -521,14 +542,63 @@ function rehypeHighlightShared(options: Parameters<typeof rehypeHighlight>[0]) {
   return transformer;
 }
 
+type HighlightOptions = { detect?: boolean; onPendingDetect?: (text: string) => void };
+
 /**
- * 无语言标注的代码块只在这些常见语言里自动探测(OCV5-421)。全量探测要逐个语法跑一遍,一个几百行的
- * 无标注块在打开历史会话 / 流式结束时会卡主线程数秒;有标注的块不受影响,照常按标注高亮。
+ * 高亮插件。有标注的代码块照常交给 rehype-highlight;无标注的块(detect 开时)由 lib/codeLanguageDetect 定语言
+ * (OCV5-422):已知或小块 → 按该语言高亮一次,与 rehype-highlight 自带探测选中该语言时的输出相同(类名 hljs、
+ * language-x);都不像(null)→ 借 plaintext 跳过探测,再还原成「自动探测无结果」的样子(只加 hljs,正文原样);
+ * 大块且还没探测过 → 本次按不探测渲染(与流式尾段相同的纯文本代码块),交给 onPendingDetect 分片探测,结果出来后
+ * 调用方重渲一次上色。attacher 每次渲染都会被调用(react-markdown 每次重建处理器),所以回调按本次渲染闭包。
  */
-const AUTO_DETECT_LANGUAGES = [
-  "bash", "shell", "python", "javascript", "typescript", "json", "xml", "css",
-  "sql", "go", "java", "c", "cpp", "rust", "yaml", "markdown",
-];
+function rehypeHighlightShared({ detect = false, onPendingDetect }: HighlightOptions = {}) {
+  const base = sharedHighlight({ detect: false });
+  if (!detect) return base;
+  return (tree: Parameters<typeof base>[0], file: Parameters<typeof base>[1]) => {
+    const blocks = unlabelledCodeBlocks(tree as unknown as HastNode).map((node) => {
+      const text = hastText(node);
+      const classes = codeClassNames(node) ?? [];
+      let language = cachedCodeLanguage(text);
+      if (language === undefined && text.length <= SYNC_DETECT_MAX_CHARS) language = detectCodeLanguageNow(text);
+      if (language === undefined) onPendingDetect?.(text);
+      node.properties = { ...node.properties, className: [...classes, `language-${language ?? "plaintext"}`] };
+      return { node, language, classes, children: node.children };
+    });
+    base(tree, file);
+    for (const block of blocks) {
+      if (typeof block.language === "string") continue;
+      block.node.children = block.children;
+      block.node.properties = {
+        ...block.node.properties,
+        className: block.language === null ? ["hljs", ...block.classes.filter((name) => name !== "hljs")] : block.classes,
+      };
+    }
+  };
+}
+
+function codeClassNames(node: HastNode): unknown[] | null {
+  const list = node.properties?.className;
+  return Array.isArray(list) ? list : null;
+}
+
+function hasLanguageClass(node: HastNode): boolean {
+  return (codeClassNames(node) ?? []).some((value) => {
+    const name = String(value);
+    return name === "no-highlight" || name === "nohighlight" || name.startsWith("lang-") || name.startsWith("language-");
+  });
+}
+
+function unlabelledCodeBlocks(tree: HastNode): HastNode[] {
+  const found: HastNode[] = [];
+  const walk = (node: HastNode, parent: HastNode | null) => {
+    if (node.type === "element" && node.tagName === "code" && parent?.type === "element" && parent.tagName === "pre") {
+      if (!hasLanguageClass(node)) found.push(node);
+    }
+    for (const child of node.children ?? []) walk(child, node);
+  };
+  walk(tree, null);
+  return found;
+}
 
 /** 代码块行数(highlight 之后 children 是 span 树,取原文数换行)。 */
 function countLines(children: ReactNode): number {

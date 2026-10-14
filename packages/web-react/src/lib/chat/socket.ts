@@ -680,6 +680,23 @@ const NOTIFY_FALLBACK_MS = 250;
 // 让活动消息全量重走 markdown 管线(remark+katex+highlight),60fps 在 10KB+ 长输出/低端机
 // 上必然掉帧发热;120ms 视觉上仍是流畅"打字机"。只降"通知频率",数据仍逐帧同步应用。
 const STREAM_NOTIFY_MS = 120;
+// OCV5-422: 慢 CPU(手机)上一次流式渲染本身就要 200ms 以上,固定 120ms 窗口让渲染首尾相接,主线程一直
+// 满载:输入、滚动、按钮都要等一整次渲染。窗口改为「上次渲染实测耗时 × 本系数」(不低于 120ms,不高于
+// STREAM_NOTIFY_MAX_MS),渲染之间至少留出两倍时间给输入和绘制。桌面一次 ~30ms,仍是 120ms。
+const STREAM_NOTIFY_COST_FACTOR = 3;
+const STREAM_NOTIFY_MAX_MS = 1000;
+
+/** 流式降频窗口:按最近渲染耗时自适应(纯函数,便于单测)。*/
+export function streamNotifyWindowMs(renderCostMs: number): number {
+  const cost = Number.isFinite(renderCostMs) && renderCostMs > 0 ? renderCostMs : 0;
+  return Math.min(STREAM_NOTIFY_MAX_MS, Math.max(STREAM_NOTIFY_MS, Math.round(cost * STREAM_NOTIFY_COST_FACTOR)));
+}
+
+/** 渲染耗时的指数平均:单次抖动(GC、懒块首挂)不至于把窗口拉满。*/
+export function nextStreamRenderCostMs(previous: number, sample: number): number {
+  if (!Number.isFinite(sample) || sample < 0) return previous;
+  return previous > 0 ? previous * 0.6 + sample * 0.4 : sample;
+}
 
 
 const LIVE_PROCESS_UNIT_KINDS = new Set([
@@ -778,6 +795,10 @@ export class ChatSocket {
   /** rAF 合并渲染:scheduleNotify 排程的 rAF 句柄 + 隐藏 tab 兜底 timer(见 scheduleNotify)。*/
   private notifyRaf: number | null = null;
   private notifyFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 当前排程的是流式降频窗口 timer(而非下一帧)。本轮结束时据此提前到下一帧。*/
+  private notifyThrottled = false;
+  /** 流式中一次渲染通知(listeners + React render/commit)的主线程耗时,指数平均(OCV5-422)。*/
+  private streamRenderCostMs = 0;
   /** useSyncExternalStore 要求 getSnapshot 在未变更时返回**同一引用**；缓存于此，
    *  仅在 notify flush 时重建（version++）。*/
   private snapshot: ChatSnapshot;
@@ -1020,56 +1041,87 @@ export class ChatSocket {
 
   /** 批量 notify：合并同 tick 的高频帧 mutation 成一次订阅回调（不每帧 setState）。*/
   private scheduleNotify(): void {
-    if (this.notifyScheduled) return;
-    this.notifyScheduled = true;
-    const flush = () => {
-      if (!this.notifyScheduled) return; // 另一路(rAF/timer)已抢先 flush,二选一
-      this.notifyScheduled = false;
-      if (this.notifyRaf !== null && typeof cancelAnimationFrame === "function") {
-        cancelAnimationFrame(this.notifyRaf);
-      }
-      this.notifyRaf = null;
-      if (this.notifyFallbackTimer !== null) {
-        clearTimeout(this.notifyFallbackTimer);
-        this.notifyFallbackTimer = null;
-      }
-      this.version++;
-      this.lastNotifyAt = Date.now();
-      this.rebuildSnapshot();
-      for (const cb of this.listeners) cb();
-    };
-    // 流式降频:turn 进行中且距上次通知不足 STREAM_NOTIFY_MS → 定时到窗口边界统一 flush
-    // (跳过 rAF 路径)。完成帧最多延迟 ~120ms,可接受;非流式路径行为不变。
     // 判据必须是会话级 _sendingInFlight(turn 生命周期权威 flag,final/错误/停止都会清),
     // 不能借用发送队列 —— 队列项会跨连接保留,拿它当 turn 信号会导致排队期间永久降频。
-    let turnActive = false;
-    for (const s of this.sessions.values()) {
-      if (s._sendingInFlight) {
-        turnActive = true;
-        break;
+    const turnActive = this.anyTurnInFlight();
+    if (this.notifyScheduled) {
+      // 降频窗口最长可到 STREAM_NOTIFY_MAX_MS;本轮结束(final / 停止 / 出错)这次变更不跟着等,
+      // 改到下一帧(OCV5-422)。
+      if (!turnActive && this.notifyThrottled) {
+        this.clearNotifyTimers();
+        this.requestNotifyFrame();
       }
+      return;
     }
+    this.notifyScheduled = true;
+    // 流式降频:turn 进行中且距上次通知不足窗口 → 定时到窗口边界统一 flush(跳过 rAF 路径)。
+    // 窗口按实测渲染耗时自适应(streamNotifyWindowMs);非流式路径行为不变。
     if (turnActive) {
       const since = Date.now() - this.lastNotifyAt;
-      if (since < STREAM_NOTIFY_MS) {
-        this.notifyFallbackTimer = setTimeout(flush, STREAM_NOTIFY_MS - since);
+      const gap = streamNotifyWindowMs(this.streamRenderCostMs);
+      if (since < gap) {
+        this.notifyThrottled = true;
+        this.notifyFallbackTimer = setTimeout(this.flushNotify, gap - since);
         return;
       }
     }
-    // 消费侧背压式流控:用 rAF 把"一帧内"多次状态变更(快速流式 token delta 每条 onmessage
-    // 都 applyFrame+scheduleNotify)合并成**一次** re-render(≤60fps),解耦"收帧速率"与"渲染
-    // 速率",避免高频流式下 React re-render storm。状态本身已在各方法里同步应用,这里只合并
-    // **渲染通知**,不延迟数据。隐藏 tab 下 rAF 被浏览器节流到几乎不触发 → setTimeout 兜底,
-    // 保证 snapshot 仍刷新 + listeners 触发(切回前台时状态一致)。SSR/测试(无 rAF)退回 microtask。
+    this.requestNotifyFrame();
+  }
+
+  // 消费侧背压式流控:用 rAF 把"一帧内"多次状态变更(快速流式 token delta 每条 onmessage
+  // 都 applyFrame+scheduleNotify)合并成**一次** re-render(≤60fps),解耦"收帧速率"与"渲染
+  // 速率",避免高频流式下 React re-render storm。状态本身已在各方法里同步应用,这里只合并
+  // **渲染通知**,不延迟数据。隐藏 tab 下 rAF 被浏览器节流到几乎不触发 → setTimeout 兜底,
+  // 保证 snapshot 仍刷新 + listeners 触发(切回前台时状态一致)。SSR/测试(无 rAF)退回 microtask。
+  private requestNotifyFrame(): void {
+    this.notifyThrottled = false;
     if (typeof requestAnimationFrame === "function") {
-      this.notifyRaf = requestAnimationFrame(flush);
-      this.notifyFallbackTimer = setTimeout(flush, NOTIFY_FALLBACK_MS);
+      this.notifyRaf = requestAnimationFrame(this.flushNotify);
+      this.notifyFallbackTimer = setTimeout(this.flushNotify, NOTIFY_FALLBACK_MS);
     } else if (typeof queueMicrotask === "function") {
-      queueMicrotask(flush);
+      queueMicrotask(this.flushNotify);
     } else {
-      Promise.resolve().then(flush);
+      Promise.resolve().then(this.flushNotify);
     }
   }
+
+  private clearNotifyTimers(): void {
+    if (this.notifyRaf !== null && typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(this.notifyRaf);
+    }
+    this.notifyRaf = null;
+    if (this.notifyFallbackTimer !== null) {
+      clearTimeout(this.notifyFallbackTimer);
+      this.notifyFallbackTimer = null;
+    }
+  }
+
+  private anyTurnInFlight(): boolean {
+    for (const s of this.sessions.values()) {
+      if (s._sendingInFlight) return true;
+    }
+    return false;
+  }
+
+  private readonly flushNotify = (): void => {
+    if (!this.notifyScheduled) return; // 另一路(rAF/timer)已抢先 flush,二选一
+    this.notifyScheduled = false;
+    this.notifyThrottled = false;
+    this.clearNotifyTimers();
+    this.version++;
+    this.lastNotifyAt = Date.now();
+    this.rebuildSnapshot();
+    const measure = this.anyTurnInFlight() && typeof performance !== "undefined" && typeof queueMicrotask === "function";
+    const started = measure ? performance.now() : 0;
+    for (const cb of this.listeners) cb();
+    // React 把 useSyncExternalStore 的同步重渲排在 listener 之后的微任务里;排在它后面的这个微任务
+    // 读到的就是本次通知的 render + commit 耗时(不含随后的样式/布局/绘制)。
+    if (measure) {
+      queueMicrotask(() => {
+        this.streamRenderCostMs = nextStreamRenderCostMs(this.streamRenderCostMs, performance.now() - started);
+      });
+    }
+  };
 
   private setStatus(label: string, cls: ChatStatusClass): void {
     if (this.statusLabel === label && this.statusCls === cls) return;
@@ -1130,11 +1182,9 @@ export class ChatSocket {
     if (this.reconnectInFlightTimer) clearTimeout(this.reconnectInFlightTimer);
     if (this.reconnectReconcileTimer) clearTimeout(this.reconnectReconcileTimer);
     // 取消挂起的 rAF 合并渲染(避免 teardown 后再 flush + dangling timer)。
-    if (this.notifyRaf !== null && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.notifyRaf);
-    this.notifyRaf = null;
-    if (this.notifyFallbackTimer !== null) clearTimeout(this.notifyFallbackTimer);
-    this.notifyFallbackTimer = null;
+    this.clearNotifyTimers();
     this.notifyScheduled = false;
+    this.notifyThrottled = false;
     for (const t of this.thinkingTimers.values()) clearTimeout(t);
     this.thinkingTimers.clear();
     for (const t of this.reconcileTimers.values()) clearTimeout(t);
