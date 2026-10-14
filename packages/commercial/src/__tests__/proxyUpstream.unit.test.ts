@@ -2340,3 +2340,16 @@ describe("pickUpstream — H6.D refresh rebind 保留 pick.account_uuid", () => 
     assert.equal(userIdObj.account_uuid, REAL_UUID, "refresh 后 account_uuid 仍要可用");
   });
 });
+
+ test("Gemini trusted transport marker is model+provider-scoped; existing Go models remain Anthropic", async () => {
+  for (const model of ['gemini-4-argon-contributor', 'deepseek-v4-flash', 'qwen3.7-plus']) {
+    const sched = makeScheduler({});
+    const result = await pickUpstream({ scheduler: sched.scheduler, staticProviderKeys: { opencodego: 'key' } },
+      bodyFor(model), selectUpstreamRoute(model), log);
+    assert.ok(result.ok);
+    if (!result.ok) throw new Error('not prepared');
+    assert.equal(result.session.transport, model.startsWith('gemini-') ? 'gemini-go' : undefined);
+    assert.equal(result.session.endpoint, 'https://opencode.ai/zen/go/v1/messages');
+    assert.equal(sched.pickCalls, 0);
+  }
+ });

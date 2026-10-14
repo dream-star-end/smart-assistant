@@ -53,7 +53,8 @@
         "deepseek-v4-flash-opencode-go",
         "deepseek-v4-flash",
         "qwen3.7-max",
-        "qwen3.7-plus"
+        "qwen3.7-plus",
+        "gemini-4-argon-contributor"
       ],
       "maxInputTokens": 1000000,
       "upstreamEndpoint": "https://opencode.ai/zen/go/v1/messages",

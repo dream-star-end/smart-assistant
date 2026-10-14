@@ -1034,3 +1034,20 @@ describe("runUpstreamRoundTrip — finally 兜底不变量", () => {
     assert.equal(dispatcher, undefined, "无 dispatcher → fetchInit 不显式赋值");
   });
 });
+
+ test("actual core dispatches marked Gemini session to Google and commits native usage under canonical model", async () => {
+  const {ctx, res, finalize} = buildCtx({ bodyModel: 'gemini-4-argon-contributor',
+    fetchImpl: async (url, init) => {
+      assert.equal(url, 'https://opencode.ai/inference/go/v1/models/gemini-4-argon-contributor:streamGenerateContent?alt=sse');
+      assert.ok('contents' in JSON.parse(init.body as string));
+      return new Response(`data: ${JSON.stringify({ candidates: [{ content: { parts: [{text:'real bridge answer'}]}, finishReason:'STOP'}],
+        usageMetadata: {promptTokenCount:100, cachedContentTokenCount:80, candidatesTokenCount:6, thoughtsTokenCount:4} })}\n\n`);
+    } });
+  ctx.session = {...ctx.session, accountId:null, transport:'gemini-go', upstreamModel:'gemini-4-argon-contributor',
+    applyUpstreamAuth(headers) {headers['x-api-key']='fixture-key'; headers['x-opencode-session']='stable-session';} };
+  await runUpstreamRoundTrip(ctx);
+  assert.ok(res.bodyText().includes('real bridge answer'));
+  assert.ok(res.bodyText().includes('message_stop'));
+  assert.equal(finalize.commitCalls.length,1);
+  assert.deepEqual(finalize.commitCalls[0], {kind:'final', usage:{input_tokens:20n,output_tokens:10n,cache_read_tokens:80n,cache_write_tokens:0n}});
+ });

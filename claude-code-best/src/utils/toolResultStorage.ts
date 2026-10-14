@@ -4,6 +4,7 @@
 
 import type { ToolResultBlockParam } from '@anthropic-ai/sdk/resources/index.mjs'
 import { mkdir, writeFile } from 'fs/promises'
+import { createHash } from 'node:crypto'
 import { join } from 'path'
 import { getOriginalCwd, getSessionId } from '../bootstrap/state.js'
 import {
@@ -113,7 +114,11 @@ export const PREVIEW_SIZE_BYTES = 2000
  */
 export function getToolResultPath(id: string, isJson: boolean): string {
   const ext = isJson ? 'json' : 'txt'
-  return join(getToolResultsDir(), `${id}.${ext}`)
+  // Google replay signatures live in opaque IDs; never use these as OS filenames.
+  const fileId = id.startsWith('toolu_g4_')
+    ? `toolu_g4_${createHash('sha256').update(id).digest('hex')}`
+    : id
+  return join(getToolResultsDir(), `${fileId}.${ext}`)
 }
 
 /**
