@@ -211,6 +211,12 @@
       "reason": "OCV5-423 Gemini Go bridge rejected Claude Code's server web_search tool locally (400) on the admin-only gemini-4 model; owner-only impact, fixed the same night.",
       "approvedBy": "user 2026-10-15 要求查根因并修复 Gemini 4 网页搜索 400（cc3 antigravity 会话）",
       "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "46cebad3af13a3df2569bb5f5b5696b005dac5a3",
+      "reason": "OCV5-424 follow-up: admin 服务池 page status chips wrapped one character per line at phone width. CSS-only change on an admin page; no user-visible surface changed.",
+      "approvedBy": "user 2026-10-15 要求修手机端服务池状态徽标逐字换行并发个人版（cc3 account-pool 会话）",
+      "expiresAt": "2026-11-14"
     }
   ]
 }
