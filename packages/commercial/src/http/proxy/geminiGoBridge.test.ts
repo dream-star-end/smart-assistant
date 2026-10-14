@@ -139,6 +139,67 @@ test('request maps system/tools/options and native signed tool replay without mu
   assert.ok(!('metadata' in native))
 })
 
+test('role:system messages from CCB join systemInstruction in order (OCV5-423 live 400)', () => {
+  // Shape of a real platform first request: top-level system blocks with
+  // cache_control, then a user turn and an inline platform-context system
+  // message. Before the fix every such request failed locally with
+  // "unsupported Gemini message role" and never reached Google.
+  const body = {
+    model: GEMINI_GO_MODEL,
+    max_tokens: 32000,
+    thinking: { type: 'adaptive' },
+    context_management: { edits: [] },
+    output_config: { effort: 'medium' },
+    system: [
+      { type: 'text', text: 'billing header' },
+      { type: 'text', text: 'static platform prompt', cache_control: { type: 'ephemeral' } },
+    ],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+      {
+        role: 'system',
+        content: [{ type: 'text', text: 'session context', cache_control: { type: 'ephemeral' } }],
+      },
+      { role: 'user', content: 'and again' },
+    ],
+  }
+  const before = structuredClone(body)
+  const out = anthropicToGemini(body)
+  assert.deepEqual(body, before)
+  assert.deepEqual(out.systemInstruction, {
+    parts: [
+      { text: 'billing header' },
+      { text: 'static platform prompt' },
+      { text: 'session context' },
+    ],
+  })
+  // Only conversation turns remain; the two user turns around the system message merge.
+  assert.deepEqual(out.contents, [
+    { role: 'user', parts: [{ text: 'hello' }, { text: 'and again' }] },
+  ])
+  assert.deepEqual(
+    anthropicToGemini({
+      ...input,
+      messages: [{ role: 'system', content: 'only context' }, ...input.messages],
+    }).systemInstruction,
+    {
+      parts: [{ text: 'only context' }],
+    },
+  )
+  assert.throws(
+    () =>
+      anthropicToGemini({
+        ...input,
+        messages: [...input.messages, { role: 'system', content: [{ type: 'image' }] }],
+      }),
+    /unsupported Gemini system content/,
+  )
+  assert.throws(
+    () => anthropicToGemini({ ...input, messages: [{ role: 'tool', content: 'x' }] }),
+    /unsupported Gemini message role/,
+  )
+})
+
 test('foreign tool history is explicit rejection, not a fabricated Google signature', () => {
   assert.throws(
     () =>
