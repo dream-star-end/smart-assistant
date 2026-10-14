@@ -2429,6 +2429,9 @@ async function handleLosslessTurnTapeRequest(args: {
           isFinal: true,
           meta: {
             reconcile: body.status === "completed" ? "turn_completed" : "interrupted",
+            // The tape commit (HTTP) can overtake the live WS tail of the same turn;
+            // the client uses this to let the live tail and the real final land first.
+            reconcileSource: "tape_commit",
             clientMessageId: result.clientMessageId,
           },
           ts: Date.now(),
@@ -2684,6 +2687,7 @@ async function handleLosslessTurnTapeRequest(args: {
             isFinal: true,
             meta: {
               reconcile: body.status === "completed" ? "turn_completed" : "interrupted",
+              reconcileSource: "tape_commit",
               clientMessageId: result.clientMessageId,
             },
             ts: Date.now(),

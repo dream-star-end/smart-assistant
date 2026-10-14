@@ -685,6 +685,9 @@ const STREAM_NOTIFY_MS = 120;
 // STREAM_NOTIFY_MAX_MS),渲染之间至少留出两倍时间给输入和绘制。桌面一次 ~30ms,仍是 120ms。
 const STREAM_NOTIFY_COST_FACTOR = 3;
 const STREAM_NOTIFY_MAX_MS = 1000;
+/** OCV5-424:tape 提交合成的 turn_completed 领先 live 尾巴时,等真 final 的宽限(实测领先 0.4–1s)。
+ *  期满本轮仍在发送态 → 按原 reconcile 语义收口 + 精确 REST 对账(真 final 丢失时的兜底不变)。*/
+export const TAPE_COMMIT_FINAL_GRACE_MS = 5_000;
 
 /** 流式降频窗口:按最近渲染耗时自适应(纯函数,便于单测)。*/
 export function streamNotifyWindowMs(renderCostMs: number): number {
@@ -865,6 +868,7 @@ export class ChatSocket {
   private readonly reconcileInFlight = new Set<string>();
   private readonly reconcileRunTokens = new Map<string, symbol>();
   private readonly reconcileTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly tapeCommitFinalTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly reconcileClientMessageIds = new Map<string, string>();
   /** REST live-journal hydration is serialized per session. Stamped WS frames
    * are held until the immutable snapshot has rebuilt the process rows, then
@@ -1189,6 +1193,8 @@ export class ChatSocket {
     this.thinkingTimers.clear();
     for (const t of this.reconcileTimers.values()) clearTimeout(t);
     this.reconcileTimers.clear();
+    for (const t of this.tapeCommitFinalTimers.values()) clearTimeout(t);
+    this.tapeCommitFinalTimers.clear();
     this.reconcileInFlight.clear();
     this.reconcileRunTokens.clear();
     this.reconcileAttempts.clear();
@@ -2059,6 +2065,7 @@ export class ChatSocket {
       refreshBalance: () => this.deps.refreshBalance?.(),
       reportTurnError: (p) =>
         this.deps.reportClientError?.({ type: "turn_error", code: p.code, traceId: p.traceId, sessionId: p.sessionId }),
+      deferTapeCommitFinal: (sessId, frame) => this.deferTapeCommitFinal(sessId, frame),
       forceSync: (sessId, context) => {
         if (this.sessions.get(sessId)?._stopSettlement?.phase === "sync") {
           this.syncSessionAndSettleStop(sessId, context);
@@ -2925,6 +2932,24 @@ export class ChatSocket {
    * 红卡、保持软状态;这里挂宽限计时器等 `sys.recovery_decision`。同会话若已有一条延后中的错误
    * (理论上不会:一轮只有一个终态),先物化旧的再接新的,不吞卡。
    */
+  /** OCV5-424:见 FrameEffects.deferTapeCommitFinal。期满时去掉来源标记重放同一帧,走原 reconcile 收口。*/
+  private deferTapeCommitFinal(sessId: string, frame: OutboundMessageWire): boolean {
+    const clientMessageId = frame.clientMessageId;
+    if (!clientMessageId) return false;
+    const prev = this.tapeCommitFinalTimers.get(sessId);
+    if (prev) clearTimeout(prev);
+    const timer = setTimeout(() => {
+      this.tapeCommitFinalTimers.delete(sessId);
+      const sess = this.sessions.get(sessId);
+      if (!sess || !sess._sendingInFlight || sess._activeClientMessageId !== clientMessageId) return;
+      const { reconcileSource: _source, ...meta } = frame.meta ?? {};
+      applyOutboundMessage(sess, { ...frame, meta }, this.effects());
+      this.scheduleNotify();
+    }, TAPE_COMMIT_FINAL_GRACE_MS);
+    this.tapeCommitFinalTimers.set(sessId, timer);
+    return true;
+  }
+
   private deferTerminalErrorForRecovery(sessId: string, paint: DeferredTerminalErrorPaint): boolean {
     if (!this.masterOwnsAutomaticRecovery) return false;
     const sess = this.sessions.get(sessId);

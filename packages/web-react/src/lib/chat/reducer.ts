@@ -119,6 +119,11 @@ export type FrameEffects = {
   /** resume_failed / reconcile：游标已推进 + 标 _liveStreamBroken 后，强制 REST 全量 sync。*/
   forceSync?: (sessId: string, context?: { clientMessageId?: string }) => void;
   /**
+   * tape 提交后的合成 turn_completed 命中**正在流式**的本轮:返回 true 表示 socket 接管——宽限期内
+   * 等 live 尾巴与真 final 自然收口,期满仍未收口再按 reconcile 收口。缺省/false → 立即收口(旧行为)。
+   */
+  deferTapeCommitFinal?: (sessId: string, frame: OutboundMessageWire) => boolean;
+  /**
    * reconcile 'turn_state_unknown'(RFC §4):server 无法判定在飞 turn 终态。**绝不清发送态**,
    * 由 socket 把该会话 thinking-safety 定时降至 60s(默认 10min),尽快复检服务端权威态。
    */
@@ -1701,6 +1706,20 @@ export function applyOutboundMessage(
     if (frameCmid && active && frameCmid !== active) {
       // 旧轮 reconcile 命中新轮:只精确对账旧轮内容,绝不触碰新轮生命周期。
       effects.forceSync?.(sess.id, { clientMessageId: frameCmid });
+      return;
+    }
+    // OCV5-424:master 在 tape 提交(HTTP)后立刻合成的 turn_completed 会**抢在**同一轮仍在 WS 上的
+    // live 尾巴之前到达。此处若立即收口,resetReplyTracker 把截止戳定在本帧 server ts,随后到达的
+    // 尾巴帧(ts 更早)全被 stale 守卫丢弃 → 本轮显示「已完成」但正文停在半句,约 1s 后 REST 对账才补齐。
+    // 本轮仍在流式时交给 socket 宽限等待真 final;hello/reconciler 的 reconcile 不带该来源,行为不变。
+    if (
+      frame.meta?.reconcile === "turn_completed" &&
+      frame.meta?.reconcileSource === "tape_commit" &&
+      frameCmid &&
+      frameCmid === active &&
+      sess._sendingInFlight &&
+      effects.deferTapeCommitFinal?.(sess.id, frame) === true
+    ) {
       return;
     }
     const clientMessageId = frameCmid ?? active;
