@@ -17,6 +17,7 @@ import {
 import type { ModelPricing, PricingCache } from '../billing/pricing.js'
 import { getPool } from '../db/index.js'
 import { query } from '../db/queries.js'
+import { recordAntigravityRelayUsage } from '../http/internalAntigravityRelay.js'
 import { useDedicatedTestDatabase } from './helpers/db.js'
 
 const db = useDedicatedTestDatabase('antigravity_settle_0305_test')
@@ -57,9 +58,9 @@ async function usageRow(
 ): Promise<void> {
   await query(
     `INSERT INTO antigravity_relay_usage
-       (request_id, user_id, route_model_id, upstream_model, request_type, status_code,
+       (call_id, request_id, user_id, route_model_id, upstream_model, request_type, status_code,
         prompt_tokens, candidates_tokens, thoughts_tokens, cached_tokens)
-     VALUES ($1, $2, $3, 'gemini-3.8-flash-low', 'agent', 200, $4, $5, 0, $6)`,
+     VALUES (gen_random_uuid(), $1, $2, $3, 'gemini-3.8-flash-low', 'agent', 200, $4, $5, 0, $6)`,
     [requestId, userId.toString(), MODEL, prompt, out, cached],
   )
 }
@@ -305,6 +306,56 @@ describe('Antigravity durable turn settlement', () => {
     )
     assert.deepEqual(usage.rows, [{ cost_credits: '0', status: 'error' }])
     assert.equal(await balance(uid), 1_000n)
+  })
+
+  test('a retried usage insert after a lost commit acknowledgement is not double-billed (Codex r3 P1)', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const uid = await user(1_000n)
+    const requestId = rid()
+    await recordAntigravityTurn(getPool(), {
+      requestId,
+      userId: uid,
+      modelId: MODEL,
+      sessionId: null,
+      traceId: null,
+    })
+    const account = await query<{ id: string }>(
+      `INSERT INTO gemini_oauth_accounts (label, email, refresh_token_enc, refresh_token_nonce)
+       VALUES ('t', $1, '\\x00', '\\x00') RETURNING id::text AS id`,
+      [`acct-${requestId}@example.test`],
+    )
+    const row = {
+      callId: '0f1e2d3c-4b5a-4968-8776-655443322110',
+      requestId,
+      userId: uid,
+      accountId: BigInt(account.rows[0]!.id),
+      routeModelId: MODEL,
+      upstreamModel: 'gemini-3.8-flash-low',
+      requestType: 'agent',
+      statusCode: 200,
+      promptTokens: 2_000_000,
+      candidatesTokens: 1_000,
+      thoughtsTokens: 0,
+      cachedTokens: 0,
+    }
+    // First insert committed but its acknowledgement was lost; the relay retries the same call.
+    await recordAntigravityRelayUsage(row)
+    await recordAntigravityRelayUsage(row)
+    const count = await query<{ n: string }>(
+      'SELECT count(*)::text AS n FROM antigravity_relay_usage WHERE request_id = $1',
+      [requestId],
+    )
+    assert.equal(count.rows[0]?.n, '1')
+    const done = await settleAntigravityTurnRecord({
+      pool: getPool(),
+      pricing,
+      requestId,
+      userId: uid,
+      engineStatus: 'success',
+    })
+    assert.ok(done)
+    // 2,000,000 × 120 + 1,000 × 150 → ceil(240.15) = 241, charged once.
+    assert.equal(await balance(uid), 1_000n - 241n)
   })
 
   test('an admission that failed before the container ran is abandoned (never billed later)', async (t) => {

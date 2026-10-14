@@ -206,26 +206,31 @@ describe('Antigravity relay handler', () => {
       'user-agent',
     ])
     assert.equal(JSON.parse(captured.body ?? '{}').model, 'gemini-3.8-flash-high')
-    assert.deepEqual(captured.usage, [
-      {
-        requestId: REQUEST_ID,
-        userId: 42n,
-        accountId: 7n,
-        routeModelId: 'antigravity-gemini-3.8-flash',
-        upstreamModel: 'gemini-3.8-flash-high',
-        requestType: 'agent',
-        statusCode: 200,
-        promptTokens: 11885,
-        candidatesTokens: 1,
-        thoughtsTokens: 28,
-        cachedTokens: 9000,
-      },
-    ])
+    assert.match(captured.usage[0]?.callId ?? '', /^[0-9a-f-]{36}$/)
+    assert.deepEqual(
+      captured.usage.map(({ callId: _c, ...rest }) => rest),
+      [
+        {
+          requestId: REQUEST_ID,
+          userId: 42n,
+          accountId: 7n,
+          routeModelId: 'antigravity-gemini-3.8-flash',
+          upstreamModel: 'gemini-3.8-flash-high',
+          requestType: 'agent',
+          statusCode: 200,
+          promptTokens: 11885,
+          candidatesTokens: 1,
+          thoughtsTokens: 28,
+          cachedTokens: 9000,
+        },
+      ],
+    )
     assert.deepEqual(captured.outcomes, [{ accountId: 7n, outcome: { kind: 'success' } }])
   })
 
   test('a transient usage-row write failure is retried, not left unbilled', async () => {
     const token = await mintRoute()
+    const seen: string[] = []
     let attempts = 0
     const rows: AntigravityUsageRow[] = []
     const { status } = await relay(
@@ -235,6 +240,7 @@ describe('Antigravity relay handler', () => {
       {
         recordUsage: async (row) => {
           attempts += 1
+          seen.push(row.callId)
           if (attempts < 3) throw new Error('pg blip')
           rows.push(row)
         },
@@ -243,6 +249,8 @@ describe('Antigravity relay handler', () => {
     assert.equal(status, 200)
     assert.equal(attempts, 3)
     assert.equal(rows.length, 1)
+    // Every retry carries the same call id, so the idempotent insert cannot double-count.
+    assert.equal(new Set(seen).size, 1)
   })
 
   test('title generation model is allowed and metered on the turn', async () => {

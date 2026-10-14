@@ -64,6 +64,8 @@ COMMENT ON TABLE gemini_oauth_accounts IS
 
 CREATE TABLE antigravity_relay_usage (
   id                 BIGSERIAL PRIMARY KEY,
+  -- One per forwarded upstream call; the relay's retried insert is idempotent on it.
+  call_id            UUID NOT NULL UNIQUE,
   request_id         TEXT NOT NULL CHECK (request_id ~ '^[0-9a-f]{32}$'),
   user_id            BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
   account_id         BIGINT REFERENCES gemini_oauth_accounts(id) ON DELETE SET NULL,

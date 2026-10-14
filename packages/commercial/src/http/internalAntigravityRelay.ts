@@ -18,6 +18,7 @@
  *     before ending the response, so turn settlement sees it;
  *   - reports the upstream status to the account pool.
  */
+import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { antigravityAllowedUpstreamModels } from '@openclaude/protocol'
 import { type Dispatcher, request } from 'undici'
@@ -95,6 +96,8 @@ export type AntigravityRelayHandler = (
 ) => Promise<void>
 
 export interface AntigravityUsageRow {
+  /** One per forwarded upstream call, fixed before any retry: the insert is idempotent on it. */
+  callId: string
   requestId: string
   userId: bigint
   accountId: bigint
@@ -211,13 +214,19 @@ export class AntigravityUsageTap {
   }
 }
 
-async function defaultRecordUsage(row: AntigravityUsageRow): Promise<void> {
+/**
+ * Idempotent on call_id: a retry after a commit whose acknowledgement was lost
+ * inserts nothing, so one upstream call is never billed twice (Codex r3 P1).
+ */
+export async function recordAntigravityRelayUsage(row: AntigravityUsageRow): Promise<void> {
   await query(
     `INSERT INTO antigravity_relay_usage
-       (request_id, user_id, account_id, route_model_id, upstream_model, request_type, status_code,
+       (call_id, request_id, user_id, account_id, route_model_id, upstream_model, request_type, status_code,
         prompt_tokens, candidates_tokens, thoughts_tokens, cached_tokens)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+     ON CONFLICT (call_id) DO NOTHING`,
     [
+      row.callId,
       row.requestId,
       row.userId.toString(),
       row.accountId.toString(),
@@ -276,7 +285,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         },
       }))
   const reportOutcome = deps.reportOutcome ?? reportAntigravityOutcome
-  const recordUsage = deps.recordUsage ?? defaultRecordUsage
+  const recordUsage = deps.recordUsage ?? recordAntigravityRelayUsage
   const meteredCost =
     deps.meteredCost ??
     (async (route: AntigravityRelayRoute) => {
@@ -498,6 +507,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         // Record before ending the response: the CLI only finishes the turn
         // after this stream ends, so settlement always sees the row.
         const row: AntigravityUsageRow = {
+          callId: randomUUID(),
           requestId: route.requestId,
           userId: route.userId,
           accountId: route.accountId,
