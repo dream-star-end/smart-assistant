@@ -235,6 +235,12 @@
       "reason": "OCV5-415 Antigravity relay refused the CLI web search RPC (405) and a closing browser socket expired running turns' relay routes (ROUTE_EXPIRED); owner-only selfhost model, fixed the same morning.",
       "approvedBy": "user 2026-10-15 截图询问 Antigravity 网页搜索 405 与任务执行失败，要求查根因修复发版（cc3 antigravity 会话）",
       "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "841969cd4d97518b297eb09cc84b909c45b6b0b5",
+      "reason": "OCV5-424 follow-up 3: admin 服务池 page 最近错误 column squeezed to 72px at phone width, stretching rows. CSS-only change on an admin page; no user-visible surface changed.",
+      "approvedBy": "user 2026-10-15 要求修手机端服务池状态徽标逐字换行并发个人版（cc3 account-pool 会话）",
+      "expiresAt": "2026-11-14"
     }
   ]
 }
