@@ -144,6 +144,7 @@ V5_WATCH_MAINT="${V5_WATCH_MAINT:-/run/openclaude-v5-selfhost/planned-maintenanc
 CUTOVER_GATE_FAILED=""
 CUTOVER_LAST_FAIL=""
 CUTOVER_KEPT_FAILED_REL=""
+CUTOVER_RECOVERY_REQUIRED=0
 
 # 本实例专属发布锁。禁止复用:
 #   /var/lock/oc-v5-deploy.lock                      V5 商业版生产(deploy-v5.sh / 发布队列 / 自愈)
@@ -1516,12 +1517,16 @@ lease_train_finish() { # <committed|failed> <reason>
   LEASE_TRAIN_ACTIVE=0
   local st="$1" reason="$2" rel="" ev
   if [[ "$st" == failed ]]; then
-    # 已动 unit 但未 committed → 交给 survivor,并要人工确认;不自动重发
+    # 本班已动 unit 但未 committed(被 SIGTERM/die 打断在中途)→ 交给 survivor,并要人工确认;不自动重发。
+    # 只看本班:没动过 unit 时 state 里是上一班留下的 phase,不能据此判(OCV5-420)。
     local phase=""
-    [[ -f "${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" ]] && \
-      phase="$(jq -er '.phase // empty' "${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" 2>/dev/null || true)"
-    # kept-failed(OCV5-418)是有意留在新版的确定性失败,不是需人工恢复的半截 mutation。
-    case "${phase:-}" in ''|armed|pre-install|pre-mutation|smoked|committed|kept-failed) ;; *) st=recovery_required ;; esac
+    if [[ "${CUTOVER_MUTATED:-0}" == 1 ]]; then
+      phase="$(survivor_state_phase)"
+      # kept-failed(OCV5-418)是有意留在新版的确定性失败,不是需人工恢复的半截 mutation。
+      case "${phase:-}" in armed|pre-install|pre-mutation|smoked|committed|kept-failed) ;; *) st=recovery_required ;; esac
+    fi
+    # 补偿本身失败:survivor --disarm 会把 phase 写成 committed,所以单独带标记(OCV5-420)。
+    [[ "${CUTOVER_RECOVERY_REQUIRED:-0}" == 1 ]] && st=recovery_required
     rel="${CUTOVER_KEPT_FAILED_REL:-}"
   else
     rel="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
@@ -1533,9 +1538,31 @@ UPDATE train SET status='$st', reason='$(lease_q "$reason")', rel_path=$( [[ -n 
        evidence_json='$(lease_q "$ev")', finished_at='$(lease_now)', updated_at='$(lease_now)'
  WHERE id='$LEASE_TRAIN_ID' AND status NOT IN ('committed','failed');
 $(lease_event_sql "$LEASE_TRAIN_ID" "train-$st" "deploy:$$" "$reason")
+$( [[ "$st" == recovery_required ]] && lease_train_alert_sql "$LEASE_TRAIN_ID" "$reason (phase=${phase:-?} cutover_log=${CUTOVER_LOG:-?})" )
 COMMIT;
 SQL
   echo "  🎫 lease train $LEASE_TRAIN_ID → $st"
+  if [[ "$st" == recovery_required ]]; then
+    deploy_alert deploy_recovery_required "$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)" \
+      "个人版列车 $LEASE_TRAIN_ID 未完成也未干净回滚(phase=${phase:-?}),已标 recovery_required,发车暂停。现场:${CUTOVER_LOG:-?}。人工核对 survivor/live 后:oc-lease.sh train resolve --id $LEASE_TRAIN_ID --as committed|failed --reason …"
+  fi
+}
+
+# survivor state 是 KEY=VALUE(phase=…);兼容旧 JSON。读不到返回空。
+survivor_state_phase() {
+  local f="${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" p=""
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+  p="$(sed -n 's/^phase=//p' "$f" 2>/dev/null | head -n1)"
+  [[ -n "$p" ]] || p="$(jq -er '.phase // empty' "$f" 2>/dev/null || true)"
+  printf '%s' "$p"
+}
+
+# 与 worker enqueue_train_alert 同一落点:最近一条在途 ride 的工单,没有则 log。只输出 SQL,随终态同事务。
+lease_train_alert_sql() { # <train_id> <reason>
+  local tk
+  tk="$(lease_sql "SELECT ticket_ref FROM lease WHERE resource='deploy:selfhost' AND status='registered' AND ticket_ref IS NOT NULL ORDER BY seq DESC LIMIT 1;" 2>/dev/null || true)"
+  lease_outbox_sql "train:$1:recovery_required" "$1" train_alert "$( [[ -n "$tk" ]] && echo ticket || echo log )" "${tk:--}" \
+    "$(lease_body_train_alert "$1" recovery_required "$2")"
 }
 
 lease_train_on_exit() {
@@ -2460,6 +2487,12 @@ cutover_compensate() { # <reason>
   cutover_rollback_inplace "${CUTOVER_REL:-}" "${CUTOVER_BACKUP:-missing}" || rb_rc=$?
   # 无论补偿成败都必须解除幸存者布防,否则 timeout 会在健康 live 上再装陈旧备份。
   cutover_disarm_survivor || cutover_clog "补偿后 disarm 失败(不掩盖补偿结果 rc=$rb_rc)"
+  if [[ "$rb_rc" != 0 ]]; then
+    # disarm 已把 phase 写成 committed;改落 compensate-failed,worker 才不会把现网当 committed 去结算搭车。
+    CUTOVER_RECOVERY_REQUIRED=1
+    cutover_persist_phase compensate-failed \
+      || cutover_clog "  ⚠ 无法落盘 phase=compensate-failed(列车仍记 recovery_required)"
+  fi
   return 1
 }
 
@@ -2553,14 +2586,14 @@ clear_stay_maintenance() {
   rm -f -- "$V5_WATCH_MAINT" && cutover_clog "  ✓ 已撤销上一班 stay 留下的维护窗口"
 }
 
-stay_alert() { # <rel> <message>;只入队+补投,失败不影响结果
+deploy_alert() { # <event> <rel> <message>;critical,只入队+补投,失败不影响结果
   local bin="$V5_WATCH_DIR/alert.sh"
   if [[ ! -x "$bin" ]]; then
-    cutover_clog "  ⚠ 缺 $bin,未发 deploy_gate_failed_kept 告警"
+    cutover_clog "  ⚠ 缺 $bin,未发 $1 告警"
     return 0
   fi
-  timeout 10 "$bin" --event deploy_gate_failed_kept --severity critical --live "$1" --message "$2" >/dev/null 2>&1 \
-    || cutover_clog "  ⚠ 告警入队失败 event=deploy_gate_failed_kept"
+  timeout 10 "$bin" --event "$1" --severity critical --live "$2" --message "$3" >/dev/null 2>&1 \
+    || cutover_clog "  ⚠ 告警入队失败 event=$1"
   timeout 30 "$bin" --flush >/dev/null 2>&1 || cutover_clog "  ⚠ 告警补投失败(下一拍看护会重投)"
   return 0
 }
@@ -2594,7 +2627,7 @@ cutover_keep_failed() { # <rel>
   fi
   reason="gate-failed-kept-live=$rel gate=${CUTOVER_GATE_FAILED:-?} detail=${CUTOVER_LAST_FAIL:-?}"
   lease_train_finish failed "$reason"
-  stay_alert "$rel" "个人版门禁失败,按 stay 策略留在新版 ${rel##*/}。失败项:${CUTOVER_LAST_FAIL:-?}。维护窗口 ${win}s 内看护不回切。现场:${CUTOVER_LOG:-?}。下一步:修好后发新列车前滚;要回上一版按 runbook 人工回滚(.prev-release 未改)。"
+  deploy_alert deploy_gate_failed_kept "$rel" "个人版门禁失败,按 stay 策略留在新版 ${rel##*/}。失败项:${CUTOVER_LAST_FAIL:-?}。维护窗口 ${win}s 内看护不回切。现场:${CUTOVER_LOG:-?}。下一步:修好后发新列车前滚;要回上一版按 runbook 人工回滚(.prev-release 未改)。"
   cutover_clog "  现场保留:cutover 日志 ${CUTOVER_LOG:-?};未跑 release GC;.prev-release 仍指向上一版"
   cutover_clog "✗ --cutover 门禁失败(已留在新版 $rel):$reason"
   return 1
