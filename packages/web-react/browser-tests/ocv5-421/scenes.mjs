@@ -1,6 +1,6 @@
 // OCV5-421 render lab scenes. Every function runs inside the page (self-contained; uses window.__lab).
-export const longCode = (n, label) => "```" + label + "\n" + Array.from({ length: n }, (_, i) =>
-  `  const row${i} = items.filter((x) => x.score > ${i % 97}).map((x) => ({ id: x.id, total: x.a + x.b * ${i} }))`).join("\n") + "\n```";
+export const longCode = (n, label) => `\`\`\`${label}\n${Array.from({ length: n }, (_, i) =>
+  `  const row${i} = items.filter((x) => x.score > ${i % 97}).map((x) => ({ id: x.id, total: x.a + x.b * ${i} }))`).join("\n")}\n\`\`\``;
 
 export const TEXT = {
   md: [
@@ -59,7 +59,7 @@ export const SCENES = [
   },
   {
     id: "code-long",
-    setup: () => { window.__lab.turn({ user: "给一段很长的代码", text: "下面是代码：\n\n" + window.__LONG_CODE + "\n\n超长单行：\n\n```\n" + "x".repeat(3000) + "\n```\n\n结束。" }); },
+    setup: () => { window.__lab.turn({ user: "给一段很长的代码", text: `下面是代码：\n\n${window.__LONG_CODE}\n\n超长单行：\n\n\`\`\`\n${"x".repeat(3000)}\n\`\`\`\n\n结束。` }); },
     probe: () => {
       const pres = [...document.querySelectorAll("pre")];
       return { preHeights: pres.map((p) => Math.round(p.getBoundingClientRect().height)), scrollHeight: document.querySelector("[data-lab-scroll]").scrollHeight };
@@ -76,7 +76,7 @@ export const SCENES = [
         tools: [
           { name: "Bash", input: { command: "ls -la /workspace" }, output: "total 8\ndrwxr-xr-x 2 agent agent 4096 .\n-rw-r--r-- 1 agent agent 12 README.md" },
           { name: "Bash", input: { command: "npm test" }, output: "Error: Cannot find module 'vitest'\n    at Module._resolveFilename", isError: true },
-          { name: "Read", input: { file_path: "/workspace/big.log" }, output: Array.from({ length: 3000 }, (_, i) => `line ${i} ` + "y".repeat(20)).join("\n") },
+          { name: "Read", input: { file_path: "/workspace/big.log" }, output: Array.from({ length: 3000 }, (_, i) => `line ${i} ${"y".repeat(20)}`).join("\n") },
           { name: "SomeUnknownTool", input: { q: 1 }, output: "ok" },
         ],
         text: "已完成：目录正常，测试缺少 vitest 依赖。",
@@ -148,18 +148,22 @@ export const SCENES = [
   },
   {
     id: "perf-stream",
-    perf: async (turns) => {
+    perf: async ({ turns, size }) => {
       const L = window.__lab;
-      const code = (n) => "```\n" + Array.from({ length: n }, (_, i) => `function f${i}(a, b) { return a.map((x) => x * ${i} + b).filter(Boolean) }`).join("\n") + "\n```";
+      const code = (n) => `\`\`\`\n${Array.from({ length: n }, (_, i) => `function f${i}(a, b) { return a.map((x) => x * ${i} + b).filter(Boolean) }`).join("\n")}\n\`\`\``;
       const para = "这是一段较长的说明文字，用来模拟模型的正常输出，包含 **加粗**、`行内代码` 和 [链接](https://example.com)。".repeat(4);
       for (let i = 0; i < turns; i++) {
         L.turn({ user: `历史问题 ${i}`, tools: i % 3 === 0 ? [{ name: "Bash", input: { command: `echo ${i}` }, output: `${i}` }] : [],
           text: `${para}\n\n${i % 5 === 0 ? code(20) : "- 列表项一\n- 列表项二"}\n\n| a | b |\n|---|---|\n| ${i} | x |`, chunk: 100000 });
       }
+      console.info(`perf: history ${turns} turns built ${Math.round(performance.now())}ms`);
       await new Promise((r) => setTimeout(r, 1500));
       const el = document.querySelector("[data-lab-scroll]"); el.scrollTop = el.scrollHeight;
       await new Promise((r) => setTimeout(r, 800));
-      const answer = [para, code(250), para, "| 列1 | 列2 | 列3 |\n|---|---|---|\n" + Array.from({ length: 60 }, (_, i) => `| ${i} | 值 ${i} | 说明 ${i} |`).join("\n"), para, code(150), para].join("\n\n");
+      const table = (n) => `| 列1 | 列2 | 列3 |\n|---|---|---|\n${Array.from({ length: n }, (_, i) => `| ${i} | 值 ${i} | 说明 ${i} |`).join("\n")}`;
+      const answer = size === "medium"
+        ? [para, code(60), para, table(20), para].join("\n\n")
+        : [para, code(250), para, table(60), para, code(150), para].join("\n\n");
       const lt = []; const po = new PerformanceObserver((l) => { for (const e of l.getEntries()) lt.push(e.duration); });
       po.observe({ type: "longtask", buffered: false });
       const gaps = []; let lastF = performance.now(); let on = true;
@@ -169,14 +173,16 @@ export const SCENES = [
       const t0 = performance.now();
       await L.stream(c, answer, { chunk: 40, everyMs: 16 });
       const streamMs = performance.now() - t0;
+      console.info(`perf: stream done ${Math.round(streamMs)}ms`);
       await new Promise((r) => setTimeout(r, 2000));
       on = false; po.disconnect();
       const sum = (a) => a.reduce((x, y) => x + y, 0);
       return {
-        turns, answerChars: answer.length, frames: Math.ceil(answer.length / 40), idealMs: Math.ceil(answer.length / 40) * 16,
+        turns, size, answerChars: answer.length, frames: Math.ceil(answer.length / 40), idealMs: Math.ceil(answer.length / 40) * 16,
         streamMs: Math.round(streamMs), longTasks: lt.length, longTaskTotalMs: Math.round(sum(lt)), longTaskMaxMs: Math.round(Math.max(0, ...lt)),
         jank50: gaps.filter((g) => g > 50).length, jank100: gaps.filter((g) => g > 100).length, maxGapMs: Math.round(Math.max(...gaps)),
         domNodes: document.getElementsByTagName("*").length,
+        streamErrors: L.errors.length, firstError: L.errors[0] ?? null,
       };
     },
   },

@@ -108,11 +108,31 @@ for (const scene of SCENES) {
 if (process.env.PERF !== "0") {
   for (const scene of SCENES.filter((s) => s.perf && (!FILTER.length || FILTER.some((f) => s.id.includes(f))))) {
     for (const [vp, viewport, mobile] of [["desktop", { width: 1280, height: 900 }, false], ["mobile", { width: 390, height: 844 }, true]]) {
+      if (process.env.PERF_VP && process.env.PERF_VP !== vp) continue;
       const runs = [];
       for (let k = 0; k < Number(process.env.PERF_RUNS ?? 3); k++) {
         const { ctx, page, errors } = await open(viewport, mobile);
+        page.on("console", (m) => { if (m.text().startsWith("perf:")) console.log(`  [${vp}#${k}] ${m.text()}`); });
         if (mobile) { const cdp = await ctx.newCDPSession(page); await cdp.send("Emulation.setCPUThrottlingRate", { rate: 4 }); }
-        const m = await page.evaluate(scene.perf, Number(process.env.PERF_TURNS ?? 150));
+        let prof = null;
+        if (process.env.PERF_PROFILE === "1") {
+          prof = await ctx.newCDPSession(page);
+          await prof.send("Profiler.enable");
+          await prof.send("Profiler.setSamplingInterval", { interval: 1000 });
+          await prof.send("Profiler.start");
+        }
+        const m = await page.evaluate(scene.perf, { turns: Number(process.env.PERF_TURNS ?? 150), size: process.env.PERF_SIZE ?? "long" });
+        if (prof) {
+          const { profile } = await prof.send("Profiler.stop");
+          const self = new Map();
+          const dt = profile.timeDeltas; const byId = new Map(profile.nodes.map((n) => [n.id, n]));
+          profile.samples.forEach((id, i) => {
+            const n = byId.get(id); const f = n.callFrame;
+            const key = `${f.functionName || "(anon)"} ${f.url.split("/").pop()}:${f.lineNumber}`;
+            self.set(key, (self.get(key) ?? 0) + (dt[i] ?? 0) / 1000);
+          });
+          m.topSelfMs = [...self.entries()].sort((a, b) => b[1] - a[1]).slice(0, 25).map(([k, v]) => `${Math.round(v)}ms ${k}`);
+        }
         m.errors = errors.length;
         runs.push(m);
         await ctx.close();
