@@ -168,6 +168,10 @@ export const PERMANENT_OPS_LEDGER_TABLES: readonly string[] = [
   // same class as the other model_pricing_*_backup ledgers: permanent rollback
   // proof. Do not DROP or TTL.
   "model_pricing_0903_cw_backup",
+  // 2026-10-14 OCV5-392: ids of usage_records rows 0304 backfilled with workload
+  // 'auto_dream' (old value NULL by construction). Rollback anchor for
+  // db/rollbacks/0304_billing_workload_column.sql; same class as the backups above.
+  "billing_workload_0304_backup",
   "emergency_containment_authorizations",
   "emergency_containment_debts",
   "verification_runs",

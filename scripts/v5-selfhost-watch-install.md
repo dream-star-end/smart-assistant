@@ -52,7 +52,7 @@ timer 实际执行的是安装目录里的 `watch.sh`，不是 git 工作树。
 
 ## 重新武装（OCV5-404）
 
-停用标记只能用已安装副本的 `--rearm` 解除，不要 `rm`：
+停用标记不要 `rm`。OCV5-420 起由 lease worker 的 autorecover 自动解除（见文末「自动恢复」）；需要立即手动时仍可用已安装副本的 `--rearm`：
 
 ```bash
 /opt/openclaude/v5-selfhost-watch/watch.sh --rearm
@@ -106,3 +106,25 @@ timer 实际执行的是安装目录里的 `watch.sh`，不是 git 工作树。
 收尾：修好后 push 新 tip 并搭车前滚；或按 runbook 人工回到 `.prev-release`。`deploy-v5-selfhost.sh --status` 的 `gate-fail:` 行显示当前策略、survivor phase 与维护窗口。
 
 宿主现状（2026-10-14 起）：策略文件已按用户确认写成 `OC_V5_SELFHOST_ON_GATE_FAIL=stay`，窗口用默认 2 小时。首次上线后用 `OC_V5_SELFHOST_GATE_FAIL_DRILL_SHA` 演练过一次门禁失败，演练行已删除。要恢复旧行为，把该行改成 `rollback` 或删掉文件。
+
+## 自动恢复（OCV5-420）
+
+这是纯 AI 项目，没有人会来跑 `train resolve`、`--rearm` 或应急恢复脚本。以前停下来等人的三处现在由 lease worker 每拍（30s）调用的 `scripts/v5-selfhost-autorecover.sh` 接管：
+
+- 列车 `recovery_required`（发布中途被打断，或补偿本身失败）；
+- `.manual-recovery-required`（cutover 两级补偿失败、看护 FAIL-LOUD 或两级兜底失败）；
+- `watch-disarmed`（看护停用）。
+
+每拍先让路：发布进程在跑、cutover survivor 还在、上一个恢复动作没结束时不动。动作是已安装看护的 `watch.sh --auto-recover`，经 `systemd-run`（unit `openclaude-v5-selfhost-autorecover-action`）异步执行并持发布锁：
+
+- 连续 `WATCH_REARM_CHECKS` 次复合健康绿且 `deps.pg=ok` → 把 `.manual-recovery-required` 改名为 `.autocleared-<UTC>`、`watch-disarmed` 改名为 `.autorearmed-<UTC>`，失败计数清零，看护恢复全部保护。
+- 仍红：外部依赖（pg / redis / docker）、schema、env 类不回切（回切救不了，等依赖恢复或修代码）；其余走与阈值路径相同的两级兜底（tier1 回上一份 release → tier2 恢复备份 unit）。
+- 退出码：0 绿、1 仍红、3 不回切类、75 现在不能动（锁 / 维护窗口 / grace / 演练模式，不计次数）。
+
+兜底按退避执行：立即、5 分钟、15 分钟，共 3 次；之后每 15 分钟只探测（`--probe-only`），绿了照样自动归档标记。
+
+绿了之后，`recovery_required` 列车由 autorecover 结成 `failed`（事件 `autorecover-resolved`）。worker 的「同 target 不自动重发」只认执行器自报的失败，所以仍在登记中的搭车会自动再发一班，即重跑被打断的列车。同一 target 24 小时内自动重跑超过 2 次就不再重跑：搭车失败回调给登记它的会话 / 工单，并升级。
+
+升级：兜底 3 次仍红、事件超过 30 分钟未恢复、重跑超限或缺看护时，用 `oc-task`（uid 3）在 OCV5 项目开一张 P1 bug 并 `ticket approve`（agent 身份），bug 首站是 AI 巡检站，PatrolEngine 会派给 AI。每个事件只开一张；之后恢复了会在该单留言「已自愈」。
+
+告警只做记录：`autorecover_started` / `autorecover_escalated` / `autorecover_closed`（alert.sh，模式同上）。状态在 `/var/lib/openclaude-v5-selfhost-watch/autorecover/`（`incident.env`、`history/`）。参数可用 `OC_V5_AUTORECOVER_*` 环境变量覆盖（`/etc/openclaude/lease-worker.env`）。
