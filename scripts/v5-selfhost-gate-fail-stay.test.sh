@@ -33,7 +33,7 @@ install -m 0755 "$SURVIVOR_SRC" "$BASE/survivor.sh"
   echo 'cutover_compensate() { echo "COMPENSATE $1" >>"$C/compensate.log"; return 1; }'
   for f in cutover_clog cutover_fail cutover_survivor_script cutover_persist_phase selfhost_policy_get \
     gate_fail_policy stay_window_sec gate_fail_drill_armed cutover_gate_against_release \
-    write_stay_maintenance clear_stay_maintenance stay_alert cutover_keep_failed lease_train_finish \
+    write_stay_maintenance clear_stay_maintenance deploy_alert cutover_keep_failed lease_train_finish \
     proc_starttime_of activate_tuple_joint; do
     body="$(fn "$f")"
     [[ -n "$body" ]] || { echo "missing function $f" >&2; exit 1; }
