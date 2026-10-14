@@ -90,14 +90,13 @@ describe("splitLiveMarkdown (OCV5-421)", () => {
     }
   });
 
-  test("$$ inside inline code does not open display math", () => {
-    const text = `\`$$\` 是行内代码\n\n${para(1)}\n\n$$\na=1+2+3+4\n\nb=2\n$$\n\n${para(2)}\n\n${para(3)}`;
+  test("$$ inside inline code never leads to a cut inside a formula", () => {
+    const math = "$$\na=1+2+3+4\n\nb=2\n$$";
+    const text = `\`$$\` 是行内代码\n\n${para(1)}\n\n${math}\n\n${para(2)}\n\n${para(3)}`;
     const parts = splitLiveMarkdown(text, 100);
-    for (const p of parts) {
-      const bare = p.replace(/(`+).*?\1/g, "");
-      expect((bare.match(/\$\$/g) ?? []).length % 2).toBe(0);
-    }
-    expect(parts.length).toBeGreaterThan(1);
+    expect(parts.join("")).toBe(text);
+    // when the two readings disagree the chunker just stops cutting; the formula stays whole
+    expect(parts.some((p) => p.includes(math))).toBe(true);
   });
 
   test("never cuts inside \\[ … \\] display math", () => {
@@ -123,5 +122,19 @@ describe("splitLiveMarkdown (OCV5-421)", () => {
     expect(hasStatefulBlock("```UI\n{}\n```")).toBe(true);
     expect(hasStatefulBlock("```htmlpreview\n<p>x</p>\n```")).toBe(true);
     expect(hasStatefulBlock("```python\nprint(1)\n```")).toBe(false);
+  });
+  // Codex r3: an unpaired backtick must not hide a real $$ opener.
+  test("an unpaired backtick before display math never lets a cut land inside the formula", () => {
+    const math = "$$\na=1+2+3+4\n\nb=2\n$$";
+    // Codex r3 repro: single newlines, so the formula follows inside the same paragraph.
+    const text = `普通文本以反引号结尾 \`\n${"x".repeat(1190)}\n${math}\n${"y".repeat(1280)}\n\n${para(2)}\n\n${para(3)}`;
+    const parts = splitLiveMarkdown(text);
+    expect(parts.join("")).toBe(text);
+    expect(parts.some((p) => p.includes(math))).toBe(true);
+  });
+
+  test("hasStatefulBlock also sees fences inside quotes and list items", () => {
+    expect(hasStatefulBlock("> ```options\n> {}\n> ```")).toBe(true);
+    expect(hasStatefulBlock("- 选项：\n\n    ```options\n    {}\n    ```")).toBe(true);
   });
 });

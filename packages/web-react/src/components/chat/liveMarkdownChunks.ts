@@ -4,8 +4,8 @@
  * text each notify made long answers O(n²) on the main thread).
  *
  * A cut is only made at a blank line that ends a top-level block for good:
- * - outside fenced code and outside display math (`$$ … $$`, `\[ … \]`; `$$` inside inline code
- *   does not count);
+ * - outside fenced code and outside display math (`$$ … $$`, `\[ … \]`), where "outside" must hold
+ *   both when inline code is skipped and when it is not (see splitLiveMarkdown);
  * - the next line is complete and starts a new block that cannot continue the previous one
  *   (not indented, not a list item, not a table row, not a blockquote line, not a definition,
  *   not a math opener).
@@ -25,8 +25,9 @@ export const LIVE_CHUNK_MIN_CHARS = 1200;
 const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})/;
 const NOT_A_FRESH_BLOCK = /^(?:\s|[-*+](?:\s|$)|\d{1,9}[.)](?:\s|$)|\||>|\[[^\]]*\]:|\$\$|\\\[)/;
 const DEFINITIONS = /^ {0,3}\[[^\]\n]+\]:/m;
-/** Stateful rich fences (user choices, iframes): must never be remounted by a re-partition. */
-const STATEFUL_FENCE = /^ {0,3}(?:`{3,}|~{3,})\s*(?:options|ui|html|htmlpreview)\b/im;
+/** Stateful rich fences (user choices, iframes): must never be remounted by a re-partition. Matched
+ * anywhere (inside quotes, list items, any indent) on purpose: a false positive only keeps chunks. */
+const STATEFUL_FENCE = /(?:`{3,}|~{3,})\s*(?:options|ui|html|htmlpreview)\b/i;
 
 export function hasMarkdownDefinitions(text: string): boolean {
   return DEFINITIONS.test(text);
@@ -61,12 +62,28 @@ function outsideInlineCode(line: string, tick: number): { bare: string; tick: nu
   return { bare, tick };
 }
 
+type MathState = { dollar: boolean; bracket: boolean };
+
+function stepMath(state: MathState, bare: string): void {
+  if ((bare.match(/\$\$/g) ?? []).length % 2 === 1) state.dollar = !state.dollar;
+  if (state.dollar) return;
+  const opens = (bare.match(/\\\[/g) ?? []).length;
+  const closes = (bare.match(/\\\]/g) ?? []).length;
+  if (!state.bracket && opens > closes) state.bracket = true;
+  else if (state.bracket && closes > 0 && closes >= opens) state.bracket = false;
+}
+
 export function splitLiveMarkdown(text: string, minChars = LIVE_CHUNK_MIN_CHARS): string[] {
   const out: string[] = [];
   let chunkStart = 0;
   let fence: string | null = null;
-  let dollarMath = false;
-  let bracketMath = false;
+  // Display math is tracked under two readings of the same text: one that skips inline code
+  // (a backtick run may open a code span that continues over later lines) and one that ignores
+  // code spans entirely. A cut needs both to say "outside math": whenever the readings disagree
+  // (unpaired backtick, `$$` inside code) we just don't cut there — never a wrong cut.
+  const withCode: MathState = { dollar: false, bracket: false };
+  const raw: MathState = { dollar: false, bracket: false };
+  const inMath = () => withCode.dollar || withCode.bracket || raw.dollar || raw.bracket;
   let pos = 0;
   let prevBlank = false;
   let sawContent = false;
@@ -77,7 +94,7 @@ export function splitLiveMarkdown(text: string, minChars = LIVE_CHUNK_MIN_CHARS)
     const line = text.slice(pos, nl);
     const blank = line.trim() === "";
     // Cut decision uses the state *before* this line: a fence opener may start a chunk.
-    if (!fence && !dollarMath && !bracketMath && !blank && prevBlank && sawContent
+    if (!fence && !inMath() && !blank && prevBlank && sawContent
       && !NOT_A_FRESH_BLOCK.test(line) && pos - chunkStart >= minChars) {
       out.push(text.slice(chunkStart, pos));
       chunkStart = pos;
@@ -85,21 +102,15 @@ export function splitLiveMarkdown(text: string, minChars = LIVE_CHUNK_MIN_CHARS)
     if (fence) {
       const m = FENCE_OPEN.exec(line);
       if (m && m[1][0] === fence[0] && m[1].length >= fence.length && line.trim() === m[1]) fence = null;
-    } else if (!dollarMath && !bracketMath && FENCE_OPEN.test(line)) {
+    } else if (!inMath() && FENCE_OPEN.test(line)) {
       fence = FENCE_OPEN.exec(line)![1];
     } else if (blank) {
       codeTick = 0; // a code span never crosses a paragraph
     } else {
       const scanned = outsideInlineCode(line, codeTick);
       codeTick = scanned.tick;
-      const bare = scanned.bare;
-      if ((bare.match(/\$\$/g) ?? []).length % 2 === 1) dollarMath = !dollarMath;
-      if (!dollarMath) {
-        const opens = (bare.match(/\\\[/g) ?? []).length;
-        const closes = (bare.match(/\\\]/g) ?? []).length;
-        if (!bracketMath && opens > closes) bracketMath = true;
-        else if (bracketMath && closes > 0 && closes >= opens) bracketMath = false;
-      }
+      stepMath(withCode, scanned.bare);
+      stepMath(raw, line);
     }
     if (!blank) sawContent = true;
     prevBlank = blank;

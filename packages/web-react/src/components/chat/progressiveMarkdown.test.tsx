@@ -44,4 +44,17 @@ describe("ProgressiveMarkdown chunked live render (OCV5-421)", () => {
     await screen.findByText(/来源说明/);
     expect(container.querySelector('a[href^="#user-content-fn-"]')).not.toBeNull();
   });
+  // Codex r3: option cards inside a blockquote or a list item are stateful too.
+  test.each([
+    ["blockquote", options.split("\n").map((l) => `> ${l}`).join("\n")],
+    ["list item", `- 请选择：\n\n${options.split("\n").map((l) => `    ${l}`).join("\n")}`],
+  ])("an option card in a %s keeps its DOM node at stream end with a late definition", async (_kind, card) => {
+    const head = `${"x".repeat(1250)}\n\n第二段。\n\n${card}\n\n`;
+    const { rerender } = render(<ProgressiveMarkdown text={head} live caret />);
+    const before = await screen.findByRole("button", { name: /正式/ });
+    const text = `${head}${para(1)}\n\n${para(2)}\n\n结论[^1]。\n\n[^1]: 来源\n`;
+    rerender(<ProgressiveMarkdown text={text} live caret />);
+    rerender(<ProgressiveMarkdown text={text} live={false} caret={false} />);
+    expect(await screen.findByRole("button", { name: /正式/ })).toBe(before);
+  });
 });
