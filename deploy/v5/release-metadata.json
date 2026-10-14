@@ -172,7 +172,8 @@
     "0298_commercial_box_api_context_1m",
     "0299_commercial_box_claude_profiles",
     "0301_commercial_box_api_haiku_5_5",
-    "0302_chat_project_workspace"
+    "0302_chat_project_workspace",
+    "0304_billing_workload_column"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

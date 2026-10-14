@@ -38,3 +38,4 @@ packages/commercial/src/__tests__/modelReleaseOperator.groupB.integ.test.ts
 packages/commercial/src/__tests__/modelReleaseOperator.groupC.integ.test.ts
 packages/commercial/src/__tests__/modelReleaseOperator.groupD.integ.test.ts
 packages/commercial/src/__tests__/modelReleaseOperator.groupE.integ.test.ts
+packages/commercial/src/__tests__/migration0304BillingWorkload.integ.test.ts

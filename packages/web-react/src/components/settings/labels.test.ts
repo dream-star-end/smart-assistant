@@ -15,6 +15,10 @@ describe("ledgerReasonView（审计 SET-16：未知 reason 显示「其他」并
     // 旧的 ledgerReasonLabel 仍原样回退，供图表 legend 等开发者可见位置使用
     expect(ledgerReasonLabel("mystery_backend_reason")).toBe("mystery_backend_reason");
   });
+  test("workload=auto_dream → 「记忆整理」(OCV5-392: reason 仍为 chat)", () => {
+    expect(ledgerReasonView("chat", "auto_dream")).toEqual({ label: "记忆整理", raw: null });
+    expect(ledgerReasonView("chat", null)).toEqual({ label: "其他", raw: "chat" });
+  });
 });
 
 describe("apiRequestStatusLabel（审计 SET-25：外接 API 结果码 → 中文）", () => {
