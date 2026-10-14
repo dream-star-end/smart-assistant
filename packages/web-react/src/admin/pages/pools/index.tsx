@@ -146,23 +146,24 @@ function PolicyNote({ policy }: { policy: PoolsResponse["policy"] }) {
   );
 }
 
+// 手机宽度下表格列被压窄,徽标必须不换行,否则会一字一行。
 function StatusChip({ m }: { m: PoolMember }) {
   if (m.status === "active") {
     return (
-      <span className="inline-flex items-center rounded-full bg-success-soft px-2 py-0.5 text-xs font-medium text-success">
+      <span className="inline-flex items-center whitespace-nowrap rounded-full bg-success-soft px-2 py-0.5 text-xs font-medium text-success">
         可调度
       </span>
     );
   }
   if (m.status === "cooldown") {
     return (
-      <span className="inline-flex items-center rounded-full bg-warning-soft px-2 py-0.5 text-xs font-medium text-warning">
+      <span className="inline-flex items-center whitespace-nowrap rounded-full bg-warning-soft px-2 py-0.5 text-xs font-medium text-warning">
         {cooldownLabel(m.cooldownReason)}
       </span>
     );
   }
   return (
-    <span className="inline-flex items-center rounded-full bg-hover px-2 py-0.5 text-xs font-medium text-muted">
+    <span className="inline-flex items-center whitespace-nowrap rounded-full bg-hover px-2 py-0.5 text-xs font-medium text-muted">
       {m.status === "banned" ? "封禁" : "管理员停用"}
     </span>
   );
@@ -184,14 +185,14 @@ function PoolSection({
       key: "type",
       title: "类型",
       width: 92,
-      render: (m) => <span className="text-meta">{m.credentialType === "api_key" ? "API key" : "订阅账号"}</span>,
+      render: (m) => <span className="whitespace-nowrap text-meta">{m.credentialType === "api_key" ? "API key" : "订阅账号"}</span>,
     },
     {
       key: "label",
       title: "名称",
       render: (m) => (
         <div className="flex flex-col">
-          <span className="font-medium">{m.label || `#${m.id}`}</span>
+          <span className="break-all font-medium">{m.label || `#${m.id}`}</span>
           <span className="font-mono text-[11.5px] text-faint">
             {[m.hints.plan, m.hints.key, m.hints.source === "env" ? "来自环境变量" : null].filter(Boolean).join(" · ") || `#${m.id}`}
           </span>
@@ -205,7 +206,7 @@ function PoolSection({
       width: 120,
       render: (m) =>
         m.status === "cooldown" ? (
-          <span className="text-meta">{remainingLabel(m.cooldownUntil)}</span>
+          <span className="whitespace-nowrap text-meta">{remainingLabel(m.cooldownUntil)}</span>
         ) : (
           <span className="text-faint">—</span>
         ),
