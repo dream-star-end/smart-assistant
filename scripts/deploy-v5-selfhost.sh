@@ -88,11 +88,14 @@ MODEL_AUTHORITY_DEPLOY_ROLE="${PG_ROLE}_model_deploy"
 REDIS_URL="redis://127.0.0.1:6379/3"
 # Runtime image pin. Rebuild with:
 #   OC_FLAVOR=selfhost OC_RUNTIME_SOURCE_COMMIT=$(git rev-parse HEAD) \
-#     packages/commercial/agent-sandbox/build-image.sh v5-cli-cc2280-codex01592-grok1013-zcode381-slim
-# which sources deploy/v5-selfhost/runtime-build.env (OC_INCLUDE_ZCODE=1).
+#     packages/commercial/agent-sandbox/build-image.sh v5-cli-cc2280-codex01592-grok1013-zcode381-agy134-slim
+# which sources deploy/v5-selfhost/runtime-build.env (OC_INCLUDE_ZCODE=1, OC_INCLUDE_ANTIGRAVITY=1).
 # cc2280 = official Claude Code 2.1.280 (recognizes claude-opus-5-5). The
 # previous tag stays on the 2.1.278 image so a tuple flip can roll back.
-RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2280-codex01592-grok1013-zcode381-slim"
+# agy134 (OCV5-415) = patch of the v5-cli-cc2280-codex01592-grok1013-zcode381-slim image that adds the official
+# Antigravity CLI 1.3.4 (same RUN block as Dockerfile.openclaude-runtime, sha512-pinned);
+# the previous tag stays for rollback.
+RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2280-codex01592-grok1013-zcode381-agy134-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"
 PERSONAL_PORT="18789"

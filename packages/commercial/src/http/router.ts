@@ -82,6 +82,12 @@ import {
   handleAdminPutAccountGroupModels,
 } from './admin/accountGroups.js'
 import {
+  handleAdminAntigravityAccountPatch,
+  handleAdminAntigravityAccountsList,
+  handleAdminAntigravityAuthComplete,
+  handleAdminAntigravityAuthStart,
+} from './admin/antigravityAccounts.js'
+import {
   handleAdminAccountsStats,
   handleAdminCreateAccount,
   handleAdminCursorSessionCancel,
@@ -1202,6 +1208,11 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'DELETE', pathPrefix: '/api/admin/accounts/cursor-session/', handler: handleAdminCursorSessionCancel },
     // Claude Code logins (CLAUDE_CONFIG_DIR profiles) on a Box account. Exact paths: the
     // accounts/ prefix routes below would swallow a sub-resource.
+    // OCV5-415 Antigravity Google AI subscription accounts. Exact paths first.
+    { method: 'POST', path: '/api/admin/antigravity-accounts/auth/start', handler: handleAdminAntigravityAuthStart },
+    { method: 'POST', path: '/api/admin/antigravity-accounts/auth/complete', handler: handleAdminAntigravityAuthComplete },
+    { method: 'GET', path: '/api/admin/antigravity-accounts', handler: handleAdminAntigravityAccountsList },
+    { method: 'PATCH', pathPrefix: '/api/admin/antigravity-accounts/', handler: handleAdminAntigravityAccountPatch },
     { method: 'GET', path: '/api/admin/box-claude-profiles', handler: handleAdminBoxClaudeProfilesList },
     { method: 'POST', path: '/api/admin/box-claude-profiles/discover', handler: handleAdminBoxClaudeProfilesDiscover },
     { method: 'PUT', path: '/api/admin/box-claude-profiles', handler: handleAdminBoxClaudeProfilesSelect },

@@ -332,6 +332,16 @@ import {
   createIoredisZcodeRelayKv,
 } from "./billing/zcodeRouteContext.js";
 import {
+  ANTIGRAVITY_RELAY_PREFIX,
+  makeAntigravityRelayHandler,
+  type AntigravityRelayHandler,
+} from "./http/internalAntigravityRelay.js";
+import {
+  configureAntigravityRelayKv,
+  expireAntigravityRelayRoute,
+} from "./billing/antigravityRouteContext.js";
+import { admitAntigravityTurn } from "./account-pool/antigravityAdmission.js";
+import {
   SKILL_EMBED_PREFIX,
   makeSkillEmbedHandler,
   type SkillEmbedHandler,
@@ -1566,6 +1576,7 @@ export async function registerCommercial(
     enableReadyCheck: true,
   });
   configureZcodeRelayKv(createIoredisZcodeRelayKv(redis));
+  configureAntigravityRelayKv(createIoredisZcodeRelayKv(redis));
 
   // 预热 dummy hash:第一次登录无影响
   await warmupLoginDummyHash();
@@ -2499,6 +2510,11 @@ export async function registerCommercial(
         identityRepo,
         codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
       });
+      const antigravityRelayHandler: AntigravityRelayHandler = makeAntigravityRelayHandler({
+        identityRepo,
+        clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
+        pricing,
+      });
       // /internal/v3/skill-embed — 容器内 mcp-memory 语义 skill_search 回源 master。
       // master 持 SKILL_EMBEDDING_API_KEY/DASHSCOPE_API_KEY(只在 master env,不注入容器),
       // 同款 verifyContainerIdentity 双因子鉴权;向量跨租户 PG 缓存,fail-closed 回落关键词。
@@ -2958,6 +2974,9 @@ export async function registerCommercial(
         }
         if (path === ZCODE_RELAY_PREFIX || path.startsWith(`${ZCODE_RELAY_PREFIX}/`)) {
           return zcodeRelayHandler(req, res, ctx);
+        }
+        if (path === ANTIGRAVITY_RELAY_PREFIX || path.startsWith(`${ANTIGRAVITY_RELAY_PREFIX}/`)) {
+          return antigravityRelayHandler(req, res, ctx);
         }
         if (path === SKILL_EMBED_PREFIX) {
           return skillEmbedHandler(req, res, ctx);
@@ -5916,6 +5935,14 @@ export async function registerCommercial(
       }),
     expireZcodeRoute: async (token) => {
       await expireZcodeRelayRoute(token);
+    },
+    admitAntigravityTurn: ({ containerId, userId, requestId, modelId, budgetCredits }) =>
+      admitAntigravityTurn(
+        { containerId, userId, requestId, modelId, budgetCredits, relayPort: V3_CONTAINER_PORT },
+        { clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "" },
+      ),
+    expireAntigravityRoute: async (token) => {
+      await expireAntigravityRelayRoute(token);
     },
     releaseGrokRouteLease: async (accountId, slotId) => {
       // Expire durable authority before freeing the local mirror. If PG is

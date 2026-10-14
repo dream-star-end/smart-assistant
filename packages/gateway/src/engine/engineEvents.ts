@@ -277,7 +277,7 @@ export interface EngineBillingEvent extends DurableCodexBilling {
  * observations onto the platform ledger (selfhost 0221+). */
 export interface EngineExternalBillingEvent {
   requestId: string
-  engine: 'cursor' | 'zcode'
+  engine: 'cursor' | 'zcode' | 'antigravity'
   status: 'success' | 'error' | 'unavailable'
   terminalCode?: 'USER_CANCELLED' | 'AUTH_UNAVAILABLE' | 'QUOTA_UNAVAILABLE' | 'ENGINE_ERROR'
   durationMs: number

@@ -171,6 +171,7 @@ import { isEngineLocalTurnExempt, isModelAuthorityRequired } from './modelAuthor
 import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import type { GrokRouteOverride } from './engine/grokAdapter.js'
 import type { ZcodeRouteOverride } from './engine/zcodeAdapter.js'
+import type { AntigravityRouteOverride } from './engine/antigravityAdapter.js'
 import { eventBus, createEvent } from './eventBus.js'
 import { beginMemoryTurnTracking } from './memoryTurnObserver.js'
 import {
@@ -5218,6 +5219,8 @@ export class SessionManager {
       resetNativeSession?: boolean
       /** ZCode CLI receives only this one-turn opaque loopback Anthropic relay. */
       zcodeRoute?: ZcodeRouteOverride | null
+      /** Antigravity CLI: one-turn relay route + limited Google token (OCV5-415). */
+      antigravityRoute?: AntigravityRouteOverride | null
       /** Master-authored platform goal snapshot for this exact turn. null
        * explicitly clears stale engine state; omission is for legacy callers. */
       platformGoal?: GoalStateSnapshot | null
@@ -5543,6 +5546,10 @@ export class SessionManager {
       const maybeSetZcodeRoute = (session.runner as any).setZcodeRoute
       if (typeof maybeSetZcodeRoute === 'function') {
         maybeSetZcodeRoute.call(session.runner, opts?.zcodeRoute ?? null)
+      }
+      const maybeSetAntigravityRoute = (session.runner as any).setAntigravityRoute
+      if (typeof maybeSetAntigravityRoute === 'function') {
+        maybeSetAntigravityRoute.call(session.runner, opts?.antigravityRoute ?? null)
       }
       // effort + model 应用都必须在本 turn 真正启动**之前**完成,且必须在 prev 之后:
       //   - prev 之前:可能中断别人的 in-flight turn

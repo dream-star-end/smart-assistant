@@ -1190,7 +1190,7 @@ export const OutboundExternalEngineBilling = Type.Intersect([Type.Object({
   type: Type.Literal('outbound.external_engine_billing'),
   sessionKey: Type.String(), channel: Type.String(), peer: Peer,
   requestId: Type.String({ pattern: '^[0-9a-f]{32}$' }),
-  engine: Type.Union([Type.Literal('cursor'), Type.Literal('zcode')]),
+  engine: Type.Union([Type.Literal('cursor'), Type.Literal('zcode'), Type.Literal('antigravity')]),
   status: Type.Union([Type.Literal('success'), Type.Literal('error'), Type.Literal('unavailable')]),
   terminalCode: Type.Optional(Type.Union([
     Type.Literal('USER_CANCELLED'), Type.Literal('AUTH_UNAVAILABLE'),

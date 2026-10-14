@@ -552,37 +552,45 @@ describe('Cursor context tier (300k default / 1M opt-in, turn-level execution ax
 })
 
 describe('Antigravity CLI engine model authority (OCV5-415)', () => {
-  test('canonical ids stay separate from the 1.3.4 `agy models` ids and upstream names', () => {
-    assert.deepEqual(ANTIGRAVITY_ENGINE_MODEL_IDS, ['antigravity-gemini-3.1-pro', 'antigravity-gemini-3.8-flash'])
-    assert.equal(isAntigravityEngineModel('antigravity-gemini-3.1-pro'), true)
-    assert.equal(isAntigravityEngineModel('gemini-3.1-pro-high'), false)
-    assert.equal(isAntigravityEngineModel('gemini-3.8-flash'), false)
+  test('canonical ids stay separate from the 1.3.4 `agy models` ids', () => {
+    assert.deepEqual(ANTIGRAVITY_ENGINE_MODEL_IDS, [
+      'antigravity-gemini-3.8-flash',
+      'antigravity-claude-sonnet-4.6',
+      'antigravity-claude-opus-4.6',
+      'antigravity-gpt-oss-120b',
+    ])
+    assert.equal(isAntigravityEngineModel('antigravity-gemini-3.8-flash'), true)
+    assert.equal(isAntigravityEngineModel('antigravity-gemini-3.1-pro'), false)
+    assert.equal(isAntigravityEngineModel('gemini-3.8-flash-high'), false)
+    assert.equal(isAntigravityEngineModel('claude-sonnet-4-6'), false)
     assert.equal(isAntigravityEngineModel('cursor-gemini-3.8-flash'), false)
   })
 
   test('effort maps to an exact CLI id; unknown effort falls back to the model default', () => {
-    assert.equal(antigravityCliModelId('antigravity-gemini-3.1-pro', 'low'), 'gemini-3.1-pro-low')
-    assert.equal(antigravityCliModelId('antigravity-gemini-3.1-pro', 'high'), 'gemini-3.1-pro-high')
-    assert.equal(antigravityCliModelId('antigravity-gemini-3.1-pro', 'medium'), 'gemini-3.1-pro-high')
-    assert.equal(antigravityCliModelId('antigravity-gemini-3.1-pro', undefined), 'gemini-3.1-pro-high')
-    assert.equal(antigravityCliModelId('antigravity-gemini-3.8-flash', 'xhigh'), 'gemini-3.8-flash-medium')
     assert.equal(antigravityCliModelId('antigravity-gemini-3.8-flash', 'low'), 'gemini-3.8-flash-low')
+    assert.equal(antigravityCliModelId('antigravity-gemini-3.8-flash', 'high'), 'gemini-3.8-flash-high')
+    assert.equal(antigravityCliModelId('antigravity-gemini-3.8-flash', 'xhigh'), 'gemini-3.8-flash-medium')
+    assert.equal(antigravityCliModelId('antigravity-gemini-3.8-flash', undefined), 'gemini-3.8-flash-medium')
+    assert.equal(antigravityCliModelId('antigravity-claude-sonnet-4.6', 'high'), 'claude-sonnet-4-6')
+    assert.equal(antigravityCliModelId('antigravity-claude-opus-4.6', undefined), 'claude-opus-4-6-thinking')
+    assert.equal(antigravityCliModelId('antigravity-gpt-oss-120b', 'low'), 'gpt-oss-120b-medium')
     assert.equal(antigravityCliModelId('gemini-3.8-flash-high', 'high'), undefined)
     assert.equal(antigravityCliModelId(undefined, 'high'), undefined)
-    assert.deepEqual(modelReasoningPolicy('antigravity-gemini-3.1-pro').supported, ['low', 'high'])
     assert.deepEqual(modelReasoningPolicy('antigravity-gemini-3.8-flash').supported, ['low', 'medium', 'high'])
+    assert.deepEqual(modelReasoningPolicy('antigravity-claude-sonnet-4.6').supported, [])
   })
 
-  test('relay allowlist includes the title-generation model and nothing else foreign', () => {
+  test('relay allowlist is the route model CLI ids plus the title-generation model', () => {
     assert.deepEqual(antigravityAllowedUpstreamModels('antigravity-gemini-3.8-flash'), [
-      'gemini-3.8-flash',
-      'gemini-3.1-flash-lite-preview',
+      'gemini-3.8-flash-low',
+      'gemini-3.8-flash-medium',
+      'gemini-3.8-flash-high',
+      'gemini-3.5-flash-lite',
     ])
-    assert.deepEqual(antigravityAllowedUpstreamModels('antigravity-gemini-3.1-pro'), [
-      'gemini-3.1-pro-preview',
-      'gemini-3.1-pro-preview-customtools',
-      'gemini-3.1-flash-lite-preview',
+    assert.deepEqual(antigravityAllowedUpstreamModels('antigravity-claude-opus-4.6'), [
+      'claude-opus-4-6-thinking',
+      'gemini-3.5-flash-lite',
     ])
-    assert.deepEqual(antigravityAllowedUpstreamModels('gemini-3.1-pro-preview'), [])
+    assert.deepEqual(antigravityAllowedUpstreamModels('antigravity-gemini-3.1-pro'), [])
   })
 })

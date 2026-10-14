@@ -575,6 +575,12 @@ import {
   V5_ZCODE_RELAY_PREFIX,
 } from './v5ZcodeRelay.js'
 import {
+  handleV5AntigravityRelayLocal,
+  readV5AntigravityRelayConfig,
+  V5_ANTIGRAVITY_RELAY_PREFIX,
+} from './v5AntigravityRelay.js'
+import type { AntigravityRouteOverride } from './engine/antigravityAdapter.js'
+import {
   handleV3MarketplaceRelayLocal,
   readV3MarketplaceRelayConfig,
   V3_MARKETPLACE_LOCAL_RELAY_PREFIX,
@@ -1583,6 +1589,58 @@ export function _buildSafeZcodeRouteOverride(args: {
     return null
   }
   return { baseUrl: route.baseUrl, routeToken: route.routeToken }
+}
+
+/** Validate the master-owned Antigravity route (OCV5-415): the opaque relay
+ * token plus the openid/userinfo-only Google token the CLI needs for its
+ * startup eligibility check. CLOUD_CODE_URL keeps the path, so the route
+ * baseUrl is used verbatim. */
+export function _buildSafeAntigravityRouteOverride(args: {
+  agent: { id: string; provider?: string; runnerKind?: string }
+  model?: string
+  rawRoute: unknown
+  officialRelayPort: number
+  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity' }
+}): AntigravityRouteOverride | null {
+  if (!args.rawRoute || typeof args.rawRoute !== 'object' || Array.isArray(args.rawRoute)) return null
+  let engineId: string
+  try {
+    engineId = resolveEngine(args.model, args.agent as never, args.authority)
+  } catch {
+    return null
+  }
+  if (engineId !== 'antigravity') return null
+  const route = args.rawRoute as Record<string, unknown>
+  const keys = Object.keys(route).sort().join(',')
+  if (keys !== 'accessToken,accessTokenExpiresAt,baseUrl,routeToken'
+    && keys !== 'accessToken,accessTokenExpiresAt,baseUrl,idToken,routeToken') return null
+  if (typeof route.routeToken !== 'string' || !/^[0-9a-f]{64}$/.test(route.routeToken)) return null
+  if (typeof route.baseUrl !== 'string' || route.baseUrl.length > 512) return null
+  if (typeof route.accessToken !== 'string' || !/^[A-Za-z0-9._~+/=-]{20,4096}$/.test(route.accessToken)) return null
+  if (typeof route.accessTokenExpiresAt !== 'string' || !Number.isFinite(Date.parse(route.accessTokenExpiresAt))) return null
+  if (route.idToken !== undefined && (typeof route.idToken !== 'string' || !/^[A-Za-z0-9._-]{20,8192}$/.test(route.idToken))) return null
+  if (!Number.isInteger(args.officialRelayPort) || args.officialRelayPort <= 0 || args.officialRelayPort > 65535) return null
+  try {
+    const parsed = new URL(route.baseUrl)
+    const expectedPath = `${V5_ANTIGRAVITY_RELAY_PREFIX}/route/${route.routeToken}`
+    if (
+      parsed.protocol !== 'http:' ||
+      parsed.hostname !== '127.0.0.1' ||
+      Number(parsed.port || '80') !== args.officialRelayPort ||
+      parsed.pathname !== expectedPath ||
+      parsed.search ||
+      parsed.hash
+    ) return null
+  } catch {
+    return null
+  }
+  return {
+    baseUrl: route.baseUrl,
+    routeToken: route.routeToken,
+    accessToken: route.accessToken,
+    accessTokenExpiresAt: route.accessTokenExpiresAt,
+    ...(typeof route.idToken === 'string' ? { idToken: route.idToken } : {}),
+  }
 }
 
 // ─── handleUpload TOCTOU hardening test seam (v3 commercial v1.0.155) ───────
@@ -4051,6 +4109,23 @@ export class Gateway {
         this.log.error('v5 zcode local relay crashed', undefined, err)
         if (!res.headersSent) {
           try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'zcode relay crashed' } }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
+
+    if (url.pathname === V5_ANTIGRAVITY_RELAY_PREFIX || url.pathname.startsWith(`${V5_ANTIGRAVITY_RELAY_PREFIX}/`)) {
+      const relayCfg = readV5AntigravityRelayConfig(process.env)
+      if (!relayCfg) {
+        this.sendJson(res, 404, { error: { code: 'ANTIGRAVITY_RELAY_NOT_CONFIGURED', message: 'antigravity relay not configured' } })
+        return
+      }
+      handleV5AntigravityRelayLocal(req, res, relayCfg).catch((err) => {
+        this.log.error('v5 antigravity local relay crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'antigravity relay crashed' } }) } catch {}
         } else {
           try { res.end() } catch {}
         }
@@ -20363,6 +20438,20 @@ export class Gateway {
           }
         : {}),
     })
+    const safeAntigravityRoute = _buildSafeAntigravityRouteOverride({
+      agent,
+      model: safeModelForRouting,
+      rawRoute: (frame as any).__oc_antigravity_route,
+      officialRelayPort: this.deps.config.gateway.port,
+      ...(turnAuthority !== undefined
+        ? {
+            authority: {
+              canonicalModel: turnAuthority.canonicalModel,
+              engine: turnAuthority.engine,
+            },
+          }
+        : {}),
+    })
 
     const baseToolsets = agent.toolsets ?? this.deps.config.defaults.toolsets
     let effectiveToolsets = mergeOnDemandToolsets(
@@ -21938,6 +22027,7 @@ export class Gateway {
       codexRoute: safeCodexRoute,
       grokRoute: safeGrokRoute,
       zcodeRoute: safeZcodeRoute,
+      antigravityRoute: safeAntigravityRoute,
       ...(automaticRetryState ? { automaticRetryState } : {}),
       ...(inboundRecovery?.automatic === true &&
           'resetNativeSession' in inboundRecovery &&

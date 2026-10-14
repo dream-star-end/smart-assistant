@@ -7,17 +7,19 @@ import { identityCompatEnvironment } from '@openclaude/storage'
  * near 128 KB and visible in `ps`); stdin stays open until the `result`
  * event, then closes so the CLI exits.
  *
- * Credentials never enter the user container. The master supplies a one-turn
- * loopback relay route; the adapter passes the opaque route token as
- * GEMINI_API_KEY and the route as GOOGLE_GEMINI_BASE_URL (1.3.4 appends
- * `/v1beta/models/<m>:streamGenerateContent`). Without a valid route the turn
- * fails closed before spawning. The relay and its metering are not part of
- * this commit, so nothing routes here yet: there is no catalog row and the
- * model ids are not in ALLOWED_INBOUND_MODELS.
+ * The CLI runs in Google-account mode against a Google AI subscription
+ * account that only master holds (OCV5-415 P2). Per turn, master supplies a
+ * loopback relay route plus a limited (openid/userinfo) token: the token goes
+ * into the launch HOME's token file for the CLI's startup eligibility check,
+ * and `CLOUD_CODE_URL=<route>` sends every `/v1internal:*` call through the
+ * relay, which swaps in the account's real token. Without a valid route the
+ * turn fails closed before spawning.
  *
- * Billing is external (relay-metered): the CLI's own `result.usage` omits the
- * title-generation call and is cumulative across a resumed conversation, so
- * it is only used for display here, summed from per-step usage.
+ * Billing is external and relay-metered: master sums the relay's per-call
+ * usageMetadata rows. The CLI's own `result.usage` omits the title-generation
+ * call and is cumulative across a resumed conversation, so it is only used
+ * for display here, summed from per-step usage. The adapter's external_billing
+ * event carries status only.
  *
  * Probe evidence for every behaviour below: docs/ocv5-415-antigravity-cli.md
  * and the fixtures under __tests__/fixtures/antigravity/.
@@ -37,7 +39,7 @@ import {
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { ExecutionTarget } from '../remoteTarget.js'
 import type { EngineAdapter, EngineCapabilities, EngineTurnRun, TurnParams } from './engineAdapter.js'
-import type { PartialSnapshot, PhantomSignals, SegmentRecord, TurnSummary, TurnToolEntry } from './engineEvents.js'
+import type { EngineExternalBillingEvent, PartialSnapshot, PhantomSignals, SegmentRecord, TurnSummary, TurnToolEntry } from './engineEvents.js'
 import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
 import { buildCodexEnv } from './codexShared.js'
@@ -83,7 +85,16 @@ const EMPTY_SIGNALS: Readonly<PhantomSignals> = Object.freeze({ apiState: 'unkno
 export interface AntigravityRouteOverride {
   baseUrl: string
   routeToken: string
+  /** openid/userinfo-only Google token for the CLI token file. */
+  accessToken: string
+  accessTokenExpiresAt: string
+  idToken?: string
 }
+
+const REQUEST_ID_RE = /^[0-9a-f]{32}$/
+/** Relay refusals that mean the turn ran out of budget, not that it failed. */
+const BUDGET_EXHAUSTED_RE = /ANTIGRAVITY_BUDGET_EXHAUSTED|\b402\b/
+const QUOTA_RE = /RESOURCE_EXHAUSTED|\b429\b|quota/i
 
 interface StepUsage {
   inputTokens: number
@@ -161,7 +172,7 @@ function assemblePrompt(platformContent: string, input: string, goal: GoalStateS
 
 /** Throws unless the route is the token-bound loopback relay. */
 export function validateAntigravityRoute(route: AntigravityRouteOverride | null): AntigravityRouteOverride {
-  if (!route || !ROUTE_TOKEN_RE.test(route.routeToken)) {
+  if (!route || !ROUTE_TOKEN_RE.test(route.routeToken) || !route.accessToken || !route.accessTokenExpiresAt) {
     throw new Error('ANTIGRAVITY_ROUTE_REQUIRED: missing master-owned Antigravity relay route')
   }
   let parsed: URL
@@ -332,6 +343,11 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       projectBound: Boolean(this.opts.projectId),
     })
     const projection = projectAntigravityPlatform({
+      credential: {
+        accessToken: route.accessToken,
+        accessTokenExpiresAt: route.accessTokenExpiresAt,
+        ...(route.idToken ? { idToken: route.idToken } : {}),
+      },
       identityCompat: this.opts.identityCompat,
       agentId: this.opts.agentId,
       projectId: this.opts.projectId,
@@ -384,8 +400,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
             OPENCLAUDE_DELEGATE_CONTEXT_FILE: projection.delegateContextFile,
           }
         : {}),
-      GEMINI_API_KEY: route.routeToken,
-      GOOGLE_GEMINI_BASE_URL: route.baseUrl,
+      CLOUD_CODE_URL: route.baseUrl,
       AGY_CLI_DISABLE_AUTO_UPDATE: 'true',
       ...(this.traceId ? { OPENCLAUDE_TRACE_ID: this.traceId } : {}),
     }
@@ -773,6 +788,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     // 1.3.4 never streams thought text (only thinking_tokens), so the
     // thinking channel stays empty.
     const usage = this.usageSnapshot(ctx)
+    this.emitExternalBilling(ctx, isError)
     ctx.params.onEvent({ kind: 'final', meta: { ...usage, stopReason, cost: 0 } })
     ctx.resolveSummary({
       usage: { cost: 0, ...usage },
@@ -791,6 +807,34 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       staleResumeId: false,
       phantomSignals: { ...EMPTY_SIGNALS },
     })
+  }
+
+  /** Status-only sideband: master settles from the relay's usage rows. */
+  private emitExternalBilling(ctx: TurnContext, isError: boolean): void {
+    const requestId = ctx.params.requestId
+    if (!requestId || !REQUEST_ID_RE.test(requestId)) return
+    const detail = ctx.errorDetail ?? ''
+    // The relay refuses new calls past the admission budget; the tokens used
+    // up to there were consumed, so settle them (master clamps to balance).
+    const budgetStop = isError && !ctx.interrupted && BUDGET_EXHAUSTED_RE.test(detail)
+    const cls = !isError || ctx.interrupted || budgetStop ? null
+      : authError(detail) ? 'auth' as const
+      : QUOTA_RE.test(detail) ? 'quota' as const
+      : null
+    const status: EngineExternalBillingEvent['status'] = budgetStop || !isError ? 'success'
+      : cls ? 'unavailable' : 'error'
+    const terminalCode: EngineExternalBillingEvent['terminalCode'] = budgetStop || !isError ? undefined
+      : ctx.interrupted ? 'USER_CANCELLED'
+      : cls === 'auth' ? 'AUTH_UNAVAILABLE'
+      : cls === 'quota' ? 'QUOTA_UNAVAILABLE'
+      : 'ENGINE_ERROR'
+    this.emit('external_billing', {
+      requestId,
+      engine: 'antigravity',
+      status,
+      durationMs: Date.now() - ctx.startedAt,
+      ...(terminalCode ? { terminalCode } : {}),
+    } satisfies EngineExternalBillingEvent)
   }
 
   private finishError(ctx: TurnContext, detail: string): void {

@@ -46,7 +46,7 @@ import { meetsMinPlan } from "./planEntitlement.js";
 // 类型
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type ModelEngine = "ccb" | "codex" | "grok" | "cursor" | "zcode";
+export type ModelEngine = "ccb" | "codex" | "grok" | "cursor" | "zcode" | "antigravity";
 export type ModelCatalogState = "staged" | "active" | "disabled" | "retired";
 
 /**
@@ -480,7 +480,7 @@ export class ModelCatalogSnapshot {
   }
 
   isExternalBillingModel(modelId: string): boolean {
-    return this.isCursorModel(modelId) || this.isZcodeModel(modelId);
+    return this.isCursorModel(modelId) || this.isZcodeModel(modelId) || this.isAntigravityModel(modelId);
   }
 
   isCursorModel(modelId: string): boolean {
@@ -489,6 +489,11 @@ export class ModelCatalogSnapshot {
 
   isZcodeModel(modelId: string): boolean {
     return this.activeByModel.get(this.aliasToCanonical(modelId))?.engine === "zcode";
+  }
+
+  /** OCV5-415: official Antigravity CLI, relay-metered external billing. */
+  isAntigravityModel(modelId: string): boolean {
+    return this.activeByModel.get(this.aliasToCanonical(modelId))?.engine === "antigravity";
   }
 
   /**

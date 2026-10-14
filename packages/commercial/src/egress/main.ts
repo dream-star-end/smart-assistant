@@ -96,6 +96,8 @@ import { CODEX_RELAY_PREFIX } from "../http/internalCodexRelay.js";
 import { GROK_RELAY_PREFIX, makeGrokRelayHandler } from "../http/internalGrokRelay.js";
 import { ZCODE_RELAY_PREFIX, makeZcodeRelayHandler } from "../http/internalZcodeRelay.js";
 import { configureZcodeRelayKv, createIoredisZcodeRelayKv } from "../billing/zcodeRouteContext.js";
+import { ANTIGRAVITY_RELAY_PREFIX, makeAntigravityRelayHandler } from "../http/internalAntigravityRelay.js";
+import { configureAntigravityRelayKv } from "../billing/antigravityRouteContext.js";
 import {
   buildCodexRelayHandler,
   buildCodexTokenRefreshHandler,
@@ -182,6 +184,7 @@ export async function startEgress(): Promise<void> {
     enableReadyCheck: true,
   });
   configureZcodeRelayKv(createIoredisZcodeRelayKv(redis));
+  configureAntigravityRelayKv(createIoredisZcodeRelayKv(redis));
   const pricing = new PricingCache();
   try {
     await pricing.load();
@@ -640,6 +643,11 @@ export async function startEgress(): Promise<void> {
     identityRepo,
     codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
   });
+  const antigravityRelayHandler = makeAntigravityRelayHandler({
+    identityRepo,
+    clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
+    pricing,
+  });
 
   const forward = makeForwarder({ controlBaseUrl });
 
@@ -754,6 +762,21 @@ export async function startEgress(): Promise<void> {
         zcodeRelayHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
       ).catch((err) => {
         log.error("zcode_relay_handler_threw", { err: (err as Error).message });
+        if (!res.headersSent) {
+          res.statusCode = 500;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ error: { code: "INTERNAL", message: "egress handler error" } }));
+        } else {
+          try { res.destroy(); } catch { /* */ }
+        }
+      });
+      return;
+    }
+    if (path === ANTIGRAVITY_RELAY_PREFIX || path.startsWith(`${ANTIGRAVITY_RELAY_PREFIX}/`)) {
+      Promise.resolve(
+        antigravityRelayHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
+      ).catch((err) => {
+        log.error("antigravity_relay_handler_threw", { err: (err as Error).message });
         if (!res.headersSent) {
           res.statusCode = 500;
           res.setHeader("Content-Type", "application/json");

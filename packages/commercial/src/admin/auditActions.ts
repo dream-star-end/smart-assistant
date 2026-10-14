@@ -115,6 +115,8 @@ export const ADMIN_AUDIT_ACTIONS = {
   "egress_proxy.patch": { kind: "write", mode: "best-effort" },
   "egress_proxy.delete": { kind: "write", mode: "best-effort" },
   "oauth.exchange": { kind: "write", mode: "best-effort" },
+  "antigravity_account.authorize": { kind: "write", mode: "best-effort" },
+  "antigravity_account.patch": { kind: "write", mode: "best-effort" },
   "box_claude_profiles.discover": { kind: "write", mode: "best-effort" },
   "box_claude_profiles.select": { kind: "write", mode: "best-effort" },
 
