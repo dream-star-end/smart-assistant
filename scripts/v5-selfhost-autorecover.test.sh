@@ -70,7 +70,10 @@ task_cli() {
   shift
   echo "$*" >>"$C/task.calls"
   case "$1 $2" in
-    'ticket create') echo '{"ok":true,"ticket":{"identifier":"OCV5-900","version":1}}' ;;
+    'ticket create') [[ -f "$C/create.fail" ]] && { echo 'gateway down' >&2; return 3; }
+      echo '{"ok":true,"ticket":{"identifier":"OCV5-900","version":1}}' ;;
+    'ticket approve') [[ -f "$C/approve.fail" ]] && { echo 'gateway down' >&2; return 3; }; echo '{"ok":true}' ;;
+    'ticket get') echo '{"ok":true,"ticket":{"identifier":"OCV5-900","version":2}}' ;;
     *) echo '{"ok":true}' ;;
   esac
 }
@@ -92,7 +95,7 @@ add_train() { # <id> <status> <target>
 add_ride() { # <id> <want>
   sql "INSERT INTO lease(id,resource,mode,status,owner,owner_uid,want_sha,ticket_ref,created_at,updated_at) VALUES('$1','deploy:selfhost','ride','registered','cc3-test','3','$2','OCV5-1',strftime('%Y-%m-%dT%H:%M:%SZ','now'),strftime('%Y-%m-%dT%H:%M:%SZ','now'));"
 }
-inc() { sed -n "s/^$1=//p" "$C/state/incident.env" 2>/dev/null | tail -n1; }
+inc() { sed -n "s/^$1=//p" "$C/state/incident.env" 2>/dev/null | tail -n1 || true; }
 calls() { [[ -f "$C/watch.calls" ]] && wc -l <"$C/watch.calls" || echo 0; }
 T1="$(printf 'a%.0s' {1..40})"
 
@@ -139,8 +142,8 @@ if [[ "$a $b $c $d $e $f" == "1 1 2 2 3 4" && "$tk" == OCV5-900 && "$probe" == "
   ok "A6 backoff 0/300/900, escalate once after 3 failed restores, then probe-only"
 else bad "A6 calls=$a,$b,$c,$d,$e,$f ticket=$tk probe=$probe tasks=$(cat "$C/task.calls" 2>/dev/null)"; fi
 echo 0 >"$C/watch.rc"; tick 4030; tick 4040; tick 4050
-if [[ ! -f "$C/state/incident.env" ]] && grep -q '^ticket comment OCV5-900' "$C/task.calls" && grep -q '已自愈' "$C/task.calls"; then
-  ok "A7 later recovery closes the incident and comments 已自愈 on the escalation ticket"
+if [[ ! -f "$C/state/incident.env" ]] && grep -q '^ticket comment OCV5-900' "$C/task.calls" && grep -q '现场已恢复' "$C/task.calls"; then
+  ok "A7 later recovery closes the incident and comments 现场已恢复 on the escalation ticket"
 else bad "A7 inc=$(cat "$C/state/incident.env" 2>/dev/null) tasks=$(cat "$C/task.calls")"; fi
 
 setup a8; printf 'reason=x\n' >"$C/watch/watch-disarmed"; echo 75 >"$C/watch.rc"
@@ -159,6 +162,37 @@ tick 1000; tick 1010; tick 2810; tk="$(inc ticket)"
 
 setup a12; add_train tr-a12 recovery_required "$T1"; rm -f "$C/watch/watch.sh"; tick 1000
 [[ "$(inc need_escalate)" == missing-watch ]] && ok "A12 missing installed watch → escalation flagged, no crash" || bad "A12 out=$OUT"
+
+# ── Codex r1:预算超限只失败本 target 包含的搭车,之后登记的修复提交不受影响 ──
+setup a15; T2="$(printf 'b%.0s' {1..40})"
+add_train tr-o1 failed "$T1"; add_train tr-o2 failed "$T1"
+sql "INSERT INTO event(subject_id,event,actor,detail,created_at) VALUES('tr-o1','autorecover-resolved','autorecover','x',strftime('%Y-%m-%dT%H:%M:%SZ','now')),('tr-o2','autorecover-resolved','autorecover','x',strftime('%Y-%m-%dT%H:%M:%SZ','now'));"
+add_train tr-a15 recovery_required "$T1"; add_ride ls-a15a "$T1"; add_ride ls-a15b "$T2"
+tick 1000; tick 1010
+a="$(sql "SELECT status FROM lease WHERE id='ls-a15a';")"; b="$(sql "SELECT status FROM lease WHERE id='ls-a15b';")"
+[[ "$a" == failed && "$b" == registered ]] && ok "A15 budget exceeded fails only rides contained in that target; a newer fix ride stays" || bad "A15 a=$a b=$b"
+
+# ── Codex r1:批准失败要重试 ──
+setup a16; printf 'reason=x\n' >"$C/watch/watch-disarmed"; echo 1 >"$C/watch.rc"; touch "$C/approve.fail"
+tick 1000; tick 1010; tick 2810; n1="$(grep -c '^ticket approve' "$C/task.calls" || true)"; ap1="$(inc approved)"
+rm -f "$C/approve.fail"; tick 2820; n2="$(grep -c '^ticket approve' "$C/task.calls" || true)"
+if [[ "$n1" == 1 && "$ap1" == 0 && "$n2" == 2 && "$(inc approved)" == 1 ]] && grep -q '^ticket approve OCV5-900 --expected-version 2' "$C/task.calls"; then
+  ok "A16 failed approve is retried (re-reading the version) until it succeeds"
+else bad "A16 n1=$n1 ap1=$ap1 n2=$n2 approved=$(inc approved) calls=$(grep '^ticket' "$C/task.calls")"; fi
+
+# ── Codex r1:触发消失也不能丢掉未完成的升级 ──
+setup a17; add_train tr-p1 failed "$T1"; add_train tr-p2 failed "$T1"
+sql "INSERT INTO event(subject_id,event,actor,detail,created_at) VALUES('tr-p1','autorecover-resolved','autorecover','x',strftime('%Y-%m-%dT%H:%M:%SZ','now')),('tr-p2','autorecover-resolved','autorecover','x',strftime('%Y-%m-%dT%H:%M:%SZ','now'));"
+add_train tr-a17 recovery_required "$T1"; add_ride ls-a17 "$T1"; touch "$C/create.fail"
+tick 1000; tick 1010; tick 1040; kept1=$([[ -f "$C/state/incident.env" ]] && echo y || echo n)
+rm -f "$C/create.fail"; tick 1070
+hist="$(ls "$C/state/history/"*.env 2>/dev/null | head -n1)"
+tk="$(sed -n 's/^ticket=//p' "$hist" 2>/dev/null | tail -n1 || true)"; ap="$(sed -n 's/^approved=//p' "$hist" 2>/dev/null | tail -n1 || true)"
+closed=$([[ -f "$C/state/incident.env" ]] && echo n || echo y)
+if [[ "$kept1" == y && "$tk" == OCV5-900 && "$ap" == 1 && "$closed" == y ]] && grep -q '^ticket comment OCV5-900' "$C/task.calls" \
+  && grep -q 'rerun-budget' "$C/task.calls"; then
+  ok "A17 incident is kept until the escalation ticket is created and approved, then closed with a note that releases stay stopped"
+else bad "A17 kept1=$kept1 tk=$tk ap=$ap closed=$closed"; fi
 
 setup a13; printf 'reason=x\n' >"$C/watch/watch-disarmed"; OC_V5_AUTORECOVER=off tick 1000
 [[ "$(calls)" == 0 && ! -f "$C/state/incident.env" ]] && ok "A13 OC_V5_AUTORECOVER=off → no-op" || bad "A13 calls=$(calls)"

@@ -98,11 +98,13 @@ COMMIT;
 SQL
     ar_log "train $id → failed($detail)"
     if (( n + 1 > AR_RERUN_MAX )); then
-      while read -r rid; do
+      # 只失败本 target 已包含的搭车(want == target 或是其祖先);之后登记的修复提交不受影响。
+      while IFS='|' read -r rid want; do
         [[ -n "$rid" ]] || continue
+        [[ "$want" == "$target" ]] || lease_sha_contained "$want" "$target" || continue
         transition_with_outbox "$rid" registered failed "target ${target:0:12} 自动重跑 $((n + 1)) 次仍未完成,停止重跑" \
           "$(lease_body_failed "$rid" "列车 $id 等同 target 已自动重跑 $((n + 1)) 次仍被打断/未完成" "autorecover 已开工单派给 AI;修复后 push 新 tip 再 register")"
-      done < <(lease_sql "SELECT id FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';")
+      done < <(lease_sql "SELECT id||'|'||COALESCE(want_sha,'') FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';")
       ar_set need_escalate "rerun-budget target=${target:0:12}"
     fi
   done < <(ar_recovery_trains)
@@ -126,9 +128,34 @@ ar_launch_action() { # <restore|probe-only>
   ar_log "已启动恢复动作 mode=$mode"
 }
 
+# 批准开工(backlog→ready,agent 可做);bug 首站是 AI 巡检站,PatrolEngine 会派给 AI。失败下 tick 重试。
+ar_approve() { # <ticket> [version]
+  local tid="$1" ver="${2:-}"
+  if [[ -z "$ver" ]]; then
+    ver="$(task_cli "$AR_TASK_UID" ticket get "$tid" 2>/dev/null | jq -r '.ticket.version // empty' 2>/dev/null || true)"
+  fi
+  [[ -n "$ver" ]] || { ar_log "批准 $tid:读不到版本,下 tick 重试"; return 1; }
+  if task_cli "$AR_TASK_UID" ticket approve "$tid" --expected-version "$ver" --owner "agent:$AR_ACTOR" >/dev/null 2>&1; then
+    ar_set approved 1
+    ar_log "已批准开工 $tid"
+    return 0
+  fi
+  ar_log "批准 $tid 失败,下 tick 重试"
+  return 1
+}
+
+# 升级是否已完成(开单且批准)。未完成的升级在触发条件消失后也不能丢。
+ar_escalation_pending() {
+  [[ -n "$(ar_get need_escalate)" || -n "$(ar_get ticket)" ]] || return 1
+  [[ -z "$(ar_get ticket)" || "$(ar_get approved)" != 1 ]]
+}
+
 ar_escalate() { # <why>
   local why="$1" title body out tid ver
-  [[ -z "$(ar_get ticket)" ]] || return 0
+  if [[ -n "$(ar_get ticket)" ]]; then
+    [[ "$(ar_get approved)" == 1 ]] || ar_approve "$(ar_get ticket)" || true
+    return 0
+  fi
   title="selfhost 自动恢复未收敛:$(ar_get reasons | cut -c1-80)"
   body="autorecover 自动升级(OCV5-420,无人值守)。
 
@@ -149,12 +176,9 @@ autorecover 仍每 ${AR_PROBE_EVERY_SEC}s 探测一次,恢复后会在本单留�
   ver="$(jq -r '.ticket.version // empty' <<<"$out" 2>/dev/null || true)"
   [[ -n "$tid" ]] || { ar_log "升级开单返回无 identifier"; return 1; }
   ar_set ticket "$tid"
-  # 批准开工(backlog→ready,agent 可做);bug 首站是 AI 巡检站,PatrolEngine 会派给 AI。
-  if [[ -n "$ver" ]] && task_cli "$AR_TASK_UID" ticket approve "$tid" --expected-version "$ver" --owner "agent:$AR_ACTOR" >/dev/null 2>&1; then
-    ar_log "已升级 $tid 并批准开工"
-  else
-    ar_log "已升级 $tid(批准开工失败,留在待立项)"
-  fi
+  ar_set approved 0
+  ar_log "已升级 $tid"
+  ar_approve "$tid" "$ver" || true
   ar_alert critical autorecover_escalated "自动恢复未收敛,已开 $tid 派给 AI:$why"
 }
 
@@ -162,7 +186,7 @@ ar_close_incident() {
   local tid
   tid="$(ar_get ticket)"
   if [[ -n "$tid" ]]; then
-    task_cli "$AR_TASK_UID" ticket comment "$tid" --body "autorecover:事件 $(ar_get id) 已自愈(标记已归档、列车已结算),$(date -u +%Y-%m-%dT%H:%M:%SZ)。根因仍需按本单排查。" >/dev/null 2>&1 \
+    task_cli "$AR_TASK_UID" ticket comment "$tid" --body "autorecover:事件 $(ar_get id) 现场已恢复(标记已归档、列车已结算),$(date -u +%Y-%m-%dT%H:%M:%SZ)。$( [[ -n "$(ar_get need_escalate)" ]] && echo "注意:升级原因 $(ar_get need_escalate) 仍成立(如同 target 重跑超限,发布已停止),需修复后 push 新 tip 再 register。" )根因仍需按本单排查。" >/dev/null 2>&1 \
       || ar_log "自愈留言失败 $tid(不影响结束事件)"
   fi
   ar_alert info autorecover_closed "自动恢复事件 $(ar_get id) 已结束:$(ar_get reasons);动作 $(ar_get attempts) 次${tid:+;工单 $tid}"
@@ -187,7 +211,12 @@ autorecover_tick() {
   mkdir -p -- "$AR_STATE_DIR" || return 0
   why="$(ar_incident_active)"
   if [[ -z "$why" ]]; then
-    [[ -f "$AR_INCIDENT" ]] && ar_close_incident
+    [[ -f "$AR_INCIDENT" ]] || return 0
+    if ar_escalation_pending; then
+      ar_escalate "$(ar_get need_escalate)"
+      ar_escalation_pending && { ar_log "现场已恢复,但升级未完成,事件保留到开单并批准为止"; return 0; }
+    fi
+    ar_close_incident
     return 0
   fi
   now="$(ar_now)"
