@@ -21,7 +21,7 @@ export function BootSplash() {
     };
   }, []);
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-3 bg-bg text-muted" role="status" aria-live="polite">
+    <output className="flex h-full flex-col items-center justify-center gap-3 bg-bg text-muted" aria-live="polite">
       <Spinner size={22} />
       {stage >= 1 && (
         <p className="text-meta text-faint" data-testid="boot-slow-hint">
@@ -37,6 +37,6 @@ export function BootSplash() {
           仍在加载？刷新重试
         </button>
       )}
-    </div>
+    </output>
   );
 }

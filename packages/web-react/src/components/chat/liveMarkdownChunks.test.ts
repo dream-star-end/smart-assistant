@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { splitLiveMarkdown } from "./liveMarkdownChunks";
 
-const para = (n: number) => `段落 ${n}：` + "这是正文内容。".repeat(30);
+const para = (n: number) => `段落 ${n}：${"这是正文内容。".repeat(30)}`;
 const join = (parts: string[]) => parts.join("");
 
 describe("splitLiveMarkdown (OCV5-421)", () => {
@@ -10,7 +10,7 @@ describe("splitLiveMarkdown (OCV5-421)", () => {
   });
 
   test("cuts only at blank lines before a fresh block, lossless", () => {
-    const text = [para(1), para(2), para(3), para(4), para(5)].join("\n\n") + "\n\n尾";
+    const text = `${[para(1), para(2), para(3), para(4), para(5)].join("\n\n")}\n\n尾`;
     const parts = splitLiveMarkdown(text, 300);
     expect(parts.length).toBeGreaterThan(1);
     expect(join(parts)).toBe(text);
@@ -30,15 +30,15 @@ describe("splitLiveMarkdown (OCV5-421)", () => {
   });
 
   test("never cuts inside fenced code (closed or streaming)", () => {
-    const code = "```js\n" + Array.from({ length: 60 }, (_, i) => `line${i}\n\nafter${i}`).join("\n") + "\n";
-    const text = para(1) + "\n\n" + code;
+    const code = `\`\`\`js\n${Array.from({ length: 60 }, (_, i) => `line${i}\n\nafter${i}`).join("\n")}\n`;
+    const text = `${para(1)}\n\n${code}`;
     const parts = splitLiveMarkdown(text, 100);
     for (const p of parts.slice(1)) expect(p.startsWith("```js")).toBe(true);
     expect(join(parts)).toBe(text);
   });
 
   test("never cuts inside $$ display math", () => {
-    const text = para(1) + "\n\n$$\n" + "a+b\n\nc\n".repeat(40) + "$$\n\n" + para(2) + "\n\n" + para(3);
+    const text = `${para(1)}\n\n$$\n${"a+b\n\nc\n".repeat(40)}$$\n\n${para(2)}\n\n${para(3)}`;
     const parts = splitLiveMarkdown(text, 100);
     for (const p of parts) {
       const n = (p.match(/\$\$/g) ?? []).length;
@@ -48,12 +48,12 @@ describe("splitLiveMarkdown (OCV5-421)", () => {
   });
 
   test("does not split lists, tables, quotes or indented continuations", () => {
-    const list = Array.from({ length: 30 }, (_, i) => `- item ${i} ` + "x".repeat(40)).join("\n\n");
-    const ol = Array.from({ length: 30 }, (_, i) => `${i + 1}. step ` + "y".repeat(40)).join("\n\n");
-    const quote = Array.from({ length: 30 }, () => "> 引用 " + "z".repeat(40)).join("\n\n");
-    const nested = "- top\n\n    continued paragraph inside the item " + "w".repeat(2000);
+    const list = Array.from({ length: 30 }, (_, i) => `- item ${i} ${"x".repeat(40)}`).join("\n\n");
+    const ol = Array.from({ length: 30 }, (_, i) => `${i + 1}. step ${"y".repeat(40)}`).join("\n\n");
+    const quote = Array.from({ length: 30 }, () => `> 引用 ${"z".repeat(40)}`).join("\n\n");
+    const nested = `- top\n\n    continued paragraph inside the item ${"w".repeat(2000)}`;
     for (const body of [list, ol, quote, nested]) {
-      const text = para(1) + "\n\n" + body;
+      const text = `${para(1)}\n\n${body}`;
       const parts = splitLiveMarkdown(text, 100);
       expect(parts.length).toBeLessThanOrEqual(2);
       if (parts.length === 2) expect(parts[1]).toBe(body);
@@ -61,7 +61,7 @@ describe("splitLiveMarkdown (OCV5-421)", () => {
   });
 
   test("footnotes / reference definitions disable splitting", () => {
-    const text = Array.from({ length: 10 }, (_, i) => para(i)).join("\n\n") + "\n\n[^1]: 来源";
+    const text = `${Array.from({ length: 10 }, (_, i) => para(i)).join("\n\n")}\n\n[^1]: 来源`;
     expect(splitLiveMarkdown(text, 100)).toEqual([text]);
   });
 });
