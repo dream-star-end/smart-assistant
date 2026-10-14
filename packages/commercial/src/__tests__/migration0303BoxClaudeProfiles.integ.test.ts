@@ -21,6 +21,8 @@ async function account(label: string): Promise<bigint> {
 const found = (profile: string, over: Partial<BoxDiscoveredProfile> = {}): BoxDiscoveredProfile => ({ profile,
   loginState: "logged_in", projectsMode: profile === "default" ? "root" : "shared", emailHint: "a***@b***.com",
   accountFingerprint: profile.padEnd(12, "0").slice(0, 12).replace(/[^0-9a-f]/g, "a"), orgType: "claude_pro", ...over });
+// 0304 (OCV5-392) follows 0303, so rolling 0303 back means rolling 0304 back first, as in production.
+const rollback0304Path = fileURLToPath(new URL("../db/rollbacks/0304_billing_workload_column.sql", import.meta.url));
 const rollbackBlock = async () => {
   const block = /-- BEGIN TESTED MANUAL ROLLBACK 0303\n([\s\S]*?)-- END TESTED MANUAL ROLLBACK 0303/.exec(await readFile(sqlPath, "utf8"))![1]!;
   return block.split("\n").map((line) => line.replace(/^-- ?/, "")).join("\n");
@@ -109,12 +111,13 @@ describe("0303 box_claude_profiles", () => {
     await resetAndMigrateBefore("0303");
     // 0304 (billing workload columns, OCV5-392) follows 0303 in the chain.
     assert.deepEqual((await runMigrations()).applied, ["0303_box_claude_profiles", "0304_billing_workload_column"]);
+    await query(await readFile(rollback0304Path, "utf8"));
     await query(await rollbackBlock());
     assert.equal((await query("SELECT to_regclass('public.box_claude_profiles') AS t")).rows[0]!.t, null);
     assert.equal((await query("SELECT 1 FROM schema_migrations WHERE version='0303_box_claude_profiles'")).rowCount, 0);
     assert.deepEqual(await listBoxProfiles([1n]), [], "reads degrade to no rows when the table is gone");
     assert.equal(await boxProfilesAvailable(), false);
-    assert.deepEqual((await runMigrations()).applied, ["0303_box_claude_profiles"]);
+    assert.deepEqual((await runMigrations()).applied, ["0303_box_claude_profiles", "0304_billing_workload_column"]);
     assert.equal(await boxProfilesAvailable(), true);
   });
 });
