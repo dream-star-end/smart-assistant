@@ -28,9 +28,21 @@
         if (tc) tc.setAttribute("content", dark ? "#0c0c11" : "#fafafb");
       } catch (e) {}
     </script>
+    <!-- OCV5-421 首屏占位:JS 还没下载完时(弱网实测 40KB/s 下 30 秒以上)#root 是空的,只有一片空白。
+         纯 CSS:居中转圈,4 秒后才淡入「网络较慢，正在加载…」,正常网络下 React 挂载前看不到文字。
+         React 首次渲染会替换 #root 的内容。颜色与 styles.css 的 --bg / --faint 一致。 -->
+    <style>
+      .oc-boot{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:#fafafb;color:#64646f;font:13px/1.5 system-ui,-apple-system,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+      html.dark .oc-boot{background:#0c0c11;color:#92929b}
+      .oc-boot-spin{width:20px;height:20px;border-radius:50%;border:2px solid currentColor;border-right-color:transparent;opacity:.75;animation:oc-boot-spin .8s linear infinite}
+      .oc-boot-hint{margin:0;opacity:0;animation:oc-boot-in .4s ease 4s forwards}
+      @keyframes oc-boot-spin{to{transform:rotate(360deg)}}
+      @keyframes oc-boot-in{to{opacity:1}}
+      @media (prefers-reduced-motion:reduce){.oc-boot-spin{animation-duration:2.4s}.oc-boot-hint{animation-duration:0s}}
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root"><div class="oc-boot" role="status" aria-live="polite"><span class="oc-boot-spin" aria-hidden="true"></span><p class="oc-boot-hint">网络较慢，正在加载…</p></div></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

@@ -10,16 +10,38 @@ export const BOOT_STALL_HINT_MS = 20_000;
  * 半分钟以上一片空白,用户分不清是卡死还是在加载。超过 4s 补一行「网络较慢,正在加载…」,
  * 超过 20s 再给「刷新重试」。
  */
+// 启动期会先后经过几个懒加载边界,每个边界挂自己的 BootSplash;若按「本实例挂载」计时,每次换边界
+// 都从 0 重数,慢网下提示永远出不来。改为按「连续处于加载态」计时:上一个 splash 卸载后 1 秒内又挂上
+// 视为同一段加载。首段从页面导航开始算(之前是 index.html 的静态占位在转圈)。
+let splashSince: number | null = null;
+let splashLeftAt = 0;
+const now = () => (typeof performance !== "undefined" ? performance.now() : Date.now());
+
+function stageAt(elapsed: number): 0 | 1 | 2 {
+  return elapsed >= BOOT_STALL_HINT_MS ? 2 : elapsed >= BOOT_SLOW_HINT_MS ? 1 : 0;
+}
+
 export function BootSplash() {
-  const [stage, setStage] = useState<0 | 1 | 2>(0);
+  const [since] = useState(() => {
+    // First splash of the page: count from navigation start, unless it only shows up much later
+    // (a lazy chunk long after boot) — then count from now.
+    if (splashSince === null) splashSince = now() < 30_000 ? 0 : now();
+    else if (now() - splashLeftAt > 1000) splashSince = now();
+    return splashSince;
+  });
+  const [stage, setStage] = useState<0 | 1 | 2>(() => stageAt(now() - since));
   useEffect(() => {
-    const slow = setTimeout(() => setStage(1), BOOT_SLOW_HINT_MS);
-    const stall = setTimeout(() => setStage(2), BOOT_STALL_HINT_MS);
+    const tick = () => setStage(stageAt(now() - since));
+    const timers = [BOOT_SLOW_HINT_MS, BOOT_STALL_HINT_MS]
+      .map((at) => at - (now() - since))
+      .filter((ms) => ms > 0)
+      .map((ms) => setTimeout(tick, ms + 20));
+    tick();
     return () => {
-      clearTimeout(slow);
-      clearTimeout(stall);
+      for (const t of timers) clearTimeout(t);
+      splashLeftAt = now();
     };
-  }, []);
+  }, [since]);
   return (
     <output className="flex h-full flex-col items-center justify-center gap-3 bg-bg text-muted" aria-live="polite">
       <Spinner size={22} />
@@ -39,4 +61,10 @@ export function BootSplash() {
       )}
     </output>
   );
+}
+
+/** Test hook: forget the shared splash period. */
+export function resetBootSplashForTest(): void {
+  splashSince = null;
+  splashLeftAt = 0;
 }
