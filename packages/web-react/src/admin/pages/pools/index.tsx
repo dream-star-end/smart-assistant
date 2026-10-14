@@ -26,6 +26,7 @@ export default function PoolsPage() {
   const [addFor, setAddFor] = useState<string | null | undefined>(undefined);
   const refresh = useCallback(() => setTick((t) => t + 1), []);
 
+  // biome-ignore lint/correctness/useExhaustiveDependencies: tick 是显式刷新触发器(刷新按钮 / 保存后重拉)。
   useEffect(() => {
     let alive = true;
     setLoading(true);

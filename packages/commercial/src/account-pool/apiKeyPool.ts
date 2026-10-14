@@ -302,7 +302,7 @@ export function createApiKeyPoolAdapter(keyFn: () => Buffer = loadKmsKey): PoolA
     listDueProbes: (limit: number): Promise<DueProbe[]> => listDueTableProbes(API_KEY_MEMBERS, limit),
     async probe(m: DueProbe): Promise<ProbeResult> {
       const res = await query<{ key_enc: Buffer; key_nonce: Buffer }>(
-        `SELECT key_enc, key_nonce FROM pool_api_keys WHERE id = $1`,
+        'SELECT key_enc, key_nonce FROM pool_api_keys WHERE id = $1',
         [m.id],
       )
       const r = res.rows[0]
@@ -353,7 +353,7 @@ export function createRelayKeyPoolAdapter(keyFn: () => Buffer = loadKmsKey): Poo
     listDueProbes: (limit: number) => listDueTableProbes(RELAY_KEY_MEMBERS, limit),
     async probe(m: DueProbe): Promise<ProbeResult> {
       const res = await query<{ api_key_enc: Buffer | null; api_key_nonce: Buffer | null }>(
-        `SELECT api_key_enc, api_key_nonce FROM api_relay_credentials WHERE id = $1`,
+        'SELECT api_key_enc, api_key_nonce FROM api_relay_credentials WHERE id = $1',
         [m.id],
       )
       const r = res.rows[0]
