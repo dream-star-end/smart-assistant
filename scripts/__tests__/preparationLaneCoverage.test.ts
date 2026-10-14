@@ -15,12 +15,13 @@ function visit(node: ts.Node): void {
   ts.forEachChild(node, visit)
 }
 visit(file)
-assert.equal(calls.length, 6, 'fixture must locate the six real production calls')
+assert.equal(calls.length, 7, 'fixture must locate the seven real production calls')
 
 // Independent fixture anchors; do not import the checker's classification table.
 const lanes = [
   ['cursor', 'cursorTurnIdentity'],
   ['zcode', 'zcodeTurnIdentity'],
+  ['antigravity', 'antigravityTurnIdentity'],
   ['annotated', 'dispatchRecordA'],
   ['codex-grok', 'dispatchRecordB'],
   ['ccb', 'dispatchRecordC'],
@@ -63,7 +64,7 @@ function rejects(input: string, expectedCalls: number): void {
 }
 
 describe('preparation lane coverage', () => {
-  it('accepts the six production preparation lanes', () => {
+  it('accepts the seven production preparation lanes', () => {
     assert.doesNotThrow(() => assertPreparationLaneCoverage(source))
   })
 
@@ -71,7 +72,7 @@ describe('preparation lane coverage', () => {
     const formatted = source.replaceAll('trackPreparation(async', 'trackPreparation( /* same call */ async')
       + '\n// trackPreparation(async () => { cursorTurnIdentity; });\n'
       + 'const textDecoy = "trackPreparation(async () => { dispatchRecordB; })";\n'
-    assertValidMutation(formatted, 6)
+    assertValidMutation(formatted, 7)
     assert.doesNotThrow(() => assertPreparationLaneCoverage(formatted))
   })
 
@@ -79,32 +80,32 @@ describe('preparation lane coverage', () => {
     it(`rejects untracked ${lane} work`, () => {
       const call = laneCall(marker)
       // Preserve the real work and its invocation, remove only its tracking wrapper.
-      rejects(replace(call, `(${callback(call).getText(file)})()`), 5)
+      rejects(replace(call, `(${callback(call).getText(file)})()`), 6)
     })
 
     it(`rejects empty tracking substituted for ${lane}`, () => {
       const call = laneCall(marker)
       const realWork = `(${callback(call).getText(file)})()`
       const decoy = `trackPreparation(async () => { /* ${marker} */ void '${marker}'; })`
-      rejects(replace(call, `(${realWork}, ${decoy})`), 6)
+      rejects(replace(call, `(${realWork}, ${decoy})`), 7)
     })
 
     it(`rejects ${lane} work hidden in an uncalled function`, () => {
       const call = laneCall(marker)
-      rejects(replace(call, `trackPreparation(async () => { const neverCalled = ${callback(call).getText(file)}; })`), 6)
+      rejects(replace(call, `trackPreparation(async () => { const neverCalled = ${callback(call).getText(file)}; })`), 7)
     })
   }
 
   it('rejects an extra tracked callback', () => {
-    rejects(source + '\ntrackPreparation(async () => {});\n', 7)
+    rejects(source + '\ntrackPreparation(async () => {});\n', 8)
   })
 
   it('rejects a duplicate lane replacing another lane', () => {
-    rejects(replace(laneCall('zcodeTurnIdentity'), laneCall('cursorTurnIdentity').getText(file)), 6)
+    rejects(replace(laneCall('zcodeTurnIdentity'), laneCall('cursorTurnIdentity').getText(file)), 7)
   })
 
   it('rejects a non-async tracking callback', () => {
-    rejects(replace(laneCall('cursorTurnIdentity'), 'trackPreparation(() => {})'), 6)
+    rejects(replace(laneCall('cursorTurnIdentity'), 'trackPreparation(() => {})'), 7)
   })
 
   it('rejects malformed source instead of accepting a partial parse', () => {

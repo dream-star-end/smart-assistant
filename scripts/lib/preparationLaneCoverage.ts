@@ -3,6 +3,7 @@ import ts from 'typescript'
 const engineMarkers = [
   ['cursor', 'cursorTurnIdentity'],
   ['zcode', 'zcodeTurnIdentity'],
+  ['antigravity', 'antigravityTurnIdentity'],
   ['annotated', 'dispatchRecordA'],
   ['codex-grok', 'dispatchRecordB'],
   ['ccb', 'dispatchRecordC'],
@@ -28,7 +29,7 @@ export function assertPreparationLaneCoverage(source: string): void {
     ts.forEachChild(node, collect)
   }
   collect(file)
-  if (calls.length !== 6) fail(`expected six tracked preparation lanes, found ${calls.length}`)
+  if (calls.length !== 7) fail(`expected seven tracked preparation lanes, found ${calls.length}`)
 
   const seen = new Set<string>()
   for (const call of calls) {
