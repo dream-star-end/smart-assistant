@@ -3547,13 +3547,21 @@ describe("Cursor external authority regression tripwire", () => {
     // Client copies of the route field are stripped.
     assert.match(source, /"__oc_antigravity_route",/);
     assert.match(source, /const \{ __oc_antigravity_route: _discard, \.\.\.withoutAntigravityRoute \} = sanitizedParsed;/);
-    // Settlement uses the relay's metered rows, never the container-reported usage.
+    // The durable turn row is written before the frame reaches the container.
+    assert.ok(
+      branch.indexOf("await recordAntigravityTurn(") < branch.indexOf("forwardPreparedFrame("),
+      "turn row must exist before the container can spend",
+    );
+    assert.match(branch, /reconcileStaleAntigravityTurns\(/);
+    // Settlement claims the durable row (works on a reconnected bridge) and
+    // uses the relay's metered rows, never the container-reported usage.
     const settleStart = source.indexOf("external.engine === 'antigravity'");
     assert.notEqual(settleStart, -1);
     const settle = source.slice(settleStart, source.indexOf("external.engine === 'cursor'", settleStart));
-    assert.match(settle, /settleAntigravityTurn\(/);
+    assert.match(settle, /settleAntigravityTurnRecord\(/);
     assert.doesNotMatch(settle, /usage,/);
-    assert.match(settle, /if \(relay && pricing\)/);
+    assert.match(settle, /if \(pricing\) \{/);
+    assert.doesNotMatch(settle, /if \(relay && pricing\)/);
   });
 
   test("OCV5-92: every base engine inbound carries a master-owned _creditBudget and ZCode gates on balance", async () => {

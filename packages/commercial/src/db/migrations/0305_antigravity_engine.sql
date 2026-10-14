@@ -14,6 +14,8 @@
 -- 3. antigravity_relay_usage: one row per metered upstream generate call,
 --    written by the relay from the upstream usageMetadata. Turn settlement
 --    sums these rows; the container never reports billable usage.
+--    antigravity_turns: durable admission record so settlement does not
+--    depend on the admitting bridge's memory.
 -- 4. Staged catalog rows + disabled pricing rows. Flash is public, the
 --    Claude / GPT-OSS models are admin-only. Activation is the normal admin
 --    catalog path after deploy (fn_model_catalog_guard: born staged).
@@ -52,7 +54,8 @@ CREATE TABLE gemini_oauth_accounts (
   updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   CONSTRAINT gemini_oauth_accounts_email_unique UNIQUE (email),
   CONSTRAINT gemini_oauth_accounts_access_pair CHECK ((access_token_enc IS NULL) = (access_token_nonce IS NULL)),
-  CONSTRAINT gemini_oauth_accounts_disabled_by_admin CHECK (status <> 'disabled' OR disabled_by = 'admin')
+  -- IS NOT NULL, not = 'admin': a NULL comparison would make the CHECK pass.
+  CONSTRAINT gemini_oauth_accounts_disabled_by_admin CHECK (status <> 'disabled' OR disabled_by IS NOT NULL)
 );
 CREATE INDEX idx_gemini_oauth_accounts_status ON gemini_oauth_accounts(status, cooldown_until);
 
@@ -76,6 +79,22 @@ CREATE TABLE antigravity_relay_usage (
 );
 CREATE INDEX idx_antigravity_relay_usage_request ON antigravity_relay_usage(request_id, user_id);
 CREATE INDEX idx_antigravity_relay_usage_created ON antigravity_relay_usage(created_at);
+
+CREATE TABLE antigravity_turns (
+  request_id   TEXT PRIMARY KEY CHECK (request_id ~ '^[0-9a-f]{32}$'),
+  user_id      BIGINT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  model_id     TEXT NOT NULL CHECK (char_length(model_id) BETWEEN 1 AND 64),
+  session_id   TEXT,
+  trace_id     TEXT,
+  status       TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','settling','settled','abandoned')),
+  engine_status TEXT CHECK (engine_status IS NULL OR engine_status IN ('success','error','unavailable','unknown')),
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX idx_antigravity_turns_pending ON antigravity_turns(user_id, created_at) WHERE status IN ('pending','settling');
+
+COMMENT ON TABLE antigravity_turns IS
+  'OCV5-415 durable admission record per Antigravity turn. Any bridge settles it from the terminal frame by (request_id, user_id); turns left pending past the route TTL are settled from relay usage on the user''s next admission.';
 
 COMMENT ON TABLE antigravity_relay_usage IS
   'OCV5-415 per-call usageMetadata observed by the Antigravity relay (title generation included). Turn settlement sums rows by (request_id, user_id).';

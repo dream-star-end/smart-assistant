@@ -24,6 +24,7 @@ DELETE FROM model_pricing WHERE model_id IN (
   'antigravity-gemini-3.8-flash', 'antigravity-claude-sonnet-4.6',
   'antigravity-claude-opus-4.6', 'antigravity-gpt-oss-120b');
 DELETE FROM model_catalog WHERE engine = 'antigravity' AND state = 'staged';
+DROP TABLE antigravity_turns;
 DROP TABLE antigravity_relay_usage;
 DROP TABLE gemini_oauth_accounts;
 DELETE FROM schema_migrations WHERE version = '0305_antigravity_engine';

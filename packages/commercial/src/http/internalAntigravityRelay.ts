@@ -8,8 +8,11 @@
  *   - verifies the container identity and the opaque route token;
  *   - forwards only the `/v1internal:<method>` calls the pinned CLI makes;
  *   - for generate calls, accepts only the route model's CLI ids plus the
- *     title-generation model, and refuses new calls once the turn's metered
- *     cost reaches its admission budget;
+ *     title-generation model, and admits a call only if metered cost plus
+ *     the in-flight reservations of the same route still fit the admission
+ *     budget (reserve-then-check in one synchronous step, so concurrent
+ *     calls cannot all pass on the same stale total), at most
+ *     ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE at a time;
  *   - injects the gemini OAuth account's full-scope access token;
  *   - records every generate call's usageMetadata (antigravity_relay_usage)
  *     before ending the response, so turn settlement sees it;
@@ -59,6 +62,10 @@ const METADATA_METHODS = new Set([
   "writeTrajectoryAcls",
 ]);
 const MAX_GENERATE_BODY = 32 * 1024 * 1024;
+/** Title + agent call run together; subagents may add a couple more. */
+export const ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE = 4;
+/** Output tokens assumed for an in-flight reservation (input comes from the body size). */
+const RESERVED_OUTPUT_TOKENS = 2048;
 const MAX_METADATA_BODY = 1024 * 1024;
 const FORWARD_REQUEST_HEADERS = ["content-type", "accept", "user-agent"];
 const HOP = new Set([
@@ -101,6 +108,10 @@ export interface AntigravityRelayDeps {
   reportOutcome?: (accountId: bigint, outcome: AntigravityPoolOutcome, detail: string | null) => Promise<void>;
   recordUsage?: (row: AntigravityUsageRow) => Promise<void>;
   meteredCost?: (route: AntigravityRelayRoute) => Promise<bigint | null>;
+  /** Conservative cost of one generate call before it runs; null = pricing missing. */
+  estimateCost?: (route: AntigravityRelayRoute, bodyBytes: number) => bigint | null;
+  /** Cost of one metered call (for the in-process running total). */
+  callCost?: (route: AntigravityRelayRoute, row: AntigravityUsageRow) => bigint;
   now?: () => number;
 }
 
@@ -193,6 +204,27 @@ async function defaultRecordUsage(row: AntigravityUsageRow): Promise<void> {
   );
 }
 
+/**
+ * Per route token, this process only (a container's route always resolves to
+ * one relay target). `recorded` is the cost of calls this process already
+ * metered for the route, so a call whose DB read raced another call's insert
+ * still counts it (committed = max(db, recorded) + reserved).
+ */
+interface InflightSlot { count: number; reserved: bigint; recorded: bigint; touchedAt: number }
+const inflight = new Map<string, InflightSlot>();
+/** Longer than the route TTL; idle slots past it are dropped. */
+const SLOT_IDLE_MS = 2 * 60 * 60 * 1000;
+
+function pruneSlots(now: number): void {
+  for (const [key, slot] of inflight) {
+    if (slot.count <= 0 && now - slot.touchedAt > SLOT_IDLE_MS) inflight.delete(key);
+  }
+}
+
+export function _antigravityInflightForTests(): ReadonlyMap<string, InflightSlot> {
+  return inflight;
+}
+
 export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): AntigravityRelayHandler {
   const now = deps.now ?? Date.now;
   const freshToken = deps.freshToken ?? ((accountId: bigint) => getFreshAntigravityAccessToken(accountId, {
@@ -208,6 +240,30 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
     if (pricing === null) return null;
     const totals = await sumAntigravityRelayUsage(getPool(), route.requestId, route.userId);
     return antigravityUsageCost(totals, pricing);
+  });
+  const estimateCost = deps.estimateCost ?? ((route: AntigravityRelayRoute, bodyBytes: number) => {
+    const pricing = deps.pricing?.get(route.modelId) ?? null;
+    if (pricing === null) return null;
+    // ~4 bytes per token of JSON body is generous for prompts (cached parts
+    // are billed lower, so this over-reserves).
+    return antigravityUsageCost({
+      promptTokens: BigInt(Math.ceil(bodyBytes / 4)),
+      candidatesTokens: BigInt(RESERVED_OUTPUT_TOKENS),
+      thoughtsTokens: 0n,
+      cachedTokens: 0n,
+      calls: 1,
+    }, pricing);
+  });
+  const callCost = deps.callCost ?? ((route: AntigravityRelayRoute, row: AntigravityUsageRow) => {
+    const pricing = deps.pricing?.get(route.modelId) ?? null;
+    if (pricing === null) return 0n;
+    return antigravityUsageCost({
+      promptTokens: BigInt(row.promptTokens),
+      candidatesTokens: BigInt(row.candidatesTokens),
+      thoughtsTokens: BigInt(row.thoughtsTokens),
+      cachedTokens: BigInt(row.cachedTokens),
+      calls: 1,
+    }, pricing);
   });
 
   return async (req, res, ctx) => {
@@ -266,6 +322,15 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
     }
     let upstreamModel = "";
     let requestType: string | null = null;
+    let reservation: { slot: InflightSlot; estimate: bigint } | null = null;
+    // Kept (not deleted) at count 0 so `recorded` survives between calls; pruned when idle.
+    const release = (): void => {
+      if (!reservation) return;
+      reservation.slot.count -= 1;
+      reservation.slot.reserved -= reservation.estimate;
+      reservation.slot.touchedAt = now();
+      reservation = null;
+    };
     if (generate) {
       let payload: Record<string, unknown>;
       try {
@@ -289,14 +354,31 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         error(res, 503, "ANTIGRAVITY_METERING_UNAVAILABLE", requestId);
         return;
       }
-      if (spent === null) {
+      const estimate = estimateCost(route, body!.length);
+      if (spent === null || estimate === null) {
         error(res, 503, "ANTIGRAVITY_PRICING_UNAVAILABLE", requestId);
         return;
       }
-      if (spent >= route.budgetCredits) {
+      // Synchronous from here to the reservation: no await between the check
+      // and the increment, so concurrent calls see each other's reservations.
+      pruneSlots(now());
+      const slot = inflight.get(token) ?? { count: 0, reserved: 0n, recorded: 0n, touchedAt: now() };
+      if (slot.count >= ANTIGRAVITY_MAX_INFLIGHT_PER_ROUTE) {
+        error(res, 429, "ANTIGRAVITY_ROUTE_BUSY", requestId);
+        return;
+      }
+      // The first call only needs budget left (serial behaviour, overspend is
+      // clamped at settlement); every concurrent call must fit with the others.
+      const committed = (spent > slot.recorded ? spent : slot.recorded) + slot.reserved;
+      if (committed >= route.budgetCredits || (slot.count > 0 && committed + estimate > route.budgetCredits)) {
         error(res, 402, "ANTIGRAVITY_BUDGET_EXHAUSTED", requestId);
         return;
       }
+      slot.count += 1;
+      slot.reserved += estimate;
+      slot.touchedAt = now();
+      inflight.set(token, slot);
+      reservation = { slot, estimate };
     }
 
     let accessToken: Buffer | null = null;
@@ -341,7 +423,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         const usage = tap.usage;
         // Record before ending the response: the CLI only finishes the turn
         // after this stream ends, so settlement always sees the row.
-        await recordUsage({
+        const row: AntigravityUsageRow = {
           requestId: route.requestId,
           userId: route.userId,
           accountId: route.accountId,
@@ -353,7 +435,9 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
           candidatesTokens: usage?.candidates ?? 0,
           thoughtsTokens: usage?.thoughts ?? 0,
           cachedTokens: usage?.cached ?? 0,
-        });
+        };
+        await recordUsage(row);
+        if (reservation) reservation.slot.recorded += callCost(route, row);
       }
       res.end();
     } catch (err) {
@@ -363,6 +447,8 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         error(res, 503, "ANTIGRAVITY_UPSTREAM_UNAVAILABLE", requestId);
       }
     } finally {
+      // After recordUsage: the call's real cost is metered before its reservation goes.
+      release();
       accessToken?.fill(0);
     }
   };

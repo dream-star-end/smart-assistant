@@ -104,7 +104,12 @@ import {
   publishZcodeCatalogSettle,
   settleZcodeCatalogUsage,
 } from "../billing/zcodeCatalogSettle.js";
-import { settleAntigravityTurn } from "../billing/antigravitySettle.js";
+import {
+  abandonAntigravityTurn,
+  reconcileStaleAntigravityTurns,
+  recordAntigravityTurn,
+  settleAntigravityTurnRecord,
+} from "../billing/antigravitySettle.js";
 import {
   abortInsertedZcodeAudit,
   applyZcodeFinalizeOutcome,
@@ -6324,7 +6329,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             if (mintedToken !== null) {
               void Promise.resolve(deps.expireAntigravityRoute?.(mintedToken)).catch(() => {});
             }
-            if (mintedRequestId !== null) pendingAntigravityRelays.delete(mintedRequestId);
+            if (mintedRequestId !== null) {
+              pendingAntigravityRelays.delete(mintedRequestId);
+              if (deps.pgPool) void abandonAntigravityTurn(deps.pgPool, mintedRequestId, uid).catch(() => {});
+            }
             mintedToken = null;
             mintedRequestId = null;
           };
@@ -6344,6 +6352,28 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               return;
             }
             const antigravityModelId = modelCapture;
+            // Turns that never got a terminal frame (bridge gone) settle from
+            // relay usage here; best-effort, off the admission path.
+            if (deps.pricing) {
+              const pool = deps.pgPool;
+              const pricing = deps.pricing;
+              void reconcileStaleAntigravityTurns({ pool, pricing, userId: uid })
+                .then(async (done) => {
+                  for (const { settled, turn } of done) {
+                    await publishZcodeCatalogSettle({
+                      settled,
+                      requestId: turn.requestId,
+                      userId: uid.toString(),
+                      modelId: turn.modelId,
+                      sessionId: turn.sessionId,
+                      traceId: turn.traceId,
+                      persist: deps.appendCostCredits,
+                      publish: (event) => { broadcastToUser(uid, event); },
+                    });
+                  }
+                })
+                .catch((err) => { bridgeLog?.warn('user-chat-bridge: antigravity reconcile failed', { err }); });
+            }
             const enriched = await attachMasterTurnState(parsedCapture, logCapture, traceCapture, !isPromptQueueDispatch && !isCronOriginDispatch, rejectPromptQueueDispatch, authorityModelCapture, recoveryJob, pretrackedEnrichment);
             if (enriched === null) return;
             dispatchRecord = lookupAdmittedDispatch(enriched);
@@ -6401,6 +6431,15 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             }
             mintedToken = minted.token;
             mintedRequestId = requestId;
+            // Durable before the container can spend: settlement is claimed
+            // from this row by whichever bridge receives the terminal frame.
+            await recordAntigravityTurn(deps.pgPool, {
+              requestId,
+              userId: uid,
+              modelId: antigravityModelId,
+              sessionId: peerCapture,
+              traceId: traceCapture,
+            });
             pendingAntigravityRelays.set(requestId, {
               token: minted.token,
               modelId: antigravityModelId,
@@ -8039,33 +8078,32 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 void Promise.resolve(deps.expireAntigravityRoute?.(relay.token)).catch(() => {});
                 pendingAntigravityRelays.delete(requestId);
               }
-              // Only this bridge's own admitted turns settle here; usage comes
-              // from the relay's rows, so a replayed frame cannot inflate it and
-              // usage_records(user_id, request_id) keeps the charge idempotent.
-              if (relay && pricing) {
+              // Claimed from the durable turn row, so a reconnected bridge
+              // settles too; usage comes from the relay's rows (a replayed
+              // frame cannot inflate it) and usage_records(user_id, request_id)
+              // keeps the charge idempotent.
+              if (pricing) {
                 void (async () => {
                   try {
-                    const settled = await settleAntigravityTurn({
+                    const done = await settleAntigravityTurnRecord({
                       pool,
                       pricing,
-                      userId: uid,
                       requestId,
-                      modelId: relay.modelId,
-                      sessionId: relay.sessionId,
+                      userId: uid,
                       engineStatus: status,
                       terminalCode,
                     });
-                    if (settled === null) {
-                      bridgeLog?.warn("user-chat-bridge: Antigravity settle skipped, pricing missing", { requestId });
+                    if (done === null) {
+                      bridgeLog?.warn("user-chat-bridge: Antigravity settle skipped (claimed elsewhere, unknown turn or pricing missing)", { requestId });
                       return;
                     }
                     await publishZcodeCatalogSettle({
-                      settled,
+                      settled: done.settled,
                       requestId,
                       userId: uid.toString(),
-                      modelId: relay.modelId,
-                      sessionId: relay.sessionId,
-                      traceId: relay.traceId,
+                      modelId: done.turn.modelId,
+                      sessionId: done.turn.sessionId,
+                      traceId: done.turn.traceId,
                       persist: deps.appendCostCredits,
                       publish: (event) => { broadcastToUser(uid, event); },
                       onPersistError: (err) => {

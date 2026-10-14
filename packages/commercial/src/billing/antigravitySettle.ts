@@ -128,3 +128,124 @@ export async function settleAntigravityTurn(args: {
     sessionId: args.sessionId,
   });
 }
+
+// ─── Durable turn record (Codex r1 P1) ──────────────────────────────────────
+// Settlement must not depend on the admitting bridge's memory: after a
+// reconnect the terminal frame reaches a different bridge. Every admitted
+// turn gets an antigravity_turns row; whichever bridge sees the terminal
+// frame claims it by (request_id, user_id). Turns nobody reported are settled
+// from relay usage on the user's next admission (no timer).
+
+/** Route TTL (1h) plus margin: a pending turn older than this cannot still be running. */
+export const ANTIGRAVITY_STALE_TURN_MS = 2 * 60 * 60 * 1000;
+
+export interface AntigravityTurnRecord {
+  requestId: string;
+  userId: bigint;
+  modelId: string;
+  sessionId: string | null;
+  traceId: string | null;
+}
+
+export async function recordAntigravityTurn(pool: Pick<Pool, "query">, turn: AntigravityTurnRecord): Promise<void> {
+  await pool.query(
+    `INSERT INTO antigravity_turns (request_id, user_id, model_id, session_id, trace_id)
+     VALUES ($1, $2, $3, $4, $5) ON CONFLICT (request_id) DO NOTHING`,
+    [turn.requestId, turn.userId.toString(), turn.modelId, turn.sessionId, turn.traceId],
+  );
+}
+
+/** Admission failed after the row was written: nothing ran on the route. */
+export async function abandonAntigravityTurn(pool: Pick<Pool, "query">, requestId: string, userId: bigint): Promise<void> {
+  await pool.query(
+    `UPDATE antigravity_turns SET status = 'abandoned', updated_at = NOW()
+      WHERE request_id = $1 AND user_id = $2 AND status = 'pending'
+        AND NOT EXISTS (SELECT 1 FROM antigravity_relay_usage u WHERE u.request_id = $1 AND u.user_id = $2)`,
+    [requestId, userId.toString()],
+  );
+}
+
+type SettledTurn = { settled: SettleResult; turn: AntigravityTurnRecord };
+
+/**
+ * Claim (pending → settling) and settle one turn. Returns null when another
+ * bridge already claimed it, the row is unknown, or pricing is missing (the
+ * row goes back to pending so a later pass retries).
+ */
+export async function settleAntigravityTurnRecord(args: {
+  pool: Pool;
+  pricing: PricingCache;
+  requestId: string;
+  userId: bigint;
+  engineStatus: AntigravityEngineStatus | "unknown";
+  terminalCode?: string | null;
+  /** Reconcile pass: also take over a 'settling' row abandoned by a crash. */
+  staleBefore?: Date;
+}): Promise<SettledTurn | null> {
+  const claim = await args.pool.query<{ model_id: string; session_id: string | null; trace_id: string | null }>(
+    `UPDATE antigravity_turns SET status = 'settling', engine_status = $3, updated_at = NOW()
+      WHERE request_id = $1 AND user_id = $2
+        AND (status = 'pending' OR ($4::timestamptz IS NOT NULL AND status = 'settling' AND updated_at < $4))
+      RETURNING model_id, session_id, trace_id`,
+    [args.requestId, args.userId.toString(), args.engineStatus, args.staleBefore ?? null],
+  );
+  const row = claim.rows[0];
+  if (!row) return null;
+  const turn: AntigravityTurnRecord = {
+    requestId: args.requestId,
+    userId: args.userId,
+    modelId: row.model_id,
+    sessionId: row.session_id,
+    traceId: row.trace_id,
+  };
+  let settled: SettleResult | null = null;
+  try {
+    settled = await settleAntigravityTurn({
+      pool: args.pool,
+      pricing: args.pricing,
+      userId: args.userId,
+      requestId: args.requestId,
+      modelId: row.model_id,
+      sessionId: row.session_id,
+      // Unreported turns consumed real upstream tokens; bill them (clamped to balance).
+      engineStatus: args.engineStatus === "unknown" ? "success" : args.engineStatus,
+      terminalCode: args.engineStatus === "unknown" ? "RECONCILED" : args.terminalCode ?? null,
+    });
+  } finally {
+    await args.pool.query(
+      "UPDATE antigravity_turns SET status = $3, updated_at = NOW() WHERE request_id = $1 AND user_id = $2",
+      [args.requestId, args.userId.toString(), settled === null ? "pending" : "settled"],
+    ).catch(() => {});
+  }
+  return settled === null ? null : { settled, turn };
+}
+
+/** Settle this user's turns that never got a terminal frame. Best-effort, bounded. */
+export async function reconcileStaleAntigravityTurns(args: {
+  pool: Pool;
+  pricing: PricingCache;
+  userId: bigint;
+  now?: number;
+  limit?: number;
+}): Promise<SettledTurn[]> {
+  const staleBefore = new Date((args.now ?? Date.now()) - ANTIGRAVITY_STALE_TURN_MS);
+  const due = await args.pool.query<{ request_id: string }>(
+    `SELECT request_id FROM antigravity_turns
+      WHERE user_id = $1 AND status IN ('pending','settling') AND updated_at < $2
+      ORDER BY created_at LIMIT $3`,
+    [args.userId.toString(), staleBefore, args.limit ?? 5],
+  );
+  const out: SettledTurn[] = [];
+  for (const { request_id } of due.rows) {
+    const done = await settleAntigravityTurnRecord({
+      pool: args.pool,
+      pricing: args.pricing,
+      requestId: request_id,
+      userId: args.userId,
+      engineStatus: "unknown",
+      staleBefore,
+    });
+    if (done) out.push(done);
+  }
+  return out;
+}

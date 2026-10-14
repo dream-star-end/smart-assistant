@@ -114,6 +114,7 @@ async function relay(
     reportOutcome: async (accountId, outcome) => { captured.outcomes.push({ accountId, outcome }); },
     recordUsage: async (row) => { captured.usage.push(row); },
     meteredCost: async () => 0n,
+    estimateCost: () => 0n,
     requestFn: (async (url: unknown, opts: { headers?: Record<string, string>; body?: Buffer }) => {
       captured.calls += 1;
       captured.url = String(url);
@@ -307,6 +308,79 @@ describe("Antigravity relay handler", () => {
     );
     assert.equal(status, 503);
     assert.equal(captured.calls, 0);
+  });
+});
+
+describe("Antigravity relay concurrent budget (Codex r1 P1)", () => {
+  async function concurrent(opts: {
+    budget: bigint;
+    n: number;
+    extra: Partial<AntigravityRelayDeps>;
+  }): Promise<{ statuses: number[]; calls: number }> {
+    const token = await mintRoute("antigravity-gemini-3.8-flash", opts.budget);
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const handler = makeAntigravityRelayHandler({
+      identityRepo: repo(),
+      clientSecret: "GOCSPX-test-secret-not-real-000",
+      freshToken: async () => Buffer.from(FULL_TOKEN, "utf8"),
+      reportOutcome: async () => {},
+      recordUsage: async () => {},
+      meteredCost: async () => 0n,
+      requestFn: (async () => {
+        calls += 1;
+        await gate;
+        return { statusCode: 200, headers: { "content-type": "text/event-stream" }, body: Readable.from([Buffer.from(SSE.join(""))]) };
+      }) as never,
+      ...opts.extra,
+    });
+    const server = createServer((req, res) => { void handler(req, res, CTX); });
+    const port = await listen(server);
+    try {
+      const path = `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`;
+      const pending = Array.from({ length: opts.n }, () => fetch(`http://127.0.0.1:${port}${path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${CONTAINER_TOKEN}`, "content-type": "application/json" },
+        body: generateBody("gemini-3.8-flash-low"),
+      }).then(async (res) => { await res.text(); return res.status; }));
+      // Let every request reach the admission check before any upstream call finishes.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      release();
+      return { statuses: await Promise.all(pending), calls };
+    } finally {
+      await close(server);
+    }
+  }
+
+  test("16 simultaneous calls on a 1-credit route: one runs, the rest are refused before Google", async () => {
+    const { statuses, calls } = await concurrent({ budget: 1n, n: 16, extra: { estimateCost: () => 10n } });
+    assert.equal(calls, 1);
+    assert.equal(statuses.filter((code) => code === 200).length, 1);
+    assert.equal(statuses.filter((code) => code === 402).length, 15);
+  });
+
+  test("calls that fit the budget run concurrently up to the per-route cap", async () => {
+    const { statuses, calls } = await concurrent({ budget: 1_000_000n, n: 7, extra: { estimateCost: () => 1n } });
+    assert.equal(calls, 4);
+    assert.equal(statuses.filter((code) => code === 200).length, 4);
+    assert.equal(statuses.filter((code) => code === 429).length, 3);
+  });
+
+  test("a finished call's cost counts even when the DB total read raced its insert", async () => {
+    const token = await mintRoute("antigravity-gemini-3.8-flash", 50n);
+    const deps: Partial<AntigravityRelayDeps> = {
+      meteredCost: async () => 0n,
+      estimateCost: () => 1n,
+      callCost: () => 100n,
+    };
+    const path = `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`;
+    // relay() builds a fresh handler each call; the in-flight table is module-level, like production.
+    const first = await relay(path, { body: generateBody("gemini-3.8-flash-low") }, { status: 200, body: SSE }, deps);
+    assert.equal(first.status, 200);
+    const second = await relay(path, { body: generateBody("gemini-3.8-flash-low") }, { status: 200, body: SSE }, deps);
+    assert.equal(second.status, 402);
+    assert.equal(second.captured.calls, 0);
   });
 });
 
