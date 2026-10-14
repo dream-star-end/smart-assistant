@@ -203,3 +203,10 @@ describe("staticKeyModels — snapshot 漂移守护(CCB-owned)", () => {
     }
   });
 });
+
+ test("Gemini Go is capability-zero with a conservative 1M window", () => {
+  expect(isOpencodeGoModel('gemini-4-argon-contributor')).toBe(true);
+  expect(isCapabilityZeroStaticModel('gemini-4-argon-contributor')).toBe(true);
+  expect(getStaticModelContextWindow('gemini-4-argon-contributor')).toBe(1000000);
+  expect(isOpencodeGoModel('gemini-4-argon')).toBe(false);
+ });

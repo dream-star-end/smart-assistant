@@ -238,6 +238,7 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
   id: 'opencodego',
   // OpenCode Zen「Go 计划」网关。2026-08-15 起平台 canonical 统一为 provider-neutral 的
   // deepseek-v4-flash；旧 deepseek-v4-flash-opencode-go 只保留作存量客户端兼容 alias。
+  // Gemini 4 uses a model-scoped Google bridge in the billed commercial proxy.
   // /messages normal/SSE/thinking/tool_use+result/cache usage 全通。Qwen3.7 仅保留历史
   // transport plumbing，执行下线由 DB catalog 决定。
   upstreamEndpoint: 'https://opencode.ai/zen/go/v1/messages',
@@ -251,7 +252,8 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
       m === 'deepseek-v4-flash' ||
       m === 'deepseek-v4-flash-opencode-go' ||
       m === 'qwen3.7-max' ||
-      m === 'qwen3.7-plus'
+      m === 'qwen3.7-plus' ||
+      m === 'gemini-4-argon-contributor'
     )
   },
   inboundModelIds: [
@@ -259,6 +261,7 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
     'deepseek-v4-flash',
     'qwen3.7-max',
     'qwen3.7-plus',
+    'gemini-4-argon-contributor',
   ],
   canonicalizeForPricing(modelId) {
     const m = modelId.toLowerCase()
@@ -266,6 +269,8 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
       ? 'deepseek-v4-flash'
       : m === 'qwen3.7-max'
         ? 'qwen3.7-max'
+        : m === 'gemini-4-argon-contributor'
+          ? 'gemini-4-argon-contributor'
         : m === 'qwen3.7-plus'
           ? 'qwen3.7-plus'
           : null
@@ -274,7 +279,7 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
     const m = modelId.toLowerCase()
     return m === 'deepseek-v4-flash' || m === 'deepseek-v4-flash-opencode-go'
       ? 'deepseek-v4-flash'
-      : modelId
+      : m === 'gemini-4-argon-contributor' ? m : modelId
   },
   stripHeaders: ['anthropic-beta'],
   // Go 的 Anthropic converter 接受 standard thinking/tool loop；firstParty-only 字段仍剥离。
