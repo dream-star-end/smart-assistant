@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, api } from "../lib/api";
+import { ApiError, api, apiErrorMessage, retryTransientRead } from "../lib/api";
 import type { AgentStatus, AuthSession } from "../lib/types";
 
 /**
@@ -75,8 +75,10 @@ function derivePhase(s: AgentStatus): AgentGatePhase {
 }
 
 function toErrorPhase(e: unknown, fallback: string): AgentGatePhase {
-  if (e instanceof ApiError) return { kind: "error", message: e.message, requestId: e.requestId };
-  return { kind: "error", message: (e as Error)?.message || fallback };
+  // 不外露 "Failed to fetch" 这类英文/技术原文(OCV5-421)。
+  // 追踪号由 AgentGate 单独一行展示,这里去掉 apiErrorMessage 附加的同一后缀。
+  const message = apiErrorMessage(e, fallback).replace(/（追踪号 [^）]*）$/, "");
+  return { kind: "error", message, requestId: e instanceof ApiError ? e.requestId : undefined };
 }
 
 export function useAgentGate(auth: AuthSession | null, enabled: boolean): AgentGate {
@@ -120,7 +122,11 @@ export function useAgentGate(auth: AuthSession | null, enabled: boolean): AgentG
     setPhase({ kind: "checking" });
     void (async () => {
       try {
-        const status = await api.getAgentStatus(a);
+        // 首屏状态查询遇到断网 / 5xx 先静默重试(期间保持「检查中」),仍失败才整块报错(OCV5-421)。
+        const status = await retryTransientRead(
+          () => api.getAgentStatus(a),
+          () => runId === runIdRef.current && !ac.signal.aborted,
+        );
         if (runId !== runIdRef.current) return;
         const next = derivePhase(status);
         setPhase(next);

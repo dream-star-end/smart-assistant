@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useToast } from "../components/ui";
-import { ApiError, api } from "../lib/api";
+import { ApiError, api, apiErrorMessage, retryTransientRead } from "../lib/api";
 import type { ChatMessage } from "../lib/chat/model";
 import { DEMO_SESSIONS } from "../lib/demo";
 import type { StoredSession } from "../lib/persist";
@@ -331,11 +331,10 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
       try {
         const sinceSeq = cbRef.current.sockRef.current?.storedMaxSeq(id) ?? 0;
         const sinceHistoryRevision = cbRef.current.sockRef.current?.storedHistoryRevision(id);
-        const detail = await api.getSession(
-          cbRef.current.authSession,
-          id,
-          sinceSeq,
-          sinceHistoryRevision,
+        // 弱网 / 网关抖动:先静默重试,仍失败才显示「会话加载失败」(OCV5-421)。
+        const detail = await retryTransientRead(
+          () => api.getSession(cbRef.current.authSession, id, sinceSeq, sinceHistoryRevision),
+          () => userIdRef.current === owner && historyFetchingRef.current.get(id) === requestToken,
         );
         // await 期间换号、reset 或删除会话 → 丢弃旧响应，绝不污染当前会话/IndexedDB。
         if (userIdRef.current !== owner || historyFetchingRef.current.get(id) !== requestToken)
@@ -451,12 +450,8 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
             return next;
           });
         } else if (historyFetchingRef.current.get(id) === requestToken) {
-          const message =
-            e instanceof ApiError
-              ? e.message || `加载失败 (${e.status})`
-              : e instanceof Error
-                ? e.message
-                : "加载失败";
+          // 不外露英文/技术原文(如 "Failed to fetch"),统一走面向用户的中文文案。
+          const message = apiErrorMessage(e, "会话加载失败，请重试");
           setHistoryErrorBySession((current) => {
             const next = new Map(current);
             next.set(id, { token: requestToken, message });

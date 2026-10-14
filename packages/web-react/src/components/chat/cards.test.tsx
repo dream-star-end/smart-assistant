@@ -1367,3 +1367,35 @@ describe("AssistantCard 存到项目入口(P5b)", () => {
     }
   });
 });
+
+// OCV5-421: 需要用户动手的错误卡必须给出动作按钮(以前只有文案「请在上方切换模型」)。
+describe("AssistantCard 需用户处理的错误卡给动作(OCV5-421)", () => {
+  test("model_not_available(cta=switch_model)末轮 → 主按钮「切换模型」", () => {
+    const onOpenModelPicker = vi.fn();
+    renderErr(errMsg({ _errorCode: "model_not_available", _clientMessageId: "u1" }), { onOpenModelPicker });
+    fireEvent.click(screen.getByRole("button", { name: "切换模型" }));
+    expect(onOpenModelPicker).toHaveBeenCalledTimes(1);
+  });
+
+  test.each(["auth_error", "container_outdated"])("%s(cta=relogin/refresh)末轮 → 「刷新页面」", (code) => {
+    renderErr(errMsg({ _errorCode: code, _clientMessageId: "u1" }), {});
+    expect(screen.getByRole("button", { name: "刷新页面" })).toBeInTheDocument();
+  });
+});
+
+describe("UserCard 用户自己停止的待发消息(OCV5-421)", () => {
+  test("显示中性「发送已取消」与「重新发送」,不是红色「发送失败」", () => {
+    const onRetrySend = vi.fn();
+    render(
+      <UserCard
+        msg={userMsg({ status: "error", _sendCancelled: true, _errorDetail: "发送已取消" })}
+        cb={{ onRetrySend }}
+      />,
+    );
+    expect(screen.queryByText("发送失败")).toBeNull();
+    const label = screen.getByText("发送已取消");
+    expect(label.parentElement!.className).toContain("text-faint");
+    fireEvent.click(screen.getByRole("button", { name: /重新发送/ }));
+    expect(onRetrySend).toHaveBeenCalledTimes(1);
+  });
+});

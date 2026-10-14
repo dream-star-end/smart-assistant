@@ -37,6 +37,11 @@ export type MarkdownProps = {
    * 渲染外来文件（项目产出预览）时传 false：无语言的块只按纯文本显示。
    */
   autoDetectCode?: boolean;
+  /**
+   * 不包 `.prose` 外壳(OCV5-421):流式长回答按顶层块分段渲染时,各段共用调用方的同一个
+   * `.prose`,DOM 与整段一次渲染完全一致(react-markdown 本身不加包裹元素)。
+   */
+  bare?: boolean;
 };
 
 let markdownImplLoader: Promise<typeof import("./MarkdownImpl")> | null = null;
@@ -111,22 +116,19 @@ function MarkdownFallback({
   children,
   live,
   readOnly,
-}: { children: string; live?: boolean; readOnly?: boolean }) {
+  bare,
+}: { children: string; live?: boolean; readOnly?: boolean; bare?: boolean }) {
   const html = readOnly ? null : extractHtmlFenceFallback(children);
-  if (html) {
-    return (
-      <div className="prose">
-        <PlainFallbackText>{html.before}</PlainFallbackText>
-        <HtmlPreviewFallback code={html.code} live={live} />
-        <PlainFallbackText>{html.after}</PlainFallbackText>
-      </div>
-    );
-  }
-  return (
-    <div className="prose">
-      <PlainFallbackText>{children}</PlainFallbackText>
-    </div>
+  const body = html ? (
+    <>
+      <PlainFallbackText>{html.before}</PlainFallbackText>
+      <HtmlPreviewFallback code={html.code} live={live} />
+      <PlainFallbackText>{html.after}</PlainFallbackText>
+    </>
+  ) : (
+    <PlainFallbackText>{children}</PlainFallbackText>
   );
+  return bare ? body : <div className="prose">{body}</div>;
 }
 
 /**
@@ -134,10 +136,23 @@ function MarkdownFallback({
  * （典型场景=发版后旧客户端持有 stale index.html，请求到已被新哈希取代的旧 chunk → 404），
  * 不能让整棵子树白屏。降级为纯文本占位，正文仍可读。
  */
-class MarkdownBoundary extends Component<{ fallback: ReactNode; children: ReactNode }, { failed: boolean }> {
-  state = { failed: false };
+class MarkdownBoundary extends Component<
+  { fallback: ReactNode; children: ReactNode; resetKey: string },
+  { failed: boolean; failedKey: string | null }
+> {
+  state = { failed: false, failedKey: null as string | null };
   static getDerivedStateFromError() {
     return { failed: true };
+  }
+  // OCV5-421: 流式中某个半截块让渲染抛错时,只降级这一版正文;内容再变(下一个 delta /
+  // 生成结束)就重新尝试正常渲染,而不是整条消息永久停在纯文本。
+  static getDerivedStateFromProps(
+    props: { resetKey: string },
+    state: { failed: boolean; failedKey: string | null },
+  ) {
+    if (!state.failed) return null;
+    if (state.failedKey === null) return { failedKey: props.resetKey };
+    return state.failedKey === props.resetKey ? null : { failed: false, failedKey: null };
   }
   render() {
     return this.state.failed ? this.props.fallback : this.props.children;
@@ -152,13 +167,14 @@ export const Markdown = memo(function Markdown({
   readOnly,
   blockImages,
   autoDetectCode,
+  bare,
 }: MarkdownProps) {
   // 组件类型按实例在挂载时定一次：chunk 到达前挂载的实例（如正在流式的消息）保持 lazy，
   // 不会在 chunk 到达后因类型变化再被整块重挂（HTML 预览 iframe 会因此重载）。
   const [MarkdownImpl] = useState(() => markdownImplModule?.default ?? LazyMarkdownImpl);
-  const fallback = <MarkdownFallback live={live} readOnly={readOnly}>{children}</MarkdownFallback>;
+  const fallback = <MarkdownFallback live={live} readOnly={readOnly} bare={bare}>{children}</MarkdownFallback>;
   return (
-    <MarkdownBoundary fallback={fallback}>
+    <MarkdownBoundary fallback={fallback} resetKey={children}>
       <Suspense fallback={fallback}>
         <MarkdownImpl
           signMedia={signMedia}
@@ -167,6 +183,7 @@ export const Markdown = memo(function Markdown({
           readOnly={readOnly}
           blockImages={blockImages}
           autoDetectCode={autoDetectCode}
+          bare={bare}
         >
           {children}
         </MarkdownImpl>

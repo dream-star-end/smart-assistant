@@ -5,6 +5,7 @@
  */
 import {
   AlertTriangle,
+  ArrowLeftRight,
   BookmarkPlus,
   Brain,
   ChevronRight,
@@ -14,6 +15,7 @@ import {
   Info,
   ListTodo,
   RotateCcw,
+  RotateCw,
   ShieldCheck,
   Sparkles,
   MessageSquare,
@@ -56,6 +58,7 @@ import { reportClientFriction, reportClientFrictionOnce } from "../../lib/client
 import { cn, groupDigits } from "../../lib/utils";
 import { useUiPlainText } from "../iui/plainText";
 import { Markdown } from "../Markdown";
+import { splitLiveMarkdown } from "./liveMarkdownChunks";
 import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
 import {
   Alert,
@@ -691,7 +694,11 @@ export function UserCard({
 }) {
   const status = msg.status;
   // 终态标签(replied/read)不在 USER_STATUS_LABEL 里 → 不渲染。
-  const statusLabel = status ? USER_STATUS_LABEL[status] : undefined;
+  // 用户自己停止的待发消息:中性说明 + 「重新发送」,不是红色失败。
+  const cancelledByUser = status === "error" && msg._sendCancelled === true;
+  const statusLabel = cancelledByUser
+    ? (msg._errorDetail || "发送已取消")
+    : status ? USER_STATUS_LABEL[status] : undefined;
   const showStatus = Boolean(statusLabel) && !(status === "error" && failurePresentedBelow);
   const canQuote = !readOnly && status !== "error" && Boolean(cb?.onQuote);
   const canEdit = !readOnly && Boolean(cb?.onEditResend);
@@ -750,7 +757,7 @@ export function UserCard({
         <div
           className={cn(
             "mt-1 flex items-center gap-2 text-caption",
-            status === "error" ? "text-danger" : "text-faint",
+            status === "error" && !cancelledByUser ? "text-danger" : "text-faint",
           )}
         >
           <span>{statusLabel}</span>
@@ -777,9 +784,12 @@ export function UserCard({
             <button
               type="button"
               onClick={() => cb.onRetrySend?.(msg)}
-              className="inline-flex items-center gap-1 rounded-full bg-danger-soft px-2 py-0.5 font-medium text-danger transition-colors hover:brightness-95 [@media(hover:none)]:min-h-11"
+              className={cn(
+                "inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-medium transition-colors hover:brightness-95 [@media(hover:none)]:min-h-11",
+                cancelledByUser ? "bg-card text-fg" : "bg-danger-soft text-danger",
+              )}
             >
-              <RotateCcw size={11} /> 重试
+              <RotateCcw size={11} /> {cancelledByUser ? "重新发送" : "重试"}
             </button>
           )}
         </div>
@@ -840,15 +850,45 @@ export function ProgressiveMarkdown({
   caret?: boolean;
 }) {
   const [visibleChars, setVisibleChars] = useState(LONG_MARKDOWN_STEP);
+  // OCV5-421: 这条正文出生时在流式 → 一直按顶层块分段渲染(结构从挂载起不变,生成结束也不重挂)。
+  // 已写完的块是独立的 memo 段,后续 delta 只重解析最后一段;段共用一个 .prose,DOM 与整段渲染相同。
+  const [streamed] = useState(live);
   const headEnd = Math.min(visibleChars, text.length);
   const hasLiveGap = live && text.length > headEnd + LIVE_MARKDOWN_TAIL;
   const liveTailStart = hasLiveGap ? text.length - LIVE_MARKDOWN_TAIL : text.length;
   const primaryEnd = live && !hasLiveGap ? text.length : headEnd;
+  const primary = text.slice(0, primaryEnd);
+  let primaryView: React.ReactNode;
+  if (streamed) {
+    const chunks = splitLiveMarkdown(primary);
+    let offset = 0;
+    primaryView = (
+      <div className="prose">
+        {chunks.map((chunk, i) => {
+          const key = offset;
+          offset += chunk.length;
+          const tail = i === chunks.length - 1;
+          return (
+            // 流式中的尾段不做无语言代码块的语言探测(同步跑全部语法,随长度平方增长);块一写完
+            // 就进前段,按原规则高亮。
+            <Markdown key={key} bare signMedia live={live} caret={tail && caret && !hasLiveGap}
+              autoDetectCode={!(live && tail)}>
+              {chunk}
+            </Markdown>
+          );
+        })}
+      </div>
+    );
+  } else {
+    primaryView = (
+      <Markdown signMedia live={live} caret={caret && !hasLiveGap}>
+        {primary}
+      </Markdown>
+    );
+  }
   return (
     <>
-      <Markdown signMedia live={live} caret={caret && !hasLiveGap}>
-        {text.slice(0, primaryEnd)}
-      </Markdown>
+      {primaryView}
       {(hasLiveGap || (!live && headEnd < text.length)) && (
         <button
           type="button"
@@ -997,9 +1037,16 @@ export function AssistantCard({
   // cta==='new_session'(上下文超限类):导航非重发,同耗尽 CTA 不受末轮门控。
   const showNewSession =
     !!presentedError && !presentedError.waived && sem.cta === "new_session" && !!cb.onStartNewSession;
+  // OCV5-421: 需要用户动手的卡必须给动作,不能只写「请在上方切换模型 / 请刷新页面」。
+  const showSwitchModel =
+    !!presentedError && !presentedError.waived && isLastTurn && sem.cta === "switch_model" && !!cb.onOpenModelPicker;
+  const showReload =
+    !!presentedError && !presentedError.waived && isLastTurn && (sem.cta === "refresh" || sem.cta === "relogin");
   const showActionRow =
     showTopUp ||
     showNewSession ||
+    showSwitchModel ||
+    showReload ||
     showInterruptedContinuation ||
     showPreciseRetry ||
     showRegenFallback ||
@@ -1231,6 +1278,14 @@ export function AssistantCard({
                       onClick={cb.onStartNewSession}
                     >
                       <MessageSquarePlus size={14} /> 新建会话继续
+                    </Button>
+                  ) : showSwitchModel ? (
+                    <Button size="sm" variant="accent" shape="pill" onClick={cb.onOpenModelPicker}>
+                      <ArrowLeftRight size={14} /> 切换模型
+                    </Button>
+                  ) : showReload ? (
+                    <Button size="sm" variant="secondary" shape="pill" onClick={() => window.location.reload()}>
+                      <RotateCw size={14} /> 刷新页面
                     </Button>
                   ) : showInterruptedContinuation ? (
                     <Button

@@ -7,6 +7,16 @@ import type { SessionDetail, User } from "../lib/types";
 import type { UseChatSocket } from "./useChatSocket";
 import { useSessionList } from "./useSessionList";
 
+// OCV5-421: 历史读取的瞬时失败会静默重试;本文件用真实重试逻辑、零间隔,免得每条用例等 12 秒。
+vi.mock("../lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/api")>();
+  return {
+    ...actual,
+    retryTransientRead: <T,>(run: () => Promise<T>, stillWanted: () => boolean) =>
+      actual.retryTransientRead(run, stillWanted, [0, 0, 0]),
+  };
+});
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
@@ -545,12 +555,41 @@ describe("useSessionList history loading fence", () => {
     await waitFor(() => expect(result.current.sessions.some((s) => s.id === "webhistory5xx")).toBe(true));
     act(() => result.current.selectSession("webhistory5xx"));
     await waitFor(() => expect(result.current.historyError?.sessionId).toBe("webhistory5xx"));
-    expect(result.current.historyError?.message).toMatch(/get failed|加载失败/);
+    // OCV5-421: 5xx 先静默重试 3 次,用尽才记 historyError;英文技术原文不外露。
+    expect(getSession).toHaveBeenCalledTimes(4);
+    expect(result.current.historyError?.message).toBe("会话加载失败，请重试");
     const activeBefore = result.current.activeId;
     getSession.mockRejectedValueOnce(new ApiError({ status: 500, message: "get failed again" }));
     act(() => result.current.retryHistory("webhistory5xx"));
-    await waitFor(() => expect(getSession.mock.calls.length).toBeGreaterThanOrEqual(2));
+    await waitFor(() => expect(getSession.mock.calls.length).toBeGreaterThanOrEqual(5));
     expect(result.current.activeId).toBe(activeBefore);
+  });
+
+  test("断网一次后恢复:静默重试成功,不出现 historyError(OCV5-421)", async () => {
+    vi.spyOn(api, "listSessions").mockResolvedValue([
+      { id: "webhistoryblip", title: "非空会话", agentId: "main", updatedAt: 2_000, lastAt: 2_000, messageCount: 4 },
+    ] as never);
+    const getSession = vi.spyOn(api, "getSession")
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValue({ id: "webhistoryblip", messages: [] } as never);
+    const auth = createMemoryAuthSession(() => {}, "token");
+    const user: User = { id: "u1", displayName: "User", roles: ["user"] };
+    const socket = {
+      storedMaxSeq: () => 0,
+      storedHistoryRevision: () => 1,
+      mergeServerHistory: vi.fn(),
+    } as unknown as UseChatSocket;
+    const { result } = renderHook(() => useSessionList({
+      demo: false, auth, authSession: auth, user, agentId: "main", sockRef: { current: socket },
+      confirmDialog: async () => true, promptText: async () => null, clearChatError: () => {},
+      onNewSessionReset: () => {}, onActiveSessionDeleted: () => {},
+    }));
+    await waitFor(() => expect(result.current.sessions.some((s) => s.id === "webhistoryblip")).toBe(true));
+    act(() => result.current.selectSession("webhistoryblip"));
+    // 第 1 次断网失败、第 2 次成功(之后可能还有正常的 tape 读取)。
+    await waitFor(() => expect(getSession.mock.calls.length).toBeGreaterThanOrEqual(2));
+    await waitFor(() => expect(result.current.historyLoading).toBeFalsy());
+    expect(result.current.historyError).toBeFalsy();
   });
 
   test("GET 404 不当成 historyError", async () => {

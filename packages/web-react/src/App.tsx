@@ -99,6 +99,7 @@ import {
 import type { ToolLike } from "./components/tool/format";
 import { Sidebar } from "./components/Sidebar";
 import { Alert, Button, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
+import { BootSplash } from "./components/BootSplash";
 import { useAgentGate } from "./hooks/useAgentGate";
 import {
   type BoardViewParam,
@@ -314,11 +315,7 @@ export function prefetchLazyCentersOnIdle(): void {
 
 /** 全屏懒块加载态（营销首页 chunk 下载期）——与启动续期 splash 同视觉,不割裂。*/
 function SplashFallback() {
-  return (
-    <div className="flex h-full items-center justify-center bg-bg text-muted">
-      <Spinner size={22} />
-    </div>
-  );
+  return <BootSplash />;
 }
 /** 对话框懒块加载态——铺一层与 Dialog.Overlay 同款的半透明遮罩 + 居中 spinner,
  *  首次打开拉块的短暂空窗内给出「正在打开」的视觉,避免点击后无反馈。
@@ -3280,11 +3277,7 @@ export function App() {
 
   // 启动续期检查中:极简 splash(避免"闪一下首页又跳工作区"的割裂;通常 <300ms)。
   if (!demo && booting) {
-    return (
-      <div className="flex h-full items-center justify-center bg-bg text-muted">
-        <Spinner size={22} />
-      </div>
-    );
+    return <BootSplash />;
   }
   // A transient boot failure is not a logout. Surface the dedicated recovery
   // action immediately instead of hiding it behind the ordinary landing page.

@@ -491,6 +491,9 @@ function RuntimeEventCard({ message }: { message: ChatMessage }) {
   );
 }
 
+/** 延迟记录读取失败后的静默重试间隔(OCV5-421)。用尽才显示「点击重试」。 */
+const LAZY_PAYLOAD_RETRY_MS = [1500, 4000] as const;
+
 function DeferredTapeRecordCard({
   message,
   isLast,
@@ -531,8 +534,18 @@ function DeferredTapeRecordCard({
   const started = useRef(records !== null);
   const requestAbortRef = useRef<AbortController | null>(null);
   const [failed, setFailed] = useState(false);
+  // OCV5-421: 弱网下单次读取失败先静默重试两次(仍显示「正在读取」),之后才给「点击重试」。
+  const autoRetries = useRef(0);
+  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (retryTimer.current) clearTimeout(retryTimer.current);
+  }, []);
   const load = useCallback(async () => {
     if (started.current) return;
+    if (retryTimer.current) {
+      clearTimeout(retryTimer.current);
+      retryTimer.current = null;
+    }
     const expected = {
       recordId: payloadId,
       role: message.role,
@@ -566,6 +579,15 @@ function DeferredTapeRecordCard({
     if (controller.signal.aborted) return;
     if (!loaded) {
       started.current = false;
+      const delay: number | undefined = LAZY_PAYLOAD_RETRY_MS[autoRetries.current];
+      if (delay !== undefined) {
+        autoRetries.current++;
+        retryTimer.current = setTimeout(() => {
+          retryTimer.current = null;
+          void loadRef.current();
+        }, delay);
+        return;
+      }
       setFailed(true);
       return;
     }
@@ -580,6 +602,8 @@ function DeferredTapeRecordCard({
     recordOrdinal,
     tapeId,
   ]);
+  const loadRef = useRef(load);
+  loadRef.current = load;
 
   useEffect(() => {
     const node = ref.current;
@@ -705,7 +729,14 @@ function DeferredTapeRecordCard({
   return (
     <div ref={ref} className="rounded-lg border border-dashed border-border bg-surface px-3.5 py-3 text-xs text-muted">
       {failed ? (
-        <button type="button" onClick={() => void load()} className="text-danger hover:underline">
+        <button
+          type="button"
+          onClick={() => {
+            autoRetries.current = 0;
+            void load();
+          }}
+          className="text-muted underline-offset-2 hover:text-fg hover:underline"
+        >
           {isUserPayload ? "完整用户消息加载失败，点击重试" : "真实记录加载失败，点击重试"}
         </button>
       ) : (
@@ -2832,13 +2863,19 @@ export function MessageList({
     () => (readOnly ? [] : messages.filter((message) => isAwaitingPermissionPrompt(message))),
     [pendingSig, readOnly, messages],
   );
-  const requestIdByToolUseId = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const message of pendingPrompts) {
-      if (message.requestId && message.toolUseId) map.set(message.toolUseId, message.requestId);
+  // OCV5-421: pendingPrompts 依赖每次渲染新过滤出的 messages,本身不缓存;以前 Context value 也跟着
+  // 每个流式 notify 换新,所有已挂载的工具卡一起重渲。value 只按映射内容换新。
+  const reopenKey = pendingPrompts
+    .map((message) => (message.requestId && message.toolUseId ? `${message.toolUseId}=${message.requestId}` : ""))
+    .join("|");
+  const permissionReopen = useMemo(() => {
+    const requestIdByToolUseId = new Map<string, string>();
+    for (const pair of reopenKey.split("|")) {
+      const at = pair.indexOf("=");
+      if (at > 0) requestIdByToolUseId.set(pair.slice(0, at), pair.slice(at + 1));
     }
-    return map;
-  }, [pendingPrompts]);
+    return { requestIdByToolUseId };
+  }, [reopenKey]);
 
   // App/admin pass an explicit null during the callback-ref's first commit.
   // Do not mount the transcript in that frame; omitted/undefined remains the
@@ -2906,7 +2943,7 @@ export function MessageList({
     event.stopPropagation();
   };
   return (
-    <PermissionToolReopenContext.Provider value={{ requestIdByToolUseId }}>
+    <PermissionToolReopenContext.Provider value={permissionReopen}>
     <>
     <PermissionPromptHost messages={messages} onRespond={onRespondPermission} readOnly={readOnly} sending={sending} sessionId={sessionId} />
     {pendingPrompts.length > 0 ? (

@@ -33,7 +33,7 @@ import { IuiBlock } from "./iui/IuiBlock";
 import { uiFencesToMarkdown } from "./iui/toMarkdown";
 import { useIntelligentUiEnabled } from "../lib/intelligentUi";
 import type { MarkdownProps } from "./Markdown";
-import { normalizeMathDelimiters } from "./mathDelimiters";
+import { normalizeMathDelimiters, unclosedDisplayMathStart } from "./mathDelimiters";
 
 /** 从(可能被 highlight 包成 span 的)code children 递归还原纯源码文本 —— mermaid/html 富块要原文。 */
 function nodeText(node: ReactNode): string {
@@ -172,8 +172,12 @@ function rehypeEmbedMedia() {
 /** 单元格不拆词:`.prose{word-break:break-word}` 会把 `MessageRenderer.tsx` / 「风险」这类标识符在任意
  *  位置拆行,把宽表硬压进 390px 容器,横滑区形同虚设。keep-all 让 CJK 只在标点/空格处换行、拉丁词
  *  整词换行;表头一律不折行 —— 放不下的宽表按 min-content 撑出容器,落进 .markdown-table-region 横滑。 */
+//  OCV5-421:但单元格里的链接 / 行内代码是不可拆的长串(URL、长标识符),keep-all 下会把一列撑到上千
+//  像素,同表其它列被挤出视口。只对它们放开 overflow-wrap:anywhere(它参与 min-content 计算),
+//  中文词与普通拉丁词仍保持整词。
 const TABLE_CELL_CLASS =
-  "[&_td]:[word-break:keep-all] [&_td]:[overflow-wrap:normal] [&_th]:[word-break:keep-all] [&_th]:whitespace-nowrap";
+  "[&_td]:[word-break:keep-all] [&_td]:[overflow-wrap:normal] [&_th]:[word-break:keep-all] [&_th]:whitespace-nowrap " +
+  "[&_td_a]:[overflow-wrap:anywhere] [&_td_code]:[overflow-wrap:anywhere] [&_td_code]:[word-break:break-all]";
 
 function MarkdownTable({ children, className, ...props }: ComponentPropsWithoutRef<"table">) {
   const regionRef = useRef<HTMLElement>(null);
@@ -292,6 +296,21 @@ function rehypeLiveCaret() {
   };
 }
 
+/** 模型常在表格单元格里写 `<br>` 换行;未启用 rehype-raw 时它会按字面显示。只把**独立的**
+ *  `<br>` / `<br/>` raw 节点换成真正的 br 元素,其它原始 HTML 仍按文本转义(OCV5-421)。 */
+function rehypeBareBreaks() {
+  const walk = (node: HastNode): void => {
+    node.children?.forEach((child, i) => {
+      if (child.type === "raw" && /^<br\s*\/?>$/i.test((child.value ?? "").trim())) {
+        node.children![i] = { type: "element", tagName: "br", properties: {}, children: [] };
+      } else {
+        walk(child);
+      }
+    });
+  };
+  return (tree: HastNode) => walk(tree);
+}
+
 function hasMarkdownImage(children: ReactNode): boolean {
   return Children.toArray(children).some((child) => {
     if (!isValidElement<{ node?: { tagName?: string }; children?: ReactNode }>(child)) return false;
@@ -307,6 +326,7 @@ export default function MarkdownImpl({
   readOnly,
   blockImages,
   autoDetectCode = true,
+  bare,
 }: MarkdownProps) {
   // `live` 只被 HtmlPreview 读:走 ref 而不进 useMemo 依赖,否则流式结束(live→false)那一次
   // 重建 components 就把所有富块(OptionsBlock 的点选、HtmlPreview 的 iframe)整个重挂载。
@@ -358,8 +378,10 @@ export default function MarkdownImpl({
                   ),
               }
             : {}),
-          code({ className, children, ...props }) {
-            const lang = /language-(\w+)/.exec(className || "")?.[1];
+          code({ className, children, node: _node, ...props }) {
+            // \S+ 保留 c++ / c# / objective-c 原名作标签;富块分派按小写比较(```UI / ```Mermaid)。
+            const label = /language-(\S+)/.exec(className || "")?.[1];
+            const lang = label?.toLowerCase();
             const isBlock = className?.includes("language-") || String(children).includes("\n");
             if (isBlock) {
               // 富块:mermaid 流程图 / html 沙盒预览(取原文,绕开 highlight 的 span 包裹)。
@@ -373,7 +395,7 @@ export default function MarkdownImpl({
               if (!readOnly && (lang === "html" || lang === "htmlpreview"))
                 return <HtmlPreview code={nodeText(children).replace(/\n$/, "")} live={liveRef.current} />;
               return (
-                <CodeBlock language={lang}>
+                <CodeBlock language={label} live={liveRef.current} lineCount={countLines(children)}>
                   <span className={className} {...props}>
                     {children}
                   </span>
@@ -386,7 +408,7 @@ export default function MarkdownImpl({
               </code>
             );
           },
-          a: ({ children, href, ...props }) => {
+          a: ({ children, href, node: _node, ...props }) => {
             const containerLocal = typeof href === "string" && isContainerPreviewUrl(href);
             // 只读站内信中的链接图片把灯箱与原链接拆成两个同级动作，避免格式包装下仍出现
             // <a><button /></a> 非法嵌套和一次点击双重导航，同时不丢原链接功能。
@@ -429,6 +451,14 @@ export default function MarkdownImpl({
                 </a>
               );
             }
+            // 页内锚点(GFM 脚注 #user-content-fn-1 / 返回 ↩)在当前页跳转,不开新标签页。
+            if (typeof href === "string" && href.startsWith("#")) {
+              return (
+                <a {...props} href={href}>
+                  {children}
+                </a>
+              );
+            }
             return (
               <a {...props} href={href} target="_blank" rel="noreferrer">
                 {children}
@@ -438,15 +468,21 @@ export default function MarkdownImpl({
     }),
     [signMedia, blockImages, readOnly],
   );
-  return (
-    <div className="prose">
+  let source = typeof children === "string" ? children : "";
+  // 流式中未闭合的 $$:截掉半截公式,块后给一行静默占位(OCV5-421)。
+  const heldMath = live && typeof children === "string" ? unclosedDisplayMathStart(children) : -1;
+  if (heldMath >= 0) source = source.slice(0, heldMath);
+  const body = (
+    <>
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
         rehypePlugins={[
+          rehypeBareBreaks,
           // detect=false 时没标语言的块不做同步语言探测（大文件预览防卡死，见 MarkdownProps.autoDetectCode）。
           [rehypeHighlight, { detect: autoDetectCode, ignoreMissing: true }],
           // 数学公式：$..$ / $$..$$ → KaTeX 渲染(remarkMath 解析 + rehypeKatex 出 HTML)。
-          [rehypeKatex, { strict: false, throwOnError: false }],
+          // errorColor 跟随主题 token(KaTeX 默认 #cc0000 在暗色底上对比度不足)。
+          [rehypeKatex, { strict: false, throwOnError: false, errorColor: "var(--danger)" }],
           // 仅在 signMedia(助手正文)启用：把媒体路径行内码转成可签名媒体节点。
           ...(signMedia && !readOnly ? [rehypeEmbedMedia] : []),
           // 流式光标内联到最后一个文本块末尾(最后执行,看到的是最终树)。
@@ -455,9 +491,23 @@ export default function MarkdownImpl({
         components={components}
       >
         {typeof children === "string"
-          ? normalizeMathDelimiters(iuiEnabled ? children : uiFencesToMarkdown(children, !!live))
+          ? normalizeMathDelimiters(iuiEnabled ? source : uiFencesToMarkdown(source, !!live))
           : children}
       </ReactMarkdown>
-    </div>
+      {heldMath >= 0 && (
+        <p className="text-meta text-faint" data-math-pending="true">
+          公式生成中…
+        </p>
+      )}
+    </>
   );
+  return bare ? body : <div className="prose">{body}</div>;
+}
+
+/** 代码块行数(highlight 之后 children 是 span 树,取原文数换行)。 */
+function countLines(children: ReactNode): number {
+  const text = nodeText(children).replace(/\n$/, "");
+  let n = 1;
+  for (let i = text.indexOf("\n"); i >= 0; i = text.indexOf("\n", i + 1)) n++;
+  return n;
 }

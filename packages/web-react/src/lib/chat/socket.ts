@@ -2236,10 +2236,13 @@ export class ChatSocket {
 
       if (decision.action === "policy" && decision.policy) {
         this.setProvisioningBanner(false);
-        this.setStatus(decision.policy.status, "disconnected");
+        // OCV5-421: 横幅直接给出该做什么(关闭其他标签页 / 充值 / 切换模型 / 刷新),而不是只有
+        // 「连接数超限 · N 秒后重试」;条件解除后照常自动重连。
+        const policyText = decision.policy.toast.replace(/[。.]$/, "");
+        this.setStatus(policyText, "disconnected");
         if (decision.policy.billing) this.deps.refreshBalance?.();
         // 按 retryAfter 排程重连（这里用标准退避兜底；server 通常会再 hint）。
-        this.schedulePolicyReconnect(decision.policy.status);
+        this.schedulePolicyReconnect(policyText);
         this.scheduleNotify();
         return;
       }
@@ -6215,6 +6218,7 @@ export class ChatSocket {
       );
       if (user && user.status !== "sent") {
         user.status = "error";
+        user._sendCancelled = true;
         user._errorDetail =
           user._isAutoRetry === true || user._automaticRecovery === true
             ? "自动重试已停止"
