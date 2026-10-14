@@ -366,7 +366,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
       CREATE TABLE ${SCHEMA}.credit_ledger (
         id bigserial PRIMARY KEY, user_id bigint NOT NULL, delta bigint NOT NULL, balance_after bigint NOT NULL,
         reason text NOT NULL, bucket text, ref_type text, ref_id text, memo text, org_id bigint,
-        created_at timestamptz NOT NULL DEFAULT NOW());
+        workload text CHECK (workload = 'auto_dream'), created_at timestamptz NOT NULL DEFAULT NOW());
       CREATE TABLE ${SCHEMA}.usage_records (
         id bigserial PRIMARY KEY, user_id bigint NOT NULL, mode text, account_id bigint, model text,
         input_tokens bigint, output_tokens bigint, cache_read_tokens bigint, cache_write_tokens bigint,
@@ -376,7 +376,7 @@ async function runIdleProtocolCase(mode: IdleCase): Promise<void> {
         turn_key text, parent_turn_key text, dispatch_id text, attempt_no integer,
         verification_run_id text, would_have_cost_credits bigint,
         board_project_id text, board_project_source text, board_project_captured_at timestamptz,
-        api_key_id bigint, ledger_id bigint, UNIQUE (user_id, request_id));
+        api_key_id bigint, ledger_id bigint, workload text CHECK (workload = 'auto_dream'), UNIQUE (user_id, request_id));
       CREATE TABLE ${SCHEMA}.request_finalize_journal (
         request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint, state text NOT NULL,
         ctx jsonb, precheck_credits bigint, dispatch_id text, attempt_no integer,
