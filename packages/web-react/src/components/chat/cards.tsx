@@ -58,7 +58,7 @@ import { reportClientFriction, reportClientFrictionOnce } from "../../lib/client
 import { cn, groupDigits } from "../../lib/utils";
 import { useUiPlainText } from "../iui/plainText";
 import { Markdown } from "../Markdown";
-import { splitLiveMarkdown } from "./liveMarkdownChunks";
+import { hasMarkdownDefinitions, splitLiveMarkdown } from "./liveMarkdownChunks";
 import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
 import {
   Alert,
@@ -860,7 +860,8 @@ export function ProgressiveMarkdown({
   const primary = text.slice(0, primaryEnd);
   let primaryView: React.ReactNode;
   if (streamed) {
-    const chunks = splitLiveMarkdown(primary);
+    // 脚注 / 引用定义要整篇解析:生成结束后合回单次渲染。沿用首段的 key,首段已挂载的内容不重挂。
+    const chunks = !live && hasMarkdownDefinitions(primary) ? [primary] : splitLiveMarkdown(primary);
     let offset = 0;
     primaryView = (
       <div className="prose">

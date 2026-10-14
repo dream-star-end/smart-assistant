@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { splitLiveMarkdown } from "./liveMarkdownChunks";
+import { hasMarkdownDefinitions, splitLiveMarkdown } from "./liveMarkdownChunks";
 
 const para = (n: number) => `段落 ${n}：${"这是正文内容。".repeat(30)}`;
 const join = (parts: string[]) => parts.join("");
@@ -60,8 +60,52 @@ describe("splitLiveMarkdown (OCV5-421)", () => {
     }
   });
 
-  test("footnotes / reference definitions disable splitting", () => {
-    const text = `${Array.from({ length: 10 }, (_, i) => para(i)).join("\n\n")}\n\n[^1]: 来源`;
-    expect(splitLiveMarkdown(text, 100)).toEqual([text]);
+  test("definitions are reported for the end-of-stream single render, but never re-split live text", () => {
+    const head = `${Array.from({ length: 4 }, (_, i) => para(i)).join("\n\n")}\n\n`;
+    const before = splitLiveMarkdown(head, 300);
+    const after = splitLiveMarkdown(`${head}[^1]: 来源\n`, 300);
+    for (let i = 0; i < before.length - 1; i++) expect(after[i]).toBe(before[i]);
+    expect(hasMarkdownDefinitions(`${head}[^1]: 来源`)).toBe(true);
+    expect(hasMarkdownDefinitions(head)).toBe(false);
+  });
+
+  // Codex r1: a cut must never appear later at an earlier position (rich blocks already mounted
+  // in the tail would remount and lose state).
+  test("a cut is fixed when its line completes; growing past any length never moves earlier text", () => {
+    const options = "```options\n{\"options\":[\"A\",\"B\"]}\n```";
+    const full = `${"x".repeat(1250)}\n\n${options}\n\n${para(1)}\n\n${para(2)}\n\n${para(3)}`;
+    let prev: string[] = [];
+    for (let end = 1; end <= full.length; end += 7) {
+      const parts = splitLiveMarkdown(full.slice(0, end));
+      // the start offset of every earlier chunk boundary stays put
+      let off = 0;
+      const starts = parts.map((p) => { const s = off; off += p.length; return s; });
+      let poff = 0;
+      const pstarts = prev.map((p) => { const s = poff; poff += p.length; return s; });
+      for (const s of pstarts) expect(starts).toContain(s);
+      // a new cut only ever lands on the line that just completed (nothing mounted earlier moves)
+      const prevText = full.slice(0, Math.max(0, end - 7));
+      for (const s of starts) if (!pstarts.includes(s)) expect(s).toBeGreaterThan(prevText.lastIndexOf("\n", prevText.length - 2));
+      prev = parts;
+    }
+  });
+
+  test("$$ inside inline code does not open display math", () => {
+    const text = `\`$$\` 是行内代码\n\n${para(1)}\n\n$$\na=1+2+3+4\n\nb=2\n$$\n\n${para(2)}\n\n${para(3)}`;
+    const parts = splitLiveMarkdown(text, 100);
+    for (const p of parts) {
+      const bare = p.replace(/(`+).*?\1/g, "");
+      expect((bare.match(/\$\$/g) ?? []).length % 2).toBe(0);
+    }
+    expect(parts.length).toBeGreaterThan(1);
+  });
+
+  test("never cuts inside \\[ … \\] display math", () => {
+    const text = `${para(1)}\n\n\\[\n${"a+b\n\nc\n".repeat(40)}\\]\n\n${para(2)}`;
+    const parts = splitLiveMarkdown(text, 100);
+    for (const p of parts) {
+      expect((p.match(/\\\[/g) ?? []).length).toBe((p.match(/\\\]/g) ?? []).length);
+    }
+    expect(parts.join("")).toBe(text);
   });
 });

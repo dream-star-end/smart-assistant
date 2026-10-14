@@ -4,28 +4,39 @@
  * text each notify made long answers O(n²) on the main thread).
  *
  * A cut is only made at a blank line that ends a top-level block for good:
- * - outside fenced code and outside `$$` display math;
- * - the next line already exists and starts a new block that cannot continue the previous one
- *   (not indented, not a list item, not a table row, not a blockquote line, not a definition).
+ * - outside fenced code and outside display math (`$$ … $$`, `\[ … \]`; `$$` inside inline code
+ *   does not count);
+ * - the next line is complete and starts a new block that cannot continue the previous one
+ *   (not indented, not a list item, not a table row, not a blockquote line, not a definition,
+ *   not a math opener).
  * Then rendering the chunks one after another yields the same block sequence as rendering the
- * whole text. Texts with footnotes or link reference definitions are never split (they resolve
- * across the whole document).
+ * whole text.
  *
- * Decisions depend only on text before the cut plus the line after it, so once a chunk is
- * emitted it never changes as the text grows — the memoized chunk keeps its exact string.
+ * Stability: whether a cut is made before a line depends only on the text up to the end of that
+ * line — never on the total length or on anything that arrives later. So once a chunk is emitted
+ * it keeps its exact string as the text grows, and nothing that is already mounted moves to
+ * another chunk (rich blocks such as option cards keep their state).
+ *
+ * Footnotes / link reference definitions resolve across the whole document; `hasMarkdownDefinitions`
+ * lets the caller fall back to a single render once streaming has ended.
  */
 export const LIVE_CHUNK_MIN_CHARS = 1200;
 
 const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})/;
-const NOT_A_FRESH_BLOCK = /^(?:\s|[-*+](?:\s|$)|\d{1,9}[.)](?:\s|$)|\||>|\[[^\]]*\]:|\$\$)/;
+const NOT_A_FRESH_BLOCK = /^(?:\s|[-*+](?:\s|$)|\d{1,9}[.)](?:\s|$)|\||>|\[[^\]]*\]:|\$\$|\\\[)/;
 const DEFINITIONS = /^ {0,3}\[[^\]\n]+\]:/m;
+const INLINE_CODE = /(`+).*?\1/g;
+
+export function hasMarkdownDefinitions(text: string): boolean {
+  return DEFINITIONS.test(text);
+}
 
 export function splitLiveMarkdown(text: string, minChars = LIVE_CHUNK_MIN_CHARS): string[] {
-  if (text.length < minChars * 2 || DEFINITIONS.test(text)) return [text];
   const out: string[] = [];
   let chunkStart = 0;
   let fence: string | null = null;
-  let inMath = false;
+  let dollarMath = false;
+  let bracketMath = false;
   let pos = 0;
   let prevBlank = false;
   let sawContent = false;
@@ -35,18 +46,25 @@ export function splitLiveMarkdown(text: string, minChars = LIVE_CHUNK_MIN_CHARS)
     const line = text.slice(pos, nl);
     const blank = line.trim() === "";
     // Cut decision uses the state *before* this line: a fence opener may start a chunk.
-    if (!fence && !inMath && !blank && prevBlank && sawContent && !NOT_A_FRESH_BLOCK.test(line)
-      && pos - chunkStart >= minChars) {
+    if (!fence && !dollarMath && !bracketMath && !blank && prevBlank && sawContent
+      && !NOT_A_FRESH_BLOCK.test(line) && pos - chunkStart >= minChars) {
       out.push(text.slice(chunkStart, pos));
       chunkStart = pos;
     }
     if (fence) {
       const m = FENCE_OPEN.exec(line);
       if (m && m[1][0] === fence[0] && m[1].length >= fence.length && line.trim() === m[1]) fence = null;
-    } else if (!inMath && FENCE_OPEN.test(line)) {
+    } else if (!dollarMath && !bracketMath && FENCE_OPEN.test(line)) {
       fence = FENCE_OPEN.exec(line)![1];
-    } else if (!blank && (line.match(/\$\$/g) ?? []).length % 2 === 1) {
-      inMath = !inMath;
+    } else if (!blank) {
+      const bare = line.replace(INLINE_CODE, "");
+      if ((bare.match(/\$\$/g) ?? []).length % 2 === 1) dollarMath = !dollarMath;
+      if (!dollarMath) {
+        const opens = (bare.match(/\\\[/g) ?? []).length;
+        const closes = (bare.match(/\\\]/g) ?? []).length;
+        if (!bracketMath && opens > closes) bracketMath = true;
+        else if (bracketMath && closes > 0 && closes >= opens) bracketMath = false;
+      }
     }
     if (!blank) sawContent = true;
     prevBlank = blank;
