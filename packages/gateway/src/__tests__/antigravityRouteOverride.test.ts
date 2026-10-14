@@ -24,7 +24,10 @@ function build(
   overrides: {
     model?: string
     port?: number
-    authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity' }
+    authority?: {
+      canonicalModel: string
+      engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity'
+    }
   } = {},
 ) {
   return _buildSafeAntigravityRouteOverride({
@@ -40,16 +43,22 @@ describe('_buildSafeAntigravityRouteOverride', () => {
   test('accepts the exact token-bound loopback route with a limited token (id token optional)', () => {
     assert.deepEqual(build(VALID), VALID)
     const withId = { ...VALID, idToken: 'eyJhbGciOi.payload.signature' }
-    assert.deepEqual(build(withId, {
-      authority: { canonicalModel: 'antigravity-gemini-3.8-flash', engine: 'antigravity' },
-    }), withId)
+    assert.deepEqual(
+      build(withId, {
+        authority: { canonicalModel: 'antigravity-gemini-3.8-flash', engine: 'antigravity' },
+      }),
+      withId,
+    )
   })
 
   test('is ignored for other engines', () => {
     assert.equal(build(VALID, { model: 'glm-5.3-zai' }), null)
-    assert.equal(build(VALID, {
-      authority: { canonicalModel: 'antigravity-gemini-3.8-flash', engine: 'ccb' },
-    }), null)
+    assert.equal(
+      build(VALID, {
+        authority: { canonicalModel: 'antigravity-gemini-3.8-flash', engine: 'ccb' },
+      }),
+      null,
+    )
   })
 
   test('rejects unknown fields, token mismatch, alternate hosts/ports and query tricks', () => {

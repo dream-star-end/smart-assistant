@@ -42,7 +42,8 @@ async function main(): Promise<void> {
   if (typeof refreshToken !== 'string' || refreshToken.length < 20) {
     throw new Error('token file has no refresh token')
   }
-  if (parsed.auth_method !== 'consumer') throw new Error('token file is not a consumer (Google account) login')
+  if (parsed.auth_method !== 'consumer')
+    throw new Error('token file is not a consumer (Google account) login')
   const grant = await refreshAntigravityGrant({ clientSecret }, refreshToken)
   const email = await fetchAntigravityAccountEmail({}, grant.accessToken)
   const accountId = await upsertAntigravityAccount({
@@ -57,7 +58,9 @@ async function main(): Promise<void> {
 
 main()
   .catch((err: unknown) => {
-    process.stderr.write(`antigravity-import-account: ${err instanceof Error ? err.message : String(err)}\n`)
+    process.stderr.write(
+      `antigravity-import-account: ${err instanceof Error ? err.message : String(err)}\n`,
+    )
     process.exitCode = 1
   })
   .finally(() => closePool().catch(() => {}))

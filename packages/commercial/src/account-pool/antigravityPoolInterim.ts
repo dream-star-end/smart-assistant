@@ -14,21 +14,21 @@
  *   - a 429 cools the account; the request is NOT retried on another account
  *     in-flight (anti-ban rule from http/proxy/core.ts).
  */
-import type { Pool } from "pg";
-import { getPool } from "../db/index.js";
+import type { Pool } from 'pg'
+import { getPool } from '../db/index.js'
 
 export type AntigravityPoolOutcome =
-  | { kind: "success" }
-  | { kind: "rate_limited"; retryAfterMs: number | null }
-  | { kind: "quota_exhausted"; resetAt: Date | null }
-  | { kind: "auth_invalid" }
-  | { kind: "upstream_error" }
-  | { kind: "network" }
-  | { kind: "client_error" };
+  | { kind: 'success' }
+  | { kind: 'rate_limited'; retryAfterMs: number | null }
+  | { kind: 'quota_exhausted'; resetAt: Date | null }
+  | { kind: 'auth_invalid' }
+  | { kind: 'upstream_error' }
+  | { kind: 'network' }
+  | { kind: 'client_error' }
 
-const SEC = 1000;
-const MIN = 60 * SEC;
-const HOUR = 60 * MIN;
+const SEC = 1000
+const MIN = 60 * SEC
+const HOUR = 60 * MIN
 /** DEFAULT_POLICY (OCV5-424 policy/decide.ts). */
 export const ANTIGRAVITY_INTERIM_POLICY = {
   rateLimitMinMs: 15 * SEC,
@@ -44,20 +44,23 @@ export const ANTIGRAVITY_INTERIM_POLICY = {
   upstreamCooldownHealth: 40,
   successBonus: 10,
   halfOpenHealth: 50,
-} as const;
+} as const
 
 function backoff(base: number, level: number, max: number): number {
-  return Math.min(max, base * 2 ** Math.min(level, 20));
+  return Math.min(max, base * 2 ** Math.min(level, 20))
 }
 
 /** Parse Retry-After (seconds or HTTP-date). */
-export function parseRetryAfterMs(value: string | string[] | undefined, now: number): number | null {
-  const raw = Array.isArray(value) ? value[0] : value;
-  if (!raw) return null;
-  const trimmed = raw.trim();
-  if (/^\d+$/.test(trimmed)) return Number(trimmed) * SEC;
-  const date = Date.parse(trimmed);
-  return Number.isFinite(date) ? Math.max(0, date - now) : null;
+export function parseRetryAfterMs(
+  value: string | string[] | undefined,
+  now: number,
+): number | null {
+  const raw = Array.isArray(value) ? value[0] : value
+  if (!raw) return null
+  const trimmed = raw.trim()
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * SEC
+  const date = Date.parse(trimmed)
+  return Number.isFinite(date) ? Math.max(0, date - now) : null
 }
 
 /** Cloud Code upstream status → pool outcome. */
@@ -66,21 +69,22 @@ export function classifyAntigravityUpstream(
   headers: Record<string, string | string[] | undefined>,
   now: number,
 ): AntigravityPoolOutcome {
-  if (status < 400) return { kind: "success" };
-  if (status === 429) return { kind: "rate_limited", retryAfterMs: parseRetryAfterMs(headers["retry-after"], now) };
+  if (status < 400) return { kind: 'success' }
+  if (status === 429)
+    return { kind: 'rate_limited', retryAfterMs: parseRetryAfterMs(headers['retry-after'], now) }
   // 401 dead token; 403 PERMISSION_DENIED / VALIDATION_REQUIRED is account-level.
-  if (status === 401 || status === 403) return { kind: "auth_invalid" };
-  if (status >= 500) return { kind: "upstream_error" };
-  return { kind: "client_error" };
+  if (status === 401 || status === 403) return { kind: 'auth_invalid' }
+  if (status >= 500) return { kind: 'upstream_error' }
+  return { kind: 'client_error' }
 }
 
 export interface AntigravityInterimTransition {
-  status: "active" | "cooldown";
-  cooldownUntil: Date | null;
-  cooldownReason: "rate_limited" | "quota" | "auth" | "upstream" | null;
-  backoffLevel: number;
-  healthScore: number;
-  success: boolean;
+  status: 'active' | 'cooldown'
+  cooldownUntil: Date | null
+  cooldownReason: 'rate_limited' | 'quota' | 'auth' | 'upstream' | null
+  backoffLevel: number
+  healthScore: number
+  success: boolean
 }
 
 /** Pure transition (unit-tested). `null` = no state change. */
@@ -89,62 +93,77 @@ export function decideAntigravityInterim(
   outcome: AntigravityPoolOutcome,
   now: number,
 ): AntigravityInterimTransition | null {
-  const p = ANTIGRAVITY_INTERIM_POLICY;
-  const level = state.backoffLevel;
-  const cooldown = (ms: number, reason: AntigravityInterimTransition["cooldownReason"], health = state.healthScore) => ({
-    status: "cooldown" as const,
+  const p = ANTIGRAVITY_INTERIM_POLICY
+  const level = state.backoffLevel
+  const cooldown = (
+    ms: number,
+    reason: AntigravityInterimTransition['cooldownReason'],
+    health = state.healthScore,
+  ) => ({
+    status: 'cooldown' as const,
     cooldownUntil: new Date(now + ms),
     cooldownReason: reason,
     backoffLevel: level + 1,
     healthScore: health,
     success: false,
-  });
+  })
   switch (outcome.kind) {
-    case "success":
+    case 'success':
       return {
-        status: "active",
+        status: 'active',
         cooldownUntil: null,
         cooldownReason: null,
         backoffLevel: 0,
         // An expired cooldown is half-open: it restarts from halfOpenHealth.
-        healthScore: Math.min(100, (state.status === "cooldown" ? p.halfOpenHealth : state.healthScore) + p.successBonus),
+        healthScore: Math.min(
+          100,
+          (state.status === 'cooldown' ? p.halfOpenHealth : state.healthScore) + p.successBonus,
+        ),
         success: true,
-      };
-    case "rate_limited": {
-      const ms = outcome.retryAfterMs !== null
-        ? Math.min(p.rateLimitMaxMs, Math.max(p.rateLimitMinMs, outcome.retryAfterMs))
-        : backoff(p.rateLimitBaseMs, level, p.rateLimitMaxMs);
-      return cooldown(ms, "rate_limited");
+      }
+    case 'rate_limited': {
+      const ms =
+        outcome.retryAfterMs !== null
+          ? Math.min(p.rateLimitMaxMs, Math.max(p.rateLimitMinMs, outcome.retryAfterMs))
+          : backoff(p.rateLimitBaseMs, level, p.rateLimitMaxMs)
+      return cooldown(ms, 'rate_limited')
     }
-    case "quota_exhausted": {
+    case 'quota_exhausted': {
       const ms = outcome.resetAt
         ? Math.min(p.quotaMaxMs, Math.max(p.rateLimitMinMs, outcome.resetAt.getTime() - now))
-        : p.quotaDefaultMs;
-      return cooldown(ms, "quota");
+        : p.quotaDefaultMs
+      return cooldown(ms, 'quota')
     }
-    case "auth_invalid":
-      return cooldown(backoff(p.authBaseMs, level, p.authMaxMs), "auth");
-    case "upstream_error": {
-      const health = Math.max(0, state.healthScore - p.upstreamStrikePenalty);
+    case 'auth_invalid':
+      return cooldown(backoff(p.authBaseMs, level, p.authMaxMs), 'auth')
+    case 'upstream_error': {
+      const health = Math.max(0, state.healthScore - p.upstreamStrikePenalty)
       if (health > p.upstreamCooldownHealth) {
-        return { status: "active", cooldownUntil: null, cooldownReason: null, backoffLevel: level, healthScore: health, success: false };
+        return {
+          status: 'active',
+          cooldownUntil: null,
+          cooldownReason: null,
+          backoffLevel: level,
+          healthScore: health,
+          success: false,
+        }
       }
-      return cooldown(backoff(p.upstreamBaseMs, level, p.upstreamMaxMs), "upstream", health);
+      return cooldown(backoff(p.upstreamBaseMs, level, p.upstreamMaxMs), 'upstream', health)
     }
-    case "network":
-    case "client_error":
-      return null;
+    case 'network':
+    case 'client_error':
+      return null
   }
 }
 
 export interface AntigravityAccountPick {
-  accountId: bigint;
-  email: string;
+  accountId: bigint
+  email: string
 }
 
 /** Healthiest selectable account; expired cooldowns are half-open. */
 export async function pickAntigravityAccount(
-  deps: { pool?: Pick<Pool, "query"> } = {},
+  deps: { pool?: Pick<Pool, 'query'> } = {},
 ): Promise<AntigravityAccountPick | null> {
   const res = await (deps.pool ?? getPool()).query<{ id: string; email: string }>(
     `SELECT id::text AS id, email FROM gemini_oauth_accounts
@@ -152,9 +171,9 @@ export async function pickAntigravityAccount(
         AND (status = 'active' OR (status = 'cooldown' AND cooldown_until <= NOW()))
       ORDER BY (status = 'active') DESC, health_score DESC, last_used_at ASC NULLS FIRST, id ASC
       LIMIT 1`,
-  );
-  const row = res.rows[0];
-  return row ? { accountId: BigInt(row.id), email: row.email } : null;
+  )
+  const row = res.rows[0]
+  return row ? { accountId: BigInt(row.id), email: row.email } : null
 }
 
 /** Apply an outcome to the row (read-modify-write under a row lock). */
@@ -162,22 +181,27 @@ export async function reportAntigravityOutcome(
   accountId: bigint,
   outcome: AntigravityPoolOutcome,
   detail: string | null,
-  deps: { pool?: Pick<Pool, "query">; now?: () => number } = {},
+  deps: { pool?: Pick<Pool, 'query'>; now?: () => number } = {},
 ): Promise<void> {
-  const pool = deps.pool ?? getPool();
-  const now = (deps.now ?? Date.now)();
-  const cur = await pool.query<{ status: string; health_score: number; backoff_level: number; disabled_by: string | null }>(
-    "SELECT status, health_score, backoff_level, disabled_by FROM gemini_oauth_accounts WHERE id = $1",
+  const pool = deps.pool ?? getPool()
+  const now = (deps.now ?? Date.now)()
+  const cur = await pool.query<{
+    status: string
+    health_score: number
+    backoff_level: number
+    disabled_by: string | null
+  }>(
+    'SELECT status, health_score, backoff_level, disabled_by FROM gemini_oauth_accounts WHERE id = $1',
     [accountId.toString()],
-  );
-  const row = cur.rows[0];
-  if (!row || row.disabled_by !== null) return;
+  )
+  const row = cur.rows[0]
+  if (!row || row.disabled_by !== null) return
   const next = decideAntigravityInterim(
     { healthScore: row.health_score, backoffLevel: row.backoff_level, status: row.status },
     outcome,
     now,
-  );
-  if (next === null) return;
+  )
+  if (next === null) return
   await pool.query(
     `UPDATE gemini_oauth_accounts SET
        status = $2, cooldown_until = $3, cooldown_reason = $4, backoff_level = $5,
@@ -189,7 +213,15 @@ export async function reportAntigravityOutcome(
        access_expires_at = CASE WHEN $4 = 'auth' THEN NOW() ELSE access_expires_at END,
        last_used_at = NOW(), updated_at = NOW()
      WHERE id = $1 AND disabled_by IS NULL`,
-    [accountId.toString(), next.status, next.cooldownUntil, next.cooldownReason,
-      next.backoffLevel, next.healthScore, next.success, detail?.slice(0, 200) ?? null],
-  );
+    [
+      accountId.toString(),
+      next.status,
+      next.cooldownUntil,
+      next.cooldownReason,
+      next.backoffLevel,
+      next.healthScore,
+      next.success,
+      detail?.slice(0, 200) ?? null,
+    ],
+  )
 }
