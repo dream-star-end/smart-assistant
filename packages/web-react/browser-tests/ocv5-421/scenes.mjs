@@ -161,7 +161,11 @@ export const SCENES = [
       const el = document.querySelector("[data-lab-scroll]"); el.scrollTop = el.scrollHeight;
       await new Promise((r) => setTimeout(r, 800));
       const table = (n) => `| 列1 | 列2 | 列3 |\n|---|---|---|\n${Array.from({ length: n }, (_, i) => `| ${i} | 值 ${i} | 说明 ${i} |`).join("\n")}`;
-      const answer = size === "medium"
+      // codetable (OCV5-422): a code block directly followed by a table that ends the answer - table rows are never a
+      // live cut point, so the code block stays in the streaming tail until the end.
+      const answer = size === "codetable"
+        ? [para, code(60), table(20)].join("\n\n")
+        : size === "medium"
         ? [para, code(60), para, table(20), para].join("\n\n")
         : [para, code(250), para, table(60), para, code(150), para].join("\n\n");
       const lt = []; const po = new PerformanceObserver((l) => { for (const e of l.getEntries()) lt.push(e.duration); });
@@ -174,6 +178,14 @@ export const SCENES = [
       await L.stream(c, answer, { chunk: 40, everyMs: 16 });
       const streamMs = performance.now() - t0;
       console.info(`perf: stream done ${Math.round(streamMs)}ms`);
+      // OCV5-422: how long after the stream ends until the answer's (unlabelled) code block is coloured.
+      const doneAt = performance.now();
+      let colouredAfterMs = null;
+      while (performance.now() - doneAt < 20000) {
+        const pres = [...document.querySelectorAll(".prose pre")];
+        if (pres.at(-1)?.querySelector("[class*=hljs-]")) { colouredAfterMs = Math.round(performance.now() - doneAt); break; }
+        await new Promise((r) => setTimeout(r, 50));
+      }
       await new Promise((r) => setTimeout(r, 2000));
       on = false; po.disconnect();
       const sum = (a) => a.reduce((x, y) => x + y, 0);
@@ -181,7 +193,7 @@ export const SCENES = [
         turns, size, answerChars: answer.length, frames: Math.ceil(answer.length / 40), idealMs: Math.ceil(answer.length / 40) * 16,
         streamMs: Math.round(streamMs), longTasks: lt.length, longTaskTotalMs: Math.round(sum(lt)), longTaskMaxMs: Math.round(Math.max(0, ...lt)),
         jank50: gaps.filter((g) => g > 50).length, jank100: gaps.filter((g) => g > 100).length, maxGapMs: Math.round(Math.max(...gaps)),
-        domNodes: document.getElementsByTagName("*").length,
+        domNodes: document.getElementsByTagName("*").length, colouredAfterMs,
         streamErrors: L.errors.length, firstError: L.errors[0] ?? null,
       };
     },
