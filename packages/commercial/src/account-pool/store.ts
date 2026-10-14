@@ -893,6 +893,15 @@ export async function updateAccount(
       throw new TypeError(`invalid status: ${patch.status}`);
     }
     push("status", patch.status);
+    // OCV5-424:状态由管理员(admin PATCH / transitionAccountStatus)直接改写时,同一条
+    // UPDATE 记录停用来源;策略层(health.applyOutcome)从不经过这里写 disabled。
+    if (patch.status === "disabled") {
+      sets.push("disabled_by = 'admin'", "cooldown_reason = NULL", "next_probe_at = NULL");
+    } else if (patch.status === "active") {
+      sets.push("disabled_by = NULL", "cooldown_reason = NULL", "next_probe_at = NULL", "backoff_level = 0");
+    } else if (patch.status === "banned") {
+      sets.push("disabled_by = NULL", "cooldown_reason = NULL", "next_probe_at = NULL");
+    }
   }
   if (patch.cooldown_until !== undefined) push("cooldown_until", patch.cooldown_until);
   if (patch.last_used_at !== undefined) push("last_used_at", patch.last_used_at);
@@ -1056,16 +1065,29 @@ export async function transitionAccountStatus(
  * @returns null 若账号不存在(已被删 race);否则返三种 hint 之一。
  */
 export type AccountRecoveryHint =
-  | { kind: "terminal"; status: "banned" | "disabled" }
+  | { kind: "terminal"; status: "banned" | "disabled" | "cooldown" }
   | { kind: "transient"; status: "cooldown"; retryAfterMs: number }
   | { kind: "ready"; status: "active" };
+
+/** OCV5-424:剩余冷却超过此值时 session pin 解绑重选,而不是让会话一直等。 */
+export const PIN_LONG_COOLDOWN_MS = 30 * 60 * 1000;
+
+export function isLongCooldownForPin(
+  reason: string | null,
+  until: Date | null,
+  now: Date,
+): boolean {
+  if (reason === "auth" || reason === "credential") return true;
+  if (until === null) return false;
+  return until.getTime() - now.getTime() > PIN_LONG_COOLDOWN_MS;
+}
 
 export async function readAccountRecoveryHint(
   id: bigint | string,
   now: () => Date = () => new Date(),
 ): Promise<AccountRecoveryHint | null> {
-  const res = await query<{ status: AccountStatus; cooldown_until: Date | null }>(
-    `SELECT status, cooldown_until
+  const res = await query<{ status: AccountStatus; cooldown_until: Date | null; cooldown_reason: string | null }>(
+    `SELECT status, cooldown_until, cooldown_reason
        FROM claude_accounts
       WHERE id = $1`,
     [String(id)],
@@ -1074,6 +1096,12 @@ export async function readAccountRecoveryHint(
   const row = res.rows[0];
   if (row.status === "banned" || row.status === "disabled") {
     return { kind: "terminal", status: row.status };
+  }
+  if (row.status === "cooldown" && isLongCooldownForPin(row.cooldown_reason, row.cooldown_until, now())) {
+    // OCV5-424:认证/凭证类冷却(要探测才能恢复)或剩余超过 PIN_LONG_COOLDOWN_MS 的冷却,
+    // 对 session pin 视同终态 → scheduler self-heal 解绑 → 409 force_repin → 前端自动
+    // 带 x-force-repin 重发并绑定池内其他成员,会话不被长冷却卡死。短冷却仍返 transient。
+    return { kind: "terminal", status: "cooldown" };
   }
   if (row.status === "cooldown") {
     // cooldown_until 缺失或已过期 → 视为"几乎可用",retryAfterMs=0 让 scheduler

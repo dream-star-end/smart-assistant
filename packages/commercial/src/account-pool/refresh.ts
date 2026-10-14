@@ -38,7 +38,7 @@ import { EVENTS } from '../admin/alertEvents.js'
 import { safeEnqueueAlert } from '../admin/alertOutbox.js'
 import { loadKmsKey } from '../crypto/keys.js'
 import { getPool } from '../db/index.js'
-import type { AccountHealthTracker } from './health.js'
+import { AccountHealthTracker, InMemoryHealthRedis } from './health.js'
 import { recordRefreshEvent } from './refreshEvents.js'
 import {
   type AccountPlan,
@@ -274,43 +274,33 @@ async function disableOnFailure(
   accountId: bigint | string,
   reason: string,
 ): Promise<void> {
-  // T-63 告警:账号 OAuth refresh 失败到需要 disable 的程度 —— warning,
-  // 连续多账号撞上同一 reason 会被 dedupe 按分钟桶收敛。不阻塞 disable 主路径。
+  // OCV5-424:refresh 失败不再写 disabled(那需要人工救)。交共享策略进 auth 冷却
+  // (5min·2^level,上限 6h),到期由 recovery actor 探测(再试 refresh),成功即回 active。
+  // 函数名保留以免牵动调用点;语义是"移出可用池并自动探测"。
   safeEnqueueAlert({
     event_type: EVENTS.ACCOUNT_POOL_TOKEN_REFRESH_FAILED,
     severity: 'warning',
-    title: '账号 refresh 失败被 disable',
-    body: `账号 #${accountId} OAuth refresh 连续失败,已被自动降级为 disabled。reason=\`${reason}\``,
+    title: '账号 refresh 失败,进入自动探测冷却',
+    body: `账号 #${accountId} OAuth refresh 失败,已移出可用池并进入 auth 冷却,到期自动探测恢复。reason=\`${reason}\``,
     payload: { account_id: String(accountId), reason },
     // 同一 reason + 同一分钟 → 合并
     dedupe_key: `account_pool.token_refresh_failed:${reason}:${new Date().toISOString().slice(0, 16)}`,
   })
-  let disabled = false
-  if (deps.health) {
-    try {
-      await deps.health.manualDisable(accountId, reason)
-      disabled = true
-    } catch {
-      /* 禁用尽力而为,不要把 refresh 的原错误覆盖掉 */
-    }
-  } else {
-    try {
-      await updateAccount(
-        accountId,
-        { status: 'disabled', last_error: reason },
-        deps.keyFn ?? loadKmsKey,
-      )
-      disabled = true
-    } catch {
-      /* 同理 */
-    }
+  let cooled = false
+  // 未注入 tracker(早期 boot / 单测)时用一次性内存计数器:auth_invalid 不读写
+  // 连续失败计数,DB 写入与注入版完全相同。
+  const tracker = deps.health ?? new AccountHealthTracker({ redis: new InMemoryHealthRedis() })
+  try {
+    const h = await tracker.applyOutcome(accountId, { kind: 'auth_invalid', detail: reason }, { errorMsg: reason })
+    cooled = h !== null && h.status === 'cooldown'
+  } catch {
+    /* 尽力而为,不要把 refresh 的原错误覆盖掉 */
   }
 
-  // v1.0.120 feat/codex-disable-rebind:disable 落库后 fire-and-forget 触发
-  // fanout actor。fanout actor 内部用 `WHERE provider = 'codex'` 做二次确认,
-  // claude 账号传进来也只是查一下 DB → 立刻 return,无副作用。
-  // disable 自身失败(上面两个 catch)就不 fanout —— 状态没变,fanout 也没意义。
-  if (disabled && deps.triggerCodexDisableFanout !== undefined) {
+  // v1.0.120 feat/codex-disable-rebind:账号移出可用池后 fire-and-forget 触发
+  // fanout actor,把仍绑该账号的 codex 容器 rebind 到其他 active 账号(fanout 以
+  // status<>'active' 判定,cooldown 同样生效)。claude 账号传进来只查一下 DB 即返回。
+  if (cooled && deps.triggerCodexDisableFanout !== undefined) {
     try {
       deps.triggerCodexDisableFanout(BigInt(accountId))
     } catch (err) {

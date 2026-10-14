@@ -31,6 +31,8 @@
  * after each use, so `readApiKey` must return a fresh copy every call.
  */
 
+import { AccountHealthTracker, InMemoryHealthRedis } from "../../account-pool/health.js";
+import type { PoolOutcome } from "../../account-pool/policy/outcome.js";
 import { createHash, randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Pool } from "pg";
@@ -127,6 +129,11 @@ export interface CursorExternalDeps {
   stickyTtlMs?: number;
   /** In-process cooldown after a credential rejection (default 10 min). */
   credentialCooldownMs?: number;
+  /**
+   * OCV5-424:把上游拒绝交共享策略持久化(401 → auth 冷却+自动探测;429 → rate_limited)。
+   * 进程内 cooled 仍立即生效;持久冷却让重启后和 Box 路由同样看见。测试可注入。
+   */
+  reportAccountOutcome?: (accountId: bigint, outcome: PoolOutcome) => Promise<unknown>;
   /**
    * Durable FS outbox. Required in the selfhost composition; unit tests may
    * omit it and keep the in-process settle-after-return path.
@@ -231,6 +238,10 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
   const now = deps.now ?? (() => Date.now());
   const stickyTtl = deps.stickyTtlMs ?? CURSOR_EXTERNAL_STICKY_TTL_MS;
   const cooldownMs = deps.credentialCooldownMs ?? CURSOR_EXTERNAL_CREDENTIAL_COOLDOWN_MS;
+  const reportAccountOutcome =
+    deps.reportAccountOutcome
+    ?? ((id: bigint, outcome: PoolOutcome) =>
+      new AccountHealthTracker({ redis: new InMemoryHealthRedis() }).applyOutcome(id, outcome));
   const listCursorAccounts =
     deps.listCursorAccounts
     ?? (() => listAccounts({ provider: "cursor", status: "active", limit: 500 }));
@@ -583,6 +594,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
       if (result.status === 401) {
         cooled.set(accountId.toString(), nowMs + cooldownMs);
         sticky.delete(uid.toString());
+        void reportAccountOutcome(accountId, { kind: "auth_invalid", detail: "cursor_http_401" }).catch(() => {});
         userLog.warn("cursor_external_credential_rejected", {
           model,
           accountId: accountId.toString(),
@@ -591,6 +603,9 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
         });
         incrAnthropicProxyReject("upstream_auth");
       } else {
+        if (result.status === 429) {
+          void reportAccountOutcome(accountId, { kind: "rate_limited", retryAfterMs: null }).catch(() => {});
+        }
         userLog.warn("cursor_external_upstream_rejected", {
           model,
           accountId: accountId.toString(),

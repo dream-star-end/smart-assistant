@@ -10,6 +10,7 @@
  * back to master direct egress or process-global HTTP_PROXY.
  */
 
+import { classifyHttpOutcome } from '../account-pool/policy/outcome.js'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { createHash } from 'node:crypto'
 import { createReadStream, createWriteStream } from 'node:fs'
@@ -1401,7 +1402,11 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
       })
       if (routeContext) {
         if (isRelayCredentialFailureStatus(upstream.status)) {
-          void markCredentialFailure(routeContext.credential.id, `http_${upstream.status}`).catch(() => {})
+          void markCredentialFailure(
+            routeContext.credential.id,
+            `http_${upstream.status}`,
+            classifyHttpOutcome(upstream.status, upstream.headers, new Date()),
+          ).catch(() => {})
         } else {
           void markCredentialSuccess(routeContext.credential.id).catch(() => {})
         }

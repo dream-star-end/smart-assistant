@@ -98,7 +98,7 @@ leader 每 60s：对每个注册池
 - 池边界：select 只见本服务成员；每成员独立出口（订阅号沿用必填 egress；API key 可选 egress_proxy_id）。
 - env 中的静态 key 启动时按指纹幂等导入为该服务池成员（source='env'），env 不再是唯一来源；gateway host 路径对 env 的读取保持不变（不在本票改）。
 
-## 2. 数据（迁移 0305_pool_policy.sql，个人版独有号段，人工 apply + 登记 schema_migrations）
+## 2. 数据（迁移 0306_pool_policy.sql，个人版独有号段，人工 apply + 登记 schema_migrations）
 - `claude_accounts`、`api_relay_credentials` 增：`cooldown_reason text`、`backoff_level smallint default 0`、`next_probe_at timestamptz`、`disabled_by text`（仅 `admin`；NULL=非停用）。
 - `box_claude_profiles` 增：`cooldown_reason`、`backoff_level`（已有 cooldown_until/last_reason）。
 - 新表 `pool_api_keys(id, service, label, key_enc, key_nonce, fingerprint, base_url, egress_proxy_id, tier, weight, status, health_score, cooldown_until, cooldown_reason, backoff_level, next_probe_at, success_count, fail_count, last_error, last_used_at, source, disabled_by, created_at, updated_at)`，`unique(service, fingerprint)`。
@@ -129,8 +129,18 @@ leader 每 60s：对每个注册池
 本票建 `gemini` 池（`pool_api_keys(service=gemini)`：后台可添加 key、健康/探测走共享策略，探测用 `GET /v1beta/models`）。Antigravity 中继 `/internal/v5/antigravity-relay` 另开票实现，届时其选 key 直接调用 `pool.select('gemini')`；本票不改 antigravity adapter（保持 fail-closed）。
 
 ## 7. 分期与验证
-- A：policy 层（outcome/decide/select/recovery/registry）+ 迁移 0305 + claude/grok/codex 订阅接入 + 消除系统 disabled。单测：decide 全表、select 分层/粘性/陈旧配额、recovery 探测退避；integ：0305 迁移、health 兼容。
+- A：policy 层（outcome/decide/select/recovery/registry）+ 迁移 0306 + claude/grok/codex 订阅接入 + 消除系统 disabled。单测：decide 全表、select 分层/粘性/陈旧配额、recovery 探测退避；integ：0306 迁移、health 兼容。
 - B：pool_api_keys + 静态 provider 多 key + claude API-key tier + codex relay + box/cursor 接入。
 - C：管理后台「服务池」页 + API；浏览器用例。
 - D：Gemini 池（中继另开票）。
 - 发布前：Codex 审查（≤3 轮）、托管 CI 绿、迁移人工 apply；发布后 cc2+Haiku 真聊 4 轮 + 扣费对账 + 后台前后截图。
+
+## 8. 实现与设计的差异（实现时确定，均有理由）
+
+- **API key 池的故障切换按"下一请求"做**：设计写的是首字节前同请求内换 key 重试（最多 2 次）。实现时为了不在 `core.ts` 里重发上游请求（会和 400 历史剥离重试、计费 journal 交织），改为：失败立即按共享策略冷却该 key（429 按 Retry-After、401 进 auth 冷却），下一个请求选到其他 key。`select.ts` 的 `mayFailoverWithinRequest` 保留为后续扩展点，当前未接线。
+- **Grok 401/403 仍按 3 连败计**：Grok relay 原有决定是 401 先强制下次刷新 token（多数自愈）、5xx 不算 strike（xAI 全局故障不应冷却全部账号）。保留这两条；只把 429 / 402 改为共享策略的立即冷却。
+- **Box 用共享状态机 + 自己的基准时长**：`BOX_POLICY` 继承 `DEFAULT_POLICY`，只把无 reset 的拒绝 15min、未登录 30min、profile 不安全 60min 作为 level 0 时长（与原行为一致），重复失败再翻倍，成功读数清零。
+- **API key 的"探测"**：API key 没有 refresh 端点；auth 冷却到期即乐观半开（backoff_level 保留），下一次真实请求再判；连续失败则 5min·2^level 递增到 6h。credential 冷却的探测是重新解密。
+- **去掉"立即探测"按钮**：恢复全自动，管理后台只做展示 + API key 添加 / 管理员启停，避免出现"需要人去点"的路径。
+- **迁移号 0306**：OCV5-415（Antigravity P2）先合入并占用 0305，本票顺延为 0306。
+- **Gemini**：本票只建池（后台可添加 key）；Antigravity 中继与 Gemini OAuth 账号表由 OCV5-415 实现，其临时上报器 `antigravityPoolInterim.ts`（TODO(OCV5-424)）待本票合入后替换为共享策略。

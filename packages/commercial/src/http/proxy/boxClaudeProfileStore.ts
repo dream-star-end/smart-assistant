@@ -161,11 +161,13 @@ export async function writeBoxProfileHealth(accountId: bigint, profile: string,
   try {
     await query(
       `UPDATE box_claude_profiles SET utilization = $3::real,
-         cooldown_until = $4::timestamptz, last_reason = $5, health_updated_at = $6::timestamptz
+         cooldown_until = $4::timestamptz, last_reason = $5, health_updated_at = $6::timestamptz,
+         cooldown_reason = $7, backoff_level = $8
        WHERE account_id = $1::bigint AND profile = $2 AND (health_updated_at IS NULL
          OR health_updated_at < $6::timestamptz)`,
       [accountId.toString(), profile, state.utilization,
         state.cooldownUntilMs === null ? null : new Date(state.cooldownUntilMs).toISOString(),
-        state.lastReason, new Date(state.updatedAtMs).toISOString()]);
+        state.lastReason, new Date(state.updatedAtMs).toISOString(),
+        state.cooldownReason ?? null, Math.min(30, Math.max(0, state.backoffLevel ?? 0))]);
   } catch (error) { if (!missingTable(error)) throw error; }
 }
