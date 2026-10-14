@@ -7420,6 +7420,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/chat.test.ts",
           "assertion": "INC-20261015-LIVE-FENCE-TRIM-REPLAY: a long answer replayed after a cursor reset is not appended twice"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T71 INC-20261015-LIVE-FENCE-TRIM-REPLAY: a long answer replayed after a cursor reset is shown once"
         }
       ]
     }

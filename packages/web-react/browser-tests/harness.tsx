@@ -227,6 +227,16 @@ declare global {
         cursor: number;
         requests: string[];
       }>;
+      /** Long answer (>1024 live deltas) replayed by a durable reset (INC-20261015-LIVE-FENCE-TRIM-REPLAY). */
+      runLongAnswerFenceReplay: () => Promise<{
+        deltas: number;
+        firstLength: number;
+        replayLength: number;
+        startCount: number;
+        endCount: number;
+        domStartCount: number;
+        domEndCount: number;
+      }>;
       /** Replay a cold refresh spanning two container frameSeq generations. */
       runDurableGenerationReset: () => Promise<{
         markers: { oldProcess: string; currentProcess: string; currentAnswer: string };
@@ -453,6 +463,9 @@ window.__replayDrive = {
   },
   runDurableGenerationReset: async () => {
     throw new Error("durable generation-reset probe 未挂载");
+  },
+  runLongAnswerFenceReplay: async () => {
+    throw new Error("long-answer fence probe 未挂载");
   },
   runDurableErrorReplay: async () => {
     throw new Error("durable error replay probe 未挂载");
@@ -2191,6 +2204,58 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
           m.role === "assistant" && m.text === markers.answer).length,
         cursor: session._lastFrameSeqByKey?.[sessionKey] ?? -1,
         requests,
+      };
+    },
+    runLongAnswerFenceReplay: async () => {
+      replaySocket.removeSession(REPLAY_SESSION_ID);
+      const session = replaySocket.ensureSession(REPLAY_SESSION_ID, REPLAY_AGENT_ID, "long answer fence replay");
+      const clientMessageId = "m-browser-long-answer";
+      const sessionKey = `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`;
+      const start = "BROWSER_FENCE_ANSWER_START ";
+      const end = " BROWSER_FENCE_ANSWER_END";
+      session.messages.push({ id: clientMessageId, role: "user", text: "BROWSER_FENCE_USER", ts: 1, status: "sent" });
+      session._sendingInFlight = true;
+      session._activeClientMessageId = clientMessageId;
+      const deltas = 1025;
+      const frames = Array.from({ length: deltas }, (_, i) => ({
+        recordId: String(i + 1),
+        streamKey: "dispatch:99999999-9999-4999-8999-999999999999:1",
+        source: "gateway" as const,
+        clientMessageId,
+        payload: {
+          type: "outbound.message",
+          sessionKey,
+          frameSeq: i + 1,
+          channel: "webchat",
+          peer: { id: REPLAY_SESSION_ID, kind: "dm" },
+          clientMessageId,
+          blocks: [{ kind: "text", text: i === 0 ? start : i === deltas - 1 ? end : "x", messageId: "srv-browser-long-answer" }],
+          isFinal: false,
+          ts: (i + 1) * 10,
+        },
+      }));
+      const answer = () => session.messages.find((m) => m.id === "srv-browser-long-answer")?.text ?? "";
+      replaySocket.applyDurableLiveFrames(REPLAY_SESSION_ID, frames);
+      const firstLength = answer().length;
+      // Refresh shape: the journal hydrate resets the turn's cursor and replays it from frame one.
+      replaySocket.applyDurableLiveFrames(REPLAY_SESSION_ID, frames, [clientMessageId]);
+      const root = document.querySelector("#timeline-replay-root");
+      for (let i = 0; i < 200 && !root?.textContent?.includes("BROWSER_FENCE_ANSWER_END"); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const text = answer();
+      const dom = root?.textContent ?? "";
+      // Leave no in-flight turn behind for later replay-root cases.
+      replaySocket.removeSession(REPLAY_SESSION_ID);
+      return {
+        deltas,
+        firstLength,
+        replayLength: text.length,
+        startCount: text.split("BROWSER_FENCE_ANSWER_START").length - 1,
+        endCount: text.split("BROWSER_FENCE_ANSWER_END").length - 1,
+        domStartCount: dom.split("BROWSER_FENCE_ANSWER_START").length - 1,
+        domEndCount: dom.split("BROWSER_FENCE_ANSWER_END").length - 1,
       };
     },
     runDurableGenerationReset: async () => {
