@@ -178,8 +178,7 @@ export async function pickAntigravityAccount(
     `SELECT id::text AS id, email FROM gemini_oauth_accounts
       WHERE disabled_by IS NULL
         AND (status = 'active' OR (status = 'cooldown' AND cooldown_until <= NOW()))
-      ORDER BY (status = 'active') DESC, health_score DESC, last_used_at ASC NULLS FIRST, id ASC
-      LIMIT 20`,
+      ORDER BY (status = 'active') DESC, health_score DESC, last_used_at ASC NULLS FIRST, id ASC`,
   )
   for (const row of res.rows) {
     const accountId = BigInt(row.id)

@@ -43,11 +43,6 @@ export function configureAntigravityRelayKv(next: AntigravityRelayKv | null): vo
   kv = next
 }
 
-/** Shared KV (null in tests); also holds per-model cooldowns. */
-export function getAntigravityRelayKv(): AntigravityRelayKv | null {
-  return kv
-}
-
 function tokenKey(token: string): string {
   return `${KV_PREFIX}${createHash('sha256').update(token, 'utf8').digest('hex')}`
 }

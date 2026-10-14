@@ -15,8 +15,10 @@ import {
 import {
   ANTIGRAVITY_MODEL_COOLDOWN_POLICY,
   _resetAntigravityModelCooldownForTests,
+  antigravityModelCooldownMs,
   antigravityModelCoolingUntil,
-  decideAntigravityModelCooldown,
+  configureAntigravityModelCooldownStore,
+  createIoredisAntigravityModelCooldownStore,
   reportAntigravityModelOutcome,
 } from '../account-pool/antigravityModelCooldown.js'
 import {
@@ -24,38 +26,26 @@ import {
   pickAntigravityAccount,
   reportAntigravityOutcome,
 } from '../account-pool/antigravityPoolInterim.js'
-import {
-  type AntigravityRelayKv,
-  _resetAntigravityRelayRoutesForTests,
-  configureAntigravityRelayKv,
-} from '../billing/antigravityRouteContext.js'
 
 const GPT = 'antigravity-gpt-oss-120b'
 const FLASH = 'antigravity-gemini-3.8-flash'
 const now = 1_800_000_000_000
+let clockNow = now
+const clock = { now: () => clockNow }
 
 afterEach(() => {
-  _resetAntigravityModelCooldownForTests()
-  _resetAntigravityRelayRoutesForTests()
+  clockNow = now
+  _resetAntigravityModelCooldownForTests(() => clockNow)
 })
 
 describe('model cooldown policy', () => {
   test('two strikes only count; the third cools 1min, doubling to a 10min cap', () => {
     const p = ANTIGRAVITY_MODEL_COOLDOWN_POLICY
-    let s = decideAntigravityModelCooldown(null, false, now)
-    assert.deepEqual(s, { strikes: 1, until: 0 })
-    s = decideAntigravityModelCooldown(s, false, now)
-    assert.deepEqual(s, { strikes: 2, until: 0 })
-    s = decideAntigravityModelCooldown(s, false, now)
-    assert.deepEqual(s, { strikes: 3, until: now + p.baseMs })
-    s = decideAntigravityModelCooldown(s, false, now)
-    assert.equal(s?.until, now + 2 * p.baseMs)
-    s = decideAntigravityModelCooldown({ strikes: 40, until: 0 }, false, now)
-    assert.equal(s?.until, now + p.maxMs)
-  })
-
-  test('a success clears the model state', () => {
-    assert.equal(decideAntigravityModelCooldown({ strikes: 5, until: now + 1 }, true, now), null)
+    assert.equal(antigravityModelCooldownMs(1), 0)
+    assert.equal(antigravityModelCooldownMs(2), 0)
+    assert.equal(antigravityModelCooldownMs(3), p.baseMs)
+    assert.equal(antigravityModelCooldownMs(4), 2 * p.baseMs)
+    assert.equal(antigravityModelCooldownMs(40), p.maxMs)
   })
 
   test('model_unavailable never changes account health or status', () => {
@@ -72,44 +62,78 @@ describe('model cooldown policy', () => {
 
 describe('model cooldown state', () => {
   test('three GPT-OSS 5xx cool GPT-OSS on that account only', async () => {
-    const clock = { now: () => now }
+    _resetAntigravityModelCooldownForTests(() => clockNow)
     for (let i = 0; i < 3; i++) await reportAntigravityModelOutcome(1n, GPT, false, clock)
     assert.equal(await antigravityModelCoolingUntil(1n, GPT, clock), now + 60_000)
     assert.equal(await antigravityModelCoolingUntil(1n, FLASH, clock), null)
     assert.equal(await antigravityModelCoolingUntil(2n, GPT, clock), null)
     // expired cooldown is usable again (half-open); strikes are still remembered
-    assert.equal(await antigravityModelCoolingUntil(1n, GPT, { now: () => now + 60_000 }), null)
-    await reportAntigravityModelOutcome(1n, GPT, false, { now: () => now + 60_000 })
-    assert.equal(
-      await antigravityModelCoolingUntil(1n, GPT, { now: () => now + 60_000 }),
-      now + 60_000 + 120_000,
-    )
-    await reportAntigravityModelOutcome(1n, GPT, true, { now: () => now + 200_000 })
-    assert.equal(await antigravityModelCoolingUntil(1n, GPT, { now: () => now + 200_000 }), null)
+    clockNow = now + 60_000
+    assert.equal(await antigravityModelCoolingUntil(1n, GPT, clock), null)
+    await reportAntigravityModelOutcome(1n, GPT, false, clock)
+    assert.equal(await antigravityModelCoolingUntil(1n, GPT, clock), clockNow + 120_000)
+    await reportAntigravityModelOutcome(1n, GPT, true, clock)
+    assert.equal(await antigravityModelCoolingUntil(1n, GPT, clock), null)
   })
 
-  test('uses the shared relay KV (master reads what egress wrote) with a TTL', async () => {
-    const store = new Map<string, { value: string; ttl: number }>()
-    const kv: AntigravityRelayKv = {
-      async get(k) {
-        return store.get(k)?.value ?? null
+  test('concurrent failures are all counted (Codex r1 P1)', async () => {
+    _resetAntigravityModelCooldownForTests(() => clockNow)
+    await Promise.all([1, 2, 3].map(() => reportAntigravityModelOutcome(1n, GPT, false, clock)))
+    assert.equal(await antigravityModelCoolingUntil(1n, GPT, clock), now + 60_000)
+  })
+
+  test('Redis store: INCR+PEXPIRE in one MULTI, cooldown key with PX TTL', async () => {
+    const data = new Map<string, string>()
+    const ttl = new Map<string, number>()
+    const client = {
+      multi() {
+        const ops: Array<() => [Error | null, unknown]> = []
+        const tx = {
+          incr(k: string) {
+            ops.push(() => {
+              const n = Number(data.get(k) ?? '0') + 1
+              data.set(k, String(n))
+              return [null, n]
+            })
+            return tx
+          },
+          pexpire(k: string, ms: number) {
+            ops.push(() => {
+              ttl.set(k, ms)
+              return [null, 1]
+            })
+            return tx
+          },
+          async exec() {
+            return ops.map((op) => op())
+          },
+        }
+        return tx
       },
-      async set(k, value, ttl) {
-        store.set(k, { value, ttl })
+      async get(k: string) {
+        return data.get(k) ?? null
       },
-      async del(k) {
-        store.delete(k)
+      async set(k: string, v: string, _mode: 'PX', ms: number) {
+        data.set(k, v)
+        ttl.set(k, ms)
+        return 'OK'
+      },
+      async del(...keys: string[]) {
+        for (const k of keys) data.delete(k)
+        return keys.length
       },
     }
-    configureAntigravityRelayKv(kv)
-    const clock = { now: () => now }
-    for (let i = 0; i < 3; i++) await reportAntigravityModelOutcome(1n, GPT, false, clock)
-    const entry = store.get('oc:v5:antigravity-model-cooldown:1:antigravity-gpt-oss-120b')
-    assert.ok(entry)
-    assert.equal(entry.ttl, (60_000 + ANTIGRAVITY_MODEL_COOLDOWN_POLICY.strikeWindowMs) / 1000)
+    configureAntigravityModelCooldownStore(createIoredisAntigravityModelCooldownStore(client))
+    await Promise.all([1, 2, 3].map(() => reportAntigravityModelOutcome(1n, GPT, false, clock)))
+    const k = 'oc:v5:antigravity-model-cooldown:1:antigravity-gpt-oss-120b'
+    const p = ANTIGRAVITY_MODEL_COOLDOWN_POLICY
+    assert.equal(data.get(`${k}:strikes`), '3')
+    assert.equal(ttl.get(`${k}:strikes`), p.maxMs + p.strikeWindowMs)
+    assert.equal(data.get(`${k}:until`), String(now + 60_000))
+    assert.equal(ttl.get(`${k}:until`), 60_000)
     assert.equal(await antigravityModelCoolingUntil(1n, GPT, clock), now + 60_000)
     await reportAntigravityModelOutcome(1n, GPT, true, clock)
-    assert.equal(store.size, 0)
+    assert.equal(data.size, 0)
   })
 })
 
@@ -168,6 +192,18 @@ describe('admission skips accounts whose model is cooling', () => {
     }
     assert.equal((await admitAntigravityTurn(args(GPT), deps)).token, 't-2')
     assert.equal((await admitAntigravityTurn(args(FLASH), deps)).token, 't-1')
+  })
+
+  test('a usable account past the first 20 is still found (Codex r1 P1)', async () => {
+    const rows = Array.from({ length: 21 }, (_, i) => ({ id: String(i + 1), email: `${i}@x` }))
+    const { pool, queries } = fakePool(rows)
+    const granted = await admitAntigravityTurn(args(GPT), {
+      ...grantDeps,
+      pick: (d) => pickAntigravityAccount({ ...d, pool }),
+      modelCoolingUntil: async (id: bigint) => (id <= 20n ? now + 60_000 : null),
+    })
+    assert.equal(granted.token, 't-21')
+    assert.doesNotMatch(queries[0]?.sql ?? '', /LIMIT/)
   })
 
   test('model cooling on every account fails fast with its own code', async () => {
