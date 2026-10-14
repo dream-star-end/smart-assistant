@@ -602,7 +602,8 @@ export function startPreviewServer(assetDir, options = {}) {
         peer: { id: sessId, kind: "dm" },
         clientMessageId,
       });
-      void playTurn(send, store, sessId, clientMessageId, text, nextSeq).catch((error) => {
+      // options.playTurn: perf scripts (ocv5-421/app-perf.mjs) stream their own answer; tests use the story.
+      void (options.playTurn ?? playTurn)(send, store, sessId, clientMessageId, text, nextSeq).catch((error) => {
         send({
           type: "outbound.error",
           sessionKey: sessionKey(sessId),

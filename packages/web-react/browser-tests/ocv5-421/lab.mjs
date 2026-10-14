@@ -1,7 +1,9 @@
 // OCV5-421 render lab driver: real MessageList + production CSS in real Chromium.
 // Shots: every scene × {desktop 1280x900, mobile 390x844} × {light, dark}; probes: DOM facts per scene;
 // perf: stream a long answer on top of a large session and record long tasks / frame gaps.
-// Env: OUT (dir), SCENES (comma filter), PERF=0 to skip perf, PERF_TURNS (default 150).
+// Env: OUT (dir), SCENES (comma filter), PERF=0 to skip perf, PERF_TURNS (default 150);
+// PERF_PROFILE=1 also writes the raw CPU profile per run (OUT/profile-*.cpuprofile);
+// PERF_TRACE=1 records a timeline trace per run and reports main-thread time per event name (traceMs).
 import { createRequire } from "node:module";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -121,9 +123,11 @@ if (process.env.PERF !== "0") {
           await prof.send("Profiler.setSamplingInterval", { interval: 1000 });
           await prof.send("Profiler.start");
         }
+        if (process.env.PERF_TRACE === "1") await browser.startTracing(page, { path: join(OUT, `trace-${scene.id}-${vp}-${k}.json`), categories: ["devtools.timeline", "disabled-by-default-devtools.timeline"] });
         const m = await page.evaluate(scene.perf, { turns: Number(process.env.PERF_TURNS ?? 150), size: process.env.PERF_SIZE ?? "long" });
         if (prof) {
           const { profile } = await prof.send("Profiler.stop");
+          writeFileSync(join(OUT, `profile-${scene.id}-${vp}-${k}.cpuprofile`), JSON.stringify(profile));
           const self = new Map();
           const dt = profile.timeDeltas; const byId = new Map(profile.nodes.map((n) => [n.id, n]));
           profile.samples.forEach((id, i) => {
@@ -132,6 +136,15 @@ if (process.env.PERF !== "0") {
             self.set(key, (self.get(key) ?? 0) + (dt[i] ?? 0) / 1000);
           });
           m.topSelfMs = [...self.entries()].sort((a, b) => b[1] - a[1]).slice(0, 25).map(([k, v]) => `${Math.round(v)}ms ${k}`);
+        }
+        if (process.env.PERF_TRACE === "1") {
+          // Main-thread time by trace event (complete events only; nested events double count, so read rows separately).
+          const trace = JSON.parse(String(await browser.stopTracing()));
+          const events = trace.traceEvents ?? trace;
+          const main = new Set(events.filter((e) => e.name === "thread_name" && e.args?.name === "CrRendererMain").map((e) => `${e.pid}:${e.tid}`));
+          const byName = new Map();
+          for (const e of events) if (e.ph === "X" && main.has(`${e.pid}:${e.tid}`)) byName.set(e.name, (byName.get(e.name) ?? 0) + (e.dur ?? 0) / 1000);
+          m.traceMs = Object.fromEntries([...byName.entries()].sort((a, b) => b[1] - a[1]).slice(0, 14).map(([k2, v]) => [k2, Math.round(v)]));
         }
         m.errors = errors.length;
         runs.push(m);
