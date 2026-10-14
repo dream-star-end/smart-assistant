@@ -223,6 +223,12 @@
       "reason": "OCV5-415 Antigravity interim pool counted a single model's upstream 5xx (GPT-OSS no capacity) as an account strike, which could cool the only account for every model; latent, no cooldown happened.",
       "approvedBy": "user 2026-10-15 要求确认单模型 5xx 只冷却该模型、会误伤则修掉（cc3 antigravity 会话）",
       "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "430ffba8e3bb866a5a4aa2c5beb25507954a0fcd",
+      "reason": "OCV5-424 follow-up 2: admin 服务池 page member names wrapped 2–3 characters per line at phone width after #736 (break-all). CSS-only change on an admin page; no user-visible surface changed.",
+      "approvedBy": "user 2026-10-15 要求修手机端服务池状态徽标逐字换行并发个人版（cc3 account-pool 会话）",
+      "expiresAt": "2026-11-14"
     }
   ]
 }
