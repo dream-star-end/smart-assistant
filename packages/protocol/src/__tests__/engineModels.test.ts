@@ -132,7 +132,7 @@ describe('GPT-5.6 / GPT-6 engine model authority', () => {
     assert.equal(contextFamilyByModelId('gpt-6-astra-1m')?.family, 'gpt-6-astra')
     assert.equal(contextFamilyByModelId('gpt-6.1-sol-1m')?.family, 'gpt-6.1-sol')
     assert.equal(contextFamilyByModelId('gpt-6-luna-1m')?.family, 'gpt-6-luna')
-    assert.equal(COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL, '更多 GPT 模型')
+    assert.equal(COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL, '更多模型')
     for (const family of CONTEXT_TIER_FAMILIES) {
       if (family.family === 'kimi-k3') continue
       assert.equal(isCodexEngineModel(family.standardId), true, family.standardId)

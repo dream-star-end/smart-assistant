@@ -138,7 +138,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
   it('deepseek direct 只放 Pro(Flash 已统一归 OpenCode Go)', () => {
     assert.deepEqual([...getStaticProvider('deepseek').inboundModelIds], ['deepseek-v4-pro'])
   })
-  it('minimax 1 项 / ark 3 项 / opencodego Flash canonical+alias + 2 个历史 Qwen', () => {
+  it('minimax 1 项 / ark 3 项 / opencodego Flash canonical+alias + 2 个历史 Qwen + OCV5-425 -go 模型', () => {
     assert.deepEqual([...getStaticProvider('minimax').inboundModelIds], ['MiniMax-M3'])
     assert.deepEqual([...getStaticProvider('ark').inboundModelIds], ['glm-5.3', 'glm-5.2', 'glm-5.1'])
     assert.deepEqual([...getStaticProvider('zai').inboundModelIds], ['glm-5.3-zai'])
@@ -148,6 +148,15 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'qwen3.7-max',
       'qwen3.7-plus',
       'gemini-4-argon-contributor',
+      'deepseek-v4-pro-go',
+      'claude-haiku-5-5-go',
+      'kimi-k3-go',
+      'minimax-m2.7-go',
+      'minimax-m3-go',
+      'space-bunny-go',
+      'qwen3.8-max-go',
+      'qwen3.8-flash-go',
+      'qwen3.7-plus-go',
     ])
     assert.deepEqual([...getStaticProvider('kimi').inboundModelIds], ['kimi-k2.7-code'])
     assert.deepEqual([...getStaticProvider('ark-k3').inboundModelIds], ['kimi-k3-ark'])
@@ -167,6 +176,15 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'qwen3.7-max',
       'qwen3.7-plus',
       'gemini-4-argon-contributor',
+      'deepseek-v4-pro-go',
+      'claude-haiku-5-5-go',
+      'kimi-k3-go',
+      'minimax-m2.7-go',
+      'minimax-m3-go',
+      'space-bunny-go',
+      'qwen3.8-max-go',
+      'qwen3.8-flash-go',
+      'qwen3.7-plus-go',
       'kimi-k2.7-code',
       'kimi-k3-ark',
       'kimi-k3',

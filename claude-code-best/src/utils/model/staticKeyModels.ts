@@ -83,11 +83,37 @@ export function isZaiGlm53Model(model: string): boolean {
   return model.trim().toLowerCase() === 'glm-5.3-zai'
 }
 
+/** OCV5-425 OpenCode Go `/messages` models, catalog id → upstream id. Mirrors protocol
+ *  OPENCODE_GO_MESSAGES_MODELS (equality pinned by staticKeyModels.test.ts). */
+export const OPENCODE_GO_MESSAGES_MODEL_IDS: readonly string[] = [
+  'deepseek-v4-pro-go',
+  'claude-haiku-5-5-go',
+  'kimi-k3-go',
+  'minimax-m2.7-go',
+  'minimax-m3-go',
+  'space-bunny-go',
+  'qwen3.8-max-go',
+  'qwen3.8-flash-go',
+  'qwen3.7-plus-go',
+]
+
 /** OpenCode Go 当前模型 + 历史 transport 集。DeepSeek 使用独立平台 alias，避免覆盖 direct
  *  provider；Qwen3.7 保留历史 plumbing 但由 DB catalog 下线。 */
 export function isOpencodeGoModel(model: string): boolean {
   const m = model.trim().toLowerCase()
-  return m === 'deepseek-v4-flash-opencode-go' || m === 'qwen3.7-max' || m === 'qwen3.7-plus' || m === 'gemini-4-argon-contributor'
+  return (
+    m === 'deepseek-v4-flash-opencode-go' ||
+    m === 'qwen3.7-max' ||
+    m === 'qwen3.7-plus' ||
+    m === 'gemini-4-argon-contributor' ||
+    OPENCODE_GO_MESSAGES_MODEL_IDS.includes(m)
+  )
+}
+
+/** Claude Haiku via OpenCode Go rejects `thinking:{enabled,budget}` (400, OCV5-425 probe);
+ *  it thinks through `output_config.effort` instead. */
+export function isOpencodeGoNoThinkingModel(model: string): boolean {
+  return model.trim().toLowerCase() === 'claude-haiku-5-5-go'
 }
 
 /** 只识别 OpenCode Go 的历史 Qwen 子集。 */
@@ -176,6 +202,21 @@ export const STATIC_MODEL_CONTEXT_WINDOW: ReadonlyArray<{
   },
   { matches: (m) => m.trim().toLowerCase() === 'glm-5.1', contextWindow: 200_000 },
   { matches: isZaiGlm53Model, contextWindow: 1_000_000 },
+  // OCV5-425: catalog windows (https://models.dev opencode-go), capped below the next OpenCode
+  // Go price tier so one per-token price is exact (Haiku 100K; MiniMax M3 / Qwen3.7 Plus 200K).
+  // Must stay before the 1M OpenCode Go default below.
+  ...Object.entries({
+    'claude-haiku-5-5-go': 100_000,
+    'minimax-m3-go': 200_000,
+    'qwen3.7-plus-go': 200_000,
+    'minimax-m2.7-go': 204_800,
+    'qwen3.8-max-go': 262_144,
+    'kimi-k3-go': 1_048_576,
+    'space-bunny-go': 1_048_576,
+  }).map(([id, contextWindow]) => ({
+    matches: (m: string) => m.trim().toLowerCase() === id,
+    contextWindow,
+  })),
   // DeepSeek alias 与历史 qwen3.7 均为 1M；direct DeepSeek 由上面的精确表独立处理。
   { matches: isOpencodeGoModel, contextWindow: 1_000_000 },
   // kimi-k2.7-code 官方规格 256K(火山 Agent Plan 托管,max output 上游硬顶 32768)。

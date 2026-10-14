@@ -114,6 +114,14 @@ export interface StaticKeyProviderSpec {
    */
   readonly allowedOutputConfigEfforts?: readonly string[]
   /**
+   * Model-scoped effort allowlist, keyed by lowercase **upstream** model. A hit wins over
+   * `allowedOutputConfigEfforts` and over `output_config` in `stripBodyFields`: the proxy keeps
+   * only `output_config.effort` when it is in the list and drops the field otherwise. Models
+   * not listed keep the provider-wide rule. Used for OpenCode Go, where only some upstream
+   * models honour effort (OCV5-425 probes).
+   */
+  readonly modelOutputConfigEfforts?: Readonly<Record<string, readonly string[]>>
+  /**
    * 上游要求的「稳定会话 id」请求头名。声明后 master/egress 转发前必须带上
    * `<header>: <引擎原生 session id>`(取 `metadata.session_id` / `metadata.user_id` JSON 的
    * session_id;缺失时退化为每请求随机 UUID —— 只影响上游路由/缓存亲和,不影响正确性)。
@@ -123,6 +131,28 @@ export interface StaticKeyProviderSpec {
    * https://opencode.ai/docs/go/#where-can-i-use-it 一致。未声明 = 不注入(其它 provider 字节不变)。
    */
   readonly sessionIdHeader?: string
+}
+
+/**
+ * OCV5-425: OpenCode Go models reached over its Anthropic `/v1/messages` endpoint, catalog id →
+ * upstream id. The `-go` suffix keeps them apart from same-named models on other providers
+ * (kimi-k3 on Moonshot, qwen3.8-max on Bailian, deepseek-v4-pro on DeepSeek …). Prices follow
+ * https://opencode.ai/docs/go/ (scripts/ocv5-425). The picker lists them under「更多模型」.
+ */
+export const OPENCODE_GO_MESSAGES_MODELS: Readonly<Record<string, string>> = {
+  'deepseek-v4-pro-go': 'deepseek-v4-pro',
+  'claude-haiku-5-5-go': 'claude-haiku-5-5',
+  'kimi-k3-go': 'kimi-k3',
+  'minimax-m2.7-go': 'minimax-m2.7',
+  'minimax-m3-go': 'minimax-m3',
+  'space-bunny-go': 'space-bunny',
+  'qwen3.8-max-go': 'qwen3.8-max',
+  'qwen3.8-flash-go': 'qwen3.8-flash',
+  'qwen3.7-plus-go': 'qwen3.7-plus',
+}
+
+function openCodeGoMessagesUpstream(modelId: string): string | undefined {
+  return OPENCODE_GO_MESSAGES_MODELS[modelId.toLowerCase()]
 }
 
 const DEEPSEEK: StaticKeyProviderSpec = {
@@ -136,7 +166,8 @@ const DEEPSEEK: StaticKeyProviderSpec = {
     return (
       modelId.startsWith('deepseek-') &&
       lower !== 'deepseek-v4-flash' &&
-      lower !== 'deepseek-v4-flash-opencode-go'
+      lower !== 'deepseek-v4-flash-opencode-go' &&
+      openCodeGoMessagesUpstream(modelId) === undefined
     )
   },
   inboundModelIds: ['deepseek-v4-pro'],
@@ -253,7 +284,8 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
       m === 'deepseek-v4-flash-opencode-go' ||
       m === 'qwen3.7-max' ||
       m === 'qwen3.7-plus' ||
-      m === 'gemini-4-argon-contributor'
+      m === 'gemini-4-argon-contributor' ||
+      openCodeGoMessagesUpstream(m) !== undefined
     )
   },
   inboundModelIds: [
@@ -262,6 +294,7 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
     'qwen3.7-max',
     'qwen3.7-plus',
     'gemini-4-argon-contributor',
+    ...Object.keys(OPENCODE_GO_MESSAGES_MODELS),
   ],
   canonicalizeForPricing(modelId) {
     const m = modelId.toLowerCase()
@@ -273,17 +306,31 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
           ? 'gemini-4-argon-contributor'
         : m === 'qwen3.7-plus'
           ? 'qwen3.7-plus'
-          : null
+          : openCodeGoMessagesUpstream(m) !== undefined
+            ? m
+            : null
   },
   upstreamModelForRequest(modelId) {
     const m = modelId.toLowerCase()
     return m === 'deepseek-v4-flash' || m === 'deepseek-v4-flash-opencode-go'
       ? 'deepseek-v4-flash'
-      : m === 'gemini-4-argon-contributor' ? m : modelId
+      : m === 'gemini-4-argon-contributor' ? m : (openCodeGoMessagesUpstream(m) ?? modelId)
   },
   stripHeaders: ['anthropic-beta'],
   // Go 的 Anthropic converter 接受 standard thinking/tool loop；firstParty-only 字段仍剥离。
   stripBodyFields: ['output_config', 'context_management', 'service_tier'],
+  // Probed 2026-10-15 (OCV5-425, g425/effort*.log): every /messages model returns 200 for any
+  // effort, but only these change their thinking. Gemini goes through the Google bridge
+  // (thinkingLevel; MINIMAL is rejected upstream). Claude Haiku: low/medium no thinking,
+  // high→max rising. Qwen3.8 Max: only low (~1.1K chars) vs high (~4.8K) is stable; medium
+  // behaves as low and max is inconsistent, so neither is offered. The rest (DeepSeek V4 Pro,
+  // Kimi K3, MiniMax, Space Bunny, Qwen3.8 Flash, Qwen3.7 Plus) show no stable effect and keep
+  // the provider-wide strip: no effort tiers.
+  modelOutputConfigEfforts: {
+    'gemini-4-argon-contributor': ['low', 'medium', 'high'],
+    'claude-haiku-5-5': ['low', 'medium', 'high', 'xhigh', 'max'],
+    'qwen3.8-max': ['low', 'high'],
+  },
   maxInputTokens: 1_000_000,
   // 红/蓝图像探针只消耗 reasoning、无可验证文本结果，按纯文本接入并启用 vision 工具兜底。
   supportsVision: false,
@@ -440,6 +487,25 @@ export function findRouteProviderForModel(modelId: string): StaticKeyProviderSpe
 
 export function getStaticProvider(id: StaticProviderId): StaticKeyProviderSpec {
   return BY_ID[id]
+}
+
+/**
+ * Efforts a static provider forwards for one upstream model: the model-scoped list when the
+ * spec has one, else the provider allowlist; `[]` when `output_config` is stripped; null when
+ * the provider puts no limit on it. Single source for the proxy ceiling, the proxy rewrite and
+ * `modelReasoningPolicy`.
+ */
+export function staticProviderOutputConfigEfforts(
+  spec: StaticKeyProviderSpec,
+  upstreamModel?: string,
+): readonly string[] | null {
+  const scoped =
+    upstreamModel === undefined
+      ? undefined
+      : spec.modelOutputConfigEfforts?.[upstreamModel.toLowerCase()]
+  if (scoped) return scoped
+  if (spec.allowedOutputConfigEfforts) return spec.allowedOutputConfigEfforts
+  return spec.stripBodyFields.includes('output_config') ? [] : null
 }
 
 /** gateway inbound 白名单：所有静态 provider 的精确字面量。 */
