@@ -1259,6 +1259,43 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(s.messages.filter((m) => m.role === "assistant")[0].text).toBe("Hello");
   });
 
+  test("INC-20261015-LIVE-FENCE-TRIM-REPLAY: a long answer replayed after a cursor reset is not appended twice", () => {
+    const s = sess();
+    const frames = Array.from({ length: 1025 }, (_, i) => msgFrame({
+      frameSeq: i + 1,
+      blocks: [{ kind: "text", text: "A", messageId: "srv-1" }],
+    }));
+    for (const frame of frames) applyOutboundMessage(s, frame);
+    const row = s.messages.find((m) => m.id === "srv-1")!;
+    expect(row.text).toHaveLength(1025);
+    resetFrameSeqCursor(s, { sessionKey: "agent:main:webchat:dm:s1" });
+    s._streamingAssistant = null;
+    for (const frame of frames) applyOutboundMessage(s, frame);
+    expect(row.text).toHaveLength(1025);
+
+    applyOutboundMessage(s, msgFrame({ frameSeq: 1026, blocks: [{ kind: "text", text: "B", messageId: "srv-1" }] }));
+    expect(row.text).toBe("A".repeat(1025) + "B");
+    // The fence stays compact: older seqs fold into one range instead of 1026 keys.
+    expect(Object.keys(row._appliedFrameSeqs ?? {}).length).toBeLessThanOrEqual(1024);
+    expect(row._appliedFrameSeqRanges?.length).toBe(1);
+  });
+
+  test("the folded frame fence keeps gaps that belong to other rows", () => {
+    const s = sess();
+    // Odd seqs go to the answer; even seqs belong to other rows and must stay unapplied for it.
+    for (let seq = 1; seq <= 2101; seq += 2) {
+      applyOutboundMessage(s, msgFrame({ frameSeq: seq, blocks: [{ kind: "text", text: "a", messageId: "srv-1" }] }));
+    }
+    const row = s.messages.find((m) => m.id === "srv-1")!;
+    expect(row.text).toHaveLength(1051);
+    resetFrameSeqCursor(s, { sessionKey: "agent:main:webchat:dm:s1" });
+    s._streamingAssistant = null;
+    applyOutboundMessage(s, msgFrame({ frameSeq: 3, blocks: [{ kind: "text", text: "a", messageId: "srv-1" }] }));
+    expect(row.text).toHaveLength(1051);
+    applyOutboundMessage(s, msgFrame({ frameSeq: 4, blocks: [{ kind: "text", text: "b", messageId: "srv-1" }] }));
+    expect(row.text).toHaveLength(1052);
+  });
+
   test("incomplete tape row with same messageId still accepts later live frames and does not double replay", () => {
     const s = sess();
     s._activeClientMessageId = "m-recover";

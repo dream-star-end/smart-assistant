@@ -733,12 +733,38 @@ function isFrozenLiveTarget(message: ChatMessage): boolean {
 
 function frameSeqAlreadyApplied(message: ChatMessage, frameSeq?: number): boolean {
   if (!(typeof frameSeq === "number" && Number.isSafeInteger(frameSeq) && frameSeq > 0)) return false;
-  return message._appliedFrameSeqs?.[frameSeq] === true;
+  if (message._appliedFrameSeqs?.[frameSeq] === true) return true;
+  const ranges = message._appliedFrameSeqRanges;
+  if (!ranges) return false;
+  let lo = 0, hi = ranges.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const [from, to] = ranges[mid];
+    if (frameSeq < from) hi = mid - 1;
+    else if (frameSeq > to) lo = mid + 1;
+    else return true;
+  }
+  return false;
 }
 
-/** Per-row replay fence size. Replays only re-deliver recent frames, while a long answer adds one
- * key per delta and the row is persisted with it (OCV5-421: 10k+ keys cloned on every save). */
+/** Per-row replay fence: the newest keys stay in `_appliedFrameSeqs`. A long answer adds one key per
+ * delta and the row is persisted with it (OCV5-421: 10k+ keys cloned on every save), so older keys
+ * are folded into closed ranges instead of being dropped. A journal hydrate resets the session cursor
+ * and replays from the start of the turn, so the fence must stay lossless. */
 const APPLIED_FRAME_SEQ_KEEP = 512;
+
+function foldFrameSeqRanges(ranges: ReadonlyArray<readonly [number, number]>, seqs: number[]): Array<[number, number]> {
+  const all: Array<[number, number]> = ranges.map(([from, to]) => [from, to]);
+  for (const seq of seqs) all.push([seq, seq]);
+  all.sort((a, b) => a[0] - b[0]);
+  const out: Array<[number, number]> = [];
+  for (const [from, to] of all) {
+    const last = out[out.length - 1];
+    if (last && from <= last[1] + 1) last[1] = Math.max(last[1], to);
+    else out.push([from, to]);
+  }
+  return out;
+}
 
 function noteAppliedFrameSeq(message: ChatMessage, frameSeq?: number): void {
   if (!(typeof frameSeq === "number" && Number.isSafeInteger(frameSeq) && frameSeq > 0)) return;
@@ -746,9 +772,14 @@ function noteAppliedFrameSeq(message: ChatMessage, frameSeq?: number): void {
   message._appliedFrameSeqs[frameSeq] = true;
   const keys = Object.keys(message._appliedFrameSeqs);
   if (keys.length > APPLIED_FRAME_SEQ_KEEP * 2) {
-    // Integer keys iterate ascending: keep the newest half.
+    // Integer keys iterate ascending: keep the newest half as keys, fold the rest into ranges.
+    const cut = keys.length - APPLIED_FRAME_SEQ_KEEP;
+    message._appliedFrameSeqRanges = foldFrameSeqRanges(
+      message._appliedFrameSeqRanges ?? [],
+      keys.slice(0, cut).map(Number),
+    );
     const kept: Record<number, true> = {};
-    for (const key of keys.slice(-APPLIED_FRAME_SEQ_KEEP)) kept[Number(key)] = true;
+    for (const key of keys.slice(cut)) kept[Number(key)] = true;
     message._appliedFrameSeqs = kept;
   }
 }
