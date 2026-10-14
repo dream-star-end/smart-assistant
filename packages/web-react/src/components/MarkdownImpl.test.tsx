@@ -2,6 +2,7 @@ import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, test } from 'vitest'
 import MarkdownImpl from './MarkdownImpl'
+import { cachedCodeLanguage } from '../lib/codeLanguageDetect'
 
 afterEach(cleanup)
 
@@ -371,6 +372,27 @@ describe('MarkdownImpl 代码高亮(OCV5-421)', () => {
     await waitFor(() => expect(code().className).toContain('language-python'), { timeout: 10_000 })
     expect(container.querySelector('pre .hljs-keyword')).not.toBeNull()
     expect(code().textContent).toContain(`handler_${unique}_49`)
+  })
+
+  // OCV5-422: 代码块后面紧跟表格时,它一直在流式尾段里(表格行不是切段点),以前要等生成结束才开始探测。
+  test('流式尾段里已写完的大块无标注代码在后台预先探测;生成结束那次渲染直接上色', async () => {
+    const unique = Math.random().toString(36).slice(2).replace(/[0-9]/g, 'y')
+    const body = Array.from({ length: 50 }, (_, i) => `def fetch_${unique}_${i}(url):\n    return [line for line in open(url) if line]`).join('\n')
+    const text = `\`\`\`\n${body}\n\`\`\`\n\n| 项 | 值 |\n|---|---|\n| a | 1 |`
+    const live = render(<MarkdownImpl live autoDetectCode={false}>{text}</MarkdownImpl>)
+    expect(live.container.querySelector('pre code > span')!.className).not.toContain('hljs')
+    await waitFor(() => expect(cachedCodeLanguage(`${body}\n`)).toBe('python'), { timeout: 10_000 })
+    expect(live.container.querySelector('pre code > span')!.className).not.toContain('hljs') // 预取不改流式中的渲染
+    live.rerender(<MarkdownImpl>{text}</MarkdownImpl>)
+    expect(live.container.querySelector('pre code > span')!.className).toContain('language-python') // 同一次渲染即上色
+  })
+
+  test('流式尾段以代码块结尾(可能还没闭合)时不预取探测', async () => {
+    const unique = Math.random().toString(36).slice(2).replace(/[0-9]/g, 'z')
+    const body = Array.from({ length: 50 }, (_, i) => `def open_${unique}_${i}(url):\n    return [line for line in open(url) if line]`).join('\n')
+    render(<MarkdownImpl live autoDetectCode={false}>{`说明：\n\n\`\`\`\n${body}`}</MarkdownImpl>)
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    expect(cachedCodeLanguage(`${body}\n`)).toBeUndefined()
   })
 
   test('流式中未闭合的 $$ 不渲染半截公式,显示「公式生成中…」', () => {

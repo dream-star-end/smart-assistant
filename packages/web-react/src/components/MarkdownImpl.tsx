@@ -357,6 +357,9 @@ export default function MarkdownImpl({
     });
   }, []);
   const knownLanguage = useCallback((text: string) => detectedRef.current.get(text), []);
+  const prefetchDetect = useCallback((text: string) => {
+    void detectCodeLanguageLater(text);
+  }, []);
   // Intelligent UI 开关:关闭(或服务端总开关关闭)时把 ```ui 围栏整段换成等价 Markdown 再渲染。
   const iuiEnabled = useIntelligentUiEnabled();
   // components 里的渲染器是「组件类型」:每次渲染都造新函数 = React 视为新类型 → 富块子树
@@ -504,7 +507,13 @@ export default function MarkdownImpl({
         rehypePlugins={[
           rehypeBareBreaks,
           // detect=false 时没标语言的块不做同步语言探测（大文件预览防卡死，见 MarkdownProps.autoDetectCode）。
-          [rehypeHighlightShared, { detect: autoDetectCode, onPendingDetect, knownLanguage }],
+          [rehypeHighlightShared, {
+            detect: autoDetectCode,
+            onPendingDetect,
+            knownLanguage,
+            // 只在流式尾段预取(项目文件预览等主动关探测的场景不探测)。
+            prefetchDetect: live && !autoDetectCode ? prefetchDetect : undefined,
+          }],
           // 数学公式：$..$ / $$..$$ → KaTeX 渲染(remarkMath 解析 + rehypeKatex 出 HTML)。
           // errorColor 跟随主题 token(KaTeX 默认 #cc0000 在暗色底上对比度不足)。
           [rehypeKatex, { strict: false, throwOnError: false, errorColor: "var(--danger)" }],
@@ -551,6 +560,11 @@ type HighlightOptions = {
   onPendingDetect?: (text: string) => void;
   /** 调用方已拿到的探测结论(优先于全局缓存)。 */
   knownLanguage?: (text: string) => string | null | undefined;
+  /**
+   * 不探测时(流式尾段)仍为已写完的大块无标注代码提前在后台探测,只进缓存、不改本次渲染;生成结束那一次渲染
+   * 直接命中缓存上色。尾段最后一个节点可能是还没闭合的围栏,不预取。
+   */
+  prefetchDetect?: (text: string) => void;
 };
 
 /**
@@ -560,8 +574,20 @@ type HighlightOptions = {
  * 大块且还没探测过 → 本次按不探测渲染(与流式尾段相同的纯文本代码块),交给 onPendingDetect 分片探测,结果出来后
  * 调用方重渲一次上色。attacher 每次渲染都会被调用(react-markdown 每次重建处理器),所以回调按本次渲染闭包。
  */
-function rehypeHighlightShared({ detect = false, onPendingDetect, knownLanguage }: HighlightOptions = {}) {
+function rehypeHighlightShared({ detect = false, onPendingDetect, knownLanguage, prefetchDetect }: HighlightOptions = {}) {
   const base = sharedHighlight({ detect: false });
+  if (!detect && prefetchDetect) {
+    return (tree: Parameters<typeof base>[0], file: Parameters<typeof base>[1]) => {
+      const root = tree as unknown as HastNode;
+      const tail = lastTextNode(root);
+      for (const node of unlabelledCodeBlocks(root)) {
+        if (tail && containsNode(node, tail)) continue; // 正文以它结尾:可能还没闭合
+        const text = hastText(node);
+        if (text.length > SYNC_DETECT_MAX_CHARS && cachedCodeLanguage(text) === undefined) prefetchDetect(text);
+      }
+      base(tree, file);
+    };
+  }
   if (!detect) return base;
   return (tree: Parameters<typeof base>[0], file: Parameters<typeof base>[1]) => {
     const blocks = unlabelledCodeBlocks(tree as unknown as HastNode).map((node) => {
@@ -584,6 +610,21 @@ function rehypeHighlightShared({ detect = false, onPendingDetect, knownLanguage 
       };
     }
   };
+}
+
+/** 文档顺序上最后一个非空白文本节点。 */
+function lastTextNode(node: HastNode): HastNode | null {
+  if (node.type === "text") return (node.value ?? "").trim() ? node : null;
+  const children = node.children ?? [];
+  for (let i = children.length - 1; i >= 0; i--) {
+    const found = lastTextNode(children[i]!);
+    if (found) return found;
+  }
+  return null;
+}
+
+function containsNode(root: HastNode, target: HastNode): boolean {
+  return root === target || (root.children ?? []).some((child) => containsNode(child, target));
 }
 
 function codeClassNames(node: HastNode): unknown[] | null {
