@@ -54,7 +54,7 @@ describe("PoolsPage 手机宽度", () => {
   });
   afterEach(cleanup);
 
-  test("状态徽标、类型和恢复时间不换行,长名称可断行", async () => {
+  test("状态徽标、类型、名称和恢复时间都不换行(表格横向滚动)", async () => {
     render(wrap(<PoolsPage />));
     for (const text of ["可调度", "认证失效·自动探测", "管理员停用"]) {
       const chips = await screen.findAllByText(text, { selector: "span.rounded-full" });
@@ -63,6 +63,10 @@ describe("PoolsPage 手机宽度", () => {
     }
     for (const el of screen.getAllByText("订阅账号")) expect(el.className).toContain("whitespace-nowrap");
     expect(screen.getByText(/小时 .* 分后/).className).toContain("whitespace-nowrap");
-    for (const el of screen.getAllByText("someone-with-a-long-name@example.com")) expect(el.className).toContain("break-all");
+    for (const el of screen.getAllByText("someone-with-a-long-name@example.com")) {
+      // break-all 会让名称列被压到两三个字符宽、邮箱逐字断行(#736 上线后实测),名称必须整行显示。
+      expect(el.className).toContain("whitespace-nowrap");
+      expect(el.className).not.toContain("break-all");
+    }
   });
 });

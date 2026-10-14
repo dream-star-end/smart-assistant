@@ -146,7 +146,7 @@ function PolicyNote({ policy }: { policy: PoolsResponse["policy"] }) {
   );
 }
 
-// 手机宽度下表格列被压窄,徽标必须不换行,否则会一字一行。
+// 手机宽度下表格列会被压窄:徽标、名称都不换行(否则一字一行),表格在卡片内横向滚动。
 function StatusChip({ m }: { m: PoolMember }) {
   if (m.status === "active") {
     return (
@@ -192,8 +192,8 @@ function PoolSection({
       title: "名称",
       render: (m) => (
         <div className="flex flex-col">
-          <span className="break-all font-medium">{m.label || `#${m.id}`}</span>
-          <span className="font-mono text-[11.5px] text-faint">
+          <span className="whitespace-nowrap font-medium">{m.label || `#${m.id}`}</span>
+          <span className="whitespace-nowrap font-mono text-[11.5px] text-faint">
             {[m.hints.plan, m.hints.key, m.hints.source === "env" ? "来自环境变量" : null].filter(Boolean).join(" · ") || `#${m.id}`}
           </span>
         </div>
