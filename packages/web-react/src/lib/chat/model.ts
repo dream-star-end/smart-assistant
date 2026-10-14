@@ -353,6 +353,8 @@ export type ChatMessage = {
    * concatenate the same incremental chunks twice. Runtime-only.
    */
   _appliedFrameSeqs?: Record<number, true>;
+  /** Older applied frameSeqs folded into sorted, disjoint, inclusive ranges (same fence, compact). */
+  _appliedFrameSeqRanges?: Array<[number, number]>;
   /** hydration 的 complete-anchor 分支盖章：该 tape 已完整原子落库（同步权威传播的作证前提）。 */
   _turnTapeComplete?: boolean;
   /** 该行在同一 lossless turn tape 内的持久 record ordinal。多个展开行共享 `_orderSeq`，
