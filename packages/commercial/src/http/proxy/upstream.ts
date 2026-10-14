@@ -466,6 +466,11 @@ export interface PickUpstreamDeps {
    * 未注入或池为空 → 用 staticProviderKeys 的 env key(旧行为)。
    */
   selectApiKey?: (service: string, stickyKey: string) => Promise<SelectedApiKey | null>;
+  /**
+   * OCV5-424:该服务池是否已有成员(任何状态)。有成员时池是权威:选不到可用 key(全部
+   * 冷却 / 管理员停用)就返回 pool_unavailable,不回落 env key。
+   */
+  apiKeyPoolHasMembers?: (service: string) => boolean;
   /** OAuth 上游 URL 覆盖;undefined → DEFAULT_UPSTREAM_ENDPOINT。测试 seam。 */
   upstreamEndpoint?: string;
   /**
@@ -997,6 +1002,16 @@ export async function pickUpstream(
       } catch (err) {
         log.warn("proxy_api_key_pool_select_failed", { provider: route.provider.id, err: errSummary(err) });
       }
+    }
+    if (!pooled && deps.selectApiKey && deps.apiKeyPoolHasMembers?.(route.provider.id) === true) {
+      // 池里有成员但都不可用:env key 也已导入为池成员,回落它会绕过管理员停用与冷却。
+      return {
+        ok: false,
+        error: {
+          kind: "pool_unavailable",
+          err: new AccountPoolUnavailableError(`no usable API key in the ${route.provider.id} pool`),
+        },
+      };
     }
     const apiKey = pooled?.apiKey ?? deps.staticProviderKeys?.[route.provider.id] ?? "";
     // upstreamModel:catalog 有 hint → upstream_model_id ?? model_id;无 hint(legacy 路径)

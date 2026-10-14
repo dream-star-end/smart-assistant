@@ -103,8 +103,13 @@ async function rows(): Promise<SecretRow[]> {
   }
 }
 
+/**
+ * Mark the snapshot stale so the next selection re-reads the table. The rows are
+ * kept: the sync config gate (`apiKeyPoolConfiguredServices`) must not see an empty
+ * pool just because one member changed state.
+ */
 export function invalidateApiKeyPoolCache(): void {
-  snapshot = null
+  if (snapshot) snapshot = { at: 0, rows: snapshot.rows }
 }
 
 /**
@@ -116,6 +121,15 @@ export function apiKeyPoolConfiguredServices(): ReadonlySet<string> {
   const out = new Set<string>()
   for (const r of snapshot?.rows ?? []) if (r.status !== 'disabled') out.add(r.service)
   return out
+}
+
+/**
+ * True when the pool holds any member for `service` (any status) in the last
+ * snapshot. When it does, the pool is the authority: callers must not fall back to
+ * the raw env key, which would bypass admin disables and cooldowns.
+ */
+export function apiKeyPoolHasMembers(service: string): boolean {
+  return (snapshot?.rows ?? []).some((r) => r.service === service)
 }
 
 /** Load the snapshot now (boot); throws if the DB is unreachable. */
@@ -185,7 +199,15 @@ export async function selectApiKey(
 /** Report what happened to a request made with this member. Never throws. */
 export async function reportApiKeyOutcome(memberId: string, outcome: PoolOutcome): Promise<void> {
   try {
-    if (await applyTableMemberOutcome(API_KEY_MEMBERS, memberId, outcome)) invalidateApiKeyPoolCache()
+    // A provider 5xx says nothing about this key (every key of the provider gets it), and
+    // most services hold a single key: counting it as a strike would cool the only key
+    // and turn a provider blip into a 10-minute outage. Visible, not a strike (same rule
+    // as the Grok relay). 429 / 401 / quota stay key-specific.
+    const effective: PoolOutcome =
+      outcome.kind === 'upstream_error' && /^http_5\d\d$/.test(outcome.detail ?? '')
+        ? { kind: 'network', detail: outcome.detail }
+        : outcome
+    if (await applyTableMemberOutcome(API_KEY_MEMBERS, memberId, effective)) invalidateApiKeyPoolCache()
   } catch (err) {
     // eslint-disable-next-line no-console -- reporting must never break the request path
     console.warn('[apiKeyPool] report failed:', (err as Error)?.message ?? err)

@@ -23,7 +23,7 @@
  * 不下沉到 shared.ts(plan v3 Codex 反馈,见 §4 修订 H)。
  */
 
-import { apiKeyPoolConfiguredServices, selectApiKey } from "../../account-pool/apiKeyPool.js";
+import { apiKeyPoolConfiguredServices, apiKeyPoolHasMembers, selectApiKey } from "../../account-pool/apiKeyPool.js";
 import { rootLogger } from "../../logging/logger.js";
 import { ensureRequestId, setSecurityHeaders } from "../util.js";
 import {
@@ -1373,6 +1373,7 @@ export function makeAnthropicProxyHandler(
           refreshDeps: deps.refreshDeps,
           staticProviderKeys: deps.staticProviderKeys,
           selectApiKey: deps.apiKeyPoolEnabled ? (service, sticky) => selectApiKey(service, sticky) : undefined,
+          apiKeyPoolHasMembers: deps.apiKeyPoolEnabled ? apiKeyPoolHasMembers : undefined,
           upstreamEndpoint: deps.upstreamEndpoint,
           // Phase 6 account_uuid 锚定 flag(plan §3.0)— v1.0.207 起从 system_settings
           // 表读取的 getter,handler 透传给 pickUpstream;入口 await 一次冻结到

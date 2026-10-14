@@ -21,6 +21,8 @@ import { KMS_KEY_BYTES } from "../crypto/keys.js";
 import { createAccount, getAccount, readAccountRecoveryHint, updateAccount } from "../account-pool/store.js";
 import { AccountHealthTracker, InMemoryHealthRedis } from "../account-pool/health.js";
 import {
+  apiKeyPoolConfiguredServices,
+  apiKeyPoolHasMembers,
   createApiKeyPoolAdapter,
   importEnvApiKeys,
   invalidateApiKeyPoolCache,
@@ -249,6 +251,21 @@ describe("API-key pools (pool_api_keys)", () => {
     assert.notEqual(second.memberId, firstPick.memberId);
     assert.ok([k1.id, k2.id].includes(second.memberId));
     assert.equal(await selectApiKey("bailian", "session-x", keyFn), null);
+  });
+
+  test("a provider 5xx is not a key strike; marking the cache stale keeps the service configured", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const k = await upsertApiKey({ service: "ark", apiKey: "ark-key-only-one-9999", source: "admin", keyFn });
+    invalidateApiKeyPoolCache();
+    assert.ok(await selectApiKey("ark", "s", keyFn));
+    for (let i = 0; i < 5; i += 1) await reportApiKeyOutcome(k.id, { kind: "upstream_error", detail: "http_503" });
+    const [m] = await listApiKeyMembers();
+    assert.equal(m.status, "active", "five provider 5xx must not cool the only key");
+    // A key-specific 429 cools it; the cache is marked stale but the service stays configured.
+    await reportApiKeyOutcome(k.id, { kind: "rate_limited", retryAfterMs: 60_000 });
+    assert.equal(apiKeyPoolConfiguredServices().has("ark"), true);
+    assert.equal(apiKeyPoolHasMembers("ark"), true);
+    assert.equal(await selectApiKey("ark", "s", keyFn), null, "the cooling key is not selected");
   });
 
   test("API-key cooldowns recover through the shared adapter", async (t) => {
