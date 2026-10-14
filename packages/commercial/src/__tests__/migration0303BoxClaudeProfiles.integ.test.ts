@@ -107,7 +107,8 @@ describe("0303 box_claude_profiles", () => {
   test("the rollback block removes the table and its ledger row, and the migration applies again", { timeout: 240000 }, async (t) => {
     if (db.skipIfUnavailable(t)) return;
     await resetAndMigrateBefore("0303");
-    assert.deepEqual((await runMigrations()).applied, ["0303_box_claude_profiles"]);
+    // 0304 (billing workload columns, OCV5-392) follows 0303 in the chain.
+    assert.deepEqual((await runMigrations()).applied, ["0303_box_claude_profiles", "0304_billing_workload_column"]);
     await query(await rollbackBlock());
     assert.equal((await query("SELECT to_regclass('public.box_claude_profiles') AS t")).rows[0]!.t, null);
     assert.equal((await query("SELECT 1 FROM schema_migrations WHERE version='0303_box_claude_profiles'")).rowCount, 0);
