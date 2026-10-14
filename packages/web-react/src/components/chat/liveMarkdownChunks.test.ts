@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { hasMarkdownDefinitions, splitLiveMarkdown } from "./liveMarkdownChunks";
+import { hasMarkdownDefinitions, hasStatefulBlock, splitLiveMarkdown } from "./liveMarkdownChunks";
 
 const para = (n: number) => `段落 ${n}：${"这是正文内容。".repeat(30)}`;
 const join = (parts: string[]) => parts.join("");
@@ -107,5 +107,21 @@ describe("splitLiveMarkdown (OCV5-421)", () => {
       expect((p.match(/\\\[/g) ?? []).length).toBe((p.match(/\\\]/g) ?? []).length);
     }
     expect(parts.join("")).toBe(text);
+  });
+  // Codex r2: a code span may continue over several lines of one paragraph.
+  test("$$ inside a multi-line inline code span does not open display math", () => {
+    const math = "$$\na=1+2+3+4\n\nb=2\n$$";
+    const text = `\`a\nb $$\` 是行内代码\n\n${"x".repeat(1190)}\n\n${math}\n\n${"y".repeat(1280)}\n\n${para(2)}`;
+    const parts = splitLiveMarkdown(text);
+    expect(parts.join("")).toBe(text);
+    // the formula is never split across chunks
+    expect(parts.some((p) => p.includes(math))).toBe(true);
+  });
+
+  test("hasStatefulBlock spots option / ui / html fences only", () => {
+    expect(hasStatefulBlock("前文\n\n```options\n{}\n```")).toBe(true);
+    expect(hasStatefulBlock("```UI\n{}\n```")).toBe(true);
+    expect(hasStatefulBlock("```htmlpreview\n<p>x</p>\n```")).toBe(true);
+    expect(hasStatefulBlock("```python\nprint(1)\n```")).toBe(false);
   });
 });

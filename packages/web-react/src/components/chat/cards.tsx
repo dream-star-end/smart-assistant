@@ -58,7 +58,7 @@ import { reportClientFriction, reportClientFrictionOnce } from "../../lib/client
 import { cn, groupDigits } from "../../lib/utils";
 import { useUiPlainText } from "../iui/plainText";
 import { Markdown } from "../Markdown";
-import { hasMarkdownDefinitions, splitLiveMarkdown } from "./liveMarkdownChunks";
+import { hasMarkdownDefinitions, hasStatefulBlock, splitLiveMarkdown } from "./liveMarkdownChunks";
 import { OptionsGroupFooter, OptionsGroupProvider } from "../optionsGroup";
 import {
   Alert,
@@ -860,8 +860,13 @@ export function ProgressiveMarkdown({
   const primary = text.slice(0, primaryEnd);
   let primaryView: React.ReactNode;
   if (streamed) {
-    // 脚注 / 引用定义要整篇解析:生成结束后合回单次渲染。沿用首段的 key,首段已挂载的内容不重挂。
-    const chunks = !live && hasMarkdownDefinitions(primary) ? [primary] : splitLiveMarkdown(primary);
+    // 脚注 / 引用定义要整篇解析:生成结束后合回单次渲染(沿用首段 key,首段内容不重挂)。但首段之后
+    // 若有选项卡 / 智能 UI / HTML 预览这类带状态的块,合并会把它们重挂、清掉用户的选择 —— 那就保持
+    // 分段(脚注在重新打开会话时按整篇解析)。
+    const live0 = splitLiveMarkdown(primary);
+    const mergeForDefinitions = !live && live0.length > 1 && hasMarkdownDefinitions(primary)
+      && !hasStatefulBlock(primary.slice(live0[0].length));
+    const chunks = mergeForDefinitions ? [primary] : live0;
     let offset = 0;
     primaryView = (
       <div className="prose">
