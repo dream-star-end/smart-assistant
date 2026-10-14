@@ -129,16 +129,29 @@ ar_launch_action() { # <restore|probe-only>
 }
 
 # 批准开工(backlog→ready,agent 可做);bug 首站是 AI 巡检站,PatrolEngine 会派给 AI。失败下 tick 重试。
+ar_ticket_state() { # <ticket> → "status version"(读不到则空)
+  task_cli "$AR_TASK_UID" ticket get "$1" 2>/dev/null \
+    | jq -r '"\(.ticket.status // "") \(.ticket.version // "")"' 2>/dev/null || true
+}
+
 ar_approve() { # <ticket> [version]
-  local tid="$1" ver="${2:-}"
+  local tid="$1" ver="${2:-}" st=""
   if [[ -z "$ver" ]]; then
-    ver="$(task_cli "$AR_TASK_UID" ticket get "$tid" 2>/dev/null | jq -r '.ticket.version // empty' 2>/dev/null || true)"
+    read -r st ver <<<"$(ar_ticket_state "$tid")"
+    # 已不在待立项(上次批准其实成功但响应丢了、已被 AI 认领、已关单)→ 视为已批准。
+    if [[ -n "$st" && "$st" != backlog ]]; then
+      ar_set approved 1; ar_log "$tid 已是 $st,视为已批准"; return 0
+    fi
   fi
   [[ -n "$ver" ]] || { ar_log "批准 $tid:读不到版本,下 tick 重试"; return 1; }
   if task_cli "$AR_TASK_UID" ticket approve "$tid" --expected-version "$ver" --owner "agent:$AR_ACTOR" >/dev/null 2>&1; then
     ar_set approved 1
     ar_log "已批准开工 $tid"
     return 0
+  fi
+  read -r st _ <<<"$(ar_ticket_state "$tid")"
+  if [[ -n "$st" && "$st" != backlog ]]; then
+    ar_set approved 1; ar_log "$tid 批准返回失败但已是 $st,视为已批准"; return 0
   fi
   ar_log "批准 $tid 失败,下 tick 重试"
   return 1

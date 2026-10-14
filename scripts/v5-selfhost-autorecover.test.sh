@@ -73,7 +73,8 @@ task_cli() {
     'ticket create') [[ -f "$C/create.fail" ]] && { echo 'gateway down' >&2; return 3; }
       echo '{"ok":true,"ticket":{"identifier":"OCV5-900","version":1}}' ;;
     'ticket approve') [[ -f "$C/approve.fail" ]] && { echo 'gateway down' >&2; return 3; }; echo '{"ok":true}' ;;
-    'ticket get') echo '{"ok":true,"ticket":{"identifier":"OCV5-900","version":2}}' ;;
+    'ticket get') if [[ -f "$C/get.ready" ]]; then echo '{"ok":true,"ticket":{"identifier":"OCV5-900","status":"ready","version":2}}'
+      else echo '{"ok":true,"ticket":{"identifier":"OCV5-900","status":"backlog","version":2}}'; fi ;;
     *) echo '{"ok":true}' ;;
   esac
 }
@@ -193,6 +194,12 @@ if [[ "$kept1" == y && "$tk" == OCV5-900 && "$ap" == 1 && "$closed" == y ]] && g
   && grep -q 'rerun-budget' "$C/task.calls"; then
   ok "A17 incident is kept until the escalation ticket is created and approved, then closed with a note that releases stay stopped"
 else bad "A17 kept1=$kept1 tk=$tk ap=$ap closed=$closed"; fi
+
+# ── Codex r2:批准其实已成功(响应丢失)→ 读到非 backlog 即视为已批准,事件能结束 ──
+setup a18; printf 'reason=x\n' >"$C/watch/watch-disarmed"; echo 1 >"$C/watch.rc"; touch "$C/approve.fail" "$C/get.ready"
+tick 1000; tick 1010; tick 2810; ap="$(inc approved)"
+echo 0 >"$C/watch.rc"; tick 3800; tick 3810; tick 3820
+[[ "$ap" == 1 && ! -f "$C/state/incident.env" ]] && ok "A18 approve lost-response (ticket already ready) counts as approved; incident closes" || bad "A18 ap=$ap inc=$(cat "$C/state/incident.env" 2>/dev/null)"
 
 setup a13; printf 'reason=x\n' >"$C/watch/watch-disarmed"; OC_V5_AUTORECOVER=off tick 1000
 [[ "$(calls)" == 0 && ! -f "$C/state/incident.env" ]] && ok "A13 OC_V5_AUTORECOVER=off → no-op" || bad "A13 calls=$(calls)"
