@@ -104,7 +104,8 @@ leader 每 60s：对每个注册池
 - 新表 `pool_api_keys(id, service, label, key_enc, key_nonce, fingerprint, base_url, egress_proxy_id, tier, weight, status, health_score, cooldown_until, cooldown_reason, backoff_level, next_probe_at, success_count, fail_count, last_error, last_used_at, source, disabled_by, created_at, updated_at)`，`unique(service, fingerprint)`。
 - 新表 `pool_events(id, service, member_kind, member_id, outcome, from_status, to_status, reason, until, at)`，保留 30 天（复用现有 sweeper 框架清理）。
 - **停用来源 `disabled_by`（admin|system）**：今后管理员路径（`admin/accounts.ts` PATCH、`health.manualDisable` 的 admin 调用）写 `admin`；策略层不再写 disabled。原 `refresh.ts disableOnFailure`、scheduler AEAD 隔离、`grokOAuth` 终态、`internalGrokRelay` 等系统路径改为 decide(auth_invalid / credential_corrupt) → cooldown。
-- **存量回填只看操作来源，不看错误文本**：`admin_audit`（永久保留）里该账号**最近一条带 status 的** `account.patch/create` 若为 `disabled` → `disabled_by='admin'`（不动）；否则（最近管理员动作是 active，或无记录）说明之后是系统改成 disabled → 转 `cooldown(reason=auth, next_probe_at=now)` 交探测判活。现网结果：仅 claude #23（`refresh 400`）转探测；其余 16 个 disabled（含 #22）均为管理员最后操作，保持 `admin` 停用。
+- **来源写入原子化**：管理员停用在**同一条 UPDATE** 里写 `status='disabled', disabled_by='admin'`（不依赖事后审计写入是否成功）；管理员启用清 `disabled_by`。
+- **存量不自动恢复**：现有 `disabled` 行无法可靠证明来源（admin_audit 为事后 best-effort 写入、告警 outbox 已清空），一律回填 `disabled_by='admin'` 保持停用，不转探测（含 claude #23）。是否把 #23 交给自动探测由用户作为管理员在后台一次性决定（后台“交给自动恢复”= 管理员启用后进入策略层，属于管理员意图）。今后系统路径不再写 disabled，因此不会再新增需人工处理的停用。
 
 ## 3. 各池适配器接入点（只改“上报 outcome + 调 select”，不改业务）
 | 池 | 选号接入 | outcome 上报 |
