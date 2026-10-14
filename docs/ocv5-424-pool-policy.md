@@ -85,6 +85,7 @@
   - 订阅池（claude/codex/grok/box）：`next_request` —— 429/认证失败只冷却该号，**同请求不换号重试**（保留 core.ts 反封号约束）；下一请求自然落到其他成员。
   - API key 池：`before_first_byte` —— 首字节前遇 429/5xx/401 立即换下一把 key 重试（最多 2 次）。
 - 并发槽沿用 scheduler 的进程内 slot + reaper。
+- **session pin 不被长冷却卡死**：`readAccountRecoveryHint` 把 `cooldown` 且（reason∈{auth,credential} 或剩余 > 30min）视为 `terminal`，走现有 self-heal：仅翻该 (user,session,account) 的 csap 为 unbound → 409 `force_repin` → 前端自动带 `x-force-repin:1` 重发 → 绑定池内其他成员。短冷却（≤30min 的 rate_limited/upstream）维持现状返回 Retry-After，不换号（反封号约束）。
 
 ### 1.4 recovery（唯一恢复者，取代 cooldownRecoveryActor 的多套逻辑）
 leader 每 60s：对每个注册池
@@ -98,11 +99,12 @@ leader 每 60s：对每个注册池
 - env 中的静态 key 启动时按指纹幂等导入为该服务池成员（source='env'），env 不再是唯一来源；gateway host 路径对 env 的读取保持不变（不在本票改）。
 
 ## 2. 数据（迁移 0305_pool_policy.sql，个人版独有号段，人工 apply + 登记 schema_migrations）
-- `claude_accounts`、`api_relay_credentials` 增：`cooldown_reason text`、`backoff_level smallint default 0`、`next_probe_at timestamptz`、`disabled_by text`（admin|legacy）。
+- `claude_accounts`、`api_relay_credentials` 增：`cooldown_reason text`、`backoff_level smallint default 0`、`next_probe_at timestamptz`、`disabled_by text`（仅 `admin`；NULL=非停用）。
 - `box_claude_profiles` 增：`cooldown_reason`、`backoff_level`（已有 cooldown_until/last_reason）。
 - 新表 `pool_api_keys(id, service, label, key_enc, key_nonce, fingerprint, base_url, egress_proxy_id, tier, weight, status, health_score, cooldown_until, cooldown_reason, backoff_level, next_probe_at, success_count, fail_count, last_error, last_used_at, source, disabled_by, created_at, updated_at)`，`unique(service, fingerprint)`。
 - 新表 `pool_events(id, service, member_kind, member_id, outcome, from_status, to_status, reason, until, at)`，保留 30 天（复用现有 sweeper 框架清理）。
-- **存量系统 disabled 的处理**：`status='disabled' AND last_error` 命中系统写入特征（`RefreshError`、`upstream returned 401`、`grok_http_4xx`、`aead`、`invalid_grant`）且 provider∈{claude,codex,grok} → `cooldown(reason=auth, next_probe_at=now)`，交给探测自动判活；其余 disabled 标 `disabled_by='legacy'`（视同管理员意图，不动）。现网命中：claude #22、#23，grok #10、#16。
+- **停用来源 `disabled_by`（admin|system）**：今后管理员路径（`admin/accounts.ts` PATCH、`health.manualDisable` 的 admin 调用）写 `admin`；策略层不再写 disabled。原 `refresh.ts disableOnFailure`、scheduler AEAD 隔离、`grokOAuth` 终态、`internalGrokRelay` 等系统路径改为 decide(auth_invalid / credential_corrupt) → cooldown。
+- **存量回填只看操作来源，不看错误文本**：`admin_audit`（永久保留）里该账号**最近一条带 status 的** `account.patch/create` 若为 `disabled` → `disabled_by='admin'`（不动）；否则（最近管理员动作是 active，或无记录）说明之后是系统改成 disabled → 转 `cooldown(reason=auth, next_probe_at=now)` 交探测判活。现网结果：仅 claude #23（`refresh 400`）转探测；其余 16 个 disabled（含 #22）均为管理员最后操作，保持 `admin` 停用。
 
 ## 3. 各池适配器接入点（只改“上报 outcome + 调 select”，不改业务）
 | 池 | 选号接入 | outcome 上报 |
@@ -111,7 +113,7 @@ leader 每 60s：对每个注册池
 | codex | 绑定 picker 用 policy.select（带健康/配额/冷却）；relay 凭证用同一 select | `internalCodexRelay.ts` 上游状态→outcome；usage_limit→quota |
 | grok | 已走 pick | `internalGrokRelay.ts` 401/402/403/429 改走 classify |
 | box | `boxProfileScheduler` 排序改用 policy.select（保留 default-first、利用率阈值作为资格过滤）；`cursorAccountSelection` 同 | `boxProfileHealth` bench → decide；`cursorExternal` 401 内存冷却改为持久 decide |
-| 静态 provider | `pickUpstream` static 分支改为 `pool.select(service)`，多 key + before_first_byte 切换 | core.ts 非 2xx → outcome；Moonshot quota circuit 归并为 quota_exhausted |
+| 静态 provider | `pickUpstream` static 分支改为 `pool.select(service)`，多 key + before_first_byte 切换；**配置权威同步改为池**：`validateUpstreamConfig()` 与启动 `assertPlatformDefaultModelConfigured()` 改问 `poolConfigured(service)`（env key 或池内存在非 admin 停用成员；池快照 30s 缓存，启动时先导入 env 成员再校验）；`staticProviderKeys` 仅作 env 导入源 | core.ts 非 2xx → outcome；Moonshot quota circuit 归并为 quota_exhausted |
 | gemini | 见 §6 待定 | — |
 
 `ReleaseResult` 扩展为携带 `outcome`（向后兼容：旧 kind 映射为 outcome）。
@@ -122,12 +124,12 @@ leader 每 60s：对每个注册池
 ## 5. 计费
 不改定价与扣费口径；claude API-key tier 与订阅号走同一 finalize/billing。canary 后对账：usage_records 与余额流水一致。
 
-## 6. 待用户确认（不阻塞 A–C）
-Gemini/Antigravity：现状 Antigravity 中继未实现（OCV5-415 P2，fail-closed）。纳管 Gemini key 后要真正“享受调度”需要实现 `/internal/v5/antigravity-relay`（转发 Gemini API、注入池中 key）。作为 Phase D。
+## 6. Gemini / Antigravity（用户 2026-10-14 决定：本票先建池，中继另开票）
+本票建 `gemini` 池（`pool_api_keys(service=gemini)`：后台可添加 key、健康/探测走共享策略，探测用 `GET /v1beta/models`）。Antigravity 中继 `/internal/v5/antigravity-relay` 另开票实现，届时其选 key 直接调用 `pool.select('gemini')`；本票不改 antigravity adapter（保持 fail-closed）。
 
 ## 7. 分期与验证
 - A：policy 层（outcome/decide/select/recovery/registry）+ 迁移 0305 + claude/grok/codex 订阅接入 + 消除系统 disabled。单测：decide 全表、select 分层/粘性/陈旧配额、recovery 探测退避；integ：0305 迁移、health 兼容。
 - B：pool_api_keys + 静态 provider 多 key + claude API-key tier + codex relay + box/cursor 接入。
 - C：管理后台「服务池」页 + API；浏览器用例。
-- D（待确认）：Gemini 池 + Antigravity 中继。
+- D：Gemini 池（中继另开票）。
 - 发布前：Codex 审查（≤3 轮）、托管 CI 绿、迁移人工 apply；发布后 cc2+Haiku 真聊 4 轮 + 扣费对账 + 后台前后截图。
