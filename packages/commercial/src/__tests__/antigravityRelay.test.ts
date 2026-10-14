@@ -370,6 +370,89 @@ describe('Antigravity relay handler', () => {
     assert.equal(captured.usage[0]?.promptTokens, 0)
   })
 
+  test('a generate 5xx cools only the route model, never the account (OCV5-415)', async () => {
+    const cases: Array<{
+      label: string
+      model: string
+      path: string
+      body: string
+      status: number
+      outcome: AntigravityPoolOutcome['kind']
+      modelOutcome: Array<[bigint, string, boolean]>
+    }> = [
+      {
+        label: 'GPT-OSS no capacity',
+        model: 'antigravity-gpt-oss-120b',
+        path: 'streamGenerateContent?alt=sse',
+        body: generateBody('gpt-oss-120b-medium'),
+        status: 503,
+        outcome: 'model_unavailable',
+        modelOutcome: [[7n, 'antigravity-gpt-oss-120b', false]],
+      },
+      {
+        label: 'title model 5xx is not the turn model',
+        model: 'antigravity-gpt-oss-120b',
+        path: 'streamGenerateContent?alt=sse',
+        body: generateBody('gemini-3.5-flash-lite', 'checkpoint'),
+        status: 500,
+        outcome: 'model_unavailable',
+        modelOutcome: [],
+      },
+      {
+        label: 'metadata 5xx stays account-level',
+        model: 'antigravity-gpt-oss-120b',
+        path: 'loadCodeAssist',
+        body: '{}',
+        status: 503,
+        outcome: 'upstream_error',
+        modelOutcome: [],
+      },
+      {
+        label: 'generate success clears the model strikes',
+        model: 'antigravity-gemini-3.8-flash',
+        path: 'streamGenerateContent?alt=sse',
+        body: generateBody('gemini-3.8-flash-high'),
+        status: 200,
+        outcome: 'success',
+        modelOutcome: [[7n, 'antigravity-gemini-3.8-flash', true]],
+      },
+      {
+        label: '429 stays account-level',
+        model: 'antigravity-gemini-3.8-flash',
+        path: 'streamGenerateContent?alt=sse',
+        body: generateBody('gemini-3.8-flash-high'),
+        status: 429,
+        outcome: 'rate_limited',
+        modelOutcome: [],
+      },
+    ]
+    for (const c of cases) {
+      const token = await mintRoute(c.model)
+      const modelOutcome: Array<[bigint, string, boolean]> = []
+      const { status, captured } = await relay(
+        `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:${c.path}`,
+        { body: c.body },
+        {
+          status: c.status,
+          headers: { 'content-type': 'application/json' },
+          body: c.status === 200 ? SSE : ['{"error":{"code":%d}}'.replace('%d', String(c.status))],
+        },
+        {
+          reportModelOutcome: async (accountId, modelId, ok) => {
+            modelOutcome.push([accountId, modelId, ok])
+          },
+        },
+      )
+      assert.equal(status, c.status, c.label)
+      assert.deepEqual(
+        captured.outcomes.map((o) => o.outcome.kind),
+        [c.outcome],
+        c.label,
+      )
+      assert.deepEqual(modelOutcome, c.modelOutcome, c.label)
+    }
+  })
+
   test('not configured → 503 without touching Google', async () => {
     const token = await mintRoute()
     const { status, captured } = await relay(

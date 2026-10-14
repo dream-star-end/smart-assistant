@@ -23,6 +23,8 @@ export type AntigravityPoolOutcome =
   | { kind: 'quota_exhausted'; resetAt: Date | null }
   | { kind: 'auth_invalid' }
   | { kind: 'upstream_error' }
+  /** 5xx on a generate call: the model, not the account (antigravityModelCooldown). */
+  | { kind: 'model_unavailable' }
   | { kind: 'network' }
   | { kind: 'client_error' }
 
@@ -150,6 +152,7 @@ export function decideAntigravityInterim(
       }
       return cooldown(backoff(p.upstreamBaseMs, level, p.upstreamMaxMs), 'upstream', health)
     }
+    case 'model_unavailable':
     case 'network':
     case 'client_error':
       return null
@@ -161,19 +164,28 @@ export interface AntigravityAccountPick {
   email: string
 }
 
-/** Healthiest selectable account; expired cooldowns are half-open. */
+/**
+ * Healthiest selectable account; expired cooldowns are half-open. `skip`
+ * drops accounts on which the turn's model is cooling down.
+ */
 export async function pickAntigravityAccount(
-  deps: { pool?: Pick<Pool, 'query'> } = {},
+  deps: {
+    pool?: Pick<Pool, 'query'>
+    skip?: (accountId: bigint) => Promise<boolean>
+  } = {},
 ): Promise<AntigravityAccountPick | null> {
   const res = await (deps.pool ?? getPool()).query<{ id: string; email: string }>(
     `SELECT id::text AS id, email FROM gemini_oauth_accounts
       WHERE disabled_by IS NULL
         AND (status = 'active' OR (status = 'cooldown' AND cooldown_until <= NOW()))
-      ORDER BY (status = 'active') DESC, health_score DESC, last_used_at ASC NULLS FIRST, id ASC
-      LIMIT 1`,
+      ORDER BY (status = 'active') DESC, health_score DESC, last_used_at ASC NULLS FIRST, id ASC`,
   )
-  const row = res.rows[0]
-  return row ? { accountId: BigInt(row.id), email: row.email } : null
+  for (const row of res.rows) {
+    const accountId = BigInt(row.id)
+    if (deps.skip && (await deps.skip(accountId))) continue
+    return { accountId, email: row.email }
+  }
+  return null
 }
 
 /** Apply an outcome to the row (read-modify-write under a row lock). */
@@ -196,6 +208,16 @@ export async function reportAntigravityOutcome(
   )
   const row = cur.rows[0]
   if (!row || row.disabled_by !== null) return
+  if (outcome.kind === 'model_unavailable') {
+    // Counted for diagnosis only: health and status belong to account-level signals.
+    await pool.query(
+      `UPDATE gemini_oauth_accounts SET fail_count = fail_count + 1, last_error = $2,
+         last_used_at = NOW(), updated_at = NOW()
+       WHERE id = $1 AND disabled_by IS NULL`,
+      [accountId.toString(), detail?.slice(0, 200) ?? null],
+    )
+    return
+  }
   const next = decideAntigravityInterim(
     { healthScore: row.health_score, backoffLevel: row.backoff_level, status: row.status },
     outcome,

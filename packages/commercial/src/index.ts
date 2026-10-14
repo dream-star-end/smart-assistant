@@ -348,6 +348,10 @@ import {
 } from "./billing/antigravityRouteContext.js";
 import { admitAntigravityTurn } from "./account-pool/antigravityAdmission.js";
 import {
+  configureAntigravityModelCooldownStore,
+  createIoredisAntigravityModelCooldownStore,
+} from "./account-pool/antigravityModelCooldown.js";
+import {
   SKILL_EMBED_PREFIX,
   makeSkillEmbedHandler,
   type SkillEmbedHandler,
@@ -1583,6 +1587,7 @@ export async function registerCommercial(
   });
   configureZcodeRelayKv(createIoredisZcodeRelayKv(redis));
   configureAntigravityRelayKv(createIoredisZcodeRelayKv(redis));
+  configureAntigravityModelCooldownStore(createIoredisAntigravityModelCooldownStore(redis));
 
   // 预热 dummy hash:第一次登录无影响
   await warmupLoginDummyHash();
