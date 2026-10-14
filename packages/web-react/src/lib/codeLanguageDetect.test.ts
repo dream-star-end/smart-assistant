@@ -28,7 +28,7 @@ describe("codeLanguageDetect", () => {
     const text = head + tail;
     expect(head.length).toBeLessThan(DETECT_SAMPLE_CHARS);
     expect(head.length).toBeGreaterThan(DETECT_SAMPLE_CHARS - 200);
-    expect(detectCodeLanguageNow(tail.trim() + `-- ${unique()}`)).not.toBe("python");
+    expect(detectCodeLanguageNow(`${tail.trim()}-- ${unique()}`)).not.toBe("python");
     expect(await detectCodeLanguageLater(text)).toBe("python");
     expect(cachedCodeLanguage(text)).toBe("python");
   });
