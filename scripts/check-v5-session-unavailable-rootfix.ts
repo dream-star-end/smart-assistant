@@ -749,14 +749,15 @@ async function runTapProof(opts: {
 }
 
 // OCV5-179: preserve every original engine lane and the new identity work lane.
+// OCV5-415: the Antigravity admission is a seventh tracked lane.
 // Independent exact leaves make missing/filtered negative controls fail this same entrypoint.
 await runTapProof({
   fromRoot: candidateRoot,
   files: ['scripts/__tests__/preparationLaneCoverage.test.ts'],
   expected: [
-    'accepts the six production preparation lanes',
+    'accepts the seven production preparation lanes',
     'ignores formatting and comment or string decoys',
-    ...['cursor', 'zcode', 'annotated', 'codex-grok', 'ccb', 'identity'].flatMap((lane) => [
+    ...['cursor', 'zcode', 'antigravity', 'annotated', 'codex-grok', 'ccb', 'identity'].flatMap((lane) => [
       `rejects untracked ${lane} work`,
       `rejects empty tracking substituted for ${lane}`,
       `rejects ${lane} work hidden in an uncalled function`,
@@ -769,7 +770,7 @@ await runTapProof({
   label: 'preparation-lane-coverage',
   timeoutMs: 120_000,
 })
-console.log('[preparation-lane-coverage] PASS — all six lanes and 24 exact positive/negative cases, zero skip/cancel')
+console.log('[preparation-lane-coverage] PASS — all seven lanes and 27 exact positive/negative cases, zero skip/cancel')
 
 await runTapProof({
   fromRoot: candidateRoot,
