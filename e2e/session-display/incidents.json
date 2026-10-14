@@ -7408,6 +7408,20 @@
           "assertion": "INC-20261014-SELFHOST-C3-GROK-REFUSAL: turn 1 registers a PO-<code> order number and turn 2 recalls it"
         }
       ]
+    },
+    {
+      "id": "INC-20261015-LIVE-FENCE-TRIM-REPLAY",
+      "occurredAt": "2026-10-15",
+      "severity": "P2",
+      "symptom": "OCV5-421 把每行的已应用 frameSeq 去重表在超过 1024 个后截成最新 512 个。journal 水合会重置会话游标并从本轮第一帧重放，长回答（超过 1024 个增量）被截掉的旧帧会再次追加，正文变长重复（1025 个 A 重放后变 1538）。G411e 个人版→商业同步的 Codex 审查发现，潜伏，无用户报告。修复：旧序号折叠成有序闭区间，去重不丢信息，持久化仍保持小体积。",
+      "rootFixCommit": "39eba126",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "INC-20261015-LIVE-FENCE-TRIM-REPLAY: a long answer replayed after a cursor reset is not appended twice"
+        }
+      ]
     }
   ]
 }
