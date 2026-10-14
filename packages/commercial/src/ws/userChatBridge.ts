@@ -6426,7 +6426,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 code: err instanceof Error ? err.message : 'unknown',
               });
               failDispatchPreForward(dispatchRecord, 'antigravity_admission_failed');
-              unavailable('Antigravity is temporarily unavailable');
+              unavailable(
+                err instanceof Error && err.message === 'ANTIGRAVITY_MODEL_COOLING_DOWN'
+                  ? 'This Antigravity model has no upstream capacity right now; retry in a few minutes or pick another model'
+                  : 'Antigravity is temporarily unavailable',
+              );
               return;
             }
             mintedToken = minted.token;

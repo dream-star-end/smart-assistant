@@ -20,8 +20,12 @@
  */
 import { randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { antigravityAllowedUpstreamModels } from '@openclaude/protocol'
+import {
+  ANTIGRAVITY_AUX_UPSTREAM_MODELS,
+  antigravityAllowedUpstreamModels,
+} from '@openclaude/protocol'
 import { type Dispatcher, request } from 'undici'
+import { reportAntigravityModelOutcome } from '../account-pool/antigravityModelCooldown.js'
 import {
   AntigravityOAuthError,
   getFreshAntigravityAccessToken,
@@ -125,6 +129,8 @@ export interface AntigravityRelayDeps {
     outcome: AntigravityPoolOutcome,
     detail: string | null,
   ) => Promise<void>
+  /** Per-(account, catalog model) 5xx strikes; see antigravityModelCooldown. */
+  reportModelOutcome?: (accountId: bigint, modelId: string, ok: boolean) => Promise<void>
   recordUsage?: (row: AntigravityUsageRow) => Promise<void>
   meteredCost?: (route: AntigravityRelayRoute) => Promise<bigint | null>
   /** Conservative cost of one generate call before it runs; null = pricing missing. */
@@ -285,6 +291,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         },
       }))
   const reportOutcome = deps.reportOutcome ?? reportAntigravityOutcome
+  const reportModelOutcome = deps.reportModelOutcome ?? reportAntigravityModelOutcome
   const recordUsage = deps.recordUsage ?? recordAntigravityRelayUsage
   const meteredCost =
     deps.meteredCost ??
@@ -484,12 +491,27 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
           body,
         },
       )
-      const outcome = classifyAntigravityUpstream(upstream.statusCode, upstream.headers, now())
+      const classified = classifyAntigravityUpstream(upstream.statusCode, upstream.headers, now())
+      // A 5xx on a generate call is the model's capacity (other models on the
+      // account keep working): cool that model, not the whole account.
+      const outcome: AntigravityPoolOutcome =
+        generate && classified.kind === 'upstream_error'
+          ? { kind: 'model_unavailable' }
+          : classified
       void reportOutcome(
         route.accountId,
         outcome,
         outcome.kind === 'success' ? null : `antigravity_http_${upstream.statusCode}`,
       ).catch(() => {})
+      if (
+        generate &&
+        !(ANTIGRAVITY_AUX_UPSTREAM_MODELS as readonly string[]).includes(upstreamModel)
+      ) {
+        const modelOk = classified.kind === 'success'
+        if (modelOk || classified.kind === 'upstream_error') {
+          void reportModelOutcome(route.accountId, route.modelId, modelOk).catch(() => {})
+        }
+      }
       res.statusCode = upstream.statusCode
       for (const [rawKey, rawValue] of Object.entries(upstream.headers)) {
         if (!HOP.has(rawKey.toLowerCase()) && rawValue !== undefined) {

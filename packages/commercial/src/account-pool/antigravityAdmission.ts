@@ -5,6 +5,7 @@ import { mintAntigravityRelayRoute } from '../billing/antigravityRouteContext.js
  * bound to that account. The route and limited token travel to the container
  * in the master-owned `__oc_antigravity_route` frame field.
  */
+import { antigravityModelCoolingUntil } from './antigravityModelCooldown.js'
 import { mintAntigravityLimitedToken } from './antigravityOAuth.js'
 import { pickAntigravityAccount, reportAntigravityOutcome } from './antigravityPoolInterim.js'
 
@@ -21,6 +22,7 @@ export class AntigravityAdmissionError extends Error {
   readonly code:
     | 'ANTIGRAVITY_NOT_CONFIGURED'
     | 'ANTIGRAVITY_NO_ACCOUNT'
+    | 'ANTIGRAVITY_MODEL_COOLING_DOWN'
     | 'ANTIGRAVITY_AUTH_UNAVAILABLE'
   constructor(code: AntigravityAdmissionError['code']) {
     super(code)
@@ -41,13 +43,27 @@ export async function admitAntigravityTurn(
   deps: {
     clientSecret: string
     pick?: typeof pickAntigravityAccount
+    modelCoolingUntil?: typeof antigravityModelCoolingUntil
     mintLimited?: typeof mintAntigravityLimitedToken
     mintRoute?: typeof mintAntigravityRelayRoute
   },
 ): Promise<AntigravityRouteGrant> {
   if (!deps.clientSecret) throw new AntigravityAdmissionError('ANTIGRAVITY_NOT_CONFIGURED')
-  const account = await (deps.pick ?? pickAntigravityAccount)()
-  if (!account) throw new AntigravityAdmissionError('ANTIGRAVITY_NO_ACCOUNT')
+  let cooled = false
+  const coolingUntil = deps.modelCoolingUntil ?? antigravityModelCoolingUntil
+  const account = await (deps.pick ?? pickAntigravityAccount)({
+    skip: async (accountId) => {
+      // A KV hiccup must not block admission: treat the model as usable.
+      const until = await coolingUntil(accountId, args.modelId).catch(() => null)
+      if (until !== null) cooled = true
+      return until !== null
+    },
+  })
+  if (!account) {
+    throw new AntigravityAdmissionError(
+      cooled ? 'ANTIGRAVITY_MODEL_COOLING_DOWN' : 'ANTIGRAVITY_NO_ACCOUNT',
+    )
+  }
   let limited: Awaited<ReturnType<typeof mintAntigravityLimitedToken>>
   try {
     limited = await (deps.mintLimited ?? mintAntigravityLimitedToken)(account.accountId, {
