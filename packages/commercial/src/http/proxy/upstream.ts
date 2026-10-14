@@ -58,6 +58,7 @@ import {
   directEgressDispatcher,
 } from "../../account-pool/egressDispatcher.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
+import type { SelectedApiKey } from "../../account-pool/apiKeyPool.js";
 import {
   findRouteProviderForModel,
   getStaticProvider,
@@ -304,10 +305,19 @@ export type ConfigError =
  */
 export function validateUpstreamConfig(
   route: UpstreamRoute,
-  deps: { staticProviderKeys?: StaticProviderKeys; boxConfigured?: boolean },
+  deps: {
+    staticProviderKeys?: StaticProviderKeys;
+    boxConfigured?: boolean;
+    /** OCV5-424:该服务池(pool_api_keys)是否有非管理员停用的成员。 */
+    apiKeyPoolConfigured?: (service: string) => boolean;
+  },
 ): ConfigError | null {
   if (route.kind === "box" && deps.boxConfigured !== true) return { kind: "box_not_configured" };
-  if (route.kind === "static" && !deps.staticProviderKeys?.[route.provider.id]) {
+  if (
+    route.kind === "static" &&
+    !deps.staticProviderKeys?.[route.provider.id] &&
+    deps.apiKeyPoolConfigured?.(route.provider.id) !== true
+  ) {
     return { kind: "static_not_configured", providerId: route.provider.id };
   }
   return null;
@@ -360,6 +370,11 @@ export interface PreparedUpstreamSession {
   readonly dispatcher: Dispatcher | undefined;
   /** 上游响应是否值得抓 quota(OAuth=true;静态=false) */
   readonly shouldUpdateQuotaFromResponse: boolean;
+  /**
+   * OCV5-424:本次请求所用的 API-key 池成员(pool_api_keys);core 据此把上游结果交共享
+   * 策略(冷却/恢复)。env key、OAuth、Box 路径为 undefined。
+   */
+  readonly poolMember?: { readonly service: string; readonly memberId: string } | null;
 
   /**
    * 写入 Authorization + Anthropic beta 头 + (OAuth)body.metadata.user_id device_id pin。
@@ -446,6 +461,16 @@ export interface PickUpstreamDeps {
    * 各装配点可只注入自己支持的子集(如 external API-key proxy 只放 deepseek)。OAuth route 不消费。
    */
   staticProviderKeys?: StaticProviderKeys;
+  /**
+   * OCV5-424:静态 provider 的 API-key 服务池选 key(多 key、共享策略冷却/恢复)。
+   * 未注入或池为空 → 用 staticProviderKeys 的 env key(旧行为)。
+   */
+  selectApiKey?: (service: string, stickyKey: string) => Promise<SelectedApiKey | null>;
+  /**
+   * OCV5-424:该服务池是否已有成员(任何状态)。有成员时池是权威:选不到可用 key(全部
+   * 冷却 / 管理员停用)就返回 pool_unavailable,不回落 env key。
+   */
+  apiKeyPoolHasMembers?: (service: string) => boolean;
   /** OAuth 上游 URL 覆盖;undefined → DEFAULT_UPSTREAM_ENDPOINT。测试 seam。 */
   upstreamEndpoint?: string;
   /**
@@ -531,6 +556,7 @@ function makeStaticKeyUpstream(
   spec: StaticKeyProviderSpec,
   apiKey: string,
   upstreamModel: string,
+  poolMember: { service: string; memberId: string } | null = null,
 ): PreparedUpstreamSession {
   // 出口策略(commercial 部署拓扑权威源):国内/亚洲静态 provider 必须显式直连,绕开 gateway
   // 启动装的全局 EnvHttpProxyAgent(给 Anthropic 出海的日本节点),否则双重跨境长流式易半路断。
@@ -549,6 +575,7 @@ function makeStaticKeyUpstream(
     upstreamModel,
     dispatcher,
     shouldUpdateQuotaFromResponse: false,
+    poolMember,
     applyUpstreamAuth(safeHeaders, body, _log) {
       // 鉴权头风格由 protocol spec 声明:缺省 bearer(deepseek/minimax/ark 逐字节不变);
       // opencodego 的 /messages 只认 x-api-key(Bearer→401,2026-07-05 实测)。
@@ -707,6 +734,53 @@ export function rewriteReminderDatesInMessages(
   return changed ? out : messages;
 }
 
+
+/**
+ * OCV5-424 — claude 服务池的 API-key 成员(pool_api_keys service='claude')。
+ * Anthropic 官方 API:x-api-key 鉴权;不注入 oauth beta、不做 persona/device pin(那些
+ * 只属于订阅号);出口走全局默认(与未绑出口的 OAuth 号相同);消息清洗与 OAuth 同源。
+ */
+function makeAnthropicKeyUpstream(
+  member: SelectedApiKey,
+  endpoint: string,
+  upstreamModel: string,
+): PreparedUpstreamSession {
+  return {
+    accountId: null,
+    slotId: null,
+    pinnedUserId: null,
+    personaTimezone: null,
+    endpoint,
+    upstreamModel,
+    dispatcher: undefined,
+    shouldUpdateQuotaFromResponse: false,
+    poolMember: { service: member.service, memberId: member.memberId },
+    applyUpstreamAuth(safeHeaders) {
+      // safeHeaders 来自 buildSafeUpstreamHeaders 白名单,不含 authorization;只设 x-api-key。
+      safeHeaders["x-api-key"] = member.apiKey;
+      const beta = (safeHeaders["anthropic-beta"] ?? "")
+        .split(",")
+        .map((b) => b.trim())
+        .filter((b) => b.length > 0 && b !== "oauth-2025-04-20");
+      if (beta.length > 0) safeHeaders["anthropic-beta"] = beta.join(",");
+      else Reflect.deleteProperty(safeHeaders, "anthropic-beta");
+    },
+    sanitizeMessages(messages, model, log) {
+      const r = stripMalformedThinkingBlocks(messages);
+      if (r.thinkingStripped + r.redactedThinkingStripped > 0) {
+        log.warn("proxy_malformed_thinking_blocks_stripped", {
+          model,
+          thinking: r.thinkingStripped,
+          redactedThinking: r.redactedThinkingStripped,
+        });
+      }
+      return r.messages;
+    },
+    zeroizeSecrets() {
+      /* the key string lives only in this closure for the request */
+    },
+  };
+}
 function makeOAuthPoolUpstream(
   pick: PickResult,
   dispatcher: Dispatcher | undefined,
@@ -916,15 +990,81 @@ export async function pickUpstream(
   if (route.kind === "static") {
     // validateUpstreamConfig 已保证该 provider 的 key 非空(handler preCheck 前 gate)。
     // 这里若仍 undefined 是 wiring bug — 退化为空字符串 Bearer 比 throw 安全(让上游 401)。
-    const apiKey = deps.staticProviderKeys?.[route.provider.id] ?? "";
+    // OCV5-424:先问该服务的 API-key 池(按会话粘性 WRH,只选 active 成员);池为空或
+    // 读池失败 → 回落 env key(旧行为)。
+    let pooled: SelectedApiKey | null = null;
+    if (deps.selectApiKey) {
+      try {
+        pooled = await deps.selectApiKey(
+          route.provider.id,
+          extractSessionId(body.metadata) ?? (userId !== undefined ? `u:${userId.toString()}` : randomUUID()),
+        );
+      } catch (err) {
+        log.warn("proxy_api_key_pool_select_failed", { provider: route.provider.id, err: errSummary(err) });
+      }
+    }
+    if (!pooled && deps.selectApiKey && deps.apiKeyPoolHasMembers?.(route.provider.id) === true) {
+      // 池里有成员但都不可用:env key 也已导入为池成员,回落它会绕过管理员停用与冷却。
+      return {
+        ok: false,
+        error: {
+          kind: "pool_unavailable",
+          err: new AccountPoolUnavailableError(`no usable API key in the ${route.provider.id} pool`),
+        },
+      };
+    }
+    const apiKey = pooled?.apiKey ?? deps.staticProviderKeys?.[route.provider.id] ?? "";
     // upstreamModel:catalog 有 hint → upstream_model_id ?? model_id;无 hint(legacy 路径)
     // → 原样透传 body.model(与本批次之前逐字节一致)。
     return {
       ok: true,
-      session: makeStaticKeyUpstream(route.provider, apiKey, route.upstreamModel ?? body.model),
+      session: makeStaticKeyUpstream(
+        route.provider,
+        apiKey,
+        route.upstreamModel ?? body.model,
+        pooled ? { service: pooled.service, memberId: pooled.memberId } : null,
+      ),
     };
   }
 
+  const oauth = await pickOAuthUpstream(deps, body, route, log, userId, forceRepin);
+  // OCV5-424:claude 服务池的 API-key 层(tier 1)。订阅号层(tier 0)整体不可用
+  // (pool_unavailable,不含 busy / pin 语义错误)时才用池里的 Anthropic API key;
+  // 订阅号仍在时绝不改走 API key(计费/封号策略不变)。
+  if (oauth.ok || oauth.error.kind !== "pool_unavailable" || !deps.selectApiKey) return oauth;
+  let anthropicKey: SelectedApiKey | null = null;
+  try {
+    anthropicKey = await deps.selectApiKey(
+      "claude",
+      extractSessionId(body.metadata) ?? (userId !== undefined ? `u:${userId.toString()}` : randomUUID()),
+    );
+  } catch (err) {
+    log.warn("proxy_api_key_pool_select_failed", { provider: "claude", err: errSummary(err) });
+  }
+  if (!anthropicKey) return oauth;
+  log.info("proxy_claude_api_key_tier", { memberId: anthropicKey.memberId });
+  return {
+    ok: true,
+    session: makeAnthropicKeyUpstream(
+      anthropicKey,
+      deps.upstreamEndpoint ?? DEFAULT_UPSTREAM_ENDPOINT,
+      route.upstreamModel ?? body.model,
+    ),
+  };
+}
+
+/** OAuth 订阅号层(原 pickUpstream 主体,OCV5-424 抽出以便接 API-key 层)。 */
+async function pickOAuthUpstream(
+  deps: PickUpstreamDeps,
+  body: ProxyBody,
+  route: Extract<UpstreamRoute, { kind: "oauth" }>,
+  log: Logger,
+  userId?: bigint,
+  forceRepin?: boolean,
+): Promise<
+  | { ok: true; session: PreparedUpstreamSession }
+  | { ok: false; error: PickError }
+> {
   // Phase 6 flag 在 OAuth 路径开头 await 一次,scheduler.pick + makeOAuthPoolUpstream
   // 同值传入,避免热改时两处读不一致(plan §5.5.4)。默认 "off" — getter 未注入
   // 或 cache miss 后 DB row 缺失时,getSystemSetting 内部已兜底 DEFAULTS["off"]。

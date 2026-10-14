@@ -1,4 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
+import { classifyHttpOutcome, type PoolOutcome } from "./policy/outcome.js";
+import { healthWeight, rankWRH } from "./policy/select.js";
+import { applyTableMemberOutcome, RELAY_KEY_MEMBERS } from "./policy/tableMembers.js";
 import type { PoolClient } from "pg";
 import { codexTransportModelId, isCodexLongContextModel } from "@openclaude/protocol";
 
@@ -528,12 +531,17 @@ export async function pickRelayCredentialForGroup(
       WHERE group_id = $1
         AND status = 'active'
         AND (cooldown_until IS NULL OR cooldown_until <= NOW())
-      ORDER BY health_score DESC, id ASC
-      LIMIT 1`,
+      ORDER BY id ASC`,
     [String(groupId)],
     runner,
   );
-  return res.rows[0] ? parseRelay(res.rows[0]) : null;
+  // OCV5-424:与其它服务池同一套选号(policy/select:按 health 加权的 WRH)。
+  const ranked = rankWRH(res.rows.map(parseRelay), {
+    key: `relay-group:${String(groupId)}`,
+    id: (r) => String(r.id),
+    weight: (r) => healthWeight(r.health_score),
+  });
+  return ranked[0] ?? null;
 }
 
 export function hashRouteToken(token: string): string {
@@ -943,25 +951,22 @@ export async function expireSettledGrokRouteLeases(
   return res.rowCount ?? 0;
 }
 
-export async function markRelayCredentialFailure(id: bigint | string, err: string): Promise<void> {
-  await query(
-    `UPDATE api_relay_credentials
-        SET fail_count = fail_count + 1,
-            last_error = $2,
-            updated_at = NOW()
-      WHERE id = $1`,
-    [String(id), err.slice(0, 500)],
-  );
+/**
+ * OCV5-424:relay key 的结果交共享策略(429 按 Retry-After 冷却、401 进 auth 冷却并自动
+ * 探测、5xx 3 连败冷却),不再只累加 fail_count。未给 outcome 时按 err 推断
+ * (`http_<status>` → 按状态分类,其余视为网络故障,不扣分)。
+ */
+export async function markRelayCredentialFailure(
+  id: bigint | string,
+  err: string,
+  outcome?: PoolOutcome,
+): Promise<void> {
+  const m = /^http_(\d{3})$/.exec(err);
+  const o: PoolOutcome =
+    outcome ?? (m ? classifyHttpOutcome(Number(m[1]), null, new Date()) : { kind: "network", detail: err.slice(0, 80) });
+  await applyTableMemberOutcome(RELAY_KEY_MEMBERS, String(id), o, err.slice(0, 500));
 }
 
 export async function markRelayCredentialSuccess(id: bigint | string): Promise<void> {
-  await query(
-    `UPDATE api_relay_credentials
-        SET success_count = success_count + 1,
-            last_used_at = NOW(),
-            last_error = NULL,
-            updated_at = NOW()
-      WHERE id = $1`,
-    [String(id)],
-  );
+  await applyTableMemberOutcome(RELAY_KEY_MEMBERS, String(id), { kind: "success" });
 }

@@ -104,6 +104,7 @@ import {
   handleAdminBoxClaudeProfilesList,
   handleAdminBoxClaudeProfilesSelect,
 } from './admin/boxClaudeProfiles.js'
+import { handleAdminPoolKeyCreate, handleAdminPoolKeyPatch, handleAdminPoolsList } from './admin/pools.js'
 import {
   handleAdminListAudit,
   handleAdminListHostAudit,
@@ -1205,6 +1206,10 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/api/admin/box-claude-profiles', handler: handleAdminBoxClaudeProfilesList },
     { method: 'POST', path: '/api/admin/box-claude-profiles/discover', handler: handleAdminBoxClaudeProfilesDiscover },
     { method: 'PUT', path: '/api/admin/box-claude-profiles', handler: handleAdminBoxClaudeProfilesSelect },
+    // OCV5-424 服务池(各服务账号/API key + 统一调度策略)。
+    { method: 'GET', path: '/api/admin/pools', handler: handleAdminPoolsList },
+    { method: 'POST', path: '/api/admin/pools/keys', handler: handleAdminPoolKeyCreate },
+    { method: 'PATCH', pathPrefix: '/api/admin/pools/keys/', handler: handleAdminPoolKeyPatch },
     // R3:reset-cooldown 子资源。pathPrefix 命中 /accounts/,handler 内部用 regex 抠
     //  `/accounts/:id/reset-cooldown`;POST 会先匹配到这条(method 一致),
     //  adjustCredits 走的是不同 prefix。
