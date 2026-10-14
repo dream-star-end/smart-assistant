@@ -18,6 +18,8 @@ assert_eq() { [[ "$1" == "$2" ]] && ok "$3 ($1)" || bad "$3: got '$1' want '$2'"
 
 # ---------- 沙箱 ----------
 mkdir -p "$T/run" "$T/lib" "$T/logs" "$T/bin" "$T/releases"
+# OCV5-420:测试夹具不得触发宿主上的自动恢复动作。
+export OC_V5_AUTORECOVER=off
 export OC_V5_LEASE_DB="$T/lib/lease.db"
 export OC_V5_LEASE_LOCK="$T/run/lease-db.lock"
 export OC_V5_LEASE_WORKER_LOCK="$T/run/lease-worker.lock"

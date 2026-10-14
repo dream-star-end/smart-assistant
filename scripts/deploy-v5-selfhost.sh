@@ -1544,7 +1544,7 @@ SQL
   echo "  🎫 lease train $LEASE_TRAIN_ID → $st"
   if [[ "$st" == recovery_required ]]; then
     deploy_alert deploy_recovery_required "$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)" \
-      "个人版列车 $LEASE_TRAIN_ID 未完成也未干净回滚(phase=${phase:-?}),已标 recovery_required,发车暂停。现场:${CUTOVER_LOG:-?}。人工核对 survivor/live 后:oc-lease.sh train resolve --id $LEASE_TRAIN_ID --as committed|failed --reason …"
+      "个人版列车 $LEASE_TRAIN_ID 未完成也未干净回滚(phase=${phase:-?}),已标 recovery_required,发车暂停。现场:${CUTOVER_LOG:-?}。autorecover 接管:现场稳定绿后自动结束本班并重跑,否则退避兜底,仍失败自动开工单派给 AI。"
   fi
 }
 
