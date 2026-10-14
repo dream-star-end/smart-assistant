@@ -33,7 +33,7 @@ const RESP: PoolsResponse = {
     members: [
       member({ id: "1" }),
       member({ id: "2", status: "cooldown", cooldownReason: "auth", cooldownUntil: new Date(Date.now() + 3 * 3_600_000).toISOString() }),
-      member({ id: "3", status: "disabled", disabledBy: "admin" }),
+      member({ id: "3", status: "disabled", disabledBy: "admin", lastError: "refresh failed: 400 invalid_grant ".repeat(6).trim() }),
     ],
     counts: { active: 1, cooldown: 1, disabled: 1, total: 3 },
   }],
@@ -63,6 +63,11 @@ describe("PoolsPage 手机宽度", () => {
     }
     for (const el of screen.getAllByText("订阅账号")) expect(el.className).toContain("whitespace-nowrap");
     expect(screen.getByText(/小时 .* 分后/).className).toContain("whitespace-nowrap");
+    // 最近错误列在 390px 下曾被压到 72px、长报错竖排把每行撑到 160px:要有最小宽度并限三行,全文放 title。
+    const err = screen.getByText(/^refresh failed: 400/);
+    expect(err.className).toContain("min-w-[14rem]");
+    expect(err.className).toContain("line-clamp-3");
+    expect(err.getAttribute("title")).toMatch(/^refresh failed: 400/);
     for (const el of screen.getAllByText("someone-with-a-long-name@example.com")) {
       // break-all 会让名称列被压到两三个字符宽、邮箱逐字断行(#736 上线后实测),名称必须整行显示。
       expect(el.className).toContain("whitespace-nowrap");

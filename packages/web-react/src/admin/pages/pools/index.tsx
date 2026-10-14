@@ -146,7 +146,7 @@ function PolicyNote({ policy }: { policy: PoolsResponse["policy"] }) {
   );
 }
 
-// 手机宽度下表格列会被压窄:徽标、名称都不换行(否则一字一行),表格在卡片内横向滚动。
+// 手机宽度下表格列会被压窄:徽标、名称都不换行(否则一字一行),最近错误给最小宽度并限三行,表格在卡片内横向滚动。
 function StatusChip({ m }: { m: PoolMember }) {
   if (m.status === "active") {
     return (
@@ -227,7 +227,11 @@ function PoolSection({
     {
       key: "err",
       title: "最近错误",
-      render: (m) => <span className="break-all text-meta text-muted">{m.lastError || "—"}</span>,
+      render: (m) => (
+        <span className="line-clamp-3 block min-w-[14rem] break-all text-meta text-muted" title={m.lastError ?? undefined}>
+          {m.lastError || "—"}
+        </span>
+      ),
     },
     {
       key: "actions",
