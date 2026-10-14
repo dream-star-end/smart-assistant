@@ -479,7 +479,7 @@ export default function MarkdownImpl({
         rehypePlugins={[
           rehypeBareBreaks,
           // detect=false 时没标语言的块不做同步语言探测（大文件预览防卡死，见 MarkdownProps.autoDetectCode）。
-          [rehypeHighlight, { detect: autoDetectCode, ignoreMissing: true }],
+          [rehypeHighlightShared, { detect: autoDetectCode, ignoreMissing: true, subset: AUTO_DETECT_LANGUAGES }],
           // 数学公式：$..$ / $$..$$ → KaTeX 渲染(remarkMath 解析 + rehypeKatex 出 HTML)。
           // errorColor 跟随主题 token(KaTeX 默认 #cc0000 在暗色底上对比度不足)。
           [rehypeKatex, { strict: false, throwOnError: false, errorColor: "var(--danger)" }],
@@ -503,6 +503,32 @@ export default function MarkdownImpl({
   );
   return bare ? body : <div className="prose">{body}</div>;
 }
+
+/**
+ * rehype-highlight 每次被挂进处理器都会 `createLowlight(common)`:新建一个 highlight.js 实例,
+ * 用到的语法全部重新编译。react-markdown 每次渲染都重建处理器,于是每个 delta、每次重渲都要
+ * 重新编译语法(OCV5-421 实测是流式时的头号开销)。返回的转换函数只闭包了 lowlight,无每次运行的
+ * 状态,按配置缓存复用即可(只有 detect 开 / 关两种)。
+ */
+const highlightTransformers = new Map<string, ReturnType<typeof rehypeHighlight>>();
+function rehypeHighlightShared(options: Parameters<typeof rehypeHighlight>[0]) {
+  const key = JSON.stringify(options ?? {});
+  let transformer = highlightTransformers.get(key);
+  if (!transformer) {
+    transformer = rehypeHighlight(options);
+    highlightTransformers.set(key, transformer);
+  }
+  return transformer;
+}
+
+/**
+ * 无语言标注的代码块只在这些常见语言里自动探测(OCV5-421)。全量探测要逐个语法跑一遍,一个几百行的
+ * 无标注块在打开历史会话 / 流式结束时会卡主线程数秒;有标注的块不受影响,照常按标注高亮。
+ */
+const AUTO_DETECT_LANGUAGES = [
+  "bash", "shell", "python", "javascript", "typescript", "json", "xml", "css",
+  "sql", "go", "java", "c", "cpp", "rust", "yaml", "markdown",
+];
 
 /** 代码块行数(highlight 之后 children 是 span 树,取原文数换行)。 */
 function countLines(children: ReactNode): number {

@@ -305,3 +305,49 @@ describe('MarkdownImpl autoDetectCode', () => {
     expect(c2.querySelector('.hljs')).not.toBeNull()
   })
 })
+
+// OCV5-421: 共享的高亮实例 + 常见语言内的自动探测。
+describe('MarkdownImpl 代码高亮(OCV5-421)', () => {
+  const py = '```\nimport os\n\ndef main():\n    for name in os.listdir("."):\n        print(name)\n```'
+
+  test('无标注的常见语言代码仍被探测并高亮,重复渲染结果一致', () => {
+    for (let i = 0; i < 3; i++) {
+      const { container, unmount } = render(<MarkdownImpl>{py}</MarkdownImpl>)
+      // CodeBlock 外层 <code class="font-mono"> 包着带高亮类名的 span。
+      const code = container.querySelector('pre code > span')!
+      expect(code.className).toContain('language-python')
+      expect(code.querySelector('.hljs-keyword')).not.toBeNull()
+      unmount()
+    }
+  })
+
+  test('有标注的语言照常高亮(不受探测子集限制)', () => {
+    const { container } = render(<MarkdownImpl>{'```kotlin\nfun main() { val x = 1 }\n```'}</MarkdownImpl>)
+    expect(container.querySelector('pre code > span')!.className).toContain('hljs')
+    expect(container.querySelector('pre .hljs-keyword')).not.toBeNull()
+  })
+
+  test('autoDetectCode=false 时无标注块不探测(流式尾段)', () => {
+    const { container } = render(<MarkdownImpl autoDetectCode={false}>{py}</MarkdownImpl>)
+    expect(container.querySelector('pre code > span')!.className).not.toContain('language-python')
+  })
+
+  test('流式中未闭合的 $$ 不渲染半截公式,显示「公式生成中…」', () => {
+    const { container } = render(<MarkdownImpl live>{'推导：\n\n$$\n\\frac{a}{'}</MarkdownImpl>)
+    expect(container.querySelector('.katex-error')).toBeNull()
+    expect(screen.getByText('公式生成中…')).toBeInTheDocument()
+  })
+
+  test('表格单元格里独立的 <br> 变成换行,其它原始 HTML 仍转义', () => {
+    const { container } = render(<MarkdownImpl>{'| a | b |\n|---|---|\n| 第一行<br>第二行 | <b>x</b> |'}</MarkdownImpl>)
+    expect(container.querySelector('td br')).not.toBeNull()
+    expect(container.querySelector('td b')).toBeNull()
+  })
+
+  test('脚注锚点在当前页跳转,外链仍开新标签', () => {
+    const { container } = render(<MarkdownImpl>{'结论[^1]，见 [官网](https://example.com)\n\n[^1]: 来源'}</MarkdownImpl>)
+    for (const a of container.querySelectorAll('a[href^="#"]')) expect(a).not.toHaveAttribute('target')
+    expect(container.querySelector('a[href="https://example.com"]')).toHaveAttribute('target', '_blank')
+    expect(container.querySelector('[node]')).toBeNull()
+  })
+})
