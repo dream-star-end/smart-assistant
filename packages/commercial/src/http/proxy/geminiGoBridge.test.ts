@@ -589,3 +589,107 @@ test('a grounded request that did not search emits no search blocks', async () =
     .map((e) => (e.content_block as Record<string, unknown>).type)
   assert.deepEqual(types, ['text'])
 })
+
+test("a follow-up turn accepts the bridge's own search output as history (Codex r1 P1)", async () => {
+  const sse = wire([
+    {
+      candidates: [
+        {
+          content: { parts: [{ text: 'OpenCode Go costs $10 per month.' }] },
+          finishReason: 'STOP',
+          groundingMetadata: {
+            webSearchQueries: ['opencode go pricing'],
+            groundingChunks: [{ web: { uri: 'https://opencode.ai/go', title: 'opencode.ai' } }],
+          },
+        },
+      ],
+      usageMetadata: usage,
+    },
+  ])
+  const sent: Record<string, unknown>[] = []
+  const fetchStub = (async (_url: string | URL | Request, init?: RequestInit) => {
+    sent.push(JSON.parse(String(init?.body)))
+    return new Response(
+      sent.length === 1
+        ? sse
+        : wire([
+            {
+              candidates: [{ content: { parts: [{ text: 'It is $10.' }] }, finishReason: 'STOP' }],
+              usageMetadata: usage,
+            },
+          ]),
+    )
+  }) as typeof fetch
+  const bridge = createGeminiGoFetch(fetchStub)
+  const first = await bridge('x', {
+    method: 'POST',
+    headers: { 'x-api-key': 'k' },
+    body: JSON.stringify(webSearchBody),
+  })
+  // Rebuild the assistant message exactly as an Anthropic SDK client accumulates it.
+  const blocks: Record<string, unknown>[] = []
+  for (const e of parse(await first.text())) {
+    if (e.type === 'content_block_start')
+      blocks.push({ ...(e.content_block as Record<string, unknown>) })
+    if (e.type === 'content_block_delta') {
+      const d = e.delta as Record<string, string>
+      const b = blocks[e.index as number]!
+      if (d.type === 'text_delta') b.text = `${b.text as string}${d.text}`
+      if (d.type === 'input_json_delta') b.input = JSON.parse(d.partial_json!)
+    }
+  }
+  assert.deepEqual(
+    blocks.map((b) => b.type),
+    ['text', 'server_tool_use', 'web_search_tool_result'],
+  )
+  const followUp = {
+    ...webSearchBody,
+    messages: [
+      ...webSearchBody.messages,
+      { role: 'assistant', content: JSON.parse(JSON.stringify(blocks)) },
+      { role: 'user', content: 'Which page did that price come from?' },
+    ],
+  }
+  const second = await bridge('x', {
+    method: 'POST',
+    headers: { 'x-api-key': 'k' },
+    body: JSON.stringify(followUp),
+  })
+  assert.equal(second.status, 200)
+  assert.equal(sent.length, 2, 'the follow-up reaches Google instead of failing locally')
+  const model = (sent[1]!.contents as Record<string, unknown>[])[1]!
+  assert.equal(model.role, 'model')
+  assert.deepEqual(model.parts, [
+    { text: 'OpenCode Go costs $10 per month.' },
+    { text: '[Web search results]\n- opencode.ai: https://opencode.ai/go' },
+  ])
+  // An error result is kept as a short note, not a rejection.
+  const failed = anthropicToGemini({
+    ...input,
+    messages: [
+      ...input.messages,
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: 'srvtoolu_x',
+            content: { type: 'web_search_tool_result_error', error_code: 'max_uses_exceeded' },
+          },
+        ],
+      },
+      { role: 'user', content: 'ok' },
+    ],
+  })
+  assert.deepEqual((failed.contents as Record<string, unknown>[])[1]!.parts, [
+    { text: '[Web search failed: max_uses_exceeded]' },
+  ])
+  assert.throws(
+    () =>
+      anthropicToGemini({
+        ...input,
+        messages: [{ role: 'user', content: [{ type: 'web_search_tool_result', content: [] }] }],
+      }),
+    /unsupported Gemini Go block: web_search_tool_result/,
+  )
+})

@@ -54,6 +54,24 @@ function systemParts(v: unknown): Obj[] {
   })
 }
 
+/** Prior web_search_tool_result → plain text the model can cite in follow-ups
+ * (Codex r1 P1: the bridge must accept its own search output as history). */
+function webSearchResultText(content: unknown): string {
+  if (!Array.isArray(content)) {
+    const code =
+      content && typeof content === 'object' && typeof (content as Obj).error_code === 'string'
+        ? (content as Obj).error_code
+        : 'unknown'
+    return `[Web search failed: ${String(code)}]`
+  }
+  const lines = content
+    .filter((r): r is Obj => !!r && typeof r === 'object' && typeof (r as Obj).url === 'string')
+    .map((r) => `- ${typeof r.title === 'string' && r.title ? r.title : r.url}: ${r.url}`)
+  return lines.length
+    ? `[Web search results]\n${lines.join('\n')}`
+    : '[Web search returned no results]'
+}
+
 export function anthropicToGemini(body: Obj): Obj {
   const contents: Obj[] = []
   const calls = new Map<string, { name: string; nativeId?: string }>()
@@ -108,6 +126,11 @@ export function anthropicToGemini(body: Obj): Obj {
         })
       } else if (b.type === 'thinking' || b.type === 'redacted_thinking') {
         // Foreign thought blocks are not Google signatures. They are not tools.
+      } else if (b.type === 'server_tool_use' && m.role === 'assistant') {
+        // A finished grounded search (ours or replayed): Google re-runs search
+        // only when asked; the results block below carries what was found.
+      } else if (b.type === 'web_search_tool_result' && m.role === 'assistant') {
+        parts.push({ text: webSearchResultText(b.content) })
       } else throw new Error(`unsupported Gemini Go block: ${String(b.type)}`)
     }
     if (!parts.length) continue
