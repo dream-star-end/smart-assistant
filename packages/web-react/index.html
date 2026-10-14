@@ -29,7 +29,7 @@
       } catch (e) {}
     </script>
     <!-- OCV5-421 首屏占位:JS 还没下载完时(弱网实测 40KB/s 下 30 秒以上)#root 是空的,只有一片空白。
-         纯 CSS:居中转圈,4 秒后才淡入「网络较慢，正在加载…」,正常网络下 React 挂载前看不到文字。
+         居中转圈;距导航开始满 4 秒才淡入「网络较慢，正在加载…」(见 #root 后的小脚本),正常网络下 React 挂载前看不到文字。
          React 首次渲染会替换 #root 的内容。颜色与 styles.css 的 --bg / --faint 一致。 -->
     <style>
       .oc-boot{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:#fafafb;color:#64646f;font:13px/1.5 system-ui,-apple-system,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
@@ -43,6 +43,14 @@
   </head>
   <body>
     <div id="root"><div class="oc-boot" role="status" aria-live="polite"><span class="oc-boot-spin" aria-hidden="true"></span><p class="oc-boot-hint">网络较慢，正在加载…</p></div></div>
+    <script>
+      // 主样式表是渲染阻塞的:慢网下页面要等它下完才第一次绘制,CSS 动画的 4 秒延迟从那时才开始算。
+      // 这段脚本排在样式表之后执行(恰好在首次绘制前),把延迟改成「距导航开始满 4 秒」:慢网首帧即见提示。
+      try {
+        var hint = document.querySelector(".oc-boot-hint");
+        if (hint) hint.style.animationDelay = Math.max(0, 4000 - performance.now()) + "ms";
+      } catch (e) {}
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
