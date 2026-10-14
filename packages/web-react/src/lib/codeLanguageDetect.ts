@@ -6,7 +6,8 @@
  * 现在:
  * - 结果按代码原文缓存(语言名或 null = 都不像),同一段代码只探测一次;
  * - 小块(≤ SYNC_DETECT_MAX_CHARS)仍在渲染时同步探测,不会先白后彩;
- * - 大块交给 detectLanguageLater:每个宏任务只跑一种语法,中间把主线程让给输入和绘制,跑完由调用方重渲一次上色。
+ * - 大块交给 detectCodeLanguageLater:只比开头约 3KB(DETECT_SAMPLE_CHARS),每个宏任务只跑一种语法,中间把
+ *   主线程让给输入和绘制,跑完由调用方重渲一次上色。
  * 用的是独立的 highlight.js 实例,注册与 lowlight common 相同的候选语法及其嵌入语法(graphql、ruby),
  * relevance 与 rehype-highlight 自带探测一致。
  */
@@ -40,6 +41,11 @@ export const AUTO_DETECT_LANGUAGES = [
 
 /** 不超过这个长度的块在渲染时同步探测(手机上也只是几十毫秒),更长的走分片探测。 */
 export const SYNC_DETECT_MAX_CHARS = 1500;
+/**
+ * 更长的块只拿开头这么多字符(在换行处截断)比 relevance:语言特征在头几十行就够分辨,探测耗时因此有上限
+ * (400 行的块不再要几秒才上色);选定语言后整块仍按该语言完整高亮。
+ */
+export const DETECT_SAMPLE_CHARS = 3000;
 /** 超长的块不缓存(避免缓存键常驻大字符串);它们仍会被探测,只是每次重新挂载都再探测一遍。 */
 const CACHE_MAX_CHARS = 200_000;
 const CACHE_MAX_ENTRIES = 300;
@@ -59,6 +65,12 @@ function remember(text: string, language: string | null): string | null {
   return language;
 }
 
+function detectionSample(text: string): string {
+  if (text.length <= DETECT_SAMPLE_CHARS) return text;
+  const cut = text.lastIndexOf("\n", DETECT_SAMPLE_CHARS);
+  return text.slice(0, cut > 0 ? cut : DETECT_SAMPLE_CHARS);
+}
+
 function relevance(language: string, text: string): number {
   try {
     return engine.highlight(text, { language, ignoreIllegals: true }).relevance;
@@ -76,10 +88,11 @@ export function cachedCodeLanguage(text: string): string | null | undefined {
 export function detectCodeLanguageNow(text: string): string | null {
   const known = cache.get(text);
   if (known !== undefined) return known;
+  const sample = detectionSample(text);
   let best: string | null = null;
   let bestRelevance = 0;
   for (const language of AUTO_DETECT_LANGUAGES) {
-    const score = relevance(language, text);
+    const score = relevance(language, sample);
     if (score > bestRelevance) {
       bestRelevance = score;
       best = language;
@@ -97,11 +110,12 @@ export function detectCodeLanguageLater(text: string): Promise<string | null> {
   let pending = inflight.get(text);
   if (!pending) {
     pending = (async () => {
+      const sample = detectionSample(text);
       let best: string | null = null;
       let bestRelevance = 0;
       for (const language of AUTO_DETECT_LANGUAGES) {
         await yieldToMain();
-        const score = relevance(language, text);
+        const score = relevance(language, sample);
         if (score > bestRelevance) {
           bestRelevance = score;
           best = language;

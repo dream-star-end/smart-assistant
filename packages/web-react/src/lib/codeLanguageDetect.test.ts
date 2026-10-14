@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   cachedCodeLanguage,
+  DETECT_SAMPLE_CHARS,
   detectCodeLanguageLater,
   detectCodeLanguageNow,
 } from "./codeLanguageDetect";
@@ -17,6 +18,19 @@ describe("codeLanguageDetect", () => {
     const box = `┌──┐ ${unique()}\n│  │\n└──┘\n`;
     expect(detectCodeLanguageNow(box)).toBeNull();
     expect(cachedCodeLanguage(box)).toBeNull();
+  });
+
+  test("超长块只按开头取样探测(耗时有上限);结论按整块原文缓存", async () => {
+    // 开头的 python 几乎填满样本(样本在 DETECT_SAMPLE_CHARS 内的最后一个换行处截断)。
+    const head = Array.from({ length: 44 }, (_, i) => `def step_${i}_${unique().replace(/[0-9]/g, "x")}(rows):\n    return [r for r in rows if r]`).join("\n");
+    // 开头之后是 8KB 的非 python 文本(单看它不是 python);只看开头样本,结论仍是 python。
+    const tail = `\n${"SELECT id, name, total FROM orders WHERE total > 100 ORDER BY id DESC;\n".repeat(200)}`;
+    const text = head + tail;
+    expect(head.length).toBeLessThan(DETECT_SAMPLE_CHARS);
+    expect(head.length).toBeGreaterThan(DETECT_SAMPLE_CHARS - 200);
+    expect(detectCodeLanguageNow(tail.trim() + `-- ${unique()}`)).not.toBe("python");
+    expect(await detectCodeLanguageLater(text)).toBe("python");
+    expect(cachedCodeLanguage(text)).toBe("python");
   });
 
   test("分片探测与同步探测结论一致;并发请求共用一次探测,中途让出主线程", async () => {
