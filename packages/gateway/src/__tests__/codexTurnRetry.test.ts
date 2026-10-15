@@ -594,3 +594,72 @@ describe('runTurn — proc 于退避期间消失(crash/shutdown)', () => {
     await h.cleanup()
   })
 })
+
+// OCV5-435: a Stop that reaches the runner while its turn is queued/starting
+// (no turn id yet) used to be dropped — the turn then ran to completion.
+describe('runTurn — interrupt() before the turn has an id (OCV5-435)', () => {
+  it('interrupt while the app-server is still starting → no turn/start, USER_CANCELLED', async () => {
+    const h = await makeRetryHarness()
+    let releaseSpawn!: () => void
+    const spawnGate = new Promise<void>((resolve) => { releaseSpawn = resolve })
+    const spawn = h.r.ensureSpawned
+    h.r.ensureSpawned = async (...args: unknown[]) => { await spawnGate; return spawn(...args) }
+    const methods: string[] = []
+    h.r.sendRequest = async (method: string) => {
+      methods.push(method)
+      if (method !== 'turn/start') return {}
+      setImmediate(() => h.r.currentTurnCompleter?.resolve({ status: 'completed' }))
+      return { turn: { id: 't-must-not-start' } }
+    }
+    h.r.processing = true // as drain() sets it around runTurn
+    const runPromise = h.r.runTurn('hi', 'req-prestart')
+    assert.equal(h.runner.interrupt(), true, 'a starting turn accepts the Stop')
+    releaseSpawn()
+    await runPromise
+    assert.ok(!methods.includes('turn/start'), 'the stopped turn never starts')
+    const res = results(h.messages)
+    assert.equal(res.length, 1)
+    assert.equal(res[0].billing_terminal_code, 'USER_CANCELLED')
+    assert.equal(res[0].stop_reason, 'interrupted')
+    assert.equal(h.r.pendingStartInterrupt, false)
+    await h.cleanup()
+  })
+
+  it('interrupt while turn/start is in flight → turn/interrupt as soon as the id arrives', async () => {
+    const h = await makeRetryHarness()
+    let answerStart!: () => void
+    const startAnswered = new Promise<void>((resolve) => { answerStart = resolve })
+    const methods: Array<{ method: string; params: any }> = []
+    h.r.sendRequest = async (method: string, params: any) => {
+      methods.push({ method, params })
+      if (method === 'turn/interrupt') {
+        setImmediate(() => h.r.currentTurnCompleter?.resolve({ status: 'interrupted' }))
+        return {}
+      }
+      if (method !== 'turn/start') return {}
+      await startAnswered
+      return { turn: { id: 't-inflight' } }
+    }
+    h.r.processing = true
+    h.r.threadId = 'thr-inflight' // a real turn/start always follows thread/start|resume
+    h.r.recycleProcKeepQueue = async () => {} // the stub proc has no process to reap
+    const runPromise = h.r.runTurn('hi', 'req-inflight')
+    await waitFor(() => methods.some((m) => m.method === 'turn/start'))
+    assert.equal(h.runner.interrupt(), true)
+    answerStart()
+    await runPromise
+    const interrupts = methods.filter((m) => m.method === 'turn/interrupt')
+    assert.equal(interrupts.length, 1)
+    assert.equal(interrupts[0]!.params.turnId, 't-inflight')
+    assert.equal(results(h.messages)[0].stop_reason, 'interrupted')
+    assert.equal(h.r.pendingStartInterrupt, false)
+    await h.cleanup()
+  })
+
+  it('without a queued or running turn interrupt() still reports nothing to stop', async () => {
+    const h = await makeRetryHarness()
+    assert.equal(h.runner.interrupt(), false)
+    assert.equal(h.r.pendingStartInterrupt, false)
+    await h.cleanup()
+  })
+})
