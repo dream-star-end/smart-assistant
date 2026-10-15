@@ -1,14 +1,14 @@
 /**
  * OCV5-434 — GPT "Fast" service tier (OpenAI priority processing), turn-level, default off.
  *
- * Upstream semantics (2026-10): OpenAI renamed priority processing to Fast mode;
- * `service_tier: "fast"` and `"priority"` are the same tier (≈2× API price, up to ~2.5× speed).
- *  - Codex (ChatGPT subscription): app-server `turn/start.serviceTierForTurn` — `"fast"` or
- *    `"default"` (explicit standard). Fast spends the plan's limits at 2.5×; no credits.
- *  - OpenCode Go `/responses`: the request carries `service_tier: "priority"`; upstream echoes
- *    neither tier nor price, so we bill the published Fast multiplier.
- * Only models that documented Fast support AND are wired here get the toggle; everything else
- * silently ignores the field.
+ * Only the OpenCode Go `/responses` Lunas offer it: the request carries
+ * `service_tier: "priority"` (verified ≈1.6× faster) and billing composes the published Fast
+ * multiplier (upstream echoes neither tier nor price).
+ *
+ * Codex (ChatGPT subscription) does NOT: its backend ignores `priority` from our client
+ * (verified 2026-10-16 — tier echoed "default", no speedup). The user chose to hide it there
+ * rather than impersonate the Codex CLI; Codex GPT-6 turns always state an explicit standard
+ * tier so a catalog Fast default (GPT-6 Luna) never applies.
  */
 import { OPENCODE_GO_RESPONSES_MODELS } from './staticKeyProviders.js'
 
@@ -19,8 +19,11 @@ export function isServiceTier(value: unknown): value is ServiceTier {
   return typeof value === 'string' && (SERVICE_TIERS as readonly string[]).includes(value)
 }
 
-/** Codex engine (ChatGPT subscription) canonical ids with documented Fast support. */
-export const CODEX_FAST_MODELS: ReadonlySet<string> = new Set([
+/**
+ * Codex engine (ChatGPT subscription) GPT-6 ids whose catalog offers — or defaults to — the
+ * priority tier. They never get a Fast toggle; every turn sends an explicit standard tier.
+ */
+export const CODEX_EXPLICIT_STANDARD_MODELS: ReadonlySet<string> = new Set([
   'gpt-6-astra',
   'gpt-6-astra-1m',
   'gpt-6.1-sol',
@@ -46,13 +49,12 @@ export function isOpenCodeGoFastUpstream(upstreamModel: string): boolean {
   return OPENCODE_GO_FAST_UPSTREAMS.has(upstreamModel.toLowerCase())
 }
 
-export type FastServiceTierRoute = 'codex' | 'opencode-responses'
+export type FastServiceTierRoute = 'opencode-responses'
 
 export function fastServiceTierRoute(
   modelId: string | null | undefined,
 ): FastServiceTierRoute | null {
   if (!modelId) return null
-  if (CODEX_FAST_MODELS.has(modelId)) return 'codex'
   if (OPENCODE_GO_FAST_MODELS.has(modelId)) return 'opencode-responses'
   return null
 }
@@ -64,27 +66,11 @@ export function supportsFastServiceTier(modelId: string | null | undefined): boo
 /** The OpenAI request value for Fast on a Responses endpoint. */
 export const OPENAI_FAST_SERVICE_TIER = 'priority'
 
-/**
- * Codex app-server tier ids come from its model catalog (`Model.serviceTiers[].id`), not the UI
- * name: Fast is `"priority"` (codex-cli 0.159.2; `"fast"` is only the CLI config alias and is
- * silently ignored by turn/start). `"default"` is explicit standard.
- */
-export const CODEX_FAST_SERVICE_TIER = 'priority'
+/** Codex app-server's explicit standard tier id (catalog ids; "fast" would be ignored). */
 export const CODEX_STANDARD_SERVICE_TIER = 'default'
-
-/**
- * What the shipped Codex catalog says Fast does per model (codex-cli 0.159.2): GPT-6 Astra and
- * GPT-6.1 Sol "2x speed, increased usage"; GPT-6 Luna "1.5x speed" (and its catalog default tier
- * is priority — which is why off must be sent explicitly).
- */
-export function codexFastHint(modelId: string | null | undefined): '2x' | '1.5x' | null {
-  if (!modelId || !CODEX_FAST_MODELS.has(modelId)) return null
-  return modelId.startsWith('gpt-6-luna') ? '1.5x' : '2x'
-}
 
 /**
  * Billing multiplier composed onto a metered (OpenCode Go) request that ran with Fast:
  * OpenAI's published Fast rates are 2× Standard for GPT-6 Luna and GPT-5.6 Luna.
- * Codex turns are not metered in credits (they spend the ChatGPT plan's limits).
  */
 export const OPENCODE_GO_FAST_BILLING_MULTIPLIER = '2.000'

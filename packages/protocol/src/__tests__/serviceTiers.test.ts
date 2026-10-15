@@ -1,11 +1,10 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
-  CODEX_FAST_MODELS,
+  CODEX_EXPLICIT_STANDARD_MODELS,
   OPENCODE_GO_FAST_BILLING_MULTIPLIER,
   OPENCODE_GO_FAST_MODELS,
-  CODEX_FAST_SERVICE_TIER,
-  codexFastHint,
+  CODEX_STANDARD_SERVICE_TIER,
   fastServiceTierRoute,
   isServiceTier,
   supportsFastServiceTier,
@@ -14,9 +13,8 @@ import { OPENCODE_GO_RESPONSES_MODELS } from '../staticKeyProviders.js'
 
 describe('OCV5-434 service tiers', () => {
   it('routes the documented Fast models and nothing else', () => {
-    assert.equal(fastServiceTierRoute('gpt-6-astra'), 'codex')
-    assert.equal(fastServiceTierRoute('gpt-6.1-sol-1m'), 'codex')
-    assert.equal(fastServiceTierRoute('gpt-6-luna'), 'codex')
+    // Codex: no Fast toggle (backend ignores priority from our client; hidden by user decision).
+    for (const id of ['gpt-6-astra', 'gpt-6.1-sol-1m', 'gpt-6-luna']) assert.equal(fastServiceTierRoute(id), null, id)
     assert.equal(fastServiceTierRoute('opencode-gpt-6-luna'), 'opencode-responses')
     assert.equal(fastServiceTierRoute('opencode-gpt-5.6-luna'), 'opencode-responses')
     for (const id of [
@@ -34,7 +32,7 @@ describe('OCV5-434 service tiers', () => {
   })
   it('every OpenCode Go Fast model is a real /responses model', () => {
     for (const id of OPENCODE_GO_FAST_MODELS) assert.ok(id in OPENCODE_GO_RESPONSES_MODELS, id)
-    for (const id of CODEX_FAST_MODELS) assert.ok(!(id in OPENCODE_GO_RESPONSES_MODELS), id)
+    for (const id of CODEX_EXPLICIT_STANDARD_MODELS) assert.ok(!(id in OPENCODE_GO_RESPONSES_MODELS), id)
   })
   it('only fast is a tier; the Go billing multiplier is the published 2×', () => {
     assert.equal(isServiceTier('fast'), true)
@@ -42,12 +40,8 @@ describe('OCV5-434 service tiers', () => {
       assert.equal(isServiceTier(v), false)
     assert.equal(OPENCODE_GO_FAST_BILLING_MULTIPLIER, '2.000')
   })
-  it('Codex Fast uses the catalog id priority; hints follow the shipped Codex catalog', () => {
-    assert.equal(CODEX_FAST_SERVICE_TIER, 'priority')
-    assert.equal(codexFastHint('gpt-6-luna'), '1.5x')
-    assert.equal(codexFastHint('gpt-6-luna-1m'), '1.5x')
-    assert.equal(codexFastHint('gpt-6-astra'), '2x')
-    assert.equal(codexFastHint('gpt-6.1-sol-1m'), '2x')
-    assert.equal(codexFastHint('opencode-gpt-6-luna'), null)
+  it('Codex GPT-6 models always send the explicit standard tier id', () => {
+    assert.equal(CODEX_STANDARD_SERVICE_TIER, 'default')
+    for (const id of ['gpt-6-luna', 'gpt-6-luna-1m', 'gpt-6-astra', 'gpt-6.1-sol']) assert.ok(CODEX_EXPLICIT_STANDARD_MODELS.has(id), id)
   })
 })

@@ -10,7 +10,6 @@ import {
   type PlatformReasoningEffort,
   contextFamilyByModelId,
   cursorFamilySupportsContextTier,
-  codexFastHint,
   fastServiceTierRoute,
   cursorFamilySupportsFast,
 } from '@openclaude/protocol'
@@ -286,8 +285,8 @@ export function ModelSelector({
   contextTier?: CursorContextTier | null
   onSelectContextTier?: (tier: CursorContextTier) => void
   /**
-   * OCV5-434 GPT Fast(OpenAI priority),会话级、默认关。只对 protocol serviceTiers 里的
-   * 模型显示:Codex GPT-6 家族(订阅额度 2.5×)与 OpenCode Go Luna(按 2× 计费)。
+   * OCV5-434 GPT Fast(OpenAI priority),会话级、默认关。只对 OpenCode Go Luna 显示(按 2× 计费);
+   * Codex 路线上游对本客户端不生效,按用户决定隐藏。
    */
   serviceTier?: ServiceTier | null
   onSelectServiceTier?: (tier: ServiceTier | null) => void
@@ -415,7 +414,6 @@ export function ModelSelector({
     onSelectContextTier != null
   const activeCursorContextTier: CursorContextTier = contextTier ?? DEFAULT_CURSOR_CONTEXT_TIER
   const gptFastRoute = fastServiceTierRoute(selectedId)
-  const gptFastHint = codexFastHint(selectedId)
   const showGptFast = gptFastRoute !== null && onSelectServiceTier != null
   const gptFastOn = serviceTier === 'fast'
   const showPlatformEffort =
@@ -858,11 +856,7 @@ export function ModelSelector({
               className="justify-between"
             >
               <span>
-                {gptFastRoute !== 'codex'
-                  ? 'Fast（更快，按 2× 计费）'
-                  : gptFastHint === '1.5x'
-                    ? 'Fast（约 1.5× 速度）'
-                    : 'Fast（约 2× 速度，订阅额度消耗更高）'}
+                Fast（更快，按 2× 计费）
               </span>
               {gptFastOn && <Check size={14} className="shrink-0 text-accent" />}
             </PickerItem>
