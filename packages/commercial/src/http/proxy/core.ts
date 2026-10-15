@@ -50,6 +50,7 @@ import {
 } from "./shared.js";
 import type { PreparedUpstreamSession } from "./upstream.js";
 import { createGeminiGoFetch } from "./geminiGoBridge.js";
+import { createOpenAIChatGoFetch } from "./openAiChatGoBridge.js";
 import {
   assertClaudeOAuthIdentity,
   ClaudeIdentityGuardError,
@@ -277,7 +278,12 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     if (session.dispatcher) fetchInit.dispatcher = session.dispatcher;
 
     const fetchStartMs = Date.now();
-    const roundTripFetch = session.transport === "gemini-go" ? createGeminiGoFetch(fetchFn) : fetchFn;
+    const roundTripFetch =
+      session.transport === "gemini-go"
+        ? createGeminiGoFetch(fetchFn)
+        : session.transport === "openai-chat-go"
+          ? createOpenAIChatGoFetch(fetchFn)
+          : fetchFn;
     let upstream = await roundTripFetch(session.endpoint, fetchInit);
     let upstreamErrorPreview: string | null = null;
     if (upstream.status === 400) {
@@ -286,7 +292,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       } catch {
         upstreamErrorPreview = "";
       }
-      if (!ctx.noHistoryRewriteRetry && session.transport !== "gemini-go" && isProviderBoundHistoryError(upstreamErrorPreview)) {
+      if (!ctx.noHistoryRewriteRetry && session.transport === undefined && isProviderBoundHistoryError(upstreamErrorPreview)) {
         const stripped = stripProviderBoundAssistantBlocks(upstreamMessages);
         if (stripped.blocksStripped > 0) {
           userLog.info("proxy_provider_bound_history_retry", {

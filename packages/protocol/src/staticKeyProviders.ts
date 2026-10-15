@@ -151,8 +151,42 @@ export const OPENCODE_GO_MESSAGES_MODELS: Readonly<Record<string, string>> = {
   'qwen3.7-plus-go': 'qwen3.7-plus',
 }
 
-function openCodeGoMessagesUpstream(modelId: string): string | undefined {
-  return OPENCODE_GO_MESSAGES_MODELS[modelId.toLowerCase()]
+/**
+ * OCV5-425 phase 2: OpenCode Go models that only answer on OpenAI `/chat/completions`, catalog
+ * id → upstream id. The proxy routes them through the chat bridge (openAiChatGoBridge).
+ */
+export const OPENCODE_GO_CHAT_MODELS: Readonly<Record<string, string>> = {
+  'glm-5.3-go': 'glm-5.3',
+  'glm-5.2-go': 'glm-5.2',
+  'glm-5.3-flash-go': 'glm-5.3-flash',
+  'kimi-k2.7-code-go': 'kimi-k2.7-code',
+  'kimi-k2.6-go': 'kimi-k2.6',
+  'mimo-v2.6-pro-go': 'mimo-v2.6-pro',
+  'mimo-v2.5-pro-go': 'mimo-v2.5-pro',
+  'mimo-v2.6-flash-go': 'mimo-v2.6-flash',
+  'mimo-v2.5-go': 'mimo-v2.5',
+  'hy4-preview-go': 'hy4-preview',
+  'hy3-go': 'hy3',
+  'longcat-2.0-go': 'longcat-2.0',
+  'longcat-2.5-preview-free-go': 'longcat-2.5-preview-free',
+  'step-5-preview-free-go': 'step-5-preview-free',
+}
+
+const OPENCODE_GO_CHAT_UPSTREAMS = new Set(Object.values(OPENCODE_GO_CHAT_MODELS))
+
+/** True when an OpenCode Go upstream model must go through the chat completions bridge. */
+export function isOpenCodeGoChatUpstream(upstreamModel: string): boolean {
+  return OPENCODE_GO_CHAT_UPSTREAMS.has(upstreamModel.toLowerCase())
+}
+
+/** Every OCV5-425 OpenCode Go catalog id (any wire format), catalog id → upstream id. */
+export const OPENCODE_GO_EXTRA_MODELS: Readonly<Record<string, string>> = {
+  ...OPENCODE_GO_MESSAGES_MODELS,
+  ...OPENCODE_GO_CHAT_MODELS,
+}
+
+function openCodeGoExtraUpstream(modelId: string): string | undefined {
+  return OPENCODE_GO_EXTRA_MODELS[modelId.toLowerCase()]
 }
 
 const DEEPSEEK: StaticKeyProviderSpec = {
@@ -167,7 +201,7 @@ const DEEPSEEK: StaticKeyProviderSpec = {
       modelId.startsWith('deepseek-') &&
       lower !== 'deepseek-v4-flash' &&
       lower !== 'deepseek-v4-flash-opencode-go' &&
-      openCodeGoMessagesUpstream(modelId) === undefined
+      openCodeGoExtraUpstream(modelId) === undefined
     )
   },
   inboundModelIds: ['deepseek-v4-pro'],
@@ -285,7 +319,7 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
       m === 'qwen3.7-max' ||
       m === 'qwen3.7-plus' ||
       m === 'gemini-4-argon-contributor' ||
-      openCodeGoMessagesUpstream(m) !== undefined
+      openCodeGoExtraUpstream(m) !== undefined
     )
   },
   inboundModelIds: [
@@ -294,7 +328,7 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
     'qwen3.7-max',
     'qwen3.7-plus',
     'gemini-4-argon-contributor',
-    ...Object.keys(OPENCODE_GO_MESSAGES_MODELS),
+    ...Object.keys(OPENCODE_GO_EXTRA_MODELS),
   ],
   canonicalizeForPricing(modelId) {
     const m = modelId.toLowerCase()
@@ -306,7 +340,7 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
           ? 'gemini-4-argon-contributor'
         : m === 'qwen3.7-plus'
           ? 'qwen3.7-plus'
-          : openCodeGoMessagesUpstream(m) !== undefined
+          : openCodeGoExtraUpstream(m) !== undefined
             ? m
             : null
   },
@@ -314,7 +348,7 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
     const m = modelId.toLowerCase()
     return m === 'deepseek-v4-flash' || m === 'deepseek-v4-flash-opencode-go'
       ? 'deepseek-v4-flash'
-      : m === 'gemini-4-argon-contributor' ? m : (openCodeGoMessagesUpstream(m) ?? modelId)
+      : m === 'gemini-4-argon-contributor' ? m : (openCodeGoExtraUpstream(m) ?? modelId)
   },
   stripHeaders: ['anthropic-beta'],
   // Go 的 Anthropic converter 接受 standard thinking/tool loop；firstParty-only 字段仍剥离。
@@ -330,6 +364,14 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
     'gemini-4-argon-contributor': ['low', 'medium', 'high'],
     'claude-haiku-5-5': ['low', 'medium', 'high', 'xhigh', 'max'],
     'qwen3.8-max': ['low', 'high'],
+    // Chat-completions bridge (reasoning_effort), g425/native-effort*.log, 3 samples each:
+    // GLM-5.2/5.3 rise low→medium→high; GLM-5.3 Flash, Hy3 and LongCat 2.0 only separate
+    // low from high. MiMo, Kimi K2.x, Hy4, LongCat 2.5 and Step 5 show no stable effect.
+    'glm-5.3': ['low', 'medium', 'high'],
+    'glm-5.2': ['low', 'medium', 'high'],
+    'glm-5.3-flash': ['low', 'high'],
+    'hy3': ['low', 'high'],
+    'longcat-2.0': ['low', 'high'],
   },
   maxInputTokens: 1_000_000,
   // 红/蓝图像探针只消耗 reasoning、无可验证文本结果，按纯文本接入并启用 vision 工具兜底。

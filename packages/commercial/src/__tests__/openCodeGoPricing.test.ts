@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { OPENCODE_GO_MESSAGES_MODELS } from '@openclaude/protocol'
+import { OPENCODE_GO_EXTRA_MODELS } from '@openclaude/protocol'
 
 import { GO_CATALOG_MODELS, goPricingFen, usdToFen } from '../admin/openCodeGoCatalog.js'
 
@@ -35,9 +35,23 @@ describe('OpenCode Go pricing', () => {
       'qwen3.8-max-go': [100, 300, 12, 125], // $2 / $6 / $0.25 / $2.50
       'qwen3.8-flash-go': [7, 23, 1, 10], // $0.15 / $0.47 / $0.016 / $0.20
       'qwen3.7-plus-go': [20, 80, 2, 25], // ≤256K $0.40 / $1.60 / $0.04 / $0.50
+      'glm-5.3-go': [70, 220, 13, 0], // $1.40 / $4.40 / $0.26
+      'glm-5.2-go': [70, 220, 13, 0],
+      'glm-5.3-flash-go': [7, 25, 1, 0], // $0.15 / $0.50 / $0.03
+      'kimi-k2.7-code-go': [47, 200, 9, 0], // $0.95 / $4.00 / $0.19
+      'kimi-k2.6-go': [47, 200, 8, 0], // $0.95 / $4.00 / $0.16
+      'mimo-v2.6-pro-go': [21, 43, 1, 0], // $0.435 / $0.87 / $0.003625
+      'mimo-v2.5-pro-go': [21, 43, 1, 0],
+      'mimo-v2.6-flash-go': [7, 14, 1, 0], // $0.14 / $0.28 / $0.0028
+      'mimo-v2.5-go': [7, 14, 1, 0],
+      'hy4-preview-go': [41, 125, 2, 0], // $0.834 / $2.501 / $0.042
+      'hy3-go': [7, 29, 1, 0], // $0.14 / $0.58 / $0.035
+      'longcat-2.0-go': [15, 60, 1, 0], // $0.30 / $1.20 / $0.006
+      'longcat-2.5-preview-free-go': [0, 0, 0, 0], // Free (limited time)
+      'step-5-preview-free-go': [0, 0, 0, 0], // Free (limited time)
     }
     assert.deepEqual(GO_CATALOG_MODELS.map((m) => m.modelId).sort(), Object.keys(expected).sort())
-    assert.deepEqual(Object.keys(OPENCODE_GO_MESSAGES_MODELS).sort(), Object.keys(expected).sort())
+    assert.deepEqual(Object.keys(OPENCODE_GO_EXTRA_MODELS).sort(), Object.keys(expected).sort())
     for (const m of GO_CATALOG_MODELS) {
       const fen = goPricingFen(m)
       assert.deepEqual(

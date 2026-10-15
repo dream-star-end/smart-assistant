@@ -62,6 +62,7 @@ import type { SelectedApiKey } from "../../account-pool/apiKeyPool.js";
 import {
   findRouteProviderForModel,
   getStaticProvider,
+  isOpenCodeGoChatUpstream,
   staticProviderOutputConfigEfforts,
   type StaticKeyProviderSpec,
   type StaticProviderId,
@@ -349,7 +350,7 @@ export interface PreparedUpstreamSession {
   /** 上游 URL;OAuth = `deps.upstreamEndpoint ?? DEFAULT`;静态 = `spec.upstreamEndpoint` */
   readonly endpoint: string;
   /** Exact, trusted static-provider transport selection, never a client flag. */
-  readonly transport?: "gemini-go";
+  readonly transport?: "gemini-go" | "openai-chat-go";
   /**
    * **转发给上游的 model 名**(模型权威批次 §1.3)。
    *
@@ -571,7 +572,10 @@ function makeStaticKeyUpstream(
     personaTimezone: null,
     endpoint: spec.upstreamEndpoint,
     ...(spec.id === "opencodego" && upstreamModel.toLowerCase() === "gemini-4-argon-contributor"
-      ? { transport: "gemini-go" as const } : {}),
+      ? { transport: "gemini-go" as const }
+      : spec.id === "opencodego" && isOpenCodeGoChatUpstream(upstreamModel)
+        ? { transport: "openai-chat-go" as const }
+        : {}),
     upstreamModel,
     dispatcher,
     shouldUpdateQuotaFromResponse: false,

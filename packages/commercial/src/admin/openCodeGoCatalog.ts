@@ -1,12 +1,12 @@
 import {
-  OPENCODE_GO_MESSAGES_MODELS,
+  OPENCODE_GO_EXTRA_MODELS,
   getStaticProvider,
   staticProviderOutputConfigEfforts,
 } from '@openclaude/protocol'
 /**
  * OCV5-425 OpenCode Go catalog data and the selfhost operation that applies it
  * (scripts/ocv5-425/catalog.ts). The apply runs inside the caller's transaction and refuses any
- * drift from the reviewed rows. Routing and effort tiers come from protocol (OPENCODE_GO_MESSAGES_MODELS,
+ * drift from the reviewed rows. Routing and effort tiers come from protocol (OPENCODE_GO_EXTRA_MODELS,
  * the opencodego spec's modelOutputConfigEfforts); this file only adds what the catalog stores.
  *
  * Prices: https://opencode.ai/docs/go/ (fetched 2026-10-15, cross-checked with
@@ -117,11 +117,138 @@ const rows: Array<Omit<GoCatalogModel, 'upstreamModelId'>> = [
     sortOrder: 308,
     defaultEffort: null,
   },
+  // Phase 2 (chat completions bridge). Thinking stays upstream; free preview models cost 0.
+  {
+    modelId: 'glm-5.3-go',
+    displayName: 'GLM-5.3 (Go)',
+    contextWindow: 1_000_000,
+    supportsThinking: false,
+    usd: { input: '1.40', output: '4.40', cacheRead: '0.26', cacheWrite: null },
+    sortOrder: 309,
+    defaultEffort: null,
+  },
+  {
+    modelId: 'glm-5.2-go',
+    displayName: 'GLM-5.2 (Go)',
+    contextWindow: 1_000_000,
+    supportsThinking: false,
+    usd: { input: '1.40', output: '4.40', cacheRead: '0.26', cacheWrite: null },
+    sortOrder: 310,
+    defaultEffort: null,
+  },
+  {
+    modelId: 'glm-5.3-flash-go',
+    displayName: 'GLM-5.3 Flash (Go)',
+    contextWindow: 1_000_000,
+    supportsThinking: false,
+    usd: { input: '0.15', output: '0.50', cacheRead: '0.03', cacheWrite: null },
+    sortOrder: 311,
+    defaultEffort: null,
+  },
+  {
+    modelId: 'kimi-k2.7-code-go',
+    displayName: 'Kimi K2.7 Code (Go)',
+    contextWindow: 262_144,
+    supportsThinking: false,
+    usd: { input: '0.95', output: '4.00', cacheRead: '0.19', cacheWrite: null },
+    sortOrder: 312,
+    defaultEffort: null,
+  },
+  {
+    modelId: 'kimi-k2.6-go',
+    displayName: 'Kimi K2.6 (Go)',
+    contextWindow: 262_144,
+    supportsThinking: false,
+    usd: { input: '0.95', output: '4.00', cacheRead: '0.16', cacheWrite: null },
+    sortOrder: 313,
+    defaultEffort: null,
+  },
+  {
+    modelId: 'mimo-v2.6-pro-go',
+    displayName: 'MiMo V2.6 Pro (Go)',
+    contextWindow: 1_048_576,
+    supportsThinking: false,
+    usd: { input: '0.435', output: '0.87', cacheRead: '0.003625', cacheWrite: null },
+    sortOrder: 314,
+    defaultEffort: null,
+  },
+  {
+    modelId: 'mimo-v2.5-pro-go',
+    displayName: 'MiMo V2.5 Pro (Go)',
+    contextWindow: 1_048_576,
+    supportsThinking: false,
+    usd: { input: '0.435', output: '0.87', cacheRead: '0.003625', cacheWrite: null },
+    sortOrder: 315,
+    defaultEffort: null,
+  },
+  {
+    modelId: 'mimo-v2.6-flash-go',
+    displayName: 'MiMo V2.6 Flash (Go)',
+    contextWindow: 1_048_576,
+    supportsThinking: false,
+    usd: { input: '0.14', output: '0.28', cacheRead: '0.0028', cacheWrite: null },
+    sortOrder: 316,
+    defaultEffort: null,
+  },
+  {
+    modelId: 'mimo-v2.5-go',
+    displayName: 'MiMo V2.5 (Go)',
+    contextWindow: 1_000_000,
+    supportsThinking: false,
+    usd: { input: '0.14', output: '0.28', cacheRead: '0.0028', cacheWrite: null },
+    sortOrder: 317,
+    defaultEffort: null,
+  },
+  {
+    modelId: 'hy4-preview-go',
+    displayName: 'Hy4 Preview (Go)',
+    contextWindow: 1_024_000,
+    supportsThinking: false,
+    usd: { input: '0.834', output: '2.501', cacheRead: '0.042', cacheWrite: null },
+    sortOrder: 318,
+    defaultEffort: null,
+  },
+  {
+    modelId: 'hy3-go',
+    displayName: 'Hy3 (Go)',
+    contextWindow: 192_000,
+    supportsThinking: false,
+    usd: { input: '0.14', output: '0.58', cacheRead: '0.035', cacheWrite: null },
+    sortOrder: 319,
+    defaultEffort: null,
+  },
+  {
+    modelId: 'longcat-2.0-go',
+    displayName: 'LongCat 2.0 (Go)',
+    contextWindow: 1_000_000,
+    supportsThinking: false,
+    usd: { input: '0.30', output: '1.20', cacheRead: '0.006', cacheWrite: null },
+    sortOrder: 320,
+    defaultEffort: null,
+  },
+  {
+    modelId: 'longcat-2.5-preview-free-go',
+    displayName: 'LongCat 2.5 Preview Free (Go)',
+    contextWindow: 1_000_000,
+    supportsThinking: false,
+    usd: { input: '0', output: '0', cacheRead: '0', cacheWrite: null },
+    sortOrder: 321,
+    defaultEffort: null,
+  },
+  {
+    modelId: 'step-5-preview-free-go',
+    displayName: 'Step 5 Preview Free (Go)',
+    contextWindow: 1_000_000,
+    supportsThinking: false,
+    usd: { input: '0', output: '0', cacheRead: '0', cacheWrite: null },
+    sortOrder: 322,
+    defaultEffort: null,
+  },
 ]
 
 export const GO_CATALOG_MODELS: readonly GoCatalogModel[] = rows.map((row) => {
-  const upstreamModelId = OPENCODE_GO_MESSAGES_MODELS[row.modelId]
-  if (!upstreamModelId) throw new Error(`${row.modelId} is not in OPENCODE_GO_MESSAGES_MODELS`)
+  const upstreamModelId = OPENCODE_GO_EXTRA_MODELS[row.modelId]
+  if (!upstreamModelId) throw new Error(`${row.modelId} is not in OPENCODE_GO_EXTRA_MODELS`)
   return { ...row, upstreamModelId }
 })
 
