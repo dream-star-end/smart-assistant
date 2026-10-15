@@ -249,21 +249,15 @@ describe('CodexAppServerRunner turn/start params', () => {
     await h.cleanup()
   })
 
-  it('OCV5-434: Fast-capable models always state their tier; others are left unchanged', async () => {
+  it('OCV5-434: Codex GPT-6 turns always send explicit standard and never priority', async () => {
     for (const model of ['gpt-6-luna', 'gpt-6-astra-1m', 'gpt-6.1-sol']) {
       const h = await makeHarness({ model })
-      // Default off: an explicit "default" keeps a plan's own Fast default from applying.
       assert.equal((h.runner as any).buildTurnStartParams('hi').serviceTierForTurn, 'default')
-      assert.equal(h.runner.setServiceTier('fast'), 'applied')
-      // Codex catalog id: "priority" (a bare "fast" is silently ignored by turn/start).
-      assert.equal((h.runner as any).buildTurnStartParams('hi').serviceTierForTurn, 'priority')
-      assert.equal(h.runner.setServiceTier('fast'), 'unchanged')
-      assert.equal(h.runner.setServiceTier(null), 'applied')
-      assert.equal((h.runner as any).buildTurnStartParams('hi').serviceTierForTurn, 'default')
+      // No Fast path on Codex: the runner does not take a service tier at all.
+      assert.equal(typeof (h.runner as any).setServiceTier, 'undefined')
       await h.cleanup()
     }
     const h = await makeHarness({ model: 'gpt-5.6-sol' })
-    h.runner.setServiceTier('fast')
     assert.equal('serviceTierForTurn' in (h.runner as any).buildTurnStartParams('hi'), false)
     await h.cleanup()
   })
