@@ -2043,7 +2043,13 @@ user_contract_gate() {
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
     V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
     V5_CANARY_PASSWORD_FILE="$password_file" \
-    node "$SCRIPT_DIR/v5-go-cache-contract.mjs"
+    node "$SCRIPT_DIR/v5-go-cache-contract.mjs" || return 1
+  # OCV5-435: a Stop sent while the turn's engine is still starting must stop that turn
+  # (INC-20261015-PRESTART-STOP-LOST answered it TURN_NOT_ACTIVE and the turn ran unseen).
+  V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
+    V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
+    V5_CANARY_PASSWORD_FILE="$password_file" \
+    node "$SCRIPT_DIR/v5-stop-before-start-contract.mjs"
 }
 
 cmd_smoke() {
