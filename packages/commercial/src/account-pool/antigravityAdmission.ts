@@ -7,7 +7,8 @@ import { mintAntigravityRelayRoute } from '../billing/antigravityRouteContext.js
  */
 import { antigravityModelCoolingUntil } from './antigravityModelCooldown.js'
 import { mintAntigravityLimitedToken } from './antigravityOAuth.js'
-import { pickAntigravityAccount, reportAntigravityOutcome } from './antigravityPool.js'
+import { ANTIGRAVITY_AFFINITY_SERVICE, pickAntigravityAccount, reportAntigravityOutcome } from './antigravityPool.js'
+import { acquireInflight, noteAdmission } from './policy/affinity.js'
 
 export interface AntigravityRouteGrant {
   token: string
@@ -52,6 +53,7 @@ export async function admitAntigravityTurn(
   let cooled = false
   const coolingUntil = deps.modelCoolingUntil ?? antigravityModelCoolingUntil
   const account = await (deps.pick ?? pickAntigravityAccount)({
+    userId: args.userId,
     skip: async (accountId) => {
       // A KV hiccup must not block admission: treat the model as usable.
       const until = await coolingUntil(accountId, args.modelId).catch(() => null)
@@ -84,6 +86,9 @@ export async function admitAntigravityTurn(
     budgetCredits: args.budgetCredits,
     relayPort: args.relayPort,
   })
+  // Per-account caps (OCV5-424): released when the turn settles (settleAntigravityTurnRecord).
+  noteAdmission(ANTIGRAVITY_AFFINITY_SERVICE, account.accountId.toString())
+  acquireInflight(ANTIGRAVITY_AFFINITY_SERVICE, account.accountId.toString(), args.requestId)
   return {
     token: route.token,
     baseUrl: route.baseUrl,

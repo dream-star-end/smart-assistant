@@ -11,6 +11,7 @@ import type { Pool } from 'pg'
 import { type TokenUsage, computeCost } from './calculator.js'
 import type { ModelPricing, PricingCache } from './pricing.js'
 import { type SettleResult, settleUsageAndLedger } from './proxyBilling.js'
+import { releaseInflight } from '../account-pool/policy/affinity.js'
 
 export type AntigravityEngineStatus = 'success' | 'error' | 'unavailable'
 
@@ -202,6 +203,8 @@ export async function settleAntigravityTurnRecord(args: {
   /** Reconcile pass: also take over a 'settling' row abandoned by a crash. */
   staleBefore?: Date
 }): Promise<SettledTurn | null> {
+  // The turn is over: free its in-flight slot on the account (OCV5-424 per-account cap).
+  releaseInflight(args.requestId)
   // A reconcile pass ('unknown') never overwrites a terminal status a bridge
   // already persisted: an error turn whose first settle attempt failed must
   // stay free (Codex r2 P1).

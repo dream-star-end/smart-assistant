@@ -20,6 +20,7 @@ import { scopeBoxExecToProfile } from "./boxProfileExec.js";
 import { boxLoginCandidates } from "./boxLoginCandidates.js";
 import { BOX_PROFILE_POLICY, pickBoxProfile, type BoxProfileCandidate,
   type BoxProfilePolicy } from "./boxProfileScheduler.js";
+import { affinitySettings, resolveAffinity } from "../../account-pool/policy/affinity.js";
 import type { BoxResolvedTarget } from "./boxTextFetch.js";
 import { rootLogger } from "../../logging/logger.js";
 
@@ -166,6 +167,32 @@ export function readBoxUidProxy(uid: bigint): string {
   } finally { if (fd !== undefined) closeSync(fd); }
 }
 
+/** OCV5-424 user affinity over Box logins (account × profile). Best-effort: null → normal pick. */
+async function boxUserAffinityPick(uid: bigint, candidates: readonly BoxProfileCandidate[]): Promise<BoxProfileCandidate | null> {
+  const key = (c: BoxProfileCandidate) => `${c.accountId}:${c.profile}`;
+  const usable = candidates.filter((c) => !c.cooldownActive && (c.utilization === null || c.utilization < BOX_CHAT_SWITCH_AT));
+  if (usable.length === 0) return null;
+  try {
+    const caps = await affinitySettings();
+    const resolved = await resolveAffinity({
+      service: "box",
+      userId: uid,
+      candidates: usable.map((c) => ({ memberKind: "box_profile" as const, id: key(c), capacity: c.weight })),
+      maxUsers: caps.maxUsersPerSubscription,
+      boundState: async (b) => {
+        const c = candidates.find((x) => key(x) === b.memberId);
+        if (!c) return { status: null, cooldownReason: null, cooldownUntil: null };
+        // Out of quota (benched on quota or at the switch line) is persistent; other benches are short.
+        const outOfQuota = c.cooldownQuotaOnly === true || (c.utilization !== null && c.utilization >= BOX_CHAT_SWITCH_AT);
+        return { status: "cooldown", cooldownReason: outOfQuota ? "quota" : null, cooldownUntil: null };
+      },
+    });
+    return resolved ? usable.find((c) => key(c) === resolved.member.id) ?? null : null;
+  } catch {
+    return null;
+  }
+}
+
 export class BoxAccountResolver {
   private readonly orphanedAgents = new Set<OwnedProxy>();
   constructor(private readonly deps: BoxAccountResolverDeps) {}
@@ -268,7 +295,11 @@ export class BoxAccountResolver {
     const stay = last && last.expires > nowMs ? candidates.find((c) => c.accountId === last.accountId
       && c.profile === last.profile && !c.cooldownActive
       && (c.utilization === null || c.utilization < BOX_CHAT_SWITCH_AT)) : undefined;
-    const pick = stay ? { candidate: stay, reason: "session" }
+    // OCV5-424: a new chat goes to the user's bound login (user affinity across chats);
+    // pickBoxProfile stays the fallback when there is no usable binding.
+    const userPick = stay ? null : await boxUserAffinityPick(args.uid, candidates);
+    const pick = stay ? { candidate: stay, reason: "session" as const }
+      : userPick ? { candidate: userPick, reason: "user" as const }
       : pickBoxProfile({ candidates, affinityKey: args.uid.toString(),
         ...(profiles.policy ? { policy: profiles.policy } : {}) });
     if (!pick) return null;

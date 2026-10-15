@@ -37,6 +37,7 @@ import type { AccountHealthTracker } from './health.js'
 import { activePoolWhere } from './poolCandidates.js'
 import type { PoolOutcome } from './policy/outcome.js'
 import { defaultHash, wrhScore } from './policy/select.js'
+import { affinitySettings, noteAdmission, resolveAffinity, underRateCap } from './policy/affinity.js'
 import { hoursUntil, quotaHeadroom, resetProximityFactor } from './poolWeight.js'
 import {
   type AccountPlan,
@@ -1107,7 +1108,14 @@ export class AccountScheduler {
       ? input.sessionId
       : this.ephemeralKey()
 
-    const result = await this.runWRHLoop(wrhPool, wrhKey)
+    // OCV5-424 user affinity (docs/ocv5-424-user-affinity.md): a user's sessions in
+    // this provider's pool go to one bound account. Only new sessions / repins reach
+    // here (a hit pin returned above), so in-session stickiness is unchanged. The
+    // bound account runs through the same WRH loop alone; if it cannot serve, the
+    // full pool below decides as before (never a new failure mode).
+    let result: PickResult | null = await this.pickByUserAffinity(provider, input.userId ?? null, wrhPool, wrhKey)
+    if (result === null) result = await this.runWRHLoop(wrhPool, wrhKey)
+    noteAdmission(provider, result.account_id.toString())
 
     // ─────────────────────────────────────────────────────────────────
     // Pin postlude
@@ -1173,6 +1181,55 @@ export class AccountScheduler {
       })
     }
     return result
+  }
+
+  /**
+   * OCV5-424 user affinity for this provider. Candidates = this request's pool minus
+   * accounts at the in-flight or per-minute cap (spill, binding unchanged). Returns
+   * null to let the caller run the full WRH loop (no user, no candidates, the
+   * chosen account could not serve, or the affinity store failed).
+   */
+  private async pickByUserAffinity(
+    provider: AccountProvider,
+    userId: bigint | string | null,
+    wrhPool: CandidateRow[],
+    wrhKey: string,
+  ): Promise<PickResult | null> {
+    if (userId === null || userId === undefined || String(userId) === '') return null
+    try {
+      const caps = await affinitySettings()
+      const now = this.now()
+      const open = wrhPool.filter(
+        (c) => (this.slots.get(c.id)?.size ?? 0) < this.maxConcurrent && underRateCap(provider, c.id, caps.ratePerMin),
+      )
+      if (open.length === 0) return null
+      const resolved = await resolveAffinity({
+        service: provider,
+        userId,
+        candidates: open.map((c) => ({
+          memberKind: 'account' as const,
+          id: c.id,
+          capacity: computeAccountWeight(c, now),
+        })),
+        maxUsers: caps.maxUsersPerSubscription,
+        boundState: async (b) => {
+          const r = await query<{ status: string; cooldown_reason: string | null; cooldown_until: Date | null }>(
+            'SELECT status, cooldown_reason, cooldown_until FROM claude_accounts WHERE id = $1',
+            [b.memberId],
+          )
+          const row = r.rows[0]
+          return row
+            ? { status: row.status, cooldownReason: row.cooldown_reason, cooldownUntil: row.cooldown_until }
+            : { status: null, cooldownReason: null, cooldownUntil: null }
+        },
+      })
+      if (!resolved) return null
+      const row = open.find((c) => c.id === resolved.member.id)
+      if (!row) return null
+      return await this.runWRHLoop([row], wrhKey)
+    } catch {
+      return null
+    }
   }
 
   /**

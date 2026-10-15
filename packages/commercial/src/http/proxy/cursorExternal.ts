@@ -77,7 +77,42 @@ import {
   type AccountRow,
   type CursorTokenSnapshot,
 } from "../../account-pool/store.js";
-import { selectCursorAccount } from "../../account-pool/cursorAccountSelection.js";
+import { cursorSelectableAccounts, selectCursorAccount } from "../../account-pool/cursorAccountSelection.js";
+import { affinitySettings, resolveAffinity, underRateCap, noteAdmission } from "../../account-pool/policy/affinity.js";
+
+/**
+ * OCV5-424 user affinity for the Cursor pool: the user's bound account among the
+ * selectable ones (spill/migrate per the shared rules). Null → the previous sticky /
+ * weighted pick decides. Best-effort: never blocks a request.
+ */
+async function cursorUserAffinity(
+  uid: bigint,
+  args: { accounts: AccountRow[]; model: string; now: Date; cooled: ReadonlySet<string> },
+): Promise<bigint | null> {
+  try {
+    const caps = await affinitySettings();
+    const selectable = cursorSelectableAccounts(args).filter(({ row }) =>
+      underRateCap("cursor", row.id.toString(), caps.ratePerMin));
+    if (selectable.length === 0) return null;
+    const resolved = await resolveAffinity({
+      service: "cursor",
+      userId: uid,
+      candidates: selectable.map(({ row, weight }) => ({ memberKind: "account" as const, id: row.id.toString(), capacity: weight })),
+      maxUsers: caps.maxUsersPerSubscription,
+      boundState: async (b) => {
+        const row = args.accounts.find((r) => r.id.toString() === b.memberId);
+        if (!row) return { status: null, cooldownReason: null, cooldownUntil: null };
+        if (args.cooled.has(b.memberId)) return { status: "cooldown", cooldownReason: null, cooldownUntil: null };
+        return { status: row.status, cooldownReason: null, cooldownUntil: row.cooldown_until ?? null };
+      },
+    });
+    if (!resolved) return null;
+    noteAdmission("cursor", resolved.member.id);
+    return BigInt(resolved.member.id);
+  } catch {
+    return null;
+  }
+}
 export { selectCursorAccount, CURSOR_EXTERNAL_SESSION_MIN_REMAINING_MS } from
   "../../account-pool/cursorAccountSelection.js";
 import { incrAnthropicProxyReject, incrAnthropicProxySettle } from "../../admin/metrics.js";
@@ -394,7 +429,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
         model,
         now: nowDate,
         cooled: excluded,
-        sticky: stickyFor(uid, nowMs),
+        sticky: (await cursorUserAffinity(uid, { accounts, model, now: nowDate, cooled: excluded })) ?? stickyFor(uid, nowMs),
       });
       if (!account) break;
       try {

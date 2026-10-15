@@ -1372,7 +1372,7 @@ export function makeAnthropicProxyHandler(
           scheduler: deps.scheduler,
           refreshDeps: deps.refreshDeps,
           staticProviderKeys: deps.staticProviderKeys,
-          selectApiKey: deps.apiKeyPoolEnabled ? (service, sticky) => selectApiKey(service, sticky) : undefined,
+          selectApiKey: deps.apiKeyPoolEnabled ? (service, sticky, userId) => selectApiKey(service, sticky, undefined, { userId }) : undefined,
           apiKeyPoolHasMembers: deps.apiKeyPoolEnabled ? apiKeyPoolHasMembers : undefined,
           upstreamEndpoint: deps.upstreamEndpoint,
           // Phase 6 account_uuid 锚定 flag(plan §3.0)— v1.0.207 起从 system_settings

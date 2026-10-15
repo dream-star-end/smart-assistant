@@ -21,6 +21,14 @@ import { getPool } from '../db/index.js'
 import { query } from '../db/queries.js'
 import type { PoolOutcome } from './policy/outcome.js'
 import { GEMINI_OAUTH_MEMBERS, applyTableMemberOutcome } from './policy/tableMembers.js'
+import {
+  affinitySettings,
+  inflightCount,
+  resolveAffinity,
+  underRateCap,
+  type AffinityAction,
+} from './policy/affinity.js'
+import { healthWeight } from './policy/select.js'
 
 export type AntigravityPoolOutcome =
   | { kind: 'success' }
@@ -66,35 +74,101 @@ export function classifyAntigravityUpstream(
 export interface AntigravityAccountPick {
   accountId: bigint
   email: string
+  /** How user affinity chose it (absent without a userId). */
+  affinity?: AffinityAction
 }
 
+/** Affinity key of the Antigravity subscription pool (one binding per user). */
+export const ANTIGRAVITY_AFFINITY_SERVICE = 'antigravity'
+
 /**
- * Healthiest selectable account: active first, then health, then the least
- * recently used. An expired rate-limit/quota/upstream cooldown is half-open;
- * an auth/credential cooldown waits for the recovery probe (a turn would only
- * fail again on a dead grant). `skip` drops accounts on which the turn's model
- * is cooling down.
+ * Account for this turn. Selectable = active, or an expired rate-limit/quota/
+ * upstream cooldown (half-open); an auth/credential cooldown waits for the
+ * recovery probe. `skip` drops accounts on which the turn's model is cooling.
+ *
+ * With a userId the shared user affinity decides (docs/ocv5-424-user-affinity.md):
+ * the user's bound account when selectable; another one for this turn only when
+ * it is temporarily out (this model cooling, short cooldown); a rebind when it is
+ * persistently out; new users go to the account with the fewest bound users.
+ * Without a userId: healthiest, then least recently used (legacy order).
  */
 export async function pickAntigravityAccount(
   deps: {
     pool?: Pick<Pool, 'query'>
     skip?: (accountId: bigint) => Promise<boolean>
+    userId?: bigint | null
   } = {},
 ): Promise<AntigravityAccountPick | null> {
-  const res = await (deps.pool ?? getPool()).query<{ id: string; email: string }>(
-    `SELECT id::text AS id, email FROM gemini_oauth_accounts
+  const res = await (deps.pool ?? getPool()).query<{
+    id: string
+    email: string
+    health_score: number
+    last_used_at: Date | null
+  }>(
+    `SELECT id::text AS id, email, health_score, last_used_at FROM gemini_oauth_accounts
       WHERE disabled_by IS NULL
         AND (status = 'active'
              OR (status = 'cooldown' AND cooldown_until <= NOW()
                  AND cooldown_reason IN ('rate_limited', 'quota', 'upstream')))
       ORDER BY (status = 'active') DESC, health_score DESC, last_used_at ASC NULLS FIRST, id ASC`,
   )
+  const usable: typeof res.rows = []
   for (const row of res.rows) {
-    const accountId = BigInt(row.id)
-    if (deps.skip && (await deps.skip(accountId))) continue
-    return { accountId, email: row.email }
+    if (deps.skip && (await deps.skip(BigInt(row.id)))) continue
+    usable.push(row)
   }
-  return null
+  if (usable.length === 0) return null
+  if (deps.userId === undefined || deps.userId === null) {
+    return { accountId: BigInt(usable[0].id), email: usable[0].email }
+  }
+  // Per-account caps (docs §6): an account at its in-flight or per-minute cap is
+  // left out for this turn only (spill); when every account is capped, use them anyway.
+  const caps = await affinitySettings()
+  const open = usable.filter(
+    (r) =>
+      inflightCount(ANTIGRAVITY_AFFINITY_SERVICE, r.id) < caps.antigravityInflight &&
+      underRateCap(ANTIGRAVITY_AFFINITY_SERVICE, r.id, caps.antigravityRatePerMin),
+  )
+  const candidates = open.length > 0 ? open : usable
+  let resolved: Awaited<ReturnType<typeof resolveAffinity>> = null
+  try {
+    resolved = await resolveAffinity({
+      service: ANTIGRAVITY_AFFINITY_SERVICE,
+      userId: deps.userId,
+      candidates: candidates.map((r) => ({
+        memberKind: 'account' as const,
+        id: r.id,
+        capacity: healthWeight(r.health_score),
+        lastUsedAt: r.last_used_at,
+      })),
+      maxUsers: caps.maxUsersPerSubscription,
+      boundState: async (b) => {
+        const st = await (deps.pool ?? getPool()).query<{
+          status: string
+          cooldown_reason: string | null
+          cooldown_until: Date | null
+        }>(
+          'SELECT status, cooldown_reason, cooldown_until FROM gemini_oauth_accounts WHERE id = $1',
+          [b.memberId],
+        )
+        const row = st.rows[0]
+        return row
+          ? {
+              status: row.status,
+              cooldownReason: row.cooldown_reason,
+              cooldownUntil: row.cooldown_until,
+            }
+          : { status: null, cooldownReason: null, cooldownUntil: null }
+      },
+    })
+  } catch {
+    // Affinity is best-effort: the store failing must not block a turn (legacy order serves).
+    return { accountId: BigInt(candidates[0].id), email: candidates[0].email }
+  }
+  if (!resolved) return null
+  const picked = resolved
+  const row = candidates.find((r) => r.id === picked.member.id) ?? candidates[0]
+  return { accountId: BigInt(row.id), email: row.email, affinity: picked.action }
 }
 
 /** Map an Antigravity outcome to the shared pool outcome (model_unavailable excluded). */

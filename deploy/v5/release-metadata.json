@@ -178,7 +178,8 @@
     "0303_box_claude_profiles",
     "0304_billing_workload_column",
     "0306_pool_policy",
-    "0307_antigravity_engine"
+    "0307_antigravity_engine",
+    "0308_pool_user_affinity"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

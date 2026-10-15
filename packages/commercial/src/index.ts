@@ -169,6 +169,8 @@ import {
 } from "./account-pool/apiKeyPool.js";
 import { createGeminiPoolAdapter } from "./account-pool/geminiPoolAdapter.js";
 import { registerPoolAdapter, startPoolRecoveryActor } from "./account-pool/policy/registry.js";
+import { configureAffinitySettings } from "./account-pool/policy/affinity.js";
+import { getSystemSetting } from "./admin/systemSettings.js";
 import { startCursorAuthSyncActor } from "./account-pool/cursorMaterializer.js";
 import { startCursorSandPreparationActor } from "./account-pool/cursorSandActor.js";
 import { startCursorUsageSweeper } from "./account-pool/cursorUsageSweeper.js";
@@ -1943,6 +1945,8 @@ export async function registerCommercial(
           provider: "grok",
           groupId: group.id,
           sessionId: sessionId ?? `container:${containerId}`,
+          // OCV5-424: user affinity (no pinMode → no session pin / 409 flow).
+          userId,
         });
       } catch (err) {
         if (err instanceof AccountPoolBusyError) { busy = err; continue; }
@@ -6183,6 +6187,13 @@ export async function registerCommercial(
   registerPoolAdapter(createAccountPoolAdapter({ health: healthTracker, triggerCodexDisableFanout }));
   registerPoolAdapter(createApiKeyPoolAdapter());
   registerPoolAdapter(createRelayKeyPoolAdapter());
+  // OCV5-424 user affinity caps: admin system settings, cached 60s in policy/affinity.
+  configureAffinitySettings(async () => ({
+    maxUsersPerSubscription: (await getSystemSetting("pool_affinity_max_users_per_subscription")).value,
+    ratePerMin: (await getSystemSetting("pool_affinity_rate_per_min")).value,
+    antigravityInflight: (await getSystemSetting("pool_affinity_antigravity_inflight")).value,
+    antigravityRatePerMin: (await getSystemSetting("pool_affinity_antigravity_rate_per_min")).value,
+  }));
   registerPoolAdapter(createGeminiPoolAdapter({
     clientSecret: () => process.env.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET?.trim() ?? "",
   }));

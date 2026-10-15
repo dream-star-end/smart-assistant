@@ -18,6 +18,7 @@
  */
 
 import { createHash } from 'node:crypto'
+import { resolveAffinity } from './policy/affinity.js'
 import { decryptToBuffer, encrypt } from '../crypto/aead.js'
 import { loadKmsKey } from '../crypto/keys.js'
 import { query } from '../db/queries.js'
@@ -178,18 +179,50 @@ export async function selectApiKey(
   service: string,
   stickyKey: string,
   keyFn: () => Buffer = loadKmsKey,
+  opts: { userId?: bigint | string | null } = {},
 ): Promise<SelectedApiKey | null> {
   const now = Date.now()
   const usable = (await rows()).filter(
     (r) => r.service === service && r.status === 'active' && (r.cooldown_until === null || r.cooldown_until.getTime() <= now),
   )
   if (usable.length === 0) return null
-  const ranked = rankWRH(usable, {
+  let ranked = rankWRH(usable, {
     key: stickyKey,
     id: (r) => r.id,
     weight: (r) => healthWeight(r.health_score, r.weight),
     tier: (r) => r.tier,
   })
+  // OCV5-424 user affinity: within the best available tier, the user's bound key
+  // first (spill/migrate per the shared rules); the WRH order stays the fallback.
+  if (opts.userId !== undefined && opts.userId !== null && String(opts.userId) !== '') {
+    try {
+      const bestTier = Math.min(...usable.map((r) => r.tier))
+      const tierRows = usable.filter((r) => r.tier === bestTier)
+      const resolved = await resolveAffinity({
+        service: `apikey:${service}`,
+        userId: opts.userId,
+        candidates: tierRows.map((r) => ({
+          memberKind: 'api_key' as const,
+          id: r.id,
+          capacity: healthWeight(r.health_score, r.weight),
+          lastUsedAt: r.last_used_at,
+        })),
+        maxUsers: null,
+        boundState: async (b) => {
+          const row = (await rows()).find((r) => r.id === b.memberId)
+          return row
+            ? { status: row.status, cooldownReason: row.cooldown_reason, cooldownUntil: row.cooldown_until }
+            : { status: null, cooldownReason: null, cooldownUntil: null }
+        },
+      })
+      if (resolved) {
+        const first = ranked.find((r) => r.id === resolved.member.id)
+        if (first) ranked = [first, ...ranked.filter((r) => r !== first)]
+      }
+    } catch {
+      /* affinity is best-effort: the WRH order still serves */
+    }
+  }
   const key = keyFn()
   try {
     for (const r of ranked) {

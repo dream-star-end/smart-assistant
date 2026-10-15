@@ -467,7 +467,8 @@ export interface PickUpstreamDeps {
    * OCV5-424:静态 provider 的 API-key 服务池选 key(多 key、共享策略冷却/恢复)。
    * 未注入或池为空 → 用 staticProviderKeys 的 env key(旧行为)。
    */
-  selectApiKey?: (service: string, stickyKey: string) => Promise<SelectedApiKey | null>;
+  /** OCV5-424: userId enables user-level affinity inside the pool. */
+  selectApiKey?: (service: string, stickyKey: string, userId?: bigint) => Promise<SelectedApiKey | null>;
   /**
    * OCV5-424:该服务池是否已有成员(任何状态)。有成员时池是权威:选不到可用 key(全部
    * 冷却 / 管理员停用)就返回 pool_unavailable,不回落 env key。
@@ -1007,6 +1008,7 @@ export async function pickUpstream(
         pooled = await deps.selectApiKey(
           route.provider.id,
           extractSessionId(body.metadata) ?? (userId !== undefined ? `u:${userId.toString()}` : randomUUID()),
+          userId,
         );
       } catch (err) {
         log.warn("proxy_api_key_pool_select_failed", { provider: route.provider.id, err: errSummary(err) });
@@ -1046,6 +1048,7 @@ export async function pickUpstream(
     anthropicKey = await deps.selectApiKey(
       "claude",
       extractSessionId(body.metadata) ?? (userId !== undefined ? `u:${userId.toString()}` : randomUUID()),
+      userId,
     );
   } catch (err) {
     log.warn("proxy_api_key_pool_select_failed", { provider: "claude", err: errSummary(err) });

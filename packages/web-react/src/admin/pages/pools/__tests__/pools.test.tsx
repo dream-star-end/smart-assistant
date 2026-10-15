@@ -85,7 +85,7 @@ describe("PoolsPage Gemini 订阅账号与订阅账号页的关系", () => {
         service: "gemini",
         accepts_api_keys: true,
         members: [
-          member({ service: "gemini", id: "2", label: "eckersonhanner@gmail.com", hints: { plan: "Antigravity", name: "eckersonhanner", manage: "antigravity" } }),
+          member({ service: "gemini", id: "2", label: "eckersonhanner@gmail.com", hints: { plan: "Antigravity", name: "eckersonhanner", manage: "antigravity", bound_users: 2 } }),
         ],
         counts: { active: 1, cooldown: 0, disabled: 0, total: 1 },
       },
@@ -106,7 +106,7 @@ describe("PoolsPage Gemini 订阅账号与订阅账号页的关系", () => {
     const g = within(section);
     expect(g.getByText("eckersonhanner@gmail.com")).toBeTruthy();
     expect(g.getByText("订阅账号")).toBeTruthy();
-    expect(g.getByText(/Antigravity · eckersonhanner/)).toBeTruthy();
+    expect(g.getByText(/Antigravity · eckersonhanner · 绑定 2 人/)).toBeTruthy();
     fireEvent.click(g.getByRole("button", { name: "停用" }));
     fireEvent.click(await screen.findByRole("button", { name: "停用", hidden: false }));
     await waitFor(() => expect(adminSend).toHaveBeenCalledWith("PATCH", "/antigravity-accounts/2", { status: "disabled" }));

@@ -15,6 +15,7 @@ import { requireAdmin, requireAdminVerifyDb } from "../../admin/requireAdmin.js"
 import { API_KEY_SERVICE_RE, setApiKeyAdminStatus, upsertApiKey } from "../../account-pool/apiKeyPool.js";
 import { DEFAULT_POLICY } from "../../account-pool/policy/decide.js";
 import { listPoolAdapters, type PoolMemberView } from "../../account-pool/policy/registry.js";
+import { affinityCounts } from "../../account-pool/policy/affinity.js";
 import { STATIC_PROVIDER_META } from "../proxy/staticProviderMeta.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
 import { HttpError, readJsonBody, sendJson } from "../util.js";
@@ -34,10 +35,27 @@ export interface PoolView {
   counts: { active: number; cooldown: number; disabled: number; total: number };
 }
 
+/** Affinity key a member's bindings live under (policy/affinity callers). */
+function affinityServiceOf(m: PoolMemberView): string {
+  if (m.memberKind === "api_key") return `apikey:${m.service}`;
+  if (m.memberKind === "account" && m.service === "gemini") return "antigravity";
+  return m.service;
+}
+
 export async function collectPools(): Promise<PoolView[]> {
   const members: PoolMemberView[] = [];
   for (const adapter of listPoolAdapters()) {
     if (adapter.listMembers) members.push(...(await adapter.listMembers()));
+  }
+  // OCV5-424 user affinity: live bound users per member (shown as "绑定 N 人").
+  try {
+    const bound = await affinityCounts();
+    for (const m of members) {
+      const n = bound.get(`${affinityServiceOf(m)}:${m.memberKind}:${m.id}`);
+      if (n !== undefined) m.hints = { ...m.hints, bound_users: n };
+    }
+  } catch {
+    /* counts are informational */
   }
   const keyServices = new Set(apiKeyServices());
   const services = new Set<string>([...SERVICE_ORDER, ...keyServices, ...members.map((m) => m.service)]);

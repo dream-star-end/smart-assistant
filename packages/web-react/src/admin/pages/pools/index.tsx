@@ -215,7 +215,15 @@ function PoolSection({
         <div className="flex flex-col">
           <span className="whitespace-nowrap font-medium">{m.label || `#${m.id}`}</span>
           <span className="whitespace-nowrap font-mono text-[11.5px] text-faint">
-            {[m.hints.plan, m.hints.name, m.hints.key, m.hints.source === "env" ? "来自环境变量" : null].filter(Boolean).join(" · ") ||
+            {[
+              m.hints.plan,
+              m.hints.name,
+              m.hints.key,
+              m.hints.source === "env" ? "来自环境变量" : null,
+              typeof m.hints.bound_users === "number" ? `绑定 ${m.hints.bound_users} 人` : null,
+            ]
+              .filter(Boolean)
+              .join(" · ") ||
               `#${m.id}`}
           </span>
         </div>
