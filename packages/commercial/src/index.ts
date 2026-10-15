@@ -167,6 +167,7 @@ import {
   primeApiKeyPool,
   startApiKeyPoolCache,
 } from "./account-pool/apiKeyPool.js";
+import { createGeminiPoolAdapter } from "./account-pool/geminiPoolAdapter.js";
 import { registerPoolAdapter, startPoolRecoveryActor } from "./account-pool/policy/registry.js";
 import { startCursorAuthSyncActor } from "./account-pool/cursorMaterializer.js";
 import { startCursorSandPreparationActor } from "./account-pool/cursorSandActor.js";
@@ -6182,6 +6183,9 @@ export async function registerCommercial(
   registerPoolAdapter(createAccountPoolAdapter({ health: healthTracker, triggerCodexDisableFanout }));
   registerPoolAdapter(createApiKeyPoolAdapter());
   registerPoolAdapter(createRelayKeyPoolAdapter());
+  registerPoolAdapter(createGeminiPoolAdapter({
+    clientSecret: () => process.env.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET?.trim() ?? "",
+  }));
   if (process.env.COMMERCIAL_COOLDOWN_RECOVERY_DISABLED !== "1") {
     leaderBundle.add({
       name: "cooldownRecovery",

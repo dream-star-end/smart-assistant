@@ -115,7 +115,7 @@ leader 每 60s：对每个注册池
 | grok | 已走 pick | `internalGrokRelay.ts` 401/402/403/429 改走 classify |
 | box | `boxProfileScheduler` 排序改用 policy.select（保留 default-first、利用率阈值作为资格过滤）；`cursorAccountSelection` 同 | `boxProfileHealth` bench → decide；`cursorExternal` 401 内存冷却改为持久 decide |
 | 静态 provider | `pickUpstream` static 分支改为 `pool.select(service)`，多 key + before_first_byte 切换；**配置权威同步改为池**：`validateUpstreamConfig()` 与启动 `assertPlatformDefaultModelConfigured()` 改问 `poolConfigured(service)`（env key 或池内存在非 admin 停用成员；池快照 30s 缓存，启动时先导入 env 成员再校验）；`staticProviderKeys` 仅作 env 导入源 | core.ts 非 2xx → outcome；Moonshot quota circuit 归并为 quota_exhausted |
-| gemini | 见 §6 待定 | — |
+| gemini | API key：`pool_api_keys(service=gemini)`；订阅账号：Antigravity `gemini_oauth_accounts`（`geminiPoolAdapter.ts` + `antigravityPool.ts`，见 §9） | 订阅账号探测 = refresh 成功 |
 
 `ReleaseResult` 扩展为携带 `outcome`（向后兼容：旧 kind 映射为 outcome）。
 
@@ -144,3 +144,9 @@ leader 每 60s：对每个注册池
 - **去掉"立即探测"按钮**：恢复全自动，管理后台只做展示 + API key 添加 / 管理员启停，避免出现"需要人去点"的路径。
 - **迁移号 0306**：OCV5-415（Antigravity P2）先合入并占用 0305，本票顺延为 0306。
 - **Gemini**：本票只建池（后台可添加 key）；Antigravity 中继与 Gemini OAuth 账号表由 OCV5-415 实现，其临时上报器 `antigravityPoolInterim.ts`（TODO(OCV5-424)）待本票合入后替换为共享策略。
+
+## 9. Gemini 池的订阅账号（2026-10-15 跟进）
+用户反馈后台「服务池」的 Gemini 组 0 个成员，但两个 Antigravity Google 订阅账号已在 `gemini_oauth_accounts`（OCV5-415）里。
+- **纳入服务池**：`tableMembers` 登记 `GEMINI_OAUTH_MEMBERS`（成员类型 `account`、服务 `gemini`，列与共享状态列一致，无需迁移），`geminiPoolAdapter.ts` 提供成员列表与共享恢复：到期普通冷却半开；认证冷却由唯一恢复 actor 探测，探测 = 存的 grant 仍能换到 access token（认证冷却时已让缓存 token 过期，所以探测真的问 Google），`invalid_grant` 加大退避，未配置 client secret 等不确定情况稍后再探。不打印 token。
+- **调度换成共享策略**：`antigravityPoolInterim.ts` 改名为 `antigravityPool.ts`，账号级结果（401/403/429、配额、元数据 5xx…）走 `applyTableMemberOutcome` → 共享 `decide`；模型级 5xx 仍只计数、按模型在 Redis 冷却（OCV5-415 #737，不变）。选号保持 OCV5-415 的顺序（active → 健康降序 → 最久未用），唯一变化：到期的认证/凭证冷却不再被流量重试，等探测（与其他池一致）。全部账号认证失效时，恢复间隔同共享策略：5 分钟起逐次加倍，上限 6 小时。
+- **后台**：服务池 Gemini 组显示订阅账号（状态、健康、最近使用、最近错误），可在本页启用/停用（复用 `PATCH /api/admin/antigravity-accounts/:id`，写 `disabled_by`）；其他服务的订阅账号行给「管理」链接。原「账号池」页面改名「订阅账号」（它管 Claude/Codex/Grok/Cursor 订阅账号的新建、登录、分组与出口），两页页头互相指路：服务池看调度状态，订阅账号做增删改。

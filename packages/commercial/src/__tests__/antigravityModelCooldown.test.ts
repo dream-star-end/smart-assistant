@@ -21,11 +21,7 @@ import {
   createIoredisAntigravityModelCooldownStore,
   reportAntigravityModelOutcome,
 } from '../account-pool/antigravityModelCooldown.js'
-import {
-  decideAntigravityInterim,
-  pickAntigravityAccount,
-  reportAntigravityOutcome,
-} from '../account-pool/antigravityPoolInterim.js'
+import { pickAntigravityAccount, reportAntigravityOutcome } from '../account-pool/antigravityPool.js'
 
 const GPT = 'antigravity-gpt-oss-120b'
 const FLASH = 'antigravity-gemini-3.8-flash'
@@ -48,16 +44,6 @@ describe('model cooldown policy', () => {
     assert.equal(antigravityModelCooldownMs(40), p.maxMs)
   })
 
-  test('model_unavailable never changes account health or status', () => {
-    assert.equal(
-      decideAntigravityInterim(
-        { healthScore: 100, backoffLevel: 0, status: 'active' },
-        { kind: 'model_unavailable' },
-        now,
-      ),
-      null,
-    )
-  })
 })
 
 describe('model cooldown state', () => {

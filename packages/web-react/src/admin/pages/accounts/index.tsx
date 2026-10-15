@@ -348,7 +348,18 @@ export default function AccountsPage() {
     <div className="flex flex-col gap-5">
       <PageHeader
         title={meta.title}
-        desc={loading && !data ? "加载中…" : `共 ${rows.length} 条`}
+        desc={
+          loading && !data ? (
+            "加载中…"
+          ) : (
+            <>
+              共 {rows.length} 条 · 这里新建和编辑订阅账号;各服务的调度状态(含 API key、Gemini)在{" "}
+              <a href="#tab=pools" className="text-accent hover:underline">
+                服务池
+              </a>
+            </>
+          )
+        }
         actions={
           <>
             <Button variant="secondary" size="sm" onClick={refresh}>

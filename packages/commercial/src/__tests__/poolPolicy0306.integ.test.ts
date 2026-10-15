@@ -9,6 +9,8 @@
  *   5. 管理员停用在同一条 UPDATE 写 disabled_by='admin',启用清除
  *   6. session pin:认证冷却对 pin 视同终态,短限流冷却仍是瞬时
  *   7. API-key 池:导入/去重/选 key/上报冷却/半开/管理员启停/env 轮换
+ *   8. Gemini 池:Antigravity 订阅账号(gemini_oauth_accounts)是服务池成员,认证冷却由
+ *      共享 actor 探测(refresh 成功回 active,invalid_grant 加大退避,未配置时稍后再探)
  */
 
 import { describe, test, before, after, beforeEach } from "node:test";
@@ -32,6 +34,12 @@ import {
   setApiKeyAdminStatus,
   upsertApiKey,
 } from "../account-pool/apiKeyPool.js";
+import { createGeminiPoolAdapter } from "../account-pool/geminiPoolAdapter.js";
+import { pickAntigravityAccount, reportAntigravityOutcome } from "../account-pool/antigravityPool.js";
+import { AntigravityOAuthError } from "../account-pool/antigravityOAuth.js";
+import { GEMINI_OAUTH_MEMBERS, applyTableMemberOutcome } from "../account-pool/policy/tableMembers.js";
+import { _resetPoolRegistryForTest, registerPoolAdapter } from "../account-pool/policy/registry.js";
+import { collectPools } from "../http/admin/pools.js";
 import { resetTestSchemaForTest } from "./helpers/db.js";
 import { insertTestEgressProxy } from "./helpers/accountFixture.js";
 
@@ -71,7 +79,7 @@ after(async () => {
 
 beforeEach(async () => {
   if (!pgAvailable) return;
-  await query("TRUNCATE TABLE usage_records, claude_accounts, pool_api_keys, pool_events RESTART IDENTITY CASCADE");
+  await query("TRUNCATE TABLE usage_records, claude_accounts, pool_api_keys, pool_events, gemini_oauth_accounts RESTART IDENTITY CASCADE");
   invalidateApiKeyPoolCache();
 });
 
@@ -308,5 +316,143 @@ describe("API-key pools (pool_api_keys)", () => {
     assert.equal(members.length, 1);
     assert.equal(members[0].key_hint, "…0002");
     assert.equal(members[0].source, "env");
+  });
+});
+
+describe("gemini pool: Antigravity subscription accounts (gemini_oauth_accounts)", () => {
+  async function googleAccount(email: string): Promise<string> {
+    const r = await query<{ id: string }>(
+      `INSERT INTO gemini_oauth_accounts (label, email, refresh_token_enc, refresh_token_nonce)
+       VALUES ($1, $2, $3, $4) RETURNING id::text AS id`,
+      [email.split("@")[0], email, randomBytes(48), randomBytes(12)],
+    );
+    return r.rows[0].id;
+  }
+  async function gemRow(id: string) {
+    const r = await query<{ status: string; cooldown_reason: string | null; backoff_level: number; next_probe_at: Date | null }>(
+      "SELECT status, cooldown_reason, backoff_level, next_probe_at FROM gemini_oauth_accounts WHERE id = $1",
+      [id],
+    );
+    return r.rows[0];
+  }
+
+  test("the admin 服务池 lists them as gemini subscription members next to gemini API keys", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const id = await googleAccount("eckersonhanner@gmail.com");
+    await upsertApiKey({ service: "gemini", apiKey: "gemini-key-abcdefgh", source: "admin", keyFn });
+    _resetPoolRegistryForTest();
+    registerPoolAdapter(createApiKeyPoolAdapter(keyFn));
+    registerPoolAdapter(createGeminiPoolAdapter({ clientSecret: () => "secret" }));
+    try {
+      const gemini = (await collectPools()).find((p) => p.service === "gemini");
+      assert.ok(gemini, "gemini pool present");
+      const sub = gemini.members.find((m) => m.credentialType === "subscription");
+      assert.ok(sub, "the Google account is a member");
+      assert.equal(sub.id, id);
+      assert.equal(sub.memberKind, "account");
+      assert.equal(sub.label, "eckersonhanner@gmail.com");
+      assert.equal(sub.status, "active");
+      assert.equal(sub.healthScore, 100);
+      assert.equal(gemini.members.filter((m) => m.credentialType === "api_key").length, 1);
+      assert.equal(gemini.counts.total, 2);
+    } finally {
+      _resetPoolRegistryForTest();
+    }
+  });
+
+  test("an auth cooldown waits for the probe; refresh success reactivates, invalid_grant backs off further", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const id = await googleAccount("a1@example.com");
+    await applyTableMemberOutcome(GEMINI_OAUTH_MEMBERS, id, { kind: "auth_invalid", detail: "http_401" });
+    let r = await gemRow(id);
+    assert.equal(r.status, "cooldown");
+    assert.equal(r.cooldown_reason, "auth");
+    assert.ok(r.next_probe_at, "auth cooldown schedules a probe");
+    const ev = await query<{ service: string; member_kind: string }>("SELECT service, member_kind FROM pool_events");
+    assert.deepEqual(ev.rows.map((e) => [e.service, e.member_kind]), [["gemini", "account"]]);
+
+    let refreshed = 0;
+    const adapter = createGeminiPoolAdapter({
+      clientSecret: () => "secret",
+      freshToken: async () => {
+        refreshed += 1;
+        return Buffer.from("access-token");
+      },
+    });
+    await query("UPDATE gemini_oauth_accounts SET cooldown_until = NOW() - INTERVAL '1 second', next_probe_at = NOW() - INTERVAL '1 second'");
+    assert.equal(await adapter.halfOpenDue(), 0, "auth cooldown is not half-opened by time alone");
+    const due = await adapter.listDueProbes(5);
+    assert.deepEqual(due.map((d) => [d.id, d.service, d.reason]), [[id, "gemini", "auth"]]);
+    const ok = await adapter.probe(due[0]);
+    assert.deepEqual(ok, { ok: true });
+    assert.equal(refreshed, 1);
+    await adapter.applyProbeResult(due[0], ok);
+    r = await gemRow(id);
+    assert.equal(r.status, "active");
+
+    await applyTableMemberOutcome(GEMINI_OAUTH_MEMBERS, id, { kind: "auth_invalid", detail: "http_401" });
+    const levelBefore = (await gemRow(id)).backoff_level;
+    await query("UPDATE gemini_oauth_accounts SET cooldown_until = NOW() - INTERVAL '1 second', next_probe_at = NOW() - INTERVAL '1 second'");
+    const dead = createGeminiPoolAdapter({
+      clientSecret: () => "secret",
+      freshToken: async () => {
+        throw new AntigravityOAuthError(400, "invalid_grant");
+      },
+    });
+    const [m] = await dead.listDueProbes(5);
+    const bad = await dead.probe(m);
+    assert.equal(bad.ok, false);
+    assert.equal("transient" in bad, false, "invalid_grant is a real failure");
+    await dead.applyProbeResult(m, bad);
+    r = await gemRow(id);
+    assert.equal(r.status, "cooldown");
+    assert.ok(r.backoff_level > levelBefore, "a failed probe backs off further");
+  });
+
+  test("turn outcomes use the shared policy: auth cools with a probe and expires the cached token", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const id = await googleAccount("a3@example.com");
+    await query("UPDATE gemini_oauth_accounts SET access_token_enc = $2, access_token_nonce = $3, access_expires_at = NOW() + INTERVAL '50 minutes' WHERE id = $1", [id, randomBytes(40), randomBytes(12)]);
+    await reportAntigravityOutcome(BigInt(id), { kind: "auth_invalid" }, "antigravity_http_401");
+    const r = await query<{ status: string; cooldown_reason: string; next_probe_at: Date | null; expired: boolean; last_error: string }>(
+      "SELECT status, cooldown_reason, next_probe_at, access_expires_at <= NOW() AS expired, last_error FROM gemini_oauth_accounts WHERE id = $1",
+      [id],
+    );
+    assert.equal(r.rows[0].status, "cooldown");
+    assert.equal(r.rows[0].cooldown_reason, "auth");
+    assert.ok(r.rows[0].next_probe_at);
+    assert.equal(r.rows[0].expired, true, "a dead grant is not served from the token cache");
+    assert.equal(r.rows[0].last_error, "antigravity_http_401");
+    await reportAntigravityOutcome(BigInt(id), { kind: "model_unavailable" }, "antigravity_http_503");
+    assert.equal((await gemRow(id)).cooldown_reason, "auth", "a model 5xx never touches account state");
+  });
+
+  test("selection: active first, expired plain cooldowns half-open, expired auth cooldowns wait for the probe", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const auth = await googleAccount("auth@example.com");
+    const limited = await googleAccount("limited@example.com");
+    const off = await googleAccount("off@example.com");
+    await reportAntigravityOutcome(BigInt(auth), { kind: "auth_invalid" }, null);
+    await reportAntigravityOutcome(BigInt(limited), { kind: "rate_limited", retryAfterMs: 60_000 }, null);
+    await query("UPDATE gemini_oauth_accounts SET status = 'disabled', disabled_by = 'admin' WHERE id = $1", [off]);
+    await query("UPDATE gemini_oauth_accounts SET cooldown_until = NOW() - INTERVAL '1 second' WHERE status = 'cooldown'");
+    const pick = await pickAntigravityAccount();
+    assert.equal(pick?.accountId.toString(), limited, "the expired rate-limit cooldown is half-open");
+    assert.equal(
+      (await pickAntigravityAccount({ skip: async (accountId) => accountId.toString() === limited })),
+      null,
+      "an auth cooldown is not retried by traffic and a disabled account never",
+    );
+    const fresh = await googleAccount("fresh@example.com");
+    assert.equal((await pickAntigravityAccount())?.accountId.toString(), fresh, "an active account comes first");
+  });
+
+  test("without the OAuth client secret the probe re-checks later instead of escalating", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const id = await googleAccount("a2@example.com");
+    await applyTableMemberOutcome(GEMINI_OAUTH_MEMBERS, id, { kind: "auth_invalid" });
+    const adapter = createGeminiPoolAdapter({ clientSecret: () => "" });
+    const res = await adapter.probe({ id, service: "gemini", reason: "auth" });
+    assert.deepEqual(res, { ok: false, transient: true, detail: "oauth_not_configured" });
   });
 });

@@ -7,7 +7,7 @@ import { mintAntigravityRelayRoute } from '../billing/antigravityRouteContext.js
  */
 import { antigravityModelCoolingUntil } from './antigravityModelCooldown.js'
 import { mintAntigravityLimitedToken } from './antigravityOAuth.js'
-import { pickAntigravityAccount, reportAntigravityOutcome } from './antigravityPoolInterim.js'
+import { pickAntigravityAccount, reportAntigravityOutcome } from './antigravityPool.js'
 
 export interface AntigravityRouteGrant {
   token: string

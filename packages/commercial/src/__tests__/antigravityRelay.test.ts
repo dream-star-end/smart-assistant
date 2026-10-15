@@ -12,12 +12,11 @@ import { Readable } from 'node:stream'
 import { afterEach, describe, test } from 'node:test'
 
 import {
-  ANTIGRAVITY_INTERIM_POLICY,
   type AntigravityPoolOutcome,
   classifyAntigravityUpstream,
-  decideAntigravityInterim,
   parseRetryAfterMs,
-} from '../account-pool/antigravityPoolInterim.js'
+  toPoolOutcome,
+} from '../account-pool/antigravityPool.js'
 import { type ContainerIdentityRepo, hashSecret } from '../auth/containerIdentity.js'
 import {
   _resetAntigravityRelayRoutesForTests,
@@ -773,78 +772,30 @@ describe('AntigravityUsageTap', () => {
   })
 })
 
-describe('Antigravity interim pool policy (TODO OCV5-424)', () => {
+describe('Antigravity pool outcomes (shared OCV5-424 policy)', () => {
   const now = 1_000_000
-  const state = { healthScore: 100, backoffLevel: 0, status: 'active' }
 
-  test('429 Retry-After is clamped to 15s..15min; without it 30s·2^level', () => {
-    const p = ANTIGRAVITY_INTERIM_POLICY
-    const short = decideAntigravityInterim(
-      state,
-      { kind: 'rate_limited', retryAfterMs: 1_000 },
-      now,
-    )
-    assert.equal(short?.cooldownUntil?.getTime(), now + p.rateLimitMinMs)
-    const long = decideAntigravityInterim(
-      state,
-      { kind: 'rate_limited', retryAfterMs: 99 * 60_000 },
-      now,
-    )
-    assert.equal(long?.cooldownUntil?.getTime(), now + p.rateLimitMaxMs)
-    const none = decideAntigravityInterim(
-      { ...state, backoffLevel: 2 },
-      { kind: 'rate_limited', retryAfterMs: null },
-      now,
-    )
-    assert.equal(none?.cooldownUntil?.getTime(), now + 120_000)
-    assert.equal(none?.cooldownReason, 'rate_limited')
-    assert.equal(none?.backoffLevel, 3)
-  })
-
-  test('auth failures cool down 5min·2^level up to 6h and never disable', () => {
-    const first = decideAntigravityInterim(state, { kind: 'auth_invalid' }, now)
-    assert.equal(first?.status, 'cooldown')
-    assert.equal(first?.cooldownUntil?.getTime(), now + 5 * 60_000)
-    const capped = decideAntigravityInterim(
-      { ...state, backoffLevel: 10 },
-      { kind: 'auth_invalid' },
-      now,
-    )
-    assert.equal(capped?.cooldownUntil?.getTime(), now + 6 * 3_600_000)
-  })
-
-  test('upstream errors cost health and cool only on the third strike', () => {
-    const one = decideAntigravityInterim(state, { kind: 'upstream_error' }, now)
-    assert.equal(one?.status, 'active')
-    assert.equal(one?.healthScore, 80)
-    const three = decideAntigravityInterim(
-      { ...state, healthScore: 60 },
-      { kind: 'upstream_error' },
-      now,
-    )
-    assert.equal(three?.status, 'cooldown')
-    assert.equal(three?.cooldownReason, 'upstream')
-  })
-
-  test('success after an expired cooldown restarts from half-open health', () => {
-    const next = decideAntigravityInterim(
-      { healthScore: 20, backoffLevel: 3, status: 'cooldown' },
-      { kind: 'success' },
-      now,
-    )
-    assert.deepEqual(next, {
-      status: 'active',
-      cooldownUntil: null,
-      cooldownReason: null,
-      backoffLevel: 0,
-      healthScore: 60,
-      success: true,
+  test('account-level outcomes map onto the shared pool outcome unchanged', () => {
+    const resetAt = new Date(now + 3_600_000)
+    assert.deepEqual(toPoolOutcome({ kind: 'success' }, null), { kind: 'success' })
+    assert.deepEqual(toPoolOutcome({ kind: 'rate_limited', retryAfterMs: 7_000 }, 'x'), {
+      kind: 'rate_limited',
+      retryAfterMs: 7_000,
     })
-  })
-
-  test('client and network errors do not change the account', () => {
-    assert.equal(decideAntigravityInterim(state, { kind: 'client_error' }, now), null)
-    assert.equal(decideAntigravityInterim(state, { kind: 'network' }, now), null)
+    assert.deepEqual(toPoolOutcome({ kind: 'quota_exhausted', resetAt }, 'x'), {
+      kind: 'quota_exhausted',
+      resetAt,
+    })
+    assert.deepEqual(toPoolOutcome({ kind: 'auth_invalid' }, 'antigravity_http_401'), {
+      kind: 'auth_invalid',
+      detail: 'antigravity_http_401',
+    })
+    assert.deepEqual(toPoolOutcome({ kind: 'upstream_error' }, 'antigravity_http_502'), {
+      kind: 'upstream_error',
+      detail: 'antigravity_http_502',
+    })
+    assert.deepEqual(toPoolOutcome({ kind: 'client_error' }, null), { kind: 'client_error', detail: null })
+    assert.deepEqual(toPoolOutcome({ kind: 'network' }, null), { kind: 'network', detail: null })
   })
 
   test('classification and Retry-After parsing', () => {

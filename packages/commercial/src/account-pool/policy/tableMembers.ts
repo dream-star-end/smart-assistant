@@ -2,7 +2,8 @@
  * OCV5-424 — one persistence path for pool members stored in tables with the
  * standard state columns (status, health_score, backoff_level, cooldown_until,
  * cooldown_reason, next_probe_at, success_count, fail_count, last_error,
- * last_used_at): pool_api_keys and api_relay_credentials. claude_accounts keeps
+ * last_used_at): pool_api_keys, api_relay_credentials and gemini_oauth_accounts
+ * (Antigravity Google subscription accounts). claude_accounts keeps
  * its Redis-backed tracker (health.ts) but runs the same decide().
  */
 
@@ -12,7 +13,7 @@ import { recordPoolEvent, type PoolMemberKind } from './events.js'
 import { outcomeLabel, type CooldownReason, type PoolOutcome } from './outcome.js'
 import type { DueProbe, ProbeResult } from './registry.js'
 
-export type MemberTable = 'pool_api_keys' | 'api_relay_credentials'
+export type MemberTable = 'pool_api_keys' | 'api_relay_credentials' | 'gemini_oauth_accounts'
 
 interface StateRow {
   id: string
@@ -35,6 +36,12 @@ export const RELAY_KEY_MEMBERS: TableMemberSpec = {
   table: 'api_relay_credentials',
   memberKind: 'relay_key',
   serviceExpr: `'codex'`,
+}
+/** Antigravity Google AI subscription accounts: the gemini pool's subscription members. */
+export const GEMINI_OAUTH_MEMBERS: TableMemberSpec = {
+  table: 'gemini_oauth_accounts',
+  memberKind: 'account',
+  serviceExpr: `'gemini'`,
 }
 
 const STRIKE_WINDOW_MS = 10 * 60 * 1000

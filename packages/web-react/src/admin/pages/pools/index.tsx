@@ -7,6 +7,16 @@ import { getAdminPage } from "../../registry";
 import { ApiKeyFormModal } from "./ApiKeyFormModal";
 import { type PoolMember, type PoolView, type PoolsResponse, cooldownLabel, remainingLabel, serviceLabel } from "./types";
 
+/** Members the 服务池 page can enable/disable itself; other subscription accounts are managed in 订阅账号. */
+function togglePath(m: PoolMember): string {
+  if (m.memberKind === "account" && m.service === "gemini") return `/antigravity-accounts/${encodeURIComponent(m.id)}`;
+  return `/pools/keys/${encodeURIComponent(m.id)}`;
+}
+
+function canToggle(m: PoolMember): boolean {
+  return m.memberKind === "api_key" || (m.memberKind === "account" && m.service === "gemini");
+}
+
 function errMsg(e: unknown): string {
   return apiErrorMessage(e, "请求失败");
 }
@@ -62,15 +72,15 @@ export default function PoolsPage() {
       const next = m.status === "disabled" ? "active" : "disabled";
       if (next === "disabled") {
         const ok = await confirm({
-          title: `停用 ${serviceLabel(m.service)} 的 API key ${m.label || m.hints.key || m.id}`,
-          body: "管理员停用后调度不会再使用它,也不会自动恢复;冷却中的 key 无需停用,会自动恢复。",
+          title: `停用 ${serviceLabel(m.service)} 的${m.credentialType === "api_key" ? " API key" : "订阅账号"} ${m.label || m.hints.key || m.id}`,
+          body: "管理员停用后调度不会再使用它,也不会自动恢复;冷却中的成员无需停用,会自动恢复。",
           danger: true,
           confirmText: "停用",
         });
         if (!ok) return;
       }
       try {
-        await adminSend("PATCH", `/pools/keys/${encodeURIComponent(m.id)}`, { status: next });
+        await adminSend("PATCH", togglePath(m), { status: next });
         toast(next === "active" ? "已启用" : "已停用", "success");
         refresh();
       } catch (e) {
@@ -86,7 +96,18 @@ export default function PoolsPage() {
     <div className="flex flex-col gap-5">
       <PageHeader
         title={meta.title}
-        desc={loading ? "加载中…" : "每个服务一个池,订阅账号与 API key 共用同一套调度、冷却与自动恢复"}
+        desc={
+          loading ? (
+            "加载中…"
+          ) : (
+            <>
+              每个服务一个池,订阅账号与 API key 共用同一套调度、冷却与自动恢复。新建或编辑订阅账号在{" "}
+              <a href="#tab=accounts" className="text-accent hover:underline">
+                订阅账号
+              </a>
+            </>
+          )
+        }
         actions={
           <>
             <Button variant="secondary" size="sm" onClick={refresh}>
@@ -194,7 +215,8 @@ function PoolSection({
         <div className="flex flex-col">
           <span className="whitespace-nowrap font-medium">{m.label || `#${m.id}`}</span>
           <span className="whitespace-nowrap font-mono text-[11.5px] text-faint">
-            {[m.hints.plan, m.hints.key, m.hints.source === "env" ? "来自环境变量" : null].filter(Boolean).join(" · ") || `#${m.id}`}
+            {[m.hints.plan, m.hints.name, m.hints.key, m.hints.source === "env" ? "来自环境变量" : null].filter(Boolean).join(" · ") ||
+              `#${m.id}`}
           </span>
         </div>
       ),
@@ -239,10 +261,14 @@ function PoolSection({
       align: "right",
       width: 90,
       render: (m) =>
-        m.memberKind === "api_key" ? (
+        canToggle(m) ? (
           <Button size="sm" variant="ghost" className={m.status === "disabled" ? "" : "text-danger"} onClick={() => onToggle(m)}>
             {m.status === "disabled" ? "启用" : "停用"}
           </Button>
+        ) : m.memberKind === "account" ? (
+          <a href="#tab=accounts" className="whitespace-nowrap text-meta text-accent hover:underline">
+            管理
+          </a>
         ) : null,
     },
   ];
@@ -269,7 +295,13 @@ function PoolSection({
         rows={pool.members}
         rowKey={(m) => `${m.memberKind}:${m.id}`}
         loading={loading}
-        emptyTitle={pool.accepts_api_keys ? "尚无成员,可添加 API key" : "尚无成员"}
+        emptyTitle={
+          pool.service === "gemini"
+            ? "尚无成员:Antigravity 订阅账号登录后出现在这里,也可添加 API key"
+            : pool.accepts_api_keys
+              ? "尚无成员,可添加 API key"
+              : "尚无成员"
+        }
       />
     </section>
   );

@@ -34,7 +34,7 @@ import {
   type AntigravityPoolOutcome,
   classifyAntigravityUpstream,
   reportAntigravityOutcome,
-} from '../account-pool/antigravityPoolInterim.js'
+} from '../account-pool/antigravityPool.js'
 import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 import {
   ContainerIdentityError,

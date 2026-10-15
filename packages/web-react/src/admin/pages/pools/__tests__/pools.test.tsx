@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ToastProvider, TooltipProvider } from "../../../../components/ui";
@@ -6,13 +6,14 @@ import PoolsPage from "../index";
 import type { PoolMember, PoolsResponse } from "../types";
 
 const adminGet = vi.fn();
+const adminSend = vi.fn();
 vi.mock("../../../lib/adminApi", async () => {
   const actual =
     await vi.importActual<typeof import("../../../lib/adminApi")>("../../../lib/adminApi");
   return {
     ...actual,
     adminGet: (...a: unknown[]) => adminGet(...a),
-    adminSend: vi.fn(),
+    adminSend: (...a: unknown[]) => adminSend(...a),
     adminText: vi.fn(),
   };
 });
@@ -61,7 +62,7 @@ describe("PoolsPage 手机宽度", () => {
       expect(chips.length).toBeGreaterThan(0);
       for (const chip of chips) expect(chip.className).toContain("whitespace-nowrap");
     }
-    for (const el of screen.getAllByText("订阅账号")) expect(el.className).toContain("whitespace-nowrap");
+    for (const el of screen.getAllByText("订阅账号", { selector: "td span" })) expect(el.className).toContain("whitespace-nowrap");
     expect(screen.getByText(/小时 .* 分后/).className).toContain("whitespace-nowrap");
     // 最近错误列在 390px 下曾被压到 72px、长报错竖排把每行撑到 160px:要有最小宽度并限三行,全文放 title。
     const err = screen.getByText(/^refresh failed: 400/);
@@ -73,5 +74,52 @@ describe("PoolsPage 手机宽度", () => {
       expect(el.className).toContain("whitespace-nowrap");
       expect(el.className).not.toContain("break-all");
     }
+  });
+});
+
+describe("PoolsPage Gemini 订阅账号与订阅账号页的关系", () => {
+  const GEMINI: PoolsResponse = {
+    pools: [
+      { ...RESP.pools[0] },
+      {
+        service: "gemini",
+        accepts_api_keys: true,
+        members: [
+          member({ service: "gemini", id: "2", label: "eckersonhanner@gmail.com", hints: { plan: "Antigravity", name: "eckersonhanner", manage: "antigravity" } }),
+        ],
+        counts: { active: 1, cooldown: 0, disabled: 0, total: 1 },
+      },
+    ],
+    policy: RESP.policy,
+  };
+  beforeEach(() => {
+    adminGet.mockReset();
+    adminSend.mockReset();
+    adminGet.mockResolvedValue(GEMINI);
+    adminSend.mockResolvedValue({});
+  });
+  afterEach(cleanup);
+
+  test("Gemini 组列出 Antigravity 订阅账号,可在本页停用(走 Antigravity 账号接口)", async () => {
+    render(wrap(<PoolsPage />));
+    const section = await screen.findByTestId("pool-gemini");
+    const g = within(section);
+    expect(g.getByText("eckersonhanner@gmail.com")).toBeTruthy();
+    expect(g.getByText("订阅账号")).toBeTruthy();
+    expect(g.getByText(/Antigravity · eckersonhanner/)).toBeTruthy();
+    fireEvent.click(g.getByRole("button", { name: "停用" }));
+    fireEvent.click(await screen.findByRole("button", { name: "停用", hidden: false }));
+    await waitFor(() => expect(adminSend).toHaveBeenCalledWith("PATCH", "/antigravity-accounts/2", { status: "disabled" }));
+  });
+
+  test("其他服务的订阅账号在本页只看状态,「管理」跳到订阅账号页;页头指向订阅账号", async () => {
+    render(wrap(<PoolsPage />));
+    const section = await screen.findByTestId("pool-claude");
+    const links = within(section).getAllByRole("link", { name: "管理" });
+    expect(links.length).toBe(3);
+    for (const a of links) expect(a.getAttribute("href")).toBe("#tab=accounts");
+    expect(within(section).queryByRole("button", { name: "停用" })).toBeNull();
+    const header = screen.getByRole("link", { name: "订阅账号" });
+    expect(header.getAttribute("href")).toBe("#tab=accounts");
   });
 });
