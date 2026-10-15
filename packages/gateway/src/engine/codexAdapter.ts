@@ -34,6 +34,7 @@ import type {
   CallTokenUsageSnapshot,
   GoalStateSnapshot,
   JobTerminal,
+  ServiceTier,
   TurnTokenUsageSnapshot,
 } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
@@ -681,6 +682,15 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
 
   setEffortLevel(level: string | undefined): void {
     this.kernel.setEffortLevel(level)
+  }
+
+  /** OCV5-434: see CodexAppServerRunner.setServiceTier (per-turn, no restart). */
+  setServiceTier(tier: ServiceTier | null, model: string | undefined): 'restart' | 'applied' | 'unchanged' {
+    return this.kernel.setServiceTier(tier, model)
+  }
+
+  get serviceTier(): ServiceTier | null {
+    return this.kernel.serviceTier
   }
 
   get effortLevel(): string | undefined {

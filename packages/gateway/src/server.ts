@@ -20346,6 +20346,10 @@ export class Gateway {
     // 支持的档位),而不是平台全集 —— 平台全集会把「模型不支持的档位」放进 runner。
     // 帧未带 effort 且 descriptor 有 codexDefaultEffort → 用模型默认档(仅新建 session
     // 生效,既存 session 的切换由 submit 处理,语义与旧实现一致)。
+    // OCV5-434 GPT Fast (turn-level). WS frames are JSON-cast: only 'fast' passes; anything
+    // else — including an absent field — is explicit standard, so Fast is never implied or
+    // carried over from an earlier turn. Runners act on it only for Fast-capable models.
+    const safeServiceTier: 'fast' | null = (frame as any).serviceTier === 'fast' ? 'fast' : null
     const _frameEffort = (frame as any).effortLevel
     const allowedEfforts: ReadonlySet<string> =
       turnAuthority !== undefined
@@ -22047,6 +22051,7 @@ export class Gateway {
       grokRoute: safeGrokRoute,
       zcodeRoute: safeZcodeRoute,
       antigravityRoute: safeAntigravityRoute,
+      serviceTier: safeServiceTier,
       ...(automaticRetryState ? { automaticRetryState } : {}),
       ...(inboundRecovery?.automatic === true &&
           'resetNativeSession' in inboundRecovery &&

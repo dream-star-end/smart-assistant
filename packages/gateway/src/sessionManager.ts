@@ -205,6 +205,7 @@ import {
   type DurableGoalUsageRecord,
   type GoalStateSnapshot,
   type OutboundContentBlock,
+  type ServiceTier,
   type SessionWorkspaceMode,
 } from '@openclaude/protocol'
 import { resolveExecutionModel } from './server.js'
@@ -5221,6 +5222,10 @@ export class SessionManager {
       zcodeRoute?: ZcodeRouteOverride | null
       /** Antigravity CLI: one-turn relay route + limited Google token (OCV5-415). */
       antigravityRoute?: AntigravityRouteOverride | null
+      /** OCV5-434 GPT Fast, turn-level (frames.ts InboundMessage.serviceTier). 'fast' | null
+       *  (explicit standard); omitted = leave the runner's current tier. Runners that do not
+       *  implement setServiceTier ignore it. */
+      serviceTier?: ServiceTier | null
       /** Master-authored platform goal snapshot for this exact turn. null
        * explicitly clears stale engine state; omission is for legacy callers. */
       platformGoal?: GoalStateSnapshot | null
@@ -5584,7 +5589,21 @@ export class SessionManager {
       if (toolsetsChanged) {
         maybeSetToolsets.call(session.runner, desiredToolsets)
       }
-      if (effortChanged || modelChanged || toolsetsChanged || iuiChanged) {
+      // OCV5-434 GPT Fast: applied after the model switch so the runner judges this turn's
+      // effective model. CCB reads it from env at spawn (→ same single shutdown as effort);
+      // Codex sends it per turn and never asks for a restart.
+      const maybeSetServiceTier = (session.runner as {
+        setServiceTier?: (tier: ServiceTier | null, model: string | undefined) => string
+      }).setServiceTier
+      const serviceTierChanged =
+        Object.prototype.hasOwnProperty.call(opts ?? {}, 'serviceTier') &&
+        typeof maybeSetServiceTier === 'function' &&
+        maybeSetServiceTier.call(
+          session.runner,
+          opts?.serviceTier === 'fast' ? 'fast' : null,
+          modelChanged ? desiredModel : session.runner.model,
+        ) === 'restart'
+      if (effortChanged || modelChanged || toolsetsChanged || iuiChanged || serviceTierChanged) {
         try {
           await session.runner.shutdown()
           // Delta tracker reset happens automatically on the next 'spawn' event
@@ -5601,6 +5620,7 @@ export class SessionManager {
               modelChanged,
               toolsetsChanged,
               iuiChanged,
+              serviceTierChanged,
               ...(traceId ? { traceId } : {}),
             },
             err,

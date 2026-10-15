@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { OPENAI_FAST_SERVICE_TIER } from '@openclaude/protocol'
 
 import {
   type Obj,
@@ -129,6 +130,8 @@ export function anthropicToOpenAIResponses(body: Obj): Obj {
   }
   if (system.length) out.instructions = system.join('\n\n')
   if (typeof body.temperature === 'number') out.temperature = body.temperature
+  // OCV5-434 GPT Fast: the proxy only leaves "priority" on the OpenCode Go Fast models.
+  if (body.service_tier === OPENAI_FAST_SERVICE_TIER) out.service_tier = OPENAI_FAST_SERVICE_TIER
   if (typeof body.top_p === 'number') out.top_p = body.top_p
   const effort = responsesReasoningEffort(body.output_config)
   if (effort) out.reasoning = { effort }

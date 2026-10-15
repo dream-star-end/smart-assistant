@@ -143,6 +143,7 @@ import {
   isGrokEngineModel,
   isCursorEngineModel,
   isCursorContextTier,
+  isServiceTier,
   isZcodeEngineModel,
   isAntigravityEngineModel,
   isClientMessageId,
@@ -161,6 +162,7 @@ import {
   type ModelAuthorityEngine,
   type ModelExecutionDescriptor,
   type CursorContextTier,
+  type ServiceTier,
   type TraceIdIssue,
   type GoalStateSnapshot,
   type MessageReplyQuote,
@@ -383,6 +385,7 @@ export interface PromptQueueDispatchRequest {
       advisorModel?: string;
       collabConfigVersion?: string;
       contextTier?: CursorContextTier;
+      serviceTier?: ServiceTier | null;
     };
   };
 }
@@ -456,7 +459,7 @@ export function parsePromptQueueDispatchRequest(value: unknown): PromptQueueDisp
     !isPlainRecord(item.content) || !isPlainRecord(item.requestedExecution)
   ) return null;
   const execution = item.requestedExecution;
-  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "effortLevel", "teamMode", "collabMode", "advisorModel", "collabConfigVersion", "contextTier"])) return null;
+  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "effortLevel", "teamMode", "collabMode", "advisorModel", "collabConfigVersion", "contextTier", "serviceTier"])) return null;
   if (execution.agentId !== owner.agentId) return null;
   if (execution.model !== undefined && typeof execution.model !== "string") return null;
   if (execution.modelSwitchId !== undefined && (typeof execution.modelSwitchId !== "string" || !/^[A-Za-z0-9:_-]{8,128}$/.test(execution.modelSwitchId))) return null;
@@ -471,6 +474,7 @@ export function parsePromptQueueDispatchRequest(value: unknown): PromptQueueDisp
   if (execution.advisorModel !== undefined && typeof execution.advisorModel !== "string") return null;
   if (execution.collabConfigVersion !== undefined && typeof execution.collabConfigVersion !== "string") return null;
   if (execution.contextTier !== undefined && !isCursorContextTier(execution.contextTier)) return null;
+  if (execution.serviceTier !== undefined && execution.serviceTier !== null && !isServiceTier(execution.serviceTier)) return null;
   return value as unknown as PromptQueueDispatchRequest;
 }
 
@@ -8505,6 +8509,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             ...(execution.model !== undefined ? { model: execution.model } : {}),
             ...(execution.modelSwitchId !== undefined ? { modelSwitchId: execution.modelSwitchId } : {}),
             ...(execution.effortLevel !== undefined ? { effortLevel: execution.effortLevel } : {}),
+            ...(execution.serviceTier !== undefined ? { serviceTier: execution.serviceTier } : {}),
             ...(execution.teamMode !== undefined ? { teamMode: execution.teamMode } : {}),
             ...(execution.collabMode !== undefined ? { collabMode: execution.collabMode } : {}),
             ...(execution.advisorModel !== undefined ? { advisorModel: execution.advisorModel } : {}),

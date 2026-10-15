@@ -5499,6 +5499,7 @@ export class ChatSocket {
     advisorModel?: string;
     collabConfigVersion?: string;
     contextTier?: InboundMessage["contextTier"];
+    serviceTier?: InboundMessage["serviceTier"];
   }): void {
     const sess = this.ensureSession(p.sessId, p.agentId);
     if (sess._recoveryStatus?.kind === "completed" || sess._recoveryStatus?.kind === "resumed") {
@@ -5529,6 +5530,7 @@ export class ChatSocket {
       ...(p.collabConfigVersion ? { collabConfigVersion: p.collabConfigVersion } : {}),
       effortLevel: p.effortLevel ?? null,
       ...(p.contextTier ? { contextTier: p.contextTier } : {}),
+      ...(p.serviceTier ? { serviceTier: p.serviceTier } : {}),
     };
     sess._lastRouting = routing;
     const media = p.media && p.media.length > 0 ? p.media : undefined;
@@ -5568,6 +5570,7 @@ export class ChatSocket {
       ...(p.collabConfigVersion ? { collabConfigVersion: p.collabConfigVersion } : {}),
       // Cursor Opus/Fable 上下文档位(300k/1m):master 逐 turn 收窄签名 descriptor 的窗口。
       ...(p.contextTier ? { contextTier: p.contextTier } : {}),
+      ...(p.serviceTier ? { serviceTier: p.serviceTier } : {}),
       ts: Date.now(),
     };
     const userMsg = addMessage(sess, "user", p.displayText ?? p.text, {
@@ -5752,6 +5755,7 @@ export class ChatSocket {
       ...(routing.advisorModel ? { advisorModel: routing.advisorModel } : {}),
       ...(routing.collabConfigVersion ? { collabConfigVersion: routing.collabConfigVersion } : {}),
       ...(routing.contextTier ? { contextTier: routing.contextTier } : {}),
+      ...(routing.serviceTier ? { serviceTier: routing.serviceTier } : {}),
       ts: Date.now(),
       clientMessageId: target.clientMessageId,
     };
@@ -5934,6 +5938,7 @@ export class ChatSocket {
       ...(routing?.advisorModel ? { advisorModel: routing.advisorModel } : {}),
       ...(routing?.collabConfigVersion ? { collabConfigVersion: routing.collabConfigVersion } : {}),
       ...(routing?.contextTier ? { contextTier: routing.contextTier } : {}),
+      ...(routing?.serviceTier ? { serviceTier: routing.serviceTier } : {}),
       ts: Date.now(),
     };
     // 重试语义分流(RFC §5):
@@ -6605,6 +6610,7 @@ export class ChatSocket {
       ...(routing?.advisorModel ? { advisorModel: routing.advisorModel } : {}),
       ...(routing?.collabConfigVersion ? { collabConfigVersion: routing.collabConfigVersion } : {}),
       ...(routing?.contextTier ? { contextTier: routing.contextTier } : {}),
+      ...(routing?.serviceTier ? { serviceTier: routing.serviceTier } : {}),
       ts: Date.now(),
     };
     const userMsg = addMessage(sess, "user", AUTO_CONTINUE_DISPLAY, {

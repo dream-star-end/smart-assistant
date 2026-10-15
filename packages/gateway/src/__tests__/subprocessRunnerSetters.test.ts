@@ -74,6 +74,26 @@ describe('SubprocessRunner.model getter / setModel', () => {
     assert.equal(spawned, false, 'setModel must not spawn — caller owns restart via shutdown()')
   })
 
+  it('OCV5-434: setServiceTier gates Fast to OpenCode Go Lunas and never spawns', () => {
+    const r = createRunner()
+    let spawned = false
+    r.on('spawn' as any, () => { spawned = true })
+    assert.equal(r.serviceTier, null)
+    // Not running yet: applied for the next spawn, no restart requested.
+    assert.equal(r.setServiceTier('fast', 'opencode-gpt-6-luna'), 'applied')
+    assert.equal(r.serviceTier, 'fast')
+    assert.equal(r.setServiceTier('fast', 'opencode-gpt-5.6-luna'), 'unchanged')
+    // Any model outside the Go Fast list keeps standard.
+    for (const model of ['gpt-6-luna', 'opencode-grok-4.7', 'glm-5.3-go', undefined]) {
+      assert.equal(r.setServiceTier('fast', model), 'applied')
+      assert.equal(r.serviceTier, null, String(model))
+      r.setServiceTier('fast', 'opencode-gpt-6-luna')
+    }
+    assert.equal(r.setServiceTier(null, 'opencode-gpt-6-luna'), 'applied')
+    assert.equal(r.serviceTier, null)
+    assert.equal(spawned, false, 'setServiceTier must not spawn — caller owns restart via shutdown()')
+  })
+
   it('ALLOWED_INBOUND_MODELS contains the currently exposed model set', () => {
     // 新增其他模型时这个测试要同步更新。
     // 防止 server.ts WS handler 的静态白名单跟前端 modelPicker 期望的列表漂移。

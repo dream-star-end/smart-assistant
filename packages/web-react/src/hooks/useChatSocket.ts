@@ -100,6 +100,7 @@ export type UseChatSocket = {
     advisorModel?: string;
     collabConfigVersion?: string;
     contextTier?: InboundMessage["contextTier"];
+    serviceTier?: InboundMessage["serviceTier"];
   }) => void;
   stop: (sessId: string) => void;
   /** 重试一条发送失败的用户消息（复用原 payload 走既有发送入口原地重发）。*/

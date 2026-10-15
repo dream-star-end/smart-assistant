@@ -26,7 +26,7 @@ import './helpers/subprocessRunnerSpawnEnvIsolate.js'
 import * as assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
-import { SubprocessRunner, _buildCcbSpawnTraceEnv } from '../subprocessRunner.js'
+import { SubprocessRunner, _buildCcbServiceTierEnv, _buildCcbSpawnTraceEnv } from '../subprocessRunner.js'
 import {
   assertCcbSpawnWiring,
   assertNotInheritedWrongValues,
@@ -35,6 +35,20 @@ import {
   variantDeleteTraceHelper,
   variantDuplicateTraceHelper,
 } from './helpers/subprocessRunnerSpawnWiring.js'
+
+// ── OCV5-434 _buildCcbServiceTierEnv ──
+
+test('OCV5-434 buildCcbServiceTierEnv: fast → priority extra body; standard → empty key, not omission', () => {
+  assert.deepEqual(_buildCcbServiceTierEnv('fast'), { CLAUDE_CODE_EXTRA_BODY: '{"service_tier":"priority"}' })
+  const std = _buildCcbServiceTierEnv(null)
+  assert.deepEqual(std, { CLAUDE_CODE_EXTRA_BODY: '' })
+  assert.ok('CLAUDE_CODE_EXTRA_BODY' in std, 'an inherited value must be cleared')
+})
+
+test('OCV5-434 the real spawn env spreads _buildCcbServiceTierEnv(this._serviceTier) exactly once', () => {
+  const src = readFileSync(new URL('../subprocessRunner.ts', import.meta.url), 'utf8')
+  assert.equal(src.split('..._buildCcbServiceTierEnv(this._serviceTier),').length - 1, 1)
+})
 
 // ── _buildCcbSpawnTraceEnv unit tests ──
 

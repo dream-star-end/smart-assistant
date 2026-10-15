@@ -6,7 +6,9 @@ import {
   PROMPT_QUEUE_MUTATION_PATH,
   PROMPT_QUEUE_SNAPSHOT_PATH,
   isCursorContextTier,
+  isServiceTier,
   type CursorContextTier,
+  type ServiceTier,
   type PromptQueueMutationFrame,
   type PromptQueueSnapshot,
   PromptQueueSnapshot as PromptQueueSnapshotSchema,
@@ -66,6 +68,7 @@ export interface PromptQueueDetail {
     advisorModel?: string
     collabConfigVersion?: string
     contextTier?: CursorContextTier
+    serviceTier?: ServiceTier | null
   }
   deliveryIntent?: {
     mode?: string
@@ -484,7 +487,7 @@ function assertOwner(value: unknown, expected: PromptQueueWireOwner, userId: str
 
 function assertRequestedExecution(value: unknown, agentId: string): void {
   const execution = record(value, 'requestedExecution')
-  assertOnlyKeys(execution, ['agentId', 'model', 'modelSwitchId', 'effortLevel', 'teamMode', 'collabMode', 'advisorModel', 'collabConfigVersion', 'contextTier'], 'requestedExecution')
+  assertOnlyKeys(execution, ['agentId', 'model', 'modelSwitchId', 'effortLevel', 'teamMode', 'collabMode', 'advisorModel', 'collabConfigVersion', 'contextTier', 'serviceTier'], 'requestedExecution')
   if (execution.agentId !== agentId) invalidResponse('requestedExecution.agentId mismatch')
   if (execution.model !== undefined && typeof execution.model !== 'string')
     invalidResponse('requestedExecution.model invalid')
@@ -518,6 +521,9 @@ function assertRequestedExecution(value: unknown, agentId: string): void {
   }
   if (execution.contextTier !== undefined && !isCursorContextTier(execution.contextTier)) {
     invalidResponse('requestedExecution.contextTier invalid')
+  }
+  if (execution.serviceTier !== undefined && execution.serviceTier !== null && !isServiceTier(execution.serviceTier)) {
+    invalidResponse('requestedExecution.serviceTier invalid')
   }
 }
 

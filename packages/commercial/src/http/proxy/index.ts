@@ -71,6 +71,7 @@ import {
 } from "./modelAuthorityGate.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
 import { findRouteProviderForModel, isClassifierSideQuery, resolveCursorPublicModel } from "@openclaude/protocol";
+import { applyFastServiceTierPricing } from "./fastServiceTier.js";
 import {
   getDegradedProviders,
   getHealthDegradedProviders,
@@ -721,15 +722,18 @@ export function makeAnthropicProxyHandler(
       // enforce 路径不再看 `pricing.enabled`:可用性的唯一权威是 catalog.state(0143 起
       // enabled 只是派生镜像),且 gate 的 isRoutable 已经断言"有价格行"。snapshot 投影为空
       // 代表内部不变量破坏；legacy cache miss 则仍按 unknown_model 拒(fail-closed)。
-      const pricing = gate
+      const basePricing = gate
         ? gate.snapshot.billingPricingFor(body.model)
         : deps.pricing.get(body.model);
-      if (!pricing || (!gate && !pricing.enabled)) {
+      if (!basePricing || (!gate && !basePricing.enabled)) {
         userLog.warn("proxy_unknown_model", { model: body.model, catalogGated: gate !== null });
         incrAnthropicProxyReject("unknown_model");
         sendJsonError(res, 400, "UNKNOWN_MODEL", `model '${body.model}' not enabled`, requestId);
         return;
       }
+      // OCV5-434 GPT Fast (OpenCode Go /responses Lunas): ×2 composed into this request's
+      // multiplier; our "priority" marker never reaches any other upstream. See fastServiceTier.ts.
+      const { pricing } = applyFastServiceTierPricing(body as { model: string; service_tier?: unknown }, basePricing);
 
       // 5a') provider 健康度拦截(P3.2)。**默认影子模式放行**:仅 OC_PROVIDER_HEALTH_ENFORCE=1
       // 才对 degraded provider 的模型 503(误判降级=拦好模型是最坏 UX,故拦截显式开关控)。

@@ -197,6 +197,14 @@ describe('InboundMessage schema', () => {
     assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), contextTier: 1000000 }), false)
     assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), contextTier: null }), false)
   })
+  it('OCV5-434: serviceTier accepts fast or explicit standard (null) only', () => {
+    assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), serviceTier: 'fast' }), true)
+    assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), serviceTier: null }), true)
+    assert.equal(Value.Check(InboundMessage, baseInbound()), true)
+    for (const bad of ['priority', 'default', 'Fast', 'ultrafast', 1, true]) {
+      assert.equal(Value.Check(InboundMessage, { ...(baseInbound() as object), serviceTier: bad }), false)
+    }
+  })
   it('accepts complete retry lineage plus the rolling legacy first hop, and rejects partial lineage', () => {
     assert.equal(Value.Check(InboundMessage, {
       ...(baseInbound() as object),

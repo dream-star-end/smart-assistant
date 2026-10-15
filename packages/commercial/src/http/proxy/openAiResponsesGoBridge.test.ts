@@ -99,6 +99,12 @@ function ccbSession(id: string): Obj[] {
 }
 
 describe('request conversion', () => {
+  test('OCV5-434: Fast forwards service_tier "priority"; standard sends no tier', () => {
+    const base = { model: 'gpt-6-luna', messages: [{ role: 'user', content: 'hi' }] }
+    assert.equal(anthropicToOpenAIResponses({ ...base, service_tier: 'priority' }).service_tier, 'priority')
+    assert.equal('service_tier' in anthropicToOpenAIResponses(base), false)
+    assert.equal('service_tier' in anthropicToOpenAIResponses({ ...base, service_tier: 'auto' }), false)
+  })
   test('later system messages stay in place, so every request extends the previous one (OCV5-432)', () => {
     const outs = ccbSession(encodeResponsesToolId('call_1')).map((b) =>
       anthropicToOpenAIResponses(b),

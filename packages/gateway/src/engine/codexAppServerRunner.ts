@@ -36,9 +36,11 @@ import {
   AUTOMATIC_TURN_RETRY_MAX,
   type CallTokenUsageSnapshot,
   type GoalStateSnapshot,
+  type ServiceTier,
   type ToolTerminationReason,
   type TurnTokenUsageSnapshot,
   codexTransportModelId,
+  fastServiceTierRoute,
   isToolExitCode,
   turnErrorSemantics,
 } from '@openclaude/protocol'
@@ -2972,6 +2974,19 @@ export class CodexAppServerRunner extends EventEmitter {
     return codexTransportModelId(this.opts.model)
   }
 
+  /** OCV5-434 GPT Fast: the user's choice for the next turns (null = standard). Per-turn
+   *  app-server param, so changing it never restarts the process. */
+  private _serviceTier: ServiceTier | null = null
+  get serviceTier(): ServiceTier | null {
+    return this._serviceTier
+  }
+  setServiceTier(tier: ServiceTier | null, _model?: string): 'applied' | 'unchanged' {
+    const next: ServiceTier | null = tier === 'fast' ? 'fast' : null
+    if (next === this._serviceTier) return 'unchanged'
+    this._serviceTier = next
+    return 'applied'
+  }
+
   private buildTurnStartParams(prompt: string): Record<string, unknown> {
     const mode = this.conversationMode
     const reasoningEffort = this.codexReasoningEffort()
@@ -2994,6 +3009,11 @@ export class CodexAppServerRunner extends EventEmitter {
     }
     if (this.codexTransportModel()) params.model = this.codexTransportModel()
     if (this.opts.structuredOutputSchema) params.outputSchema = this.opts.structuredOutputSchema
+    // OCV5-434: Fast-capable models always state their tier — explicit "default" keeps a
+    // ChatGPT plan's own Fast default from spending 2.5× limits without the user asking.
+    if (fastServiceTierRoute(this.opts.model) === 'codex') {
+      params.serviceTierForTurn = this._serviceTier === 'fast' ? 'fast' : 'default'
+    }
     return params
   }
 
