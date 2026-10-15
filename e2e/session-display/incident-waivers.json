@@ -229,6 +229,12 @@
       "reason": "OCV5-424 follow-up 2: admin 服务池 page member names wrapped 2–3 characters per line at phone width after #736 (break-all). CSS-only change on an admin page; no user-visible surface changed.",
       "approvedBy": "user 2026-10-15 要求修手机端服务池状态徽标逐字换行并发个人版（cc3 account-pool 会话）",
       "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "f51560cfb5c23956b1b331522c1c521043987fd5",
+      "reason": "OCV5-415 Antigravity relay refused the CLI web search RPC (405) and a closing browser socket expired running turns' relay routes (ROUTE_EXPIRED); owner-only selfhost model, fixed the same morning.",
+      "approvedBy": "user 2026-10-15 截图询问 Antigravity 网页搜索 405 与任务执行失败，要求查根因修复发版（cc3 antigravity 会话）",
+      "expiresAt": "2026-11-14"
     }
   ]
 }

@@ -3564,6 +3564,17 @@ describe("Cursor external authority regression tripwire", () => {
     assert.doesNotMatch(settle, /if \(relay && pricing\)/);
   });
 
+  test("OCV5-415: a closing bridge keeps Antigravity routes alive; the terminal frame expires them by requestId", async () => {
+    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    // Live 2026-10-15: expiring routes on browser reconnect made the running CLI 404 ROUTE_EXPIRED.
+    const close = source.slice(source.indexOf("inflightCodexTurns.clear();"), source.indexOf("admittedDispatches.clear();"));
+    assert.match(close, /pendingAntigravityRelays\.clear\(\);/);
+    assert.doesNotMatch(close, /expireAntigravityRoute/);
+    const settleStart = source.indexOf("external.engine === 'antigravity'");
+    const settle = source.slice(settleStart, source.indexOf("settleAntigravityTurnRecord(", settleStart));
+    assert.match(settle, /deps\.expireAntigravityRouteForRequest\?\.\(requestId\)/);
+  });
+
   test("OCV5-92: every base engine inbound carries a master-owned _creditBudget and ZCode gates on balance", async () => {
     const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
 

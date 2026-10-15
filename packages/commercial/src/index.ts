@@ -345,6 +345,7 @@ import {
 import {
   configureAntigravityRelayKv,
   expireAntigravityRelayRoute,
+  expireAntigravityRelayRouteForRequest,
 } from "./billing/antigravityRouteContext.js";
 import { admitAntigravityTurn } from "./account-pool/antigravityAdmission.js";
 import {
@@ -5971,6 +5972,9 @@ export async function registerCommercial(
       ),
     expireAntigravityRoute: async (token) => {
       await expireAntigravityRelayRoute(token);
+    },
+    expireAntigravityRouteForRequest: async (requestId) => {
+      await expireAntigravityRelayRouteForRequest(requestId);
     },
     releaseGrokRouteLease: async (accountId, slotId) => {
       // Expire durable authority before freeing the local mirror. If PG is

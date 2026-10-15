@@ -21,7 +21,9 @@ import {
 import { type ContainerIdentityRepo, hashSecret } from '../auth/containerIdentity.js'
 import {
   _resetAntigravityRelayRoutesForTests,
+  configureAntigravityRelayKv,
   expireAntigravityRelayRoute,
+  expireAntigravityRelayRouteForRequest,
   mintAntigravityRelayRoute,
   resolveAntigravityRelayRoute,
 } from '../billing/antigravityRouteContext.js'
@@ -265,6 +267,63 @@ describe('Antigravity relay handler', () => {
     assert.equal(captured.usage[0]?.routeModelId, 'antigravity-claude-sonnet-4.6')
   })
 
+  test('web search: non-streaming generateContent is forwarded and metered from its JSON body', async () => {
+    const token = await mintRoute()
+    const json = JSON.stringify({
+      response: {
+        candidates: [{ content: { parts: [{ text: 'results' }] } }],
+        usageMetadata: {
+          promptTokenCount: 900,
+          candidatesTokenCount: 120,
+          thoughtsTokenCount: 10,
+          cachedContentTokenCount: 0,
+        },
+      },
+    })
+    const { status, text, captured } = await relay(
+      `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:generateContent`,
+      { body: generateBody('gemini-3.5-flash-lite', 'web_search') },
+      {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+        body: [json.slice(0, 40), json.slice(40)],
+      },
+    )
+    assert.equal(status, 200)
+    assert.equal(text, json)
+    assert.equal(captured.url, `${ANTIGRAVITY_UPSTREAM_BASE_URL}/v1internal:generateContent`)
+    assert.equal(captured.usage.length, 1)
+    assert.equal(captured.usage[0]?.requestType, 'web_search')
+    assert.equal(captured.usage[0]?.upstreamModel, 'gemini-3.5-flash-lite')
+    assert.equal(captured.usage[0]?.promptTokens, 900)
+    assert.equal(captured.usage[0]?.candidatesTokens, 120)
+    assert.equal(captured.usage[0]?.thoughtsTokens, 10)
+  })
+
+  test('generateContent takes no query; streamGenerateContent still requires alt=sse', async () => {
+    const token = await mintRoute()
+    const withQuery = await relay(
+      `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:generateContent?alt=sse`,
+      { body: generateBody('gemini-3.5-flash-lite', 'web_search') },
+      { status: 200, body: ['{}'] },
+    )
+    assert.equal(withQuery.status, 400)
+    assert.equal(withQuery.captured.calls, 0)
+    const noSse = await relay(
+      `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent`,
+      { body: generateBody('gemini-3.8-flash-high') },
+      { status: 200, body: SSE },
+    )
+    assert.equal(noSse.status, 400)
+    assert.equal(noSse.captured.calls, 0)
+    const otherModel = await relay(
+      `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:generateContent`,
+      { body: generateBody('claude-opus-4-6-thinking', 'web_search') },
+      { status: 200, body: ['{}'] },
+    )
+    assert.equal(otherModel.status, 403)
+  })
+
   test('refuses a model outside the route allowlist before calling Google', async () => {
     const token = await mintRoute('antigravity-gemini-3.8-flash')
     const { status, text, captured } = await relay(
@@ -318,7 +377,7 @@ describe('Antigravity relay handler', () => {
     assert.equal(ok.captured.usage.length, 0)
     assert.equal(ok.captured.body, '{"metadata":{"ideType":"ANTIGRAVITY"}}')
 
-    for (const method of ['onboardUser', 'generateContent', 'setUserSettings']) {
+    for (const method of ['onboardUser', 'generateChat', 'setUserSettings']) {
       const refused = await relay(
         `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:${method}`,
         { body: '{}' },
@@ -609,6 +668,44 @@ describe('Antigravity relay budget rounding (Codex r2 P1)', () => {
 })
 
 describe('Antigravity route context', () => {
+  test('expire by requestId works in memory and through the shared KV', async () => {
+    const token = await mintRoute()
+    await expireAntigravityRelayRouteForRequest('e'.repeat(32))
+    assert.ok(await resolveAntigravityRelayRoute({ token, containerId: 11, userId: 42 }))
+    await expireAntigravityRelayRouteForRequest(REQUEST_ID)
+    assert.equal(await resolveAntigravityRelayRoute({ token, containerId: 11, userId: 42 }), null)
+
+    const store = new Map<string, string>()
+    configureAntigravityRelayKv({
+      get: async (k) => store.get(k) ?? null,
+      set: async (k, v) => {
+        store.set(k, v)
+      },
+      del: async (k) => {
+        store.delete(k)
+      },
+    })
+    const minted = await mintAntigravityRelayRoute({
+      containerId: 11,
+      userId: 42,
+      requestId: REQUEST_ID,
+      modelId: 'antigravity-gemini-3.8-flash',
+      accountId: 7n,
+      budgetCredits: 1_000n,
+      relayPort: 18789,
+    })
+    assert.equal(store.size, 2)
+    assert.ok(
+      await resolveAntigravityRelayRoute({ token: minted.token, containerId: 11, userId: 42 }),
+    )
+    await expireAntigravityRelayRouteForRequest(REQUEST_ID)
+    assert.equal(store.size, 0)
+    assert.equal(
+      await resolveAntigravityRelayRoute({ token: minted.token, containerId: 11, userId: 42 }),
+      null,
+    )
+  })
+
   test('binds container, user, account and budget; rejects other containers', async () => {
     const token = await mintRoute('antigravity-gpt-oss-120b', 77n)
     const route = await resolveAntigravityRelayRoute({ token, containerId: 11, userId: 42 })
@@ -643,6 +740,23 @@ describe('Antigravity route context', () => {
 })
 
 describe('AntigravityUsageTap', () => {
+  test('json mode reads usageMetadata from one response body, also when it outgrows the buffer', () => {
+    const tap = new AntigravityUsageTap('json')
+    tap.push('{"response":{"candidates":[],')
+    tap.push('"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":2}}}')
+    tap.end()
+    assert.deepEqual(tap.usage, { prompt: 5, candidates: 2, thoughts: 0, cached: 0 })
+    const big = new AntigravityUsageTap('json')
+    big.push(
+      `{"response":{"candidates":[{"content":{"parts":[{"text":"${'x'.repeat(17 * 1024 * 1024)}"}]}}],`,
+    )
+    big.push(
+      '"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"cachedContentTokenCount":1}}}',
+    )
+    big.end()
+    assert.deepEqual(big.usage, { prompt: 7, candidates: 3, thoughts: 0, cached: 1 })
+  })
+
   test('keeps the last usageMetadata across chunk boundaries and ignores non-data lines', () => {
     const tap = new AntigravityUsageTap()
     for (const chunk of SSE) tap.push(chunk)
