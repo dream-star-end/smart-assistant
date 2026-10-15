@@ -7005,6 +7005,40 @@
           "assertion": "T72 INC-20261015-RESUME-REPLAY-LAG: a completion inside the reload replay backlog settles at once and syncs history"
         }
       ]
+    },
+    {
+      "id": "INC-20261015-COLDSTART-QUEUED-THINKING",
+      "occurredAt": "2026-10-15",
+      "severity": "P2",
+      "symptom": "个人版 uid3 容器被空闲回收后冷启动约 2 分 20 秒（入口 20s + 网关启动 72s + bootAutoResume 连续预热 145 个会话把 /healthz 饿住 29s）；手机端消息停在本地待发送队列，活动行却显示「助手 思考中」+停止键，用户以为消息已发出。修复：服务器确认收到(admission ACK)前活动行显示「正在连接服务… · N 条待发送」/「服务启动中，就绪后自动发送」/「正在发送…」；网关预热每个会话让出事件循环。",
+      "rootFixCommit": "0d031559",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/dispatchStatus.test.ts",
+          "assertion": "container still starting: queued message is `connecting`, never in-flight"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/dispatchStatus.test.ts",
+          "assertion": "on the wire without admission ACK is `sending`; the ACK clears it"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnActivityDispatch.test.tsx",
+          "assertion": "connecting shows the service state and the queue count, not 「思考中」"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/bootAutoResumeYield.test.ts",
+          "assertion": "yields a macrotask at the top of every iteration, before any pre-warm work"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T73 INC-20261015-COLDSTART-QUEUED-THINKING: a queued message shows the connection state until the server admits it"
+        }
+      ]
     }
   ]
 }
