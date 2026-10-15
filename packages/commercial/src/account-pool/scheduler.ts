@@ -1113,20 +1113,30 @@ export class AccountScheduler {
     // here (a hit pin returned above), so in-session stickiness is unchanged. The
     // bound account runs through the same WRH loop alone; if it cannot serve, the
     // full pool below decides as before (never a new failure mode).
-    // Affinity candidates come from the whole (group-scoped) pool: the binding
-    // replaces the "accounts this user used before" narrowing, which would
-    // otherwise hide an idle account when the history account is capped.
+    // Affinity candidates keep the anti-spread rule (accounts this user already
+    // used first); only when none of those can take the request now (slots or
+    // per-minute cap) do they widen to the whole group pool.
     const caps = await affinitySettings().catch(() => null)
     const underRate = (c: CandidateRow) => caps === null || underRateCap(provider, c.id, caps.ratePerMin)
-    let result: PickResult | null = await this.pickByUserAffinity(provider, input.userId ?? null, pool, wrhKey)
+    let result: PickResult | null = await this.pickByUserAffinity(provider, input.userId ?? null, wrhPool, pool, wrhKey)
     if (result === null) {
       // The per-minute cap also applies to the fallback: prefer accounts under it
       // (history-narrowed first, then the whole pool); only when every account is
       // over it does the cap give way (never refuse service).
-      const ratedHistory = wrhPool.filter(underRate)
-      const ratedAll = pool.filter(underRate)
-      const fallback = ratedHistory.length > 0 ? ratedHistory : ratedAll.length > 0 ? ratedAll : wrhPool
-      result = await this.runWRHLoop(fallback, wrhKey)
+      // Each tier is tried in turn when the previous one is busy (all its slots full),
+      // so the soft rate cap never turns into a new "busy" refusal.
+      const tiers = [wrhPool.filter(underRate), pool.filter(underRate), wrhPool, pool].filter((t) => t.length > 0)
+      let lastBusy: unknown = null
+      for (const tier of tiers) {
+        try {
+          result = await this.runWRHLoop(tier, wrhKey)
+          break
+        } catch (err) {
+          if (!(err instanceof AccountPoolBusyError)) throw err
+          lastBusy = err
+        }
+      }
+      if (result === null) throw lastBusy ?? new AccountPoolUnavailableError('no candidates')
     }
     noteAdmission(provider, result.account_id.toString())
 
@@ -1205,6 +1215,7 @@ export class AccountScheduler {
   private async pickByUserAffinity(
     provider: AccountProvider,
     userId: bigint | string | null,
+    historyPool: CandidateRow[],
     groupPool: CandidateRow[],
     wrhKey: string,
   ): Promise<PickResult | null> {
@@ -1212,9 +1223,10 @@ export class AccountScheduler {
     try {
       const caps = await affinitySettings()
       const now = this.now()
-      const open = groupPool.filter(
-        (c) => (this.slots.get(c.id)?.size ?? 0) < this.maxConcurrent && underRateCap(provider, c.id, caps.ratePerMin),
-      )
+      const isOpen = (c: CandidateRow) =>
+        (this.slots.get(c.id)?.size ?? 0) < this.maxConcurrent && underRateCap(provider, c.id, caps.ratePerMin)
+      const openHistory = historyPool.filter(isOpen)
+      const open = openHistory.length > 0 ? openHistory : groupPool.filter(isOpen)
       if (open.length === 0) return null
       const resolved = await resolveAffinity({
         service: provider,

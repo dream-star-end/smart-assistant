@@ -178,11 +178,13 @@ export async function pickAntigravityAccount(
   if (deps.reserveToken) {
     // Atomic check-and-reserve: a concurrent turn may have filled the preferred
     // account since the filter above; then this turn spills to the least busy one.
-    const order = [preferred.id, ...candidates.filter((r) => r.id !== preferred.id)
+    // Order over every usable account (not only the ones that passed the cap
+    // filter before the awaits above): capacity freed meanwhile is seen here.
+    const order = [preferred.id, ...usable.filter((r) => r.id !== preferred.id)
       .sort((a, b) => inflightCount(ANTIGRAVITY_AFFINITY_SERVICE, a.id) - inflightCount(ANTIGRAVITY_AFFINITY_SERVICE, b.id))
       .map((r) => r.id)]
     const id = reserveInflight(ANTIGRAVITY_AFFINITY_SERVICE, order, deps.reserveToken, caps.antigravityInflight)
-    row = candidates.find((r) => r.id === id) ?? preferred
+    row = usable.find((r) => r.id === id) ?? preferred
   }
   const action: AffinityAction | undefined = resolved ? (row.id === resolved.member.id ? resolved.action : 'spill') : undefined
   return { accountId: BigInt(row.id), email: row.email, ...(action ? { affinity: action } : {}) }

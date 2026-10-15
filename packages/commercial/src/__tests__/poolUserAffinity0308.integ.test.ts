@@ -241,4 +241,21 @@ describe("per-member caps (Codex r1)", () => {
     const ev = await query<{ outcome: string }>("SELECT outcome FROM pool_events WHERE service = 'box'");
     assert.deepEqual(ev.rows.map((r) => r.outcome), ["affinity_bind"], "no migration recorded");
   });
+
+  test("Claude: the rate cap never becomes a busy refusal (Codex r2) — full slots under the cap fall through to the capped idle account", async (t) => {
+    if (skipIfNoDb(t)) return;
+    configureAffinitySettings(async () => ({ maxUsersPerSubscription: 8, ratePerMin: 1, antigravityInflight: 3, antigravityRatePerMin: 100 }));
+    const a = await createAccount({ runtime_channel: "v3", label: "fa", plan: "pro", token: "TA", egress_proxy_id: await insertTestEgressProxy(KEY) }, keyFn);
+    const b = await createAccount({ runtime_channel: "v3", label: "fb", plan: "pro", token: "TB", egress_proxy_id: await insertTestEgressProxy(KEY) }, keyFn);
+    const s = new AccountScheduler({ health: new AccountHealthTracker({ redis: new InMemoryHealthRedis() }), keyFn, maxConcurrent: 1 });
+    // A: its only slot is held (under the rate cap after this admission is forgotten); B: idle but over the cap.
+    const holdA = await s.pick({ mode: "agent", provider: "claude", sessionId: "hold", userId: 77n });
+    if (holdA.account_id !== a.id) {
+      await s.release({ account_id: holdA.account_id, slotId: holdA.slotId, result: { kind: "success" } } as never);
+      return t.skip("seed landed on B; covered by the symmetric case");
+    }
+    noteAdmission("claude", b.id.toString());
+    const got = await s.pick({ mode: "agent", provider: "claude", sessionId: "new", userId: 78n });
+    assert.equal(got.account_id, b.id, "falls through to the idle account instead of AccountPoolBusyError");
+  });
 });
