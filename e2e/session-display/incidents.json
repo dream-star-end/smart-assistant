@@ -6971,6 +6971,40 @@
           "assertion": "INC-20261015-TAPE-COMMIT-FINAL-RACE (OCV5-424): a tape-commit turn_completed that overtakes the"
         }
       ]
+    },
+    {
+      "id": "INC-20261015-RESUME-REPLAY-LAG",
+      "occurredAt": "2026-10-15",
+      "severity": "P2",
+      "symptom": "个人版长回答流式中途刷新页面后，页面落后实时几十秒：刷新后的页面先发游标 hello、REST 同步后又发一次点名本轮的 hello，网关回两批重放（累计 3000+ 帧，被重复处理），浏览器每帧 15–28ms 处理；tape 提交的完成帧夹在积压重放帧之间先到，客户端按 OCV5-424 宽限 5 秒等实时尾巴（尾巴其实排在积压之后），本轮显示已结算但正文停在中间（600 行停在 L0378），之后历史同步或再刷新才补齐（OCV5-427，真聊复现 peer g421fmv8vppvy / g421tmv8z5cp8）。修复：页面加载首个 hello 即点名本轮、同步后的注册 hello 按本轮去重，网关每连接每轮只做一次整轮重放；重复命中的重放帧不触发渲染、准入确认仅在有变化时通知；恢复重放中的 tape 提交完成帧立即收口并对账。",
+      "rootFixCommit": "5120dbea",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "INC-20261015-RESUME-REPLAY-LAG: the page-load hello asks for the running turn once and the REST sync does not ask again"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "INC-20261015-RESUME-REPLAY-LAG: replayed deltas the row already holds do not schedule a render"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "INC-20261015-RESUME-REPLAY-LAG: a tape-commit completion during a resume replay settles at once and syncs history"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/activeTurnReplayDedupe.test.ts",
+          "assertion": "OCV5-427: a socket gets the exact-turn replay once per turn"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T72 INC-20261015-RESUME-REPLAY-LAG: a completion inside the reload replay backlog settles at once and syncs history"
+        }
+      ]
     }
   ]
 }
