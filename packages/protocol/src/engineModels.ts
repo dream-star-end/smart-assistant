@@ -12,7 +12,11 @@
 // 设计边界:只回答「哪些 model id 由 codex engine 承接」。模型准入(白名单 /
 // 授权可见性)与 engine 构造(registry fail-closed)仍在各自消费方收口。
 
-import { findRouteProviderForModel } from './staticKeyProviders.js'
+import {
+  findRouteProviderForModel,
+  OPENCODE_GO_MESSAGES_MODELS,
+  staticProviderOutputConfigEfforts,
+} from './staticKeyProviders.js'
 
 /**
  * v5 对外承诺的统一思考深度枚举。
@@ -168,8 +172,19 @@ export const CONTEXT_TIER_FAMILIES = [
 export type ContextTierFamily = (typeof CONTEXT_TIER_FAMILIES)[number]
 export type ContextTierFamilyId = ContextTierFamily['family']
 
-/** 选择器折叠组标题(单一权威,前端与测试共用)。 */
-export const COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL = '更多 GPT 模型'
+/**
+ * 选择器折叠组标题(单一权威,前端与测试共用)。组内是 collapsedByDefault 的上下文家族
+ * 与 `isMorePickerModelId` 的模型。
+ */
+export const COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL = '更多模型'
+
+/**
+ * OCV5-425: models the picker lists only inside the collapsed「更多模型」group (OpenCode Go
+ * models added alongside the main list). Display only; admission, billing and routing ignore it.
+ */
+export function isMorePickerModelId(modelId: string): boolean {
+  return Object.hasOwn(OPENCODE_GO_MESSAGES_MODELS, modelId)
+}
 
 export function contextFamilyCollapsedByDefault(family: ContextTierFamilyId): boolean {
   return CONTEXT_TIER_FAMILIES.some((row) => row.family === family && row.collapsedByDefault)
@@ -1607,17 +1622,20 @@ export function modelReasoningPolicy(modelId: string): ModelReasoningPolicy {
   }
 
   const provider = findRouteProviderForModel(modelId)
-  if (provider?.allowedOutputConfigEfforts) {
+  const efforts = provider
+    ? staticProviderOutputConfigEfforts(
+        provider,
+        provider.upstreamModelForRequest?.(modelId) ?? modelId,
+      )
+    : null
+  if (efforts !== null) {
     const platformSet = new Set<string>(PLATFORM_REASONING_EFFORTS)
     return {
-      supported: provider.allowedOutputConfigEfforts.filter(
+      supported: efforts.filter(
         (effort): effort is PlatformReasoningEffort => platformSet.has(effort),
       ),
       codexModelDefault: null,
     }
-  }
-  if (provider?.stripBodyFields.includes('output_config')) {
-    return { supported: [], codexModelDefault: null }
   }
   return { supported: PLATFORM_REASONING_EFFORTS, codexModelDefault: null }
 }

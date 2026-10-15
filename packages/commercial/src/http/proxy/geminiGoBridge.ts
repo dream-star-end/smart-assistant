@@ -72,6 +72,19 @@ function webSearchResultText(content: unknown): string {
     : '[Web search returned no results]'
 }
 
+/**
+ * Platform effort → Gemini thinkingLevel (OCV5-425). The proxy has already narrowed
+ * `output_config` to `{effort}` from the spec's model-scoped list (low/medium/high; upstream
+ * rejects MINIMAL). No effort keeps the previous fixed LOW.
+ */
+export function geminiThinkingLevel(outputConfig: unknown): 'LOW' | 'MEDIUM' | 'HIGH' {
+  const effort =
+    outputConfig !== null && typeof outputConfig === 'object' && !Array.isArray(outputConfig)
+      ? (outputConfig as Obj).effort
+      : undefined
+  return effort === 'high' ? 'HIGH' : effort === 'medium' ? 'MEDIUM' : 'LOW'
+}
+
 export function anthropicToGemini(body: Obj): Obj {
   const contents: Obj[] = []
   const calls = new Map<string, { name: string; nativeId?: string }>()
@@ -142,7 +155,7 @@ export function anthropicToGemini(body: Obj): Obj {
   if (!contents.length) throw new Error('Gemini requires nonempty content')
   const generationConfig: Obj = {
     maxOutputTokens: Math.min(65536, typeof body.max_tokens === 'number' ? body.max_tokens : 32000),
-    thinkingConfig: { thinkingLevel: 'LOW' },
+    thinkingConfig: { thinkingLevel: geminiThinkingLevel(body.output_config) },
   }
   if (typeof body.temperature === 'number') generationConfig.temperature = body.temperature
   if (typeof body.top_p === 'number') generationConfig.topP = body.top_p

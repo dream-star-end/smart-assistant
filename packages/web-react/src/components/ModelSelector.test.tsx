@@ -596,7 +596,40 @@ describe('ModelSelector GPT-6 家族(selfhost 无默认折叠组)', () => {
     expect(families).toEqual(['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna'])
     expect(screen.getByText('GPT-6-Luna')).toBeInTheDocument()
     expect(document.querySelector('[data-collapsed-group]')).toBeNull()
-    expect(screen.queryByText('更多 GPT 模型')).toBeNull()
+    expect(screen.queryByText('更多模型')).toBeNull()
+  })
+})
+
+// OCV5-425: OpenCode Go models sit in the collapsed「更多模型」group; the main list stays as is.
+describe('ModelSelector「更多模型」(OpenCode Go)', () => {
+  const MODELS: PublicModel[] = [
+    { id: 'deepseek-v4-flash', display_name: 'DeepSeek V4 Flash' },
+    { id: 'kimi-k3', display_name: 'Kimi K3' },
+    { id: 'kimi-k3-go', display_name: 'Kimi K3 (Go)' },
+    { id: 'qwen3.8-max-go', display_name: 'Qwen3.8 Max (Go)' },
+  ]
+
+  it('main-list models stay visible; Go models only appear after expanding the group', async () => {
+    render(<ModelSelector models={MODELS} selectedId="deepseek-v4-flash" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(screen.getAllByText('DeepSeek V4 Flash').length).toBeGreaterThan(0)
+    expect(screen.getByText('Kimi K3')).toBeInTheDocument()
+    const header = document.querySelector('[data-collapsed-group]')
+    expect(header?.getAttribute('data-collapsed-group')).toBe('closed')
+    expect(screen.getByText('更多模型')).toBeInTheDocument()
+    expect(screen.queryByText('Kimi K3 (Go)')).toBeNull()
+    if (header) fireEvent.click(header)
+    expect(await screen.findByText('Kimi K3 (Go)')).toBeInTheDocument()
+    expect(screen.getByText('Qwen3.8 Max (Go)')).toBeInTheDocument()
+  })
+
+  it('a selected Go model opens the group so the selection stays visible', async () => {
+    render(<ModelSelector models={MODELS} selectedId="qwen3.8-max-go" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(document.querySelector('[data-collapsed-group]')?.getAttribute('data-collapsed-group')).toBe('open')
+    expect(screen.getAllByText('Qwen3.8 Max (Go)').length).toBeGreaterThan(0)
   })
 })
 

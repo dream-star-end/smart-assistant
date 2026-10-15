@@ -62,6 +62,7 @@ import type { SelectedApiKey } from "../../account-pool/apiKeyPool.js";
 import {
   findRouteProviderForModel,
   getStaticProvider,
+  staticProviderOutputConfigEfforts,
   type StaticKeyProviderSpec,
   type StaticProviderId,
   type StaticProviderKeys,
@@ -210,11 +211,8 @@ export function providerCapabilityCeiling(route: UpstreamRoute): ProviderCapabil
     return { supportsVision: true, efforts: null };
   }
   const spec = route.provider;
-  const efforts = spec.allowedOutputConfigEfforts
-    ? spec.allowedOutputConfigEfforts
-    : spec.stripBodyFields.includes("output_config")
-      ? [] // 整体 strip output_config ⇒ 该 provider 机制上不支持思考档位
-      : null;
+  // Model-scoped list (OCV5-425) > provider allowlist > [] when output_config is stripped.
+  const efforts = staticProviderOutputConfigEfforts(spec, route.upstreamModel);
   return { supportsVision: spec.supportsVision === true, efforts };
 }
 
@@ -253,6 +251,7 @@ export function checkSnapshotCapabilities(snapshot: {
     modelId: string;
     engine: string;
     providerId: string | null;
+    upstreamModelId?: string | null;
     state: string;
     capabilityProfile: {
       supportsVision: boolean;
@@ -267,7 +266,8 @@ export function checkSnapshotCapabilities(snapshot: {
     try {
       route = selectUpstreamRoute(e.modelId, {
         providerId: e.providerId,
-        upstreamModelId: e.modelId,
+        // The catalog's upstream id decides model-scoped efforts (`kimi-k3-go` → `kimi-k3`).
+        upstreamModelId: e.upstreamModelId ?? e.modelId,
       });
     } catch (err) {
       violations.push(
@@ -597,6 +597,9 @@ function makeStaticKeyUpstream(
         delete safeHeaders[header];
       }
       const mutableBody = body as Record<string, unknown>;
+      // Model-scoped effort (OCV5-425): read before the provider-wide strip removes it.
+      const modelEfforts = spec.modelOutputConfigEfforts?.[upstreamModel.toLowerCase()];
+      const requestedOutputConfig = mutableBody.output_config;
       for (const field of spec.stripBodyFields) {
         delete mutableBody[field];
       }
@@ -623,16 +626,15 @@ function makeStaticKeyUpstream(
       // 火山端点仅识别 output_config.effort(其余 CCB firstParty-only 子字段 task_budget/format 等会拒/忽略),
       // 且 glm-5.2 产品只暴露高/最高两档。按 protocol 权威白名单收口:effort ∈ allowlist → 重建为 { effort };
       // 否则(非法值/缺失/非 string/非 object)删掉整个 output_config,退回火山默认思考,避免 400 与产品档位漂移。
-      if (spec.allowedOutputConfigEfforts) {
-        const oc = mutableBody.output_config;
+      // A model-scoped list (OCV5-425) reads the body from before the provider-wide strip.
+      const effortAllowlist = modelEfforts ?? spec.allowedOutputConfigEfforts;
+      if (effortAllowlist) {
+        const oc = modelEfforts ? requestedOutputConfig : mutableBody.output_config;
         const effort =
           oc !== null && typeof oc === "object" && !Array.isArray(oc)
             ? (oc as Record<string, unknown>).effort
             : undefined;
-        if (
-          typeof effort === "string" &&
-          spec.allowedOutputConfigEfforts.includes(effort)
-        ) {
+        if (typeof effort === "string" && effortAllowlist.includes(effort)) {
           mutableBody.output_config = { effort };
         } else {
           delete mutableBody.output_config;

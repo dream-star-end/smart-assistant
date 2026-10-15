@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { modelSupportsThinking } from "../../thinking.js";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -10,6 +11,7 @@ import {
   isMoonshotKimiK3Model,
   isCapabilityZeroStaticModel,
   isOpencodeGoModel,
+  OPENCODE_GO_MESSAGES_MODEL_IDS,
   isOpencodeQwenModel,
   isZaiGlm53Model,
   getStaticModelContextWindow,
@@ -210,3 +212,31 @@ describe("staticKeyModels — snapshot 漂移守护(CCB-owned)", () => {
   expect(getStaticModelContextWindow('gemini-4-argon-contributor')).toBe(1000000);
   expect(isOpencodeGoModel('gemini-4-argon')).toBe(false);
  });
+
+describe("OCV5-425 OpenCode Go /messages models (CCB fallback)", () => {
+  test("the CCB id list mirrors protocol OPENCODE_GO_MESSAGES_MODELS", async () => {
+    const protocol = await import("../../../../../packages/protocol/src/staticKeyProviders.ts");
+    expect([...OPENCODE_GO_MESSAGES_MODEL_IDS].sort()).toEqual(
+      Object.keys(protocol.OPENCODE_GO_MESSAGES_MODELS).sort(),
+    );
+  });
+
+  test("capability-zero Go models; thinking except Claude Haiku; windows capped at the price tier", () => {
+    for (const id of OPENCODE_GO_MESSAGES_MODEL_IDS) {
+      expect(isOpencodeGoModel(id)).toBe(true);
+      expect(isCapabilityZeroStaticModel(id)).toBe(true);
+      expect(modelSupportsThinking(id)).toBe(id !== "claude-haiku-5-5-go");
+    }
+    expect(getStaticModelContextWindow("claude-haiku-5-5-go")).toBe(100_000);
+    expect(getStaticModelContextWindow("minimax-m3-go")).toBe(200_000);
+    expect(getStaticModelContextWindow("qwen3.7-plus-go")).toBe(200_000);
+    expect(getStaticModelContextWindow("minimax-m2.7-go")).toBe(204_800);
+    expect(getStaticModelContextWindow("qwen3.8-max-go")).toBe(262_144);
+    expect(getStaticModelContextWindow("kimi-k3-go")).toBe(1_048_576);
+    expect(getStaticModelContextWindow("deepseek-v4-pro-go")).toBe(1_000_000);
+    expect(getStaticModelContextWindow("qwen3.8-flash-go")).toBe(1_000_000);
+    // bare names keep their own providers' rows
+    expect(isOpencodeGoModel("kimi-k3")).toBe(false);
+    expect(getStaticModelContextWindow("deepseek-v4-pro")).toBe(1_000_000);
+  });
+});
