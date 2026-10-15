@@ -234,6 +234,20 @@ describe('stream conversion', () => {
     assert.deepEqual((out[11]!.usage as Obj).cache_creation_input_tokens, 6700)
   })
 
+  test('a refusal completes as text, not as a broken stream (Codex r1)', async () => {
+    const out = await events([
+      { type: 'response.refusal.delta', delta: "I can't " },
+      { type: 'response.refusal.delta', delta: 'help with that.' },
+      { type: 'response.refusal.done', refusal: "I can't help with that." },
+      completed(),
+    ])
+    assert.deepEqual(
+      out.filter((e) => e.type === 'content_block_delta').map((e) => (e.delta as Obj).text),
+      ["I can't ", 'help with that.'],
+    )
+    assert.equal((out.at(-2)!.delta as Obj).stop_reason, 'end_turn')
+  })
+
   test('incomplete for max_output_tokens maps to max_tokens; other incompletes fail', async () => {
     const out = await events([
       { type: 'response.output_text.delta', delta: 'partial' },

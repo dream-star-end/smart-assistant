@@ -263,7 +263,12 @@ export async function* responsesToAnthropicEvents(
       }
       if (e.type === 'error' || e.type === 'response.failed')
         throw new Error('OpenCode Go returned an error event')
-      if (e.type === 'response.output_text.delta' && typeof e.delta === 'string' && e.delta) {
+      // A refusal is the model's answer (Codex r1): stream it as text like output_text.
+      if (
+        (e.type === 'response.output_text.delta' || e.type === 'response.refusal.delta') &&
+        typeof e.delta === 'string' &&
+        e.delta
+      ) {
         if (!openText) {
           yield frame('content_block_start', { index, content_block: { type: 'text', text: '' } })
           openText = true

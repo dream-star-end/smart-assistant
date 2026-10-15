@@ -48,8 +48,12 @@ export function systemTexts(v: unknown): string[] {
 
 export function webSearchResultText(content: unknown): string {
   if (!Array.isArray(content)) return 'Web search failed.'
-  const lines = content.map(obj).map((r, i) => `${i + 1}. ${String(r.title ?? '')} — ${String(r.url ?? '')}`)
-  return lines.length ? `Web search results:\n${lines.join('\n')}` : 'Web search returned no results.'
+  const lines = content
+    .map(obj)
+    .map((r, i) => `${i + 1}. ${String(r.title ?? '')} — ${String(r.url ?? '')}`)
+  return lines.length
+    ? `Web search results:\n${lines.join('\n')}`
+    : 'Web search returned no results.'
 }
 
 export function toolResultText(b: Obj): string {
@@ -72,7 +76,8 @@ export function isServerTool(t: Obj): boolean {
 
 /** Platform effort (already narrowed by the proxy) → OpenAI `reasoning_effort`. */
 export function chatReasoningEffort(outputConfig: unknown): string | undefined {
-  if (!outputConfig || typeof outputConfig !== 'object' || Array.isArray(outputConfig)) return undefined
+  if (!outputConfig || typeof outputConfig !== 'object' || Array.isArray(outputConfig))
+    return undefined
   const effort = (outputConfig as Obj).effort
   return typeof effort === 'string' ? effort : undefined
 }
@@ -99,7 +104,11 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
         } else if (b.type === 'tool_result') {
           if (typeof b.tool_use_id !== 'string' || !issued.has(b.tool_use_id))
             throw new Error('OpenCode Go tool result has no matching tool call')
-          messages.push({ role: 'tool', tool_call_id: decodeChatToolId(b.tool_use_id), content: toolResultText(b) })
+          messages.push({
+            role: 'tool',
+            tool_call_id: decodeChatToolId(b.tool_use_id),
+            content: toolResultText(b),
+          })
         } else throw new Error(`unsupported OpenCode Go user block: ${String(b.type)}`)
       }
       if (texts.length) messages.push({ role: 'user', content: texts.join('\n\n') })
@@ -119,9 +128,16 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
         calls.push({
           id: decodeChatToolId(b.id),
           type: 'function',
-          function: { name: b.name, arguments: JSON.stringify(b.input === undefined ? {} : obj(b.input)) },
+          function: {
+            name: b.name,
+            arguments: JSON.stringify(b.input === undefined ? {} : obj(b.input)),
+          },
         })
-      } else if (b.type === 'thinking' || b.type === 'redacted_thinking' || b.type === 'server_tool_use') {
+      } else if (
+        b.type === 'thinking' ||
+        b.type === 'redacted_thinking' ||
+        b.type === 'server_tool_use'
+      ) {
         // Not replayable here: foreign thinking has no meaning upstream; a finished server
         // search is represented by its result block below.
       } else if (b.type === 'web_search_tool_result') {
@@ -144,16 +160,20 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
     stream_options: { include_usage: true },
     max_tokens: Math.min(
       OPENAI_CHAT_GO_MAX_TOKENS,
-      typeof body.max_tokens === 'number' && body.max_tokens > 0 ? body.max_tokens : OPENAI_CHAT_GO_MAX_TOKENS,
+      typeof body.max_tokens === 'number' && body.max_tokens > 0
+        ? body.max_tokens
+        : OPENAI_CHAT_GO_MAX_TOKENS,
     ),
   }
   if (typeof body.temperature === 'number') out.temperature = body.temperature
   if (typeof body.top_p === 'number') out.top_p = body.top_p
-  if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) out.stop = body.stop_sequences
+  if (Array.isArray(body.stop_sequences) && body.stop_sequences.length)
+    out.stop = body.stop_sequences
   const effort = chatReasoningEffort(body.output_config)
   if (effort) out.reasoning_effort = effort
   const tools = Array.isArray(body.tools) ? body.tools.map(obj) : []
-  if (tools.some(isServerTool)) throw new Error('OpenCode Go chat models do not offer server tools (web search)')
+  if (tools.some(isServerTool))
+    throw new Error('OpenCode Go chat models do not offer server tools (web search)')
   if (tools.length) {
     out.tools = tools.map((t) => {
       if (typeof t.name !== 'string' || t.input_schema === undefined)
@@ -200,7 +220,9 @@ export function chatUsage(v: unknown): Obj {
   const u = obj(v)
   const prompt = count(u.prompt_tokens)
   const details =
-    u.prompt_tokens_details === undefined || u.prompt_tokens_details === null ? {} : obj(u.prompt_tokens_details)
+    u.prompt_tokens_details === undefined || u.prompt_tokens_details === null
+      ? {}
+      : obj(u.prompt_tokens_details)
   const cached = count(details.cached_tokens)
   if (cached > prompt) throw new Error('OpenCode Go cached usage exceeds input')
   return {
@@ -212,7 +234,9 @@ export function chatUsage(v: unknown): Obj {
 }
 
 function frame(type: string, fields: Obj): Uint8Array {
-  return new TextEncoder().encode(`event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`)
+  return new TextEncoder().encode(
+    `event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`,
+  )
 }
 
 /** SSE `data:` chunks; `[DONE]` ends the stream. An unfinished stream is never successful. */
@@ -289,22 +313,30 @@ export async function* chatToAnthropicEvents(
             content: [],
             stop_reason: null,
             stop_sequence: null,
-            usage: { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0 },
+            usage: {
+              input_tokens: 0,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+              output_tokens: 0,
+            },
           },
         })
       }
       const choices = chunk.choices === undefined ? [] : chunk.choices
-      if (!Array.isArray(choices) || choices.length > 1) throw new Error('invalid OpenCode Go choices')
+      if (!Array.isArray(choices) || choices.length > 1)
+        throw new Error('invalid OpenCode Go choices')
       for (const rawChoice of choices) {
         const choice = obj(rawChoice)
         if (typeof choice.finish_reason === 'string') finish = choice.finish_reason
         const delta = choice.delta === undefined || choice.delta === null ? {} : obj(choice.delta)
-        if (typeof delta.content === 'string' && delta.content) {
+        // A refusal is the model's answer: stream it as text like content.
+        for (const piece of [delta.content, delta.refusal]) {
+          if (typeof piece !== 'string' || !piece) continue
           if (!openText) {
             yield frame('content_block_start', { index, content_block: { type: 'text', text: '' } })
             openText = true
           }
-          yield frame('content_block_delta', { index, delta: { type: 'text_delta', text: delta.content } })
+          yield frame('content_block_delta', { index, delta: { type: 'text_delta', text: piece } })
           hasText = true
         }
         if (delta.tool_calls !== undefined && delta.tool_calls !== null) {
@@ -314,7 +346,8 @@ export async function* chatToAnthropicEvents(
             const at = typeof call.index === 'number' ? call.index : 0
             const pending = calls.get(at) ?? { id: '', name: '', args: '' }
             if (typeof call.id === 'string' && call.id) pending.id = call.id
-            const fn = call.function === undefined || call.function === null ? {} : obj(call.function)
+            const fn =
+              call.function === undefined || call.function === null ? {} : obj(call.function)
             if (typeof fn.name === 'string' && fn.name && !pending.name) pending.name = fn.name
             if (typeof fn.arguments === 'string') pending.args += fn.arguments
             calls.set(at, pending)
@@ -336,7 +369,12 @@ export async function* chatToAnthropicEvents(
       obj(input)
       yield frame('content_block_start', {
         index,
-        content_block: { type: 'tool_use', id: encodeChatToolId(call.id), name: call.name, input: {} },
+        content_block: {
+          type: 'tool_use',
+          id: encodeChatToolId(call.id),
+          name: call.name,
+          input: {},
+        },
       })
       yield frame('content_block_delta', {
         index,
@@ -390,14 +428,19 @@ export function createOpenAIChatGoFetch(fetchImpl: typeof fetch): typeof fetch {
     headers.set('authorization', `Bearer ${key}`)
     headers.set('content-type', 'application/json')
     headers.set('user-agent', 'OpenClaude/5 OpenCodeGoChat')
-    const raw = await fetchImpl(OPENAI_CHAT_GO_ENDPOINT, { ...init, headers, body: JSON.stringify(body) })
+    const raw = await fetchImpl(OPENAI_CHAT_GO_ENDPOINT, {
+      ...init,
+      headers,
+      body: JSON.stringify(body),
+    })
     if (!raw.ok) {
       let message = 'OpenCode Go upstream request failed'
       try {
         const data = obj(await raw.json())
         if (data.error) {
           const detail = obj(data.error)
-          if (typeof detail.message === 'string') message = detail.message.replaceAll(key, '[redacted]').slice(0, 2000)
+          if (typeof detail.message === 'string')
+            message = detail.message.replaceAll(key, '[redacted]').slice(0, 2000)
         }
       } catch {
         /* do not echo arbitrary upstream HTML or credentials */
@@ -411,7 +454,9 @@ export function createOpenAIChatGoFetch(fetchImpl: typeof fetch): typeof fetch {
           status: raw.status,
           headers: {
             'content-type': 'application/json',
-            ...(raw.headers.get('retry-after') && { 'retry-after': raw.headers.get('retry-after') as string }),
+            ...(raw.headers.get('retry-after') && {
+              'retry-after': raw.headers.get('retry-after') as string,
+            }),
           },
         },
       )
