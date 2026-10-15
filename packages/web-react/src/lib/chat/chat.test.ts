@@ -1274,7 +1274,7 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(row.text).toHaveLength(1025);
 
     applyOutboundMessage(s, msgFrame({ frameSeq: 1026, blocks: [{ kind: "text", text: "B", messageId: "srv-1" }] }));
-    expect(row.text).toBe("A".repeat(1025) + "B");
+    expect(row.text).toBe(`${"A".repeat(1025)}B`);
     // The fence stays compact: older seqs fold into one range instead of 1026 keys.
     expect(Object.keys(row._appliedFrameSeqs ?? {}).length).toBeLessThanOrEqual(1024);
     expect(row._appliedFrameSeqRanges?.length).toBe(1);

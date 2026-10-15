@@ -736,7 +736,8 @@ function frameSeqAlreadyApplied(message: ChatMessage, frameSeq?: number): boolea
   if (message._appliedFrameSeqs?.[frameSeq] === true) return true;
   const ranges = message._appliedFrameSeqRanges;
   if (!ranges) return false;
-  let lo = 0, hi = ranges.length - 1;
+  let lo = 0;
+  let hi = ranges.length - 1;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
     const [from, to] = ranges[mid];
