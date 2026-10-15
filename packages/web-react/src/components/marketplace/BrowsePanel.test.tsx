@@ -637,7 +637,10 @@ test("插件类目搜索态:只并入命中关键词的内置插件", async () =
   // 防抖 250ms 后进入搜索态:不命中的内置插件退出,命中的留下
   await waitFor(() => expect(screen.queryByRole("button", { name: /^GitHub/ })).not.toBeInTheDocument());
   expect(screen.getByRole("button", { name: /^WebDAV 网盘/ })).toBeInTheDocument();
-  expect(searchMarketplace).toHaveBeenLastCalledWith(auth, "坚果云", "connector", expect.any(Number));
+  // The local keyword filter hides GitHub at once; the market search goes out only after the
+  // 250ms debounce. Under CI load the assertion above can win that race (seen twice on
+  // 2026-10-15: last call still had the empty query), so wait for the debounced call.
+  await waitFor(() => expect(searchMarketplace).toHaveBeenLastCalledWith(auth, "坚果云", "connector", expect.any(Number)));
 });
 
 test("插件目录读不到 / 没有管理中心出口:只显示市场结果,详情与安装流不受影响", async () => {
