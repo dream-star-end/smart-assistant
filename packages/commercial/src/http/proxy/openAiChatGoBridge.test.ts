@@ -54,7 +54,61 @@ const usageChunk = {
   },
 }
 
+// OCV5-432: the shape CCB actually sends (captured 2026-10-15). A preamble system message
+// after the first user turn, then a `<total_tokens>` system message after every turn whose
+// value changes. Three consecutive requests of one session: tool call, tool result, next turn.
+function ccbSession(id: string): Obj[] {
+  const base: Obj[] = [
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: '<system-reminder>ctx</system-reminder>' },
+        { type: 'text', text: 'run it' },
+      ],
+    },
+    { role: 'system', content: [{ type: 'text', text: '# Environment\nstable' }] },
+  ]
+  const turn1: Obj[] = [
+    ...base,
+    {
+      role: 'assistant',
+      content: [{ type: 'tool_use', id, name: 'Bash', input: { command: 'ls' } }],
+    },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'a.txt' }] },
+    {
+      role: 'system',
+      content: [{ type: 'text', text: '<total_tokens>900 tokens left</total_tokens>' }],
+    },
+  ]
+  const turn2: Obj[] = [
+    // History keeps the earlier notice (as a string, as CCB re-sends it) and appends a new one.
+    ...turn1.slice(0, -1),
+    { role: 'system', content: '<total_tokens>900 tokens left</total_tokens>' },
+    { role: 'assistant', content: [{ type: 'text', text: 'a.txt' }] },
+    { role: 'user', content: 'again?' },
+    {
+      role: 'system',
+      content: [{ type: 'text', text: '<total_tokens>800 tokens left</total_tokens>' }],
+    },
+  ]
+  return [base, turn1, turn2].map((messages) => ({ model: 'm', system: 'top system', messages }))
+}
+
 describe('request conversion', () => {
+  test('later system messages stay in place, so every request extends the previous one (OCV5-432)', () => {
+    const outs = ccbSession(encodeChatToolId('call_1')).map((b) => anthropicToOpenAIChat(b))
+    for (let i = 1; i < outs.length; i++) {
+      const prev = outs[i - 1].messages as Obj[]
+      assert.deepEqual((outs[i].messages as Obj[]).slice(0, prev.length), prev)
+    }
+    const msgs = outs[2].messages as Obj[]
+    assert.deepEqual(msgs[0], { role: 'system', content: 'top system\n\n# Environment\nstable' })
+    assert.deepEqual(msgs.filter((x) => x.role === 'system').slice(1), [
+      { role: 'system', content: '<total_tokens>900 tokens left</total_tokens>' },
+      { role: 'system', content: '<total_tokens>800 tokens left</total_tokens>' },
+    ])
+  })
+
   test('system, inline system, text, tool loop, effort, cap and tools', () => {
     const id = encodeChatToolId('call_abc.1')
     const out = anthropicToOpenAIChat({

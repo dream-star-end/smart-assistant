@@ -88,11 +88,18 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
   const system: string[] = body.system === undefined ? [] : systemTexts(body.system)
   const messages: Obj[] = []
   const issued = new Set<string>()
+  // OCV5-432: CCB sends platform context as role:"system" messages. Only the preamble (before
+  // the first assistant message) folds into the leading system message; later ones (the
+  // per-turn `<total_tokens>…`) stay in place so the prompt-cache prefix never changes.
+  let afterAssistant = false
   for (const raw of body.messages) {
     const m = obj(raw)
     if (m.role === 'system') {
-      // CCB sends platform context as role:"system" messages; fold them like geminiGoBridge.
-      system.push(...systemTexts(m.content))
+      if (!afterAssistant) system.push(...systemTexts(m.content))
+      else {
+        const texts = systemTexts(m.content)
+        if (texts.length) messages.push({ role: 'system', content: texts.join('\n\n') })
+      }
       continue
     }
     if (m.role === 'user') {
@@ -115,6 +122,7 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
       continue
     }
     if (m.role !== 'assistant') throw new Error('unsupported OpenCode Go message role')
+    afterAssistant = true
     const texts: string[] = []
     const calls: Obj[] = []
     for (const b of blocks(m.content)) {

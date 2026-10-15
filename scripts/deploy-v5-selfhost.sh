@@ -2037,7 +2037,13 @@ user_contract_gate() {
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
     V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
     V5_CANARY_PASSWORD_FILE="$password_file" V5_CONTRACT_COST=live \
-    node "$SCRIPT_DIR/v5-user-contract-smoke.mjs"
+    node "$SCRIPT_DIR/v5-user-contract-smoke.mjs" || return 1
+  # OCV5-432: a real multi-turn OpenCode Go chat must read the upstream prompt cache
+  # (INC-20261015-GO-CACHE-PREFIX wrote the whole prompt every request and read 0).
+  V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
+    V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
+    V5_CANARY_PASSWORD_FILE="$password_file" \
+    node "$SCRIPT_DIR/v5-go-cache-contract.mjs"
 }
 
 cmd_smoke() {
@@ -2357,7 +2363,7 @@ cutover_smoke_against_release() { # <rel>
     cutover_clog "  ✓ egress 双槽拓扑一致:active=$want"
   fi
   # Must pass before either branch persists phase=smoked (survivor invariant).
-  user_contract_gate || { cutover_fail "cutover smoke: 用户契约门禁(C1–C3)失败"; return 1; }
+  user_contract_gate || { cutover_fail "cutover smoke: 用户契约门禁(C1–C3 + G1 Go 缓存)失败"; return 1; }
 }
 
 cutover_smoke_healthz_only() {

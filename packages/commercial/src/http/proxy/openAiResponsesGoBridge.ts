@@ -48,10 +48,19 @@ export function anthropicToOpenAIResponses(body: Obj): Obj {
   const system: string[] = body.system === undefined ? [] : systemTexts(body.system)
   const input: Obj[] = []
   const issued = new Set<string>()
+  // OCV5-432: only the preamble (system messages before the first assistant message) folds
+  // into instructions. Later ones — CCB appends `<total_tokens>…` after every turn — stay in
+  // place, so each request only appends to the previous one and the upstream prompt cache
+  // keeps its prefix (folded, they changed instructions every request: Luna read 0).
+  let afterAssistant = false
   for (const raw of body.messages) {
     const m = obj(raw)
     if (m.role === 'system') {
-      system.push(...systemTexts(m.content))
+      if (!afterAssistant) system.push(...systemTexts(m.content))
+      else {
+        const texts = systemTexts(m.content)
+        if (texts.length) input.push({ role: 'system', content: texts.join('\n\n') })
+      }
       continue
     }
     if (m.role === 'user') {
@@ -74,6 +83,7 @@ export function anthropicToOpenAIResponses(body: Obj): Obj {
       continue
     }
     if (m.role !== 'assistant') throw new Error('unsupported OpenCode Go message role')
+    afterAssistant = true
     const texts: string[] = []
     const calls: Obj[] = []
     for (const b of blocks(m.content)) {
