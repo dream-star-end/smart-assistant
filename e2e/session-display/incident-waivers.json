@@ -259,6 +259,12 @@
       "reason": "OCV5-424 user affinity (PR #750): fixes the Codex r3 finding on the not-yet-released feature itself; no released behaviour is changed.",
       "approvedBy": "user 2026-10-15 确认按用户粘性设计「用户分配方案没问题」并要求实现发版（cc3 account-pool 会话）",
       "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "47194f47b465fd1f1966982fd9cdf32c07512626",
+      "reason": "OCV5-424 merged 服务池 tab follow-up: admin-only page (Antigravity quota user-agent, Cursor rows shown once, stale-window text). No user-visible surface changed.",
+      "approvedBy": "user 2026-10-15 要求服务池与订阅账号合并并显示使用额度（cc3 account-pool 会话）",
+      "expiresAt": "2026-11-14"
     }
   ]
 }
