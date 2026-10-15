@@ -271,6 +271,12 @@
       "reason": "OCV5-434 GPT Fast acceptance fix: Codex turn/start needs the catalog tier id \"priority\"; released <1h earlier the Codex Fast toggle was a no-op (standard speed). No wrong charge (Codex is subscription, not credits) and nothing broke. Unit tests pin priority; live acceptance re-verifies the echoed tier by capture.",
       "approvedBy": "user 2026-10-16 选择「Waiver」处理 OCV5-434 Codex Fast tier id 修复（cc3 会话）",
       "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "f72d9a708ea04948f5bc892ab779388ecb4b68c0",
+      "reason": "OCV5-439: removes an unref() from the 200 ms wait before a runner error's RUNNER_CRASHED terminal (a tracked persistence awaited by awaitPendingPersistence/shutdownAll). Latent: only a gateway exit within 200 ms of a runner error could lose that terminal; no user report. Unit test pins it.",
+      "approvedBy": "user 2026-10-16 管家按用户「有问题就搞」决定一起修：去掉 handleError 200ms unref，按规范写 Incident: none 豁免（cc3 sync 会话）",
+      "expiresAt": "2026-11-15"
     }
   ]
 }
