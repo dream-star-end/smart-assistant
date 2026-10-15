@@ -22,6 +22,8 @@ import {
   MODEL_THINKING_KEEPALIVE_MS,
   MODEL_THINKING_WORKING_DETAIL,
   isNativeEngineTransientContinuationSafe,
+  messageSendAttempt,
+  stopControlSendAttempt,
   type AgentSession,
 } from "../sessionManager.js";
 import { CcbAdapter } from "../engine/ccbAdapter.js";
@@ -1965,6 +1967,219 @@ describe("crash/interrupt partial persistence", () => {
 
     } finally {
       usageBag.stop();
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  // OCV5-435: a browser Stop that reached the gateway before this turn's engine
+  // run existed must stop that exact turn as soon as the run is created.
+  // Previously it was answered TURN_NOT_ACTIVE and the turn ran unseen (a Codex
+  // question then hung in waiting_for_user behind a hidden card).
+  function runOneTurnFor(
+    sm: SessionManager,
+    session: AgentSession,
+    events: SessionStreamEvent[],
+    clientMessageId: string,
+  ): Promise<void> {
+    return (sm as unknown as {
+      _runOneTurn: (...args: unknown[]) => Promise<void>;
+    })._runOneTurn(
+      session, "ask me first", (e: SessionStreamEvent) => events.push(e), "req-unit",
+      undefined, undefined, undefined, undefined, undefined, undefined, clientMessageId,
+    );
+  }
+
+  function makeStoppableRunner(): { runner: FakeCcbRunner; interruptCalls: () => number; bind: (s: AgentSession) => void } {
+    let calls = 0;
+    let session!: AgentSession;
+    const runner = new FakeCcbRunner((r) => {
+      setImmediate(() => {
+        if (calls > 0) return;
+        r.text("model answered");
+        r.result({ usage: { input_tokens: 5, output_tokens: 2 } });
+      });
+    });
+    runner.interrupt = () => {
+      // Only a Stop on a created run reaches the engine; an earlier one has
+      // nothing to interrupt (it is what the pre-start fence is for).
+      if (!session._persistActiveTurn) return false;
+      calls += 1;
+      setImmediate(() => {
+        session.runner.emit("billing", {
+          requestId: "req-unit",
+          engineSessionId: `oceng-${"e".repeat(48)}`,
+          status: "error",
+          terminalCode: "USER_CANCELLED",
+          durationMs: 5,
+          usage: { input_tokens: 5, output_tokens: 0 },
+        });
+        runner.result({
+          is_error: true,
+          result: "codex turn interrupted",
+          stop_reason: "interrupted",
+          usage: { input_tokens: 5, output_tokens: 0 },
+        });
+      });
+      return false;
+    };
+    return { runner, interruptCalls: () => calls, bind: (s) => { session = s; } };
+  }
+
+  function makeWebchatSession(sm: SessionManager, runner: FakeCcbRunner, clientMessageId: string): AgentSession {
+    const session = makeSession(runner, {
+      channel: "webchat",
+      userId: "user-1",
+      _currentDispatch: {
+        userId: "user-1",
+        sessionId: "engine-peer",
+        clientMessageId,
+        dispatchId: "22222222-2222-4222-8222-222222222222",
+        attemptNo: 1,
+      },
+    } as Partial<AgentSession>);
+    (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(session.sessionKey, session);
+    return session;
+  }
+
+  test("OCV5-435: a Stop fenced before the engine run ends that exact turn as USER_CANCELLED", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const { runner, interruptCalls, bind } = makeStoppableRunner();
+      const session = makeWebchatSession(sm, runner, "m-prestart-0001");
+      bind(session);
+
+      sm.fencePreStartStop(session.peerId, "m-prestart-0001");
+      await runOneTurnFor(sm, session, events, "m-prestart-0001");
+      await sm.awaitPendingPersistence();
+
+      assert.equal(interruptCalls(), 1, "the run is interrupted the moment it exists");
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "interrupted");
+      assert.equal(captured.payloads[0]!.errorCode, "USER_CANCELLED");
+      assert.equal(captured.payloads[0]!.text ?? "", "", "no model output reaches the tape");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("OCV5-435: the pre-start fence is exact and consumed once", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const other = makeStoppableRunner();
+      const otherSession = makeWebchatSession(sm, other.runner, "m-prestart-other");
+      other.bind(otherSession);
+      sm.fencePreStartStop(otherSession.peerId, "m-prestart-0002");
+      await runOneTurnFor(sm, otherSession, [], "m-prestart-other");
+      assert.equal(other.interruptCalls(), 0, "a different turn of the same peer is not stopped");
+
+      const once = makeStoppableRunner();
+      const onceSession = makeWebchatSession(sm, once.runner, "m-prestart-0002");
+      once.bind(onceSession);
+      await runOneTurnFor(sm, onceSession, [], "m-prestart-0002");
+      assert.equal(once.interruptCalls(), 1);
+
+      const again = makeStoppableRunner();
+      const againSession = makeWebchatSession(sm, again.runner, "m-prestart-0002");
+      again.bind(againSession);
+      await runOneTurnFor(sm, againSession, [], "m-prestart-0002");
+      assert.equal(again.interruptCalls(), 0, "the fence does not outlive the turn it stopped");
+      await sm.awaitPendingPersistence();
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("OCV5-435: an expired pre-start fence does not stop a later run", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const { runner, interruptCalls, bind } = makeStoppableRunner();
+      const session = makeWebchatSession(sm, runner, "m-prestart-0004");
+      bind(session);
+      sm.fencePreStartStop(session.peerId, "m-prestart-0004", 1);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await runOneTurnFor(sm, session, [], "m-prestart-0004");
+      await sm.awaitPendingPersistence();
+      assert.equal(interruptCalls(), 0);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("OCV5-435: admission of the same send keeps an overtaking Stop armed however long the run takes", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const { runner, interruptCalls, bind } = makeStoppableRunner();
+      const session = makeWebchatSession(sm, runner, "m-prestart-0005");
+      bind(session);
+      sm.fencePreStartStop(session.peerId, "m-prestart-0005", 30, 0);
+      sm.adoptPreStartStopOnAdmission(session.peerId, "m-prestart-0005", 0);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      await runOneTurnFor(sm, session, [], "m-prestart-0005");
+      await sm.awaitPendingPersistence();
+      assert.equal(interruptCalls(), 1, "the short fence became an admitted-turn fence");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("OCV5-435: an overtaking Stop for one send attempt does not stop a resend of the same message", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const { runner, interruptCalls, bind } = makeStoppableRunner();
+      const session = makeWebchatSession(sm, runner, "m-prestart-0006");
+      bind(session);
+      sm.fencePreStartStop(session.peerId, "m-prestart-0006", 30_000, 0);
+      sm.adoptPreStartStopOnAdmission(session.peerId, "m-prestart-0006", 1);
+      await runOneTurnFor(sm, session, [], "m-prestart-0006");
+      await sm.awaitPendingPersistence();
+      assert.equal(interruptCalls(), 0);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("OCV5-435: send attempts are read from the browser's Stop control id and message idempotency key", () => {
+    assert.equal(stopControlSendAttempt("control:stop:m-a1", "m-a1"), 0);
+    assert.equal(stopControlSendAttempt("control:stop:m-a1:attempt:4", "m-a1"), 4);
+    assert.equal(stopControlSendAttempt("control:stop:m-a1:recovery-fence", "m-a1"), undefined);
+    assert.equal(stopControlSendAttempt("control:stop:hq1w2e3", "m-a1"), undefined);
+    assert.equal(stopControlSendAttempt(undefined, "m-a1"), undefined);
+    assert.equal(messageSendAttempt("web:m-a1:0", "m-a1"), 0);
+    assert.equal(messageSendAttempt("web:m-a1:7", "m-a1"), 7);
+    assert.equal(messageSendAttempt("web:m-b2:7", "m-a1"), undefined);
+    assert.equal(messageSendAttempt("hk3j4", "m-a1"), undefined);
+  });
+
+  test("OCV5-435: an exact Stop before terminal persistence exists arms the pre-start fence", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const { runner, interruptCalls, bind } = makeStoppableRunner();
+      const session = makeWebchatSession(sm, runner, "m-prestart-0003");
+      bind(session);
+      session._runningClientMessageId = "m-prestart-0003";
+      assert.equal(session._persistActiveTurn, undefined);
+
+      assert.equal(sm.interruptClientTurn(session.sessionKey, "m-prestart-0003"), false,
+        "no engine run to interrupt yet");
+      await runOneTurnFor(sm, session, [], "m-prestart-0003");
+      await sm.awaitPendingPersistence();
+
+      assert.equal(interruptCalls(), 1);
+      assert.equal(captured.payloads[0]?.errorCode, "USER_CANCELLED");
+    } finally {
       setV3MasterSinkSingleton(null);
     }
   });

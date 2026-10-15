@@ -549,6 +549,10 @@ import {
   lookupRecentTerminal,
   parseVerificationVerdict,
   persistInterruptedPromptQueueTurn,
+  PRE_ADMISSION_STOP_TTL_MS,
+  messageSendAttempt,
+  preStartStopKey,
+  stopControlSendAttempt,
   type PromptQueueExternalTurnReservation,
 } from './sessionManager.js'
 import { WebhookRouter } from './webhooks.js'
@@ -11442,6 +11446,9 @@ export class Gateway {
     done: Promise<void>
     release: () => void
   }> | undefined
+  /** OCV5-435 — webchat turns between ws admission and settlement
+   * (preStartStopKey → live dispatch count). Lazy for Object.create scaffolds. */
+  private _admittedClientTurns: Map<string, number> | undefined
   /** HTTP/MCP delegate 续跑绑定。测试脚手架 Object.create 不跑字段初始化,使用处惰性 ??=。 */
   private _delegateResume: DelegateResumeRegistry | undefined
 
@@ -17677,7 +17684,7 @@ export class Gateway {
           await runDurableDispatchAdmission({
             ctx: dctx,
             sendReceipt: (row) => this._sendTurnDispatchReceipt(ws, dctx, row),
-            dispatch: () => this.dispatchInbound(frame),
+            dispatch: () => this._dispatchAdmittedClientTurn(frame),
             onAdmitError: (err) => {
               // 受理事务异常 = 拒轮(可重试),不半受理。不建 inbox 行 → 无孤儿。
               this.log.error(
@@ -17697,7 +17704,7 @@ export class Gateway {
           return
         }
         try {
-          await this.dispatchInbound(frame)
+          await this._dispatchAdmittedClientTurn(frame)
         } finally {
           const unusedQueueLifecycle = this._promptQueueLifecycleByFrame.get(frame as object)
           const unusedQueueFence = this._promptQueueExecutionFenceByFrame.get(frame as object)
@@ -18167,6 +18174,38 @@ export class Gateway {
     }
   }
 
+  /** OCV5-435 — a webchat turn counts as admitted from ws dispatch until it
+   * settles, so a Stop that beats its engine run still binds to this turn. */
+  private async _dispatchAdmittedClientTurn(frame: InboundFrame): Promise<void> {
+    const clientMessageId = (frame as { clientMessageId?: unknown }).clientMessageId
+    if (
+      frame.type !== 'inbound.message' ||
+      frame.channel !== 'webchat' ||
+      !isClientMessageId(clientMessageId)
+    ) {
+      return this.dispatchInbound(frame)
+    }
+    const key = preStartStopKey(frame.peer.id, clientMessageId)
+    const admitted = (this._admittedClientTurns ??= new Map())
+    admitted.set(key, (admitted.get(key) ?? 0) + 1)
+    this.sessions.adoptPreStartStopOnAdmission(
+      frame.peer.id,
+      clientMessageId,
+      messageSendAttempt((frame as { idempotencyKey?: unknown }).idempotencyKey, clientMessageId),
+    )
+    try {
+      await this.dispatchInbound(frame)
+    } finally {
+      const left = (admitted.get(key) ?? 1) - 1
+      if (left > 0) {
+        admitted.set(key, left)
+      } else {
+        admitted.delete(key)
+        this.sessions.clearPreStartStop(frame.peer.id, clientMessageId)
+      }
+    }
+  }
+
   private async handleStop(frame: {
     type: 'inbound.control.stop'
     channel: string
@@ -18210,6 +18249,30 @@ export class Gateway {
         })
         return ok
       }
+      // OCV5-435: accepted but its engine run does not exist yet (cold start,
+      // lock wait). Bind the Stop to that exact turn instead of answering
+      // TURN_NOT_ACTIVE and letting it run unseen.
+      if (this._admittedClientTurns?.has(preStartStopKey(frame.peer.id, clientMessageId))) {
+        this.sessions.fencePreStartStop(frame.peer.id, clientMessageId)
+        this.log.info('interrupt', {
+          sessionKey: `*${suffix}`,
+          clientMessageId,
+          ok: true,
+          preStart: true,
+        })
+        return true
+      }
+      // Not admitted here yet: the Stop may have overtaken its own message
+      // (Master acks admission before forwarding it). Arm a short fence for
+      // that send attempt; admission of the same attempt extends it, another
+      // attempt drops it. Nothing is active now, so the receipt stays
+      // TURN_NOT_ACTIVE.
+      this.sessions.fencePreStartStop(
+        frame.peer.id,
+        clientMessageId,
+        PRE_ADMISSION_STOP_TTL_MS,
+        stopControlSendAttempt((frame as { controlId?: unknown }).controlId, clientMessageId),
+      )
       this.log.info('interrupt', {
         sessionKey: `*${suffix}`,
         clientMessageId,
