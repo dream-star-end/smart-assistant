@@ -241,6 +241,12 @@
       "reason": "OCV5-424 follow-up 3: admin 服务池 page 最近错误 column squeezed to 72px at phone width, stretching rows. CSS-only change on an admin page; no user-visible surface changed.",
       "approvedBy": "user 2026-10-15 要求修手机端服务池状态徽标逐字换行并发个人版（cc3 account-pool 会话）",
       "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "929cd4cd2e1b1650329517014e82a3b757be2fdf",
+      "reason": "OCV5-424 user affinity (PR #750): fixes Codex r1 findings on the not-yet-released feature itself; no released behaviour is changed.",
+      "approvedBy": "user 2026-10-15 确认按用户粘性设计「用户分配方案没问题」并要求实现发版（cc3 account-pool 会话）",
+      "expiresAt": "2026-11-14"
     }
   ]
 }
