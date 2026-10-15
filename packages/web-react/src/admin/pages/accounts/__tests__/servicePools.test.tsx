@@ -82,7 +82,12 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
-const section = async (desc: RegExp) => (await screen.findByText(desc)).closest("section") as HTMLElement;
+// Wait for the rows first: before the data arrives every section renders "· 0 条" and would match.
+const section = async (desc: RegExp) => {
+  await screen.findByText("claude-main");
+  await screen.findByText("codex-idle");
+  return screen.getByText(desc).closest("section") as HTMLElement;
+};
 
 describe("服务池(合并后的一个 tab)", () => {
   test("导航只有一个服务池入口;旧的 #tab=accounts 链接打开它", () => {
