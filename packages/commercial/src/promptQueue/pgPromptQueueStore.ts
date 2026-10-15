@@ -3,7 +3,9 @@ import {
   MAX_ATTACHMENTS_PER_MESSAGE,
   PROMPT_QUEUE_MAX_TOTAL_CONTENT_BYTES,
   isCursorContextTier,
+  isServiceTier,
   type CursorContextTier,
+  type ServiceTier,
   type PromptQueueAttachmentRef,
   type PromptQueueMutationFrame,
   type PromptQueueMutationOperation,
@@ -1152,6 +1154,7 @@ async function readSnapshot(
         effortLevel?: string | null
         teamMode?: boolean
         contextTier?: CursorContextTier
+        serviceTier?: ServiceTier | null
       },
       createdAt: row.created_at.getTime(),
       updatedAt: row.updated_at.getTime(),
@@ -1392,6 +1395,9 @@ function validateRequestedExecution(value: Record<string, unknown>): void {
   }
   if (value.contextTier !== undefined && !isCursorContextTier(value.contextTier)) {
     throw new PromptQueueStoreError('INVALID_REQUEST', 'requestedExecution.contextTier is invalid')
+  }
+  if (value.serviceTier !== undefined && value.serviceTier !== null && !isServiceTier(value.serviceTier)) {
+    throw new PromptQueueStoreError('INVALID_REQUEST', 'requestedExecution.serviceTier is invalid')
   }
 }
 

@@ -13,6 +13,7 @@ import { appUpdate } from "./lib/appUpdate";
 import {
   type CursorContextTier,
   cursorModelSupportsContextTier,
+  supportsFastServiceTier,
   isCodexEngineModel,
   normalizeMessageReplyQuote,
   type MessageReplyQuote,
@@ -183,6 +184,7 @@ import {
 
 import { clearSessionEffort, writeSessionEffort } from "./lib/sessionEffort";
 import { clearContextTierForSession, writeContextTier } from "./lib/sessionContextTier";
+import { writeSessionServiceTier } from "./lib/sessionServiceTier";
 import { DEFAULT_AGENT, agentFromApiRow, type Agent } from "./lib/agents";
 import {
   PRODUCT_CAPABILITIES,
@@ -765,6 +767,7 @@ export function App() {
       clearTeamModeForSession(id); // 顺手清该会话的团队模式 per-session 键(不留孤儿键)
       clearSessionEffort(id); // 同上:思考档位 per-session 键
       clearContextTierForSession(id); // 同上:Cursor 上下文档位 per-session 键
+      writeSessionServiceTier(id, null); // OCV5-434 GPT Fast per-session 键
     },
     onActiveSessionDeleted: () => {
       setMessages([]);
@@ -1246,7 +1249,8 @@ export function App() {
   }, [activeId, applyCollabDoc, auth, demo]);
 
   // 本会话的思考档位与上下文档位(hooks/useSessionEngineOptions,原位调用)。
-  const { sessionEffort, setSessionEffort, contextTier, setContextTier } = useSessionEngineOptions(activeId);
+  const { sessionEffort, setSessionEffort, contextTier, setContextTier, serviceTier, setServiceTier } =
+    useSessionEngineOptions(activeId);
 
   // Async goal saves can finish after navigation; only consume the selected draft's project.
   const selectedSessionIdRef = useRef(activeId);
@@ -1333,6 +1337,7 @@ export function App() {
         // 显式档位选择存在才落地(未选择 = 继续继承全局偏好,不写键)。
         if (sessionEffort !== undefined) writeSessionEffort(sessionId, sessionEffort);
         writeContextTier(sessionId, contextTier);
+        writeSessionServiceTier(sessionId, serviceTier);
         sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
         if (modelId) sockRef.current?.setSessionModel(sessionId, modelId);
         if (auth && (collabMode !== "solo" || collabAsDefault)) {
@@ -1443,6 +1448,8 @@ export function App() {
         // Cursor Opus/Fable 上下文档位:只在当前模型支持分档时随帧发送;其它模型不带该字段
         // (master 对非分档模型本就忽略,但不发送可以让路由快照/日志更干净)。
         ...(cursorModelSupportsContextTier(modelId) ? { contextTier } : {}),
+        // OCV5-434 GPT Fast:只在当前模型支持且用户开着时随帧发送;不带 = 标准。
+        ...(serviceTier === "fast" && supportsFastServiceTier(modelId) ? { serviceTier } : {}),
       });
       // 侧栏：提到顶 + 更新标题/时间/计数（计数仅作排序提示，权威消息在 WS service）。
       setSessions((c) => {
@@ -1494,6 +1501,7 @@ export function App() {
       preferenceEffort,
       sessionEffort,
       contextTier,
+      serviceTier,
       collabMode,
       collabUi,
       collabAsDefault,
@@ -3831,6 +3839,8 @@ export function App() {
           onSelectEffort={demo ? undefined : setSessionEffort}
           contextTier={contextTier}
           onSelectContextTier={demo ? undefined : setContextTier}
+          serviceTier={serviceTier}
+          onSelectServiceTier={demo ? undefined : setServiceTier}
           modelPickerOpen={modelPickerOpen}
           onModelPickerOpenChange={setModelPickerOpen}
           // 团队模式知情指示:与 send 的生效条件同构(teamMode 只对 main 生效,

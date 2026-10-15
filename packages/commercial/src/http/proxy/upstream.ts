@@ -64,6 +64,8 @@ import {
   getStaticProvider,
   isOpenCodeGoChatUpstream,
   isOpenCodeGoResponsesUpstream,
+  isOpenCodeGoFastUpstream,
+  OPENAI_FAST_SERVICE_TIER,
   staticProviderOutputConfigEfforts,
   type StaticKeyProviderSpec,
   type StaticProviderId,
@@ -608,8 +610,18 @@ function makeStaticKeyUpstream(
       // Model-scoped effort (OCV5-425): read before the provider-wide strip removes it.
       const modelEfforts = spec.modelOutputConfigEfforts?.[upstreamModel.toLowerCase()];
       const requestedOutputConfig = mutableBody.output_config;
+      // OCV5-434 GPT Fast: index.ts already kept "priority" only for the OpenCode Go Fast models;
+      // read it before the provider-wide strip and restore it for those upstreams alone.
+      const requestedServiceTier = mutableBody.service_tier;
       for (const field of spec.stripBodyFields) {
         delete mutableBody[field];
+      }
+      if (
+        spec.id === "opencodego" &&
+        requestedServiceTier === OPENAI_FAST_SERVICE_TIER &&
+        isOpenCodeGoFastUpstream(upstreamModel)
+      ) {
+        mutableBody.service_tier = OPENAI_FAST_SERVICE_TIER;
       }
       // 恒思考模型兜底：provider-wide(kimi-k2.7-code)或 model-scoped(glm-5.3)
       // 不支持 thinking:{type:'disabled'}；删参退回上游默认(照常思考)。model-scoped

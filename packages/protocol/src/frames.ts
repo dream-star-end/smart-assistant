@@ -1,5 +1,6 @@
 import { type Static, Type } from '@sinclair/typebox'
 import { CURSOR_CONTEXT_TIERS, PLATFORM_REASONING_EFFORTS } from './engineModels.js'
+import { SERVICE_TIERS } from './serviceTiers.js'
 import { GOAL_STATUSES, type GoalStateSnapshot } from './goalState.js'
 import { MessageReplyQuote } from './messageReply.js'
 import { SysMediaJob } from './mediaGeneration.js'
@@ -245,6 +246,14 @@ export const InboundMessage = Type.Object({
   contextTier: Type.Optional(
     Type.Union(CURSOR_CONTEXT_TIERS.map((tier) => Type.Literal(tier))),
   ),
+  // OCV5-434 GPT Fast (OpenAI priority processing), turn-level, default off. Only models in
+  // protocol/serviceTiers (Codex GPT-6 family, OpenCode Go Lunas) act on it; others ignore it.
+  //   - 'fast': this turn runs on the Fast tier (Codex: serviceTierForTurn; Go: service_tier)
+  //   - null : explicit standard (Codex sends serviceTierForTurn "default")
+  //   - absent: same as null for supported models — Fast is never implied
+  serviceTier: Type.Optional(
+    Type.Union([Type.Null(), ...SERVICE_TIERS.map((tier) => Type.Literal(tier))]),
+  ),
   // 团队模式(v5 轻量组队):main 队长收到此 flag 的 turn 会被鼓励按任务复杂度自主
   // delegate_task 给已安装 agent 组队,简单任务自己答。turn 级、可中途切,只对 main 生效。
   teamMode: Type.Optional(Type.Boolean()),
@@ -440,6 +449,7 @@ export const PromptQueueItem = Type.Object({
     model: Type.Optional(Type.String()),
     modelSwitchId: Type.Optional(ControlId),
     effortLevel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+    serviceTier: Type.Optional(Type.Union([Type.Null(), ...SERVICE_TIERS.map((tier) => Type.Literal(tier))])),
     teamMode: Type.Optional(Type.Boolean()),
     collabMode: Type.Optional(
       Type.Union([Type.Literal('solo'), Type.Literal('advisor'), Type.Literal('team')]),
@@ -532,6 +542,7 @@ export const InboundPromptQueueEnqueue = Type.Object({
   requestedExecution: Type.Object({
     model: Type.Optional(Type.String()),
     effortLevel: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+    serviceTier: Type.Optional(Type.Union([Type.Null(), ...SERVICE_TIERS.map((tier) => Type.Literal(tier))])),
     teamMode: Type.Optional(Type.Boolean()),
     collabMode: Type.Optional(
       Type.Union([Type.Literal('solo'), Type.Literal('advisor'), Type.Literal('team')]),

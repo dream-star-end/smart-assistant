@@ -24,6 +24,7 @@ import {
   PROMPT_QUEUE_DETAIL_PATH,
   PROMPT_QUEUE_CLAIM_PATH,
   isCursorContextTier,
+  isServiceTier,
 } from '@openclaude/protocol'
 
 export {
@@ -236,7 +237,7 @@ function validateMutation(value: unknown, owner: PromptQueueOwner): void {
       if (!isRecord(value.requestedExecution)) {
         throw new InvalidPromptQueueBodyError('requestedExecution object required')
       }
-      assertOnlyKeys(value.requestedExecution, ['model', 'effortLevel', 'teamMode', 'collabMode', 'advisorModel', 'collabConfigVersion', 'contextTier'])
+      assertOnlyKeys(value.requestedExecution, ['model', 'effortLevel', 'teamMode', 'collabMode', 'advisorModel', 'collabConfigVersion', 'contextTier', 'serviceTier'])
       assertOptionalString('model', value.requestedExecution.model, 256)
       assertOptionalString('effortLevel', value.requestedExecution.effortLevel, 64, true)
       if (
@@ -244,6 +245,13 @@ function validateMutation(value: unknown, owner: PromptQueueOwner): void {
         !isCursorContextTier(value.requestedExecution.contextTier)
       ) {
         throw new InvalidPromptQueueBodyError('contextTier invalid')
+      }
+      if (
+        value.requestedExecution.serviceTier !== undefined &&
+        value.requestedExecution.serviceTier !== null &&
+        !isServiceTier(value.requestedExecution.serviceTier)
+      ) {
+        throw new InvalidPromptQueueBodyError('serviceTier invalid')
       }
       if (value.observedVersion !== undefined) assertString('observedVersion', value.observedVersion, 20, VERSION_RE)
       assertString('clientMessageId', value.clientMessageId, 128, ITEM_ID_RE)
