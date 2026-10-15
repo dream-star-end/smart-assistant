@@ -251,6 +251,21 @@ assert_eq "$(git -C "$T/wt" rev-parse HEAD)" "$LOCAL" "分叉的工作树原样�
 assert_eq "$(starts)" 0 "分叉不发车"
 grep -q "分叉" "$T/comments/OCV5-910.md" 2>/dev/null && ok "分叉告警写明原因" || bad "分叉告警未写明原因"
 
+# d) 被忽略的本地文件(.env)会被 tip 新增的同名跟踪文件覆盖 → 不 ff、不发车、本地内容原样、告警
+git -C "$T/wt" reset -q --hard "$C5"
+echo ".env" >"$T/wt/.gitignore"; git -C "$T/wt" add .gitignore; git -C "$T/wt" commit -qm ignore-env
+C6="$(git -C "$T/wt" rev-parse HEAD)"
+git -C "$T/wt" add -f .gitignore; echo "tip-env" >"$T/wt/.env"; git -C "$T/wt" add -f .env; git -C "$T/wt" commit -qm track-env
+C7="$(git -C "$T/wt" rev-parse HEAD)"; git -C "$T/wt" push -q -f origin feat/test
+git -C "$T/wt" reset -q --hard "$C6"; echo "local secret" >"$T/wt/.env"
+reset_db; set_live "$C5" committed
+"$LEASE" register --resource deploy:selfhost --mode ride --sha "$C7" --ticket OCV5-911 --owner s1 >/dev/null
+"$WORKER" >/dev/null 2>&1
+assert_eq "$(git -C "$T/wt" rev-parse HEAD)" "$C6" "被忽略文件会被覆盖 → 工作树不动"
+assert_eq "$(cat "$T/wt/.env")" "local secret" "被忽略的本地文件原样保留"
+assert_eq "$(starts)" 0 "不发车"
+assert_eq "$(q "SELECT COUNT(*) FROM outbox WHERE id LIKE 'lease:%:ff-blocked:%';")" 1 "告警入 outbox"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]]

@@ -220,8 +220,9 @@ canonical_fast_forward() { # <head> <tip>
     why="工作树有未提交改动"
   elif ! git -C "$LEASE_REPO_ROOT" merge-base --is-ancestor "$head" "$tip"; then
     why="HEAD ${head:0:12} 不是 origin tip ${tip:0:12} 的祖先(已分叉)"
-  elif ! git -C "$LEASE_REPO_ROOT" merge -q --ff-only "$tip" >/dev/null 2>&1; then
-    why="git merge --ff-only 失败(未跟踪文件会被覆盖等)"
+  elif ! git -C "$LEASE_REPO_ROOT" merge -q --ff-only --no-overwrite-ignore "$tip" >/dev/null 2>&1; then
+    # --no-overwrite-ignore:被忽略的本地文件(如 .env)也不许被 tip 里的同名跟踪文件覆盖。
+    why="git merge --ff-only 失败(本地未跟踪/被忽略文件会被覆盖等)"
   fi
   if [[ -z "$why" ]]; then
     wlog "工作树 ${head:0:12} 已快进到 origin tip ${tip:0:12}"
