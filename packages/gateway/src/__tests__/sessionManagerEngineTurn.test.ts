@@ -431,7 +431,16 @@ describe("phantom three-state judgment", () => {
     const session = makeSession(runner);
 
     await runOneTurn(sm, session, events);
-    assert.ok(events.some((e) => e.kind === "final"));
+    // Not phantom: one engine attempt, no PHANTOM_TURN reject/retry. Since
+    // fc0e393ac a zero-token, zero-output turn is not a reply either: it ends
+    // as NO_RESPONSE instead of a completed final.
+    assert.equal(runner.submittedInputs.length, 1, "no phantom retry");
+    assert.equal(events.some((e) => e.kind === "final"), false, "a zero-token turn is not a completed reply");
+    assert.deepEqual(
+      events.filter((e) => e.kind === "error"),
+      [{ kind: "error", error: "任务未能产生有效回复。本轮已自动免单；请重新尝试。" }],
+      "the turn ends with the NO_RESPONSE notice",
+    );
     assert.equal(session.turns, 1);
   });
 
@@ -642,6 +651,10 @@ describe("crash/interrupt partial persistence", () => {
   test("capacity failure succeeds within the shared 10-retry budget and persists one exact paid turn", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
+    // The same-class breaker (3, transientRetryCircuitBreaker.test.ts) would open
+    // first; this case pins the shared 10-retry budget underneath it.
+    const breakerEnv = process.env.OPENCLAUDE_TRANSIENT_BREAKER;
+    process.env.OPENCLAUDE_TRANSIENT_BREAKER = "100";
     try {
       const sm = new SessionManager(makeConfigStub());
       (sm as unknown as { _transientRetryDelayMs: () => number })
@@ -756,12 +769,18 @@ describe("crash/interrupt partial persistence", () => {
       );
     } finally {
       setV3MasterSinkSingleton(null);
+      if (breakerEnv === undefined) Reflect.deleteProperty(process.env, "OPENCLAUDE_TRANSIENT_BREAKER");
+      else process.env.OPENCLAUDE_TRANSIENT_BREAKER = breakerEnv;
     }
   });
 
   test("capacity failure stops after ten retries and emits only the terminal error billing", async () => {
     const captured = makeCapturingSink();
     setV3MasterSinkSingleton(captured.sink);
+    // The same-class breaker (3, transientRetryCircuitBreaker.test.ts) would open
+    // first; this case pins the shared 10-retry budget underneath it.
+    const breakerEnv = process.env.OPENCLAUDE_TRANSIENT_BREAKER;
+    process.env.OPENCLAUDE_TRANSIENT_BREAKER = "100";
     try {
       const sm = new SessionManager(makeConfigStub());
       (sm as unknown as { _transientRetryDelayMs: () => number })
@@ -816,6 +835,8 @@ describe("crash/interrupt partial persistence", () => {
       assert.deepEqual(session._durableDelegateEngineBillings, [payload.engineBilling]);
     } finally {
       setV3MasterSinkSingleton(null);
+      if (breakerEnv === undefined) Reflect.deleteProperty(process.env, "OPENCLAUDE_TRANSIENT_BREAKER");
+      else process.env.OPENCLAUDE_TRANSIENT_BREAKER = breakerEnv;
     }
   });
 
@@ -1933,8 +1954,8 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
-      assert.equal(sm.interrupt(session.sessionKey), true, "repeat Stop remains idempotent");
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true, "repeat Stop remains idempotent");
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2233,7 +2254,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2292,12 +2313,15 @@ describe("crash/interrupt partial persistence", () => {
           dispatchId: "77777777-7777-4777-8777-777777777777",
           attemptNo: 1,
         },
-      } as Partial<AgentSession>, { harness: "official-cc" } as EngineCreateOpts);
+      // Production routes Cursor models on official Claude Code through
+      // CursorSandAdapter, which marks the Cursor authority (since 430cb38b8 the
+      // pseudo-USD is external only for that authority).
+      } as Partial<AgentSession>, { harness: "official-cc", authorityEngine: "cursor" } as EngineCreateOpts);
       (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(session.sessionKey, session);
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2365,7 +2389,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2433,7 +2457,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2511,7 +2535,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2573,7 +2597,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2632,7 +2656,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2698,7 +2722,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2771,7 +2795,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2839,7 +2863,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2901,7 +2925,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -2971,7 +2995,7 @@ describe("crash/interrupt partial persistence", () => {
 
       const completion = runOneTurn(sm, session, events);
       await started;
-      assert.equal(sm.interrupt(session.sessionKey), true);
+      assert.equal(sm.interrupt(session.sessionKey, "user"), true);
       await completion;
       await sm.awaitPendingPersistence();
 
@@ -3659,6 +3683,49 @@ describe("crash/interrupt partial persistence", () => {
         ),
       );
     } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  // OCV5-439: the wait after a runner error belongs to a tracked persistence
+  // (awaitPendingPersistence / shutdownAll wait on it). An unref'd timer there
+  // let the process leave before RUNNER_CRASHED was written whenever nothing
+  // else held the event loop.
+  test("OCV5-439: the RUNNER_CRASHED wait after a runner error holds the event loop until the terminal is written", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    const realSetTimeout = globalThis.setTimeout;
+    const unrefDelays: number[] = [];
+    globalThis.setTimeout = ((fn: (...args: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+      const handle = realSetTimeout(fn, ms, ...rest);
+      const unref = handle.unref.bind(handle);
+      handle.unref = () => {
+        unrefDelays.push(ms ?? 0);
+        return unref();
+      };
+      return handle;
+    }) as typeof setTimeout;
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _terminalRequestGraceMs: number })._terminalRequestGraceMs = 5;
+      const runner = new FakeCcbRunner((r) => {
+        setImmediate(() => r.emit("error", new Error("pipe broke mid-turn")));
+      });
+      const session = makeSession(runner, {
+        channel: "webchat",
+        userId: "user-1",
+      } as Partial<AgentSession>);
+
+      await runOneTurn(sm, session, []);
+      await sm.awaitPendingPersistence();
+
+      assert.equal(unrefDelays.includes(200), false, "the tracked 200 ms wait keeps the event loop alive");
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, "crashed");
+      assert.equal(captured.payloads[0]!.errorCode, "RUNNER_CRASHED");
+      assert.match(captured.payloads[0]!.errorDetail ?? "", /pipe broke mid-turn/);
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
       setV3MasterSinkSingleton(null);
     }
   });

@@ -8454,9 +8454,12 @@ export class SessionManager {
           plannedAtError ? 'SERVICE_RESTART' : 'RUNNER_CRASHED',
         )
         const persistence = (async () => {
+          // Not unref'd: this wait is part of a tracked persistence that
+          // awaitPendingPersistence (and shutdownAll) waits on. An unref'd
+          // timer let the process leave before the RUNNER_CRASHED terminal was
+          // written whenever nothing else held the event loop (OCV5-439).
           await new Promise<void>((resolveWait) => {
-            const timer = setTimeout(resolveWait, 200)
-            timer.unref?.()
+            setTimeout(resolveWait, 200)
           })
           if (terminalPersistenceClaim !== 'none' || turn?.finalized) return
           const planned = this.shouldClassifyExitAsServiceRestart(session, runnerExitInfo)
