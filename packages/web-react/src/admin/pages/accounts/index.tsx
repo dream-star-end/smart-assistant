@@ -604,7 +604,7 @@ export default function AccountsPage() {
   );
 }
 
-/** 账号池状态构成 donut(active/cooldown/disabled/banned)+ 平均健康 / 今日成功率。 */
+/** 订阅账号状态构成 donut(active/cooldown/disabled/banned)+ 平均健康 / 今日成功率。 */
 function PoolDonut({ snapshot }: { snapshot: AccountPoolSnapshot | null }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const segs = snapshot
@@ -631,7 +631,7 @@ function PoolDonut({ snapshot }: { snapshot: AccountPoolSnapshot | null }) {
     : undefined;
 
   return (
-    <ChartCard title="账号池状态构成" hint={hint} height={240}>
+    <ChartCard title="订阅账号状态构成" hint={hint} height={240}>
       {segs.length > 0 ? (
         <canvas ref={ref} />
       ) : (

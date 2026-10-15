@@ -20,6 +20,7 @@ import {
   ruleAccountPoolNotConfigured,
   ruleAccountPoolAllDown,
   ruleAccountPoolLowCapacity,
+  ruleServicePoolAllDown,
   ruleSignupSpike,
   ruleRateLimitSpike,
   ruleLoginFailureSpike,
@@ -271,10 +272,33 @@ describe("ruleLoginFailureSpike", () => {
   });
 });
 
+describe("ruleServicePoolAllDown (OCV5-424)", () => {
+  const snap = (servicePools: NonNullable<RuleSnapshot["servicePools"]>) => ({ servicePools } as unknown as RuleSnapshot);
+  test("a pool whose every eligible member is down fires, naming the reasons", () => {
+    const out = ruleServicePoolAllDown.evaluate(snap([
+      { service: "gemini", eligible: 2, active: 0, reasons: ["auth"] },
+      { service: "codex", eligible: 3, active: 1, reasons: ["rate_limited"] },
+    ]));
+    assert.equal(out.firing, true);
+    if (!out.firing) return;
+    assert.equal(out.dedupe_key, `${EVENTS.SERVICE_POOL_ALL_DOWN}:gemini`);
+    assert.match(out.title, /gemini/);
+    assert.match(out.body, /2 个成员全部不可用\(认证失效/);
+    assert.doesNotMatch(out.body, /codex/);
+  });
+  test("pools with a serving member, or with only admin-disabled members (eligible 0), do not fire", () => {
+    assert.equal(ruleServicePoolAllDown.evaluate(snap([
+      { service: "claude", eligible: 0, active: 0, reasons: [] },
+      { service: "grok", eligible: 1, active: 1, reasons: [] },
+    ])).firing, false);
+    assert.equal(ruleServicePoolAllDown.evaluate(snap([])).firing, false);
+  });
+});
+
 describe("defaultPolledRules", () => {
-  test("包含 7 条默认规则", () => {
+  test("包含 8 条默认规则", () => {
     const rules = defaultPolledRules();
-    assert.equal(rules.length, 7);
+    assert.equal(rules.length, 8);
     const ids = rules.map((r) => r.id).sort();
     assert.deepEqual(ids, [
       EVENTS.ACCOUNT_POOL_ALL_DOWN,
@@ -284,6 +308,7 @@ describe("defaultPolledRules", () => {
       EVENTS.RISK_RATE_LIMIT_SPIKE,
       EVENTS.RISK_SIGNUP_SPIKE,
       EVENTS.RISK_SILENT_NEW_USER_COHORT,
+      EVENTS.SERVICE_POOL_ALL_DOWN,
     ].sort());
   });
 

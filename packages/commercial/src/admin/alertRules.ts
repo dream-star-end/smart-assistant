@@ -27,6 +27,7 @@ import { query } from "../db/queries.js";
 import { EVENTS } from "./alertEvents.js";
 import { enqueueAlert, transitionRuleState } from "./alertOutbox.js";
 import { getSystemSetting } from "./systemSettings.js";
+import { listPoolAdapters } from "../account-pool/policy/registry.js";
 
 export interface RuleSnapshot {
   accountHealth: Array<{ account_id: string; health_score: number; status: string }>;
@@ -43,6 +44,11 @@ export interface RuleSnapshot {
    * 与 ruleSilentNewUserCohort 配对,阈值由 alerts_silent_new_user_threshold 控。
    */
   silentNewUserCount24h: number;
+  /**
+   * OCV5-424: per service pool, members that should be able to serve (all but the ones an
+   * admin disabled) and how many of them can. Empty when no pool adapter is registered.
+   */
+  servicePools?: Array<{ service: string; eligible: number; active: number; reasons: string[] }>;
 }
 
 export interface SnapshotDeps {
@@ -137,6 +143,28 @@ export async function collectRuleSnapshot(deps: SnapshotDeps = {}): Promise<Rule
     console.warn("[admin/alertRules] silent_new_user snapshot failed:", err);
   }
 
+  const servicePools: NonNullable<RuleSnapshot["servicePools"]> = [];
+  try {
+    const byService = new Map<string, { eligible: number; active: number; reasons: Set<string> }>();
+    for (const adapter of listPoolAdapters()) {
+      if (!adapter.listMembers) continue;
+      for (const m of await adapter.listMembers()) {
+        if ((m.status === "disabled" && m.disabledBy === "admin") || m.status === "banned") continue;
+        const e = byService.get(m.service) ?? { eligible: 0, active: 0, reasons: new Set<string>() };
+        e.eligible += 1;
+        if (m.status === "active") e.active += 1;
+        else e.reasons.add(m.cooldownReason ?? m.status);
+        byService.set(m.service, e);
+      }
+    }
+    for (const [service, e] of [...byService].sort(([a], [b]) => a.localeCompare(b))) {
+      servicePools.push({ service, eligible: e.eligible, active: e.active, reasons: [...e.reasons].sort() });
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn("[admin/alertRules] service pool snapshot failed:", err);
+  }
+
   return {
     accountHealth,
     signupCountLastWindowMin,
@@ -146,6 +174,7 @@ export async function collectRuleSnapshot(deps: SnapshotDeps = {}): Promise<Rule
     loginFailureBlockedLastWindowMin,
     loginFailureWindowMin,
     silentNewUserCount24h,
+    servicePools,
     ...deps.override,
   };
 }
@@ -244,6 +273,35 @@ export const ruleAccountPoolAllDown: PolledRule = {
       resolvedTitle: "[RESOLVED] 账号池已恢复",
       resolvedBody: `${healthy.length}/${s.accountHealth.length} 账号重新 healthy。`,
     };
+  },
+};
+
+const REASON_TEXT: Record<string, string> = {
+  rate_limited: "限流冷却", quota: "配额用尽", auth: "认证失效(自动探测中)", credential: "凭证异常(自动探测中)",
+  upstream: "上游故障冷却", cooldown: "冷却中", disabled: "已自动停用",
+};
+
+/**
+ * OCV5-424: a service pool with members none of which can serve (every one cooling down or
+ * failing auth). Recovery stays automatic (probes); this makes the outage visible. Members an
+ * admin disabled do not count, so a pool switched off on purpose never fires.
+ */
+export const ruleServicePoolAllDown: PolledRule = {
+  id: EVENTS.SERVICE_POOL_ALL_DOWN,
+  event_type: EVENTS.SERVICE_POOL_ALL_DOWN,
+  evaluate(s) {
+    const down = (s.servicePools ?? []).filter((p) => p.eligible > 0 && p.active === 0);
+    if (down.length > 0) {
+      const lines = down.map((p) => `- ${p.service}:${p.eligible} 个成员全部不可用(${p.reasons.map((r) => REASON_TEXT[r] ?? r).join("、")})`);
+      return {
+        firing: true,
+        dedupe_key: `${EVENTS.SERVICE_POOL_ALL_DOWN}:${down.map((p) => p.service).join(",")}`,
+        title: `[CRITICAL] 服务池不可用:${down.map((p) => p.service).join("、")}`,
+        body: `${lines.join("\n")}\n\n冷却与认证失效会按统一调度策略自动探测恢复;见管理后台 → 服务池。`,
+        payload: { services: down.map((p) => ({ service: p.service, eligible: p.eligible, reasons: p.reasons })) },
+      };
+    }
+    return { firing: false, resolvedTitle: "[RESOLVED] 服务池已恢复", resolvedBody: "每个服务池都至少有一个可调度成员。" };
   },
 };
 
@@ -400,6 +458,7 @@ export function defaultPolledRules(): PolledRule[] {
     ruleAccountPoolNotConfigured,
     ruleAccountPoolAllDown,
     ruleAccountPoolLowCapacity,
+    ruleServicePoolAllDown,
     ruleSignupSpike,
     ruleRateLimitSpike,
     ruleLoginFailureSpike,
@@ -513,7 +572,8 @@ export async function runRulesOnce(deps: RunRulesDeps = {}): Promise<RunRulesRes
 
 function inferSeverity(eventType: string): "info" | "warning" | "critical" {
   // 为了避免循环 import,这里根据 prefix 简单推断;与 alertEvents EVENT_META 保持一致
-  if (eventType === EVENTS.ACCOUNT_POOL_ALL_DOWN || eventType === EVENTS.ACCOUNT_POOL_NOT_CONFIGURED) {
+  if (eventType === EVENTS.ACCOUNT_POOL_ALL_DOWN || eventType === EVENTS.ACCOUNT_POOL_NOT_CONFIGURED
+    || eventType === EVENTS.SERVICE_POOL_ALL_DOWN) {
     return "critical";
   }
   return "warning";
