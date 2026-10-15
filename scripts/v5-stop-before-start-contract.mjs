@@ -6,8 +6,9 @@
 // The defect this proves gone (INC-20261015-PRESTART-STOP-LOST) answered that Stop
 // TURN_NOT_ACTIVE and let the turn run unseen: the model answered (or asked a question that
 // hung in waiting_for_user) after the user had stopped it. The stopped turn must commit as
-// interrupted (not turn_completed) and must never ask the user anything; a follow-up turn in
-// the same session must then complete. The Stop can reach the gateway just before or just
+// interrupted with the user-stop notice (a crash also commits as interrupted, with another
+// notice) and must never ask the user anything; a follow-up turn in the same session must
+// then commit as turn_completed. The Stop can reach the gateway just before or just
 // after the message itself, so the verdict reads the committed outcome, not the receipt.
 // Prints TAP only; never prints credentials, tokens or response bodies.
 import { randomBytes } from 'node:crypto'
@@ -23,6 +24,8 @@ const ACK_TIMEOUT = 20_000
 const FINAL_TIMEOUT = 90_000
 const QUIET_MS = 5_000
 const TURN_TIMEOUT = 120_000
+/** SessionManager.interrupt(..., 'user') persists exactly this reason (USER_CANCELLED). */
+const USER_STOP_NOTICE = '本轮已由用户停止。'
 const base = new URL(process.env.V5_E2E_BASE || 'http://127.0.0.1:18790').origin
 const email = process.env.V5_CANARY_EMAIL || 'v5-selfhost-canary@claudeai.chat'
 const passwordFile =
@@ -62,6 +65,8 @@ function messageFrame(peer, cmid, text) {
     peer: { id: peer, kind: 'dm' },
     agentId: 'main',
     clientMessageId: cmid,
+    // Same send identity the browser uses for a first attempt.
+    idempotencyKey: `web:${cmid}:0`,
     content: { text },
     model: MODEL,
     ts: Date.now(),
@@ -141,6 +146,11 @@ async function stoppedTurn(token, peer, cmid) {
   if (committed !== 'interrupted') {
     throw new Error(`stopped turn committed as ${committed} (output after Stop: ${[...new Set(outputs)].join(',') || 'none'})`)
   }
+  const userStopped = own.some(
+    (e) => e.frame.type === 'outbound.message' &&
+      (e.frame.blocks ?? []).some((b) => b?.kind === 'text' && String(b.text ?? '').includes(USER_STOP_NOTICE)),
+  )
+  if (!userStopped) throw new Error('stopped turn ended without the user-stop notice (crashed or interrupted by the system)')
   const waits = outputs.filter((kind) => kind === 'permission_request' || kind === 'waiting_for_user')
   if (waits.length > 0) throw new Error(`stopped turn still asked the user: ${[...new Set(waits)].join(',')}`)
 }
@@ -167,7 +177,10 @@ function plainTurn(token, peer, cmid, text) {
         if (f?.peer?.id !== peer || f.clientMessageId !== cmid) return
         if (f.error || ['outbound.error', 'outbound.turn_error', 'error'].includes(f.type))
           finish(new Error(`follow-up turn failed: ${f.error?.code ?? f.code ?? f.type}`))
-        else if (f.type === 'outbound.message' && f.isFinal === true) finish()
+        else if (f.type === 'outbound.message' && f.isFinal === true && f.meta?.reconcileSource === 'tape_commit')
+          f.meta.reconcile === 'turn_completed'
+            ? finish()
+            : finish(new Error(`follow-up turn committed as ${f.meta.reconcile}`))
       })
       ws.on('close', () => finish(new Error('chat socket closed before the follow-up final')))
       ws.send(JSON.stringify(messageFrame(peer, cmid, text)))
