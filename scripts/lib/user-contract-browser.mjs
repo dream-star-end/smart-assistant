@@ -7,13 +7,28 @@ export async function coldUiLogin(page, options, password) {
   // A fresh context has no cookies, IndexedDB or service workers. Clear web storage
   // once on the landing page, never add an init script that would erase UI login.
   const pageErrors = [];
-  let failedScripts = 0;
+  // OCV5-437:只记计数查不出是哪一块、为什么。按路径(不带 query,防带出令牌)记网络错误/HTTP 状态;
+  // Chromium 对 404 脚本既给 response 又给 requestfailed(ERR_ABORTED),同一路径合并成一条。
+  const scriptReasons = new Map();
+  const noteScript = (url, reason) => {
+    let path = url;
+    try { path = new URL(url).pathname; } catch {}
+    const reasons = scriptReasons.get(path) ?? [];
+    if (!reasons.includes(reason)) reasons.push(reason);
+    scriptReasons.set(path, reasons);
+  };
   const onPageError = (error) => { if (pageErrors.length < 3) pageErrors.push(error.name); };
   const onRequestFailed = (request) => {
-    if (request.resourceType() === "script") failedScripts++;
+    if (request.resourceType() === "script") noteScript(request.url(), request.failure()?.errorText ?? "failed");
+  };
+  const onResponse = (response) => {
+    if (response.request().resourceType() === "script" && response.status() >= 400) {
+      noteScript(response.url(), `HTTP ${response.status()}`);
+    }
   };
   page.on("pageerror", onPageError);
   page.on("requestfailed", onRequestFailed);
+  page.on("response", onResponse);
   const landing = await page.goto(options.base, { waitUntil: "domcontentloaded" });
   if (!landing?.ok()) throw new Error(`Cold landing HTTP ${landing?.status() ?? "no response"}`);
   await page.evaluate(() => { localStorage.clear(); sessionStorage.clear(); });
@@ -23,16 +38,19 @@ export async function coldUiLogin(page, options, password) {
     // the UI bundle. Keep the real login requirement; only extend that bounded
     // render wait, never substitute an API login or reuse an authenticated page.
     await page.getByRole("button", { name: "登录", exact: true }).first()
-      .waitFor({ state: "visible", timeout: 60_000 });
+      .waitFor({ state: "visible", timeout: options.renderTimeoutMs ?? 60_000 });
   } catch {
     const state = await page.evaluate(() => ({ readyState: document.readyState,
-      rootChildren: document.getElementById("root")?.childElementCount ?? -1 }))
-      .catch(() => ({ readyState: "unavailable", rootChildren: -1 }));
+      rootChildren: document.getElementById("root")?.childElementCount ?? -1,
+      rootText: (document.getElementById("root")?.innerText ?? "").replace(/\s+/g, " ").trim().slice(0, 80) }))
+      .catch(() => ({ readyState: "unavailable", rootChildren: -1, rootText: "" }));
+    const scriptFailures = [...scriptReasons].slice(0, 3).map(([path, reasons]) => `${path} ${reasons.join(", ")}`);
     throw new Error(`Cold login not rendered: ${JSON.stringify({
-      ...state, pageErrors, failedScripts })}`);
+      ...state, pageErrors, failedScripts: scriptReasons.size, scriptFailures })}`);
   } finally {
     page.off("pageerror", onPageError);
     page.off("requestfailed", onRequestFailed);
+    page.off("response", onResponse);
   }
   await page.getByRole("button", { name: "登录", exact: true }).first().click();
   const form = page.locator('form').filter({ has: page.locator('input[type="password"]') });
