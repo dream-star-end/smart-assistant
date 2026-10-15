@@ -243,19 +243,19 @@
       "expiresAt": "2026-11-14"
     },
     {
-      "commit": "929cd4cd2e1b1650329517014e82a3b757be2fdf",
+      "commit": "05313a5764e8fa7c710afb7c2960bbd50fa20fb9",
       "reason": "OCV5-424 user affinity (PR #750): fixes Codex r1 findings on the not-yet-released feature itself; no released behaviour is changed.",
       "approvedBy": "user 2026-10-15 确认按用户粘性设计「用户分配方案没问题」并要求实现发版（cc3 account-pool 会话）",
       "expiresAt": "2026-11-14"
     },
     {
-      "commit": "96e2c464ee13c5f2b22bda6363dafac9d987bca7",
+      "commit": "7d2d20741a046c8dd8b4ff2c4e3725f30956686f",
       "reason": "OCV5-424 user affinity (PR #750): fixes Codex r2 findings on the not-yet-released feature itself; no released behaviour is changed.",
       "approvedBy": "user 2026-10-15 确认按用户粘性设计「用户分配方案没问题」并要求实现发版（cc3 account-pool 会话）",
       "expiresAt": "2026-11-14"
     },
     {
-      "commit": "0327b31847703dfd42449ed9be7bd693d1ea9d21",
+      "commit": "6baa10cf2a5259602b2e7056980933478da89b1f",
       "reason": "OCV5-424 user affinity (PR #750): fixes the Codex r3 finding on the not-yet-released feature itself; no released behaviour is changed.",
       "approvedBy": "user 2026-10-15 确认按用户粘性设计「用户分配方案没问题」并要求实现发版（cc3 account-pool 会话）",
       "expiresAt": "2026-11-14"
