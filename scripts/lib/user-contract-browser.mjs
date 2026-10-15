@@ -91,11 +91,56 @@ export async function installTurnProbe(context, base, cost) {
   return probe;
 }
 
+// OCV5-431: the 发送 click for C2 and every C3 turn. A trusted mouse click at the button's
+// centre after the checks locator.click makes (visible, enabled, stable, hit target), but
+// without its post-click navigation barrier: on 2026-10-15 (#748 first train) that barrier
+// waited 20s ("click action done - waiting for scheduled navigations to finish") while the
+// app had already queued the message. The verdict stays with the outbound frame / turn
+// evidence the caller waits for. Navigation requests issued during the click are reported
+// so the next occurrence names its trigger.
+export async function clickSend(page, log = console.log, timeout = 20_000) {
+  const button = page.getByRole("button", { name: "发送", exact: true });
+  await button.waitFor({ state: "visible", timeout });
+  const deadline = Date.now() + timeout;
+  let box = null;
+  for (;;) {
+    const enabled = await button.isEnabled();
+    const next = enabled ? await button.boundingBox() : null;
+    if (next && box && next.x === box.x && next.y === box.y && next.width === box.width && next.height === box.height) break;
+    box = next;
+    if (Date.now() >= deadline) throw new Error(enabled ? "发送 button never became stable" : "发送 button stayed disabled");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const x = box.x + box.width / 2;
+  const y = box.y + box.height / 2;
+  const cover = await page.evaluate(({ x, y }) => {
+    const el = document.elementFromPoint(x, y);
+    if (el?.closest('button[aria-label="发送"]')) return null;
+    if (!el) return "nothing";
+    const role = el.getAttribute("role");
+    const label = el.getAttribute("aria-label");
+    return `${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ""}${role ? `[role=${role}]` : ""}${label ? `[aria-label=${label}]` : ""}`;
+  }, { x, y });
+  if (cover) throw new Error(`发送 button is covered by ${cover}`);
+  const navigations = [];
+  const onRequest = (request) => {
+    if (!request.isNavigationRequest()) return;
+    navigations.push(`${request.frame() === page.mainFrame() ? "main" : "sub"} ${new URL(request.url()).pathname}`);
+  };
+  page.on("request", onRequest);
+  try {
+    await page.mouse.click(x, y);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  } finally {
+    page.off("request", onRequest);
+  }
+  if (navigations.length) log(`# warn send_click_navigation_request ${JSON.stringify(navigations.slice(0, 3))}`);
+}
 export async function sendContractTurn(page, probe, { model, engine, catalog, cost, requireHttpModel = false, text = `R2-${crypto.randomUUID()} 请只回答数字2，不使用工具。` }) {
   if (turnPolicy(cost).forward) probe.liveTexts.add(text);
   const rowsBefore = await page.getByTestId("assistant-row").count();
   await page.locator("textarea").first().fill(text);
-  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await clickSend(page);
   // Bridge the observer into an event-driven page wait; timers here bound the
   // observer only, not retries of the test or of a message.
   const sent = await waitUntil(() => probe.sent.find((f) => f.content?.text === text), 20_000, "No outbound chat frame");
