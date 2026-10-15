@@ -3756,7 +3756,7 @@ function ColdStartQueueProbe() {
     ? { dispatch, startedAt: session._turnStartedAt ?? null, agentName: "助手" }
     : null;
   return (
-    <div ref={setScroller} className="chat-scroll-area timeline-scroll-probe" data-testid="cold-start-queue-probe" tabIndex={0}>
+    <div ref={setScroller} className="chat-scroll-area timeline-scroll-probe" data-testid="cold-start-queue-probe">
       <MessageList
         messages={session?.messages ?? []}
         sending={sending}
