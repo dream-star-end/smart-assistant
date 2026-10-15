@@ -769,7 +769,7 @@ describe("crash/interrupt partial persistence", () => {
       );
     } finally {
       setV3MasterSinkSingleton(null);
-      if (breakerEnv === undefined) delete process.env.OPENCLAUDE_TRANSIENT_BREAKER;
+      if (breakerEnv === undefined) Reflect.deleteProperty(process.env, "OPENCLAUDE_TRANSIENT_BREAKER");
       else process.env.OPENCLAUDE_TRANSIENT_BREAKER = breakerEnv;
     }
   });
@@ -835,7 +835,7 @@ describe("crash/interrupt partial persistence", () => {
       assert.deepEqual(session._durableDelegateEngineBillings, [payload.engineBilling]);
     } finally {
       setV3MasterSinkSingleton(null);
-      if (breakerEnv === undefined) delete process.env.OPENCLAUDE_TRANSIENT_BREAKER;
+      if (breakerEnv === undefined) Reflect.deleteProperty(process.env, "OPENCLAUDE_TRANSIENT_BREAKER");
       else process.env.OPENCLAUDE_TRANSIENT_BREAKER = breakerEnv;
     }
   });
