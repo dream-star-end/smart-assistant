@@ -97,6 +97,25 @@ export const OPENCODE_GO_MESSAGES_MODEL_IDS: readonly string[] = [
   'qwen3.7-plus-go',
 ]
 
+/** OCV5-425 phase 2 OpenCode Go chat-completions models (proxy bridge). Mirrors protocol
+ *  OPENCODE_GO_CHAT_MODELS (equality pinned by staticKeyModels.test.ts). */
+export const OPENCODE_GO_CHAT_MODEL_IDS: readonly string[] = [
+  'glm-5.3-go',
+  'glm-5.2-go',
+  'glm-5.3-flash-go',
+  'kimi-k2.7-code-go',
+  'kimi-k2.6-go',
+  'mimo-v2.6-pro-go',
+  'mimo-v2.5-pro-go',
+  'mimo-v2.6-flash-go',
+  'mimo-v2.5-go',
+  'hy4-preview-go',
+  'hy3-go',
+  'longcat-2.0-go',
+  'longcat-2.5-preview-free-go',
+  'step-5-preview-free-go',
+]
+
 /** OpenCode Go 当前模型 + 历史 transport 集。DeepSeek 使用独立平台 alias，避免覆盖 direct
  *  provider；Qwen3.7 保留历史 plumbing 但由 DB catalog 下线。 */
 export function isOpencodeGoModel(model: string): boolean {
@@ -106,14 +125,18 @@ export function isOpencodeGoModel(model: string): boolean {
     m === 'qwen3.7-max' ||
     m === 'qwen3.7-plus' ||
     m === 'gemini-4-argon-contributor' ||
-    OPENCODE_GO_MESSAGES_MODEL_IDS.includes(m)
+    OPENCODE_GO_MESSAGES_MODEL_IDS.includes(m) ||
+    OPENCODE_GO_CHAT_MODEL_IDS.includes(m)
   )
 }
 
 /** Claude Haiku via OpenCode Go rejects `thinking:{enabled,budget}` (400, OCV5-425 probe);
  *  it thinks through `output_config.effort` instead. */
 export function isOpencodeGoNoThinkingModel(model: string): boolean {
-  return model.trim().toLowerCase() === 'claude-haiku-5-5-go'
+  const m = model.trim().toLowerCase()
+  // The chat bridge does not take Anthropic thinking (reasoning runs upstream, effort maps to
+  // reasoning_effort), so CCB sends none.
+  return m === 'claude-haiku-5-5-go' || OPENCODE_GO_CHAT_MODEL_IDS.includes(m)
 }
 
 /** 只识别 OpenCode Go 的历史 Qwen 子集。 */
@@ -213,6 +236,13 @@ export const STATIC_MODEL_CONTEXT_WINDOW: ReadonlyArray<{
     'qwen3.8-max-go': 262_144,
     'kimi-k3-go': 1_048_576,
     'space-bunny-go': 1_048_576,
+    'kimi-k2.7-code-go': 262_144,
+    'kimi-k2.6-go': 262_144,
+    'hy3-go': 192_000,
+    'hy4-preview-go': 1_024_000,
+    'mimo-v2.6-pro-go': 1_048_576,
+    'mimo-v2.5-pro-go': 1_048_576,
+    'mimo-v2.6-flash-go': 1_048_576,
   }).map(([id, contextWindow]) => ({
     matches: (m: string) => m.trim().toLowerCase() === id,
     contextWindow,

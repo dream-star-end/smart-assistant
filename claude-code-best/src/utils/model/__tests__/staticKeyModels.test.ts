@@ -11,6 +11,7 @@ import {
   isMoonshotKimiK3Model,
   isCapabilityZeroStaticModel,
   isOpencodeGoModel,
+  OPENCODE_GO_CHAT_MODEL_IDS,
   OPENCODE_GO_MESSAGES_MODEL_IDS,
   isOpencodeQwenModel,
   isZaiGlm53Model,
@@ -219,6 +220,22 @@ describe("OCV5-425 OpenCode Go /messages models (CCB fallback)", () => {
     expect([...OPENCODE_GO_MESSAGES_MODEL_IDS].sort()).toEqual(
       Object.keys(protocol.OPENCODE_GO_MESSAGES_MODELS).sort(),
     );
+    expect([...OPENCODE_GO_CHAT_MODEL_IDS].sort()).toEqual(
+      Object.keys(protocol.OPENCODE_GO_CHAT_MODELS).sort(),
+    );
+  });
+
+  test("chat bridge models: capability-zero, no Anthropic thinking, catalog windows", () => {
+    for (const id of OPENCODE_GO_CHAT_MODEL_IDS) {
+      expect(isOpencodeGoModel(id)).toBe(true);
+      expect(isCapabilityZeroStaticModel(id)).toBe(true);
+      expect(modelSupportsThinking(id)).toBe(false);
+    }
+    expect(getStaticModelContextWindow("hy3-go")).toBe(192_000);
+    expect(getStaticModelContextWindow("kimi-k2.7-code-go")).toBe(262_144);
+    expect(getStaticModelContextWindow("mimo-v2.6-pro-go")).toBe(1_048_576);
+    expect(getStaticModelContextWindow("glm-5.3-go")).toBe(1_000_000);
+    expect(isOpencodeGoModel("glm-5.3")).toBe(false);
   });
 
   test("capability-zero Go models; thinking except Claude Haiku; windows capped at the price tier", () => {

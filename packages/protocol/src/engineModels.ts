@@ -14,7 +14,7 @@
 
 import {
   findRouteProviderForModel,
-  OPENCODE_GO_MESSAGES_MODELS,
+  OPENCODE_GO_EXTRA_MODELS,
   staticProviderOutputConfigEfforts,
 } from './staticKeyProviders.js'
 
@@ -183,7 +183,7 @@ export const COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL = '更多模型'
  * models added alongside the main list). Display only; admission, billing and routing ignore it.
  */
 export function isMorePickerModelId(modelId: string): boolean {
-  return Object.hasOwn(OPENCODE_GO_MESSAGES_MODELS, modelId)
+  return Object.hasOwn(OPENCODE_GO_EXTRA_MODELS, modelId)
 }
 
 export function contextFamilyCollapsedByDefault(family: ContextTierFamilyId): boolean {
