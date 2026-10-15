@@ -8,19 +8,19 @@ import { randomUUID } from 'node:crypto'
  * Anthropic thinking: there is no signature to give it. Server web search is not offered.
  */
 
-type Obj = Record<string, unknown>
+export type Obj = Record<string, unknown>
 export const OPENAI_CHAT_GO_ENDPOINT = 'https://opencode.ai/inference/go/v1/chat/completions'
 const TOOL_PREFIX = 'toolu_oc_'
 const MAX_EVENT = 2 * 1024 * 1024
 /** Requests ask for at most this many output tokens (CCB may send 64K; Go models cap lower). */
 export const OPENAI_CHAT_GO_MAX_TOKENS = 32_000
 
-function obj(v: unknown): Obj {
+export function obj(v: unknown): Obj {
   if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('expected object')
   return v as Obj
 }
 
-function blocks(v: unknown): Obj[] {
+export function blocks(v: unknown): Obj[] {
   if (typeof v === 'string') return v ? [{ type: 'text', text: v }] : []
   if (!Array.isArray(v)) throw new Error('expected content blocks')
   return v.map(obj)
@@ -38,7 +38,7 @@ export function decodeChatToolId(id: string): string {
   return decoded
 }
 
-function systemTexts(v: unknown): string[] {
+export function systemTexts(v: unknown): string[] {
   return blocks(v).map((b) => {
     if (b.type !== 'text' || typeof b.text !== 'string')
       throw new Error('OpenCode Go supports text system prompts only')
@@ -46,13 +46,13 @@ function systemTexts(v: unknown): string[] {
   })
 }
 
-function webSearchResultText(content: unknown): string {
+export function webSearchResultText(content: unknown): string {
   if (!Array.isArray(content)) return 'Web search failed.'
   const lines = content.map(obj).map((r, i) => `${i + 1}. ${String(r.title ?? '')} — ${String(r.url ?? '')}`)
   return lines.length ? `Web search results:\n${lines.join('\n')}` : 'Web search returned no results.'
 }
 
-function toolResultText(b: Obj): string {
+export function toolResultText(b: Obj): string {
   const text =
     b.content === undefined
       ? ''
@@ -66,7 +66,7 @@ function toolResultText(b: Obj): string {
   return b.is_error === true ? `Error: ${text}` : text
 }
 
-function isServerTool(t: Obj): boolean {
+export function isServerTool(t: Obj): boolean {
   return t.input_schema === undefined && typeof t.type === 'string' && t.type !== 'custom'
 }
 
