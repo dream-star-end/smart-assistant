@@ -247,6 +247,12 @@
       "reason": "OCV5-424 user affinity (PR #750): fixes Codex r1 findings on the not-yet-released feature itself; no released behaviour is changed.",
       "approvedBy": "user 2026-10-15 确认按用户粘性设计「用户分配方案没问题」并要求实现发版（cc3 account-pool 会话）",
       "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "96e2c464ee13c5f2b22bda6363dafac9d987bca7",
+      "reason": "OCV5-424 user affinity (PR #750): fixes Codex r2 findings on the not-yet-released feature itself; no released behaviour is changed.",
+      "approvedBy": "user 2026-10-15 确认按用户粘性设计「用户分配方案没问题」并要求实现发版（cc3 account-pool 会话）",
+      "expiresAt": "2026-11-14"
     }
   ]
 }
