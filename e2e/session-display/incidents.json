@@ -6939,6 +6939,38 @@
           "assertion": "T71 INC-20261015-LIVE-FENCE-TRIM-REPLAY: a long answer replayed after a cursor reset is shown once"
         }
       ]
+    },
+    {
+      "id": "INC-20261015-TAPE-COMMIT-FINAL-RACE",
+      "occurredAt": "2026-10-14",
+      "severity": "P2",
+      "symptom": "个人版发布门 C3 在 grok-build 上间歇报 \"Continuation turn did not recall the first turn's code\"（tr-20261014T221151Z-8db4f43f5fb5 等），但失败截图里第二轮答出了正确的 PO-<code>，usage 显示第二轮 8.9k input + 65.8k cache read（历史完整带上）。线上复现（第二轮先跑一次工具）4/8：本轮已显示完成（无光标、按钮回到发送）但正文停在半句，约 1s 后才补齐，真实用户同样看到。帧序：master 在 lossless tape 提交（HTTP）后广播的合成 final（meta.reconcile=turn_completed，无 frameSeq）比同一轮 WS 上的 live 尾巴早 0.4–1s 到达；reducer 立即收口并把 stale 截止定在该帧 ts，随后尾巴帧被丢，等 REST 对账才补齐。修复：master 给该广播打 reconcileSource=tape_commit；前端对仍在流式的本轮延后收口，等 live 尾巴与真 final，5s 宽限内未到再按原 reconcile 收口；hello/reconciler 对账不变。与 INC-20261014-SELFHOST-C3-GROK-REFUSAL（模型拒答）不同根因。",
+      "rootFixCommit": "0c8cafb9",
+      "coverageCommits": [
+        "e1a63668"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
+          "assertion": "本轮仍在流式 → 不收口;更早 ts 的尾巴照常追加,真 final 收口"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
+          "assertion": "ChatSocket:宽限期内真 final 收口;真 final 丢失则期满按 reconcile 收口"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
+          "assertion": "visible action commits and broadcasts authoritative final before any part"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/process-disclosure-app.node-test.mjs",
+          "assertion": "INC-20261015-TAPE-COMMIT-FINAL-RACE (OCV5-424): a tape-commit turn_completed that overtakes the"
+        }
+      ]
     }
   ]
 }
