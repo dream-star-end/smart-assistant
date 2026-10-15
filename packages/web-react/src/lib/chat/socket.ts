@@ -3562,6 +3562,15 @@ export class ChatSocket {
         const fresh = !this.activeReplayAttemptKeys.has(attemptKey);
         const hasFreshCandidates = candidates.length > 0 && fresh;
         if (requireFreshRegistration && !fresh) return;
+        // OCV5-430: an idle-cursor registration exists only for a session this
+        // socket has not registered yet. Once any hello on this socket carried
+        // this session, re-registering it after the turn settled just makes the
+        // gateway resend frames of the finished turn from a stale cursor.
+        if (
+          requireFreshRegistration &&
+          keyCandidates.length === 0 &&
+          [...this.activeReplayAttemptKeys].some((key) => key.startsWith(`${pid}:${aid}:`))
+        ) return;
         if (fresh) attemptKeys.push(attemptKey);
         const emitInFlight = includeInFlight && !!s._sendingInFlight;
         peers.push({
