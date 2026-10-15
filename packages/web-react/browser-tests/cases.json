@@ -289,6 +289,10 @@
     {
       "id": "T72",
       "proves": "刷新后本轮经 active_turn_replay_start 重放，tape 提交的完成帧夹在积压重放帧之间到达时立即收口并请求历史对账（不等 5 秒宽限），积压余下的旧帧既不让正文增长也不重复，正文交给历史对账(INC-20261015-RESUME-REPLAY-LAG)"
+    },
+    {
+      "id": "T73",
+      "proves": "冷启动(传输已开、relay 未就绪→4503 starting→重连 relay_ready)期间排队消息的活动行依次显示「正在连接服务… · 1 条待发送」「服务启动中，就绪后自动发送 · 1 条待发送」「正在发送…」，服务器确认收到(admission ACK)前绝不显示「思考中」(INC-20261015-COLDSTART-QUEUED-THINKING，OCV5-428)"
     }
   ]
 }

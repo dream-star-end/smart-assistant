@@ -19455,6 +19455,10 @@ export class Gateway {
     if (resumableKeys.length === 0) return
 
     for (const sessionKey of resumableKeys) {
+      // OCV5-428: yield a macrotask per session. The loop runs right after listen();
+      // without this the readiness probe (/healthz + WS upgrade) waited ~29s on a
+      // 145-session cold start, holding every queued user message.
+      await new Promise<void>((resolve) => setImmediate(resolve))
       if (this.sessions.getByKey(sessionKey)) continue
 
       const parts = sessionKey.split(':')

@@ -360,6 +360,20 @@ export type ChatSocketDeps = {
   defaultAgentId?: string;
 };
 
+/**
+ * OCV5-428: the pre-admission phase of a session's next turn, for the activity row.
+ * `connecting` = transport (ws + bridge relay) not ready, `sending` = on the wire and
+ * waiting for the server's admission ACK, `paused` = held after a stop. Null once the
+ * server admitted the turn: only then may the row say 「思考中」.
+ */
+export type DispatchStatus = {
+  phase: "connecting" | "sending" | "paused";
+  /** Unadmitted messages of this session (the head turn included). */
+  queued: number;
+  /** The last close was the 4503 container-provisioning signal (cold start / update). */
+  serviceStarting: boolean;
+};
+
 type OfflineItem = {
   sessId: string;
   payload: InboundMessage;
@@ -1038,6 +1052,30 @@ export class ChatSocket {
     return !!sess?._sendingInFlight ||
       !!sess?._stopSettlement ||
       this.offlineQueue.some((item) => item.sessId === sessId);
+  }
+
+  /** OCV5-428: see DispatchStatus. A turn the server already admitted (the
+   * active cmid is no longer in the journal) keeps the normal activity row even
+   * when later messages wait behind it in FIFO. */
+  getDispatchStatus(sessId: string): DispatchStatus | null {
+    const sess = this.sessions.get(sessId);
+    if (!sess || sess._stopSettlement) return null;
+    const pending = this.offlineQueue.filter((item) => item.sessId === sessId);
+    if (pending.length === 0) return null;
+    if (
+      sess._sendingInFlight &&
+      !pending.some((item) => item.msgId === sess._activeClientMessageId)
+    ) {
+      return null;
+    }
+    const transportReady = !!this.ws && this.ws.readyState === 1 && this.relayReady;
+    if (!transportReady) {
+      return { phase: "connecting", queued: pending.length, serviceStarting: this.provisioning };
+    }
+    if (sess._dispatchPaused && !sess._sendingInFlight) {
+      return { phase: "paused", queued: pending.length, serviceStarting: false };
+    }
+    return { phase: "sending", queued: pending.length, serviceStarting: false };
   }
 
   private rebuildSnapshot(): void {

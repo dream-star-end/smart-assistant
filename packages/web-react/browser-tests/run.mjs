@@ -249,7 +249,7 @@ const html = `<!doctype html><html><head><meta charset="utf-8"><style>${producti
   #timeline-paint-anchor-root [data-chat-virtual-key*="paint-short"]{min-height:80px}
   #timeline-paint-anchor-root [data-chat-virtual-key*="paint-tall"]{min-height:420px}
   #timeline-estimate-anchor-root .chat-timeline-row{min-height:420px}
-</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="timeline-paint-anchor-root"></div><div id="timeline-estimate-anchor-root"></div><div id="hud-refresh-root"></div><div id="process-card-owner-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="stopped-turn-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
+</style></head><body><div id="root"></div><div id="timeline-user-root"></div><div id="timeline-agent-root"></div><div id="timeline-thinking-root"></div><div id="timeline-replay-root"></div><div id="cold-start-queue-root"></div><div id="chat-entry-ux-root"></div><div id="timeline-scroll-root"></div><div id="timeline-archive-root"></div><div id="timeline-paint-anchor-root"></div><div id="timeline-estimate-anchor-root"></div><div id="hud-refresh-root"></div><div id="process-card-owner-root"></div><div id="single-agent-card-root"></div><div id="team-agent-card-root"></div><div id="tool-card-polish-root"></div><div id="interrupted-tool-status-root"></div><div id="feedback-root"></div><div id="message-quote-root"></div><div id="error-ux-root"></div><div id="stopped-turn-root"></div><div id="ask-question-root"></div><div id="model-selector-root"></div><div id="markdown-rich-root"></div><div id="media-task-root"></div><div id="connectors-root"></div><div id="memory-report-root"></div><div id="community-tutorial-root"></div><div id="codex-density-root"></div><div id="settings-shell-root"></div><div id="unread-request-root"></div><script>${readFileSync(bundlePath, "utf8")}</script></body></html>`;
 
 const toolTouchHtml = `<!doctype html><html><head><meta charset="utf-8"><style>${productionCss}</style></head><body><div id="tool-card-polish-root"></div><script>${readFileSync(toolTouchBundlePath, "utf8")}</script></body></html>`;
 
@@ -3120,6 +3120,30 @@ await check("T71 INC-20261015-LIVE-FENCE-TRIM-REPLAY: a long answer replayed aft
     result.domStartCount !== 1 || result.domEndCount !== 1
   ) {
     throw new Error(`长回答重放后正文重复:${JSON.stringify({ expected, ...result })}`);
+  }
+});
+
+await check("T73 INC-20261015-COLDSTART-QUEUED-THINKING: a queued message shows the connection state until the server admits it", async () => {
+  const root = page.locator("#cold-start-queue-root");
+  const row = root.getByLabel("生成中");
+  const noThinking = async (why) => {
+    if (await root.getByText(/思考中/).count()) throw new Error(why);
+  };
+  try {
+    await page.evaluate(() => window.__coldStartDrive.connectWithoutRelay());
+    await page.evaluate(() => window.__coldStartDrive.send());
+    await row.getByText("正在连接服务… · 1 条待发送", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+    await noThinking("消息仍在待发送队列,活动行却显示「思考中」");
+    await page.evaluate(() => window.__coldStartDrive.closeStarting());
+    await row.getByText("服务启动中，就绪后自动发送 · 1 条待发送", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+    await noThinking("4503 容器启动中,活动行却显示「思考中」");
+    const cmid = await page.evaluate(() => window.__coldStartDrive.reconnectReady());
+    await row.getByText("正在发送…", { exact: true }).waitFor({ state: "visible", timeout: 3000 });
+    await noThinking("服务器尚未确认收到,活动行已显示「思考中」");
+    await page.evaluate((id) => window.__coldStartDrive.admit(id), cmid);
+    await row.getByText(/思考中/).waitFor({ state: "visible", timeout: 3000 });
+  } finally {
+    await page.evaluate(() => window.__coldStartDrive.finish());
   }
 });
 

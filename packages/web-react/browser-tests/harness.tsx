@@ -3695,3 +3695,143 @@ createRoot(document.getElementById("settings-shell-root")!).render(
     <SettingsShellProbe />
   </StrictMode>,
 );
+
+
+// ── T73 / OCV5-428: cold-start queue. A message that waits for the container (transport open,
+// relay not ready, then 4503 starting) must show the connection state; 「思考中」 only after the
+// server's admission ACK. Own socket + own fake transport so the shared replay socket is untouched.
+const COLD_SESSION_ID = "cold-start-queue";
+class ColdStartWebSocket {
+  static latest: ColdStartWebSocket | null = null;
+  readyState = 0;
+  bufferedAmount = 0;
+  sent: string[] = [];
+  onopen: ((ev: unknown) => void) | null = null;
+  onmessage: ((ev: { data: string }) => void) | null = null;
+  onclose: ((ev: { code: number; reason: string }) => void) | null = null;
+  onerror: ((ev: unknown) => void) | null = null;
+  constructor(_url: string, _protocols?: string[]) {
+    ColdStartWebSocket.latest = this;
+    setTimeout(() => {
+      this.readyState = 1;
+      this.onopen?.({});
+    }, 0);
+  }
+  send(data: string): void {
+    this.sent.push(data);
+    try {
+      const frame = JSON.parse(data) as { type?: string; id?: number };
+      if (frame?.type === "ping") setTimeout(() => this.deliver({ type: "pong", id: frame.id }), 0);
+    } catch {
+      /* 非 JSON 帧忽略 */
+    }
+  }
+  close(code = 1000, reason = ""): void {
+    if (this.readyState === 3) return;
+    this.readyState = 3;
+    this.onclose?.({ code, reason });
+  }
+  deliver(frame: unknown): void {
+    this.onmessage?.({ data: JSON.stringify(frame) });
+  }
+}
+const coldStartSocket = new ChatSocket({
+  getToken: () => "harness-cold-start",
+  getAuthEpoch: () => 0,
+  silentRefresh: async (epoch) => ({ kind: "transient" as const, epoch, retryAfterMs: 1000 }),
+  onAuthExpired: () => {},
+  defaultAgentId: REPLAY_AGENT_ID,
+});
+coldStartSocket.ensureSession(COLD_SESSION_ID, REPLAY_AGENT_ID, "冷启动会话");
+
+function ColdStartQueueProbe() {
+  const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
+  const snap = useSyncExternalStore(coldStartSocket.subscribe, coldStartSocket.getSnapshot);
+  void snap.version;
+  const session = snap.sessions.get(COLD_SESSION_ID);
+  const sending = coldStartSocket.isSessionBusy(COLD_SESSION_ID);
+  // Same gating as App.tsx turnActivity (OCV5-428).
+  const dispatch = coldStartSocket.getDispatchStatus(COLD_SESSION_ID);
+  const turnActivity = session && (session._sendingInFlight || dispatch)
+    ? { dispatch, startedAt: session._turnStartedAt ?? null, agentName: "助手" }
+    : null;
+  return (
+    <div ref={setScroller} className="chat-scroll-area timeline-scroll-probe" data-testid="cold-start-queue-probe" tabIndex={0}>
+      <MessageList
+        messages={session?.messages ?? []}
+        sending={sending}
+        turnActivity={turnActivity}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration={`cold::${COLD_SESSION_ID}`}
+      />
+    </div>
+  );
+}
+
+createRoot(document.getElementById("cold-start-queue-root")!).render(
+  <StrictMode><ColdStartQueueProbe /></StrictMode>,
+);
+
+let coldStartOriginalWebSocket: typeof WebSocket | null = null;
+const coldStartWaitOpen = async (previous: ColdStartWebSocket | null) => {
+  for (let i = 0; i < 100; i++) {
+    const ws = ColdStartWebSocket.latest;
+    if (ws && ws !== previous && ws.readyState === 1) return ws;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("冷启动探针传输未打开");
+};
+(window as unknown as { __coldStartDrive: unknown }).__coldStartDrive = {
+  /** Bridge accepted the socket, ensureRunning still waiting: no relay_ready. */
+  connectWithoutRelay: async () => {
+    coldStartOriginalWebSocket = window.WebSocket;
+    (window as unknown as { WebSocket: unknown }).WebSocket = ColdStartWebSocket;
+    coldStartSocket.setGateReady(true);
+    coldStartSocket.start();
+    await coldStartWaitOpen(null);
+  },
+  send: () => {
+    coldStartSocket.sendMessage({
+      sessId: COLD_SESSION_ID,
+      agentId: REPLAY_AGENT_ID,
+      text: "COLD_START_QUEUED_MESSAGE",
+      model: "glm-5.2",
+    });
+  },
+  /** The master gives up for now: 4503 {reason:"starting"}. */
+  closeStarting: () => {
+    ColdStartWebSocket.latest?.close(4503, JSON.stringify({ retryAfterSec: 5, reason: "starting" }));
+  },
+  /** Container ready: reconnect, relay_ready flushes the queue. Returns the sent clientMessageId. */
+  reconnectReady: async () => {
+    const previous = ColdStartWebSocket.latest;
+    coldStartSocket.retryConnectNow();
+    const ws = await coldStartWaitOpen(previous);
+    ws.deliver(relayReadyFrame);
+    for (let i = 0; i < 100; i++) {
+      for (const raw of ws.sent) {
+        const frame = JSON.parse(raw) as { type?: string; clientMessageId?: string };
+        if (frame.type === "inbound.message" && frame.clientMessageId) return frame.clientMessageId;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error("relay 就绪后排队消息没有发出");
+  },
+  admit: (clientMessageId: string) => {
+    ColdStartWebSocket.latest?.deliver({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: COLD_SESSION_ID, kind: "dm" },
+      clientMessageId,
+    });
+  },
+  finish: () => {
+    coldStartSocket.stop();
+    if (coldStartOriginalWebSocket) {
+      (window as unknown as { WebSocket: unknown }).WebSocket = coldStartOriginalWebSocket;
+      coldStartOriginalWebSocket = null;
+    }
+  },
+};
