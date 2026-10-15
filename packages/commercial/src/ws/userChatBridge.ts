@@ -1,4 +1,4 @@
-import { inboundSessionKey, observeUserContentReview } from '../../../gateway/src/jevContentReview.js'
+import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway'
 /**
  * V3 Phase 2 Task 2E — 用户 WS ↔ 容器 WS 桥接。
  *
