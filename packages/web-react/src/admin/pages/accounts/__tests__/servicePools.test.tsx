@@ -180,8 +180,10 @@ describe("服务池(合并后的一个 tab)", () => {
 
   test("Box Claude 组:两条路线、模型开关、当前并发、登录的 5 小时/每周额度,拿不到写原因", async () => {
     renderPage(<ServicePoolsPage />);
+    // The section renders while loading; wait for the data before asserting.
     const box = within(await screen.findByTestId("box-claude-section"));
-    expect(box.getByText("路线 A · box-api-claude-*")).toBeTruthy();
+    expect(await box.findByText("路线 A · box-api-claude-*")).toBeTruthy();
+    await box.findByText("account2");
     expect(box.getByText("路线 B · box-claude-*")).toBeTruthy();
     expect(box.getByText("已关闭")).toBeTruthy();
     expect(box.getByText("已开启")).toBeTruthy();
