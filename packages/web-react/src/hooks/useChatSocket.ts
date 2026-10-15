@@ -4,7 +4,7 @@ import { ApiError, api } from "../lib/api";
 import { reportClientFriction } from "../lib/clientFriction";
 import type { ChatMessage, ChatSession } from "../lib/chat/model";
 import { isLiveUnitsPage } from "../lib/chat/liveUnitsHydrate";
-import { ChatSocket, type ChatSnapshot } from "../lib/chat/socket";
+import { ChatSocket, type ChatSnapshot, type DispatchStatus } from "../lib/chat/socket";
 import { DeferredPayloadQueue } from "../lib/chat/deferredPayloadQueue";
 import { parseTapeRecordPayload, type TapePayloadExpectation } from "../lib/chat/tapePayload";
 import type { InboundMessage, MediaJobWire, RepoBindErrorWire, RepoStatusWire } from "../lib/chat/frames";
@@ -71,6 +71,8 @@ export type UseChatSocket = {
   getMessages: (sessId: string | undefined) => ChatMessage[];
   getSession: (sessId: string | undefined) => ChatSession | undefined;
   isSending: (sessId: string | undefined) => boolean;
+  /** OCV5-428: pre-admission phase of the session's next turn (null = admitted / idle). */
+  dispatchStatus: (sessId: string | undefined) => DispatchStatus | null;
   ensureSession: (sessId: string, agentId: string, title?: string) => void;
   /** Confirm the server session row before an ownership-gated operation that
    * can occur before the first message (notably GoalState set). */
@@ -746,6 +748,14 @@ export function useChatSocket(opts: {
     [snap, socket],
   );
 
+  const dispatchStatus = useCallback(
+    (sessId: string | undefined) => {
+      void snap.version;
+      return sessId ? socket.getDispatchStatus(sessId) : null;
+    },
+    [snap, socket],
+  );
+
   const ensureSession = useCallback((sessId: string, agentId: string, title?: string) => {
     socket.ensureSession(sessId, agentId, title);
   }, [socket]);
@@ -1144,6 +1154,7 @@ export function useChatSocket(opts: {
       getMessages,
       getSession,
       isSending,
+      dispatchStatus,
       ensureSession,
       ensureServerSession,
       removeSession,
@@ -1186,6 +1197,7 @@ export function useChatSocket(opts: {
       getMessages,
       getSession,
       isSending,
+      dispatchStatus,
       ensureSession,
       ensureServerSession,
       removeSession,

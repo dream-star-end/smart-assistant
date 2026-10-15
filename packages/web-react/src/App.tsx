@@ -2437,8 +2437,13 @@ export function App() {
       : null;
   // biome-ignore lint/correctness/useExhaustiveDependencies: chat.version 是就地 mutation 会话的刷新触发器(见末行注释)。
   const turnActivity = useMemo<TurnActivityInfo | null>(() => {
-    if (demo || !activeSess || !activeSess._sendingInFlight) return null;
+    if (demo || !activeSess) return null;
+    // OCV5-428: a message still in the local journal (transport down, or on the wire
+    // without the server's admission ACK) gets its own row; 「思考中」 waits for admission.
+    const dispatch = chat.dispatchStatus(activeSess.id);
+    if (!activeSess._sendingInFlight && !dispatch) return null;
     return {
+      dispatch,
       startedAt: activeSess._turnStartedAt ?? null,
       lastFrameAt: activeSess._lastFrameAt,
       progressHint: activeSess._turnProgressHint,
@@ -2462,7 +2467,7 @@ export function App() {
       leaderStep: teamLeaderActive ? deriveActivePlanStep(extractLatestTodos(wsMessages)) : null,
     };
     // chat.version 是就地 mutation 会话的变更权威信号（同引用，须显式入依赖才随帧刷新）。
-  }, [demo, activeSess, teamLeaderActive, agent.name, wsMessages, chat.version]);
+  }, [demo, activeSess, teamLeaderActive, agent.name, wsMessages, chat.version, chat.dispatchStatus]);
 
   // ── 冷会话加载骨架屏窗口计时 ──────────────────────────────────────────
   // activeId 变化即重置两个截止标记；GRACE 用于 meta 未知（深链）分支，CAP 是安全封顶。
