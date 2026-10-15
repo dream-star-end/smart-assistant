@@ -220,6 +220,37 @@ q "UPDATE outbox SET next_attempt_at=strftime('%Y-%m-%dT%H:%M:%SZ','now');"   # 
 assert_eq "$(q "SELECT status FROM outbox WHERE kind='satisfied';")" delivered "outbox 最终 delivered"
 assert_eq "$(comments OCV5-907)" 1 "响应丢失重投后面板仍只 1 条评论(transport_id 幂等)"
 
+echo "═══ T6 工作树落后 tip → 自动快进后发车;脏/分叉 → 不覆盖、不发车、告警(每小时一次) ═══"
+# a) 落后:工作树停在已 push 的旧 commit,origin tip 更新 → worker 在 deploy.lock 内 ff 后发车
+reset_db; set_live "$C2" committed
+C4="$(mk c4)"; git -C "$T/wt" push -q origin feat/test; git -C "$T/wt" reset -q --hard "$C2"
+"$LEASE" register --resource deploy:selfhost --mode ride --sha "$C4" --ticket OCV5-908 --owner s1 >/dev/null
+"$WORKER" >/dev/null 2>&1
+assert_eq "$(git -C "$T/wt" rev-parse HEAD)" "$C4" "落后的工作树被快进到 origin tip"
+assert_eq "$(starts)" 1 "快进后同一 tick 发车"
+assert_eq "$(q "SELECT target_sha FROM train ORDER BY seq DESC LIMIT 1;")" "$C4" "列车 target = origin tip"
+wait_train_done || bad "T6a train 未在时限内终态"; "$WORKER" >/dev/null 2>&1
+# b) 脏:origin tip 再前进,工作树停在旧 commit 且有未提交改动 → 不 ff、不发车、改动原样保留、告警一次
+reset_db; set_live "$C4" committed
+C5="$(mk c5)"; git -C "$T/wt" push -q origin feat/test; git -C "$T/wt" reset -q --hard "$C4"
+echo "local edit" >>"$T/wt/c4"
+"$LEASE" register --resource deploy:selfhost --mode ride --sha "$C5" --ticket OCV5-909 --owner s1 >/dev/null
+"$WORKER" >/dev/null 2>&1; "$WORKER" >/dev/null 2>&1
+assert_eq "$(git -C "$T/wt" rev-parse HEAD)" "$C4" "脏工作树不被移动"
+assert_eq "$(tail -1 "$T/wt/c4")" "local edit" "未提交改动原样保留"
+assert_eq "$(starts)" 0 "脏工作树不发车"
+assert_eq "$(q "SELECT COUNT(*) FROM outbox WHERE id LIKE 'lease:%:ff-blocked:%';")" 1 "告警入 outbox,同一小时只一次"
+grep -q "未提交改动" "$T/comments/OCV5-909.md" 2>/dev/null && ok "告警写明原因" || bad "告警未写明原因"
+# c) 分叉:工作树多了一个未 push 的本地 commit → 不 reset、不发车、告警
+git -C "$T/wt" checkout -q -- c4
+LOCAL="$(mk c4-local)"
+reset_db; set_live "$C4" committed
+"$LEASE" register --resource deploy:selfhost --mode ride --sha "$C5" --ticket OCV5-910 --owner s1 >/dev/null
+"$WORKER" >/dev/null 2>&1
+assert_eq "$(git -C "$T/wt" rev-parse HEAD)" "$LOCAL" "分叉的工作树原样保留"
+assert_eq "$(starts)" 0 "分叉不发车"
+grep -q "分叉" "$T/comments/OCV5-910.md" 2>/dev/null && ok "分叉告警写明原因" || bad "分叉告警未写明原因"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]]
