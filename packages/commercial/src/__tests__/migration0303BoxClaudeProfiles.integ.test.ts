@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { runMigrations } from "../db/migrate.js";
@@ -27,6 +29,16 @@ const rollbackBlock = async () => {
   const block = /-- BEGIN TESTED MANUAL ROLLBACK 0303\n([\s\S]*?)-- END TESTED MANUAL ROLLBACK 0303/.exec(await readFile(sqlPath, "utf8"))![1]!;
   return block.split("\n").map((line) => line.replace(/^-- ?/, "")).join("\n");
 };
+
+/** The real migration files up to and including 0304, symlinked into a temp dir. */
+async function migrationsThrough0304(): Promise<string> {
+  const src = fileURLToPath(new URL("../db/migrations/", import.meta.url));
+  const out = await mkdtemp(path.join(tmpdir(), "oc-migrations-through-0304-"));
+  for (const f of (await readdir(src)).filter((f) => f.endsWith(".sql") && f.slice(0, 4) <= "0304")) {
+    await symlink(path.join(src, f), path.join(out, f));
+  }
+  return out;
+}
 
 describe("0303 box_claude_profiles", () => {
   test("the full chain creates the table and a second run changes nothing", async (t) => {
@@ -109,15 +121,17 @@ describe("0303 box_claude_profiles", () => {
   test("the rollback block removes the table and its ledger row, and the migration applies again", { timeout: 240000 }, async (t) => {
     if (db.skipIfUnavailable(t)) return;
     await resetAndMigrateBefore("0303");
-    // 0304 (billing workload columns, OCV5-392) follows 0303 in the chain.
-    assert.deepEqual((await runMigrations()).applied, ["0303_box_claude_profiles", "0304_billing_workload_column"]);
+    // Stop the chain after 0304 (billing workload columns, OCV5-392): later migrations
+    // (0306+, one of them on this table) would block the 0304 rollback's later-migration guard.
+    const dir = await migrationsThrough0304();
+    assert.deepEqual((await runMigrations({ dir })).applied, ["0303_box_claude_profiles", "0304_billing_workload_column"]);
     await query(await readFile(rollback0304Path, "utf8"));
     await query(await rollbackBlock());
     assert.equal((await query("SELECT to_regclass('public.box_claude_profiles') AS t")).rows[0]!.t, null);
     assert.equal((await query("SELECT 1 FROM schema_migrations WHERE version='0303_box_claude_profiles'")).rowCount, 0);
     assert.deepEqual(await listBoxProfiles([1n]), [], "reads degrade to no rows when the table is gone");
     assert.equal(await boxProfilesAvailable(), false);
-    assert.deepEqual((await runMigrations()).applied, ["0303_box_claude_profiles", "0304_billing_workload_column"]);
+    assert.deepEqual((await runMigrations({ dir })).applied, ["0303_box_claude_profiles", "0304_billing_workload_column"]);
     assert.equal(await boxProfilesAvailable(), true);
   });
 });

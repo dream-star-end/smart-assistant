@@ -114,3 +114,16 @@ test("a rejection without a trustworthy reset does not extend an active quota be
   health.observe("a", { kind: "rate_limit", status: "rejected", utilization: 1.04, resetsAtMs: now + 7_200_000 });
   assert.equal(health.get("a")!.cooldownUntilMs, now + 7_200_000);
 });
+
+test("OCV5-424: reported windows merge per window and reach the persister", () => {
+  const now = 1_000;
+  const saved: unknown[] = [];
+  const health = new BoxProfileHealth(() => now, (_key, state) => { saved.push(state.windows); });
+  health.observe("1:a", { kind: "rate_limit", status: "allowed", utilization: 0.2, resetsAtMs: null,
+    windows: { fiveHour: { utilization: 0.2, resetsAtMs: 5_000 }, sevenDay: { utilization: 0.1, resetsAtMs: 9_000 } } });
+  health.observe("1:a", { kind: "rate_limit", status: "allowed", utilization: 0.3, resetsAtMs: null,
+    windows: { fiveHour: { utilization: 0.3, resetsAtMs: 5_000 } } });
+  assert.deepEqual(health.get("1:a")!.windows,
+    { fiveHour: { utilization: 0.3, resetsAtMs: 5_000 }, sevenDay: { utilization: 0.1, resetsAtMs: 9_000 } });
+  assert.deepEqual(saved.at(-1), health.get("1:a")!.windows);
+});

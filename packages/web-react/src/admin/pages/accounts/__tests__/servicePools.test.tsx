@@ -74,6 +74,23 @@ const POOLS: PoolsResponse = {
     },
     { service: "deepseek", accepts_api_keys: true, counts: { active: 1, cooldown: 0, disabled: 0, total: 1 }, members: [member({ service: "deepseek", memberKind: "api_key", credentialType: "api_key", id: "k2", label: "deepseek-env", hints: { key: "…1234", source: "env" } })] },
   ],
+  box_claude: {
+    routes: [
+      { key: "A", runner: "print", models: [{ id: "box-api-claude-opus-5-5", upstream_model: "claude-opus-5-5", enabled: false, visibility: "admin", catalog_state: "active", engine: "ccb", provider: "box_cli", inflight: { current: 0, peak: 0 } }] },
+      { key: "B", runner: "interactive", models: [
+        { id: "box-claude-opus-5-5", upstream_model: "claude-opus-5-5", enabled: true, visibility: "public", catalog_state: "active", engine: "ccb", provider: "box_cli", inflight: { current: 2, peak: 3 } },
+        { id: "box-claude-haiku-5-5", upstream_model: "claude-haiku-5-5", enabled: true, visibility: "public", catalog_state: null, engine: null, provider: null, inflight: { current: 0, peak: 1 } },
+      ] },
+    ],
+    caps: { max_runs_per_account: 10, max_runs_per_user: 10, proxy_concurrency: 20, proxy_rate_per_minute: 120 },
+    inflight_source: "egress",
+    logins: [
+      { account_id: "25", profile: "account2", enabled: true, is_default: true, login_state: "logged_in", email_hint: "a***@x.com", utilization: 0.12, cooldown_until: null, cooldown_reason: null, health_updated_at: new Date(now).toISOString(),
+        quota: { five_hour: { used: 0.12, resets_at: new Date(now + 2 * 3_600_000).toISOString() }, weekly: { used: 0.4, resets_at: new Date(now + 3 * 86_400_000).toISOString() }, reason: null } },
+      { account_id: "25", profile: "account3", enabled: false, is_default: false, login_state: "logged_in", email_hint: null, utilization: null, cooldown_until: null, cooldown_reason: null, health_updated_at: null,
+        quota: { five_hour: null, weekly: null, reason: "登录未参与调度，不会被使用，额度不更新" } },
+    ],
+  },
   policy: { fail_threshold: 3, rate_limit_ms: [15_000, 900_000], auth_backoff_ms: [300_000, 21_600_000], credential_backoff_ms: [1_800_000, 86_400_000], upstream_backoff_ms: [600_000, 600_000], quota_default_ms: 3_600_000 },
 };
 
@@ -153,14 +170,42 @@ describe("服务池(合并后的一个 tab)", () => {
     expect(within(gemini).getByText("订阅账号").className).toContain("whitespace-nowrap");
   });
 
-  test("Cursor 账号只出现一次(服务端的 box 池即 Cursor 账号),Box 登录列在 Cursor 分段下", async () => {
+  test("Cursor 账号只出现一次(服务端的 box 池即 Cursor 账号)", async () => {
     renderPage(<ServicePoolsPage />);
     await screen.findByText("claude-main");
     expect(screen.queryByTestId("pool-box")).toBeNull();
+    expect(screen.queryByTestId("pool-box-keys")).toBeNull();
     expect(screen.getAllByText("cursor-box")).toHaveLength(1);
-    const keys = await screen.findByTestId("pool-box-keys");
-    expect(within(keys).getByText("account2")).toBeTruthy();
-    expect(within(keys).getByText(/Box 内的 Claude 登录没有上游额度信号/)).toBeTruthy();
+  });
+
+  test("Box Claude 组:两条路线、模型开关、当前并发、登录的 5 小时/每周额度,拿不到写原因", async () => {
+    renderPage(<ServicePoolsPage />);
+    // The section renders while loading; wait for the data before asserting.
+    const box = within(await screen.findByTestId("box-claude-section"));
+    expect(await box.findByText("路线 A · box-api-claude-*")).toBeTruthy();
+    await box.findByText("account2");
+    expect(box.getByText("路线 B · box-claude-*")).toBeTruthy();
+    expect(box.getByText("已关闭")).toBeTruthy();
+    expect(box.getByText("已开启")).toBeTruthy();
+    expect(box.getByText("不在模型目录")).toBeTruthy();
+    expect(box.getByText("· 峰值 3")).toBeTruthy();
+    expect(box.getByTestId("box-claude-caps").textContent).toContain("每个 Box 账号 10 个运行");
+    expect(box.getByText("已用 12%")).toBeTruthy();
+    expect(box.getByText("已用 40%")).toBeTruthy();
+    expect(box.getByText(/2h 后重置/)).toBeTruthy();
+    expect(box.getByText("登录未参与调度，不会被使用，额度不更新")).toBeTruthy();
+    expect(box.getByText("Box 账号 25 · a***@x.com")).toBeTruthy();
+  });
+
+  test("服务端没有 Box Claude 信息时写明原因", async () => {
+    adminGet.mockImplementation((path: string) => {
+      if (path === "/accounts") return Promise.resolve({ rows: ROWS });
+      if (path === "/pools") return Promise.resolve({ ...POOLS, box_claude: null });
+      return Promise.resolve(null);
+    });
+    renderPage(<ServicePoolsPage />);
+    const box = within(await screen.findByTestId("box-claude-section"));
+    expect(await box.findByText("Box Claude 信息读取失败,稍后自动刷新。")).toBeTruthy();
   });
 
   test("已重置的窗口不显示旧百分比;未在调度中的账号说明不读取额度", async () => {

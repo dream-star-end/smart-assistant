@@ -1,7 +1,7 @@
 /** Per-login health the scheduler reads and the exec tap writes. Process-local
  * and fast; `persist` mirrors every change to the durable store (best effort)
  * so the admin page, a restarted egress and another process see it too. */
-import type { BoxProfileSignal } from "./boxProfileSignals.js";
+import type { BoxProfileSignal, BoxQuotaWindows } from "./boxProfileSignals.js";
 import { DEFAULT_POLICY, decide, type PolicyConfig } from "../../account-pool/policy/decide.js";
 import type { CooldownReason, PoolOutcome } from "../../account-pool/policy/outcome.js";
 
@@ -13,6 +13,8 @@ export interface BoxProfileHealthState {
   updatedAtMs: number;
   /** When the quota window the utilization belongs to resets (epoch ms); not persisted. */
   windowResetsAtMs?: number | null;
+  /** OCV5-424: the last reported 5-hour / weekly windows (persisted for the admin page). */
+  windows?: BoxQuotaWindows;
   /** OCV5-424 shared policy: consecutive bench level (reset by a successful read). */
   backoffLevel?: number;
   cooldownReason?: CooldownReason | null;
@@ -107,6 +109,7 @@ export class BoxProfileHealth {
     const next: BoxProfileHealthState = { utilization: held?.utilization ?? null,
       cooldownUntilMs: held?.cooldownUntilMs ?? null, lastReason: held?.lastReason ?? null,
       updatedAtMs: at, windowResetsAtMs: held?.windowResetsAtMs ?? null,
+      ...(held?.windows ? { windows: held.windows } : {}),
       backoffLevel: held?.backoffLevel ?? 0, cooldownReason: held?.cooldownReason ?? null };
     // Re-reading the same evidence (a replayed spool, a resumed run) must not push a bench further out.
     const benched = (reason: string): boolean => held?.lastReason === reason && (held.cooldownUntilMs ?? 0) > at;
@@ -135,12 +138,14 @@ export class BoxProfileHealth {
       next.utilization = Math.max(signal.utilization ?? 1, 1);
       next.lastReason = "quota_exhausted";
       next.windowResetsAtMs = signal.resetsAtMs;
+      if (signal.windows) next.windows = { ...next.windows, ...signal.windows };
     } else if (signal.status === "allowed" || signal.status === "allowed_warning") {
       next.backoffLevel = 0;
       if (signal.utilization !== null) {
         next.utilization = signal.utilization;
         next.windowResetsAtMs = signal.resetsAtMs;
       }
+      if (signal.windows) next.windows = { ...next.windows, ...signal.windows };
       // A successful read after a reset clears an expired bench.
       if (next.cooldownUntilMs !== null && next.cooldownUntilMs <= at) {
         next.cooldownUntilMs = null; next.lastReason = null; next.cooldownReason = null;

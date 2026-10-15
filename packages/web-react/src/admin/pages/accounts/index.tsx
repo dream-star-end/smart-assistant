@@ -25,7 +25,7 @@ import {
 import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { useAdminPoll } from "../../lib/useAdminPoll";
 import { getAdminPage } from "../../registry";
-import { ApiKeyFormModal, PolicyNote, PoolSection, QuotaWindowsCell, accountQuota, togglePath } from "../pools";
+import { ApiKeyFormModal, BoxClaudeSection, PolicyNote, PoolSection, QuotaWindowsCell, accountQuota, togglePath } from "../pools";
 import type { PoolMember, PoolView, PoolsResponse } from "../pools/types";
 import { AccountFormModal } from "./AccountFormModal";
 import { BoxClaudeProfilesModal } from "./BoxClaudeProfilesModal";
@@ -105,7 +105,8 @@ const POOL_SERVICE_OF: Record<string, string> = { cursor: "box" };
 function keyMembersOf(pools: PoolsResponse | null, service: string): PoolView | null {
   const pool = pools?.pools?.find((p) => p.service === service);
   if (!pool) return null;
-  const members = pool.members.filter((m) => m.memberKind !== "account");
+  // Box Claude logins have their own group (BoxClaudeSection) with routes, models and quota.
+  const members = pool.members.filter((m) => m.memberKind !== "account" && m.memberKind !== "box_profile");
   if (members.length === 0 && !pool.accepts_api_keys) return null;
   return { ...pool, members };
 }
@@ -529,7 +530,7 @@ export default function AccountsPage() {
                       loading={loading && !data}
                       onAdd={(svc) => setAddKeyFor(svc)}
                       onToggle={togglePoolMember}
-                      title={section.id === "codex" ? "中转 key" : section.id === "cursor" ? "Box 内的 Claude 登录" : "API key"}
+                      title={section.id === "codex" ? "中转 key" : "API key"}
                       bare
                     />
                   ) : null;
@@ -537,6 +538,9 @@ export default function AccountsPage() {
               </section>
             );
           })}
+          {!provider || provider === "cursor" ? (
+            <BoxClaudeSection view={data ? (pools ? pools.box_claude : null) : undefined} loading={loading && !data} />
+          ) : null}
           {!provider
             ? otherPools.map((p) => (
                 <PoolSection

@@ -170,4 +170,56 @@ export async function writeBoxProfileHealth(accountId: bigint, profile: string,
         state.lastReason, new Date(state.updatedAtMs).toISOString(),
         state.cooldownReason ?? null, Math.min(30, Math.max(0, state.backoffLevel ?? 0))]);
   } catch (error) { if (!missingTable(error)) throw error; }
+  if (state.windows?.fiveHour || state.windows?.sevenDay) await writeBoxProfileQuotaWindows(accountId, profile, state);
+}
+
+const iso = (ms: number | null | undefined): string | null => (ms === null || ms === undefined ? null : new Date(ms).toISOString());
+
+/**
+ * OCV5-424: per-window quota for the admin 服务池 page (migration 0309). Separate
+ * and best-effort: a database without the columns (or the table) skips it, so the
+ * scheduling write above is never affected. Windows not reported keep their value;
+ * a report older than the row's last health write is dropped, like that write.
+ */
+async function writeBoxProfileQuotaWindows(accountId: bigint, profile: string, state: BoxProfileHealthState): Promise<void> {
+  const w = state.windows ?? {};
+  try {
+    await query(
+      `UPDATE box_claude_profiles SET
+         quota_5h = COALESCE($3::real, quota_5h), quota_5h_resets_at = CASE WHEN $3::real IS NULL THEN quota_5h_resets_at ELSE $4::timestamptz END,
+         quota_7d = COALESCE($5::real, quota_7d), quota_7d_resets_at = CASE WHEN $5::real IS NULL THEN quota_7d_resets_at ELSE $6::timestamptz END
+       WHERE account_id = $1::bigint AND profile = $2
+         AND (health_updated_at IS NULL OR health_updated_at <= $7::timestamptz)`,
+      [accountId.toString(), profile,
+        w.fiveHour?.utilization ?? null, iso(w.fiveHour?.resetsAtMs),
+        w.sevenDay?.utilization ?? null, iso(w.sevenDay?.resetsAtMs), iso(state.updatedAtMs)]);
+  } catch (error) {
+    const code = (error as { code?: unknown } | null)?.code;
+    if (code !== "42P01" && code !== "42703") throw error;
+  }
+}
+
+/** One login's 5-hour / weekly quota as last reported (null when never reported or not migrated). */
+export interface BoxProfileQuota {
+  accountId: bigint;
+  profile: string;
+  quota5h: number | null;
+  quota5hResetsAt: Date | null;
+  quota7d: number | null;
+  quota7dResetsAt: Date | null;
+}
+
+/** Admin read of the per-window columns; empty when the database predates 0309. */
+export async function listBoxProfileQuotas(): Promise<BoxProfileQuota[]> {
+  try {
+    const r = await query<{ account_id: string; profile: string; quota_5h: number | null; quota_5h_resets_at: Date | null; quota_7d: number | null; quota_7d_resets_at: Date | null }>(
+      `SELECT account_id::text AS account_id, profile, quota_5h::float8 AS quota_5h, quota_5h_resets_at,
+              quota_7d::float8 AS quota_7d, quota_7d_resets_at FROM box_claude_profiles ORDER BY account_id, profile`);
+    return r.rows.map((x) => ({ accountId: BigInt(x.account_id), profile: x.profile, quota5h: x.quota_5h,
+      quota5hResetsAt: x.quota_5h_resets_at, quota7d: x.quota_7d, quota7dResetsAt: x.quota_7d_resets_at }));
+  } catch (error) {
+    const code = (error as { code?: unknown } | null)?.code;
+    if (code === "42P01" || code === "42703") return [];
+    throw error;
+  }
 }

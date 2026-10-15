@@ -41,8 +41,53 @@ export interface PoolView {
   counts: { active: number; cooldown: number; disabled: number; total: number };
 }
 
+/** Box Claude group (Claude Code logins inside a Cursor Box; not in the accounts table). */
+export interface BoxClaudeModelView {
+  id: string;
+  upstream_model: string;
+  enabled: boolean | null;
+  visibility: string | null;
+  catalog_state: string | null;
+  engine: string | null;
+  provider: string | null;
+  inflight: { current: number; peak: number } | null;
+}
+
+export interface BoxQuotaWindowView {
+  used: number;
+  resets_at: string | null;
+}
+
+export interface BoxClaudeLoginView {
+  account_id: string;
+  profile: string;
+  enabled: boolean;
+  is_default: boolean;
+  login_state: string;
+  email_hint: string | null;
+  utilization: number | null;
+  cooldown_until: string | null;
+  cooldown_reason: string | null;
+  health_updated_at: string | null;
+  quota: { five_hour: BoxQuotaWindowView | null; weekly: BoxQuotaWindowView | null; reason: string | null };
+}
+
+export interface BoxClaudeView {
+  routes: { key: "A" | "B"; runner: "print" | "interactive"; models: BoxClaudeModelView[] }[];
+  caps: {
+    max_runs_per_account: number;
+    max_runs_per_user: number;
+    proxy_concurrency: number | null;
+    proxy_rate_per_minute: number | null;
+  };
+  inflight_source: "egress" | "local" | "local_fallback" | "unavailable";
+  logins: BoxClaudeLoginView[];
+}
+
 export interface PoolsResponse {
   pools: PoolView[];
+  /** Absent on servers before the Box Claude group; null when it could not be collected. */
+  box_claude?: BoxClaudeView | null;
   policy: {
     fail_threshold: number;
     rate_limit_ms: [number, number];
