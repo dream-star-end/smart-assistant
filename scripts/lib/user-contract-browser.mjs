@@ -61,7 +61,7 @@ export async function newSession(page) {
 // browser send is observed but never forwarded to the server (zero inference).
 export async function installTurnProbe(context, base, cost) {
   const sent = [], received = [], writes = [], catalogs = [];
-  const probe = { sent, received, writes, catalogs, liveTexts: new Set() };
+  const probe = { sent, received, writes, catalogs, liveTexts: new Set(), connects: 0 };
   context.on("request", (r) => {
     const u = new URL(r.url());
     if (u.origin === base && /^\/api\/sessions\/[^/]+$/.test(u.pathname) && ["PUT", "PATCH"].includes(r.method())) {
@@ -77,6 +77,7 @@ export async function installTurnProbe(context, base, cost) {
   const expected = new URL(base);
   await context.routeWebSocket((url) => url.host === expected.host && url.pathname.startsWith("/ws"), (ws) => {
     const server = ws.connectToServer();
+    probe.connects += 1;
     ws.onMessage((raw) => {
       const f = parseFrame(raw);
       if (f?.type === "inbound.message") {
@@ -215,6 +216,10 @@ export async function waitTurnUiSettled(page, rowsBefore, { model, recheck, time
   const settledMs = Date.now() - started;
   log(`# warn slow_ui_settle model=${model} settled_ms=${settledMs} strict_ms=${strictMs} state_at_strict=${JSON.stringify(atStrict)}`);
   return { slow: true, settledMs };
+}
+/** OCV5-429: the bridge confirmed the container relay (ensureRunning done). Prewarm only. */
+export async function waitRelayReady(probe, timeout) {
+  return waitUntil(() => probe.received.find((f) => f.type === "sys.relay_ready"), timeout, "Canary relay not ready");
 }
 export async function waitUntil(check, timeout, message) {
   const deadline = Date.now() + timeout;

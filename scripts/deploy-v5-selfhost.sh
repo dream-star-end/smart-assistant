@@ -2026,6 +2026,14 @@ user_contract_gate() {
   local password_file=/etc/openclaude/selfhost-canary.password
   [[ -f "$password_file" && -r "$password_file" && -s "$password_file" ]] \
     || { echo "FATAL: user contract canary password missing/unreadable/empty: $password_file" >&2; return 1; }
+  # OCV5-429: the cutover may recycle the canary container onto the new runtime tuple (or it was
+  # idle-swept); its cold start outlasts C2's 20s window. Warm it first (same UI login, no message,
+  # wait for relay_ready). Not part of the verdict: a prewarm that never gets ready only warns.
+  V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
+    V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
+    V5_CANARY_PASSWORD_FILE="$password_file" \
+    node "$SCRIPT_DIR/v5-user-contract-prewarm.mjs" \
+    || echo "  ⚠ canary 预热未就绪,门禁照跑(由 C1–C3 判定)" >&2
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
     V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
     V5_CANARY_PASSWORD_FILE="$password_file" V5_CONTRACT_COST=live \
