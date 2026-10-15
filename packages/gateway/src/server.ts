@@ -2830,6 +2830,8 @@ export class Gateway {
   // can catch up without hitting REST. When the ring can't satisfy a resume,
   // we emit `outbound.resume_failed` so the client escalates to REST sync.
   private _outboundRing!: OutboundRingBuffer
+  /** OCV5-427: exact-turn replays already served per socket (`sessionKey\u0000clientMessageId`). */
+  private readonly _activeTurnReplaysServed = new WeakMap<object, Set<string>>()
 
   // ── 模型执行权威(docs/V5_MODEL_AUTHORITY_PLAN.md §2/§7)────────────────────
   // 容器侧验签消费器(进程级:keyring + 容器身份 + epoch 单调水位 + replay cache)。
@@ -19705,9 +19707,19 @@ export class Gateway {
       // durable server-side persistence from Phase 0.1/0.2 remains the
       // authoritative backstop for any duration of disconnect.
       const clientLastSeq = typeof peerLastFrameSeq === 'number' ? peerLastFrameSeq : 0
-      const activeReplayClientMessageId = _matchActiveTurnReplayCandidate(
+      const matchedActiveReplay = _matchActiveTurnReplayCandidate(
         session?._runningClientMessageId,
         peer.resumeActiveTurnCandidateMessageIds,
+      )
+      // OCV5-427: one exact-turn replay per socket and turn. A second hello on
+      // the same socket for the same running turn (page-load hello + post-sync
+      // registration hello) gets the cursor replay instead of the whole turn
+      // again, so the browser does not chew the same frames twice.
+      const activeReplayClientMessageId = _unservedActiveTurnReplay(
+        this._activeTurnReplaysServed,
+        ws,
+        sessionKey,
+        matchedActiveReplay,
       )
       if (clientLastSeq >= 0) {
         const replay = activeReplayClientMessageId
@@ -19719,6 +19731,9 @@ export class Gateway {
         // only ever pruned on resume.
         this._recordRingEvictions(replay.evicted)
         if (replay.ok) {
+          if (activeReplayClientMessageId) {
+            _noteActiveTurnReplayServed(this._activeTurnReplaysServed, ws, sessionKey, activeReplayClientMessageId)
+          }
           if (activeReplayClientMessageId) {
             try {
               ws.send(JSON.stringify({
@@ -22961,6 +22976,36 @@ export function _matchActiveTurnReplayCandidate(
   )
     ? runningClientMessageId
     : undefined
+}
+
+/** OCV5-427: the exact-turn replay a hello may still get on this socket.
+ * One per socket and turn; a repeat ask returns undefined so the caller
+ * falls back to the cursor replay instead of resending the whole turn. */
+export function _unservedActiveTurnReplay(
+  served: WeakMap<object, Set<string>>,
+  socket: object,
+  sessionKey: string,
+  matchedClientMessageId: string | undefined,
+): string | undefined {
+  if (!matchedClientMessageId) return undefined
+  return served.get(socket)?.has(`${sessionKey}\u0000${matchedClientMessageId}`)
+    ? undefined
+    : matchedClientMessageId
+}
+
+/** OCV5-427: record an exact-turn replay that was actually sent on `socket`. */
+export function _noteActiveTurnReplayServed(
+  served: WeakMap<object, Set<string>>,
+  socket: object,
+  sessionKey: string,
+  clientMessageId: string,
+): void {
+  let keys = served.get(socket)
+  if (!keys) {
+    keys = new Set()
+    served.set(socket, keys)
+  }
+  keys.add(`${sessionKey}\u0000${clientMessageId}`)
 }
 
 // ── turn-alive-heartbeat (Plan 1) — autoResumeFromHello judgment helper ──

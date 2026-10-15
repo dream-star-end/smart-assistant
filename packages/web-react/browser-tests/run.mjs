@@ -4113,6 +4113,18 @@ await check("T69 贴底补更早过程步骤时已渲染锚点不位移，离底
   }
 });
 
+await check("T72 INC-20261015-RESUME-REPLAY-LAG: a completion inside the reload replay backlog settles at once and syncs history", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runResumeReplayCompletion());
+  if (
+    result.settledMs === null || result.settledMs > 1000 ||
+    result.syncCalls < 1 ||
+    result.textLength !== result.expectedLength ||
+    result.domStartCount !== 1 || result.domEndCount !== 0
+  ) {
+    throw new Error(`重放积压中的完成帧没有立即收口/对账:${JSON.stringify(result)}`);
+  }
+});
+
 await check("T20 预览用例结束后主 harness 页面未被摧毁", async () => {
   const alive = await page.evaluate(() => ({
     root: Boolean(document.querySelector("#root")),

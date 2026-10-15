@@ -676,6 +676,14 @@ export type ChatSession = {
   /** User-row id of the turn currently streaming in this browser. */
   _activeClientMessageId?: string;
   /**
+   * Turn whose live frames this browser is re-reading through an
+   * `outbound.active_turn_replay_start` backlog (reload / reconnect). Its
+   * tape-commit completion settles at once from REST instead of waiting for a
+   * live tail that is still queued behind the replay (OCV5-427). Session
+   * memory only — not written to persist snapshots.
+   */
+  _resumeReplayClientMessageId?: string;
+  /**
    * Browser-only stop settlement fence. A successful online Stop stays busy
    * until this exact turn reaches a terminal frame and the authoritative REST
    * hydration succeeds, so late full-session sync cannot visibly append after

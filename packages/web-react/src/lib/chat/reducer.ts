@@ -1712,12 +1712,15 @@ export function applyOutboundMessage(
     // live 尾巴之前到达。此处若立即收口,resetReplyTracker 把截止戳定在本帧 server ts,随后到达的
     // 尾巴帧(ts 更早)全被 stale 守卫丢弃 → 本轮显示「已完成」但正文停在半句,约 1s 后 REST 对账才补齐。
     // 本轮仍在流式时交给 socket 宽限等待真 final;hello/reconciler 的 reconcile 不带该来源,行为不变。
+    // OCV5-427:刷新/重连后本轮正经 active_turn_replay_start 重读,尾巴排在成百上千条积压重放帧之后,
+    // 宽限期内等不到 → 不等,立即收口并走下方 onFinal 的精确 REST 对账(tape 已提交,历史即完整)。
     if (
       frame.meta?.reconcile === "turn_completed" &&
       frame.meta?.reconcileSource === "tape_commit" &&
       frameCmid &&
       frameCmid === active &&
       sess._sendingInFlight &&
+      sess._resumeReplayClientMessageId !== frameCmid &&
       effects.deferTapeCommitFinal?.(sess.id, frame) === true
     ) {
       return;
