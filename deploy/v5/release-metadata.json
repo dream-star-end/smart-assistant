@@ -179,7 +179,8 @@
     "0304_billing_workload_column",
     "0306_pool_policy",
     "0307_antigravity_engine",
-    "0308_pool_user_affinity"
+    "0308_pool_user_affinity",
+    "0309_box_profile_quota_windows"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

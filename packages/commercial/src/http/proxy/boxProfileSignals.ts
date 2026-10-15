@@ -13,10 +13,15 @@
 export type BoxProfileSignal =
   | { kind: "rate_limit"; status: "allowed" | "allowed_warning" | "rejected" | "other";
       /** Highest utilization over the reported windows, 0..1+ (null: not reported). */
-      utilization: number | null; resetsAtMs: number | null }
+      utilization: number | null; resetsAtMs: number | null;
+      /** OCV5-424: each reported window as is (admin 5-hour / weekly view). */
+      windows?: BoxQuotaWindows }
   | { kind: "login_required" }
   /** Set by the Box-side guard, not read from a stream: the login no longer meets the safety checks. */
   | { kind: "profile_unsafe" };
+
+export interface BoxQuotaWindow { utilization: number; resetsAtMs: number | null }
+export interface BoxQuotaWindows { fiveHour?: BoxQuotaWindow; sevenDay?: BoxQuotaWindow }
 
 function num(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -41,11 +46,16 @@ function parseLine(line: string): BoxProfileSignal | null {
     let utilization = num(body.utilization);
     let resetsAt = num(body.resetsAt);
     const windows = body.unifiedWindows;
+    const kept: BoxQuotaWindows = {};
     if (windows && typeof windows === "object") {
-      for (const value of Object.values(windows as Record<string, unknown>)) {
+      for (const [name, value] of Object.entries(windows as Record<string, unknown>)) {
         if (!value || typeof value !== "object") continue;
         const window = value as { utilization?: unknown; resetsAt?: unknown };
         const used = num(window.utilization);
+        if (used !== null && (name === "five_hour" || name === "seven_day")) {
+          const at = num(window.resetsAt);
+          kept[name === "five_hour" ? "fiveHour" : "sevenDay"] = { utilization: used, resetsAtMs: at === null ? null : Math.round(at * 1000) };
+        }
         if (used !== null && (utilization === null || used > utilization)) {
           utilization = used;
           // The binding window's reset is the one that matters for a rejection.
@@ -54,7 +64,8 @@ function parseLine(line: string): BoxProfileSignal | null {
       }
     }
     return { kind: "rate_limit", status, utilization,
-      resetsAtMs: resetsAt === null ? null : Math.round(resetsAt * 1000) };
+      resetsAtMs: resetsAt === null ? null : Math.round(resetsAt * 1000),
+      ...(kept.fiveHour || kept.sevenDay ? { windows: kept } : {}) };
   }
   if (top.type === "assistant" && top.message && typeof top.message === "object") {
     const message = top.message as { model?: unknown; content?: unknown };

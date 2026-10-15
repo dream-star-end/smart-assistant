@@ -26,4 +26,5 @@ packages/commercial/src/http/proxy/boxParallelAdmission.integ.test.ts
 packages/commercial/src/__tests__/migration0303BoxClaudeProfiles.integ.test.ts
 packages/commercial/src/__tests__/poolPolicy0306.integ.test.ts
 packages/commercial/src/__tests__/poolUserAffinity0308.integ.test.ts
+packages/commercial/src/__tests__/migration0309BoxProfileQuotaWindows.integ.test.ts
 packages/commercial/src/__tests__/migration0304BillingWorkload.integ.test.ts

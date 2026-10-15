@@ -63,13 +63,13 @@ function keyConfiguredMap(): Record<string, boolean> {
 // /internal/v5/egress-stats 拉取(地址用与 egress bind **同一推导函数**,不猜 env)。
 // egress split 未开或拉取失败 → fail-soft 回落本进程快照并标注 source。
 
-interface StatsResult {
+export interface StatsResult {
   by_model: InflightSnapshot["by_model"];
   source: "egress" | "local" | "local_fallback";
   started_at: string;
 }
 
-async function fetchInflightStats(): Promise<StatsResult> {
+export async function fetchInflightStats(): Promise<StatsResult> {
   const local = (source: StatsResult["source"]): StatsResult => {
     const snap = snapshotInflight();
     return { by_model: snap.by_model, source, started_at: snap.started_at };

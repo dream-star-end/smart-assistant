@@ -16,6 +16,7 @@ import { API_KEY_SERVICE_RE, setApiKeyAdminStatus, upsertApiKey } from "../../ac
 import { DEFAULT_POLICY } from "../../account-pool/policy/decide.js";
 import { listPoolAdapters, type PoolMemberView } from "../../account-pool/policy/registry.js";
 import { affinityCounts } from "../../account-pool/policy/affinity.js";
+import { collectBoxClaude } from "./boxClaudePool.js";
 import { STATIC_PROVIDER_META } from "../proxy/staticProviderMeta.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
 import { HttpError, readJsonBody, sendJson } from "../util.js";
@@ -100,7 +101,8 @@ export async function handleAdminPoolsList(
   deps: CommercialHttpDeps,
 ): Promise<void> {
   await requireAdmin(req, deps.jwtSecret);
-  sendJson(res, 200, { pools: await collectPools(), policy: policySummary() });
+  const [pools, boxClaude] = await Promise.all([collectPools(), collectBoxClaude().catch(() => null)]);
+  sendJson(res, 200, { pools, policy: policySummary(), box_claude: boxClaude });
 }
 
 export async function handleAdminPoolKeyCreate(
