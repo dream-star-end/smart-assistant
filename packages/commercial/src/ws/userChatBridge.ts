@@ -1265,6 +1265,8 @@ export interface UserChatBridgeDeps {
   }>;
   /** Drop a minted Antigravity relay token after the turn settles or aborts. */
   expireAntigravityRoute?: (token: string) => void | Promise<void>;
+  /** Expire a turn's relay route by requestId (any bridge; see the terminal-frame branch). */
+  expireAntigravityRouteForRequest?: (requestId: string) => void | Promise<void>;
   /**
    * Trusted UUID of the compute host running this bridge. Cursor credentials
    * are mounted only by that host's local supervisor, so Cursor dispatch must
@@ -8082,6 +8084,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 void Promise.resolve(deps.expireAntigravityRoute?.(relay.token)).catch(() => {});
                 pendingAntigravityRelays.delete(requestId);
               }
+              // A reconnected bridge never saw the token: expire by requestId too.
+              void Promise.resolve(deps.expireAntigravityRouteForRequest?.(requestId)).catch(() => {});
               // Claimed from the durable turn row, so a reconnected bridge
               // settles too; usage comes from the relay's rows (a replayed
               // frame cannot inflate it) and usage_records(user_id, request_id)
@@ -10312,12 +10316,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
         pendingZcodeRelays.clear();
       }
-      if (pendingAntigravityRelays.size > 0) {
-        for (const relay of pendingAntigravityRelays.values()) {
-          void Promise.resolve(deps.expireAntigravityRoute?.(relay.token)).catch(() => {});
-        }
-        pendingAntigravityRelays.clear();
-      }
+      // Antigravity routes are NOT expired here (OCV5-415): the container keeps running the
+      // turn across browser reconnects, and expiring on close made every later CLI call 404
+      // ROUTE_EXPIRED (live 2026-10-15). The terminal frame expires the route by requestId on
+      // whichever bridge receives it; a turn that never ends falls back to the route TTL.
+      pendingAntigravityRelays.clear();
       for (const dispatchId of [...cronOriginClaimWaiters.keys()]) {
         settleCronOriginClaim(dispatchId, { kind: "delivery_unknown" });
       }

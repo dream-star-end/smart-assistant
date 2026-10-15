@@ -59,7 +59,13 @@ import { REQUEST_ID_HEADER, ensureRequestId, setSecurityHeaders } from './util.j
 export { ANTIGRAVITY_RELAY_PREFIX }
 /** `CLOUD_CODE_URL` upstream that serves this OAuth client (cloudcode-pa 429s it). */
 export const ANTIGRAVITY_UPSTREAM_BASE_URL = 'https://daily-cloudcode-pa.googleapis.com'
-const GENERATE_METHODS = new Set(['streamGenerateContent'])
+/**
+ * Metered model calls. `generateContent` (non-streaming JSON) is the CLI's `search_web` tool:
+ * gemini-3.5-flash-lite with Google Search grounding, requestType `web_search` (OCV5-415,
+ * captured 2026-10-15; refusing it surfaced as "405 Method Not Allowed" in the search step).
+ */
+const GENERATE_METHODS = new Set(['streamGenerateContent', 'generateContent'])
+const STREAMING_GENERATE = 'streamGenerateContent'
 /** Every `/v1internal:*` method the pinned 1.3.4 CLI calls (probe 2026-10-14). */
 const METADATA_METHODS = new Set([
   'loadCodeAssist',
@@ -175,10 +181,22 @@ function count(value: unknown): number {
  */
 export class AntigravityUsageTap {
   private pending = ''
+  private truncated = false
   usage: { prompt: number; candidates: number; thoughts: number; cached: number } | null = null
+
+  /** `sse` for streamGenerateContent, `json` for one generateContent response body. */
+  constructor(private readonly mode: 'sse' | 'json' = 'sse') {}
 
   push(chunk: Buffer | string): void {
     this.pending += typeof chunk === 'string' ? chunk : chunk.toString('utf8')
+    if (this.mode === 'json') {
+      // Keep the tail: usageMetadata is the last field of the response.
+      if (this.pending.length > 16 * 1024 * 1024) {
+        this.pending = this.pending.slice(-1024 * 1024)
+        this.truncated = true
+      }
+      return
+    }
     let nl: number
     while ((nl = this.pending.indexOf('\n')) >= 0) {
       const line = this.pending.slice(0, nl).trim()
@@ -189,13 +207,28 @@ export class AntigravityUsageTap {
   }
 
   end(): void {
+    if (this.mode === 'json') {
+      const body = this.pending.trim()
+      this.pending = ''
+      if (!this.truncated) {
+        this.scanPayload(body)
+        if (this.usage) return
+      }
+      const all = [...body.matchAll(/"usageMetadata"\s*:\s*(\{[^{}]*\})/g)]
+      const last = all.at(-1)?.[1]
+      if (last) this.scanPayload(`{"usageMetadata":${last}}`)
+      return
+    }
     this.scanLine(this.pending.trim())
     this.pending = ''
   }
 
   private scanLine(line: string): void {
     if (!line.startsWith('data:')) return
-    const payload = line.slice(5).trim()
+    this.scanPayload(line.slice(5).trim())
+  }
+
+  private scanPayload(payload: string): void {
     if (!payload.includes('usageMetadata')) return
     let parsed: unknown
     try {
@@ -347,7 +380,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       error(res, 405, 'METHOD_NOT_ALLOWED', requestId)
       return
     }
-    if (generate ? parsed.search !== '?alt=sse' : parsed.search !== '') {
+    if (rpc === STREAMING_GENERATE ? parsed.search !== '?alt=sse' : parsed.search !== '') {
       error(res, 400, 'QUERY_NOT_ALLOWED', requestId)
       return
     }
@@ -518,7 +551,9 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
           res.setHeader(rawKey, Array.isArray(rawValue) ? rawValue : String(rawValue))
         }
       }
-      const tap = generate ? new AntigravityUsageTap() : null
+      const tap = generate
+        ? new AntigravityUsageTap(rpc === STREAMING_GENERATE ? 'sse' : 'json')
+        : null
       for await (const chunk of upstream.body) {
         tap?.push(chunk as Buffer)
         if (!res.write(chunk)) await new Promise<void>((resolve) => res.once('drain', resolve))

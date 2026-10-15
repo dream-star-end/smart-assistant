@@ -47,6 +47,11 @@ function tokenKey(token: string): string {
   return `${KV_PREFIX}${createHash('sha256').update(token, 'utf8').digest('hex')}`
 }
 
+/** requestId → token key, so whichever bridge sees the terminal frame can expire the route. */
+function requestKey(requestId: string): string {
+  return `${KV_PREFIX}req:${requestId}`
+}
+
 function serialize(row: AntigravityRelayRoute): string {
   return JSON.stringify({
     containerId: row.containerId,
@@ -127,7 +132,9 @@ export async function mintAntigravityRelayRoute(args: {
     expiresAt: now + ttl,
   }
   if (kv) {
-    await kv.set(tokenKey(token), serialize(row), Math.max(1, Math.ceil(ttl / 1000)))
+    const ttlSec = Math.max(1, Math.ceil(ttl / 1000))
+    await kv.set(tokenKey(token), serialize(row), ttlSec)
+    await kv.set(requestKey(args.requestId), tokenKey(token), ttlSec)
   } else {
     routes.set(token, row)
   }
@@ -169,6 +176,22 @@ export async function expireAntigravityRelayRoute(token: string): Promise<void> 
     return
   }
   routes.delete(token)
+}
+
+/**
+ * Expire the route of one turn by its requestId (OCV5-415). The turn's terminal frame may reach
+ * a reconnected bridge that never saw the token; a closed bridge no longer expires routes,
+ * because the container keeps running the turn across browser reconnects.
+ */
+export async function expireAntigravityRelayRouteForRequest(requestId: string): Promise<void> {
+  if (!REQUEST_ID_RE.test(requestId)) return
+  if (kv) {
+    const key = await kv.get(requestKey(requestId))
+    if (key?.startsWith(KV_PREFIX) && !key.startsWith(`${KV_PREFIX}req:`)) await kv.del(key)
+    await kv.del(requestKey(requestId))
+    return
+  }
+  for (const [token, row] of routes) if (row.requestId === requestId) routes.delete(token)
 }
 
 export function _resetAntigravityRelayRoutesForTests(): void {
