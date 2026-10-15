@@ -20,9 +20,19 @@ const PEER_ID = 'wsess-prestart0001'
 const PEER = { id: PEER_ID, kind: 'dm' as const }
 const CMID = 'm-prestart-abc1'
 
-function makeGateway(): { gateway: any; fences: string[]; ttls: Array<number | undefined>; cleared: string[]; interrupts: string[] } {
+function makeGateway(): {
+  gateway: any
+  fences: string[]
+  ttls: Array<number | undefined>
+  attempts: Array<number | undefined>
+  adopted: Array<[string, number | undefined]>
+  cleared: string[]
+  interrupts: string[]
+} {
   const fences: string[] = []
   const ttls: Array<number | undefined> = []
+  const attempts: Array<number | undefined> = []
+  const adopted: Array<[string, number | undefined]> = []
   const cleared: string[] = []
   const interrupts: string[] = []
   const gateway = Object.create(Gateway.prototype) as any
@@ -36,24 +46,27 @@ function makeGateway(): { gateway: any; fences: string[]; ttls: Array<number | u
       interrupts.push(key)
       return false
     },
-    fencePreStartStop: (peerId: string, cmid: string, ttlMs?: number) => {
+    fencePreStartStop: (peerId: string, cmid: string, ttlMs?: number, sendAttempt?: number) => {
       fences.push(preStartStopKey(peerId, cmid))
       ttls.push(ttlMs)
+      attempts.push(sendAttempt)
     },
+    adoptPreStartStopOnAdmission: (peerId: string, cmid: string, sendAttempt?: number) =>
+      adopted.push([preStartStopKey(peerId, cmid), sendAttempt]),
     clearPreStartStop: (peerId: string, cmid: string) => cleared.push(preStartStopKey(peerId, cmid)),
   }
   gateway._interruptDelegationsForParent = () => false
-  return { gateway, fences, ttls, cleared, interrupts }
+  return { gateway, fences, ttls, attempts, adopted, cleared, interrupts }
 }
 
-function stopFrame() {
-  return { type: 'inbound.control.stop' as const, channel: 'webchat', peer: PEER, clientMessageId: CMID }
+function stopFrame(controlId = `control:stop:${CMID}`) {
+  return { type: 'inbound.control.stop' as const, channel: 'webchat', peer: PEER, clientMessageId: CMID, controlId }
 }
 
 function messageFrame() {
   return {
     type: 'inbound.message' as const,
-    idempotencyKey: CMID,
+    idempotencyKey: `web:${CMID}:0`,
     channel: 'webchat',
     peer: PEER,
     agentId: 'main',
@@ -79,11 +92,27 @@ describe('handleStop before the engine run exists (OCV5-435)', () => {
   })
 
   it('a Stop that overtook its message answers not-active but arms a short fence', async () => {
-    const { gateway, fences, ttls, interrupts } = makeGateway()
+    const { gateway, fences, ttls, attempts, interrupts } = makeGateway()
     assert.equal(await gateway.handleStop(stopFrame()), false)
-    assert.deepEqual(fences, [preStartStopKey(PEER_ID, CMID)])
-    assert.deepEqual(ttls, [PRE_ADMISSION_STOP_TTL_MS])
+    assert.equal(await gateway.handleStop(stopFrame(`control:stop:${CMID}:attempt:2`)), false)
+    assert.equal(await gateway.handleStop(stopFrame('control:stop:h1x2y3')), false)
+    assert.deepEqual(fences, Array(3).fill(preStartStopKey(PEER_ID, CMID)))
+    assert.deepEqual(ttls, Array(3).fill(PRE_ADMISSION_STOP_TTL_MS))
+    assert.deepEqual(attempts, [0, 2, undefined], 'the fence names the send attempt the Stop was for')
     assert.deepEqual(interrupts, [], 'an exact Stop never falls back to a peer-wide interrupt')
+  })
+
+  it('admission hands the message send attempt to any fence armed before it', async () => {
+    const { gateway, adopted } = makeGateway()
+    gateway.dispatchInbound = async () => {}
+    await gateway._dispatchAdmittedClientTurn(messageFrame())
+    await gateway._dispatchAdmittedClientTurn({ ...messageFrame(), idempotencyKey: `web:${CMID}:3` })
+    await gateway._dispatchAdmittedClientTurn({ ...messageFrame(), idempotencyKey: 'opaque' })
+    assert.deepEqual(adopted, [
+      [preStartStopKey(PEER_ID, CMID), 0],
+      [preStartStopKey(PEER_ID, CMID), 3],
+      [preStartStopKey(PEER_ID, CMID), undefined],
+    ])
   })
 
   it('forgets the admitted turn and any unused fence once dispatch settles', async () => {

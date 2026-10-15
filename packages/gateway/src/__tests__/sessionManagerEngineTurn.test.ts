@@ -22,6 +22,8 @@ import {
   MODEL_THINKING_KEEPALIVE_MS,
   MODEL_THINKING_WORKING_DETAIL,
   isNativeEngineTransientContinuationSafe,
+  messageSendAttempt,
+  stopControlSendAttempt,
   type AgentSession,
 } from "../sessionManager.js";
 import { CcbAdapter } from "../engine/ccbAdapter.js";
@@ -2108,6 +2110,55 @@ describe("crash/interrupt partial persistence", () => {
     } finally {
       setV3MasterSinkSingleton(null);
     }
+  });
+
+  test("OCV5-435: admission of the same send keeps an overtaking Stop armed however long the run takes", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const { runner, interruptCalls, bind } = makeStoppableRunner();
+      const session = makeWebchatSession(sm, runner, "m-prestart-0005");
+      bind(session);
+      sm.fencePreStartStop(session.peerId, "m-prestart-0005", 30, 0);
+      sm.adoptPreStartStopOnAdmission(session.peerId, "m-prestart-0005", 0);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      await runOneTurnFor(sm, session, [], "m-prestart-0005");
+      await sm.awaitPendingPersistence();
+      assert.equal(interruptCalls(), 1, "the short fence became an admitted-turn fence");
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("OCV5-435: an overtaking Stop for one send attempt does not stop a resend of the same message", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const { runner, interruptCalls, bind } = makeStoppableRunner();
+      const session = makeWebchatSession(sm, runner, "m-prestart-0006");
+      bind(session);
+      sm.fencePreStartStop(session.peerId, "m-prestart-0006", 30_000, 0);
+      sm.adoptPreStartStopOnAdmission(session.peerId, "m-prestart-0006", 1);
+      await runOneTurnFor(sm, session, [], "m-prestart-0006");
+      await sm.awaitPendingPersistence();
+      assert.equal(interruptCalls(), 0);
+    } finally {
+      setV3MasterSinkSingleton(null);
+    }
+  });
+
+  test("OCV5-435: send attempts are read from the browser's Stop control id and message idempotency key", () => {
+    assert.equal(stopControlSendAttempt("control:stop:m-a1", "m-a1"), 0);
+    assert.equal(stopControlSendAttempt("control:stop:m-a1:attempt:4", "m-a1"), 4);
+    assert.equal(stopControlSendAttempt("control:stop:m-a1:recovery-fence", "m-a1"), undefined);
+    assert.equal(stopControlSendAttempt("control:stop:hq1w2e3", "m-a1"), undefined);
+    assert.equal(stopControlSendAttempt(undefined, "m-a1"), undefined);
+    assert.equal(messageSendAttempt("web:m-a1:0", "m-a1"), 0);
+    assert.equal(messageSendAttempt("web:m-a1:7", "m-a1"), 7);
+    assert.equal(messageSendAttempt("web:m-b2:7", "m-a1"), undefined);
+    assert.equal(messageSendAttempt("hk3j4", "m-a1"), undefined);
   });
 
   test("OCV5-435: an exact Stop before terminal persistence exists arms the pre-start fence", async () => {

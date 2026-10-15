@@ -1370,6 +1370,28 @@ export const PRE_START_STOP_TTL_MS = 10 * 60_000
  * behind, and a stale Stop must not outlive a retry of the same message. */
 export const PRE_ADMISSION_STOP_TTL_MS = 30_000
 
+/** Send attempt named by a browser Stop control id (`control:stop:<cmid>` is
+ * attempt 0, `control:stop:<cmid>:attempt:<n>` attempt n); undefined when the
+ * id is hashed or names no attempt. */
+export function stopControlSendAttempt(controlId: unknown, clientMessageId: string): number | undefined {
+  if (typeof controlId !== 'string') return undefined
+  const base = `control:stop:${clientMessageId}`
+  if (controlId === base) return 0
+  const match = controlId.startsWith(`${base}:attempt:`)
+    ? /^(\d{1,9})$/.exec(controlId.slice(base.length + ':attempt:'.length))
+    : null
+  return match ? Number(match[1]) : undefined
+}
+
+/** Send attempt named by a browser message idempotency key (`web:<cmid>:<n>`). */
+export function messageSendAttempt(idempotencyKey: unknown, clientMessageId: string): number | undefined {
+  if (typeof idempotencyKey !== 'string') return undefined
+  const prefix = `web:${clientMessageId}:`
+  if (!idempotencyKey.startsWith(prefix)) return undefined
+  const match = /^(\d{1,9})$/.exec(idempotencyKey.slice(prefix.length))
+  return match ? Number(match[1]) : undefined
+}
+
 /** Exact browser-turn identity for a pre-start Stop (peer id sanitized like sessionKey). */
 export function preStartStopKey(peerId: string, clientMessageId: string): string {
   return `${peerId.replace(/[^a-zA-Z0-9_-]/g, '_')}\u0000${clientMessageId}`
@@ -2200,7 +2222,7 @@ export class SessionManager {
   private _promptQueueExecutionKeys = new Set<string>()
   /** OCV5-435 — Stops for an accepted browser turn whose engine run did not
    * exist yet (preStartStopKey → expiry). Consumed when that run is created. */
-  private _preStartStops = new Map<string, number>()
+  private _preStartStops = new Map<string, { expiresAt: number; sendAttempt?: number }>()
   /** Accepted grants need a fence before getOrCreate() and attachment
    * preprocessing. The token lets that one queue dispatch adopt/replace its
    * own session while every legacy or second dispatch fails closed. */
@@ -8624,12 +8646,36 @@ export class SessionManager {
     peerId: string,
     clientMessageId: string,
     ttlMs: number = PRE_START_STOP_TTL_MS,
+    sendAttempt?: number,
   ): void {
     const now = Date.now()
-    for (const [key, expiresAt] of this._preStartStops) {
-      if (expiresAt <= now) this._preStartStops.delete(key)
+    for (const [key, fence] of this._preStartStops) {
+      if (fence.expiresAt <= now) this._preStartStops.delete(key)
     }
-    this._preStartStops.set(preStartStopKey(peerId, clientMessageId), now + ttlMs)
+    this._preStartStops.set(preStartStopKey(peerId, clientMessageId), {
+      expiresAt: now + ttlMs,
+      ...(sendAttempt !== undefined ? { sendAttempt } : {}),
+    })
+  }
+
+  /** A message was just admitted. A fence armed before it arrived either
+   * belongs to this send (it then lives as long as an admitted turn's fence,
+   * however long the run takes to start) or to another send attempt of the
+   * same message (a resend after a Stop the gateway never saw the original
+   * for), which it must not stop. Unknown attempts on either side keep it. */
+  adoptPreStartStopOnAdmission(peerId: string, clientMessageId: string, sendAttempt?: number): void {
+    const key = preStartStopKey(peerId, clientMessageId)
+    const fence = this._preStartStops.get(key)
+    if (!fence) return
+    if (fence.expiresAt <= Date.now()) {
+      this._preStartStops.delete(key)
+      return
+    }
+    if (fence.sendAttempt !== undefined && sendAttempt !== undefined && fence.sendAttempt !== sendAttempt) {
+      this._preStartStops.delete(key)
+      return
+    }
+    fence.expiresAt = Date.now() + PRE_START_STOP_TTL_MS
   }
 
   /** Drop a fence whose turn ended without ever creating an engine run. */
@@ -8639,10 +8685,10 @@ export class SessionManager {
 
   private _takePreStartStop(peerId: string, clientMessageId: string): boolean {
     const key = preStartStopKey(peerId, clientMessageId)
-    const expiresAt = this._preStartStops.get(key)
-    if (expiresAt === undefined) return false
+    const fence = this._preStartStops.get(key)
+    if (fence === undefined) return false
     this._preStartStops.delete(key)
-    return expiresAt > Date.now()
+    return fence.expiresAt > Date.now()
   }
 
   getByKey(sessionKey: string): AgentSession | undefined {

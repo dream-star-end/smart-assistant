@@ -550,7 +550,9 @@ import {
   parseVerificationVerdict,
   persistInterruptedPromptQueueTurn,
   PRE_ADMISSION_STOP_TTL_MS,
+  messageSendAttempt,
   preStartStopKey,
+  stopControlSendAttempt,
   type PromptQueueExternalTurnReservation,
 } from './sessionManager.js'
 import { WebhookRouter } from './webhooks.js'
@@ -18186,6 +18188,11 @@ export class Gateway {
     const key = preStartStopKey(frame.peer.id, clientMessageId)
     const admitted = (this._admittedClientTurns ??= new Map())
     admitted.set(key, (admitted.get(key) ?? 0) + 1)
+    this.sessions.adoptPreStartStopOnAdmission(
+      frame.peer.id,
+      clientMessageId,
+      messageSendAttempt((frame as { idempotencyKey?: unknown }).idempotencyKey, clientMessageId),
+    )
     try {
       await this.dispatchInbound(frame)
     } finally {
@@ -18256,10 +18263,16 @@ export class Gateway {
         return true
       }
       // Not admitted here yet: the Stop may have overtaken its own message
-      // (Master acks admission before forwarding it). Arm a short fence so
-      // that message stops the moment its run exists; nothing is active now,
-      // so the receipt stays TURN_NOT_ACTIVE.
-      this.sessions.fencePreStartStop(frame.peer.id, clientMessageId, PRE_ADMISSION_STOP_TTL_MS)
+      // (Master acks admission before forwarding it). Arm a short fence for
+      // that send attempt; admission of the same attempt extends it, another
+      // attempt drops it. Nothing is active now, so the receipt stays
+      // TURN_NOT_ACTIVE.
+      this.sessions.fencePreStartStop(
+        frame.peer.id,
+        clientMessageId,
+        PRE_ADMISSION_STOP_TTL_MS,
+        stopControlSendAttempt((frame as { controlId?: unknown }).controlId, clientMessageId),
+      )
       this.log.info('interrupt', {
         sessionKey: `*${suffix}`,
         clientMessageId,
