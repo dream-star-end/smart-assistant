@@ -20,6 +20,10 @@ import {
   ruleAccountPoolNotConfigured,
   ruleAccountPoolAllDown,
   ruleAccountPoolLowCapacity,
+  evaluateServicePool,
+  runServicePoolRules,
+  servicePoolRuleId,
+  type RunRulesResult,
   ruleSignupSpike,
   ruleRateLimitSpike,
   ruleLoginFailureSpike,
@@ -268,6 +272,65 @@ describe("ruleLoginFailureSpike", () => {
     assert.equal(ruleLoginFailureSpike.evaluate(s).firing, false);
     const s2 = baseSnapshot({ loginFailureBlockedLastWindowMin: 30 });
     assert.equal(ruleLoginFailureSpike.evaluate(s2).firing, true);
+  });
+});
+
+describe("service pool rules (OCV5-424)", () => {
+  const snap = (servicePools: RuleSnapshot["servicePools"]) => ({ servicePools } as unknown as RuleSnapshot);
+  const harness = (firing: string[] = []) => {
+    const state = new Map<string, boolean>(firing.map((id) => [id, true]));
+    const sent: Array<{ id: string; title: string }> = [];
+    return {
+      sent, state,
+      deps: {
+        transition: (async (id: string, f: boolean) => {
+          const prev = state.get(id) ?? false;
+          state.set(id, f);
+          return { transitioned: prev !== f, previous: prev };
+        }) as never,
+        enqueue: (async (e: { title: string }, id?: string) => { sent.push({ id: id!, title: e.title }); return {} as never; }) as never,
+        firingIds: async () => [...state].filter(([, f]) => f).map(([id]) => id),
+      },
+    };
+  };
+  const result = () => ({ evaluated: [], firings: [], resolutions: [], errors: [] }) as RunRulesResult;
+
+  test("each service fires on its own: a second pool going down while the first is firing still alerts", async () => {
+    const h = harness();
+    await runServicePoolRules(snap([{ service: "gemini", eligible: 2, active: 0, reasons: ["auth"] }]), result(), h.deps);
+    const r = result();
+    await runServicePoolRules(snap([
+      { service: "gemini", eligible: 2, active: 0, reasons: ["auth"] },
+      { service: "codex", eligible: 1, active: 0, reasons: ["quota"] },
+    ]), r, h.deps);
+    assert.deepEqual(r.firings, [servicePoolRuleId("codex")]);
+    assert.deepEqual(h.sent.map((x) => x.id), [servicePoolRuleId("gemini"), servicePoolRuleId("codex")]);
+    assert.match(h.sent[0]!.title, /gemini/);
+  });
+
+  test("an unknown snapshot changes nothing (no false recovery)", async () => {
+    const h = harness([servicePoolRuleId("gemini")]);
+    const r = result();
+    await runServicePoolRules(snap(undefined), r, h.deps);
+    assert.deepEqual(r.resolutions, []);
+    assert.equal(h.state.get(servicePoolRuleId("gemini")), true);
+  });
+
+  test("admin-disabled-only pools never fire; a recovered or vanished pool resolves", async () => {
+    const h = harness([servicePoolRuleId("gemini"), servicePoolRuleId("minimax")]);
+    const r = result();
+    await runServicePoolRules(snap([
+      { service: "claude", eligible: 0, active: 0, reasons: [] },
+      { service: "gemini", eligible: 2, active: 1, reasons: ["auth"] },
+    ]), r, h.deps);
+    assert.deepEqual(r.firings, []);
+    assert.deepEqual(r.resolutions.sort(), [servicePoolRuleId("gemini"), servicePoolRuleId("minimax")].sort());
+  });
+
+  test("the alert text names the reasons", () => {
+    const out = evaluateServicePool({ service: "gemini", eligible: 2, active: 0, reasons: ["auth"] });
+    assert.equal(out.firing, true);
+    if (out.firing) assert.match(out.body, /2 个成员全部不可用\(认证失效/);
   });
 });
 
