@@ -13,6 +13,12 @@ import { directEgressDispatcher } from './egressDispatcher.js'
 
 export const ANTIGRAVITY_QUOTA_BASE_URL = 'https://daily-cloudcode-pa.googleapis.com'
 export const ANTIGRAVITY_QUOTA_TTL_MS = 10 * 60 * 1000
+/**
+ * Google only returns the current tier and project to the Antigravity client:
+ * without this user-agent loadCodeAssist answers allowedTiers/ineligibleTiers
+ * only (no project), so the quota call cannot be made. Matches the pinned CLI.
+ */
+export const ANTIGRAVITY_QUOTA_USER_AGENT = 'antigravity/1.3.4'
 const TIMEOUT_MS = 8_000
 
 export interface QuotaWindow {
@@ -88,7 +94,7 @@ async function defaultPost(path: string, token: string, body: unknown): Promise<
   const res = await request(`${ANTIGRAVITY_QUOTA_BASE_URL}${path}`, {
     method: 'POST',
     dispatcher: directEgressDispatcher(),
-    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'user-agent': ANTIGRAVITY_QUOTA_USER_AGENT },
     body: JSON.stringify(body),
     headersTimeout: TIMEOUT_MS,
     bodyTimeout: TIMEOUT_MS,

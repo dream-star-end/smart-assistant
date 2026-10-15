@@ -96,7 +96,10 @@ type AccountsData = {
 };
 
 /** Account-pool services: their subscription accounts are the rows above; the pool adds keys. */
-const ACCOUNT_SERVICES = new Set(["claude", "codex", "grok", "cursor"]);
+// Cursor accounts are the "box" pool on the server (Box runs on them): same rows, one group.
+const ACCOUNT_SERVICES = new Set(["claude", "codex", "grok", "cursor", "box"]);
+/** Pool service holding an account section's extra members. */
+const POOL_SERVICE_OF: Record<string, string> = { cursor: "box" };
 
 /** The non-account members (API keys, relay keys) of an account-pool service. */
 function keyMembersOf(pools: PoolsResponse | null, service: string): PoolView | null {
@@ -519,14 +522,14 @@ export default function AccountsPage() {
                   emptyTitle={`${section.title} 暂无订阅账号`}
                 />
                 {(() => {
-                  const keys = keyMembersOf(pools, section.id);
+                  const keys = keyMembersOf(pools, POOL_SERVICE_OF[section.id] ?? section.id);
                   return keys ? (
                     <PoolSection
                       pool={keys}
                       loading={loading && !data}
                       onAdd={(svc) => setAddKeyFor(svc)}
                       onToggle={togglePoolMember}
-                      title={section.id === "codex" ? "中转 key" : "API key"}
+                      title={section.id === "codex" ? "中转 key" : section.id === "cursor" ? "Box 内的 Claude 登录" : "API key"}
                       bare
                     />
                   ) : null;

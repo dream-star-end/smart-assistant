@@ -30,7 +30,11 @@ export function accountQuota(a: AccountRow, now = Date.now()): MemberQuota {
       return {
         windows: [],
         updatedAt: a.grok_usage_updated_at ?? null,
-        note: a.grok_usage_error ? `读取失败:${a.grok_usage_error}` : "每小时从 xAI 读取,尚无数据",
+        note: a.grok_usage_error
+          ? `读取失败:${a.grok_usage_error}`
+          : a.status !== "active" && a.status !== "cooldown"
+            ? "账号未在调度中,不读取额度"
+            : "每小时从 xAI 读取,尚无数据",
       };
     }
     return { windows: [{ label: "每周", usedPct: pct, resetsAt: a.grok_credit_period_end ?? null }], updatedAt: a.grok_usage_updated_at ?? null, note: null };
@@ -43,7 +47,11 @@ export function accountQuota(a: AccountRow, now = Date.now()): MemberQuota {
         updatedAt: a.cursor_usage_updated_at ?? null,
         note: a.cursor_credential_kind !== "session"
           ? "API key 凭证读不到用量(需 Cursor 账号会话凭证)"
-          : a.cursor_usage_error ? `读取失败:${a.cursor_usage_error}` : "每小时从 Cursor 读取,尚无数据",
+          : a.cursor_usage_error
+            ? `读取失败:${a.cursor_usage_error}`
+            : a.status !== "active" && a.status !== "cooldown"
+              ? "账号未在调度中,不读取额度"
+              : "每小时从 Cursor 读取,尚无数据",
       };
     }
     return { windows: [{ label: "Sand 周期", usedPct: pct, resetsAt: a.cursor_sand_next_reset_at ?? null }], updatedAt: a.cursor_usage_updated_at ?? null, note: null };
@@ -79,6 +87,15 @@ export function QuotaWindowsCell({ quota, now = Date.now() }: { quota: MemberQuo
   return (
     <div className="flex min-w-[11rem] flex-col gap-0.5" data-testid="quota-cell">
       {quota.windows.map((w) => {
+        const passed = w.resetsAt !== null && !Number.isNaN(new Date(w.resetsAt).getTime()) && new Date(w.resetsAt).getTime() <= now;
+        if (passed) {
+          // The figure belongs to a window that has already reset: showing it would mislead.
+          return (
+            <span key={w.label} className="whitespace-nowrap text-meta">
+              <span className="text-muted">{w.label}</span> <span className="text-faint">已重置,待下次使用后更新</span>
+            </span>
+          );
+        }
         const tone = w.usedPct === null ? null : toneOf(w.usedPct);
         const pct = w.usedPct === null ? "—" : `${w.usedPct % 1 === 0 ? w.usedPct.toFixed(0) : w.usedPct.toFixed(1)}%`;
         const reset = resetLabel(w.resetsAt, now);

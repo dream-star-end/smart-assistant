@@ -40,6 +40,9 @@ const ROWS = [
   { ...base, id: "26", provider: "codex", label: "codex-main", quota_7d_pct: 21, quota_7d_resets_at: new Date(now + 5 * 86_400_000).toISOString(), quota_updated_at: new Date(now).toISOString() },
   { ...base, id: "27", provider: "codex", label: "codex-idle" },
   { ...base, id: "24", provider: "grok", label: "grok-main", grok_credit_usage_pct: null, grok_usage_error: "http_401" },
+  { ...base, id: "30", provider: "grok", label: "grok-off", status: "disabled", grok_credit_usage_pct: null, grok_usage_error: null },
+  { ...base, id: "31", provider: "claude", label: "claude-old", status: "disabled", quota_5h_pct: 2, quota_5h_resets_at: new Date(now - 86_400_000).toISOString(), quota_7d_pct: 6, quota_7d_resets_at: new Date(now + 86_400_000).toISOString(), quota_updated_at: new Date(now - 30 * 86_400_000).toISOString() },
+  { ...base, id: "25", provider: "cursor", label: "cursor-box", cursor_credential_kind: "session", cursor_sand_usage_pct: 30, cursor_sand_next_reset_at: new Date(now + 2 * 86_400_000).toISOString() },
 ] as unknown as AccountRow[];
 
 function member(over: Partial<PoolMember>): PoolMember {
@@ -61,6 +64,13 @@ const POOLS: PoolsResponse = {
           { label: "Claude/GPT · 每周", usedPct: 26.4, resetsAt: new Date(now + 6 * 86_400_000).toISOString() },
         ] },
       })],
+    },
+    {
+      service: "box", accepts_api_keys: false, counts: { active: 2, cooldown: 0, disabled: 0, total: 2 },
+      members: [
+        member({ service: "box", id: "25", label: "cursor-box" }),
+        member({ service: "box", memberKind: "box_profile", id: "25:account2", label: "account2" }),
+      ],
     },
     { service: "deepseek", accepts_api_keys: true, counts: { active: 1, cooldown: 0, disabled: 0, total: 1 }, members: [member({ service: "deepseek", memberKind: "api_key", credentialType: "api_key", id: "k2", label: "deepseek-env", hints: { key: "…1234", source: "env" } })] },
   ],
@@ -100,7 +110,7 @@ describe("服务池(合并后的一个 tab)", () => {
     renderPage(<ServicePoolsPage />);
     const claude = await section(/Claude Code 订阅账号/);
     expect(within(claude).getByText("claude-main")).toBeTruthy();
-    expect(within(claude).getByText("5 小时")).toBeTruthy();
+    expect(within(claude).getAllByText("5 小时").length).toBeGreaterThan(0);
     expect(within(claude).getByText("已用 23%")).toBeTruthy();
     expect(within(claude).getByText("已用 41%")).toBeTruthy();
     expect(within(claude).getByText(/3h 后重置/)).toBeTruthy();
@@ -141,5 +151,25 @@ describe("服务池(合并后的一个 tab)", () => {
     }
     expect(within(gemini).getByText("eckersonhanner@gmail.com").className).toContain("whitespace-nowrap");
     expect(within(gemini).getByText("订阅账号").className).toContain("whitespace-nowrap");
+  });
+
+  test("Cursor 账号只出现一次(服务端的 box 池即 Cursor 账号),Box 登录列在 Cursor 分段下", async () => {
+    renderPage(<ServicePoolsPage />);
+    await screen.findByText("claude-main");
+    expect(screen.queryByTestId("pool-box")).toBeNull();
+    expect(screen.getAllByText("cursor-box")).toHaveLength(1);
+    const keys = await screen.findByTestId("pool-box-keys");
+    expect(within(keys).getByText("account2")).toBeTruthy();
+    expect(within(keys).getByText(/Box 内的 Claude 登录没有上游额度信号/)).toBeTruthy();
+  });
+
+  test("已重置的窗口不显示旧百分比;未在调度中的账号说明不读取额度", async () => {
+    renderPage(<ServicePoolsPage />);
+    const claude = await section(/Claude Code 订阅账号/);
+    expect(within(claude).getByText("已重置,待下次使用后更新")).toBeTruthy();
+    expect(within(claude).queryByText("已用 2%")).toBeNull();
+    expect(within(claude).getByText("已用 6%")).toBeTruthy();
+    const grok = await section(/Grok Build 订阅账号/);
+    expect(within(grok).getByText("账号未在调度中,不读取额度")).toBeTruthy();
   });
 });
