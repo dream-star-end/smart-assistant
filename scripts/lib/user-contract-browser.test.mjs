@@ -59,3 +59,36 @@ test("cold UI login fails immediately on a non-200 landing page", async () => {
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+test("cold UI login failure names the failed scripts and what the page shows (OCV5-437)",
+  { timeout: 30_000 }, async () => {
+    const server = createServer((req, res) => {
+      if (req.url.startsWith("/assets/reset-")) { req.socket.destroy(); return; }
+      if (req.url.startsWith("/assets/gone-")) { res.writeHead(404); res.end(); return; }
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(`<!doctype html><div id="root"><div>正在加载</div></div>
+        <script src="/assets/reset-a1.js?token=s3cret"></script>
+        <script src="/assets/gone-b2.js"></script>`);
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const base = `http://127.0.0.1:${server.address().port}`;
+    let browser;
+    try {
+      browser = await launchJourneyBrowser();
+      const page = await browser.newPage();
+      const error = await coldUiLogin(page,
+        { base, email: "canary@example.invalid", renderTimeoutMs: 3_000 }, "synthetic")
+        .then(() => null, (e) => e);
+      assert.ok(error, "cold login must fail without a login button");
+      const detail = JSON.parse(error.message.replace(/^Cold login not rendered: /, ""));
+      assert.equal(detail.failedScripts, 2);
+      assert.equal(detail.rootText, "正在加载");
+      assert.ok(detail.scriptFailures.some((s) => /^\/assets\/reset-a1\.js net::ERR_/.test(s)), detail.scriptFailures.join(" | "));
+      assert.ok(detail.scriptFailures.some((s) => /^\/assets\/gone-b2\.js .*HTTP 404/.test(s)), detail.scriptFailures.join(" | "));
+      assert.doesNotMatch(error.message, /s3cret|token=/);
+    } finally {
+      await browser?.close().catch(() => {});
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
