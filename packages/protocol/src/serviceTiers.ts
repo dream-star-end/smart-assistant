@@ -65,6 +65,24 @@ export function supportsFastServiceTier(modelId: string | null | undefined): boo
 export const OPENAI_FAST_SERVICE_TIER = 'priority'
 
 /**
+ * Codex app-server tier ids come from its model catalog (`Model.serviceTiers[].id`), not the UI
+ * name: Fast is `"priority"` (codex-cli 0.159.2; `"fast"` is only the CLI config alias and is
+ * silently ignored by turn/start). `"default"` is explicit standard.
+ */
+export const CODEX_FAST_SERVICE_TIER = 'priority'
+export const CODEX_STANDARD_SERVICE_TIER = 'default'
+
+/**
+ * What the shipped Codex catalog says Fast does per model (codex-cli 0.159.2): GPT-6 Astra and
+ * GPT-6.1 Sol "2x speed, increased usage"; GPT-6 Luna "1.5x speed" (and its catalog default tier
+ * is priority — which is why off must be sent explicitly).
+ */
+export function codexFastHint(modelId: string | null | undefined): '2x' | '1.5x' | null {
+  if (!modelId || !CODEX_FAST_MODELS.has(modelId)) return null
+  return modelId.startsWith('gpt-6-luna') ? '1.5x' : '2x'
+}
+
+/**
  * Billing multiplier composed onto a metered (OpenCode Go) request that ran with Fast:
  * OpenAI's published Fast rates are 2× Standard for GPT-6 Luna and GPT-5.6 Luna.
  * Codex turns are not metered in credits (they spend the ChatGPT plan's limits).
