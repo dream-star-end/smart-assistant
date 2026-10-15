@@ -3110,6 +3110,19 @@ await check("T32 durable error replay：用户 Stop 不上报，历史非尾错�
   }
 });
 
+await check("T71 INC-20261015-LIVE-FENCE-TRIM-REPLAY: a long answer replayed after a cursor reset is shown once", async () => {
+  const result = await page.evaluate(() => window.__replayDrive.runLongAnswerFenceReplay());
+  const expected = "BROWSER_FENCE_ANSWER_START ".length + (result.deltas - 2) + " BROWSER_FENCE_ANSWER_END".length;
+  if (
+    result.firstLength !== expected ||
+    result.replayLength !== expected ||
+    result.startCount !== 1 || result.endCount !== 1 ||
+    result.domStartCount !== 1 || result.domEndCount !== 1
+  ) {
+    throw new Error(`长回答重放后正文重复:${JSON.stringify({ expected, ...result })}`);
+  }
+});
+
 await check("T39 刷新跨容器代际恢复：旧高游标不再吞掉新容器实时内容", async () => {
   const result = await page.evaluate(() => window.__replayDrive.runDurableGenerationReset());
   if (
