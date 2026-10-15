@@ -28,6 +28,13 @@ import {
 } from "../account-pool/policy/affinity.js";
 import { pickAntigravityAccount, reportAntigravityOutcome } from "../account-pool/antigravityPool.js";
 import { invalidateApiKeyPoolCache, selectApiKey, upsertApiKey } from "../account-pool/apiKeyPool.js";
+import { configureAffinitySettings, inflightCount, noteAdmission, releaseInflight } from "../account-pool/policy/affinity.js";
+import { AccountScheduler } from "../account-pool/scheduler.js";
+import { AccountHealthTracker, InMemoryHealthRedis } from "../account-pool/health.js";
+import { createAccount } from "../account-pool/store.js";
+import { insertTestEgressProxy } from "./helpers/accountFixture.js";
+import { boxUserAffinityPick } from "../http/proxy/boxAccountResolver.js";
+import { BOX_PROFILE_POLICY, type BoxProfileCandidate } from "../http/proxy/boxProfileScheduler.js";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ??
@@ -64,7 +71,7 @@ after(async () => {
 
 beforeEach(async () => {
   if (!pgAvailable) return;
-  await query("TRUNCATE TABLE pool_user_affinity, pool_events, gemini_oauth_accounts, pool_api_keys RESTART IDENTITY CASCADE");
+  await query("TRUNCATE TABLE pool_user_affinity, pool_events, gemini_oauth_accounts, pool_api_keys, claude_accounts RESTART IDENTITY CASCADE");
   _resetAffinityTouchForTest();
   _resetAffinityCapsForTest();
   invalidateApiKeyPoolCache();
@@ -172,5 +179,66 @@ describe("pool_user_affinity", () => {
     assert.equal(picks.size, 1, "same key for every session of the user");
     const b = await readAffinity("apikey:deepseek", 3n);
     assert.equal(b?.memberKind, "api_key");
+  });
+});
+
+describe("per-member caps (Codex r1)", () => {
+  test("Antigravity: concurrent admissions reserve atomically; the bound account never exceeds its in-flight cap", async (t) => {
+    if (skipIfNoDb(t)) return;
+    configureAffinitySettings(async () => ({ maxUsersPerSubscription: 8, ratePerMin: 100, antigravityInflight: 3, antigravityRatePerMin: 100 }));
+    for (const email of ["b1@example.com", "b2@example.com"]) {
+      await query(
+        "INSERT INTO gemini_oauth_accounts (label, email, refresh_token_enc, refresh_token_nonce) VALUES ($1, $2, $3, $4)",
+        [email, email, randomBytes(48), randomBytes(12)],
+      );
+    }
+    const bound = await pickAntigravityAccount({ userId: 3n, reserveToken: "warm" });
+    releaseInflight("warm");
+    const picks = await Promise.all(
+      [1, 2, 3, 4].map((i) => pickAntigravityAccount({ userId: 3n, reserveToken: `req-${i}` })),
+    );
+    const onBound = picks.filter((p) => p?.accountId === bound?.accountId).length;
+    assert.equal(onBound, 3, "three turns on the bound account");
+    assert.equal(picks.filter((p) => p?.accountId !== bound?.accountId).length, 1, "the fourth spills");
+    assert.equal(inflightCount("antigravity", bound!.accountId.toString()), 3);
+    assert.equal((await readAffinity("antigravity", 3n))?.memberId, bound!.accountId.toString(), "binding unchanged");
+    for (const i of [1, 2, 3, 4]) releaseInflight(`req-${i}`);
+  });
+
+  test("Claude: a bound account at its per-minute cap spills to an idle one; when all are capped the pick still serves", async (t) => {
+    if (skipIfNoDb(t)) return;
+    configureAffinitySettings(async () => ({ maxUsersPerSubscription: 8, ratePerMin: 2, antigravityInflight: 3, antigravityRatePerMin: 100 }));
+    const a = await createAccount({ runtime_channel: "v3", label: "ra", plan: "pro", token: "TA", egress_proxy_id: await insertTestEgressProxy(KEY) }, keyFn);
+    const b = await createAccount({ runtime_channel: "v3", label: "rb", plan: "pro", token: "TB", egress_proxy_id: await insertTestEgressProxy(KEY) }, keyFn);
+    const s = new AccountScheduler({ health: new AccountHealthTracker({ redis: new InMemoryHealthRedis() }), keyFn });
+    const first = await s.pick({ mode: "agent", provider: "claude", sessionId: "s1", userId: 3n });
+    await s.release({ account_id: first.account_id, slotId: first.slotId, result: { kind: "success" } } as never);
+    const boundId = first.account_id;
+    const other = boundId === a.id ? b.id : a.id;
+    noteAdmission("claude", boundId.toString());
+    const spilled = await s.pick({ mode: "agent", provider: "claude", sessionId: "s2", userId: 3n });
+    assert.equal(spilled.account_id, other, "over the per-minute cap → this request uses the idle account");
+    assert.equal((await readAffinity("claude", 3n))?.memberId, boundId.toString(), "binding unchanged");
+    noteAdmission("claude", other.toString());
+    noteAdmission("claude", other.toString());
+    const any = await s.pick({ mode: "agent", provider: "claude", sessionId: "s3", userId: 3n });
+    assert.ok([a.id, b.id].includes(any.account_id), "everything capped: still served");
+  });
+
+  test("Box: a busy bound login or one outside this request's scope hands back to pickBoxProfile without migrating", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const login = (profile: string, over: Partial<BoxProfileCandidate> = {}): BoxProfileCandidate => ({
+      accountId: 20n, profile, isDefault: profile === "default", weight: 1, utilization: 0.1,
+      cooldownActive: false, loginLoad: 0, boxLoad: 0, ...over,
+    });
+    const first = await boxUserAffinityPick(3n, [login("b")], BOX_PROFILE_POLICY);
+    assert.equal(first?.profile, "b");
+    const busy = await boxUserAffinityPick(3n, [login("b", { loginLoad: BOX_PROFILE_POLICY.loginSpillLoad }), login("default")], BOX_PROFILE_POLICY);
+    assert.equal(busy?.profile ?? null, null, "busy bound login → pickBoxProfile decides");
+    const scoped = await boxUserAffinityPick(3n, [login("default")], BOX_PROFILE_POLICY);
+    assert.equal(scoped, null, "out of scope → spill, not deleted");
+    assert.equal((await readAffinity("box", 3n))?.memberId, "20:b");
+    const ev = await query<{ outcome: string }>("SELECT outcome FROM pool_events WHERE service = 'box'");
+    assert.deepEqual(ev.rows.map((r) => r.outcome), ["affinity_bind"], "no migration recorded");
   });
 });

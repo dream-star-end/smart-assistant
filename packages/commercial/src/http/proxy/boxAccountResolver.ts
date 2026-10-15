@@ -168,9 +168,14 @@ export function readBoxUidProxy(uid: bigint): string {
 }
 
 /** OCV5-424 user affinity over Box logins (account × profile). Best-effort: null → normal pick. */
-async function boxUserAffinityPick(uid: bigint, candidates: readonly BoxProfileCandidate[]): Promise<BoxProfileCandidate | null> {
+export async function boxUserAffinityPick(uid: bigint, candidates: readonly BoxProfileCandidate[],
+  policy: BoxProfilePolicy): Promise<BoxProfileCandidate | null> {
   const key = (c: BoxProfileCandidate) => `${c.accountId}:${c.profile}`;
-  const usable = candidates.filter((c) => !c.cooldownActive && (c.utilization === null || c.utilization < BOX_CHAT_SWITCH_AT));
+  // Same "healthy and roomy" line pickBoxProfile spills on: a busy or hot bound login
+  // hands the choice back to pickBoxProfile instead of overriding its load spill.
+  const usable = candidates.filter((c) => !c.cooldownActive
+    && (c.utilization === null || c.utilization < policy.utilizationCeiling)
+    && c.loginLoad < policy.loginSpillLoad && c.boxLoad < policy.boxSpillLoad);
   if (usable.length === 0) return null;
   try {
     const caps = await affinitySettings();
@@ -180,14 +185,21 @@ async function boxUserAffinityPick(uid: bigint, candidates: readonly BoxProfileC
       candidates: usable.map((c) => ({ memberKind: "box_profile" as const, id: key(c), capacity: c.weight })),
       maxUsers: caps.maxUsersPerSubscription,
       boundState: async (b) => {
+        // Candidates are request-scoped (login scope, model): a bound login missing here is
+        // only out of scope for this request — spill, never treat it as deleted.
         const c = candidates.find((x) => key(x) === b.memberId);
-        if (!c) return { status: null, cooldownReason: null, cooldownUntil: null };
-        // Out of quota (benched on quota or at the switch line) is persistent; other benches are short.
+        if (!c) return { status: "active", cooldownReason: null, cooldownUntil: null };
+        // Out of quota (benched on quota or at the switch line) is persistent; load, health and
+        // other benches are temporary.
         const outOfQuota = c.cooldownQuotaOnly === true || (c.utilization !== null && c.utilization >= BOX_CHAT_SWITCH_AT);
-        return { status: "cooldown", cooldownReason: outOfQuota ? "quota" : null, cooldownUntil: null };
+        return outOfQuota
+          ? { status: "cooldown", cooldownReason: "quota", cooldownUntil: null }
+          : { status: "active", cooldownReason: null, cooldownUntil: null };
       },
     });
-    return resolved ? usable.find((c) => key(c) === resolved.member.id) ?? null : null;
+    // A spill is pickBoxProfile's job (its load/health ranking); only stay/bind/migrate pick here.
+    if (!resolved || resolved.action === "spill") return null;
+    return usable.find((c) => key(c) === resolved.member.id) ?? null;
   } catch {
     return null;
   }
@@ -297,7 +309,7 @@ export class BoxAccountResolver {
       && (c.utilization === null || c.utilization < BOX_CHAT_SWITCH_AT)) : undefined;
     // OCV5-424: a new chat goes to the user's bound login (user affinity across chats);
     // pickBoxProfile stays the fallback when there is no usable binding.
-    const userPick = stay ? null : await boxUserAffinityPick(args.uid, candidates);
+    const userPick = stay ? null : await boxUserAffinityPick(args.uid, candidates, profiles.policy ?? BOX_PROFILE_POLICY);
     const pick = stay ? { candidate: stay, reason: "session" as const }
       : userPick ? { candidate: userPick, reason: "user" as const }
       : pickBoxProfile({ candidates, affinityKey: args.uid.toString(),

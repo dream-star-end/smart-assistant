@@ -7,8 +7,8 @@ import { mintAntigravityRelayRoute } from '../billing/antigravityRouteContext.js
  */
 import { antigravityModelCoolingUntil } from './antigravityModelCooldown.js'
 import { mintAntigravityLimitedToken } from './antigravityOAuth.js'
-import { ANTIGRAVITY_AFFINITY_SERVICE, pickAntigravityAccount, reportAntigravityOutcome } from './antigravityPool.js'
-import { acquireInflight, noteAdmission } from './policy/affinity.js'
+import { pickAntigravityAccount, reportAntigravityOutcome } from './antigravityPool.js'
+import { releaseInflight } from './policy/affinity.js'
 
 export interface AntigravityRouteGrant {
   token: string
@@ -54,6 +54,7 @@ export async function admitAntigravityTurn(
   const coolingUntil = deps.modelCoolingUntil ?? antigravityModelCoolingUntil
   const account = await (deps.pick ?? pickAntigravityAccount)({
     userId: args.userId,
+    reserveToken: args.requestId,
     skip: async (accountId) => {
       // A KV hiccup must not block admission: treat the model as usable.
       const until = await coolingUntil(accountId, args.modelId).catch(() => null)
@@ -75,20 +76,25 @@ export async function admitAntigravityTurn(
       },
     })
   } catch {
+    // Not admitted: give back the in-flight unit the pick reserved for this turn.
+    releaseInflight(args.requestId)
     throw new AntigravityAdmissionError('ANTIGRAVITY_AUTH_UNAVAILABLE')
   }
-  const route = await (deps.mintRoute ?? mintAntigravityRelayRoute)({
-    containerId: args.containerId,
-    userId: args.userId,
-    requestId: args.requestId,
-    modelId: args.modelId,
-    accountId: account.accountId,
-    budgetCredits: args.budgetCredits,
-    relayPort: args.relayPort,
-  })
-  // Per-account caps (OCV5-424): released when the turn settles (settleAntigravityTurnRecord).
-  noteAdmission(ANTIGRAVITY_AFFINITY_SERVICE, account.accountId.toString())
-  acquireInflight(ANTIGRAVITY_AFFINITY_SERVICE, account.accountId.toString(), args.requestId)
+  let route: Awaited<ReturnType<typeof mintAntigravityRelayRoute>>
+  try {
+    route = await (deps.mintRoute ?? mintAntigravityRelayRoute)({
+      containerId: args.containerId,
+      userId: args.userId,
+      requestId: args.requestId,
+      modelId: args.modelId,
+      accountId: account.accountId,
+      budgetCredits: args.budgetCredits,
+      relayPort: args.relayPort,
+    })
+  } catch (err) {
+    releaseInflight(args.requestId)
+    throw err
+  }
   return {
     token: route.token,
     baseUrl: route.baseUrl,

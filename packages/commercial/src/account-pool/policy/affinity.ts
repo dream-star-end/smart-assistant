@@ -386,6 +386,26 @@ export function acquireInflight(service: string, id: string, token: string, now 
   inflightOwner.set(token, k)
 }
 
+/**
+ * Check-and-reserve with no await in between (atomic in this process): reserve a
+ * unit on the first member in `order` under `cap`; when every member is at the
+ * cap, reserve on the first anyway (never refuse service). Also counts the
+ * admission for the per-minute window. Returns the member id reserved.
+ */
+export function reserveInflight(
+  service: string,
+  order: ReadonlyArray<string>,
+  token: string,
+  cap: number,
+  now = Date.now(),
+): string | null {
+  if (order.length === 0) return null
+  const id = order.find((m) => inflightCount(service, m, now) < cap) ?? order[0]
+  acquireInflight(service, id, token, now)
+  noteAdmission(service, id, now)
+  return id
+}
+
 export function releaseInflight(token: string): void {
   const k = inflightOwner.get(token)
   if (!k) return

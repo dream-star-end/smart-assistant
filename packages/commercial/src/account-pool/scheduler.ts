@@ -1113,8 +1113,21 @@ export class AccountScheduler {
     // here (a hit pin returned above), so in-session stickiness is unchanged. The
     // bound account runs through the same WRH loop alone; if it cannot serve, the
     // full pool below decides as before (never a new failure mode).
-    let result: PickResult | null = await this.pickByUserAffinity(provider, input.userId ?? null, wrhPool, wrhKey)
-    if (result === null) result = await this.runWRHLoop(wrhPool, wrhKey)
+    // Affinity candidates come from the whole (group-scoped) pool: the binding
+    // replaces the "accounts this user used before" narrowing, which would
+    // otherwise hide an idle account when the history account is capped.
+    const caps = await affinitySettings().catch(() => null)
+    const underRate = (c: CandidateRow) => caps === null || underRateCap(provider, c.id, caps.ratePerMin)
+    let result: PickResult | null = await this.pickByUserAffinity(provider, input.userId ?? null, pool, wrhKey)
+    if (result === null) {
+      // The per-minute cap also applies to the fallback: prefer accounts under it
+      // (history-narrowed first, then the whole pool); only when every account is
+      // over it does the cap give way (never refuse service).
+      const ratedHistory = wrhPool.filter(underRate)
+      const ratedAll = pool.filter(underRate)
+      const fallback = ratedHistory.length > 0 ? ratedHistory : ratedAll.length > 0 ? ratedAll : wrhPool
+      result = await this.runWRHLoop(fallback, wrhKey)
+    }
     noteAdmission(provider, result.account_id.toString())
 
     // ─────────────────────────────────────────────────────────────────
@@ -1192,14 +1205,14 @@ export class AccountScheduler {
   private async pickByUserAffinity(
     provider: AccountProvider,
     userId: bigint | string | null,
-    wrhPool: CandidateRow[],
+    groupPool: CandidateRow[],
     wrhKey: string,
   ): Promise<PickResult | null> {
     if (userId === null || userId === undefined || String(userId) === '') return null
     try {
       const caps = await affinitySettings()
       const now = this.now()
-      const open = wrhPool.filter(
+      const open = groupPool.filter(
         (c) => (this.slots.get(c.id)?.size ?? 0) < this.maxConcurrent && underRateCap(provider, c.id, caps.ratePerMin),
       )
       if (open.length === 0) return null

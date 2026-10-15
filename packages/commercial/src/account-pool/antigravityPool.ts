@@ -24,6 +24,7 @@ import { GEMINI_OAUTH_MEMBERS, applyTableMemberOutcome } from './policy/tableMem
 import {
   affinitySettings,
   inflightCount,
+  reserveInflight,
   resolveAffinity,
   underRateCap,
   type AffinityAction,
@@ -97,6 +98,13 @@ export async function pickAntigravityAccount(
     pool?: Pick<Pool, 'query'>
     skip?: (accountId: bigint) => Promise<boolean>
     userId?: bigint | null
+    /**
+     * Reserve an in-flight unit for this turn under this token (the requestId) as
+     * part of the pick, with no await between the cap check and the reservation.
+     * The caller releases it with releaseInflight(token) if the turn is not admitted;
+     * settlement releases it otherwise.
+     */
+    reserveToken?: string
   } = {},
 ): Promise<AntigravityAccountPick | null> {
   const res = await (deps.pool ?? getPool()).query<{
@@ -163,12 +171,21 @@ export async function pickAntigravityAccount(
     })
   } catch {
     // Affinity is best-effort: the store failing must not block a turn (legacy order serves).
-    return { accountId: BigInt(candidates[0].id), email: candidates[0].email }
+    resolved = null
   }
-  if (!resolved) return null
-  const picked = resolved
-  const row = candidates.find((r) => r.id === picked.member.id) ?? candidates[0]
-  return { accountId: BigInt(row.id), email: row.email, affinity: picked.action }
+  const preferred = resolved ? candidates.find((r) => r.id === resolved!.member.id) ?? candidates[0] : candidates[0]
+  let row = preferred
+  if (deps.reserveToken) {
+    // Atomic check-and-reserve: a concurrent turn may have filled the preferred
+    // account since the filter above; then this turn spills to the least busy one.
+    const order = [preferred.id, ...candidates.filter((r) => r.id !== preferred.id)
+      .sort((a, b) => inflightCount(ANTIGRAVITY_AFFINITY_SERVICE, a.id) - inflightCount(ANTIGRAVITY_AFFINITY_SERVICE, b.id))
+      .map((r) => r.id)]
+    const id = reserveInflight(ANTIGRAVITY_AFFINITY_SERVICE, order, deps.reserveToken, caps.antigravityInflight)
+    row = candidates.find((r) => r.id === id) ?? preferred
+  }
+  const action: AffinityAction | undefined = resolved ? (row.id === resolved.member.id ? resolved.action : 'spill') : undefined
+  return { accountId: BigInt(row.id), email: row.email, ...(action ? { affinity: action } : {}) }
 }
 
 /** Map an Antigravity outcome to the shared pool outcome (model_unavailable excluded). */
