@@ -9,7 +9,7 @@ import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { performance } from 'node:perf_hooks'
 import WebSocket from 'ws'
-import { assessGoCache, goCachePrompts, parseGoCacheModel } from './lib/user-contract-go-cache.mjs'
+import { GO_CACHE_MODEL, assessGoCache, goCachePrompts } from './lib/user-contract-go-cache.mjs'
 import { tapResult } from './lib/user-contract.mjs'
 
 const GO_CACHE_CASE = 'G1 OpenCode Go prompt cache hits across turns'
@@ -95,7 +95,7 @@ function turn(token, peer, model, cmid, text) {
 }
 
 try {
-  const model = parseGoCacheModel(process.env.V5_GO_CACHE_MODEL)
+  const model = GO_CACHE_MODEL
   const password = readFileSync(passwordFile, 'utf8').trim()
   if (!password) throw new Error('Canary password file is empty')
   // Placeholder token: passes only through the account-level Turnstile allowlist the canary is

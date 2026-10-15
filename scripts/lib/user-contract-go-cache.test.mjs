@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
-import { assessGoCache, goCachePrompts, parseGoCacheModel } from './user-contract-go-cache.mjs'
+import { GO_CACHE_MODEL, assessGoCache, goCachePrompts } from './user-contract-go-cache.mjs'
 
 // Shapes from production usage (OCV5-432): before the fix every Luna request wrote the whole
 // prompt and read nothing; after it, later turns read the earlier prompt.
@@ -58,11 +59,16 @@ test('OCV5-432: a missing row, too few requests or non-numeric usage fail closed
   )
 })
 
-test('OCV5-432: prompts are unique per run and the model id is validated', () => {
+test('OCV5-432: prompts are unique per run and the proven model is fixed', () => {
   const p = goCachePrompts('0123abcd')
   assert.equal(p.length, 3)
   assert.equal(new Set(p).size, 3)
   assert.throws(() => goCachePrompts('bad nonce'))
-  assert.throws(() => parseGoCacheModel('bad model!'))
-  assert.equal(parseGoCacheModel(), 'opencode-gpt-6-luna')
+  assert.equal(GO_CACHE_MODEL, 'opencode-gpt-6-luna')
+})
+
+test('OCV5-432 Codex r1: the release check has no model override', () => {
+  const src = readFileSync(new URL('../v5-go-cache-contract.mjs', import.meta.url), 'utf8')
+  assert.match(src, /const model = GO_CACHE_MODEL\n/)
+  assert.doesNotMatch(src, /process\.env\.V5_GO_CACHE/)
 })

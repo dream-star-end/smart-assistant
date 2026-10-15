@@ -1,16 +1,12 @@
 // OCV5-432: pure policy for the selfhost release's OpenCode Go prompt-cache check.
 // Importing this module never opens a socket or reads secrets.
+// Fixed on purpose (Codex r1): the proof is about this model's cache; no override.
 export const GO_CACHE_MODEL = 'opencode-gpt-6-luna'
 export const GO_CACHE_TURNS = 3
 // Each later turn re-sends the earlier prompt, so with a working cache roughly (n-1)/n of the
 // prompt tokens are cache reads (3 turns ≈ 0.67). The OCV5-432 defect read exactly 0. 0.3
 // still passes when the upstream evicts one entry, never when the prefix is unstable.
 export const GO_CACHE_MIN_RATIO = 0.3
-
-export function parseGoCacheModel(value = GO_CACHE_MODEL) {
-  if (!/^[a-z0-9][a-z0-9._-]{1,80}$/.test(value)) throw new Error('Invalid go-cache contract model')
-  return value
-}
 
 export function goCachePrompts(nonce) {
   if (!/^[a-f0-9]{8,32}$/.test(nonce)) throw new Error('Invalid go-cache nonce')
