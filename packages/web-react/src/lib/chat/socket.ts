@@ -688,6 +688,11 @@ const STREAM_NOTIFY_MAX_MS = 1000;
 /** OCV5-424:tape 提交合成的 turn_completed 领先 live 尾巴时,等真 final 的宽限(实测领先 0.4–1s)。
  *  期满本轮仍在发送态 → 按原 reconcile 语义收口 + 精确 REST 对账(真 final 丢失时的兜底不变)。*/
 export const TAPE_COMMIT_FINAL_GRACE_MS = 5_000;
+/** OCV5-427: frame/block fields a no-op replay delta may carry and still skip a render. */
+const QUIET_REPLAY_FRAME_KEYS: ReadonlySet<string> = new Set([
+  "type", "sessionKey", "channel", "peer", "clientMessageId", "frameSeq", "blocks", "isFinal", "ts",
+]);
+const QUIET_REPLAY_BLOCK_KEYS: ReadonlySet<string> = new Set(["kind", "text", "messageId"]);
 
 /** 流式降频窗口:按最近渲染耗时自适应(纯函数,便于单测)。*/
 export function streamNotifyWindowMs(renderCostMs: number): number {
@@ -2969,7 +2974,13 @@ export class ChatSocket {
    */
   private textReplayProbe(frame: OutboundMessageWire): { unchanged: () => boolean } | null {
     if (frame.isFinal || frame.meta || !Array.isArray(frame.blocks) || frame.blocks.length === 0) return null;
-    if (!frame.blocks.every((block) => block?.kind === "text" || block?.kind === "thinking")) return null;
+    // Only plain top-level row deltas. Sub-agent text (parentToolUseId → childBlocks),
+    // cron pushes or any field this fingerprint does not see always notify.
+    if (!Object.keys(frame).every((key) => QUIET_REPLAY_FRAME_KEYS.has(key))) return null;
+    if (!frame.blocks.every((block) =>
+      (block?.kind === "text" || block?.kind === "thinking") &&
+      Object.keys(block).every((key) => QUIET_REPLAY_BLOCK_KEYS.has(key))
+    )) return null;
     const sess = frame.peer?.id ? this.sessions.get(frame.peer.id) : undefined;
     if (!sess) return null;
     const fingerprint = () => {

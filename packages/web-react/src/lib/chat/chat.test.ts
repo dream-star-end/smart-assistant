@@ -11442,6 +11442,39 @@ describe("OCV5-427 resume replay catch-up", () => {
     vi.unstubAllGlobals();
   });
 
+  test("sub-agent text and any unrecognised frame field always notify", () => {
+    FakeWS.instances = [];
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.ensureSession("s1", "main");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const s = sock.sessions.get("s1")!;
+    s._sendingInFlight = true;
+    s._activeClientMessageId = running;
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({ frameSeq: 1, clientMessageId: running, blocks: [{ kind: "text", text: "A", messageId: "srv-s1-main-t1-s0" }] })) });
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 2, clientMessageId: running,
+      blocks: [{ kind: "tool_use", blockId: "child-1", toolName: "Agent", partial: false, inputJson: { description: "child" } }],
+    })) });
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(s._agentGroups?.get("child-1")).toBe(group?.id);
+    const notify = vi.spyOn(sock as unknown as { scheduleNotify: () => void }, "scheduleNotify");
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 3, clientMessageId: running, blocks: [{ kind: "text", text: "child output", parentToolUseId: "child-1" }],
+    })) });
+    expect(group?.childBlocks?.some((b) => b.kind === "text" && b.text === "child output")).toBe(true);
+    expect(notify).toHaveBeenCalled();
+    notify.mockClear();
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 4, clientMessageId: running, cronJob: { label: "x" }, blocks: [{ kind: "text", text: "B", messageId: "srv-s1-main-t1-s0" }],
+    })) });
+    expect(notify).toHaveBeenCalled();
+    sock.stop();
+    vi.unstubAllGlobals();
+  });
+
   test("INC-20261015-RESUME-REPLAY-LAG: a tape-commit completion during a resume replay settles at once and syncs history", () => {
     const s = sess();
     s._sendingInFlight = true;
