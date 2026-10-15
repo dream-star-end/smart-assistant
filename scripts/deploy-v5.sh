@@ -6843,8 +6843,11 @@ smoke() {
   #     默认关;关停 OC_DESKTOP_ENROLL_SWEEP_DISABLED=1。shared 域条目进本名单是既有
   #     先例,idleSweep/alert/refreshEventsSweep 等同列;smoke 校验 healthz.schedulers
   #     必须是本名单子集,加白名单即可,不改 domain)
+  #   cursorExternalApiOutbox(2026-09-08 f8bb83471 引入:index.ts leaderBundle.add(
+  #     {name:"cursorExternalApiOutbox",domain:"v5-owned"}),扫 Cursor external API 计费 FS outbox
+  #     做 durable 结算;仅 flavor 身份 ok 时挂上。当时漏登本名单,test:v5:ops 一直红(OCV5-438))
   allowed="subscriptionRollover accountSlotReaper researchJobs codexRefresh codexDriftReconciler marketplaceAiReview providerHealth sessionsGcSweep incidentSnapshot cursorAuthSync"
-  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration cursorAuditReconciler cursorUsageSweep grokUsageSweep desktopEnrollSweep"
+  allowed="$allowed idleSweep volumeGc orphanReconcile migrationReconcile healthPoller containerEvents alert refreshEventsSweep auditRetentionSweep imageUsageSweep cooldownRecovery pendingOrdersExpirer finalizeReconciler liveFrameMaintenance tapeJobScheduler turnDispatchReconciler onboarding inboxEmail cronWake incidentReconciler incidentSweeper connectorSweeper knowledgePlanetAutomation githubWorkspaceSweeper wecomAlert userNoticeApproval mediaGeneration cursorAuditReconciler cursorUsageSweep grokUsageSweep desktopEnrollSweep cursorExternalApiOutbox"
   bad=""
   IFS=',' read -ra _sarr <<<"$scheds"
   for s in "${_sarr[@]}"; do
