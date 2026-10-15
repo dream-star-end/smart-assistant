@@ -25,7 +25,7 @@
 
 import { query } from "../db/queries.js";
 import { EVENTS } from "./alertEvents.js";
-import { enqueueAlert, transitionRuleState } from "./alertOutbox.js";
+import { enqueueAlert, listRuleStates, transitionRuleState } from "./alertOutbox.js";
 import { getSystemSetting } from "./systemSettings.js";
 import { listPoolAdapters } from "../account-pool/policy/registry.js";
 
@@ -46,7 +46,8 @@ export interface RuleSnapshot {
   silentNewUserCount24h: number;
   /**
    * OCV5-424: per service pool, members that should be able to serve (all but the ones an
-   * admin disabled) and how many of them can. Empty when no pool adapter is registered.
+   * admin disabled) and how many of them can. Empty when no pool adapter is registered;
+   * undefined when it could not be read (the rule then keeps its state).
    */
   servicePools?: Array<{ service: string; eligible: number; active: number; reasons: string[] }>;
 }
@@ -143,7 +144,8 @@ export async function collectRuleSnapshot(deps: SnapshotDeps = {}): Promise<Rule
     console.warn("[admin/alertRules] silent_new_user snapshot failed:", err);
   }
 
-  const servicePools: NonNullable<RuleSnapshot["servicePools"]> = [];
+  // Undefined (unknown) when any adapter fails: a partial list must never read as "recovered".
+  let servicePools: RuleSnapshot["servicePools"] = [];
   try {
     const byService = new Map<string, { eligible: number; active: number; reasons: Set<string> }>();
     for (const adapter of listPoolAdapters()) {
@@ -161,6 +163,7 @@ export async function collectRuleSnapshot(deps: SnapshotDeps = {}): Promise<Rule
       servicePools.push({ service, eligible: e.eligible, active: e.active, reasons: [...e.reasons].sort() });
     }
   } catch (err) {
+    servicePools = undefined;
     // eslint-disable-next-line no-console
     console.warn("[admin/alertRules] service pool snapshot failed:", err);
   }
@@ -281,29 +284,72 @@ const REASON_TEXT: Record<string, string> = {
   upstream: "上游故障冷却", cooldown: "冷却中", disabled: "已自动停用",
 };
 
+/** One service pool's alert state key (one condition per service, so each fires and resolves on its own). */
+export const servicePoolRuleId = (service: string): string => `${EVENTS.SERVICE_POOL_ALL_DOWN}:${service}`;
+
 /**
  * OCV5-424: a service pool with members none of which can serve (every one cooling down or
  * failing auth). Recovery stays automatic (probes); this makes the outage visible. Members an
  * admin disabled do not count, so a pool switched off on purpose never fires.
  */
-export const ruleServicePoolAllDown: PolledRule = {
-  id: EVENTS.SERVICE_POOL_ALL_DOWN,
-  event_type: EVENTS.SERVICE_POOL_ALL_DOWN,
-  evaluate(s) {
-    const down = (s.servicePools ?? []).filter((p) => p.eligible > 0 && p.active === 0);
-    if (down.length > 0) {
-      const lines = down.map((p) => `- ${p.service}:${p.eligible} 个成员全部不可用(${p.reasons.map((r) => REASON_TEXT[r] ?? r).join("、")})`);
-      return {
-        firing: true,
-        dedupe_key: `${EVENTS.SERVICE_POOL_ALL_DOWN}:${down.map((p) => p.service).join(",")}`,
-        title: `[CRITICAL] 服务池不可用:${down.map((p) => p.service).join("、")}`,
-        body: `${lines.join("\n")}\n\n冷却与认证失效会按统一调度策略自动探测恢复;见管理后台 → 服务池。`,
-        payload: { services: down.map((p) => ({ service: p.service, eligible: p.eligible, reasons: p.reasons })) },
-      };
+export function evaluateServicePool(p: { service: string; eligible: number; active: number; reasons: string[] }): PolledRuleOutcome {
+  if (p.eligible > 0 && p.active === 0) {
+    return {
+      firing: true,
+      dedupe_key: servicePoolRuleId(p.service),
+      severity: "critical",
+      title: `[CRITICAL] 服务池不可用:${p.service}`,
+      body: `${p.service}:${p.eligible} 个成员全部不可用(${p.reasons.map((r) => REASON_TEXT[r] ?? r).join("、")})。\n\n冷却与认证失效会按统一调度策略自动探测恢复;见管理后台 → 服务池。`,
+      payload: { service: p.service, eligible: p.eligible, reasons: p.reasons },
+    };
+  }
+  return { firing: false, resolvedTitle: `[RESOLVED] 服务池已恢复:${p.service}`, resolvedBody: `${p.service} 有 ${p.active} 个可调度成员。` };
+}
+
+/**
+ * Per-service pass of runRulesOnce. Unknown snapshot → no transition at all. A service that
+ * left the snapshot (no members any more) resolves if it was firing.
+ */
+export async function runServicePoolRules(
+  snap: RuleSnapshot,
+  result: RunRulesResult,
+  deps: { transition?: typeof transitionRuleState; enqueue?: typeof enqueueAlert; firingIds?: () => Promise<string[]> } = {},
+): Promise<void> {
+  if (!snap.servicePools) return;
+  const transition = deps.transition ?? transitionRuleState;
+  const enqueue = deps.enqueue ?? enqueueAlert;
+  const firingIds = deps.firingIds ?? (async () => (await listRuleStates())
+    .filter((r) => r.firing && r.rule_id.startsWith(`${EVENTS.SERVICE_POOL_ALL_DOWN}:`)).map((r) => r.rule_id));
+  const pools = [...snap.servicePools];
+  try {
+    const present = new Set(pools.map((p) => servicePoolRuleId(p.service)));
+    for (const id of await firingIds()) {
+      if (!present.has(id)) pools.push({ service: id.slice(EVENTS.SERVICE_POOL_ALL_DOWN.length + 1), eligible: 0, active: 0, reasons: [] });
     }
-    return { firing: false, resolvedTitle: "[RESOLVED] 服务池已恢复", resolvedBody: "每个服务池都至少有一个可调度成员。" };
-  },
-};
+  } catch (err) {
+    result.errors.push({ rule_id: EVENTS.SERVICE_POOL_ALL_DOWN, err: (err as Error)?.message ?? String(err) });
+  }
+  for (const p of pools) {
+    const id = servicePoolRuleId(p.service);
+    result.evaluated.push(id);
+    const outcome = evaluateServicePool(p);
+    try {
+      const trans = await transition(id, outcome.firing, outcome.firing ? outcome.dedupe_key : null, outcome.firing ? outcome.payload : {});
+      if (!trans.transitioned) continue;
+      if (outcome.firing) {
+        result.firings.push(id);
+        await enqueue({ event_type: EVENTS.SERVICE_POOL_ALL_DOWN, severity: "critical", title: outcome.title, body: outcome.body,
+          payload: outcome.payload, dedupe_key: outcome.dedupe_key }, id);
+      } else {
+        result.resolutions.push(id);
+        await enqueue({ event_type: EVENTS.SERVICE_POOL_ALL_DOWN, severity: "info", title: outcome.resolvedTitle ?? `[RESOLVED] ${id}`,
+          body: outcome.resolvedBody ?? "Condition no longer holds.", payload: { resolved: true, rule_id: id }, dedupe_key: null }, id);
+      }
+    } catch (err) {
+      result.errors.push({ rule_id: id, err: (err as Error)?.message ?? String(err) });
+    }
+  }
+}
 
 export const ruleAccountPoolLowCapacity: PolledRule = {
   id: EVENTS.ACCOUNT_POOL_LOW_CAPACITY,
@@ -458,7 +504,6 @@ export function defaultPolledRules(): PolledRule[] {
     ruleAccountPoolNotConfigured,
     ruleAccountPoolAllDown,
     ruleAccountPoolLowCapacity,
-    ruleServicePoolAllDown,
     ruleSignupSpike,
     ruleRateLimitSpike,
     ruleLoginFailureSpike,
@@ -567,6 +612,8 @@ export async function runRulesOnce(deps: RunRulesDeps = {}): Promise<RunRulesRes
       result.errors.push({ rule_id: rule.id, err: (err as Error)?.message ?? String(err) });
     }
   }
+  // OCV5-424: per-service pool states (default rule set only; a test passing its own rules opts out).
+  if (!deps.rules) await runServicePoolRules(snap, result);
   return result;
 }
 
