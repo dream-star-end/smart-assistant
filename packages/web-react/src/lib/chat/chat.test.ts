@@ -11442,6 +11442,48 @@ describe("OCV5-427 resume replay catch-up", () => {
     vi.unstubAllGlobals();
   });
 
+  test("OCV5-430: a session this socket already registered is not re-registered after its turn settles", () => {
+    FakeWS.instances = [];
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: vi.fn() });
+    sock.loadStored(storedInFlight() as never);
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    expect(hellos(ws)).toHaveLength(1);
+    ws.onmessage?.({ data: replayStart() });
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 7, isFinal: true, clientMessageId: running, blocks: [{ kind: "text", text: " done", messageId: "srv-s1-main-t1-s0" }],
+    })) });
+    expect(sock.sessions.get("s1")!._sendingInFlight).toBeFalsy();
+    sock.applyServerMessages("s1", "main", [
+      { id: running, role: "user", text: "long task", ts: 1, status: "sent" } as ChatMessage,
+      { id: "srv-s1-main-t1-s0", role: "assistant", text: "partial done", ts: 2 } as ChatMessage,
+    ], true, 2);
+    expect(hellos(ws)).toHaveLength(1);
+    sock.stop();
+    vi.unstubAllGlobals();
+  });
+
+  test("a session first loaded after the socket opened still gets its idle-cursor registration", () => {
+    FakeWS.instances = [];
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: vi.fn() });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const before = hellos(ws).length;
+    sock.ensureSession("s2", "main");
+    sock.applyServerMessages("s2", "main", [
+      { id: "srv-s2-main-t1-s0", role: "assistant", text: "old answer", ts: 2 } as ChatMessage,
+    ], true, 1);
+    const after = hellos(ws);
+    expect(after.length).toBe(before + 1);
+    expect(after.at(-1).peers.some((peer: { peerId: string }) => peer.peerId === "s2")).toBe(true);
+    sock.stop();
+    vi.unstubAllGlobals();
+  });
+
   test("sub-agent text and any unrecognised frame field always notify", () => {
     FakeWS.instances = [];
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
