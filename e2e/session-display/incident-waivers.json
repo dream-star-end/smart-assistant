@@ -265,6 +265,12 @@
       "reason": "OCV5-424 merged 服务池 tab follow-up: admin-only page (Antigravity quota user-agent, Cursor rows shown once, stale-window text). No user-visible surface changed.",
       "approvedBy": "user 2026-10-15 要求服务池与订阅账号合并并显示使用额度（cc3 account-pool 会话）",
       "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "cc01fd30ec4d77f1c6d40a8b035869a6a4896b07",
+      "reason": "OCV5-434 GPT Fast acceptance fix: Codex turn/start needs the catalog tier id \"priority\"; released <1h earlier the Codex Fast toggle was a no-op (standard speed). No wrong charge (Codex is subscription, not credits) and nothing broke. Unit tests pin priority; live acceptance re-verifies the echoed tier by capture.",
+      "approvedBy": "user 2026-10-16 选择「Waiver」处理 OCV5-434 Codex Fast tier id 修复（cc3 会话）",
+      "expiresAt": "2026-11-15"
     }
   ]
 }
