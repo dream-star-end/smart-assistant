@@ -23,6 +23,7 @@ import {
   inflightCount,
   noteAdmission,
   releaseInflight,
+  reserveInflight,
   underRateCap,
 } from "./affinity.js";
 
@@ -148,6 +149,18 @@ describe("per-member rate and in-flight caps", () => {
     assert.equal(inflightCount("antigravity", "1", t0), 1);
     assert.equal(inflightCount("antigravity", "1", t0 + 1_001), 0, "expired unit dropped");
     releaseInflight("unknown");
+  });
+
+  it("reservation prefers room and the per-minute cap, then room, then the first (Codex r3)", () => {
+    const t0 = NOW.getTime();
+    acquireInflight("antigravity", "A", "x1", t0);
+    acquireInflight("antigravity", "A", "x2", t0);
+    acquireInflight("antigravity", "C", "x3", t0);
+    for (let i = 0; i < 20; i++) noteAdmission("antigravity", "B", t0);
+    // A has room (2/3) and is first; B is idle but over 20/min; C has room and is under the cap.
+    assert.equal(reserveInflight("antigravity", ["A", "B", "C"], "r1", 3, t0 + 1, 20), "A");
+    assert.equal(reserveInflight("antigravity", ["A", "B", "C"], "r2", 3, t0 + 2, 20), "C", "A full now; B over the rate cap");
+    assert.equal(reserveInflight("antigravity", ["A", "B"], "r3", 3, t0 + 3, 20), "B", "room beats the rate cap when nothing else has room");
   });
 
   it("settings come from the admin loader, cached; a failed read keeps the last/default values", async () => {

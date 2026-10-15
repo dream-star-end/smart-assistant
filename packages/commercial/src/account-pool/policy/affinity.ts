@@ -388,8 +388,9 @@ export function acquireInflight(service: string, id: string, token: string, now 
 
 /**
  * Check-and-reserve with no await in between (atomic in this process): reserve a
- * unit on the first member in `order` under `cap`; when every member is at the
- * cap, reserve on the first anyway (never refuse service). Also counts the
+ * unit on the first member in `order` with room under `cap` and (when given)
+ * under the per-minute cap; then the first with room; when every member is at
+ * the cap, the first anyway (never refuse service). Also counts the
  * admission for the per-minute window. Returns the member id reserved.
  */
 export function reserveInflight(
@@ -398,9 +399,13 @@ export function reserveInflight(
   token: string,
   cap: number,
   now = Date.now(),
+  ratePerMin: number | null = null,
 ): string | null {
   if (order.length === 0) return null
-  const id = order.find((m) => inflightCount(service, m, now) < cap) ?? order[0]
+  const roomy = (m: string) => inflightCount(service, m, now) < cap
+  const rated = (m: string) => ratePerMin === null || underRateCap(service, m, ratePerMin, now)
+  // In order: room and under the per-minute cap; then room only; then the first.
+  const id = order.find((m) => roomy(m) && rated(m)) ?? order.find(roomy) ?? order[0]
   acquireInflight(service, id, token, now)
   noteAdmission(service, id, now)
   return id

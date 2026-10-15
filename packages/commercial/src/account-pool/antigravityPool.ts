@@ -183,7 +183,14 @@ export async function pickAntigravityAccount(
     const order = [preferred.id, ...usable.filter((r) => r.id !== preferred.id)
       .sort((a, b) => inflightCount(ANTIGRAVITY_AFFINITY_SERVICE, a.id) - inflightCount(ANTIGRAVITY_AFFINITY_SERVICE, b.id))
       .map((r) => r.id)]
-    const id = reserveInflight(ANTIGRAVITY_AFFINITY_SERVICE, order, deps.reserveToken, caps.antigravityInflight)
+    const id = reserveInflight(
+      ANTIGRAVITY_AFFINITY_SERVICE,
+      order,
+      deps.reserveToken,
+      caps.antigravityInflight,
+      Date.now(),
+      caps.antigravityRatePerMin,
+    )
     row = usable.find((r) => r.id === id) ?? preferred
   }
   const action: AffinityAction | undefined = resolved ? (row.id === resolved.member.id ? resolved.action : 'spill') : undefined
