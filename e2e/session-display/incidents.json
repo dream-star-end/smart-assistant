@@ -7071,7 +7071,8 @@
       "symptom": "个人版 GPT-6-Astra 会话（webmv9omkexy7xfyl）发出消息 4 秒后浏览器发停止，此时引擎冷启动尚未起来（11 秒），网关按 clientMessageId 找不到运行中的 turn，回 TURN_NOT_ACTIVE，master 把停止记为终态；turn 随后照常启动，Codex 调 request_user_input 提问，会话快照因该轮有停止把提问投影成 cancelled/user_stop，前端加载后把卡片判为已结束不显示，网关补推被僵尸卡守卫丢弃；引擎一直 waiting_for_user，第二条消息被堵（OCV5-435；真聊复现 g435amv9pv5fh 发出后 250ms 点停止；canary 合同在修复前 5/5 红：停止回 TURN_NOT_ACTIVE、该轮按 turn_completed 落账）。修复：网关从 ws 受理到 turn 结束跟踪本轮，引擎未起时到达的停止登记精确的启动前停止围栏并回 applied，引擎 run 创建即按用户停止收尾（interrupted / USER_CANCELLED）；精确命中但终态持久化尚未建立的停止同样登记围栏；抢在消息之前到达的停止仍回 TURN_NOT_ACTIVE，但登记 30 秒短围栏，消息一到即停。",
       "rootFixCommit": "b2d263c9",
       "coverageCommits": [
-        "44e04ac6"
+        "44e04ac6",
+        "693212d9"
       ],
       "regressions": [
         {
@@ -7098,6 +7099,11 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
           "assertion": "OCV5-435: an overtaking Stop for one send attempt does not stop a resend of the same message"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexTurnRetry.test.ts",
+          "assertion": "interrupt while the app-server is still starting → no turn/start, USER_CANCELLED"
         },
         {
           "layer": "deploy-gate",
