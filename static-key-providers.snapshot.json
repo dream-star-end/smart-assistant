@@ -77,7 +77,13 @@
         "hy3-go",
         "longcat-2.0-go",
         "longcat-2.5-preview-free-go",
-        "step-5-preview-free-go"
+        "step-5-preview-free-go",
+        "opencode-grok-4.7",
+        "opencode-grok-4.6",
+        "opencode-gpt-6-luna",
+        "opencode-gpt-5.6-luna",
+        "muse-spark-1.3-go",
+        "muse-spark-1.2-go"
       ],
       "maxInputTokens": 1000000,
       "upstreamEndpoint": "https://opencode.ai/zen/go/v1/messages",

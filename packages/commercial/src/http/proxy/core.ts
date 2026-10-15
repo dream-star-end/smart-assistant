@@ -51,6 +51,7 @@ import {
 import type { PreparedUpstreamSession } from "./upstream.js";
 import { createGeminiGoFetch } from "./geminiGoBridge.js";
 import { createOpenAIChatGoFetch } from "./openAiChatGoBridge.js";
+import { createOpenAIResponsesGoFetch } from "./openAiResponsesGoBridge.js";
 import {
   assertClaudeOAuthIdentity,
   ClaudeIdentityGuardError,
@@ -283,7 +284,9 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
         ? createGeminiGoFetch(fetchFn)
         : session.transport === "openai-chat-go"
           ? createOpenAIChatGoFetch(fetchFn)
-          : fetchFn;
+          : session.transport === "openai-responses-go"
+            ? createOpenAIResponsesGoFetch(fetchFn)
+            : fetchFn;
     let upstream = await roundTripFetch(session.endpoint, fetchInit);
     let upstreamErrorPreview: string | null = null;
     if (upstream.status === 400) {

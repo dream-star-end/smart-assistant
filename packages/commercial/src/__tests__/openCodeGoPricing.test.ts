@@ -49,6 +49,12 @@ describe('OpenCode Go pricing', () => {
       'longcat-2.0-go': [15, 60, 1, 0], // $0.30 / $1.20 / $0.006
       'longcat-2.5-preview-free-go': [0, 0, 0, 0], // Free (limited time)
       'step-5-preview-free-go': [0, 0, 0, 0], // Free (limited time)
+      'opencode-grok-4.7': [100, 300, 25, 0], // ≤200K $2 / $6 / $0.50
+      'opencode-grok-4.6': [100, 300, 25, 0],
+      'opencode-gpt-6-luna': [5, 25, 1, 6], // ≤272K $0.10 / $0.50 / $0.01 / $0.125
+      'opencode-gpt-5.6-luna': [10, 60, 1, 12], // ≤272K $0.20 / $1.20 / $0.02 / $0.25
+      'muse-spark-1.3-go': [5, 10, 1, 0], // $0.10 / $0.20 / $0.002
+      'muse-spark-1.2-go': [5, 10, 1, 0],
     }
     assert.deepEqual(GO_CATALOG_MODELS.map((m) => m.modelId).sort(), Object.keys(expected).sort())
     assert.deepEqual(Object.keys(OPENCODE_GO_EXTRA_MODELS).sort(), Object.keys(expected).sort())
@@ -67,5 +73,9 @@ describe('OpenCode Go pricing', () => {
     assert.ok(window['claude-haiku-5-5-go']! <= 100_000)
     assert.ok(window['qwen3.7-plus-go']! <= 200_000)
     assert.ok(window['minimax-m3-go']! <= 200_000)
+    assert.ok(window['opencode-grok-4.7']! <= 200_000 && window['opencode-grok-4.6']! <= 200_000)
+    assert.ok(
+      window['opencode-gpt-6-luna']! <= 272_000 && window['opencode-gpt-5.6-luna']! <= 272_000,
+    )
   })
 })

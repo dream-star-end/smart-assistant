@@ -63,6 +63,7 @@ import {
   findRouteProviderForModel,
   getStaticProvider,
   isOpenCodeGoChatUpstream,
+  isOpenCodeGoResponsesUpstream,
   staticProviderOutputConfigEfforts,
   type StaticKeyProviderSpec,
   type StaticProviderId,
@@ -350,7 +351,7 @@ export interface PreparedUpstreamSession {
   /** 上游 URL;OAuth = `deps.upstreamEndpoint ?? DEFAULT`;静态 = `spec.upstreamEndpoint` */
   readonly endpoint: string;
   /** Exact, trusted static-provider transport selection, never a client flag. */
-  readonly transport?: "gemini-go" | "openai-chat-go";
+  readonly transport?: "gemini-go" | "openai-chat-go" | "openai-responses-go";
   /**
    * **转发给上游的 model 名**(模型权威批次 §1.3)。
    *
@@ -575,7 +576,9 @@ function makeStaticKeyUpstream(
       ? { transport: "gemini-go" as const }
       : spec.id === "opencodego" && isOpenCodeGoChatUpstream(upstreamModel)
         ? { transport: "openai-chat-go" as const }
-        : {}),
+        : spec.id === "opencodego" && isOpenCodeGoResponsesUpstream(upstreamModel)
+          ? { transport: "openai-responses-go" as const }
+          : {}),
     upstreamModel,
     dispatcher,
     shouldUpdateQuotaFromResponse: false,

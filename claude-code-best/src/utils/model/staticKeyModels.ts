@@ -116,6 +116,17 @@ export const OPENCODE_GO_CHAT_MODEL_IDS: readonly string[] = [
   'step-5-preview-free-go',
 ]
 
+/** OCV5-425 phase 3 OpenCode Go Responses models (proxy bridge). Mirrors protocol
+ *  OPENCODE_GO_RESPONSES_MODELS (equality pinned by staticKeyModels.test.ts). */
+export const OPENCODE_GO_RESPONSES_MODEL_IDS: readonly string[] = [
+  'opencode-grok-4.7',
+  'opencode-grok-4.6',
+  'opencode-gpt-6-luna',
+  'opencode-gpt-5.6-luna',
+  'muse-spark-1.3-go',
+  'muse-spark-1.2-go',
+]
+
 /** OpenCode Go 当前模型 + 历史 transport 集。DeepSeek 使用独立平台 alias，避免覆盖 direct
  *  provider；Qwen3.7 保留历史 plumbing 但由 DB catalog 下线。 */
 export function isOpencodeGoModel(model: string): boolean {
@@ -126,7 +137,8 @@ export function isOpencodeGoModel(model: string): boolean {
     m === 'qwen3.7-plus' ||
     m === 'gemini-4-argon-contributor' ||
     OPENCODE_GO_MESSAGES_MODEL_IDS.includes(m) ||
-    OPENCODE_GO_CHAT_MODEL_IDS.includes(m)
+    OPENCODE_GO_CHAT_MODEL_IDS.includes(m) ||
+    OPENCODE_GO_RESPONSES_MODEL_IDS.includes(m)
   )
 }
 
@@ -136,7 +148,11 @@ export function isOpencodeGoNoThinkingModel(model: string): boolean {
   const m = model.trim().toLowerCase()
   // The chat bridge does not take Anthropic thinking (reasoning runs upstream, effort maps to
   // reasoning_effort), so CCB sends none.
-  return m === 'claude-haiku-5-5-go' || OPENCODE_GO_CHAT_MODEL_IDS.includes(m)
+  return (
+    m === 'claude-haiku-5-5-go' ||
+    OPENCODE_GO_CHAT_MODEL_IDS.includes(m) ||
+    OPENCODE_GO_RESPONSES_MODEL_IDS.includes(m)
+  )
 }
 
 /** 只识别 OpenCode Go 的历史 Qwen 子集。 */
@@ -243,6 +259,12 @@ export const STATIC_MODEL_CONTEXT_WINDOW: ReadonlyArray<{
     'mimo-v2.6-pro-go': 1_048_576,
     'mimo-v2.5-pro-go': 1_048_576,
     'mimo-v2.6-flash-go': 1_048_576,
+    'opencode-grok-4.7': 200_000,
+    'opencode-grok-4.6': 200_000,
+    'opencode-gpt-6-luna': 272_000,
+    'opencode-gpt-5.6-luna': 272_000,
+    'muse-spark-1.3-go': 1_048_576,
+    'muse-spark-1.2-go': 1_048_576,
   }).map(([id, contextWindow]) => ({
     matches: (m: string) => m.trim().toLowerCase() === id,
     contextWindow,

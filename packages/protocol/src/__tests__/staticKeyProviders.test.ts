@@ -171,6 +171,12 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'longcat-2.0-go',
       'longcat-2.5-preview-free-go',
       'step-5-preview-free-go',
+      'opencode-grok-4.7',
+      'opencode-grok-4.6',
+      'opencode-gpt-6-luna',
+      'opencode-gpt-5.6-luna',
+      'muse-spark-1.3-go',
+      'muse-spark-1.2-go',
     ])
     assert.deepEqual([...getStaticProvider('kimi').inboundModelIds], ['kimi-k2.7-code'])
     assert.deepEqual([...getStaticProvider('ark-k3').inboundModelIds], ['kimi-k3-ark'])
@@ -213,6 +219,12 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'longcat-2.0-go',
       'longcat-2.5-preview-free-go',
       'step-5-preview-free-go',
+      'opencode-grok-4.7',
+      'opencode-grok-4.6',
+      'opencode-gpt-6-luna',
+      'opencode-gpt-5.6-luna',
+      'muse-spark-1.3-go',
+      'muse-spark-1.2-go',
       'kimi-k2.7-code',
       'kimi-k3-ark',
       'kimi-k3',

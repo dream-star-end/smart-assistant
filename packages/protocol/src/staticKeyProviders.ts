@@ -179,10 +179,33 @@ export function isOpenCodeGoChatUpstream(upstreamModel: string): boolean {
   return OPENCODE_GO_CHAT_UPSTREAMS.has(upstreamModel.toLowerCase())
 }
 
+/**
+ * OCV5-425 phase 3: OpenCode Go models that only answer on OpenAI `/responses`, catalog id →
+ * upstream id, served by openAiResponsesGoBridge. GPT and Grok ids start with `opencode-`
+ * instead of ending in `-go`: several paths treat any `gpt-…` / `grok…` prefix as the Codex or
+ * Grok engine (WeChat inbound, CCB chatgptModels, gateway teamMode/promptSlots).
+ */
+export const OPENCODE_GO_RESPONSES_MODELS: Readonly<Record<string, string>> = {
+  'opencode-grok-4.7': 'grok-4.7',
+  'opencode-grok-4.6': 'grok-4.6',
+  'opencode-gpt-6-luna': 'gpt-6-luna',
+  'opencode-gpt-5.6-luna': 'gpt-5.6-luna',
+  'muse-spark-1.3-go': 'muse-spark-1.3-contributor',
+  'muse-spark-1.2-go': 'muse-spark-1.2-contributor',
+}
+
+const OPENCODE_GO_RESPONSES_UPSTREAMS = new Set(Object.values(OPENCODE_GO_RESPONSES_MODELS))
+
+/** True when an OpenCode Go upstream model must go through the Responses bridge. */
+export function isOpenCodeGoResponsesUpstream(upstreamModel: string): boolean {
+  return OPENCODE_GO_RESPONSES_UPSTREAMS.has(upstreamModel.toLowerCase())
+}
+
 /** Every OCV5-425 OpenCode Go catalog id (any wire format), catalog id → upstream id. */
 export const OPENCODE_GO_EXTRA_MODELS: Readonly<Record<string, string>> = {
   ...OPENCODE_GO_MESSAGES_MODELS,
   ...OPENCODE_GO_CHAT_MODELS,
+  ...OPENCODE_GO_RESPONSES_MODELS,
 }
 
 function openCodeGoExtraUpstream(modelId: string): string | undefined {
@@ -372,6 +395,13 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
     'glm-5.3-flash': ['low', 'high'],
     'hy3': ['low', 'high'],
     'longcat-2.0': ['low', 'high'],
+    // Responses bridge (reasoning.effort), g425/resp-effort.log, 2 samples each: high beats low
+    // clearly in both for Grok 4.6/4.7, GPT-6 Luna and Muse Spark 1.2; medium is not reliably in
+    // between, so it is not offered. GPT-5.6 Luna shows no effect, Muse Spark 1.3 no clear one.
+    'grok-4.6': ['low', 'high'],
+    'grok-4.7': ['low', 'high'],
+    'gpt-6-luna': ['low', 'high'],
+    'muse-spark-1.2-contributor': ['low', 'high'],
   },
   maxInputTokens: 1_000_000,
   // 红/蓝图像探针只消耗 reasoning、无可验证文本结果，按纯文本接入并启用 vision 工具兜底。

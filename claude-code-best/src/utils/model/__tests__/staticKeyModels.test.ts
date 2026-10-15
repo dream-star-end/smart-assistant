@@ -12,6 +12,7 @@ import {
   isCapabilityZeroStaticModel,
   isOpencodeGoModel,
   OPENCODE_GO_CHAT_MODEL_IDS,
+  OPENCODE_GO_RESPONSES_MODEL_IDS,
   OPENCODE_GO_MESSAGES_MODEL_IDS,
   isOpencodeQwenModel,
   isZaiGlm53Model,
@@ -223,6 +224,16 @@ describe("OCV5-425 OpenCode Go /messages models (CCB fallback)", () => {
     expect([...OPENCODE_GO_CHAT_MODEL_IDS].sort()).toEqual(
       Object.keys(protocol.OPENCODE_GO_CHAT_MODELS).sort(),
     );
+    expect([...OPENCODE_GO_RESPONSES_MODEL_IDS].sort()).toEqual(
+      Object.keys(protocol.OPENCODE_GO_RESPONSES_MODELS).sort(),
+    );
+    for (const id of OPENCODE_GO_RESPONSES_MODEL_IDS) {
+      expect(isOpencodeGoModel(id)).toBe(true);
+      expect(modelSupportsThinking(id)).toBe(false);
+    }
+    expect(getStaticModelContextWindow("opencode-grok-4.7")).toBe(200_000);
+    expect(getStaticModelContextWindow("opencode-gpt-6-luna")).toBe(272_000);
+    expect(getStaticModelContextWindow("muse-spark-1.3-go")).toBe(1_048_576);
   });
 
   test("chat bridge models: capability-zero, no Anthropic thinking, catalog windows", () => {
