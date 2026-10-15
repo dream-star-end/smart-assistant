@@ -227,6 +227,15 @@ declare global {
         cursor: number;
         requests: string[];
       }>;
+      /** Reload mid-turn: the tape-commit completion lands inside the replay backlog (INC-20261015-RESUME-REPLAY-LAG). */
+      runResumeReplayCompletion: () => Promise<{
+        settledMs: number | null;
+        syncCalls: number;
+        textLength: number;
+        expectedLength: number;
+        domStartCount: number;
+        domEndCount: number;
+      }>;
       /** Long answer (>1024 live deltas) replayed by a durable reset (INC-20261015-LIVE-FENCE-TRIM-REPLAY). */
       runLongAnswerFenceReplay: () => Promise<{
         deltas: number;
@@ -466,6 +475,9 @@ window.__replayDrive = {
   },
   runLongAnswerFenceReplay: async () => {
     throw new Error("long-answer fence probe 未挂载");
+  },
+  runResumeReplayCompletion: async () => {
+    throw new Error("resume replay completion probe 未挂载");
   },
   runDurableErrorReplay: async () => {
     throw new Error("durable error replay probe 未挂载");
@@ -2204,6 +2216,73 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
           m.role === "assistant" && m.text === markers.answer).length,
         cursor: session._lastFrameSeqByKey?.[sessionKey] ?? -1,
         requests,
+      };
+    },
+    runResumeReplayCompletion: async () => {
+      if (!replaySocket.sessions.get(REPLAY_SESSION_ID)) {
+        replaySocket.ensureSession(REPLAY_SESSION_ID, REPLAY_AGENT_ID, "resume replay completion");
+      }
+      const cmid = await window.__replayDrive.openTurn();
+      const ws = live();
+      const sessionKey = `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`;
+      const peer = { id: REPLAY_SESSION_ID, kind: "dm" };
+      const rowId = "srv-browser-resume-row";
+      const start = "BROWSER_RESUME_START ";
+      const end = " BROWSER_RESUME_END";
+      const total = 400;
+      const cut = 200;
+      const delta = (seq: number) => ({
+        type: "outbound.message",
+        sessionKey,
+        channel: "webchat",
+        peer,
+        clientMessageId: cmid,
+        frameSeq: seq,
+        blocks: [{ kind: "text", text: seq === 1 ? start : seq === total ? end : "x", messageId: rowId }],
+        isFinal: false,
+        ts: seq,
+      });
+      // Reload shape: the gateway re-reads the running turn from its start.
+      ws.deliver({ type: "outbound.active_turn_replay_start", sessionKey, channel: "webchat", peer, clientMessageId: cmid });
+      for (let seq = 1; seq <= cut; seq++) ws.deliver(delta(seq));
+      const syncBefore = replaySyncCalls;
+      const t0 = performance.now();
+      // The tape commit already happened; its completion overtakes the rest of the backlog.
+      ws.deliver({
+        type: "outbound.message",
+        sessionKey,
+        channel: "webchat",
+        peer,
+        clientMessageId: cmid,
+        blocks: [],
+        isFinal: true,
+        meta: { reconcile: "turn_completed", reconcileSource: "tape_commit" },
+        // Committed after the whole answer was generated: newer than every backlog frame.
+        ts: total + 1,
+      });
+      let settledMs: number | null = null;
+      for (let i = 0; i < 200; i++) {
+        if (!replaySocket.sessions.get(REPLAY_SESSION_ID)?._sendingInFlight) {
+          settledMs = Math.round(performance.now() - t0);
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const syncCalls = replaySyncCalls - syncBefore;
+      // The rest of the backlog is older than the settled completion: REST history, not the
+      // backlog, completes the row, so these frames must neither grow nor double it.
+      for (let seq = cut + 1; seq <= total; seq++) ws.deliver(delta(seq));
+      const root = document.querySelector("#timeline-replay-root");
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const text = replaySocket.sessions.get(REPLAY_SESSION_ID)?.messages.find((m) => m.id === rowId)?.text ?? "";
+      const dom = root?.textContent ?? "";
+      return {
+        settledMs,
+        syncCalls,
+        textLength: text.length,
+        expectedLength: start.length + (cut - 1),
+        domStartCount: dom.split("BROWSER_RESUME_START").length - 1,
+        domEndCount: dom.split("BROWSER_RESUME_END").length - 1,
       };
     },
     runLongAnswerFenceReplay: async () => {

@@ -11360,3 +11360,164 @@ describe("durable rejected feedback bridges placeholder to later server error", 
     expect(live._recoveryRejectedNotices).toBeUndefined(); sock.stop();
   });
 });
+
+// ═══════════════ OCV5-427 reload mid-turn: one replay, quiet duplicates, no grace wait ═══════════════
+describe("OCV5-427 resume replay catch-up", () => {
+  const key = "agent:main:webchat:dm:s1";
+  const running = "m-user-running";
+  const storedInFlight = () => ({
+    id: "s1",
+    agentId: "main",
+    title: "s1",
+    messages: [
+      { id: running, role: "user" as const, text: "long task", ts: 1, status: "sent" as const },
+      { id: "srv-s1-main-t1-s0", role: "assistant" as const, text: "partial", ts: 2 },
+    ],
+    createdAt: 1,
+    lastAt: 2,
+    _lastFrameSeqByKey: { [key]: 1134 },
+    _lastFrameSeq: 1134,
+    _sendingInFlight: true,
+    _activeClientMessageId: running,
+  });
+  const hellos = (ws: FakeWS) => ws.sent.map((raw) => JSON.parse(raw)).filter((frame) => frame.type === "inbound.hello");
+  const replayStart = () => JSON.stringify({
+    type: "outbound.active_turn_replay_start",
+    sessionKey: key,
+    channel: "webchat",
+    peer: { id: "s1", kind: "dm" },
+    clientMessageId: running,
+  });
+
+  test("INC-20261015-RESUME-REPLAY-LAG: the page-load hello asks for the running turn once and the REST sync does not ask again", () => {
+    FakeWS.instances = [];
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: vi.fn() });
+    sock.loadStored(storedInFlight() as never);
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const first = hellos(ws);
+    expect(first).toHaveLength(1);
+    expect(first[0].peers[0]).toMatchObject({ peerId: "s1", lastFrameSeq: 1134, resumeActiveTurnCandidateMessageIds: [running] });
+
+    // REST history has only the running user row: before OCV5-427 this sent a second hello naming the same turn.
+    sock.applyServerMessages("s1", "main", [{ id: running, role: "user", text: "long task", ts: 1, status: "sent" } as ChatMessage], true, 1);
+    expect(hellos(ws)).toHaveLength(1);
+
+    // Later registration hellos on the same page keep the cheap cursor replay.
+    sock.sendRepoBind("s1", "main", 1);
+    const later = hellos(ws).at(-1);
+    expect(later.peers[0].resumeActiveTurnCandidateMessageIds).toBeUndefined();
+    sock.stop();
+    vi.unstubAllGlobals();
+  });
+
+  test("INC-20261015-RESUME-REPLAY-LAG: replayed deltas the row already holds do not schedule a render", () => {
+    FakeWS.instances = [];
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.ensureSession("s1", "main");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const s = sock.sessions.get("s1")!;
+    s._sendingInFlight = true;
+    s._activeClientMessageId = running;
+    const notify = vi.spyOn(sock as unknown as { scheduleNotify: () => void }, "scheduleNotify");
+    const delta = (seq: number, text: string) => JSON.stringify(msgFrame({
+      frameSeq: seq, clientMessageId: running, blocks: [{ kind: "text", text, messageId: "srv-s1-main-t1-s0" }],
+    }));
+    ws.onmessage?.({ data: delta(1, "A") });
+    ws.onmessage?.({ data: delta(2, "B") });
+    ws.onmessage?.({ data: replayStart() });
+    const beforeReplay = notify.mock.calls.length;
+    ws.onmessage?.({ data: delta(1, "A") });
+    ws.onmessage?.({ data: delta(2, "B") });
+    expect(notify).toHaveBeenCalledTimes(beforeReplay);
+    ws.onmessage?.({ data: delta(3, "C") });
+    expect(notify.mock.calls.length).toBeGreaterThan(beforeReplay);
+    expect(s.messages.find((m) => m.id === "srv-s1-main-t1-s0")?.text).toBe("ABC");
+    sock.stop();
+    vi.unstubAllGlobals();
+  });
+
+  test("sub-agent text and any unrecognised frame field always notify", () => {
+    FakeWS.instances = [];
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.ensureSession("s1", "main");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const s = sock.sessions.get("s1")!;
+    s._sendingInFlight = true;
+    s._activeClientMessageId = running;
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({ frameSeq: 1, clientMessageId: running, blocks: [{ kind: "text", text: "A", messageId: "srv-s1-main-t1-s0" }] })) });
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 2, clientMessageId: running,
+      blocks: [{ kind: "tool_use", blockId: "child-1", toolName: "Agent", partial: false, inputJson: { description: "child" } }],
+    })) });
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(s._agentGroups?.get("child-1")).toBe(group?.id);
+    const notify = vi.spyOn(sock as unknown as { scheduleNotify: () => void }, "scheduleNotify");
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 3, clientMessageId: running, blocks: [{ kind: "text", text: "child output", parentToolUseId: "child-1" }],
+    })) });
+    expect(group?.childBlocks?.some((b) => b.kind === "text" && b.text === "child output")).toBe(true);
+    expect(notify).toHaveBeenCalled();
+    notify.mockClear();
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 4, clientMessageId: running, cronJob: { label: "x" }, blocks: [{ kind: "text", text: "B", messageId: "srv-s1-main-t1-s0" }],
+    })) });
+    expect(notify).toHaveBeenCalled();
+    sock.stop();
+    vi.unstubAllGlobals();
+  });
+
+  test("INC-20261015-RESUME-REPLAY-LAG: a tape-commit completion during a resume replay settles at once and syncs history", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    s._activeClientMessageId = running;
+    s._resumeReplayClientMessageId = running;
+    const deferTapeCommitFinal = vi.fn(() => true);
+    const forceSync = vi.fn();
+    const onFinal = vi.fn();
+    const completion = msgFrame({
+      isFinal: true,
+      clientMessageId: running,
+      meta: { reconcile: "turn_completed", reconcileSource: "tape_commit" },
+    });
+    applyOutboundMessage(s, completion, { deferTapeCommitFinal, forceSync, onFinal });
+    expect(deferTapeCommitFinal).not.toHaveBeenCalled();
+    expect(s._sendingInFlight).toBe(false);
+    expect(forceSync).toHaveBeenCalledWith("s1", { clientMessageId: running });
+
+    // Without a resume replay the OCV5-424 grace for the live tail stays.
+    const live = sess();
+    live._sendingInFlight = true;
+    live._activeClientMessageId = running;
+    applyOutboundMessage(live, completion, { deferTapeCommitFinal, forceSync: vi.fn(), onFinal: vi.fn() });
+    expect(deferTapeCommitFinal).toHaveBeenCalledTimes(1);
+    expect(live._sendingInFlight).toBe(true);
+  });
+
+  test("the resume replay marker is set by replay_start and cleared by the turn's final", () => {
+    FakeWS.instances = [];
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: vi.fn() });
+    sock.ensureSession("s1", "main");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    ws.onmessage?.({ data: replayStart() });
+    const s = sock.sessions.get("s1")!;
+    expect(s._resumeReplayClientMessageId).toBe(running);
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 5, isFinal: true, clientMessageId: running, blocks: [{ kind: "text", text: "done", messageId: "srv-s1-main-t1-s0" }],
+    })) });
+    expect(s._resumeReplayClientMessageId).toBeUndefined();
+    sock.stop();
+    vi.unstubAllGlobals();
+  });
+});

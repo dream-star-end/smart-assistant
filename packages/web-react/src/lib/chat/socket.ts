@@ -688,6 +688,11 @@ const STREAM_NOTIFY_MAX_MS = 1000;
 /** OCV5-424:tape 提交合成的 turn_completed 领先 live 尾巴时,等真 final 的宽限(实测领先 0.4–1s)。
  *  期满本轮仍在发送态 → 按原 reconcile 语义收口 + 精确 REST 对账(真 final 丢失时的兜底不变)。*/
 export const TAPE_COMMIT_FINAL_GRACE_MS = 5_000;
+/** OCV5-427: frame/block fields a no-op replay delta may carry and still skip a render. */
+const QUIET_REPLAY_FRAME_KEYS: ReadonlySet<string> = new Set([
+  "type", "sessionKey", "channel", "peer", "clientMessageId", "frameSeq", "blocks", "isFinal", "ts",
+]);
+const QUIET_REPLAY_BLOCK_KEYS: ReadonlySet<string> = new Set(["kind", "text", "messageId"]);
 
 /** 流式降频窗口:按最近渲染耗时自适应(纯函数,便于单测)。*/
 export function streamNotifyWindowMs(renderCostMs: number): number {
@@ -921,6 +926,8 @@ export class ChatSocket {
    * successful targeted hello. A server-reset idle cursor is a new identity,
    * while repeating the same snapshot cannot cause a resume_failed/sync loop. */
   private readonly activeReplayAttemptKeys = new Set<string>();
+  /** First hello of this page lifetime has gone out (OCV5-427: exact-turn replay on page load only). */
+  private pageHelloSent = false;
   /** 当前选中会话（App 经 setActiveSession 告知）：对账时无条件优先拉它。*/
   private activeSessionId: string | undefined;
   getActiveSessionId(): string | undefined {
@@ -1903,6 +1910,10 @@ export class ChatSocket {
     // authority. A late admission ACK must not revive sending or remove the
     // local teardown fence during that settlement window.
     if (sess._stopSettlement?.clientMessageId === clientMessageId) return true;
+    // OCV5-427: every live frame of the turn re-confirms admission. Only a
+    // confirmation that moved something opens a render window; replayed
+    // frames of an already admitted turn stay quiet.
+    let changed = pending !== undefined || this.dispatchSlots.get(sessId) !== clientMessageId;
     this.clearPendingDispatch(sessId, clientMessageId);
     this.dispatchSlots.set(sessId, clientMessageId);
     const user = sess.messages.find((message) => message.role === "user" && message.id === clientMessageId);
@@ -1911,13 +1922,20 @@ export class ChatSocket {
     // row forward out of its transport states; once answer blocks have marked
     // it read/replied, a later status-only or usage frame must not drag it back
     // to sent — that made「已送达」flicker on and off for the whole turn.
-    if (user && user.status !== "read" && user.status !== "replied") user.status = "sent";
+    if (user && user.status !== "read" && user.status !== "replied" && user.status !== "sent") {
+      user.status = "sent";
+      changed = true;
+    }
     if (
       user?._routing?.modelSwitchId &&
       sess._preparedModelSwitch?.id === user._routing.modelSwitchId
-    ) sess._preparedModelSwitch = undefined;
+    ) {
+      sess._preparedModelSwitch = undefined;
+      changed = true;
+    }
     const alreadyInFlight = sess._sendingInFlight;
     if (!alreadyInFlight) {
+      changed = true;
       sess._streamingAssistant = null;
       sess._streamingThinking = null;
       sess._blockIdToMsgId = new Map();
@@ -1938,10 +1956,15 @@ export class ChatSocket {
     this.clearTransientNotice(sess.id);
     // Authoritative admission always starts a new cost reminder window, even
     // when submit already set _sendingInFlight for the "replying" affordance.
+    if (
+      sess._turnCostCredits !== "0" ||
+      (sess._turnCostSeenRequestIds?.size ?? 0) > 0 ||
+      sess._turnCostReminderCredits !== undefined
+    ) changed = true;
     sess._turnCostCredits = "0";
     sess._turnCostSeenRequestIds = new Set();
     sess._turnCostReminderCredits = undefined;
-    this.scheduleNotify();
+    if (changed) this.scheduleNotify();
     return true;
   }
 
@@ -1980,6 +2003,9 @@ export class ChatSocket {
   private effects(): FrameEffects {
     return {
       onFinal: (sess, frame, isCronOrHeartbeat, clientMessageId) => {
+        if (sess._resumeReplayClientMessageId === (frame.clientMessageId ?? clientMessageId)) {
+          sess._resumeReplayClientMessageId = undefined;
+        }
         if (!isCronOrHeartbeat) this.reportRecoveredProblemCard(sess, frame, clientMessageId);
         this.clearThinkingSafety(sess.id);
         this.clearTransientNotice(sess.id); // turn 收尾：清 transient 软提示
@@ -2242,6 +2268,9 @@ export class ChatSocket {
       const firstTextPaint = f.type === "outbound.message"
         ? this.prepareFirstTextPaint(f as OutboundMessageWire)
         : null;
+      const replayProbe = f.type === "outbound.message"
+        ? this.textReplayProbe(f as OutboundMessageWire)
+        : null;
       let dispatched = false;
       try {
         this.dispatch(f);
@@ -2250,6 +2279,10 @@ export class ChatSocket {
         /* dispatch 失败：吞掉，不落 payload */
       }
       if (dispatched && firstTextPaint) this.attachFirstTextPaintProbe(firstTextPaint);
+      // OCV5-427: a replayed text/thinking delta the row fence already holds
+      // changed nothing; opening a render window for it only slows the page
+      // while it works through a reload/reconnect backlog.
+      if (dispatched && replayProbe && replayProbe.unchanged()) return;
       this.scheduleNotify();
     };
 
@@ -2535,6 +2568,7 @@ export class ChatSocket {
         this.noteAuthoritativeFrameSeqReset(sess, frame);
         resetFrameSeqCursor(sess, frame);
         sess._activeClientMessageId = frame.clientMessageId;
+        sess._resumeReplayClientMessageId = frame.clientMessageId;
         sess._sendingInFlight = true;
         sess._localTeardownAt = undefined;
         sess._liveStreamBroken = false;
@@ -2933,6 +2967,54 @@ export class ChatSocket {
    * (理论上不会:一轮只有一个终态),先物化旧的再接新的,不吞卡。
    */
   /** OCV5-424:见 FrameEffects.deferTapeCommitFinal。期满时去掉来源标记重放同一帧,走原 reconcile 收口。*/
+  /**
+   * OCV5-427: cheap before/after fingerprint for a plain text/thinking delta.
+   * Returns null for anything that can change more than row text (finals,
+   * meta, tool/plan/other blocks), so those always notify as before.
+   */
+  private textReplayProbe(frame: OutboundMessageWire): { unchanged: () => boolean } | null {
+    if (frame.isFinal || frame.meta || !Array.isArray(frame.blocks) || frame.blocks.length === 0) return null;
+    // Only plain top-level row deltas. Sub-agent text (parentToolUseId → childBlocks),
+    // cron pushes or any field this fingerprint does not see always notify.
+    if (!Object.keys(frame).every((key) => QUIET_REPLAY_FRAME_KEYS.has(key))) return null;
+    if (!frame.blocks.every((block) =>
+      (block?.kind === "text" || block?.kind === "thinking") &&
+      Object.keys(block).every((key) => QUIET_REPLAY_BLOCK_KEYS.has(key))
+    )) return null;
+    const sess = frame.peer?.id ? this.sessions.get(frame.peer.id) : undefined;
+    if (!sess) return null;
+    const fingerprint = () => {
+      let textLength = 0;
+      let userStatuses = "";
+      for (const message of sess.messages) {
+        textLength += message.text?.length ?? 0;
+        if (message.role === "user") userStatuses += `${message.status ?? ""},`;
+      }
+      return [
+        sess.messages,
+        sess.messages.length,
+        textLength,
+        userStatuses,
+        this.offlineQueue.length,
+        sess._preparedModelSwitch,
+        sess._streamingAssistant,
+        sess._streamingAssistant?.text?.length,
+        sess._streamingThinking,
+        sess._streamingThinking?.text?.length,
+        sess._sendingInFlight,
+        sess._activeClientMessageId,
+        sess._turnStatus,
+      ];
+    };
+    const before = fingerprint();
+    return {
+      unchanged: () => {
+        const after = fingerprint();
+        return before.every((value, index) => Object.is(value, after[index]));
+      },
+    };
+  }
+
   private deferTapeCommitFinal(sessId: string, frame: OutboundMessageWire): boolean {
     const clientMessageId = frame.clientMessageId;
     if (!clientMessageId) return false;
@@ -3419,12 +3501,25 @@ export class ChatSocket {
         const aid = agentId || s.agentId || this.deps.defaultAgentId || "main";
         if (emitted.has(aid)) return;
         emitted.add(aid);
-        const candidates = this.activeTurnReplayCandidates(s);
+        const historyCandidates = this.activeTurnReplayCandidates(s);
+        // OCV5-427: a restored in-flight turn is keyed by the turn itself, so
+        // the page-load hello and the registration hello after the REST sync
+        // are the same attempt and only the first goes out. Only the very
+        // first hello of the page asks for the exact turn from its start;
+        // later sockets on the same page keep the cheap cursor replay.
+        const runningTurn = historyCandidates.length === 0 &&
+          s._sendingInFlight &&
+          isClientMessageId(s._activeClientMessageId) &&
+          s._cancelledAutomaticRecoveryIds?.[s._activeClientMessageId] !== true
+          ? s._activeClientMessageId
+          : undefined;
+        const keyCandidates = runningTurn ? [runningTurn] : historyCandidates;
+        const candidates = runningTurn && this.pageHelloSent ? [] : keyCandidates;
         // An idle session can be loaded after this socket's initial hello.
         // Its persisted cursor still needs server arbitration before the next
         // turn, even though completed history has no active replay candidate.
-        const attemptKey = candidates.length > 0
-          ? `${pid}:${aid}:${candidates.join(",")}`
+        const attemptKey = keyCandidates.length > 0
+          ? `${pid}:${aid}:${keyCandidates.join(",")}`
           : `${pid}:${aid}:idle-cursor:${lastFrameSeq}`;
         const fresh = !this.activeReplayAttemptKeys.has(attemptKey);
         const hasFreshCandidates = candidates.length > 0 && fresh;
@@ -3481,6 +3576,7 @@ export class ChatSocket {
     if (requireFreshRegistration && hello.attemptKeys.length === 0) return false;
     const sent = this.safeWsSend(hello.data);
     if (sent) for (const key of hello.attemptKeys) this.activeReplayAttemptKeys.add(key);
+    if (sent) this.pageHelloSent = true;
     return sent;
   }
 
@@ -3808,6 +3904,7 @@ export class ChatSocket {
     this.reportedProblemCards.clear();
     this.problemCardSourceCodes.clear();
     this.activeReplayAttemptKeys.clear();
+    this.pageHelloSent = false;
     this.activeSessionId = undefined;
     if (this.sessions.size === 0) return;
     this.sessions.clear();

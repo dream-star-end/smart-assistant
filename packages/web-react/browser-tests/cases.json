@@ -285,6 +285,10 @@
     {
       "id": "T71",
       "proves": "同一行收到超过 1024 个实时增量后，journal 水合重置游标并从第一帧重放，正文与页面都只出现一次、长度不变(INC-20261015-LIVE-FENCE-TRIM-REPLAY)"
+    },
+    {
+      "id": "T72",
+      "proves": "刷新后本轮经 active_turn_replay_start 重放，tape 提交的完成帧夹在积压重放帧之间到达时立即收口并请求历史对账（不等 5 秒宽限），积压余下的旧帧既不让正文增长也不重复，正文交给历史对账(INC-20261015-RESUME-REPLAY-LAG)"
     }
   ]
 }
