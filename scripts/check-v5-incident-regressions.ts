@@ -193,6 +193,15 @@ type RunnerVerdict = { status: "wired" | "pending"; runner: string };
 const CI_WORKFLOW = readFileSync(join(ROOT, ".github/workflows/v5-ci.yml"), "utf8");
 const DEPLOY_SCRIPT = readFileSync(join(ROOT, "scripts/deploy-v5.sh"), "utf8");
 const ROOT_PACKAGE_JSON = readFileSync(join(ROOT, "package.json"), "utf8");
+let selfhostDeployCache: string | null = null;
+/** Read only in the selfhost edition; a missing script means no selfhost runner is wired. */
+function selfhostDeployScript(): string {
+  if (selfhostDeployCache === null) {
+    const file = join(ROOT, "scripts/deploy-v5-selfhost.sh");
+    selfhostDeployCache = existsSync(file) ? readFileSync(file, "utf8") : "";
+  }
+  return selfhostDeployCache;
+}
 
 function requireCi(script: string, runner: string): RunnerVerdict {
   if (!CI_WORKFLOW.includes(script)) fail(`CI workflow 未调用 ${script},runner 映射已失效`);
@@ -208,7 +217,17 @@ function resolveRunner(layer: string, path: string): RunnerVerdict {
   }
   if (layer === "deploy-gate") {
     const base = path.split("/").pop() ?? "";
-    if (!DEPLOY_SCRIPT.includes(base)) fail(`deploy-v5.sh 未调用 ${path},不能标 deploy-gate`);
+    // OCV5-432: the selfhost release has its own fail-closed gate (deploy-v5-selfhost.sh user
+    // contract). In the selfhost edition a script that release really calls is a wired proof;
+    // the commercial edition keeps accepting deploy-v5.sh only.
+    if (!DEPLOY_SCRIPT.includes(base) && EDITION === "selfhost" && selfhostDeployScript().includes(base)) {
+      return { status: "wired", runner: `deploy-v5-selfhost.sh → ${base}` };
+    }
+    if (!DEPLOY_SCRIPT.includes(base)) {
+      fail(EDITION === "selfhost"
+        ? `deploy-v5.sh 与 deploy-v5-selfhost.sh 都未调用 ${path},不能标 deploy-gate`
+        : `deploy-v5.sh 未调用 ${path},不能标 deploy-gate`);
+    }
     return { status: "wired", runner: `deploy-v5.sh → ${base}` };
   }
   if (layer === "integration") {
