@@ -7039,6 +7039,30 @@
           "assertion": "T73 INC-20261015-COLDSTART-QUEUED-THINKING: a queued message shows the connection state until the server admits it"
         }
       ]
+    },
+    {
+      "id": "INC-20261015-GO-CACHE-PREFIX",
+      "occurredAt": "2026-10-15",
+      "severity": "P2",
+      "symptom": "个人版 OpenCode Go 的 /responses 与 /chat/completions 桥把 CCB 每轮追加的 role:system「<total_tokens>…」消息并进 instructions/首条 system，前缀逐请求变化：GPT-6 Luna / GPT-5.6 Luna 每轮全量 cache_write、cache_read=0，Grok/Muse 仅命中约 16–18K/35K。计费如实、无误差，但用户付了缓存写溢价却拿不到读折扣。",
+      "rootFixCommit": "085b03e3",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/openAiResponsesGoBridge.test.ts",
+          "assertion": "later system messages stay in place, so every request extends the previous one (OCV5-432)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/openAiChatGoBridge.test.ts",
+          "assertion": "later system messages stay in place, so every request extends the previous one (OCV5-432)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-go-cache-contract.mjs",
+          "assertion": "G1 OpenCode Go prompt cache hits across turns"
+        }
+      ]
     }
   ]
 }
