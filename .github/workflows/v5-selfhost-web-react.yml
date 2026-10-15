@@ -73,3 +73,8 @@ jobs:
 
       - name: Run web-react-browser
         run: npm run test:browser
+
+      # OCV5-431: the selfhost C1-C3 contract gate browser tests (clickSend, settle,
+      # continuation) live in scripts/lib and were never run by CI; same runner and browser.
+      - name: Contract gate browser tests (scripts/lib)
+        run: node --test scripts/lib/user-contract-*.test.mjs
