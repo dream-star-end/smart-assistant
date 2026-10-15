@@ -46,6 +46,15 @@ export interface PoolMemberView {
   lastUsedAt: string | null
   /** Short, non-secret hints: plan, quota %, key fingerprint, egress label. */
   hints: Record<string, string | number | null>
+  /**
+   * Usage quota windows (subscription members whose upstream reports one), or a
+   * note saying why there is none. Absent: the page derives it from the account row.
+   */
+  quota?: {
+    windows: Array<{ label: string; usedPct: number | null; resetsAt: string | null }>
+    updatedAt: string | null
+    note: string | null
+  }
 }
 
 export interface PoolAdapter {

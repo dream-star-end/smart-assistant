@@ -17,6 +17,21 @@ export interface PoolMember {
   lastError: string | null;
   lastUsedAt: string | null;
   hints: Record<string, string | number | null>;
+  /** Usage quota windows, or a note saying why there are none (OCV5-424 merged tab). */
+  quota?: MemberQuota;
+}
+
+export interface QuotaWindowView {
+  label: string;
+  /** 0–100 used share; null when the upstream gives no figure for this window. */
+  usedPct: number | null;
+  resetsAt: string | null;
+}
+
+export interface MemberQuota {
+  windows: QuotaWindowView[];
+  updatedAt: string | null;
+  note: string | null;
 }
 
 export interface PoolView {

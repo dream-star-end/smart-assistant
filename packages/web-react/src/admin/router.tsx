@@ -1,5 +1,5 @@
 import { useMemo, useSyncExternalStore } from "react";
-import { adminTabKeys } from "./registry";
+import { ADMIN_TAB_ALIASES, adminTabKeys } from "./registry";
 
 /**
  * 管理后台 hash 路由（与旧 vanilla admin 深链兼容）。
@@ -21,7 +21,7 @@ const DEFAULT_TAB = "dashboard";
 /** 解析 hash → { tab, params }。纯函数，供路由与测试直接消费。 */
 export function parseAdminHash(hash: string): { tab: string; params: AdminRouteParams } {
   const m = /#tab=([A-Za-z0-9_]+)(?:&(.+))?$/.exec(hash);
-  const raw = m?.[1];
+  const raw = m?.[1] ? (ADMIN_TAB_ALIASES[m[1]] ?? m[1]) : undefined;
   const tab = raw && adminTabKeys.has(raw) ? raw : DEFAULT_TAB;
   const params: AdminRouteParams = {};
   if (m?.[2]) {

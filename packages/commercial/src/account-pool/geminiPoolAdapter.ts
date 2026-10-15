@@ -12,6 +12,7 @@ import {
   type AntigravityOAuthDeps,
 } from './antigravityOAuth.js'
 import { query } from '../db/queries.js'
+import { antigravityAccountQuota, type AntigravityQuotaDeps } from './antigravityQuota.js'
 import type { CooldownReason } from './policy/outcome.js'
 import type { DueProbe, PoolAdapter, PoolMemberView, ProbeResult } from './policy/registry.js'
 import {
@@ -25,6 +26,8 @@ export interface GeminiPoolAdapterDeps {
   /** OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET; empty → probes report transient (re-check later). */
   clientSecret: () => string
   freshToken?: (accountId: bigint, deps: AntigravityOAuthDeps) => Promise<Buffer>
+  /** Admin quota reader (tests inject); default reads Google with the account's token, cached. */
+  quota?: (accountId: string) => Promise<NonNullable<PoolMemberView['quota']>>
 }
 
 export function createGeminiPoolAdapter(deps: GeminiPoolAdapterDeps): PoolAdapter {
@@ -69,7 +72,10 @@ export function createGeminiPoolAdapter(deps: GeminiPoolAdapterDeps): PoolAdapte
                 next_probe_at, last_error, last_used_at
            FROM gemini_oauth_accounts ORDER BY id`,
       )
-      return res.rows.map((r) => ({
+      const quotaDeps: AntigravityQuotaDeps = { clientSecret: deps.clientSecret }
+      const readQuota = deps.quota ?? ((id: string) => antigravityAccountQuota(id, quotaDeps))
+      const quotas = await Promise.all(res.rows.map((r) => readQuota(r.id)))
+      return res.rows.map((r, i) => ({
         service: 'gemini',
         memberKind: 'account' as const,
         id: r.id,
@@ -84,6 +90,7 @@ export function createGeminiPoolAdapter(deps: GeminiPoolAdapterDeps): PoolAdapte
         lastError: r.last_error ? r.last_error.slice(0, 160) : null,
         lastUsedAt: r.last_used_at?.toISOString() ?? null,
         hints: { plan: 'Antigravity', name: r.label !== r.email ? r.label : null, manage: 'antigravity' },
+        quota: quotas[i],
       }))
     },
   }

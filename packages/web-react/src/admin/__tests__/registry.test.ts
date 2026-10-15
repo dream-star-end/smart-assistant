@@ -10,7 +10,7 @@ import {
 // 分组 → 期望 key 列表（权威源 = React registry 的运营信息架构）。
 const EXPECTED: Record<string, string[]> = {
   经营驾驶舱: ["dashboard", "users"],
-  账号与调度: ["pools", "accounts", "accountGroups", "egressProxies"],
+  账号与调度: ["pools", "accountGroups", "egressProxies"],
   运行资源: ["containers", "hosts"],
   财务与商业: ["ledger", "orders", "pricing", "plans", "org", "modelGrants"],
   用户声音与体验: ["feedback", "autoDreamFindings", "productFriction"],
@@ -22,11 +22,11 @@ const EXPECTED: Record<string, string[]> = {
 };
 
 describe("registry 完整性", () => {
-  test("恰好 27 个页面，key 无重复", () => {
-    expect(adminPages).toHaveLength(27);
+  test("恰好 26 个页面，key 无重复", () => {
+    expect(adminPages).toHaveLength(26);
     const keys = adminPages.map((p) => p.key);
-    expect(new Set(keys).size).toBe(27);
-    expect(adminTabKeys.size).toBe(27);
+    expect(new Set(keys).size).toBe(26);
+    expect(adminTabKeys.size).toBe(26);
   });
 
   test("每个 key 都存在且分组正确", () => {
@@ -44,8 +44,8 @@ describe("registry 完整性", () => {
     expect(adminGroups.map((g) => g.group)).toEqual(ADMIN_GROUP_ORDER);
     const flat = adminGroups.flatMap((g) => g.pages.map((p) => p.key));
     expect(flat).toEqual(Object.values(EXPECTED).flat());
-    expect(flat).toHaveLength(27);
-    expect(new Set(flat).size).toBe(27);
+    expect(flat).toHaveLength(26);
+    expect(new Set(flat).size).toBe(26);
   });
 
   test("每页有标题/描述/图标/懒组件", () => {
