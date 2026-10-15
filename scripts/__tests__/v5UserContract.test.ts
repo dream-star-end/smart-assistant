@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { parseModels, parseOptions, turnPolicy, engineMatrix, tapResult, assertOutbound, turnEvidence, continuationCode, continuationPrompts, assertSameSession, assertContinuationAnswer } from "../lib/user-contract.mjs";
 const catalog = [{ id: "grok-build", engine: "grok" }, { id: "deepseek-v4-flash", engine: "ccb" }];
@@ -83,4 +85,28 @@ test("new gate is within forward smoke before smoked and absent from rollback", 
   const fn = shellFunction("user_contract_gate");
   assert.match(fn, /V5_CONTRACT_COST=live/);
   assert.match(fn, /node "\$SCRIPT_DIR\/v5-user-contract-smoke.mjs"/);
+});
+test("OCV5-429: canary prewarm runs before the smoke and never decides the verdict", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ocv5-429-"));
+  const pw = join(dir, "pw");
+  writeFileSync(pw, "x");
+  const fn = shellFunction("user_contract_gate").replace("/etc/openclaude/selfhost-canary.password", pw);
+  const run = (prewarmRc: number, smokeRc: number) => execFileSync("bash", ["-c",
+    `${fn}\nSCRIPT_DIR=/s; V5_PORT=1; node(){ echo "RUN $1 $V5_CONTRACT_COST"; case "$1" in *prewarm*) return ${prewarmRc};; *) return ${smokeRc};; esac; }; user_contract_gate; echo rc=$?`,
+  ], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const ok = run(1, 0);
+  assert.match(ok, /RUN \/s\/v5-user-contract-prewarm\.mjs \nRUN \/s\/v5-user-contract-smoke\.mjs live\nrc=0/);
+  assert.match(run(0, 1), /rc=1/);
+  assert.match(run(1, 1), /rc=1/);
+});
+test("OCV5-429: prewarm is a UI login that sends nothing and waits for relay_ready", async () => {
+  const src = readFileSync(new URL("../v5-user-contract-prewarm.mjs", import.meta.url), "utf8");
+  assert.match(src, /await coldUiLogin\(page, options, password\)/);
+  assert.match(src, /await waitRelayReady\(probe, PREWARM_TIMEOUT\)/);
+  assert.doesNotMatch(src, /fetch\(|sendContractTurn|\/api\/auth/);
+  const { waitRelayReady } = await import("../lib/user-contract-browser.mjs");
+  const probe = { received: [{ type: "sys.frontend_build" }] as Array<{ type: string }> };
+  setTimeout(() => probe.received.push({ type: "sys.relay_ready" }), 30);
+  assert.equal((await waitRelayReady(probe, 1000)).type, "sys.relay_ready");
+  await assert.rejects(waitRelayReady({ received: [] }, 50), /Canary relay not ready/);
 });
