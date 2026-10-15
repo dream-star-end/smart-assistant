@@ -39,6 +39,8 @@ import {
   type ServiceTier,
   type ToolTerminationReason,
   type TurnTokenUsageSnapshot,
+  CODEX_FAST_SERVICE_TIER,
+  CODEX_STANDARD_SERVICE_TIER,
   codexTransportModelId,
   fastServiceTierRoute,
   isToolExitCode,
@@ -3009,10 +3011,12 @@ export class CodexAppServerRunner extends EventEmitter {
     }
     if (this.codexTransportModel()) params.model = this.codexTransportModel()
     if (this.opts.structuredOutputSchema) params.outputSchema = this.opts.structuredOutputSchema
-    // OCV5-434: Fast-capable models always state their tier — explicit "default" keeps a
-    // ChatGPT plan's own Fast default from spending 2.5× limits without the user asking.
+    // OCV5-434: Fast-capable models always state their tier with Codex's catalog ids — "priority"
+    // (Fast; "fast" is ignored by turn/start) or explicit "default", which keeps the catalog's own
+    // Fast default (GPT-6 Luna) from applying without the user asking.
     if (fastServiceTierRoute(this.opts.model) === 'codex') {
-      params.serviceTierForTurn = this._serviceTier === 'fast' ? 'fast' : 'default'
+      params.serviceTierForTurn =
+        this._serviceTier === 'fast' ? CODEX_FAST_SERVICE_TIER : CODEX_STANDARD_SERVICE_TIER
     }
     return params
   }
