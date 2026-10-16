@@ -82,7 +82,7 @@ async function turnStatus(requestId: string): Promise<string | undefined> {
 }
 
 describe('0307 antigravity engine schema', () => {
-  test('engine CHECK accepts antigravity; catalog rows are staged, pricing disabled, claude/gpt-oss admin-only', async (t) => {
+  test('engine CHECK accepts antigravity; catalog rows are staged, pricing disabled, all admin-only (commercial)', async (t) => {
     if (db.skipIfUnavailable(t)) return
     const rows = await query<{
       model_id: string
@@ -111,7 +111,7 @@ describe('0307 antigravity engine schema', () => {
         model_id: 'antigravity-gemini-3.8-flash',
         state: 'staged',
         enabled: false,
-        visibility: 'public',
+        visibility: 'admin',
       },
       {
         model_id: 'antigravity-gpt-oss-120b',

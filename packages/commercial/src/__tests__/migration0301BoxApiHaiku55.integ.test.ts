@@ -8,7 +8,7 @@ import { getPool } from "../db/index.js";
 import { runMigrations } from "../db/migrate.js";
 import { query } from "../db/queries.js";
 import { issueBoxNativeContextOwner } from "../http/proxy/boxNativeContextOwner.js";
-import { resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js";
+import { migrationsDirBefore, resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js";
 
 const db = useDedicatedTestDatabase("commercial_box_api_haiku55_0301_test");
 const sqlPath = fileURLToPath(new URL("../db/migrations/0301_commercial_box_api_haiku_5_5.sql", import.meta.url));
@@ -72,8 +72,9 @@ describe("0301 prepares Claude Haiku 5.5 on the commercial Box model route witho
     const before = await others();
     assert.equal((await query("SELECT 1 FROM model_catalog WHERE model_id=$1", [MODEL])).rowCount, 0);
     // 0302 (chat_projects columns, OCV5-380) and 0304 (billing workload columns, OCV5-392) follow 0301
-    // in the chain and touch no catalog row.
-    assert.deepEqual((await runMigrations()).applied,
+    // in the chain and touch no catalog row. 0307 adds the staged Antigravity rows on purpose, so the
+    // chain here stops before 0305.
+    assert.deepEqual((await runMigrations({ dir: await migrationsDirBefore("0305") })).applied,
       ["0301_commercial_box_api_haiku_5_5", "0302_chat_project_workspace", "0304_billing_workload_column"]);
     assert.deepEqual(await others(), before);
     assert.equal((await prepared()).state, "staged");
