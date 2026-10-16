@@ -22,128 +22,150 @@
  * OC_EGRESS_SECRET,任一缺失拒启(比"静默半配跑起来"好排查)。
  */
 
-import { BoxSwitchStore, boxSwitchCompactionEnabled } from "../http/proxy/boxSwitchCompaction.js";
-import { boxApiModelById } from "@openclaude/protocol";
-import { createServer as createHttpServer } from "node:http";
-import { randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import IORedis from "ioredis";
+import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { createServer as createHttpServer } from 'node:http'
+import { join } from 'node:path'
+import { boxApiModelById } from '@openclaude/protocol'
+import IORedis from 'ioredis'
+import { BoxSwitchStore, boxSwitchCompactionEnabled } from '../http/proxy/boxSwitchCompaction.js'
 
-import { loadConfig } from "../config.js";
-import { getPool } from "../db/index.js";
-import { PricingCache } from "../billing/pricing.js";
+import { loadBoxBridgeMod } from '@openclaude/gateway'
+import { EGRESS_HEALTH_PATH, EGRESS_STATS_PATH } from '@openclaude/protocol'
 import {
-  authorityKeyringProvider,
-  getModelCatalogCache,
-  isModelAuthorityEnforced,
-} from "../billing/modelCatalogRuntime.js";
-import { releasePreCheck, wrapIoredisForPreCheck } from "../billing/preCheck.js";
-import { settleBoxReplayBeforeDelivery } from "../billing/boxBillingRecovery.js";
-import { BoxContinuationDecisionError, type PreparedContinuation } from "../http/proxy/boxPreparedContinuation.js";
-import { wrapIoredis } from "../middleware/rateLimit.js";
-import { AccountHealthTracker, wrapIoredisForHealth } from "../account-pool/health.js";
-import { AccountScheduler } from "../account-pool/scheduler.js";
-import { listEnabledGroupsForModel } from "../account-pool/groups.js";
-import { getPhase6AccountUuidEnforce, getSessionPinMode } from "../admin/runtimeFlags.js";
-import { createPgIdentityRepo } from "../auth/containerIdentity.js";
-import { makeContainerIdentityStrategy } from "../auth/proxyIdentity.js";
-import { makeLoadUserModelAuthz } from "../auth/userModelAuthz.js";
-import {
-  makeAnthropicProxyHandler,
-  ConcurrencyLimiter,
-  FallbackRateLimiter,
-  DEFAULT_PROXY_RATE_LIMIT,
-  DEFAULT_MAX_CONCURRENT_PER_UID,
-} from "../http/anthropicProxy.js";
-import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProviderMeta.js";
+  configureAntigravityModelCooldownStore,
+  createIoredisAntigravityModelCooldownStore,
+} from '../account-pool/antigravityModelCooldown.js'
 import {
   apiKeyPoolConfiguredServices,
   importEnvApiKeys,
   primeApiKeyPool,
   startApiKeyPoolCache,
-} from "../account-pool/apiKeyPool.js";
-import { BoxTextFetch } from "../http/proxy/boxTextFetch.js";
-import { boxInteractiveRunnerEnabled, type BoxInteractiveHostAsset } from "../http/proxy/boxTextPlan.js";
-import { loadBoxBridgeMod } from "@openclaude/gateway";
-import { BoxToolFetch } from "../http/proxy/boxToolFetch.js";
-import { BoxInvocationRegistry } from "../http/proxy/boxInvocationRegistry.js";
-import { resolveBoxCapacityPolicy } from "../http/proxy/boxCapacityPolicy.js";
-import { BoxDurableJournal } from "../http/proxy/boxDurableJournal.js";
-import { createBoxReplayReader, createBoxReplayRecoveryWriter,
-  createBoxReplayWriter } from "./boxReplaySetup.js";
-import { findCompletedBoxReplay } from "../http/proxy/boxReplayCompleted.js";
-import { observeBoxToolUnknown } from "../http/proxy/boxToolUnknownObserver.js";
-import { observeBoxTextUnknown } from "../http/proxy/boxTextUnknownObserver.js";
-import { createProductionBoxAccountResolver, productionBoxProfileHealth } from "../http/proxy/boxAccountResolver.js";
-import { listBoxProfiles } from "../http/proxy/boxClaudeProfileStore.js";
-import { BoxInteractiveLogins } from "../http/proxy/boxInteractiveLogins.js";
-import { boxInteractiveMasterRoute, isBoxInteractiveMasterPath, makeBoxLoginHandler } from "../http/proxy/boxLoginHandler.js";
-import { BOX_API_RESOLVE_MODEL } from "../http/proxy/boxApiResolveModel.js";
-import { boxExecTargetEntitlement } from "../cursor/access.js";
-import { getAccount } from "../account-pool/store.js";
-import { BoxUserStopCoordinator } from "../http/proxy/boxUserStopCoordinator.js";
-import { BoxCliVersionGate, gateBoxLaunchResolver } from "../http/proxy/boxCliVersion.js";
-import { makeBoxUserStopHandler } from "../http/proxy/boxUserStopHandler.js";
-import { makeBoxIdleProofHandler } from "../http/proxy/boxIdleProofHandler.js";
-import { startLatencyProber } from "./latencyProber.js";
-import { startRecoveryProber } from "./recoveryProber.js";
-import { snapshotInflight } from "../http/proxy/inflightTracker.js";
+} from '../account-pool/apiKeyPool.js'
 import {
-  EGRESS_CAPABILITIES,
-  assertModelAuthorityCutoverFloor,
-} from "../runtimeCapabilities.js";
-import { ocGatewayIpForChannel, ocInternalProxyPortForChannel } from "../agent-sandbox/v3supervisor.js";
-import { getSelfHost } from "../compute-pool/queries.js";
-import { EGRESS_HEALTH_PATH, EGRESS_STATS_PATH } from "@openclaude/protocol";
-import { rootLogger } from "../logging/logger.js";
-import { CODEX_TOKEN_REFRESH_PATH } from "../http/internalCodexTokenRefresh.js";
-import { CODEX_RELAY_PREFIX } from "../http/internalCodexRelay.js";
-import { GROK_RELAY_PREFIX, makeGrokRelayHandler } from "../http/internalGrokRelay.js";
-import { ZCODE_RELAY_PREFIX, makeZcodeRelayHandler } from "../http/internalZcodeRelay.js";
-import { configureZcodeRelayKv, createIoredisZcodeRelayKv } from "../billing/zcodeRouteContext.js";
-import { ANTIGRAVITY_RELAY_PREFIX, makeAntigravityRelayHandler } from "../http/internalAntigravityRelay.js";
+  type CodexDisableFanoutDeps,
+  enqueueCodexDisableFanout,
+} from '../account-pool/codexDisableFanout.js'
+import { listEnabledGroupsForModel } from '../account-pool/groups.js'
+import { AccountHealthTracker, wrapIoredisForHealth } from '../account-pool/health.js'
+import { AccountScheduler } from '../account-pool/scheduler.js'
+import { getAccount } from '../account-pool/store.js'
+import { shutdownDurableMetricRollups } from '../admin/durableMetricRollups.js'
+import { getPhase6AccountUuidEnforce, getSessionPinMode } from '../admin/runtimeFlags.js'
+import { V3_AGENT_GID, V3_AGENT_UID } from '../agent-sandbox/constants.js'
 import {
-  configureAntigravityModelCooldownStore,
-  createIoredisAntigravityModelCooldownStore,
-} from "../account-pool/antigravityModelCooldown.js";
-import { configureAntigravityRelayKv } from "../billing/antigravityRouteContext.js";
+  ocGatewayIpForChannel,
+  ocInternalProxyPortForChannel,
+} from '../agent-sandbox/v3supervisor.js'
+import { createPgIdentityRepo } from '../auth/containerIdentity.js'
+import { makeDesktopIdentityStrategy } from '../auth/desktopIdentity.js'
+import { makeContainerIdentityStrategy } from '../auth/proxyIdentity.js'
+import { makeLoadUserModelAuthz } from '../auth/userModelAuthz.js'
+import { configureAntigravityRelayKv } from '../billing/antigravityRouteContext.js'
+import { settleBoxReplayBeforeDelivery } from '../billing/boxBillingRecovery.js'
+import {
+  authorityKeyringProvider,
+  getModelCatalogCache,
+  isModelAuthorityEnforced,
+} from '../billing/modelCatalogRuntime.js'
+import { releasePreCheck, wrapIoredisForPreCheck } from '../billing/preCheck.js'
+import { PricingCache } from '../billing/pricing.js'
+import { configureZcodeRelayKv, createIoredisZcodeRelayKv } from '../billing/zcodeRouteContext.js'
+import { getSelfHost } from '../compute-pool/queries.js'
+import { loadConfig } from '../config.js'
+import { boxExecTargetEntitlement } from '../cursor/access.js'
+import { getPool } from '../db/index.js'
+import { getDesktopFlagSnapshot } from '../desktop/flags.js'
+import { extractDesktopTlsContext } from '../desktop/tlsContext.js'
+import {
+  ConcurrencyLimiter,
+  DEFAULT_MAX_CONCURRENT_PER_UID,
+  DEFAULT_PROXY_RATE_LIMIT,
+  FallbackRateLimiter,
+  makeAnthropicProxyHandler,
+} from '../http/anthropicProxy.js'
 import {
   buildCodexRelayHandler,
   buildCodexTokenRefreshHandler,
   putRemoteCodexAuthViaServiceableHost,
   readCodexContainerDir,
-} from "../http/codexInternalAssembly.js";
+} from '../http/codexInternalAssembly.js'
+import { createPgDesktopIdentityRepo } from '../http/desktopEnroll.js'
+import { startDesktopTlsListener } from '../http/desktopTlsListener.js'
 import {
-  type CodexDisableFanoutDeps,
-  enqueueCodexDisableFanout,
-} from "../account-pool/codexDisableFanout.js";
-import { V3_AGENT_GID, V3_AGENT_UID } from "../agent-sandbox/constants.js";
-import { CostEventSink } from "./costEventSink.js";
-import { makeForwarder } from "./forwarder.js";
-import { shutdownDurableMetricRollups } from "../admin/durableMetricRollups.js";
-import { computeListenPlan, type SlotHealthBody } from "./listenPlan.js";
-import { startDesktopTlsListener } from "../http/desktopTlsListener.js";
-import { createPgDesktopIdentityRepo } from "../http/desktopEnroll.js";
-import { makeDesktopIdentityStrategy } from "../auth/desktopIdentity.js";
-import { extractDesktopTlsContext } from "../desktop/tlsContext.js";
-import { getDesktopFlagSnapshot } from "../desktop/flags.js";
-import { sendJson } from "../http/util.js";
+  ANTIGRAVITY_RELAY_PREFIX,
+  makeAntigravityRelayHandler,
+} from '../http/internalAntigravityRelay.js'
+import { CODEX_RELAY_PREFIX } from '../http/internalCodexRelay.js'
+import { CODEX_TOKEN_REFRESH_PATH } from '../http/internalCodexTokenRefresh.js'
+import { GROK_RELAY_PREFIX, makeGrokRelayHandler } from '../http/internalGrokRelay.js'
+import { ZCODE_RELAY_PREFIX, makeZcodeRelayHandler } from '../http/internalZcodeRelay.js'
+import {
+  createProductionBoxAccountResolver,
+  productionBoxProfileHealth,
+} from '../http/proxy/boxAccountResolver.js'
+import { BOX_API_RESOLVE_MODEL } from '../http/proxy/boxApiResolveModel.js'
+import { resolveBoxCapacityPolicy } from '../http/proxy/boxCapacityPolicy.js'
+import { listBoxProfiles } from '../http/proxy/boxClaudeProfileStore.js'
+import { BoxCliVersionGate, gateBoxLaunchResolver } from '../http/proxy/boxCliVersion.js'
+import { BoxDurableJournal } from '../http/proxy/boxDurableJournal.js'
+import { makeBoxIdleProofHandler } from '../http/proxy/boxIdleProofHandler.js'
+import { BoxInteractiveLogins } from '../http/proxy/boxInteractiveLogins.js'
+import { BoxInvocationRegistry } from '../http/proxy/boxInvocationRegistry.js'
+import {
+  boxInteractiveMasterRoute,
+  isBoxInteractiveMasterPath,
+  makeBoxLoginHandler,
+} from '../http/proxy/boxLoginHandler.js'
+import {
+  BoxContinuationDecisionError,
+  type PreparedContinuation,
+} from '../http/proxy/boxPreparedContinuation.js'
+import { findCompletedBoxReplay } from '../http/proxy/boxReplayCompleted.js'
+import { BoxTextFetch } from '../http/proxy/boxTextFetch.js'
+import {
+  type BoxInteractiveHostAsset,
+  boxInteractiveRunnerEnabled,
+} from '../http/proxy/boxTextPlan.js'
+import { observeBoxTextUnknown } from '../http/proxy/boxTextUnknownObserver.js'
+import { BoxToolFetch } from '../http/proxy/boxToolFetch.js'
+import { observeBoxToolUnknown } from '../http/proxy/boxToolUnknownObserver.js'
+import { BoxUserStopCoordinator } from '../http/proxy/boxUserStopCoordinator.js'
+import { makeBoxUserStopHandler } from '../http/proxy/boxUserStopHandler.js'
+import { snapshotInflight } from '../http/proxy/inflightTracker.js'
+import {
+  assertPlatformDefaultModelConfigured,
+  staticProviderKeysFromConfig,
+} from '../http/proxy/staticProviderMeta.js'
+import { sendJson } from '../http/util.js'
+import { rootLogger } from '../logging/logger.js'
+import { wrapIoredis } from '../middleware/rateLimit.js'
+import { EGRESS_CAPABILITIES, assertModelAuthorityCutoverFloor } from '../runtimeCapabilities.js'
+import {
+  createBoxReplayReader,
+  createBoxReplayRecoveryWriter,
+  createBoxReplayWriter,
+} from './boxReplaySetup.js'
+import { CostEventSink } from './costEventSink.js'
+import { makeForwarder } from './forwarder.js'
+import { startLatencyProber } from './latencyProber.js'
+import { type SlotHealthBody, computeListenPlan } from './listenPlan.js'
+import { startRecoveryProber } from './recoveryProber.js'
 
-const log = rootLogger.child({ subsys: "egressMain" });
+const log = rootLogger.child({ subsys: 'egressMain' })
 
 /** SIGTERM 后给在飞流的 drain 上限(systemd TimeoutStopSec 须 ≥ 此值+缓冲)。 */
-const EGRESS_DRAIN_MS = Number(process.env.EGRESS_DRAIN_MS ?? 30 * 60_000);
+const EGRESS_DRAIN_MS = Number(process.env.EGRESS_DRAIN_MS ?? 30 * 60_000)
 
 export async function startEgress(): Promise<void> {
-  process.env.OC_EGRESS_PROCESS = "1";
+  process.env.OC_EGRESS_PROCESS = '1'
   // D3④:进程实例标识 —— 优先 systemd invocation id(每次 (re)start 变化),否则随机
   // UUID。finalize 门槛用它区分"队列自然排空"与"egress 中途重启计数归零假绿"。
-  const processStartId = process.env.INVOCATION_ID ?? randomUUID();
+  const processStartId = process.env.INVOCATION_ID ?? randomUUID()
   // 蓝绿双槽:sd_listen_fds 传入的共享 SO_REUSEPORT socket + 每槽私有健康口。
   // 在任何 await 之前算好(LISTEN_* 是 systemd 在 exec 时注入的,越早读越不会被子进程搅)。
-  const listenPlan = computeListenPlan(process.env, process.pid);
-  const slot = listenPlan.slot;
+  const listenPlan = computeListenPlan(process.env, process.pid)
+  const slot = listenPlan.slot
   // 出口拓扑与拆分前的 master 完全对齐(packages/cli gateway.ts 同款):
   // 有 HTTP(S)_PROXY env(日本 sing-box 节点)→ 装全局 EnvHttpProxyAgent,给
   // Anthropic/OpenAI 等出海上游用;国内静态 provider(ark glm/deepseek/minimax)
@@ -156,105 +178,88 @@ export async function startEgress(): Promise<void> {
     process.env.http_proxy ||
     process.env.https_proxy
   ) {
-    const { setGlobalDispatcher, EnvHttpProxyAgent } = await import("undici");
-    setGlobalDispatcher(new EnvHttpProxyAgent());
-    log.info("egress_global_proxy_agent_installed", {});
+    const { setGlobalDispatcher, EnvHttpProxyAgent } = await import('undici')
+    setGlobalDispatcher(new EnvHttpProxyAgent())
+    log.info('egress_global_proxy_agent_installed', {})
   }
-  const cfg = loadConfig();
+  const cfg = loadConfig()
   if (!cfg.OC_EGRESS_SPLIT) {
-    throw new Error("[egress] OC_EGRESS_SPLIT!=1 — egress 进程只在 split 模式下运行,拒启");
+    throw new Error('[egress] OC_EGRESS_SPLIT!=1 — egress 进程只在 split 模式下运行,拒启')
   }
   // 步骤 5 兼容地板(方案 §7 步 5,R4-M2:egress 是四面之一)。marker 置位却 flag 关 = 拒启。
-  assertModelAuthorityCutoverFloor();
-  const bind = cfg.INTERNAL_PROXY_BIND;
-  const port = cfg.INTERNAL_PROXY_PORT;
-  const controlBind = cfg.INTERNAL_CONTROL_BIND;
-  const controlPort = cfg.INTERNAL_CONTROL_PORT;
-  const secret = cfg.OC_EGRESS_SECRET;
-  if (!bind || port === undefined) throw new Error("[egress] INTERNAL_PROXY_BIND/PORT 必配,拒启");
+  assertModelAuthorityCutoverFloor()
+  const bind = cfg.INTERNAL_PROXY_BIND
+  const port = cfg.INTERNAL_PROXY_PORT
+  const controlBind = cfg.INTERNAL_CONTROL_BIND
+  const controlPort = cfg.INTERNAL_CONTROL_PORT
+  const secret = cfg.OC_EGRESS_SECRET
+  if (!bind || port === undefined) throw new Error('[egress] INTERNAL_PROXY_BIND/PORT 必配,拒启')
   if (!controlBind || controlPort === undefined) {
-    throw new Error("[egress] INTERNAL_CONTROL_BIND/PORT 必配(master 控制口转发目标),拒启");
+    throw new Error('[egress] INTERNAL_CONTROL_BIND/PORT 必配(master 控制口转发目标),拒启')
   }
-  if (!secret) throw new Error("[egress] OC_EGRESS_SECRET 必配,拒启");
+  if (!secret) throw new Error('[egress] OC_EGRESS_SECRET 必配,拒启')
   // 与 master 同款双权威错位防护:容器 egress 目标(supervisor 注入 env 的单一权威
   // helper)必须与本进程实际 bind 一致,否则容器一调用就挂。
-  const expectBind = ocGatewayIpForChannel();
-  const expectPort = ocInternalProxyPortForChannel();
+  const expectBind = ocGatewayIpForChannel()
+  const expectPort = ocInternalProxyPortForChannel()
   if (bind !== expectBind || port !== expectPort) {
     throw new Error(
       `[egress] bind 与 channel 期望不符:${bind}:${port}(期望 ${expectBind}:${expectPort}),拒启`,
-    );
+    )
   }
   // 平台默认模型 key 缺失 → loud fail(与 master 同款 guard)。OCV5-424:服务池里已有
   // 该 provider 的 key 也算已配置;读池失败(DB 未就绪)按"池为空"处理,仍由 env 决定。
-  await primeApiKeyPool().catch(() => {});
+  await primeApiKeyPool().catch(() => {})
   assertPlatformDefaultModelConfigured(cfg, {
     apiKeyPoolConfigured: (service) => apiKeyPoolConfiguredServices().has(service),
-  });
+  })
 
   const redis = new IORedis(cfg.REDIS_URL, {
     lazyConnect: false,
     maxRetriesPerRequest: 3,
     enableReadyCheck: true,
-  });
-  configureZcodeRelayKv(createIoredisZcodeRelayKv(redis));
-  configureAntigravityRelayKv(createIoredisZcodeRelayKv(redis));
-  configureAntigravityModelCooldownStore(createIoredisAntigravityModelCooldownStore(redis));
-  const pricing = new PricingCache();
+  })
+  configureZcodeRelayKv(createIoredisZcodeRelayKv(redis))
+  configureAntigravityRelayKv(createIoredisZcodeRelayKv(redis))
+  configureAntigravityModelCooldownStore(createIoredisAntigravityModelCooldownStore(redis))
+  const pricing = new PricingCache()
   try {
-    await pricing.load();
+    await pricing.load()
   } catch (err) {
     // 与 master 同语义:不阻塞启动,cache 空时 handler 返 503 PRICING_NOT_READY。
-    log.error("pricing_initial_load_failed", { err: (err as Error).message });
+    log.error('pricing_initial_load_failed', { err: (err as Error).message })
   }
   try {
-    await pricing.startListener(cfg.DATABASE_URL);
+    await pricing.startListener(cfg.DATABASE_URL)
   } catch (err) {
-    log.error("pricing_listener_failed", { err: (err as Error).message });
+    log.error('pricing_listener_failed', { err: (err as Error).message })
   }
 
-  const preCheckRedis = wrapIoredisForPreCheck(redis);
-  const rateLimitRedis = wrapIoredis(redis);
+  const preCheckRedis = wrapIoredisForPreCheck(redis)
+  const rateLimitRedis = wrapIoredis(redis)
   const healthTracker = new AccountHealthTracker({
     redis: wrapIoredisForHealth(redis as unknown as Parameters<typeof wrapIoredisForHealth>[0]),
-  });
-  const scheduler = new AccountScheduler({ health: healthTracker });
-  const identityRepo = createPgIdentityRepo();
-  const loadUserModelAuthz = makeLoadUserModelAuthz();
+  })
+  const scheduler = new AccountScheduler({ health: healthTracker })
+  const identityRepo = createPgIdentityRepo()
+  const loadUserModelAuthz = makeLoadUserModelAuthz()
   const identityStrategy = makeContainerIdentityStrategy({
     repo: identityRepo,
     pricing,
     loadUserModelAuthz,
-  });
+  })
 
-  const controlBaseUrl = `http://${controlBind}:${controlPort}`;
-  const costSink = new CostEventSink({ controlBaseUrl, secret });
-  await costSink.init();
+  const controlBaseUrl = `http://${controlBind}:${controlPort}`
+  const costSink = new CostEventSink({ controlBaseUrl, secret })
+  await costSink.init()
 
   // 静态 key 解析表 —— proxyHandler 与延迟探测器(0105)共用同一份,防两处漂移。
-  const staticProviderKeys = {
-    deepseek: cfg.DEEPSEEK_API_KEY,
-    // 2026-07-07:切回 MiniMax 官方(回退 06-30 火山迁移;火山 Ark 大图识图挂死,官方 4.9s)。
-    minimax: cfg.MINIMAX_TOKEN_PLAN_KEY,
-    ark: cfg.ARK_CODING_PLAN_KEY,
-    // 2026-08-15:智谱国际版 Z.AI GLM Coding Plan(glm-5.3-zai)。
-    zai: cfg.ZAI_CODING_PLAN_KEY,
-    // 2026-07-05:OpenCode Go(qwen3.7-max/plus)。与 master internalProxyHandler 同口径注入。
-    opencodego: cfg.OPENCODE_GO_API_KEY,
-    // 2026-07-06:火山 Agent Plan Kimi(kimi-k2.7-code),与 minimax 共 ARK_AGENT_PLAN_KEY。
-    kimi: cfg.ARK_AGENT_PLAN_KEY,
-    // 2026-07-22:火山 Agent Plan Kimi K3(kimi-k3-ark),同订阅/key、独立能力机制。
-    "ark-k3": cfg.ARK_AGENT_PLAN_KEY,
-    // 2026-07-17:Moonshot 官方 Kimi For Coding(kimi-k3),独立订阅独立 key。
-    moonshot: cfg.MOONSHOT_CODING_PLAN_KEY,
-    // 2026-08-04:阿里百炼 Token Plan(qwen3.8-max)，独立订阅独立 key。
-    bailian: cfg.BAILIAN_TOKEN_PLAN_KEY,
-  };
+  const staticProviderKeys = staticProviderKeysFromConfig(cfg)
   // OCV5-424:env key 幂等导入为各自服务池成员(source='env'),池快照后台保鲜。
   await importEnvApiKeys(staticProviderKeys).catch((err) => {
-    console.warn("[egress] api-key pool env import failed:", (err as Error)?.message ?? err);
-  });
-  startApiKeyPoolCache();
+    console.warn('[egress] api-key pool env import failed:', (err as Error)?.message ?? err)
+  })
+  startApiKeyPoolCache()
 
   // ── 模型执行 catalog(模型权威批次 · 方案 §1.2/§4)────────────────────────────
   //
@@ -265,288 +270,411 @@ export async function startEgress(): Promise<void> {
   // 两个模式都加载 catalog(影子期用真实流量证明"切判定源不改变任何请求的命运");
   // 加载失败 → 抛 → egress 拒启(fail-closed:半开状态会让每条请求都被 fence 拒)。
   // **生效面**:改本段或 gate/路由代码,部署必须 `deploy-v5.sh --egress`。
-  const modelCatalog = await getModelCatalogCache();
-  const modelAuthorityEnforce = isModelAuthorityEnforced();
-  log.info("model_catalog_ready", {
+  const modelCatalog = await getModelCatalogCache()
+  const modelAuthorityEnforce = isModelAuthorityEnforced()
+  log.info('model_catalog_ready', {
     enforce: modelAuthorityEnforce,
     securityEpoch: modelCatalog.current().securityEpoch.toString(),
     executionRevision: modelCatalog.current().executionRevision.slice(0, 12),
-  });
+  })
 
-  const sharedProxyConcurrency = new ConcurrencyLimiter(DEFAULT_MAX_CONCURRENT_PER_UID);
+  const sharedProxyConcurrency = new ConcurrencyLimiter(DEFAULT_MAX_CONCURRENT_PER_UID)
   // OCV5-297: one capacity policy feeds the registry, the durable journal cap
   // and the Box proxy pool/rate. Commercial defaults leave all three unchanged.
-  const boxCapacity = resolveBoxCapacityPolicy(process.env);
-  const boxProxyConcurrency = boxCapacity.proxyConcurrency === null ? undefined
-    : new ConcurrencyLimiter(boxCapacity.proxyConcurrency);
-  const boxProxyRateLimit = boxCapacity.proxyRatePerMinute === null ? undefined
-    : { ...DEFAULT_PROXY_RATE_LIMIT, scope: "proxy_uid_box", windowSeconds: 60,
-      max: boxCapacity.proxyRatePerMinute };
+  const boxCapacity = resolveBoxCapacityPolicy(process.env)
+  const boxProxyConcurrency =
+    boxCapacity.proxyConcurrency === null
+      ? undefined
+      : new ConcurrencyLimiter(boxCapacity.proxyConcurrency)
+  const boxProxyRateLimit =
+    boxCapacity.proxyRatePerMinute === null
+      ? undefined
+      : {
+          ...DEFAULT_PROXY_RATE_LIMIT,
+          scope: 'proxy_uid_box',
+          windowSeconds: 60,
+          max: boxCapacity.proxyRatePerMinute,
+        }
   const sharedProxyFallback = new FallbackRateLimiter(
     DEFAULT_PROXY_RATE_LIMIT.windowSeconds,
     Math.max(1, Math.floor(DEFAULT_PROXY_RATE_LIMIT.max / 3)),
-  );
+  )
   // Off by default. Keep the same authenticated /v1/messages handler and
   // OpenClaude user-container agent; Box owns only the supervised model call.
   // Missing staged assets make egress refuse startup when explicitly enabled.
-  const boxResolver = process.env.OC_BOX_MODEL_API === "1"
-    ? createProductionBoxAccountResolver() : null;
+  const boxResolver =
+    process.env.OC_BOX_MODEL_API === '1' ? createProductionBoxAccountResolver() : null
   // The in-process registry and the durable journal share the same caps; the
   // journal remains the cross-process (A/B slot) authority.
-  if (boxResolver) log.info("box_capacity_policy", { ...boxCapacity });
-  const boxJournal = boxResolver ? new BoxDurableJournal(getPool(), () => ({
-    maxRunsPerAccount: boxCapacity.maxRunsPerAccount,
-    maxRunsPerUser: boxCapacity.maxRunsPerUser,
-  })) : null;
+  if (boxResolver) log.info('box_capacity_policy', { ...boxCapacity })
+  const boxJournal = boxResolver
+    ? new BoxDurableJournal(getPool(), () => ({
+        maxRunsPerAccount: boxCapacity.maxRunsPerAccount,
+        maxRunsPerUser: boxCapacity.maxRunsPerUser,
+      }))
+    : null
   // The Box model route has no independent feature flag for private response
   // capsules. Its already-injected platform state root gives this instance a
   // durable sibling directory; commercial instances with Box off create none.
-  const boxReplayWriter = createBoxReplayWriter(boxResolver !== null,
-    process.env.OC_PLATFORM_ROOT);
-  const boxRecoveryWriter = boxReplayWriter
-    ?? createBoxReplayRecoveryWriter(process.env.OC_PLATFORM_ROOT);
-  const boxReplayReader = createBoxReplayReader(process.env.OC_PLATFORM_ROOT);
-  const boxReplayJournal = boxJournal ?? new BoxDurableJournal(getPool());
-  const boxStopResolver = boxResolver ?? createProductionBoxAccountResolver();
-  const boxReplay = boxReplayReader ? {
-    lookup: async (input: Parameters<typeof findCompletedBoxReplay>[0]) => {
-      const deps = { journal: boxReplayJournal, readMessage: boxReplayReader };
-      const onlyAfterSettlement = async (
-        replay: Awaited<ReturnType<typeof findCompletedBoxReplay>>,
-      ): Promise<Awaited<ReturnType<typeof findCompletedBoxReplay>>> => {
-        if (replay.kind !== "ready") return replay;
-        const pointer = replay.identity.messagePointer;
-        if (!pointer || !await settleBoxReplayBeforeDelivery(getPool(), {
-          uid: input.uid, pointer })) return { kind: "pending", identity: replay.identity };
-        await releasePreCheck(preCheckRedis, { userId: input.uid.toString(),
-          requestId: pointer.requestId }).catch(() => {});
-        return replay;
-      };
-      const first = await findCompletedBoxReplay(input, deps);
-      if (first.kind === "ready") return onlyAfterSettlement(first);
-      if (first.kind !== "pending" || first.identity.state !== "unknown"
-        || !first.identity.rootLaunchPermit || !boxReplayWriter) return first;
-      if (first.identity.invocationMode === "detached_tool") {
-        await observeBoxToolUnknown({ identity: first.identity,
-          canonicalBody: input.canonicalBody, upstreamModel: input.upstreamModel }, {
-          journal: boxReplayJournal, writeMessage: boxReplayWriter,
-          resolveTarget: (args) => boxStopResolver.resolve(args),
-        });
-      } else if (first.identity.detachedRunnerHash
-        && first.identity.upstreamModel) {
-        await observeBoxTextUnknown({ identity: first.identity }, {
-          journal: boxReplayJournal, writeMessage: boxReplayWriter,
-          resolveTarget: (args) => boxStopResolver.resolve(args),
-        });
-      } else return first;
-      return onlyAfterSettlement(await findCompletedBoxReplay(input, deps));
-    },
-    // OCV5-306: CCB's same-request fallback must outlast a Box call that is
-    // still finishing after an ambiguous transport cut (#2ee979cd).
-    pendingWait: { budgetMs: 240_000, intervalMs: 3_000 }, // < CCB fallback 300s
-  } : undefined;
-  const reportBoxUnknown = async ({ uid, accountId, requestId, phase }: {
-    uid: bigint; accountId: bigint; requestId: string; phase: string }) => {
-    log.error("box_model_outcome_unknown", { uid: uid.toString(),
-      accountId: accountId.toString(), requestId, phase });
-  };
+  const boxReplayWriter = createBoxReplayWriter(boxResolver !== null, process.env.OC_PLATFORM_ROOT)
+  const boxRecoveryWriter =
+    boxReplayWriter ?? createBoxReplayRecoveryWriter(process.env.OC_PLATFORM_ROOT)
+  const boxReplayReader = createBoxReplayReader(process.env.OC_PLATFORM_ROOT)
+  const boxReplayJournal = boxJournal ?? new BoxDurableJournal(getPool())
+  const boxStopResolver = boxResolver ?? createProductionBoxAccountResolver()
+  const boxReplay = boxReplayReader
+    ? {
+        lookup: async (input: Parameters<typeof findCompletedBoxReplay>[0]) => {
+          const deps = { journal: boxReplayJournal, readMessage: boxReplayReader }
+          const onlyAfterSettlement = async (
+            replay: Awaited<ReturnType<typeof findCompletedBoxReplay>>,
+          ): Promise<Awaited<ReturnType<typeof findCompletedBoxReplay>>> => {
+            if (replay.kind !== 'ready') return replay
+            const pointer = replay.identity.messagePointer
+            if (
+              !pointer ||
+              !(await settleBoxReplayBeforeDelivery(getPool(), {
+                uid: input.uid,
+                pointer,
+              }))
+            )
+              return { kind: 'pending', identity: replay.identity }
+            await releasePreCheck(preCheckRedis, {
+              userId: input.uid.toString(),
+              requestId: pointer.requestId,
+            }).catch(() => {})
+            return replay
+          }
+          const first = await findCompletedBoxReplay(input, deps)
+          if (first.kind === 'ready') return onlyAfterSettlement(first)
+          if (
+            first.kind !== 'pending' ||
+            first.identity.state !== 'unknown' ||
+            !first.identity.rootLaunchPermit ||
+            !boxReplayWriter
+          )
+            return first
+          if (first.identity.invocationMode === 'detached_tool') {
+            await observeBoxToolUnknown(
+              {
+                identity: first.identity,
+                canonicalBody: input.canonicalBody,
+                upstreamModel: input.upstreamModel,
+              },
+              {
+                journal: boxReplayJournal,
+                writeMessage: boxReplayWriter,
+                resolveTarget: (args) => boxStopResolver.resolve(args),
+              },
+            )
+          } else if (first.identity.detachedRunnerHash && first.identity.upstreamModel) {
+            await observeBoxTextUnknown(
+              { identity: first.identity },
+              {
+                journal: boxReplayJournal,
+                writeMessage: boxReplayWriter,
+                resolveTarget: (args) => boxStopResolver.resolve(args),
+              },
+            )
+          } else return first
+          return onlyAfterSettlement(await findCompletedBoxReplay(input, deps))
+        },
+        // OCV5-306: CCB's same-request fallback must outlast a Box call that is
+        // still finishing after an ambiguous transport cut (#2ee979cd).
+        pendingWait: { budgetMs: 240_000, intervalMs: 3_000 }, // < CCB fallback 300s
+      }
+    : undefined
+  const reportBoxUnknown = async ({
+    uid,
+    accountId,
+    requestId,
+    phase,
+  }: {
+    uid: bigint
+    accountId: bigint
+    requestId: string
+    phase: string
+  }) => {
+    log.error('box_model_outcome_unknown', {
+      uid: uid.toString(),
+      accountId: accountId.toString(),
+      requestId,
+      phase,
+    })
+  }
   // OCV5-313: only these two model launch paths go through the CLI version
   // gate. Stop, cleanup and recovery keep the plain resolver (boxStopResolver).
-  const boxCliGate = new BoxCliVersionGate({ onRejected: (info) =>
-    log.error("box_cli_version_unsupported", info) });
-  const resolveBoxLaunch = boxResolver ? gateBoxLaunchResolver(
-    (args: Parameters<typeof boxResolver.resolve>[0]) => boxResolver.resolve(args),
-    boxCliGate) : null;
+  const boxCliGate = new BoxCliVersionGate({
+    onRejected: (info) => log.error('box_cli_version_unsupported', info),
+  })
+  const resolveBoxLaunch = boxResolver
+    ? gateBoxLaunchResolver(
+        (args: Parameters<typeof boxResolver.resolve>[0]) => boxResolver.resolve(args),
+        boxCliGate,
+      )
+    : null
   // OCV5-378: models with BoxApiRunner "interactive" (box-claude-*) run through the oc-box host in
   // print mode. Loaded once like the other Box helpers, and only where the installation turned the
   // interactive runner on (boxInteractiveRunnerEnabled); without it those models are refused
   // (BOX_INTERACTIVE_HOST_UNAVAILABLE) and every `claude -p` model is unaffected.
-  let boxInteractiveHost: BoxInteractiveHostAsset | undefined;
-  if (boxResolver && !boxInteractiveRunnerEnabled()) log.info("box_interactive_runner_off");
+  let boxInteractiveHost: BoxInteractiveHostAsset | undefined
+  if (boxResolver && !boxInteractiveRunnerEnabled()) log.info('box_interactive_runner_off')
   if (boxResolver && boxInteractiveRunnerEnabled()) {
     try {
-      const mod = loadBoxBridgeMod(join(process.cwd(), "packages/gateway/box-bridge-mod"));
-      boxInteractiveHost = { host: Buffer.from(mod.hostPy, "utf8"),
-        modFiles: JSON.stringify(mod.files), modSha256: mod.sha256 };
+      const mod = loadBoxBridgeMod(join(process.cwd(), 'packages/gateway/box-bridge-mod'))
+      boxInteractiveHost = {
+        host: Buffer.from(mod.hostPy, 'utf8'),
+        modFiles: JSON.stringify(mod.files),
+        modSha256: mod.sha256,
+      }
     } catch {
-      log.error("box_interactive_host_unavailable");
+      log.error('box_interactive_host_unavailable')
     }
   }
-  const boxTextModel = boxResolver && boxJournal ? new BoxTextFetch({
-    supervisorAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_supervisor.py")),
-    keeperAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_keeper.py")),
-    detachedRunnerAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_detached_runner.py")),
-    ...(boxInteractiveHost ? { interactiveHost: boxInteractiveHost } : {}),
-    registry: new BoxInvocationRegistry({ maxPerUser: boxCapacity.maxRunsPerUser,
-      maxPerAccount: boxCapacity.maxRunsPerAccount, leaseMs: 900_000 }),
-    journal: boxJournal,
-    writeMessage: boxReplayWriter,
-    maxOutputTokensForModel: (model) =>
-      boxApiModelById(model)?.maxOutputTokens ?? null,
-    resolveTarget: (args) => resolveBoxLaunch!({ ...args,
-      allowWakeIfHibernated: true }),
-    onUnknown: reportBoxUnknown,
-  }) : undefined;
+  const boxTextModel =
+    boxResolver && boxJournal
+      ? new BoxTextFetch({
+          supervisorAsset: readFileSync(join(process.cwd(), 'scripts/ocv5-289/box_supervisor.py')),
+          keeperAsset: readFileSync(join(process.cwd(), 'scripts/ocv5-289/box_keeper.py')),
+          detachedRunnerAsset: readFileSync(
+            join(process.cwd(), 'scripts/ocv5-289/box_detached_runner.py'),
+          ),
+          ...(boxInteractiveHost ? { interactiveHost: boxInteractiveHost } : {}),
+          registry: new BoxInvocationRegistry({
+            maxPerUser: boxCapacity.maxRunsPerUser,
+            maxPerAccount: boxCapacity.maxRunsPerAccount,
+            leaseMs: 900_000,
+          }),
+          journal: boxJournal,
+          writeMessage: boxReplayWriter,
+          maxOutputTokensForModel: (model) => boxApiModelById(model)?.maxOutputTokens ?? null,
+          resolveTarget: (args) => resolveBoxLaunch!({ ...args, allowWakeIfHibernated: true }),
+          onUnknown: reportBoxUnknown,
+        })
+      : undefined
   // This second flag stays OFF until actual Box detached lifetime, multi-round
   // live acceptance, remote cleanup/reconciliation and T2 review all pass.
-  const boxToolModel = boxResolver && boxJournal
-    && process.env.OC_BOX_MODEL_API === "1" && process.env.OC_BOX_TOOL_BRIDGE === "1"
-    ? new BoxToolFetch({
-      supervisorAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_supervisor.py")),
-      keeperAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_keeper.py")),
-      virtualMcpAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_virtual_mcp.py")),
-      detachedRunnerAsset: readFileSync(join(process.cwd(), "scripts/ocv5-289/box_detached_runner.py")),
-      ...(boxInteractiveHost ? { interactiveHost: boxInteractiveHost } : {}),
-      // OCV5-300: the CLI sees mcp__ocbridge__<client name> (Bash, Read, …)
-      // like native Claude Code; older opaque chains still bind via
-      // boxCatalogMatching.
-      toolAliasMode: "natural",
-      journal: boxJournal,
-      writeMessage: boxReplayWriter,
-      maxOutputTokensForModel: (model) =>
-        boxApiModelById(model)?.maxOutputTokens ?? null,
-      resolveTarget: (args) => resolveBoxLaunch!(args),
-      onUnknown: reportBoxUnknown,
-      onNativeDecision: (info) => log.info("box_native_decision", info),
-      // OCV5-299: a locally rejected first-round stream is stopped through the
-      // same explicit-stop coordinator as a user Stop (declared below; only
-      // called at request time, after startup).
-      stopRejectedRun: (identity) => boxStopCoordinator.requestStop(identity),
-      // OCV5-304: a recovered dispatch frees the earlier dispatch's orphaned run.
-      stopOrphanRun: (identity) => boxStopCoordinator.requestStop(identity),
-    }) : undefined;
-  const boxModel = boxTextModel ? {
-    toolBridgeReady: boxToolModel !== undefined,
-    // A running chat that must leave its login is compacted by Haiku before it moves (opt-in).
-    ...(boxResolver && boxSwitchCompactionEnabled() ? { switchCompaction: { store: new BoxSwitchStore(),
-      chatMustMove: (uid: bigint, stickyKey: string) => boxResolver.chatMustMove(uid, stickyKey),
-      fetch: (args: Parameters<BoxTextFetch["fetch"]>[0]) => boxTextModel.fetch(args) } } : {}),
-    fetch: (args: Parameters<BoxTextFetch["fetch"]>[0] & {
-      prepared?: PreparedContinuation;
-    }) => {
-      if (!args.prepared) {
-        throw new BoxContinuationDecisionError("reject", "BOX_PREPARED_STALE");
+  const boxToolModel =
+    boxResolver &&
+    boxJournal &&
+    process.env.OC_BOX_MODEL_API === '1' &&
+    process.env.OC_BOX_TOOL_BRIDGE === '1'
+      ? new BoxToolFetch({
+          supervisorAsset: readFileSync(join(process.cwd(), 'scripts/ocv5-289/box_supervisor.py')),
+          keeperAsset: readFileSync(join(process.cwd(), 'scripts/ocv5-289/box_keeper.py')),
+          virtualMcpAsset: readFileSync(join(process.cwd(), 'scripts/ocv5-289/box_virtual_mcp.py')),
+          detachedRunnerAsset: readFileSync(
+            join(process.cwd(), 'scripts/ocv5-289/box_detached_runner.py'),
+          ),
+          ...(boxInteractiveHost ? { interactiveHost: boxInteractiveHost } : {}),
+          // OCV5-300: the CLI sees mcp__ocbridge__<client name> (Bash, Read, …)
+          // like native Claude Code; older opaque chains still bind via
+          // boxCatalogMatching.
+          toolAliasMode: 'natural',
+          journal: boxJournal,
+          writeMessage: boxReplayWriter,
+          maxOutputTokensForModel: (model) => boxApiModelById(model)?.maxOutputTokens ?? null,
+          resolveTarget: (args) => resolveBoxLaunch!(args),
+          onUnknown: reportBoxUnknown,
+          onNativeDecision: (info) => log.info('box_native_decision', info),
+          // OCV5-299: a locally rejected first-round stream is stopped through the
+          // same explicit-stop coordinator as a user Stop (declared below; only
+          // called at request time, after startup).
+          stopRejectedRun: (identity) => boxStopCoordinator.requestStop(identity),
+          // OCV5-304: a recovered dispatch frees the earlier dispatch's orphaned run.
+          stopOrphanRun: (identity) => boxStopCoordinator.requestStop(identity),
+        })
+      : undefined
+  const boxModel = boxTextModel
+    ? {
+        toolBridgeReady: boxToolModel !== undefined,
+        // A running chat that must leave its login is compacted by Haiku before it moves (opt-in).
+        ...(boxResolver && boxSwitchCompactionEnabled()
+          ? {
+              switchCompaction: {
+                store: new BoxSwitchStore(),
+                chatMustMove: (uid: bigint, stickyKey: string) =>
+                  boxResolver.chatMustMove(uid, stickyKey),
+                fetch: (args: Parameters<BoxTextFetch['fetch']>[0]) => boxTextModel.fetch(args),
+              },
+            }
+          : {}),
+        fetch: (
+          args: Parameters<BoxTextFetch['fetch']>[0] & {
+            prepared?: PreparedContinuation
+          },
+        ) => {
+          if (!args.prepared) {
+            throw new BoxContinuationDecisionError('reject', 'BOX_PREPARED_STALE')
+          }
+          const prepared = args.prepared
+          if (prepared.classification === 'reject') {
+            throw new BoxContinuationDecisionError(
+              'reject',
+              prepared.rejectCode ?? 'BOX_PREPARED_REJECT',
+            )
+          }
+          if (prepared.classification === 'continuation_candidate') {
+            if (!boxToolModel) {
+              throw new BoxContinuationDecisionError('reject', 'BOX_PREPARED_BRIDGE_REQUIRED')
+            }
+            return boxToolModel.fetch({ ...args, prepared })
+          }
+          return args.canonicalBody.tools?.length && boxToolModel
+            ? boxToolModel.fetch({ ...args, prepared })
+            : boxTextModel.fetch(args)
+        },
       }
-      const prepared = args.prepared;
-      if (prepared.classification === "reject") {
-        throw new BoxContinuationDecisionError("reject",
-          prepared.rejectCode ?? "BOX_PREPARED_REJECT");
-      }
-      if (prepared.classification === "continuation_candidate") {
-        if (!boxToolModel) {
-          throw new BoxContinuationDecisionError("reject", "BOX_PREPARED_BRIDGE_REQUIRED");
-        }
-        return boxToolModel.fetch({ ...args, prepared });
-      }
-      return args.canonicalBody.tools?.length && boxToolModel
-        ? boxToolModel.fetch({ ...args, prepared }) : boxTextModel.fetch(args);
-    },
-  } : undefined;
+    : undefined
   // The resolver retains failed private ProxyAgent closes across requests;
   // retry only these proven pre-invocation orphans, never a remote unknown CLI.
-  const boxCleanupTimer = boxResolver && boxTextModel ? setInterval(() => {
-    void boxTextModel.retryFailedOrphanCleanup().catch(() =>
-      log.error("box_target_orphan_cleanup_failed"));
-    void boxTextModel.retryDetachedCleanupRelease().catch(() =>
-      log.error("box_text_detached_local_release_failed"));
-  }, 60_000) : null;
-  boxCleanupTimer?.unref();
+  const boxCleanupTimer =
+    boxResolver && boxTextModel
+      ? setInterval(() => {
+          void boxTextModel
+            .retryFailedOrphanCleanup()
+            .catch(() => log.error('box_target_orphan_cleanup_failed'))
+          void boxTextModel
+            .retryDetachedCleanupRelease()
+            .catch(() => log.error('box_text_detached_local_release_failed'))
+        }, 60_000)
+      : null
+  boxCleanupTimer?.unref()
   // A stop for an already-admitted Box run must remain available even after
   // the model launch flag is turned OFF. It cannot create a new paid call.
-  const boxStopJournal = boxJournal ?? new BoxDurableJournal(getPool());
+  const boxStopJournal = boxJournal ?? new BoxDurableJournal(getPool())
   // Recovery survives disabling the model launch flags. Empty assets are never
   // used by this off-route worker; it dispatches only idempotent cleanup Exec.
-  const boxRecoveryModel = boxToolModel ?? new BoxToolFetch({
-    supervisorAsset: Buffer.alloc(0), keeperAsset: Buffer.alloc(0),
-    virtualMcpAsset: Buffer.alloc(0), detachedRunnerAsset: Buffer.alloc(0),
-    journal: boxStopJournal, maxOutputTokensForModel: () => null,
-    resolveTarget: (args) => boxStopResolver.resolve(args),
-    onUnknown: reportBoxUnknown,
-  });
-  let textObserverBusy = false;
+  const boxRecoveryModel =
+    boxToolModel ??
+    new BoxToolFetch({
+      supervisorAsset: Buffer.alloc(0),
+      keeperAsset: Buffer.alloc(0),
+      virtualMcpAsset: Buffer.alloc(0),
+      detachedRunnerAsset: Buffer.alloc(0),
+      journal: boxStopJournal,
+      maxOutputTokensForModel: () => null,
+      resolveTarget: (args) => boxStopResolver.resolve(args),
+      onUnknown: reportBoxUnknown,
+    })
+  let textObserverBusy = false
   const reconcileTextUnknown = async (): Promise<void> => {
-    if (!boxRecoveryWriter || textObserverBusy) return;
-    textObserverBusy = true;
+    if (!boxRecoveryWriter || textObserverBusy) return
+    textObserverBusy = true
     try {
       for (const candidate of await boxStopJournal.listTextUnknownCandidates(2)) {
         try {
-          if (!await boxStopJournal.claimTextUnknownCandidate(candidate)) continue;
-          await observeBoxTextUnknown({ identity: candidate }, {
-            journal: boxStopJournal, writeMessage: boxRecoveryWriter,
-            resolveTarget: (args) => boxStopResolver.resolve(args),
-          });
-        } catch { log.error("box_text_unknown_reconcile_failed", {
-          requestId: candidate.requestId }); }
+          if (!(await boxStopJournal.claimTextUnknownCandidate(candidate))) continue
+          await observeBoxTextUnknown(
+            { identity: candidate },
+            {
+              journal: boxStopJournal,
+              writeMessage: boxRecoveryWriter,
+              resolveTarget: (args) => boxStopResolver.resolve(args),
+            },
+          )
+        } catch {
+          log.error('box_text_unknown_reconcile_failed', {
+            requestId: candidate.requestId,
+          })
+        }
       }
-    } finally { textObserverBusy = false; }
-  };
-  let boxNativeGcTicks = 0;
-  const boxRecoveryTimer = setInterval(() => {
-    void reconcileTextUnknown().catch(() =>
-      log.error("box_text_unknown_selection_failed"));
-    void boxStopResolver.retryFailedAgentCleanup().catch(() =>
-      log.error("box_resolver_orphan_cleanup_failed"));
-    void boxRecoveryModel.retryFailedCleanup().catch(() =>
-      log.error("box_tool_target_cleanup_failed"));
-    void boxRecoveryModel.retryTerminalCleanup().catch(() =>
-      log.error("box_tool_remote_cleanup_failed"));
-    void boxRecoveryModel.reconcileRemoteCleanup(10).catch(() =>
-      log.error("box_tool_remote_reconcile_failed"));
-    void boxRecoveryModel.reconcilePrelaunchRecovery(10).catch(() =>
-      log.error("box_tool_prelaunch_recovery_failed"));
-    if (++boxNativeGcTicks % 15 === 0) {
-      void boxRecoveryModel.reconcileNativeGc(10).catch(() =>
-        log.error("box_native_gc_failed"));
+    } finally {
+      textObserverBusy = false
     }
-  }, 60_000);
-  boxRecoveryTimer.unref();
+  }
+  let boxNativeGcTicks = 0
+  const boxRecoveryTimer = setInterval(() => {
+    void reconcileTextUnknown().catch(() => log.error('box_text_unknown_selection_failed'))
+    void boxStopResolver
+      .retryFailedAgentCleanup()
+      .catch(() => log.error('box_resolver_orphan_cleanup_failed'))
+    void boxRecoveryModel
+      .retryFailedCleanup()
+      .catch(() => log.error('box_tool_target_cleanup_failed'))
+    void boxRecoveryModel
+      .retryTerminalCleanup()
+      .catch(() => log.error('box_tool_remote_cleanup_failed'))
+    void boxRecoveryModel
+      .reconcileRemoteCleanup(10)
+      .catch(() => log.error('box_tool_remote_reconcile_failed'))
+    void boxRecoveryModel
+      .reconcilePrelaunchRecovery(10)
+      .catch(() => log.error('box_tool_prelaunch_recovery_failed'))
+    if (++boxNativeGcTicks % 15 === 0) {
+      void boxRecoveryModel.reconcileNativeGc(10).catch(() => log.error('box_native_gc_failed'))
+    }
+  }, 60_000)
+  boxRecoveryTimer.unref()
   const boxStopCoordinator = new BoxUserStopCoordinator({
     journal: boxStopJournal,
     resolver: boxStopResolver,
-  });
-  const boxStopHandler = makeBoxUserStopHandler({ identity: identityStrategy,
+  })
+  const boxStopHandler = makeBoxUserStopHandler({
+    identity: identityStrategy,
     journal: boxStopJournal,
-    coordinator: boxStopCoordinator });
-  const boxIdleProofHandler = makeBoxIdleProofHandler({ identity: identityStrategy,
-    journal: boxStopJournal, readCapsule: boxReplayReader });
+    coordinator: boxStopCoordinator,
+  })
+  const boxIdleProofHandler = makeBoxIdleProofHandler({
+    identity: identityStrategy,
+    journal: boxStopJournal,
+    readCapsule: boxReplayReader,
+  })
   // Which Box login an interactive session (box-claude-*) launches under, and what its turns
   // reported: the admin's selection plus the login health this process shares with the Box
   // model route. Independent of OC_BOX_MODEL_API: interactive sessions exist without that route.
   // OCV5-380: built only where OC_BOX_INTERACTIVE_MASTER=1 (selfhost); elsewhere all three paths 404.
-  const boxLoginHandler = boxInteractiveMasterRoute(process.env, () => makeBoxLoginHandler({ identity: identityStrategy,
-    logins: new BoxInteractiveLogins({
-      accountActive: async (id) => {
-        const row = await getAccount(id);
-        return row?.provider === "cursor" && row.status === "active";
-      },
-      list: (ids) => listBoxProfiles(ids),
-      health: productionBoxProfileHealth(),
-    }),
-    // The Box exec endpoint for an interactive session, from the account's own credential and egress
-    // (the model route's resolver), for a uid entitled to the owner's Cursor accounts. No Sand relay.
-    execTargets: async (uid) => {
-      const entitlement = boxExecTargetEntitlement(uid);
-      if (entitlement !== "entitled") return { kind: entitlement };
-      const abort = new AbortController();
-      const timer = setTimeout(() => abort.abort(), 60_000);
-      try {
-        const target = await boxStopResolver.resolve({ uid, sessionId: null, requestId: `box-exec-target-${uid}`,
-          upstreamModel: BOX_API_RESOLVE_MODEL, signal: abort.signal, allowWakeIfHibernated: true,
-          interactiveExecTarget: true });
+  const boxLoginHandler = boxInteractiveMasterRoute(process.env, () =>
+    makeBoxLoginHandler({
+      identity: identityStrategy,
+      logins: new BoxInteractiveLogins({
+        accountActive: async (id) => {
+          const row = await getAccount(id)
+          return row?.provider === 'cursor' && row.status === 'active'
+        },
+        list: (ids) => listBoxProfiles(ids),
+        health: productionBoxProfileHealth(),
+      }),
+      // The Box exec endpoint for an interactive session, from the account's own credential and egress
+      // (the model route's resolver), for a uid entitled to the owner's Cursor accounts. No Sand relay.
+      execTargets: async (uid) => {
+        const entitlement = boxExecTargetEntitlement(uid)
+        if (entitlement !== 'entitled') return { kind: entitlement }
+        const abort = new AbortController()
+        const timer = setTimeout(() => abort.abort(), 60_000)
         try {
-          if (!target.execTarget) return { kind: "unavailable" };
-          return { kind: "target", accountId: target.accountId, ...target.execTarget };
-        } finally { await target.dispose?.(); }
-      } catch (err) {
-        log.warn("box_exec_target_unavailable", { code: (err as { code?: string }).code ?? "unknown" });
-        return { kind: "unavailable" };
-      } finally { clearTimeout(timer); }
-    } }));
+          const target = await boxStopResolver.resolve({
+            uid,
+            sessionId: null,
+            requestId: `box-exec-target-${uid}`,
+            upstreamModel: BOX_API_RESOLVE_MODEL,
+            signal: abort.signal,
+            allowWakeIfHibernated: true,
+            interactiveExecTarget: true,
+          })
+          try {
+            if (!target.execTarget) return { kind: 'unavailable' }
+            return { kind: 'target', accountId: target.accountId, ...target.execTarget }
+          } finally {
+            await target.dispose?.()
+          }
+        } catch (err) {
+          log.warn('box_exec_target_unavailable', {
+            code: (err as { code?: string }).code ?? 'unknown',
+          })
+          return { kind: 'unavailable' }
+        } finally {
+          clearTimeout(timer)
+        }
+      },
+    }),
+  )
   const boxStopCleanupTimer = setInterval(() => {
-    void boxStopCoordinator.retryFailedLocal().catch(() =>
-      log.error("box_stop_local_cleanup_failed"));
-  }, 60_000);
-  boxStopCleanupTimer.unref();
+    void boxStopCoordinator
+      .retryFailedLocal()
+      .catch(() => log.error('box_stop_local_cleanup_failed'))
+  }, 60_000)
+  boxStopCleanupTimer.unref()
   const proxyHandler = makeAnthropicProxyHandler({
     pgPool: getPool(),
     pricing,
@@ -569,7 +697,11 @@ export async function startEgress(): Promise<void> {
     // 跨进程 post-commit hooks:两者都收敛到 costSink FIFO(persist 先入队,
     // broadcast 后入队;master 端按序 apply,与原进程内顺序一致)。
     broadcastToUser: (uid, payload) => {
-      costSink.enqueue({ kind: "broadcast", uid: uid.toString(), payload: payload as Record<string, unknown> });
+      costSink.enqueue({
+        kind: 'broadcast',
+        uid: uid.toString(),
+        payload: payload as Record<string, unknown>,
+      })
     },
     appendCostCredits: async (
       requestId: string,
@@ -585,7 +717,7 @@ export async function startEgress(): Promise<void> {
       // 空间对齐逻辑留在唯一写入方,防两处漂移)。parentSessionId(委派父客户端会话)
       // 随 persist 事件过 egress→master,不能在 egress 边界丢弃否则 durable 归并失效。
       await costSink.enqueueDurable({
-        kind: "persist",
+        kind: 'persist',
         requestId,
         uid: rawUserId,
         costCredits,
@@ -594,27 +726,27 @@ export async function startEgress(): Promise<void> {
         delegateAgentId: delegateAgentId ?? null,
         turnKey: turnKey ?? null,
         parentTurnKey: parentTurnKey ?? null,
-      });
+      })
     },
     staticProviderKeys,
     getPhase6AccountUuidEnforce,
     getSessionPinMode,
     listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
-  });
+  })
 
   // 0105:上游延迟探测器(admin「模型与服务商」页数据源)。挂 egress 因为这里才是真实 LLM
   // 流量的出口进程(dispatcher direct/proxy 语义一致);任何失败只告警,不影响在飞流主职。
-  const latencyProber = startLatencyProber({ staticProviderKeys, log });
+  const latencyProber = startLatencyProber({ staticProviderKeys, log })
 
   // 降级探活恢复器(根治 auto 降级→前端禁选→零真实流量→零样本→永不恢复的死锁)。
   // 与 latencyProber 同理挂 egress(真实推理出口,dispatcher/鉴权语义一致);只对
   // auto+degraded provider 发最小推理探活,成功才写 kind='final' 样本(model 带
   // probe: 前缀),恢复判定仍由 master scheduler 既有数学接管。零迁移。
-  const recoveryProber = startRecoveryProber({ staticProviderKeys, log });
+  const recoveryProber = startRecoveryProber({ staticProviderKeys, log })
 
   // self-host uuid 与 master 同权威(PG compute host 表)——identity 双因子里
   // hostUuid 参与 bearer 归属校验,两进程必须同值。取失败拒启(egress 无降级路径)。
-  const selfHostUuid = (await getSelfHost()).id;
+  const selfHostUuid = (await getSelfHost()).id
 
   // ── codex 内部端点(M1b 架构决策:relay 归属 egress 进程)──────────────────
   // /internal/v3/codex-relay(流式)与 /internal/v3/codex/token-refresh(401 自愈)
@@ -631,188 +763,234 @@ export async function startEgress(): Promise<void> {
       putRemoteCodexAuth: putRemoteCodexAuthViaServiceableHost,
     },
     concurrency: 4,
-    logger: rootLogger.child({ subsys: "egress", module: "codexDisableFanout" }),
-  };
+    logger: rootLogger.child({ subsys: 'egress', module: 'codexDisableFanout' }),
+  }
   const codexTokenRefreshHandler = buildCodexTokenRefreshHandler({
     identityRepo,
     rateLimitRedis,
     healthTracker,
     selfHostId: selfHostUuid,
     triggerCodexDisableFanout: (accountId) => {
-      enqueueCodexDisableFanout(accountId, codexFanoutDeps);
+      enqueueCodexDisableFanout(accountId, codexFanoutDeps)
     },
-  });
+  })
   const codexRelayHandler = buildCodexRelayHandler({
     identityRepo,
     preCheckRedis,
     pgPool: getPool(),
     onImageCharge: (uid, charge) => {
       costSink.enqueue({
-        kind: "broadcast",
+        kind: 'broadcast',
         uid: uid.toString(),
         payload: {
-          type: "outbound.cost_charged",
+          type: 'outbound.cost_charged',
           costCredits: charge.costCredits,
           balanceAfter: charge.balanceAfter,
         },
-      });
+      })
     },
-  });
-  const grokRelayHandler = makeGrokRelayHandler({ identityRepo });
+  })
+  const grokRelayHandler = makeGrokRelayHandler({ identityRepo })
   const zcodeRelayHandler = makeZcodeRelayHandler({
     identityRepo,
-    codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
-  });
+    codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? '',
+  })
   const antigravityRelayHandler = makeAntigravityRelayHandler({
     identityRepo,
-    clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
+    clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? '',
     pricing,
-  });
+  })
 
-  const forward = makeForwarder({ controlBaseUrl });
+  const forward = makeForwarder({ controlBaseUrl })
 
   const server = createHttpServer((req, res) => {
-    const path = (req.url ?? "/").split("?")[0];
-    const peerIp = req.socket.remoteAddress ?? "";
-    if (path === "/internal/box/idle-proof") {
-      Promise.resolve(boxIdleProofHandler(req, res, {
-        hostUuid: selfHostUuid, boundIp: peerIp,
-      })).catch((err) => {
-        log.error("box_idle_proof_handler_threw", { err: (err as Error).message });
-        if (!res.headersSent && !res.destroyed) {
-          res.statusCode = 503;
-          res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify({ status: "pending", reason: "unavailable" }));
-        } else try { res.destroy(); } catch { /* */ }
-      });
-      return;
-    }
-    if (isBoxInteractiveMasterPath(path)) {
-      Promise.resolve(boxLoginHandler(req, res, {
-        hostUuid: selfHostUuid, boundIp: peerIp,
-      })).catch((err) => {
-        log.error("box_login_handler_threw", { err: (err as Error).message });
-        if (!res.headersSent && !res.destroyed) {
-          res.statusCode = 503;
-          res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify({ error: "BOX_LOGIN_STORE_UNAVAILABLE" }));
-        } else try { res.destroy(); } catch { /* */ }
-      });
-      return;
-    }
-    if (path === "/internal/box/stop") {
-      Promise.resolve(boxStopHandler(req, res, {
-        hostUuid: selfHostUuid, boundIp: peerIp,
-      })).catch((err) => {
-        log.error("box_stop_handler_threw", { err: (err as Error).message });
-        if (!res.headersSent && !res.destroyed) {
-          res.statusCode = 500;
-          res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify({ error: "INTERNAL" }));
-        } else try { res.destroy(); } catch { /* */ }
-      });
-      return;
-    }
-    if (path === "/v1/messages") {
+    const path = (req.url ?? '/').split('?')[0]
+    const peerIp = req.socket.remoteAddress ?? ''
+    if (path === '/internal/box/idle-proof') {
       Promise.resolve(
-        proxyHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
+        boxIdleProofHandler(req, res, {
+          hostUuid: selfHostUuid,
+          boundIp: peerIp,
+        }),
       ).catch((err) => {
-        log.error("proxy_handler_threw", { err: (err as Error).message });
-        if (!res.headersSent) {
-          res.statusCode = 500;
-          res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify({ error: { code: "INTERNAL", message: "egress handler error" } }));
-        } else {
+        log.error('box_idle_proof_handler_threw', { err: (err as Error).message })
+        if (!res.headersSent && !res.destroyed) {
+          res.statusCode = 503
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ status: 'pending', reason: 'unavailable' }))
+        } else
           try {
-            res.destroy();
+            res.destroy()
           } catch {
             /* */
           }
-        }
-      });
-      return;
+      })
+      return
+    }
+    if (isBoxInteractiveMasterPath(path)) {
+      Promise.resolve(
+        boxLoginHandler(req, res, {
+          hostUuid: selfHostUuid,
+          boundIp: peerIp,
+        }),
+      ).catch((err) => {
+        log.error('box_login_handler_threw', { err: (err as Error).message })
+        if (!res.headersSent && !res.destroyed) {
+          res.statusCode = 503
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: 'BOX_LOGIN_STORE_UNAVAILABLE' }))
+        } else
+          try {
+            res.destroy()
+          } catch {
+            /* */
+          }
+      })
+      return
+    }
+    if (path === '/internal/box/stop') {
+      Promise.resolve(
+        boxStopHandler(req, res, {
+          hostUuid: selfHostUuid,
+          boundIp: peerIp,
+        }),
+      ).catch((err) => {
+        log.error('box_stop_handler_threw', { err: (err as Error).message })
+        if (!res.headersSent && !res.destroyed) {
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: 'INTERNAL' }))
+        } else
+          try {
+            res.destroy()
+          } catch {
+            /* */
+          }
+      })
+      return
+    }
+    if (path === '/v1/messages') {
+      Promise.resolve(proxyHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp })).catch(
+        (err) => {
+          log.error('proxy_handler_threw', { err: (err as Error).message })
+          if (!res.headersSent) {
+            res.statusCode = 500
+            res.setHeader('Content-Type', 'application/json')
+            res.end(
+              JSON.stringify({ error: { code: 'INTERNAL', message: 'egress handler error' } }),
+            )
+          } else {
+            try {
+              res.destroy()
+            } catch {
+              /* */
+            }
+          }
+        },
+      )
+      return
     }
     if (path === CODEX_TOKEN_REFRESH_PATH) {
       Promise.resolve(
         codexTokenRefreshHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
       ).catch((err) => {
-        log.error("codex_token_refresh_handler_threw", { err: (err as Error).message });
+        log.error('codex_token_refresh_handler_threw', { err: (err as Error).message })
         if (!res.headersSent) {
-          res.statusCode = 500;
-          res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify({ error: { code: "INTERNAL", message: "egress handler error" } }));
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: { code: 'INTERNAL', message: 'egress handler error' } }))
         } else {
-          try { res.destroy(); } catch { /* */ }
+          try {
+            res.destroy()
+          } catch {
+            /* */
+          }
         }
-      });
-      return;
+      })
+      return
     }
     if (path === CODEX_RELAY_PREFIX || path.startsWith(`${CODEX_RELAY_PREFIX}/`)) {
       Promise.resolve(
         codexRelayHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
       ).catch((err) => {
-        log.error("codex_relay_handler_threw", { err: (err as Error).message });
+        log.error('codex_relay_handler_threw', { err: (err as Error).message })
         if (!res.headersSent) {
-          res.statusCode = 500;
-          res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify({ error: { code: "INTERNAL", message: "egress handler error" } }));
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: { code: 'INTERNAL', message: 'egress handler error' } }))
         } else {
-          try { res.destroy(); } catch { /* */ }
+          try {
+            res.destroy()
+          } catch {
+            /* */
+          }
         }
-      });
-      return;
+      })
+      return
     }
     if (path === GROK_RELAY_PREFIX || path.startsWith(`${GROK_RELAY_PREFIX}/`)) {
       Promise.resolve(
         grokRelayHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
       ).catch((err) => {
-        log.error("grok_relay_handler_threw", { err: (err as Error).message });
+        log.error('grok_relay_handler_threw', { err: (err as Error).message })
         if (!res.headersSent) {
-          res.statusCode = 500;
-          res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify({ error: { code: "INTERNAL", message: "egress handler error" } }));
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: { code: 'INTERNAL', message: 'egress handler error' } }))
         } else {
-          try { res.destroy(); } catch { /* */ }
+          try {
+            res.destroy()
+          } catch {
+            /* */
+          }
         }
-      });
-      return;
+      })
+      return
     }
     if (path === ZCODE_RELAY_PREFIX || path.startsWith(`${ZCODE_RELAY_PREFIX}/`)) {
       Promise.resolve(
         zcodeRelayHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
       ).catch((err) => {
-        log.error("zcode_relay_handler_threw", { err: (err as Error).message });
+        log.error('zcode_relay_handler_threw', { err: (err as Error).message })
         if (!res.headersSent) {
-          res.statusCode = 500;
-          res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify({ error: { code: "INTERNAL", message: "egress handler error" } }));
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: { code: 'INTERNAL', message: 'egress handler error' } }))
         } else {
-          try { res.destroy(); } catch { /* */ }
+          try {
+            res.destroy()
+          } catch {
+            /* */
+          }
         }
-      });
-      return;
+      })
+      return
     }
     if (path === ANTIGRAVITY_RELAY_PREFIX || path.startsWith(`${ANTIGRAVITY_RELAY_PREFIX}/`)) {
       Promise.resolve(
         antigravityRelayHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
       ).catch((err) => {
-        log.error("antigravity_relay_handler_threw", { err: (err as Error).message });
+        log.error('antigravity_relay_handler_threw', { err: (err as Error).message })
         if (!res.headersSent) {
-          res.statusCode = 500;
-          res.setHeader("Content-Type", "application/json");
-          res.end(JSON.stringify({ error: { code: "INTERNAL", message: "egress handler error" } }));
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: { code: 'INTERNAL', message: 'egress handler error' } }))
         } else {
-          try { res.destroy(); } catch { /* */ }
+          try {
+            res.destroy()
+          } catch {
+            /* */
+          }
         }
-      });
-      return;
+      })
+      return
     }
     if (path === EGRESS_HEALTH_PATH) {
       // D3④:finalize 门槛差分数据源。processStartId + 单调计数器一并暴露,
       // 部署脚本据此判断队列真排空(startId 未变 ∧ pendingEnd=0 ∧ enqueuedDelta==sentDelta
       // ∧ expired/overflow delta=0)。
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "application/json");
+      res.statusCode = 200
+      res.setHeader('Content-Type', 'application/json')
       // capabilities:**构建级事实**(本 egress 版本实现了模型权威协议:每请求 epoch fence +
       // catalog 数据驱动路由)。deploy 的四面守卫在开 flag / 走 cutover 前读它 —— 一个旧
       // egress 进程(无 fence)会让 master 签发的权威在出站面失效,必须在启用前被拒。
@@ -820,7 +998,7 @@ export async function startEgress(): Promise<void> {
       res.end(
         JSON.stringify({
           ok: true,
-          role: "egress",
+          role: 'egress',
           slot,
           listenMode: listenPlan.mode,
           processStartId,
@@ -828,97 +1006,97 @@ export async function startEgress(): Promise<void> {
           capabilities: [...EGRESS_CAPABILITIES],
           modelAuthority: { enforced: isModelAuthorityEnforced() },
         }),
-      );
-      return;
+      )
+      return
     }
     // 0106 — per-model 在飞快照(admin 容量面;master 的 model-ops 端点拉取,egress 是
     // /v1/messages 的独占进程,这里的计数即全量权威)。与 egress-health 同级内网只读面。
     if (path === EGRESS_STATS_PATH) {
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify({ ok: true, role: "egress", inflight: snapshotInflight() }));
-      return;
+      res.statusCode = 200
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ ok: true, role: 'egress', inflight: snapshotInflight() }))
+      return
     }
-    forward(req, res, peerIp);
-  });
+    forward(req, res, peerIp)
+  })
   // LLM 流可长达数十分钟,禁 socket 空闲超时误杀(与 master internal listener 同语义)。
-  server.requestTimeout = 0;
-  server.headersTimeout = 60_000;
+  server.requestTimeout = 0
+  server.headersTimeout = 60_000
 
   // 共享口:sd_activation 时接管 systemd 传入的 SO_REUSEPORT fd(与另一个槽同组),
   // 否则自 bind(legacy 单 unit / 开发)。注意 systemd 的 socket 已 listen(),node 只是
   // 在它上面 accept;backlog 由 unit 的 Backlog= 决定。
   await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
+    server.once('error', reject)
     const onListening = () => {
-      server.removeListener("error", reject);
-      resolve();
-    };
-    if (listenPlan.mode === "sd_activation") {
-      server.listen({ fd: listenPlan.fd! }, onListening);
-    } else {
-      server.listen(port, bind, onListening);
+      server.removeListener('error', reject)
+      resolve()
     }
-  });
-  log.info("egress_listening", {
+    if (listenPlan.mode === 'sd_activation') {
+      server.listen({ fd: listenPlan.fd! }, onListening)
+    } else {
+      server.listen(port, bind, onListening)
+    }
+  })
+  log.info('egress_listening', {
     bind,
     port,
     control: controlBaseUrl,
     slot,
     listenMode: listenPlan.mode,
-  });
+  })
   // eslint-disable-next-line no-console
   console.log(
-    `[egress] listening on ${bind}:${port} (${listenPlan.mode}${slot ? `, slot ${slot}` : ""}) → control ${controlBaseUrl}`,
-  );
+    `[egress] listening on ${bind}:${port} (${listenPlan.mode}${slot ? `, slot ${slot}` : ''}) → control ${controlBaseUrl}`,
+  )
 
   // 私有健康口(仅有槽时):部署脚本靠它判定「本槽已接管共享口」。只答 GET,不转发。
   // 必须在共享口 listen 成功**之后**才起,否则脚本会把「进程活着但还没接管」误判就绪。
-  let slotHealthServer: ReturnType<typeof createHttpServer> | null = null;
+  let slotHealthServer: ReturnType<typeof createHttpServer> | null = null
   if (slot && listenPlan.privatePort) {
     const body: SlotHealthBody = {
       ok: true,
-      role: "egress",
+      role: 'egress',
       slot,
       listenMode: listenPlan.mode,
       processStartId,
       pid: process.pid,
-    };
+    }
     slotHealthServer = createHttpServer((req, res) => {
-      const p = (req.url ?? "/").split("?")[0];
-      if (req.method === "GET" && (p === "/internal/v5/egress-slot-health" || p === "/healthz")) {
-        res.statusCode = 200;
-        res.setHeader("Content-Type", "application/json");
-        res.end(JSON.stringify({ ...body, inflight: snapshotInflight().total_current }));
-        return;
+      const p = (req.url ?? '/').split('?')[0]
+      if (req.method === 'GET' && (p === '/internal/v5/egress-slot-health' || p === '/healthz')) {
+        res.statusCode = 200
+        res.setHeader('Content-Type', 'application/json')
+        res.end(JSON.stringify({ ...body, inflight: snapshotInflight().total_current }))
+        return
       }
-      res.statusCode = 404;
-      res.end();
-    });
-    const shs = slotHealthServer;
+      res.statusCode = 404
+      res.end()
+    })
+    const shs = slotHealthServer
     await new Promise<void>((resolve, reject) => {
-      shs.once("error", reject);
-      shs.listen(listenPlan.privatePort!, "127.0.0.1", () => {
-        shs.removeListener("error", reject);
-        resolve();
-      });
-    });
-    log.info("egress_slot_health_listening", { slot, port: listenPlan.privatePort });
+      shs.once('error', reject)
+      shs.listen(listenPlan.privatePort!, '127.0.0.1', () => {
+        shs.removeListener('error', reject)
+        resolve()
+      })
+    })
+    log.info('egress_slot_health_listening', { slot, port: listenPlan.privatePort })
     // eslint-disable-next-line no-console
-    console.log(`[egress] slot ${slot} health on 127.0.0.1:${listenPlan.privatePort}`);
+    console.log(`[egress] slot ${slot} health on 127.0.0.1:${listenPlan.privatePort}`)
   }
 
-  let desktopTlsClose: (() => Promise<void>) | undefined;
+  let desktopTlsClose: (() => Promise<void>) | undefined
   void (async () => {
-    const deskFlags = await getDesktopFlagSnapshot();
-    if (!deskFlags.assembled) return;
-    const deskRepo = createPgDesktopIdentityRepo();
+    const deskFlags = await getDesktopFlagSnapshot()
+    if (!deskFlags.assembled) return
+    const deskRepo = createPgDesktopIdentityRepo()
     const deskIdentity = makeDesktopIdentityStrategy({
       repo: deskRepo,
       tlsFromReq: (req) => extractDesktopTlsContext(req),
       pricing,
       loadUserModelAuthz,
-    });
+    })
     const deskMessages = makeAnthropicProxyHandler({
       pgPool: getPool(),
       pricing,
@@ -927,7 +1105,7 @@ export async function startEgress(): Promise<void> {
       identity: deskIdentity,
       loadUserModelAuthz,
       rateLimitRedis,
-      runtimeKind: "desktop",
+      runtimeKind: 'desktop',
       concurrencyLimiter: sharedProxyConcurrency,
       fallbackLimiter: sharedProxyFallback,
       modelCatalog,
@@ -935,11 +1113,24 @@ export async function startEgress(): Promise<void> {
       authorityKeyring: authorityKeyringProvider(),
       refreshDeps: { health: healthTracker },
       broadcastToUser: (uid, payload) => {
-        costSink.enqueue({ kind: "broadcast", uid: uid.toString(), payload: payload as Record<string, unknown> });
+        costSink.enqueue({
+          kind: 'broadcast',
+          uid: uid.toString(),
+          payload: payload as Record<string, unknown>,
+        })
       },
-      appendCostCredits: async (requestId, rawUserId, costCredits, sessionId, parentSessionId, delegateAgentId, turnKey, parentTurnKey) => {
+      appendCostCredits: async (
+        requestId,
+        rawUserId,
+        costCredits,
+        sessionId,
+        parentSessionId,
+        delegateAgentId,
+        turnKey,
+        parentTurnKey,
+      ) => {
         await costSink.enqueueDurable({
-          kind: "persist",
+          kind: 'persist',
           requestId,
           uid: rawUserId,
           costCredits,
@@ -948,19 +1139,24 @@ export async function startEgress(): Promise<void> {
           delegateAgentId: delegateAgentId ?? null,
           turnKey: turnKey ?? null,
           parentTurnKey: parentTurnKey ?? null,
-        });
+        })
       },
       staticProviderKeys,
       apiKeyPoolEnabled: true,
       getPhase6AccountUuidEnforce,
       getSessionPinMode,
       listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
-    });
-    const notOnEgress = async (_req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => {
-      sendJson(res, 404, { error: { code: "NOT_FOUND", message: "desktop internal path is served on master 18445" } });
-    };
+    })
+    const notOnEgress = async (
+      _req: import('node:http').IncomingMessage,
+      res: import('node:http').ServerResponse,
+    ) => {
+      sendJson(res, 404, {
+        error: { code: 'NOT_FOUND', message: 'desktop internal path is served on master 18445' },
+      })
+    }
     const listener = await startDesktopTlsListener({
-      role: "egress",
+      role: 'egress',
       allowRegister: false,
       identityRepo: deskRepo,
       handlers: {
@@ -970,58 +1166,69 @@ export async function startEgress(): Promise<void> {
         turnLease: notOnEgress,
         catalog: notOnEgress,
       },
-    });
+    })
     if (listener) {
-      desktopTlsClose = () => listener.close();
-      log.info("desktop_tls_egress_listening", listener.address);
+      desktopTlsClose = () => listener.close()
+      log.info('desktop_tls_egress_listening', listener.address)
     }
   })().catch((err) => {
-    log.warn("desktop_tls_egress_not_started", { err: (err as Error)?.message });
-  });
+    log.warn('desktop_tls_egress_not_started', { err: (err as Error)?.message })
+  })
 
-  let shuttingDown = false;
+  let shuttingDown = false
   const shutdown = () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    latencyProber?.stop();
-    recoveryProber?.stop();
-    if (boxCleanupTimer) clearInterval(boxCleanupTimer);
-    clearInterval(boxRecoveryTimer);
-    clearInterval(boxStopCleanupTimer);
-    void desktopTlsClose?.().catch(() => {});
+    if (shuttingDown) return
+    shuttingDown = true
+    latencyProber?.stop()
+    recoveryProber?.stop()
+    if (boxCleanupTimer) clearInterval(boxCleanupTimer)
+    clearInterval(boxRecoveryTimer)
+    clearInterval(boxStopCleanupTimer)
+    void desktopTlsClose?.().catch(() => {})
     // eslint-disable-next-line no-console
     console.log(
-      `[egress] SIGTERM — draining in-flight streams (max ${EGRESS_DRAIN_MS}ms)${slot ? ` slot ${slot}` : ""}…`,
-    );
+      `[egress] SIGTERM — draining in-flight streams (max ${EGRESS_DRAIN_MS}ms)${slot ? ` slot ${slot}` : ''}…`,
+    )
     // 私有健康口立刻关:部署脚本/watch 把「私有口不可连」当成本槽已退出接管。
-    try { slotHealthServer?.close(); } catch { /* */ }
+    try {
+      slotHealthServer?.close()
+    } catch {
+      /* */
+    }
     // close() 停接新连接,已建立连接(在飞流)自然完结;到 drain 上限强制退出。
     // 双槽下 close() 只把本进程摘出 reuseport 组(tcp_migrate_req=1 时 accept 队列
     // 里的半开连接迁到另一槽),另一槽继续接新连接 —— 这就是零停机的全部机制。
     server.close(() => {
       void (async () => {
-        try { await costSink.flush(); } finally {
-          try { await shutdownDurableMetricRollups(); } catch { /* best-effort */ }
-          process.exit(0);
+        try {
+          await costSink.flush()
+        } finally {
+          try {
+            await shutdownDurableMetricRollups()
+          } catch {
+            /* best-effort */
+          }
+          process.exit(0)
         }
-      })();
-    });
+      })()
+    })
     setTimeout(() => {
       // eslint-disable-next-line no-console
-      console.log("[egress] drain timeout — force exit");
-      process.exit(0);
-    }, EGRESS_DRAIN_MS).unref();
-  };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+      console.log('[egress] drain timeout — force exit')
+      process.exit(0)
+    }, EGRESS_DRAIN_MS).unref()
+  }
+  process.on('SIGTERM', shutdown)
+  process.on('SIGINT', shutdown)
 }
 
 // 直接执行(systemd ExecStart=npx tsx packages/commercial/src/egress/main.ts)
-const isDirectRun = process.argv[1]?.endsWith("egress/main.ts") || process.argv[1]?.endsWith("egress/main.js");
+const isDirectRun =
+  process.argv[1]?.endsWith('egress/main.ts') || process.argv[1]?.endsWith('egress/main.js')
 if (isDirectRun) {
   startEgress().catch((err) => {
     // eslint-disable-next-line no-console
-    console.error("[egress] fatal:", err);
-    process.exit(1);
-  });
+    console.error('[egress] fatal:', err)
+    process.exit(1)
+  })
 }

@@ -10,42 +10,46 @@
 // 故意**不**放进 protocol —— protocol 是 commercial+gateway 共享的纯路由契约，不应耦合
 // commercial 的 config/错误码/metrics(Codex plan review #1)。
 
-import { findRouteProviderForModel, type StaticProviderId } from "@openclaude/protocol";
-import { PLATFORM_DEFAULT_MODEL } from "../../platformDefaults.js";
+import {
+  type StaticProviderId,
+  type StaticProviderKeys,
+  findRouteProviderForModel,
+} from '@openclaude/protocol'
+import { PLATFORM_DEFAULT_MODEL } from '../../platformDefaults.js'
 
 export interface StaticProviderCommercialMeta {
   /** 静态 key 在 commercial Config 里的字段名(不含 key 值本身) */
   readonly keyConfigField:
-    | "DEEPSEEK_API_KEY"
-    | "MINIMAX_TOKEN_PLAN_KEY"
-    | "ARK_CODING_PLAN_KEY"
-    | "ARK_AGENT_PLAN_KEY"
-    | "OPENCODE_GO_API_KEY"
-    | "MOONSHOT_CODING_PLAN_KEY"
-    | "BAILIAN_TOKEN_PLAN_KEY"
-    | "ZAI_CODING_PLAN_KEY";
+    | 'DEEPSEEK_API_KEY'
+    | 'MINIMAX_TOKEN_PLAN_KEY'
+    | 'ARK_CODING_PLAN_KEY'
+    | 'ARK_AGENT_PLAN_KEY'
+    | 'OPENCODE_GO_API_KEY'
+    | 'MOONSHOT_CODING_PLAN_KEY'
+    | 'BAILIAN_TOKEN_PLAN_KEY'
+    | 'ZAI_CODING_PLAN_KEY'
   /** 缺 key → 503 错误码 */
   readonly notConfiguredHttpCode:
-    | "DEEPSEEK_NOT_CONFIGURED"
-    | "MINIMAX_NOT_CONFIGURED"
-    | "ARK_NOT_CONFIGURED"
-    | "OPENCODEGO_NOT_CONFIGURED"
-    | "KIMI_NOT_CONFIGURED"
-    | "ARK_K3_NOT_CONFIGURED"
-    | "MOONSHOT_NOT_CONFIGURED"
-    | "BAILIAN_NOT_CONFIGURED"
-    | "ZAI_NOT_CONFIGURED";
+    | 'DEEPSEEK_NOT_CONFIGURED'
+    | 'MINIMAX_NOT_CONFIGURED'
+    | 'ARK_NOT_CONFIGURED'
+    | 'OPENCODEGO_NOT_CONFIGURED'
+    | 'KIMI_NOT_CONFIGURED'
+    | 'ARK_K3_NOT_CONFIGURED'
+    | 'MOONSHOT_NOT_CONFIGURED'
+    | 'BAILIAN_NOT_CONFIGURED'
+    | 'ZAI_NOT_CONFIGURED'
   /** 缺 key → reject metric label(须与 admin/metrics.ts ProxyRejectReason 一致) */
   readonly rejectMetricLabel:
-    | "deepseek_config"
-    | "minimax_config"
-    | "ark_config"
-    | "opencodego_config"
-    | "kimi_config"
-    | "ark_k3_config"
-    | "moonshot_config"
-    | "bailian_config"
-    | "zai_config";
+    | 'deepseek_config'
+    | 'minimax_config'
+    | 'ark_config'
+    | 'opencodego_config'
+    | 'kimi_config'
+    | 'ark_k3_config'
+    | 'moonshot_config'
+    | 'bailian_config'
+    | 'zai_config'
   /**
    * 出站出口策略(commercial 部署网络拓扑语义,非 protocol 路由契约,故落本表)。
    *
@@ -61,86 +65,86 @@ export interface StaticProviderCommercialMeta {
    * 新增 provider 必须显式声明本字段(无默认),避免再次落进"dispatcher=undefined 被全局代理
    * 静默接管 → 绕日本"的陷阱。
    */
-  readonly egress: "direct" | "proxy";
+  readonly egress: 'direct' | 'proxy'
 }
 
 export const STATIC_PROVIDER_META: Record<StaticProviderId, StaticProviderCommercialMeta> = {
   deepseek: {
-    keyConfigField: "DEEPSEEK_API_KEY",
-    notConfiguredHttpCode: "DEEPSEEK_NOT_CONFIGURED",
-    rejectMetricLabel: "deepseek_config",
+    keyConfigField: 'DEEPSEEK_API_KEY',
+    notConfiguredHttpCode: 'DEEPSEEK_NOT_CONFIGURED',
+    rejectMetricLabel: 'deepseek_config',
     // api.deepseek.com:国内端点,海外部署机直连可达且优于绕日本(实测 TLS 0.32s vs 1.11s)。
-    egress: "direct",
+    egress: 'direct',
   },
   minimax: {
     // 2026-07-07:切回 MiniMax 官方(回退 06-30 火山迁移;火山 Ark 大图识图挂死,官方 4.9s)。
     // key 改回 MINIMAX_TOKEN_PLAN_KEY;上游 api.minimaxi.com/anthropic/v1/messages(见 staticKeyProviders)。
-    keyConfigField: "MINIMAX_TOKEN_PLAN_KEY",
-    notConfiguredHttpCode: "MINIMAX_NOT_CONFIGURED",
-    rejectMetricLabel: "minimax_config",
+    keyConfigField: 'MINIMAX_TOKEN_PLAN_KEY',
+    notConfiguredHttpCode: 'MINIMAX_NOT_CONFIGURED',
+    rejectMetricLabel: 'minimax_config',
     // api.minimaxi.com:新加坡端点,海外直连最快;绕日本 TLS 抖到 ~6s 且半路断 → 必须 direct。
-    egress: "direct",
+    egress: 'direct',
   },
   ark: {
-    keyConfigField: "ARK_CODING_PLAN_KEY",
-    notConfiguredHttpCode: "ARK_NOT_CONFIGURED",
-    rejectMetricLabel: "ark_config",
+    keyConfigField: 'ARK_CODING_PLAN_KEY',
+    notConfiguredHttpCode: 'ARK_NOT_CONFIGURED',
+    rejectMetricLabel: 'ark_config',
     // ark.cn-beijing.volces.com:火山北京端点,直连 TLS ~0.3s 且稳;绕日本双重跨境 ~6s 且半路断。
-    egress: "direct",
+    egress: 'direct',
   },
   zai: {
-    keyConfigField: "ZAI_CODING_PLAN_KEY",
-    notConfiguredHttpCode: "ZAI_NOT_CONFIGURED",
-    rejectMetricLabel: "zai_config",
+    keyConfigField: 'ZAI_CODING_PLAN_KEY',
+    notConfiguredHttpCode: 'ZAI_NOT_CONFIGURED',
+    rejectMetricLabel: 'zai_config',
     // api.z.ai 为国际版全球入口；生产网络直连探针稳定 200，显式 direct
     // 防止继承 Anthropic 日本代理后形成不必要绕路。
-    egress: "direct",
+    egress: 'direct',
   },
   opencodego: {
-    keyConfigField: "OPENCODE_GO_API_KEY",
-    notConfiguredHttpCode: "OPENCODEGO_NOT_CONFIGURED",
-    rejectMetricLabel: "opencodego_config",
+    keyConfigField: 'OPENCODE_GO_API_KEY',
+    notConfiguredHttpCode: 'OPENCODEGO_NOT_CONFIGURED',
+    rejectMetricLabel: 'opencodego_config',
     // opencode.ai:Cloudflare 全球 anycast(Go 档服务器美/欧/新加坡),海外部署机直连可达
     // (2026-07-05 部署机直连探针全通);无需绕日本节点。若未来直连劣化再评估切 "proxy"。
-    egress: "direct",
+    egress: 'direct',
   },
   kimi: {
     // 与 minimax 共 key:同一张火山方舟 Agent Plan 订阅(/api/plan)同时托管 MiniMax-M3 与
     // kimi-k2.7-code,key 字段复用 ARK_AGENT_PLAN_KEY(keyConfigField 与 provider 本就非 1:1,
     // minimax 先例)。缺 key 时两 provider 同时 503,各自独立打点。
-    keyConfigField: "ARK_AGENT_PLAN_KEY",
-    notConfiguredHttpCode: "KIMI_NOT_CONFIGURED",
-    rejectMetricLabel: "kimi_config",
+    keyConfigField: 'ARK_AGENT_PLAN_KEY',
+    notConfiguredHttpCode: 'KIMI_NOT_CONFIGURED',
+    rejectMetricLabel: 'kimi_config',
     // ark.cn-beijing.volces.com:火山北京端点,同 minimax/ark 必须直连(绕日本双重跨境会断流)。
-    egress: "direct",
+    egress: 'direct',
   },
-  "ark-k3": {
+  'ark-k3': {
     // 火山 Agent Plan K3 与 kimi-k2.7-code 共订阅/key，但能力和平台 model id 独立。
-    keyConfigField: "ARK_AGENT_PLAN_KEY",
-    notConfiguredHttpCode: "ARK_K3_NOT_CONFIGURED",
-    rejectMetricLabel: "ark_k3_config",
-    egress: "direct",
+    keyConfigField: 'ARK_AGENT_PLAN_KEY',
+    notConfiguredHttpCode: 'ARK_K3_NOT_CONFIGURED',
+    rejectMetricLabel: 'ark_k3_config',
+    egress: 'direct',
   },
   moonshot: {
     // Moonshot 官方「Kimi For Coding」订阅(kimi-k3,2026-07-17)。独立订阅独立 key,
     // 与火山转售的 'kimi'(ARK_AGENT_PLAN_KEY)互不相干。
-    keyConfigField: "MOONSHOT_CODING_PLAN_KEY",
-    notConfiguredHttpCode: "MOONSHOT_NOT_CONFIGURED",
-    rejectMetricLabel: "moonshot_config",
+    keyConfigField: 'MOONSHOT_CODING_PLAN_KEY',
+    notConfiguredHttpCode: 'MOONSHOT_NOT_CONFIGURED',
+    rejectMetricLabel: 'moonshot_config',
     // api.kimi.com:国内域名(部署机实测直连可达;若走出海代理会被上游按出口 IP 掐断 TLS,
     // 2026-07-17 实测经日本节点 SSL_ERROR_SYSCALL)→ 必须 direct。
-    egress: "direct",
+    egress: 'direct',
   },
   bailian: {
     // 阿里云百炼 Token Plan 正式 qwen3.8-max。聊天中出现过的 key 只用于开发验证，
     // 生产必须先旋转并通过 EnvironmentFile 注入。
-    keyConfigField: "BAILIAN_TOKEN_PLAN_KEY",
-    notConfiguredHttpCode: "BAILIAN_NOT_CONFIGURED",
-    rejectMetricLabel: "bailian_config",
+    keyConfigField: 'BAILIAN_TOKEN_PLAN_KEY',
+    notConfiguredHttpCode: 'BAILIAN_NOT_CONFIGURED',
+    rejectMetricLabel: 'bailian_config',
     // token-plan.cn-beijing.maas.aliyuncs.com 为北京端点，显式直连避免绕全局日本代理。
-    egress: "direct",
+    egress: 'direct',
   },
-};
+}
 
 /**
  * fail-closed guard：若平台全局默认模型(PLATFORM_DEFAULT_MODEL，2026-08-22 起 glm-5.3-zai→zai)路由到某静态 key
@@ -152,28 +156,51 @@ export const STATIC_PROVIDER_META: Record<StaticProviderId, StaticProviderCommer
  *
  * 默认模型若走 OAuth(findRouteProviderForModel 返回 undefined)→ 无静态 key 依赖，直接放行。
  */
-export function assertPlatformDefaultModelConfigured(cfg: {
-  DEEPSEEK_API_KEY?: string;
-  MINIMAX_TOKEN_PLAN_KEY?: string;
-  ARK_CODING_PLAN_KEY?: string;
-  ARK_AGENT_PLAN_KEY?: string;
-  OPENCODE_GO_API_KEY?: string;
-  MOONSHOT_CODING_PLAN_KEY?: string;
-  BAILIAN_TOKEN_PLAN_KEY?: string;
-  ZAI_CODING_PLAN_KEY?: string;
-}, opts: {
-  /** OCV5-424:服务池(pool_api_keys)里已有该 provider 的非停用成员也算已配置。 */
-  apiKeyPoolConfigured?: (service: string) => boolean;
-} = {}): void {
-  const provider = findRouteProviderForModel(PLATFORM_DEFAULT_MODEL);
-  if (!provider) return;
-  const meta = STATIC_PROVIDER_META[provider.id];
-  const key = cfg[meta.keyConfigField];
-  if ((key === undefined || key.trim() === "") && opts.apiKeyPoolConfigured?.(provider.id) !== true) {
+export function assertPlatformDefaultModelConfigured(
+  cfg: {
+    DEEPSEEK_API_KEY?: string
+    MINIMAX_TOKEN_PLAN_KEY?: string
+    ARK_CODING_PLAN_KEY?: string
+    ARK_AGENT_PLAN_KEY?: string
+    OPENCODE_GO_API_KEY?: string
+    MOONSHOT_CODING_PLAN_KEY?: string
+    BAILIAN_TOKEN_PLAN_KEY?: string
+    ZAI_CODING_PLAN_KEY?: string
+  },
+  opts: {
+    /** OCV5-424:服务池(pool_api_keys)里已有该 provider 的非停用成员也算已配置。 */
+    apiKeyPoolConfigured?: (service: string) => boolean
+  } = {},
+): void {
+  const provider = findRouteProviderForModel(PLATFORM_DEFAULT_MODEL)
+  if (!provider) return
+  const meta = STATIC_PROVIDER_META[provider.id]
+  const key = cfg[meta.keyConfigField]
+  if (
+    (key === undefined || key.trim() === '') &&
+    opts.apiKeyPoolConfigured?.(provider.id) !== true
+  ) {
     throw new Error(
       `PLATFORM_DEFAULT_MODEL="${PLATFORM_DEFAULT_MODEL}" 路由到静态 provider "${provider.id}"，` +
         `但其 key(${meta.keyConfigField})未在生产 env 配置。拒绝启动 internal proxy(loud fail)，` +
         `避免全员默认模型静默 503。请先在 systemd EnvironmentFile 写入(旋转后的) ${meta.keyConfigField} 再部署。`,
-    );
+    )
   }
+}
+
+/**
+ * provider id → platform static key, derived from `keyConfigField` (OCV5-455). The one
+ * mapping for the master proxy, the egress proxy/probers and the API-key pool import;
+ * they used to hand-copy it, so each new provider had to be added in three places.
+ * Blank or whitespace-only values are left out (treated as not configured).
+ */
+export function staticProviderKeysFromConfig(
+  cfg: Partial<Record<StaticProviderCommercialMeta['keyConfigField'], string | undefined>>,
+): StaticProviderKeys {
+  const keys: StaticProviderKeys = {}
+  for (const id of Object.keys(STATIC_PROVIDER_META) as StaticProviderId[]) {
+    const raw = cfg[STATIC_PROVIDER_META[id].keyConfigField]
+    if (typeof raw === 'string' && raw.trim()) keys[id] = raw
+  }
+  return keys
 }
