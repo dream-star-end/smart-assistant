@@ -66,6 +66,9 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
   { table: "turn_runtime_observations", column: "observed_at", days: 90 },
   { table: "turn_upstream_performance", column: "observed_at", days: 90 },
   { table: "telemetry_metric_rollups", column: "bucket_start", days: 180 },
+  // OCV5-424 0306: shared pool policy transition audit, kept 30 days (docs/ocv5-424-pool-policy.md;
+  // pool_events_at_idx serves the sweep).
+  { table: "pool_events", column: "at", days: 30 },
   { table: "response_rating_nudges", column: "updated_at", days: 180 },
   { table: "telemetry_readiness_evidence", column: "created_at", days: 180 },
   { table: "memory_usage_events", column: "observed_at", days: 30 },
