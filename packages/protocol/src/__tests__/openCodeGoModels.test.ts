@@ -41,7 +41,9 @@ describe('OpenCode Go /messages models', () => {
     assert.equal(findRouteProviderForModel('kimi-k3')?.id, 'moonshot')
     assert.equal(findRouteProviderForModel('qwen3.8-max')?.id, 'bailian')
     assert.equal(findRouteProviderForModel('minimax-m3')?.id, 'minimax')
-    assert.equal(findRouteProviderForModel('glm-5.3')?.id, 'ark')
+    // commercial: bare glm-5.3 belongs to SCNET (Ark keeps glm-5.2 / glm-5.1)
+    assert.equal(findRouteProviderForModel('glm-5.3')?.id, 'scnet')
+    assert.equal(findRouteProviderForModel('glm-5.2')?.id, 'ark')
     assert.equal(findRouteProviderForModel('glm-5.3-zai')?.id, 'zai')
     assert.equal(findRouteProviderForModel('kimi-k2.7-code')?.id, 'kimi')
   })
@@ -131,8 +133,9 @@ describe('model-scoped effort tiers', () => {
       assert.deepEqual(modelReasoningPolicy(id).supported, [], id)
     // Codex's own gpt-6-luna keeps its engine policy
     assert.notDeepEqual(modelReasoningPolicy('gpt-6-luna').supported, ['low', 'high'])
-    // Ark's own glm-5.3 keeps its provider-wide tiers
-    assert.deepEqual(modelReasoningPolicy('glm-5.3').supported, ['high', 'max'])
+    // Ark's own glm-5.2 keeps its provider-wide tiers; commercial SCNET glm-5.3 has none
+    assert.deepEqual(modelReasoningPolicy('glm-5.2').supported, ['high', 'max'])
+    assert.deepEqual(modelReasoningPolicy('glm-5.3').supported, [])
   })
 
   it('provider-wide rules are unchanged for other providers', () => {

@@ -835,7 +835,7 @@ describe("crash/interrupt partial persistence", () => {
           r.result({
             is_error: true,
             subtype: "error_during_execution",
-            result: "Selected model is at capacity. Please retry later.",
+            result: "Selected model is at capacity. Please try a different model.",
             errorClass: "model_capacity",
           });
         });
@@ -846,23 +846,24 @@ describe("crash/interrupt partial persistence", () => {
         _durableDelegateEngineBillings: [],
       } as Partial<AgentSession>);
 
-      await assert.rejects(
-        () => sm.submit(
-          session,
-          "finish the task",
-          (event) => events.push(event),
-          undefined,
-          undefined,
-          requestId,
-        ),
-        (err: unknown) => {
-          assert.match(String(err), /TRANSIENT_CIRCUIT_OPEN/);
-          return true;
-        },
+      await sm.submit(
+        session,
+        "finish the task",
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        requestId,
       );
 
-      assert.equal(submits, 3);
-      assert.deepEqual(runner.submittedInputs, ["finish the task", ...Array(2).fill(TRANSIENT_RETRY_INPUT)]);
+      assert.equal(submits, 11);
+      assert.deepEqual(runner.submittedInputs, ["finish the task", ...Array(10).fill(TRANSIENT_RETRY_INPUT)]);
+      assert.equal(captured.payloads.length, 1);
+      const payload = captured.payloads[0]!;
+      assert.equal(payload.errorCode, "model_capacity");
+      assert.equal(payload.engineBilling?.engineSessionId, `oceng-${"11".repeat(48)}`);
+      assert.equal(events.filter((event) => event.kind === "codex_billing").length, 1);
+      assert.equal(events.filter((event) => event.kind === "error").length, 1);
+      assert.deepEqual(session._durableDelegateEngineBillings, [payload.engineBilling]);
     } finally {
       setV3MasterSinkSingleton(null);
       if (breakerEnv === undefined) Reflect.deleteProperty(process.env, "OPENCLAUDE_TRANSIENT_BREAKER");
