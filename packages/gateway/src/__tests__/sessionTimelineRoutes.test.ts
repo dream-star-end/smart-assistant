@@ -8,9 +8,9 @@ import { _parseHistoryRevisionCursor } from '../server.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const source = readFileSync(join(here, '..', 'server.ts'), 'utf8')
-const start = source.indexOf('// ── Client session sync (cross-device, multi-user) ──')
-const end = source.indexOf('// ── Changelog', start)
-const routes = source.slice(start, end > start ? end : start + 20_000)
+// OCV5-465: the client session routes moved to routes/clientSessions.ts (whole file).
+const routes = readFileSync(join(here, '..', 'routes', 'clientSessions.ts'), 'utf8')
+const start = routes.indexOf('// ── Client session sync (cross-device, multi-user) ──')
 
 test('browser history uses one opaque unified timeline route', () => {
   assert.ok(start >= 0, 'client session route block not found')
@@ -21,7 +21,8 @@ test('browser history uses one opaque unified timeline route', () => {
     routes,
     /getClientSession\(sessId, userId, \{[\s\S]*?view: 'timeline'[\s\S]*?permissionLookupIds[\s\S]*?\}\)/,
   )
-  assert.match(routes, /parsePermissionLookupQuery\(url.searchParams.get\('permission_lookup'\)\)/)
+  // whitespace-tolerant: the moved block is biome-formatted in routes/clientSessions.ts
+  assert.match(routes, /parsePermissionLookupQuery\(\s*url\.searchParams\.get\('permission_lookup'\),?\s*\)/)
   assert.match(routes, /getClientSessionPartial\(sessId, userId, sinceSeq, \{[\s\S]*?view: 'timeline',[\s\S]*?sinceHistoryRevision,[\s\S]*?\}\)/)
   assert.match(routes, /const timelineMatch = url\.pathname\.match/)
   assert.match(routes, /decodeClientTimelineCursor\(rawCursor\)/)
@@ -46,15 +47,15 @@ test('session GET failures log message+stack+sessionId and return requestId', ()
   assert.match(source, /private sendSessionReadFailure\(/)
   assert.match(source, /this\.log\.error\('session read failed', \{ sessionId, requestId, publicError \}, err\)/)
   assert.match(source, /this\.sendJson\(res, 500, \{ error: publicError, requestId \}\)/)
-  assert.match(routes, /this\.sendSessionReadFailure\(res, error, sessId, 'timeline read failed'\)/)
-  assert.match(routes, /this\.sendSessionReadFailure\(res, error, sessId, 'get failed'\)/)
+  assert.match(routes, /io\.sendSessionReadFailure\(res, error, sessId, 'timeline read failed'\)/)
+  assert.match(routes, /io\.sendSessionReadFailure\(res, error, sessId, 'get failed'\)/)
   assert.equal(
-    (routes.match(/this\.sendSessionReadFailure\(res, error, sessId, 'get failed'\)/g) ?? []).length,
+    (routes.match(/io\.sendSessionReadFailure\(res, error, sessId, 'get failed'\)/g) ?? []).length,
     2,
   )
   assert.doesNotMatch(
     routes.slice(routes.indexOf('const timelineMatch'), routes.indexOf('const archiveMatch')),
-    /\.catch\(\(\) => this\.sendJson\(res, 500/,
+    /\.catch\(\(\) => io\.sendJson\(res, 500/,
   )
 })
 
