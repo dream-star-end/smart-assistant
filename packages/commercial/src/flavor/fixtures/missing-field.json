@@ -3,5 +3,5 @@
   "flavor": "commercial",
   "sourceCommit": "dddddddddddddddddddddddddddddddddddddddd",
   "builder": "deploy-v5.sh",
-  "expectedHosts": ["kl-mirror"]
+  "expectedHosts": ["kl-mirror", "cj-volc-gz"]
 }
