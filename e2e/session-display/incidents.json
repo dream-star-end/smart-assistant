@@ -7188,10 +7188,16 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/process-disclosure.node-test.mjs",
           "assertion": "stop row keeps copy / more instead of a standing time row"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/cards.test.tsx",
+          "assertion": "OCV5-459: a stop row copies and quotes the turn's text, not the stop line"
         }
       ],
       "coverageCommits": [
-        "eda1105b"
+        "eda1105b",
+        "f65e85e2"
       ]
     }
   ]
