@@ -51,6 +51,7 @@ WATCH_INTERVAL="${V5SB_WATCH_INTERVAL:-2}"
 PG_DUMP="${V5SB_PG_DUMP:-pg_dump}"
 PG_RESTORE="${V5SB_PG_RESTORE:-pg_restore}"
 PSQL="${V5SB_PSQL:-psql}"
+STATUS_PY="${V5SB_STATUS_PY:-python3}"
 # Run pg tools as this OS user (peer auth on the local socket). Empty = as is.
 PG_AS="${V5SB_PG_AS-postgres}"
 DRILL_DB="${V5SB_DRILL_DB:-openclaude_v5_selfhost_restore_drill}"
@@ -81,9 +82,11 @@ now_iso() { date -u +%FT%TZ; }
 write_status() { # <tier> <json-object-for-tier>
   local tier="$1" obj="$2" dir tmp
   dir="$(dirname -- "$STATUS_FILE")"
-  install -d -m 755 -- "$dir"
-  tmp="$(mktemp -p "$dir" .pg-backup-status.XXXXXX)"
-  python3 - "$STATUS_FILE" "$tier" "$obj" >"$tmp" <<'PY'
+  install -d -m 755 -- "$dir" || return 1
+  tmp="$(mktemp -p "$dir" .pg-backup-status.XXXXXX)" || return 1
+  # Callers run with set -e disabled (`run_core || rc=$?`): check every step, and
+  # never let an empty or partial file replace the previous status.
+  if ! "$STATUS_PY" - "$STATUS_FILE" "$tier" "$obj" >"$tmp" <<'PY'
 import json, sys
 path, tier, raw = sys.argv[1:]
 try:
@@ -109,8 +112,15 @@ state[tier] = new
 json.dump(state, sys.stdout, ensure_ascii=False, sort_keys=True, indent=2)
 sys.stdout.write("\n")
 PY
-  chmod 644 -- "$tmp"
-  mv -T -- "$tmp" "$STATUS_FILE"
+  then
+    unlink -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  if [[ ! -s "$tmp" ]] || ! chmod 644 -- "$tmp" || ! mv -T -- "$tmp" "$STATUS_FILE"; then
+    unlink -- "$tmp" 2>/dev/null || true
+    return 1
+  fi
+  return 0
 }
 
 tier_json() { # key=value ... (numbers stay numbers when they look like integers)

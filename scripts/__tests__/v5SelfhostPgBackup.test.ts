@@ -362,6 +362,19 @@ describe('v5-selfhost-pg-backup.sh review r1 hardening', () => {
     assert.equal(existsSync(path.join(dir, 'psql.log')), false)
   })
 
+  test('a failing status write keeps the previous status and fails the run', () => {
+    assert.equal(run().status, 0)
+    const before = readFileSync(path.join(dir, 'state/status.json'), 'utf8')
+    stub('failpy', 'cat >/dev/null; exit 1')
+    const r = run(['run', '--tier', 'core'], { V5SB_STATUS_PY: path.join(dir, 'bin/failpy') })
+    assert.notEqual(r.status, 0, r.out)
+    assert.equal(readFileSync(path.join(dir, 'state/status.json'), 'utf8'), before)
+    assert.deepEqual(
+      readdirSync(path.join(dir, 'state')).filter((f) => f.startsWith('.pg-backup-status.')),
+      [],
+    )
+  })
+
   test('bad knobs and a relative backup dir are usage errors', () => {
     assert.equal(run(['run'], { V5SB_KEEP: '0' }).status, 2)
     assert.equal(run(['run'], { V5SB_MIN_FREE_GIB: 'x' }).status, 2)
