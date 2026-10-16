@@ -717,7 +717,9 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
               const el = document.querySelector("[data-testid=find-chat-scroll]");
               if (el) el.scrollTop = el.scrollHeight;
             });
-            await page.waitForTimeout(40);
+            // Past the 200 ms quiet window: the reset's scroll must not arm a timer that ends the
+            // fresh fence before the jump is captured pending.
+            await page.waitForTimeout(250);
             await takeGestureEvents(page);
             await holdFence(page);
             events.wheels += 1;
