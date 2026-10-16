@@ -36,7 +36,9 @@ log_dir=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --list) printf '%s\n' "${WATCH_GATE_TESTS[@]}"; exit 0 ;;
-    --log-dir) log_dir="${2:-}"; shift 2 ;;
+    --log-dir)
+      [[ -n "${2:-}" ]] || { echo "--log-dir needs a directory" >&2; exit 2; }
+      log_dir="$2"; shift 2 ;;
     -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac

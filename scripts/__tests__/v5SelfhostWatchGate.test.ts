@@ -48,5 +48,7 @@ describe('selfhost watch gate list', () => {
   test('unknown arguments are a usage error (exit 2)', () => {
     const r = spawnSync('bash', [runner, '--bogus'], { encoding: 'utf8' })
     assert.equal(r.status, 2)
+    const noDir = spawnSync('bash', [runner, '--log-dir'], { encoding: 'utf8', timeout: 5000 })
+    assert.equal(noDir.status, 2)
   })
 })
