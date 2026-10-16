@@ -97,10 +97,14 @@ if ! grep -q '^  sync_watch_from "\$rel"' <<<"$pre" && fn cmd_smoke | grep -q 'a
   ok "S11 no sync before committed; smoke and status wired"
 else bad "S11 wiring"; fi
 gate="$(awk '/rootfix contract gate 失败/{f=1} f; /harden_unique_release_tree "\$staging"/{exit}' "$LIB")"
+# OCV5-447: the list lives in scripts/v5-selfhost-watch-gate.sh (shared with PR CI); the
+# gate section must run that runner, and the runner must list every watch test.
 missing=""
+grep -q 'bash scripts/v5-selfhost-watch-gate.sh' <<<"$gate" || missing="$missing runner-call"
+gate_list="$(bash "$(dirname "$LIB")/v5-selfhost-watch-gate.sh" --list 2>/dev/null || true)"
 for t in v5-selfhost-watch-selftest.sh v5-selfhost-watch-disarm-observe.test.sh v5-selfhost-watch-lock.test.sh \
   v5-selfhost-watch-rearm.test.sh v5-selfhost-watch-sync.test.sh v5-selfhost-watch-alert.test.sh; do
-  grep -q "$t" <<<"$gate" || missing="$missing $t"
+  grep -qx "$t" <<<"$gate_list" || missing="$missing $t"
 done
 if [[ -z "$missing" ]]; then ok "S12 release gate runs every watch test before harden"; else bad "S12 missing:$missing"; fi
 

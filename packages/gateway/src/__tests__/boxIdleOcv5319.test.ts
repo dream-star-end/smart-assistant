@@ -21,6 +21,7 @@ import {
   readIdleOp,
   readPendingIdle,
   runtimeIncarnationStartMs,
+  setRuntimeIncarnationStartForTest,
   startIdleOp,
   withIncarnationShutdown,
   writeIdleCandidate,
@@ -143,7 +144,10 @@ describe('OCV5-319 idle turn without a summary', () => {
         { sessionId, turnKey: sourceTurn }, dir)
       assert.equal(counters.shutdowns, 1)
       assert.equal(readIdleOp(dir, key, revision)?.runnerKilledAt, undefined)
-    } finally { await server.close() }
+    } finally {
+      setRuntimeIncarnationStartForTest(undefined)
+      await server.close()
+    }
   })
 })
 
@@ -186,6 +190,9 @@ describe('OCV5-319 runtime incarnation as shutdown evidence', () => {
       const path = join(dir, 'idle-ops', encodeURIComponent(key), `${revision}.json`)
       const old = new Date(Date.UTC(2001, 0, 1))
       utimesSync(path, old, old) // written long before this host/container started
+      // The previous container died 10 minutes ago: past IDLE_STOPPED_GRACE_MS no matter
+      // how long this runner has been up (a fresh CI runner's PID 1 can be < 120 s old).
+      setRuntimeIncarnationStartForTest(Date.now() - 10 * 60_000)
       await finish.call({}, fakeSession(key, counters), { sessionId, turnKey: sourceTurn }, dir)
       const settled = readIdleOp(dir, key, revision)
       assert.equal(settled?.disposition, 'abandoned')

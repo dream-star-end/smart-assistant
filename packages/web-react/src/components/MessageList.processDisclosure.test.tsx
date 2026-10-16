@@ -200,6 +200,68 @@ describe("MessageList Manus 过程披露", () => {
     expect(answer.closest("[data-testid=process-disclosure]")).toBeNull();
   });
 
+  // OCV5-459: session webmvawsvz2zkzoxm (Grok, 停止于 86 步). The tape stamped USER_CANCELLED on the last
+  // narration and steps ran after it: the narration before it sat outside the shell with a timestamp, then
+  // the stamped narration, then 已停止生成. Narration stays in the steps; only the stop line is outside.
+  const stoppedTurn = (shape: "tape" | "live"): ChatMessage[] => [
+    row("u", "user", "你知道 rea", { status: shape === "tape" ? "replied" : "sent" }),
+    row("s3", "assistant", "请求在平台说明处被截断了。", { _clientMessageId: "u", ts: 1_700_000_001_000 }),
+    row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "probe-read-head" }, _completed: true, output: "ok" }),
+    row("s4", "assistant", "原始提示还在临时文件里，我直接看结尾。", {
+      _clientMessageId: "u",
+      ts: 1_700_000_002_000,
+      ...(shape === "tape"
+        ? { _errorCode: "USER_CANCELLED", _errorDetail: "本轮已由用户停止。", usage: { traceId: "trace-stop" } }
+        : {}),
+    }),
+    row("t2", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "probe-read-tail" }, _completed: true, cancelled: true }),
+    ...(shape === "live"
+      ? [row("stop", "assistant", "本轮已取消。", { _clientMessageId: "u", _errorCode: "user_cancelled", usage: { traceId: "trace-stop" } })]
+      : []),
+  ];
+
+  for (const shape of ["tape", "live"] as const) {
+    test(`OCV5-459 (${shape}): 停止后过程叙述留在步骤里，消息中间没有时间戳`, () => {
+      renderList(stoppedTurn(shape));
+      expect(screen.getAllByTestId("process-disclosure")).toHaveLength(1);
+      expect(screen.queryByText("请求在平台说明处被截断了。")).not.toBeInTheDocument();
+      expect(screen.queryByText("原始提示还在临时文件里，我直接看结尾。")).not.toBeInTheDocument();
+      expect(screen.getAllByRole("status", { name: "已停止生成" })).toHaveLength(1);
+      const stop = screen.getByRole("status", { name: "已停止生成" });
+      expect(stop.closest("[data-testid=process-disclosure]")).toBeNull();
+      // The only time on the turn is the stop row's own meta, after the stop line: none in the middle.
+      const stopRow = stop.closest("[data-testid=assistant-row]") as HTMLElement;
+      // r2: the stop row keeps copy / more like any finished message; meta goes back into them.
+      const actions = within(stopRow).getByTestId("assistant-actions");
+      expect(within(actions).getByRole("button", { name: "复制" })).toBeInTheDocument();
+      expect(within(actions).getByRole("button", { name: "更多操作" })).toBeInTheDocument();
+      expect(within(stopRow).getAllByTestId("assistant-meta").every((meta) => actions.contains(meta))).toBe(true);
+      for (const time of document.querySelectorAll("time")) {
+        expect(time.closest("[data-testid=assistant-row]")).toBe(stopRow);
+        expect(stop.compareDocumentPosition(time) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      }
+      // The stop line comes after the shell.
+      const shell = screen.getByTestId("process-disclosure");
+      expect(shell.compareDocumentPosition(stop) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+      fireEvent.click(screen.getByTestId("process-toggle"));
+      const stages = screen.getAllByTestId("process-stage").map((node) => node.textContent ?? "").join("\n");
+      expect(stages).toContain("请求在平台说明处被截断了。");
+      expect(stages).toContain("原始提示还在临时文件里，我直接看结尾。");
+      expect(screen.getAllByRole("status", { name: "已停止生成" })).toHaveLength(1);
+    });
+  }
+
+  test("OCV5-459: 停在回答中途时，已写出的回答仍在步骤外", () => {
+    renderList([
+      row("u", "user", "写个总结", { status: "replied" }),
+      row("t1", "tool", "终端", { _clientMessageId: "u", toolName: "Bash", inputJson: { command: "probe-read" }, _completed: true, output: "ok" }),
+      row("a", "assistant", "总结的前半段", { _clientMessageId: "u", _errorCode: "USER_CANCELLED", _errorDetail: "本轮已由用户停止。" }),
+    ]);
+    expect(screen.getByText("总结的前半段").closest("[data-testid=process-disclosure]")).toBeNull();
+    expect(screen.getAllByRole("status", { name: "已停止生成" })).toHaveLength(1);
+  });
+
   // OCV5-307 回归:OCV5-308 实况 —— 中途一次 model_not_available(detail=error_during_execution JSON)
   // 之后本轮继续跑工具并给出回答,这张错误卡曾单独挂在收起的「工作过程」下面。
   const midTurnError = (code = "model_not_available") =>

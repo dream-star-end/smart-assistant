@@ -423,6 +423,16 @@ export function runtimeIncarnationStartMs(): number | undefined {
 }
 
 /**
+ * Test seam: pin the incarnation start (number), or clear the cache (undefined)
+ * so the next call reads /proc again. A freshly booted CI runner's PID 1 can be
+ * younger than IDLE_STOPPED_GRACE_MS, which made tests that rely on a real
+ * incarnation start depend on runner uptime (OCV5-458).
+ */
+export function setRuntimeIncarnationStartForTest(ms: number | undefined): void {
+  incarnationStart = ms
+}
+
+/**
  * An unfinished op last written before this incarnation started belongs to a
  * runner that died with the previous container/host: treat the incarnation
  * start as its confirmed shutdown, so the usual grace + `not_found` proof can

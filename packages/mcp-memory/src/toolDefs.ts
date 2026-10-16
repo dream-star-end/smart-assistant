@@ -575,7 +575,8 @@ export const TOOLS = [
     name: 'present_task_approval',
     description: [
       '向当前对话投递一张任务单人工审批卡。调用后立刻返回(不阻塞、不等待、不轮询)。',
-      '用户在对话里点「通过/批准」或「打回」会以用户本人身份改单据;done 仍不属于 AI。',
+      '用户在对话里点「通过/批准」或「打回」会以用户本人身份改单据;本工具只投卡,不代点。',
+      '用户明确授权且当前环境正式接口已支持时,Agent 验收关单另走 oc-task ticket done,必须附 reason(关单理由)、evidence(证据链接)并写入审计。取消与重开仍由人操作。',
       '只用于 backlog(立项批准)或 waiting_human(验收通过)。id 只用面板返回的 identifier 或 uuid。',
       '返回后必须立刻结束本回合;不要让用户去打开任务面板,不要用选择题卡代替。',
       '一次一张单;一条回复最多 4 次。子 agent 环境会 skipped。',

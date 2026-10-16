@@ -272,10 +272,16 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       await stream.page.evaluate(() => window.__processPage.appendAnswer("\n尾部仍在增长"));
       await stream.page.getByText("尾部仍在增长").waitFor();
       await stream.page.evaluate(() => window.__processPage.setSending(false));
-      await stream.page.getByText("尾部仍在增长").waitFor();
-      assert.equal(await stream.page.getByTestId("process-toggle").getAttribute("aria-expanded"), "true", "manual open collapsed when the turn finished");
-      const finished = await stream.page.getByText("STREAM_TAIL_MARKER").evaluate((node) => !!node.closest("[data-testid=assistant-row]") && !node.closest("[data-testid=process-disclosure]"));
+      // The finished layout lands on a later render. Waiting for text that was already on the
+      // page returned at once and raced it on slow runners (OCV5-457); wait for the layout itself.
+      const finished = await stream.page.waitForFunction(() => {
+        const has = (el) => (el.textContent || "").includes("STREAM_TAIL_MARKER");
+        const inAnswer = [...document.querySelectorAll("[data-testid=assistant-row]")].some((row) => has(row) && !row.closest("[data-testid=process-disclosure]"));
+        const inProcess = [...document.querySelectorAll("[data-testid=process-disclosure]")].some(has);
+        return inAnswer && !inProcess;
+      }, null, { timeout: 4000 }).then(() => true, () => false);
       assert.equal(finished, true, "finished answer did not become the only top-level reply");
+      assert.equal(await stream.page.getByTestId("process-toggle").getAttribute("aria-expanded"), "true", "manual open collapsed when the turn finished");
       await stream.page.screenshot({ path: join(shots, "ocv5-265-manus-stream-answer.png") });
       await stream.page.screenshot({ path: join(shots, "ocv5-265-live-flow-stream-finished.png") });
       assert.equal(stream.errors.length, 0, stream.errors.join("\n"));
@@ -370,6 +376,62 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       assert.equal(attention.errors.length, 0, attention.errors.join("\n"));
     } finally {
       await attention.context.close();
+    }
+
+    // OCV5-459: after Stop, narration stays in 已执行 N 个步骤 and no timestamp sits between the steps and
+    // 已停止生成. Both the tape shape (refresh / other device) and the live shape (the device that stopped).
+    for (const shape of ["tape", "live"]) {
+      const stopped = await open(390, true);
+      try {
+        await stopped.page.evaluate((scene) => window.__processPage.setScene(scene), `stopped-${shape}`);
+        await stopped.page.waitForFunction((scene) => document.querySelector("[data-testid=process-harness]")?.getAttribute("data-scene") === scene, `stopped-${shape}`);
+        const status = stopped.page.getByRole("status", { name: "已停止生成" });
+        await status.waitFor();
+        assert.equal(await status.count(), 1, `${shape}: one stop line`);
+        const shells = stopped.page.getByTestId("process-disclosure");
+        assert.equal(await shells.count(), 1, `${shape}: one steps shell`);
+        assert.equal(await stopped.page.getByText(/STOP_NARRATION_(ONE|TWO)/).count(), 0, `${shape}: narration is folded`);
+        const layout = await stopped.page.evaluate(() => {
+          const shell = document.querySelector("[data-testid=process-disclosure]");
+          const stop = document.querySelector('output[aria-label="已停止生成"]');
+          const visible = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && Number(s.opacity) > 0; };
+          const shellBottom = shell.getBoundingClientRect().bottom;
+          const stopTop = stop.getBoundingClientRect().top;
+          const between = [...document.querySelectorAll("time")].filter(visible).map((t) => t.getBoundingClientRect())
+            .filter((r) => r.top >= shellBottom - 1 && r.bottom <= stopTop + 1).length;
+          const proseBetween = [...document.querySelectorAll("[data-testid=assistant-row]")]
+            .filter((row) => !row.contains(stop) && visible(row) && row.getBoundingClientRect().top >= shellBottom - 1).length;
+          return { shellBottom, stopTop, between, proseBetween };
+        });
+        assert.ok(layout.stopTop >= layout.shellBottom - 1, `${shape}: stop line below the shell ${JSON.stringify(layout)}`);
+        assert.equal(layout.between, 0, `${shape}: no timestamp between the steps and the stop line ${JSON.stringify(layout)}`);
+        assert.equal(layout.proseBetween, 0, `${shape}: no assistant text outside the shell ${JSON.stringify(layout)}`);
+        // r2: the stop row keeps copy / more like a finished message, 44px touch targets; on touch the
+        // time / credits / request ID live in the menu, so no time is visible on the turn.
+        const stopRow = stopped.page.getByTestId("assistant-row").filter({ has: status });
+        for (const name of ["复制", "更多操作"]) {
+          const button = stopRow.getByTestId("assistant-actions").getByRole("button", { name, exact: true });
+          await button.waitFor({ state: "visible" });
+          const box = await button.boundingBox();
+          assert.ok(box && box.height >= 44 && box.width >= 44, `${shape}: stop row ${name} touch target ${JSON.stringify(box)}`);
+        }
+        const visibleTimes = await stopped.page.evaluate(() => [...document.querySelectorAll("time")].filter((t) => {
+          const r = t.getBoundingClientRect(); const s = getComputedStyle(t);
+          return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && Number(s.opacity) > 0;
+        }).length);
+        assert.equal(visibleTimes, 0, `${shape}: stop row keeps copy / more instead of a standing time row`);
+        await stopped.page.screenshot({ path: join(shots, `ocv5-459-stopped-${shape}-mobile-collapsed.png`) });
+        await stopped.page.getByTestId("process-toggle").tap();
+        await stopped.page.getByText(/STOP_NARRATION_TWO/).waitFor();
+        assert.equal(await shells.getByText(/STOP_NARRATION_ONE/).count(), 1, `${shape}: first narration inside the shell`);
+        assert.equal(await shells.getByText(/STOP_NARRATION_TWO/).count(), 1, `${shape}: stamped narration inside the shell`);
+        assert.equal(await status.count(), 1, `${shape}: still one stop line after expanding`);
+        await stopped.page.screenshot({ path: join(shots, `ocv5-459-stopped-${shape}-mobile-expanded.png`) });
+        assert.equal(stopped.errors.length, 0, stopped.errors.join("\n"));
+      } finally {
+        await stopped.context.close();
+      }
     }
   } finally {
     await browser.close();

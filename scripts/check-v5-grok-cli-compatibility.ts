@@ -13,6 +13,9 @@
  * is the master's Grok web search handler, served over loopback HTTP against a
  * stand-in upstream that applies xAI's version rule.
  * Not proven here: the binary inside a built image and a real upstream 426.
+ * Also the release gate for INC-20261016-GROK-PROMPT-OFFLOAD (OCV5-460): the
+ * candidate's GrokAdapter against a stand-in CLI with 1.0.13's prompt-file rule.
+ * Not proven there: the real CLI's offload threshold.
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -317,6 +320,61 @@ function proveImagePin(): string {
   return "[grok-426-image-pin] PASS — a new runtime image is built with a Grok CLI xAI serves";
 }
 
+// OCV5-460 (INC-20261016-GROK-PROMPT-OFFLOAD): the candidate's own GrokAdapter, driven like a
+// real turn, against a stand-in CLI that applies Grok CLI 1.0.13's --prompt-file rule: without
+// --verbatim a prompt over ~20 KB keeps only its head and tail inline and the model is told to
+// read the rest from sessions/<id>/prompts/. The platform context alone is past that size, so
+// the user's words must reach the model's context inline, inside one <user_query>.
+const INLINE_LIMIT = 20 * 1024;
+const STANDIN_GROK = `#!/usr/bin/env node
+const fs = require("node:fs");
+const argv = process.argv.slice(2);
+const file = fs.readFileSync(argv[argv.indexOf("--prompt-file") + 1], "utf8");
+const verbatim = argv.includes("--verbatim");
+const wrapped = verbatim ? file : "<user_query>\\n" + file + "\\n</user_query>";
+const context = verbatim || Buffer.byteLength(wrapped) <= ${INLINE_LIMIT} ? wrapped
+  : wrapped.slice(0, 8192) + "\\n[request truncated; read_file sessions/s/prompts/prompt_0.txt for the full request]\\n" + wrapped.slice(-4096);
+fs.writeFileSync(process.env.OC_GROK_INLINE_CAPTURE, JSON.stringify({ argv, context }));
+console.log(JSON.stringify({ type: "end", stopReason: "end_turn", sessionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", usage: { input_tokens: 1, output_tokens: 1 } }));
+`;
+async function proveRequestInline(): Promise<string> {
+  const dir = mkdtempSync(join(tmpdir(), "oc-grok-inline-gate-"));
+  const fake = join(dir, "grok");
+  const capture = join(dir, "capture.json");
+  writeFileSync(fake, STANDIN_GROK);
+  chmodSync(fake, 0o755);
+  const saved = { bin: process.env.OC_GROK_CLI_BIN, capture: process.env.OC_GROK_INLINE_CAPTURE };
+  process.env.OC_GROK_CLI_BIN = fake;
+  process.env.OC_GROK_INLINE_CAPTURE = capture;
+  try {
+    const { GrokAdapter } = await import(pathToFileURL(join(CANDIDATE, "packages/gateway/src/engine/grokAdapter.ts")).href);
+    const adapter = new GrokAdapter({
+      sessionKey: "agent:main:webchat:dm:grok-inline-gate", agentId: "main", agentBaseDir: dir, model: "grok-build", effortLevel: "high",
+      config: { version: 1, gateway: { bind: "127.0.0.1", port: 0, accessToken: "" }, auth: { mode: "subscription", claudeCodePath: "" }, sessions: { dbPath: "" }, defaults: { model: "grok-build" } },
+    });
+    adapter.setGrokRoute({ baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${"a".repeat(64)}/v1`, routeToken: "a".repeat(64) });
+    adapter.on("error", () => {});
+    const sentinel = `user-words-${NONCE}`;
+    const run = adapter.submitTurn({
+      input: `${"用户在长对话里的原话。".repeat(1_500)}${sentinel}`, requestId: "b".repeat(32), onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map(),
+    });
+    await run.submitted;
+    await run.summary;
+    await adapter.waitForOutputDrain();
+    if (!existsSync(capture)) fail("REQUEST_INLINE_NO_SPAWN");
+    const { context } = JSON.parse(readFileSync(capture, "utf8")) as { context: string };
+    if (/read_file sessions\/[^ ]*\/prompts\//.test(context)) fail("REQUEST_INLINE_OFFLOADED");
+    const query = /<user_query>\n([\s\S]*)\n<\/user_query>/.exec(context)?.[1] ?? "";
+    if (context.split("<user_query>").length !== 2 || !query.endsWith(sentinel)) fail("REQUEST_INLINE_USER_WORDS_MISSING");
+    return "[grok-prompt-offload-inline] PASS — the user's words reach the model's context inline, not as a file to read";
+  } finally {
+    if (saved.bin === undefined) Reflect.deleteProperty(process.env, "OC_GROK_CLI_BIN"); else process.env.OC_GROK_CLI_BIN = saved.bin;
+    if (saved.capture === undefined) Reflect.deleteProperty(process.env, "OC_GROK_INLINE_CAPTURE"); else process.env.OC_GROK_INLINE_CAPTURE = saved.capture;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 async function main(): Promise<void> {
   const candidateSha = parseArgs(process.argv);
   let box: Capsule | undefined;
@@ -329,7 +387,7 @@ async function main(): Promise<void> {
   try {
     box = capsule();
     const proofs = [proveOfflinePrepare(box), proveOnlineImage(box), proveStagedActivation(box),
-      await proveWebSearchHeader(), proveImagePin()];
+      await proveWebSearchHeader(), proveImagePin(), await proveRequestInline()];
     const digest = createHash("sha256").update(readFileSync(DEPLOY)).digest("hex");
     process.stdout.write(`${JSON.stringify({ ok: true, candidateSha, candidate: CANDIDATE, deploySha256: digest, proofs })}\n`);
   } finally {

@@ -1,35 +1,15 @@
-import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 import { chmodSync, existsSync, lstatSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
+import { type IdentityCompatRuntimeContext, identityCompatEnvironment } from '@openclaude/storage'
 
 import { paths } from '@openclaude/storage'
 import { issueDelegateContextToken } from '../delegateContext.js'
 import { resolveMcpMemoryLaunch } from '../mcpMemoryEntry.js'
+import { PLATFORM_MEMORY_MCP_TOOLS } from './platformMemoryMcpTools.js'
 
-export const ZCODE_MEMORY_MCP_TOOLS = [
-  'skill_search',
-  'skill_list',
-  'skill_view',
-  'skill_save',
-  'skill_delete',
-  'create_reminder',
-  'list_reminders',
-  'update_reminder',
-  'delete_reminder',
-  'send_to_agent',
-  'delegate_task',
-  'delegate_tasks',
-  'request_review',
-  'consult_advisor',
-  'task_create',
-  'task_update',
-  'task_comment',
-  'task_list',
-  'task_get',
-  'task_approve',
-] as const
+export const ZCODE_MEMORY_MCP_TOOLS = PLATFORM_MEMORY_MCP_TOOLS
 
 const CONTEXT_PREFIX = join(tmpdir(), 'oc-zcode-context-')
 const HOT_HOOK_COLLECTOR = '/run/oc/platform/current/bin/oc-zcode-hook'
@@ -114,8 +94,8 @@ export function createZcodePlatformArtifacts(
       )
       const env: Record<string, string> = {
         OPENCLAUDE_AGENT_ID: input.agentId,
-      OC_AGENT_ID: input.agentId,
-      ...identityCompatEnvironment(input.identityCompat),
+        OC_AGENT_ID: input.agentId,
+        ...identityCompatEnvironment(input.identityCompat),
         ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
         OPENCLAUDE_HOME: openclaudeHome,
         OPENCLAUDE_SESSION_KEY: input.sessionKey,
@@ -348,8 +328,8 @@ export function readZcodeReasoningParts(input: {
   sessionId: string
   startedAt: number
 }): ZcodeReasoningPart[] {
-  return readZcodeContentSnapshot(input).parts
-    .filter((part) => part.kind === 'reasoning')
+  return readZcodeContentSnapshot(input)
+    .parts.filter((part) => part.kind === 'reasoning')
     .map(({ kind: _kind, ...part }) => part)
 }
 

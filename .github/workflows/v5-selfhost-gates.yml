@@ -62,6 +62,16 @@ jobs:
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           echo "comparison base: $ref"
 
+      # OCV5-450:列车迁移门的两项先在 PR 上跑:未列入 requiredMigrations 即红;
+      # 破坏性 DDL 只标注(发布时仍需用户批准 + OC_V5_ALLOW_BREAKING_MIGRATION=1)。
+      - name: Migration precheck (same rules as the train's migration gate)
+        run: bash scripts/v5-selfhost-migration-precheck.sh --base "${{ steps.base.outputs.ref }}"
+
+      # 大文件棘轮(FINDINGS §7 / ARC-3):已 >3000 行的源码文件不许净增,其余不得超过 3000 行;
+      # 例外写 .github/file-size-ratchet-exceptions.json(ticket/reason/≤30 天到期)。
+      - name: Large source file ratchet
+        run: npx tsx scripts/check-file-size-ratchet.ts --base "${{ steps.base.outputs.ref }}"
+
       - name: Biome (changed files, no new errors)
         run: bash scripts/check-biome-changed.sh --base "${{ steps.base.outputs.ref }}"
 
@@ -80,3 +90,23 @@ jobs:
 
       - name: Two-tree divergence (report only until the unified sync)
         run: npx tsx scripts/check-v5-two-tree-divergence.ts --against origin/feat/v5-aurora-rewrite
+
+  # OCV5-447:列车 pinned staging 跑的 watch / autorecover 行为门,PR 上先跑同一份清单
+  # (scripts/v5-selfhost-watch-gate.sh)。此前只有列车跑,watch 改动要等一趟列车失败才知道。
+  watch-gate:
+    name: selfhost-watch-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Watch behaviour gate (same list as the train)
+        run: bash scripts/v5-selfhost-watch-gate.sh --log-dir "$RUNNER_TEMP/watch-gate"
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-watch-gate-logs
+          path: ${{ runner.temp }}/watch-gate

@@ -36,7 +36,16 @@ function userIdFrom(value: string): number {
   return id
 }
 
-type ManagedSetupProvider = 'knowledge-planet' | 'weibo' | 'zhihu' | 'bili-account'
+// One list of QR-setup providers (OCV5-462): the type, both route patterns and the
+// manager table come from it, and setupManager's table is exhaustive, so a new
+// provider cannot silently fall through to another provider's manager.
+export const MANAGED_SETUP_PROVIDERS = ['knowledge-planet', 'weibo', 'zhihu', 'bili-account'] as const
+type ManagedSetupProvider = (typeof MANAGED_SETUP_PROVIDERS)[number]
+const SETUP_PROVIDER_ALT = MANAGED_SETUP_PROVIDERS.join('|')
+const SETUP_SESSION_RE = new RegExp(
+  `^\\/api\\/plugins\\/(${SETUP_PROVIDER_ALT})\\/setup\\/([0-9a-f-]{36})(\\/qr)?$`,
+)
+const SETUP_ROOT_RE = new RegExp(`^\\/api\\/plugins\\/(${SETUP_PROVIDER_ALT})\\/setup$`)
 type ManagedSetupManager =
   | KnowledgePlanetSetupManager
   | WeiboSetupManager
@@ -67,14 +76,13 @@ function setupManager(
   deps: CommercialHttpDeps & PluginHttpDeps,
   provider: ManagedSetupProvider,
 ): ManagedSetupManager {
-  const manager =
-    provider === 'knowledge-planet'
-      ? deps.knowledgePlanetSetup
-      : provider === 'weibo'
-        ? deps.weiboSetup
-        : provider === 'zhihu'
-          ? deps.zhihuSetup
-          : deps.biliAccountSetup
+  const managers: Record<ManagedSetupProvider, ManagedSetupManager | undefined> = {
+    'knowledge-planet': deps.knowledgePlanetSetup,
+    weibo: deps.weiboSetup,
+    zhihu: deps.zhihuSetup,
+    'bili-account': deps.biliAccountSetup,
+  }
+  const manager = managers[provider]
   if (!manager) throw pluginHttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
   return manager
 }
@@ -202,7 +210,7 @@ function setupMatch(
   path: string,
 ): { provider: ManagedSetupProvider; sessionId: string; qr: boolean } | null {
   const match =
-    /^\/api\/plugins\/(knowledge-planet|weibo|zhihu|bili-account)\/setup\/([0-9a-f-]{36})(\/qr)?$/.exec(
+    SETUP_SESSION_RE.exec(
       path,
     )
   return match
@@ -237,7 +245,7 @@ export async function dispatchPluginsRoute(
     return
   }
 
-  const setupRoot = /^\/api\/plugins\/(knowledge-planet|weibo|zhihu|bili-account)\/setup$/.exec(path)
+  const setupRoot = SETUP_ROOT_RE.exec(path)
   if (method === 'POST' && setupRoot) {
     const raw = await readJsonBody(req, 1024)
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw))

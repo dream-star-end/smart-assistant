@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
-import { parseModels, parseOptions, turnPolicy, engineMatrix, tapResult, assertOutbound, turnEvidence, continuationCode, continuationPrompts, assertSameSession, assertContinuationAnswer } from "../lib/user-contract.mjs";
+import { parseModels, parseOptions, turnPolicy, engineMatrix, tapResult, assertOutbound, turnEvidence, continuationCode, continuationPrompts, assertSameSession, assertContinuationAnswer, offloadedRequestReads } from "../lib/user-contract.mjs";
 const catalog = [{ id: "grok-build", engine: "grok" }, { id: "deepseek-v4-flash", engine: "ccb" }];
 test("contract options default dry and reject malformed modes/origins", () => {
   assert.equal(parseOptions({}).cost, "dry");
@@ -136,4 +136,19 @@ test("OCV5-429: prewarm is a UI login that sends nothing and waits for relay_rea
   setTimeout(() => probe.received.push({ type: "sys.relay_ready" }), 30);
   assert.equal((await waitRelayReady(probe, 1000)).type, "sys.relay_ready");
   await assert.rejects(waitRelayReady({ received: [] }, 50), /Canary relay not ready/);
+});
+test("OCV5-460: a contract turn that reads an offloaded request file is caught", () => {
+  const sent = { peer: { id: "p1" }, clientMessageId: "m1" };
+  const read = { kind: "tool_use", toolName: "Read", inputJson: { file_path: "/home/agent/.openclaude/grok-build/caller/x/sessions/w/01a14455-86c8-7140-bd18-5fad8286980d/prompts/prompt_0.txt" } };
+  const other = { kind: "tool_use", toolName: "Read", inputJson: { file_path: "src/prompts/prompt_guide.md" } };
+  const frame = (blocks, clientMessageId = "m1") => ({ type: "outbound.message", peer: { id: "p1" }, clientMessageId, blocks });
+  assert.deepEqual(offloadedRequestReads([frame([read])], sent), ["Read"]);
+  assert.deepEqual(offloadedRequestReads([frame([{ kind: "text", text: "收到" }, other])], sent), []);
+  assert.deepEqual(offloadedRequestReads([frame([read], "m2")], sent), []);
+  assert.deepEqual(offloadedRequestReads([{ type: "outbound.turn_status", peer: { id: "p1" }, clientMessageId: "m1" }], sent), []);
+});
+test("OCV5-460: the smoke fails C3 when any continuation turn read an offloaded request file", () => {
+  const smoke = readFileSync(new URL("../v5-user-contract-smoke.mjs", import.meta.url), "utf8");
+  assert.match(smoke, /const run = await runContinuationTurns\(/);
+  assert.match(smoke, /for \(const sent of run\.sent \?\? \[\]\) \{\n\s+const reads = offloadedRequestReads\(probe\.received, sent\);\n\s+if \(reads\.length\) throw new Error/);
 });

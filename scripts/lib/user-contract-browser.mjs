@@ -196,7 +196,7 @@ export async function runContinuationTurns(page, probe, turn, log = console.log)
   assertContinuationAnswer(await lastAssistantText(page), code);
   await assertSessionClean(page, probe, [first.sent, second.sent]);
   log(`# continuation model=${turn.model} turns=2 same_session=ok recall=ok`);
-  return { executed: true };
+  return { executed: true, sent: [first.sent, second.sent] };
 }
 // Text the user actually sees in the newest assistant row (timeline projection,
 // so CCB answers that only reach the tape are included).

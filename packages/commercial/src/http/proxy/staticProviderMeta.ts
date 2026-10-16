@@ -10,7 +10,7 @@
 // 故意**不**放进 protocol —— protocol 是 commercial+gateway 共享的纯路由契约，不应耦合
 // commercial 的 config/错误码/metrics(Codex plan review #1)。
 
-import { findRouteProviderForModel, type StaticProviderId } from "@openclaude/protocol";
+import { findRouteProviderForModel, type StaticProviderId, type StaticProviderKeys } from "@openclaude/protocol";
 import { PLATFORM_DEFAULT_MODEL } from "../../platformDefaults.js";
 
 export interface StaticProviderCommercialMeta {
@@ -188,4 +188,21 @@ export function assertPlatformDefaultModelConfigured(cfg: {
         `避免全员默认模型静默 503。请先在 systemd EnvironmentFile 写入(旋转后的) ${meta.keyConfigField} 再部署。`,
     );
   }
+}
+
+/**
+ * provider id → platform static key, derived from `keyConfigField` (OCV5-455). The one
+ * mapping for the master proxy, the egress proxy/probers and the API-key pool import;
+ * they used to hand-copy it, so each new provider had to be added in three places.
+ * Blank or whitespace-only values are left out (treated as not configured).
+ */
+export function staticProviderKeysFromConfig(
+  cfg: Partial<Record<StaticProviderCommercialMeta["keyConfigField"], string | undefined>>,
+): StaticProviderKeys {
+  const keys: StaticProviderKeys = {};
+  for (const id of Object.keys(STATIC_PROVIDER_META) as StaticProviderId[]) {
+    const raw = cfg[STATIC_PROVIDER_META[id].keyConfigField];
+    if (typeof raw === "string" && raw.trim()) keys[id] = raw;
+  }
+  return keys;
 }
