@@ -1,4 +1,3 @@
-import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 /**
  * Project OpenClaude platform context + openclaude-memory MCP into official
  * Grok CLI. Grok does not inherit CCB/Cursor wiring; this module is the
@@ -7,34 +6,14 @@ import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@o
 import { randomBytes } from 'node:crypto'
 import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { type IdentityCompatRuntimeContext, identityCompatEnvironment } from '@openclaude/storage'
 
 import { paths } from '@openclaude/storage'
 import { issueParentCallerToken } from '../delegateContext.js'
 import { resolveMcpMemoryLaunch } from '../mcpMemoryEntry.js'
+import { PLATFORM_MEMORY_MCP_TOOLS } from './platformMemoryMcpTools.js'
 
-export const GROK_MEMORY_MCP_TOOLS = [
-  'skill_search',
-  'skill_list',
-  'skill_view',
-  'skill_save',
-  'skill_delete',
-  'create_reminder',
-  'list_reminders',
-  'update_reminder',
-  'delete_reminder',
-  'send_to_agent',
-  'delegate_task',
-  'delegate_tasks',
-  'request_review',
-  'consult_advisor',
-  'task_create',
-  'task_update',
-  'task_comment',
-  'task_list',
-  'task_get',
-  'task_approve',
-  'present_task_approval',
-] as const
+export const GROK_MEMORY_MCP_TOOLS = PLATFORM_MEMORY_MCP_TOOLS
 
 export const GROK_PREAMBLE = `# OpenClaude Platform Context (Grok adapter)
 
