@@ -289,6 +289,18 @@
       "reason": "OCV5-441: repairs 23 stale test:gateway failures and moves five commercial imports of gateway/src onto the @openclaude/gateway package export (same modules, no behaviour change). Test and CI only; nothing user-visible.",
       "approvedBy": "user 2026-10-16 管家按用户「有问题就搞、尽快上线」派单 OCV5-441：修全量网关测试并接入个人版 CI，按规范写 Incident: none 豁免（cc3 会话）",
       "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "6588fe7c2ff2c6ce265e49a41a0dba881df1e6b9",
+      "reason": "OCV5-411 #723 Codex r1 P1: the Antigravity relay parked on a drain that never came when the CLI disconnected under backpressure (usage unrecorded, reservation held). Latent: Antigravity is admin-only and disabled in commercial and no commercial release carried it; on selfhost it is owner-only.",
+      "approvedBy": "user 2026-10-16 管家转用户要求：#723 Codex r1 的 P1 与红项都修掉，不发商业版（cc3 sync 会话）",
+      "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "0d54eea02425d164ed68a6c77f21a5d563744756",
+      "reason": "OCV5-411 #723 Codex r1 P1: six tables from selfhost migrations 0306–0308 had no retention disposition; pool_events now gets its documented 30-day sweep. Latent: the tables do not exist in commercial yet; nothing user-visible.",
+      "approvedBy": "user 2026-10-16 管家转用户要求：#723 Codex r1 的 P1 与红项都修掉，不发商业版（cc3 sync 会话）",
+      "expiresAt": "2026-11-15"
     }
   ]
 }
