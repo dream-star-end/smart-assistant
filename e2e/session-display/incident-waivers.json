@@ -295,6 +295,12 @@
       "reason": "OCV5-445: backport of commercial 0d54eea02. Registers retention for the six 0306–0308 tables; pool_events is swept after 30 days. Latent: pool_events' oldest row is from 2026-10-15, none has reached 30 days. retentionRegistry.integ red without, green with.",
       "approvedBy": "user 2026-10-16 管家派单 OCV5-445：把商业 #723 同步里 Codex 发现的两个问题回挂个人版，按规范写 Incident: none 豁免（cc3 antigravity 会话）",
       "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "cc82daee1a48d307530e7c08923475c5428947f5",
+      "reason": "OCV5-451: a call that outlives a stopped Antigravity turn (recorded by the relay after settlement) is folded into the turn's waived usage row, so its tokens and wouldHaveCharged cover every call. Latent: audit snapshot only; stopped turns are waived and the charge stays 0. Settle integ test red without the fix.",
+      "approvedBy": "user 2026-10-16 「继续修上次汇报里留下的小问题：停止轮在用量入账前就结算，免收费快照里「本应收费」金额偏小」，按规范写 Incident: none 豁免（cc3 antigravity 会话）",
+      "expiresAt": "2026-11-15"
     }
   ]
 }
