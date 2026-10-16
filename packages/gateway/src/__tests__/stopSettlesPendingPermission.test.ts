@@ -76,6 +76,9 @@ function makeGateway(lives: Live[]): {
       interrupts.push(key)
       return true
     },
+    // OCV5-435: a Stop for a turn this gateway has not admitted arms a short
+    // pre-start fence; it never touches runtime permissions.
+    fencePreStartStop: () => {},
   }
   gateway._interruptDelegationsForParent = () => false
   gateway._recordSettlement = (...args: unknown[]) => {

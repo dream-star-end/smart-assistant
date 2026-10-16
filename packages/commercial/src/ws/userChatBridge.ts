@@ -106,6 +106,12 @@ import {
   settleZcodeCatalogUsage,
 } from "../billing/zcodeCatalogSettle.js";
 import {
+  abandonAntigravityTurn,
+  reconcileStaleAntigravityTurns,
+  recordAntigravityTurn,
+  settleAntigravityTurnRecord,
+} from "../billing/antigravitySettle.js";
+import {
   abortInsertedZcodeAudit,
   applyZcodeFinalizeOutcome,
   closePendingZcodeAudits,
@@ -138,7 +144,9 @@ import {
   isGrokEngineModel,
   isCursorEngineModel,
   isCursorContextTier,
+  isServiceTier,
   isZcodeEngineModel,
+  isAntigravityEngineModel,
   isClientMessageId,
   formatMessageReplyPrompt,
   projectContextWindowForCursorTier,
@@ -155,6 +163,7 @@ import {
   type ModelAuthorityEngine,
   type ModelExecutionDescriptor,
   type CursorContextTier,
+  type ServiceTier,
   type TraceIdIssue,
   type GoalStateSnapshot,
   type MessageReplyQuote,
@@ -377,6 +386,7 @@ export interface PromptQueueDispatchRequest {
       advisorModel?: string;
       collabConfigVersion?: string;
       contextTier?: CursorContextTier;
+      serviceTier?: ServiceTier | null;
     };
   };
 }
@@ -450,7 +460,7 @@ export function parsePromptQueueDispatchRequest(value: unknown): PromptQueueDisp
     !isPlainRecord(item.content) || !isPlainRecord(item.requestedExecution)
   ) return null;
   const execution = item.requestedExecution;
-  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "effortLevel", "teamMode", "collabMode", "advisorModel", "collabConfigVersion", "contextTier"])) return null;
+  if (!hasOnlyKeys(execution, ["agentId", "model", "modelSwitchId", "effortLevel", "teamMode", "collabMode", "advisorModel", "collabConfigVersion", "contextTier", "serviceTier"])) return null;
   if (execution.agentId !== owner.agentId) return null;
   if (execution.model !== undefined && typeof execution.model !== "string") return null;
   if (execution.modelSwitchId !== undefined && (typeof execution.modelSwitchId !== "string" || !/^[A-Za-z0-9:_-]{8,128}$/.test(execution.modelSwitchId))) return null;
@@ -465,6 +475,7 @@ export function parsePromptQueueDispatchRequest(value: unknown): PromptQueueDisp
   if (execution.advisorModel !== undefined && typeof execution.advisorModel !== "string") return null;
   if (execution.collabConfigVersion !== undefined && typeof execution.collabConfigVersion !== "string") return null;
   if (execution.contextTier !== undefined && !isCursorContextTier(execution.contextTier)) return null;
+  if (execution.serviceTier !== undefined && execution.serviceTier !== null && !isServiceTier(execution.serviceTier)) return null;
   return value as unknown as PromptQueueDispatchRequest;
 }
 
@@ -1243,6 +1254,27 @@ export interface UserChatBridgeDeps {
   }) => Promise<{ token: string; baseUrl: string }>;
   /** Drop a minted ZCode relay token after the turn settles or aborts. */
   expireZcodeRoute?: (token: string) => void | Promise<void>;
+  /**
+   * OCV5-415: pick a gemini OAuth account, mint the CLI's limited token and an
+   * opaque Antigravity relay route bound to container/user/request/model/account.
+   */
+  admitAntigravityTurn?: (args: {
+    containerId: number;
+    userId: bigint;
+    requestId: string;
+    modelId: string;
+    budgetCredits: bigint;
+  }) => Promise<{
+    token: string;
+    baseUrl: string;
+    accessToken: string;
+    accessTokenExpiresAt: string;
+    idToken: string | null;
+  }>;
+  /** Drop a minted Antigravity relay token after the turn settles or aborts. */
+  expireAntigravityRoute?: (token: string) => void | Promise<void>;
+  /** Expire a turn's relay route by requestId (any bridge; see the terminal-frame branch). */
+  expireAntigravityRouteForRequest?: (requestId: string) => void | Promise<void>;
   /**
    * Trusted UUID of the compute host running this bridge. Cursor credentials
    * are mounted only by that host's local supervisor, so Cursor dispatch must
@@ -3725,6 +3757,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       sessionId: string | null;
       traceId: string;
     }>();
+    const pendingAntigravityRelays = new Map<string, {
+      token: string;
+      modelId: string;
+      sessionId: string | null;
+      traceId: string;
+    }>();
     // P0 修复(2026-07-03)— 跨桥 settle 的同步去重簿记:同 requestId 的 duplicate
     // billing 帧在 journal 回查/settle 在途期间直接丢弃(与主路径 Map.delete 先行
     // 的单次门控同构)。跨进程/跨桥并发仍由 journal CAS + usage_records UNIQUE 兜底。
@@ -5148,6 +5186,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       let isCodexInboundFrame = false;
       let isCursorInboundFrame = false;
       let isZcodeInboundFrame = false;
+      let isAntigravityInboundFrame = false;
       let isAnnotatedImageInboundFrame = false;
       // Session-scoped Codex admission key. Outbound terminal frames match this
       // peer plus clientMessageId; missing peer falls back to a bridge-local
@@ -5947,9 +5986,14 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 ? (authorityDeps?.catalog.peek()?.isZcodeModel(authorityModelForFrame) ??
                    isZcodeEngineModel(effectiveModel))
                 : isZcodeEngineModel(effectiveModel);
+            isAntigravityInboundFrame =
+              authorityOn && authorityModelForFrame !== null
+                ? (authorityDeps?.catalog.peek()?.isAntigravityModel(authorityModelForFrame) ??
+                   isAntigravityEngineModel(effectiveModel))
+                : isAntigravityEngineModel(effectiveModel);
             // peer.id was frozen at inbound.message entry for every turn-level
             // error exit. AgentId is still only needed on engine-billed paths.
-            if (isCodexInboundFrame || isCursorInboundFrame || isZcodeInboundFrame) {
+            if (isCodexInboundFrame || isCursorInboundFrame || isZcodeInboundFrame || isAntigravityInboundFrame) {
               // PR2 v1.0.66 — 把 agentId 提到外层供 codex billing IIFE 用
               // (查 agent_cost_overrides multiplier)。
               inboundAgentIdForFrame = effectiveFrameAgentId;
@@ -5994,6 +6038,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sanitizedParsed,
               "__oc_zcode_route",
             );
+            const hasClientAntigravityRoute = Object.prototype.hasOwnProperty.call(
+              sanitizedParsed,
+              "__oc_antigravity_route",
+            );
             const hasClientWorkspaceMode = Object.prototype.hasOwnProperty.call(
               sanitizedParsed,
               "_workspaceMode",
@@ -6010,6 +6058,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               hasClientCodexRoute ||
               hasClientGrokRoute ||
               hasClientZcodeRoute ||
+              hasClientAntigravityRoute ||
               hasClientWorkspaceMode ||
               hasClientCreditBudget ||
               teamModeMain
@@ -6029,6 +6078,10 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               if (hasClientZcodeRoute) {
                 delete sanitizedParsed.__oc_zcode_route;
+              }
+              if (hasClientAntigravityRoute) {
+                const { __oc_antigravity_route: _discard, ...withoutAntigravityRoute } = sanitizedParsed;
+                sanitizedParsed = withoutAntigravityRoute;
               }
               if (hasClientWorkspaceMode) {
                 const { _workspaceMode: _discard, ...withoutWorkspaceMode } = sanitizedParsed;
@@ -6256,6 +6309,196 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             if (!cleaned && userWs.readyState === WebSocket.OPEN) {
               sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor is temporarily unavailable', cursorTurnIdentity);
             }
+          }
+        });
+        return;
+      }
+      if (isAntigravityInboundFrame && containerId !== undefined) {
+        // OCV5-415 P2: official Antigravity CLI. Same admission shape as ZCode
+        // (authority + spendable gate + master-owned route), but billing is
+        // relay-metered: settle reads antigravity_relay_usage, never the
+        // container's report.
+        const parsedCapture = inboundParsedFrame;
+        const traceCapture = turnTraceIdForFrame;
+        const logCapture = turnLogForFrame;
+        const authorityModelCapture = authorityModelForFrame;
+        const modelCapture = effectiveModelForFrame;
+        const peerCapture = inboundPeerIdForFrame;
+        const cid = containerId;
+        const antigravityTurnIdentity = {
+          peerId: peerCapture,
+          clientMessageId: parsedCapture !== null && isClientMessageId(parsedCapture.clientMessageId)
+            ? parsedCapture.clientMessageId
+            : null,
+        };
+        trackPreparation(async () => {
+          let dispatchRecord: AdmittedDispatch | undefined;
+          let mintedToken: string | null = null;
+          let mintedRequestId: string | null = null;
+          const dropMinted = (): void => {
+            if (mintedToken !== null) {
+              void Promise.resolve(deps.expireAntigravityRoute?.(mintedToken)).catch(() => {});
+            }
+            if (mintedRequestId !== null) {
+              pendingAntigravityRelays.delete(mintedRequestId);
+              if (deps.pgPool) void abandonAntigravityTurn(deps.pgPool, mintedRequestId, uid).catch(() => {});
+            }
+            mintedToken = null;
+            mintedRequestId = null;
+          };
+          const unavailable = (message: string): void => {
+            rejectPromptQueueDispatch('ANTIGRAVITY_UNAVAILABLE');
+            if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+              sendErrorFrame(userWs, 'ANTIGRAVITY_UNAVAILABLE', message, antigravityTurnIdentity);
+            }
+          };
+          try {
+            if (
+              !deps.pgPool || parsedCapture === null || traceCapture === null
+              || typeof modelCapture !== "string" || !isAntigravityEngineModel(modelCapture)
+              || !deps.admitAntigravityTurn
+            ) {
+              unavailable('Antigravity is unavailable for this account');
+              return;
+            }
+            const antigravityModelId = modelCapture;
+            // Turns that never got a terminal frame (bridge gone) settle from
+            // relay usage here; best-effort, off the admission path.
+            if (deps.pricing) {
+              const pool = deps.pgPool;
+              const pricing = deps.pricing;
+              void reconcileStaleAntigravityTurns({ pool, pricing, userId: uid })
+                .then(async (done) => {
+                  for (const { settled, turn } of done) {
+                    await publishZcodeCatalogSettle({
+                      settled,
+                      requestId: turn.requestId,
+                      userId: uid.toString(),
+                      modelId: turn.modelId,
+                      sessionId: turn.sessionId,
+                      traceId: turn.traceId,
+                      persist: deps.appendCostCredits,
+                      publish: (event) => { broadcastToUser(uid, event); },
+                    });
+                  }
+                })
+                .catch((err) => { bridgeLog?.warn('user-chat-bridge: antigravity reconcile failed', { err }); });
+            }
+            const enriched = await attachMasterTurnState(parsedCapture, logCapture, traceCapture, !isPromptQueueDispatch && !isCronOriginDispatch, rejectPromptQueueDispatch, authorityModelCapture, recoveryJob, pretrackedEnrichment);
+            if (enriched === null) return;
+            dispatchRecord = lookupAdmittedDispatch(enriched);
+            let authorityExec: ResolvedTurnExecution | null = null;
+            if (authorityOn) {
+              authorityExec = await resolveAuthorityExecOrReject({ model: authorityModelCapture, classifiedCodex: true, log: logCapture, onReject: rejectPromptQueueDispatch, turn: antigravityTurnIdentity });
+              if (
+                authorityExec === null
+                || authorityExec.engine !== 'antigravity'
+                || authorityExec.canonicalModel !== antigravityModelId
+              ) {
+                failDispatchPreForward(dispatchRecord, 'antigravity_authority_rejected');
+                return;
+              }
+            }
+            const requestId = dispatchRecord ? dispatchRecord.billingRequestId : ensureRequestIdServerSide();
+            let spendable: bigint;
+            try {
+              spendable = await readTotalSpendableBalance(uid);
+            } catch (err) {
+              logCapture?.error('user-chat-bridge: antigravity spendable lookup failed', { err });
+              failDispatchPreForward(dispatchRecord, 'antigravity_spendable_unavailable');
+              unavailable('Antigravity billing is temporarily unavailable');
+              return;
+            }
+            if (spendable <= 0n) {
+              rejectPromptQueueDispatch('ERR_INSUFFICIENT_CREDITS');
+              failDispatchPreForward(dispatchRecord, 'insufficient_credits');
+              if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                sendErrorFrame(
+                  userWs,
+                  'ERR_INSUFFICIENT_CREDITS',
+                  `insufficient credits: balance=${spendable} required=1`,
+                  antigravityTurnIdentity,
+                );
+              }
+              return;
+            }
+            let minted: Awaited<ReturnType<NonNullable<typeof deps.admitAntigravityTurn>>>;
+            try {
+              minted = await deps.admitAntigravityTurn({
+                containerId: cid,
+                userId: uid,
+                requestId,
+                modelId: antigravityModelId,
+                budgetCredits: spendable,
+              });
+            } catch (err) {
+              logCapture?.error('user-chat-bridge: Antigravity admission failed', {
+                code: err instanceof Error ? err.message : 'unknown',
+              });
+              failDispatchPreForward(dispatchRecord, 'antigravity_admission_failed');
+              unavailable(
+                err instanceof Error && err.message === 'ANTIGRAVITY_MODEL_COOLING_DOWN'
+                  ? 'This Antigravity model has no upstream capacity right now; retry in a few minutes or pick another model'
+                  : 'Antigravity is temporarily unavailable',
+              );
+              return;
+            }
+            mintedToken = minted.token;
+            mintedRequestId = requestId;
+            // Durable before the container can spend: settlement is claimed
+            // from this row by whichever bridge receives the terminal frame.
+            await recordAntigravityTurn(deps.pgPool, {
+              requestId,
+              userId: uid,
+              modelId: antigravityModelId,
+              sessionId: peerCapture,
+              traceId: traceCapture,
+            });
+            pendingAntigravityRelays.set(requestId, {
+              token: minted.token,
+              modelId: antigravityModelId,
+              sessionId: peerCapture,
+              traceId: traceCapture,
+            });
+            let authorityFields: Record<string, unknown> = {};
+            if (authorityExec !== null) {
+              const sealed = await sealAuthorityFieldsOrReject({ exec: authorityExec, billingRequestId: requestId, log: logCapture, onReject: rejectPromptQueueDispatch, turn: antigravityTurnIdentity });
+              if (sealed === null) {
+                failDispatchPreForward(dispatchRecord, 'antigravity_authority_seal_rejected');
+                dropMinted();
+                return;
+              }
+              authorityFields = sealed;
+            }
+            const forwarded = {
+              ...enriched,
+              requestId,
+              traceId: traceCapture,
+              // After the spread so a browser-forged budget or route cannot survive.
+              _creditBudget: spendable.toString(),
+              __oc_antigravity_route: {
+                baseUrl: minted.baseUrl,
+                routeToken: minted.token,
+                accessToken: minted.accessToken,
+                accessTokenExpiresAt: minted.accessTokenExpiresAt,
+                ...(minted.idToken ? { idToken: minted.idToken } : {}),
+              },
+              ...authorityFields,
+              ...dispatchAuthorityField(dispatchRecord),
+            };
+            const encoded = JSON.stringify(forwarded); const len = Buffer.byteLength(encoded);
+            if (len > maxFrameBytes) {
+              failDispatchPreForward(dispatchRecord, 'ERR_FRAME_TOO_BIG');
+              rejectPromptQueueDispatch('ERR_FRAME_TOO_BIG');
+              dropMinted();
+              return;
+            }
+            await forwardPreparedFrame(Buffer.from(encoded, 'utf8'), false, len, dispatchRecord);
+          } catch (err) {
+            logCapture?.error('user-chat-bridge: Antigravity admission threw', { err });
+            failDispatchPreForward(dispatchRecord, 'antigravity_admission_failed');
+            dropMinted();
+            unavailable('Antigravity is temporarily unavailable');
           }
         });
         return;
@@ -7841,6 +8084,53 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                   }
                 }
               })());
+            } else if (deps.pgPool && requestId && status && durationMs !== null && external.engine === 'antigravity') {
+              const pool = deps.pgPool;
+              const pricing = deps.pricing;
+              const relay = pendingAntigravityRelays.get(requestId);
+              if (relay) {
+                void Promise.resolve(deps.expireAntigravityRoute?.(relay.token)).catch(() => {});
+                pendingAntigravityRelays.delete(requestId);
+              }
+              // A reconnected bridge never saw the token: expire by requestId too.
+              void Promise.resolve(deps.expireAntigravityRouteForRequest?.(requestId)).catch(() => {});
+              // Claimed from the durable turn row, so a reconnected bridge
+              // settles too; usage comes from the relay's rows (a replayed
+              // frame cannot inflate it) and usage_records(user_id, request_id)
+              // keeps the charge idempotent.
+              if (pricing) {
+                void (async () => {
+                  try {
+                    const done = await settleAntigravityTurnRecord({
+                      pool,
+                      pricing,
+                      requestId,
+                      userId: uid,
+                      engineStatus: status,
+                      terminalCode,
+                    });
+                    if (done === null) {
+                      bridgeLog?.warn("user-chat-bridge: Antigravity settle skipped (claimed elsewhere, unknown turn or pricing missing)", { requestId });
+                      return;
+                    }
+                    await publishZcodeCatalogSettle({
+                      settled: done.settled,
+                      requestId,
+                      userId: uid.toString(),
+                      modelId: done.turn.modelId,
+                      sessionId: done.turn.sessionId,
+                      traceId: done.turn.traceId,
+                      persist: deps.appendCostCredits,
+                      publish: (event) => { broadcastToUser(uid, event); },
+                      onPersistError: (err) => {
+                        bridgeLog?.warn("user-chat-bridge: Antigravity persist costCredits threw", { requestId, err });
+                      },
+                    });
+                  } catch (err) {
+                    bridgeLog?.warn("user-chat-bridge: Antigravity settle failed", { requestId, err });
+                  }
+                })();
+              }
             } else if (deps.pgPool && requestId && status && durationMs !== null && external.engine === 'cursor') {
               const pool = deps.pgPool;
               const pricing = deps.pricing;
@@ -8223,6 +8513,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
             ...(execution.model !== undefined ? { model: execution.model } : {}),
             ...(execution.modelSwitchId !== undefined ? { modelSwitchId: execution.modelSwitchId } : {}),
             ...(execution.effortLevel !== undefined ? { effortLevel: execution.effortLevel } : {}),
+            ...(execution.serviceTier !== undefined ? { serviceTier: execution.serviceTier } : {}),
             ...(execution.teamMode !== undefined ? { teamMode: execution.teamMode } : {}),
             ...(execution.collabMode !== undefined ? { collabMode: execution.collabMode } : {}),
             ...(execution.advisorModel !== undefined ? { advisorModel: execution.advisorModel } : {}),
@@ -10034,6 +10325,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
         }
         pendingZcodeRelays.clear();
       }
+      // Antigravity routes are NOT expired here (OCV5-415): the container keeps running the
+      // turn across browser reconnects, and expiring on close made every later CLI call 404
+      // ROUTE_EXPIRED (live 2026-10-15). The terminal frame expires the route by requestId on
+      // whichever bridge receives it; a turn that never ends falls back to the route TTL.
+      pendingAntigravityRelays.clear();
       for (const dispatchId of [...cronOriginClaimWaiters.keys()]) {
         settleCronOriginClaim(dispatchId, { kind: "delivery_unknown" });
       }

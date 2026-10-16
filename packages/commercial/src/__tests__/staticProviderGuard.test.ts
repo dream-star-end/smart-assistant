@@ -68,8 +68,9 @@ describe("assertPlatformDefaultModelConfigured", () => {
     const indexPath = fileURLToPath(new URL("../index.ts", import.meta.url));
     const src = readFileSync(indexPath, "utf-8");
 
-    const guardIdx = src.indexOf("assertPlatformDefaultModelConfigured(cfg)");
-    assert.ok(guardIdx >= 0, "必须存在 assertPlatformDefaultModelConfigured(cfg) 调用");
+    // OCV5-424:调用多了第二参数(服务池也算已配置),按调用前缀定位。
+    const guardIdx = src.indexOf("assertPlatformDefaultModelConfigured(cfg");
+    assert.ok(guardIdx >= 0, "必须存在 assertPlatformDefaultModelConfigured(cfg, …) 调用");
 
     const handlerIdx = src.indexOf("internalProxyHandler = makeAnthropicProxyHandler({");
     assert.ok(handlerIdx > guardIdx, "internal proxy 装配应在 guard 之后");

@@ -115,8 +115,13 @@ export const ADMIN_AUDIT_ACTIONS = {
   "egress_proxy.patch": { kind: "write", mode: "best-effort" },
   "egress_proxy.delete": { kind: "write", mode: "best-effort" },
   "oauth.exchange": { kind: "write", mode: "best-effort" },
+  "antigravity_account.authorize": { kind: "write", mode: "best-effort" },
+  "antigravity_account.patch": { kind: "write", mode: "best-effort" },
   "box_claude_profiles.discover": { kind: "write", mode: "best-effort" },
   "box_claude_profiles.select": { kind: "write", mode: "best-effort" },
+  // OCV5-424 服务池:API key 成员的添加 / 管理员启停。
+  "pool_key.create": { kind: "write", mode: "best-effort" },
+  "pool_key.patch": { kind: "write", mode: "best-effort" },
 
   // ── 容器/compute host 运维──────────────────────────────────────────
   "agent_container.restart": { kind: "write", mode: "best-effort" },

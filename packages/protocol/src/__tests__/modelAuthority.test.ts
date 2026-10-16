@@ -266,7 +266,7 @@ describe('verifyAuthority', () => {
   })
 
   it('Antigravity engine 签发 → 验签 → 载荷逐字段还原', () => {
-    const p = makePayload({ canonicalModel: 'antigravity-gemini-3.1-pro', engine: 'antigravity' })
+    const p = makePayload({ canonicalModel: 'antigravity-gemini-3.8-flash', engine: 'antigravity' })
     const got = verifyAuthority(signAuthorityEnvelope(p), keyring, NOW + 1000)
     assert.deepEqual(got, p)
   })

@@ -31,6 +31,8 @@
  * after each use, so `readApiKey` must return a fresh copy every call.
  */
 
+import { AccountHealthTracker, InMemoryHealthRedis } from "../../account-pool/health.js";
+import type { PoolOutcome } from "../../account-pool/policy/outcome.js";
 import { createHash, randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Pool } from "pg";
@@ -75,7 +77,42 @@ import {
   type AccountRow,
   type CursorTokenSnapshot,
 } from "../../account-pool/store.js";
-import { selectCursorAccount } from "../../account-pool/cursorAccountSelection.js";
+import { cursorSelectableAccounts, selectCursorAccount } from "../../account-pool/cursorAccountSelection.js";
+import { affinitySettings, resolveAffinity, underRateCap, noteAdmission } from "../../account-pool/policy/affinity.js";
+
+/**
+ * OCV5-424 user affinity for the Cursor pool: the user's bound account among the
+ * selectable ones (spill/migrate per the shared rules). Null → the previous sticky /
+ * weighted pick decides. Best-effort: never blocks a request.
+ */
+async function cursorUserAffinity(
+  uid: bigint,
+  args: { accounts: AccountRow[]; model: string; now: Date; cooled: ReadonlySet<string> },
+): Promise<bigint | null> {
+  try {
+    const caps = await affinitySettings();
+    const selectable = cursorSelectableAccounts(args).filter(({ row }) =>
+      underRateCap("cursor", row.id.toString(), caps.ratePerMin));
+    if (selectable.length === 0) return null;
+    const resolved = await resolveAffinity({
+      service: "cursor",
+      userId: uid,
+      candidates: selectable.map(({ row, weight }) => ({ memberKind: "account" as const, id: row.id.toString(), capacity: weight })),
+      maxUsers: caps.maxUsersPerSubscription,
+      boundState: async (b) => {
+        const row = args.accounts.find((r) => r.id.toString() === b.memberId);
+        if (!row) return { status: null, cooldownReason: null, cooldownUntil: null };
+        if (args.cooled.has(b.memberId)) return { status: "cooldown", cooldownReason: null, cooldownUntil: null };
+        return { status: row.status, cooldownReason: null, cooldownUntil: row.cooldown_until ?? null };
+      },
+    });
+    if (!resolved) return null;
+    noteAdmission("cursor", resolved.member.id);
+    return BigInt(resolved.member.id);
+  } catch {
+    return null;
+  }
+}
 export { selectCursorAccount, CURSOR_EXTERNAL_SESSION_MIN_REMAINING_MS } from
   "../../account-pool/cursorAccountSelection.js";
 import { incrAnthropicProxyReject, incrAnthropicProxySettle } from "../../admin/metrics.js";
@@ -127,6 +164,11 @@ export interface CursorExternalDeps {
   stickyTtlMs?: number;
   /** In-process cooldown after a credential rejection (default 10 min). */
   credentialCooldownMs?: number;
+  /**
+   * OCV5-424:把上游拒绝交共享策略持久化(401 → auth 冷却+自动探测;429 → rate_limited)。
+   * 进程内 cooled 仍立即生效;持久冷却让重启后和 Box 路由同样看见。测试可注入。
+   */
+  reportAccountOutcome?: (accountId: bigint, outcome: PoolOutcome) => Promise<unknown>;
   /**
    * Durable FS outbox. Required in the selfhost composition; unit tests may
    * omit it and keep the in-process settle-after-return path.
@@ -231,6 +273,10 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
   const now = deps.now ?? (() => Date.now());
   const stickyTtl = deps.stickyTtlMs ?? CURSOR_EXTERNAL_STICKY_TTL_MS;
   const cooldownMs = deps.credentialCooldownMs ?? CURSOR_EXTERNAL_CREDENTIAL_COOLDOWN_MS;
+  const reportAccountOutcome =
+    deps.reportAccountOutcome
+    ?? ((id: bigint, outcome: PoolOutcome) =>
+      new AccountHealthTracker({ redis: new InMemoryHealthRedis() }).applyOutcome(id, outcome));
   const listCursorAccounts =
     deps.listCursorAccounts
     ?? (() => listAccounts({ provider: "cursor", status: "active", limit: 500 }));
@@ -383,7 +429,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
         model,
         now: nowDate,
         cooled: excluded,
-        sticky: stickyFor(uid, nowMs),
+        sticky: (await cursorUserAffinity(uid, { accounts, model, now: nowDate, cooled: excluded })) ?? stickyFor(uid, nowMs),
       });
       if (!account) break;
       try {
@@ -583,6 +629,7 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
       if (result.status === 401) {
         cooled.set(accountId.toString(), nowMs + cooldownMs);
         sticky.delete(uid.toString());
+        void reportAccountOutcome(accountId, { kind: "auth_invalid", detail: "cursor_http_401" }).catch(() => {});
         userLog.warn("cursor_external_credential_rejected", {
           model,
           accountId: accountId.toString(),
@@ -591,6 +638,9 @@ export function makeCursorExternalRoute(deps: CursorExternalDeps): CursorExterna
         });
         incrAnthropicProxyReject("upstream_auth");
       } else {
+        if (result.status === 429) {
+          void reportAccountOutcome(accountId, { kind: "rate_limited", retryAfterMs: null }).catch(() => {});
+        }
         userLog.warn("cursor_external_upstream_rejected", {
           model,
           accountId: accountId.toString(),

@@ -46,12 +46,60 @@ export function decodeGeminiToolId(id: string): Obj {
   return e
 }
 
+function systemParts(v: unknown): Obj[] {
+  return blocks(v).map((b) => {
+    if (b.type !== 'text' || typeof b.text !== 'string')
+      throw new Error('unsupported Gemini system content')
+    return { text: b.text }
+  })
+}
+
+/** Prior web_search_tool_result → plain text the model can cite in follow-ups
+ * (Codex r1 P1: the bridge must accept its own search output as history). */
+function webSearchResultText(content: unknown): string {
+  if (!Array.isArray(content)) {
+    const code =
+      content && typeof content === 'object' && typeof (content as Obj).error_code === 'string'
+        ? (content as Obj).error_code
+        : 'unknown'
+    return `[Web search failed: ${String(code)}]`
+  }
+  const lines = content
+    .filter((r): r is Obj => !!r && typeof r === 'object' && typeof (r as Obj).url === 'string')
+    .map((r) => `- ${typeof r.title === 'string' && r.title ? r.title : r.url}: ${r.url}`)
+  return lines.length
+    ? `[Web search results]\n${lines.join('\n')}`
+    : '[Web search returned no results]'
+}
+
+/**
+ * Platform effort → Gemini thinkingLevel (OCV5-425). The proxy has already narrowed
+ * `output_config` to `{effort}` from the spec's model-scoped list (low/medium/high; upstream
+ * rejects MINIMAL). No effort keeps the previous fixed LOW.
+ */
+export function geminiThinkingLevel(outputConfig: unknown): 'LOW' | 'MEDIUM' | 'HIGH' {
+  const effort =
+    outputConfig !== null && typeof outputConfig === 'object' && !Array.isArray(outputConfig)
+      ? (outputConfig as Obj).effort
+      : undefined
+  return effort === 'high' ? 'HIGH' : effort === 'medium' ? 'MEDIUM' : 'LOW'
+}
+
 export function anthropicToGemini(body: Obj): Obj {
   const contents: Obj[] = []
   const calls = new Map<string, { name: string; nativeId?: string }>()
+  // CCB sends platform context as role:"system" messages inside `messages`
+  // (OCV5-423 live 400: every real platform turn carried one). Google has no
+  // system role in contents, so they join systemInstruction in order, after
+  // the top-level system — the same folding boxMessagesMapper applies.
+  const inlineSystem: Obj[] = []
   if (!Array.isArray(body.messages)) throw new Error('Gemini requires messages')
   for (const raw of body.messages) {
     const m = obj(raw)
+    if (m.role === 'system') {
+      inlineSystem.push(...systemParts(m.content))
+      continue
+    }
     if (m.role !== 'user' && m.role !== 'assistant')
       throw new Error('unsupported Gemini message role')
     const parts: Obj[] = []
@@ -91,6 +139,11 @@ export function anthropicToGemini(body: Obj): Obj {
         })
       } else if (b.type === 'thinking' || b.type === 'redacted_thinking') {
         // Foreign thought blocks are not Google signatures. They are not tools.
+      } else if (b.type === 'server_tool_use' && m.role === 'assistant') {
+        // A finished grounded search (ours or replayed): Google re-runs search
+        // only when asked; the results block below carries what was found.
+      } else if (b.type === 'web_search_tool_result' && m.role === 'assistant') {
+        parts.push({ text: webSearchResultText(b.content) })
       } else throw new Error(`unsupported Gemini Go block: ${String(b.type)}`)
     }
     if (!parts.length) continue
@@ -102,35 +155,31 @@ export function anthropicToGemini(body: Obj): Obj {
   if (!contents.length) throw new Error('Gemini requires nonempty content')
   const generationConfig: Obj = {
     maxOutputTokens: Math.min(65536, typeof body.max_tokens === 'number' ? body.max_tokens : 32000),
-    thinkingConfig: { thinkingLevel: 'LOW' },
+    thinkingConfig: { thinkingLevel: geminiThinkingLevel(body.output_config) },
   }
   if (typeof body.temperature === 'number') generationConfig.temperature = body.temperature
   if (typeof body.top_p === 'number') generationConfig.topP = body.top_p
   if (Array.isArray(body.stop_sequences)) generationConfig.stopSequences = body.stop_sequences
   const result: Obj = { contents, generationConfig }
-  if (body.system !== undefined) {
-    const parts = blocks(body.system).map((b) => {
-      if (b.type !== 'text' || typeof b.text !== 'string')
-        throw new Error('unsupported Gemini system content')
-      return { text: b.text }
+  const system = [...(body.system === undefined ? [] : systemParts(body.system)), ...inlineSystem]
+  if (system.length) result.systemInstruction = { parts: system }
+  const search = webSearchSpec(body)
+  const functionTools = Array.isArray(body.tools)
+    ? body.tools.map(obj).filter((t) => !isWebSearchServerTool(t))
+    : []
+  if (search) result.tools = [{ googleSearch: {} }]
+  if (functionTools.length) {
+    ;(result.tools = (result.tools as Obj[] | undefined) ?? []).push({
+      functionDeclarations: functionTools.map((t) => {
+        if (typeof t.name !== 'string' || t.input_schema === undefined)
+          throw new Error('unsupported Gemini tool declaration')
+        return {
+          name: t.name,
+          ...(typeof t.description === 'string' && { description: t.description }),
+          parametersJsonSchema: obj(t.input_schema),
+        }
+      }),
     })
-    if (parts.length) result.systemInstruction = { parts }
-  }
-  if (Array.isArray(body.tools) && body.tools.length) {
-    result.tools = [
-      {
-        functionDeclarations: body.tools.map((raw) => {
-          const t = obj(raw)
-          if (typeof t.name !== 'string' || t.input_schema === undefined)
-            throw new Error('unsupported Gemini tool declaration')
-          return {
-            name: t.name,
-            ...(typeof t.description === 'string' && { description: t.description }),
-            parametersJsonSchema: obj(t.input_schema),
-          }
-        }),
-      },
-    ]
     const choice = body.tool_choice === undefined ? { type: 'auto' } : obj(body.tool_choice)
     const mode =
       choice.type === 'auto'
@@ -141,14 +190,102 @@ export function anthropicToGemini(body: Obj): Obj {
             ? 'ANY'
             : null
     if (!mode) throw new Error('unsupported Gemini tool choice')
-    result.toolConfig = {
-      functionCallingConfig: {
-        mode,
-        ...(choice.type === 'tool' && { allowedFunctionNames: [choice.name] }),
-      },
+    // A forced server web_search is satisfied by Google grounding, not a function call.
+    if (!(search && choice.type === 'tool' && choice.name === search.name)) {
+      result.toolConfig = {
+        functionCallingConfig: {
+          mode,
+          ...(choice.type === 'tool' && { allowedFunctionNames: [choice.name] }),
+        },
+      }
     }
   }
   return result
+}
+
+/**
+ * Anthropic server-side web search (`{type:"web_search_YYYYMMDD", name}`): the
+ * official Claude Code WebSearch tool sends it in a side request. Gemini Go has
+ * no such server tool, so it maps to Google Search grounding and the grounding
+ * metadata is returned as server_tool_use + web_search_tool_result blocks.
+ */
+export interface GeminiWebSearchSpec {
+  name: string
+  allowedDomains: string[]
+  blockedDomains: string[]
+}
+function isWebSearchServerTool(t: Obj): boolean {
+  return typeof t.type === 'string' && t.type.startsWith('web_search_')
+}
+function domains(v: unknown): string[] {
+  return Array.isArray(v)
+    ? v
+        .filter((d): d is string => typeof d === 'string' && d.length > 0)
+        .map((d) => d.toLowerCase())
+    : []
+}
+export function webSearchSpec(body: Obj): GeminiWebSearchSpec | null {
+  if (!Array.isArray(body.tools)) return null
+  const tool = body.tools.map(obj).find(isWebSearchServerTool)
+  if (!tool) return null
+  return {
+    name: typeof tool.name === 'string' ? tool.name : 'web_search',
+    allowedDomains: domains(tool.allowed_domains),
+    blockedDomains: domains(tool.blocked_domains),
+  }
+}
+const GROUNDING_REDIRECT = 'https://vertexaisearch.cloud.google.com/grounding-api-redirect/'
+const REDIRECT_TIMEOUT_MS = 3000
+const MAX_SEARCH_RESULTS = 20
+function hostMatches(host: string, domain: string): boolean {
+  return host === domain || host.endsWith(`.${domain}`)
+}
+/** Google grounding chunks → web_search_result items. Redirect links are
+ * resolved to the real URL when possible (short timeout, never fatal). */
+export async function groundingResults(
+  grounding: Obj,
+  spec: GeminiWebSearchSpec,
+  fetchImpl: typeof fetch,
+): Promise<Obj[]> {
+  const chunks = Array.isArray(grounding.groundingChunks) ? grounding.groundingChunks : []
+  const webs = chunks
+    .map((c) => (c && typeof c === 'object' ? (c as Obj).web : undefined))
+    .filter((w): w is Obj => !!w && typeof w === 'object' && typeof (w as Obj).uri === 'string')
+    .slice(0, MAX_SEARCH_RESULTS)
+  const resolved = await Promise.all(
+    webs.map(async (w) => {
+      const uri = w.uri as string
+      if (!uri.startsWith(GROUNDING_REDIRECT)) return uri
+      try {
+        const r = await fetchImpl(uri, {
+          method: 'HEAD',
+          redirect: 'manual',
+          signal: AbortSignal.timeout(REDIRECT_TIMEOUT_MS),
+        })
+        const location = r.headers.get('location')
+        return location && /^https?:\/\//.test(location) ? location : uri
+      } catch {
+        return uri
+      }
+    }),
+  )
+  const out: Obj[] = []
+  webs.forEach((w, i) => {
+    const url = resolved[i] as string
+    const title = typeof w.title === 'string' && w.title ? w.title : url
+    let host = ''
+    try {
+      host = new URL(url).hostname.toLowerCase()
+    } catch {
+      /* keep empty */
+    }
+    // An unresolved redirect hides the host; Google puts the site domain in title.
+    const site = host && !url.startsWith(GROUNDING_REDIRECT) ? host : title.toLowerCase()
+    if (spec.allowedDomains.length && !spec.allowedDomains.some((d) => hostMatches(site, d))) return
+    if (spec.blockedDomains.some((d) => hostMatches(site, d))) return
+    out.push({ type: 'web_search_result', title, url, encrypted_content: '', page_age: null })
+  })
+  return out
 }
 
 function count(v: unknown): number {
@@ -217,7 +354,9 @@ async function* googleEvents(reader: ReadableStreamDefaultReader<Uint8Array>): A
 async function* anthropicEvents(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   model: string,
+  search: { spec: GeminiWebSearchSpec; fetchImpl: typeof fetch } | null = null,
 ): AsyncGenerator<Uint8Array> {
+  let grounding: Obj | undefined
   let usage: Obj | undefined
   let finish: string | undefined
   let index = 0
@@ -259,6 +398,7 @@ async function* anthropicEvents(
         throw new Error('invalid Gemini candidates')
       for (const raw of candidates) {
         const c = obj(raw)
+        if (search && c.groundingMetadata !== undefined) grounding = obj(c.groundingMetadata)
         if (typeof c.finishReason === 'string') finish = c.finishReason
         const content = c.content === undefined ? undefined : obj(c.content)
         if (content?.parts !== undefined && !Array.isArray(content.parts))
@@ -312,6 +452,40 @@ async function* anthropicEvents(
       // CCB settles each message_delta, so success must emit exactly ONE.
       // On a broken stream the catch below emits the latest partial usage once.
     }
+    if (search && grounding) {
+      const queries = Array.isArray(grounding.webSearchQueries)
+        ? grounding.webSearchQueries.filter((q): q is string => typeof q === 'string' && !!q)
+        : []
+      if (queries.length) {
+        if (openText) {
+          yield frame('content_block_stop', { index })
+          index++
+          openText = false
+        }
+        const results = await groundingResults(grounding, search.spec, search.fetchImpl)
+        const id = `srvtoolu_g4_${randomUUID().replaceAll('-', '')}`
+        yield frame('content_block_start', {
+          index,
+          content_block: { type: 'server_tool_use', id, name: search.spec.name, input: {} },
+        })
+        yield frame('content_block_delta', {
+          index,
+          delta: {
+            type: 'input_json_delta',
+            partial_json: JSON.stringify({ query: queries.join(' | ') }),
+          },
+        })
+        yield frame('content_block_stop', { index })
+        index++
+        yield frame('content_block_start', {
+          index,
+          content_block: { type: 'web_search_tool_result', tool_use_id: id, content: results },
+        })
+        yield frame('content_block_stop', { index })
+        index++
+        hasContent = true
+      }
+    }
     if (!hasContent || !usage || (finish !== 'STOP' && finish !== 'MAX_TOKENS')) {
       throw new Error('Gemini stream ended without a successful complete response')
     }
@@ -335,9 +509,12 @@ async function* anthropicEvents(
 export function createGeminiGoFetch(fetchImpl: typeof fetch): typeof fetch {
   return async (_input, init) => {
     let body: Obj
+    let search: GeminiWebSearchSpec | null
     try {
       if (typeof init?.body !== 'string') throw new Error('Gemini bridge requires a JSON body')
-      body = anthropicToGemini(obj(JSON.parse(init.body)))
+      const anthropic = obj(JSON.parse(init.body))
+      search = webSearchSpec(anthropic)
+      body = anthropicToGemini(anthropic)
     } catch (error) {
       return new Response(
         JSON.stringify({
@@ -395,7 +572,11 @@ export function createGeminiGoFetch(fetchImpl: typeof fetch): typeof fetch {
     }
     if (!raw.body) throw new Error('Gemini returned no stream body')
     const reader = raw.body.getReader()
-    const events = anthropicEvents(reader, GEMINI_GO_MODEL)
+    const events = anthropicEvents(
+      reader,
+      GEMINI_GO_MODEL,
+      search ? { spec: search, fetchImpl } : null,
+    )
     const stream = new ReadableStream<Uint8Array>(
       {
         async pull(controller) {

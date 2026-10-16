@@ -83,9 +83,9 @@ describe("AccountsPage", () => {
   test("渲染 KPI + 账号行,列表带 status 参数拉取", async () => {
     renderPage(<AccountsPage />);
     expect(await screen.findByText("acct-tokyo")).toBeTruthy();
-    expect(screen.getByText("CCB")).toBeTruthy();
-    expect(screen.getByText("Cursor")).toBeTruthy();
-    expect(screen.getByText("Codex")).toBeTruthy();
+    expect(screen.getByText("Claude")).toBeTruthy();
+    expect(screen.getByText("Cursor(Box)")).toBeTruthy();
+    expect(screen.getByText("Codex / ChatGPT")).toBeTruthy();
     // KPI:可用 / 冷却
     expect(screen.getByText("8 / 1")).toBeTruthy();
     // 总账号
@@ -146,9 +146,9 @@ describe("AccountsPage", () => {
     expect(await screen.findByText("cursor-slot-1")).toBeTruthy();
     expect(screen.getByText("acct-tokyo")).toBeTruthy();
     expect(screen.getByText("codex-main")).toBeTruthy();
-    expect(screen.getByText("Cursor 订阅 API Key 池 · 1 条")).toBeTruthy();
-    expect(screen.getByText("Claude Code 官方账号池 · 1 条")).toBeTruthy();
-    expect(screen.getByText("Codex 官方账号池 · 1 条")).toBeTruthy();
+    expect(screen.getByText("Cursor 订阅账号 · 1 条")).toBeTruthy();
+    expect(screen.getByText("Claude Code 订阅账号 · 1 条")).toBeTruthy();
+    expect(screen.getByText("Codex 订阅账号 · 1 条")).toBeTruthy();
   });
 
   const GROK_ROW = {
@@ -181,23 +181,22 @@ describe("AccountsPage", () => {
   test("grok 行渲染周额度 Badge", async () => {
     mockGrokAccounts();
     renderPage(<AccountsPage />);
-    const grokDesc = await screen.findByText("Grok Build 官方账号池 · 1 条");
+    const grokDesc = await screen.findByText("Grok Build 订阅账号 · 1 条");
     const grokSection = grokDesc.closest("section");
     expect(grokSection).toBeTruthy();
-    expect(within(grokSection!).getByText("67%")).toBeTruthy();
+    expect(within(grokSection!).getByText("已用 67%")).toBeTruthy();
     expect(within(grokSection!).getByText("SuperGrokPro")).toBeTruthy();
   });
 
-  test("grok 段显示周额度列头且不显示 Sand 列", async () => {
+  test("grok 段:统一的使用额度列(每周窗口)+ 订阅档,无 Cursor 专属列", async () => {
     mockGrokAccounts();
     renderPage(<AccountsPage />);
-    const grokDesc = await screen.findByText("Grok Build 官方账号池 · 1 条");
+    const grokDesc = await screen.findByText("Grok Build 订阅账号 · 1 条");
     const grokSection = grokDesc.closest("section")!;
-    expect(within(grokSection).getByText("周额度已用%")).toBeTruthy();
-    expect(within(grokSection).getByText("额度重置")).toBeTruthy();
+    expect(within(grokSection).getByText("使用额度")).toBeTruthy();
+    expect(within(grokSection).getByText("每周")).toBeTruthy();
     expect(within(grokSection).getByText("订阅档")).toBeTruthy();
-    expect(within(grokSection).queryByText("Sand 已用%")).toBeNull();
-    expect(within(grokSection).queryByText("Sand 重置")).toBeNull();
+    expect(within(grokSection).queryByText("套餐 / 账期")).toBeNull();
   });
 
   test("grok 行更多操作含立即刷新 Grok 额度", async () => {

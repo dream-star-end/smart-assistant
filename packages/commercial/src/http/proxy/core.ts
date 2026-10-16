@@ -26,6 +26,8 @@
  *     是不可移除的兜底,任何路径 return 都必经此 finally。
  */
 
+import { attachPoolOutcome, classifyHttpOutcome } from "../../account-pool/policy/outcome.js";
+import { reportApiKeyOutcome } from "../../account-pool/apiKeyPool.js";
 import type { Pool } from "pg";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
@@ -48,6 +50,8 @@ import {
 } from "./shared.js";
 import type { PreparedUpstreamSession } from "./upstream.js";
 import { createGeminiGoFetch } from "./geminiGoBridge.js";
+import { createOpenAIChatGoFetch } from "./openAiChatGoBridge.js";
+import { createOpenAIResponsesGoFetch } from "./openAiResponsesGoBridge.js";
 import {
   assertClaudeOAuthIdentity,
   ClaudeIdentityGuardError,
@@ -275,7 +279,14 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     if (session.dispatcher) fetchInit.dispatcher = session.dispatcher;
 
     const fetchStartMs = Date.now();
-    const roundTripFetch = session.transport === "gemini-go" ? createGeminiGoFetch(fetchFn) : fetchFn;
+    const roundTripFetch =
+      session.transport === "gemini-go"
+        ? createGeminiGoFetch(fetchFn)
+        : session.transport === "openai-chat-go"
+          ? createOpenAIChatGoFetch(fetchFn)
+          : session.transport === "openai-responses-go"
+            ? createOpenAIResponsesGoFetch(fetchFn)
+            : fetchFn;
     let upstream = await roundTripFetch(session.endpoint, fetchInit);
     let upstreamErrorPreview: string | null = null;
     if (upstream.status === 400) {
@@ -284,7 +295,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       } catch {
         upstreamErrorPreview = "";
       }
-      if (!ctx.noHistoryRewriteRetry && session.transport !== "gemini-go" && isProviderBoundHistoryError(upstreamErrorPreview)) {
+      if (!ctx.noHistoryRewriteRetry && session.transport === undefined && isProviderBoundHistoryError(upstreamErrorPreview)) {
         const stripped = stripProviderBoundAssistantBlocks(upstreamMessages);
         if (stripped.blocksStripped > 0) {
           userLog.info("proxy_provider_bound_history_retry", {
@@ -329,6 +340,17 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
             ? "UPSTREAM_UNAVAILABLE"
             : "UPSTREAM_REJECTED";
       const err = new Error(`upstream returned ${upstream.status} (${upstreamClass})`);
+      // OCV5-424:把已分类结果挂到 err 上,finalize → scheduler.release 交共享 policy/decide
+      // (429 按 Retry-After 冷却该号、配额窗口用尽按 reset 冷却、401 进 auth 冷却并自动探测)。
+      // 订阅号仍不在同一请求内换号重试(见下方 429 透传说明)。
+      const poolOutcome = isClientBadRequest
+        ? ({ kind: "client_error", detail: "invalid_request" } as const)
+        : classifyHttpOutcome(upstream.status, upstream.headers, new Date(), { quotaHint: isQuotaExhausted });
+      attachPoolOutcome(err, poolOutcome);
+      // API-key 池成员(无 claude_accounts 槽位,finalize 不经 scheduler.release)直接上报。
+      if (session.poolMember) {
+        void reportApiKeyOutcome(session.poolMember.memberId, poolOutcome);
+      }
       if (isClientBadRequest) {
         userLog.warn("proxy_upstream_invalid_request", {
           status: upstream.status,
@@ -450,6 +472,10 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
           err: errSummary(quotaErr),
         });
       }
+    }
+    // OCV5-424:API-key 池成员拿到健康 2xx 头 → 成功上报(health 回升、退避级别归零)。
+    if (session.poolMember) {
+      void reportApiKeyOutcome(session.poolMember.memberId, { kind: "success" });
     }
     // M9 配额可见性 — 从上游响应头抽 5h/7d utilization + reset,fire-and-forget
     // UPDATE accounts。30s 进程内 throttle + SQL WHERE + 全局 cap 32 三层防护,

@@ -31,6 +31,16 @@ import type { QueryResultRow } from "pg";
 import { query } from "../db/queries.js";
 import { getRuntimeChannel } from "../runtimeChannel.js";
 import type { AccountStatus } from "./store.js";
+import {
+  DEFAULT_POLICY,
+  decide,
+  decideProbe,
+  type PolicyConfig,
+  type Transition,
+} from "./policy/decide.js";
+import { recordPoolEvent } from "./policy/events.js";
+import type { ProbeResult } from "./policy/registry.js";
+import { outcomeLabel, type CooldownReason, type PoolOutcome } from "./policy/outcome.js";
 
 /** 连续失败多少次后熔断。规约值 3,可测试覆盖。 */
 export const DEFAULT_FAIL_THRESHOLD = 3;
@@ -87,6 +97,12 @@ interface RawHealthRow extends QueryResultRow {
   cooldown_until: Date | null;
 }
 
+interface RawStateRow extends RawHealthRow {
+  backoff_level: number | null;
+  cooldown_reason: CooldownReason | null;
+  provider: string;
+}
+
 function parseHealth(row: RawHealthRow): AccountHealth {
   return {
     id: BigInt(row.id),
@@ -103,6 +119,7 @@ export class AccountHealthTracker {
   private readonly cooldownMs: number;
   private readonly healthTtlSec: number;
   private readonly failWindowSec: number;
+  private readonly policy: PolicyConfig;
 
   constructor(deps: HealthDeps) {
     this.redis = deps.redis;
@@ -111,42 +128,26 @@ export class AccountHealthTracker {
     this.cooldownMs = deps.cooldownMs ?? DEFAULT_COOLDOWN_MS;
     this.healthTtlSec = deps.healthTtlSec ?? DEFAULT_HEALTH_TTL_SEC;
     this.failWindowSec = deps.failWindowSec ?? DEFAULT_FAIL_WINDOW_SEC;
+    // OCV5-424:阈值/时长仍可按 deps 覆盖,但状态机统一走 policy/decide。
+    this.policy = {
+      ...DEFAULT_POLICY,
+      failThreshold: this.failThreshold,
+      upstreamBaseMs: this.cooldownMs,
+    };
   }
 
   /**
-   * 成功回调:清连续失败计数 + 积分恢复。
+   * 成功回调:清连续失败计数 + 积分恢复 + 退避级别归零(走共享 policy/decide)。
    *
    * @returns 账号当前 health;不存在返 null
    */
   async onSuccess(accountId: bigint | string): Promise<AccountHealth | null> {
-    const id = String(accountId);
-    // 先清连续失败计数,避免"成功后仍残留 2 次失败,再一次失败就熔断"
-    await this.redis.del(failKey(id));
-    const res = await query<RawHealthRow>(
-      `UPDATE claude_accounts
-       SET success_count = success_count + 1,
-           health_score = LEAST(100, health_score + 10),
-           last_used_at = NOW(),
-           last_error = NULL,
-           updated_at = NOW()
-       WHERE id = $1
-       RETURNING id::text AS id, status, health_score, cooldown_until`,
-      [id],
-    );
-    if (res.rowCount === 0) {
-      await this.redis.del(healthKey(id));
-      return null;
-    }
-    const h = parseHealth(res.rows[0]);
-    await this.redis.set(healthKey(id), String(h.health_score), { exSec: this.healthTtlSec });
-    return h;
+    return this.applyOutcome(accountId, { kind: "success" });
   }
 
   /**
-   * 失败回调:记录错误 + 失败计数 +(必要时)熔断。
-   *
-   * 熔断条件 = 连续失败计数 ≥ threshold **且** 当前 status='active'。
-   * 熔断后清连续失败计数器,下一轮 halfOpen 恢复后从 0 重新累积。
+   * 失败回调(未分类的上游失败 = upstream_error):health −20,窗口内连续
+   * failThreshold 次且当前 active → cooldown(reason=upstream,10min·2^level)。
    *
    * @param errorMsg 可选的错误信息,会写 last_error 列;不想覆盖则传 null
    */
@@ -154,52 +155,223 @@ export class AccountHealthTracker {
     accountId: bigint | string,
     errorMsg: string | null = null,
   ): Promise<AccountHealth | null> {
-    const id = String(accountId);
-    const failCount = await this.redis.incr(failKey(id));
-    if (failCount === 1) {
-      // 第一次失败才设 TTL,避免每次失败都续期"永远过期不了"
-      await this.redis.expire(failKey(id), this.failWindowSec);
-    }
+    return this.applyOutcome(accountId, { kind: "upstream_error", detail: errorMsg }, { errorMsg });
+  }
 
+  /**
+   * OCV5-424 — 所有服务池共用的结果上报入口(claude_accounts 侧)。
+   *
+   * 读当前状态 → policy/decide 求下一状态 → 以 `status = 读到的旧值` 为守卫写回
+   * (与管理员停用等并发写不互相覆盖;守卫失败重读重算一次)。策略层永不写
+   * disabled/banned。状态有变化时写 pool_events(best-effort)。
+   */
+  async applyOutcome(
+    accountId: bigint | string,
+    outcome: PoolOutcome,
+    opts: { errorMsg?: string | null } = {},
+  ): Promise<AccountHealth | null> {
+    const id = String(accountId);
+    let consecutiveFailures: number | undefined;
+    if (outcome.kind === "upstream_error") {
+      consecutiveFailures = await this.redis.incr(failKey(id));
+      if (consecutiveFailures === 1) {
+        // 第一次失败才设 TTL,避免每次失败都续期"永远过期不了"
+        await this.redis.expire(failKey(id), this.failWindowSec);
+      }
+    }
+    // 调用方显式传了 errorMsg(含 null = 保留旧 last_error)就照用;否则用分类标签。
+    const errorMsg =
+      outcome.kind === "success"
+        ? null
+        : "errorMsg" in opts
+          ? (opts.errorMsg ?? null)
+          : outcome.kind === "client_error" || outcome.kind === "network"
+            ? null
+            : outcomeLabel(outcome);
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const cur = await query<RawStateRow>(
+        `SELECT id::text AS id, status, health_score, cooldown_until, backoff_level, cooldown_reason, provider
+         FROM claude_accounts WHERE id = $1`,
+        [id],
+      );
+      if (cur.rowCount === 0) {
+        await this.redis.del(failKey(id));
+        await this.redis.del(healthKey(id));
+        return null;
+      }
+      const row = cur.rows[0];
+      const tr = decide(
+        {
+          status: row.status,
+          healthScore: row.health_score,
+          backoffLevel: row.backoff_level ?? 0,
+          consecutiveFailures,
+        },
+        outcome,
+        this.now(),
+        this.policy,
+      );
+      const written = await this.writeTransition(id, row, tr, errorMsg, true);
+      if (written === null) continue; // 并发改了 status,重读重算
+      if (tr.resetFailures) await this.redis.del(failKey(id));
+      await this.redis.set(healthKey(id), String(written.health_score), { exSec: this.healthTtlSec });
+      if (tr.changed) {
+        await recordPoolEvent({
+          service: row.provider,
+          memberKind: "account",
+          memberId: id,
+          outcome: outcomeLabel(outcome),
+          fromStatus: row.status,
+          toStatus: tr.status,
+          reason: tr.cooldownReason,
+          until: tr.cooldownUntil,
+        });
+      }
+      return written;
+    }
+    // 两次都撞并发:返回当前值,不强写(下一次上报会再判)。
+    const res = await query<RawHealthRow>(
+      "SELECT id::text AS id, status, health_score, cooldown_until FROM claude_accounts WHERE id = $1",
+      [id],
+    );
+    return res.rowCount === 0 ? null : parseHealth(res.rows[0]);
+  }
+
+  /** 按 Transition 写回一行;`status` 守卫不匹配返 null。 */
+  private async writeTransition(
+    id: string,
+    prev: RawStateRow,
+    tr: Transition,
+    errorMsg: string | null,
+    touchLastUsed: boolean,
+  ): Promise<AccountHealth | null> {
     const res = await query<RawHealthRow>(
       `UPDATE claude_accounts
-       SET fail_count = fail_count + 1,
-           health_score = GREATEST(0, health_score - 20),
-           last_error = COALESCE($2, last_error),
-           last_used_at = NOW(),
+       SET status = $3,
+           health_score = $4,
+           backoff_level = $5,
+           cooldown_until = CASE WHEN $6::boolean THEN $7::timestamptz ELSE cooldown_until END,
+           cooldown_reason = CASE WHEN $6::boolean THEN $8::text ELSE cooldown_reason END,
+           next_probe_at = CASE WHEN $6::boolean THEN $9::timestamptz ELSE next_probe_at END,
+           success_count = success_count + $10,
+           fail_count = fail_count + $11,
+           last_error = CASE WHEN $10 = 1 THEN NULL ELSE COALESCE($12, last_error) END,
+           last_used_at = CASE WHEN $13::boolean THEN NOW() ELSE last_used_at END,
            updated_at = NOW()
-       WHERE id = $1
+       WHERE id = $1 AND status = $2
        RETURNING id::text AS id, status, health_score, cooldown_until`,
-      [id, errorMsg],
+      [
+        id,
+        prev.status,
+        tr.status,
+        tr.healthScore,
+        tr.backoffLevel,
+        tr.changed,
+        tr.cooldownUntil,
+        tr.cooldownReason,
+        tr.needsProbe ? tr.cooldownUntil : null,
+        tr.successDelta,
+        tr.failDelta,
+        errorMsg,
+        touchLastUsed,
+      ],
     );
-    if (res.rowCount === 0) {
-      await this.redis.del(failKey(id));
-      await this.redis.del(healthKey(id));
-      return null;
-    }
-    let row = res.rows[0];
+    if (res.rowCount === 0) return null;
+    return parseHealth(res.rows[0]);
+  }
 
-    if (failCount >= this.failThreshold && row.status === "active") {
-      const cooldownUntil = new Date(this.now().getTime() + this.cooldownMs);
-      const r2 = await query<RawHealthRow>(
-        `UPDATE claude_accounts
-         SET status = 'cooldown',
-             cooldown_until = $2,
-             updated_at = NOW()
-         WHERE id = $1 AND status = 'active'
-         RETURNING id::text AS id, status, health_score, cooldown_until`,
-        [id, cooldownUntil],
+  /**
+   * OCV5-424 — 到期待探测的认证/凭证类冷却账号(本实例 channel 内)。
+   */
+  async listDueProbes(limit: number): Promise<Array<{ id: bigint; provider: string; reason: CooldownReason }>> {
+    const res = await query<{ id: string; provider: string; cooldown_reason: CooldownReason }>(
+      `SELECT id::text AS id, provider, cooldown_reason
+       FROM claude_accounts
+       WHERE status = 'cooldown'
+         AND cooldown_reason IN ('auth', 'credential')
+         AND cooldown_until IS NOT NULL
+         AND cooldown_until < NOW()
+         AND NOT (provider IN ('codex', 'grok') AND runtime_channel <> $1)
+       ORDER BY cooldown_until
+       LIMIT $2`,
+      [getRuntimeChannel(), limit],
+    );
+    return res.rows.map((r) => ({ id: BigInt(r.id), provider: r.provider, reason: r.cooldown_reason }));
+  }
+
+  /**
+   * OCV5-424 — 探测结果落库:成功 → active(health 50);失败 → 同原因加大退避;
+   * transient(出口/上游暂时不可判)→ 不加级,authBaseMs 后再探。
+   *
+   * 只处理仍处于认证/凭证冷却且已到期的行:探测期间管理员手工启用/停用,或刷新路径
+   * 自己已经把冷却往后推(cooldown_until > now,即已经加过一级)的,一律不再覆盖。
+   */
+  async applyProbeResult(
+    accountId: bigint | string,
+    result: ProbeResult,
+  ): Promise<AccountHealth | null> {
+    const id = String(accountId);
+    const cur = await query<RawStateRow>(
+      `SELECT id::text AS id, status, health_score, cooldown_until, backoff_level, cooldown_reason, provider
+       FROM claude_accounts WHERE id = $1`,
+      [id],
+    );
+    if (cur.rowCount === 0) return null;
+    const row = cur.rows[0];
+    const now = this.now();
+    if (row.status !== "cooldown" || (row.cooldown_reason !== "auth" && row.cooldown_reason !== "credential")) {
+      return parseHealth(row);
+    }
+    if (!result.ok && row.cooldown_until !== null && row.cooldown_until.getTime() > now.getTime()) {
+      return parseHealth(row);
+    }
+    let tr: Transition;
+    if (!result.ok && "transient" in result) {
+      const until = new Date(now.getTime() + this.policy.authBaseMs);
+      tr = {
+        status: "cooldown",
+        healthScore: row.health_score,
+        backoffLevel: row.backoff_level ?? 0,
+        cooldownUntil: until,
+        cooldownReason: row.cooldown_reason,
+        needsProbe: true,
+        resetFailures: false,
+        successDelta: 0,
+        failDelta: 0,
+        changed: true,
+      };
+    } else {
+      tr = decideProbe(
+        {
+          status: row.status,
+          healthScore: row.health_score,
+          backoffLevel: row.backoff_level ?? 0,
+          cooldownReason: row.cooldown_reason,
+        },
+        result.ok,
+        now,
+        this.policy,
       );
-      if ((r2.rowCount ?? 0) > 0) {
-        row = r2.rows[0];
-      }
-      // 熔断触发后清计数,下一轮 half-open 恢复从 0 开始
-      await this.redis.del(failKey(id));
     }
-
-    const h = parseHealth(row);
-    await this.redis.set(healthKey(id), String(h.health_score), { exSec: this.healthTtlSec });
-    return h;
+    const detail = result.ok ? null : result.detail.slice(0, 200);
+    const written = await this.writeTransition(id, row, tr, detail, false);
+    if (written === null) return null;
+    if (result.ok) {
+      await this.redis.del(failKey(id));
+      await this.redis.set(healthKey(id), String(written.health_score), { exSec: this.healthTtlSec });
+    }
+    await recordPoolEvent({
+      service: row.provider,
+      memberKind: "account",
+      memberId: id,
+      outcome: result.ok ? "probe_ok" : `probe_${"transient" in result ? "transient" : "failed"}:${detail}`,
+      fromStatus: row.status,
+      toStatus: tr.status,
+      reason: tr.cooldownReason,
+      until: tr.cooldownUntil,
+    });
+    return written;
   }
 
   /**
@@ -216,10 +388,14 @@ export class AccountHealthTracker {
        SET status = 'active',
            health_score = 50,
            cooldown_until = NULL,
+           cooldown_reason = NULL,
+           next_probe_at = NULL,
            updated_at = NOW()
        WHERE status = 'cooldown'
          AND cooldown_until IS NOT NULL
          AND cooldown_until < NOW()
+         -- OCV5-424:认证/凭证类冷却到期要先探测(recovery actor),不直接半开。
+         AND (cooldown_reason IS NULL OR cooldown_reason NOT IN ('auth', 'credential'))
          AND NOT (provider IN ('codex', 'grok') AND runtime_channel <> $1)
        RETURNING id::text AS id, status, health_score, cooldown_until`,
       [getRuntimeChannel()],
@@ -246,6 +422,9 @@ export class AccountHealthTracker {
     const res = await query<RawHealthRow>(
       `UPDATE claude_accounts
        SET status = 'disabled',
+           disabled_by = 'admin',
+           cooldown_reason = NULL,
+           next_probe_at = NULL,
            last_error = COALESCE($2, last_error),
            updated_at = NOW()
        WHERE id = $1
@@ -290,6 +469,8 @@ export class AccountHealthTracker {
        SET status = 'active',
            health_score = 50,
            cooldown_until = NULL,
+           cooldown_reason = NULL,
+           next_probe_at = NULL,
            updated_at = NOW()
        WHERE id = $1 AND status = 'cooldown'
        RETURNING id::text AS id, status, health_score, cooldown_until`,
@@ -321,6 +502,10 @@ export class AccountHealthTracker {
        SET status = 'active',
            health_score = 100,
            cooldown_until = NULL,
+           cooldown_reason = NULL,
+           next_probe_at = NULL,
+           backoff_level = 0,
+           disabled_by = NULL,
            last_error = NULL,
            updated_at = NOW()
        WHERE id = $1

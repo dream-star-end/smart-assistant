@@ -12,6 +12,7 @@ import {
   cursorFamilyEfforts,
   cursorModelById,
   formatCostX,
+  isMorePickerModelId,
 } from '@openclaude/protocol'
 import type { LockedPublicModel, PublicModel } from './types'
 
@@ -28,7 +29,7 @@ export type ContextPickerRow = {
   spec: ContextTierFamily
   /**
    * protocol CONTEXT_TIER_FAMILIES.collapsedByDefault 的投影:为 true 的家族默认收进
-   * 「更多 GPT 模型」折叠组。纯展示语义,不改准入/计费。
+   * 「更多模型」折叠组。纯展示语义,不改准入/计费。
    */
   collapsed: boolean
 }
@@ -225,9 +226,14 @@ export function modelPickerRows(
   return [...usable, ...lockedPickerRows(models, lockedModels, seenCursor), ...degraded]
 }
 
-/** 折叠组里的行(仅 context-family 且 collapsed)。锁定/降级行不进折叠组。 */
+/**
+ * 折叠组「更多模型」里的行:collapsed 的 context-family,以及 `isMorePickerModelId` 的普通行
+ * (OCV5-425 OpenCode Go)。锁定/降级行不进折叠组。
+ */
 export function isCollapsedPickerRow(row: ModelPickerRow): boolean {
-  return row.kind === 'context-family' && row.row.collapsed && !rowDegraded(row)
+  if (rowDegraded(row)) return false
+  if (row.kind === 'context-family') return row.row.collapsed
+  return row.kind === 'plain' && isMorePickerModelId(row.model.id)
 }
 
 /**
@@ -246,9 +252,10 @@ export function partitionCollapsedRows(
     if (isCollapsedPickerRow(row)) {
       collapsed.push(row)
       if (
-        row.kind === 'context-family' &&
         selectedId !== undefined &&
-        row.row.members.some((member) => member.id === selectedId)
+        ((row.kind === 'context-family' &&
+          row.row.members.some((member) => member.id === selectedId)) ||
+          (row.kind === 'plain' && row.model.id === selectedId))
       ) {
         selectedInCollapsed = true
       }

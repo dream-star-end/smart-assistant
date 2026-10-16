@@ -550,6 +550,10 @@ import {
   lookupRecentTerminal,
   parseVerificationVerdict,
   persistInterruptedPromptQueueTurn,
+  PRE_ADMISSION_STOP_TTL_MS,
+  messageSendAttempt,
+  preStartStopKey,
+  stopControlSendAttempt,
   type PromptQueueExternalTurnReservation,
 } from './sessionManager.js'
 import { WebhookRouter } from './webhooks.js'
@@ -575,6 +579,12 @@ import {
   readV5ZcodeRelayConfig,
   V5_ZCODE_RELAY_PREFIX,
 } from './v5ZcodeRelay.js'
+import {
+  handleV5AntigravityRelayLocal,
+  readV5AntigravityRelayConfig,
+  V5_ANTIGRAVITY_RELAY_PREFIX,
+} from './v5AntigravityRelay.js'
+import type { AntigravityRouteOverride } from './engine/antigravityAdapter.js'
 import {
   handleV3MarketplaceRelayLocal,
   readV3MarketplaceRelayConfig,
@@ -1584,6 +1594,58 @@ export function _buildSafeZcodeRouteOverride(args: {
     return null
   }
   return { baseUrl: route.baseUrl, routeToken: route.routeToken }
+}
+
+/** Validate the master-owned Antigravity route (OCV5-415): the opaque relay
+ * token plus the openid/userinfo-only Google token the CLI needs for its
+ * startup eligibility check. CLOUD_CODE_URL keeps the path, so the route
+ * baseUrl is used verbatim. */
+export function _buildSafeAntigravityRouteOverride(args: {
+  agent: { id: string; provider?: string; runnerKind?: string }
+  model?: string
+  rawRoute: unknown
+  officialRelayPort: number
+  authority?: { canonicalModel: string; engine: 'ccb' | 'codex' | 'grok' | 'cursor' | 'zcode' | 'antigravity' }
+}): AntigravityRouteOverride | null {
+  if (!args.rawRoute || typeof args.rawRoute !== 'object' || Array.isArray(args.rawRoute)) return null
+  let engineId: string
+  try {
+    engineId = resolveEngine(args.model, args.agent as never, args.authority)
+  } catch {
+    return null
+  }
+  if (engineId !== 'antigravity') return null
+  const route = args.rawRoute as Record<string, unknown>
+  const keys = Object.keys(route).sort().join(',')
+  if (keys !== 'accessToken,accessTokenExpiresAt,baseUrl,routeToken'
+    && keys !== 'accessToken,accessTokenExpiresAt,baseUrl,idToken,routeToken') return null
+  if (typeof route.routeToken !== 'string' || !/^[0-9a-f]{64}$/.test(route.routeToken)) return null
+  if (typeof route.baseUrl !== 'string' || route.baseUrl.length > 512) return null
+  if (typeof route.accessToken !== 'string' || !/^[A-Za-z0-9._~+/=-]{20,4096}$/.test(route.accessToken)) return null
+  if (typeof route.accessTokenExpiresAt !== 'string' || !Number.isFinite(Date.parse(route.accessTokenExpiresAt))) return null
+  if (route.idToken !== undefined && (typeof route.idToken !== 'string' || !/^[A-Za-z0-9._-]{20,8192}$/.test(route.idToken))) return null
+  if (!Number.isInteger(args.officialRelayPort) || args.officialRelayPort <= 0 || args.officialRelayPort > 65535) return null
+  try {
+    const parsed = new URL(route.baseUrl)
+    const expectedPath = `${V5_ANTIGRAVITY_RELAY_PREFIX}/route/${route.routeToken}`
+    if (
+      parsed.protocol !== 'http:' ||
+      parsed.hostname !== '127.0.0.1' ||
+      Number(parsed.port || '80') !== args.officialRelayPort ||
+      parsed.pathname !== expectedPath ||
+      parsed.search ||
+      parsed.hash
+    ) return null
+  } catch {
+    return null
+  }
+  return {
+    baseUrl: route.baseUrl,
+    routeToken: route.routeToken,
+    accessToken: route.accessToken,
+    accessTokenExpiresAt: route.accessTokenExpiresAt,
+    ...(typeof route.idToken === 'string' ? { idToken: route.idToken } : {}),
+  }
 }
 
 // ─── handleUpload TOCTOU hardening test seam (v3 commercial v1.0.155) ───────
@@ -2773,6 +2835,8 @@ export class Gateway {
   // can catch up without hitting REST. When the ring can't satisfy a resume,
   // we emit `outbound.resume_failed` so the client escalates to REST sync.
   private _outboundRing!: OutboundRingBuffer
+  /** OCV5-427: exact-turn replays already served per socket (`sessionKey\u0000clientMessageId`). */
+  private readonly _activeTurnReplaysServed = new WeakMap<object, Set<string>>()
 
   // ── 模型执行权威(docs/V5_MODEL_AUTHORITY_PLAN.md §2/§7)────────────────────
   // 容器侧验签消费器(进程级:keyring + 容器身份 + epoch 单调水位 + replay cache)。
@@ -4052,6 +4116,23 @@ export class Gateway {
         this.log.error('v5 zcode local relay crashed', undefined, err)
         if (!res.headersSent) {
           try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'zcode relay crashed' } }) } catch {}
+        } else {
+          try { res.end() } catch {}
+        }
+      })
+      return
+    }
+
+    if (url.pathname === V5_ANTIGRAVITY_RELAY_PREFIX || url.pathname.startsWith(`${V5_ANTIGRAVITY_RELAY_PREFIX}/`)) {
+      const relayCfg = readV5AntigravityRelayConfig(process.env)
+      if (!relayCfg) {
+        this.sendJson(res, 404, { error: { code: 'ANTIGRAVITY_RELAY_NOT_CONFIGURED', message: 'antigravity relay not configured' } })
+        return
+      }
+      handleV5AntigravityRelayLocal(req, res, relayCfg).catch((err) => {
+        this.log.error('v5 antigravity local relay crashed', undefined, err)
+        if (!res.headersSent) {
+          try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'antigravity relay crashed' } }) } catch {}
         } else {
           try { res.end() } catch {}
         }
@@ -11366,6 +11447,9 @@ export class Gateway {
     done: Promise<void>
     release: () => void
   }> | undefined
+  /** OCV5-435 — webchat turns between ws admission and settlement
+   * (preStartStopKey → live dispatch count). Lazy for Object.create scaffolds. */
+  private _admittedClientTurns: Map<string, number> | undefined
   /** HTTP/MCP delegate 续跑绑定。测试脚手架 Object.create 不跑字段初始化,使用处惰性 ??=。 */
   private _delegateResume: DelegateResumeRegistry | undefined
 
@@ -17604,7 +17688,7 @@ export class Gateway {
           await runDurableDispatchAdmission({
             ctx: dctx,
             sendReceipt: (row) => this._sendTurnDispatchReceipt(ws, dctx, row),
-            dispatch: () => this.dispatchInbound(frame),
+            dispatch: () => this._dispatchAdmittedClientTurn(frame),
             onAdmitError: (err) => {
               // 受理事务异常 = 拒轮(可重试),不半受理。不建 inbox 行 → 无孤儿。
               this.log.error(
@@ -17624,7 +17708,7 @@ export class Gateway {
           return
         }
         try {
-          await this.dispatchInbound(frame)
+          await this._dispatchAdmittedClientTurn(frame)
         } finally {
           const unusedQueueLifecycle = this._promptQueueLifecycleByFrame.get(frame as object)
           const unusedQueueFence = this._promptQueueExecutionFenceByFrame.get(frame as object)
@@ -18094,6 +18178,38 @@ export class Gateway {
     }
   }
 
+  /** OCV5-435 — a webchat turn counts as admitted from ws dispatch until it
+   * settles, so a Stop that beats its engine run still binds to this turn. */
+  private async _dispatchAdmittedClientTurn(frame: InboundFrame): Promise<void> {
+    const clientMessageId = (frame as { clientMessageId?: unknown }).clientMessageId
+    if (
+      frame.type !== 'inbound.message' ||
+      frame.channel !== 'webchat' ||
+      !isClientMessageId(clientMessageId)
+    ) {
+      return this.dispatchInbound(frame)
+    }
+    const key = preStartStopKey(frame.peer.id, clientMessageId)
+    const admitted = (this._admittedClientTurns ??= new Map())
+    admitted.set(key, (admitted.get(key) ?? 0) + 1)
+    this.sessions.adoptPreStartStopOnAdmission(
+      frame.peer.id,
+      clientMessageId,
+      messageSendAttempt((frame as { idempotencyKey?: unknown }).idempotencyKey, clientMessageId),
+    )
+    try {
+      await this.dispatchInbound(frame)
+    } finally {
+      const left = (admitted.get(key) ?? 1) - 1
+      if (left > 0) {
+        admitted.set(key, left)
+      } else {
+        admitted.delete(key)
+        this.sessions.clearPreStartStop(frame.peer.id, clientMessageId)
+      }
+    }
+  }
+
   private async handleStop(frame: {
     type: 'inbound.control.stop'
     channel: string
@@ -18137,6 +18253,30 @@ export class Gateway {
         })
         return ok
       }
+      // OCV5-435: accepted but its engine run does not exist yet (cold start,
+      // lock wait). Bind the Stop to that exact turn instead of answering
+      // TURN_NOT_ACTIVE and letting it run unseen.
+      if (this._admittedClientTurns?.has(preStartStopKey(frame.peer.id, clientMessageId))) {
+        this.sessions.fencePreStartStop(frame.peer.id, clientMessageId)
+        this.log.info('interrupt', {
+          sessionKey: `*${suffix}`,
+          clientMessageId,
+          ok: true,
+          preStart: true,
+        })
+        return true
+      }
+      // Not admitted here yet: the Stop may have overtaken its own message
+      // (Master acks admission before forwarding it). Arm a short fence for
+      // that send attempt; admission of the same attempt extends it, another
+      // attempt drops it. Nothing is active now, so the receipt stays
+      // TURN_NOT_ACTIVE.
+      this.sessions.fencePreStartStop(
+        frame.peer.id,
+        clientMessageId,
+        PRE_ADMISSION_STOP_TTL_MS,
+        stopControlSendAttempt((frame as { controlId?: unknown }).controlId, clientMessageId),
+      )
       this.log.info('interrupt', {
         sessionKey: `*${suffix}`,
         clientMessageId,
@@ -19382,6 +19522,10 @@ export class Gateway {
     if (resumableKeys.length === 0) return
 
     for (const sessionKey of resumableKeys) {
+      // OCV5-428: yield a macrotask per session. The loop runs right after listen();
+      // without this the readiness probe (/healthz + WS upgrade) waited ~29s on a
+      // 145-session cold start, holding every queued user message.
+      await new Promise<void>((resolve) => setImmediate(resolve))
       if (this.sessions.getByKey(sessionKey)) continue
 
       const parts = sessionKey.split(':')
@@ -19634,9 +19778,19 @@ export class Gateway {
       // durable server-side persistence from Phase 0.1/0.2 remains the
       // authoritative backstop for any duration of disconnect.
       const clientLastSeq = typeof peerLastFrameSeq === 'number' ? peerLastFrameSeq : 0
-      const activeReplayClientMessageId = _matchActiveTurnReplayCandidate(
+      const matchedActiveReplay = _matchActiveTurnReplayCandidate(
         session?._runningClientMessageId,
         peer.resumeActiveTurnCandidateMessageIds,
+      )
+      // OCV5-427: one exact-turn replay per socket and turn. A second hello on
+      // the same socket for the same running turn (page-load hello + post-sync
+      // registration hello) gets the cursor replay instead of the whole turn
+      // again, so the browser does not chew the same frames twice.
+      const activeReplayClientMessageId = _unservedActiveTurnReplay(
+        this._activeTurnReplaysServed,
+        ws,
+        sessionKey,
+        matchedActiveReplay,
       )
       if (clientLastSeq >= 0) {
         const replay = activeReplayClientMessageId
@@ -19648,6 +19802,9 @@ export class Gateway {
         // only ever pruned on resume.
         this._recordRingEvictions(replay.evicted)
         if (replay.ok) {
+          if (activeReplayClientMessageId) {
+            _noteActiveTurnReplayServed(this._activeTurnReplaysServed, ws, sessionKey, activeReplayClientMessageId)
+          }
           if (activeReplayClientMessageId) {
             try {
               ws.send(JSON.stringify({
@@ -20256,6 +20413,10 @@ export class Gateway {
     // 支持的档位),而不是平台全集 —— 平台全集会把「模型不支持的档位」放进 runner。
     // 帧未带 effort 且 descriptor 有 codexDefaultEffort → 用模型默认档(仅新建 session
     // 生效,既存 session 的切换由 submit 处理,语义与旧实现一致)。
+    // OCV5-434 GPT Fast (turn-level). WS frames are JSON-cast: only 'fast' passes; anything
+    // else — including an absent field — is explicit standard, so Fast is never implied or
+    // carried over from an earlier turn. Runners act on it only for Fast-capable models.
+    const safeServiceTier: 'fast' | null = (frame as any).serviceTier === 'fast' ? 'fast' : null
     const _frameEffort = (frame as any).effortLevel
     const allowedEfforts: ReadonlySet<string> =
       turnAuthority !== undefined
@@ -20357,6 +20518,20 @@ export class Gateway {
       agent,
       model: safeModelForRouting,
       rawRoute: (frame as any).__oc_zcode_route,
+      officialRelayPort: this.deps.config.gateway.port,
+      ...(turnAuthority !== undefined
+        ? {
+            authority: {
+              canonicalModel: turnAuthority.canonicalModel,
+              engine: turnAuthority.engine,
+            },
+          }
+        : {}),
+    })
+    const safeAntigravityRoute = _buildSafeAntigravityRouteOverride({
+      agent,
+      model: safeModelForRouting,
+      rawRoute: (frame as any).__oc_antigravity_route,
       officialRelayPort: this.deps.config.gateway.port,
       ...(turnAuthority !== undefined
         ? {
@@ -21942,6 +22117,8 @@ export class Gateway {
       codexRoute: safeCodexRoute,
       grokRoute: safeGrokRoute,
       zcodeRoute: safeZcodeRoute,
+      antigravityRoute: safeAntigravityRoute,
+      serviceTier: safeServiceTier,
       ...(automaticRetryState ? { automaticRetryState } : {}),
       ...(inboundRecovery?.automatic === true &&
           'resetNativeSession' in inboundRecovery &&
@@ -22884,6 +23061,36 @@ export function _matchActiveTurnReplayCandidate(
   )
     ? runningClientMessageId
     : undefined
+}
+
+/** OCV5-427: the exact-turn replay a hello may still get on this socket.
+ * One per socket and turn; a repeat ask returns undefined so the caller
+ * falls back to the cursor replay instead of resending the whole turn. */
+export function _unservedActiveTurnReplay(
+  served: WeakMap<object, Set<string>>,
+  socket: object,
+  sessionKey: string,
+  matchedClientMessageId: string | undefined,
+): string | undefined {
+  if (!matchedClientMessageId) return undefined
+  return served.get(socket)?.has(`${sessionKey}\u0000${matchedClientMessageId}`)
+    ? undefined
+    : matchedClientMessageId
+}
+
+/** OCV5-427: record an exact-turn replay that was actually sent on `socket`. */
+export function _noteActiveTurnReplayServed(
+  served: WeakMap<object, Set<string>>,
+  socket: object,
+  sessionKey: string,
+  clientMessageId: string,
+): void {
+  let keys = served.get(socket)
+  if (!keys) {
+    keys = new Set()
+    served.set(socket, keys)
+  }
+  keys.add(`${sessionKey}\u0000${clientMessageId}`)
 }
 
 // ── turn-alive-heartbeat (Plan 1) — autoResumeFromHello judgment helper ──

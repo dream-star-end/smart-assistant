@@ -285,6 +285,15 @@ lease_body_alert() { # <lease_id> <age_h> <blocker>
 EOF
 }
 
+lease_body_ff_blocked() { # <repo> <head> <tip> <why>
+  cat <<EOF
+🚨 发版主工作树无法快进到 origin tip ${3:0:12}(HEAD ${2:0:12})
+- 工作树: $1
+- 原因: $4
+- worker 只做 fast-forward,不会 reset/覆盖;本 tick 不发车。人工把工作树对齐后,下一个 tick 自动发车。
+EOF
+}
+
 lease_body_train_alert() { # <train_id> <status> <reason>
   cat <<EOF
 🚨 train $1 进入 $2

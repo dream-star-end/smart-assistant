@@ -116,6 +116,14 @@ export interface StaticKeyProviderSpec {
    */
   readonly allowedOutputConfigEfforts?: readonly string[]
   /**
+   * Model-scoped effort allowlist, keyed by lowercase **upstream** model. A hit wins over
+   * `allowedOutputConfigEfforts` and over `output_config` in `stripBodyFields`: the proxy keeps
+   * only `output_config.effort` when it is in the list and drops the field otherwise. Models
+   * not listed keep the provider-wide rule. Used for OpenCode Go, where only some upstream
+   * models honour effort (OCV5-425 probes).
+   */
+  readonly modelOutputConfigEfforts?: Readonly<Record<string, readonly string[]>>
+  /**
    * 上游要求的「稳定会话 id」请求头名。声明后 master/egress 转发前必须带上
    * `<header>: <引擎原生 session id>`(取 `metadata.session_id` / `metadata.user_id` JSON 的
    * session_id;缺失时退化为每请求随机 UUID —— 只影响上游路由/缓存亲和,不影响正确性)。
@@ -125,6 +133,85 @@ export interface StaticKeyProviderSpec {
    * https://opencode.ai/docs/go/#where-can-i-use-it 一致。未声明 = 不注入(其它 provider 字节不变)。
    */
   readonly sessionIdHeader?: string
+}
+
+/**
+ * OCV5-425: OpenCode Go models reached over its Anthropic `/v1/messages` endpoint, catalog id →
+ * upstream id. The `-go` suffix keeps them apart from same-named models on other providers
+ * (kimi-k3 on Moonshot, qwen3.8-max on Bailian, deepseek-v4-pro on DeepSeek …). Prices follow
+ * https://opencode.ai/docs/go/ (scripts/ocv5-425). The picker lists them under「更多模型」.
+ */
+export const OPENCODE_GO_MESSAGES_MODELS: Readonly<Record<string, string>> = {
+  'deepseek-v4-pro-go': 'deepseek-v4-pro',
+  'claude-haiku-5-5-go': 'claude-haiku-5-5',
+  'kimi-k3-go': 'kimi-k3',
+  'minimax-m2.7-go': 'minimax-m2.7',
+  'minimax-m3-go': 'minimax-m3',
+  'space-bunny-go': 'space-bunny',
+  'qwen3.8-max-go': 'qwen3.8-max',
+  'qwen3.8-flash-go': 'qwen3.8-flash',
+  'qwen3.7-plus-go': 'qwen3.7-plus',
+}
+
+/**
+ * OCV5-425 phase 2: OpenCode Go models that only answer on OpenAI `/chat/completions`, catalog
+ * id → upstream id. The proxy routes them through the chat bridge (openAiChatGoBridge).
+ */
+export const OPENCODE_GO_CHAT_MODELS: Readonly<Record<string, string>> = {
+  'glm-5.3-go': 'glm-5.3',
+  'glm-5.2-go': 'glm-5.2',
+  'glm-5.3-flash-go': 'glm-5.3-flash',
+  'kimi-k2.7-code-go': 'kimi-k2.7-code',
+  'kimi-k2.6-go': 'kimi-k2.6',
+  'mimo-v2.6-pro-go': 'mimo-v2.6-pro',
+  'mimo-v2.5-pro-go': 'mimo-v2.5-pro',
+  'mimo-v2.6-flash-go': 'mimo-v2.6-flash',
+  'mimo-v2.5-go': 'mimo-v2.5',
+  'hy4-preview-go': 'hy4-preview',
+  'hy3-go': 'hy3',
+  'longcat-2.0-go': 'longcat-2.0',
+  'longcat-2.5-preview-free-go': 'longcat-2.5-preview-free',
+  'step-5-preview-free-go': 'step-5-preview-free',
+}
+
+const OPENCODE_GO_CHAT_UPSTREAMS = new Set(Object.values(OPENCODE_GO_CHAT_MODELS))
+
+/** True when an OpenCode Go upstream model must go through the chat completions bridge. */
+export function isOpenCodeGoChatUpstream(upstreamModel: string): boolean {
+  return OPENCODE_GO_CHAT_UPSTREAMS.has(upstreamModel.toLowerCase())
+}
+
+/**
+ * OCV5-425 phase 3: OpenCode Go models that only answer on OpenAI `/responses`, catalog id →
+ * upstream id, served by openAiResponsesGoBridge. GPT and Grok ids start with `opencode-`
+ * instead of ending in `-go`: several paths treat any `gpt-…` / `grok…` prefix as the Codex or
+ * Grok engine (WeChat inbound, CCB chatgptModels, gateway teamMode/promptSlots).
+ */
+export const OPENCODE_GO_RESPONSES_MODELS: Readonly<Record<string, string>> = {
+  'opencode-grok-4.7': 'grok-4.7',
+  'opencode-grok-4.6': 'grok-4.6',
+  'opencode-gpt-6-luna': 'gpt-6-luna',
+  'opencode-gpt-5.6-luna': 'gpt-5.6-luna',
+  'muse-spark-1.3-go': 'muse-spark-1.3-contributor',
+  'muse-spark-1.2-go': 'muse-spark-1.2-contributor',
+}
+
+const OPENCODE_GO_RESPONSES_UPSTREAMS = new Set(Object.values(OPENCODE_GO_RESPONSES_MODELS))
+
+/** True when an OpenCode Go upstream model must go through the Responses bridge. */
+export function isOpenCodeGoResponsesUpstream(upstreamModel: string): boolean {
+  return OPENCODE_GO_RESPONSES_UPSTREAMS.has(upstreamModel.toLowerCase())
+}
+
+/** Every OCV5-425 OpenCode Go catalog id (any wire format), catalog id → upstream id. */
+export const OPENCODE_GO_EXTRA_MODELS: Readonly<Record<string, string>> = {
+  ...OPENCODE_GO_MESSAGES_MODELS,
+  ...OPENCODE_GO_CHAT_MODELS,
+  ...OPENCODE_GO_RESPONSES_MODELS,
+}
+
+function openCodeGoExtraUpstream(modelId: string): string | undefined {
+  return OPENCODE_GO_EXTRA_MODELS[modelId.toLowerCase()]
 }
 
 const DEEPSEEK: StaticKeyProviderSpec = {
@@ -138,7 +225,8 @@ const DEEPSEEK: StaticKeyProviderSpec = {
     return (
       modelId.startsWith('deepseek-') &&
       lower !== 'deepseek-v4-flash' &&
-      lower !== 'deepseek-v4-flash-opencode-go'
+      lower !== 'deepseek-v4-flash-opencode-go' &&
+      openCodeGoExtraUpstream(modelId) === undefined
     )
   },
   inboundModelIds: ['deepseek-v4-pro'],
@@ -277,7 +365,8 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
       m === 'deepseek-v4-flash-opencode-go' ||
       m === 'qwen3.7-max' ||
       m === 'qwen3.7-plus' ||
-      m === 'gemini-4-argon-contributor'
+      m === 'gemini-4-argon-contributor' ||
+      openCodeGoExtraUpstream(m) !== undefined
     )
   },
   inboundModelIds: [
@@ -286,6 +375,7 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
     'qwen3.7-max',
     'qwen3.7-plus',
     'gemini-4-argon-contributor',
+    ...Object.keys(OPENCODE_GO_EXTRA_MODELS),
   ],
   canonicalizeForPricing(modelId) {
     const m = modelId.toLowerCase()
@@ -297,17 +387,46 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
           ? 'gemini-4-argon-contributor'
         : m === 'qwen3.7-plus'
           ? 'qwen3.7-plus'
-          : null
+          : openCodeGoExtraUpstream(m) !== undefined
+            ? m
+            : null
   },
   upstreamModelForRequest(modelId) {
     const m = modelId.toLowerCase()
     return m === 'deepseek-v4-flash' || m === 'deepseek-v4-flash-opencode-go'
       ? 'deepseek-v4-flash'
-      : m === 'gemini-4-argon-contributor' ? m : modelId
+      : m === 'gemini-4-argon-contributor' ? m : (openCodeGoExtraUpstream(m) ?? modelId)
   },
   stripHeaders: ['anthropic-beta'],
   // Go 的 Anthropic converter 接受 standard thinking/tool loop；firstParty-only 字段仍剥离。
   stripBodyFields: ['output_config', 'context_management', 'service_tier'],
+  // Probed 2026-10-15 (OCV5-425, g425/effort*.log): every /messages model returns 200 for any
+  // effort, but only these change their thinking. Gemini goes through the Google bridge
+  // (thinkingLevel; MINIMAL is rejected upstream). Claude Haiku: low/medium no thinking,
+  // high→max rising. Qwen3.8 Max: only low (~1.1K chars) vs high (~4.8K) is stable; medium
+  // behaves as low and max is inconsistent, so neither is offered. The rest (DeepSeek V4 Pro,
+  // Kimi K3, MiniMax, Space Bunny, Qwen3.8 Flash, Qwen3.7 Plus) show no stable effect and keep
+  // the provider-wide strip: no effort tiers.
+  modelOutputConfigEfforts: {
+    'gemini-4-argon-contributor': ['low', 'medium', 'high'],
+    'claude-haiku-5-5': ['low', 'medium', 'high', 'xhigh', 'max'],
+    'qwen3.8-max': ['low', 'high'],
+    // Chat-completions bridge (reasoning_effort), g425/native-effort*.log, 3 samples each:
+    // GLM-5.2/5.3 rise low→medium→high; GLM-5.3 Flash, Hy3 and LongCat 2.0 only separate
+    // low from high. MiMo, Kimi K2.x, Hy4, LongCat 2.5 and Step 5 show no stable effect.
+    'glm-5.3': ['low', 'medium', 'high'],
+    'glm-5.2': ['low', 'medium', 'high'],
+    'glm-5.3-flash': ['low', 'high'],
+    'hy3': ['low', 'high'],
+    'longcat-2.0': ['low', 'high'],
+    // Responses bridge (reasoning.effort), g425/resp-effort.log, 2 samples each: high beats low
+    // clearly in both for Grok 4.6/4.7, GPT-6 Luna and Muse Spark 1.2; medium is not reliably in
+    // between, so it is not offered. GPT-5.6 Luna shows no effect, Muse Spark 1.3 no clear one.
+    'grok-4.6': ['low', 'high'],
+    'grok-4.7': ['low', 'high'],
+    'gpt-6-luna': ['low', 'high'],
+    'muse-spark-1.2-contributor': ['low', 'high'],
+  },
   maxInputTokens: 1_000_000,
   // 红/蓝图像探针只消耗 reasoning、无可验证文本结果，按纯文本接入并启用 vision 工具兜底。
   supportsVision: false,
@@ -466,6 +585,25 @@ export function findRouteProviderForModel(modelId: string): StaticKeyProviderSpe
 
 export function getStaticProvider(id: StaticProviderId): StaticKeyProviderSpec {
   return BY_ID[id]
+}
+
+/**
+ * Efforts a static provider forwards for one upstream model: the model-scoped list when the
+ * spec has one, else the provider allowlist; `[]` when `output_config` is stripped; null when
+ * the provider puts no limit on it. Single source for the proxy ceiling, the proxy rewrite and
+ * `modelReasoningPolicy`.
+ */
+export function staticProviderOutputConfigEfforts(
+  spec: StaticKeyProviderSpec,
+  upstreamModel?: string,
+): readonly string[] | null {
+  const scoped =
+    upstreamModel === undefined
+      ? undefined
+      : spec.modelOutputConfigEfforts?.[upstreamModel.toLowerCase()]
+  if (scoped) return scoped
+  if (spec.allowedOutputConfigEfforts) return spec.allowedOutputConfigEfforts
+  return spec.stripBodyFields.includes('output_config') ? [] : null
 }
 
 /** gateway inbound 白名单：所有静态 provider 的精确字面量。 */

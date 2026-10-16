@@ -90,6 +90,12 @@ export type OutboundMessageMeta = NonNullable<OutboundMessage["meta"]> & {
    * 且**不合成空轮气泡**(它不是真正的空轮,内容在服务端已生成)。见 applyOutboundMessage。
    */
   reconcile?: string;
+  /**
+   * 'tape_commit' = master 在 lossless tape 提交(HTTP)后合成的 turn_completed。它可能先于同一轮
+   * 仍在 WS 上的 live 尾巴和真 final 到达(OCV5-424:grok 带工具的轮次实测领先 0.4–1s)。
+   * 前端对**正在流式的本轮**不立即收口,等真 final;宽限期内没等到再按 reconcile 收口。
+   */
+  reconcileSource?: string;
 };
 
 // ─── 出站帧（gateway → client，消费侧）───────────────────────────────

@@ -352,7 +352,7 @@ function parseAgentGroups(obj: Record<string, unknown>): Array<Record<string, un
         if (!runId || runId.length > 128 || !SAFE_AGENT_ID.test(agentId)) {
           throw new Error(`turn tape payload.agentGroups[${groupIndex}].goalUsageRecords[${recordIndex}] identity is invalid`);
         }
-        if (record.engine !== "ccb" && record.engine !== "codex" && record.engine !== "grok" && record.engine !== "cursor" && record.engine !== "zcode") {
+        if (record.engine !== "ccb" && record.engine !== "codex" && record.engine !== "grok" && record.engine !== "cursor" && record.engine !== "zcode" && record.engine !== "antigravity") {
           throw new Error(`turn tape payload.agentGroups[${groupIndex}].goalUsageRecords[${recordIndex}].engine is invalid`);
         }
         return {

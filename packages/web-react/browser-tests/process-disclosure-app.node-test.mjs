@@ -523,6 +523,22 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       await shotFramed(desktop.page, desktop.page.locator(".chat-scroll-area").getByText("还在。可售合计 128，南仓预警已经分开标出。"), "ocv5-265-avatar-polish-pure");
       await desktop.page.getByRole("button", { name: "发送" }).waitFor();
 
+      // INC-20261015-TAPE-COMMIT-FINAL-RACE (OCV5-424): a tape-commit turn_completed that overtakes the
+      // live tail must not make the turn look finished with half an answer. Record the text at the very
+      // first frame where the turn looks done (no caret, 发送 back) — exactly what a user, or C3, reads.
+      await sendText(desktop.page, "回执竞速：今天第一张采购单的编号是多少？");
+      const firstDone = await desktop.page.waitForFunction(() => {
+        const rows = document.querySelectorAll("[data-testid=assistant-row]");
+        const last = rows[rows.length - 1];
+        const text = last?.querySelector(".prose")?.textContent ?? "";
+        if (!text.includes("今天第一张采购单的编号是")) return false;
+        if (last.querySelector(".caret-blink") || !document.querySelector('button[aria-label="发送"]')) return false;
+        return text;
+      }, undefined, { polling: "raf", timeout: 20_000 });
+      const doneText = await firstDone.jsonValue();
+      evidence.tapeCommitRace = { doneText };
+      assert.match(doneText, /PO-RACE4242。这是你上一条消息里给出的编号。/, `turn looked finished with a partial answer: ${doneText}`);
+
       async function fixtureStep() {
         const endpoint = new URL("/api/fixture/step", preview.url);
         const response = await fetch(endpoint, { method: "POST" });

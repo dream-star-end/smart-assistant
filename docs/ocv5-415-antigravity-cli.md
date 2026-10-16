@@ -2,7 +2,7 @@
 
 2026-10-14 CST，cc3 会话（Claude Code account3）。个人版 `feat/v5-selfhost` 先行，商业版之后走两树同步。
 
-**本轮没有登录任何 Google 账号，也没有使用任何真实 key。** 下面的「实测」都是在本机隔离 HOME 里跑官方二进制得到的：凭据是假 key，Gemini API 指向 loopback mock，没有调用付费接口。来源分三类：「实测」、「官方文档」、「二手/未核实」。
+**P1（第 1–5 节）没有登录任何 Google 账号，也没有使用任何真实 key；第 6–7 节的 P2 结论用用户确认的个人订阅账号实测。** P1 时 下面的「实测」都是在本机隔离 HOME 里跑官方二进制得到的：凭据是假 key，Gemini API 指向 loopback mock，没有调用付费接口。来源分三类：「实测」、「官方文档」、「二手/未核实」。
 
 ## 1. 它是什么
 
@@ -73,39 +73,43 @@
   2. 用 `--conversation` 续聊时是**整个对话的累计值**。
 - 结论：计费不能用 CLI 自报的数，只能在 relay 侧按上游 SSE 的 `usageMetadata` 逐次计量（zcode 的 external 模式），并且白名单要包括标题调用的模型。
 
-## 6. 方案
+## 6. 用户决定（2026-10-14）
 
-和 zcode、grok 同构：每轮起一个官方 CLI 进程，跑在用户容器里；凭据只在 egress 上；容器拿到的是一次性的不透明 route token。
+用户原话：「走个人订阅，遥测不拦，其它按推荐」，并明确知道并接受第 3 节的条款与封号风险；之后又定了「按推荐开放模型，开始第二阶段」。
 
-- **P1（本 PR，个人版，不需要凭据）**：引擎骨架，隐藏且 fail-closed。
-  - protocol：模型表 `antigravity-gemini-3.1-pro` 和 `antigravity-gemini-3.8-flash`（实验，不公开）、CLI id 与上游白名单的映射；authority 和 goalState 的 engine union 加上 `antigravity`。
-  - gateway：
-    - `antigravityAdapter`：stdin 输入、流解析、工具映射、soft-deny 和空回复判失败、OAuth 回退时立即杀进程、prompt 上限、只在成功时提交续聊 id、usage 按步骤累加。
-    - `antigravityPlatform`：每次启动独立 HOME，conversations 和 bin 共享，settings 和 MCP 配置 0600。
-    - 同时改了 registry、resumeArtifacts、catalogClient 和 server/sessionManager 的 union。
-  - **没有 route 就不启动**。模型 id 不在 `ALLOWED_INBOUND_MODELS` 里，没有目录行，master 也不会签发 antigravity 的 authority，所以上线后用户侧不可达。
-  - 测试用实测录下的 NDJSON 夹具回放。
-- **P2（个人版）**：Gemini relay 加计量。
-  - 网关侧 loopback `/internal/v5/antigravity-relay/route/<token>`，经 master/egress 转发。
-  - egress 只放行 `antigravityAllowedUpstreamModels`，换成真 key，按 `usageMetadata` 逐次写 external billing（参照 zcode 的 `internalZcodeRelay`、`zcodeCatalogSettle`）。
-  - bridge 下发 route，`OutboundExternalEngineBilling.engine` 加 `antigravity`，加 catalog engine CHECK 迁移和 staged 目录行。
-  - **具体走哪种上游协议取决于下面的 D1。**
-- **P3（需要凭据和用户拍板）**：
-  - runtime 镜像按上面的 URL 和 sha512 装 1.3.4，并预解出 bin，镜像约增加 230 MB。v5-dev 根分区已用 95%。
-  - 目录行加价格行，激活后用真实多轮 canary 和扣费对账。
-  - 遥测和出网核对：看 CLI 在容器里除了 relay 之外还会连哪些地址。
+- **D1 凭据**：个人订阅 Google 账号 OAuth（当前账号 d1193355375@gmail.com，Google AI Pro）。§3「个人订阅 OAuth 一律不接」的结论由用户决定推翻，风险由用户承担。
+- **D2 账号主体**：上面这个个人订阅账号；没有 Cloud 项目，没有单独预算上限，按平台积分对用户扣费。
+- **D3 模型和价格**：上线前实测账号只给 3.8 Flash 三档、Claude Sonnet 4.6、Claude Opus 4.6 Thinking、GPT-OSS 120B，**没有 3.1 Pro**。
+  - `antigravity-gemini-3.8-flash`（low/medium/high）对所有用户公开：价格同 Cursor Gemini 3.8 Flash（120/150/5 分每百万，×1）。
+  - `antigravity-claude-sonnet-4.6`（同 CCB Sonnet 4.6，150/750/15，×2）、`antigravity-claude-opus-4.6`（同 Opus 4.7，250/1250/25，×2）、`antigravity-gpt-oss-120b`（同 Flash）只给管理员。
+- **D4 遥测**：不拦。容器里的 CLI 仍会直连 play.googleapis.com、antigravity-unleash.goog、aicode.googleapis.com、lh3.googleusercontent.com、www.googleapis.com（userinfo）。
+- **D5 镜像**：接受 runtime 镜像约 +215 MB。
 
-## 7. 需要用户决定和提供的
+## 7. 方案（P2，个人版）
 
-- **D1 凭据路线**（决定 P2 relay 的协议）：
-  - 推荐 **Gemini Enterprise API Key**：条款豁免，但需要先用真 key 验证它能走 `modelProvider:gemini` 加 base URL。
-  - 次选普通 Gemini API 付费 key：已实测可以经 relay，但 Antigravity 条款仍然适用，有封号风险，需要你明确接受。
-  - Vertex/Enterprise ADC：除非接受把短期的 cloud-platform token 放进用户容器（yolo 工具能读到，作用域是整个项目），否则不能用，不推荐。
-  - 个人 Google 订阅 OAuth：条款禁止，不接。
-- **D2 账号和计费主体**：用哪个 Google Cloud 项目或付费账户，预算上限多少。
-- **D3 模型和价格**：上哪几个模型（当前是 3.1 Pro 和 3.8 Flash）、价格（积分/百万 token）、是否像 Grok 一样先只给管理员。
-- **D4 遥测**：是否要求容器层面封掉 CLI 直连 Google 的遥测出网。
-- **D5 镜像体积**：runtime 镜像约 +230 MB，可以接受吗？
+账号模式实测（v5-dev，2026-10-14）：
+
+- `CLOUD_CODE_URL=<url>` 把 CLI 的**全部** `/v1internal:*` 调用改到这个地址，**保留路径前缀**。上游必须是 `daily-cloudcode-pa.googleapis.com`（`cloudcode-pa` 对这个 client 返回 429）。
+- CLI 启动时的资格检查直连 `www.googleapis.com` 的 userinfo，所以 CLI 需要一个真的 Google token。用同一个 refresh token 以 `openid userinfo.email userinfo.profile` 换出的**受限令牌**就够：它调不了 Cloud Code。CLI 拿受限令牌、relay 换上全权限令牌，实测 6 个模型都通。
+- 每次 HOME 只需要 `.gemini/antigravity-cli/antigravity-oauth-token`；数据共享开关在 Google 服务端（登录时已关），print 模式不需要 onboarding。
+- 上游请求体的 `model` 就是 CLI 的模型 id；标题生成是 `gemini-3.5-flash-lite`（`requestType: checkpoint`）。
+
+数据流：
+
+1. **账号**：`gemini_oauth_accounts`（0307），refresh/access token 用 `loadKmsKey` AES-GCM 加密。接入走管理接口 `POST /api/admin/antigravity-accounts/auth/start|complete`（PKCE，与 CLI 同一个同意页），或运维脚本 `packages/commercial/scripts/antigravity-import-account.ts`（导入宿主机上已登录 CLI 的 token 文件）。client secret 是 1.3.4 二进制内嵌的 installed-app secret，放在 master/egress env `OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET`。
+2. **准入**（master，userChatBridge）：authority 必须是 `antigravity` 引擎 → 余额 > 0 → 选账号 → 签受限令牌 → 签 route（Redis，只存 token 的 sha256；绑定容器/用户/requestId/模型/账号/准入预算）→ 帧里带 `__oc_antigravity_route {baseUrl, routeToken, accessToken, accessTokenExpiresAt, idToken?}`，客户端同名字段一律剥掉。
+3. **容器**（gateway）：`_buildSafeAntigravityRouteOverride` 逐字段校验 → adapter 把受限令牌写进本次 HOME 的 token 文件（0600，refresh_token 为空），设 `CLOUD_CODE_URL=<route>`。CLI 的请求打到 gateway 的 loopback relay，去掉 CLI 的 Authorization / x-goog-api-key / cookie，换成容器 token 转给 master/egress。
+4. **relay**（`internalAntigravityRelay`，master 与 egress 都挂）：校验容器身份和 route；只放行 CLI 实际调用的 8 个方法；生成调用只放行该模型的 CLI id 和标题模型；按已计量费用 ≥ 准入预算时拒绝新调用（402）；注入账号全权限令牌转给 daily-cloudcode-pa；流结束前把 `usageMetadata` 写进 `antigravity_relay_usage`。
+5. **结算**：adapter 只发状态（`external_billing`，engine=antigravity）。bridge 收到后按 `(request_id, user_id)` 汇总 relay 记的用量，按回合模型的目录价结算（`settleUsageAndLedger`，`usage_records` 唯一键保证幂等）；非 success 或无输出不扣（预算触顶按 success 结算已用部分）。
+6. **账号调度**：与 OCV5-424 约定，账号池的统一调度策略由 424 实现。在那之前用 `account-pool/antigravityPoolInterim.ts`（`TODO(OCV5-424)`，数值与 424 的 DEFAULT_POLICY 一致）：429 按 Retry-After 冷却（15 秒到 15 分钟），认证失败按 5 分钟×2^n 冷却（上限 6 小时），从不写 `disabled`，冷却到期自动半开，没有自己的定时器。**必做后续**：424 合入后改成 `classifyHttpOutcome + decide`，并在 registry 注册 `probe = refresh 成功`。
+7. **镜像**：`OC_INCLUDE_ANTIGRAVITY=1`（`deploy/v5-selfhost/runtime-build.env`）把钉死 sha512 的 1.3.4 装到 `/usr/local/bin/antigravity`，放在 base 阶段末尾，不使上面的大层缓存失效。
+
+已知缺口：
+
+- 回合结束前桥断开（浏览器关闭、master 重启），relay 已记的用量不会结算，路由也只在清理时失效。与 zcode 现状相同；补一个按 `antigravity_relay_usage` 找未结算 requestId 的对账任务列为后续。
+- 一个回合内所有调用（含标题）按回合模型的价格计。
+- 受限令牌在容器里可被 yolo 工具读到，只能读账号的邮箱和头像；CLI 在回合中途若重新做资格检查且令牌已过期（签发时保证 ≥20 分钟余量），回合会以认证失败结束。
+- 迁移 0307 扩 `model_catalog` 的 engine CHECK（先 DROP 再 ADD），按个人版迁移门属于破坏性 DDL，发布需要 `OC_V5_ALLOW_BREAKING_MIGRATION=1` 或发布前人工 apply，并需要用户批准。
 
 ## 8. 证据
 

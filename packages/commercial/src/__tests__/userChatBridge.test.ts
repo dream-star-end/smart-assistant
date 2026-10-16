@@ -3526,6 +3526,55 @@ describe("Cursor external authority regression tripwire", () => {
     assert.match(source, /isZcodeModel\(authorityModelForFrame\)/);
   });
 
+  test("OCV5-415: Antigravity admission gates on authority and balance before minting; settle reads relay rows", async () => {
+    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    const start = source.indexOf("if (isAntigravityInboundFrame && containerId !== undefined)");
+    const end = source.indexOf("if (isZcodeInboundFrame && containerId !== undefined)", start);
+    assert.notEqual(start, -1);
+    assert.ok(end > start);
+    const branch = source.slice(start, end);
+    assert.match(branch, /authorityExec\.engine !== 'antigravity'/);
+    assert.match(branch, /isAntigravityEngineModel\(modelCapture\)/);
+    assert.match(branch, /if \(spendable <= 0n\)/);
+    assert.ok(
+      branch.indexOf("if (spendable <= 0n)") < branch.indexOf("deps.admitAntigravityTurn("),
+      "balance gate must precede account/route admission",
+    );
+    // Master-owned fields are written after the spread so a browser cannot forge them.
+    assert.match(branch, /\.\.\.enriched,[\s\S]*?_creditBudget: spendable\.toString\(\),[\s\S]*?__oc_antigravity_route:/);
+    assert.match(branch, /budgetCredits: spendable/);
+    assert.doesNotMatch(branch, /isCursorCredentialMember|insertPendingZcodeAudit/);
+    // Client copies of the route field are stripped.
+    assert.match(source, /"__oc_antigravity_route",/);
+    assert.match(source, /const \{ __oc_antigravity_route: _discard, \.\.\.withoutAntigravityRoute \} = sanitizedParsed;/);
+    // The durable turn row is written before the frame reaches the container.
+    assert.ok(
+      branch.indexOf("await recordAntigravityTurn(") < branch.indexOf("forwardPreparedFrame("),
+      "turn row must exist before the container can spend",
+    );
+    assert.match(branch, /reconcileStaleAntigravityTurns\(/);
+    // Settlement claims the durable row (works on a reconnected bridge) and
+    // uses the relay's metered rows, never the container-reported usage.
+    const settleStart = source.indexOf("external.engine === 'antigravity'");
+    assert.notEqual(settleStart, -1);
+    const settle = source.slice(settleStart, source.indexOf("external.engine === 'cursor'", settleStart));
+    assert.match(settle, /settleAntigravityTurnRecord\(/);
+    assert.doesNotMatch(settle, /usage,/);
+    assert.match(settle, /if \(pricing\) \{/);
+    assert.doesNotMatch(settle, /if \(relay && pricing\)/);
+  });
+
+  test("OCV5-415: a closing bridge keeps Antigravity routes alive; the terminal frame expires them by requestId", async () => {
+    const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
+    // Live 2026-10-15: expiring routes on browser reconnect made the running CLI 404 ROUTE_EXPIRED.
+    const close = source.slice(source.indexOf("inflightCodexTurns.clear();"), source.indexOf("admittedDispatches.clear();"));
+    assert.match(close, /pendingAntigravityRelays\.clear\(\);/);
+    assert.doesNotMatch(close, /expireAntigravityRoute/);
+    const settleStart = source.indexOf("external.engine === 'antigravity'");
+    const settle = source.slice(settleStart, source.indexOf("settleAntigravityTurnRecord(", settleStart));
+    assert.match(settle, /deps\.expireAntigravityRouteForRequest\?\.\(requestId\)/);
+  });
+
   test("OCV5-92: every base engine inbound carries a master-owned _creditBudget and ZCode gates on balance", async () => {
     const source = await readFile(new URL("../ws/userChatBridge.ts", import.meta.url), "utf8");
 

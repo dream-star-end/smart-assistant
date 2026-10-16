@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { modelSupportsThinking } from "../../thinking.js";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -10,6 +11,9 @@ import {
   isMoonshotKimiK3Model,
   isCapabilityZeroStaticModel,
   isOpencodeGoModel,
+  OPENCODE_GO_CHAT_MODEL_IDS,
+  OPENCODE_GO_RESPONSES_MODEL_IDS,
+  OPENCODE_GO_MESSAGES_MODEL_IDS,
   isOpencodeQwenModel,
   isScnetGlmModel,
   isZaiGlm53Model,
@@ -222,3 +226,57 @@ describe("staticKeyModels — snapshot 漂移守护(CCB-owned)", () => {
   expect(getStaticModelContextWindow('gemini-4-argon-contributor')).toBe(1000000);
   expect(isOpencodeGoModel('gemini-4-argon')).toBe(false);
  });
+
+describe("OCV5-425 OpenCode Go /messages models (CCB fallback)", () => {
+  test("the CCB id list mirrors protocol OPENCODE_GO_MESSAGES_MODELS", async () => {
+    const protocol = await import("../../../../../packages/protocol/src/staticKeyProviders.ts");
+    expect([...OPENCODE_GO_MESSAGES_MODEL_IDS].sort()).toEqual(
+      Object.keys(protocol.OPENCODE_GO_MESSAGES_MODELS).sort(),
+    );
+    expect([...OPENCODE_GO_CHAT_MODEL_IDS].sort()).toEqual(
+      Object.keys(protocol.OPENCODE_GO_CHAT_MODELS).sort(),
+    );
+    expect([...OPENCODE_GO_RESPONSES_MODEL_IDS].sort()).toEqual(
+      Object.keys(protocol.OPENCODE_GO_RESPONSES_MODELS).sort(),
+    );
+    for (const id of OPENCODE_GO_RESPONSES_MODEL_IDS) {
+      expect(isOpencodeGoModel(id)).toBe(true);
+      expect(modelSupportsThinking(id)).toBe(false);
+    }
+    expect(getStaticModelContextWindow("opencode-grok-4.7")).toBe(200_000);
+    expect(getStaticModelContextWindow("opencode-gpt-6-luna")).toBe(272_000);
+    expect(getStaticModelContextWindow("muse-spark-1.3-go")).toBe(1_048_576);
+  });
+
+  test("chat bridge models: capability-zero, no Anthropic thinking, catalog windows", () => {
+    for (const id of OPENCODE_GO_CHAT_MODEL_IDS) {
+      expect(isOpencodeGoModel(id)).toBe(true);
+      expect(isCapabilityZeroStaticModel(id)).toBe(true);
+      expect(modelSupportsThinking(id)).toBe(false);
+    }
+    expect(getStaticModelContextWindow("hy3-go")).toBe(192_000);
+    expect(getStaticModelContextWindow("kimi-k2.7-code-go")).toBe(262_144);
+    expect(getStaticModelContextWindow("mimo-v2.6-pro-go")).toBe(1_048_576);
+    expect(getStaticModelContextWindow("glm-5.3-go")).toBe(1_000_000);
+    expect(isOpencodeGoModel("glm-5.3")).toBe(false);
+  });
+
+  test("capability-zero Go models; thinking except Claude Haiku; windows capped at the price tier", () => {
+    for (const id of OPENCODE_GO_MESSAGES_MODEL_IDS) {
+      expect(isOpencodeGoModel(id)).toBe(true);
+      expect(isCapabilityZeroStaticModel(id)).toBe(true);
+      expect(modelSupportsThinking(id)).toBe(id !== "claude-haiku-5-5-go");
+    }
+    expect(getStaticModelContextWindow("claude-haiku-5-5-go")).toBe(100_000);
+    expect(getStaticModelContextWindow("minimax-m3-go")).toBe(200_000);
+    expect(getStaticModelContextWindow("qwen3.7-plus-go")).toBe(200_000);
+    expect(getStaticModelContextWindow("minimax-m2.7-go")).toBe(204_800);
+    expect(getStaticModelContextWindow("qwen3.8-max-go")).toBe(262_144);
+    expect(getStaticModelContextWindow("kimi-k3-go")).toBe(1_048_576);
+    expect(getStaticModelContextWindow("deepseek-v4-pro-go")).toBe(1_000_000);
+    expect(getStaticModelContextWindow("qwen3.8-flash-go")).toBe(1_000_000);
+    // bare names keep their own providers' rows
+    expect(isOpencodeGoModel("kimi-k3")).toBe(false);
+    expect(getStaticModelContextWindow("deepseek-v4-pro")).toBe(1_000_000);
+  });
+});

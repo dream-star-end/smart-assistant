@@ -88,11 +88,14 @@ MODEL_AUTHORITY_DEPLOY_ROLE="${PG_ROLE}_model_deploy"
 REDIS_URL="redis://127.0.0.1:6379/3"
 # Runtime image pin. Rebuild with:
 #   OC_FLAVOR=selfhost OC_RUNTIME_SOURCE_COMMIT=$(git rev-parse HEAD) \
-#     packages/commercial/agent-sandbox/build-image.sh v5-cli-cc2280-codex01592-grok1013-zcode381-slim
-# which sources deploy/v5-selfhost/runtime-build.env (OC_INCLUDE_ZCODE=1).
+#     packages/commercial/agent-sandbox/build-image.sh v5-cli-cc2280-codex01592-grok1013-zcode381-agy134-slim
+# which sources deploy/v5-selfhost/runtime-build.env (OC_INCLUDE_ZCODE=1, OC_INCLUDE_ANTIGRAVITY=1).
 # cc2280 = official Claude Code 2.1.280 (recognizes claude-opus-5-5). The
 # previous tag stays on the 2.1.278 image so a tuple flip can roll back.
-RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2280-codex01592-grok1013-zcode381-slim"
+# agy134 (OCV5-415) = patch of the v5-cli-cc2280-codex01592-grok1013-zcode381-slim image that adds the official
+# Antigravity CLI 1.3.4 (same RUN block as Dockerfile.openclaude-runtime, sha512-pinned);
+# the previous tag stays for rollback.
+RUNTIME_IMAGE="openclaude/openclaude-runtime:v5-cli-cc2280-codex01592-grok1013-zcode381-agy134-slim"
 SECRETS_ENV="/etc/openclaude/secrets.env"
 PERSONAL_UNIT="openclaude.service"
 PERSONAL_PORT="18789"
@@ -2023,10 +2026,30 @@ user_contract_gate() {
   local password_file=/etc/openclaude/selfhost-canary.password
   [[ -f "$password_file" && -r "$password_file" && -s "$password_file" ]] \
     || { echo "FATAL: user contract canary password missing/unreadable/empty: $password_file" >&2; return 1; }
+  # OCV5-429: the cutover may recycle the canary container onto the new runtime tuple (or it was
+  # idle-swept); its cold start outlasts C2's 20s window. Warm it first (same UI login, no message,
+  # wait for relay_ready). Not part of the verdict: a prewarm that never gets ready only warns.
+  V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
+    V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
+    V5_CANARY_PASSWORD_FILE="$password_file" \
+    node "$SCRIPT_DIR/v5-user-contract-prewarm.mjs" \
+    || echo "  ⚠ canary 预热未就绪,门禁照跑(由 C1–C3 判定)" >&2
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
     V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
     V5_CANARY_PASSWORD_FILE="$password_file" V5_CONTRACT_COST=live \
-    node "$SCRIPT_DIR/v5-user-contract-smoke.mjs"
+    node "$SCRIPT_DIR/v5-user-contract-smoke.mjs" || return 1
+  # OCV5-432: a real multi-turn OpenCode Go chat must read the upstream prompt cache
+  # (INC-20261015-GO-CACHE-PREFIX wrote the whole prompt every request and read 0).
+  V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
+    V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
+    V5_CANARY_PASSWORD_FILE="$password_file" \
+    node "$SCRIPT_DIR/v5-go-cache-contract.mjs" || return 1
+  # OCV5-435: a Stop sent while the turn's engine is still starting must stop that turn
+  # (INC-20261015-PRESTART-STOP-LOST answered it TURN_NOT_ACTIVE and the turn ran unseen).
+  V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
+    V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
+    V5_CANARY_PASSWORD_FILE="$password_file" \
+    node "$SCRIPT_DIR/v5-stop-before-start-contract.mjs"
 }
 
 cmd_smoke() {
@@ -2346,7 +2369,7 @@ cutover_smoke_against_release() { # <rel>
     cutover_clog "  ✓ egress 双槽拓扑一致:active=$want"
   fi
   # Must pass before either branch persists phase=smoked (survivor invariant).
-  user_contract_gate || { cutover_fail "cutover smoke: 用户契约门禁(C1–C3)失败"; return 1; }
+  user_contract_gate || { cutover_fail "cutover smoke: 用户契约门禁(C1–C3 + G1 Go 缓存)失败"; return 1; }
 }
 
 cutover_smoke_healthz_only() {

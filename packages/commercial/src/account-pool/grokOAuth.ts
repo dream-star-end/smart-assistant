@@ -3,6 +3,8 @@ import type { Pool } from 'pg'
 import { request, type Dispatcher } from 'undici'
 import { getPool } from '../db/index.js'
 import { directEgressDispatcher } from './egressDispatcher.js'
+import { AccountHealthTracker, InMemoryHealthRedis } from './health.js'
+import type { PoolOutcome } from './policy/outcome.js'
 import {
   getGrokTokenSnapshotInTx,
   updateGrokTokenSnapshotInTx,
@@ -35,6 +37,8 @@ export async function getFreshGrokAccessToken(
     pool?: Pick<Pool, 'connect'>
     getSnapshot?: typeof getGrokTokenSnapshotInTx
     updateSnapshot?: typeof updateGrokTokenSnapshotInTx
+    /** OCV5-424:终态 OAuth 失败交共享策略(默认 auth 冷却 + 自动探测)。测试可注入。 */
+    reportOutcome?: (accountId: bigint | string, outcome: PoolOutcome, errorMsg: string) => Promise<unknown>
   } = {},
 ): Promise<Buffer> {
   const client = await (deps.pool ?? getPool()).connect()
@@ -105,12 +109,12 @@ export async function getFreshGrokAccessToken(
   } catch (err) {
     try { await client.query('ROLLBACK') } catch {}
     if (err instanceof GrokOAuthRefreshError && err.terminal) {
-      await client.query(
-        `UPDATE claude_accounts
-            SET status = 'disabled', last_error = $2, updated_at = NOW()
-          WHERE id = $1 AND provider = 'grok'`,
-        [String(accountId), err.message],
-      ).catch(() => {})
+      // OCV5-424:终态 OAuth 失败不再写 disabled;交共享策略进 auth 冷却,到期自动探测。
+      const report =
+        deps.reportOutcome ??
+        ((id: bigint | string, outcome: PoolOutcome, errorMsg: string) =>
+          new AccountHealthTracker({ redis: new InMemoryHealthRedis() }).applyOutcome(id, outcome, { errorMsg }))
+      await report(accountId, { kind: 'auth_invalid', detail: 'grok_oauth_terminal' }, err.message).catch(() => {})
     }
     throw err
   } finally {

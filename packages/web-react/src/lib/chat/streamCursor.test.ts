@@ -56,7 +56,10 @@ describe("OCV5-178 idle cursor registration", () => {
     dispatch({ type: "outbound.resume_failed", channel: "webchat", peer: { id, kind: "dm" },
       sessionKey: key, from: 401, to: 0, reason: "no_buffer" });
     hydrate(); hydrate(); hydrate();
-    expect(send).toHaveBeenCalledTimes(2);
+    // OCV5-430: the session is already registered on this socket and the
+    // no_buffer reply was that registration's cursor arbitration; a second
+    // idle hello from cursor 0 would only make the gateway re-peek its ring.
+    expect(send).toHaveBeenCalledTimes(1);
   });
   test("failed registration remains retryable and idle does not consume active candidates", () => {
     const { socket, hydrate, send } = setup();

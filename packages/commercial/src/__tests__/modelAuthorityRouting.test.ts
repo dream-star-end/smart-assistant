@@ -403,9 +403,15 @@ describe("能力上限:catalog capability ⊆ provider 机制上限", () => {
     // 每个静态 provider 的每个 inbound 模型:providerCapabilityCeiling(spec) 得到的 effort 上限
     // 必须与 modelReasoningPolicy(modelId).supported 完全一致(后者是 per-model 入口,前者是
     // per-provider 机制上限 —— 现网所有模型都恰好取满机制上限,故应逐项相等)。
+    // OCV5-425: the ceiling is per upstream model (modelOutputConfigEfforts), so it is taken
+    // with the same upstream id modelReasoningPolicy resolves.
     for (const spec of STATIC_KEY_PROVIDERS) {
-      const ceiling = providerCapabilityCeiling({ kind: "static", provider: spec });
       for (const modelId of spec.inboundModelIds) {
+        const ceiling = providerCapabilityCeiling({
+          kind: "static",
+          provider: spec,
+          upstreamModel: spec.upstreamModelForRequest?.(modelId) ?? modelId,
+        });
         const policy = modelReasoningPolicy(modelId);
         const expected = ceiling.efforts === null ? null : [...ceiling.efforts];
         const actual = [...policy.supported];

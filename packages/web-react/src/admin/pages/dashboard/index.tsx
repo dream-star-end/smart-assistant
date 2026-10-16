@@ -264,9 +264,9 @@ export default function DashboardPage() {
           icon={CheckCircle2}
           loading={first}
         />
-        <ClickableCard onClick={() => navigate('accounts')} label="查看账号池">
+        <ClickableCard onClick={() => navigate('pools')} label="查看服务池">
           <StatCard
-            label="账号池可用"
+            label="订阅账号可用"
             value={poolAvail}
             hint={
               d?.pool
@@ -502,8 +502,8 @@ export default function DashboardPage() {
               : '按状态分布'
           }
           action={
-            <Button variant="link" size="sm" onClick={() => navigate('accounts')}>
-              账号池 →
+            <Button variant="link" size="sm" onClick={() => navigate('pools')}>
+              服务池 →
             </Button>
           }
           height={240}

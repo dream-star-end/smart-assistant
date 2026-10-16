@@ -139,6 +139,67 @@ test('request maps system/tools/options and native signed tool replay without mu
   assert.ok(!('metadata' in native))
 })
 
+test('role:system messages from CCB join systemInstruction in order (OCV5-423 live 400)', () => {
+  // Shape of a real platform first request: top-level system blocks with
+  // cache_control, then a user turn and an inline platform-context system
+  // message. Before the fix every such request failed locally with
+  // "unsupported Gemini message role" and never reached Google.
+  const body = {
+    model: GEMINI_GO_MODEL,
+    max_tokens: 32000,
+    thinking: { type: 'adaptive' },
+    context_management: { edits: [] },
+    output_config: { effort: 'medium' },
+    system: [
+      { type: 'text', text: 'billing header' },
+      { type: 'text', text: 'static platform prompt', cache_control: { type: 'ephemeral' } },
+    ],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'hello' }] },
+      {
+        role: 'system',
+        content: [{ type: 'text', text: 'session context', cache_control: { type: 'ephemeral' } }],
+      },
+      { role: 'user', content: 'and again' },
+    ],
+  }
+  const before = structuredClone(body)
+  const out = anthropicToGemini(body)
+  assert.deepEqual(body, before)
+  assert.deepEqual(out.systemInstruction, {
+    parts: [
+      { text: 'billing header' },
+      { text: 'static platform prompt' },
+      { text: 'session context' },
+    ],
+  })
+  // Only conversation turns remain; the two user turns around the system message merge.
+  assert.deepEqual(out.contents, [
+    { role: 'user', parts: [{ text: 'hello' }, { text: 'and again' }] },
+  ])
+  assert.deepEqual(
+    anthropicToGemini({
+      ...input,
+      messages: [{ role: 'system', content: 'only context' }, ...input.messages],
+    }).systemInstruction,
+    {
+      parts: [{ text: 'only context' }],
+    },
+  )
+  assert.throws(
+    () =>
+      anthropicToGemini({
+        ...input,
+        messages: [...input.messages, { role: 'system', content: [{ type: 'image' }] }],
+      }),
+    /unsupported Gemini system content/,
+  )
+  assert.throws(
+    () => anthropicToGemini({ ...input, messages: [{ role: 'tool', content: 'x' }] }),
+    /unsupported Gemini message role/,
+  )
+})
+
 test('foreign tool history is explicit rejection, not a fabricated Google signature', () => {
   assert.throws(
     () =>
@@ -357,4 +418,278 @@ test('canceling converted body cancels native reader without a background consum
   )
   await r.body!.cancel()
   assert.equal(canceled, true)
+})
+
+// OCV5-423 live: official Claude Code WebSearch sends a side request whose only
+// tool is Anthropic's server web_search; the bridge rejected it locally (400).
+const webSearchBody = {
+  model: GEMINI_GO_MODEL,
+  max_tokens: 32000,
+  system: [{ type: 'text', text: 'You are an assistant for performing a web search tool use' }],
+  messages: [
+    {
+      role: 'user',
+      content: [{ type: 'text', text: 'Perform a web search for the query: opencode go pricing' }],
+    },
+  ],
+  tools: [
+    {
+      type: 'web_search_20250305',
+      name: 'web_search',
+      max_uses: 8,
+      blocked_domains: ['spam.example'],
+    },
+  ],
+  tool_choice: { type: 'auto' },
+}
+
+test('server web_search maps to Google Search grounding; other server tools still fail closed', () => {
+  const out = anthropicToGemini(webSearchBody)
+  assert.deepEqual(out.tools, [{ googleSearch: {} }])
+  assert.equal(out.toolConfig, undefined)
+  const forced = anthropicToGemini({
+    ...webSearchBody,
+    tool_choice: { type: 'tool', name: 'web_search' },
+  })
+  assert.deepEqual(forced.tools, [{ googleSearch: {} }])
+  assert.equal(forced.toolConfig, undefined)
+  const mixed = anthropicToGemini({
+    ...webSearchBody,
+    tools: [...webSearchBody.tools, { name: 'echo', input_schema: { type: 'object' } }],
+  })
+  assert.deepEqual(mixed.tools, [
+    { googleSearch: {} },
+    { functionDeclarations: [{ name: 'echo', parametersJsonSchema: { type: 'object' } }] },
+  ])
+  assert.deepEqual(mixed.toolConfig, { functionCallingConfig: { mode: 'AUTO' } })
+  assert.throws(
+    () =>
+      anthropicToGemini({
+        ...webSearchBody,
+        tools: [{ type: 'web_fetch_20250910', name: 'web_fetch' }],
+      }),
+    /unsupported Gemini tool declaration/,
+  )
+})
+
+test('grounded answer streams text then server_tool_use + web_search_tool_result with resolved links', async () => {
+  const redirect = (n: number) =>
+    `https://vertexaisearch.cloud.google.com/grounding-api-redirect/r${n}`
+  const sse = wire([
+    { candidates: [{ content: { parts: [{ text: 'OpenCode Go costs ' }] } }] },
+    {
+      candidates: [
+        {
+          content: { parts: [{ text: '$10 per month.' }] },
+          finishReason: 'STOP',
+          groundingMetadata: {
+            webSearchQueries: ['opencode go pricing'],
+            groundingChunks: [
+              { web: { uri: redirect(1), title: 'opencode.ai' } },
+              { web: { uri: redirect(2), title: 'spam.example' } },
+              { web: { uri: redirect(3), title: 'docs.example.org' } },
+            ],
+          },
+        },
+      ],
+      usageMetadata: usage,
+    },
+  ])
+  const seen: string[] = []
+  const fetchStub = (async (url: string | URL | Request, init?: RequestInit) => {
+    const u = String(url)
+    seen.push(`${init?.method ?? 'GET'} ${u}`)
+    if (u === GEMINI_GO_ENDPOINT) {
+      const sent = JSON.parse(String(init?.body))
+      assert.deepEqual(sent.tools, [{ googleSearch: {} }])
+      return new Response(sse, { headers: { 'content-type': 'text/event-stream' } })
+    }
+    if (u === redirect(1))
+      return new Response(null, {
+        status: 302,
+        headers: { location: 'https://opencode.ai/docs/go/' },
+      })
+    if (u === redirect(2))
+      return new Response(null, {
+        status: 302,
+        headers: { location: 'https://www.spam.example/x' },
+      })
+    throw new Error('network down') // redirect(3) stays unresolved, still usable
+  }) as typeof fetch
+  const r = await createGeminiGoFetch(fetchStub)('https://unused.invalid/messages', {
+    method: 'POST',
+    headers: { 'x-api-key': 'fixture-key', 'x-opencode-session': 's' },
+    body: JSON.stringify(webSearchBody),
+  })
+  assert.equal(r.status, 200)
+  const events = parse(await r.text())
+  const starts = events
+    .filter((e) => e.type === 'content_block_start')
+    .map((e) => e.content_block as Record<string, unknown>)
+  assert.deepEqual(
+    starts.map((b) => b.type),
+    ['text', 'server_tool_use', 'web_search_tool_result'],
+  )
+  const toolUse = starts[1]!
+  assert.match(toolUse.id as string, /^srvtoolu_g4_/)
+  assert.equal(toolUse.name, 'web_search')
+  const queryDelta = events.find(
+    (e) =>
+      e.type === 'content_block_delta' &&
+      (e.delta as Record<string, unknown>).type === 'input_json_delta',
+  )!
+  assert.deepEqual(JSON.parse((queryDelta.delta as Record<string, string>).partial_json!), {
+    query: 'opencode go pricing',
+  })
+  const result = starts[2]!
+  assert.equal(result.tool_use_id, toolUse.id)
+  // blocked_domains drops the spam result; the unresolved redirect keeps its link.
+  assert.deepEqual(result.content, [
+    {
+      type: 'web_search_result',
+      title: 'opencode.ai',
+      url: 'https://opencode.ai/docs/go/',
+      encrypted_content: '',
+      page_age: null,
+    },
+    {
+      type: 'web_search_result',
+      title: 'docs.example.org',
+      url: redirect(3),
+      encrypted_content: '',
+      page_age: null,
+    },
+  ])
+  const indexes = events.filter((e) => e.type === 'content_block_start').map((e) => e.index)
+  assert.deepEqual(indexes, [0, 1, 2])
+  assert.equal((events.at(-2)!.delta as Record<string, unknown>).stop_reason, 'end_turn')
+  assert.equal(seen.filter((s) => s.startsWith('HEAD ')).length, 3)
+})
+
+test('a grounded request that did not search emits no search blocks', async () => {
+  const sse = wire([
+    {
+      candidates: [
+        {
+          content: { parts: [{ text: 'No search needed.' }] },
+          finishReason: 'STOP',
+          groundingMetadata: {},
+        },
+      ],
+      usageMetadata: usage,
+    },
+  ])
+  const r = await createGeminiGoFetch((async () => new Response(sse)) as typeof fetch)('x', {
+    method: 'POST',
+    headers: { 'x-api-key': 'fixture-key' },
+    body: JSON.stringify(webSearchBody),
+  })
+  const types = parse(await r.text())
+    .filter((e) => e.type === 'content_block_start')
+    .map((e) => (e.content_block as Record<string, unknown>).type)
+  assert.deepEqual(types, ['text'])
+})
+
+test("a follow-up turn accepts the bridge's own search output as history (Codex r1 P1)", async () => {
+  const sse = wire([
+    {
+      candidates: [
+        {
+          content: { parts: [{ text: 'OpenCode Go costs $10 per month.' }] },
+          finishReason: 'STOP',
+          groundingMetadata: {
+            webSearchQueries: ['opencode go pricing'],
+            groundingChunks: [{ web: { uri: 'https://opencode.ai/go', title: 'opencode.ai' } }],
+          },
+        },
+      ],
+      usageMetadata: usage,
+    },
+  ])
+  const sent: Record<string, unknown>[] = []
+  const fetchStub = (async (_url: string | URL | Request, init?: RequestInit) => {
+    sent.push(JSON.parse(String(init?.body)))
+    return new Response(
+      sent.length === 1
+        ? sse
+        : wire([
+            {
+              candidates: [{ content: { parts: [{ text: 'It is $10.' }] }, finishReason: 'STOP' }],
+              usageMetadata: usage,
+            },
+          ]),
+    )
+  }) as typeof fetch
+  const bridge = createGeminiGoFetch(fetchStub)
+  const first = await bridge('x', {
+    method: 'POST',
+    headers: { 'x-api-key': 'k' },
+    body: JSON.stringify(webSearchBody),
+  })
+  // Rebuild the assistant message exactly as an Anthropic SDK client accumulates it.
+  const blocks: Record<string, unknown>[] = []
+  for (const e of parse(await first.text())) {
+    if (e.type === 'content_block_start')
+      blocks.push({ ...(e.content_block as Record<string, unknown>) })
+    if (e.type === 'content_block_delta') {
+      const d = e.delta as Record<string, string>
+      const b = blocks[e.index as number]!
+      if (d.type === 'text_delta') b.text = `${b.text as string}${d.text}`
+      if (d.type === 'input_json_delta') b.input = JSON.parse(d.partial_json!)
+    }
+  }
+  assert.deepEqual(
+    blocks.map((b) => b.type),
+    ['text', 'server_tool_use', 'web_search_tool_result'],
+  )
+  const followUp = {
+    ...webSearchBody,
+    messages: [
+      ...webSearchBody.messages,
+      { role: 'assistant', content: JSON.parse(JSON.stringify(blocks)) },
+      { role: 'user', content: 'Which page did that price come from?' },
+    ],
+  }
+  const second = await bridge('x', {
+    method: 'POST',
+    headers: { 'x-api-key': 'k' },
+    body: JSON.stringify(followUp),
+  })
+  assert.equal(second.status, 200)
+  assert.equal(sent.length, 2, 'the follow-up reaches Google instead of failing locally')
+  const model = (sent[1]!.contents as Record<string, unknown>[])[1]!
+  assert.equal(model.role, 'model')
+  assert.deepEqual(model.parts, [
+    { text: 'OpenCode Go costs $10 per month.' },
+    { text: '[Web search results]\n- opencode.ai: https://opencode.ai/go' },
+  ])
+  // An error result is kept as a short note, not a rejection.
+  const failed = anthropicToGemini({
+    ...input,
+    messages: [
+      ...input.messages,
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: 'srvtoolu_x',
+            content: { type: 'web_search_tool_result_error', error_code: 'max_uses_exceeded' },
+          },
+        ],
+      },
+      { role: 'user', content: 'ok' },
+    ],
+  })
+  assert.deepEqual((failed.contents as Record<string, unknown>[])[1]!.parts, [
+    { text: '[Web search failed: max_uses_exceeded]' },
+  ])
+  assert.throws(
+    () =>
+      anthropicToGemini({
+        ...input,
+        messages: [{ role: 'user', content: [{ type: 'web_search_tool_result', content: [] }] }],
+      }),
+    /unsupported Gemini Go block: web_search_tool_result/,
+  )
 })

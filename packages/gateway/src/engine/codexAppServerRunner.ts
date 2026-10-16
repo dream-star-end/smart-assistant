@@ -38,6 +38,8 @@ import {
   type GoalStateSnapshot,
   type ToolTerminationReason,
   type TurnTokenUsageSnapshot,
+  CODEX_EXPLICIT_STANDARD_MODELS,
+  CODEX_STANDARD_SERVICE_TIER,
   codexTransportModelId,
   isToolExitCode,
   turnErrorSemantics,
@@ -1116,6 +1118,14 @@ export class CodexAppServerRunner extends EventEmitter {
    * websocket/relay 死掉的 PID。置位后下一 ensureSpawned 必须 recycle。
    */
   private staleProcGeneration = false
+  /**
+   * OCV5-435: a Stop that arrives while a queued/starting turn has no turn id
+   * yet (spawn, thread/start|resume, before turn/start answers). It used to be
+   * dropped, so the turn ran to completion. runTurn consumes it: before
+   * turn/start the turn ends as USER_CANCELLED without starting; once the id
+   * arrives it is interrupted at once. Cleared when runTurn returns.
+   */
+  private pendingStartInterrupt = false
   /** True iff the *current* app-server proc has done thread/start or
    *  thread/resume for this.threadId. Cleared when the proc dies. Distinct
    *  from `initialized` (which tracks the JSON-RPC handshake) — re-spawning
@@ -1662,6 +1672,10 @@ export class CodexAppServerRunner extends EventEmitter {
     }
     const hadPendingUserInput = this.pendingUserInputs.size > 0
     if (hadPendingUserInput) this.settleAllPendingUserInputs('runner interrupt')
+    if (!this.activeTurnId && (this.processing || this.queue.length > 0)) {
+      this.pendingStartInterrupt = true
+      return true
+    }
     if (!this.proc || this.proc.killed) return hadPendingUserInput
     if (!this.threadId || !this.activeTurnId) return hadPendingUserInput
     void this.sendRequest('turn/interrupt', {
@@ -2994,6 +3008,12 @@ export class CodexAppServerRunner extends EventEmitter {
     }
     if (this.codexTransportModel()) params.model = this.codexTransportModel()
     if (this.opts.structuredOutputSchema) params.outputSchema = this.opts.structuredOutputSchema
+    // OCV5-434: no Fast on Codex (the backend ignores priority from our client; the user chose to
+    // hide it rather than impersonate Codex CLI). GPT-6 turns state an explicit standard tier so
+    // a catalog Fast default (GPT-6 Luna) never applies.
+    if (CODEX_EXPLICIT_STANDARD_MODELS.has(this.opts.model ?? '')) {
+      params.serviceTierForTurn = CODEX_STANDARD_SERVICE_TIER
+    }
     return params
   }
 
@@ -4190,6 +4210,23 @@ export class CodexAppServerRunner extends EventEmitter {
           this.currentTurnCompleter = { resolve, reject }
         })
 
+        if (this.pendingStartInterrupt) {
+          // OCV5-435: stopped before turn/start — never start it.
+          this.pendingStartInterrupt = false
+          this.currentTurnCompleter = null
+          void completed.catch(() => {})
+          this.emitResult({
+            durationMs: Date.now() - startedAt,
+            ok: false,
+            error: 'codex turn interrupted',
+            requestId,
+            rateLimits: this._consumeRateLimitsForEmit(),
+            stopReason: 'interrupted',
+            terminalCode: 'USER_CANCELLED',
+          })
+          return
+        }
+
         let tres: { turn?: { id?: string } } | undefined
         try {
           tres = (await this.sendRequest('turn/start', this.buildTurnStartParams(prompt))) as
@@ -4275,6 +4312,11 @@ export class CodexAppServerRunner extends EventEmitter {
           throw new Error('turn/start did not return turn.id')
         }
         this.activeTurnId = turnId
+        if (this.pendingStartInterrupt) {
+          // OCV5-435: stopped while turn/start was in flight — interrupt now.
+          this.pendingStartInterrupt = false
+          this.interrupt()
+        }
 
         const turn = await completed
 
@@ -4410,6 +4452,28 @@ export class CodexAppServerRunner extends EventEmitter {
       this.activeTurnId = null
       this.currentTurnCompleter = null
       const durationMs = Date.now() - startedAt
+      if (this.pendingStartInterrupt) {
+        // OCV5-442: the user stopped this turn before it had an id, and it then
+        // failed before starting — typically the gateway's shutdown escalation
+        // after the Stop grace while the app-server was still initializing. The
+        // outcome is the user's Stop, as in the "stopped before turn/start" branch.
+        this.pendingStartInterrupt = false
+        log.info('codex turn stopped before start', {
+          sessionKey: this.opts.sessionKey,
+          err: (err as Error).message,
+        })
+        this.emitResult({
+          durationMs,
+          ok: false,
+          error: 'codex turn interrupted',
+          usage: failedTurnUsage ? _codexUsageToAnthropicShape(failedTurnUsage) : undefined,
+          requestId,
+          rateLimits: this._consumeRateLimitsForEmit(),
+          stopReason: 'interrupted',
+          terminalCode: 'USER_CANCELLED',
+        })
+        return
+      }
       // turn-retry 批:catch 路径也结构化分类(非 unknown 才带 errorClass)。此路径
       // 覆盖 turn/start 拒绝但**不满足重试门**、attach/spawn 失败、mid-turn 异常等。
       const errMsg = `codex app-server: ${(err as Error).message}`
@@ -4435,6 +4499,7 @@ export class CodexAppServerRunner extends EventEmitter {
     } finally {
       this.currentCollabAgentPolicy = undefined
       this.activeRequestId = undefined
+      this.pendingStartInterrupt = false
     }
   }
 

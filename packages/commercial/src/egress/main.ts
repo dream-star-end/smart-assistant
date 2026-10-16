@@ -57,6 +57,12 @@ import {
   DEFAULT_MAX_CONCURRENT_PER_UID,
 } from "../http/anthropicProxy.js";
 import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProviderMeta.js";
+import {
+  apiKeyPoolConfiguredServices,
+  importEnvApiKeys,
+  primeApiKeyPool,
+  startApiKeyPoolCache,
+} from "../account-pool/apiKeyPool.js";
 import { BoxTextFetch } from "../http/proxy/boxTextFetch.js";
 import { boxInteractiveRunnerEnabled, type BoxInteractiveHostAsset } from "../http/proxy/boxTextPlan.js";
 import { loadBoxBridgeMod } from "@openclaude/gateway";
@@ -96,6 +102,12 @@ import { CODEX_RELAY_PREFIX } from "../http/internalCodexRelay.js";
 import { GROK_RELAY_PREFIX, makeGrokRelayHandler } from "../http/internalGrokRelay.js";
 import { ZCODE_RELAY_PREFIX, makeZcodeRelayHandler } from "../http/internalZcodeRelay.js";
 import { configureZcodeRelayKv, createIoredisZcodeRelayKv } from "../billing/zcodeRouteContext.js";
+import { ANTIGRAVITY_RELAY_PREFIX, makeAntigravityRelayHandler } from "../http/internalAntigravityRelay.js";
+import {
+  configureAntigravityModelCooldownStore,
+  createIoredisAntigravityModelCooldownStore,
+} from "../account-pool/antigravityModelCooldown.js";
+import { configureAntigravityRelayKv } from "../billing/antigravityRouteContext.js";
 import {
   buildCodexRelayHandler,
   buildCodexTokenRefreshHandler,
@@ -173,8 +185,12 @@ export async function startEgress(): Promise<void> {
       `[egress] bind 与 channel 期望不符:${bind}:${port}(期望 ${expectBind}:${expectPort}),拒启`,
     );
   }
-  // 平台默认模型 key 缺失 → loud fail(与 master 同款 guard)。
-  assertPlatformDefaultModelConfigured(cfg);
+  // 平台默认模型 key 缺失 → loud fail(与 master 同款 guard)。OCV5-424:服务池里已有
+  // 该 provider 的 key 也算已配置;读池失败(DB 未就绪)按"池为空"处理,仍由 env 决定。
+  await primeApiKeyPool().catch(() => {});
+  assertPlatformDefaultModelConfigured(cfg, {
+    apiKeyPoolConfigured: (service) => apiKeyPoolConfiguredServices().has(service),
+  });
 
   const redis = new IORedis(cfg.REDIS_URL, {
     lazyConnect: false,
@@ -182,6 +198,8 @@ export async function startEgress(): Promise<void> {
     enableReadyCheck: true,
   });
   configureZcodeRelayKv(createIoredisZcodeRelayKv(redis));
+  configureAntigravityRelayKv(createIoredisZcodeRelayKv(redis));
+  configureAntigravityModelCooldownStore(createIoredisAntigravityModelCooldownStore(redis));
   const pricing = new PricingCache();
   try {
     await pricing.load();
@@ -234,6 +252,11 @@ export async function startEgress(): Promise<void> {
     // 2026-08-04:阿里百炼 Token Plan(qwen3.8-max)，独立订阅独立 key。
     bailian: cfg.BAILIAN_TOKEN_PLAN_KEY,
   };
+  // OCV5-424:env key 幂等导入为各自服务池成员(source='env'),池快照后台保鲜。
+  await importEnvApiKeys(staticProviderKeys).catch((err) => {
+    console.warn("[egress] api-key pool env import failed:", (err as Error)?.message ?? err);
+  });
+  startApiKeyPoolCache();
 
   // ── 模型执行 catalog(模型权威批次 · 方案 §1.2/§4)────────────────────────────
   //
@@ -642,6 +665,11 @@ export async function startEgress(): Promise<void> {
     identityRepo,
     codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
   });
+  const antigravityRelayHandler = makeAntigravityRelayHandler({
+    identityRepo,
+    clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
+    pricing,
+  });
 
   const forward = makeForwarder({ controlBaseUrl });
 
@@ -756,6 +784,21 @@ export async function startEgress(): Promise<void> {
         zcodeRelayHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
       ).catch((err) => {
         log.error("zcode_relay_handler_threw", { err: (err as Error).message });
+        if (!res.headersSent) {
+          res.statusCode = 500;
+          res.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ error: { code: "INTERNAL", message: "egress handler error" } }));
+        } else {
+          try { res.destroy(); } catch { /* */ }
+        }
+      });
+      return;
+    }
+    if (path === ANTIGRAVITY_RELAY_PREFIX || path.startsWith(`${ANTIGRAVITY_RELAY_PREFIX}/`)) {
+      Promise.resolve(
+        antigravityRelayHandler(req, res, { hostUuid: selfHostUuid, boundIp: peerIp }),
+      ).catch((err) => {
+        log.error("antigravity_relay_handler_threw", { err: (err as Error).message });
         if (!res.headersSent) {
           res.statusCode = 500;
           res.setHeader("Content-Type", "application/json");
@@ -910,6 +953,7 @@ export async function startEgress(): Promise<void> {
         });
       },
       staticProviderKeys,
+      apiKeyPoolEnabled: true,
       getPhase6AccountUuidEnforce,
       getSessionPinMode,
       listEnabledAccountGroupsForModel: listEnabledGroupsForModel,

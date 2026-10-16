@@ -370,6 +370,11 @@ describe("internalServerAuthored handler — lossless v2 multipart", () => {
       (broadcasts[0]!.payload.meta as { reconcile?: string }).reconcile,
       "turn_completed",
     );
+    // OCV5-424: tape-commit finals are tagged so the client lets the live tail land first.
+    assert.equal(
+      (broadcasts[0]!.payload.meta as { reconcileSource?: string }).reconcileSource,
+      "tape_commit",
+    );
     assert.equal(broadcasts[0]!.payload.clientMessageId, "cm-visible-1");
   });
 

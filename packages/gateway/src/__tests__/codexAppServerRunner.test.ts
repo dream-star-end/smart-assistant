@@ -249,6 +249,19 @@ describe('CodexAppServerRunner turn/start params', () => {
     await h.cleanup()
   })
 
+  it('OCV5-434: Codex GPT-6 turns always send explicit standard and never priority', async () => {
+    for (const model of ['gpt-6-luna', 'gpt-6-astra-1m', 'gpt-6.1-sol']) {
+      const h = await makeHarness({ model })
+      assert.equal((h.runner as any).buildTurnStartParams('hi').serviceTierForTurn, 'default')
+      // No Fast path on Codex: the runner does not take a service tier at all.
+      assert.equal(typeof (h.runner as any).setServiceTier, 'undefined')
+      await h.cleanup()
+    }
+    const h = await makeHarness({ model: 'gpt-5.6-sol' })
+    assert.equal('serviceTierForTurn' in (h.runner as any).buildTurnStartParams('hi'), false)
+    await h.cleanup()
+  })
+
   it('uses each GPT-5.6 model default and passes explicit max through', async () => {
     const expectedDefaults = [
       ['gpt-5.6-sol', 'xhigh'],

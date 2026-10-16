@@ -10,7 +10,15 @@ const ALLOWED = '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed
 
 test("a real rejection reports the binding window's reset", () => {
   assert.deepEqual(readBoxProfileSignals(`${REJECTED}\n${LIMIT_TEXT}\n`),
-    [{ kind: "rate_limit", status: "rejected", utilization: 1.04, resetsAtMs: 1791300000000 }]);
+    [{ kind: "rate_limit", status: "rejected", utilization: 1.04, resetsAtMs: 1791300000000,
+      windows: { fiveHour: { utilization: 1.04, resetsAtMs: 1791300000000 },
+        sevenDay: { utilization: 0.4, resetsAtMs: 1791316800000 } } }]);
+});
+test("OCV5-424: the 5-hour and weekly windows are kept separately; other windows are ignored", () => {
+  const line = '{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"seven_day":{"utilization":0.31},"seven_day_opus":{"utilization":0.9,"resetsAt":1791316800}}}}';
+  const [signal] = readBoxProfileSignals(line);
+  assert.deepEqual(signal, { kind: "rate_limit", status: "allowed", utilization: 0.9, resetsAtMs: 1791316800000,
+    windows: { sevenDay: { utilization: 0.31, resetsAtMs: null } } });
 });
 test("a real logged-out run is a login signal", () => {
   assert.deepEqual(readBoxProfileSignals(NOT_LOGGED_IN), [{ kind: "login_required" }]);

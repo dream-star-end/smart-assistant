@@ -596,7 +596,40 @@ describe('ModelSelector GPT-6 家族(selfhost 无默认折叠组)', () => {
     expect(families).toEqual(['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-luna'])
     expect(screen.getByText('GPT-6-Luna')).toBeInTheDocument()
     expect(document.querySelector('[data-collapsed-group]')).toBeNull()
-    expect(screen.queryByText('更多 GPT 模型')).toBeNull()
+    expect(screen.queryByText('更多模型')).toBeNull()
+  })
+})
+
+// OCV5-425: OpenCode Go models sit in the collapsed「更多模型」group; the main list stays as is.
+describe('ModelSelector「更多模型」(OpenCode Go)', () => {
+  const MODELS: PublicModel[] = [
+    { id: 'deepseek-v4-flash', display_name: 'DeepSeek V4 Flash' },
+    { id: 'kimi-k3', display_name: 'Kimi K3' },
+    { id: 'kimi-k3-go', display_name: 'Kimi K3 (Go)' },
+    { id: 'qwen3.8-max-go', display_name: 'Qwen3.8 Max (Go)' },
+  ]
+
+  it('main-list models stay visible; Go models only appear after expanding the group', async () => {
+    render(<ModelSelector models={MODELS} selectedId="deepseek-v4-flash" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(screen.getAllByText('DeepSeek V4 Flash').length).toBeGreaterThan(0)
+    expect(screen.getByText('Kimi K3')).toBeInTheDocument()
+    const header = document.querySelector('[data-collapsed-group]')
+    expect(header?.getAttribute('data-collapsed-group')).toBe('closed')
+    expect(screen.getByText('更多模型')).toBeInTheDocument()
+    expect(screen.queryByText('Kimi K3 (Go)')).toBeNull()
+    if (header) fireEvent.click(header)
+    expect(await screen.findByText('Kimi K3 (Go)')).toBeInTheDocument()
+    expect(screen.getByText('Qwen3.8 Max (Go)')).toBeInTheDocument()
+  })
+
+  it('a selected Go model opens the group so the selection stays visible', async () => {
+    render(<ModelSelector models={MODELS} selectedId="qwen3.8-max-go" onSelect={() => {}} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(document.querySelector('[data-collapsed-group]')?.getAttribute('data-collapsed-group')).toBe('open')
+    expect(screen.getAllByText('Qwen3.8 Max (Go)').length).toBeGreaterThan(0)
   })
 })
 
@@ -849,5 +882,46 @@ describe('ModelSelector Box Claude 走平台思考档位(OCV5-378)', () => {
     openMenu(screen.getByRole('button', { name: '选择对话模型' }))
     await screen.findAllByRole('menuitem')
     expect(document.querySelector('[data-effort]')).toBeNull()
+  })
+})
+
+describe('ModelSelector OCV5-434 GPT Fast(turn 级 serviceTier,默认关)', () => {
+  const GPT_MODELS: PublicModel[] = [
+    { id: 'gpt-6-luna', display_name: 'GPT-6 Luna' },
+    { id: 'opencode-gpt-6-luna', display_name: 'GPT-6 Luna (OpenCode)' },
+    { id: 'opencode-grok-4.7', display_name: 'Grok 4.7' },
+    { id: 'glm-5.2', display_name: 'GLM-5.2' },
+  ]
+
+  it('OpenCode Go Luna: Fast 标注按 2× 计费;serviceTier=fast 时 Fast 打勾,点标准上抛 null', async () => {
+    const onSelectServiceTier = vi.fn()
+    render(
+      <ModelSelector
+        models={GPT_MODELS}
+        selectedId="opencode-gpt-6-luna"
+        onSelect={() => {}}
+        serviceTier="fast"
+        onSelectServiceTier={onSelectServiceTier}
+      />,
+    )
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    const std = document.querySelector('[data-gpt-fast="false"]')
+    const fast = document.querySelector('[data-gpt-fast="true"]')
+    expect(fast?.textContent).toContain('按 2× 计费')
+    expect(fast?.querySelector('svg')).toBeTruthy()
+    if (std) fireEvent.click(std)
+    expect(onSelectServiceTier).toHaveBeenCalledWith(null)
+  })
+
+  it('Codex GPT-6 与不支持 Fast 的模型不渲染速度段', async () => {
+    // Codex GPT-6 Luna 也不显示(OCV5-434:上游不生效,按用户决定隐藏)。
+    for (const id of ['gpt-6-luna', 'opencode-grok-4.7', 'glm-5.2']) {
+      cleanup()
+      render(<ModelSelector models={GPT_MODELS} selectedId={id} onSelect={() => {}} onSelectServiceTier={() => {}} />)
+      openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+      await screen.findAllByRole('menuitem')
+      expect(document.querySelector('[data-gpt-fast]')).toBeNull()
+    }
   })
 })

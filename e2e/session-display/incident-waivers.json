@@ -205,6 +205,90 @@
       "reason": "Antigravity relay prefix was a raw /internal/v5 literal missing from the internal route registry; only the commercial-unit contract test failed during the OCV5-411 two-tree sync. Engine is hidden and fail-closed, no user-visible behaviour, billing or data change. Commercial cherry-pick -x of selfhost 1f4e95be5 (same patch); mirrors that waiver.",
       "approvedBy": "user 2026-10-14 要求在个人版正规修复内部路由注册表登记 (OCV5-415, cc3-sync 反馈)",
       "expiresAt": "2026-11-13"
+    },
+    {
+      "commit": "43ed279fe7b9ddbb04c6b2701de39e209de47e5e",
+      "reason": "OCV5-423 Gemini Go bridge rejected CCB role:system messages locally (400). Model was admin-only and staged/disabled again; no user-visible model or default changed.",
+      "approvedBy": "user 2026-10-15 要求 cc 接手 OCV5-423 查明并修好 Gemini 400（cc3 antigravity 会话）",
+      "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "332954cc5ee1276cefbe027a9d62c13b6a4517bd",
+      "reason": "OCV5-423 Gemini Go bridge rejected Claude Code's server web_search tool locally (400) on the admin-only gemini-4 model; owner-only impact, fixed the same night.",
+      "approvedBy": "user 2026-10-15 要求查根因并修复 Gemini 4 网页搜索 400（cc3 antigravity 会话）",
+      "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "46cebad3af13a3df2569bb5f5b5696b005dac5a3",
+      "reason": "OCV5-424 follow-up: admin 服务池 page status chips wrapped one character per line at phone width. CSS-only change on an admin page; no user-visible surface changed.",
+      "approvedBy": "user 2026-10-15 要求修手机端服务池状态徽标逐字换行并发个人版（cc3 account-pool 会话）",
+      "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "734f0e491836c73c202688ac7483baf2d3c7a3fc",
+      "reason": "OCV5-415 Antigravity interim pool counted a single model's upstream 5xx (GPT-OSS no capacity) as an account strike, which could cool the only account for every model; latent, no cooldown happened.",
+      "approvedBy": "user 2026-10-15 要求确认单模型 5xx 只冷却该模型、会误伤则修掉（cc3 antigravity 会话）",
+      "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "430ffba8e3bb866a5a4aa2c5beb25507954a0fcd",
+      "reason": "OCV5-424 follow-up 2: admin 服务池 page member names wrapped 2–3 characters per line at phone width after #736 (break-all). CSS-only change on an admin page; no user-visible surface changed.",
+      "approvedBy": "user 2026-10-15 要求修手机端服务池状态徽标逐字换行并发个人版（cc3 account-pool 会话）",
+      "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "f51560cfb5c23956b1b331522c1c521043987fd5",
+      "reason": "OCV5-415 Antigravity relay refused the CLI web search RPC (405) and a closing browser socket expired running turns' relay routes (ROUTE_EXPIRED); owner-only selfhost model, fixed the same morning.",
+      "approvedBy": "user 2026-10-15 截图询问 Antigravity 网页搜索 405 与任务执行失败，要求查根因修复发版（cc3 antigravity 会话）",
+      "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "841969cd4d97518b297eb09cc84b909c45b6b0b5",
+      "reason": "OCV5-424 follow-up 3: admin 服务池 page 最近错误 column squeezed to 72px at phone width, stretching rows. CSS-only change on an admin page; no user-visible surface changed.",
+      "approvedBy": "user 2026-10-15 要求修手机端服务池状态徽标逐字换行并发个人版（cc3 account-pool 会话）",
+      "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "05313a5764e8fa7c710afb7c2960bbd50fa20fb9",
+      "reason": "OCV5-424 user affinity (PR #750): fixes Codex r1 findings on the not-yet-released feature itself; no released behaviour is changed.",
+      "approvedBy": "user 2026-10-15 确认按用户粘性设计「用户分配方案没问题」并要求实现发版（cc3 account-pool 会话）",
+      "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "7d2d20741a046c8dd8b4ff2c4e3725f30956686f",
+      "reason": "OCV5-424 user affinity (PR #750): fixes Codex r2 findings on the not-yet-released feature itself; no released behaviour is changed.",
+      "approvedBy": "user 2026-10-15 确认按用户粘性设计「用户分配方案没问题」并要求实现发版（cc3 account-pool 会话）",
+      "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "6baa10cf2a5259602b2e7056980933478da89b1f",
+      "reason": "OCV5-424 user affinity (PR #750): fixes the Codex r3 finding on the not-yet-released feature itself; no released behaviour is changed.",
+      "approvedBy": "user 2026-10-15 确认按用户粘性设计「用户分配方案没问题」并要求实现发版（cc3 account-pool 会话）",
+      "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "47194f47b465fd1f1966982fd9cdf32c07512626",
+      "reason": "OCV5-424 merged 服务池 tab follow-up: admin-only page (Antigravity quota user-agent, Cursor rows shown once, stale-window text). No user-visible surface changed.",
+      "approvedBy": "user 2026-10-15 要求服务池与订阅账号合并并显示使用额度（cc3 account-pool 会话）",
+      "expiresAt": "2026-11-14"
+    },
+    {
+      "commit": "cc01fd30ec4d77f1c6d40a8b035869a6a4896b07",
+      "reason": "OCV5-434 GPT Fast acceptance fix: Codex turn/start needs the catalog tier id \"priority\"; released <1h earlier the Codex Fast toggle was a no-op (standard speed). No wrong charge (Codex is subscription, not credits) and nothing broke. Unit tests pin priority; live acceptance re-verifies the echoed tier by capture.",
+      "approvedBy": "user 2026-10-16 选择「Waiver」处理 OCV5-434 Codex Fast tier id 修复（cc3 会话）",
+      "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "f72d9a708ea04948f5bc892ab779388ecb4b68c0",
+      "reason": "OCV5-439: removes an unref() from the 200 ms wait before a runner error's RUNNER_CRASHED terminal (a tracked persistence awaited by awaitPendingPersistence/shutdownAll). Latent: only a gateway exit within 200 ms of a runner error could lose that terminal; no user report. Unit test pins it.",
+      "approvedBy": "user 2026-10-16 管家按用户「有问题就搞」决定一起修：去掉 handleError 200ms unref，按规范写 Incident: none 豁免（cc3 sync 会话）",
+      "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "bca1355a9ab22f522256fca3b73d33a00f9cdf4d",
+      "reason": "OCV5-441: repairs 23 stale test:gateway failures and moves five commercial imports of gateway/src onto the @openclaude/gateway package export (same modules, no behaviour change). Test and CI only; nothing user-visible.",
+      "approvedBy": "user 2026-10-16 管家按用户「有问题就搞、尽快上线」派单 OCV5-441：修全量网关测试并接入个人版 CI，按规范写 Incident: none 豁免（cc3 会话）",
+      "expiresAt": "2026-11-15"
     }
   ]
 }

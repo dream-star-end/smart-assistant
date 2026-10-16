@@ -58,9 +58,15 @@ import {
   directEgressDispatcher,
 } from "../../account-pool/egressDispatcher.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
+import type { SelectedApiKey } from "../../account-pool/apiKeyPool.js";
 import {
   findRouteProviderForModel,
   getStaticProvider,
+  isOpenCodeGoChatUpstream,
+  isOpenCodeGoResponsesUpstream,
+  isOpenCodeGoFastUpstream,
+  OPENAI_FAST_SERVICE_TIER,
+  staticProviderOutputConfigEfforts,
   type StaticKeyProviderSpec,
   type StaticProviderId,
   type StaticProviderKeys,
@@ -210,11 +216,8 @@ export function providerCapabilityCeiling(route: UpstreamRoute): ProviderCapabil
     return { supportsVision: true, efforts: null };
   }
   const spec = route.provider;
-  const efforts = spec.allowedOutputConfigEfforts
-    ? spec.allowedOutputConfigEfforts
-    : spec.stripBodyFields.includes("output_config")
-      ? [] // 整体 strip output_config ⇒ 该 provider 机制上不支持思考档位
-      : null;
+  // Model-scoped list (OCV5-425) > provider allowlist > [] when output_config is stripped.
+  const efforts = staticProviderOutputConfigEfforts(spec, route.upstreamModel);
   return { supportsVision: spec.supportsVision === true, efforts };
 }
 
@@ -253,6 +256,7 @@ export function checkSnapshotCapabilities(snapshot: {
     modelId: string;
     engine: string;
     providerId: string | null;
+    upstreamModelId?: string | null;
     state: string;
     capabilityProfile: {
       supportsVision: boolean;
@@ -267,7 +271,8 @@ export function checkSnapshotCapabilities(snapshot: {
     try {
       route = selectUpstreamRoute(e.modelId, {
         providerId: e.providerId,
-        upstreamModelId: e.modelId,
+        // The catalog's upstream id decides model-scoped efforts (`kimi-k3-go` → `kimi-k3`).
+        upstreamModelId: e.upstreamModelId ?? e.modelId,
       });
     } catch (err) {
       violations.push(
@@ -305,10 +310,19 @@ export type ConfigError =
  */
 export function validateUpstreamConfig(
   route: UpstreamRoute,
-  deps: { staticProviderKeys?: StaticProviderKeys; boxConfigured?: boolean },
+  deps: {
+    staticProviderKeys?: StaticProviderKeys;
+    boxConfigured?: boolean;
+    /** OCV5-424:该服务池(pool_api_keys)是否有非管理员停用的成员。 */
+    apiKeyPoolConfigured?: (service: string) => boolean;
+  },
 ): ConfigError | null {
   if (route.kind === "box" && deps.boxConfigured !== true) return { kind: "box_not_configured" };
-  if (route.kind === "static" && !deps.staticProviderKeys?.[route.provider.id]) {
+  if (
+    route.kind === "static" &&
+    !deps.staticProviderKeys?.[route.provider.id] &&
+    deps.apiKeyPoolConfigured?.(route.provider.id) !== true
+  ) {
     return { kind: "static_not_configured", providerId: route.provider.id };
   }
   return null;
@@ -340,7 +354,7 @@ export interface PreparedUpstreamSession {
   /** 上游 URL;OAuth = `deps.upstreamEndpoint ?? DEFAULT`;静态 = `spec.upstreamEndpoint` */
   readonly endpoint: string;
   /** Exact, trusted static-provider transport selection, never a client flag. */
-  readonly transport?: "gemini-go";
+  readonly transport?: "gemini-go" | "openai-chat-go" | "openai-responses-go";
   /**
    * **转发给上游的 model 名**(模型权威批次 §1.3)。
    *
@@ -361,6 +375,11 @@ export interface PreparedUpstreamSession {
   readonly dispatcher: Dispatcher | undefined;
   /** 上游响应是否值得抓 quota(OAuth=true;静态=false) */
   readonly shouldUpdateQuotaFromResponse: boolean;
+  /**
+   * OCV5-424:本次请求所用的 API-key 池成员(pool_api_keys);core 据此把上游结果交共享
+   * 策略(冷却/恢复)。env key、OAuth、Box 路径为 undefined。
+   */
+  readonly poolMember?: { readonly service: string; readonly memberId: string } | null;
 
   /**
    * 写入 Authorization + Anthropic beta 头 + (OAuth)body.metadata.user_id device_id pin。
@@ -447,6 +466,17 @@ export interface PickUpstreamDeps {
    * 各装配点可只注入自己支持的子集(如 external API-key proxy 只放 deepseek)。OAuth route 不消费。
    */
   staticProviderKeys?: StaticProviderKeys;
+  /**
+   * OCV5-424:静态 provider 的 API-key 服务池选 key(多 key、共享策略冷却/恢复)。
+   * 未注入或池为空 → 用 staticProviderKeys 的 env key(旧行为)。
+   */
+  /** OCV5-424: userId enables user-level affinity inside the pool. */
+  selectApiKey?: (service: string, stickyKey: string, userId?: bigint) => Promise<SelectedApiKey | null>;
+  /**
+   * OCV5-424:该服务池是否已有成员(任何状态)。有成员时池是权威:选不到可用 key(全部
+   * 冷却 / 管理员停用)就返回 pool_unavailable,不回落 env key。
+   */
+  apiKeyPoolHasMembers?: (service: string) => boolean;
   /** OAuth 上游 URL 覆盖;undefined → DEFAULT_UPSTREAM_ENDPOINT。测试 seam。 */
   upstreamEndpoint?: string;
   /**
@@ -532,6 +562,7 @@ function makeStaticKeyUpstream(
   spec: StaticKeyProviderSpec,
   apiKey: string,
   upstreamModel: string,
+  poolMember: { service: string; memberId: string } | null = null,
 ): PreparedUpstreamSession {
   // 出口策略(commercial 部署拓扑权威源):国内/亚洲静态 provider 必须显式直连,绕开 gateway
   // 启动装的全局 EnvHttpProxyAgent(给 Anthropic 出海的日本节点),否则双重跨境长流式易半路断。
@@ -546,10 +577,16 @@ function makeStaticKeyUpstream(
     personaTimezone: null,
     endpoint: spec.upstreamEndpoint,
     ...(spec.id === "opencodego" && upstreamModel.toLowerCase() === "gemini-4-argon-contributor"
-      ? { transport: "gemini-go" as const } : {}),
+      ? { transport: "gemini-go" as const }
+      : spec.id === "opencodego" && isOpenCodeGoChatUpstream(upstreamModel)
+        ? { transport: "openai-chat-go" as const }
+        : spec.id === "opencodego" && isOpenCodeGoResponsesUpstream(upstreamModel)
+          ? { transport: "openai-responses-go" as const }
+          : {}),
     upstreamModel,
     dispatcher,
     shouldUpdateQuotaFromResponse: false,
+    poolMember,
     applyUpstreamAuth(safeHeaders, body, _log) {
       // 鉴权头风格由 protocol spec 声明:缺省 bearer(deepseek/minimax/ark 逐字节不变);
       // opencodego 的 /messages 只认 x-api-key(Bearer→401,2026-07-05 实测)。
@@ -571,8 +608,21 @@ function makeStaticKeyUpstream(
         delete safeHeaders[header];
       }
       const mutableBody = body as Record<string, unknown>;
+      // Model-scoped effort (OCV5-425): read before the provider-wide strip removes it.
+      const modelEfforts = spec.modelOutputConfigEfforts?.[upstreamModel.toLowerCase()];
+      const requestedOutputConfig = mutableBody.output_config;
+      // OCV5-434 GPT Fast: index.ts already kept "priority" only for the OpenCode Go Fast models;
+      // read it before the provider-wide strip and restore it for those upstreams alone.
+      const requestedServiceTier = mutableBody.service_tier;
       for (const field of spec.stripBodyFields) {
         delete mutableBody[field];
+      }
+      if (
+        spec.id === "opencodego" &&
+        requestedServiceTier === OPENAI_FAST_SERVICE_TIER &&
+        isOpenCodeGoFastUpstream(upstreamModel)
+      ) {
+        mutableBody.service_tier = OPENAI_FAST_SERVICE_TIER;
       }
       // 恒思考模型兜底：provider-wide(kimi-k2.7-code)或 model-scoped(glm-5.3)
       // 不支持 thinking:{type:'disabled'}；删参退回上游默认(照常思考)。model-scoped
@@ -597,16 +647,15 @@ function makeStaticKeyUpstream(
       // 火山端点仅识别 output_config.effort(其余 CCB firstParty-only 子字段 task_budget/format 等会拒/忽略),
       // 且 glm-5.2 产品只暴露高/最高两档。按 protocol 权威白名单收口:effort ∈ allowlist → 重建为 { effort };
       // 否则(非法值/缺失/非 string/非 object)删掉整个 output_config,退回火山默认思考,避免 400 与产品档位漂移。
-      if (spec.allowedOutputConfigEfforts) {
-        const oc = mutableBody.output_config;
+      // A model-scoped list (OCV5-425) reads the body from before the provider-wide strip.
+      const effortAllowlist = modelEfforts ?? spec.allowedOutputConfigEfforts;
+      if (effortAllowlist) {
+        const oc = modelEfforts ? requestedOutputConfig : mutableBody.output_config;
         const effort =
           oc !== null && typeof oc === "object" && !Array.isArray(oc)
             ? (oc as Record<string, unknown>).effort
             : undefined;
-        if (
-          typeof effort === "string" &&
-          spec.allowedOutputConfigEfforts.includes(effort)
-        ) {
+        if (typeof effort === "string" && effortAllowlist.includes(effort)) {
           mutableBody.output_config = { effort };
         } else {
           delete mutableBody.output_config;
@@ -708,6 +757,53 @@ export function rewriteReminderDatesInMessages(
   return changed ? out : messages;
 }
 
+
+/**
+ * OCV5-424 — claude 服务池的 API-key 成员(pool_api_keys service='claude')。
+ * Anthropic 官方 API:x-api-key 鉴权;不注入 oauth beta、不做 persona/device pin(那些
+ * 只属于订阅号);出口走全局默认(与未绑出口的 OAuth 号相同);消息清洗与 OAuth 同源。
+ */
+function makeAnthropicKeyUpstream(
+  member: SelectedApiKey,
+  endpoint: string,
+  upstreamModel: string,
+): PreparedUpstreamSession {
+  return {
+    accountId: null,
+    slotId: null,
+    pinnedUserId: null,
+    personaTimezone: null,
+    endpoint,
+    upstreamModel,
+    dispatcher: undefined,
+    shouldUpdateQuotaFromResponse: false,
+    poolMember: { service: member.service, memberId: member.memberId },
+    applyUpstreamAuth(safeHeaders) {
+      // safeHeaders 来自 buildSafeUpstreamHeaders 白名单,不含 authorization;只设 x-api-key。
+      safeHeaders["x-api-key"] = member.apiKey;
+      const beta = (safeHeaders["anthropic-beta"] ?? "")
+        .split(",")
+        .map((b) => b.trim())
+        .filter((b) => b.length > 0 && b !== "oauth-2025-04-20");
+      if (beta.length > 0) safeHeaders["anthropic-beta"] = beta.join(",");
+      else Reflect.deleteProperty(safeHeaders, "anthropic-beta");
+    },
+    sanitizeMessages(messages, model, log) {
+      const r = stripMalformedThinkingBlocks(messages);
+      if (r.thinkingStripped + r.redactedThinkingStripped > 0) {
+        log.warn("proxy_malformed_thinking_blocks_stripped", {
+          model,
+          thinking: r.thinkingStripped,
+          redactedThinking: r.redactedThinkingStripped,
+        });
+      }
+      return r.messages;
+    },
+    zeroizeSecrets() {
+      /* the key string lives only in this closure for the request */
+    },
+  };
+}
 function makeOAuthPoolUpstream(
   pick: PickResult,
   dispatcher: Dispatcher | undefined,
@@ -917,15 +1013,83 @@ export async function pickUpstream(
   if (route.kind === "static") {
     // validateUpstreamConfig 已保证该 provider 的 key 非空(handler preCheck 前 gate)。
     // 这里若仍 undefined 是 wiring bug — 退化为空字符串 Bearer 比 throw 安全(让上游 401)。
-    const apiKey = deps.staticProviderKeys?.[route.provider.id] ?? "";
+    // OCV5-424:先问该服务的 API-key 池(按会话粘性 WRH,只选 active 成员);池为空或
+    // 读池失败 → 回落 env key(旧行为)。
+    let pooled: SelectedApiKey | null = null;
+    if (deps.selectApiKey) {
+      try {
+        pooled = await deps.selectApiKey(
+          route.provider.id,
+          extractSessionId(body.metadata) ?? (userId !== undefined ? `u:${userId.toString()}` : randomUUID()),
+          userId,
+        );
+      } catch (err) {
+        log.warn("proxy_api_key_pool_select_failed", { provider: route.provider.id, err: errSummary(err) });
+      }
+    }
+    if (!pooled && deps.selectApiKey && deps.apiKeyPoolHasMembers?.(route.provider.id) === true) {
+      // 池里有成员但都不可用:env key 也已导入为池成员,回落它会绕过管理员停用与冷却。
+      return {
+        ok: false,
+        error: {
+          kind: "pool_unavailable",
+          err: new AccountPoolUnavailableError(`no usable API key in the ${route.provider.id} pool`),
+        },
+      };
+    }
+    const apiKey = pooled?.apiKey ?? deps.staticProviderKeys?.[route.provider.id] ?? "";
     // upstreamModel:catalog 有 hint → upstream_model_id ?? model_id;无 hint(legacy 路径)
     // → 原样透传 body.model(与本批次之前逐字节一致)。
     return {
       ok: true,
-      session: makeStaticKeyUpstream(route.provider, apiKey, route.upstreamModel ?? body.model),
+      session: makeStaticKeyUpstream(
+        route.provider,
+        apiKey,
+        route.upstreamModel ?? body.model,
+        pooled ? { service: pooled.service, memberId: pooled.memberId } : null,
+      ),
     };
   }
 
+  const oauth = await pickOAuthUpstream(deps, body, route, log, userId, forceRepin);
+  // OCV5-424:claude 服务池的 API-key 层(tier 1)。订阅号层(tier 0)整体不可用
+  // (pool_unavailable,不含 busy / pin 语义错误)时才用池里的 Anthropic API key;
+  // 订阅号仍在时绝不改走 API key(计费/封号策略不变)。
+  if (oauth.ok || oauth.error.kind !== "pool_unavailable" || !deps.selectApiKey) return oauth;
+  let anthropicKey: SelectedApiKey | null = null;
+  try {
+    anthropicKey = await deps.selectApiKey(
+      "claude",
+      extractSessionId(body.metadata) ?? (userId !== undefined ? `u:${userId.toString()}` : randomUUID()),
+      userId,
+    );
+  } catch (err) {
+    log.warn("proxy_api_key_pool_select_failed", { provider: "claude", err: errSummary(err) });
+  }
+  if (!anthropicKey) return oauth;
+  log.info("proxy_claude_api_key_tier", { memberId: anthropicKey.memberId });
+  return {
+    ok: true,
+    session: makeAnthropicKeyUpstream(
+      anthropicKey,
+      deps.upstreamEndpoint ?? DEFAULT_UPSTREAM_ENDPOINT,
+      route.upstreamModel ?? body.model,
+    ),
+  };
+}
+
+/** OAuth 订阅号层(原 pickUpstream 主体,OCV5-424 抽出以便接 API-key 层)。 */
+async function pickOAuthUpstream(
+  deps: PickUpstreamDeps,
+  body: ProxyBody,
+  route: Extract<UpstreamRoute, { kind: "oauth" }>,
+  log: Logger,
+  userId?: bigint,
+  forceRepin?: boolean,
+): Promise<
+  | { ok: true; session: PreparedUpstreamSession }
+  | { ok: false; error: PickError }
+> {
   // Phase 6 flag 在 OAuth 路径开头 await 一次,scheduler.pick + makeOAuthPoolUpstream
   // 同值传入,避免热改时两处读不一致(plan §5.5.4)。默认 "off" — getter 未注入
   // 或 cache miss 后 DB row 缺失时,getSystemSetting 内部已兜底 DEFAULTS["off"]。

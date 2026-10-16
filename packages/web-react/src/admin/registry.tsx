@@ -2,11 +2,11 @@ import {
   Activity,
   Bell,
   BookOpen,
+  Boxes,
   Building2,
   Container,
   CreditCard,
   History,
-  KeyRound,
   Layers,
   LayoutDashboard,
   Mail,
@@ -83,7 +83,8 @@ export const adminPages: AdminPage[] = [
   { key: "dashboard", title: "总览", group: "经营驾驶舱", desc: "收入、用量、资源和告警", icon: LayoutDashboard, Component: lz(() => import("./pages/dashboard")) },
   { key: "users", title: "用户", group: "经营驾驶舱", desc: "增长、留存、余额和详情", icon: Users, Component: lz(() => import("./pages/users")) },
   // ── 账号与调度 ──
-  { key: "accounts", title: "账号池", group: "账号与调度", desc: "Claude 账号健康", icon: KeyRound, Component: lz(() => import("./pages/accounts")) },
+  // OCV5-424: 服务池 and 订阅账号 are one tab (each service: subscription accounts with quota + API keys).
+  { key: "pools", title: "服务池", group: "账号与调度", desc: "各服务的订阅账号、使用额度与 API key", icon: Boxes, Component: lz(() => import("./pages/accounts")) },
   { key: "accountGroups", title: "账号分组", group: "账号与调度", desc: "容量、权重和调度边界", icon: Layers, Component: lz(() => import("./pages/accountGroups")) },
   { key: "egressProxies", title: "代理池", group: "账号与调度", desc: "出口线路和失败冷却", icon: Network, Component: lz(() => import("./pages/egressProxies")) },
   // ── 运行资源 ──
@@ -120,9 +121,13 @@ export const adminPages: AdminPage[] = [
 /** tab key 白名单（路由回落判定）。 */
 export const adminTabKeys = new Set(adminPages.map((p) => p.key));
 
+/** Retired tab keys still reached by old links / bookmarks → their current tab. */
+export const ADMIN_TAB_ALIASES: Readonly<Record<string, string>> = { accounts: "pools" };
+
 /** 取某 tab 的元数据；非法 key 回落 dashboard（第一页）。 */
 export function getAdminPage(tab: string): AdminPage {
-  return adminPages.find((p) => p.key === tab) ?? adminPages[0];
+  const key = ADMIN_TAB_ALIASES[tab] ?? tab;
+  return adminPages.find((p) => p.key === key) ?? adminPages[0];
 }
 
 /** 按 ADMIN_GROUP_ORDER 分组后的页面（侧栏渲染用）。 */

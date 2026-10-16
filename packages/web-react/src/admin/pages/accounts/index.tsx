@@ -25,6 +25,8 @@ import {
 import { adminGet, adminSend, apiErrorMessage } from "../../lib/adminApi";
 import { useAdminPoll } from "../../lib/useAdminPoll";
 import { getAdminPage } from "../../registry";
+import { ApiKeyFormModal, BoxClaudeSection, PolicyNote, PoolSection, QuotaWindowsCell, accountQuota, togglePath } from "../pools";
+import type { PoolMember, PoolView, PoolsResponse } from "../pools/types";
 import { AccountFormModal } from "./AccountFormModal";
 import { BoxClaudeProfilesModal } from "./BoxClaudeProfilesModal";
 import { CursorUsageModal, GrokUsageModal, RecentUsersModal, RefreshHistoryModal } from "./AccountInfoModals";
@@ -55,16 +57,16 @@ const STATUS_KEY = "admin_acc_status";
 const PROVIDER_KEY = "admin_acc_provider";
 
 const PROVIDER_SECTIONS = [
-  { id: "cursor", title: "Cursor", desc: "Cursor 订阅 API Key 池" },
-  { id: "claude", title: "CCB", desc: "Claude Code 官方账号池" },
-  { id: "codex", title: "Codex", desc: "Codex 官方账号池" },
-  { id: "grok", title: "Grok", desc: "Grok Build 官方账号池" },
+  { id: "claude", title: "Claude", desc: "Claude Code 订阅账号" },
+  { id: "codex", title: "Codex / ChatGPT", desc: "Codex 订阅账号" },
+  { id: "grok", title: "Grok", desc: "Grok Build 订阅账号" },
+  { id: "cursor", title: "Cursor(Box)", desc: "Cursor 订阅账号" },
 ] as const;
 
 /** 0262/0276 — 按 provider 段切换的列:Cursor 段隐藏 Anthropic 配额与 Grok 列,Grok 段隐藏 Sand 与 5h/7d 配额(保留 oauth_exp),其余段隐藏 Sand 与 Grok 列。 */
-const CCB_ONLY_COLUMNS = new Set(["q5h", "q5hr", "q7d", "q7dr", "oauth_exp"]);
-const CURSOR_ONLY_COLUMNS = new Set(["sand_pct", "sand_reset", "cursor_plan", "usage_upd", "cursor_pool"]);
-const GROK_ONLY_COLUMNS = new Set(["grok_pct", "grok_reset", "grok_plan", "grok_usage_upd"]);
+const CCB_ONLY_COLUMNS = new Set(["oauth_exp"]);
+const CURSOR_ONLY_COLUMNS = new Set(["cursor_plan", "usage_upd", "cursor_pool"]);
+const GROK_ONLY_COLUMNS = new Set(["grok_plan", "grok_usage_upd"]);
 
 function unionSets(...sets: Array<ReadonlySet<string>>): Set<string> {
   const out = new Set<string>();
@@ -90,10 +92,27 @@ type AccountsData = {
   rows: AccountRow[];
   stats: AccountsPoolStats | null;
   snapshot: AccountPoolSnapshot | null;
+  pools: PoolsResponse | null;
 };
 
+/** Account-pool services: their subscription accounts are the rows above; the pool adds keys. */
+// Cursor accounts are the "box" pool on the server (Box runs on them): same rows, one group.
+const ACCOUNT_SERVICES = new Set(["claude", "codex", "grok", "cursor", "box"]);
+/** Pool service holding an account section's extra members. */
+const POOL_SERVICE_OF: Record<string, string> = { cursor: "box" };
+
+/** The non-account members (API keys, relay keys) of an account-pool service. */
+function keyMembersOf(pools: PoolsResponse | null, service: string): PoolView | null {
+  const pool = pools?.pools?.find((p) => p.service === service);
+  if (!pool) return null;
+  // Box Claude logins have their own group (BoxClaudeSection) with routes, models and quota.
+  const members = pool.members.filter((m) => m.memberKind !== "account" && m.memberKind !== "box_profile");
+  if (members.length === 0 && !pool.accepts_api_keys) return null;
+  return { ...pool, members };
+}
+
 export default function AccountsPage() {
-  const meta = getAdminPage("accounts");
+  const meta = getAdminPage("pools");
   const toast = useToast();
   const [confirm, confirmEl] = useConfirm();
 
@@ -110,8 +129,10 @@ export default function AccountsPage() {
       });
       const statsP = adminGet<AccountsPoolStats>("/accounts/stats").catch(() => null);
       const snapP = adminGet<AccountPoolSnapshot>("/stats/account-pool").catch(() => null);
-      const [rowsR, stats, snapshot] = await Promise.all([rowsP, statsP, snapP]);
-      return { rows: Array.isArray(rowsR.rows) ? rowsR.rows : [], stats, snapshot };
+      // OCV5-424 merged tab: API keys, Gemini/Antigravity and Box members + the shared policy.
+      const poolsP = adminGet<PoolsResponse>("/pools").catch(() => null);
+      const [rowsR, stats, snapshot, pools] = await Promise.all([rowsP, statsP, snapP, poolsP]);
+      return { rows: Array.isArray(rowsR.rows) ? rowsR.rows : [], stats, snapshot, pools };
     },
     { intervalMs: 30_000, deps: [status, provider] },
   );
@@ -119,6 +140,12 @@ export default function AccountsPage() {
   const rows = data?.rows ?? [];
   const stats = data?.stats ?? null;
   const snapshot = data?.snapshot ?? null;
+  const pools = data?.pools ?? null;
+  const keyServices = (pools?.pools ?? []).filter((p) => p.accepts_api_keys).map((p) => p.service);
+  const otherPools = (pools?.pools ?? []).filter(
+    (p) => !ACCOUNT_SERVICES.has(p.service) && (p.members.length > 0 || p.accepts_api_keys),
+  );
+  const [addKeyFor, setAddKeyFor] = useState<string | null | undefined>(undefined);
 
   // ── modals ──
   const [formModal, setFormModal] = useState<{ mode: "create" | "edit"; account?: AccountRow } | null>(null);
@@ -209,6 +236,30 @@ export default function AccountsPage() {
     [toast, refresh],
   );
 
+  // OCV5-424 — API keys and Antigravity accounts are enabled / disabled from their pool row.
+  const togglePoolMember = useCallback(
+    async (m: PoolMember) => {
+      const next = m.status === "disabled" ? "active" : "disabled";
+      if (next === "disabled") {
+        const ok = await confirm({
+          title: `停用 ${m.label || m.hints.key || m.id}`,
+          body: "管理员停用后调度不会再使用它,也不会自动恢复;冷却中的成员无需停用,会自动恢复。",
+          danger: true,
+          confirmText: "停用",
+        });
+        if (!ok) return;
+      }
+      try {
+        await adminSend("PATCH", togglePath(m), { status: next });
+        toast(next === "active" ? "已启用" : "已停用", "success");
+        refresh();
+      } catch (e) {
+        toast(`操作失败:${errMsg(e)}`, "error");
+      }
+    },
+    [confirm, toast, refresh],
+  );
+
   // 0276 — 立即回源刷新一行的 Grok 周额度(同 grokUsageSweeper 路径)。
   const doRefreshGrokUsage = useCallback(
     async (a: AccountRow) => {
@@ -256,18 +307,13 @@ export default function AccountsPage() {
     { key: "cursor_pool", title: "Cursor 池", width: 120, render: (a) => <CursorPoolCell a={a} /> },
     // 0262 — Cursor 段专用:Sand(Grok Bot)池已用 % / 周重置 / 套餐与账期 / 用量刷新时间。
     // CCB 段专用:Anthropic 5h/7d 滚动配额。两组列语义不同,按 provider 段切换(见 sectionColumns)。
-    { key: "sand_pct", title: "Sand 已用%", align: "right", render: (a) => <CursorSandUsageCell a={a} /> },
-    { key: "sand_reset", title: "Sand 重置", align: "right", render: (a) => <ResetCell resetsAt={a.cursor_sand_next_reset_at ?? null} /> },
     { key: "cursor_plan", title: "套餐 / 账期", width: 110, render: (a) => <CursorPlanCell a={a} /> },
     { key: "usage_upd", title: "用量更新", width: 100, render: (a) => <LastUsed iso={a.cursor_usage_updated_at ?? null} /> },
-    { key: "grok_pct", title: "周额度已用%", align: "right", render: (a) => <GrokCreditUsageCell a={a} /> },
-    { key: "grok_reset", title: "额度重置", align: "right", render: (a) => <ResetCell resetsAt={a.grok_credit_period_end ?? null} /> },
     { key: "grok_plan", title: "订阅档", width: 110, render: (a) => <GrokPlanCell a={a} /> },
     { key: "grok_usage_upd", title: "用量更新", width: 100, render: (a) => <LastUsed iso={a.grok_usage_updated_at ?? null} /> },
-    { key: "q5h", title: "5h%", align: "right", render: (a) => <QuotaCell pct={a.quota_5h_pct} updatedAt={a.quota_updated_at} /> },
-    { key: "q5hr", title: "5h 重置", align: "right", render: (a) => <ResetCell resetsAt={a.quota_5h_resets_at} /> },
-    { key: "q7d", title: "7d%", align: "right", render: (a) => <QuotaCell pct={a.quota_7d_pct} updatedAt={a.quota_updated_at} /> },
-    { key: "q7dr", title: "7d 重置", align: "right", render: (a) => <ResetCell resetsAt={a.quota_7d_resets_at} /> },
+    // OCV5-424 merged tab: one 使用额度 column for every provider (window · used % · reset), with
+    // the reason when the upstream gives nothing (no blank cells).
+    { key: "quota", title: "使用额度", render: (a) => <QuotaWindowsCell quota={accountQuota(a)} /> },
     { key: "cooldown", title: "冷却至", align: "right", render: (a) => <CooldownCell cooldownUntil={a.cooldown_until} /> },
     { key: "last_used", title: "最近使用", width: 110, render: (a) => <LastUsed iso={a.last_used_at} /> },
     {
@@ -348,14 +394,21 @@ export default function AccountsPage() {
     <div className="flex flex-col gap-5">
       <PageHeader
         title={meta.title}
-        desc={loading && !data ? "加载中…" : `共 ${rows.length} 条`}
+        desc={
+          loading && !data
+            ? "加载中…"
+            : `每个服务一个池:订阅账号与 API key 共用同一套调度、冷却与自动恢复 · 订阅账号 ${rows.length} 个`
+        }
         actions={
           <>
             <Button variant="secondary" size="sm" onClick={refresh}>
               <RefreshCw size={15} /> 刷新
             </Button>
+            <Button variant="secondary" size="sm" onClick={() => setAddKeyFor(null)} disabled={keyServices.length === 0}>
+              <Plus size={15} /> 添加 API key
+            </Button>
             <Button variant="primary" size="sm" onClick={() => setFormModal({ mode: "create" })}>
-              <Plus size={15} /> 新建账号
+              <Plus size={15} /> 新建订阅账号
             </Button>
           </>
         }
@@ -416,6 +469,8 @@ export default function AccountsPage() {
         />
       </StatCardRow>
 
+      {pools?.policy ? <PolicyNote policy={pools.policy} /> : null}
+
       <PoolDonut snapshot={snapshot} />
 
       <FilterBar>
@@ -426,7 +481,7 @@ export default function AccountsPage() {
           options={[
             { label: "全部", value: "" },
             { label: "Cursor", value: "cursor" },
-            { label: "CCB", value: "claude" },
+            { label: "Claude", value: "claude" },
             { label: "Codex", value: "codex" },
             { label: "Grok", value: "grok" },
           ]}
@@ -465,14 +520,48 @@ export default function AccountsPage() {
                   rows={sectionRows}
                   rowKey={(a) => a.id}
                   loading={loading && !data}
-                  emptyTitle={`${section.title} 暂无账号`}
+                  emptyTitle={`${section.title} 暂无订阅账号`}
                 />
+                {(() => {
+                  const keys = keyMembersOf(pools, POOL_SERVICE_OF[section.id] ?? section.id);
+                  return keys ? (
+                    <PoolSection
+                      pool={keys}
+                      loading={loading && !data}
+                      onAdd={(svc) => setAddKeyFor(svc)}
+                      onToggle={togglePoolMember}
+                      title={section.id === "codex" ? "中转 key" : "API key"}
+                      bare
+                    />
+                  ) : null;
+                })()}
               </section>
             );
           })}
+          {!provider || provider === "cursor" ? (
+            <BoxClaudeSection view={data ? (pools ? pools.box_claude : null) : undefined} loading={loading && !data} />
+          ) : null}
+          {!provider
+            ? otherPools.map((p) => (
+                <PoolSection
+                  key={p.service}
+                  pool={p}
+                  loading={loading && !data}
+                  onAdd={(svc) => setAddKeyFor(svc)}
+                  onToggle={togglePoolMember}
+                />
+              ))
+            : null}
         </div>
       )}
 
+      <ApiKeyFormModal
+        open={addKeyFor !== undefined}
+        onOpenChange={(o) => !o && setAddKeyFor(undefined)}
+        services={keyServices}
+        initialService={addKeyFor ?? keyServices[0] ?? ""}
+        onSaved={refresh}
+      />
       <AccountFormModal
         open={formModal !== null}
         onOpenChange={(o) => !o && setFormModal(null)}
@@ -515,7 +604,7 @@ export default function AccountsPage() {
   );
 }
 
-/** 账号池状态构成 donut(active/cooldown/disabled/banned)+ 平均健康 / 今日成功率。 */
+/** 订阅账号状态构成 donut(active/cooldown/disabled/banned)+ 平均健康 / 今日成功率。 */
 function PoolDonut({ snapshot }: { snapshot: AccountPoolSnapshot | null }) {
   const ref = useRef<HTMLCanvasElement>(null);
   const segs = snapshot
@@ -542,7 +631,7 @@ function PoolDonut({ snapshot }: { snapshot: AccountPoolSnapshot | null }) {
     : undefined;
 
   return (
-    <ChartCard title="账号池状态构成" hint={hint} height={240}>
+    <ChartCard title="订阅账号状态构成" hint={hint} height={240}>
       {segs.length > 0 ? (
         <canvas ref={ref} />
       ) : (

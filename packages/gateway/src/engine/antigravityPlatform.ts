@@ -11,9 +11,10 @@ import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@o
  *   home/.gemini/antigravity-cli/bin            helpers the CLI extracts on
  *       first run (a 16 MB webm_encoder); shared so each launch does not.
  *   cache/                                     XDG_CACHE_HOME (fontconfig/mesa).
- *   launch/<random>/                           per-launch HOME. settings.json
- *       and config/mcp_config.json live here, so a concurrent turn of another
- *       session cannot retarget this process's MCP env before it spawns.
+ *   launch/<random>/                           per-launch HOME. settings.json,
+ *       config/mcp_config.json and the limited OAuth token file live here, so
+ *       a concurrent turn of another session cannot retarget this process's
+ *       MCP env or credential before it spawns.
  *
  * Behaviour pinned from the 1.3.4 binary (docs/ocv5-415-antigravity-cli.md):
  * MCP is read only from `$HOME/.gemini/config/mcp_config.json` (no CLI flag);
@@ -107,7 +108,15 @@ export interface AntigravityPlatformProjection {
   delegateContextFile: string | null
 }
 
+/** Limited (openid/userinfo) Google token minted by master for one turn. */
+export interface AntigravityLaunchCredential {
+  accessToken: string
+  accessTokenExpiresAt: string
+  idToken?: string
+}
+
 export interface AntigravityPlatformInput {
+  credential: AntigravityLaunchCredential
   identityCompat?: IdentityCompatRuntimeContext
   agentId: string
   projectId?: string
@@ -163,9 +172,21 @@ export function projectAntigravityPlatform(input: AntigravityPlatformInput): Ant
   linkShared(join(stable, 'conversations'), join(cliDir, 'conversations'))
   linkShared(join(stable, 'bin'), join(cliDir, 'bin'))
 
-  // modelProvider=gemini is what makes 1.3.4 honour GEMINI_API_KEY and
-  // GOOGLE_GEMINI_BASE_URL instead of starting the Google OAuth flow.
-  writePrivate(join(cliDir, 'settings.json'), `${JSON.stringify({ modelProvider: 'gemini' }, null, 2)}\n`)
+  // Google-account mode: no modelProvider override. The CLI reads this token
+  // file when no keyring is reachable; it only runs the userinfo eligibility
+  // check with it. Every Cloud Code call goes to CLOUD_CODE_URL (the relay),
+  // which swaps in the account's real token. refresh_token stays empty.
+  writePrivate(join(cliDir, 'settings.json'), `${JSON.stringify({}, null, 2)}\n`)
+  writePrivate(join(cliDir, 'antigravity-oauth-token'), `${JSON.stringify({
+    token: {
+      access_token: input.credential.accessToken,
+      token_type: 'Bearer',
+      refresh_token: '',
+      expiry: input.credential.accessTokenExpiresAt,
+    },
+    auth_method: 'consumer',
+    ...(input.credential.idToken ? { id_token: input.credential.idToken } : {}),
+  })}\n`)
 
   const advertisedMcpTools: string[] = []
   let delegateContextFile: string | null = null

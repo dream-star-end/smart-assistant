@@ -91,6 +91,8 @@ GROK_VERSION="1.0.13"
 ZCODE_APPIMAGE_VERSION="3.8.1"
 ZCODE_APPIMAGE_SHA256="ba51f8c091762bf1ba733cb71390975b8397dc178c753d52d4738365ce59ac61"
 ZCODE_CLI_VERSION="${OC_ZCODE_CLI_VERSION:-0.16.3}"
+# OCV5-415: build id + sha512 are pinned in the Dockerfile; only 1.3.4 exists there.
+ANTIGRAVITY_CLI_VERSION="1.3.4"
 
 # The image tag is a deployment handle and may be chosen before the final source commit.
 # Bind the image to the exact staged source independently so activation can reject a stale
@@ -470,6 +472,7 @@ PY
     "OC_INCLUDE_CURSOR=${OC_INCLUDE_CURSOR:-0}" \
     "OC_INCLUDE_GROK=${OC_INCLUDE_GROK:-0}" \
     "OC_INCLUDE_ZCODE=${OC_INCLUDE_ZCODE:-0}" \
+    "OC_INCLUDE_ANTIGRAVITY=${OC_INCLUDE_ANTIGRAVITY:-0}" \
     "CODEX_VERSION=${CODEX_VERSION}" \
     "OC_OFFICIAL_CLAUDE_VERSION=${OFFICIAL_CLAUDE_VERSION}" \
     "OC_CURSOR_AGENT_VERSION=${CURSOR_AGENT_VERSION}" \
@@ -477,7 +480,8 @@ PY
     "OC_GROK_VERSION=${GROK_VERSION}" \
     "OC_ZCODE_APPIMAGE_VERSION=${ZCODE_APPIMAGE_VERSION}" \
     "OC_ZCODE_APPIMAGE_SHA256=${ZCODE_APPIMAGE_SHA256}" \
-    "OC_ZCODE_CLI_VERSION=${ZCODE_CLI_VERSION}"
+    "OC_ZCODE_CLI_VERSION=${ZCODE_CLI_VERSION}" \
+    "OC_ANTIGRAVITY_CLI_VERSION=${ANTIGRAVITY_CLI_VERSION}"
 }
 
 lookup_image_by_input_digest() {
@@ -596,6 +600,8 @@ if [ "$SKIPPED_BUILD" != "1" ]; then
     --label "oc.runtime.include_zcode=${OC_INCLUDE_ZCODE:-0}" \
     --label "oc.runtime.zcode_appimage_version=$ZCODE_APPIMAGE_VERSION" \
     --label "oc.runtime.zcode_cli_version=$ZCODE_CLI_VERSION" \
+    --label "oc.runtime.include_antigravity=${OC_INCLUDE_ANTIGRAVITY:-0}" \
+    --label "oc.runtime.antigravity_cli_version=$ANTIGRAVITY_CLI_VERSION" \
     --label "oc.runtime.embed_source=${OC_EMBED_SOURCE:-1}" \
     "${LABEL_DIGEST_ARGS[@]+"${LABEL_DIGEST_ARGS[@]}"}" \
     --build-arg "OC_INCLUDE_CODEX=${OC_INCLUDE_CODEX:-1}" \
@@ -610,6 +616,8 @@ if [ "$SKIPPED_BUILD" != "1" ]; then
     --build-arg "OC_ZCODE_APPIMAGE_VERSION=$ZCODE_APPIMAGE_VERSION" \
     --build-arg "OC_ZCODE_APPIMAGE_SHA256=$ZCODE_APPIMAGE_SHA256" \
     --build-arg "OC_ZCODE_CLI_VERSION=$ZCODE_CLI_VERSION" \
+    --build-arg "OC_INCLUDE_ANTIGRAVITY=${OC_INCLUDE_ANTIGRAVITY:-0}" \
+    --build-arg "OC_ANTIGRAVITY_CLI_VERSION=$ANTIGRAVITY_CLI_VERSION" \
     --build-arg "OC_EMBED_SOURCE=${OC_EMBED_SOURCE:-1}" \
     -f "$BUILD_CTX/Dockerfile.openclaude-runtime" \
     -t "$IMAGE_FULL" \

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
@@ -119,6 +119,7 @@ describe('advisorMode snapshot', () => {
     }
     const authorized = join(root, 'ocv5-210-e4-this-task.txt')
     const sentinel = join(root, 'ocv5-210-e4-other-task-sentinel.txt')
+    t.after(() => Promise.all([rm(authorized, { force: true }), rm(sentinel, { force: true })]))
     await writeFile(authorized, 'THIS_TASK_PRODUCT')
     await writeFile(sentinel, 'SYNTHETIC_OTHER_TASK_PRIVATE_SENTINEL')
     const mentioned = parentAuthorizedArtifactTexts({
@@ -177,6 +178,7 @@ describe('advisorMode snapshot', () => {
     }
     const output = join(root, 'ocv5-210-m6-own-output.txt')
     const sentinel = join(root, 'ocv5-210-m6-other-task-sentinel.txt')
+    t.after(() => Promise.all([rm(output, { force: true }), rm(sentinel, { force: true })]))
     await writeFile(output, 'THIS_TASK_WRITE_PRODUCT')
     await writeFile(sentinel, 'SYNTHETIC_OTHER_TASK_PRIVATE_SENTINEL')
     const writeMentioned = parentAuthorizedArtifactTexts({

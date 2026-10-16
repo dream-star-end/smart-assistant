@@ -28,8 +28,13 @@ function makeConfigStub() {
   } as any
 }
 
+// Every manager is shut down before testHome is removed: their runner children
+// otherwise keep writing under agents/_platform while after() deletes it (ENOTEMPTY).
+const managers: InstanceType<typeof SessionManager>[] = []
+
 function makeManager() {
   const sm = new SessionManager(makeConfigStub())
+  managers.push(sm)
   const internals = sm as any
   internals._saveResumeMap = () => {}
   internals._resumeMap.clear()
@@ -51,6 +56,7 @@ function recordNativePrewarmId(sm: InstanceType<typeof SessionManager>, key: str
 const agent = { id: 'main', model: 'gpt-5.6-sol' } as any
 
 after(async () => {
+  for (const sm of managers) await sm.shutdownAll()
   await closeSessionsDb()
   await rm(testHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 })
 })

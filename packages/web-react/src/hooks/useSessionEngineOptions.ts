@@ -4,9 +4,10 @@
  * effect 顺序不变。语义见 lib/sessionEffort、lib/sessionContextTier。
  */
 import { useCallback, useEffect, useState } from "react";
-import type { CursorContextTier } from "@openclaude/protocol";
+import type { CursorContextTier, ServiceTier } from "@openclaude/protocol";
 import { readContextTierForSession, writeContextTier } from "../lib/sessionContextTier";
 import { readSessionEffort, writeSessionEffort } from "../lib/sessionEffort";
+import { readSessionServiceTier, writeSessionServiceTier } from "../lib/sessionServiceTier";
 import type { PreferenceEffort } from "../lib/modelPreferences";
 
 export function useSessionEngineOptions(activeId: string | undefined): {
@@ -14,6 +15,8 @@ export function useSessionEngineOptions(activeId: string | undefined): {
   setSessionEffort: (value: PreferenceEffort | null) => void;
   contextTier: CursorContextTier;
   setContextTier: (tier: CursorContextTier) => void;
+  serviceTier: ServiceTier | null;
+  setServiceTier: (tier: ServiceTier | null) => void;
 } {
   // 思考档位的会话级记忆(语义见 lib/sessionEffort):undefined = 未选择(继承
   // preferences.default_effort);null = 显式跟随模型默认;档位 = 显式选择。
@@ -48,5 +51,20 @@ export function useSessionEngineOptions(activeId: string | undefined): {
     setContextTierState(readContextTierForSession(activeId));
   }, [activeId]);
 
-  return { sessionEffort, setSessionEffort, contextTier, setContextTier };
+  // OCV5-434 GPT Fast(语义见 lib/sessionServiceTier):会话级、默认关、不跨会话继承。
+  const [serviceTier, setServiceTierState] = useState<ServiceTier | null>(() =>
+    readSessionServiceTier(activeId),
+  );
+  const setServiceTier = useCallback(
+    (tier: ServiceTier | null) => {
+      setServiceTierState(tier);
+      writeSessionServiceTier(activeId, tier);
+    },
+    [activeId],
+  );
+  useEffect(() => {
+    setServiceTierState(readSessionServiceTier(activeId));
+  }, [activeId]);
+
+  return { sessionEffort, setSessionEffort, contextTier, setContextTier, serviceTier, setServiceTier };
 }

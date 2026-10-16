@@ -173,12 +173,15 @@ export function assertPlatformDefaultModelConfigured(cfg: {
   BAILIAN_TOKEN_PLAN_KEY?: string;
   ZAI_CODING_PLAN_KEY?: string;
   SCNET_TOKEN_PLAN_KEY?: string;
-}): void {
+}, opts: {
+  /** OCV5-424:服务池(pool_api_keys)里已有该 provider 的非停用成员也算已配置。 */
+  apiKeyPoolConfigured?: (service: string) => boolean;
+} = {}): void {
   const provider = findRouteProviderForModel(PLATFORM_DEFAULT_MODEL);
   if (!provider) return;
   const meta = STATIC_PROVIDER_META[provider.id];
   const key = cfg[meta.keyConfigField];
-  if (key === undefined || key.trim() === "") {
+  if ((key === undefined || key.trim() === "") && opts.apiKeyPoolConfigured?.(provider.id) !== true) {
     throw new Error(
       `PLATFORM_DEFAULT_MODEL="${PLATFORM_DEFAULT_MODEL}" 路由到静态 provider "${provider.id}"，` +
         `但其 key(${meta.keyConfigField})未在生产 env 配置。拒绝启动 internal proxy(loud fail)，` +

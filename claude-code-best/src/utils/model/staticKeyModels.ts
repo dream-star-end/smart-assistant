@@ -89,11 +89,76 @@ export function isZaiGlm53Model(model: string): boolean {
   return model.trim().toLowerCase() === 'glm-5.3-zai'
 }
 
+/** OCV5-425 OpenCode Go `/messages` models, catalog id → upstream id. Mirrors protocol
+ *  OPENCODE_GO_MESSAGES_MODELS (equality pinned by staticKeyModels.test.ts). */
+export const OPENCODE_GO_MESSAGES_MODEL_IDS: readonly string[] = [
+  'deepseek-v4-pro-go',
+  'claude-haiku-5-5-go',
+  'kimi-k3-go',
+  'minimax-m2.7-go',
+  'minimax-m3-go',
+  'space-bunny-go',
+  'qwen3.8-max-go',
+  'qwen3.8-flash-go',
+  'qwen3.7-plus-go',
+]
+
+/** OCV5-425 phase 2 OpenCode Go chat-completions models (proxy bridge). Mirrors protocol
+ *  OPENCODE_GO_CHAT_MODELS (equality pinned by staticKeyModels.test.ts). */
+export const OPENCODE_GO_CHAT_MODEL_IDS: readonly string[] = [
+  'glm-5.3-go',
+  'glm-5.2-go',
+  'glm-5.3-flash-go',
+  'kimi-k2.7-code-go',
+  'kimi-k2.6-go',
+  'mimo-v2.6-pro-go',
+  'mimo-v2.5-pro-go',
+  'mimo-v2.6-flash-go',
+  'mimo-v2.5-go',
+  'hy4-preview-go',
+  'hy3-go',
+  'longcat-2.0-go',
+  'longcat-2.5-preview-free-go',
+  'step-5-preview-free-go',
+]
+
+/** OCV5-425 phase 3 OpenCode Go Responses models (proxy bridge). Mirrors protocol
+ *  OPENCODE_GO_RESPONSES_MODELS (equality pinned by staticKeyModels.test.ts). */
+export const OPENCODE_GO_RESPONSES_MODEL_IDS: readonly string[] = [
+  'opencode-grok-4.7',
+  'opencode-grok-4.6',
+  'opencode-gpt-6-luna',
+  'opencode-gpt-5.6-luna',
+  'muse-spark-1.3-go',
+  'muse-spark-1.2-go',
+]
+
 /** OpenCode Go 当前模型 + 历史 transport 集。DeepSeek 使用独立平台 alias，避免覆盖 direct
  *  provider；Qwen3.7 保留历史 plumbing 但由 DB catalog 下线。 */
 export function isOpencodeGoModel(model: string): boolean {
   const m = model.trim().toLowerCase()
-  return m === 'deepseek-v4-flash-opencode-go' || m === 'qwen3.7-max' || m === 'qwen3.7-plus' || m === 'gemini-4-argon-contributor'
+  return (
+    m === 'deepseek-v4-flash-opencode-go' ||
+    m === 'qwen3.7-max' ||
+    m === 'qwen3.7-plus' ||
+    m === 'gemini-4-argon-contributor' ||
+    OPENCODE_GO_MESSAGES_MODEL_IDS.includes(m) ||
+    OPENCODE_GO_CHAT_MODEL_IDS.includes(m) ||
+    OPENCODE_GO_RESPONSES_MODEL_IDS.includes(m)
+  )
+}
+
+/** Claude Haiku via OpenCode Go rejects `thinking:{enabled,budget}` (400, OCV5-425 probe);
+ *  it thinks through `output_config.effort` instead. */
+export function isOpencodeGoNoThinkingModel(model: string): boolean {
+  const m = model.trim().toLowerCase()
+  // The chat bridge does not take Anthropic thinking (reasoning runs upstream, effort maps to
+  // reasoning_effort), so CCB sends none.
+  return (
+    m === 'claude-haiku-5-5-go' ||
+    OPENCODE_GO_CHAT_MODEL_IDS.includes(m) ||
+    OPENCODE_GO_RESPONSES_MODEL_IDS.includes(m)
+  )
 }
 
 /** 只识别 OpenCode Go 的历史 Qwen 子集。 */
@@ -184,6 +249,34 @@ export const STATIC_MODEL_CONTEXT_WINDOW: ReadonlyArray<{
   { matches: (m) => m.trim().toLowerCase() === 'glm-5.1', contextWindow: 200_000 },
   { matches: isScnetGlmModel, contextWindow: 1_000_000 },
   { matches: isZaiGlm53Model, contextWindow: 1_000_000 },
+  // OCV5-425: catalog windows (https://models.dev opencode-go), capped below the next OpenCode
+  // Go price tier so one per-token price is exact (Haiku 100K; MiniMax M3 / Qwen3.7 Plus 200K).
+  // Must stay before the 1M OpenCode Go default below.
+  ...Object.entries({
+    'claude-haiku-5-5-go': 100_000,
+    'minimax-m3-go': 200_000,
+    'qwen3.7-plus-go': 200_000,
+    'minimax-m2.7-go': 204_800,
+    'qwen3.8-max-go': 262_144,
+    'kimi-k3-go': 1_048_576,
+    'space-bunny-go': 1_048_576,
+    'kimi-k2.7-code-go': 262_144,
+    'kimi-k2.6-go': 262_144,
+    'hy3-go': 192_000,
+    'hy4-preview-go': 1_024_000,
+    'mimo-v2.6-pro-go': 1_048_576,
+    'mimo-v2.5-pro-go': 1_048_576,
+    'mimo-v2.6-flash-go': 1_048_576,
+    'opencode-grok-4.7': 200_000,
+    'opencode-grok-4.6': 200_000,
+    'opencode-gpt-6-luna': 272_000,
+    'opencode-gpt-5.6-luna': 272_000,
+    'muse-spark-1.3-go': 1_048_576,
+    'muse-spark-1.2-go': 1_048_576,
+  }).map(([id, contextWindow]) => ({
+    matches: (m: string) => m.trim().toLowerCase() === id,
+    contextWindow,
+  })),
   // DeepSeek alias 与历史 qwen3.7 均为 1M；direct DeepSeek 由上面的精确表独立处理。
   { matches: isOpencodeGoModel, contextWindow: 1_000_000 },
   // kimi-k2.7-code 官方规格 256K(火山 Agent Plan 托管,max output 上游硬顶 32768)。

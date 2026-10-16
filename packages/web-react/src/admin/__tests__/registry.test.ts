@@ -10,7 +10,7 @@ import {
 // 分组 → 期望 key 列表（权威源 = React registry 的运营信息架构）。
 const EXPECTED: Record<string, string[]> = {
   经营驾驶舱: ["dashboard", "users"],
-  账号与调度: ["accounts", "accountGroups", "egressProxies"],
+  账号与调度: ["pools", "accountGroups", "egressProxies"],
   运行资源: ["containers", "hosts"],
   财务与商业: ["ledger", "orders", "pricing", "plans", "org", "modelGrants"],
   用户声音与体验: ["feedback", "autoDreamFindings", "productFriction"],

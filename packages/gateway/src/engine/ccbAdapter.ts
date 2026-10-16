@@ -18,7 +18,7 @@
  */
 import { isBoxApiModel } from '@openclaude/protocol'
 import { EventEmitter } from 'node:events'
-import { TURN_LEASE_RENEW_AFTER_MS, type GoalStateSnapshot, type JobTerminal } from '@openclaude/protocol'
+import { TURN_LEASE_RENEW_AFTER_MS, type GoalStateSnapshot, type JobTerminal, type ServiceTier } from '@openclaude/protocol'
 import type { OpenClaudeConfig } from '@openclaude/storage'
 import type { IntelligentUiApplied } from '../promptSlots.js'
 import { CcbMessageParser, type TurnResult } from '../ccbMessageParser.js'
@@ -856,6 +856,15 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
 
   setEffortLevel(level: string | undefined): void {
     this.runner.setEffortLevel(level)
+  }
+
+  /** OCV5-434: see SubprocessRunner.setServiceTier. */
+  setServiceTier(tier: ServiceTier | null, model: string | undefined): 'restart' | 'applied' | 'unchanged' {
+    return this.runner.setServiceTier(tier, model)
+  }
+
+  get serviceTier(): ServiceTier | null {
+    return this.runner.serviceTier
   }
 
   get effortLevel(): string | undefined {

@@ -151,11 +151,11 @@ describe('DashboardPage', () => {
     expect(screen.getByText('待发 / 失败').closest('.grid')).toHaveClass('grid-cols-1', 'sm:grid-cols-3')
   })
 
-  test('点击「账号池可用」KPI → 深链 #tab=accounts', async () => {
+  test('点击「订阅账号可用」KPI → 深链 #tab=pools', async () => {
     renderPage(<DashboardPage />)
-    const card = await screen.findByRole('button', { name: '查看账号池' })
+    const card = await screen.findByRole('button', { name: '查看服务池' })
     fireEvent.click(card)
-    expect(window.location.hash).toBe('#tab=accounts')
+    expect(window.location.hash).toBe('#tab=pools')
   })
 
   test('点击告警摘要卡 → 深链 #tab=alerts', async () => {
