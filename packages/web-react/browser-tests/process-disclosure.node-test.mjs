@@ -407,6 +407,20 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
         assert.ok(layout.stopTop >= layout.shellBottom - 1, `${shape}: stop line below the shell ${JSON.stringify(layout)}`);
         assert.equal(layout.between, 0, `${shape}: no timestamp between the steps and the stop line ${JSON.stringify(layout)}`);
         assert.equal(layout.proseBetween, 0, `${shape}: no assistant text outside the shell ${JSON.stringify(layout)}`);
+        // r2: the stop row keeps copy / more like a finished message, 44px touch targets; on touch the
+        // time / credits / request ID live in the menu, so no time is visible on the turn.
+        const stopRow = stopped.page.getByTestId("assistant-row").filter({ has: status });
+        for (const name of ["复制", "更多操作"]) {
+          const button = stopRow.getByTestId("assistant-actions").getByRole("button", { name, exact: true });
+          await button.waitFor({ state: "visible" });
+          const box = await button.boundingBox();
+          assert.ok(box && box.height >= 44 && box.width >= 44, `${shape}: stop row ${name} touch target ${JSON.stringify(box)}`);
+        }
+        const visibleTimes = await stopped.page.evaluate(() => [...document.querySelectorAll("time")].filter((t) => {
+          const r = t.getBoundingClientRect(); const s = getComputedStyle(t);
+          return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && Number(s.opacity) > 0;
+        }).length);
+        assert.equal(visibleTimes, 0, `${shape}: stop row keeps copy / more instead of a standing time row`);
         await stopped.page.screenshot({ path: join(shots, `ocv5-459-stopped-${shape}-mobile-collapsed.png`) });
         await stopped.page.getByTestId("process-toggle").tap();
         await stopped.page.getByText(/STOP_NARRATION_TWO/).waitFor();

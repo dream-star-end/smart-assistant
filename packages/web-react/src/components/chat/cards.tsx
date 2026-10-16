@@ -1350,7 +1350,10 @@ export function AssistantCard({
           // model wrote before a tool, or before the error the turn ended on, carries no action row.
           const showActions = !live && !hasError && !!msg.text && !isSyntheticEmptyNotice &&
             (ctx.turnFinalAssistant ?? ctx.isLast ?? true);
-          const showMinimalActions = !live && hasError && !!presentedError?.bodyText;
+          // OCV5-459: a user-stop row whose text went into the steps keeps copy / more like any
+          // finished message; copy takes the turn's last text (_stopCopyText, view-only).
+          const minimalText = presentedError?.bodyText || (isUserCancelled ? msg._stopCopyText : undefined);
+          const showMinimalActions = !live && hasError && !!minimalText;
           // 中断轮仍要露出 requestId / 积分：这是 server usage 上的持久字段，
           // 刷新后跟 server-wins 回显，不能因为 stopped 就整行藏掉。
           const showMeta = metaVisible && !hideOrphanSilentMeta;
@@ -1395,7 +1398,7 @@ export function AssistantCard({
                   msg={msg}
                   cb={cb}
                   showRegen={false}
-                  text={presentedError!.bodyText}
+                  text={minimalText}
                   minimal
                   readOnly={readOnly}
                   latest={isLastTurn}

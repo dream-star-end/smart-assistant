@@ -235,6 +235,9 @@ describe("stopped turn narration (OCV5-459)", () => {
     expect(stop.usage?.traceId).toBe("trace-s4");
     expect(stop._timelineUnitKey).toBe("unit-s4:stopped");
     expect(stop.ts).toBe(6000);
+    // r2: the stop row keeps copy / more; copy takes the stamped narration.
+    expect(stop._stopCopyText).toBe("原始提示还在临时文件里，我直接看结尾。");
+    expect(narration._stopCopyText).toBeUndefined();
   });
 
   test("after the split the stopped turn has no answer, so no narration leaves the steps", () => {
@@ -252,8 +255,32 @@ describe("stopped turn narration (OCV5-459)", () => {
       mk("tool", { id: "t2", toolName: "Bash", _completed: true, cancelled: true, _clientMessageId: "u" }),
       mk("assistant", { id: "stop", text: "本轮已取消。", _clientMessageId: "u", _errorCode: "user_cancelled" }),
     ];
-    expect(splitStoppedNarration(msgs)).toBe(msgs);
     expect(finals(msgs)).toEqual([]);
+  });
+
+  test("live stop row keeps copy / more: copy takes the turn's last text, rows stay in place", () => {
+    const msgs = [
+      mk("user", { id: "u", text: "问" }),
+      mk("assistant", { id: "n1", text: "我先读请求", _clientMessageId: "u" }),
+      mk("tool", { id: "t1", toolName: "Bash", _completed: true, _clientMessageId: "u" }),
+      mk("assistant", { id: "n2", text: "再看结尾", _clientMessageId: "u" }),
+      mk("tool", { id: "t2", toolName: "Bash", _completed: true, cancelled: true, _clientMessageId: "u" }),
+      mk("assistant", { id: "stop", text: "本轮已取消。", _clientMessageId: "u", _errorCode: "user_cancelled" }),
+    ];
+    const out = splitStoppedNarration(msgs);
+    expect(out.map((m) => m.id)).toEqual(["u", "n1", "t1", "n2", "t2", "stop"]);
+    expect(out[5]!._stopCopyText).toBe("再看结尾");
+    expect(out[5]!.text).toBe("本轮已取消。");
+    expect(msgs[5]!._stopCopyText).toBeUndefined();
+  });
+
+  test("a stop before any text has nothing to copy", () => {
+    const msgs = [
+      mk("user", { id: "u", text: "问" }),
+      mk("tool", { id: "t1", toolName: "Bash", _completed: true, cancelled: true, _clientMessageId: "u" }),
+      mk("assistant", { id: "stop", text: "本轮已取消。", _clientMessageId: "u", _errorCode: "user_cancelled" }),
+    ];
+    expect(splitStoppedNarration(msgs)).toBe(msgs);
   });
 
   test("stopped mid-answer: text with no step after it stays the answer, stamp is not split", () => {
