@@ -272,10 +272,16 @@ test("OCV5-265 process disclosure: real MessageList, production CSS, red/green e
       await stream.page.evaluate(() => window.__processPage.appendAnswer("\n尾部仍在增长"));
       await stream.page.getByText("尾部仍在增长").waitFor();
       await stream.page.evaluate(() => window.__processPage.setSending(false));
-      await stream.page.getByText("尾部仍在增长").waitFor();
-      assert.equal(await stream.page.getByTestId("process-toggle").getAttribute("aria-expanded"), "true", "manual open collapsed when the turn finished");
-      const finished = await stream.page.getByText("STREAM_TAIL_MARKER").evaluate((node) => !!node.closest("[data-testid=assistant-row]") && !node.closest("[data-testid=process-disclosure]"));
+      // The finished layout lands on a later render. Waiting for text that was already on the
+      // page returned at once and raced it on slow runners (OCV5-457); wait for the layout itself.
+      const finished = await stream.page.waitForFunction(() => {
+        const has = (el) => (el.textContent || "").includes("STREAM_TAIL_MARKER");
+        const inAnswer = [...document.querySelectorAll("[data-testid=assistant-row]")].some((row) => has(row) && !row.closest("[data-testid=process-disclosure]"));
+        const inProcess = [...document.querySelectorAll("[data-testid=process-disclosure]")].some(has);
+        return inAnswer && !inProcess;
+      }, null, { timeout: 4000 }).then(() => true, () => false);
       assert.equal(finished, true, "finished answer did not become the only top-level reply");
+      assert.equal(await stream.page.getByTestId("process-toggle").getAttribute("aria-expanded"), "true", "manual open collapsed when the turn finished");
       await stream.page.screenshot({ path: join(shots, "ocv5-265-manus-stream-answer.png") });
       await stream.page.screenshot({ path: join(shots, "ocv5-265-live-flow-stream-finished.png") });
       assert.equal(stream.errors.length, 0, stream.errors.join("\n"));

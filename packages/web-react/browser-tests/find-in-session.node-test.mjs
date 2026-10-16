@@ -165,6 +165,13 @@ async function holdFence(page) {
   await page.waitForFunction(() => window.__findPage.wheelFence === true, null, { timeout: 2000 });
 }
 
+/** Wait (bounded) for a gesture to clear the pin; the assertions that follow still decide. */
+async function waitPinCleared(page) {
+  await page.waitForFunction(() =>
+    (document.querySelector("[data-testid=timeline-short-list]")?.getAttribute("data-find-pin") ?? "") === "",
+  null, { timeout: 4000 }).catch(() => {});
+}
+
 async function waitPin(page, key) {
   await page.waitForFunction((k) =>
     document.querySelector("[data-testid=timeline-short-list]")?.getAttribute("data-find-pin") === k,
@@ -696,13 +703,41 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
         try {
           await typeNeedle(page, "FIND_NEEDLE_MID");
           events.keys += 15;
-          await holdFence(page);
-          events.wheels += 1;
+          await installGestureObserver(page);
+          await page.getByTestId("find-chat-scroll").hover();
           const sessionBefore = await page.getByTestId("session").textContent();
-          await page.getByRole("button", { name: "下一处" }).click();
-          events.clicks += 1;
-          await waitPin(page, "m250");
-          const pending = await snapshot(page);
+          // holdFence only marks the fence; any scroll in the meantime arms the 200 ms quiet timer,
+          // and on a slow runner the jump could land before the wheel arrived (OCV5-457). Count an
+          // attempt only when the wheel reached the page while the jump was still pending, as
+          // runToolbarCancel does.
+          let pending = null;
+          let ev = null;
+          for (let attempt = 0; attempt < 4 && !ev; attempt += 1) {
+            await page.evaluate(() => {
+              const el = document.querySelector("[data-testid=find-chat-scroll]");
+              if (el) el.scrollTop = el.scrollHeight;
+            });
+            // Past the 200 ms quiet window: the reset's scroll must not arm a timer that ends the
+            // fresh fence before the jump is captured pending.
+            await page.waitForTimeout(250);
+            await takeGestureEvents(page);
+            await holdFence(page);
+            events.wheels += 1;
+            await page.getByRole("button", { name: "下一处" }).click();
+            events.clicks += 1;
+            await waitPin(page, "m250");
+            pending = await snapshot(page);
+            if (!(pending.findPin === "m250" && pending.visible !== true && pending.wheelFence === true)) continue;
+            await page.mouse.wheel(0, -240);
+            events.wheels += 1;
+            await page.waitForFunction(() =>
+              (window.__findGestureEvents || []).some((e) => e.type === "wheel" && e.deltaY === -240),
+            null, { timeout: 4000 });
+            const gest = await takeGestureEvents(page);
+            // The DOM pin attribute lags a landed jump by one render; the scroll position does not.
+            ev = [...gest].reverse().find((e) => e.type === "wheel" && e.deltaY === -240 && e.pin === "m250"
+              && Math.abs((e.top ?? 0) - pending.scrollTop) < 400) || null;
+          }
           pending.pageErrors = errors.length;
           const pendingOk = pending.findPin === "m250" && pending.visible !== true && pending.following === false;
           record(rows, "pending-positive-m250", {
@@ -713,9 +748,9 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
           assert.equal(pending.visible, false);
           assert.equal(pending.following, false);
           const topBefore = pending.scrollTop;
-          await page.getByTestId("find-chat-scroll").hover();
-          await page.mouse.wheel(0, -240);
-          events.wheels += 1;
+          assert.ok(ev, "no wheel reached the page while the find pin was pending");
+          // Then keep the 280 ms window that would catch a re-jump.
+          await waitPinCleared(page);
           await page.waitForTimeout(280);
           const afterWheel = await snapshot(page);
           afterWheel.pageErrors = errors.length;
@@ -747,6 +782,7 @@ test("OCV5-188 F4 find navigation (real MessageList, controller, production CSS)
           await page.mouse.move(x, y - 50, { steps: 6 });
           await page.mouse.up();
           events.drags += 1;
+          await waitPinCleared(page);
           await page.waitForTimeout(280);
           const afterDrag = await snapshot(page);
           afterDrag.pageErrors = errors.length;
