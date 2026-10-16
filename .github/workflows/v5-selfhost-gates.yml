@@ -62,6 +62,11 @@ jobs:
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
           echo "comparison base: $ref"
 
+      # OCV5-450:列车迁移门的两项先在 PR 上跑:未列入 requiredMigrations 即红;
+      # 破坏性 DDL 只标注(发布时仍需用户批准 + OC_V5_ALLOW_BREAKING_MIGRATION=1)。
+      - name: Migration precheck (same rules as the train's migration gate)
+        run: bash scripts/v5-selfhost-migration-precheck.sh --base "${{ steps.base.outputs.ref }}"
+
       - name: Biome (changed files, no new errors)
         run: bash scripts/check-biome-changed.sh --base "${{ steps.base.outputs.ref }}"
 
