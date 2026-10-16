@@ -301,6 +301,12 @@
       "reason": "OCV5-411 #723 Codex r1 P1: six tables from selfhost migrations 0306–0308 had no retention disposition; pool_events now gets its documented 30-day sweep. Latent: the tables do not exist in commercial yet; nothing user-visible.",
       "approvedBy": "user 2026-10-16 管家转用户要求：#723 Codex r1 的 P1 与红项都修掉，不发商业版（cc3 sync 会话）",
       "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "51790b628c2c9daddf200f9ad9645e5cee6df93e",
+      "reason": "OCV5-411 #723 CI red (commercial-integ pr-3): getFreshAntigravityAccessToken leaked a pool client when the KMS key failed to load, so poolPolicy0306 hung in its after hook. Latent: Antigravity is admin-only and disabled in commercial and no commercial release carried it; selfhost owner-only.",
+      "approvedBy": "user 2026-10-16 管家转用户要求：#723 Codex r1 的 P1 与红项都修掉，不发商业版（cc3 sync 会话）",
+      "expiresAt": "2026-11-15"
     }
   ]
 }
