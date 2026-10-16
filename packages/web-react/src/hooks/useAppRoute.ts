@@ -236,6 +236,84 @@ export function parseTutorialStep(sp: URLSearchParams): number | null {
 }
 
 /** help 面板除 topic / case / community 之外的可选定位：页签、精选作品、目标步骤。 */
+/**
+ * 当前 location 上的特判页与启动深链（OCV5-467 自 App.tsx 移入）。App 每次渲染都调用一次：
+ * 特判开关须随 URL 变化（离开 /reset-password 后 routingEnabled 会翻转），不能冻结在 boot；
+ * panel 与 tutorial* 只被 App 的 useState 初值消费。
+ * - /reset-password?token=…：密码重置邮件链接（gateway SPA fallback 对无扩展名路径回退
+ *   index.html），启动即进入 AuthGate 的 reset 模式；
+ * - /desktop/enroll?enrollment_id=：桌面 enrollment 确认页（同族）；
+ * - demo / reset-password / desktop/enroll 不启用路由（routingEnabled=false，URL 原样保留）。
+ */
+export type LocationRoute = {
+  params: URLSearchParams
+  demo: boolean
+  resetToken: string | undefined
+  desktopEnroll: boolean
+  routingEnabled: boolean
+  panel: PanelParam | null
+  tutorialCommunity: string | null
+  tutorialCase: TutorialCaseId | null
+  tutorialTopic: ProductFeatureId | null
+  tutorialTab: TutorialTab | null
+  tutorialWork: TutorialWorkId | null
+  tutorialStep: number | null
+}
+
+export function readLocationRoute(loc: { pathname: string; search: string }): LocationRoute {
+  const params = new URLSearchParams(loc.search)
+  const demo = params.get('demo') === '1'
+  const resetToken =
+    !demo && loc.pathname === '/reset-password' ? params.get('token') || undefined : undefined
+  const desktopEnroll = !demo && loc.pathname === '/desktop/enroll'
+  const routingEnabled = !demo && !resetToken && !desktopEnroll
+  const tutorialCommunity = routingEnabled ? parseTutorialCommunity(params) : null
+  const tutorialCase = routingEnabled ? parseTutorialCase(params) : null
+  return {
+    params,
+    demo,
+    resetToken,
+    desktopEnroll,
+    routingEnabled,
+    panel: routingEnabled ? parsePanelParam(params) : null,
+    tutorialCommunity,
+    tutorialCase,
+    tutorialTopic:
+      routingEnabled && !tutorialCase && !tutorialCommunity ? parseTutorialTopic(params) : null,
+    // 教程中心一级页签 / 精选作品 / 目标步骤深链（tutorials 审计 TU-17）：解析函数自带互斥，
+    // 有 topic/case/community 时 tab、work 为 null；step 只跟 topic。
+    tutorialTab: routingEnabled ? parseTutorialTab(params) : null,
+    tutorialWork: routingEnabled ? parseTutorialWork(params) : null,
+    tutorialStep: routingEnabled ? parseTutorialStep(params) : null,
+  }
+}
+
+/** 面板深链单选优先级：教程 > 设置 > 市场 > 管理 > 组织（同一时刻仅镜像一个顶层中心）。 */
+export function activePanelOf(open: {
+  help: boolean
+  settings: boolean
+  market: boolean
+  manage: boolean
+  org: boolean
+}): PanelParam | null {
+  if (open.help) return 'help'
+  if (open.settings) return 'settings'
+  if (open.market) return 'market'
+  if (open.manage) return 'manage'
+  if (open.org) return 'org'
+  return null
+}
+
+/** 一次性 query（OAuth 回调标记、邀请 token 等）消费后写回：replaceState，保留 path 与 hash。 */
+export function replaceSearchParams(sp: URLSearchParams): void {
+  const q = sp.toString()
+  window.history.replaceState(
+    {},
+    '',
+    window.location.pathname + (q ? `?${q}` : '') + window.location.hash,
+  )
+}
+
 export type TutorialPanelExtras = {
   tab?: TutorialTab | null
   work?: TutorialWorkId | null
