@@ -7631,8 +7631,8 @@
         },
         {
           "layer": "deploy-gate",
-          "path": "scripts/v5-user-contract-smoke.mjs",
-          "assertion": "C3 the model answers from the user's message in its context, never from an offloaded request file"
+          "path": "scripts/check-v5-grok-cli-compatibility.ts",
+          "assertion": "the user's words reach the model's context inline, not as a file to read"
         }
       ]
     },
