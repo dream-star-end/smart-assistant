@@ -104,10 +104,10 @@ import { useAgentGate } from "./hooks/useAgentGate";
 import { useHistorySkeleton } from "./hooks/useHistorySkeleton";
 import {
   type BoardViewParam,
-  type PanelParam,
   parseBoardView,
   parseBoardTicket,
   parseBoardTicketType,
+  activePanelOf,
   parsePanelParam,
   parseProjectPath,
   parseSessionPath,
@@ -118,6 +118,8 @@ import {
   parseTutorialTopic,
   parseTutorialWork,
   preferredBoardView,
+  readLocationRoute,
+  replaceSearchParams,
   type ProjectRoute,
   type TutorialTab,
   type TutorialWorkId,
@@ -359,31 +361,10 @@ function replyQuoteText(message: ChatMessage): string {
 
 
 export function App() {
-  const params = new URLSearchParams(location.search);
-  const demo = params.get("demo") === "1";
-  // 密码重置邮件链接：/reset-password?token=…（gateway SPA fallback 对无扩展名路径回退
-  // index.html，故 SPA 能接住）。启动即检测 → 直接进入 AuthGate 的 reset 模式。
-  const resetToken =
-    !demo && location.pathname === "/reset-password"
-      ? params.get("token") || undefined
-      : undefined;
-  // 桌面 enrollment 确认页：/desktop/enroll?enrollment_id=（gateway SPA fallback 无扩展名回退
-  // index.html，与 /reset-password 同族）。demo 模式不启用。
-  const desktopEnroll = !demo && location.pathname === "/desktop/enroll";
-  // P7 最小路由（无路由库）：demo / reset-password / desktop/enroll 特判不启用。boot 时一次性解析
-  // URL 深链（会话 /s/<id> + 面板 ?panel=），此后 URL 是状态的 replaceState 单向镜像。
-  const routingEnabled = !demo && !resetToken && !desktopEnroll;
-  const bootPanel = routingEnabled ? parsePanelParam(params) : null;
-  const bootTutorialCommunity = routingEnabled ? parseTutorialCommunity(params) : null;
-  const bootTutorialCase = routingEnabled ? parseTutorialCase(params) : null;
-  const bootTutorialTopic = routingEnabled && !bootTutorialCase && !bootTutorialCommunity
-    ? parseTutorialTopic(params)
-    : null;
-  // 教程中心一级页签 / 精选作品 / 目标步骤深链（tutorials 审计 TU-17）：解析函数自带互斥，
-  // 有 topic/case/community 时 tab、work 为 null；step 只跟 topic。
-  const bootTutorialTab = routingEnabled ? parseTutorialTab(params) : null;
-  const bootTutorialWork = routingEnabled ? parseTutorialWork(params) : null;
-  const bootTutorialStep = routingEnabled ? parseTutorialStep(params) : null;
+  // P7 最小路由（无路由库）：特判页（demo / reset-password / desktop/enroll）与启动深链
+  // （会话 /s/<id> + 面板 ?panel=）的解析见 readLocationRoute；此后 URL 是状态的 replaceState 单向镜像。
+  const urlRoute = readLocationRoute(location);
+  const { params, demo, resetToken, desktopEnroll, routingEnabled } = urlRoute;
   // 会话深链恢复未决标记：resolve 前 useSessionList 暂停"自动选中上次会话"
   // （URL 指定 > 最近会话）；resolve/放弃后置 null。
   const [pendingRouteSession, setPendingRouteSession] = useState<string | null>(() =>
@@ -492,7 +473,7 @@ export function App() {
   );
   // 面板深链：boot 读到 ?panel= 即以打开态初始化（工作区渲染后即呈现；未登录深链则
   // 登录后呈现）。打开/关闭经 useAppRoute 同步回 query。
-  const [settingsOpen, setSettingsOpen] = useState(bootPanel === "settings");
+  const [settingsOpen, setSettingsOpen] = useState(urlRoute.panel === "settings");
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("account");
   const [messageFeedback, setMessageFeedback] = useState<FeedbackContext | null>(null);
   const messageFeedbackTriggerRef = useRef<HTMLElement | null>(null);
@@ -512,22 +493,22 @@ export function App() {
   const [liveMediaJob, setLiveMediaJob] = useState<MediaGenerationJob | null>(null);
   const [repoModalOpen, setRepoModalOpen] = useState(false);
   const repoModalMounted = useMountedOnce(repoModalOpen);
-  const [manageOpen, setManageOpen] = useState(bootPanel === "manage");
+  const [manageOpen, setManageOpen] = useState(urlRoute.panel === "manage");
   const [manageTab, setManageTab] = useState<ManageTab>(DEFAULT_MANAGE_TAB);
   const [manageAutoAuthorizePluginSlug, setManageAutoAuthorizePluginSlug] = useState<
     string | null
   >(null);
-  const [marketplaceOpen, setMarketplaceOpen] = useState(bootPanel === "market");
-  const [orgOpen, setOrgOpen] = useState(bootPanel === "org");
+  const [marketplaceOpen, setMarketplaceOpen] = useState(urlRoute.panel === "market");
+  const [orgOpen, setOrgOpen] = useState(urlRoute.panel === "org");
   const [orgSection, setOrgSection] = useState<OrgSection>("overview");
-  const [tutorialOpen, setTutorialOpen] = useState(bootPanel === "help");
-  const [tutorialTopic, setTutorialTopic] = useState<ProductFeatureId | null>(bootTutorialTopic);
-  const [tutorialCase, setTutorialCase] = useState<TutorialCaseId | null>(bootTutorialCase);
-  const [tutorialCommunity, setTutorialCommunity] = useState<string | null>(bootTutorialCommunity);
+  const [tutorialOpen, setTutorialOpen] = useState(urlRoute.panel === "help");
+  const [tutorialTopic, setTutorialTopic] = useState<ProductFeatureId | null>(urlRoute.tutorialTopic);
+  const [tutorialCase, setTutorialCase] = useState<TutorialCaseId | null>(urlRoute.tutorialCase);
+  const [tutorialCommunity, setTutorialCommunity] = useState<string | null>(urlRoute.tutorialCommunity);
   // 一级页签（null = 案例展厅，不进 URL）/ 精选作品 / 功能教程目标步骤：镜像到 ?tab= / ?work= / ?step=。
-  const [tutorialTab, setTutorialTab] = useState<TutorialTab | null>(bootTutorialTab);
-  const [tutorialWork, setTutorialWork] = useState<TutorialWorkId | null>(bootTutorialWork);
-  const [tutorialStep, setTutorialStep] = useState<number | null>(bootTutorialStep);
+  const [tutorialTab, setTutorialTab] = useState<TutorialTab | null>(urlRoute.tutorialTab);
+  const [tutorialWork, setTutorialWork] = useState<TutorialWorkId | null>(urlRoute.tutorialWork);
+  const [tutorialStep, setTutorialStep] = useState<number | null>(urlRoute.tutorialStep);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
@@ -2058,14 +2039,7 @@ export function App() {
       sp.delete("connector_error");
       touched = true;
     }
-    if (touched) {
-      const q = sp.toString();
-      window.history.replaceState(
-        {},
-        "",
-        window.location.pathname + (q ? `?${q}` : "") + window.location.hash,
-      );
-    }
+    if (touched) replaceSearchParams(sp);
   }, [demo, toast]);
 
   // 组织邀请接受流:URL 带 ?orgInvite=<token>。已登录 → 确认弹层 → accept → 刷新 /api/me;
@@ -2091,8 +2065,7 @@ export function App() {
       // 无论接受与否都清掉 query,避免刷新重复弹层。
       const sp = new URLSearchParams(window.location.search);
       sp.delete("orgInvite");
-      const q = sp.toString();
-      window.history.replaceState({}, "", window.location.pathname + (q ? `?${q}` : "") + window.location.hash);
+      replaceSearchParams(sp);
       if (!ok) return;
       try {
         await api.acceptOrgInvitation(a, token);
@@ -3202,18 +3175,14 @@ export function App() {
   }, [inWorkspace, sending, stopTurn]);
 
   // ── P7 最小路由接线：URL 单向镜像（会话路径 + 面板 query）/ popstate / 深链恢复 ──
-  // 面板深链单选优先级：教程 > 设置 > 市场 > 管理 > 组织（同一时刻仅镜像一个顶层中心）。
-  const activePanel: PanelParam | null = tutorialOpen
-    ? "help"
-    : settingsOpen
-      ? "settings"
-      : marketplaceOpen
-        ? "market"
-        : manageOpen
-          ? "manage"
-          : orgOpen
-            ? "org"
-            : null;
+  // 面板深链单选优先级见 activePanelOf（同一时刻仅镜像一个顶层中心）。
+  const activePanel = activePanelOf({
+    help: tutorialOpen,
+    settings: settingsOpen,
+    market: marketplaceOpen,
+    manage: manageOpen,
+    org: orgOpen,
+  });
   const routeProjectIds = useMemo(() => projects.map((p) => p.id), [projects]);
   useAppRoute({
     enabled: routingEnabled,
