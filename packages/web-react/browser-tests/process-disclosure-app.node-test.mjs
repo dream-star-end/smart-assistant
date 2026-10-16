@@ -258,23 +258,22 @@ test("OCV5-265 App E2E: real WebSocket fixture, not a disconnected preview", { t
       return placed;
     }
 
+    // Layout helper only: brings a row into the top band for screenshots and geometry checks.
+    // It scrolls the list directly; a synthetic hover/wheel here waited 20 s on a stalled input
+    // ack on CI (OCV5-457). Tests that need a real user wheel dispatch it themselves.
     async function align(page, locator) {
-      const scroller = page.locator(".chat-scroll-area");
-      await scroller.hover();
       for (let i = 0; i < 16; i += 1) {
         const placed = await locator.evaluate((el) => {
           const box = el.closest(".chat-scroll-area");
           if (!box) return false;
           const view = box.getBoundingClientRect();
           const row = el.getBoundingClientRect();
-          return row.height > 8 && row.top >= view.top + 4 && row.top <= view.top + 200;
+          if (row.height > 8 && row.top >= view.top + 4 && row.top <= view.top + 200) return true;
+          box.scrollTop += row.top - (view.top + 40);
+          box.dispatchEvent(new Event("scroll"));
+          return false;
         });
         if (placed) return;
-        const dir = await locator.evaluate((el) => {
-          const box = el.closest(".chat-scroll-area");
-          return el.getBoundingClientRect().top < box.getBoundingClientRect().top + 4 ? -1 : 1;
-        });
-        await page.mouse.wheel(0, dir * 360);
         await page.waitForTimeout(70);
       }
     }
