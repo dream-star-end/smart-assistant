@@ -308,6 +308,22 @@ export function _antigravityInflightForTests(): ReadonlyMap<string, InflightSlot
   return inflight
 }
 
+/** Resolves true once `res` drains, false if it closes (or already has) first. */
+function drainedOrClosed(res: ServerResponse): Promise<boolean> {
+  if (res.destroyed || res.writableEnded) return Promise.resolve(false)
+  return new Promise<boolean>((resolve) => {
+    const settle = (open: boolean) => {
+      res.off('drain', onDrain)
+      res.off('close', onClose)
+      resolve(open)
+    }
+    const onDrain = () => settle(true)
+    const onClose = () => settle(false)
+    res.once('drain', onDrain)
+    res.once('close', onClose)
+  })
+}
+
 export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): AntigravityRelayHandler {
   const now = deps.now ?? Date.now
   const freshToken =
@@ -554,9 +570,14 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       const tap = generate
         ? new AntigravityUsageTap(rpc === STREAMING_GENERATE ? 'sse' : 'json')
         : null
+      // A CLI that goes away mid-stream must not park this handler on a `drain`
+      // that never comes: keep reading Google to the end (the call is billed
+      // upstream either way) so usage is still recorded and the reservation freed.
+      let downstreamOpen = true
       for await (const chunk of upstream.body) {
         tap?.push(chunk as Buffer)
-        if (!res.write(chunk)) await new Promise<void>((resolve) => res.once('drain', resolve))
+        if (!downstreamOpen) continue
+        if (res.destroyed || !res.write(chunk)) downstreamOpen = await drainedOrClosed(res)
       }
       if (tap) {
         tap.end()
@@ -598,7 +619,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
           }
         }
       }
-      res.end()
+      if (downstreamOpen) res.end()
     } catch (err) {
       if (res.headersSent) {
         res.destroy(err instanceof Error ? err : undefined)
