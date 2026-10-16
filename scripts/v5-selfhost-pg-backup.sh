@@ -31,6 +31,8 @@
 # Non-zero exits trigger openclaude-v5-selfhost-watch-alert@ via OnFailure=.
 set -Eeuo pipefail
 umask 077
+# Deterministic glob/sort order: rotation relies on it.
+export LC_ALL=C
 
 DB="${V5SB_DB:-openclaude_v5_selfhost}"
 BACKUP_DIR="${V5SB_DIR:-/var/backups/openclaude-v5-selfhost}"
@@ -45,13 +47,15 @@ LARGE_TABLES="${V5SB_LARGE_TABLES:-client_session_turn_tape_records client_sessi
 COMPRESS="${V5SB_COMPRESS:-zstd:3}"
 CORE_EST_DEFAULT_BYTES="${V5SB_CORE_EST_BYTES:-1073741824}"
 FULL_SINK="${V5SB_FULL_SINK:-}"
-WATCH_INTERVAL="${V5SB_WATCH_INTERVAL:-5}"
+WATCH_INTERVAL="${V5SB_WATCH_INTERVAL:-2}"
 PG_DUMP="${V5SB_PG_DUMP:-pg_dump}"
 PG_RESTORE="${V5SB_PG_RESTORE:-pg_restore}"
 PSQL="${V5SB_PSQL:-psql}"
 # Run pg tools as this OS user (peer auth on the local socket). Empty = as is.
 PG_AS="${V5SB_PG_AS-postgres}"
 DRILL_DB="${V5SB_DRILL_DB:-openclaude_v5_selfhost_restore_drill}"
+DRILL_FACTOR="${V5SB_DRILL_FACTOR:-30}"
+PG_DATA_PATH="${V5SB_PG_DATA_PATH:-/var/lib/postgresql}"
 
 GIB=1073741824
 
@@ -154,90 +158,174 @@ exclude_args() {
 }
 
 # ── core tier ────────────────────────────────────────────────────────────────
-run_core() {
-  local started est free need floor ts final partial pid rc reason bytes sha tdata
-  started=$(date +%s)
-  install -d -m 700 -- "$BACKUP_DIR"
-  est=$(last_core_bytes)
-  if (( est > 0 )); then est=$(( est * 3 / 2 )); else est=$CORE_EST_DEFAULT_BYTES; fi
-  free=$(avail_bytes "$BACKUP_DIR")
-  need=$(( est + MIN_FREE_GIB * GIB ))
-  if (( free < need )); then
-    reason="free=${free} < estimate=${est} + floor=${MIN_FREE_GIB}GiB"
-    log "core SKIPPED_LOW_DISK $reason"
-    write_status core "$(tier_json result=skipped_low_disk "at=$(now_iso)" "reason=$reason" "freeBytes=$free")"
-    return 3
-  fi
+# Every step below checks its own result: run_core is called as `run_core || rc=$?`,
+# which turns `set -e` off inside it (OCV5-443 review r1).
+core_fail() { # <result> <reason>
+  log "core ${1^^} $2"
+  write_status core "$(tier_json "result=$1" "at=$(now_iso)" "reason=$2")" || log "status write failed"
+}
 
-  ts=$(date -u +%Y%m%dT%H%M%SZ)
-  final="$BACKUP_DIR/core-$ts.dump"
-  partial="$final.partial"
-  floor=$(( ABORT_FREE_GIB * GIB ))
-  log "core start db=$DB est=${est} free=${free} -> $final"
+# The backup dir must be a real directory owned by us, mode 0700, so nothing
+# else can plant links or files in it.
+ensure_backup_dir() {
+  [[ ! -L "$BACKUP_DIR" ]] || return 1
+  install -d -m 700 -- "$BACKUP_DIR" || return 1
+  [[ -d "$BACKUP_DIR" && ! -L "$BACKUP_DIR" ]] || return 1
+  [[ "$(stat -c %u -- "$BACKUP_DIR")" == "$(id -u)" ]] || return 1
+  chmod 700 -- "$BACKUP_DIR"
+}
 
-  local -a args
-  mapfile -t args < <(exclude_args)
-  # The redirect is done by this (root) shell, so the file is root:root 0600.
-  as_pg "$PG_DUMP" -Fc -Z "$COMPRESS" --no-password "${args[@]}" -d "$DB" >"$partial" &
-  pid=$!
-  reason=""
+# Wait for <pid> while sampling free space on <path>. Kills it when free space
+# drops below <floor>, and samples once more after it exits (the last writes
+# can land between two samples). Sets WD_RC and WD_REASON (empty = no abort).
+watchdog_wait() { # <pid> <path> <floor-bytes> <what>
+  local pid="$1" path="$2" floor="$3" what="$4" free
+  WD_RC=0
+  WD_REASON=""
   while kill -0 "$pid" 2>/dev/null; do
-    free=$(avail_bytes "$BACKUP_DIR")
-    if (( free < floor )); then
-      reason="free=${free} fell below abort floor ${ABORT_FREE_GIB}GiB during dump"
+    free=$(avail_bytes "$path")
+    if [[ ! "$free" =~ ^[0-9]+$ ]] || (( free < floor )); then
+      WD_REASON="free=${free:-unknown} below abort floor ${ABORT_FREE_GIB}GiB during $what"
       pkill -TERM -P "$pid" 2>/dev/null || true
       kill -TERM "$pid" 2>/dev/null || true
       break
     fi
     sleep "$WATCH_INTERVAL"
   done
-  rc=0
-  wait "$pid" || rc=$?
-  if [[ -n "$reason" ]]; then
-    rm -f -- "$partial"
-    log "core ABORTED_LOW_DISK $reason"
-    write_status core "$(tier_json result=aborted_low_disk "at=$(now_iso)" "reason=$reason")"
+  wait "$pid" || WD_RC=$?
+  if [[ -z "$WD_REASON" ]]; then
+    free=$(avail_bytes "$path")
+    if [[ ! "$free" =~ ^[0-9]+$ ]] || (( free < floor )); then
+      WD_REASON="free=${free:-unknown} below abort floor ${ABORT_FREE_GIB}GiB after $what"
+    fi
+  fi
+  return 0
+}
+
+# Removes one file this script owns: a plain name inside BACKUP_DIR, never a path.
+drop_own() { # <basename>
+  local name="$1"
+  [[ -n "$name" && "$name" != */* && "$name" == core-* ]] || return 1
+  rm -f -- "${BACKUP_DIR:?}/${name}"
+}
+
+run_core() {
+  local started est free need floor ts name final partial sumfile p rc bytes sha tdata
+  started=$(date +%s)
+  if ! ensure_backup_dir; then
+    core_fail dir_unsafe "$BACKUP_DIR is not a real directory owned by uid $(id -u)"
+    return 1
+  fi
+  est=$(last_core_bytes)
+  [[ "$est" =~ ^[0-9]+$ ]] || est=0
+  if (( est > 0 )); then est=$(( est * 3 / 2 )); else est=$CORE_EST_DEFAULT_BYTES; fi
+  free=$(avail_bytes "$BACKUP_DIR")
+  if [[ ! "$free" =~ ^[0-9]+$ ]]; then
+    core_fail df_failed "cannot read free space of $BACKUP_DIR"
+    return 1
+  fi
+  need=$(( est + MIN_FREE_GIB * GIB ))
+  if (( free < need )); then
+    log "core SKIPPED_LOW_DISK free=${free} < estimate=${est} + floor=${MIN_FREE_GIB}GiB"
+    write_status core "$(tier_json result=skipped_low_disk "at=$(now_iso)" \
+      "reason=free=${free} < estimate=${est} + floor=${MIN_FREE_GIB}GiB" "freeBytes=$free")" || true
     return 3
   fi
-  if (( rc != 0 )) || [[ ! -s "$partial" ]]; then
-    rm -f -- "$partial"
-    log "core DUMP_FAILED rc=$rc"
-    write_status core "$(tier_json result=dump_failed "at=$(now_iso)" "reason=pg_dump rc=$rc")"
+
+  ts=$(date -u +%Y%m%dT%H%M%SZ)
+  name="core-$ts.dump"
+  final="$BACKUP_DIR/$name"
+  partial="$final.partial"
+  sumfile="$final.sha256"
+  for p in "$final" "$partial" "$sumfile"; do
+    if [[ -e "$p" || -L "$p" ]]; then
+      core_fail path_exists "refusing to reuse existing path $p"
+      return 1
+    fi
+  done
+  floor=$(( ABORT_FREE_GIB * GIB ))
+  log "core start db=$DB est=${est} free=${free} -> $final"
+
+  local -a args
+  mapfile -t args < <(exclude_args)
+  # noclobber: the redirect never opens an existing file or follows a link.
+  # Done by this (root) shell, so the file is root:root 0600 (umask 077).
+  ( set -C; as_pg "$PG_DUMP" -Fc -Z "$COMPRESS" --no-password "${args[@]}" -d "$DB" >"$partial" ) &
+  watchdog_wait $! "$BACKUP_DIR" "$floor" dump
+  rc=$WD_RC
+  if [[ -n "$WD_REASON" ]]; then
+    drop_own "$name.partial" || true
+    core_fail aborted_low_disk "$WD_REASON"
+    return 3
+  fi
+  if (( rc != 0 )) || [[ ! -f "$partial" || -L "$partial" || ! -s "$partial" ]]; then
+    drop_own "$name.partial" || true
+    core_fail dump_failed "pg_dump rc=$rc"
     return 1
   fi
 
   # Verify: the archive TOC must be readable and contain table data.
   tdata=$("$PG_RESTORE" --list -- "$partial" 2>/dev/null | grep -c ' TABLE DATA ' || true)
-  if [[ -z "$tdata" || "$tdata" -lt 1 ]]; then
-    rm -f -- "$partial"
-    log "core VERIFY_FAILED table_data=${tdata:-0}"
-    write_status core "$(tier_json result=verify_failed "at=$(now_iso)" "reason=pg_restore --list table_data=${tdata:-0}")"
+  if [[ ! "$tdata" =~ ^[0-9]+$ ]] || (( tdata < 1 )); then
+    drop_own "$name.partial" || true
+    core_fail verify_failed "pg_restore --list table_data=${tdata:-0}"
     return 1
   fi
 
-  bytes=$(stat -c %s -- "$partial")
-  sha=$(sha256sum -- "$partial" | awk '{print $1}')
-  mv -T -- "$partial" "$final"
-  printf '%s  %s\n' "$sha" "$(basename -- "$final")" >"$final.sha256"
-  rotate_core
+  bytes=$(stat -c %s -- "$partial" || true)
+  sha=$(sha256sum -- "$partial" | awk '{print $1}' || true)
+  if [[ ! "$bytes" =~ ^[0-9]+$ || ! "$sha" =~ ^[0-9a-f]{64}$ ]]; then
+    drop_own "$name.partial" || true
+    core_fail hash_failed "size or sha256 of $partial unreadable"
+    return 1
+  fi
+  if ! mv -T -- "$partial" "$final" || [[ ! -f "$final" || -L "$final" || -e "$partial" ]]; then
+    drop_own "$name.partial" || true
+    core_fail promote_failed "mv $partial -> $final failed"
+    return 1
+  fi
+  if ! ( set -C; printf '%s  %s\n' "$sha" "$name" >"$sumfile" ); then
+    core_fail sidecar_failed "cannot write $sumfile (dump kept at $final)"
+    return 1
+  fi
+  if ! rotate_core; then
+    core_fail rotate_failed "rotation failed after writing $final"
+    return 1
+  fi
   log "core OK bytes=$bytes table_data=$tdata sha256=$sha seconds=$(( $(date +%s) - started ))"
-  write_status core "$(tier_json result=ok "at=$(now_iso)" "file=$final" "bytes=$bytes" "sha256=$sha" \
-    "tableData=$tdata" "durationSec=$(( $(date +%s) - started ))" "excludedData=$LARGE_TABLES")"
+  if ! write_status core "$(tier_json result=ok "at=$(now_iso)" "file=$final" "bytes=$bytes" "sha256=$sha" \
+    "tableData=$tdata" "durationSec=$(( $(date +%s) - started ))" "excludedData=$LARGE_TABLES")"; then
+    log "core status write failed"
+    return 1
+  fi
   return 0
 }
 
+# Only names that this script creates are ever deleted: each glob result is
+# matched against a strict regex (no line splitting), links are skipped.
 rotate_core() {
-  local -a files
-  local i
-  mapfile -t files < <(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'core-*.dump' -printf '%f\n' | sort)
-  if (( ${#files[@]} > KEEP )); then
-    for (( i = 0; i < ${#files[@]} - KEEP; i++ )); do
-      rm -f -- "$BACKUP_DIR/${files[$i]}" "$BACKUP_DIR/${files[$i]}.sha256"
-      log "core rotated out ${files[$i]}"
-    done
-  fi
+  local -a files=()
+  local f base i
+  for f in "$BACKUP_DIR"/core-*.dump; do
+    base=${f##*/}
+    [[ "$base" =~ ^core-[0-9]{8}T[0-9]{6}Z\.dump$ && -f "$f" && ! -L "$f" ]] || continue
+    files+=("$base")
+  done
+  # Glob order is sorted under LC_ALL=C and names carry UTC stamps: oldest first.
+  for (( i = 0; i + KEEP < ${#files[@]}; i++ )); do
+    drop_own "${files[$i]}" || return 1
+    drop_own "${files[$i]}.sha256" || return 1
+    log "core rotated out ${files[$i]}"
+  done
   # A crashed earlier run may have left a partial; it is never a valid backup.
-  find "$BACKUP_DIR" -maxdepth 1 -type f -name 'core-*.dump.partial' -mmin +360 -delete
+  for f in "$BACKUP_DIR"/core-*.dump.partial; do
+    base=${f##*/}
+    [[ "$base" =~ ^core-[0-9]{8}T[0-9]{6}Z\.dump\.partial$ && -f "$f" && ! -L "$f" ]] || continue
+    if [[ -n "$(find "$f" -maxdepth 0 -mmin +360 2>/dev/null)" ]]; then
+      drop_own "$base" || return 1
+    fi
+  done
+  return 0
 }
 
 # ── full tier ────────────────────────────────────────────────────────────────
@@ -273,21 +361,37 @@ run_full() {
 }
 
 # ── restore drill ────────────────────────────────────────────────────────────
+# The scratch DB lives in the same PostgreSQL cluster and on the same disk, so
+# it gets the same precheck + watchdog as a dump: restored size is estimated at
+# V5SB_DRILL_FACTOR x the compressed dump.
 run_drill() {
-  local dump="${1:-}" exists t live got bad=0
+  local dump="${1:-}" exists t live got bad=0 size free need f
   if [[ -z "$dump" ]]; then
-    dump=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'core-*.dump' -printf '%p\n' | sort | tail -n 1)
+    for f in "$BACKUP_DIR"/core-*.dump; do
+      if [[ "${f##*/}" =~ ^core-[0-9]{8}T[0-9]{6}Z\.dump$ && -f "$f" && ! -L "$f" ]]; then dump="$f"; fi
+    done
   fi
-  [[ -n "$dump" && -f "$dump" ]] || { log "drill: no core dump found"; return 1; }
+  [[ -n "$dump" && -f "$dump" && ! -L "$dump" ]] || { log "drill: no core dump found"; return 1; }
   [[ "$DRILL_DB" != "$DB" ]] || { log "drill: refusing, drill db equals live db"; return 1; }
+  size=$(stat -c %s -- "$dump")
+  free=$(avail_bytes "$PG_DATA_PATH")
+  [[ "$free" =~ ^[0-9]+$ ]] || { log "drill: cannot read free space of $PG_DATA_PATH"; return 1; }
+  need=$(( size * DRILL_FACTOR + MIN_FREE_GIB * GIB ))
+  if (( free < need )); then
+    log "drill SKIPPED_LOW_DISK free=$free < ${DRILL_FACTOR}x dump ($size) + ${MIN_FREE_GIB}GiB"
+    return 3
+  fi
   exists=$(as_pg "$PSQL" -Atqc "select 1 from pg_database where datname='${DRILL_DB}'" postgres)
   [[ -z "$exists" ]] || { log "drill: $DRILL_DB already exists, refusing to touch it"; return 1; }
   log "drill restore $dump -> $DRILL_DB"
-  as_pg "$PSQL" -qc "create database \"${DRILL_DB}\"" postgres
+  as_pg "$PSQL" -qc "create database \"${DRILL_DB}\"" postgres || { log "drill: create database failed"; return 1; }
   # The archive is root-owned 0600; feed it on stdin so the postgres user needs no access.
-  if ! as_pg "$PG_RESTORE" --no-owner --no-privileges --exit-on-error -d "$DRILL_DB" <"$dump"; then
+  as_pg "$PG_RESTORE" --no-owner --no-privileges --exit-on-error -d "$DRILL_DB" <"$dump" &
+  watchdog_wait $! "$PG_DATA_PATH" "$(( ABORT_FREE_GIB * GIB ))" restore
+  if [[ -n "$WD_REASON" || "$WD_RC" != 0 ]]; then
     as_pg "$PSQL" -qc "drop database if exists \"${DRILL_DB}\"" postgres || true
-    log "drill FAILED restore"
+    log "drill FAILED restore rc=$WD_RC ${WD_REASON}"
+    if [[ -n "$WD_REASON" ]]; then return 3; fi
     return 1
   fi
   for t in users usage_records credit_ledger model_catalog schema_migrations; do
@@ -295,12 +399,12 @@ run_drill() {
     got=$(as_pg "$PSQL" -Atqc "select count(*) from public.${t}" "$DRILL_DB" 2>/dev/null || echo NA)
     log "drill rows $t live=$live restored=$got"
     # Live keeps growing after the dump; restored may lag but never exceed it.
-    if [[ "$got" == NA || ( "$live" != NA && "$got" -gt "$live" ) ]]; then bad=1; fi
+    if [[ ! "$got" =~ ^[0-9]+$ ]] || [[ "$live" =~ ^[0-9]+$ && "$got" -gt "$live" ]]; then bad=1; fi
   done
-  as_pg "$PSQL" -qc "drop database \"${DRILL_DB}\"" postgres
+  as_pg "$PSQL" -qc "drop database \"${DRILL_DB}\"" postgres || { log "drill: drop database failed"; return 1; }
   if (( bad )); then log "drill FAILED row check"; return 1; fi
   log "drill OK"
-  write_status drill "$(tier_json result=ok "at=$(now_iso)" "file=$dump")"
+  write_status drill "$(tier_json result=ok "at=$(now_iso)" "file=$dump")" || true
   return 0
 }
 
@@ -315,6 +419,14 @@ case "$cmd" in
   -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
   *) die_usage "unknown command: $cmd" ;;
 esac
+
+for knob in KEEP MIN_FREE_GIB ABORT_FREE_GIB DEPLOY_WAIT_SEC DRILL_FACTOR CORE_EST_DEFAULT_BYTES; do
+  [[ "${!knob}" =~ ^[0-9]+$ ]] || die_usage "$knob must be a non-negative integer"
+done
+(( KEEP >= 1 )) || die_usage "V5SB_KEEP must be >= 1"
+(( ABORT_FREE_GIB <= MIN_FREE_GIB )) || die_usage "V5SB_ABORT_FREE_GIB must be <= V5SB_MIN_FREE_GIB"
+# BACKUP_DIR is the only place this script deletes from: absolute, not "/".
+[[ "$BACKUP_DIR" == /?* && "$BACKUP_DIR" != *//* && "$BACKUP_DIR" != */ ]] || die_usage "V5SB_DIR must be an absolute directory path"
 
 tier=all
 if [[ "$cmd" == run ]]; then

@@ -11,6 +11,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -274,5 +275,97 @@ describe('v5-selfhost-pg-backup.sh cli and units', () => {
     )
     assert.match(timer, /^Persistent=true$/m)
     assert.match(timer, /^OnCalendar=/m)
+  })
+})
+
+// Review r1 (g443-review-r1.txt) regressions: each case is one P1.
+describe('v5-selfhost-pg-backup.sh review r1 hardening', () => {
+  test('a failing promote (mv) is reported as failure, never ok', () => {
+    // only the promote of the .partial fails; status writes still work
+    stub('mv', 'if [[ "$*" == *.partial* ]]; then exit 1; fi; exec /usr/bin/mv "$@"')
+    const r = run(['run', '--tier', 'core'])
+    assert.equal(r.status, 1, r.out)
+    assert.equal(status().core.result, 'promote_failed')
+    assert.equal(status().core.lastOkAt, undefined)
+    assert.equal(
+      backups().some((f) => /\.dump$/.test(f)),
+      false,
+    )
+  })
+
+  test('a failing sha256 is reported as failure and the partial is dropped', () => {
+    stub('sha256sum', 'exit 1')
+    const r = run(['run', '--tier', 'core'])
+    assert.equal(r.status, 1, r.out)
+    assert.equal(status().core.result, 'hash_failed')
+    assert.deepEqual(backups(), [])
+  })
+
+  test('rotation ignores names with newlines and anything not core-<UTC>.dump', () => {
+    const b = path.join(dir, 'backups')
+    mkdirSync(b, { mode: 0o700 })
+    const tricky = 'core-\noperator-notes.txt\nx.dump'
+    writeFileSync(path.join(b, tricky), 'x')
+    writeFileSync(path.join(b, 'operator-notes.txt'), 'keep me')
+    writeFileSync(path.join(b, 'core-20200101T000000Z.dump'), 'old')
+    const r = run(['run', '--tier', 'core'], { V5SB_KEEP: '1' })
+    assert.equal(r.status, 0, r.out)
+    const files = backups()
+    assert.ok(files.includes(tricky), files.join(','))
+    assert.ok(files.includes('operator-notes.txt'))
+    assert.equal(files.includes('core-20200101T000000Z.dump'), false)
+    assert.equal(files.filter((f) => /^core-\d{8}T\d{6}Z\.dump$/.test(f)).length, 1)
+  })
+
+  test('a pre-planted link at the dump path is refused and its target is not written', () => {
+    stub(
+      'date',
+      'if [[ "$*" == "-u +%Y%m%dT%H%M%SZ" ]]; then echo 20261016T000000Z; else exec /usr/bin/date "$@"; fi',
+    )
+    const b = path.join(dir, 'backups')
+    mkdirSync(b, { mode: 0o700 })
+    const victim = path.join(dir, 'victim.txt')
+    writeFileSync(victim, 'precious')
+    symlinkSync(victim, path.join(b, 'core-20261016T000000Z.dump.partial'))
+    const r = run(['run', '--tier', 'core'])
+    assert.equal(r.status, 1, r.out)
+    assert.equal(status().core.result, 'path_exists')
+    assert.equal(readFileSync(victim, 'utf8'), 'precious')
+  })
+
+  test('a backup dir that is a symlink is refused', () => {
+    const real = path.join(dir, 'elsewhere')
+    mkdirSync(real)
+    symlinkSync(real, path.join(dir, 'backups'))
+    const r = run(['run', '--tier', 'core'])
+    assert.equal(r.status, 1, r.out)
+    assert.equal(status().core.result, 'dir_unsafe')
+    assert.deepEqual(readdirSync(real), [])
+  })
+
+  test('free space is re-checked after pg_dump exits (drop between samples)', () => {
+    // first sample (t=0) sees plenty; the drop happens inside the 5 s sleep, then pg_dump exits
+    stub('pg_dump', 'sleep 0.5; echo archive; echo 1 > "$STUB_DIR/avail"; exit 0')
+    const r = run(['run', '--tier', 'core'], { V5SB_WATCH_INTERVAL: '5' })
+    assert.equal(r.status, 3, r.out)
+    assert.equal(status().core.result, 'aborted_low_disk')
+    assert.match(status().core.reason, /after dump/)
+    assert.deepEqual(backups(), [])
+  })
+
+  test('drill refuses on low disk before creating any database', () => {
+    assert.equal(run().status, 0)
+    stub('psql', 'printf "%s\\n" "$*" >> "$STUB_DIR/psql.log"')
+    setAvail(10 * GIB)
+    const r = run(['drill'], { V5SB_PG_DATA_PATH: dir })
+    assert.equal(r.status, 3, r.out)
+    assert.equal(existsSync(path.join(dir, 'psql.log')), false)
+  })
+
+  test('bad knobs and a relative backup dir are usage errors', () => {
+    assert.equal(run(['run'], { V5SB_KEEP: '0' }).status, 2)
+    assert.equal(run(['run'], { V5SB_MIN_FREE_GIB: 'x' }).status, 2)
+    assert.equal(run(['run'], { V5SB_DIR: 'relative/dir' }).status, 2)
+    assert.equal(run(['run'], { V5SB_DIR: '/' }).status, 2)
   })
 })
