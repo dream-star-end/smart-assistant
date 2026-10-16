@@ -1,6 +1,7 @@
 /**
  * 对话内任务单人工审批卡。Agent 只负责投递;点选由用户浏览器以 human actor
- * 调 /api/board,done 仍不属于 AI。
+ * 调 /api/board。本工具不代点;已获用户授权的 Agent 验收关单另走当前环境
+ * 已支持的正式 CLI/API,必须附理由与证据并留审计。取消与重开仍由人操作。
  *
  * 与 present_options 一样 detached:校验后立刻返回,不等用户、不代点。
  */
