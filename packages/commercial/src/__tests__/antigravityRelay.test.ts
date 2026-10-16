@@ -636,6 +636,7 @@ describe('Antigravity relay downstream close (OCV5-411 Codex r1 P1)', () => {
   test('a CLI that disconnects under backpressure does not hang the call: usage is metered, the reservation freed', async () => {
     const token = await mintRoute('antigravity-gemini-3.8-flash', 1_000_000n)
     const usage: AntigravityUsageRow[] = []
+    const refreshed: string[] = []
     let handlerDone!: () => void
     const finished = new Promise<void>((resolve) => {
       handlerDone = resolve
@@ -654,6 +655,9 @@ describe('Antigravity relay downstream close (OCV5-411 Codex r1 P1)', () => {
       reportOutcome: async () => {},
       recordUsage: async (row) => {
         usage.push(row)
+      },
+      refreshWaived: async (route) => {
+        refreshed.push(route.requestId)
       },
       meteredCost: async () => 0n,
       estimateCost: () => 1n,
@@ -695,6 +699,9 @@ describe('Antigravity relay downstream close (OCV5-411 Codex r1 P1)', () => {
       assert.equal(slot?.count, 0, 'in-flight slot released')
       assert.equal(slot?.reserved, 0n, 'reservation released')
       assert.equal(slot?.recorded.calls, 1)
+      // The Stop may have settled the turn first: the late row is folded into it (OCV5-451).
+      assert.equal(refreshed.length, 1)
+      assert.equal(refreshed[0], usage[0]?.requestId)
     } finally {
       server.closeAllConnections()
       await close(server)

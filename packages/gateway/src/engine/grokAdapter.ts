@@ -351,6 +351,16 @@ function assembleGrokPrompt(
   return `${preamble}\n${withGoal}`
 }
 
+// OCV5-460 (INC-20261016-GROK-PROMPT-OFFLOAD): without --verbatim, Grok CLI 1.0.13 keeps
+// only ~20 KB of a --prompt-file prompt inline, cuts the middle and tells the model to
+// read_file the whole request from sessions/<id>/prompts/. The platform context alone is
+// ~30 KB, so every turn made the model read its own request back from disk. --verbatim
+// sends the file as given but also drops the CLI's <user_query> wrapper, which the
+// grok-build system prompt names as the user's request, so the adapter adds it here.
+function grokUserQuery(prompt: string): string {
+  return `<user_query>\n${prompt}\n</user_query>`
+}
+
 interface GrokTurnContext {
   params: TurnParams
   readonly canonicalModel: string | undefined
@@ -598,7 +608,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     const promptDir = mkdtempSync(join(tmpdir(), 'oc-grok-prompt-'))
     const promptFile = join(promptDir, 'prompt.md')
     try {
-      writeFileSync(promptFile, prompt, { encoding: 'utf8', mode: 0o600, flag: 'wx' })
+      writeFileSync(promptFile, grokUserQuery(prompt), { encoding: 'utf8', mode: 0o600, flag: 'wx' })
     } catch (err) {
       try { rmSync(promptDir, { recursive: true, force: true }) } catch { /* best effort */ }
       throw err
@@ -666,6 +676,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       '--agent', 'grok-build',
       '--model', ctx.upstreamModelId,
       '--prompt-file', spec.promptFile,
+      '--verbatim',
       '--output-format', 'streaming-json',
       '--always-approve',
       '--no-subagents',

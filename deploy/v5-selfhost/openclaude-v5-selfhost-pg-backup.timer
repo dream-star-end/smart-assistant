@@ -1,0 +1,11 @@
+[Unit]
+Description=OpenClaude v5 selfhost PostgreSQL backup timer (daily 03:40 Asia/Taipei)
+
+[Timer]
+OnCalendar=*-*-* 19:40:00 UTC
+RandomizedDelaySec=10m
+Persistent=true
+Unit=openclaude-v5-selfhost-pg-backup.service
+
+[Install]
+WantedBy=timers.target

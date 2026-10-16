@@ -307,6 +307,36 @@
       "reason": "OCV5-411 #723 CI red (commercial-integ pr-3): getFreshAntigravityAccessToken leaked a pool client when the KMS key failed to load, so poolPolicy0306 hung in its after hook. Latent: Antigravity is admin-only and disabled in commercial and no commercial release carried it; selfhost owner-only.",
       "approvedBy": "user 2026-10-16 管家转用户要求：#723 Codex r1 的 P1 与红项都修掉，不发商业版（cc3 sync 会话）",
       "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "c349d7f4bc78dd11b1520fc2b968fe9443eb3602",
+      "reason": "OCV5-445: backport of commercial 6588fe7c2. The Antigravity relay now waits for drain or close, so a CLI that disconnects under backpressure no longer parks the handler; usage is still recorded and the reservation released. Latent: no user report, Antigravity is owner-only on selfhost. Regression test red without the fix.",
+      "approvedBy": "user 2026-10-16 管家派单 OCV5-445：把商业 #723 同步里 Codex 发现的两个问题回挂个人版，按规范写 Incident: none 豁免（cc3 antigravity 会话）",
+      "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "35d484dbcae7be8337d13d911b58bef813d1ebd3",
+      "reason": "OCV5-445: backport of commercial 0d54eea02. Registers retention for the six 0306–0308 tables; pool_events is swept after 30 days. Latent: pool_events' oldest row is from 2026-10-15, none has reached 30 days. retentionRegistry.integ red without, green with.",
+      "approvedBy": "user 2026-10-16 管家派单 OCV5-445：把商业 #723 同步里 Codex 发现的两个问题回挂个人版，按规范写 Incident: none 豁免（cc3 antigravity 会话）",
+      "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "cc82daee1a48d307530e7c08923475c5428947f5",
+      "reason": "OCV5-451: a call that outlives a stopped Antigravity turn (recorded by the relay after settlement) is folded into the turn's waived usage row, so its tokens and wouldHaveCharged cover every call. Latent: audit snapshot only; stopped turns are waived and the charge stays 0. Settle integ test red without the fix.",
+      "approvedBy": "user 2026-10-16 「继续修上次汇报里留下的小问题：停止轮在用量入账前就结算，免收费快照里「本应收费」金额偏小」，按规范写 Incident: none 豁免（cc3 antigravity 会话）",
+      "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "8029e3febb165d144bfe324382a96bc819d5003f",
+      "reason": "OCV5-452: ZCode's prompt listed the memory-MCP tools from its own copy, which missed present_task_approval when e87e3723a added it to Grok and Cursor; the MCP server always exposed the tool. Latent: no user report. The three platform engines now share one list with a contract test.",
+      "approvedBy": "user 2026-10-16 「新开一个cc3会话对个人版架构进行全面梳理……可扩展性是否强大……进行持续迭代优化」（cc3 ocv5-selfhost-arch-review，FINDINGS EXT-3）",
+      "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "cc3c7b0648afc2dc17a81d4e5338e5db89e3b5aa",
+      "reason": "OCV5-453: backport of commercial 51790b628. getFreshAntigravityAccessToken loads the KMS key before checking out a pool client, so a key failure can no longer strand the client and hang pool.end(). Latent: selfhost has its KMS key, no user report; found through a commercial CI integ timeout. Unit test red without the fix.",
+      "approvedBy": "user 2026-10-16 「开始回挂 cc3-sync 的连接泄漏修复 51790b628……到个人版」，按规范写 Incident: none 豁免（cc3 antigravity 会话）",
+      "expiresAt": "2026-11-15"
     }
   ]
 }

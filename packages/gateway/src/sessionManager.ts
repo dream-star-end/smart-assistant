@@ -3,7 +3,6 @@ import type { GrokExecutionDescriptor } from '@openclaude/protocol'
 import { getDesiredIntelligentUi, intelligentUiNeedsRestart, isIntelligentUiApplied } from './intelligentUiDesired.js'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
-import { rename, writeFile } from 'node:fs/promises'
 import { join, resolve as resolvePath } from 'node:path'
 import {
   resolveRuntimeExecutionAgent,
@@ -183,6 +182,12 @@ import {
 import { emptyCompletedTurnAssistantText, shouldFailClosedEmptyModelTurn } from './emptyCompletedTurn.js'
 import { applyPlatformCostIfMissing } from './usageCost.js'
 import { createLogger } from './logger.js'
+import {
+  CCB_PROVIDER_TAG,
+  CCB_RESUME_HISTORY_CONTEXT_VERSION,
+  normalizeEngineTag,
+  ResumeStore,
+} from './resumeStore.js'
 import { collectSessionOutputAssets } from './projectAssetCollector.js'
 import { adoptRunContext } from './runContextPersist.js'
 import {
@@ -2513,7 +2518,13 @@ export class SessionManager {
     }
   }
 
-  private resumeMapPath = join(paths.home, 'resume-map.json')
+  private readonly resumeStore = new ResumeStore(join(paths.home, 'resume-map.json'))
+  private get resumeMapPath(): string {
+    return this.resumeStore.path
+  }
+  private set resumeMapPath(path: string) {
+    this.resumeStore.path = path
+  }
 
   constructor(public config: OpenClaudeConfig) {
     this._loadResumeMap()
@@ -3354,112 +3365,40 @@ export class SessionManager {
     }
   }
 
-  // Resume map: sessionKey → ccbSessionId (survives gateway restart)
-  private _resumeMap = new Map<string, string>()
-  // Parallel map: sessionKey → runner provider that produced the id.
-  // Needed to keep codex thread_ids and CCB session_ids from being cross-fed
-  // when the same sessionKey is later served by a different provider.
-  // Legacy entries without explicit provider are treated as 'ccb' on load.
-  private _resumeMapProvider = new Map<string, string>()
-  /** Parallel map: sessionKey → prior native ids for the SAME provider, newest
-   *  first, bounded by RESUME_HISTORY_MAX. This is the fallback ladder for
-   *  "the head id never produced a durable transcript" (CLI emitted session_id
-   *  then died / container rebuilt mid-spawn). Persisted as `history` in
-   *  resume-map.json. Cleared whenever the provider changes or the entry is
-   *  intentionally reset (model switch, context_too_long, destroy). */
-  private _resumeMapHistory = new Map<string, string[]>()
-  /** sessionKey → native ids the ENGINE itself rejected at runtime for this
-   *  session ("No conversation found with session ID", zcode `Session not
-   *  found`). A non-empty file on disk is not proof the engine can load it
-   *  (2026-09-07: transcript existed under another cwd's project dir), so the
-   *  durable-artifact probe alone re-promoted the same dead id after every
-   *  crash. Anything in this set is skipped by the history ladder for the
-   *  rest of the gateway process; in-memory only — a restart re-arms the
-   *  probe, and a fresh spawn either relocates the transcript or lands on a
-   *  new id. */
-  private _resumeRejectedIds = new Map<string, Set<string>>()
-  // Serialized write queue to prevent concurrent writeFile race conditions
-  private _resumeMapWrite: Promise<void> = Promise.resolve()
+  // Resume-map state lives in ResumeStore (resumeStore.ts, FINDINGS §7 step 1).
+  // These private views and delegates keep the resume policy below and the
+  // existing tests on their old names.
+  private get _resumeMap() { return this.resumeStore.ids }
+  private get _resumeMapProvider() { return this.resumeStore.provider }
+  private get _resumeMapHistory() { return this.resumeStore.history }
+  private get _resumeRejectedIds() { return this.resumeStore.rejected }
+  private get _resumeMapTimestamps() { return this.resumeStore.timestamps }
+  private get _resumeMapLastCost() { return this.resumeStore.lastCost }
+  private get _resumeMapCostImprecise() { return this.resumeStore.costImprecise }
+  private get _resumeMapWrite() { return this.resumeStore.write }
 
-  /** Push `prev` onto the history ladder for `key` (dedup, newest first, bounded). */
   private _pushResumeHistory(key: string, prev: string | undefined | null): void {
-    if (!prev) return
-    if (this._resumeRejectedIds.get(key)?.has(prev)) return
-    const cur = this._resumeMapHistory.get(key) ?? []
-    const next = [prev, ...cur.filter((x) => x !== prev)].slice(0, RESUME_HISTORY_MAX)
-    this._resumeMapHistory.set(key, next)
+    this.resumeStore.pushHistory(key, prev)
   }
 
-  /** Ids the engine named in its stale-resume error. CCB: `No conversation
-   *  found with session ID: <uuid>`; zcode: `Session not found: sess_…`. The
-   *  engine mints a NEW session id before it fails to load the old one, so
-   *  `session.ccbSessionId` at detection time is the fresh id, not the refused
-   *  one — the error text is the only authoritative source. */
   static extractRejectedResumeIds(errorDetail: string | undefined): string[] {
-    if (!errorDetail) return []
-    const out = new Set<string>()
-    const re =
-      /(?:No conversation found with session ID|Session not found|Persisted child session not found):\s*([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|sess_[A-Za-z0-9_-]{8,80})/g
-    for (const m of errorDetail.matchAll(re)) {
-      const id = m[1]
-      if (id) out.add(id.toLowerCase())
-    }
-    return [...out]
+    return ResumeStore.extractRejectedIds(errorDetail)
   }
 
-  /** Mark every resume-map id for `key` (head, history, live) whose engine-side
-   *  inner id is one the engine just refused. Resume-map ids may carry a
-   *  transport prefix (`sand-ccb:<uuid>`), so match on the trailing segment. */
   private _markResumeRejectedFromError(
     key: string,
     errorDetail: string | undefined,
     liveId: string | null | undefined,
   ): string[] {
-    const refused = SessionManager.extractRejectedResumeIds(errorDetail)
-    if (refused.length === 0) return []
-    const candidates = new Set<string>()
-    const head = this._resumeMap.get(key)
-    if (head) candidates.add(head)
-    for (const h of this._resumeMapHistory.get(key) ?? []) candidates.add(h)
-    if (liveId) candidates.add(liveId)
-    const marked: string[] = []
-    for (const cand of candidates) {
-      const inner = cand.includes(':') ? cand.slice(cand.lastIndexOf(':') + 1) : cand
-      if (refused.includes(inner.toLowerCase())) {
-        this._markResumeRejected(key, cand)
-        marked.push(cand)
-      }
-    }
-    return marked
+    return this.resumeStore.markRejectedFromError(key, errorDetail, liveId)
   }
 
-  /** Record that the engine refused to resume `id` for `key`. Bounded per key
-   *  so a pathological session cannot grow the set without limit. */
   private _markResumeRejected(key: string, id: string | undefined | null): void {
-    if (!id) return
-    const set = this._resumeRejectedIds.get(key) ?? new Set<string>()
-    set.add(id)
-    if (set.size > RESUME_HISTORY_MAX * 4) {
-      const [oldest] = set
-      if (oldest !== undefined) set.delete(oldest)
-    }
-    this._resumeRejectedIds.set(key, set)
-    const hist = this._resumeMapHistory.get(key)
-    if (hist?.includes(id)) {
-      const next = hist.filter((h) => h !== id)
-      if (next.length > 0) this._resumeMapHistory.set(key, next)
-      else this._resumeMapHistory.delete(key)
-    }
+    this.resumeStore.markRejected(key, id)
   }
 
-  /** Remove every resume-map projection for `key` (id, ts, provider, cost, history). */
   private _forgetResumeEntry(key: string): void {
-    this._resumeMap.delete(key)
-    this._resumeMapTimestamps.delete(key)
-    this._resumeMapProvider.delete(key)
-    this._resumeMapLastCost.delete(key)
-    this._resumeMapCostImprecise.delete(key)
-    this._resumeMapHistory.delete(key)
+    this.resumeStore.forget(key)
   }
 
   /**
@@ -3526,18 +3465,8 @@ export class SessionManager {
     return picked.id
   }
 
-  /** Provider name for CCB-backed runners (default). Used as the fallback
-   *  tag when an on-disk resume-map entry omits `provider` (legacy format). */
-  private static CCB_PROVIDER_TAG = 'ccb'
-
-  /**
-   * Version 1 means a CCB native session was created after provider-switch
-   * history became model-window-bounded. Older native JSONL may contain one
-   * immutable, oversized synthetic history prompt; resuming it makes every
-   * later CCB auto-compaction replay the same rejected request. Such entries
-   * must rebuild once from the exact finite PG history suffix instead.
-   */
-  private static CCB_RESUME_HISTORY_CONTEXT_VERSION = 1
+  private static CCB_PROVIDER_TAG = CCB_PROVIDER_TAG
+  private static CCB_RESUME_HISTORY_CONTEXT_VERSION = CCB_RESUME_HISTORY_CONTEXT_VERSION
 
   /** Return the resumable id for this session iff the persisted entry was
    *  produced by `wantProvider`. Cross-provider mismatches return undefined
@@ -3762,176 +3691,19 @@ export class SessionManager {
     return tag === wantProvider && this._resumeMapCostImprecise.get(sessionKey) === true
   }
 
-  /** M1a:resume-map provider tag 的历史值归一。旧格式在 P1f 前写过
-   *  'codex-native'(provider 语义);engine 维度泛化后统一为 engine id
-   *  'codex',其余(含缺省)一律 'ccb'。加载与比较都过这一个函数,
-   *  防新旧 tag 混用导致 resume 条目被误判跨底座。 */
-  private static normalizeEngineTag(tag: string | undefined): string {
-    if (tag === 'codex-native' || tag === 'codex') return 'codex'
-    if (tag === 'grok') return 'grok'
-    if (tag === 'cursor') return 'cursor'
-    if (tag === 'zcode') return 'zcode'
-    if (tag === 'antigravity') return 'antigravity'
-    return SessionManager.CCB_PROVIDER_TAG
-  }
+  private static normalizeEngineTag = normalizeEngineTag
 
   private _loadResumeMap(): void {
-    // Try primary file first, fall back to backup if corrupted (atomic-write safety net)
-    for (const path of [this.resumeMapPath, this.resumeMapPath + '.bak']) {
-      try {
-        if (!existsSync(path)) continue
-        const data = JSON.parse(readFileSync(path, 'utf-8'))
-        // Support both legacy format {key: sessionId} and new format
-        // {key: {id, ts, lastCost?, provider?, historyContextVersion?}}
-        // Missing `provider` → treated as CCB (the only provider before
-        // codex-native landed), matching _resumeIdFor's fallback.
-        for (const [key, val] of Object.entries(data)) {
-          if (typeof val === 'string') {
-            log.info('dropping CCB resume from obsolete history context contract', {
-              sessionKey: key,
-              historyContextVersion: null,
-            })
-          } else if (val && typeof val === 'object' && 'id' in (val as any)) {
-            const prov = SessionManager.normalizeEngineTag(
-              typeof (val as any).provider === 'string' && (val as any).provider
-                ? (val as any).provider
-                : undefined,
-            )
-            if (
-              prov === SessionManager.CCB_PROVIDER_TAG &&
-              (val as any).historyContextVersion !==
-                SessionManager.CCB_RESUME_HISTORY_CONTEXT_VERSION
-            ) {
-              log.info('dropping CCB resume from obsolete history context contract', {
-                sessionKey: key,
-                historyContextVersion: (val as any).historyContextVersion ?? null,
-              })
-              continue
-            }
-            this._resumeMap.set(key, (val as any).id)
-            this._resumeMapTimestamps.set(key, (val as any).ts ?? Date.now())
-            // Optional cost-delta baseline for the resumed CCB. If present,
-            // CCB will restore STATE.totalCostUSD to this value and the
-            // gateway needs the same baseline to compute correct per-turn
-            // deltas on the first post-resume `result`.
-            const lastCost = (val as any).lastCost
-            if (typeof lastCost === 'number' && Number.isFinite(lastCost) && lastCost >= 0) {
-              this._resumeMapLastCost.set(key, lastCost)
-            }
-            if ((val as any).costImprecise === true) {
-              this._resumeMapCostImprecise.set(key, true)
-            }
-            const history = (val as any).history
-            if (Array.isArray(history)) {
-              const cleaned = history
-                .filter(
-                  (h): h is string =>
-                    typeof h === 'string' && h.length > 0 && h !== (val as any).id,
-                )
-                .slice(0, RESUME_HISTORY_MAX)
-              if (cleaned.length > 0) this._resumeMapHistory.set(key, cleaned)
-            }
-            // M1a:tag 归一为 engine id(历史 'codex-native' → 'codex')。
-            this._resumeMapProvider.set(key, prov)
-          }
-        }
-        return // Successfully parsed (even if empty — empty means all sessions were destroyed)
-      } catch {
-        log.warn('failed to load resume-map', { path })
-      }
-    }
+    this.resumeStore.load()
   }
 
   private _saveResumeMap(): void {
-    // Merge: start from the loaded resume-map (includes sessions not yet re-activated),
-    // then overlay with live sessions (which may have updated ccbSessionIds after resume).
-    type ResumeEntry = {
-      id: string
-      ts: number
-      lastCost?: number
-      costImprecise?: boolean
-      provider?: string
-      historyContextVersion?: number
-      /** Prior same-provider ids, newest first (durable-artifact fallback ladder). */
-      history?: string[]
-    }
-    const obj: Record<string, ResumeEntry> = {}
-    const now = Date.now()
-    for (const [key, val] of this._resumeMap) {
-      const entry: ResumeEntry = {
-        id: val,
-        ts: this._resumeMapTimestamps.get(key) ?? now,
-      }
-      const cached = this._resumeMapLastCost.get(key)
-      if (cached !== undefined && cached > 0) entry.lastCost = cached
-      if (this._resumeMapCostImprecise.get(key) === true) entry.costImprecise = true
-      const prov = SessionManager.normalizeEngineTag(this._resumeMapProvider.get(key))
-      if (prov === SessionManager.CCB_PROVIDER_TAG) {
-        entry.historyContextVersion = SessionManager.CCB_RESUME_HISTORY_CONTEXT_VERSION
-      }
-      // Only serialize provider when it differs from the implicit 'ccb' default.
-      if (prov && prov !== SessionManager.CCB_PROVIDER_TAG) entry.provider = prov
-      const hist = this._resumeMapHistory.get(key)?.filter((h) => h !== val)
-      if (hist && hist.length > 0) entry.history = hist.slice(0, RESUME_HISTORY_MAX)
-      obj[key] = entry
-    }
-    for (const [key, sess] of this.sessions) {
-      if (sess.ccbSessionId) {
-        const entry: ResumeEntry = {
-          id: sess.ccbSessionId,
-          ts: now,
-        }
-        if (sess._lastCcbCumulativeCost > 0) entry.lastCost = sess._lastCcbCumulativeCost
-        if (sess.costImprecise === true) entry.costImprecise = true
-        // Provider map wins when set. When a drop just cleared it, fall back
-        // to the live engine so a Grok id is not rewritten as implicit ccb
-        // (historyContextVersion only) and then refused on the next lookup.
-        const prov = SessionManager.normalizeEngineTag(
-          this._resumeMapProvider.get(key) ?? sess.providerTag,
-        )
-        if (prov === SessionManager.CCB_PROVIDER_TAG) {
-          entry.historyContextVersion = SessionManager.CCB_RESUME_HISTORY_CONTEXT_VERSION
-        }
-        if (prov && prov !== SessionManager.CCB_PROVIDER_TAG) entry.provider = prov
-        // Live session is authoritative for head. History is only ever fed by
-        // the session_id handler (previous durable id) — never re-derived here,
-        // so a promotion can't be undone by the serializer (review B2).
-        const hist = this._resumeMapHistory.get(key)?.filter((h) => h !== sess.ccbSessionId)
-        if (hist && hist.length > 0) entry.history = hist.slice(0, RESUME_HISTORY_MAX)
-        obj[key] = entry
-        // Keep in-memory maps in sync
-        this._resumeMap.set(key, sess.ccbSessionId)
-        this._resumeMapTimestamps.set(key, now)
-        this._resumeMapLastCost.set(key, sess._lastCcbCumulativeCost)
-        if (sess.costImprecise === true) this._resumeMapCostImprecise.set(key, true)
-      }
-    }
-    const data = JSON.stringify(obj, null, 2)
-    // Atomic write: write to .tmp, then rename (rename is atomic on Linux/ext4)
-    const tmpPath = this.resumeMapPath + '.tmp'
-    const bakPath = this.resumeMapPath + '.bak'
-    this._resumeMapWrite = this._resumeMapWrite
-      .then(async () => {
-        await writeFile(tmpPath, data)
-        // Backup current file before overwriting (fallback if crash during rename)
-        try {
-          if (existsSync(this.resumeMapPath)) {
-            await rename(this.resumeMapPath, bakPath)
-          }
-        } catch {}
-        await rename(tmpPath, this.resumeMapPath)
-      })
-      .catch((err) => log.error('resume-map write failed', {}, err))
+    this.resumeStore.persist(this.resumeStore.serialize(this.sessions))
   }
 
-  /** Await any pending resume-map disk writes (used by shutdown to prevent data loss).
-   *  Loops until the write promise stabilizes — handles late writes queued during await. */
+  /** Await any pending resume-map disk writes (used by shutdown to prevent data loss). */
   async awaitResumeMapFlush(): Promise<void> {
-    let prev: Promise<void> | null = null
-    while (prev !== this._resumeMapWrite) {
-      prev = this._resumeMapWrite
-      await prev
-    }
+    await this.resumeStore.flush()
   }
 
   /** Check which sessionKeys in the resume map match a given pattern (e.g., containing a peerId) */
@@ -9461,15 +9233,6 @@ export class SessionManager {
     return () => clearInterval(t)
   }
 
-  // Resume-map TTL: track when each entry was last updated
-  private _resumeMapTimestamps = new Map<string, number>()
-  // Persisted cost-delta baseline for resumed CCB sessions. CCB's
-  // restoreCostStateForSession sets STATE.totalCostUSD to this value on start,
-  // so the gateway must seed the matching baseline before the first post-resume
-  // `result` arrives (otherwise the parser would compute delta against 0 and
-  // re-attribute the entire historical cumulative as this turn's cost).
-  private _resumeMapLastCost = new Map<string, number>()
-  private _resumeMapCostImprecise = new Map<string, boolean>()
   // Idle TTL for entries whose in-memory AgentSession was already evicted.
   // 7 days covers typical gateway restarts / multi-day reconnect gaps while
   // preventing resume-map from growing unbounded. Rationale: resume-map exists
@@ -9477,29 +9240,11 @@ export class SessionManager {
   private static RESUME_MAP_INACTIVE_TTL = 7 * 24 * 60 * 60 * 1000 // 7 days
 
   private _pruneResumeMap(): void {
-    const now = Date.now()
-    let pruned = false
-    for (const [key] of this._resumeMap) {
-      if (this.sessions.has(key)) continue // live session — keep
-      // ts=0 = unknown age (legacy entry whose file mtime could not be stat'd
-      // in _loadResumeMap). Treat as instantly-expired: `now - 0` is huge, so
-      // it trivially exceeds the threshold and gets pruned on first sweep.
-      const ts = this._resumeMapTimestamps.get(key) ?? 0
-      if (now - ts > SessionManager.RESUME_MAP_INACTIVE_TTL) {
-        this._resumeMap.delete(key)
-        this._resumeMapTimestamps.delete(key)
-        this._resumeMapLastCost.delete(key)
-        this._resumeMapCostImprecise.delete(key)
-        this._resumeMapProvider.delete(key)
-        this._resumeMapHistory.delete(key)
-        pruned = true
-        log.info('pruned idle resume-map entry', {
-          sessionKey: key,
-          ageMs: ts === 0 ? null : now - ts,
-        })
-      }
+    const pruned = this.resumeStore.prune((key) => this.sessions.has(key), SessionManager.RESUME_MAP_INACTIVE_TTL)
+    for (const { key, ageMs } of pruned) {
+      log.info('pruned idle resume-map entry', { sessionKey: key, ageMs })
     }
-    if (pruned) this._saveResumeMap()
+    if (pruned.length > 0) this._saveResumeMap()
   }
 }
 

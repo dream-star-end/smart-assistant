@@ -89,6 +89,12 @@ describe("messageSignature 流式防闪签名", () => {
     expect(childSignature({ kind: "plan", steps: [null] as never })).toContain("plan");
   });
 
+  test("OCV5-459: a stop row's copy text changes the signature", () => {
+    const a = mk("assistant", { text: "", _errorCode: "user_cancelled", _stopCopyText: "FIRST_TEXT" });
+    const b = mk("assistant", { text: "", _errorCode: "user_cancelled", _stopCopyText: "FINAL_TEXT" });
+    expect(messageSignature(a, CTX)).not.toBe(messageSignature(b, CTX));
+  });
+
   test("assistant 文本增量 → 签名变化（触发重渲）", () => {
     const a = mk("assistant", { text: "hel" });
     const b = mk("assistant", { text: "hello" });

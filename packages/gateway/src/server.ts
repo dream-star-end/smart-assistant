@@ -2512,6 +2512,18 @@ export function attachPermissionSnapshotIfMissing<T extends {
   }
 }
 
+/**
+ * Access-log filter for the gateway HTTP server. Static assets are never logged.
+ * Probe paths (/healthz, /metrics) are hit every few seconds by the watch timer
+ * and monitors: a healthy probe is not logged (it was ~16% of the selfhost
+ * master log on 2026-10-16, OCV5-461); a failing or slow one still is. The
+ * request metrics count every request regardless.
+ */
+export function shouldLogHttpAccess(path: string, status: number, durationMs: number): boolean {
+  if (path === '/healthz' || path === '/metrics') return status !== 200 || durationMs >= 1000
+  return path.startsWith('/api/') || path.startsWith('/v1/')
+}
+
 export class Gateway {
   private wss!: WebSocketServer
   /** Bound helpers for the route modules in routes/ (OCV5-376 P2). */
@@ -4062,7 +4074,7 @@ export class Gateway {
       httpRequestsTotal.inc({ method, path: normalizePath(path), status })
       httpRequestDuration.observe(duration, { method, path: normalizePath(path) })
       // Log non-static requests (skip static assets to reduce noise)
-      if (path.startsWith('/api/') || path.startsWith('/v1/') || path === '/healthz' || path === '/metrics') {
+      if (shouldLogHttpAccess(path, res.statusCode, duration)) {
         this.log.info('http', { method, path, status: res.statusCode, durationMs: duration })
       }
     })

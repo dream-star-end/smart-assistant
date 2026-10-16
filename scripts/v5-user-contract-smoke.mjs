@@ -3,10 +3,13 @@
 import { readFileSync } from "node:fs";
 import { performance } from "node:perf_hooks";
 import { launchJourneyBrowser } from "./lib/journey-browser.mjs";
-import { CASES, TOTAL_TIMEOUT, parseOptions, engineMatrix, tapResult } from "./lib/user-contract.mjs";
+import { CASES, TOTAL_TIMEOUT, parseOptions, engineMatrix, tapResult, offloadedRequestReads } from "./lib/user-contract.mjs";
 import { coldUiLogin, newSession, installTurnProbe, selectJourneyModel, sendContractTurn, runContinuationTurns, contractEvidenceBase } from "./lib/user-contract-browser.mjs";
 let browser, page, current = 0, stepStart = performance.now();
 const timings = [];
+// OCV5-460 (INC-20261016-GROK-PROMPT-OFFLOAD): grok-build used to read its own request
+// back from a file the CLI offloaded it to; the user's words were not in its context.
+const INLINE_REQUEST = "C3 the model answers from the user's message in its context, never from an offloaded request file";
 console.log("TAP version 13\n1..3");
 let finishing = false;
 async function fail(error) {
@@ -63,7 +66,12 @@ try {
       await newSession(page);
       await selectJourneyModel(page, id);
       console.log(`# route model=${id} engine=${engine} cost=${options.cost}`);
-      await runContinuationTurns(page, probe, { model: id, engine, catalog: latest, cost: options.cost });
+      const run = await runContinuationTurns(page, probe, { model: id, engine, catalog: latest, cost: options.cost });
+      for (const sent of run.sent ?? []) {
+        const reads = offloadedRequestReads(probe.received, sent);
+        if (reads.length) throw new Error(`${INLINE_REQUEST}: model=${id} read an offloaded request file (${reads.join(",")})`);
+      }
+      if (run.executed) console.log(`# inline_request model=${id} ok`);
     }
   });
   console.log(`# timings_ms ${JSON.stringify(timings.map(Math.round))}`);

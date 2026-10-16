@@ -379,6 +379,8 @@ export function messageSignature(
         m._emptyTurnSoft ? 1 : 0,
         m._emptyTurnTimeout ? 1 : 0,
         m.cronPush ? `cron:${m.cronLabel ?? ""}` : "",
+        // OCV5-459: view-only copy / quote text on a user-stop row.
+        textSig(m._stopCopyText),
       ].join("|");
     case "user":
       return [

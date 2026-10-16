@@ -196,6 +196,8 @@ wsetup() {
   export WATCH_DRY=0 WATCH_SKIP_ACTIONS=1 WATCH_FAIL_THRESHOLD=2 WATCH_NOTIFY_COOLDOWN_SEC=86400 WATCH_REARM_INTERVAL_SEC=0
   export WATCH_STUB_UNIT_MASTER=active WATCH_STUB_UNIT_EGRESS=active WATCH_STUB_MASTER=ok WATCH_STUB_EGRESS=ok
   export WATCH_STUB_MASTER_BODY='{"ok":true,"deps":{"pg":"ok"}}' WATCH_STUB_PG=ok WATCH_STUB_REDIS=ok WATCH_STUB_DOCKER=ok
+  # OCV5-444 host_checks: stub the disk and point at a missing backup status, like every other host probe here.
+  export WATCH_STUB_DISK_AVAIL_BYTES=$((100 * 1024 * 1024 * 1024)) WATCH_PG_BACKUP_STATUS="$C/no-pg-backup-status.json"
   unset WATCH_STUB_FAIL_LOUD || true
   mkdir -p "$C/run" "$C/inst" "$C/rel"
   cp -- "$WATCH" "$WATCH_INSTALLED_BIN"

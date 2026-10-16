@@ -162,6 +162,28 @@ describe("消息引用动作与已发送引用块", () => {
     expect(onQuote).toHaveBeenCalledWith(message);
   });
 
+  test("OCV5-459: a stop row copies and quotes the turn's text, not the stop line", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    const onQuote = vi.fn();
+    const stop = errMsg({ id: "s4:stopped", text: "本轮已取消。", _errorCode: "user_cancelled",
+      _stopCopyText: "原始提示还在临时文件里，我直接看结尾。", usage: { traceId: "trace-stop" } });
+    renderErr(stop, { onQuote });
+    expect(screen.getByRole("status", { name: "已停止生成" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "复制" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("原始提示还在临时文件里，我直接看结尾。"));
+    openMoreMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "引用" }));
+    expect(onQuote).toHaveBeenCalledWith(expect.objectContaining({ id: "s4:stopped", text: "原始提示还在临时文件里，我直接看结尾。" }));
+  });
+
+  test("OCV5-459: a stop with nothing to copy keeps the standing meta row", () => {
+    renderErr(errMsg({ text: "本轮已取消。", _errorCode: "user_cancelled", usage: { traceId: "trace-stop" } }), {});
+    expect(screen.getByRole("status", { name: "已停止生成" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "复制" })).toBeNull();
+    expect(screen.getByTestId("assistant-meta")).toBeInTheDocument();
+  });
+
   test("用户气泡展示完整引用快照的两行视觉块，并可继续被引用", () => {
     const onQuote = vi.fn();
     const message = userMsg({

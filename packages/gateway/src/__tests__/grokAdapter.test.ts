@@ -257,6 +257,55 @@ console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'aa
     }
   })
 
+  test('OCV5-460: the whole request reaches Grok inline as one user_query and the CLI is told not to offload it', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'oc-grok-inline-prompt-'))
+    const fake = path.join(dir, 'fake-grok.cjs')
+    const capture = path.join(dir, 'capture.json')
+    await writeFile(fake, `#!/usr/bin/env node
+const fs = require('node:fs')
+const argv = process.argv.slice(2)
+const prompt = fs.readFileSync(argv[argv.indexOf('--prompt-file') + 1], 'utf8')
+fs.writeFileSync(process.env.FAKE_GROK_CAPTURE, JSON.stringify({ argv, prompt }))
+console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn', sessionId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', usage: { input_tokens: 1, output_tokens: 1 } }))
+`)
+    await chmod(fake, 0o755)
+    const previousBin = process.env.OC_GROK_CLI_BIN
+    const previousCapture = process.env.FAKE_GROK_CAPTURE
+    process.env.OC_GROK_CLI_BIN = fake
+    process.env.FAKE_GROK_CAPTURE = capture
+    try {
+      const adapter = new GrokAdapter(createOpts(dir))
+      adapter.setGrokRoute({
+        baseUrl: `http://127.0.0.1:18789/internal/v5/grok-relay/route/${TOKEN}/v1`,
+        routeToken: TOKEN,
+      })
+      adapter.on('error', () => {})
+      // Past the CLI's ~20 KB inline limit, with the user's words at the very end.
+      const userText = `${'平台说明之后的用户原话。'.repeat(2_000)}inline-request-sentinel`
+      const run = adapter.submitTurn({
+        input: userText,
+        requestId: REQUEST_ID,
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      assert.ok(await run.summary)
+      await adapter.waitForOutputDrain()
+      const captured = JSON.parse(await readFile(capture, 'utf8')) as { argv: string[]; prompt: string }
+      assert.ok(captured.argv.includes('--verbatim'))
+      assert.equal(captured.argv[captured.argv.indexOf('--verbatim') - 2], '--prompt-file')
+      assert.ok(Buffer.byteLength(captured.prompt) > 20 * 1024)
+      assert.ok(captured.prompt.startsWith('<user_query>\n# OpenClaude Platform Context (Grok adapter)'))
+      assert.ok(captured.prompt.endsWith(`${userText}\n</user_query>`))
+      assert.equal(captured.prompt.split('<user_query>').length, 2)
+    } finally {
+      restoreEnv('OC_GROK_CLI_BIN', previousBin)
+      restoreEnv('FAKE_GROK_CAPTURE', previousCapture)
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test('fails closed before spawn when the master-owned route is missing', async () => {
     const adapter = new GrokAdapter(createOpts(tmpdir()))
     adapter.on('error', () => {})

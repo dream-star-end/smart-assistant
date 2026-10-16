@@ -408,6 +408,9 @@ export type ChatMessage = {
   _timelineAuxiliary?: "bash-tail" | "terminal";
   /** Stable server identity for one logical visible record. */
   _timelineUnitKey?: string;
+  /** OCV5-459: view-only, set by splitStoppedNarration on a user-stop row: the text the copy button
+   * copies (the turn's last text before the Stop). Never persisted. */
+  _stopCopyText?: string;
   /** Exact logical order inside one immutable physical tape record. */
   _timelineLogicalOrdinal?: number;
   /** Server-authored lifecycle stamp (OCV5-21). Absent on legacy rows. */

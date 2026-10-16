@@ -1,4 +1,3 @@
-import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 /**
  * Project OpenClaude platform context + openclaude-memory MCP into the
  * official Google Antigravity CLI (OCV5-415). The CLI inherits nothing from
@@ -24,36 +23,16 @@ import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@o
 import { randomBytes } from 'node:crypto'
 import { chmodSync, lstatSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { type IdentityCompatRuntimeContext, identityCompatEnvironment } from '@openclaude/storage'
 
 import { paths } from '@openclaude/storage'
 import { issueParentCallerToken } from '../delegateContext.js'
 import { resolveMcpMemoryLaunch } from '../mcpMemoryEntry.js'
+import { PLATFORM_MEMORY_MCP_TOOLS } from './platformMemoryMcpTools.js'
 
 export const ANTIGRAVITY_MCP_SERVER = 'openclaude-memory'
 
-export const ANTIGRAVITY_MEMORY_MCP_TOOLS = [
-  'skill_search',
-  'skill_list',
-  'skill_view',
-  'skill_save',
-  'skill_delete',
-  'create_reminder',
-  'list_reminders',
-  'update_reminder',
-  'delete_reminder',
-  'send_to_agent',
-  'delegate_task',
-  'delegate_tasks',
-  'request_review',
-  'consult_advisor',
-  'task_create',
-  'task_update',
-  'task_comment',
-  'task_list',
-  'task_get',
-  'task_approve',
-  'present_task_approval',
-] as const
+export const ANTIGRAVITY_MEMORY_MCP_TOOLS = PLATFORM_MEMORY_MCP_TOOLS
 
 export const ANTIGRAVITY_PREAMBLE = `# OpenClaude Platform Context (Antigravity adapter)
 
@@ -162,7 +141,9 @@ function linkShared(target: string, link: string): void {
   }
 }
 
-export function projectAntigravityPlatform(input: AntigravityPlatformInput): AntigravityPlatformProjection {
+export function projectAntigravityPlatform(
+  input: AntigravityPlatformInput,
+): AntigravityPlatformProjection {
   const root = antigravityRoot()
   const stable = antigravityStableCliDir(root)
   const cacheDir = privateDir(join(root, 'cache'))
@@ -177,16 +158,19 @@ export function projectAntigravityPlatform(input: AntigravityPlatformInput): Ant
   // check with it. Every Cloud Code call goes to CLOUD_CODE_URL (the relay),
   // which swaps in the account's real token. refresh_token stays empty.
   writePrivate(join(cliDir, 'settings.json'), `${JSON.stringify({}, null, 2)}\n`)
-  writePrivate(join(cliDir, 'antigravity-oauth-token'), `${JSON.stringify({
-    token: {
-      access_token: input.credential.accessToken,
-      token_type: 'Bearer',
-      refresh_token: '',
-      expiry: input.credential.accessTokenExpiresAt,
-    },
-    auth_method: 'consumer',
-    ...(input.credential.idToken ? { id_token: input.credential.idToken } : {}),
-  })}\n`)
+  writePrivate(
+    join(cliDir, 'antigravity-oauth-token'),
+    `${JSON.stringify({
+      token: {
+        access_token: input.credential.accessToken,
+        token_type: 'Bearer',
+        refresh_token: '',
+        expiry: input.credential.accessTokenExpiresAt,
+      },
+      auth_method: 'consumer',
+      ...(input.credential.idToken ? { id_token: input.credential.idToken } : {}),
+    })}\n`,
+  )
 
   const advertisedMcpTools: string[] = []
   let delegateContextFile: string | null = null
@@ -224,7 +208,9 @@ export function projectAntigravityPlatform(input: AntigravityPlatformInput): Ant
           ? { OPENCLAUDE_BASELINE_SKILLS_DIR: process.env.OPENCLAUDE_BASELINE_SKILLS_DIR }
           : {}),
         ...(input.skillEvalMode ? { OPENCLAUDE_SKILL_EVAL_MODE: '1' } : {}),
-        ...(input.skillEvalExclude ? { OPENCLAUDE_SKILL_EVAL_EXCLUDE: input.skillEvalExclude } : {}),
+        ...(input.skillEvalExclude
+          ? { OPENCLAUDE_SKILL_EVAL_EXCLUDE: input.skillEvalExclude }
+          : {}),
         ...(input.skillEvalDraft
           ? {
               OPENCLAUDE_SKILL_EVAL_DRAFT_NAME: input.skillEvalDraft.name,
@@ -236,12 +222,17 @@ export function projectAntigravityPlatform(input: AntigravityPlatformInput): Ant
     }
     advertisedMcpTools.push(...ANTIGRAVITY_MEMORY_MCP_TOOLS)
   }
-  writePrivate(join(configDir, 'mcp_config.json'), `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`)
+  writePrivate(
+    join(configDir, 'mcp_config.json'),
+    `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`,
+  )
   return { root, launchHome, cacheDir, advertisedMcpTools, delegateContextFile }
 }
 
 /** Remove one launch HOME. Never follows the shared symlinks. */
-export function cleanupAntigravityLaunch(projection: Pick<AntigravityPlatformProjection, 'root' | 'launchHome'>): void {
+export function cleanupAntigravityLaunch(
+  projection: Pick<AntigravityPlatformProjection, 'root' | 'launchHome'>,
+): void {
   const launchRoot = join(projection.root, 'launch')
   if (!projection.launchHome.startsWith(`${launchRoot}/`)) return
   try {

@@ -780,18 +780,16 @@ build_master_release() {
   # OCV5-420:中途退出 / 补偿失败的列车终态(recovery_required、不结算搭车)同样先在 staging 跑。
   # OCV5-420 二期:autorecover(不等人,自动恢复/重跑/升级派 AI)与 watch.sh --auto-recover 同样先在 staging 跑。
   mlog "  selfhost watch selftest + disarm-observe / lock / rearm / gate-fail-stay behavior @ pinned staging"
-  local watch_t watch_log
-  for watch_t in v5-selfhost-watch-selftest.sh v5-selfhost-watch-disarm-observe.test.sh \
-      v5-selfhost-watch-lock.test.sh v5-selfhost-watch-rearm.test.sh v5-selfhost-watch-sync.test.sh \
-      v5-selfhost-watch-alert.test.sh v5-selfhost-gate-fail-stay.test.sh \
-      v5-selfhost-train-recovery.test.sh v5-selfhost-watch-autorecover.test.sh v5-selfhost-autorecover.test.sh; do
-    watch_log="$MASTER_GATE_TMPDIR/${watch_t}.log"
-    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash "scripts/$watch_t" >"$watch_log" 2>&1 ); then
-      tail -n 20 "$watch_log" >&2 || true
-      cleanup_master_staging
-      die "pinned selfhost watch gate 失败: $watch_t"
-    fi
-  done
+  # OCV5-447:清单只在 scripts/v5-selfhost-watch-gate.sh 一处,PR CI(v5-selfhost-gates.yml)跑同一份。
+  if [[ ! -f "$staging/scripts/v5-selfhost-watch-gate.sh" ]]; then
+    cleanup_master_staging
+    die "新候选缺 scripts/v5-selfhost-watch-gate.sh"
+  fi
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/v5-selfhost-watch-gate.sh \
+      --log-dir "$MASTER_GATE_TMPDIR/watch-gate" ); then
+    cleanup_master_staging
+    die "pinned selfhost watch gate 失败(失败的脚本与日志尾见上方 FAIL 行)"
+  fi
   cleanup_master_gate_tmpdir
 
   t0="$(date +%s)"
@@ -1009,27 +1007,9 @@ console.log("transform-ok");
   mlog "  ✓ tsx 自检通过(无 HTTP)"
 }
 
-sql_file_has_breaking_ddl() { # <sql-file> → rc 0 = breaking
-  local f="$1"
-  python3 - "$f" <<'PY'
-import re, sys
-path = sys.argv[1]
-text = open(path, encoding="utf-8", errors="replace").read()
-text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-text = re.sub(r"--.*?$", " ", text, flags=re.M)
-if re.search(r"\bDROP\s+TABLE\b", text, re.I):
-    print("DROP TABLE"); sys.exit(0)
-if re.search(r"\bDROP\s+COLUMN\b", text, re.I):
-    print("DROP COLUMN"); sys.exit(0)
-if re.search(r"\bALTER\b[\s\S]{0,200}\bDROP\b", text, re.I):
-    print("ALTER ... DROP"); sys.exit(0)
-if re.search(r"\bRENAME\s+(TO|COLUMN|TABLE)\b", text, re.I):
-    print("RENAME"); sys.exit(0)
-if re.search(r"\bTRUNCATE\b", text, re.I):
-    print("TRUNCATE"); sys.exit(0)
-sys.exit(1)
-PY
-}
+# OCV5-450: the detector lives in scripts/lib/v5-migration-ddl.sh (shared with the PR precheck).
+# shellcheck source=scripts/lib/v5-migration-ddl.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-migration-ddl.sh"
 
 # git object 必须存在;diff 非 0 必须 fail-closed。禁止 || true 把坏 SHA 变成「无 migration」。
 git_migration_name_diff() { # <from-commit> <to-commit>

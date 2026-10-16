@@ -49,6 +49,7 @@ import {
 import {
   type AntigravityUsageTotals,
   antigravityUsageCost,
+  refreshWaivedAntigravityUsage,
   sumAntigravityRelayUsage,
 } from '../billing/antigravitySettle.js'
 import type { PricingCache } from '../billing/pricing.js'
@@ -143,6 +144,8 @@ export interface AntigravityRelayDeps {
   estimateCost?: (route: AntigravityRelayRoute, bodyBytes: number) => bigint | null
   /** Cost of the summed in-process usage, rounded once like settlement (not per call). */
   totalsCost?: (route: AntigravityRelayRoute, totals: AntigravityUsageTotals) => bigint
+  /** After a call's row is written: fold it into a turn that already settled as waived. */
+  refreshWaived?: (route: AntigravityRelayRoute) => Promise<void>
   now?: () => number
 }
 
@@ -349,6 +352,17 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       if (pricing === null) return null
       const totals = await sumAntigravityRelayUsage(getPool(), route.requestId, route.userId)
       return antigravityUsageCost(totals, pricing)
+    })
+  const refreshWaived =
+    deps.refreshWaived ??
+    (async (route: AntigravityRelayRoute) => {
+      if (!deps.pricing) return
+      await refreshWaivedAntigravityUsage({
+        pool: getPool(),
+        pricing: deps.pricing,
+        requestId: route.requestId,
+        userId: route.userId,
+      })
     })
   const estimateCost =
     deps.estimateCost ??
@@ -618,6 +632,8 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
             calls: r.calls + 1,
           }
         }
+        // A Stop may have settled the turn while this call was still streaming (OCV5-451).
+        void refreshWaived(route).catch(() => {})
       }
       if (downstreamOpen) res.end()
     } catch (err) {

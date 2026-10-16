@@ -7606,6 +7606,88 @@
         "reason": "商业版暂无 proof 层证据:发版证据是 S1(scripts/v5-stop-before-start-contract.mjs),它只接在个人版发版 deploy-v5-selfhost.sh,依赖个人版 canary 的 Codex 模型;商业版没有对应模型/测试账号,deploy-v5.sh 跑不了 S1。本轮由 sessionManagerEngineTurn/preStartStop/codexTurnRetry 单测锁住。补证到期 2026-11-15:补商业真网关浏览器证明或商业发布门。管家 2026-10-16 决定方案 a。",
         "since": "2026-10-16"
       }
+    },
+    {
+      "id": "INC-20261016-GROK-PROMPT-OFFLOAD",
+      "occurredAt": "2026-10-16",
+      "severity": "P0",
+      "symptom": "个人版 Grok 4.7（grok-build）用户报：模型每轮先「读取文件 …/<grok 会话 id>/prompts/prompt_0.txt」，说请求很长、在平台说明处被截断，再去 OpenClaude 会话记录里找原始用户消息。根因：grokAdapter 把 preamble + 平台上下文 + 用户原话拼成一个文件经 --prompt-file 交给 grok-native 1.0.13；CLI 对内联 user prompt 只保留约 20 KB，截掉中段，整份落盘到 sessions/<id>/prompts/prompt_N.txt，并追加「[Full request offloaded to file] … Read this file with read_file before responding」。平台上下文单独就 30–54 KB，所以每一轮都超限，模型只能自己读回请求（OCV5-460；个人版 u3 464 个 Grok 会话 438 个、canary u765 368/368 命中，最早 2026-09-15；修复前真聊 g460-before2 截图「读取 1 个文件 · 我先读取完整请求」，uid 3 七轮每轮都 read_file/grep 自己的 prompt 文件）。修复：Grok CLI 加 --verbatim 原样发送（实测新会话与 --resume 都整份进入 user 消息、无横幅、无落盘），adapter 自己包回 <user_query>；发布用户契约 C3 的 grok-build 两轮若有工具调用碰到 offloaded 请求文件即红。",
+      "rootFixCommit": "cede43f1",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/grokAdapter.test.ts",
+          "assertion": "OCV5-460: the whole request reaches Grok inline as one user_query and the CLI is told not to offload it"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5UserContract.test.ts",
+          "assertion": "OCV5-460: a contract turn that reads an offloaded request file is caught"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5UserContract.test.ts",
+          "assertion": "OCV5-460: the smoke fails C3 when any continuation turn read an offloaded request file"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-user-contract-smoke.mjs",
+          "assertion": "C3 the model answers from the user's message in its context, never from an offloaded request file"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261016-STOP-NARRATION-LAYOUT",
+      "occurredAt": "2026-10-16",
+      "severity": "P2",
+      "symptom": "手机端 Grok 4.7 停止生成后（已执行 86 个步骤），过程叙述「请求在平台说明处被截断了…」被当成回答挂在步骤折叠块外，下面常显「4 分钟前」时间戳，再接被停止码盖章的另一句叙述，最后才是「已停止生成」。根因：tape 把 USER_CANCELLED 盖在本轮最后一段叙述上（其后还有 29 个步骤），回答判定跳过带错误码的行，于是前一句叙述成了回答并失去动作条、常显时间；实时停止端则把最后一句叙述当回答。修复：停止的轮次里后面还有步骤的文字不算回答；盖章的叙述拆成步骤内叙述 + 无正文的停止行。 r2：拆分后停止行无正文，丢了复制/更多按钮（只剩常显时间·积分·请求ID）；停止行改为保留复制/更多，明细回到菜单。",
+      "rootFixCommit": "596541be",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
+          "assertion": "tape stamp on narration splits into a plain narration row and a trailing stop row"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
+          "assertion": "live stop row: the last narration followed by steps is not the answer"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
+          "assertion": "stopped mid-answer: text with no step after it stays the answer, stamp is not split"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageList.processDisclosure.test.tsx",
+          "assertion": "停止后过程叙述留在步骤里，消息中间没有时间戳"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/process-disclosure.node-test.mjs",
+          "assertion": "no timestamp between the steps and the stop line"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
+          "assertion": "live stop row keeps copy / more: copy takes the turn's last text, rows stay in place"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/process-disclosure.node-test.mjs",
+          "assertion": "stop row keeps copy / more instead of a standing time row"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/cards.test.tsx",
+          "assertion": "OCV5-459: a stop row copies and quotes the turn's text, not the stop line"
+        }
+      ],
+      "coverageCommits": [
+        "eda1105b",
+        "f65e85e2"
+      ]
     }
   ]
 }
