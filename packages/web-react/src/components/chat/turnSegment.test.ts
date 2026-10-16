@@ -5,7 +5,7 @@
  */
 import { describe, expect, test } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
-import { currentTurnSettled, currentTurnStartIndex, turnFinalAssistantFlags } from "./turnSegment";
+import { currentTurnSettled, currentTurnStartIndex, splitStoppedNarration, turnFinalAssistantFlags } from "./turnSegment";
 
 function mk(role: ChatMessage["role"], extra: Partial<ChatMessage> = {}): ChatMessage {
   return { id: Math.random().toString(36), role, text: "", ts: 1000, ...extra };
@@ -195,5 +195,102 @@ describe("currentTurnSettled(HUD 收口判据,消息层证据)", () => {
         mk("tool", { toolName: "TodoWrite", _completed: true }),
       ]),
     ).toBe(false);
+  });
+});
+
+// OCV5-459: session webmvawsvz2zkzoxm (Grok, stopped after 86 steps). The tape stamped USER_CANCELLED on
+// the last narration (s4); 29 tool/thinking rows ran after it. s3 became the "answer" with a timestamp and
+// s4 sat below it with 已停止生成.
+describe("stopped turn narration (OCV5-459)", () => {
+  const tapeStop = (): ChatMessage[] => [
+    mk("user", { id: "u", text: "问", _orderSeq: 1 }),
+    mk("assistant", { id: "s3", text: "请求在平台说明处被截断了。", _clientMessageId: "u", _orderSeq: 2, ts: 2000 }),
+    mk("tool", { id: "t1", toolName: "Bash", _completed: true, _clientMessageId: "u", _orderSeq: 3, ts: 3000 }),
+    mk("assistant", {
+      id: "s4",
+      text: "原始提示还在临时文件里，我直接看结尾。",
+      _clientMessageId: "u",
+      _orderSeq: 4,
+      ts: 4000,
+      _errorCode: "USER_CANCELLED",
+      _errorDetail: "本轮已由用户停止。",
+      _timelineUnitKey: "unit-s4",
+      usage: { traceId: "trace-s4" },
+    }),
+    mk("thinking", { id: "k1", text: "看结尾", _clientMessageId: "u", _orderSeq: 5, ts: 5000 }),
+    mk("tool", { id: "t2", toolName: "Bash", _completed: true, cancelled: true, _clientMessageId: "u", _orderSeq: 6, ts: 6000 }),
+  ];
+
+  test("tape stamp on narration splits into a plain narration row and a trailing stop row", () => {
+    const out = splitStoppedNarration(tapeStop());
+    expect(out.map((m) => m.id)).toEqual(["u", "s3", "t1", "s4", "k1", "t2", "s4:stopped"]);
+    const narration = out[3]!;
+    expect(narration.text).toBe("原始提示还在临时文件里，我直接看结尾。");
+    expect(narration._errorCode).toBeUndefined();
+    expect(narration.usage).toBeUndefined();
+    expect(narration._timelineUnitKey).toBe("unit-s4");
+    const stop = out[6]!;
+    expect(stop.text).toBe("");
+    expect(stop._errorCode).toBe("USER_CANCELLED");
+    expect(stop.usage?.traceId).toBe("trace-s4");
+    expect(stop._timelineUnitKey).toBe("unit-s4:stopped");
+    expect(stop.ts).toBe(6000);
+  });
+
+  test("after the split the stopped turn has no answer, so no narration leaves the steps", () => {
+    expect(finals(splitStoppedNarration(tapeStop()))).toEqual([]);
+    // Unsplit (useResponseRatings reads raw rows): s3 is not promoted either.
+    expect(finals(tapeStop())).toEqual([]);
+  });
+
+  test("live stop row: the last narration followed by steps is not the answer", () => {
+    const msgs = [
+      mk("user", { id: "u", text: "问" }),
+      mk("assistant", { id: "n1", text: "我先读请求", _clientMessageId: "u" }),
+      mk("tool", { id: "t1", toolName: "Bash", _completed: true, _clientMessageId: "u" }),
+      mk("assistant", { id: "n2", text: "再看结尾", _clientMessageId: "u" }),
+      mk("tool", { id: "t2", toolName: "Bash", _completed: true, cancelled: true, _clientMessageId: "u" }),
+      mk("assistant", { id: "stop", text: "本轮已取消。", _clientMessageId: "u", _errorCode: "user_cancelled" }),
+    ];
+    expect(splitStoppedNarration(msgs)).toBe(msgs);
+    expect(finals(msgs)).toEqual([]);
+  });
+
+  test("stopped mid-answer: text with no step after it stays the answer, stamp is not split", () => {
+    const tape = [
+      mk("user", { id: "u", text: "问" }),
+      mk("tool", { id: "t1", toolName: "Bash", _completed: true, _clientMessageId: "u" }),
+      mk("assistant", { id: "a", text: "答案的前半段", _clientMessageId: "u", _errorCode: "USER_CANCELLED" }),
+    ];
+    expect(splitStoppedNarration(tape)).toBe(tape);
+    const live = [
+      mk("user", { id: "u", text: "问" }),
+      mk("tool", { id: "t1", toolName: "Bash", _completed: true, _clientMessageId: "u" }),
+      mk("assistant", { id: "a", text: "答案的前半段", _clientMessageId: "u" }),
+      mk("assistant", { id: "stop", text: "本轮已取消。", _clientMessageId: "u", _errorCode: "user_cancelled" }),
+    ];
+    expect(finals(live)).toEqual([2]);
+  });
+
+  test("a turn that was not stopped keeps its last text as the answer even with a late step", () => {
+    const msgs = [
+      mk("user", { id: "u", text: "问" }),
+      mk("assistant", { id: "a", text: "答", _clientMessageId: "u" }),
+      mk("plan", { id: "p", _clientMessageId: "u" }),
+    ];
+    expect(finals(msgs)).toEqual([1]);
+  });
+
+  test("a stop in another turn does not touch this turn", () => {
+    const msgs = [
+      mk("user", { id: "u1", text: "问1" }),
+      mk("assistant", { id: "a1", text: "答1", _clientMessageId: "u1" }),
+      mk("plan", { id: "p1", _clientMessageId: "u1" }),
+      mk("user", { id: "u2", text: "问2" }),
+      mk("assistant", { id: "n2", text: "先看看", _clientMessageId: "u2" }),
+      mk("tool", { id: "t2", toolName: "Bash", _completed: true, _clientMessageId: "u2" }),
+      mk("assistant", { id: "stop", text: "", _clientMessageId: "u2", _errorCode: "user_cancelled" }),
+    ];
+    expect(finals(msgs)).toEqual([1]);
   });
 });

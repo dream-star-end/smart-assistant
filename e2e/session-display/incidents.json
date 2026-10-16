@@ -7146,6 +7146,40 @@
           "assertion": "C3 the model answers from the user's message in its context, never from an offloaded request file"
         }
       ]
+    },
+    {
+      "id": "INC-20261016-STOP-NARRATION-LAYOUT",
+      "occurredAt": "2026-10-16",
+      "severity": "P2",
+      "symptom": "手机端 Grok 4.7 停止生成后（已执行 86 个步骤），过程叙述「请求在平台说明处被截断了…」被当成回答挂在步骤折叠块外，下面常显「4 分钟前」时间戳，再接被停止码盖章的另一句叙述，最后才是「已停止生成」。根因：tape 把 USER_CANCELLED 盖在本轮最后一段叙述上（其后还有 29 个步骤），回答判定跳过带错误码的行，于是前一句叙述成了回答并失去动作条、常显时间；实时停止端则把最后一句叙述当回答。修复：停止的轮次里后面还有步骤的文字不算回答；盖章的叙述拆成步骤内叙述 + 无正文的停止行。",
+      "rootFixCommit": "596541be",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
+          "assertion": "tape stamp on narration splits into a plain narration row and a trailing stop row"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
+          "assertion": "live stop row: the last narration followed by steps is not the answer"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
+          "assertion": "stopped mid-answer: text with no step after it stays the answer, stamp is not split"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MessageList.processDisclosure.test.tsx",
+          "assertion": "停止后过程叙述留在步骤里，消息中间没有时间戳"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/process-disclosure.node-test.mjs",
+          "assertion": "no timestamp between the steps and the stop line"
+        }
+      ]
     }
   ]
 }

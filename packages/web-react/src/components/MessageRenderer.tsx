@@ -84,7 +84,7 @@ import {
 import { PermissionToolReopenContext, ToolCardSlot } from "./chat/toolCardSlot";
 import { reopenPermissionUi } from "../lib/chat/permissionPopupCoordinator";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
-import { currentTurnStartIndex, turnFinalAssistantFlags, turnRatingFlags, turnRecoveryParents } from "./chat/turnSegment";
+import { currentTurnStartIndex, splitStoppedNarration, turnFinalAssistantFlags, turnRatingFlags, turnRecoveryParents } from "./chat/turnSegment";
 import {
   captureVisibleVirtualRowAnchor,
   correctedScrollTop,
@@ -2202,7 +2202,8 @@ export function MessageList({
   );
   // OCV5-313: view-only — rows of an earlier finished turn that a refresh merge left under a later
   // user go back to their own turn before grouping, so they never fold into the newest 处理过程.
-  const renderableMessages = returnStrayRowsToOwnerTurn(safeMessages.filter(
+  // OCV5-459: a Stop stamped on mid-turn narration splits into that narration (a step) and the stop row.
+  const renderableMessages = splitStoppedNarration(returnStrayRowsToOwnerTurn(safeMessages.filter(
     (m) =>
       !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
       typeof m.id === "string" &&
@@ -2226,7 +2227,7 @@ export function MessageList({
       !isRedundantRuntimeEnvelope(m) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds) &&
       !isErrorCardSupersededByTurnStatus(m, statusRecordTurnIds),
-  ));
+  )));
   const visibleUserIds = new Set(
     renderableMessages
       .filter((message) => message.role === "user")
