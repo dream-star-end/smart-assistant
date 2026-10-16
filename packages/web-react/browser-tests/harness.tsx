@@ -227,6 +227,25 @@ declare global {
         cursor: number;
         requests: string[];
       }>;
+      /** Reload mid-turn: the tape-commit completion lands inside the replay backlog (INC-20261015-RESUME-REPLAY-LAG). */
+      runResumeReplayCompletion: () => Promise<{
+        settledMs: number | null;
+        syncCalls: number;
+        textLength: number;
+        expectedLength: number;
+        domStartCount: number;
+        domEndCount: number;
+      }>;
+      /** Long answer (>1024 live deltas) replayed by a durable reset (INC-20261015-LIVE-FENCE-TRIM-REPLAY). */
+      runLongAnswerFenceReplay: () => Promise<{
+        deltas: number;
+        firstLength: number;
+        replayLength: number;
+        startCount: number;
+        endCount: number;
+        domStartCount: number;
+        domEndCount: number;
+      }>;
       /** Replay a cold refresh spanning two container frameSeq generations. */
       runDurableGenerationReset: () => Promise<{
         markers: { oldProcess: string; currentProcess: string; currentAnswer: string };
@@ -453,6 +472,12 @@ window.__replayDrive = {
   },
   runDurableGenerationReset: async () => {
     throw new Error("durable generation-reset probe 未挂载");
+  },
+  runLongAnswerFenceReplay: async () => {
+    throw new Error("long-answer fence probe 未挂载");
+  },
+  runResumeReplayCompletion: async () => {
+    throw new Error("resume replay completion probe 未挂载");
   },
   runDurableErrorReplay: async () => {
     throw new Error("durable error replay probe 未挂载");
@@ -2193,6 +2218,125 @@ createRoot(document.getElementById("chat-entry-ux-root")!).render(
         requests,
       };
     },
+    runResumeReplayCompletion: async () => {
+      if (!replaySocket.sessions.get(REPLAY_SESSION_ID)) {
+        replaySocket.ensureSession(REPLAY_SESSION_ID, REPLAY_AGENT_ID, "resume replay completion");
+      }
+      const cmid = await window.__replayDrive.openTurn();
+      const ws = live();
+      const sessionKey = `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`;
+      const peer = { id: REPLAY_SESSION_ID, kind: "dm" };
+      const rowId = "srv-browser-resume-row";
+      const start = "BROWSER_RESUME_START ";
+      const end = " BROWSER_RESUME_END";
+      const total = 400;
+      const cut = 200;
+      const delta = (seq: number) => ({
+        type: "outbound.message",
+        sessionKey,
+        channel: "webchat",
+        peer,
+        clientMessageId: cmid,
+        frameSeq: seq,
+        blocks: [{ kind: "text", text: seq === 1 ? start : seq === total ? end : "x", messageId: rowId }],
+        isFinal: false,
+        ts: seq,
+      });
+      // Reload shape: the gateway re-reads the running turn from its start.
+      ws.deliver({ type: "outbound.active_turn_replay_start", sessionKey, channel: "webchat", peer, clientMessageId: cmid });
+      for (let seq = 1; seq <= cut; seq++) ws.deliver(delta(seq));
+      const syncBefore = replaySyncCalls;
+      const t0 = performance.now();
+      // The tape commit already happened; its completion overtakes the rest of the backlog.
+      ws.deliver({
+        type: "outbound.message",
+        sessionKey,
+        channel: "webchat",
+        peer,
+        clientMessageId: cmid,
+        blocks: [],
+        isFinal: true,
+        meta: { reconcile: "turn_completed", reconcileSource: "tape_commit" },
+        // Committed after the whole answer was generated: newer than every backlog frame.
+        ts: total + 1,
+      });
+      let settledMs: number | null = null;
+      for (let i = 0; i < 200; i++) {
+        if (!replaySocket.sessions.get(REPLAY_SESSION_ID)?._sendingInFlight) {
+          settledMs = Math.round(performance.now() - t0);
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const syncCalls = replaySyncCalls - syncBefore;
+      // The rest of the backlog is older than the settled completion: REST history, not the
+      // backlog, completes the row, so these frames must neither grow nor double it.
+      for (let seq = cut + 1; seq <= total; seq++) ws.deliver(delta(seq));
+      const root = document.querySelector("#timeline-replay-root");
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const text = replaySocket.sessions.get(REPLAY_SESSION_ID)?.messages.find((m) => m.id === rowId)?.text ?? "";
+      const dom = root?.textContent ?? "";
+      return {
+        settledMs,
+        syncCalls,
+        textLength: text.length,
+        expectedLength: start.length + (cut - 1),
+        domStartCount: dom.split("BROWSER_RESUME_START").length - 1,
+        domEndCount: dom.split("BROWSER_RESUME_END").length - 1,
+      };
+    },
+    runLongAnswerFenceReplay: async () => {
+      replaySocket.removeSession(REPLAY_SESSION_ID);
+      const session = replaySocket.ensureSession(REPLAY_SESSION_ID, REPLAY_AGENT_ID, "long answer fence replay");
+      const clientMessageId = "m-browser-long-answer";
+      const sessionKey = `agent:${REPLAY_AGENT_ID}:webchat:dm:${REPLAY_SESSION_ID}`;
+      const start = "BROWSER_FENCE_ANSWER_START ";
+      const end = " BROWSER_FENCE_ANSWER_END";
+      session.messages.push({ id: clientMessageId, role: "user", text: "BROWSER_FENCE_USER", ts: 1, status: "sent" });
+      session._sendingInFlight = true;
+      session._activeClientMessageId = clientMessageId;
+      const deltas = 1025;
+      const frames = Array.from({ length: deltas }, (_, i) => ({
+        recordId: String(i + 1),
+        streamKey: "dispatch:99999999-9999-4999-8999-999999999999:1",
+        source: "gateway" as const,
+        clientMessageId,
+        payload: {
+          type: "outbound.message",
+          sessionKey,
+          frameSeq: i + 1,
+          channel: "webchat",
+          peer: { id: REPLAY_SESSION_ID, kind: "dm" },
+          clientMessageId,
+          blocks: [{ kind: "text", text: i === 0 ? start : i === deltas - 1 ? end : "x", messageId: "srv-browser-long-answer" }],
+          isFinal: false,
+          ts: (i + 1) * 10,
+        },
+      }));
+      const answer = () => session.messages.find((m) => m.id === "srv-browser-long-answer")?.text ?? "";
+      replaySocket.applyDurableLiveFrames(REPLAY_SESSION_ID, frames);
+      const firstLength = answer().length;
+      // Refresh shape: the journal hydrate resets the turn's cursor and replays it from frame one.
+      replaySocket.applyDurableLiveFrames(REPLAY_SESSION_ID, frames, [clientMessageId]);
+      const root = document.querySelector("#timeline-replay-root");
+      for (let i = 0; i < 200 && !root?.textContent?.includes("BROWSER_FENCE_ANSWER_END"); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const text = answer();
+      const dom = root?.textContent ?? "";
+      // Leave no in-flight turn behind for later replay-root cases.
+      replaySocket.removeSession(REPLAY_SESSION_ID);
+      return {
+        deltas,
+        firstLength,
+        replayLength: text.length,
+        startCount: text.split("BROWSER_FENCE_ANSWER_START").length - 1,
+        endCount: text.split("BROWSER_FENCE_ANSWER_END").length - 1,
+        domStartCount: dom.split("BROWSER_FENCE_ANSWER_START").length - 1,
+        domEndCount: dom.split("BROWSER_FENCE_ANSWER_END").length - 1,
+      };
+    },
     runDurableGenerationReset: async () => {
       replaySocket.removeSession(REPLAY_SESSION_ID);
       const session = replaySocket.ensureSession(
@@ -3551,3 +3695,143 @@ createRoot(document.getElementById("settings-shell-root")!).render(
     <SettingsShellProbe />
   </StrictMode>,
 );
+
+
+// ── T73 / OCV5-428: cold-start queue. A message that waits for the container (transport open,
+// relay not ready, then 4503 starting) must show the connection state; 「思考中」 only after the
+// server's admission ACK. Own socket + own fake transport so the shared replay socket is untouched.
+const COLD_SESSION_ID = "cold-start-queue";
+class ColdStartWebSocket {
+  static latest: ColdStartWebSocket | null = null;
+  readyState = 0;
+  bufferedAmount = 0;
+  sent: string[] = [];
+  onopen: ((ev: unknown) => void) | null = null;
+  onmessage: ((ev: { data: string }) => void) | null = null;
+  onclose: ((ev: { code: number; reason: string }) => void) | null = null;
+  onerror: ((ev: unknown) => void) | null = null;
+  constructor(_url: string, _protocols?: string[]) {
+    ColdStartWebSocket.latest = this;
+    setTimeout(() => {
+      this.readyState = 1;
+      this.onopen?.({});
+    }, 0);
+  }
+  send(data: string): void {
+    this.sent.push(data);
+    try {
+      const frame = JSON.parse(data) as { type?: string; id?: number };
+      if (frame?.type === "ping") setTimeout(() => this.deliver({ type: "pong", id: frame.id }), 0);
+    } catch {
+      /* 非 JSON 帧忽略 */
+    }
+  }
+  close(code = 1000, reason = ""): void {
+    if (this.readyState === 3) return;
+    this.readyState = 3;
+    this.onclose?.({ code, reason });
+  }
+  deliver(frame: unknown): void {
+    this.onmessage?.({ data: JSON.stringify(frame) });
+  }
+}
+const coldStartSocket = new ChatSocket({
+  getToken: () => "harness-cold-start",
+  getAuthEpoch: () => 0,
+  silentRefresh: async (epoch) => ({ kind: "transient" as const, epoch, retryAfterMs: 1000 }),
+  onAuthExpired: () => {},
+  defaultAgentId: REPLAY_AGENT_ID,
+});
+coldStartSocket.ensureSession(COLD_SESSION_ID, REPLAY_AGENT_ID, "冷启动会话");
+
+function ColdStartQueueProbe() {
+  const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
+  const snap = useSyncExternalStore(coldStartSocket.subscribe, coldStartSocket.getSnapshot);
+  void snap.version;
+  const session = snap.sessions.get(COLD_SESSION_ID);
+  const sending = coldStartSocket.isSessionBusy(COLD_SESSION_ID);
+  // Same gating as App.tsx turnActivity (OCV5-428).
+  const dispatch = coldStartSocket.getDispatchStatus(COLD_SESSION_ID);
+  const turnActivity = session && (session._sendingInFlight || dispatch)
+    ? { dispatch, startedAt: session._turnStartedAt ?? null, agentName: "助手" }
+    : null;
+  return (
+    <div ref={setScroller} className="chat-scroll-area timeline-scroll-probe" data-testid="cold-start-queue-probe">
+      <MessageList
+        messages={session?.messages ?? []}
+        sending={sending}
+        turnActivity={turnActivity}
+        cb={{}}
+        onRespondPermission={() => {}}
+        scrollParent={scroller}
+        historyGeneration={`cold::${COLD_SESSION_ID}`}
+      />
+    </div>
+  );
+}
+
+createRoot(document.getElementById("cold-start-queue-root")!).render(
+  <StrictMode><ColdStartQueueProbe /></StrictMode>,
+);
+
+let coldStartOriginalWebSocket: typeof WebSocket | null = null;
+const coldStartWaitOpen = async (previous: ColdStartWebSocket | null) => {
+  for (let i = 0; i < 100; i++) {
+    const ws = ColdStartWebSocket.latest;
+    if (ws && ws !== previous && ws.readyState === 1) return ws;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("冷启动探针传输未打开");
+};
+(window as unknown as { __coldStartDrive: unknown }).__coldStartDrive = {
+  /** Bridge accepted the socket, ensureRunning still waiting: no relay_ready. */
+  connectWithoutRelay: async () => {
+    coldStartOriginalWebSocket = window.WebSocket;
+    (window as unknown as { WebSocket: unknown }).WebSocket = ColdStartWebSocket;
+    coldStartSocket.setGateReady(true);
+    coldStartSocket.start();
+    await coldStartWaitOpen(null);
+  },
+  send: () => {
+    coldStartSocket.sendMessage({
+      sessId: COLD_SESSION_ID,
+      agentId: REPLAY_AGENT_ID,
+      text: "COLD_START_QUEUED_MESSAGE",
+      model: "glm-5.2",
+    });
+  },
+  /** The master gives up for now: 4503 {reason:"starting"}. */
+  closeStarting: () => {
+    ColdStartWebSocket.latest?.close(4503, JSON.stringify({ retryAfterSec: 5, reason: "starting" }));
+  },
+  /** Container ready: reconnect, relay_ready flushes the queue. Returns the sent clientMessageId. */
+  reconnectReady: async () => {
+    const previous = ColdStartWebSocket.latest;
+    coldStartSocket.retryConnectNow();
+    const ws = await coldStartWaitOpen(previous);
+    ws.deliver(relayReadyFrame);
+    for (let i = 0; i < 100; i++) {
+      for (const raw of ws.sent) {
+        const frame = JSON.parse(raw) as { type?: string; clientMessageId?: string };
+        if (frame.type === "inbound.message" && frame.clientMessageId) return frame.clientMessageId;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error("relay 就绪后排队消息没有发出");
+  },
+  admit: (clientMessageId: string) => {
+    ColdStartWebSocket.latest?.deliver({
+      type: "outbound.ack",
+      admitted: true,
+      peer: { id: COLD_SESSION_ID, kind: "dm" },
+      clientMessageId,
+    });
+  },
+  finish: () => {
+    coldStartSocket.stop();
+    if (coldStartOriginalWebSocket) {
+      (window as unknown as { WebSocket: unknown }).WebSocket = coldStartOriginalWebSocket;
+      coldStartOriginalWebSocket = null;
+    }
+  },
+};

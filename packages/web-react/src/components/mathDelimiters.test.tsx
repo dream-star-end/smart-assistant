@@ -4,7 +4,7 @@ import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkMath from "remark-math";
 import { afterEach, describe, expect, test } from "vitest";
-import { normalizeMathDelimiters as N } from "./mathDelimiters";
+import { normalizeMathDelimiters as N, unclosedDisplayMathStart } from "./mathDelimiters";
 
 afterEach(cleanup);
 
@@ -86,5 +86,48 @@ describe("端到端渲染(根治验证)", () => {
     const txt = container.textContent || "";
     expect(txt).not.toContain("\\("); // 无裸行内定界符残留
     expect(txt).not.toContain("\\["); // 无裸行间定界符残留
+  });
+});
+
+describe("货币 $ 不被当成公式(OCV5-421)", () => {
+  test("价格转义为字面 $,真公式保留", () => {
+    expect(N("基础版 $5，专业版 $10 每月；企业版 $1,299 起。公式：$E=mc^2$，以及 $2x+1$。")).toBe(
+      "基础版 \\$5，专业版 \\$10 每月；企业版 \\$1,299 起。公式：$E=mc^2$，以及 $2x+1$。",
+    );
+    expect(N("The basic plan is $5 and the pro plan is $10 per month.")).toBe(
+      "The basic plan is \\$5 and the pro plan is \\$10 per month.",
+    );
+    expect(N("costs $5-$10")).toBe("costs \\$5-\\$10");
+    expect(N("$x$ costs $5")).toBe("$x$ costs \\$5");
+  });
+
+  test("像公式的数字开头仍按公式:$5$、$5 + x$、$2^n$", () => {
+    expect(N("$5$ 与 $2^n$ 和 $a_i$")).toBe("$5$ 与 $2^n$ 和 $a_i$");
+    expect(N("$5 + x$")).toBe("$5 + x$");
+    expect(N("$$\\int_0^1 x$$ and $3")).toBe("$$\\int_0^1 x$$ and \\$3");
+  });
+
+  test("代码与已转义的 $ 不动", () => {
+    expect(N("`$5 and $10` code")).toBe("`$5 and $10` code");
+    expect(N("价格\\$5 已转义")).toBe("价格\\$5 已转义");
+  });
+
+  test("端到端:两个价格之间不再渲染出 KaTeX,后面的真公式照常渲染", () => {
+    const { container } = renderMd(N("基础版 $5，专业版 $10 每月。公式 $E=mc^2$。"));
+    const katex = [...container.querySelectorAll(".katex")];
+    expect(katex).toHaveLength(1);
+    expect(container.textContent).toContain("$5，专业版 $10 每月");
+  });
+});
+
+describe("unclosedDisplayMathStart(流式半截公式)", () => {
+  test("奇数个 $$ 返回最后一个位置,偶数返回 -1", () => {
+    expect(unclosedDisplayMathStart("推导：\n\n$$\n\\frac{a}{")).toBe(5);
+    expect(unclosedDisplayMathStart("$$a$$ 和 $$b$$")).toBe(-1);
+    expect(unclosedDisplayMathStart("无公式")).toBe(-1);
+  });
+  test("代码里的 $$ 不计", () => {
+    expect(unclosedDisplayMathStart("```sh\necho $$\n```\n正文")).toBe(-1);
+    expect(unclosedDisplayMathStart("`$$` 然后 $$x")).toBe(8);
   });
 });

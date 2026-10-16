@@ -12,6 +12,8 @@ packages/commercial/src/__tests__/orders.integ.test.ts
 packages/commercial/src/__tests__/ledger.integ.test.ts
 packages/commercial/src/__tests__/preCheckCap.integ.test.ts
 packages/commercial/src/__tests__/settleUsage.integ.test.ts
+packages/commercial/src/__tests__/antigravitySettle.integ.test.ts
+packages/commercial/src/__tests__/openCodeGoCatalog.integ.test.ts
 packages/commercial/src/__tests__/settleUsageConcurrent.integ.test.ts
 packages/commercial/src/__tests__/turnWaiver.integ.test.ts
 packages/commercial/src/__tests__/imageBilling.integ.test.ts

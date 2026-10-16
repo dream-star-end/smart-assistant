@@ -625,6 +625,14 @@ export const commercialConfigSchema = z
      */
     SCNET_TOKEN_PLAN_KEY: z.string().trim().min(1).max(512).optional(),
     /**
+     * OCV5-415 Antigravity CLI 的 Google OAuth client secret(官方 1.3.4 二进制内嵌的
+     * installed-app secret,client id 见 antigravityOAuth.ts)。
+     * - 只用于 master/egress 刷新 gemini_oauth_accounts 的令牌与签发受限令牌
+     * - 只存在于 master/egress EnvironmentFile,绝不注入用户容器或写入 git
+     * - 未配置 → Antigravity relay 与账号接入返回 ANTIGRAVITY_NOT_CONFIGURED
+     */
+    OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET: z.string().trim().regex(/^GOCSPX-[A-Za-z0-9_-]{20,64}$/).optional(),
+    /**
      * Deepgram Nova-3 streaming ASR key for browser voice input.
      *
      * - 只在 master-side `/ws/voice-transcribe` 使用,前端永远不见 key。

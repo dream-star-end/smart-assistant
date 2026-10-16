@@ -119,6 +119,11 @@ export type FrameEffects = {
   /** resume_failed / reconcile：游标已推进 + 标 _liveStreamBroken 后，强制 REST 全量 sync。*/
   forceSync?: (sessId: string, context?: { clientMessageId?: string }) => void;
   /**
+   * tape 提交后的合成 turn_completed 命中**正在流式**的本轮:返回 true 表示 socket 接管——宽限期内
+   * 等 live 尾巴与真 final 自然收口,期满仍未收口再按 reconcile 收口。缺省/false → 立即收口(旧行为)。
+   */
+  deferTapeCommitFinal?: (sessId: string, frame: OutboundMessageWire) => boolean;
+  /**
    * reconcile 'turn_state_unknown'(RFC §4):server 无法判定在飞 turn 终态。**绝不清发送态**,
    * 由 socket 把该会话 thinking-safety 定时降至 60s(默认 10min),尽快复检服务端权威态。
    */
@@ -733,13 +738,56 @@ function isFrozenLiveTarget(message: ChatMessage): boolean {
 
 function frameSeqAlreadyApplied(message: ChatMessage, frameSeq?: number): boolean {
   if (!(typeof frameSeq === "number" && Number.isSafeInteger(frameSeq) && frameSeq > 0)) return false;
-  return message._appliedFrameSeqs?.[frameSeq] === true;
+  if (message._appliedFrameSeqs?.[frameSeq] === true) return true;
+  const ranges = message._appliedFrameSeqRanges;
+  if (!ranges) return false;
+  let lo = 0;
+  let hi = ranges.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const [from, to] = ranges[mid];
+    if (frameSeq < from) hi = mid - 1;
+    else if (frameSeq > to) lo = mid + 1;
+    else return true;
+  }
+  return false;
+}
+
+/** Per-row replay fence: the newest keys stay in `_appliedFrameSeqs`. A long answer adds one key per
+ * delta and the row is persisted with it (OCV5-421: 10k+ keys cloned on every save), so older keys
+ * are folded into closed ranges instead of being dropped. A journal hydrate resets the session cursor
+ * and replays from the start of the turn, so the fence must stay lossless. */
+const APPLIED_FRAME_SEQ_KEEP = 512;
+
+function foldFrameSeqRanges(ranges: ReadonlyArray<readonly [number, number]>, seqs: number[]): Array<[number, number]> {
+  const all: Array<[number, number]> = ranges.map(([from, to]) => [from, to]);
+  for (const seq of seqs) all.push([seq, seq]);
+  all.sort((a, b) => a[0] - b[0]);
+  const out: Array<[number, number]> = [];
+  for (const [from, to] of all) {
+    const last = out[out.length - 1];
+    if (last && from <= last[1] + 1) last[1] = Math.max(last[1], to);
+    else out.push([from, to]);
+  }
+  return out;
 }
 
 function noteAppliedFrameSeq(message: ChatMessage, frameSeq?: number): void {
   if (!(typeof frameSeq === "number" && Number.isSafeInteger(frameSeq) && frameSeq > 0)) return;
   if (!message._appliedFrameSeqs) message._appliedFrameSeqs = {};
   message._appliedFrameSeqs[frameSeq] = true;
+  const keys = Object.keys(message._appliedFrameSeqs);
+  if (keys.length > APPLIED_FRAME_SEQ_KEEP * 2) {
+    // Integer keys iterate ascending: keep the newest half as keys, fold the rest into ranges.
+    const cut = keys.length - APPLIED_FRAME_SEQ_KEEP;
+    message._appliedFrameSeqRanges = foldFrameSeqRanges(
+      message._appliedFrameSeqRanges ?? [],
+      keys.slice(0, cut).map(Number),
+    );
+    const kept: Record<number, true> = {};
+    for (const key of keys.slice(cut)) kept[Number(key)] = true;
+    message._appliedFrameSeqs = kept;
+  }
 }
 
 function matchesDelegateProgress(groupMsg: ChatMessage, progress: ChatMessage): boolean {
@@ -1660,6 +1708,23 @@ export function applyOutboundMessage(
       effects.forceSync?.(sess.id, { clientMessageId: frameCmid });
       return;
     }
+    // OCV5-424:master 在 tape 提交(HTTP)后立刻合成的 turn_completed 会**抢在**同一轮仍在 WS 上的
+    // live 尾巴之前到达。此处若立即收口,resetReplyTracker 把截止戳定在本帧 server ts,随后到达的
+    // 尾巴帧(ts 更早)全被 stale 守卫丢弃 → 本轮显示「已完成」但正文停在半句,约 1s 后 REST 对账才补齐。
+    // 本轮仍在流式时交给 socket 宽限等待真 final;hello/reconciler 的 reconcile 不带该来源,行为不变。
+    // OCV5-427:刷新/重连后本轮正经 active_turn_replay_start 重读,尾巴排在成百上千条积压重放帧之后,
+    // 宽限期内等不到 → 不等,立即收口并走下方 onFinal 的精确 REST 对账(tape 已提交,历史即完整)。
+    if (
+      frame.meta?.reconcile === "turn_completed" &&
+      frame.meta?.reconcileSource === "tape_commit" &&
+      frameCmid &&
+      frameCmid === active &&
+      sess._sendingInFlight &&
+      sess._resumeReplayClientMessageId !== frameCmid &&
+      effects.deferTapeCommitFinal?.(sess.id, frame) === true
+    ) {
+      return;
+    }
     const clientMessageId = frameCmid ?? active;
     sess._streamingAssistant = null;
     sess._streamingThinking = null;
@@ -2367,6 +2432,8 @@ export function applyOutboundMessage(
       }
       if (m.role === "tool" && typeof m._completed === "boolean" && !m._completed && !m.error && !m._background) {
         m._completed = true;
+        // OCV5-421: 停止 / 中断收尾时这一步没拿到任何结果,它没跑完 —— 显示「已取消」而不是绿勾「完成」。
+        if ((frame.meta?.interrupted || suppressLegacyErrorText) && !m.output && !m.bashTail) m.cancelled = true;
       }
       // agent-group / delegate-progress：turn 收尾仍未完成 → 标完成。turn 已结束就不该再
       // "运行中/子智能体启动中…"(委托帧 runId 绑定缺位时会卡住,这里兜底收口)。
@@ -2550,6 +2617,21 @@ export type DeferredTerminalErrorPaint = {
   traceId?: string;
 };
 
+/**
+ * 终态错误收尾(OCV5-421):本轮还在「运行中」的工具不会再有结果帧(legacy `error` 之后没有 final,
+ * 只有下一轮 final 才会顺手扫掉),于是红卡下面一直转圈。按本轮归属把它们标成已取消。
+ * 后台委派(_background)照旧等子任务自己的终态。
+ */
+function settleOrphanTools(sess: ChatSession, ownerId: string | undefined): void {
+  for (const m of sess.messages) {
+    if (m.role !== "tool" || m._completed !== false || m.error || m._background) continue;
+    if (isImmutableTapeViewportRow(m)) continue;
+    if (ownerId && m._turnOwnerId && m._turnOwnerId !== ownerId) continue;
+    m._completed = true;
+    if (!m.output && !m.bashTail) m.cancelled = true;
+  }
+}
+
 function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint, userCancelled: boolean): void {
   const silent = isSilentTurnErrorCode(paint.normalized);
   const keepQuietStopLine = paint.normalized === "stopped" || paint.normalized === "user_cancelled";
@@ -2576,6 +2658,7 @@ function paintTerminalError(sess: ChatSession, paint: DeferredTerminalErrorPaint
     ? sess._activeClientMessageId === paint.clientMessageId
     : true; // rolling compatibility for old gateways
   if (ownsActiveTurn) {
+    settleOrphanTools(sess, paint.clientMessageId ?? sess._activeClientMessageId);
     sess._sendingInFlight = false;
     sess._activeClientMessageId = undefined;
     clearTurnTiming(sess);

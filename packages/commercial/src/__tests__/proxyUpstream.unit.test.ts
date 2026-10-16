@@ -2359,3 +2359,92 @@ describe("pickUpstream — H6.D refresh rebind 保留 pick.account_uuid", () => 
     assert.equal(userIdObj.account_uuid, REAL_UUID, "refresh 后 account_uuid 仍要可用");
   });
 });
+
+ test("Gemini trusted transport marker is model+provider-scoped; existing Go models remain Anthropic", async () => {
+  for (const model of ['gemini-4-argon-contributor', 'deepseek-v4-flash', 'qwen3.7-plus']) {
+    const sched = makeScheduler({});
+    const result = await pickUpstream({ scheduler: sched.scheduler, staticProviderKeys: { opencodego: 'key' } },
+      bodyFor(model), selectUpstreamRoute(model), log);
+    assert.ok(result.ok);
+    if (!result.ok) throw new Error('not prepared');
+    assert.equal(result.session.transport, model.startsWith('gemini-') ? 'gemini-go' : undefined);
+    assert.equal(result.session.endpoint, 'https://opencode.ai/zen/go/v1/messages');
+    assert.equal(sched.pickCalls, 0);
+  }
+ });
+
+// ─── OCV5-424:静态 provider 的 API-key 服务池 ─────────────────────────────
+
+describe("pickUpstream — API-key 服务池(OCV5-424)", () => {
+  test("池选到 key → 用池里的 key 并带 poolMember,不用 env key", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      {
+        scheduler: sched.scheduler,
+        staticProviderKeys: { deepseek: "ENV-KEY" },
+        selectApiKey: async (service) => ({ service, memberId: "7", apiKey: "POOL-KEY" }),
+        apiKeyPoolHasMembers: () => true,
+      },
+      bodyFor("deepseek-v4-pro"),
+      DEEPSEEK_ROUTE,
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    const headers: Record<string, string> = {};
+    res.session.applyUpstreamAuth(headers, { metadata: {} } as never, log);
+    assert.equal(headers.authorization, "Bearer POOL-KEY");
+    assert.deepEqual(res.session.poolMember, { service: "deepseek", memberId: "7" });
+    assert.equal(sched.pickCalls, 0);
+  });
+
+  test("池里有成员但全部冷却/停用 → pool_unavailable,不回落 env key(否则绕过管理员停用与冷却)", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      {
+        scheduler: sched.scheduler,
+        staticProviderKeys: { deepseek: "ENV-KEY" },
+        selectApiKey: async () => null,
+        apiKeyPoolHasMembers: (service) => service === "deepseek",
+      },
+      bodyFor("deepseek-v4-pro"),
+      DEEPSEEK_ROUTE,
+      log,
+    );
+    assert.equal(res.ok, false);
+    if (res.ok) return;
+    assert.equal(res.error.kind, "pool_unavailable");
+  });
+
+  test("池为空(尚未导入/该服务没有成员)→ 仍用 env key,poolMember 为空", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      {
+        scheduler: sched.scheduler,
+        staticProviderKeys: { deepseek: "ENV-KEY" },
+        selectApiKey: async () => null,
+        apiKeyPoolHasMembers: () => false,
+      },
+      bodyFor("deepseek-v4-pro"),
+      DEEPSEEK_ROUTE,
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    const headers: Record<string, string> = {};
+    res.session.applyUpstreamAuth(headers, { metadata: {} } as never, log);
+    assert.equal(headers.authorization, "Bearer ENV-KEY");
+    assert.equal(res.session.poolMember ?? null, null);
+  });
+
+  test("validateUpstreamConfig:无 env key 但服务池有成员 → 视为已配置", () => {
+    assert.equal(
+      validateUpstreamConfig(BAILIAN_ROUTE, { apiKeyPoolConfigured: (s) => s === "bailian" }),
+      null,
+    );
+    assert.deepEqual(validateUpstreamConfig(BAILIAN_ROUTE, { apiKeyPoolConfigured: () => false }), {
+      kind: "static_not_configured",
+      providerId: "bailian",
+    });
+  });
+});

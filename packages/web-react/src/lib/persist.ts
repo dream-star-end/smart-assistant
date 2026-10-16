@@ -2428,6 +2428,7 @@ export class SessionStore {
             teamMode: payload.teamMode === true,
             effortLevel: payload.effortLevel ?? null,
             ...(payload.contextTier ? { contextTier: payload.contextTier } : {}),
+            ...(payload.serviceTier ? { serviceTier: payload.serviceTier } : {}),
           },
           _sendAttempt: Number.isSafeInteger(attempt) && attempt >= 0 ? attempt : 0,
         };

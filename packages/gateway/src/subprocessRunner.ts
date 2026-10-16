@@ -1,4 +1,4 @@
-import { BOX_API_MODELS, isBoxApiModel } from '@openclaude/protocol'
+import { BOX_API_MODELS, OPENAI_FAST_SERVICE_TIER, fastServiceTierRoute, isBoxApiModel } from '@openclaude/protocol'
 import {
   identityCompatEnvironment,
   isProjectSearchEnabled,
@@ -16,7 +16,7 @@ import { boxCcBridgePath, stripBoxCcParentAuth } from './engine/cursorBoxCc.js'
 import { ccbStdinUserContent } from './ccbNativeCompaction.js'
 import { atomicWriteJsonFile, buildCcbEfficiencySettings } from './efficiencyHookConfig.js'
 import { isV3ContainerRuntime, resolveHostStaticProviderEnv } from './hostStaticProviders.js'
-import type { GoalStateSnapshot, StaticProviderKeys } from '@openclaude/protocol'
+import type { GoalStateSnapshot, ServiceTier, StaticProviderKeys } from '@openclaude/protocol'
 import { renderCcbGoalPrompt } from './goalPrompt.js'
 import { modelHintAppliedTotal } from './metrics.js'
 import {
@@ -189,6 +189,18 @@ function buildRemoteTargetEnv(target: ExecutionTarget | undefined): Record<strin
     OC_REMOTE_HOST: hostMeta.host,
     OC_REMOTE_PORT: String(hostMeta.port),
     OC_REMOTE_WORKDIR: hostMeta.remoteWorkdir,
+  }
+}
+
+/**
+ * OCV5-434 GPT Fast for OpenCode Go /responses models: CCB merges CLAUDE_CODE_EXTRA_BODY into
+ * every request body, the proxy keeps `service_tier: "priority"` for the Fast models only.
+ * Standard → empty string (NOT key omission): the spawn env starts from process.env, so an
+ * inherited value must be cleared; CCB ignores an empty CLAUDE_CODE_EXTRA_BODY.
+ */
+export function _buildCcbServiceTierEnv(tier: ServiceTier | null): { CLAUDE_CODE_EXTRA_BODY: string } {
+  return {
+    CLAUDE_CODE_EXTRA_BODY: tier === 'fast' ? JSON.stringify({ service_tier: OPENAI_FAST_SERVICE_TIER }) : '',
   }
 }
 
@@ -1591,6 +1603,25 @@ export class SubprocessRunner extends EventEmitter {
     this.opts.effortLevel = level
   }
 
+  /** OCV5-434 GPT Fast for OpenCode Go /responses models: carried as
+   *  CLAUDE_CODE_EXTRA_BODY={"service_tier":"priority"} (read once at spawn, like effort).
+   *  Any other model keeps standard. */
+  private _serviceTier: ServiceTier | null = null
+  get serviceTier(): ServiceTier | null {
+    return this._serviceTier
+  }
+
+  /** Returns 'restart' when a running subprocess must be recycled for the new value to apply
+   *  (the caller folds it into its single shutdown, like setEffortLevel). `model` is the
+   *  turn's effective canonical model. */
+  setServiceTier(tier: ServiceTier | null, model: string | undefined): 'restart' | 'applied' | 'unchanged' {
+    const next: ServiceTier | null =
+      tier === 'fast' && fastServiceTierRoute(model) === 'opencode-responses' ? 'fast' : null
+    if (next === this._serviceTier) return 'unchanged'
+    this._serviceTier = next
+    return this.isRunning ? 'restart' : 'applied'
+  }
+
   /** Current model id (used by sessionManager.submit to detect changes
    *  before deciding whether to recycle the subprocess). 2026-04-26 v1.0.4
    *  起新增,配合 InboundMessage.model 让用户在前端 pill 切模型生效。 */
@@ -1963,6 +1994,8 @@ export class SubprocessRunner extends EventEmitter {
           // Empty string deletes any inherited CLAUDE_CODE_EFFORT_LEVEL so a
           // gateway-process env doesn't bleed into spawned CCBs.
           CLAUDE_CODE_EFFORT_LEVEL: this.opts.effortLevel ?? '',
+          // OCV5-434: OpenCode Go GPT Fast (see _buildCcbServiceTierEnv).
+          ..._buildCcbServiceTierEnv(this._serviceTier),
           ...(this.opts.hermeticNoTools ? { CLAUDE_CODE_DISABLE_ADVISOR_TOOL: '1' } : {}),
           // Note: CLAUDE_CODE_DISABLE_BACKGROUND_TASKS used to be set to '1'
           // here to strip run_in_background from Bash/Agent/PowerShell tool

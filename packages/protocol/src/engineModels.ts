@@ -12,7 +12,11 @@
 // 设计边界:只回答「哪些 model id 由 codex engine 承接」。模型准入(白名单 /
 // 授权可见性)与 engine 构造(registry fail-closed)仍在各自消费方收口。
 
-import { findRouteProviderForModel } from './staticKeyProviders.js'
+import {
+  findRouteProviderForModel,
+  OPENCODE_GO_EXTRA_MODELS,
+  staticProviderOutputConfigEfforts,
+} from './staticKeyProviders.js'
 
 /**
  * v5 对外承诺的统一思考深度枚举。
@@ -190,8 +194,19 @@ export const CONTEXT_TIER_FAMILIES = [
 export type ContextTierFamily = (typeof CONTEXT_TIER_FAMILIES)[number]
 export type ContextTierFamilyId = ContextTierFamily['family']
 
-/** 选择器折叠组标题(单一权威,前端与测试共用)。 */
-export const COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL = '更多 GPT 模型'
+/**
+ * 选择器折叠组标题(单一权威,前端与测试共用)。组内是 collapsedByDefault 的上下文家族
+ * 与 `isMorePickerModelId` 的模型。
+ */
+export const COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL = '更多模型'
+
+/**
+ * OCV5-425: models the picker lists only inside the collapsed「更多模型」group (OpenCode Go
+ * models added alongside the main list). Display only; admission, billing and routing ignore it.
+ */
+export function isMorePickerModelId(modelId: string): boolean {
+  return Object.hasOwn(OPENCODE_GO_EXTRA_MODELS, modelId)
+}
 
 export function contextFamilyCollapsedByDefault(family: ContextTierFamilyId): boolean {
   return CONTEXT_TIER_FAMILIES.some((row) => row.family === family && row.collapsedByDefault)
@@ -293,38 +308,59 @@ export function zcodeTransportModelId(modelId: string | undefined): string | und
 /**
  * Official Google Antigravity CLI (`agy`/`antigravity`) engine (OCV5-415).
  *
- * Hidden and experimental: no catalog row, no relay wiring yet. Everything
- * below was read from the pinned 1.3.4 linux-x64 binary with a fake key and a
- * loopback mock (docs/ocv5-415-antigravity-cli.md), not from secondary docs.
+ * The CLI runs signed in with a Google AI subscription account (consumer
+ * OAuth). Every `/v1internal:*` call goes through the master relay via
+ * `CLOUD_CODE_URL`; the relay injects the account's full-scope token. The
+ * values below were read from the pinned 1.3.4 binary through that relay
+ * (docs/ocv5-415-antigravity-cli.md), not from secondary docs.
  *
- * - `cliFamily` + effort → the exact `agy models` id passed to `--model`
- *   (e.g. `gemini-3.1-pro-high`). The CLI's own `--effort` flag is not used:
- *   with a family id it silently picks the maximum thinking budget.
- * - `upstreamModels` are the Gemini API model names the CLI actually requests
- *   for that family. A relay must accept only these plus
- *   ANTIGRAVITY_AUX_UPSTREAM_MODELS and bill every call it forwards.
+ * - `cliModels` maps an effort (or `default` for single-level models) to the
+ *   exact `agy models` id passed to `--model`. The CLI's own `--effort` flag
+ *   is not used: with a family id it silently picks the maximum budget.
+ * - The upstream request's `model` field equals that CLI id. A relay accepts
+ *   only the route model's CLI ids plus ANTIGRAVITY_AUX_UPSTREAM_MODELS and
+ *   meters every call it forwards.
  */
 export const ANTIGRAVITY_CLI_VERSION = '1.3.4'
-/** Title generation call the CLI makes on every new conversation. It is NOT
- * included in the CLI's own `result.usage`, so CLI usage alone under-bills. */
-export const ANTIGRAVITY_AUX_UPSTREAM_MODELS = ['gemini-3.1-flash-lite-preview'] as const
+/** Title generation (`requestType: checkpoint`) the CLI makes on every new
+ * conversation. It is NOT included in the CLI's own `result.usage`, so CLI
+ * usage alone under-bills. */
+export const ANTIGRAVITY_AUX_UPSTREAM_MODELS = ['gemini-3.5-flash-lite'] as const
 export const ANTIGRAVITY_ENGINE_MODELS = [
-  {
-    id: 'antigravity-gemini-3.1-pro',
-    displayName: 'Gemini 3.1 Pro (Antigravity)',
-    cliFamily: 'gemini-3.1-pro',
-    efforts: ['low', 'high'],
-    defaultEffort: 'high',
-    upstreamModels: ['gemini-3.1-pro-preview', 'gemini-3.1-pro-preview-customtools'],
-    experimental: true,
-  },
   {
     id: 'antigravity-gemini-3.8-flash',
     displayName: 'Gemini 3.8 Flash (Antigravity)',
-    cliFamily: 'gemini-3.8-flash',
     efforts: ['low', 'medium', 'high'],
     defaultEffort: 'medium',
-    upstreamModels: ['gemini-3.8-flash'],
+    cliModels: {
+      low: 'gemini-3.8-flash-low',
+      medium: 'gemini-3.8-flash-medium',
+      high: 'gemini-3.8-flash-high',
+    },
+    experimental: true,
+  },
+  {
+    id: 'antigravity-claude-sonnet-4.6',
+    displayName: 'Claude Sonnet 4.6 (Antigravity)',
+    efforts: [],
+    defaultEffort: 'default',
+    cliModels: { default: 'claude-sonnet-4-6' },
+    experimental: true,
+  },
+  {
+    id: 'antigravity-claude-opus-4.6',
+    displayName: 'Claude Opus 4.6 Thinking (Antigravity)',
+    efforts: [],
+    defaultEffort: 'default',
+    cliModels: { default: 'claude-opus-4-6-thinking' },
+    experimental: true,
+  },
+  {
+    id: 'antigravity-gpt-oss-120b',
+    displayName: 'GPT-OSS 120B (Antigravity)',
+    efforts: [],
+    defaultEffort: 'default',
+    cliModels: { default: 'gpt-oss-120b-medium' },
     experimental: true,
   },
 ] as const
@@ -348,16 +384,17 @@ export function antigravityCliModelId(
 ): string | undefined {
   const entry = ANTIGRAVITY_ENGINE_MODELS.find((m) => m.id === modelId)
   if (!entry) return undefined
+  const cliModels = entry.cliModels as Readonly<Record<string, string>>
   const efforts = entry.efforts as readonly string[]
   const level = effort && efforts.includes(effort) ? effort : entry.defaultEffort
-  return `${entry.cliFamily}-${level}`
+  return cliModels[level]
 }
 
-/** Upstream Gemini model names a relay may forward for this canonical id. */
+/** Upstream model names a relay may forward for this canonical id. */
 export function antigravityAllowedUpstreamModels(modelId: string | undefined): readonly string[] {
   const entry = ANTIGRAVITY_ENGINE_MODELS.find((m) => m.id === modelId)
   if (!entry) return []
-  return [...entry.upstreamModels, ...ANTIGRAVITY_AUX_UPSTREAM_MODELS]
+  return [...Object.values(entry.cliModels as Readonly<Record<string, string>>), ...ANTIGRAVITY_AUX_UPSTREAM_MODELS]
 }
 
 /**
@@ -1607,17 +1644,20 @@ export function modelReasoningPolicy(modelId: string): ModelReasoningPolicy {
   }
 
   const provider = findRouteProviderForModel(modelId)
-  if (provider?.allowedOutputConfigEfforts) {
+  const efforts = provider
+    ? staticProviderOutputConfigEfforts(
+        provider,
+        provider.upstreamModelForRequest?.(modelId) ?? modelId,
+      )
+    : null
+  if (efforts !== null) {
     const platformSet = new Set<string>(PLATFORM_REASONING_EFFORTS)
     return {
-      supported: provider.allowedOutputConfigEfforts.filter(
+      supported: efforts.filter(
         (effort): effort is PlatformReasoningEffort => platformSet.has(effort),
       ),
       codexModelDefault: null,
     }
-  }
-  if (provider?.stripBodyFields.includes('output_config')) {
-    return { supported: [], codexModelDefault: null }
   }
   return { supported: PLATFORM_REASONING_EFFORTS, codexModelDefault: null }
 }

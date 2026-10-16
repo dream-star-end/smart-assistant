@@ -43,6 +43,8 @@ export interface LedgerRowView {
   delta: string;
   balance_after: string;
   reason: string;
+  /** 0304 OCV5-392: 'auto_dream' = memory consolidation; ledger column, else the linked usage row's. */
+  workload: string | null;
   channel: "web" | "wechat" | null;
   model: string | null;
   ref_type: string | null;
@@ -129,6 +131,7 @@ export async function listLedger(input: ListLedgerInput = {}): Promise<ListLedge
               cl.delta::text        AS delta,
               cl.balance_after::text AS balance_after,
               cl.reason,
+              cl.workload,
               cl.ref_type,
               cl.ref_id,
               cl.memo,
@@ -142,6 +145,7 @@ export async function listLedger(input: ListLedgerInput = {}): Promise<ListLedge
             cl.delta,
             cl.balance_after,
             cl.reason,
+            COALESCE(cl.workload, ur.workload) AS workload,
             CASE
               WHEN ur.id IS NULL THEN NULL
               WHEN ur.session_id ~ '^wsess-[0-9a-f]{16}$'

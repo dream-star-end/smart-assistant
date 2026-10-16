@@ -1259,6 +1259,43 @@ describe("applyOutboundMessage (§3/§7/§9/§11)", () => {
     expect(s.messages.filter((m) => m.role === "assistant")[0].text).toBe("Hello");
   });
 
+  test("INC-20261015-LIVE-FENCE-TRIM-REPLAY: a long answer replayed after a cursor reset is not appended twice", () => {
+    const s = sess();
+    const frames = Array.from({ length: 1025 }, (_, i) => msgFrame({
+      frameSeq: i + 1,
+      blocks: [{ kind: "text", text: "A", messageId: "srv-1" }],
+    }));
+    for (const frame of frames) applyOutboundMessage(s, frame);
+    const row = s.messages.find((m) => m.id === "srv-1")!;
+    expect(row.text).toHaveLength(1025);
+    resetFrameSeqCursor(s, { sessionKey: "agent:main:webchat:dm:s1" });
+    s._streamingAssistant = null;
+    for (const frame of frames) applyOutboundMessage(s, frame);
+    expect(row.text).toHaveLength(1025);
+
+    applyOutboundMessage(s, msgFrame({ frameSeq: 1026, blocks: [{ kind: "text", text: "B", messageId: "srv-1" }] }));
+    expect(row.text).toBe(`${"A".repeat(1025)}B`);
+    // The fence stays compact: older seqs fold into one range instead of 1026 keys.
+    expect(Object.keys(row._appliedFrameSeqs ?? {}).length).toBeLessThanOrEqual(1024);
+    expect(row._appliedFrameSeqRanges?.length).toBe(1);
+  });
+
+  test("the folded frame fence keeps gaps that belong to other rows", () => {
+    const s = sess();
+    // Odd seqs go to the answer; even seqs belong to other rows and must stay unapplied for it.
+    for (let seq = 1; seq <= 2101; seq += 2) {
+      applyOutboundMessage(s, msgFrame({ frameSeq: seq, blocks: [{ kind: "text", text: "a", messageId: "srv-1" }] }));
+    }
+    const row = s.messages.find((m) => m.id === "srv-1")!;
+    expect(row.text).toHaveLength(1051);
+    resetFrameSeqCursor(s, { sessionKey: "agent:main:webchat:dm:s1" });
+    s._streamingAssistant = null;
+    applyOutboundMessage(s, msgFrame({ frameSeq: 3, blocks: [{ kind: "text", text: "a", messageId: "srv-1" }] }));
+    expect(row.text).toHaveLength(1051);
+    applyOutboundMessage(s, msgFrame({ frameSeq: 4, blocks: [{ kind: "text", text: "b", messageId: "srv-1" }] }));
+    expect(row.text).toHaveLength(1052);
+  });
+
   test("incomplete tape row with same messageId still accepts later live frames and does not double replay", () => {
     const s = sess();
     s._activeClientMessageId = "m-recover";
@@ -11321,5 +11358,208 @@ describe("durable rejected feedback bridges placeholder to later server error", 
     sock.loadStored({ ...disk(live.id), messages: [{ ...error(), _errorCode: undefined, _recoverySkippedNotice: oldNotice }],
       _recoveryRejectedNotices: { "bad:source": { code: "engine_error", notice: oldNotice }, "u-empty": { code: "engine_error", notice: "" }, "u-array": [] } as any });
     expect(live._recoveryRejectedNotices).toBeUndefined(); sock.stop();
+  });
+});
+
+// ═══════════════ OCV5-427 reload mid-turn: one replay, quiet duplicates, no grace wait ═══════════════
+describe("OCV5-427 resume replay catch-up", () => {
+  const key = "agent:main:webchat:dm:s1";
+  const running = "m-user-running";
+  const storedInFlight = () => ({
+    id: "s1",
+    agentId: "main",
+    title: "s1",
+    messages: [
+      { id: running, role: "user" as const, text: "long task", ts: 1, status: "sent" as const },
+      { id: "srv-s1-main-t1-s0", role: "assistant" as const, text: "partial", ts: 2 },
+    ],
+    createdAt: 1,
+    lastAt: 2,
+    _lastFrameSeqByKey: { [key]: 1134 },
+    _lastFrameSeq: 1134,
+    _sendingInFlight: true,
+    _activeClientMessageId: running,
+  });
+  const hellos = (ws: FakeWS) => ws.sent.map((raw) => JSON.parse(raw)).filter((frame) => frame.type === "inbound.hello");
+  const replayStart = () => JSON.stringify({
+    type: "outbound.active_turn_replay_start",
+    sessionKey: key,
+    channel: "webchat",
+    peer: { id: "s1", kind: "dm" },
+    clientMessageId: running,
+  });
+
+  test("INC-20261015-RESUME-REPLAY-LAG: the page-load hello asks for the running turn once and the REST sync does not ask again", () => {
+    FakeWS.instances = [];
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: vi.fn() });
+    sock.loadStored(storedInFlight() as never);
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const first = hellos(ws);
+    expect(first).toHaveLength(1);
+    expect(first[0].peers[0]).toMatchObject({ peerId: "s1", lastFrameSeq: 1134, resumeActiveTurnCandidateMessageIds: [running] });
+
+    // REST history has only the running user row: before OCV5-427 this sent a second hello naming the same turn.
+    sock.applyServerMessages("s1", "main", [{ id: running, role: "user", text: "long task", ts: 1, status: "sent" } as ChatMessage], true, 1);
+    expect(hellos(ws)).toHaveLength(1);
+
+    // Later registration hellos on the same page keep the cheap cursor replay.
+    sock.sendRepoBind("s1", "main", 1);
+    const later = hellos(ws).at(-1);
+    expect(later.peers[0].resumeActiveTurnCandidateMessageIds).toBeUndefined();
+    sock.stop();
+    vi.unstubAllGlobals();
+  });
+
+  test("INC-20261015-RESUME-REPLAY-LAG: replayed deltas the row already holds do not schedule a render", () => {
+    FakeWS.instances = [];
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.ensureSession("s1", "main");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const s = sock.sessions.get("s1")!;
+    s._sendingInFlight = true;
+    s._activeClientMessageId = running;
+    const notify = vi.spyOn(sock as unknown as { scheduleNotify: () => void }, "scheduleNotify");
+    const delta = (seq: number, text: string) => JSON.stringify(msgFrame({
+      frameSeq: seq, clientMessageId: running, blocks: [{ kind: "text", text, messageId: "srv-s1-main-t1-s0" }],
+    }));
+    ws.onmessage?.({ data: delta(1, "A") });
+    ws.onmessage?.({ data: delta(2, "B") });
+    ws.onmessage?.({ data: replayStart() });
+    const beforeReplay = notify.mock.calls.length;
+    ws.onmessage?.({ data: delta(1, "A") });
+    ws.onmessage?.({ data: delta(2, "B") });
+    expect(notify).toHaveBeenCalledTimes(beforeReplay);
+    ws.onmessage?.({ data: delta(3, "C") });
+    expect(notify.mock.calls.length).toBeGreaterThan(beforeReplay);
+    expect(s.messages.find((m) => m.id === "srv-s1-main-t1-s0")?.text).toBe("ABC");
+    sock.stop();
+    vi.unstubAllGlobals();
+  });
+
+  test("OCV5-430: a session this socket already registered is not re-registered after its turn settles", () => {
+    FakeWS.instances = [];
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: vi.fn() });
+    sock.loadStored(storedInFlight() as never);
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    expect(hellos(ws)).toHaveLength(1);
+    ws.onmessage?.({ data: replayStart() });
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 7, isFinal: true, clientMessageId: running, blocks: [{ kind: "text", text: " done", messageId: "srv-s1-main-t1-s0" }],
+    })) });
+    expect(sock.sessions.get("s1")!._sendingInFlight).toBeFalsy();
+    sock.applyServerMessages("s1", "main", [
+      { id: running, role: "user", text: "long task", ts: 1, status: "sent" } as ChatMessage,
+      { id: "srv-s1-main-t1-s0", role: "assistant", text: "partial done", ts: 2 } as ChatMessage,
+    ], true, 2);
+    expect(hellos(ws)).toHaveLength(1);
+    sock.stop();
+    vi.unstubAllGlobals();
+  });
+
+  test("a session first loaded after the socket opened still gets its idle-cursor registration", () => {
+    FakeWS.instances = [];
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: vi.fn() });
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const before = hellos(ws).length;
+    sock.ensureSession("s2", "main");
+    sock.applyServerMessages("s2", "main", [
+      { id: "srv-s2-main-t1-s0", role: "assistant", text: "old answer", ts: 2 } as ChatMessage,
+    ], true, 1);
+    const after = hellos(ws);
+    expect(after.length).toBe(before + 1);
+    expect(after.at(-1).peers.some((peer: { peerId: string }) => peer.peerId === "s2")).toBe(true);
+    sock.stop();
+    vi.unstubAllGlobals();
+  });
+
+  test("sub-agent text and any unrecognised frame field always notify", () => {
+    FakeWS.instances = [];
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.ensureSession("s1", "main");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const s = sock.sessions.get("s1")!;
+    s._sendingInFlight = true;
+    s._activeClientMessageId = running;
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({ frameSeq: 1, clientMessageId: running, blocks: [{ kind: "text", text: "A", messageId: "srv-s1-main-t1-s0" }] })) });
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 2, clientMessageId: running,
+      blocks: [{ kind: "tool_use", blockId: "child-1", toolName: "Agent", partial: false, inputJson: { description: "child" } }],
+    })) });
+    const group = s.messages.find((m) => m.role === "agent-group");
+    expect(s._agentGroups?.get("child-1")).toBe(group?.id);
+    const notify = vi.spyOn(sock as unknown as { scheduleNotify: () => void }, "scheduleNotify");
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 3, clientMessageId: running, blocks: [{ kind: "text", text: "child output", parentToolUseId: "child-1" }],
+    })) });
+    expect(group?.childBlocks?.some((b) => b.kind === "text" && b.text === "child output")).toBe(true);
+    expect(notify).toHaveBeenCalled();
+    notify.mockClear();
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 4, clientMessageId: running, cronJob: { label: "x" }, blocks: [{ kind: "text", text: "B", messageId: "srv-s1-main-t1-s0" }],
+    })) });
+    expect(notify).toHaveBeenCalled();
+    sock.stop();
+    vi.unstubAllGlobals();
+  });
+
+  test("INC-20261015-RESUME-REPLAY-LAG: a tape-commit completion during a resume replay settles at once and syncs history", () => {
+    const s = sess();
+    s._sendingInFlight = true;
+    s._activeClientMessageId = running;
+    s._resumeReplayClientMessageId = running;
+    const deferTapeCommitFinal = vi.fn(() => true);
+    const forceSync = vi.fn();
+    const onFinal = vi.fn();
+    const completion = msgFrame({
+      isFinal: true,
+      clientMessageId: running,
+      meta: { reconcile: "turn_completed", reconcileSource: "tape_commit" },
+    });
+    applyOutboundMessage(s, completion, { deferTapeCommitFinal, forceSync, onFinal });
+    expect(deferTapeCommitFinal).not.toHaveBeenCalled();
+    expect(s._sendingInFlight).toBe(false);
+    expect(forceSync).toHaveBeenCalledWith("s1", { clientMessageId: running });
+
+    // Without a resume replay the OCV5-424 grace for the live tail stays.
+    const live = sess();
+    live._sendingInFlight = true;
+    live._activeClientMessageId = running;
+    applyOutboundMessage(live, completion, { deferTapeCommitFinal, forceSync: vi.fn(), onFinal: vi.fn() });
+    expect(deferTapeCommitFinal).toHaveBeenCalledTimes(1);
+    expect(live._sendingInFlight).toBe(true);
+  });
+
+  test("the resume replay marker is set by replay_start and cleared by the turn's final", () => {
+    FakeWS.instances = [];
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket({ syncSession: vi.fn() });
+    sock.ensureSession("s1", "main");
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    ws.onmessage?.({ data: replayStart() });
+    const s = sock.sessions.get("s1")!;
+    expect(s._resumeReplayClientMessageId).toBe(running);
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({
+      frameSeq: 5, isFinal: true, clientMessageId: running, blocks: [{ kind: "text", text: "done", messageId: "srv-s1-main-t1-s0" }],
+    })) });
+    expect(s._resumeReplayClientMessageId).toBeUndefined();
+    sock.stop();
+    vi.unstubAllGlobals();
   });
 });

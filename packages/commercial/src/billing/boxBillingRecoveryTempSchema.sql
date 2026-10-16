@@ -57,13 +57,15 @@ CREATE TEMP TABLE usage_records (
     board_project_source text,
     board_project_captured_at timestamp with time zone,
     api_key_id bigint,
+    workload text,
     CONSTRAINT usage_records_authority_kind_check CHECK (((authority_kind IS NULL) OR (authority_kind = ANY (ARRAY['bridge_signed'::text, 'local_catalog'::text])))),
     CONSTRAINT usage_records_mode_check CHECK ((mode = ANY (ARRAY['chat'::text, 'agent'::text, 'delegate'::text]))),
     CONSTRAINT usage_records_parent_turn_key_check CHECK (((parent_turn_key IS NULL) OR (parent_turn_key ~ '^[0-9a-f]{64}$'::text))),
     CONSTRAINT usage_records_status_check CHECK ((status = ANY (ARRAY['success'::text, 'billing_failed'::text, 'error'::text]))),
     CONSTRAINT usage_records_turn_key_check CHECK (((turn_key IS NULL) OR (turn_key ~ '^[0-9a-f]{64}$'::text))),
     CONSTRAINT usage_records_verification_pair_check CHECK ((((verification_run_id IS NULL) AND (would_have_cost_credits IS NULL)) OR ((verification_run_id IS NOT NULL) AND (would_have_cost_credits IS NOT NULL) AND (cost_credits = 0)))),
-    CONSTRAINT usage_records_would_have_cost_credits_check CHECK ((would_have_cost_credits >= 0))
+    CONSTRAINT usage_records_would_have_cost_credits_check CHECK ((would_have_cost_credits >= 0)),
+    CONSTRAINT usage_records_workload_check CHECK ((workload = 'auto_dream'::text))
 );
 CREATE TEMP TABLE pending_usage_patches (
     request_id text NOT NULL,
@@ -233,9 +235,11 @@ CREATE TEMP TABLE credit_ledger (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     bucket text DEFAULT 'wallet'::text NOT NULL,
     org_id bigint,
+    workload text,
     CONSTRAINT ck_cl_org_wallet_has_org CHECK (((bucket <> ALL (ARRAY['org_wallet'::text, 'org_period'::text])) OR (org_id IS NOT NULL))),
     CONSTRAINT credit_ledger_bucket_check CHECK ((bucket = ANY (ARRAY['wallet'::text, 'period'::text, 'org_wallet'::text, 'org_period'::text]))),
-    CONSTRAINT credit_ledger_reason_check CHECK ((reason = ANY (ARRAY['topup'::text, 'chat'::text, 'agent_chat'::text, 'agent_subscription'::text, 'refund'::text, 'admin_adjust'::text, 'promotion'::text, 'minimax_media'::text, 'image_generation'::text, 'subscription'::text, 'subscription_expire'::text, 'pack'::text])))
+    CONSTRAINT credit_ledger_reason_check CHECK ((reason = ANY (ARRAY['topup'::text, 'chat'::text, 'agent_chat'::text, 'agent_subscription'::text, 'refund'::text, 'admin_adjust'::text, 'promotion'::text, 'minimax_media'::text, 'image_generation'::text, 'subscription'::text, 'subscription_expire'::text, 'pack'::text]))),
+    CONSTRAINT credit_ledger_workload_check CHECK ((workload = 'auto_dream'::text))
 );
 
 -- The recovery path relies on these durable uniqueness fences. Reproduce

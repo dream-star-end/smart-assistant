@@ -413,8 +413,8 @@ describe("incident severity CLI admission", () => {
           case "pending ceiling preserved":
             item.regressions.pop();
             item.proofPending = { reason: "isolated valid unit-only record", since: "2026-09-09" };
-            f.manifest.incidents = Array.from({ length: 18 }, (_, i) => ({ ...item, id: `INC-20260909-P2-PENDING-${String(i).padStart(2, "0")}` }));
-            reason = /proofPending 事故 18 条 > 基线 17/; break;
+            f.manifest.incidents = Array.from({ length: 20 }, (_, i) => ({ ...item, id: `INC-20260909-P2-PENDING-${String(i).padStart(2, "0")}` }));
+            reason = /proofPending 事故 20 条 > 基线 19/; break;
           default: throw new Error(`unexpected catalog member: ${name}`);
         }
         expected = { exit: "nonzero", reason: reason.source };
@@ -483,6 +483,12 @@ describe("incident selfhost edition", () => {
       rmSync(f.dir, { recursive: true, force: true });
     }
   });
+  // OCV5-432: the incident's proof is a script only the selfhost release runs.
+  const selfhostProof = (f: SeverityFixture, called: boolean) => {
+    f.write("scripts/selfhost-proof-fixture.mjs", "// SELFHOST_PROOF_ASSERTION\n");
+    f.write("scripts/deploy-v5-selfhost.sh", called ? 'node "$SCRIPT_DIR/selfhost-proof-fixture.mjs"\n' : "# no proof call\n");
+    f.manifest.incidents[0].regressions[1] = { layer: "deploy-gate", path: "scripts/selfhost-proof-fixture.mjs", assertion: "SELFHOST_PROOF_ASSERTION" };
+  };
   const cases: Array<{ name: string; arrange: (f: SeverityFixture) => string[]; pass: boolean; reason: RegExp }> = [
     {
       name: "a listed unit-only incident passes",
@@ -558,6 +564,35 @@ describe("incident selfhost edition", () => {
       },
       pass: false,
       reason: /缺原因/,
+    },
+    {
+      name: "OCV5-432: a proof the selfhost release script calls is wired in the selfhost edition",
+      arrange: (f) => {
+        selfhostProof(f, true);
+        debt(f, {});
+        return ["--edition=selfhost"];
+      },
+      pass: true,
+      reason: /\[incident-regressions\] PASS:/,
+    },
+    {
+      name: "OCV5-432: a deploy-gate script neither release calls is refused in the selfhost edition",
+      arrange: (f) => {
+        selfhostProof(f, false);
+        debt(f, {});
+        return ["--edition=selfhost"];
+      },
+      pass: false,
+      reason: /deploy-v5\.sh 与 deploy-v5-selfhost\.sh 都未调用 scripts\/selfhost-proof-fixture\.mjs/,
+    },
+    {
+      name: "OCV5-432: the commercial edition does not accept the selfhost release script",
+      arrange: (f) => {
+        selfhostProof(f, true);
+        return [];
+      },
+      pass: false,
+      reason: /deploy-v5\.sh 未调用 scripts\/selfhost-proof-fixture\.mjs/,
     },
     {
       name: "an unknown edition is refused",

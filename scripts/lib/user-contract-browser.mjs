@@ -7,13 +7,28 @@ export async function coldUiLogin(page, options, password) {
   // A fresh context has no cookies, IndexedDB or service workers. Clear web storage
   // once on the landing page, never add an init script that would erase UI login.
   const pageErrors = [];
-  let failedScripts = 0;
+  // OCV5-437:只记计数查不出是哪一块、为什么。按路径(不带 query,防带出令牌)记网络错误/HTTP 状态;
+  // Chromium 对 404 脚本既给 response 又给 requestfailed(ERR_ABORTED),同一路径合并成一条。
+  const scriptReasons = new Map();
+  const noteScript = (url, reason) => {
+    let path = url;
+    try { path = new URL(url).pathname; } catch {}
+    const reasons = scriptReasons.get(path) ?? [];
+    if (!reasons.includes(reason)) reasons.push(reason);
+    scriptReasons.set(path, reasons);
+  };
   const onPageError = (error) => { if (pageErrors.length < 3) pageErrors.push(error.name); };
   const onRequestFailed = (request) => {
-    if (request.resourceType() === "script") failedScripts++;
+    if (request.resourceType() === "script") noteScript(request.url(), request.failure()?.errorText ?? "failed");
+  };
+  const onResponse = (response) => {
+    if (response.request().resourceType() === "script" && response.status() >= 400) {
+      noteScript(response.url(), `HTTP ${response.status()}`);
+    }
   };
   page.on("pageerror", onPageError);
   page.on("requestfailed", onRequestFailed);
+  page.on("response", onResponse);
   const landing = await page.goto(options.base, { waitUntil: "domcontentloaded" });
   if (!landing?.ok()) throw new Error(`Cold landing HTTP ${landing?.status() ?? "no response"}`);
   await page.evaluate(() => { localStorage.clear(); sessionStorage.clear(); });
@@ -23,16 +38,19 @@ export async function coldUiLogin(page, options, password) {
     // the UI bundle. Keep the real login requirement; only extend that bounded
     // render wait, never substitute an API login or reuse an authenticated page.
     await page.getByRole("button", { name: "登录", exact: true }).first()
-      .waitFor({ state: "visible", timeout: 60_000 });
+      .waitFor({ state: "visible", timeout: options.renderTimeoutMs ?? 60_000 });
   } catch {
     const state = await page.evaluate(() => ({ readyState: document.readyState,
-      rootChildren: document.getElementById("root")?.childElementCount ?? -1 }))
-      .catch(() => ({ readyState: "unavailable", rootChildren: -1 }));
+      rootChildren: document.getElementById("root")?.childElementCount ?? -1,
+      rootText: (document.getElementById("root")?.innerText ?? "").replace(/\s+/g, " ").trim().slice(0, 80) }))
+      .catch(() => ({ readyState: "unavailable", rootChildren: -1, rootText: "" }));
+    const scriptFailures = [...scriptReasons].slice(0, 3).map(([path, reasons]) => `${path} ${reasons.join(", ")}`);
     throw new Error(`Cold login not rendered: ${JSON.stringify({
-      ...state, pageErrors, failedScripts })}`);
+      ...state, pageErrors, failedScripts: scriptReasons.size, scriptFailures })}`);
   } finally {
     page.off("pageerror", onPageError);
     page.off("requestfailed", onRequestFailed);
+    page.off("response", onResponse);
   }
   await page.getByRole("button", { name: "登录", exact: true }).first().click();
   const form = page.locator('form').filter({ has: page.locator('input[type="password"]') });
@@ -61,7 +79,7 @@ export async function newSession(page) {
 // browser send is observed but never forwarded to the server (zero inference).
 export async function installTurnProbe(context, base, cost) {
   const sent = [], received = [], writes = [], catalogs = [];
-  const probe = { sent, received, writes, catalogs, liveTexts: new Set() };
+  const probe = { sent, received, writes, catalogs, liveTexts: new Set(), connects: 0 };
   context.on("request", (r) => {
     const u = new URL(r.url());
     if (u.origin === base && /^\/api\/sessions\/[^/]+$/.test(u.pathname) && ["PUT", "PATCH"].includes(r.method())) {
@@ -77,6 +95,7 @@ export async function installTurnProbe(context, base, cost) {
   const expected = new URL(base);
   await context.routeWebSocket((url) => url.host === expected.host && url.pathname.startsWith("/ws"), (ws) => {
     const server = ws.connectToServer();
+    probe.connects += 1;
     ws.onMessage((raw) => {
       const f = parseFrame(raw);
       if (f?.type === "inbound.message") {
@@ -90,11 +109,56 @@ export async function installTurnProbe(context, base, cost) {
   return probe;
 }
 
+// OCV5-431: the 发送 click for C2 and every C3 turn. A trusted mouse click at the button's
+// centre after the checks locator.click makes (visible, enabled, stable, hit target), but
+// without its post-click navigation barrier: on 2026-10-15 (#748 first train) that barrier
+// waited 20s ("click action done - waiting for scheduled navigations to finish") while the
+// app had already queued the message. The verdict stays with the outbound frame / turn
+// evidence the caller waits for. Navigation requests issued during the click are reported
+// so the next occurrence names its trigger.
+export async function clickSend(page, log = console.log, timeout = 20_000) {
+  const button = page.getByRole("button", { name: "发送", exact: true });
+  await button.waitFor({ state: "visible", timeout });
+  const deadline = Date.now() + timeout;
+  let box = null;
+  for (;;) {
+    const enabled = await button.isEnabled();
+    const next = enabled ? await button.boundingBox() : null;
+    if (next && box && next.x === box.x && next.y === box.y && next.width === box.width && next.height === box.height) break;
+    box = next;
+    if (Date.now() >= deadline) throw new Error(enabled ? "发送 button never became stable" : "发送 button stayed disabled");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  const x = box.x + box.width / 2;
+  const y = box.y + box.height / 2;
+  const cover = await page.evaluate(({ x, y }) => {
+    const el = document.elementFromPoint(x, y);
+    if (el?.closest('button[aria-label="发送"]')) return null;
+    if (!el) return "nothing";
+    const role = el.getAttribute("role");
+    const label = el.getAttribute("aria-label");
+    return `${el.tagName.toLowerCase()}${el.id ? `#${el.id}` : ""}${role ? `[role=${role}]` : ""}${label ? `[aria-label=${label}]` : ""}`;
+  }, { x, y });
+  if (cover) throw new Error(`发送 button is covered by ${cover}`);
+  const navigations = [];
+  const onRequest = (request) => {
+    if (!request.isNavigationRequest()) return;
+    navigations.push(`${request.frame() === page.mainFrame() ? "main" : "sub"} ${new URL(request.url()).pathname}`);
+  };
+  page.on("request", onRequest);
+  try {
+    await page.mouse.click(x, y);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  } finally {
+    page.off("request", onRequest);
+  }
+  if (navigations.length) log(`# warn send_click_navigation_request ${JSON.stringify(navigations.slice(0, 3))}`);
+}
 export async function sendContractTurn(page, probe, { model, engine, catalog, cost, requireHttpModel = false, text = `R2-${crypto.randomUUID()} 请只回答数字2，不使用工具。` }) {
   if (turnPolicy(cost).forward) probe.liveTexts.add(text);
   const rowsBefore = await page.getByTestId("assistant-row").count();
   await page.locator("textarea").first().fill(text);
-  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await clickSend(page);
   // Bridge the observer into an event-driven page wait; timers here bound the
   // observer only, not retries of the test or of a message.
   const sent = await waitUntil(() => probe.sent.find((f) => f.content?.text === text), 20_000, "No outbound chat frame");
@@ -215,6 +279,10 @@ export async function waitTurnUiSettled(page, rowsBefore, { model, recheck, time
   const settledMs = Date.now() - started;
   log(`# warn slow_ui_settle model=${model} settled_ms=${settledMs} strict_ms=${strictMs} state_at_strict=${JSON.stringify(atStrict)}`);
   return { slow: true, settledMs };
+}
+/** OCV5-429: the bridge confirmed the container relay (ensureRunning done). Prewarm only. */
+export async function waitRelayReady(probe, timeout) {
+  return waitUntil(() => probe.received.find((f) => f.type === "sys.relay_ready"), timeout, "Canary relay not ready");
 }
 export async function waitUntil(check, timeout, message) {
   const deadline = Date.now() + timeout;

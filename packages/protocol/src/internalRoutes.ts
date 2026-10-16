@@ -44,9 +44,9 @@ export const EGRESS_STATS_PATH = '/internal/v5/egress-stats'
 export const GROK_RELAY_PREFIX = '/internal/v5/grok-relay'
 export const ZCODE_RELAY_PREFIX = '/internal/v5/zcode-relay'
 /**
- * OCV5-415 Antigravity CLI 的 Gemini relay(容器 loopback route,形态同 zcode)。
- * P1 只有 gateway adapter 校验这条前缀;relay 服务端尚未实现,也没有任何挂载
- * 或 egress 截胡,所以 forwarder 按 v5 默认 403、adapter 无 route 不启动。
+ * OCV5-415 Antigravity CLI 的 Cloud Code relay(容器 loopback route,形态同 zcode)。
+ * CLI 以 `CLOUD_CODE_URL=<route>` 把全部 `/v1internal:*` 调用打到这里;gateway
+ * loopback 转发到 master/egress,由 internalAntigravityRelay 换上账号的全权限令牌。
  */
 export const ANTIGRAVITY_RELAY_PREFIX = '/internal/v5/antigravity-relay'
 export const PROMPT_QUEUE_MUTATION_PATH = '/internal/v5/prompt-queue/mutation'
@@ -202,13 +202,16 @@ export const INTERNAL_ROUTES = [
     egressLocalIntercept: true,
     sources: ['gateway/src/v5ZcodeRelay.ts', 'commercial/src/billing/zcodeRouteContext.ts'],
   },
-  // OCV5-415 P1:只有消费方(adapter 校验 route 形态),无服务端挂载、无
-  // egressLocalIntercept —— fail-closed 现状。P2 实现 relay 时补标记与服务端 source。
   {
     path: ANTIGRAVITY_RELAY_PREFIX,
     match: 'prefix',
     plane: 'v5',
-    sources: ['gateway/src/engine/antigravityAdapter.ts'],
+    egressLocalIntercept: true,
+    sources: [
+      'gateway/src/engine/antigravityAdapter.ts',
+      'gateway/src/v5AntigravityRelay.ts',
+      'commercial/src/http/internalAntigravityRelay.ts',
+    ],
   },
   // v5 prompt-queue:master dispatchInternal 挂载(flag 门控);**不是** forwarder
   // 放行例外 —— split 拓扑下容器经 forwarder 打到这些路径会 403(现状事实)。

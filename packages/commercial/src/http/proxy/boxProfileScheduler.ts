@@ -46,7 +46,7 @@ export interface BoxProfilePolicy {
 export const BOX_PROFILE_POLICY: BoxProfilePolicy = {
   utilizationCeiling: 0.92, loginSpillLoad: 10, boxSpillLoad: 14, defaultBonus: 1.5 };
 
-export type BoxProfilePickReason = "affinity" | "spill_unhealthy" | "spill_load" | "last_resort" | "quota_benched";
+export type BoxProfilePickReason = "affinity" | "spill_unhealthy" | "spill_load" | "last_resort" | "quota_benched" | "user";
 export interface BoxProfilePick { candidate: BoxProfileCandidate; reason: BoxProfilePickReason }
 
 function unitHash(parts: string[]): number {

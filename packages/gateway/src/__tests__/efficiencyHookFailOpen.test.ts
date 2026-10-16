@@ -222,6 +222,9 @@ describe('precompiled inner is preferred over tsx', () => {
         ...process.env,
         OPENCLAUDE_HOME: home,
         OPENCLAUDE_EFFICIENCY_HOOK_TIMEOUT_MS: '4000',
+        // tsx keeps its compile cache under os.tmpdir(); a long-lived host cache
+        // (63k entries on v5-dev) alone doubled the cold start past the 4s budget.
+        TMPDIR: home,
       },
     })
     assertAllowed('cursor', result.stdout ?? '', result.status)

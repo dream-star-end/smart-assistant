@@ -18,7 +18,7 @@ import {
   isErrorCardSupersededByTurnStatus,
 } from "./render";
 import { detectServerTerminalTurns } from "../persist";
-import { ChatSocket, messageAttemptIdempotencyKey, type ChatSocketDeps } from "./socket";
+import { ChatSocket, TAPE_COMMIT_FINAL_GRACE_MS, messageAttemptIdempotencyKey, type ChatSocketDeps } from "./socket";
 import type { OutboundMessageWire } from "./frames";
 
 // ─── helpers（照 chat.test.ts）────────────────────────────────────────
@@ -972,6 +972,133 @@ describe("retryMessage clientMessageId 分流 (RFC §5)", () => {
     expect(inbound.clientMessageId).not.toBe(oldId);
     expect(inbound.idempotencyKey).toBe(messageAttemptIdempotencyKey(userMsg.id, 0));
     expect(userMsg._sendAttempt).toBe(0);
+    sock.stop();
+  });
+});
+
+// ═══════════════ OCV5-424:tape 提交合成 final 抢在 live 尾巴前 ═══════════════
+// 线上复现(grok 带工具的轮次 4/8):master 在 lossless tape 提交后广播 reconcile:"turn_completed",
+// 比同一轮仍在 WS 上的 live 尾巴早 0.4–1s 到达;旧实现立即收口并把 stale 截止定在该帧 ts,随后
+// 尾巴帧(ts 更早)被丢,本轮显示「已完成」但正文停在半句。
+describe("tape_commit reconcile final 领先 live 尾巴 (OCV5-424)", () => {
+  afterEach(() => {
+    FakeWS.instances = [];
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  function streamingTurn() {
+    const s = sess();
+    const u = addMessage(s, "user", "今天第一张采购单的编号是多少？", { status: "sent" });
+    s._replyingToMsgId = u.id;
+    s._sendingInFlight = true;
+    s._activeClientMessageId = u.id;
+    return { s, cmid: u.id };
+  }
+  const answer = (s: ReturnType<typeof sess>) =>
+    s.messages.filter((m) => m.role === "assistant").map((m) => m.text).join("");
+
+  test("本轮仍在流式 → 不收口;更早 ts 的尾巴照常追加,真 final 收口", () => {
+    const { s, cmid } = streamingTurn();
+    const t0 = 1_800_000_000_000;
+    const deferTapeCommitFinal = vi.fn(() => true);
+    const forceSync = vi.fn();
+    const effects = { deferTapeCommitFinal, forceSync };
+    applyOutboundMessage(s, msgFrame({ clientMessageId: cmid, frameSeq: 1, ts: t0, blocks: [{ kind: "text", blockId: "b1", text: "编号是 " }] }), effects);
+    applyOutboundMessage(s, msgFrame({
+      clientMessageId: cmid, ts: t0 + 300, isFinal: true, blocks: [], agentId: "main",
+      meta: { reconcile: "turn_completed", reconcileSource: "tape_commit", clientMessageId: cmid },
+    }), effects);
+    expect(deferTapeCommitFinal).toHaveBeenCalledTimes(1);
+    expect(s._sendingInFlight).toBe(true);
+    expect(s._activeClientMessageId).toBe(cmid);
+    expect(forceSync).not.toHaveBeenCalled();
+    // 尾巴帧在 gateway 侧更早生成(ts 小于合成 final),只是更晚送达。
+    applyOutboundMessage(s, msgFrame({ clientMessageId: cmid, frameSeq: 2, ts: t0 + 100, blocks: [{ kind: "text", blockId: "b1", text: "PO-ABCD1234。" }] }), effects);
+    expect(answer(s)).toBe("编号是 PO-ABCD1234。");
+    applyOutboundMessage(s, msgFrame({ clientMessageId: cmid, frameSeq: 3, ts: t0 + 400, isFinal: true, blocks: [] }), effects);
+    expect(s._sendingInFlight).toBe(false);
+    expect(answer(s)).toBe("编号是 PO-ABCD1234。");
+  });
+
+  test("hello 对账的 turn_completed(无 tape_commit 来源)仍立即收口,不询问 socket", () => {
+    const { s, cmid } = streamingTurn();
+    const deferTapeCommitFinal = vi.fn(() => true);
+    const forceSync = vi.fn();
+    applyOutboundMessage(s, msgFrame({
+      clientMessageId: cmid, ts: Date.now(), isFinal: true, blocks: [],
+      meta: { reconcile: "turn_completed", clientMessageId: cmid },
+    }), { deferTapeCommitFinal, forceSync });
+    expect(deferTapeCommitFinal).not.toHaveBeenCalled();
+    expect(s._sendingInFlight).toBe(false);
+    expect(forceSync).toHaveBeenCalledWith("s1", { clientMessageId: cmid });
+  });
+
+  test("真 final 已先到(不在发送态)→ tape_commit 帧照旧对账,不延后", () => {
+    const { s, cmid } = streamingTurn();
+    const deferTapeCommitFinal = vi.fn(() => true);
+    const forceSync = vi.fn();
+    applyOutboundMessage(s, msgFrame({ clientMessageId: cmid, frameSeq: 1, ts: 1_800_000_000_000, isFinal: true, blocks: [] }), { forceSync });
+    expect(s._sendingInFlight).toBe(false);
+    applyOutboundMessage(s, msgFrame({
+      clientMessageId: cmid, ts: 1_800_000_000_500, isFinal: true, blocks: [],
+      meta: { reconcile: "turn_completed", reconcileSource: "tape_commit", clientMessageId: cmid },
+    }), { deferTapeCommitFinal, forceSync });
+    expect(deferTapeCommitFinal).not.toHaveBeenCalled();
+    expect(forceSync).toHaveBeenLastCalledWith("s1", { clientMessageId: cmid });
+  });
+
+  test("socket 未接管(无 effect)→ 保持旧行为立即收口", () => {
+    const { s, cmid } = streamingTurn();
+    const forceSync = vi.fn();
+    applyOutboundMessage(s, msgFrame({
+      clientMessageId: cmid, ts: Date.now(), isFinal: true, blocks: [],
+      meta: { reconcile: "turn_completed", reconcileSource: "tape_commit", clientMessageId: cmid },
+    }), { forceSync });
+    expect(s._sendingInFlight).toBe(false);
+    expect(forceSync).toHaveBeenCalledWith("s1", { clientMessageId: cmid });
+  });
+
+  test("ChatSocket:宽限期内真 final 收口;真 final 丢失则期满按 reconcile 收口", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
+    const sock = makeSocket();
+    sock.setGateReady(true);
+    const ws = FakeWS.instances.at(-1)!;
+    ws.open();
+    const send = () => {
+      sock.sendMessage({ sessId: "s1", agentId: "main", text: "问题" });
+      const sess1 = sock.sessions.get("s1")!;
+      return { sess1, cmid: sess1._activeClientMessageId! };
+    };
+    const tapeFinal = (cmid: string, ts: number) => JSON.stringify(msgFrame({
+      clientMessageId: cmid, ts, isFinal: true, blocks: [], agentId: "main",
+      meta: { reconcile: "turn_completed", reconcileSource: "tape_commit", clientMessageId: cmid },
+    }));
+
+    // ① 真 final 在宽限期内到达:合成帧不收口,真 final 收口,期满计时器无副作用。
+    const a = send();
+    const t0 = Date.now();
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({ clientMessageId: a.cmid, frameSeq: 1, ts: t0, blocks: [{ kind: "text", blockId: "b1", text: "编号是 " }] })) });
+    ws.onmessage?.({ data: tapeFinal(a.cmid, t0 + 300) });
+    expect(a.sess1._sendingInFlight).toBe(true);
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({ clientMessageId: a.cmid, frameSeq: 2, ts: t0 + 100, blocks: [{ kind: "text", blockId: "b1", text: "PO-ABCD1234。" }] })) });
+    ws.onmessage?.({ data: JSON.stringify(msgFrame({ clientMessageId: a.cmid, frameSeq: 3, ts: t0 + 400, isFinal: true, blocks: [] })) });
+    expect(a.sess1._sendingInFlight).toBe(false);
+    expect(a.sess1.messages.filter((m) => m.role === "assistant").map((m) => m.text).join("")).toBe("编号是 PO-ABCD1234。");
+    await vi.advanceTimersByTimeAsync(TAPE_COMMIT_FINAL_GRACE_MS + 10);
+    expect(a.sess1._sendingInFlight).toBe(false);
+
+    // ② 真 final 丢失:期满按 reconcile 收口(兜底语义不变)。
+    const b = send();
+    expect(b.cmid).not.toBe(a.cmid);
+    ws.onmessage?.({ data: tapeFinal(b.cmid, Date.now() + 1000) });
+    expect(b.sess1._sendingInFlight).toBe(true);
+    await vi.advanceTimersByTimeAsync(TAPE_COMMIT_FINAL_GRACE_MS - 100);
+    expect(b.sess1._sendingInFlight).toBe(true);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(b.sess1._sendingInFlight).toBe(false);
+    expect(b.sess1._activeClientMessageId).toBeUndefined();
     sock.stop();
   });
 });

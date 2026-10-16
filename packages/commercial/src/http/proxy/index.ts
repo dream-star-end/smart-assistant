@@ -23,6 +23,7 @@
  * 不下沉到 shared.ts(plan v3 Codex 反馈,见 §4 修订 H)。
  */
 
+import { apiKeyPoolConfiguredServices, apiKeyPoolHasMembers, selectApiKey } from "../../account-pool/apiKeyPool.js";
 import { rootLogger } from "../../logging/logger.js";
 import { ensureRequestId, setSecurityHeaders } from "../util.js";
 import {
@@ -70,6 +71,7 @@ import {
 } from "./modelAuthorityGate.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
 import { findRouteProviderForModel, isClassifierSideQuery, resolveCursorPublicModel } from "@openclaude/protocol";
+import { applyFastServiceTierPricing } from "./fastServiceTier.js";
 import {
   getDegradedProviders,
   getHealthDegradedProviders,
@@ -105,6 +107,7 @@ import {
   estimateInputTokens,
   estimateContextInputTokens,
   estimateMaxCostBothSides,
+  applyWorkloadMode,
   extractUsageAttribution,
   stripUsageAttributionKeys,
   readBoundedJsonMeasured,
@@ -719,15 +722,18 @@ export function makeAnthropicProxyHandler(
       // enforce 路径不再看 `pricing.enabled`:可用性的唯一权威是 catalog.state(0143 起
       // enabled 只是派生镜像),且 gate 的 isRoutable 已经断言"有价格行"。snapshot 投影为空
       // 代表内部不变量破坏；legacy cache miss 则仍按 unknown_model 拒(fail-closed)。
-      const pricing = gate
+      const basePricing = gate
         ? gate.snapshot.billingPricingFor(body.model)
         : deps.pricing.get(body.model);
-      if (!pricing || (!gate && !pricing.enabled)) {
+      if (!basePricing || (!gate && !basePricing.enabled)) {
         userLog.warn("proxy_unknown_model", { model: body.model, catalogGated: gate !== null });
         incrAnthropicProxyReject("unknown_model");
         sendJsonError(res, 400, "UNKNOWN_MODEL", `model '${body.model}' not enabled`, requestId);
         return;
       }
+      // OCV5-434 GPT Fast (OpenCode Go /responses Lunas): ×2 composed into this request's
+      // multiplier; our "priority" marker never reaches any other upstream. See fastServiceTier.ts.
+      const { pricing } = applyFastServiceTierPricing(body as { model: string; service_tier?: unknown }, basePricing);
 
       // 5a') provider 健康度拦截(P3.2)。**默认影子模式放行**:仅 OC_PROVIDER_HEALTH_ENFORCE=1
       // 才对 degraded provider 的模型 503(误判降级=拦好模型是最坏 UX,故拦截显式开关控)。
@@ -1058,6 +1064,9 @@ export function makeAnthropicProxyHandler(
       }
       const cfgErr = validateUpstreamConfig(route, {
         staticProviderKeys: deps.staticProviderKeys,
+        apiKeyPoolConfigured: deps.apiKeyPoolEnabled
+          ? (service) => apiKeyPoolConfiguredServices().has(service)
+          : undefined,
         boxConfigured: process.env.OC_BOX_MODEL_API === "1" && deps.boxModel !== undefined,
       });
       if (cfgErr) {
@@ -1367,6 +1376,8 @@ export function makeAnthropicProxyHandler(
           scheduler: deps.scheduler,
           refreshDeps: deps.refreshDeps,
           staticProviderKeys: deps.staticProviderKeys,
+          selectApiKey: deps.apiKeyPoolEnabled ? (service, sticky, userId) => selectApiKey(service, sticky, undefined, { userId }) : undefined,
+          apiKeyPoolHasMembers: deps.apiKeyPoolEnabled ? apiKeyPoolHasMembers : undefined,
           upstreamEndpoint: deps.upstreamEndpoint,
           // Phase 6 account_uuid 锚定 flag(plan §3.0)— v1.0.207 起从 system_settings
           // 表读取的 getter,handler 透传给 pickUpstream;入口 await 一次冻结到
@@ -1513,7 +1524,8 @@ export function makeAnthropicProxyHandler(
       // rolling-lease renewal can prove that this signed authorityTurnId was
       // actually used by this immutable turnKey. Prompt/response content is
       // never written to the journal.
-      const attribution = extractUsageAttribution(body.metadata);
+      const ccWorkload = extractCcWorkload(body.system);
+      const attribution = applyWorkloadMode(extractUsageAttribution(body.metadata), ccWorkload);
       let sessionId = attribution.sessionId;
 
       // 0170 durable-turn dispatch 身份(RFC-v5-durable-turn-dispatch §3 CCB 段 / §7 项 10)。
@@ -1660,7 +1672,7 @@ export function makeAnthropicProxyHandler(
             gate,
             dispatchIdentity,
             turnKey: attribution.turnKey ?? undefined,
-            workload: extractCcWorkload(body.system),
+            workload: ccWorkload,
           }), ...(route.kind === "box" ? {
             boxInvocationRecovery: "v1",
             billingPricing: serializeBillingPricing(pricing),

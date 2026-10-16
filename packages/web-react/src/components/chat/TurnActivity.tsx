@@ -18,6 +18,7 @@ import {
   type TurnStatusState,
 } from "../../lib/chat/model";
 import { computeTypingLabel, MODEL_THINKING_WORKING_DETAIL } from "../../lib/chat/pure";
+import type { DispatchStatus } from "../../lib/chat/socket";
 import { cn } from "../../lib/utils";
 
 /**
@@ -26,6 +27,8 @@ import { cn } from "../../lib/utils";
  * tick 推进，无需把整个会话对象拖进渲染依赖。
  */
 export type TurnActivityInfo = {
+  /** OCV5-428: the turn is not admitted by the server yet (ChatSocket.getDispatchStatus). */
+  dispatch?: DispatchStatus | null;
   /** 本轮开始时刻（_turnStartedAt）。null 时退化为无秒数的「思考中」。 */
   startedAt: number | null;
   /** 最近一帧到达时刻（_lastFrameAt），用于静默时长升级文案。 */
@@ -50,6 +53,27 @@ export type TurnActivityInfo = {
   /** 团队模式：队长当前正在执行的 plan step 文本（非团队模式恒 null，由 App 门控）。 */
   leaderStep?: string | null;
 };
+
+/**
+ * OCV5-428: activity text before the server admitted the turn. Never 「思考中」:
+ * the message may still be in the local queue while the service (re)starts.
+ */
+export function dispatchActivityLabel(dispatch: DispatchStatus): { text: string; cls: string } {
+  const count = `${dispatch.queued} 条待发送`;
+  if (dispatch.phase === "connecting") {
+    return {
+      text: dispatch.serviceStarting
+        ? `服务启动中，就绪后自动发送 · ${count}`
+        : `正在连接服务… · ${count}`,
+      cls: "connecting",
+    };
+  }
+  if (dispatch.phase === "paused") return { text: count, cls: "queued" };
+  return {
+    text: dispatch.queued > 1 ? `正在发送… · ${count}` : "正在发送…",
+    cls: "sending",
+  };
+}
 
 /**
  * 从任务列表（HUD 同源，PinnedTaskTracker.extractLatestTodos 的产物）推导「当前正在执行的
@@ -108,6 +132,8 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
   if (recoveryKind === "stopping") {
     text = "正在停止…";
     cls = "stopping";
+  } else if (info.dispatch) {
+    ({ text, cls } = dispatchActivityLabel(info.dispatch));
   } else if (retry) {
     // OCV5-390: a retry in progress is still just work in progress for the user; no "busy", no counter.
     // The failure card appears only when the retries are used up.

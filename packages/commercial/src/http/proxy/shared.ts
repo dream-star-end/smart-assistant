@@ -558,11 +558,24 @@ export const OC_ATTR_PARENT_TURN_KEY = "oc_parent_turn_key";
  */
 export interface UsageAttribution {
   sessionId: string | null;
-  mode: "chat" | "delegate";
+  mode: "chat" | "delegate" | "auto_dream";
   parentSessionId: string | null;
   delegateAgentId: string | null;
   turnKey: string | null;
   parentTurnKey: string | null;
+}
+
+/**
+ * OCV5-392: a chat-attributed request carrying CCB's `cc_workload=auto-dream` tag
+ * (extractCcWorkload) is background memory consolidation. Settlement still writes
+ * mode / reason 'chat' and tags both rows workload='auto_dream' (0304). Delegate attribution wins:
+ * it already names a parent session and agent. Only the label changes; the amount
+ * and admission are the same as a chat call.
+ */
+export function applyWorkloadMode(attribution: UsageAttribution, workload: string | null): UsageAttribution {
+  return attribution.mode === "chat" && workload === "auto-dream"
+    ? { ...attribution, mode: "auto_dream" }
+    : attribution;
 }
 
 const CHAT_ATTRIBUTION: Omit<UsageAttribution, "sessionId"> = {
@@ -1759,6 +1772,11 @@ export interface AnthropicProxyDeps {
    * 与 process.env 完全解耦:wiring 在 index.ts 显式从 loadConfig() 取对应字段并注入,proxy 内不读 process.env。
    */
   staticProviderKeys?: StaticProviderKeys;
+  /**
+   * OCV5-424:启用静态 provider 的 API-key 服务池(pool_api_keys,多 key + 共享策略)。
+   * production wiring 置 true;测试/外部 API-key proxy 不置 → 只用 env key(旧行为)。
+   */
+  apiKeyPoolEnabled?: boolean;
   /**
    * 模型执行 catalog(模型权威批次 · 方案 §1.2/§4)。**注入 = 本进程参与 catalog 判定**。
    *

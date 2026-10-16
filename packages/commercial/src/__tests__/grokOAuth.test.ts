@@ -91,7 +91,9 @@ describe('getFreshGrokAccessToken', () => {
     assert.ok(oldRefresh.every((byte) => byte === 0))
   })
 
-  test('disables a terminal invalid_grant account after rollback so the pool can fail over', async () => {
+  // OCV5-424: a terminal refresh no longer writes status='disabled' (that needed a human);
+  // the shared policy puts the account into an auth cooldown that the recovery actor probes.
+  test('cools a terminal invalid_grant account (auth cooldown) after rollback so the pool can fail over', async () => {
     const calls: Array<{ sql: string; params?: unknown[] }> = []
     const client = {
       async query(sql: string, params?: unknown[]) {
@@ -116,14 +118,18 @@ describe('getFreshGrokAccessToken', () => {
           statusCode: 400,
           body: { text: async () => '{"error":"invalid_grant"}' },
         })) as never,
+        reportOutcome: async (id, outcome, errorMsg) => {
+          calls.push({ sql: 'REPORT', params: [String(id), outcome.kind, errorMsg] })
+        },
       }),
       (err: unknown) => err instanceof GrokOAuthRefreshError && err.terminal,
     )
     const rollback = calls.findIndex(({ sql }) => sql === 'ROLLBACK')
-    const disable = calls.findIndex(({ sql }) => sql.includes("SET status = 'disabled'"))
+    const report = calls.findIndex(({ sql }) => sql === 'REPORT')
     assert.ok(rollback >= 0)
-    assert.ok(disable > rollback)
-    assert.deepEqual(calls[disable]?.params, ['53', 'GROK_OAUTH_REFRESH_FAILED:400:invalid_grant'])
+    assert.ok(report > rollback)
+    assert.deepEqual(calls[report]?.params, ['53', 'auth_invalid', 'GROK_OAUTH_REFRESH_FAILED:400:invalid_grant'])
+    assert.equal(calls.some(({ sql }) => sql.includes("SET status = 'disabled'")), false)
   })
 
   test('defaults to the process-direct dispatcher instead of the bound account egress', async () => {

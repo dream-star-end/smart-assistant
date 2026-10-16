@@ -350,3 +350,51 @@ describe("submit() codex 计费 guard(fail-closed)", () => {
     );
   });
 });
+
+// OCV5-434 GPT Fast: submit() hands opts.serviceTier to runners that implement setServiceTier,
+// judged against the turn's effective model; a 'restart' answer (CCB env) folds into the single
+// pre-turn shutdown, while Codex ('applied', per-turn param) never restarts.
+class TierRunner extends FakeEngineAdapter {
+  tierCalls: Array<[unknown, unknown]> = [];
+  shutdowns = 0;
+  answer: "restart" | "applied" | "unchanged" = "applied";
+  setServiceTier(tier: unknown, model: unknown): string {
+    this.tierCalls.push([tier, model]);
+    return this.answer;
+  }
+  override async shutdown(): Promise<void> {
+    this.shutdowns += 1;
+  }
+}
+
+describe("OCV5-434 submit() serviceTier", () => {
+  test("a restart answer shuts the runner down once before the turn", async () => {
+    const runner = new TierRunner("ccb", CCB_CAPS, "opencode-gpt-6-luna");
+    runner.answer = "restart";
+    const session = makeSession(runner as unknown as FakeEngineAdapter);
+    await makeSm().submit(session, "hello", () => {}, undefined, undefined, undefined, undefined, undefined, {
+      serviceTier: "fast",
+    });
+    assert.deepEqual(runner.tierCalls, [["fast", "opencode-gpt-6-luna"]]);
+    assert.equal(runner.shutdowns, 1);
+    assert.equal(runner.submitTurnCalls.length, 1);
+  });
+
+  test("Codex applies per turn without a restart; null is explicit standard", async () => {
+    const runner = new TierRunner("codex", CCB_CAPS, "gpt-6-luna");
+    const session = makeSession(runner as unknown as FakeEngineAdapter);
+    await makeSm().submit(session, "hello", () => {}, undefined, undefined, undefined, undefined, undefined, {
+      serviceTier: null,
+    });
+    assert.deepEqual(runner.tierCalls, [[null, "gpt-6-luna"]]);
+    assert.equal(runner.shutdowns, 0);
+  });
+
+  test("omitted serviceTier leaves the runner untouched (other channels)", async () => {
+    const runner = new TierRunner("ccb", CCB_CAPS, "opencode-gpt-6-luna");
+    const session = makeSession(runner as unknown as FakeEngineAdapter);
+    await makeSm().submit(session, "hello", () => {});
+    assert.deepEqual(runner.tierCalls, []);
+    assert.equal(runner.shutdowns, 0);
+  });
+});

@@ -9,7 +9,7 @@
  * 重要：reducer 对 `session.messages` **就地 mutation**（push / 改字段），不每帧
  * 重建数组（streaming delta 频率极高）。订阅侧靠 `version` 单调递增触发重渲。
  */
-import type { CursorContextTier, MessageReplyQuote } from "@openclaude/protocol";
+import type { CursorContextTier, MessageReplyQuote, ServiceTier } from "@openclaude/protocol";
 import type {
   CallTokenUsageSnapshot,
   TurnTokenUsageSnapshot,
@@ -63,6 +63,8 @@ export type ChatRoutingSnapshot = {
   effortLevel?: string | null;
   /** Cursor Opus/Fable 上下文档位(300k / 1m);非分档模型不带。重试/合成续写原样复用。 */
   contextTier?: CursorContextTier;
+  /** OCV5-434 GPT Fast(仅支持的模型带);重试原样复用,不进服务端合成续写。 */
+  serviceTier?: ServiceTier;
 };
 
 export type RecoveryStatusState = {
@@ -272,6 +274,8 @@ export type ChatMessage = {
   _continuationOfTurnKey?: string;
   // ── user ──
   status?: UserMsgStatus;
+  /** 用户自己点停止取消的待发消息(OCV5-421):仍可重发,但显示中性「发送已取消」而不是红色「发送失败」。 */
+  _sendCancelled?: boolean;
   _media?: MediaRef[];
   /** Full local retry payload; hidden source/mask never enter cloud user-message persistence. */
   _retryMedia?: MediaRef[];
@@ -351,6 +355,8 @@ export type ChatMessage = {
    * concatenate the same incremental chunks twice. Runtime-only.
    */
   _appliedFrameSeqs?: Record<number, true>;
+  /** Older applied frameSeqs folded into sorted, disjoint, inclusive ranges (same fence, compact). */
+  _appliedFrameSeqRanges?: Array<[number, number]>;
   /** hydration 的 complete-anchor 分支盖章：该 tape 已完整原子落库（同步权威传播的作证前提）。 */
   _turnTapeComplete?: boolean;
   /** 该行在同一 lossless turn tape 内的持久 record ordinal。多个展开行共享 `_orderSeq`，
@@ -491,6 +497,8 @@ export type ChatMessage = {
   /** Exact structured tool result before any text-oriented rendering. */
   outputJson?: unknown;
   error?: boolean;
+  /** 本轮被停止 / 中断时还没拿到结果的工具:中性「已取消」,不是「完成」也不再转圈(OCV5-421)。 */
+  cancelled?: boolean;
   bashTail?: BashTail;
 
   // ── agent-group ──
@@ -669,6 +677,14 @@ export type ChatSession = {
   _turnProgressHint?: string;
   /** User-row id of the turn currently streaming in this browser. */
   _activeClientMessageId?: string;
+  /**
+   * Turn whose live frames this browser is re-reading through an
+   * `outbound.active_turn_replay_start` backlog (reload / reconnect). Its
+   * tape-commit completion settles at once from REST instead of waiting for a
+   * live tail that is still queued behind the replay (OCV5-427). Session
+   * memory only — not written to persist snapshots.
+   */
+  _resumeReplayClientMessageId?: string;
   /**
    * Browser-only stop settlement fence. A successful online Stop stays busy
    * until this exact turn reaches a terminal frame and the authoritative REST

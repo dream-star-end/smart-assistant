@@ -359,6 +359,8 @@ describe('grok relay account health feedback', () => {
     }
   })
 
+  // OCV5-424: 429 / 402 go to the shared policy as an immediate rate_limited /
+  // quota cooldown (applyOutcome) instead of a 3-strike failure; 401/403 stay strikes.
   test('recorder routes success/failure through the shared health tracker and ignores client errors', async () => {
     const calls: string[] = []
     const sql: Array<[string, unknown[]]> = []
@@ -366,14 +368,21 @@ describe('grok relay account health feedback', () => {
       health: {
         onSuccess: async (id) => { calls.push(`ok:${id}`); return null },
         onFailure: async (id, msg) => { calls.push(`fail:${id}:${msg}`); return null },
+        applyOutcome: async (id, outcome, opts) => { calls.push(`outcome:${id}:${outcome.kind}:${opts?.errorMsg}`); return null },
       },
       query: (async (text: string, params: unknown[]) => { sql.push([text, params]); return { rows: [], rowCount: 0 } }) as never,
     })
     await recorder(53n, 200)
     await recorder(53n, 400)
     await recorder(53n, 429)
+    await recorder(53n, 402)
     await recorder(53n, 403)
-    assert.deepEqual(calls, ['ok:53', 'fail:53:grok_http_429', 'fail:53:grok_http_403'])
+    assert.deepEqual(calls, [
+      'ok:53',
+      'outcome:53:rate_limited:grok_http_429',
+      'outcome:53:quota_exhausted:grok_http_402',
+      'fail:53:grok_http_403',
+    ])
     assert.equal(sql.length, 0, 'no direct SQL unless 401 / 5xx')
   })
 
@@ -384,6 +393,7 @@ describe('grok relay account health feedback', () => {
       health: {
         onSuccess: async (id) => { calls.push(`ok:${id}`); return null },
         onFailure: async (id, msg) => { calls.push(`fail:${id}:${msg}`); return null },
+        applyOutcome: async (id, outcome) => { calls.push(`outcome:${id}:${outcome.kind}`); return null },
       },
       query: (async (text: string, params: unknown[]) => { sql.push([text, params]); return { rows: [], rowCount: 1 } }) as never,
     })
@@ -406,6 +416,7 @@ describe('grok relay account health feedback', () => {
       health: {
         onSuccess: async () => null,
         onFailure: async (id, msg) => { order.push(`fail:${id}:${msg}`); return null },
+        applyOutcome: async () => null,
       },
       query: (async (text: string, params: unknown[]) => {
         assert.match(text, /oauth_expires_at = NOW\(\)/)

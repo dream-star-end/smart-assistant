@@ -335,6 +335,55 @@ describe("settleUsageAndLedger (integ)", () => {
     assert.equal(ur.rows[0].cost_credits, "300");
   });
 
+  test("auto_dream (OCV5-392): same chat debit, tagged workload auto_dream on usage and ledger", async (t) => {
+    if (skipIfNoPg(t)) return;
+    const uid = await createUser("dream@example.com", 1000n);
+    const result = await settleUsageAndLedger(getPool(), {
+      userId: uid,
+      accountId: null,
+      requestId: "req-dream-1",
+      model: "deepseek-v4-flash",
+      usage: makeUsage(),
+      snapshotJson: SNAPSHOT_JSON,
+      costCredits: 4n,
+      status: "success",
+      sessionId: "sess-dream",
+      mode: "auto_dream",
+    });
+    assert.equal(result.debitedCredits, 4n);
+    assert.equal(result.balanceAfter, 996n);
+    const ur = await query<{ mode: string; workload: string | null; cost_credits: string }>(
+      "SELECT mode, workload, cost_credits::text AS cost_credits FROM usage_records WHERE id=$1",
+      [result.usageId.toString()],
+    );
+    assert.deepEqual(ur.rows[0], { mode: "chat", workload: "auto_dream", cost_credits: "4" });
+    const led = await query<{ reason: string; workload: string | null; delta: string; ref_id: string }>(
+      "SELECT reason, workload, delta::text AS delta, ref_id FROM credit_ledger WHERE user_id=$1",
+      [uid.toString()],
+    );
+    assert.deepEqual(led.rows, [
+      { reason: "chat", workload: "auto_dream", delta: "-4", ref_id: result.usageId.toString() },
+    ]);
+    // An ordinary chat settle leaves both columns NULL.
+    const plain = await settleUsageAndLedger(getPool(), {
+      userId: uid,
+      accountId: null,
+      requestId: "req-dream-2",
+      model: "deepseek-v4-flash",
+      usage: makeUsage(),
+      snapshotJson: SNAPSHOT_JSON,
+      costCredits: 4n,
+      status: "success",
+      sessionId: "sess-dream",
+    });
+    const pw = await query<{ u: string | null; l: string | null }>(
+      `SELECT (SELECT workload FROM usage_records WHERE id=$1) AS u,
+              (SELECT workload FROM credit_ledger WHERE ref_id=$2) AS l`,
+      [plain.usageId.toString(), plain.usageId.toString()],
+    );
+    assert.deepEqual(pw.rows[0], { u: null, l: null });
+  });
+
   test("lossless locator is committed atomically with the real ledger debit", async (t) => {
     if (skipIfNoPg(t)) return;
     const uid = await createUser("lossless-cost@example.com", 1000n);

@@ -158,10 +158,19 @@ import {
   startCodexRefreshActor,
   type CodexRefreshActorHandle,
 } from "./account-pool/codexAccountActor.js";
+import { createAccountPoolAdapter } from "./account-pool/accountPoolAdapter.js";
 import {
-  startCooldownRecoveryActor,
-  type CooldownRecoveryActorHandle,
-} from "./account-pool/cooldownRecoveryActor.js";
+  apiKeyPoolConfiguredServices,
+  createApiKeyPoolAdapter,
+  createRelayKeyPoolAdapter,
+  importEnvApiKeys,
+  primeApiKeyPool,
+  startApiKeyPoolCache,
+} from "./account-pool/apiKeyPool.js";
+import { createGeminiPoolAdapter } from "./account-pool/geminiPoolAdapter.js";
+import { registerPoolAdapter, startPoolRecoveryActor } from "./account-pool/policy/registry.js";
+import { configureAffinitySettings } from "./account-pool/policy/affinity.js";
+import { getSystemSetting } from "./admin/systemSettings.js";
 import { startCursorAuthSyncActor } from "./account-pool/cursorMaterializer.js";
 import { startCursorSandPreparationActor } from "./account-pool/cursorSandActor.js";
 import { startCursorUsageSweeper } from "./account-pool/cursorUsageSweeper.js";
@@ -331,6 +340,21 @@ import {
   configureZcodeRelayKv,
   createIoredisZcodeRelayKv,
 } from "./billing/zcodeRouteContext.js";
+import {
+  ANTIGRAVITY_RELAY_PREFIX,
+  makeAntigravityRelayHandler,
+  type AntigravityRelayHandler,
+} from "./http/internalAntigravityRelay.js";
+import {
+  configureAntigravityRelayKv,
+  expireAntigravityRelayRoute,
+  expireAntigravityRelayRouteForRequest,
+} from "./billing/antigravityRouteContext.js";
+import { admitAntigravityTurn } from "./account-pool/antigravityAdmission.js";
+import {
+  configureAntigravityModelCooldownStore,
+  createIoredisAntigravityModelCooldownStore,
+} from "./account-pool/antigravityModelCooldown.js";
 import {
   SKILL_EMBED_PREFIX,
   makeSkillEmbedHandler,
@@ -1566,6 +1590,8 @@ export async function registerCommercial(
     enableReadyCheck: true,
   });
   configureZcodeRelayKv(createIoredisZcodeRelayKv(redis));
+  configureAntigravityRelayKv(createIoredisZcodeRelayKv(redis));
+  configureAntigravityModelCooldownStore(createIoredisAntigravityModelCooldownStore(redis));
 
   // 预热 dummy hash:第一次登录无影响
   await warmupLoginDummyHash();
@@ -1919,6 +1945,8 @@ export async function registerCommercial(
           provider: "grok",
           groupId: group.id,
           sessionId: sessionId ?? `container:${containerId}`,
+          // OCV5-424: user affinity (no pinMode → no session pin / 409 flow).
+          userId,
         });
       } catch (err) {
         if (err instanceof AccountPoolBusyError) { busy = err; continue; }
@@ -2171,7 +2199,23 @@ export async function registerCommercial(
     // internalProxyHandler 置空后让 master 继续跑;若 guard 在 try 内,缺 key 会被降级吞成
     // "internal proxy 禁用但 master 照跑",违反 loud-fail。放 try 外则异常直接冒泡崩 master boot。
     // 触发面仅此 internal-proxy/agent-runtime 启动路径;unit test / external proxy harness 不进此分支。
-    assertPlatformDefaultModelConfigured(cfg);
+    // OCV5-424:env key 先幂等导入服务池,再按"env 或池内成员"校验默认模型。
+    await importEnvApiKeys({
+      deepseek: cfg.DEEPSEEK_API_KEY,
+      minimax: cfg.MINIMAX_TOKEN_PLAN_KEY,
+      ark: cfg.ARK_CODING_PLAN_KEY,
+      zai: cfg.ZAI_CODING_PLAN_KEY,
+      opencodego: cfg.OPENCODE_GO_API_KEY,
+      kimi: cfg.ARK_AGENT_PLAN_KEY,
+      "ark-k3": cfg.ARK_AGENT_PLAN_KEY,
+      moonshot: cfg.MOONSHOT_CODING_PLAN_KEY,
+      bailian: cfg.BAILIAN_TOKEN_PLAN_KEY,
+    }).catch((err) => console.warn("[commercial] api-key pool env import failed:", (err as Error)?.message ?? err));
+    await primeApiKeyPool().catch(() => {});
+    startApiKeyPoolCache();
+    assertPlatformDefaultModelConfigured(cfg, {
+      apiKeyPoolConfigured: (service) => apiKeyPoolConfiguredServices().has(service),
+    });
     try {
       const identityRepo = createPgIdentityRepo();
       const rateLimitRedis = sharedRateLimitRedis;
@@ -2275,6 +2319,7 @@ export async function registerCommercial(
           // 2026-08-04:阿里百炼 Token Plan(qwen3.8-max)，独立订阅独立 key。
           bailian: cfg.BAILIAN_TOKEN_PLAN_KEY,
         },
+        apiKeyPoolEnabled: true,
         // v1.0.207 起 Phase 6 account_uuid 锚定(plan §3.0)+ csap session pin 三态
         // (0072+0073+0074),从 env-only 迁到 `system_settings` 表(admin UI 立即可改,
         // 不需要 systemctl restart)。注入 30s TTL cache 的 getter
@@ -2500,6 +2545,11 @@ export async function registerCommercial(
       const zcodeRelayHandler: ZcodeRelayHandler = makeZcodeRelayHandler({
         identityRepo,
         codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
+      });
+      const antigravityRelayHandler: AntigravityRelayHandler = makeAntigravityRelayHandler({
+        identityRepo,
+        clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
+        pricing,
       });
       // /internal/v3/skill-embed — 容器内 mcp-memory 语义 skill_search 回源 master。
       // master 持 SKILL_EMBEDDING_API_KEY/DASHSCOPE_API_KEY(只在 master env,不注入容器),
@@ -2960,6 +3010,9 @@ export async function registerCommercial(
         }
         if (path === ZCODE_RELAY_PREFIX || path.startsWith(`${ZCODE_RELAY_PREFIX}/`)) {
           return zcodeRelayHandler(req, res, ctx);
+        }
+        if (path === ANTIGRAVITY_RELAY_PREFIX || path.startsWith(`${ANTIGRAVITY_RELAY_PREFIX}/`)) {
+          return antigravityRelayHandler(req, res, ctx);
         }
         if (path === SKILL_EMBED_PREFIX) {
           return skillEmbedHandler(req, res, ctx);
@@ -5919,6 +5972,17 @@ export async function registerCommercial(
     expireZcodeRoute: async (token) => {
       await expireZcodeRelayRoute(token);
     },
+    admitAntigravityTurn: ({ containerId, userId, requestId, modelId, budgetCredits }) =>
+      admitAntigravityTurn(
+        { containerId, userId, requestId, modelId, budgetCredits, relayPort: V3_CONTAINER_PORT },
+        { clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "" },
+      ),
+    expireAntigravityRoute: async (token) => {
+      await expireAntigravityRelayRoute(token);
+    },
+    expireAntigravityRouteForRequest: async (requestId) => {
+      await expireAntigravityRelayRouteForRequest(requestId);
+    },
     releaseGrokRouteLease: async (accountId, slotId) => {
       // Expire durable authority before freeing the local mirror. If PG is
       // unavailable the slot remains occupied and the immutable terminal frame
@@ -6118,17 +6182,31 @@ export async function registerCommercial(
     }));
   }
 
-  // 账号池 cooldown 半开恢复 actor —— 周期扫 cooldown_until 已过期的账号 → active。
-  // 默认 5min tick(下限 1s 防 typo)。
+  // OCV5-424 — 各服务池共用的唯一恢复 actor(policy/registry):到期普通冷却半开、
+  // 认证/凭证冷却到期探测(成功回 active,失败加大退避,不确定则稍后再探)。
+  // 各池只注册适配器,不各自起定时器。默认 60s tick(下限 1s 防 typo)。
   // 关闭:`COMMERCIAL_COOLDOWN_RECOVERY_DISABLED=1`(测试 / 应急)。
+  registerPoolAdapter(createAccountPoolAdapter({ health: healthTracker, triggerCodexDisableFanout }));
+  registerPoolAdapter(createApiKeyPoolAdapter());
+  registerPoolAdapter(createRelayKeyPoolAdapter());
+  // OCV5-424 user affinity caps: admin system settings, cached 60s in policy/affinity.
+  configureAffinitySettings(async () => ({
+    maxUsersPerSubscription: (await getSystemSetting("pool_affinity_max_users_per_subscription")).value,
+    ratePerMin: (await getSystemSetting("pool_affinity_rate_per_min")).value,
+    antigravityInflight: (await getSystemSetting("pool_affinity_antigravity_inflight")).value,
+    antigravityRatePerMin: (await getSystemSetting("pool_affinity_antigravity_rate_per_min")).value,
+  }));
+  registerPoolAdapter(createGeminiPoolAdapter({
+    clientSecret: () => process.env.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET?.trim() ?? "",
+  }));
   if (process.env.COMMERCIAL_COOLDOWN_RECOVERY_DISABLED !== "1") {
     leaderBundle.add({
       name: "cooldownRecovery",
       domain: "shared",
       start: () => {
         const raw = Number(process.env.COMMERCIAL_COOLDOWN_RECOVERY_INTERVAL_MS);
-        const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 5 * 60_000;
-        const h = trackScheduler("cooldownRecovery", "shared", startCooldownRecoveryActor({ tracker: healthTracker, intervalMs }));
+        const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
+        const h = trackScheduler("cooldownRecovery", "shared", startPoolRecoveryActor({ intervalMs }));
         return { stop: () => h.stop() };
       },
     });

@@ -130,6 +130,14 @@ export const KEY_SCHEMAS = {
    * < 0.5% 安全)→ enforce。
    */
   session_pin_mode: z.enum(["off", "observe", "enforce"]),
+  /** OCV5-424 user affinity: max users bound to one subscription account (new bindings only). */
+  pool_affinity_max_users_per_subscription: z.number().int().min(1).max(1000),
+  /** OCV5-424: new requests per minute per subscription account before spilling to another. */
+  pool_affinity_rate_per_min: z.number().int().min(1).max(10_000),
+  /** OCV5-424: concurrent Antigravity turns per Google account before spilling. */
+  pool_affinity_antigravity_inflight: z.number().int().min(1).max(100),
+  /** OCV5-424: Antigravity turns per minute per Google account before spilling. */
+  pool_affinity_antigravity_rate_per_min: z.number().int().min(1).max(10_000),
   /** V5 Auto-Dream background consolidator model; validated against the live catalog on write. */
   auto_dream_model: z.string().min(1).max(64),
   /**
@@ -224,6 +232,10 @@ export const DEFAULTS: { [K in SystemSettingKey]: SystemSettingValue<K> } = {
   // (见 http/proxy/index.ts),正是反封想要的"不在会话中途静默切号"。
   // 如需回退观察:admin PUT /api/admin/settings/session_pin_mode = "observe"|"off"。
   session_pin_mode: "enforce",
+  pool_affinity_max_users_per_subscription: 8,
+  pool_affinity_rate_per_min: 30,
+  pool_affinity_antigravity_inflight: 3,
+  pool_affinity_antigravity_rate_per_min: 20,
   auto_dream_model: DEFAULT_AUTO_DREAM_MODEL,
   desktop_virtual_container: false,
   desktop_allowlist: [] as string[],
@@ -301,6 +313,22 @@ export const KEY_META: Record<
     enumValues: ["off", "fail_open", "fail_closed"],
     description:
       "Phase 6 account_uuid 锚定执行模式。灰度 off → fail_open(hook 重写非 null)→ fail_closed(scheduler 过滤 NULL 候选)",
+  },
+  pool_affinity_max_users_per_subscription: {
+    kind: "number", min: 1, max: 1000,
+    description: "按用户粘性:每个订阅账号最多绑定的用户数(只限制新绑定;全部满时仍分给最少的账号)",
+  },
+  pool_affinity_rate_per_min: {
+    kind: "number", min: 1, max: 10000,
+    description: "按用户粘性:每个订阅账号每分钟最多接的新请求,超出本次溢出到其他账号(绑定不变)",
+  },
+  pool_affinity_antigravity_inflight: {
+    kind: "number", min: 1, max: 100,
+    description: "按用户粘性:每个 Antigravity Google 账号同时进行的轮次上限,超出本次溢出",
+  },
+  pool_affinity_antigravity_rate_per_min: {
+    kind: "number", min: 1, max: 10000,
+    description: "按用户粘性:每个 Antigravity Google 账号每分钟轮次上限,超出本次溢出",
   },
   session_pin_mode: {
     kind: "enum",

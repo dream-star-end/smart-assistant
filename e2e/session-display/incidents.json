@@ -7408,6 +7408,204 @@
           "assertion": "INC-20261014-SELFHOST-C3-GROK-REFUSAL: turn 1 registers a PO-<code> order number and turn 2 recalls it"
         }
       ]
+    },
+    {
+      "id": "INC-20261015-LIVE-FENCE-TRIM-REPLAY",
+      "occurredAt": "2026-10-15",
+      "severity": "P2",
+      "symptom": "OCV5-421 把每行的已应用 frameSeq 去重表在超过 1024 个后截成最新 512 个。journal 水合会重置会话游标并从本轮第一帧重放，长回答（超过 1024 个增量）被截掉的旧帧会再次追加，正文变长重复（1025 个 A 重放后变 1538）。G411e 个人版→商业同步的 Codex 审查发现，潜伏，无用户报告。修复：旧序号折叠成有序闭区间，去重不丢信息，持久化仍保持小体积。",
+      "rootFixCommit": "39eba126",
+      "coverageCommits": [
+        "aedb6f5e"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "INC-20261015-LIVE-FENCE-TRIM-REPLAY: a long answer replayed after a cursor reset is not appended twice"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T71 INC-20261015-LIVE-FENCE-TRIM-REPLAY: a long answer replayed after a cursor reset is shown once"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261015-TAPE-COMMIT-FINAL-RACE",
+      "occurredAt": "2026-10-14",
+      "severity": "P2",
+      "symptom": "个人版发布门 C3 在 grok-build 上间歇报 \"Continuation turn did not recall the first turn's code\"（tr-20261014T221151Z-8db4f43f5fb5 等），但失败截图里第二轮答出了正确的 PO-<code>，usage 显示第二轮 8.9k input + 65.8k cache read（历史完整带上）。线上复现（第二轮先跑一次工具）4/8：本轮已显示完成（无光标、按钮回到发送）但正文停在半句，约 1s 后才补齐，真实用户同样看到。帧序：master 在 lossless tape 提交（HTTP）后广播的合成 final（meta.reconcile=turn_completed，无 frameSeq）比同一轮 WS 上的 live 尾巴早 0.4–1s 到达；reducer 立即收口并把 stale 截止定在该帧 ts，随后尾巴帧被丢，等 REST 对账才补齐。修复：master 给该广播打 reconcileSource=tape_commit；前端对仍在流式的本轮延后收口，等 live 尾巴与真 final，5s 宽限内未到再按原 reconcile 收口；hello/reconciler 对账不变。与 INC-20261014-SELFHOST-C3-GROK-REFUSAL（模型拒答）不同根因。",
+      "rootFixCommit": "0c8cafb9",
+      "coverageCommits": [
+        "e1a63668"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
+          "assertion": "本轮仍在流式 → 不收口;更早 ts 的尾巴照常追加,真 final 收口"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/durableTurnDispatch.test.ts",
+          "assertion": "ChatSocket:宽限期内真 final 收口;真 final 丢失则期满按 reconcile 收口"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalServerAuthored.test.ts",
+          "assertion": "visible action commits and broadcasts authoritative final before any part"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/process-disclosure-app.node-test.mjs",
+          "assertion": "INC-20261015-TAPE-COMMIT-FINAL-RACE (OCV5-424): a tape-commit turn_completed that overtakes the"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261015-RESUME-REPLAY-LAG",
+      "occurredAt": "2026-10-15",
+      "severity": "P2",
+      "symptom": "个人版长回答流式中途刷新页面后，页面落后实时几十秒：刷新后的页面先发游标 hello、REST 同步后又发一次点名本轮的 hello，网关回两批重放（累计 3000+ 帧，被重复处理），浏览器每帧 15–28ms 处理；tape 提交的完成帧夹在积压重放帧之间先到，客户端按 OCV5-424 宽限 5 秒等实时尾巴（尾巴其实排在积压之后），本轮显示已结算但正文停在中间（600 行停在 L0378），之后历史同步或再刷新才补齐（OCV5-427，真聊复现 peer g421fmv8vppvy / g421tmv8z5cp8）。修复：页面加载首个 hello 即点名本轮、同步后的注册 hello 按本轮去重，网关每连接每轮只做一次整轮重放；重复命中的重放帧不触发渲染、准入确认仅在有变化时通知；恢复重放中的 tape 提交完成帧立即收口并对账。",
+      "rootFixCommit": "5120dbea",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "INC-20261015-RESUME-REPLAY-LAG: the page-load hello asks for the running turn once and the REST sync does not ask again"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "INC-20261015-RESUME-REPLAY-LAG: replayed deltas the row already holds do not schedule a render"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "INC-20261015-RESUME-REPLAY-LAG: a tape-commit completion during a resume replay settles at once and syncs history"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/activeTurnReplayDedupe.test.ts",
+          "assertion": "OCV5-427: a socket gets the exact-turn replay once per turn"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T72 INC-20261015-RESUME-REPLAY-LAG: a completion inside the reload replay backlog settles at once and syncs history"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261015-COLDSTART-QUEUED-THINKING",
+      "occurredAt": "2026-10-15",
+      "severity": "P2",
+      "symptom": "个人版 uid3 容器被空闲回收后冷启动约 2 分 20 秒（入口 20s + 网关启动 72s + bootAutoResume 连续预热 145 个会话把 /healthz 饿住 29s）；手机端消息停在本地待发送队列，活动行却显示「助手 思考中」+停止键，用户以为消息已发出。修复：服务器确认收到(admission ACK)前活动行显示「正在连接服务… · N 条待发送」/「服务启动中，就绪后自动发送」/「正在发送…」；网关预热每个会话让出事件循环。",
+      "rootFixCommit": "0d031559",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/dispatchStatus.test.ts",
+          "assertion": "container still starting: queued message is `connecting`, never in-flight"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/dispatchStatus.test.ts",
+          "assertion": "on the wire without admission ACK is `sending`; the ACK clears it"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnActivityDispatch.test.tsx",
+          "assertion": "connecting shows the service state and the queue count, not 「思考中」"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/bootAutoResumeYield.test.ts",
+          "assertion": "yields a macrotask at the top of every iteration, before any pre-warm work"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T73 INC-20261015-COLDSTART-QUEUED-THINKING: a queued message shows the connection state until the server admits it"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261015-GO-CACHE-PREFIX",
+      "occurredAt": "2026-10-15",
+      "severity": "P2",
+      "symptom": "个人版 OpenCode Go 的 /responses 与 /chat/completions 桥把 CCB 每轮追加的 role:system「<total_tokens>…」消息并进 instructions/首条 system，前缀逐请求变化：GPT-6 Luna / GPT-5.6 Luna 每轮全量 cache_write、cache_read=0，Grok/Muse 仅命中约 16–18K/35K。计费如实、无误差，但用户付了缓存写溢价却拿不到读折扣。",
+      "rootFixCommit": "085b03e3",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/openAiResponsesGoBridge.test.ts",
+          "assertion": "later system messages stay in place, so every request extends the previous one (OCV5-432)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/openAiChatGoBridge.test.ts",
+          "assertion": "later system messages stay in place, so every request extends the previous one (OCV5-432)"
+        }
+      ],
+      "proofPending": {
+        "reason": "商业版暂无 proof 层证据:发版证据是 G1(scripts/v5-go-cache-contract.mjs),它只接在个人版发版 deploy-v5-selfhost.sh;商业版没有已上架的 OpenCode Go 模型和对应测试账号,deploy-v5.sh 跑不了 G1。本轮由 Go 桥单测锁住(openAiResponsesGoBridge/openAiChatGoBridge)。补证到期 2026-11-15:商业上架 Go 模型时接入商业发布门,或补等价商业证据。管家 2026-10-16 决定方案 a。",
+        "since": "2026-10-16"
+      }
+    },
+    {
+      "id": "INC-20261015-PRESTART-STOP-LOST",
+      "occurredAt": "2026-10-15",
+      "severity": "P2",
+      "symptom": "个人版 GPT-6-Astra 会话（webmv9omkexy7xfyl）发出消息 4 秒后浏览器发停止，此时引擎冷启动尚未起来（11 秒），网关按 clientMessageId 找不到运行中的 turn，回 TURN_NOT_ACTIVE，master 把停止记为终态；turn 随后照常启动，Codex 调 request_user_input 提问，会话快照因该轮有停止把提问投影成 cancelled/user_stop，前端加载后把卡片判为已结束不显示，网关补推被僵尸卡守卫丢弃；引擎一直 waiting_for_user，第二条消息被堵（OCV5-435；真聊复现 g435amv9pv5fh 发出后 250ms 点停止；canary 合同在修复前 5/5 红：停止回 TURN_NOT_ACTIVE、该轮按 turn_completed 落账）。修复：网关从 ws 受理到 turn 结束跟踪本轮，引擎未起时到达的停止登记精确的启动前停止围栏并回 applied，引擎 run 创建即按用户停止收尾（interrupted / USER_CANCELLED）；精确命中但终态持久化尚未建立的停止同样登记围栏；抢在消息之前到达的停止仍回 TURN_NOT_ACTIVE，但登记 30 秒短围栏，消息一到即停。",
+      "rootFixCommit": "b2d263c9",
+      "coverageCommits": [
+        "44e04ac6",
+        "693212d9",
+        "74b6c0c2"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "OCV5-435: a Stop fenced before the engine run ends that exact turn as USER_CANCELLED"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "OCV5-435: an exact Stop before terminal persistence exists arms the pre-start fence"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/preStartStop.test.ts",
+          "assertion": "binds the Stop to an admitted turn and reports it applied"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/preStartStop.test.ts",
+          "assertion": "a Stop that overtook its message answers not-active but arms a short fence"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "OCV5-435: an overtaking Stop for one send attempt does not stop a resend of the same message"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexTurnRetry.test.ts",
+          "assertion": "interrupt while the app-server is still starting → no turn/start, USER_CANCELLED"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexTurnRetry.test.ts",
+          "assertion": "Stop while starting, then shutdown rejects the start → USER_CANCELLED, not CODEX_ERROR"
+        }
+      ],
+      "proofPending": {
+        "reason": "商业版暂无 proof 层证据:发版证据是 S1(scripts/v5-stop-before-start-contract.mjs),它只接在个人版发版 deploy-v5-selfhost.sh,依赖个人版 canary 的 Codex 模型;商业版没有对应模型/测试账号,deploy-v5.sh 跑不了 S1。本轮由 sessionManagerEngineTurn/preStartStop/codexTurnRetry 单测锁住。补证到期 2026-11-15:补商业真网关浏览器证明或商业发布门。管家 2026-10-16 决定方案 a。",
+        "since": "2026-10-16"
+      }
     }
   ]
 }

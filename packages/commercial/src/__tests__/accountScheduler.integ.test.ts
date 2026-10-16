@@ -15,6 +15,7 @@
  *  11. account 在 pick 和 readToken 之间被删 → AccountPoolUnavailableError
  */
 
+import { _resetAffinityCapsForTest, _resetAffinityTouchForTest } from '../account-pool/policy/affinity.js'
 import assert from 'node:assert/strict'
 import { randomBytes } from 'node:crypto'
 import { after, before, beforeEach, describe, test } from 'node:test'
@@ -86,7 +87,11 @@ after(async () => {
 
 beforeEach(async () => {
   if (!pgAvailable) return
-  await query('TRUNCATE TABLE usage_records, claude_accounts RESTART IDENTITY CASCADE')
+  await query('TRUNCATE TABLE usage_records, claude_accounts, pool_user_affinity RESTART IDENTITY CASCADE')
+  // OCV5-424: ids restart per test, so the in-process per-member caps and the
+  // user-affinity bindings must not carry over between tests.
+  _resetAffinityCapsForTest()
+  _resetAffinityTouchForTest()
 })
 
 function skipIfNoDb(t: { skip: (reason: string) => void }): boolean {

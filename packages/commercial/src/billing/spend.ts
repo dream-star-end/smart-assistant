@@ -62,6 +62,8 @@ export interface SpendTwoBucketInput {
    * null / undefined = 不限(默认宽松)。由 settle 从 resolveOrgBillingContext 一并传入。
    */
   monthlyOrgBudget?: bigint | null;
+  /** 0304 OCV5-392: credit_ledger.workload — 'auto_dream' for memory consolidation, else NULL. */
+  workload?: "auto_dream" | null;
 }
 
 export interface SpendTwoBucketResult {
@@ -129,14 +131,15 @@ async function insertLedger(
     bucket: LedgerBucket;
     ref?: LedgerRef;
     memo?: string;
+    workload?: "auto_dream" | null;
   },
 ): Promise<bigint> {
   // org_id 追加到列尾(非插在 user_id 之后):保持既有 $1..$8 位次不变,避免打乱
   // 按参数位断言 credit_ledger INSERT 的既有测试(codex/bridge)。
   const r = await client.query<{ id: string }>(
     `INSERT INTO credit_ledger
-        (user_id, delta, balance_after, reason, bucket, ref_type, ref_id, memo, org_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        (user_id, delta, balance_after, reason, bucket, ref_type, ref_id, memo, org_id, workload)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      RETURNING id::text AS id`,
     [
       args.uid,
@@ -148,6 +151,7 @@ async function insertLedger(
       args.ref?.id ?? null,
       args.memo ?? null,
       args.orgId ?? null,
+      args.workload ?? null,
     ],
   );
   return BigInt(r.rows[0].id);
@@ -310,6 +314,7 @@ export async function spendTwoBucket(
       bucket: "org_period",
       ref: input.ref,
       memo,
+      workload: input.workload,
     });
   }
   if (fromOrg > 0n && orgParticipates && orgId !== null) {
@@ -326,6 +331,7 @@ export async function spendTwoBucket(
       bucket: "org_wallet",
       ref: input.ref,
       memo,
+      workload: input.workload,
     });
   }
   if (fromPeriod > 0n && subId) {
@@ -341,6 +347,7 @@ export async function spendTwoBucket(
       bucket: "period",
       ref: input.ref,
       memo,
+      workload: input.workload,
     });
   }
   if (fromWallet > 0n) {
@@ -353,6 +360,7 @@ export async function spendTwoBucket(
       bucket: "wallet",
       ref: input.ref,
       memo,
+      workload: input.workload,
     });
   }
 

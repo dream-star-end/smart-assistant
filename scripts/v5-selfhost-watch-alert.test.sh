@@ -15,8 +15,12 @@ ok() { pass=$((pass + 1)); echo "PASS $*"; }
 bad() { fail=$((fail + 1)); echo "FAIL $*"; }
 
 BASE="$(mktemp -d /tmp/v5-watch-alert.XXXXXX)"
-trap 'rm -rf "$BASE"' EXIT
+# 失败路径可能留下仍在睡的 psql 替身;收尾一并清掉。
+trap 'pkill -f "$BASE/" 2>/dev/null || true; rm -rf "$BASE"' EXIT
 KEY="k3y-$(date +%s%N)-secret"
+# 库卡住的替身睡这么久。A18/A19 的时间上限按它推出(超时坏了就会等满它),
+# 不按空闲机器上的正常耗时推:门禁和运行时构建并跑时同样的拍会慢好几倍(OCV5-436)。
+STALL_SEC=120
 
 setup() {
   C="$BASE/$1"
@@ -170,14 +174,16 @@ if grep -q -- '-v uid=3 ' "$TRACE" && ! grep -q -- '-v uid=1 ' "$TRACE"; then ok
 
 # A18 库卡住:入队立即返回;flush 受逐通道超时与总预算约束,记录留在 spool 待下一拍。
 setup a18; conf "WATCH_ALERT_MODE=live" "WATCH_ALERT_WECOM_KEY=$KEY"
-export PSQL_SLEEP=30 WATCH_ALERT_DB_TIMEOUT_SEC=2 WATCH_ALERT_FLUSH_BUDGET_SEC=1
-t0=$SECONDS; send --event rollback_start --severity critical --message x; t_enq=$((SECONDS - t0))
+export PSQL_SLEEP=$STALL_SEC WATCH_ALERT_DB_TIMEOUT_SEC=2 WATCH_ALERT_FLUSH_BUDGET_SEC=1
+send --event rollback_start --severity critical --message x
 send --event tier1_skipped --severity warning --message y
+enq_net="$(grep -cE '^(psql|curl) ' "$TRACE" || true)"
 t0=$SECONDS; send --flush; t_flush=$((SECONDS - t0))
 left="$({ cat "$C"/state/alert-spool/*.json 2>/dev/null || true; } | jq -sc 'map(.pending) | sort')"
-if [[ "$t_enq" -le 1 && "$t_flush" -le 6 && "$(nfiles "$C/state/alert-spool")" == 2 && "$left" == *'["db"]'* ]] && grep -q 'FLUSH 预算' "$WATCH_LOG"; then
-  ok "A18 blocked db: enqueue instant, flush bounded, records kept"
-else bad "A18 enq=${t_enq}s flush=${t_flush}s left=$left"; fi
+# 入队不碰网络和库;flush 远早于替身睡醒就返回,说明是自己的超时/预算截断的。
+if [[ "$enq_net" == 0 && "$t_flush" -lt $((STALL_SEC / 2)) && "$(nfiles "$C/state/alert-spool")" == 2 && "$left" == *'["db"]'* ]] && grep -q 'FLUSH 预算' "$WATCH_LOG"; then
+  ok "A18 blocked db: enqueue offline, flush bounded (${t_flush}s), records kept"
+else bad "A18 enq_net=$enq_net flush=${t_flush}s left=$left"; fi
 unset WATCH_ALERT_DB_TIMEOUT_SEC WATCH_ALERT_FLUSH_BUDGET_SEC; export PSQL_SLEEP=0
 
 # ── 接入看护 ─────────────────────────────────────────────────────────────
@@ -232,11 +238,24 @@ export WATCH_STUB_MASTER=ok
 
 # A19 live 且库卡住:看护仍按时走完两级兜底、写停用标记,告警留在 spool(review r1)。
 wsetup a19; conf "WATCH_ALERT_MODE=live" "WATCH_ALERT_WECOM_KEY=$KEY"
-export PSQL_SLEEP=30 WATCH_ALERT_DB_TIMEOUT_SEC=2 WATCH_ALERT_FLUSH_BUDGET_SEC=3 WATCH_STUB_MASTER=down
+# 告警脚本套一层记录:每次调用都要自己返回(有 end 行)。被看护外层 timeout 杀掉就没有 end 行。
+cat >"$C/alert-shim" <<S
+#!/usr/bin/env bash
+printf 'start %s\n' "\$1" >>"$C/alert-calls"
+bash "$ALERT" "\$@"; rc=\$?
+printf 'end %s rc=%s\n' "\$1" "\$rc" >>"$C/alert-calls"
+exit "\$rc"
+S
+chmod 0755 "$C/alert-shim"; export WATCH_ALERT_BIN="$C/alert-shim"
+export PSQL_SLEEP=$STALL_SEC WATCH_ALERT_DB_TIMEOUT_SEC=2 WATCH_ALERT_FLUSH_BUDGET_SEC=3 WATCH_STUB_MASTER=down
 t0=$SECONDS; tick; e1=$TEC; tick; e2=$TEC; dt=$((SECONDS - t0))
-if [[ "$e2" == 1 && -e "$WATCH_DISARM" && "$dt" -le 25 ]] && grep -q '两级兜底仍红' "$WATCH_LOG" && [[ "$(nfiles "$C/state/alert-spool")" -ge 1 ]] && ! argv_leaked; then
-  ok "A19 blocked alert db cannot stall the watch (${dt}s, disarm written, alerts spooled)"
-else bad "A19 e1=$e1 e2=$e2 dt=${dt}s disarm=$([[ -e "$WATCH_DISARM" ]] && echo y || echo n) spool=$(nfiles "$C/state/alert-spool")"; fi
+starts="$(grep -c '^start ' "$C/alert-calls" 2>/dev/null || true)"
+ends="$(grep -c '^end .* rc=0$' "$C/alert-calls" 2>/dev/null || true)"
+if [[ "$e2" == 1 && -e "$WATCH_DISARM" && "$starts" -ge 2 && "$ends" == "$starts" && "$dt" -lt "$STALL_SEC" ]] \
+  && grep -q '两级兜底仍红' "$WATCH_LOG" && [[ "$(nfiles "$C/state/alert-spool")" -ge 1 ]] && ! argv_leaked; then
+  ok "A19 blocked alert db cannot stall the watch (${dt}s, ${ends}/${starts} alert calls self-bounded, disarm written, alerts spooled)"
+else bad "A19 e1=$e1 e2=$e2 dt=${dt}s calls=${ends}/${starts} disarm=$([[ -e "$WATCH_DISARM" ]] && echo y || echo n) spool=$(nfiles "$C/state/alert-spool")"; fi
+unset WATCH_ALERT_BIN
 unset WATCH_ALERT_DB_TIMEOUT_SEC WATCH_ALERT_FLUSH_BUDGET_SEC; export PSQL_SLEEP=0 WATCH_STUB_MASTER=ok
 
 echo "ALERT_CASES pass=$pass fail=$fail"

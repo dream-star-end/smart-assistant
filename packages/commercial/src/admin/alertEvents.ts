@@ -41,6 +41,8 @@ export const EVENTS = {
   ACCOUNT_POOL_NOT_CONFIGURED: "account_pool.not_configured",
   ACCOUNT_POOL_LOW_CAPACITY: "account_pool.low_capacity",
   ACCOUNT_POOL_TOKEN_REFRESH_FAILED: "account_pool.token_refresh_failed",
+  /** OCV5-424: one service pool (Antigravity, Codex, API keys, …) has members but none can serve. */
+  SERVICE_POOL_ALL_DOWN: "account_pool.service_all_down",
 
   // ── 支付(5 个已 wire)──────────────────────────────────────
   PAYMENT_FIRST_TOPUP: "payment.first_topup",
@@ -111,6 +113,8 @@ export const EVENT_META: EventMeta[] = [
     description: "健康账号数低于阈值", trigger: "polled" },
   { event_type: EVENTS.ACCOUNT_POOL_TOKEN_REFRESH_FAILED, severity: "warning", group: "account_pool",
     description: "账号 OAuth refresh 连续失败 / 被自动降级", trigger: "passive" },
+  { event_type: EVENTS.SERVICE_POOL_ALL_DOWN, severity: "critical", group: "account_pool",
+    description: "某个服务池(订阅账号 / API key)有成员但全部冷却或认证失效,该服务不可用", trigger: "polled" },
 
   // payment
   { event_type: EVENTS.PAYMENT_FIRST_TOPUP, severity: "info", group: "payment",

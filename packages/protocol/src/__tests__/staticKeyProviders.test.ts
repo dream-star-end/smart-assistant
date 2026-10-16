@@ -148,7 +148,7 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
   it('deepseek direct 只放 Pro(Flash 已统一归 OpenCode Go)', () => {
     assert.deepEqual([...getStaticProvider('deepseek').inboundModelIds], ['deepseek-v4-pro'])
   })
-  it('minimax 1 项 / ark 2 项 / scnet 2 项 / opencodego Flash canonical+alias + 2 个历史 Qwen', () => {
+  it('minimax 1 项 / ark 2 项 / scnet 2 项 / opencodego Flash canonical+alias + 2 个历史 Qwen + OCV5-425 -go 模型', () => {
     assert.deepEqual([...getStaticProvider('minimax').inboundModelIds], ['MiniMax-M3'])
     assert.deepEqual([...getStaticProvider('ark').inboundModelIds], ['glm-5.2', 'glm-5.1'])
     assert.deepEqual([...getStaticProvider('zai').inboundModelIds], ['glm-5.3-zai'])
@@ -158,6 +158,36 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'deepseek-v4-flash',
       'qwen3.7-max',
       'qwen3.7-plus',
+      'gemini-4-argon-contributor',
+      'deepseek-v4-pro-go',
+      'claude-haiku-5-5-go',
+      'kimi-k3-go',
+      'minimax-m2.7-go',
+      'minimax-m3-go',
+      'space-bunny-go',
+      'qwen3.8-max-go',
+      'qwen3.8-flash-go',
+      'qwen3.7-plus-go',
+      'glm-5.3-go',
+      'glm-5.2-go',
+      'glm-5.3-flash-go',
+      'kimi-k2.7-code-go',
+      'kimi-k2.6-go',
+      'mimo-v2.6-pro-go',
+      'mimo-v2.5-pro-go',
+      'mimo-v2.6-flash-go',
+      'mimo-v2.5-go',
+      'hy4-preview-go',
+      'hy3-go',
+      'longcat-2.0-go',
+      'longcat-2.5-preview-free-go',
+      'step-5-preview-free-go',
+      'opencode-grok-4.7',
+      'opencode-grok-4.6',
+      'opencode-gpt-6-luna',
+      'opencode-gpt-5.6-luna',
+      'muse-spark-1.3-go',
+      'muse-spark-1.2-go',
     ])
     assert.deepEqual([...getStaticProvider('kimi').inboundModelIds], ['kimi-k2.7-code'])
     assert.deepEqual([...getStaticProvider('ark-k3').inboundModelIds], ['kimi-k3-ark'])
@@ -177,6 +207,36 @@ describe('staticKeyProviders — inboundModelIds(与 route 面故意不同)', ()
       'deepseek-v4-flash',
       'qwen3.7-max',
       'qwen3.7-plus',
+      'gemini-4-argon-contributor',
+      'deepseek-v4-pro-go',
+      'claude-haiku-5-5-go',
+      'kimi-k3-go',
+      'minimax-m2.7-go',
+      'minimax-m3-go',
+      'space-bunny-go',
+      'qwen3.8-max-go',
+      'qwen3.8-flash-go',
+      'qwen3.7-plus-go',
+      'glm-5.3-go',
+      'glm-5.2-go',
+      'glm-5.3-flash-go',
+      'kimi-k2.7-code-go',
+      'kimi-k2.6-go',
+      'mimo-v2.6-pro-go',
+      'mimo-v2.5-pro-go',
+      'mimo-v2.6-flash-go',
+      'mimo-v2.5-go',
+      'hy4-preview-go',
+      'hy3-go',
+      'longcat-2.0-go',
+      'longcat-2.5-preview-free-go',
+      'step-5-preview-free-go',
+      'opencode-grok-4.7',
+      'opencode-grok-4.6',
+      'opencode-gpt-6-luna',
+      'opencode-gpt-5.6-luna',
+      'muse-spark-1.3-go',
+      'muse-spark-1.2-go',
       'kimi-k2.7-code',
       'kimi-k3-ark',
       'kimi-k3',
@@ -518,4 +578,15 @@ describe('staticKeyProviders — snapshot 漂移守护(protocol-owned)', () => {
       )
     }
   })
+})
+
+// Google-only upstream is selected by commercial's trusted transport marker.
+it('Gemini Go is exact, canonical, text-only and does not change the legacy endpoint', () => {
+  const p = getStaticProvider('opencodego')
+  assert.equal(p.matchesRoute('GEMINI-4-ARGON-CONTRIBUTOR'), true)
+  assert.equal(p.matchesRoute('gemini-4-argon'), false)
+  assert.equal(p.canonicalizeForPricing('GEMINI-4-ARGON-CONTRIBUTOR'), 'gemini-4-argon-contributor')
+  assert.equal(p.upstreamModelForRequest?.('GEMINI-4-ARGON-CONTRIBUTOR'), 'gemini-4-argon-contributor')
+  assert.equal(p.supportsVision, false)
+  assert.equal(p.upstreamEndpoint, 'https://opencode.ai/zen/go/v1/messages')
 })

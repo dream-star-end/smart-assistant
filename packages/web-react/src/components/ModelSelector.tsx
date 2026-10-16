@@ -2,6 +2,7 @@ import {
   COLLAPSED_CONTEXT_FAMILY_GROUP_LABEL,
   type ContextTierFamily,
   type CursorContextTier,
+  type ServiceTier,
   type CursorEngineFamilyId,
   DEFAULT_CODEX_ENGINE_MODEL,
   DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME,
@@ -9,6 +10,7 @@ import {
   type PlatformReasoningEffort,
   contextFamilyByModelId,
   cursorFamilySupportsContextTier,
+  fastServiceTierRoute,
   cursorFamilySupportsFast,
 } from '@openclaude/protocol'
 import { AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Loader2, Lock, Users } from 'lucide-react'
@@ -260,6 +262,8 @@ export function ModelSelector({
   onSelectEffort,
   contextTier,
   onSelectContextTier,
+  serviceTier,
+  onSelectServiceTier,
   open,
   onOpenChange,
 }: {
@@ -280,6 +284,12 @@ export function ModelSelector({
    */
   contextTier?: CursorContextTier | null
   onSelectContextTier?: (tier: CursorContextTier) => void
+  /**
+   * OCV5-434 GPT Fast(OpenAI priority),会话级、默认关。只对 OpenCode Go Luna 显示(按 2× 计费);
+   * Codex 路线上游对本客户端不生效,按用户决定隐藏。
+   */
+  serviceTier?: ServiceTier | null
+  onSelectServiceTier?: (tier: ServiceTier | null) => void
   open?: boolean
   onOpenChange?: (open: boolean) => void
 }) {
@@ -403,6 +413,9 @@ export function ModelSelector({
     cursorFamilySupportsContextTier(selectedCursor.family) &&
     onSelectContextTier != null
   const activeCursorContextTier: CursorContextTier = contextTier ?? DEFAULT_CURSOR_CONTEXT_TIER
+  const gptFastRoute = fastServiceTierRoute(selectedId)
+  const showGptFast = gptFastRoute !== null && onSelectServiceTier != null
+  const gptFastOn = serviceTier === 'fast'
   const showPlatformEffort =
     !selectedCursor && Boolean(effortSupported && effortSupported.length > 0 && onSelectEffort)
   const [confirmLongContext, confirmLongContextEl] = useConfirm()
@@ -817,6 +830,35 @@ export function ModelSelector({
               {grokBuildFastSelected(selectedId) && (
                 <Check size={14} className="shrink-0 text-accent" />
               )}
+            </PickerItem>
+          </div>
+        )}
+        {showGptFast && onSelectServiceTier && (
+          <div className={mode === 'menu' ? 'shrink-0' : undefined}>
+            <PickerSeparator mode={mode} />
+            <PickerLabel mode={mode} className="flex items-center justify-between">
+              速度
+              <PickerSectionSummary mode={mode}>{gptFastOn ? 'Fast' : '标准'}</PickerSectionSummary>
+            </PickerLabel>
+            <PickerItem
+              mode={mode}
+              data-gpt-fast="false"
+              onSelect={() => onSelectServiceTier(null)}
+              className="justify-between"
+            >
+              <span>标准</span>
+              {!gptFastOn && <Check size={14} className="shrink-0 text-accent" />}
+            </PickerItem>
+            <PickerItem
+              mode={mode}
+              data-gpt-fast="true"
+              onSelect={() => onSelectServiceTier('fast')}
+              className="justify-between"
+            >
+              <span>
+                Fast（更快，按 2× 计费）
+              </span>
+              {gptFastOn && <Check size={14} className="shrink-0 text-accent" />}
             </PickerItem>
           </div>
         )}

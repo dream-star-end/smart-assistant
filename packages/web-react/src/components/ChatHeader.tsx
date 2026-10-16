@@ -1,4 +1,4 @@
-import type { CursorContextTier } from "@openclaude/protocol";
+import type { CursorContextTier, ServiceTier } from "@openclaude/protocol";
 import {
   Bell,
   ChevronDown,
@@ -56,6 +56,8 @@ export function ChatHeader({
   onSelectEffort,
   contextTier,
   onSelectContextTier,
+  serviceTier,
+  onSelectServiceTier,
   modelPickerOpen,
   onModelPickerOpenChange,
   teamModeActive,
@@ -99,6 +101,9 @@ export function ChatHeader({
   /** Cursor Opus/Fable 上下文档位(300k 默认 / 1M);透传给模型菜单的「上下文」区块。 */
   contextTier?: CursorContextTier | null;
   onSelectContextTier?: (tier: CursorContextTier) => void;
+  /** OCV5-434 GPT Fast(会话级,默认关)。 */
+  serviceTier?: ServiceTier | null;
+  onSelectServiceTier?: (tier: ServiceTier | null) => void;
   modelPickerOpen?: boolean;
   onModelPickerOpenChange?: (v: boolean) => void;
   /**
@@ -359,6 +364,8 @@ export function ChatHeader({
               onSelectEffort={onSelectEffort}
               contextTier={contextTier}
               onSelectContextTier={onSelectContextTier}
+              serviceTier={serviceTier}
+              onSelectServiceTier={onSelectServiceTier}
               open={modelPickerOpen}
               onOpenChange={onModelPickerOpenChange}
             />

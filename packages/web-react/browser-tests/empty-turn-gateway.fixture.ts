@@ -58,6 +58,8 @@ class ExternalCcbRunner extends EventEmitter {
   setModel(model: string | undefined) { this.model = model; }
   setEffortLevel(level: string | undefined) { this.effortLevel = level; }
   setTraceId(_traceId: unknown) {}
+  // OCV5-434: CcbAdapter forwards the session's service tier to its runner on every submit.
+  setServiceTier(_tier: unknown, _model: unknown) { return "unchanged" as const; }
   setGoalState(_goal: unknown) { return false; }
   updateConfig(_config: unknown) {}
   setToolsets(toolsets: string[] | undefined) { this.toolsets = toolsets; }

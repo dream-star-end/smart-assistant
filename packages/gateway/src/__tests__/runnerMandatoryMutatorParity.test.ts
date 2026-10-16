@@ -53,6 +53,7 @@ import '../engine/codexAdapter.js'
 import '../engine/cursorAdapter.js'
 import '../engine/grokAdapter.js'
 import '../engine/zcodeAdapter.js'
+import '../engine/antigravityAdapter.js'
 import type { EngineAdapter } from '../engine/engineAdapter.js'
 import { type EngineCreateOpts, createEngine, registeredEngines } from '../engine/registry.js'
 
@@ -135,6 +136,11 @@ const MUTATOR_PROBES: Record<string, MutatorProbe> = {
     arg: null,
     // zcode 专属:缺失 = master mint 的本地 relay token 路由被静默丢弃。
     requiredOnEngines: ['zcode'],
+  },
+  setAntigravityRoute: {
+    arg: null,
+    // antigravity 专属(OCV5-415):缺失 = master 下发的 Google AI 订阅 relay 路由被静默丢弃。
+    requiredOnEngines: ['antigravity'],
   },
 }
 

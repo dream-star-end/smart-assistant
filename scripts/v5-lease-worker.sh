@@ -4,6 +4,7 @@
 # 每 tick 严格顺序(design-v2 §3.2):
 #   1 单例 flock(双 worker 防线)
 #   2 train 对账:非终态 train 无活 executor → 按 survivor 证据结算 / recovery_required
+#   2b autorecover(OCV5-420):recovery_required / manual-recovery / 看护停用 → 自动恢复,不等人
 #   3 过期:granted 超 ack/heartbeat 且执行器确认退出 → revoked;ride 超 6h → 面板告警(不过期)
 #   4 结算:live committed sha ⊇ want_sha → satisfied(同事务写 outbox)
 #   5 发车:仅剩余 ride、无 open train、锁可取 → 固定 target_sha 起一班 deploy(锁 fd 继承给执行器)
@@ -15,6 +16,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/v5-lease-lib.sh
 source "$SCRIPT_DIR/v5-lease-lib.sh"
+# OCV5-420:recovery_required / manual-recovery / 看护停用不再等人,由 autorecover 接管。
+# shellcheck source=scripts/v5-selfhost-autorecover.sh
+source "$SCRIPT_DIR/v5-selfhost-autorecover.sh"
 
 WORKER_LOCK="${OC_V5_LEASE_WORKER_LOCK:-/run/openclaude-v5-selfhost/lease-worker.lock}"
 WORKER_LOG_DIR="${OC_V5_LEASE_LOG_DIR:-/opt/openclaude/tmp/lease-trains}"
@@ -74,8 +78,8 @@ reconcile_trains() {
     elif live_sha="$(lease_live_committed_sha)"; then
       finish_train "$id" failed "执行器退出;live committed 但 sourceCommit=${live_sha:0:12} ≠ target ${target:0:12}(本班未上线)" "$ev"
     else
-      # survivor 处于未提交 mutation,或 live 不可读 → 需人工
-      finish_train "$id" recovery_required "执行器退出且 survivor 非 committed(uncommitted mutation / 宿主重启丢证据)。禁止自动重发。" "$ev"
+      # survivor 处于未提交 mutation,或 live 不可读 → recovery_required,由 autorecover 接管
+      finish_train "$id" recovery_required "执行器退出且 survivor 非 committed(uncommitted mutation / 宿主重启丢证据)。暂停发车,autorecover 确认现场稳定绿后自动结束并重跑。" "$ev"
       enqueue_train_alert "$id" recovery_required "执行器 pid=${pid:-?} 已退;survivor 证据 $ev"
     fi
   done <<<"$rows"
@@ -205,6 +209,41 @@ settle_rides() {
 }
 
 # ---------- 5 发车 ----------
+# OCV5-439:发版主工作树落后 origin tip 时只做 fast-forward。检出的不是发版分支 / 有未提交改动 /
+# HEAD 不是 tip 的祖先(分叉)/ ff 本身失败 → 不动工作树、不发车,向等待中的 ride 告警(每小时一次)。
+canonical_fast_forward() { # <head> <tip>
+  local head="$1" tip="$2" branch why=""
+  branch="$(git -C "$LEASE_REPO_ROOT" symbolic-ref -q --short HEAD || true)"
+  if [[ "$branch" != "$LEASE_BRANCH" ]]; then
+    why="检出的是 ${branch:-detached HEAD},不是 $LEASE_BRANCH"
+  elif [[ -n "$(git -C "$LEASE_REPO_ROOT" status --porcelain --untracked-files=no)" ]]; then
+    why="工作树有未提交改动"
+  elif ! git -C "$LEASE_REPO_ROOT" merge-base --is-ancestor "$head" "$tip"; then
+    why="HEAD ${head:0:12} 不是 origin tip ${tip:0:12} 的祖先(已分叉)"
+  elif ! git -C "$LEASE_REPO_ROOT" merge -q --ff-only --no-overwrite-ignore "$tip" >/dev/null 2>&1; then
+    # --no-overwrite-ignore:被忽略的本地文件(如 .env)也不许被 tip 里的同名跟踪文件覆盖。
+    why="git merge --ff-only 失败(本地未跟踪/被忽略文件会被覆盖等)"
+  fi
+  if [[ -z "$why" ]]; then
+    wlog "工作树 ${head:0:12} 已快进到 origin tip ${tip:0:12}"
+    return 0
+  fi
+  wlog "工作树 HEAD ${head:0:12} 无法快进到 origin tip ${tip:0:12}: $why;不覆盖、不发车"
+  local id hour tk tt body
+  hour="$(lease_sql "SELECT strftime('%Y%m%d%H','now');")"
+  body="$(lease_body_ff_blocked "$LEASE_REPO_ROOT" "$head" "$tip" "$why")"
+  while read -r id; do
+    [[ -n "$id" ]] || continue
+    IFS=$'\t' read -r tk tt < <(lease_callback_target "$id")
+    lease_tx <<SQL || true
+BEGIN IMMEDIATE;
+$(lease_outbox_sql "lease:$id:ff-blocked:$hour" "$id" alert "$tk" "$tt" "$body")
+COMMIT;
+SQL
+  done < <(lease_sql "SELECT id FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';")
+  return 1
+}
+
 dispatch_train() {
   local pending open tip miss id now logf
   pending="$(lease_sql "SELECT COUNT(*) FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';")"
@@ -241,14 +280,19 @@ dispatch_train() {
     pending="$(lease_sql "SELECT COUNT(*) FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';")"
     [[ "$pending" -gt 0 ]] || { wlog "tip ${tip:0:12} 上一班 $ftid 已 failed 且无新 ride,不发车"; return 0; }
   fi
-  # 宿主工作树 HEAD 必须等于 tip(deploy 脚本认工作树 HEAD;lease 列车只发已 push 的 tip)
-  local head; head="$(git -C "$LEASE_REPO_ROOT" rev-parse HEAD)"
-  [[ "$head" == "$tip" ]] || { wlog "工作树 HEAD ${head:0:12} ≠ origin tip ${tip:0:12};不发车(等 ff-merge/push 对齐)"; return 0; }
-
   # 取 deploy.lock(fd 8,与 deploy 脚本同一把;取到就持有并传给执行器继承)
   mkdir -p "$(dirname "$LEASE_DEPLOY_LOCK")" 2>/dev/null || true
   exec 8>"$LEASE_DEPLOY_LOCK"
   flock -n 8 || { wlog "deploy.lock 被持有,不发车"; exec 8>&-; return 0; }
+
+  # 宿主工作树 HEAD 必须等于 tip(deploy 脚本认工作树 HEAD;lease 列车只发已 push 的 tip)。
+  # OCV5-439:落后时在 deploy.lock 内自动快进;不能快进就告警、不覆盖、不发车。
+  local head; head="$(git -C "$LEASE_REPO_ROOT" rev-parse HEAD)"
+  if [[ "$head" != "$tip" ]]; then
+    canonical_fast_forward "$head" "$tip" || { exec 8>&-; return 0; }
+    head="$(git -C "$LEASE_REPO_ROOT" rev-parse HEAD)"
+  fi
+  [[ "$head" == "$tip" ]] || { wlog "工作树 HEAD ${head:0:12} ≠ origin tip ${tip:0:12};不发车(等 ff-merge/push 对齐)"; exec 8>&-; return 0; }
 
   id="$(lease_new_id tr)"; now="$(lease_now)"
   mkdir -p "$WORKER_LOG_DIR"; logf="$WORKER_LOG_DIR/$id.log"
@@ -489,6 +533,8 @@ main() {
   acquire_singleton
   lease_init_db
   reconcile_trains
+  # 失败只记日志:自动恢复出错不能挡住结算、发车与投递。
+  autorecover_tick || wlog "autorecover tick 异常(下 tick 重试)"
   expire_and_alert
   settle_rides
   dispatch_train

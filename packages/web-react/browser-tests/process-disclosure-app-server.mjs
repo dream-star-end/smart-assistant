@@ -406,6 +406,8 @@ export function startPreviewServer(assetDir, options = {}) {
     try {
       const url = new URL(req.url || "/", "http://127.0.0.1");
       const path = url.pathname;
+      // INC-20261015-TAPE-COMMIT-FINAL-RACE: production REST sync after a tape-commit final took ~1s.
+      if (store.detailDelayUntil > Date.now() && path.startsWith(`/api/sessions/${BOARD_SESSION}`)) await sleep(1500);
       if (path === "/api/media-signed" && url.searchParams.get("t") === "inventory-board") {
         const body = Buffer.from(CSV_BODY, "utf8");
         res.writeHead(200, {
@@ -628,7 +630,8 @@ export function startPreviewServer(assetDir, options = {}) {
         pendingWarningFinals.set(key, { resolve });
         warningFinal = promise;
       }
-      void playTurn(send, store, sessId, clientMessageId, text, nextSeq, warningFinal).catch((error) => {
+      // options.playTurn: perf scripts (ocv5-421/app-perf.mjs) stream their own answer; tests use the story.
+      void (options.playTurn ?? playTurn)(send, store, sessId, clientMessageId, text, nextSeq, warningFinal).catch((error) => {
         send({
           type: "outbound.error",
           sessionKey: sessionKey(sessId),
@@ -1022,6 +1025,41 @@ async function playTurn(send, store, sessId, clientMessageId, text, nextSeq, war
     });
   };
   remember(clientMessageId, "user", text, { status: "replied" });
+
+  if (text.includes("回执竞速")) {
+    // INC-20261015-TAPE-COMMIT-FINAL-RACE (OCV5-424): master broadcasts a synthetic turn_completed
+    // right after the lossless tape commit (HTTP). In production it overtook the same turn's live
+    // tail on the WS path by 0.4-1s; the tail was generated before the commit (older ts) and only
+    // delivered later. Replay that exact order.
+    const answerId = `race-${clientMessageId}`;
+    const head = "今天第一张采购单的编号是 ";
+    const tail = "PO-RACE4242。这是你上一条消息里给出的编号。";
+    const headTs = Date.now();
+    send({ ...base, frameSeq: nextSeq(sessId), ts: headTs, blocks: [{ kind: "text", text: head, messageId: answerId }] });
+    await sleep(300);
+    remember(answerId, "assistant", head + tail, { _clientMessageId: clientMessageId });
+    const start = (bucket.at(-1)?._seq || 0) + 1;
+    bucket.push(...stamp(persisted, start));
+    store.revision += 1;
+    store.clocks[BOARD_SESSION].updatedAt = Date.now();
+    store.detailDelayUntil = Date.now() + 3000;
+    send({
+      type: "outbound.message",
+      channel: "webchat",
+      peer: base.peer,
+      agentId: "main",
+      clientMessageId,
+      blocks: [],
+      isFinal: true,
+      meta: { reconcile: "turn_completed", reconcileSource: "tape_commit", clientMessageId },
+      ts: headTs + 300,
+    });
+    await sleep(500);
+    send({ ...base, frameSeq: nextSeq(sessId), ts: headTs + 1, blocks: [{ kind: "text", text: tail, messageId: answerId }] });
+    await sleep(150);
+    send({ ...base, frameSeq: nextSeq(sessId), ts: Date.now(), blocks: [], isFinal: true });
+    return;
+  }
 
   if (text.includes("抖动复核")) {
     await playReviewTurn(emit, remember, clientMessageId);
