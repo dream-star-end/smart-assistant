@@ -589,7 +589,10 @@ function MessageActions({
             </DropdownMenuItem>
           )}
           {canQuote && (
-            <DropdownMenuItem onSelect={() => cb.onQuote?.(msg)}>
+            <DropdownMenuItem
+              // The quote carries the text this row copies (partial answer / stopped turn's text).
+              onSelect={() => cb.onQuote?.(text !== undefined ? { ...msg, text } : msg)}
+            >
               <Quote size={14} className={MENU_ICON} aria-hidden="true" />
               引用
             </DropdownMenuItem>
