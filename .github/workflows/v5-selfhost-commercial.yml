@@ -1,0 +1,183 @@
+name: V5 selfhost commercial
+
+# OCV5-456 (FINDINGS DEP-15):个人版 PR 此前从不跑 packages/commercial(master 本体)的
+# unit 与 tsc typecheck —— v5-ci.yml 只触发 feat/v5-aurora-rewrite,个人版对 master 的
+# 回归要等同步到商业才暴露。这里在个人版上跑同一套:
+#   · typecheck:npm run typecheck(tsc -b + web-react),2026-10-16 个人版实测 0 错;
+#   · commercial-unit:与 v5-ci.yml 的 commercial-unit job 逐字相同(同一 gate 脚本、
+#     同一 known-failures 基线、同一 admission policy),只拦新增失败。
+
+on:
+  pull_request:
+    branches: [feat/v5-selfhost]
+  push:
+    branches: [feat/v5-selfhost]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v5-selfhost-commercial-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typecheck:
+    name: selfhost-typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+  commercial-unit:
+    name: selfhost-commercial-unit (known-failures diff gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # PG/Redis service 配置照抄 v3 ci.yml(fix/v3-test-gate):
+    # 商业 unit 套件里有 DB 门控测试(REQUIRE_TEST_DB / CI=true 时缺 DB 直接 throw,
+    # 防静默 skip),必须起同款 fixture。
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: openclaude_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d openclaude_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7
+        ports:
+          - 56379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      CI: 'true'
+      REQUIRE_TEST_DB: '1'
+      TEST_DATABASE_URL: postgres://test:test@127.0.0.1:55432/openclaude_test
+      TEST_REDIS_URL: redis://127.0.0.1:56379/0
+      COMMERCIAL_UNIT_TAP: commercial-unit.tap
+      # 挂死止损预算必须都小于 timeout-minutes(30):否则 GitHub 先 cancel,TAP 产物
+      # 和 JS 栈全丢(2026-09-06 #557 两轮各盲等 30 min)。
+      # - OC_TEST_MUTEX_TIMEOUT:test-mutex 的执行总预算(默认 3600 > 1800,在 CI 形同没有)
+      # - COMMERCIAL_UNIT_IDLE_TIMEOUT:gate 的 TAP 零增长看门狗(基线单套件最长 ~36s)
+      OC_TEST_MUTEX_TIMEOUT: '1500'
+      COMMERCIAL_UNIT_IDLE_TIMEOUT: '240'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Same proof runtimes as commercial (443398e7c): the gate rejects any skip in CI,
+      # and oc-docx / sealed-image proofs must run, not skip.
+      - name: Install isolated proof runtimes
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends redis-server python3-docx python3-pil pandoc
+          redis-server --version
+          /usr/bin/python3 -c 'import docx, PIL; print("python-docx", docx.__version__, "Pillow", PIL.__version__)'
+          pandoc --version
+          dpkg-query -W redis-server python3-docx python3-pil pandoc
+
+      - name: Wait for test fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in {1..30}; do
+            if docker exec '${{ job.services.postgres.id }}' pg_isready -U test -d openclaude_test; then
+              break
+            fi
+            if [[ "$i" == 30 ]]; then
+              echo 'Postgres did not become ready in time' >&2
+              exit 1
+            fi
+            sleep 2
+          done
+          for i in {1..30}; do
+            if docker exec '${{ job.services.redis.id }}' redis-cli ping; then
+              break
+            fi
+            if [[ "$i" == 30 ]]; then
+              echo 'Redis did not become ready in time' >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Run commercial unit tests (baseline diff gate)
+        env:
+          TAP_OUT: ${{ env.COMMERCIAL_UNIT_TAP }}
+        # v5 master 生产 unit 以 User=root 运行;provision 契约会创建并 chown
+        # /run/ccb-ssh/u<uid>。GitHub runner 普通用户无法验证这条真实权限路径,
+        # 会稳定 EACCES。托管 runner 本身支持 passwordless sudo,这里只透传门禁必需 env。
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "CI=$CI" \
+            "REQUIRE_TEST_DB=$REQUIRE_TEST_DB" \
+            "TEST_DATABASE_URL=$TEST_DATABASE_URL" \
+            "TEST_REDIS_URL=$TEST_REDIS_URL" \
+            "TAP_OUT=$TAP_OUT" \
+            "OC_TEST_MUTEX_TIMEOUT=$OC_TEST_MUTEX_TIMEOUT" \
+            "COMMERCIAL_UNIT_IDLE_TIMEOUT=$COMMERCIAL_UNIT_IDLE_TIMEOUT" \
+            npm run test:commercial:unit:gate
+
+      - name: Explain missing TAP
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          tap="${COMMERCIAL_UNIT_TAP:-commercial-unit.tap}"
+          if [[ ! -s "$tap" ]]; then
+            echo "::error::commercial-unit.tap was not produced. The known-failures gate did not run. Diagnose the first failed step (usually npm ci or Wait for test fixtures), not TAP parsing. 2026-09-05 run 33948677980 attempt 1 was npm ci ECONNRESET downloading onnxruntime, then this upload step masked it as missing TAP."
+          else
+            echo "TAP present: $tap ($(wc -c < "$tap") bytes)"
+          fi
+
+      - name: Upload TAP output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: commercial-unit-tap
+          path: ${{ env.COMMERCIAL_UNIT_TAP }}
+          # error (check:ci-parity contract): missing TAP must keep the job red.
+          # The "Explain missing TAP" step above already surfaces the real cause
+          # (e.g. npm ci ECONNRESET in run 33948677980 attempt 1) before this fails.
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: known-failures admission policy
+        if: always()
+        run: node .github/scripts/check-known-failures-policy.mjs

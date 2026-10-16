@@ -456,6 +456,30 @@
     "handler": "handleAdminCursorSessionCancel"
   },
   {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/antigravity-accounts/auth/start",
+    "handler": "handleAdminAntigravityAuthStart"
+  },
+  {
+    "method": "POST",
+    "pathKind": "path",
+    "pathValue": "/api/admin/antigravity-accounts/auth/complete",
+    "handler": "handleAdminAntigravityAuthComplete"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/antigravity-accounts",
+    "handler": "handleAdminAntigravityAccountsList"
+  },
+  {
+    "method": "PATCH",
+    "pathKind": "pathPrefix",
+    "pathValue": "/api/admin/antigravity-accounts/",
+    "handler": "handleAdminAntigravityAccountPatch"
+  },
+  {
     "method": "GET",
     "pathKind": "path",
     "pathValue": "/api/admin/box-claude-profiles",

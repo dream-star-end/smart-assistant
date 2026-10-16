@@ -192,7 +192,12 @@ function hasPythonDocx(): boolean {
   }
 }
 
-describe('oc-docx check', { skip: !hasPythonDocx() }, () => {
+const pythonDocxAvailable = hasPythonDocx()
+if (process.env.CI === 'true' && !pythonDocxAvailable) {
+  throw new Error('oc-docx proof runtime missing python-docx; CI must install document fixtures, not skip them')
+}
+
+describe('oc-docx check', { skip: !pythonDocxAvailable }, () => {
   test('OC_DOCXCHECK=off: check equals inspect (no VERDICT line, empty content is warning)', async () => {
     const work = mkdtempSync(join(tmpdir(), 'oc-docx-check-off-'))
     try {
