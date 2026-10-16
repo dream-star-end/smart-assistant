@@ -88,8 +88,10 @@ async function run(mode, cost = "live") {
 const T = { timeout: 60_000 };
 test("healthy backend: two turns in one session recall the code", T, async () => {
   const { result, logs, probe } = await run("remember");
-  assert.deepEqual(result, { executed: true });
+  assert.equal(result.executed, true);
   assert.equal(probe.sent.length, 2);
+  // OCV5-460: the smoke checks each executed turn's tool calls, so both sent frames come back.
+  assert.deepEqual(result.sent, probe.sent);
   assert.match(logs.join("\n"), /# continuation model=m turns=2 same_session=ok recall=ok/);
 });
 test("backend that loses context fails the gate", T, async () => {
