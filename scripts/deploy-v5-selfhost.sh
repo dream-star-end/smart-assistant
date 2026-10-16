@@ -2111,6 +2111,14 @@ cmd_smoke() {
   log "✓ smoke 通过"
 }
 
+# One state word per unit. `systemctl is-active` prints "inactive"/"failed" AND exits
+# non-zero, so `$(systemctl is-active X || echo n/a)` printed two lines (OCV5-449).
+status_unit_state() { # <unit> [fallback]
+  local s
+  s="$(systemctl is-active "$1" 2>/dev/null)" || true
+  printf '%s' "${s:-${2:-n/a}}"
+}
+
 cmd_status() {
   local live_now prev_now
   log "══ selfhost status ══"
@@ -2136,29 +2144,35 @@ cmd_status() {
     log "  OC_PLATFORM_BUNDLE=$(oc_hotcfg_env_get "$V5_ENV" OC_PLATFORM_BUNDLE)"
     log "  OC_CONTROL_PLANE_LEADER=$(oc_hotcfg_env_get "$V5_ENV" OC_CONTROL_PLANE_LEADER)"
   fi
-  log "  unit master:  $(systemctl is-active "$V5_UNIT" 2>/dev/null || echo n/a)"
-  log "  unit egress:  legacy=$(systemctl is-active "$V5_EGRESS_UNIT" 2>/dev/null || echo n/a) slotA=$(systemctl is-active "$(egress_slot_unit A service)" 2>/dev/null || echo n/a) slotB=$(systemctl is-active "$(egress_slot_unit B service)" 2>/dev/null || echo n/a) serving=$(egress_describe_topology) tcp_migrate_req=$(sysctl -n net.ipv4.tcp_migrate_req 2>/dev/null || echo n/a)"
-  log "  unit hostnet: $(systemctl is-active "$V5_HOSTNET_UNIT" 2>/dev/null || echo n/a)"
-  log "  unit ccb-proxy: $(systemctl is-active "$V5_CCB_PROXY_UNIT" 2>/dev/null || echo n/a)"
-  log "  unit sshgate: $(systemctl is-active "$V5_SSHGATE_UNIT" 2>/dev/null || echo n/a)"
+  log "  unit master:  $(status_unit_state "$V5_UNIT" n/a)"
+  log "  unit egress:  legacy=$(status_unit_state "$V5_EGRESS_UNIT" n/a) slotA=$(status_unit_state "$(egress_slot_unit A service)" n/a) slotB=$(status_unit_state "$(egress_slot_unit B service)" n/a) serving=$(egress_describe_topology) tcp_migrate_req=$(sysctl -n net.ipv4.tcp_migrate_req 2>/dev/null || echo n/a)"
+  log "  unit hostnet: $(status_unit_state "$V5_HOSTNET_UNIT" n/a)"
+  log "  unit ccb-proxy: $(status_unit_state "$V5_CCB_PROXY_UNIT" n/a)"
+  log "  unit sshgate: $(status_unit_state "$V5_SSHGATE_UNIT" n/a)"
   # tunnel 是公网入口,不随部署自动 enable —— 由人显式决定是否对外暴露。
-  log "  unit tunnel:  $(systemctl is-active "$V5_TUNNEL_UNIT" 2>/dev/null || echo inactive) (enable 后跑 scripts/selfhost-sync-tunnel-url.sh --apply)"
-  if [[ -f "$REPO_ROOT/packages/web-react/dist/index.html" ]]; then
-    log "  spa dist:    present"
+  log "  unit tunnel:  $(status_unit_state "$V5_TUNNEL_UNIT" inactive) (enable 后跑 scripts/selfhost-sync-tunnel-url.sh --apply)"
+  # What is served is the live release, not this worktree (OCV5-449).
+  if [[ -n "${live_now:-}" && -d "$live_now" ]]; then
+    if [[ -f "$live_now/packages/web-react/dist/index.html" ]]; then
+      log "  spa dist:    present (live)"
+    else
+      log "  spa dist:    MISSING (live $live_now)"
+    fi
+    if [[ -f "$live_now/.complete" ]]; then
+      log "  .complete:   present (live) $(jq -er '.sourceCommit' "$live_now/.complete" 2>/dev/null || echo '?')"
+    else
+      log "  .complete:   MISSING (live $live_now)"
+    fi
   else
-    log "  spa dist:    MISSING"
-  fi
-  if [[ -f "$REPO_ROOT/.complete" ]]; then
-    log "  .complete:   present $(jq -er '.sourceCommit' "$REPO_ROOT/.complete" 2>/dev/null || echo '?')"
-  else
-    log "  .complete:   MISSING"
+    log "  spa dist:    n/a (no live release)"
+    log "  .complete:   n/a (no live release)"
   fi
   log "  watch:       $(watch_summary "${live_now:-}")"
   log "  gate-fail:   policy=$(gate_fail_policy 2>/dev/null) survivor-phase=$(sed -n 's/^phase=//p' "${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" 2>/dev/null | head -n1 || true) maint=$(sed -n 's/^until=//p' "$V5_WATCH_MAINT" 2>/dev/null | head -n1 || true)"
   if [[ -f "$V5_ENV" ]]; then
     log "  OC_SESSIONS_STORE=$(oc_hotcfg_env_get "$V5_ENV" OC_SESSIONS_STORE)"
   fi
-  log "  personal:     $(systemctl is-active "$PERSONAL_UNIT" 2>/dev/null || echo n/a)"
+  log "  personal:     $(status_unit_state "$PERSONAL_UNIT" n/a)"
   if docker network inspect openclaude-v5-net >/dev/null 2>&1; then
     log "  net: openclaude-v5-net 存在"
   else
