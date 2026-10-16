@@ -130,7 +130,7 @@ export async function settleAntigravityTurn(args: {
     pricing,
     terminalCode: args.terminalCode ?? null,
   })
-  return settleUsageAndLedger(args.pool, {
+  const settled = await settleUsageAndLedger(args.pool, {
     userId: args.userId,
     accountId: null,
     requestId: args.requestId,
@@ -141,6 +141,88 @@ export async function settleAntigravityTurn(args: {
     status: plan.settleStatus,
     sessionId: args.sessionId,
   })
+  // A call that recorded its row between the sum above and this write would
+  // otherwise be missed: its relay refresh found no usage row to update yet.
+  if (args.engineStatus !== 'success') {
+    await refreshWaivedAntigravityUsage({
+      pool: args.pool,
+      pricing: args.pricing,
+      requestId: args.requestId,
+      userId: args.userId,
+    }).catch(() => {})
+  }
+  return settled
+}
+
+/**
+ * A Stop ends the turn while a call is still streaming: the CLI drops the
+ * relay socket, the relay keeps reading Google to the end and records the
+ * call's row after the turn already settled (OCV5-451). Such a turn is waived,
+ * so nothing is charged, but its usage row and `wouldHaveCharged` must still
+ * cover every call. Recomputes the waived row from the full relay sum under a
+ * row lock; idempotent, and a no-op for charged or still-running turns.
+ * Returns true when the row changed.
+ */
+export async function refreshWaivedAntigravityUsage(args: {
+  pool: Pool
+  pricing: Pick<PricingCache, 'get'>
+  requestId: string
+  userId: bigint
+}): Promise<boolean> {
+  const client = await args.pool.connect()
+  try {
+    await client.query('BEGIN')
+    const cur = await client.query<{
+      id: string
+      model: string
+      snapshot: Record<string, unknown>
+    }>(
+      `SELECT id::text AS id, model, price_snapshot AS snapshot FROM usage_records
+        WHERE user_id = $1 AND request_id = $2 AND cost_credits = 0 AND ledger_id IS NULL
+          AND status = 'error' AND price_snapshot ? 'antigravity_status'
+          AND price_snapshot->>'antigravity_status' <> 'success'
+        FOR UPDATE`,
+      [args.userId.toString(), args.requestId],
+    )
+    const row = cur.rows[0]
+    const pricing = row ? args.pricing.get(row.model) : null
+    if (!row || pricing === null) {
+      await client.query('ROLLBACK')
+      return false
+    }
+    const totals = await sumAntigravityRelayUsage(client, args.requestId, args.userId)
+    if (totals.calls === Number(row.snapshot.antigravity_calls)) {
+      await client.query('ROLLBACK')
+      return false
+    }
+    const terminalCode = row.snapshot.antigravity_terminal_code
+    const plan = planAntigravitySettle({
+      engineStatus: row.snapshot.antigravity_status as AntigravityEngineStatus,
+      totals,
+      pricing,
+      terminalCode: typeof terminalCode === 'string' ? terminalCode : null,
+    })
+    await client.query(
+      `UPDATE usage_records SET input_tokens = $2, output_tokens = $3, cache_read_tokens = $4,
+              cache_write_tokens = $5, price_snapshot = $6::jsonb
+        WHERE id = $1 AND cost_credits = 0`,
+      [
+        row.id,
+        plan.usage.input_tokens.toString(),
+        plan.usage.output_tokens.toString(),
+        plan.usage.cache_read_tokens.toString(),
+        plan.usage.cache_write_tokens.toString(),
+        plan.snapshotJson,
+      ],
+    )
+    await client.query('COMMIT')
+    return true
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw err
+  } finally {
+    client.release()
+  }
 }
 
 // ─── Durable turn record (Codex r1 P1) ──────────────────────────────────────
