@@ -283,7 +283,7 @@ describe('服务端强制规则在 MCP 侧同样生效', () => {
     assert.match(text, /task_get/)
   })
 
-  it('task_update 传入 status=done 不得写入 PATCH body(done 不属于 AI)', async () => {
+  it('task_update 传入 status=done 不得写入 PATCH body(关单须走独立审计接口)', async () => {
     const { fetchImpl, calls } = jsonFetch(() => ({
       status: 200,
       body: { ok: true, ticket: SAMPLE_TICKET },
@@ -305,7 +305,7 @@ describe('服务端强制规则在 MCP 侧同样生效', () => {
     assert.equal(calls[0]!.url.includes('/done'), false)
   })
 
-  it('MCP 无 task_done 入口,update 不打 /done(403 由 HTTP 状态机锁)', () => {
+  it('MCP 无 task_done 入口,update 不打 /done(已支持环境另走正式 CLI)', () => {
     const names = TOOLS.map((t) => t.name)
     assert.equal(names.includes('task_done'), false)
     const update = TOOLS.find((t) => t.name === 'task_update')
@@ -317,6 +317,17 @@ describe('服务端强制规则在 MCP 侧同样生效', () => {
 })
 
 describe('toolNames.ts ↔ toolDefs.ts 的 task_* 锁步', () => {
+  it('投卡工具说明区分人工卡片与授权 Agent 的正式审计关单', () => {
+    const tool = TOOLS.find((t) => t.name === 'present_task_approval')
+    assert.ok(tool)
+    assert.match(tool.description, /本工具只投卡,不代点/)
+    assert.match(tool.description, /用户明确授权且当前环境正式接口已支持/)
+    assert.match(tool.description, /oc-task ticket done/)
+    assert.match(tool.description, /reason.*evidence.*写入审计/)
+    assert.match(tool.description, /取消与重开仍由人/)
+    assert.doesNotMatch(tool.description, /done.*不属于 AI/)
+  })
+
   it('两边的 task_* 集合一致(顺序即 TOOLS 声明顺序)', () => {
     const fromDefs = TOOLS.map((t) => t.name).filter((n) => n.startsWith('task_'))
     const fromNames = MEMORY_MCP_TOOL_NAMES.filter((n) => n.startsWith('task_'))

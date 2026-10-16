@@ -51,6 +51,13 @@ WATCH_REARM_INTERVAL_SEC="${WATCH_REARM_INTERVAL_SEC:-5}"
 # OCV5-410:告警脚本。显式 WATCH_ALERT_BIN,或安装目录里有可执行 alert.sh 才调用;
 # 仓库里跑的看护测试没有 alert.sh,不会去写宿主状态目录。
 WATCH_ALERT_BIN="${WATCH_ALERT_BIN:-}"
+# OCV5-444:宿主卫生检查(根盘剩余空间、PG 备份新鲜度)。只告警,不改健康判定、失败计数或退出码。
+WATCH_DISK_PATH="${WATCH_DISK_PATH:-/}"
+WATCH_DISK_WARN_GIB="${WATCH_DISK_WARN_GIB:-15}"
+WATCH_DISK_CRIT_GIB="${WATCH_DISK_CRIT_GIB:-10}"
+WATCH_PG_BACKUP_STATUS="${WATCH_PG_BACKUP_STATUS:-/var/lib/openclaude-v5-selfhost/pg-backup-status.json}"
+WATCH_PG_BACKUP_MAX_AGE_SEC="${WATCH_PG_BACKUP_MAX_AGE_SEC:-129600}"
+WATCH_STUB_DISK_AVAIL_BYTES="${WATCH_STUB_DISK_AVAIL_BYTES:-}"
 
 wlog() {
   local msg
@@ -1212,6 +1219,93 @@ watch_selftest() {
   return 0
 }
 
+# ── 宿主卫生(OCV5-444)────────────────────────────────────────────────────────
+# 2026-10-16 v5-dev 根盘 93%,运行期没有任何磁盘告警,10-06~16 有 5 趟列车死于 8 GiB 磁盘门;
+# OCV5-443 的 PG 备份也需要“多久没成功”的监控。这里每拍只读检查并按“级别变化或冷却到期”告警。
+# 永远 best-effort:不写失败计数、不碰标记、不影响 watch_once 的判定与退出码。
+host_notify() { # <key> <ok|warning|critical|stale> <severity> <event> <message>
+  local key="$1" level="$2" sev="$3" event="$4" msg="$5"
+  local path last_level last_at now cooldown tmp
+  path="${WATCH_RUN_DIR}/watch-host-${key}"
+  now="$(watch_now)"
+  cooldown="${WATCH_NOTIFY_COOLDOWN_SEC:-21600}"
+  [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=21600
+  mkdir -p -- "$WATCH_RUN_DIR" || return 0
+  last_level="$(parse_kv_file "$path" level || true)"
+  last_at="$(parse_kv_file "$path" notified_at || true)"
+  if [[ "$level" == ok ]]; then
+    [[ "$last_level" == ok ]] && return 0
+    if [[ -n "$last_level" ]]; then
+      wlog "host ${key} 恢复 ok(之前 ${last_level}) ${msg}" || true
+      watch_alert info "${event}_recovered" "$msg"
+    fi
+  else
+    if [[ "$level" == "$last_level" && "$last_at" =~ ^[0-9]+$ ]] && (( now - last_at < cooldown )); then
+      return 0
+    fi
+    wlog "host ${key} level=${level} ${msg}" || true
+    watch_alert "$sev" "$event" "$msg"
+  fi
+  tmp="$(mktemp "${WATCH_RUN_DIR}/.watch-host-${key}.XXXXXX")" || return 0
+  if printf 'level=%s\nnotified_at=%s\n' "$level" "$now" >"$tmp" && mv -T -- "$tmp" "$path"; then
+    return 0
+  fi
+  rm -f -- "$tmp"
+  return 0
+}
+
+host_disk_avail_bytes() {
+  if [[ -n "$WATCH_STUB_DISK_AVAIL_BYTES" ]]; then
+    printf '%s\n' "$WATCH_STUB_DISK_AVAIL_BYTES"
+  else
+    df -PB1 -- "$WATCH_DISK_PATH" 2>/dev/null | awk 'NR==2 {print $4}'
+  fi
+}
+
+# 输出:空 = 备份未安装(无状态文件,不检查);never = 装了但从未成功;否则距上次成功的秒数。
+host_backup_age() {
+  local f="$WATCH_PG_BACKUP_STATUS" at epoch
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+  at="$(jq -r '.core.lastOkAt // empty' "$f" 2>/dev/null || true)"
+  epoch=""
+  [[ -n "$at" ]] && epoch="$(date -u -d "$at" +%s 2>/dev/null || true)"
+  if [[ "$epoch" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$(( $(watch_now) - epoch ))"
+  else
+    printf 'never\n'
+  fi
+}
+
+host_checks() {
+  local gib=1073741824 avail level sev age desc
+  avail="$(host_disk_avail_bytes || true)"
+  if [[ "$avail" =~ ^[0-9]+$ ]]; then
+    level=ok
+    sev=info
+    if (( avail < WATCH_DISK_CRIT_GIB * gib )); then
+      level=critical
+      sev=critical
+    elif (( avail < WATCH_DISK_WARN_GIB * gib )); then
+      level=warning
+      sev=warning
+    fi
+    host_notify disk "$level" "$sev" disk_low "根盘 ${WATCH_DISK_PATH} 剩余 $(( avail / gib )) GiB（warning <${WATCH_DISK_WARN_GIB}、critical <${WATCH_DISK_CRIT_GIB} GiB；发布门要 8 GiB）。下一步：du -xsh /opt/openclaude/tmp /var/lib/docker/volumes/* /var/backups/* 找增长源；只清自己建的 worktree 与临时文件。"
+  fi
+  age="$(host_backup_age || true)"
+  if [[ -n "$age" ]]; then
+    level=ok
+    if [[ "$age" == never ]]; then
+      level=stale
+      desc="从未成功"
+    else
+      desc="$(( age / 3600 )) 小时前"
+      (( age > WATCH_PG_BACKUP_MAX_AGE_SEC )) && level=stale
+    fi
+    host_notify pg_backup "$level" warning pg_backup_stale "个人版 PG 备份 core 层最近成功：${desc}（上限 $(( WATCH_PG_BACKUP_MAX_AGE_SEC / 3600 )) 小时）。下一步：/opt/openclaude/openclaude-v5-selfhost-live/scripts/v5-selfhost-pg-backup.sh status；journalctl -u openclaude-v5-selfhost-pg-backup.service。"
+  fi
+  return 0
+}
+
 usage_watch() {
   cat <<'EOF'
 用法: watch.sh [--once|--selftest|--rearm|--auto-recover [--probe-only]]
@@ -1235,7 +1329,7 @@ main() {
     --selftest) watch_selftest ;;
     # 本拍(含 set -e 中断)结束时投递已入队告警;保留原退出码。不用 `|| rc=$?`,
     # 那会让 watch_once 内部的 set -e 全部失效。
-    --once|"") trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; watch_once ;;
+    --once|"") trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; host_checks || true; watch_once ;;
     --rearm) trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; watch_rearm ;;
     --auto-recover) trap 'watch_exit_rc=$?; watch_alert_flush; exit "$watch_exit_rc"' EXIT; watch_auto_recover "${2:-}" ;;
     *)

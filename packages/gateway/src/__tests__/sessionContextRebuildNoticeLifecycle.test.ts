@@ -58,7 +58,9 @@ const agent = { id: 'main', model: 'gpt-5.6-sol' } as any
 after(async () => {
   for (const sm of managers) await sm.shutdownAll()
   await closeSessionsDb()
-  await rm(testHome, { recursive: true, force: true })
+  // A runner child can still flush under agents/_platform for a moment after
+  // shutdownAll (CI: ENOTEMPTY, OCV5-448); rm retries ENOTEMPTY natively.
+  await rm(testHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
 })
 
 test('switching an untouched Codex prewarm with a native thread id to Cursor creates no rebuild notice', async () => {
