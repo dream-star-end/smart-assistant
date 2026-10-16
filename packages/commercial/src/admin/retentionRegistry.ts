@@ -246,6 +246,18 @@ export const DURABLE_TABLES: readonly string[] = [
   "content_review_account_bans",
   "content_review_appeals",
   "content_review_strikes",
+  // OCV5-424 / OCV5-415 migrations 0306–0308 (retention settled in the 2026-10-16 commercial
+  // sync review, OCV5-445). Admin-managed pool members (pool_api_keys: env rows replaced by
+  // fingerprint, admin rows edited/disabled on the 服务池 page; gemini_oauth_accounts:
+  // Antigravity Google accounts), one affinity row per (service, user) overwritten on rebind
+  // (expires_at is a logical expiry, not a sweep), and the Antigravity billing evidence
+  // (per-call relay usage + per-turn admission record, read by settlement and kept like
+  // cursor_external_usage_audit). No time-based DELETE.
+  "pool_api_keys",
+  "gemini_oauth_accounts",
+  "pool_user_affinity",
+  "antigravity_relay_usage",
+  "antigravity_turns",
 ] as const;
 
 /**
