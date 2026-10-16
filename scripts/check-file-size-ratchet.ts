@@ -214,8 +214,11 @@ function main(argv: string[]): number {
   }
   let names: string[]
   try {
-    names = git(root, ['diff', '--name-only', '--diff-filter=AMR', `${base}...${head}`])
-      .split('\n')
+    // -z: NUL-separated, unquoted paths. Without it git quotes and escapes
+    // non-ASCII names, the quoted name fails the extension filter, and the
+    // file skips the check.
+    names = git(root, ['diff', '-z', '--name-only', '--diff-filter=AMR', `${base}...${head}`])
+      .split('\0')
       .filter(Boolean)
   } catch (err) {
     console.error(`git diff ${base}...${head} failed: ${(err as Error).message}`)
@@ -269,7 +272,7 @@ function main(argv: string[]): number {
     const b = headBaseline.files[c.path] as number
     console.log(`  ${c.path}: ${c.head} lines (baseline ${b}, cap ${b + headBaseline.slack})`)
     if (c.head < b)
-      console.log(`    shrank below its baseline: run --update-baseline in this PR to lock it in`)
+      console.log('    shrank below its baseline: run --update-baseline in this PR to lock it in')
   }
   return violations.length + problemErrors > 0 ? 1 : 0
 }

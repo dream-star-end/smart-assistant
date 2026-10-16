@@ -228,6 +228,14 @@ describe('CLI against a temp git repo', () => {
     assert.match(r.out, /::warning file=\.github\/file-size-ratchet-exceptions\.json::.*expired/)
   })
 
+  test('non-ASCII file names are checked too (git diff -z)', () => {
+    write('src/模块.ts', lines(3001))
+    commit()
+    const r = cli('--base', 'base')
+    assert.equal(r.status, 1, r.out)
+    assert.match(r.out, /src\/模块\.ts/)
+  })
+
   test('a bad base ref is a usage error', () => {
     assert.equal(cli('--base', 'nope').status, 2)
   })
