@@ -656,6 +656,67 @@ describe('runTurn — interrupt() before the turn has an id (OCV5-435)', () => {
     await h.cleanup()
   })
 
+  // OCV5-442: the gateway escalates a Stop that got no result within its grace
+  // to runner.shutdown(), which rejects the still-pending start. That failure
+  // is the user's Stop, not a CODEX_ERROR (release gate S1 saw upstream_failed).
+  it('Stop while starting, then shutdown rejects the start → USER_CANCELLED, not CODEX_ERROR', async () => {
+    const h = await makeRetryHarness()
+    let failSpawn!: (err: Error) => void
+    const spawnGate = new Promise<void>((_resolve, reject) => { failSpawn = reject })
+    h.r.ensureSpawned = async () => { await spawnGate }
+    const methods: string[] = []
+    h.r.sendRequest = async (method: string) => { methods.push(method); return {} }
+    h.r.processing = true
+    const runPromise = h.r.runTurn('hi', 'req-prestart-shutdown')
+    assert.equal(h.runner.interrupt(), true)
+    failSpawn(new Error('CodexAppServerRunner shutdown'))
+    await runPromise
+    assert.ok(!methods.includes('turn/start'), 'the stopped turn never starts')
+    const res = results(h.messages)
+    assert.equal(res.length, 1)
+    assert.equal(res[0].billing_terminal_code, 'USER_CANCELLED')
+    assert.equal(res[0].stop_reason, 'interrupted')
+    assert.equal(h.r.pendingStartInterrupt, false)
+    await h.cleanup()
+  })
+
+  it('Stop while turn/start is in flight, then shutdown rejects it → USER_CANCELLED', async () => {
+    const h = await makeRetryHarness()
+    let failStart!: (err: Error) => void
+    const methods: string[] = []
+    h.r.sendRequest = (method: string) => {
+      methods.push(method)
+      if (method !== 'turn/start') return Promise.resolve({})
+      return new Promise((_resolve, reject) => { failStart = reject })
+    }
+    h.r.processing = true
+    h.r.threadId = 'thr-shutdown'
+    const runPromise = h.r.runTurn('hi', 'req-inflight-shutdown')
+    await waitFor(() => methods.includes('turn/start'))
+    assert.equal(h.runner.interrupt(), true)
+    failStart(new Error('CodexAppServerRunner shutdown'))
+    await runPromise
+    const res = results(h.messages)
+    assert.equal(res.length, 1)
+    assert.equal(res[0].billing_terminal_code, 'USER_CANCELLED')
+    assert.equal(res[0].stop_reason, 'interrupted')
+    assert.equal(h.r.pendingStartInterrupt, false)
+    await h.cleanup()
+  })
+
+  it('the same start failure without a Stop stays a CODEX_ERROR', async () => {
+    const h = await makeRetryHarness()
+    h.r.ensureSpawned = async () => { throw new Error('CodexAppServerRunner shutdown') }
+    h.r.processing = true
+    await h.r.runTurn('hi', 'req-no-stop')
+    const res = results(h.messages)
+    assert.equal(res.length, 1)
+    assert.equal(res[0].billing_terminal_code, 'CODEX_ERROR')
+    assert.equal(res[0].stop_reason, undefined)
+    assert.match(res[0].result, /CodexAppServerRunner shutdown/)
+    await h.cleanup()
+  })
+
   it('without a queued or running turn interrupt() still reports nothing to stop', async () => {
     const h = await makeRetryHarness()
     assert.equal(h.runner.interrupt(), false)

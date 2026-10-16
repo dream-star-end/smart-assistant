@@ -7072,7 +7072,8 @@
       "rootFixCommit": "b2d263c9",
       "coverageCommits": [
         "44e04ac6",
-        "693212d9"
+        "693212d9",
+        "74b6c0c2"
       ],
       "regressions": [
         {
@@ -7104,6 +7105,11 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/codexTurnRetry.test.ts",
           "assertion": "interrupt while the app-server is still starting → no turn/start, USER_CANCELLED"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexTurnRetry.test.ts",
+          "assertion": "Stop while starting, then shutdown rejects the start → USER_CANCELLED, not CODEX_ERROR"
         },
         {
           "layer": "deploy-gate",
