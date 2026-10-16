@@ -100,6 +100,17 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Same proof runtimes as commercial (443398e7c): the gate rejects any skip in CI,
+      # and oc-docx / sealed-image proofs must run, not skip.
+      - name: Install isolated proof runtimes
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends redis-server python3-docx python3-pil pandoc
+          redis-server --version
+          /usr/bin/python3 -c 'import docx, PIL; print("python-docx", docx.__version__, "Pillow", PIL.__version__)'
+          pandoc --version
+          dpkg-query -W redis-server python3-docx python3-pil pandoc
+
       - name: Wait for test fixtures
         shell: bash
         run: |
