@@ -104,6 +104,19 @@ describe('v5-selfhost-migration-precheck.sh', () => {
     )
   })
 
+  test('a base with no merge base fails closed (exit 2), never "no changes"', () => {
+    migration('0002_add', 'ALTER TABLE a ADD COLUMN b int;')
+    git('add', '-A')
+    git('commit', '-qm', 'unregistered')
+    git('checkout', '-q', '--orphan', 'other')
+    git('commit', '-qm', 'unrelated root', '--allow-empty')
+    const orphan = git('rev-parse', 'HEAD')
+    git('checkout', '-q', 'main')
+    const r = precheck(orphan)
+    assert.equal(r.status, 2, r.out)
+    assert.doesNotMatch(r.out, /no migration changes/)
+  })
+
   test('usage errors exit 2', () => {
     assert.equal(precheck('no-such-ref').status, 2)
     const r = spawnSync('bash', [path.join(repo, 'scripts/v5-selfhost-migration-precheck.sh')], {

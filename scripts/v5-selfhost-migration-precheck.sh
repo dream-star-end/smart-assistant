@@ -27,7 +27,14 @@ done
 git -C "$REPO_ROOT" rev-parse --verify -q "$base^{commit}" >/dev/null || { echo "base not a commit: $base" >&2; exit 2; }
 
 meta="$REPO_ROOT/deploy/v5/release-metadata.json"
-mapfile -t files < <(git -C "$REPO_ROOT" diff --name-only --diff-filter=AMR "$base"...HEAD -- 'packages/commercial/src/db/migrations/*.sql')
+# Not a process substitution: its exit status would be lost and a failing diff
+# (no merge base, shallow clone) would read as "no migration changes".
+if ! changed="$(git -C "$REPO_ROOT" diff --name-only --diff-filter=AMR "$base"...HEAD -- 'packages/commercial/src/db/migrations/*.sql')"; then
+  echo "git diff $base...HEAD failed; cannot tell which migrations changed" >&2
+  exit 2
+fi
+files=()
+if [[ -n "$changed" ]]; then mapfile -t files <<<"$changed"; fi
 if (( ${#files[@]} == 0 )); then
   echo "migration precheck: no migration changes since $base"
   exit 0
