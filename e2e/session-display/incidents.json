@@ -7151,7 +7151,7 @@
       "id": "INC-20261016-STOP-NARRATION-LAYOUT",
       "occurredAt": "2026-10-16",
       "severity": "P2",
-      "symptom": "手机端 Grok 4.7 停止生成后（已执行 86 个步骤），过程叙述「请求在平台说明处被截断了…」被当成回答挂在步骤折叠块外，下面常显「4 分钟前」时间戳，再接被停止码盖章的另一句叙述，最后才是「已停止生成」。根因：tape 把 USER_CANCELLED 盖在本轮最后一段叙述上（其后还有 29 个步骤），回答判定跳过带错误码的行，于是前一句叙述成了回答并失去动作条、常显时间；实时停止端则把最后一句叙述当回答。修复：停止的轮次里后面还有步骤的文字不算回答；盖章的叙述拆成步骤内叙述 + 无正文的停止行。",
+      "symptom": "手机端 Grok 4.7 停止生成后（已执行 86 个步骤），过程叙述「请求在平台说明处被截断了…」被当成回答挂在步骤折叠块外，下面常显「4 分钟前」时间戳，再接被停止码盖章的另一句叙述，最后才是「已停止生成」。根因：tape 把 USER_CANCELLED 盖在本轮最后一段叙述上（其后还有 29 个步骤），回答判定跳过带错误码的行，于是前一句叙述成了回答并失去动作条、常显时间；实时停止端则把最后一句叙述当回答。修复：停止的轮次里后面还有步骤的文字不算回答；盖章的叙述拆成步骤内叙述 + 无正文的停止行。 r2：拆分后停止行无正文，丢了复制/更多按钮（只剩常显时间·积分·请求ID）；停止行改为保留复制/更多，明细回到菜单。",
       "rootFixCommit": "596541be",
       "regressions": [
         {
@@ -7178,7 +7178,20 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/process-disclosure.node-test.mjs",
           "assertion": "no timestamp between the steps and the stop line"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
+          "assertion": "live stop row keeps copy / more: copy takes the turn's last text, rows stay in place"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/process-disclosure.node-test.mjs",
+          "assertion": "stop row keeps copy / more instead of a standing time row"
         }
+      ],
+      "coverageCommits": [
+        "eda1105b"
       ]
     }
   ]
