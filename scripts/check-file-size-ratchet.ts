@@ -162,7 +162,12 @@ function git(root: string, args: string[]): string {
 
 function fileAt(root: string, ref: string, file: string): string | null {
   try {
-    return git(root, ['show', `${ref}:${file}`])
+    // A missing path is an expected answer here (new file, first baseline); keep git quiet.
+    return execFileSync('git', ['-C', root, 'show', `${ref}:${file}`], {
+      encoding: 'utf8',
+      maxBuffer: 256 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
   } catch {
     return null
   }

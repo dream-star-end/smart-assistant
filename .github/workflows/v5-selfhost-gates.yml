@@ -67,6 +67,11 @@ jobs:
       - name: Migration precheck (same rules as the train's migration gate)
         run: bash scripts/v5-selfhost-migration-precheck.sh --base "${{ steps.base.outputs.ref }}"
 
+      # 大文件棘轮(FINDINGS §7 / ARC-3):已 >3000 行的源码文件不许净增,其余不得超过 3000 行;
+      # 例外写 .github/file-size-ratchet-exceptions.json(ticket/reason/≤30 天到期)。
+      - name: Large source file ratchet
+        run: npx tsx scripts/check-file-size-ratchet.ts --base "${{ steps.base.outputs.ref }}"
+
       - name: Biome (changed files, no new errors)
         run: bash scripts/check-biome-changed.sh --base "${{ steps.base.outputs.ref }}"
 
