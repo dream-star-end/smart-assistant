@@ -252,7 +252,11 @@ function clearStoppedNarrationFinals(messages: readonly ChatMessage[], flags: bo
  * working after that text, the text is narration and belongs with the steps, while the stop status
  * belongs at the end of the turn. Split such a row into the narration (same id, so find-in-session
  * and hydration keep their anchor) and a text-less stop row (derived id, keeps usage and request ID)
- * placed after the turn's last row. Live stops already arrive as two rows and pass through unchanged.
+ * placed after the turn's last row.
+ *
+ * The stop row keeps the turn's copy / more actions like any finished message (OCV5-459 r2): it carries
+ * `_stopCopyText` = the turn's last text before the Stop (the stamped narration, or on the device that
+ * pressed Stop, where the stop arrives as its own row, the last assistant text before it).
  */
 export function splitStoppedNarration(messages: ChatMessage[]): ChatMessage[] {
   const moved = new Map<number, ChatMessage[]>();
@@ -282,11 +286,28 @@ export function splitStoppedNarration(messages: ChatMessage[]): ChatMessage[] {
       ...m,
       id: `${m.id}:stopped`,
       text: "",
+      _stopCopyText: narration,
       ts: stoppedAt > 0 ? stoppedAt : m.ts,
       ...(m._timelineUnitKey ? { _timelineUnitKey: `${m._timelineUnitKey}:stopped` } : {}),
     };
     const at = end - 1;
     moved.set(at, [...(moved.get(at) ?? []), stop]);
+  }
+  // Live shape: the stop is its own row with no partial answer; copy takes the turn's last text.
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m?.role !== "assistant" || !isUserStopCode(m._errorCode) || replaced.has(i)) continue;
+    if (errorPresentation(m._errorCode, m.text, m._errorDetail, m.usage?.waived === true).bodyText) continue;
+    const [start] = arraySegment(messages, i);
+    let copy = "";
+    for (let j = i - 1; j >= start; j--) {
+      const row = messages[j];
+      if (row?.role === "assistant" && !row._errorCode && (row.text ?? "").trim()) {
+        copy = row.text ?? "";
+        break;
+      }
+    }
+    if (copy) replaced.set(i, { ...m, _stopCopyText: copy });
   }
   if (replaced.size === 0) return messages;
   const out: ChatMessage[] = [];

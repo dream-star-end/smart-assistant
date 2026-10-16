@@ -230,7 +230,12 @@ describe("MessageList Manus 过程披露", () => {
       const stop = screen.getByRole("status", { name: "已停止生成" });
       expect(stop.closest("[data-testid=process-disclosure]")).toBeNull();
       // The only time on the turn is the stop row's own meta, after the stop line: none in the middle.
-      const stopRow = stop.closest("[data-testid=assistant-row]");
+      const stopRow = stop.closest("[data-testid=assistant-row]") as HTMLElement;
+      // r2: the stop row keeps copy / more like any finished message; meta goes back into them.
+      const actions = within(stopRow).getByTestId("assistant-actions");
+      expect(within(actions).getByRole("button", { name: "复制" })).toBeInTheDocument();
+      expect(within(actions).getByRole("button", { name: "更多操作" })).toBeInTheDocument();
+      expect(within(stopRow).getAllByTestId("assistant-meta").every((meta) => actions.contains(meta))).toBe(true);
       for (const time of document.querySelectorAll("time")) {
         expect(time.closest("[data-testid=assistant-row]")).toBe(stopRow);
         expect(stop.compareDocumentPosition(time) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
