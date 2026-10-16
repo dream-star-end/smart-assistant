@@ -301,6 +301,12 @@
       "reason": "OCV5-451: a call that outlives a stopped Antigravity turn (recorded by the relay after settlement) is folded into the turn's waived usage row, so its tokens and wouldHaveCharged cover every call. Latent: audit snapshot only; stopped turns are waived and the charge stays 0. Settle integ test red without the fix.",
       "approvedBy": "user 2026-10-16 「继续修上次汇报里留下的小问题：停止轮在用量入账前就结算，免收费快照里「本应收费」金额偏小」，按规范写 Incident: none 豁免（cc3 antigravity 会话）",
       "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "cc3c7b0648afc2dc17a81d4e5338e5db89e3b5aa",
+      "reason": "OCV5-453: backport of commercial 51790b628. getFreshAntigravityAccessToken loads the KMS key before checking out a pool client, so a key failure can no longer strand the client and hang pool.end(). Latent: selfhost has its KMS key, no user report; found through a commercial CI integ timeout. Unit test red without the fix.",
+      "approvedBy": "user 2026-10-16 「开始回挂 cc3-sync 的连接泄漏修复 51790b628……到个人版」，按规范写 Incident: none 豁免（cc3 antigravity 会话）",
+      "expiresAt": "2026-11-15"
     }
   ]
 }
