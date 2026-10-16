@@ -237,8 +237,15 @@ export async function getFreshAntigravityAccessToken(
   },
 ): Promise<Buffer> {
   const now = deps.now ?? Date.now
-  const client: PoolClient = (await (deps.pool ?? getPool()).connect()) as PoolClient
+  // Key first: a throw here must not strand a checked-out client (pool.end() would wait forever).
   const key = (deps.keyFn ?? loadKmsKey)()
+  let client: PoolClient
+  try {
+    client = (await (deps.pool ?? getPool()).connect()) as PoolClient
+  } catch (err) {
+    zeroBuffer(key)
+    throw err
+  }
   let refresh: Buffer | null = null
   try {
     await client.query('BEGIN')
