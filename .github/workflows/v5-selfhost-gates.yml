@@ -80,3 +80,23 @@ jobs:
 
       - name: Two-tree divergence (report only until the unified sync)
         run: npx tsx scripts/check-v5-two-tree-divergence.ts --against origin/feat/v5-aurora-rewrite
+
+  # OCV5-447:列车 pinned staging 跑的 watch / autorecover 行为门,PR 上先跑同一份清单
+  # (scripts/v5-selfhost-watch-gate.sh)。此前只有列车跑,watch 改动要等一趟列车失败才知道。
+  watch-gate:
+    name: selfhost-watch-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Watch behaviour gate (same list as the train)
+        run: bash scripts/v5-selfhost-watch-gate.sh --log-dir "$RUNNER_TEMP/watch-gate"
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-watch-gate-logs
+          path: ${{ runner.temp }}/watch-gate

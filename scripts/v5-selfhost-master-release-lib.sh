@@ -780,18 +780,16 @@ build_master_release() {
   # OCV5-420:中途退出 / 补偿失败的列车终态(recovery_required、不结算搭车)同样先在 staging 跑。
   # OCV5-420 二期:autorecover(不等人,自动恢复/重跑/升级派 AI)与 watch.sh --auto-recover 同样先在 staging 跑。
   mlog "  selfhost watch selftest + disarm-observe / lock / rearm / gate-fail-stay behavior @ pinned staging"
-  local watch_t watch_log
-  for watch_t in v5-selfhost-watch-selftest.sh v5-selfhost-watch-disarm-observe.test.sh \
-      v5-selfhost-watch-lock.test.sh v5-selfhost-watch-rearm.test.sh v5-selfhost-watch-sync.test.sh \
-      v5-selfhost-watch-alert.test.sh v5-selfhost-gate-fail-stay.test.sh \
-      v5-selfhost-train-recovery.test.sh v5-selfhost-watch-autorecover.test.sh v5-selfhost-autorecover.test.sh; do
-    watch_log="$MASTER_GATE_TMPDIR/${watch_t}.log"
-    if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash "scripts/$watch_t" >"$watch_log" 2>&1 ); then
-      tail -n 20 "$watch_log" >&2 || true
-      cleanup_master_staging
-      die "pinned selfhost watch gate 失败: $watch_t"
-    fi
-  done
+  # OCV5-447:清单只在 scripts/v5-selfhost-watch-gate.sh 一处,PR CI(v5-selfhost-gates.yml)跑同一份。
+  if [[ ! -f "$staging/scripts/v5-selfhost-watch-gate.sh" ]]; then
+    cleanup_master_staging
+    die "新候选缺 scripts/v5-selfhost-watch-gate.sh"
+  fi
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" bash scripts/v5-selfhost-watch-gate.sh \
+      --log-dir "$MASTER_GATE_TMPDIR/watch-gate" ); then
+    cleanup_master_staging
+    die "pinned selfhost watch gate 失败(失败的脚本与日志尾见上方 FAIL 行)"
+  fi
   cleanup_master_gate_tmpdir
 
   t0="$(date +%s)"
