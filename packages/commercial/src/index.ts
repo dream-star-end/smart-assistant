@@ -12,57 +12,153 @@ import { alertContentReview } from './admin/contentReviewAlert.js'
  *   - 实例化 HTTP 路由处理器,通过 result.handle 暴露给 gateway
  */
 
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
-import * as fs from 'node:fs'
-import type { IncomingMessage } from 'node:http'
-import { type Server as HttpServer, createServer as createHttpServer } from 'node:http'
-import type { ServerResponse } from 'node:http'
-import { type Server as HttpsServer, createServer as createHttpsServer } from 'node:https'
-import { isIPv4 } from 'node:net'
-import { homedir } from 'node:os'
-import * as path from 'node:path'
-import type { Duplex } from 'node:stream'
-import type { TLSSocket } from 'node:tls'
+import type { IncomingMessage } from "node:http";
+import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
+import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
+// P3 双 master 蓝绿交接 + cohort 分批切流(RFC-v5-dual-master-cohort)。
+import type { Slot } from "./deploy/deployState.js";
+import { startDesiredWatch, type DesiredWatch } from "./deploy/deployState.js";
+import { createLeaderBundle, type LeaderBundle, type BundleMemberHandle } from "./deploy/leaderBundle.js";
 import {
-  ALLOWED_INBOUND_MODELS,
-  setHostStaticProviderKeys,
-  setLiteratureSkillProvider,
-  setModelHintProvider,
-} from '@openclaude/gateway'
-import type {
-  DurableCodexBilling,
-  StaticProviderId,
-  StaticProviderKeys,
-} from '@openclaude/protocol'
-import { isGrokEngineModel, normalizeTurnErrorCode } from '@openclaude/protocol'
+  createLeaderLeaseController,
+  resolveLeaderEnvEligibility,
+  type LeaderLeaseController,
+  type LeadershipStatus,
+} from "./deploy/leaderLease.js";
 import {
-  allMasterWsessRows,
-  appendCostCredits,
-  appendServerAuthoredMessage,
-  appendServerAuthoredMessageDrainByUser,
-  appendServerAuthoredMessageForRequest,
-  drainDelegateCostForClientSession,
-  getClientSession,
-  getEngineContextMessages,
-  getWechatBindingByUserId,
-  hasCompletedClientTurn,
-  patchServerAuthoredMessage,
-  readArchivedMessages,
-  // P2 master 会话权威迁 PG(RFC-v5-sessions-pg D1):一次性注入 backend 的 composition root 入口。
-  setClientSessionsBackend,
-  softDeleteMasterSession,
-  // P1.7 slice 7c — broker assembly 需要的 master sqlite helpers
-  upsertMasterClientSession,
-} from '@openclaude/storage'
-import Docker from 'dockerode'
-import IORedis from 'ioredis'
-import { createAccountPoolAdapter } from './account-pool/accountPoolAdapter.js'
-import { type SlotReaperHandle, startAccountSlotReaper } from './account-pool/accountSlotReaper.js'
-import { admitAntigravityTurn } from './account-pool/antigravityAdmission.js'
+  createControlListener,
+  privatePortForSlot,
+  type ControlListener,
+} from "./deploy/controlListener.js";
 import {
-  configureAntigravityModelCooldownStore,
-  createIoredisAntigravityModelCooldownStore,
-} from './account-pool/antigravityModelCooldown.js'
+  createSlotRelayClient,
+  handleSlotRelayRequest,
+  type SlotRelayLocal,
+} from "./deploy/slotRelay.js";
+import type { TLSSocket } from "node:tls";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { isIPv4 } from "node:net";
+import type { Duplex } from "node:stream";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { homedir } from "node:os";
+import IORedis from "ioredis";
+import Docker from "dockerode";
+import { runMigrations } from "./db/migrate.js";
+import { assertFlavorIdentity } from "./flavor/assertFlavor.js";
+import {
+  cursorExternalApiOutboxDirForFlavor,
+  openCursorExternalApiOutbox,
+  type CursorExternalApiOutbox,
+} from "./billing/cursorExternalApiOutbox.js";
+import { closePool, createPool, getPool } from "./db/index.js";
+import { reconcileBoxBillingBatch } from "./billing/boxBillingRecovery.js";
+import { BoxDurableJournal } from "./http/proxy/boxDurableJournal.js";
+import { createProductionBoxAccountResolver } from "./http/proxy/boxAccountResolver.js";
+import { BoxRemoteCleanupWorker } from "./http/proxy/boxRemoteCleanupWorker.js";
+import { createBoxReplayRecoveryWriter } from "./egress/boxReplaySetup.js";
+import {
+  assertModelCatalogAdminPoolConfigured,
+  closeModelCatalogAdminPool,
+} from "./db/modelCatalogAdmin.js";
+import { loadConfig, type CommercialConfig } from "./config.js";
+import { stubMailer, createResendMailer } from "./auth/mail.js";
+import { wrapIoredis } from "./middleware/rateLimit.js";
+import { createCommercialHandler, type CommercialHandler } from "./http/router.js";
+import { deriveMediaSignKey } from "./http/mediaSign.js";
+import { ThumbnailDiskCache } from "./http/mediaThumbnail.js";
+import { deriveWechatLiveLinkKey } from "./wechat/liveShare.js";
+import { loadKmsKey, zeroBuffer } from "./crypto/keys.js";
+import { rootLogger } from "./logging/logger.js";
+import { warmupLoginDummyHash } from "./auth/login.js";
+import { secretToKey } from "./auth/jwt.js";
+import { PricingCache, createModelHintProvider, type ModelPricing } from "./billing/pricing.js";
+import { applyTurnWaiver } from "./billing/refund.js";
+import { canUseModel } from "./billing/authzModels.js";
+import { ALLOWED_INBOUND_MODELS, setModelHintProvider, setLiteratureSkillProvider, setHostStaticProviderKeys } from "@openclaude/gateway";
+import { getPreferences, patchPreferences } from "./user/preferences.js";
+import { getLiteratureSkillConfig } from "./admin/literatureConfig.js";
+import {
+  getPhase6AccountUuidEnforce,
+  getSessionPinMode,
+} from "./admin/runtimeFlags.js";
+import { LITERATURE_SKILL_POINTER } from "./literatureSkill.js";
+import {
+  estimateMaxCost,
+  InsufficientCreditsError,
+  preCheckWithCost,
+  releasePreCheck,
+  type ReservationHandle,
+  wrapIoredisForPreCheck,
+} from "./billing/preCheck.js";
+import { createHttpHupijiaoClient, type HupijiaoClient, type HupijiaoConfig } from "./payment/hupijiao/client.js";
+import {
+  AccountScheduler,
+  AccountPoolBusyError,
+  AccountPoolUnavailableError,
+  ContainerStaleBindingError,
+  pickCodexAccountForBindingInTx,
+} from "./account-pool/scheduler.js";
+import {
+  commitCodexRebindInTx,
+  fetchSnapshotAndWriteContainerAuth,
+  type WriteAuthDeps,
+} from "./account-pool/codexLazyMigrate.js";
+import {
+  type CodexDisableFanoutDeps,
+  type CodexDriftReconcilerHandle,
+  enqueueCodexDisableFanout,
+  startCodexDisableDriftReconciler,
+} from "./account-pool/codexDisableFanout.js";
+import { AccountHealthTracker, wrapIoredisForHealth } from "./account-pool/health.js";
+import {
+  putRemoteCodexContainerAuth,
+  deleteRemoteCodexContainerAuth,
+} from "./codex-auth/remoteCodexAuth.js";
+import { tx } from "./db/queries.js";
+import { GoalStateService } from './goal/goalStateService.js'
+import { recordProductFrictionEvent } from "./productFriction/events.js";
+import {
+  startLifecycleScheduler,
+  type LifecycleScheduler,
+  type LifecycleLogger,
+} from "./agent/index.js";
+import type { AgentHttpDeps } from "./http/agent.js";
+import { startAlertScheduler, type AlertScheduler } from "./admin/alerts.js";
+import {
+  startRefreshEventsSweeper,
+  type SweeperHandle as RefreshEventsSweeperHandle,
+} from "./account-pool/refreshEventsSweeper.js";
+import {
+  startDesktopEnrollmentSweep,
+  createPgDesktopIdentityRepo,
+  handleDesktopTokenMint,
+  handleDesktopTokenRefresh,
+  desktopTokenRequestContext,
+} from "./http/desktopEnroll.js";
+import { handleDesktopRuntimeManifest } from "./http/desktopBootstrap.js";
+import { startDesktopTlsListener, makeDesktopRequestVerifier } from "./http/desktopTlsListener.js";
+import { makeDesktopIdentityStrategy } from "./auth/desktopIdentity.js";
+import { extractDesktopTlsContext } from "./desktop/tlsContext.js";
+import { makeDesktopContainerTransport } from "./wechat/desktopContainerTransport.js";
+import { resolveDispatchEndpoint } from "./dispatch/resolveDispatchEndpoint.js";
+import { getDesktopFlagSnapshot } from "./desktop/flags.js";
+import { ChatGptProxyCredentialStore } from "./chatgptProxy/credentials.js";
+import { getChatGptProxyFlagSnapshot, readChatGptProxyEnv } from "./chatgptProxy/flags.js";
+import { createChatGptProxyServer, type ChatGptProxyServer } from "./chatgptProxy/server.js";
+import type { ChatGptProxyHttpDeps } from "./http/chatgptProxy.js";
+import { getDesktopTunnelRegistry } from "./ws/desktopTunnelRegistry.js";
+import {
+  startAuditRetentionSweeper,
+  type AuditRetentionSweeperHandle,
+} from "./admin/auditRetention.js";
+import { startGithubWorkspaceSweeper } from "./github/sessionWorkspaces.js";
+import { startImageUsageSweeper } from "./billing/imageBilling.js";
+import {
+  startCodexRefreshActor,
+  type CodexRefreshActorHandle,
+} from "./account-pool/codexAccountActor.js";
+import { createAccountPoolAdapter } from "./account-pool/accountPoolAdapter.js";
 import {
   apiKeyPoolConfiguredServices,
   createApiKeyPoolAdapter,
@@ -70,27 +166,135 @@ import {
   importEnvApiKeys,
   primeApiKeyPool,
   startApiKeyPoolCache,
-} from './account-pool/apiKeyPool.js'
+} from "./account-pool/apiKeyPool.js";
+import { createGeminiPoolAdapter } from "./account-pool/geminiPoolAdapter.js";
+import { registerPoolAdapter, startPoolRecoveryActor } from "./account-pool/policy/registry.js";
+import { configureAffinitySettings } from "./account-pool/policy/affinity.js";
+import { getSystemSetting } from "./admin/systemSettings.js";
+import { startCursorAuthSyncActor } from "./account-pool/cursorMaterializer.js";
+import { startCursorSandPreparationActor } from "./account-pool/cursorSandActor.js";
+import { startCursorUsageSweeper } from "./account-pool/cursorUsageSweeper.js";
+import { startGrokUsageSweeper } from "./account-pool/grokUsageSweeper.js";
 import {
-  type CodexRefreshActorHandle,
-  startCodexRefreshActor,
-} from './account-pool/codexAccountActor.js'
+  DEFAULT_V3_CODEX_CONTAINER_DIR,
+  V3_CONTAINER_PORT,
+  stopAndRemoveV3Container,
+  ocGatewayIpForChannel,
+  ocInternalProxyPortForChannel,
+} from "./agent-sandbox/v3supervisor.js";
+import { AuthoritySigner } from "./ws/authoritySigner.js";
+import { ModelCatalogCache, PLATFORM_AUX_MODEL_IDS } from "./billing/modelCatalog.js";
+import { getRuntimeChannel } from "./runtimeChannel.js";
+import { activePoolWhere } from "./account-pool/poolCandidates.js";
+import { V3_AGENT_GID, V3_AGENT_UID } from "./agent-sandbox/constants.js";
 import {
-  type CodexDisableFanoutDeps,
-  type CodexDriftReconcilerHandle,
-  enqueueCodexDisableFanout,
-  startCodexDisableDriftReconciler,
-} from './account-pool/codexDisableFanout.js'
+  startPendingOrdersExpirer,
+  type SweeperHandle as PendingOrdersExpirerHandle,
+} from "./payment/pendingOrdersExpirer.js";
 import {
-  type WriteAuthDeps,
-  commitCodexRebindInTx,
-  fetchSnapshotAndWriteContainerAuth,
-} from './account-pool/codexLazyMigrate.js'
-import { startCursorAuthSyncActor } from './account-pool/cursorMaterializer.js'
-import { startCursorSandPreparationActor } from './account-pool/cursorSandActor.js'
-import { startCursorUsageSweeper } from './account-pool/cursorUsageSweeper.js'
-import { createGeminiPoolAdapter } from './account-pool/geminiPoolAdapter.js'
-import { startGrokUsageSweeper } from './account-pool/grokUsageSweeper.js'
+  startSubscriptionRolloverSweeper,
+  type SubscriptionRolloverHandle,
+} from "./billing/subscriptionRolloverSweeper.js";
+import {
+  startAccountSlotReaper,
+  type SlotReaperHandle,
+} from "./account-pool/accountSlotReaper.js";
+import {
+  startFinalizeJournalReconciler,
+  resolveStuckThresholdMs,
+  resolveDurableWaiverAgeMs,
+  markGatewayShutdownEvidence,
+  DEFAULT_RECONCILE_INTERVAL_MS,
+  MIN_INTERVAL_MS as FINALIZE_RECONCILER_MIN_INTERVAL_MS,
+  type ReconcilerHandle as FinalizeJournalReconcilerHandle,
+} from "./billing/finalizeJournalReconciler.js";
+import { startTapeJobScheduler } from "./db/tapeJobScheduler.js";
+import {
+  startLiveFrameMaintenanceScheduler,
+  resolveLiveFrameMaintenanceDisabled,
+  resolveLiveFrameMaintenanceIntervalMs,
+  resolvePruneMaxBatches,
+  resolveRetireMinAgeMs,
+} from "./db/liveFrameMaintenanceScheduler.js";
+import {
+  startOnboardingScheduler,
+  type OnboardingSchedulerHandle,
+} from "./inbox/onboarding.js";
+import {
+  startInboxEmailScheduler,
+  type InboxEmailSchedulerHandle,
+} from "./inbox/email.js";
+import {
+  startResearchJobScheduler,
+  type ResearchJobSchedulerHandle,
+} from "./research/scheduler.js";
+import { makeResearchFetchJobHandlers } from "./research/fetchJobs.js";
+import {
+  startCronWakeScheduler,
+  findDueCronWakeUsers,
+  runCronWakeRescan,
+  type CronWakeSchedulerHandle,
+  type CronWakeRunner,
+} from "./agent-sandbox/cronWake.js";
+import { createCronDeliveryInboxMessage, createInboxMessage } from "./inbox/inbox.js";
+import {
+  startMarketplaceAiReviewScheduler,
+  type MarketplaceAiReviewSchedulerHandle,
+} from "./marketplace/aiReview.js";
+import {
+  startProviderHealthScheduler,
+  type ProviderHealthSchedulerHandle,
+} from "./admin/providerHealthScheduler.js";
+import {
+  startIncidentReconciler,
+  startIncidentSweeper,
+  assertSelfhealConfig,
+  selfhealTickMs,
+  type IncidentReconcilerHandle,
+  type IncidentSweeperHandle,
+} from "./selfheal/index.js";
+import {
+  startWecomAlertDispatcher,
+} from "./admin/wecomAlertDispatcher.js";
+import {
+  getWecomAibotConnectionManager,
+} from "./admin/wecomAibotConnection.js";
+import {
+  startUserNoticeApproval,
+} from "./selfheal/userNoticeApproval.js";
+import {
+  makeAnthropicProxyHandler,
+  ConcurrencyLimiter,
+  FallbackRateLimiter,
+  DEFAULT_PROXY_RATE_LIMIT,
+  DEFAULT_MAX_CONCURRENT_PER_UID,
+  type AnthropicProxyHandler,
+} from "./http/anthropicProxy.js";
+import { assertPlatformDefaultModelConfigured, STATIC_PROVIDER_META, staticProviderKeysFromConfig } from "./http/proxy/staticProviderMeta.js";
+import { makeCursorExternalRoute, type CursorExternalRoute } from "./http/proxy/cursorExternal.js";
+import type {
+  DurableCodexBilling,
+  StaticProviderId,
+  StaticProviderKeys,
+} from "@openclaude/protocol";
+import { isGrokEngineModel, normalizeTurnErrorCode } from "@openclaude/protocol";
+import { makePlatformContextLoader } from "./platform/platformContextLoader.js";
+import { makeDefaultVolumeContextReader } from "./platform/volumeContextReader.js";
+import {
+  makeServerAuthoredHandler,
+  makeTurnTapeStateHandler,
+  SERVER_AUTHORED_PATH,
+  TURN_TAPE_STATE_PATH,
+  type ServerAuthoredHandler,
+} from "./http/internalServerAuthored.js";
+import {
+  CODEX_TOKEN_REFRESH_PATH,
+  type CodexTokenRefreshHandler,
+} from "./http/internalCodexTokenRefresh.js";
+import {
+  buildCodexRelayHandler,
+  buildCodexTokenRefreshHandler,
+} from "./http/codexInternalAssembly.js";
 import {
   MAX_DELEGATE_GROK_LEASES_PER_CONTAINER,
   createCodexRouteContextForModel,
@@ -103,576 +307,277 @@ import {
   listActiveGrokRouteLeases,
   listEnabledGroupsForModel,
   resolveGrokRouteContext,
-} from './account-pool/groups.js'
-import { AccountHealthTracker, wrapIoredisForHealth } from './account-pool/health.js'
-import { configureAffinitySettings } from './account-pool/policy/affinity.js'
-import { registerPoolAdapter, startPoolRecoveryActor } from './account-pool/policy/registry.js'
-import { activePoolWhere } from './account-pool/poolCandidates.js'
+} from "./account-pool/groups.js";
 import {
-  type SweeperHandle as RefreshEventsSweeperHandle,
-  startRefreshEventsSweeper,
-} from './account-pool/refreshEventsSweeper.js'
+  CODEX_RELAY_PREFIX,
+  makeDefaultCodexRelayDb,
+  type CodexRelayHandler,
+} from "./http/internalCodexRelay.js";
 import {
-  AccountPoolBusyError,
-  AccountPoolUnavailableError,
-  AccountScheduler,
-  ContainerStaleBindingError,
-  pickCodexAccountForBindingInTx,
-} from './account-pool/scheduler.js'
-import { type AlertScheduler, startAlertScheduler } from './admin/alerts.js'
-import {
-  type AuditRetentionSweeperHandle,
-  startAuditRetentionSweeper,
-} from './admin/auditRetention.js'
-import { shutdownDurableMetricRollups } from './admin/durableMetricRollups.js'
-import { getLiteratureSkillConfig } from './admin/literatureConfig.js'
-import {
-  observeWsBridgeBuffered,
-  observeWsBridgeSessionDuration,
-  observeWsBridgeTtft,
-} from './admin/metrics.js'
-import { getProviderRoutingAvailability } from './admin/providerHealthGate.js'
-import {
-  type ProviderHealthSchedulerHandle,
-  startProviderHealthScheduler,
-} from './admin/providerHealthScheduler.js'
-import { getResearchConfigPublic } from './admin/researchConfig.js'
-import { getPhase6AccountUuidEnforce, getSessionPinMode } from './admin/runtimeFlags.js'
-import { getSystemSetting } from './admin/systemSettings.js'
-import { getWecomAibotConnectionManager } from './admin/wecomAibotConnection.js'
-import { startWecomAlertDispatcher } from './admin/wecomAlertDispatcher.js'
-import { V3_AGENT_GID, V3_AGENT_UID } from './agent-sandbox/constants.js'
-import {
-  type CronWakeRunner,
-  type CronWakeSchedulerHandle,
-  findDueCronWakeUsers,
-  runCronWakeRescan,
-  startCronWakeScheduler,
-} from './agent-sandbox/cronWake.js'
-import {
-  DEFAULT_PLATFORM_ROOT,
-  DEFAULT_RUNTIME_RELEASES_ROOT,
-  DEFAULT_V3_CCB_BASELINE_DIR,
-  INITIAL_SWEEP_BATCH_LIMIT,
-  type IdleSweepScheduler,
-  type MigrationReconcileScheduler,
-  type OrphanReconcileScheduler,
-  type UserMediaLocation,
-  type V3ContainerEventsWorker,
-  type V3RuntimeTuple,
-  type V3SupervisorDeps,
-  type VolumeGcScheduler,
-  createSyntheticEvalOverlayRuntime,
-  createUserMediaResolver,
-  isUserVolumeMediaPath,
-  lookupContainerUserRole,
-  makeDesktopOrDockerResolver,
-  makeInboundChannelResolver,
-  makePrewarmContainer,
-  makeUidSingleflight,
-  makeV3EnsureRunning,
-  markV3ContainerActivity,
-  preheatV3Image,
-  readSyntheticEvalReleaseSourceCommit,
-  resolveCcbBaselineMounts,
-  resolvePlatformBundleMount,
-  resolveRuntimeReleaseMount,
-  startIdleSweepScheduler,
-  startMigrationReconcileScheduler,
-  startOrphanReconcileScheduler,
-  startV3ContainerEventsWorker,
-  startVolumeGcScheduler,
-} from './agent-sandbox/index.js'
-import {
-  DEFAULT_V3_CODEX_CONTAINER_DIR,
-  V3_CONTAINER_PORT,
-  ocGatewayIpForChannel,
-  ocInternalProxyPortForChannel,
-  stopAndRemoveV3Container,
-} from './agent-sandbox/v3supervisor.js'
-import {
-  type LifecycleLogger,
-  type LifecycleScheduler,
-  startLifecycleScheduler,
-} from './agent/index.js'
-import { getUserSignalTrafficClass } from './analytics/signalTraffic.js'
-import { makeApiKeyIdentityStrategy, resolveApiKeyIdentity } from './auth/apiKeyIdentity.js'
-import { makePgApiKeyRepo } from './auth/apiKeyRepo.js'
-import { createPgIdentityRepo } from './auth/containerIdentity.js'
-import { makeDesktopIdentityStrategy } from './auth/desktopIdentity.js'
-import { secretToKey } from './auth/jwt.js'
-import { warmupLoginDummyHash } from './auth/login.js'
-import { createResendMailer, stubMailer } from './auth/mail.js'
-import { makeContainerIdentityStrategy } from './auth/proxyIdentity.js'
-import { makeLoadUserModelAuthz } from './auth/userModelAuthz.js'
-import {
-  applyAutoDreamPreferenceAction,
-  reportAutoDreamPlatformFindings,
-} from './autoDream/optimizerStore.js'
-import {
-  type AdvisorCodexSelectorDecision,
   selectAdvisorCodexAdmitRoute,
-} from './billing/advisorCodexAdmitRoute.js'
+  type AdvisorCodexSelectorDecision,
+} from "./billing/advisorCodexAdmitRoute.js";
 import {
-  composeMultiplier,
-  getAgentCostMultiplier,
-  listAgentCostOverrides,
-} from './billing/agentMultiplier.js'
+  isDelegateGrokRoutePath,
+  makeDelegateGrokRouteHandler,
+  type DelegateGrokRouteAllocation,
+  type DelegateGrokRouteHandler,
+} from "./http/internalDelegateGrokRoute.js";
+import {
+  GROK_RELAY_PREFIX,
+  makeGrokRelayHandler,
+  makeGrokRelayHealthRecorder,
+  type GrokRelayHandler,
+} from "./http/internalGrokRelay.js";
+import {
+  ZCODE_RELAY_PREFIX,
+  makeZcodeRelayHandler,
+  type ZcodeRelayHandler,
+} from "./http/internalZcodeRelay.js";
+import {
+  mintZcodeRelayRoute,
+  expireZcodeRelayRoute,
+  configureZcodeRelayKv,
+  createIoredisZcodeRelayKv,
+} from "./billing/zcodeRouteContext.js";
+import {
+  ANTIGRAVITY_RELAY_PREFIX,
+  makeAntigravityRelayHandler,
+  type AntigravityRelayHandler,
+} from "./http/internalAntigravityRelay.js";
 import {
   configureAntigravityRelayKv,
   expireAntigravityRelayRoute,
   expireAntigravityRelayRouteForRequest,
-} from './billing/antigravityRouteContext.js'
-import { canUseModel } from './billing/authzModels.js'
-import { reconcileBoxBillingBatch } from './billing/boxBillingRecovery.js'
+} from "./billing/antigravityRouteContext.js";
+import { admitAntigravityTurn } from "./account-pool/antigravityAdmission.js";
 import {
-  type CodexFinalizeHandle,
-  DURABLE_CODEX_RECOVERY_VERSION,
-  deriveEngineSessionId,
-  makeCodexFinalizer,
-} from './billing/codexFinalizer.js'
+  configureAntigravityModelCooldownStore,
+  createIoredisAntigravityModelCooldownStore,
+} from "./account-pool/antigravityModelCooldown.js";
 import {
-  parseZeroChargeCutoff,
-  startCursorAuditReconciler,
-} from './billing/cursorAuditReconciler.js'
+  SKILL_EMBED_PREFIX,
+  makeSkillEmbedHandler,
+  type SkillEmbedHandler,
+} from "./http/internalSkillEmbed.js";
 import {
-  type CursorExternalApiOutbox,
-  cursorExternalApiOutboxDirForFlavor,
-  openCursorExternalApiOutbox,
-} from './billing/cursorExternalApiOutbox.js'
-import { createDelegateEngineBillingRuntime } from './billing/delegateEngineBillingRuntime.js'
-import { settleDurableCodexBilling } from './billing/durableCodexBilling.js'
+  CORE_MEMORY_RANK_PATH,
+  makeCoreMemoryRankHandler,
+  type CoreMemoryRankHandler,
+} from "./http/internalCoreMemoryRank.js";
 import {
-  isCursorDurableBilling,
-  settleDurableCursorBilling,
-} from './billing/durableCursorBilling.js'
+  MARKETPLACE_SYNC_PATH,
+  makeMarketplaceSyncHandler,
+  type MarketplaceSyncHandler,
+} from "./http/internalMarketplaceSync.js";
 import {
-  DEFAULT_RECONCILE_INTERVAL_MS,
-  MIN_INTERVAL_MS as FINALIZE_RECONCILER_MIN_INTERVAL_MS,
-  type ReconcilerHandle as FinalizeJournalReconcilerHandle,
-  markGatewayShutdownEvidence,
-  resolveDurableWaiverAgeMs,
-  resolveStuckThresholdMs,
-  startFinalizeJournalReconciler,
-} from './billing/finalizeJournalReconciler.js'
-import { startImageUsageSweeper } from './billing/imageBilling.js'
-import { type ModelCatalogCache, PLATFORM_AUX_MODEL_IDS } from './billing/modelCatalog.js'
+  TURN_WAIVE_PATH,
+  makeTurnWaiveHandler,
+  type TurnWaiveHandler,
+} from "./http/internalTurnWaive.js";
 import {
-  authorityKeyringProvider,
-  getModelCatalogCache,
-  isModelAuthorityEnforced,
-  peekModelCatalogCache,
-} from './billing/modelCatalogRuntime.js'
-import { serializeBillingPricing } from './billing/persistedBillingPricing.js'
+  TURN_LEASE_RENEW_PATH,
+  makeTurnLeaseRenewHandler,
+  type TurnLeaseRenewHandler,
+} from "./http/internalTurnLeaseRenew.js";
 import {
-  InsufficientCreditsError,
-  type ReservationHandle,
-  estimateMaxCost,
-  preCheckWithCost,
-  releasePreCheck,
-  wrapIoredisForPreCheck,
-} from './billing/preCheck.js'
-import { type ModelPricing, PricingCache, createModelHintProvider } from './billing/pricing.js'
-import { type JournalFailureCode, startInflightJournal } from './billing/proxyBilling.js'
-import { applyTurnWaiver } from './billing/refund.js'
+  PROMPT_QUEUE_CLAIM_PATH,
+  PROMPT_QUEUE_DETAIL_PATH,
+  PROMPT_QUEUE_MUTATION_PATH,
+  PROMPT_QUEUE_SNAPSHOT_PATH,
+  isPromptQueueV1Enabled,
+  makePromptQueueHandler,
+  type PromptQueueHandler,
+} from "./http/internalPromptQueue.js";
+import { PgPromptQueueStore } from "./promptQueue/pgPromptQueueStore.js";
+import { LEASE_CALLBACK_PATH, LEASE_CALLBACK_VALIDATE_PATH, makeLeaseCallbackHandler } from "./http/internalLeaseCallback.js";
+import { lookupLeaseCallbackSession } from "./db/pgSessionsBackend.js";
 import {
-  type SubscriptionRolloverHandle,
-  startSubscriptionRolloverSweeper,
-} from './billing/subscriptionRolloverSweeper.js'
+  COST_EVENT_PATH,
+  makeCostEventHandler,
+  type CostEventHandler,
+} from "./http/internalCostEvent.js";
 import {
-  configureZcodeRelayKv,
-  createIoredisZcodeRelayKv,
-  expireZcodeRelayRoute,
-  mintZcodeRelayRoute,
-} from './billing/zcodeRouteContext.js'
-import { DEFAULT_BRIDGE_SECRET_PATH, loadOrCreateBridgeSecret } from './bridgeSecret.js'
-import { ChatGptProxyCredentialStore } from './chatgptProxy/credentials.js'
-import { getChatGptProxyFlagSnapshot, readChatGptProxyEnv } from './chatgptProxy/flags.js'
-import { type ChatGptProxyServer, createChatGptProxyServer } from './chatgptProxy/server.js'
+  MARKETPLACE_AGENT_PREFIX,
+  makeMarketplaceAgentHandler,
+  type MarketplaceAgentHandler,
+} from "./http/internalMarketplaceAgent.js";
 import {
-  deleteRemoteCodexContainerAuth,
-  putRemoteCodexContainerAuth,
-} from './codex-auth/remoteCodexAuth.js'
-import { type BaselineServer, getBaselineServer } from './compute-pool/baselineServer.js'
+  TOOL_CALL_ROLLUP_PATH,
+  TOOL_FAILURE_AUDIT_PATH,
+  isToolFailureAuditEnabled,
+  makeToolCallRollupHandler,
+  makeToolFailureAuditHandler,
+  type ToolCallRollupHandler,
+  type ToolFailureAuditHandler,
+} from "./http/internalToolFailureAudit.js";
 import {
-  ensureCa,
-  ensureMasterLeaf,
-  extractHostUuidFromSpiffe,
-  extractSpiffeUris,
-} from './compute-pool/certAuthority.js'
-import { createContainerService } from './compute-pool/containerService.js'
-import { getImagePromoteScheduler } from './compute-pool/imagePromote.js'
+  TURN_OBSERVATION_PATH,
+  makeTurnObservationHandler,
+} from "./http/internalTurnObservation.js";
 import {
-  hostRowToTarget,
-  deleteFile as nodeAgentDeleteFile,
-  getFile as nodeAgentGetFile,
-  putFile as nodeAgentPutFile,
-  resolveServiceableHostTarget,
-  startSshControlMaster,
-  stopSshControlMaster,
-} from './compute-pool/nodeAgentClient.js'
-import { type HealthPoller, getHealthPoller } from './compute-pool/nodeHealth.js'
-import { initComputePool } from './compute-pool/poolInit.js'
-import * as computeQueries from './compute-pool/queries.js'
-import { type CommercialConfig, loadConfig } from './config.js'
-import { seedDefaultConnectors } from './connectors/declarativeSeed.js'
+  MEMORY_USAGE_PATH,
+  makeMemoryUsageHandler,
+} from "./http/internalMemoryUsage.js";
 import {
-  CONNECTORS_RPC_PREFIX,
-  type ConnectorsRpcHandler,
-  PLUGINS_RPC_PREFIX,
-  makeConnectorsRpcHandler,
-} from './connectors/rpc.js'
-import { startConnectorSweeper } from './connectors/sweeper.js'
-import { loadKmsKey, zeroBuffer } from './crypto/keys.js'
-import { closePool, createPool, getPool } from './db/index.js'
+  SKILL_USAGE_PATH,
+  isSkillUsageEnabled,
+  makeSkillUsageHandler,
+  type SkillUsageHandler,
+} from "./http/internalSkillUsage.js";
 import {
-  resolveLiveFrameMaintenanceDisabled,
-  resolveLiveFrameMaintenanceIntervalMs,
-  resolvePruneMaxBatches,
-  resolveRetireMinAgeMs,
-  startLiveFrameMaintenanceScheduler,
-} from './db/liveFrameMaintenanceScheduler.js'
-import { persistGatewayLiveFrame } from './db/liveTurnFrames.js'
-import { runMigrations } from './db/migrate.js'
+  SKILL_FEEDBACK_PATH,
+  makeSkillFeedbackHandler,
+  type SkillFeedbackHandler,
+} from "./http/internalSkillFeedback.js";
 import {
-  assertModelCatalogAdminPoolConfigured,
-  closeModelCatalogAdminPool,
-} from './db/modelCatalogAdmin.js'
-import { lookupLeaseCallbackSession } from './db/pgSessionsBackend.js'
+  SKILL_SHADOW_PATH,
+  isSkillShadowEnabled,
+  makeSkillShadowHandler,
+  type SkillShadowHandler,
+} from "./http/internalSkillShadow.js";
 import {
-  type AutomaticRecoveryDecision,
-  type DispatchAdmissionBackend,
-  type LosslessTurnTapeStorage,
-  _setAfterLosslessStageBatch,
-  commitVisibleLosslessTurnPhaseA,
-  createPgSessionsBackend,
-  startSessionsGcSweeper,
-} from './db/pgSessionsBackend.js'
-import { tx } from './db/queries.js'
-import { resolveSessionsStoreAuthority } from './db/sessionsStoreAuthority.js'
-import { startTapeJobScheduler } from './db/tapeJobScheduler.js'
-import {
-  type ControlListener,
-  createControlListener,
-  privatePortForSlot,
-} from './deploy/controlListener.js'
-// P3 双 master 蓝绿交接 + cohort 分批切流(RFC-v5-dual-master-cohort)。
-import type { Slot } from './deploy/deployState.js'
-import { type DesiredWatch, startDesiredWatch } from './deploy/deployState.js'
-import { type LaneMetricsSnapshot, getLaneMetricsSnapshot } from './deploy/laneEvaluate.js'
-import {
-  type BundleMemberHandle,
-  type LeaderBundle,
-  createLeaderBundle,
-} from './deploy/leaderBundle.js'
-import {
-  type LeaderLeaseController,
-  type LeadershipStatus,
-  createLeaderLeaseController,
-  resolveLeaderEnvEligibility,
-} from './deploy/leaderLease.js'
-import {
-  type SlotRelayLocal,
-  createSlotRelayClient,
-  handleSlotRelayRequest,
-} from './deploy/slotRelay.js'
-import { getDesktopFlagSnapshot } from './desktop/flags.js'
-import { extractDesktopTlsContext } from './desktop/tlsContext.js'
-import { makeContainerDispatchClient } from './dispatch/containerDispatchClient.js'
-import { makeEnginePreheatClient } from './dispatch/enginePreheatClient.js'
-import { resolveDispatchEndpoint } from './dispatch/resolveDispatchEndpoint.js'
-import {
-  DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS,
-  buildTurnDispatchReconcileFrame,
-  resolveDispatchStuckThresholdMs,
-  runShutdownDispatchHandoff,
-  startTurnDispatchReconciler,
-} from './dispatch/turnDispatchReconciler.js'
-import { createBoxReplayRecoveryWriter } from './egress/boxReplaySetup.js'
-import { assertFlavorIdentity } from './flavor/assertFlavor.js'
-import { startGithubWorkspaceSweeper } from './github/sessionWorkspaces.js'
-import { GoalStateService } from './goal/goalStateService.js'
-import {
-  GROK_VISION_PATH,
-  type GrokVisionHandler,
-  makeGrokVisionHandler,
-} from './grok/visionProxy.js'
-import {
-  GROK_WEB_SEARCH_PATH,
-  type GrokWebSearchHandler,
-  makeGrokWebSearchHandler,
-} from './grok/webSearchProxy.js'
-import type { AgentHttpDeps } from './http/agent.js'
-import {
-  type AnthropicProxyHandler,
-  ConcurrencyLimiter,
-  DEFAULT_MAX_CONCURRENT_PER_UID,
-  DEFAULT_PROXY_RATE_LIMIT,
-  FallbackRateLimiter,
-  makeAnthropicProxyHandler,
-} from './http/anthropicProxy.js'
-import type { ChatGptProxyHttpDeps } from './http/chatgptProxy.js'
-import {
-  buildCodexRelayHandler,
-  buildCodexTokenRefreshHandler,
-} from './http/codexInternalAssembly.js'
-import { handleDesktopRuntimeManifest } from './http/desktopBootstrap.js'
-import {
-  createPgDesktopIdentityRepo,
-  desktopTokenRequestContext,
-  handleDesktopTokenMint,
-  handleDesktopTokenRefresh,
-  startDesktopEnrollmentSweep,
-} from './http/desktopEnroll.js'
-import { makeDesktopRequestVerifier, startDesktopTlsListener } from './http/desktopTlsListener.js'
-import {
-  ANTIGRAVITY_RELAY_PREFIX,
-  type AntigravityRelayHandler,
-  makeAntigravityRelayHandler,
-} from './http/internalAntigravityRelay.js'
+  AUTO_DREAM_POLICY_PATH,
+  makeAutoDreamPolicyHandler,
+  type AutoDreamPolicyHandler,
+} from "./http/internalAutoDreamPolicy.js";
 import {
   AUTO_DREAM_OPTIMIZER_ABANDON_PATH,
   AUTO_DREAM_OPTIMIZER_ACTION_PATH,
   AUTO_DREAM_OPTIMIZER_ADMIT_PATH,
   AUTO_DREAM_OPTIMIZER_FINDINGS_PATH,
   AUTO_DREAM_OPTIMIZER_SETTLE_PATH,
-  type AutoDreamOptimizerRuntime,
   isAutoDreamOptimizerInternalPath,
   makeAutoDreamOptimizerHandler,
   projectAutoDreamCodexRoute,
-} from './http/internalAutoDreamOptimizer.js'
+  type AutoDreamOptimizerRuntime,
+} from "./http/internalAutoDreamOptimizer.js";
 import {
-  AUTO_DREAM_POLICY_PATH,
-  type AutoDreamPolicyHandler,
-  makeAutoDreamPolicyHandler,
-} from './http/internalAutoDreamPolicy.js'
-import {
-  CODEX_RELAY_PREFIX,
-  type CodexRelayHandler,
-  makeDefaultCodexRelayDb,
-} from './http/internalCodexRelay.js'
-import {
-  CODEX_TOKEN_REFRESH_PATH,
-  type CodexTokenRefreshHandler,
-} from './http/internalCodexTokenRefresh.js'
-import {
-  CORE_MEMORY_RANK_PATH,
-  type CoreMemoryRankHandler,
-  makeCoreMemoryRankHandler,
-} from './http/internalCoreMemoryRank.js'
-import {
-  COST_EVENT_PATH,
-  type CostEventHandler,
-  makeCostEventHandler,
-} from './http/internalCostEvent.js'
-import {
-  CRON_INDEX_PATH,
-  type CronIndexHandler,
-  makeCronIndexHandler,
-} from './http/internalCronIndex.js'
-import {
-  CRON_ORIGIN_INJECT_PATH,
-  type CronOriginInjectHandler,
-  makeCronOriginInjectHandler,
-} from './http/internalCronOriginInject.js'
-import {
-  type DelegateEngineBillingRuntime,
   isDelegateEngineBillingInternalPath,
   makeDelegateEngineBillingHandler,
-} from './http/internalDelegateEngineBilling.js'
+  type DelegateEngineBillingRuntime,
+} from "./http/internalDelegateEngineBilling.js";
+import { createDelegateEngineBillingRuntime } from "./billing/delegateEngineBillingRuntime.js";
 import {
-  type DelegateGrokRouteAllocation,
-  type DelegateGrokRouteHandler,
-  isDelegateGrokRoutePath,
-  makeDelegateGrokRouteHandler,
-} from './http/internalDelegateGrokRoute.js'
+  applyAutoDreamPreferenceAction,
+  reportAutoDreamPlatformFindings,
+} from "./autoDream/optimizerStore.js";
+import { getUserSignalTrafficClass } from "./analytics/signalTraffic.js";
 import {
-  GROK_RELAY_PREFIX,
-  type GrokRelayHandler,
-  makeGrokRelayHandler,
-  makeGrokRelayHealthRecorder,
-} from './http/internalGrokRelay.js'
+  CRON_INDEX_PATH,
+  makeCronIndexHandler,
+  type CronIndexHandler,
+} from "./http/internalCronIndex.js";
+import {
+  CRON_ORIGIN_INJECT_PATH,
+  makeCronOriginInjectHandler,
+  type CronOriginInjectHandler,
+} from "./http/internalCronOriginInject.js";
 import {
   INBOX_ALERT_PATH,
   INBOX_POST_PATH,
-  type InboxPostHandler,
   makeInboxPostHandler,
-} from './http/internalInboxPost.js'
-import {
-  LEASE_CALLBACK_PATH,
-  LEASE_CALLBACK_VALIDATE_PATH,
-  makeLeaseCallbackHandler,
-} from './http/internalLeaseCallback.js'
-import {
-  MARKETPLACE_AGENT_PREFIX,
-  type MarketplaceAgentHandler,
-  makeMarketplaceAgentHandler,
-} from './http/internalMarketplaceAgent.js'
-import {
-  MARKETPLACE_SYNC_PATH,
-  type MarketplaceSyncHandler,
-  makeMarketplaceSyncHandler,
-} from './http/internalMarketplaceSync.js'
-import { MEMORY_USAGE_PATH, makeMemoryUsageHandler } from './http/internalMemoryUsage.js'
+  type InboxPostHandler,
+} from "./http/internalInboxPost.js";
 import {
   MODEL_CATALOG_EPOCH_PATH,
   MODEL_CATALOG_PATH,
-  type ModelCatalogHandler,
   assertSeedModelsActive,
   makeModelCatalogHandler,
-} from './http/internalModelCatalog.js'
+  type ModelCatalogHandler,
+} from "./http/internalModelCatalog.js";
 import {
-  PLATFORM_PROMPT_SLOTS_PATH,
-  type PlatformPromptSlotsHandler,
-  makePlatformPromptSlotsHandler,
-} from './http/internalPlatformPromptSlots.js'
+  authorityKeyringProvider,
+  getModelCatalogCache,
+  isModelAuthorityEnforced,
+  peekModelCatalogCache,
+} from "./billing/modelCatalogRuntime.js";
 import {
-  type InternalProjectAssetsHandler,
-  PROJECT_ASSETS_REGISTER_PATH,
-  makeInternalProjectAssetsHandler,
-} from './http/internalProjectAssets.js'
+  MASTER_CAPABILITIES,
+  assertModelAuthorityCutoverFloor,
+} from "./runtimeCapabilities.js";
 import {
-  type InternalProjectContextHandler,
-  PROJECT_CONTEXT_PATH,
-  makeInternalProjectContextHandler,
-} from './http/internalProjectContext.js'
+  makePgSkillEmbedCache,
+  makePgSkillSearchLogger,
+} from "./http/skillEmbedCachePg.js";
 import {
-  type InternalProjectSearchHandler,
-  PROJECT_SEARCH_PATH,
-  makeInternalProjectSearchHandler,
-} from './http/internalProjectSearch.js'
+  appendCostCredits,
+  appendServerAuthoredMessage,
+  appendServerAuthoredMessageForRequest,
+  appendServerAuthoredMessageDrainByUser,
+  drainDelegateCostForClientSession,
+  getClientSession,
+  patchServerAuthoredMessage,
+  readArchivedMessages,
+  getEngineContextMessages,
+  hasCompletedClientTurn,
+  // P1.7 slice 7c — broker assembly 需要的 master sqlite helpers
+  upsertMasterClientSession,
+  softDeleteMasterSession,
+  allMasterWsessRows,
+  getWechatBindingByUserId,
+  // P2 master 会话权威迁 PG(RFC-v5-sessions-pg D1):一次性注入 backend 的 composition root 入口。
+  setClientSessionsBackend,
+} from "@openclaude/storage";
 import {
-  PROMPT_QUEUE_CLAIM_PATH,
-  PROMPT_QUEUE_DETAIL_PATH,
-  PROMPT_QUEUE_MUTATION_PATH,
-  PROMPT_QUEUE_SNAPSHOT_PATH,
-  type PromptQueueHandler,
-  isPromptQueueV1Enabled,
-  makePromptQueueHandler,
-} from './http/internalPromptQueue.js'
+  createPgSessionsBackend,
+  commitVisibleLosslessTurnPhaseA,
+  _setAfterLosslessStageBatch,
+  type AutomaticRecoveryDecision,
+  type DispatchAdmissionBackend,
+  startSessionsGcSweeper,
+  type LosslessTurnTapeStorage,
+} from "./db/pgSessionsBackend.js";
+import { persistGatewayLiveFrame } from "./db/liveTurnFrames.js";
+import { makeContainerDispatchClient } from "./dispatch/containerDispatchClient.js";
+import { makeEnginePreheatClient } from "./dispatch/enginePreheatClient.js";
 import {
-  SERVER_AUTHORED_PATH,
-  type ServerAuthoredHandler,
-  TURN_TAPE_STATE_PATH,
-  makeServerAuthoredHandler,
-  makeTurnTapeStateHandler,
-} from './http/internalServerAuthored.js'
+  resolveDispatchStuckThresholdMs,
+  startTurnDispatchReconciler,
+  buildTurnDispatchReconcileFrame,
+  runShutdownDispatchHandoff,
+  DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS,
+} from "./dispatch/turnDispatchReconciler.js";
+import { resolveSessionsStoreAuthority } from "./db/sessionsStoreAuthority.js";
+import { getLaneMetricsSnapshot, type LaneMetricsSnapshot } from "./deploy/laneEvaluate.js";
 import {
-  SKILL_EMBED_PREFIX,
-  type SkillEmbedHandler,
-  makeSkillEmbedHandler,
-} from './http/internalSkillEmbed.js'
+  WECHAT_OUTBOUND_PATH,
+  makeOutboundReceiverHandler,
+  type WechatCodexBillingBody,
+} from "./wechat/outboundReceiver.js";
 import {
-  SKILL_FEEDBACK_PATH,
-  type SkillFeedbackHandler,
-  makeSkillFeedbackHandler,
-} from './http/internalSkillFeedback.js'
-import {
-  SKILL_SHADOW_PATH,
-  type SkillShadowHandler,
-  isSkillShadowEnabled,
-  makeSkillShadowHandler,
-} from './http/internalSkillShadow.js'
-import {
-  SKILL_USAGE_PATH,
-  type SkillUsageHandler,
-  isSkillUsageEnabled,
-  makeSkillUsageHandler,
-} from './http/internalSkillUsage.js'
-import {
-  TOOL_CALL_ROLLUP_PATH,
-  TOOL_FAILURE_AUDIT_PATH,
-  type ToolCallRollupHandler,
-  type ToolFailureAuditHandler,
-  isToolFailureAuditEnabled,
-  makeToolCallRollupHandler,
-  makeToolFailureAuditHandler,
-} from './http/internalToolFailureAudit.js'
-import {
-  TURN_LEASE_RENEW_PATH,
-  type TurnLeaseRenewHandler,
-  makeTurnLeaseRenewHandler,
-} from './http/internalTurnLeaseRenew.js'
-import {
-  TURN_OBSERVATION_PATH,
-  makeTurnObservationHandler,
-} from './http/internalTurnObservation.js'
-import {
-  TURN_WAIVE_PATH,
-  type TurnWaiveHandler,
-  makeTurnWaiveHandler,
-} from './http/internalTurnWaive.js'
-import {
-  ZCODE_RELAY_PREFIX,
-  type ZcodeRelayHandler,
-  makeZcodeRelayHandler,
-} from './http/internalZcodeRelay.js'
-import { deriveMediaSignKey } from './http/mediaSign.js'
-import { ThumbnailDiskCache } from './http/mediaThumbnail.js'
-import { createProductionBoxAccountResolver } from './http/proxy/boxAccountResolver.js'
-import { BoxDurableJournal } from './http/proxy/boxDurableJournal.js'
-import { BoxRemoteCleanupWorker } from './http/proxy/boxRemoteCleanupWorker.js'
-import { type CursorExternalRoute, makeCursorExternalRoute } from './http/proxy/cursorExternal.js'
-import {
-  type ExternalModelsHandler,
-  makeExternalModelsHandler,
-} from './http/proxy/externalModels.js'
-import { type ExternalUsageHandler, makeExternalUsageHandler } from './http/proxy/externalUsage.js'
-import {
-  STATIC_PROVIDER_META,
-  assertPlatformDefaultModelConfigured,
-  staticProviderKeysFromConfig,
-} from './http/proxy/staticProviderMeta.js'
-import { type CommercialHandler, createCommercialHandler } from './http/router.js'
-import { makePgSkillEmbedCache, makePgSkillSearchLogger } from './http/skillEmbedCachePg.js'
-import { type InboxEmailSchedulerHandle, startInboxEmailScheduler } from './inbox/email.js'
-import { createCronDeliveryInboxMessage, createInboxMessage } from './inbox/inbox.js'
-import { type OnboardingSchedulerHandle, startOnboardingScheduler } from './inbox/onboarding.js'
+  WECHAT_PROACTIVE_PATH,
+  makeProactiveReceiverHandler,
+  canonicalWechatSenderId,
+  type ProactiveReceiverHandler,
+} from "./wechat/proactiveReceiver.js";
+import { getCurrentSessionId } from "./wechat/sessionPointer.js";
+import { MASTER_USER_PREFIX } from "./wechat/userIds.js";
 import {
   LITERATURE_SEARCH_PATH,
-  type LiteratureProxyHandler,
   makeLiteratureProxyHandler,
-} from './literatureProxy.js'
-import { LITERATURE_SKILL_POINTER } from './literatureSkill.js'
-import { rootLogger } from './logging/logger.js'
+  type LiteratureProxyHandler,
+} from "./literatureProxy.js";
 import {
-  type MarketplaceAiReviewSchedulerHandle,
-  startMarketplaceAiReviewScheduler,
-} from './marketplace/aiReview.js'
+  CONNECTORS_RPC_PREFIX,
+  PLUGINS_RPC_PREFIX,
+  makeConnectorsRpcHandler,
+  type ConnectorsRpcHandler,
+} from './connectors/rpc.js'
+import { PREFS_PLUGIN_ENABLEMENT } from './plugins/enablement.js'
+import { PluginRuntimeFacade } from './plugins/runtime.js'
+import { ManagedBrowserRuntime } from './plugins/browserRuntime.js'
 import {
-  seedPlatformGeneralAgents,
-  seedPlatformResearchAgents,
-} from './marketplace/seedPlatformAgents.js'
-import {
-  MEDIA_GENERATION_INTERNAL_PREFIX,
-  type MediaGenerationInternalHandler,
-  makeMediaGenerationInternalHandler,
-} from './media-generation/http.js'
-import { MediaGenerationService } from './media-generation/service.js'
-import { wrapIoredis } from './middleware/rateLimit.js'
-import {
-  MINIMAX_MEDIA_PATH,
-  type MiniMaxMediaHandler,
-  makeMiniMaxMediaHandler,
-} from './minimax/mediaProxy.js'
-import {
-  MINIMAX_WEB_SEARCH_PATH,
-  type MiniMaxWebSearchHandler,
-  makeMiniMaxWebSearchHandler,
-} from './minimax/webSearchProxy.js'
-import { OCR_PREFIX, type OcrProxyHandler, makeOcrProxyHandler } from './ocr/ocrProxy.js'
-import { PgOcrJobStore } from './ocr/ocrStore.js'
-import {
-  type HupijiaoClient,
-  type HupijiaoConfig,
-  createHttpHupijiaoClient,
-} from './payment/hupijiao/client.js'
-import {
-  type SweeperHandle as PendingOrdersExpirerHandle,
-  startPendingOrdersExpirer,
-} from './payment/pendingOrdersExpirer.js'
-import { makePlatformContextLoader } from './platform/platformContextLoader.js'
-import { makeDefaultVolumeContextReader } from './platform/volumeContextReader.js'
+  KnowledgePlanetDockerService,
+  createKnowledgePlanetRuntimeRegistries,
+} from './plugins/knowledgePlanet.js'
+import { KnowledgePlanetSetupManager } from './plugins/knowledgePlanetSetup.js'
+import { KnowledgePlanetAutomationService } from './plugins/knowledgePlanetAutomation.js'
+import { startKnowledgePlanetAutomationScheduler } from './plugins/knowledgePlanetAutomationScheduler.js'
+import { WeiboDockerService, createWeiboRuntimeRegistries } from './plugins/weibo.js'
+import { WeiboSetupManager } from './plugins/weiboSetup.js'
+import { ZhihuDockerService, createZhihuRuntimeRegistries } from './plugins/zhihu.js'
+import { ZhihuSetupManager } from './plugins/zhihuSetup.js'
 import {
   BILI_ACCOUNT_BROKER_ROOT,
   BILI_ACCOUNT_WORKER_ROOT,
@@ -680,104 +585,216 @@ import {
   createBiliAccountRuntimeRegistries,
 } from './plugins/biliAccount.js'
 import { BiliAccountSetupManager } from './plugins/biliAccountSetup.js'
-import { ManagedBrowserRuntime } from './plugins/browserRuntime.js'
-import { PREFS_PLUGIN_ENABLEMENT } from './plugins/enablement.js'
+import { seedDefaultConnectors } from './connectors/declarativeSeed.js'
+import { startConnectorSweeper } from './connectors/sweeper.js'
 import {
-  KnowledgePlanetDockerService,
-  createKnowledgePlanetRuntimeRegistries,
-} from './plugins/knowledgePlanet.js'
-import { KnowledgePlanetAutomationService } from './plugins/knowledgePlanetAutomation.js'
-import { startKnowledgePlanetAutomationScheduler } from './plugins/knowledgePlanetAutomationScheduler.js'
-import { KnowledgePlanetSetupManager } from './plugins/knowledgePlanetSetup.js'
-import { PluginRuntimeFacade } from './plugins/runtime.js'
-import { WeiboDockerService, createWeiboRuntimeRegistries } from './plugins/weibo.js'
-import { WeiboSetupManager } from './plugins/weiboSetup.js'
-import { ZhihuDockerService, createZhihuRuntimeRegistries } from './plugins/zhihu.js'
-import { ZhihuSetupManager } from './plugins/zhihuSetup.js'
-import { recordProductFrictionEvent } from './productFriction/events.js'
-import { PgPromptQueueStore } from './promptQueue/pgPromptQueueStore.js'
-import { readQqBotConfig } from './qqbot/config.js'
-import { makeSaveQqMediaToUserUploads } from './qqbot/mediaIngest.js'
-import { makeQqOutboundMediaResolver } from './qqbot/outboundMedia.js'
+  RESEARCH_PREFIX,
+  makeResearchProxyHandler,
+  type ResearchProxyHandler,
+} from "./research/researchProxy.js";
+import {
+  OCR_PREFIX,
+  makeOcrProxyHandler,
+  type OcrProxyHandler,
+} from "./ocr/ocrProxy.js";
+import { PgOcrJobStore } from "./ocr/ocrStore.js";
+import { getResearchConfigPublic } from "./admin/researchConfig.js";
+import {
+  seedPlatformGeneralAgents,
+  seedPlatformResearchAgents,
+} from "./marketplace/seedPlatformAgents.js";
+import {
+  PLATFORM_PROMPT_SLOTS_PATH,
+  makePlatformPromptSlotsHandler,
+  type PlatformPromptSlotsHandler,
+} from "./http/internalPlatformPromptSlots.js";
+import {
+  PROJECT_CONTEXT_PATH,
+  makeInternalProjectContextHandler,
+  type InternalProjectContextHandler,
+} from "./http/internalProjectContext.js";
+import {
+  PROJECT_ASSETS_REGISTER_PATH,
+  makeInternalProjectAssetsHandler,
+  type InternalProjectAssetsHandler,
+} from "./http/internalProjectAssets.js";
+import {
+  PROJECT_SEARCH_PATH,
+  makeInternalProjectSearchHandler,
+  type InternalProjectSearchHandler,
+} from "./http/internalProjectSearch.js";
+import {
+  MINIMAX_MEDIA_PATH,
+  makeMiniMaxMediaHandler,
+  type MiniMaxMediaHandler,
+} from "./minimax/mediaProxy.js";
+import {
+  MINIMAX_WEB_SEARCH_PATH,
+  makeMiniMaxWebSearchHandler,
+  type MiniMaxWebSearchHandler,
+} from "./minimax/webSearchProxy.js";
+import {
+  GROK_WEB_SEARCH_PATH,
+  makeGrokWebSearchHandler,
+  type GrokWebSearchHandler,
+} from "./grok/webSearchProxy.js";
+import {
+  GROK_VISION_PATH,
+  makeGrokVisionHandler,
+  type GrokVisionHandler,
+} from "./grok/visionProxy.js";
+import { MediaGenerationService } from "./media-generation/service.js";
+import {
+  MEDIA_GENERATION_INTERNAL_PREFIX,
+  makeMediaGenerationInternalHandler,
+  type MediaGenerationInternalHandler,
+} from "./media-generation/http.js";
+import {
+  makeInboundDispatcher,
+  type PrepareWechatCodexTurnResult,
+} from "./wechat/inboundDispatcher.js";
+import { handleWechatModelCommand } from "./wechat/modelCommand.js";
+import { pickWechatInboundModel } from "./wechat/modelResolver.js";
+import { makeNodeHttpContainerTransport } from "./wechat/nodeHttpContainerTransport.js";
+import { makeIlinkSendAdapter, makeIlinkSendMediaAdapter } from "./wechat/ilinkSendAdapter.js";
+import { makeSaveWechatMediaToUserUploads } from "./wechat/imageIngest.js";
+import { makeWechatOutboundMediaResolver } from "./wechat/outboundMedia.js";
+import { createNoopRateLimiter } from "./wechat/rateLimiter.js";
+import { makeWechatBroker, type WechatBroker } from "./wechat/broker.js";
+import { readQqBotConfig } from "./qqbot/config.js";
+import {
+  makeQqBotService,
+  qqInboundChannelProfile,
+  type QqBotService,
+} from "./qqbot/service.js";
+import { makeSaveQqMediaToUserUploads } from "./qqbot/mediaIngest.js";
+import { makeQqOutboundMediaResolver } from "./qqbot/outboundMedia.js";
 import {
   QQ_OUTBOUND_PATH,
   QQ_PROACTIVE_PATH,
   makeQqOutboundReceiver,
   makeQqProactiveReceiver,
-} from './qqbot/receiver.js'
-import { type QqBotService, makeQqBotService, qqInboundChannelProfile } from './qqbot/service.js'
-import { RemoteHostError } from './remoteHosts/service.js'
-import { setRemoteMuxDeps } from './remoteHosts/sshMux.js'
-import { makeResearchFetchJobHandlers } from './research/fetchJobs.js'
+} from "./qqbot/receiver.js";
+import { createPgIdentityRepo } from "./auth/containerIdentity.js";
+import { makeContainerIdentityStrategy } from "./auth/proxyIdentity.js";
+import { makeLoadUserModelAuthz } from "./auth/userModelAuthz.js";
+import { getProviderRoutingAvailability } from "./admin/providerHealthGate.js";
+import { makePgApiKeyRepo } from "./auth/apiKeyRepo.js";
+import { makeApiKeyIdentityStrategy, resolveApiKeyIdentity } from "./auth/apiKeyIdentity.js";
+import { makeExternalModelsHandler, type ExternalModelsHandler } from "./http/proxy/externalModels.js";
+import { makeExternalUsageHandler, type ExternalUsageHandler } from "./http/proxy/externalUsage.js";
 import {
-  RESEARCH_PREFIX,
-  type ResearchProxyHandler,
-  makeResearchProxyHandler,
-} from './research/researchProxy.js'
-import { type ResearchJobSchedulerHandle, startResearchJobScheduler } from './research/scheduler.js'
-import { MASTER_CAPABILITIES, assertModelAuthorityCutoverFloor } from './runtimeCapabilities.js'
-import { getRuntimeChannel } from './runtimeChannel.js'
-import {
-  type IncidentReconcilerHandle,
-  type IncidentSweeperHandle,
-  assertSelfhealConfig,
-  selfhealTickMs,
-  startIncidentReconciler,
-  startIncidentSweeper,
-} from './selfheal/index.js'
-import { startUserNoticeApproval } from './selfheal/userNoticeApproval.js'
-import { getPreferences, patchPreferences } from './user/preferences.js'
-import { type WechatBroker, makeWechatBroker } from './wechat/broker.js'
-import { makeDesktopContainerTransport } from './wechat/desktopContainerTransport.js'
-import { makeIlinkSendAdapter, makeIlinkSendMediaAdapter } from './wechat/ilinkSendAdapter.js'
-import { makeSaveWechatMediaToUserUploads } from './wechat/imageIngest.js'
-import {
-  type PrepareWechatCodexTurnResult,
-  makeInboundDispatcher,
-} from './wechat/inboundDispatcher.js'
-import { deriveWechatLiveLinkKey } from './wechat/liveShare.js'
-import { handleWechatModelCommand } from './wechat/modelCommand.js'
-import { pickWechatInboundModel } from './wechat/modelResolver.js'
-import { makeNodeHttpContainerTransport } from './wechat/nodeHttpContainerTransport.js'
-import { makeWechatOutboundMediaResolver } from './wechat/outboundMedia.js'
-import {
-  WECHAT_OUTBOUND_PATH,
-  type WechatCodexBillingBody,
-  makeOutboundReceiverHandler,
-} from './wechat/outboundReceiver.js'
-import {
-  type ProactiveReceiverHandler,
-  WECHAT_PROACTIVE_PATH,
-  canonicalWechatSenderId,
-  makeProactiveReceiverHandler,
-} from './wechat/proactiveReceiver.js'
-import { createNoopRateLimiter } from './wechat/rateLimiter.js'
-import { getCurrentSessionId } from './wechat/sessionPointer.js'
-import { MASTER_USER_PREFIX } from './wechat/userIds.js'
-import { AuthoritySigner } from './ws/authoritySigner.js'
-import {
-  CONTAINER_PREVIEW_MAX_FRAME_BYTES,
-  type ContainerPreviewBridgeHandler,
-  createContainerPreviewBridge,
-} from './ws/containerPreviewBridge.js'
-import { ContainerPreviewTicketStore } from './ws/containerPreviewTickets.js'
-import { getDesktopTunnelRegistry } from './ws/desktopTunnelRegistry.js'
-import {
-  type DirectContainerPreviewService,
-  createDirectContainerPreviewService,
-} from './ws/directContainerPreview.js'
-import { createFrontendBuildProbe } from './ws/frontendBuild.js'
-import { createTunnelContainerSocket } from './ws/tunnelContainerSocket.js'
-import {
-  type BridgeMetricSink,
-  type CodexBindingHandle,
+  createUserChatBridge,
   ContainerUnreadyError,
   DEFAULT_MAX_FRAME_BYTES,
+  type CodexBindingHandle,
   type ResolveContainerEndpoint,
   type UserChatBridgeHandler,
-  createUserChatBridge,
-} from './ws/userChatBridge.js'
-import { type VoiceTranscribeHandler, createVoiceTranscribeHandler } from './ws/voiceTranscribe.js'
+  type BridgeMetricSink,
+} from "./ws/userChatBridge.js";
+import { createFrontendBuildProbe } from "./ws/frontendBuild.js";
+import {
+  createVoiceTranscribeHandler,
+  type VoiceTranscribeHandler,
+} from "./ws/voiceTranscribe.js";
+import {
+  composeMultiplier,
+  getAgentCostMultiplier,
+  listAgentCostOverrides,
+} from "./billing/agentMultiplier.js";
+import {
+  startInflightJournal,
+  type JournalFailureCode,
+} from "./billing/proxyBilling.js";
+import {
+  DURABLE_CODEX_RECOVERY_VERSION,
+  deriveEngineSessionId,
+  makeCodexFinalizer,
+  type CodexFinalizeHandle,
+} from "./billing/codexFinalizer.js";
+import { settleDurableCodexBilling } from "./billing/durableCodexBilling.js";
+import { isCursorDurableBilling, settleDurableCursorBilling } from "./billing/durableCursorBilling.js";
+import { parseZeroChargeCutoff, startCursorAuditReconciler } from "./billing/cursorAuditReconciler.js";
+import { serializeBillingPricing } from "./billing/persistedBillingPricing.js";
+import { createTunnelContainerSocket } from "./ws/tunnelContainerSocket.js";
+import {
+  CONTAINER_PREVIEW_MAX_FRAME_BYTES,
+  createContainerPreviewBridge,
+  type ContainerPreviewBridgeHandler,
+} from "./ws/containerPreviewBridge.js";
+import { ContainerPreviewTicketStore } from "./ws/containerPreviewTickets.js";
+import {
+  createDirectContainerPreviewService,
+  type DirectContainerPreviewService,
+} from "./ws/directContainerPreview.js";
+import {
+  DEFAULT_V3_CCB_BASELINE_DIR,
+  lookupContainerUserRole,
+  resolveCcbBaselineMounts,
+  makePrewarmContainer,
+  makeUidSingleflight,
+  makeV3EnsureRunning,
+  makeDesktopOrDockerResolver,
+  makeInboundChannelResolver,
+  preheatV3Image,
+  startIdleSweepScheduler,
+  INITIAL_SWEEP_BATCH_LIMIT,
+  startMigrationReconcileScheduler,
+  startOrphanReconcileScheduler,
+  markV3ContainerActivity,
+  startV3ContainerEventsWorker,
+  startVolumeGcScheduler,
+  createUserMediaResolver,
+  createSyntheticEvalOverlayRuntime,
+  isUserVolumeMediaPath,
+  readSyntheticEvalReleaseSourceCommit,
+  resolvePlatformBundleMount,
+  resolveRuntimeReleaseMount,
+  DEFAULT_PLATFORM_ROOT,
+  DEFAULT_RUNTIME_RELEASES_ROOT,
+  type IdleSweepScheduler,
+  type MigrationReconcileScheduler,
+  type OrphanReconcileScheduler,
+  type UserMediaLocation,
+  type V3ContainerEventsWorker,
+  type V3SupervisorDeps,
+  type V3RuntimeTuple,
+  type VolumeGcScheduler,
+} from "./agent-sandbox/index.js";
+import {
+  observeWsBridgeBuffered,
+  observeWsBridgeSessionDuration,
+  observeWsBridgeTtft,
+} from "./admin/metrics.js";
+import { shutdownDurableMetricRollups } from "./admin/durableMetricRollups.js";
+import { loadOrCreateBridgeSecret, DEFAULT_BRIDGE_SECRET_PATH } from "./bridgeSecret.js";
+import { setRemoteMuxDeps } from "./remoteHosts/sshMux.js";
+import { RemoteHostError } from "./remoteHosts/service.js";
+import * as computeQueries from "./compute-pool/queries.js";
+import {
+  hostRowToTarget,
+  resolveServiceableHostTarget,
+  startSshControlMaster,
+  stopSshControlMaster,
+  putFile as nodeAgentPutFile,
+  deleteFile as nodeAgentDeleteFile,
+  getFile as nodeAgentGetFile,
+} from "./compute-pool/nodeAgentClient.js";
+import { createContainerService } from "./compute-pool/containerService.js";
+import { getHealthPoller, type HealthPoller } from "./compute-pool/nodeHealth.js";
+import { initComputePool } from "./compute-pool/poolInit.js";
+import { getImagePromoteScheduler } from "./compute-pool/imagePromote.js";
+import {
+  getBaselineServer,
+  type BaselineServer,
+} from "./compute-pool/baselineServer.js";
+import {
+  ensureCa,
+  ensureMasterLeaf,
+  extractSpiffeUris,
+  extractHostUuidFromSpiffe,
+} from "./compute-pool/certAuthority.js";
+import type { ServerResponse } from "node:http";
 
 /**
  * 控制面 leader 判定(单一权威,可测)。返回 true = 本实例是控制面 leader
@@ -800,11 +817,11 @@ export function resolveControlPlaneLeader(
   env: Record<string, string | undefined>,
   runtimeChannel: string,
 ): boolean {
-  const explicit = env.OC_CONTROL_PLANE_LEADER?.trim()
-  if (explicit === '1') return true
-  if (explicit === '0') return false
-  if (runtimeChannel === 'v5') return false
-  return env.COMMERCIAL_CONTROL_PLANE_DISABLED !== '1'
+  const explicit = env.OC_CONTROL_PLANE_LEADER?.trim();
+  if (explicit === "1") return true;
+  if (explicit === "0") return false;
+  if (runtimeChannel === "v5") return false;
+  return env.COMMERCIAL_CONTROL_PLANE_DISABLED !== "1";
 }
 
 /**
@@ -820,20 +837,20 @@ function shouldAutoMigrate(
   env: Record<string, string | undefined> = process.env,
   warn: (msg: string) => void = (m) => {
     // eslint-disable-next-line no-console
-    console.warn(m)
+    console.warn(m);
   },
 ): boolean {
-  const raw = env.COMMERCIAL_AUTO_MIGRATE
-  if (raw === undefined || raw === '' || raw === '1') return true
-  if (raw === '0') return false
+  const raw = env.COMMERCIAL_AUTO_MIGRATE;
+  if (raw === undefined || raw === "" || raw === "1") return true;
+  if (raw === "0") return false;
   // 无法识别的值:运维最常见的失误是写成 "true"/"false"/"no" —— 我们继续
   // 执行 migration(默认开),但要 warn。坚持 "只有 0 才关" 的严格口径,
   // 但不让它 fail hard(和 COMMERCIAL_ENABLED 的严格枚举不同)。
   warn(
     `[commercial] COMMERCIAL_AUTO_MIGRATE=${JSON.stringify(raw)} not recognized; ` +
       "auto-migrate remains ON. Use exactly '0' to disable.",
-  )
-  return true
+  );
+  return true;
 }
 
 /**
@@ -843,32 +860,32 @@ function shouldAutoMigrate(
  */
 export interface CommercialRuntimeStatus {
   /** 运行时 channel 单一权威(OC_RUNTIME_CHANNEL),默认 "v3"。 */
-  channel: string
+  channel: string;
   /** 后台控制面 mutator 是否启用(v5 follower 恒为 false)。 */
-  controlPlaneEnabled: boolean
+  controlPlaneEnabled: boolean;
   /** 启动是否执行了共享 PG migration(COMMERCIAL_AUTO_MIGRATE)。 */
-  autoMigrate: boolean
+  autoMigrate: boolean;
   /** legacy agent 运行时(AGENT_IMAGE/docker)状态。 */
-  agentRuntime: 'enabled' | 'disabled'
+  agentRuntime: "enabled" | "disabled";
   /** v3 supervisor 容器运行时(OC_RUNTIME_IMAGE)状态。 */
-  containerRuntime: 'enabled' | 'disabled'
+  containerRuntime: "enabled" | "disabled";
   /** 当前存活的后台 scheduler/actor 名单(v5 follower 必须为空)。live getter:反映 LeaderBundle 实时启停。 */
-  schedulers: string[]
+  schedulers: string[];
   /**
    * 本 master 构建实现的协议能力(见 runtimeCapabilities.ts)。**构建级事实,不是开关态** ——
    * deploy 的四面 capability 守卫读 `/healthz` 的 `runtime.capabilities` 判断"这个 master
    * 版本认不认模型权威协议",据此拒绝把不认的旧版本翻上来(方案 §7 步 5 兼容地板)。
    * 注:gateway 顶层的 `body.capabilities` 是**容器 file-proxy 面**的语义,与本字段无关。
    */
-  capabilities: string[]
+  capabilities: string[];
   /**
    * P3 leader lease 归属(RFC-v5-dual-master-cohort D4)。healthz 只读断言面:
    * state=ineligible(env kill-switch)|standby(有 env 资格但 desired 非本 slot)|
    * acquiring|leader|fenced。env=1 不再等同 active leader(smoke 断言随之改为断言 state=leader)。
    */
-  leadership: LeadershipStatus
+  leadership: LeadershipStatus;
   /** P3 lane 放量观测快照(evaluateLane 命中计数,详见 deploy/laneEvaluate.ts)。 */
-  laneMetrics: LaneMetricsSnapshot
+  laneMetrics: LaneMetricsSnapshot;
 }
 
 export interface RegisterCommercialResult {
@@ -876,17 +893,17 @@ export interface RegisterCommercialResult {
    * HTTP 处理器:gateway 在自身 handleHttp 入口前调用,
    * 返回 true 表示已处理完毕,gateway 不再继续路由。
    */
-  handle: CommercialHandler
+  handle: CommercialHandler;
   /** v5 灰度运行时状态(见 CommercialRuntimeStatus)。 */
-  runtimeStatus?: CommercialRuntimeStatus
+  runtimeStatus?: CommercialRuntimeStatus;
   /**
    * WebSocket upgrade 处理器:gateway 在 HTTP server 的 `upgrade` 事件里调用。
    * 返回 true → commercial 已处理(可能是鉴权失败 + destroy,也可能是成功 upgrade);
    * 返回 false → 非 commercial 路由(如 `/ws`),gateway 自行处理。
    */
-  handleWsUpgrade: (req: IncomingMessage, socket: Duplex, head: Buffer) => boolean
+  handleWsUpgrade: (req: IncomingMessage, socket: Duplex, head: Buffer) => boolean;
   /** 关闭所有商业化资源(pool / redis / ws)。 */
-  shutdown: () => Promise<void>
+  shutdown: () => Promise<void>;
   /**
    * V3 2H:内部 anthropic 代理监听地址(`{host, port}`),用于:
    *   - /healthz 反映启用状态
@@ -894,12 +911,12 @@ export interface RegisterCommercialResult {
    *   - dev 工具按地址探活
    * 未启用(env 缺失 / skipInternalProxy / 监听失败)时为 undefined。
    */
-  internalProxyAddress?: { host: string; port: number }
+  internalProxyAddress?: { host: string; port: number };
   /**
    * V3 D.1b:外部 mTLS 监听地址(18443)。remote-host node-agent L7 反代从这里进。
    * 未启用(EXTERNAL_MTLS_ENABLED != 1 / 缺 bind/port / 监听失败)时为 undefined。
    */
-  externalMtlsAddress?: { host: string; port: number }
+  externalMtlsAddress?: { host: string; port: number };
   /**
    * Commercial access JWT 的 HMAC 密钥(已规范化为 ≥32 byte Uint8Array)。
    *
@@ -912,7 +929,7 @@ export interface RegisterCommercialResult {
    * gateway 用同步 HS256 验签(node:crypto.createHmac),不引入 jose 依赖,
    * 也不需要把 checkHttpAuth 链路改 async(改动面太大)。
    */
-  jwtSecret: Uint8Array
+  jwtSecret: Uint8Array;
   /**
    * V3 multi-tenant `/api/uploads` 写入与 `/api/media` 读取的存储路径解析器。
    *
@@ -931,7 +948,7 @@ export interface RegisterCommercialResult {
    * 多条 active → ambiguous;volume 不存在 → volume-missing。gateway 转译为对应
    * HTTP 4xx/5xx,不做静默回退。
    */
-  resolveUserMediaDirs?: (userId: string) => Promise<UserMediaLocation>
+  resolveUserMediaDirs?: (userId: string) => Promise<UserMediaLocation>;
   /**
    * V3 multi-tenant **textual** 谓词:判定一个 resolvedPath 是否长得像
    * `/var/lib/docker/volumes/oc-v3-data-u<digits>/_data/(uploads|generated)[/<file>]`。
@@ -945,7 +962,7 @@ export interface RegisterCommercialResult {
    * 唯一合法用途:启动时 `.tmp-*` orphan sweep(无 userId 上下文,只想匹配
    * docker volumes 根下的 user volume 目录壳子)。
    */
-  isUserVolumeMediaPath?: (resolvedPath: string) => boolean
+  isUserVolumeMediaPath?: (resolvedPath: string) => boolean;
   /**
    * v1.0.192 — 给 gateway `handleUpload` 在写 user docker volume 之前用的
    * 冷启动护栏。**结构化返回**(不抛 ContainerUnreadyError),让 gateway 保持
@@ -963,17 +980,17 @@ export interface RegisterCommercialResult {
    */
   ensureContainerReady?: (
     uid: bigint,
-  ) => Promise<{ ok: true } | { ok: false; retryAfterSec: number; reason: string }>
+  ) => Promise<{ ok: true } | { ok: false; retryAfterSec: number; reason: string }>;
   /**
    * GET /api/sessions/:id 时 master 把引擎预热打到用户容器
    * `/internal/v3/engine-preheat`。失败必须 swallow。
    */
   preheatUserContainer?: (args: {
-    userId: string
-    sessionId: string
-    agentId: string
-    modelId?: string
-  }) => Promise<void>
+    userId: string;
+    sessionId: string;
+    agentId: string;
+    modelId?: string;
+  }) => Promise<void>;
   /**
    * 2026-05-16 hotfix — remote-host upload push hook。
    *
@@ -992,10 +1009,10 @@ export interface RegisterCommercialResult {
    * 装配 —— closure 内部自己用 pool,与上面的 resolver 一致。
    */
   pushRemoteHostUpload?: (args: {
-    hostUuid: string
-    remotePath: string
-    content: Buffer
-  }) => Promise<void>
+    hostUuid: string;
+    remotePath: string;
+    content: Buffer;
+  }) => Promise<void>;
   /**
    * 2026-05-16 hotfix Phase 2 — remote-host **读路径**对称 hook。
    *
@@ -1017,9 +1034,9 @@ export interface RegisterCommercialResult {
    * 装配条件、psk 清零纪律与 `pushRemoteHostUpload` 完全对称。
    */
   pullRemoteHostMedia?: (args: {
-    hostUuid: string
-    remotePath: string
-  }) => Promise<Buffer | null>
+    hostUuid: string;
+    remotePath: string;
+  }) => Promise<Buffer | null>;
   /**
    * P1.7 slice 7c — WeChat broker 入站入口。
    *
@@ -1037,25 +1054,25 @@ export interface RegisterCommercialResult {
    * 补"依赖宕机但 healthz 仍绿零告警"的盲区。返回 { pg, redis } 各自 ok/err,
    * 内部 2s 超时;gateway 未拿到该函数(旧接线/个人版)时退回仅探 sessions.db。
    */
-  probeDeps?: () => Promise<Record<string, { ok: true } | { ok: false; error: string }>>
+  probeDeps?: () => Promise<Record<string, { ok: true } | { ok: false; error: string }>>;
   wechatBroker?: {
     onInbound(evt: {
-      bindingUserId: string
-      accountId?: string
-      senderId: string
-      text: string
-      messageId?: string
-      itemTypes?: string
-      rawPayload?: unknown
-      mediaAttachments?: import('@openclaude/channel-wechat').WechatMediaAttachment[]
-      imageAttachments?: import('@openclaude/channel-wechat').WechatImageAttachment[]
-      idempotencyKey: string
-      receivedAt: number
-      channel?: 'wechat'
-      agentId?: string
-    }): Promise<unknown>
-    cleanupBinding(bindingUserId: string): Promise<unknown>
-  }
+      bindingUserId: string;
+      accountId?: string;
+      senderId: string;
+      text: string;
+      messageId?: string;
+      itemTypes?: string;
+      rawPayload?: unknown;
+      mediaAttachments?: import("@openclaude/channel-wechat").WechatMediaAttachment[];
+      imageAttachments?: import("@openclaude/channel-wechat").WechatImageAttachment[];
+      idempotencyKey: string;
+      receivedAt: number;
+      channel?: "wechat";
+      agentId?: string;
+    }): Promise<unknown>;
+    cleanupBinding(bindingUserId: string): Promise<unknown>;
+  };
 }
 
 // ─── D.1b: 18443 mTLS 反代前置校验 ─────────────────────────────────────────
@@ -1072,12 +1089,12 @@ export interface RegisterCommercialResult {
 
 /** Raw DER → PEM。node TLSSocket.getPeerCertificate(true).raw 是 DER Buffer。 */
 function derToPem(der: Buffer): string {
-  const b64 = der.toString('base64')
-  const lines: string[] = []
+  const b64 = der.toString("base64");
+  const lines: string[] = [];
   for (let i = 0; i < b64.length; i += 64) {
-    lines.push(b64.slice(i, i + 64))
+    lines.push(b64.slice(i, i + 64));
   }
-  return `-----BEGIN CERTIFICATE-----\n${lines.join('\n')}\n-----END CERTIFICATE-----\n`
+  return `-----BEGIN CERTIFICATE-----\n${lines.join("\n")}\n-----END CERTIFICATE-----\n`;
 }
 
 function sendMtlsError(
@@ -1087,16 +1104,12 @@ function sendMtlsError(
   extra?: Record<string, unknown>,
 ): void {
   if (res.headersSent) {
-    try {
-      res.end()
-    } catch {
-      /* socket gone */
-    }
-    return
+    try { res.end(); } catch { /* socket gone */ }
+    return;
   }
-  res.statusCode = status
-  res.setHeader('Content-Type', 'application/json')
-  res.end(JSON.stringify({ error: { code, ...(extra ?? {}) } }))
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify({ error: { code, ...(extra ?? {}) } }));
 }
 
 async function handleExternalMtls(
@@ -1104,109 +1117,109 @@ async function handleExternalMtls(
   res: ServerResponse,
   proxyHandler: AnthropicProxyHandler,
 ): Promise<void> {
-  const socket = req.socket as TLSSocket
+  const socket = req.socket as TLSSocket;
   // TLS 层已经 rejectUnauthorized:true,到这里 authorized 理论必真;额外 belt-and-suspenders
   if (!socket.authorized) {
-    sendMtlsError(res, 401, 'PEER_UNAUTHORIZED', { reason: socket.authorizationError?.message })
-    return
+    sendMtlsError(res, 401, "PEER_UNAUTHORIZED", { reason: socket.authorizationError?.message });
+    return;
   }
-  const peerCert = socket.getPeerCertificate(true)
+  const peerCert = socket.getPeerCertificate(true);
   if (!peerCert || !peerCert.raw || peerCert.raw.length === 0) {
-    sendMtlsError(res, 401, 'NO_PEER_CERT')
-    return
+    sendMtlsError(res, 401, "NO_PEER_CERT");
+    return;
   }
 
   // SPIFFE URI → host uuid
-  const certPem = derToPem(peerCert.raw)
-  let uris: string[]
+  const certPem = derToPem(peerCert.raw);
+  let uris: string[];
   try {
-    uris = await extractSpiffeUris(certPem)
+    uris = await extractSpiffeUris(certPem);
   } catch {
-    sendMtlsError(res, 403, 'CERT_PARSE_FAIL')
-    return
+    sendMtlsError(res, 403, "CERT_PARSE_FAIL");
+    return;
   }
-  const hostUri = uris.find((u) => u.startsWith('spiffe://openclaude/host/'))
+  const hostUri = uris.find((u) => u.startsWith("spiffe://openclaude/host/"));
   if (!hostUri) {
-    sendMtlsError(res, 403, 'NO_HOST_SPIFFE')
-    return
+    sendMtlsError(res, 403, "NO_HOST_SPIFFE");
+    return;
   }
-  const hostUuid = extractHostUuidFromSpiffe(hostUri)
+  const hostUuid = extractHostUuidFromSpiffe(hostUri);
   if (!hostUuid) {
-    sendMtlsError(res, 403, 'BAD_SPIFFE_URI')
-    return
+    sendMtlsError(res, 403, "BAD_SPIFFE_URI");
+    return;
   }
 
   // DB state + fingerprint pin。**不做 in-proc cache**,每请求一查 —— admin 轮换 fp 就即时生效
-  const row = await computeQueries.getHostById(hostUuid)
+  const row = await computeQueries.getHostById(hostUuid);
   if (!row) {
-    sendMtlsError(res, 403, 'HOST_NOT_FOUND')
-    return
+    sendMtlsError(res, 403, "HOST_NOT_FOUND");
+    return;
   }
   // A3 — 终态 revoked host(被入侵/下线)不得再用 file-proxy。setRevoked 已把
   // agent_cert_fingerprint_sha256 置 NULL,下面 expectedFp 检查本就会 fail-closed;
   // 这里显式拒一遍,给出明确 reason code + 不依赖"fp 一定被清"的隐式不变量。
-  if (row.status === 'revoked') {
-    sendMtlsError(res, 403, 'HOST_REVOKED')
-    return
+  if (row.status === "revoked") {
+    sendMtlsError(res, 403, "HOST_REVOKED");
+    return;
   }
-  const expectedFp = row.agent_cert_fingerprint_sha256
+  const expectedFp = row.agent_cert_fingerprint_sha256;
   if (!expectedFp) {
-    sendMtlsError(res, 403, 'NO_PINNED_FP')
-    return
+    sendMtlsError(res, 403, "NO_PINNED_FP");
+    return;
   }
   // peerCert.fingerprint256 是 "AA:BB:..." 冒号分隔大写 hex。
   // 异常 TLS 对象形态下可能为 undefined/"",统一落 401 而非走到后面抛 500。
-  if (!peerCert.fingerprint256 || typeof peerCert.fingerprint256 !== 'string') {
-    sendMtlsError(res, 401, 'NO_PEER_FINGERPRINT')
-    return
+  if (!peerCert.fingerprint256 || typeof peerCert.fingerprint256 !== "string") {
+    sendMtlsError(res, 401, "NO_PEER_FINGERPRINT");
+    return;
   }
-  const presentedFp = peerCert.fingerprint256.replace(/:/g, '').toLowerCase()
-  const pBuf = Buffer.from(presentedFp, 'hex')
-  const eBuf = Buffer.from(expectedFp.toLowerCase(), 'hex')
+  const presentedFp = peerCert.fingerprint256.replace(/:/g, "").toLowerCase();
+  const pBuf = Buffer.from(presentedFp, "hex");
+  const eBuf = Buffer.from(expectedFp.toLowerCase(), "hex");
   if (pBuf.length !== eBuf.length || pBuf.length === 0 || !timingSafeEqual(pBuf, eBuf)) {
-    sendMtlsError(res, 403, 'FINGERPRINT_MISMATCH')
-    return
+    sendMtlsError(res, 403, "FINGERPRINT_MISMATCH");
+    return;
   }
 
   // 0042 — agent-uplink-probe 专用快路径:绕过 status='ready' 与 X-V3-Container-IP 校验。
   // 目的:让 quarantined host 也能从 uplink-probe-failed 自愈;同时不开放任何代理能力,
   // 仅返回 200 {ok:true,hostUuid} 让 agent 知道 mTLS+fingerprint 校验通过。
   // 请求路径硬匹配 GET /v3/agent-uplink-probe。
-  if (req.method === 'GET' && req.url === '/v3/agent-uplink-probe') {
-    res.statusCode = 200
-    res.setHeader('Content-Type', 'application/json')
-    res.end(JSON.stringify({ ok: true, hostUuid }))
-    return
+  if (req.method === "GET" && req.url === "/v3/agent-uplink-probe") {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ ok: true, hostUuid }));
+    return;
   }
 
   // 业务流量(/v1/messages 等)需要 host 处于 ready
-  if (row.status !== 'ready') {
-    sendMtlsError(res, 503, 'HOST_NOT_READY', { status: row.status })
-    return
+  if (row.status !== "ready") {
+    sendMtlsError(res, 503, "HOST_NOT_READY", { status: row.status });
+    return;
   }
 
   // X-V3-Container-IP 校验:三重防御(数组 / CRLF header-folding / 非 IPv4)
-  const rawIp = req.headers['x-v3-container-ip']
+  const rawIp = req.headers["x-v3-container-ip"];
   if (Array.isArray(rawIp)) {
-    sendMtlsError(res, 400, 'IP_HEADER_ARRAY')
-    return
+    sendMtlsError(res, 400, "IP_HEADER_ARRAY");
+    return;
   }
-  if (!rawIp || typeof rawIp !== 'string') {
-    sendMtlsError(res, 400, 'IP_HEADER_MISSING')
-    return
+  if (!rawIp || typeof rawIp !== "string") {
+    sendMtlsError(res, 400, "IP_HEADER_MISSING");
+    return;
   }
-  if (rawIp.includes('\r') || rawIp.includes('\n')) {
-    sendMtlsError(res, 400, 'IP_HEADER_CRLF')
-    return
+  if (rawIp.includes("\r") || rawIp.includes("\n")) {
+    sendMtlsError(res, 400, "IP_HEADER_CRLF");
+    return;
   }
   if (!isIPv4(rawIp)) {
-    sendMtlsError(res, 400, 'IP_HEADER_NOT_IPV4')
-    return
+    sendMtlsError(res, 400, "IP_HEADER_NOT_IPV4");
+    return;
   }
 
   // 剥掉 X-V3-Container-IP 头,防止透传到 anthropic 上游
-  delete req.headers['x-v3-container-ip']
-  await proxyHandler(req, res, { hostUuid, boundIp: rawIp })
+  delete req.headers["x-v3-container-ip"];
+  await proxyHandler(req, res, { hostUuid, boundIp: rawIp });
 }
 
 /**
@@ -1219,7 +1232,7 @@ async function handleExternalMtls(
  * resolveSyntheticTurnModel 的 routable 自检据此不降级,符合预期)。
  */
 function buildHostStaticProviderKeys(cfg: CommercialConfig): StaticProviderKeys {
-  return staticProviderKeysFromConfig(cfg)
+  return staticProviderKeysFromConfig(cfg);
 }
 
 /**
@@ -1238,7 +1251,7 @@ export async function registerCommercial(
   app: unknown,
   options: {
     /** 测试可注入 jwt secret 而非从 env 读 */
-    jwtSecret?: string | Uint8Array
+    jwtSecret?: string | Uint8Array;
     /**
      * V3 Phase 2 Task 2H:用户 WS 桥接的容器端点解析器。
      *
@@ -1247,45 +1260,45 @@ export async function registerCommercial(
      *
      * 测试可注入 stub 直接返回 host/port。
      */
-    resolveContainerEndpoint?: ResolveContainerEndpoint
+    resolveContainerEndpoint?: ResolveContainerEndpoint;
     /**
      * V3 Phase 2 Task 2H:跳过启动内部 anthropic 代理 listener(测试默认 true 避免抢端口)。
      * 生产侧由 cli launcher 显式置 false 让代理上线;dev/CI 不需要。
      */
-    skipInternalProxy?: boolean
+    skipInternalProxy?: boolean;
     /**
      * 版本握手(v5 spa):静态前端 dist 目录。webRoot 的路径决策权威在 cli launcher
      * (commands/gateway.ts,按 OC_RUNTIME_CHANNEL 分流),此处只透传,不做第二次推导。
      * 注入后 userChatBridge 会在每个 userWs accept 时下发 `sys.frontend_build` 帧
      * (见 ws/frontendBuild.ts)。v3 / 测试不传 → 功能整体 inert。
      */
-    webDistDir?: string
+    webDistDir?: string;
     /** 当前 gateway 实际监听端口;Quick Tunnel 必须回源到本 slot,不能固定指向 A。 */
-    gatewayPort?: number
+    gatewayPort?: number;
   } = {},
 ): Promise<RegisterCommercialResult> {
-  void app
+  void app;
 
   // 步骤 5 兼容地板(方案 §7 步 5,R3-B4):cutover marker 置位后禁止在 flag 关闭态下起。
   // 放在最前 —— 拒启要发生在任何 DB/容器/调度器副作用之前。
-  assertModelAuthorityCutoverFloor()
-  const flavorIdentity = assertFlavorIdentity()
+  assertModelAuthorityCutoverFloor();
+  const flavorIdentity = assertFlavorIdentity();
   const cursorExternalOutboxDir =
-    flavorIdentity.status === 'ok'
+    flavorIdentity.status === "ok"
       ? cursorExternalApiOutboxDirForFlavor(flavorIdentity.flavor)
-      : null
+      : null;
 
-  const cfg = loadConfig()
+  const cfg = loadConfig();
 
   // v5 灰度 — 运行时 channel 单一权威。OC_RUNTIME_CHANNEL 默认 "v3"(现网零行为变化)。
   // v5=follower:控制面(后台 mutator,会写共享 PG/账号池/订单/发邮件)必须静默,
   // 直到 P1 控制面权威收敛 + leader 选举再按需放开。controlPlaneEnabled 作为单一闸门
   // 直接 AND 进每个后台 mutator 的启动条件 —— 根除"漏关某个 *_DISABLED 即污染共享现网"
   // 的整类风险(个别 *_DISABLED 仍保留为 v3 细粒度运维开关)。
-  const runtimeChannel = process.env.OC_RUNTIME_CHANNEL?.trim() || 'v3'
+  const runtimeChannel = process.env.OC_RUNTIME_CHANNEL?.trim() || "v3";
   // 控制面 leader 权威从 channel 解耦为显式信号 OC_CONTROL_PLANE_LEADER(见
   // resolveControlPlaneLeader 文档)。未设时行为与旧代码完全一致(v3=leader / v5=follower)。
-  const controlPlaneEnabled = resolveControlPlaneLeader(process.env, runtimeChannel)
+  const controlPlaneEnabled = resolveControlPlaneLeader(process.env, runtimeChannel);
 
   // ── mutator 归属矩阵(单一权威源)─────────────────────────────────────────
   // 每个后台 scheduler/worker 创建即经 trackScheduler 登记,登记必须声明数据域归属:
@@ -1297,19 +1310,19 @@ export async function registerCommercial(
   // enabledSchedulers 由本登记表**派生**——根除"创建了 scheduler 但忘登记 → 不变量断言
   // 出现盲区"的一类缺陷(此前 subscriptionRollover / imagePromote 均漏登记)。
   // scripts/check-schedulers.ts 强制 index.ts 内所有 scheduler 工厂调用必须包 trackScheduler。
-  type MutatorDomain = 'shared' | 'v5-owned' | 'local'
-  const schedulerRegistry: Array<{ name: string; domain: MutatorDomain }> = []
+  type MutatorDomain = "shared" | "v5-owned" | "local";
+  const schedulerRegistry: Array<{ name: string; domain: MutatorDomain }> = [];
   const unregisterMutator = (name: string): void => {
-    const i = schedulerRegistry.findIndex((s) => s.name === name)
-    if (i >= 0) schedulerRegistry.splice(i, 1)
-  }
+    const i = schedulerRegistry.findIndex((s) => s.name === name);
+    if (i >= 0) schedulerRegistry.splice(i, 1);
+  };
   function trackScheduler<T>(name: string, domain: MutatorDomain, handle: T): T {
     // 幂等:同名重复登记只记一次(imagePromote 在 gate 判定点先同步登记占位,
     // 异步 initComputePool 完成后真正 .start() 时再包一层 —— 不产生重复项)。
     if (handle && !schedulerRegistry.some((s) => s.name === name)) {
-      schedulerRegistry.push({ name, domain })
+      schedulerRegistry.push({ name, domain });
     }
-    return handle
+    return handle;
   }
 
   // v5 follower 硬约束 —— fail-closed,早于一切共享-state 副作用。
@@ -1320,66 +1333,66 @@ export async function registerCommercial(
   //   - WECHAT_BROKER_ENABLED=1:渠道 broker 写共享 outbox/session
   // (compute-pool 写仍由 OC_IMAGE_DISTRIBUTE_DISABLED=1 + 无 COMPUTE_POOL_SELF_HOST_UUID 挡;
   //  控制面 sweeper 仍由 controlPlaneEnabled=false + 各 *_DISABLED + 末尾 enabledSchedulers 不变量挡。)
-  if (runtimeChannel === 'v5') {
-    const offenders: string[] = []
-    if (process.env.AGENT_IMAGE) offenders.push('AGENT_IMAGE')
-    if (process.env.WECHAT_BROKER_ENABLED === '1') offenders.push('WECHAT_BROKER_ENABLED=1')
+  if (runtimeChannel === "v5") {
+    const offenders: string[] = [];
+    if (process.env.AGENT_IMAGE) offenders.push("AGENT_IMAGE");
+    if (process.env.WECHAT_BROKER_ENABLED === "1") offenders.push("WECHAT_BROKER_ENABLED=1");
     if (offenders.length > 0) {
       throw new Error(
         `[commercial] v5 follower 禁止 legacy/渠道副作用(写共享现网),检测到危险 env=[${offenders.join(
-          ',',
+          ",",
         )}],拒启。`,
-      )
+      );
     }
     // 内部代理双权威错位防护(Codex 重要项):listener 实际 bind 读 INTERNAL_PROXY_BIND/PORT
     // env,而容器 egress 目标由 ocGatewayIpForChannel()/ocInternalProxyPortForChannel() 计算。
     // 二者必须一致,否则容器把 API 打到一个没人监听的地址 → 全部 turn fail。env 漏配/错配时
     // fail-closed 拒启,而非上线后才发现 v5 容器一调用就挂。expected 来自单一权威 helper。
-    const expectBind = ocGatewayIpForChannel() // v5 → 172.31.0.1
-    const expectPort = ocInternalProxyPortForChannel() // v5 → 18892
-    const actualBind = process.env.INTERNAL_PROXY_BIND?.trim()
-    const actualPort = Number(process.env.INTERNAL_PROXY_PORT?.trim())
-    if (process.env.OC_EGRESS_SPLIT === '1') {
+    const expectBind = ocGatewayIpForChannel(); // v5 → 172.31.0.1
+    const expectPort = ocInternalProxyPortForChannel(); // v5 → 18892
+    const actualBind = process.env.INTERNAL_PROXY_BIND?.trim();
+    const actualPort = Number(process.env.INTERNAL_PROXY_PORT?.trim());
+    if (process.env.OC_EGRESS_SPLIT === "1") {
       // egress split(2026-07-02):容器出站地址(INTERNAL_PROXY_*)由独立 egress
       // 进程监听(它自己带同款 fail-closed guard,见 egress/main.ts),master 改听
       // loopback 控制口。这里只验证控制口配置齐全 + 秘钥在位——master 若仍试图
       // bind 容器地址会跟 egress 撞端口,而漏配控制口会让转发面全 503。
-      const cb = process.env.INTERNAL_CONTROL_BIND?.trim()
-      const cp = process.env.INTERNAL_CONTROL_PORT?.trim()
+      const cb = process.env.INTERNAL_CONTROL_BIND?.trim();
+      const cp = process.env.INTERNAL_CONTROL_PORT?.trim();
       if (!cb || !cp || !process.env.OC_EGRESS_SECRET) {
         throw new Error(
-          '[commercial] OC_EGRESS_SPLIT=1 但 INTERNAL_CONTROL_BIND/PORT/OC_EGRESS_SECRET 未配齐,拒启。',
-        )
+          "[commercial] OC_EGRESS_SPLIT=1 但 INTERNAL_CONTROL_BIND/PORT/OC_EGRESS_SECRET 未配齐,拒启。",
+        );
       }
     } else if (actualBind !== expectBind || actualPort !== expectPort) {
       throw new Error(
         `[commercial] v5 内部代理 env 与 channel 期望不符:` +
-          `INTERNAL_PROXY_BIND=${actualBind ?? '(unset)'} (期望 ${expectBind}),` +
-          `INTERNAL_PROXY_PORT=${process.env.INTERNAL_PROXY_PORT ?? '(unset)'} (期望 ${expectPort})。` +
+          `INTERNAL_PROXY_BIND=${actualBind ?? "(unset)"} (期望 ${expectBind}),` +
+          `INTERNAL_PROXY_PORT=${process.env.INTERNAL_PROXY_PORT ?? "(unset)"} (期望 ${expectPort})。` +
           `容器 egress 与 listener bind 须一致,拒启。`,
-      )
+      );
     }
   }
 
   // 共享 PG schema 迁移同样受控制面单一权威 gate:v5 follower 绝不迁移共享库
   // (防漏配 COMMERCIAL_AUTO_MIGRATE=0 仍误改现网 schema)。一次计算,供下方 runtimeStatus 复用。
-  const autoMigrateEffective = controlPlaneEnabled && shouldAutoMigrate()
+  const autoMigrateEffective = controlPlaneEnabled && shouldAutoMigrate();
   if (autoMigrateEffective) {
     // eslint-disable-next-line no-console
-    console.log('[commercial] auto-migrate: running...')
+    console.log("[commercial] auto-migrate: running...");
     const r = await runMigrations({
       // eslint-disable-next-line no-console
       onApply: (v) => console.log(`[commercial] auto-migrate applied ${v}`),
-    })
+    });
     // eslint-disable-next-line no-console
     console.log(
       `[commercial] auto-migrate done. applied=${r.applied.length} skipped=${r.skipped.length}`,
-    )
+    );
   } else {
     // eslint-disable-next-line no-console
     console.log(
       `[commercial] auto-migrate disabled (controlPlaneEnabled=${controlPlaneEnabled} channel=${runtimeChannel})`,
-    )
+    );
   }
 
   // ── P2:master 会话权威 backend 选择(RFC-v5-sessions-pg D1 启动矩阵)────────────
@@ -1388,76 +1401,64 @@ export async function registerCommercial(
   // 依 OC_SESSIONS_STORE + PG 状态行 + 本地 manifest 三元组裁决 sqlite/pg;矩阵之外 fail-closed
   // 拒起(resolveSessionsStoreAuthority 抛错即 registerCommercial 抛错 = master 拒起)。
   // 驱动选择权威在此一处(composition root),函数内禁 if(pg) 分支;pg 则一次性 setClientSessionsBackend。
-  let sessionsGcSweeper: { stop: () => Promise<void> } | null = null
-  let turnDispatchShutdownHandoff: (() => Promise<unknown>) | undefined
-  let losslessTurnTapeStorage: LosslessTurnTapeStorage | undefined
+  let sessionsGcSweeper: { stop: () => Promise<void> } | null = null;
+  let turnDispatchShutdownHandoff: (() => Promise<unknown>) | undefined;
+  let losslessTurnTapeStorage: LosslessTurnTapeStorage | undefined;
   // durable turn dispatch(RFC §2):受理、tape-state 与真实终态读需 DispatchAdmissionBackend 面。
-  let dispatchAdmissionBackend: DispatchAdmissionBackend | undefined
+  let dispatchAdmissionBackend: DispatchAdmissionBackend | undefined;
   const goalUsageRefreshRef: {
-    current: (userId: string, sessionId: string) => void | Promise<void>
-  } = {
-    current: () => {
-      /* GoalState service is assembled below. */
-    },
-  }
+    current: (userId: string, sessionId: string) => void | Promise<void>;
+  } = { current: () => { /* GoalState service is assembled below. */ } };
   // Phase B finalize decides (inside its tx) whether the master will retry the
   // terminal turn. The browser learns the verdict through this post-commit
   // sideband so it can keep showing 「正在重试中」 instead of flashing a red card
   // until outbound.ack{recovery} arrives — or materialize the red card at once
   // when no recovery will follow. Forward-ref: the bridge is assembled below.
   const recoveryDecisionBroadcastRef: {
-    current: (userId: string, sessionId: string, decision: AutomaticRecoveryDecision) => void
-  } = {
-    current: () => {
-      /* bridge not assembled yet — browser converges via ack/history */
-    },
-  }
+    current: (userId: string, sessionId: string, decision: AutomaticRecoveryDecision) => void;
+  } = { current: () => { /* bridge not assembled yet — browser converges via ack/history */ } };
   const recordRecoveryJobTerminalFriction = (
     userId: string,
     sessionId: string,
     info: {
-      rootClientMessageId: string
-      errorCode: string
-      semanticAttempt: number
-      terminalStatus: 'completed' | 'paused'
-      pauseReason: string | null
+      rootClientMessageId: string;
+      errorCode: string;
+      semanticAttempt: number;
+      terminalStatus: "completed" | "paused";
+      pauseReason: string | null;
     },
   ): void => {
-    const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId)
-    if (!uidMatch) return
-    const code = normalizeTurnErrorCode(info.errorCode)
-    if (!/^[A-Za-z0-9_]{1,64}$/.test(code)) return
+    const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
+    if (!uidMatch) return;
+    const code = normalizeTurnErrorCode(info.errorCode);
+    if (!/^[A-Za-z0-9_]{1,64}$/.test(code)) return;
     void recordProductFrictionEvent({
       correlation: `${sessionId}:${info.rootClientMessageId}`,
       userId: BigInt(uidMatch[1]!),
-      surface: 'recovery',
-      stage: 'recovery_job',
+      surface: "recovery",
+      stage: "recovery_job",
       code,
-      outcome: info.terminalStatus === 'completed' ? 'recovered' : 'failed',
+      outcome: info.terminalStatus === "completed" ? "recovered" : "failed",
       attempts: info.semanticAttempt,
-      path: 'job_terminal',
+      path: "job_terminal",
       reason: info.pauseReason ?? undefined,
       sessionId,
     }).catch((err: unknown) => {
-      rootLogger.warn('recovery_job_friction_failed', {
+      rootLogger.warn("recovery_job_friction_failed", {
         sessionId,
         errorClass: err instanceof Error ? err.constructor.name : typeof err,
-      })
-    })
-  }
+      });
+    });
+  };
   // HTTP finalize (Phase A) nudges the leader-owned tape job scheduler so Phase B
   // (and therefore the recovery verdict above) runs now, not on the next 5s tick.
   // Non-leader masters keep the noop: the leader's interval still converges.
-  const tapeSchedulerKickRef: { current: () => void } = {
-    current: () => {
-      /* no scheduler here */
-    },
-  }
-  let sessionsStoreGeneration = 0
-  if (runtimeChannel === 'v5') {
-    const decision = await resolveSessionsStoreAuthority({ pool: getPool() })
-    if (decision.store === 'pg') {
-      sessionsStoreGeneration = decision.generation
+  const tapeSchedulerKickRef: { current: () => void } = { current: () => { /* no scheduler here */ } };
+  let sessionsStoreGeneration = 0;
+  if (runtimeChannel === "v5") {
+    const decision = await resolveSessionsStoreAuthority({ pool: getPool() });
+    if (decision.store === "pg") {
+      sessionsStoreGeneration = decision.generation;
       const pgSessionsBackend = createPgSessionsBackend(getPool(), {
         expectedGeneration: decision.generation,
         onGoalUsageChanged: (userId, sessionId) => goalUsageRefreshRef.current(userId, sessionId),
@@ -1465,86 +1466,76 @@ export async function registerCommercial(
           recoveryDecisionBroadcastRef.current(userId, sessionId, verdict),
         onRecoveryJobTerminal: (userId, sessionId, info) =>
           recordRecoveryJobTerminalFriction(userId, sessionId, info),
-      })
-      setClientSessionsBackend(pgSessionsBackend)
-      losslessTurnTapeStorage = pgSessionsBackend
-      dispatchAdmissionBackend = pgSessionsBackend
+      });
+      setClientSessionsBackend(pgSessionsBackend);
+      losslessTurnTapeStorage = pgSessionsBackend;
+      dispatchAdmissionBackend = pgSessionsBackend;
       // advisory lease fencing 下的 usage 聚合 GC(RFC D3):双 master 只由持锁者执行。
       // trackScheduler 登记为 v5-owned(会话正文权威落 PG 是 v5 独有数据域)。
-      sessionsGcSweeper = trackScheduler(
-        'sessionsGcSweep',
-        'v5-owned',
-        startSessionsGcSweeper({
-          pool: getPool(),
-          onGoalUsageChanged: (userId, sessionId) => goalUsageRefreshRef.current(userId, sessionId),
-          onStats: (s) => {
-            if (s.pendingFolded || s.pendingUnreachableExpired || s.tapePartsPurged) {
-              rootLogger.info('[sessionsGcSweep] lossless 收尾 GC', {
-                pendingFolded: s.pendingFolded,
-                pendingUnreachableExpired: s.pendingUnreachableExpired,
-                tapePartsPurged: s.tapePartsPurged,
-              })
-            }
-            // 折叠异常 = (request_id,user_id) 已有坐标/金额不符的 cost component。行被
-            // 保留待人工核对;持续非零应查 appendCostCredits/finalize 两路径的归因分歧。
-            if (s.pendingFoldAnomaly) {
-              rootLogger.warn('[sessionsGcSweep] pending 折叠异常(component 坐标不符,行已保留)', {
-                pendingFoldAnomaly: s.pendingFoldAnomaly,
-              })
-            }
-          },
-        }),
-      )
+      sessionsGcSweeper = trackScheduler("sessionsGcSweep", "v5-owned", startSessionsGcSweeper({
+        pool: getPool(),
+        onGoalUsageChanged: (userId, sessionId) => goalUsageRefreshRef.current(userId, sessionId),
+        onStats: (s) => {
+          if (s.pendingFolded || s.pendingUnreachableExpired || s.tapePartsPurged) {
+            rootLogger.info("[sessionsGcSweep] lossless 收尾 GC", {
+              pendingFolded: s.pendingFolded,
+              pendingUnreachableExpired: s.pendingUnreachableExpired,
+              tapePartsPurged: s.tapePartsPurged,
+            });
+          }
+          // 折叠异常 = (request_id,user_id) 已有坐标/金额不符的 cost component。行被
+          // 保留待人工核对;持续非零应查 appendCostCredits/finalize 两路径的归因分歧。
+          if (s.pendingFoldAnomaly) {
+            rootLogger.warn("[sessionsGcSweep] pending 折叠异常(component 坐标不符,行已保留)", {
+              pendingFoldAnomaly: s.pendingFoldAnomaly,
+            });
+          }
+        },
+      }));
       // eslint-disable-next-line no-console
-      console.log(`[commercial] sessions store authority = PG (generation=${decision.generation})`)
+      console.log(`[commercial] sessions store authority = PG (generation=${decision.generation})`);
     } else {
       // eslint-disable-next-line no-console
-      console.log('[commercial] sessions store authority = SQLite(未割接 / 基建先行期)')
+      console.log("[commercial] sessions store authority = SQLite(未割接 / 基建先行期)");
     }
   }
 
   // ── P3 双 master 蓝绿:LeaderBundle + lease + desired watch + 控制口 VIP(RFC D3/D4)─────────
   // 本 slot 静态身份(RFC §3:A/B)。默认 'A'——基建版现有 unit 即 A slot。非法值 fail-closed。
-  const ocSlotRaw = process.env.OC_SLOT?.trim() || 'A'
-  if (ocSlotRaw !== 'A' && ocSlotRaw !== 'B') {
-    throw new Error(
-      `[commercial] OC_SLOT 必须是 'A'|'B'(当前=${JSON.stringify(process.env.OC_SLOT)}),拒起`,
-    )
+  const ocSlotRaw = process.env.OC_SLOT?.trim() || "A";
+  if (ocSlotRaw !== "A" && ocSlotRaw !== "B") {
+    throw new Error(`[commercial] OC_SLOT 必须是 'A'|'B'(当前=${JSON.stringify(process.env.OC_SLOT)}),拒起`);
   }
-  const ocSlot: Slot = ocSlotRaw
+  const ocSlot: Slot = ocSlotRaw;
   // 双 master 是 v5 特性:v5 走 lease-gated bundle + 控制口 VIP;非 v5(v3/个人版)保持旧 eager 语义。
-  const dualMasterEnabled = runtimeChannel === 'v5'
+  const dualMasterEnabled = runtimeChannel === "v5";
   // LeaderBundle 始终构造(统一收口 shared+4 特例调度器的启动);触发方式按 channel 分流(见文末)。
   // onMemberStopped:成员 drain 后从 schedulerRegistry 摘除,让 healthz schedulers getter 实时反映让位。
   const leaderBundle: LeaderBundle = createLeaderBundle({
     onMemberStopped: (name) => unregisterMutator(name),
-    onError: (ctx, err) =>
-      rootLogger.warn(`[leaderBundle] ${ctx}`, { err: (err as Error)?.message ?? String(err) }),
+    onError: (ctx, err) => rootLogger.warn(`[leaderBundle] ${ctx}`, { err: (err as Error)?.message ?? String(err) }),
     logger: {
-      info: (m) => rootLogger.info(m, { subsys: 'leaderBundle' }),
-      warn: (m, meta) => rootLogger.warn(m, { subsys: 'leaderBundle', meta }),
+      info: (m) => rootLogger.info(m, { subsys: "leaderBundle" }),
+      warn: (m, meta) => rootLogger.warn(m, { subsys: "leaderBundle", meta }),
     },
-  })
+  });
   // 平台 preset 的 current_approved_version_id 是双 slot 共享 PG 状态，不能由 0% standby
   // candidate 在进程启动时 eager 改写。真正的实现会在 pricing/marketplace 依赖装配完成后
   // 赋给此闭包，并仅由 leadership acquire 路径 await；旧 slot 在 abort/rollback 后重新
   // acquire 时也会按其 release 自带定义幂等重指 current，形成确定性补偿。
-  let seedPlatformAgentsForLeadership: () => Promise<void> = async () => {}
+  let seedPlatformAgentsForLeadership: () => Promise<void> = async () => {};
   // desired watch(5s 轮询缓存):lease 读 desired_leader_slot,控制口读 desired_control_slot。仅 v5 需要。
-  let deployDesiredWatch: DesiredWatch | undefined
-  let leaderLease: LeaderLeaseController | undefined
-  let controlListener: ControlListener | undefined
+  let deployDesiredWatch: DesiredWatch | undefined;
+  let leaderLease: LeaderLeaseController | undefined;
+  let controlListener: ControlListener | undefined;
   if (dualMasterEnabled) {
     deployDesiredWatch = startDesiredWatch({
       pool: getPool(),
-      onError: (err) =>
-        rootLogger.warn('[deployDesiredWatch] poll 失败(保留旧缓存)', {
-          err: (err as Error)?.message ?? String(err),
-        }),
-    })
+      onError: (err) => rootLogger.warn("[deployDesiredWatch] poll 失败(保留旧缓存)", { err: (err as Error)?.message ?? String(err) }),
+    });
     // env 资格严格解析('1'|'0';unset/非法=fail-closed 拒起)。与 controlPlaneEnabled 分职:
     // controlPlaneEnabled 仍供 auto-migrate 等一次性启动分支(读 env 资格不动);lease 用严格版。
-    const eligibleEnv = resolveLeaderEnvEligibility(process.env)
+    const eligibleEnv = resolveLeaderEnvEligibility(process.env);
     leaderLease = createLeaderLeaseController({
       pool: getPool(),
       slot: ocSlot,
@@ -1554,71 +1545,69 @@ export async function registerCommercial(
         // BLOCKER 1:onAcquire=bundle start-all-or-fail;required 成员起不来 → start() reject →
         // lease step-down + onFatal(fail-stop)。onFence 返回 {drained,stuck};drained:false → lease fail-stop。
         onAcquire: async () => {
-          await leaderBundle.start()
-          await seedPlatformAgentsForLeadership()
+          await leaderBundle.start();
+          await seedPlatformAgentsForLeadership();
         },
         onFence: (reason) => {
-          rootLogger.warn(`[leaderLease] fence → stopAndDrain bundle(${reason})`, {
-            subsys: 'leaderLease',
-          })
-          return leaderBundle.stopAndDrain()
+          rootLogger.warn(`[leaderLease] fence → stopAndDrain bundle(${reason})`, { subsys: "leaderLease" });
+          return leaderBundle.stopAndDrain();
         },
       },
       // fail-stop:无法安全持有/交出 leadership(bundle 半启动 / drain 有 stuck / 掉线后 ACK 也失败)时
       // 退进程,systemd Restart=on-failure 拉起后因 desired 判定以 standby 起,后继经 PID liveness 接管。
       onFatal: (reason, detail) => {
-        rootLogger.error(`[leaderLease] FAIL-STOP: ${reason}`, {
-          subsys: 'leaderLease',
-          detail: (detail as Error)?.message ?? detail,
-        })
+        rootLogger.error(`[leaderLease] FAIL-STOP: ${reason}`, { subsys: "leaderLease", detail: (detail as Error)?.message ?? detail });
         // eslint-disable-next-line no-process-exit
-        process.exit(1)
+        process.exit(1);
       },
       logger: {
-        info: (m, meta) => rootLogger.info(m, { subsys: 'leaderLease', meta }),
-        warn: (m, meta) => rootLogger.warn(m, { subsys: 'leaderLease', meta }),
-        error: (m, meta) => rootLogger.error(m, { subsys: 'leaderLease', meta }),
+        info: (m, meta) => rootLogger.info(m, { subsys: "leaderLease", meta }),
+        warn: (m, meta) => rootLogger.warn(m, { subsys: "leaderLease", meta }),
+        error: (m, meta) => rootLogger.error(m, { subsys: "leaderLease", meta }),
       },
-    })
+    });
   }
 
   const jwtSecret =
-    options.jwtSecret ?? process.env.COMMERCIAL_JWT_SECRET ?? process.env.JWT_SECRET ?? ''
-  if (typeof jwtSecret === 'string' && jwtSecret.length === 0) {
+    options.jwtSecret ??
+    process.env.COMMERCIAL_JWT_SECRET ??
+    process.env.JWT_SECRET ??
+    "";
+  if (typeof jwtSecret === "string" && jwtSecret.length === 0) {
     throw new Error(
-      '[commercial] COMMERCIAL_JWT_SECRET (or JWT_SECRET) must be set when COMMERCIAL_ENABLED=1',
-    )
+      "[commercial] COMMERCIAL_JWT_SECRET (or JWT_SECRET) must be set when COMMERCIAL_ENABLED=1",
+    );
   }
 
   const redis = new IORedis(cfg.REDIS_URL, {
     lazyConnect: false,
     maxRetriesPerRequest: 3,
     enableReadyCheck: true,
-  })
-  configureZcodeRelayKv(createIoredisZcodeRelayKv(redis))
-  configureAntigravityRelayKv(createIoredisZcodeRelayKv(redis))
-  configureAntigravityModelCooldownStore(createIoredisAntigravityModelCooldownStore(redis))
+  });
+  configureZcodeRelayKv(createIoredisZcodeRelayKv(redis));
+  configureAntigravityRelayKv(createIoredisZcodeRelayKv(redis));
+  configureAntigravityModelCooldownStore(createIoredisAntigravityModelCooldownStore(redis));
 
   // 预热 dummy hash:第一次登录无影响
-  await warmupLoginDummyHash()
+  await warmupLoginDummyHash();
 
   // T-20: 初始化定价缓存。启动时 load,并开启 LISTEN pricing_changed
   // 以便 admin UI 改价时自动 reload。两步失败都不阻塞启动,让 gateway
   // 继续上线;HTTP handler 在 cache 空时会返 503 PRICING_NOT_READY,
   // 而 pricing 热路径(T-21 计费)会直接得到 "unknown model" —— 比把
   // 整个服务卡死更好。
-  const pricing = new PricingCache()
+  const pricing = new PricingCache();
   try {
-    await pricing.load()
+    await pricing.load();
   } catch (err) {
     // eslint-disable-next-line no-console
-    console.error('[commercial] pricing initial load failed:', err)
+    console.error("[commercial] pricing initial load failed:", err);
   }
   try {
-    await pricing.startListener(cfg.DATABASE_URL)
+    await pricing.startListener(cfg.DATABASE_URL);
   } catch (err) {
     // eslint-disable-next-line no-console
-    console.error('[commercial] pricing LISTEN setup failed:', err)
+    console.error("[commercial] pricing LISTEN setup failed:", err);
   }
 
   // 0060 — 把 per-model extra_system_prompt 注入到 gateway promptSlots。
@@ -1627,14 +1616,14 @@ export async function registerCommercial(
   // PricingCache 缓存空(initial load 失败)时 get() 自然返 null → buildModelHintSlot 落 null,
   // 不会影响 prompt 构建。
   // canonical id 直接取 PricingCache 命中行的 model_id(详见 createModelHintProvider 注释)。
-  setModelHintProvider(createModelHintProvider(pricing))
+  setModelHintProvider(createModelHintProvider(pricing));
 
   // 2026-07-07 MAJOR-1 — host 静态 provider 平台直连 key seam。
   // host 平台 agent(main)的合成首帧(cron/webhook/task/inter-agent/openai-compat)解析到
   // 非 codex 静态模型(默认 deepseek-v4-flash)后,host CCB 子进程需平台静态 key 直连上游
   // (见 gateway/hostStaticProviders + subprocessRunner 注入点)。个人版不 import commercial →
   // seam 恒 null = 整块 no-op,settings.json 继续掌权。与 setModelHintProvider 同注册/清理生命周期。
-  setHostStaticProviderKeys(buildHostStaticProviderKeys(cfg))
+  setHostStaticProviderKeys(buildHostStaticProviderKeys(cfg));
 
   // 0069 — SKILLS_LITERATURE slot 反向钩子:容器 spawn 重建 system prompt 时读窄配置,
   // admin 改完下次 spawn 自然生效(无 cache / 无 LISTEN/NOTIFY,见 0069 migration 注释)。
@@ -1643,24 +1632,24 @@ export async function registerCommercial(
   // fail-soft:DB 抖动 → 返 null + warn,prompt 构建照样推进。
   setLiteratureSkillProvider(async () => {
     try {
-      const cfg = await getLiteratureSkillConfig()
-      if (!cfg.enabled || !cfg.token_set) return null
+      const cfg = await getLiteratureSkillConfig();
+      if (!cfg.enabled || !cfg.token_set) return null;
       return {
-        name: 'SKILLS_LITERATURE',
+        name: "SKILLS_LITERATURE",
         content: LITERATURE_SKILL_POINTER,
-      }
+      };
     } catch (err) {
       // 单行 DB 读失败就跳过 slot,不要让 master DB 闪断拖垮容器系统 prompt 构建。
       // 选 warn 不 error:这条 slot 是增强非必需,日志噪声压低。
       // eslint-disable-next-line no-console
-      console.warn('[commercial] literatureSkillProvider read failed, skipping slot:', err)
-      return null
+      console.warn("[commercial] literatureSkillProvider read failed, skipping slot:", err);
+      return null;
     }
-  })
+  });
 
   // T-24 虎皮椒:三件套齐全 → 生产 client;否则 undefined(handler 会 503)
-  let hupijiao: HupijiaoClient | undefined
-  let hupijiaoConfig: Pick<HupijiaoConfig, 'appId' | 'appSecret'> | undefined
+  let hupijiao: HupijiaoClient | undefined;
+  let hupijiaoConfig: Pick<HupijiaoConfig, "appId" | "appSecret"> | undefined;
   if (cfg.HUPIJIAO_APP_ID && cfg.HUPIJIAO_APP_SECRET && cfg.HUPIJIAO_CALLBACK_URL) {
     const fullCfg: HupijiaoConfig = {
       appId: cfg.HUPIJIAO_APP_ID,
@@ -1668,12 +1657,12 @@ export async function registerCommercial(
       notifyUrl: cfg.HUPIJIAO_CALLBACK_URL,
       returnUrl: cfg.HUPIJIAO_RETURN_URL,
       endpoint: cfg.HUPIJIAO_ENDPOINT,
-    }
-    hupijiao = createHttpHupijiaoClient(fullCfg)
-    hupijiaoConfig = { appId: fullCfg.appId, appSecret: fullCfg.appSecret }
+    };
+    hupijiao = createHttpHupijiaoClient(fullCfg);
+    hupijiaoConfig = { appId: fullCfg.appId, appSecret: fullCfg.appSecret };
   }
 
-  const preCheckRedis = wrapIoredisForPreCheck(redis)
+  const preCheckRedis = wrapIoredisForPreCheck(redis);
 
   const knowledgePlanetMediaResolverRef: {
     current: ((userId: string) => Promise<UserMediaLocation>) | undefined
@@ -1794,41 +1783,41 @@ export async function registerCommercial(
 
   // T-53: 装配 agent 运行时(image + seccomp + rpc dir + lifecycle scheduler)。
   // 任一必要字段缺失 → agentRuntime 置 undefined;/api/agent/open 返 503,/status 仍然可读。
-  let agentRuntime: AgentHttpDeps | undefined
-  let lifecycleScheduler: LifecycleScheduler | undefined
+  let agentRuntime: AgentHttpDeps | undefined;
+  let lifecycleScheduler: LifecycleScheduler | undefined;
   const agentEnvStatus: Record<string, boolean> = {
     AGENT_IMAGE: !!cfg.AGENT_IMAGE,
     AGENT_NETWORK: !!cfg.AGENT_NETWORK,
     AGENT_PROXY_URL: !!cfg.AGENT_PROXY_URL,
     AGENT_SECCOMP_PATH: !!cfg.AGENT_SECCOMP_PATH,
     AGENT_RPC_SOCKET_DIR: !!cfg.AGENT_RPC_SOCKET_DIR,
-  }
-  const agentReady = Object.values(agentEnvStatus).every(Boolean)
+  };
+  const agentReady = Object.values(agentEnvStatus).every(Boolean);
   if (agentReady) {
     try {
       // Docker:走默认 socketPath 或 AGENT_DOCKER_SOCKET 覆盖
       const docker = cfg.AGENT_DOCKER_SOCKET
         ? new Docker({ socketPath: cfg.AGENT_DOCKER_SOCKET })
-        : new Docker()
+        : new Docker();
       // Seccomp profile 一次性读成字符串,后续 provision 直接用
-      const seccompProfileJson = fs.readFileSync(cfg.AGENT_SECCOMP_PATH!, 'utf8')
+      const seccompProfileJson = fs.readFileSync(cfg.AGENT_SECCOMP_PATH!, "utf8");
       // RPC socket 父目录启动时自愈:mkdir -p + 0700
-      fs.mkdirSync(cfg.AGENT_RPC_SOCKET_DIR!, { recursive: true, mode: 0o700 })
+      fs.mkdirSync(cfg.AGENT_RPC_SOCKET_DIR!, { recursive: true, mode: 0o700 });
 
       const agentLogger: LifecycleLogger = {
         info: (m, meta) => {
           // eslint-disable-next-line no-console
-          console.log(m, meta ?? {})
+          console.log(m, meta ?? {});
         },
         warn: (m, meta) => {
           // eslint-disable-next-line no-console
-          console.warn(m, meta ?? {})
+          console.warn(m, meta ?? {});
         },
         error: (m, meta) => {
           // eslint-disable-next-line no-console
-          console.error(m, meta ?? {})
+          console.error(m, meta ?? {});
         },
-      }
+      };
 
       agentRuntime = {
         docker,
@@ -1845,45 +1834,39 @@ export async function registerCommercial(
         priceCredits: cfg.AGENT_PLAN_PRICE_CREDITS,
         durationDays: cfg.AGENT_PLAN_DURATION_DAYS,
         logger: agentLogger,
-      }
+      };
 
       // Lifecycle scheduler:默认 1h tick,不在启动时跑
-      lifecycleScheduler = trackScheduler(
-        'lifecycle',
-        'shared',
-        startLifecycleScheduler(docker, {
-          intervalMs: cfg.AGENT_LIFECYCLE_TICK_MS,
-          volumeGcDays: cfg.AGENT_VOLUME_GC_DAYS,
-          logger: agentLogger,
-          runOnStart: false,
-        }),
-      )
+      lifecycleScheduler = trackScheduler("lifecycle", "shared", startLifecycleScheduler(docker, {
+        intervalMs: cfg.AGENT_LIFECYCLE_TICK_MS,
+        volumeGcDays: cfg.AGENT_VOLUME_GC_DAYS,
+        logger: agentLogger,
+        runOnStart: false,
+      }));
       // eslint-disable-next-line no-console
-      console.log('[commercial] agent runtime ready', {
+      console.log("[commercial] agent runtime ready", {
         image: cfg.AGENT_IMAGE,
         network: cfg.AGENT_NETWORK,
         rpc_dir: cfg.AGENT_RPC_SOCKET_DIR,
-      })
+      });
     } catch (err) {
       // eslint-disable-next-line no-console
-      console.error('[commercial] agent runtime init failed, disabling:', err)
-      agentRuntime = undefined
+      console.error("[commercial] agent runtime init failed, disabling:", err);
+      agentRuntime = undefined;
       if (lifecycleScheduler) {
-        try {
-          await lifecycleScheduler.stop()
-        } catch {
-          /* */
-        }
+        try { await lifecycleScheduler.stop(); } catch { /* */ }
       }
-      lifecycleScheduler = undefined
-      unregisterMutator('lifecycle') // 初始化失败已回滚 → 登记表同步撤销,不留幽灵项
+      lifecycleScheduler = undefined;
+      unregisterMutator("lifecycle"); // 初始化失败已回滚 → 登记表同步撤销,不留幽灵项
     }
   } else {
     const missing = Object.entries(agentEnvStatus)
       .filter(([, v]) => !v)
-      .map(([k]) => k)
+      .map(([k]) => k);
     // eslint-disable-next-line no-console
-    console.log(`[commercial] agent runtime disabled; missing env: ${missing.join(', ')}`)
+    console.log(
+      `[commercial] agent runtime disabled; missing env: ${missing.join(", ")}`,
+    );
   }
 
   // V3: account-pool 仍然装配(供 admin 列表/T-30 store + agent 容器内部 chat 走 anthropic
@@ -1892,9 +1875,9 @@ export async function registerCommercial(
   // anthropicProxy(2D)统一调上游。
   const healthRedis = wrapIoredisForHealth(
     redis as unknown as Parameters<typeof wrapIoredisForHealth>[0],
-  )
-  const healthTracker = new AccountHealthTracker({ redis: healthRedis })
-  const scheduler = new AccountScheduler({ health: healthTracker })
+  );
+  const healthTracker = new AccountHealthTracker({ redis: healthRedis });
+  const scheduler = new AccountScheduler({ health: healthTracker });
 
   // V3 Phase 2 Task 2H:启动内部 Anthropic 代理监听(供容器内 OpenClaude 出站调用)。
   //
@@ -1907,133 +1890,120 @@ export async function registerCommercial(
   // egress split 模式:容器出站地址(INTERNAL_PROXY_*)让位给独立 egress 进程,
   // master 的 internal listener 改绑 loopback 控制口(容器流量经 egress 转发到达,
   // /internal/v5/* 控制专用路径只有 egress 能直连)。未开 split → 完全旧行为。
-  const egressSplitEnabled = cfg.OC_EGRESS_SPLIT === true
-  const proxyBind = egressSplitEnabled ? cfg.INTERNAL_CONTROL_BIND : cfg.INTERNAL_PROXY_BIND
-  const proxyPort = egressSplitEnabled ? cfg.INTERNAL_CONTROL_PORT : cfg.INTERNAL_PROXY_PORT
-  let internalProxyServer: HttpServer | undefined
-  let internalProxyHandler: AnthropicProxyHandler | undefined
-  let internalProxyAddress: { host: string; port: number } | undefined
-  let externalMtlsServer: HttpsServer | undefined
-  let externalMtlsAddress: { host: string; port: number } | undefined
-  let desktopTlsClose: (() => Promise<void>) | undefined
+  const egressSplitEnabled = cfg.OC_EGRESS_SPLIT === true;
+  const proxyBind = egressSplitEnabled ? cfg.INTERNAL_CONTROL_BIND : cfg.INTERNAL_PROXY_BIND;
+  const proxyPort = egressSplitEnabled ? cfg.INTERNAL_CONTROL_PORT : cfg.INTERNAL_PROXY_PORT;
+  let internalProxyServer: HttpServer | undefined;
+  let internalProxyHandler: AnthropicProxyHandler | undefined;
+  let internalProxyAddress: { host: string; port: number } | undefined;
+  let externalMtlsServer: HttpsServer | undefined;
+  let externalMtlsAddress: { host: string; port: number } | undefined;
+  let desktopTlsClose: (() => Promise<void>) | undefined;
   // 2026-05-05 v3 commercial server-authored persistence:18791 plain + 18443 mTLS
   // 共享同一个 dispatcher,按 url path 分流到 anthropicProxy 或 internalServerAuthored。
   // 在 internalProxyHandler 构造完毕后赋值;mTLS listener 读它而不是 internalProxyHandler。
-  let dispatchInternal: AnthropicProxyHandler | undefined
+  let dispatchInternal: AnthropicProxyHandler | undefined;
 
   // ── grok relay route allocation(浏览器 turn 与 delegate turn 共用)──────
   // createCommercialCodexRoute 原 grok 分支的原样抽取:bridge(每帧铸 route)
   // 与下方 delegateGrokRouteHandler(容器本地 delegate turn 主动申请)必须走
   // 同一账号池、同一 grok_route_contexts durable 并发权威,不允许各自解释。
-  const allocateGrokRelayRoute = async ({
-    containerId,
-    userId,
-    modelId,
-    sessionId,
-    origin,
-  }: {
-    containerId: number
-    userId: bigint
-    modelId: string
-    sessionId?: string
+  const allocateGrokRelayRoute = async ({ containerId, userId, modelId, sessionId, origin }: {
+    containerId: number;
+    userId: bigint;
+    modelId: string;
+    sessionId?: string;
     /**
      * bridge(默认)= 浏览器 turn:7 天孤儿 TTL,计费终结帧显式 expire。
      * delegate = 容器本地 delegate turn:无计费终结帧,走短心跳租约
      * (GROK_DELEGATE_ROUTE_TTL_MS)+ per-container 并发限额,网关崩溃后
      * 分钟级自愈,不再占满账号并发上限一周。
      */
-    origin?: 'bridge' | 'delegate'
+    origin?: "bridge" | "delegate";
   }) => {
     // grok_route_contexts is the durable concurrency authority. Rebuild the
     // local scheduler mirror before every allocation so a browser disconnect,
     // generic slot reaper, or Master restart cannot make a live route vanish
     // from the cap check. Reap billed/vanished rows first — restore would
     // otherwise refill the 10-slot cap from finished turns.
-    await expireSettledGrokRouteLeases()
+    await expireSettledGrokRouteLeases();
     for (const lease of await listActiveGrokRouteLeases()) {
-      scheduler.restoreCodexSlot(lease.accountId, lease.slotId)
+      scheduler.restoreCodexSlot(lease.accountId, lease.slotId);
     }
-    const groups = await listEnabledGroupsForModel({ modelId, provider: 'grok' })
-    let busy: AccountPoolBusyError | null = null
+    const groups = await listEnabledGroupsForModel({ modelId, provider: "grok" });
+    let busy: AccountPoolBusyError | null = null;
     for (const group of groups) {
-      let picked
+      let picked;
       try {
         picked = await scheduler.pick({
-          mode: 'agent',
-          provider: 'grok',
+          mode: "agent",
+          provider: "grok",
           groupId: group.id,
           sessionId: sessionId ?? `container:${containerId}`,
           // OCV5-424: user affinity (no pinMode → no session pin / 409 flow).
           userId,
-        })
+        });
       } catch (err) {
-        if (err instanceof AccountPoolBusyError) {
-          busy = err
-          continue
-        }
-        if (err instanceof AccountPoolUnavailableError) continue
-        throw err
+        if (err instanceof AccountPoolBusyError) { busy = err; continue; }
+        if (err instanceof AccountPoolUnavailableError) continue;
+        throw err;
       }
-      picked.token.fill(0)
-      picked.refresh?.fill(0)
-      let route
+      picked.token.fill(0);
+      picked.refresh?.fill(0);
+      let route;
       try {
-        route = await tx((client) =>
-          createGrokRouteContextForModel({
-            containerId,
-            userId,
-            modelId,
-            accountId: picked.account_id,
-            slotId: picked.slotId,
-            groupId: group.id,
-            runner: client,
-            maxConcurrent: scheduler.maxConcurrent,
-            kind: origin ?? 'bridge',
-            ...(origin === 'delegate'
-              ? { maxDelegatePerContainer: MAX_DELEGATE_GROK_LEASES_PER_CONTAINER }
-              : {}),
-          }),
-        )
+        route = await tx((client) => createGrokRouteContextForModel({
+          containerId,
+          userId,
+          modelId,
+          accountId: picked.account_id,
+          slotId: picked.slotId,
+          groupId: group.id,
+          runner: client,
+          maxConcurrent: scheduler.maxConcurrent,
+          kind: origin ?? "bridge",
+          ...(origin === "delegate"
+            ? { maxDelegatePerContainer: MAX_DELEGATE_GROK_LEASES_PER_CONTAINER }
+            : {}),
+        }));
       } catch (err) {
-        scheduler.releaseCodexSlot(picked.account_id, picked.slotId)
-        throw err
+        scheduler.releaseCodexSlot(picked.account_id, picked.slotId);
+        throw err;
       }
       if (!route) {
-        scheduler.releaseCodexSlot(picked.account_id, picked.slotId)
-        continue
+        scheduler.releaseCodexSlot(picked.account_id, picked.slotId);
+        continue;
       }
       return {
-        kind: 'api_relay' as const,
-        engine: 'grok' as const,
+        kind: "api_relay" as const,
+        engine: "grok" as const,
         token: route.token,
         baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v5/grok-relay/route/${route.token}/v1`,
-        modelProvider: 'grok',
-        providerName: 'xAI Grok subscription',
-        wireApi: 'chat' as const,
-        preferredAuthMethod: 'apikey' as const,
+        modelProvider: "grok",
+        providerName: "xAI Grok subscription",
+        wireApi: "chat" as const,
+        preferredAuthMethod: "apikey" as const,
         disableResponseStorage: true,
         groupId: route.group.id.toString(),
         credentialId: route.accountId.toString(),
         accountId: route.accountId.toString(),
         slotId: picked.slotId,
-      }
+      };
     }
-    if (busy) throw busy
-    return { kind: 'unavailable' as const, reason: 'no usable Grok subscription account' }
-  }
+    if (busy) throw busy;
+    return { kind: "unavailable" as const, reason: "no usable Grok subscription account" };
+  };
   // Internal listeners are assembled before model-authority startup. Renewal
   // reads this forward ref at request time; startup windows fail closed 503.
-  let modelAuthoritySigner: AuthoritySigner | undefined
-  let modelCatalogCache: ModelCatalogCache | undefined
+  let modelAuthoritySigner: AuthoritySigner | undefined;
+  let modelCatalogCache: ModelCatalogCache | undefined;
   // 前向引用占位:userChatBridge 在下方创建,但 anthropicProxy 在这里就要它的 broadcastToUser。
   // 给 proxy 的 dep 是稳定的闭包(总是调 bridgeBroadcastRef.current),创建 bridge 后赋值。
   // 在 bridge 初始化完成前到达的 cost_charged broadcast 会走到 noop,不 throw 也不落盘(前端
   // 看不到积分显示,但扣费本身仍生效;生产上 proxy 处理请求前 bridge 必已初始化)。
   const bridgeBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
-    current: () => {
-      /* bridge 还没装好,静默丢弃 */
-    },
-  }
+    current: () => { /* bridge 还没装好,静默丢弃 */ },
+  };
   const mediaGenerationService = new MediaGenerationService({
     workerUrl: cfg.MEDIA_GENERATION_WORKER_URL,
     workerToken: cfg.MEDIA_GENERATION_WORKER_TOKEN,
@@ -2042,45 +2012,40 @@ export async function registerCommercial(
     maxInputBytes: cfg.MEDIA_GENERATION_MAX_INPUT_BYTES,
     maxUserStoredInputBytes: cfg.MEDIA_GENERATION_MAX_USER_STORED_INPUT_BYTES,
     broadcast: (uid, frame) => bridgeBroadcastRef.current(uid, frame),
-  })
-  if (runtimeChannel === 'v5' && mediaGenerationService.configured()) {
+  });
+  if (runtimeChannel === "v5" && mediaGenerationService.configured()) {
     leaderBundle.add({
-      name: 'mediaGeneration',
-      domain: 'v5-owned',
+      name: "mediaGeneration",
+      domain: "v5-owned",
       start: () => mediaGenerationService.start(),
-    })
+    });
   }
   const goalBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
-    current: () => {
-      /* bridge not assembled yet */
-    },
-  }
+    current: () => { /* bridge not assembled yet */ },
+  };
   const goalSyncRef: { current: (uid: bigint, payload: unknown) => void } = {
-    current: () => {
-      /* bridge not assembled yet */
-    },
-  }
+    current: () => { /* bridge not assembled yet */ },
+  };
   const goalStateService = new GoalStateService({
     pool: getPool(),
-    broadcast: (uid, snapshot) =>
-      goalBroadcastRef.current(uid, {
-        type: 'sys.goal_snapshot',
-        goal: snapshot,
-      }),
+    broadcast: (uid, snapshot) => goalBroadcastRef.current(uid, {
+      type: 'sys.goal_snapshot',
+      goal: snapshot,
+    }),
     syncEngine: (uid, snapshot) => goalSyncRef.current(uid, snapshot),
-  })
+  });
   goalUsageRefreshRef.current = async (userId, sessionId) => {
-    if (!/^c:\d+$/.test(userId)) return
-    await goalStateService.refreshUsage(BigInt(userId.slice(2)), sessionId)
-  }
+    if (!/^c:\d+$/.test(userId)) return;
+    await goalStateService.refreshUsage(BigInt(userId.slice(2)), sessionId);
+  };
   // 双槽私有 relay 的本槽 bridge forward-ref。控制口先起、bridge 后装配，窗口内安全返空。
   const slotRelayLocalRef: { current: SlotRelayLocal } = {
     current: { onlineUserSubset: () => [], broadcastToUsers: () => 0 },
-  }
+  };
   const slotRelayClient = createSlotRelayClient({
-    secret: cfg.OC_EGRESS_SECRET ?? '',
-    logger: rootLogger.child({ subsys: 'commercial', module: 'slotRelay' }),
-  })
+    secret: cfg.OC_EGRESS_SECRET ?? "",
+    logger: rootLogger.child({ subsys: "commercial", module: "slotRelay" }),
+  });
   // ⚠️ 命名空间对齐(根因修复):商业版 session 存储(SQLite client_sessions /
   // pending_usage_patches / server_authored_request_map)的 user_id 是 `c:<uid>`
   // (MASTER_USER_PREFIX),而 proxy/bridge 传进来的是裸 uid(与 PG 计费同口径)。
@@ -2110,7 +2075,7 @@ export async function registerCommercial(
       delegateAgentId,
       turnKey,
       parentTurnKey,
-    )
+    );
   // Tape engine_billings settlement entry shared by the finalize sync path and
   // the held settlement job. Codex/grok frames carry no discriminator and go
   // through the journal finalizer; `engine:'cursor'` frames (2026-09-02 fix for
@@ -2119,84 +2084,81 @@ export async function registerCommercial(
   const durableCursorBillingDeps = () => ({
     pgPool: getPool(),
     pricing,
-    logger: rootLogger.child({ subsys: 'durableCursorBilling' }),
+    logger: rootLogger.child({ subsys: "durableCursorBilling" }),
     appendCostCredits: appendCostCreditsForUser,
     broadcastToUser: (uid: bigint, payload: Record<string, unknown>) =>
       bridgeBroadcastRef.current(uid, payload),
-  })
+  });
   const settleTapeEngineBilling = async (
     userId: bigint,
-    billing: import('@openclaude/protocol').DurableCodexBilling,
+    billing: import("@openclaude/protocol").DurableCodexBilling,
   ): Promise<void> => {
     if (isCursorDurableBilling(billing)) {
-      await settleDurableCursorBilling(durableCursorBillingDeps(), userId, billing)
-      return
+      await settleDurableCursorBilling(durableCursorBillingDeps(), userId, billing);
+      return;
     }
     await settleDurableCodexBilling(
       {
         pgPool: getPool(),
         preCheckRedis,
         pricing,
-        logger: rootLogger.child({ subsys: 'durableCodexBilling' }),
+        logger: rootLogger.child({ subsys: "durableCodexBilling" }),
       },
       userId,
       billing,
-    )
-  }
+    );
+  };
   // P1.7 slice 7c — broker 前向引用。dispatchInternal 在 line ~883 装配,需要路由
   // `/internal/v3/wechat-outbound` → broker.outboundHandler;但 broker 本身依赖
   // resolveContainerEndpoint(line ~1529)装配完才能 makeInboundDispatcher → makeWechatBroker。
   // 这层 ref 把"路由表"(dispatchInternal)与"broker 实例"装配顺序解耦,与
   // bridgeBroadcastRef 同型:proxy 闭包总读 ref.current,broker 未就绪时短路 404 不 throw。
-  const wechatBrokerRef: { current: WechatBroker | null } = { current: null }
+  const wechatBrokerRef: { current: WechatBroker | null } = { current: null };
   const autoDreamOptimizerRuntimeRef: { current: AutoDreamOptimizerRuntime | null } = {
     current: null,
-  }
+  };
   const commercialCodexRouteRef: {
-    current:
-      | ((args: {
-          containerId: number
-          userId: bigint
-          modelId: string
-          sessionId?: string
-        }) => Promise<AdvisorCodexSelectorDecision>)
-      | null
+    current: ((args: {
+      containerId: number
+      userId: bigint
+      modelId: string
+      sessionId?: string
+    }) => Promise<AdvisorCodexSelectorDecision>) | null
   } = { current: null }
   const delegateEngineBillingRuntimeRef: { current: DelegateEngineBillingRuntime | null } = {
     current: null,
-  }
+  };
   // 主动微信投递接收点(cron/提醒 → master 权威解析收件人 → outbox)。与 broker 同生命周期,
   // 同条件块内装配;未装配时 dispatchInternal 显式 404(同 wechat-outbound 语义)。
-  const wechatProactiveRef: { current: ProactiveReceiverHandler | null } = { current: null }
+  const wechatProactiveRef: { current: ProactiveReceiverHandler | null } = { current: null };
   const qqOutboundRef: {
-    current: ReturnType<typeof makeQqOutboundReceiver> | null
-  } = { current: null }
+    current: ReturnType<typeof makeQqOutboundReceiver> | null;
+  } = { current: null };
   const qqProactiveRef: {
-    current: ReturnType<typeof makeQqProactiveReceiver> | null
-  } = { current: null }
+    current: ReturnType<typeof makeQqProactiveReceiver> | null;
+  } = { current: null };
   // v1.0.120 feat/codex-disable-rebind:fanoutDeps 依赖 v3Deps.putRemoteCodexAuth,
   // 必须在 v3Deps 装配后才能赋值;但 proxy / codex token refresh
   // handler / commercialHttpDeps 在更早就要拿到 trigger 闭包,故用 ref 打破先后。
   //
   // 装配前到达的事件(理论不可能,proxy 接请求前 v3Deps 已就绪)走 noop。
   const triggerCodexDisableFanoutRef: { current: (accountId: bigint) => void } = {
-    current: () => {
-      /* fanoutDeps 还没装好,静默丢弃 */
-    },
-  }
+    current: () => { /* fanoutDeps 还没装好,静默丢弃 */ },
+  };
   const triggerCodexDisableFanout = (accountId: bigint): void => {
-    triggerCodexDisableFanoutRef.current(accountId)
-  }
+    triggerCodexDisableFanoutRef.current(accountId);
+  };
   // D.1b: self host uuid 取失败只降级多机路径(proxy / v3Deps.containerService /
   // baselineServer),不牵连整个 commercial 启动。多处共用,提前一次性取。
-  let selfHostUuid: string | undefined
+  let selfHostUuid: string | undefined;
   try {
-    selfHostUuid = (await computeQueries.getSelfHost()).id
+    selfHostUuid = (await computeQueries.getSelfHost()).id;
   } catch (err) {
     // eslint-disable-next-line no-console
-    console.error('[commercial] getSelfHost failed; multi-host routing + internal proxy disabled', {
-      err: (err as Error)?.message ?? String(err),
-    })
+    console.error(
+      "[commercial] getSelfHost failed; multi-host routing + internal proxy disabled",
+      { err: (err as Error)?.message ?? String(err) },
+    );
     // selfHostUuid 保持 undefined;下面 proxy / v3Deps / baselineServer 全部靠 guard 跳过
   }
 
@@ -2207,17 +2169,22 @@ export async function registerCommercial(
   //
   // 注:rateLimitRedis 仅在两条 proxy strategy 中消费;放在外层不会额外占资源
   // (redis 客户端是同一个,wrapIoredis 只是 typed-method 投影)。
-  const sharedRateLimitRedis = wrapIoredis(redis)
+  const sharedRateLimitRedis = wrapIoredis(redis);
   // 2026-07-02 egress split:authz 加载器抽到 auth/userModelAuthz.ts 单一权威
   // (master 与 egress 两进程共用同一份规则),语义与原内联实现逐行等价。
-  const loadUserModelAuthz = makeLoadUserModelAuthz()
+  const loadUserModelAuthz = makeLoadUserModelAuthz();
   // cron-origin-inject 的 bridge 晚绑定引用:handler 必须在内层 internal-proxy 作用域
   // 创建(identityRepo 在那里),而 userChatBridge 要到 registerCommercial 尾部才初始化。
   // 直接闭包引用 const userChatBridge 会在初始化窗口内 TDZ 抛错(b1d9e4fbb 同类问题);
   // 用可空 ref:bridge 未就绪 → no_transport(503),容器侧按 retryable 下轮重试。
-  let cronOriginBridgeRef: UserChatBridgeHandler | null = null
+  let cronOriginBridgeRef: UserChatBridgeHandler | null = null;
 
-  if (!options.skipInternalProxy && proxyBind && proxyPort !== undefined && selfHostUuid) {
+  if (
+    !options.skipInternalProxy &&
+    proxyBind &&
+    proxyPort !== undefined &&
+    selfHostUuid
+  ) {
     // fail-closed guard(Codex plan review #4 + diff review Blocker):平台默认模型(2026-06-17 起
     // glm-5.3)路由到静态 provider ark,若 ARK_CODING_PLAN_KEY 未配 → throw,loud fail 拒绝启动。
     // guard 动态走 PLATFORM_DEFAULT_MODEL→provider→meta.keyConfigField,非硬编码某 provider。
@@ -2228,17 +2195,15 @@ export async function registerCommercial(
     // "internal proxy 禁用但 master 照跑",违反 loud-fail。放 try 外则异常直接冒泡崩 master boot。
     // 触发面仅此 internal-proxy/agent-runtime 启动路径;unit test / external proxy harness 不进此分支。
     // OCV5-424:env key 先幂等导入服务池,再按"env 或池内成员"校验默认模型。
-    await importEnvApiKeys(staticProviderKeysFromConfig(cfg)).catch((err) =>
-      console.warn('[commercial] api-key pool env import failed:', (err as Error)?.message ?? err),
-    )
-    await primeApiKeyPool().catch(() => {})
-    startApiKeyPoolCache()
+    await importEnvApiKeys(staticProviderKeysFromConfig(cfg)).catch((err) => console.warn("[commercial] api-key pool env import failed:", (err as Error)?.message ?? err));
+    await primeApiKeyPool().catch(() => {});
+    startApiKeyPoolCache();
     assertPlatformDefaultModelConfigured(cfg, {
       apiKeyPoolConfigured: (service) => apiKeyPoolConfiguredServices().has(service),
-    })
+    });
     try {
-      const identityRepo = createPgIdentityRepo()
-      const rateLimitRedis = sharedRateLimitRedis
+      const identityRepo = createPgIdentityRepo();
+      const rateLimitRedis = sharedRateLimitRedis;
       // V3 Phase 2(2026-05-18 anthropicProxy 拆分):身份层 strategy。
       // 把 verify + recordHostRequest + loadUserModelAuthz + canUseModel 收口到
       // IdentityStrategy 单一注入点。loadUserModelAuthz 闭包形状不变(从权威源 DB
@@ -2252,7 +2217,7 @@ export async function registerCommercial(
         loadUserModelAuthz,
         // recordHostRequest 不显式注入,strategy 内部走模块级 default
         // (../compute-pool/hostReqCounter.recordHostRequest)。
-      })
+      });
       // ── 模型执行 catalog(模型权威批次 · 方案 §1.2/§4/§6)──────────────────────
       //
       // 进程内唯一一份(modelCatalogRuntime 单例)—— bridge 签发 / 内部下发端点 /
@@ -2266,22 +2231,22 @@ export async function registerCommercial(
       //     不如启动就响亮失败);
       //   - 影子期 → **fail-soft**:catalog 只是观测面,没有任何判定依赖它;此时因为
       //     0143 未 apply 就把 master 拒启,是纯自伤(零安全收益)。记 error 继续跑 legacy。
-      const modelAuthorityEnforce = isModelAuthorityEnforced()
-      let modelCatalogForProxy: Awaited<ReturnType<typeof getModelCatalogCache>> | undefined
+      const modelAuthorityEnforce = isModelAuthorityEnforced();
+      let modelCatalogForProxy: Awaited<ReturnType<typeof getModelCatalogCache>> | undefined;
       try {
-        modelCatalogForProxy = await getModelCatalogCache()
+        modelCatalogForProxy = await getModelCatalogCache();
       } catch (err) {
-        if (modelAuthorityEnforce) throw err
+        if (modelAuthorityEnforce) throw err;
         console.error(
-          '[commercial] model catalog load failed (shadow mode → legacy 判定继续):',
+          "[commercial] model catalog load failed (shadow mode → legacy 判定继续):",
           err,
-        )
+        );
       }
-      const sharedProxyConcurrency = new ConcurrencyLimiter(DEFAULT_MAX_CONCURRENT_PER_UID)
+      const sharedProxyConcurrency = new ConcurrencyLimiter(DEFAULT_MAX_CONCURRENT_PER_UID);
       const sharedProxyFallback = new FallbackRateLimiter(
         DEFAULT_PROXY_RATE_LIMIT.windowSeconds,
         Math.max(1, Math.floor(DEFAULT_PROXY_RATE_LIMIT.max / 3)),
-      )
+      );
       internalProxyHandler = makeAnthropicProxyHandler({
         pgPool: getPool(),
         pricing,
@@ -2328,7 +2293,7 @@ export async function registerCommercial(
         getPhase6AccountUuidEnforce,
         getSessionPinMode,
         listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
-      })
+      });
       // 2026-05-05 v3 commercial server-authored persistence — 复用 18791/18443
       // 同一个 listener,新加 POST /internal/v3/server-authored-message。
       // 路由由 dispatchInternal 按 url path 分流;仅 path 完全匹配 SERVER_AUTHORED_PATH
@@ -2352,20 +2317,17 @@ export async function registerCommercial(
           patchServerAuthoredMessage,
         },
         recordOversized: ({ userId, requestId, sessionId }) => {
-          void recordProductFrictionEvent(
-            {
-              correlation: requestId,
-              userId,
-              surface: 'session',
-              stage: 'persist',
-              code: 'SESSION_OVERSIZED',
-              outcome: 'failed',
-              sessionId,
-            },
-            getPool(),
-          ).catch(() => {})
+          void recordProductFrictionEvent({
+            correlation: requestId,
+            userId,
+            surface: "session",
+            stage: "persist",
+            code: "SESSION_OVERSIZED",
+            outcome: "failed",
+            sessionId,
+          }, getPool()).catch(() => {});
         },
-      })
+      });
       // Codex reverse-RPC `account/chatgptAuthTokens/refresh` over HTTP.
       // Container's gateway forwards 401-recovery refresh asks here; we read
       // the bound codex_account, refresh upstream, persist to DB + per-container
@@ -2385,14 +2347,14 @@ export async function registerCommercial(
         // v1.0.120:triggerCodexDisableFanout — codex token refresh 失败 disable
         // 后立刻 fanout rebind 其他活跃容器,避免老 token 仍被 codex CLI 沿用。
         triggerCodexDisableFanout,
-      })
+      });
       // /v3/literature/search — DeepXiv 文献检索 proxy。复用 identityRepo
       // (同 anthropicProxy 的双因子身份),token 留在 master,容器只走 mTLS 内部 proxy。
       // GET-then-INCR Lua 配额 + per-container 60req/5min in-memory limiter。
       const literatureProxyHandler: LiteratureProxyHandler = makeLiteratureProxyHandler({
         identityRepo,
         redis,
-      })
+      });
       // /v3/connectors/{list|call} — 应用连接器容器 RPC(oc-connect CLI 回源)。
       // 同款 verifyContainerIdentity 双因子;第三方凭据只在 master(connections 表
       // AES-256-GCM),容器只带自身身份 bearer。写操作过确认门(connector_write_ledger),
@@ -2410,43 +2372,40 @@ export async function registerCommercial(
       const researchProxyHandler: ResearchProxyHandler = makeResearchProxyHandler({
         identityRepo,
         redis,
-      })
+      });
       // /v3/ocr/* — container-authenticated async SCNet document parsing.
       // Provider credentials and durable tenant ownership stay on master.
       const ocrProxyHandler: OcrProxyHandler = makeOcrProxyHandler({
         identityRepo,
         store: new PgOcrJobStore(getPool()),
-      })
+      });
       // /internal/v3/platform-prompt-slots — 容器 → master 拉取平台级 prompt slot
       // (SKILLS_LITERATURE / MODEL_HINT)。镜像 build 排除 packages/commercial,所以
       // 容器进程内的 gateway 看不到 setLiteratureSkillProvider / setModelHintProvider
       // 注册的 hook;这条 endpoint 把 master 持有的 slot 内容 GET 给容器,在容器
       // buildPromptContext 时合并进 extra-prompt.md。详见
       // packages/commercial/src/http/internalPlatformPromptSlots.ts 头注。
-      const platformPromptSlotsHandler: PlatformPromptSlotsHandler = makePlatformPromptSlotsHandler(
-        {
+      const platformPromptSlotsHandler: PlatformPromptSlotsHandler =
+        makePlatformPromptSlotsHandler({
           identityRepo,
           pricingCache: pricing,
           // MODEL_HINT 的 alias→canonical 单一权威 = catalog(model_aliases);
           // pricingCache 只留 extra_system_prompt 文案。未装配(shadow 期 catalog
           // 拉不起来)→ handler 内部退 legacy 归一。
           catalog: modelCatalogForProxy,
-        },
-      )
+        });
       const projectContextHandler: InternalProjectContextHandler =
-        makeInternalProjectContextHandler({ identityRepo })
+        makeInternalProjectContextHandler({ identityRepo });
       // /internal/v3/project-assets — 容器回合产出登记进 master sessions 后端(PG),
       // 侧栏/资产面板读的就是它;容器本地 SQLite 没人读。租户只取容器身份。
-      const projectAssetsHandler: InternalProjectAssetsHandler = makeInternalProjectAssetsHandler({
-        identityRepo,
-      })
+      const projectAssetsHandler: InternalProjectAssetsHandler =
+        makeInternalProjectAssetsHandler({ identityRepo });
       // /internal/v3/project-search — the agent's project_search tool (via the
       // container gateway). Tenant from the container identity only; searches
       // the tenant's chat project bound to the given board id. 404 unless
       // OC_PROJECT_CONTEXT and OC_P5_PROJECT_SEARCH are on.
-      const projectSearchHandler: InternalProjectSearchHandler = makeInternalProjectSearchHandler({
-        identityRepo,
-      })
+      const projectSearchHandler: InternalProjectSearchHandler =
+        makeInternalProjectSearchHandler({ identityRepo });
       // /internal/v3/minimax — 容器内 safe mmx wrapper → master 代持 MiniMax
       // Token Plan key 调用多模态 API 并记账。Token Plan key 只在 master env,
       // 不注入容器；鉴权同 anthropicProxy / platform slots 双因子。
@@ -2454,20 +2413,20 @@ export async function registerCommercial(
         identityRepo,
         pgPool: getPool(),
         tokenPlanKey: cfg.MINIMAX_TOKEN_PLAN_KEY,
-      })
+      });
       const mediaGenerationInternalHandler: MediaGenerationInternalHandler =
-        makeMediaGenerationInternalHandler({ identityRepo, service: mediaGenerationService })
+        makeMediaGenerationInternalHandler({ identityRepo, service: mediaGenerationService });
       // /internal/v3/minimax-search — 容器内 CCB 内置 WebSearch(MiniMaxSearchAdapter)回源 master。
       // key(MINIMAX_TOKEN_PLAN_KEY)只在 master,不注入容器;同款 verifyContainerIdentity 双因子。
       // MiniMax coding_plan/search 中文深度强,替代脆弱的 Bing HTML 刮页(Bing Search API 已退役)。
       const minimaxWebSearchHandler: MiniMaxWebSearchHandler = makeMiniMaxWebSearchHandler({
         identityRepo,
         tokenPlanKey: cfg.MINIMAX_TOKEN_PLAN_KEY,
-      })
+      });
       // MiniMax 失败时 CCB 再打这条。Grok 订阅 token 只留在 master。
       const grokWebSearchHandler: GrokWebSearchHandler = makeGrokWebSearchHandler({
         identityRepo,
-      })
+      });
       // /internal/v3/grok-vision — 识图后端(understand_image / oc-vision / oc-figcheck)。
       // 容器只交图片和问题;master 借一个 Grok 账号调 Grok 4.7,并按 grok-build 目录价
       // 走 预扣 → journal → 结算(用量取上游响应)。订阅 token 和计费请求号都不出 master。
@@ -2478,14 +2437,14 @@ export async function registerCommercial(
         pricing,
         catalog: {
           async assertFresh() {
-            const cache = modelCatalogForProxy ?? peekModelCatalogCache()
-            if (!cache) throw new Error('GROK_VISION_CATALOG_UNAVAILABLE')
-            return cache.assertFresh()
+            const cache = modelCatalogForProxy ?? peekModelCatalogCache();
+            if (!cache) throw new Error("GROK_VISION_CATALOG_UNAVAILABLE");
+            return cache.assertFresh();
           },
         },
         loadUserModelAuthz,
         recordStatus: makeGrokRelayHealthRecorder({ health: healthTracker }),
-      })
+      });
       // /internal/v3/codex-relay — 平台管控的 codex api_relay 流式转发。
       // egress split(M1b 架构决策):同一 handler 同时在 egress 进程本地挂载,
       // 生产在飞 codex 流走 egress 不经 master;master 挂载留作非 split 拓扑兜底。
@@ -2500,7 +2459,7 @@ export async function registerCommercial(
             balanceAfter: charge.balanceAfter,
           })
         },
-      })
+      });
       const grokRelayHandler: GrokRelayHandler = makeGrokRelayHandler({
         identityRepo,
         // Per-request account feedback through the shared health tracker:
@@ -2513,58 +2472,50 @@ export async function registerCommercial(
           if (!scheduler.renewCodexSlot(accountId, slotId)) {
             // resolveGrokRouteContext already proved the durable row active.
             // Rebuild a local mirror forgotten by a restart/orphan reaper.
-            scheduler.restoreCodexSlot(accountId, slotId)
+            scheduler.restoreCodexSlot(accountId, slotId);
           }
-          return true
+          return true;
         },
-      })
+      });
       // /internal/v5/delegate/grok-route/* — 容器本地 delegate turn 的 grok route
       // mint/renew/release(与浏览器 turn 同一账号池与 durable 并发权威)。仅在
       // selfhost engine-local-turn 豁免下挂载(与 gateway modelAuthority
       // isEngineLocalTurnExempt 同一 env 语义);生产不路由 → 容器侧 delegate 在
       // decideLocalExecution 已 fail-closed,不会也不该到达这里。
       const delegateGrokRouteHandler: DelegateGrokRouteHandler | undefined =
-        process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === '1'
+        process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"
           ? makeDelegateGrokRouteHandler({
               identityRepo,
               // origin=delegate:短心跳租约 + per-container 限额(与浏览器 bridge
               // 的 7 天孤儿 TTL 语义分离,见 allocateGrokRelayRoute 注释)。
-              allocate: (input) => allocateGrokRelayRoute({ ...input, origin: 'delegate' }),
+              allocate: (input) => allocateGrokRelayRoute({ ...input, origin: "delegate" }),
               release: async ({ routeToken, containerId, userId }) => {
-                const context = await resolveGrokRouteContext({
-                  token: routeToken,
-                  containerId,
-                  userId,
-                })
-                if (!context) return false
-                await expireGrokRouteContextByLease(context.accountId, context.slotId)
-                scheduler.releaseCodexSlot(context.accountId, context.slotId)
-                return true
+                const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
+                if (!context) return false;
+                await expireGrokRouteContextByLease(context.accountId, context.slotId);
+                scheduler.releaseCodexSlot(context.accountId, context.slotId);
+                return true;
               },
               renew: async ({ routeToken, containerId, userId }) => {
-                const context = await resolveGrokRouteContext({
-                  token: routeToken,
-                  containerId,
-                  userId,
-                })
-                if (!context) return false
+                const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
+                if (!context) return false;
                 if (!scheduler.renewCodexSlot(context.accountId, context.slotId)) {
-                  scheduler.restoreCodexSlot(context.accountId, context.slotId)
+                  scheduler.restoreCodexSlot(context.accountId, context.slotId);
                 }
-                return true
+                return true;
               },
-              logger: rootLogger.child({ subsys: 'delegateGrokRoute' }),
+              logger: rootLogger.child({ subsys: "delegateGrokRoute" }),
             })
-          : undefined
+          : undefined;
       const zcodeRelayHandler: ZcodeRelayHandler = makeZcodeRelayHandler({
         identityRepo,
-        codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? '',
-      })
+        codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
+      });
       const antigravityRelayHandler: AntigravityRelayHandler = makeAntigravityRelayHandler({
         identityRepo,
-        clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? '',
+        clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
         pricing,
-      })
+      });
       // /internal/v3/skill-embed — 容器内 mcp-memory 语义 skill_search 回源 master。
       // master 持 SKILL_EMBEDDING_API_KEY/DASHSCOPE_API_KEY(只在 master env,不注入容器),
       // 同款 verifyContainerIdentity 双因子鉴权;向量跨租户 PG 缓存,fail-closed 回落关键词。
@@ -2572,18 +2523,18 @@ export async function registerCommercial(
         identityRepo,
         cache: makePgSkillEmbedCache(),
         recordSearch: makePgSkillSearchLogger(),
-      })
+      });
       // Core memory stays first-party: current safe chunks are ranked by the
       // q8 model bundled in this master release, with no vector persistence.
       const coreMemoryRankHandler: CoreMemoryRankHandler = makeCoreMemoryRankHandler({
         identityRepo,
-      })
+      });
       // /internal/v3/marketplace/sync — 容器内 mcp-memory 拉取本用户已安装(未撤回)
       // 的市场 skill artifact 做 hub 对账(pull 模型,同款 verifyContainerIdentity)。
       const marketplaceSyncHandler: MarketplaceSyncHandler = makeMarketplaceSyncHandler({
         identityRepo,
         flavorIdentity,
-      })
+      });
       // /internal/v3/turn-waive — 滚动升级/审计修复的兼容入口。master 只按
       // (user, turnKey) 精确冲正，并在同一事务写一封定向站内信。主路径
       // 由 lossless turn tape 携 waiveReason，不再使用会话时间窗口。
@@ -2591,17 +2542,17 @@ export async function registerCommercial(
         identityRepo,
         pgPool: getPool(),
         broadcastToUser: (uid, payload) => bridgeBroadcastRef.current(uid, payload),
-      })
+      });
       const turnLeaseRenewHandler: TurnLeaseRenewHandler = makeTurnLeaseRenewHandler({
         identityRepo,
         pgPool: getPool(),
         getSigner: () => modelAuthoritySigner,
-      })
+      });
       // durable turn dispatch(RFC §2.4 / §3):容器 boot recovery 查 tape 三态。同容器身份双因子。
       const turnTapeStateHandler: ServerAuthoredHandler = makeTurnTapeStateHandler({
         identityRepo,
         storage: dispatchAdmissionBackend,
-      })
+      });
       // V5 queue P1 compatibility layer:strict opt-in. Flag off means no store
       // instance and no route registration, so legacy internal dispatch remains exact.
       const promptQueueHandler: PromptQueueHandler | null = isPromptQueueV1Enabled()
@@ -2609,14 +2560,14 @@ export async function registerCommercial(
             identityRepo,
             store: new PgPromptQueueStore(getPool()),
           })
-        : null
+        : null;
       // /internal/v3/marketplace/agent/* — 容器内 AI(market skill / oc-market CLI)
       // 代用户做市场操作(search/install/uninstall/publish),同款 verifyContainerIdentity
       // 限本用户;install 仅已审内容、publish 仅入 pending(管理员审核前不上线)。
       const marketplaceAgentHandler: MarketplaceAgentHandler = makeMarketplaceAgentHandler({
         identityRepo,
         listPublicModels: () => pricing.listPublic(),
-      })
+      });
       // /internal/v3/agent-audit/tool-failure — 容器 gateway 自动上报失败工具调用。
       // user_id 由 verifyContainerIdentity 推导,不信任容器传入;写入 agent_audit 供后台优化。
       // 显式开关 OC_TOOL_FAILURE_AUDIT=1(与容器侧 reporter 同名 env,supervisor 只在
@@ -2628,22 +2579,22 @@ export async function registerCommercial(
             identityRepo,
             queryRunner: getPool(),
           })
-        : null
+        : null;
       const toolCallRollupHandler: ToolCallRollupHandler | null = isToolFailureAuditEnabled()
         ? makeToolCallRollupHandler({
             identityRepo,
             queryRunner: getPool(),
           })
-        : null
+        : null;
       const turnObservationHandler = isToolFailureAuditEnabled()
         ? makeTurnObservationHandler({ identityRepo, queryRunner: getPool() })
-        : null
+        : null;
       // Privacy-minimized memory operation stream. Always registered when the
       // runtime has a container identity channel; no raw query/session/body is accepted.
       const memoryUsageHandler = makeMemoryUsageHandler({
         identityRepo,
         queryRunner: getPool(),
-      })
+      });
       // /internal/v3/marketplace/skill-usage — 容器 gateway skillUsageReporter 批量上报
       // 「hub 技能被使用」的低敏信号(slug/agent/trace,不记内容)。user_id 由
       // verifyContainerIdentity 推导,不信容器传入;写入 marketplace_skill_usage_events 供
@@ -2655,7 +2606,7 @@ export async function registerCommercial(
             identityRepo,
             queryRunner: getPool(),
           })
-        : null
+        : null;
       // /internal/v3/skill-shadow — 四路 cost-free 检索旁路 + 同 turn skill_view 金标。
       // 严格 opt-in:env 缺省时不注册路由，与容器侧 listener 的门控同源。
       const skillShadowHandler: SkillShadowHandler | null = isSkillShadowEnabled()
@@ -2663,7 +2614,7 @@ export async function registerCommercial(
             identityRepo,
             queryRunner: getPool(),
           })
-        : null
+        : null;
       // /internal/v3/marketplace/skill-feedback — 容器 gateway 起技能训练前拉「该用户对该技能
       // 差评过的真实场景引用」(只回 sessionKey/traceId/at,内容主权不出容器)。user_id 由
       // verifyContainerIdentity 推导。**无条件注册**:纯只读端点,无数据时返 {refs:[],total:0};
@@ -2671,26 +2622,26 @@ export async function registerCommercial(
       const skillFeedbackHandler: SkillFeedbackHandler = makeSkillFeedbackHandler({
         identityRepo,
         queryRunner: getPool(),
-      })
+      });
       const autoDreamPolicyHandler: AutoDreamPolicyHandler = makeAutoDreamPolicyHandler({
         identityRepo,
-      })
+      });
       const autoDreamOptimizerHandler = makeAutoDreamOptimizerHandler({
         identityRepo,
         runtimeRef: autoDreamOptimizerRuntimeRef,
-      })
-      const advisorCodexRelayDb = makeDefaultCodexRelayDb()
+      });
+      const advisorCodexRelayDb = makeDefaultCodexRelayDb();
       delegateEngineBillingRuntimeRef.current = createDelegateEngineBillingRuntime({
         getPool,
         preCheckRedis,
         pricing,
         catalog: {
           async assertFresh() {
-            const cache = modelCatalogForProxy ?? peekModelCatalogCache()
+            const cache = modelCatalogForProxy ?? peekModelCatalogCache();
             if (!cache) {
-              throw new Error('DELEGATE_ENGINE_BILLING_CATALOG_UNAVAILABLE')
+              throw new Error("DELEGATE_ENGINE_BILLING_CATALOG_UNAVAILABLE");
             }
-            return cache.assertFresh()
+            return cache.assertFresh();
           },
         },
         loadUserModelAuthz,
@@ -2706,50 +2657,56 @@ export async function registerCommercial(
           })
         },
         expireAdvisorCodexRoute: (token) => expireCodexRouteContext(token).then(() => {}),
-      })
+      });
       const delegateEngineBillingHandler = makeDelegateEngineBillingHandler({
         identityRepo,
         runtimeRef: delegateEngineBillingRuntimeRef,
-      })
+      });
       // 平台 preset seed 会写双 slot 共享的 marketplace current 指针，必须跟随唯一
       // leadership，而非 candidate process startup。初次 acquire / finalize 接管 / abort
       // 后旧 slot re-acquire 都 await 同一幂等逻辑；单个 seed 仍沿用原 fail-soft 语义。
-      if (runtimeChannel === 'v5') {
+      if (runtimeChannel === "v5") {
         seedPlatformAgentsForLeadership = async () => {
           // 平台官方**科研** agent：仅 research_config 开启时 seed。
           try {
-            const rc = await getResearchConfigPublic()
+            const rc = await getResearchConfigPublic();
             if (rc.enabled) {
               const seeded = await seedPlatformResearchAgents({
                 listPublicModels: () => pricing.listPublic(),
-              })
-              console.log('[commercial] platform research agents seed:', JSON.stringify(seeded))
+              });
+              console.log(
+                "[commercial] platform research agents seed:",
+                JSON.stringify(seeded),
+              );
             }
           } catch (err) {
-            console.error('[commercial] seedPlatformResearchAgents failed:', err)
+            console.error("[commercial] seedPlatformResearchAgents failed:", err);
           }
           // 平台官方**通用** agent(办公助手 + 编程助手)：不依赖 research_config，无条件 seed。
           try {
             const seeded = await seedPlatformGeneralAgents({
               listPublicModels: () => pricing.listPublic(),
-            })
-            console.log('[commercial] platform general agents seed:', JSON.stringify(seeded))
+            });
+            console.log(
+              "[commercial] platform general agents seed:",
+              JSON.stringify(seeded),
+            );
           } catch (err) {
-            console.error('[commercial] seedPlatformGeneralAgents failed:', err)
+            console.error("[commercial] seedPlatformGeneralAgents failed:", err);
           }
-        }
+        };
       }
       // 声明式**默认连接器**(notion/feishu/github)的幂等 seed —— 走完整 securityApprove 审计
       // 路径落 security_approved,catalog 才有可绑连接器、用户/agent 才发现得到。无此调用则生产
       // 目录为空(整套端到端不成立)。fire-and-forget,失败只 log 不阻断启动;幂等,重启可反复跑。
       void (async () => {
         try {
-          const seeded = await seedDefaultConnectors(getPool())
-          console.log('[commercial] default connectors seed:', JSON.stringify(seeded))
+          const seeded = await seedDefaultConnectors(getPool());
+          console.log("[commercial] default connectors seed:", JSON.stringify(seeded));
         } catch (err) {
-          console.error('[commercial] seedDefaultConnectors failed:', err)
+          console.error("[commercial] seedDefaultConnectors failed:", err);
         }
-      })()
+      })();
       // egress split:cost 回执接收端(egress finalize 后的 SQLite 持久化 + WS 广播
       // 回投)。仅 split 模式挂载;秘钥头校验在 handler 内(loopback + egress 剥头 +
       // 秘钥三层)。
@@ -2758,12 +2715,12 @@ export async function registerCommercial(
         appendCostCredits: appendCostCreditsForUser,
         broadcastToUser: async (uid, payload) => {
           if (dualMasterEnabled) {
-            await slotRelayClient.broadcastToUsers([uid.toString()], payload)
-            return
+            await slotRelayClient.broadcastToUsers([uid.toString()], payload);
+            return;
           }
-          bridgeBroadcastRef.current(uid, payload)
+          bridgeBroadcastRef.current(uid, payload);
         },
-      })
+      });
       // /internal/v3/cron-index — 容器 gateway 上报「派生唤醒索引」(nextFireAt/enabledCount)。
       // uid 由 verifyContainerIdentity 推导;upsert cron_wake_index(runtime_channel=当前)。
       // 见 http/internalCronIndex.ts + agent-sandbox/cronWake.ts。runner 用 getPool()(结构上
@@ -2771,14 +2728,14 @@ export async function registerCommercial(
       const cronIndexHandler: CronIndexHandler = makeCronIndexHandler({
         identityRepo,
         runner: getPool() as unknown as CronWakeRunner,
-      })
+      });
       const cronOriginInjectHandler: CronOriginInjectHandler = makeCronOriginInjectHandler({
         identityRepo,
         inject: (input) =>
           cronOriginBridgeRef
             ? cronOriginBridgeRef.injectCronOriginTurn(input)
-            : Promise.resolve({ kind: 'no_transport' as const }),
-      })
+            : Promise.resolve({ kind: "no_transport" as const }),
+      });
       // /internal/v3/inbox-post — 容器 onDeliver「离线送达兜底写站内信」。uid 由容器身份推导,
       // audience 硬编码 'user' 只给自己写;created_by = MIN active admin(同 onboarding 语义,
       // 每次现解析,不缓存)。无 admin → 抛错 → handler 500。见 http/internalInboxPost.ts。
@@ -2786,13 +2743,13 @@ export async function registerCommercial(
       // 当前 selfhost 单主用户,cron 跑在 uid 容器内,token 即该用户,路径可用。
       const postInboxToUser = async (
         uid: number,
-        msg: { title: string; bodyMd: string; level: 'info' | 'warning'; deliveryKey?: string },
+        msg: { title: string; bodyMd: string; level: "info" | "warning"; deliveryKey?: string },
       ) => {
         const adminRow = await getPool().query<{ id: string }>(
           `SELECT id::text AS id FROM users WHERE role = 'admin' AND status = 'active' ORDER BY id ASC LIMIT 1`,
-        )
-        const senderId = adminRow.rows[0]?.id
-        if (!senderId) throw new Error('inbox-post: no active admin sender')
+        );
+        const senderId = adminRow.rows[0]?.id;
+        if (!senderId) throw new Error("inbox-post: no active admin sender");
         if (msg.deliveryKey) {
           await createCronDeliveryInboxMessage({
             userId: uid,
@@ -2801,27 +2758,27 @@ export async function registerCommercial(
             level: msg.level,
             createdBy: senderId,
             deliveryKey: msg.deliveryKey,
-          })
-          return
+          });
+          return;
         }
         await createInboxMessage(senderId, {
-          audience: 'user',
+          audience: "user",
           user_id: uid,
           title: msg.title,
           body_md: msg.bodyMd,
           level: msg.level,
-        })
-      }
+        });
+      };
       const inboxPostHandler: InboxPostHandler = makeInboxPostHandler({
         identityRepo,
         postMessage: postInboxToUser,
-      })
+      });
       // 熔断告警:允许 warning,仍走同一 createInboxMessage / deliveryKey 幂等。
       const inboxAlertHandler: InboxPostHandler = makeInboxPostHandler({
         identityRepo,
         postMessage: postInboxToUser,
         allowWarning: true,
-      })
+      });
       // /internal/v3/model-catalog{,-epoch} —— 容器 catalog client 的 per-uid 投影下发
       // (模型权威批次 §3/§6)。服务的是**本地路径**(cron/synthetic/delegate)判定;浏览器
       // turn 的判定随 inbound 的签名 descriptor 下来,不经这条路。
@@ -2844,18 +2801,18 @@ export async function registerCommercial(
               getProviderRoutingAvailability(Date.now(), undefined, undefined, true),
             loadAgentCostOverrides: () => listAgentCostOverrides(getPool()),
           })
-        : null
+        : null;
       void (async () => {
-        const deskFlags = await getDesktopFlagSnapshot()
-        if (!deskFlags.assembled) return
-        const deskRepo = createPgDesktopIdentityRepo()
-        const deskVerify = makeDesktopRequestVerifier(deskRepo)
+        const deskFlags = await getDesktopFlagSnapshot();
+        if (!deskFlags.assembled) return;
+        const deskRepo = createPgDesktopIdentityRepo();
+        const deskVerify = makeDesktopRequestVerifier(deskRepo);
         const deskIdentity = makeDesktopIdentityStrategy({
           repo: deskRepo,
           tlsFromReq: (req) => extractDesktopTlsContext(req),
           pricing,
           loadUserModelAuthz,
-        })
+        });
         const deskMessages = makeAnthropicProxyHandler({
           pgPool: getPool(),
           pricing,
@@ -2864,7 +2821,7 @@ export async function registerCommercial(
           identity: deskIdentity,
           loadUserModelAuthz,
           rateLimitRedis,
-          runtimeKind: 'desktop',
+          runtimeKind: "desktop",
           modelCatalog: modelCatalogForProxy,
           modelAuthorityEnforce,
           authorityKeyring: authorityKeyringProvider(),
@@ -2876,24 +2833,21 @@ export async function registerCommercial(
           listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
           concurrencyLimiter: sharedProxyConcurrency,
           fallbackLimiter: sharedProxyFallback,
-        })
+        });
         const deskHttpDeps = {
           jwtSecret,
           mailer: stubMailer,
           redis: wrapIoredis(redis),
           desktopTunnelRegistry: getDesktopTunnelRegistry(),
-        } as import('./http/handlers.js').CommercialHttpDeps
+        } as import("./http/handlers.js").CommercialHttpDeps;
         const listener = await startDesktopTlsListener({
-          role: 'master',
+          role: "master",
           allowRegister: true,
           handlers: {
             messages: deskMessages,
-            tokenMint: (req, res) =>
-              handleDesktopTokenMint(req, res, desktopTokenRequestContext(req), deskHttpDeps),
-            tokenRefresh: (req, res) =>
-              handleDesktopTokenRefresh(req, res, desktopTokenRequestContext(req), deskHttpDeps),
-            runtimeManifest: (req, res) =>
-              handleDesktopRuntimeManifest(req, res, desktopTokenRequestContext(req), deskHttpDeps),
+            tokenMint: (req, res) => handleDesktopTokenMint(req, res, desktopTokenRequestContext(req), deskHttpDeps),
+            tokenRefresh: (req, res) => handleDesktopTokenRefresh(req, res, desktopTokenRequestContext(req), deskHttpDeps),
+            runtimeManifest: (req, res) => handleDesktopRuntimeManifest(req, res, desktopTokenRequestContext(req), deskHttpDeps),
             serverAuthored: makeServerAuthoredHandler({
               identityRepo,
               verify: deskVerify,
@@ -2927,398 +2881,360 @@ export async function registerCommercial(
                   loadUserModelAuthz,
                 })
               : async (_req, res) => {
-                  res.statusCode = 503
-                  res.end()
+                  res.statusCode = 503;
+                  res.end();
                 },
           },
           identityRepo: deskRepo,
-        })
-        if (listener) desktopTlsClose = () => listener.close()
+        });
+        if (listener) desktopTlsClose = () => listener.close();
       })().catch((err) => {
-        rootLogger.warn('[commercial] desktop TLS listener not started', {
-          err: (err as Error)?.message,
-        })
-      })
+        rootLogger.warn("[commercial] desktop TLS listener not started", { err: (err as Error)?.message });
+      });
       // seed 完整性(§5 / R2-M8):平台预设 agent 引用的模型必须在 catalog active,否则用户
       // 点开预设助手第一句话就被 gate 拒。**全局**断言(per-uid 下发仍严格过滤、不强塞)。
       // 影子期只告警(判定还没切过去,不该因此拒启);enforce 期 → 抛。
       if (modelCatalogForProxy) {
         try {
-          assertSeedModelsActive(modelCatalogForProxy.current())
+          assertSeedModelsActive(modelCatalogForProxy.current());
         } catch (err) {
-          if (modelAuthorityEnforce) throw err
-          console.error('[commercial] seed model catalog check failed (shadow):', err)
+          if (modelAuthorityEnforce) throw err;
+          console.error("[commercial] seed model catalog check failed (shadow):", err);
         }
       }
       dispatchInternal = (req, res, ctx) => {
-        const path = (req.url ?? '/').split('?')[0]
+        const path = (req.url ?? "/").split("?")[0];
         if (egressSplitEnabled && path === COST_EVENT_PATH) {
-          return costEventHandler(req, res)
+          return costEventHandler(req, res);
         }
         if (
           modelCatalogHandler &&
           (path === MODEL_CATALOG_PATH || path === MODEL_CATALOG_EPOCH_PATH)
         ) {
-          return modelCatalogHandler(req, res, ctx)
+          return modelCatalogHandler(req, res, ctx);
         }
         if (path === SERVER_AUTHORED_PATH) {
-          return serverAuthoredHandler(req, res, ctx)
+          return serverAuthoredHandler(req, res, ctx);
         }
         if (path === TURN_TAPE_STATE_PATH) {
-          return turnTapeStateHandler(req, res, ctx)
+          return turnTapeStateHandler(req, res, ctx);
         }
         if (path === LITERATURE_SEARCH_PATH) {
-          return literatureProxyHandler(req, res, ctx)
+          return literatureProxyHandler(req, res, ctx);
         }
-        if (path.startsWith(CONNECTORS_RPC_PREFIX) || path.startsWith(PLUGINS_RPC_PREFIX)) {
-          return connectorsRpcHandler(req, res, ctx)
+        if (
+          path.startsWith(CONNECTORS_RPC_PREFIX) ||
+          path.startsWith(PLUGINS_RPC_PREFIX)
+        ) {
+          return connectorsRpcHandler(req, res, ctx);
         }
         if (path.startsWith(RESEARCH_PREFIX)) {
-          return researchProxyHandler(req, res, ctx)
+          return researchProxyHandler(req, res, ctx);
         }
         if (path.startsWith(OCR_PREFIX)) {
-          return ocrProxyHandler(req, res, ctx)
+          return ocrProxyHandler(req, res, ctx);
         }
         if (path === PLATFORM_PROMPT_SLOTS_PATH) {
-          return platformPromptSlotsHandler(req, res, ctx)
+          return platformPromptSlotsHandler(req, res, ctx);
         }
         if (path === PROJECT_CONTEXT_PATH) {
-          return projectContextHandler(req, res, ctx)
+          return projectContextHandler(req, res, ctx);
         }
         if (path === PROJECT_ASSETS_REGISTER_PATH) {
-          return projectAssetsHandler(req, res, ctx)
+          return projectAssetsHandler(req, res, ctx);
         }
         if (path === PROJECT_SEARCH_PATH) {
-          return projectSearchHandler(req, res, ctx)
+          return projectSearchHandler(req, res, ctx);
         }
         if (path === MINIMAX_MEDIA_PATH) {
-          return minimaxMediaHandler(req, res, ctx)
+          return minimaxMediaHandler(req, res, ctx);
         }
         if (
           path === MEDIA_GENERATION_INTERNAL_PREFIX ||
           path.startsWith(`${MEDIA_GENERATION_INTERNAL_PREFIX}/`)
         ) {
-          return mediaGenerationInternalHandler(req, res, ctx)
+          return mediaGenerationInternalHandler(req, res, ctx);
         }
         if (path === MINIMAX_WEB_SEARCH_PATH) {
-          return minimaxWebSearchHandler(req, res, ctx)
+          return minimaxWebSearchHandler(req, res, ctx);
         }
         if (path === GROK_WEB_SEARCH_PATH) {
-          return grokWebSearchHandler(req, res, ctx)
+          return grokWebSearchHandler(req, res, ctx);
         }
         if (path === GROK_VISION_PATH) {
-          return grokVisionHandler(req, res, ctx)
+          return grokVisionHandler(req, res, ctx);
         }
         if (path === CODEX_TOKEN_REFRESH_PATH) {
-          return codexTokenRefreshHandler(req, res, ctx)
+          return codexTokenRefreshHandler(req, res, ctx);
         }
         if (path === CODEX_RELAY_PREFIX || path.startsWith(`${CODEX_RELAY_PREFIX}/`)) {
-          return codexRelayHandler(req, res, ctx)
+          return codexRelayHandler(req, res, ctx);
         }
         if (path === GROK_RELAY_PREFIX || path.startsWith(`${GROK_RELAY_PREFIX}/`)) {
-          return grokRelayHandler(req, res, ctx)
+          return grokRelayHandler(req, res, ctx);
         }
         if (path === ZCODE_RELAY_PREFIX || path.startsWith(`${ZCODE_RELAY_PREFIX}/`)) {
-          return zcodeRelayHandler(req, res, ctx)
+          return zcodeRelayHandler(req, res, ctx);
         }
         if (path === ANTIGRAVITY_RELAY_PREFIX || path.startsWith(`${ANTIGRAVITY_RELAY_PREFIX}/`)) {
-          return antigravityRelayHandler(req, res, ctx)
+          return antigravityRelayHandler(req, res, ctx);
         }
         if (path === SKILL_EMBED_PREFIX) {
-          return skillEmbedHandler(req, res, ctx)
+          return skillEmbedHandler(req, res, ctx);
         }
         if (path === CORE_MEMORY_RANK_PATH) {
-          return coreMemoryRankHandler(req, res, ctx)
+          return coreMemoryRankHandler(req, res, ctx);
         }
         if (path === MARKETPLACE_SYNC_PATH) {
-          return marketplaceSyncHandler(req, res, ctx)
+          return marketplaceSyncHandler(req, res, ctx);
         }
         if (path === TURN_WAIVE_PATH) {
-          return turnWaiveHandler(req, res, ctx)
+          return turnWaiveHandler(req, res, ctx);
         }
         if (path === TURN_LEASE_RENEW_PATH) {
-          return turnLeaseRenewHandler(req, res, ctx)
+          return turnLeaseRenewHandler(req, res, ctx);
         }
         if (delegateGrokRouteHandler && isDelegateGrokRoutePath(path)) {
-          return delegateGrokRouteHandler(req, res, ctx)
+          return delegateGrokRouteHandler(req, res, ctx);
         }
         if (
           promptQueueHandler &&
-          (path === PROMPT_QUEUE_MUTATION_PATH ||
-            path === PROMPT_QUEUE_SNAPSHOT_PATH ||
-            path === PROMPT_QUEUE_DETAIL_PATH ||
-            path === PROMPT_QUEUE_CLAIM_PATH)
+          (path === PROMPT_QUEUE_MUTATION_PATH || path === PROMPT_QUEUE_SNAPSHOT_PATH ||
+            path === PROMPT_QUEUE_DETAIL_PATH || path === PROMPT_QUEUE_CLAIM_PATH)
         ) {
-          return promptQueueHandler(req, res, ctx)
+          return promptQueueHandler(req, res, ctx);
         }
         if (toolFailureAuditHandler && path === TOOL_FAILURE_AUDIT_PATH) {
-          return toolFailureAuditHandler(req, res, ctx)
+          return toolFailureAuditHandler(req, res, ctx);
         }
         if (toolCallRollupHandler && path === TOOL_CALL_ROLLUP_PATH) {
-          return toolCallRollupHandler(req, res, ctx)
+          return toolCallRollupHandler(req, res, ctx);
         }
         if (turnObservationHandler && path === TURN_OBSERVATION_PATH) {
-          return turnObservationHandler(req, res, ctx)
+          return turnObservationHandler(req, res, ctx);
         }
         if (path === MEMORY_USAGE_PATH) {
-          return memoryUsageHandler(req, res, ctx)
+          return memoryUsageHandler(req, res, ctx);
         }
         if (skillUsageHandler && path === SKILL_USAGE_PATH) {
-          return skillUsageHandler(req, res, ctx)
+          return skillUsageHandler(req, res, ctx);
         }
         if (skillShadowHandler && path === SKILL_SHADOW_PATH) {
-          return skillShadowHandler(req, res, ctx)
+          return skillShadowHandler(req, res, ctx);
         }
         if (path === SKILL_FEEDBACK_PATH) {
-          return skillFeedbackHandler(req, res, ctx)
+          return skillFeedbackHandler(req, res, ctx);
         }
         if (path === AUTO_DREAM_POLICY_PATH) {
-          return autoDreamPolicyHandler(req, res, ctx)
+          return autoDreamPolicyHandler(req, res, ctx);
         }
         if (isAutoDreamOptimizerInternalPath(path)) {
-          return autoDreamOptimizerHandler(req, res, ctx, path)
+          return autoDreamOptimizerHandler(req, res, ctx, path);
         }
         if (isDelegateEngineBillingInternalPath(path)) {
-          return delegateEngineBillingHandler(req, res, ctx, path)
+          return delegateEngineBillingHandler(req, res, ctx, path);
         }
         if (path === CRON_INDEX_PATH) {
-          return cronIndexHandler(req, res, ctx)
+          return cronIndexHandler(req, res, ctx);
         }
         if (path === CRON_ORIGIN_INJECT_PATH) {
-          return cronOriginInjectHandler(req, res, ctx)
+          return cronOriginInjectHandler(req, res, ctx);
         }
         if (path === INBOX_POST_PATH) {
-          return inboxPostHandler(req, res, ctx)
+          return inboxPostHandler(req, res, ctx);
         }
         if (path === INBOX_ALERT_PATH) {
-          return inboxAlertHandler(req, res, ctx)
+          return inboxAlertHandler(req, res, ctx);
         }
         if (path.startsWith(MARKETPLACE_AGENT_PREFIX)) {
-          return marketplaceAgentHandler(req, res, ctx)
+          return marketplaceAgentHandler(req, res, ctx);
         }
         if (path === WECHAT_OUTBOUND_PATH) {
           // P1.7 slice 7c — wechat broker outbound 接收点
           // broker 自带 brokerEnabled() 短路 403,无需在此重判 cfg.WECHAT_BROKER_ENABLED;
           // 未装配(ref.current=null)时显式 404,避免 caller container 把缺失误读为 503/超时
           // (回 retry,污染 retryQueue)— 404 在 v3WechatOutbound 端被分类为 fatal,直接 drop。
-          const broker = wechatBrokerRef.current
+          const broker = wechatBrokerRef.current;
           if (!broker) {
-            res.statusCode = 404
-            res.setHeader('Content-Type', 'application/json; charset=utf-8')
-            res.end(
-              JSON.stringify({
-                error: {
-                  code: 'WECHAT_BROKER_NOT_ASSEMBLED',
-                  message: 'wechat broker not assembled',
-                },
-              }),
-            )
-            return Promise.resolve()
+            res.statusCode = 404;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.end(JSON.stringify({
+              error: { code: "WECHAT_BROKER_NOT_ASSEMBLED", message: "wechat broker not assembled" },
+            }));
+            return Promise.resolve();
           }
-          return broker.outboundHandler(req, res, ctx)
+          return broker.outboundHandler(req, res, ctx);
         }
         if (path === WECHAT_PROACTIVE_PATH) {
           // 主动微信投递(cron/提醒)。未装配 → 404(同 wechat-outbound:容器侧分类为 fatal 直接 drop,
           // 不污染 retryQueue)。装配条件与 broker 一致,故复用 broker null 判定即可。
-          const proactive = wechatProactiveRef.current
+          const proactive = wechatProactiveRef.current;
           if (!proactive) {
-            res.statusCode = 404
-            res.setHeader('Content-Type', 'application/json; charset=utf-8')
-            res.end(
-              JSON.stringify({
-                error: {
-                  code: 'WECHAT_BROKER_NOT_ASSEMBLED',
-                  message: 'wechat broker not assembled',
-                },
-              }),
-            )
-            return Promise.resolve()
+            res.statusCode = 404;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.end(JSON.stringify({
+              error: { code: "WECHAT_BROKER_NOT_ASSEMBLED", message: "wechat broker not assembled" },
+            }));
+            return Promise.resolve();
           }
-          return proactive(req, res, ctx)
+          return proactive(req, res, ctx);
         }
         if (path === QQ_OUTBOUND_PATH) {
-          const receiver = qqOutboundRef.current
+          const receiver = qqOutboundRef.current;
           if (!receiver) {
-            res.statusCode = 404
-            res.setHeader('Content-Type', 'application/json; charset=utf-8')
-            res.end(
-              JSON.stringify({
-                error: { code: 'QQ_BOT_NOT_ASSEMBLED', message: 'QQ Bot not assembled' },
-              }),
-            )
-            return Promise.resolve()
+            res.statusCode = 404;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.end(JSON.stringify({
+              error: { code: "QQ_BOT_NOT_ASSEMBLED", message: "QQ Bot not assembled" },
+            }));
+            return Promise.resolve();
           }
-          return receiver(req, res, ctx)
+          return receiver(req, res, ctx);
         }
         if (path === QQ_PROACTIVE_PATH) {
-          const receiver = qqProactiveRef.current
+          const receiver = qqProactiveRef.current;
           if (!receiver) {
-            res.statusCode = 404
-            res.setHeader('Content-Type', 'application/json; charset=utf-8')
-            res.end(
-              JSON.stringify({
-                error: { code: 'QQ_BOT_NOT_ASSEMBLED', message: 'QQ Bot not assembled' },
-              }),
-            )
-            return Promise.resolve()
+            res.statusCode = 404;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.end(JSON.stringify({
+              error: { code: "QQ_BOT_NOT_ASSEMBLED", message: "QQ Bot not assembled" },
+            }));
+            return Promise.resolve();
           }
-          return receiver(req, res, ctx)
+          return receiver(req, res, ctx);
         }
-        return internalProxyHandler!(req, res, ctx)
-      }
+        return internalProxyHandler!(req, res, ctx);
+      };
       // ── P3 控制口只读端点(RFC D3;私有口 + VIP 共用此 handler)────────────────────
       // 这两个是 Agent A/C 之间掉的球,现在补上:deploy lane 的 finalize 四门槛 / candidate 自检 /
       // abort 健康核验都靠它们。在 dispatchInternal(anthropic proxy 路由,不认这些路径)之前拦截。
       const currentLeadership = (): LeadershipStatus =>
         leaderLease
           ? leaderLease.status()
-          : { state: 'ineligible', slot: ocSlot, generation: null, leasePid: null }
+          : { state: "ineligible", slot: ocSlot, generation: null, leasePid: null };
       // 私有口 healthz:leadership + vip(owner|released)+ slot —— deploy 脚本据此判断 standby/leader/VIP 归属。
       const respondControlHealthz = (res: ServerResponse): void => {
-        const vip = controlListener?.status().vipBound ? 'owner' : 'released'
+        const vip = controlListener?.status().vipBound ? "owner" : "released";
         const body = {
           ok: true, // 本控制口在响应即证明进程存活;深度依赖探活走 /internal/v5/control-probe。
           channel: runtimeChannel,
           slot: ocSlot,
           leadership: currentLeadership(),
           vip,
-        }
-        res.statusCode = 200
-        res.setHeader('Content-Type', 'application/json; charset=utf-8')
-        res.end(JSON.stringify(body))
-      }
+        };
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        res.end(JSON.stringify(body));
+      };
       // control-probe:egress secret 校验后自检 dispatcher 路由表 + PG SELECT 1 + "本实例持有 VIP"。
-      const respondControlProbe = async (
-        req: IncomingMessage,
-        res: ServerResponse,
-      ): Promise<void> => {
+      const respondControlProbe = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
         const reply = (code: number, obj: Record<string, unknown>): void => {
-          res.statusCode = code
-          res.setHeader('Content-Type', 'application/json; charset=utf-8')
-          res.end(JSON.stringify(obj))
-        }
-        const secret = cfg.OC_EGRESS_SECRET
-        if (!secret) return reply(503, { ok: false, error: 'EGRESS_SECRET_UNSET' })
-        const presented = req.headers['x-oc-egress-secret']
+          res.statusCode = code;
+          res.setHeader("Content-Type", "application/json; charset=utf-8");
+          res.end(JSON.stringify(obj));
+        };
+        const secret = cfg.OC_EGRESS_SECRET;
+        if (!secret) return reply(503, { ok: false, error: "EGRESS_SECRET_UNSET" });
+        const presented = req.headers["x-oc-egress-secret"];
         const okSecret =
-          typeof presented === 'string' &&
+          typeof presented === "string" &&
           (() => {
-            const pBuf = Buffer.from(presented)
-            const eBuf = Buffer.from(secret)
-            return pBuf.length === eBuf.length && pBuf.length > 0 && timingSafeEqual(pBuf, eBuf)
-          })()
-        if (!okSecret) return reply(401, { ok: false, error: 'UNAUTHORIZED' })
+            const pBuf = Buffer.from(presented);
+            const eBuf = Buffer.from(secret);
+            return pBuf.length === eBuf.length && pBuf.length > 0 && timingSafeEqual(pBuf, eBuf);
+          })();
+        if (!okSecret) return reply(401, { ok: false, error: "UNAUTHORIZED" });
         // ① dispatcher 路由表已装配 ② PG 连通 ③ 本实例持有 VIP
-        const routeTable =
-          typeof dispatchInternal === 'function' && typeof internalProxyHandler === 'function'
-        let pgOk = false
+        const routeTable = typeof dispatchInternal === "function" && typeof internalProxyHandler === "function";
+        let pgOk = false;
         try {
-          await getPool().query('SELECT 1')
-          pgOk = true
+          await getPool().query("SELECT 1");
+          pgOk = true;
         } catch {
-          pgOk = false
+          pgOk = false;
         }
-        const vipOwner = controlListener?.status().vipBound === true
+        const vipOwner = controlListener?.status().vipBound === true;
         return reply(200, {
           ok: routeTable && pgOk && vipOwner,
           routeTable,
-          pg: pgOk ? 'ok' : 'error',
+          pg: pgOk ? "ok" : "error",
           vipOwner,
           slot: ocSlot,
           leadership: currentLeadership(),
-        })
-      }
+        });
+      };
       const leaseCallbackHandler = makeLeaseCallbackHandler({
         secret: cfg.OC_LEASE_CALLBACK_SECRET,
         lookupSession: (uid, sid) => lookupLeaseCallbackSession(getPool(), uid, sid),
-        inject: (input) =>
-          cronOriginBridgeRef
-            ? cronOriginBridgeRef.injectCronOriginTurn(input)
-            : Promise.resolve({ kind: 'no_transport' as const }),
-      })
+        inject: (input) => cronOriginBridgeRef
+          ? cronOriginBridgeRef.injectCronOriginTurn(input)
+          : Promise.resolve({ kind: "no_transport" as const }),
+      });
       // 请求 dispatcher 闭包(VIP+私有双 listener 与单 listener 共用)。
       const internalRequestHandler = (req: IncomingMessage, res: ServerResponse): void => {
         // P3 控制端点前置拦截(GET /healthz、GET /internal/v5/control-probe)。
-        const urlPath = (req.url ?? '').split('?')[0]
+        const urlPath = (req.url ?? "").split("?")[0];
         if (urlPath === LEASE_CALLBACK_PATH || urlPath === LEASE_CALLBACK_VALIDATE_PATH) {
-          void leaseCallbackHandler(req, res, urlPath === LEASE_CALLBACK_VALIDATE_PATH).catch(
-            () => {
-              if (!res.headersSent) res.statusCode = 503
-              res.end()
-            },
-          )
-          return
+          void leaseCallbackHandler(req, res, urlPath === LEASE_CALLBACK_VALIDATE_PATH).catch(() => {
+            if (!res.headersSent) res.statusCode = 503;
+            res.end();
+          });
+          return;
         }
-        if (req.method === 'GET' && urlPath === '/healthz') {
-          try {
-            respondControlHealthz(res)
-          } catch {
-            /* socket gone */
-          }
-          return
+        if (req.method === "GET" && urlPath === "/healthz") {
+          try { respondControlHealthz(res); } catch { /* socket gone */ }
+          return;
         }
-        if (req.method === 'GET' && urlPath === '/internal/v5/control-probe') {
+        if (req.method === "GET" && urlPath === "/internal/v5/control-probe") {
           void respondControlProbe(req, res).catch((err) => {
             // eslint-disable-next-line no-console
-            console.error('[commercial] control-probe handler threw:', err)
+            console.error("[commercial] control-probe handler threw:", err);
             if (!res.headersSent) {
               try {
-                res.statusCode = 500
-                res.setHeader('Content-Type', 'application/json')
-                res.end(JSON.stringify({ ok: false, error: 'PROBE_INTERNAL' }))
-              } catch {
-                /* socket gone */
-              }
+                res.statusCode = 500;
+                res.setHeader("Content-Type", "application/json");
+                res.end(JSON.stringify({ ok: false, error: "PROBE_INTERNAL" }));
+              } catch { /* socket gone */ }
             }
-          })
-          return
+          });
+          return;
         }
         // 双槽定向通知 relay 只允许走本 slot 私有控制口；VIP/普通 proxy 端口不暴露该面。
         if (
           dualMasterEnabled &&
           req.socket.localPort === privatePortForSlot(ocSlot) &&
           handleSlotRelayRequest(req, res, {
-            secret: cfg.OC_EGRESS_SECRET ?? '',
+            secret: cfg.OC_EGRESS_SECRET ?? "",
             local: {
               onlineUserSubset: (uids) => slotRelayLocalRef.current.onlineUserSubset(uids),
-              broadcastToUsers: (uids, payload) =>
-                slotRelayLocalRef.current.broadcastToUsers(uids, payload),
+              broadcastToUsers: (uids, payload) => slotRelayLocalRef.current.broadcastToUsers(uids, payload),
             },
-            logger: rootLogger.child({ subsys: 'commercial', module: 'slotRelayServer' }),
+            logger: rootLogger.child({ subsys: "commercial", module: "slotRelayServer" }),
           })
-        )
-          return
+        ) return;
         // self-host 路径:container → plain HTTP 18791 → 这里。peerIp 就是 container 的 bound_ip,
         // hostUuid 固定 = selfHostUuid(本机容器不需要也不可能带 mTLS cert)。
         // split 模式下容器流量经 egress 转发到达,socket peer 恒为 loopback;
         // 真实容器 ip 由 egress 注入 x-v5-egress-peer-ip(它同时会剥掉入站同名头,容器伪造不进来)。
-        const fwdPeer = egressSplitEnabled ? req.headers['x-v5-egress-peer-ip'] : undefined
+        const fwdPeer = egressSplitEnabled ? req.headers["x-v5-egress-peer-ip"] : undefined;
         const peerIp =
-          (typeof fwdPeer === 'string' && fwdPeer.trim()) || req.socket.remoteAddress || ''
+          (typeof fwdPeer === "string" && fwdPeer.trim()) || req.socket.remoteAddress || "";
         Promise.resolve(
           dispatchInternal!(req, res, { hostUuid: selfHostUuid!, boundIp: peerIp }),
         ).catch((err) => {
           // eslint-disable-next-line no-console
-          console.error('[commercial] internal listener handler threw:', err)
+          console.error("[commercial] internal listener handler threw:", err);
           if (!res.headersSent) {
             try {
-              res.statusCode = 500
-              res.setHeader('Content-Type', 'application/json')
-              res.end(
-                JSON.stringify({ error: { code: 'INTERNAL', message: 'internal listener error' } }),
-              )
-            } catch {
-              /* socket gone */
-            }
+              res.statusCode = 500;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ error: { code: "INTERNAL", message: "internal listener error" } }));
+            } catch { /* socket gone */ }
           } else {
-            try {
-              res.end()
-            } catch {
-              /* */
-            }
+            try { res.end(); } catch { /* */ }
           }
-        })
-      }
+        });
+      };
       if (dualMasterEnabled && egressSplitEnabled && deployDesiredWatch) {
         // ── P3 双 master 控制口:VIP + 私有双 listener(RFC D3)────────────────────
         // VIP=proxyBind:proxyPort(egress 唯一目标,零改动),仅 desired_control_slot==本 slot bind;
@@ -3330,69 +3246,57 @@ export async function registerCommercial(
           handler: internalRequestHandler,
           vip: { host: proxyBind, port: proxyPort },
           logger: {
-            info: (m, meta) => rootLogger.info(m, { subsys: 'controlListener', meta }),
-            warn: (m, meta) => rootLogger.warn(m, { subsys: 'controlListener', meta }),
-            error: (m, meta) => rootLogger.error(m, { subsys: 'controlListener', meta }),
+            info: (m, meta) => rootLogger.info(m, { subsys: "controlListener", meta }),
+            warn: (m, meta) => rootLogger.warn(m, { subsys: "controlListener", meta }),
+            error: (m, meta) => rootLogger.error(m, { subsys: "controlListener", meta }),
           },
-        })
+        });
         // 首绑前 prime desired 缓存:确保 controlListener 的 firstAttempt VIP 判定看到真实
         // desired_control_slot(而非 watch 尚未首轮轮询的 null)。首读失败(PG 抖)不阻塞——
         // current() 保持 null → VIP 首绑跳过,由 watch onChange 后补 bind。
-        try {
-          await deployDesiredWatch.refreshNow()
-        } catch {
-          /* 首读失败,后补 */
-        }
-        await controlListener.start()
-        internalProxyAddress = { host: proxyBind, port: proxyPort }
+        try { await deployDesiredWatch.refreshNow(); } catch { /* 首读失败,后补 */ }
+        await controlListener.start();
+        internalProxyAddress = { host: proxyBind, port: proxyPort };
         // eslint-disable-next-line no-console
-        console.log(
-          `[commercial] P3 控制口 VIP+私有双 listener 就绪 (slot=${ocSlot}, vip=${proxyBind}:${proxyPort})`,
-        )
+        console.log(`[commercial] P3 控制口 VIP+私有双 listener 就绪 (slot=${ocSlot}, vip=${proxyBind}:${proxyPort})`);
       } else {
-        internalProxyServer = createHttpServer(internalRequestHandler)
+        internalProxyServer = createHttpServer(internalRequestHandler);
         // 同步监听 + 转 promise:监听失败立即 throw,主流程 catch 后降级
         await new Promise<void>((resolve, reject) => {
-          internalProxyServer!.once('error', reject)
+          internalProxyServer!.once("error", reject);
           internalProxyServer!.listen(proxyPort, proxyBind, () => {
-            internalProxyServer!.removeListener('error', reject)
-            resolve()
-          })
-        })
-        internalProxyAddress = { host: proxyBind, port: proxyPort }
+            internalProxyServer!.removeListener("error", reject);
+            resolve();
+          });
+        });
+        internalProxyAddress = { host: proxyBind, port: proxyPort };
         // eslint-disable-next-line no-console
-        console.log(`[commercial] internal anthropic proxy listening on ${proxyBind}:${proxyPort}`)
+        console.log(
+          `[commercial] internal anthropic proxy listening on ${proxyBind}:${proxyPort}`,
+        );
       }
     } catch (err) {
       // P3:控制口(VIP+私有)bind 失败 = 部署故障,fail-loud 拒起(私有口是本 slot 自检基础设施,
       // egress 靠 VIP 送 cost 事件——静默 disable 会让 v5 master 带病运行)。单 listener 路径保持
       // 旧"降级 disable"语义(容器直连非 split,失败退化为无内部代理,/healthz 反映)。
       if (dualMasterEnabled && egressSplitEnabled) {
-        try {
-          await controlListener?.close()
-        } catch {
-          /* */
-        }
-        controlListener = undefined
-        throw err
+        try { await controlListener?.close(); } catch { /* */ }
+        controlListener = undefined;
+        throw err;
       }
       // eslint-disable-next-line no-console
-      console.error('[commercial] internal proxy listener failed; disabling:', err)
-      try {
-        internalProxyServer?.close()
-      } catch {
-        /* */
-      }
-      internalProxyServer = undefined
-      internalProxyHandler = undefined
-      internalProxyAddress = undefined
-      dispatchInternal = undefined
+      console.error("[commercial] internal proxy listener failed; disabling:", err);
+      try { internalProxyServer?.close(); } catch { /* */ }
+      internalProxyServer = undefined;
+      internalProxyHandler = undefined;
+      internalProxyAddress = undefined;
+      dispatchInternal = undefined;
     }
   } else if (!options.skipInternalProxy) {
     // eslint-disable-next-line no-console
     console.log(
-      '[commercial] internal anthropic proxy disabled; missing INTERNAL_PROXY_BIND / INTERNAL_PROXY_PORT',
-    )
+      "[commercial] internal anthropic proxy disabled; missing INTERNAL_PROXY_BIND / INTERNAL_PROXY_PORT",
+    );
   }
 
   // V3 CC 外接 plan Phase 3(2026-05-18)— public-facing
@@ -3411,85 +3315,83 @@ export async function registerCommercial(
   // 装配失败语义(Codex Phase 3 plan-review MINOR 1):catch + undefined,router
   // 见 undefined 走 503 EXTERNAL_PROXY_UNAVAILABLE 而非 404(部署故障不该伪装成
   // "用户 URL 写错")。
-  let externalApiKeyProxy: AnthropicProxyHandler | undefined
+  let externalApiKeyProxy: AnthropicProxyHandler | undefined;
   // 2026-09-07:`GET /api/anthropic/v1/models` 外接模型发现,与 proxy 同批装配。
-  let externalApiKeyModels: ExternalModelsHandler | undefined
+  let externalApiKeyModels: ExternalModelsHandler | undefined;
   // 2026-09-08:`GET /api/anthropic/v1/usage` 外接余额 / 单 key 消耗,同批装配。
-  let externalApiKeyUsage: ExternalUsageHandler | undefined
+  let externalApiKeyUsage: ExternalUsageHandler | undefined;
   // cursor-* 模型在 external API-key 路径上的服务端 Sand relay(本地 Claude Code 接入
   // Cursor 系模型)。仅 external 实例注入;容器 internal proxy 不注 —— 容器内 cursor 走
   // 容器自己的 relay。shutdown 时 close() 归零凭据副本。
-  let cursorExternalRoute: CursorExternalRoute | undefined
-  let cursorExternalOutbox: CursorExternalApiOutbox | undefined
+  let cursorExternalRoute: CursorExternalRoute | undefined;
+  let cursorExternalOutbox: CursorExternalApiOutbox | undefined;
   if (!options.skipInternalProxy) {
     try {
-      const apiKeyRepo = makePgApiKeyRepo(getPool())
+      const apiKeyRepo = makePgApiKeyRepo(getPool());
       const apiKeyIdentityDeps = {
         repo: apiKeyRepo,
         pricing,
         loadUserModelAuthz,
-        logger: rootLogger.child({ subsys: 'apiKeyIdentity' }),
-      }
-      const apiKeyStrategy = makeApiKeyIdentityStrategy(apiKeyIdentityDeps)
+        logger: rootLogger.child({ subsys: "apiKeyIdentity" }),
+      };
+      const apiKeyStrategy = makeApiKeyIdentityStrategy(apiKeyIdentityDeps);
       // 模型发现与 messages 共用同一条 key 判定链(格式/撤销/禁用/admin gate),
       // 只是不做 UA 门控(桌面工具用自己的 HTTP 客户端拉列表)。
       externalApiKeyModels = makeExternalModelsHandler({
-        resolveIdentity: (req) =>
-          resolveApiKeyIdentity(apiKeyIdentityDeps, req, { enforceUserAgent: false }),
+        resolveIdentity: (req) => resolveApiKeyIdentity(apiKeyIdentityDeps, req, { enforceUserAgent: false }),
         pricing,
         loadUserModelAuthz,
-        ownedBy: 'clarvy',
-        logger: rootLogger.child({ subsys: 'externalModels' }),
-      })
+        ownedBy: "clarvy",
+        logger: rootLogger.child({ subsys: "externalModels" }),
+      });
       // 用量端点与 models 同一条 key 判定链 + 同样不做 UA 门控(CC Switch 用量脚本是
       // reqwest 客户端)。只读、不打上游、不动积分、不 bump last_used_at。
       externalApiKeyUsage = makeExternalUsageHandler({
-        resolveIdentity: (req) =>
-          resolveApiKeyIdentity(apiKeyIdentityDeps, req, { enforceUserAgent: false }),
+        resolveIdentity: (req) => resolveApiKeyIdentity(apiKeyIdentityDeps, req, { enforceUserAgent: false }),
         repo: apiKeyRepo,
-        logger: rootLogger.child({ subsys: 'externalUsage' }),
-      })
+        logger: rootLogger.child({ subsys: "externalUsage" }),
+      });
       // Phase 5 platform envelope rewriter wiring(2026-05-21)。
       // secret 缺失 → throw → 外层 catch 将 externalApiKeyProxy 置 undefined,
       // 同 hupi/deepseek 已有的"缺配置 → 端点 503"模式一致(non-fatal,主进程继续)。
       // Loader 持有 PlatformContextReader 单例,master 进程生命期与之绑定,无须 close。
       if (!cfg.PLATFORM_HMAC_SECRET) {
         throw new Error(
-          'PLATFORM_HMAC_SECRET required for external ApiKey proxy (Phase 5 envelope)',
-        )
+          "PLATFORM_HMAC_SECRET required for external ApiKey proxy (Phase 5 envelope)",
+        );
       }
       const platformContextLoader = makePlatformContextLoader({
         reader: makeDefaultVolumeContextReader(),
-      })
+      });
       if (cursorExternalOutboxDir) {
         try {
           cursorExternalOutbox = await openCursorExternalApiOutbox({
             directory: cursorExternalOutboxDir,
-            logger: rootLogger.child({ subsys: 'cursorExternalOutbox' }),
-          })
+            logger: rootLogger.child({ subsys: "cursorExternalOutbox" }),
+          });
           cursorExternalRoute = makeCursorExternalRoute({
             pgPool: getPool(),
             pricing,
-            logger: rootLogger.child({ subsys: 'cursorExternal' }),
+            logger: rootLogger.child({ subsys: "cursorExternal" }),
             outbox: cursorExternalOutbox,
-          })
+          });
         } catch (err) {
           // Directory failure closes only the Cursor engine channel.
           // eslint-disable-next-line no-console
           console.error(
-            '[commercial] cursor external API outbox failed; cursor engine models unavailable on api-key proxy:',
+            "[commercial] cursor external API outbox failed; cursor engine models unavailable on api-key proxy:",
             err,
-          )
-          cursorExternalOutbox = undefined
-          const staleCursor = cursorExternalRoute
-          cursorExternalRoute = undefined
-          void staleCursor?.close().catch(() => undefined)
+          );
+          cursorExternalOutbox = undefined;
+          const staleCursor = cursorExternalRoute;
+          cursorExternalRoute = undefined;
+          void staleCursor?.close().catch(() => undefined);
         }
       } else {
         // eslint-disable-next-line no-console
         console.log(
-          '[commercial] cursor external API outbox not configured; cursor engine models unavailable on api-key proxy',
-        )
+          "[commercial] cursor external API outbox not configured; cursor engine models unavailable on api-key proxy",
+        );
       }
       externalApiKeyProxy = makeAnthropicProxyHandler({
         pgPool: getPool(),
@@ -3518,23 +3420,23 @@ export async function registerCommercial(
         getPhase6AccountUuidEnforce,
         getSessionPinMode,
         listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
-      })
+      });
       // eslint-disable-next-line no-console
       console.log(
-        '[commercial] external api-key anthropic proxy assembled (POST /api/anthropic/v1/messages + GET /v1/models + GET /v1/usage, engine models via relay)',
-      )
+        "[commercial] external api-key anthropic proxy assembled (POST /api/anthropic/v1/messages + GET /v1/models + GET /v1/usage, engine models via relay)",
+      );
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error(
-        '[commercial] external api-key proxy failed to assemble; endpoint will return 503:',
+        "[commercial] external api-key proxy failed to assemble; endpoint will return 503:",
         err,
-      )
-      externalApiKeyProxy = undefined
-      externalApiKeyModels = undefined
-      externalApiKeyUsage = undefined
-      const stale = cursorExternalRoute
-      cursorExternalRoute = undefined
-      void stale?.close().catch(() => undefined)
+      );
+      externalApiKeyProxy = undefined;
+      externalApiKeyModels = undefined;
+      externalApiKeyUsage = undefined;
+      const stale = cursorExternalRoute;
+      cursorExternalRoute = undefined;
+      void stale?.close().catch(() => undefined);
     }
   }
 
@@ -3552,17 +3454,17 @@ export async function registerCommercial(
     cfg.EXTERNAL_MTLS_BIND &&
     cfg.EXTERNAL_MTLS_PORT !== undefined
   ) {
-    const mtlsBind = cfg.EXTERNAL_MTLS_BIND
-    const mtlsPort = cfg.EXTERNAL_MTLS_PORT
+    const mtlsBind = cfg.EXTERNAL_MTLS_BIND;
+    const mtlsPort = cfg.EXTERNAL_MTLS_PORT;
     try {
-      const caMat = await ensureCa()
-      const masterLeaf = await ensureMasterLeaf()
-      const caPem = await fs.promises.readFile(caMat.caCertPath, 'utf8')
-      const masterKey = await fs.promises.readFile(masterLeaf.keyPath, 'utf8')
+      const caMat = await ensureCa();
+      const masterLeaf = await ensureMasterLeaf();
+      const caPem = await fs.promises.readFile(caMat.caCertPath, "utf8");
+      const masterKey = await fs.promises.readFile(masterLeaf.keyPath, "utf8");
       // 2026-05-05: 用 dispatchInternal 而不是 internalProxyHandler,这样
       // remote-host 容器也能命中 /internal/v3/server-authored-message 路径,
       // 与 self-host 路径行为一致(同一 dispatcher 共享 path 分流逻辑)。
-      const capturedHandler = dispatchInternal
+      const capturedHandler = dispatchInternal;
       externalMtlsServer = createHttpsServer(
         {
           key: masterKey,
@@ -3572,81 +3474,75 @@ export async function registerCommercial(
           rejectUnauthorized: true,
           // master + node-agent 都我们自己控(Node 18+ / Go 1.22 均原生 TLS 1.3),
           // 没有历史客户端兼容性包袱,直接 hard-require 1.3。
-          minVersion: 'TLSv1.3',
+          minVersion: "TLSv1.3",
         },
         (req, res) => {
           Promise.resolve(handleExternalMtls(req, res, capturedHandler)).catch((err) => {
             // eslint-disable-next-line no-console
-            console.error('[commercial] external mTLS handler threw:', err)
+            console.error("[commercial] external mTLS handler threw:", err);
             if (!res.headersSent) {
               try {
-                res.statusCode = 500
-                res.setHeader('Content-Type', 'application/json')
-                res.end(JSON.stringify({ error: { code: 'INTERNAL', message: 'mtls error' } }))
-              } catch {
-                /* socket gone */
-              }
+                res.statusCode = 500;
+                res.setHeader("Content-Type", "application/json");
+                res.end(JSON.stringify({ error: { code: "INTERNAL", message: "mtls error" } }));
+              } catch { /* socket gone */ }
             } else {
-              try {
-                res.end()
-              } catch {
-                /* */
-              }
+              try { res.end(); } catch { /* */ }
             }
-          })
+          });
         },
-      )
+      );
       await new Promise<void>((resolve, reject) => {
-        externalMtlsServer!.once('error', reject)
+        externalMtlsServer!.once("error", reject);
         externalMtlsServer!.listen(mtlsPort, mtlsBind, () => {
-          externalMtlsServer!.removeListener('error', reject)
-          resolve()
-        })
-      })
-      externalMtlsAddress = { host: mtlsBind, port: mtlsPort }
+          externalMtlsServer!.removeListener("error", reject);
+          resolve();
+        });
+      });
+      externalMtlsAddress = { host: mtlsBind, port: mtlsPort };
       // eslint-disable-next-line no-console
-      console.log(`[commercial] external mTLS listening on ${mtlsBind}:${mtlsPort}`)
+      console.log(
+        `[commercial] external mTLS listening on ${mtlsBind}:${mtlsPort}`,
+      );
     } catch (err) {
       // eslint-disable-next-line no-console
-      console.error('[commercial] external mTLS listener failed; disabling:', err)
-      try {
-        externalMtlsServer?.close()
-      } catch {
-        /* */
-      }
-      externalMtlsServer = undefined
-      externalMtlsAddress = undefined
+      console.error("[commercial] external mTLS listener failed; disabling:", err);
+      try { externalMtlsServer?.close(); } catch { /* */ }
+      externalMtlsServer = undefined;
+      externalMtlsAddress = undefined;
     }
   } else if (internalProxyHandler && !cfg.EXTERNAL_MTLS_ENABLED) {
     // eslint-disable-next-line no-console
-    console.log('[commercial] external mTLS listener disabled (EXTERNAL_MTLS_ENABLED != 1)')
+    console.log("[commercial] external mTLS listener disabled (EXTERNAL_MTLS_ENABLED != 1)");
   }
 
   // T-12+ 真实 mailer:env 配 RESEND_API_KEY 后切到 Resend,否则保留 stub(dev/测试)。
-  const resendKey = process.env.RESEND_API_KEY?.trim()
-  const mailFrom = process.env.MAIL_FROM?.trim() || 'auth@claudeai.chat'
-  const mailer = resendKey ? createResendMailer({ apiKey: resendKey, from: mailFrom }) : stubMailer
+  const resendKey = process.env.RESEND_API_KEY?.trim();
+  const mailFrom = process.env.MAIL_FROM?.trim() || "auth@claudeai.chat";
+  const mailer = resendKey
+    ? createResendMailer({ apiKey: resendKey, from: mailFrom })
+    : stubMailer;
   if (resendKey) {
-    console.log(`[commercial] mailer = resend (from=${mailFrom})`)
+    console.log(`[commercial] mailer = resend (from=${mailFrom})`);
   } else {
-    console.log('[commercial] mailer = stub (RESEND_API_KEY 未设置, 验证邮件只打日志)')
+    console.log("[commercial] mailer = stub (RESEND_API_KEY 未设置, 验证邮件只打日志)");
   }
 
   // v3 file proxy:HOST bridge root secret。加载/生成 `/var/lib/openclaude/.v3-bridge-secret`。
   // 任何失败(权限 / 磁盘 / 路径)→ fail-closed 只警告,让 supervisor 不注入 env,file
   // proxy 整体降级为 CONTAINER_OUTDATED 503,不会阻止 gateway 启动。
-  let bridgeSecret: string | undefined
+  let bridgeSecret: string | undefined;
   try {
-    bridgeSecret = loadOrCreateBridgeSecret()
+    bridgeSecret = loadOrCreateBridgeSecret();
     // eslint-disable-next-line no-console
-    console.log('[commercial] v3 bridge secret loaded', { path: DEFAULT_BRIDGE_SECRET_PATH })
+    console.log("[commercial] v3 bridge secret loaded", { path: DEFAULT_BRIDGE_SECRET_PATH });
   } catch (err) {
     // eslint-disable-next-line no-console
-    console.error('[commercial] v3 bridge secret load/create failed; file proxy will be DISABLED', {
-      path: DEFAULT_BRIDGE_SECRET_PATH,
-      error: (err as Error)?.message ?? String(err),
-    })
-    bridgeSecret = undefined
+    console.error(
+      "[commercial] v3 bridge secret load/create failed; file proxy will be DISABLED",
+      { path: DEFAULT_BRIDGE_SECRET_PATH, error: (err as Error)?.message ?? String(err) },
+    );
+    bridgeSecret = undefined;
   }
 
   // v3 signed-URL media key —— HKDF(bridgeSecret, info="oc-media-sign-v1") 派生
@@ -3657,51 +3553,51 @@ export async function registerCommercial(
   // 不会偷偷退回 `<img src="/api/file?path=...">` —— 那条路径正是 iOS Safari 丢
   // cookie 的根因,绕回去等于把 bug 重新放出来。bridgeSecret 缺失通常意味整个
   // file proxy 都没装配(单租户 personal 版),本来也用不到 commercial 媒体渲染。
-  let mediaSignKey: Buffer | undefined
-  let wechatLiveLinkKey: Buffer | undefined
+  let mediaSignKey: Buffer | undefined;
+  let wechatLiveLinkKey: Buffer | undefined;
   if (bridgeSecret) {
     try {
-      mediaSignKey = deriveMediaSignKey(bridgeSecret)
+      mediaSignKey = deriveMediaSignKey(bridgeSecret);
       // eslint-disable-next-line no-console
-      console.log('[commercial] v3 media signing key derived')
+      console.log("[commercial] v3 media signing key derived");
     } catch (err) {
       // eslint-disable-next-line no-console
-      console.error('[commercial] media sign key derivation failed; signed URL DISABLED', {
+      console.error("[commercial] media sign key derivation failed; signed URL DISABLED", {
         error: (err as Error)?.message ?? String(err),
-      })
-      mediaSignKey = undefined
+      });
+      mediaSignKey = undefined;
     }
     try {
-      wechatLiveLinkKey = deriveWechatLiveLinkKey(bridgeSecret)
+      wechatLiveLinkKey = deriveWechatLiveLinkKey(bridgeSecret);
       // eslint-disable-next-line no-console
-      console.log('[commercial] v3 wechat live link key derived')
+      console.log("[commercial] v3 wechat live link key derived");
     } catch (err) {
       // eslint-disable-next-line no-console
-      console.error('[commercial] wechat live key derivation failed; live links DISABLED', {
+      console.error("[commercial] wechat live key derivation failed; live links DISABLED", {
         error: (err as Error)?.message ?? String(err),
-      })
-      wechatLiveLinkKey = undefined
+      });
+      wechatLiveLinkKey = undefined;
     }
   }
 
   // 服务端缩略图磁盘缓存 —— 与 mediaSignKey 同生命周期(依赖 signed media 管线)。
   // 落 OPENCLAUDE_HOME/media-thumb-cache/,启动清零(init)。缺 mediaSignKey → 不装配,
   // `?w=` 被 handler 忽略回原图(优雅降级)。
-  let thumbnailCache: ThumbnailDiskCache | undefined
+  let thumbnailCache: ThumbnailDiskCache | undefined;
   if (mediaSignKey) {
     try {
-      const home = process.env.OPENCLAUDE_HOME ?? path.join(homedir(), '.openclaude')
-      const cache = new ThumbnailDiskCache(path.join(home, 'media-thumb-cache'))
-      await cache.init()
-      thumbnailCache = cache
+      const home = process.env.OPENCLAUDE_HOME ?? path.join(homedir(), ".openclaude");
+      const cache = new ThumbnailDiskCache(path.join(home, "media-thumb-cache"));
+      await cache.init();
+      thumbnailCache = cache;
       // eslint-disable-next-line no-console
-      console.log('[commercial] media thumbnail cache ready (startup-cleared)')
+      console.log("[commercial] media thumbnail cache ready (startup-cleared)");
     } catch (err) {
       // eslint-disable-next-line no-console
-      console.error('[commercial] thumbnail cache init failed; thumbnails DISABLED', {
+      console.error("[commercial] thumbnail cache init failed; thumbnails DISABLED", {
         error: (err as Error)?.message ?? String(err),
-      })
-      thumbnailCache = undefined
+      });
+      thumbnailCache = undefined;
     }
   }
 
@@ -3721,37 +3617,37 @@ export async function registerCommercial(
   // 静默不可用,还不如启动就响亮失败)。
   //
   // 关 flag → 全部旧行为(容器不 attest 也不会被拒;帧不带 envelope;判定回 baked)。
-  const modelAuthorityFlag = process.env.OC_MODEL_AUTHORITY === '1'
+  const modelAuthorityFlag = process.env.OC_MODEL_AUTHORITY === "1";
   // 缺省为 true，保持既有原子开关语义。只允许 deploy-v5.sh 的回滚闭环短暂写 0：
   // master 继续签发/验 attest，同时停止制造新的 OC_MODEL_AUTHORITY=1 容器，等旧容器
   // 经 authenticated drain 全量退出后才真正关总 flag，消除回滚 census 的尾巴竞态。
   const modelAuthorityProvisionRequired =
-    modelAuthorityFlag && process.env.OC_MODEL_AUTHORITY_PROVISION_REQUIRED !== '0'
+    modelAuthorityFlag && process.env.OC_MODEL_AUTHORITY_PROVISION_REQUIRED !== "0";
   if (modelAuthorityFlag) {
     // catalog HTTP mutation 必须走独立低权 admin role；缺失/串用 app role 时拒绝启动。
-    await assertModelCatalogAdminPoolConfigured()
-    modelAuthoritySigner = AuthoritySigner.loadOrCreate()
+    await assertModelCatalogAdminPoolConfigured();
+    modelAuthoritySigner = AuthoritySigner.loadOrCreate();
     // 与 proxy/internal catalog 共用进程级单例，禁止 bridge 另起一份快照。
-    modelCatalogCache = await getModelCatalogCache()
+    modelCatalogCache = await getModelCatalogCache();
     // eslint-disable-next-line no-console
-    console.log('[commercial] model authority ENABLED', {
+    console.log("[commercial] model authority ENABLED", {
       activeKeyId: modelAuthoritySigner.activeKeyId,
       keyIds: modelAuthoritySigner.keyIds.length,
       securityEpoch: modelCatalogCache.current().securityEpoch.toString(),
       executionRevision: modelCatalogCache.current().executionRevision.slice(0, 12),
-    })
+    });
   }
 
   // V3 Phase 3 supervisor 装配 —— 必须在 createCommercialHandler 之前构造,
   // 因为 admin/containers HIGH#6 路径要在 deps.v3Supervisor 上 dispatch v3 行。
   // 见下方 idleSweep / volumeGc / orphanReconcile / makeV3EnsureRunning 都复用 v3Deps。
-  let v3Deps: V3SupervisorDeps | undefined
+  let v3Deps: V3SupervisorDeps | undefined;
   if (cfg.OC_RUNTIME_IMAGE) {
     // 复用 agentRuntime 路径的 docker socket / 默认逻辑,避免 v2/v3 端再各开一个 docker client
     // (一个进程开多个 dockerode 也无副作用,但同一 socket 没必要)
     const v3Docker = cfg.AGENT_DOCKER_SOCKET
       ? new Docker({ socketPath: cfg.AGENT_DOCKER_SOCKET })
-      : new Docker()
+      : new Docker();
 
     // ── V5 runtime tuple 启动期解析(plan §1.5 prepare/startup 一次性全量校验)──
     // OC_PLATFORM_BUNDLE / OC_RUNTIME_RELEASE 配了就在此**一次性**跑昂贵的 resolvePlatformBundleMount
@@ -3759,17 +3655,17 @@ export async function registerCommercial(
     // provision 每次只做便宜的 assertCurrentMatches。解析失败**不阻断 gateway 启动**(与 baseline
     // 自检同范式)——只 console.error 留态;下一次 provision 由 supervisor 依 v5 fail-closed / OPTIONAL
     // 决定拒/降级(bundlePath 传下去但 bundleRev 空 → provision 侧判 "解析失败" 拒)。
-    let runtimeTuple: V3RuntimeTuple | undefined
+    let runtimeTuple: V3RuntimeTuple | undefined;
     if (cfg.OC_RUNTIME_IMAGE_ID || cfg.OC_PLATFORM_BUNDLE || cfg.OC_RUNTIME_RELEASE) {
-      const platformRoot = cfg.OC_PLATFORM_ROOT ?? DEFAULT_PLATFORM_ROOT
-      const releasesRoot = cfg.OC_RUNTIME_RELEASES_ROOT ?? DEFAULT_RUNTIME_RELEASES_ROOT
+      const platformRoot = cfg.OC_PLATFORM_ROOT ?? DEFAULT_PLATFORM_ROOT;
+      const releasesRoot = cfg.OC_RUNTIME_RELEASES_ROOT ?? DEFAULT_RUNTIME_RELEASES_ROOT;
       const t: V3RuntimeTuple = {
         imageId: cfg.OC_RUNTIME_IMAGE_ID,
         bundlePath: cfg.OC_PLATFORM_BUNDLE,
         releasePath: cfg.OC_RUNTIME_RELEASE,
         platformRoot,
         releasesRoot,
-      }
+      };
       if (cfg.OC_PLATFORM_BUNDLE) {
         try {
           // B5 containment:传 platformRoot 让校验器显式断言 resolved 落在 <platformRoot>/bundles/ 下
@@ -3777,41 +3673,41 @@ export async function registerCommercial(
           const resolved = resolvePlatformBundleMount(cfg.OC_PLATFORM_BUNDLE, {
             ancestorRoot: platformRoot,
             platformRoot,
-          })
-          t.bundleResolvedPath = resolved.resolvedPath
-          t.bundleRev = resolved.bundleRev
-          t.bootHash = resolved.bootHash
+          });
+          t.bundleResolvedPath = resolved.resolvedPath;
+          t.bundleRev = resolved.bundleRev;
+          t.bootHash = resolved.bootHash;
           // eslint-disable-next-line no-console
-          console.log('[commercial] v5 platform bundle validated', {
+          console.log("[commercial] v5 platform bundle validated", {
             bundlePath: cfg.OC_PLATFORM_BUNDLE,
             bundleRev: resolved.bundleRev,
             bootHash: resolved.bootHash,
-          })
+          });
         } catch (err) {
           // eslint-disable-next-line no-console
           console.error(
-            '[commercial] v5 platform bundle validation FAILED — provision will fail-closed (or skip with OC_PLATFORM_BUNDLE_OPTIONAL=1)',
+            "[commercial] v5 platform bundle validation FAILED — provision will fail-closed (or skip with OC_PLATFORM_BUNDLE_OPTIONAL=1)",
             { bundlePath: cfg.OC_PLATFORM_BUNDLE, error: (err as Error).message },
-          )
+          );
         }
       }
       if (cfg.OC_RUNTIME_RELEASE) {
         try {
-          t.releaseResolvedPath = resolveRuntimeReleaseMount(cfg.OC_RUNTIME_RELEASE, releasesRoot)
+          t.releaseResolvedPath = resolveRuntimeReleaseMount(cfg.OC_RUNTIME_RELEASE, releasesRoot);
           // eslint-disable-next-line no-console
-          console.log('[commercial] v5 runtime release validated', {
+          console.log("[commercial] v5 runtime release validated", {
             releasePath: cfg.OC_RUNTIME_RELEASE,
             resolved: t.releaseResolvedPath,
-          })
+          });
         } catch (err) {
           // eslint-disable-next-line no-console
           console.error(
-            '[commercial] v5 runtime release validation FAILED — provision will fail-closed',
+            "[commercial] v5 runtime release validation FAILED — provision will fail-closed",
             { releasePath: cfg.OC_RUNTIME_RELEASE, error: (err as Error).message },
-          )
+          );
         }
       }
-      runtimeTuple = t
+      runtimeTuple = t;
     }
 
     v3Deps = {
@@ -3841,7 +3737,7 @@ export async function registerCommercial(
       ...(runtimeTuple ? { runtimeTuple } : {}),
       // Default-no-op exact-prompt evaluation lane. The runtime adapter rejects
       // every real UID and any absent/invalid/expired root-owned active record.
-      ...(getRuntimeChannel() === 'v5'
+      ...(getRuntimeChannel() === "v5"
         ? {
             syntheticEvalOverlay: createSyntheticEvalOverlayRuntime({
               expectedBaseCommit: readSyntheticEvalReleaseSourceCommit(
@@ -3872,32 +3768,40 @@ export async function registerCommercial(
               lastRefreshIso: string,
             ) => {
               // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒。
-              const target = await resolveServiceableHostTarget(hostUuid)
+              const target = await resolveServiceableHostTarget(hostUuid);
               try {
-                await putRemoteCodexContainerAuth(target, containerId, accessToken, lastRefreshIso)
+                await putRemoteCodexContainerAuth(
+                  target,
+                  containerId,
+                  accessToken,
+                  lastRefreshIso,
+                );
               } finally {
-                target.psk?.fill(0)
+                target.psk?.fill(0);
               }
             },
-            deleteRemoteCodexAuth: async (hostUuid: string, containerId: string) => {
+            deleteRemoteCodexAuth: async (
+              hostUuid: string,
+              containerId: string,
+            ) => {
               // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒
               // (与 put/pull 对称;清 codex auth 也是 node-agent file 接触)。
-              const target = await resolveServiceableHostTarget(hostUuid)
+              const target = await resolveServiceableHostTarget(hostUuid);
               try {
-                await deleteRemoteCodexContainerAuth(target, containerId)
+                await deleteRemoteCodexContainerAuth(target, containerId);
               } finally {
-                target.psk?.fill(0)
+                target.psk?.fill(0);
               }
             },
           }
         : {}),
-    }
+    };
     // eslint-disable-next-line no-console
-    console.log('[commercial] v3 supervisor wired', {
+    console.log("[commercial] v3 supervisor wired", {
       image: cfg.OC_RUNTIME_IMAGE,
       multiHost: Boolean(selfHostUuid),
       selfHostId: selfHostUuid ?? null,
-    })
+    });
 
     // CCB 基线自检(只读诊断,不自己阻断启动 —— 真正的 fail-closed 发生在
     // provisionV3Container 里抛 SupervisorError("CcbBaselineMissing"))。
@@ -3906,32 +3810,32 @@ export async function registerCommercial(
     // 避免"rsync 漏了目录,gateway 跑得好好的但下一个 provision 直接 500"。
     // MISSING 时日志态势明确,不用等用户踩坑才发现。
     {
-      const baselineDir = process.env.OC_V3_CCB_BASELINE_DIR?.trim() || DEFAULT_V3_CCB_BASELINE_DIR
-      const resolved = resolveCcbBaselineMounts(baselineDir)
-      const optional = process.env.OC_V3_CCB_BASELINE_OPTIONAL?.trim().toLowerCase()
-      const optionalFlagOn = optional === '1' || optional === 'true' || optional === 'yes'
+      const baselineDir = process.env.OC_V3_CCB_BASELINE_DIR?.trim() || DEFAULT_V3_CCB_BASELINE_DIR;
+      const resolved = resolveCcbBaselineMounts(baselineDir);
+      const optional = process.env.OC_V3_CCB_BASELINE_OPTIONAL?.trim().toLowerCase();
+      const optionalFlagOn = optional === "1" || optional === "true" || optional === "yes";
       if (resolved) {
         // eslint-disable-next-line no-console
-        console.log('[commercial] v3 ccb baseline ready', {
+        console.log("[commercial] v3 ccb baseline ready", {
           baselineDir,
           claudeMd: resolved.claudeMdHostPath,
           skillsDir: resolved.skillsDirHostPath,
           optional: optionalFlagOn,
-        })
+        });
       } else if (optionalFlagOn) {
         // dev/test 显式允许缺基线,不阻断
         // eslint-disable-next-line no-console
         console.warn(
-          '[commercial] v3 ccb baseline missing (OPTIONAL=1) — new containers will spawn WITHOUT platform guardrails',
+          "[commercial] v3 ccb baseline missing (OPTIONAL=1) — new containers will spawn WITHOUT platform guardrails",
           { baselineDir },
-        )
+        );
       } else {
         // 生产路径 —— 下一次 provisionV3Container 将抛 CcbBaselineMissing
         // eslint-disable-next-line no-console
         console.error(
-          '[commercial] v3 ccb baseline MISSING — next provisionV3Container will FAIL (fail-closed). Fix baseline rsync or set OC_V3_CCB_BASELINE_OPTIONAL=1 for dev only.',
+          "[commercial] v3 ccb baseline MISSING — next provisionV3Container will FAIL (fail-closed). Fix baseline rsync or set OC_V3_CCB_BASELINE_OPTIONAL=1 for dev only.",
           { baselineDir },
-        )
+        );
       }
     }
 
@@ -3944,14 +3848,14 @@ export async function registerCommercial(
     // 任一 slot 都必须显式关掉这些开关,否则 fail-loud 拒起。v3 已下线、v5 镜像本机常驻,compute-pool
     // 对 v5 本就无用(preheat 是 noop)。【收口债】后续应将 compute-pool 纳入 LeaderBundle 或从 v5 剥离。
     if (dualMasterEnabled && controlPlaneEnabled) {
-      const preheatOn = process.env.OC_PREHEAT_DISABLED !== '1'
-      const distributeOn = process.env.OC_IMAGE_DISTRIBUTE_DISABLED !== '1'
+      const preheatOn = process.env.OC_PREHEAT_DISABLED !== "1";
+      const distributeOn = process.env.OC_IMAGE_DISTRIBUTE_DISABLED !== "1";
       if (preheatOn || distributeOn) {
         throw new Error(
-          '[commercial] v5 双 master:compute-pool 三件套(preheat/initComputePool/imagePromote)未纳入 ' +
-            'LeaderBundle,eager 跑会在两 slot 双写 v3 compute_hosts 且违反 shared 单跑不变量。须在 v5 ' +
-            'drop-in 显式关闭:OC_PREHEAT_DISABLED=1 且 OC_IMAGE_DISTRIBUTE_DISABLED=1(v3 已下线、v5 镜像本机常驻)。拒起。',
-        )
+          "[commercial] v5 双 master:compute-pool 三件套(preheat/initComputePool/imagePromote)未纳入 " +
+            "LeaderBundle,eager 跑会在两 slot 双写 v3 compute_hosts 且违反 shared 单跑不变量。须在 v5 " +
+            "drop-in 显式关闭:OC_PREHEAT_DISABLED=1 且 OC_IMAGE_DISTRIBUTE_DISABLED=1(v3 已下线、v5 镜像本机常驻)。拒起。",
+        );
       }
     }
 
@@ -3961,21 +3865,15 @@ export async function registerCommercial(
     // P1d 单一权威:preheat + 其内嵌的 compute pool init / image-promote scheduler 都向
     // 共享 compute_hosts 写状态。v5(dualMaster)已由上方 MAJOR 4 护栏要求显式关闭这些开关;
     // 走到此处的 v5 一定 preheatOn=false,故本块实际只在非双 master(v3/legacy leader)执行。
-    if (controlPlaneEnabled && process.env.OC_PREHEAT_DISABLED !== '1') {
+    if (controlPlaneEnabled && process.env.OC_PREHEAT_DISABLED !== "1") {
       void preheatV3Image(v3Docker, cfg.OC_RUNTIME_IMAGE, {
-        info: (m, meta) => {
-          /* eslint-disable-next-line no-console */ console.log(m, meta ?? {})
-        },
-        warn: (m, meta) => {
-          /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {})
-        },
+        info: (m, meta) => { /* eslint-disable-next-line no-console */ console.log(m, meta ?? {}); },
+        warn: (m, meta) => { /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {}); },
       }).catch((err: unknown) => {
         // preheatV3Image 内部已经吞了所有错;到这里只是兜底防 unhandledRejection
         // eslint-disable-next-line no-console
-        console.warn('[commercial] v3 preheat unexpectedly threw', {
-          error: (err as Error)?.message ?? String(err),
-        })
-      })
+        console.warn("[commercial] v3 preheat unexpectedly threw", { error: (err as Error)?.message ?? String(err) });
+      });
 
       // 0042 — 启动时 compute pool 初始化:
       //   1. inspect 本地 OC_RUNTIME_IMAGE → 算 desiredImageId
@@ -3988,14 +3886,14 @@ export async function registerCommercial(
       //  本调用替代旧 distributePreheatToAllHosts startup 调用 —— promoteOnce 内部已经包了
       //  distribute,且会写 loaded_image_id + clear quarantine。
       //  OC_IMAGE_DISTRIBUTE_DISABLED=1 仍可关掉(单机 dev / 测试)。
-      if (process.env.OC_IMAGE_DISTRIBUTE_DISABLED !== '1') {
+      if (process.env.OC_IMAGE_DISTRIBUTE_DISABLED !== "1") {
         // imagePromote 实际 .start() 在 initComputePool 完成后(异步),但归属登记必须
         // 同步发生在 gate 判定点 —— 否则 v5 不变量断言窗口期看不到它(此前的漏登记盲区)。
-        trackScheduler('imagePromote', 'shared', true)
+        trackScheduler("imagePromote", "shared", true);
         void initComputePool({ imageTag: cfg.OC_RUNTIME_IMAGE })
           .then((r) => {
             // eslint-disable-next-line no-console
-            console.log('[commercial] compute pool init done', {
+            console.log("[commercial] compute pool init done", {
               desiredImageId: r.desiredImageId,
               selfSynced: r.selfSynced,
               backfillHosts: r.backfillHosts,
@@ -4003,27 +3901,25 @@ export async function registerCommercial(
               backfillSkipped: r.backfillSkipped,
               backfillTimedOut: r.backfillTimedOut,
               promoteRan: r.promoteRan,
-            })
+            });
             // 启动周期性 promote scheduler(60s 后第一 tick,之后每 5min)。
             // trackScheduler 幂等:gate 判定点已同步登记占位,此处重复包装不产生重复项。
-            trackScheduler(
-              'imagePromote',
-              'shared',
-              getImagePromoteScheduler({ imageTag: cfg.OC_RUNTIME_IMAGE }),
-            ).start()
+            trackScheduler("imagePromote", "shared", getImagePromoteScheduler({ imageTag: cfg.OC_RUNTIME_IMAGE })).start();
           })
           .catch((err: unknown) => {
             // initComputePool 内部 best-effort 不抛;到这里就是 bug
             // eslint-disable-next-line no-console
-            console.warn('[commercial] compute pool init unexpectedly threw', {
+            console.warn("[commercial] compute pool init unexpectedly threw", {
               error: (err as Error)?.message ?? String(err),
-            })
-          })
+            });
+          });
       }
     }
   } else {
     // eslint-disable-next-line no-console
-    console.log('[commercial] v3 supervisor disabled; missing env: OC_RUNTIME_IMAGE')
+    console.log(
+      "[commercial] v3 supervisor disabled; missing env: OC_RUNTIME_IMAGE",
+    );
   }
 
   // v1.0.120 feat/codex-disable-rebind:fanoutDeps 装配 —— admin disable codex
@@ -4034,10 +3930,10 @@ export async function registerCommercial(
   // 走本地 fs 写;若实际 row.host_uuid 是远端但 helper 未注入,
   // fetchSnapshotAndWriteContainerAuth 会抛错 → tx ROLLBACK,符合强一致语义。
   // 句柄声明在 block 外,shutdown 才能 stop(fanoutDeps 是 block-local)。
-  let codexDriftReconciler: CodexDriftReconcilerHandle | undefined
+  let codexDriftReconciler: CodexDriftReconcilerHandle | undefined;
   {
     const codexContainerDirForFanout =
-      process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR
+      process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
     const fanoutDeps: CodexDisableFanoutDeps = {
       writeAuth: {
         selfHostId: v3Deps?.selfHostId ?? null,
@@ -4048,13 +3944,13 @@ export async function registerCommercial(
       },
       concurrency: 4,
       logger: rootLogger.child({
-        subsys: 'commercial',
-        module: 'codexDisableFanout',
+        subsys: "commercial",
+        module: "codexDisableFanout",
       }),
-    }
+    };
     triggerCodexDisableFanoutRef.current = (accountId: bigint) => {
-      enqueueCodexDisableFanout(accountId, fanoutDeps)
-    }
+      enqueueCodexDisableFanout(accountId, fanoutDeps);
+    };
     // B3 — fanout 是 fire-and-forget,单容器 rebind 失败无重试且恢复 actor 看不到
     // disabled 账号的残留绑定 → 周期性兜底对账,复用同一强一致 rebind。
     //
@@ -4063,16 +3959,12 @@ export async function registerCommercial(
     // runtime_channel 注入)。沿旧 controlPlaneEnabled gate 会让 v5 的 codex 绑定漂移
     // 永远无人对账(v3 leader 只管 v3 行)—— 与 channel 纪律自相矛盾,故 v5 必须自己跑。
     if (
-      (controlPlaneEnabled || runtimeChannel === 'v5') &&
-      process.env.COMMERCIAL_CODEX_DRIFT_RECONCILER_DISABLED !== '1'
+      (controlPlaneEnabled || runtimeChannel === "v5") &&
+      process.env.COMMERCIAL_CODEX_DRIFT_RECONCILER_DISABLED !== "1"
     ) {
-      const raw = Number(process.env.COMMERCIAL_CODEX_DRIFT_RECONCILER_INTERVAL_MS)
-      const intervalMs = Number.isFinite(raw) && raw >= 30_000 ? raw : 300_000
-      codexDriftReconciler = trackScheduler(
-        'codexDriftReconciler',
-        'v5-owned',
-        startCodexDisableDriftReconciler({ deps: fanoutDeps, intervalMs }),
-      )
+      const raw = Number(process.env.COMMERCIAL_CODEX_DRIFT_RECONCILER_INTERVAL_MS);
+      const intervalMs = Number.isFinite(raw) && raw >= 30_000 ? raw : 300_000;
+      codexDriftReconciler = trackScheduler("codexDriftReconciler", "v5-owned", startCodexDisableDriftReconciler({ deps: fanoutDeps, intervalMs }));
     }
   }
 
@@ -4083,28 +3975,29 @@ export async function registerCommercial(
   // V5 P1 是 local-only，明确不注册/调度 remote compute host，也不能在 A/B 双 master
   // 同时抢占一个 baseline 端口；V5 本地容器直接 ro bind slot-local baseline，无需此 server。
   // V3 bind 0.0.0.0 + mTLS + PSK 双因子认证;GCP default-allow-internal 挡公网。
-  let baselineSrv: BaselineServer | undefined
-  if (v3Deps && selfHostUuid && runtimeChannel !== 'v5') {
+  let baselineSrv: BaselineServer | undefined;
+  if (v3Deps && selfHostUuid && runtimeChannel !== "v5") {
     try {
-      const baselineDir = process.env.OC_V3_CCB_BASELINE_DIR?.trim() || DEFAULT_V3_CCB_BASELINE_DIR
+      const baselineDir =
+        process.env.OC_V3_CCB_BASELINE_DIR?.trim() || DEFAULT_V3_CCB_BASELINE_DIR;
       baselineSrv = getBaselineServer({
         baselineDir,
-        bind: '0.0.0.0',
+        bind: "0.0.0.0",
         port: 18792,
-      })
-      await baselineSrv.start()
+      });
+      await baselineSrv.start();
       // eslint-disable-next-line no-console
-      console.log('[commercial] baseline server started', {
-        bind: '0.0.0.0',
+      console.log("[commercial] baseline server started", {
+        bind: "0.0.0.0",
         port: 18792,
         baselineDir,
-      })
+      });
     } catch (err) {
       // eslint-disable-next-line no-console
-      console.error('[commercial] baseline server start failed', {
+      console.error("[commercial] baseline server start failed", {
         err: (err as Error)?.message ?? String(err),
-      })
-      baselineSrv = undefined
+      });
+      baselineSrv = undefined;
     }
   }
 
@@ -4120,54 +4013,54 @@ export async function registerCommercial(
   // 参数目前只用于日志;未来若放宽"单用户多容器",此处要重新 keyed by (userId, hostId)。
   setRemoteMuxDeps({
     async resolvePlacement(userId, hostId) {
-      const uidInt = Number.parseInt(userId, 10)
+      const uidInt = Number.parseInt(userId, 10);
       if (!Number.isFinite(uidInt) || uidInt <= 0 || String(uidInt) !== userId) {
         throw new RemoteHostError(
-          'INTERNAL',
+          "INTERNAL",
           `resolvePlacement: userId not positive integer: ${userId}`,
-        )
+        );
       }
-      const sticky = await computeQueries.findUserStickyHost(uidInt)
+      const sticky = await computeQueries.findUserStickyHost(uidInt);
       if (!sticky) {
         throw new RemoteHostError(
-          'INTERNAL',
+          "INTERNAL",
           `NO_CONTAINER: user ${userId} has no active container (hostId=${hostId})`,
-        )
+        );
       }
-      const hostRow = await computeQueries.getHostById(sticky.hostUuid)
+      const hostRow = await computeQueries.getHostById(sticky.hostUuid);
       if (!hostRow) {
         throw new RemoteHostError(
-          'INTERNAL',
+          "INTERNAL",
           `compute_host ${sticky.hostUuid} not found (userId=${userId} hostId=${hostId})`,
-        )
+        );
       }
-      rootLogger.debug('sshMux resolvePlacement', {
-        subsys: 'remote-ssh',
+      rootLogger.debug("sshMux resolvePlacement", {
+        subsys: "remote-ssh",
         userId,
         hostId,
         resolvedHostUuid: hostRow.id,
         resolvedName: hostRow.name,
-      })
-      if (hostRow.name === 'self') return { kind: 'self' }
+      });
+      if (hostRow.name === "self") return { kind: "self" };
       // A3 — 终态 revoked host 不再做 SSH 远端文件操作(deny)。setRevoked 已清
       // fingerprint;requireFingerprint=true 让缺 pin 的 host 也在 TLS 层 fail-closed。
-      if (hostRow.status === 'revoked') {
+      if (hostRow.status === "revoked") {
         throw new RemoteHostError(
-          'INTERNAL',
+          "INTERNAL",
           `compute_host ${sticky.hostUuid} revoked (userId=${userId} hostId=${hostId})`,
-        )
+        );
       }
-      const target = hostRowToTarget(hostRow)
-      target.requireFingerprint = true
-      return { kind: 'remote', target }
+      const target = hostRowToTarget(hostRow);
+      target.requireFingerprint = true;
+      return { kind: "remote", target };
     },
     startSshControlMaster,
     stopSshControlMaster,
     putRemoteFile: nodeAgentPutFile,
     deleteRemoteFile: nodeAgentDeleteFile,
-  })
+  });
   // eslint-disable-next-line no-console
-  console.log('[commercial] sshMux remote deps wired')
+  console.log("[commercial] sshMux remote deps wired");
 
   // v1.0.191 — /api/media-signed 冷启动护栏 + per-uid singleflight 合并。
   // 详见 handlers.ts ensureContainerReady JSDoc 与 ensureContainerSingleflight.ts。
@@ -4188,12 +4081,8 @@ export async function registerCommercial(
   const clearResolvedEndpointSecret = (
     endpoint: Awaited<ReturnType<ResolveContainerEndpoint>>,
   ): void => {
-    try {
-      endpoint.tunnel?.nodeAgent.psk?.fill(0)
-    } catch {
-      /* best-effort secret cleanup */
-    }
-  }
+    try { endpoint.tunnel?.nodeAgent.psk?.fill(0); } catch { /* best-effort secret cleanup */ }
+  };
   const cloneResolvedEndpoint = (
     endpoint: Awaited<ReturnType<ResolveContainerEndpoint>>,
   ): Awaited<ReturnType<ResolveContainerEndpoint>> => ({
@@ -4211,7 +4100,7 @@ export async function registerCommercial(
           },
         }
       : {}),
-  })
+  });
   const sharedEnsureRunning: ResolveContainerEndpoint | undefined = v3Deps
     ? makeUidSingleflight(makeV3EnsureRunning(v3Deps), {
         // A provision singleflight may fan out to chat, legacy preview and
@@ -4220,18 +4109,18 @@ export async function registerCommercial(
         cloneResult: cloneResolvedEndpoint,
         disposeSharedResult: clearResolvedEndpointSecret,
       })
-    : undefined
+    : undefined;
 
   const ensureContainerEndpointReady: ((uid: bigint) => Promise<void>) | undefined =
     sharedEnsureRunning
       ? async (uid) => {
-          const endpoint = await sharedEnsureRunning(uid)
-          clearResolvedEndpointSecret(endpoint)
+          const endpoint = await sharedEnsureRunning(uid);
+          clearResolvedEndpointSecret(endpoint);
         }
-      : undefined
+      : undefined;
 
   const ensureContainerReady: ((uid: bigint) => Promise<void>) | undefined =
-    ensureContainerEndpointReady
+    ensureContainerEndpointReady;
 
   // 邮箱验证成功 → fire-and-forget 触发 v3 容器 pre-warm(p50=215s"验证 → 首消息"间隔
   // 覆盖 docker run 冷启,首条消息命中 running)。
@@ -4244,23 +4133,20 @@ export async function registerCommercial(
   const prewarmContainer: ((uid: bigint) => void) | undefined = sharedEnsureRunning
     ? makePrewarmContainer(
         sharedEnsureRunning,
-        rootLogger.child({ subsys: 'v3/prewarm' }),
+        rootLogger.child({ subsys: "v3/prewarm" }),
         ({ userId, correlation, latencyMs }) => {
-          void recordProductFrictionEvent(
-            {
-              correlation,
-              userId,
-              surface: 'container',
-              stage: 'prewarm',
-              code: 'PREWARM_FAILED',
-              outcome: 'failed',
-              latencyMs,
-            },
-            getPool(),
-          ).catch(() => {})
+          void recordProductFrictionEvent({
+            correlation,
+            userId,
+            surface: "container",
+            stage: "prewarm",
+            code: "PREWARM_FAILED",
+            outcome: "failed",
+            latencyMs,
+          }, getPool()).catch(() => {});
         },
       )
-    : undefined
+    : undefined;
 
   // V3 multi-tenant media resolver(`c:<uid>` → user volume {uploads, generated})
   // 仅暴露给 gateway(`RegisterCommercialResult.resolveUserMediaDirs`,装配
@@ -4278,31 +4164,38 @@ export async function registerCommercial(
   // 解析 /api/media/<file> 时报"媒体不存在或不可读"。v3 prod 有 AGENT_IMAGE(agentRuntime 在)
   // 故无此问题。这里把 docker 退到 v3Deps.docker：优先 agentRuntime(v3 行为零改变),v5 用 v3Deps。
   // resolver 内部按 getRuntimeChannel() 解析 channel 卷(oc-v5-data-u<uid>),安全。
-  const mediaResolverDocker = agentRuntime?.docker ?? v3Deps?.docker
+  const mediaResolverDocker = agentRuntime?.docker ?? v3Deps?.docker;
   const userMediaResolver = mediaResolverDocker
     ? createUserMediaResolver({
         pool: getPool(),
         docker: mediaResolverDocker,
       })
-    : undefined
+    : undefined;
   knowledgePlanetMediaResolverRef.current = userMediaResolver
 
   // Shared remote-host upload closure. It is used by both gateway /api/uploads
   // and the master-side WeChat image ingest bridge so the two paths keep the
   // same node-agent semantics (0644, owner 1000:1000, PSK zeroing).
   const pushRemoteHostUpload = async (args: {
-    hostUuid: string
-    remotePath: string
-    content: Buffer
+    hostUuid: string;
+    remotePath: string;
+    content: Buffer;
   }) => {
     // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒。
-    const target = await resolveServiceableHostTarget(args.hostUuid)
+    const target = await resolveServiceableHostTarget(args.hostUuid);
     try {
-      await nodeAgentPutFile(target, args.remotePath, args.content, 0o644, 1000, 1000)
+      await nodeAgentPutFile(
+        target,
+        args.remotePath,
+        args.content,
+        0o644,
+        1000,
+        1000,
+      );
     } finally {
-      target.psk?.fill(0)
+      target.psk?.fill(0);
     }
-  }
+  };
 
   // Endpoint resolver split (P1-IMPL-09 / design v2 §1.2 / §4.5.3):
   //
@@ -4322,27 +4215,31 @@ export async function registerCommercial(
   // makeDesktopContainerTransport separately for already-admitted desktop
   // turns. Screencast / legacy /ws/agent is gone (v5 uses user-chat-bridge).
   const dockerEnsureRunning: ResolveContainerEndpoint =
-    makeInboundChannelResolver(sharedEnsureRunning)
+    makeInboundChannelResolver(sharedEnsureRunning);
   const resolveContainerEndpoint: ResolveContainerEndpoint =
-    options.resolveContainerEndpoint ?? makeDesktopOrDockerResolver(sharedEnsureRunning)
+    options.resolveContainerEndpoint
+    ?? makeDesktopOrDockerResolver(sharedEnsureRunning);
 
   // V5 container-local web preview is intentionally atomic: the HTTP ticket
   // endpoint stays unavailable until the authenticated public WS bridge has
   // been assembled below. Model authority provides the existing Ed25519 trust
   // root; without it, a same-UID process inside the user container could forge
   // preview capabilities.
-  const containerPreviewBaseUrl = process.env.COMMERCIAL_BASE_URL?.trim()
+  const containerPreviewBaseUrl = process.env.COMMERCIAL_BASE_URL?.trim();
   const containerPreviewTickets =
-    runtimeChannel === 'v5' && modelAuthoritySigner && v3Deps && containerPreviewBaseUrl
+    runtimeChannel === "v5"
+    && modelAuthoritySigner
+    && v3Deps
+    && containerPreviewBaseUrl
       ? new ContainerPreviewTicketStore()
-      : undefined
-  let containerPreviewBridge: ContainerPreviewBridgeHandler | undefined
-  let directContainerPreview: DirectContainerPreviewService | undefined
+      : undefined;
+  let containerPreviewBridge: ContainerPreviewBridgeHandler | undefined;
+  let directContainerPreview: DirectContainerPreviewService | undefined;
   if (
-    process.env.OC_CONTAINER_DIRECT_PREVIEW_ENABLED === '1' &&
-    containerPreviewTickets &&
-    modelAuthoritySigner &&
-    containerPreviewBaseUrl
+    process.env.OC_CONTAINER_DIRECT_PREVIEW_ENABLED === "1"
+    && containerPreviewTickets
+    && modelAuthoritySigner
+    && containerPreviewBaseUrl
   ) {
     try {
       directContainerPreview = createDirectContainerPreviewService({
@@ -4355,33 +4252,33 @@ export async function registerCommercial(
         cloudflaredBinary: process.env.OC_CONTAINER_PREVIEW_CLOUDFLARED_BIN,
         maxSessions: Number(process.env.OC_CONTAINER_PREVIEW_MAX_SESSIONS),
         warmTunnels: Number(process.env.OC_CONTAINER_PREVIEW_WARM_TUNNELS || 2),
-        logger: rootLogger.child({ subsys: 'commercial', module: 'directContainerPreview' }),
-      })
+        logger: rootLogger.child({ subsys: "commercial", module: "directContainerPreview" }),
+      });
       // eslint-disable-next-line no-console
-      console.log('[commercial] V5 native iframe preview ENABLED (temporary Quick Tunnel beta)')
+      console.log("[commercial] V5 native iframe preview ENABLED (temporary Quick Tunnel beta)");
     } catch (err) {
-      rootLogger.error('[commercial] native iframe preview disabled', {
+      rootLogger.error("[commercial] native iframe preview disabled", {
         error: (err as Error)?.message ?? String(err),
-      })
+      });
     }
   }
 
   // ChatGPT 直连代理:公网 TLS CONNECT 监听(仅白名单域名),链到订阅 egress。
   // env fail-closed;证书缺失/配置错 → 记 error、功能关闭,不影响 master 启动。
-  let chatgptProxyServer: ChatGptProxyServer | undefined
-  let chatgptProxyHttp: ChatGptProxyHttpDeps | undefined
+  let chatgptProxyServer: ChatGptProxyServer | undefined;
+  let chatgptProxyHttp: ChatGptProxyHttpDeps | undefined;
   {
-    const cgpEnv = readChatGptProxyEnv()
-    if (cgpEnv.enabled && runtimeChannel === 'v5' && v3Deps) {
+    const cgpEnv = readChatGptProxyEnv();
+    if (cgpEnv.enabled && runtimeChannel === "v5" && v3Deps) {
       if (cgpEnv.configError || !cgpEnv.upstream) {
-        rootLogger.error('[commercial] chatgpt proxy disabled: bad config', {
-          error: cgpEnv.configError ?? 'no upstream',
-        })
+        rootLogger.error("[commercial] chatgpt proxy disabled: bad config", {
+          error: cgpEnv.configError ?? "no upstream",
+        });
       } else {
         try {
-          const cgpLogger = rootLogger.child({ subsys: 'commercial', module: 'chatgptProxy' })
-          const credentials = new ChatGptProxyCredentialStore(v3Deps.pool)
-          const pool = v3Deps.pool
+          const cgpLogger = rootLogger.child({ subsys: "commercial", module: "chatgptProxy" });
+          const credentials = new ChatGptProxyCredentialStore(v3Deps.pool);
+          const pool = v3Deps.pool;
           chatgptProxyServer = createChatGptProxyServer({
             publicHost: cgpEnv.publicHost,
             port: cgpEnv.port,
@@ -4393,34 +4290,32 @@ export async function registerCommercial(
               const r = await pool.query<{ role: string }>(
                 `SELECT role FROM users WHERE id = $1::bigint AND status = 'active' LIMIT 1`,
                 [uid],
-              )
-              const role = r.rows[0]?.role
-              return role === 'admin' || role === 'user' ? role : null
+              );
+              const role = r.rows[0]?.role;
+              return role === "admin" || role === "user" ? role : null;
             },
             getEntitlement: async () => {
-              const snap = await getChatGptProxyFlagSnapshot()
-              return { assembled: snap.assembled, allowlist: snap.allowlist }
+              const snap = await getChatGptProxyFlagSnapshot();
+              return { assembled: snap.assembled, allowlist: snap.allowlist };
             },
             onTunnelUsed: (uid) => credentials.touchLastUsed(uid),
             logger: cgpLogger,
-          })
+          });
           chatgptProxyHttp = {
             publicHost: cgpEnv.publicHost,
             port: cgpEnv.port,
             credentials,
             getFlags: () => getChatGptProxyFlagSnapshot(),
-          }
-          chatgptProxyServer.listenWithRetry()
+          };
+          chatgptProxyServer.listenWithRetry();
           // eslint-disable-next-line no-console
-          console.log(
-            `[commercial] ChatGPT direct-connect proxy ENABLED on ${cgpEnv.publicHost}:${cgpEnv.port}`,
-          )
+          console.log(`[commercial] ChatGPT direct-connect proxy ENABLED on ${cgpEnv.publicHost}:${cgpEnv.port}`);
         } catch (err) {
-          chatgptProxyServer = undefined
-          chatgptProxyHttp = undefined
-          rootLogger.error('[commercial] chatgpt proxy disabled: init failed', {
+          chatgptProxyServer = undefined;
+          chatgptProxyHttp = undefined;
+          rootLogger.error("[commercial] chatgpt proxy disabled: init failed", {
             error: (err as Error)?.message ?? String(err),
-          })
+          });
         }
       }
     }
@@ -4457,7 +4352,7 @@ export async function registerCommercial(
     requireEmailVerified: cfg.REQUIRE_EMAIL_VERIFIED,
     // HIGH#4:生产 claudeai.chat 全 HTTPS,默认 Secure cookie;
     // 仅当 env COMMERCIAL_INSECURE_COOKIE=1(本地 dev / docker compose)才关
-    refreshCookieSecure: process.env.COMMERCIAL_INSECURE_COOKIE === '1' ? false : true,
+    refreshCookieSecure: process.env.COMMERCIAL_INSECURE_COOKIE === "1" ? false : true,
     verifyEmailUrlBase: process.env.COMMERCIAL_BASE_URL,
     resetPasswordUrlBase: process.env.COMMERCIAL_BASE_URL,
     pricing,
@@ -4511,7 +4406,7 @@ export async function registerCommercial(
     externalApiKeyProxy,
     externalApiKeyModels,
     externalApiKeyUsage,
-  })
+  });
 
   // legacy /ws/agent(T-52 老 agent runtime WS 入口)已删除;v5 一律走 /ws/user-chat-bridge。
 
@@ -4532,160 +4427,122 @@ export async function registerCommercial(
   // (注册进 schedulerRegistry + 满足 scheduler-wiring lint);drain 时 bundle 经 onMemberStopped 摘除。
   // orphanReconcile 曾以 v5-owned `||v5` 双跑(错峰缓解),P3 归入 leader 单跑=正解(消错峰假设)。
   if (cursorExternalOutbox) {
-    const outbox = cursorExternalOutbox
+    const outbox = cursorExternalOutbox;
     leaderBundle.add({
-      name: 'cursorExternalApiOutbox',
-      domain: 'v5-owned',
+      name: "cursorExternalApiOutbox",
+      domain: "v5-owned",
       required: false,
       start: () => {
         const h = trackScheduler(
-          'cursorExternalApiOutbox',
-          'v5-owned',
+          "cursorExternalApiOutbox",
+          "v5-owned",
           outbox.startScanner({
             pool: getPool(),
             pricing,
-            logger: rootLogger.child({ subsys: 'cursorExternalApiOutbox' }),
+            logger: rootLogger.child({ subsys: "cursorExternalApiOutbox" }),
           }),
-        )
-        return { stop: () => h.stop() }
+        );
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
-  if (v3Deps && process.env.OC_IDLE_SWEEP_DISABLED !== '1') {
-    const deps = v3Deps
+  if (v3Deps && process.env.OC_IDLE_SWEEP_DISABLED !== "1") {
+    const deps = v3Deps;
     leaderBundle.add({
-      name: 'idleSweep',
-      domain: 'shared',
+      name: "idleSweep",
+      domain: "shared",
       start: () => {
-        const idleSweepLog = rootLogger.child({ subsys: 'v3/idleSweep' })
-        const h = trackScheduler(
-          'idleSweep',
-          'shared',
-          startIdleSweepScheduler(deps, {
-            logger: idleSweepLog,
-            runOnStart: false,
-            batchLimit: INITIAL_SWEEP_BATCH_LIMIT,
-          }),
-        )
-        idleSweepLog.info('scheduler started', {
-          tickSec: 60,
-          idleCutoffMin: 30,
-          batchLimit: INITIAL_SWEEP_BATCH_LIMIT,
-        })
-        return { stop: () => h.stop() }
+        const idleSweepLog = rootLogger.child({ subsys: "v3/idleSweep" });
+        const h = trackScheduler("idleSweep", "shared", startIdleSweepScheduler(deps, { logger: idleSweepLog, runOnStart: false, batchLimit: INITIAL_SWEEP_BATCH_LIMIT }));
+        idleSweepLog.info("scheduler started", { tickSec: 60, idleCutoffMin: 30, batchLimit: INITIAL_SWEEP_BATCH_LIMIT });
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
-  if (v3Deps && process.env.OC_VOLUME_GC_DISABLED !== '1') {
-    const deps = v3Deps
+  if (v3Deps && process.env.OC_VOLUME_GC_DISABLED !== "1") {
+    const deps = v3Deps;
     leaderBundle.add({
-      name: 'volumeGc',
-      domain: 'shared',
+      name: "volumeGc",
+      domain: "shared",
       start: () => {
-        const volumeGcLog = rootLogger.child({ subsys: 'v3/volumeGc' })
-        const h = trackScheduler(
-          'volumeGc',
-          'shared',
-          startVolumeGcScheduler(deps, { logger: volumeGcLog, runOnStart: false }),
-        )
-        volumeGcLog.info('scheduler started', { tickSec: 3600, bannedDays: 7, noLoginDays: 90 })
-        return { stop: () => h.stop() }
+        const volumeGcLog = rootLogger.child({ subsys: "v3/volumeGc" });
+        const h = trackScheduler("volumeGc", "shared", startVolumeGcScheduler(deps, { logger: volumeGcLog, runOnStart: false }));
+        volumeGcLog.info("scheduler started", { tickSec: 3600, bannedDays: 7, noLoginDays: 90 });
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
-  if (v3Deps && process.env.OC_ORPHAN_RECONCILE_DISABLED !== '1') {
-    const deps = v3Deps
+  if (v3Deps && process.env.OC_ORPHAN_RECONCILE_DISABLED !== "1") {
+    const deps = v3Deps;
     leaderBundle.add({
-      name: 'orphanReconcile',
-      domain: 'v5-owned',
+      name: "orphanReconcile",
+      domain: "v5-owned",
       start: () => {
-        const orphanReconcileLog = rootLogger.child({ subsys: 'v3/orphanReconcile' })
-        const h = trackScheduler(
-          'orphanReconcile',
-          'v5-owned',
-          startOrphanReconcileScheduler(deps, { logger: orphanReconcileLog }),
-        )
-        orphanReconcileLog.info('scheduler started', { tickSec: 3600, runOnStart: true })
-        return { stop: () => h.stop() }
+        const orphanReconcileLog = rootLogger.child({ subsys: "v3/orphanReconcile" });
+        const h = trackScheduler("orphanReconcile", "v5-owned", startOrphanReconcileScheduler(deps, { logger: orphanReconcileLog }));
+        orphanReconcileLog.info("scheduler started", { tickSec: 3600, runOnStart: true });
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
-  if (v3Deps && process.env.OC_MIGRATION_RECONCILER_DISABLED !== '1') {
-    const deps = v3Deps
+  if (v3Deps && process.env.OC_MIGRATION_RECONCILER_DISABLED !== "1") {
+    const deps = v3Deps;
     leaderBundle.add({
-      name: 'migrationReconcile',
-      domain: 'shared',
+      name: "migrationReconcile",
+      domain: "shared",
       start: () => {
-        const migrationReconcileLog = rootLogger.child({ subsys: 'v3/migrationReconciler' })
-        const h = trackScheduler(
-          'migrationReconcile',
-          'shared',
-          startMigrationReconcileScheduler(deps, { logger: migrationReconcileLog }),
-        )
-        migrationReconcileLog.info('scheduler started', {
-          tickSec: 60,
-          staleSec: 600,
-          runOnStart: true,
-        })
-        return { stop: () => h.stop() }
+        const migrationReconcileLog = rootLogger.child({ subsys: "v3/migrationReconciler" });
+        const h = trackScheduler("migrationReconcile", "shared", startMigrationReconcileScheduler(deps, { logger: migrationReconcileLog }));
+        migrationReconcileLog.info("scheduler started", { tickSec: 60, staleSec: 600, runOnStart: true });
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
-  if (v3Deps && process.env.OC_HEALTH_POLLER_DISABLED !== '1') {
+  if (v3Deps && process.env.OC_HEALTH_POLLER_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'healthPoller',
-      domain: 'shared',
+      name: "healthPoller",
+      domain: "shared",
       start: () => {
-        const hp = trackScheduler('healthPoller', 'shared', getHealthPoller())
-        hp.start()
-        rootLogger
-          .child({ subsys: 'node-health' })
-          .info('scheduler started', { intervalMs: 30_000 })
-        return { stop: () => hp.stop() }
+        const hp = trackScheduler("healthPoller", "shared", getHealthPoller());
+        hp.start();
+        rootLogger.child({ subsys: "node-health" }).info("scheduler started", { intervalMs: 30_000 });
+        return { stop: () => hp.stop() };
       },
-    })
+    });
   }
 
-  if (v3Deps && process.env.OC_CONTAINER_EVENTS_DISABLED !== '1') {
-    const deps = v3Deps
+  if (v3Deps && process.env.OC_CONTAINER_EVENTS_DISABLED !== "1") {
+    const deps = v3Deps;
     leaderBundle.add({
-      name: 'containerEvents',
-      domain: 'shared',
+      name: "containerEvents",
+      domain: "shared",
       start: () => {
-        const h = trackScheduler(
-          'containerEvents',
-          'shared',
-          startV3ContainerEventsWorker({
-            docker: deps.docker,
-            logger: {
-              debug: (m, meta) => {
-                /* eslint-disable-next-line no-console */ console.debug(m, meta ?? {})
-              },
-              info: (m, meta) => {
-                /* eslint-disable-next-line no-console */ console.log(m, meta ?? {})
-              },
-              warn: (m, meta) => {
-                /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {})
-              },
-              error: (m, meta) => {
-                /* eslint-disable-next-line no-console */ console.error(m, meta ?? {})
-              },
-            },
-          }),
-        )
+        const h = trackScheduler("containerEvents", "shared", startV3ContainerEventsWorker({
+          docker: deps.docker,
+          logger: {
+            debug: (m, meta) => { /* eslint-disable-next-line no-console */ console.debug(m, meta ?? {}); },
+            info:  (m, meta) => { /* eslint-disable-next-line no-console */ console.log(m, meta ?? {}); },
+            warn:  (m, meta) => { /* eslint-disable-next-line no-console */ console.warn(m, meta ?? {}); },
+            error: (m, meta) => { /* eslint-disable-next-line no-console */ console.error(m, meta ?? {}); },
+          },
+        }));
         // eslint-disable-next-line no-console
-        console.log('[commercial] v3 container events worker started (oom/die → alerts)')
-        return { stop: () => h.stop() }
+        console.log("[commercial] v3 container events worker started (oom/die → alerts)");
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
-  if (containerPreviewTickets && modelAuthoritySigner && containerPreviewBaseUrl) {
+  if (
+    containerPreviewTickets
+    && modelAuthoritySigner
+    && containerPreviewBaseUrl
+  ) {
     try {
       containerPreviewBridge = createContainerPreviewBridge({
         tickets: containerPreviewTickets,
@@ -4695,71 +4552,73 @@ export async function registerCommercial(
         allowedOrigin: containerPreviewBaseUrl,
         maxGlobalSessions: Number(process.env.OC_CONTAINER_PREVIEW_MAX_SESSIONS),
         createTunnelContainerSocket: (tunnel, port, assertion, connectionTraceId, signal) =>
-          createTunnelContainerSocket(tunnel.nodeAgent, tunnel.containerInternalId, port, signal, {
-            maxFrameBytes: CONTAINER_PREVIEW_MAX_FRAME_BYTES,
-            connectionTraceId,
-            containerWsPath: '/ws/container-preview',
-            previewAssertion: assertion,
-          }),
-        logger: rootLogger.child({ subsys: 'commercial', module: 'containerPreviewBridge' }),
-      })
+          createTunnelContainerSocket(
+            tunnel.nodeAgent,
+            tunnel.containerInternalId,
+            port,
+            signal,
+            {
+              maxFrameBytes: CONTAINER_PREVIEW_MAX_FRAME_BYTES,
+              connectionTraceId,
+              containerWsPath: "/ws/container-preview",
+              previewAssertion: assertion,
+            },
+          ),
+        logger: rootLogger.child({ subsys: "commercial", module: "containerPreviewBridge" }),
+      });
       // eslint-disable-next-line no-console
-      console.log('[commercial] V5 container web preview ENABLED')
+      console.log("[commercial] V5 container web preview ENABLED");
     } catch (err) {
       // Ticket issuance remains fail-closed through containerPreviewAvailable.
-      rootLogger.error('[commercial] container web preview disabled', {
+      rootLogger.error("[commercial] container web preview disabled", {
         error: (err as Error)?.message ?? String(err),
-      })
+      });
     }
   }
+
 
   // ─── wechat codex(gpt-*)turn:api_relay 路由 + 真扣费 ─────────────────────
   // 接收侧插槽:wechat/inboundDispatcher.prepareCodexTurn / outboundReceiver.handleCodexBilling。
   // v5 计费口径(M1b):finalizer 走双钱包 settle;usage_records.account_id=NULL;
   // session_id=deriveEngineSessionId 口径;cost 回执走 appendCostCreditsForUser
   // (c:<uid> 前缀对齐 session 存储命名空间 —— v3 旧版直调 appendCostCredits 是孤儿成本 bug)。
-  const CODEX_PRECHECK_TOKEN_ESTIMATE = 64_000
-  const DEFAULT_CODEX_SESSION_MAX_MS = 600_000
+  const CODEX_PRECHECK_TOKEN_ESTIMATE = 64_000;
+  const DEFAULT_CODEX_SESSION_MAX_MS = 600_000;
   const readCodexSessionMaxMs = (): number => {
-    const raw = process.env.CODEX_SESSION_MAX_MS
-    if (!raw) return DEFAULT_CODEX_SESSION_MAX_MS
-    const n = Number(raw)
-    return Number.isFinite(n) && n >= 1000 ? n : DEFAULT_CODEX_SESSION_MAX_MS
-  }
-  const newCodexRequestId = (): string => randomBytes(16).toString('hex')
-  const codexRouteLog = rootLogger.child({ subsys: 'commercial', module: 'codexRoute' })
+    const raw = process.env.CODEX_SESSION_MAX_MS;
+    if (!raw) return DEFAULT_CODEX_SESSION_MAX_MS;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 1000 ? n : DEFAULT_CODEX_SESSION_MAX_MS;
+  };
+  const newCodexRequestId = (): string => randomBytes(16).toString("hex");
+  const codexRouteLog = rootLogger.child({ subsys: "commercial", module: "codexRoute" });
 
   // M2 — 网页(bridge)codex turn 的 per-turn 路由决策(与 wechat 版差异:bridge
   // 需要 api_relay / official_oauth / unavailable 判别联合,由 bridge 决定占槽
   // 还是 fast-fail;wechat 只走 api_relay)。恢复源 = P1f^ 同名函数,零语义改动。
-  const createCommercialCodexRoute = async ({
-    containerId,
-    userId,
-    modelId,
-    sessionId,
-  }: {
-    containerId: number
-    userId: bigint
-    modelId: string
-    sessionId?: string
+  const createCommercialCodexRoute = async ({ containerId, userId, modelId, sessionId }: {
+    containerId: number;
+    userId: bigint;
+    modelId: string;
+    sessionId?: string;
   }) => {
     if (isGrokEngineModel(modelId)) {
-      return allocateGrokRelayRoute({ containerId, userId, modelId, sessionId })
+      return allocateGrokRelayRoute({ containerId, userId, modelId, sessionId });
     }
-    const groups = await listEnabledGroupsForModel({ modelId, provider: 'codex' })
-    if (groups.length === 0) return null
+    const groups = await listEnabledGroupsForModel({ modelId, provider: "codex" });
+    if (groups.length === 0) return null;
     for (const group of groups) {
-      if (group.kind === 'api_relay') {
+      if (group.kind === "api_relay") {
         const route = await createCodexRouteContextForModel({
           containerId,
           userId,
           modelId,
           groupId: group.id,
-        })
-        if (!route) continue
+        });
+        if (!route) continue;
         return {
-          kind: 'api_relay' as const,
-          engine: 'codex' as const,
+          kind: "api_relay" as const,
+          engine: "codex" as const,
           token: route.token,
           baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v3/codex-relay/route/${route.token}`,
           modelProvider: route.credential.model_provider,
@@ -4769,148 +4628,142 @@ export async function registerCommercial(
           disableResponseStorage: route.credential.disable_response_storage,
           groupId: route.group.id.toString(),
           credentialId: route.credential.id.toString(),
-        }
+        };
       }
-      if (group.kind === 'official_oauth') {
-        const hasAccount = await hasActiveOfficialOAuthAccountInGroup(group.id, 'codex')
-        if (!hasAccount) continue
-        return { kind: 'official_oauth' as const, groupId: group.id.toString() }
+      if (group.kind === "official_oauth") {
+        const hasAccount = await hasActiveOfficialOAuthAccountInGroup(group.id, "codex");
+        if (!hasAccount) continue;
+        return { kind: "official_oauth" as const, groupId: group.id.toString() };
       }
     }
-    return { kind: 'unavailable' as const, reason: 'no usable enabled Codex group' }
-  }
-  commercialCodexRouteRef.current = (args) => createCommercialCodexRoute(args)
+    return { kind: "unavailable" as const, reason: "no usable enabled Codex group" };
+  };
+  commercialCodexRouteRef.current = (args) => createCommercialCodexRoute(args);
 
   const createWechatApiRelayRoute = async (args: {
-    containerId: number
-    userId: bigint
-    modelId: string
+    containerId: number;
+    userId: bigint;
+    modelId: string;
   }) => {
-    const groups = await listEnabledGroupsForModel({ modelId: args.modelId, provider: 'codex' })
+    const groups = await listEnabledGroupsForModel({ modelId: args.modelId, provider: "codex" });
     for (const group of groups) {
-      if (group.kind !== 'api_relay') continue
+      if (group.kind !== "api_relay") continue;
       const route = await createCodexRouteContextForModel({
         containerId: args.containerId,
         userId: args.userId,
         modelId: args.modelId,
         groupId: group.id,
-      })
-      if (!route) continue
+      });
+      if (!route) continue;
       return {
         token: route.token,
         routeFrame: {
           baseUrl: `http://127.0.0.1:${V3_CONTAINER_PORT}/internal/v3/codex-relay/route/${route.token}`,
           modelProvider: route.credential.model_provider,
           providerName: route.credential.provider_name ?? null,
-          wireApi: route.credential.wire_api ?? 'responses',
-          preferredAuthMethod: route.credential.preferred_auth_method ?? 'apikey',
+          wireApi: route.credential.wire_api ?? "responses",
+          preferredAuthMethod: route.credential.preferred_auth_method ?? "apikey",
           disableResponseStorage: route.credential.disable_response_storage ?? true,
         },
-      }
+      };
     }
-    return null
-  }
+    return null;
+  };
 
   type WechatCodexTurnSnapshot = {
-    finalizer: CodexFinalizeHandle
-    reservation: ReservationHandle
-    requestId: string
-    userId: bigint
-    containerId: number
-    model: string
-    traceId: string
-    routeToken: string
-    timeout: ReturnType<typeof setTimeout>
-  }
-  const wechatCodexTurns = new Map<string, WechatCodexTurnSnapshot>()
+    finalizer: CodexFinalizeHandle;
+    reservation: ReservationHandle;
+    requestId: string;
+    userId: bigint;
+    containerId: number;
+    model: string;
+    traceId: string;
+    routeToken: string;
+    timeout: ReturnType<typeof setTimeout>;
+  };
+  const wechatCodexTurns = new Map<string, WechatCodexTurnSnapshot>();
 
   const expireCodexRouteToken = (token: string | null | undefined, reason: string): void => {
-    if (!token) return
+    if (!token) return;
     expireCodexRouteContext(token).catch((err) => {
-      codexRouteLog.warn('expire_codex_route_failed', {
+      codexRouteLog.warn("expire_codex_route_failed", {
         reason,
         errMessage: (err as Error)?.message ?? String(err),
-      })
-    })
-  }
+      });
+    });
+  };
 
   const failWechatCodexTurn = async (requestId: string, reason: string): Promise<void> => {
-    const snap = wechatCodexTurns.get(requestId)
-    if (!snap) return
-    wechatCodexTurns.delete(requestId)
-    clearTimeout(snap.timeout)
-    const failureCode: JournalFailureCode =
-      reason === 'wechat_container_cold_start'
-        ? 'UPSTREAM_UNAVAILABLE'
-        : reason.startsWith('wechat_container_rejected_') ||
-            reason === 'wechat_container_terminal_before_start'
-          ? 'UPSTREAM_REJECTED'
-          : 'INTERNAL_ERROR'
+    const snap = wechatCodexTurns.get(requestId);
+    if (!snap) return;
+    wechatCodexTurns.delete(requestId);
+    clearTimeout(snap.timeout);
+    const failureCode: JournalFailureCode = reason === "wechat_container_cold_start"
+      ? "UPSTREAM_UNAVAILABLE"
+      : reason.startsWith("wechat_container_rejected_")
+          || reason === "wechat_container_terminal_before_start"
+        ? "UPSTREAM_REJECTED"
+        : "INTERNAL_ERROR";
     try {
-      await snap.finalizer.fail(reason, failureCode)
+      await snap.finalizer.fail(reason, failureCode);
     } finally {
-      expireCodexRouteToken(snap.routeToken, reason)
+      expireCodexRouteToken(snap.routeToken, reason);
     }
-  }
+  };
 
   const expireWechatCodexRecoverySnapshot = async (requestId: string): Promise<void> => {
-    const snap = wechatCodexTurns.get(requestId)
-    if (!snap) return
-    wechatCodexTurns.delete(requestId)
-    clearTimeout(snap.timeout)
+    const snap = wechatCodexTurns.get(requestId);
+    if (!snap) return;
+    wechatCodexTurns.delete(requestId);
+    clearTimeout(snap.timeout);
     // This is only an in-memory retention timeout, not a billing decision.
     // Keep the durable journal inflight indefinitely; a delayed fsynced frame
     // can reconstruct settlement after any master restart.
-    await releasePreCheck(preCheckRedis, snap.reservation).catch(() => {})
-    expireCodexRouteToken(snap.routeToken, 'wechat_codex_snapshot_expired')
-  }
+    await releasePreCheck(preCheckRedis, snap.reservation).catch(() => {});
+    expireCodexRouteToken(snap.routeToken, "wechat_codex_snapshot_expired");
+  };
 
   const safeBillingNum = (v: unknown): number => {
-    if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) return 0
-    return Math.trunc(v)
-  }
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return 0;
+    return Math.trunc(v);
+  };
 
   const handleWechatCodexBilling = async (
     body: WechatCodexBillingBody,
     identity: { userId: number; containerId: number },
   ): Promise<void> => {
-    const pool = getPool()
+    const pool = getPool();
     const journal = await pool.query<{
-      user_id: string
-      container_id: string | null
-      ctx: unknown
+      user_id: string;
+      container_id: string | null;
+      ctx: unknown;
     }>(
       `SELECT user_id::text AS user_id, container_id::text AS container_id, ctx
          FROM request_finalize_journal WHERE request_id=$1`,
       [body.requestId],
-    )
-    const row = journal.rows[0]
-    if (!row) throw new Error(`wechat codex billing journal missing for ${body.requestId}`)
-    if (
-      row.user_id !== String(identity.userId) ||
-      row.container_id !== String(identity.containerId)
-    ) {
-      throw new Error(`wechat codex billing identity mismatch for ${body.requestId}`)
+    );
+    const row = journal.rows[0];
+    if (!row) throw new Error(`wechat codex billing journal missing for ${body.requestId}`);
+    if (row.user_id !== String(identity.userId) || row.container_id !== String(identity.containerId)) {
+      throw new Error(`wechat codex billing identity mismatch for ${body.requestId}`);
     }
-    const ctx =
-      row.ctx !== null && typeof row.ctx === 'object' && !Array.isArray(row.ctx)
-        ? (row.ctx as Record<string, unknown>)
-        : {}
-    const agentId =
-      typeof ctx.agentId === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(ctx.agentId)
-        ? ctx.agentId
-        : 'codex'
+    const ctx = row.ctx !== null && typeof row.ctx === "object" && !Array.isArray(row.ctx)
+      ? row.ctx as Record<string, unknown>
+      : {};
+    const agentId = typeof ctx.agentId === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(ctx.agentId)
+      ? ctx.agentId
+      : "codex";
     const derivedEngineSessionId = deriveEngineSessionId(
       `wechat:${identity.userId}:${identity.containerId}:${agentId}`,
-    )
-    const journalEngineSessionId =
-      typeof ctx.engineSessionId === 'string' && /^oceng-[0-9a-f]{48}$/.test(ctx.engineSessionId)
-        ? ctx.engineSessionId
-        : derivedEngineSessionId
+    );
+    const journalEngineSessionId = typeof ctx.engineSessionId === "string"
+      && /^oceng-[0-9a-f]{48}$/.test(ctx.engineSessionId)
+      ? ctx.engineSessionId
+      : derivedEngineSessionId;
     if (body.engineSessionId !== undefined && body.engineSessionId !== journalEngineSessionId) {
-      throw new Error(`wechat codex billing engine session mismatch for ${body.requestId}`)
+      throw new Error(`wechat codex billing engine session mismatch for ${body.requestId}`);
     }
-    const u = body.usage ?? {}
+    const u = body.usage ?? {};
     const billing: DurableCodexBilling = {
       requestId: body.requestId,
       ...(body.turnKey ? { turnKey: body.turnKey } : {}),
@@ -4929,110 +4782,107 @@ export async function registerCommercial(
         cache_creation_input_tokens: safeBillingNum(u.cache_creation_input_tokens),
       },
       ...(body.rateLimits !== undefined ? { rateLimits: body.rateLimits } : {}),
-    }
+    };
     try {
       await settleDurableCodexBilling(
         {
           pgPool: pool,
           preCheckRedis,
           pricing,
-          logger: rootLogger.child({ subsys: 'wechatDurableCodexBilling' }),
+          logger: rootLogger.child({ subsys: "wechatDurableCodexBilling" }),
         },
         BigInt(identity.userId),
         billing,
-      )
+      );
     } catch (err) {
-      codexRouteLog.error('wechat_codex_finalizer_commit_failed', {
+      codexRouteLog.error("wechat_codex_finalizer_commit_failed", {
         requestId: body.requestId,
         errMessage: (err as Error)?.message ?? String(err),
-      })
+      });
       // Propagate so outboundReceiver returns non-2xx and the gateway retains
       // its fsynced retry frame. Never ACK an unsettled/unknown journal.
-      throw err
+      throw err;
     }
-    const snap = wechatCodexTurns.get(body.requestId)
+    const snap = wechatCodexTurns.get(body.requestId);
     if (snap) {
-      wechatCodexTurns.delete(body.requestId)
-      clearTimeout(snap.timeout)
-      expireCodexRouteToken(snap.routeToken, 'wechat_codex_billing_settled')
+      wechatCodexTurns.delete(body.requestId);
+      clearTimeout(snap.timeout);
+      expireCodexRouteToken(snap.routeToken, "wechat_codex_billing_settled");
     }
-  }
+  };
 
   const prepareWechatCodexTurn = async (args: {
-    containerId: number
-    bindingUserId: string
-    userId: bigint
-    modelId: string
-    agentId: string
-    traceId: string
+    containerId: number;
+    bindingUserId: string;
+    userId: bigint;
+    modelId: string;
+    agentId: string;
+    traceId: string;
   }): Promise<PrepareWechatCodexTurnResult> => {
-    const route = await createWechatApiRelayRoute(args)
+    const route = await createWechatApiRelayRoute(args);
     if (!route) {
       return {
-        kind: 'unavailable',
-        reply: 'GPT 模型通道暂时不可用，请稍后再试，或发送 /model 切换到其它模型。',
-      }
+        kind: "unavailable",
+        reply: "GPT 模型通道暂时不可用，请稍后再试，或发送 /model 切换到其它模型。",
+      };
     }
 
-    const modelPricing = pricing.get(args.modelId)
+    const modelPricing = pricing.get(args.modelId);
     if (!modelPricing) {
-      expireCodexRouteToken(route.token, 'wechat_codex_pricing_missing')
-      return { kind: 'unavailable', reply: 'GPT 模型计费配置暂时不可用，请稍后再试。' }
+      expireCodexRouteToken(route.token, "wechat_codex_pricing_missing");
+      return { kind: "unavailable", reply: "GPT 模型计费配置暂时不可用，请稍后再试。" };
     }
 
-    const agentForCharge = args.agentId || 'codex'
-    let derivedPricing: ModelPricing
+    const agentForCharge = args.agentId || "codex";
+    let derivedPricing: ModelPricing;
     try {
-      const agentMul = await getAgentCostMultiplier(getPool(), agentForCharge)
+      const agentMul = await getAgentCostMultiplier(getPool(), agentForCharge);
       derivedPricing = {
         ...modelPricing,
         multiplier: composeMultiplier(modelPricing.multiplier, agentMul),
-      }
+      };
     } catch (err) {
-      expireCodexRouteToken(route.token, 'wechat_codex_multiplier_failed')
-      codexRouteLog.error('wechat_codex_multiplier_failed', {
+      expireCodexRouteToken(route.token, "wechat_codex_multiplier_failed");
+      codexRouteLog.error("wechat_codex_multiplier_failed", {
         agentId: agentForCharge,
         errMessage: (err as Error)?.message ?? String(err),
-      })
-      return { kind: 'unavailable', reply: 'GPT 模型计费配置暂时不可用，请稍后再试。' }
+      });
+      return { kind: "unavailable", reply: "GPT 模型计费配置暂时不可用，请稍后再试。" };
     }
 
-    const requestId = newCodexRequestId()
-    let maxCost: bigint
+    const requestId = newCodexRequestId();
+    let maxCost: bigint;
     try {
-      maxCost = estimateMaxCost(CODEX_PRECHECK_TOKEN_ESTIMATE, derivedPricing)
+      maxCost = estimateMaxCost(CODEX_PRECHECK_TOKEN_ESTIMATE, derivedPricing);
     } catch (err) {
-      expireCodexRouteToken(route.token, 'wechat_codex_estimate_failed')
-      codexRouteLog.error('wechat_codex_estimate_failed', {
+      expireCodexRouteToken(route.token, "wechat_codex_estimate_failed");
+      codexRouteLog.error("wechat_codex_estimate_failed", {
         errMessage: (err as Error)?.message ?? String(err),
-      })
-      return { kind: 'unavailable', reply: 'GPT 模型计费配置暂时不可用，请稍后再试。' }
+      });
+      return { kind: "unavailable", reply: "GPT 模型计费配置暂时不可用，请稍后再试。" };
     }
 
-    let preCheckResult: Awaited<ReturnType<typeof preCheckWithCost>>
+    let preCheckResult: Awaited<ReturnType<typeof preCheckWithCost>>;
     try {
       preCheckResult = await preCheckWithCost(preCheckRedis, {
         userId: args.userId,
         requestId,
         maxCost,
-      })
+      });
     } catch (err) {
-      expireCodexRouteToken(route.token, 'wechat_codex_precheck_failed')
+      expireCodexRouteToken(route.token, "wechat_codex_precheck_failed");
       if (err instanceof InsufficientCreditsError) {
-        return {
-          kind: 'unavailable',
-          reply: '余额不足，请到网页端充值后再使用 GPT 模型，或发送 /model 切换其它模型。',
-        }
+        return { kind: "unavailable", reply: "余额不足，请到网页端充值后再使用 GPT 模型，或发送 /model 切换其它模型。" };
       }
-      codexRouteLog.error('wechat_codex_precheck_failed', {
+      codexRouteLog.error("wechat_codex_precheck_failed", {
         errMessage: (err as Error)?.message ?? String(err),
-      })
-      return { kind: 'unavailable', reply: 'GPT 模型计费检查暂时不可用，请稍后再试。' }
+      });
+      return { kind: "unavailable", reply: "GPT 模型计费检查暂时不可用，请稍后再试。" };
     }
 
     const engineSessionId = deriveEngineSessionId(
       `wechat:${args.bindingUserId}:${args.containerId}:${agentForCharge}`,
-    )
+    );
     try {
       const admitted = await startInflightJournal(getPool(), {
         requestId,
@@ -5043,26 +4893,26 @@ export async function registerCommercial(
         ctxJson: {
           agentId: agentForCharge,
           codexAccountId: null,
-          source: 'wechat_codex_api_relay',
+          source: "wechat_codex_api_relay",
           durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION,
           billingPricing: serializeBillingPricing(derivedPricing),
           engineSessionId,
         },
-      })
+      });
       if (!admitted) {
-        await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {})
-        expireCodexRouteToken(route.token, 'wechat_codex_journal_conflict')
-        codexRouteLog.error('wechat_codex_journal_conflict', { requestId })
-        return { kind: 'unavailable', reply: 'GPT 模型计费初始化暂时不可用，请稍后再试。' }
+        await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
+        expireCodexRouteToken(route.token, "wechat_codex_journal_conflict");
+        codexRouteLog.error("wechat_codex_journal_conflict", { requestId });
+        return { kind: "unavailable", reply: "GPT 模型计费初始化暂时不可用，请稍后再试。" };
       }
     } catch (err) {
-      await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {})
-      expireCodexRouteToken(route.token, 'wechat_codex_journal_failed')
-      codexRouteLog.error('wechat_codex_journal_failed', {
+      await releasePreCheck(preCheckRedis, preCheckResult.reservation).catch(() => {});
+      expireCodexRouteToken(route.token, "wechat_codex_journal_failed");
+      codexRouteLog.error("wechat_codex_journal_failed", {
         requestId,
         errMessage: (err as Error)?.message ?? String(err),
-      })
-      return { kind: 'unavailable', reply: 'GPT 模型计费初始化暂时不可用，请稍后再试。' }
+      });
+      return { kind: "unavailable", reply: "GPT 模型计费初始化暂时不可用，请稍后再试。" };
     }
 
     const finalizer = makeCodexFinalizer({
@@ -5077,11 +4927,11 @@ export async function registerCommercial(
       model: args.modelId,
       derivedPricing,
       reservation: preCheckResult.reservation,
-    })
+    });
     const timeout = setTimeout(() => {
-      void expireWechatCodexRecoverySnapshot(requestId)
-    }, readCodexSessionMaxMs())
-    timeout.unref?.()
+      void expireWechatCodexRecoverySnapshot(requestId);
+    }, readCodexSessionMaxMs());
+    timeout.unref?.();
     wechatCodexTurns.set(requestId, {
       finalizer,
       reservation: preCheckResult.reservation,
@@ -5092,47 +4942,51 @@ export async function registerCommercial(
       traceId: args.traceId,
       routeToken: route.token,
       timeout,
-    })
+    });
 
-    return { kind: 'ready', requestId, routeFrame: route.routeFrame }
-  }
+    return { kind: "ready", requestId, routeFrame: route.routeFrame };
+  };
 
   // ─── Auto-Dream V2 optimizer: master-owned policy, actions and reporting ──
   type AutoDreamCodexSnapshot = {
-    reservation: ReservationHandle
-    finalizer: CodexFinalizeHandle
-    routeToken: string | null
-    userId: bigint
-    containerId: number
-    engineSessionId: string
-    timeout: NodeJS.Timeout
-  }
-  const autoDreamCodexTurns = new Map<string, AutoDreamCodexSnapshot>()
+    reservation: ReservationHandle;
+    finalizer: CodexFinalizeHandle;
+    routeToken: string | null;
+    userId: bigint;
+    containerId: number;
+    engineSessionId: string;
+    timeout: NodeJS.Timeout;
+  };
+  const autoDreamCodexTurns = new Map<string, AutoDreamCodexSnapshot>();
 
   const requireAutoDreamString = (
     body: Record<string, unknown>,
     key: string,
     re: RegExp,
   ): string => {
-    const value = body[key]
-    if (typeof value !== 'string' || !re.test(value)) {
-      throw new Error(`AUTO_DREAM_INVALID_${key.toUpperCase()}`)
+    const value = body[key];
+    if (typeof value !== "string" || !re.test(value)) {
+      throw new Error(`AUTO_DREAM_INVALID_${key.toUpperCase()}`);
     }
-    return value
-  }
+    return value;
+  };
 
   autoDreamOptimizerRuntimeRef.current = {
     handle: async ({ path, identity, body }) => {
-      const userId = BigInt(identity.userId)
+      const userId = BigInt(identity.userId);
       if (path === AUTO_DREAM_OPTIMIZER_ADMIT_PATH) {
-        const runId = requireAutoDreamString(body, 'runId', /^[0-9a-f-]{36}$/)
-        const callId = requireAutoDreamString(body, 'callId', /^[0-9a-f-]{36}:\d{1,8}$/)
-        const agentId = requireAutoDreamString(body, 'agentId', /^[A-Za-z0-9_-]{1,64}$/)
-        const model = requireAutoDreamString(body, 'model', /^gpt-5\.6-terra$/)
-        const { getAutoDreamPolicy } = await import('./user/autoDream.js')
-        const policy = await getAutoDreamPolicy(userId)
-        if (!policy.enabled || policy.mode !== 'optimizer_v2' || policy.modelId !== model) {
-          throw new Error('AUTO_DREAM_INVALID_POLICY')
+        const runId = requireAutoDreamString(body, "runId", /^[0-9a-f-]{36}$/);
+        const callId = requireAutoDreamString(body, "callId", /^[0-9a-f-]{36}:\d{1,8}$/);
+        const agentId = requireAutoDreamString(body, "agentId", /^[A-Za-z0-9_-]{1,64}$/);
+        const model = requireAutoDreamString(body, "model", /^gpt-5\.6-terra$/);
+        const { getAutoDreamPolicy } = await import("./user/autoDream.js");
+        const policy = await getAutoDreamPolicy(userId);
+        if (
+          !policy.enabled ||
+          policy.mode !== "optimizer_v2" ||
+          policy.modelId !== model
+        ) {
+          throw new Error("AUTO_DREAM_INVALID_POLICY");
         }
         const route = projectAutoDreamCodexRoute(
           await createCommercialCodexRoute({
@@ -5140,30 +4994,30 @@ export async function registerCommercial(
             userId,
             modelId: model,
           }),
-        )
-        if (!route) throw new Error('AUTO_DREAM_ROUTE_UNAVAILABLE')
-        const basePricing = pricing.get(model)
+        );
+        if (!route) throw new Error("AUTO_DREAM_ROUTE_UNAVAILABLE");
+        const basePricing = pricing.get(model);
         if (!basePricing) {
-          expireCodexRouteToken(route.token, 'auto_dream_pricing_missing')
-          throw new Error('AUTO_DREAM_PRICING_UNAVAILABLE')
+          expireCodexRouteToken(route.token, "auto_dream_pricing_missing");
+          throw new Error("AUTO_DREAM_PRICING_UNAVAILABLE");
         }
-        const agentMul = await getAgentCostMultiplier(getPool(), agentId)
+        const agentMul = await getAgentCostMultiplier(getPool(), agentId);
         const derivedPricing: ModelPricing = {
           ...basePricing,
           multiplier: composeMultiplier(basePricing.multiplier, agentMul),
-        }
-        const requestId = newCodexRequestId()
-        const maxCost = estimateMaxCost(CODEX_PRECHECK_TOKEN_ESTIMATE, derivedPricing)
-        let precheck: Awaited<ReturnType<typeof preCheckWithCost>>
+        };
+        const requestId = newCodexRequestId();
+        const maxCost = estimateMaxCost(CODEX_PRECHECK_TOKEN_ESTIMATE, derivedPricing);
+        let precheck: Awaited<ReturnType<typeof preCheckWithCost>>;
         try {
-          precheck = await preCheckWithCost(preCheckRedis, { userId, requestId, maxCost })
+          precheck = await preCheckWithCost(preCheckRedis, { userId, requestId, maxCost });
         } catch (err) {
-          expireCodexRouteToken(route.token, 'auto_dream_precheck_failed')
-          throw err
+          expireCodexRouteToken(route.token, "auto_dream_precheck_failed");
+          throw err;
         }
         const engineSessionId = deriveEngineSessionId(
           `auto-dream:${identity.userId}:${identity.containerId}:${agentId}`,
-        )
+        );
         try {
           const admitted = await startInflightJournal(getPool(), {
             requestId,
@@ -5175,17 +5029,17 @@ export async function registerCommercial(
               agentId,
               runId,
               callId,
-              source: 'auto_dream_optimizer',
+              source: "auto_dream_optimizer",
               durableBillingRecovery: DURABLE_CODEX_RECOVERY_VERSION,
               billingPricing: serializeBillingPricing(derivedPricing),
               engineSessionId,
             },
-          })
-          if (!admitted) throw new Error('AUTO_DREAM_JOURNAL_CONFLICT')
+          });
+          if (!admitted) throw new Error("AUTO_DREAM_JOURNAL_CONFLICT");
         } catch (err) {
-          await releasePreCheck(preCheckRedis, precheck.reservation).catch(() => {})
-          expireCodexRouteToken(route.token, 'auto_dream_journal_failed')
-          throw err
+          await releasePreCheck(preCheckRedis, precheck.reservation).catch(() => {});
+          expireCodexRouteToken(route.token, "auto_dream_journal_failed");
+          throw err;
         }
         const finalizer = makeCodexFinalizer({
           pgPool: getPool(),
@@ -5196,15 +5050,15 @@ export async function registerCommercial(
           model,
           derivedPricing,
           reservation: precheck.reservation,
-        })
+        });
         const timeout = setTimeout(() => {
-          const live = autoDreamCodexTurns.get(requestId)
-          if (!live) return
-          autoDreamCodexTurns.delete(requestId)
-          expireCodexRouteToken(live.routeToken, 'auto_dream_admission_expired')
-          void releasePreCheck(preCheckRedis, live.reservation).catch(() => {})
-        }, readCodexSessionMaxMs())
-        timeout.unref?.()
+          const live = autoDreamCodexTurns.get(requestId);
+          if (!live) return;
+          autoDreamCodexTurns.delete(requestId);
+          expireCodexRouteToken(live.routeToken, "auto_dream_admission_expired");
+          void releasePreCheck(preCheckRedis, live.reservation).catch(() => {});
+        }, readCodexSessionMaxMs());
+        timeout.unref?.();
         autoDreamCodexTurns.set(requestId, {
           reservation: precheck.reservation,
           finalizer,
@@ -5213,27 +5067,27 @@ export async function registerCommercial(
           containerId: identity.containerId,
           engineSessionId,
           timeout,
-        })
+        });
         return {
           requestId,
           engineSessionId,
           routeFrame: route.routeFrame,
-        }
+        };
       }
       if (path === AUTO_DREAM_OPTIMIZER_FINDINGS_PATH) {
-        const runId = requireAutoDreamString(body, 'runId', /^[0-9a-f-]{36}$/)
-        const agentId = requireAutoDreamString(body, 'agentId', /^[A-Za-z0-9_-]{1,64}$/)
-        const { getAutoDreamPolicy } = await import('./user/autoDream.js')
-        const policy = await getAutoDreamPolicy(userId)
-        if (!policy.enabled || policy.mode !== 'optimizer_v2') {
-          throw new Error('AUTO_DREAM_INVALID_POLICY')
+        const runId = requireAutoDreamString(body, "runId", /^[0-9a-f-]{36}$/);
+        const agentId = requireAutoDreamString(body, "agentId", /^[A-Za-z0-9_-]{1,64}$/);
+        const { getAutoDreamPolicy } = await import("./user/autoDream.js");
+        const policy = await getAutoDreamPolicy(userId);
+        if (!policy.enabled || policy.mode !== "optimizer_v2") {
+          throw new Error("AUTO_DREAM_INVALID_POLICY");
         }
-        const pseudonymKey = loadKmsKey()
+        const pseudonymKey = loadKmsKey();
         try {
           return await reportAutoDreamPlatformFindings(getPool(), {
-            subjectHash: createHmac('sha256', jwtSecret)
+            subjectHash: createHmac("sha256", jwtSecret)
               .update(`auto-dream-platform-finding-user\0${identity.userId}`)
-              .digest('hex'),
+              .digest("hex"),
             agentId,
             runId,
             model: policy.modelId,
@@ -5241,72 +5095,80 @@ export async function registerCommercial(
             rawFindings: body.rawFindings,
             trafficClass: await getUserSignalTrafficClass(identity.userId, getPool()),
             pseudonymKey,
-          })
+          });
         } finally {
-          zeroBuffer(pseudonymKey)
+          zeroBuffer(pseudonymKey);
         }
       }
       if (path === AUTO_DREAM_OPTIMIZER_ACTION_PATH) {
-        const action = requireAutoDreamString(body, 'action', /^preference\.patch$/)
-        void action
+        const action = requireAutoDreamString(body, "action", /^preference\.patch$/);
+        void action;
         return await applyAutoDreamPreferenceAction(getPool(), {
           userId: identity.userId,
-          proposalId: requireAutoDreamString(body, 'proposalId', /^[0-9a-f]{32}$/),
-          targetId: requireAutoDreamString(body, 'targetId', /^preferences\.[a-z_]{1,64}$/),
-          beforeFingerprint: requireAutoDreamString(body, 'beforeFingerprint', /^[0-9a-f]{64}$/),
+          proposalId: requireAutoDreamString(body, "proposalId", /^[0-9a-f]{32}$/),
+          targetId: requireAutoDreamString(
+            body,
+            "targetId",
+            /^preferences\.[a-z_]{1,64}$/,
+          ),
+          beforeFingerprint: requireAutoDreamString(
+            body,
+            "beforeFingerprint",
+            /^[0-9a-f]{64}$/,
+          ),
           after:
-            typeof body.after === 'string' && body.after.length <= 32_000
+            typeof body.after === "string" && body.after.length <= 32_000
               ? body.after
               : (() => {
-                  throw new Error('AUTO_DREAM_INVALID_AFTER')
+                  throw new Error("AUTO_DREAM_INVALID_AFTER");
                 })(),
-        })
+        });
       }
 
-      const requestId = requireAutoDreamString(body, 'requestId', /^[0-9a-f]{32}$/)
+      const requestId = requireAutoDreamString(body, "requestId", /^[0-9a-f]{32}$/);
       const journal = await getPool().query<{
-        user_id: string
-        container_id: string | null
-        ctx: Record<string, unknown> | null
+        user_id: string;
+        container_id: string | null;
+        ctx: Record<string, unknown> | null;
       }>(
         `SELECT user_id::text,container_id::text,ctx
            FROM request_finalize_journal WHERE request_id=$1`,
         [requestId],
-      )
-      const journalRow = journal.rows[0]
+      );
+      const journalRow = journal.rows[0];
       if (
         !journalRow ||
         journalRow.user_id !== String(identity.userId) ||
         journalRow.container_id !== String(identity.containerId) ||
-        journalRow.ctx?.source !== 'auto_dream_optimizer'
+        journalRow.ctx?.source !== "auto_dream_optimizer"
       ) {
-        throw new Error('AUTO_DREAM_INVALID_JOURNAL_IDENTITY')
+        throw new Error("AUTO_DREAM_INVALID_JOURNAL_IDENTITY");
       }
 
       if (path === AUTO_DREAM_OPTIMIZER_SETTLE_PATH) {
         const usage =
-          body.usage && typeof body.usage === 'object' && !Array.isArray(body.usage)
-            ? (body.usage as Record<string, unknown>)
-            : {}
+          body.usage && typeof body.usage === "object" && !Array.isArray(body.usage)
+            ? body.usage as Record<string, unknown>
+            : {};
         const safe = (value: unknown): number =>
-          typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.trunc(value) : 0
-        const status = body.status === 'success' ? 'success' : 'error'
+          typeof value === "number" && Number.isFinite(value) && value > 0
+            ? Math.trunc(value)
+            : 0;
+        const status = body.status === "success" ? "success" : "error";
         await settleDurableCodexBilling(
           {
             pgPool: getPool(),
             preCheckRedis,
             pricing,
-            logger: rootLogger.child({ subsys: 'autoDreamDurableCodexBilling' }),
+            logger: rootLogger.child({ subsys: "autoDreamDurableCodexBilling" }),
           },
           userId,
           {
             requestId,
             engineSessionId:
-              typeof journalRow.ctx.engineSessionId === 'string'
+              typeof journalRow.ctx.engineSessionId === "string"
                 ? journalRow.ctx.engineSessionId
-                : deriveEngineSessionId(
-                    `auto-dream:${identity.userId}:${identity.containerId}:main`,
-                  ),
+                : deriveEngineSessionId(`auto-dream:${identity.userId}:${identity.containerId}:main`),
             status,
             durationMs: safe(body.durationMs),
             usage: {
@@ -5316,53 +5178,58 @@ export async function registerCommercial(
               cache_read_input_tokens: safe(usage.cache_read_input_tokens),
               cache_creation_input_tokens: safe(usage.cache_creation_input_tokens),
             },
-            ...(body.terminalCode === 'USER_CANCELLED' || body.terminalCode === 'CODEX_ERROR'
+            ...(body.terminalCode === "USER_CANCELLED" || body.terminalCode === "CODEX_ERROR"
               ? { terminalCode: body.terminalCode }
               : {}),
             ...(body.rateLimits !== undefined ? { rateLimits: body.rateLimits as any } : {}),
           },
-        )
-        const live = autoDreamCodexTurns.get(requestId)
+        );
+        const live = autoDreamCodexTurns.get(requestId);
         if (live) {
-          autoDreamCodexTurns.delete(requestId)
-          clearTimeout(live.timeout)
-          expireCodexRouteToken(live.routeToken, 'auto_dream_billing_settled')
+          autoDreamCodexTurns.delete(requestId);
+          clearTimeout(live.timeout);
+          expireCodexRouteToken(live.routeToken, "auto_dream_billing_settled");
         }
-        return { settled: true }
+        return { settled: true };
       }
       if (path === AUTO_DREAM_OPTIMIZER_ABANDON_PATH) {
-        const live = autoDreamCodexTurns.get(requestId)
+        const live = autoDreamCodexTurns.get(requestId);
         if (live) {
-          autoDreamCodexTurns.delete(requestId)
-          clearTimeout(live.timeout)
+          autoDreamCodexTurns.delete(requestId);
+          clearTimeout(live.timeout);
           try {
-            await live.finalizer.fail('auto_dream_abandoned', 'INTERNAL_ERROR')
+            await live.finalizer.fail("auto_dream_abandoned", "INTERNAL_ERROR");
           } finally {
-            expireCodexRouteToken(live.routeToken, 'auto_dream_abandoned')
+            expireCodexRouteToken(live.routeToken, "auto_dream_abandoned");
           }
         } else {
-          const { abortInflightJournal } = await import('./billing/proxyBilling.js')
-          await abortInflightJournal(getPool(), requestId, 'auto_dream_abandoned', 'INTERNAL_ERROR')
+          const { abortInflightJournal } = await import("./billing/proxyBilling.js");
+          await abortInflightJournal(
+            getPool(),
+            requestId,
+            "auto_dream_abandoned",
+            "INTERNAL_ERROR",
+          );
           await releasePreCheck(preCheckRedis, {
             userId: String(identity.userId),
             requestId,
-          }).catch(() => {})
+          }).catch(() => {});
         }
-        return { abandoned: true }
+        return { abandoned: true };
       }
-      throw new Error('AUTO_DREAM_INVALID_PATH')
+      throw new Error("AUTO_DREAM_INVALID_PATH");
     },
-  }
+  };
 
   // ─── V5 QQ Official Bot ────────────────────────────────────────────────
   // One platform bot is owned by the LeaderBundle.  HTTP binding/internal
   // receivers remain stateless on both slots and write the shared PG tables;
   // only the leader owns Tencent's gateway connection and outbox sends.
-  const qqConfig = readQqBotConfig(process.env)
-  let qqBotService: QqBotService | undefined
+  const qqConfig = readQqBotConfig(process.env);
+  let qqBotService: QqBotService | undefined;
   if (qqConfig) {
     if (!bridgeSecret) {
-      throw new Error('QQ Bot is configured but the container bridge secret is unavailable')
+      throw new Error("QQ Bot is configured but the container bridge secret is unavailable");
     }
     const qqDispatcher = makeInboundDispatcher({
       pgPool: getPool(),
@@ -5372,37 +5239,41 @@ export async function registerCommercial(
       fallbackDockerEnsure: dockerEnsureRunning,
       bridgeSecret,
       resolveModel: async (bindingUserId) => {
-        const uid = BigInt(bindingUserId)
-        const [prefs, authz] = await Promise.all([getPreferences(uid), loadUserModelAuthz(uid)])
+        const uid = BigInt(bindingUserId);
+        const [prefs, authz] = await Promise.all([
+          getPreferences(uid),
+          loadUserModelAuthz(uid),
+        ]);
         return pickWechatInboundModel({
           preferredModel: prefs.prefs.default_model,
           visibleModels: pricing.listForUser(authz),
           canUseModel: (modelId) => canUseModel({ pricing }, { ...authz, modelId }),
           allowedModels: ALLOWED_INBOUND_MODELS,
-        })
+        });
       },
       prepareCodexTurn: prepareWechatCodexTurn,
       failCodexTurn: failWechatCodexTurn,
       upsertMasterClientSession,
       softDeleteMasterSession: async (sessionId, userId) => {
-        await softDeleteMasterSession(sessionId, userId)
+        await softDeleteMasterSession(sessionId, userId);
       },
       transport: makeNodeHttpContainerTransport(),
       channel: qqInboundChannelProfile(),
-    })
-    const resolveQqOutboundMedia = userMediaResolver
-      ? makeQqOutboundMediaResolver({
-          resolveUserMediaDirs: userMediaResolver,
-          pullRemoteHostMedia: async (args) => {
-            const target = await resolveServiceableHostTarget(args.hostUuid)
-            try {
-              return await nodeAgentGetFile(target, args.remotePath)
-            } finally {
-              target.psk?.fill(0)
-            }
-          },
-        })
-      : undefined
+    });
+    const resolveQqOutboundMedia =
+      userMediaResolver
+        ? makeQqOutboundMediaResolver({
+            resolveUserMediaDirs: userMediaResolver,
+            pullRemoteHostMedia: async (args) => {
+              const target = await resolveServiceableHostTarget(args.hostUuid);
+              try {
+                return await nodeAgentGetFile(target, args.remotePath);
+              } finally {
+                target.psk?.fill(0);
+              }
+            },
+          })
+        : undefined;
     qqBotService = makeQqBotService({
       pool: getPool(),
       config: qqConfig,
@@ -5417,41 +5288,45 @@ export async function registerCommercial(
           : undefined,
       resolveOutboundMedia: resolveQqOutboundMedia,
       handleModelCommand: async (bindingUserId, text) => {
-        const uid = BigInt(bindingUserId)
-        const [prefs, authz] = await Promise.all([getPreferences(uid), loadUserModelAuthz(uid)])
+        const uid = BigInt(bindingUserId);
+        const [prefs, authz] = await Promise.all([
+          getPreferences(uid),
+          loadUserModelAuthz(uid),
+        ]);
         return await handleWechatModelCommand({
           text,
-          channelName: 'QQ',
+          channelName: "QQ",
           preferredModel: prefs.prefs.default_model,
           visibleModels: pricing.listForUser(authz),
-          canUseModel: (modelId) => canUseModel({ pricing }, { ...authz, modelId }),
+          canUseModel: (modelId) =>
+            canUseModel({ pricing }, { ...authz, modelId }),
           allowedModels: ALLOWED_INBOUND_MODELS,
           setDefaultModel: async (modelId) => {
-            await patchPreferences(uid, { default_model: modelId })
+            await patchPreferences(uid, { default_model: modelId });
           },
-        })
+        });
       },
-    })
-    const qqIdentityRepo = createPgIdentityRepo()
+    });
+    const qqIdentityRepo = createPgIdentityRepo();
     qqOutboundRef.current = makeQqOutboundReceiver({
       pool: getPool(),
       identityRepo: qqIdentityRepo,
       handleCodexBilling: handleWechatCodexBilling,
       onQueued: () => qqBotService?.kickOutbox(),
-    })
+    });
     qqProactiveRef.current = makeQqProactiveReceiver({
       pool: getPool(),
       identityRepo: qqIdentityRepo,
       onQueued: () => qqBotService?.kickOutbox(),
-    })
+    });
     leaderBundle.add({
-      name: 'qqBot',
-      domain: 'shared',
+      name: "qqBot",
+      domain: "shared",
       start: async () => {
-        await qqBotService!.start()
-        return { stop: () => qqBotService!.stop() }
+        await qqBotService!.start();
+        return { stop: () => qqBotService!.stop() };
       },
-    })
+    });
   }
 
   // ─── P1.7 slice 7c — WeChat broker 装配 ───────────────────────────────────
@@ -5465,7 +5340,7 @@ export async function registerCommercial(
   // (没装就没 onInbound 也没 outboundHandler),所以 callback 直接 () => true。
   // 这样后续若加 ConfigService 热重载,把 callback 换成 ConfigService.get 即可,
   // 不动 broker.ts。
-  let wechatBroker: WechatBroker | undefined
+  let wechatBroker: WechatBroker | undefined;
   // controlPlaneEnabled 纳入:broker 启动 outbox worker/reconcile/housekeeping(写 wechat_outbox /
   // soft-delete session / 发 iLink)属共享-state mutator,v5 follower 必须静默。
   // 【P3 MINOR 3 收口债】wechatBroker 目前以 controlPlaneEnabled 静态 gate + eager start(未纳入
@@ -5476,24 +5351,25 @@ export async function registerCommercial(
   if (controlPlaneEnabled && cfg.WECHAT_BROKER_ENABLED && bridgeSecret) {
     // ─ 依赖装配(自下而上):transport → dispatcher → outboundReceiver →
     //   sendText → broker
-    const wechatLog = rootLogger.child({ subsys: 'wechatBrokerAssembly' })
-    const containerTransport = makeNodeHttpContainerTransport()
-    const ilinkSendText = makeIlinkSendAdapter()
-    const ilinkSendMedia = makeIlinkSendMediaAdapter()
-    const resolveWechatOutboundMedia = userMediaResolver
-      ? makeWechatOutboundMediaResolver({
-          resolveUserMediaDirs: userMediaResolver,
-          pullRemoteHostMedia: async (args) => {
-            // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒。
-            const target = await resolveServiceableHostTarget(args.hostUuid)
-            try {
-              return await nodeAgentGetFile(target, args.remotePath)
-            } finally {
-              target.psk?.fill(0)
-            }
-          },
-        })
-      : undefined
+    const wechatLog = rootLogger.child({ subsys: "wechatBrokerAssembly" });
+    const containerTransport = makeNodeHttpContainerTransport();
+    const ilinkSendText = makeIlinkSendAdapter();
+    const ilinkSendMedia = makeIlinkSendMediaAdapter();
+    const resolveWechatOutboundMedia =
+      userMediaResolver
+        ? makeWechatOutboundMediaResolver({
+            resolveUserMediaDirs: userMediaResolver,
+            pullRemoteHostMedia: async (args) => {
+              // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒。
+              const target = await resolveServiceableHostTarget(args.hostUuid);
+              try {
+                return await nodeAgentGetFile(target, args.remotePath);
+              } finally {
+                target.psk?.fill(0);
+              }
+            },
+          })
+        : undefined;
 
     const inboundDispatcher = makeInboundDispatcher({
       pgPool: getPool(),
@@ -5502,15 +5378,19 @@ export async function registerCommercial(
       fallbackDockerEnsure: dockerEnsureRunning,
       bridgeSecret,
       resolveModel: async (bindingUserId) => {
-        const uid = BigInt(bindingUserId)
-        const [prefs, authz] = await Promise.all([getPreferences(uid), loadUserModelAuthz(uid)])
+        const uid = BigInt(bindingUserId);
+        const [prefs, authz] = await Promise.all([
+          getPreferences(uid),
+          loadUserModelAuthz(uid),
+        ]);
 
         return pickWechatInboundModel({
           preferredModel: prefs.prefs.default_model,
           visibleModels: pricing.listForUser(authz),
-          canUseModel: (modelId) => canUseModel({ pricing }, { ...authz, modelId }),
+          canUseModel: (modelId) =>
+            canUseModel({ pricing }, { ...authz, modelId }),
           allowedModels: ALLOWED_INBOUND_MODELS,
-        })
+        });
       },
       prepareCodexTurn: prepareWechatCodexTurn,
       failCodexTurn: failWechatCodexTurn,
@@ -5519,20 +5399,20 @@ export async function registerCommercial(
       // dispatcher Step 2b 失败 + broker reconcile 共用同一个 soft-delete
       // (返 boolean,broker.softDeleteMasterSession 期待 Promise<void> — 包一层吞掉返回值)
       softDeleteMasterSession: async (sessionId, userId) => {
-        await softDeleteMasterSession(sessionId, userId)
+        await softDeleteMasterSession(sessionId, userId);
       },
       transport: containerTransport,
-    })
+    });
 
-    const identityRepo = createPgIdentityRepo()
-    const rateLimitRedis = wrapIoredis(redis)
-    void rateLimitRedis // P1 占位:noop limiter;P3 真实滑窗时切回 rateLimitRedis 依赖
+    const identityRepo = createPgIdentityRepo();
+    const rateLimitRedis = wrapIoredis(redis);
+    void rateLimitRedis; // P1 占位:noop limiter;P3 真实滑窗时切回 rateLimitRedis 依赖
     const outboundReceiver = makeOutboundReceiverHandler({
       identityRepo,
       pool: getPool(),
       rateLimiter: createNoopRateLimiter(),
       handleCodexBilling: handleWechatCodexBilling,
-    })
+    });
 
     // 主动微信投递接收点 —— 权威解析收件人(senderId = binding.loginUserId),
     // 不接受 body 指定收件人。绑微信默认开(prefs.wechat_proactive_push !== false)。
@@ -5543,93 +5423,93 @@ export async function registerCommercial(
         // SQLite wechat_bindings.user_id 是 `c:<digit>`(MASTER_USER_PREFIX),而容器身份
         // bindingUserId 是裸数字 —— 与 outboxWorker.getBinding(MASTER_USER_PREFIX + …) 同源约定。
         // 漏前缀会永远查不到(no_binding),且可能误命中 legacy 裸 id 行破坏 trust boundary。
-        const b = await getWechatBindingByUserId(MASTER_USER_PREFIX + bindingUserId)
-        if (!b || b.status !== 'active' || !b.loginUserId) return null
+        const b = await getWechatBindingByUserId(MASTER_USER_PREFIX + bindingUserId);
+        if (!b || b.status !== "active" || !b.loginUserId) return null;
         // loginUserId 是 wire 形态(<base64url>@im.wechat),但 contextTokens 的 key 是
         // canonical(剥后缀)。senderId 必须 canonical 才能命中 contextTokens(否则永久
         // no_context_token),且与既有 outbound 路径的 canonical senderId 一致。
-        return { senderId: canonicalWechatSenderId(b.loginUserId), contextTokens: b.contextTokens }
+        return { senderId: canonicalWechatSenderId(b.loginUserId), contextTokens: b.contextTokens };
       },
       isProactiveEnabled: async (userId) => {
-        const snap = await getPreferences(BigInt(userId))
-        return snap.prefs.wechat_proactive_push !== false
+        const snap = await getPreferences(BigInt(userId));
+        return snap.prefs.wechat_proactive_push !== false;
       },
       getSessionId: getCurrentSessionId,
-    })
+    });
 
-    wechatBroker = trackScheduler(
-      'wechatBroker',
-      'shared',
-      makeWechatBroker({
-        pgPool: getPool(),
-        dispatcher: inboundDispatcher,
-        outboundReceiver,
-        // broker reconcile 一次性读全集 wsess 行,然后内部 diff 出孤儿。
-        allMasterWsessRows,
-        softDeleteMasterSession: async (sessionId, userId) => {
-          await softDeleteMasterSession(sessionId, userId)
-        },
-        sendText: ilinkSendText,
-        sendMedia: ilinkSendMedia,
-        resolveOutboundMediaPart: resolveWechatOutboundMedia,
-        wechatLiveLinkKey,
-        wechatUxCommands: {
-          handleModelCommand: async (evt) => {
-            const uid = BigInt(evt.bindingUserId)
-            const [prefs, authz] = await Promise.all([getPreferences(uid), loadUserModelAuthz(uid)])
+    wechatBroker = trackScheduler("wechatBroker", "shared", makeWechatBroker({
+      pgPool: getPool(),
+      dispatcher: inboundDispatcher,
+      outboundReceiver,
+      // broker reconcile 一次性读全集 wsess 行,然后内部 diff 出孤儿。
+      allMasterWsessRows,
+      softDeleteMasterSession: async (sessionId, userId) => {
+        await softDeleteMasterSession(sessionId, userId);
+      },
+      sendText: ilinkSendText,
+      sendMedia: ilinkSendMedia,
+      resolveOutboundMediaPart: resolveWechatOutboundMedia,
+      wechatLiveLinkKey,
+      wechatUxCommands: {
+        handleModelCommand: async (evt) => {
+          const uid = BigInt(evt.bindingUserId);
+          const [prefs, authz] = await Promise.all([
+            getPreferences(uid),
+            loadUserModelAuthz(uid),
+          ]);
 
-            return await handleWechatModelCommand({
-              text: evt.text,
-              preferredModel: prefs.prefs.default_model,
-              visibleModels: pricing.listForUser(authz),
-              canUseModel: (modelId) => canUseModel({ pricing }, { ...authz, modelId }),
-              allowedModels: ALLOWED_INBOUND_MODELS,
-              setDefaultModel: async (modelId) => {
-                await patchPreferences(uid, { default_model: modelId })
-              },
-            })
-          },
+          return await handleWechatModelCommand({
+            text: evt.text,
+            preferredModel: prefs.prefs.default_model,
+            visibleModels: pricing.listForUser(authz),
+            canUseModel: (modelId) =>
+              canUseModel({ pricing }, { ...authz, modelId }),
+            allowedModels: ALLOWED_INBOUND_MODELS,
+            setDefaultModel: async (modelId) => {
+              await patchPreferences(uid, { default_model: modelId });
+            },
+          });
         },
-        wechatProcessVisibility: {
-          getShowToolCalls: async (bindingUserId) => {
-            const snap = await getPreferences(BigInt(bindingUserId))
-            return snap.prefs.wechat_show_tool_calls !== false
-          },
-          setShowToolCalls: async (bindingUserId, show) => {
-            await patchPreferences(BigInt(bindingUserId), {
-              wechat_show_tool_calls: show,
-            })
-          },
+      },
+      wechatProcessVisibility: {
+        getShowToolCalls: async (bindingUserId) => {
+          const snap = await getPreferences(BigInt(bindingUserId));
+          return snap.prefs.wechat_show_tool_calls !== false;
         },
-        saveWechatMedia: userMediaResolver
-          ? makeSaveWechatMediaToUserUploads({
-              resolveUserMediaDirs: userMediaResolver,
-              pushRemoteHostUpload,
-            })
-          : undefined,
-        // 读 master sqlite wechat_bindings 拿 botToken + contextTokens 给 outboxWorker。
-        // 失败 / 不存在 → 返 null,worker 该 row 走 permanent(无可恢复 token)。
-        getBinding: async (bindingUserId) => {
-          const b = await getWechatBindingByUserId(bindingUserId)
-          if (!b) return null
-          return { botToken: b.botToken, contextTokens: b.contextTokens }
+        setShowToolCalls: async (bindingUserId, show) => {
+          await patchPreferences(BigInt(bindingUserId), {
+            wechat_show_tool_calls: show,
+          });
         },
-        brokerEnabled: () => true, // 装配链已 gate 过整体开关
-      }),
-    )
-    wechatBroker.start()
-    wechatBrokerRef.current = wechatBroker
-    wechatLog.info('wechat_broker_assembled')
+      },
+      saveWechatMedia: userMediaResolver
+        ? makeSaveWechatMediaToUserUploads({
+            resolveUserMediaDirs: userMediaResolver,
+            pushRemoteHostUpload,
+          })
+        : undefined,
+      // 读 master sqlite wechat_bindings 拿 botToken + contextTokens 给 outboxWorker。
+      // 失败 / 不存在 → 返 null,worker 该 row 走 permanent(无可恢复 token)。
+      getBinding: async (bindingUserId) => {
+        const b = await getWechatBindingByUserId(bindingUserId);
+        if (!b) return null;
+        return { botToken: b.botToken, contextTokens: b.contextTokens };
+      },
+      brokerEnabled: () => true, // 装配链已 gate 过整体开关
+    }));
+    wechatBroker.start();
+    wechatBrokerRef.current = wechatBroker;
+    wechatLog.info("wechat_broker_assembled");
     // eslint-disable-next-line no-console
-    console.log('[commercial] wechat broker assembled + started')
+    console.log("[commercial] wechat broker assembled + started");
   } else {
     // eslint-disable-next-line no-console
     if (cfg.WECHAT_BROKER_ENABLED && !bridgeSecret) {
       console.warn(
-        '[commercial] WECHAT_BROKER_ENABLED=1 but bridgeSecret missing; broker NOT assembled',
-      )
+        "[commercial] WECHAT_BROKER_ENABLED=1 but bridgeSecret missing; broker NOT assembled",
+      );
     } else {
-      console.log('[commercial] wechat broker disabled (WECHAT_BROKER_ENABLED!=1)')
+      console.log("[commercial] wechat broker disabled (WECHAT_BROKER_ENABLED!=1)");
     }
   }
 
@@ -5639,16 +5519,14 @@ export async function registerCommercial(
     onBufferedBytes: (_uid, side, bytes) => observeWsBridgeBuffered(side, bytes),
     onClose: (stats) => observeWsBridgeSessionDuration(stats.cause, stats.durationMs / 1000),
     onTtft: (_uid, kind, seconds) => observeWsBridgeTtft(kind, seconds),
-  }
+  };
   // PR1:bridge 拿到 client→container 帧时刷 last_ws_activity(60s debounce)。
   // 防 idle sweep 把"长 WS 单连但持续在用"的会话误判为 idle。fire-and-forget 包到
   // 闭包里;markV3ContainerActivity 自身已 swallow 异常。无 v3Deps(单测 / mock)
   // → 不注入,bridge 退化为 PR1 之前的行为(只 ensureRunning 刷一次)。
   const markActivityForBridge = v3Deps
-    ? (cid: number) => {
-        void markV3ContainerActivity(v3Deps!, cid)
-      }
-    : undefined
+    ? (cid: number) => { void markV3ContainerActivity(v3Deps!, cid); }
+    : undefined;
 
   // plan v3 G5/G7 → M2 复活 — codex 容器绑定 / per-account 并发槽 handle。
   // 恢复源 = P1f^ 同段(byte-parity 除注释);SQL 带 runtime_channel(P1d 加固,
@@ -5665,25 +5543,25 @@ export async function registerCommercial(
   //   - release(account_id, slotId):按 slotId 精确还槽,幂等。
   //   - v3Deps 未注入(测试 / 早期 boot 路径)→ codexBinding=undefined,bridge 退化为不做并发管控
   // 闭包外 capture v3Deps 给 stale recycle fire-and-forget 路径用(必须非空)。
-  const v3DepsForCodex = v3Deps
+  const v3DepsForCodex = v3Deps;
   const codexBinding: CodexBindingHandle | undefined = v3Deps
     ? {
         async acquire(containerId: number, groupId?: string | null) {
           // tx 内做"锁 + 查 + 可能 lazy migrate / stale recycle";acquire slot / 容器 rm 在 tx 外
           type AcquireResult =
-            | { kind: 'active'; account_id: bigint }
-            | { kind: 'stale'; containerInternalId: string | null; hostUuid: string | null }
-            | null
-          const desiredGroupId = groupId ?? null
+            | { kind: "active"; account_id: bigint }
+            | { kind: "stale"; containerInternalId: string | null; hostUuid: string | null }
+            | null;
+          const desiredGroupId = groupId ?? null;
           const result: AcquireResult = await tx<AcquireResult>(async (client) => {
             const lookup = await client.query<{
-              account_id: string | null
-              account_status: string | null
-              account_group_id: string | null
-              state: string
-              container_internal_id: string | null
-              host_uuid: string | null
-              age_seconds: string
+              account_id: string | null;
+              account_status: string | null;
+              account_group_id: string | null;
+              state: string;
+              container_internal_id: string | null;
+              host_uuid: string | null;
+              age_seconds: string;
             }>(
               `SELECT ac.codex_account_id::text AS account_id,
                       ca.status AS account_status,
@@ -5697,17 +5575,17 @@ export async function registerCommercial(
                WHERE ac.id = $1 AND ac.runtime_channel = $2 AND ac.runtime_kind = 'docker'
                FOR UPDATE OF ac`,
               [containerId, getRuntimeChannel()],
-            )
+            );
             if (lookup.rows.length === 0) {
               // 容器在 acquire 前刚被删了 — 当 legacy 透传(下游 sendToContainer 必失败,
               // 错误从那条路径返回给前端,与本桥状态一致)
-              return null
+              return null;
             }
-            const row = lookup.rows[0]
-            if (row.state !== 'active') {
+            const row = lookup.rows[0];
+            if (row.state !== "active") {
               // 容器已不再 active(stopped / vanished / removed) — 当 legacy 透传,
               // 让下游 sendToContainer 路径产出标准错误,不在 acquire 这层造一种新的错。
-              return null
+              return null;
             }
             if (row.account_id === null) {
               // legacy NULL 绑定。检查池子里是否有 active codex 账号:
@@ -5717,15 +5595,15 @@ export async function registerCommercial(
               //            重新走 picker 路径产出 per-container mount。
               // 池子查询条件与 pickCodexAccountForBinding 同源(poolCandidates.activePoolWhere),
               // 否则可能误判为"有账号"但 picker 实际拿不到。
-              const poolPredicate = activePoolWhere({ provider: 'codex', groupId: desiredGroupId })
+              const poolPredicate = activePoolWhere({ provider: "codex", groupId: desiredGroupId });
               const poolCount = await client.query<{ cnt: string }>(
                 `SELECT count(*)::text AS cnt
                    FROM claude_accounts
-                  WHERE ${poolPredicate.clauses.join(' AND ')}`,
+                  WHERE ${poolPredicate.clauses.join(" AND ")}`,
                 poolPredicate.params,
-              )
-              if (Number(poolCount.rows[0]?.cnt ?? '0') === 0) {
-                return null
+              );
+              if (Number(poolCount.rows[0]?.cnt ?? "0") === 0) {
+                return null;
               }
               // **死循环守护(v1.0.72 Codex review High#1)**:
               // 远端 host 的 putRemoteCodexAuth 短暂故障(node-agent 抖 / fingerprint
@@ -5739,14 +5617,14 @@ export async function registerCommercial(
               // 用户 GPT 请求会失败但容器照常用,不会陷入重建循环。运维通过监控 NULL
               // bind 容器数 + 日志告警感知后,修复 host 后下一轮自然 recycle 自愈
               // (60s 后行不再"年轻")。
-              const ageSec = Number(row.age_seconds ?? '0')
+              const ageSec = Number(row.age_seconds ?? "0");
               if (Number.isFinite(ageSec) && ageSec < 60) {
                 // eslint-disable-next-line no-console
                 console.warn(
-                  '[codex acquire] skip stale recycle: row too young (likely upstream codex bind failed last provision)',
+                  "[codex acquire] skip stale recycle: row too young (likely upstream codex bind failed last provision)",
                   { containerId, ageSec, hostUuid: row.host_uuid },
-                )
-                return null
+                );
+                return null;
               }
               // 池子非空 — recycle。同 tx 内把 row 标 vanished,与下面 lazy migrate
               // 的 UPDATE 同 commit,避免并发 acquirer 看到 state='active' 走错路径。
@@ -5760,23 +5638,20 @@ export async function registerCommercial(
                   WHERE id = $1 AND state = 'active' AND runtime_channel = $2
                     AND runtime_kind = 'docker'`,
                 [containerId, getRuntimeChannel()],
-              )
+              );
               if ((upd.rowCount ?? 0) === 0) {
                 throw new Error(
                   `codex stale recycle: UPDATE state=vanished rowCount=0 for container ${containerId} (invariant: FOR UPDATE row was active)`,
-                )
+                );
               }
               return {
-                kind: 'stale',
+                kind: "stale",
                 containerInternalId: row.container_internal_id,
                 hostUuid: row.host_uuid,
-              }
+              };
             }
-            if (
-              row.account_status === 'active' &&
-              (desiredGroupId === null || row.account_group_id === desiredGroupId)
-            ) {
-              return { kind: 'active', account_id: BigInt(row.account_id) }
+            if (row.account_status === "active" && (desiredGroupId === null || row.account_group_id === desiredGroupId)) {
+              return { kind: "active", account_id: BigInt(row.account_id) };
             }
             // disabled / quarantined / 任意非 active → lazy migrate
             //
@@ -5789,14 +5664,14 @@ export async function registerCommercial(
             //   - 写失败 → tx ROLLBACK → row 仍指 disabled 账号 → 下次 inbound 再
             //     acquire 重试(孤儿 auth.json 由 stop/remove、volume gc、重 provision
             //     覆盖兜底)
-            const picked = await pickCodexAccountForBindingInTx(client, String(containerId), {
-              groupId: desiredGroupId,
-            })
+            const picked = await pickCodexAccountForBindingInTx(client, String(containerId), { groupId: desiredGroupId });
             if (!picked) {
-              throw new Error(`codex pool empty during lazy migrate for container ${containerId}`)
+              throw new Error(
+                `codex pool empty during lazy migrate for container ${containerId}`,
+              );
             }
             const codexContainerDir =
-              process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR
+              process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
             // v1.0.72 host 路由由 helper 内部决定(selfHostId / host_uuid / putRemote
             // 三选一,见 codexLazyMigrate.fetchSnapshotAndWriteContainerAuth);
             // 远端 helper 未注入抛错 → tx ROLLBACK,与之前行为一致。
@@ -5806,7 +5681,7 @@ export async function registerCommercial(
               containerGid: V3_AGENT_GID,
               codexContainerDir,
               putRemoteCodexAuth: v3DepsForCodex?.putRemoteCodexAuth,
-            }
+            };
             // 用 client 传入 helper → 走 in-tx snapshot,**不**申请第二个 PG client
             // (避免 burst 时撑大 pool 占用)。
             await fetchSnapshotAndWriteContainerAuth({
@@ -5815,13 +5690,13 @@ export async function registerCommercial(
               hostUuidUnderLock: row.host_uuid,
               deps: writeAuthDeps,
               client,
-            })
+            });
             // FOR UPDATE 持锁内 UPDATE,COMMIT 时一同落盘。失败 → tx 抛出 → ROLLBACK
-            await commitCodexRebindInTx(client, containerId, picked.account_id)
-            return { kind: 'active', account_id: picked.account_id }
-          })
-          if (result === null) return null
-          if (result.kind === 'stale') {
+            await commitCodexRebindInTx(client, containerId, picked.account_id);
+            return { kind: "active", account_id: picked.account_id };
+          });
+          if (result === null) return null;
+          if (result.kind === "stale") {
             // tx 已 commit:row.state 已落 vanished。**必须 await** 把 docker 实体清掉
             // 再返错,否则容器名是 per-uid 固定,旧实体没 rm 时下条 message 触发
             // ensureRunning 会撞 docker NameConflict 被卡几秒重试,体验上不"自愈"。
@@ -5832,39 +5707,31 @@ export async function registerCommercial(
                 id: containerId,
                 container_internal_id: result.containerInternalId,
                 host_uuid: result.hostUuid,
-              })
+              });
             } catch (err) {
               rootLogger.warn(
-                '[commercial] codex stale recycle: stopAndRemoveV3Container failed (continuing — ensureRunning will retry on next message)',
+                "[commercial] codex stale recycle: stopAndRemoveV3Container failed (continuing — ensureRunning will retry on next message)",
                 {
                   containerId,
                   err: (err as Error)?.message ?? String(err),
                 },
-              )
+              );
             }
-            throw new ContainerStaleBindingError(containerId)
+            throw new ContainerStaleBindingError(containerId);
           }
           // tx 已 commit;现在尝试占 in-process per-account slot。Busy → 抛 AccountPoolBusyError
           // (bridge 转 CODEX_POOL_BUSY)。lazy migrate 已落盘不会回滚,Busy 只影响本 turn。
-          const slotId = scheduler.acquireCodexSlot(result.account_id)
-          return { account_id: result.account_id, slotId }
+          const slotId = scheduler.acquireCodexSlot(result.account_id);
+          return { account_id: result.account_id, slotId };
         },
         release(account_id: bigint, slotId: string): void {
-          try {
-            scheduler.releaseCodexSlot(account_id, slotId)
-          } catch {
-            /* */
-          }
+          try { scheduler.releaseCodexSlot(account_id, slotId); } catch { /* */ }
         },
         renew(account_id: bigint, slotId: string): boolean {
-          try {
-            return scheduler.renewCodexSlot(account_id, slotId)
-          } catch {
-            return false
-          }
+          try { return scheduler.renewCodexSlot(account_id, slotId); } catch { return false; }
         },
       }
-    : undefined
+    : undefined;
 
   /**
    * 容器不支持 model authority attestation(旧 release / 旧 env)→ 销毁它。
@@ -5875,56 +5742,56 @@ export async function registerCommercial(
    * orphanReconcile 路径一致)。
    */
   const recycleUnattestedContainer = (containerId: number, reason: string): void => {
-    if (!v3Deps) return
-    const depsForRecycle = v3Deps
+    if (!v3Deps) return;
+    const depsForRecycle = v3Deps;
     void (async () => {
       try {
         const { rows } = await getPool().query<{
-          id: number
-          container_internal_id: string | null
-          host_uuid: string | null
-          runtime_kind: string
+          id: number;
+          container_internal_id: string | null;
+          host_uuid: string | null;
+          runtime_kind: string;
         }>(
           // lint-agent-containers-sql: allow — recycle by id then branch on kind (must see any state)
-          'SELECT id, container_internal_id, host_uuid, runtime_kind FROM agent_containers WHERE id = $1',
+          "SELECT id, container_internal_id, host_uuid, runtime_kind FROM agent_containers WHERE id = $1",
           [containerId],
-        )
-        const row = rows[0]
-        if (!row) return
-        if (row.runtime_kind === 'desktop') {
-          const { getDesktopTunnelRegistry } = await import('./ws/desktopTunnelRegistry.js')
-          getDesktopTunnelRegistry().drop(containerId, 'attestation_failed')
+        );
+        const row = rows[0];
+        if (!row) return;
+        if (row.runtime_kind === "desktop") {
+          const { getDesktopTunnelRegistry } = await import("./ws/desktopTunnelRegistry.js");
+          getDesktopTunnelRegistry().drop(containerId, "attestation_failed");
           await getPool().query(
             `UPDATE agent_containers SET update_required = true, updated_at = NOW()
               WHERE id = $1 AND runtime_kind = 'desktop'`,
             [containerId],
-          )
+          );
           await getPool().query(
             `INSERT INTO desktop_device_audit(user_id, event, container_id, extra)
              SELECT user_id, 'update_required', id, $2::jsonb FROM agent_containers
               WHERE id = $1 AND runtime_kind = 'desktop' AND state = 'active'`,
             [containerId, JSON.stringify({ reason })],
-          )
-          rootLogger.warn('[commercial] desktop container marked update_required (no vanish)', {
+          );
+          rootLogger.warn("[commercial] desktop container marked update_required (no vanish)", {
             containerId,
             reason,
-          })
-          return
+          });
+          return;
         }
-        await stopAndRemoveV3Container(depsForRecycle, row)
-        rootLogger.warn('[commercial] recycled container without model-authority attestation', {
+        await stopAndRemoveV3Container(depsForRecycle, row);
+        rootLogger.warn("[commercial] recycled container without model-authority attestation", {
           containerId,
           reason,
-        })
+        });
       } catch (err) {
-        rootLogger.error('[commercial] model-authority recycle failed', {
+        rootLogger.error("[commercial] model-authority recycle failed", {
           containerId,
           reason,
           err: (err as Error)?.message ?? String(err),
-        })
+        });
       }
-    })()
-  }
+    })();
+  };
 
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     jwtSecret,
@@ -5967,35 +5834,32 @@ export async function registerCommercial(
       }),
     // 注入 logger,让 bridge 把 4503 reason / container error 等关键路径日志写出来。
     // 不传则静默 noop,生产排错时全部不可见(原版 commit 漏了)。
-    logger: rootLogger.child({ subsys: 'commercial', module: 'userChatBridge' }),
+    logger: rootLogger.child({ subsys: "commercial", module: "userChatBridge" }),
     // 模型授权 checker。模型权威开启后 role+grants 与 catalog visibility 必须绑定同一
     // fenced epoch：不信握手 JWT 的旧 role，也不回读可能 reload 失败的 PricingCache。
     loadAllowedModelChecker: async (uid, requiredEpoch) => {
       if (modelCatalogCache) {
-        const snapshot = await modelCatalogCache.assertFresh()
+        const snapshot = await modelCatalogCache.assertFresh();
         if (requiredEpoch !== undefined && snapshot.securityEpoch < requiredEpoch) {
           throw new Error(
             `catalog snapshot epoch ${snapshot.securityEpoch} < required ${requiredEpoch}`,
-          )
+          );
         }
-        const authz = await loadUserModelAuthz(uid, snapshot.securityEpoch)
-        return (modelId: string) =>
-          snapshot.canUseModel(
-            {
-              uid: uid.toString(),
-              role: authz.role,
-              grantedModelIds: authz.grantedModelIds,
-              deniedModelIds: authz.deniedModelIds,
-              userPlanTier: authz.userPlanTier ?? null,
-              orgPlanCode: authz.orgPlanCode ?? null,
-            },
-            modelId,
-          )
+        const authz = await loadUserModelAuthz(uid, snapshot.securityEpoch);
+        return (modelId: string) => snapshot.canUseModel({
+          uid: uid.toString(),
+          role: authz.role,
+          grantedModelIds: authz.grantedModelIds,
+          deniedModelIds: authz.deniedModelIds,
+          userPlanTier: authz.userPlanTier ?? null,
+          orgPlanCode: authz.orgPlanCode ?? null,
+        }, modelId);
       }
       // cutover 前 legacy 路径仍从 DB loader 取 role+grants，不再信 JWT role。
-      const { canUseModel } = await import('./billing/authzModels.js')
-      const authz = await loadUserModelAuthz(uid)
-      return (modelId: string) => canUseModel({ pricing }, { ...authz, modelId })
+      const { canUseModel } = await import("./billing/authzModels.js");
+      const authz = await loadUserModelAuthz(uid);
+      return (modelId: string) =>
+        canUseModel({ pricing }, { ...authz, modelId });
     },
     // P0 计费旁路封堵 —— bridge 可信模型推导的 agent 权威(seed 声明 / 常量 +
     // marketplace 预设/已装 manifest,详见 ws/agentModelAuthority.ts 头注)。
@@ -6008,26 +5872,38 @@ export async function registerCommercial(
     // 抛 SeedDeclarationError → bridge close(1011) fail-closed,绝不回落 master 常量。
     // 验证为selfhost的部署默认按rev;商业/无manifest兼容旧路径，显式0可回退。
     loadAgentModelResolver: async (uid, opts) => {
-      const { loadAgentModelResolverForUser } = await import('./ws/agentModelAuthority.js')
+      const { loadAgentModelResolverForUser } = await import("./ws/agentModelAuthority.js");
       return loadAgentModelResolverForUser(uid, {
         bundleRev: opts.bundleRev ?? null,
-        flavor: flavorIdentity.status === 'ok' ? flavorIdentity.flavor : undefined,
+        flavor: flavorIdentity.status === "ok" ? flavorIdentity.flavor : undefined,
         flavorIdentity,
         // 与 supervisor / bundle 校验器同一稳定根(见上方 runtimeTuple 装配)。
         platformRoot: cfg.OC_PLATFORM_ROOT ?? DEFAULT_PLATFORM_ROOT,
-      })
+      });
     },
     // 引擎历史只读真实 Tape 的有限模型窗口 sidecar。浏览器历史不受该窗口影响；当前
     // prompt/引擎/上下文窗口均由 bridge 的可信 catalog snapshot 传入，避免回退到全量
     // BYTEA 全量水合后再做固定行数/字符数截断。
     loadMasterSessionMessages: async (uid, sessionId, context) =>
-      getEngineContextMessages(sessionId, MASTER_USER_PREFIX + uid.toString(), context),
+      getEngineContextMessages(
+        sessionId,
+        MASTER_USER_PREFIX + uid.toString(),
+        context,
+      ),
     hasCompletedClientTurn: async (uid, sessionId, clientMessageId) =>
-      hasCompletedClientTurn(sessionId, MASTER_USER_PREFIX + uid.toString(), clientMessageId),
+      hasCompletedClientTurn(
+        sessionId,
+        MASTER_USER_PREFIX + uid.toString(),
+        clientMessageId,
+      ),
     loadGoalState: (uid, sessionId) => goalStateService.get(uid, sessionId),
     updateGoalEngineMetrics: (args) => goalStateService.updateEngineMetrics(args),
     persistMasterUserMessage: async (uid, sessionId, message) =>
-      appendServerAuthoredMessage(sessionId, MASTER_USER_PREFIX + uid.toString(), message),
+      appendServerAuthoredMessage(
+        sessionId,
+        MASTER_USER_PREFIX + uid.toString(),
+        message,
+      ),
     persistOutboundFrame: (input) => persistGatewayLiveFrame(getPool(), input),
     // durable turn dispatch 受理面(RFC §2.1):容器 attest durable-turn-dispatch-v1 时
     // 替代 persistMasterUserMessage(单事务 append + dispatch 冲突表)。未装 backend → undefined → legacy。
@@ -6038,18 +5914,17 @@ export async function registerCommercial(
       ? (uid, limit) => dispatchAdmissionBackend!.reconcileAutomaticRecoveryJobs(uid, limit)
       : undefined,
     loadSessionWorkspaceMode: dispatchAdmissionBackend
-      ? (uid, sessionId) =>
-          dispatchAdmissionBackend!.getClientSessionWorkspaceMode(
-            sessionId,
-            MASTER_USER_PREFIX + uid.toString(),
-          )
+      ? (uid, sessionId) => dispatchAdmissionBackend!.getClientSessionWorkspaceMode(
+          sessionId,
+          MASTER_USER_PREFIX + uid.toString(),
+        )
       : undefined,
     // plan v3 G5/G7 → M2 — codex per-account 并发槽 / lazy migrate / 严格单飞 handle。
     // v3Deps 未注入(测试 mock)→ undefined,bridge 退化为透传不做并发管控(测试默认行为)。
     codexBinding,
     createCodexRoute: createCommercialCodexRoute,
     expireCodexRoute: async (token) => {
-      await Promise.all([expireCodexRouteContext(token), expireGrokRouteContext(token)])
+      await Promise.all([expireCodexRouteContext(token), expireGrokRouteContext(token)]);
     },
     mintZcodeRoute: ({ containerId, userId, requestId, modelId }) =>
       mintZcodeRelayRoute({
@@ -6060,25 +5935,25 @@ export async function registerCommercial(
         relayPort: V3_CONTAINER_PORT,
       }),
     expireZcodeRoute: async (token) => {
-      await expireZcodeRelayRoute(token)
+      await expireZcodeRelayRoute(token);
     },
     admitAntigravityTurn: ({ containerId, userId, requestId, modelId, budgetCredits }) =>
       admitAntigravityTurn(
         { containerId, userId, requestId, modelId, budgetCredits, relayPort: V3_CONTAINER_PORT },
-        { clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? '' },
+        { clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "" },
       ),
     expireAntigravityRoute: async (token) => {
-      await expireAntigravityRelayRoute(token)
+      await expireAntigravityRelayRoute(token);
     },
     expireAntigravityRouteForRequest: async (requestId) => {
-      await expireAntigravityRelayRouteForRequest(requestId)
+      await expireAntigravityRelayRouteForRequest(requestId);
     },
     releaseGrokRouteLease: async (accountId, slotId) => {
       // Expire durable authority before freeing the local mirror. If PG is
       // unavailable the slot remains occupied and the immutable terminal frame
       // can retry without admitting an over-cap turn.
-      await expireGrokRouteContextByLease(accountId, slotId)
-      scheduler.releaseCodexSlot(accountId, slotId)
+      await expireGrokRouteContextByLease(accountId, slotId);
+      scheduler.releaseCodexSlot(accountId, slotId);
     },
     // PR2 v1.0.66 → M2 — codex 真扣费三件套(pgPool / preCheckRedis / pricing 进程级
     //   singleton):bridge 内 preCheckWithCost / startInflightJournal,settle 收口
@@ -6093,62 +5968,62 @@ export async function registerCommercial(
     // master's `client_sessions.messages[i].usage.costCredits`。与 anthropicProxy
     // 走同一个 storage helper,签名一致。
     appendCostCredits: appendCostCreditsForUser, // c:<uid> 前缀对齐 session 存储命名空间
-  })
+  });
   // 把 proxy 的 forward-ref 指向真实 broadcastToUser —— 此刻以后,commit 成功
   // 扣费事件会实时推到用户前端。cron-origin-inject 同理由此刻起可注入。
-  cronOriginBridgeRef = userChatBridge
+  cronOriginBridgeRef = userChatBridge;
   bridgeBroadcastRef.current = (uid, payload) => {
-    userChatBridge.broadcastToUser(uid, payload)
-  }
+    userChatBridge.broadcastToUser(uid, payload);
+  };
   recoveryDecisionBroadcastRef.current = (userId, sessionId, verdict) => {
     // Session owners are `c:<uid>`; personal/test namespaces have no bridge user.
-    const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId)
-    if (!uidMatch) return
-    const uid = uidMatch[1]!
-    const code = normalizeTurnErrorCode(verdict.errorCode)
+    const uidMatch = /^c:([1-9][0-9]*)$/.exec(userId);
+    if (!uidMatch) return;
+    const uid = uidMatch[1]!;
+    const code = normalizeTurnErrorCode(verdict.errorCode);
     if (/^[A-Za-z0-9_]{1,64}$/.test(code)) {
       void recordProductFrictionEvent({
         correlation: `${sessionId}:${verdict.sourceClientMessageId}`,
         userId: BigInt(uid),
-        surface: 'recovery',
-        stage: 'recovery_decision',
+        surface: "recovery",
+        stage: "recovery_decision",
         code,
-        outcome: verdict.scheduled ? 'pending' : 'failed',
+        outcome: verdict.scheduled ? "pending" : "failed",
         attempts: verdict.scheduled ? verdict.attempt : undefined,
-        path: 'decision',
+        path: "decision",
         reason: verdict.scheduled ? undefined : verdict.reason,
         sessionId,
       }).catch((err: unknown) => {
-        rootLogger.warn('recovery_decision_friction_failed', {
+        rootLogger.warn("recovery_decision_friction_failed", {
           sessionId,
           errorClass: err instanceof Error ? err.constructor.name : typeof err,
-        })
-      })
+        });
+      });
     }
     const payload = {
-      type: 'sys.recovery_decision',
-      peer: { id: sessionId, kind: 'dm' },
+      type: "sys.recovery_decision",
+      peer: { id: sessionId, kind: "dm" },
       ...verdict,
       ts: Date.now(),
-    }
+    };
     // Phase B runs on the leader slot only; the user's WS may live on the
     // other slot. Same dual-master fan-out as outbound.cost_charged.
     if (dualMasterEnabled) {
-      void slotRelayClient.broadcastToUsers([uid], payload).catch(() => undefined)
-      return
+      void slotRelayClient.broadcastToUsers([uid], payload).catch(() => undefined);
+      return;
     }
-    userChatBridge.broadcastToUser(BigInt(uid), payload)
-  }
+    userChatBridge.broadcastToUser(BigInt(uid), payload);
+  };
   goalBroadcastRef.current = (uid, payload) => {
-    userChatBridge.broadcastToUser(uid, payload)
-  }
+    userChatBridge.broadcastToUser(uid, payload);
+  };
   goalSyncRef.current = (uid, payload) => {
-    userChatBridge.syncGoalToContainers(uid, payload)
-  }
+    userChatBridge.syncGoalToContainers(uid, payload);
+  };
   slotRelayLocalRef.current = {
     onlineUserSubset: (uids) => userChatBridge.onlineUserSubset(uids),
     broadcastToUsers: (uids, payload) => userChatBridge.broadcastToUsers(uids, payload),
-  }
+  };
 
   // Browser voice input: MediaRecorder → master WS → Deepgram Nova-3 streaming,
   // then one-shot DeepSeek V4 Flash (OpenCode Go) context polish after stop.
@@ -6163,49 +6038,45 @@ export async function registerCommercial(
     maxSeconds: cfg.VOICE_MAX_SECONDS,
     maxPerUser: cfg.VOICE_MAX_PER_USER,
     maxGlobal: cfg.VOICE_MAX_GLOBAL,
-    logger: rootLogger.child({ subsys: 'commercial', module: 'voiceTranscribe' }),
-  })
+    logger: rootLogger.child({ subsys: "commercial", module: "voiceTranscribe" }),
+  });
 
   // T-62 告警调度器 —— 默认 60s tick,不在启动时立刻跑(避免冷启动误报)。P3:收口 LeaderBundle。
-  if (process.env.COMMERCIAL_ALERTS_DISABLED !== '1') {
+  if (process.env.COMMERCIAL_ALERTS_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'alert',
-      domain: 'shared',
+      name: "alert",
+      domain: "shared",
       start: () => {
         // 非法 / 空 / NaN → 60s;下限 1s(防 typo 写成 "50" ms 把 DB 打穿)
-        const raw = Number(process.env.COMMERCIAL_ALERT_TICK_MS)
-        const tickMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000
-        const h = trackScheduler(
-          'alert',
-          'shared',
-          startAlertScheduler({ intervalMs: tickMs, runOnStart: false }),
-        )
-        return { stop: () => h.stop() }
+        const raw = Number(process.env.COMMERCIAL_ALERT_TICK_MS);
+        const tickMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
+        const h = trackScheduler("alert", "shared", startAlertScheduler({ intervalMs: tickMs, runOnStart: false }));
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // M6/P1-9 — account_refresh_events 28 天 retention sweeper(24h interval,unref)。P3:收口 LeaderBundle。
-  if (process.env.COMMERCIAL_REFRESH_EVENTS_SWEEP_DISABLED !== '1') {
+  if (process.env.COMMERCIAL_REFRESH_EVENTS_SWEEP_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'refreshEventsSweep',
-      domain: 'shared',
+      name: "refreshEventsSweep",
+      domain: "shared",
       start: () => {
-        const h = trackScheduler('refreshEventsSweep', 'shared', startRefreshEventsSweeper())
-        return { stop: () => h.stop() }
+        const h = trackScheduler("refreshEventsSweep", "shared", startRefreshEventsSweeper());
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
-  if (process.env.OC_DESKTOP_ENROLL_SWEEP_DISABLED !== '1') {
+  if (process.env.OC_DESKTOP_ENROLL_SWEEP_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'desktopEnrollSweep',
-      domain: 'shared',
+      name: "desktopEnrollSweep",
+      domain: "shared",
       start: () => {
-        const h = trackScheduler('desktopEnrollSweep', 'shared', startDesktopEnrollmentSweep())
-        return { stop: () => h.stop() }
+        const h = trackScheduler("desktopEnrollSweep", "shared", startDesktopEnrollmentSweep());
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // 审计体系整改批 — 审计/事件表统一 retention sweeper(boot 立即异步跑一轮,随后 24h tick)。
@@ -6214,44 +6085,38 @@ export async function registerCommercial(
   // 政策注册表=admin/auditRetention.ts(security_events 180d/agent_audit 90d/
   // compute_host_audit 90d/turn_traces 90d/rate_limit_events 30d;admin_audit 显式
   // 永久,不允许出现在删除政策)。shared 域:删的是共享审计表,仅 leader 运行。
-  if (process.env.COMMERCIAL_AUDIT_RETENTION_SWEEP_DISABLED !== '1') {
+  if (process.env.COMMERCIAL_AUDIT_RETENTION_SWEEP_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'auditRetentionSweep',
-      domain: 'shared',
+      name: "auditRetentionSweep",
+      domain: "shared",
       start: () => {
-        const h = trackScheduler(
-          'auditRetentionSweep',
-          'shared',
-          startAuditRetentionSweeper({ runOnStart: true }),
-        )
-        return { stop: () => h.stop() }
+        const h = trackScheduler("auditRetentionSweep", "shared", startAuditRetentionSweeper({ runOnStart: true }));
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // Image journey recovery is operational state, not request-triggered
   // cleanup: one-shot users may never make another image call. The V5 leader
   // finalizes stale journeys/attempts globally in bounded batches.
-  if (runtimeChannel === 'v5' && process.env.COMMERCIAL_IMAGE_USAGE_SWEEP_DISABLED !== '1') {
+  if (
+    runtimeChannel === "v5" &&
+    process.env.COMMERCIAL_IMAGE_USAGE_SWEEP_DISABLED !== "1"
+  ) {
     leaderBundle.add({
-      name: 'imageUsageSweep',
-      domain: 'v5-owned',
+      name: "imageUsageSweep",
+      domain: "v5-owned",
       start: () => {
-        const h = trackScheduler(
-          'imageUsageSweep',
-          'v5-owned',
-          startImageUsageSweeper({
-            pool: getPool(),
-            onError: (error) =>
-              rootLogger.warn('image usage sweep failed', {
-                errorClass: error instanceof Error ? error.name : typeof error,
-                message: error instanceof Error ? error.message : String(error),
-              }),
+        const h = trackScheduler("imageUsageSweep", "v5-owned", startImageUsageSweeper({
+          pool: getPool(),
+          onError: (error) => rootLogger.warn("image usage sweep failed", {
+            errorClass: error instanceof Error ? error.name : typeof error,
+            message: error instanceof Error ? error.message : String(error),
           }),
-        )
-        return { stop: () => h.stop() }
+        }));
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // plan G2/G4 — codex token refresh actor(单进程独占,60s tick,unref)。
@@ -6263,157 +6128,120 @@ export async function registerCommercial(
   // 的容器 auth。沿旧 controlPlaneEnabled gate 会让 v5 的 codex 账号 token 无人续期
   // (v3 leader 只刷 v3 行)→ 池子静默烂掉;故 channel=v5 必须自己跑。
   // 单账号单刷新权威由 channel 列保证(v3/v5 各只见自己的行),无双刷 family 吊销风险。
-  let codexRefreshActor: CodexRefreshActorHandle | undefined
+  let codexRefreshActor: CodexRefreshActorHandle | undefined;
   if (
-    (controlPlaneEnabled || runtimeChannel === 'v5') &&
-    process.env.COMMERCIAL_CODEX_REFRESH_ACTOR_DISABLED !== '1'
+    (controlPlaneEnabled || runtimeChannel === "v5") &&
+    process.env.COMMERCIAL_CODEX_REFRESH_ACTOR_DISABLED !== "1"
   ) {
     const codexContainerDir =
-      process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR
+      process.env.OC_V3_CODEX_CONTAINER_DIR?.trim() || DEFAULT_V3_CODEX_CONTAINER_DIR;
     // v1.0.72 多机:把 v3Deps 上的 putRemoteCodexAuth helper(已含
     // getHostById → hostRowToTarget → finally psk.fill(0) 三件套)透传给 actor,
     // actor 自己不持密钥 buffer,泄密面与 lazy migrate / provision 完全一致。
-    codexRefreshActor = trackScheduler(
-      'codexRefresh',
-      'v5-owned',
-      startCodexRefreshActor({
-        codexContainerDir,
-        containerUid: V3_AGENT_UID,
-        containerGid: V3_AGENT_GID,
-        selfHostId: v3Deps?.selfHostId ?? null,
-        writeRemoteFn: v3Deps?.putRemoteCodexAuth,
-      }),
-    )
+    codexRefreshActor = trackScheduler("codexRefresh", "v5-owned", startCodexRefreshActor({
+      codexContainerDir,
+      containerUid: V3_AGENT_UID,
+      containerGid: V3_AGENT_GID,
+      selfHostId: v3Deps?.selfHostId ?? null,
+      writeRemoteFn: v3Deps?.putRemoteCodexAuth,
+    }));
   }
 
   // OCV5-424 — 各服务池共用的唯一恢复 actor(policy/registry):到期普通冷却半开、
   // 认证/凭证冷却到期探测(成功回 active,失败加大退避,不确定则稍后再探)。
   // 各池只注册适配器,不各自起定时器。默认 60s tick(下限 1s 防 typo)。
   // 关闭:`COMMERCIAL_COOLDOWN_RECOVERY_DISABLED=1`(测试 / 应急)。
-  registerPoolAdapter(
-    createAccountPoolAdapter({ health: healthTracker, triggerCodexDisableFanout }),
-  )
-  registerPoolAdapter(createApiKeyPoolAdapter())
-  registerPoolAdapter(createRelayKeyPoolAdapter())
+  registerPoolAdapter(createAccountPoolAdapter({ health: healthTracker, triggerCodexDisableFanout }));
+  registerPoolAdapter(createApiKeyPoolAdapter());
+  registerPoolAdapter(createRelayKeyPoolAdapter());
   // OCV5-424 user affinity caps: admin system settings, cached 60s in policy/affinity.
   configureAffinitySettings(async () => ({
-    maxUsersPerSubscription: (await getSystemSetting('pool_affinity_max_users_per_subscription'))
-      .value,
-    ratePerMin: (await getSystemSetting('pool_affinity_rate_per_min')).value,
-    antigravityInflight: (await getSystemSetting('pool_affinity_antigravity_inflight')).value,
-    antigravityRatePerMin: (await getSystemSetting('pool_affinity_antigravity_rate_per_min')).value,
-  }))
-  registerPoolAdapter(
-    createGeminiPoolAdapter({
-      clientSecret: () => process.env.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET?.trim() ?? '',
-    }),
-  )
-  if (process.env.COMMERCIAL_COOLDOWN_RECOVERY_DISABLED !== '1') {
+    maxUsersPerSubscription: (await getSystemSetting("pool_affinity_max_users_per_subscription")).value,
+    ratePerMin: (await getSystemSetting("pool_affinity_rate_per_min")).value,
+    antigravityInflight: (await getSystemSetting("pool_affinity_antigravity_inflight")).value,
+    antigravityRatePerMin: (await getSystemSetting("pool_affinity_antigravity_rate_per_min")).value,
+  }));
+  registerPoolAdapter(createGeminiPoolAdapter({
+    clientSecret: () => process.env.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET?.trim() ?? "",
+  }));
+  if (process.env.COMMERCIAL_COOLDOWN_RECOVERY_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'cooldownRecovery',
-      domain: 'shared',
+      name: "cooldownRecovery",
+      domain: "shared",
       start: () => {
-        const raw = Number(process.env.COMMERCIAL_COOLDOWN_RECOVERY_INTERVAL_MS)
-        const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000
-        const h = trackScheduler(
-          'cooldownRecovery',
-          'shared',
-          startPoolRecoveryActor({ intervalMs }),
-        )
-        return { stop: () => h.stop() }
+        const raw = Number(process.env.COMMERCIAL_COOLDOWN_RECOVERY_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
+        const h = trackScheduler("cooldownRecovery", "shared", startPoolRecoveryActor({ intervalMs }));
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // Cursor account-pool → host auth-dir materializer. No-ops when
   // OC_V5_CURSOR_AUTH_DIR is unset (commercial hosts without a local key dir).
-  if (process.env.COMMERCIAL_CURSOR_AUTH_SYNC_DISABLED !== '1') {
+  if (process.env.COMMERCIAL_CURSOR_AUTH_SYNC_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'cursorAuthSync',
-      domain: 'v5-owned',
+      name: "cursorAuthSync",
+      domain: "v5-owned",
       start: () => {
-        const raw = Number(process.env.COMMERCIAL_CURSOR_AUTH_SYNC_INTERVAL_MS)
-        const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000
-        const preparation = trackScheduler(
-          'cursorAuthSync',
-          'v5-owned',
-          startCursorSandPreparationActor(),
-        )
-        const h = trackScheduler(
-          'cursorAuthSync',
-          'v5-owned',
-          startCursorAuthSyncActor({ intervalMs }),
-        )
-        return {
-          stop: async () => {
-            await Promise.all([h.stop(), preparation.stop()])
-          },
-        }
+        const raw = Number(process.env.COMMERCIAL_CURSOR_AUTH_SYNC_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
+        const preparation = trackScheduler("cursorAuthSync", "v5-owned", startCursorSandPreparationActor());
+        const h = trackScheduler("cursorAuthSync", "v5-owned", startCursorAuthSyncActor({ intervalMs }));
+        return { stop: async () => { await Promise.all([h.stop(), preparation.stop()]); } };
       },
-    })
+    });
   }
 
   // 0262 — Cursor Sand (Grok Bot) usage sweeper. Hourly, per session row:
   // cursor.com get-sand-usage-status → claude_accounts.cursor_sand_* columns
   // → `.slot-weight` sidecar via the materializer. Leader-only (one set of
   // cursor.com calls per pool, and the materializer already runs here).
-  if (process.env.COMMERCIAL_CURSOR_USAGE_SWEEP_DISABLED !== '1') {
+  if (process.env.COMMERCIAL_CURSOR_USAGE_SWEEP_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'cursorUsageSweep',
-      domain: 'v5-owned',
+      name: "cursorUsageSweep",
+      domain: "v5-owned",
       start: () => {
-        const raw = Number(process.env.COMMERCIAL_CURSOR_USAGE_SWEEP_INTERVAL_MS)
-        const intervalMs = Number.isFinite(raw) && raw >= 60_000 ? raw : 60 * 60_000
-        const h = trackScheduler(
-          'cursorUsageSweep',
-          'v5-owned',
-          startCursorUsageSweeper({ intervalMs }),
-        )
-        return { stop: () => h.stop() }
+        const raw = Number(process.env.COMMERCIAL_CURSOR_USAGE_SWEEP_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 60_000 ? raw : 60 * 60_000;
+        const h = trackScheduler("cursorUsageSweep", "v5-owned", startCursorUsageSweeper({ intervalMs }));
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // 0276 — Grok Build (xAI subscription) usage sweeper. Hourly, per grok
   // row: cli-chat-proxy /billing + /user → claude_accounts.grok_* columns.
   // Leader-only (one set of xAI calls per pool). No materializer: grok has
   // no sidecar. Direct egress only (sing-box IPv6 RST).
-  if (process.env.COMMERCIAL_GROK_USAGE_SWEEP_DISABLED !== '1') {
+  if (process.env.COMMERCIAL_GROK_USAGE_SWEEP_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'grokUsageSweep',
-      domain: 'v5-owned',
+      name: "grokUsageSweep",
+      domain: "v5-owned",
       start: () => {
-        const raw = Number(process.env.COMMERCIAL_GROK_USAGE_SWEEP_INTERVAL_MS)
-        const intervalMs = Number.isFinite(raw) && raw >= 60_000 ? raw : 60 * 60_000
-        const h = trackScheduler(
-          'grokUsageSweep',
-          'v5-owned',
-          startGrokUsageSweeper({ intervalMs }),
-        )
-        return { stop: () => h.stop() }
+        const raw = Number(process.env.COMMERCIAL_GROK_USAGE_SWEEP_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 60_000 ? raw : 60 * 60_000;
+        const h = trackScheduler("grokUsageSweep", "v5-owned", startGrokUsageSweeper({ intervalMs }));
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // A1 — pending 订单 expirer(默认 60s tick,部署即 boot 跑一次清历史脏单)。
   // markOrderPaid 不在事务内对 expires_at 做硬防线(避免用户超时几秒扫码就硬失败
   // 的体验回归);过期清理由本 sweeper 负责,被推 expired 后 markOrderPaid 自然拒。
   // 非法 / 空 / NaN → 60s;下限 1s(防 typo 把 DB 打穿)
-  if (process.env.COMMERCIAL_PENDING_ORDERS_EXPIRER_DISABLED !== '1') {
+  if (process.env.COMMERCIAL_PENDING_ORDERS_EXPIRER_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'pendingOrdersExpirer',
-      domain: 'shared',
+      name: "pendingOrdersExpirer",
+      domain: "shared",
       start: () => {
-        const raw = Number(process.env.COMMERCIAL_PENDING_ORDERS_EXPIRER_INTERVAL_MS)
-        const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000
-        const h = trackScheduler(
-          'pendingOrdersExpirer',
-          'shared',
-          startPendingOrdersExpirer({ intervalMs }),
-        )
-        return { stop: () => h.stop() }
+        const raw = Number(process.env.COMMERCIAL_PENDING_ORDERS_EXPIRER_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
+        const h = trackScheduler("pendingOrdersExpirer", "shared", startPendingOrdersExpirer({ intervalMs }));
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // 0096 / 0115 — 订阅周期轮转 sweeper(默认 5min tick,boot 即结算已到期订阅)。
@@ -6427,18 +6255,14 @@ export async function registerCommercial(
   // (产品语义断供;spendTwoBucket 排除过期桶所以钱是安全的)。故 channel=v5 必须自己跑。
   // 并发安全:rollover 内部 FOR UPDATE SKIP LOCKED,多实例同跑无双重结算。
   // org 轮转并入本 sweeper(同 v5-owned 域/同 tick/同认领模式),不新建独立 scheduler。
-  let subscriptionRolloverSweeper: SubscriptionRolloverHandle | undefined
+  let subscriptionRolloverSweeper: SubscriptionRolloverHandle | undefined;
   if (
-    (controlPlaneEnabled || runtimeChannel === 'v5') &&
-    process.env.COMMERCIAL_SUBSCRIPTION_ROLLOVER_DISABLED !== '1'
+    (controlPlaneEnabled || runtimeChannel === "v5") &&
+    process.env.COMMERCIAL_SUBSCRIPTION_ROLLOVER_DISABLED !== "1"
   ) {
-    const raw = Number(process.env.COMMERCIAL_SUBSCRIPTION_ROLLOVER_INTERVAL_MS)
-    const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 300_000
-    subscriptionRolloverSweeper = trackScheduler(
-      'subscriptionRollover',
-      'v5-owned',
-      startSubscriptionRolloverSweeper({ intervalMs }),
-    )
+    const raw = Number(process.env.COMMERCIAL_SUBSCRIPTION_ROLLOVER_INTERVAL_MS);
+    const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 300_000;
+    subscriptionRolloverSweeper = trackScheduler("subscriptionRollover", "v5-owned", startSubscriptionRolloverSweeper({ intervalMs }));
   }
 
   // B7 — account-pool per-slot 租约泄漏回收 sweeper(60s tick)。回收进程存活期间
@@ -6448,121 +6272,108 @@ export async function registerCommercial(
   // 【域归属 local】纯进程内自愈,无任何共享-state 副作用 —— 此前 gate 在
   // controlPlaneEnabled 是一刀切误伤:v5 的聊天代理路径同样持有 slot 租约,
   // 泄漏后无人回收 → v5 侧虚假 429 永不自愈。任何 channel 都应运行。
-  let accountSlotReaper: SlotReaperHandle | undefined
-  if (process.env.COMMERCIAL_ACCOUNT_SLOT_REAPER_DISABLED !== '1') {
-    const raw = Number(process.env.COMMERCIAL_ACCOUNT_SLOT_REAPER_INTERVAL_MS)
-    const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000
-    accountSlotReaper = trackScheduler(
-      'accountSlotReaper',
-      'local',
-      startAccountSlotReaper({ scheduler, intervalMs }),
-    )
+  let accountSlotReaper: SlotReaperHandle | undefined;
+  if (process.env.COMMERCIAL_ACCOUNT_SLOT_REAPER_DISABLED !== "1") {
+    const raw = Number(process.env.COMMERCIAL_ACCOUNT_SLOT_REAPER_INTERVAL_MS);
+    const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 60_000;
+    accountSlotReaper = trackScheduler("accountSlotReaper", "local", startAccountSlotReaper({ scheduler, intervalMs }));
   }
 
   // B1 — request_finalize_journal reconciler + GC(migration 0015 承诺、之前漏接)。
   // 把崩溃后卡 inflight/finalizing 的 journal 行终态化并 GC 老终态行。legacy stuck
   // 阈值向上夹到 max(CODEX_SESSION_MAX_MS*3, 30min)；durable Codex 另用 ≥24h
   // evidence SLA，且只豁免无 usage 的 inflight，绝不抢 finalizing owner。
-  if (process.env.COMMERCIAL_FINALIZE_RECONCILER_DISABLED !== '1') {
+  if (process.env.COMMERCIAL_FINALIZE_RECONCILER_DISABLED !== "1") {
     // Local ProxyAgent cleanup state must outlive a temporary loss of shared
     // leadership. Only the scheduler starts/stops on each leader term.
     const boxRemoteCleanup = new BoxRemoteCleanupWorker({
       journal: new BoxDurableJournal(getPool()),
       resolver: createProductionBoxAccountResolver(),
       writeRecoveryMessage: createBoxReplayRecoveryWriter(process.env.OC_PLATFORM_ROOT),
-    })
+    });
     leaderBundle.add({
-      name: 'finalizeReconciler',
-      domain: 'shared',
+      name: "finalizeReconciler",
+      domain: "shared",
       start: () => {
-        const rawInterval = Number(process.env.COMMERCIAL_FINALIZE_RECONCILER_INTERVAL_MS)
+        const rawInterval = Number(process.env.COMMERCIAL_FINALIZE_RECONCILER_INTERVAL_MS);
         const intervalMs =
           Number.isFinite(rawInterval) && rawInterval >= FINALIZE_RECONCILER_MIN_INTERVAL_MS
             ? rawInterval
-            : DEFAULT_RECONCILE_INTERVAL_MS
-        const rawCodexMax = Number(process.env.CODEX_SESSION_MAX_MS)
+            : DEFAULT_RECONCILE_INTERVAL_MS;
+        const rawCodexMax = Number(process.env.CODEX_SESSION_MAX_MS);
         const thresholdMs = resolveStuckThresholdMs(
           process.env.COMMERCIAL_FINALIZE_RECONCILER_THRESHOLD_MS,
           Number.isFinite(rawCodexMax) ? rawCodexMax : undefined,
-        )
+        );
         const durableWaiverAgeMs = resolveDurableWaiverAgeMs(
           process.env.COMMERCIAL_FINALIZE_DURABLE_WAIVER_AGE_MS,
           thresholdMs,
-        )
-        const h = trackScheduler(
-          'finalizeReconciler',
-          'shared',
-          startFinalizeJournalReconciler({
-            intervalMs,
-            thresholdMs,
-            durableWaiverAgeMs,
-            boxRecoveryFn: async () => {
-              const results = await Promise.allSettled([
-                reconcileBoxBillingBatch(getPool(), 20, preCheckRedis),
-                boxRemoteCleanup.reconcileBatch(10),
-              ])
-              if (results.some((result) => result.status === 'rejected')) {
-                throw new Error('BOX_RECOVERY_PARTIAL_FAILURE')
-              }
-            },
-          }),
-        )
-        return { stop: () => h.stop() }
+        );
+        const h = trackScheduler("finalizeReconciler", "shared", startFinalizeJournalReconciler({
+          intervalMs,
+          thresholdMs,
+          durableWaiverAgeMs,
+          boxRecoveryFn: async () => {
+            const results = await Promise.allSettled([
+              reconcileBoxBillingBatch(getPool(), 20, preCheckRedis),
+              boxRemoteCleanup.reconcileBatch(10),
+            ]);
+            if (results.some((result) => result.status === "rejected")) {
+              throw new Error("BOX_RECOVERY_PARTIAL_FAILURE");
+            }
+          },
+        }));
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // live journal 帧表维护:删已投影且确有 tape 记录的流的帧,并给不可能再产帧的
   // live 流打 retired_at(帧仍可见,只从在飞 owner 集合剔除)。leaderBundle shared
   // 单跑(双 master 只 leader)。仅 v5(client_session_live_frames 是 v5 表)。
   // 失败只记日志,start() 同步返回,不挡 leadership / 监听端口。
-  if (runtimeChannel === 'v5' && !resolveLiveFrameMaintenanceDisabled()) {
+  if (runtimeChannel === "v5" && !resolveLiveFrameMaintenanceDisabled()) {
     leaderBundle.add({
-      name: 'liveFrameMaintenance',
-      domain: 'shared',
+      name: "liveFrameMaintenance",
+      domain: "shared",
       start: () => {
         const intervalMs = resolveLiveFrameMaintenanceIntervalMs(
           process.env.COMMERCIAL_LIVE_FRAME_MAINTENANCE_INTERVAL_MS,
-        )
+        );
         const pruneMaxBatches = resolvePruneMaxBatches(
           process.env.COMMERCIAL_LIVE_FRAME_PRUNE_MAX_BATCHES,
-        )
+        );
         const retireMinAgeMs = resolveRetireMinAgeMs(
           process.env.COMMERCIAL_LIVE_FRAME_RETIRE_MIN_AGE_MS,
-        )
-        const h = trackScheduler(
-          'liveFrameMaintenance',
-          'shared',
-          startLiveFrameMaintenanceScheduler({
-            pool: getPool(),
-            intervalMs,
-            pruneMaxBatches,
-            retireMinAgeMs,
-            runOnStart: true,
-            onError: (err) =>
-              rootLogger.warn('[liveFrameMaintenance] tick failed', {
-                err: (err as Error)?.message ?? String(err),
-              }),
+        );
+        const h = trackScheduler("liveFrameMaintenance", "shared", startLiveFrameMaintenanceScheduler({
+          pool: getPool(),
+          intervalMs,
+          pruneMaxBatches,
+          retireMinAgeMs,
+          runOnStart: true,
+          onError: (err) => rootLogger.warn("[liveFrameMaintenance] tick failed", {
+            err: (err as Error)?.message ?? String(err),
           }),
-        )
-        return { stop: () => h.stop() }
+        }));
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // tape materialization + settlement jobs (design 2026-08-19 rev2). Dedicated pool
   // uses 120s statement_timeout so 67MB finalize is not the request-path 30s cap.
-  if (runtimeChannel === 'v5' && process.env.COMMERCIAL_TAPE_MATERIALIZATION_DISABLED !== '1') {
+  if (runtimeChannel === "v5" && process.env.COMMERCIAL_TAPE_MATERIALIZATION_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'tapeJobScheduler',
-      domain: 'shared',
+      name: "tapeJobScheduler",
+      domain: "shared",
       start: () => {
         const materializePool = createPool({
           max: 2,
           statementTimeoutMs: 120_000,
           idleInTransactionSessionTimeoutMs: 600_000,
-          applicationName: 'openclaude-tape-materialize',
-        })
+          applicationName: "openclaude-tape-materialize",
+        });
         const materializeBackend = createPgSessionsBackend(materializePool, {
           expectedGeneration: sessionsStoreGeneration,
           // Phase B runs here, not on the request-path backend, so the recovery
@@ -6571,181 +6382,156 @@ export async function registerCommercial(
             recoveryDecisionBroadcastRef.current(userId, sessionId, verdict),
           onRecoveryJobTerminal: (userId, sessionId, info) =>
             recordRecoveryJobTerminalFriction(userId, sessionId, info),
-        })
-        const rawInterval = Number(process.env.COMMERCIAL_TAPE_MATERIALIZATION_INTERVAL_MS)
-        const intervalMs = Number.isFinite(rawInterval) && rawInterval >= 1000 ? rawInterval : 5_000
-        const h = trackScheduler(
-          'tapeJobScheduler',
-          'shared',
-          startTapeJobScheduler({
-            pool: getPool(),
-            materializePool,
-            intervalMs,
-            runOnStart: true,
-            onError: (err) =>
-              rootLogger.warn('[tapeJobScheduler] tick failed', {
-                err: (err as Error)?.message ?? String(err),
-              }),
-            materializeTape: async (job, renew) => {
-              _setAfterLosslessStageBatch(renew)
-              try {
-                const header = await getPool().query<{
-                  agent_id: string
-                  turn_index: number
-                  status: 'completed' | 'interrupted' | 'crashed'
-                  turn_key: string
-                  tape_sha256: string
-                  total_bytes: string
-                  part_count: number
-                  created_at: string
-                  waive_reason: string | null
-                  model: string | null
-                  dispatch_id: string | null
-                  attempt_no: number | null
-                  materialized: boolean
-                }>(
-                  `SELECT agent_id, turn_index, status, turn_key, tape_sha256, total_bytes::text,
+        });
+        const rawInterval = Number(process.env.COMMERCIAL_TAPE_MATERIALIZATION_INTERVAL_MS);
+        const intervalMs = Number.isFinite(rawInterval) && rawInterval >= 1000 ? rawInterval : 5_000;
+        const h = trackScheduler("tapeJobScheduler", "shared", startTapeJobScheduler({
+          pool: getPool(),
+          materializePool,
+          intervalMs,
+          runOnStart: true,
+          onError: (err) => rootLogger.warn("[tapeJobScheduler] tick failed", {
+            err: (err as Error)?.message ?? String(err),
+          }),
+          materializeTape: async (job, renew) => {
+            _setAfterLosslessStageBatch(renew);
+            try {
+              const header = await getPool().query<{
+                agent_id: string;
+                turn_index: number;
+                status: "completed" | "interrupted" | "crashed";
+                turn_key: string;
+                tape_sha256: string;
+                total_bytes: string;
+                part_count: number;
+                created_at: string;
+                waive_reason: string | null;
+                model: string | null;
+                dispatch_id: string | null;
+                attempt_no: number | null;
+                materialized: boolean;
+              }>(
+                `SELECT agent_id, turn_index, status, turn_key, tape_sha256, total_bytes::text,
                         part_count, created_at::text, waive_reason, NULL::text AS model,
                         dispatch_id::text, attempt_no,
                         (materialization_status='complete' OR finalized_at IS NOT NULL) AS materialized
                    FROM client_session_turn_tapes
                   WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
-                  [job.sessionId, job.userId, job.tapeId],
-                )
-                const row = header.rows[0]
-                if (!row) throw new Error('tape header missing for materialization job')
-                if (row.materialized) return
-                const result = await materializeBackend.finalizeLosslessTurnTape(job.userId, {
-                  protocolVersion: 2,
-                  action: 'finalize',
-                  sessionId: job.sessionId,
-                  agentId: row.agent_id,
-                  turnIndex: row.turn_index,
-                  status: row.status,
-                  turnKey: row.turn_key,
-                  tapeId: job.tapeId,
-                  tapeSha256: row.tape_sha256,
-                  totalBytes: Number(row.total_bytes),
-                  partCount: row.part_count,
-                  createdAt: Number(row.created_at),
-                  ...(row.waive_reason ? { waiveReason: row.waive_reason as 'idle_timeout' } : {}),
-                  ...(row.dispatch_id
-                    ? { dispatchId: row.dispatch_id, attemptNo: row.attempt_no ?? 1 }
-                    : {}),
-                })
-                if (result.applied === 'incomplete') {
-                  throw new Error('tape materialization still incomplete')
-                }
-                const done = await getPool().query<{ ok: boolean }>(
-                  `SELECT (materialization_status='complete' OR finalized_at IS NOT NULL) AS ok
+                [job.sessionId, job.userId, job.tapeId],
+              );
+              const row = header.rows[0];
+              if (!row) throw new Error("tape header missing for materialization job");
+              if (row.materialized) return;
+              const result = await materializeBackend.finalizeLosslessTurnTape(job.userId, {
+                protocolVersion: 2,
+                action: "finalize",
+                sessionId: job.sessionId,
+                agentId: row.agent_id,
+                turnIndex: row.turn_index,
+                status: row.status,
+                turnKey: row.turn_key,
+                tapeId: job.tapeId,
+                tapeSha256: row.tape_sha256,
+                totalBytes: Number(row.total_bytes),
+                partCount: row.part_count,
+                createdAt: Number(row.created_at),
+                ...(row.waive_reason ? { waiveReason: row.waive_reason as "idle_timeout" } : {}),
+                ...(row.dispatch_id ? { dispatchId: row.dispatch_id, attemptNo: row.attempt_no ?? 1 } : {}),
+              });
+              if (result.applied === "incomplete") {
+                throw new Error("tape materialization still incomplete");
+              }
+              const done = await getPool().query<{ ok: boolean }>(
+                `SELECT (materialization_status='complete' OR finalized_at IS NOT NULL) AS ok
                    FROM client_session_turn_tapes
                   WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
-                  [job.sessionId, job.userId, job.tapeId],
-                )
-                if (done.rows[0]?.ok !== true) {
-                  throw new Error('tape materialization pending after finalize')
-                }
-              } finally {
-                _setAfterLosslessStageBatch(null)
+                [job.sessionId, job.userId, job.tapeId],
+              );
+              if (done.rows[0]?.ok !== true) {
+                throw new Error("tape materialization pending after finalize");
               }
-            },
-            settleJob: async (job) => {
-              const uidMatch = /^c:([1-9][0-9]*)$/.exec(job.userId)
-              if (!uidMatch) throw new Error('settlement job requires commercial user')
-              const uid = BigInt(uidMatch[1]!)
-              if (job.kind === 'billing') {
-                const billings = Array.isArray(
-                  (job.payload as { engineBillings?: unknown }).engineBillings,
-                )
-                  ? (
-                      job.payload as {
-                        engineBillings: import('@openclaude/protocol').DurableCodexBilling[]
-                      }
-                    ).engineBillings
-                  : []
-                for (const billing of billings) {
-                  await settleTapeEngineBilling(uid, billing)
-                }
-                return
+            } finally {
+              _setAfterLosslessStageBatch(null);
+            }
+          },
+          settleJob: async (job) => {
+            const uidMatch = /^c:([1-9][0-9]*)$/.exec(job.userId);
+            if (!uidMatch) throw new Error("settlement job requires commercial user");
+            const uid = BigInt(uidMatch[1]!);
+            if (job.kind === "billing") {
+              const billings = Array.isArray((job.payload as { engineBillings?: unknown }).engineBillings)
+                ? (job.payload as { engineBillings: import("@openclaude/protocol").DurableCodexBilling[] }).engineBillings
+                : [];
+              for (const billing of billings) {
+                await settleTapeEngineBilling(uid, billing);
               }
-              const reason = (job.payload as { reason?: string; turnKey?: string }).reason
-              const turnKey = (job.payload as { turnKey?: string }).turnKey
-              if (!reason || !turnKey) throw new Error('waiver job payload missing reason/turnKey')
-              await applyTurnWaiver(getPool(), {
-                userId: uid,
-                turnKey,
-                reason: reason as 'idle_timeout',
-                logger: rootLogger.child({ subsys: 'tapeWaiver' }),
-              })
-            },
-          }),
-        )
+              return;
+            }
+            const reason = (job.payload as { reason?: string; turnKey?: string }).reason;
+            const turnKey = (job.payload as { turnKey?: string }).turnKey;
+            if (!reason || !turnKey) throw new Error("waiver job payload missing reason/turnKey");
+            await applyTurnWaiver(getPool(), {
+              userId: uid,
+              turnKey,
+              reason: reason as "idle_timeout",
+              logger: rootLogger.child({ subsys: "tapeWaiver" }),
+            });
+          },
+        }));
         // Coalesce: a burst of finalizes runs at most one extra tick at a time;
         // kicks that arrive mid-tick fold into a single follow-up tick (each
         // tick claims one materialization job, so the follow-up is needed for
         // the second finalize of a burst; anything beyond that waits for the
         // interval). runNow() itself serialises against the scheduler's inFlight.
-        let kickRunning = false
-        let kickRequested = false
+        let kickRunning = false;
+        let kickRequested = false;
         const drainKicks = (): void => {
-          if (kickRunning) {
-            kickRequested = true
-            return
-          }
-          kickRunning = true
-          void h
-            .runNow()
-            .catch(() => undefined)
-            .finally(() => {
-              kickRunning = false
-              if (kickRequested) {
-                kickRequested = false
-                drainKicks()
-              }
-            })
-        }
-        tapeSchedulerKickRef.current = drainKicks
+          if (kickRunning) { kickRequested = true; return; }
+          kickRunning = true;
+          void h.runNow().catch(() => undefined).finally(() => {
+            kickRunning = false;
+            if (kickRequested) { kickRequested = false; drainKicks(); }
+          });
+        };
+        tapeSchedulerKickRef.current = drainKicks;
         return {
           stop: async () => {
-            tapeSchedulerKickRef.current = () => {
-              /* scheduler stopped */
-            }
-            await h.stop()
-            await materializePool.end()
+            tapeSchedulerKickRef.current = () => { /* scheduler stopped */ };
+            await h.stop();
+            await materializePool.end();
           },
-        }
+        };
       },
-    })
+    });
   }
 
   // durable turn dispatch reconciler(RFC §2.3):open dispatch 周期收敛(admitted 过期租约 →
   // 容器求证 → terminal/accepted;terminal 未通知 → 财务联查 → 真实终态 / manual_reconcile)。
   // leaderBundle shared 单跑(双 master 只 leader)。仅 v5(turn_dispatches 由 0170 建)。
-  if (runtimeChannel === 'v5' && process.env.COMMERCIAL_TURN_DISPATCH_RECONCILER_DISABLED !== '1') {
-    const dispatchBridgeSecret = bridgeSecret
+  if (runtimeChannel === "v5" && process.env.COMMERCIAL_TURN_DISPATCH_RECONCILER_DISABLED !== "1") {
+    const dispatchBridgeSecret = bridgeSecret;
     leaderBundle.add({
-      name: 'turnDispatchReconciler',
-      domain: 'shared',
+      name: "turnDispatchReconciler",
+      domain: "shared",
       start: () => {
-        const rawInterval = Number(process.env.COMMERCIAL_TURN_DISPATCH_RECONCILER_INTERVAL_MS)
-        const intervalMs =
-          Number.isFinite(rawInterval) && rawInterval >= 5000 ? rawInterval : 30_000
-        const rawCodexMax = Number(process.env.CODEX_SESSION_MAX_MS)
+        const rawInterval = Number(process.env.COMMERCIAL_TURN_DISPATCH_RECONCILER_INTERVAL_MS);
+        const intervalMs = Number.isFinite(rawInterval) && rawInterval >= 5000 ? rawInterval : 30_000;
+        const rawCodexMax = Number(process.env.CODEX_SESSION_MAX_MS);
         const stuckThresholdMs = resolveDispatchStuckThresholdMs(
           process.env.COMMERCIAL_TURN_DISPATCH_STUCK_MS,
           Number.isFinite(rawCodexMax) ? rawCodexMax : undefined,
-        )
+        );
         // 独立 transport 实例(keep-alive 池);无 bridgeSecret → resolveRunningEndpoint 恒 null,
         // 容器求证分支跳过,reconciler 仍跑纯 DB 的财务/告警分支(不静默丢终态)。
         const container = makeContainerDispatchClient({
           transport: makeNodeHttpContainerTransport(),
           desktopTransport: makeDesktopContainerTransport(),
-          bridgeSecret: dispatchBridgeSecret ?? '',
+          bridgeSecret: dispatchBridgeSecret ?? "",
           resolveRunningEndpoint: async (id) => {
-            if (!dispatchBridgeSecret) return null
-            return resolveDispatchEndpoint(id)
+            if (!dispatchBridgeSecret) return null;
+            return resolveDispatchEndpoint(id);
           },
-        })
+        });
         const reconcilerDeps = {
           pool: getPool(),
           container,
@@ -6753,9 +6539,7 @@ export async function registerCommercial(
           // B-R1-1:abort 掉从未执行的 pre-forward journal 后,提前释放其 preCheck reservation
           // (best-effort;reservation 本会自然过期)。
           releaseReservation: (ref: { userId: string; requestId: string }) =>
-            releasePreCheck(preCheckRedis, { userId: ref.userId, requestId: ref.requestId }).then(
-              () => {},
-            ),
+            releasePreCheck(preCheckRedis, { userId: ref.userId, requestId: ref.requestId }).then(() => {}),
           // M4:真实终态落库后 best-effort 实时 nudge —— 复用既有 turn_state_unknown
           // reconcile 帧型(前端收到即 forceSync 拉回该 dispatch 的权威状态卡)。
           // published≠delivered:用户离线/已切轮则无害吞掉,终态已持久,下次 sync 必达。
@@ -6765,50 +6549,43 @@ export async function registerCommercial(
             uid: bigint,
             sessionId: string,
             clientMessageId: string,
-            reconcile?: 'turn_completed' | 'interrupted' | 'turn_state_unknown',
+            reconcile?: "turn_completed" | "interrupted" | "turn_state_unknown",
           ) => {
             try {
-              userChatBridge.broadcastToUser(
-                uid,
-                buildTurnDispatchReconcileFrame({
-                  sessionId,
-                  clientMessageId,
-                  reconcile,
-                }),
-              )
+              userChatBridge.broadcastToUser(uid, buildTurnDispatchReconcileFrame({
+                sessionId,
+                clientMessageId,
+                reconcile,
+              }));
             } catch {
               /* best-effort */
             }
           },
-          commitVisibleTape: async (input: {
-            userId: string
-            sessionId: string
-            tapeId: string
-          }) => {
+          commitVisibleTape: async (input: { userId: string; sessionId: string; tapeId: string }) => {
             const header = await getPool().query<{
-              agent_id: string
-              turn_index: number
-              status: 'completed' | 'interrupted' | 'crashed'
-              turn_key: string
-              tape_sha256: string
-              total_bytes: string
-              part_count: number
-              created_at: string
-              waive_reason: string | null
-              dispatch_id: string | null
-              attempt_no: number | null
+              agent_id: string;
+              turn_index: number;
+              status: "completed" | "interrupted" | "crashed";
+              turn_key: string;
+              tape_sha256: string;
+              total_bytes: string;
+              part_count: number;
+              created_at: string;
+              waive_reason: string | null;
+              dispatch_id: string | null;
+              attempt_no: number | null;
             }>(
               `SELECT agent_id, turn_index, status, turn_key, tape_sha256, total_bytes::text,
                       part_count, created_at::text, waive_reason, dispatch_id::text, attempt_no
                  FROM client_session_turn_tapes
                 WHERE session_id=$1 AND user_id=$2 AND tape_id=$3`,
               [input.sessionId, input.userId, input.tapeId],
-            )
-            const row = header.rows[0]
-            if (!row) throw new Error('visible tape header missing')
+            );
+            const row = header.rows[0];
+            if (!row) throw new Error("visible tape header missing");
             await commitVisibleLosslessTurnPhaseA(getPool(), input.userId, {
               protocolVersion: 2,
-              action: 'finalize',
+              action: "finalize",
               sessionId: input.sessionId,
               agentId: row.agent_id,
               turnIndex: row.turn_index,
@@ -6819,81 +6596,69 @@ export async function registerCommercial(
               totalBytes: Number(row.total_bytes),
               partCount: row.part_count,
               createdAt: Number(row.created_at),
-              ...(row.waive_reason ? { waiveReason: row.waive_reason as 'idle_timeout' } : {}),
-              ...(row.dispatch_id
-                ? { dispatchId: row.dispatch_id, attemptNo: row.attempt_no ?? 1 }
-                : {}),
-            })
+              ...(row.waive_reason ? { waiveReason: row.waive_reason as "idle_timeout" } : {}),
+              ...(row.dispatch_id ? { dispatchId: row.dispatch_id, attemptNo: row.attempt_no ?? 1 } : {}),
+            });
           },
-        }
-        const h = trackScheduler(
-          'turnDispatchReconciler',
-          'shared',
-          startTurnDispatchReconciler({
-            ...reconcilerDeps,
-            intervalMs,
-            runOnStart: true,
-          }),
-        )
-        turnDispatchShutdownHandoff = () =>
-          runShutdownDispatchHandoff({
-            ...reconcilerDeps,
-            budgetMs: DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS,
-            limit: 8,
-          })
-        return { stop: () => h.stop() }
+        };
+        const h = trackScheduler("turnDispatchReconciler", "shared", startTurnDispatchReconciler({
+          ...reconcilerDeps,
+          intervalMs,
+          runOnStart: true,
+        }));
+        turnDispatchShutdownHandoff = () => runShutdownDispatchHandoff({
+          ...reconcilerDeps,
+          budgetMs: DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS,
+          limit: 8,
+        });
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // Cursor pending-audit reconciler(2026-09-02):兜底 cursor_external_usage_audit 长期
   // pending 的行(live WS 帧丢失 + 旧 gateway tape 无 engine_billings),从 finalized tape
   // 重建 usage 走 durable cursor settle。cutoff 之前的历史行只补 usage_records/cost
   // component、0 扣款(运营决策)。cutoff 缺省 = 进程启动时刻(保守:宁少扣不多扣)。
-  if (runtimeChannel === 'v5' && process.env.COMMERCIAL_CURSOR_AUDIT_RECONCILER_DISABLED !== '1') {
+  if (runtimeChannel === "v5" && process.env.COMMERCIAL_CURSOR_AUDIT_RECONCILER_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'cursorAuditReconciler',
-      domain: 'shared',
+      name: "cursorAuditReconciler",
+      domain: "shared",
       start: () => {
-        const rawInterval = Number(process.env.COMMERCIAL_CURSOR_AUDIT_RECONCILER_INTERVAL_MS)
-        const intervalMs =
-          Number.isFinite(rawInterval) && rawInterval >= 5000 ? rawInterval : 60_000
+        const rawInterval = Number(process.env.COMMERCIAL_CURSOR_AUDIT_RECONCILER_INTERVAL_MS);
+        const intervalMs = Number.isFinite(rawInterval) && rawInterval >= 5000 ? rawInterval : 60_000;
         const zeroChargeBefore =
-          parseZeroChargeCutoff(process.env.COMMERCIAL_CURSOR_AUDIT_BACKFILL_ZERO_CHARGE_BEFORE) ??
-          new Date()
-        const h = trackScheduler(
-          'cursorAuditReconciler',
-          'shared',
-          startCursorAuditReconciler({
-            ...durableCursorBillingDeps(),
-            pool: getPool(),
-            zeroChargeBefore,
-            intervalMs,
-            runOnStart: true,
-          }),
-        )
-        rootLogger.info('cursorAuditReconciler started', {
+          parseZeroChargeCutoff(process.env.COMMERCIAL_CURSOR_AUDIT_BACKFILL_ZERO_CHARGE_BEFORE)
+          ?? new Date();
+        const h = trackScheduler("cursorAuditReconciler", "shared", startCursorAuditReconciler({
+          ...durableCursorBillingDeps(),
+          pool: getPool(),
+          zeroChargeBefore,
+          intervalMs,
+          runOnStart: true,
+        }));
+        rootLogger.info("cursorAuditReconciler started", {
           intervalMs,
           zeroChargeBefore: zeroChargeBefore.toISOString(),
-        })
-        return { stop: () => h.stop() }
+        });
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // Onboarding inbox scheduler — 由 system_settings.onboarding_enabled 决定是否真发,
   // 默认 false 上线即静默,boss 显式开启后才触达用户。详见 inbox/onboarding.ts。P3:收口 LeaderBundle。
-  if (process.env.COMMERCIAL_ONBOARDING_DISABLED !== '1') {
+  if (process.env.COMMERCIAL_ONBOARDING_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'onboarding',
-      domain: 'shared',
+      name: "onboarding",
+      domain: "shared",
       start: () => {
-        const raw = Number(process.env.COMMERCIAL_ONBOARDING_INTERVAL_MS)
-        const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 60_000
-        const h = trackScheduler('onboarding', 'shared', startOnboardingScheduler({ intervalMs }))
-        return { stop: () => h.stop() }
+        const raw = Number(process.env.COMMERCIAL_ONBOARDING_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 60_000;
+        const h = trackScheduler("onboarding", "shared", startOnboardingScheduler({ intervalMs }));
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // Plan C — inbox 站内信邮件推送 worker.
@@ -6901,21 +6666,17 @@ export async function registerCommercial(
   // 本 scheduler 周期 drain;启动时一次 stale cleanup(sending>5min → interrupted).
   // 关闭:COMMERCIAL_INBOX_EMAIL_DISABLED=1.默认 30s tick / 50 条/batch / 600ms 间隔.
   // mailer 走 stub 也能跑(打 stdout),只有禁用 worker 时不跑.
-  if (process.env.COMMERCIAL_INBOX_EMAIL_DISABLED !== '1') {
+  if (process.env.COMMERCIAL_INBOX_EMAIL_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'inboxEmail',
-      domain: 'shared',
+      name: "inboxEmail",
+      domain: "shared",
       start: () => {
-        const raw = Number(process.env.COMMERCIAL_INBOX_EMAIL_INTERVAL_MS)
-        const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 30_000
-        const h = trackScheduler(
-          'inboxEmail',
-          'shared',
-          startInboxEmailScheduler({ mailer, intervalMs }),
-        )
-        return { stop: () => h.stop() }
+        const raw = Number(process.env.COMMERCIAL_INBOX_EMAIL_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 30_000;
+        const h = trackScheduler("inboxEmail", "shared", startInboxEmailScheduler({ mailer, intervalMs }));
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // 科研 durable job worker(v5 科研 agent 子系统)。
@@ -6929,23 +6690,19 @@ export async function registerCommercial(
   // 关闭:COMMERCIAL_RESEARCH_JOBS_DISABLED=1.默认 5s tick.
   // handler map:R5 Phase A 起接 research_task(mode=fetch 批量全文下载,见
   // research/fetchJobs.ts);其余 kind 仍留 DI seam 待后续期注入.
-  let researchJobScheduler: ResearchJobSchedulerHandle | undefined
+  let researchJobScheduler: ResearchJobSchedulerHandle | undefined;
   if (
-    (controlPlaneEnabled || runtimeChannel === 'v5') &&
-    process.env.COMMERCIAL_RESEARCH_JOBS_DISABLED !== '1'
+    (controlPlaneEnabled || runtimeChannel === "v5") &&
+    process.env.COMMERCIAL_RESEARCH_JOBS_DISABLED !== "1"
   ) {
-    const raw = Number(process.env.COMMERCIAL_RESEARCH_JOBS_INTERVAL_MS)
-    const intervalMs = Number.isFinite(raw) && raw >= 2000 ? raw : 5_000
-    researchJobScheduler = trackScheduler(
-      'researchJobs',
-      'v5-owned',
-      startResearchJobScheduler({
-        // R5 Phase A:research_task(mode=fetch)批量全文下载 —— dormant scheduler 的
-        // 第一个真实 handler(逐条容错 + pdf_ingested 相位 checkpoint 续跑)。
-        handlers: makeResearchFetchJobHandlers(),
-        intervalMs,
-      }),
-    )
+    const raw = Number(process.env.COMMERCIAL_RESEARCH_JOBS_INTERVAL_MS);
+    const intervalMs = Number.isFinite(raw) && raw >= 2000 ? raw : 5_000;
+    researchJobScheduler = trackScheduler("researchJobs", "v5-owned", startResearchJobScheduler({
+      // R5 Phase A:research_task(mode=fetch)批量全文下载 —— dormant scheduler 的
+      // 第一个真实 handler(逐条容错 + pdf_ingested 相位 checkpoint 续跑)。
+      handlers: makeResearchFetchJobHandlers(),
+      intervalMs,
+    }));
   }
 
   // cron 触发权威上移 master:到点确保容器活着(方案 docs/plans/v5-cron-master-wake-2026-07-07.md §3)。
@@ -6956,60 +6713,52 @@ export async function registerCommercial(
   // rescan 是 self-host 假设(v5 现状全本机卷);多机化时改走 node-agent 读卷(方案已登记为已知边界)。
   // P3:cronWake 需交接调度器(RFC §2)→ 收口 LeaderBundle(单 leader 唤醒,消双 master 双唤醒烧钱)。
   // membership = ensureContainerReady 在手 + !DISABLED(不含 leadership;lease/legacy 触发启动)。
-  if (process.env.COMMERCIAL_CRON_WAKE_DISABLED !== '1' && ensureContainerReady) {
-    const wakeFn = ensureContainerReady // 已 guard 非空
+  if (process.env.COMMERCIAL_CRON_WAKE_DISABLED !== "1" && ensureContainerReady) {
+    const wakeFn = ensureContainerReady; // 已 guard 非空
     leaderBundle.add({
-      name: 'cronWake',
-      domain: 'v5-owned',
+      name: "cronWake",
+      domain: "v5-owned",
       start: () => {
-        const cronWakeRunner = getPool() as unknown as CronWakeRunner
-        const maxRaw = Number(process.env.COMMERCIAL_CRON_WAKE_MAX_PER_TICK)
-        const maxPerTick = Number.isFinite(maxRaw) && maxRaw >= 1 ? Math.trunc(maxRaw) : undefined
-        const cdRaw = Number(process.env.COMMERCIAL_CRON_WAKE_COOLDOWN_MIN)
-        const cooldownMs =
-          Number.isFinite(cdRaw) && cdRaw >= 0 ? Math.trunc(cdRaw) * 60_000 : undefined
-        const cronWakeScheduler = trackScheduler(
-          'cronWake',
-          'v5-owned',
-          startCronWakeScheduler({
-            findDueUsers: (scanLimit, horizonSec) =>
-              findDueCronWakeUsers(cronWakeRunner, {
-                runtimeChannel: getRuntimeChannel(),
-                horizonSec,
-                scanLimit,
-              }),
-            // active 判定:**有在跑容器**(state='active' 且 cid 已落库)才跳过唤醒。
-            // 修 Codex MAJOR:不再用 findUserDataHost(纯按 state 派生、不看 cid)—— 否则 saga
-            // 孤儿(active+cid=NULL,master 在 Tx1/Tx2 间崩溃/重启留下)被当 active → skippedActive
-            // → 永不唤醒 → 永不进 sharedEnsureRunning 自愈 → cron 驱动用户 cron 永不 fire。
-            // userHasRunningContainer 用 cid IS NOT NULL 排除孤儿(返回 false),让 cronWake 照常
-            // 唤醒:在途→join singleflight;孤儿→getV3ContainerStatus provisioning/missing 自愈。
-            // (agent_containers 只做「跳过 active」优化,不做发现源;发现源=cron_wake_index。)
-            isContainerActive: async (uid) => computeQueries.userHasRunningContainer(Number(uid)),
-            wakeContainer: (uid) => wakeFn(uid),
-            recordWakeOutcome: ({ userId, correlation, outcome, attempts }) => {
-              void recordProductFrictionEvent(
-                {
-                  correlation,
-                  userId,
-                  surface: 'cron',
-                  stage: 'container_wake',
-                  code: 'WAKE_FAILED',
-                  outcome,
-                  attempts,
-                },
-                getPool(),
-              ).catch(() => {})
-            },
-            runRescan: () => runCronWakeRescan({ runner: cronWakeRunner }),
-            logger: rootLogger,
-            maxPerTick,
-            cooldownMs,
-          }),
-        )
-        return { stop: () => cronWakeScheduler.stop() }
+    const cronWakeRunner = getPool() as unknown as CronWakeRunner;
+    const maxRaw = Number(process.env.COMMERCIAL_CRON_WAKE_MAX_PER_TICK);
+    const maxPerTick = Number.isFinite(maxRaw) && maxRaw >= 1 ? Math.trunc(maxRaw) : undefined;
+    const cdRaw = Number(process.env.COMMERCIAL_CRON_WAKE_COOLDOWN_MIN);
+    const cooldownMs = Number.isFinite(cdRaw) && cdRaw >= 0 ? Math.trunc(cdRaw) * 60_000 : undefined;
+    const cronWakeScheduler = trackScheduler("cronWake", "v5-owned", startCronWakeScheduler({
+      findDueUsers: (scanLimit, horizonSec) =>
+        findDueCronWakeUsers(cronWakeRunner, {
+          runtimeChannel: getRuntimeChannel(),
+          horizonSec,
+          scanLimit,
+        }),
+      // active 判定:**有在跑容器**(state='active' 且 cid 已落库)才跳过唤醒。
+      // 修 Codex MAJOR:不再用 findUserDataHost(纯按 state 派生、不看 cid)—— 否则 saga
+      // 孤儿(active+cid=NULL,master 在 Tx1/Tx2 间崩溃/重启留下)被当 active → skippedActive
+      // → 永不唤醒 → 永不进 sharedEnsureRunning 自愈 → cron 驱动用户 cron 永不 fire。
+      // userHasRunningContainer 用 cid IS NOT NULL 排除孤儿(返回 false),让 cronWake 照常
+      // 唤醒:在途→join singleflight;孤儿→getV3ContainerStatus provisioning/missing 自愈。
+      // (agent_containers 只做「跳过 active」优化,不做发现源;发现源=cron_wake_index。)
+      isContainerActive: async (uid) => computeQueries.userHasRunningContainer(Number(uid)),
+      wakeContainer: (uid) => wakeFn(uid),
+      recordWakeOutcome: ({ userId, correlation, outcome, attempts }) => {
+        void recordProductFrictionEvent({
+          correlation,
+          userId,
+          surface: "cron",
+          stage: "container_wake",
+          code: "WAKE_FAILED",
+          outcome,
+          attempts,
+        }, getPool()).catch(() => {});
       },
-    })
+      runRescan: () => runCronWakeRescan({ runner: cronWakeRunner }),
+      logger: rootLogger,
+      maxPerTick,
+      cooldownMs,
+    }));
+        return { stop: () => cronWakeScheduler.stop() };
+      },
+    });
   }
 
   // 市场发布 AI 自动审批 worker(deepseek-v4-flash via OpenCode Go)。仅 v5 启动:marketplace 表 v3/v5 共享
@@ -7017,29 +6766,28 @@ export async function registerCommercial(
   // 纯人审、零行为变更。domain 'v5-owned'(v5 合法后台职责;写共享 marketplace 表但由
   // FOR UPDATE SKIP LOCKED 协调,v3 不参与)。关停:OC_MARKETPLACE_AI_REVIEW_DISABLED=1。
   // key 缺席不崩:worker 把 queued backlog 转人工 + 启动 warn(fail-closed)。
-  let marketplaceAiReviewScheduler: MarketplaceAiReviewSchedulerHandle | undefined
-  if (runtimeChannel === 'v5' && process.env.OC_MARKETPLACE_AI_REVIEW_DISABLED !== '1') {
-    const raw = Number(process.env.OC_MARKETPLACE_AI_REVIEW_INTERVAL_MS)
-    const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 15_000
-    marketplaceAiReviewScheduler = trackScheduler(
-      'marketplaceAiReview',
-      'v5-owned',
-      startMarketplaceAiReviewScheduler({
-        apiKey: cfg.OPENCODE_GO_API_KEY,
-        intervalMs,
-        logger: {
-          info: (m) => rootLogger.info(m, { subsys: 'commercial', module: 'marketplaceAiReview' }),
-          warn: (m) => rootLogger.warn(m, { subsys: 'commercial', module: 'marketplaceAiReview' }),
-        },
-        onError: (err, versionId) =>
-          rootLogger.warn(
-            `[marketplace/aiReview] error${versionId ? ` (version ${versionId})` : ''}: ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-            { subsys: 'commercial', module: 'marketplaceAiReview' },
-          ),
-      }),
-    )
+  let marketplaceAiReviewScheduler: MarketplaceAiReviewSchedulerHandle | undefined;
+  if (
+    runtimeChannel === "v5" &&
+    process.env.OC_MARKETPLACE_AI_REVIEW_DISABLED !== "1"
+  ) {
+    const raw = Number(process.env.OC_MARKETPLACE_AI_REVIEW_INTERVAL_MS);
+    const intervalMs = Number.isFinite(raw) && raw >= 5000 ? raw : 15_000;
+    marketplaceAiReviewScheduler = trackScheduler("marketplaceAiReview", "v5-owned", startMarketplaceAiReviewScheduler({
+      apiKey: cfg.OPENCODE_GO_API_KEY,
+      intervalMs,
+      logger: {
+        info: (m) => rootLogger.info(m, { subsys: "commercial", module: "marketplaceAiReview" }),
+        warn: (m) => rootLogger.warn(m, { subsys: "commercial", module: "marketplaceAiReview" }),
+      },
+      onError: (err, versionId) =>
+        rootLogger.warn(
+          `[marketplace/aiReview] error${versionId ? ` (version ${versionId})` : ""}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+          { subsys: "commercial", module: "marketplaceAiReview" },
+        ),
+    }));
   }
 
   // provider 健康度自动探测判定器(P3.2)。egress 在流 settle 写 provider_health_samples,
@@ -7048,15 +6796,14 @@ export async function registerCommercial(
   // 503 拦截另由 OC_PROVIDER_HEALTH_ENFORCE 控)。domain 'v5-owned':provider_ops /
   // provider_health_samples 是 v5 引入表、样本由 v5 egress 写、v3 树无对应代码。关停:
   // OC_PROVIDER_HEALTH_DISABLED=1。
-  let providerHealthScheduler: ProviderHealthSchedulerHandle | undefined
-  if (runtimeChannel === 'v5' && process.env.OC_PROVIDER_HEALTH_DISABLED !== '1') {
-    const raw = Number(process.env.OC_PROVIDER_HEALTH_INTERVAL_MS)
-    const intervalMs = Number.isFinite(raw) && raw >= 10_000 ? raw : 60_000
-    providerHealthScheduler = trackScheduler(
-      'providerHealth',
-      'v5-owned',
-      startProviderHealthScheduler({ intervalMs }),
-    )
+  let providerHealthScheduler: ProviderHealthSchedulerHandle | undefined;
+  if (
+    runtimeChannel === "v5" &&
+    process.env.OC_PROVIDER_HEALTH_DISABLED !== "1"
+  ) {
+    const raw = Number(process.env.OC_PROVIDER_HEALTH_INTERVAL_MS);
+    const intervalMs = Number.isFinite(raw) && raw >= 10_000 ? raw : 60_000;
+    providerHealthScheduler = trackScheduler("providerHealth", "v5-owned", startProviderHealthScheduler({ intervalMs }));
   }
 
   // v5 全链路自愈体系(RFC-v5-selfheal-ops)切片① — incidentReconciler + deliveries sweeper。
@@ -7065,37 +6812,33 @@ export async function registerCommercial(
   // 不写共享现网,v5 必须自跑)。reconciler 读 alert_conditions 当前值 level-triggered 投影 incidents;
   // sweeper durable 投递 WS(bridge broadcast forward-ref)+ inbox(同事务幂等)。tick 10s。
   // 关停:OC_SELFHEAL_DISABLED=1。派单(codex 修复)是切片②,sweeper 内 stub 默认关。
-  if (runtimeChannel === 'v5' && process.env.OC_SELFHEAL_DISABLED !== '1') {
+  if (runtimeChannel === "v5" && process.env.OC_SELFHEAL_DISABLED !== "1") {
     // M5+B3(收尾批):装配前配置硬校验——dispatch 启用时密钥长度/互异/派单 URL
     // loopback 钉死,违规 throw fail-fast 拒启;禁用时仅 warn。数值 env 解析统一
     // 收口 selfheal/config.ts。
-    assertSelfhealConfig()
+    assertSelfhealConfig();
     leaderBundle.add({
-      name: 'incidentReconciler',
-      domain: 'v5-owned',
+      name: "incidentReconciler",
+      domain: "v5-owned",
       start: () => {
         const h: IncidentReconcilerHandle = trackScheduler(
-          'incidentReconciler',
-          'v5-owned',
+          "incidentReconciler",
+          "v5-owned",
           startIncidentReconciler({ intervalMs: selfhealTickMs() }),
-        )
-        return { stop: () => h.stop() }
+        );
+        return { stop: () => h.stop() };
       },
-    })
+    });
     leaderBundle.add({
-      name: 'incidentSweeper',
-      domain: 'v5-owned',
+      name: "incidentSweeper",
+      domain: "v5-owned",
       start: () => {
-        const h: IncidentSweeperHandle = trackScheduler(
-          'incidentSweeper',
-          'v5-owned',
-          startIncidentSweeper({
-            intervalMs: selfhealTickMs(),
-          }),
-        )
-        return { stop: () => h.stop() }
+        const h: IncidentSweeperHandle = trackScheduler("incidentSweeper", "v5-owned", startIncidentSweeper({
+          intervalMs: selfhealTickMs(),
+        }));
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // 应用连接器 sweeper(设计终稿 §3 护栏):独立定时器,**不挂**被钉死的 idleSweep。
@@ -7106,21 +6849,17 @@ export async function registerCommercial(
   // 旧实现 eager-start + gate 在 controlPlaneEnabled(静态 env):双 master 下两 slot env 都=1 →
   // 双跑(双 expire / 双 DELETE 竞态)。收口进 bundle(单 leader 单跑,与 wecomAlert/cronWake 同),
   // 启停交给 lease。关停:OC_CONNECTOR_SWEEPER_DISABLED=1。
-  if (runtimeChannel === 'v5' && process.env.OC_CONNECTOR_SWEEPER_DISABLED !== '1') {
+  if (runtimeChannel === "v5" && process.env.OC_CONNECTOR_SWEEPER_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'connectorSweeper',
-      domain: 'v5-owned',
+      name: "connectorSweeper",
+      domain: "v5-owned",
       start: async () => {
-        const raw = Number(process.env.OC_CONNECTOR_SWEEPER_INTERVAL_MS)
-        const intervalMs = Number.isFinite(raw) && raw >= 5_000 ? raw : 60_000
-        const h = trackScheduler(
-          'connectorSweeper',
-          'v5-owned',
-          startConnectorSweeper({ intervalMs }),
-        )
-        return { stop: () => h.stop() }
+        const raw = Number(process.env.OC_CONNECTOR_SWEEPER_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 5_000 ? raw : 60_000;
+        const h = trackScheduler("connectorSweeper", "v5-owned", startConnectorSweeper({ intervalMs }));
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // 知识星球无人值守回复只写 v5 专属 0168 三表，并复用 Plugin 账号串行租约。
@@ -7138,10 +6877,7 @@ export async function registerCommercial(
       start: () => {
         const raw = Number(process.env.OC_KNOWLEDGE_PLANET_AUTOMATION_INTERVAL_MS)
         const intervalMs = Number.isFinite(raw) && raw >= 60_000 ? raw : 5 * 60_000
-        const scheduler = trackScheduler(
-          'knowledgePlanetAutomation',
-          'v5-owned',
-          startKnowledgePlanetAutomationScheduler({
+        const scheduler = trackScheduler('knowledgePlanetAutomation', 'v5-owned', startKnowledgePlanetAutomationScheduler({
             runtime: pluginFacade,
             preCheckRedis,
             pricing,
@@ -7152,26 +6888,21 @@ export async function registerCommercial(
                 duty,
                 error: error instanceof Error ? error.message : String(error),
               }),
-          }),
-        )
+          }))
         return { stop: () => scheduler.stop() }
       },
     })
   }
 
-  if (runtimeChannel === 'v5' && process.env.OC_GITHUB_WORKSPACE_SWEEPER_DISABLED !== '1') {
+  if (runtimeChannel === "v5" && process.env.OC_GITHUB_WORKSPACE_SWEEPER_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'githubWorkspaceSweeper',
-      domain: 'v5-owned',
+      name: "githubWorkspaceSweeper",
+      domain: "v5-owned",
       start: () => {
-        const h = trackScheduler(
-          'githubWorkspaceSweeper',
-          'v5-owned',
-          startGithubWorkspaceSweeper(getPool()),
-        )
-        return { stop: () => h.stop() }
+        const h = trackScheduler("githubWorkspaceSweeper", "v5-owned", startGithubWorkspaceSweeper(getPool()));
+        return { stop: () => h.stop() };
       },
-    })
+    });
   }
 
   // 企业微信群机器人告警投递(v5-owned)。偿「v5 告警只入库不推送」债(playbook 债表
@@ -7192,77 +6923,48 @@ export async function registerCommercial(
   // aibot 单连接约束:双 master 各起一条 wss = 双投递/连接抢占,故必须随 leader 单实例启停。
   // dispatcher/aibot/approval 同一 member 内有序启停；approval 经 loopback slot relay
   // 并行查询/投递 A/B 两槽，只记录真实 deliveredUids，peer down/half-open 有界降级为空。
-  if (runtimeChannel === 'v5' && process.env.OC_WECOM_ALERT_DISABLED !== '1') {
+  if (runtimeChannel === "v5" && process.env.OC_WECOM_ALERT_DISABLED !== "1") {
     leaderBundle.add({
-      name: 'wecomAlert',
-      domain: 'v5-owned',
+      name: "wecomAlert",
+      domain: "v5-owned",
       start: async () => {
-        const raw = Number(process.env.OC_WECOM_ALERT_INTERVAL_MS)
-        const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 5_000
-        const aibotConn = getWecomAibotConnectionManager()
-        let dispatcher: ReturnType<typeof startWecomAlertDispatcher> | undefined
-        let approval: ReturnType<typeof startUserNoticeApproval> | undefined
+        const raw = Number(process.env.OC_WECOM_ALERT_INTERVAL_MS);
+        const intervalMs = Number.isFinite(raw) && raw >= 1000 ? raw : 5_000;
+        const aibotConn = getWecomAibotConnectionManager();
+        let dispatcher: ReturnType<typeof startWecomAlertDispatcher> | undefined;
+        let approval: ReturnType<typeof startUserNoticeApproval> | undefined;
         try {
-          await aibotConn.start()
-          dispatcher = trackScheduler(
-            'wecomAlert',
-            'v5-owned',
-            startWecomAlertDispatcher({
-              dispatchIntervalMs: intervalMs,
-              deps: { sendAibotAlert: (id, md) => aibotConn.send(id, md) },
-            }),
-          )
-          approval = trackScheduler(
-            'userNoticeApproval',
-            'v5-owned',
-            startUserNoticeApproval(aibotConn, {
+          await aibotConn.start();
+          dispatcher = trackScheduler("wecomAlert", "v5-owned", startWecomAlertDispatcher({
+            dispatchIntervalMs: intervalMs,
+            deps: { sendAibotAlert: (id, md) => aibotConn.send(id, md) },
+          }));
+          approval = trackScheduler("userNoticeApproval", "v5-owned", startUserNoticeApproval(
+            aibotConn,
+            {
               onlineUserSubset: (uids) => slotRelayClient.onlineUserSubset(uids),
               broadcastToUsers: (uids, payload) => slotRelayClient.broadcastToUsers(uids, payload),
-            }),
-          )
+            },
+          ));
         } catch (err) {
-          unregisterMutator('userNoticeApproval')
-          unregisterMutator('wecomAlert')
-          try {
-            await approval?.stop()
-          } catch {
-            /* ignore */
-          }
-          try {
-            await dispatcher?.stop()
-          } catch {
-            /* ignore */
-          }
-          try {
-            await aibotConn.stop()
-          } catch {
-            /* ignore */
-          }
-          throw err
+          unregisterMutator("userNoticeApproval");
+          unregisterMutator("wecomAlert");
+          try { await approval?.stop(); } catch { /* ignore */ }
+          try { await dispatcher?.stop(); } catch { /* ignore */ }
+          try { await aibotConn.stop(); } catch { /* ignore */ }
+          throw err;
         }
-        if (!dispatcher || !approval) throw new Error('wecom leader member incomplete startup')
+        if (!dispatcher || !approval) throw new Error("wecom leader member incomplete startup");
         return {
           stop: async () => {
-            try {
-              await approval.stop()
-            } catch {
-              /* ignore */
-            }
-            unregisterMutator('userNoticeApproval')
-            try {
-              await dispatcher.stop()
-            } catch {
-              /* ignore */
-            }
-            try {
-              await aibotConn.stop()
-            } catch {
-              /* ignore */
-            }
+            try { await approval.stop(); } catch { /* ignore */ }
+            unregisterMutator("userNoticeApproval");
+            try { await dispatcher.stop(); } catch { /* ignore */ }
+            try { await aibotConn.stop(); } catch { /* ignore */ }
           },
-        }
+        };
       },
-    })
+    });
   }
 
   // v5 灰度可观测 — runtimeStatus 暴露给 gateway /healthz,作为"控制面静默 / 运行时隔离 /
@@ -7274,30 +6976,30 @@ export async function registerCommercial(
   // gateway 每次 /healthz 都 `body.runtime=c.runtimeStatus` 再 JSON.stringify(会调 getter)→ 实时反映。
   // leadership:非 v5(无 lease)给合成态(controlPlaneEnabled→leader);v5 走 leaseController.status()。
   const legacyLeadership = (): LeadershipStatus => ({
-    state: controlPlaneEnabled ? 'leader' : 'ineligible',
+    state: controlPlaneEnabled ? "leader" : "ineligible",
     slot: ocSlot,
     generation: null,
     leasePid: controlPlaneEnabled ? process.pid : null,
-  })
+  });
   const runtimeStatus: CommercialRuntimeStatus = {
     channel: runtimeChannel,
     controlPlaneEnabled,
     autoMigrate: autoMigrateEffective,
-    agentRuntime: agentRuntime ? 'enabled' : 'disabled',
-    containerRuntime: v3Deps ? 'enabled' : 'disabled',
+    agentRuntime: agentRuntime ? "enabled" : "disabled",
+    containerRuntime: v3Deps ? "enabled" : "disabled",
     get schedulers(): string[] {
-      return schedulerRegistry.map((s) => s.name)
+      return schedulerRegistry.map((s) => s.name);
     },
     capabilities: [...MASTER_CAPABILITIES],
     get leadership(): LeadershipStatus {
-      return leaderLease ? leaderLease.status() : legacyLeadership()
+      return leaderLease ? leaderLease.status() : legacyLeadership();
     },
     // P3 放量观测(RFC D1):lane_evaluations(请求次)+lane_users((generation,uid) 去重),
     // operator 据此判断 promote N% 已覆盖多少活跃用户。只读快照,零成本。
     get laneMetrics(): ReturnType<typeof getLaneMetricsSnapshot> {
-      return getLaneMetricsSnapshot()
+      return getLaneMetricsSnapshot();
     },
-  }
+  };
   // fail-closed:非 leader 绝不允许 shared mutator 存活 —— 拦"gate 漏配让 follower 写共享现网"。
   // P3 MAJOR 5:判据从**静态 controlPlaneEnabled 改为实时 leadership**。原因:双 master 下两 slot 的
   // OC_CONTROL_PLANE_LEADER 都=1 → controlPlaneEnabled 两 slot 都 true,`!controlPlaneEnabled` 恒 false
@@ -7309,22 +7011,22 @@ export async function registerCommercial(
   // eager 残留(compute-pool 三件套=imagePromote/preheat 已由 MAJOR 4 在 v5 双 master fail-loud 拒起;
   // lifecycle=agent 容器 GC 仍 eager 跑在所有 v5 slot,收口债未迁 bundle)——它们不是"follower 违规",
   // 对 v5 从覆盖集剔除;非 v5(无 lease)保持全覆盖旧语义。
-  const liveLeader = leaderLease ? leaderLease.status().state === 'leader' : controlPlaneEnabled
-  const eagerResidual = leaderLease ? new Set(['lifecycle', 'imagePromote']) : new Set<string>()
+  const liveLeader = leaderLease ? leaderLease.status().state === "leader" : controlPlaneEnabled;
+  const eagerResidual = leaderLease ? new Set(["lifecycle", "imagePromote"]) : new Set<string>();
   const sharedOnFollower = schedulerRegistry
-    .filter((s) => s.domain === 'shared' && !eagerResidual.has(s.name))
-    .map((s) => s.name)
+    .filter((s) => s.domain === "shared" && !eagerResidual.has(s.name))
+    .map((s) => s.name);
   if (!liveLeader && sharedOnFollower.length > 0) {
     throw new Error(
       `[commercial] control-plane invariant violated: 非 leader(leadership=${
         leaderLease ? leaderLease.status().state : `env:${controlPlaneEnabled}`
-      })却有 shared-domain 调度器在册=[${sharedOnFollower.join(',')}]。非 leader 只允许 v5-owned/local 域 mutator。`,
-    )
+      })却有 shared-domain 调度器在册=[${sharedOnFollower.join(",")}]。非 leader 只允许 v5-owned/local 域 mutator。`,
+    );
   }
   rootLogger.info(
-    `commercial runtime status: channel=${runtimeChannel} controlPlane=${controlPlaneEnabled} slot=${ocSlot} dualMaster=${dualMasterEnabled} agentRuntime=${runtimeStatus.agentRuntime} containerRuntime=${runtimeStatus.containerRuntime} schedulers=[${runtimeStatus.schedulers.join(',')}]`,
-    { subsys: 'commercial', runtimeStatus },
-  )
+    `commercial runtime status: channel=${runtimeChannel} controlPlane=${controlPlaneEnabled} slot=${ocSlot} dualMaster=${dualMasterEnabled} agentRuntime=${runtimeStatus.agentRuntime} containerRuntime=${runtimeStatus.containerRuntime} schedulers=[${runtimeStatus.schedulers.join(",")}]`,
+    { subsys: "commercial", runtimeStatus },
+  );
 
   // ── P3 触发:LeaderBundle 启动时机(RFC D4/§5)────────────────────────────────
   // v5:交给 lease controller——env 资格 ∧ desired_leader_slot==本 slot → 竞 advisory → 安装 lease →
@@ -7333,15 +7035,13 @@ export async function registerCommercial(
   // 非 v5(v3/个人版遗留):无 lease,保持旧 eager 语义——controlPlaneEnabled(leader)即同步 start 全部
   //    bundle 成员(与改造前"每个 shared 都 if(controlPlaneEnabled) eager-start"净效果一致)。
   if (dualMasterEnabled) {
-    leaderLease!.start()
+    leaderLease!.start();
   } else if (controlPlaneEnabled) {
-    await leaderBundle.start()
-    await seedPlatformAgentsForLeadership()
+    await leaderBundle.start();
+    await seedPlatformAgentsForLeadership();
   }
 
-  setContentReviewAlerter((event) => {
-    void alertContentReview(event)
-  })
+  setContentReviewAlerter((event) => { void alertContentReview(event) })
 
   return {
     handle: async (req, res) => {
@@ -7349,27 +7049,27 @@ export async function registerCommercial(
       // Claim those requests before the ordinary commercial router so an
       // invalid/expired preview can never fall through to the main SPA/API.
       if (directContainerPreview && (await directContainerPreview.handleHttp(req, res))) {
-        return true
+        return true;
       }
-      return await handler(req, res)
+      return await handler(req, res);
     },
     runtimeStatus,
     handleWsUpgrade: (req, socket, head) => {
-      if (directContainerPreview?.handleUpgrade(req, socket, head)) return true
+      if (directContainerPreview?.handleUpgrade(req, socket, head)) return true;
       // Preview uses its own short-lived one-time ticket and must never fall
       // through to the ordinary cookie/JWT bridges.
-      if (containerPreviewBridge?.handleUpgrade(req, socket, head)) return true
+      if (containerPreviewBridge?.handleUpgrade(req, socket, head)) return true;
       // V3: 优先匹配 voice input,再 /ws/user-chat-bridge(2E)。legacy /ws/agent 已删除。
-      if (voiceTranscribeHandler.handleUpgrade(req, socket, head)) return true
-      if (userChatBridge.handleUpgrade(req, socket, head)) return true
-      return false
+      if (voiceTranscribeHandler.handleUpgrade(req, socket, head)) return true;
+      if (userChatBridge.handleUpgrade(req, socket, head)) return true;
+      return false;
     },
     shutdown: async () => {
       // P2:停 sessions GC sweeper —— 清 sweep timer、unlock advisory lease、还/销毁持锁连接
       // (否则残留 setInterval + 永不归还池的持锁连接会泄漏,且备 master 竞不到锁)。
       if (sessionsGcSweeper) {
         try {
-          await sessionsGcSweeper.stop()
+          await sessionsGcSweeper.stop();
         } catch {
           /* ignore */
         }
@@ -7379,48 +7079,20 @@ export async function registerCommercial(
       // 还能借 listener 把已经 admitted 的 outbound 完成最后一搏;同样 broker
       // 内部 fire-and-forget reflection 也能在 listener 拆掉前发送完。
       if (wechatBroker) {
-        try {
-          await wechatBroker.stop()
-        } catch {
-          /* ignore */
-        }
+        try { await wechatBroker.stop(); } catch { /* ignore */ }
       }
-      const previewBridge = containerPreviewBridge
-      containerPreviewBridge = undefined
-      const directPreview = directContainerPreview
-      directContainerPreview = undefined
-      const cgpServer = chatgptProxyServer
-      chatgptProxyServer = undefined
-      try {
-        await cgpServer?.close()
-      } catch {
-        /* ignore */
-      }
-      try {
-        await directPreview?.shutdown()
-      } catch {
-        /* ignore */
-      }
-      try {
-        await previewBridge?.shutdown()
-      } catch {
-        /* ignore */
-      }
-      try {
-        await voiceTranscribeHandler.shutdown()
-      } catch {
-        /* ignore */
-      }
-      try {
-        await userChatBridge.shutdown()
-      } catch {
-        /* ignore */
-      }
-      try {
-        await cursorExternalRoute?.close()
-      } catch {
-        /* ignore */
-      }
+      const previewBridge = containerPreviewBridge;
+      containerPreviewBridge = undefined;
+      const directPreview = directContainerPreview;
+      directContainerPreview = undefined;
+      const cgpServer = chatgptProxyServer;
+      chatgptProxyServer = undefined;
+      try { await cgpServer?.close(); } catch { /* ignore */ }
+      try { await directPreview?.shutdown(); } catch { /* ignore */ }
+      try { await previewBridge?.shutdown(); } catch { /* ignore */ }
+      try { await voiceTranscribeHandler.shutdown(); } catch { /* ignore */ }
+      try { await userChatBridge.shutdown(); } catch { /* ignore */ }
+      try { await cursorExternalRoute?.close(); } catch { /* ignore */ }
       // Managed setup/action workers must drain while PG/Redis and Docker control are alive.
       try {
         await Promise.all([
@@ -7437,181 +7109,94 @@ export async function registerCommercial(
       //    +unlock advisory —— 新 holder 拿锁即见 ACK,零等待零重叠;非 leader 则只清连接/timer。
       // 非 v5:无 lease,直接 stopAndDrain bundle(幂等)。二者都把 shared+4 特例调度器逐个 stop。
       if (leaderLease) {
-        try {
-          await leaderLease.shutdown()
-        } catch {
-          /* ignore */
-        }
+        try { await leaderLease.shutdown(); } catch { /* ignore */ }
       } else {
-        try {
-          await leaderBundle.stopAndDrain()
-        } catch {
-          /* ignore */
-        }
+        try { await leaderBundle.stopAndDrain(); } catch { /* ignore */ }
       }
       // 停机收尾:先给在飞 journal/dispatch 落「进程退出」证据,预算内再容器求证。
       // 绝不盲 finalize(引擎可能仍在容器里)。超时只留证据,让重启 tick 立刻判定。
       try {
         if (turnDispatchShutdownHandoff) {
-          await turnDispatchShutdownHandoff()
+          await turnDispatchShutdownHandoff();
         } else {
-          await markGatewayShutdownEvidence({ reason: 'process_shutdown' })
+          await markGatewayShutdownEvidence({ reason: "process_shutdown" });
         }
       } catch {
         /* ignore — 退出优先,证据写失败由重启后的保守阈值兜底 */
       }
       if (controlListener) {
-        try {
-          await controlListener.close()
-        } catch {
-          /* ignore */
-        }
+        try { await controlListener.close(); } catch { /* ignore */ }
       }
       if (deployDesiredWatch) {
-        try {
-          deployDesiredWatch.stop()
-        } catch {
-          /* ignore */
-        }
+        try { deployDesiredWatch.stop(); } catch { /* ignore */ }
       }
       // 非 bundle 的常驻调度器(v5-owned 安全双跑 + local + eager shared 例外)照旧逐个 stop。
       if (lifecycleScheduler) {
-        try {
-          await lifecycleScheduler.stop()
-        } catch {
-          /* ignore */
-        }
+        try { await lifecycleScheduler.stop(); } catch { /* ignore */ }
       }
       // 0042 — ImagePromoteScheduler 是 module 级单例,getImagePromoteScheduler() 拿到实例后调 stop
       // (compute-pool trio 保留 controlPlaneEnabled gate,未入 bundle——见文首 P3 residual 说明)
-      try {
-        getImagePromoteScheduler().stop()
-      } catch {
-        /* ignore */
-      }
+      try { getImagePromoteScheduler().stop(); } catch { /* ignore */ }
       if (codexRefreshActor) {
-        try {
-          codexRefreshActor.stop()
-        } catch {
-          /* ignore */
-        }
+        try { codexRefreshActor.stop(); } catch { /* ignore */ }
       }
       if (subscriptionRolloverSweeper) {
-        try {
-          subscriptionRolloverSweeper.stop()
-        } catch {
-          /* ignore */
-        }
+        try { subscriptionRolloverSweeper.stop(); } catch { /* ignore */ }
       }
       if (accountSlotReaper) {
-        try {
-          accountSlotReaper.stop()
-        } catch {
-          /* ignore */
-        }
+        try { accountSlotReaper.stop(); } catch { /* ignore */ }
       }
       if (codexDriftReconciler) {
-        try {
-          codexDriftReconciler.stop()
-        } catch {
-          /* ignore */
-        }
+        try { codexDriftReconciler.stop(); } catch { /* ignore */ }
       }
       if (researchJobScheduler) {
-        try {
-          researchJobScheduler.stop()
-        } catch {
-          /* ignore */
-        }
+        try { researchJobScheduler.stop(); } catch { /* ignore */ }
       }
       if (marketplaceAiReviewScheduler) {
-        try {
-          marketplaceAiReviewScheduler.stop()
-        } catch {
-          /* ignore */
-        }
+        try { marketplaceAiReviewScheduler.stop(); } catch { /* ignore */ }
       }
       if (providerHealthScheduler) {
-        try {
-          providerHealthScheduler.stop()
-        } catch {
-          /* ignore */
-        }
+        try { providerHealthScheduler.stop(); } catch { /* ignore */ }
       }
       // connector/selfheal/WeCom writers 已迁入 LeaderBundle，由 lease.shutdown→stopAndDrain 回收。
       if (baselineSrv) {
-        try {
-          await baselineSrv.stop()
-        } catch {
-          /* ignore */
-        }
+        try { await baselineSrv.stop(); } catch { /* ignore */ }
       }
       if (internalProxyServer) {
         await new Promise<void>((resolve) => {
           try {
-            internalProxyServer!.close(() => resolve())
+            internalProxyServer!.close(() => resolve());
             // 主动断现有连接,close 才能尽快回调
-            const closeAll = (
-              internalProxyServer as unknown as { closeAllConnections?: () => void }
-            ).closeAllConnections
-            if (typeof closeAll === 'function') closeAll.call(internalProxyServer)
-          } catch {
-            resolve()
-          }
-        })
+            const closeAll = (internalProxyServer as unknown as { closeAllConnections?: () => void }).closeAllConnections;
+            if (typeof closeAll === "function") closeAll.call(internalProxyServer);
+          } catch { resolve(); }
+        });
       }
       if (externalMtlsServer) {
         await new Promise<void>((resolve) => {
           try {
-            externalMtlsServer!.close(() => resolve())
-            const closeAll = (externalMtlsServer as unknown as { closeAllConnections?: () => void })
-              .closeAllConnections
-            if (typeof closeAll === 'function') closeAll.call(externalMtlsServer)
-          } catch {
-            resolve()
-          }
-        })
+            externalMtlsServer!.close(() => resolve());
+            const closeAll = (externalMtlsServer as unknown as { closeAllConnections?: () => void }).closeAllConnections;
+            if (typeof closeAll === "function") closeAll.call(externalMtlsServer);
+          } catch { resolve(); }
+        });
       }
       if (desktopTlsClose) {
-        await desktopTlsClose().catch(() => {})
+        await desktopTlsClose().catch(() => {});
       }
       // 0060 — 清空 model hint provider,避免 shutdown 后还有人持 stale closure
       // (用于测试热重启场景:同一进程多次 register/shutdown 不能让旧 cache 被新 cache 引用)
-      try {
-        setModelHintProvider(null)
-      } catch {
-        /* ignore */
-      }
+      try { setModelHintProvider(null); } catch { /* ignore */ }
       // MAJOR-1 — 清空 host 静态 provider key seam(同进程热重启场景,避免旧 key 表被新进程引用)
-      try {
-        setHostStaticProviderKeys(null)
-      } catch {
-        /* ignore */
-      }
+      try { setHostStaticProviderKeys(null); } catch { /* ignore */ }
       // 0069 — 同理清空 literature skill provider(同进程热重启场景,且 closure 持
       // pg pool 句柄,留着会阻止 closePool 释放最后引用)
-      try {
-        setLiteratureSkillProvider(null)
-      } catch {
-        /* ignore */
-      }
-      try {
-        await pricing.shutdown()
-      } catch {
-        /* ignore */
-      }
-      try {
-        await redis.quit()
-      } catch {
-        /* ignore */
-      }
-      await closeModelCatalogAdminPool()
-      try {
-        await shutdownDurableMetricRollups()
-      } catch {
-        /* best-effort; absolute snapshots retry safely */
-      }
-      await closePool()
+      try { setLiteratureSkillProvider(null); } catch { /* ignore */ }
+      try { await pricing.shutdown(); } catch { /* ignore */ }
+      try { await redis.quit(); } catch { /* ignore */ }
+      await closeModelCatalogAdminPool();
+      try { await shutdownDurableMetricRollups(); } catch { /* best-effort; absolute snapshots retry safely */ }
+      await closePool();
     },
     /** V3 2H 测试 / /healthz 探测用:内部代理实际监听地址(undefined = 未启用)。 */
     internalProxyAddress,
@@ -7638,17 +7223,17 @@ export async function registerCommercial(
     ensureContainerReady: ensureContainerEndpointReady
       ? async (uid) => {
           try {
-            await ensureContainerEndpointReady(uid)
-            return { ok: true as const }
+            await ensureContainerEndpointReady(uid);
+            return { ok: true as const };
           } catch (err) {
             if (err instanceof ContainerUnreadyError) {
               return {
                 ok: false as const,
                 retryAfterSec: err.retryAfterSec,
                 reason: err.reason,
-              }
+              };
             }
-            throw err
+            throw err;
           }
         }
       : undefined,
@@ -7658,10 +7243,10 @@ export async function registerCommercial(
           bridgeSecret,
           resolveRunningEndpoint: async (uid) => {
             const r = await getPool().query<{
-              id: string
-              bound_ip: string | null
-              port: number | null
-              host_name: string | null
+              id: string;
+              bound_ip: string | null;
+              port: number | null;
+              host_name: string | null;
             }>(
               `SELECT ac.id::text AS id, host(ac.bound_ip) AS bound_ip, ac.port,
                       ch.name AS host_name
@@ -7672,16 +7257,16 @@ export async function registerCommercial(
                   AND ac.bound_ip IS NOT NULL AND ac.port IS NOT NULL
                 ORDER BY ac.updated_at DESC LIMIT 1`,
               [uid.toString(), getRuntimeChannel()],
-            )
-            const row = r.rows[0]
-            if (!row || !row.bound_ip || row.port === null) return null
-            const isRemoteHost = row.host_name !== null && row.host_name !== 'self'
+            );
+            const row = r.rows[0];
+            if (!row || !row.bound_ip || row.port === null) return null;
+            const isRemoteHost = row.host_name !== null && row.host_name !== "self";
             return {
               host: row.bound_ip,
               port: Number(row.port),
               containerId: Number(row.id),
-              ...(isRemoteHost ? { tunnel: { kind: 'remote-host' as const } } : {}),
-            }
+              ...(isRemoteHost ? { tunnel: { kind: "remote-host" as const } } : {}),
+            };
           },
         })
       : undefined,
@@ -7700,15 +7285,15 @@ export async function registerCommercial(
     // 与 pushRemoteHostUpload 同纪律(psk 清零)与同错误语义(throw → gateway 502)。
     // node-agent 404 → 返 null,让 gateway 决定 fallback 还是终态 404。
     pullRemoteHostMedia: async (args: {
-      hostUuid: string
-      remotePath: string
+      hostUuid: string;
+      remotePath: string;
     }) => {
       // A3 — service file-IO:revoked / 缺 fingerprint 的 host 直接拒。
-      const target = await resolveServiceableHostTarget(args.hostUuid)
+      const target = await resolveServiceableHostTarget(args.hostUuid);
       try {
-        return await nodeAgentGetFile(target, args.remotePath)
+        return await nodeAgentGetFile(target, args.remotePath);
       } finally {
-        target.psk?.fill(0)
+        target.psk?.fill(0);
       }
     },
     // healthz 深度探活:gateway healthz 经此 seam 探 PG/Redis(gateway 对二者零编译依赖)。
@@ -7717,27 +7302,27 @@ export async function registerCommercial(
     // 2s 超时:探活不能被慢依赖拖住 healthz;timer unref 不阻止进程退出。
     probeDeps: async () => {
       const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> => {
-        let timer: NodeJS.Timeout | undefined
+        let timer: NodeJS.Timeout | undefined;
         const timeout = new Promise<never>((_, rej) => {
-          timer = setTimeout(() => rej(new Error(`probe timeout ${ms}ms`)), ms)
-          timer.unref?.()
-        })
-        return Promise.race([p, timeout]).finally(() => clearTimeout(timer)) as Promise<T>
-      }
-      const out: Record<string, { ok: true } | { ok: false; error: string }> = {}
+          timer = setTimeout(() => rej(new Error(`probe timeout ${ms}ms`)), ms);
+          timer.unref?.();
+        });
+        return Promise.race([p, timeout]).finally(() => clearTimeout(timer)) as Promise<T>;
+      };
+      const out: Record<string, { ok: true } | { ok: false; error: string }> = {};
       try {
-        await withTimeout(getPool().query('SELECT 1'), 2000)
-        out.pg = { ok: true }
+        await withTimeout(getPool().query("SELECT 1"), 2000);
+        out.pg = { ok: true };
       } catch (err) {
-        out.pg = { ok: false, error: (err as Error).message }
+        out.pg = { ok: false, error: (err as Error).message };
       }
       try {
-        await withTimeout(redis.ping(), 2000)
-        out.redis = { ok: true }
+        await withTimeout(redis.ping(), 2000);
+        out.redis = { ok: true };
       } catch (err) {
-        out.redis = { ok: false, error: (err as Error).message }
+        out.redis = { ok: false, error: (err as Error).message };
       }
-      return out
+      return out;
     },
     // P1.7 slice 7c — broker 装配成功(WECHAT_BROKER_ENABLED=1 + bridgeSecret 齐)
     // 才暴露。gateway cli 把 commercial.wechatBroker 作为 onInboundOverride 透传给
@@ -7752,33 +7337,33 @@ export async function registerCommercial(
           cleanupBinding: (bindingUserId) => wechatBroker!.cleanupBinding(bindingUserId),
         }
       : undefined,
-  }
+  };
 }
 
-export const COMMERCIAL_VERSION = '0.1.0'
+export const COMMERCIAL_VERSION = "0.1.0";
 // 便于 gateway / 测试单独访问
-export { runMigrations } from './db/migrate.js'
-export { shouldAutoMigrate }
-export { createCommercialHandler } from './http/router.js'
-export type { CommercialHandler } from './http/router.js'
-export type { CommercialHttpDeps } from './http/handlers.js'
-export { PricingCache, perKtokCredits } from './billing/pricing.js'
-export type { ModelPricing, PublicModel } from './billing/pricing.js'
-export { computeCost } from './billing/calculator.js'
-export type { TokenUsage, PriceSnapshot, CostResult } from './billing/calculator.js'
+export { runMigrations } from "./db/migrate.js";
+export { shouldAutoMigrate };
+export { createCommercialHandler } from "./http/router.js";
+export type { CommercialHandler } from "./http/router.js";
+export type { CommercialHttpDeps } from "./http/handlers.js";
+export { PricingCache, perKtokCredits } from "./billing/pricing.js";
+export type { ModelPricing, PublicModel } from "./billing/pricing.js";
+export { computeCost } from "./billing/calculator.js";
+export type { TokenUsage, PriceSnapshot, CostResult } from "./billing/calculator.js";
 export {
   adminAdjust,
   listLedger,
   InsufficientCreditsError,
   LEDGER_REASONS,
-} from './billing/ledger.js'
+} from "./billing/ledger.js";
 export type {
   LedgerReason,
   LedgerRef,
   DebitResult,
   AdminAdjustResult,
   LedgerRow,
-} from './billing/ledger.js'
+} from "./billing/ledger.js";
 export {
   preCheck,
   preCheckWithCost,
@@ -7788,7 +7373,7 @@ export {
   InsufficientCreditsError as PreCheckInsufficientCreditsError,
   InMemoryPreCheckRedis,
   wrapIoredisForPreCheck,
-} from './billing/preCheck.js'
+} from "./billing/preCheck.js";
 export type {
   PreCheckRedis,
   PreCheckInput,
@@ -7796,23 +7381,23 @@ export type {
   PreCheckResult,
   ReservationHandle,
   AtomicReserveResult,
-} from './billing/preCheck.js'
+} from "./billing/preCheck.js";
 export {
   signHupijiao,
   verifyHupijiao,
   buildSignBase,
-} from './payment/hupijiao/sign.js'
-export type { SignParams } from './payment/hupijiao/sign.js'
+} from "./payment/hupijiao/sign.js";
+export type { SignParams } from "./payment/hupijiao/sign.js";
 export {
   createHttpHupijiaoClient,
   HupijiaoError,
-} from './payment/hupijiao/client.js'
+} from "./payment/hupijiao/client.js";
 export type {
   HupijiaoClient,
   HupijiaoConfig,
   CreateQrInput,
   CreateQrResult,
-} from './payment/hupijiao/client.js'
+} from "./payment/hupijiao/client.js";
 export {
   listPlans,
   getPlanByCode,
@@ -7825,7 +7410,7 @@ export {
   PlanNotFoundError,
   OrderNotFoundError,
   InvalidOrderStateError,
-} from './payment/orders.js'
+} from "./payment/orders.js";
 export type {
   TopupPlan,
   OrderRow,
@@ -7833,7 +7418,7 @@ export type {
   CreatePendingOrderInput,
   MarkOrderPaidInput,
   MarkOrderPaidResult,
-} from './payment/orders.js'
+} from "./payment/orders.js";
 // T-30 账号池 store
 export {
   createAccount,
@@ -7845,7 +7430,7 @@ export {
   ACCOUNT_PLANS,
   ACCOUNT_STATUSES,
   AccountNotFoundError,
-} from './account-pool/store.js'
+} from "./account-pool/store.js";
 export type {
   AccountPlan,
   AccountStatus,
@@ -7854,7 +7439,7 @@ export type {
   CreateAccountInput,
   UpdateAccountPatch,
   ListAccountsOptions,
-} from './account-pool/store.js'
+} from "./account-pool/store.js";
 // T-31 账号池 health
 export {
   AccountHealthTracker,
@@ -7866,12 +7451,12 @@ export {
   DEFAULT_COOLDOWN_MS,
   DEFAULT_HEALTH_TTL_SEC,
   DEFAULT_FAIL_WINDOW_SEC,
-} from './account-pool/health.js'
+} from "./account-pool/health.js";
 export type {
   AccountHealth,
   HealthRedis,
   HealthDeps,
-} from './account-pool/health.js'
+} from "./account-pool/health.js";
 // T-32 账号池 scheduler
 export {
   AccountScheduler,
@@ -7884,7 +7469,7 @@ export {
   pickWRH,
   computeAccountWeight,
   defaultHash,
-} from './account-pool/scheduler.js'
+} from "./account-pool/scheduler.js";
 export type {
   PickInput,
   PickResult,
@@ -7892,7 +7477,7 @@ export type {
   ReleaseResult,
   SchedulerDeps,
   CandidateRow,
-} from './account-pool/scheduler.js'
+} from "./account-pool/scheduler.js";
 // T-33 账号池 refresh + proxy
 export {
   refreshAccountToken,
@@ -7902,13 +7487,13 @@ export {
   DEFAULT_REFRESH_SKEW_MS,
   DEFAULT_OAUTH_ENDPOINT,
   DEFAULT_FALLBACK_EXPIRES_MS,
-} from './account-pool/refresh.js'
+} from "./account-pool/refresh.js";
 export type {
   RefreshErrorCode,
   RefreshHttpClient,
   RefreshDeps,
   RefreshedTokens,
-} from './account-pool/refresh.js'
+} from "./account-pool/refresh.js";
 export {
   streamClaude,
   ProxyError,
@@ -7916,12 +7501,12 @@ export {
   DEFAULT_CLAUDE_ENDPOINT,
   DEFAULT_ANTHROPIC_VERSION,
   DEFAULT_MAX_SSE_BUFFER,
-} from './account-pool/proxy.js'
+} from "./account-pool/proxy.js";
 export type {
   ProxyEvent,
   ProxyDeps,
   StreamClaudeInput,
-} from './account-pool/proxy.js'
+} from "./account-pool/proxy.js";
 // V3 Phase 2: T-40/T-40b/T-41 v2 chat orchestrator(chat/orchestrator.ts、chat/debit.ts、
 // ws/chat.ts、http/chat.ts)已删除 — v3 chat 不再走 commercial 进程出口,改由用户的
 // docker 容器跑个人版 → 经 anthropicProxy(2D 待加)统一访问上游。
@@ -7930,23 +7515,23 @@ export type {
 export {
   ConnectionRegistry,
   DEFAULT_MAX_PER_USER,
-} from './ws/connections.js'
+} from "./ws/connections.js";
 export type {
   Conn,
   RegisterResult,
-} from './ws/connections.js'
+} from "./ws/connections.js";
 // V3 Phase 2 Task 2I-1: 结构化 logger
 export {
   createLogger,
   rootLogger,
   parseLevel,
   SENSITIVE_KEYS,
-} from './logging/logger.js'
+} from "./logging/logger.js";
 export type {
   Logger,
   LogLevel,
   LoggerOptions,
-} from './logging/logger.js'
+} from "./logging/logger.js";
 // V3 Phase 2 Task 2C: 容器身份双因子校验
 export {
   verifyContainerIdentity,
@@ -7955,23 +7540,23 @@ export {
   compareHash,
   createPgIdentityRepo,
   ContainerIdentityError,
-} from './auth/containerIdentity.js'
+} from "./auth/containerIdentity.js";
 export type {
   ContainerIdentity,
   ContainerIdentityRepo,
-} from './auth/containerIdentity.js'
+} from "./auth/containerIdentity.js";
 // V3 anthropicProxy 拆分 Phase 2(2026-05-18):身份层 strategy 物理切出
 export {
   makeContainerIdentityStrategy,
   IdentityError,
   AuthzLoadError,
   AuthzDeniedError,
-} from './auth/proxyIdentity.js'
+} from "./auth/proxyIdentity.js";
 export type {
   IdentityStrategy,
   ProxyIdentity,
   ContainerIdentityStrategyDeps,
-} from './auth/proxyIdentity.js'
+} from "./auth/proxyIdentity.js";
 // V3 Phase 2 Task 2D: 内部 Anthropic 中央代理(monolith)
 export {
   makeAnthropicProxyHandler,
@@ -7992,55 +7577,55 @@ export {
   CHARS_PER_TOKEN_ESTIMATE,
   DEFAULT_PROXY_RATE_LIMIT,
   DEFAULT_MAX_CONCURRENT_PER_UID,
-} from './http/anthropicProxy.js'
+} from "./http/anthropicProxy.js";
 export type {
   AnthropicProxyDeps,
   AnthropicProxyHandler,
   ProxyBody,
   UsageObservation,
   PipeStreamResult,
-} from './http/anthropicProxy.js'
+} from "./http/anthropicProxy.js";
 // V3 Phase 1 split: billing 子模块(从 anthropicProxy.ts L956-1485 物理切出)
 export {
   startInflightJournal,
   makeFinalizer,
-} from './billing/proxyBilling.js'
+} from "./billing/proxyBilling.js";
 export type {
   FinalizeContext,
   FinalizeOutcome,
   FinalizerHandle,
-} from './billing/proxyBilling.js'
+} from "./billing/proxyBilling.js";
 // V3 Phase 4 split: upstream round-trip 子模块(从 anthropicProxy.ts L1421-1639 物理切出)
-export { runUpstreamRoundTrip } from './http/proxy/core.js'
-export type { RoundTripCtx } from './http/proxy/core.js'
+export { runUpstreamRoundTrip } from "./http/proxy/core.js";
+export type { RoundTripCtx } from "./http/proxy/core.js";
 // V3 Phase 3 split: upstream session 子模块(从 anthropicProxy.ts §3.4 物理切出)
 export {
   selectUpstreamRoute,
   validateUpstreamConfig,
   pickUpstream,
   releaseUpstreamSession,
-} from './http/proxy/upstream.js'
+} from "./http/proxy/upstream.js";
 export type {
   UpstreamRoute,
   ConfigError,
   PreparedUpstreamSession,
   PickError,
   PickUpstreamDeps,
-} from './http/proxy/upstream.js'
+} from "./http/proxy/upstream.js";
 // V3 Phase 2 Task 2E: 用户 WS ↔ 容器 WS 桥接
 export {
   createUserChatBridge,
   ContainerUnreadyError,
   CLOSE_BRIDGE,
   BRIDGE_WS_PATH,
-} from './ws/userChatBridge.js'
+} from "./ws/userChatBridge.js";
 export type {
   UserChatBridgeDeps,
   UserChatBridgeHandler,
   ResolveContainerEndpoint,
   BridgeMetricSink,
   BridgeCloseCause,
-} from './ws/userChatBridge.js'
+} from "./ws/userChatBridge.js";
 // T-53: Agent 订阅 + 生命周期
 export {
   openAgentSubscription,
@@ -8062,7 +7647,7 @@ export {
   provisionContainer,
   runLifecycleTick,
   startLifecycleScheduler,
-} from './agent/index.js'
+} from "./agent/index.js";
 export type {
   AgentPlan,
   AgentSubscriptionStatus,
@@ -8079,8 +7664,8 @@ export type {
   LifecycleLogger,
   LifecycleScheduler,
   StartLifecycleSchedulerOptions,
-} from './agent/index.js'
-export type { AgentHttpDeps } from './http/agent.js'
+} from "./agent/index.js";
+export type { AgentHttpDeps } from "./http/agent.js";
 // T-62 metrics + alerts
 export {
   renderPrometheus,
@@ -8090,26 +7675,26 @@ export {
   resetMetricsForTest,
   normalizeRoute,
   snapshotForAlerts,
-} from './admin/metrics.js'
+} from "./admin/metrics.js";
 export {
   startAlertScheduler,
   createTelegramSender,
   defaultRules,
   ruleAccountPoolAllDown,
   ruleNoAccountsConfigured,
-} from './admin/alerts.js'
+} from "./admin/alerts.js";
 export type {
   AlertScheduler,
   AlertSchedulerOptions,
   AlertRule,
   AlertSender,
   Snapshot,
-} from './admin/alerts.js'
+} from "./admin/alerts.js";
 // V5 prompt queue P1 repository/internal transport (feature remains opt-in).
-export { PgPromptQueueStore, PromptQueueStoreError } from './promptQueue/pgPromptQueueStore.js'
+export { PgPromptQueueStore, PromptQueueStoreError } from "./promptQueue/pgPromptQueueStore.js";
 export type {
   PromptQueueOwner,
   PromptQueueDetail,
   PromptQueueClaimRequest,
   PromptQueueClaimResult,
-} from './promptQueue/pgPromptQueueStore.js'
+} from "./promptQueue/pgPromptQueueStore.js";
