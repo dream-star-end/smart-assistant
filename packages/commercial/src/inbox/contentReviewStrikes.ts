@@ -4,7 +4,7 @@ import { createInboxMessage } from './inbox.js'
 import {
   shouldBanForStrikes,
   violationInbox,
-} from '../../../gateway/src/contentReviewNotice.js'
+} from '@openclaude/gateway'
 
 export interface StrikeNoticeInput {
   adminId: string

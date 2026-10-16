@@ -124,8 +124,11 @@ export { setLiteratureSkillProvider, type LiteratureSkillProvider } from './prom
 export { setHostStaticProviderKeys } from './hostStaticProviders.js'
 
 export {
+  type ContentReviewAlert,
   inboundSessionKey,
   isContentReviewSessionBanned,
   observeUserContentReview,
   setContentReviewAlerter,
 } from './jevContentReview.js'
+export { getContentReviewStore } from './contentReviewStore.js'
+export { shouldBanForStrikes, violationInbox } from './contentReviewNotice.js'

@@ -6,7 +6,7 @@
 import './subprocessRunnerSpawnEnvIsolate.js'
 
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
@@ -456,6 +456,25 @@ function waitForProbe(
   })
 }
 
+/**
+ * Hosts on Node < 22.6 (v5-dev, selfhost CI) reject `--experimental-strip-types`,
+ * which SubprocessRunner passes to a `node` runtime (production containers run
+ * Node 22). The probe entry is plain .js and needs no stripping, so on such a
+ * host a PATH-first `node` shim drops only that flag and execs the real node:
+ * argv building and the real LocalBackend spawn stay under test.
+ */
+function installStripTypesShim(): string | null {
+  if (process.allowedNodeEnvironmentFlags.has('--experimental-strip-types')) return null
+  const dir = mkdtempSync('/tmp/ocv5-441-node-shim-')
+  const shim = join(dir, 'node')
+  writeFileSync(
+    shim,
+    `#!/bin/sh\n[ "$1" = --experimental-strip-types ] && shift\nexec ${JSON.stringify(process.execPath)} "$@"\n`,
+  )
+  chmodSync(shim, 0o755)
+  return dir
+}
+
 export async function spawnAndReadChildEnv(input: {
   sessionKey: string
   traceId: string | undefined
@@ -467,7 +486,10 @@ export async function spawnAndReadChildEnv(input: {
     OC_SESSION_KEY: process.env.OC_SESSION_KEY,
     OPENCLAUDE_SESSION_KEY: process.env.OPENCLAUDE_SESSION_KEY,
     OPENCLAUDE_TRACE_ID: process.env.OPENCLAUDE_TRACE_ID,
+    PATH: process.env.PATH,
   }
+  const shimDir = installStripTypesShim()
+  if (shimDir) process.env.PATH = `${shimDir}:${process.env.PATH ?? ''}`
   process.env.OC_SESSION_KEY = PARENT_WRONG.OC_SESSION_KEY
   process.env.OPENCLAUDE_SESSION_KEY = PARENT_WRONG.OPENCLAUDE_SESSION_KEY
   process.env.OPENCLAUDE_TRACE_ID = PARENT_WRONG.OPENCLAUDE_TRACE_ID
@@ -539,6 +561,7 @@ export async function spawnAndReadChildEnv(input: {
       else process.env[key] = value
     }
     rmSync(agentBaseDir, { recursive: true, force: true })
+    if (shimDir) rmSync(shimDir, { recursive: true, force: true })
   }
 }
 

@@ -277,6 +277,12 @@
       "reason": "OCV5-439: removes an unref() from the 200 ms wait before a runner error's RUNNER_CRASHED terminal (a tracked persistence awaited by awaitPendingPersistence/shutdownAll). Latent: only a gateway exit within 200 ms of a runner error could lose that terminal; no user report. Unit test pins it.",
       "approvedBy": "user 2026-10-16 管家按用户「有问题就搞」决定一起修：去掉 handleError 200ms unref，按规范写 Incident: none 豁免（cc3 sync 会话）",
       "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "bca1355a9ab22f522256fca3b73d33a00f9cdf4d",
+      "reason": "OCV5-441: repairs 23 stale test:gateway failures and moves five commercial imports of gateway/src onto the @openclaude/gateway package export (same modules, no behaviour change). Test and CI only; nothing user-visible.",
+      "approvedBy": "user 2026-10-16 管家按用户「有问题就搞、尽快上线」派单 OCV5-441：修全量网关测试并接入个人版 CI，按规范写 Incident: none 豁免（cc3 会话）",
+      "expiresAt": "2026-11-15"
     }
   ]
 }

@@ -224,7 +224,10 @@ describe("parity with check-v5-incident-regressions.ts on the real repo", () => 
     const isGit = spawnSync("git", ["-C", root, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8" });
     if (isGit.status !== 0) return; // runtime snapshot without .git — nothing to compare
     const bash = runGate(root);
-    const ts = spawnSync("npx", ["--no-install", "tsx", "scripts/check-v5-incident-regressions.ts"], {
+    // The bash gate is the selfhost pre-build gate, so its TS counterpart is the
+    // selfhost edition (as v5-selfhost-gates.yml runs it). The commercial default
+    // aborts on selfhost proof-debt incidents before any trailer verdict.
+    const ts = spawnSync("npx", ["--no-install", "tsx", "scripts/check-v5-incident-regressions.ts", "--edition=selfhost"], {
       cwd: root, encoding: "utf8",
     });
     const tsTrailerRed = /Incident trailer 格式非法|缺 trailer|没有对应 waiver|waiver 已于 .* 过期|不在 incidents\.json 内|未包含本 commit/

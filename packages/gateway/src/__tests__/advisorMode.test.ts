@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
@@ -109,10 +109,11 @@ describe('advisorMode snapshot', () => {
     assert.deepEqual(fromQuestion, ['/home/agent/.openclaude/generated/other.txt'])
   })
 
-  it('does not treat untrusted web/shell mentions as file authorization', async () => {
+  it('does not treat untrusted web/shell mentions as file authorization', async (t) => {
     const root = '/home/agent/.openclaude/generated'
     const authorized = join(root, 'ocv5-210-e4-this-task.txt')
     const sentinel = join(root, 'ocv5-210-e4-other-task-sentinel.txt')
+    t.after(() => Promise.all([rm(authorized, { force: true }), rm(sentinel, { force: true })]))
     await writeFile(authorized, 'THIS_TASK_PRODUCT')
     await writeFile(sentinel, 'SYNTHETIC_OTHER_TASK_PRIVATE_SENTINEL')
     const mentioned = parentAuthorizedArtifactTexts({
@@ -161,10 +162,11 @@ describe('advisorMode snapshot', () => {
     assert.equal(prompt.includes('THIS_TASK_PRODUCT'), true)
   })
 
-  it('Write/Edit content is not a target path; Read/Write file_path is', async () => {
+  it('Write/Edit content is not a target path; Read/Write file_path is', async (t) => {
     const root = '/home/agent/.openclaude/generated'
     const output = join(root, 'ocv5-210-m6-own-output.txt')
     const sentinel = join(root, 'ocv5-210-m6-other-task-sentinel.txt')
+    t.after(() => Promise.all([rm(output, { force: true }), rm(sentinel, { force: true })]))
     await writeFile(output, 'THIS_TASK_WRITE_PRODUCT')
     await writeFile(sentinel, 'SYNTHETIC_OTHER_TASK_PRIVATE_SENTINEL')
     const writeMentioned = parentAuthorizedArtifactTexts({

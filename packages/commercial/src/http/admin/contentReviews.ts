@@ -5,7 +5,7 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
-import { getContentReviewStore } from '../../../../gateway/src/contentReviewStore.js'
+import { getContentReviewStore } from '@openclaude/gateway'
 
 import { requireAdmin, requireAdminVerifyDb } from '../../admin/requireAdmin.js'
 import {

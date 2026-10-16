@@ -75,8 +75,12 @@ export function saveIdleCheckpoint(home: string, root: string, sessionKey: strin
     const rel = relative(home, file);
     assert.ok(!rel.startsWith(".."));
     mkdirSync(dirname(join(root, rel)), { recursive: true });
-    cpSync(file, join(root, rel));
-    return { relative: rel, sha256: createHash("sha256").update(readFileSync(file)).digest("hex") };
+    // One read: the copy and its hash are the same bytes. Copying then re-reading
+    // the live file raced a concurrent write on a fast runner, so the snapshot
+    // failed its own integrity check at restore.
+    const bytes = readFileSync(file);
+    writeFileSync(join(root, rel), bytes);
+    return { relative: rel, sha256: createHash("sha256").update(bytes).digest("hex") };
   });
   const result = { root, home, files: saved, directories };
   writeFileSync(join(root, "manifest.json"), JSON.stringify(result, null, 2));

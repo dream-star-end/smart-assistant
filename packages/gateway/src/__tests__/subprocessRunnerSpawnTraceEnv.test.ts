@@ -164,9 +164,11 @@ test('structural: SubprocessRunnerOpts type declares traceId field', () => {
 
   const optsIdx = optsSrc.indexOf('export interface SubprocessRunnerOpts')
   assert.ok(optsIdx >= 0, 'SubprocessRunnerOpts interface declaration not found')
-  // Body between this and the next top-level `}`. Use a coarse 5000-char
-  // window — the interface is currently ~70 lines.
-  const span = optsSrc.slice(optsIdx, optsIdx + 5000)
+  // Body up to the interface's own closing brace (a fixed-size window went
+  // stale once the interface grew past it).
+  const endIdx = optsSrc.indexOf('\n}\n', optsIdx)
+  assert.ok(endIdx > optsIdx, 'SubprocessRunnerOpts closing brace not found')
+  const span = optsSrc.slice(optsIdx, endIdx)
   assert.match(
     span,
     /traceId\?:\s*string/,

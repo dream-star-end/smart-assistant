@@ -268,7 +268,7 @@ describe("SessionManager pending-persistence tracking", () => {
       session,
     );
 
-    assert.equal(sm.interrupt(session.sessionKey), true);
+    assert.equal(sm.interrupt(session.sessionKey, "user"), true);
     assert.equal(logicalAbort.signal.aborted, true);
     assert.deepEqual(calls, [{
       status: "interrupted",
@@ -292,6 +292,28 @@ describe("SessionManager pending-persistence tracking", () => {
     assert.equal(drained, true);
   });
 
+  test("a reason-less interrupt is a system interrupt, never a user cancel", () => {
+    // 577ba459a made 'system' the default; only explicit user Stop paths pass 'user'.
+    const sm = new SessionManager(makeConfigStub());
+    const runner = new FakeTurnRunner(() => {});
+    const session = makeTurnSession(runner);
+    const calls: Array<{ status: string; reason: string; errorCode: string }> = [];
+    session._persistActiveTurn = async (status, reason, errorCode) => {
+      calls.push({ status, reason, errorCode });
+    };
+    (sm as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
+      session.sessionKey,
+      session,
+    );
+
+    assert.equal(sm.interrupt(session.sessionKey), true);
+    assert.deepEqual(calls, [{
+      status: "interrupted",
+      reason: "本轮因系统调度中断。",
+      errorCode: "SYSTEM_INTERRUPT",
+    }]);
+  });
+
   test("user Stop retains the direct runner fallback before the persistence hook exists", () => {
     const sm = new SessionManager(makeConfigStub());
     const runner = new FakeTurnRunner(() => {});
@@ -302,7 +324,7 @@ describe("SessionManager pending-persistence tracking", () => {
       session,
     );
 
-    assert.equal(sm.interrupt(session.sessionKey), true);
+    assert.equal(sm.interrupt(session.sessionKey, "user"), true);
     assert.equal(runner.interruptCalls, 1);
   });
 
