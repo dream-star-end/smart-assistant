@@ -74,6 +74,18 @@ export function assertContinuationAnswer(text, code) {
   const tokens = String(text ?? "").toUpperCase().match(/[A-Z0-9]+/g) ?? [];
   if (!tokens.includes(code)) throw new Error("Continuation turn did not recall the first turn's code");
 }
+// OCV5-460: Grok CLI cut every request over ~20 KB, saved it to
+// sessions/<id>/prompts/prompt_N.txt and told the model to read it back, so the
+// model opened its own request with a file tool before answering. A contract turn
+// whose tool calls touch such a file did not have the user's message in context.
+const OFFLOADED_REQUEST_FILE = /\/prompts\/prompt_\d+\.txt\b/;
+export function offloadedRequestReads(frames, sent) {
+  const own = frames.filter((f) => f?.peer?.id === sent.peer.id && f.clientMessageId === sent.clientMessageId);
+  return own
+    .flatMap((f) => (Array.isArray(f.blocks) ? f.blocks : []))
+    .filter((b) => b?.kind === "tool_use" && OFFLOADED_REQUEST_FILE.test(JSON.stringify(b)))
+    .map((b) => b.toolName);
+}
 export function tapResult(ok, n, name, ms, error) {
   const clean = (s) => String(s).replace(/[\r\n]+/g, " ");
   return `${ok ? "ok" : "not ok"} ${n} - ${clean(name)}\n# duration_ms ${n} ${Math.round(ms)}${error ? `\n# error ${clean(error)}` : ""}`;

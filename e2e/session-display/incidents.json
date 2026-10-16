@@ -7119,6 +7119,35 @@
       ]
     },
     {
+      "id": "INC-20261016-GROK-PROMPT-OFFLOAD",
+      "occurredAt": "2026-10-16",
+      "severity": "P0",
+      "symptom": "个人版 Grok 4.7（grok-build）用户报：模型每轮先「读取文件 …/<grok 会话 id>/prompts/prompt_0.txt」，说请求很长、在平台说明处被截断，再去 OpenClaude 会话记录里找原始用户消息。根因：grokAdapter 把 preamble + 平台上下文 + 用户原话拼成一个文件经 --prompt-file 交给 grok-native 1.0.13；CLI 对内联 user prompt 只保留约 20 KB，截掉中段，整份落盘到 sessions/<id>/prompts/prompt_N.txt，并追加「[Full request offloaded to file] … Read this file with read_file before responding」。平台上下文单独就 30–54 KB，所以每一轮都超限，模型只能自己读回请求（OCV5-460；个人版 u3 464 个 Grok 会话 438 个、canary u765 368/368 命中，最早 2026-09-15；修复前真聊 g460-before2 截图「读取 1 个文件 · 我先读取完整请求」，uid 3 七轮每轮都 read_file/grep 自己的 prompt 文件）。修复：Grok CLI 加 --verbatim 原样发送（实测新会话与 --resume 都整份进入 user 消息、无横幅、无落盘），adapter 自己包回 <user_query>；发布用户契约 C3 的 grok-build 两轮若有工具调用碰到 offloaded 请求文件即红。",
+      "rootFixCommit": "cede43f1",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/grokAdapter.test.ts",
+          "assertion": "OCV5-460: the whole request reaches Grok inline as one user_query and the CLI is told not to offload it"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5UserContract.test.ts",
+          "assertion": "OCV5-460: a contract turn that reads an offloaded request file is caught"
+        },
+        {
+          "layer": "unit",
+          "path": "scripts/__tests__/v5UserContract.test.ts",
+          "assertion": "OCV5-460: the smoke fails C3 when any continuation turn read an offloaded request file"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-user-contract-smoke.mjs",
+          "assertion": "C3 the model answers from the user's message in its context, never from an offloaded request file"
+        }
+      ]
+    },
+    {
       "id": "INC-20261016-STOP-NARRATION-LAYOUT",
       "occurredAt": "2026-10-16",
       "severity": "P2",

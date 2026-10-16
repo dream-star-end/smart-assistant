@@ -270,7 +270,7 @@ import {
   DEFAULT_MAX_CONCURRENT_PER_UID,
   type AnthropicProxyHandler,
 } from "./http/anthropicProxy.js";
-import { assertPlatformDefaultModelConfigured, STATIC_PROVIDER_META } from "./http/proxy/staticProviderMeta.js";
+import { assertPlatformDefaultModelConfigured, STATIC_PROVIDER_META, staticProviderKeysFromConfig } from "./http/proxy/staticProviderMeta.js";
 import { makeCursorExternalRoute, type CursorExternalRoute } from "./http/proxy/cursorExternal.js";
 import type {
   DurableCodexBilling,
@@ -1232,12 +1232,7 @@ async function handleExternalMtls(
  * resolveSyntheticTurnModel 的 routable 自检据此不降级,符合预期)。
  */
 function buildHostStaticProviderKeys(cfg: CommercialConfig): StaticProviderKeys {
-  const keys: StaticProviderKeys = {};
-  for (const id of Object.keys(STATIC_PROVIDER_META) as StaticProviderId[]) {
-    const raw = cfg[STATIC_PROVIDER_META[id].keyConfigField];
-    if (typeof raw === "string" && raw.trim()) keys[id] = raw;
-  }
-  return keys;
+  return staticProviderKeysFromConfig(cfg);
 }
 
 /**
@@ -2200,17 +2195,7 @@ export async function registerCommercial(
     // "internal proxy 禁用但 master 照跑",违反 loud-fail。放 try 外则异常直接冒泡崩 master boot。
     // 触发面仅此 internal-proxy/agent-runtime 启动路径;unit test / external proxy harness 不进此分支。
     // OCV5-424:env key 先幂等导入服务池,再按"env 或池内成员"校验默认模型。
-    await importEnvApiKeys({
-      deepseek: cfg.DEEPSEEK_API_KEY,
-      minimax: cfg.MINIMAX_TOKEN_PLAN_KEY,
-      ark: cfg.ARK_CODING_PLAN_KEY,
-      zai: cfg.ZAI_CODING_PLAN_KEY,
-      opencodego: cfg.OPENCODE_GO_API_KEY,
-      kimi: cfg.ARK_AGENT_PLAN_KEY,
-      "ark-k3": cfg.ARK_AGENT_PLAN_KEY,
-      moonshot: cfg.MOONSHOT_CODING_PLAN_KEY,
-      bailian: cfg.BAILIAN_TOKEN_PLAN_KEY,
-    }).catch((err) => console.warn("[commercial] api-key pool env import failed:", (err as Error)?.message ?? err));
+    await importEnvApiKeys(staticProviderKeysFromConfig(cfg)).catch((err) => console.warn("[commercial] api-key pool env import failed:", (err as Error)?.message ?? err));
     await primeApiKeyPool().catch(() => {});
     startApiKeyPoolCache();
     assertPlatformDefaultModelConfigured(cfg, {
@@ -2298,25 +2283,7 @@ export async function registerCommercial(
         // key 只留 master,不进用户容器。平台默认模型 glm-5.3(ark)的 key(ARK_CODING_PLAN_KEY)缺失
         // 已由下方 assertPlatformDefaultModelConfigured guard 在装配前 loud-fail;minimax(文本走
         // ARK_AGENT_PLAN_KEY)/deepseek 不被该 guard 拦,缺失则命中其模型时 503。
-        staticProviderKeys: {
-          deepseek: cfg.DEEPSEEK_API_KEY,
-          // 2026-07-07:minimax 文本/识图上游切回 MiniMax 官方,key 来源改回 MINIMAX_TOKEN_PLAN_KEY
-          //(与媒体/搜索 proxy 同 key;回退 06-30 火山迁移,因火山 Ark 大图识图挂死)。
-          minimax: cfg.MINIMAX_TOKEN_PLAN_KEY,
-          ark: cfg.ARK_CODING_PLAN_KEY,
-          // 2026-08-15:智谱国际版 Z.AI GLM Coding Plan(glm-5.3-zai)。
-          zai: cfg.ZAI_CODING_PLAN_KEY,
-          // 2026-07-05:OpenCode Go(qwen3.7-max/plus)。个人订阅配额,缺 key 命中时 503。
-          opencodego: cfg.OPENCODE_GO_API_KEY,
-          // 2026-07-06:火山 Agent Plan Kimi(kimi-k2.7-code),与 minimax 共 ARK_AGENT_PLAN_KEY。
-          kimi: cfg.ARK_AGENT_PLAN_KEY,
-          // 2026-07-22:火山 Agent Plan Kimi K3(kimi-k3-ark),同订阅/key、独立能力机制。
-          "ark-k3": cfg.ARK_AGENT_PLAN_KEY,
-          // 2026-07-17:Moonshot 官方 Kimi For Coding(kimi-k3),独立订阅独立 key。
-          moonshot: cfg.MOONSHOT_CODING_PLAN_KEY,
-          // 2026-08-04:阿里百炼 Token Plan(qwen3.8-max)，独立订阅独立 key。
-          bailian: cfg.BAILIAN_TOKEN_PLAN_KEY,
-        },
+        staticProviderKeys: staticProviderKeysFromConfig(cfg),
         apiKeyPoolEnabled: true,
         // v1.0.207 起 Phase 6 account_uuid 锚定(plan §3.0)+ csap session pin 三态
         // (0072+0073+0074),从 env-only 迁到 `system_settings` 表(admin UI 立即可改,

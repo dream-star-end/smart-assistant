@@ -56,7 +56,7 @@ import {
   DEFAULT_PROXY_RATE_LIMIT,
   DEFAULT_MAX_CONCURRENT_PER_UID,
 } from "../http/anthropicProxy.js";
-import { assertPlatformDefaultModelConfigured } from "../http/proxy/staticProviderMeta.js";
+import { assertPlatformDefaultModelConfigured, staticProviderKeysFromConfig } from "../http/proxy/staticProviderMeta.js";
 import {
   apiKeyPoolConfiguredServices,
   importEnvApiKeys,
@@ -232,24 +232,7 @@ export async function startEgress(): Promise<void> {
   await costSink.init();
 
   // 静态 key 解析表 —— proxyHandler 与延迟探测器(0105)共用同一份,防两处漂移。
-  const staticProviderKeys = {
-    deepseek: cfg.DEEPSEEK_API_KEY,
-    // 2026-07-07:切回 MiniMax 官方(回退 06-30 火山迁移;火山 Ark 大图识图挂死,官方 4.9s)。
-    minimax: cfg.MINIMAX_TOKEN_PLAN_KEY,
-    ark: cfg.ARK_CODING_PLAN_KEY,
-    // 2026-08-15:智谱国际版 Z.AI GLM Coding Plan(glm-5.3-zai)。
-    zai: cfg.ZAI_CODING_PLAN_KEY,
-    // 2026-07-05:OpenCode Go(qwen3.7-max/plus)。与 master internalProxyHandler 同口径注入。
-    opencodego: cfg.OPENCODE_GO_API_KEY,
-    // 2026-07-06:火山 Agent Plan Kimi(kimi-k2.7-code),与 minimax 共 ARK_AGENT_PLAN_KEY。
-    kimi: cfg.ARK_AGENT_PLAN_KEY,
-    // 2026-07-22:火山 Agent Plan Kimi K3(kimi-k3-ark),同订阅/key、独立能力机制。
-    "ark-k3": cfg.ARK_AGENT_PLAN_KEY,
-    // 2026-07-17:Moonshot 官方 Kimi For Coding(kimi-k3),独立订阅独立 key。
-    moonshot: cfg.MOONSHOT_CODING_PLAN_KEY,
-    // 2026-08-04:阿里百炼 Token Plan(qwen3.8-max)，独立订阅独立 key。
-    bailian: cfg.BAILIAN_TOKEN_PLAN_KEY,
-  };
+  const staticProviderKeys = staticProviderKeysFromConfig(cfg);
   // OCV5-424:env key 幂等导入为各自服务池成员(source='env'),池快照后台保鲜。
   await importEnvApiKeys(staticProviderKeys).catch((err) => {
     console.warn("[egress] api-key pool env import failed:", (err as Error)?.message ?? err);
