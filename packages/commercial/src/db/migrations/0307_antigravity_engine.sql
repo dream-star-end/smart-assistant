@@ -16,9 +16,11 @@
 --    sums these rows; the container never reports billable usage.
 --    antigravity_turns: durable admission record so settlement does not
 --    depend on the admitting bridge's memory.
--- 4. Staged catalog rows + disabled pricing rows. Flash is public, the
---    Claude / GPT-OSS models are admin-only. Activation is the normal admin
---    catalog path after deploy (fn_model_catalog_guard: born staged).
+-- 4. Staged catalog rows + disabled pricing rows. On selfhost Flash is public
+--    and the Claude / GPT-OSS models are admin-only. In the commercial tree all
+--    four are admin-only (user rule 2026-10-15: models a selfhost sync brings are
+--    visible to admins only; commercialSyncedModelsAdminOnly.test.ts). Activation
+--    is the normal admin catalog path after deploy (fn_model_catalog_guard: born staged).
 -- Rollback: db/rollbacks/0307_antigravity_engine.sql.
 
 DO $$ DECLARE c RECORD; BEGIN
@@ -125,7 +127,7 @@ INSERT INTO model_pricing(
 ) VALUES
   ('antigravity-gemini-3.8-flash', 'Gemini 3.8 Flash (Antigravity)',
    120, 150, 5, 0, '1', FALSE,
-   (SELECT COALESCE(MAX(sort_order),100)+1 FROM model_pricing), 'public', NULL, 'medium', 0),
+   (SELECT COALESCE(MAX(sort_order),100)+1 FROM model_pricing), 'admin', NULL, 'medium', 0),
   ('antigravity-claude-sonnet-4.6', 'Claude Sonnet 4.6 (Antigravity)',
    150, 750, 15, 0, '2', FALSE,
    (SELECT COALESCE(MAX(sort_order),100)+2 FROM model_pricing), 'admin', NULL, NULL, 0),
