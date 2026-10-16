@@ -997,6 +997,13 @@ export async function runIdleCase(mode: "short" | "fresh" | "live2" | "grow2" | 
         assert.equal("requestId" in proof, false);
         assert.deepEqual([...(proof.requestIds as string[])].sort(), [...freshIds].sort());
       }
+      // The next turn's usage/ledger row settles asynchronously after submit()
+      // resolves; reading the books at once raced it on CI (nextBooks.length 0,
+      // PR #780 idle 2/3). Wait for it, bounded, like the fresh rows above.
+      await until(async () => (await pool.query(
+        `SELECT 1 FROM usage_records u JOIN credit_ledger l ON l.id = u.ledger_id
+          WHERE u.user_id = 3 AND u.request_id <> ALL($1::text[])`, [freshIds])).rows.length > 0,
+      30_000, "next turn usage/ledger row");
       const books = await pool.query<{ request_id: string; turn_key: string; ledger_id: string; delta: string; balance_after: string }>(
         `SELECT u.request_id, u.turn_key, l.id::text AS ledger_id, l.delta::text, l.balance_after::text
            FROM usage_records u JOIN credit_ledger l ON l.id = u.ledger_id
