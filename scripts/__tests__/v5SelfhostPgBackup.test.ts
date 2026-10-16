@@ -375,6 +375,21 @@ describe('v5-selfhost-pg-backup.sh review r1 hardening', () => {
     )
   })
 
+  test('a second run in the same UTC second waits for a fresh name instead of failing', () => {
+    // the first two stamp calls return the same second, the third the next one
+    stub(
+      'date',
+      'if [[ "$*" == "-u +%Y%m%dT%H%M%SZ" ]]; then n=$(cat "$STUB_DIR/datecount" 2>/dev/null || echo 0); echo $((n + 1)) > "$STUB_DIR/datecount"; if (( n < 2 )); then echo 20261016T000000Z; else echo 20261016T000001Z; fi; else exec /usr/bin/date "$@"; fi',
+    )
+    assert.equal(run(['run', '--tier', 'core']).status, 0)
+    const r = run(['run', '--tier', 'core'])
+    assert.equal(r.status, 0, r.out)
+    assert.deepEqual(
+      backups().filter((f) => f.endsWith('.dump')),
+      ['core-20261016T000000Z.dump', 'core-20261016T000001Z.dump'],
+    )
+  })
+
   test('bad knobs and a relative backup dir are usage errors', () => {
     assert.equal(run(['run'], { V5SB_KEEP: '0' }).status, 2)
     assert.equal(run(['run'], { V5SB_MIN_FREE_GIB: 'x' }).status, 2)

@@ -242,17 +242,26 @@ run_core() {
     return 3
   fi
 
-  ts=$(date -u +%Y%m%dT%H%M%SZ)
-  name="core-$ts.dump"
-  final="$BACKUP_DIR/$name"
-  partial="$final.partial"
-  sumfile="$final.sha256"
-  for p in "$final" "$partial" "$sumfile"; do
-    if [[ -e "$p" || -L "$p" ]]; then
-      core_fail path_exists "refusing to reuse existing path $p"
-      return 1
-    fi
+  # Names carry a 1 s UTC stamp; a run right after another (same second) waits
+  # for a fresh one. Anything still occupying the name (file or link) is refused.
+  local try taken
+  for (( try = 0; try < 3; try++ )); do
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+    name="core-$ts.dump"
+    final="$BACKUP_DIR/$name"
+    partial="$final.partial"
+    sumfile="$final.sha256"
+    taken=""
+    for p in "$final" "$partial" "$sumfile"; do
+      if [[ -e "$p" || -L "$p" ]]; then taken="$p"; fi
+    done
+    [[ -n "$taken" ]] || break
+    sleep 1
   done
+  if [[ -n "$taken" ]]; then
+    core_fail path_exists "refusing to reuse existing path $taken"
+    return 1
+  fi
   floor=$(( ABORT_FREE_GIB * GIB ))
   log "core start db=$DB est=${est} free=${free} -> $final"
 
