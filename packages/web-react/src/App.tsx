@@ -46,7 +46,6 @@ import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/T
 import { EmptyState, greetingName } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
 import { SessionTimelineBoundary } from "./components/SessionTimelineBoundary";
-import { sessionHistorySurface } from "./lib/chat/historyLoadState";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
 import { PendingPaymentRecovery } from "./components/payment/PendingPaymentRecovery";
@@ -64,7 +63,7 @@ import type { OrgSection } from "./components/OrgCenter";
 import type { MarketplaceKind, MarketplaceTab } from "./components/MarketplaceCenter";
 import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList, type MessageListArchive } from "./components/MessageRenderer";
-import { MessageListSkeleton, shouldShowHistorySkeleton } from "./components/chat/HistorySkeleton";
+import { MessageListSkeleton } from "./components/chat/HistorySkeleton";
 import { TurnCostReminder } from "./components/chat/TurnCostReminder";
 import {
   captureVisibleVirtualRowAnchor,
@@ -102,6 +101,7 @@ import { Sidebar } from "./components/Sidebar";
 import { Alert, Button, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
 import { BootSplash } from "./components/BootSplash";
 import { useAgentGate } from "./hooks/useAgentGate";
+import { useHistorySkeleton } from "./hooks/useHistorySkeleton";
 import {
   type BoardViewParam,
   type PanelParam,
@@ -357,12 +357,6 @@ function replyQuoteText(message: ChatMessage): string {
   return media.length > 0 ? "[附件]" : "";
 }
 
-
-// 冷会话骨架屏窗口（见 HistorySkeleton.shouldShowHistorySkeleton）：
-//  - GRACE：meta 未知（深链/列表未落定）时的兜底窗，过后放行 EmptyState。
-//  - CAP：确知有历史但迟迟不到（getSession 慢/失败）的安全封顶，防骨架永停。
-const HISTORY_SKELETON_GRACE_MS = 800;
-const HISTORY_SKELETON_CAP_MS = 8000;
 
 export function App() {
   const params = new URLSearchParams(location.search);
@@ -2477,22 +2471,23 @@ export function App() {
     // chat.version 是就地 mutation 会话的变更权威信号（同引用，须显式入依赖才随帧刷新）。
   }, [demo, activeSess, teamLeaderActive, agent.name, wsMessages, chat.version, chat.dispatchStatus]);
 
-  // ── 冷会话加载骨架屏窗口计时 ──────────────────────────────────────────
-  // activeId 变化即重置两个截止标记；GRACE 用于 meta 未知（深链）分支，CAP 是安全封顶。
-  // 骨架本身随 wsMessages 到达（cachedCount>0）立即隐藏，计时器只做「永不停」兜底。
-  const [historyGraceExpired, setHistoryGraceExpired] = useState(false);
-  const [historyCapExpired, setHistoryCapExpired] = useState(false);
-  useEffect(() => {
-    setHistoryGraceExpired(false);
-    setHistoryCapExpired(false);
-    if (demo || !activeId) return;
-    const t1 = setTimeout(() => setHistoryGraceExpired(true), HISTORY_SKELETON_GRACE_MS);
-    const t2 = setTimeout(() => setHistoryCapExpired(true), HISTORY_SKELETON_CAP_MS);
-    return () => {
-      clearTimeout(t1);
-      clearTimeout(t2);
-    };
-  }, [demo, activeId]);
+  // 对话前置门：非 demo 且尚无访问权（容器未就绪/未订阅/出错等）→ 由 AgentGate 占据对话区
+  // 并禁用 Composer。demo 与已就绪（ready|dormant）放行正常对话。
+  const gated = !demo && !gate.access;
+  // 冷会话加载骨架（计时器 + 派生，见 hooks/useHistorySkeleton）。须在下方 boot/登录等早返回之前调用。
+  const { loadingHistory, historySurface } = useHistorySkeleton({
+    demo,
+    activeId,
+    sessions,
+    gated,
+    wsMessageCount: wsMessages.length,
+    wsSending,
+    demoMessageCount: messages.length,
+    demoBusy: busy,
+    serverListSettled,
+    historyLoading,
+    historyError,
+  });
 
   // 会话级 transient 软提示（"较长时间未收到新内容…"）：非消息卡片、不落库；随快照读回。
   const transientNotice = !demo && activeId ? chat.getTransientNotice(activeId) : null;
@@ -3452,10 +3447,6 @@ export function App() {
   }
 
   const showEmpty = demo ? messages.length === 0 && !busy : wsMessages.length === 0 && !wsSending;
-  // 对话前置门：非 demo 且尚无访问权（容器未就绪/未订阅/出错等）→ 由 AgentGate 占据对话区
-  // 并禁用 Composer。demo 与已就绪（ready|dormant）放行正常对话。
-  const gated = !demo && !gate.access;
-
   // ── 输入框上方的全局横幅栈(shell 审计 S-06)──────────────────────────────
   // 五种横幅原先各自按条件挂载、互不知情,断线 + 休眠 + 新版本 + 发送失败同时成立时 390px
   // 屏上横幅吃掉 ~560px。这里先算出"此刻成立的有哪些",交给 resolveBanners 按优先级裁决:
@@ -3469,32 +3460,6 @@ export function App() {
   if (!demo && !gated && activeSess?._turnCostReminderCredits) activeBannerKinds.push("cost");
   const bannerStack = resolveBanners(activeBannerKinds, bannersExpanded);
   const showBanner = (kind: BannerKind) => bannerStack.visible.includes(kind);
-
-  // 冷会话加载骨架：切换/深链到本地无缓存会话、getSession 拉取期间显示消息形骨架，
-  // 取代「空白 → 突然填满」。meta（messageCount）取自侧栏当前选中会话，metaKnown
-  // 需 listSessions 已落定且命中列表（否则视为深链未决走 800ms 兜底窗）。
-  const activeMeta = !demo && activeId ? sessions.find((s) => s.id === activeId) : undefined;
-  const loadingHistory =
-    !demo &&
-    shouldShowHistorySkeleton({
-      selected: !!activeId,
-      gated,
-      cachedCount: wsMessages.length,
-      sending: wsSending,
-      knownMessageCount: activeMeta?.messageCount ?? 0,
-      metaKnown: serverListSettled && !!activeMeta,
-      loading: historyLoading,
-      graceExpired: historyGraceExpired,
-      capExpired: historyCapExpired,
-    });
-  const historySurface = sessionHistorySurface({
-    gated,
-    loadingHistory,
-    hasMessages: demo ? messages.length > 0 : wsMessages.length > 0,
-    sending: demo ? busy : wsSending,
-    knownNonEmpty: (activeMeta?.messageCount ?? 0) > 0,
-    historyError: !demo && historyError !== null,
-  });
 
   // 更早对话仍只靠显式按钮，滚动不发请求。
   // 本轮处理步骤按游标自动补齐，不在过程区放「加载更早的处理步骤」。
