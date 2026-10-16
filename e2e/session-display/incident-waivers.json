@@ -301,6 +301,12 @@
       "reason": "OCV5-451: a call that outlives a stopped Antigravity turn (recorded by the relay after settlement) is folded into the turn's waived usage row, so its tokens and wouldHaveCharged cover every call. Latent: audit snapshot only; stopped turns are waived and the charge stays 0. Settle integ test red without the fix.",
       "approvedBy": "user 2026-10-16 「继续修上次汇报里留下的小问题：停止轮在用量入账前就结算，免收费快照里「本应收费」金额偏小」，按规范写 Incident: none 豁免（cc3 antigravity 会话）",
       "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "8029e3febb165d144bfe324382a96bc819d5003f",
+      "reason": "OCV5-452: ZCode's prompt listed the memory-MCP tools from its own copy, which missed present_task_approval when e87e3723a added it to Grok and Cursor; the MCP server always exposed the tool. Latent: no user report. The three platform engines now share one list with a contract test.",
+      "approvedBy": "user 2026-10-16 「新开一个cc3会话对个人版架构进行全面梳理……可扩展性是否强大……进行持续迭代优化」（cc3 ocv5-selfhost-arch-review，FINDINGS EXT-3）",
+      "expiresAt": "2026-11-15"
     }
   ]
 }
