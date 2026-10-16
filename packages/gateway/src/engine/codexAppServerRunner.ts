@@ -4452,6 +4452,28 @@ export class CodexAppServerRunner extends EventEmitter {
       this.activeTurnId = null
       this.currentTurnCompleter = null
       const durationMs = Date.now() - startedAt
+      if (this.pendingStartInterrupt) {
+        // OCV5-442: the user stopped this turn before it had an id, and it then
+        // failed before starting — typically the gateway's shutdown escalation
+        // after the Stop grace while the app-server was still initializing. The
+        // outcome is the user's Stop, as in the "stopped before turn/start" branch.
+        this.pendingStartInterrupt = false
+        log.info('codex turn stopped before start', {
+          sessionKey: this.opts.sessionKey,
+          err: (err as Error).message,
+        })
+        this.emitResult({
+          durationMs,
+          ok: false,
+          error: 'codex turn interrupted',
+          usage: failedTurnUsage ? _codexUsageToAnthropicShape(failedTurnUsage) : undefined,
+          requestId,
+          rateLimits: this._consumeRateLimitsForEmit(),
+          stopReason: 'interrupted',
+          terminalCode: 'USER_CANCELLED',
+        })
+        return
+      }
       // turn-retry 批:catch 路径也结构化分类(非 unknown 才带 errorClass)。此路径
       // 覆盖 turn/start 拒绝但**不满足重试门**、attach/spawn 失败、mid-turn 异常等。
       const errMsg = `codex app-server: ${(err as Error).message}`
