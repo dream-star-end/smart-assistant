@@ -691,7 +691,7 @@ describe('Antigravity relay downstream close (OCV5-411 Codex r1 P1)', () => {
       assert.equal(outcome, 'finished', 'handler parked on a drain that never comes')
       assert.equal(usage.length, 1, 'the abandoned call is still metered')
       assert.equal(usage[0]?.promptTokens, 11885)
-      const slot = [..._antigravityInflightForTests().values()][0]
+      const slot = _antigravityInflightForTests().get(token)
       assert.equal(slot?.count, 0, 'in-flight slot released')
       assert.equal(slot?.reserved, 0n, 'reservation released')
       assert.equal(slot?.recorded.calls, 1)
