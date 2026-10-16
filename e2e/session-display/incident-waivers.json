@@ -283,6 +283,18 @@
       "reason": "OCV5-441: repairs 23 stale test:gateway failures and moves five commercial imports of gateway/src onto the @openclaude/gateway package export (same modules, no behaviour change). Test and CI only; nothing user-visible.",
       "approvedBy": "user 2026-10-16 管家按用户「有问题就搞、尽快上线」派单 OCV5-441：修全量网关测试并接入个人版 CI，按规范写 Incident: none 豁免（cc3 会话）",
       "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "c349d7f4bc78dd11b1520fc2b968fe9443eb3602",
+      "reason": "OCV5-445: backport of commercial 6588fe7c2. The Antigravity relay now waits for drain or close, so a CLI that disconnects under backpressure no longer parks the handler; usage is still recorded and the reservation released. Latent: no user report, Antigravity is owner-only on selfhost. Regression test red without the fix.",
+      "approvedBy": "user 2026-10-16 管家派单 OCV5-445：把商业 #723 同步里 Codex 发现的两个问题回挂个人版，按规范写 Incident: none 豁免（cc3 antigravity 会话）",
+      "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "35d484dbcae7be8337d13d911b58bef813d1ebd3",
+      "reason": "OCV5-445: backport of commercial 0d54eea02. Registers retention for the six 0306–0308 tables; pool_events is swept after 30 days. Latent: pool_events' oldest row is from 2026-10-15, none has reached 30 days. retentionRegistry.integ red without, green with.",
+      "approvedBy": "user 2026-10-16 管家派单 OCV5-445：把商业 #723 同步里 Codex 发现的两个问题回挂个人版，按规范写 Incident: none 豁免（cc3 antigravity 会话）",
+      "expiresAt": "2026-11-15"
     }
   ]
 }
