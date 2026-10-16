@@ -38,6 +38,7 @@ import {
   type AntigravityRelayDeps,
   type AntigravityUsageRow,
   AntigravityUsageTap,
+  _antigravityInflightForTests,
   makeAntigravityRelayHandler,
 } from '../http/internalAntigravityRelay.js'
 
@@ -628,6 +629,76 @@ describe('Antigravity relay concurrent budget (Codex r1 P1)', () => {
     )
     assert.equal(second.status, 402)
     assert.equal(second.captured.calls, 0)
+  })
+})
+
+describe('Antigravity relay downstream close (OCV5-411 Codex r1 P1)', () => {
+  test('a CLI that disconnects under backpressure does not hang the call: usage is metered, the reservation freed', async () => {
+    const token = await mintRoute('antigravity-gemini-3.8-flash', 1_000_000n)
+    const usage: AntigravityUsageRow[] = []
+    let handlerDone!: () => void
+    const finished = new Promise<void>((resolve) => {
+      handlerDone = resolve
+    })
+    // 16 MiB the client never reads: res.write returns false and no drain follows.
+    const pad = Buffer.from(`: ${'x'.repeat(16 * 1024 * 1024)}\n\n`, 'utf8')
+    async function* upstreamBody() {
+      yield pad
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      for (const chunk of SSE) yield Buffer.from(chunk, 'utf8')
+    }
+    const handler = makeAntigravityRelayHandler({
+      identityRepo: repo(),
+      clientSecret: 'GOCSPX-test-secret-not-real-000',
+      freshToken: async () => Buffer.from(FULL_TOKEN, 'utf8'),
+      reportOutcome: async () => {},
+      recordUsage: async (row) => {
+        usage.push(row)
+      },
+      meteredCost: async () => 0n,
+      estimateCost: () => 1n,
+      requestFn: (async () => ({
+        statusCode: 200,
+        headers: { 'content-type': 'text/event-stream' },
+        body: Readable.from(upstreamBody()),
+      })) as never,
+    })
+    const server = createServer((req, res) => {
+      void handler(req, res, CTX).finally(handlerDone)
+    })
+    const port = await listen(server)
+    try {
+      const abort = new AbortController()
+      const res = await fetch(
+        `http://127.0.0.1:${port}${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`,
+        {
+          method: 'POST',
+          headers: { authorization: `Bearer ${CONTAINER_TOKEN}`, 'content-type': 'application/json' },
+          body: generateBody('gemini-3.8-flash-low'),
+          signal: abort.signal,
+        },
+      )
+      assert.equal(res.status, 200)
+      abort.abort()
+      let timer: NodeJS.Timeout | undefined
+      const outcome = await Promise.race([
+        finished.then(() => 'finished'),
+        new Promise<string>((resolve) => {
+          timer = setTimeout(() => resolve('hung'), 5000)
+        }),
+      ])
+      clearTimeout(timer)
+      assert.equal(outcome, 'finished', 'handler parked on a drain that never comes')
+      assert.equal(usage.length, 1, 'the abandoned call is still metered')
+      assert.equal(usage[0]?.promptTokens, 11885)
+      const slot = _antigravityInflightForTests().get(token)
+      assert.equal(slot?.count, 0, 'in-flight slot released')
+      assert.equal(slot?.reserved, 0n, 'reservation released')
+      assert.equal(slot?.recorded.calls, 1)
+    } finally {
+      server.closeAllConnections()
+      await close(server)
+    }
   })
 })
 
