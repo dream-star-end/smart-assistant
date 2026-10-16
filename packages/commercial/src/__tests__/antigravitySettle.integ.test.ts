@@ -12,6 +12,7 @@ import {
   abandonAntigravityTurn,
   reconcileStaleAntigravityTurns,
   recordAntigravityTurn,
+  refreshWaivedAntigravityUsage,
   settleAntigravityTurnRecord,
 } from '../billing/antigravitySettle.js'
 import type { ModelPricing, PricingCache } from '../billing/pricing.js'
@@ -381,5 +382,101 @@ describe('Antigravity durable turn settlement', () => {
       }),
       null,
     )
+  })
+
+  test('a call recorded after a stopped turn settled is folded into the waived row (OCV5-451)', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const uid = await user(1_000n)
+    const requestId = rid()
+    await recordAntigravityTurn(getPool(), {
+      requestId,
+      userId: uid,
+      modelId: MODEL,
+      sessionId: null,
+      traceId: null,
+    })
+    // The checkpoint call finished; the agent call is still streaming when Stop settles the turn.
+    await usageRow(requestId, uid, 16_376, 10)
+    const done = await settleAntigravityTurnRecord({
+      pool: getPool(),
+      pricing,
+      requestId,
+      userId: uid,
+      engineStatus: 'error',
+      terminalCode: 'USER_STOPPED',
+    })
+    assert.ok(done)
+    const read = async () =>
+      (
+        await query<{
+          cost_credits: string
+          input_tokens: string
+          output_tokens: string
+          snapshot: Record<string, unknown>
+        }>(
+          `SELECT cost_credits::text, input_tokens::text, output_tokens::text, price_snapshot AS snapshot
+             FROM usage_records WHERE request_id = $1 AND user_id = $2`,
+          [requestId, uid.toString()],
+        )
+      ).rows[0]!
+    assert.equal((await read()).snapshot.antigravity_calls, 1)
+    // The relay read the agent call to its end and records it after settlement.
+    await usageRow(requestId, uid, 29_175, 8_525)
+    assert.equal(
+      await refreshWaivedAntigravityUsage({ pool: getPool(), pricing, requestId, userId: uid }),
+      true,
+    )
+    const after = await read()
+    assert.equal(after.cost_credits, '0')
+    assert.equal(after.input_tokens, String(16_376 + 29_175))
+    assert.equal(after.output_tokens, String(10 + 8_525))
+    assert.equal(after.snapshot.antigravity_calls, 2)
+    assert.equal(after.snapshot.antigravity_status, 'error')
+    assert.equal(after.snapshot.antigravity_terminal_code, 'USER_STOPPED')
+    assert.equal(after.snapshot.waived, 'antigravity_engine_not_success')
+    // ceil((45551 × 120 + 8535 × 150) / 1e6) = ceil(6.74637) = 7
+    assert.equal(after.snapshot.wouldHaveCharged, '7')
+    assert.equal(await balance(uid), 1_000n)
+    // Idempotent: nothing new to fold.
+    assert.equal(
+      await refreshWaivedAntigravityUsage({ pool: getPool(), pricing, requestId, userId: uid }),
+      false,
+    )
+  })
+
+  test('the late-row refresh never touches a charged turn (OCV5-451)', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const uid = await user(1_000_000n)
+    const requestId = rid()
+    await recordAntigravityTurn(getPool(), {
+      requestId,
+      userId: uid,
+      modelId: MODEL,
+      sessionId: null,
+      traceId: null,
+    })
+    await usageRow(requestId, uid, 2_000_000, 1_000)
+    assert.ok(
+      await settleAntigravityTurnRecord({
+        pool: getPool(),
+        pricing,
+        requestId,
+        userId: uid,
+        engineStatus: 'success',
+      }),
+    )
+    const charged = 1_000_000n - (await balance(uid))
+    assert.ok(charged > 0n)
+    await usageRow(requestId, uid, 5_000, 40)
+    assert.equal(
+      await refreshWaivedAntigravityUsage({ pool: getPool(), pricing, requestId, userId: uid }),
+      false,
+    )
+    const row = await query<{ cost_credits: string; input_tokens: string }>(
+      'SELECT cost_credits::text, input_tokens::text FROM usage_records WHERE request_id = $1',
+      [requestId],
+    )
+    assert.deepEqual(row.rows, [{ cost_credits: charged.toString(), input_tokens: '2000000' }])
+    assert.equal(1_000_000n - (await balance(uid)), charged)
   })
 })
