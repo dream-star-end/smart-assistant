@@ -1,0 +1,144 @@
+name: V5 selfhost tests
+
+# 个人版(feat/v5-selfhost)的全量网关与运维脚本测试(OCV5-441)。
+# 此前只有商业 v5-ci.yml 跑 test:gateway / test:v5:ops(只触发 feat/v5-aurora-rewrite),
+# 个人版树上无人跑:9 月起 v5ReleaseSafety 3 项(OCV5-438)、网关 23 项(OCV5-441)
+# 悄悄变红,其中一项是会让商用发版 smoke 失败的调度器白名单遗漏。
+#   · gateway:npm run test:gateway 全量(同一文件集与 runner 参数),单机串行超过 90 分钟,
+#     按 .github/scripts/gateway-test-shard.sh 取模分片:unit K/4 + idle 管线 integ K/3;
+#     两个分区都按排序后下标取模,新增文件必落进某个分片,不会悄悄漏跑。idle 管线 integ
+#     需要 PG(55432)+ Redis(56379)与 claude-code-best 依赖(bun,按 lockfile);
+#   · v5-ops:npm run test:v5:ops,含真实 psql 的发版安全契约,与商业 v5-ops job 同构。
+
+on:
+  pull_request:
+    branches: [feat/v5-selfhost]
+  push:
+    branches: [feat/v5-selfhost]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v5-selfhost-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gateway:
+    name: selfhost-gateway (${{ matrix.kind }} ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      # 一个分片红不取消其余,要看全量结果
+      fail-fast: false
+      matrix:
+        # timeout = v5-dev 实测(2026-10-16,OCV5-441)约 1.5 倍:unit 18/18/19/15 分钟;
+        # idle 1/3 = grow2 32 分钟,2/3 = idlePipeline.integ 12 分钟,3/3 = seam 10 分钟。
+        include:
+          - { kind: unit, shard: '1/4', timeout: 30 }
+          - { kind: unit, shard: '2/4', timeout: 30 }
+          - { kind: unit, shard: '3/4', timeout: 30 }
+          - { kind: unit, shard: '4/4', timeout: 30 }
+          - { kind: idle, shard: '1/3', timeout: 50 }
+          - { kind: idle, shard: '2/3', timeout: 20 }
+          - { kind: idle, shard: '3/3', timeout: 20 }
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: openclaude_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d openclaude_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+      redis:
+        image: redis:7
+        ports:
+          - 56379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      CI: 'true'
+      TEST_DATABASE_URL: postgres://test:test@127.0.0.1:55432/openclaude_test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install CCB from lockfile
+        working-directory: claude-code-best
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Prepare idle box project directory
+        run: sudo mkdir -p /home/box/.claude/projects && sudo chown -R "$(id -u):$(id -g)" /home/box
+
+      - name: Run test:gateway shard
+        run: .github/scripts/gateway-test-shard.sh ${{ matrix.kind }} ${{ matrix.shard }}
+
+  v5-ops:
+    name: selfhost-v5-ops
+    runs-on: ubuntu-latest
+    # v5-dev 实测 8 分钟
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: openclaude_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d openclaude_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      CI: 'true'
+      TEST_DATABASE_URL: postgres://test:test@127.0.0.1:55432/openclaude_test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run v5-ops
+        # baseline hardening must prove production root:root ownership.
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "CI=$CI" \
+            "TEST_DATABASE_URL=$TEST_DATABASE_URL" \
+            npm run test:v5:ops
