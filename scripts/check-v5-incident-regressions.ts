@@ -35,9 +35,12 @@ const ASSERTION_DEBT_BASELINE = 37;
  * 11 = 4 条存量(3 条 Weibo/Kimi 原本用无关脚本充数 + 1 条把 CI unit 误标 deploy-gate)
  *   + 5 条 2026-07-25 紧急通道事故(补登记时如实标注:回归只到 unit 层)
  *   + 2 条 SCNet 关机后从 V5 主发布门移除的 OCR 活体 proof。
+ * 17 → 19(2026-10-16 管家决定,OCV5-411 #723 最终同步):INC-20261015-GO-CACHE-PREFIX 与
+ *   INC-20261015-PRESTART-STOP-LOST 的发版证据 G1/S1 只接在个人版 deploy-v5-selfhost.sh,商业版
+ *   没有对应模型/测试账号,deploy-v5.sh 跑不了;两条的 proofPending 写明原因与补证到期 2026-11-15。
  * 这个数是**债务上界**,不是目标:补上真 proof 证据后必须同步调低。
  */
-const PROOF_PENDING_BASELINE = 17;
+const PROOF_PENDING_BASELINE = 19;
 
 // ── 个人版(--edition=selfhost)────────────────────────────────────────────────
 // 个人版的发布(deploy-v5-selfhost.sh)不跑商业的 deploy-gate / live-e2e proof,所以同一条事故在

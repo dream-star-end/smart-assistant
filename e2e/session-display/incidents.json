@@ -7547,13 +7547,12 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/openAiChatGoBridge.test.ts",
           "assertion": "later system messages stay in place, so every request extends the previous one (OCV5-432)"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/v5-go-cache-contract.mjs",
-          "assertion": "G1 OpenCode Go prompt cache hits across turns"
         }
-      ]
+      ],
+      "proofPending": {
+        "reason": "商业版暂无 proof 层证据:发版证据是 G1(scripts/v5-go-cache-contract.mjs),它只接在个人版发版 deploy-v5-selfhost.sh;商业版没有已上架的 OpenCode Go 模型和对应测试账号,deploy-v5.sh 跑不了 G1。本轮由 Go 桥单测锁住(openAiResponsesGoBridge/openAiChatGoBridge)。补证到期 2026-11-15:商业上架 Go 模型时接入商业发布门,或补等价商业证据。管家 2026-10-16 决定方案 a。",
+        "since": "2026-10-16"
+      }
     },
     {
       "id": "INC-20261015-PRESTART-STOP-LOST",
@@ -7601,13 +7600,12 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/codexTurnRetry.test.ts",
           "assertion": "Stop while starting, then shutdown rejects the start → USER_CANCELLED, not CODEX_ERROR"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/v5-stop-before-start-contract.mjs",
-          "assertion": "S1 Stop sent while the engine starts ends the turn before the model answers"
         }
-      ]
+      ],
+      "proofPending": {
+        "reason": "商业版暂无 proof 层证据:发版证据是 S1(scripts/v5-stop-before-start-contract.mjs),它只接在个人版发版 deploy-v5-selfhost.sh,依赖个人版 canary 的 Codex 模型;商业版没有对应模型/测试账号,deploy-v5.sh 跑不了 S1。本轮由 sessionManagerEngineTurn/preStartStop/codexTurnRetry 单测锁住。补证到期 2026-11-15:补商业真网关浏览器证明或商业发布门。管家 2026-10-16 决定方案 a。",
+        "since": "2026-10-16"
+      }
     }
   ]
 }

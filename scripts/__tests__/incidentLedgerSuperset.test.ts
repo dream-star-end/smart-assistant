@@ -413,8 +413,8 @@ describe("incident severity CLI admission", () => {
           case "pending ceiling preserved":
             item.regressions.pop();
             item.proofPending = { reason: "isolated valid unit-only record", since: "2026-09-09" };
-            f.manifest.incidents = Array.from({ length: 18 }, (_, i) => ({ ...item, id: `INC-20260909-P2-PENDING-${String(i).padStart(2, "0")}` }));
-            reason = /proofPending 事故 18 条 > 基线 17/; break;
+            f.manifest.incidents = Array.from({ length: 20 }, (_, i) => ({ ...item, id: `INC-20260909-P2-PENDING-${String(i).padStart(2, "0")}` }));
+            reason = /proofPending 事故 20 条 > 基线 19/; break;
           default: throw new Error(`unexpected catalog member: ${name}`);
         }
         expected = { exit: "nonzero", reason: reason.source };
