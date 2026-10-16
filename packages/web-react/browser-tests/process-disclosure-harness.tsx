@@ -7,7 +7,7 @@ import type { ChatMessage } from "../src/lib/chat/model";
 import { TooltipProvider } from "../src/components/ui";
 import { BASH_CMD, OLD_TS, READ_PATH, STAGE_TEXT, answerText, recentTs } from "./process-disclosure-story.mjs";
 
-type Scene = "gallery" | "stream" | "find" | "attention" | "parallel" | "goals";
+type Scene = "gallery" | "stream" | "find" | "attention" | "parallel" | "goals" | "stopped-tape" | "stopped-live";
 type Mode = "legacy" | "manus";
 
 function row(id: string, role: ChatMessage["role"], text: string, extra: Partial<ChatMessage> = {}): ChatMessage {
@@ -150,7 +150,29 @@ function parallelMessages(): ChatMessage[] {
   ];
 }
 
+// OCV5-459: session webmvawsvz2zkzoxm (Grok, 停止于 86 步). "tape" = the refreshed / other-device shape (Stop
+// stamped on the last narration); "live" = the device that pressed Stop (a separate stop row).
+function stoppedMessages(shape: "tape" | "live"): ChatMessage[] {
+  const owner = { _clientMessageId: "u-stop" };
+  const now = recentTs();
+  const stamp = { _errorCode: "USER_CANCELLED", _errorDetail: "本轮已由用户停止。", usage: { traceId: "stoptrace01", costCredits: "4" } };
+  return [
+    row("u-stop", "user", "你知道 rea", { status: shape === "tape" ? "replied" : "sent", ts: now - 300_000 }),
+    row("n-stop-1", "assistant", "STOP_NARRATION_ONE 请求在平台说明处被截断了。", { ...owner, ts: now - 240_000 }),
+    row("t-stop-1", "tool", "终端", { ...owner, toolName: "Bash", inputJson: { command: "probe-read-head" },
+      _completed: true, output: "ok", ts: now - 230_000 }),
+    row("n-stop-2", "assistant", "STOP_NARRATION_TWO 原始提示还在临时文件里，我直接看结尾。", {
+      ...owner, ts: now - 200_000, ...(shape === "tape" ? stamp : {}) }),
+    row("k-stop", "thinking", "看结尾", { ...owner, ts: now - 190_000 }),
+    row("t-stop-2", "tool", "终端", { ...owner, toolName: "Bash", inputJson: { command: "probe-read-tail" },
+      _completed: true, cancelled: true, ts: now - 180_000 }),
+    ...(shape === "live" ? [row("stop-live", "assistant", "本轮已取消。", { ...owner, ts: now - 170_000, ...stamp, _errorCode: "user_cancelled" })] : []),
+  ];
+}
+
 function messagesFor(scene: Scene, extra: string): ChatMessage[] {
+  if (scene === "stopped-tape") return stoppedMessages("tape");
+  if (scene === "stopped-live") return stoppedMessages("live");
   if (scene === "stream") return streamMessages(extra);
   if (scene === "find") return findMessages();
   if (scene === "attention") return attentionMessages();

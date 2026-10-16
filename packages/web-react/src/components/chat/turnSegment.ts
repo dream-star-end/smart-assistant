@@ -11,8 +11,9 @@
  *  - MessageRenderer:仅该段(且本轮进行中)抑制 TodoWrite / structured plan 的 inline
  *    卡,历史段渲染只读卡 → 翻历史会话仍能看到当时的计划与完成状态。
  */
+import { normalizeTurnErrorCode } from "@openclaude/protocol";
 import type { ChatMessage } from "../../lib/chat/model";
-import { isCollapsedAnchorTerminalEvidence } from "../../lib/chat/render";
+import { errorPresentation, isCollapsedAnchorTerminalEvidence } from "../../lib/chat/render";
 
 /** 当前活跃段的起始下标(最后一条 user 消息的下一条;无 user 消息 → 0)。 */
 export function currentTurnStartIndex(messages: readonly ChatMessage[]): number {
@@ -203,5 +204,96 @@ export function turnFinalAssistantFlags(messages: ChatMessage[],
     }
   }
   if (lastBody >= 0 && !segmentHasGroupedBody) flags[lastBody] = true;
+  clearStoppedNarrationFinals(messages, flags);
   return flags;
+}
+
+// Same roles as WORK_ROLES in ProcessDisclosure (not imported: cards → turnSegment would cycle).
+const STEP_ROLES = new Set<ChatMessage["role"]>(["tool", "thinking", "plan", "agent-group", "delegate-progress"]);
+
+function isUserStopCode(code: string | undefined): boolean {
+  if (!code) return false;
+  const normalized = normalizeTurnErrorCode(code);
+  return normalized === "stopped" || normalized === "user_cancelled";
+}
+
+/** Whether `m` is the user's Stop: the live stop row, the tape segment it was stamped on, or the status record. */
+function isUserStopRow(m: ChatMessage | undefined): boolean {
+  return !!m && (m.role === "assistant" || m._turnStatusRecord === true) && isUserStopCode(m._errorCode);
+}
+
+/** [start, end) of the user turn that holds index `i` in array order (user row = boundary). */
+function arraySegment(messages: readonly ChatMessage[], i: number): [number, number] {
+  let start = i;
+  while (start > 0 && messages[start - 1]?.role !== "user") start--;
+  let end = i + 1;
+  while (end < messages.length && messages[end]?.role !== "user") end++;
+  return [start, end];
+}
+
+/**
+ * OCV5-459: a turn the user stopped has no answer when work ran after its last text. That text was the
+ * model's narration before a tool ("原始提示还在临时文件里，我直接看结尾…"); promoting it put a step
+ * outside 已执行 N 个步骤 with its own timestamp. Text with nothing after it (stopped mid-answer) stays
+ * the answer.
+ */
+function clearStoppedNarrationFinals(messages: readonly ChatMessage[], flags: boolean[]): void {
+  for (let i = 0; i < flags.length; i++) {
+    if (!flags[i]) continue;
+    const [start, end] = arraySegment(messages, i);
+    const segment = messages.slice(start, end);
+    if (!segment.some(isUserStopRow)) continue;
+    if (messages.slice(i + 1, end).some((m) => !!m && STEP_ROLES.has(m.role))) flags[i] = false;
+  }
+}
+
+/**
+ * OCV5-459: the tape stamps the user's Stop on the turn's last text segment. When the model kept
+ * working after that text, the text is narration and belongs with the steps, while the stop status
+ * belongs at the end of the turn. Split such a row into the narration (same id, so find-in-session
+ * and hydration keep their anchor) and a text-less stop row (derived id, keeps usage and request ID)
+ * placed after the turn's last row. Live stops already arrive as two rows and pass through unchanged.
+ */
+export function splitStoppedNarration(messages: ChatMessage[]): ChatMessage[] {
+  const moved = new Map<number, ChatMessage[]>();
+  const replaced = new Map<number, ChatMessage>();
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (m?.role !== "assistant" || !isUserStopCode(m._errorCode)) continue;
+    const narration = errorPresentation(m._errorCode, m.text, m._errorDetail, m.usage?.waived === true).bodyText;
+    if (!narration) continue;
+    const [, end] = arraySegment(messages, i);
+    if (!messages.slice(i + 1, end).some((row) => !!row && STEP_ROLES.has(row.role))) continue;
+    const {
+      _errorCode: _code,
+      _errorDetail: _detail,
+      _errorCardSnapshot: _snapshot,
+      error: _error,
+      _isError: _isErr,
+      usage: _usage,
+      _turnKey: _key,
+      ...rest
+    } = m;
+    replaced.set(i, { ...rest, text: narration });
+    // The stop came after the turn's last step; processTimeBounds reads this row as the shell's end.
+    const stoppedAt = Math.max(...messages.slice(i, end).map((row) =>
+      typeof row?.ts === "number" && Number.isFinite(row.ts) ? row.ts : 0));
+    const stop: ChatMessage = {
+      ...m,
+      id: `${m.id}:stopped`,
+      text: "",
+      ts: stoppedAt > 0 ? stoppedAt : m.ts,
+      ...(m._timelineUnitKey ? { _timelineUnitKey: `${m._timelineUnitKey}:stopped` } : {}),
+    };
+    const at = end - 1;
+    moved.set(at, [...(moved.get(at) ?? []), stop]);
+  }
+  if (replaced.size === 0) return messages;
+  const out: ChatMessage[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    out.push(replaced.get(i) ?? messages[i]!);
+    const tail = moved.get(i);
+    if (tail) out.push(...tail);
+  }
+  return out;
 }
