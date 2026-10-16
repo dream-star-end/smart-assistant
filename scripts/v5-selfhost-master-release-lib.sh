@@ -1007,27 +1007,9 @@ console.log("transform-ok");
   mlog "  ✓ tsx 自检通过(无 HTTP)"
 }
 
-sql_file_has_breaking_ddl() { # <sql-file> → rc 0 = breaking
-  local f="$1"
-  python3 - "$f" <<'PY'
-import re, sys
-path = sys.argv[1]
-text = open(path, encoding="utf-8", errors="replace").read()
-text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-text = re.sub(r"--.*?$", " ", text, flags=re.M)
-if re.search(r"\bDROP\s+TABLE\b", text, re.I):
-    print("DROP TABLE"); sys.exit(0)
-if re.search(r"\bDROP\s+COLUMN\b", text, re.I):
-    print("DROP COLUMN"); sys.exit(0)
-if re.search(r"\bALTER\b[\s\S]{0,200}\bDROP\b", text, re.I):
-    print("ALTER ... DROP"); sys.exit(0)
-if re.search(r"\bRENAME\s+(TO|COLUMN|TABLE)\b", text, re.I):
-    print("RENAME"); sys.exit(0)
-if re.search(r"\bTRUNCATE\b", text, re.I):
-    print("TRUNCATE"); sys.exit(0)
-sys.exit(1)
-PY
-}
+# OCV5-450: the detector lives in scripts/lib/v5-migration-ddl.sh (shared with the PR precheck).
+# shellcheck source=scripts/lib/v5-migration-ddl.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-migration-ddl.sh"
 
 # git object 必须存在;diff 非 0 必须 fail-closed。禁止 || true 把坏 SHA 变成「无 migration」。
 git_migration_name_diff() { # <from-commit> <to-commit>
