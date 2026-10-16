@@ -307,6 +307,12 @@
       "reason": "OCV5-452: ZCode's prompt listed the memory-MCP tools from its own copy, which missed present_task_approval when e87e3723a added it to Grok and Cursor; the MCP server always exposed the tool. Latent: no user report. The three platform engines now share one list with a contract test.",
       "approvedBy": "user 2026-10-16 「新开一个cc3会话对个人版架构进行全面梳理……可扩展性是否强大……进行持续迭代优化」（cc3 ocv5-selfhost-arch-review，FINDINGS EXT-3）",
       "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "cc3c7b0648afc2dc17a81d4e5338e5db89e3b5aa",
+      "reason": "OCV5-453: backport of commercial 51790b628. getFreshAntigravityAccessToken loads the KMS key before checking out a pool client, so a key failure can no longer strand the client and hang pool.end(). Latent: selfhost has its KMS key, no user report; found through a commercial CI integ timeout. Unit test red without the fix.",
+      "approvedBy": "user 2026-10-16 「开始回挂 cc3-sync 的连接泄漏修复 51790b628……到个人版」，按规范写 Incident: none 豁免（cc3 antigravity 会话）",
+      "expiresAt": "2026-11-15"
     }
   ]
 }
