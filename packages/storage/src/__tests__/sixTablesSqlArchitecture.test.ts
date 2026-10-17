@@ -58,6 +58,9 @@ const SQL_CONTEXT = new RegExp(
 // 白名单(相对 REPO_ROOT 的 POSIX 路径)。理由见文件顶注。
 const WHITELIST = new Set<string>([
   "packages/storage/src/sessionsDb.ts",
+  // sessionsDb.ts 的拆分模块(OCV5-485):同一 SQLite sessions 权威,只是按职责分文件。
+  "packages/storage/src/sessionsDbProjects.ts",
+  "packages/storage/src/sessionsDbSidebar.ts",
   "packages/storage/src/wechatBindings.ts",
   "packages/storage/src/clientSessionsPlan.ts",
   "packages/storage/src/sessionsMigrate.ts",

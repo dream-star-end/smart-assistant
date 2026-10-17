@@ -10,7 +10,7 @@
     "packages/commercial/src/marketplace/marketplaceDb.ts": 3621,
     "packages/commercial/src/ws/userChatBridge.ts": 10600,
     "packages/gateway/src/server.ts": 8804,
-    "packages/storage/src/sessionsDb.ts": 7990,
+    "packages/storage/src/sessionsDb.ts": 6184,
     "packages/web-react/browser-tests/harness.tsx": 3837,
     "packages/web-react/browser-tests/run.mjs": 4185,
     "packages/web-react/src/components/MessageRenderer.tsx": 3165,
