@@ -7718,7 +7718,7 @@
       "occurredAt": "2026-10-17",
       "severity": "P1",
       "symptom": "官方 DeepSeek(deepseek-v4-flash)把输入预测块紧贴正文写成 2```ui{\"type\":\"next\",…}，CommonMark 只在行首开围栏，聊天页把整块当行内代码显示原始 JSON，输入预测也丢失。商业热修 #809 第二次重发被真实对话门挡下(g477-deploy2-journal.log)。修复：渲染、ui→Markdown 转换、输入预测前统一把贴行的 ui 开/收围栏挪到单独一行。",
-      "rootFixCommit": "1e7dbd6a",
+      "rootFixCommit": "4f305612",
       "regressions": [
         {
           "layer": "unit",
@@ -7742,7 +7742,6 @@
         }
       ],
       "coverageCommits": [
-        "4f305612",
         "7ef1370c"
       ]
     }
