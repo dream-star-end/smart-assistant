@@ -990,6 +990,8 @@ export interface UserChatBridgeDeps {
    * 未注入(v3 / 测试)或返回 null → 不发帧,零行为变化。
    */
   getFrontendBuildId?: () => string | null;
+  /** 可选:build id 变化后给已连 socket 补发帧的轮询间隔(默认 15s;测试注入)。 */
+  frontendBuildReannounceMs?: number;
   /** 可选:每用户最大并发(默认 3)。 */
   maxPerUser?: number;
   /** 可选:单帧上限(双向,默认 1MB)。 */
@@ -2318,6 +2320,29 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     60_000,
   );
   ringPruneTimer.unref?.();
+
+  /**
+   * P0-Web(OCV5-489):前端构建目录热切换不重启 master,已连着的客户端收不到 accept 帧。
+   * 定时读探针,build id 变了就给所有已开 socket 补发一帧 sys.frontend_build;客户端
+   * reload governor 照旧只在安全点(无在飞 turn / 无草稿附件 / 输入空闲)软刷新。
+   * best-effort:探针返回 null 或发送失败都静默跳过。
+   */
+  let announcedFrontendBuild: string | null = null;
+  try { announcedFrontendBuild = deps.getFrontendBuildId?.() ?? null; } catch { /* best-effort */ }
+  const frontendBuildTimer: NodeJS.Timeout | null = deps.getFrontendBuildId
+    ? setInterval(() => {
+        let build: string | null = null;
+        try { build = deps.getFrontendBuildId?.() ?? null; } catch { return; }
+        if (!build || build === announcedFrontendBuild) return;
+        announcedFrontendBuild = build;
+        const frame = JSON.stringify({ type: "sys.frontend_build", build });
+        for (const client of wss.clients) {
+          if (client.readyState !== WebSocket.OPEN) continue;
+          try { client.send(frame); } catch { /* best-effort */ }
+        }
+      }, deps.frontendBuildReannounceMs ?? 15_000)
+    : null;
+  frontendBuildTimer?.unref?.();
 
   /**
    * uid(string) → 该用户当前持有的所有正在正常桥接中的 user WS 集合。
@@ -10403,6 +10428,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
   async function shutdown(reason = "server shutting down"): Promise<void> {
     clearInterval(ringPruneTimer);
+    if (frontendBuildTimer) clearInterval(frontendBuildTimer);
     clearInterval(controlDrainTimer);
     clearInterval(recoveryDrainTimer);
     registry.closeAll(reason);

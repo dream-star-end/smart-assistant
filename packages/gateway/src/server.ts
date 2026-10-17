@@ -2374,7 +2374,10 @@ export class Gateway {
   }
 
   // ── In-memory cache for static web UI files ──
-  private _staticFileCache = new Map<string, { content: Buffer; mime: string; etag: string; mtimeMs: number }>()
+  private _staticFileCache = new Map<
+    string,
+    { content: Buffer; mime: string; etag: string; mtimeMs: number; ino?: number; size?: number }
+  >()
   // (channel, peer.id) → 当前活跃的 ws client(用于回传 outbound)
   private clientsByPeer = new Map<string, Set<WebSocket>>()
   /** Commercial bridge sockets are the only valid path for an internal queue
@@ -4024,7 +4027,7 @@ export class Gateway {
         const firstKey = this._staticFileCache.keys().next().value
         if (firstKey !== undefined) this._staticFileCache.delete(firstKey)
       }
-      this._staticFileCache.set(filePath, { content, mime, etag, mtimeMs: s.mtimeMs })
+      this._staticFileCache.set(filePath, { content, mime, etag, mtimeMs: s.mtimeMs, ino: s.ino, size: s.size })
       if (req.headers['if-none-match'] === etag) {
         res.writeHead(304)
         res.end()
@@ -4038,10 +4041,21 @@ export class Gateway {
     }
   }
 
-  /** 缓存条目与磁盘是否仍一致(mtimeMs 比对;stat 失败/文件已删 → 视为失效)。 */
-  private _staticCacheFreshOnDisk(filePath: string, entry: { mtimeMs: number }): boolean {
+  /**
+   * 缓存条目与磁盘是否仍一致(mtimeMs + inode + size 比对;stat 失败/文件已删 → 视为失效)。
+   * inode/size 是为 P0-Web(OCV5-489):webRoot 是 overlay 符号链接,换指向后同一路径是
+   * 另一个文件,cp -a 保留的 mtime 可能与旧文件相同。缺字段的旧条目只比 mtime。
+   */
+  private _staticCacheFreshOnDisk(
+    filePath: string,
+    entry: { mtimeMs: number; ino?: number; size?: number },
+  ): boolean {
     try {
-      return statSync(filePath).mtimeMs === entry.mtimeMs
+      const s = statSync(filePath)
+      if (s.mtimeMs !== entry.mtimeMs) return false
+      if (entry.ino !== undefined && s.ino !== entry.ino) return false
+      if (entry.size !== undefined && s.size !== entry.size) return false
+      return true
     } catch {
       return false
     }

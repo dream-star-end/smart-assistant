@@ -91,6 +91,7 @@ async function startRig(opts: {
   loadSessionWorkspaceMode?: UserChatBridgeDeps["loadSessionWorkspaceMode"];
   logger?: Logger;
   getFrontendBuildId?: () => string | null;
+  frontendBuildReannounceMs?: number;
   pgPool?: UserChatBridgeDeps["pgPool"];
   preCheckRedis?: UserChatBridgeDeps["preCheckRedis"];
   pricing?: UserChatBridgeDeps["pricing"];
@@ -136,6 +137,7 @@ async function startRig(opts: {
     loadSessionWorkspaceMode: opts.loadSessionWorkspaceMode,
     logger: opts.logger,
     getFrontendBuildId: opts.getFrontendBuildId,
+    frontendBuildReannounceMs: opts.frontendBuildReannounceMs,
     pgPool: opts.pgPool,
     preCheckRedis: opts.preCheckRedis,
     pricing: opts.pricing,
@@ -3937,6 +3939,38 @@ describe("frontend build handshake", () => {
       assert.equal(first.build, "a1b2c3d4e5f60718");
       const second = JSON.parse(await frames.next()) as { type: string };
       assert.notEqual(second.type, "sys.frontend_build");
+      await waitClose(ws);
+    } finally {
+      await stopRig(rig);
+    }
+  });
+
+  test("P0-Web 热切换:build id 变化后给已连 socket 补发一帧,不变则不重复发(OCV5-489)", async () => {
+    let build = "aaaaaaaaaaaaaaaa";
+    const rig = await startRig({ getFrontendBuildId: () => build, frontendBuildReannounceMs: 20 });
+    try {
+      const ws = new WebSocket(
+        `ws://127.0.0.1:${rig.gatewayPort}${BRIDGE_WS_PATH}`,
+        ["bearer", await makeJwt("4891")],
+      );
+      const frames = frameCollector(ws);
+      const builds: string[] = [];
+      const collect = (async () => {
+        for (;;) {
+          const parsed = JSON.parse(await frames.next()) as { type: string; build?: string };
+          if (parsed.type === "sys.frontend_build" && parsed.build) builds.push(parsed.build);
+          if (builds.length >= 2) return;
+        }
+      })();
+      // 连上后先等几个轮询周期:build 未变,不得补发。
+      await new Promise((r) => setTimeout(r, 120));
+      assert.deepEqual(builds, ["aaaaaaaaaaaaaaaa"]);
+      build = "bbbbbbbbbbbbbbbb";
+      await collect;
+      assert.deepEqual(builds, ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"]);
+      await new Promise((r) => setTimeout(r, 120));
+      assert.equal(builds.length, 2, "same build must not be re-announced");
+      ws.close();
       await waitClose(ws);
     } finally {
       await stopRig(rig);
