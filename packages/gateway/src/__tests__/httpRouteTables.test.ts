@@ -175,7 +175,8 @@ describe('thin-dispatch routes call the original handler', () => {
 })
 
 describe('server.ts wiring', () => {
-  const src = readFileSync(join(here, '../server.ts'), 'utf8')
+  // The HTTP entry (handleHttp / _handleHttpAfterCommercial) moved to gatewayHttp.ts (OCV5-493).
+  const src = readFileSync(join(here, '../gatewayHttp.ts'), 'utf8')
   const at = (s: string) => {
     const i = src.indexOf(s)
     assert.ok(i > 0, `missing: ${s}`)

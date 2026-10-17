@@ -12,9 +12,11 @@ import { fileURLToPath } from 'node:url'
 
 import { readServerFeatures } from '@openclaude/protocol'
 import { matchBridgeApiAllowlist, matchCommercialContainerApiProxy } from '../bridgeApiAllowlist.js'
+import { readGatewaySource } from './helpers/gatewaySource.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const serverSrc = readFileSync(join(here, '../server.ts'), 'utf8')
+// OCV5-493: KNOWN_ROUTES / normalizePath moved with the HTTP entry to gatewayHttp.ts; read the source set.
+const serverSrc = readGatewaySource()
 // FINDINGS §7.5 2b: /api/features and /api/config dispatch live in the APP_CONFIG_ROUTES table.
 const routeSrc = readFileSync(join(here, '../routes/appConfig.ts'), 'utf8')
 

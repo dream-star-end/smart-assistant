@@ -35,6 +35,9 @@ export const GATEWAY_SOURCE_FILES: readonly string[] = [
   'turnFrames.ts',
   'askUserSanitize.ts',
   'gatewayTypes.ts',
+  'gatewayLifecycle.ts',
+  'gatewayHttp.ts',
+  'sessionRepoBinding.ts',
 ]
 
 export function readGatewaySource(): string {
