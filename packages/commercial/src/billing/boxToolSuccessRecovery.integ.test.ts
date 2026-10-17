@@ -45,6 +45,8 @@ function finalSpool() {
 }
 
 async function shadow(client: import("pg").PoolClient): Promise<void> {
+  // Always shadow the owner lookup, even when all other fixtures clone public.
+  await client.query("CREATE TEMP TABLE agent_containers (id bigint PRIMARY KEY, state text NOT NULL)");
   const names = ["request_finalize_journal", "usage_records", "pending_usage_patches",
     "users", "user_subscriptions", "org_memberships", "orgs",
     "org_subscriptions", "turn_waivers", "client_sessions", "chat_projects",
@@ -67,7 +69,8 @@ async function shadow(client: import("pg").PoolClient): Promise<void> {
     `SELECT 'request_finalize_journal'::regclass = 'pg_temp.request_finalize_journal'::regclass
       AND 'usage_records'::regclass = 'pg_temp.usage_records'::regclass
       AND 'credit_ledger'::regclass = 'pg_temp.credit_ledger'::regclass
-      AND 'users'::regclass = 'pg_temp.users'::regclass AS only_temp`);
+      AND 'users'::regclass = 'pg_temp.users'::regclass
+      AND 'agent_containers'::regclass = 'pg_temp.agent_containers'::regclass AS only_temp`);
   assert.equal(shadowOk.rows[0]?.only_temp, true);
 }
 
