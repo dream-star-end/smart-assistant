@@ -35,6 +35,13 @@ describe('normalizeInlineUiFences(OCV5-482)', () => {
     expect(normalizeInlineUiFences('没有组件')).toBe('没有组件')
   })
 
+  test('缩进代码块里的 ```ui 示例不动,后续正文保留(Codex r1)', () => {
+    const indented = '示例:\n\n    ```ui\n    {"type":"next","text":"继续"}\n    ```\n\n后续回答。'
+    expect(normalizeInlineUiFences(indented)).toBe(indented)
+    const indentedGlued = '    示例 2```ui{"type":"next"}\n    ```\n\n后续回答。'
+    expect(normalizeInlineUiFences(indentedGlued)).toBe(indentedGlued)
+  })
+
   test('输入预测与 Markdown 转换都认得贴行的块', () => {
     expect(nextPredictionOf(GATE_RAW)).toBe('2+2等于几?')
     expect(uiFencesToMarkdown(GATE_RAW).trim()).toBe('2')
