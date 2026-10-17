@@ -80,6 +80,8 @@ type Api = {
   stopHandler: (deps: unknown) => RouteHandler;
   idleProofHandler: (deps: unknown) => RouteHandler;
   jsonError: (res: unknown, status: number, code: string, message: string, requestId: string) => void;
+  /** egress' model authority gate reject, as /v1/messages serializes it. */
+  gateReject: (kind: string, detail: string) => { status: number; code: string; clientMessage: string };
   /** The box-resident Claude CLI lane (box-claude-*): the gateway runner and its stdio bridge. */
   boxCli: { runner: (opts: unknown) => { submit: (text: string, requestId: undefined, authority: unknown,
       turnKey: string) => Promise<void>; updateTurnLease: (lease: string) => Promise<void> };
@@ -187,6 +189,7 @@ async function load(): Promise<Api> {
   const stopRoute = await import(pathToFileURL(join(PROXY, "boxUserStopHandler.ts")).href);
   const idleRoute = await import(pathToFileURL(join(PROXY, "boxIdleProofHandler.ts")).href);
   const shared = await import(pathToFileURL(join(PROXY, "shared.ts")).href);
+  const authorityGate = await import(pathToFileURL(join(PROXY, "modelAuthorityGate.ts")).href);
   const cliVersion = await import(pathToFileURL(join(PROXY, "boxCliVersion.ts")).href);
   const prelaunch = await import(pathToFileURL(join(PROXY, "boxPrelaunchControl.ts")).href);
   const stageFiles = await import(pathToFileURL(join(PROXY, "boxStageFiles.ts")).href);
@@ -244,6 +247,7 @@ async function load(): Promise<Api> {
       read: replaySetup.createBoxReplayReader(root) }),
     stopHandler: stopRoute.makeBoxUserStopHandler, idleProofHandler: idleRoute.makeBoxIdleProofHandler,
     jsonError: shared.sendJsonError,
+    gateReject: (kind: string, detail: string) => new authorityGate.ModelGateReject(kind, detail),
     boxCli: { runner: (opts) => new boxRunner.SubprocessRunner(opts), bridge: boxBridge.runBoxCcBridge },
     ccbAdapter: (runner) => new ccb.CcbAdapter({}, runner),
     fetchIdleProof: idleClient.fetchBoxIdleProof,
@@ -1957,6 +1961,58 @@ async function proveRejectBlocksNextMessage(api: Api, db: Db): Promise<string> {
   return "[ocv5-315-reject-blocks-next-message] PASS — a rejected continuation stops the parked Box turn and the next message passes submit";
 }
 
+// INC-20261017-CONFIG-CHANGE-PINS-BOX-SESSION, live #49fab402 (commercial uid 4):
+// a catalog change bumped the global model security epoch mid-turn. The next
+// continuation never reached Box: egress' authority gate answered it 409
+// MODEL_CONFIG_CHANGED_RETRY_TURN. Claude Code ended the turn, the handed-off
+// Box CLI stayed parked, and every next message of the session was refused
+// ("消息未开始处理") until the 4 h deadline. That reject must stop it as well.
+async function proveConfigChangedBlocksNextMessage(api: Api, db: Db): Promise<string> {
+  const journal = api.journal(db);
+  const who = { uid: 900_000_486n, containerId: 486n, sessionId: "session-config-changed" };
+  const turnKey = "4860".repeat(16);
+  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'config-changed@test.invalid','unused',10000)",
+    [who.uid.toString()]);
+  const turn = boxTurn(api, db, journal, who, "box-cfg", turnKey);
+  await turn.first();
+  // the gate's own reject, serialized the way /v1/messages answers it
+  const reject = api.gateReject("config_changed", "epoch drift (bridge): token=225 snapshot=226");
+  let wire = "";
+  api.jsonError({ headersSent: false, writeHead: () => {}, setHeader: () => {}, end: (body: string) => { wire = body; } },
+    reject.status, reject.code, reject.clientMessage, "49fab4020000000000000000000000ff");
+  if (reject.status !== 409 || !wire.includes("MODEL_CONFIG_CHANGED_RETRY_TURN")) fail(`CONFIG_WIRE_${reject.status}`);
+  const routes = await egressInternalRoutes(api, journal, who, turn.host.target);
+  const dir = api.home;
+  const counters = { submits: 0, shutdowns: 0 };
+  const session = gatewaySession(api, "config-changed-session", counters);
+  api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: session.sessionKey, sessionId: who.sessionId, turnKey });
+  try {
+    if ((await api.fetchIdleProof({ sessionId: who.sessionId, turnKey })).status !== "pending") fail("CONFIG_NOT_PARKED");
+    if (await submitMessage(api, session) !== "IDLE_HISTORY_PENDING") fail("CONFIG_PARKED_TURN_DID_NOT_BLOCK");
+    const runner = Object.assign(new EventEmitter(), { model: MODEL, sessionId: who.sessionId,
+      setConsultTurn: () => {}, submit: async () => {}, interrupt: () => true });
+    const adapter = api.ccbAdapter(runner);
+    const ccbTurn = adapter.submitTurn({ input: "continue", turnKey, onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map() });
+    await ccbTurn.submitted;
+    runner.emit("message", { type: "result", subtype: "success", is_error: true, result: `API Error: 409 ${wire}` });
+    if ((await ccbTurn.summary)?.isError !== true) fail("CONFIG_TURN_NOT_ENDED");
+    await routes.settled();
+    if (routes.calls.filter((path) => path === "/internal/box/stop").length !== 1) {
+      fail(`CONFIG_PARKED_TURN_NOT_STOPPED_${routes.calls.join(",")}`);
+    }
+    const parked = await journalRow(db, "box-cfg-1");
+    if (parked?.ctx.boxState !== "failed_stopped" || turn.host.count.stop !== 1) fail(`CONFIG_ROW_${String(parked?.ctx.boxState)}`);
+    const idle = await api.fetchIdleProof({ sessionId: who.sessionId, turnKey });
+    if (idle.status !== "failed") fail(`CONFIG_IDLE_${idle.status}`);
+    if (await submitMessage(api, session) !== "admitted") fail("CONFIG_NEXT_MESSAGE_STILL_BLOCKED");
+    if (api.idle.readIdleCandidate(dir, session.sessionKey) !== undefined || counters.submits !== 0) fail("CONFIG_CANDIDATE_KEPT");
+  } finally {
+    await routes.close();
+  }
+  return "[ocv5-486-config-change-pins-box-session] PASS — a config-changed continuation reject stops the parked Box turn and the next message passes submit";
+}
+
 // INC-20261003-BOX-IDLE-NO-SUMMARY-STRANDS-SESSION: a session's idle compaction
 // was dispatched; CCB's compact fallback request carried `temperature: 1`,
 // egress refused it (BOX_PARAMETER_UNMAPPED) and CCB ended the idle turn
@@ -3259,7 +3315,8 @@ async function main(): Promise<void> {
     await proveSandInstallerHostF95dbfb(api), await proveSandInstallerHostF1727e3(api),
     ...await withJournalDatabase(database, async (db) => [await proveRejectedStreamWedge(api, db),
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
-      await proveRejectBlocksNextMessage(api, db), await proveIdleNoSummary(api, db),
+      await proveRejectBlocksNextMessage(api, db), await proveConfigChangedBlocksNextMessage(api, db),
+      await proveIdleNoSummary(api, db),
       await proveAnsweredExchangePrompt(api, db), await proveWaitingHandoffSuperseded(api, db), await proveResumeUnsentParked(api, db),
       await proveUnknownNeverClosed(api, db), await proveSyntheticTurnHeld(api, db),
       await proveUpstreamRefusal(api, db), await proveNativeResumedStop(api, db),
