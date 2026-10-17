@@ -603,10 +603,13 @@ export function _handleReleaseJobStatus(
   res: ServerResponse,
   id: string,
 ): void {
+  // biome-ignore lint/correctness/noVoidTypeReturn: moved verbatim from server.ts (OCV5-471); pre-existing there
   if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
+  // biome-ignore lint/correctness/noVoidTypeReturn: moved verbatim from server.ts (OCV5-471); pre-existing there
   if (!isReleaseJobId(id)) return this.sendError(res, 400, 'invalid release job id')
   this.getUserId(req)
   const job = readReleaseJob(defaultReleaseJobDir(), id)
+  // biome-ignore lint/correctness/noVoidTypeReturn: moved verbatim from server.ts (OCV5-471); pre-existing there
   if (!job) return this.sendError(res, 404, 'release job not found')
   this.sendJson(res, 200, publicReleaseJob(job))
 }

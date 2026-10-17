@@ -758,6 +758,7 @@ export async function _runAutoDreamOptimizerModel(
             invalidEvent ??= 'multiple_billing'
           } else {
             billing = { ...event }
+            // biome-ignore lint/performance/noDelete: moved verbatim from server.ts (OCV5-471); pre-existing there
             delete (billing as { kind?: string }).kind
           }
           return
