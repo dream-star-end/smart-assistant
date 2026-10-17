@@ -250,7 +250,7 @@ export const ZCODE_ENGINE_MODELS = [
     displayName: 'ZCode Experimental',
     upstreamModel: ZCODE_CLI_UPSTREAM_MODEL,
     experimental: true,
-    communityCliVersion: '0.16.3',
+    communityCliVersion: '0.16.9',
   },
 ] as const
 
