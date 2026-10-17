@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url'
 const here = dirname(fileURLToPath(import.meta.url))
 const source = readFileSync(join(here, '..', 'sessionManager.ts'), 'utf8')
 const submitStart = source.indexOf('  async submit(')
-const submitEnd = source.indexOf('  private async runOneTurnWithRetry(', submitStart)
+// the next member after submit; its forwarder is no longer `async` (OCV5-469: forwarders return the impl promise)
+const submitEnd = source.slice(submitStart).search(/\n {2}private (?:async )?runOneTurnWithRetry\(/) + submitStart + 1
 const submit = source.slice(submitStart, submitEnd)
 
 test('commercial foreground turns hold the shared memory barrier until submit finally', () => {
