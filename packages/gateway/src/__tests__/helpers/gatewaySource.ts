@@ -17,6 +17,8 @@ export const GATEWAY_SOURCE_FILES: readonly string[] = [
   'routes/appConfig.ts',
   'routes/agents.ts',
   'routes/workspaceApi.ts',
+  'agentHandlers.ts',
+  'skillHandlers.ts',
 ]
 
 export function readGatewaySource(): string {

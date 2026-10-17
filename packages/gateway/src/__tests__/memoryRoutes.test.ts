@@ -20,22 +20,27 @@ import { describe, it } from 'node:test'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const SERVER_TS = readFileSync(join(__dirname, '..', 'server.ts'), 'utf-8')
+// FINDINGS §7.6 S2: the memory / auto-dream handler bodies live in agentHandlers.ts
+const AGENT_HANDLERS_TS = readFileSync(join(__dirname, '..', 'agentHandlers.ts'), 'utf-8')
 
 function extractMethodBody(source: string, methodName: string): string {
   // `(` after the name: the Gateway's route io adapters list `handleMemory: (...args) => …` too
-  const startRe = new RegExp(`^  (private|public|protected)?\\s*(async\\s+)?${methodName}\\(`, 'm')
+  const startRe = new RegExp(
+    `^(?:  (private|public|protected)?\\s*(async\\s+)?|export (?:async )?function )${methodName}\\(`,
+    'm',
+  )
   const startMatch = startRe.exec(source)
   if (!startMatch) throw new Error(`method ${methodName} not found`)
   const startIdx = startMatch.index
   const rest = source.slice(startIdx + startMatch[0].length)
-  const nextMatch = /^  (private|public|protected|async|static)\b/m.exec(rest)
+  const nextMatch = /^(?:  (private|public|protected|async|static)\b|export |\/\*\*)/m.exec(rest)
   const endIdx = nextMatch ? startIdx + startMatch[0].length + nextMatch.index : source.length
   return source.slice(startIdx, endIdx)
 }
 
-const handleMemory = extractMethodBody(SERVER_TS, 'handleMemory')
-const handleMemoryFile = extractMethodBody(SERVER_TS, 'handleMemoryFile')
-const handleAutoDreamReport = extractMethodBody(SERVER_TS, 'handleAutoDreamReport')
+const handleMemory = extractMethodBody(AGENT_HANDLERS_TS, 'handleMemory')
+const handleMemoryFile = extractMethodBody(AGENT_HANDLERS_TS, 'handleMemoryFile')
+const handleAutoDreamReport = extractMethodBody(AGENT_HANDLERS_TS, 'handleAutoDreamReport')
 
 describe('handleMemory(memdir)', () => {
   it('user 目标底层换 userProfile(读/写),结构不变', () => {
