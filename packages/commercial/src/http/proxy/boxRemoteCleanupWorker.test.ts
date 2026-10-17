@@ -619,7 +619,7 @@ function abandonedWorker(input: { abandoned: boolean; intent?: boolean }) {
       if (request.args.at(-1)?.startsWith("/tmp/ocv5-289-proof-")) {
         sequence.push("proof-read");
         if (!stopped) throw Object.assign(new Error("BOX_EXEC_REMOTE_EXIT"), { code: "BOX_EXEC_REMOTE_EXIT" });
-        return { stdout: JSON.stringify(stoppedProof) + "\n", stderrBytes: 0, exitCode: 0 };
+        return { stdout: `${JSON.stringify(stoppedProof)}\n`, stderrBytes: 0, exitCode: 0 };
       }
       assert.deepEqual(request.args.slice(-2), [candidate.runNonce, candidate.leaseEpoch],
         "stop is bound to the original nonce/epoch keeper");
