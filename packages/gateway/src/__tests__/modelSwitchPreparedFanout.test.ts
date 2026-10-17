@@ -5,6 +5,7 @@
  * Pin the fanout/ring helper structurally so a later refactor cannot revert
  * to `ws.send` as the only reply path.
  */
+import { gatewayMethodBody, readGatewaySource } from './helpers/gatewaySource.js'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -14,7 +15,8 @@ import assert from 'node:assert/strict'
 import { preparedModelSwitchCatchupFrame } from '../server.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const serverSrc = readFileSync(join(__dirname, '..', 'server.ts'), 'utf8')
+// server.ts + split-out modules (FINDINGS §7.6 S6: dispatchInbound / ws connection moved out)
+const serverSrc = readGatewaySource()
 
 test('structural: prepare_model_switch replies through _sendStampedSessionFrame', () => {
   const startMarker = "} else if ((frame as any).type === 'control.session.prepare_model_switch') {"
@@ -44,10 +46,9 @@ test('structural: prepare_model_switch replies through _sendStampedSessionFrame'
 })
 
 test('structural: hello catch-up emits preparedModelSwitchCatchupFrame', () => {
-  const startMarker = "private async autoResumeFromHello("
-  const startIdx = serverSrc.indexOf(startMarker)
-  assert.ok(startIdx >= 0, 'autoResumeFromHello not found')
-  const tail = serverSrc.slice(startIdx, startIdx + 12_000)
+  // FINDINGS §7.6 S6: autoResumeFromHello lives in wsConnection.ts; read its implementation.
+  const tail = gatewayMethodBody('autoResumeFromHello')
+  assert.ok(tail.length > 0, 'autoResumeFromHello not found')
   assert.equal(
     tail.includes('preparedModelSwitchCatchupFrame(session)'),
     true,
