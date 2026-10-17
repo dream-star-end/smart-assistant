@@ -79,8 +79,8 @@ type Api = {
   replayStore: (root: string) => { write: unknown; read: unknown };
   stopHandler: (deps: unknown) => RouteHandler;
   idleProofHandler: (deps: unknown) => RouteHandler;
-  /** OCV5-488: the product's Box billing reconcile, which settles a handoff's completed calls. */
-  settleBoxBilling: (db: Db) => Promise<{ settled: number; pending: number; manual: number }>;
+  /** OCV5-488: the product's Box billing recovery for one row: it settles a handoff's completed calls. */
+  settleBoxBilling: (db: Db, requestId: string, uid: bigint) => Promise<string>;
   /** OCV5-488: the ops.box_hold_stuck alert's own query and row mapping. */
   boxHoldStuck: { sql: string; rows: (rows: unknown[]) => Array<{ requestId: string; absent: boolean }> };
   jsonError: (res: unknown, status: number, code: string, message: string, requestId: string) => void;
@@ -254,8 +254,8 @@ async function load(): Promise<Api> {
       read: replaySetup.createBoxReplayReader(root) }),
     stopHandler: stopRoute.makeBoxUserStopHandler, idleProofHandler: idleRoute.makeBoxIdleProofHandler,
     boxHoldStuck: { sql: holdStuck.BOX_HOLD_STUCK_SQL, rows: holdStuck.boxHoldStuckRows },
-    settleBoxBilling: (db) => boxBilling.reconcileBoxBillingBatch({ query: db.query.bind(db),
-      connect: async () => ({ query: db.query.bind(db), release: () => {} }) }, 50),
+    settleBoxBilling: (db, requestId, uid) => boxBilling.recoverBoxBillingRequest({ query: db.query.bind(db),
+      connect: async () => ({ query: db.query.bind(db), release: () => {} }) }, requestId, uid),
     jsonError: shared.sendJsonError,
     gateReject: (kind: string, detail: string) => new authorityGate.ModelGateReject(kind, detail),
     boxCli: { runner: (opts) => new boxRunner.SubprocessRunner(opts), bridge: boxBridge.runBoxCcBridge },
@@ -1307,6 +1307,10 @@ async function withJournalDatabase<T>(config: unknown, run: (db: Db) => Promise<
       const sql = statement.replace(/^\s*--.*$/gm, "").trim();
       if (sql) await client.query(sql);
     }
+    // ids of the settled rows, as the billing recovery integ test numbers them (OCV5-488)
+    for (const table of ["usage", "ledger"]) await client.query(`CREATE TEMP SEQUENCE box_recovery_${table}_id_seq`);
+    await client.query("ALTER TABLE pg_temp.usage_records ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_recovery_usage_id_seq'::regclass)");
+    await client.query("ALTER TABLE pg_temp.credit_ledger ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_recovery_ledger_id_seq'::regclass)");
     await client.query(`CREATE TEMP TABLE turn_dispatches (dispatch_id uuid PRIMARY KEY,
       user_id bigint NOT NULL, status text NOT NULL)`);
     const shadow = await client.query(`SELECT n.nspname AS schema FROM pg_class c
@@ -3226,10 +3230,11 @@ async function proveProcessAbsentReleased(api: Api, db: Db): Promise<string> {
   };
   const gone = await park(900_000_488n, "gone");
   const rebooted = await park(900_000_489n, "rebooted");
-  // the product's own billing reconcile settles the calls these rounds completed (10-17: 1943 credits)
-  await api.settleBoxBilling(db);
+  // the product's own billing recovery settles the calls these rounds completed (10-17: 1943 credits)
   const billed = new Map<string, Awaited<ReturnType<typeof journalRow>>>();
   for (const run of [gone, rebooted]) {
+    const outcome = await api.settleBoxBilling(db, run.requestId, run.who.uid);
+    if (outcome !== "settled") fail(`ABSENT_${run.requestId}_SETTLE_${outcome}`);
     const row = await journalRow(db, run.requestId);
     if (row?.state !== "committed" || row.ctx.boxState !== "handoff") {
       fail(`ABSENT_${run.requestId}_NOT_SETTLED_${String(row?.state)}`);
