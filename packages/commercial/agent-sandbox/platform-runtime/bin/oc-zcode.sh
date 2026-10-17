@@ -1,5 +1,5 @@
 #!/bin/sh
-# oc-zcode — experimental community ZCode CLI launcher (zcode.cjs 0.16.3).
+# oc-zcode — experimental community ZCode CLI launcher (zcode.cjs 0.16.9).
 #
 # This is NOT an official standalone CLI. The real Coding Plan key never
 # enters this wrapper, argv, logs, or yolo child env. Hosted turns receive
@@ -52,11 +52,11 @@ if [ "$test_mode" -eq 1 ]; then
   node_bin=$test_node
   auth_file=$test_auth
 else
-  zcode_cjs=/opt/zcode-cli/versions/0.16.3/zcode.cjs
+  zcode_cjs=/opt/zcode-cli/versions/0.16.9/zcode.cjs
   node_bin=/usr/local/bin/node
   auth_file=""
   [ -f "$zcode_cjs" ] || die "experimental community CLI is not installed"
-  [ -x "$node_bin" ] || die "node 22 is required to run zcode.cjs 0.16.3"
+  [ -x "$node_bin" ] || die "node 22 is required to run zcode.cjs 0.16.9"
 fi
 
 prompt=""
@@ -148,6 +148,7 @@ case "$upstream" in
   *) die "upstream model is not allowlisted" ;;
 esac
 provider=${upstream%%/*}
+model_id=${upstream#*/}
 
 relay_base=${OC_ZCODE_RELAY_BASE_URL:-}
 relay_token=${OC_ZCODE_RELAY_TOKEN:-}
@@ -248,6 +249,7 @@ if [ -n "$platform_config" ]; then
   export OC_ZCODE_CONFIG_BASE_FILE="$platform_config"
   export OC_ZCODE_CONFIG_UPSTREAM="$upstream"
   export OC_ZCODE_CONFIG_PROVIDER="$provider"
+  export OC_ZCODE_CONFIG_MODEL="$model_id"
   export OC_ZCODE_CONFIG_BASE_URL="$anthropic_base"
   export OC_ZCODE_CONFIG_API_KEY="$api_key"
   "$node_bin" - "$zcode_home/.zcode/cli/config.json" <<'NODE'
@@ -264,7 +266,8 @@ const provider = process.env.OC_ZCODE_CONFIG_PROVIDER
 const upstream = process.env.OC_ZCODE_CONFIG_UPSTREAM
 const baseURL = process.env.OC_ZCODE_CONFIG_BASE_URL
 const apiKey = process.env.OC_ZCODE_CONFIG_API_KEY
-if (!provider || !upstream || !baseURL || !apiKey) throw new Error('managed provider config is incomplete')
+const modelId = process.env.OC_ZCODE_CONFIG_MODEL
+if (!provider || !upstream || !baseURL || !apiKey || !modelId) throw new Error('managed provider config is incomplete')
 const config = {
   ...base,
   model: { main: upstream },
@@ -273,15 +276,18 @@ const config = {
       kind: 'anthropic',
       name: 'Z.AI Coding Plan',
       options: { apiKeyRequired: true, baseURL, apiKey },
+      // 0.16.9 migrates this file to ~/.zcode/v2/provider_config.json and
+      // only selects a model that the provider lists; 0.16.3 ignores it.
+      models: { [modelId]: { name: modelId } },
     },
   },
 }
 fs.writeFileSync(out, `${JSON.stringify(config)}\n`, { encoding: 'utf8', mode: 0o600 })
 NODE
-  unset OC_ZCODE_CONFIG_BASE_FILE OC_ZCODE_CONFIG_UPSTREAM OC_ZCODE_CONFIG_PROVIDER
+  unset OC_ZCODE_CONFIG_BASE_FILE OC_ZCODE_CONFIG_UPSTREAM OC_ZCODE_CONFIG_PROVIDER OC_ZCODE_CONFIG_MODEL
   unset OC_ZCODE_CONFIG_BASE_URL OC_ZCODE_CONFIG_API_KEY
 else
-  printf '%s\n' "{\"model\":{\"main\":\"$upstream\"},\"provider\":{\"$provider\":{\"kind\":\"anthropic\",\"name\":\"Z.AI Coding Plan\",\"options\":{\"apiKeyRequired\":true,\"baseURL\":\"$anthropic_base\",\"apiKey\":\"$api_key\"}}}}" \
+  printf '%s\n' "{\"model\":{\"main\":\"$upstream\"},\"provider\":{\"$provider\":{\"kind\":\"anthropic\",\"name\":\"Z.AI Coding Plan\",\"options\":{\"apiKeyRequired\":true,\"baseURL\":\"$anthropic_base\",\"apiKey\":\"$api_key\"},\"models\":{\"$model_id\":{\"name\":\"$model_id\"}}}}}" \
     > "$zcode_home/.zcode/cli/config.json"
 fi
 /bin/chmod 0600 -- "$zcode_home/.zcode/cli/config.json"

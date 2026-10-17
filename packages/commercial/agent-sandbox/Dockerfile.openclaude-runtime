@@ -368,14 +368,15 @@ RUN if [ "$OC_INCLUDE_GROK" = "1" ]; then set -eux; \
     else echo "[runtime] skip Grok CLI install (OC_INCLUDE_GROK=0)"; fi
 
 # Experimental community ZCode CLI — NOT an official standalone product.
-# The 0.16.3 `zcode.cjs` is extracted from official desktop AppImage 3.8.1
-# (community-verified pairing). Default off; fail-closed when the pin cannot
+# The 0.16.9 `zcode.cjs` is extracted from official desktop AppImage 3.15.3
+# (OCV5-470; 3.8.1/0.16.3 is gone from the CDN). 0.16.9 also reads
+# `provider/zcode-builtin.json` next to the script, so that file is copied too. Default off; fail-closed when the pin cannot
 # be verified. Do not install npm `zcode` / `zcode-cli` (0.0.1 stubs).
 # First `hsqs` offset in this AppImage is a false positive; use the embedded
 # --appimage-extract runtime instead of unsquashfs -o $first_offset.
-ARG OC_ZCODE_APPIMAGE_VERSION=3.8.1
-ARG OC_ZCODE_APPIMAGE_SHA256=ba51f8c091762bf1ba733cb71390975b8397dc178c753d52d4738365ce59ac61
-ARG OC_ZCODE_CLI_VERSION=0.16.3
+ARG OC_ZCODE_APPIMAGE_VERSION=3.15.3
+ARG OC_ZCODE_APPIMAGE_SHA256=2edc79650fcff72358670af4ffbfbf7d979ba95476611a80ad1151d577e90fe3
+ARG OC_ZCODE_CLI_VERSION=0.16.9
 ARG OC_INCLUDE_ZCODE=0
 RUN if [ "$OC_INCLUDE_ZCODE" = "1" ]; then set -eux; \
       test "$(dpkg --print-architecture)" = amd64; \
@@ -392,6 +393,10 @@ RUN if [ "$OC_INCLUDE_ZCODE" = "1" ]; then set -eux; \
       install_root="/opt/zcode-cli/versions/${OC_ZCODE_CLI_VERSION}"; \
       mkdir -p "$install_root"; \
       cp "$cjs" "$install_root/zcode.cjs"; \
+      builtin=$(find /tmp/zcode-extract/squashfs-root -path '*/config/provider/zcode-builtin.json' -type f | head -1); \
+      test -n "$builtin"; \
+      mkdir -p "$install_root/provider"; \
+      cp "$builtin" "$install_root/provider/zcode-builtin.json"; \
       chmod 0755 "$install_root/zcode.cjs"; \
       chmod -R a-w "$install_root"; \
       test "$(node "$install_root/zcode.cjs" --version)" = "$OC_ZCODE_CLI_VERSION"; \
