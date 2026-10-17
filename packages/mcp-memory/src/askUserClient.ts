@@ -1,7 +1,7 @@
 /**
  * Cursor ask_user MCP client helpers.
  *
- * Pinned CLI `2026.08.11-e8db854` hard-times out MCP `tools/call` at ~60.01s.
+ * CLI `2026.08.11-e8db854` (measured) hard-times out MCP `tools/call` at ~60.01s.
  * The timeout is not configurable and progress notifications cannot renew it.
  * 55s is the measured-safe wait; the HTTP client timeout sits a few seconds
  * above that wait budget but still under 60s so the tool always returns

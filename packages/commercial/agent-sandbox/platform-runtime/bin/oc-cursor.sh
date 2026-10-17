@@ -46,7 +46,7 @@ for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /bin/ls \
   [ -x "$required_tool" ] || die "runtime image is missing $required_tool"
 done
 
-cursor_bin=/opt/cursor-agent/versions/2026.08.11-e8db854/cursor-agent
+cursor_bin=/opt/cursor-agent/versions/2026.10.16-e3cb207/cursor-agent
 cursor_probe_bin=/usr/bin/curl
 cursor_probe_url=https://api2.cursor.sh
 cursor_select_budget=45

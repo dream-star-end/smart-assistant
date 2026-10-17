@@ -290,6 +290,7 @@ export function zcodeTransportModelId(modelId: string | undefined): string | und
  * OAuth). Every `/v1internal:*` call goes through the master relay via
  * `CLOUD_CODE_URL`; the relay injects the account's full-scope token. The
  * values below were read from the pinned 1.3.4 binary through that relay
+ * (every id is still present in the 1.4.0 binary, OCV5-470 strings probe)
  * (docs/ocv5-415-antigravity-cli.md), not from secondary docs.
  *
  * - `cliModels` maps an effort (or `default` for single-level models) to the
@@ -299,7 +300,7 @@ export function zcodeTransportModelId(modelId: string | undefined): string | und
  *   only the route model's CLI ids plus ANTIGRAVITY_AUX_UPSTREAM_MODELS and
  *   meters every call it forwards.
  */
-export const ANTIGRAVITY_CLI_VERSION = '1.3.4'
+export const ANTIGRAVITY_CLI_VERSION = '1.4.0'
 /** Title generation (`requestType: checkpoint`) the CLI makes on every new
  * conversation. It is NOT included in the CLI's own `result.usage`, so CLI
  * usage alone under-bills. */
