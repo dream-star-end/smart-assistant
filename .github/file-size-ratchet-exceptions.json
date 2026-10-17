@@ -8,9 +8,9 @@
   },
   {
     "path": "scripts/check-v5-box-incident-proofs.ts",
-    "maxLines": 3356,
+    "maxLines": 3538,
     "ticket": "OCV5-491",
-    "reason": "verbatim port of the commercial Box incident proofs gate (OCV5-488); both trees keep the file identical for two-tree sync, so it is split in both trees together with the OCV5-491 selfhost Box catch-up",
+    "reason": "verbatim port of the commercial Box incident proofs gate (OCV5-488); both trees keep the file identical for two-tree sync, so it is split in both trees together with the OCV5-491 selfhost Box catch-up; OCV5-488 PR-2 adds the process-absent and idle-stop proofs",
     "expires": "2026-11-16"
   }
 ]
