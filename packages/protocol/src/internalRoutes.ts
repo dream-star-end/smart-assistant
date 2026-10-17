@@ -142,13 +142,12 @@ export interface InternalRouteEntry {
 }
 
 export const INTERNAL_ROUTES = [
-  // ── v5:delegate grok-route(forwarder 唯一放行例外;selfhost 门控挂载)──
+  // ── v5:delegate grok-route(forwarder 唯一放行例外;两版都挂载,relay 按计费 journal 放行)──
   {
     path: DELEGATE_GROK_ROUTE_MINT_PATH,
     match: 'exact',
     plane: 'v5',
     egressForwardException: true,
-    selfhostOnly: true,
     sources: ['gateway/src/delegateGrokRoute.ts', 'commercial/src/http/internalDelegateGrokRoute.ts'],
   },
   {
@@ -156,7 +155,6 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v5',
     egressForwardException: true,
-    selfhostOnly: true,
     sources: ['gateway/src/delegateGrokRoute.ts', 'commercial/src/http/internalDelegateGrokRoute.ts'],
   },
   {
@@ -164,7 +162,6 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v5',
     egressForwardException: true,
-    selfhostOnly: true,
     sources: ['gateway/src/delegateGrokRoute.ts', 'commercial/src/http/internalDelegateGrokRoute.ts'],
   },
   // ── v5:控制专用/egress 本地面 ──────────────────────────────────────────

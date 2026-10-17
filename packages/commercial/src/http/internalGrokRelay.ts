@@ -7,7 +7,7 @@ import {
   verifyContainerIdentity,
   type ContainerIdentityRepo,
 } from '../auth/containerIdentity.js'
-import { resolveGrokRouteContext } from '../account-pool/groups.js'
+import { hasInflightDelegateGrokBilling, resolveGrokRouteContext } from '../account-pool/groups.js'
 import { getFreshGrokAccessToken } from '../account-pool/grokOAuth.js'
 import type { AccountHealthTracker } from '../account-pool/health.js'
 import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
@@ -138,6 +138,8 @@ function grokRelayPublicMessage(code: string): string {
       return 'grok slot lease lost'
     case 'UNAUTHORIZED':
       return 'grok relay unauthorized'
+    case 'GROK_DELEGATE_NOT_BILLED':
+      return 'grok delegate route has no admitted billing'
     default:
       return `grok relay error (${code})`
   }
@@ -182,6 +184,7 @@ function upstreamHeaders(req: IncomingMessage, accessToken: Buffer, modelId: str
 export function makeGrokRelayHandler(deps: {
   identityRepo: ContainerIdentityRepo
   resolveContext?: typeof resolveGrokRouteContext
+  hasDelegateBilling?: typeof hasInflightDelegateGrokBilling
   freshToken?: typeof getFreshGrokAccessToken
   resolveDispatcher?: (accountId: bigint) => Promise<{ dispatcher: Dispatcher }>
   requestFn?: typeof request
@@ -211,6 +214,14 @@ export function makeGrokRelayHandler(deps: {
       userId: BigInt(identity.userId),
     })
     if (!context || !GROK_RELAY_MODEL_IDS.has(context.modelId)) { error(res, 404, 'GROK_ROUTE_EXPIRED', requestId); return }
+    if (context.kind === 'delegate') {
+      const billed = await (deps.hasDelegateBilling ?? hasInflightDelegateGrokBilling)({
+        token: match[1]!,
+        containerId: identity.containerId,
+        userId: BigInt(identity.userId),
+      })
+      if (!billed) { error(res, 403, 'GROK_DELEGATE_NOT_BILLED', requestId); return }
+    }
     let accessToken: Buffer | null = null
     if (deps.renewSlot && !deps.renewSlot(context.accountId, context.slotId)) {
       error(res, 409, 'GROK_SLOT_LEASE_LOST', requestId)

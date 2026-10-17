@@ -1078,3 +1078,68 @@ async function runDelegate(
   await gw.handleDelegateTask(req, res, targetAgentId)
   return { status, body: raw ? JSON.parse(raw) : {} }
 }
+
+// ── OCV5-477 billed kinds: commercial grok delegate / codex advisor without the exemption ──
+
+describe('OCV5-477 billed_delegate / billed_advisor', () => {
+  const billedView = () =>
+    view([row('glm-5.2', 'ccb'), row('gpt-5.6-sol', 'codex'), row('grok-build', 'grok')], {})
+
+  test('billed_delegate runs a grok member without the selfhost exemption', () => {
+    const d = decideLocalExecution({
+      view: billedView(),
+      agent: { id: 'member', model: 'grok-build' },
+      kind: 'billed_delegate',
+      env: {} as NodeJS.ProcessEnv,
+    })
+    assert.equal(d.engine, 'grok')
+    assert.equal(d.canonicalModel, 'grok-build')
+  })
+
+  test('billed_delegate still rejects a codex member (no codex route for delegates)', () => {
+    assert.throws(
+      () =>
+        decideLocalExecution({
+          view: billedView(),
+          agent: { id: 'member', model: 'gpt-5.6-sol' },
+          kind: 'billed_delegate',
+          env: {} as NodeJS.ProcessEnv,
+        }),
+      (err: unknown) => (err as { code?: string })?.code === 'DELEGATE_CODEX_UNSUPPORTED',
+    )
+  })
+
+  test('billed_advisor runs a codex advisor without the selfhost exemption', () => {
+    const d = decideLocalExecution({
+      view: billedView(),
+      agent: { id: 'advisor', model: 'gpt-5.6-sol' },
+      model: 'gpt-5.6-sol',
+      kind: 'billed_advisor',
+      env: {} as NodeJS.ProcessEnv,
+    })
+    assert.equal(d.engine, 'codex')
+  })
+
+  test('billed_advisor rejects grok, and plain turn still rejects grok without the exemption', () => {
+    for (const kind of ['billed_advisor', 'turn'] as const) {
+      assert.throws(
+        () =>
+          decideLocalExecution({
+            view: billedView(),
+            agent: { id: 'member', model: 'grok-build' },
+            kind,
+            env: {} as NodeJS.ProcessEnv,
+          }),
+        (err: unknown) => (err as { code?: string })?.code === 'DELEGATE_CODEX_UNSUPPORTED',
+      )
+    }
+  })
+
+  test('billed_delegate keeps the codex-native provider pin rejected', () => {
+    assert.throws(
+      () =>
+        decideLocalExecution({ view: billedView(), agent: CODEX_PINNED, kind: 'billed_delegate', env: {} as NodeJS.ProcessEnv }),
+      (err: unknown) => (err as { code?: string })?.code === 'DELEGATE_CODEX_UNSUPPORTED',
+    )
+  })
+})

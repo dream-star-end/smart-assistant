@@ -15,12 +15,11 @@
  * caller's (containerId, userId), so one container can never expire or slide
  * another container's lease.
  *
- * Mount gating: only routed when the master runs with the selfhost
- * engine-local-turn exemption (OC_SELFHOST_ENGINE_LOCAL_TURNS=1, parity with
- * gateway modelAuthority.ts isEngineLocalTurnExempt). Production masters never
- * mount it: production containers reject grok delegate turns in
- * decideLocalExecution long before they could call here, and an unrouted path
- * keeps this a fail-closed non-billing bypass rather than an open one.
+ * Mounted on both editions (OCV5-477). Minting a route is not billing: the
+ * container must then admit delegate billing, which binds the route token hash
+ * into an inflight journal, and the grok relay refuses kind=delegate routes
+ * without such a journal (hasInflightDelegateGrokBilling). A route minted but
+ * never admitted therefore cannot reach upstream.
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'

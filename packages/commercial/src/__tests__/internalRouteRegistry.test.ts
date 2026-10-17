@@ -228,13 +228,20 @@ describe('internalRouteRegistry — dispatchInternal 挂载', () => {
       /isDelegateGrokRoutePath\(path\)/,
       'dispatchInternal 里没有 delegate grok-route 的挂载引用(放行了 forwarder 却 404 —— 事故形态复现)',
     )
-    // selfhost 门控事实:挂载 handler 的装配受 OC_SELFHOST_ENGINE_LOCAL_TURNS=1 门控。
+    // OCV5-477:两版都挂载(不再受 OC_SELFHOST_ENGINE_LOCAL_TURNS 门控);mint 不等于计费,
+    // 所以 grok relay 必须对 kind=delegate 的路由校验 inflight 计费 journal。
     const gateIdx = source.indexOf('const delegateGrokRouteHandler')
     assert.ok(gateIdx >= 0 && gateIdx < start, 'delegateGrokRouteHandler 装配点丢失')
-    assert.match(
+    assert.doesNotMatch(
       source.slice(gateIdx, gateIdx + 400),
-      /OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"/,
-      'delegate grok-route 挂载的 selfhost 门控被改动(注册表 selfhostOnly 标记随之失真)',
+      /OC_SELFHOST_ENGINE_LOCAL_TURNS/,
+      'delegate grok-route 挂载又被 selfhost 门控(商业团队模式的 grok 成员会 404)',
+    )
+    const relay = await readFile(new URL('../http/internalGrokRelay.ts', import.meta.url), 'utf8')
+    assert.match(
+      relay,
+      /context\.kind === 'delegate'[\s\S]{0,200}hasInflightDelegateGrokBilling/,
+      'grok relay 不再对 delegate 路由校验计费 journal(mint 后不准入即可白跑)',
     )
     for (const entry of registryEntries) {
       if (entry.selfhostOnly) {
