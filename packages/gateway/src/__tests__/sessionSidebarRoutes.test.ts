@@ -8,9 +8,11 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { readGatewaySource } from './helpers/gatewaySource.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const serverSrc = readFileSync(join(here, '../server.ts'), 'utf8')
+// OCV5-493: KNOWN_ROUTES / normalizePath moved with the HTTP entry to gatewayHttp.ts; read the source set.
+const serverSrc = readGatewaySource()
 // OCV5-465: the client session routes live in routes/clientSessions.ts; server.ts dispatches to it.
 const sessionsSrc = readFileSync(join(here, '../routes/clientSessions.ts'), 'utf8')
 const allowlistSrc = readFileSync(join(here, '../bridgeApiAllowlist.ts'), 'utf8')

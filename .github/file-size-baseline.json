@@ -9,7 +9,7 @@
     "packages/commercial/src/index.ts": 7700,
     "packages/commercial/src/marketplace/marketplaceDb.ts": 3621,
     "packages/commercial/src/ws/userChatBridge.ts": 10600,
-    "packages/gateway/src/server.ts": 6654,
+    "packages/gateway/src/server.ts": 4897,
     "packages/storage/src/sessionsDb.ts": 6184,
     "packages/web-react/browser-tests/harness.tsx": 3837,
     "packages/web-react/browser-tests/run.mjs": 4185,

@@ -48,7 +48,7 @@ import {
   unlinkSync,
 } from 'node:fs'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
-import { type IncomingHttpHeaders, type IncomingMessage, type ServerResponse, createServer } from 'node:http'
+import type { IncomingHttpHeaders, IncomingMessage, ServerResponse, createServer } from 'node:http'
 import { isIPv4 } from 'node:net'
 import { basename, dirname, extname, join, relative, resolve } from 'node:path'
 import sharp from 'sharp'
@@ -351,10 +351,10 @@ import {
   normalizeSkillTrainArgs,
   type FeedbackScenario,
 } from './skillTrain.js'
-import { WebSocket, WebSocketServer } from 'ws'
+import { WebSocket, type WebSocketServer } from 'ws'
 import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
 import {
-  CronScheduler,
+  type CronScheduler,
   backfillCronOccurrenceDelegateJobs,
   type CronDeliveryContext,
   type CronJob,
@@ -418,7 +418,7 @@ import { handleTaskboardApi, resolveTaskboardActor, setPatrolExecutionHandler } 
 import { getTaskboardDb } from './taskboard/db/index.js'
 import { isPatrolSessionKey } from './taskboard/domain.js'
 import { isTaskboardEnabled } from './taskboard/feature.js'
-import { PatrolEngine } from './taskboard/patrol.js'
+import type { PatrolEngine } from './taskboard/patrol.js'
 import { TaskboardNotifier } from './taskboard/notify.js'
 import { sendV3WechatProactive, readV3WechatProactiveConfig } from './v3WechatProactive.js'
 import { sendV3QqProactive, readV3QqProactiveConfig } from './v3QqProactive.js'
@@ -473,7 +473,7 @@ import {
   isDelegateRunnerIdle,
   resolveDelegateCutoverFreezeMs,
 } from './delegateCutover.js'
-import { DefaultEngineNotifier, writeInlinePushForSession, type InlinePushSession } from './engineNotifier.js'
+import { type DefaultEngineNotifier, writeInlinePushForSession, type InlinePushSession } from './engineNotifier.js'
 import { resolveParentTapeIngestState, type ParentTapeIngestState } from './delegateNotifyTape.js'
 import {
   delayUntilNextNotifyRetry,
@@ -572,7 +572,7 @@ import {
   stopControlSendAttempt,
   type PromptQueueExternalTurnReservation,
 } from './sessionManager.js'
-import { WebhookRouter } from './webhooks.js'
+import type { WebhookRouter } from './webhooks.js'
 import { inferAgentForModel } from './inferAgentForModel.js'
 import {
   capMarketplaceToolsets,
@@ -741,6 +741,9 @@ import { _stripPrivateRoutingFields } from './turnFrames.js'
 // Moved to ./gatewayTypes.js (FINDINGS §7.6, OCV5-484); re-exported for existing importers.
 export type { CommercialHook } from './gatewayTypes.js'
 import type { CommercialHook } from './gatewayTypes.js'
+import { type GatewayLifecycleHost, start as startImpl, _doShutdown as _doShutdownImpl, shutdown as shutdownImpl, bootAutoResume as bootAutoResumeImpl, _recoverTurnDispatchInbox as _recoverTurnDispatchInboxImpl, _startTurnDispatchRecoveryLoop as _startTurnDispatchRecoveryLoopImpl, _runTurnDispatchRecoverySweep as _runTurnDispatchRecoverySweepImpl, _ensureEngineNotifier as _ensureEngineNotifierImpl, _armNotifyRetryScheduler as _armNotifyRetrySchedulerImpl, _tickScheduledTasks as _tickScheduledTasksImpl } from './gatewayLifecycle.js'
+import { type GatewayHttpHost, handleHttp as handleHttpImpl, _handleHttpAfterCommercial as _handleHttpAfterCommercialImpl, _serveStaticCached as _serveStaticCachedImpl, _staticCacheFreshOnDisk as _staticCacheFreshOnDiskImpl, openFileHardened as openFileHardenedImpl, setSessionCookie as setSessionCookieImpl, _refreshToken as _refreshTokenImpl, verifyCommercialJwt as verifyCommercialJwtImpl, checkHttpAuth as checkHttpAuthImpl, extractToken as extractTokenImpl, isHttps as isHttpsImpl, getUserId as getUserIdImpl, readBody as readBodyImpl } from './gatewayHttp.js'
+import { type SessionRepoBindingHost, _handleSessionRepoBind as _handleSessionRepoBindImpl, _handleSessionRepoUnbind as _handleSessionRepoUnbindImpl, _checkRepoBindSession as _checkRepoBindSessionImpl, _flushPendingRepoBinds as _flushPendingRepoBindsImpl } from './sessionRepoBinding.js'
 // Moved to ./askUserSanitize.js (FINDINGS §7.6, OCV5-484); re-exported for existing importers.
 export { sanitizeAskUserQuestionUpdatedInput, sanitizeEngineAskUserQuestions, ASK_USER_QUESTION_STRING_MAX_LEN } from './askUserSanitize.js'
 export type { EngineAskUserSettlement } from './askUserSanitize.js'
@@ -1189,6 +1192,12 @@ export function makePeerKey(userId: string, channel: string, peerId: string): st
   return `${userId}:${channel}:${peerId}`
 }
 
+// Hoisted so the methods moved out of Gateway (OCV5-493) read the same value; the class statics alias them.
+export const PENDING_PERMISSION_SWEEP_MS = 60_000
+export const REPO_BIND_HELLO_GRACE_MS = 5_000
+export const REPO_BIND_PENDING_TIMEOUT_MS = 5_000
+export const JWT_TTL_SECONDS = 30 * 86400 // 30 days
+
 export class Gateway {
   private wss!: WebSocketServer
   /** Bound helpers for the route modules in routes/ (OCV5-376 P2). */
@@ -1482,7 +1491,7 @@ export class Gateway {
   /** Detached Cursor ask_user cards stay answerable this long. */
   private static readonly DETACHED_ASK_USER_TTL_MS = DETACHED_ASK_USER_TTL_MS
   /** How often the janitor scans _pendingPermissions. */
-  private static readonly PENDING_PERMISSION_SWEEP_MS = 60_000
+  private static readonly PENDING_PERMISSION_SWEEP_MS = PENDING_PERMISSION_SWEEP_MS
   // Recently-settled permission requests: requestId → authoritative result.
   // Used to replay the true `behavior` when a duplicate/late response arrives
   // after the first responder already won the race. Without this, the
@@ -1555,8 +1564,8 @@ export class Gateway {
       timer: ReturnType<typeof setTimeout>
     }
   >()
-  private static readonly REPO_BIND_HELLO_GRACE_MS = 5_000
-  private static readonly REPO_BIND_PENDING_TIMEOUT_MS = 5_000
+  private static readonly REPO_BIND_HELLO_GRACE_MS = REPO_BIND_HELLO_GRACE_MS
+  private static readonly REPO_BIND_PENDING_TIMEOUT_MS = REPO_BIND_PENDING_TIMEOUT_MS
   private _repoWorkspace = new SessionRepoWorkspaceManager({
     info: (msg, fields) => this.log.info(msg, fields),
     warn: (msg, fields) => this.log.warn(msg, fields),
@@ -1680,764 +1689,8 @@ export class Gateway {
     outboundRingSizeBytes.value = this._outboundRing.totalBytes()
   }
 
-  async start(): Promise<void> {
-    const { config } = this.deps
-
-    // Phase 0.2: replay any server-authored messages queued to the outbox
-    // while the previous gateway instance was unable to reach SQLite (disk
-    // full, crash mid-write, etc.). Runs before the WS endpoint opens so
-    // catch-up writes precede live traffic. Failures here must not block
-    // startup — we'd rather serve with a retryable queue than refuse boot.
-    try {
-      const { replayMsgOutbox } = await import('@openclaude/storage')
-      const summary = await replayMsgOutbox()
-      if (summary.processed > 0) {
-        this.log.info('msg-outbox replay', summary)
-      }
-    } catch (err) {
-      this.log.error('msg-outbox replay failed (continuing startup)', undefined, err as Error)
-    }
-
-    try {
-      if (isDelegateSmEnabled()) {
-        const store = this._ensureDelegateJobStore()
-        if (!isDelegateDurableEffective()) {
-          await restoreDelegateJobSnapshots(store)
-        }
-      }
-      const summary = await recoverInterruptedSendToAgentIntents(
-        (intent) => this._deliverInterruptedSendToAgentIntent(intent),
-        process.env,
-        {
-          callbackOwner: resolveDelegateCallbackOwner(),
-          resolveJob: (jobId) => this._delegateJobs?.snapshotOf(jobId),
-          ensureCallback: (job, intent) => this._ensureDurableSendToAgentCallback(job, intent),
-        },
-      )
-      if (summary.recovered > 0 || summary.retained > 0 || summary.malformed > 0) {
-        this.log.info('send_to_agent intent recovery', summary)
-      }
-    } catch (err) {
-      this.log.error('send_to_agent intent recovery failed (continuing startup)', undefined, err as Error)
-    }
-
-    // V3 commercial: container → master sink for server-authored messages.
-    // Wire only if env is configured (set by v3supervisor when spawning
-    // commercial containers). Personal version + dev sandbox don't set
-    // these envs and the sink stays null — sessionManager falls back to
-    // the legacy local-SQLite durable path. This block is no-op for
-    // non-commercial deployments.
-    //
-    // Order matters:
-    //   1. read config (env-driven; null → skip).
-    //   2. create retry queue WITHOUT a sink reference (queue calls a
-    //      function we'll close over).
-    //   3. create sink with queue injected.
-    //   4. wire the queue's attemptSend to call sink.attemptOnce.
-    //   5. set the global getter so sessionManager picks it up before
-    //      any turn-end callback fires.
-    //   6. kick a drain pass + start periodic timer so any entries
-    //      from a prior gateway crash get retried.
-    try {
-      const { makeV3MasterSink, readV3MasterSinkConfig, setV3MasterSinkSingleton } =
-        await import('./v3MasterSink.js')
-      const { makeV3MasterRetryQueue } = await import('./v3MasterRetryQueue.js')
-      const sinkCfg = readV3MasterSinkConfig()
-      if (sinkCfg) {
-        // Two-phase wire to break the cycle: queue.attemptSend wants the
-        // sink's single-attempt path, sink.persistOrQueue wants the queue
-        // for fallback. Box `sinkRef` so the queue can call it via late-
-        // binding when sink is constructed below.
-        let sinkAttemptOnce: ((p: import('./v3MasterSink.js').V3MasterSinkWirePayload) => Promise<void>) | null = null
-        const queue = makeV3MasterRetryQueue({
-          attemptSend: async (p) => {
-            if (!sinkAttemptOnce) {
-              throw new Error('v3MasterRetryQueue: drainer fired before sink wired (impossible)')
-            }
-            return sinkAttemptOnce(p)
-          },
-          // RFC-v5-durable-turn-dispatch §3/§B6 + M-R1-1 ①(R3)— 延迟送达 ACK 驱动 inbox terminal。
-          // 返回终态是否确认:resolveInboxTerminalAck 内 CAS 成功 / 已幂等终态(同 outcome)→ true,drainer
-          // 删文件;CAS 落空且行非目标终态(缺失 / 仍非终态 / 异 outcome)→ false,**保留文件**退避重试,
-          // 绝不"文件已删、行永停 sink_staged"。写失败(抛)→ false(同样保留)。
-          onDispatchAck: async (dispatchId, attemptNo, status): Promise<boolean> => {
-            try {
-              const ok = await resolveInboxTerminalAck(dispatchId, attemptNo, status)
-              if (!ok) {
-                this.log.warn(
-                  'inbox terminal (deferred ack) CAS did not apply and row not target-terminal; retaining entry',
-                  { dispatchId, attemptNo, status },
-                )
-              }
-              return ok
-            } catch (err) {
-              this.log.error(
-                'inbox terminal (deferred ack) write failed; retaining entry for retry',
-                { dispatchId },
-                err as Error,
-              )
-              return false
-            }
-          },
-        })
-        const sink = makeV3MasterSink({
-          config: sinkCfg,
-          retryQueue: queue,
-          // RFC-v5-durable-turn-dispatch §3/§B6 — sink 生命周期钩子驱动 inbox 状态机。
-          // **await durable 迁移(去 best-effort)**:钩子返回 = 状态迁移已尝试落库并确认;
-          // 迁移失败一律 error log + 依赖周期 recovery 兜底,绝不静默停在旧态。
-          inboxHooks: {
-            onStaged: async (dispatchId, attemptNo) => {
-              try {
-                await inboxSinkStagedByDispatch(dispatchId, attemptNo)
-              } catch (err) {
-                // running→sink_staged 写失败:tape 已 fsync 进 retry queue,boot ①路径
-                // (retryQueueHasDispatch→sink_staged)会收敛。仅 error log。
-                this.log.error('inbox sink_staged write failed', { dispatchId }, err as Error)
-              }
-            },
-            // M-R1-1 ①(R3)— 同步 ACK 后**先**确认 terminal CAS 再删 entry。返回终态是否确认:
-            // resolveInboxTerminalAck 成功 / 已幂等终态 → true(persistOrQueue 随后 ackDurable 删 entry);
-            // CAS 落空且行非目标终态 / 写失败 → false(保留 entry + kick drainer 重试,幂等)。
-            onAck: async (dispatchId, attemptNo, status): Promise<boolean> => {
-              try {
-                const ok = await resolveInboxTerminalAck(dispatchId, attemptNo, status)
-                if (!ok) {
-                  this.log.warn(
-                    'inbox terminal (sync ack) CAS did not apply and row not target-terminal; retaining entry',
-                    { dispatchId, attemptNo, status },
-                  )
-                }
-                return ok
-              } catch (err) {
-                this.log.error(
-                  'inbox terminal (sync ack) write failed; retaining entry for retry',
-                  { dispatchId },
-                  err as Error,
-                )
-                return false
-              }
-            },
-            onStageFailed: async (dispatchId, attemptNo) => {
-              this.log.error('turn dispatch tape stage failed', { dispatchId, attemptNo })
-              // B6:stageDurable 失败 → 行仍 running(从未 stage)。sink_stage_failed 写入
-              // **必须同步确认**;写入也失败 → error log,行留 running 由周期 recovery
-              // (running→recovery 协议)兜底重试,不许静默停在 running。
-              try {
-                const row = await inboxSinkStageFailedByDispatch(dispatchId, attemptNo)
-                if (!row) {
-                  this.log.error(
-                    'inbox sink_stage_failed CAS did not apply; leaving to periodic recovery',
-                    { dispatchId, attemptNo },
-                  )
-                }
-              } catch (err) {
-                this.log.error('inbox sink_stage_failed write failed', { dispatchId }, err as Error)
-              }
-            },
-          },
-        })
-        sinkAttemptOnce = (p) => sink.attemptOnce(p)
-        setV3MasterSinkSingleton(sink)
-        // Boot drain — best-effort, never blocks listen().
-        queue.kick()
-        queue.startPeriodic()
-        this._stopV3RetryDrainer = () => queue.stopPeriodic()
-        this._kickV3RetryDrainer = () => queue.kick()
-        // RFC-v5-durable-turn-dispatch §3/§B4/§B5 — durable inbox boot recovery。**在开放新
-        // ingress 前单飞跑完**:queued→rejected;running→三态收敛。阻塞于 sink 就绪之后
-        // (需 retry queue 查同 dispatch + 合成 tape 走同一 queue)。
-        this._turnDispatchQueue = queue
-        // _runTurnDispatchRecoverySweep 成功一轮 → 自置 _durableTurnDispatchReady(B5);
-        // 首跑失败仅 log(不置 ready → capability 不申报 → legacy),周期 recovery 会自愈。
-        try {
-          await this._runTurnDispatchRecoverySweep(queue)
-        } catch (err) {
-          this.log.error('turn dispatch boot recovery failed', undefined, err as Error)
-        }
-        // B4:启动首跑之后挂周期 single-flight 重试(收敛 recovery_pending / 不可达行)。
-        this._startTurnDispatchRecoveryLoop(queue)
-        this.log.info('v3 master sink wired', {
-          baseUrl: sinkCfg.baseUrl,
-          durableTurnDispatchReady: this._durableTurnDispatchReady,
-        })
-      }
-    } catch (err) {
-      // Non-fatal — fall back to legacy local durable path. Ops will see
-      // turn texts going to local SQLite (which is permanently empty in
-      // v3 commercial) so the symptom is "client_sessions empty" — same
-      // as pre-fix; loud enough to detect via dashboards.
-      this.log.error('v3 master sink wire failed (falling back to legacy path)', undefined, err as Error)
-    }
-
-    // Plan B (2026-05-09): clean up orphan `.tmp-*` files left in uploadsDir
-    // by handleUpload runs that crashed mid-stream (or were aborted by the
-    // client and the cleanup unlink raced past us). One-shot at startup —
-    // intentionally no periodic sweep; abort/error paths in handleUpload
-    // already unlink eagerly. Codex Plan B v2 review confirmed.
-    //
-    // V3 multi-tenant extension (2026-05-12): handleUpload writes land in
-    // per-user docker volume host paths, not the global paths.uploadsDir.
-    // We sweep both:
-    //   1. paths.uploadsDir (personal-version / legacy 'default' uploads)
-    //   2. /var/lib/docker/volumes/oc-v3-data-u<uid>/_data/uploads/* (commercial)
-    // Each block is wrapped in its own try/catch so a docker host without
-    // `/var/lib/docker/volumes` (e.g. dev box) doesn't fail the legacy sweep.
-    const cutoff = Date.now() - 60 * 60 * 1000 // 1h
-    const sweepTmpInDir = (dir: string): number => {
-      let cleaned = 0
-      try {
-        const baseReal = realpathSync(dir)
-        for (const fname of readdirSync(baseReal)) {
-          if (!fname.startsWith('.tmp-')) continue
-          try {
-            const st = statSync(join(baseReal, fname))
-            if (st.mtimeMs < cutoff) {
-              unlinkSync(join(baseReal, fname))
-              cleaned++
-            }
-          } catch {}
-        }
-      } catch {
-        // Directory missing or unreadable — caller decides whether to log.
-        return -1
-      }
-      return cleaned
-    }
-    try {
-      mkdirSync(paths.uploadsDir, { recursive: true })
-      const cleaned = sweepTmpInDir(paths.uploadsDir)
-      if (cleaned > 0) this.log.info('upload .tmp orphan cleanup', { cleaned, dir: 'legacy' })
-    } catch (err) {
-      this.log.warn('upload .tmp orphan cleanup (legacy) failed', undefined, err)
-    }
-    if (this.deps.commercial?.isUserVolumeMediaPath) {
-      // Multi-tenant mode — iterate /var/lib/docker/volumes/oc-v3-data-u*.
-      // No DB lookup needed; we accept stale uid dirs (e.g. volume deleted)
-      // because readdirSync skips them naturally.
-      // We only sweep uploads/, NOT generated/: gateway 自身上传走 .tmp-
-      // 协议(rename-after-fsync),codex image_gen 用 writeFile 直接落盘,
-      // 不会留 .tmp- 残留,所以 generated/ 没有 orphan 需要清。
-      // TODO: 若 generated/ 写入将来切到 .tmp-* publish 语义(例如 codex
-      // image_gen 改成 rename-after-fsync),把 generated/ 也加进 sweep 列表。
-      try {
-        const volsRoot = '/var/lib/docker/volumes'
-        let totalCleaned = 0
-        let dirsSwept = 0
-        for (const entry of readdirSync(volsRoot)) {
-          if (!/^oc-v3-data-u[1-9][0-9]{0,18}$/.test(entry)) continue
-          const userUploads = join(volsRoot, entry, '_data', 'uploads')
-          const r = sweepTmpInDir(userUploads)
-          if (r >= 0) {
-            dirsSwept++
-            totalCleaned += r
-          }
-        }
-        if (totalCleaned > 0 || dirsSwept > 0) {
-          this.log.info('upload .tmp orphan cleanup', { cleaned: totalCleaned, dirsSwept, dir: 'per-user' })
-        }
-      } catch (err) {
-        // /var/lib/docker/volumes typically requires root (gateway runs as
-        // root in v3 commercial); ENOENT just means docker isn't installed
-        // (CI / dev). Log warn but don't fail startup.
-        this.log.warn('upload .tmp orphan cleanup (per-user) failed', undefined, err)
-      }
-    }
-
-    this.httpServer = createServer((req, res) => this.handleHttp(req, res))
-    // V3 2H: 改用 noServer + 手动 upgrade dispatch,以便商业化模块的 /ws/user-chat-bridge
-    // 与 /ws/agent 路径在 gateway 自身的 /ws 之前优先匹配。原 `path: '/ws'` 模式下
-    // ws lib 会对所有非 /ws 请求 socket.destroy(),把商业化路径吃掉。
-    // 商用 v3:容器内 gateway 作为 server 接收 bridge client 转发的 user 帧。
-    // 用户允许单附件 200 MiB / 总 300 MiB,base64 后 ≈ 400 MiB + envelope → 448 MiB。
-    // ws 默认 maxPayload=100 MiB 会让 Receiver 对大附件帧直接 RangeError 关连接。
-    this.wss = new WebSocketServer({ noServer: true, maxPayload: 448 * 1024 * 1024 })
-    this.httpServer.on('upgrade', (req, socket, head) => {
-      // 1) 商业化模块优先(/ws/user-chat-bridge / /ws/agent / 未来私有路径)
-      try {
-        if (this.deps.commercial?.handleWsUpgrade(req, socket, head)) return
-      } catch (err) {
-        this.log.error('commercial.handleWsUpgrade threw', undefined, err)
-        try { socket.destroy() } catch {}
-        return
-      }
-      // 2) V5 container-only Chromium preview. The handler itself requires a
-      // signed master assertion + exact trusted bridge IP before accepting.
-      try {
-        if (this._containerPreview.handleUpgrade(req, socket, head)) return
-      } catch (err) {
-        this.log.error('containerPreview.handleUpgrade threw', undefined, err)
-        try { socket.destroy() } catch {}
-        return
-      }
-      // 3) gateway 自身 /ws(浏览器 ↔ gateway 的 ChannelAdapter 协议)
-      const url = req.url ?? '/'
-      // 只接受 exact `/ws` 或 `/ws?…` 路径,剩余的 4xx + close
-      const path = (() => { try { return new URL(url, 'http://x').pathname } catch { return url } })()
-      if (path === '/ws') {
-        this.wss.handleUpgrade(req, socket, head, (ws) => this.wss.emit('connection', ws, req))
-        return
-      }
-      // 4) 不认识的 ws path:401 + close(对齐 ws lib 默认对未匹配路径的处理)
-      try {
-        socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n')
-        socket.destroy()
-      } catch {}
-    })
-
-    // WS keepalive: ping every 25s, terminate if no pong in 35s
-    this._wsKeepaliveTimer = setInterval(() => {
-      for (const ws of this.wss.clients) {
-        if ((ws as any)._isAlive === false) {
-          ws.terminate()
-          continue
-        }
-        ;(ws as any)._isAlive = false
-        ws.ping()
-      }
-    }, 25_000)
-
-    this.wss.on('connection', (ws, req) => this.handleWsConnection(ws, req))
-
-    // 启动渠道
-    for (const factory of this.deps.channelFactories ?? []) {
-      const adapter = factory({ config })
-      const ctx: ChannelContext = {
-        dispatch: (frame) => this.dispatchInbound(frame, adapter),
-        log: {
-          // Channel name last so adapter-supplied meta.channel can't spoof it.
-          info: (m, meta) => this.log.info(m, { ...(meta ?? {}), channel: adapter.name }),
-          error: (m, meta) => this.log.error(m, { ...(meta ?? {}), channel: adapter.name }),
-        },
-        config: (config.channels as any)[adapter.name] ?? {},
-        // Reset session keyed by (channel, peer). Used by channel /new handlers.
-        // Destroys every session the router could route this (channel, peer) to.
-        resetSession: async (channel, peerId, peerKind) => {
-          const safePeer = peerId.replace(/[^a-zA-Z0-9_-]/g, '_')
-          const prefix = `agent:`
-          const suffix = `:${channel}:${peerKind}:${safePeer}`
-          const keys: string[] = []
-          for (const s of this.sessions.list()) {
-            if (s.sessionKey.startsWith(prefix) && s.sessionKey.endsWith(suffix)) {
-              keys.push(s.sessionKey)
-            }
-          }
-          for (const k of keys) {
-            try { await this.sessions.destroySession(k) } catch {}
-            this._outboundRing.clear(k)
-          }
-          // Refresh size_bytes gauge — without this, a Prometheus scrape
-          // after a wipe still reports the pre-clear bytes until the next
-          // store/peek path runs.
-          outboundRingSizeBytes.value = this._outboundRing.totalBytes()
-        },
-      }
-      try {
-        await adapter.init(ctx)
-        this.channels.set(adapter.name, adapter)
-        this.log.info('channel ready', { channel: adapter.name })
-      } catch (err) {
-        this.log.error('channel failed to init', { channel: adapter.name }, err)
-      }
-    }
-
-    this._stopEviction = this.sessions.startEvictionLoop()
-    process.once('SIGINT', () => {
-      this.shutdown().catch((err) => this.log.error('shutdown error (SIGINT)', undefined, err))
-    })
-    process.once('SIGTERM', () => {
-      this.shutdown().catch((err) => this.log.error('shutdown error (SIGTERM)', undefined, err))
-    })
-
-
-    // Start cron scheduler for reflection jobs (L3)
-    // Smart delivery: push to last active channel, fallback to all webchat clients
-    const wechatProactiveCfg = readV3WechatProactiveConfig()
-    const qqProactiveCfg = readV3QqProactiveConfig()
-    this.cron = new CronScheduler(config, this.sessions, async (text, job, delivery) => {
-      await deliverCronOutput(text, job, delivery, {
-        lastActiveChannel: this.lastActiveChannel,
-        clientsByPeer: this.clientsByPeer as CronDeliverDeps['clientsByPeer'],
-        channels: this.channels as CronDeliverDeps['channels'],
-        deliver: (msg) => this.deliver(msg as OutboundMessage),
-        makePeerKey: (userId, channel, peerId) => Gateway.makePeerKey(userId, channel, peerId),
-        qqProactiveCfg,
-        wechatProactiveCfg,
-        sendQqProactive: sendV3QqProactive,
-        sendWechatProactive: sendV3WechatProactive,
-        postInboxDurable: postInboxMessageDurable,
-      })
-    }, (job, delivery) => this.injectCronOriginSession(job, delivery))
-    this.cron.setProjectPorts(this.cronProjectPorts())
-    this.cron.lastActiveChannel = this.lastActiveChannel
-    this.cron.getRegisteredDeliverChannels = () => this.channels.keys()
-    this.cron.start().catch((err) => this.log.error('cron start failed', undefined, err))
-    if (isDelegateSmEnabled()) {
-      this.cron.delegateJobs = this._ensureDelegateJobStore()
-    }
-
-    // Start event persistence (writes all events to SQLite event_log)
-    startEventPersistence()
-
-    // Exact memory usage + current-fact freshness shadow. Fail-open observers
-    // never alter turn execution or user-visible memory results.
-    startMemoryTurnObserver()
-    startMemoryUsageReporter()
-
-    // Start metrics collection (eventBus → prometheus counters)
-    startMetricsCollection()
-
-    // Commercial container telemetry: privacy-safe call rollups + failure rows.
-    this._toolFailureReporter = startToolFailureReporter()
-
-    // Commercial container product signal: hub skill_view → master marketplace usage.
-    // 默认开(OC_MARKET_SKILL_USAGE!='0');resolveTraceId 从活跃 session 读本 turn 的
-    // canonical traceId 作评分归因键(engine 中立、只透传不铸造)。
-    startSkillUsageReporter({
-      resolveTraceId: (sessionKey) => this.sessions.getByKey(sessionKey)?._currentTurnTraceId ?? null,
-    })
-
-    // Retrieval quality shadow: strict opt-in via OC_SKILL_SHADOW_SAMPLE_RATE.
-    // The observer never mutates prompt/tool state and never blocks dispatchInbound;
-    // it only reads the same agent-visible metadata used by the SKILLS slot.
-    this._skillShadowReporter = startSkillShadowReporter({
-      resolveTraceId: (sessionKey) => this.sessions.getByKey(sessionKey)?._currentTurnTraceId ?? null,
-    })
-
-    // Start rate limiter cleanup
-    this.rateLimiter.startCleanup()
-
-    // EventBus: bridge CCB CronCreate/CronDelete to gateway CronScheduler
-    eventBus.on('task.created', (ev) => {
-      if (!this.cron || ev.source !== 'cron-bridge') return
-      if (isHiddenSystemAgentId(ev.agentId)) {
-        this.log.warn('eventBus task.created hidden system agent rejected', {
-          taskId: ev.taskId,
-          agentId: ev.agentId,
-        })
-        return
-      }
-      // Use taskId directly — sessionManager already generates unique ccb-xxx IDs
-      this.cron
-        .addJob({
-          id: ev.taskId,
-          schedule: ev.schedule || '* * * * *',
-          agent: ev.agentId,
-          prompt: ev.prompt,
-          deliver: 'webchat',
-          enabled: true,
-          oneshot: ev.oneshot ?? true,
-          label: ev.prompt.slice(0, 50),
-          // Same creation stamp as the /api/cron path — every user-facing cron
-          // entry point must set createdAt so catch-up can't backfire pre-creation.
-          createdAt: Date.now(),
-        })
-        .then(() =>
-          this.log.info('eventBus task.created → gateway job', { taskId: ev.taskId }),
-        )
-        .catch((err) =>
-          this.log.warn('eventBus task.created failed', { taskId: ev.taskId }, err),
-        )
-    })
-    eventBus.on('task.deleted', (ev) => {
-      if (!this.cron) return
-      this.cron
-        .removeJob(ev.taskId)
-        .then((ok) =>
-          this.log.info('eventBus task.deleted', {
-            taskId: ev.taskId,
-            result: ok ? 'removed' : 'not found',
-          }),
-        )
-        .catch((err) =>
-          this.log.warn('eventBus task.deleted failed', { taskId: ev.taskId }, err),
-        )
-    })
-
-    // Start webhook router
-    this.webhookRouter = new WebhookRouter()
-    await this.webhookRouter.load()
-    this.log.info('webhooks loaded', { count: this.webhookRouter.list().length })
-
-    // EventBus: route webhook.received → agent execution + delivery
-    eventBus.on('webhook.received', (ev) => {
-      const { webhookId, agentId, payload } = ev
-      if (isHiddenSystemAgentId(agentId)) {
-        this.log.warn('webhook hidden system agent rejected', { agentId, webhookId })
-        return
-      }
-      const { resolvedPrompt } = payload as any
-      ;(async () => {
-        const cfg = await this._getAgentsConfig()
-        const agent = cfg.agents.find((a) => a.id === agentId)
-        if (!agent) {
-          this.log.warn('webhook agent not found', { agentId, webhookId })
-          return
-        }
-        const sessionKey = `agent:${agentId}:webhook:${webhookId}:${Date.now()}`
-        // 合成首帧路由字段补齐(同 cron):webhook 触发的会话首帧绕过 master bridge
-        // 计费编排,落 codex 会被 CODEX_BILLING_GUARD 拒 → 解析为非 codex 执行模型。
-        const _whRoute = resolveSyntheticTurnModel(agent, this.deps.config.defaults.model)
-        // 模型权威 §3(无 envelope 的本地路径):flag 开 → 判定源换成 master catalog 投影
-        // (归一 / 可用性 / engine 全取投影;拉不到 → 抛 → 本次 webhook 执行失败并记日志,
-        // 不回落 baked)。flag 未开 → undefined,沿用上面的 baked 合成降级,零变化。
-        const _whExec = await resolveLocalExecutionIfEnforced({
-          agent,
-          kind: 'synthetic',
-          model: _whRoute?.model,
-          defaultModel: this.deps.config.defaults.model,
-        })
-        const _whModel = _whExec?.canonicalModel ?? _whRoute?.model
-        const session = await this.sessions.getOrCreate({
-          sessionKey,
-          agent,
-          ...(_whModel ? { model: _whModel } : {}),
-          ...localExecutionOverride(_whExec),
-          channel: 'webhook',
-          peerId: webhookId,
-          title: `[webhook] ${webhookId}`,
-        })
-        // MAJOR-2 透明化:降级不静默 —— effective_model 落 runLog(doctor 面可见)。
-        const _whRun = this._runLog.start({
-          agentId,
-          sessionKey,
-          taskType: 'webhook',
-          ...(_whRoute ? { effectiveModel: _whRoute.model } : {}),
-        })
-        let output = ''
-        let _whError = ''
-        try {
-          await this.sessions.submit(
-            session,
-            resolvedPrompt,
-            (e) => {
-              if (e.kind === 'block' && e.block.kind === 'text') output += (e.block as any).text
-              if (e.kind === 'error') _whError = e.error
-            },
-            undefined,
-            _whModel,
-          )
-          this._runLog.complete(_whRun, {
-            status: _whError ? 'failed' : 'completed',
-            error: _whError || undefined,
-          })
-        } catch (err: any) {
-          _whError = _whError || String(err)
-          this._runLog.complete(_whRun, { status: 'failed', error: _whError })
-        }
-        // Deliver to last active webchat
-        if (output.trim()) {
-          const lastActive =
-            this.lastActiveChannel.get(agentId) || this.lastActiveChannel.get('main')
-          if (lastActive) {
-            // Route through deliver() so the server-assigned ts gets stamped —
-            // otherwise the web client's stale-final guard has nothing to compare
-            // against and every webhook-delivered isFinal bypasses the guard.
-            this.deliver({
-              type: 'outbound.message' as const,
-              sessionKey: lastActive.sessionKey,
-              channel: 'webchat' as const,
-              peer: { id: lastActive.peerId, kind: 'dm' as const },
-              blocks: [
-                { kind: 'text' as const, text: `🔔 **Webhook ${webhookId}**\n\n${output.trim()}` },
-              ],
-              isFinal: true,
-              _userId: lastActive.userId,
-            } as OutboundMessage)
-          }
-        }
-      })().catch((err) =>
-        this.log.error('webhook execution failed', { webhookId, agentId }, err),
-      )
-    })
-
-    // TaskStore: schedule-triggered tasks run alongside cron (check every 60s)
-    this._taskSchedulerTimer = setInterval(() => {
-      this._tickScheduledTasks().catch((err) =>
-        this.log.error('task-scheduler tick failed', undefined, err),
-      )
-    }, 60_000)
-
-    // 商业版容器由 master 注入 OC_TASKBOARD_ENABLED=0(taskboardEnv.ts):不起巡检、不发简报。
-    // 只关后台自动化,/api/board/* 仍在(project-context / MCP 复用)。
-    if (isTaskboardEnabled()) {
-      // Taskboard 统一巡检 tick:一个 60s 定时器扫全部 stage,不按 stage 建 cron job。
-      // 通知复用 onDeliver 瀑布(微信接管则不再推站内信);熔断 warning 走 createInboxMessage。
-      const taskboardNotify = new TaskboardNotifier({
-        getDb: () => getTaskboardDb(),
-        log: (msg, extra) => this.log.warn(msg, extra),
-        transport: {
-          sendWechat: async ({ text, outboundId }) => {
-            const cfg = readV3WechatProactiveConfig()
-            if (!cfg) return { kind: 'fallback' as const, marked: false }
-            return sendV3WechatProactive({ config: cfg, text, outboundId })
-          },
-          postInbox: async ({ title, bodyMd, deliveryKey }) => {
-            try {
-              return await postInboxMessageDurable({ title, bodyMd, deliveryKey })
-            } catch (err) {
-              this.log.warn('taskboard inbox durable failed', {
-                deliveryKey,
-                err: String(err),
-              })
-              return false
-            }
-          },
-          createInboxMessage: async (args) => {
-            try {
-              return await postInboxAlertDurable(args)
-            } catch (err) {
-              this.log.warn('taskboard inbox-alert durable failed', {
-                deliveryKey: args.deliveryKey,
-                err: String(err),
-              })
-              return false
-            }
-          },
-        },
-      })
-      this._taskboardPatrol = new PatrolEngine({
-        getDb: () => getTaskboardDb(),
-        delegate: (input) => this._runTaskboardDelegate(input),
-        log: (msg, extra) => this.log.info(msg, extra),
-        notify: taskboardNotify,
-        onAlert: (alert) => {
-          this.log.warn('taskboard guardrail', {
-            kind: alert.kind,
-            outboundId: alert.outboundId,
-            message: alert.message,
-            stageId: alert.stageId,
-            ticketId: alert.ticketId,
-          })
-          void taskboardNotify.onGuardrailAlert(alert)
-        },
-      })
-      setPatrolExecutionHandler((job) => {
-        void this._taskboardPatrol?.executeJob(job).catch((err) =>
-          this.log.error('taskboard patrol job failed', undefined, err),
-        )
-      })
-      this._taskboardTickTimer = setInterval(() => {
-        this._taskboardPatrol?.tick().catch((err) =>
-          this.log.error('taskboard tick failed', undefined, err),
-        )
-      }, 60_000)
-      this._taskboardTickTimer.unref()
-    } else {
-      this.log.info('taskboard automation disabled (OC_TASKBOARD_ENABLED=0)')
-    }
-
-    // Invalidate task cache when tasks are created or deleted
-    eventBus.on('task.created', () => this._invalidateTaskCache())
-    eventBus.on('task.deleted', () => this._invalidateTaskCache())
-
-    // EventBus: webhook.received can also trigger webhook-type tasks
-    eventBus.on('webhook.received', (ev) => {
-      this._getCachedTasks()
-        .then((tasks) => {
-          for (const t of tasks) {
-            if (
-              t.trigger === 'webhook' &&
-              t.webhookId === ev.webhookId &&
-              t.status !== 'disabled'
-            ) {
-              this._triggerTask(t.id).catch(() => {})
-            }
-          }
-        })
-        .catch(() => {})
-    })
-
-    // EventBus: catch-all listener for event-triggered tasks (uses cached task list)
-    eventBus.on('*', (ev) => {
-      this._getCachedTasks()
-        .then((tasks) => {
-          for (const t of tasks) {
-            if (t.trigger === 'event' && t.eventType === ev.type && t.status !== 'disabled') {
-              this._triggerTask(t.id).catch(() => {})
-            }
-          }
-        })
-        .catch(() => {})
-    })
-
-    // Handle subprocess crashes: push a system message to the client so they know
-    // the session will auto-recover on the next message they send
-    eventBus.on('session.crashed', (ev) => {
-      // Route through deliver() so the ts-stamp path is the single source of truth
-      // for stale-final ordering. Preserves original semantics (no-op if no
-      // clients are connected — deliver() bails early on empty peer set).
-      // Cast keeps the legacy `agentId` field the crash notification has always
-      // carried; OutboundMessage schema doesn't define it but the client reads
-      // it, and the wire format tolerates extra keys.
-      this.deliver({
-        type: 'outbound.message',
-        sessionKey: ev.sessionKey,
-        channel: 'webchat',
-        peer: { id: ev.peerId, kind: 'dm' },
-        agentId: ev.agentId,
-        blocks: [
-          {
-            kind: 'text',
-            text: '⚠️ AI 进程异常退出，下一条消息将自动恢复上下文。',
-          },
-        ],
-        isFinal: true,
-      } as OutboundMessage)
-      this.log.info('pushed crash notification', { peerId: ev.peerId })
-
-      // Ordinary pending permissions die with the subprocess. Detached
-      // ask_user cards do not — see `_reapCrashedSessionPendingPermissions`.
-      this._reapCrashedSessionPendingPermissions(ev.sessionKey)
-    })
-
-    // Periodic OAuth token refresh (every 10 min). Running subprocesses keep
-    // the old token until restarted; 401 detection in sessionManager handles
-    // the restart + retry when the old token expires mid-conversation.
-    this._oauthRefreshTimer = setInterval(() => this.refreshClaudeOAuthIfNeeded().catch(() => {}), 10 * 60_000)
-    // Periodic pending-permission janitor: TTL-based auto-deny + orphan cleanup.
-    this._pendingPermissionSweepTimer = setInterval(
-      () => {
-        try { this._sweepStalePendingPermissions() } catch (err) {
-          this.log.warn('pending permission sweep failed', undefined, err)
-        }
-      },
-      Gateway.PENDING_PERMISSION_SWEEP_MS,
-    )
-    // Check immediately on boot
-    this.refreshClaudeOAuthIfNeeded().catch(() => {})
-
-    // Converge orphan live streams BEFORE listen: clients that connect the
-    // instant the port opens would otherwise page the stale live snapshot and
-    // replay frames whose authoritative tape already finalized. One idempotent
-    // UPDATE; failure is logged and must not block startup.
-    try {
-      const { convergeFinalizedTapeLiveStreams } = await import('@openclaude/storage')
-      const { converged } = await convergeFinalizedTapeLiveStreams()
-      if (converged > 0) {
-        this.log.info('converged finalized live streams to tape', { converged })
-      }
-    } catch (err) {
-      this.log.warn('live stream convergence failed', undefined, err)
-    }
-
-    const listenOpts = resolveGatewayListen(config.gateway.bind, config.gateway.port)
-    await new Promise<void>((res) => {
-      if (listenOpts.exclusive) {
-        this.httpServer.listen(
-          { port: listenOpts.port, host: listenOpts.host, exclusive: true },
-          () => res(),
-        )
-      } else {
-        this.httpServer.listen(listenOpts.port, listenOpts.host, () => res())
-      }
-    })
-    this.log.info('server started', { bind: listenOpts.host, port: listenOpts.port })
-
-    // Auto-resume: proactively continue interrupted webchat sessions after gateway restart
-    this.bootAutoResume().catch((err) =>
-      this.log.error('auto-resume boot failed', undefined, err),
-    )
+  start(): Promise<void> {
+    return startImpl.call(this as unknown as GatewayLifecycleHost)
   }
 
   /**
@@ -2450,16 +1703,7 @@ export class Gateway {
    * want to exit with code 1 after graceful flush).
    */
   public shutdown(exit = true): Promise<void> {
-    if (this._shutdownPromise) return this._shutdownPromise
-    // Set ingress guard FIRST so handlers reject new requests immediately
-    this._shuttingDown = true
-    this._shutdownPromise = this._doShutdown(exit).catch((err) => {
-      try {
-        this.log.error('shutdown failed', undefined, err)
-      } catch {}
-      if (exit) process.exit(1)
-    })
-    return this._shutdownPromise
+    return shutdownImpl.call(this as unknown as GatewayLifecycleHost, exit)
   }
 
   /** True once shutdown has begun; handlers use this to reject new ingress. */
@@ -2467,250 +1711,13 @@ export class Gateway {
     return this._shuttingDown
   }
 
-  private async _doShutdown(exit: boolean): Promise<void> {
-    this.log.info('shutting down')
-
-    // ── Stage 1: stop accepting new traffic ──
-    // `httpServer.close()` stops accepting new HTTP connections but lets
-    // in-flight requests finish. WS upgrade happens via the HTTP server so
-    // new WS connections are also refused. Existing handlers additionally
-    // check `_shuttingDown` to short-circuit.
-    // We capture the close-completion Promise here and await it in Stage 5
-    // so the full close lifecycle is awaited before exit.
-    let httpCloseDone: Promise<void> = Promise.resolve()
-    if (this.httpServer) {
-      httpCloseDone = new Promise<void>((resolveClose) => {
-        try {
-          this.httpServer.close((err) => {
-            if (err) this.log.warn('httpServer.close error', undefined, err)
-            resolveClose()
-          })
-        } catch (err) {
-          this.log.warn('httpServer.close threw', undefined, err)
-          resolveClose()
-        }
-      })
-    }
-
-    // ── Stage 2: stop all background timers ──
-    try {
-      this._stopEviction?.()
-    } catch {}
-    this._stopEviction = null
-    try {
-      await this._persistAndCloseDelegateJobs()
-    } catch (err) {
-      this.log.error(
-        'delegate job snapshot persist failed; keeping in-memory jobs',
-        undefined,
-        err as Error,
-      )
-    }
-    this._skillShadowReporter?.stop()
-    this._skillShadowReporter = null
-    if (this._wsKeepaliveTimer !== null) {
-      clearInterval(this._wsKeepaliveTimer)
-      this._wsKeepaliveTimer = null
-    }
-    if (this._taskSchedulerTimer !== null) {
-      clearInterval(this._taskSchedulerTimer)
-      this._taskSchedulerTimer = null
-    }
-    if (this._taskboardTickTimer !== null) {
-      clearInterval(this._taskboardTickTimer)
-      this._taskboardTickTimer = null
-    }
-    setPatrolExecutionHandler(null)
-    this._taskboardPatrol = null
-    if (this._oauthRefreshTimer !== null) {
-      clearInterval(this._oauthRefreshTimer)
-      this._oauthRefreshTimer = null
-    }
-    if (this._pendingPermissionSweepTimer !== null) {
-      clearInterval(this._pendingPermissionSweepTimer)
-      this._pendingPermissionSweepTimer = null
-    }
-    try {
-      this.cron?.stop()
-    } catch (err) {
-      this.log.warn('cron stop error', undefined, err)
-    }
-    // v3 master sink retry queue periodic timer ONLY here. The sink
-    // singleton itself MUST stay set until after sessions.shutdownAll()
-    // drains turn-end / handleExit-flush callbacks (stage 4) — clearing
-    // it now would send late partial-flush writes through the legacy
-    // local SQLite path that's permanently empty in v3 commercial,
-    // recreating the original data-loss bug. Stopping the periodic timer
-    // is fine: it's purely additive (drains entries already on disk
-    // from prior boot), and `kick()` is idempotent.
-    // Codex R2 BLOCK-2.
-    try {
-      this._stopV3RetryDrainer?.()
-    } catch (err) {
-      this.log.warn('v3 retry drainer stop error', undefined, err)
-    }
-    this._stopV3RetryDrainer = null
-    // RFC-v5-durable-turn-dispatch §B4 — 停周期 recovery 定时器(纯附加,清干净不留句柄)。
-    if (this._turnDispatchRecoveryTimer) {
-      clearInterval(this._turnDispatchRecoveryTimer)
-      this._turnDispatchRecoveryTimer = null
-    }
-
-    // ── Stage 3: drain channel adapters (Telegram etc.) ──
-    for (const ch of this.channels.values()) {
-      try {
-        await ch.shutdown()
-      } catch (err) {
-        this.log.warn('channel shutdown error', { channel: ch.name }, err)
-      }
-    }
-
-    // ── Stage 3.5: V3 2H — drain 商业化模块(close redis/pricing/anthropic proxy/ws bridge) ──
-    if (this.deps.commercial) {
-      try {
-        await this.deps.commercial.shutdown()
-      } catch (err) {
-        this.log.warn('commercial shutdown error', undefined, err)
-      }
-    }
-
-    // ── Stage 3.75: close isolated preview Chromium/CDP sessions ──
-    try {
-      await this._containerPreview.shutdown()
-    } catch (err) {
-      this.log.warn('container preview shutdown error', undefined, err)
-    }
-
-    // ── Stage 4: drain sessions (kill CCB subprocesses, flush resume map) ──
-    try {
-      await this.sessions.shutdownAll()
-    } catch (err) {
-      this.log.warn('sessions shutdownAll error', undefined, err)
-    }
-    try {
-      await this.sessions.awaitResumeMapFlush()
-    } catch (err) {
-      this.log.warn('resume map flush error', undefined, err)
-    }
-    this._promptQueueCoordinator?.shutdown()
-    this._promptQueueCoordinator = null
-
-    // ── Stage 4.25: persist the final tool-call rollup ──
-    // Keep the reporter subscribed until every runner has stopped so late
-    // tool_result events are included. shutdown() atomically queues+fsyncs the
-    // final batch; HTTP delivery may resume from disk on the next boot.
-    try {
-      await this._toolFailureReporter?.shutdown()
-    } catch (err) {
-      this.log.warn('tool failure reporter shutdown error', undefined, err)
-    }
-    this._toolFailureReporter = null
-
-    // ── Stage 4.5: clear v3 master sink singleton ──
-    // shutdownAll above internally awaits awaitPendingPersistence(), so
-    // every turn-end / handleExit-flush has either landed on master via
-    // the sink HTTP POST or has been durably enqueued on disk for
-    // retry-on-next-boot. Now safe to disable the write path.
-    // Codex R2 BLOCK-2 — kept the kill-switch out of stage 2 and put it
-    // here after sessions are fully drained.
-    try {
-      const { setV3MasterSinkSingleton } = await import('./v3MasterSink.js')
-      setV3MasterSinkSingleton(null)
-      this._kickV3RetryDrainer = null
-    } catch (err) {
-      this.log.warn('v3 master sink singleton clear error', undefined, err)
-    }
-
-    // ── Stage 5: force-close remaining sockets ──
-    // WS: terminate remaining clients so `wss.close()` callback fires promptly.
-    // HTTP: `closeAllConnections()` destroys active sockets (e.g. SSE streams)
-    //       that would otherwise block the Stage 1 `close()` callback.
-    if (this.httpServer) {
-      try {
-        const closeAll = (this.httpServer as any).closeAllConnections
-        if (typeof closeAll === 'function') closeAll.call(this.httpServer)
-      } catch (err) {
-        this.log.warn('closeAllConnections error', undefined, err)
-      }
-    }
-    const wssCloseDone = new Promise<void>((resolveClose) => {
-      if (!this.wss) return resolveClose()
-      try {
-        for (const ws of this.wss.clients) {
-          try { ws.terminate() } catch {}
-        }
-        this.wss.close((err) => {
-          if (err) this.log.warn('wss.close error', undefined, err)
-          resolveClose()
-        })
-      } catch (err) {
-        this.log.warn('wss.close threw', undefined, err)
-        resolveClose()
-      }
-    })
-    await Promise.allSettled([httpCloseDone, wssCloseDone])
-    this.log.info('shutdown complete')
-    if (exit) process.exit(0)
+  private _doShutdown(exit: boolean): Promise<void> {
+    return _doShutdownImpl.call(this as unknown as GatewayLifecycleHost, exit)
   }
 
   // ───────── HTTP ─────────
   private handleHttp(req: IncomingMessage, res: ServerResponse): void {
-    // Ingress guard: refuse new work once shutdown has begun
-    if (this._shuttingDown) {
-      res.statusCode = 503
-      res.setHeader('Connection', 'close')
-      res.setHeader('Content-Type', 'text/plain')
-      res.end('shutting down')
-      return
-    }
-
-    // V5 direct webpage preview: only the commercial master can reach this
-    // signed internal path. It must run before commercial/gateway routing so
-    // the user app can never collide with a platform API path.
-    try {
-      if (this._containerPreview.handleHttp(req, res)) return
-    } catch (err) {
-      this.log.error('containerPreview.handleHttp threw', undefined, err)
-      if (!res.headersSent) {
-        res.statusCode = 500
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8')
-        res.setHeader('Cache-Control', 'no-store')
-        res.end('preview proxy error')
-      } else if (!res.writableEnded) {
-        try { res.destroy() } catch {}
-      }
-      return
-    }
-
-    // V3 2H: 商业化模块优先 — 其 router 自管 auth + 输入校验 + status code,
-    // 返 true 即"已处理",gateway 不再走自家 /api/auth/login 等路径。
-    // 必须在 security headers 之前,否则 commercial 自己设置的 CSP/headers 会被覆盖。
-    if (this.deps.commercial) {
-      const r = this.deps.commercial.handle(req, res)
-      if (r === true) return
-      if (r && typeof (r as Promise<boolean>).then === 'function') {
-        ;(r as Promise<boolean>)
-          .then((handled) => {
-            if (handled) return
-            this._handleHttpAfterCommercial(req, res)
-          })
-          .catch((err) => {
-            this.log.error('commercial.handle threw', undefined, err)
-            if (!res.headersSent) {
-              try {
-                res.statusCode = 500
-                res.setHeader('Content-Type', 'application/json')
-                res.end(JSON.stringify({ error: { code: 'INTERNAL', message: 'commercial error' } }))
-              } catch {}
-            } else {
-              try { res.end() } catch {}
-            }
-          })
-        return
-      }
-      // false 同步 → 走 gateway 路由
-    }
-    this._handleHttpAfterCommercial(req, res)
+    handleHttpImpl.call(this as unknown as GatewayHttpHost, req, res)
   }
   /** Narrow view of the Gateway for routes/preAuth.ts (FINDINGS §7.5 2b, OCV5-468). */
   private readonly preAuthRoutesIo: PreAuthRoutesIo = ((gw: Gateway): PreAuthRoutesIo => ({
@@ -2901,129 +1908,7 @@ export class Gateway {
 
 
   private _handleHttpAfterCommercial(req: IncomingMessage, res: ServerResponse): void {
-    const reqStart = Date.now()
-    const url = new URL(req.url ?? '/', `http://${req.headers.host}`)
-    const method = req.method ?? 'GET'
-    const path = url.pathname
-
-    // M1: Security headers on every response
-    res.setHeader('X-Content-Type-Options', 'nosniff')
-    res.setHeader('X-Frame-Options', 'DENY')
-    res.setHeader('Referrer-Policy', 'no-referrer')
-    // Cloudflare Turnstile widget iframe (challenges.cloudflare.com) needs a
-    // handful of sensor/attestation features delegated to it; default deny
-    // policy makes the widget hang at "before-interactive" and never produce a
-    // token (silent failure — user sees blank widget area). See:
-    // https://developers.cloudflare.com/turnstile/troubleshooting/permissions-policy
-    // microphone=(self): 允许同源页面用 getUserMedia 录音(语音输入 /ws/voice-transcribe）。
-    // 之前 microphone=() 对所有源(含自身)禁用 → 浏览器报 "Permissions policy violation:
-    // microphone is not allowed" → 语音输入彻底不可用。用户仍需显式授予麦克风权限,无安全损失。
-    res.setHeader('Permissions-Policy', [
-      'camera=()', 'microphone=(self)', 'geolocation=()',
-      'accelerometer=(self "https://challenges.cloudflare.com")',
-      'gyroscope=(self "https://challenges.cloudflare.com")',
-      'magnetometer=(self "https://challenges.cloudflare.com")',
-      'xr-spatial-tracking=(self "https://challenges.cloudflare.com")',
-      'attribution-reporting=(self "https://challenges.cloudflare.com")',
-      'private-state-token-issuance=(self "https://challenges.cloudflare.com")',
-      'private-state-token-redemption=(self "https://challenges.cloudflare.com")',
-    ].join(', '))
-
-    // Instrument response — record metrics after response finishes
-    res.on('finish', () => {
-      const duration = Date.now() - reqStart
-      const status = String(res.statusCode)
-      httpRequestsTotal.inc({ method, path: normalizePath(path), status })
-      httpRequestDuration.observe(duration, { method, path: normalizePath(path) })
-      // Log non-static requests (skip static assets to reduce noise)
-      if (shouldLogHttpAccess(path, res.statusCode, duration)) {
-        this.log.info('http', { method, path, status: res.statusCode, durationMs: duration })
-      }
-    })
-    // Pre-auth routes (local relays, project search, login): dispatched BEFORE the auth gate: routes/preAuth.ts (FINDINGS §7.5 2b).
-    if (dispatchRoutes(PRE_AUTH_ROUTES, this.preAuthRoutesIo, req, res, url)) return
-
-    // Routes that need auth
-    // All /api/*, /v1/*, and /metrics endpoints require auth except healthz
-    const needsAuth =
-      (url.pathname.startsWith('/api/') && url.pathname !== '/api/healthz') ||
-      url.pathname.startsWith('/v1/') ||
-      url.pathname === '/metrics'
-    // v3 file proxy: HOST gateway → container /api/file or /api/media via docker bridge
-    // bypasses checkHttpAuth if all four conditions hold (see checkBridgeBypass).
-    const bridgeVerified = needsAuth ? this.checkBridgeBypass(req, url) : false
-    const delegateAuthedByContext =
-      this._isDelegateHttpPath(url.pathname) && this._hasValidDelegateContext(req)
-    if (
-      needsAuth &&
-      !bridgeVerified &&
-      !this.checkHttpAuth(req) &&
-      !checkLocalBridge(req) &&
-      !delegateAuthedByContext
-    ) {
-      res.writeHead(401, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ error: 'unauthorized' }))
-      return
-    }
-    // Platform routes (/v1/, auth session/logout, /internal/v3/*): routes/platform.ts (FINDINGS §7.5 2b).
-    if (dispatchRoutes(PLATFORM_ROUTES, this.platformRoutesIo, req, res, url)) return
-    // System routes (web-trace, healthz, metrics, version, doctor, usage, runs): routes/system.ts (FINDINGS §7.5 2b).
-    if (dispatchRoutes(SYSTEM_ROUTES, this.systemRoutesIo, req, res, url)) return
-    // Client session routes (/api/sessions/*): routes/clientSessions.ts (FINDINGS §7 step 2a).
-    if (handleClientSessionsHttp(this.clientSessionsIo, req, res, url)) return
-    // App config routes (/api/features, /api/config): routes/appConfig.ts (FINDINGS §7.5 2b).
-    if (dispatchRoutes(APP_CONFIG_ROUTES, this.appConfigRoutesIo, req, res, url)) return
-    // Agent routes (agents, persona, memory, auto-dream optimizer, skills, skill eval/training, release jobs, messaging, delegate, advisor, ask-user, collaboration config): routes/agents.ts (FINDINGS §7.5 2b).
-    if (dispatchRoutes(AGENT_ROUTES, this.agentRoutesIo, req, res, url)) return
-    // Workspace API routes (changelog, feedback, search, cron, board, tasks, webhooks, wechat, Claude auth, uploads, media, file): routes/workspaceApi.ts (FINDINGS §7.5 2b).
-    if (dispatchRoutes(WORKSPACE_API_ROUTES, this.workspaceApiRoutesIo, req, res, url)) return
-
-    // ── API / WS 404 守卫（仅 spa 模式）────────────────────────────────────
-    // 走到这里说明请求未匹配上方任何 /api/* 或 /ws/* 路由(所有已匹配路由都已 return)。
-    // spa 模式必须在 SPA fallback 之前对未匹配的 /api/*、/ws/* 显式返回 404 JSON:
-    // 否则它们会落到下方 SPA fallback 拿到 index.html(200),新 React client 调错端点
-    // 时会把 HTML 当 JSON 解析直接抛错、难定位。
-    // 严格 gate 在 staticMode==='spa':vanilla(v3) 分支完全不进此守卫,行为字节级不变
-    // (v3 零影响);且只拦"本就该 404 的兜底",不触碰任何已匹配路由。
-    if (
-      this.deps.staticMode === 'spa' &&
-      (url.pathname.startsWith('/api/') ||
-        url.pathname === '/ws' ||
-        url.pathname.startsWith('/ws/'))
-    ) {
-      this.sendJson(res, 404, { error: 'not found' })
-      return
-    }
-
-    // 静态 web UI (with in-memory cache)
-    if (this.deps.webRoot) {
-      // /admin → /admin.html:React 管理后台是 web-react 的第二 Vite 入口,产物是 dist 里
-      // 真实存在的 /admin.html。提供一个无扩展名的 /admin 便捷入口,302 到真实文件后由下方
-      // 通用静态服务命中(no-cache,同 index.html);否则 /admin 会落到 SPA fallback 拿到用户端
-      // index.html。仅 spa(v5 Aurora)模式:vanilla(v3/personal)产物不含 admin.html。
-      if (this.deps.staticMode === 'spa' && url.pathname === '/admin') {
-        res.writeHead(302, { Location: '/admin.html' })
-        res.end()
-        return
-      }
-      const safePath = url.pathname === '/' ? '/index.html' : url.pathname
-      // Cache-Control 按托管模式分流(规则单一权威 = staticCacheControl)。两模式共用下方的
-      // ETag/304、路径白名单与 SPA 回退;仅本头不同 → vanilla 分支与历史完全一致(v3 零变化)。
-      const cacheHeader = staticCacheControl(safePath, this.deps.staticMode)
-      const filePath = resolve(this.deps.webRoot, `.${safePath}`)
-      if (filePath.startsWith(resolve(this.deps.webRoot))) {
-        if (this._serveStaticCached(filePath, cacheHeader, req, res, mimeFor(filePath))) return
-      }
-      // SPA fallback — only for navigation requests (no file extension)
-      // Static assets (.js/.css/.map/.min.js etc.) should 404, not serve index.html
-      const hasExtension = /\.\w+$/.test(url.pathname)
-      if (!hasExtension) {
-        const indexPath = resolve(this.deps.webRoot, 'index.html')
-        if (this._serveStaticCached(indexPath, 'no-cache', req, res, 'text/html')) return
-      }
-    }
-    res.writeHead(404)
-    res.end('not found')
+    _handleHttpAfterCommercialImpl.call(this as unknown as GatewayHttpHost, req, res)
   }
 
   /**
@@ -3034,45 +1919,8 @@ export class Gateway {
    * 前端 update banner 陷入刷新死循环)。
    * 返回 true = 已响应(200/304);false = 磁盘无此文件,由调用方走兜底/404。
    */
-  private _serveStaticCached(
-    filePath: string,
-    cacheHeader: string,
-    req: IncomingMessage,
-    res: ServerResponse,
-    mime: string,
-  ): boolean {
-    const cached = this._staticFileCache.get(filePath)
-    if (cached && this._staticCacheFreshOnDisk(filePath, cached)) {
-      if (req.headers['if-none-match'] === cached.etag) {
-        res.writeHead(304)
-        res.end()
-        return true
-      }
-      res.writeHead(200, { 'Content-Type': cached.mime, 'ETag': cached.etag, 'Cache-Control': cacheHeader })
-      res.end(cached.content)
-      return true
-    }
-    try {
-      const s = statSync(filePath)
-      if (!s.isFile()) return false
-      const content = readFileSync(filePath)
-      const etag = `"${createHash('md5').update(content).digest('hex').slice(0, 16)}"`
-      if (this._staticFileCache.size >= 200) {
-        const firstKey = this._staticFileCache.keys().next().value
-        if (firstKey !== undefined) this._staticFileCache.delete(firstKey)
-      }
-      this._staticFileCache.set(filePath, { content, mime, etag, mtimeMs: s.mtimeMs, ino: s.ino, size: s.size })
-      if (req.headers['if-none-match'] === etag) {
-        res.writeHead(304)
-        res.end()
-        return true
-      }
-      res.writeHead(200, { 'Content-Type': mime, 'ETag': etag, 'Cache-Control': cacheHeader })
-      res.end(content)
-      return true
-    } catch {
-      return false
-    }
+  private _serveStaticCached(filePath: string, cacheHeader: string, req: IncomingMessage, res: ServerResponse, mime: string): boolean {
+    return _serveStaticCachedImpl.call(this as unknown as GatewayHttpHost, filePath, cacheHeader, req, res, mime)
   }
 
   /**
@@ -3080,37 +1928,13 @@ export class Gateway {
    * inode/size 是为 P0-Web(OCV5-489):webRoot 是 overlay 符号链接,换指向后同一路径是
    * 另一个文件,cp -a 保留的 mtime 可能与旧文件相同。缺字段的旧条目只比 mtime。
    */
-  private _staticCacheFreshOnDisk(
-    filePath: string,
-    entry: { mtimeMs: number; ino?: number; size?: number },
-  ): boolean {
-    try {
-      const s = statSync(filePath)
-      if (s.mtimeMs !== entry.mtimeMs) return false
-      if (entry.ino !== undefined && s.ino !== entry.ino) return false
-      if (entry.size !== undefined && s.size !== entry.size) return false
-      return true
-    } catch {
-      return false
-    }
+  private _staticCacheFreshOnDisk(filePath: string, entry: { mtimeMs: number; ino?: number; size?: number }): boolean {
+    return _staticCacheFreshOnDiskImpl.call(this as unknown as GatewayHttpHost, filePath, entry)
   }
 
   /** Extract bearer token from request (header, WS protocol, or cookie). */
   private extractToken(req: IncomingMessage): string {
-    const authHeader = req.headers.authorization?.replace(/^Bearer\s+/, '') ?? ''
-    const protocols = (req.headers['sec-websocket-protocol'] || '').split(',').map((s) => s.trim())
-    const protoToken =
-      protocols.includes('bearer') && protocols.length >= 2 ? protocols[protocols.length - 1] : ''
-    const cookies = (req.headers.cookie || '').split(';').reduce(
-      (acc, c) => {
-        const [k, ...v] = c.trim().split('=')
-        if (k) acc[k] = v.join('=')
-        return acc
-      },
-      {} as Record<string, string>,
-    )
-    const cookieToken = cookies.oc_session || ''
-    return authHeader || protoToken || cookieToken
+    return extractTokenImpl.call(this as unknown as GatewayHttpHost, req)
   }
 
   private _isDelegateHttpPath(pathname: string): boolean {
@@ -3122,17 +1946,7 @@ export class Gateway {
   }
 
   private checkHttpAuth(req: IncomingMessage): boolean {
-    const t = this.extractToken(req)
-    // Try JWT first (multi-user mode)
-    const jwt = verifyJwt(t, this.deps.config.gateway.accessToken)
-    if (jwt) return true
-    // V3 commercial: accept JWTs signed by commercial module's jwtSecret too,
-    // otherwise paths that fall through to gateway (e.g. /api/agents,
-    // /api/sessions/*, /api/changelog) would 401 right after a successful
-    // commercial login and trigger a token-expired redirect storm.
-    if (this.verifyCommercialJwt(t) !== null) return true
-    // Fall back to legacy single token
-    return checkToken(t, this.deps.config.gateway.accessToken)
+    return checkHttpAuthImpl.call(this as unknown as GatewayHttpHost, req)
   }
 
   /**
@@ -3307,52 +2121,13 @@ export class Gateway {
    *
    * Returns an fd on success; writes 403/404 to res and returns null on failure.
    */
-  private openFileHardened(
-    res: ServerResponse,
-    realPath: string,
-    agentCwds: string[],
-    extraAllowed?: (p: string) => boolean,
-  ): number | null {
-    let fd: number
-    try {
-      fd = openSync(realPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
-    } catch {
-      res.writeHead(404)
-      res.end('not found')
-      return null
-    }
-    let fdReal: string
-    try {
-      fdReal = resolveOpenedPath(fd, realPath)
-    } catch {
-      closeSync(fd)
-      res.writeHead(404)
-      res.end('not found')
-      return null
-    }
-    // Re-check via fd realpath as fail-closed defense (redundant with caller's
-    // upstream check, but cheap). The user-scoped `extraAllowed` predicate
-    // covers v3 commercial docker-volume paths for the **current** uid.
-    if (fdReal !== realPath || !isFileAllowed(fdReal, agentCwds, extraAllowed) || isFileBlocked(fdReal)) {
-      closeSync(fd)
-      res.writeHead(403)
-      res.end('access denied')
-      return null
-    }
-    return fd
+  private openFileHardened(res: ServerResponse, realPath: string, agentCwds: string[], extraAllowed?: (p: string) => boolean): number | null {
+    return openFileHardenedImpl.call(this as unknown as GatewayHttpHost, res, realPath, agentCwds, extraAllowed)
   }
 
   /** Get authenticated userId from request. Returns 'default' for legacy token auth. */
   private getUserId(req: IncomingMessage): string {
-    const t = this.extractToken(req)
-    const jwt = verifyJwt(t, this.deps.config.gateway.accessToken)
-    if (jwt?.userId) return jwt.userId
-    // Commercial JWT: prefix sub (BIGINT user_id as string) so it cannot
-    // collide with personal-version userIds (which are arbitrary usernames).
-    // Used as partition key for SQLite client_sessions etc.
-    const cm = this.verifyCommercialJwt(t)
-    if (cm) return `c:${cm.sub}`
-    return 'default'
+    return getUserIdImpl.call(this as unknown as GatewayHttpHost, req)
   }
 
   /**
@@ -3423,25 +2198,7 @@ export class Gateway {
    * malformed payload, or commercial module not loaded).
    */
   private verifyCommercialJwt(token: string): { sub: string; role: 'user' | 'admin'; exp: number } | null {
-    if (!token || !this.deps.commercial?.jwtSecret) return null
-    const parts = token.split('.')
-    if (parts.length !== 3) return null
-    const [headerB64, payloadB64, sigB64] = parts
-    let header: any
-    try { header = JSON.parse(Buffer.from(headerB64, 'base64url').toString()) } catch { return null }
-    if (header?.alg !== 'HS256') return null
-    let actualSig: Buffer
-    try { actualSig = Buffer.from(sigB64, 'base64url') } catch { return null }
-    const expectedSig = createHmac('sha256', this.deps.commercial.jwtSecret).update(`${headerB64}.${payloadB64}`).digest()
-    if (expectedSig.length !== actualSig.length) return null
-    if (!timingSafeEqual(expectedSig, actualSig)) return null
-    let payload: any
-    try { payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString()) } catch { return null }
-    const now = Math.floor(Date.now() / 1000)
-    if (typeof payload?.exp !== 'number' || payload.exp <= now) return null
-    if (typeof payload?.sub !== 'string' || payload.sub.length === 0) return null
-    if (payload.role !== 'user' && payload.role !== 'admin') return null
-    return { sub: payload.sub, role: payload.role, exp: payload.exp }
+    return verifyCommercialJwtImpl.call(this as unknown as GatewayHttpHost, token)
   }
 
   /** Get userId stashed on a WS at handshake time. Falls back to 'default' if
@@ -3464,16 +2221,12 @@ export class Gateway {
    * i.e. a local reverse proxy. External connections must use direct TLS.
    */
   private isHttps(req: IncomingMessage): boolean {
-    if ((req.socket as any).encrypted === true) return true
-    const remoteAddr = req.socket.remoteAddress ?? ''
-    // Trust X-Forwarded-Proto only from loopback (127.x.x.x, ::1, IPv4-mapped ::ffff:127.x.x.x)
-    const isLoopback = remoteAddr === '::1' || remoteAddr.startsWith('127.') || remoteAddr.startsWith('::ffff:127.')
-    return isLoopback && req.headers['x-forwarded-proto'] === 'https'
+    return isHttpsImpl.call(this as unknown as GatewayHttpHost, req)
   }
 
   /** Session token lifetime — used for JWT issuance and legacy-mode cookie cap.
    *  Kept in one place so JWT TTL and cookie Max-Age can't drift. */
-  private static readonly JWT_TTL_SECONDS = 30 * 86400 // 30 days
+  private static readonly JWT_TTL_SECONDS = JWT_TTL_SECONDS // 30 days
 
   /** Set HttpOnly session cookie on response — stores the verified auth token so
    *  <img src="/api/file/...">, <audio>, <video> can access protected media on
@@ -3493,44 +2246,7 @@ export class Gateway {
    *
    *  Returns true if a cookie was set; false if the caller should 401. */
   private setSessionCookie(res: ServerResponse, req: IncomingMessage): boolean {
-    const t = this.extractToken(req)
-    const secure = this.isHttps(req) ? '; Secure' : ''
-
-    const jwt = verifyJwt(t, this.deps.config.gateway.accessToken)
-    if (jwt && typeof jwt.exp === 'number') {
-      // Clamp remaining seconds to [60, JWT_TTL_SECONDS]. Max-Age=0 semantically
-      // means "delete cookie"; a positive floor keeps the cookie alive long
-      // enough for the client to renew or get a clean 401 on the next request.
-      const remaining = jwt.exp - Math.floor(Date.now() / 1000)
-      const maxAge = Math.max(60, Math.min(remaining, Gateway.JWT_TTL_SECONDS))
-      res.setHeader(
-        'Set-Cookie',
-        `oc_session=${t}; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=${maxAge}`,
-      )
-      return true
-    }
-    if (checkToken(t, this.deps.config.gateway.accessToken)) {
-      // Legacy raw-token auth. `t` is constant-time equal to the configured
-      // accessToken (which came from trusted config), so it's safe to echo
-      // into Set-Cookie without further sanitization.
-      res.setHeader(
-        'Set-Cookie',
-        `oc_session=${t}; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=${Gateway.JWT_TTL_SECONDS}`,
-      )
-      return true
-    }
-    // V3 commercial JWT — same Max-Age clamping logic as personal-version JWT.
-    const cm = this.verifyCommercialJwt(t)
-    if (cm) {
-      const remaining = cm.exp - Math.floor(Date.now() / 1000)
-      const maxAge = Math.max(60, Math.min(remaining, Gateway.JWT_TTL_SECONDS))
-      res.setHeader(
-        'Set-Cookie',
-        `oc_session=${t}; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=${maxAge}`,
-      )
-      return true
-    }
-    return false
+    return setSessionCookieImpl.call(this as unknown as GatewayHttpHost, res, req)
   }
 
   private sendJson(res: ServerResponse, code: number, body: unknown): void {
@@ -4346,68 +3062,7 @@ export class Gateway {
   }
 
   private _ensureEngineNotifier(): DefaultEngineNotifier | undefined {
-    if (!isDelegateNotifierEffective()) return undefined
-    if (this._engineNotifier) return this._engineNotifier
-    this._engineNotifier = new DefaultEngineNotifier({
-      inlinePush: {
-        write: async (event) => {
-          const session = this.sessions?.getByKey?.(event.parentSessionKey) as InlinePushSession | undefined
-          return writeInlinePushForSession(
-            session,
-            event,
-            formatJobTerminalMarkdown(event),
-            process.env,
-            {
-              isCutoverWindowActive: () => this._delegateJobs?.hasActiveCutoverWindow() === true,
-            },
-          )
-        },
-      },
-      parentTapeIngestState: async (notifyId, event): Promise<ParentTapeIngestState> =>
-        resolveParentTapeIngestState({
-          notifyId,
-          parentSessionKey: event.parentSessionKey,
-          clientMessageId: delegateCallbackMessageId(event.jobId, event.callbackEpoch),
-          callbackOriginUserId: event.callbackOriginUserId,
-          liveSessionUserId: this.sessions?.getByKey?.(event.parentSessionKey)?.userId,
-          envUserId: process.env.OC_USER_ID,
-          loadSession: (peerId, userId) => getClientSession(peerId, userId),
-        }),
-      resumeInject: {
-        inject: async (event) => {
-          const result =
-            event.callback === 'cron-origin-inject'
-              ? await this.injectCronOriginFromTerminal(event)
-              : await this.injectSendToAgentCallback({
-                  parentSessionKey: event.parentSessionKey,
-                  jobId: event.jobId,
-                  agentId: event.agentId || 'unknown',
-                  goal: event.goal || '',
-                  ...injectPayloadFromJobTerminal(event),
-                  userId: event.callbackOriginUserId,
-                  clientMessageId: delegateCallbackMessageId(event.jobId, event.callbackEpoch),
-                  once: true,
-                })
-          if (result.kind === 'injected') return { ok: true }
-          if (result.kind === 'retryable_failure' && result.code === 'ORIGIN_SESSION_BUSY') {
-            return { ok: false, failureClass: 'internal' as const, busy: true }
-          }
-          if (result.kind === 'fallback') {
-            return { ok: false, failureClass: 'transport' as const, gone: true }
-          }
-          return { ok: false, failureClass: 'transport' as const }
-        },
-      },
-      onSample: (sample) => {
-        delegateNotifyTotal.inc({
-          lane: sample.lane,
-          ok: sample.ok ? '1' : '0',
-          degraded: sample.degraded ? '1' : '0',
-        })
-        delegateNotifyLatencyMs.observe(sample.latencyMs, { lane: sample.lane })
-      },
-    })
-    return this._engineNotifier
+    return _ensureEngineNotifierImpl.call(this as unknown as GatewayLifecycleHost)
   }
 
   private _dispatchDelegateNotify(job: DelegateJobSnapshot): Promise<void> {
@@ -4447,28 +3102,7 @@ export class Gateway {
   }
 
   private _armNotifyRetryScheduler(): void {
-    if (this._notifyRetryTimer) {
-      clearTimeout(this._notifyRetryTimer)
-      this._notifyRetryTimer = undefined
-    }
-    if (!this._delegateJobs) return
-    const notifierOn = isDelegateNotifierEffective()
-    if (!notifierOn && !isDelegateDurableEffective()) return
-    const delay = notifierOn
-      ? delayUntilNextNotifyRetry(this._delegateJobs)
-      : delayUntilNextNotifyRetry(this._delegateJobs, Date.now(), {
-          callbacks: ['cron-origin-inject'],
-          skipLegacyCron: true,
-        })
-    if (delay == null) return
-    this._notifyRetryTimer = setTimeout(() => {
-      this._notifyRetryTimer = undefined
-      const work = notifierOn
-        ? this._retryDelegateNotifies({ dueOnly: true })
-        : this._drainFlagOffCronOriginNotifies({ dueOnly: true })
-      void work.finally(() => this._armNotifyRetryScheduler())
-    }, delay)
-    this._notifyRetryTimer.unref()
+    _armNotifyRetrySchedulerImpl.call(this as unknown as GatewayLifecycleHost)
   }
 
   private readonly _activeSendToAgentCallbacks = new Map<string, {
@@ -5039,23 +3673,8 @@ export class Gateway {
   }
 
   /** Check schedule-triggered tasks and fire if cron matches */
-  private async _tickScheduledTasks(): Promise<void> {
-    const tasks = await this._taskStore.list()
-    const now = new Date()
-    for (const t of tasks) {
-      if (t.trigger !== 'schedule' || !t.schedule || t.status === 'disabled') continue
-      // Simple minute-level dedup: skip if ran in this minute
-      const minuteKey = Math.floor(now.getTime() / 60_000)
-      if (t.lastRunAt && Math.floor(t.lastRunAt / 60_000) === minuteKey) continue
-      // Import cronMatches from cron.ts is complex — use a simple check
-      // Delegate to CronScheduler's cronMatches by re-importing
-      try {
-        const { cronMatches } = await import('./cron.js')
-        if (cronMatches(t.schedule, now)) {
-          this._triggerTask(t.id).catch(() => {})
-        }
-      } catch {}
-    }
+  private _tickScheduledTasks(): Promise<void> {
+    return _tickScheduledTasksImpl.call(this as unknown as GatewayLifecycleHost)
   }
 
   /** Trigger a task by ID (shared by schedule tick, webhook, and manual API) */
@@ -5296,81 +3915,12 @@ export class Gateway {
     }
   }
 
-  private async _refreshToken(
-    providerKey: string,
-    oauth: { refreshToken: string; scope: string; expiresAt: number },
-  ): Promise<void> {
-    const prov = this.OAUTH_PROVIDERS[providerKey]
-    if (!prov || !prov.tokenUrl) {
-      this.log.warn('oauth skipping refresh', {
-        provider: providerKey,
-        reason: !prov ? 'unknown provider' : 'no tokenUrl configured',
-      })
-      return
-    }
-
-    try {
-      const tokenRes = await fetch(prov.tokenUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(providerKey === 'claude' ? { 'User-Agent': CLAUDE_OAUTH_USER_AGENT } : {}),
-        },
-        // 出站硬超时:refresh 挂起会卡住定时续期链路(与 commercial refresh.ts 同款收口)。
-        signal: AbortSignal.timeout(30_000),
-        body: JSON.stringify({
-          grant_type: 'refresh_token',
-          client_id: prov.clientId,
-          refresh_token: oauth.refreshToken,
-          ...(providerKey === 'claude' ? { scope: prov.scopes } : {}),
-        }),
-      })
-
-      if (!tokenRes.ok) {
-        this.log.error('oauth refresh failed', { provider: providerKey, status: tokenRes.status })
-        return
-      }
-
-      const tokens = (await tokenRes.json()) as any
-      const config = await readConfig()
-      if (config) {
-        const refreshed = {
-          accessToken: tokens.access_token,
-          refreshToken: tokens.refresh_token ?? oauth.refreshToken,
-          expiresAt: Date.now() + (tokens.expires_in ?? 3600) * 1000,
-          scope: tokens.scope ?? oauth.scope,
-        }
-        if (providerKey === 'claude') config.auth.claudeOAuth = refreshed
-        else (config.auth as any)[`${providerKey}OAuth`] = refreshed
-        await writeConfig(config)
-        this.deps.config = config
-        this.sessions.updateConfig(config)
-        this.log.info('oauth token refreshed', {
-          provider: providerKey,
-          expiresInSec: tokens.expires_in,
-        })
-      }
-    } catch (err) {
-      this.log.error('oauth refresh error', { provider: providerKey }, err)
-    }
+  private _refreshToken(providerKey: string, oauth: { refreshToken: string; scope: string; expiresAt: number }): Promise<void> {
+    return _refreshTokenImpl.call(this as unknown as GatewayHttpHost, providerKey, oauth)
   }
 
   private readBody(req: IncomingMessage, maxBytes = 10 * 1024 * 1024): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const chunks: Buffer[] = []
-      let size = 0
-      req.on('data', (c: Buffer) => {
-        size += c.length
-        if (size > maxBytes) {
-          req.destroy()
-          reject(new Error('body too large'))
-          return
-        }
-        chunks.push(c)
-      })
-      req.on('end', () => resolve(Buffer.concat(chunks).toString()))
-      req.on('error', reject)
-    })
+    return readBodyImpl.call(this as unknown as GatewayHttpHost, req, maxBytes)
   }
 
   private wsClients = new Set<WebSocket>()
@@ -5423,35 +3973,8 @@ export class Gateway {
    * dispatch、master 三态查询、synthetic crashed tape staging(走同一 retry queue,
    * 确定性 payload 来自 inbox 持久化字段)。
    */
-  private async _recoverTurnDispatchInbox(
-    queue: import('./v3MasterRetryQueue.js').V3MasterRetryQueue,
-  ): Promise<void> {
-    await recoverTurnDispatchInboxOnBoot({
-      retryQueueHasDispatch: (dispatchId, attemptNo) =>
-        queue.hasEntryForDispatch(dispatchId, attemptNo),
-      queryMasterTapeState: (dispatchId, attemptNo) => queryMasterTapeState(dispatchId, attemptNo),
-      // 活执行行一律跳过(§B4 周期 sweep 防误杀在飞 turn);boot 首跑注册表恒空,语义不变。
-      isDispatchLive: (dispatchId, attemptNo) => isTurnDispatchLive(dispatchId, attemptNo),
-      stageSyntheticCrashedTape: async (row) => {
-        const payload = buildSyntheticCrashedTapePayload(row)
-        // stageDurable 只需 wire payload;tape 分片在 drain 时由 attemptSend 现算。
-        // createdAt 用 inbox 持久化值 → 确定性(多次恢复同 tapeId/hash)。
-        await queue.stageDurable({
-          schemaVersion: 1,
-          payload: { ...payload },
-          firstSeenAt: row.createdAt,
-          attempts: 0,
-        })
-        // stage 成功后立即 kick,让 crashed tape 尽快送达 master。
-        queue.kick()
-      },
-      onManualReconcile: (row, reason) => {
-        this.log.error('turn dispatch boot recovery: manual reconcile required', {
-          dispatchId: row.dispatchId,
-          reason,
-        })
-      },
-    })
+  private _recoverTurnDispatchInbox(queue: import('./v3MasterRetryQueue.js').V3MasterRetryQueue): Promise<void> {
+    return _recoverTurnDispatchInboxImpl.call(this as unknown as GatewayLifecycleHost, queue)
   }
 
   /**
@@ -5461,17 +3984,8 @@ export class Gateway {
    * 成功跑完一轮 → 置 `_durableTurnDispatchReady`(B5:即便 boot 首跑曾失败,某轮周期成功即自愈)。
    * 检查+置位同步发生(await 前),JS 单线程下并发调用第二个必早退,无竞态。
    */
-  private async _runTurnDispatchRecoverySweep(
-    queue: import('./v3MasterRetryQueue.js').V3MasterRetryQueue,
-  ): Promise<void> {
-    if (this._turnDispatchRecoveryInFlight) return
-    this._turnDispatchRecoveryInFlight = true
-    try {
-      await this._recoverTurnDispatchInbox(queue)
-      this._durableTurnDispatchReady = true
-    } finally {
-      this._turnDispatchRecoveryInFlight = false
-    }
+  private _runTurnDispatchRecoverySweep(queue: import('./v3MasterRetryQueue.js').V3MasterRetryQueue): Promise<void> {
+    return _runTurnDispatchRecoverySweepImpl.call(this as unknown as GatewayLifecycleHost, queue)
   }
 
   /**
@@ -5481,29 +3995,8 @@ export class Gateway {
    * 未终局行需要周期重试才能最终收敛(I1 永不静默)。每 60s 一轮:先看是否存在 open 行
    * (无 → 跳过,不空扫),再走单飞 sweep。timer unref 不挡进程退出;shutdown 里清。
    */
-  private _startTurnDispatchRecoveryLoop(
-    queue: import('./v3MasterRetryQueue.js').V3MasterRetryQueue,
-  ): void {
-    if (this._turnDispatchRecoveryTimer) return
-    // e2e 用 OC_TURN_DISPATCH_SWEEP_MS 压缩 tick 周期复现"sweep 撞在飞 turn"场景;
-    // 生产不设 → 60s。clamp 防误配(过小空转,过大失去收敛时效)。
-    const envMs = Number(process.env.OC_TURN_DISPATCH_SWEEP_MS)
-    const RETRY_MS = Number.isFinite(envMs) && envMs > 0
-      ? Math.min(Math.max(envMs, 1_000), 600_000)
-      : 60_000
-    this._turnDispatchRecoveryTimer = setInterval(() => {
-      void (async () => {
-        try {
-          if (this._turnDispatchRecoveryInFlight) return
-          const stats = await turnDispatchInboxStats()
-          if (stats.openJobs === 0) return
-          await this._runTurnDispatchRecoverySweep(queue)
-        } catch (err) {
-          this.log.error('turn dispatch periodic recovery sweep failed', undefined, err as Error)
-        }
-      })()
-    }, RETRY_MS)
-    this._turnDispatchRecoveryTimer.unref?.()
+  private _startTurnDispatchRecoveryLoop(queue: import('./v3MasterRetryQueue.js').V3MasterRetryQueue): void {
+    _startTurnDispatchRecoveryLoopImpl.call(this as unknown as GatewayLifecycleHost, queue)
   }
 
   /**
@@ -5593,91 +4086,12 @@ export class Gateway {
    *   - 'rejected':硬拒(sessionId 不合法)
    */
   private _checkRepoBindSession(ws: WebSocket, sessionId: string): 'authorized' | 'queued' {
-    const userId = this.getWsUserId(ws)
-    // grace window:hello 后 5s 内,任何 bind 帧引用其 peerIds 视作 authorized。
-    // 帮 race:bind 在 hello 之后但 message 注册之前到达。
-    const recent = this._recentHelloPeers.get(ws)
-    if (recent && Date.now() - recent.recordedAt <= Gateway.REPO_BIND_HELLO_GRACE_MS) {
-      if (recent.peerIds.has(sessionId)) return 'authorized'
-    }
-    // 直查 clientsByPeer:Codex Phase 4.7 #1 — makePeerKey 是 `userId:channel:peerId`
-    // (3 parts),不是 4 parts。直接构造预期 key 避免格式漂移 bug。
-    // sessionId 已通过 caller 的 SAFE_GIT_REF / SESSION_ID_RE 校验,sanitizePeerId
-    // 后等于自身;仍走 sanitize 与 dispatch 路径(L3459-3460)的 makePeerKey 保持一致。
-    const sanitizedSid = sessionId.replace(/[^a-zA-Z0-9_-]/g, '_')
-    const expectedKey = Gateway.makePeerKey(userId, 'webchat', sanitizedSid)
-    const set = this.clientsByPeer.get(expectedKey)
-    if (set?.has(ws)) return 'authorized'
-    return 'queued'
+    return _checkRepoBindSessionImpl.call(this as unknown as SessionRepoBindingHost, ws, sessionId)
   }
 
   /** Phase 4 — bind 帧处理 */
-  private async _handleSessionRepoBind(
-    ws: WebSocket,
-    frame: SessionRepoBindFrame,
-  ): Promise<void> {
-    // 基础 schema 校验(master bridge 已做严格校验,这里兜底)。
-    // Codex Phase 5 review P1:owner/repo/branch typeof + selectionVersion safe-int 必须显式
-    // 校验,否则 manager 里 regex.test(undefined) 会把 'undefined' 字符串通过,
-    // version 被 NaN/Infinity/小数/负数 污染会进路径和 pending key。
-    const isSafePositiveInt =
-      typeof frame.selectionVersion === 'number' &&
-      Number.isSafeInteger(frame.selectionVersion) &&
-      frame.selectionVersion > 0
-    const isNonEmptyStr = (v: unknown): v is string => typeof v === 'string' && v.length > 0
-    if (
-      !isNonEmptyStr(frame.sessionId) ||
-      !/^[A-Za-z0-9_-]+$/.test(frame.sessionId) ||
-      !isSafePositiveInt ||
-      !isNonEmptyStr(frame.accessToken) ||
-      !isNonEmptyStr(frame.owner) ||
-      !isNonEmptyStr(frame.repo) ||
-      !isNonEmptyStr(frame.branch)
-    ) {
-      this._sendStatusFrame(ws, {
-        type: 'outbound.control.session_repo_status',
-        sessionId: String(frame?.sessionId ?? ''),
-        selectionVersion: isSafePositiveInt ? frame.selectionVersion : 0,
-        status: 'failed',
-        errorCode: 'INVALID_BIND_FRAME',
-        errorMessage: 'bind frame schema invalid',
-      })
-      return
-    }
-    const auth = this._checkRepoBindSession(ws, frame.sessionId)
-    // v1.0.95 诊断 instrument:确认 auth 走了哪条路径(authorized / queued)
-    this.log.info('repo_bind_auth_decision', {
-      sessionId: frame.sessionId,
-      selectionVersion: frame.selectionVersion,
-      auth,
-    })
-    if (auth === 'queued') {
-      // 入 pending 5s 队列
-      const key = `${frame.sessionId}|${frame.selectionVersion}`
-      // 同 key 已在 pending → 覆盖(用最新 frame)
-      const old = this._pendingRepoBinds.get(key)
-      if (old) clearTimeout(old.timer)
-      const timer = setTimeout(() => {
-        this._pendingRepoBinds.delete(key)
-        // v1.0.95 诊断 instrument:5s grace 没等到 hello 注册 → 走 fail 路径
-        this.log.warn('repo_bind_pending_timeout', {
-          sessionId: frame.sessionId,
-          selectionVersion: frame.selectionVersion,
-        })
-        this._sendStatusFrame(ws, {
-          type: 'outbound.control.session_repo_status',
-          sessionId: frame.sessionId,
-          selectionVersion: frame.selectionVersion,
-          status: 'failed',
-          errorCode: 'SESSION_NOT_REGISTERED',
-          errorMessage: 'session not registered with this WS within grace window',
-        })
-      }, Gateway.REPO_BIND_PENDING_TIMEOUT_MS)
-      this._pendingRepoBinds.set(key, { ws, frame, timer })
-      return
-    }
-    // authorized → 立即处理
-    await this._repoWorkspace.bind(frame, this._buildStatusCallback(ws, frame.sessionId))
+  private _handleSessionRepoBind(ws: WebSocket, frame: SessionRepoBindFrame): Promise<void> {
+    return _handleSessionRepoBindImpl.call(this as unknown as SessionRepoBindingHost, ws, frame)
   }
 
   /**
@@ -5716,62 +4130,13 @@ export class Gateway {
    * 没有 selectionVersion 的 unbind 帧:rejected(理论不该发生,前端必带版本号;
    * 没版本的话 workspaceMgr 的 tombstone-too-old 保护就失效)。
    */
-  private async _handleSessionRepoUnbind(
-    ws: WebSocket,
-    frame: { sessionId: string; selectionVersion?: number },
-  ): Promise<void> {
-    if (typeof frame?.sessionId !== 'string' || !/^[A-Za-z0-9_-]+$/.test(frame.sessionId)) return
-    if (
-      typeof frame.selectionVersion !== 'number' ||
-      !Number.isSafeInteger(frame.selectionVersion) ||
-      frame.selectionVersion <= 0
-    ) {
-      this.log.warn('repo_unbind_invalid_version', {
-        sessionId: frame.sessionId,
-        selectionVersion: frame.selectionVersion,
-      })
-      return
-    }
-    // unbind 不要求 ws 注册校验:用户主动清空,任何路径来都允许。
-    // Codex Phase 5 review P0:unbind 返 boolean,只在真删 state 时 recycle。
-    // stale tombstone(workspace 已被新 version 替换)被 manager ignore 时 caller
-    // 必须不 kill runner — 否则旧 v_x runner 被错杀,新 v_y 还在 cloning,下次
-    // spawn 读 ready snapshot 走 v_y workspaceDir 而非 v_x。
-    const deleted = await this._repoWorkspace.unbind(frame.sessionId, frame.selectionVersion)
-    if (!deleted) {
-      this.log.info('repo_unbind_skipped_no_recycle', {
-        sessionId: frame.sessionId,
-        selectionVersion: frame.selectionVersion,
-      })
-      return
-    }
-    await this.sessions.recyclePeerForRepoUnbind(frame.sessionId).catch((err) =>
-      this.log.warn('recycle_for_repo_unbind_failed', {
-        sessionId: frame.sessionId,
-        err: err instanceof Error ? err.message : String(err),
-      }),
-    )
-    // 不发 status 帧 — DELETE 已经在 master DB 写 cleared
+  private _handleSessionRepoUnbind(ws: WebSocket, frame: { sessionId: string; selectionVersion?: number }): Promise<void> {
+    return _handleSessionRepoUnbindImpl.call(this as unknown as SessionRepoBindingHost, ws, frame)
   }
 
   /** Phase 4 — hello 到达后,看 pending 队列里有没有匹配的 bind 可以处理 */
   private _flushPendingRepoBinds(ws: WebSocket, peerIds: Set<string>): void {
-    if (this._pendingRepoBinds.size === 0) return
-    for (const [key, entry] of this._pendingRepoBinds) {
-      if (entry.ws !== ws) continue
-      if (!peerIds.has(entry.frame.sessionId)) continue
-      clearTimeout(entry.timer)
-      this._pendingRepoBinds.delete(key)
-      // async 处理(不阻塞 hello 转发后续)
-      // 用同一个 _buildStatusCallback wrapper:既 forward 给 ws,也触发 recycle。
-      this._repoWorkspace
-        .bind(entry.frame, this._buildStatusCallback(ws, entry.frame.sessionId))
-        .catch((err) =>
-          this.log.warn('flush_pending_bind_failed', {
-            err: err instanceof Error ? err.message : String(err),
-          }),
-        )
-    }
+    _flushPendingRepoBindsImpl.call(this as unknown as SessionRepoBindingHost, ws, peerIds)
   }
 
   /** Phase 4 — send outbound.control.session_repo_status to a single ws,容错 closed/error。 */
@@ -6202,62 +4567,8 @@ export class Gateway {
   }
 
   /** Pre-warm webchat sessions on boot so they respond instantly to the first user message */
-  private async bootAutoResume(): Promise<void> {
-    const resumableKeys = this.sessions.getResumableKeys((k) => k.includes(':webchat:'))
-    if (resumableKeys.length === 0) return
-
-    for (const sessionKey of resumableKeys) {
-      // OCV5-428: yield a macrotask per session. The loop runs right after listen();
-      // without this the readiness probe (/healthz + WS upgrade) waited ~29s on a
-      // 145-session cold start, holding every queued user message.
-      await new Promise<void>((resolve) => setImmediate(resolve))
-      if (this.sessions.getByKey(sessionKey)) continue
-
-      const parts = sessionKey.split(':')
-      const agentId = parts[1]
-      if (isHiddenSystemAgentId(agentId)) {
-        this.log.warn('auto-resume skipped hidden system agent session', { sessionKey })
-        continue
-      }
-      const peerId = parts.slice(4).join(':')
-
-      this.log.info('auto-resume pre-warming', { sessionKey })
-      const cfg = await this._getAgentsConfig()
-      const agent = cfg.agents.find((a) => a.id === agentId) ?? ({ id: agentId } as AgentDef)
-      // 模型权威 §3:预热也不许查 baked 表(engine/model 取投影)。但预热**不是 turn**——
-      // 不执行、不计费 → 不套 codex 真值表(见 decideLocalExecution 的 'prewarm' 语义)。
-      // 投影拉不到 → **跳过本次预热**(best-effort:预热失败不该炸 boot 循环;真正的 turn
-      // 到来时会重新判定)。绝不回落 baked spawn。
-      try {
-        const preExec = await resolveLocalExecutionIfEnforced({
-          agent,
-          kind: 'prewarm',
-          defaultModel: this.deps.config.defaults.model,
-        })
-        await this.sessions.getOrCreate({
-          sessionKey,
-          agent,
-          ...localExecutionOverride(preExec),
-          channel: 'webchat',
-          peerId,
-        })
-      } catch (err) {
-        this.log.warn(
-          'auto-resume pre-warm skipped',
-          { sessionKey, code: localExecutionRejectCode(err) ?? 'unknown' },
-          err as Error,
-        )
-        continue
-      }
-      this.lastActiveChannel.set(agentId, {
-        channel: 'webchat',
-        peerId,
-        sessionKey,
-        userId: 'default',
-        at: Date.now(),
-      })
-      this.log.info('auto-resume pre-warmed', { sessionKey })
-    }
+  private bootAutoResume(): Promise<void> {
+    return bootAutoResumeImpl.call(this as unknown as GatewayLifecycleHost)
   }
 
   /**
@@ -6576,74 +4887,6 @@ export function staticCacheControl(safePath: string, mode: 'vanilla' | 'spa' | u
 // 既有 import 路径(如 security.test.ts `import { shouldServeInline } from '../server.js'`)不变。
 // (原 ACTIVE_CONTENT_TYPES 集合与未被引用的 isActiveContentType 一并移入 protocol。)
 export { shouldServeInline }
-
-/** Known route prefixes for metrics normalization (avoids high-cardinality labels). */
-const KNOWN_ROUTES = [
-  '/api/healthz', '/api/doctor', '/api/usage', '/api/usage/events',
-  '/api/runs', '/api/sessions', '/api/sessions/list', '/api/sessions/search', '/api/sessions/batch',
-  '/api/sessions/read-all',
-  '/api/chat-projects', '/api/project-assets', '/api/config', '/api/features', '/api/agents', '/api/collaboration-config', '/api/search',
-  '/api/cron', '/api/cron/channels', '/api/board', '/api/board/projects', '/api/board/tickets',
-  '/api/board/pipelines', '/api/board/agents', '/api/board/settings',
-  '/api/board/stats/cost', '/api/board/templates', '/api/board/reports/weekly',
-  '/api/delegate/wait', '/api/tasks', '/api/tasks-executions', '/api/webhooks',
-  '/api/wechat/pair/start', '/api/wechat/pair/poll', '/api/wechat/pair/cancel',
-  '/api/wechat/binding', '/api/wechat/binding/status',
-  '/api/auth/session', '/api/auth/logout', '/api/auth/claude/start',
-  '/api/auth/claude/callback', '/api/auth/claude/status',
-  '/api/file', '/healthz', '/metrics',
-]
-
-/** Normalize URL paths for metrics labels (replace dynamic IDs with :id to avoid high cardinality). */
-function normalizePath(p: string): string {
-  // Exact match for known routes
-  if (KNOWN_ROUTES.includes(p)) return p
-  // Dynamic API routes — normalize IDs
-  const normalized = p
-    .replace(/\/api\/sessions\/[a-zA-Z0-9_-]+\/inflight-delegates$/, '/api/sessions/:id/inflight-delegates')
-    .replace(/\/api\/sessions\/[a-zA-Z0-9_-]+\/read$/, '/api/sessions/:id/read')
-    .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/skills\/[a-z0-9-]+/, '/api/agents/:id/skills/:name')
-    .replace(/\/api\/skills\/[a-z0-9-]+/, '/api/skills/:name')
-    .replace(/\/api\/agents\/[a-zA-Z0-9_-]+\/([a-z]+)/, '/api/agents/:id/$1')
-    .replace(/\/api\/agents\/[a-zA-Z0-9_-]+/, '/api/agents/:id')
-    .replace(/\/api\/cron\/[a-zA-Z0-9_-]+/, '/api/cron/:id')
-    .replace(/\/api\/chat-projects\/[a-zA-Z0-9_-]+\/restore/, '/api/chat-projects/:id/restore')
-    .replace(/\/api\/chat-projects\/[a-zA-Z0-9_-]+/, '/api/chat-projects/:id')
-    .replace(/\/api\/project-assets\/[a-zA-Z0-9_-]+\/versions/, '/api/project-assets/:id/versions')
-    .replace(/\/api\/project-assets\/[a-zA-Z0-9_-]+\/restore/, '/api/project-assets/:id/restore')
-    .replace(/\/api\/project-assets\/[a-zA-Z0-9_-]+/, '/api/project-assets/:id')
-    .replace(/\/api\/board\/projects\/[^/]+\/board/, '/api/board/projects/:id/board')
-    .replace(/\/api\/board\/projects\/[^/]+\/context\/preview/, '/api/board/projects/:id/context/preview')
-    .replace(/\/api\/board\/projects\/[^/]+\/ensure/, '/api/board/projects/:id/ensure')
-    .replace(/\/api\/board\/projects\/[^/]+\/workspace\/file/, '/api/board/projects/:id/workspace/file')
-    .replace(/\/api\/board\/projects\/[^/]+\/workspace$/, '/api/board/projects/:id/workspace')
-    .replace(/\/api\/board\/projects\/[^/]+\/context/, '/api/board/projects/:id/context')
-    .replace(
-      /\/api\/board\/projects\/[^/]+\/memories\/[^/]+\/[a-z]+/,
-      '/api/board/projects/:id/memories/:file/:action',
-    )
-    .replace(/\/api\/board\/projects\/[^/]+\/memories/, '/api/board/projects/:id/memories')
-    .replace(/\/api\/board\/projects\/[^/]+/, '/api/board/projects/:id')
-    .replace(/\/api\/board\/tickets\/[^/]+\/[a-z_]+/, '/api/board/tickets/:id/:action')
-    .replace(/\/api\/board\/tickets\/[^/]+/, '/api/board/tickets/:id')
-    .replace(/\/api\/board\/pipelines\/[^/]+\/reorder/, '/api/board/pipelines/:id/reorder')
-    .replace(/\/api\/board\/pipelines\/[^/]+\/stages/, '/api/board/pipelines/:id/stages')
-    .replace(/\/api\/board\/pipelines\/[^/]+/, '/api/board/pipelines/:id')
-    .replace(/\/api\/board\/stages\/[^/]+/, '/api/board/stages/:id')
-    .replace(/\/api\/board\/runs\/[^/]+\/context/, '/api/board/runs/:id/context')
-    .replace(/\/api\/board\/runs\/[^/]+/, '/api/board/runs/:id')
-    .replace(/\/api\/board\/relations\/[^/]+/, '/api/board/relations/:id')
-    .replace(/\/api\/board\/templates\/[^/]+\/apply/, '/api/board/templates/:id/apply')
-    .replace(/\/api\/board\/templates\/[^/]+/, '/api/board/templates/:id')
-    .replace(/\/api\/tasks\/[a-zA-Z0-9_-]+/, '/api/tasks/:id')
-    .replace(/\/api\/webhooks\/[a-zA-Z0-9_-]+/, '/api/webhooks/:id')
-    .replace(/\/api\/media\/.+/, '/api/media/:file')
-  if (normalized !== p) return normalized
-  // OpenAI compat
-  if (p.startsWith('/v1/')) return '/v1/:endpoint'
-  // Static files and unknown paths — collapse to prevent cardinality explosion
-  return '/__other__'
-}
 
 // 便捷工厂
 export async function createGateway(opts?: { webRoot?: string }): Promise<Gateway> {

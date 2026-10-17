@@ -11,7 +11,8 @@ import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const serverSrc = readFileSync(join(here, '../server.ts'), 'utf8')
+// OCV5-493: KNOWN_ROUTES / normalizePath moved with the HTTP entry to gatewayHttp.ts; read the source set.
+const serverSrc = readGatewaySource()
 // FINDINGS §7.5 2b: the /api/cron* dispatch lives in the WORKSPACE_API_ROUTES table.
 const routeSrc = readFileSync(join(here, '../routes/workspaceApi.ts'), 'utf8')
 const allowlistSrc = readFileSync(join(here, '../bridgeApiAllowlist.ts'), 'utf8')

@@ -42,6 +42,9 @@ const gatewaySource = [
   'turnFrames.ts',
   'askUserSanitize.ts',
   'gatewayTypes.ts',
+  'gatewayLifecycle.ts',
+  'gatewayHttp.ts',
+  'sessionRepoBinding.ts',
 ]
   .map((f) => readFileSync(join(root, 'packages/gateway/src', f), 'utf8'))
   .join('\n')
