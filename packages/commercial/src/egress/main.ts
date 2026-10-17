@@ -491,7 +491,8 @@ export async function startEgress(): Promise<void> {
     journal: boxStopJournal,
     coordinator: boxStopCoordinator });
   const boxIdleProofHandler = makeBoxIdleProofHandler({ identity: identityStrategy,
-    journal: boxStopJournal, readCapsule: boxReplayReader });
+    journal: boxStopJournal, readCapsule: boxReplayReader,
+    stopParked: { journal: boxStopJournal, coordinator: boxStopCoordinator } });
   // Which Box login an interactive session (box-claude-*) launches under, and what its turns
   // reported: the admin's selection plus the login health this process shares with the Box
   // model route. Independent of OC_BOX_MODEL_API: interactive sessions exist without that route.

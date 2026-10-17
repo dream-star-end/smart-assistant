@@ -38,12 +38,16 @@ import { BOX_MCP_TOOL_NAME, boxCatalogMatching } from "./boxToolCatalog.js";
 import { normalizeBoxResultImagesForCli } from "./boxToolResultImages.js";
 import { BOX_EXPIRED_UNPROVEN_STATE, BOX_OPERATOR_UNREACHABLE_CLOSED_STATE,
   isBoxExpiredCloseCause, isBoxUnknownPhase, parseBoxExpiredClose,
-  parseBoxOperatorUnreachableClose } from "./boxExpiredClose.js";
+  parseBoxOperatorUnreachableClose, BOX_ABSENCE_CONFIRM_MS, BOX_PROCESS_ABSENT_CAUSE,
+  isBoxBootId, parseBoxRunAbsent, type BoxRunAbsent } from "./boxExpiredClose.js";
 
 const journalLog = rootLogger.child({ subsys: "box-journal" });
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming", "linked"];
 /** OCV5-322: past this age (from its first active row) a run cannot be alive. */
 export const BOX_RUN_EXPIRED_AFTER_MS = BOX_TOOL_MAX_WALL_MS + 15 * 60 * 1000;
+/** OCV5-488: a run younger than this may not have started its keeper yet;
+ * finding nothing of it on the Box is no evidence. */
+const BOX_ABSENCE_LAUNCH_GRACE_SEC = 180;
 
 export class BoxDurableJournalError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxDurableJournalError"; }
@@ -2568,10 +2572,16 @@ export class BoxDurableJournal implements BoxJournalPort {
    * OCV5-312 operator close left in operator_unreachable_closed. */
   async markRunExpiredUnproven(input: Pick<BoxJournalAdmission,
     "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> & {
-    cause: string; operatorClosed?: true; apply?: boolean }): Promise<BoxExpiredCloseResult> {
+    cause: string; operatorClosed?: true; apply?: boolean;
+    /** OCV5-488: instead of the age, the leaf's boxRunAbsent first look plus
+     * this second one (same boot id at least BOX_ABSENCE_CONFIRM_MS later, or
+     * another boot id) found nothing of the run on the Box. */
+    absence?: { boot: string } }): Promise<BoxExpiredCloseResult> {
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
       || input.accountId <= 0n || !/^[a-f0-9]{24}$/.test(input.runNonce)
-      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch) || !isBoxExpiredCloseCause(input.cause)) {
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch) || !isBoxExpiredCloseCause(input.cause)
+      || (input.absence !== undefined && (input.cause !== BOX_PROCESS_ABSENT_CAUSE
+        || !isBoxBootId(input.absence.boot) || input.operatorClosed === true))) {
       throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_IDENTITY_INVALID");
     }
     const uid = input.uid.toString(), accountId = input.accountId.toString();
@@ -2585,7 +2595,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       await client.query("BEGIN");
       const lockedSessionId = await lockChainSession(client, input.uid, input.requestId);
       type Row = { request_id: string; state: string; final_credits: string | null;
-        failure_code: string | null; expired: boolean; ctx: Record<string, unknown> };
+        failure_code: string | null; expired: boolean; launched: boolean; now_ms: string;
+        ctx: Record<string, unknown> };
       const rows: Row[] = [];
       const seen = new Set<string>();
       let cursor: string | null = input.requestId;
@@ -2594,9 +2605,12 @@ export class BoxDurableJournal implements BoxJournalPort {
         seen.add(cursor);
         const found: { rows: Row[]; rowCount: number | null } = await client.query<Row>(
           `SELECT request_id,state,final_credits::text AS final_credits,failure_code,ctx,
-              created_at <= NOW() - make_interval(secs => $3::double precision) AS expired
+              created_at <= NOW() - make_interval(secs => $3::double precision) AS expired,
+              created_at <= NOW() - make_interval(secs => $4::double precision) AS launched,
+              (EXTRACT(EPOCH FROM NOW())*1000)::bigint::text AS now_ms
              FROM request_finalize_journal
-            WHERE request_id=$1 AND user_id=$2 FOR UPDATE`, [cursor, uid, expirySec]);
+            WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+          [cursor, uid, expirySec, BOX_ABSENCE_LAUNCH_GRACE_SEC]);
         const row = found.rows[0];
         if (found.rowCount !== 1 || !row?.ctx || row.ctx.boxInvocationRecovery !== "v1"
           || !stoppedRunMode(row.ctx) || row.ctx.boxRunNonce !== input.runNonce
@@ -2684,7 +2698,18 @@ export class BoxDurableJournal implements BoxJournalPort {
         || basis.boxInvocationMode !== "detached_tool"
         || typeof basis.boxHandoffRevision !== "string"
         || !UUID_V4.test(basis.boxHandoffRevision)))) invalid();
-      if (!leaf.expired) throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_RUN_NOT_EXPIRED");
+      if (input.absence) {
+        const seen = parseBoxRunAbsent(basis.boxRunAbsent);
+        if (!leaf.launched || !seen || (seen.boot === input.absence.boot
+          && Number(leaf.now_ms) - seen.atMs < BOX_ABSENCE_CONFIRM_MS)) {
+          throw new BoxDurableJournalError("BOX_ABSENT_CLOSE_NOT_CONFIRMED");
+        }
+        // Calls the run completed before it vanished are settled first: the
+        // Box billing scan does not read expired rows. Nothing here bills.
+        if (rows.some((row) => row.ctx.boxToolHandoff !== undefined && row.state !== "committed")) {
+          throw new BoxDurableJournalError("BOX_ABSENT_CLOSE_BILLING_UNSETTLED");
+        }
+      } else if (!leaf.expired) throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_RUN_NOT_EXPIRED");
       if (!handoff) {
         const usage = await client.query(
           `SELECT 1 FROM usage_records WHERE request_id=$1 AND user_id=$2 LIMIT 1`,
@@ -2692,7 +2717,8 @@ export class BoxDurableJournal implements BoxJournalPort {
         if (usage.rowCount) throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_USAGE_CONFLICT");
       }
       const params = [leaf.request_id, uid, input.leaseEpoch, input.runNonce, actual,
-        BOX_EXPIRED_UNPROVEN_STATE, prior, input.cause, expirySec];
+        BOX_EXPIRED_UNPROVEN_STATE, prior, input.cause,
+        input.absence ? BOX_ABSENCE_LAUNCH_GRACE_SEC : expirySec];
       const marker = `ctx || jsonb_build_object('boxState',$6::text,
               'boxExpiredClose',jsonb_build_object('v',1,
                 'atMs',(EXTRACT(EPOCH FROM NOW())*1000)::bigint,
@@ -2700,7 +2726,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       const fence = `request_id=$1 AND user_id=$2
             AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxState'=$5
             AND NOT (ctx ? 'boxTerminalProof') AND NOT (ctx ? 'boxResumeRequestId')
-            AND NOT (ctx ? 'settlementClaimId') AND NOT (ctx ? 'boxExpiredClose')
+            AND NOT (ctx ? 'settlementClaimId') AND NOT (ctx ? 'boxExpiredClose')${
+              input.absence ? "\n            AND ctx ? 'boxRunAbsent'" : ""}
             AND created_at <= NOW() - make_interval(secs => $9::double precision)`;
       const changed = handoff ? await client.query(
         `UPDATE request_finalize_journal SET ctx=${marker}
@@ -2830,6 +2857,48 @@ export class BoxDurableJournal implements BoxJournalPort {
       [input.requestId, input.uid.toString(), input.accountId.toString(),
         input.runNonce, input.leaseEpoch, input.phase]);
     return changed.rowCount === 1;
+  }
+
+  /** OCV5-488: the first look that found nothing of the run on the Box
+   * (boxRunLiveness `absent`). Keeps an existing look and returns it; the
+   * caller closes only on a confirming second look. Never changes billing
+   * age. */
+  async recordRunAbsence(input: BoxStoppedFailureProbeCandidate & { boot: string }):
+    Promise<BoxRunAbsent | null> {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
+      || input.accountId <= 0n || !/^[a-f0-9]{24}$/.test(input.runNonce)
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch) || !isBoxBootId(input.boot)) {
+      throw new BoxDurableJournalError("BOX_RUN_ABSENT_IDENTITY_INVALID");
+    }
+    const changed = await this.pool.query<{ seen: unknown }>(
+      `WITH prior AS (
+         SELECT ctx->'boxRunAbsent' AS seen FROM request_finalize_journal
+          WHERE request_id=$1 AND user_id=$2 FOR UPDATE)
+       UPDATE request_finalize_journal
+          SET ctx=CASE WHEN ctx ? 'boxRunAbsent' THEN ctx
+            ELSE ctx || jsonb_build_object('boxRunAbsent',jsonb_build_object('v',1,
+              'atMs',(EXTRACT(EPOCH FROM NOW())*1000)::bigint,'boot',$6::text)) END
+         FROM prior
+        WHERE request_id=$1 AND user_id=$2 AND ${STOP_PROBE_STATE_FENCE}
+          AND ctx->>'boxInvocationRecovery'='v1'
+          AND ctx->>'boxAccountId'=$3 AND ctx->>'boxRunNonce'=$4
+          AND ctx->>'boxLeaseEpoch'=$5
+          AND NOT (ctx ? 'boxResumeRequestId') AND NOT (ctx ? 'boxTerminalProof')
+        RETURNING prior.seen`,
+      [input.requestId, input.uid.toString(), input.accountId.toString(),
+        input.runNonce, input.leaseEpoch, input.boot]);
+    if (changed.rowCount !== 1) throw new BoxDurableJournalError("BOX_RUN_ABSENT_FENCE_LOST");
+    return parseBoxRunAbsent(changed.rows[0]?.seen);
+  }
+
+  /** OCV5-488: a later look found the run alive again; the next absence
+   * starts over. */
+  async clearRunAbsence(input: BoxStoppedFailureProbeCandidate): Promise<void> {
+    await this.pool.query(
+      `UPDATE request_finalize_journal SET ctx=ctx - 'boxRunAbsent'
+        WHERE request_id=$1 AND user_id=$2 AND ctx ? 'boxRunAbsent'
+          AND ctx->>'boxRunNonce'=$3 AND ctx->>'boxLeaseEpoch'=$4`,
+      [input.requestId, input.uid.toString(), input.runNonce, input.leaseEpoch]);
   }
 
   /** Cross-worker CAS with a durable retry clock; never changes billing age. */
@@ -3105,6 +3174,46 @@ export class BoxDurableJournal implements BoxJournalPort {
       || !/^[a-f0-9]{32}$/.test(ctx.boxLeaseEpoch)) {
       throw new BoxDurableJournalError("BOX_CANCEL_RUN_UNKNOWN");
     }
+    return { requestId: row.request_id, uid: input.uid,
+      accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce,
+      leaseEpoch: ctx.boxLeaseEpoch };
+  }
+
+  /** OCV5-488: the container reads a turn's idle proof only after that turn
+   * ended on its side (under the session lock, before the next submit). A
+   * leaf of that turn still parked on a tool handoff can then never be
+   * answered; it is the run to stop. Same container-scoped identity as
+   * findCancelableRun; null when the turn has no such leaf. */
+  async findParkedHandoffRun(input: { uid: bigint; containerId: bigint;
+    sessionId: string; turnKey: string }): Promise<Pick<BoxJournalAdmission,
+      "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> | null> {
+    if (input.uid <= 0n || input.containerId <= 0n
+      || !/^[A-Za-z0-9._:-]{1,256}$/.test(input.sessionId)
+      || !/^[a-f0-9]{64}$/.test(input.turnKey)) {
+      throw new BoxDurableJournalError("BOX_CANCEL_IDENTITY_INVALID");
+    }
+    const found = await this.pool.query<{ request_id: string; ctx: Record<string, unknown> }>(
+      `SELECT request_id,ctx FROM request_finalize_journal
+        WHERE user_id=$1 AND container_id=$2
+          AND ctx->>'boxSessionId'=$3 AND ctx->>'boxTurnKey'=$4
+          AND ctx->>'model' IN (${BOX_MODEL_IDS_SQL})
+          AND ctx->>'boxInvocationRecovery'='v1'
+          AND ${STOP_MODE_FENCE}
+          AND ${STOP_PROBE_STATE_FENCE}
+          AND ctx->>'boxState'='handoff' AND ctx ? 'boxToolHandoff'
+          AND NOT (ctx ? 'boxResumeRequestId')
+          AND NOT (ctx ? 'boxTerminalProof')`,
+      [input.uid.toString(), input.containerId.toString(),
+        input.sessionId, input.turnKey]);
+    const row = found.rows[0], ctx = row?.ctx;
+    if (found.rowCount !== 1 || !row || !ctx
+      || !/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)
+      || typeof ctx.boxAccountId !== "string"
+      || !/^[1-9][0-9]{0,19}$/.test(ctx.boxAccountId)
+      || typeof ctx.boxRunNonce !== "string"
+      || !/^[a-f0-9]{24}$/.test(ctx.boxRunNonce)
+      || typeof ctx.boxLeaseEpoch !== "string"
+      || !/^[a-f0-9]{32}$/.test(ctx.boxLeaseEpoch)) return null;
     return { requestId: row.request_id, uid: input.uid,
       accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce,
       leaseEpoch: ctx.boxLeaseEpoch };

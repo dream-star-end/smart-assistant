@@ -3,10 +3,11 @@
  * tool publication or paid retry exists in this worker. */
 import { BOX_API_RESOLVE_MODEL } from "./boxApiResolveModel.js";
 import type { BoxAccountResolver } from "./boxAccountResolver.js";
-import type { BoxDurableJournal, BoxRemoteCleanupCandidate, BoxStaleResumePhase,
-  BoxStoppedFailureProbeCandidate } from "./boxDurableJournal.js";
-import { isBoxExpiredCloseCause } from "./boxExpiredClose.js";
+import { BoxDurableJournalError, type BoxDurableJournal, type BoxRemoteCleanupCandidate,
+  type BoxStaleResumePhase, type BoxStoppedFailureProbeCandidate } from "./boxDurableJournal.js";
+import { BOX_PROCESS_ABSENT_CAUSE, isBoxExpiredCloseCause } from "./boxExpiredClose.js";
 import { makeBoxKeeperStop } from "./boxKeeperStop.js";
+import { makeBoxRunLiveness, parseBoxRunLiveness, type BoxRunLiveness } from "./boxRunLiveness.js";
 import { makeBoxRunCleanup } from "./boxRunCleanup.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { readBoxStagedToolCatalog } from "./boxStagedCatalogRead.js";
@@ -60,7 +61,8 @@ type Journal = Pick<BoxDurableJournal, "listRemoteCleanupCandidates" |
     "listStoppedFailureProbeCandidates" | "claimStoppedFailureProbe" |
     "markFirstRoundStoppedFailure" | "markToolChainStoppedFailure" |
     "readDetachedUnknownRecovery" | "complete" | "completeToolChain" |
-    "readRecoveryWinner" | "recordStaleResumeStop" | "markRunExpiredUnproven">>;
+    "readRecoveryWinner" | "recordStaleResumeStop" | "markRunExpiredUnproven" |
+    "recordRunAbsence" | "clearRunAbsence">>;
 type Resolver = Pick<BoxAccountResolver, "resolve"> &
   Partial<Pick<BoxAccountResolver, "retryFailedAgentCleanup">>;
 
@@ -73,7 +75,10 @@ export class BoxRemoteCleanupWorker {
     staleResumeProofWaitMs?: number;
     /** Test seam for the worker_complete recovery below. */
     recoverProvedSuccess?: (candidate: BoxStoppedFailureProbeCandidate,
-      target: BoxResolvedTarget) => Promise<ProvedSuccess> }) {}
+      target: BoxResolvedTarget) => Promise<ProvedSuccess>;
+    /** OCV5-488: told after a run whose processes were gone was closed. */
+    onProcessAbsentClosed?: (closed: { requestId: string; accountId: bigint;
+      shape: string; rebooted: boolean }) => void }) {}
 
   private async resolvePinned(candidate: Pick<BoxRemoteCleanupCandidate,
     "uid" | "requestId" | "accountId">): Promise<BoxResolvedTarget> {
@@ -152,7 +157,8 @@ export class BoxRemoteCleanupWorker {
           }
         } catch (error) {
           // The proof files are gone and no keeper answered the stop.
-          if (!await this.closeExpired(candidate, error)) throw error;
+          if (!await this.closeExpired(candidate, error)
+            && !await this.closeAbsent(candidate, target)) throw error;
           recovered++;
           continue;
         }
@@ -207,6 +213,61 @@ export class BoxRemoteCleanupWorker {
     workerLog.warn("box_run_expired_unproven", { requestId: candidate.requestId,
       accountId: candidate.accountId.toString(), cause, shape: closed.shape,
       ancestors: closed.ancestors });
+    return true;
+  }
+
+  /** OCV5-488 (10-17 commercial account 79, three handoff leaves held for
+   * 78 min with no CLI left): no proof, and the run is not stale or not
+   * stoppable. Look at the Box. Nothing of the run on two looks, a minute
+   * apart or across a reboot, closes it the way an expired run is closed;
+   * alive, terminal or unreadable keeps it pending exactly as before. */
+  private async closeAbsent(candidate: BoxStoppedFailureProbeCandidate,
+    target: BoxResolvedTarget): Promise<boolean> {
+    const journal = this.deps.journal;
+    if (!journal.recordRunAbsence || !journal.clearRunAbsence
+      || !journal.markRunExpiredUnproven) return false;
+    let seen: BoxRunLiveness | null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        target.exec.run(makeBoxRunLiveness(candidate.runNonce, candidate.cliCwd),
+          { timeoutMs: 10_000, maxResponseBytes: 256 }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("BOX_RUN_LIVENESS_TIMEOUT")), 10_500);
+        }),
+      ]);
+      seen = parseBoxRunLiveness(result.stdout);
+    } catch { return false; }
+    finally { if (timer) clearTimeout(timer); }
+    if (!seen || seen.state === "terminal") return false;
+    if (seen.state === "alive") {
+      await journal.clearRunAbsence.call(journal, candidate);
+      return false;
+    }
+    const first = await journal.recordRunAbsence.call(journal, { ...candidate, boot: seen.boot });
+    if (!first) {
+      workerLog.warn("box_run_absent_seen", { requestId: candidate.requestId,
+        accountId: candidate.accountId.toString() });
+      return false;
+    }
+    let closed: Awaited<ReturnType<NonNullable<Journal["markRunExpiredUnproven"]>>>;
+    try {
+      closed = await journal.markRunExpiredUnproven.call(journal, { requestId: candidate.requestId,
+        uid: candidate.uid, accountId: candidate.accountId, runNonce: candidate.runNonce,
+        leaseEpoch: candidate.leaseEpoch, cause: BOX_PROCESS_ABSENT_CAUSE,
+        absence: { boot: seen.boot } });
+    } catch (error) {
+      // Seen gone, but not yet a minute ago: the next probe confirms.
+      if (error instanceof BoxDurableJournalError
+        && error.code === "BOX_ABSENT_CLOSE_NOT_CONFIRMED") return false;
+      throw error;
+    }
+    const rebooted = first.boot !== seen.boot;
+    workerLog.warn("box_run_process_absent_closed", { requestId: candidate.requestId,
+      accountId: candidate.accountId.toString(), shape: closed.shape,
+      ancestors: closed.ancestors, rebooted });
+    this.deps.onProcessAbsentClosed?.({ requestId: candidate.requestId,
+      accountId: candidate.accountId, shape: closed.shape, rebooted });
     return true;
   }
 

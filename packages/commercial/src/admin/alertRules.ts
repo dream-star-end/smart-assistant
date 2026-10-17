@@ -28,6 +28,7 @@ import { EVENTS } from "./alertEvents.js";
 import { enqueueAlert, listRuleStates, transitionRuleState } from "./alertOutbox.js";
 import { getSystemSetting } from "./systemSettings.js";
 import { listPoolAdapters } from "../account-pool/policy/registry.js";
+import { BOX_HOLD_STUCK_SQL, boxHoldStuckRows, type BoxHoldStuckRow } from "../http/proxy/boxHoldStuck.js";
 
 export interface RuleSnapshot {
   accountHealth: Array<{ account_id: string; health_score: number; status: string }>;
@@ -50,6 +51,12 @@ export interface RuleSnapshot {
    * undefined when it could not be read (the rule then keeps its state).
    */
   servicePools?: Array<{ service: string; eligible: number; active: number; reasons: string[] }>;
+  /**
+   * OCV5-488: Box journal rows still holding a slot although the cleanup worker
+   * saw nothing of the run on the Box over 10 min ago, or past the 4 h 15 min
+   * ceiling by 15 min. Undefined when it could not be read.
+   */
+  boxHoldStuck?: BoxHoldStuckRow[];
 }
 
 export interface SnapshotDeps {
@@ -168,6 +175,15 @@ export async function collectRuleSnapshot(deps: SnapshotDeps = {}): Promise<Rule
     console.warn("[admin/alertRules] service pool snapshot failed:", err);
   }
 
+  let boxHoldStuck: RuleSnapshot["boxHoldStuck"];
+  try {
+    boxHoldStuck = boxHoldStuckRows((await query<{ request_id: string; account_id: string | null;
+      box_state: string; age_min: number; absent: boolean }>(BOX_HOLD_STUCK_SQL)).rows);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn("[admin/alertRules] box hold snapshot failed:", err);
+  }
+
   return {
     accountHealth,
     signupCountLastWindowMin,
@@ -178,6 +194,7 @@ export async function collectRuleSnapshot(deps: SnapshotDeps = {}): Promise<Rule
     loginFailureWindowMin,
     silentNewUserCount24h,
     servicePools,
+    boxHoldStuck,
     ...deps.override,
   };
 }
@@ -499,6 +516,37 @@ export const ruleSilentNewUserCohort: PolledRule = {
   },
 };
 
+/**
+ * OCV5-488: a Box run still holds a session/account slot although the Box
+ * showed nothing of it for 10+ min, or 15 min past its 4 h 15 min ceiling.
+ * The automatic closers are failing (unsettled billing, fence errors, a
+ * stopped worker); before this such holds were warn logs only (10-17
+ * account 79: 78 min, released by hand). An unreadable snapshot keeps the
+ * rule's state.
+ */
+export const ruleBoxHoldStuck: PolledRule = {
+  id: EVENTS.OPS_BOX_HOLD_STUCK,
+  event_type: EVENTS.OPS_BOX_HOLD_STUCK,
+  evaluate(s) {
+    const stuck = s.boxHoldStuck;
+    if (!stuck) throw new Error("box hold snapshot unavailable");
+    if (stuck.length === 0) {
+      return { firing: false, resolvedTitle: "[RESOLVED] Box 占位已释放",
+        resolvedBody: "没有超时未释放的 Box 运行。" };
+    }
+    const accounts = [...new Set(stuck.map((row) => row.accountId))].sort();
+    return {
+      firing: true,
+      dedupe_key: `${EVENTS.OPS_BOX_HOLD_STUCK}:${accounts.join(",")}`,
+      title: `Box 占位未释放:${stuck.length} 条(账号 ${accounts.join(",")})`,
+      body: `${stuck.map((row) => `${row.requestId.slice(0, 12)} ${row.boxState} ${row.ageMin}min `
+        + (row.absent ? "Box 上已无进程" : "超过 4h15m 上限")).join("\n")}\n`
+        + "自动收口未生效。排查见 ocv5-box-model-route「Box 上的残留和排查」,不要直接改库。",
+      payload: { count: stuck.length, accounts, requestIds: stuck.map((row) => row.requestId) },
+    };
+  },
+};
+
 export function defaultPolledRules(): PolledRule[] {
   return [
     ruleAccountPoolNotConfigured,
@@ -508,6 +556,7 @@ export function defaultPolledRules(): PolledRule[] {
     ruleRateLimitSpike,
     ruleLoginFailureSpike,
     ruleSilentNewUserCohort,
+    ruleBoxHoldStuck,
   ];
 }
 

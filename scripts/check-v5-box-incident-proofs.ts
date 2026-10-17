@@ -79,6 +79,8 @@ type Api = {
   replayStore: (root: string) => { write: unknown; read: unknown };
   stopHandler: (deps: unknown) => RouteHandler;
   idleProofHandler: (deps: unknown) => RouteHandler;
+  /** OCV5-488: the ops.box_hold_stuck alert's own query and row mapping. */
+  boxHoldStuck: { sql: string; rows: (rows: unknown[]) => Array<{ requestId: string; absent: boolean }> };
   jsonError: (res: unknown, status: number, code: string, message: string, requestId: string) => void;
   /** egress' model authority gate reject, as /v1/messages serializes it. */
   gateReject: (kind: string, detail: string) => { status: number; code: string; clientMessage: string };
@@ -179,6 +181,7 @@ async function load(): Promise<Api> {
   const observe = await import(pathToFileURL(join(PROXY, "boxDetachedTextObserve.ts")).href);
   const journal = await import(pathToFileURL(join(PROXY, "boxDurableJournal.ts")).href);
   const stop = await import(pathToFileURL(join(PROXY, "boxUserStopCoordinator.ts")).href);
+  const holdStuck = await import(pathToFileURL(join(PROXY, "boxHoldStuck.ts")).href);
   const billing = await import(pathToFileURL(join(PROXY, "boxBillingContext.ts")).href);
   const toolFetch = await import(pathToFileURL(join(PROXY, "boxToolFetch.ts")).href);
   const replay = await import(pathToFileURL(join(PROXY, "boxReplayCompleted.ts")).href);
@@ -246,6 +249,7 @@ async function load(): Promise<Api> {
     replayStore: (root) => ({ write: replaySetup.createBoxReplayWriter(true, root),
       read: replaySetup.createBoxReplayReader(root) }),
     stopHandler: stopRoute.makeBoxUserStopHandler, idleProofHandler: idleRoute.makeBoxIdleProofHandler,
+    boxHoldStuck: { sql: holdStuck.BOX_HOLD_STUCK_SQL, rows: holdStuck.boxHoldStuckRows },
     jsonError: shared.sendJsonError,
     gateReject: (kind: string, detail: string) => new authorityGate.ModelGateReject(kind, detail),
     boxCli: { runner: (opts) => new boxRunner.SubprocessRunner(opts), bridge: boxBridge.runBoxCcBridge },
@@ -680,6 +684,8 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
   spoolRead?: (call: number) => void;
   pendingRead?: (call: number) => void;
   proofRead?: (call: number) => void;
+  /** OCV5-488: what the read-only liveness probe finds of the run on the Box (default: alive). */
+  liveness?: { state: string; boot: string };
   capacityWaitMs?: number;
   signal?: AbortSignal;
   /** The durable journal on real Postgres instead of the in-memory one. */
@@ -693,7 +699,7 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
   const emitted: string[] = [];
   /** What each handoff recorded in the journal (the claim the next round is built from). */
   const handoffs: unknown[] = [];
-  const count = { admit: 0, launch: 0, spoolRead: 0, pendingRead: 0, proofRead: 0, stop: 0 };
+  const count = { admit: 0, launch: 0, spoolRead: 0, pendingRead: 0, proofRead: 0, stop: 0, look: 0 };
   // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   let nonce = "", epoch = "", controlHash = "", disposed = false;
   const epochs = new Map<string, string>();
@@ -741,6 +747,10 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
       count.stop++;
       if (faults.real?.proofReason === undefined && !faults.real?.stopIgnored) stopped.add(args[3]!);
       return reply("stop-requested\n");
+    }
+    if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("/proc/sys/kernel/random/boot_id")) {
+      count.look++;
+      return reply(`${faults.liveness?.state ?? "alive"} ${faults.liveness?.boot ?? PROOF_BOOT}\n`);
     }
     if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("terminal.json")) {
       faults.proofRead?.(++count.proofRead);
@@ -1566,11 +1576,14 @@ function boxTurn(api: Api, db: Db, journal: Journal, who: { uid: bigint; contain
     /** The CLI stays alive waiting: no terminal proof exists until its keeper is told to stop. */
     parked?: "until-stopped" | "unreadable";
     /** The Box account cannot be reached for a continuation publish. */
-    unreachable?: { active: boolean } } = {}) {
+    unreachable?: { active: boolean };
+    /** OCV5-488: what a liveness look finds of this run on the Box. */
+    liveness?: { state: string; boot: string } } = {}) {
   const cut = { active: false };
-  const { parked, unreachable, ...hostOptions } = options;
+  const { parked, unreachable, liveness, ...hostOptions } = options;
   const host: ReturnType<typeof boxHost> = boxHost(api, spoolOf([cliInit, ...BRIDGE_CALL]), {
     ...(parked ? { proofRead: () => { if (parked === "unreadable" || host.count.stop === 0) throw api.transportError("BOX_EXEC_REMOTE_EXIT"); } } : {}),
+    ...(liveness ? { liveness } : {}),
     // the exec stream of a continuation is cut in a way a re-read cannot repair
     spoolRead: () => { if (cut.active) throw api.transportError("BOX_EXEC_HTTP_500"); },
     real: { journal, ...who, accountId: who.containerId, requestId: `${name}-1`, turnKey, ...hostOptions } });
@@ -1822,11 +1835,14 @@ async function proveRecoveredToolExchange(api: Api, db: Db): Promise<string> {
  * user container has for reaching them. The gateway code under test calls
  * them with its own clients. */
 async function egressInternalRoutes(api: Api, journal: Journal, who: { uid: bigint; containerId: bigint },
-  target: unknown, readCapsule?: unknown) {
+  target: unknown, readCapsule?: unknown, stopParked = false) {
   const identity = { resolve: async () => ({ uid: who.uid, containerId: who.containerId, apiKey: null }) };
+  // OCV5-488: production also stops a parked leaf from the idle route; the proofs of the
+  // adapter's own stop leave it off so each proves its mechanism alone.
   const routes: Record<string, RouteHandler> = {
     "/internal/box/stop": api.stopHandler({ identity, journal, coordinator: api.stopCoordinator(journal, target) }),
-    "/internal/box/idle-proof": api.idleProofHandler({ identity, journal, ...(readCapsule ? { readCapsule } : {}) }) };
+    "/internal/box/idle-proof": api.idleProofHandler({ identity, journal, ...(readCapsule ? { readCapsule } : {}),
+      ...(stopParked ? { stopParked: { journal, coordinator: api.stopCoordinator(journal, target) } } : {}) }) };
   const calls: string[] = [];
   let idle: Promise<void> = Promise.resolve();
   const server = createServer((req, res) => {
@@ -3169,6 +3185,141 @@ async function proveUnknownNeverClosed(api: Api, db: Db): Promise<string> {
   return "[ocv5-313-unknown-never-closed] PASS — the 2.1.288 image echo continues and an abandoned unknown run is stopped or expired so its session continues";
 }
 
+const PROOF_BOOT = "6c1e2f3a-4b5c-4d6e-8f70-8192a3b4c5d6";
+/** The worker probes a row at most every 2 minutes; make the next probe due now. */
+const rearm = (db: Db, requestId: string) => db.query(
+  "UPDATE request_finalize_journal SET ctx=ctx - 'boxStopProbeAfterMs' WHERE request_id=$1", [requestId]);
+/** The first look that found the run gone was taken this much earlier. */
+const lookedEarlier = (db: Db, requestId: string, ms: number) => db.query(
+  `UPDATE request_finalize_journal SET ctx=jsonb_set(ctx,'{boxRunAbsent,atMs}',
+     to_jsonb((ctx->'boxRunAbsent'->>'atMs')::bigint - $2::bigint)) WHERE request_id=$1`, [requestId, ms]);
+
+/** INC-20261017-BOX-HELD-NO-PROCESS, commercial account 79 (10-17 07:10-08:28Z): three handoff leaves of uid 4
+ * held the account after their CLIs were gone from the Box. No terminal proof could be read
+ * (BOX_EXEC_REMOTE_EXIT), the leaves were neither stale resumes nor 4 h 15 min old, so every probe logged
+ * box_stop_probe_pending until an operator closed them by hand. The cleanup worker now looks at the Box:
+ * nothing of the run on two looks a minute apart, or across a reboot, closes it as an expired run is closed,
+ * money untouched. A leaf whose completed calls are not settled yet is not closed, and the alert's own
+ * query reports it. */
+async function proveProcessAbsentReleased(api: Api, db: Db): Promise<string> {
+  const journal = api.journal(db);
+  const turnKey = "e".repeat(64);
+  const park = async (uid: bigint, label: string) => {
+    const who = { uid, containerId: uid - 900_000_000n, sessionId: `session-${label}` };
+    await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,$2,'unused',10000)",
+      [uid.toString(), `${label}@test.invalid`]);
+    const look = { state: "alive", boot: PROOF_BOOT };
+    const turn = boxTurn(api, db, journal, who, `box-${label}`, turnKey, undefined,
+      { parked: "unreadable", liveness: look });
+    await turn.first();
+    const requestId = `box-${label}-1`;
+    const leaf = await journalRow(db, requestId);
+    if (leaf?.ctx.boxState !== "handoff" || leaf.state !== "committed") {
+      fail(`ABSENT_${label}_FIXTURE_${String(leaf?.ctx.boxState)}_${String(leaf?.state)}`);
+    }
+    // past the launch grace; the run is nowhere near its 4 h 15 min ceiling
+    await aged(db, requestId, "10 minutes", true);
+    return { who, turn, look, requestId, leaf: leaf! };
+  };
+  const gone = await park(900_000_488n, "gone");
+  const rebooted = await park(900_000_489n, "rebooted");
+  const unsettled = await park(900_000_490n, "unsettled");
+  // its completed calls are not settled yet: closing it would hide them from the Box billing scan
+  await db.query("UPDATE request_finalize_journal SET state='inflight' WHERE request_id=$1", [unsettled.requestId]);
+  const runs = [gone, rebooted, unsettled];
+  const worker = boxCleanupWorker(api, journal, runs.map((run) => run.turn));
+  const round = async () => {
+    for (const run of runs) await rearm(db, run.requestId);
+    await worker.reconcileStoppedFailures(50);
+  };
+  const state = async (requestId: string) => (await journalRow(db, requestId))?.ctx;
+  // the CLIs are alive and waiting: nothing is recorded or closed
+  await round();
+  for (const run of runs) {
+    const ctx = await state(run.requestId);
+    if (ctx?.boxState !== "handoff" || ctx.boxRunAbsent !== undefined || run.turn.host.count.look !== 1) {
+      fail(`ABSENT_ALIVE_${run.requestId}_${String(ctx?.boxState)}_${run.turn.host.count.look}`);
+    }
+  }
+  // the CLIs are gone: a first look only records
+  for (const run of runs) run.look.state = "absent";
+  await round();
+  for (const run of runs) {
+    const ctx = await state(run.requestId);
+    if (ctx?.boxState !== "handoff" || ctx.boxRunAbsent === undefined) fail(`ABSENT_FIRST_LOOK_${run.requestId}`);
+  }
+  // within the minute the same boot confirms nothing; a reboot of the Box confirms at once
+  rebooted.look.boot = "6c1e2f3a-4b5c-4d6e-8f70-000000000488";
+  await round();
+  if ((await state(gone.requestId))?.boxState !== "handoff") fail("ABSENT_CLOSED_WITHIN_A_MINUTE");
+  // a minute later the same boot confirms too
+  await lookedEarlier(db, gone.requestId, 61_000);
+  await lookedEarlier(db, unsettled.requestId, 61_000);
+  await round();
+  for (const run of [gone, rebooted]) {
+    const row = await journalRow(db, run.requestId);
+    const close = row?.ctx.boxExpiredClose as { cause?: string; priorBoxState?: string } | undefined;
+    if (row?.ctx.boxState !== "expired_unproven" || close?.cause !== "box_process_absent"
+      || close.priorBoxState !== "handoff" || row.state !== run.leaf.state || row.credits !== run.leaf.credits
+      || run.turn.host.count.stop !== 0) {
+      fail(`ABSENT_NOT_RELEASED_${run.requestId}_${String(row?.ctx.boxState)}_${String(close?.cause)}_${row?.state}_${row?.credits}`);
+    }
+    await sessionReleased(api, db, journal, run.who, turnKey, `ABSENT_${run.requestId.toUpperCase().replaceAll("-", "_")}`);
+  }
+  // unsettled: still held, and ten minutes on the alert's own query names it
+  if ((await state(unsettled.requestId))?.boxState !== "handoff") fail("ABSENT_UNSETTLED_CLOSED");
+  await lookedEarlier(db, unsettled.requestId, 10 * 60_000);
+  const stuck = api.boxHoldStuck.rows((await db.query(api.boxHoldStuck.sql)).rows);
+  const named = stuck.find((row) => row.requestId === unsettled.requestId);
+  if (!named?.absent || stuck.some((row) => row.requestId === gone.requestId || row.requestId === rebooted.requestId)) {
+    fail(`ABSENT_ALERT_${stuck.map((row) => row.requestId).join(",")}`);
+  }
+  return "[ocv5-488-process-absent-released] PASS — a parked run whose processes are gone from the Box is released on two looks without its age or any money change, and an unsettled one is held and alerted";
+}
+
+/** INC-20261017-BOX-HELD-NO-PROCESS, the session side: the turn had ended in uid 4's container while its Box
+ * CLI stayed parked on the handoff, and each next message read that turn's idle proof as pending and was
+ * refused. A container reads a turn's idle proof only once that turn ended on its side, so egress stops the
+ * parked leaf on that read the way a browser Stop does, whatever ended the turn (here nothing the adapter
+ * knows: no /internal/box/stop is ever sent). */
+async function proveIdleProofStopsParkedTurn(api: Api, db: Db): Promise<string> {
+  if (!api.egressSource.includes("stopParked: { journal: boxStopJournal, coordinator: boxStopCoordinator }")) {
+    fail("IDLE_STOP_NOT_WIRED_IN_EGRESS");
+  }
+  const journal = api.journal(db);
+  const who = { uid: 900_000_491n, containerId: 491n, sessionId: "session-idle-stop" };
+  const turnKey = "4910".repeat(16);
+  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'idle-stop@test.invalid','unused',10000)",
+    [who.uid.toString()]);
+  const turn = boxTurn(api, db, journal, who, "box-idlestop", turnKey);
+  await turn.first();
+  const routes = await egressInternalRoutes(api, journal, who, turn.host.target, undefined, true);
+  const dir = api.home;
+  const counters = { submits: 0, shutdowns: 0 };
+  const session = gatewaySession(api, "idle-stop-session", counters);
+  api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: session.sessionKey, sessionId: who.sessionId, turnKey });
+  try {
+    // the first message reads the pending proof; egress starts the stop on that read
+    const first = await submitMessage(api, session);
+    let leaf = await journalRow(db, "box-idlestop-1");
+    for (let i = 0; i < 400 && leaf?.ctx.boxState !== "failed_stopped"; i++) {
+      await tick(25);
+      leaf = await journalRow(db, "box-idlestop-1");
+    }
+    await routes.settled();
+    if (routes.calls.includes("/internal/box/stop") || turn.host.count.stop !== 1
+      || leaf?.ctx.boxState !== "failed_stopped") {
+      fail(`IDLE_STOP_${first}_${turn.host.count.stop}_${String(leaf?.ctx.boxState)}_${routes.calls.join(",")}`);
+    }
+    const idle = await api.fetchIdleProof({ sessionId: who.sessionId, turnKey });
+    if (idle.status !== "failed") fail(`IDLE_STOP_IDLE_${idle.status}`);
+    if (await submitMessage(api, session) !== "admitted") fail("IDLE_STOP_NEXT_MESSAGE_STILL_BLOCKED");
+  } finally {
+    await routes.close();
+  }
+  return "[ocv5-488-idle-proof-stops-parked-turn] PASS — a turn the container has ended stops its parked Box leaf on the next idle read and the next message passes";
+}
+
 /** Things this run created outside its own memory. */
 const cleanups = new Set<() => Promise<void> | void>();
 /** Every cleanup is attempted; the first failure is reported after all of them ran. */
@@ -3343,7 +3494,8 @@ async function main(): Promise<void> {
       await proveRejectBlocksNextMessage(api, db), await proveConfigChangedBlocksNextMessage(api, db),
       await proveIdleNoSummary(api, db),
       await proveAnsweredExchangePrompt(api, db), await proveWaitingHandoffSuperseded(api, db), await proveResumeUnsentParked(api, db),
-      await proveUnknownNeverClosed(api, db), await proveNativeResumedStop(api, db)]),
+      await proveUnknownNeverClosed(api, db), await proveNativeResumedStop(api, db),
+      await proveProcessAbsentReleased(api, db), await proveIdleProofStopsParkedTurn(api, db)]),
     ...await proveFinalizedTurnRecovery(api, database)];
   await cleanUp();
   clearTimeout(deadline);
