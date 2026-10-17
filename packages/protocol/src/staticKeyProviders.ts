@@ -553,6 +553,32 @@ const BY_ID: Record<StaticProviderId, StaticKeyProviderSpec> = {
 }
 
 /** commercial proxy 路由判定：返回命中的 provider(用 matchesRoute)，否则 undefined(走 OAuth)。 */
+/**
+ * OCV5-482: fallback upstream of a static route, keyed by the primary provider and the lowercase
+ * upstream model. The catalog's execution version stays the primary. The fallback serves only while
+ * the primary cannot: its key pool has no usable member, it is health-degraded, or it refused the
+ * request (429/402/5xx) before anything streamed. The primary's pool recovery brings traffic back.
+ * OpenCode Go DeepSeek V4.1 Flash → the same model on the official DeepSeek API (Go's weekly limit).
+ */
+export interface StaticRouteFallback {
+  readonly providerId: StaticProviderId
+  readonly upstreamModel: string
+}
+
+const DEEPSEEK_FLASH_OFFICIAL: StaticRouteFallback = { providerId: 'deepseek', upstreamModel: 'deepseek-flash' }
+
+const STATIC_ROUTE_FALLBACKS: Readonly<Record<string, Readonly<Record<string, StaticRouteFallback>>>> = {
+  opencodego: {
+    'deepseek-v4.1-flash': DEEPSEEK_FLASH_OFFICIAL,
+    // Platform-direct calls name the Go model by its older id.
+    'deepseek-v4-flash': DEEPSEEK_FLASH_OFFICIAL,
+  },
+}
+
+export function staticRouteFallback(providerId: string, upstreamModel: string): StaticRouteFallback | undefined {
+  return STATIC_ROUTE_FALLBACKS[providerId]?.[upstreamModel.toLowerCase()]
+}
+
 export function findRouteProviderForModel(modelId: string): StaticKeyProviderSpec | undefined {
   return STATIC_KEY_PROVIDERS.find((p) => p.matchesRoute(modelId))
 }
