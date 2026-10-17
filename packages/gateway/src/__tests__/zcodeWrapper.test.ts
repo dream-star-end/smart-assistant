@@ -1,5 +1,5 @@
 /**
- * Locks the experimental oc-zcode wrapper to the live 0.16.3 hosted contract.
+ * Locks the experimental oc-zcode wrapper to the 0.16.9 hosted contract (0.16.3 until OCV5-470).
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/zcodeWrapper.test.ts
  */
@@ -88,7 +88,7 @@ describe('oc-zcode wrapper', () => {
     assert.doesNotMatch(text, /rm -rf -- "\$ZCODE_SESSION_DB_PATH"/)
   })
 
-  test('selfhost runtime build profile persistently includes ZCode 0.16.3', () => {
+  test('selfhost runtime build profile persistently includes ZCode 0.16.9', () => {
     const profile = readFileSync(
       path.resolve(process.cwd(), 'deploy/v5-selfhost/runtime-build.env'),
       'utf8',
@@ -102,7 +102,7 @@ describe('oc-zcode wrapper', () => {
       'utf8',
     )
     assert.match(profile, /^OC_INCLUDE_ZCODE=1$/m)
-    assert.match(profile, /^OC_ZCODE_CLI_VERSION=0\.16\.3$/m)
+    assert.match(profile, /^OC_ZCODE_CLI_VERSION=0\.16\.9$/m)
     assert.match(profile, /^OC_INCLUDE_GROK=1$/m)
     assert.match(profile, /^OC_INCLUDE_CURSOR=1$/m)
     assert.match(profile, /^OC_EMBED_SOURCE=0$/m)
@@ -111,8 +111,9 @@ describe('oc-zcode wrapper', () => {
     assert.match(build, /oc\.runtime\.include_zcode=\$\{OC_INCLUDE_ZCODE:-0\}/)
     assert.match(build, /OC_INCLUDE_ZCODE=\$\{OC_INCLUDE_ZCODE:-0\}/)
     assert.match(dockerfile, /ARG OC_INCLUDE_ZCODE=0/)
-    assert.match(dockerfile, /OC_ZCODE_CLI_VERSION=0\.16\.3/)
-    assert.match(dockerfile, /ba51f8c091762bf1ba733cb71390975b8397dc178c753d52d4738365ce59ac61/)
+    assert.match(dockerfile, /OC_ZCODE_CLI_VERSION=0\.16\.9/)
+    assert.match(dockerfile, /2edc79650fcff72358670af4ffbfbf7d979ba95476611a80ad1151d577e90fe3/)
+    assert.match(dockerfile, /\$install_root\/provider\/zcode-builtin\.json/)
     assert.match(dockerfile, /--appimage-extract/)
   })
 
@@ -170,7 +171,7 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', 
         env: Record<string, string | undefined>
         config: {
           model: { main: string }
-          provider: { 'zai-coding-plan': { kind: string; options: { apiKey: string; baseURL: string } } }
+          provider: { 'zai-coding-plan': { kind: string; options: { apiKey: string; baseURL: string }; models: unknown } }
         }
         configMode: number
       }
@@ -192,6 +193,7 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_w', response: 'wrapped', 
       assert.equal(captured.config.model.main, 'zai-coding-plan/glm-5.3')
       assert.equal(captured.config.provider['zai-coding-plan'].kind, 'anthropic')
       assert.equal(captured.config.provider['zai-coding-plan'].options.apiKey, 'super-secret-zcode-key')
+      assert.deepEqual(captured.config.provider['zai-coding-plan'].models, { 'glm-5.3': { name: 'glm-5.3' } })
       assert.equal(
         captured.config.provider['zai-coding-plan'].options.baseURL,
         'http://127.0.0.1:18791/internal/v5/zcode-relay/route/ab/v1',
@@ -245,6 +247,7 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_platform', response: 'ok'
       assert.equal(cfg.hooks.enabled, true)
       assert.equal(cfg.model.main, 'zai-coding-plan/glm-5.3')
       assert.equal(cfg.provider['zai-coding-plan'].options.apiKey, 'relay-secret')
+      assert.deepEqual(cfg.provider['zai-coding-plan'].models, { 'glm-5.3': { name: 'glm-5.3' } })
       assert.equal(
         cfg.provider['zai-coding-plan'].options.baseURL,
         'http://127.0.0.1:18791/internal/v5/zcode-relay/route/test/v1',
@@ -550,7 +553,7 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_shared', response: 'ok', 
     }
   })
 
-  const REAL_ZCODE_CJS = '/opt/zcode-cli/versions/0.16.3/zcode.cjs'
+  const REAL_ZCODE_CJS = '/opt/zcode-cli/versions/0.16.9/zcode.cjs'
   const REAL_NODE = '/usr/local/bin/node'
 
   function runRealCli(
@@ -584,7 +587,7 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_shared', response: 'ok', 
   }
 
   test(
-    'real CLI 0.16.3 --resume reads sqlite from ZCODE_SESSION_DB_PATH across two ephemeral HOMEs',
+    'real CLI 0.16.9 --resume reads sqlite from ZCODE_SESSION_DB_PATH across two ephemeral HOMEs',
     {
       skip:
         Number.parseInt(process.versions.node.split('.')[0] ?? '0', 10) < 22 ||
@@ -612,6 +615,7 @@ process.stdout.write(JSON.stringify({ sessionId: 'sess_shared', response: 'ok', 
               baseURL: 'http://127.0.0.1:9/v1',
               apiKey: dummyKey,
             },
+            models: { 'glm-5.3': { name: 'glm-5.3' } },
           },
         },
       })

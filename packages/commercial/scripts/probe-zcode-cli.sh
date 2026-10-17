@@ -1,5 +1,5 @@
 #!/bin/sh
-# Reusable probe for the experimental community ZCode CLI 0.16.3.
+# Reusable probe for the experimental community ZCode CLI 0.16.9.
 # Never logs in. Never prints env or credential values.
 set -eu
 
@@ -7,7 +7,7 @@ OUT_DIR=${1:-/tmp/zcode-cli-probe}
 mkdir -p "$OUT_DIR"
 echo "probe-zcode-cli: writing sanitized fixtures under $OUT_DIR" >&2
 
-echo "== npm registry (expect stub / ETARGET for 0.16.3) ==" >&2
+echo "== npm registry (expect stub / ETARGET for 0.16.9) ==" >&2
 if command -v npm >/dev/null 2>&1; then
   npm view zcode-cli versions --json > "$OUT_DIR/npm-zcode-cli-versions.json" 2>"$OUT_DIR/npm-zcode-cli.err" || true
   npm view zcode version --json > "$OUT_DIR/npm-zcode-version.json" 2>"$OUT_DIR/npm-zcode.err" || true
@@ -15,12 +15,12 @@ else
   echo "npm not available" > "$OUT_DIR/npm-skipped.txt"
 fi
 
-APP_VERSION=3.8.1
-APP_SHA=ba51f8c091762bf1ba733cb71390975b8397dc178c753d52d4738365ce59ac61
+APP_VERSION=3.15.3
+APP_SHA=2edc79650fcff72358670af4ffbfbf7d979ba95476611a80ad1151d577e90fe3
 APP_URL="https://cdn-zcode.z.ai/zcode/electron/releases/${APP_VERSION}/linux-x64/ZCode-${APP_VERSION}-linux-x64.AppImage"
 archive="$OUT_DIR/ZCode-${APP_VERSION}-linux-x64.AppImage"
 
-echo "== AppImage ${APP_VERSION} (community-verified pairing with CLI 0.16.3) ==" >&2
+echo "== AppImage ${APP_VERSION} (pairing with CLI 0.16.9, OCV5-470) ==" >&2
 if [ ! -f "$archive" ]; then
   curl -fsSL --retry 2 --retry-all-errors -o "$archive" "$APP_URL"
 fi
@@ -43,7 +43,7 @@ HOME="$PROBE_HOME" node "$cjs" --prompt ping --json --mode yolo --no-color --cwd
   > "$OUT_DIR/prompt-no-config.stdout" 2>"$OUT_DIR/prompt-no-config.stderr"
 set -e
 
-test "$(tr -d '[:space:]' < "$OUT_DIR/version.txt")" = "0.16.3"
+test "$(tr -d '[:space:]' < "$OUT_DIR/version.txt")" = "0.16.9"
 
 # Redact any accidental secret-shaped values from captured text.
 for f in "$OUT_DIR"/*.txt "$OUT_DIR"/*.err "$OUT_DIR"/*.stdout "$OUT_DIR"/*.stderr "$OUT_DIR"/*.json; do
