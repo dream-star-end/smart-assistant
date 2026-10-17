@@ -694,6 +694,7 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
   /** What each handoff recorded in the journal (the claim the next round is built from). */
   const handoffs: unknown[] = [];
   const count = { admit: 0, launch: 0, spoolRead: 0, pendingRead: 0, proofRead: 0, stop: 0 };
+  // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   let nonce = "", epoch = "", controlHash = "", disposed = false;
   const epochs = new Map<string, string>();
   const stopped = new Set<string>();
@@ -927,6 +928,7 @@ function boxTextHost(api: Api, capacityWaitMs: number) {
     messages: [{ role: "user", content: "synthetic text only" }] };
   const output = spoolOf(TEXT_ANSWER).toString("utf8");
   const calls: string[] = [];
+  // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   let proofDir = "", leaseEpoch = "";
   const run = async (request: ExecRequest, options: { onStdout?: (chunk: string) => void }): Promise<ExecReply> => {
     const args = request.args;
@@ -1071,6 +1073,7 @@ async function proveCliRejectedCall(api: Api): Promise<string> {
   }
   // the production window is 45s, with backoff, and returns the first rejection unchanged
   if (api.capacityWaitMs !== 45_000) fail("CAPACITY_WINDOW_NOT_45S");
+  // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   let clock = 0, attempts = 0;
   const first = slotHeld();
   const lasted = await api.waitCapacity(() => { attempts++; throw attempts === 1 ? first : slotHeld(); },
@@ -1316,6 +1319,7 @@ async function prechecked(api: Api, db: Db, row: { requestId: string; uid: bigin
       ...(row.dispatchId ? { dispatchId: row.dispatchId, attemptNo: 1 } : {}) }) })]);
 }
 const journalRow = async (db: Db, requestId: string) => (await db.query(
+  // biome-ignore lint/style/noUnusedTemplateLiteral: moved verbatim from the commercial copy of this file (OCV5-488)
   `SELECT state,failure_code,final_credits::text AS credits,ctx FROM request_finalize_journal WHERE request_id=$1`,
   [requestId])).rows[0] as { state: string; failure_code: string | null; credits: string | null;
     ctx: Record<string, unknown> } | undefined;
@@ -1650,10 +1654,12 @@ async function proveReplayPendingAfterCut(api: Api, db: Db): Promise<string> {
     if ((await journalRow(db, "box-cut-2"))?.ctx.boxState !== "terminal") fail("REPLAY_LEAF_NOT_SETTLED");
     // production waits 240s in 3s steps, inside CCB's 300s fallback timeout, and the handler uses it
     const wait = /pendingWait: \{ budgetMs: ([0-9_]+), intervalMs: ([0-9_]+) \}/.exec(api.egressSource);
+    // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
     const budgetMs = Number(wait?.[1]?.replaceAll("_", "")), intervalMs = Number(wait?.[2]?.replaceAll("_", ""));
     if (!(budgetMs >= 120_000 && budgetMs < 300_000 && intervalMs >= 1000 && intervalMs <= 10_000)) fail("REPLAY_PRODUCTION_WAIT");
     if (!/replay\.kind === "pending" && pendingWait\)[\s\S]{0,400}waitForBoxReplay\(replay, lookupReplay,\s*\{ \.\.\.pendingWait/
       .test(api.proxySource)) fail("REPLAY_HANDLER_NOT_WAITING");
+    // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
     let clock = 0, polls = 0;
     const still = await api.waitReplay({ kind: "pending" }, async () => { polls++; return { kind: "pending" }; },
       { budgetMs, intervalMs, signal: new AbortController().signal, now: () => clock,
@@ -1681,6 +1687,7 @@ async function proveReplayPendingAfterCut(api: Api, db: Db): Promise<string> {
     const sweeper = api.cleanupWorker({ journal, writeRecoveryMessage: store.write,
       resolver: { resolve: async () => unseen.host.target } });
     const swept = await sweeper.reconcileStoppedFailures();
+    // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
     const leaf = await journalRow(db, "box-unseen-2"), parent = await journalRow(db, "box-unseen-1");
     if (swept.recovered !== 1 || leaf?.state !== "aborted" || leaf.credits !== "0"
       || leaf.ctx.boxState !== "failed_stopped" || leaf.ctx.boxStopOutcome !== "rejected_stream"
@@ -1745,6 +1752,7 @@ async function proveRecoveredToolExchange(api: Api, db: Db): Promise<string> {
   if (turn.host.count.stop !== 1 || turn.host.count.launch !== 2) {
     fail(`RECOVERED_EXCHANGE_STOP_${turn.host.count.stop}_LAUNCH_${turn.host.count.launch}`);
   }
+  // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   const orphan = await journalRow(db, "box-rec-1"), fresh = await journalRow(db, "box-rec-2");
   if (orphan?.ctx.boxState !== "failed_stopped" || orphan.ctx.boxRecoveredBy !== "box-rec-2"
     || (orphan.ctx.boxTerminalProof as { reason?: string } | undefined)?.reason !== "keeper_stopped") {
@@ -2093,6 +2101,7 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
       fail(`IDLE_STRANDED_OP_${String(released?.disposition)}`);
     }
     // the incident's own shape: after the slot switch egress knows neither the source nor the idle turn
+    // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
     const lost = "idle-lost-source", lostSource = "2".repeat(64);
     const lostTurn = createHash("sha256").update(`${lost}:${revision}`).digest("hex");
     api.idle.startIdleOp({ dir, sessionKey: lost, sourceSessionId: who.sessionId, sourceTurnKey: lostSource,
@@ -2196,6 +2205,7 @@ async function withSessionsBackend<T>(api: Api, config: unknown,
 // continuation itself, with a short budget, and only when nothing is open.
 async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<string[]> {
   return withSessionsBackend(api, database, async (backend, db) => {
+    // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
     const uid = 9n, sessionUser = "c:9";
     const settled = [
       { blockId: "toolu_317_bash", toolName: "Bash", inputJson: { command: "git status --short" }, output: "M a.ts", completed: true },
@@ -2207,6 +2217,7 @@ async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<
       recoveryAttempt?: number; text?: string; runtimeEvents?: unknown[]; outputTokens?: number;
       /** Frames still in the live stream of this message when the tape is finalized. */
       liveFrames?: unknown[][] }) => {
+      // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
       const sessionId = `s-ocv5-317-${name}`, clientMessageId = `cm-ocv5-317-${name}`;
       const turnKey = createHash("sha256").update(`ocv5-317:${name}:${++turns}`).digest("hex");
       const admitted = await backend.admitUserTurn({ uid, sessionUserId: sessionUser, sessionId, clientMessageId,
@@ -2219,6 +2230,7 @@ async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<
       if (admitted.kind !== "admitted") fail(`SETTLED_${name}_NOT_ADMITTED`);
       const hash = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
       if (shape.liveFrames) {
+        // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
         const sessionKey = `agent:main:webchat:dm:${sessionId}`, streamKey = `legacy:621:${sessionKey}`;
         await db.query(`INSERT INTO client_session_live_streams
           (stream_key,session_id,user_id,client_message_id,source,projection_source,terminal_status)
@@ -2303,6 +2315,7 @@ async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<
       recoveryAttempt: attempt, outputTokens: 0, text: 'API Error: 409 {"error":{"code":"BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION"}}',
       runtimeEvents: [{ ordinal: 1, observedAt: 1_783_950_170_100, source: "ccb",
         payload: { type: "result", is_error: true, num_turns: 1 } }] });
+    // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
     const retried = await empty(2), stopped = await empty(3);
     if (!isDeepStrictEqual(retried.jobs.map((job) => job.split("#")[1]), ["3"]) || stopped.jobs.length !== 0) {
       fail(`ANSWERED_EMPTY_RECOVERY_BUDGET_${retried.jobs.join(",")}_${stopped.jobs.join(",")}`);
@@ -2413,6 +2426,7 @@ function boxCliBridge(api: Api, box: Awaited<ReturnType<typeof boxCliBox>>, tag:
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const stderr = new PassThrough();
+  // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   let out = "", err = "";
   stdout.on("data", (chunk: Buffer) => { out += chunk.toString("utf8"); });
   stderr.on("data", (chunk: Buffer) => { err += chunk.toString("utf8"); });
@@ -2984,6 +2998,7 @@ async function proveWaitingHandoffSuperseded(api: Api, db: Db): Promise<string> 
   if (turn.host.count.stop !== 1 || turn.host.count.launch !== 2) {
     fail(`SUPERSEDED_STOP_${turn.host.count.stop}_LAUNCH_${turn.host.count.launch}`);
   }
+  // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   const waiting = await journalRow(db, "box-sup-1"), fresh = await journalRow(db, "box-sup-2");
   if (waiting?.ctx.boxState !== "failed_stopped" || waiting.ctx.boxRecoveredBy !== "box-sup-2") {
     fail(`SUPERSEDED_WAITING_${String(waiting?.ctx.boxState)}_${String(waiting?.ctx.boxRecoveredBy)}`);
@@ -3170,7 +3185,9 @@ async function proveNativeResumedStop(api: Api, db: Db): Promise<string> {
     [who.uid.toString()]);
   const turn = boxTurn(api, db, journal, who, "box-nstop", turnKey);
   await turn.first();
+  // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   const nonce = turn.host.runNonce, epoch = turn.host.leaseEpoch;
+  // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   const run = `/tmp/ocv5-289-run-${nonce}`, proofDir = `/tmp/ocv5-289-proof-${nonce}`;
   const native = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
   const keeperPath = `/tmp/ocv5-289-v2-keeper-${randomBytes(8).toString("hex")}.py`;
@@ -3186,6 +3203,7 @@ async function proveNativeResumedStop(api: Api, db: Db): Promise<string> {
     "--lease-epoch", epoch], { cwd: native, stdio: "ignore" });
   cleanups.add(() => { if (keeper.exitCode === null) keeper.kill("SIGKILL"); });
   for (let i = 0; i < 200 && !existsSync(`${native}/ready`); i++) await tick(10);
+  // biome-ignore lint/style/useTemplate: moved verbatim from the commercial copy of this file (OCV5-488)
   writeFileSync(`${proofDir}/stop.ready`, JSON.stringify({ runNonce: nonce, leaseEpoch: epoch,
     keeperPid: keeper.pid, cliPid: keeper.pid, revision: 1 }) + "\n", { mode: 0o600 });
   // the journal records the resumed transcript's cwd, as claimToolResume writes it for a native resume
