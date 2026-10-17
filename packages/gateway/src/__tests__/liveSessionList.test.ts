@@ -8,6 +8,7 @@
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/liveSessionList.test.ts
  */
+import { readSessionManagerSource } from './helpers/sessionManagerSource.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -108,7 +109,8 @@ describe('接线未漂移', () => {
   })
 
   test('LRU 驱逐使用 isTempSessionKey', () => {
-    const source = readFileSync(join(here, '..', 'sessionManager.ts'), 'utf8')
+    // sessionManager.ts + split-out modules (FINDINGS §7.6 M3: eviction lives in sessionLifecycle.ts)
+    const source = readSessionManagerSource()
     assert.match(source, /const isTempSession = isTempSessionKey\(key\)/)
     assert.match(source, /isPatrolSessionKey\(sessionKey\)/)
   })

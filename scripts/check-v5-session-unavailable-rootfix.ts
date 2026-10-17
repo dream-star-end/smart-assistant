@@ -36,7 +36,7 @@ const gatewaySource = [
   .map((f) => readFileSync(join(root, 'packages/gateway/src', f), 'utf8'))
   .join('\n')
 // sessionManager.ts plus the modules split out of it (FINDINGS §7.6 M1: sessionTurnRunner.ts).
-const sessionManager = ['sessionManager.ts', 'sessionTurnRunner.ts', 'sessionSubmit.ts']
+const sessionManager = ['sessionManager.ts', 'sessionTurnRunner.ts', 'sessionSubmit.ts', 'sessionTail.ts', 'sessionAgentGroups.ts', 'sessionLifecycle.ts', 'sessionTypes.ts', 'sessionTurnOutcome.ts']
   .map((f) => readFileSync(join(root, 'packages/gateway/src', f), 'utf8'))
   .join('\n')
 const memoryDir = readFileSync(join(root, 'packages/storage/src/memoryDir.ts'), 'utf8')
@@ -830,7 +830,7 @@ console.log(
 // Isolated unit suites cover seal/sink-pending/T2 isolation, validator,
 // materialize stamp, persist owner-merge, and the read-only historical planner.
 const lateDelegateHelperSrc = readFileSync(join(root, 'packages/gateway/src/delegateLateCompletion.ts'), 'utf8')
-const lateSessionManagerSrc = readFileSync(join(root, 'packages/gateway/src/sessionManager.ts'), 'utf8')
+const lateSessionManagerSrc = sessionManager // sessionManager.ts + split-out modules (OCV5-480)
 const lateServerSrc = gatewaySource
 const lateTapeSrc = readFileSync(join(root, 'packages/commercial/src/http/losslessTurnTape.ts'), 'utf8')
 const latePersistSrc = readFileSync(join(root, 'packages/web-react/src/lib/persist.ts'), 'utf8')

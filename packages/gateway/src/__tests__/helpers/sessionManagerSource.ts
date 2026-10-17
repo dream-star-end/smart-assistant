@@ -13,6 +13,11 @@ export const SESSION_MANAGER_SOURCE_FILES: readonly string[] = [
   'sessionManager.ts',
   'sessionTurnRunner.ts',
   'sessionSubmit.ts',
+  'sessionTail.ts',
+  'sessionAgentGroups.ts',
+  'sessionLifecycle.ts',
+  'sessionTypes.ts',
+  'sessionTurnOutcome.ts',
 ]
 
 export function readSessionManagerSource(): string {
