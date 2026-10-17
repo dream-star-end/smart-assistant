@@ -1,5 +1,6 @@
 /**
- * FINDINGS §7.6: methods moved out of Gateway / SessionManager keep one-line forwarders
+ * FINDINGS §7.6/§8: methods moved out of Gateway / SessionManager / CodexAppServerRunner keep
+ * one-line forwarders
  * `name(...) { return nameImpl.call(this as unknown as Host, ...) }`.
  *
  * A forwarder must NOT be `async`: an async wrapper returning the impl's promise settles a few
@@ -52,7 +53,7 @@ function forwarders(file: string) {
 }
 
 describe('method-move forwarders keep the original promise timing', () => {
-  for (const file of ['server.ts', 'sessionManager.ts']) {
+  for (const file of ['server.ts', 'sessionManager.ts', 'engine/codexAppServerRunner.ts']) {
     it(`${file}: no async forwarder, no value returned from a void forwarder`, () => {
       const fwd = forwarders(file)
       assert.ok(fwd.length > 0, `${file} has no forwarders — the move pattern changed?`)
