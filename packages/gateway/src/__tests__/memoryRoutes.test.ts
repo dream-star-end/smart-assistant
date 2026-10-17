@@ -22,7 +22,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const SERVER_TS = readFileSync(join(__dirname, '..', 'server.ts'), 'utf-8')
 
 function extractMethodBody(source: string, methodName: string): string {
-  const startRe = new RegExp(`^  (private|public|protected)?\\s*(async\\s+)?${methodName}\\b`, 'm')
+  // `(` after the name: the Gateway's route io adapters list `handleMemory: (...args) => …` too
+  const startRe = new RegExp(`^  (private|public|protected)?\\s*(async\\s+)?${methodName}\\(`, 'm')
   const startMatch = startRe.exec(source)
   if (!startMatch) throw new Error(`method ${methodName} not found`)
   const startIdx = startMatch.index
@@ -97,14 +98,18 @@ describe('handleMemoryFile(memdir files/:file)', () => {
 
 describe('dispatch 注册 files/:file 路由', () => {
   it('/memory/files/:file 路由存在并派发到 handleMemoryFile', () => {
-    assert.match(SERVER_TS, /\\\/memory\\\/files\\\/\(\[\^\/\]\+\)\$/)
-    assert.match(SERVER_TS, /this\.handleMemoryFile\(/)
+    // FINDINGS §7.5 2b: the dispatch lives in the AGENT_ROUTES table; the handler stays on the Gateway.
+    const AGENT_ROUTES_TS = readFileSync(join(__dirname, '..', 'routes', 'agents.ts'), 'utf-8')
+    assert.match(AGENT_ROUTES_TS, /\\\/memory\\\/files\\\/\(\[\^\/\]\+\)\$/)
+    assert.match(AGENT_ROUTES_TS, /io\.handleMemoryFile\(/)
+    assert.match(SERVER_TS, /handleMemoryFile: \(\.\.\.args\) => gw\.handleMemoryFile\(\.\.\.args\)/)
   })
 })
 
 describe('Auto-Dream 用户可见报告路由', () => {
   it('只允许 GET、隐藏系统 agent 返回 404，并调用严格投影服务', () => {
-    assert.match(SERVER_TS, /auto-dream-report/)
+    // FINDINGS §7.5 2b: the route pattern lives in the AGENT_ROUTES table
+    assert.match(readFileSync(join(__dirname, '..', 'routes', 'agents.ts'), 'utf-8'), /auto-dream-report/)
     assert.match(handleAutoDreamReport, /isHiddenSystemAgentId\(agentId\)/)
     assert.match(handleAutoDreamReport, /req\.method !== 'GET'/)
     assert.match(handleAutoDreamReport, /this\.autoDream\.getPublicStatus\(agentId\)/)

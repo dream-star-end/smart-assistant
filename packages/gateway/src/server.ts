@@ -1,6 +1,15 @@
 import { fetchIdentityCompatProjection, resolveRuntimeExecutionAgent } from '@openclaude/storage'
 import { handleChatProjectsHttp } from './routes/chatProjects.js'
 import type { GatewayHttpIo } from './routes/httpIo.js'
+// Moved with its only caller; re-exported for existing importers.
+export { _buildHealthzDeps } from './routes/system.js'
+import { PRE_AUTH_ROUTES, type PreAuthRoutesIo } from './routes/preAuth.js'
+import { PLATFORM_ROUTES, type PlatformRoutesIo } from './routes/platform.js'
+import { SYSTEM_ROUTES, type SystemRoutesIo } from './routes/system.js'
+import { APP_CONFIG_ROUTES, type AppConfigRoutesIo } from './routes/appConfig.js'
+import { AGENT_ROUTES, type AgentRoutesIo } from './routes/agents.js'
+import { WORKSPACE_API_ROUTES, type WorkspaceApiRoutesIo } from './routes/workspaceApi.js'
+import { dispatchRoutes } from './routes/routeTable.js'
 import {
   type ClientSessionsHttpIo,
   clientSessionIsActive,
@@ -1303,34 +1312,6 @@ export function localExecutionOverride(decision: LocalExecutionDecision | undefi
       source: 'local_catalog',
     },
   }
-}
-
-/**
- * /healthz 深度探活结果合并(纯函数,便于单测)。
- *
- * 输入:sessions.db 探活结果 + commercial 注入的其余依赖探活 map(pg/redis/...)。
- * 输出:扁平化 `deps`(`<name>: 'ok'|'error'` + 失败时 `<name>Error: <msg>`,保留
- * 既有 `sessionsDb`/`sessionsDbError` 形态供既有监控消费)与顶层 `ok`(任一 fail →
- * false)。**HTTP 状态码由调用方恒写 200**,本函数只决定 ok 供告警面消费。
- */
-export function _buildHealthzDeps(
-  sess: { ok: true } | { ok: false; error: string },
-  extra: Record<string, { ok: true } | { ok: false; error: string }>,
-): { deps: Record<string, string>; ok: boolean } {
-  const deps: Record<string, string> = {}
-  let ok = true
-  const put = (name: string, r: { ok: true } | { ok: false; error: string }) => {
-    if (r.ok) {
-      deps[name] = 'ok'
-    } else {
-      deps[name] = 'error'
-      deps[`${name}Error`] = r.error
-      ok = false
-    }
-  }
-  put('sessionsDb', sess)
-  for (const [name, r] of Object.entries(extra)) put(name, r)
-  return { deps, ok }
 }
 
 /** Mirror SubprocessRunner's MCP merge rules for prompt/upload hints.
@@ -3872,6 +3853,193 @@ export class Gateway {
     }
     this._handleHttpAfterCommercial(req, res)
   }
+  /** Narrow view of the Gateway for routes/preAuth.ts (FINDINGS §7.5 2b, OCV5-468). */
+  private readonly preAuthRoutesIo: PreAuthRoutesIo = ((gw: Gateway): PreAuthRoutesIo => ({
+    _handleSkillEvalGenStart: (...args) => gw._handleSkillEvalGenStart(...args),
+    _handleSkillEvalGenStatus: (...args) => gw._handleSkillEvalGenStatus(...args),
+    _handleSkillTrainRun: (...args) => gw._handleSkillTrainRun(...args),
+    _handleSkillTrainStart: (...args) => gw._handleSkillTrainStart(...args),
+    extractToken: (...args) => gw.extractToken(...args),
+    readBody: (...args) => gw.readBody(...args),
+    sendInternalError: (...args) => gw.sendInternalError(...args),
+    sendJson: (...args) => gw.sendJson(...args),
+    get deps() {
+      return gw.deps
+    },
+    get log() {
+      return gw.log
+    },
+    get rateLimiter() {
+      return gw.rateLimiter
+    },
+    get JWT_TTL_SECONDS() {
+      return Gateway.JWT_TTL_SECONDS
+    },
+  }))(this)
+
+  /** Narrow view of the Gateway for routes/platform.ts (FINDINGS §7.5 2b, OCV5-468). */
+  private readonly platformRoutesIo: PlatformRoutesIo = ((gw: Gateway): PlatformRoutesIo => ({
+    _delegateRunnerIdle: (...args) => gw._delegateRunnerIdle(...args),
+    _ensureDelegateJobStore: (...args) => gw._ensureDelegateJobStore(...args),
+    _getAgentsConfigUserView: (...args) => gw._getAgentsConfigUserView(...args),
+    checkHttpAuth: (...args) => gw.checkHttpAuth(...args),
+    checkInboundBypass: (...args) => gw.checkInboundBypass(...args),
+    handleEnginePreheat: (...args) => gw.handleEnginePreheat(...args),
+    handleTurnCancelIfQueued: (...args) => gw.handleTurnCancelIfQueued(...args),
+    handleTurnDispatchState: (...args) => gw.handleTurnDispatchState(...args),
+    handleTurnRejectIfAbsent: (...args) => gw.handleTurnRejectIfAbsent(...args),
+    handleWechatInbound: (...args) => gw.handleWechatInbound(...args),
+    handleWechatInboundCompensate: (...args) => gw.handleWechatInboundCompensate(...args),
+    handleWechatStop: (...args) => gw.handleWechatStop(...args),
+    isHttps: (...args) => gw.isHttps(...args),
+    readBody: (...args) => gw.readBody(...args),
+    sendError: (...args) => gw.sendError(...args),
+    sendInternalError: (...args) => gw.sendInternalError(...args),
+    sendJson: (...args) => gw.sendJson(...args),
+    setSessionCookie: (...args) => gw.setSessionCookie(...args),
+    get _runLog() {
+      return gw._runLog
+    },
+    get _runtimeRecycleDrainCoordinator() {
+      return gw._runtimeRecycleDrainCoordinator
+    },
+    set _runtimeRecycleDrainCoordinator(value) {
+      gw._runtimeRecycleDrainCoordinator = value
+    },
+    get _runtimeRecycleDrainUntil() {
+      return gw._runtimeRecycleDrainUntil
+    },
+    set _runtimeRecycleDrainUntil(value) {
+      gw._runtimeRecycleDrainUntil = value
+    },
+    get _runtimeRecycleIngressActive() {
+      return gw._runtimeRecycleIngressActive
+    },
+    get deps() {
+      return gw.deps
+    },
+    get log() {
+      return gw.log
+    },
+    get sessions() {
+      return gw.sessions
+    },
+  }))(this)
+
+  /** Narrow view of the Gateway for routes/system.ts (FINDINGS §7.5 2b, OCV5-468). */
+  private readonly systemRoutesIo: SystemRoutesIo = ((gw: Gateway): SystemRoutesIo => ({
+    getUserId: (...args) => gw.getUserId(...args),
+    readBody: (...args) => gw.readBody(...args),
+    sendJson: (...args) => gw.sendJson(...args),
+    get _dispatchAuthority() {
+      return gw._dispatchAuthority
+    },
+    get _durableTurnDispatchReady() {
+      return gw._durableTurnDispatchReady
+    },
+    get _runLog() {
+      return gw._runLog
+    },
+    get deps() {
+      return gw.deps
+    },
+    get log() {
+      return gw.log
+    },
+    get sessions() {
+      return gw.sessions
+    },
+    get webhookRouter() {
+      return gw.webhookRouter
+    },
+  }))(this)
+
+  /** Narrow view of the Gateway for routes/appConfig.ts (FINDINGS §7.5 2b, OCV5-468). */
+  private readonly appConfigRoutesIo: AppConfigRoutesIo = ((gw: Gateway): AppConfigRoutesIo => ({
+    sendError: (...args) => gw.sendError(...args),
+    sendJson: (...args) => gw.sendJson(...args),
+    get deps() {
+      return gw.deps
+    },
+  }))(this)
+
+  /** Narrow view of the Gateway for routes/agents.ts (FINDINGS §7.5 2b, OCV5-468). */
+  private readonly agentRoutesIo: AgentRoutesIo = ((gw: Gateway): AgentRoutesIo => ({
+    _handleReleaseJobStatus: (...args) => gw._handleReleaseJobStatus(...args),
+    _handleSkillEvalGenStart: (...args) => gw._handleSkillEvalGenStart(...args),
+    _handleSkillEvalGenStatus: (...args) => gw._handleSkillEvalGenStatus(...args),
+    _handleSkillEvalRunStatus: (...args) => gw._handleSkillEvalRunStatus(...args),
+    _handleSkillEvalStart: (...args) => gw._handleSkillEvalStart(...args),
+    _handleSkillEvalsFile: (...args) => gw._handleSkillEvalsFile(...args),
+    _handleSkillTrainComment: (...args) => gw._handleSkillTrainComment(...args),
+    _handleSkillTrainDraftItem: (...args) => gw._handleSkillTrainDraftItem(...args),
+    _handleSkillTrainDrafts: (...args) => gw._handleSkillTrainDrafts(...args),
+    _handleSkillTrainList: (...args) => gw._handleSkillTrainList(...args),
+    _handleSkillTrainMerge: (...args) => gw._handleSkillTrainMerge(...args),
+    _handleSkillTrainRun: (...args) => gw._handleSkillTrainRun(...args),
+    _handleSkillTrainStart: (...args) => gw._handleSkillTrainStart(...args),
+    _handleUserSkillFiles: (...args) => gw._handleUserSkillFiles(...args),
+    _handleUserSkillHistory: (...args) => gw._handleUserSkillHistory(...args),
+    _handleUserSkillRestore: (...args) => gw._handleUserSkillRestore(...args),
+    handleAgentItem: (...args) => gw.handleAgentItem(...args),
+    handleAgentMessage: (...args) => gw.handleAgentMessage(...args),
+    handleAgentsCollection: (...args) => gw.handleAgentsCollection(...args),
+    handleAutoDreamOptimizer: (...args) => gw.handleAutoDreamOptimizer(...args),
+    handleAutoDreamOptimizerCancel: (...args) => gw.handleAutoDreamOptimizerCancel(...args),
+    handleAutoDreamOptimizerProposal: (...args) => gw.handleAutoDreamOptimizerProposal(...args),
+    handleAutoDreamReport: (...args) => gw.handleAutoDreamReport(...args),
+    handleCollaborationConfig: (...args) => gw.handleCollaborationConfig(...args),
+    handleConsultAdvisor: (...args) => gw.handleConsultAdvisor(...args),
+    handleDelegateTask: (...args) => gw.handleDelegateTask(...args),
+    handleDelegateWait: (...args) => gw.handleDelegateWait(...args),
+    handleEngineAskUser: (...args) => gw.handleEngineAskUser(...args),
+    handleMemory: (...args) => gw.handleMemory(...args),
+    handleMemoryFile: (...args) => gw.handleMemoryFile(...args),
+    handleMemoryUsage: (...args) => gw.handleMemoryUsage(...args),
+    handlePersona: (...args) => gw.handlePersona(...args),
+    handleSkillItem: (...args) => gw.handleSkillItem(...args),
+    handleSkillsList: (...args) => gw.handleSkillsList(...args),
+    handleUserSkillItem: (...args) => gw.handleUserSkillItem(...args),
+    handleUserSkillsList: (...args) => gw.handleUserSkillsList(...args),
+    sendInternalError: (...args) => gw.sendInternalError(...args),
+  }))(this)
+
+  /** Narrow view of the Gateway for routes/workspaceApi.ts (FINDINGS §7.5 2b, OCV5-468). */
+  private readonly workspaceApiRoutesIo: WorkspaceApiRoutesIo = ((gw: Gateway): WorkspaceApiRoutesIo => ({
+    _getAgentsConfigUserView: (...args) => gw._getAgentsConfigUserView(...args),
+    _handleTaskItem: (...args) => gw._handleTaskItem(...args),
+    _handleTasksApi: (...args) => gw._handleTasksApi(...args),
+    _handleWebhook: (...args) => gw._handleWebhook(...args),
+    _handleWechat: (...args) => gw._handleWechat(...args),
+    checkBridgeBypass: (...args) => gw.checkBridgeBypass(...args),
+    getUserId: (...args) => gw.getUserId(...args),
+    handleApiFile: (...args) => gw.handleApiFile(...args),
+    handleCronApi: (...args) => gw.handleCronApi(...args),
+    handleCronChannels: (...args) => gw.handleCronChannels(...args),
+    handleCronItem: (...args) => gw.handleCronItem(...args),
+    handleMediaGet: (...args) => gw.handleMediaGet(...args),
+    handleOAuthCallback: (...args) => gw.handleOAuthCallback(...args),
+    handleOAuthStart: (...args) => gw.handleOAuthStart(...args),
+    handleSearch: (...args) => gw.handleSearch(...args),
+    handleUpload: (...args) => gw.handleUpload(...args),
+    readBody: (...args) => gw.readBody(...args),
+    sendInternalError: (...args) => gw.sendInternalError(...args),
+    sendJson: (...args) => gw.sendJson(...args),
+    verifyCommercialJwt: (...args) => gw.verifyCommercialJwt(...args),
+    get _taskStore() {
+      return gw._taskStore
+    },
+    get deps() {
+      return gw.deps
+    },
+    get log() {
+      return gw.log
+    },
+    get webhookRouter() {
+      return gw.webhookRouter
+    },
+  }))(this)
+
 
   private _handleHttpAfterCommercial(req: IncomingMessage, res: ServerResponse): void {
     const reqStart = Date.now()
@@ -3913,198 +4081,8 @@ export class Gateway {
         this.log.info('http', { method, path, status: res.statusCode, durationMs: duration })
       }
     })
-
-
-    // v3 commercial Codex local relay(M1a 复活)。Codex CLI uses Authorization
-    // for its upstream token, so the container gateway must translate it into a
-    // private header and authenticate to master with OPENCLAUDE_V3_CONTAINER_TOKEN.
-    // The handler is loopback-only; other bridge containers cannot use it.
-    if (url.pathname === V3_CODEX_RELAY_PREFIX || url.pathname.startsWith(`${V3_CODEX_RELAY_PREFIX}/`)) {
-      const relayCfg = readV3CodexRelayConfig(process.env)
-      if (!relayCfg) {
-        this.sendJson(res, 404, { error: { code: 'CODEX_RELAY_NOT_CONFIGURED', message: 'codex relay not configured' } })
-        return
-      }
-      handleV3CodexRelayLocal(req, res, relayCfg).catch((err) => {
-        this.log.error('v3 codex local relay crashed', undefined, err)
-        if (!res.headersSent) {
-          try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'codex relay crashed' } }) } catch {}
-        } else {
-          try { res.end() } catch {}
-        }
-      })
-      return
-    }
-
-    if (url.pathname === V5_GROK_RELAY_PREFIX || url.pathname.startsWith(`${V5_GROK_RELAY_PREFIX}/`)) {
-      const relayCfg = readV5GrokRelayConfig(process.env)
-      if (!relayCfg) {
-        this.sendJson(res, 404, { error: { code: 'GROK_RELAY_NOT_CONFIGURED', message: 'grok relay not configured' } })
-        return
-      }
-      handleV5GrokRelayLocal(req, res, relayCfg).catch((err) => {
-        this.log.error('v5 grok local relay crashed', undefined, err)
-        if (!res.headersSent) {
-          try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'grok relay crashed' } }) } catch {}
-        } else {
-          try { res.end() } catch {}
-        }
-      })
-      return
-    }
-
-    if (url.pathname === V5_ZCODE_RELAY_PREFIX || url.pathname.startsWith(`${V5_ZCODE_RELAY_PREFIX}/`)) {
-      const relayCfg = readV5ZcodeRelayConfig(process.env)
-      if (!relayCfg) {
-        this.sendJson(res, 404, { error: { code: 'ZCODE_RELAY_NOT_CONFIGURED', message: 'zcode relay not configured' } })
-        return
-      }
-      handleV5ZcodeRelayLocal(req, res, relayCfg).catch((err) => {
-        this.log.error('v5 zcode local relay crashed', undefined, err)
-        if (!res.headersSent) {
-          try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'zcode relay crashed' } }) } catch {}
-        } else {
-          try { res.end() } catch {}
-        }
-      })
-      return
-    }
-
-    if (url.pathname === V5_ANTIGRAVITY_RELAY_PREFIX || url.pathname.startsWith(`${V5_ANTIGRAVITY_RELAY_PREFIX}/`)) {
-      const relayCfg = readV5AntigravityRelayConfig(process.env)
-      if (!relayCfg) {
-        this.sendJson(res, 404, { error: { code: 'ANTIGRAVITY_RELAY_NOT_CONFIGURED', message: 'antigravity relay not configured' } })
-        return
-      }
-      handleV5AntigravityRelayLocal(req, res, relayCfg).catch((err) => {
-        this.log.error('v5 antigravity local relay crashed', undefined, err)
-        if (!res.headersSent) {
-          try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'antigravity relay crashed' } }) } catch {}
-        } else {
-          try { res.end() } catch {}
-        }
-      })
-      return
-    }
-
-    // v3/v5 commercial marketplace relay. Codex subprocesses cannot see
-    // OPENCLAUDE_* env, so oc-market falls back to this loopback-only path.
-    if (url.pathname === V3_MARKETPLACE_LOCAL_RELAY_PREFIX || url.pathname.startsWith(`${V3_MARKETPLACE_LOCAL_RELAY_PREFIX}/`)) {
-      const relayCfg = readV3MarketplaceRelayConfig(process.env)
-      if (!relayCfg) {
-        this.sendJson(res, 404, { error: { code: 'MARKETPLACE_RELAY_NOT_CONFIGURED', message: 'marketplace relay not configured' } })
-        return
-      }
-      handleV3MarketplaceRelayLocal(req, res, relayCfg).catch((err) => {
-        this.log.error('v3 marketplace local relay crashed', undefined, err)
-        if (!res.headersSent) {
-          try { this.sendJson(res, 500, { error: { code: 'INTERNAL', message: 'marketplace relay crashed' } }) } catch {}
-        } else {
-          try { res.end() } catch {}
-        }
-      })
-      return
-    }
-
-    // oc-skill 对话内训练/评测生成:容器内 CLI(回环)打本 gateway 自己的 train/eval-gen
-    // API。Codex 子进程 env 被擦拿不到 accessToken,故走这条 loopback-only 路径映射到既有
-    // /api 处理器。身份仍走 getUserId(回环无 JWT → 'default',与 master 代理剥掉
-    // auth/cookie 后的前端请求同一分区 → CLI 起的训练在管理中心可见)。relay 只做「回环 +
-    // 路径匹配」,可写性门/生成-评测互斥/owner/method 一律由被派发的处理器权威执行。
-    if (url.pathname === SKILL_LOCAL_RELAY_PREFIX || url.pathname.startsWith(`${SKILL_LOCAL_RELAY_PREFIX}/`)) {
-      const decision = decideSkillLocalRelay(url.pathname, req.socket.remoteAddress)
-      if (decision.action === 'forbidden') {
-        this.sendJson(res, 403, { error: { code: 'FORBIDDEN', message: 'skill relay is loopback-only' } })
-        return
-      }
-      if (decision.action === 'not-found') {
-        this.sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'unknown skill relay path' } })
-        return
-      }
-      const p = decision.param
-      const guarded = (pr: Promise<void>) => pr.catch((err) => this.sendInternalError(res, err))
-      switch (decision.route) {
-        case 'train-start':
-          guarded(this._handleSkillTrainStart(req, res, p))
-          return
-        case 'train-status':
-          guarded(this._handleSkillTrainRun(req, res, p))
-          return
-        case 'evalgen-start':
-          guarded(this._handleSkillEvalGenStart(req, res, p))
-          return
-        case 'evalgen-status':
-          guarded(this._handleSkillEvalGenStatus(req, res, p))
-          return
-      }
-      return
-    }
-
-    // project_search MCP tool (P5a): loopback-only + the raw gateway token (no JWT,
-    // no bridge bypass). Not an /api/* path, so the browser proxy never reaches it.
-    if (url.pathname === PROJECT_SEARCH_LOCAL_PATH) {
-      const authorized = checkToken(this.extractToken(req), this.deps.config.gateway.accessToken)
-      handleProjectSearchLocal({
-        method: req.method ?? 'GET',
-        url: req.url ?? '/',
-        remoteAddress: req.socket.remoteAddress,
-        authorized,
-      })
-        .then((r) => this.sendJson(res, r.status, r.body))
-        .catch((err) => this.sendInternalError(res, err))
-      return
-    }
-
-    // ── Multi-user login (no auth required, rate-limited) ──
-    if (url.pathname === '/api/auth/login' && req.method === 'POST') {
-      // Use socket address only — X-Forwarded-For is client-spoofable; cloudflared connects locally
-      const clientIp = req.socket.remoteAddress || 'unknown'
-      if (!this.rateLimiter.check(clientIp, 'login')) {
-        this.sendJson(res, 429, { error: 'too many login attempts, try again later' })
-        return
-      }
-      this.readBody(req).then((body) => {
-        let parsed: any
-        try {
-          parsed = JSON.parse(body)
-        } catch {
-          this.sendJson(res, 400, { error: 'invalid JSON' })
-          return
-        }
-        if (typeof parsed !== 'object' || parsed === null) {
-          this.sendJson(res, 400, { error: 'body must be a JSON object' })
-          return
-        }
-        const { username, password } = parsed
-        const users = this.deps.config.gateway.users
-        if (!users?.length) {
-          // Legacy mode: accept raw accessToken as password — username not required
-          if (typeof password !== 'string') {
-            this.sendJson(res, 400, { error: 'password must be a string' })
-            return
-          }
-          if (checkToken(password, this.deps.config.gateway.accessToken)) {
-            const token = signJwt({ userId: 'default', exp: Math.floor(Date.now() / 1000) + Gateway.JWT_TTL_SECONDS }, this.deps.config.gateway.accessToken)
-            this.sendJson(res, 200, { token, userId: 'default', name: 'Default' })
-          } else {
-            this.sendJson(res, 401, { error: 'invalid credentials' })
-          }
-          return
-        }
-        if (typeof username !== 'string' || typeof password !== 'string') {
-          this.sendJson(res, 400, { error: 'username and password must be strings' })
-          return
-        }
-        const user = users.find((u) => u.id === username)
-        if (!user || !verifyPassword(password, user.passwordHash)) {
-          this.sendJson(res, 401, { error: 'invalid credentials' })
-          return
-        }
-        const token = signJwt({ userId: user.id, exp: Math.floor(Date.now() / 1000) + Gateway.JWT_TTL_SECONDS }, this.deps.config.gateway.accessToken)
-        this.sendJson(res, 200, { token, userId: user.id, name: user.name })
-      }).catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
-      return
-    }
+    // Pre-auth routes (local relays, project search, login): dispatched BEFORE the auth gate: routes/preAuth.ts (FINDINGS §7.5 2b).
+    if (dispatchRoutes(PRE_AUTH_ROUTES, this.preAuthRoutesIo, req, res, url)) return
 
     // Routes that need auth
     // All /api/*, /v1/*, and /metrics endpoints require auth except healthz
@@ -4128,1165 +4106,18 @@ export class Gateway {
       res.end(JSON.stringify({ error: 'unauthorized' }))
       return
     }
-
-    // OpenAI-compatible API: /v1/chat/completions, /v1/models
-    if (url.pathname.startsWith('/v1/')) {
-      // /v1/models 枚举面走用户可见投影(隐藏系统 agent 不列);/v1/chat/completions
-      // 目标解析/拒绝仍用全量 agentsConfig + predicate(判定面)。
-      this._getAgentsConfigUserView()
-        .then((agentsConfigUserView) =>
-          handleOpenAIRequest(req, res, url, {
-            config: this.deps.config,
-            agentsConfig: this.deps.agentsConfig,
-            agentsConfigUserView,
-            sessions: this.sessions,
-            runLog: this._runLog,
-            readBody: (r) => this.readBody(r),
-            sendJson: (r, c, b) => this.sendJson(r, c, b),
-            sendError: (r, c, m) => this.sendError(r, c, m),
-          }),
-        )
-        .then((handled) => {
-          if (!handled) this.sendError(res, 404, 'unknown v1 endpoint')
-        })
-        .catch((err) => this.sendInternalError(res, err))
-      return
-    }
-
-    // Session cookie endpoint — called by frontend after login to set HttpOnly cookie
-    // (so img/audio/video elements can access /api/file and /api/media without JS headers)
-    if (url.pathname === '/api/auth/session' && req.method === 'POST') {
-      if (!this.checkHttpAuth(req)) {
-        res.writeHead(401)
-        res.end('unauthorized')
-        return
-      }
-      // setSessionCookie re-verifies the token; if JWT just raced into expiry,
-      // return 401 rather than silently downgrading to 'default' identity.
-      if (!this.setSessionCookie(res, req)) {
-        res.writeHead(401)
-        res.end('unauthorized')
-        return
-      }
-      this.sendJson(res, 200, { ok: true })
-      return
-    }
-
-    // Logout: expire the HttpOnly session cookie
-    if (url.pathname === '/api/auth/logout' && req.method === 'POST') {
-      const secure = this.isHttps(req) ? '; Secure' : ''
-      res.setHeader('Set-Cookie', `oc_session=; HttpOnly; SameSite=Strict${secure}; Path=/api/; Max-Age=0`)
-      this.sendJson(res, 200, { ok: true })
-      return
-    }
-
-    // v5 stale-image recycle handshake. Authentication reuses the existing
-    // host→container inbound nonce; v3 never calls this endpoint.
-    if (url.pathname === '/internal/v3/runtime-recycle-drain' && req.method === 'POST') {
-      if (!this.checkInboundBypass(req, url)) {
-        this.sendJson(res, 401, { error: 'unauthorized' })
-        return
-      }
-      const ttlMs = 10_000
-      let coordinator = this._runtimeRecycleDrainCoordinator
-      if (coordinator === null) {
-        coordinator = new RuntimeRecycleDrainCoordinator({
-          ttlMs,
-          now: () => Date.now(),
-          armGatewayDrain: (until) => {
-            this._runtimeRecycleDrainUntil = until
-          },
-          isGatewayDrainActive: (now) => this._runtimeRecycleDrainUntil > now,
-          releaseGatewayDrain: () => {
-            this._runtimeRecycleDrainUntil = 0
-          },
-          armSessionDrain: (ttl) => this.sessions.armRuntimeRecycleDrain(ttl),
-          isSessionDrainActive: (now) => this.sessions.isRuntimeRecycleDraining(now),
-          releaseSessionDrain: () => this.sessions.releaseRuntimeRecycleDrain(),
-          activeIngress: () => this._runtimeRecycleIngressActive,
-          countDurableRunning: () => countRuntimeRecycleUnsafeTurnDispatches(),
-          ...(isDelegateCutoverEffective()
-            ? {
-                countRunningDelegateJobs: () => this._ensureDelegateJobStore().countRunning(),
-                peekRunningDelegateJobs: () => this._ensureDelegateJobStore().countRunning(),
-                freezeDelegateDispatch: (holder: string, expiresAt?: number) => {
-                  this._ensureDelegateJobStore().freezeDispatch(holder, expiresAt)
-                },
-                thawDelegateDispatch: (holder: string) => {
-                  this._ensureDelegateJobStore().thawDispatch(holder)
-                },
-              }
-            : {}),
-        })
-        this._runtimeRecycleDrainCoordinator = coordinator
-      }
-      void coordinator.attempt().then(
-        (decision) => {
-          if (decision.ok) {
-            this.sendJson(res, 200, { ok: true, drainTtlMs: decision.drainTtlMs })
-            return
-          }
-          this.sendJson(res, decision.status, decision)
-        },
-        (err) => {
-          // Unexpected callback failure is still fail-closed: never leave a
-          // half-armed drain or let the supervisor interpret it as accepted.
-          this._runtimeRecycleDrainUntil = 0
-          this.sessions.releaseRuntimeRecycleDrain()
-          this.log.error('runtime recycle drain evaluation failed', undefined, err as Error)
-          this.sendJson(res, 503, { ok: false, reason: 'drain_state_unavailable' })
-        },
-      )
-      return
-    }
-
-    // OCV5-22 stage 3: host cutover freeze. Scripts are wired in a later
-    // deploy batch; this endpoint is the gateway-side BeginCutover signal.
-    if (url.pathname === '/internal/v3/delegate-begin-cutover' && req.method === 'POST') {
-      if (!this.checkInboundBypass(req, url)) {
-        this.sendJson(res, 401, { error: 'unauthorized' })
-        return
-      }
-      if (!isDelegateCutoverEffective()) {
-        this.sendJson(res, 409, { ok: false, reason: 'cutover_flag_off' })
-        return
-      }
-      const store = this._ensureDelegateJobStore()
-      const rawGeneration = Number.parseInt(url.searchParams.get('generation') ?? '', 10)
-      const generation = Number.isFinite(rawGeneration) ? rawGeneration : Date.now()
-      void beginDelegateCutover(store, {
-        generation,
-        freezeBudgetMs: resolveDelegateCutoverFreezeMs(),
-        isIdle: (job) => this._delegateRunnerIdle(job),
-      }).then(
-        (result) => {
-          this.sendJson(res, 200, { ok: true, ...result })
-        },
-        (err) => {
-          endDelegateCutover(store, generation)
-          this.log.error('delegate begin-cutover failed', undefined, err as Error)
-          this.sendJson(res, 503, { ok: false, reason: 'cutover_quiesce_failed' })
-        },
-      )
-      return
-    }
-
-    if (url.pathname === '/internal/v3/delegate-end-cutover' && req.method === 'POST') {
-      if (!this.checkInboundBypass(req, url)) {
-        this.sendJson(res, 401, { error: 'unauthorized' })
-        return
-      }
-      if (!isDelegateCutoverEffective()) {
-        this.sendJson(res, 409, { ok: false, reason: 'cutover_flag_off' })
-        return
-      }
-      const store = this._ensureDelegateJobStore()
-      const rawGeneration = Number.parseInt(url.searchParams.get('generation') ?? '', 10)
-      if (!Number.isFinite(rawGeneration)) {
-        this.sendJson(res, 400, { ok: false, reason: 'generation_required' })
-        return
-      }
-      this.sendJson(res, 200, { ok: true, ...endDelegateCutover(store, rawGeneration) })
-      return
-    }
-
-    // v3 WeChat broker → 容器 inbound 通道(D3d:HMAC-derived nonce 鉴权)。
-    // master 侧 broker 经 docker bridge gateway 主动 POST 把 WeChat 收到的消息塞进
-    // 容器的 dispatchInbound() 路径,等价于"模拟一条 WS inbound.message"。
-    //
-    // 鉴权完全靠 checkInboundBypass —— **不接受任何 JWT / 旧 token,也不允许 host loopback**;
-    // env(OPENCLAUDE_TRUST_BRIDGE_IP/OC_CONTAINER_ID/OPENCLAUDE_INBOUND_NONCE)缺失 / 形态错
-    // 一律 false,fail-closed。401 时只回最小 JSON,不暴露原因(防 oracle)。
-    //
-    // 端点放到 needsAuth 块之前并提前 return —— 防 `/internal/*` 之类未来路由意外
-    // 被 needsAuth 漏判公开化(/internal/ 不在 needsAuth 当前的 prefix 列表里)。
-    if (url.pathname === '/internal/v3/wechat-inbound' && req.method === 'POST') {
-      if (!this.checkInboundBypass(req, url)) {
-        this.sendJson(res, 401, { error: 'unauthorized' })
-        return
-      }
-      this.handleWechatInbound(req, res).catch((err) => {
-        this.log.error('wechat-inbound handler crashed', undefined, err)
-        if (!res.headersSent) {
-          try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
-        } else {
-          try { res.end() } catch {}
-        }
-      })
-      return
-    }
-    if (url.pathname === '/internal/v3/qq-inbound' && req.method === 'POST') {
-      if (!this.checkInboundBypass(req, url)) {
-        this.sendJson(res, 401, { error: 'unauthorized' })
-        return
-      }
-      this.handleWechatInbound(req, res, 'qqbot').catch((err) => {
-        this.log.error('qq-inbound handler crashed', undefined, err)
-        if (!res.headersSent) {
-          try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
-        } else {
-          try { res.end() } catch {}
-        }
-      })
-      return
-    }
-
-    // master → 容器 session-open 引擎预热。鉴权同 wechat-inbound(checkInboundBypass)。
-    // 内部口自带 gate,不读 OC_ENGINE_PREHEAT。先 200 再异步 spawn,避免卡住 master POST。
-    if (url.pathname === '/internal/v3/engine-preheat' && req.method === 'POST') {
-      if (!this.checkInboundBypass(req, url)) {
-        this.sendJson(res, 401, { error: 'unauthorized' })
-        return
-      }
-      this.handleEnginePreheat(req, res).catch((err) => {
-        this.log.warn('engine-preheat handler crashed', undefined, err as Error)
-        if (!res.headersSent) {
-          try { this.sendJson(res, 200, { ok: true, skipped: true }) } catch {}
-        } else {
-          try { res.end() } catch {}
-        }
-      })
-      return
-    }
-
-    // 容器侧 WeChat inbound 补偿端点。master broker 的 inboundDispatcher Step 2
-    // 失败时调本端点撤销 Step 1 写入的 client_sessions row。
-    //
-    //   - 鉴权同 /wechat-inbound:走 checkInboundBypass(已支持 /internal/v3/* 前缀)
-    //   - **idempotent + always-200**:dispatcher 视任何 500 / 非-200 都为 "compensation
-    //     failed",而 reconcile 30s 才兜底。always-200 + `deleted` 字段把"行不存在 / 已
-    //     删 / 真删了"三种状态显式化,避免 dispatcher 把 idempotent no-op 错记成 error
-    //   - 真 DB 错也照 200 返(body 内带 errMessage 让 broker log 观测,但 dispatcher
-    //     不重试 — 重试同一条 compensation 也不会成,reconcile 会兜底清孤儿)
-    if (url.pathname === '/internal/v3/wechat-inbound-compensate' && req.method === 'POST') {
-      if (!this.checkInboundBypass(req, url)) {
-        this.sendJson(res, 401, { error: 'unauthorized' })
-        return
-      }
-      this.handleWechatInboundCompensate(req, res).catch((err) => {
-        this.log.error('wechat-inbound-compensate handler crashed', undefined, err)
-        if (!res.headersSent) {
-          // crash 路径也照 200 返 — dispatcher 永远不该 retry compensation
-          try { this.sendJson(res, 200, { ok: true, deleted: false, errMessage: 'internal' }) } catch {}
-        } else {
-          try { res.end() } catch {}
-        }
-      })
-      return
-    }
-    if (url.pathname === '/internal/v3/qq-inbound-compensate' && req.method === 'POST') {
-      if (!this.checkInboundBypass(req, url)) {
-        this.sendJson(res, 401, { error: 'unauthorized' })
-        return
-      }
-      this.handleWechatInboundCompensate(req, res).catch((err) => {
-        this.log.error('qq-inbound-compensate handler crashed', undefined, err)
-        if (!res.headersSent) {
-          try { this.sendJson(res, 200, { ok: true, deleted: false, errMessage: 'internal' }) } catch {}
-        } else {
-          try { res.end() } catch {}
-        }
-      })
-      return
-    }
-
-    // v3 WeChat `/stop` bridge. Master broker resolves the current wsess and
-    // POSTs here so the container can interrupt the in-process runner. Same
-    // HMAC gate as `/wechat-inbound`; the endpoint is intentionally internal
-    // and never exposed to browser/client traffic.
-    if (url.pathname === '/internal/v3/wechat-stop' && req.method === 'POST') {
-      if (!this.checkInboundBypass(req, url)) {
-        this.sendJson(res, 401, { error: 'unauthorized' })
-        return
-      }
-      this.handleWechatStop(req, res).catch((err) => {
-        this.log.error('wechat-stop handler crashed', undefined, err)
-        if (!res.headersSent) {
-          try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
-        } else {
-          try { res.end() } catch {}
-        }
-      })
-      return
-    }
-    if (url.pathname === '/internal/v3/qq-stop' && req.method === 'POST') {
-      if (!this.checkInboundBypass(req, url)) {
-        this.sendJson(res, 401, { error: 'unauthorized' })
-        return
-      }
-      this.handleWechatStop(req, res).catch((err) => {
-        this.log.error('qq-stop handler crashed', undefined, err)
-        if (!res.headersSent) {
-          try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
-        } else {
-          try { res.end() } catch {}
-        }
-      })
-      return
-    }
-
-    // ── RFC-v5-durable-turn-dispatch §3 端点(鉴权同 wechat-inbound:checkInboundBypass,
-    //    HMAC-derived nonce,fail-closed;master reconciler / turnDispatchReconciler 调用)──
-    //
-    // POST /internal/v3/turn-reject-if-absent —— reconciler rejecting 分支:有 inbox 行
-    // 返状态(negative proof 不成立);无行插 rejected(not_accepted)墓碑。durable
-    // rejected tombstone 是 I2 里 negative proof 的**唯一**合法来源。
-    if (url.pathname === TURN_CANCEL_IF_QUEUED_PATH && req.method === 'POST') {
-      if (!this.checkInboundBypass(req, url)) {
-        this.sendJson(res, 401, { error: 'unauthorized' })
-        return
-      }
-      this.handleTurnCancelIfQueued(req, res).catch((err) => {
-        this.log.error('turn-cancel-if-queued handler crashed', undefined, err)
-        if (!res.headersSent) {
-          try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
-        } else {
-          try { res.end() } catch {}
-        }
-      })
-      return
-    }
-    if (url.pathname === '/internal/v3/turn-reject-if-absent' && req.method === 'POST') {
-      if (!this.checkInboundBypass(req, url)) {
-        this.sendJson(res, 401, { error: 'unauthorized' })
-        return
-      }
-      this.handleTurnRejectIfAbsent(req, res).catch((err) => {
-        this.log.error('turn-reject-if-absent handler crashed', undefined, err)
-        if (!res.headersSent) {
-          try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
-        } else {
-          try { res.end() } catch {}
-        }
-      })
-      return
-    }
-
-    // GET /internal/v3/turn-dispatch-state —— reconciler accepted 分支查行(按逻辑键)。
-    if (url.pathname === '/internal/v3/turn-dispatch-state' && req.method === 'GET') {
-      if (!this.checkInboundBypass(req, url)) {
-        this.sendJson(res, 401, { error: 'unauthorized' })
-        return
-      }
-      this.handleTurnDispatchState(url, res).catch((err) => {
-        this.log.error('turn-dispatch-state handler crashed', undefined, err)
-        if (!res.headersSent) {
-          try { this.sendJson(res, 500, { error: 'internal' }) } catch {}
-        } else {
-          try { res.end() } catch {}
-        }
-      })
-      return
-    }
-
-    // Frontend diagnostic trace sink — receives ring-buffer events from
-    // packages/web/public/modules/trace.js for diagnosing the "已读但无回复"
-    // class of bug (assistant frame delivered by gateway but never landed in
-    // client_sessions.messages). NO database write — pino structured log only,
-    // queryable via journalctl/grep. 50KB body cap defends the endpoint from
-    // accidental flood (RING_MAX*compact entries fits well under).
-    if (url.pathname === '/api/web-trace' && req.method === 'POST') {
-      const userId = this.getUserId(req)
-      this.readBody(req, 50 * 1024)
-        .then((body) => {
-          let payload: unknown
-          try {
-            payload = JSON.parse(body)
-          } catch {
-            this.sendJson(res, 400, { error: 'invalid json' })
-            return
-          }
-          const events = (payload as { events?: unknown })?.events
-          if (!Array.isArray(events)) {
-            this.sendJson(res, 400, { error: 'events array required' })
-            return
-          }
-          this.log.info('web-trace', { userId, count: events.length, events })
-          res.writeHead(204)
-          res.end()
-        })
-        .catch((err) => {
-          const tooLarge = String(err?.message ?? err).includes('body too large')
-          if (tooLarge) {
-            this.sendJson(res, 413, { error: 'body too large' })
-          } else {
-            this.sendJson(res, 400, { error: 'read failed' })
-          }
-        })
-      return
-    }
-
-    if (url.pathname === '/healthz') {
-      // V3 2H: /healthz 增加 commercial 模块状态(供运维快速判断 v2/v3 实例形态)
-      const c = this.deps.commercial
-      // v3 file proxy: advertise `file-proxy-v1` capability only when ALL three
-      // env vars HOST relies on are injected AND well-formed. Incomplete或形态不对
-      // (supervisor 写错 / 部署降级 / 容器复用)→ not ready → HOST 返 CONTAINER_OUTDATED,
-      // 避免 HOST 按 bypass 发头结果容器内 checkBridgeBypass 失败 401 的 dead lock。
-      // (Codex R1 SHOULD-3:校验形态,不只校验非空)
-      const OC_CONTAINER_ID = process.env.OC_CONTAINER_ID || ''
-      // file-proxy-v1 仍只看 TRUST_BRIDGE 三件套形态(isHealthzFileProxyReady)。
-      // local-bridge token 不是三件套的一部分,W4:不得因此广播 file-proxy-v1。
-      const bridgeReady = isHealthzFileProxyReady(process.env)
-      const body: Record<string, unknown> = c
-        ? {
-            ok: true,
-            commercial: {
-              enabled: true,
-              internalProxy: c.internalProxyAddress
-                ? { host: c.internalProxyAddress.host, port: c.internalProxyAddress.port }
-                : null,
-            },
-          }
-        : { ok: true }
-      body.containerId = OC_CONTAINER_ID || null
-      // RFC-v5-durable-turn-dispatch §3/§B5 — durable-turn-dispatch-v1 runtime capability
-      // 在 healthz 与 attest 两处一致广播,且**绑定完整 readiness**(验签能力 ∧ sink 装配 ∧
-      // boot recovery 首跑成功);任一不满足 → 不申报(legacy)。单一权威 durableTurnDispatchCapabilities。
-      const healthzCaps: string[] = []
-      if (bridgeReady) healthzCaps.push('file-proxy-v1')
-      healthzCaps.push(
-        ...durableTurnDispatchCapabilities(
-          this._dispatchAuthority.enabled,
-          this._durableTurnDispatchReady,
-        ),
-      )
-      body.capabilities = healthzCaps
-      // v5 灰度可观测 — channel 标签 + commercial 运行时状态(控制面静默 / 运行时隔离 /
-      // 灰度归属的只读断言面)。无标签默认 "v3";commercial 未注入 runtimeStatus 时省略。
-      body.channel = process.env.OC_RUNTIME_CHANNEL?.trim() || 'v3'
-      // P3(RFC D3/D5):v5 双 master 下 healthz 顶层暴露 slot 身份(与 commercial ocSlot 同权威源
-      // OC_SLOT,A 默认)。Caddy verifier 经此断言"经分流命中的响应确实来自目标 slot"(去 || true 后严格)。
-      if (body.channel === 'v5') body.slot = process.env.OC_SLOT?.trim() || 'A'
-      const instanceId = process.env.OC_INSTANCE_ID?.trim()
-      if (instanceId) body.instance = instanceId
-      if (c?.runtimeStatus) body.runtime = c.runtimeStatus
-      if (c) {
-        // master 形态深度探活:sessions.db open 失败 = 会话 list/save/落库全崩;
-        // commercial 注入的强依赖(PG `SELECT 1` / Redis `PING`,见 probeDeps)挂了
-        // 同样致命。任一 fail → ok 翻 false 让监控(断言 .ok==true)与 deploy smoke
-        // 抓到 —— 2026-07-06 存量库 schema 事故中进程活着但全站 500 两小时无告警的
-        // 盲区收口,本波扩到 PG/Redis 维度(同构盲区:换权威源维度)。
-        // 保持 HTTP 200:深度不健康 ≠ 完全不可服务(聊天引擎/静态资源仍在跑),
-        // 不给上游 LB 摘流量的信号,只翻 ok 供告警面消费。
-        // 容器内 gateway(c 为空)不探活:HOST probe 消费 capabilities 语义,不动。
-        // commercial 未注入 probeDeps(旧接线/个人版)时退回仅探 sessions.db。
-        void Promise.all([
-          probeSessionsDb().catch(
-            (): { ok: false; error: string } => ({ ok: false, error: 'probe rejected' }),
-          ),
-          c.probeDeps
-            ? c.probeDeps().catch(
-                (): Record<string, { ok: false; error: string }> => ({
-                  commercialDeps: { ok: false, error: 'probe rejected' },
-                }),
-              )
-            : Promise.resolve<Record<string, { ok: true } | { ok: false; error: string }>>({}),
-        ])
-          .then(([sess, extra]) => {
-            const built = _buildHealthzDeps(sess, extra)
-            body.deps = built.deps
-            if (!built.ok) body.ok = false
-            res.writeHead(200, { 'Content-Type': 'application/json' })
-            res.end(JSON.stringify(body))
-          })
-          .catch(() => {
-            // 兜底防 healthz 挂起(上面各探活分支已内部 catch,理论到不了这里)。
-            body.ok = false
-            body.deps = { sessionsDb: 'error', sessionsDbError: 'probe rejected' }
-            res.writeHead(200, { 'Content-Type': 'application/json' })
-            res.end(JSON.stringify(body))
-          })
-        return
-      }
-      // 容器/个人版形态(c 空):附 durable inbox open-job / 字节 gauge(RFC §3
-      // healthz),异步取一次后 end。stats 失败不阻塞健康返回(inbox 是可观测面,
-      // 非可服务面)。个人版(无 commercial 注入)同样深度探 sessions.db —— 本地
-      // SQLite 在此形态下就是会话权威库,打不开 = list/save/落库全崩,必须翻 ok
-      // 供监控/doctor 消费(与上方 master 形态同一探针与 deps 语义)。
-      void Promise.all([
-        probeSessionsDb().catch(
-          (): { ok: false; error: string } => ({ ok: false, error: 'probe rejected' }),
-        ),
-        turnDispatchInboxStats()
-          .then((stats): { openJobs: number | null; bytes: number | null } => ({
-            openJobs: stats.openJobs,
-            bytes: stats.bytes,
-          }))
-          .catch((): { openJobs: null; bytes: null } => ({ openJobs: null, bytes: null })),
-      ])
-        .then(([sess, inbox]) => {
-          body.turnDispatchInbox = inbox
-          const built = _buildHealthzDeps(sess, {})
-          body.deps = built.deps
-          if (!built.ok) body.ok = false
-        })
-        .catch(() => {
-          // 兜底防 healthz 挂起(上面各探活分支已内部 catch,理论到不了这里)。
-          body.ok = false
-          body.deps = { sessionsDb: 'error', sessionsDbError: 'probe rejected' }
-        })
-        .finally(() => {
-          res.writeHead(200, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify(body))
-        })
-      return
-    }
-    if (path === '/metrics') {
-      sessionsActive.value = this.sessions.list().length
-      res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' })
-      res.end(serializeMetrics())
-      return
-    }
-    // /version — reports currently-live release. Written by scripts/deploy-v3.sh
-    // as <cwd>/VERSION.json after rsync and before systemctl restart. Public
-    // (no auth) because commit hash of a private repo carries no secret value
-    // and matches the already-open /healthz posture.
-    if (url.pathname === '/version' && req.method === 'GET') {
-      let body: { tag: string; builtAt: string | null; commit?: string } = {
-        tag: 'unknown',
-        builtAt: null,
-      }
-      try {
-        const raw = readFileSync(resolve(process.cwd(), 'VERSION.json'), 'utf-8')
-        const j = JSON.parse(raw)
-        if (typeof j.tag === 'string') body.tag = j.tag
-        if (typeof j.builtAt === 'string') body.builtAt = j.builtAt
-        if (typeof j.commit === 'string') body.commit = j.commit
-      } catch {
-        // file missing / unreadable / malformed → return defaults above
-      }
-      this.sendJson(res, 200, body)
-      return
-    }
-    if (url.pathname === '/api/doctor') {
-      const summary = this._runLog.summary()
-      const recentRuns = this._runLog.recent(20)
-      const sessions = this.sessions.list()
-      const webhooks = this.webhookRouter?.list().length ?? 0
-      this.sendJson(res, 200, {
-        uptime: process.uptime(),
-        memoryMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
-        activeSessions: sessions.length,
-        webhooks,
-        runLog: summary,
-        recentRuns,
-      })
-      return
-    }
-    if (url.pathname === '/api/usage' && req.method === 'GET') {
-      const agentId = url.searchParams.get('agentId') ?? undefined
-      const sessionId = url.searchParams.get('sessionId') ?? undefined
-      const sinceRaw = url.searchParams.get('since')
-      const since = sinceRaw ? Number(sinceRaw) : undefined
-      if (since !== undefined && !Number.isFinite(since)) {
-        this.sendJson(res, 400, { error: 'since must be a valid number' }); return
-      }
-      Promise.all([
-        getUsageSummary({ agentId, sessionId, since }),
-        queryEvents({ type: 'cost.recorded', agentId, sessionKey: sessionId, since, limit: 50 }),
-      ]).then(([summary, events]) => {
-        this.sendJson(res, 200, { summary, recentCostEvents: events })
-      }).catch(() => this.sendJson(res, 500, { error: 'usage query failed' }))
-      return
-    }
-    if (url.pathname === '/api/usage/events' && req.method === 'GET') {
-      const type = url.searchParams.get('type') ?? undefined
-      const agentId = url.searchParams.get('agentId') ?? undefined
-      const sessionKey = url.searchParams.get('sessionKey') ?? undefined
-      const sinceRaw = url.searchParams.get('since')
-      const since = sinceRaw ? Number(sinceRaw) : undefined
-      const limitRaw = url.searchParams.get('limit')
-      const limitNum = limitRaw ? Number(limitRaw) : 100
-      const limit = Number.isFinite(limitNum) ? Math.min(Math.max(limitNum, 1), 1000) : 100
-      if (since !== undefined && !Number.isFinite(since)) {
-        this.sendJson(res, 400, { error: 'since must be a valid number' }); return
-      }
-      queryEvents({ type, agentId, sessionKey, since, limit })
-        .then((events) => this.sendJson(res, 200, { events }))
-        .catch(() => this.sendJson(res, 500, { error: 'event query failed' }))
-      return
-    }
-    if (url.pathname === '/api/runs' && req.method === 'GET') {
-      this.sendJson(res, 200, { runs: this._runLog.recent(50) })
-      return
-    }
+    // Platform routes (/v1/, auth session/logout, /internal/v3/*): routes/platform.ts (FINDINGS §7.5 2b).
+    if (dispatchRoutes(PLATFORM_ROUTES, this.platformRoutesIo, req, res, url)) return
+    // System routes (web-trace, healthz, metrics, version, doctor, usage, runs): routes/system.ts (FINDINGS §7.5 2b).
+    if (dispatchRoutes(SYSTEM_ROUTES, this.systemRoutesIo, req, res, url)) return
     // Client session routes (/api/sessions/*): routes/clientSessions.ts (FINDINGS §7 step 2a).
     if (handleClientSessionsHttp(this.clientSessionsIo, req, res, url)) return
-    // Server-side feature flags for the web UI (env predicates, see protocol/serverFeatures).
-    // Its own route because /api/config stays host-only: the master proxies only this one.
-    if (url.pathname === '/api/features') {
-      if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-      this.sendJson(res, 200, { features: readServerFeatures(process.env) })
-      return
-    }
-    if (url.pathname === '/api/config') {
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      const activeMcps: Array<{ id: string; label?: string; provider?: string; tools?: string[] }> =
-        []
-      const activeProvider = this.deps.config.provider
-      for (const srv of this.deps.config.mcpServers ?? []) {
-        if (srv.enabled === false) continue
-        if (srv.provider && srv.provider !== activeProvider) continue
-        activeMcps.push({ id: srv.id, label: srv.label, provider: srv.provider, tools: srv.tools })
-      }
-      const authInfo: Record<string, any> = { mode: this.deps.config.auth.mode }
-      if (this.deps.config.auth.claudeOAuth?.accessToken) {
-        authInfo.claudeOAuth = {
-          active: true,
-          expiresAt: this.deps.config.auth.claudeOAuth.expiresAt,
-        }
-      }
-      res.end(
-        JSON.stringify({
-          gateway: { bind: this.deps.config.gateway.bind, port: this.deps.config.gateway.port },
-          defaults: this.deps.config.defaults,
-          channels: Object.keys(this.deps.config.channels),
-          provider: activeProvider,
-          auth: authInfo,
-          mcpServers: activeMcps,
-          features: readServerFeatures(process.env),
-        }),
-      )
-      return
-    }
-    if (url.pathname === '/api/agents') {
-      this.handleAgentsCollection(req, res).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    const agentIdMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)$/)
-    if (agentIdMatch) {
-      this.handleAgentItem(req, res, agentIdMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const personaMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/persona$/)
-    if (personaMatch) {
-      this.handlePersona(req, res, personaMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const memoryMatch = url.pathname.match(
-      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/(memory|user)$/,
-    )
-    if (memoryMatch) {
-      this.handleMemory(req, res, memoryMatch[1], memoryMatch[2] as 'memory' | 'user').catch(
-        (err) => this.sendInternalError(res, err),
-      )
-      return
-    }
-    const memoryUsageMatch = url.pathname.match(
-      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/usage$/,
-    )
-    if (memoryUsageMatch) {
-      this.handleMemoryUsage(req, res, memoryUsageMatch[1], url).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const autoDreamReportMatch = url.pathname.match(
-      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/auto-dream-report$/,
-    )
-    if (autoDreamReportMatch) {
-      this.handleAutoDreamReport(req, res, autoDreamReportMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const optimizerMatch = url.pathname.match(
-      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/auto-dream-optimizer$/,
-    )
-    if (optimizerMatch) {
-      this.handleAutoDreamOptimizer(req, res, optimizerMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const optimizerCancelMatch = url.pathname.match(
-      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/auto-dream-optimizer\/cancel$/,
-    )
-    if (optimizerCancelMatch) {
-      this.handleAutoDreamOptimizerCancel(req, res, optimizerCancelMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const optimizerProposalMatch = url.pathname.match(
-      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/auto-dream-optimizer\/proposals\/([0-9a-f]{32})\/(apply|dismiss)$/,
-    )
-    if (optimizerProposalMatch) {
-      this.handleAutoDreamOptimizerProposal(
-        req,
-        res,
-        optimizerProposalMatch[1],
-        optimizerProposalMatch[2],
-        optimizerProposalMatch[3] as 'apply' | 'dismiss',
-      ).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    // 单条记忆文件 CRUD(memdir)::file 用宽松 [^/]+ 捕获,handler 内 basename+MEMORY_FILE_RE 双保险。
-    const memoryFileMatch = url.pathname.match(
-      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/memory\/files\/([^/]+)$/,
-    )
-    if (memoryFileMatch) {
-      this.handleMemoryFile(req, res, memoryFileMatch[1], memoryFileMatch[2]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    // User-level skill library (agentId-less; baseline + shared + aggregated legacy).
-    if (url.pathname === '/api/skills') {
-      this.handleUserSkillsList(req, res).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    const userSkillFilesMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)\/files$/)
-    if (userSkillFilesMatch) {
-      this._handleUserSkillFiles(req, res, userSkillFilesMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const userSkillHistoryMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)\/history$/)
-    if (userSkillHistoryMatch) {
-      this._handleUserSkillHistory(req, res, userSkillHistoryMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const userSkillRestoreMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)\/restore$/)
-    if (userSkillRestoreMatch) {
-      this._handleUserSkillRestore(req, res, userSkillRestoreMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const userSkillItemMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)$/)
-    if (userSkillItemMatch) {
-      this.handleUserSkillItem(req, res, userSkillItemMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const skillsListMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/skills$/)
-    if (skillsListMatch) {
-      this.handleSkillsList(req, res, skillsListMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const skillViewMatch = url.pathname.match(
-      /^\/api\/agents\/([a-zA-Z0-9_-]+)\/skills\/([a-z0-9-]+)$/,
-    )
-    if (skillViewMatch) {
-      this.handleSkillItem(req, res, skillViewMatch[1], skillViewMatch[2]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    // ── Skill evals(用例 CRUD + 隔离双跑评测)──
-    const skillEvalsFileMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)\/evals$/)
-    if (skillEvalsFileMatch) {
-      this._handleSkillEvalsFile(req, res, skillEvalsFileMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const skillEvalStartMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)\/eval-run$/)
-    if (skillEvalStartMatch) {
-      this._handleSkillEvalStart(req, res, skillEvalStartMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const skillEvalRunMatch = url.pathname.match(/^\/api\/skill-eval\/([a-zA-Z0-9_-]+)$/)
-    if (skillEvalRunMatch) {
-      this._handleSkillEvalRunStatus(req, res, skillEvalRunMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    // AI 生成用例(P1):启动异步生成 + 轮询状态。skill 名段用 [a-z0-9-]+ 与容器路由 /
-    // bridge allowlist 完全一致(evals 精确路由带 $,不会吞掉 evals/generate)。
-    const skillEvalGenStartMatch = url.pathname.match(
-      /^\/api\/skills\/([a-z0-9-]+)\/evals\/generate$/,
-    )
-    if (skillEvalGenStartMatch) {
-      this._handleSkillEvalGenStart(req, res, skillEvalGenStartMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const skillEvalGenRunMatch = url.pathname.match(/^\/api\/skill-eval-gen\/([a-zA-Z0-9_-]+)$/)
-    if (skillEvalGenRunMatch) {
-      this._handleSkillEvalGenStatus(req, res, skillEvalGenRunMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const releaseJobMatch = url.pathname.match(/^\/api\/v5\/release-jobs\/(rel-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12})$/)
-    if (releaseJobMatch) {
-      this._handleReleaseJobStatus(req, res, releaseJobMatch[1])
-      return
-    }
-
-    // ── SkillOpt skill-training (async; train → diff → confirm-merge) ──
-    const skillTrainStartMatch = url.pathname.match(/^\/api\/skills\/([a-z0-9-]+)\/train$/)
-    if (skillTrainStartMatch) {
-      this._handleSkillTrainStart(req, res, skillTrainStartMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const skillTrainDraftItemMatch = url.pathname.match(
-      /^\/api\/skill-training\/([a-zA-Z0-9_-]+)\/drafts\/([a-z0-9-]+)$/,
-    )
-    if (skillTrainDraftItemMatch) {
-      this._handleSkillTrainDraftItem(
-        req,
-        res,
-        skillTrainDraftItemMatch[1],
-        skillTrainDraftItemMatch[2],
-      ).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    const skillTrainCommentMatch = url.pathname.match(
-      /^\/api\/skill-training\/([a-zA-Z0-9_-]+)\/drafts\/([a-z0-9-]+)\/comment$/,
-    )
-    if (skillTrainCommentMatch) {
-      this._handleSkillTrainComment(
-        req,
-        res,
-        skillTrainCommentMatch[1],
-        skillTrainCommentMatch[2],
-      ).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    const skillTrainDraftsMatch = url.pathname.match(
-      /^\/api\/skill-training\/([a-zA-Z0-9_-]+)\/drafts$/,
-    )
-    if (skillTrainDraftsMatch) {
-      this._handleSkillTrainDrafts(req, res, skillTrainDraftsMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    const skillTrainMergeMatch = url.pathname.match(
-      /^\/api\/skill-training\/([a-zA-Z0-9_-]+)\/merge$/,
-    )
-    if (skillTrainMergeMatch) {
-      this._handleSkillTrainMerge(req, res, skillTrainMergeMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    // 集合端点在 :runId 之前精确匹配 —— 训练 run 的找回入口(刷新/重启后 runId 不再只活在前端 state)。
-    if (url.pathname === '/api/skill-training') {
-      this._handleSkillTrainList(req, res).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    const skillTrainRunMatch = url.pathname.match(/^\/api\/skill-training\/([a-zA-Z0-9_-]+)$/)
-    if (skillTrainRunMatch) {
-      this._handleSkillTrainRun(req, res, skillTrainRunMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    // ── Inter-agent messaging ──
-    const agentMsgMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/message$/)
-    if (agentMsgMatch) {
-      this.handleAgentMessage(req, res, agentMsgMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    // ── Async delegate job long-poll (Cursor MCP 60s ceiling) ──
-    if (url.pathname === '/api/delegate/wait') {
-      this.handleDelegateWait(req, res).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    // ── Advisor consult (dedicated; never /delegate) ──
-    if (url.pathname === '/api/agents/advisor/consult' && req.method === 'POST') {
-      this.handleConsultAdvisor(req, res).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    if (url.pathname === '/api/collaboration-config') {
-      this.handleCollaborationConfig(req, res, url).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    // ── Synchronous task delegation ──
-    const delegateMatch = url.pathname.match(/^\/api\/agents\/([A-Za-z0-9._:-]+)\/delegate$/)
-    if (delegateMatch) {
-      this.handleDelegateTask(req, res, delegateMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    // ── Engine ask-user bridge (cursor MCP ask_user → web choice cards) ──
-    const askUserMatch = url.pathname.match(/^\/api\/agents\/([a-zA-Z0-9_-]+)\/ask-user$/)
-    if (askUserMatch) {
-      this.handleEngineAskUser(req, res, askUserMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    // ── Changelog / Release Notes ──
-    if (url.pathname === '/api/changelog' && req.method === 'GET') {
-      const changelogPath = join(paths.home, 'changelog.json')
-      try {
-        const raw = readFileSync(changelogPath, 'utf-8')
-        const data = JSON.parse(raw)
-        this.sendJson(res, 200, data)
-      } catch {
-        this.sendJson(res, 200, { currentVersion: '0.0.0', releases: [] })
-      }
-      return
-    }
-
-    // ── User Feedback ──
-    if (url.pathname === '/api/feedback' && req.method === 'POST') {
-      this.readBody(req).then(async (body) => {
-        try {
-          const { category, description, sessionId, userAgent } = JSON.parse(body)
-          if (!description || typeof description !== 'string' || description.trim().length < 15) {
-            this.sendJson(res, 400, { error: '反馈描述至少需要 15 个字符' }); return
-          }
-          const feedbackDir = join(paths.home, 'feedback')
-          await mkdir(feedbackDir, { recursive: true })
-          const entry = {
-            id: `fb-${Date.now()}-${randomBytes(4).toString('hex')}`,
-            category: category || 'general',
-            description,
-            sessionId: sessionId || null,
-            userAgent: userAgent || null,
-            userId: this.getUserId(req),
-            createdAt: new Date().toISOString(),
-          }
-          const filePath = join(feedbackDir, `${entry.id}.json`)
-          await writeFile(filePath, JSON.stringify(entry, null, 2))
-          this.sendJson(res, 200, { ok: true, id: entry.id })
-        } catch (err) {
-          // E5 — 原始错误(可能含内部路径/栈)只进日志,响应体给受控文案。
-          this.log.warn('feedback submit failed', undefined, err as Error)
-          this.sendJson(res, 400, { error: '反馈提交失败，请稍后重试' })
-        }
-      }).catch(() => this.sendJson(res, 400, { error: 'invalid body' }))
-      return
-    }
-    if (url.pathname === '/api/feedback' && req.method === 'GET') {
-      const feedbackDir = join(paths.home, 'feedback')
-      const userId = this.getUserId(req)
-      try {
-        const files = existsSync(feedbackDir)
-          ? readdirSync(feedbackDir).filter(f => f.endsWith('.json')).sort().reverse()
-          : []
-        const items: unknown[] = []
-        for (const f of files) {
-          if (items.length >= 50) break
-          try {
-            const entry = JSON.parse(readFileSync(join(feedbackDir, f), 'utf-8'))
-            if (entry && entry.userId === userId) items.push(entry)
-          } catch { /* skip corrupt files */ }
-        }
-        this.sendJson(res, 200, { feedback: items })
-      } catch {
-        this.sendJson(res, 200, { feedback: [] })
-      }
-      return
-    }
-
-    if (url.pathname === '/api/search') {
-      this.handleSearch(req, res, url).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    // ── Cron/reminder REST API ──
-    // /api/cron/channels 必须写在 :id 匹配之前,否则会被当成 job id「channels」。
-    if (url.pathname === '/api/cron/channels') {
-      this.handleCronChannels(req, res).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    if (url.pathname === '/api/cron') {
-      this.handleCronApi(req, res).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    const cronItemMatch = url.pathname.match(/^\/api\/cron\/([a-zA-Z0-9_-]+)$/)
-    if (cronItemMatch) {
-      this.handleCronItem(req, res, cronItemMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    // ── Taskboard REST API (`/api/board/*`) ──
-    // 分发形态必须写在本文件的 url.pathname === / match 上,containerRouteInventory
-    // 靠扫描这三种字面量收路由;藏进 helper 会让 allowlist 闭包测试变死规则。
-    if (
-      url.pathname === '/api/board/projects' ||
-      url.pathname === '/api/board/tickets' ||
-      url.pathname === '/api/board/pipelines' ||
-      url.pathname === '/api/board/agents' ||
-      url.pathname === '/api/board/settings' ||
-      url.pathname === '/api/board/stats/cost' ||
-      url.pathname === '/api/board/templates' ||
-      url.pathname === '/api/board/reports/weekly' ||
-      url.pathname.match(/^\/api\/board\/projects\/([^/]+)$/) ||
-      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/board$/) ||
-      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/context$/) ||
-      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/context\/preview$/) ||
-      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/ensure$/) ||
-      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/workspace$/) ||
-      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/workspace\/file$/) ||
-      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories$/) ||
-      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)$/) ||
-      url.pathname.match(/^\/api\/board\/projects\/([^/]+)\/memories\/([^/]+)\/(promote|reject|deprecate)$/) ||
-      url.pathname.match(/^\/api\/board\/runs\/([^/]+)\/context$/) ||
-      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)$/) ||
-      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(ready|claim|advance)$/) ||
-      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(block|approve|reject)$/) ||
-      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(done|cancel|comment|patrol|move)$/) ||
-      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/runs$/) ||
-      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/relations$/) ||
-      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/comments$/) ||
-      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/activity$/) ||
-      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/timeline$/) ||
-      url.pathname.match(/^\/api\/board\/pipelines\/([^/]+)$/) ||
-      url.pathname.match(/^\/api\/board\/pipelines\/([^/]+)\/reorder$/) ||
-      url.pathname.match(/^\/api\/board\/pipelines\/([^/]+)\/stages$/) ||
-      url.pathname.match(/^\/api\/board\/stages\/([^/]+)$/) ||
-      url.pathname.match(/^\/api\/board\/runs\/([^/]+)$/) ||
-      url.pathname.match(/^\/api\/board\/relations\/([^/]+)$/) ||
-      url.pathname.match(/^\/api\/board\/templates\/([^/]+)$/) ||
-      url.pathname.match(/^\/api\/board\/templates\/([^/]+)\/apply$/)
-    ) {
-      handleTaskboardApi(req, res, {
-        resolveActor: (r) =>
-          resolveTaskboardActor(r, {
-            jwtSecret: this.deps.config.gateway.accessToken,
-            isCommercialJwt: (t) => this.verifyCommercialJwt(t) !== null,
-            // 必须传真实校验结果:taskboard 层不得自行嗅 X-OpenClaude-Bridge-Nonce,
-            // 否则容器内 agent 伪造该头即可冒充 human 自批自结单。
-            bridgeVerified: this.checkBridgeBypass(r, url),
-          }),
-        listAgents: async () => {
-          const view = await this._getAgentsConfigUserView()
-          return view.agents.map((a) => ({
-            id: a.id,
-            name: a.displayName ?? a.id,
-            model: a.model ?? '',
-            description: a.greeting ?? '',
-          }))
-        },
-      }).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    // ── Tasks REST API ──
-    if (url.pathname === '/api/tasks') {
-      this._handleTasksApi(req, res).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    const taskItemMatch = url.pathname.match(/^\/api\/tasks\/([a-zA-Z0-9_-]+)$/)
-    if (taskItemMatch) {
-      this._handleTaskItem(req, res, taskItemMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-    if (url.pathname === '/api/tasks-executions' && req.method === 'GET') {
-      this._taskStore
-        .recentExecutions()
-        .then((execs) => this.sendJson(res, 200, { executions: execs }))
-        .catch((err) => this.sendInternalError(res, err))
-      return
-    }
-
-    // ── Webhook REST API ──
-    if (url.pathname === '/api/webhooks' && req.method === 'GET') {
-      const list = filterUserVisibleByAgentField(this.webhookRouter?.list() ?? [])
-      this.sendJson(res, 200, { webhooks: list })
-      return
-    }
-    const webhookMatch = url.pathname.match(/^\/api\/webhooks\/([a-zA-Z0-9_-]+)$/)
-    if (webhookMatch) {
-      this._handleWebhook(req, res, webhookMatch[1]).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-
-    // ── WeChat (iLink) bot binding ──
-    // Multi-tenant: each OC user can bind their own WeChat bot via QR scan.
-    //   POST   /api/wechat/pair/start            → { qrcode, qrcodeImgContent }
-    //   POST   /api/wechat/pair/poll  {qrcode}   → { status, accountId?, loginUserId? }
-    //   GET    /api/wechat/binding               → { binding: {...} | null }
-    //   DELETE /api/wechat/binding               → { ok: true }
-    //   PUT    /api/wechat/binding/status        → { ok, status }
-    if (url.pathname.startsWith('/api/wechat/')) {
-      this._handleWechat(req, res, url.pathname).catch((err) =>
-        this.sendInternalError(res, err),
-      )
-      return
-    }
-
-    // ── Claude.ai OAuth ──
-    if (url.pathname === '/api/auth/claude/start') {
-      this.handleOAuthStart(req, res).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    if (url.pathname === '/api/auth/claude/callback') {
-      this.handleOAuthCallback(req, res).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-    if (url.pathname === '/api/auth/claude/status') {
-      const oauth = this.deps.config.auth.claudeOAuth
-      this.sendJson(res, 200, {
-        authenticated: !!oauth?.accessToken,
-        expiresAt: oauth?.expiresAt,
-        scope: oauth?.scope,
-      })
-      return
-    }
-
-    // ── Streaming upload endpoint (Plan B 2026-05-09) ──
-    // Single-file raw-binary POST. Body streams directly to disk, sha256-named.
-    // Replaces sending base64 inside the WS frame's `_media[i].base64` — that
-    // path bloated `client_sessions.messages` JSON and triggered the 2026-05-08
-    // event-loop stall incident. See feedback memo
-    // v3_attachments_independent_channel.md.
-    if (url.pathname === '/api/uploads' && req.method === 'POST') {
-      this.handleUpload(req, res).catch((err) => this.sendInternalError(res, err))
-      return
-    }
-
-    // ── Media file serving ──
-    // Serve user-uploaded and MCP-generated media files for inline rendering.
-    // Async because v3 commercial uploads dir resolution touches PG + docker.
-    // Use the same dispatch pattern as /api/uploads to keep handleHttp sync.
-    const mediaMatch = url.pathname.match(/^\/api\/media\/(.+)$/)
-    if (mediaMatch) {
-      this.handleMediaGet(req, res, mediaMatch[1]).catch((err) => {
-        if (!res.headersSent) {
-          this.sendInternalError(res, err)
-        } else {
-          try { res.end() } catch { /* socket gone */ }
-        }
-      })
-      return
-    }
-
-    // ── File serving by absolute path (whitelist-restricted) ──
-    // Async dispatch because v3 commercial requires resolving the caller's
-    // {uploads, generated} dirs for a user-scoped allowlist predicate (DB +
-    // docker inspect). Pattern mirrors /api/uploads and /api/media.
-    if (url.pathname === '/api/file') {
-      this.handleApiFile(req, res, url).catch((err) => {
-        if (!res.headersSent) {
-          this.sendInternalError(res, err)
-        } else {
-          try { res.end() } catch { /* socket gone */ }
-        }
-      })
-      return
-    }
+    // App config routes (/api/features, /api/config): routes/appConfig.ts (FINDINGS §7.5 2b).
+    if (dispatchRoutes(APP_CONFIG_ROUTES, this.appConfigRoutesIo, req, res, url)) return
+    // Agent routes (agents, persona, memory, auto-dream optimizer, skills, skill eval/training, release jobs, messaging, delegate, advisor, ask-user, collaboration config): routes/agents.ts (FINDINGS §7.5 2b).
+    if (dispatchRoutes(AGENT_ROUTES, this.agentRoutesIo, req, res, url)) return
+    // Workspace API routes (changelog, feedback, search, cron, board, tasks, webhooks, wechat, Claude auth, uploads, media, file): routes/workspaceApi.ts (FINDINGS §7.5 2b).
+    if (dispatchRoutes(WORKSPACE_API_ROUTES, this.workspaceApiRoutesIo, req, res, url)) return
 
     // ── API / WS 404 守卫（仅 spa 模式）────────────────────────────────────
     // 走到这里说明请求未匹配上方任何 /api/* 或 /ws/* 路由(所有已匹配路由都已 return)。
