@@ -14,7 +14,7 @@ const reconciler = readFileSync(
   'utf8',
 )
 // sessionManager.ts plus the modules split out of it (FINDINGS §7.6 M1: sessionTurnRunner.ts).
-const sessionManager = ['sessionManager.ts', 'sessionTurnRunner.ts']
+const sessionManager = ['sessionManager.ts', 'sessionTurnRunner.ts', 'sessionSubmit.ts']
   .map((f) => readFileSync(join(root, 'packages/gateway/src', f), 'utf8'))
   .join('\n')
 const memoryDir = readFileSync(join(root, 'packages/storage/src/memoryDir.ts'), 'utf8')
@@ -295,7 +295,7 @@ if (!sandInstallerSrc.includes('execute the exact python3 heredoc below once in 
 console.log('[sand-install-retry] PASS — INC-20260921-SAND-INSTALL-RETRY: source regression guard, not end-to-end proof.')
 
 // INC-20260921-CCB-TRANSIENT-CONTINUE: source regression guard, not end-to-end proof.
-const sessionManagerSrc = sessionManager // sessionManager.ts + sessionTurnRunner.ts
+const sessionManagerSrc = sessionManager // sessionManager.ts + sessionTurnRunner.ts + sessionSubmit.ts
 if (!sessionManagerSrc.includes('export function isNativeEngineTransientContinuationSafe(')) {
   throw new Error('[ccb-transient-continue] missing native continuation predicate')
 }

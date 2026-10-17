@@ -1,3 +1,4 @@
+import { readSessionManagerSource, sessionManagerMethodBody } from './helpers/sessionManagerSource.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -6,7 +7,8 @@ import { fileURLToPath } from 'node:url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const SERVER_TS = readFileSync(join(__dirname, '..', 'server.ts'), 'utf-8')
-const SESSION_MANAGER_TS = readFileSync(join(__dirname, '..', 'sessionManager.ts'), 'utf-8')
+// sessionManager.ts + the modules split out of it (FINDINGS §7.6 M1/M2)
+const SESSION_MANAGER_TS = readSessionManagerSource()
 
 function extractMethodBody(source: string, methodName: string): string {
   // `(` after the name: the Gateway's route io adapters list `name: (...args) => …` too
@@ -28,8 +30,8 @@ const delegateWrapper = extractMethodBody(SERVER_TS, '_runDelegateTask')
 const delegateCore = extractMethodBody(SERVER_TS, '_runDelegateTaskCore')
 const handleStop = extractMethodBody(SERVER_TS, 'handleStop')
 const getOrCreate =
-  extractMethodBody(SESSION_MANAGER_TS, 'getOrCreate') +
-  extractMethodBody(SESSION_MANAGER_TS, '_getOrCreateExclusive')
+  sessionManagerMethodBody('getOrCreate') +
+  sessionManagerMethodBody('_getOrCreateExclusive')
 
 test('delegate wrapper still dispatches into _runDelegateTaskCore', () => {
   assert.match(

@@ -18,6 +18,19 @@ import ts from 'typescript'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
+function isLiteralDefault(e: ts.Expression): boolean {
+  return (
+    ts.isLiteralExpression(e) ||
+    e.kind === ts.SyntaxKind.TrueKeyword ||
+    e.kind === ts.SyntaxKind.FalseKeyword ||
+    e.kind === ts.SyntaxKind.NullKeyword ||
+    (ts.isIdentifier(e) && e.text === 'undefined') ||
+    (ts.isArrayLiteralExpression(e) && e.elements.length === 0) ||
+    (ts.isObjectLiteralExpression(e) && e.properties.length === 0) ||
+    (ts.isPrefixUnaryExpression(e) && ts.isNumericLiteral(e.operand))
+  )
+}
+
 function forwarders(file: string) {
   const text = readFileSync(join(here, '..', file), 'utf8')
   const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true)
@@ -40,7 +53,10 @@ function forwarders(file: string) {
       ) {
         out.push({
           name: n.name.getText(sf),
-          isAsync: !!n.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword),
+          // async is kept only when a parameter default could throw (it must reject, not throw)
+          isAsync:
+            !!n.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword) &&
+            n.parameters.every((p) => !p.initializer || isLiteralDefault(p.initializer)),
           voidReturn: n.type?.kind === ts.SyntaxKind.VoidKeyword && ts.isReturnStatement(st),
         })
       }
