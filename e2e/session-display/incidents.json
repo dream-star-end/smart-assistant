@@ -7705,6 +7705,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/collaborationConfig.test.ts",
           "assertion": "rolls advisor back: it cannot run without the saved config"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-477-collab-404-app.node-test.mjs",
+          "assertion": "solo must stick after a 404 save"
         }
       ]
     }
