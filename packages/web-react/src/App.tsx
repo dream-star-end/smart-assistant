@@ -178,6 +178,7 @@ import {
   collaborationPutBody,
   docToUiState,
   isStaleCollabEpoch,
+  keepCollabChoiceOnSaveFailure,
   recommendedAdvisorModel,
   sendCollabFields,
 } from "./lib/collaborationConfig";
@@ -1143,17 +1144,22 @@ export function App() {
       // Empty composer has no sessionId. Skipping PUT avoids the old asDefault/!sessionId
       // default-write path; first send persists against the minted session id.
       if (!activeId && !asDefault) return;
+      // Solo/team keep the user's pick on a failed save (see keepCollabChoiceOnSaveFailure);
+      // only advisor rolls back, so a failing save can never pin the session to advisor.
+      const failSave = (msg: string) => {
+        if (keepCollabChoiceOnSaveFailure(mode)) return;
+        setCollabUi(previous);
+        setTeamModeState(previous.mode === "team");
+        setCollabSaveError(msg);
+        toast(msg, "error");
+      };
       if (activeId && sockRef.current) {
         if (modelId) sockRef.current.setSessionModel(activeId, modelId);
         const title =
           sessions.find((session) => session.id === activeId)?.title || "新对话";
         const ensured = await sockRef.current.ensureServerSession(activeId, agent.id, title);
         if (!ensured) {
-          setCollabUi(previous);
-          setTeamModeState(previous.mode === "team");
-          const msg = "会话尚未创建成功，请检查网络后重试";
-          setCollabSaveError(msg);
-          toast(msg, "error");
+          failSave("会话尚未创建成功，请检查网络后重试");
           return;
         }
       }
@@ -1186,19 +1192,11 @@ export function App() {
           } catch (rereadErr) {
             if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
             if (collabAuth.snapshot().epoch !== identityEpoch) return;
-            const msg = apiErrorMessage(rereadErr, "协作配置冲突后重读失败");
-            setCollabUi(previous);
-            setTeamModeState(previous.mode === "team");
-            setCollabSaveError(msg);
-            toast(msg, "error");
+            failSave(apiErrorMessage(rereadErr, "协作配置冲突后重读失败"));
             return;
           }
         }
-        setCollabUi(previous);
-        setTeamModeState(previous.mode === "team");
-        const msg = apiErrorMessage(err, "协作配置保存失败");
-        setCollabSaveError(msg);
-        toast(msg, "error");
+        failSave(apiErrorMessage(err, "协作配置保存失败"));
       }
     },
     [activeId, agent.id, applyCollabDoc, auth, collabUi, demo, modelId, models, sessions, toast],
@@ -1370,10 +1368,13 @@ export function App() {
             unavailableForSend = doc.advisorUnavailableReason;
           } catch (err) {
             if (collabAuth.snapshot().epoch !== identityEpoch) return;
-            const msg = apiErrorMessage(err, "协作配置保存失败");
-            setCollabSaveError(msg);
-            toast(msg, "error");
-            return;
+            // Team still sends: it rides on the turn frame. Only advisor needs the saved config.
+            if (!keepCollabChoiceOnSaveFailure(collabMode)) {
+              const msg = apiErrorMessage(err, "协作配置保存失败");
+              setCollabSaveError(msg);
+              toast(msg, "error");
+              return;
+            }
           }
         }
         setSessions((c) => [createdSession!, ...c]);
