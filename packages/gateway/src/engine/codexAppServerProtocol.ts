@@ -33,7 +33,11 @@ function finiteNumber(raw: unknown): number | undefined {
   return typeof raw === 'number' && Number.isFinite(raw) ? raw : undefined
 }
 
-export function normalizeCodexGoal(raw: unknown, cleared = false, blockId = 'codex-goal'): CodexGoalBlock {
+export function normalizeCodexGoal(
+  raw: unknown,
+  cleared = false,
+  blockId = 'codex-goal',
+): CodexGoalBlock {
   const obj = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
   const goal: CodexGoalBlock = { blockId }
   if (typeof obj.objective === 'string') goal.objective = obj.objective
