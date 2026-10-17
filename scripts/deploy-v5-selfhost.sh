@@ -472,7 +472,7 @@ usage() {
   --force-npm-ci        配合 --build-master-only 或 --deploy:跳过硬链,在 staging 内冷装
   --p0-web --target-sha=SHA
                         P0 纯前端热修(OCV5-489):只换前端构建目录,不重启 master/不动 runtime。相对 live
-                        只改前端静态面才放行;切换后握手+E2E J1-J5,失败自动切回。构建在锁外,切换持锁
+                        只改前端静态面才放行;切换后握手+UI 门 C1+C2,失败自动切回。构建在锁外,切换持锁
   --p0-web-revert       切回上一份前端构建目录(秒级,不重启)
   --p0-web-status       打印 overlay 指针、生效的 P0-Web sourceCommit 与最近 history
 
