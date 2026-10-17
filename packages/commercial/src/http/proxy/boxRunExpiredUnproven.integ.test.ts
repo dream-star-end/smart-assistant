@@ -50,6 +50,7 @@ async function withDb(fn: (db: {
   try {
     // OCV5-488 discovery reads the owning container in this same isolated fixture.
     await client.query("CREATE TEMP TABLE agent_containers (id bigint PRIMARY KEY, state text NOT NULL)");
+    // lint-agent-containers-kind: allow — seeds only the pinned TEMP fixture by id, independent of runtime kind.
     await client.query("INSERT INTO agent_containers VALUES (635, 'active')");
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL, container_id bigint,
