@@ -1,3 +1,4 @@
+import { normalizeAssistantOutputUiFences } from './uiFenceNormalize.js'
 /**
  * Session turn execution (one turn, retry wrapper)
  *
@@ -1593,11 +1594,13 @@ export async function _runOneTurn(
       if (result) {
         terminalPersistenceClaim = 'complete'
         flushTerminalBilling()
-        const completedAssistantRaw = combineRetryAssistantOutput(
-          retryAssistantSegments,
-          result.assistantText,
-          freezeSegments(result.assistantSegments, assistantMessageId),
-          Date.now(),
+        const completedAssistantRaw = normalizeAssistantOutputUiFences(
+          combineRetryAssistantOutput(
+            retryAssistantSegments,
+            result.assistantText,
+            freezeSegments(result.assistantSegments, assistantMessageId),
+            Date.now(),
+          ),
         )
         const completedAssistantText = emptyCompletedTurnAssistantText({
           status: terminalOverride?.status ?? 'completed',
