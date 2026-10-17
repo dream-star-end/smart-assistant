@@ -102,7 +102,11 @@ async function verifyEvents() {
     testNamePatterns: ['OCV5-187'],
     concurrency: false,
     forceExit: false,
-    timeout: 30_000,
+    // OCV5-492: this bounds the whole file subprocess, not one case. A cold tsx load of the
+    // commercial import graph is ~11.5 s of the file's ~12.4 s when the host is idle, and passed
+    // 30 s at load 16 (tr-20261017T063335Z, tr-20261017T112342Z, tr-20261017T115615Z). The four
+    // cases keep their own 30 s limit in the test file, so a hung case still fails fast.
+    timeout: 150_000,
   }));
   console.log(title + ` PASS selected=4 selectedSkip=0 runnerTests=${result.runnerTests}`
     + ` filteredSkips=${result.filteredSkips} node=${process.version}`);
@@ -128,7 +132,7 @@ async function supervise() {
       try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already reaped */ }
     }, 5_000);
   };
-  const timer = setTimeout(stop, 1_920_000); // mutex wait <=1800s + execution <=90s
+  const timer = setTimeout(stop, 2_070_000); // mutex wait <=1800s + execution <=240s + 30s margin
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);
   try {
@@ -147,7 +151,7 @@ async function supervise() {
       // TMPDIR is kept: the release gives each build its own, so tsx's
       // compile cache goes away with the build (OCV5-357).
       env: { PATH: process.env.PATH, HOME: home, OPENCLAUDE_HOME: home,
-        NODE_ENV: 'test', OC_TEST_MUTEX_TIMEOUT: '90',
+        NODE_ENV: 'test', OC_TEST_MUTEX_TIMEOUT: '240',
         ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}) },
     });
     const code = await new Promise((resolve, reject) => {

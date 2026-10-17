@@ -60,11 +60,32 @@ describe("selfhost release gates use a per-build tsx cache (OCV5-357)", () => {
     assert.match(box, /if \(process\.env\.TMPDIR\) allowed\.add\("TMPDIR"\);/);
     assert.match(box, /\.\.\.\(process\.env\.TMPDIR \? \{ TMPDIR: process\.env\.TMPDIR \} : \{\}\),\n {6}\.\.\.extra,/);
     const cb = readFileSync(path.join(root, "scripts/check-v5-callback-payload-hash.mjs"), "utf8");
-    assert.match(cb, /OC_TEST_MUTEX_TIMEOUT: '90',\n\s+\.\.\.\(process\.env\.TMPDIR \? \{ TMPDIR: process\.env\.TMPDIR \} : \{\}\) \},/);
+    assert.match(cb, /OC_TEST_MUTEX_TIMEOUT: '240',\n\s+\.\.\.\(process\.env\.TMPDIR \? \{ TMPDIR: process\.env\.TMPDIR \} : \{\}\) \},/);
     // The others already give their workers a TMPDIR under os.tmpdir(), which is the private dir.
     for (const f of ["check-v5-cursor-sand-inference.ts", "check-v5-delegate-billing-requestid.ts", "check-v5-cron-submit-boundary.ts", "check-v5-session-unavailable-rootfix.ts"]) {
       assert.match(readFileSync(path.join(root, "scripts", f), "utf8"), /TMPDIR/, f);
     }
+  });
+
+  test("OCV5-492: callback proof limits nest — per-case < file run() < mutex execution < supervisor timer", () => {
+    const cb = readFileSync(path.join(root, "scripts/check-v5-callback-payload-hash.mjs"), "utf8");
+    const ms = (re: RegExp) => {
+      const m = cb.match(re);
+      assert.ok(m, String(re));
+      return Number(m[1]!.replaceAll("_", ""));
+    };
+    const fileMs = ms(/forceExit: false,\n(?:\s*\/\/[^\n]*\n)*\s*timeout: ([\d_]+),/);
+    const mutexMs = ms(/OC_TEST_MUTEX_TIMEOUT: '(\d+)'/) * 1000;
+    const timerMs = ms(/const timer = setTimeout\(stop, ([\d_]+)\);/);
+    const bridge = readFileSync(path.join(root, "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts"), "utf8");
+    const caseMs = Number(bridge.match(/const OCV5_187_CASE_TIMEOUT_MS = ([\d_]+);/)?.[1]?.replaceAll("_", ""));
+    // Every OCV5-187 case carries the per-case guard (three generated cron-origin cases + the browser case).
+    assert.equal(bridge.match(/test\([^\n]*OCV5-187[^\n]*\{ timeout: OCV5_187_CASE_TIMEOUT_MS \}/g)?.length, 2);
+    assert.ok(caseMs > 0 && caseMs < fileMs, `per-case ${caseMs} < file ${fileMs}`);
+    // An idle cold run of the file is ~12.4 s; the file bound must leave room for a loaded host.
+    assert.ok(fileMs >= 120_000, `file bound ${fileMs} covers cold load under contention`);
+    assert.ok(fileMs + 30_000 <= mutexMs, `file ${fileMs} + worker start-up < mutex ${mutexMs}`);
+    assert.ok(1_800_000 + mutexMs <= timerMs, `mutex wait 1800 s + execution ${mutexMs} <= timer ${timerMs}`);
   });
 
   test("every failure path cleans the gate dir: cleanup_master_staging calls it first", () => {
