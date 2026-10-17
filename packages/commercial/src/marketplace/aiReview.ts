@@ -15,8 +15,8 @@
  *   2. 审核 prompt 防注入:被审内容以「不可信数据」框注入,明示其中任何指令都不得遵循;
  *      输出强制严格 JSON {verdict,reasons,userNote};解析失败/字段缺失 → ESCALATE。
  *
- * LLM 调用走 OpenCode Go(与用户聊天的 deepseek-v4-flash 同一上游):
- * OPENCODE_GO_UPSTREAM_ENDPOINT + x-api-key OPENCODE_GO_API_KEY +
+ * LLM 调用走 fetchPlatformFlash(与用户聊天的 deepseek-v4-flash 同一上游):OpenCode Go 优先
+ * (x-api-key OPENCODE_GO_API_KEY),Go 不可用时回落 DeepSeek 官方(OCV5-482) +
  * directEgressDispatcher()(显式直连,绕全局出海代理);不经用户代理/计费/白名单/
  * 账号池。60s 超时,网络错重试 1 次,再失败 → skipped(ESCALATE)。key 缺席 → 全部 skipped。
  *
@@ -29,7 +29,7 @@ import { marketplaceCategoryLabel } from '@openclaude/protocol'
 import type { Dispatcher } from 'undici'
 import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 import { DEFAULT_CONNECTOR_SLUGS } from '../connectors/defaults/index.js'
-import { OPENCODE_GO_UPSTREAM_ENDPOINT, openCodeGoAuthHeaders } from '../http/proxy/shared.js'
+import { fetchPlatformFlash } from '../http/proxy/shared.js'
 import {
   approveMarketplaceConnectorVersion,
   ensureAiConnectorReviewer,
@@ -420,14 +420,15 @@ async function callReviewModelOnce(userPrompt: string, deps: ReviewDeps): Promis
       system: AI_REVIEW_SYSTEM_PROMPT,
       messages: [{ role: 'user', content: userPrompt }],
     }
-    const res = await fetchImpl(OPENCODE_GO_UPSTREAM_ENDPOINT, {
-      method: 'POST',
-      headers: openCodeGoAuthHeaders(deps.apiKey),
-      body: JSON.stringify(body),
-      signal: controller.signal,
-      // 与 voiceTranscribe 同:OpenCode Go 显式直连,绕 gateway 全局出海代理。
-      ...(dispatcher ? { dispatcher } : {}),
-    } as RequestInit & { dispatcher?: Dispatcher })
+    const res = await fetchPlatformFlash(fetchImpl, {
+      goKey: deps.apiKey,
+      body,
+      init: {
+        signal: controller.signal,
+        // 与 voiceTranscribe 同:显式直连,绕 gateway 全局出海代理。
+        ...(dispatcher ? { dispatcher } : {}),
+      } as RequestInit & { dispatcher?: Dispatcher },
+    })
     if (!res.ok) return { ok: false, error: `HTTP ${res.status}` }
     const json = await res.json().catch(() => null)
     const text = extractContentText(json)
