@@ -76,6 +76,7 @@ import { PricingCache, createModelHintProvider, type ModelPricing } from "./bill
 import { applyTurnWaiver } from "./billing/refund.js";
 import { canUseModel } from "./billing/authzModels.js";
 import { ALLOWED_INBOUND_MODELS, setModelHintProvider, setLiteratureSkillProvider, setHostStaticProviderKeys } from "@openclaude/gateway";
+import { setPlatformFlashFallbackKey } from "./http/proxy/shared.js";
 import { getPreferences, patchPreferences } from "./user/preferences.js";
 import { getLiteratureSkillConfig } from "./admin/literatureConfig.js";
 import {
@@ -1624,6 +1625,8 @@ export async function registerCommercial(
   // (见 gateway/hostStaticProviders + subprocessRunner 注入点)。个人版不 import commercial →
   // seam 恒 null = 整块 no-op,settings.json 继续掌权。与 setModelHintProvider 同注册/清理生命周期。
   setHostStaticProviderKeys(buildHostStaticProviderKeys(cfg));
+  // OCV5-482:平台直连 flash(市场审核/语音润色/知识星球)Go 不可用时回落 DeepSeek 官方。
+  setPlatformFlashFallbackKey(cfg.DEEPSEEK_API_KEY);
 
   // 0069 — SKILLS_LITERATURE slot 反向钩子:容器 spawn 重建 system prompt 时读窄配置,
   // admin 改完下次 spawn 自然生效(无 cache / 无 LISTEN/NOTIFY,见 0069 migration 注释)。

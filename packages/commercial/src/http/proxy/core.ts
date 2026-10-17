@@ -137,6 +137,14 @@ export interface RoundTripCtx {
   uid: bigint;
   body: ProxyBody;
   session: PreparedUpstreamSession;
+  /**
+   * OCV5-482: prepares a session on the static route's declared fallback upstream. Set only when the
+   * session is the route's primary and a fallback is declared; core retries once on it when the
+   * primary refuses (429/402/5xx) before anything streamed.
+   */
+  fallbackSession?: () => Promise<PreparedUpstreamSession | null>;
+  /** OCV5-482: keep the serving provider/model in the usage price snapshot. */
+  recordServedUpstream?: boolean;
   /** Box CLI calls are non-replayable: never strip signed history and invoke it again. */
   noHistoryRewriteRetry?: boolean;
   /** Set only for the one request that atomically won an expired quota probe lease. */
@@ -191,7 +199,6 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     requestId,
     uid,
     body,
-    session,
     quotaProbeProviderId,
     finalize,
     sessionId,
@@ -208,6 +215,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
   req.on("close", onClose);
   res.on("close", onClose);
 
+  let session = ctx.session;
   let observed: UsageObservation = { kind: "none" };
   try {
     // safe headers + Authorization
@@ -308,6 +316,44 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
           });
           upstreamErrorPreview = null;
         }
+      }
+    }
+    // OCV5-482:主上游(如 OpenCode Go 周额度用尽 429)拒绝且路由声明了回落上游 → 尚未向客户端
+    // 写任何字节，先把主 key 的结果交池策略(冷却;池恢复后自动回主上游)，本请求在回落上游重试一次。
+    if (ctx.fallbackSession && (upstream.status === 429 || upstream.status === 402 || upstream.status >= 500)) {
+      const primaryPreview = upstreamErrorPreview ?? (await upstream.text().catch(() => "")).slice(0, 500);
+      upstreamErrorPreview = primaryPreview;
+      const fallback = await ctx.fallbackSession().catch((err: unknown) => {
+        userLog.warn("proxy_static_fallback_prepare_failed", { err: errSummary(err) });
+        return null;
+      });
+      if (fallback) {
+        if (session.poolMember) {
+          void reportApiKeyOutcome(
+            session.poolMember.memberId,
+            classifyHttpOutcome(upstream.status, upstream.headers, new Date(), {
+              quotaHint: /GoUsageLimitError|usage limit/i.test(primaryPreview),
+            }),
+          );
+        }
+        userLog.info("proxy_static_fallback", {
+          model: body.model,
+          provider: session.providerId,
+          fallback: fallback.providerId,
+          status: upstream.status,
+          reason: "upstream_refused",
+        });
+        session.zeroizeSecrets();
+        session = fallback;
+        const fallbackHeaders = buildSafeUpstreamHeaders(req.headers);
+        session.applyUpstreamAuth(fallbackHeaders, body, userLog);
+        upstream = await fetchFn(session.endpoint, {
+          ...fetchInit,
+          headers: fallbackHeaders,
+          body: serializeUpstreamBody(session.sanitizeMessages(body.messages, body.model, userLog)),
+          dispatcher: session.dispatcher,
+        } as RequestInit & { dispatcher?: unknown });
+        upstreamErrorPreview = null;
       }
     }
     if (upstream.status < 200 || upstream.status >= 300) {
@@ -417,7 +463,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       // P3.2 健康信号:上游 5xx / 429(过载)算 provider 侧失败;4xx(含 400 客户端 body 损坏、
       // 内容策略拒绝)不归 provider 健康,避免误判(fire-and-forget,只静态 provider 记)。
       if (!isClientBadRequest && (upstream.status >= 500 || upstream.status === 429)) {
-        recordProviderHealthSample(body.model, "upstream_5xx");
+        recordProviderHealthSample(body.model, "upstream_5xx", session.providerId);
       }
       // 反封复盘 2026-08 — 上游 429 **透传为 429**(带 Retry-After),不再伪装成 502。
       //
@@ -456,7 +502,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       const err = new Error(`upstream ${upstream.status} but no body`);
       await finalize.fail(observed, err, "UPSTREAM_UNAVAILABLE");
       incrAnthropicProxySettle("aborted");
-      recordProviderHealthSample(body.model, "upstream_5xx"); // 2xx 却无 body = provider 返回畸形
+      recordProviderHealthSample(body.model, "upstream_5xx", session.providerId); // 2xx 却无 body = provider 返回畸形
       sendJsonError(res, 502, "UPSTREAM_NO_BODY", "upstream returned no body", requestId);
       return;
     }
@@ -472,6 +518,9 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
           err: errSummary(quotaErr),
         });
       }
+    }
+    if (ctx.recordServedUpstream && session.providerId) {
+      finalize.setUpstream?.({ provider: session.providerId, model: session.upstreamModel });
     }
     // OCV5-424:API-key 池成员拿到健康 2xx 头 → 成功上报(health 回升、退避级别归零)。
     if (session.poolMember) {
@@ -543,14 +592,14 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     if (result.error !== null) {
       if (isClientAbort(result.error)) {
         outcome = await finalize.failClient(observed, result.error, "CLIENT_ABORT");
-        recordProviderHealthSample(body.model, "aborted"); // 客户端断:judgement 排除,不算 provider 失败
+        recordProviderHealthSample(body.model, "aborted", session.providerId); // 客户端断:judgement 排除,不算 provider 失败
       } else {
         outcome = await finalize.fail(observed, result.error, "STREAM_FAILED");
-        recordProviderHealthSample(body.model, "partial"); // 中途断流 = provider 侧失败
+        recordProviderHealthSample(body.model, "partial", session.providerId); // 中途断流 = provider 侧失败
       }
     } else {
       outcome = await finalize.commit(observed);
-      recordProviderHealthSample(body.model, "final"); // 完整完成:抽样 1/10
+      recordProviderHealthSample(body.model, "final", session.providerId); // 完整完成:抽样 1/10
     }
     // 把真实扣费的积分 + 扣费后余额推给该 uid 的前端 WS,前端会替换响应 meta
     // 行里 $0.xxxx(容器侧估算,口径不一致)为真实扣费积分。
@@ -657,10 +706,10 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       await finalize.failClient(observed, err, "INVALID_REQUEST");
     } else if (isClientAbort(err)) {
       await finalize.failClient(observed, err, "CLIENT_ABORT");
-      recordProviderHealthSample(body.model, "aborted"); // 客户端断:judgement 排除
+      recordProviderHealthSample(body.model, "aborted", session.providerId); // 客户端断:judgement 排除
     } else {
       await finalize.fail(observed, err, "UPSTREAM_UNAVAILABLE");
-      recordProviderHealthSample(body.model, "timeout"); // fetch 抛错:超时/DNS/socket = provider 不可达
+      recordProviderHealthSample(body.model, "timeout", session.providerId); // fetch 抛错:超时/DNS/socket = provider 不可达
     }
     incrAnthropicProxySettle("aborted");
     recordUpstreamPerformance(

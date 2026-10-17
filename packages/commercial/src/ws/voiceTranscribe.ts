@@ -5,7 +5,7 @@ import { WebSocketServer, WebSocket, type RawData } from "ws";
 
 import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import type { Logger } from "../logging/logger.js";
-import { OPENCODE_GO_UPSTREAM_ENDPOINT, openCodeGoAuthHeaders } from "../http/proxy/shared.js";
+import { fetchPlatformFlash } from "../http/proxy/shared.js";
 import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
 import type { Dispatcher } from "undici";
 
@@ -416,14 +416,16 @@ async function polishTranscriptStream(input: {
 
   let res: Response;
   try {
-    res = await input.fetchImpl(OPENCODE_GO_UPSTREAM_ENDPOINT, {
-      method: "POST",
-      headers: openCodeGoAuthHeaders(input.apiKey, "text/event-stream"),
-      body: JSON.stringify(body),
-      signal: input.signal,
-      // OpenCode Go 显式直连,绕开 gateway 全局 EnvHttpProxyAgent(给 Anthropic 出海的日本节点)。
-      dispatcher: directEgressDispatcher(),
-    } as RequestInit & { dispatcher: Dispatcher });
+    res = await fetchPlatformFlash(input.fetchImpl, {
+      goKey: input.apiKey,
+      body,
+      accept: "text/event-stream",
+      init: {
+        signal: input.signal,
+        // 显式直连(Go 与 DeepSeek 回落同),绕开 gateway 全局 EnvHttpProxyAgent(给 Anthropic 出海的日本节点)。
+        dispatcher: directEgressDispatcher(),
+      } as RequestInit & { dispatcher: Dispatcher },
+    });
   } catch {
     return null;
   }
@@ -502,14 +504,15 @@ async function polishTranscriptOnce(input: {
 
   let res: Response;
   try {
-    res = await input.fetchImpl(OPENCODE_GO_UPSTREAM_ENDPOINT, {
-      method: "POST",
-      headers: openCodeGoAuthHeaders(input.apiKey),
-      body: JSON.stringify(body),
-      signal: input.signal,
-      // OpenCode Go 显式直连,绕开 gateway 全局 EnvHttpProxyAgent(日本),理由同上。
-      dispatcher: directEgressDispatcher(),
-    } as RequestInit & { dispatcher: Dispatcher });
+    res = await fetchPlatformFlash(input.fetchImpl, {
+      goKey: input.apiKey,
+      body,
+      init: {
+        signal: input.signal,
+        // 显式直连,绕开 gateway 全局 EnvHttpProxyAgent(日本),理由同上。
+        dispatcher: directEgressDispatcher(),
+      } as RequestInit & { dispatcher: Dispatcher },
+    });
   } catch {
     return { text: transcript, changed: false, confidence: 0, skipped: true };
   }

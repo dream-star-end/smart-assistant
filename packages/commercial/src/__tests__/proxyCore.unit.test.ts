@@ -1051,3 +1051,76 @@ describe("runUpstreamRoundTrip — finally 兜底不变量", () => {
   assert.equal(finalize.commitCalls.length,1);
   assert.deepEqual(finalize.commitCalls[0], {kind:'final', usage:{input_tokens:20n,output_tokens:10n,cache_read_tokens:80n,cache_write_tokens:0n}});
  });
+
+// ─── OCV5-482:主上游拒绝时同请求改发回落上游 ───────────────────────────────
+
+describe("runUpstreamRoundTrip — static route fallback (OCV5-482)", () => {
+  const GO_LIMIT = '{"type":"error","error":{"type":"GoUsageLimitError","message":"Go usage limit exceeded"}}';
+  function fallbackSpy() {
+    const spy = makeSession({ endpoint: "https://api.deepseek.com/anthropic/v1/messages", upstreamModel: "deepseek-flash" });
+    (spy.session as { providerId?: string }).providerId = "deepseek";
+    return spy;
+  }
+
+  test("Go 周额度 429 → 回落上游重试一次,正常结算并记实际上游", async () => {
+    const calls: Array<[string, unknown]> = [];
+    const fb = fallbackSpy();
+    const { ctx, session, finalize } = buildCtx({
+      bodyModel: "deepseek-v4-flash",
+      sessionOver: { endpoint: "https://opencode.ai/zen/go/v1/messages", upstreamModel: "deepseek-v4.1-flash" },
+      fetchImpl: async (url, init) => {
+        calls.push([url, (JSON.parse(String(init.body)) as { model?: unknown }).model]);
+        return calls.length === 1 ? new Response(GO_LIMIT, { status: 429 }) : sseFullResponse();
+      },
+      finalizerOutcome: { state: "committed", debitedCredits: 0n },
+    });
+    const served: Array<{ provider: string; model: string }> = [];
+    ctx.finalize = { ...ctx.finalize, setUpstream: (u) => served.push(u) };
+    ctx.fallbackSession = async () => fb.session;
+    ctx.recordServedUpstream = true;
+    await runUpstreamRoundTrip(ctx);
+    assert.deepEqual(calls, [
+      ["https://opencode.ai/zen/go/v1/messages", "deepseek-v4.1-flash"],
+      ["https://api.deepseek.com/anthropic/v1/messages", "deepseek-flash"],
+    ]);
+    assert.equal(finalize.commitCalls.length, 1);
+    assert.equal(finalize.failCalls.length, 0);
+    assert.deepEqual(served, [{ provider: "deepseek", model: "deepseek-flash" }]);
+    assert.equal(ctx.body.model, "deepseek-v4-flash", "计费 canonical model 不变");
+    assert.equal(session.zeroizeCount, 1, "主上游 session 换下时零化");
+    assert.equal(fb.zeroizeCount, 1, "回落 session 在 finally 零化");
+    assert.equal(fb.applyAuthCalls, 1);
+  });
+
+  test("回落上游不可用 → 主上游 429 原样透传", async () => {
+    let fetches = 0;
+    const { ctx, res, finalize } = buildCtx({
+      bodyModel: "deepseek-v4-flash",
+      fetchImpl: async () => {
+        fetches += 1;
+        return new Response(GO_LIMIT, { status: 429, headers: { "Retry-After": "30" } });
+      },
+    });
+    ctx.fallbackSession = async () => null;
+    await runUpstreamRoundTrip(ctx);
+    assert.equal(fetches, 1);
+    assert.equal(res.statusCode, 429);
+    assert.equal(res.responseHeaders["retry-after"], "30");
+    assert.equal(finalize.failCalls.length, 1);
+  });
+
+  test("主上游 400 不触发回落", async () => {
+    let asked = 0;
+    const { ctx, finalize } = buildCtx({
+      bodyModel: "deepseek-v4-flash",
+      fetchImpl: async () => new Response('{"type":"error","error":{"type":"invalid_request_error"}}', { status: 400 }),
+    });
+    ctx.fallbackSession = async () => {
+      asked += 1;
+      return null;
+    };
+    await runUpstreamRoundTrip(ctx);
+    assert.equal(asked, 0);
+    assert.equal(finalize.failClientCalls.length, 1);
+  });
+});
