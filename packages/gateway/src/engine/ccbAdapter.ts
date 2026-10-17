@@ -120,12 +120,16 @@ const CCB_EDE_CANCEL_DIAGNOSTIC_RE =
  * still parked waiting for their results, holding the account slot. Its idle
  * proof then stays pending, so the session's idle candidate blocks every next
  * message with IDLE_HISTORY_PENDING ("消息未开始处理"). Only this exact
- * reject qualifies; transient Box errors keep their own recovery. */
+ * reject qualifies; transient Box errors keep their own recovery.
+ * OCV5-486 (commercial uid 4, 10-17 #49fab402): a catalog change bumps the
+ * global model security epoch, and egress' authority gate answers the next
+ * continuation 409 MODEL_CONFIG_CHANGED_RETRY_TURN before any Box call. Same
+ * parked CLI, same pinned session; the gate's exact reject stops it too. */
 const BOX_CONTINUATION_REJECTED =
-  /^API Error: 409 \{"error":\{"code":"BOX_[A-Z0-9_]{1,64}","message":"continuation rejected"\}/
+  /^API Error: 409 \{"error":\{"code":(?:"BOX_[A-Z0-9_]{1,64}","message":"continuation rejected"|"MODEL_CONFIG_CHANGED_RETRY_TURN","message":"model configuration changed, please retry in a new turn")\}/
 
 export function isBoxContinuationRejectedDetail(errorDetail: string | undefined): boolean {
-  if (!errorDetail || !errorDetail.includes('continuation rejected')) return false
+  if (!errorDetail || !/continuation rejected|MODEL_CONFIG_CHANGED_RETRY_TURN/.test(errorDetail)) return false
   let parsed: unknown
   try { parsed = JSON.parse(errorDetail) } catch { return false }
   const result = (parsed as { result?: unknown } | null)?.result
