@@ -110,6 +110,14 @@ describe('v5-web-overlay-lib', () => {
       'packages/gateway/src/server.ts',
       'packages/web-react/package.json',
     ])
+
+    // rename 的源路径也要过白名单:后端文件原样挪进 e2e/ 不是纯前端改动。
+    const head = git('rev-parse', 'HEAD')
+    git('mv', 'packages/gateway/src/server.ts', 'e2e/server.ts')
+    git('commit', '-qm', 'rename')
+    r = wo('wo_check_surface', [repo, head, git('rev-parse', 'HEAD')])
+    assert.equal(r.status, 1)
+    assert.match(r.stdout, /packages\/gateway\/src\/server\.ts/)
   })
 
   test('staged webroot keeps old lazy chunks, replaces root files, and passes the static gate', () => {
@@ -120,15 +128,16 @@ describe('v5-web-overlay-lib', () => {
     const r = wo('wo_stage_webroot', [f.bucket, fresh, 'b'.repeat(40), f.rel])
     assert.equal(r.status, 0, r.stderr)
     const webroot = r.stdout.trim()
-    assert.equal(webroot, path.join(f.bucket, 'webroots/bbbbbbbb'))
+    assert.equal(webroot, path.join(f.bucket, `webroots/bbbbbbbb-${'b'.repeat(12)}`))
     assert.ok(existsSync(path.join(webroot, 'assets/lazy-old.js')), 'old chunk kept for open tabs')
     assert.ok(existsSync(path.join(webroot, 'assets/main-new.js')))
     assert.match(readFileSync(path.join(webroot, 'index.html'), 'utf8'), /bbbbbbbb/)
     assert.equal(readFileSync(path.join(f.dist, 'index.html'), 'utf8').includes('aaaaaaaa'), true, 'release dist untouched')
-    const meta = JSON.parse(readFileSync(path.join(f.bucket, 'webroots/bbbbbbbb.json'), 'utf8'))
+    const meta = JSON.parse(readFileSync(`${webroot}.json`, 'utf8'))
     assert.equal(meta.sourceCommit, 'b'.repeat(40))
     assert.equal(meta.previous, f.dist)
-    assert.equal(existsSync(path.join(webroot, 'bbbbbbbb.json')), false, 'metadata is not served')
+    assert.equal(existsSync(path.join(webroot, `bbbbbbbb-${'b'.repeat(12)}.json`)), false, 'metadata is not served')
+    assert.equal(wo('wo_staged_from', [webroot]).stdout.trim(), f.dist)
 
     assert.equal(wo('wo_static_gate', [webroot, 'bbbbbbbb']).status, 0)
     assert.equal(wo('wo_static_gate', [webroot, 'cccccccc']).status, 1)
@@ -136,6 +145,37 @@ describe('v5-web-overlay-lib', () => {
     const g = wo('wo_static_gate', [webroot, 'bbbbbbbb'])
     assert.equal(g.status, 1)
     assert.match(g.stderr, /main-new\.js/)
+  })
+
+  test('same oc-build from another commit gets its own webroot (oc-build only hashes index.html)', () => {
+    const f = fixture()
+    assert.equal(wo('wo_seed_pointer', [f.overlay, f.rel, 'a'.repeat(40)]).status, 0)
+    const one = path.join(f.t, 'one')
+    writeDist(one, 'bbbbbbbb', { 'main-new.js': 'new' })
+    writeFileSync(path.join(one, 'robots.txt'), 'v1')
+    const w1 = wo('wo_stage_webroot', [f.bucket, one, 'b'.repeat(40), f.rel]).stdout.trim()
+    const two = path.join(f.t, 'two')
+    writeDist(two, 'bbbbbbbb', { 'main-new.js': 'new' })
+    writeFileSync(path.join(two, 'robots.txt'), 'v2')
+    const w2 = wo('wo_stage_webroot', [f.bucket, two, 'c'.repeat(40), f.rel]).stdout.trim()
+    assert.notEqual(w1, w2)
+    assert.equal(readFileSync(path.join(w2, 'robots.txt'), 'utf8'), 'v2')
+    assert.equal(JSON.parse(readFileSync(`${w2}.json`, 'utf8')).sourceCommit, 'c'.repeat(40))
+  })
+
+  test('a reused webroot dir is rebuilt when it was staged from a different base', () => {
+    const f = fixture()
+    assert.equal(wo('wo_seed_pointer', [f.overlay, f.rel, 'a'.repeat(40)]).status, 0)
+    const fresh = path.join(f.t, 'fresh')
+    writeDist(fresh, 'bbbbbbbb', { 'main-new.js': 'new' })
+    const w1 = wo('wo_stage_webroot', [f.bucket, fresh, 'b'.repeat(40), f.rel]).stdout.trim()
+    const other = path.join(f.t, 'other')
+    writeDist(other, 'dddddddd', { 'only-in-other.js': 'o' })
+    assert.equal(wo('wo_point', [f.bucket, other]).status, 0)
+    const w2 = wo('wo_stage_webroot', [f.bucket, fresh, 'b'.repeat(40), f.rel]).stdout.trim()
+    assert.equal(w2, w1)
+    assert.equal(wo('wo_staged_from', [w2]).stdout.trim(), other)
+    assert.ok(existsSync(path.join(w2, 'assets/only-in-other.js')), 'restaged on top of the new base')
   })
 
   test('unchanged chunks stay hardlinked to the previous webroot (no full copy per flip)', () => {
@@ -184,6 +224,33 @@ describe('v5-web-overlay-lib', () => {
     mkdirSync(empty)
     assert.equal(wo('wo_point', [f.bucket, empty]).status, 1)
     assert.equal(readlinkSync(path.join(f.bucket, 'current')), f.dist)
+  })
+
+  test('p0web EXIT cleanup flips the pointer back when the lane dies after the flip', () => {
+    const f = fixture()
+    assert.equal(wo('wo_seed_pointer', [f.overlay, f.rel, 'a'.repeat(40)]).status, 0)
+    const fresh = path.join(f.t, 'fresh')
+    writeDist(fresh, 'bbbbbbbb', { 'main-new.js': 'new' })
+    const lane = path.join(root, 'scripts/v5-selfhost-p0-web-lib.sh')
+    const r = spawnSync(
+      'bash',
+      [
+        '-c',
+        `set -Eeuo pipefail; source "${lib}"; source "${lane}"; trap p0web_cleanup_build EXIT
+w="$(wo_stage_webroot "$1" "$2" "$3" "$4")"
+P0WEB_REVERT_BUCKET="$1"; P0WEB_REVERT_TARGET="$(wo_current_target "$1")"
+wo_point "$1" "$w"
+false  # e.g. history append hits ENOSPC under set -e`,
+        'x',
+        f.bucket,
+        fresh,
+        'b'.repeat(40),
+        f.rel,
+      ],
+      { encoding: 'utf8', env: { PATH: process.env.PATH ?? '' } },
+    )
+    assert.notEqual(r.status, 0)
+    assert.equal(readlinkSync(path.join(f.bucket, 'current')), f.dist, r.stderr)
   })
 
   test('bucket refuses non-release directories', () => {

@@ -14,7 +14,18 @@
 P0WEB_CANARY_PASSWORD_FILE="${P0WEB_CANARY_PASSWORD_FILE:-/etc/openclaude/selfhost-canary.password}"
 P0WEB_BUILD_DIR=""
 
+# 换指针之后、判定通过之前,任何退出(die / set -e / 信号)都由 EXIT trap 切回原指针。
+P0WEB_REVERT_BUCKET=""
+P0WEB_REVERT_TARGET=""
+
 p0web_cleanup_build() {
+  if [[ -n "$P0WEB_REVERT_BUCKET" && -n "$P0WEB_REVERT_TARGET" ]]; then
+    echo "✗ --p0-web 中途退出 → 切回 $P0WEB_REVERT_TARGET" >&2
+    wo_point "$P0WEB_REVERT_BUCKET" "$P0WEB_REVERT_TARGET" \
+      || echo "✗✗ 切回失败,人工核查 $P0WEB_REVERT_BUCKET/current" >&2
+    P0WEB_REVERT_BUCKET=""
+    P0WEB_REVERT_TARGET=""
+  fi
   [[ -n "$P0WEB_BUILD_DIR" && -d "$P0WEB_BUILD_DIR" ]] && rm -rf -- "$P0WEB_BUILD_DIR"
   P0WEB_BUILD_DIR=""
 }
@@ -101,7 +112,7 @@ p0web_journey() {
 }
 
 cmd_p0_web() {
-  local t0 sha live live_sha bucket bad dist build webroot prev prev_build pre post fail="" epoch0 epoch1
+  local t0 sha live live_sha active bucket bad dist build webroot prev prev_build pre post fail="" epoch0 epoch1
   t0="$(date +%s)"
   log "══ v5 selfhost --p0-web(前端构建目录热切换;不重启 master、不动 runtime/egress/目录)══"
   [[ "$LEASE_TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || die "--p0-web 需要 --target-sha=<40 位 sha>"
@@ -114,6 +125,11 @@ cmd_p0_web() {
     || die "目标 $sha 不在已推送的 origin/feat/v5-selfhost 上"
   git -C "$REPO_ROOT" merge-base --is-ancestor "$live_sha" "$sha" \
     || die "目标不包含 live sourceCommit ${live_sha:0:12}:P0-Web 只能在 live 之上前进"
+  active="$(wo_active_overlay_commit "$WEB_OVERLAY_ROOT" "$live")" || die "读不到当前 overlay 元数据"
+  if [[ -n "$active" ]]; then
+    git -C "$REPO_ROOT" merge-base --is-ancestor "$active" "$sha" \
+      || die "目标不包含当前生效的 P0-Web 修复 ${active:0:12}:只能前进,不能覆盖已上线的修复"
+  fi
   log "── 资格:live ${live_sha:0:12} → 目标 ${sha:0:12} 只改前端静态面 ──"
   bad="$(wo_check_surface "$REPO_ROOT" "$live_sha" "$sha")" \
     || die "不能走 P0-Web(请走普通 --deploy)。不在前端静态面的改动:
@@ -131,14 +147,18 @@ ${bad:-<见上方错误>}"
   [[ "$(readlink -f -- "$MASTER_LIVE_LINK")" == "$live" ]] \
     || die "等锁期间 live release 变了($live → $(readlink -f -- "$MASTER_LIVE_LINK"))。重跑 --p0-web。"
   prev="$(wo_current_target "$bucket")" || die "读不到当前指针"
+  [[ "$prev" == "$(wo_staged_from "$webroot")" ]] \
+    || die "等锁期间前端指针变了(组装基线 $(wo_staged_from "$webroot") → 现在 $prev),新 webroot 可能缺新上线的 chunk。重跑 --p0-web。"
   prev_build="$(wo_build_id_of "$prev")" || die "当前指针目标缺 oc-build: $prev"
   pre="$(p0web_backend_snapshot)"
   epoch0="$(p0web_epoch)"
-  wo_point "$bucket" "$webroot" || die "换指针失败(线上未变)"
-  wo_append_history "$bucket" "$webroot" "$build" "$sha"
+  P0WEB_REVERT_BUCKET="$bucket"
+  P0WEB_REVERT_TARGET="$prev"
+  wo_point "$bucket" "$webroot" || die "换指针失败"
+  wo_append_history "$bucket" "$webroot" "$build" "$sha" || fail="history 写入失败"
   log "  ✓ 已切换 $prev_build → $build(+$(( $(date +%s) - t0 ))s)"
 
-  p0web_handshake "$build" || fail="握手/资产面"
+  if [[ -z "$fail" ]]; then p0web_handshake "$build" || fail="握手/资产面"; fi
   if [[ -z "$fail" ]]; then p0web_journey || fail="E2E J1-J5"; fi
   post="$(p0web_backend_snapshot)"
   if [[ -z "$fail" && "$pre" != "$post" ]]; then fail="后端快照变化(pre=$pre post=$post)"; fi
@@ -147,11 +167,16 @@ ${bad:-<见上方错误>}"
     || log "  ⚠ model_security_epoch 窗口内 $epoch0 → $epoch1(P0-Web 不写库;是别处的目录操作)"
   if [[ -n "$fail" ]]; then
     log "  ✗ $fail → 自动切回 $prev_build"
-    wo_point "$bucket" "$prev" && wo_append_history "$bucket" "$prev" "$prev_build" "revert"
+    P0WEB_REVERT_BUCKET=""
+    P0WEB_REVERT_TARGET=""
+    wo_point "$bucket" "$prev" || die "--p0-web 失败:$fail;切回也失败,人工核查 $bucket/current"
+    wo_append_history "$bucket" "$prev" "$prev_build" "revert" || log "  ⚠ 切回已生效,history 未记"
     p0web_handshake "$prev_build" || log "  ⚠ 切回后握手未通过,人工核查 $bucket/current"
     die "--p0-web 失败:$fail;已切回 $prev_build(用时 $(( $(date +%s) - t0 ))s)"
   fi
-  wo_gc_webroots "$bucket"
+  P0WEB_REVERT_BUCKET=""
+  P0WEB_REVERT_TARGET=""
+  wo_gc_webroots "$bucket" || log "  ⚠ webroot GC 失败(仅告警)"
   log "✓ --p0-web 完成 oc-build=$build sha=${sha:0:12} 用时 $(( $(date +%s) - t0 ))s;后端快照不变:$post"
   log "  回滚: scripts/deploy-v5-selfhost.sh --p0-web-revert(秒级,不重启)"
 }
