@@ -497,7 +497,7 @@ export function makeGrokVisionHandler(deps: GrokVisionHandlerDeps): GrokVisionHa
           "x-authenticateresponse": "authenticate-response",
           "x-grok-model-override": canonical,
           "x-grok-client-mode": "headless",
-          "x-grok-client-version": "1.0.13",
+          "x-grok-client-version": "1.0.62",
           "x-grok-client-identifier": "openclaude-vision",
         },
         body: grokVisionBody({ upstreamModel, mediaType: image.mediaType, data: image.data, prompt }),

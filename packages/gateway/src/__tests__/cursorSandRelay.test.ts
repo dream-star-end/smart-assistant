@@ -1146,7 +1146,7 @@ test('loopback relay hits InferenceService/Stream with Sand identity and emits A
     const headers = new Headers(init.headers)
     assert.equal(headers.get('x-cursor-client-type'), 'sand')
     assert.equal(headers.get('x-cursor-client-source'), CURSOR_SAND_DIRECT_CLIENT_SOURCE)
-    assert.equal(headers.get('x-cursor-client-version'), 'cli-2026.08.11-e8db854')
+    assert.equal(headers.get('x-cursor-client-version'), 'cli-2026.10.16-e3cb207')
     assert.equal(headers.get('content-type'), 'application/connect+proto')
     const body = Buffer.from(init.body as Uint8Array)
     const length = body.readUInt32BE(1)

@@ -18,7 +18,7 @@ export const ANTIGRAVITY_QUOTA_TTL_MS = 10 * 60 * 1000
  * without this user-agent loadCodeAssist answers allowedTiers/ineligibleTiers
  * only (no project), so the quota call cannot be made. Matches the pinned CLI.
  */
-export const ANTIGRAVITY_QUOTA_USER_AGENT = 'antigravity/1.3.4'
+export const ANTIGRAVITY_QUOTA_USER_AGENT = 'antigravity/1.4.0'
 const TIMEOUT_MS = 8_000
 
 export interface QuotaWindow {
