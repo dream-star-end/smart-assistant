@@ -86,20 +86,18 @@ wo_check_surface() { # <repo> <from-sha> <to-sha>
 # 旧 chunk 仍 200;根文件按新 dist 覆盖(--delete 只作用于 assets 以外)。rsync 先写临时文件再
 # rename,不会改到与上一份 webroot(乃至不可变 release dist)共享 inode 的文件;--checksum 让同名
 # 同内容的 chunk 保持硬链。刻意不用 -a:-t/-p 会对内容相同的硬链文件就地改 mtime/权限。
-# 目录名 = <oc-build>-<sha12>:oc-build 只哈希 index.html,不同提交可能同 id,不能只按 id 复用。
-# 同名目录已存在时,只有元数据里 sourceCommit 与 previous 都一致才复用。
+# 目录名 = <oc-build>-<sha12>-<基线8>:oc-build 只哈希 index.html,不同提交可能同 id;基线(组装时的
+# 指针目标)不同,union 出来的 assets 也不同。三者都相同的目录内容必然相同,直接复用;本函数
+# 从不删除任何已有 webroot(它可能正被 serve 或是回退目标)。
 wo_stage_webroot() { # <bucket> <new-dist> <source-sha> <base-release> → stdout 新 webroot
   local bucket="$1" dist="$2" sha="$3" base="$4" build cur dest tmp name
   build="$(wo_build_id_of "$dist")" || { wo_err "新 dist 缺 oc-build meta"; return 1; }
   cur="$(wo_current_target "$bucket")" || { wo_err "桶内没有当前指针: $bucket"; return 1; }
-  name="$build-${sha:0:12}"
+  name="$build-${sha:0:12}-$(printf '%s' "$cur" | sha256sum | cut -c1-8)"
   dest="$bucket/webroots/$name"
-  if [[ -d "$dest" ]]; then
-    if [[ "$(jq -r '.sourceCommit + " " + .previous' "$dest.json" 2>/dev/null)" == "$sha $cur" ]]; then
-      printf '%s\n' "$dest"
-      return 0
-    fi
-    rm -rf -- "$dest" "$dest.json"
+  if [[ -d "$dest" && -f "$dest.json" ]]; then
+    printf '%s\n' "$dest"
+    return 0
   fi
   mkdir -p -- "$bucket/webroots" || return 1
   tmp="$bucket/webroots/.staging.$name.$$"

@@ -126,6 +126,7 @@ cmd_p0_web() {
   git -C "$REPO_ROOT" merge-base --is-ancestor "$live_sha" "$sha" \
     || die "目标不包含 live sourceCommit ${live_sha:0:12}:P0-Web 只能在 live 之上前进"
   active="$(wo_active_overlay_commit "$WEB_OVERLAY_ROOT" "$live")" || die "读不到当前 overlay 元数据"
+  [[ "$active" != "$sha" ]] || { log "✓ $sha 已经是生效的 P0-Web 前端,无需切换"; return 0; }
   if [[ -n "$active" ]]; then
     git -C "$REPO_ROOT" merge-base --is-ancestor "$active" "$sha" \
       || die "目标不包含当前生效的 P0-Web 修复 ${active:0:12}:只能前进,不能覆盖已上线的修复"
@@ -149,6 +150,12 @@ ${bad:-<见上方错误>}"
   prev="$(wo_current_target "$bucket")" || die "读不到当前指针"
   [[ "$prev" == "$(wo_staged_from "$webroot")" ]] \
     || die "等锁期间前端指针变了(组装基线 $(wo_staged_from "$webroot") → 现在 $prev),新 webroot 可能缺新上线的 chunk。重跑 --p0-web。"
+  # 锁内再判一次「只前进」:构建期间可能有另一条 P0-Web 上线。
+  active="$(wo_active_overlay_commit "$WEB_OVERLAY_ROOT" "$live")" || die "读不到当前 overlay 元数据"
+  if [[ -n "$active" ]]; then
+    git -C "$REPO_ROOT" merge-base --is-ancestor "$active" "$sha" \
+      || die "等锁期间上线了不被目标包含的 P0-Web 修复 ${active:0:12},拒绝覆盖。"
+  fi
   prev_build="$(wo_build_id_of "$prev")" || die "当前指针目标缺 oc-build: $prev"
   pre="$(p0web_backend_snapshot)"
   epoch0="$(p0web_epoch)"

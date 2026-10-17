@@ -128,7 +128,7 @@ describe('v5-web-overlay-lib', () => {
     const r = wo('wo_stage_webroot', [f.bucket, fresh, 'b'.repeat(40), f.rel])
     assert.equal(r.status, 0, r.stderr)
     const webroot = r.stdout.trim()
-    assert.equal(webroot, path.join(f.bucket, `webroots/bbbbbbbb-${'b'.repeat(12)}`))
+    assert.match(webroot, new RegExp(`/webroots/bbbbbbbb-${'b'.repeat(12)}-[0-9a-f]{8}$`))
     assert.ok(existsSync(path.join(webroot, 'assets/lazy-old.js')), 'old chunk kept for open tabs')
     assert.ok(existsSync(path.join(webroot, 'assets/main-new.js')))
     assert.match(readFileSync(path.join(webroot, 'index.html'), 'utf8'), /bbbbbbbb/)
@@ -136,7 +136,7 @@ describe('v5-web-overlay-lib', () => {
     const meta = JSON.parse(readFileSync(`${webroot}.json`, 'utf8'))
     assert.equal(meta.sourceCommit, 'b'.repeat(40))
     assert.equal(meta.previous, f.dist)
-    assert.equal(existsSync(path.join(webroot, `bbbbbbbb-${'b'.repeat(12)}.json`)), false, 'metadata is not served')
+    assert.equal(existsSync(path.join(webroot, `${path.basename(webroot)}.json`)), false, 'metadata is not served')
     assert.equal(wo('wo_staged_from', [webroot]).stdout.trim(), f.dist)
 
     assert.equal(wo('wo_static_gate', [webroot, 'bbbbbbbb']).status, 0)
@@ -163,19 +163,23 @@ describe('v5-web-overlay-lib', () => {
     assert.equal(JSON.parse(readFileSync(`${w2}.json`, 'utf8')).sourceCommit, 'c'.repeat(40))
   })
 
-  test('a reused webroot dir is rebuilt when it was staged from a different base', () => {
+  test('a different base gets its own webroot and never deletes the one being served', () => {
     const f = fixture()
     assert.equal(wo('wo_seed_pointer', [f.overlay, f.rel, 'a'.repeat(40)]).status, 0)
     const fresh = path.join(f.t, 'fresh')
     writeDist(fresh, 'bbbbbbbb', { 'main-new.js': 'new' })
     const w1 = wo('wo_stage_webroot', [f.bucket, fresh, 'b'.repeat(40), f.rel]).stdout.trim()
-    const other = path.join(f.t, 'other')
-    writeDist(other, 'dddddddd', { 'only-in-other.js': 'o' })
-    assert.equal(wo('wo_point', [f.bucket, other]).status, 0)
-    const w2 = wo('wo_stage_webroot', [f.bucket, fresh, 'b'.repeat(40), f.rel]).stdout.trim()
-    assert.equal(w2, w1)
-    assert.equal(wo('wo_staged_from', [w2]).stdout.trim(), other)
-    assert.ok(existsSync(path.join(w2, 'assets/only-in-other.js')), 'restaged on top of the new base')
+    assert.equal(wo('wo_point', [f.bucket, w1]).status, 0)
+    // 同一提交再组装一次:基线已是 w1,得到新目录,w1(正在 serve)原封不动。
+    const r = wo('wo_stage_webroot', [f.bucket, fresh, 'b'.repeat(40), f.rel])
+    assert.equal(r.status, 0, r.stderr)
+    const w2 = r.stdout.trim()
+    assert.notEqual(w2, w1)
+    assert.equal(wo('wo_staged_from', [w2]).stdout.trim(), w1)
+    assert.ok(existsSync(path.join(w1, 'index.html')), 'served webroot must survive')
+    assert.equal(readlinkSync(path.join(f.bucket, 'current')), w1)
+    // 同提交同基线:复用。
+    assert.equal(wo('wo_stage_webroot', [f.bucket, fresh, 'b'.repeat(40), f.rel]).stdout.trim(), w2)
   })
 
   test('unchanged chunks stay hardlinked to the previous webroot (no full copy per flip)', () => {
