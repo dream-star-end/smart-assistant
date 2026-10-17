@@ -1119,8 +1119,7 @@ export function App() {
       // Empty composer has no sessionId. Skipping PUT avoids the old asDefault/!sessionId
       // default-write path; first send persists against the minted session id.
       if (!activeId && !asDefault) return;
-      // Solo/team keep the user's pick on a failed save (see keepCollabChoiceOnSaveFailure);
-      // only advisor rolls back, so a failing save can never pin the session to advisor.
+      // Failed save: solo/team keep the pick, only advisor rolls back (keepCollabChoiceOnSaveFailure).
       const failSave = (msg: string) => {
         if (keepCollabChoiceOnSaveFailure(mode)) return;
         setCollabUi(previous);
