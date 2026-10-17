@@ -7285,6 +7285,45 @@
           "assertion": "OCV5-315 only the exact continuation reject qualifies"
         }
       ]
+    },
+    {
+      "id": "INC-20261017-BOX-HELD-NO-PROCESS",
+      "occurredAt": "2026-10-17",
+      "severity": "P0",
+      "symptom": "商业（2026-10-17 07:10–08:28Z）：账号 79 被 uid 4 的 3 条 Box handoff 叶子（1022999…/232016…/91fe2b3f…）占住，Box 上已无 claude 进程。清理 worker 读不到 terminal proof（BOX_EXEC_REMOTE_EXIT），这些叶子既不是 stale resume、也没到 4h15m，于是每 2 分钟打一次 box_stop_probe_pending 却不释放；会话每条消息 IDLE_HISTORY_PENDING，账号上其它请求 BOX_CAPACITY_HELD，最后人工在生产租约下标 expired_unproven 释放。两周内同类第 13 起，此前每次只补一条退出路径。修复（OCV5-488 PR-2）：清理 worker 读不到 proof 时用只读探针看 Box 上该 run 的进程，同一 bootId 下相隔 1 分钟两次都不在（或 Box 重启过）即按 expired 两种形态收口，金额不动、计费未结算的链先不关；容器读到某回合 idle proof 为 pending 且该回合叶子仍停在 handoff 时，egress 按浏览器 Stop 的同一路径停掉它；新增 ops.box_hold_stuck 轮询告警与 ops.box_hold_released 通报。",
+      "rootFixCommit": "e18d0045",
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-488-process-absent-released] PASS — a parked run whose processes are gone from the Box is released on two looks without its age or any money change, and an unsettled one is held and alerted"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-488-idle-proof-stops-parked-turn] PASS — a turn the container has ended stops its parked Box leaf on the next idle read and the next message passes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
+          "assertion": "OCV5-488 a run seen gone on two looks is closed without waiting for its age"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
+          "assertion": "OCV5-488 the journal's refusal keeps the run pending and releases nothing"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRunLiveness.test.ts",
+          "assertion": "OCV5-488 a keeper naming the run is alive; once it is gone the run is absent"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/alertRules.test.ts",
+          "assertion": "a run held past what the closers allow fires once per account set"
+        }
+      ]
     }
   ]
 }
