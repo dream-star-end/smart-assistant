@@ -10,6 +10,8 @@ const LINE_FENCE = /^ {0,3}(`{3,}|~{3,})[ \t]*([^\s`]*)/
 const LINE_UI_WITH_BODY = /^( {0,3})(`{3,}|~{3,})[ \t]*ui[ \t]*(\{.*)$/i
 /** 行中间的 ui 开围栏:后面只能是 JSON 开头或行尾,否则是正文里提到这个写法。 */
 const GLUED_UI = /(`{3,}|~{3,})ui(?=[ \t]*(?:\{|$))/i
+/** 缩进代码块的行:原样保留,里面的 ```ui 只是示例文字。 */
+const INDENTED_CODE = /^(?: {4}|\t)/
 
 export function normalizeInlineUiFences(text: string): string {
   if (!text.includes('```ui') && !text.includes('~~~ui')) return text
@@ -55,10 +57,11 @@ export function normalizeInlineUiFences(text: string): string {
       open = { char: m[1]![0]!, len: m[1]!.length, ui: m[2]!.toLowerCase() === 'ui' }
       continue
     }
-    const g = GLUED_UI.exec(line)
-    if (g && g.index > 0) {
-      const before = line.slice(0, g.index).trimEnd()
-      if (before) out.push(before)
+    // 只处理正文后面贴着的开围栏:前面得有文字,且这一行不是缩进代码块(4 空格/Tab 起头)。
+    const g = INDENTED_CODE.test(line) ? null : GLUED_UI.exec(line)
+    const before = g ? line.slice(0, g.index).trimEnd() : ''
+    if (g && before.trim()) {
+      out.push(before)
       openUi('', g[1]!, line.slice(g.index + g[0].length))
       continue
     }
