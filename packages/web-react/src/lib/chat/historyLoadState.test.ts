@@ -35,10 +35,7 @@ describe("sessionHistorySurface", () => {
 
 test("App.tsx routes GET failure + messageCount through sessionHistorySurface, not EmptyState", () => {
   const here = dirname(fileURLToPath(import.meta.url));
-  // OCV5-472: App's hook section lives in app/useAppState.tsx + app/useAppActions.tsx.
-  const source = ["../../App.tsx", "../../app/useAppState.tsx", "../../app/useAppActions.tsx"]
-    .map((f) => readFileSync(join(here, f), "utf8"))
-    .join("\n");
+  const source = readFileSync(join(here, "../../App.tsx"), "utf8");
   // OCV5-466: the derivation lives in hooks/useHistorySkeleton; App consumes its historySurface.
   const hookSource = readFileSync(join(here, "../../hooks/useHistorySkeleton.ts"), "utf8");
   expect(source).toContain("useHistorySkeleton({");
