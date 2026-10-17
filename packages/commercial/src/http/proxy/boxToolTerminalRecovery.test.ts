@@ -245,7 +245,8 @@ test("bound heartbeat still needs a real final proof and exact EOF", async () =>
     journal: { complete: async () => { throw new Error("must not complete"); },
       completeToolChain: async () => { throw new Error("must not complete"); },
       readRecoveryWinner: async () => null } as never });
-  assert.deepEqual(unbound, { status: "pending", reason: "BOX_TOOL_RECORD_INVALID" });
+  assert.deepEqual(unbound, { status: "pending", reason: "BOX_TOOL_RECORD_INVALID",
+    undeliverable: true });
   const noProof = await run([beat(native), echo, ...finalBody], (args) => {
     if (args[2]?.includes("terminal.json")) throw new Error("proof unread");
     return undefined;
@@ -309,7 +310,9 @@ test("terminal recovery bills the final message after a pre-model compact and re
     journal: { complete: async () => { throw new Error("must not complete"); },
       completeToolChain: async () => { throw new Error("must not complete"); },
       readRecoveryWinner: async () => null } as never });
-  assert.deepEqual(mid, { status: "pending", reason: "BOX_CLI_COMPACT_PHASE" });
+  // INC-20261006-BOX-SYNTHETIC-TURN-HELD: a finished run whose message carries
+  // a synthetic CLI turn can never be delivered; it must close, not wait.
+  assert.deepEqual(mid, { status: "pending", reason: "BOX_CLI_COMPACT_PHASE", undeliverable: true });
 });
 
 // OCV5-313 (#1a28c670): only what the finished spool itself rules out is
@@ -366,4 +369,21 @@ test("OCV5-377 a model safety stop in the finished spool is undeliverable", asyn
   assert.deepEqual(await observeBoxToolTerminalOnly({ evidence, catalog,
     target: spool(refused) as never }, deps),
   { status: "pending", reason: "BOX_CLI_MODEL_REFUSED", undeliverable: true });
+});
+
+// INC-20261006-BOX-SYNTHETIC-TURN-HELD (canary after the first fix): a finished
+// run whose CLI answered without a stream (assistant snapshots only) is rejected
+// by the decoder as BOX_TOOL_SNAPSHOT_INVALID. The spool cannot change any more,
+// so that is final: undeliverable, never an endless pending that pins the session.
+test("INC-20261006 a finished spool the decoder rejects is undeliverable", async () => {
+  const snapshotsOnly = finalRecords.filter((record) =>
+    (record as { type?: string }).type !== "stream_event");
+  const outcome = await observeBoxToolTerminalOnly({
+    evidence, catalog, target: spool(snapshotsOnly) as never }, {
+    writeMessage: async () => { throw new Error("must not write"); },
+    journal: { complete: async () => { throw new Error("must not complete"); },
+      completeToolChain: async () => { throw new Error("must not complete"); },
+      readRecoveryWinner: async () => null } as never });
+  assert.deepEqual(outcome, { status: "pending", reason: "BOX_TOOL_SNAPSHOT_INVALID",
+    undeliverable: true });
 });

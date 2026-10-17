@@ -21,6 +21,7 @@ test("Box journal fences replay/account capacity and persists proof plus exact u
     max: 1 });
   const client = await pool.connect();
   try {
+    await client.query("CREATE TEMP TABLE agent_containers (id bigint PRIMARY KEY, state text NOT NULL)");
     await client.query(`CREATE TEMP TABLE request_finalize_journal (
       request_id text PRIMARY KEY, user_id bigint NOT NULL,
       container_id bigint, state text NOT NULL,
