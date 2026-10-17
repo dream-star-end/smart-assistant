@@ -10,7 +10,7 @@
     "packages/commercial/src/marketplace/marketplaceDb.ts": 3621,
     "packages/commercial/src/ws/userChatBridge.ts": 10600,
     "packages/gateway/src/server.ts": 19942,
-    "packages/gateway/src/sessionManager.ts": 6872,
+    "packages/gateway/src/sessionManager.ts": 4580,
     "packages/gateway/src/subprocessRunner.ts": 3271,
     "packages/gateway/src/taskboard/http.ts": 3043,
     "packages/storage/src/sessionsDb.ts": 7990,

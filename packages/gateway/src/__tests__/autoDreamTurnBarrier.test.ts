@@ -1,3 +1,4 @@
+import { sessionManagerMethodBody } from './helpers/sessionManagerSource.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -6,10 +7,10 @@ import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const source = readFileSync(join(here, '..', 'sessionManager.ts'), 'utf8')
-const submitStart = source.indexOf('  async submit(')
-// the next member after submit; its forwarder is no longer `async` (OCV5-469: forwarders return the impl promise)
-const submitEnd = source.slice(submitStart).search(/\n {2}private (?:async )?runOneTurnWithRetry\(/) + submitStart + 1
-const submit = source.slice(submitStart, submitEnd)
+// FINDINGS §7.6 M2: submit's implementation lives in sessionSubmit.ts; the class keeps a forwarder.
+const submit = sessionManagerMethodBody('submit')
+const submitStart = 0
+const submitEnd = submit.length
 
 test('commercial foreground turns hold the shared memory barrier until submit finally', () => {
   assert.ok(submitStart >= 0 && submitEnd > submitStart, 'submit method must be extractable')
