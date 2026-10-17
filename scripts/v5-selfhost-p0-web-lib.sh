@@ -5,7 +5,7 @@
 # master、不碰 runtime tuple / egress / 模型目录,所以不重建用户容器、不打断在飞回合。
 # 流程:资格判定(相对 live sourceCommit 只改前端静态面)→ 只解出前端构建输入在临时目录构建
 # (live release 的 node_modules)→ 组装 webroot(旧 assets ∪ 新构建)→ 切换前静态门 →
-# 持发布锁原子换指针 → 握手 + 资产面 + E2E J1-J5 → 后端快照前后一致;任一失败自动换回。
+# 持发布锁原子换指针 → 握手 + 资产面 + 前端用户路径门(C1+C2)→ 后端快照前后一致;任一失败自动换回。
 #
 # 被部署脚本 source:复用其 die/log/锁/端口/canary 口径;纯函数在 v5-web-overlay-lib.sh。
 # 普通发布侧:cutover 给新 release 建指针(wo_seed_pointer),--deploy 拒绝不包含当前 overlay
@@ -58,9 +58,15 @@ p0web_build() { # <sha> <live-rel>
   git -C "$REPO_ROOT" archive "$sha" -- "${paths[@]}" | tar -x -C "$P0WEB_BUILD_DIR" \
     || die "git archive $sha 前端构建输入失败"
   ln -s -- "$live/node_modules" "$P0WEB_BUILD_DIR/node_modules"
-  log "  构建 web-react @ ${sha:0:12}(tsc -b && vite build,node_modules=live)"
-  ( cd "$P0WEB_BUILD_DIR/packages/web-react" && NODE_OPTIONS='--max-old-space-size=4096' npm run build ) \
-    || die "web-react 构建失败(线上未变)"
+  # 与 package.json "build"(tsc -b && vite build)同两步;tsconfig noEmit,vite 不读 tsc 产物,
+  # 两步并行跑,两步都过才算构建通过。
+  log "  构建 web-react @ ${sha:0:12}(tsc -b ∥ vite build,node_modules=live)"
+  local tsc_rc=0 vite_rc=0 tsc_pid
+  ( cd "$P0WEB_BUILD_DIR/packages/web-react" && NODE_OPTIONS='--max-old-space-size=4096' "$P0WEB_BUILD_DIR/node_modules/.bin/tsc" -b ) &
+  tsc_pid=$!
+  ( cd "$P0WEB_BUILD_DIR/packages/web-react" && "$P0WEB_BUILD_DIR/node_modules/.bin/vite" build ) || vite_rc=$?
+  wait "$tsc_pid" || tsc_rc=$?
+  [[ "$tsc_rc" == 0 && "$vite_rc" == 0 ]] || die "web-react 构建失败 tsc=$tsc_rc vite=$vite_rc(线上未变)"
   P0WEB_DIST="$P0WEB_BUILD_DIR/packages/web-react/dist"
 }
 
@@ -101,14 +107,17 @@ p0web_handshake() { # <expected-build>
   log "  ✓ 握手:oc-build=$got,index/admin 引用的 assets 全部 200"
 }
 
-p0web_journey() {
+# 前端用户路径门:C1 冷启动 UI 登录 + C2 选模型发送到达出站请求(拦截,不调上游)。与切流时
+# user_contract_gate 的 C1/C2 同一套浏览器步骤;C3(各引擎真 turn)不在此:P0-Web 不发后端字节。
+# (v5-e2e-journey-canary.mjs 的 J1 选择器按商业版登录页写,selfhost 新登录页上 J1 恒失败,不用。)
+p0web_ui_gate() {
   [[ -s "$P0WEB_CANARY_PASSWORD_FILE" && -r "$P0WEB_CANARY_PASSWORD_FILE" ]] \
     || { log "  ✗ canary 密码文件缺失/不可读: $P0WEB_CANARY_PASSWORD_FILE"; return 1; }
-  log "── E2E 旅程门 J1-J5(真浏览器,canary,直连 127.0.0.1:${V5_PORT})──"
+  log "── 前端用户路径门 C1+C2(真浏览器,canary,直连 127.0.0.1:${V5_PORT},cost=dry)──"
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
     V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
-    V5_CANARY_PASSWORD="$(<"$P0WEB_CANARY_PASSWORD_FILE")" \
-    timeout 510 node "$SCRIPT_DIR/v5-e2e-journey-canary.mjs"
+    V5_CANARY_PASSWORD_FILE="$P0WEB_CANARY_PASSWORD_FILE" \
+    node "$SCRIPT_DIR/v5-p0-web-ui-smoke.mjs"
 }
 
 cmd_p0_web() {
@@ -166,7 +175,7 @@ ${bad:-<见上方错误>}"
   log "  ✓ 已切换 $prev_build → $build(+$(( $(date +%s) - t0 ))s)"
 
   if [[ -z "$fail" ]]; then p0web_handshake "$build" || fail="握手/资产面"; fi
-  if [[ -z "$fail" ]]; then p0web_journey || fail="E2E J1-J5"; fi
+  if [[ -z "$fail" ]]; then p0web_ui_gate || fail="前端用户路径门 C1+C2"; fi
   post="$(p0web_backend_snapshot)"
   if [[ -z "$fail" && "$pre" != "$post" ]]; then fail="后端快照变化(pre=$pre post=$post)"; fi
   epoch1="$(p0web_epoch)"
