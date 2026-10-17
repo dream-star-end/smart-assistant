@@ -19,6 +19,7 @@ import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 import { Gateway } from '../server.js'
+import { readGatewaySource } from './helpers/gatewaySource.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
@@ -81,7 +82,7 @@ describe('team mode preamble — 两策略(审议/执行)+ 队长自主送审纪
 
 describe('team mode hidden reviewer — 可见性守护(不变)', () => {
   it('keeps hidden reviewer out of user-facing agent management APIs', () => {
-    const src = readFileSync(SERVER_TS, 'utf8')
+    const src = readGatewaySource() // FINDINGS §7: server.ts + split-out modules
     assert.match(src, /filterUserVisibleAgentsForManagement\(cfg\.agents\)/)
     assert.match(src, /userVisibleDefaultAgentId\(cfg\.default\)/)
     assert.match(src, /filterUserVisibleRoutesForManagement\(cfg\.routes\)/)
@@ -106,7 +107,7 @@ describe('team mode hidden reviewer — 可见性守护(不变)', () => {
   })
 
   it('rejects hidden reviewer from other user-controlled execution and mutation surfaces', () => {
-    const src = readFileSync(SERVER_TS, 'utf8')
+    const src = readGatewaySource() // FINDINGS §7: server.ts + split-out modules
     const cronSrc = readFileSync(CRON_TS, 'utf8')
     // 枚举面(P2 债E 收口):skill 作用域 / webhook·task·cron 列表改走用户可见投影
     // (_getAgentsConfigUserView / filterUserVisibleByAgentField),不再各自手工过滤;
@@ -114,7 +115,8 @@ describe('team mode hidden reviewer — 可见性守护(不变)', () => {
     assert.match(src, /validateSkillAgentScopeInput[\s\S]*_getAgentsConfigUserView\(\)/)
     assert.match(src, /eventBus\.on\('task\.created'[\s\S]*isHiddenSystemAgentId\(ev\.agentId\)/)
     assert.match(src, /eventBus\.on\('webhook\.received'[\s\S]*isHiddenSystemAgentId\(agentId\)/)
-    assert.match(src, /filterUserVisibleByAgentField\(this\.webhookRouter\?\.list\(\) \?\? \[\]\)/)
+    // the /api/webhooks branch moved to routes/workspaceApi.ts, where the Gateway is `io`
+    assert.match(src, /filterUserVisibleByAgentField\((?:this|io)\.webhookRouter\?\.list\(\) \?\? \[\]\)/)
     assert.match(src, /if \(isHiddenSystemAgentId\(wh\.agent\)\)[\s\S]*webhook not found/)
     assert.match(src, /filterUserVisibleByAgentField\(await this\._taskStore\.list\(\)\)/)
     assert.match(src, /const taskAgent = typeof agent === 'string' && agent \? agent : 'main'/)

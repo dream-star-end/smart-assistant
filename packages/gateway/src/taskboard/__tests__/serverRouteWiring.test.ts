@@ -13,10 +13,13 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { readGatewaySource } from '../../__tests__/helpers/gatewaySource.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const httpSrc = readFileSync(join(here, '../http.ts'), 'utf8')
-const serverSrc = readFileSync(join(here, '../../server.ts'), 'utf8')
+// FINDINGS §7.5 2b: the /api/board dispatch whitelist moved to routes/workspaceApi.ts; read the
+// Gateway source set (server.ts + split-out modules).
+const serverSrc = readGatewaySource()
 const frontendSrc = readFileSync(
   join(here, '../../../../web-react/src/lib/taskboard.ts'),
   'utf8',
