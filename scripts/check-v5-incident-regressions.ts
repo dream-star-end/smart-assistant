@@ -194,11 +194,18 @@ const CI_WORKFLOW = readFileSync(join(ROOT, ".github/workflows/v5-ci.yml"), "utf
 const DEPLOY_SCRIPT = readFileSync(join(ROOT, "scripts/deploy-v5.sh"), "utf8");
 const ROOT_PACKAGE_JSON = readFileSync(join(ROOT, "package.json"), "utf8");
 let selfhostDeployCache: string | null = null;
-/** Read only in the selfhost edition; a missing script means no selfhost runner is wired. */
+/** Read only in the selfhost edition; a missing script means no selfhost runner is wired.
+ * OCV5-488: deploy-v5-selfhost.sh sources v5-selfhost-master-release-lib.sh, whose
+ * build_master_release runs the pinned-staging gates (Box success recovery, continuation,
+ * incident proofs). The library counts only while the deploy script really sources it. */
 function selfhostDeployScript(): string {
   if (selfhostDeployCache === null) {
     const file = join(ROOT, "scripts/deploy-v5-selfhost.sh");
-    selfhostDeployCache = existsSync(file) ? readFileSync(file, "utf8") : "";
+    const deploy = existsSync(file) ? readFileSync(file, "utf8") : "";
+    const lib = join(ROOT, "scripts/v5-selfhost-master-release-lib.sh");
+    const sourced = /^MASTER_RELEASE_LIB="\$SCRIPT_DIR\/v5-selfhost-master-release-lib\.sh"$/m.test(deploy)
+      && /^source "\$MASTER_RELEASE_LIB"$/m.test(deploy) && existsSync(lib);
+    selfhostDeployCache = sourced ? `${deploy}\n${readFileSync(lib, "utf8")}` : deploy;
   }
   return selfhostDeployCache;
 }
