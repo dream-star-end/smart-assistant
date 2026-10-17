@@ -7688,6 +7688,30 @@
         "eda1105b",
         "f65e85e2"
       ]
+    },
+    {
+      "id": "INC-20261017-COLLAB-MODE-LOCK",
+      "occurredAt": "2026-10-17",
+      "severity": "P0",
+      "symptom": "商业版全能助手协作方式：选「顾问」提示暂时没有可用的顾问型号，红字「协作配置保存失败（追踪号 50e024e47bcd4ccd9500877225074562）」，之后切回单人/团队也切不了，无法发送。根因：商业容器 /api/collaboration-config 是 selfhost-only 恒 404；前端保存失败回滚到 previous，连点后 previous 已是顾问，于是永远回滚到顾问。个人版无顾问型号时 PUT 400 同样锁死。修复：单人/团队是每轮帧字段，保存失败保留用户选择、首发不拦截；只有顾问回滚。",
+      "rootFixCommit": "e0921a6f",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/collaborationConfig.test.ts",
+          "assertion": "keeps solo/team after a failed save so the user is never locked into advisor"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/collaborationConfig.test.ts",
+          "assertion": "rolls advisor back: it cannot run without the saved config"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-477-collab-404-app.node-test.mjs",
+          "assertion": "solo must stick after a 404 save"
+        }
+      ]
     }
   ]
 }

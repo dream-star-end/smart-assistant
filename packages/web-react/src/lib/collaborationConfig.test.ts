@@ -4,6 +4,7 @@ import {
   collaborationPutBody,
   docToUiState,
   isStaleCollabEpoch,
+  keepCollabChoiceOnSaveFailure,
   recommendedAdvisorModel,
   sendCollabFields,
   type CollaborationConfigDoc,
@@ -207,5 +208,16 @@ describe("recommendedAdvisorModel", () => {
         advisorModels: [],
       }),
     ).toBeNull();
+  });
+});
+
+describe("keepCollabChoiceOnSaveFailure", () => {
+  it("keeps solo/team after a failed save so the user is never locked into advisor", () => {
+    expect(keepCollabChoiceOnSaveFailure("solo")).toBe(true);
+    expect(keepCollabChoiceOnSaveFailure("team")).toBe(true);
+  });
+
+  it("rolls advisor back: it cannot run without the saved config", () => {
+    expect(keepCollabChoiceOnSaveFailure("advisor")).toBe(false);
   });
 });
