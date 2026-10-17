@@ -216,6 +216,9 @@ export interface BoxStoppedFailureProbeCandidate {
    * waits for tool results that no request will publish again.
    * OCV5-313: every launched detached-tool unknown leaf, whatever its phase. */
   readonly staleResume?: { readonly phase: BoxStaleResumePhase; readonly unknownForMs: number };
+  /** OCV5-488: a handoff leaf whose turn ran in a container that is no longer
+   * the user's active one (rebuilt, swept, removed), for over two minutes. */
+  readonly abandonedHandoff?: true;
   /** OCV5-313: the row is older than BOX_RUN_EXPIRED_AFTER_MS, so its run
    * cannot be alive any more (same rule as admission capacity). */
   readonly expired?: boolean;
@@ -332,6 +335,20 @@ function stoppedRunMode(ctx: Record<string, unknown>): boolean {
       && typeof ctx.boxDetachedRunnerHash === "string"
       && /^[a-f0-9]{64}$/.test(ctx.boxDetachedRunnerHash));
 }
+
+/* OCV5-488 (user-approved deviation from a gateway keepalive lease, 10-17):
+ * whether the turn that handed a tool call to a Box run can still answer it
+ * is decided server-side. A user has at most one active container; a run
+ * whose turn ran in any other (rebuilt, swept, removed) can never be
+ * answered, while one in the active container is left alone however long
+ * its tools run. A keepalive would only cover containers already running a
+ * new runtime. */
+// lint-agent-containers-kind: allow — 按本行自己的 container_id 查它是否仍 active;与容器种类无关
+export const OWNER_CONTAINER_GONE = `(container_id IS NULL OR NOT EXISTS (
+  SELECT 1 FROM agent_containers ac
+   WHERE ac.id = request_finalize_journal.container_id AND ac.state = 'active'))`;
+/** A handoff this recent may belong to a container being replaced right now. */
+const BOX_ABANDONED_HANDOFF_GRACE_MS = 2 * 60_000;
 
 export const STOP_PROBE_STATE_FENCE = `((state='inflight'
   AND ctx->>'boxState' IN ('running','unknown','linked')
@@ -2764,11 +2781,12 @@ export class BoxDurableJournal implements BoxJournalPort {
    * pinned Box read returns a valid terminal marker; no paid call is retried. */
   async listStoppedFailureProbeCandidates(limit = 10): Promise<BoxStoppedFailureProbeCandidate[]> {
     const found = await this.pool.query<{ request_id: string; user_id: string;
-      state: string; unknown_for_ms: string; expired: boolean;
+      state: string; unknown_for_ms: string; expired: boolean; owner_gone: boolean;
       ctx: Record<string, unknown> }>(
       `SELECT request_id,user_id::text,state,ctx,
           GREATEST(0,(EXTRACT(EPOCH FROM (NOW()-updated_at))*1000))::bigint::text AS unknown_for_ms,
-          created_at <= NOW() - make_interval(secs => $2::double precision) AS expired
+          created_at <= NOW() - make_interval(secs => $2::double precision) AS expired,
+          ${OWNER_CONTAINER_GONE} AS owner_gone
         FROM request_finalize_journal
         WHERE ${STOP_PROBE_STATE_FENCE} AND ctx->>'boxInvocationRecovery'='v1'
           AND ${STOP_MODE_FENCE}
@@ -2819,12 +2837,18 @@ export class BoxDurableJournal implements BoxJournalPort {
         && isBoxUnknownPhase(ctx.boxUnknownPhase)
         && Number.isSafeInteger(unknownForMs)
         ? { phase: ctx.boxUnknownPhase, unknownForMs } : undefined;
+      // OCV5-488: a leaf parked on a tool handoff whose turn ran in a container
+      // that is no longer the user's active one can never be answered.
+      const abandonedHandoff = row.owner_gone === true && ctx.boxState === "handoff"
+        && ctx.boxToolHandoff !== undefined && Number.isSafeInteger(unknownForMs)
+        && unknownForMs >= BOX_ABANDONED_HANDOFF_GRACE_MS;
       const cliCwd = nativeKeeperCwd(ctx, ctx.boxRunNonce);
       candidates.push({ requestId: row.request_id, uid: BigInt(row.user_id),
         accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce,
         leaseEpoch: ctx.boxLeaseEpoch, linked: ctx.boxOwnerRequestId !== undefined,
         ...(cliCwd ? { cliCwd } : {}),
         ...(staleResume ? { staleResume } : {}),
+        ...(abandonedHandoff ? { abandonedHandoff: true as const } : {}),
         ...(row.expired === true ? { expired: true } : {}) });
     }
     return candidates;

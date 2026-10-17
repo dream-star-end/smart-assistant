@@ -77,7 +77,7 @@ export class BoxRemoteCleanupWorker {
     recoverProvedSuccess?: (candidate: BoxStoppedFailureProbeCandidate,
       target: BoxResolvedTarget) => Promise<ProvedSuccess>;
     /** OCV5-488: records the looks at the Box that find a run gone. */
-    holds?: Pick<BoxHoldRelease, "recordRunAbsence" | "clearRunAbsence">;
+    holds?: Pick<BoxHoldRelease, "recordRunAbsence" | "clearRunAbsence" | "recordAbandonedHandoffStop">;
     /** OCV5-488: told after a run whose processes were gone was closed. */
     onProcessAbsentClosed?: (closed: { requestId: string; accountId: bigint;
       shape: string; rebooted: boolean }) => void }) {}
@@ -154,8 +154,9 @@ export class BoxRemoteCleanupWorker {
           try { proof = await this.readProof(candidate, target); }
           catch (error) {
             const phase = staleResumeDue(candidate);
-            if (!phase) throw error;
-            proof = await this.stopStaleResume(candidate, target, phase, error);
+            if (phase) proof = await this.stopStaleResume(candidate, target, phase, error);
+            else if (candidate.abandonedHandoff) proof = await this.stopAbandonedHandoff(candidate, target, error);
+            else throw error;
           }
         } catch (error) {
           // The proof files are gone and no keeper answered the stop.
@@ -298,6 +299,25 @@ export class BoxRemoteCleanupWorker {
     readError: unknown): Promise<BoxTerminalProof> {
     const record = this.deps.journal.recordStaleResumeStop;
     if (!record || !await record.call(this.deps.journal, { ...candidate, phase })) throw readError;
+    return this.stopKeeperForProof(candidate, target, readError, "box_stale_resume_stop",
+      { phase, unknownForMs: candidate.staleResume?.unknownForMs });
+  }
+
+  /** OCV5-488 (10-17 commercial uid 4: its container was rebuilt at 07:53
+   * while three of its turns' CLIs stayed parked on their handoffs): the turn
+   * that would answer a handoff ran in a container that is no longer the
+   * user's active one. Same journalled intent, original keeper and proof wait
+   * as a stale resume; without a proof the row stays pending. */
+  private async stopAbandonedHandoff(candidate: BoxStoppedFailureProbeCandidate,
+    target: BoxResolvedTarget, readError: unknown): Promise<BoxTerminalProof> {
+    const holds = this.deps.holds;
+    if (!holds || !await holds.recordAbandonedHandoffStop(candidate)) throw readError;
+    return this.stopKeeperForProof(candidate, target, readError, "box_abandoned_handoff_stop", {});
+  }
+
+  private async stopKeeperForProof(candidate: BoxStoppedFailureProbeCandidate,
+    target: BoxResolvedTarget, readError: unknown, event: string,
+    tags: Record<string, unknown>): Promise<BoxTerminalProof> {
     let outcome: string;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -312,9 +332,8 @@ export class BoxRemoteCleanupWorker {
       outcome = /^[a-z-]{1,32}$/.test(result.stdout.trim()) ? result.stdout.trim() : "unexpected";
     } catch (error) { outcome = probeFailureTag(error).reason; }
     finally { if (timer) clearTimeout(timer); }
-    workerLog.warn("box_stale_resume_stop", { requestId: candidate.requestId,
-      accountId: candidate.accountId.toString(), phase,
-      unknownForMs: candidate.staleResume?.unknownForMs, outcome });
+    workerLog.warn(event, { requestId: candidate.requestId,
+      accountId: candidate.accountId.toString(), ...tags, outcome });
     if (outcome !== "stop-requested" && outcome !== "terminal-present") throw readError;
     const deadline = Date.now() + (this.deps.staleResumeProofWaitMs ?? 15_000);
     for (;;) {
