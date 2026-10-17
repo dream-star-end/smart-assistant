@@ -36,6 +36,12 @@ const gatewaySource = [
   'channelHandlers.ts',
   'inboundDispatch.ts',
   'wsConnection.ts',
+  'gatewayFilePolicy.ts',
+  'localExecution.ts',
+  'routeOverrides.ts',
+  'turnFrames.ts',
+  'askUserSanitize.ts',
+  'gatewayTypes.ts',
 ]
   .map((f) => readFileSync(join(root, 'packages/gateway/src', f), 'utf8'))
   .join('\n')
