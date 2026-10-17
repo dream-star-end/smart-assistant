@@ -32,6 +32,7 @@ import { CodeBlock } from "./CodeBlock";
 import { OptionsBlock, ChartBlock, HtmlPreview, MermaidBlock } from "./RichBlocks";
 import { IuiBlock } from "./iui/IuiBlock";
 import { uiFencesToMarkdown } from "./iui/toMarkdown";
+import { normalizeInlineUiFences } from "../lib/uiFence";
 import { useIntelligentUiEnabled } from "../lib/intelligentUi";
 import type { MarkdownProps } from "./Markdown";
 import { normalizeMathDelimiters, unclosedDisplayMathStart } from "./mathDelimiters";
@@ -525,7 +526,9 @@ export default function MarkdownImpl({
         components={components}
       >
         {typeof children === "string"
-          ? normalizeMathDelimiters(iuiEnabled ? source : uiFencesToMarkdown(source, !!live))
+          ? normalizeMathDelimiters(
+              iuiEnabled ? normalizeInlineUiFences(source) : uiFencesToMarkdown(source, !!live),
+            )
           : children}
       </ReactMarkdown>
       {heldMath >= 0 && (
