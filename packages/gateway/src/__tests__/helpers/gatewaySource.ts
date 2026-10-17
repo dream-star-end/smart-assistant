@@ -22,6 +22,9 @@ export const GATEWAY_SOURCE_FILES: readonly string[] = [
   'delegateRuntime.ts',
   'delegateCallbacks.ts',
   'delegateSupervision.ts',
+  'advisorHandlers.ts',
+  'askUserPermissions.ts',
+  'cronTaskWebhook.ts',
 ]
 
 export function readGatewaySource(): string {
