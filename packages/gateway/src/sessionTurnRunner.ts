@@ -123,6 +123,7 @@ const RECOVERY_READ_ONLY_TOOLS = new Set(['Read', 'Glob', 'Grep'])
 
 function stampGatewayToolEffect(tool: TurnToolEntry): TurnToolEntry {
   const frozen = structuredClone(tool) as TurnToolEntry & { _toolEffect?: unknown }
+  // biome-ignore lint/performance/noDelete: moved verbatim from sessionManager.ts (OCV5-469); pre-existing there
   delete frozen._toolEffect
   if (!RECOVERY_READ_ONLY_TOOLS.has(frozen.toolName) || frozen.completed === false) {
     return frozen
