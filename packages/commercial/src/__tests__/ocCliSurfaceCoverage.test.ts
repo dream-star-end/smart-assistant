@@ -133,7 +133,7 @@ function browserLauncherProbe(): void {
 
 function cursorLauncherProbe(): void {
   const value = readFileSync(join(BIN_DIR, 'oc-cursor.sh'), 'utf8')
-  assert.match(value, /cursor_bin=\/opt\/cursor-agent\/versions\/2026\.08\.11-e8db854\/cursor-agent/)
+  assert.match(value, /cursor_bin=\/opt\/cursor-agent\/versions\/2026\.10\.16-e3cb207\/cursor-agent/)
   assert.match(value, /auth_file=\/run\/oc\/cursor-auth\/api-key/)
   assert.match(value, /--output-format stream-json --stream-partial-output/)
   assert.match(value, /CURSOR_API_KEY="\$api_key"/)
