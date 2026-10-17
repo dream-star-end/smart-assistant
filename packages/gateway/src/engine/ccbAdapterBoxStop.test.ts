@@ -120,22 +120,39 @@ test('OCV5-315 a Box continuation reject settles the parked Box turn once', asyn
 // OCV5-486: egress' authority gate (modelAuthorityGate config_changed) body.
 const CONFIG_CHANGED_MESSAGE = 'model configuration changed, please retry in a new turn'
 
-test('OCV5-315 only the exact continuation reject qualifies', () => {
+// OCV5-488 (user-approved, 10-17): every refusal egress answers a continuation
+// with before it reaches Box parks the CLI the same way, so the code no longer
+// matters. What OCV5-315 guarded stays guarded: a call still resolving, a
+// retried status and any 5xx keep their own recovery (the run may finish and
+// its answer be delivered), and only egress' own error shape at the start counts.
+test('OCV5-488 any refusal before Box qualifies; retried, still-resolving and 5xx results do not', () => {
   const detail = (result: unknown, extra: Record<string, unknown> = {}) =>
     JSON.stringify({ subtype: 'success', result, ...extra })
-  assert.equal(isBoxContinuationRejectedDetail(detail(rejected('BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION'))), true)
-  assert.equal(isBoxContinuationRejectedDetail(detail(rejected('BOX_PREPARED_CATALOG_MISSING'))), true)
-  assert.equal(isBoxContinuationRejectedDetail(
-    detail(rejected('MODEL_CONFIG_CHANGED_RETRY_TURN', CONFIG_CHANGED_MESSAGE))), true)
-  for (const other of [
-    detail(rejected('BOX_REPLAY_PENDING', 'previous Box call still resolving')),
+  const status = (code: number, name: string, message = 'refused') =>
+    `API Error: ${code} {"error":{"code":"${name}","message":"${message}"}}`
+  for (const refusal of [
+    detail(rejected('BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION')),
+    detail(rejected('BOX_PREPARED_CATALOG_MISSING')),
+    detail(rejected('MODEL_CONFIG_CHANGED_RETRY_TURN', CONFIG_CHANGED_MESSAGE)),
+    // formerly refused by the exact list; each is answered before any Box call
     detail(rejected('BOX_AUTHORITY_REJECTED', 'authority binding rejected')),
-    detail('API Error: 503 {"error":{"code":"BOX_REPLAY_UNAVAILABLE","message":"continuation rejected"}}'),
     detail('API Error: 409 {"error":{"code":"OTHER","message":"continuation rejected"}}'),
-    detail('the model said: API Error: 409 {"error":{"code":"BOX_X","message":"continuation rejected"}}'),
     detail(rejected('MODEL_CONFIG_CHANGED_RETRY_TURN', 'continuation rejected')),
     detail(rejected('MODEL_AUTHORITY_INVALID', CONFIG_CHANGED_MESSAGE)),
+    detail(status(400, 'BOX_REQUEST_UNSUPPORTED', 'request shape not supported')),
+    detail(status(403, 'NOT_AUTHORIZED', 'model not authorized')),
+  ]) {
+    assert.equal(isBoxContinuationRejectedDetail(refusal), true, String(refusal))
+  }
+  for (const other of [
+    detail(rejected('BOX_REPLAY_PENDING', 'previous Box call still resolving')),
+    detail(status(408, 'REQUEST_TIMEOUT')),
+    detail(status(429, 'RATE_LIMITED')),
+    detail(status(500, 'BOX_EXEC_HTTP_500')),
+    detail('API Error: 503 {"error":{"code":"BOX_REPLAY_UNAVAILABLE","message":"continuation rejected"}}'),
     detail(`API Error: 503 {"error":{"code":"MODEL_CONFIG_CHANGED_RETRY_TURN","message":"${CONFIG_CHANGED_MESSAGE}"}}`),
+    detail('the model said: API Error: 409 {"error":{"code":"BOX_X","message":"continuation rejected"}}'),
+    detail('API Error: 400 Bad Request'),
     detail(null),
     'not json continuation rejected',
     undefined,

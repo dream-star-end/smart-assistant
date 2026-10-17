@@ -119,21 +119,32 @@ const CCB_EDE_CANCEL_DIAGNOSTIC_RE =
  * Code ends the turn on it, but the Box CLI that handed off the tool calls is
  * still parked waiting for their results, holding the account slot. Its idle
  * proof then stays pending, so the session's idle candidate blocks every next
- * message with IDLE_HISTORY_PENDING ("消息未开始处理"). Only this exact
- * reject qualifies; transient Box errors keep their own recovery.
+ * message with IDLE_HISTORY_PENDING ("消息未开始处理"). At first only this
+ * exact reject qualified (OCV5-488 widened it, below); transient Box errors
+ * keep their own recovery.
  * OCV5-486 (commercial uid 4, 10-17 #49fab402): a catalog change bumps the
  * global model security epoch, and egress' authority gate answers the next
  * continuation 409 MODEL_CONFIG_CHANGED_RETRY_TURN before any Box call. Same
  * parked CLI, same pinned session; the gate's exact reject stops it too. */
-const BOX_CONTINUATION_REJECTED =
-  /^API Error: 409 \{"error":\{"code":(?:"BOX_[A-Z0-9_]{1,64}","message":"continuation rejected"|"MODEL_CONFIG_CHANGED_RETRY_TURN","message":"model configuration changed, please retry in a new turn")\}/
+/* OCV5-488 (user-approved deviation, 10-17): adding one more exact code per
+ * incident left the next code to pin a session. Any refusal egress answers
+ * before the request reaches Box qualifies: a 4xx in egress' own error shape.
+ * Not: 408 and 429 (retried, may still reach Box), BOX_REPLAY_PENDING (the
+ * earlier call is still resolving), and every 5xx or timeout, where the run
+ * may still finish and the cleanup worker's success recovery delivers its
+ * answer; stopping it would throw that answer away. */
+const BOX_CONTINUATION_REFUSED =
+  /^API Error: (4[0-9]{2}) \{"error":\{"code":"([A-Z][A-Z0-9_]{0,63})","message":"[^"\\]{0,200}"\}/
 
 export function isBoxContinuationRejectedDetail(errorDetail: string | undefined): boolean {
-  if (!errorDetail || !/continuation rejected|MODEL_CONFIG_CHANGED_RETRY_TURN/.test(errorDetail)) return false
+  if (!errorDetail || !errorDetail.includes('API Error: 4')) return false
   let parsed: unknown
   try { parsed = JSON.parse(errorDetail) } catch { return false }
   const result = (parsed as { result?: unknown } | null)?.result
-  return typeof result === 'string' && BOX_CONTINUATION_REJECTED.test(result)
+  const refused = typeof result === 'string' ? BOX_CONTINUATION_REFUSED.exec(result) : null
+  if (!refused) return false
+  const status = Number(refused[1])
+  return status !== 408 && status !== 429 && refused[2] !== 'BOX_REPLAY_PENDING'
 }
 
 export function isCcbUserCancellationDiagnostic(

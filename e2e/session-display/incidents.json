@@ -5587,7 +5587,7 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/engine/ccbAdapterBoxStop.test.ts",
-          "assertion": "OCV5-315 only the exact continuation reject qualifies"
+          "assertion": "OCV5-488 any refusal before Box qualifies; retried, still-resolving and 5xx results do not"
         }
       ]
     },
@@ -7282,7 +7282,7 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/engine/ccbAdapterBoxStop.test.ts",
-          "assertion": "OCV5-315 only the exact continuation reject qualifies"
+          "assertion": "OCV5-488 any refusal before Box qualifies; retried, still-resolving and 5xx results do not"
         }
       ]
     },

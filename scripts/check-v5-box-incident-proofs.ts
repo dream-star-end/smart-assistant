@@ -1317,11 +1317,15 @@ async function withJournalDatabase<T>(config: unknown, run: (db: Db) => Promise<
     await client.query("ALTER TABLE pg_temp.credit_ledger ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_recovery_ledger_id_seq'::regclass)");
     await client.query(`CREATE TEMP TABLE turn_dispatches (dispatch_id uuid PRIMARY KEY,
       user_id bigint NOT NULL, status text NOT NULL)`);
+    // OCV5-488: the cleanup worker asks whether a row's container is still the user's active one
+    await client.query(`CREATE TEMP TABLE agent_containers (id bigint PRIMARY KEY,
+      user_id bigint NOT NULL, state text NOT NULL)`);
     const shadow = await client.query(`SELECT n.nspname AS schema FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE c.oid = ANY (ARRAY[to_regclass('request_finalize_journal'), to_regclass('usage_records'),
-        to_regclass('users'), to_regclass('credit_ledger'), to_regclass('turn_dispatches')])`);
-    if (shadow.rows.length !== 5 || shadow.rows.some((row: { schema: string }) => !/^pg_temp(?:_\d+)?$/.test(row.schema))) {
+        to_regclass('users'), to_regclass('credit_ledger'), to_regclass('turn_dispatches'),
+        to_regclass('agent_containers')])`);
+    if (shadow.rows.length !== 6 || shadow.rows.some((row: { schema: string }) => !/^pg_temp(?:_\d+)?$/.test(row.schema))) {
       fail("JOURNAL_TABLES_NOT_SESSION_LOCAL");
     }
     return await run(client as Db);
@@ -1341,6 +1345,9 @@ async function prechecked(api: Api, db: Db, row: { requestId: string; uid: bigin
     boxInvocationRecovery: "v1", billingPricing: JOURNAL_PRICING,
     boxBillingContext: api.billingContext({ sessionId: row.sessionId, turnKey: row.turnKey,
       ...(row.dispatchId ? { dispatchId: row.dispatchId, attemptNo: 1 } : {}) }) })]);
+  // the request came from this container, so it is the user's active one
+  await db.query(`INSERT INTO agent_containers(id,user_id,state) VALUES ($1,$2,'active')
+    ON CONFLICT (id) DO NOTHING`, [row.containerId.toString(), row.uid.toString()]);
 }
 const journalRow = async (db: Db, requestId: string) => (await db.query(
   // biome-ignore lint/style/noUnusedTemplateLiteral: moved verbatim from the commercial copy of this file (OCV5-488)
@@ -3350,6 +3357,108 @@ async function proveIdleProofStopsParkedTurn(api: Api, db: Db): Promise<string> 
   return "[ocv5-488-idle-proof-stops-parked-turn] PASS — a turn the container has ended stops its parked Box leaf on the next idle read and the next message passes";
 }
 
+/** INC-20261017-BOX-HELD-NO-PROCESS, the container side (commercial uid 4, 10-17): the deploy at 07:53 rebuilt
+ * oc-v5-u4 while its turns' Box CLIs were parked on tool handoffs. Nothing could answer them any more, nothing
+ * stopped them, and the user's next messages from the new container waited out the held session.
+ * OCV5-488 deviation (user-approved 10-17): the plan's gateway keepalive lease is replaced by a server-side
+ * check. A user has at most one active container; a handoff leaf whose turn ran in any other one is
+ * abandoned. A keepalive would only cover containers already running a new runtime, and a rebuilt container
+ * is exactly the one that never sends it. A leaf in the active container is never stopped by this, however
+ * long its tools run. */
+async function proveContainerRebuiltStopsParkedTurn(api: Api, db: Db): Promise<string> {
+  const journal = api.journal(db);
+  const who = { uid: 900_000_492n, containerId: 492n, sessionId: "session-rebuilt" };
+  const turnKey = "4920".repeat(16);
+  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'rebuilt@test.invalid','unused',10000)",
+    [who.uid.toString()]);
+  const turn = boxTurn(api, db, journal, who, "box-rebuilt", turnKey, undefined, { parked: "until-stopped" });
+  await turn.first();
+  const leafId = "box-rebuilt-1";
+  // the tools have been running for ten minutes: long, but legitimate while the container lives
+  await aged(db, leafId, "10 minutes");
+  const worker = boxCleanupWorker(api, journal, [turn], api.holds(db));
+  await rearm(db, leafId);
+  await worker.reconcileStoppedFailures(50);
+  if (turn.host.count.stop !== 0 || (await journalRow(db, leafId))?.ctx.boxState !== "handoff") {
+    fail(`REBUILT_LIVE_CONTAINER_STOPPED_${turn.host.count.stop}`);
+  }
+  // the deploy rebuilds the container: the old one vanishes, a new one is the user's active container
+  const rebuilt = { ...who, containerId: 493n };
+  await db.query("UPDATE agent_containers SET state='vanished' WHERE id=$1", [who.containerId.toString()]);
+  await db.query("INSERT INTO agent_containers(id,user_id,state) VALUES ($1,$2,'active')",
+    [rebuilt.containerId.toString(), who.uid.toString()]);
+  const nextFrom = async (requestId: string) => {
+    await prechecked(api, db, { ...rebuilt, requestId, turnKey: "d".repeat(64) });
+    return boxHost(api, spoolOf([cliInit, ...FINAL_ANSWER]), { capacityWaitMs: 500,
+      real: { journal, ...rebuilt, accountId: who.containerId, requestId, turnKey: "d".repeat(64) } });
+  };
+  // as on 10-17: the new container's next message finds the session still held by the parked run
+  const blocked = await codeOf(async () => (await nextFrom("rebuilt-before")).round());
+  if (blocked !== "BOX_CAPACITY_HELD") fail(`REBUILT_NOT_HELD_${blocked}`);
+  await rearm(db, leafId);
+  await worker.reconcileStoppedFailures(50);
+  const leaf = await journalRow(db, leafId);
+  if (turn.host.count.stop !== 1 || leaf?.ctx.boxState !== "failed_stopped"
+    || leaf.ctx.boxAbandonedHandoffStop === undefined) {
+    fail(`REBUILT_NOT_STOPPED_${turn.host.count.stop}_${String(leaf?.ctx.boxState)}`);
+  }
+  const idle = await journal.readIdleProof({ ...who, turnKey });
+  if (idle.status !== "failed") fail(`REBUILT_IDLE_${idle.status}`);
+  const next = await nextFrom("rebuilt-after");
+  if ((await must("REBUILT_NEXT_MESSAGE", next.round())).kind !== "final" || !next.sse().includes("done")) {
+    fail("REBUILT_NEXT_MESSAGE_NO_ANSWER");
+  }
+  return "[ocv5-488-container-rebuilt-stops-parked-turn] PASS — a handoff whose container was rebuilt is stopped and the new container's next message runs, while one in the active container is left alone";
+}
+
+/** INC-20261017-BOX-HELD-NO-PROCESS, the turn side. OCV5-315 and OCV5-486 each added one exact reject to the
+ * adapter's stop (409 BOX_* "continuation rejected", then the authority gate's config_changed), and the next
+ * unlisted refusal would pin a session again. OCV5-488 deviation (user-approved 10-17): any refusal egress
+ * answers before the request reaches Box stops the parked turn (a 4xx in egress' error shape, except 408, 429
+ * and BOX_REPLAY_PENDING). A 5xx or timeout does not: the run may still finish, and the cleanup worker's
+ * success recovery then delivers its answer, which a stop would throw away. */
+async function proveAnyRefusalStopsParkedTurn(api: Api, db: Db): Promise<string> {
+  const journal = api.journal(db);
+  const endTurn = async (uid: bigint, label: string, status: number, code: string, message: string) => {
+    const who = { uid, containerId: uid - 900_000_000n, sessionId: `session-${label}` };
+    const turnKey = createHash("sha256").update(label).digest("hex");
+    await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,$2,'unused',10000)",
+      [uid.toString(), `${label}@test.invalid`]);
+    const turn = boxTurn(api, db, journal, who, `box-${label}`, turnKey);
+    await turn.first();
+    // egress' own answer, serialized the way /v1/messages sends it
+    let wire = "";
+    api.jsonError({ headersSent: false, writeHead: () => {}, setHeader: () => {}, end: (body: string) => { wire = body; } },
+      status, code, message, "4880000000000000000000000000000a");
+    const routes = await egressInternalRoutes(api, journal, who, turn.host.target);
+    try {
+      const runner = Object.assign(new EventEmitter(), { model: MODEL, sessionId: who.sessionId,
+        setConsultTurn: () => {}, submit: async () => {}, interrupt: () => true });
+      const ccbTurn = api.ccbAdapter(runner).submitTurn({ input: "continue", turnKey, onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map() });
+      await ccbTurn.submitted;
+      runner.emit("message", { type: "result", subtype: "success", is_error: true, result: `API Error: ${status} ${wire}` });
+      if ((await ccbTurn.summary)?.isError !== true) fail(`REFUSAL_${label}_TURN_NOT_ENDED`);
+      await routes.settled();
+      return { calls: routes.calls.filter((path) => path === "/internal/box/stop").length,
+        stops: turn.host.count.stop, state: String((await journalRow(db, `box-${label}-1`))?.ctx.boxState) };
+    } finally {
+      await routes.close();
+    }
+  };
+  // not one of the codes the exact list knew
+  const refused = await endTurn(900_000_494n, "refused-400", 400, "BOX_REQUEST_UNSUPPORTED", "request shape not supported");
+  if (refused.calls !== 1 || refused.stops !== 1 || refused.state !== "failed_stopped") {
+    fail(`REFUSAL_NOT_STOPPED_${refused.calls}_${refused.stops}_${refused.state}`);
+  }
+  const transient = await endTurn(900_000_495n, "transient-503", 503, "BOX_REPLAY_UNAVAILABLE",
+    "previous Box response unavailable");
+  if (transient.calls !== 0 || transient.stops !== 0 || transient.state !== "handoff") {
+    fail(`REFUSAL_5XX_STOPPED_${transient.calls}_${transient.stops}_${transient.state}`);
+  }
+  return "[ocv5-488-any-refusal-stops-parked-turn] PASS — a refusal before Box of any code stops the parked Box turn, and a 5xx leaves the run to finish and deliver its answer";
+}
+
 /** Things this run created outside its own memory. */
 const cleanups = new Set<() => Promise<void> | void>();
 /** Every cleanup is attempted; the first failure is reported after all of them ran. */
@@ -3525,7 +3634,8 @@ async function main(): Promise<void> {
       await proveIdleNoSummary(api, db),
       await proveAnsweredExchangePrompt(api, db), await proveWaitingHandoffSuperseded(api, db), await proveResumeUnsentParked(api, db),
       await proveUnknownNeverClosed(api, db), await proveNativeResumedStop(api, db),
-      await proveProcessAbsentReleased(api, db), await proveIdleProofStopsParkedTurn(api, db)]),
+      await proveProcessAbsentReleased(api, db), await proveIdleProofStopsParkedTurn(api, db),
+      await proveContainerRebuiltStopsParkedTurn(api, db), await proveAnyRefusalStopsParkedTurn(api, db)]),
     ...await proveFinalizedTurnRecovery(api, database)];
   await cleanUp();
   clearTimeout(deadline);
