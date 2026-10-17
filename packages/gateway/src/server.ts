@@ -716,6 +716,8 @@ import {
 import { AutoDreamOptimizerClient } from './autoDreamOptimizerClient.js'
 import { AutoDreamPolicyClient, type AutoDreamOptimizerPolicy } from './autoDreamPolicy.js'
 import { GATEWAY_PENDING_PERMISSION_TTL_MS, _isBlockingUserInputTool, _permissionRequestExpiresAt, _pendingPermissionCatchupFrames, parsePermissionLookupQuery, attachPermissionSnapshotIfMissing } from './pendingPermissionSnapshot.js'
+import { type AgentHandlersHost, handleAgentsCollection as handleAgentsCollectionImpl, handleAgentItem as handleAgentItemImpl, handlePersona as handlePersonaImpl, handleMemory as handleMemoryImpl, handleMemoryUsage as handleMemoryUsageImpl, handleAutoDreamReport as handleAutoDreamReportImpl, handleAutoDreamOptimizer as handleAutoDreamOptimizerImpl, handleAutoDreamOptimizerCancel as handleAutoDreamOptimizerCancelImpl, handleAutoDreamOptimizerProposal as handleAutoDreamOptimizerProposalImpl, handleMemoryFile as handleMemoryFileImpl, _loadAutoDreamAuditDataset as _loadAutoDreamAuditDatasetImpl, _runAutoDreamOptimizerModel as _runAutoDreamOptimizerModelImpl, _hydrateAutoDreamOptimizerProposals as _hydrateAutoDreamOptimizerProposalsImpl, _applyAutoDreamOptimizerProposal as _applyAutoDreamOptimizerProposalImpl, _runAutoDreamModel as _runAutoDreamModelImpl } from './agentHandlers.js'
+import { type SkillHandlersHost, handleSkillsList as handleSkillsListImpl, handleSkillItem as handleSkillItemImpl, handleUserSkillsList as handleUserSkillsListImpl, _handleUserSkillFiles as _handleUserSkillFilesImpl, _handleUserSkillHistory as _handleUserSkillHistoryImpl, _handleUserSkillRestore as _handleUserSkillRestoreImpl, validateSkillAgentScopeInput as validateSkillAgentScopeInputImpl, handleUserSkillItem as handleUserSkillItemImpl, _handleSkillEvalsFile as _handleSkillEvalsFileImpl, _handleSkillEvalStart as _handleSkillEvalStartImpl, _handleSkillEvalRunStatus as _handleSkillEvalRunStatusImpl, _handleSkillEvalGenStart as _handleSkillEvalGenStartImpl, _handleSkillEvalGenStatus as _handleSkillEvalGenStatusImpl, _handleReleaseJobStatus as _handleReleaseJobStatusImpl, _runSkillEvalGen as _runSkillEvalGenImpl, _skillEvalTurn as _skillEvalTurnImpl, _runSkillEval as _runSkillEvalImpl, _startSkillAutoRegression as _startSkillAutoRegressionImpl, _skillAutoRegressionTick as _skillAutoRegressionTickImpl, _collectSkillFeedbackScenarios as _collectSkillFeedbackScenariosImpl, _handleSkillTrainStart as _handleSkillTrainStartImpl, _handleSkillTrainList as _handleSkillTrainListImpl, _handleSkillTrainRun as _handleSkillTrainRunImpl, _handleSkillTrainDrafts as _handleSkillTrainDraftsImpl, _handleSkillTrainDraftItem as _handleSkillTrainDraftItemImpl, _handleSkillTrainComment as _handleSkillTrainCommentImpl, _handleSkillTrainMerge as _handleSkillTrainMergeImpl } from './skillHandlers.js'
 export { GATEWAY_PENDING_PERMISSION_TTL_MS, BLOCKING_USER_INPUT_TOOLS, _isBlockingUserInputTool, _permissionRequestExpiresAt, type PendingPermissionCatchupEntry, _pendingPermissionCatchupFrames, parsePermissionLookupQuery, projectRuntimePermissionSnapshot, attachPermissionSnapshotIfMissing } from './pendingPermissionSnapshot.js'
 
 // User-Agent for gateway-internal Claude OAuth fetch (token exchange + refresh).
@@ -2222,35 +2224,6 @@ export function resolveDelegateParentClientSessionId(args: {
   if (typeof key !== 'string' || !key) return undefined
   const webchat = /^agent:[^:]+:webchat:dm:(.+)$/.exec(key)
   return webchat?.[1] ?? key
-}
-
-/** Transport paging only: every source character is retained in one chunk. */
-function splitAuditEvidence(label: string, content: string, chunkChars = 96_000): string[] {
-  if (content.length === 0) {
-    return [JSON.stringify({ evidenceLabel: label, fragmentIndex: 1, fragmentCount: 1, content: '' })]
-  }
-  const fragments: string[] = []
-  for (let offset = 0; offset < content.length; ) {
-    let end = Math.min(content.length, offset + chunkChars)
-    if (
-      end < content.length &&
-      end > offset &&
-      content.charCodeAt(end - 1) >= 0xd800 &&
-      content.charCodeAt(end - 1) <= 0xdbff
-    ) {
-      end--
-    }
-    fragments.push(content.slice(offset, end))
-    offset = end
-  }
-  return fragments.map((fragment, index) =>
-    JSON.stringify({
-      evidenceLabel: label,
-      fragmentIndex: index + 1,
-      fragmentCount: fragments.length,
-      content: fragment,
-    }),
-  )
 }
 
 const AUTO_DREAM_SCHEDULE_KEYS = new Set([
@@ -6277,173 +6250,20 @@ export class Gateway {
   // GET /api/agents         → { agents, default }
   // POST /api/agents        → create { id, model?, persona? }
   private async handleAgentsCollection(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (req.method === 'GET') {
-      // 枚举面:走用户可见投影(隐藏系统 agent 已剔除、default 已收敛)。
-      const view = await this._getAgentsConfigUserView()
-      this.sendJson(res, 200, {
-        agents: view.agents,
-        default: view.default,
-        routes: view.routes,
-        identityCompat: await fetchIdentityCompatProjection(),
-      })
-      return
-    }
-    if (req.method === 'POST') {
-      // 建 agent 是 mutation 面:必须读/写全量 config(不能用投影视图,否则写回
-      // agents.yaml 会把隐藏系统 agent 一并删掉)。保留 id 拒绝仍用 predicate 看全量。
-      const body = await this.readJsonBody<Partial<AgentDef>>(req)
-      if (!body.id || !/^[a-zA-Z0-9_-]+$/.test(body.id)) {
-        this.sendError(res, 400, 'invalid agent id (use only a-z 0-9 _ -)')
-        return
-      }
-      if (isHiddenSystemAgentId(body.id)) {
-        this.sendError(res, 403, 'agent id is reserved')
-        return
-      }
-      const id = body.id
-      const identityProjection = await fetchIdentityCompatProjection()
-      if (identityProjection?.profiles.some(({ profile }) => profile.legacyAgentId === id || profile.canonicalAgentId === id)) {
-        return this.sendJson(res, 409, { error: '此身份由已登记的兼容关系管理，不能新建为独立 Agent。', code: 'IDENTITY_COMPAT_MANAGED' })
-      }
-      const { config: cfg, result: agent } = await updateAgentsConfig((cfg) => {
-        if (cfg.agents.find((a) => a.id === id)) {
-          return null
-        }
-        // Inherit provider/permissionMode/cwd from request or sensible defaults
-        const defaultAgent = cfg.agents.find((a) => a.id === cfg.default)
-        const agent: AgentDef = {
-          id: id,
-          model: body.model ?? this.deps.config.defaults.model,
-          persona: paths.agentClaudeMd(id),
-          permissionMode:
-            body.permissionMode ??
-            defaultAgent?.permissionMode ??
-            this.deps.config.defaults.permissionMode,
-          provider: body.provider ?? defaultAgent?.provider,
-          cwd: body.cwd ?? defaultAgent?.cwd,
-          toolsets: body.toolsets,
-        }
-        cfg.agents.push(agent)
-        return agent
-      })
-      if (!agent) return this.sendError(res, 409, 'agent already exists')
-      this.deps.agentsConfig = cfg
-      await mkdir(paths.agentSessionsDir(body.id), { recursive: true })
-      // Seed an empty persona file if missing
-      try {
-        await writeFile(paths.agentClaudeMd(body.id), `# Agent: ${body.id}\n\n`, { flag: 'wx' })
-      } catch {}
-      // 热更新路由
-      this.router.reload(cfg)
-      this.sendJson(res, 201, { agent })
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
+    return handleAgentsCollectionImpl.call(this as unknown as AgentHandlersHost, req, res)
   }
 
   // GET /api/agents/:id    → { agent }
   // PUT /api/agents/:id    → update model | persona
   // DELETE /api/agents/:id → remove (cannot remove default)
-  private async handleAgentItem(
-    req: IncomingMessage,
-    res: ServerResponse,
-    id: string,
-  ): Promise<void> {
-    if (isHiddenSystemAgentId(id)) return this.sendError(res, 404, 'agent not found')
-    if (req.method === 'GET') {
-      const cfg = await readAgentsConfig()
-      const agent = cfg.agents.find((a) => a.id === id)
-      if (!agent) return this.sendError(res, 404, 'agent not found')
-      this.sendJson(res, 200, { agent })
-      return
-    }
-    if (req.method === 'PUT' || req.method === 'DELETE') {
-      const identityProjection = await fetchIdentityCompatProjection()
-      if (identityProjection?.profiles.some(({ profile }) => profile.legacyAgentId === id)) {
-        return this.sendJson(res, 409, { error: '此条目仅保留本实例运行手册；执行配置由关联市场 Agent 管理。', code: 'IDENTITY_COMPAT_MANAGED' })
-      }
-      const body = req.method === 'PUT' ? await this.readJsonBody<Partial<AgentDef>>(req) : {}
-      const { config: cfg, result } = await updateAgentsConfig(async (cfg) => {
-        const idx = cfg.agents.findIndex((a) => a.id === id)
-        if (idx < 0) return { status: 404, body: { error: 'agent not found' } }
-        const agent = cfg.agents[idx]
-        // Provenance comes from the locked server state, never from the request.
-        if (agent.source === 'marketplace') return { status: 409, body: {
-          error: '此 Agent 由 AI 市场管理，请在市场源端修改或卸载。',
-          code: 'MARKETPLACE_AGENT_MANAGED', authority: 'marketplace',
-        } }
-        if (req.method === 'DELETE') {
-          if (cfg.default === id) return { status: 400, body: { error: 'cannot delete default agent' } }
-          cfg.agents.splice(idx, 1)
-          return { status: 200, body: { ok: true } }
-        }
-        if (body.persona !== undefined && await isMarketplacePersonaTarget(cfg, body.persona)) {
-          return { status: 409, body: { error: '人格文件由 AI 市场管理，不能作为本地编辑目标。', code: 'MARKETPLACE_AGENT_MANAGED', authority: 'marketplace' } }
-        }
-        if (body.model !== undefined) agent.model = body.model
-        if (body.persona !== undefined) agent.persona = body.persona
-        if (body.cwd !== undefined) agent.cwd = body.cwd
-        if (body.permissionMode !== undefined) agent.permissionMode = body.permissionMode
-        if (body.displayName !== undefined) agent.displayName = body.displayName
-        if (body.avatarEmoji !== undefined) agent.avatarEmoji = body.avatarEmoji
-        if (body.greeting !== undefined) agent.greeting = body.greeting
-        if (body.provider !== undefined) agent.provider = body.provider
-        if (body.toolsets !== undefined) agent.toolsets = body.toolsets
-        if (body.mcpServers !== undefined) agent.mcpServers = body.mcpServers
-        return { status: 200, body: { agent } }
-      })
-      if (result.status === 200) {
-        this.deps.agentsConfig = cfg
-        this.router.reload(cfg)
-      }
-      this.sendJson(res, result.status, result.body)
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
+  private async handleAgentItem(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
+    return handleAgentItemImpl.call(this as unknown as AgentHandlersHost, req, res, id)
   }
 
   // GET /api/agents/:id/persona  → { text }
   // PUT /api/agents/:id/persona  → { text }
-  private async handlePersona(
-    req: IncomingMessage,
-    res: ServerResponse,
-    id: string,
-  ): Promise<void> {
-    if (isHiddenSystemAgentId(id)) return this.sendError(res, 404, 'agent not found')
-    const cfg = await readAgentsConfig()
-    const agent = cfg.agents.find((a) => a.id === id)
-    if (!agent) return this.sendError(res, 404, 'agent not found')
-    const personaPath = agent.persona ?? paths.agentClaudeMd(id)
-    if (req.method === 'GET') {
-      let text = ''
-      try {
-        text = await readFile(personaPath, 'utf-8')
-      } catch {}
-      this.sendJson(res, 200, { text, path: personaPath })
-      return
-    }
-    if (req.method === 'PUT') {
-      const body = await this.readJsonBody<{ text?: string }>(req)
-      const text = typeof body.text === 'string' ? body.text : ''
-      const { result } = await updateAgentsConfig(async (current) => {
-        const currentAgent = current.agents.find((a) => a.id === id)
-        if (!currentAgent) return { status: 404, body: { error: 'agent not found' } }
-        if (currentAgent.source === 'marketplace') return { status: 409, body: {
-          error: '此 Agent 的人格由 AI 市场管理，请在市场源端修改。',
-          code: 'MARKETPLACE_AGENT_MANAGED', authority: 'marketplace',
-        } }
-        const currentPath = currentAgent.persona ?? paths.agentClaudeMd(id)
-        if (await isMarketplacePersonaTarget(current, currentPath)) {
-          return { status: 409, body: { error: '人格文件由 AI 市场管理，请在市场源端修改。', code: 'MARKETPLACE_AGENT_MANAGED', authority: 'marketplace' } }
-        }
-        await mkdir(dirname(currentPath), { recursive: true })
-        await writeFile(currentPath, text, { mode: 0o600 })
-        return { status: 200, body: { ok: true, path: currentPath } }
-      })
-      this.sendJson(res, result.status, result.body)
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
+  private async handlePersona(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
+    return handlePersonaImpl.call(this as unknown as AgentHandlersHost, req, res, id)
   }
 
   // memdir 范式下的记忆读写面(单一权威在 storage 的 MemoryDir / userProfile):
@@ -6453,163 +6273,29 @@ export class Gateway {
   //                       单条记忆改走 /memory/files/:file)。
   //
   // 单条记忆文件的 CRUD 在 handleMemoryFile(files/:file 子路由)。
-  private async handleMemory(
-    req: IncomingMessage,
-    res: ServerResponse,
-    agentId: string,
-    target: 'memory' | 'user',
-  ): Promise<void> {
-    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
-
-    // ── 用户画像 user.md(共享单文本;底层换 userProfile,响应结构不变)──
-    if (target === 'user') {
-      if (req.method === 'GET') {
-        const { text, version } = await readUserProfile()
-        this.sendJson(res, 200, {
-          text,
-          charCount: text.length,
-          // memdir 下无写侧硬预算;limit = 注入侧 cap(user.md 实际会被注入的上限),
-          // 仍是 UI 预算条唯一有意义的界。单一权威 = promptSlots.USER_PROFILE_INJECT_MAX_CHARS。
-          limit: USER_PROFILE_INJECT_MAX_CHARS,
-          // 乐观并发指纹:UI 拿到后随 PUT 回传,后端锁内重读比对防覆盖并发写入。
-          version,
-          target,
-        })
-        return
-      }
-      if (req.method === 'PUT') {
-        const body = await this.readJsonBody<{ text?: string; version?: string }>(req)
-        const r = await writeUserProfile(body.text ?? '', body.version)
-        if (r.ok) {
-          await recordMemoryUsageEvent({
-            agentId,
-            operation: 'profile_write',
-            memoryType: 'profile',
-            outcome: 'success',
-            metadata: { source: 'ui' },
-          }).catch(() => {})
-          const { text, version } = await readUserProfile()
-          this.sendJson(res, 200, {
-            ok: true,
-            charCount: text.length,
-            limit: USER_PROFILE_INJECT_MAX_CHARS,
-            version,
-          })
-          return
-        }
-        // 版本冲突(面板打开期间被别的进程写过)→ 409 + 当前盘上内容/版本,交由前端三方合并。
-        // conflict 结构对齐历史:{ text, version, charCount, limit }。三态 union 用 'conflict' in r 判别。
-        if ('conflict' in r) {
-          return this.sendJson(res, 409, {
-            error: 'memory conflict',
-            conflict: {
-              text: r.conflict.current,
-              version: r.conflict.version,
-              charCount: r.conflict.current.length,
-              limit: USER_PROFILE_INJECT_MAX_CHARS,
-            },
-          })
-        }
-        return this.sendError(res, 400, r.error ?? 'save failed')
-      }
-      return this.sendError(res, 405, 'method not allowed')
-    }
-
-    // ── 记忆索引 MEMORY.md(target='memory')──
-    const md = new MemoryDir(agentId)
-    if (req.method === 'GET') {
-      // GET 前懒迁移:把旧 blob 版 MEMORY.md 拆成 memdir(幂等,锁内)。
-      await md.ensureMigrated()
-      // reconcileIndex 锁内双向对账后返回索引文本;list 逐文件解析 frontmatter。
-      const [text, files] = await Promise.all([md.reconcileIndex(), md.list()])
-      this.sendJson(res, 200, {
-        kind: 'index',
-        // text 保留兼容:UI 可直接展示索引原文(只读折叠预览)。
-        text,
-        files,
-        // 索引不再手写,version 仅为响应结构完整性(索引文本内容指纹)。
-        version: createHash('sha256').update(text).digest('hex').slice(0, 16),
-      })
-      return
-    }
-    if (req.method === 'PUT') {
-      // memdir:索引由 reconcileIndex 自愈,不接受整段手写覆盖。单条改走 files/:file。
-      return this.sendError(res, 410, 'memory index is auto-managed; edit memory/<file> instead')
-    }
-    this.sendError(res, 405, 'method not allowed')
+  private async handleMemory(req: IncomingMessage, res: ServerResponse, agentId: string, target: 'memory' | 'user'): Promise<void> {
+    return handleMemoryImpl.call(this as unknown as AgentHandlersHost, req, res, agentId, target)
   }
 
-  private async handleMemoryUsage(
-    req: IncomingMessage,
-    res: ServerResponse,
-    agentId: string,
-    url: URL,
-  ): Promise<void> {
-    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
-    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-    const rawDays = Number(url.searchParams.get('days') ?? '30')
-    const days = Number.isInteger(rawDays) ? Math.max(1, Math.min(90, rawDays)) : 30
-    this.sendJson(res, 200, await getMemoryUsageDashboard({ agentId, days }))
+  private async handleMemoryUsage(req: IncomingMessage, res: ServerResponse, agentId: string, url: URL): Promise<void> {
+    return handleMemoryUsageImpl.call(this as unknown as AgentHandlersHost, req, res, agentId, url)
   }
 
   // GET /api/agents/:id/auto-dream-report → sanitized latest result/progress.
-  private async handleAutoDreamReport(
-    req: IncomingMessage,
-    res: ServerResponse,
-    agentId: string,
-  ): Promise<void> {
-    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
-    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-    this.sendJson(res, 200, await this.autoDream.getPublicStatus(agentId))
+  private async handleAutoDreamReport(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+    return handleAutoDreamReportImpl.call(this as unknown as AgentHandlersHost, req, res, agentId)
   }
 
-  private async handleAutoDreamOptimizer(
-    req: IncomingMessage,
-    res: ServerResponse,
-    agentId: string,
-  ): Promise<void> {
-    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
-    if (req.method === 'GET') {
-      this.sendJson(res, 200, await this.autoDreamOptimizer.getPublicState(agentId))
-      return
-    }
-    if (req.method === 'POST') {
-      this.sendJson(
-        res,
-        202,
-        await this.autoDreamOptimizer.startManual(agentId, this.getUserId(req)),
-      )
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
+  private async handleAutoDreamOptimizer(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+    return handleAutoDreamOptimizerImpl.call(this as unknown as AgentHandlersHost, req, res, agentId)
   }
 
-  private async handleAutoDreamOptimizerCancel(
-    req: IncomingMessage,
-    res: ServerResponse,
-    agentId: string,
-  ): Promise<void> {
-    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
-    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
-    this.sendJson(res, 202, await this.autoDreamOptimizer.cancel(agentId))
+  private async handleAutoDreamOptimizerCancel(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+    return handleAutoDreamOptimizerCancelImpl.call(this as unknown as AgentHandlersHost, req, res, agentId)
   }
 
-  private async handleAutoDreamOptimizerProposal(
-    req: IncomingMessage,
-    res: ServerResponse,
-    agentId: string,
-    proposalId: string,
-    action: 'apply' | 'dismiss',
-  ): Promise<void> {
-    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
-    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
-    this.sendJson(
-      res,
-      200,
-      action === 'apply'
-        ? await this.autoDreamOptimizer.apply(agentId, proposalId)
-        : await this.autoDreamOptimizer.dismiss(agentId, proposalId),
-    )
+  private async handleAutoDreamOptimizerProposal(req: IncomingMessage, res: ServerResponse, agentId: string, proposalId: string, action: 'apply' | 'dismiss'): Promise<void> {
+    return handleAutoDreamOptimizerProposalImpl.call(this as unknown as AgentHandlersHost, req, res, agentId, proposalId, action)
   }
 
   // GET    /api/agents/:id/memory/files/:file → { file, content, version } | 404
@@ -6618,132 +6304,25 @@ export class Gateway {
   //
   // 单条记忆文件的 CRUD。文件名双保险:路由已限 [^/],这里再过 MEMORY_FILE_RE(防 `..`
   // 及非法字符穿越)——「API 层拒绝非法名」是读侧安全权威之一(见设计契约§安全)。
-  private async handleMemoryFile(
-    req: IncomingMessage,
-    res: ServerResponse,
-    agentId: string,
-    file: string,
-  ): Promise<void> {
-    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
-    const safe = basename(file)
-    if (safe !== file || !MEMORY_FILE_RE.test(safe)) {
-      return this.sendError(res, 400, 'invalid memory file name')
-    }
-    const md = new MemoryDir(agentId)
-    if (req.method === 'GET') {
-      await md.ensureMigrated()
-      const hit = await md.read(safe)
-      if (!hit) return this.sendError(res, 404, 'memory file not found')
-      this.sendJson(res, 200, { file: safe, content: hit.content, version: hit.version })
-      return
-    }
-    if (req.method === 'PUT') {
-      const body = await this.readJsonBody<{ content?: string; version?: string }>(req)
-      const existed = Boolean(await md.read(safe))
-      const r = await md.write(safe, body.content ?? '', body.version)
-      if (r.ok) {
-        await recordMemoryUsageEvent({
-          agentId,
-          operation: existed ? 'core_update' : 'core_write',
-          memoryType: 'core',
-          outcome: 'success',
-          topMatchKey: safe,
-          metadata: { source: 'ui' },
-        }).catch(() => {})
-        this.sendJson(res, 200, { ok: true, file: safe, version: r.version })
-        return
-      }
-      // 版本冲突结构对齐 user 路由:{ error, conflict:{ text, version } }。三态 union 用 'conflict' in r 判别。
-      if ('conflict' in r) {
-        return this.sendJson(res, 409, {
-          error: 'memory conflict',
-          conflict: { text: r.conflict.current, version: r.conflict.version },
-        })
-      }
-      return this.sendError(res, 400, r.error ?? 'save failed')
-    }
-    if (req.method === 'DELETE') {
-      const removed = await md.remove(safe)
-      if (!removed) return this.sendError(res, 404, 'memory file not found')
-      await recordMemoryUsageEvent({
-        agentId,
-        operation: 'core_delete',
-        memoryType: 'core',
-        outcome: 'success',
-        topMatchKey: safe,
-        metadata: { source: 'ui' },
-      }).catch(() => {})
-      this.sendJson(res, 200, { ok: true, file: safe })
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
+  private async handleMemoryFile(req: IncomingMessage, res: ServerResponse, agentId: string, file: string): Promise<void> {
+    return handleMemoryFileImpl.call(this as unknown as AgentHandlersHost, req, res, agentId, file)
   }
 
   // GET /api/agents/:id/skills — list
-  private async handleSkillsList(
-    req: IncomingMessage,
-    res: ServerResponse,
-    agentId: string,
-  ): Promise<void> {
-    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
-    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-    const identity = await resolveRuntimeExecutionAgent({ id: agentId })
-    const store = buildAgentSkillStore(identity.agent.id, identity.context.assets ? { profile: identity.context.assets.profile } : undefined)
-    // User-facing surface: never enumerate platform baseline/seed skills.
-    const list = await store.list({ includePlatform: false })
-    this.sendJson(res, 200, { skills: list })
+  private async handleSkillsList(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+    return handleSkillsListImpl.call(this as unknown as SkillHandlersHost, req, res, agentId)
   }
 
   // GET/PUT/DELETE /api/agents/:id/skills/:name
-  private async handleSkillItem(
-    req: IncomingMessage,
-    res: ServerResponse,
-    agentId: string,
-    skillName: string,
-  ): Promise<void> {
-    if (isHiddenSystemAgentId(agentId)) return this.sendError(res, 404, 'agent not found')
-    const identity = await resolveRuntimeExecutionAgent({ id: agentId })
-    const store = buildAgentSkillStore(identity.agent.id, identity.context.assets ? { profile: identity.context.assets.profile } : undefined)
-    if (req.method === 'GET') {
-      // User-facing read: platform skills resolve to 404, never leak their body.
-      const v = await store.view(skillName, undefined, { includePlatform: false })
-      if (!v || typeof v === 'string') return this.sendError(res, 404, 'skill not found')
-      this.sendJson(res, 200, { skill: v })
-      return
-    }
-    if (req.method === 'PUT') {
-      const body = await this.readJsonBody<{
-        description?: string
-        body?: string
-        tags?: string[]
-      }>(req)
-      const r = await store.save(
-        { name: skillName, description: body.description ?? '', tags: body.tags },
-        body.body ?? '',
-      )
-      if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
-      this.sendJson(res, 200, { ok: true })
-      return
-    }
-    if (req.method === 'DELETE') {
-      const r = await store.delete(skillName)
-      if (!r.ok) return this.sendError(res, 404, r.error ?? 'delete failed')
-      this.sendJson(res, 200, { ok: true })
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
+  private async handleSkillItem(req: IncomingMessage, res: ServerResponse, agentId: string, skillName: string): Promise<void> {
+    return handleSkillItemImpl.call(this as unknown as SkillHandlersHost, req, res, agentId, skillName)
   }
 
   // GET /api/skills — user-level skill library list.
   // Aggregates shared + all agents' legacy + marketplace hub (NOT per-agent seed),
   // so a user sees one unified "my skills" library regardless of which agent is active.
   private async handleUserSkillsList(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-    await this.syncMarketplaceHubForManagement()
-    const store = buildUserSkillStore()
-    // User-facing surface: never enumerate platform baseline/seed skills.
-    const list = await store.list({ includePlatform: false })
-    this.sendJson(res, 200, { skills: list })
+    return handleUserSkillsListImpl.call(this as unknown as SkillHandlersHost, req, res)
   }
 
   private async syncMarketplaceHubForManagement(): Promise<void> {
@@ -6756,182 +6335,28 @@ export class Gateway {
 
   // PUT/DELETE /api/skills/:name/files — 技能目录内辅助文件的写/删(编辑器)。
   // 路径白名单 references/|assets/|evals/|scripts/,单文件≤64KB;evals.json 过 schema。
-  private async _handleUserSkillFiles(
-    req: IncomingMessage,
-    res: ServerResponse,
-    skillName: string,
-  ): Promise<void> {
-    const store = buildUserSkillStore()
-    const skill = await store.view(skillName, undefined, { includePlatform: false })
-    if (!skill || typeof skill === 'string') return this.sendError(res, 404, 'skill not found')
-    if (skill.writable !== true) return this.sendError(res, 403, 'skill is read-only')
-    const AUX_PREFIXES = ['references/', 'assets/', 'evals/', 'scripts/']
-    if (req.method === 'PUT') {
-      const body = await this.readJsonBody<{ path?: string; content?: string }>(req)
-      const path = (body?.path ?? '').trim()
-      const content = body?.content
-      if (!path || typeof content !== 'string') return this.sendError(res, 400, 'path/content required')
-      if (!AUX_PREFIXES.some((p) => path.startsWith(p)))
-        return this.sendError(res, 400, `path 须位于 ${AUX_PREFIXES.join(' | ')} 之下`)
-      if (Buffer.byteLength(content, 'utf8') > 64 * 1024)
-        return this.sendError(res, 400, '单文件上限 64KB')
-      if (path === 'evals/evals.json') {
-        const parsed = parseSkillEvalsJson(content)
-        if (!parsed.ok) {
-          this.sendJson(res, 422, { error: 'invalid evals', errors: parsed.errors })
-          return
-        }
-      }
-      const r = await store.saveAuxFile(skillName, path, content)
-      if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
-      this.sendJson(res, 200, { ok: true })
-      return
-    }
-    if (req.method === 'DELETE') {
-      const path = new URL(req.url ?? '/', 'http://x').searchParams.get('path') ?? ''
-      if (!AUX_PREFIXES.some((p) => path.startsWith(p)))
-        return this.sendError(res, 400, 'invalid path')
-      const r = await store.deleteAuxFile(skillName, path)
-      if (!r.ok) return this.sendError(res, 400, r.error ?? 'delete failed')
-      this.sendJson(res, 200, { ok: true })
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
+  private async _handleUserSkillFiles(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+    return _handleUserSkillFilesImpl.call(this as unknown as SkillHandlersHost, req, res, skillName)
   }
 
   // GET /api/skills/:name/history — 版本历史;POST /api/skills/:name/restore — 恢复。
   // 历史/恢复只覆盖 SKILL.md 正文(save() 快照机制),辅助文件不在快照范围。
-  private async _handleUserSkillHistory(
-    req: IncomingMessage,
-    res: ServerResponse,
-    skillName: string,
-  ): Promise<void> {
-    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-    const store = buildUserSkillStore()
-    const skill = await store.view(skillName, undefined, { includePlatform: false })
-    if (!skill || typeof skill === 'string') return this.sendError(res, 404, 'skill not found')
-    this.sendJson(res, 200, { history: await store.history(skillName), writable: skill.writable === true })
+  private async _handleUserSkillHistory(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+    return _handleUserSkillHistoryImpl.call(this as unknown as SkillHandlersHost, req, res, skillName)
   }
 
-  private async _handleUserSkillRestore(
-    req: IncomingMessage,
-    res: ServerResponse,
-    skillName: string,
-  ): Promise<void> {
-    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
-    const store = buildUserSkillStore()
-    const skill = await store.view(skillName, undefined, { includePlatform: false })
-    if (!skill || typeof skill === 'string') return this.sendError(res, 404, 'skill not found')
-    if (skill.writable !== true) return this.sendError(res, 403, 'skill is read-only')
-    const body = await this.readJsonBody<{ version?: string }>(req)
-    const version = (body?.version ?? '').trim()
-    if (!version) return this.sendError(res, 400, 'version required')
-    const r = await store.restore(skillName, version)
-    if (!r.ok) return this.sendError(res, 400, r.error ?? 'restore failed')
-    this.sendJson(res, 200, { ok: true })
+  private async _handleUserSkillRestore(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+    return _handleUserSkillRestoreImpl.call(this as unknown as SkillHandlersHost, req, res, skillName)
   }
 
   private async validateSkillAgentScopeInput(input: unknown): Promise<string[] | { error: string }> {
-    const parsed = validateSkillAgentScope(input)
-    if (!parsed.ok || !parsed.agentIds) return { error: parsed.error ?? 'invalid agentIds' }
-    // 枚举面:走用户可见投影 —— view.agents 已剔除隐藏系统 agent、view.default 已
-    // 收敛,故 allowed 集合天然不含隐藏 id(无需再手工 !isHiddenSystemAgentId 过滤)。
-    let cfg: AgentsConfig
-    try {
-      cfg = await this._getAgentsConfigUserView()
-    } catch {
-      cfg = { agents: [{ id: 'main' }], routes: [], default: 'main' }
-    }
-    const allowed = new Set<string>(
-      ['main', cfg.default, ...(cfg.agents ?? []).map((a) => a.id)].filter(
-        (id): id is string => typeof id === 'string',
-      ),
-    )
-    const bad = parsed.agentIds.find((id) => !allowed.has(id))
-    if (bad) return { error: `unknown agentId: ${bad}` }
-    return parsed.agentIds
+    return validateSkillAgentScopeInputImpl.call(this as unknown as SkillHandlersHost, input)
   }
 
   // GET/PUT/DELETE /api/skills/:name — user-level skill item. Writes/deletes go to
   // the shared library (delete also sweeps same-named legacy residue across agents).
-  private async handleUserSkillItem(
-    req: IncomingMessage,
-    res: ServerResponse,
-    skillName: string,
-  ): Promise<void> {
-    if (req.method === 'GET') {
-      await this.syncMarketplaceHubForManagement()
-      const store = buildUserSkillStore()
-      // User-facing read: platform skills resolve to 404, never leak their body.
-      // ?file=<rel> → 读取技能目录内单个文件(编辑器/整目录发布导入用)。
-      const fileParam = new URL(req.url ?? '/', 'http://x').searchParams.get('file')
-      if (fileParam) {
-        // 目录穿越由 view() 的词法守卫兜底;此处仅挡明显非法与 history/。
-        if (fileParam.includes('..') || fileParam.startsWith('/') || fileParam.startsWith('history/')) {
-          return this.sendError(res, 400, 'invalid file path')
-        }
-        const content = await store.view(skillName, fileParam, { includePlatform: false })
-        if (typeof content !== 'string') return this.sendError(res, 404, 'file not found')
-        this.sendJson(res, 200, { path: fileParam, content })
-        return
-      }
-      const v = await store.view(skillName, undefined, { includePlatform: false })
-      if (!v || typeof v === 'string') return this.sendError(res, 404, 'skill not found')
-      this.sendJson(res, 200, { skill: v })
-      return
-    }
-    const store = buildUserSkillStore()
-    if (req.method === 'PUT') {
-      const body = await this.readJsonBody<{
-        description?: string
-        body?: string
-        tags?: string[]
-        agentIds?: unknown
-        createOnly?: unknown
-      }>(req)
-      const hasDescription = Object.prototype.hasOwnProperty.call(body, 'description')
-      const hasBody = Object.prototype.hasOwnProperty.call(body, 'body')
-      const hasTags = Object.prototype.hasOwnProperty.call(body, 'tags')
-      const hasAgentIds = Object.prototype.hasOwnProperty.call(body, 'agentIds')
-      let agentIds: string[] | undefined
-      if (hasAgentIds) {
-        const scope = await this.validateSkillAgentScopeInput(body.agentIds)
-        if (!Array.isArray(scope)) return this.sendError(res, 400, scope.error)
-        agentIds = scope
-      }
-      if (hasAgentIds && !hasDescription && !hasBody && !hasTags) {
-        const r = await store.setAgentScope(skillName, agentIds as string[])
-        if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
-        this.sendJson(res, 200, { ok: true })
-        return
-      }
-      // `createOnly: true` in the body: 412 when the skill already exists
-      // (checked and written under one per-name lock; see userSkillWrite.ts).
-      // A body field, not If-None-Match: the master's container proxy forwards
-      // only a fixed header set.
-      const outcome = await saveUserSkill(
-        store,
-        {
-          name: skillName,
-          description: body.description ?? '',
-          tags: body.tags,
-          body: body.body ?? '',
-          ...(agentIds ? { agentIds } : {}),
-        },
-        { createOnly: body.createOnly === true },
-      )
-      if (outcome.status === 'exists') return this.sendError(res, 412, 'skill already exists')
-      if (!outcome.ok) return this.sendError(res, 400, outcome.error ?? 'save failed')
-      this.sendJson(res, 200, { ok: true })
-      return
-    }
-    if (req.method === 'DELETE') {
-      const r = await store.delete(skillName)
-      if (!r.ok) return this.sendError(res, 404, r.error ?? 'delete failed')
-      this.sendJson(res, 200, { ok: true })
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
+  private async handleUserSkillItem(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+    return handleUserSkillItemImpl.call(this as unknown as SkillHandlersHost, req, res, skillName)
   }
 
   // ── Skill evals(评测:用例文件 CRUD + 隔离双跑 run)──────────────────────
@@ -6940,145 +6365,18 @@ export class Gateway {
   // 对话框),run.usage 逐 turn 累计供前端实报;用例上限(≤5)即成本上限。
 
   /** GET: evals 文件 + 上次结果;PUT: 保存 evals(仅可写技能)。 */
-  private async _handleSkillEvalsFile(
-    req: IncomingMessage,
-    res: ServerResponse,
-    skillName: string,
-  ): Promise<void> {
-    const store = buildUserSkillStore()
-    // 评测读取面对平台 baseline 技能开放(includePlatform:true):平台技能的 evals 以
-    // 源码形式随 ccb-baseline 分发,容器内本就整目录只读可 cat,这里不构成枚举泄露
-    // ("用户向列表面禁平台技能"红线针对管理面板枚举);写入(PUT)仍被 writable 门挡住。
-    const skill = await store.view(skillName, undefined, { includePlatform: true })
-    if (!skill || typeof skill === 'string') return this.sendError(res, 404, 'skill not found')
-    if (req.method === 'GET') {
-      const raw = await store.view(skillName, 'evals/evals.json', { includePlatform: true })
-      let evals: SkillEvalsFile | null = null
-      let parseErrors: string[] | undefined
-      if (typeof raw === 'string') {
-        const parsed = parseSkillEvalsJson(raw)
-        if (parsed.ok) evals = parsed.file
-        else parseErrors = parsed.errors
-      }
-      let lastRun: unknown = null
-      const lastRaw = await store.view(skillName, 'evals/last-run.json', {
-        includePlatform: true,
-      })
-      if (typeof lastRaw === 'string') {
-        try {
-          lastRun = JSON.parse(lastRaw)
-        } catch {}
-      }
-      this.sendJson(res, 200, {
-        evals,
-        parseErrors,
-        lastRun,
-        writable: skill.writable === true,
-      })
-      return
-    }
-    if (req.method === 'PUT') {
-      if (skill.writable !== true) return this.sendError(res, 403, 'skill is read-only')
-      const body = await this.readBody(req)
-      let parsedBody: { evals?: unknown }
-      try {
-        parsedBody = JSON.parse(body)
-      } catch {
-        return this.sendError(res, 400, 'invalid JSON')
-      }
-      const parsed = parseSkillEvalsJson(JSON.stringify(parsedBody.evals ?? null))
-      if (!parsed.ok) {
-        this.sendJson(res, 422, { error: 'invalid evals', errors: parsed.errors })
-        return
-      }
-      const w = await store.saveAuxFile(skillName, 'evals/evals.json', serializeSkillEvals(parsed.file))
-      if (!w.ok) return this.sendError(res, 400, w.error ?? 'failed to save evals')
-      this.sendJson(res, 200, { ok: true, evals: parsed.file })
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
+  private async _handleSkillEvalsFile(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+    return _handleSkillEvalsFileImpl.call(this as unknown as SkillHandlersHost, req, res, skillName)
   }
 
   /** POST /api/skills/:name/eval-run — 启动评测(202 → runId,进度轮询 status)。 */
-  private async _handleSkillEvalStart(
-    req: IncomingMessage,
-    res: ServerResponse,
-    skillName: string,
-  ): Promise<void> {
-    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
-    const userId = this.getUserId(req)
-    const store = buildUserSkillStore()
-    // 平台 baseline 技能允许跑 baseline 评测(canary 回归脚本/用户自查都走这里);
-    // draft 模式天然被 train-run 属主校验挡住(训练本就拒平台技能)。
-    const skill = await store.view(skillName, undefined, { includePlatform: true })
-    if (!skill || typeof skill === 'string') return this.sendError(res, 404, 'skill not found')
-
-    const body = await this.readJsonBody<{ mode?: string; trainRunId?: string }>(req).catch(
-      () => ({}) as { mode?: string; trainRunId?: string },
-    )
-    const mode = body?.mode === 'draft' ? ('draft' as const) : ('baseline' as const)
-
-    // draft 模式:草稿必须存在且属于本用户的训练 run,用草稿携带的用例(如有)覆盖现版用例。
-    let draftDir: string | undefined
-    let draftEvalsJson: string | undefined
-    let trainRunId: string | null = null
-    if (mode === 'draft') {
-      const trainRun = body?.trainRunId ? this.skillTrainJobs.get(body.trainRunId) : undefined
-      if (!trainRun || trainRun.userId !== userId)
-        return this.sendError(res, 404, 'training run not found')
-      const draft = await this.skillDrafts.readDraft(trainRun.runId, skillName)
-      if (!draft || draft.record.op === 'delete')
-        return this.sendError(res, 400, 'no evaluable draft for this skill in the training run')
-      trainRunId = trainRun.runId
-      draftDir = join(paths.skillDraftRunDir(trainRun.runId), skillName)
-      draftEvalsJson = draft.evalsJson
-    }
-
-    // 用例来源:草稿附带 > 技能自带。没有用例 → 明确 400(而不是空跑烧积分)。
-    let evalsRaw =
-      draftEvalsJson ??
-      ((await store.view(skillName, 'evals/evals.json', { includePlatform: true })) as
-        | string
-        | null)
-    if (typeof evalsRaw !== 'string') evalsRaw = null
-    if (!evalsRaw)
-      return this.sendError(res, 400, 'skill has no evals/evals.json — add eval cases first')
-    const parsed = parseSkillEvalsJson(evalsRaw)
-    if (!parsed.ok) {
-      this.sendJson(res, 422, { error: 'invalid evals', errors: parsed.errors })
-      return
-    }
-
-    const guard = this.skillEvalJobs.canStart(skillName)
-    if (!guard.ok) return this.sendError(res, 409, guard.reason ?? 'cannot start eval')
-
-    const run = await this.skillEvalJobs.create({
-      runId: SkillEvalJobStore.newRunId(),
-      skillName,
-      userId,
-      mode,
-      trainRunId,
-      model: SKILL_TRAIN_DEFAULT_MODEL,
-      cases: parsed.file.cases,
-      now: Date.now(),
-    })
-    void this._runSkillEval(run, { draftDir }).catch((err) => {
-      void this.skillEvalJobs.finish(run, Date.now(), { error: String(err) })
-    })
-    this.sendJson(res, 202, { ok: true, runId: run.runId })
+  private async _handleSkillEvalStart(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+    return _handleSkillEvalStartImpl.call(this as unknown as SkillHandlersHost, req, res, skillName)
   }
 
   /** GET /api/skill-eval/:runId — run 状态(owner 校验,同训练 run 语义)。 */
-  private async _handleSkillEvalRunStatus(
-    req: IncomingMessage,
-    res: ServerResponse,
-    runId: string,
-  ): Promise<void> {
-    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-    const run = this.skillEvalJobs.get(runId)
-    if (!run) return this.sendError(res, 404, 'eval run not found')
-    if (run.userId !== this.getUserId(req)) return this.sendError(res, 403, 'forbidden')
-    this.sendJson(res, 200, { run })
+  private async _handleSkillEvalRunStatus(req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
+    return _handleSkillEvalRunStatusImpl.call(this as unknown as SkillHandlersHost, req, res, runId)
   }
 
   // ── P1:AI 生成评测用例(异步 job + 轮询;不落库,只回草稿供编辑器审阅保存)──
@@ -7091,71 +6389,18 @@ export class Gateway {
    *         的可写性门同一权威(store.view(...).writable);
    *   409 = 同技能已有生成 or 评测在跑(生成/评测互斥,避免并跑扰乱与重复扣费)。
    */
-  private async _handleSkillEvalGenStart(
-    req: IncomingMessage,
-    res: ServerResponse,
-    skillName: string,
-  ): Promise<void> {
-    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
-    const userId = this.getUserId(req)
-
-    // 可写性门(与训练/PUT evals 同权威):includePlatform:false 让平台技能解析为 404,
-    // 用户可写技能才放行;hub/只读技能存在但 writable!==true → 403。
-    const store = buildUserSkillStore()
-    const skill = await store.view(skillName, undefined, { includePlatform: false })
-    if (!skill || typeof skill === 'string') return this.sendError(res, 404, 'skill not found')
-    if (skill.writable !== true) return this.sendError(res, 403, 'skill is read-only')
-
-    // 生成/评测互斥:同技能不能既生成又评测(各查各 store 的同技能活跃 run)。
-    if (this.skillEvalGenJobs.activeForSkill(skillName) || this.skillEvalJobs.activeForSkill(skillName)) {
-      return this.sendError(res, 409, `a generation or eval for "${skillName}" is already in progress`)
-    }
-    const guard = this.skillEvalGenJobs.canStart(skillName)
-    if (!guard.ok) return this.sendError(res, 409, guard.reason ?? 'cannot start generation')
-
-    const run = await this.skillEvalGenJobs.create({
-      runId: SkillEvalGenJobStore.newRunId(),
-      skillName,
-      userId,
-      model: SKILL_TRAIN_DEFAULT_MODEL,
-      now: Date.now(),
-    })
-    // fire-and-forget:采集素材 → 生成 turn → 归一化落 job;任何异常都收敛为 job failed。
-    void this._runSkillEvalGen(run, {
-      skillMd: skill.rawContent,
-      description: skill.description ?? '',
-    }).catch((err) => {
-      void this.skillEvalGenJobs.finishFailed(run, Date.now(), String(err))
-    })
-    this.sendJson(res, 202, { ok: true, runId: run.runId })
+  private async _handleSkillEvalGenStart(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+    return _handleSkillEvalGenStartImpl.call(this as unknown as SkillHandlersHost, req, res, skillName)
   }
 
   /** GET /api/skill-eval-gen/:runId — 生成 run 状态(owner 校验,与评测 run 同语义)。 */
-  private async _handleSkillEvalGenStatus(
-    req: IncomingMessage,
-    res: ServerResponse,
-    runId: string,
-  ): Promise<void> {
-    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-    const run = this.skillEvalGenJobs.get(runId)
-    if (!run) return this.sendError(res, 404, 'generation run not found')
-    if (run.userId !== this.getUserId(req)) return this.sendError(res, 403, 'forbidden')
-    this.sendJson(res, 200, {
-      status: run.status,
-      ...(run.status === 'done' ? { cases: run.cases } : {}),
-      ...(run.note ? { note: run.note } : {}),
-      usage: run.usage,
-    })
+  private async _handleSkillEvalGenStatus(req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
+    return _handleSkillEvalGenStatusImpl.call(this as unknown as SkillHandlersHost, req, res, runId)
   }
 
   /** GET /api/v5/release-jobs/:id — hydrate the in-chat release card after refresh. */
   private _handleReleaseJobStatus(req: IncomingMessage, res: ServerResponse, id: string): void {
-    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-    if (!isReleaseJobId(id)) return this.sendError(res, 400, 'invalid release job id')
-    this.getUserId(req)
-    const job = readReleaseJob(defaultReleaseJobDir(), id)
-    if (!job) return this.sendError(res, 404, 'release job not found')
-    this.sendJson(res, 200, publicReleaseJob(job))
+    return _handleReleaseJobStatusImpl.call(this as unknown as SkillHandlersHost, req, res, id)
   }
 
   /**
@@ -7195,122 +6440,16 @@ export class Gateway {
   }
 
   /** 生成编排:采集素材 → 单个隔离 turn(deepseek,正常计费)→ 宽容解析+归一化+过格式权威。 */
-  private async _runSkillEvalGen(
-    run: SkillEvalGenRun,
-    input: { skillMd: string; description: string },
-  ): Promise<void> {
-    // 现有用例(补充生成的去重锚 + id 归一化避让);读不到按空处理。
-    let existingCases: SkillEvalCase[] = []
-    const store = buildUserSkillStore()
-    const rawEvals = await store
-      .view(run.skillName, 'evals/evals.json', { includePlatform: false })
-      .catch(() => null)
-    if (typeof rawEvals === 'string') {
-      const parsedExisting = parseSkillEvalsJson(rawEvals)
-      if (parsedExisting.ok) existingCases = parsedExisting.file.cases
-    }
-
-    const excerpts = await this._collectGenSessionExcerpts(run.skillName, input.description)
-    const prompt = buildGeneratePrompt({
-      skillName: run.skillName,
-      description: input.description,
-      skillMd: input.skillMd,
-      existingCases,
-      excerpts,
-    })
-
-    // 单 turn 无工具:素材已在 prompt 里,隔离一次性会话(同 _skillEvalTurn 形态,正常计费)。
-    const { text, usage } = await this._skillEvalTurn(
-      `skillevalgen:${run.runId}`,
-      run.userId,
-      prompt,
-      run.model,
-      {},
-    )
-    addUsage(run.usage, usage)
-
-    const finalized = finalizeGeneratedCases(text, existingCases)
-    if (!finalized.ok) {
-      await this.skillEvalGenJobs.finishFailed(run, Date.now(), finalized.error)
-      return
-    }
-    const note = buildGenerationNote({
-      excerptCount: excerpts.length,
-      existingCount: existingCases.length,
-      generatedCount: finalized.cases.length,
-    })
-    await this.skillEvalGenJobs.finishDone(run, Date.now(), { cases: finalized.cases, note })
+  private async _runSkillEvalGen(run: SkillEvalGenRun, input: { skillMd: string; description: string }): Promise<void> {
+    return _runSkillEvalGenImpl.call(this as unknown as SkillHandlersHost, run, input)
   }
 
   /** 跑一个被测/评分 turn:一次性会话,收最终文本+用量,完了销毁会话释放资源。 */
-  private async _skillEvalTurn(
-    sessionKey: string,
-    userId: string,
-    prompt: string,
-    model: string,
-    opts: {
+  private async _skillEvalTurn(sessionKey: string, userId: string, prompt: string, model: string, opts: {
       skillEvalExclude?: string
       skillEvalDraft?: { name: string; dir: string }
-    },
-  ): Promise<{ text: string; usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number } }> {
-    const agent = await this._trainingAgent()
-    if (!agent) throw new Error('no agent available for eval')
-    // 模型权威 §3:skill-eval 是**真实计费的本地 turn**(无 envelope)→ kind='turn'
-    // (codex 意图不降级、直接结构化拒:换个模型跑分等于换了被测对象)。
-    const evalExec = await resolveLocalExecutionIfEnforced({
-      agent,
-      kind: 'turn',
-      model,
-      defaultModel: this.deps.config.defaults.model,
-    })
-    const evalModel = evalExec?.canonicalModel ?? model
-    const session = await this.sessions.getOrCreate({
-      // flag 未开 → localExecutionOverride 展开为 {},**不带 model** —— 与改造前逐字
-      // 一致(spawn 用 agent.model,submit 再按 run.model 覆盖)。零行为变化。
-      sessionKey,
-      agent,
-      ...localExecutionOverride(evalExec),
-      channel: 'skill-eval',
-      peerId: sessionKey,
-      userId,
-      effortLevel: 'high',
-      workload: 'skill-eval',
-      skillEvalMode: true,
-      skillEvalExclude: opts.skillEvalExclude,
-      skillEvalDraft: opts.skillEvalDraft,
-    })
-    try {
-      return await new Promise((resolvePromise, rejectPromise) => {
-        // 文本块按 blockId 聚合(同 block 流式覆盖,不同 block 顺序拼接)。
-        const texts = new Map<string, string>()
-        const order: string[] = []
-        this.sessions
-          .submit(
-            session,
-            prompt,
-            (e) => {
-              if (e.kind === 'block' && e.block.kind === 'text' && typeof e.block.text === 'string') {
-                // parser 发出的 text 是**增量片段**(内部才做累计),按 messageId 拼接。
-                const id = e.block.messageId ?? 'b0'
-                if (!texts.has(id)) order.push(id)
-                texts.set(id, (texts.get(id) ?? '') + e.block.text)
-              } else if (e.kind === 'final') {
-                const text = order.map((id) => texts.get(id) ?? '').join('\n').trim()
-                resolvePromise({ text, usage: e.meta })
-              } else if (e.kind === 'error') {
-                rejectPromise(new Error(e.error))
-              }
-            },
-            'high',
-            // getOrCreate 与 submit 的模型**同源**(flag 未开时 evalModel === model)。
-            evalModel,
-          )
-          .catch(rejectPromise)
-      })
-    } finally {
-      // 评测会话一次性:立即销毁,释放子进程/pids;失败不影响结果。
-      await this.sessions.destroySession(sessionKey).catch(() => {})
-    }
+    }): Promise<{ text: string; usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number } }> {
+    return _skillEvalTurnImpl.call(this as unknown as SkillHandlersHost, sessionKey, userId, prompt, model, opts)
   }
 
   private async _loadAutoDreamAuditDataset(input: {
@@ -7318,236 +6457,11 @@ export class Gateway {
     afterSeq: number | null
     policy: AutoDreamOptimizerPolicy
   }): Promise<AutoDreamAuditDataset> {
-    const successWindow = await listAutoDreamSuccessfulSessionsBetween({
-      agentId: input.agentId,
-      channels: ['webchat', 'wechat', 'telegram'],
-      afterSeq: input.afterSeq ?? 0,
-    })
-    const sessions =
-      input.afterSeq === null
-        ? await listAutoDreamAuditSessions(input.agentId)
-        : successWindow.sessions.map((row) => ({
-            id: row.id,
-            agentId: row.agentId,
-            channel: row.channel,
-            peerId: '',
-            title: '',
-            startedAt: row.completedAt,
-            lastAt: row.completedAt,
-            turnCount: 0,
-            totalCostUSD: 0,
-          }))
-    const byId = new Map(sessions.map((row) => [row.id, row]))
-    const pages: string[] = []
-    const memory = new MemoryDir(input.agentId)
-    await memory.ensureMigrated()
-    const memoryRows = await memory.list()
-    const memoryContent = await Promise.all(
-      memoryRows.map(async (row) => ({
-        file: row.file,
-        type: row.type,
-        content: (await memory.read(row.file))?.content ?? '',
-      })),
-    )
-    const skills = await buildAgentSkillStore(input.agentId).list({ includePlatform: true })
-    const skillContent = await Promise.all(
-      skills.map(async (skill) => {
-        const content = await buildAgentSkillStore(input.agentId).view(skill.name)
-        return {
-          name: skill.name,
-          layer: skill.layer,
-          description: skill.description,
-          content: content && typeof content !== 'string' ? content.rawContent : '',
-        }
-      }),
-    )
-    const profile = await readUserProfile()
-    const persona = await readFile(paths.agentClaudeMd(input.agentId), 'utf8').catch(() => '')
-    const cronJobs = this.cron
-      ? (await this.cron.listJobs()).filter((job) => job.agent === input.agentId)
-      : []
-    const platformContext = {
-      auditContract: {
-        consent: 'optimizer_v2',
-        applyRequiresUserConfirmation: true,
-        platformFindingsAutoReportedAnonymously: true,
-      },
-      capabilities: [
-        'multi-channel chat and durable sessions',
-        'memory and shared user profile',
-        'custom and marketplace skills',
-        'agent persona and rules',
-        'plugins/connectors and marketplace',
-        'scheduled tasks and reminders',
-        'model/default effort/preferences',
-        'goals, files, browser, research and office tools',
-      ],
-      preferences: input.policy.auditContext?.preferences ?? {},
-      installedPlugins: input.policy.auditContext?.installedPlugins ?? [],
-      memories: memoryContent,
-      userProfile: profile.text,
-      agentPersonaAndRules: persona,
-      skills: skillContent,
-      schedules: cronJobs,
-      proposalTargetRules: {
-        memory: 'targetId=memory/<file>.md; before/after must be exact complete file text',
-        profile: 'targetId=profile; before/after must be exact complete user profile text',
-        skill: 'targetId=skill/<name>; before/after must be exact complete SKILL.md',
-        ruleOrPersona:
-          'targetId=agent-persona; before/after must be exact complete agent CLAUDE.md',
-        preference:
-          'targetId must be an existing safe preference key shown in this page; before/after must be JSON.stringify(current/desired value)',
-        schedule:
-          'targetId=schedule/<existing-id or new>; before/after must be complete CronJob JSON',
-        platformSkills:
-          'platform/baseline skills are read-only; do not propose skill.upsert/delete for those names',
-      },
-    }
-    pages.push(...splitAuditEvidence('platform-context', JSON.stringify(platformContext)))
-
-    for (const meta of byId.values()) {
-      const [turns, events, usage] = await Promise.all([
-        loadSessionTurns(meta.id, null),
-        loadSessionEvents(meta.id),
-        loadSessionUsage(meta.id),
-      ])
-      pages.push(
-        ...splitAuditEvidence(
-          `session:${createHash('sha256').update(meta.id).digest('hex').slice(0, 16)}`,
-          JSON.stringify({
-            session: {
-              channel: meta.channel,
-              title: meta.title,
-              startedAt: meta.startedAt,
-              lastAt: meta.lastAt,
-              turnCount: meta.turnCount,
-            },
-            turns,
-            events: events.map(({ peerId: _peerId, ...event }) => event),
-            usage,
-          }),
-        ),
-      )
-    }
-    return {
-      pages,
-      sessionsReviewed: byId.size,
-      throughSeq: successWindow.throughSeq,
-    }
+    return _loadAutoDreamAuditDatasetImpl.call(this as unknown as AgentHandlersHost, input)
   }
 
-  private async _runAutoDreamOptimizerModel(
-    input: AutoDreamOptimizerModelRun,
-    client: AutoDreamOptimizerClient,
-  ): Promise<string> {
-    const cfg = await this._getAgentsConfig()
-    const sourceAgent =
-      cfg.agents.find((row) => row.id === input.agentId) ??
-      cfg.agents.find((row) => row.id === cfg.default)
-    if (!sourceAgent) throw new Error('AUTO_DREAM_AGENT_NOT_FOUND')
-    const agent: AgentDef = {
-      ...sourceAgent,
-      model: input.model,
-      provider: undefined,
-      runnerKind: undefined,
-      persona: undefined,
-      cwd: undefined,
-      mcpServers: [],
-      toolsets: [],
-    }
-    const execution = await resolveLocalExecutionIfEnforced({
-      agent,
-      kind: 'auto_dream',
-      model: input.model,
-      defaultModel: this.deps.config.defaults.model,
-    })
-    const model = execution?.canonicalModel ?? input.model
-    const expectedEngine =
-      model === 'gpt-5.6-terra'
-        ? 'codex'
-        : model === 'deepseek-v4-flash' || model === 'MiniMax-M3'
-          ? 'ccb'
-          : null
-    const engine = execution?.engine ?? expectedEngine
-    if (!expectedEngine || engine !== expectedEngine) {
-      throw new Error('AUTO_DREAM_MODEL_ENGINE_MISMATCH')
-    }
-    const admission =
-      engine === 'codex'
-        ? await client.admit(input)
-        : await client.retryPending(input.agentId).then(() => null)
-    const sessionKey =
-      input.phase === 'map'
-        ? `auto-dream-optimizer:${input.callId}`
-        : `auto-dream-optimizer:${input.runId}:reduce`
-    let session: Awaited<ReturnType<SessionManager['getOrCreate']>>
-    try {
-      session = await this.sessions.getOrCreate({
-        sessionKey,
-        agent,
-        ...localExecutionOverride(execution),
-        channel: 'auto-dream',
-        peerId: sessionKey,
-        ...(engine === 'ccb' ? { userId: input.userId } : {}),
-        effortLevel: 'max',
-        workload: 'auto-dream',
-        hermeticNoTools: true,
-        structuredOutputSchema: AUTO_DREAM_OPTIMIZER_JSON_SCHEMA,
-      })
-    } catch (err) {
-      if (admission) await client.abandon(admission.requestId).catch(() => {})
-      throw err
-    }
-    const structuredOutput = new AutoDreamStructuredOutputCollector()
-    let invalidEvent: string | null = null
-    let billing: import('@openclaude/protocol').DurableCodexBilling | null = null
-    let stagedBilling = false
-    let completed = false
-    try {
-      await this.sessions.submit(
-        session,
-        input.prompt,
-        (event) => {
-          if (event.kind === 'codex_billing') {
-            if (!admission) {
-              invalidEvent ??= 'unexpected_billing'
-              return
-            }
-            if (billing) {
-              invalidEvent ??= 'multiple_billing'
-            } else {
-              billing = { ...event }
-              delete (billing as { kind?: string }).kind
-            }
-            return
-          }
-          structuredOutput.accept(event)
-        },
-        'max',
-        model,
-        admission?.requestId,
-        undefined,
-        'default',
-        admission ? { codexRoute: admission.routeFrame } : undefined,
-      )
-      if (admission && billing) {
-        const stage = await client.stageBilling(input.agentId, billing)
-        stagedBilling = true
-        await client.settleStaged(input.agentId, billing, stage)
-      }
-      if (admission && !billing) throw new Error('AUTO_DREAM_MISSING_BILLING')
-      if (invalidEvent) throw new Error(`AUTO_DREAM_INVALID_EVENT_${invalidEvent}`)
-      const output = structuredOutput.finish()
-      completed = true
-      return output
-    } finally {
-      if (admission && !billing && !stagedBilling) {
-        await client.abandon(admission.requestId).catch(() => {})
-      }
-      if (input.phase === 'map' || !completed) {
-        await this.sessions.destroySession(sessionKey).catch(() => {})
-      }
-    }
+  private async _runAutoDreamOptimizerModel(input: AutoDreamOptimizerModelRun, client: AutoDreamOptimizerClient): Promise<string> {
+    return _runAutoDreamOptimizerModelImpl.call(this as unknown as AgentHandlersHost, input, client)
   }
 
   private async _hydrateAutoDreamOptimizerProposals(input: {
@@ -7555,253 +6469,11 @@ export class Gateway {
     agentId: string
     proposals: AutoDreamOptimizerProposal[]
   }): Promise<AutoDreamOptimizerProposal[]> {
-    const policy = await new AutoDreamPolicyClient().get({ fresh: true })
-    if (!policy.enabled || policy.mode !== 'optimizer_v2') {
-      throw new Error('AUTO_DREAM_OPTIMIZER_NOT_ENABLED')
-    }
-    const [profile, persona, jobs] = await Promise.all([
-      readUserProfile(),
-      readFile(paths.agentClaudeMd(input.agentId), 'utf8').catch(() => ''),
-      this.cron ? this.cron.listJobs() : Promise.resolve([]),
-    ])
-    const skillStore = buildAgentSkillStore(input.agentId)
-    const userSkills = new Map(
-      (await skillStore.list({ includePlatform: false })).map((skill) => [skill.name, skill]),
-    )
-    const preferenceSnapshot = policy.auditContext?.preferences ?? {}
-    const hydrated: AutoDreamOptimizerProposal[] = []
-
-    for (const proposal of input.proposals) {
-      let targetId = proposal.targetId
-      let before = ''
-      let after = proposal.after
-      if (proposal.action === 'profile.replace') {
-        before = profile.text
-      } else if (proposal.action === 'memory.upsert' || proposal.action === 'memory.delete') {
-        const file = proposal.targetId.replace(/^memory\//, '')
-        const current = await new MemoryDir(input.agentId).read(file)
-        if (proposal.action === 'memory.delete') {
-          if (!current) continue
-          after = ''
-        }
-        before = current?.content ?? ''
-      } else if (proposal.action === 'skill.upsert' || proposal.action === 'skill.delete') {
-        const name = proposal.targetId.replace(/^skill\//, '')
-        const metadata = userSkills.get(name)
-        if (metadata && !metadata.writable) continue
-        const current = await skillStore.view(name, undefined, { includePlatform: false })
-        if (proposal.action === 'skill.delete') {
-          if (!current || typeof current === 'string') continue
-          after = ''
-        }
-        before = current && typeof current !== 'string' ? current.rawContent : ''
-      } else if (
-        proposal.action === 'rule.replace' ||
-        proposal.action === 'agent.persona.replace'
-      ) {
-        before = persona
-      } else if (proposal.action === 'preference.patch') {
-        const key = proposal.targetId.slice('preferences.'.length)
-        const current = Object.prototype.hasOwnProperty.call(preferenceSnapshot, key)
-          ? preferenceSnapshot[key]
-          : null
-        before = JSON.stringify(current)
-      } else if (
-        proposal.action === 'schedule.upsert' ||
-        proposal.action === 'schedule.delete'
-      ) {
-        const requestedId = proposal.targetId.replace(/^schedule\//, '')
-        const jobId =
-          requestedId === 'new'
-            ? `auto-dream-${createHash('sha256')
-                .update(`${input.runId}\0${proposal.after}`)
-                .digest('hex')
-                .slice(0, 24)}`
-            : requestedId
-        if (jobs.some((job) => job.id === jobId && job.agent !== input.agentId)) continue
-        const current = jobs.find((job) => job.id === jobId && job.agent === input.agentId)
-        if (proposal.action === 'schedule.delete') {
-          if (!current) continue
-          after = ''
-        } else {
-          try {
-            after = JSON.stringify(normalizeAutoDreamSchedule(after, input.agentId, jobId))
-          } catch {
-            continue
-          }
-        }
-        before = current ? JSON.stringify(current) : ''
-        targetId = `schedule/${jobId}`
-      } else if (proposal.action === 'plugin.install') {
-        before = ''
-      } else if (proposal.action === 'manual.review') {
-        before = proposal.before
-      } else {
-        continue
-      }
-
-      const fingerprint = createHash('sha256')
-        .update(`${proposal.action}\0${targetId}\0${before}\0${after}`)
-        .digest('hex')
-      hydrated.push({
-        ...proposal,
-        id: createHash('sha256')
-          .update(`${input.runId}\0${hydrated.length}\0${fingerprint}`)
-          .digest('hex')
-          .slice(0, 32),
-        fingerprint,
-        targetId,
-        before,
-        after,
-        beforeFingerprint: createHash('sha256').update(before).digest('hex'),
-      })
-    }
-    return hydrated
+    return _hydrateAutoDreamOptimizerProposalsImpl.call(this as unknown as AgentHandlersHost, input)
   }
 
-  private async _applyAutoDreamOptimizerProposal(
-    input: { agentId: string; proposal: AutoDreamOptimizerProposal },
-    client: AutoDreamOptimizerClient,
-  ): Promise<{ ok: true; result?: string } | { ok: false; conflict: string }> {
-    const { agentId, proposal } = input
-    if (proposal.action === 'preference.patch') {
-      return await client.applyMasterProposal(proposal)
-    }
-    if (proposal.action === 'profile.replace') {
-      const current = await readUserProfile()
-      if (current.text === proposal.after) return { ok: true, result: 'profile already applied' }
-      if (createHash('sha256').update(current.text).digest('hex') !== proposal.beforeFingerprint) {
-        return { ok: false, conflict: '用户画像已在审计后发生变化。' }
-      }
-      const result = await writeUserProfile(proposal.after, current.version)
-      return result.ok
-        ? { ok: true, result: 'profile applied' }
-        : { ok: false, conflict: 'conflict' in result ? '用户画像已发生变化。' : result.error }
-    }
-    if (proposal.action === 'memory.upsert' || proposal.action === 'memory.delete') {
-      const file = proposal.targetId.replace(/^memory\//, '')
-      if (!MEMORY_FILE_RE.test(file)) throw new Error('AUTO_DREAM_MEMORY_TARGET_INVALID')
-      const store = new MemoryDir(agentId)
-      const current = await store.read(file)
-      const currentText = current?.content ?? ''
-      if (proposal.action === 'memory.upsert' && currentText === proposal.after) {
-        return { ok: true, result: 'memory already applied' }
-      }
-      if (proposal.action === 'memory.delete' && !current) {
-        return { ok: true, result: 'memory already deleted' }
-      }
-      if (createHash('sha256').update(currentText).digest('hex') !== proposal.beforeFingerprint) {
-        return { ok: false, conflict: '该记忆已在审计后发生变化。' }
-      }
-      if (proposal.action === 'memory.delete') {
-        if (!current) return { ok: true, result: 'memory already deleted' }
-        const result = await store.applyBatchCas({
-          upserts: [],
-          deletes: [{ file, expectedVersion: current.version }],
-        })
-        return result.ok
-          ? { ok: true, result: 'memory deleted' }
-          : { ok: false, conflict: '该记忆已发生变化。' }
-      }
-      const result = await store.write(file, proposal.after, current?.version ?? null)
-      return result.ok
-        ? { ok: true, result: 'memory applied' }
-        : { ok: false, conflict: '该记忆已发生变化。' }
-    }
-    if (proposal.action === 'skill.upsert' || proposal.action === 'skill.delete') {
-      const name = proposal.targetId.replace(/^skill\//, '')
-      const store = buildAgentSkillStore(agentId)
-      const current = await store.view(name, undefined, { includePlatform: false })
-      const currentText = current && typeof current !== 'string' ? current.rawContent : ''
-      if (proposal.action === 'skill.delete' && !current) {
-        return { ok: true, result: 'skill already deleted' }
-      }
-      if (proposal.action === 'skill.upsert' && current && typeof current !== 'string') {
-        const desired = parseFrontmatter(proposal.after)
-        const currentParsed = parseFrontmatter(current.rawContent)
-        if (
-          desired.body === currentParsed.body &&
-          desired.meta.description === currentParsed.meta.description &&
-          JSON.stringify(desired.meta.tags ?? []) === JSON.stringify(currentParsed.meta.tags ?? []) &&
-          JSON.stringify(desired.meta.related_skills ?? []) ===
-            JSON.stringify(currentParsed.meta.related_skills ?? [])
-        ) {
-          return { ok: true, result: 'skill already applied' }
-        }
-      }
-      if (createHash('sha256').update(currentText).digest('hex') !== proposal.beforeFingerprint) {
-        return { ok: false, conflict: '该技能已在审计后发生变化。' }
-      }
-      if (proposal.action === 'skill.delete') {
-        const removed = await store.delete(name)
-        return removed.ok
-          ? { ok: true, result: 'skill deleted' }
-          : { ok: false, conflict: removed.error ?? '技能删除失败。' }
-      }
-      const parsed = parseFrontmatter(proposal.after)
-      const description =
-        typeof parsed.meta.description === 'string' ? parsed.meta.description : ''
-      const saved = await store.save(
-        {
-          name,
-          description,
-          version: parsed.meta.version,
-          tags: parsed.meta.tags,
-          related_skills: parsed.meta.related_skills,
-        },
-        parsed.body,
-      )
-      return saved.ok
-        ? { ok: true, result: 'skill applied' }
-        : { ok: false, conflict: saved.error ?? '技能保存失败。' }
-    }
-    if (proposal.action === 'rule.replace' || proposal.action === 'agent.persona.replace') {
-      if (proposal.targetId !== 'agent-persona') {
-        throw new Error('AUTO_DREAM_PERSONA_TARGET_INVALID')
-      }
-      const path = paths.agentClaudeMd(agentId)
-      const current = await readFile(path, 'utf8').catch(() => '')
-      if (current === proposal.after) return { ok: true, result: 'agent rules already applied' }
-      if (createHash('sha256').update(current).digest('hex') !== proposal.beforeFingerprint) {
-        return { ok: false, conflict: 'Agent 规则已在审计后发生变化。' }
-      }
-      await mkdir(dirname(path), { recursive: true })
-      const tmp = `${path}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`
-      await writeFile(tmp, proposal.after, { mode: 0o600 })
-      await rename(tmp, path)
-      return { ok: true, result: 'agent rules applied' }
-    }
-    if (proposal.action === 'schedule.upsert' || proposal.action === 'schedule.delete') {
-      if (!this.cron) throw new Error('AUTO_DREAM_CRON_UNAVAILABLE')
-      const requestedId = proposal.targetId.replace(/^schedule\//, '')
-      const jobId = requestedId === 'new' ? `auto-dream-${proposal.id}` : requestedId
-      const jobs = await this.cron.listJobs()
-      const current = jobs.find((job) => job.id === jobId && job.agent === agentId)
-      if (jobs.some((job) => job.id === jobId && job.agent !== agentId)) {
-        throw new Error('AUTO_DREAM_SCHEDULE_TARGET_OWNED_BY_ANOTHER_AGENT')
-      }
-      const currentText = current ? JSON.stringify(current) : ''
-      let desired: import('./cron.js').CronJob | undefined
-      if (proposal.action === 'schedule.delete' && !current) {
-        return { ok: true, result: 'schedule already deleted' }
-      }
-      if (proposal.action === 'schedule.upsert') {
-        desired = normalizeAutoDreamSchedule(proposal.after, agentId, jobId)
-        const desiredText = JSON.stringify(desired)
-        if (currentText === desiredText) return { ok: true, result: 'schedule already applied' }
-      }
-      if (createHash('sha256').update(currentText).digest('hex') !== proposal.beforeFingerprint) {
-        return { ok: false, conflict: '该定时任务已在审计后发生变化。' }
-      }
-      if (proposal.action === 'schedule.delete') {
-        await this.cron.removeJob(jobId)
-        return { ok: true, result: 'schedule deleted' }
-      }
-      if (!desired) throw new Error('AUTO_DREAM_SCHEDULE_INVALID')
-      await this.cron.addJob(desired)
-      return { ok: true, result: 'schedule applied' }
-    }
-    throw new Error('AUTO_DREAM_ACTION_UNSUPPORTED')
+  private async _applyAutoDreamOptimizerProposal(input: { agentId: string; proposal: AutoDreamOptimizerProposal }, client: AutoDreamOptimizerClient): Promise<{ ok: true; result?: string } | { ok: false; conflict: string }> {
+    return _applyAutoDreamOptimizerProposalImpl.call(this as unknown as AgentHandlersHost, input, client)
   }
 
   /**
@@ -7810,269 +6482,23 @@ export class Gateway {
    * persona/repo/memory/skills/MCP/resume context.
    */
   private async _runAutoDreamModel(input: AutoDreamModelRun): Promise<string> {
-    const cfg = await this._getAgentsConfig()
-    const sourceAgent =
-      cfg.agents.find((row) => row.id === input.agentId) ??
-      cfg.agents.find((row) => row.id === cfg.default)
-    if (!sourceAgent) throw new Error('AUTO_DREAM_AGENT_NOT_FOUND')
-    const agent: AgentDef = {
-      ...sourceAgent,
-      model: input.model,
-      provider: undefined,
-      runnerKind: undefined,
-      persona: undefined,
-      mcpServers: [],
-      toolsets: [],
-    }
-    const execution = await resolveLocalExecutionIfEnforced({
-      agent,
-      kind: 'turn',
-      model: input.model,
-      defaultModel: this.deps.config.defaults.model,
-    })
-    if (execution && execution.engine !== 'ccb') throw new Error('AUTO_DREAM_MODEL_NOT_CCB')
-    const model = execution?.canonicalModel ?? input.model
-    const sessionKey = `auto-dream:${input.attemptId}`
-    const session = await this.sessions.getOrCreate({
-      sessionKey,
-      agent,
-      ...localExecutionOverride(execution),
-      channel: 'auto-dream',
-      peerId: sessionKey,
-      userId: input.userId,
-      effortLevel: 'medium',
-      workload: 'auto-dream',
-      hermeticNoTools: true,
-      structuredOutputSchema: AUTO_DREAM_PROPOSAL_JSON_SCHEMA,
-    })
-    const collector = new AutoDreamStructuredOutputCollector()
-    try {
-      await this.sessions.submit(
-        session,
-        input.prompt,
-        (event) => collector.accept(event),
-        'medium',
-        model,
-      )
-      return collector.finish()
-    } finally {
-      await this.sessions.destroySession(sessionKey).catch(() => {})
-    }
+    return _runAutoDreamModelImpl.call(this as unknown as AgentHandlersHost, input)
   }
 
   /** 评测编排:逐 case 逐 arm 隔离跑 → 每 case 一个匿名 grader turn → benchmark。 */
   private async _runSkillEval(run: SkillEvalRun, opts: { draftDir?: string }): Promise<void> {
-    run.status = 'running'
-    await this.skillEvalJobs.touch(run, Date.now())
-    const arms = armsForMode(run.mode)
-    const preferences: Array<'draft' | 'current' | 'tie'> = []
-
-    for (const c of run.cases) {
-      const armOutputs: Array<{ arm: (typeof arms)[number]; result: SkillEvalCaseResult }> = []
-      for (const arm of arms) {
-        const sessionKey = `skilleval:${run.runId}:${c.id}:${arm}`
-        const result: SkillEvalCaseResult = {
-          caseId: c.id,
-          arm,
-          output: '',
-          usage: emptyUsage(),
-          assertions: [],
-        }
-        try {
-          const { text, usage } = await this._skillEvalTurn(
-            sessionKey,
-            run.userId,
-            buildEvalCasePrompt(c),
-            run.model,
-            {
-              skillEvalExclude: arm === 'without' ? run.skillName : undefined,
-              skillEvalDraft:
-                arm === 'draft' && opts.draftDir
-                  ? { name: run.skillName, dir: opts.draftDir }
-                  : undefined,
-            },
-          )
-          result.output = text.slice(0, 20_000)
-          addUsage(result.usage, usage)
-          addUsage(run.usage, usage)
-        } catch (err) {
-          result.error = String(err)
-        }
-        run.results.push(result)
-        armOutputs.push({ arm, result })
-        run.progress.done++
-        await this.skillEvalJobs.touch(run, Date.now())
-      }
-
-      // grading(仅对无 error 的输出;全挂就跳过本 case)
-      const gradable = armOutputs.filter((a) => !a.result.error)
-      if (gradable.length === 0) continue
-      run.status = 'grading'
-      await this.skillEvalJobs.touch(run, Date.now())
-      // 匿名化 + 随机顺序(盲测防位置偏好)。label→arm 映射只在本进程内存。
-      const shuffled = [...gradable].sort(() => Math.random() - 0.5)
-      const labels = ['A', 'B', 'C']
-      const graderArms: GraderArmInput[] = shuffled.map((a, i) => ({
-        label: labels[i],
-        output: a.result.output,
-      }))
-      try {
-        const { text: gradeText, usage: gradeUsage } = await this._skillEvalTurn(
-          `skilleval:${run.runId}:grade:${c.id}`,
-          run.userId,
-          buildGraderPrompt(c, graderArms, {
-            wantPreference: run.mode === 'draft' && gradable.length >= 2,
-          }),
-          run.model,
-          {},
-        )
-        addUsage(run.usage, gradeUsage)
-        const parsed = parseGraderJson(gradeText)
-        if (!parsed) {
-          for (const a of gradable) a.result.error = 'grader output unparseable'
-        } else {
-          shuffled.forEach((a, i) => {
-            a.result.assertions = gradesToAssertions(c, parsed.grades[labels[i]])
-          })
-          if (parsed.preference && run.mode === 'draft') {
-            const idx = parsed.preference === 'tie' ? -1 : labels.indexOf(parsed.preference)
-            if (idx === -1) preferences.push('tie')
-            else preferences.push(shuffled[idx]?.arm === 'draft' ? 'draft' : 'current')
-          }
-        }
-      } catch (err) {
-        for (const a of gradable) a.result.error = `grading failed: ${String(err)}`
-      }
-      run.status = 'running'
-      await this.skillEvalJobs.touch(run, Date.now())
-    }
-
-    const benchmark = computeBenchmark(run.results, {
-      draftMode: run.mode === 'draft',
-      preferences,
-    })
-    await this.skillEvalJobs.finish(run, Date.now(), { benchmark })
-
-    // 可写技能:落 evals/last-run.json 摘要(面板即开即见;draft 模式不写 —— 未合并)。
-    if (run.mode === 'baseline') {
-      const store = buildUserSkillStore()
-      await store
-        .saveAuxFile(
-          run.skillName,
-          'evals/last-run.json',
-          `${JSON.stringify(
-            {
-              runId: run.runId,
-              mode: run.mode,
-              finishedAt: run.finishedAt,
-              benchmark,
-              usage: run.usage,
-            },
-            null,
-            2,
-          )}\n`,
-        )
-        .catch(() => {})
-    }
-
+    return _runSkillEvalImpl.call(this as unknown as SkillHandlersHost, run, opts)
   }
 
   // ── P3:技能每日自动回归(opt-in)────────────────────────────────────────
   private _skillRegressionTimer: ReturnType<typeof setInterval> | null = null
 
   private _startSkillAutoRegression(): void {
-    // 检查间隔 1h(可 env 缩短供 e2e),真正执行按「距上次 ≥22h」判定 —— 每技能每日至多一轮。
-    const checkMs = Number(process.env.OC_SKILL_REGRESSION_CHECK_MS) || 60 * 60 * 1000
-    const minGapMs = Number(process.env.OC_SKILL_REGRESSION_MIN_GAP_MS) || 22 * 60 * 60 * 1000
-    this._skillRegressionTimer = setInterval(() => {
-      void this._skillAutoRegressionTick(minGapMs).catch((err) =>
-        this.log.warn('skill auto-regression tick failed', {}, err),
-      )
-    }, checkMs)
-    this._skillRegressionTimer.unref?.()
+    return _startSkillAutoRegressionImpl.call(this as unknown as SkillHandlersHost)
   }
 
   private async _skillAutoRegressionTick(minGapMs: number): Promise<void> {
-    const stampPath = join(paths.skillEvalsDir, 'auto-regression.json')
-    let stamps: Record<string, number> = {}
-    try {
-      stamps = JSON.parse(await readFile(stampPath, 'utf-8')) as Record<string, number>
-    } catch {}
-    const store = buildUserSkillStore()
-    const skills = await store.list({ includePlatform: false }).catch(() => [])
-    for (const sk of skills) {
-      if (!sk?.name) continue
-      const raw = await store.view(sk.name, 'evals/evals.json', { includePlatform: false })
-      if (typeof raw !== 'string') continue
-      const parsed = parseSkillEvalsJson(raw)
-      if (!parsed.ok || parsed.file.autoRegression !== true) continue
-      const last = stamps[sk.name] ?? 0
-      if (Date.now() - last < minGapMs) continue
-      if (!this.skillEvalJobs.canStart(sk.name).ok) continue
-
-      // 记录上一次通过率(回归对比基线);本轮结果由 _runSkillEval 写回 last-run.json。
-      let prevWith: number | null = null
-      const prevRaw = await store.view(sk.name, 'evals/last-run.json', { includePlatform: false })
-      if (typeof prevRaw === 'string') {
-        try {
-          const prev = JSON.parse(prevRaw) as { benchmark?: { passRate?: { with?: number } } }
-          prevWith = prev.benchmark?.passRate?.with ?? null
-        } catch {}
-      }
-
-      stamps[sk.name] = Date.now()
-      await mkdir(paths.skillEvalsDir, { recursive: true }).catch(() => {})
-      await writeFile(stampPath, JSON.stringify(stamps, null, 2)).catch(() => {})
-
-      const run = await this.skillEvalJobs.create({
-        runId: SkillEvalJobStore.newRunId(),
-        skillName: sk.name,
-        // 'default' 即容器内 HTTP 侧的归属权威:商业代理刻意不转发 auth 头
-        // (containerApiProxy FORWARD_REQUEST_HEADERS),getUserId 对代理请求恒为
-        // 'default' —— 后台定时 run 用同值才能过 owner 校验,别改成别的。
-        userId: 'default',
-        mode: 'baseline',
-        model: SKILL_TRAIN_DEFAULT_MODEL,
-        cases: parsed.file.cases,
-        now: Date.now(),
-      })
-      try {
-        await this._runSkillEval(run, {})
-      } catch (err) {
-        await this.skillEvalJobs.finish(run, Date.now(), { error: String(err) })
-      }
-
-      const b = run.benchmark
-      const withRate = b?.passRate?.with
-      const failed = run.status === 'failed'
-      const regressed =
-        failed ||
-        (b?.verdict ?? '').includes('反而更差') ||
-        (prevWith !== null && withRate !== undefined && withRate < prevWith - 0.05)
-      if (!regressed) continue
-
-      // 推送提醒(不自动改技能、不自动开训练 —— 修复动作由用户在管理中心发起)。
-      const pct = (x?: number | null) => (x == null ? '?' : `${Math.round(x * 100)}%`)
-      const lines = [
-        failed
-          ? `自动回归运行失败:${run.error ?? '未知错误'}`
-          : `断言通过率 ${pct(prevWith)} → ${pct(withRate)}${b?.verdict ? `(${b.verdict})` : ''}`,
-        `本次回归消耗:输入 ${run.usage.inputTokens.toLocaleString()} / 输出 ${run.usage.outputTokens.toLocaleString()} tokens(${run.usage.turns} 轮,实际扣费以账单为准)`,
-        '建议:打开 管理中心 → 技能 → 该技能 → 训练优化,让 AI 基于失败结果起草改进(草稿经你确认才会合并)。',
-        '不再需要提醒可在 管理中心 → 技能 → 评测 里关闭「每日自动回归」。',
-      ]
-      await this.cron
-        ?.deliverNotice(lines.join('\n'), {
-          id: `skill-regression-${sk.name}`,
-          schedule: '0 0 * * *',
-          agent: 'main',
-          prompt: '',
-          deliver: 'webchat',
-          enabled: true,
-          label: `技能回归提醒:${sk.name}`,
-        })
-        .catch(() => {})
-    }
+    return _skillAutoRegressionTickImpl.call(this as unknown as SkillHandlersHost, minGapMs)
   }
 
   // ── SkillOpt skill-training (async; train → diff → confirm-merge) ──
@@ -8182,337 +6608,47 @@ export class Gateway {
    * (DISTINCT session_key,供前端"已找到 N 条"提示)。任何环节失败/无数据 → `{[], 0}`
    * (训练照常,不注入失败案例小节)。内容主权不出容器:master 只回引用,摘录本体由本地 DB 组装。
    */
-  private async _collectSkillFeedbackScenarios(
-    skillName: string,
-  ): Promise<{ scenarios: FeedbackScenario[]; total: number }> {
-    let feedback: { refs: SkillFeedbackRef[]; total: number }
-    try {
-      // 拉取有界超时(fail-open):不让 master 慢响应拖住训练启动。
-      feedback = await fetchUserSkillFeedbackRefs(skillName, { timeoutMs: 5_000 })
-    } catch {
-      return { scenarios: [], total: 0 } // 已 fail-open,这里再兜底一层绝不上抛
-    }
-    if (feedback.refs.length === 0) return { scenarios: [], total: 0 }
-    const scenarios: FeedbackScenario[] = []
-    for (const ref of feedback.refs) {
-      if (scenarios.length >= MAX_FEEDBACK_SCENARIOS) break
-      let turns: Awaited<ReturnType<typeof loadSessionTurns>>
-      try {
-        // sessions_meta.id / sessions_fts.session_id == sessionKey(sessionManager
-        // indexTurn 用 session.sessionKey 作 FTS 主键),故 loadSessionTurns 直接吃 sessionKey。
-        turns = await loadSessionTurns(ref.sessionKey)
-      } catch {
-        continue
-      }
-      const text = buildSessionExcerpt(turns, SESSION_EXCERPT_MAX_CHARS)
-      if (!text) continue // 会话已归档/清理 → 跳过该 ref
-      scenarios.push({ text })
-    }
-    return { scenarios, total: feedback.total }
+  private async _collectSkillFeedbackScenarios(skillName: string): Promise<{ scenarios: FeedbackScenario[]; total: number }> {
+    return _collectSkillFeedbackScenariosImpl.call(this as unknown as SkillHandlersHost, skillName)
   }
 
-  private async _handleSkillTrainStart(
-    req: IncomingMessage,
-    res: ServerResponse,
-    skillName: string,
-  ): Promise<void> {
-    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
-    const userId = this.getUserId(req)
-
-    // Authority: only train user-authored skills. Use the user-management view so a
-    // platform baseline/seed name resolves to 404 (same as a nonexistent skill) instead
-    // of 403 — otherwise the 403/404 split would be an existence oracle for the
-    // (otherwise hidden) platform skill catalog.
-    const userStore = buildUserSkillStore()
-    const current = await userStore.view(skillName, undefined, { includePlatform: false })
-    if (!current || typeof current === 'string') return this.sendError(res, 404, 'skill not found')
-
-    const guard = this.skillTrainJobs.canStart(skillName)
-    if (!guard.ok) return this.sendError(res, 409, guard.reason ?? 'cannot start training')
-
-    const agent = await this._trainingAgent()
-    if (!agent) return this.sendError(res, 500, 'no agent available for training')
-
-    const body = await this.readJsonBody<{ focus?: string; autoEval?: boolean }>(req).catch(
-      () => ({}) as { focus?: string; autoEval?: boolean },
-    )
-    const runId = SkillTrainJobStore.newRunId()
-    const opts = normalizeSkillTrainArgs(
-      { runId, targetSkill: skillName, focus: body?.focus },
-      agent.id,
-    )
-    await this.skillTrainJobs.create({
-      runId,
-      skillName,
-      agentId: agent.id,
-      userId,
-      model: SKILL_TRAIN_DEFAULT_MODEL,
-      effort: SKILL_TRAIN_EFFORT,
-      autoEval: body?.autoEval !== false,
-      now: Date.now(),
-    })
-
-    // 差评驱动:起训前拉「用户对该技能差评过的真实使用记录」→ 按 sessionKey 从本地
-    // sessions.db 取摘录,注入训练 prompt 的失败案例小节。整链 fail-open:任一步失败/无
-    // 数据都返回空 → 照常训练(feedbackRefs=0),绝不影响训练启动。
-    const { scenarios: feedbackScenarios, total: feedbackTotal } =
-      await this._collectSkillFeedbackScenarios(skillName)
-    const feedbackSection = buildFeedbackScenariosSection(feedbackScenarios)
-    // feedbackRefs:仅当确有素材注入训练时才回传 master 的未截断差评总数(前端"已找到 N 条")。
-    // 差评存在但摘录全部拉不到(会话已清理)→ 无注入 → 0(不误报"将优先分析")。
-    const feedbackRefs = feedbackScenarios.length > 0 ? feedbackTotal : 0
-
-    // 模型权威 §3:skill-train 是**真实计费的本地 turn**(无 envelope)→ kind='turn'。
-    // 投影不可用 / 模型不可用 / codex 意图 → 结构化拒(HTTP 4xx/503),不 spawn runner。
-    let trainExec: LocalExecutionDecision | undefined
-    try {
-      trainExec = await resolveLocalExecutionIfEnforced({
-        agent,
-        kind: 'turn',
-        model: SKILL_TRAIN_DEFAULT_MODEL,
-        defaultModel: this.deps.config.defaults.model,
-      })
-    } catch (err) {
-      const mapped = this._mapLocalExecutionError(err)
-      if (!mapped) throw err
-      await this.skillTrainJobs.setStatus(runId, 'failed', Date.now(), mapped.message)
-      return this.sendError(res, mapped.httpStatus, mapped.message)
-    }
-    const trainModel = trainExec?.canonicalModel ?? SKILL_TRAIN_DEFAULT_MODEL
-    // Background session bound to this run (skillTrainRunId exposes skill_propose).
-    const session = await this.sessions.getOrCreate({
-      sessionKey: `skilltrain:${runId}`,
-      agent,
-      ...localExecutionOverride(trainExec),
-      channel: 'skill-train',
-      peerId: runId,
-      userId,
-      effortLevel: SKILL_TRAIN_EFFORT,
-      skillTrainRunId: runId,
-    })
-    // Fire-and-forget: fold stream events into the run state; don't block the HTTP reply.
-    void this.sessions
-      .submit(
-        session,
-        buildSkillTrainPrompt(opts, new Date(), feedbackSection),
-        (e) => this._onTrainEvent(runId, e),
-        SKILL_TRAIN_EFFORT,
-        trainModel,
-        runId,
-      )
-      .catch((err) => {
-        void this.skillTrainJobs.setStatus(runId, 'failed', Date.now(), String(err))
-      })
-    this.sendJson(res, 202, { ok: true, runId, feedbackRefs })
+  private async _handleSkillTrainStart(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+    return _handleSkillTrainStartImpl.call(this as unknown as SkillHandlersHost, req, res, skillName)
   }
 
   // GET /api/skill-training — 当前用户的训练 run 列表(startedAt 降序)。归属权威与
   // _ownedTrainRun 同一来源(getUserId):runId 不再只活在前端组件 state 里,刷新页面 /
   // gateway 重启后前端凭此找回 running(续轮询)或 diff_ready(续合并/修订)的 run。
   private async _handleSkillTrainList(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-    this.sendJson(res, 200, { runs: this.skillTrainJobs.list(this.getUserId(req)) })
+    return _handleSkillTrainListImpl.call(this as unknown as SkillHandlersHost, req, res)
   }
 
   // GET /api/skill-training/:runId — run status. DELETE — discard run + its drafts.
-  private async _handleSkillTrainRun(
-    req: IncomingMessage,
-    res: ServerResponse,
-    runId: string,
-  ): Promise<void> {
-    const run = this._ownedTrainRun(req, res, runId)
-    if (!run) return
-    if (req.method === 'GET') {
-      this.sendJson(res, 200, { run })
-      return
-    }
-    if (req.method === 'DELETE') {
-      await this.skillDrafts.deleteRun(runId)
-      await this.skillTrainJobs.setStatus(runId, 'discarded', Date.now())
-      this.skillTrainJobs.forget(runId)
-      this.sendJson(res, 200, { ok: true })
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
+  private async _handleSkillTrainRun(req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
+    return _handleSkillTrainRunImpl.call(this as unknown as SkillHandlersHost, req, res, runId)
   }
 
   // GET /api/skill-training/:runId/drafts — list staged draft summaries.
-  private async _handleSkillTrainDrafts(
-    req: IncomingMessage,
-    res: ServerResponse,
-    runId: string,
-  ): Promise<void> {
-    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-    if (!this._ownedTrainRun(req, res, runId)) return
-    const drafts = await this.skillDrafts.listDrafts(runId)
-    this.sendJson(res, 200, { drafts })
+  private async _handleSkillTrainDrafts(req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
+    return _handleSkillTrainDraftsImpl.call(this as unknown as SkillHandlersHost, req, res, runId)
   }
 
   // GET /api/skill-training/:runId/drafts/:name — draft + current authoritative
   // (the two diff sides). PUT — apply a manual user edit to the draft.
-  private async _handleSkillTrainDraftItem(
-    req: IncomingMessage,
-    res: ServerResponse,
-    runId: string,
-    skillName: string,
-  ): Promise<void> {
-    if (!this._ownedTrainRun(req, res, runId)) return
-    if (req.method === 'GET') {
-      const draft = await this.skillDrafts.readDraft(runId, skillName)
-      if (!draft) return this.sendError(res, 404, 'draft not found')
-      const cur = await buildUserSkillStore().view(skillName, undefined, { includePlatform: false })
-      const current =
-        cur && typeof cur !== 'string'
-          ? { body: cur.body, description: cur.description, version: cur.version }
-          : null
-      this.sendJson(res, 200, { draft, current })
-      return
-    }
-    if (req.method === 'PUT') {
-      const existing = await this.skillDrafts.readDraft(runId, skillName)
-      if (!existing) return this.sendError(res, 404, 'draft not found')
-      const body = await this.readJsonBody<{
-        description?: string
-        body?: string
-        tags?: string[]
-      }>(req)
-      const r = await this.skillDrafts.writeDraft({
-        runId,
-        op: existing.record.op,
-        meta: {
-          name: skillName,
-          description: body.description ?? existing.meta.description,
-          tags: body.tags ?? existing.meta.tags,
-        },
-        body: body.body ?? existing.body,
-        authoredBy: 'user',
-      })
-      if (!r.ok) return this.sendError(res, 400, r.error ?? 'save failed')
-      this.sendJson(res, 200, { ok: true })
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
+  private async _handleSkillTrainDraftItem(req: IncomingMessage, res: ServerResponse, runId: string, skillName: string): Promise<void> {
+    return _handleSkillTrainDraftItemImpl.call(this as unknown as SkillHandlersHost, req, res, runId, skillName)
   }
 
   // POST /api/skill-training/:runId/drafts/:name/comment — user comment → AI revises
   // the draft by continuing the SAME training session (async; status returns to running).
-  private async _handleSkillTrainComment(
-    req: IncomingMessage,
-    res: ServerResponse,
-    runId: string,
-    skillName: string,
-  ): Promise<void> {
-    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
-    const run = this._ownedTrainRun(req, res, runId)
-    if (!run) return
-    const body = await this.readJsonBody<{ comment: string; lineRange?: string }>(req)
-    const comment = (body?.comment ?? '').trim()
-    if (!comment) return this.sendError(res, 400, 'comment required')
-    const agent = await this._trainingAgent()
-    if (!agent) return this.sendError(res, 500, 'no agent available')
-
-    const where = body.lineRange ? ` (lines ${body.lineRange})` : ''
-    const revisePrompt = [
-      `The user reviewed your draft for skill "${skillName}"${where} and commented:`,
-      '',
-      comment,
-      '',
-      `Revise the draft accordingly: re-issue skill_propose (runId="${runId}") with the`,
-      'improved content addressing the comment. Keep all prior good content; change only',
-      'what the comment asks for.',
-    ].join('\n')
-
-    // 模型权威 §3:同 skill-train 起训(本地 turn)。
-    let reviseExec: LocalExecutionDecision | undefined
-    try {
-      reviseExec = await resolveLocalExecutionIfEnforced({
-        agent,
-        kind: 'turn',
-        model: SKILL_TRAIN_DEFAULT_MODEL,
-        defaultModel: this.deps.config.defaults.model,
-      })
-    } catch (err) {
-      const mapped = this._mapLocalExecutionError(err)
-      if (!mapped) throw err
-      return this.sendError(res, mapped.httpStatus, mapped.message)
-    }
-    const reviseModel = reviseExec?.canonicalModel ?? SKILL_TRAIN_DEFAULT_MODEL
-    const session = await this.sessions.getOrCreate({
-      sessionKey: `skilltrain:${runId}`,
-      agent,
-      ...localExecutionOverride(reviseExec),
-      channel: 'skill-train',
-      peerId: runId,
-      userId: run.userId,
-      effortLevel: SKILL_TRAIN_EFFORT,
-      skillTrainRunId: runId,
-    })
-    await this.skillTrainJobs.reopen(runId, Date.now())
-    void this.sessions
-      .submit(
-        session,
-        revisePrompt,
-        (e) => this._onTrainEvent(runId, e),
-        SKILL_TRAIN_EFFORT,
-        reviseModel,
-        runId,
-      )
-      .catch((err) => {
-        void this.skillTrainJobs.setStatus(runId, 'failed', Date.now(), String(err))
-      })
-    this.sendJson(res, 202, { ok: true, runId })
+  private async _handleSkillTrainComment(req: IncomingMessage, res: ServerResponse, runId: string, skillName: string): Promise<void> {
+    return _handleSkillTrainCommentImpl.call(this as unknown as SkillHandlersHost, req, res, runId, skillName)
   }
 
   // POST /api/skill-training/:runId/merge — promote draft(s) into the AUTHORITATIVE
   // library (the only write to live skills). Body {name?} merges one, else all.
-  private async _handleSkillTrainMerge(
-    req: IncomingMessage,
-    res: ServerResponse,
-    runId: string,
-  ): Promise<void> {
-    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
-    const run = this._ownedTrainRun(req, res, runId)
-    if (!run) return
-    if (run.status !== 'diff_ready') {
-      return this.sendError(res, 409, `run is not ready to merge (status: ${run.status})`)
-    }
-    const body = await this.readJsonBody<{ name?: string }>(req).catch(
-      () => ({}) as { name?: string },
-    )
-    const all = await this.skillDrafts.listDrafts(runId)
-    const targets = body?.name ? all.filter((d) => d.name === body.name) : all
-    if (targets.length === 0) return this.sendError(res, 404, 'no drafts to merge')
-
-    const store = buildUserSkillStore()
-    const results: Array<{ name: string; ok: boolean; error?: string }> = []
-    for (const t of targets) {
-      const draft = await this.skillDrafts.readDraft(runId, t.name)
-      if (!draft) {
-        results.push({ name: t.name, ok: false, error: 'draft vanished' })
-        continue
-      }
-      const r =
-        draft.record.op === 'delete'
-          ? await store.delete(t.name)
-          : await store.save(
-              { name: t.name, description: draft.meta.description, tags: draft.meta.tags },
-              draft.body,
-            )
-      // 草稿携带的评测用例随合并落库(evals/evals.json)—— 训练闭环的验收基准。
-      if (r.ok && draft.record.op !== 'delete' && draft.evalsJson) {
-        await store.saveAuxFile(t.name, 'evals/evals.json', draft.evalsJson).catch(() => {})
-      }
-      results.push({ name: t.name, ok: r.ok, error: r.error })
-      if (r.ok) await this.skillDrafts.deleteDraft(runId, t.name)
-    }
-
-    // All drafts consumed → close the run; otherwise leave it for a retry.
-    const remaining = await this.skillDrafts.listDrafts(runId)
-    if (remaining.length === 0) {
-      await this.skillTrainJobs.setStatus(runId, 'merged', Date.now())
-      this.skillTrainJobs.forget(runId)
-    }
-    this.sendJson(res, 200, { ok: results.every((r) => r.ok), results })
+  private async _handleSkillTrainMerge(req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
+    return _handleSkillTrainMergeImpl.call(this as unknown as SkillHandlersHost, req, res, runId)
   }
 
   // GET /api/search?q=... → full-text search past sessions
