@@ -15,6 +15,7 @@
  */
 
 import type { InputPrediction } from "./inputCompletion";
+import { normalizeInlineUiFences } from "./uiFence";
 
 export type { InputPrediction, InputPredictionSource } from "./inputCompletion";
 
@@ -63,7 +64,7 @@ function textOf(v: unknown): string {
 /** 回答里已闭合的 ```ui 块(按出现顺序);其它语言的围栏(含其中的 ```ui 字样)跳过。 */
 function uiBlocksOf(text: string): Record<string, unknown>[] {
   if (!text.includes("```ui") && !text.includes("~~~ui")) return [];
-  const lines = text.split("\n");
+  const lines = normalizeInlineUiFences(text).split("\n");
   const blocks: Record<string, unknown>[] = [];
   let i = 0;
   while (i < lines.length) {
