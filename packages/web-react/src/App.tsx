@@ -1146,12 +1146,12 @@ export function App() {
       if (!activeId && !asDefault) return;
       // Solo/team keep the user's pick on a failed save (see keepCollabChoiceOnSaveFailure);
       // only advisor rolls back, so a failing save can never pin the session to advisor.
+      // Inline error only (cleared on the next save): an error toast never auto-dismisses.
       const failSave = (msg: string) => {
         if (keepCollabChoiceOnSaveFailure(mode)) return;
         setCollabUi(previous);
         setTeamModeState(previous.mode === "team");
         setCollabSaveError(msg);
-        toast(msg, "error");
       };
       if (activeId && sockRef.current) {
         if (modelId) sockRef.current.setSessionModel(activeId, modelId);
