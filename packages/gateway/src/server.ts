@@ -941,7 +941,18 @@ export function resolveSyntheticTurnModel(
 //      → 保持 fail-closed)同向,只是把"晚期 guard 拒"提前成结构化错误。
 
 /** 本地路径的 turn 语义分类(决定 codex 意图怎么处理,见上方真值表)。 */
-export type LocalTurnKind = 'synthetic' | 'turn' | 'prewarm' | 'auto_dream'
+/**
+ * `billed_delegate` / `billed_advisor`: container-local turns whose caller admits master billing
+ * (delegateEngineBilling.admit, fail-closed) before execution, so grok (delegate) / codex (advisor)
+ * may run without the selfhost exemption. Callers must not use them on an unbilled path.
+ */
+export type LocalTurnKind =
+  | 'synthetic'
+  | 'turn'
+  | 'prewarm'
+  | 'auto_dream'
+  | 'billed_delegate'
+  | 'billed_advisor'
 
 /** 本地路径判定结果:该 turn 的 canonical 模型 + engine(= getOrCreate/submit 的同源入参)。 */
 export interface LocalExecutionDecision {
@@ -1148,7 +1159,14 @@ export function decideLocalExecution(args: {
     if (kind === 'prewarm' || kind === 'auto_dream') {
       return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision })
     }
-    if (kind === 'turn') {
+    // 计费准入在调用方先行(见 LocalTurnKind):grok 委派 / codex 顾问不需要豁免门。
+    if (
+      (kind === 'billed_delegate' && engine === 'grok') ||
+      (kind === 'billed_advisor' && engine === 'codex')
+    ) {
+      return decorate({ canonicalModel, engine, supportsVision: descriptor.supportsVision })
+    }
+    if (kind === 'turn' || kind === 'billed_delegate' || kind === 'billed_advisor') {
       // selfhost 豁免门(OC_SELFHOST_ENGINE_LOCAL_TURNS=1)未开 -> 结构化拒(现状)。
       if (!isEngineLocalTurnExempt(env)) {
         // 无票沿用的会话模型若是 cursor/codex/grok,生产环境不能本地跑 —— 跳过它
@@ -12259,7 +12277,6 @@ export class Gateway {
   }
 
   private async handleConsultAdvisor(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (!isEngineLocalTurnExempt()) return this.sendError(res, 404, 'advisor consult is selfhost only')
     if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
     const body = await this.readBody(req)
     let parsed: { question?: unknown; concern?: unknown }
@@ -13125,7 +13142,7 @@ export class Gateway {
     }
     const execution = await resolveLocalExecutionIfEnforced({
       agent,
-      kind: 'turn',
+      kind: 'billed_advisor',
       model: input.snapshot.advisorModel,
       defaultModel: this.deps.config.defaults.model,
     })
@@ -13404,9 +13421,6 @@ export class Gateway {
     res: ServerResponse,
     url: URL,
   ): Promise<void> {
-    if (!isEngineLocalTurnExempt()) {
-      return this.sendError(res, 404, 'collaboration-config is selfhost only')
-    }
     const userId = this.getUserId(req)
     // Selfhost ACCESS / container-proxy / static MCP resolve to 'default' after
     // outer checkHttpAuth (or a valid bridge nonce). That identity owns this
@@ -14271,7 +14285,7 @@ export class Gateway {
     try {
       delegateExec = await resolveLocalExecutionIfEnforced({
         agent: execAgent,
-        kind: 'turn',
+        kind: 'billed_delegate',
         model: requestedModel,
         defaultModel: this.deps.config.defaults.model,
         preferredModels: preferGrokDefault ? DELEGATE_DEFAULT_PREFERRED_MODELS : undefined,
@@ -20483,12 +20497,10 @@ export class Gateway {
     // 团队模式(v5 轻量组队):turn 级 flag,仅 main 队长生效。ws 帧无 typebox runtime
     // 校验(JSON cast),用 === true 防御(与 _frameRequestId 同模式)。
     const teamMode = (frame as any).teamMode === true
-    const inboundCollabMode = !isEngineLocalTurnExempt()
-      ? normalizeCollabMode({ teamMode })
-      : normalizeCollabMode({
-          collabMode: (frame as { collabMode?: unknown }).collabMode,
-          teamMode,
-        })
+    const inboundCollabMode = normalizeCollabMode({
+      collabMode: (frame as { collabMode?: unknown }).collabMode,
+      teamMode,
+    })
 
     // v5 codex route 消费链(A1):master bridge 注入的 `__oc_codex_route` →
     // 严格校验(_buildSafeCodexRouteOverride)→ submit opts.codexRoute →

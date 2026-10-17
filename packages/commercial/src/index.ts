@@ -2478,35 +2478,31 @@ export async function registerCommercial(
         },
       });
       // /internal/v5/delegate/grok-route/* — 容器本地 delegate turn 的 grok route
-      // mint/renew/release(与浏览器 turn 同一账号池与 durable 并发权威)。仅在
-      // selfhost engine-local-turn 豁免下挂载(与 gateway modelAuthority
-      // isEngineLocalTurnExempt 同一 env 语义);生产不路由 → 容器侧 delegate 在
-      // decideLocalExecution 已 fail-closed,不会也不该到达这里。
-      const delegateGrokRouteHandler: DelegateGrokRouteHandler | undefined =
-        process.env.OC_SELFHOST_ENGINE_LOCAL_TURNS === "1"
-          ? makeDelegateGrokRouteHandler({
-              identityRepo,
-              // origin=delegate:短心跳租约 + per-container 限额(与浏览器 bridge
-              // 的 7 天孤儿 TTL 语义分离,见 allocateGrokRelayRoute 注释)。
-              allocate: (input) => allocateGrokRelayRoute({ ...input, origin: "delegate" }),
-              release: async ({ routeToken, containerId, userId }) => {
-                const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
-                if (!context) return false;
-                await expireGrokRouteContextByLease(context.accountId, context.slotId);
-                scheduler.releaseCodexSlot(context.accountId, context.slotId);
-                return true;
-              },
-              renew: async ({ routeToken, containerId, userId }) => {
-                const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
-                if (!context) return false;
-                if (!scheduler.renewCodexSlot(context.accountId, context.slotId)) {
-                  scheduler.restoreCodexSlot(context.accountId, context.slotId);
-                }
-                return true;
-              },
-              logger: rootLogger.child({ subsys: "delegateGrokRoute" }),
-            })
-          : undefined;
+      // mint/renew/release(与浏览器 turn 同一账号池与 durable 并发权威)。两版都挂载:
+      // 容器在 mint 后必须先过 delegate 计费准入(绑定 routeTokenHash),grok relay 对
+      // kind=delegate 的路由只在有 inflight 计费 journal 时放行(OCV5-477)。
+      const delegateGrokRouteHandler: DelegateGrokRouteHandler = makeDelegateGrokRouteHandler({
+        identityRepo,
+        // origin=delegate:短心跳租约 + per-container 限额(与浏览器 bridge
+        // 的 7 天孤儿 TTL 语义分离,见 allocateGrokRelayRoute 注释)。
+        allocate: (input) => allocateGrokRelayRoute({ ...input, origin: "delegate" }),
+        release: async ({ routeToken, containerId, userId }) => {
+          const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
+          if (!context) return false;
+          await expireGrokRouteContextByLease(context.accountId, context.slotId);
+          scheduler.releaseCodexSlot(context.accountId, context.slotId);
+          return true;
+        },
+        renew: async ({ routeToken, containerId, userId }) => {
+          const context = await resolveGrokRouteContext({ token: routeToken, containerId, userId });
+          if (!context) return false;
+          if (!scheduler.renewCodexSlot(context.accountId, context.slotId)) {
+            scheduler.restoreCodexSlot(context.accountId, context.slotId);
+          }
+          return true;
+        },
+        logger: rootLogger.child({ subsys: "delegateGrokRoute" }),
+      });
       const zcodeRelayHandler: ZcodeRelayHandler = makeZcodeRelayHandler({
         identityRepo,
         codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",

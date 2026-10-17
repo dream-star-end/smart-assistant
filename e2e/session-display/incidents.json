@@ -7710,7 +7710,25 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/ocv5-477-collab-404-app.node-test.mjs",
           "assertion": "solo must stick after a 404 save"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelAuthorityLocalPath.test.ts",
+          "assertion": "billed_delegate runs a grok member without the selfhost exemption"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/collaborationConfigHttp.test.ts",
+          "assertion": "commercial (no exemption) serves and saves collaboration-config"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalGrokRelay.test.ts",
+          "assertion": "OCV5-477: a delegate route with no admitted billing is refused before upstream traffic"
         }
+      ],
+      "coverageCommits": [
+        "84ab6a18"
       ]
     },
     {
