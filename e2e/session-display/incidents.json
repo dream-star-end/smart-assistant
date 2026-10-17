@@ -7734,7 +7734,8 @@
       ],
       "coverageCommits": [
         "84ab6a18",
-        "0fab8a0d"
+        "0fab8a0d",
+        "7d838973"
       ]
     },
     {
@@ -7772,7 +7773,9 @@
       ],
       "coverageCommits": [
         "7ef1370c",
-        "753a51d5"
+        "753a51d5",
+        "1e7dbd6a",
+        "a8f82025"
       ]
     },
     {
@@ -7797,6 +7800,10 @@
           "path": "packages/gateway/src/engine/ccbAdapterBoxStop.test.ts",
           "assertion": "OCV5-315 only the exact continuation reject qualifies"
         }
+      ],
+      "coverageCommits": [
+        "1e3de7fd",
+        "d882229c"
       ]
     },
     {
