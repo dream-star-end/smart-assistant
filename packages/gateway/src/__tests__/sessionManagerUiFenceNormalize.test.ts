@@ -143,7 +143,7 @@ function makeSm(): SessionManager {
 const savedChannel = process.env.OC_RUNTIME_CHANNEL;
 afterEach(() => {
   setV3MasterSinkSingleton(null);
-  if (savedChannel === undefined) delete process.env.OC_RUNTIME_CHANNEL;
+  if (savedChannel === undefined) Reflect.deleteProperty(process.env, "OC_RUNTIME_CHANNEL");
   else process.env.OC_RUNTIME_CHANNEL = savedChannel;
 });
 
