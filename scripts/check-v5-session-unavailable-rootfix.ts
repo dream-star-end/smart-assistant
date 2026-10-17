@@ -29,6 +29,9 @@ const gatewaySource = [
   'delegateRuntime.ts',
   'delegateCallbacks.ts',
   'delegateSupervision.ts',
+  'advisorHandlers.ts',
+  'askUserPermissions.ts',
+  'cronTaskWebhook.ts',
 ]
   .map((f) => readFileSync(join(root, 'packages/gateway/src', f), 'utf8'))
   .join('\n')

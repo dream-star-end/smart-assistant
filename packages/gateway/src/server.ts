@@ -259,10 +259,10 @@ import {
   formatAskUserAnswerMessage,
   isDetachedAskUserPending,
   isDetachedAskUserRequestId,
-  pendingFromDetachedAskUserMessage,
+  type pendingFromDetachedAskUserMessage,
 } from './detachedAskUser.js'
 import {
-  AskUserWaiter,
+  type AskUserWaiter,
   askUserHttpUnwritable,
   askUserHttpWriteSucceeded,
   resolveAskUserWaitMs,
@@ -281,7 +281,7 @@ import { listCollaboratorAgents } from './collaboratorAgents.js'
 import {
   advisorPreamble,
   advisorExecutionFromSnapshotJson,
-  buildAdvisorSnapshot,
+  type buildAdvisorSnapshot,
   collectAuthorizedArtifacts,
   formatAdvisorConsultPrompt,
   ADVISOR_CONSULT_PARENT_ENGINES,
@@ -303,9 +303,9 @@ import {
   stripAdvisorPreambleFromInjected,
   type AdvisorConsultExecution,
 } from './advisorMode.js'
-import { AdvisorConsultStore, hashEvidence, mintConsultId } from './advisorConsultStore.js'
+import { type AdvisorConsultStore, hashEvidence, mintConsultId } from './advisorConsultStore.js'
 import {
-  AdvisorConfigStore,
+  type AdvisorConfigStore,
   CollaborationConfigError,
   resolveSessionCollab,
 } from './advisorConfigStore.js'
@@ -523,7 +523,7 @@ import {
   type DelegateGrokRouteLease,
 } from './delegateGrokRoute.js'
 import {
-  defaultDelegateEngineBilling,
+  type defaultDelegateEngineBilling,
   mapDelegateEngineBillingError,
   resolveDelegateEngineBillingEngine,
   shouldAdmitDelegateEngineBilling,
@@ -721,6 +721,9 @@ import { type SkillHandlersHost, handleSkillsList as handleSkillsListImpl, handl
 import { type DelegateCallbacksHost, _dispatchDelegateNotify as _dispatchDelegateNotifyImpl, _adoptOrphanedStdoutWaitDelegates as _adoptOrphanedStdoutWaitDelegatesImpl, _retryDelegateNotifies as _retryDelegateNotifiesImpl, _persistSendToAgentIntent as _persistSendToAgentIntentImpl, _deliverInterruptedSendToAgentIntent as _deliverInterruptedSendToAgentIntentImpl, _persistInterruptedSendToAgentCallbacks as _persistInterruptedSendToAgentCallbacksImpl, _ensureDurableSendToAgentCallback as _ensureDurableSendToAgentCallbackImpl, handleCcbLocalAgentNotification as handleCcbLocalAgentNotificationImpl, handleCcbLocalAgentDelivered as handleCcbLocalAgentDeliveredImpl, flushCcbLocalAgentPendingOnFinalize as flushCcbLocalAgentPendingOnFinalizeImpl, queueCcbLocalAgentInject as queueCcbLocalAgentInjectImpl, injectCcbLocalAgentCallback as injectCcbLocalAgentCallbackImpl, tryCcbLocalAgentCallbackDispatch as tryCcbLocalAgentCallbackDispatchImpl, _queueSendToAgentCallback as _queueSendToAgentCallbackImpl, injectSendToAgentCallback as injectSendToAgentCallbackImpl, trySendToAgentCallbackDispatch as trySendToAgentCallbackDispatchImpl, _sendToAgentCallbackTurnAlreadyQueued as _sendToAgentCallbackTurnAlreadyQueuedImpl } from './delegateCallbacks.js'
 import { type DelegateSupervisionHost, _ensureDelegateInflightSurface as _ensureDelegateInflightSurfaceImpl, _projectDelegateInflightFromJob as _projectDelegateInflightFromJobImpl, _forgetDelegateInflight as _forgetDelegateInflightImpl, _dropDelegateInflightSurface as _dropDelegateInflightSurfaceImpl, _touchDelegateInflightSurface as _touchDelegateInflightSurfaceImpl, _armDelegateReconcileFollowup as _armDelegateReconcileFollowupImpl, _armDelegateReaper as _armDelegateReaperImpl, _delegateRunnerIdle as _delegateRunnerIdleImpl, _delegateChildAlive as _delegateChildAliveImpl, _forgetEvictedDelegateResumes as _forgetEvictedDelegateResumesImpl, _completeDelegateResumeClaim as _completeDelegateResumeClaimImpl, _persistAndCloseDelegateJobs as _persistAndCloseDelegateJobsImpl } from './delegateSupervision.js'
 import { type DelegateRuntimeHost, type DelegateTaskResult, _isDelegateHttpPath as _isDelegateHttpPathImpl, _hasValidDelegateContext as _hasValidDelegateContextImpl, _ensureDelegateJobStore as _ensureDelegateJobStoreImpl, _resolveDelegateParentEngine as _resolveDelegateParentEngineImpl, _resolveDelegateProgressTarget as _resolveDelegateProgressTargetImpl, _resolveDelegateParent as _resolveDelegateParentImpl, _markDelegateAncestorActivity as _markDelegateAncestorActivityImpl, handleDelegateTask as handleDelegateTaskImpl, _delegateResultToHttp as _delegateResultToHttpImpl, handleDelegateWait as handleDelegateWaitImpl, _runDelegateTask as _runDelegateTaskImpl, _runDelegateTaskCore as _runDelegateTaskCoreImpl, _runTaskboardDelegate as _runTaskboardDelegateImpl, _readDelegateMemoryPressure as _readDelegateMemoryPressureImpl, _tryReserveDelegateSlot as _tryReserveDelegateSlotImpl, _releaseDelegateSlot as _releaseDelegateSlotImpl, _waitForDelegateCapacity as _waitForDelegateCapacityImpl, _releasePreadmittedDelegateCapacity as _releasePreadmittedDelegateCapacityImpl, _admitDelegateCreate as _admitDelegateCreateImpl, _applyDelegateCapacityReject as _applyDelegateCapacityRejectImpl } from './delegateRuntime.js'
+import { type AdvisorHandlersHost, advisorConsultStore as advisorConsultStoreImpl, _ensureConsultBillingProjection as _ensureConsultBillingProjectionImpl, advisorConfigStore as advisorConfigStoreImpl, _projectAdvisorConsultSettled as _projectAdvisorConsultSettledImpl, _adviceFromConsult as _adviceFromConsultImpl, _advisorSessionKey as _advisorSessionKeyImpl, _closeStaleConsult as _closeStaleConsultImpl, _presentConsultBody as _presentConsultBodyImpl, _presentExistingConsult as _presentExistingConsultImpl, _freezeAdvisorTurn as _freezeAdvisorTurnImpl, _invocationFromLiveConsultTool as _invocationFromLiveConsultToolImpl, handleConsultAdvisor as handleConsultAdvisorImpl, _loadConsultHistoryTape as _loadConsultHistoryTapeImpl, _resolveAdvisorConsultExecution as _resolveAdvisorConsultExecutionImpl, _spawnCcbAdvisorConsult as _spawnCcbAdvisorConsultImpl, _advisorConsultRouteOverride as _advisorConsultRouteOverrideImpl, _spawnAdvisorConsult as _spawnAdvisorConsultImpl } from './advisorHandlers.js'
+import { type AskUserPermissionsHost, handlePermissionResponse as handlePermissionResponseImpl, _broadcastPermissionSettled as _broadcastPermissionSettledImpl, handleEngineAskUser as handleEngineAskUserImpl, _finishInWindowAskUserWait as _finishInWindowAskUserWaitImpl, _compensateInWindowAskUserAnswer as _compensateInWindowAskUserAnswerImpl, _persistDetachedAskUserCard as _persistDetachedAskUserCardImpl, _patchDetachedAskUserResolved as _patchDetachedAskUserResolvedImpl, _loadDetachedAskUserCard as _loadDetachedAskUserCardImpl, _hydrateDetachedAskUserPending as _hydrateDetachedAskUserPendingImpl, _submitDetachedAskUserAnswer as _submitDetachedAskUserAnswerImpl, _forceDenyPendingPermission as _forceDenyPendingPermissionImpl, _reapCrashedSessionPendingPermissions as _reapCrashedSessionPendingPermissionsImpl, _settlePendingPermissionsForStop as _settlePendingPermissionsForStopImpl, _autoDenyPendingPermissions as _autoDenyPendingPermissionsImpl, _sweepStalePendingPermissions as _sweepStalePendingPermissionsImpl } from './askUserPermissions.js'
+import { type CronTaskWebhookHost, _drainFlagOffCronOriginNotifies as _drainFlagOffCronOriginNotifiesImpl, _handleWebhook as _handleWebhookImpl, _handleTasksApi as _handleTasksApiImpl, _handleTaskItem as _handleTaskItemImpl, _triggerTask as _triggerTaskImpl, injectCronOriginFromTerminal as injectCronOriginFromTerminalImpl, injectCronOriginSession as injectCronOriginSessionImpl, cronProjectPorts as cronProjectPortsImpl, stampCronProject as stampCronProjectImpl, handleCronChannels as handleCronChannelsImpl, handleCronApi as handleCronApiImpl, handleCronItem as handleCronItemImpl } from './cronTaskWebhook.js'
 export { GATEWAY_PENDING_PERMISSION_TTL_MS, BLOCKING_USER_INPUT_TOOLS, _isBlockingUserInputTool, _permissionRequestExpiresAt, type PendingPermissionCatchupEntry, _pendingPermissionCatchupFrames, parsePermissionLookupQuery, projectRuntimePermissionSnapshot, attachPermissionSnapshotIfMissing } from './pendingPermissionSnapshot.js'
 
 // User-Agent for gateway-internal Claude OAuth fetch (token exchange + refresh).
@@ -2171,6 +2174,10 @@ export function normalizeAutoDreamSchedule(
 export function shouldLogHttpAccess(path: string, status: number, durationMs: number): boolean {
   if (path === '/healthz' || path === '/metrics') return status !== 200 || durationMs >= 1000
   return path.startsWith('/api/') || path.startsWith('/v1/')
+}
+
+export function makePeerKey(userId: string, channel: string, peerId: string): string {
+  return `${userId}:${channel}:${peerId}`
 }
 
 export class Gateway {
@@ -5080,9 +5087,8 @@ export class Gateway {
    *  non-unique) peerId cannot receive each other's broadcasts. Individual
    *  clients are already scoped by userId via SQLite `client_sessions`, but
    *  WS-layer `clientsByPeer` wasn't — this closes that gap. */
-  private static makePeerKey(userId: string, channel: string, peerId: string): string {
-    return `${userId}:${channel}:${peerId}`
-  }
+  // Pure; lifted to module scope (FINDINGS §7.6 S4) so code moved out of the class can call it.
+  private static makePeerKey = makePeerKey
 
   /** Check if the request arrived over HTTPS (direct TLS or behind a trusted reverse proxy like cloudflared).
    * X-Forwarded-Proto is only trusted when the connection originates from a loopback address (127.0.0.1 / ::1),
@@ -6902,33 +6908,8 @@ export class Gateway {
    * cron-origin-inject rows. Drain them with the same dlgcb.* ResumeInject
    * path so BUSY leftovers are not stranded (review blocker 1 on→off).
    */
-  private async _drainFlagOffCronOriginNotifies(opts: { dueOnly?: boolean } = {}): Promise<void> {
-    const store = this._delegateJobs
-    if (!store || isDelegateNotifierEffective() || !isDelegateDurableEffective()) return
-    const notifier = new DefaultEngineNotifier({
-      resumeInject: {
-        inject: async (event) => {
-          const result = await this.injectCronOriginFromTerminal(event)
-          if (result.kind === 'injected') return { ok: true }
-          if (result.kind === 'retryable_failure' && result.code === 'ORIGIN_SESSION_BUSY') {
-            return { ok: false, failureClass: 'internal' as const, busy: true }
-          }
-          if (result.kind === 'fallback') {
-            return { ok: false, failureClass: 'transport' as const, gone: true }
-          }
-          return { ok: false, failureClass: 'transport' as const }
-        },
-      },
-    })
-    try {
-      const summary = await retryPendingNotifies(store, notifier, this._notifyDispatchHooks(), {
-        ...opts,
-        callbacks: ['cron-origin-inject'],
-      })
-      if (summary.scanned > 0) this.log.info('flag-off cron-origin drain', summary)
-    } catch (err) {
-      this.log.warn('flag-off cron-origin drain threw', undefined, err as Error)
-    }
+  private _drainFlagOffCronOriginNotifies(opts: { dueOnly?: boolean } = {}): Promise<void> {
+    return _drainFlagOffCronOriginNotifiesImpl.call(this as unknown as CronTaskWebhookHost, opts)
   }
 
   private _armNotifyRetryScheduler(): void {
@@ -7243,40 +7224,15 @@ export class Gateway {
   }
 
   private advisorConsultStore(): AdvisorConsultStore {
-    const store = (this._advisorConsults ??= new AdvisorConsultStore())
-    const billing = this._delegateEngineBilling ?? defaultDelegateEngineBilling
-    this._ensureConsultBillingProjection(store, billing)
-    return store
+    return advisorConsultStoreImpl.call(this as unknown as AdvisorHandlersHost)
   }
 
-  private _ensureConsultBillingProjection(
-    store: AdvisorConsultStore,
-    billing: typeof defaultDelegateEngineBilling,
-  ): void {
-    if (this._consultBillingProjecting) return
-    this._consultBillingProjecting = true
-    const retryMsRaw = Number(this._consultBillingRetryMs)
-    const retryMs = Number.isFinite(retryMsRaw) && retryMsRaw > 0 ? retryMsRaw : 250
-    void Promise.resolve(billing.projectConsults?.(store))
-      .catch((err) => {
-        this.log.warn('advisor_consult_billing_projection_failed', {
-          err: String((err as Error)?.message ?? err),
-        })
-        if (this._consultBillingRetryTimer) return
-        this._consultBillingRetryTimer = setTimeout(() => {
-          this._consultBillingRetryTimer = undefined
-          this._consultBillingProjecting = false
-          this._ensureConsultBillingProjection(store, billing)
-        }, retryMs)
-        this._consultBillingRetryTimer.unref?.()
-      })
-      .finally(() => {
-        this._consultBillingProjecting = false
-      })
+  private _ensureConsultBillingProjection(store: AdvisorConsultStore, billing: typeof defaultDelegateEngineBilling): void {
+    _ensureConsultBillingProjectionImpl.call(this as unknown as AdvisorHandlersHost, store, billing)
   }
 
   private advisorConfigStore(): AdvisorConfigStore {
-    return (this._advisorConfig ??= new AdvisorConfigStore())
+    return advisorConfigStoreImpl.call(this as unknown as AdvisorHandlersHost)
   }
 
   private _liveMainSessionForClient(sessionId: string, userId: string): AgentSession | undefined {
@@ -7334,9 +7290,7 @@ export class Gateway {
   }
 
   private _projectAdvisorConsultSettled(billing: { requestId?: string }): void {
-    const requestId = typeof billing.requestId === 'string' ? billing.requestId : ''
-    if (!requestId || !this._advisorConsults) return
-    this._advisorConsults.projectOneReceipt(requestId)
+    _projectAdvisorConsultSettledImpl.call(this as unknown as AdvisorHandlersHost, billing)
   }
 
   private _collaborationCapabilityFields(input: {
@@ -7363,11 +7317,7 @@ export class Gateway {
     advice?: string | null
     jobId?: string | null
   }): string {
-    if (typeof record.advice === 'string' && record.advice) return record.advice
-    if (!record.jobId) return ''
-    const view = this._ensureDelegateJobStore().get(record.jobId)
-    const body = view.status === 'done' || view.status === 'failed' ? view.body : undefined
-    return typeof body?.advice === 'string' ? body.advice : ''
+    return _adviceFromConsultImpl.call(this as unknown as AdvisorHandlersHost, record)
   }
 
   private _consultJobFailedState(view: {
@@ -7387,7 +7337,7 @@ export class Gateway {
   }
 
   private _advisorSessionKey(record: { originTurnKey: string; consultId: string }): string {
-    return `advisor:${record.originTurnKey}:${record.consultId}`
+    return _advisorSessionKeyImpl.call(this as unknown as AdvisorHandlersHost, record)
   }
 
   private _consultStillLive(record: { originTurnKey: string; consultId: string; jobId?: string | null }): boolean {
@@ -7403,670 +7353,48 @@ export class Gateway {
     return view?.status === 'running' || view?.status === 'queued'
   }
 
-  private _closeStaleConsult(
-    record: import('./advisorConsultStore.js').AdvisorConsultRecord,
-  ): import('./advisorConsultStore.js').AdvisorConsultRecord {
-    const terminal = new Set(['settled', 'settle_pending', 'completed', 'failed', 'cancelled', 'admission_unknown'])
-    if (terminal.has(record.state)) return record
-    if (this._consultStillLive(record)) return record
-    const jobs = this._delegateJobs
-    const view = record.jobId && jobs ? jobs.get(record.jobId) : undefined
-    if (view && (view.status === 'running' || view.status === 'queued')) return record
-    const advice = this._adviceFromConsult(record)
-    const ccb = advisorExecutionFromSnapshotJson(record.snapshotJson)?.engine === 'ccb'
-    if (ccb) {
-      const failed = view ? this._consultJobFailedState(view) : 'failed'
-      const state = failed ?? 'failed'
-      return this.advisorConsultStore().update(record.consultId, { state, advice: advice || null })
-    }
-    if (view?.status === 'done' && !this._consultJobFailedState(view) && advice) {
-      return this.advisorConsultStore().update(record.consultId, { state: 'settled', advice })
-    }
-    const failed = view ? this._consultJobFailedState(view) : 'failed'
-    const state = failed ?? 'failed'
-    return this.advisorConsultStore().update(record.consultId, { state, advice: advice || null })
+  private _closeStaleConsult(record: import('./advisorConsultStore.js').AdvisorConsultRecord): import('./advisorConsultStore.js').AdvisorConsultRecord {
+    return _closeStaleConsultImpl.call(this as unknown as AdvisorHandlersHost, record)
   }
 
-  private _presentConsultBody(
-    current: import('./advisorConsultStore.js').AdvisorConsultRecord,
-    extra: Record<string, unknown> = {},
-  ): Record<string, unknown> {
-    const advice = this._adviceFromConsult(current)
-    const ccb = advisorExecutionFromSnapshotJson(current.snapshotJson)?.engine === 'ccb'
-    return {
-      status: current.state,
-      consultId: current.consultId,
-      jobId: current.jobId,
-      requestId: current.billingRequestId,
-      invocationId: current.invocationId,
-      advisorModel: current.advisorModel,
-      advice: advice || undefined,
-      reused: true,
-      recoverable: true,
-      ...(current.state === 'completed' || ccb ? { billingMode: 'proxy' } : {}),
-      error:
-        current.state === 'failed' || current.state === 'cancelled'
-          ? current.state
-          : current.state === 'settle_pending'
-            ? 'settle_pending'
-            : undefined,
-      ...extra,
-    }
+  private _presentConsultBody(current: import('./advisorConsultStore.js').AdvisorConsultRecord, extra: Record<string, unknown> = {}): Record<string, unknown> {
+    return _presentConsultBodyImpl.call(this as unknown as AdvisorHandlersHost, current, extra)
   }
 
-  private async _presentExistingConsult(input: {
+  private _presentExistingConsult(input: {
     record: import('./advisorConsultStore.js').AdvisorConsultRecord
     question: string
     concern: string
   }): Promise<{ status: number; body: Record<string, unknown> }> {
-    const { record } = input
-    if (!matchConsultIdentity(record, { question: input.question, concern: input.concern })) {
-      return { status: 409, body: { error: 'invocation 与 question/concern 不一致' } }
-    }
-    if (record.state === 'admission_unknown') {
-      return {
-        status: 503,
-        body: {
-          error: '顾问准入不确定，不重复 admit',
-          consultId: record.consultId,
-          state: 'admission_unknown',
-          reused: true,
-        },
-      }
-    }
-    const terminal = new Set(['settled', 'settle_pending', 'completed', 'failed', 'cancelled'])
-    const ccbConsult = advisorExecutionFromSnapshotJson(record.snapshotJson)?.engine === 'ccb'
-    const deadline = Date.now() + this._consultWaitMs()
-    let current = record
-    while (Date.now() <= deadline) {
-      current = this.advisorConsultStore().findById(current.consultId) ?? current
-      const advice = this._adviceFromConsult(current)
-      if (terminal.has(current.state) || (advice && !ccbConsult)) {
-        return { status: 200, body: this._presentConsultBody(current) }
-      }
-      if (current.jobId) {
-        const jobs = this._ensureDelegateJobStore()
-        const view = await jobs.wait(current.jobId, Math.min(5_000, Math.max(0, deadline - Date.now())))
-        current = this.advisorConsultStore().findById(current.consultId) ?? current
-        const failed = this._consultJobFailedState(view)
-        if (failed) {
-          current = this.advisorConsultStore().update(current.consultId, {
-            state: failed,
-            advice: this._adviceFromConsult(current) || null,
-          })
-          return { status: 200, body: this._presentConsultBody(current) }
-        }
-        const waitedAdvice =
-          this._adviceFromConsult(current) ||
-          ((view.status === 'done' || view.status === 'failed') && typeof view.body?.advice === 'string'
-            ? view.body.advice
-            : '')
-        if (waitedAdvice || terminal.has(current.state)) {
-          if (waitedAdvice && !terminal.has(current.state) && !ccbConsult) {
-            current = this.advisorConsultStore().update(current.consultId, {
-              state: 'settled',
-              advice: waitedAdvice,
-            })
-          }
-          return { status: 200, body: this._presentConsultBody(current, { advice: waitedAdvice || undefined }) }
-        }
-        if (view.status === 'expired') {
-          current = this._closeStaleConsult(current)
-          if (terminal.has(current.state)) {
-            return { status: 200, body: this._presentConsultBody(current) }
-          }
-        }
-      } else {
-        await new Promise((resolve) => setTimeout(resolve, 20))
-      }
-    }
-    current = this.advisorConsultStore().findById(record.consultId) ?? record
-    if (terminal.has(current.state) || (this._adviceFromConsult(current) && !ccbConsult)) {
-      return { status: 200, body: this._presentConsultBody(current) }
-    }
-    if (!this._consultStillLive(current)) {
-      current = this._closeStaleConsult(current)
-      if (terminal.has(current.state) || (this._adviceFromConsult(current) && !ccbConsult)) {
-        return { status: 200, body: this._presentConsultBody(current) }
-      }
-    }
-    return {
-      status: 202,
-      body: {
-        status: 'pending',
-        consultId: current.consultId,
-        jobId: current.jobId,
-        requestId: current.billingRequestId,
-        invocationId: current.invocationId,
-        reused: true,
-        recoverable: true,
-      },
-    }
+    return _presentExistingConsultImpl.call(this as unknown as AdvisorHandlersHost, input)
   }
 
-  private async _freezeAdvisorTurn(
-    requested: string,
-  ): Promise<{ ok: true; advisorModel: string } | { ok: false; error: string }> {
-    try {
-      const collabDoc = this.advisorConfigStore().read()
-      const proven = [...openAdvisorEngines(), ...(collabDoc.provenEngines ?? [])]
-      const view = await getLocalCatalogView()
-      const listed = listProvenAdvisorModels({
-        catalog: view.models,
-        provenEngines: proven,
-        provenCcbModels: collabDoc.provenCcbModels,
-      })
-      const allowed = assertAdvisorModelAllowed({
-        requested,
-        advisorModels: listed.advisorModels,
-        unavailableReason: listed.advisorUnavailableReason,
-      })
-      if (!allowed.ok) return allowed
-      return { ok: true, advisorModel: allowed.model }
-    } catch (err) {
-      return {
-        ok: false,
-        error: `catalog unavailable: ${String((err as Error)?.message ?? err)}`,
-      }
-    }
+  private _freezeAdvisorTurn(requested: string): Promise<{ ok: true; advisorModel: string } | { ok: false; error: string }> {
+    return _freezeAdvisorTurnImpl.call(this as unknown as AdvisorHandlersHost, requested)
   }
 
-  private async _invocationFromLiveConsultTool(parent: {
+  private _invocationFromLiveConsultTool(parent: {
     runner?: { getPartialSnapshot?: () => { completedTools?: unknown[] } }
   } | undefined): Promise<{ ok: true; invocationId: string } | { ok: false; reason: 'none' | 'ambiguous' }> {
-    const read = () => {
-      const tools = parent?.runner?.getPartialSnapshot?.()?.completedTools
-      return uniquePendingConsultInvocationId(Array.isArray(tools) ? (tools as never) : [])
-    }
-    let found = read()
-    for (let i = 0; !found.ok && found.reason === 'none' && i < 8; i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 50))
-      found = read()
-    }
-    return found
+    return _invocationFromLiveConsultToolImpl.call(this as unknown as AdvisorHandlersHost, parent)
   }
 
-  private async handleConsultAdvisor(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (!isEngineLocalTurnExempt()) return this.sendError(res, 404, 'advisor consult is selfhost only')
-    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
-    const body = await this.readBody(req)
-    let parsed: { question?: unknown; concern?: unknown }
-    try {
-      parsed = JSON.parse(body) as { question?: unknown; concern?: unknown }
-    } catch {
-      return this.sendError(res, 400, 'invalid JSON')
-    }
-    const question = typeof parsed.question === 'string' ? parsed.question.trim() : ''
-    const concern = typeof parsed.concern === 'string' ? parsed.concern.trim() : ''
-    if (!question) return this.sendError(res, 400, 'question 必填')
-    const contextRaw = req.headers[DELEGATE_CONTEXT_HEADER]
-    const token = Array.isArray(contextRaw) ? contextRaw[0] : contextRaw
-    const inspected = inspectConsultTurnToken(typeof token === 'string' ? token : undefined)
-    if (!inspected) {
-      return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
-    }
-    const claims = inspected.claims
-    const invocationRaw = req.headers[CONSULT_INVOCATION_HEADER]
-    const headerInvocation = (Array.isArray(invocationRaw) ? invocationRaw[0] : invocationRaw)?.trim() ?? ''
-    if (headerInvocation && !/^[A-Za-z0-9:_-]{8,128}$/.test(headerInvocation)) {
-      return this.sendError(res, 400, 'x-openclaude-consult-invocation invalid')
-    }
-    let invocationId = headerInvocation
-    if (!invocationId) {
-      const liveParent = this.sessions?.getByKey(claims.sessionKey)
-      const bound = await this._invocationFromLiveConsultTool(liveParent)
-      if (!bound.ok) {
-        const message = bound.reason === 'ambiguous'
-          ? '这一轮有多次顾问提问叠在一起，请一次只问一个。主模型不会被切换。'
-          : '这次顾问提问还没对上同一次调用，请再问一次。主模型不会被切换。'
-        return this.sendError(res, 409, message)
-      }
-      invocationId = bound.invocationId
-    }
-    const userId = String(this.getUserId(req) ?? '')
-    if (!userId) return this.sendError(res, 401, 'missing user')
-    const store = this.advisorConsultStore()
-    const existing = store.findByInvocation({
-      userId,
-      originTurnKey: claims.turnKey,
-      invocationId,
-    })
-    if (existing) {
-      if (existing.sessionKey !== claims.sessionKey || existing.configVersion !== claims.configVersion) {
-        return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
-      }
-      const presentedReceipt = hashConsultTurnToken(String(token))
-      const storedReceipt = typeof existing.tokenReceipt === 'string' ? existing.tokenReceipt.trim() : ''
-      const receiptMatches = storedReceipt.length > 0 && storedReceipt === presentedReceipt
-      // HMAC-ok: live process may present a same-user row. If a receipt was
-      // recorded, it must still be the exact original token hash (no remint).
-      // HMAC-fail: only the exact stored receipt recovers; no-receipt rows 401.
-      if (inspected.hmacOk) {
-        if (storedReceipt && !receiptMatches) {
-          return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
-        }
-      } else if (!receiptMatches) {
-        return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
-      }
-      const presented = await this._presentExistingConsult({ record: existing, question, concern })
-      return this.sendJson(res, presented.status, presented.body)
-    }
-    if (!inspected.hmacOk) {
-      return this.sendError(res, 401, 'advisor consult requires an immutable turn token')
-    }
-    const parent = this.sessions?.getByKey(claims.sessionKey)
-    if (!parent || parent.agentId !== 'main' || parent._collabModeTurn !== 'advisor' || !parent._advisorTurn) {
-      return this.sendError(res, 409, '当前回合不是顾问模式，无法咨询')
-    }
-    if (!isAdvisorConsultParentEngine(parent.providerTag)) {
-      return this.sendError(res, 409, ADVISOR_CONSULT_PARENT_REASON)
-    }
-    if (parent._currentTurnKey !== claims.turnKey) {
-      return this.sendError(res, 409, '原回合已结束，不能再发起新的顾问咨询')
-    }
-    if (String(parent.userId ?? '') && String(parent.userId) !== userId) {
-      return this.sendError(res, 401, 'missing user')
-    }
-    const snap = parent.runner.getPartialSnapshot()
-    const currentTools = snap.completedTools?.map((tool) => ({
-      name: tool.toolName,
-      input: tool.inputJson,
-      result: typeof tool.output === 'string' ? tool.output : JSON.stringify(tool.output ?? ''),
-      completed: tool.completed !== false,
-    }))
-    const frozen = {
-      userId,
-      sessionKey: claims.sessionKey,
-      originTurnKey: claims.turnKey,
-      originTurnIndex: claims.turnIndex,
-      configVersion: claims.configVersion,
-      advisorModel: parent._advisorTurn.advisorModel,
-      userTask: parent._currentTurnUserText ?? '',
-      constraints: parent._injectedTurnConstraints,
-      currentTools,
-      peerId: parent.peerId,
-    }
-    const consultId = mintConsultId()
-    const advisorSessionKey = `advisor:${frozen.originTurnKey}:${consultId}`
-    const abort = new AbortController()
-    ;(this._advisorConsultAborts ??= new Map()).set(advisorSessionKey, abort)
-    const unregisterEarly = this._registerActiveDelegation(frozen.sessionKey, advisorSessionKey)
-    const originIntact = (): boolean => {
-      if (abort.signal.aborted) return false
-      const live = this.sessions?.getByKey(frozen.sessionKey)
-      if (!live) return false
-      if (live._currentTurnKey !== frozen.originTurnKey) return false
-      if (live._collabModeTurn !== 'advisor') return false
-      return true
-    }
-    const releaseEarly = (): void => {
-      this._advisorConsultAborts?.delete(advisorSessionKey)
-      unregisterEarly?.()
-    }
-    let handedToSpawn = false
-    let recordedConsultId: string | undefined
-    try {
-    let historyRecords: ReturnType<typeof historyFromSessionMessages>['records']
-    let historyMissing: string[] = []
-    try {
-      const page = await this._loadConsultHistoryTape(frozen.peerId, frozen.userId, frozen.originTurnKey)
-      if (page?.records) {
-        const hist = historyFromSessionMessages(page.records, { hasMore: page.nextCursor != null })
-        historyRecords = hist.records
-        historyMissing = hist.missing
-      }
-    } catch {
-      /* sqlite stub returns null; PG errors fall through to client session */
-    }
-    if (!historyRecords) {
-      try {
-        const tape = await this._loadClientSession(frozen.peerId, frozen.userId)
-        const hist = historyFromSessionMessages(coerceHistoryMessages(tape?.messages), {
-          archivedThroughSeq: tape?.archivedThroughSeq,
-          hasMore: tape?.timelineHasMore,
-        })
-        historyRecords = hist.records
-        historyMissing = [...historyMissing, ...hist.missing]
-      } catch {
-        historyMissing = ['history_tape']
-      }
-    }
-    if (!originIntact()) {
-      releaseEarly()
-      return this.sendJson(res, 409, {
-        error: abort.signal.aborted ? 'parent Stop' : '原回合已结束，不能再发起新的顾问咨询',
-        state: 'cancelled',
-      })
-    }
-    const snapshot = buildAdvisorSnapshot({
-      question,
-      concern,
-      advisorModel: frozen.advisorModel,
-      source: {
-        userTask: frozen.userTask,
-        injectedConstraints: frozen.constraints,
-        historyRecords,
-        currentTools: frozen.currentTools,
-        authorizedArtifacts: collectAuthorizedArtifacts({
-          generatedRoot: paths.generatedDir,
-          mentioned: parentAuthorizedArtifactTexts({
-            userTask: frozen.userTask,
-            currentTools: frozen.currentTools,
-          }),
-        }),
-      },
-    })
-    for (const item of historyMissing) {
-      if (!snapshot.missing.includes(item)) snapshot.missing.push(item)
-    }
-    const snapshotJson = JSON.stringify(snapshot)
-    const inserted = store.insertNew({
-      consultId,
-      invocationId,
-      userId: frozen.userId,
-      sessionKey: frozen.sessionKey,
-      clientSessionId: frozen.peerId,
-      originTurnKey: frozen.originTurnKey,
-      originTurnIndex: frozen.originTurnIndex,
-      configVersion: frozen.configVersion,
-      evidenceVersion: hashEvidence(snapshotJson),
-      advisorModel: frozen.advisorModel,
-      question,
-      concern,
-      snapshotJson,
-      jobId: null,
-      billingRequestId: null,
-      state: 'accepted',
-      tokenReceipt: hashConsultTurnToken(String(token)),
-    })
-    recordedConsultId = inserted.record.consultId
-    if (inserted.reused) {
-      releaseEarly()
-      const presented = await this._presentExistingConsult({
-        record: inserted.record,
-        question,
-        concern,
-      })
-      return this.sendJson(res, presented.status, presented.body)
-    }
-    const resolvedExec = await this._resolveAdvisorConsultExecution(frozen.advisorModel)
-    if (!resolvedExec.ok) {
-      releaseEarly()
-      store.update(inserted.record.consultId, { state: 'failed' })
-      return this.sendJson(res, resolvedExec.status, {
-        error: resolvedExec.error,
-        consultId: inserted.record.consultId,
-      })
-    }
-    snapshot.execution = resolvedExec.value
-    store.update(inserted.record.consultId, { snapshotJson: JSON.stringify(snapshot) })
-    if (resolvedExec.value.engine === 'ccb') {
-      if (!originIntact()) {
-        releaseEarly()
-        store.update(inserted.record.consultId, { state: 'cancelled' })
-        return this.sendJson(res, 409, { error: 'parent Stop', state: 'cancelled', consultId })
-      }
-      handedToSpawn = true
-      const spawned = await this._spawnCcbAdvisorConsult({
-        consultId: inserted.record.consultId,
-        parent,
-        originTurnKey: frozen.originTurnKey,
-        snapshot,
-        execution: resolvedExec.value,
-        abort,
-        unregister: unregisterEarly,
-      })
-      return this.sendJson(res, 200, {
-        status: spawned.state,
-        consultId: inserted.record.consultId,
-        jobId: spawned.jobId,
-        advice: spawned.advice,
-        advisorModel: frozen.advisorModel,
-        billingMode: 'proxy',
-        missing: snapshot.missing,
-        truncated: snapshot.truncated,
-        error: spawned.error,
-      })
-    }
-    const proven = this.advisorConfigStore().read().provenEngines
-    if (!isAdvisorEngineOpen('codex', process.env, proven)) {
-      releaseEarly()
-      store.update(inserted.record.consultId, { state: 'failed' })
-      return this.sendJson(res, 503, {
-        error: '顾问引擎尚未完成无工具证明，不能咨询',
-        consultId: inserted.record.consultId,
-      })
-    }
-    if (!originIntact()) {
-      releaseEarly()
-      store.update(inserted.record.consultId, { state: 'cancelled' })
-      return this.sendJson(res, 409, { error: 'parent Stop', state: 'cancelled', consultId })
-    }
-    store.update(inserted.record.consultId, { state: 'admission_attempt' })
-    const billingApi = this._delegateEngineBilling ?? defaultDelegateEngineBilling
-    let admission: DelegateEngineBillingAdmission
-    try {
-      admission = await billingApi.admit({
-        model: frozen.advisorModel,
-        engine: 'codex',
-        agentId: ADVISOR_AGENT_ID,
-        delegateAgentId: ADVISOR_AGENT_ID,
-        sessionKey: advisorSessionKey,
-        parentSessionId: frozen.peerId,
-        parentTurnKey: frozen.originTurnKey,
-      })
-    } catch (err) {
-      releaseEarly()
-      store.update(inserted.record.consultId, { state: 'admission_unknown' })
-      return this.sendJson(res, 503, {
-        error: `顾问准入不确定，不重复 admit: ${String((err as Error)?.message ?? err)}`,
-        consultId: inserted.record.consultId,
-        state: 'admission_unknown',
-      })
-    }
-    if (!originIntact()) {
-      try {
-        await billingApi.abandon(admission.requestId)
-        store.update(inserted.record.consultId, {
-          state: 'cancelled',
-          billingRequestId: admission.requestId,
-        })
-        releaseEarly()
-        return this.sendJson(res, 409, {
-          error: 'parent Stop',
-          state: 'cancelled',
-          consultId: inserted.record.consultId,
-          requestId: admission.requestId,
-        })
-      } catch {
-        store.update(inserted.record.consultId, {
-          state: 'admission_unknown',
-          billingRequestId: admission.requestId,
-        })
-        releaseEarly()
-        return this.sendJson(res, 503, {
-          error: '已准入但父回合已停止，abandon 不确定',
-          consultId: inserted.record.consultId,
-          state: 'admission_unknown',
-          requestId: admission.requestId,
-        })
-      }
-    }
-    const parsedRoute = parseAdvisorAdmitRoute(admission.route)
-    const codexRoute = parsedRoute.ok
-      ? this._advisorConsultRouteOverride(parsedRoute.route, frozen.advisorModel)
-      : null
-    if (!codexRoute) {
-      try {
-        await billingApi.abandon(admission.requestId)
-        store.update(inserted.record.consultId, {
-          state: 'failed',
-          billingRequestId: admission.requestId,
-        })
-        releaseEarly()
-        return this.sendJson(res, 503, {
-          error: '顾问路由不可用，已按原 requestId abandon',
-          consultId: inserted.record.consultId,
-          state: 'failed',
-          requestId: admission.requestId,
-        })
-      } catch {
-        store.update(inserted.record.consultId, {
-          state: 'admission_unknown',
-          billingRequestId: admission.requestId,
-        })
-        releaseEarly()
-        return this.sendJson(res, 503, {
-          error: '已准入但顾问路由不可用，abandon 不确定',
-          consultId: inserted.record.consultId,
-          state: 'admission_unknown',
-          requestId: admission.requestId,
-        })
-      }
-    }
-    try {
-      store.update(inserted.record.consultId, {
-        state: 'admitted',
-        billingRequestId: admission.requestId,
-      })
-    } catch (err) {
-      try {
-        await billingApi.abandon(admission.requestId)
-      } catch {
-        store.update(inserted.record.consultId, {
-          state: 'admission_unknown',
-          billingRequestId: admission.requestId,
-        })
-        releaseEarly()
-        return this.sendJson(res, 503, {
-          error: '已准入但绑定落盘失败，已尝试 abandon',
-          consultId: inserted.record.consultId,
-          state: 'admission_unknown',
-        })
-      }
-      store.update(inserted.record.consultId, { state: 'failed' })
-      releaseEarly()
-      return this.sendError(res, 500, 'consult persist after admit failed')
-    }
-    handedToSpawn = true
-    const spawned = await this._spawnAdvisorConsult({
-      consultId: inserted.record.consultId,
-      parent,
-      originTurnKey: frozen.originTurnKey,
-      snapshot,
-      requestId: admission.requestId,
-      billingApi,
-      abort,
-      unregister: unregisterEarly,
-      codexRoute,
-    })
-    return this.sendJson(res, 200, {
-      status: spawned.state,
-      consultId: inserted.record.consultId,
-      requestId: admission.requestId,
-      jobId: spawned.jobId,
-      advice: spawned.advice,
-      advisorModel: frozen.advisorModel,
-      ...(spawned.usage ? { usage: spawned.usage } : {}),
-      missing: snapshot.missing,
-      truncated: snapshot.truncated,
-      error: spawned.error,
-    })
-    } catch (err) {
-      if (recordedConsultId) {
-        const rec = store.findById(recordedConsultId)
-        if (
-          rec &&
-          !rec.billingRequestId &&
-          (rec.state === 'accepted' || rec.state === 'admission_attempt')
-        ) {
-          try {
-            store.update(recordedConsultId, { state: 'failed' })
-          } catch {
-            /* best-effort close of a never-admitted row */
-          }
-        }
-      }
-      return this.sendError(res, 500, String((err as Error)?.message ?? err))
-    } finally {
-      if (!handedToSpawn) releaseEarly()
-    }
+  private handleConsultAdvisor(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    return handleConsultAdvisorImpl.call(this as unknown as AdvisorHandlersHost, req, res)
   }
 
-  private async _loadConsultHistoryTape(peerId: string, userId: string, turnKey: string) {
-    return listTurnTapeRecords(peerId, userId, turnKey, 0, 80)
+  private _loadConsultHistoryTape(peerId: string, userId: string, turnKey: string) {
+    return _loadConsultHistoryTapeImpl.call(this as unknown as AdvisorHandlersHost, peerId, userId, turnKey)
   }
 
-  private async _resolveAdvisorConsultExecution(
-    advisorModel: string,
-  ): Promise<
+  private _resolveAdvisorConsultExecution(advisorModel: string): Promise<
     | { ok: true; value: AdvisorConsultExecution }
     | { ok: false; error: string; status: number }
   > {
-    const store = this.advisorConfigStore().read()
-    if (!isModelAuthorityRequired()) {
-      const baked = resolveEngine(advisorModel, { id: ADVISOR_AGENT_ID })
-      if (baked === 'codex' && isAdvisorEngineOpen('codex', process.env, store.provenEngines)) {
-        return {
-          ok: true,
-          value: { modelId: advisorModel, engine: 'codex', providerId: 'codex' },
-        }
-      }
-    }
-    try {
-      const view = await getLocalCatalogView()
-      const row = view.resolve(view.canonicalize(advisorModel))
-      if (!row || row.available === false) {
-        return { ok: false, status: 400, error: '顾问型号不在当前 catalog' }
-      }
-      if (row.engine === 'ccb') {
-        const providerId = (row.providerId ?? '').trim()
-        if (
-          !isCcbAdvisorModelProven({
-            modelId: row.modelId,
-            providerId,
-            provenCcbModels: store.provenCcbModels,
-          })
-        ) {
-          return { ok: false, status: 503, error: '该 CCB 顾问型号尚未完成无工具证明' }
-        }
-        return {
-          ok: true,
-          value: {
-            modelId: row.modelId,
-            engine: 'ccb',
-            providerId,
-            profileVersion: CCB_ADVISOR_PROFILE_VERSION,
-          },
-        }
-      }
-      if (row.engine === 'codex') {
-        if (!isAdvisorEngineOpen('codex', process.env, store.provenEngines)) {
-          return { ok: false, status: 503, error: '顾问引擎尚未完成无工具证明，不能咨询' }
-        }
-        return {
-          ok: true,
-          value: {
-            modelId: row.modelId,
-            engine: 'codex',
-            providerId: (row.providerId ?? 'codex').trim() || 'codex',
-          },
-        }
-      }
-      return { ok: false, status: 409, error: '顾问型号引擎不是已证明的 Codex 或 CCB' }
-    } catch (err) {
-      // Authority mode: catalog failure is always fail-closed.
-      // Non-authority Codex already returned via baked resolveEngine above;
-      // CCB/unknown must not inherit a proven Codex engine.
-      return {
-        ok: false,
-        status: 503,
-        error: `catalog unavailable: ${String((err as Error)?.message ?? err)}`,
-      }
-    }
+    return _resolveAdvisorConsultExecutionImpl.call(this as unknown as AdvisorHandlersHost, advisorModel)
   }
 
-  private async _spawnCcbAdvisorConsult(input: {
+  private _spawnCcbAdvisorConsult(input: {
     consultId: string
     parent: AgentSession
     originTurnKey: string
@@ -8080,290 +7408,14 @@ export class Gateway {
     jobId?: string
     error?: string
   }> {
-    const consultStore = this.advisorConsultStore()
-    const advisorSessionKey = `advisor:${input.originTurnKey}:${input.consultId}`
-    const slotOpts = { parentBucketKey: input.parent.sessionKey, isReview: false }
-    const unregister =
-      input.unregister ?? this._registerActiveDelegation(input.parent.sessionKey, advisorSessionKey)
-    const abort = input.abort ?? new AbortController()
-    ;(this._advisorConsultAborts ??= new Map()).set(advisorSessionKey, abort)
-    let slotHeld = false
-    let jobId: string | undefined
-    let jobs: DelegateJobStore | undefined
-    let advice = ''
-    let toolViolation = false
-    const cancelIfAborted = async (): Promise<{
-      state: string
-      advice: string
-      jobId?: string
-      error?: string
-    } | null> => {
-      const liveParent = this.sessions?.getByKey(input.parent.sessionKey)
-      const originGone =
-        abort.signal.aborted ||
-        !liveParent ||
-        liveParent._currentTurnKey !== input.originTurnKey
-      if (!originGone) return null
-      consultStore.update(input.consultId, {
-        state: 'cancelled',
-        advice: advice || null,
-      })
-      if (jobs && jobId) {
-        const spawnFailSnap = jobs.snapshotOf(jobId)
-        const spawnFailFence =
-          spawnFailSnap?.claimToken
-            ? { claimToken: spawnFailSnap.claimToken, fencingEpoch: spawnFailSnap.fencingEpoch }
-            : undefined
-        jobs.fail(jobId, {
-          failureClass: 'cancelled',
-          detail: 'parent Stop',
-          httpStatus: 409,
-          body: { ok: false, error: 'parent Stop', advice, consultId: input.consultId },
-          nextState: 'cancelled',
-          ...(spawnFailFence ?? {}),
-        })
-      }
-      return { state: 'cancelled', advice, jobId, error: 'parent Stop' }
-    }
-    try {
-    const cfg = await this._getAgentsConfig()
-    const abortedBeforeSpawn = await cancelIfAborted()
-    if (abortedBeforeSpawn) return abortedBeforeSpawn
-    const sourceAgent =
-      cfg.agents.find((row) => row.id === 'main') ??
-      cfg.agents.find((row) => row.id === cfg.default)
-    if (!sourceAgent) throw new Error('advisor source agent missing')
-    const agent: AgentDef = {
-      ...sourceAgent,
-      id: ADVISOR_AGENT_ID,
-      model: input.execution.modelId,
-      provider: undefined,
-      runnerKind: undefined,
-      persona: undefined,
-      cwd: undefined,
-      mcpServers: [],
-      toolsets: [],
-    }
-    const execution = await resolveLocalExecutionIfEnforced({
-      agent,
-      kind: 'turn',
-      model: input.execution.modelId,
-      defaultModel: this.deps.config.defaults.model,
-    })
-    const engine = execution?.engine ?? 'ccb'
-    if (engine !== 'ccb' || input.execution.engine !== 'ccb') {
-      throw new Error('顾问引擎未开放或型号不是已证明的 CCB 顾问')
-    }
-    jobs = this._ensureDelegateJobStore()
-    const gate = await this._waitForDelegateCapacity({
-      sessionKey: advisorSessionKey,
-      parentBucketKey: input.parent.sessionKey,
-      isReview: false,
-    })
-    if (gate.status !== 'ok') {
-      const state = gate.status === 'aborted' ? 'cancelled' : 'failed'
-      consultStore.update(input.consultId, { state })
-      return {
-        state,
-        advice: '',
-        error: `顾问资源闸未放行: ${gate.status}`,
-      }
-    }
-    slotHeld = true
-    const abortedAfterQueue = await cancelIfAborted()
-    if (abortedAfterQueue) return abortedAfterQueue
-    const created = jobs.create(ADVISOR_AGENT_ID, {
-      sessionKey: advisorSessionKey,
-      parentSessionKey: input.parent.sessionKey,
-      queued: false,
-      kind: 'advisor',
-      callback: 'stdout-wait',
-      idempotencyKey: input.consultId,
-    })
-    if ('error' in created) {
-      throw new Error('too many in-flight advisor jobs')
-    }
-    jobId = created.jobId
-    consultStore.update(input.consultId, { jobId, state: 'spawned' })
-    const abortedBeforeCreate = await cancelIfAborted()
-    if (abortedBeforeCreate) return abortedBeforeCreate
-    const session = await this.sessions.getOrCreate({
-      sessionKey: advisorSessionKey,
-      agent,
-      ...localExecutionOverride(execution),
-      channel: 'advisor',
-      peerId: input.parent.peerId,
-      userId: input.parent.userId,
-      hermeticNoTools: true,
-      advisorExecutionLock: input.execution,
-      usageAttribution: {
-        mode: 'delegate',
-        delegateAgentId: ADVISOR_AGENT_ID,
-        parentSessionId: input.parent.peerId,
-        parentTurnKey: input.originTurnKey,
-      },
-    })
-    const abortedAfterCreate = await cancelIfAborted()
-    if (abortedAfterCreate) return abortedAfterCreate
-    let error: string | undefined
-    let cancelCode: string | undefined
-    const originConsultId = input.consultId
-    const lockToolViolation = (): void => {
-      if (toolViolation) return
-      toolViolation = true
-      try {
-        session.runner.interrupt()
-      } catch {
-        /* interrupt is best-effort; finally still destroys the session */
-      }
-    }
-    try {
-      await this.sessions.submit(
-        session,
-        formatAdvisorConsultPrompt(input.snapshot),
-        (e) => {
-          const latest = consultStore.findById(originConsultId)
-          if (
-            latest &&
-            (latest.state === 'completed' ||
-              latest.state === 'failed' ||
-              latest.state === 'cancelled' ||
-              latest.originTurnKey !== input.originTurnKey)
-          ) {
-            return
-          }
-          if (e.kind === 'error') {
-            error = e.error
-            const code = (e as { errorCode?: string }).errorCode
-            if (code === 'USER_CANCELLED') cancelCode = code
-          }
-          if (toolViolation) return
-          const eventKind = (e as { kind?: string }).kind
-          if (eventKind === 'tool_use_detected' || eventKind === 'permission_request') {
-            lockToolViolation()
-            return
-          }
-          if (e.kind === 'block' && (e.block.kind === 'tool_use' || e.block.kind === 'tool_result')) {
-            lockToolViolation()
-            return
-          }
-          if (e.kind === 'block' && e.block.kind === 'text') advice += e.block.text ?? ''
-        },
-        undefined,
-        input.execution.modelId,
-        undefined,
-        undefined,
-        undefined,
-        {
-          automaticRetryState: {
-            rootClientMessageId: input.consultId,
-            attempt: 0,
-            max: 0,
-          },
-        },
-      )
-    } catch (err) {
-      const code = (err as { errorCode?: string })?.errorCode
-      if (code === 'USER_CANCELLED') cancelCode = code
-      error = String((err as Error)?.message ?? err)
-    }
-    const cancelled =
-      !toolViolation && (cancelCode === 'USER_CANCELLED' || abort.signal.aborted)
-    const jobSnap = jobs.snapshotOf(jobId)
-    const fence =
-      jobSnap?.claimToken
-        ? { claimToken: jobSnap.claimToken, fencingEpoch: jobSnap.fencingEpoch }
-        : undefined
-    if (cancelled) {
-      consultStore.update(input.consultId, { state: 'cancelled', advice: advice || null })
-      jobs.fail(jobId, {
-        failureClass: 'cancelled',
-        detail: 'parent Stop',
-        httpStatus: 409,
-        body: { ok: false, error: 'parent Stop', advice, consultId: input.consultId },
-        nextState: 'cancelled',
-        ...(fence ?? {}),
-      })
-      return { state: 'cancelled', advice, jobId, error: 'parent Stop' }
-    }
-    if (toolViolation || error || !advice.trim()) {
-      const detail = toolViolation
-        ? '顾问发出了工具或权限事件，不能作为无工具完成'
-        : error || '顾问未返回非空建议'
-      consultStore.update(input.consultId, { state: 'failed', advice: advice || null })
-      jobs.fail(jobId, {
-        failureClass: 'child_error',
-        detail,
-        httpStatus: 500,
-        body: { ok: false, error: detail, advice, consultId: input.consultId },
-        ...(fence ?? {}),
-      })
-      return { state: 'failed', advice, jobId, error: detail }
-    }
-    consultStore.update(input.consultId, { state: 'completed', advice })
-    jobs.complete(
-      jobId,
-      {
-        httpStatus: 200,
-        body: { ok: true, advice, consultId: input.consultId, billingMode: 'proxy' },
-      },
-      fence,
-    )
-    return { state: 'completed', advice, jobId }
-    } catch (err) {
-      const detail = String((err as Error)?.message ?? err)
-      consultStore.update(input.consultId, { state: 'failed', advice: advice || null })
-      if (jobs && jobId) {
-        const spawnFailSnap = jobs.snapshotOf(jobId)
-        jobs.fail(jobId, {
-          failureClass: 'child_error',
-          detail,
-          httpStatus: 500,
-          body: { ok: false, error: detail, advice, consultId: input.consultId },
-          ...(spawnFailSnap?.claimToken
-            ? { claimToken: spawnFailSnap.claimToken, fencingEpoch: spawnFailSnap.fencingEpoch }
-            : {}),
-        })
-      }
-      return { state: 'failed', advice, jobId, error: detail }
-    } finally {
-      this._advisorConsultAborts?.delete(advisorSessionKey)
-      unregister?.()
-      if (slotHeld) this._releaseDelegateSlot(slotOpts)
-      await this.sessions.destroySession(advisorSessionKey).catch(() => {})
-    }
+    return _spawnCcbAdvisorConsultImpl.call(this as unknown as AdvisorHandlersHost, input)
   }
 
-  private _advisorConsultRouteOverride(
-    route: AdvisorAdmitRouteOk,
-    model: string,
-  ): import('./engine/codexShared.js').CodexProviderConfigOverride | null {
-    const port = this.deps.config.gateway.port
-    if (route.kind === 'official_oauth') {
-      return _buildSafeCodexRouteOverride({
-        agent: { id: ADVISOR_AGENT_ID },
-        model,
-        rawRoute: { kind: 'official_oauth' },
-        officialRelayPort: port,
-      })
-    }
-    if (!Number.isInteger(port) || port <= 0 || port > 65535) return null
-    return _buildSafeCodexRouteOverride({
-      agent: { id: ADVISOR_AGENT_ID },
-      model,
-      rawRoute: {
-        baseUrl: `http://127.0.0.1:${port}${V3_CODEX_RELAY_PREFIX}/route/${route.token}`,
-        modelProvider: route.modelProvider,
-        providerName: route.providerName ?? null,
-        wireApi: route.wireApi ?? 'responses',
-        preferredAuthMethod: route.preferredAuthMethod ?? 'apikey',
-        disableResponseStorage: route.disableResponseStorage ?? true,
-      },
-      officialRelayPort: port,
-    })
+  private _advisorConsultRouteOverride(route: AdvisorAdmitRouteOk, model: string): import('./engine/codexShared.js').CodexProviderConfigOverride | null {
+    return _advisorConsultRouteOverrideImpl.call(this as unknown as AdvisorHandlersHost, route, model)
   }
 
-  private async _spawnAdvisorConsult(input: {
+  private _spawnAdvisorConsult(input: {
     consultId: string
     parent: AgentSession
     originTurnKey: string
@@ -8380,351 +7432,7 @@ export class Gateway {
     error?: string
     usage?: DurableCodexBilling['usage']
   }> {
-    const consultStore = this.advisorConsultStore()
-    const advisorSessionKey = `advisor:${input.originTurnKey}:${input.consultId}`
-    const slotOpts = { parentBucketKey: input.parent.sessionKey, isReview: false }
-    const unregister =
-      input.unregister ?? this._registerActiveDelegation(input.parent.sessionKey, advisorSessionKey)
-    const abort = input.abort ?? new AbortController()
-    ;(this._advisorConsultAborts ??= new Map()).set(advisorSessionKey, abort)
-    let slotHeld = false
-    let jobId: string | undefined
-    let jobs: DelegateJobStore | undefined
-    let liveBilling: DurableCodexBilling | null = null
-    let advice = ''
-    let settleError: string | undefined
-    const cancelIfAborted = async (): Promise<{
-      state: string
-      advice: string
-      jobId?: string
-      error?: string
-    } | null> => {
-      const liveParent = this.sessions?.getByKey(input.parent.sessionKey)
-      const originGone =
-        abort.signal.aborted ||
-        !liveParent ||
-        liveParent._currentTurnKey !== input.originTurnKey
-      if (!originGone) return null
-      if (!liveBilling) await input.billingApi.abandon(input.requestId).catch(() => {})
-      consultStore.update(input.consultId, {
-        state: liveBilling ? 'settle_pending' : 'cancelled',
-        advice: advice || null,
-      })
-      if (jobs && jobId) {
-        const spawnFailSnap = jobs.snapshotOf(jobId)
-        const spawnFailFence =
-          spawnFailSnap?.claimToken
-            ? { claimToken: spawnFailSnap.claimToken, fencingEpoch: spawnFailSnap.fencingEpoch }
-            : undefined
-        jobs.fail(jobId, {
-          failureClass: 'cancelled',
-          detail: 'parent Stop',
-          httpStatus: 409,
-          body: { ok: false, error: 'parent Stop', advice, consultId: input.consultId },
-          nextState: 'cancelled',
-          ...(spawnFailFence ?? {}),
-        })
-      }
-      return {
-        state: liveBilling ? 'settle_pending' : 'cancelled',
-        advice,
-        jobId,
-        error: 'parent Stop',
-      }
-    }
-    try {
-    const cfg = await this._getAgentsConfig()
-    const abortedBeforeSpawn = await cancelIfAborted()
-    if (abortedBeforeSpawn) return abortedBeforeSpawn
-    const sourceAgent =
-      cfg.agents.find((row) => row.id === 'main') ??
-      cfg.agents.find((row) => row.id === cfg.default)
-    if (!sourceAgent) throw new Error('advisor source agent missing')
-    const agent: AgentDef = {
-      ...sourceAgent,
-      id: ADVISOR_AGENT_ID,
-      model: input.snapshot.advisorModel,
-      provider: undefined,
-      runnerKind: undefined,
-      persona: undefined,
-      cwd: undefined,
-      mcpServers: [],
-      toolsets: [],
-    }
-    const execution = await resolveLocalExecutionIfEnforced({
-      agent,
-      kind: 'turn',
-      model: input.snapshot.advisorModel,
-      defaultModel: this.deps.config.defaults.model,
-    })
-    const engine = execution?.engine ?? 'codex'
-    if (
-      engine !== 'codex' ||
-      !isAdvisorEngineOpen('codex', process.env, this.advisorConfigStore().read().provenEngines)
-    ) {
-      throw new Error('顾问引擎未开放或型号不是已证明的 Codex 顾问')
-    }
-    jobs = this._ensureDelegateJobStore()
-    const gate = await this._waitForDelegateCapacity({
-      sessionKey: advisorSessionKey,
-      parentBucketKey: input.parent.sessionKey,
-      isReview: false,
-    })
-    if (gate.status !== 'ok') {
-      await input.billingApi.abandon(input.requestId).catch(() => {})
-      const state = gate.status === 'aborted' ? 'cancelled' : 'failed'
-      consultStore.update(input.consultId, { state })
-      return {
-        state,
-        advice: '',
-        error: `顾问资源闸未放行: ${gate.status}`,
-      }
-    }
-    slotHeld = true
-    const abortedAfterQueue = await cancelIfAborted()
-    if (abortedAfterQueue) return abortedAfterQueue
-    const created = jobs.create(ADVISOR_AGENT_ID, {
-      sessionKey: advisorSessionKey,
-      parentSessionKey: input.parent.sessionKey,
-      queued: false,
-      kind: 'advisor',
-      callback: 'stdout-wait',
-      idempotencyKey: input.consultId,
-    })
-    if ('error' in created) {
-      throw new Error('too many in-flight advisor jobs')
-    }
-    jobId = created.jobId
-    consultStore.update(input.consultId, { jobId, state: 'admitted' })
-    const abortedBeforeCreate = await cancelIfAborted()
-    if (abortedBeforeCreate) return abortedBeforeCreate
-    const session = await this.sessions.getOrCreate({
-      sessionKey: advisorSessionKey,
-      agent,
-      ...localExecutionOverride(execution),
-      channel: 'advisor',
-      peerId: input.parent.peerId,
-      userId: input.parent.userId,
-      hermeticNoTools: true,
-      usageAttribution: {
-        mode: 'delegate',
-        delegateAgentId: ADVISOR_AGENT_ID,
-        parentSessionId: input.parent.peerId,
-        parentTurnKey: input.originTurnKey,
-      },
-    })
-    const abortedAfterCreate = await cancelIfAborted()
-    if (abortedAfterCreate) return abortedAfterCreate
-    consultStore.update(input.consultId, { state: 'spawned', jobId })
-    let error: string | undefined
-    let cancelCode: string | undefined
-    let settleTask: Promise<void> | undefined
-    const originConsultId = input.consultId
-    try {
-      await this.sessions.submit(
-        session,
-        formatAdvisorConsultPrompt(input.snapshot),
-        (e) => {
-          if (e.kind === 'codex_billing') {
-            const billing = { ...e } as DurableCodexBilling & { kind?: string }
-            delete billing.kind
-            liveBilling = billing
-            settleTask = input.billingApi.settle(billing).catch((settleErr) => {
-              settleError = String((settleErr as Error)?.message ?? settleErr)
-              this.log.warn('advisor_engine_billing_settle_failed', {
-                consultId: input.consultId,
-                requestId: billing.requestId,
-                err: settleError,
-              })
-            })
-            return
-          }
-          const latest = consultStore.findById(originConsultId)
-          if (
-            latest &&
-            (latest.state === 'settled' ||
-              latest.state === 'failed' ||
-              latest.state === 'cancelled' ||
-              latest.originTurnKey !== input.originTurnKey)
-          ) {
-            return
-          }
-          if (e.kind === 'block' && e.block.kind === 'text') advice += e.block.text ?? ''
-          if (e.kind === 'error') {
-            error = e.error
-            const code = (e as { errorCode?: string }).errorCode
-            if (code === 'USER_CANCELLED') cancelCode = code
-          }
-        },
-        undefined,
-        input.snapshot.advisorModel,
-        input.requestId,
-        undefined,
-        undefined,
-        { codexRoute: input.codexRoute },
-      )
-    } catch (err) {
-      const code = (err as { errorCode?: string })?.errorCode
-      if (code === 'USER_CANCELLED') cancelCode = code
-      error = String((err as Error)?.message ?? err)
-    }
-    if (advice) {
-      try {
-        consultStore.update(input.consultId, { advice })
-      } catch {
-        /* projection retries from settledReceipts once advice is durable */
-      }
-    }
-    if (settleTask) await settleTask
-    // Only project after an authoritative 2xx for this requestId. Advice or
-    // observed usage is not payment evidence.
-    if (!settleError && liveBilling && advice) {
-      try {
-        consultStore.projectOneReceipt(input.requestId)
-      } catch {
-        /* keep settle_pending / spawned until receipt-driven auto-retry */
-      }
-    }
-    const jobSnap = jobs.snapshotOf(jobId)
-    const fence =
-      jobSnap?.claimToken
-        ? { claimToken: jobSnap.claimToken, fencingEpoch: jobSnap.fencingEpoch }
-        : undefined
-    const cancelled = cancelCode === 'USER_CANCELLED'
-    const usage = (liveBilling as DurableCodexBilling | null)?.usage
-    if (!liveBilling) {
-      await input.billingApi.abandon(input.requestId).catch(() => {})
-      const state = cancelled ? 'cancelled' : 'failed'
-      consultStore.update(input.consultId, { state, advice: advice || null })
-      jobs.fail(jobId, {
-        failureClass: cancelled ? 'cancelled' : 'child_error',
-        detail: error || 'missing billing frame',
-        httpStatus: cancelled ? 409 : 500,
-        body: { ok: false, error, advice, consultId: input.consultId },
-        ...(cancelled ? { nextState: 'cancelled' as const } : {}),
-        ...(fence ?? {}),
-      })
-      return {
-        state,
-        advice,
-        jobId,
-        error: error || '顾问未产生计费帧（401 或未完成推理不算无工具 PASS）',
-      }
-    }
-    if (settleError) {
-      consultStore.update(input.consultId, {
-        state: 'settle_pending',
-        billingRequestId: input.requestId,
-        advice,
-      })
-      jobs.complete(
-        jobId,
-        {
-          httpStatus: 200,
-          body: { ok: true, advice, consultId: input.consultId, settlePending: true },
-        },
-        fence,
-      )
-      return {
-        state: 'settle_pending',
-        advice,
-        jobId,
-        ...(usage ? { usage } : {}),
-        error: `计费 settle 失败，保留 pending 与原 owner: ${settleError}`,
-      }
-    }
-    const state = cancelled ? 'cancelled' : error ? 'failed' : 'settled'
-    consultStore.update(input.consultId, { state, advice })
-    if (cancelled || error) {
-      jobs.fail(jobId, {
-        failureClass: cancelled ? 'cancelled' : 'child_error',
-        detail: error || 'cancelled',
-        httpStatus: cancelled ? 409 : 500,
-        body: { ok: false, error, advice, consultId: input.consultId },
-        ...(cancelled ? { nextState: 'cancelled' as const } : {}),
-        ...(fence ?? {}),
-      })
-    } else {
-      jobs.complete(
-        jobId,
-        { httpStatus: 200, body: { ok: true, advice, consultId: input.consultId } },
-        fence,
-      )
-    }
-    return { state, advice, jobId, error, ...(usage ? { usage } : {}) }
-    } catch (err) {
-      const detail = String((err as Error)?.message ?? err)
-      const observed = Boolean(liveBilling)
-      const current = consultStore.findById(input.consultId)
-      if (observed || current?.state === 'settled' || current?.state === 'settle_pending') {
-        const inheritSettled = current?.state === 'settled' && !settleError
-        try {
-          consultStore.update(input.consultId, {
-            state: inheritSettled ? 'settled' : 'settle_pending',
-            billingRequestId: input.requestId,
-            advice: advice || current?.advice || null,
-          })
-        } catch {
-          /* keep HTTP advice even if the local projection write fails again */
-        }
-        if (jobs && jobId) {
-          const spawnFailSnap = jobs.snapshotOf(jobId)
-          const spawnFailFence =
-            spawnFailSnap?.claimToken
-              ? { claimToken: spawnFailSnap.claimToken, fencingEpoch: spawnFailSnap.fencingEpoch }
-              : undefined
-          try {
-            jobs.complete(
-              jobId,
-              {
-                httpStatus: 200,
-                body: {
-                  ok: true,
-                  advice,
-                  consultId: input.consultId,
-                  settlePending: !inheritSettled,
-                },
-              },
-              spawnFailFence,
-            )
-          } catch {
-            /* job already terminal */
-          }
-        }
-        return {
-          state: inheritSettled ? 'settled' : 'settle_pending',
-          advice,
-          jobId,
-          error: detail,
-        }
-      }
-      await input.billingApi.abandon(input.requestId).catch(() => {})
-      try {
-        consultStore.update(input.consultId, { state: 'failed', advice: advice || null })
-      } catch {
-        /* persist best-effort */
-      }
-      if (jobs && jobId) {
-        const spawnFailSnap = jobs.snapshotOf(jobId)
-        const spawnFailFence =
-          spawnFailSnap?.claimToken
-            ? { claimToken: spawnFailSnap.claimToken, fencingEpoch: spawnFailSnap.fencingEpoch }
-            : undefined
-        jobs.fail(jobId, {
-          failureClass: 'child_error',
-          detail,
-          httpStatus: 500,
-          body: { ok: false, error: detail, consultId: input.consultId },
-          ...(spawnFailFence ?? {}),
-        })
-      }
-      return { state: 'failed', advice: '', jobId, error: detail }
-    } finally {
-      this._advisorConsultAborts?.delete(advisorSessionKey)
-      unregister?.()
-      if (slotHeld) this._releaseDelegateSlot(slotOpts)
-      await this.sessions.destroySession(advisorSessionKey).catch(() => {})
-    }
+    return _spawnAdvisorConsultImpl.call(this as unknown as AdvisorHandlersHost, input)
   }
 
   private async handleCollaborationConfig(
@@ -8946,33 +7654,8 @@ export class Gateway {
   }
 
 
-  private async _handleWebhook(
-    req: IncomingMessage,
-    res: ServerResponse,
-    whId: string,
-  ): Promise<void> {
-    if (req.method === 'POST') {
-      const wh = this.webhookRouter?.find(whId)
-      if (!wh) {
-        this.sendError(res, 404, 'webhook not found')
-        return
-      }
-      if (isHiddenSystemAgentId(wh.agent)) {
-        this.sendError(res, 404, 'webhook not found')
-        return
-      }
-      const body = await this.readBody(req)
-      const sig = (req.headers['x-hub-signature-256'] || req.headers['x-signature'] || '') as string
-      const result = await this.webhookRouter!.process(wh, body, sig)
-      this.sendJson(res, result.ok ? 200 : 403, result)
-      return
-    }
-    if (req.method === 'DELETE') {
-      const removed = await this.webhookRouter?.remove(whId)
-      this.sendJson(res, removed ? 200 : 404, { ok: !!removed })
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
+  private _handleWebhook(req: IncomingMessage, res: ServerResponse, whId: string): Promise<void> {
+    return _handleWebhookImpl.call(this as unknown as CronTaskWebhookHost, req, res, whId)
   }
 
   private async _handleWechat(
@@ -9159,98 +7842,12 @@ export class Gateway {
     this.sendError(res, 404, 'wechat route not found')
   }
 
-  private async _handleTasksApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (req.method === 'GET') {
-      const tasks = filterUserVisibleByAgentField(await this._taskStore.list())
-      this.sendJson(res, 200, { tasks })
-      return
-    }
-    if (req.method === 'POST') {
-      const body = await this.readBody(req)
-      let parsed: any
-      try {
-        parsed = JSON.parse(body)
-      } catch {
-        return this.sendError(res, 400, 'invalid JSON')
-      }
-      const { id, title, agent, prompt, trigger, schedule, webhookId, eventType, maxRuns } = parsed
-      if (!title || !prompt) return this.sendError(res, 400, 'title and prompt required')
-      const taskAgent = typeof agent === 'string' && agent ? agent : 'main'
-      if (isHiddenSystemAgentId(taskAgent)) return this.sendError(res, 404, 'agent not found')
-      const task = await this._taskStore.create({
-        id: id || `task-${Date.now().toString(36)}`,
-        title,
-        agent: taskAgent,
-        prompt,
-        trigger: trigger || 'manual',
-        schedule,
-        webhookId,
-        eventType,
-        maxRuns,
-      })
-      this._invalidateTaskCache()
-      this.sendJson(res, 201, { ok: true, task })
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
+  private _handleTasksApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    return _handleTasksApiImpl.call(this as unknown as CronTaskWebhookHost, req, res)
   }
 
-  private async _handleTaskItem(
-    req: IncomingMessage,
-    res: ServerResponse,
-    taskId: string,
-  ): Promise<void> {
-    if (req.method === 'GET') {
-      const task = await this._taskStore.get(taskId)
-      if (!task) return this.sendError(res, 404, 'task not found')
-      if (isHiddenSystemAgentId(task.agent)) return this.sendError(res, 404, 'task not found')
-      this.sendJson(res, 200, { task })
-      return
-    }
-    if (req.method === 'PUT') {
-      const body = await this.readBody(req)
-      let parsed: any
-      try {
-        parsed = JSON.parse(body)
-      } catch {
-        return this.sendError(res, 400, 'invalid JSON')
-      }
-      if (parsed.agent !== undefined && isHiddenSystemAgentId(parsed.agent)) {
-        return this.sendError(res, 404, 'agent not found')
-      }
-      const existing = await this._taskStore.get(taskId)
-      if (existing && isHiddenSystemAgentId(existing.agent)) {
-        return this.sendError(res, 404, 'task not found')
-      }
-      const ok = await this._taskStore.update(taskId, parsed)
-      if (ok) this._invalidateTaskCache()
-      this.sendJson(res, ok ? 200 : 404, { ok })
-      return
-    }
-    if (req.method === 'DELETE') {
-      const task = await this._taskStore.get(taskId)
-      if (task && isHiddenSystemAgentId(task.agent)) {
-        return this.sendError(res, 404, 'task not found')
-      }
-      const ok = await this._taskStore.remove(taskId)
-      if (ok) this._invalidateTaskCache()
-      this.sendJson(res, ok ? 200 : 404, { ok })
-      return
-    }
-    // POST → manually trigger the task (uses shared _triggerTask with RunLog)
-    if (req.method === 'POST') {
-      const task = await this._taskStore.get(taskId)
-      if (!task) return this.sendError(res, 404, 'task not found')
-      if (isHiddenSystemAgentId(task.agent)) return this.sendError(res, 404, 'task not found')
-      if (task.status === 'disabled')
-        return this.sendError(res, 409, 'task is disabled (maxRuns reached)')
-      this._triggerTask(taskId).catch((err) =>
-        this.log.error('task manual trigger failed', { taskId }, err),
-      )
-      this.sendJson(res, 202, { ok: true, message: 'task triggered' })
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
+  private _handleTaskItem(req: IncomingMessage, res: ServerResponse, taskId: string): Promise<void> {
+    return _handleTaskItemImpl.call(this as unknown as CronTaskWebhookHost, req, res, taskId)
   }
 
   /** Check schedule-triggered tasks and fire if cron matches */
@@ -9274,75 +7871,8 @@ export class Gateway {
   }
 
   /** Trigger a task by ID (shared by schedule tick, webhook, and manual API) */
-  private async _triggerTask(taskId: string): Promise<void> {
-    const task = await this._taskStore.get(taskId)
-    if (!task || task.status === 'disabled') return
-    if (isHiddenSystemAgentId(task.agent)) {
-      this.log.warn('task hidden system agent rejected', { taskId, agent: task.agent })
-      return
-    }
-    const cfg = await this._getAgentsConfig()
-    const requestedAgent = cfg.agents.find((a) => a.id === task.agent)
-    if (!requestedAgent) return
-    const agent = (await resolveRuntimeExecutionAgent(requestedAgent, cfg)).agent
-    const sessionKey = `agent:${task.agent}:task:${taskId}:${Date.now()}`
-    // 合成首帧路由字段补齐(同 cron):定时任务的会话首帧绕过 master bridge 计费编排,
-    // 落 codex 会被 CODEX_BILLING_GUARD 拒 → 解析为非 codex 执行模型。
-    const _taskRoute = resolveSyntheticTurnModel(agent, this.deps.config.defaults.model)
-    // 模型权威 §3(无 envelope 的本地路径):flag 开 → 判定源换成 master catalog 投影。
-    // 投影不可用 → 抛 → 由 _triggerTask 的调用方 .catch 记录(任务本次不执行,不回落 baked)。
-    const _taskExec = await resolveLocalExecutionIfEnforced({
-      agent,
-      kind: 'synthetic',
-      model: _taskRoute?.model,
-      defaultModel: this.deps.config.defaults.model,
-    })
-    const _taskModel = _taskExec?.canonicalModel ?? _taskRoute?.model
-    const session = await this.sessions.getOrCreate({
-      sessionKey,
-      agent,
-      ...(_taskModel ? { model: _taskModel } : {}),
-      ...localExecutionOverride(_taskExec),
-      channel: 'task',
-      peerId: taskId,
-      title: `[task] ${task.title}`,
-    })
-    // MAJOR-2 透明化:effective_model 落 runLog(doctor 面)+ 下方 recordExecution(执行台账)。
-    const runEntry = this._runLog.start({
-      agentId: task.agent,
-      sessionKey,
-      taskType: 'task',
-      ...(_taskRoute ? { effectiveModel: _taskRoute.model } : {}),
-    })
-    let output = ''
-    let error = ''
-    try {
-      await this.sessions.submit(
-        session,
-        task.prompt,
-        (e) => {
-          if (e.kind === 'block' && e.block.kind === 'text') output += (e.block as any).text
-          if (e.kind === 'error') error = e.error
-        },
-        undefined,
-        _taskModel,
-      )
-    } catch (err: any) {
-      error = String(err)
-    }
-    this._runLog.complete(runEntry, {
-      status: error ? 'failed' : 'completed',
-      error: error || undefined,
-    })
-    await this._taskStore.recordExecution({
-      taskId,
-      startedAt: runEntry.startedAt,
-      completedAt: Date.now(),
-      status: error ? 'failed' : 'completed',
-      output: output.slice(0, 2000),
-      error: error || undefined,
-      ...(_taskRoute ? { effectiveModel: _taskRoute.model } : {}),
-    })
+  private _triggerTask(taskId: string): Promise<void> {
+    return _triggerTaskImpl.call(this as unknown as CronTaskWebhookHost, taskId)
   }
 
   private async handleSearch(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
@@ -9366,104 +7896,12 @@ export class Gateway {
    * same persist+dispatch path as Completer origin-session fire, with
    * dlgcb.{jobId}.{epoch} as the message id.
    */
-  private async injectCronOriginFromTerminal(event: JobTerminal): Promise<CronOriginFireResult> {
-    const fallbackText =
-      event.state === 'completed' && !isJobTerminalFailure(event) && event.resultRef?.trim()
-        ? event.resultRef
-        : formatJobTerminalMarkdown(event)
-    const payload = resolveCronOriginInjectPayload(event, fallbackText)
-    if (!payload) return { kind: 'fallback' }
-    return this.injectCronOriginSession(payload.job, payload.delivery, payload.override)
+  private injectCronOriginFromTerminal(event: JobTerminal): Promise<CronOriginFireResult> {
+    return injectCronOriginFromTerminalImpl.call(this as unknown as CronTaskWebhookHost, event)
   }
 
-  private async injectCronOriginSession(
-    job: CronJob,
-    delivery: CronDeliveryContext,
-    override?: { text?: string; clientMessageId?: string; idempotencyKey?: string },
-  ): Promise<CronOriginFireResult> {
-    const origin = parseOriginWebchatSessionKey(job.sourceSessionKey || '')
-    if (!origin) return { kind: 'fallback' }
-    const text = override?.text ?? buildCronOriginResumeText(job)
-    const clientMessageId = override?.clientMessageId ?? cronOriginClientMessageId(delivery.deliveryId)
-    const masterCfg = readV3CronOriginInjectConfig()
-    if (masterCfg) {
-      const posted = await postCronOriginInject(
-        {
-          sessionId: origin.peerId,
-          text,
-          clientMessageId,
-          agentId: origin.agentId,
-        },
-        { config: masterCfg },
-      )
-      if (posted.kind === 'injected') return { kind: 'injected' }
-      if (posted.kind === 'gone') return { kind: 'fallback' }
-      if (posted.kind === 'in_flight') {
-        return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_IN_FLIGHT' }
-      }
-      return { kind: 'retryable_failure', code: posted.code }
-    }
-    const userId =
-      (typeof job.sourceUserId === 'string' && job.sourceUserId.trim()) ||
-      process.env.OC_USER_ID?.trim() ||
-      'default'
-    let existing
-    try {
-      existing = await clientSessionIsActive(origin.peerId, userId)
-    } catch (err) {
-      this.log.warn('origin-session lookup failed', { jobId: job.id }, err as Error)
-      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_LOOKUP_FAILED' }
-    }
-    if (!existing) return { kind: 'fallback' }
-    const liveParent = this.sessions.getByKey(origin.sessionKey)
-    if ((liveParent?._activeTurnCount ?? 0) > 0 || (liveParent?._activeClientTurnCount ?? 0) > 0) {
-      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_BUSY' }
-    }
-    try {
-      const persisted = await appendServerAuthoredMessage(origin.peerId, userId, {
-        id: clientMessageId,
-        role: 'user',
-        text,
-        ts: Date.now(),
-      })
-      if (!persisted.applied) {
-        const decision = decideCronOriginDispatchAfterPersist(persisted)
-        if (decision === 'ack_injected') {
-          // Durable consumer-side idempotency: same clientMessageId already
-          // in sessions.db. ACK and do not dispatch a second turn. The
-          // process Map in dispatchInbound is not restart-safe.
-          return { kind: 'injected' }
-        }
-        if (decision === 'fallback') return { kind: 'fallback' }
-        return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
-      }
-    } catch (err) {
-      this.log.warn('origin-session persist failed', { jobId: job.id }, err as Error)
-      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_PERSIST_FAILED' }
-    }
-    try {
-      const cronBoard =
-        job.projectMode === 'fixed' && typeof job.boardProjectId === 'string'
-          ? job.boardProjectId
-          : undefined
-      await this.dispatchInbound({
-        type: 'inbound.message',
-        channel: origin.channel,
-        peer: { id: origin.peerId, kind: origin.peerKind },
-        agentId: origin.agentId,
-        content: { text },
-        ts: Date.now(),
-        idempotencyKey:
-          override?.idempotencyKey ?? cronOriginIdempotencyKey(job.id, delivery.deliveryId),
-        clientMessageId,
-        _userId: userId,
-        ...(cronBoard ? { _cronBoardProjectId: cronBoard, _cronProjectMode: 'fixed' } : {}),
-      } as any)
-    } catch (err) {
-      this.log.warn('origin-session dispatch failed', { jobId: job.id }, err as Error)
-      return { kind: 'retryable_failure', code: 'ORIGIN_SESSION_DISPATCH_FAILED' }
-    }
-    return { kind: 'injected' }
+  private injectCronOriginSession(job: CronJob, delivery: CronDeliveryContext, override?: { text?: string; clientMessageId?: string; idempotencyKey?: string }): Promise<CronOriginFireResult> {
+    return injectCronOriginSessionImpl.call(this as unknown as CronTaskWebhookHost, job, delivery, override)
   }
 
   private async _acquireSyntheticTurnBarrier(sessionKey: string): Promise<{
@@ -9604,156 +8042,23 @@ export class Gateway {
 
   // ── Cron/Reminder API handlers ──
   private cronProjectPorts(): CronProjectPorts {
-    return {
-      getBoardProject: async (id) => {
-        const p = getProject(getTaskboardDb(), id)
-        return p ? { id: p.id, archivedAt: p.archivedAt } : null
-      },
-      getSessionBoardProject: async (sessionId) => {
-        const ws = await resolveChatRunWorkspace({ sessionId })
-        return ws.bound ? ws.projectId : null
-      },
-    }
+    return cronProjectPortsImpl.call(this as unknown as CronTaskWebhookHost)
   }
 
-  private async stampCronProject(
-    parsed: { projectMode?: unknown; boardProjectId?: unknown },
-    originPeerId?: string,
-  ): Promise<{ projectMode: 'follow_session' | 'fixed'; boardProjectId: string | null } | { error: string }> {
-    const wantFixed = parsed.projectMode === 'fixed'
-    if (!wantFixed) return { projectMode: 'follow_session', boardProjectId: null }
-    let candidate = typeof parsed.boardProjectId === 'string' ? parsed.boardProjectId : ''
-    if (!candidate && originPeerId) {
-      const live = await resolveChatRunWorkspace({ sessionId: originPeerId })
-      candidate = live.bound && live.projectId ? live.projectId : ''
-    }
-    const derived = await deriveFixedBoardProjectId(this.cronProjectPorts(), candidate)
-    if (!derived) return { error: 'fixed project must be a live unarchived board project' }
-    return { projectMode: 'fixed', boardProjectId: derived }
+  private stampCronProject(parsed: { projectMode?: unknown; boardProjectId?: unknown }, originPeerId?: string): Promise<{ projectMode: 'follow_session' | 'fixed'; boardProjectId: string | null } | { error: string }> {
+    return stampCronProjectImpl.call(this as unknown as CronTaskWebhookHost, parsed, originPeerId)
   }
 
-  private async handleCronChannels(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (req.method !== 'GET') return this.sendError(res, 405, 'method not allowed')
-    this.sendJson(res, 200, { channels: listCronDeliverChannels(this.channels.keys()) })
+  private handleCronChannels(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    return handleCronChannelsImpl.call(this as unknown as CronTaskWebhookHost, req, res)
   }
 
-  private async handleCronApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    if (!this.cron) return this.sendError(res, 503, 'cron not initialized')
-    if (req.method === 'GET') {
-      const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
-      let jobs = filterUserVisibleByAgentField(await this.cron.listJobsWithMeta())
-      const boardRaw = url.searchParams.get('boardProjectId')
-      if (boardRaw && boardRaw !== 'all') {
-        jobs = await filterCronJobsForBoard(jobs, boardRaw, this.cronProjectPorts())
-      }
-      this.sendJson(res, 200, { jobs })
-      return
-    }
-    if (req.method === 'POST') {
-      const body = await this.readBody(req)
-      let parsed: any
-      try {
-        parsed = JSON.parse(body)
-      } catch {
-        return this.sendError(res, 400, 'invalid JSON')
-      }
-      const { schedule, prompt, deliver, oneshot, label, agent } = parsed
-      if (!schedule || !prompt) return this.sendError(res, 400, 'schedule and prompt required')
-      const cronAgent = typeof agent === 'string' && agent ? agent : 'main'
-      if (isHiddenSystemAgentId(cronAgent)) return this.sendError(res, 404, 'agent not found')
-      const id = `remind-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
-      const job: CronJob = {
-        id,
-        schedule,
-        agent: cronAgent,
-        prompt,
-        deliver: deliver || 'webchat',
-        enabled: true,
-        oneshot: oneshot ?? true,
-        label: label || prompt.slice(0, 50),
-        // Stamp creation time so bounded catch-up never "makes up" a missed fire
-        // for a schedule point that predates this job (see cron.ts resolveDueMinute).
-        createdAt: Date.now(),
-      }
-      if (parsed.resume === 'origin-session') {
-        const origin = parseOriginWebchatSessionKey(
-          typeof parsed.originSessionKey === 'string' ? parsed.originSessionKey : '',
-        )
-        const live = origin ? this.sessions.getByKey(origin.sessionKey) : undefined
-        const containerUser = process.env.OC_USER_ID?.trim()
-        if (!origin || !live) {
-          return this.sendError(
-            res,
-            400,
-            'origin-session requires the current live webchat conversation; do not pass a session id',
-          )
-        }
-        if (
-          containerUser &&
-          typeof live.userId === 'string' &&
-          live.userId !== containerUser &&
-          live.userId !== 'default'
-        ) {
-          return this.sendError(res, 403, 'origin-session does not belong to this user')
-        }
-        job.resume = 'origin-session'
-        job.sourceSessionKey = origin.sessionKey
-        job.sourceUserId =
-          (typeof live.userId === 'string' && live.userId) || containerUser || 'default'
-      }
-      const stamped = await this.stampCronProject(parsed, parseOriginWebchatSessionKey(job.sourceSessionKey || '')?.peerId)
-      if ('error' in stamped) return this.sendError(res, 400, stamped.error)
-      job.projectMode = stamped.projectMode
-      job.boardProjectId = stamped.boardProjectId
-      await this.cron.addJob(job)
-      this.sendJson(res, 201, { ok: true, job })
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
+  private handleCronApi(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    return handleCronApiImpl.call(this as unknown as CronTaskWebhookHost, req, res)
   }
 
-  private async handleCronItem(
-    req: IncomingMessage,
-    res: ServerResponse,
-    id: string,
-  ): Promise<void> {
-    if (!this.cron) return this.sendError(res, 503, 'cron not initialized')
-    if (req.method === 'DELETE') {
-      const existing = (await this.cron.listJobsWithMeta()).find((job) => job.id === id)
-      if (existing && isHiddenSystemAgentId(existing.agent)) {
-        return this.sendError(res, 404, 'cron job not found')
-      }
-      const removed = await this.cron.removeJob(id)
-      this.sendJson(res, removed ? 200 : 404, { ok: removed })
-      return
-    }
-    if (req.method === 'PUT') {
-      const body = await this.readBody(req)
-      let parsed: any
-      try {
-        parsed = JSON.parse(body)
-      } catch {
-        return this.sendError(res, 400, 'invalid JSON')
-      }
-      if (parsed.agent !== undefined && isHiddenSystemAgentId(parsed.agent)) {
-        return this.sendError(res, 404, 'agent not found')
-      }
-      const existing = (await this.cron.listJobsWithMeta()).find((job) => job.id === id)
-      if (existing && isHiddenSystemAgentId(existing.agent)) {
-        return this.sendError(res, 404, 'cron job not found')
-      }
-      if (parsed.projectMode !== undefined || parsed.boardProjectId !== undefined) {
-        const originPeer = parseOriginWebchatSessionKey(existing?.sourceSessionKey || '')?.peerId
-        const stamped = await this.stampCronProject(parsed, originPeer)
-        if ('error' in stamped) return this.sendError(res, 400, stamped.error)
-        parsed.projectMode = stamped.projectMode
-        parsed.boardProjectId = stamped.boardProjectId
-      }
-      const updated = await this.cron.updateJob(id, parsed)
-      this.sendJson(res, updated ? 200 : 404, { ok: updated })
-      return
-    }
-    this.sendError(res, 405, 'method not allowed')
+  private handleCronItem(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
+    return handleCronItemImpl.call(this as unknown as CronTaskWebhookHost, req, res, id)
   }
 
   // ── Claude.ai OAuth PKCE Flow ──
@@ -11278,7 +9583,7 @@ export class Gateway {
   }
 
   /** Handle permission approval/denial from the web frontend */
-  private async handlePermissionResponse(frame: {
+  private handlePermissionResponse(frame: {
     type: 'inbound.permission_response'
     channel: string
     peer: { id: string; kind: 'dm' | 'group' }
@@ -11292,269 +9597,7 @@ export class Gateway {
      *  forwarded to CCB; untrusted client fields are dropped. */
     updatedInput?: Record<string, unknown>
   }): Promise<void> {
-    // Consume pending first so we can use its authoritative channel/peer/sessionKey
-    // instead of trusting the client-supplied frame fields. For the not-found /
-    // dead-session branches we fall back to frame.* because we have nothing else.
-    let pending = this._pendingPermissions.get(frame.requestId)
-    if (pending) this._pendingPermissions.delete(frame.requestId)
-    if (!pending) {
-      pending = (await this._hydrateDetachedAskUserPending(frame)) ?? undefined
-    }
-    if (!pending) {
-      // Race: another tab (or our own /stop / timeout path) settled this
-      // requestId first. Replay the authoritative behavior from the recent-
-      // settlements map so a 3rd tab that missed the first broadcast doesn't
-      // end up labeled with the LATE responder's behavior (which may differ).
-      // If we have no record at all (expired / server restarted), fall back
-      // to the late responder's own behavior — the only signal we have.
-      const prior = this._lookupSettlement(frame.requestId)
-      this.log.warn('permission response for unknown/already-settled request', {
-        requestId: frame.requestId,
-        hasPrior: !!prior,
-        lateBehavior: frame.behavior,
-      })
-      if (prior) {
-        // Route the rebroadcast using prior.* (server-trusted) so a late
-        // duplicate can't steer the settlement to a peerKey of its choosing.
-        const priorPeerKey = Gateway.makePeerKey(prior.userId, prior.channel, prior.peer.id)
-        this._broadcastPermissionSettled(priorPeerKey, {
-          sessionKey: prior.sessionKey,
-          channel: prior.channel,
-          peer: prior.peer,
-          requestId: frame.requestId,
-          behavior: prior.behavior,
-          reason: 'already_settled',
-          ...(prior.answers ? { answers: prior.answers } : {}),
-        })
-      } else {
-        // No server-side record survives — fall back to frame.* because
-        // that's the only signal we have for where to route the settlement.
-        // Use the ws-stashed userId (set by the inbound handler) so we don't
-        // have to trust a client-supplied userId field.
-        const fallbackUserId: string =
-          typeof (frame as any)._userId === 'string' ? (frame as any)._userId : 'default'
-        const peerKey = Gateway.makePeerKey(fallbackUserId, frame.channel, frame.peer.id)
-        this._broadcastPermissionSettled(peerKey, {
-          sessionKey: '',
-          channel: frame.channel,
-          peer: frame.peer,
-          requestId: frame.requestId,
-          behavior: frame.behavior,
-          reason: 'already_settled',
-        })
-      }
-      return
-    }
-
-    const session = this.sessions.getByKey(pending.sessionKey)
-    if (!session && (isDetachedAskUserPending(pending) || isDetachedAskUserRequestId(frame.requestId))) {
-      // Detached ask_user answers start a new turn via dispatchInbound;
-      // an evicted in-memory session is expected after hours away.
-    } else if (!session) {
-      this.log.warn('permission response for dead session', { sessionKey: pending.sessionKey })
-      // Session is gone, but tabs still hold the modal — clear them.
-      // Record the authoritative deny so any late duplicate rebroadcasts deny.
-      // Use pending.* (server-trusted) instead of frame.* (client-supplied).
-      this._recordSettlement(frame.requestId, {
-        behavior: 'deny',
-        channel: pending.channel,
-        peer: pending.peer,
-        sessionKey: pending.sessionKey,
-        userId: pending.userId,
-      })
-      this._broadcastPermissionSettled(pending.peerKey, {
-        sessionKey: pending.sessionKey,
-        channel: pending.channel,
-        peer: pending.peer,
-        requestId: frame.requestId,
-        behavior: 'deny',
-        reason: 'disconnect',
-      })
-      return
-    }
-    // Build the updatedInput that will be passed to CCB.
-    // Default: preserve original input so CCB doesn't receive an empty object.
-    // Tool-specific exception: AskUserQuestion lets the client merge in
-    // `answers` / `annotations` — we validate & whitelist them first so a
-    // compromised client can't inject arbitrary keys into the tool payload.
-    //
-    // `effectiveBehavior` starts at frame.behavior but can be downgraded to
-    // 'deny' if the AskUserQuestion sanitizer finds nothing usable in the
-    // client-supplied updatedInput. Silently allowing an empty-answers
-    // AskUserQuestion turn would pass the tool call through with zero
-    // answers and leave the model wondering what the user said — far
-    // harder to diagnose than an explicit deny.
-    let forwardedInput: Record<string, unknown> = pending.input
-    let effectiveBehavior: 'allow' | 'deny' = frame.behavior
-    let effectiveMessage = frame.message
-    // AskUserQuestion allow *requires* valid client-supplied answers. If the
-    // client forgot to send updatedInput (buggy tab), sent a non-object, or
-    // sent one whose fields all fail whitelist, we must downgrade to deny —
-    // otherwise CCB receives an empty-answers AskUserQuestion turn and the
-    // model has no idea why the user didn't answer. We run this branch
-    // *unconditionally* when the tool is AskUserQuestion + behavior=allow;
-    // the sanitizer itself handles every shape of bad input.
-    if (frame.behavior === 'allow' && pending.toolName === 'AskUserQuestion') {
-      const rawCandidate =
-        frame.updatedInput && typeof frame.updatedInput === 'object' && !Array.isArray(frame.updatedInput)
-          ? frame.updatedInput
-          : {}
-      const sanitized = sanitizeAskUserQuestionUpdatedInput(pending.input, rawCandidate)
-      if (sanitized === null) {
-        this.log.warn('AskUserQuestion allow without valid answers — denying', {
-          requestId: frame.requestId,
-          receivedUpdatedInput: typeof frame.updatedInput,
-        })
-        effectiveBehavior = 'deny'
-        effectiveMessage = 'No valid answers supplied'
-      } else {
-        forwardedInput = sanitized
-      }
-    }
-    const response = effectiveBehavior === 'allow'
-      ? { behavior: 'allow' as const, updatedInput: forwardedInput, toolUseID: pending.toolUseId }
-      : { behavior: 'deny' as const, message: effectiveMessage || 'User denied', toolUseID: pending.toolUseId }
-    const settledAnswers =
-      effectiveBehavior === 'allow' &&
-      pending.toolName === 'AskUserQuestion' &&
-      forwardedInput !== pending.input &&
-      (forwardedInput as { answers?: unknown }).answers &&
-      typeof (forwardedInput as { answers?: unknown }).answers === 'object'
-        ? ((forwardedInput as { answers: Record<string, string> }).answers)
-        : undefined
-    if (isDetachedAskUserPending(pending) || isDetachedAskUserRequestId(frame.requestId)) {
-      this._recordSettlement(frame.requestId, {
-        behavior: effectiveBehavior,
-        channel: pending.channel,
-        peer: pending.peer,
-        sessionKey: pending.sessionKey,
-        userId: pending.userId,
-        ...(settledAnswers ? { answers: settledAnswers } : {}),
-      })
-      this._broadcastPermissionSettled(pending.peerKey, {
-        sessionKey: pending.sessionKey,
-        channel: pending.channel,
-        peer: pending.peer,
-        requestId: frame.requestId,
-        behavior: effectiveBehavior,
-        reason: 'remote',
-        ...(settledAnswers ? { answers: settledAnswers } : {}),
-      })
-      const answerText = effectiveBehavior === 'allow'
-        ? formatAskUserAnswerMessage(pending.input, settledAnswers ?? {})
-        : undefined
-      const answerId = answerText ? buildDetachedAskUserAnswerMessageId(frame.requestId) : undefined
-      const waiter = this._askUserWaiters?.get(frame.requestId)
-      const inWindow = waiter?.tryAnswer({
-        behavior: effectiveBehavior,
-        answers: settledAnswers,
-        answerText,
-      }) === true
-      if (inWindow) {
-        this._askUserWaiters.delete(frame.requestId)
-        // Patch the tape card so the UI renders "already answered". Do not
-        // append a user-answer row or dispatchInbound — the in-flight turn
-        // consumes the answer via the MCP tool result.
-        void this._patchDetachedAskUserResolved(
-          pending,
-          frame.requestId,
-          {
-            _resolved: true,
-            _behavior: effectiveBehavior,
-            _settledReason: 'remote',
-            ...(settledAnswers ? { _answers: settledAnswers } : {}),
-          },
-        )
-        this.log.info('detached ask_user settled', {
-          requestId: frame.requestId,
-          behavior: effectiveBehavior,
-          startedTurn: false,
-          inWindow: true,
-        })
-        return
-      }
-      void this._patchDetachedAskUserResolved(
-        pending,
-        frame.requestId,
-        {
-          _resolved: true,
-          _behavior: effectiveBehavior,
-          _settledReason: 'remote',
-          ...(settledAnswers ? { _answers: settledAnswers } : {}),
-        },
-        answerText && answerId ? { id: answerId, text: answerText } : undefined,
-      )
-      if (answerText && answerId) {
-        await this._submitDetachedAskUserAnswer(pending, answerText, frame.requestId, answerId)
-      }
-      this.log.info('detached ask_user settled', {
-        requestId: frame.requestId,
-        behavior: effectiveBehavior,
-        startedTurn: effectiveBehavior === 'allow',
-        inWindow: false,
-      })
-      return
-    }
-    if (!session) {
-      this.log.warn('permission response for dead session', { sessionKey: pending.sessionKey })
-      return
-    }
-    const ok = session.runner.sendPermissionResponse(frame.requestId, response)
-    this.log.info('permission response', {
-      requestId: frame.requestId,
-      behavior: effectiveBehavior,
-      clientBehavior: frame.behavior,
-      ok,
-      toolName: pending.toolName,
-      askUserQuestionMerged:
-        pending.toolName === 'AskUserQuestion' && forwardedInput !== pending.input,
-    })
-    if (!ok) {
-      // The Codex reverse-RPC write did not reach a live stdin. Keep the
-      // authoritative prompt pending instead of recording/broadcasting a
-      // settlement the engine never received.
-      this._pendingPermissions.set(frame.requestId, pending)
-      this.log.warn('permission response write failed; request restored', {
-        requestId: frame.requestId,
-        sessionKey: pending.sessionKey,
-      })
-      return
-    }
-    // Record the authoritative result BEFORE broadcasting so any late
-    // duplicate response that arrives between here and the broadcast round
-    // will see the correct behavior. Use pending.* so late duplicates replay
-    // the server-trusted peer identity, not whatever the current client sent.
-    // effectiveBehavior may differ from frame.behavior when the AskUserQuestion
-    // sanitizer downgraded a malformed allow to deny — record the downgrade
-    // so other tabs see the truth.
-    //
-    // For AskUserQuestion allow we also record + broadcast the sanitized
-    // answers so other tabs can fill in their permission card correctly
-    // (without having the user re-enter anything) and the sender tab can
-    // reconcile its optimistic state if the gateway-visible answers ever
-    // differ from what the tab cached locally.
-    this._recordSettlement(frame.requestId, {
-      behavior: effectiveBehavior,
-      channel: pending.channel,
-      peer: pending.peer,
-      sessionKey: pending.sessionKey,
-      userId: pending.userId,
-      ...(settledAnswers ? { answers: settledAnswers } : {}),
-    })
-    // Tell every tab attached to this peer (including the sender) that the
-    // request is resolved. Other tabs dismiss their stuck prompt with the
-    // actual behavior. The sender tab previously treated this as a no-op,
-    // but now uses the broadcast to reconcile optimistic state (especially
-    // important when the gateway downgraded allow→deny).
-    this._broadcastPermissionSettled(pending.peerKey, {
-      sessionKey: pending.sessionKey,
-      channel: pending.channel,
-      peer: pending.peer,
-      requestId: frame.requestId,
-      behavior: effectiveBehavior,
-      reason: 'remote',
-      ...(settledAnswers ? { answers: settledAnswers } : {}),
-    })
+    return handlePermissionResponseImpl.call(this as unknown as AskUserPermissionsHost, frame)
   }
 
   /** Broadcast a settlement event to all WS clients at a peerKey.
@@ -11562,9 +9605,7 @@ export class Gateway {
    *  other tabs render the collected answers in the permission card, and
    *  lets the sender tab keep its optimistic state in sync if we later
    *  switch semantics (e.g. if answers get server-side post-processing). */
-  private _broadcastPermissionSettled(
-    peerKey: string,
-    payload: {
+  private _broadcastPermissionSettled(peerKey: string, payload: {
       sessionKey: string
       channel: string
       peer: { id: string; kind: 'dm' | 'group' }
@@ -11572,17 +9613,8 @@ export class Gateway {
       behavior: 'allow' | 'deny'
       reason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed' | 'user_stop'
       answers?: Record<string, string>
-    },
-  ): void {
-    // Route through the stamped session-frame helper so the settlement is
-    // recorded in the outbound ring buffer keyed by sessionKey. A reconnecting
-    // tab that missed the live broadcast (e.g. iOS Safari suspended its WS)
-    // can then receive the settled frame via ring replay and update the
-    // inline permission card from "Waiting" to "Allowed/Denied".
-    this._sendStampedSessionFrame(payload.sessionKey, peerKey, {
-      type: 'outbound.permission_settled',
-      ...payload,
-    })
+    }): void {
+    _broadcastPermissionSettledImpl.call(this as unknown as AskUserPermissionsHost, peerKey, payload)
   }
 
   /** Send a session-scoped wire frame to all WS clients at a peerKey, stamping
@@ -11813,157 +9845,8 @@ export class Gateway {
    * dispatchInbound path so it cannot vanish. The HTTP response is always
    * produced by the waiter timer or a terminal claim — it cannot hang past waitMs.
    */
-  private async handleEngineAskUser(
-    req: IncomingMessage,
-    res: ServerResponse,
-    targetAgentId: string,
-  ): Promise<void> {
-    if (req.method !== 'POST') return this.sendError(res, 405, 'method not allowed')
-    const body = await this.readBody(req)
-    let parsed: any
-    try {
-      parsed = JSON.parse(body)
-    } catch {
-      return this.sendError(res, 400, 'invalid JSON')
-    }
-    const questions = sanitizeEngineAskUserQuestions(parsed?.questions)
-    if (!questions) {
-      return this.sendError(
-        res,
-        400,
-        'questions invalid: need 1-4 items with question + 2-4 options each',
-      )
-    }
-    const sessionKey = typeof parsed.sessionKey === 'string' ? parsed.sessionKey : ''
-    if (!sessionKey) return this.sendError(res, 400, 'sessionKey required')
-    const session = this.sessions.getByKey(sessionKey)
-    if (!session) return this.sendError(res, 404, 'session not found')
-    if (session.agentId !== targetAgentId) {
-      return this.sendError(res, 409, 'session belongs to another agent')
-    }
-    if (session.providerTag && session.providerTag !== 'cursor') {
-      return this.sendError(res, 409, 'ask_user is only available on the cursor engine')
-    }
-    if (!session.runner.isRunning) {
-      return this.sendError(res, 409, 'no active turn on session')
-    }
-
-    const waitMs = resolveAskUserWaitMs(parsed.waitMs)
-    const deadlineAt = Date.now() + waitMs
-    const input = { questions }
-    const requestId = `ask-user:${randomBytes(16).toString('hex')}`
-    const userId = session.userId ?? 'default'
-    const channel = session.channel
-    const peer = {
-      id: session.peerId,
-      kind: sessionKey.includes(':group:') ? ('group' as const) : ('dm' as const),
-    }
-    const peerKey = Gateway.makePeerKey(userId, channel, peer.id)
-    const expiresAt = Date.now() + Gateway.DETACHED_ASK_USER_TTL_MS
-    if (!this._askUserWaiters) this._askUserWaiters = new Map()
-    const waiter = new AskUserWaiter()
-    this._askUserWaiters.set(requestId, waiter)
-    this._pendingPermissions.set(requestId, {
-      sessionKey,
-      toolName: 'AskUserQuestion',
-      input,
-      peerKey,
-      userId,
-      channel,
-      peer,
-      expiresAt,
-      detachedAskUser: true,
-    })
-
-    let clientGone = false
-    const releaseOnDisconnect = () => {
-      clientGone = true
-      waiter.tryRelease()
-    }
-    req.on('aborted', releaseOnDisconnect)
-    req.on('close', () => {
-      if (!res.headersSent) releaseOnDisconnect()
-    })
-
-    const persistArgs = {
-      requestId,
-      questions,
-      sessionKey,
-      userId,
-      channel,
-      peer,
-      expiresAt,
-      agentId: session.agentId,
-    }
-    const persistP = this._persistDetachedAskUserCard(persistArgs)
-    const persistBudget = Math.max(0, deadlineAt - Date.now())
-    await Promise.race([
-      persistP,
-      new Promise<void>((resolve) => setTimeout(resolve, persistBudget)),
-    ])
-    // Persist-first: the tape row exists (or we hit the waitMs budget) before
-    // the card is shown, so a later patch cannot beat the insert. The persist
-    // promise keeps running if we raced the deadline.
-    void persistP
-    this._sendStampedSessionFrame(sessionKey, peerKey, {
-      type: 'outbound.permission_request',
-      sessionKey,
-      channel,
-      peer,
-      requestId,
-      toolName: 'AskUserQuestion',
-      inputPreview: JSON.stringify(input).slice(0, 400),
-      inputJson: input,
-      expiresAt,
-      detachedAskUser: true,
-    })
-    this.log.info('engine ask_user posted', {
-      requestId,
-      sessionKey,
-      agentId: session.agentId,
-      waitMs,
-    })
-
-    const pendingForWait = { sessionKey, userId, channel, peer }
-    try {
-      const remaining = Math.max(0, deadlineAt - Date.now())
-      waiter.startTimer(remaining)
-      const result = await waiter.wait()
-      this._askUserWaiters.delete(requestId)
-      if (result.status === 'answered') {
-        await this._finishInWindowAskUserWait({
-          req,
-          res,
-          waiter,
-          result,
-          requestId,
-          pending: pendingForWait,
-          clientGone,
-        })
-        return
-      }
-      if (clientGone || askUserHttpUnwritable(req, res)) return
-      this.sendJson(res, 200, buildDetachedAskUserPostedResult(requestId))
-    } catch (err) {
-      waiter.tryRelease()
-      this._askUserWaiters.delete(requestId)
-      this.log.error('engine ask_user wait failed', { requestId }, err as Error)
-      const answered = waiter.getAnswer()
-      if (waiter.getPhase() === 'answered_in_window' && answered) {
-        await this._finishInWindowAskUserWait({
-          req,
-          res,
-          waiter,
-          result: { status: 'answered', answer: answered },
-          requestId,
-          pending: pendingForWait,
-          clientGone,
-        })
-        return
-      }
-      if (clientGone || askUserHttpUnwritable(req, res)) return
-      this.sendJson(res, 200, buildDetachedAskUserPostedResult(requestId))
-    }
+  private handleEngineAskUser(req: IncomingMessage, res: ServerResponse, targetAgentId: string): Promise<void> {
+    return handleEngineAskUserImpl.call(this as unknown as AskUserPermissionsHost, req, res, targetAgentId)
   }
 
   /**
@@ -11971,7 +9854,7 @@ export class Gateway {
    * same dispatchInbound path used after timeout. `tryClaimDelivery` is the
    * synchronous one-shot so HTTP success and compensation cannot both fire.
    */
-  private async _finishInWindowAskUserWait(args: {
+  private _finishInWindowAskUserWait(args: {
     req: IncomingMessage
     res: ServerResponse
     waiter: AskUserWaiter
@@ -11985,80 +9868,23 @@ export class Gateway {
     }
     clientGone: boolean
   }): Promise<void> {
-    const { req, res, waiter, result, requestId, pending, clientGone } = args
-    const answer = result.answer
-    const httpBlocked = clientGone || askUserHttpUnwritable(req, res)
-
-    if (!httpBlocked) {
-      if (!waiter.tryClaimDelivery()) return
-      try {
-        if (answer.behavior === 'deny') {
-          this.sendJson(res, 200, buildDetachedAskUserSkippedResult(requestId))
-        } else {
-          this.sendJson(res, 200, buildDetachedAskUserAnsweredResult({
-            requestId,
-            answers: answer.answers,
-            answerText: answer.answerText,
-          }))
-        }
-        if (askUserHttpWriteSucceeded(res)) return
-      } catch (err) {
-        this.log.warn('in-window ask_user HTTP write failed', { requestId }, err as Error)
-      }
-      if (answer.behavior === 'allow' && answer.answerText) {
-        try {
-          await this._compensateInWindowAskUserAnswer(pending, requestId, answer)
-        } catch (err) {
-          this.log.error('in-window ask_user compensation failed', { requestId }, err as Error)
-        }
-      }
-      return
-    }
-
-    if (answer.behavior === 'allow' && answer.answerText) {
-      if (!waiter.tryClaimDelivery()) return
-      try {
-        await this._compensateInWindowAskUserAnswer(pending, requestId, answer)
-      } catch (err) {
-        this.log.error('in-window ask_user compensation failed', { requestId }, err as Error)
-      }
-      return
-    }
-    waiter.tryClaimDelivery()
+    return _finishInWindowAskUserWaitImpl.call(this as unknown as AskUserPermissionsHost, args)
   }
 
   /**
    * In-window answer could not be written back to the MCP HTTP caller.
    * Reuse the timeout-then-answer path: tape user-answer row + dispatchInbound.
    */
-  private async _compensateInWindowAskUserAnswer(
-    pending: {
+  private _compensateInWindowAskUserAnswer(pending: {
       sessionKey: string
       userId: string
       channel: string
       peer: { id: string; kind: 'dm' | 'group' }
-    },
-    requestId: string,
-    answer: AskUserWaiterAnswer,
-  ): Promise<void> {
-    if (answer.behavior !== 'allow' || !answer.answerText) return
-    const answerId = buildDetachedAskUserAnswerMessageId(requestId)
-    void this._patchDetachedAskUserResolved(
-      pending,
-      requestId,
-      {
-        _resolved: true,
-        _behavior: 'allow',
-        _settledReason: 'remote',
-        ...(answer.answers ? { _answers: answer.answers } : {}),
-      },
-      { id: answerId, text: answer.answerText },
-    )
-    this.log.info('in-window ask_user compensated via new turn', { requestId })
-    await this._submitDetachedAskUserAnswer(pending, answer.answerText, requestId, answerId)
+    }, requestId: string, answer: AskUserWaiterAnswer): Promise<void> {
+    return _compensateInWindowAskUserAnswerImpl.call(this as unknown as AskUserPermissionsHost, pending, requestId, answer)
   }
 
-  private async _persistDetachedAskUserCard(args: {
+  private _persistDetachedAskUserCard(args: {
     requestId: string
     questions: Array<Record<string, unknown>>
     sessionKey: string
@@ -12068,177 +9894,23 @@ export class Gateway {
     expiresAt: number
     agentId: string
   }): Promise<void> {
-    const msg = buildDetachedAskUserPersistMessage(args)
-    const sink = getV3MasterSinkOrNull()
-    if (sink) {
-      try {
-        const outcome = await sink.persistOrQueue(buildDetachedAskUserSinkPayload({
-          requestId: args.requestId,
-          questions: args.questions,
-          sessionKey: args.sessionKey,
-          agentId: args.agentId,
-          sessionId: args.peer.id,
-          channel: args.channel,
-          peer: args.peer,
-          expiresAt: args.expiresAt,
-          ts: msg.ts,
-        }))
-        if (outcome.ok) {
-          this.log.info('detached ask_user persist acked via master sink', {
-            requestId: args.requestId,
-          })
-          return
-        }
-        if ('queued' in outcome && outcome.queued) {
-          this.log.error('detached ask_user persist queued for master-sink retry', {
-            requestId: args.requestId,
-            errorClass: outcome.errorClass,
-          })
-          return
-        }
-        this.log.error('detached ask_user persist dropped by master sink', {
-          requestId: args.requestId,
-          reason: 'droppedReason' in outcome ? outcome.droppedReason : 'dropped',
-        })
-      } catch (err) {
-        this.log.error(
-          'detached ask_user persist via master sink failed',
-          { requestId: args.requestId },
-          err as Error,
-        )
-      }
-      return
-    }
-    try {
-      const r = await appendServerAuthoredMessageDurable(args.peer.id, args.userId, msg)
-      if (r.applied || r.reason === 'already_exists') return
-      this.log.error('detached ask_user persist not applied', {
-        requestId: args.requestId,
-        reason: r.reason,
-        ...('error' in r ? { error: r.error } : {}),
-      })
-    } catch (err) {
-      this.log.error('detached ask_user persist failed', { requestId: args.requestId }, err as Error)
-    }
+    return _persistDetachedAskUserCardImpl.call(this as unknown as AskUserPermissionsHost, args)
   }
 
-  private async _patchDetachedAskUserResolved(
-    pending: {
+  private _patchDetachedAskUserResolved(pending: {
       peer: { id: string; kind?: 'dm' | 'group' }
       userId: string
       sessionKey: string
       channel?: string
-    },
-    requestId: string,
-    patch: Record<string, unknown>,
-    userAnswer?: { id: string; text: string; ts?: number },
-  ): Promise<void> {
-    const behavior = patch._behavior === 'allow' || patch._behavior === 'deny'
-      ? patch._behavior
-      : 'deny'
-    const settledReason =
-      patch._settledReason === 'remote' ||
-      patch._settledReason === 'already_settled' ||
-      patch._settledReason === 'disconnect' ||
-      patch._settledReason === 'timeout' ||
-      patch._settledReason === 'crashed' ||
-      patch._settledReason === 'user_stop'
-        ? patch._settledReason
-        : 'remote'
-    const answers =
-      patch._answers && typeof patch._answers === 'object' && !Array.isArray(patch._answers)
-        ? (patch._answers as Record<string, string>)
-        : undefined
-    const sink = getV3MasterSinkOrNull()
-    if (sink) {
-      try {
-        const outcome = await sink.persistOrQueue(buildDetachedAskUserResolvedSinkPayload({
-          requestId,
-          agentId: agentIdFromAskUserSessionKey(pending.sessionKey),
-          sessionId: pending.peer.id,
-          sessionKey: pending.sessionKey,
-          behavior,
-          settledReason,
-          answers,
-          userAnswer,
-        }))
-        if (outcome.ok) {
-          this.log.info('detached ask_user resolved persist acked via master sink', { requestId })
-          return
-        }
-        if ('queued' in outcome && outcome.queued) {
-          this.log.error('detached ask_user resolved persist queued for master-sink retry', {
-            requestId,
-            errorClass: outcome.errorClass,
-          })
-          return
-        }
-        this.log.error('detached ask_user resolved persist dropped by master sink', {
-          requestId,
-          reason: 'droppedReason' in outcome ? outcome.droppedReason : 'dropped',
-        })
-      } catch (err) {
-        this.log.error(
-          'detached ask_user resolved persist via master sink failed',
-          { requestId },
-          err as Error,
-        )
-      }
-      return
-    }
-    try {
-      const r = await patchServerAuthoredMessage(pending.peer.id, pending.userId, requestId, patch)
-      if (!r.applied) {
-        this.log.error('detached ask_user tape patch not applied', {
-          requestId,
-          reason: r.reason,
-        })
-      }
-    } catch (err) {
-      this.log.error('detached ask_user tape patch failed', { requestId }, err as Error)
-    }
-    if (!userAnswer) return
-    try {
-      const r = await appendServerAuthoredMessageDurable(pending.peer.id, pending.userId, {
-        id: userAnswer.id,
-        role: 'user',
-        text: userAnswer.text,
-        ts: userAnswer.ts ?? Date.now(),
-      })
-      if (r.applied || r.reason === 'already_exists') return
-      this.log.error('detached ask_user answer persist not applied', {
-        requestId,
-        reason: r.reason,
-        ...('error' in r ? { error: r.error } : {}),
-      })
-    } catch (err) {
-      this.log.error('detached ask_user answer persist failed', { requestId }, err as Error)
-    }
+    }, requestId: string, patch: Record<string, unknown>, userAnswer?: { id: string; text: string; ts?: number }): Promise<void> {
+    return _patchDetachedAskUserResolvedImpl.call(this as unknown as AskUserPermissionsHost, pending, requestId, patch, userAnswer)
   }
 
-  private async _loadDetachedAskUserCard(
-    sessionId: string,
-    userId: string,
-    requestId: string,
-  ): Promise<Record<string, unknown> | null> {
-    if (getV3MasterSinkOrNull() || readV3MasterSinkConfig()) {
-      return fetchAskUserPermissionCard({ sessionId, requestId })
-    }
-    const sess = await getClientSession(sessionId, userId)
-    const hot = findDetachedAskUserCardInMessages(sess?.messages, requestId)
-    if (hot) return hot
-    let beforeSeq = 0
-    for (let pageNo = 0; pageNo < 16; pageNo++) {
-      const page = await readArchivedMessages(sessionId, userId, beforeSeq, 200)
-      const archived = findDetachedAskUserCardInMessages(page.messages, requestId)
-      if (archived) return archived
-      if (!page.hasMore || page.oldestSeq == null) break
-      beforeSeq = page.oldestSeq
-    }
-    return null
+  private _loadDetachedAskUserCard(sessionId: string, userId: string, requestId: string): Promise<Record<string, unknown> | null> {
+    return _loadDetachedAskUserCardImpl.call(this as unknown as AskUserPermissionsHost, sessionId, userId, requestId)
   }
 
-  private async _hydrateDetachedAskUserPending(frame: {
+  private _hydrateDetachedAskUserPending(frame: {
     requestId: string
     channel: string
     peer: { id: string; kind: 'dm' | 'group' }
@@ -12247,103 +9919,20 @@ export class Gateway {
      *  once the in-memory pending entry is gone (restart / TTL rebuild). */
     _userId?: unknown
   }): Promise<ReturnType<typeof pendingFromDetachedAskUserMessage>> {
-    if (!isDetachedAskUserRequestId(frame.requestId)) return null
-    const userId = typeof frame._userId === 'string' && frame._userId ? frame._userId : 'default'
-    try {
-      const msg = await this._loadDetachedAskUserCard(frame.peer.id, userId, frame.requestId)
-      if (!msg) return null
-      return pendingFromDetachedAskUserMessage(msg, {
-        userId,
-        channel: frame.channel,
-        peer: frame.peer,
-        peerKey: Gateway.makePeerKey(userId, frame.channel, frame.peer.id),
-      })
-    } catch (err) {
-      this.log.error('detached ask_user hydrate failed', { requestId: frame.requestId }, err as Error)
-      return null
-    }
+    return _hydrateDetachedAskUserPendingImpl.call(this as unknown as AskUserPermissionsHost, frame)
   }
 
-  private async _submitDetachedAskUserAnswer(
-    pending: {
+  private async _submitDetachedAskUserAnswer(pending: {
       sessionKey: string
       userId: string
       channel: string
       peer: { id: string; kind: 'dm' | 'group' }
-    },
-    text: string,
-    requestId: string,
-    clientMessageId: string = buildDetachedAskUserAnswerMessageId(requestId),
-  ): Promise<void> {
-    const agentId = agentIdFromAskUserSessionKey(pending.sessionKey)
-    await this.dispatchInbound({
-      type: 'inbound.message',
-      channel: pending.channel,
-      peer: pending.peer,
-      agentId,
-      content: { text },
-      ts: Date.now(),
-      idempotencyKey: `ask-user-answer:${requestId}`,
-      clientMessageId,
-      _userId: pending.userId,
-    } as any)
+    }, text: string, requestId: string, clientMessageId: string = buildDetachedAskUserAnswerMessageId(requestId)): Promise<void> {
+    return _submitDetachedAskUserAnswerImpl.call(this as unknown as AskUserPermissionsHost, pending, text, requestId, clientMessageId)
   }
 
-  private _forceDenyPendingPermission(
-    requestId: string,
-    reason: 'disconnect' | 'timeout' | 'crashed' | 'user_stop',
-    denyMessage: string,
-  ): boolean {
-    const pending = this._pendingPermissions.get(requestId)
-    if (!pending) return false
-    this._pendingPermissions.delete(requestId)
-    // Unblock a held ask_user HTTP waiter (if any) before anything that could
-    // throw, so it never hangs to the 60s MCP tools/call wall.
-    this._askUserWaiters?.get(requestId)?.tryRelease()
-    this._askUserWaiters?.delete(requestId)
-    const session = this.sessions.getByKey(pending.sessionKey)
-    if (session && !isDetachedAskUserPending(pending)) {
-      // sendPermissionResponse swallows its own errors and returns false if
-      // the subprocess is gone — `false` is expected on crash/exit paths.
-      const ok = session.runner.sendPermissionResponse(requestId, {
-        behavior: 'deny',
-        message: denyMessage,
-        toolUseID: pending.toolUseId,
-      })
-      this.log.info('auto-denied pending permission', {
-        requestId,
-        reason,
-        runnerAccepted: ok,
-      })
-    }
-    if (isDetachedAskUserPending(pending)) {
-      void this._patchDetachedAskUserResolved(pending, requestId, {
-        _resolved: true,
-        _behavior: 'deny',
-        _settledReason: reason,
-      })
-    }
-    // Record authoritative 'deny' so a late duplicate response (from a
-    // reconnecting tab or a redelivered frame) replays the correct result
-    // instead of whatever the late responder happens to have sent.
-    this._recordSettlement(requestId, {
-      behavior: 'deny',
-      channel: pending.channel,
-      peer: pending.peer,
-      sessionKey: pending.sessionKey,
-      userId: pending.userId,
-    })
-    // Broadcast so any still-connected tab dismisses its modal immediately.
-    // No-op when no clients remain (e.g. disconnect path).
-    this._broadcastPermissionSettled(pending.peerKey, {
-      sessionKey: pending.sessionKey,
-      channel: pending.channel,
-      peer: pending.peer,
-      requestId,
-      behavior: 'deny',
-      reason,
-    })
-    return true
+  private _forceDenyPendingPermission(requestId: string, reason: 'disconnect' | 'timeout' | 'crashed' | 'user_stop', denyMessage: string): boolean {
+    return _forceDenyPendingPermissionImpl.call(this as unknown as AskUserPermissionsHost, requestId, reason, denyMessage)
   }
 
   /**
@@ -12357,14 +9946,7 @@ export class Gateway {
    * `_autoDenyPendingPermissions` and `_sweepStalePendingPermissions`.
    */
   private _reapCrashedSessionPendingPermissions(sessionKey: string): void {
-    const pendingToReap: string[] = []
-    for (const [requestId, pending] of this._pendingPermissions) {
-      if (isDetachedAskUserPending(pending)) continue
-      if (pending.sessionKey === sessionKey) pendingToReap.push(requestId)
-    }
-    for (const requestId of pendingToReap) {
-      this._forceDenyPendingPermission(requestId, 'crashed', 'Session crashed')
-    }
+    _reapCrashedSessionPendingPermissionsImpl.call(this as unknown as AskUserPermissionsHost, sessionKey)
   }
 
   /**
@@ -12389,77 +9971,20 @@ export class Gateway {
    * permissions for different turns of one session at once). Returns the
    * number of settled requests.
    */
-  private _settlePendingPermissionsForStop(
-    sessionKey: string,
-    clientMessageId?: string,
-  ): number {
-    const toSettle: string[] = []
-    for (const [requestId, pending] of this._pendingPermissions) {
-      if (isDetachedAskUserPending(pending)) continue
-      if (pending.sessionKey !== sessionKey) continue
-      if (clientMessageId && pending.clientMessageId && pending.clientMessageId !== clientMessageId) {
-        continue
-      }
-      toSettle.push(requestId)
-    }
-    let settled = 0
-    for (const requestId of toSettle) {
-      if (this._forceDenyPendingPermission(requestId, 'user_stop', 'User stopped the turn')) {
-        settled += 1
-      }
-    }
-    if (settled > 0) {
-      this.log.info('stop settled pending permissions', {
-        sessionKey,
-        clientMessageId,
-        count: settled,
-      })
-    }
-    return settled
+  private _settlePendingPermissionsForStop(sessionKey: string, clientMessageId?: string): number {
+    return _settlePendingPermissionsForStopImpl.call(this as unknown as AskUserPermissionsHost, sessionKey, clientMessageId)
   }
 
   /** Auto-deny all pending permission requests associated with a peerKey (on disconnect) */
   private _autoDenyPendingPermissions(peerKey: string): void {
-    // Snapshot requestIds first — the helper mutates _pendingPermissions.
-    const requestIds: string[] = []
-    for (const [requestId, pending] of this._pendingPermissions) {
-      if (pending.detachedAskUser || pending.blockingUserInput) continue
-      if (pending.peerKey === peerKey) requestIds.push(requestId)
-    }
-    for (const requestId of requestIds) {
-      this._forceDenyPendingPermission(requestId, 'disconnect', 'Client disconnected')
-    }
+    _autoDenyPendingPermissionsImpl.call(this as unknown as AskUserPermissionsHost, peerKey)
   }
 
   /** Periodic janitor: auto-deny permissions whose wait has exceeded the TTL.
    *  Also cleans up entries whose session no longer exists (subprocess was
    *  evicted or destroyed without going through the crash event path). */
   private _sweepStalePendingPermissions(): void {
-    const now = Date.now()
-    const toExpire: Array<{ requestId: string; reason: 'timeout' | 'crashed' }> = []
-    for (const [requestId, pending] of this._pendingPermissions) {
-      if (isDetachedAskUserPending(pending)) {
-        // 24h TTL only. Turn end / session eviction must not kill the card.
-        if (now >= pending.expiresAt) toExpire.push({ requestId, reason: 'timeout' })
-        continue
-      }
-      if (now >= pending.expiresAt) {
-        toExpire.push({ requestId, reason: 'timeout' })
-      } else if (!this.sessions.getByKey(pending.sessionKey)) {
-        // Orphan: session was evicted/ended without the crash event firing.
-        // Treat as "crashed" for the UI — the underlying subprocess is gone.
-        toExpire.push({ requestId, reason: 'crashed' })
-      }
-    }
-    if (toExpire.length === 0) return
-    for (const { requestId, reason } of toExpire) {
-      const msg = reason === 'timeout' ? 'Permission request timed out' : 'Session ended'
-      this._forceDenyPendingPermission(requestId, reason, msg)
-    }
-    this.log.info('pending permission sweep', {
-      expired: toExpire.length,
-      remaining: this._pendingPermissions.size,
-    })
+    _sweepStalePendingPermissionsImpl.call(this as unknown as AskUserPermissionsHost)
   }
 
   /** Pre-warm webchat sessions on boot so they respond instantly to the first user message */

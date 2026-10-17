@@ -3,6 +3,7 @@
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/cronChannelsRoute.test.ts
  */
+import { readGatewaySource } from './helpers/gatewaySource.js'
 import * as assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -24,8 +25,9 @@ describe('GET /api/cron/channels 网关接线', () => {
     assert.ok(cronAt >= 0)
     assert.ok(itemAt > channelsAt, '/api/cron/channels 必须在 :id 正则之前,否则会被当成 job id')
     assert.match(routeSrc, /io\.handleCronChannels\(/)
-    assert.match(serverSrc, /handleCronChannels\(/)
-    assert.match(serverSrc, /listCronDeliverChannels\(/)
+    // FINDINGS §7.6 S4: the cron handlers live in cronTaskWebhook.ts (server.ts keeps forwarders)
+    assert.match(readGatewaySource(), /handleCronChannels\(/)
+    assert.match(readGatewaySource(), /listCronDeliverChannels\(/)
   })
 
   it('KNOWN_ROUTES 含 /api/cron/channels', () => {
