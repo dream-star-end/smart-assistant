@@ -79,6 +79,8 @@ type Api = {
   replayStore: (root: string) => { write: unknown; read: unknown };
   stopHandler: (deps: unknown) => RouteHandler;
   idleProofHandler: (deps: unknown) => RouteHandler;
+  /** OCV5-488: the product's Box billing reconcile, which settles a handoff's completed calls. */
+  settleBoxBilling: (db: Db) => Promise<{ settled: number; pending: number; manual: number }>;
   /** OCV5-488: the ops.box_hold_stuck alert's own query and row mapping. */
   boxHoldStuck: { sql: string; rows: (rows: unknown[]) => Array<{ requestId: string; absent: boolean }> };
   jsonError: (res: unknown, status: number, code: string, message: string, requestId: string) => void;
@@ -182,6 +184,8 @@ async function load(): Promise<Api> {
   const journal = await import(pathToFileURL(join(PROXY, "boxDurableJournal.ts")).href);
   const stop = await import(pathToFileURL(join(PROXY, "boxUserStopCoordinator.ts")).href);
   const holdStuck = await import(pathToFileURL(join(PROXY, "boxHoldStuck.ts")).href);
+  const boxBilling = await import(pathToFileURL(join(CANDIDATE,
+    "packages/commercial/src/billing/boxBillingRecovery.ts")).href);
   const billing = await import(pathToFileURL(join(PROXY, "boxBillingContext.ts")).href);
   const toolFetch = await import(pathToFileURL(join(PROXY, "boxToolFetch.ts")).href);
   const replay = await import(pathToFileURL(join(PROXY, "boxReplayCompleted.ts")).href);
@@ -250,6 +254,8 @@ async function load(): Promise<Api> {
       read: replaySetup.createBoxReplayReader(root) }),
     stopHandler: stopRoute.makeBoxUserStopHandler, idleProofHandler: idleRoute.makeBoxIdleProofHandler,
     boxHoldStuck: { sql: holdStuck.BOX_HOLD_STUCK_SQL, rows: holdStuck.boxHoldStuckRows },
+    settleBoxBilling: (db) => boxBilling.reconcileBoxBillingBatch({ query: db.query.bind(db),
+      connect: async () => ({ query: db.query.bind(db), release: () => {} }) }, 50),
     jsonError: shared.sendJsonError,
     gateReject: (kind: string, detail: string) => new authorityGate.ModelGateReject(kind, detail),
     boxCli: { runner: (opts) => new boxRunner.SubprocessRunner(opts), bridge: boxBridge.runBoxCcBridge },
@@ -3213,20 +3219,28 @@ async function proveProcessAbsentReleased(api: Api, db: Db): Promise<string> {
       { parked: "unreadable", liveness: look });
     await turn.first();
     const requestId = `box-${label}-1`;
-    const leaf = await journalRow(db, requestId);
-    if (leaf?.ctx.boxState !== "handoff" || leaf.state !== "committed") {
-      fail(`ABSENT_${label}_FIXTURE_${String(leaf?.ctx.boxState)}_${String(leaf?.state)}`);
-    }
-    // past the launch grace; the run is nowhere near its 4 h 15 min ceiling
+    if ((await journalRow(db, requestId))?.ctx.boxState !== "handoff") fail(`ABSENT_${label}_FIXTURE`);
+    // past the launch grace and the live finalizer's grace; nowhere near the 4 h 15 min ceiling
     await aged(db, requestId, "10 minutes", true);
-    return { who, turn, look, requestId, leaf: leaf! };
+    return { who, turn, look, requestId };
   };
   const gone = await park(900_000_488n, "gone");
   const rebooted = await park(900_000_489n, "rebooted");
+  // the product's own billing reconcile settles the calls these rounds completed (10-17: 1943 credits)
+  await api.settleBoxBilling(db);
+  const billed = new Map<string, Awaited<ReturnType<typeof journalRow>>>();
+  for (const run of [gone, rebooted]) {
+    const row = await journalRow(db, run.requestId);
+    if (row?.state !== "committed" || row.ctx.boxState !== "handoff") {
+      fail(`ABSENT_${run.requestId}_NOT_SETTLED_${String(row?.state)}`);
+    }
+    billed.set(run.requestId, row);
+  }
+  // this one's completed calls are not settled yet: closing it would hide them from the billing scan
   const unsettled = await park(900_000_490n, "unsettled");
-  // its completed calls are not settled yet: closing it would hide them from the Box billing scan
-  await db.query("UPDATE request_finalize_journal SET state='inflight' WHERE request_id=$1", [unsettled.requestId]);
+  if ((await journalRow(db, unsettled.requestId))?.state !== "inflight") fail("ABSENT_UNSETTLED_FIXTURE");
   const runs = [gone, rebooted, unsettled];
+  const moneyBefore = await Promise.all([gone, rebooted].map((run) => money(db, run.who.uid)));
   const worker = boxCleanupWorker(api, journal, runs.map((run) => run.turn));
   const round = async () => {
     for (const run of runs) await rearm(db, run.requestId);
@@ -3259,11 +3273,17 @@ async function proveProcessAbsentReleased(api: Api, db: Db): Promise<string> {
   for (const run of [gone, rebooted]) {
     const row = await journalRow(db, run.requestId);
     const close = row?.ctx.boxExpiredClose as { cause?: string; priorBoxState?: string } | undefined;
+    const before = billed.get(run.requestId);
     if (row?.ctx.boxState !== "expired_unproven" || close?.cause !== "box_process_absent"
-      || close.priorBoxState !== "handoff" || row.state !== run.leaf.state || row.credits !== run.leaf.credits
+      || close.priorBoxState !== "handoff" || row.state !== before?.state || row.credits !== before?.credits
       || run.turn.host.count.stop !== 0) {
       fail(`ABSENT_NOT_RELEASED_${run.requestId}_${String(row?.ctx.boxState)}_${String(close?.cause)}_${row?.state}_${row?.credits}`);
     }
+  }
+  // closing changed no money: same usage, ledger and wallets as right after settlement
+  const moneyAfter = await Promise.all([gone, rebooted].map((run) => money(db, run.who.uid)));
+  if (!isDeepStrictEqual(moneyBefore, moneyAfter)) fail(`ABSENT_MONEY_${JSON.stringify([moneyBefore, moneyAfter])}`);
+  for (const run of [gone, rebooted]) {
     await sessionReleased(api, db, journal, run.who, turnKey, `ABSENT_${run.requestId.toUpperCase().replaceAll("-", "_")}`);
   }
   // unsettled: still held, and ten minutes on the alert's own query names it
