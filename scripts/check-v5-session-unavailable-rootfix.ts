@@ -32,6 +32,8 @@ const gatewaySource = [
   'advisorHandlers.ts',
   'askUserPermissions.ts',
   'cronTaskWebhook.ts',
+  'httpMiscHandlers.ts',
+  'channelHandlers.ts',
 ]
   .map((f) => readFileSync(join(root, 'packages/gateway/src', f), 'utf8'))
   .join('\n')

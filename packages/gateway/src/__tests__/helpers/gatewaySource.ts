@@ -25,6 +25,8 @@ export const GATEWAY_SOURCE_FILES: readonly string[] = [
   'advisorHandlers.ts',
   'askUserPermissions.ts',
   'cronTaskWebhook.ts',
+  'httpMiscHandlers.ts',
+  'channelHandlers.ts',
 ]
 
 export function readGatewaySource(): string {

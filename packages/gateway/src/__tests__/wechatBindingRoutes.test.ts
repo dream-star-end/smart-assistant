@@ -9,6 +9,7 @@
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/wechatBindingRoutes.test.ts
  */
+import { gatewayMethodBody, readGatewaySource } from './helpers/gatewaySource.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -30,7 +31,8 @@ function extractMethodBody(source: string, methodName: string): string {
   return source.slice(startIdx, endIdx)
 }
 
-const handleWechat = extractMethodBody(SERVER_TS, '_handleWechat')
+// FINDINGS §7.6 S5: _handleWechat lives in channelHandlers.ts; the class keeps a forwarder.
+const handleWechat = gatewayMethodBody('_handleWechat')
 
 test('_handleWechat maps duplicate-account pairing to WECHAT_ACCOUNT_ALREADY_BOUND 409', () => {
   assert.match(handleWechat, /WechatAccountAlreadyBoundError/)
