@@ -291,7 +291,7 @@ RUN printf '%s\n' 'deb http://deb.debian.org/debian bookworm-backports main' \
 # seam 永不走 codex、模型面无 gpt-*,故 codex 二进制对 v5 是纯死重)。v3 默认 1,行为不变。
 ARG OC_INCLUDE_CODEX=1
 RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
-      npm install -g @openai/codex@0.159.2 --no-audit --no-fund \
+      npm install -g @openai/codex@0.163.0 --no-audit --no-fund \
       && npm cache clean --force \
       && rm -rf /root/.npm; \
     else echo "[v5 ccb-only] skip codex CLI install (OC_INCLUDE_CODEX=0)"; fi
@@ -301,7 +301,7 @@ RUN if [ "$OC_INCLUDE_CODEX" = "1" ]; then \
 # pinned and verified at build time; gateway additionally gates every spawn to
 # a credential-bound loopback Cursor relay.
 ARG OC_INCLUDE_OFFICIAL_CLAUDE=0
-ARG OC_OFFICIAL_CLAUDE_VERSION=2.1.280
+ARG OC_OFFICIAL_CLAUDE_VERSION=2.1.302
 RUN if [ "$OC_INCLUDE_OFFICIAL_CLAUDE" = "1" ]; then set -eux; \
       npm install -g "@anthropic-ai/claude-code@${OC_OFFICIAL_CLAUDE_VERSION}" --no-audit --no-fund; \
       test "$(claude --version | awk '{print $1}')" = "$OC_OFFICIAL_CLAUDE_VERSION"; \
@@ -315,8 +315,8 @@ RUN if [ "$OC_INCLUDE_OFFICIAL_CLAUDE" = "1" ]; then set -eux; \
 # account-scoped wrapper always resolves this exact, checksum-pinned build.
 # Opt-in keeps ordinary V3/runtime rebuilds unchanged. A Cursor-enabled V5
 # candidate must build with OC_INCLUDE_CURSOR=1 and retain the matching label.
-ARG OC_CURSOR_AGENT_VERSION=2026.08.11-e8db854
-ARG OC_CURSOR_AGENT_SHA256=bfff4bf6f4e9dd30c1d0ef0a70b6077b074015dd2948e4c50685d53afdcfce5a
+ARG OC_CURSOR_AGENT_VERSION=2026.10.16-e3cb207
+ARG OC_CURSOR_AGENT_SHA256=3aa3f48cd7a3909a98c9b3f2a4085f0c021088bf826690b22c61f424c843e552
 ARG OC_INCLUDE_CURSOR=0
 COPY --chown=root:root ./scripts/patch-cursor-agent-sand.mjs /usr/local/lib/openclaude/patch-cursor-agent-sand.mjs
 RUN if [ "$OC_INCLUDE_CURSOR" = "1" ]; then set -eux; \
@@ -356,7 +356,7 @@ COPY --chown=root:root ./platform-runtime/etc-codex/managed_config.toml /etc/cod
 # native binary under $GROK_HOME; copy that verified binary to /usr/local/bin so
 # per-user persistent homes do not each receive a ~100 MB duplicate.
 ARG OC_INCLUDE_GROK=0
-ARG OC_GROK_VERSION=1.0.13
+ARG OC_GROK_VERSION=1.0.62
 RUN if [ "$OC_INCLUDE_GROK" = "1" ]; then set -eux; \
       npm install -g "@xai-official/grok@${OC_GROK_VERSION}" --no-audit --no-fund; \
       grok --version | grep -q "^grok ${OC_GROK_VERSION} "; \
@@ -368,14 +368,15 @@ RUN if [ "$OC_INCLUDE_GROK" = "1" ]; then set -eux; \
     else echo "[runtime] skip Grok CLI install (OC_INCLUDE_GROK=0)"; fi
 
 # Experimental community ZCode CLI — NOT an official standalone product.
-# The 0.16.3 `zcode.cjs` is extracted from official desktop AppImage 3.8.1
-# (community-verified pairing). Default off; fail-closed when the pin cannot
+# The 0.16.9 `zcode.cjs` is extracted from official desktop AppImage 3.15.3
+# (OCV5-470; 3.8.1/0.16.3 is gone from the CDN). 0.16.9 also reads
+# `provider/zcode-builtin.json` next to the script, so that file is copied too. Default off; fail-closed when the pin cannot
 # be verified. Do not install npm `zcode` / `zcode-cli` (0.0.1 stubs).
 # First `hsqs` offset in this AppImage is a false positive; use the embedded
 # --appimage-extract runtime instead of unsquashfs -o $first_offset.
-ARG OC_ZCODE_APPIMAGE_VERSION=3.8.1
-ARG OC_ZCODE_APPIMAGE_SHA256=ba51f8c091762bf1ba733cb71390975b8397dc178c753d52d4738365ce59ac61
-ARG OC_ZCODE_CLI_VERSION=0.16.3
+ARG OC_ZCODE_APPIMAGE_VERSION=3.15.3
+ARG OC_ZCODE_APPIMAGE_SHA256=2edc79650fcff72358670af4ffbfbf7d979ba95476611a80ad1151d577e90fe3
+ARG OC_ZCODE_CLI_VERSION=0.16.9
 ARG OC_INCLUDE_ZCODE=0
 RUN if [ "$OC_INCLUDE_ZCODE" = "1" ]; then set -eux; \
       test "$(dpkg --print-architecture)" = amd64; \
@@ -392,6 +393,10 @@ RUN if [ "$OC_INCLUDE_ZCODE" = "1" ]; then set -eux; \
       install_root="/opt/zcode-cli/versions/${OC_ZCODE_CLI_VERSION}"; \
       mkdir -p "$install_root"; \
       cp "$cjs" "$install_root/zcode.cjs"; \
+      builtin=$(find /tmp/zcode-extract/squashfs-root -path '*/config/provider/zcode-builtin.json' -type f | head -1); \
+      test -n "$builtin"; \
+      mkdir -p "$install_root/provider"; \
+      cp "$builtin" "$install_root/provider/zcode-builtin.json"; \
       chmod 0755 "$install_root/zcode.cjs"; \
       chmod -R a-w "$install_root"; \
       test "$(node "$install_root/zcode.cjs" --version)" = "$OC_ZCODE_CLI_VERSION"; \
@@ -798,12 +803,12 @@ RUN set -eux; \
 # ------------------------------------------------------------
 # Opt-in like Grok/ZCode. Placed at the end of `base` so the heavy cached layers
 # above stay valid. Release-bucket URL + sha512 from the official manifest for
-# 1.3.4 (docs/ocv5-415-antigravity-cli.md §2). No Node dependency. Auto-update
+# 1.4.0 (docs/ocv5-415-antigravity-cli.md §2). No Node dependency. Auto-update
 # is disabled at runtime by the adapter (AGY_CLI_DISABLE_AUTO_UPDATE=true).
 ARG OC_INCLUDE_ANTIGRAVITY=0
-ARG OC_ANTIGRAVITY_CLI_VERSION=1.3.4
-ARG OC_ANTIGRAVITY_CLI_BUILD=1.3.4-5524158944247808
-ARG OC_ANTIGRAVITY_CLI_SHA512=dbdacfc5a1d9874fbbea3a21026d3990b4728e2e3487fd0316dc53cae9a3091023f969425828f3e2e0fadda43cea07dd978ea96f4ca7c202adf2201f419c56dd
+ARG OC_ANTIGRAVITY_CLI_VERSION=1.4.0
+ARG OC_ANTIGRAVITY_CLI_BUILD=1.4.0-5281842794987520
+ARG OC_ANTIGRAVITY_CLI_SHA512=6c4b298c2a69b6bd0f58567031cc56d8097a32be54c4b633aa80ad395871b389618ab3860d4ba0a12599831b8226b51b03e258ee2ec7fae105a45b8e0fce2188
 RUN if [ "$OC_INCLUDE_ANTIGRAVITY" = "1" ]; then set -eux; \
       test "$(dpkg --print-architecture)" = amd64; \
       archive=/tmp/antigravity-cli-${OC_ANTIGRAVITY_CLI_VERSION}.tar.gz; \

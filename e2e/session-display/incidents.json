@@ -5426,17 +5426,17 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-grok-cli-compatibility.ts",
-          "assertion": "[grok-426-offline-prepare] PASS — the cutover is prepared only for an image whose Grok CLI is 1.0.13"
+          "assertion": "[grok-426-offline-prepare] PASS — the cutover is prepared only for an image whose Grok CLI is 1.0.62"
         },
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-grok-cli-compatibility.ts",
-          "assertion": "[grok-426-online-image] PASS — the online image switch accepts only Grok CLI 1.0.13"
+          "assertion": "[grok-426-online-image] PASS — the online image switch accepts only Grok CLI 1.0.62"
         },
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-grok-cli-compatibility.ts",
-          "assertion": "[grok-426-staged-activation] PASS — the staged unit is checked against Grok CLI 1.0.13 before it may start"
+          "assertion": "[grok-426-staged-activation] PASS — the staged unit is checked against Grok CLI 1.0.62 before it may start"
         },
         {
           "layer": "deploy-gate",

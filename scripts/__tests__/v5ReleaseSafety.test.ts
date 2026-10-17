@@ -76,7 +76,7 @@ describe('V5 branch deployment policy', () => {
     assert.match(source, /\\mathrm\{MSE\}=\\frac\{1\}\{n\}\\sum_\{i=1\}\^\{n\}\(y_i-\\hat\{y\}_i\)\^2/)
     assert.match(source, /grep -q 'y' \/tmp\/oc-docx-smoke\.txt/)
     assert.match(source, /! grep -q '¿' \/tmp\/oc-docx-smoke\.txt/)
-    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-cli-cc2280-codex01592-grok1013-zcode381-slim$/m)
+    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-cli-cc2302-codex01630-grok1062-zcode3153-agy140-slim$/m)
     assert.match(overrides, /v5-ccb-f8800e0c0480-embedded\(OC_RUNTIME_EMERGENCY_TUPLE/)
   })
 
@@ -4216,7 +4216,7 @@ describe('v5 release safety lanes', () => {
       '  elif [[ "$*" == *"docker image inspect"* ]]; then',
       `    printf '%s\\n' "\${ACTUAL_ID:-${imageId}}"`,
       '  elif [[ "$*" == *"--entrypoint grok-native"* ]]; then',
-      '    printf "%s\\n" "${GROK_VERSION:-grok 1.0.13 (test)}"',
+      '    printf "%s\\n" "${GROK_VERSION:-grok 1.0.62 (test)}"',
       '  elif [[ "$*" == *"OC_RUNTIME_RELEASE"* ]]; then',
       '    printf "%s\\n" /runtime/prev',
       '  else',
@@ -4253,7 +4253,8 @@ describe('v5 release safety lanes', () => {
       [{ EMBED_SOURCE: '1' }, /只接受 slim image/],
       [{ INCLUDE_GROK: '0' }, /缺 official Grok binary/],
       [{ GROK_VERSION: 'grok 1.0.2 (old)' }, /Grok binary=/],
-      [{ GROK_VERSION: 'grok 1.0.5 (previous commercial)' }, /Grok binary=.*expected='grok 1\.0\.13/],
+      [{ GROK_VERSION: 'grok 1.0.5 (incident image)' }, /Grok binary=.*expected='grok 1\.0\.62/],
+      [{ GROK_VERSION: 'grok 1.0.13 (previous commercial)' }, /Grok binary=.*expected='grok 1\.0\.62/],
       [{ SOURCE_COMMIT: 'a'.repeat(40), ANCESTOR_RC: '1' }, /不是 canonical HEAD 的可验证 ancestor/],
     ] as const) {
       await writeFile(capture, '')
