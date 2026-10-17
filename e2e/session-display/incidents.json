@@ -7735,6 +7735,10 @@
           "path": "packages/web-react/browser-tests/ocv5-482-inline-ui-fence.node-test.mjs",
           "assertion": "an inline ```ui next block never reaches the screen"
         }
+      ],
+      "coverageCommits": [
+        "4f305612",
+        "7ef1370c"
       ]
     }
   ]
