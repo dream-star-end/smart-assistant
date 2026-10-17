@@ -48,6 +48,7 @@
  * Repository convention: `.js` imports for TS NodeNext + tsx test runner.
  */
 
+import { gatewayMethodBody, readGatewaySource } from './helpers/gatewaySource.js'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -365,7 +366,8 @@ test('stripPrivateRoutingFields: permission_request shape — private fields rem
 // ── Structural regression assertion ──
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const serverSrc = readFileSync(join(__dirname, '..', 'server.ts'), 'utf8')
+// server.ts + split-out modules (FINDINGS §7.6 S6: dispatchInbound / ws connection moved out)
+const serverSrc = readGatewaySource()
 
 /**
  * Extract the body of `Gateway.dispatchInbound` so we can scan only the
@@ -408,7 +410,10 @@ function extractDispatchInboundBody(src: string): string {
   return lines.slice(0, endLine).join('\n')
 }
 
-const dispatchBody = extractDispatchInboundBody(serverSrc)
+// FINDINGS §7.6 S6: dispatchInbound's implementation lives in inboundDispatch.ts (the class keeps a
+// one-line forwarder), so read the implementation rather than the forwarder.
+const dispatchBody = gatewayMethodBody('dispatchInbound')
+void extractDispatchInboundBody
 
 /**
  * Strip `//` line comments before structural regex assertions so doc
@@ -522,28 +527,9 @@ test('structural: _sendStampedSessionFrame body funnels through _stripPrivateRou
   //
   // Locate `private _sendStampedSessionFrame(` and scan its body up to the next
   // sibling member; assert the body references `_stripPrivateRoutingFields(`.
-  const startMarker = 'private _sendStampedSessionFrame('
-  const startIdx = serverSrc.indexOf(startMarker)
-  assert.ok(startIdx >= 0, '_sendStampedSessionFrame not found in server.ts')
-  const tail = serverSrc.slice(startIdx)
-  const lines = tail.split('\n')
-  let endLine = -1
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i] ?? ''
-    if (
-      line.startsWith('  private ') ||
-      line.startsWith('  public ') ||
-      line.startsWith('  protected ') ||
-      line.startsWith('  static ') ||
-      line.startsWith('  async ') ||
-      line === '}'
-    ) {
-      endLine = i
-      break
-    }
-  }
-  assert.ok(endLine > 0, '_sendStampedSessionFrame body terminator not found')
-  const body = lines.slice(0, endLine).join('\n')
+  // FINDINGS §7.6 S6: the implementation lives in wsConnection.ts (the class keeps a forwarder).
+  const body = gatewayMethodBody('_sendStampedSessionFrame')
+  assert.ok(body.length > 0, '_sendStampedSessionFrame not found')
 
   // (a) exactly one strip call — guards against accidental double-strip /
   //     mid-body re-introduction of a `wireFrame`-based JSON path.

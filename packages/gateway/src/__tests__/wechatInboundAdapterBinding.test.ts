@@ -70,7 +70,7 @@ function extractMethodBody(source: string, methodName: string): string {
 
 // FINDINGS §7.6 S5: the WeChat/QQ ingress lives in channelHandlers.ts; the class keeps forwarders.
 const handleWechatInbound = gatewayMethodBody('handleWechatInbound')
-const handleStop = extractMethodBody(SERVER_TS, 'handleStop')
+const handleStop = gatewayMethodBody('handleStop') // FINDINGS §7.6 S6: handleStop lives in wsConnection.ts
 
 // ── 基础前置:method 抽出来非空、且包含必要 keyword ──
 test('extractMethodBody finds handleWechatInbound and includes core skeleton', () => {

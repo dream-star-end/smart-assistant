@@ -31,7 +31,7 @@ function extractMethodBody(source: string, methodName: string): string {
 // FINDINGS §7.6 S3: the delegate runtime lives in delegateRuntime.ts; the class keeps forwarders.
 const delegateWrapper = gatewayMethodBody('_runDelegateTask')
 const delegateCore = gatewayMethodBody('_runDelegateTaskCore')
-const handleStop = extractMethodBody(SERVER_TS, 'handleStop')
+const handleStop = gatewayMethodBody('handleStop') // FINDINGS §7.6 S6: handleStop lives in wsConnection.ts
 const getOrCreate =
   sessionManagerMethodBody('getOrCreate') +
   sessionManagerMethodBody('_getOrCreateExclusive')

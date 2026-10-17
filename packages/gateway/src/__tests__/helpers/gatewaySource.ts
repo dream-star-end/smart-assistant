@@ -27,6 +27,8 @@ export const GATEWAY_SOURCE_FILES: readonly string[] = [
   'cronTaskWebhook.ts',
   'httpMiscHandlers.ts',
   'channelHandlers.ts',
+  'inboundDispatch.ts',
+  'wsConnection.ts',
 ]
 
 export function readGatewaySource(): string {

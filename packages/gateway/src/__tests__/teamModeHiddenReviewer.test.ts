@@ -31,7 +31,7 @@ const TEAM_MODE_TS = join(__dirname, '..', 'teamMode.ts')
 
 describe('team mode preamble — 两策略(审议/执行)+ 队长自主送审纪律(2026-09-04 起在 teamMode.ts)', () => {
   it('server.ts 仍是唯一注入点:队长 main + teamMode → buildTeamPreamble(catalog panel)', () => {
-    const src = readFileSync(SERVER_TS, 'utf8')
+    const src = readGatewaySource() // FINDINGS §7: server.ts + split-out modules
     assert.match(src, /if \(teamMode && agent\.id === 'main'\)/)
     assert.match(src, /listCollaboratorAgents\(teamCfg, \{ selfId: 'main', includeMain: false \}\)/)
     assert.match(src, /pickDeliberationPanel\(view, \{/)
