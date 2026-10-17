@@ -1078,7 +1078,7 @@ const syntheticTurnRaw = Buffer.from([records[0], records[1],
   { type: "user", isSynthetic: true, parent_tool_use_id: null,
     message: { role: "user", content: [{ type: "text",
       text: "Output token limit hit. Resume directly" }] } },
-  ...records.slice(2)].map((record) => JSON.stringify(record) + "\n").join(""));
+  ...records.slice(2)].map((record) => `${JSON.stringify(record)}\n`).join(""));
 
 test("INC-20261006 a synthetic CLI turn inside a message is stopped and settled, not left unknown", async () => {
   const f = fixture({ spoolBody: syntheticTurnRaw });
