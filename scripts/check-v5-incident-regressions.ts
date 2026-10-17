@@ -194,12 +194,17 @@ const CI_WORKFLOW = readFileSync(join(ROOT, ".github/workflows/v5-ci.yml"), "utf
 const DEPLOY_SCRIPT = readFileSync(join(ROOT, "scripts/deploy-v5.sh"), "utf8");
 const ROOT_PACKAGE_JSON = readFileSync(join(ROOT, "package.json"), "utf8");
 let selfhostDeployCache: string | null = null;
+/** OCV5-488: a shell command that runs a script (see selfhostDeployScript). */
+const RUNS_SCRIPT =
+  /(?:^|[;&|(])\s*(?:(?:env(?:\s+-u\s+\S+)*|[A-Za-z_][A-Za-z0-9_]*=\S*)\s+)*(?:npx --no-install tsx|node) scripts\/[\w.-]+/;
 /** Read only in the selfhost edition; a missing script means no selfhost runner is wired.
  * OCV5-488: deploy-v5-selfhost.sh sources v5-selfhost-master-release-lib.sh, whose
  * build_master_release runs the pinned-staging gates (Box success recovery, continuation,
- * incident proofs). Only while the deploy script really sources it, and only the library's
- * lines that execute a script count: a file-presence check or an error message naming a
- * proof is no wiring (Codex r3). */
+ * incident proofs). Only while the deploy script really sources it, and only where a command
+ * of the library really runs a script: continuation lines joined, quoted text dropped (a
+ * file-presence check, an error message or an echo naming a proof is no run; Codex r3 and
+ * #833/#834 r1), and npx/node in command position (line start, or after ( ; & |, behind
+ * env -u … or VAR=… prefixes). */
 function selfhostDeployScript(): string {
   if (selfhostDeployCache === null) {
     const file = join(ROOT, "scripts/deploy-v5-selfhost.sh");
@@ -207,8 +212,10 @@ function selfhostDeployScript(): string {
     const lib = join(ROOT, "scripts/v5-selfhost-master-release-lib.sh");
     const sourced = /^MASTER_RELEASE_LIB="\$SCRIPT_DIR\/v5-selfhost-master-release-lib\.sh"$/m.test(deploy)
       && /^source "\$MASTER_RELEASE_LIB"$/m.test(deploy) && existsSync(lib);
-    const runs = sourced ? readFileSync(lib, "utf8").split("\n").filter((line) =>
-      !/^\s*#/.test(line) && /(?:^|[\s(;&|])(?:npx --no-install tsx|node) scripts\/[\w.-]+/.test(line)) : [];
+    const runs = sourced ? readFileSync(lib, "utf8").replace(/\\\n/g, " ").split("\n")
+      .filter((line) => !/^\s*#/.test(line))
+      .map((line) => line.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''"))
+      .filter((line) => RUNS_SCRIPT.test(line)) : [];
     selfhostDeployCache = runs.length ? `${deploy}\n${runs.join("\n")}` : deploy;
   }
   return selfhostDeployCache;
