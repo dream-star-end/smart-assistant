@@ -7265,6 +7265,9 @@
       "severity": "P0",
       "symptom": "商业（2026-10-17，#49fab402）：uid 4 会话 webmvbypkb8b255w1 全能助手 Box Claude Opus 5.5 最高档，一轮执行 68 步后显示『模型配置已更新，请重发』（中断前 44 次已完成调用计 1943 积分，被拒那次未计费），之后『请继续』等每条消息都显示『消息未开始处理，已确认未计费』。根因：07:10:13Z 管理端下线 DeepSeek V4 Pro（审计 3332）同事务 bump 全局 model_security_epoch，egress 授权门对该回合下一次 Box 续接回 409 MODEL_CONFIG_CHANGED_RETRY_TURN（未到 Box）；Claude Code 以此结束回合，但交出工具调用的 Box CLI 仍挂起等结果，idle proof 恒 pending，会话之后每条消息 IDLE_HISTORY_PENDING，直到 4 小时期限。OCV5-315 的内部 Box Stop 只认 409 BOX_* continuation rejected。修复：授权门的 config_changed 精确拒绝同样走内部 Box Stop，链收为已证明停止的失败，下一条消息正常开始；非 Box 模型与其它错误码不变。",
       "rootFixCommit": "1e3de7fd",
+      "coverageCommits": [
+        "d882229c"
+      ],
       "regressions": [
         {
           "layer": "deploy-gate",
