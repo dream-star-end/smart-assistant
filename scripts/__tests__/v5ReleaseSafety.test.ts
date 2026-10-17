@@ -102,6 +102,7 @@ describe('V5 branch deployment policy', () => {
 
 async function runTurnCanaryFixture(
   mode: 'foreign-then-success' | 'foreign-only' | 'own-error' | 'ccb-final-cost-tape-text' | 'ccb-final-cost-empty-session',
+  answer = '2',
 ): Promise<{ code: number | null; stdout: string; stderr: string; elapsedMs: number }> {
   const dir = await mkdtemp(path.join(tmpdir(), 'v5-turn-canary-'))
   dirs.push(dir)
@@ -122,7 +123,7 @@ async function runTurnCanaryFixture(
     if (req.method === 'GET' && req.url?.startsWith('/api/sessions/')) {
       res.writeHead(200, { 'Content-Type': 'application/json' })
       if (mode === 'ccb-final-cost-tape-text') {
-        res.end(JSON.stringify({ messages: [{ role: 'assistant', text: '2' }] }))
+        res.end(JSON.stringify({ messages: [{ role: 'assistant', text: answer }] }))
       } else if (mode === 'ccb-final-cost-empty-session') {
         res.end(JSON.stringify({ messages: [{ role: 'assistant', text: '' }] }))
       } else {
@@ -194,7 +195,7 @@ async function runTurnCanaryFixture(
         channel: 'webchat',
         peer: inbound.peer,
         clientMessageId: inbound.clientMessageId,
-        blocks: [{ kind: 'text', text: '2' }],
+        blocks: [{ kind: 'text', text: answer }],
         isFinal: false,
       }))
       ws.send(JSON.stringify({
@@ -8503,7 +8504,7 @@ wait $!
     assert.doesNotMatch(beforeAttempt, /let saw(Text|Final|Cost|Error)/)
     assert.match(source.slice(attemptAt), /let answerText = ''/)
     assert.match(source.slice(attemptAt), /answerText \+= b\.text/)
-    assert.match(source.slice(attemptAt), /finalText = answerText\.trim\(\)/)
+    assert.match(source.slice(attemptAt), /finalText = answerTextForExactCheck\(answerText\.trim\(\)\)/)
     assert.match(source.slice(attemptAt), /let finalText = ''/)
     assert.match(source.slice(attemptAt), /resolve\(\{ reason, sawText, sawFinal, sawCost, sawError, finalText, textVia \}\)/)
     assert.match(source, /extractAssistantText/)
@@ -8527,6 +8528,29 @@ wait $!
       foreignOnly.elapsedMs < 900,
       `foreign frames incorrectly refreshed the 60ms silence timer (${foreignOnly.elapsedMs}ms)`,
     )
+  })
+
+  test('OCV5-482: real-turn canary drops only one trailing well-formed ui next block before the exact check', async () => {
+    const next = '```ui\n{"type":"next","text":"再算一下 2+2"}\n```'
+    const trailing = await runTurnCanaryFixture('foreign-then-success', `2\n\n${next}`)
+    assert.equal(trailing.code, 0, trailing.stderr || trailing.stdout)
+    assert.match(trailing.stdout, /TURN_OK model=grok-build exact_text=2 final=true cost_charged=true via=ws/)
+
+    const tape = await runTurnCanaryFixture('ccb-final-cost-tape-text', `2\n${next}`)
+    assert.equal(tape.code, 0, tape.stderr || tape.stdout)
+    assert.match(tape.stdout, /via=tape/)
+
+    for (const bad of [
+      '2```ui{"type":"next","text":"x"}\n```',
+      `${next}\n2`,
+      `2\n${next}\n${next}`,
+      '2\n```ui\n{"type":"choices","text":"x"}\n```',
+      '2\n```ui\n{"type":"next","text":"x"\n```',
+    ]) {
+      const failed = await runTurnCanaryFixture('foreign-then-success', bad)
+      assert.equal(failed.code, 1, `must stay a failure: ${JSON.stringify(bad)}\n${failed.stdout}`)
+      assert.match(failed.stderr, /TURN_INCOMPLETE.*exact_text/)
+    }
   })
 
   test('real-turn canary accepts tape assistant text when CCB final+cost omit WS blocks', async () => {

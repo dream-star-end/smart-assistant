@@ -37,6 +37,7 @@
 import { createRequire } from 'node:module'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { answerTextForExactCheck } from './lib/smoke-turn-text.mjs'
 
 const require_ = createRequire(join(process.cwd(), 'package.json'))
 const { WebSocket } = require_('ws')
@@ -156,7 +157,7 @@ const attempt = () => new Promise((resolve) => {
     const tryOnce = async () => {
       if (settled) return
       try {
-        const text = await readTapeAssistantText()
+        const text = answerTextForExactCheck(await readTapeAssistantText())
         if (text === '2') {
           sawText = true
           finalText = text
@@ -213,7 +214,7 @@ const attempt = () => new Promise((resolve) => {
         sawFinal = true   // 干净收尾信号(cost_charged 在其后广播)
         // WebChat 正常路径会先逐块流正文,再发 blocks=[] 的 final 终止帧；
         // final-with-content 的早拒绝路径也存在。两者都按本次连接累积出的最终正文断言。
-        finalText = answerText.trim()
+        finalText = answerTextForExactCheck(answerText.trim())
         armTapeTextEvidence()
         if (
           ALLOW_LEDGER_COST_EVIDENCE &&
