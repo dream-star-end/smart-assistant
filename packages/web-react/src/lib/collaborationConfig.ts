@@ -80,6 +80,15 @@ export function docToUiState(doc: CollaborationConfigDoc): CollabUiState {
   };
 }
 
+/**
+ * A failed collaboration-config save must never lock the user out of solo/team.
+ * Those two modes travel per turn on the send frame and need no server-side config,
+ * so the user's pick stays; only advisor depends on the saved config and rolls back.
+ */
+export function keepCollabChoiceOnSaveFailure(mode: CollabMode): boolean {
+  return mode !== "advisor";
+}
+
 /** Ignore in-flight GET/PUT that started before a newer user action or session switch. */
 export function isStaleCollabEpoch(started: number, current: number): boolean {
   return started !== current;
