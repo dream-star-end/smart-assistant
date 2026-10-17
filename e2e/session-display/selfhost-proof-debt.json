@@ -63,7 +63,6 @@
     "INC-20261009-ADMIN-BOUNDARY-STICKY": "个人版独有事故,登记时只有 unit/integration 证据",
     "INC-20261009-ALERT-INBOX-FALLBACK": "个人版独有事故,登记时只有 unit/integration 证据",
     "INC-20261009-INBOX-DELIVERY-KEY-500": "个人版独有事故,登记时只有 unit/integration 证据",
-    "INC-20261009-SELFHEAL-LOAD-MORE-400": "个人版独有事故,登记时只有 unit/integration 证据",
-    "INC-20261010-BOX-OUTPUT-LIMIT-RESUME": "商业版的 proof 是 deploy-gate scripts/check-v5-box-incident-proofs.ts,只在商业发布/商业 CI 跑;个人版发布不跑它。原登记:回归在 unit 层：decoder 用 Box 上 Claude Code 2.1.296 真实写出的续写记录形态走完“max_tokens 截断→续写→回答”，续轮测试在 native 与非 native 下都走到 final 并按两次调用计费。个人版 canary 用不了仅管理员可见的 box-api-claude-opus-5-5，触发需要一次真实打满输出上限的回答，不是可重复执行的 browser/live-e2e/deploy-gate 产物。"
+    "INC-20261009-SELFHEAL-LOAD-MORE-400": "个人版独有事故,登记时只有 unit/integration 证据"
   }
 }

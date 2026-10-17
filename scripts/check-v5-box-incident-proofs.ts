@@ -3602,13 +3602,6 @@ async function cleanUp(): Promise<void> {
   if (failed) throw failed.reason;
 }
 
-/* OCV5-488: selfhost runs every proof whose fix it carries. Three proofs of
- * this file (the commercial copy) are not called here because their fixes
- * exist only in commercial so far, and each is red on selfhost (2026-10-17,
- * g488-probe-p1.log): proveSyntheticTurnHeld, proveUpstreamRefusal
- * (INC-20261006-BOX-SYNTHETIC-TURN-HELD) and proveOutputLimitResume
- * (OCV5-368). OCV5-491 brings the fixes to selfhost and calls them again.
- * Nothing here counts them as passed. */
 async function main(): Promise<void> {
   const expectSha = parseArgs(process.argv);
   const deadline = setTimeout(() => {
@@ -3633,7 +3626,9 @@ async function main(): Promise<void> {
       await proveRejectBlocksNextMessage(api, db), await proveConfigChangedBlocksNextMessage(api, db),
       await proveIdleNoSummary(api, db),
       await proveAnsweredExchangePrompt(api, db), await proveWaitingHandoffSuperseded(api, db), await proveResumeUnsentParked(api, db),
-      await proveUnknownNeverClosed(api, db), await proveNativeResumedStop(api, db),
+      await proveUnknownNeverClosed(api, db), await proveSyntheticTurnHeld(api, db),
+      await proveUpstreamRefusal(api, db), await proveNativeResumedStop(api, db),
+      await proveOutputLimitResume(api, db),
       await proveProcessAbsentReleased(api, db), await proveIdleProofStopsParkedTurn(api, db),
       await proveContainerRebuiltStopsParkedTurn(api, db), await proveAnyRefusalStopsParkedTurn(api, db)]),
     ...await proveFinalizedTurnRecovery(api, database)];
