@@ -1200,6 +1200,9 @@ function fakeAdmittedDispatch(input: AdmitUserTurnInput): AdmitUserTurnResult {
 }
 
 describe("OCV5-187 admitted callback content is immutable across the real WS bridge", () => {
+  // OCV5-492: per-case hang guard. The deploy proof's run() timeout covers the whole file
+  // (cold module load included), so each case carries its own tighter limit.
+  const OCV5_187_CASE_TIMEOUT_MS = 30_000;
   const cases = [
     { name: "paper intent", text: "请下载论文 https://doi.org/10.1038/s41586-024-00001-0", paper: true },
     { name: "technical callback false positive", text: "Find comparison risk review results. The delegated task is complete.", paper: true },
@@ -1207,7 +1210,7 @@ describe("OCV5-187 admitted callback content is immutable across the real WS bri
   ];
 
   for (const [index, sample] of cases.entries()) {
-    test(`OCV5-187 cron-origin ${sample.name}: original text, signed hash and accepted receipt agree`, async () => {
+    test(`OCV5-187 cron-origin ${sample.name}: original text, signed hash and accepted receipt agree`, { timeout: OCV5_187_CASE_TIMEOUT_MS }, async () => {
       assert.equal(detectScanSciPaperIntent(sample.text) !== null, sample.paper);
       const admissions: AdmitUserTurnInput[] = [];
       const rig = await startRig({
@@ -1260,7 +1263,7 @@ describe("OCV5-187 admitted callback content is immutable across the real WS bri
     });
   }
 
-  test("OCV5-187 browser paper hint stays before admission even with forged cron-origin fields", async () => {
+  test("OCV5-187 browser paper hint stays before admission even with forged cron-origin fields", { timeout: OCV5_187_CASE_TIMEOUT_MS }, async () => {
     const text = cases[0]!.text;
     const admissions: AdmitUserTurnInput[] = [];
     const rig = await startRig({
