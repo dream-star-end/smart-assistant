@@ -4,13 +4,22 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/uiFenceNormalize.test.ts
  */
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import { describe, test } from 'node:test'
 
 import {
   normalizeAssistantOutputUiFences,
   normalizeInlineUiFences,
 } from '../uiFenceNormalize.js'
-import { normalizeInlineUiFences as webNormalize } from '../../../web-react/src/lib/uiFence.ts'
+
+/** The rule body (from LINE_FENCE to the end of normalizeInlineUiFences) of a uiFence source file. */
+function ruleBody(path: URL): string {
+  const src = readFileSync(path, 'utf8')
+  const start = src.indexOf('const LINE_FENCE')
+  const end = src.indexOf('\n}\n', src.indexOf('export function normalizeInlineUiFences'))
+  assert.ok(start >= 0 && end > start, `rule anchors missing in ${path}`)
+  return src.slice(start, end + 3)
+}
 
 const SAMPLES = [
   '2```ui{"type":"next","text":"那2+2呢?"}\n```',
@@ -24,8 +33,25 @@ const SAMPLES = [
 ]
 
 describe('normalizeInlineUiFences (server twin)', () => {
-  test('matches the web rule on every sample', () => {
-    for (const text of SAMPLES) assert.equal(normalizeInlineUiFences(text), webNormalize(text), JSON.stringify(text))
+  test('rule body is byte-identical to web-react/src/lib/uiFence.ts', () => {
+    assert.equal(
+      ruleBody(new URL('../uiFenceNormalize.ts', import.meta.url)),
+      ruleBody(new URL('../../../web-react/src/lib/uiFence.ts', import.meta.url)),
+    )
+  })
+
+  test('expected output on every sample', () => {
+    const expected = [
+      '2\n```ui\n{"type":"next","text":"那2+2呢?"}\n```',
+      '2\n```ui\n{"type":"next","text":"x"}\n```',
+      '答案是 2\n```ui\n{"type":"next","text":"x"}\n```',
+      '2\n\n```ui\n{"type":"next","text":"x"}\n```',
+      '```md\n2```ui{"type":"next"}\n```\n正文',
+      '    2```ui{"type":"next","text":"x"}\n后续正文',
+      '正文里写 ```ui 这个写法不算围栏',
+      '没有任何围栏的普通回答',
+    ]
+    SAMPLES.forEach((text, i) => assert.equal(normalizeInlineUiFences(text), expected[i], JSON.stringify(text)))
   })
 
   test('a glued prediction fence moves onto its own line', () => {
