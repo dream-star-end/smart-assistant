@@ -7725,6 +7725,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/internalGrokRelay.test.ts",
           "assertion": "OCV5-477: a delegate route with no admitted billing is refused before upstream traffic"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-477-advisor-error-clears-app.node-test.mjs",
+          "assertion": "no stale save error after a successful save"
         }
       ],
       "coverageCommits": [
