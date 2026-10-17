@@ -29,6 +29,12 @@ export const GATEWAY_SOURCE_FILES: readonly string[] = [
   'channelHandlers.ts',
   'inboundDispatch.ts',
   'wsConnection.ts',
+  'gatewayFilePolicy.ts',
+  'localExecution.ts',
+  'routeOverrides.ts',
+  'turnFrames.ts',
+  'askUserSanitize.ts',
+  'gatewayTypes.ts',
 ]
 
 export function readGatewaySource(): string {
