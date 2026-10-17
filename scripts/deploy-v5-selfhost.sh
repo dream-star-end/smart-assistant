@@ -172,6 +172,12 @@ die() {
 # shellcheck source=scripts/v5-selfhost-master-release-lib.sh
 # shellcheck disable=SC1091
 source "$MASTER_RELEASE_LIB"
+# P0-Web 前端热切换(OCV5-489):overlay 指针根 + 纯函数库 + --p0-web* 编排。
+WEB_OVERLAY_ROOT="${OC_V5_WEB_OVERLAY_ROOT:-/var/lib/openclaude-v5-selfhost/web-overlay}"
+# shellcheck source=scripts/v5-web-overlay-lib.sh
+source "$SCRIPT_DIR/v5-web-overlay-lib.sh"
+# shellcheck source=scripts/v5-selfhost-p0-web-lib.sh
+source "$SCRIPT_DIR/v5-selfhost-p0-web-lib.sh"
 BOOT_SCRIPT_DIR="${BOOT_SCRIPT_DIR:-${BREAKGLASS_ROOT}/boot}"
 # 看护 timer 执行的是这个安装目录里的 watch.sh,不是 release(OCV5-404)。
 V5_WATCH_DIR="${V5_WATCH_DIR:-/opt/openclaude/v5-selfhost-watch}"
@@ -204,6 +210,7 @@ cleanup_selfhost_deploy() {
   fi
   cleanup_master_staging
   cleanup_cutover_unit_snap
+  p0web_cleanup_build || true
   if [[ "${SELFHOST_DEPLOY_LOCK_HOLDER_OWNED:-0}" == 1 && -n "${SELFHOST_DEPLOY_LOCK_HOLDER:-}" ]]; then
     rm -f "$SELFHOST_DEPLOY_LOCK_HOLDER"
     SELFHOST_DEPLOY_LOCK_HOLDER_OWNED=0
@@ -461,6 +468,11 @@ usage() {
                         仅限止血;会打 ⚠ 留痕,CI check:v5:incidents 仍会红,事后必须补 waiver / 冻结 tip。
   --force-env           仅配合 --bootstrap:覆盖已存在的 env 文件
   --force-npm-ci        配合 --build-master-only 或 --deploy:跳过硬链,在 staging 内冷装
+  --p0-web --target-sha=SHA
+                        P0 纯前端热修(OCV5-489):只换前端构建目录,不重启 master/不动 runtime。相对 live
+                        只改前端静态面才放行;切换后握手+UI 门 C1+C2,失败自动切回。构建在锁外,切换持锁
+  --p0-web-revert       切回上一份前端构建目录(秒级,不重启)
+  --p0-web-status       打印 overlay 指针、生效的 P0-Web sourceCommit 与最近 history
 
 脏工作树三面:
   master live     = git archive HEAD → 脏文件不会上线
@@ -492,7 +504,7 @@ for arg in "$@"; do
     --release=*) CUTOVER_RELEASE="${arg#--release=}" ;;
     --lease-train=*) LEASE_TRAIN_ID="${arg#--lease-train=}" ;;
     --target-sha=*) LEASE_TARGET_SHA="${arg#--target-sha=}" ;;
-    --preflight|--bootstrap|--deploy|--smoke|--status|--build-master-only|--cutover)
+    --preflight|--bootstrap|--deploy|--smoke|--status|--build-master-only|--cutover|--p0-web|--p0-web-revert|--p0-web-status)
       [[ -z "$MODE" ]] || die "只能指定一个主模式(已有 --$MODE,又收到 $arg)"
       MODE="${arg#--}"
       ;;
@@ -517,8 +529,11 @@ done
   && die "--force-npm-ci 只能与 --build-master-only 或 --deploy 同用"
 [[ -n "$CUTOVER_RELEASE" && "$MODE" != "cutover" ]] \
   && die "--release= 只能与 --cutover 同用"
-[[ -n "$LEASE_TRAIN_ID$LEASE_TARGET_SHA" && "$MODE" != "deploy" ]] \
-  && die "--lease-train=/--target-sha= 只能与 --deploy 同用"
+[[ -n "$LEASE_TRAIN_ID" && "$MODE" != "deploy" ]] \
+  && die "--lease-train= 只能与 --deploy 同用"
+[[ -n "$LEASE_TARGET_SHA" && "$MODE" != "deploy" && "$MODE" != "p0-web" ]] \
+  && die "--target-sha= 只能与 --deploy 或 --p0-web 同用"
+[[ "$DRY" == 1 && "$MODE" == p0-web* ]] && die "--p0-web* 没有 dry-run(构建在锁外、切换可秒级回退)"
 [[ -n "$LEASE_TRAIN_ID" && -z "$LEASE_TARGET_SHA" ]] && die "--lease-train= 必须同时给 --target-sha="
 [[ -z "$LEASE_TARGET_SHA" || "$LEASE_TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || die "--target-sha= 必须是 40 位 sha"
 [[ -f "$MASTER_RELEASE_LIB" ]] || die "缺 master release lib: $MASTER_RELEASE_LIB"
@@ -1015,6 +1030,7 @@ ensure_selfhost_env_keys() {
   ensure_env_kv "$V5_ENV" OC_USER_TZ "Asia/Shanghai"
   ensure_env_kv "$V5_ENV" OC_SELFHOST_ENGINE_LOCAL_TURNS 1
   ensure_env_kv "$V5_ENV" SELFHOST_CURSOR_EGRESS 1
+  ensure_env_kv "$V5_ENV" OC_V5_WEB_OVERLAY_ROOT "$WEB_OVERLAY_ROOT"
   log "  ✓ 制品根 / PG sessions / privacy-safe telemetry / CCB Japan transport keys"
 }
 
@@ -2294,6 +2310,7 @@ $dirty
   sha="$(source_commit)"
   lease_train_begin "$sha"
   assert_fix_trailers "$sha"
+  assert_p0_web_overlay_contained "$sha"
   log "── source=$sha 构建三面制品(失败则 live 不动) ──"
   start_runtime_release_bg "$sha"
   build_master_release "$sha"
@@ -2910,6 +2927,11 @@ cmd_cutover() {
   cutover_clog "  Box success recovery 已在 build_master_release 封存前执行;已封存 rel 的切流与回退不再依赖该脚本"
   expected_build="$(dist_oc_build "$rel")"
   cutover_clog "  dist oc-build=$expected_build"
+  # OCV5-489:master 启动前给候选建 P0-Web overlay 指针(指向它自带 dist,serve 内容不变)。
+  # 失败只失去热切换能力:master 找不到指针就回落 release dist。
+  if [[ "$DRY" != 1 ]] && ! wo_seed_pointer "$WEB_OVERLAY_ROOT" "$rel" "$head"; then
+    cutover_clog "  ⚠ P0-Web overlay 指针未建立(仅失去前端热切换能力)"
+  fi
   cutover_clog "  从已过 digest 的候选快照 unit(危险窗口不再读工作树)"
   if [[ "$DRY" == 1 ]]; then
     assert_unit_templates_live_wd "$rel/deploy/v5-selfhost"
@@ -3138,6 +3160,8 @@ cmd_cutover() {
     || cutover_clog "  ⚠ master release GC 失败/安全跳过(仅告警,不回滚)"
   oc_hotcfg_gc "$V5_ENV" "$OC_HOTCFG_HISTORY" 2>&1 | sed 's/^/  /' \
     || cutover_clog "  ⚠ runtime GC 失败(仅告警,不回滚)"
+  wo_gc_buckets "$WEB_OVERLAY_ROOT" "$MASTER_RELEASES_ROOT" 2>&1 | sed 's/^/  /' \
+    || cutover_clog "  ⚠ P0-Web overlay 桶 GC 失败(仅告警,不回滚)"
   cutover_clog "✓ --cutover 完成 live → $rel"
 }
 
@@ -3149,5 +3173,8 @@ case "$MODE" in
   cutover) cmd_cutover ;;
   smoke) cmd_smoke ;;
   status) cmd_status ;;
+  p0-web) cmd_p0_web ;;
+  p0-web-revert) cmd_p0_web_revert ;;
+  p0-web-status) cmd_p0_web_status ;;
   *) die "内部错误:未知 MODE=$MODE" ;;
 esac

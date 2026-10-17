@@ -197,11 +197,47 @@ const CI_WORKFLOW = readFileSync(join(ROOT, ".github/workflows/v5-ci.yml"), "utf
 const DEPLOY_SCRIPT = readFileSync(join(ROOT, "scripts/deploy-v5.sh"), "utf8");
 const ROOT_PACKAGE_JSON = readFileSync(join(ROOT, "package.json"), "utf8");
 let selfhostDeployCache: string | null = null;
-/** Read only in the selfhost edition; a missing script means no selfhost runner is wired. */
+/** OCV5-488: a shell command that runs a script (see selfhostDeployScript). */
+const RUNS_SCRIPT =
+  /(?:^|[;&|(])\s*(?:(?:env(?:\s+-u\s+\S+)*|[A-Za-z_][A-Za-z0-9_]*=\S*)\s+)*(?:npx --no-install tsx|node) scripts\/[\w.-]+/;
+/** OCV5-488: the command lines of build_master_release() in the selfhost master release library
+ * that run a script. Lexical only: continuation lines joined, heredoc bodies skipped, quoted
+ * text and comments dropped (an echo, a message, a file-presence check or a trailing comment
+ * naming a proof is no run; Codex r3 and #833/#834 r1-r2). It cannot see control flow: a run
+ * written under `if false` would still count, as any mention counts in deploy-v5.sh. */
+function releaseGateRuns(lib: string): string[] {
+  const lines = lib.replace(/\\\n/g, " ").split("\n");
+  const start = lines.findIndex((line) => /^build_master_release\(\) \{\s*$/.test(line));
+  if (start < 0) return [];
+  const runs: string[] = [];
+  let heredoc: { tag: string; dash: boolean } | null = null;
+  for (const raw of lines.slice(start + 1)) {
+    if (heredoc) {
+      if ((heredoc.dash ? raw.replace(/^\t+/, "") : raw) === heredoc.tag) heredoc = null;
+      continue;
+    }
+    if (/^\}/.test(raw)) break;
+    const doc = /<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/.exec(raw);
+    if (doc) heredoc = { tag: doc[3]!, dash: doc[1] === "-" };
+    const code = raw.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''").replace(/(^|\s)#.*$/, "$1");
+    if (RUNS_SCRIPT.test(code)) runs.push(code);
+  }
+  return runs;
+}
+/** Read only in the selfhost edition; a missing script means no selfhost runner is wired.
+ * OCV5-488: deploy-v5-selfhost.sh sources v5-selfhost-master-release-lib.sh, whose
+ * build_master_release runs the pinned-staging gates (Box success recovery, continuation,
+ * incident proofs). Only while the deploy script really sources it, and only the command
+ * lines of build_master_release() that run a script (releaseGateRuns). */
 function selfhostDeployScript(): string {
   if (selfhostDeployCache === null) {
     const file = join(ROOT, "scripts/deploy-v5-selfhost.sh");
-    selfhostDeployCache = existsSync(file) ? readFileSync(file, "utf8") : "";
+    const deploy = existsSync(file) ? readFileSync(file, "utf8") : "";
+    const lib = join(ROOT, "scripts/v5-selfhost-master-release-lib.sh");
+    const sourced = /^MASTER_RELEASE_LIB="\$SCRIPT_DIR\/v5-selfhost-master-release-lib\.sh"$/m.test(deploy)
+      && /^source "\$MASTER_RELEASE_LIB"$/m.test(deploy) && existsSync(lib);
+    const runs = sourced ? releaseGateRuns(readFileSync(lib, "utf8")) : [];
+    selfhostDeployCache = runs.length ? `${deploy}\n${runs.join("\n")}` : deploy;
   }
   return selfhostDeployCache;
 }

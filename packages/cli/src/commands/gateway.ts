@@ -6,6 +6,7 @@ import {
   makeV3WechatOutboundAdapter,
   makeV3QqbotOutboundAdapter,
   readV3WechatOutboundConfig,
+  resolveV5WebRoot,
   type CommercialHook,
 } from '@openclaude/gateway'
 import type { ChannelAdapter } from '@openclaude/plugin-sdk'
@@ -108,10 +109,21 @@ export async function gatewayCmd(_opts: { dev?: boolean }): Promise<void> {
   // 不引入 cli→commercial 结构耦合。fail-closed 的 v3|v5 校验在同进程的 commercial 侧)。
   //   - v5(Aurora): packages/web-react/dist(Vite bundler 产物)+ 'spa' 缓存模式。
   //   - 其它(默认 v3/personal): packages/web/public(vanilla)+ 'vanilla' 模式,行为不变。
+  //   - v5 且配了 OC_V5_WEB_OVERLAY_ROOT:若本 release 有 P0-Web overlay 指针则 serve 指针
+  //     (OCV5-489,前端热切换不重启 master);否则同上用 release dist。
   const isV5Channel = (process.env.OC_RUNTIME_CHANNEL?.trim() || 'v3') === 'v5'
-  const webRoot = isV5Channel
+  let webRoot = isV5Channel
     ? resolve(here, '../../../web-react/dist')
     : resolve(here, '../../../web/public')
+  if (isV5Channel) {
+    const decision = resolveV5WebRoot({
+      releaseDist: webRoot,
+      releaseRoot: resolve(here, '../../../..'),
+      overlayRoot: process.env.OC_V5_WEB_OVERLAY_ROOT,
+    })
+    webRoot = decision.webRoot
+    log.info(`gateway: web root ${decision.overlay ? 'overlay' : 'release'} (${decision.reason})`)
+  }
   const staticMode: 'vanilla' | 'spa' = isV5Channel ? 'spa' : 'vanilla'
 
   const channelFactories: Array<(deps: { config: OpenClaudeConfig }) => ChannelAdapter> = []

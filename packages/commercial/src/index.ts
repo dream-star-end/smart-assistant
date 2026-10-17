@@ -56,6 +56,7 @@ import { reconcileBoxBillingBatch } from "./billing/boxBillingRecovery.js";
 import { BoxDurableJournal } from "./http/proxy/boxDurableJournal.js";
 import { createProductionBoxAccountResolver } from "./http/proxy/boxAccountResolver.js";
 import { BoxRemoteCleanupWorker } from "./http/proxy/boxRemoteCleanupWorker.js";
+import { BoxHoldRelease } from "./http/proxy/boxHoldRelease.js";
 import { createBoxReplayRecoveryWriter } from "./egress/boxReplaySetup.js";
 import {
   assertModelCatalogAdminPoolConfigured,
@@ -125,6 +126,8 @@ import {
 } from "./agent/index.js";
 import type { AgentHttpDeps } from "./http/agent.js";
 import { startAlertScheduler, type AlertScheduler } from "./admin/alerts.js";
+import { EVENTS as ALERT_EVENTS } from "./admin/alertEvents.js";
+import { safeEnqueueAlert } from "./admin/alertOutbox.js";
 import {
   startRefreshEventsSweeper,
   type SweeperHandle as RefreshEventsSweeperHandle,
@@ -6286,6 +6289,17 @@ export async function registerCommercial(
       journal: new BoxDurableJournal(getPool()),
       resolver: createProductionBoxAccountResolver(),
       writeRecoveryMessage: createBoxReplayRecoveryWriter(process.env.OC_PLATFORM_ROOT),
+      holds: new BoxHoldRelease(getPool()),
+      // OCV5-488: every automatic release of a run gone from the Box is told once.
+      onProcessAbsentClosed: (closed) => safeEnqueueAlert({
+        event_type: ALERT_EVENTS.OPS_BOX_HOLD_RELEASED, severity: "info",
+        title: `Box 占位已自动释放(账号 ${closed.accountId})`,
+        body: `运行 ${closed.requestId.slice(0, 12)} 在 Box 上已无进程`
+          + `${closed.rebooted ? "(Box 重启过)" : "(两次确认)"},按 ${closed.shape} 收口,金额未变。`,
+        payload: { requestId: closed.requestId, accountId: closed.accountId.toString(),
+          shape: closed.shape, rebooted: closed.rebooted },
+        dedupe_key: `${ALERT_EVENTS.OPS_BOX_HOLD_RELEASED}:${closed.requestId}`,
+      }),
     });
     leaderBundle.add({
       name: "finalizeReconciler",

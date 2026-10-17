@@ -2,6 +2,7 @@ import { act, cleanup, renderHook } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { PRODUCT_CAPABILITIES } from '../lib/productCapabilities'
 import {
+  activePanelOf,
   parseBoardPath,
   parseBoardTicket,
   parseBoardTicketType,
@@ -16,6 +17,8 @@ import {
   parseTutorialWork,
   preferredBoardView,
   projectPath,
+  readLocationRoute,
+  replaceSearchParams,
   tutorialHref,
   type UseAppRouteOptions,
   useAppRoute,
@@ -457,3 +460,83 @@ describe('项目主页 /p/<id> 深链', () => {
   })
 })
 
+
+describe('readLocationRoute（OCV5-467 自 App.tsx 移入）', () => {
+  const at = (path: string) => {
+    const u = new URL(path, 'https://example.test')
+    return readLocationRoute({ pathname: u.pathname, search: u.search })
+  }
+
+  it('普通路径启用路由并解析面板与教程深链', () => {
+    const r = at('/s/abcdefgh?panel=help&topic=github-repository&step=2')
+    expect(r).toMatchObject({
+      demo: false,
+      resetToken: undefined,
+      desktopEnroll: false,
+      routingEnabled: true,
+    })
+    expect(r.panel).toBe('help')
+    expect(r.tutorialTopic).toBe(PRODUCT_CAPABILITIES.github.id)
+    expect(r.tutorialStep).toBe(2)
+    expect(r.params.get('panel')).toBe('help')
+  })
+
+  it('demo / reset-password / desktop/enroll 不启用路由，深链一律不解析', () => {
+    for (const path of [
+      '/?demo=1&panel=settings',
+      '/reset-password?token=t1&panel=settings',
+      '/desktop/enroll?enrollment_id=e&panel=settings',
+    ]) {
+      const r = at(path)
+      expect(r.routingEnabled).toBe(false)
+      expect(r.panel).toBeNull()
+      expect(r.tutorialCase).toBeNull()
+    }
+    expect(at('/reset-password?token=t1').resetToken).toBe('t1')
+    expect(at('/reset-password').resetToken).toBeUndefined()
+    expect(at('/reset-password').routingEnabled).toBe(true)
+    expect(at('/reset-password?token=t1&demo=1').resetToken).toBeUndefined()
+    expect(at('/desktop/enroll?demo=1')).toMatchObject({ demo: true, desktopEnroll: false })
+  })
+
+  it('topic 只在没有 case / community 时解析', () => {
+    expect(
+      at('/?panel=help&topic=github-repository&case=research-bike-demand').tutorialTopic,
+    ).toBeNull()
+    expect(at('/?panel=help&topic=github-repository&community=c1').tutorialTopic).toBeNull()
+  })
+})
+
+describe('activePanelOf', () => {
+  const none = { help: false, settings: false, market: false, manage: false, org: false }
+  it('单选优先级：教程 > 设置 > 市场 > 管理 > 组织', () => {
+    expect(activePanelOf(none)).toBeNull()
+    expect(activePanelOf({ ...none, org: true, manage: true })).toBe('manage')
+    expect(activePanelOf({ ...none, org: true, manage: true, market: true })).toBe('market')
+    expect(activePanelOf({ ...none, settings: true, market: true })).toBe('settings')
+    expect(
+      activePanelOf({ help: true, settings: true, market: true, manage: true, org: true }),
+    ).toBe('help')
+    expect(activePanelOf({ ...none, org: true })).toBe('org')
+  })
+})
+
+describe('replaceSearchParams', () => {
+  it('replaceState 写回 query，保留 path 与 hash，不压栈', () => {
+    window.history.replaceState({}, '', '/s/abcdefgh?github_linked=1&keep=1#frag')
+    const before = window.history.length
+    const sp = new URLSearchParams(window.location.search)
+    sp.delete('github_linked')
+    replaceSearchParams(sp)
+    expect(window.location.pathname + window.location.search + window.location.hash).toBe(
+      '/s/abcdefgh?keep=1#frag',
+    )
+    expect(window.history.length).toBe(before)
+    sp.delete('keep')
+    replaceSearchParams(sp)
+    expect(window.location.pathname + window.location.search + window.location.hash).toBe(
+      '/s/abcdefgh#frag',
+    )
+    window.history.replaceState({}, '', '/')
+  })
+})

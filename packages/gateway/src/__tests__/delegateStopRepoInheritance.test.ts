@@ -1,3 +1,5 @@
+import { gatewayMethodBody, readGatewaySource } from './helpers/gatewaySource.js'
+import { readSessionManagerSource, sessionManagerMethodBody } from './helpers/sessionManagerSource.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -5,11 +7,14 @@ import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const SERVER_TS = readFileSync(join(__dirname, '..', 'server.ts'), 'utf-8')
-const SESSION_MANAGER_TS = readFileSync(join(__dirname, '..', 'sessionManager.ts'), 'utf-8')
+// server.ts + the modules split out of it (FINDINGS §7.6 S3: delegate runtime moved to delegateRuntime.ts)
+const SERVER_TS = readGatewaySource()
+// sessionManager.ts + the modules split out of it (FINDINGS §7.6 M1/M2)
+const SESSION_MANAGER_TS = readSessionManagerSource()
 
 function extractMethodBody(source: string, methodName: string): string {
-  const startRe = new RegExp(`^  (private|public|protected)?\\s*(async\\s+)?${methodName}\\b`, 'm')
+  // `(` after the name: the Gateway's route io adapters list `name: (...args) => …` too
+  const startRe = new RegExp(`^  (private|public|protected)?\\s*(async\\s+)?${methodName}\\(`, 'm')
   const startMatch = startRe.exec(source)
   if (!startMatch) throw new Error(`method ${methodName} not found in source`)
   const startIdx = startMatch.index
@@ -23,12 +28,13 @@ function extractMethodBody(source: string, methodName: string): string {
 // P2 债C:委派执行核心先从 HTTP 端点抽到 _runDelegateTask; 3ad3d58ef 再拆出
 // _runDelegateTaskCore(resume claim 包在薄包装里)。身份/repo 绑定/资源闸护栏都在
 // Core 体里,扫包装会假红。另守包装仍 dispatch 到 Core,避免接线被拆掉。
-const delegateWrapper = extractMethodBody(SERVER_TS, '_runDelegateTask')
-const delegateCore = extractMethodBody(SERVER_TS, '_runDelegateTaskCore')
-const handleStop = extractMethodBody(SERVER_TS, 'handleStop')
+// FINDINGS §7.6 S3: the delegate runtime lives in delegateRuntime.ts; the class keeps forwarders.
+const delegateWrapper = gatewayMethodBody('_runDelegateTask')
+const delegateCore = gatewayMethodBody('_runDelegateTaskCore')
+const handleStop = gatewayMethodBody('handleStop') // FINDINGS §7.6 S6: handleStop lives in wsConnection.ts
 const getOrCreate =
-  extractMethodBody(SESSION_MANAGER_TS, 'getOrCreate') +
-  extractMethodBody(SESSION_MANAGER_TS, '_getOrCreateExclusive')
+  sessionManagerMethodBody('getOrCreate') +
+  sessionManagerMethodBody('_getOrCreateExclusive')
 
 test('delegate wrapper still dispatches into _runDelegateTaskCore', () => {
   assert.match(

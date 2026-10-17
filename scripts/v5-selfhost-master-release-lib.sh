@@ -744,6 +744,18 @@ build_master_release() {
     cleanup_master_staging
     die "pinned Box multitool continuation gate 失败"
   fi
+  mlog "  Box incident proofs gate (OCV5-488) @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
+  if [[ ! -f "$staging/scripts/check-v5-box-incident-proofs.ts" ]]; then
+    cleanup_master_staging
+    die "新候选缺 scripts/check-v5-box-incident-proofs.ts"
+  fi
+  # 与 success recovery 门同一个显式 loopback *_test DSN;Box 只在 exec 端点模拟。
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH \
+      TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
+      npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$full_sha" ); then
+    cleanup_master_staging
+    die "pinned Box incident proofs gate (OCV5-488) 失败"
+  fi
   mlog "  Cursor Sand InferenceService contract gate @ pinned staging"
   if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts ); then
     cleanup_master_staging

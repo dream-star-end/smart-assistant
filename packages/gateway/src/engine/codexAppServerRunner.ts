@@ -76,8 +76,93 @@ import type {
   CollabAgentPolicy,
   NativeModelHandoffArtifact,
 } from './engineAdapter.js'
+import {
+  type PendingRequest,
+  type CodexGoalBlock,
+  normalizeCodexGoal,
+  collabReceiverThreadIds,
+  collabAgentsStates,
+  collabTool,
+  collabStatus,
+  collabPrompt,
+  shortThreadId,
+  collabAgentInput,
+  summarizeCollabControl,
+  isTerminalCollabAgentStatus,
+  isErrorCollabAgentStatus,
+  codexToolOutcome,
+  type JsonRpcCallError,
+  isMissingRolloutError,
+  isGoalAlreadyClearedError,
+  type RunnerMessage,
+  type CodexTokenBreakdown,
+  _EMPTY_TOKEN_BREAKDOWN,
+  _coerceTokenBreakdown,
+  _subtractTokenBreakdown,
+  _codexUsageToAnthropicShape,
+  _codexTurnUsageSnapshot,
+  _SUPPRESSED_ITEM_TYPES,
+  _normaliseCodexItemType,
+  _isContextCompactionItem,
+  _stringifyItemBounded,
+  type RuntimeRateLimits,
+  _parseCodexRateLimits,
+  type PendingCodexUserInput,
+  _classifyJsonRpcLine,
+  jsonRpcResult,
+  jsonRpcMethodNotFound,
+  jsonRpcInvalidParams,
+  asRecord,
+  codexReverseRpcKey,
+  normalizeCodexUserInput,
+  buildMcpElicitationContent,
+  summarizeCommandForDescription,
+  stripShellWrapper,
+} from './codexAppServerProtocol.js'
+import {
+  type CodexNotificationHost,
+  type TurnRetryMeta,
+  buildServerRequestAutoApproval as buildServerRequestAutoApprovalImpl,
+  handleRequestUserInput as handleRequestUserInputImpl,
+  handleLine as handleLineImpl,
+  emitPlanBlock as emitPlanBlockImpl,
+  emitGoalBlock as emitGoalBlockImpl,
+  handleNotification as handleNotificationImpl,
+  handleContextCompactionItem as handleContextCompactionItemImpl,
+  rememberCollabSpawnReceivers as rememberCollabSpawnReceiversImpl,
+  handleCollabAgentToolStarted as handleCollabAgentToolStartedImpl,
+  maybeEmitCompletedCollabAgentGroups as maybeEmitCompletedCollabAgentGroupsImpl,
+  handleCollabAgentToolCompleted as handleCollabAgentToolCompletedImpl,
+  handleItemStarted as handleItemStartedImpl,
+  handleItemCompleted as handleItemCompletedImpl,
+  emitAssistantToolUse as emitAssistantToolUseImpl,
+  bindItemCallUsageEpochFromItem as bindItemCallUsageEpochFromItemImpl,
+  bindItemCallUsageEpoch as bindItemCallUsageEpochImpl,
+  callUsageRecord as callUsageRecordImpl,
+  emitCallUsageEpoch as emitCallUsageEpochImpl,
+  recordCallUsageTarget as recordCallUsageTargetImpl,
+  recordCallUsageSnapshot as recordCallUsageSnapshotImpl,
+  sameTokenBreakdown as sameTokenBreakdownImpl,
+  emitToolResult as emitToolResultImpl,
+  emitTurnStatus as emitTurnStatusImpl,
+  emitRetryingStatus as emitRetryingStatusImpl,
+  _consumeRateLimitsForEmit as _consumeRateLimitsForEmitImpl,
+  emitResult as emitResultImpl,
+} from './codexAppServerNotifications.js'
+export {
+  isMissingRolloutError,
+  isGoalAlreadyClearedError,
+  _codexUsageToAnthropicShape,
+  _stringifyItemBounded,
+  _CODEX_5H_WINDOW_MINS,
+  _CODEX_7D_WINDOW_MINS,
+  _parseCodexRateLimits,
+  _classifyJsonRpcLine,
+  summarizeCommandForDescription,
+} from './codexAppServerProtocol.js'
+export type { JsonRpcCallError, RuntimeRateLimits } from './codexAppServerProtocol.js'
 
-const log = createLogger({ module: 'codexAppServerRunner' })
+export const log = createLogger({ module: 'codexAppServerRunner' })
 
 const guardedStdin = new WeakSet<object>()
 function guardStdinErrors(stdin: {
@@ -143,15 +228,6 @@ export async function readLatestCodexNativeHandoff(
 /** 第 N 次失败后、第 N+1 次尝试前的基础退避(index = 失败的 attempt 序号 − 1)。 */
 const RETRY_BACKOFFS_MS = [2_000, 5_000] as const
 const RETRY_JITTER_MS = 500
-
-/** 自动重试侧信道载荷(不进 tape)。字段与 protocol frames.ts OutboundTurnStatus
- *  的 retrying 分支 / ccbMessageParser TurnRetryMeta 逐字段对齐。 */
-interface TurnRetryMeta {
-  attempt: number
-  max: number
-  delayMs: number
-  retryAt: number
-}
 
 function runnerShutdownTimeoutMs(name: string, fallback: number): number {
   const raw = Number(process.env[name])
@@ -328,772 +404,6 @@ export function assertPromptQueueRunnerAdmission(
       `queue turn cannot enter Codex runner backlog (processing=${processing}, queued=${queuedTurns})`,
     )
   }
-}
-
-interface PendingRequest {
-  resolve: (value: unknown) => void
-  reject: (err: Error) => void
-  method: string
-}
-
-type CodexGoalBlock = {
-  blockId: string
-  objective?: string
-  status?: string
-  tokenBudget?: number | null
-  tokensUsed?: number
-  timeUsedSeconds?: number
-  updatedAt?: number
-  cleared?: boolean
-  platformGoalId?: string
-  platformStateRevision?: number
-}
-
-type CollabAgentStateSummary = { status: string; message?: string }
-
-function finiteNumber(raw: unknown): number | undefined {
-  return typeof raw === 'number' && Number.isFinite(raw) ? raw : undefined
-}
-
-function normalizeCodexGoal(raw: unknown, cleared = false, blockId = 'codex-goal'): CodexGoalBlock {
-  const obj = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
-  const goal: CodexGoalBlock = { blockId }
-  if (typeof obj.objective === 'string') goal.objective = obj.objective
-  if (typeof obj.status === 'string') goal.status = obj.status
-  if (obj.tokenBudget === null) {
-    goal.tokenBudget = null
-  } else {
-    const tokenBudget = finiteNumber(obj.tokenBudget)
-    if (tokenBudget !== undefined) goal.tokenBudget = tokenBudget
-  }
-  const tokensUsed = finiteNumber(obj.tokensUsed)
-  if (tokensUsed !== undefined) goal.tokensUsed = tokensUsed
-  const timeUsedSeconds = finiteNumber(obj.timeUsedSeconds)
-  if (timeUsedSeconds !== undefined) goal.timeUsedSeconds = timeUsedSeconds
-  const updatedAt = finiteNumber(obj.updatedAt)
-  if (updatedAt !== undefined) goal.updatedAt = updatedAt
-  if (cleared) goal.cleared = true
-  return goal
-}
-
-function collabReceiverThreadIds(item: Record<string, unknown>): string[] {
-  return Array.isArray(item.receiverThreadIds)
-    ? item.receiverThreadIds.filter((v): v is string => typeof v === 'string' && v.length > 0)
-    : []
-}
-
-function collabAgentsStates(
-  item: Record<string, unknown>,
-): Record<string, CollabAgentStateSummary> {
-  const raw = item.agentsStates
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
-  const out: Record<string, CollabAgentStateSummary> = {}
-  for (const [threadId, stateUnk] of Object.entries(raw as Record<string, unknown>)) {
-    const state =
-      stateUnk && typeof stateUnk === 'object' ? (stateUnk as Record<string, unknown>) : {}
-    const status = typeof state.status === 'string' ? state.status : ''
-    if (!threadId || !status) continue
-    const message = typeof state.message === 'string' && state.message ? state.message : undefined
-    out[threadId] = message ? { status, message } : { status }
-  }
-  return out
-}
-
-function collabTool(item: Record<string, unknown>): string {
-  return typeof item.tool === 'string' && item.tool ? item.tool : 'unknown'
-}
-
-function collabStatus(item: Record<string, unknown>): string {
-  return typeof item.status === 'string' && item.status ? item.status : 'unknown'
-}
-
-function collabPrompt(item: Record<string, unknown>): string {
-  return typeof item.prompt === 'string' ? item.prompt : ''
-}
-
-function shortThreadId(threadId: string): string {
-  return threadId.length > 12 ? `${threadId.slice(0, 6)}…${threadId.slice(-4)}` : threadId
-}
-
-function collabAgentInput(
-  item: Record<string, unknown>,
-  description: string,
-  policy?: CollabAgentPolicy,
-): Record<string, unknown> {
-  const prompt = collabPrompt(item)
-  const receivers = collabReceiverThreadIds(item)
-  const input: Record<string, unknown> = {
-    openclaudeOrigin: 'codex-collab',
-    ...(policy === 'team-mode-prefer-delegate' ? { openclaudeTeamFallback: true } : {}),
-    description: description || prompt || 'Codex 子 Agent',
-    codexTool: collabTool(item),
-  }
-  if (prompt) input.prompt = prompt
-  if (receivers.length > 0) input.receiverThreadIds = receivers
-  if (typeof item.model === 'string' && item.model) input.model = item.model
-  if (typeof item.reasoningEffort === 'string' && item.reasoningEffort) {
-    input.reasoningEffort = item.reasoningEffort
-  }
-  const states = collabAgentsStates(item)
-  if (Object.keys(states).length > 0) input.agentsStates = states
-  return input
-}
-
-function summarizeCollabControl(item: Record<string, unknown>): string {
-  const tool = collabTool(item)
-  const status = collabStatus(item)
-  const receivers = collabReceiverThreadIds(item)
-  const states = collabAgentsStates(item)
-  const parts = [`${tool}: ${status}`]
-  if (receivers.length > 0) parts.push(`receivers: ${receivers.map(shortThreadId).join(', ')}`)
-  const stateLines = Object.entries(states).map(([threadId, state]) => {
-    const msg = state.message ? ` — ${state.message}` : ''
-    return `${shortThreadId(threadId)}: ${state.status}${msg}`
-  })
-  if (stateLines.length > 0) parts.push(stateLines.join('\n'))
-  return parts.join('\n')
-}
-
-function isTerminalCollabAgentStatus(status: string): boolean {
-  return (
-    status === 'completed' || status === 'errored' || status === 'shutdown' || status === 'notFound'
-  )
-}
-
-function isErrorCollabAgentStatus(status: string): boolean {
-  return status === 'errored' || status === 'notFound'
-}
-
-function codexToolOutcome(item: Record<string, unknown>): {
-  isError: boolean
-  terminationReason?: ToolTerminationReason
-} {
-  const status = typeof item.status === 'string' ? item.status.toLowerCase() : ''
-  if (status === 'cancelled' || status === 'canceled' || status === 'interrupted') {
-    return { isError: true, terminationReason: 'cancelled' }
-  }
-  if (
-    status === 'failed' ||
-    status === 'error' ||
-    status === 'errored' ||
-    (item.error !== undefined && item.error !== null)
-  ) {
-    return { isError: true, terminationReason: 'tool_error' }
-  }
-  return { isError: false }
-}
-
-/** Structured error produced by `sendRequest` when codex replies with a
- *  JSON-RPC error frame. Callers can branch on `rpcCode` / `rpcMessage` /
- *  `rpcMethod` without re-parsing `message`; the human-readable `message`
- *  is preserved (`"<method> -> <code>: <message>"`) for log/UI use. */
-export interface JsonRpcCallError extends Error {
-  rpcCode: number
-  rpcMessage: string
-  rpcMethod: string
-}
-
-/** Detect codex's "thread/resume against a thread whose rollout is no longer
- *  on disk" failure mode. Triggered when v3 commercial containers idle-rebuild
- *  and their `~/.codex/sessions/...` JSONL is wiped while master gateway still
- *  holds the old `thread_id` in resume-map.json. The fix is a transparent
- *  thread/start fallback (see runTurn attach block).
- *
- *  Three guards (Codex review #019e0b72 BLOCKER 1):
- *   - `rpcMethod === 'thread/resume'` — only this method can produce the
- *     missing-rollout case; other methods returning -32600 mean something else.
- *   - `rpcCode === -32600` — JSON-RPC "Invalid Request" code that codex 0.125
- *     reuses for missing rollout (verified via spike).
- *   - `/no rollout found/i` — text guard so a future codex release that
- *     repurposes -32600 for protocol/schema drift (e.g. param shape change)
- *     won't be silently downgraded into "start a fresh thread". Drift should
- *     surface as a hard error instead. */
-export function isMissingRolloutError(err: unknown): err is JsonRpcCallError {
-  if (!(err instanceof Error)) return false
-  const e = err as Partial<JsonRpcCallError>
-  return (
-    e.rpcMethod === 'thread/resume' &&
-    e.rpcCode === -32600 &&
-    typeof e.rpcMessage === 'string' &&
-    /no rollout found/i.test(e.rpcMessage)
-  )
-}
-
-/** Detect codex's "clear a goal on a thread that has none" failure mode.
- *  syncPlatformGoal sends a clearing `thread/goal/set` (objective: null) for
- *  every session whose platform goal state is absent/cleared; codex 0.125
- *  rejects that with -32600 "no goal exists" when the thread never had a
- *  goal. The desired end state (no goal upstream) already holds, so the
- *  clear is idempotent success — treating it as fatal killed every turn on
- *  goalless sessions (2026-07-17 outage).
- *
- *  Same three guards as isMissingRolloutError: method + code + text, so a
- *  future codex release repurposing -32600 for schema drift on this method
- *  still surfaces as a hard error. */
-export function isGoalAlreadyClearedError(err: unknown): err is JsonRpcCallError {
-  if (!(err instanceof Error)) return false
-  const e = err as Partial<JsonRpcCallError>
-  return (
-    e.rpcMethod === 'thread/goal/set' &&
-    e.rpcCode === -32600 &&
-    typeof e.rpcMessage === 'string' &&
-    /no goal exists/i.test(e.rpcMessage)
-  )
-}
-
-/** Runner message shape used by sessionManager.ts (subset of SdkMessage). */
-interface RunnerMessage {
-  type: string
-  subtype?: string
-  session_id?: string | null
-  /** PR2 v1.0.66 — emitResult 透传的 turn requestId,只 codex result 帧带,
-   *  sessionManager 据此识别这是 codex turn 终态,转发到 outbound.codex_billing 帧。
-   *  非 codex 路径 / 非 result 帧均不带。 */
-  requestId?: string
-  message?: {
-    role?: string
-    content?: Array<{
-      type: string
-      text?: string
-      id?: string
-      name?: string
-      input?: unknown
-      tool_use_id?: string
-      content?: string | unknown
-      is_error?: boolean
-      /** OpenClaude-only structured metadata on synthetic codex tool_result rows. */
-      exit_code?: number
-      termination_reason?: ToolTerminationReason
-    }>
-  }
-  result?: string
-  /** Parsed final agentMessage for turns started with outputSchema. The
-   * stream may contain abandoned schema-attempt deltas, so only the completed
-   * item is authoritative. */
-  structured_output?: unknown
-  total_cost_usd?: number
-  duration_ms?: number
-  is_error?: boolean
-  // Anthropic-style usage shape — ccbMessageParser._handleResult reads
-  // `input_tokens / output_tokens / cache_read_input_tokens / cache_creation_input_tokens`.
-  // We additionally surface `reasoning_output_tokens` (codex-only field) so
-  // PR2 billing can decide whether to fold it into output billing or split
-  // it out. Other readers ignore the extra field.
-  usage?: {
-    input_tokens?: number
-    output_tokens?: number
-    cache_read_input_tokens?: number
-    cache_creation_input_tokens?: number
-    reasoning_output_tokens?: number
-    total_tokens?: number
-  }
-  /** Issue A v1.0.108 — codex `account/rateLimits/updated` 快照(0..100% pct + ISO
-   *  reset)。仅 codex result 帧带,sessionManager 透传到 outbound.codex_billing
-   *  的 rateLimits 字段,master.userChatBridge 落库 claude_accounts.quota_*。 */
-  rateLimits?: RuntimeRateLimits
-  /** LOW-2(2026-07-03)— codex turn 终态映射到 CCB result 行的 stop_reason 口径,
-   *  ccbMessageParser._handleResult 读取后随 final meta 下发(此前 codex 路径恒缺,
-   *  会触发 telemetry 的"willCallApi fired but no stop_reason"误告警):
-   *    turn status 'completed'   → 'end_turn'
-   *    turn status 'interrupted' → 'interrupted'(用户主动 stop;无 Anthropic 等价枚举)
-   *    failed / unexpected / catch 路径 → 不带(保持 is_error 语义,不伪造终态)。 */
-  stop_reason?: string
-  /** Billing-only stable terminal classification. Unlike stop_reason this
-   * distinguishes an explicit user interrupt from process/deploy shutdown. */
-  billing_terminal_code?: 'USER_CANCELLED' | 'CODEX_ERROR'
-  /** turn-retry 批 — runner 现场对 error 文本做的结构化分类(gateway 共享
-   *  classifyRunError,非 'unknown' 才带)。ccbMessageParser / server 据此派生
-   *  outbound.error.code(权威语义在 protocol turnErrorTaxonomy)。仅 is_error
-   *  result 帧带。 */
-  errorClass?: ClassifiedErrorCode
-  event?: unknown
-}
-
-/** codex `ThreadTokenUsage.{last,total}` shape — schema at
- *  /tmp/codex-protocol/v2/ThreadTokenUsageUpdatedNotification.json. */
-interface CodexTokenBreakdown {
-  cachedInputTokens: number
-  inputTokens: number
-  outputTokens: number
-  reasoningOutputTokens: number
-  totalTokens: number
-}
-
-const _EMPTY_TOKEN_BREAKDOWN: Readonly<CodexTokenBreakdown> = Object.freeze({
-  cachedInputTokens: 0,
-  inputTokens: 0,
-  outputTokens: 0,
-  reasoningOutputTokens: 0,
-  totalTokens: 0,
-})
-
-/** Defensive coerce: ThreadTokenUsageUpdatedNotification.params.tokenUsage.{last,total}.
- *  All numeric fields are required per schema, but a malformed frame should
- *  never throw — coerce non-numbers to 0 and clamp negatives. */
-function _coerceTokenBreakdown(v: unknown): CodexTokenBreakdown {
-  if (!v || typeof v !== 'object') return { ..._EMPTY_TOKEN_BREAKDOWN }
-  const o = v as Record<string, unknown>
-  const num = (k: string) => {
-    const n = o[k]
-    return typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : 0
-  }
-  return {
-    cachedInputTokens: num('cachedInputTokens'),
-    inputTokens: num('inputTokens'),
-    outputTokens: num('outputTokens'),
-    reasoningOutputTokens: num('reasoningOutputTokens'),
-    totalTokens: num('totalTokens'),
-  }
-}
-
-/** Compute per-turn delta = current cumulative thread total - prior turn's
- *  cumulative total. Codex's `total` is monotonic across the thread, so taking
- *  the most-recent total minus the snapshot at last completed turn boundary
- *  yields the active turn's actual usage independent of how many notifications
- *  arrive during the turn (multi-LLM-call agentic turns issue one notification
- *  per server-side call). Clamp to 0 to defend against any rare retrograde
- *  updates (codex shouldn't emit them; defense in depth). */
-function _subtractTokenBreakdown(
-  a: CodexTokenBreakdown,
-  b: CodexTokenBreakdown,
-): CodexTokenBreakdown {
-  return {
-    cachedInputTokens: Math.max(0, a.cachedInputTokens - b.cachedInputTokens),
-    inputTokens: Math.max(0, a.inputTokens - b.inputTokens),
-    outputTokens: Math.max(0, a.outputTokens - b.outputTokens),
-    reasoningOutputTokens: Math.max(0, a.reasoningOutputTokens - b.reasoningOutputTokens),
-    totalTokens: Math.max(0, a.totalTokens - b.totalTokens),
-  }
-}
-
-/** Convert a codex turn-delta breakdown to the Anthropic-shaped `usage` object
- *  that ccbMessageParser._handleResult and downstream billing.calculator read.
- *
- *  Token-shape gotcha that bit production billing (Issue C):
- *    - Codex `inputTokens` is the **total** prompt counted by OpenAI,
- *      cached + non-cached. Reference: openai/codex `non_cached_input =
- *      input_tokens - cached_input_tokens` in `protocol/src/protocol.rs`.
- *    - Anthropic `input_tokens` is **disjoint** from `cache_read_input_tokens`.
- *    - calculator.computeCost adds them, so passing raw codex inputTokens
- *      double-charges the cached portion.
- *  Subtract here at the boundary so the rest of the pipeline can trust the
- *  Anthropic-shape contract.
- *
- *  _coerceTokenBreakdown already guarantees both fields are finite ≥ 0, so
- *  Math.max(0, ...) on the subtraction is sufficient (covers any rare frame
- *  where cached > input, e.g. stale-baseline edge after self-heal). */
-export function _codexUsageToAnthropicShape(turn: CodexTokenBreakdown): {
-  input_tokens: number
-  output_tokens: number
-  cache_read_input_tokens: number
-  cache_creation_input_tokens: number
-  reasoning_output_tokens: number
-  total_tokens: number
-} {
-  return {
-    input_tokens: Math.max(0, turn.inputTokens - turn.cachedInputTokens),
-    output_tokens: turn.outputTokens,
-    cache_read_input_tokens: turn.cachedInputTokens,
-    cache_creation_input_tokens: 0,
-    reasoning_output_tokens: turn.reasoningOutputTokens,
-    total_tokens: turn.totalTokens,
-  }
-}
-
-function _codexTurnUsageSnapshot(turn: CodexTokenBreakdown): TurnTokenUsageSnapshot {
-  return {
-    totalTokens: turn.totalTokens,
-    inputTokens: Math.max(0, turn.inputTokens - turn.cachedInputTokens),
-    outputTokens: turn.outputTokens,
-    cacheReadTokens: turn.cachedInputTokens,
-  }
-}
-
-/** ThreadItem.type values that are server-internal echoes (not real tool
- *  invocations) and therefore must not surface in the UI. `userMessage` is
- *  the codex echoing back what we just sent; `hookPrompt` is a system hook
- *  (e.g. session-init scaffolding). Either one as a tool card produces the
- *  ugly "CODEX:USERMESSAGE" dump boss flagged. */
-const _SUPPRESSED_ITEM_TYPES = new Set<string>(['userMessage', 'hookPrompt'])
-
-function _normaliseCodexItemType(type: unknown): string | null {
-  if (type === 'context_compaction') return 'contextCompaction'
-  return typeof type === 'string' ? type : null
-}
-
-function _isContextCompactionItem(item: unknown): item is Record<string, unknown> {
-  if (!item || typeof item !== 'object') return false
-  return _normaliseCodexItemType((item as Record<string, unknown>).type) === 'contextCompaction'
-}
-
-/** Full item JSON. The old 2,000-character preview budget silently discarded
- * paid tool/MCP output; Turn Tape now handles transport/storage size instead. */
-export function _stringifyItemBounded(item: unknown, _legacyBudget?: number): string {
-  return JSON.stringify(item) ?? 'null'
-}
-
-/** Issue A v1.0.108 — Anthropic-shape 配额快照(0..100% + ISO8601 reset)。
- *  落到 OutboundCodexBilling.rateLimits 字段,master.userChatBridge 直接传 quota.ts。
- *  字段全 optional,允许 plan 类型只有单窗口的情况(e.g. free 只发 7d)。 */
-export interface RuntimeRateLimits {
-  util5h?: number
-  reset5h?: string
-  util7d?: number
-  reset7d?: string
-}
-
-/** codex 5h 窗口对应 windowDurationMins 值(5 * 60)。schema:int64 minutes。 */
-export const _CODEX_5H_WINDOW_MINS = 300
-/** codex 7d 窗口对应 windowDurationMins 值(7 * 24 * 60)。 */
-export const _CODEX_7D_WINDOW_MINS = 10080
-
-/** 解析 codex `account/rateLimits/updated` 通知的 RateLimitSnapshot。
- *
- *  schema(/tmp/codex-protocol/v2/AccountRateLimitsUpdatedNotification.json):
- *    RateLimitSnapshot { credits?, limitId?, limitName?, planType?,
- *                        primary?: RateLimitWindow, rateLimitReachedType?,
- *                        secondary?: RateLimitWindow }
- *    RateLimitWindow { usedPercent: int, resetsAt?: int64 epoch sec,
- *                      windowDurationMins?: int64 }
- *
- *  桶路由:
- *   - `windowDurationMins === 300` → 5h
- *   - `windowDurationMins === 10080` → 7d
- *   - 双窗口都缺 duration 时 fallback `primary=5h secondary=7d`
- *     (实测 plus/pro 双窗口 plan 上 codex 这个顺序稳定)
- *   - **单窗口且无 duration 时拒绝写入**(Codex review NEEDS-FIX 1):
- *     免费/usage-based plan 可能只有 1 个窗口,语义不明,宁可不写也不要写错桶
- *
- *  Returns null 当 snapshot 完全无可用窗口。 */
-export function _parseCodexRateLimits(rl: unknown): RuntimeRateLimits | null {
-  if (!rl || typeof rl !== 'object') return null
-  const r = rl as Record<string, unknown>
-  const primary =
-    r.primary && typeof r.primary === 'object' ? (r.primary as Record<string, unknown>) : null
-  const secondary =
-    r.secondary && typeof r.secondary === 'object' ? (r.secondary as Record<string, unknown>) : null
-
-  // 提取每个 window 的 duration(可缺/可 null)
-  const primaryMins =
-    primary && typeof primary.windowDurationMins === 'number' ? primary.windowDurationMins : null
-  const secondaryMins =
-    secondary && typeof secondary.windowDurationMins === 'number'
-      ? secondary.windowDurationMins
-      : null
-
-  // Codex review NEEDS-FIX 1:fallback 仅在双窗口都存在且都无 duration 时启用。
-  // 单窗口 + 无 duration:返回 null,避免把 7d-only plan 错写成 5h。
-  const eligibleFallback =
-    primary !== null && secondary !== null && primaryMins === null && secondaryMins === null
-
-  const out: RuntimeRateLimits = {}
-  const writeWindow = (win: Record<string, unknown>, bucket: '5h' | '7d'): void => {
-    const usedPercent =
-      typeof win.usedPercent === 'number' && Number.isFinite(win.usedPercent)
-        ? win.usedPercent
-        : null
-    const resetsAt =
-      typeof win.resetsAt === 'number' && Number.isFinite(win.resetsAt) && win.resetsAt > 0
-        ? win.resetsAt
-        : null
-    if (usedPercent !== null) {
-      const clamped = Math.max(0, Math.min(100, usedPercent))
-      if (bucket === '5h') out.util5h = clamped
-      else out.util7d = clamped
-    }
-    if (resetsAt !== null) {
-      // schema 单位 epoch seconds(int64);> 1e12 视为已经是 ms(防御性兼容)
-      const ms = resetsAt >= 1e12 ? resetsAt : resetsAt * 1000
-      // Codex review NEEDS-FIX:容器侧 JSON-RPC 任意输入,Date 越界(>±8.64e15 ms)
-      // 会让 toISOString 抛 RangeError。new Date(invalid) 的 getTime() 返 NaN,
-      // 用此判定避免崩 — 不可解析就丢这个 reset 字段(util 仍写)。
-      const d = new Date(ms)
-      if (Number.isFinite(d.getTime())) {
-        const iso = d.toISOString()
-        if (bucket === '5h') out.reset5h = iso
-        else out.reset7d = iso
-      }
-    }
-  }
-
-  for (const [slot, win, mins] of [
-    ['primary', primary, primaryMins] as const,
-    ['secondary', secondary, secondaryMins] as const,
-  ]) {
-    if (!win) continue
-    let bucket: '5h' | '7d' | null = null
-    if (mins === _CODEX_5H_WINDOW_MINS) bucket = '5h'
-    else if (mins === _CODEX_7D_WINDOW_MINS) bucket = '7d'
-    else if (mins === null && eligibleFallback) bucket = slot === 'primary' ? '5h' : '7d'
-    if (bucket === null) continue
-    writeWindow(win, bucket)
-  }
-
-  return Object.keys(out).length === 0 ? null : out
-}
-
-type JsonRpcLine =
-  | {
-      kind: 'response'
-      id: number | string
-      result?: unknown
-      error?: { code: number; message: string }
-    }
-  | { kind: 'server-request'; id: number | string; method: string; params?: unknown }
-  | { kind: 'notification'; method: string; params?: unknown }
-  | { kind: 'unknown' }
-
-interface PendingCodexUserInput {
-  /** Exact app-server reverse-RPC id. Must be echoed without string coercion. */
-  rpcId: number | string
-  /** Canonical key used only for duplicate detection while the RPC is pending. */
-  rpcKey: string
-  turnId: string
-  itemId: string
-  /** Existing AskUserQuestion answers are keyed by question text; Codex's
-   * response is keyed by this stable question id. */
-  questions: Array<{ id: string; question: string }>
-}
-
-interface NormalizedCodexUserInput {
-  threadId: string
-  turnId: string
-  itemId: string
-  questions: Array<{ id: string; question: string }>
-  input: Record<string, unknown>
-}
-
-/**
- * Classify a JSON-RPC line. Codex app-server uses bidirectional JSON-RPC 2.0:
- *   - Response: { id, result } or { id, error } — reply to one of our requests.
- *   - Server request: { id, method, params } — server expects a response.
- *   - Notification: { method, params } — fire-and-forget event.
- * Anything else (including non-JSON) is `unknown` and surfaced via parse_error.
- */
-export function _classifyJsonRpcLine(line: string): JsonRpcLine {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(line)
-  } catch {
-    return { kind: 'unknown' }
-  }
-  if (!parsed || typeof parsed !== 'object') return { kind: 'unknown' }
-  const m = parsed as Record<string, unknown>
-  if (typeof m.method === 'string') {
-    if ('id' in m && (typeof m.id === 'number' || typeof m.id === 'string')) {
-      return {
-        kind: 'server-request',
-        id: m.id as number | string,
-        method: m.method,
-        params: m.params,
-      }
-    }
-    return { kind: 'notification', method: m.method, params: m.params }
-  }
-  if (
-    'id' in m &&
-    (typeof m.id === 'number' || typeof m.id === 'string') &&
-    ('result' in m || 'error' in m)
-  ) {
-    return {
-      kind: 'response',
-      id: m.id as number | string,
-      result: m.result,
-      error: m.error as { code: number; message: string } | undefined,
-    }
-  }
-  return { kind: 'unknown' }
-}
-
-function jsonRpcResult(id: number | string, result: unknown): string {
-  return JSON.stringify({ jsonrpc: '2.0', id, result })
-}
-
-function jsonRpcMethodNotFound(id: number | string, method: string): string {
-  return JSON.stringify({
-    jsonrpc: '2.0',
-    id,
-    error: {
-      code: -32601,
-      message: `method '${method}' not implemented by openclaude-gateway`,
-    },
-  })
-}
-
-function jsonRpcInvalidParams(id: number | string, method: string): string {
-  return JSON.stringify({
-    jsonrpc: '2.0',
-    id,
-    error: {
-      code: -32602,
-      message: `invalid params for '${method}'`,
-    },
-  })
-}
-
-function asRecord(v: unknown): Record<string, unknown> {
-  return v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
-}
-
-function codexReverseRpcKey(id: number | string): string {
-  return JSON.stringify([typeof id, id])
-}
-
-/** Project Codex 0.144/0.149 ToolRequestUserInputParams onto the already-shipped
- * CCB AskUserQuestion input shape. Codex has no multiSelect request field;
- * every model-facing option list is mutually exclusive, so the projection is
- * explicitly single-select. Protocol-only fields are retained as harmless
- * metadata inside the existing question objects (no second wire model). */
-function normalizeCodexUserInput(paramsUnk: unknown): NormalizedCodexUserInput | null {
-  const params = asRecord(paramsUnk)
-  const threadId = typeof params.threadId === 'string' ? params.threadId : ''
-  const turnId = typeof params.turnId === 'string' ? params.turnId : ''
-  const itemId = typeof params.itemId === 'string' ? params.itemId : ''
-  if (!threadId || !turnId || !itemId || !Array.isArray(params.questions)) return null
-
-  const inputQuestions: Array<Record<string, unknown>> = []
-  const questions: Array<{ id: string; question: string }> = []
-  for (const questionUnk of params.questions) {
-    const question = asRecord(questionUnk)
-    const id = typeof question.id === 'string' ? question.id : ''
-    const header = typeof question.header === 'string' ? question.header : ''
-    const text = typeof question.question === 'string' ? question.question : ''
-    if (!id || !text || typeof question.header !== 'string') return null
-
-    const rawOptions = question.options
-    if (rawOptions !== null && rawOptions !== undefined && !Array.isArray(rawOptions)) return null
-    const options: Array<{ label: string; description: string }> = []
-    for (const optionUnk of Array.isArray(rawOptions) ? rawOptions : []) {
-      const option = asRecord(optionUnk)
-      if (typeof option.label !== 'string' || typeof option.description !== 'string') return null
-      options.push({ label: option.label, description: option.description })
-    }
-
-    questions.push({ id, question: text })
-    inputQuestions.push({
-      id,
-      header,
-      question: text,
-      multiSelect: false,
-      isOther: question.isOther === true,
-      isSecret: question.isSecret === true,
-      options,
-    })
-  }
-  if (questions.length === 0) return null
-
-  const isBlocking = params.isBlocking
-  if (isBlocking !== undefined && typeof isBlocking !== 'boolean') return null
-  const autoResolutionMs = params.autoResolutionMs
-  if (
-    autoResolutionMs !== undefined &&
-    autoResolutionMs !== null &&
-    (typeof autoResolutionMs !== 'number' ||
-      !Number.isSafeInteger(autoResolutionMs) ||
-      autoResolutionMs < 60_000 ||
-      autoResolutionMs > 240_000)
-  ) {
-    return null
-  }
-
-  // 0.149 makes isBlocking authoritative and deprecates autoResolutionMs.
-  // Legacy 0.144 requests omit isBlocking, so preserve their old duration
-  // semantics. A new non-blocking request without a usable legacy duration
-  // receives the platform minimum instead of becoming accidentally blocking.
-  const effectiveAutoResolutionMs =
-    isBlocking === true
-      ? undefined
-      : isBlocking === false
-        ? typeof autoResolutionMs === 'number'
-          ? autoResolutionMs
-          : 60_000
-        : typeof autoResolutionMs === 'number'
-          ? autoResolutionMs
-          : undefined
-
-  return {
-    threadId,
-    turnId,
-    itemId,
-    questions,
-    input: {
-      questions: inputQuestions,
-      ...(typeof effectiveAutoResolutionMs === 'number'
-        ? { autoResolutionMs: effectiveAutoResolutionMs }
-        : {}),
-    },
-  }
-}
-
-function chooseApprovalString(options: unknown[]): string {
-  const strings = options.filter((v): v is string => typeof v === 'string')
-  const preferred = [
-    'approve',
-    'always_allow',
-    'allow',
-    'approved',
-    'accept',
-    'approved_for_session',
-    'yes',
-  ]
-  for (const p of preferred) {
-    const hit = strings.find((s) => s.toLowerCase().includes(p))
-    if (hit) return hit
-  }
-  return (
-    strings.find((s) => !/decline|deny|denied|cancel|abort|reject/i.test(s)) ?? strings[0] ?? ''
-  )
-}
-
-function buildMcpElicitationFieldValue(schemaUnk: unknown): unknown {
-  const schema = asRecord(schemaUnk)
-  if ('default' in schema && schema.default !== undefined && schema.default !== null) {
-    return schema.default
-  }
-
-  if (Array.isArray(schema.enum)) {
-    return chooseApprovalString(schema.enum)
-  }
-  if (Array.isArray(schema.oneOf)) {
-    return chooseApprovalString(schema.oneOf.map((o) => asRecord(o).const))
-  }
-  const items = asRecord(schema.items)
-  if (Array.isArray(items.anyOf)) {
-    return [chooseApprovalString(items.anyOf.map((o) => asRecord(o).const))]
-  }
-  if (Array.isArray(items.enum)) {
-    return [chooseApprovalString(items.enum)]
-  }
-
-  switch (schema.type) {
-    case 'boolean':
-      return true
-    case 'number':
-    case 'integer':
-      return 0
-    case 'array':
-      return []
-    case 'string':
-      return ''
-    default:
-      return null
-  }
-}
-
-function buildMcpElicitationContent(paramsUnk: unknown): Record<string, unknown> | null {
-  const params = asRecord(paramsUnk)
-  if (params.mode !== 'form') return null
-  const requestedSchema = asRecord(params.requestedSchema)
-  const properties = asRecord(requestedSchema.properties)
-  const required = Array.isArray(requestedSchema.required)
-    ? requestedSchema.required.filter((v): v is string => typeof v === 'string')
-    : Object.keys(properties)
-  const out: Record<string, unknown> = {}
-  for (const key of required) {
-    if (!(key in properties)) continue
-    out[key] = buildMcpElicitationFieldValue(properties[key])
-  }
-  return out
 }
 
 export class CodexAppServerRunner extends EventEmitter {
@@ -2698,284 +2008,28 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private buildServerRequestAutoApproval(method: string, params: unknown): unknown | null {
-    switch (method) {
-      case 'item/commandExecution/requestApproval':
-        return { decision: 'acceptForSession' }
-      case 'item/fileChange/requestApproval':
-        return { decision: 'acceptForSession' }
-      case 'execCommandApproval':
-      case 'applyPatchApproval':
-        return { decision: 'approved_for_session' }
-      case 'item/permissions/requestApproval': {
-        const requested = asRecord(asRecord(params).permissions)
-        const permissions: Record<string, unknown> = {}
-        if (requested.network !== undefined && requested.network !== null) {
-          permissions.network = requested.network
-        }
-        if (requested.fileSystem !== undefined && requested.fileSystem !== null) {
-          permissions.fileSystem = requested.fileSystem
-        }
-        return { permissions, scope: 'session', strictAutoReview: false }
-      }
-      case 'mcpServer/elicitation/request':
-        return {
-          action: 'accept',
-          content: buildMcpElicitationContent(params),
-          _meta: null,
-        }
-      default:
-        return null
-    }
+    return buildServerRequestAutoApprovalImpl.call(this as unknown as CodexNotificationHost, method, params)
   }
 
   private handleRequestUserInput(id: number | string, paramsUnk: unknown): void {
-    const params = normalizeCodexUserInput(paramsUnk)
-    if (!params) {
-      this.writeRaw(jsonRpcInvalidParams(id, 'item/tool/requestUserInput'))
-      return
-    }
-    if (
-      !this.currentTurnCompleter ||
-      params.threadId !== this.threadId ||
-      (this.activeTurnId !== null && params.turnId !== this.activeTurnId)
-    ) {
-      log.warn('codex requestUserInput does not match active thread/turn', {
-        sessionKey: this.opts.sessionKey,
-        requestThreadId: params.threadId,
-        activeThreadId: this.threadId,
-        requestTurnId: params.turnId,
-        activeTurnId: this.activeTurnId,
-      })
-      this.writeRaw(jsonRpcInvalidParams(id, 'item/tool/requestUserInput'))
-      return
-    }
-
-    // A reverse request can share the stdout chunk with the turn/start
-    // response. Mirror notification handling's early-turn adoption so the
-    // subsequent turn/completed cleanup is scoped correctly.
-    if (this.activeTurnId === null && this.currentTurnCompleter) {
-      this.activeTurnId = params.turnId
-    }
-
-    const rpcKey = codexReverseRpcKey(id)
-    const duplicateRequestId = this.pendingUserInputIdsByRpc.get(rpcKey)
-    if (duplicateRequestId) {
-      log.warn('duplicate pending codex requestUserInput ignored', {
-        sessionKey: this.opts.sessionKey,
-        requestId: duplicateRequestId,
-        rpcId: id,
-      })
-      return
-    }
-
-    // turnId + itemId are app-server generated and make this opaque id stable
-    // and collision-resistant across runner respawns; the serial disambiguates
-    // a protocol-violating duplicate item id without parsing the id later.
-    const requestId = `codex-user-input:${params.turnId}:${params.itemId}:${++this.nextUserInputRequestId}`
-    this.pendingUserInputs.set(requestId, {
-      rpcId: id,
-      rpcKey,
-      turnId: params.turnId,
-      itemId: params.itemId,
-      questions: params.questions,
-    })
-    this.pendingUserInputIdsByRpc.set(rpcKey, requestId)
-    this.emitUserInputWaitStatus()
-
-    // turn-retry 台账:permission / requestUserInput 请求是对外 emit 边界 → 置位。
-    this.attemptHadToolOrPermission = true
-    // Reuse the exact CCB parser ingress. CcbMessageParser converts this
-    // synthetic control_request into the canonical permission_request event,
-    // so no Codex-specific frame or frontend card is introduced.
-    this.emit('message', {
-      type: 'control_request',
-      request_id: requestId,
-      request: {
-        subtype: 'can_use_tool',
-        tool_name: 'AskUserQuestion',
-        tool_use_id: params.itemId,
-        input: params.input,
-      },
-    } as unknown as RunnerMessage)
+    handleRequestUserInputImpl.call(this as unknown as CodexNotificationHost, id, paramsUnk)
   }
 
   private handleLine(line: string): void {
-    const msg = _classifyJsonRpcLine(line)
-    // Preserve the exact app-server JSON-RPC object before any UI projection,
-    // filtering or normalization. The per-turn parser stores this opaque event
-    // in the immutable tape, so command exit codes, full file-change objects,
-    // collaboration payloads, reasoning items and future protocol fields all
-    // survive refresh even when the compact UI card shows only a summary.
-    //
-    // patchUpdated is the one deliberate exception: every notification is a
-    // cumulative copy of the same growing patch, so appending all copies would
-    // make the tape O(N²). Its latest exact snapshot is retained separately by
-    // CcbMessageParser for crash/interrupt persistence, and the native final
-    // fileChange item remains in this raw tape.
-    if (
-      (this.currentTurnCompleter || this.activeTurnId) &&
-      !(msg.kind === 'notification' && msg.method === 'item/fileChange/patchUpdated')
-    ) {
-      let payload: unknown
-      try {
-        payload = JSON.parse(line)
-      } catch {
-        payload = { rawLine: line, parseError: true }
-      }
-      this.emit('runtime_event', payload)
-    }
-    if (msg.kind === 'unknown') {
-      this.emit('parse_error', { line, error: 'unknown JSON-RPC shape' })
-      return
-    }
-    if (msg.kind === 'response') {
-      const numId = typeof msg.id === 'number' ? msg.id : Number(msg.id)
-      const p = this.pending.get(numId)
-      if (!p) {
-        log.warn('orphan JSON-RPC response', {
-          sessionKey: this.opts.sessionKey,
-          id: msg.id,
-        })
-        return
-      }
-      this.pending.delete(numId)
-      if (msg.error) {
-        // Structured reject: keep the human message for log/UI use, but also
-        // attach `rpcCode` / `rpcMessage` / `rpcMethod` so callers can branch
-        // on protocol-level fields without re-parsing the message string. The
-        // self-heal in runTurn (attach → thread/resume → -32600 "no rollout
-        // found") relies on these fields to avoid swallowing unrelated
-        // -32600 Invalid Request errors (e.g. schema/protocol drift) as a
-        // missing-rollout case (Codex review #019e0b72 BLOCKER 1).
-        const err = new Error(
-          `${p.method} -> ${msg.error.code}: ${msg.error.message}`,
-        ) as JsonRpcCallError
-        err.rpcCode = msg.error.code
-        err.rpcMessage = msg.error.message
-        err.rpcMethod = p.method
-        p.reject(err)
-      } else {
-        p.resolve(msg.result)
-      }
-      return
-    }
-    if (msg.kind === 'server-request') {
-      // Reverse-RPC methods we recognize:
-      //   - `account/chatgptAuthTokens/refresh` (commercial codex
-      //     401-recovery): forward to v3 master HTTP endpoint, reply with the
-      //     new token. This MUST stay ahead of generic approval handling.
-      //   - Approval / MCP elicitation requests: OpenClaude commercial runs
-      //     codex app-server as a trusted autonomous agent, so answer with a
-      //     session-scoped accept instead of hanging behind a browser prompt.
-      if (msg.method === 'account/chatgptAuthTokens/refresh') {
-        // Async fire-and-forget; we reply to codex in the callback. Errors
-        // here become a JSON-RPC error frame back to codex.
-        void this._handleChatgptAuthTokensRefresh(msg.id, msg.params)
-        return
-      }
-      if (this.opts.hermeticNoTools && isHermeticExecutionMethod(msg.method)) {
-        const denial = buildHermeticDenial(msg.method)
-        if (denial) {
-          this.attemptHadToolOrPermission = true
-          log.info('codex app-server hermetic reverse-RPC denied', {
-            sessionKey: this.opts.sessionKey,
-            method: msg.method,
-          })
-          this.writeRaw(jsonRpcResult(msg.id, denial))
-          return
-        }
-      }
-      if (msg.method === 'item/tool/requestUserInput') {
-        this.handleRequestUserInput(msg.id, msg.params)
-        return
-      }
-      const autoApproval = this.buildServerRequestAutoApproval(msg.method, msg.params)
-      if (autoApproval !== null) {
-        // 审计 R2 — 自动批准 = 对当前 thread 的权限/命令/文件副作用,是本 attempt
-        // 的对外 emit 边界。**必须在写批准响应之前**单调置位台账 flag:同一 stdout
-        // chunk 内的 reverse-RPC 可能先于 turn/start 的 Promise resolve 到达,若不在此
-        // 记账,后续 turn/start application error 时重试门会误判"零权限副作用"而重发,
-        // 造成已批准的副作用重复执行。与 handleRequestUserInput 的记账点对称。
-        this.attemptHadToolOrPermission = true
-        // 若该 reverse-RPC 携带 turnId 且本 attempt 尚未 adopt(activeTurnId===null)
-        // 且 turn 在飞(currentTurnCompleter),提前 adopt —— 与 handleRequestUserInput /
-        // handleNotification 的 early-turn adoption 同语义,让重试门的 activeTurnId
-        // 守卫也一并 fail-closed(双重封死),并把后继 turn/completed 清理正确定界。
-        const approvalTurnId =
-          msg.params && typeof msg.params === 'object'
-            ? (msg.params as Record<string, unknown>).turnId
-            : undefined
-        if (
-          typeof approvalTurnId === 'string' &&
-          approvalTurnId.length > 0 &&
-          this.activeTurnId === null &&
-          this.currentTurnCompleter
-        ) {
-          this.activeTurnId = approvalTurnId
-        }
-        log.info('codex app-server server request auto-approved', {
-          sessionKey: this.opts.sessionKey,
-          method: msg.method,
-        })
-        this.writeRaw(jsonRpcResult(msg.id, autoApproval))
-      } else {
-        // Keep unknown server-initiated methods fail-fast so a future Codex
-        // protocol addition doesn't hang this runner silently.
-        this.writeRaw(jsonRpcMethodNotFound(msg.id, msg.method))
-      }
-      return
-    }
-    if (msg.kind === 'notification') {
-      this.handleNotification(msg.method, msg.params)
-      return
-    }
+    handleLineImpl.call(this as unknown as CodexNotificationHost, line)
   }
 
-  private emitPlanBlock(
-    plan: {
+  private emitPlanBlock(plan: {
       text?: string
       explanation?: string
       steps?: Array<{ step: string; status: 'pending' | 'inProgress' | 'completed' }>
       partial?: boolean
-    },
-    callTargetId?: string,
-  ): void {
-    // Scope the plan card identity to the current Codex turn. The frontend
-    // uses blockId as the stable update key; a process-wide "codex-plan"
-    // key made separate turns fight over one card and made multi-client
-    // persistence preserve duplicate random-id plan rows.
-    const planBlockId = `codex-plan-${this.activeTurnId ?? 'pending'}`
-    // turn-retry 台账:plan 块是对外可观测输出边界 → 置位。
-    this.attemptHadObservableOutput = true
-    this.emit('message', {
-      type: 'openclaude_plan',
-      session_id: this.threadId,
-      ...(callTargetId ? { openclaude_call_target_id: callTargetId } : {}),
-      plan: {
-        blockId: planBlockId,
-        ...plan,
-      },
-    } as unknown as RunnerMessage)
-    if (callTargetId) this.recordCallUsageTarget(callTargetId)
+    }, callTargetId?: string): void {
+    emitPlanBlockImpl.call(this as unknown as CodexNotificationHost, plan, callTargetId)
   }
 
   private emitGoalBlock(goal: CodexGoalBlock): void {
-    // turn-retry 台账:goal 块是对外可观测输出边界 → 置位。
-    this.attemptHadObservableOutput = true
-    const platformGoal = this.syncedPlatformGoal
-    this.emit('message', {
-      type: 'openclaude_goal',
-      session_id: this.threadId,
-      goal: {
-        ...goal,
-        ...(platformGoal
-          ? {
-              platformGoalId: platformGoal.goalId,
-              platformStateRevision: platformGoal.stateRevision,
-            }
-          : {}),
-      },
-    } as unknown as RunnerMessage)
+    emitGoalBlockImpl.call(this as unknown as CodexNotificationHost, goal)
   }
 
   private codexReasoningEffort(): string | undefined {
@@ -3018,780 +2072,35 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private handleNotification(method: string, params: unknown): void {
-    if (!params || typeof params !== 'object') return
-    const p = params as Record<string, unknown>
-    const turnId = typeof p.turnId === 'string' ? p.turnId : undefined
-
-    if (
-      this.pendingNativeCompaction &&
-      method === 'item/completed' &&
-      _isContextCompactionItem(p.item) &&
-      (typeof p.threadId !== 'string' || p.threadId === this.threadId)
-    ) {
-      const pending = this.pendingNativeCompaction
-      this.pendingNativeCompaction = null
-      clearTimeout(pending.timer)
-      pending.resolve()
-      return
-    }
-
-    // Codex exposes auto-compaction as a ThreadItem (`contextCompaction`).
-    // In the app-server protocol it may belong to a short internal turn whose
-    // turnId differs from the user-visible turn. Personal-edition Codex shows
-    // that item as a normal tool card, so commercial must not drop it merely
-    // because the turnId is internal. Surface only while a user turn is
-    // actually in flight; otherwise it is background noise from app-server
-    // housekeeping.
-    if (
-      (method === 'item/started' || method === 'item/completed') &&
-      _isContextCompactionItem(p.item) &&
-      this.currentTurnCompleter
-    ) {
-      this.handleContextCompactionItem(method, p.item)
-      return
-    }
-
-    // Filter turn-scoped notifications. codex may emit notifications for
-    // system-internal turns (compaction, hooks) that the client should ignore.
-    //
-    // Subtle ordering issue (Codex review #019dde20 MAJOR 3): turn/start is a
-    // request whose Promise resolution is a microtask, but stdout `data`
-    // events deliver subsequent notifications synchronously inside the same
-    // chunk. So a notification carrying the turnId can arrive (and run
-    // through handleNotification) BEFORE runTurn assigns activeTurnId from
-    // the resolved request. To avoid dropping early tokens/items, when a turn
-    // is in flight (`currentTurnCompleter` set) and `activeTurnId` is still
-    // null, we adopt the first turnId we see.
-    if (turnId) {
-      if (this.activeTurnId === null) {
-        if (this.currentTurnCompleter) {
-          this.activeTurnId = turnId
-        } else {
-          // No turn in flight → server-internal turn we don't track. Drop.
-          return
-        }
-      } else if (turnId !== this.activeTurnId) {
-        return
-      }
-    }
-
-    if (method === 'thread/goal/updated') {
-      this.emitGoalBlock(
-        normalizeCodexGoal(p.goal, false, `codex-goal-${this.activeTurnId ?? 'pending'}`),
-      )
-      return
-    }
-    if (method === 'thread/goal/cleared') {
-      this.emitGoalBlock(
-        normalizeCodexGoal(undefined, true, `codex-goal-${this.activeTurnId ?? 'pending'}`),
-      )
-      return
-    }
-    if (method === 'item/agentMessage/delta') {
-      const delta = typeof p.delta === 'string' ? p.delta : ''
-      if (!delta) return
-      const itemId = typeof p.itemId === 'string' ? p.itemId : ''
-      if (itemId) this.bindItemCallUsageEpoch(itemId)
-      // turn-retry 台账:assistant 正文 delta 是对外可观测输出边界 → 置位。
-      this.attemptHadObservableOutput = true
-      this.currentAssistantBuf += delta
-      this.emit('message', {
-        type: 'stream_event',
-        session_id: this.threadId,
-        ...(itemId ? { openclaude_call_target_id: itemId } : {}),
-        event: {
-          type: 'content_block_delta',
-          index: 0,
-          delta: { type: 'text_delta', text: delta },
-        },
-      } as unknown as RunnerMessage)
-      if (itemId) this.recordCallUsageTarget(itemId)
-      return
-    }
-    if (method === 'item/plan/delta') {
-      const delta = typeof p.delta === 'string' ? p.delta : ''
-      if (!delta) return
-      const itemId = typeof p.itemId === 'string' ? p.itemId : ''
-      if (itemId) this.bindItemCallUsageEpoch(itemId)
-      this.currentPlanDraft += delta
-      this.emitPlanBlock({ text: this.currentPlanDraft, partial: true }, itemId || undefined)
-      return
-    }
-    if (method === 'turn/plan/updated') {
-      const explanation = typeof p.explanation === 'string' ? p.explanation : undefined
-      const rawSteps = Array.isArray(p.plan) ? p.plan : []
-      const steps = rawSteps
-        .map((s) => {
-          const obj = s && typeof s === 'object' ? (s as Record<string, unknown>) : {}
-          const step = typeof obj.step === 'string' ? obj.step : ''
-          const status = obj.status
-          if (!step) return null
-          return {
-            step,
-            status:
-              status === 'inProgress' || status === 'completed' || status === 'pending'
-                ? status
-                : 'pending',
-          } as const
-        })
-        .filter((s): s is { step: string; status: 'pending' | 'inProgress' | 'completed' } =>
-          Boolean(s),
-        )
-      const planBlockId = `codex-plan-${this.activeTurnId ?? 'pending'}`
-      this.emitPlanBlock({ explanation, steps, partial: true }, planBlockId)
-      return
-    }
-    // Reasoning streaming: codex emits raw `textDelta` (chain-of-thought) OR
-    // `summaryTextDelta` (model-distilled summary). Both map to CCB
-    // `thinking_delta` so the frontend renders a 💭 thinking row — same
-    // surface claude-code uses. Turn-level persistence is owned by
-    // CcbMessageParser's `thinkingBuf`; the runner only routes packets.
-    //
-    // Lossless policy: if codex emits both raw text and a distilled summary
-    // for the same item, preserve both in wire arrival order. They may be
-    // redundant, but choosing one would irreversibly discard paid output.
-    if (method === 'item/reasoning/textDelta' || method === 'item/reasoning/summaryTextDelta') {
-      const delta = typeof p.delta === 'string' ? p.delta : ''
-      if (!delta) return
-      // turn-retry 台账:reasoning/thinking delta 是对外可观测输出边界 → 置位。
-      this.attemptHadObservableOutput = true
-      const itemId = typeof p.itemId === 'string' ? p.itemId : ''
-      if (itemId) {
-        this.bindItemCallUsageEpoch(itemId)
-        const st = this.reasoningItemState.get(itemId) ?? { sawContent: false }
-        st.sawContent = true
-        this.reasoningItemState.set(itemId, st)
-      }
-      this.emit('message', {
-        type: 'stream_event',
-        session_id: this.threadId,
-        ...(itemId ? { openclaude_call_target_id: itemId } : {}),
-        event: {
-          type: 'content_block_delta',
-          index: 0,
-          delta: { type: 'thinking_delta', thinking: delta },
-        },
-      } as unknown as RunnerMessage)
-      if (itemId) this.recordCallUsageTarget(itemId)
-      return
-    }
-    // Summary parts are structural model events. Avoid only a leading empty
-    // paragraph; once any content exists, retain every part boundary.
-    if (method === 'item/reasoning/summaryPartAdded') {
-      const itemId = typeof p.itemId === 'string' ? p.itemId : ''
-      if (!itemId) return
-      const st = this.reasoningItemState.get(itemId) ?? { sawContent: false }
-      if (!st.sawContent) {
-        this.reasoningItemState.set(itemId, st)
-        return
-      }
-      // turn-retry 台账:summary part boundary(💭 段落分隔)也是对外输出 → 置位。
-      this.attemptHadObservableOutput = true
-      this.emit('message', {
-        type: 'stream_event',
-        session_id: this.threadId,
-        openclaude_call_target_id: itemId,
-        event: {
-          type: 'content_block_delta',
-          index: 0,
-          delta: { type: 'thinking_delta', thinking: '\n\n' },
-        },
-      } as unknown as RunnerMessage)
-      this.recordCallUsageTarget(itemId)
-      return
-    }
-    if (method === 'item/fileChange/patchUpdated') {
-      const notificationThreadId = typeof p.threadId === 'string' ? p.threadId : ''
-      const itemId = typeof p.itemId === 'string' ? p.itemId : ''
-      const changes = Array.isArray(p.changes)
-        ? p.changes.filter(
-            (change): change is Record<string, unknown> =>
-              Boolean(change) && typeof change === 'object' && !Array.isArray(change),
-          )
-        : []
-      if (
-        !this.currentTurnCompleter ||
-        !this.threadId ||
-        notificationThreadId !== this.threadId ||
-        !itemId ||
-        changes.length === 0
-      ) {
-        return
-      }
-      const first = changes[0]
-      const kind =
-        first.kind && typeof first.kind === 'object' && !Array.isArray(first.kind)
-          ? (first.kind as Record<string, unknown>).type
-          : undefined
-      const toolName = kind === 'add' ? 'Write' : 'Edit'
-      const filePath = typeof first.path === 'string' ? first.path : ''
-      const input = {
-        file_path: filePath,
-        kind: typeof kind === 'string' ? kind : undefined,
-        changes,
-      }
-      // This is an observable tool boundary, so a rejected turn/start must
-      // never retry and duplicate content the user has already seen. It also
-      // counts as an emitted tool_use for orphan-result pairing, while the
-      // parser's dedicated snapshot path deliberately avoids formal pending
-      // tool counts/bridges until Codex emits the native final item.
-      this.attemptHadToolOrPermission = true
-      this.emittedToolUseIds.add(itemId)
-      this.bindItemCallUsageEpoch(itemId)
-      this.emit('message', {
-        type: 'openclaude_tool_snapshot',
-        session_id: this.threadId,
-        tool: {
-          id: itemId,
-          name: toolName,
-          input,
-          inputPreview: JSON.stringify({ file_path: filePath, kind }),
-        },
-      } as unknown as RunnerMessage)
-      this.recordCallUsageTarget(itemId)
-      return
-    }
-    if (method === 'item/started') {
-      this.bindItemCallUsageEpochFromItem(p.item)
-      this.handleItemStarted(p.item)
-      return
-    }
-    if (method === 'item/completed') {
-      // Track the async handler so `runTurn` can drain pending file IO /
-      // emits before snapshotting `currentAssistantBuf` and emitting result.
-      // codex sends item/completed before turn/completed; without this,
-      // imageGeneration's base64 writeFile (or any other async item path)
-      // can race past the result frame, leaving the UI with empty output.
-      const itemUnk = p.item
-      this.bindItemCallUsageEpochFromItem(itemUnk)
-      const itemId =
-        itemUnk && typeof itemUnk === 'object'
-          ? typeof (itemUnk as Record<string, unknown>).id === 'string'
-            ? ((itemUnk as Record<string, unknown>).id as string)
-            : '<no-id>'
-          : '<no-id>'
-      const itemType =
-        itemUnk && typeof itemUnk === 'object'
-          ? typeof (itemUnk as Record<string, unknown>).type === 'string'
-            ? ((itemUnk as Record<string, unknown>).type as string)
-            : '<no-type>'
-          : '<no-type>'
-      const handler = this.handleItemCompleted(itemUnk)
-        .catch((err) => {
-          // Belt + suspenders: handleItemCompleted's per-branch logic already
-          // logs+falls back on business errors (image copy/write failures emit
-          // a "[image copy failed: ...]" note). Anything escaping here is an
-          // unexpected throw — log enough to triage but don't poison runner
-          // state (don't reject the turn, don't disturb the next item).
-          log.warn('codex handleItemCompleted threw', {
-            sessionKey: this.opts.sessionKey,
-            itemType,
-            itemId,
-            err: (err as Error).message,
-          })
-          this.emit('runtime_event', {
-            type: 'openclaude_handler_error',
-            handler: 'handleItemCompleted',
-            item: structuredClone(itemUnk),
-            error:
-              err instanceof Error
-                ? { name: err.name, message: err.message, stack: err.stack }
-                : { value: String(err) },
-          })
-        })
-        .finally(() => {
-          this.inflightItemHandlers.delete(handler)
-        })
-      // turn-retry 台账:item handler 注册即代表本 attempt 已产出工具/输出侧效果
-      // (handler 内部 emitToolResult / text_delta 也会置位,但注册点先于其异步体
-      // 执行 —— 提前置位保证 fail-closed,即便 handler 尚未 flush)。
-      this.attemptHadToolOrPermission = true
-      this.inflightItemHandlers.add(handler)
-      return
-    }
-    if (method === 'turn/completed') {
-      // Per schema: { threadId, turn: { id, status, durationMs, error? } }.
-      // turn-retry 批:turn.error 除 message 外还带 codexErrorInfo(实测值形如
-      // "other");这里把整个 turn(含 error 全字段)wholesale 透传给 completer,
-      // runTurn 的 failed 分支据此读 codexErrorInfo 进内部日志(不进用户面)。
-      const turn = p.turn as Record<string, unknown> | undefined
-      if (!turn) return
-      // Defensive: even though we already filtered turnId above (via top-level
-      // p.turnId), turn.id is the authoritative id on this notification —
-      // re-check.
-      const tid = typeof turn.id === 'string' ? turn.id : undefined
-      if (tid && this.activeTurnId && tid !== this.activeTurnId) return
-      // A normal requestUserInput keeps the turn open until the browser
-      // answers. This fallback covers app-server auto-resolution, interrupt,
-      // and protocol races: echo the schema-valid no-answer result once and
-      // remove both pending indexes before the next turn can start.
-      const completedTurnId = tid ?? this.activeTurnId
-      if (completedTurnId) {
-        this.settlePendingUserInputsForTurn(completedTurnId, 'turn completed')
-      }
-      if (this.currentTurnCompleter) {
-        this.currentTurnCompleter.resolve(
-          turn as Parameters<typeof this.currentTurnCompleter.resolve>[0],
-        )
-        this.currentTurnCompleter = null
-      }
-      return
-    }
-    if (method === 'thread/tokenUsage/updated') {
-      // Schema: ThreadTokenUsageUpdatedNotification — { threadId, turnId,
-      // tokenUsage: { last, total, modelContextWindow? } }. Both `last` and
-      // `total` are TokenUsageBreakdown (cachedInputTokens, inputTokens,
-      // outputTokens, reasoningOutputTokens, totalTokens).
-      //
-      // Strategy (per Codex review v2): use `total` for idempotent snapshots
-      // — it's monotonically growing across the thread, so overwriting our
-      // activeTurnTotal on every notification is safe even if codex emits
-      // duplicate frames. Per-turn delta = activeTurnTotal − priorTurnTotal
-      // is computed at turn/completed time, decoupling notification-frame
-      // count from the billed amount.
-      const tu = p.tokenUsage as Record<string, unknown> | undefined
-      if (!tu) return
-      const total = _coerceTokenBreakdown(tu.total)
-      const duplicateTotal =
-        this.activeTurnTotal !== null && this.sameTokenBreakdown(this.activeTurnTotal, total)
-      const last = _coerceTokenBreakdown(tu.last)
-      this.recordCallUsageSnapshot(last, duplicateTotal)
-      // Bootstrap baseline on the FIRST notification of a fresh runner
-      // instance attached to a thread with prior history (e.g. server hot-
-      // reload mid-conversation, sessionManager constructs a new
-      // CodexAppServerRunner with resumeSessionId). Without this, priorTurnTotal
-      // would be null and the next turn's delta = full thread total → massive
-      // over-bill. `tokenUsage.last` is "tokens used by the most recent LLM
-      // call", so `total - last` ≈ "everything before this most recent call"
-      // ≈ correct baseline IF this is the first call of the turn. Multi-call
-      // turns whose runner happens to be constructed mid-turn (essentially
-      // impossible given current sessionManager wiring) would undercount;
-      // accepted defensive trade-off.
-      if (this.priorTurnTotal === null && this.activeTurnTotal === null) {
-        this.priorTurnTotal = _subtractTokenBreakdown(total, last)
-      }
-      this.activeTurnTotal = total
-      const baseline = this.priorTurnTotal ?? _EMPTY_TOKEN_BREAKDOWN
-      const delta = _subtractTokenBreakdown(total, baseline)
-      if (delta.totalTokens > 0) this.emit('usage', _codexTurnUsageSnapshot(delta))
-      return
-    }
-    if (method === 'account/rateLimits/updated') {
-      // Issue A v1.0.108 — schema 强制 params.rateLimits = RateLimitSnapshot;
-      // 兼容早期 codex 版本可能把 snapshot 直接放在 params 顶层(spike 实测见过),
-      // hit 顶层 fallback 时 debug log 一次方便后续协议漂移诊断(Codex review MINOR 5)。
-      let rl: unknown = p.rateLimits
-      if ((!rl || typeof rl !== 'object') && (p.primary || p.secondary)) {
-        rl = p
-        log.debug('codex account/rateLimits/updated: top-level snapshot fallback', {
-          sessionKey: this.opts.sessionKey,
-        })
-      }
-      const parsed = _parseCodexRateLimits(rl)
-      if (parsed) this.latestRateLimits = parsed
-      return
-    }
-    // Other notifications (turn/started, plan/delta, config-warning, etc.)
-    // are dropped — they are observability/UI hints that don't gate the
-    // turn lifecycle.
+    handleNotificationImpl.call(this as unknown as CodexNotificationHost, method, params)
   }
 
   private handleContextCompactionItem(method: string, itemUnk: unknown): void {
-    if (!itemUnk || typeof itemUnk !== 'object') return
-    const item = itemUnk as Record<string, unknown>
-    const itemId = typeof item.id === 'string' ? item.id : `codex-compact-${Date.now()}`
-    const visibleItem = { ...item, type: 'contextCompaction' }
-    if (method === 'item/started') {
-      this.emitTurnStatus('compacting')
-      this.emitAssistantToolUse(itemId, 'codex:contextCompaction', visibleItem)
-      return
-    }
-    this.emitToolResult(itemId, _stringifyItemBounded(visibleItem), false)
-    this.emitTurnStatus(null)
+    handleContextCompactionItemImpl.call(this as unknown as CodexNotificationHost, method, itemUnk)
   }
 
   private rememberCollabSpawnReceivers(spawnId: string, receiverThreadIds: string[]): void {
-    if (receiverThreadIds.length === 0) return
-    let receivers = this.collabSpawnReceivers.get(spawnId)
-    if (!receivers) {
-      receivers = new Set<string>()
-      this.collabSpawnReceivers.set(spawnId, receivers)
-    }
-    for (const receiverId of receiverThreadIds) {
-      receivers.add(receiverId)
-      this.collabReceiverToSpawnId.set(receiverId, spawnId)
-    }
+    rememberCollabSpawnReceiversImpl.call(this as unknown as CodexNotificationHost, spawnId, receiverThreadIds)
   }
 
-  private handleCollabAgentToolStarted(
-    itemId: string,
-    item: Record<string, unknown>,
-    policy?: CollabAgentPolicy,
-  ): void {
-    const tool = collabTool(item)
-    if (tool === 'spawnAgent') {
-      const receivers = collabReceiverThreadIds(item)
-      this.rememberCollabSpawnReceivers(itemId, receivers)
-      const prompt = collabPrompt(item)
-      this.emitAssistantToolUse(
-        itemId,
-        'Agent',
-        collabAgentInput(item, prompt || '启动 Codex 子 Agent', policy),
-      )
-      return
-    }
-
-    this.emitAssistantToolUse(
-      itemId,
-      'Codex:multiAgent',
-      collabAgentInput(item, `Codex multi-agent: ${tool}`, policy),
-    )
+  private handleCollabAgentToolStarted(itemId: string, item: Record<string, unknown>, policy?: CollabAgentPolicy): void {
+    handleCollabAgentToolStartedImpl.call(this as unknown as CodexNotificationHost, itemId, item, policy)
   }
 
   private maybeEmitCompletedCollabAgentGroups(item: Record<string, unknown>): void {
-    const states = collabAgentsStates(item)
-    if (Object.keys(states).length === 0) return
-
-    const touchedReceivers = new Set([...collabReceiverThreadIds(item), ...Object.keys(states)])
-    const touchedSpawnIds = new Set<string>()
-    for (const receiverId of touchedReceivers) {
-      const spawnId = this.collabReceiverToSpawnId.get(receiverId)
-      if (spawnId) touchedSpawnIds.add(spawnId)
-    }
-
-    for (const spawnId of touchedSpawnIds) {
-      if (this.completedCollabSpawnResults.has(spawnId)) continue
-      const receivers = this.collabSpawnReceivers.get(spawnId)
-      if (!receivers || receivers.size === 0) continue
-      const receiverList = [...receivers]
-      const allTerminal = receiverList.every((receiverId) =>
-        isTerminalCollabAgentStatus(states[receiverId]?.status || ''),
-      )
-      if (!allTerminal) continue
-
-      const isError = receiverList.some((receiverId) =>
-        isErrorCollabAgentStatus(states[receiverId]?.status || ''),
-      )
-      const lines = receiverList.map((receiverId) => {
-        const state = states[receiverId]
-        const msg = state?.message ? ` — ${state.message}` : ''
-        return `${shortThreadId(receiverId)}: ${state?.status || 'unknown'}${msg}`
-      })
-      this.completedCollabSpawnResults.add(spawnId)
-      this.emitToolResult(spawnId, lines.join('\n') || 'Codex child agent completed', isError)
-    }
+    maybeEmitCompletedCollabAgentGroupsImpl.call(this as unknown as CodexNotificationHost, item)
   }
 
   private handleCollabAgentToolCompleted(itemId: string, item: Record<string, unknown>): void {
-    const tool = collabTool(item)
-    const status = collabStatus(item)
-
-    if (tool === 'spawnAgent') {
-      this.rememberCollabSpawnReceivers(itemId, collabReceiverThreadIds(item))
-      if (status === 'failed' || status === 'errored') {
-        this.completedCollabSpawnResults.add(itemId)
-        this.emitToolResult(itemId, summarizeCollabControl(item), true)
-      } else {
-        this.maybeEmitCompletedCollabAgentGroups(item)
-      }
-      return
-    }
-
-    this.emitToolResult(
-      itemId,
-      summarizeCollabControl(item),
-      status === 'failed' || status === 'errored',
-    )
-    this.maybeEmitCompletedCollabAgentGroups(item)
+    handleCollabAgentToolCompletedImpl.call(this as unknown as CodexNotificationHost, itemId, item)
   }
 
   private handleItemStarted(itemUnk: unknown): void {
-    if (!itemUnk || typeof itemUnk !== 'object') return
-    const item = itemUnk as Record<string, unknown>
-    const itemId = typeof item.id === 'string' ? item.id : `codex-${Date.now()}`
-    const itemType = _normaliseCodexItemType(item.type)
-    const visibleItem = itemType === item.type ? item : { ...item, type: itemType }
-    if (itemType === 'commandExecution') {
-      const cmd = typeof item.command === 'string' ? item.command : ''
-      const stripped = stripShellWrapper(cmd)
-      // LOW-1(2026-07-03):description 曾硬编码 'codex commandExecution',直接
-      // 泄到前端 Bash 卡片副标题。改为命令首行摘要(≤60 字符);空命令不带该字段。
-      const summary = summarizeCommandForDescription(stripped)
-      this.emitAssistantToolUse(itemId, 'Bash', {
-        command: stripped,
-        ...(summary !== '' ? { description: summary } : {}),
-      })
-      return
-    }
-    if (itemType === 'fileChange') {
-      const changes = Array.isArray(item.changes) ? (item.changes as unknown[]) : []
-      const first = (changes[0] ?? {}) as Record<string, unknown>
-      const kind = (first.kind as { type?: string } | undefined)?.type
-      const name = kind === 'add' ? 'Write' : 'Edit'
-      this.emitAssistantToolUse(itemId, name, {
-        file_path: typeof first.path === 'string' ? first.path : '',
-        kind,
-        changes,
-      })
-      return
-    }
-    if (itemType === 'collabAgentToolCall') {
-      this.handleCollabAgentToolStarted(itemId, item, this.currentCollabAgentPolicy)
-      return
-    }
-    // agentMessage / reasoning are streamed via deltas; nothing to surface
-    // here. userMessage / hookPrompt are server-internal echoes — also
-    // suppressed (otherwise they emit as ugly "CODEX:USERMESSAGE" tool
-    // cards). Other types (mcpToolCall, webSearch, imageGeneration, plan,
-    // dynamicToolCall, collabAgentToolCall, contextCompaction, etc.)
-    // surface as `codex:<type>` tool_use so the frontend's
-    // _CODEX_TYPE_META table can render them with friendly icons +
-    // labels.
-    if (itemType === null) return
-    if (_SUPPRESSED_ITEM_TYPES.has(itemType)) return
-    if (itemType === 'agentMessage' || itemType === 'reasoning') return
-    if (itemType === 'contextCompaction') this.emitTurnStatus('compacting')
-    this.emitAssistantToolUse(itemId, `codex:${itemType}`, visibleItem)
+    handleItemStartedImpl.call(this as unknown as CodexNotificationHost, itemUnk)
   }
 
-  private async handleItemCompleted(itemUnk: unknown): Promise<void> {
-    if (!itemUnk || typeof itemUnk !== 'object') return
-    const item = itemUnk as Record<string, unknown>
-    const itemId = typeof item.id === 'string' ? item.id : `codex-${Date.now()}`
-    const itemType = _normaliseCodexItemType(item.type)
-    const visibleItem = itemType === item.type ? item : { ...item, type: itemType }
-    // Mirror handleItemStarted suppression — userMessage/hookPrompt have no
-    // tool_use card to attach a result to, and the generic JSON.stringify
-    // fallback at the bottom of this function would dump the echo content
-    // into a pseudo-tool-result.
-    if (typeof itemType === 'string' && _SUPPRESSED_ITEM_TYPES.has(itemType)) return
-    if (itemType === 'commandExecution') {
-      const out = typeof item.aggregatedOutput === 'string' ? item.aggregatedOutput : ''
-      const exit = typeof item.exitCode === 'number' ? item.exitCode : undefined
-      const safeExit = isToolExitCode(exit) ? exit : undefined
-      const outcome = codexToolOutcome(item)
-      const failedExit = exit != null && exit !== 0
-      const isError = failedExit || outcome.isError
-      let engineMeta: { exitCode?: number; terminationReason?: ToolTerminationReason } | undefined
-      if (failedExit) {
-        engineMeta =
-          safeExit === undefined
-            ? undefined
-            : { exitCode: safeExit, terminationReason: 'exit_code' }
-      } else if (outcome.isError) {
-        engineMeta = {
-          ...(safeExit !== undefined ? { exitCode: safeExit } : {}),
-          ...(outcome.terminationReason !== undefined
-            ? { terminationReason: outcome.terminationReason }
-            : {}),
-        }
-      } else if (safeExit !== undefined) {
-        engineMeta = { exitCode: safeExit, terminationReason: 'exit_code' }
-      }
-      this.emitToolResult(itemId, out, isError, undefined, engineMeta)
-      return
-    }
-    if (itemType === 'fileChange') {
-      const outcome = codexToolOutcome(item)
-      const changes = Array.isArray(item.changes) ? (item.changes as unknown[]) : []
-      const summary = changes
-        .map((c) => {
-          const o = c as Record<string, unknown>
-          const k = (o.kind as { type?: string } | undefined)?.type
-          return `${k ?? 'change'}: ${o.path ?? ''}`
-        })
-        .join('\n')
-      this.emitToolResult(
-        itemId,
-        outcome.isError ? _stringifyItemBounded(item) : summary || 'file changes applied',
-        outcome.isError,
-        undefined,
-        outcome.terminationReason === undefined
-          ? undefined
-          : { terminationReason: outcome.terminationReason },
-      )
-      return
-    }
-    if (itemType === 'collabAgentToolCall') {
-      this.handleCollabAgentToolCompleted(itemId, item)
-      return
-    }
-    if (itemType === 'imageGeneration') {
-      const outcome = codexToolOutcome(item)
-      if (outcome.isError) {
-        this.emitToolResult(itemId, 'imageGeneration failed', true, undefined, {
-          terminationReason: outcome.terminationReason ?? 'tool_error',
-        })
-        return
-      }
-      // codex's image_gen tool emits two notification shapes depending on the
-      // upstream auth mode (verified 2026-05-03 via JSON-RPC spike vs codex
-      // 0.125.0):
-      //   - auth_mode=chatgpt (full OAuth + refresh_token): item carries BOTH
-      //     `savedPath` (absolute path under <CODEX_HOME>/generated_images/...)
-      //     AND `result` (base64 PNG bytes).
-      //   - auth_mode=chatgptAuthTokens (commercial pool, token-only): item
-      //     carries `result` only — `savedPath` is absent. Codex still writes
-      //     the PNG to the same on-disk location, but the path is not surfaced
-      //     in the protocol frame.
-      // Without the base64 fallback, commercial-pool users see imageGeneration
-      // stuck at the started event's `status: in_progress`, no image rendered.
-      const saved = typeof item.savedPath === 'string' ? item.savedPath : ''
-      const resultB64 = typeof item.result === 'string' ? item.result : ''
-      if (!this.threadId || (!saved && !resultB64)) {
-        this.emitToolResult(itemId, _stringifyItemBounded(item), true, undefined, {
-          terminationReason: outcome.terminationReason ?? 'tool_error',
-        })
-        return
-      }
-      let publicPaths: string[] = []
-      let failedNames: string[] = []
-      let localFailure = false
-      try {
-        if (saved) {
-          const { copied, failedNames: f } = await copyImagePathsToPublicDir(
-            this.threadId,
-            [saved],
-            paths.generatedDir,
-          )
-          publicPaths = copied.map((c) => c.publicPath)
-          failedNames = f
-        } else {
-          // Decode base64 PNG bytes from item.result and write to public dir
-          // directly. Mirrors copyImagePathsToPublicDir's naming pattern
-          // (`codex-<sanitizedThreadId>-<basename>`) so the file appears in the
-          // same place as the savedPath path.
-          const safeThread = _sanitizeThreadId(this.threadId)
-          // Sanitize itemId before using as filename — it arrives over the wire
-          // and must not introduce path separators or shell metacharacters even
-          // though codex's observed form is `ig_<hex>`.
-          const safeItemId = itemId.replace(/[^A-Za-z0-9._-]/g, '')
-          const baseName = `${safeItemId || `image-${Date.now()}`}.png`
-          const dst = join(paths.generatedDir, `codex-${safeThread}-${baseName}`)
-          try {
-            await mkdir(paths.generatedDir, { recursive: true })
-            await writeFile(dst, Buffer.from(resultB64, 'base64'))
-            publicPaths = [dst]
-          } catch (err) {
-            log.warn('codex image base64 write failed', {
-              sessionKey: this.opts.sessionKey,
-              dst,
-              err: (err as Error).message,
-            })
-            failedNames = [baseName]
-            localFailure = true
-          }
-        }
-        const newEmits = publicPaths.filter((p) => !this.currentAssistantBuf.includes(p))
-        if (newEmits.length > 0) {
-          // Surrounding blank lines so frontend's "absolute path on its own
-          // line → render attachment" recognizer matches each path.
-          const text = `\n\n${newEmits.join('\n')}\n`
-          this.currentAssistantBuf += text
-          this.emit('message', {
-            type: 'stream_event',
-            session_id: this.threadId,
-            event: {
-              type: 'content_block_delta',
-              index: 0,
-              delta: { type: 'text_delta', text },
-            },
-          } as unknown as RunnerMessage)
-        }
-        if (failedNames.length > 0) {
-          const note = `\n\n[image copy failed: ${failedNames.join(', ')}]\n`
-          this.currentAssistantBuf += note
-          this.emit('message', {
-            type: 'stream_event',
-            session_id: this.threadId,
-            event: {
-              type: 'content_block_delta',
-              index: 0,
-              delta: { type: 'text_delta', text: note },
-            },
-          } as unknown as RunnerMessage)
-        }
-      } catch (err) {
-        log.warn('codex app-server image copy failed', {
-          sessionKey: this.opts.sessionKey,
-          err: (err as Error).message,
-        })
-        localFailure = true
-      }
-      // Also emit the original tool_result for the imageGeneration card so
-      // the UI's tool-call panel reflects the call. Prefer the codex on-disk
-      // path when available, otherwise the public path we just wrote.
-      const summary = saved || publicPaths[0] || '<base64>'
-      const isError = outcome.isError || localFailure || failedNames.length > 0
-      this.emitToolResult(
-        itemId,
-        isError
-          ? `imageGeneration failed: ${failedNames.join(', ') || 'tool reported an error'}`
-          : `imageGeneration → ${summary}`,
-        isError,
-        undefined,
-        isError ? { terminationReason: outcome.terminationReason ?? 'tool_error' } : undefined,
-      )
-      return
-    }
-    if (itemType === 'agentMessage') {
-      if (this.opts.structuredOutputSchema) {
-        this.hasCurrentStructuredOutput = false
-        this.currentStructuredOutput = undefined
-        if (typeof item.text === 'string') {
-          try {
-            this.currentStructuredOutput = JSON.parse(item.text)
-            this.hasCurrentStructuredOutput = true
-          } catch {
-            // Final result omits structured_output; the caller's structured
-            // output collector then fails closed instead of parsing deltas.
-          }
-        }
-      }
-      // Already streamed via deltas; no separate tool_result needed.
-      return
-    }
-    if (itemType === 'reasoning') {
-      // Already streamed via deltas; no separate tool_result needed.
-      return
-    }
-    if (itemType === 'contextCompaction') {
-      const outcome = codexToolOutcome(item)
-      this.emitToolResult(
-        itemId,
-        _stringifyItemBounded(visibleItem),
-        outcome.isError,
-        undefined,
-        outcome.terminationReason === undefined
-          ? undefined
-          : { terminationReason: outcome.terminationReason },
-      )
-      this.emitTurnStatus(null)
-      return
-    }
-    // Generic completion for unknown item types (mcpToolCall / webSearch /
-    // dynamicToolCall / plan / error / subAgentActivity / …):内层截断 + 完整
-    // stringify,保证前端 pickCodexItem 永远拿到可 parse 的 JSON。
-    //
-    // V5 CG(2026-07-10)— 传 orphanPairing:这些类型里有的(尤其 subAgentActivity)
-    // codex 只发 item/completed 不发 item/started(见 emittedToolUseIds 注释),
-    // emitToolResult 会据此先补一帧 `codex:<type>` tool_use 再发 result,消掉前端
-    // 的孤儿 'unknown' 裸 JSON 卡。itemType 为 null(item.type 非字符串)时退回
-    // codex:unknown。
-    const pairName = itemType ? `codex:${itemType}` : 'codex:unknown'
-    const outcome = codexToolOutcome(item)
-    this.emitToolResult(
-      itemId,
-      _stringifyItemBounded(item),
-      outcome.isError,
-      {
-        name: pairName,
-        input: visibleItem,
-      },
-      outcome.terminationReason === undefined
-        ? undefined
-        : { terminationReason: outcome.terminationReason },
-    )
+  private handleItemCompleted(itemUnk: unknown): Promise<void> {
+    return handleItemCompletedImpl.call(this as unknown as CodexNotificationHost, itemUnk)
   }
 
   /** Spawn a brand-new codex thread and wire its id into runner state +
@@ -4504,33 +2813,15 @@ export class CodexAppServerRunner extends EventEmitter {
   }
 
   private emitAssistantToolUse(id: string, name: string, input: unknown): void {
-    // turn-retry 台账:tool_use 是对外 emit 边界 → 置位,封死 turn/start 窄路径重试。
-    this.attemptHadToolOrPermission = true
-    // 登记本 turn 已发 tool_use 的 item id —— emitToolResult 据此判断是否孤儿。
-    this.emittedToolUseIds.add(id)
-    this.emit('message', {
-      type: 'assistant',
-      session_id: this.threadId,
-      message: {
-        role: 'assistant',
-        content: [{ type: 'tool_use', id, name, input }],
-      },
-    } satisfies RunnerMessage)
-    this.recordCallUsageTarget(id)
+    emitAssistantToolUseImpl.call(this as unknown as CodexNotificationHost, id, name, input)
   }
 
   private bindItemCallUsageEpochFromItem(item: unknown): void {
-    if (!item || typeof item !== 'object') return
-    const id = (item as Record<string, unknown>).id
-    if (typeof id === 'string' && id) this.bindItemCallUsageEpoch(id)
+    bindItemCallUsageEpochFromItemImpl.call(this as unknown as CodexNotificationHost, item)
   }
 
   private bindItemCallUsageEpoch(itemId: string): number {
-    const existing = this.itemCallUsageEpoch.get(itemId)
-    if (existing !== undefined) return existing
-    const epoch = this.callUsageEpoch
-    this.itemCallUsageEpoch.set(itemId, epoch)
-    return epoch
+    return bindItemCallUsageEpochImpl.call(this as unknown as CodexNotificationHost, itemId)
   }
 
   private callUsageRecord(epoch: number): {
@@ -4538,49 +2829,23 @@ export class CodexAppServerRunner extends EventEmitter {
     targetIds: Set<string>
     usage?: TurnTokenUsageSnapshot
   } {
-    let record = this.callUsageByEpoch.get(epoch)
-    if (!record) {
-      record = { callId: `codex-${epoch + 1}`, targetIds: new Set() }
-      this.callUsageByEpoch.set(epoch, record)
-    }
-    return record
+    return callUsageRecordImpl.call(this as unknown as CodexNotificationHost, epoch)
   }
 
   private emitCallUsageEpoch(epoch: number): void {
-    const record = this.callUsageByEpoch.get(epoch)
-    if (!record?.usage || record.targetIds.size === 0) return
-    const call: CallTokenUsageSnapshot = {
-      callId: record.callId,
-      targetIds: [...record.targetIds],
-      usage: { ...record.usage },
-    }
-    this.emit('call_usage', call)
+    emitCallUsageEpochImpl.call(this as unknown as CodexNotificationHost, epoch)
   }
 
   private recordCallUsageTarget(itemId: string): void {
-    const epoch = this.bindItemCallUsageEpoch(itemId)
-    const record = this.callUsageRecord(epoch)
-    const before = record.targetIds.size
-    record.targetIds.add(itemId)
-    if (record.targetIds.size !== before) this.emitCallUsageEpoch(epoch)
+    recordCallUsageTargetImpl.call(this as unknown as CodexNotificationHost, itemId)
   }
 
   private recordCallUsageSnapshot(last: CodexTokenBreakdown, duplicateTotal: boolean): void {
-    const epoch = duplicateTotal ? Math.max(0, this.callUsageEpoch - 1) : this.callUsageEpoch
-    const record = this.callUsageRecord(epoch)
-    record.usage = _codexTurnUsageSnapshot(last)
-    this.emitCallUsageEpoch(epoch)
-    if (!duplicateTotal) this.callUsageEpoch++
+    recordCallUsageSnapshotImpl.call(this as unknown as CodexNotificationHost, last, duplicateTotal)
   }
 
   private sameTokenBreakdown(a: CodexTokenBreakdown, b: CodexTokenBreakdown): boolean {
-    return (
-      a.cachedInputTokens === b.cachedInputTokens &&
-      a.inputTokens === b.inputTokens &&
-      a.outputTokens === b.outputTokens &&
-      a.reasoningOutputTokens === b.reasoningOutputTokens &&
-      a.totalTokens === b.totalTokens
-    )
+    return sameTokenBreakdownImpl.call(this as unknown as CodexNotificationHost, a, b)
   }
 
   /** V5 CG(2026-07-10)— tool_use/tool_result 成对不变量的唯一守卫点(见
@@ -4588,52 +2853,12 @@ export class CodexAppServerRunner extends EventEmitter {
    *  的调用点(handleItemCompleted 通用兜底)传入,给补发的 tool_use 一个像样的
    *  `codex:<type>` 名字与原始 item 载荷;不传时退化为 `codex:unknown`/`{}`,仍
    *  保证成对(防御任何未预料的孤儿路径,总比裸 result 体面)。 */
-  private emitToolResult(
-    toolUseId: string,
-    content: string,
-    isError: boolean,
-    orphanPairing?: { name: string; input: unknown },
-    engineMeta?: { exitCode?: number; terminationReason?: ToolTerminationReason },
-  ): void {
-    // turn-retry 台账:tool_result 是对外 emit 边界 → 置位。
-    this.attemptHadToolOrPermission = true
-    if (!this.emittedToolUseIds.has(toolUseId)) {
-      // 孤儿 result:先补一帧配对 tool_use(emitAssistantToolUse 内部会登记 id,
-      // 故同 id 的后续 result 不再重复补发)。
-      this.emitAssistantToolUse(
-        toolUseId,
-        orphanPairing?.name ?? 'codex:unknown',
-        orphanPairing?.input ?? {},
-      )
-    }
-    this.emit('message', {
-      type: 'user',
-      session_id: this.threadId,
-      message: {
-        role: 'user',
-        content: [
-          {
-            type: 'tool_result',
-            tool_use_id: toolUseId,
-            content,
-            is_error: isError,
-            ...(engineMeta?.exitCode !== undefined ? { exit_code: engineMeta.exitCode } : {}),
-            ...(engineMeta?.terminationReason !== undefined
-              ? { termination_reason: engineMeta.terminationReason }
-              : {}),
-          },
-        ],
-      },
-    } satisfies RunnerMessage)
+  private emitToolResult(toolUseId: string, content: string, isError: boolean, orphanPairing?: { name: string; input: unknown }, engineMeta?: { exitCode?: number; terminationReason?: ToolTerminationReason }): void {
+    emitToolResultImpl.call(this as unknown as CodexNotificationHost, toolUseId, content, isError, orphanPairing, engineMeta)
   }
 
   private emitTurnStatus(status: 'compacting' | 'waiting_for_user' | null): void {
-    this.emit('message', {
-      type: 'system',
-      subtype: 'status',
-      session_id: this.threadId,
-      status,
-    } as unknown as RunnerMessage)
+    emitTurnStatusImpl.call(this as unknown as CodexNotificationHost, status)
   }
 
   /** turn-retry 批 — 发射 fake-SDK `retrying` 状态帧(与 compacting 同 stdout 形状,
@@ -4641,13 +2866,7 @@ export class CodexAppServerRunner extends EventEmitter {
    *  turn_status.retrying)。**本帧自身不置台账 flag**(侧信道,不算 turn 输出)。
    *  清除走 emitTurnStatus(null)。 */
   private emitRetryingStatus(retry: TurnRetryMeta): void {
-    this.emit('message', {
-      type: 'system',
-      subtype: 'status',
-      session_id: this.threadId,
-      status: 'retrying',
-      retry,
-    } as unknown as RunnerMessage)
+    emitRetryingStatusImpl.call(this as unknown as CodexNotificationHost, retry)
   }
 
   /** Issue A v1.0.108 round-2 — 决定本次 emitResult 是否带 rateLimits。
@@ -4658,11 +2877,7 @@ export class CodexAppServerRunner extends EventEmitter {
    *  JSON 序列化对比要求 _parseCodexRateLimits 输出 key 顺序稳定 — 当前实现按
    *  primary→secondary、字段按写入顺序固定,序列化稳定。 */
   private _consumeRateLimitsForEmit(): RuntimeRateLimits | undefined {
-    if (this.latestRateLimits === null) return undefined
-    const json = JSON.stringify(this.latestRateLimits)
-    if (json === this.lastEmittedRateLimitsJson) return undefined
-    this.lastEmittedRateLimitsJson = json
-    return this.latestRateLimits
+    return _consumeRateLimitsForEmitImpl.call(this as unknown as CodexNotificationHost)
   }
 
   private emitResult(opts: {
@@ -4690,27 +2905,7 @@ export class CodexAppServerRunner extends EventEmitter {
     /** turn-retry 批 — 非 'unknown' 的结构化错误码(classifyRunError 产物)。 */
     errorClass?: ClassifiedErrorCode
   }): void {
-    // turn-retry 台账:任何 result 终态帧发出即封死本 attempt 的 turn/start 重试。
-    this.attemptEmittedTerminal = true
-    const msg: RunnerMessage = {
-      type: 'result',
-      subtype: opts.ok ? 'success' : 'error_during_execution',
-      session_id: this.threadId,
-      total_cost_usd: 0,
-      duration_ms: opts.durationMs,
-      is_error: !opts.ok,
-      result: opts.ok ? (opts.text ?? '') : (opts.error ?? 'codex error'),
-      usage: opts.usage,
-      requestId: opts.requestId,
-      ...(opts.ok && this.hasCurrentStructuredOutput
-        ? { structured_output: this.currentStructuredOutput }
-        : {}),
-      ...(opts.rateLimits ? { rateLimits: opts.rateLimits } : {}),
-      ...(opts.stopReason ? { stop_reason: opts.stopReason } : {}),
-      ...(!opts.ok ? { billing_terminal_code: opts.terminalCode ?? ('CODEX_ERROR' as const) } : {}),
-      ...(opts.errorClass ? { errorClass: opts.errorClass } : {}),
-    }
-    this.emit('message', msg)
+    emitResultImpl.call(this as unknown as CodexNotificationHost, opts)
   }
 
   /** turn-retry 批 — error 文本结构化分类;'unknown' 归 undefined(不带 errorClass,
@@ -4728,148 +2923,6 @@ function normalisePrompt(input: string | Array<{ type: string; text?: string }>)
     if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text)
   }
   return parts.join('\n')
-}
-
-/**
- * LOW-1(2026-07-03)— Bash 卡 description:取命令首个非空行做摘要,≤60 字符
- * (超长截 59 + '…')。空命令返回 ''(caller 不带 description 字段)。
- */
-export function summarizeCommandForDescription(cmd: string): string {
-  const firstLine = cmd
-    .split('\n')
-    .map((l) => l.trim())
-    .find((l) => l.length > 0)
-  if (firstLine === undefined) return ''
-  return firstLine.length > 60 ? `${firstLine.slice(0, 59)}…` : firstLine
-}
-
-/**
- * V5 CG(2026-07-10)— Codex 把每条 shell 命令包成 `/bin/bash -lc <arg>` 再执行,
- * 剥掉包装让前端 Bash 卡显示用户原始命令。历史实现只有一条正则,只认「单引号
- * 整体包裹」一种形状(`-lc '...'`),生产实测漏掉两类真实包装,原样透传进前端卡
- * (露出 `/bin/bash -lc` 包装体 + 转义符,非常丑):
- *   ① 双引号包裹:`/bin/bash -lc "printf 'cwd=%s\n' \"$PWD\" && …"`(内含 \" 转义)
- *   ② 单/双引号段相邻拼接:`/bin/bash -lc 'rm -f x && echo '"'已清理'"`(结尾非单引号)
- *
- * 根因在「用正则抠一种引号形状」这个思路本身 —— shell 引号是可任意拼接/嵌套的
- * 词法,不是单一正则能覆盖的一类。因此把剥包装升级成一个最小 POSIX shell 单词
- * 解析器:识别 `/bin/(ba)?sh -lc`(或 `-c`)前缀后,对剩余部分做真正的引号解析
- * (单引号原文 / 双引号内仅 \\ \" \$ \` 转义 / 裸段反斜杠转义 / 相邻段拼接),
- * **当整体恰好构成一个 shell word 时**返回解包后的命令;解析失败(未闭合引号)
- * 或不止一个 word 时,保守只剥前缀返回剩余原文——比露出完整包装体面。
- *
- * `'\''`(单引号内嵌单引号的标准转义,如 `it's`→`'it'\''s'`)天然被覆盖:解析器
- * 吞整个 word(含外层引号),`'it'` 收 SQ 段 "it" → 裸 `\'` 转义出一个 `'` → `'s'`
- * 收 SQ 段 "s",拼成 `it's`,无需旧实现那样对 `'\''` 做二次字符串替换。
- */
-function stripShellWrapper(cmd: string): string {
-  // 前缀:/bin/bash 或 /bin/sh,-lc 或 -c(允许 l 可选、多空白)。宽松匹配容忍漂移。
-  const m = cmd.match(/^\/bin\/(?:ba)?sh\s+-l?c\s+([\s\S]*)$/)
-  if (!m) return cmd
-  const rest = m[1]
-  const words = tokenizeShellWords(rest)
-  // 恰好一个 word → 解包成功返回;解析失败(null)/ 多 word / 空 → 只剥前缀返回原文。
-  if (words && words.length === 1) return words[0]
-  return rest
-}
-
-/**
- * 最小 POSIX shell 单词分词器,服务于 {@link stripShellWrapper}。返回 word 数组;
- * 遇未闭合引号返回 null(解析失败,让调用方走保守路径)。规则:
- *   - 引号外空白(空格 / Tab / 换行)分词,连续空白折叠,不产生空 word。
- *   - 单引号内全字面(含反斜杠),直到下一个单引号。
- *   - 双引号内反斜杠仅对 `\ " $ \`` 及换行(续行)生效,其余反斜杠字面保留
- *     (故 `\n` 原样保留成 `\n`,不误解析成换行)。
- *   - 裸段反斜杠转义下一字符;反斜杠+换行=续行(整体删除);末尾孤立反斜杠字面。
- *   - 相邻的不同引号 / 裸段拼进同一个 word(shell 词法)。
- */
-function tokenizeShellWords(input: string): string[] | null {
-  const words: string[] = []
-  let buf = ''
-  let inWord = false
-  let i = 0
-  const n = input.length
-  while (i < n) {
-    const ch = input[i]
-    if (ch === ' ' || ch === '\t' || ch === '\n') {
-      if (inWord) {
-        words.push(buf)
-        buf = ''
-        inWord = false
-      }
-      i++
-      continue
-    }
-    if (ch === "'") {
-      inWord = true
-      i++
-      let closed = false
-      while (i < n) {
-        if (input[i] === "'") {
-          closed = true
-          i++
-          break
-        }
-        buf += input[i]
-        i++
-      }
-      if (!closed) return null // 未闭合单引号
-      continue
-    }
-    if (ch === '"') {
-      inWord = true
-      i++
-      let closed = false
-      while (i < n) {
-        const c = input[i]
-        if (c === '"') {
-          closed = true
-          i++
-          break
-        }
-        if (c === '\\' && i + 1 < n) {
-          const nx = input[i + 1]
-          if (nx === '\\' || nx === '"' || nx === '$' || nx === '`') {
-            buf += nx
-            i += 2
-            continue
-          }
-          if (nx === '\n') {
-            i += 2 // 续行:反斜杠+换行整体删除
-            continue
-          }
-          buf += c // 其余:反斜杠字面保留(如 \n)
-          i++
-          continue
-        }
-        buf += c
-        i++
-      }
-      if (!closed) return null // 未闭合双引号
-      continue
-    }
-    if (ch === '\\') {
-      inWord = true
-      if (i + 1 < n) {
-        const nx = input[i + 1]
-        if (nx === '\n') {
-          i += 2 // 续行
-          continue
-        }
-        buf += nx
-        i += 2
-        continue
-      }
-      buf += ch // 末尾孤立反斜杠字面
-      i++
-      continue
-    }
-    inWord = true
-    buf += ch
-    i++
-  }
-  if (inWord) words.push(buf)
-  return words
 }
 
 // Re-export internal helpers for the test harness — the test patches

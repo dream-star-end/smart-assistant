@@ -3,10 +3,12 @@
  * tool publication or paid retry exists in this worker. */
 import { BOX_API_RESOLVE_MODEL } from "./boxApiResolveModel.js";
 import type { BoxAccountResolver } from "./boxAccountResolver.js";
-import type { BoxDurableJournal, BoxRemoteCleanupCandidate, BoxStaleResumePhase,
-  BoxStoppedFailureProbeCandidate } from "./boxDurableJournal.js";
-import { isBoxExpiredCloseCause } from "./boxExpiredClose.js";
+import { BoxDurableJournalError, type BoxDurableJournal, type BoxRemoteCleanupCandidate,
+  type BoxStaleResumePhase, type BoxStoppedFailureProbeCandidate } from "./boxDurableJournal.js";
+import { BOX_PROCESS_ABSENT_CAUSE, isBoxExpiredCloseCause } from "./boxExpiredClose.js";
 import { makeBoxKeeperStop } from "./boxKeeperStop.js";
+import { makeBoxRunLiveness, parseBoxRunLiveness, type BoxRunLiveness } from "./boxRunLiveness.js";
+import type { BoxHoldRelease } from "./boxHoldRelease.js";
 import { makeBoxRunCleanup } from "./boxRunCleanup.js";
 import { readBoxTerminalProof, type BoxTerminalProof } from "./boxTerminalProof.js";
 import { readBoxStagedToolCatalog } from "./boxStagedCatalogRead.js";
@@ -73,7 +75,12 @@ export class BoxRemoteCleanupWorker {
     staleResumeProofWaitMs?: number;
     /** Test seam for the worker_complete recovery below. */
     recoverProvedSuccess?: (candidate: BoxStoppedFailureProbeCandidate,
-      target: BoxResolvedTarget) => Promise<ProvedSuccess> }) {}
+      target: BoxResolvedTarget) => Promise<ProvedSuccess>;
+    /** OCV5-488: records the looks at the Box that find a run gone. */
+    holds?: Pick<BoxHoldRelease, "recordRunAbsence" | "clearRunAbsence" | "recordAbandonedHandoffStop">;
+    /** OCV5-488: told after a run whose processes were gone was closed. */
+    onProcessAbsentClosed?: (closed: { requestId: string; accountId: bigint;
+      shape: string; rebooted: boolean }) => void }) {}
 
   private async resolvePinned(candidate: Pick<BoxRemoteCleanupCandidate,
     "uid" | "requestId" | "accountId">): Promise<BoxResolvedTarget> {
@@ -147,12 +154,14 @@ export class BoxRemoteCleanupWorker {
           try { proof = await this.readProof(candidate, target); }
           catch (error) {
             const phase = staleResumeDue(candidate);
-            if (!phase) throw error;
-            proof = await this.stopStaleResume(candidate, target, phase, error);
+            if (phase) proof = await this.stopStaleResume(candidate, target, phase, error);
+            else if (candidate.abandonedHandoff) proof = await this.stopAbandonedHandoff(candidate, target, error);
+            else throw error;
           }
         } catch (error) {
           // The proof files are gone and no keeper answered the stop.
-          if (!await this.closeExpired(candidate, error)) throw error;
+          if (!await this.closeExpired(candidate, error)
+            && !await this.closeAbsent(candidate, target)) throw error;
           recovered++;
           continue;
         }
@@ -222,6 +231,61 @@ export class BoxRemoteCleanupWorker {
     return true;
   }
 
+  /** OCV5-488 (10-17 commercial account 79, three handoff leaves held for
+   * 78 min with no CLI left): no proof, and the run is not stale or not
+   * stoppable. Look at the Box. Nothing of the run on two looks, a minute
+   * apart or across a reboot, closes it the way an expired run is closed;
+   * alive, terminal or unreadable keeps it pending exactly as before. */
+  private async closeAbsent(candidate: BoxStoppedFailureProbeCandidate,
+    target: BoxResolvedTarget): Promise<boolean> {
+    const journal = this.deps.journal;
+    const holds = this.deps.holds;
+    if (!holds || !journal.markRunExpiredUnproven) return false;
+    let seen: BoxRunLiveness | null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        target.exec.run(makeBoxRunLiveness(candidate.runNonce, candidate.cliCwd),
+          { timeoutMs: 10_000, maxResponseBytes: 256 }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("BOX_RUN_LIVENESS_TIMEOUT")), 10_500);
+        }),
+      ]);
+      seen = parseBoxRunLiveness(result.stdout);
+    } catch { return false; }
+    finally { if (timer) clearTimeout(timer); }
+    if (!seen || seen.state === "terminal") return false;
+    if (seen.state === "alive") {
+      await holds.clearRunAbsence(candidate);
+      return false;
+    }
+    const first = await holds.recordRunAbsence({ ...candidate, boot: seen.boot });
+    if (!first) {
+      workerLog.warn("box_run_absent_seen", { requestId: candidate.requestId,
+        accountId: candidate.accountId.toString() });
+      return false;
+    }
+    let closed: Awaited<ReturnType<NonNullable<Journal["markRunExpiredUnproven"]>>>;
+    try {
+      closed = await journal.markRunExpiredUnproven.call(journal, { requestId: candidate.requestId,
+        uid: candidate.uid, accountId: candidate.accountId, runNonce: candidate.runNonce,
+        leaseEpoch: candidate.leaseEpoch, cause: BOX_PROCESS_ABSENT_CAUSE,
+        absence: { boot: seen.boot } });
+    } catch (error) {
+      // Seen gone, but not yet a minute ago: the next probe confirms.
+      if (error instanceof BoxDurableJournalError
+        && error.code === "BOX_ABSENT_CLOSE_NOT_CONFIRMED") return false;
+      throw error;
+    }
+    const rebooted = first.boot !== seen.boot;
+    workerLog.warn("box_run_process_absent_closed", { requestId: candidate.requestId,
+      accountId: candidate.accountId.toString(), shape: closed.shape,
+      ancestors: closed.ancestors, rebooted });
+    this.deps.onProcessAbsentClosed?.({ requestId: candidate.requestId,
+      accountId: candidate.accountId, shape: closed.shape, rebooted });
+    return true;
+  }
+
   private async readProof(candidate: BoxStoppedFailureProbeCandidate,
     target: BoxResolvedTarget): Promise<BoxTerminalProof> {
     const abort = new AbortController();
@@ -247,6 +311,25 @@ export class BoxRemoteCleanupWorker {
     readError: unknown): Promise<BoxTerminalProof> {
     const record = this.deps.journal.recordStaleResumeStop;
     if (!record || !await record.call(this.deps.journal, { ...candidate, phase })) throw readError;
+    return this.stopKeeperForProof(candidate, target, readError, "box_stale_resume_stop",
+      { phase, unknownForMs: candidate.staleResume?.unknownForMs });
+  }
+
+  /** OCV5-488 (10-17 commercial uid 4: its container was rebuilt at 07:53
+   * while three of its turns' CLIs stayed parked on their handoffs): the turn
+   * that would answer a handoff ran in a container that is no longer the
+   * user's active one. Same journalled intent, original keeper and proof wait
+   * as a stale resume; without a proof the row stays pending. */
+  private async stopAbandonedHandoff(candidate: BoxStoppedFailureProbeCandidate,
+    target: BoxResolvedTarget, readError: unknown): Promise<BoxTerminalProof> {
+    const holds = this.deps.holds;
+    if (!holds || !await holds.recordAbandonedHandoffStop(candidate)) throw readError;
+    return this.stopKeeperForProof(candidate, target, readError, "box_abandoned_handoff_stop", {});
+  }
+
+  private async stopKeeperForProof(candidate: BoxStoppedFailureProbeCandidate,
+    target: BoxResolvedTarget, readError: unknown, event: string,
+    tags: Record<string, unknown>): Promise<BoxTerminalProof> {
     let outcome: string;
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -261,9 +344,8 @@ export class BoxRemoteCleanupWorker {
       outcome = /^[a-z-]{1,32}$/.test(result.stdout.trim()) ? result.stdout.trim() : "unexpected";
     } catch (error) { outcome = probeFailureTag(error).reason; }
     finally { if (timer) clearTimeout(timer); }
-    workerLog.warn("box_stale_resume_stop", { requestId: candidate.requestId,
-      accountId: candidate.accountId.toString(), phase,
-      unknownForMs: candidate.staleResume?.unknownForMs, outcome });
+    workerLog.warn(event, { requestId: candidate.requestId,
+      accountId: candidate.accountId.toString(), ...tags, outcome });
     if (outcome !== "stop-requested" && outcome !== "terminal-present") throw readError;
     const deadline = Date.now() + (this.deps.staleResumeProofWaitMs ?? 15_000);
     for (;;) {

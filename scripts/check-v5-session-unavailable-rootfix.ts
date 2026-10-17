@@ -13,7 +13,45 @@ const reconciler = readFileSync(
   join(root, 'packages/commercial/src/dispatch/turnDispatchReconciler.ts'),
   'utf8',
 )
-const sessionManager = readFileSync(join(root, 'packages/gateway/src/sessionManager.ts'), 'utf8')
+// Gateway source set: server.ts plus the modules split out of it (FINDINGS §7.5–7.6: route tables,
+// agent/skill handlers, delegate runtime/callbacks/supervision). Source guards below read this so a
+// verbatim move between these files keeps them meaningful.
+const gatewaySource = [
+  'server.ts',
+  'routes/preAuth.ts',
+  'routes/platform.ts',
+  'routes/system.ts',
+  'routes/appConfig.ts',
+  'routes/agents.ts',
+  'routes/workspaceApi.ts',
+  'agentHandlers.ts',
+  'skillHandlers.ts',
+  'delegateRuntime.ts',
+  'delegateCallbacks.ts',
+  'delegateSupervision.ts',
+  'advisorHandlers.ts',
+  'askUserPermissions.ts',
+  'cronTaskWebhook.ts',
+  'httpMiscHandlers.ts',
+  'channelHandlers.ts',
+  'inboundDispatch.ts',
+  'wsConnection.ts',
+  'gatewayFilePolicy.ts',
+  'localExecution.ts',
+  'routeOverrides.ts',
+  'turnFrames.ts',
+  'askUserSanitize.ts',
+  'gatewayTypes.ts',
+  'gatewayLifecycle.ts',
+  'gatewayHttp.ts',
+  'sessionRepoBinding.ts',
+]
+  .map((f) => readFileSync(join(root, 'packages/gateway/src', f), 'utf8'))
+  .join('\n')
+// sessionManager.ts plus the modules split out of it (FINDINGS §7.6 M1: sessionTurnRunner.ts).
+const sessionManager = ['sessionManager.ts', 'sessionTurnRunner.ts', 'sessionSubmit.ts', 'sessionTail.ts', 'sessionAgentGroups.ts', 'sessionLifecycle.ts', 'sessionTypes.ts', 'sessionTurnOutcome.ts']
+  .map((f) => readFileSync(join(root, 'packages/gateway/src', f), 'utf8'))
+  .join('\n')
 const memoryDir = readFileSync(join(root, 'packages/storage/src/memoryDir.ts'), 'utf8')
 
 const timeout = bridge.match(
@@ -292,7 +330,7 @@ if (!sandInstallerSrc.includes('execute the exact python3 heredoc below once in 
 console.log('[sand-install-retry] PASS — INC-20260921-SAND-INSTALL-RETRY: source regression guard, not end-to-end proof.')
 
 // INC-20260921-CCB-TRANSIENT-CONTINUE: source regression guard, not end-to-end proof.
-const sessionManagerSrc = readFileSync(join(root, 'packages/gateway/src/sessionManager.ts'), 'utf8')
+const sessionManagerSrc = sessionManager // sessionManager.ts + sessionTurnRunner.ts + sessionSubmit.ts
 if (!sessionManagerSrc.includes('export function isNativeEngineTransientContinuationSafe(')) {
   throw new Error('[ccb-transient-continue] missing native continuation predicate')
 }
@@ -323,7 +361,7 @@ console.log('[claude-identity-guard] PASS — INC-20260921-CLAUDE-IDENTITY-GUARD
 
 // INC-20260923-CCB-FOREGROUND-BASH-CALLBACK: source regression guard, not end-to-end proof.
 const foregroundBashCallbackSrc = readFileSync(join(root, 'packages/gateway/src/ccbLocalAgentCallback.ts'), 'utf8')
-const foregroundBashServerSrc = readFileSync(join(root, 'packages/gateway/src/server.ts'), 'utf8')
+const foregroundBashServerSrc = gatewaySource
 const foregroundBashCardsSrc = readFileSync(join(root, 'packages/web-react/src/components/chat/cards.tsx'), 'utf8')
 if (!foregroundBashCallbackSrc.includes('export function finalizeCcbLocalAgentPendingInjections(')) {
   throw new Error('[ccb-foreground-bash] flush predicate missing from ccbLocalAgentCallback.ts')
@@ -350,7 +388,7 @@ console.log('[ccb-foreground-bash] PASS — INC-20260923-CCB-FOREGROUND-BASH-CAL
 // a real-interval cron heartbeat; this gate only stops the contracts regressing.
 const delegateDurableSrc = readFileSync(join(root, 'packages/gateway/src/delegateDurable.ts'), 'utf8')
 const delegateJobsSrc = readFileSync(join(root, 'packages/gateway/src/delegateJobs.ts'), 'utf8')
-const delegateServerSrc = readFileSync(join(root, 'packages/gateway/src/server.ts'), 'utf8')
+const delegateServerSrc = gatewaySource
 const delegateCronSrc = readFileSync(join(root, 'packages/gateway/src/cron.ts'), 'utf8')
 
 // Retired rows must stay invisible to every runtime read/CAS. If this count drops,
@@ -805,8 +843,8 @@ console.log(
 // Isolated unit suites cover seal/sink-pending/T2 isolation, validator,
 // materialize stamp, persist owner-merge, and the read-only historical planner.
 const lateDelegateHelperSrc = readFileSync(join(root, 'packages/gateway/src/delegateLateCompletion.ts'), 'utf8')
-const lateSessionManagerSrc = readFileSync(join(root, 'packages/gateway/src/sessionManager.ts'), 'utf8')
-const lateServerSrc = readFileSync(join(root, 'packages/gateway/src/server.ts'), 'utf8')
+const lateSessionManagerSrc = sessionManager // sessionManager.ts + split-out modules (OCV5-480)
+const lateServerSrc = gatewaySource
 const lateTapeSrc = readFileSync(join(root, 'packages/commercial/src/http/losslessTurnTape.ts'), 'utf8')
 const latePersistSrc = readFileSync(join(root, 'packages/web-react/src/lib/persist.ts'), 'utf8')
 const lateSocketSrc = readFileSync(join(root, 'packages/web-react/src/lib/chat/socket.ts'), 'utf8')
