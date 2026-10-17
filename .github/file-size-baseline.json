@@ -18,7 +18,6 @@
     "packages/web-react/browser-tests/harness.tsx": 3837,
     "packages/web-react/browser-tests/run.mjs": 4185,
     "packages/web-react/src/components/MessageRenderer.tsx": 3165,
-    "packages/web-react/src/lib/api.ts": 5140,
     "packages/web-react/src/lib/chat/reducer.ts": 3300,
     "packages/web-react/src/lib/chat/socket.ts": 6645,
     "packages/web/public/modules/main.js": 3733,
