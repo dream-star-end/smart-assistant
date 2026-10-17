@@ -6249,20 +6249,20 @@ export class Gateway {
 
   // GET /api/agents         → { agents, default }
   // POST /api/agents        → create { id, model?, persona? }
-  private async handleAgentsCollection(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  private handleAgentsCollection(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return handleAgentsCollectionImpl.call(this as unknown as AgentHandlersHost, req, res)
   }
 
   // GET /api/agents/:id    → { agent }
   // PUT /api/agents/:id    → update model | persona
   // DELETE /api/agents/:id → remove (cannot remove default)
-  private async handleAgentItem(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
+  private handleAgentItem(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
     return handleAgentItemImpl.call(this as unknown as AgentHandlersHost, req, res, id)
   }
 
   // GET /api/agents/:id/persona  → { text }
   // PUT /api/agents/:id/persona  → { text }
-  private async handlePersona(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
+  private handlePersona(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
     return handlePersonaImpl.call(this as unknown as AgentHandlersHost, req, res, id)
   }
 
@@ -6273,28 +6273,28 @@ export class Gateway {
   //                       单条记忆改走 /memory/files/:file)。
   //
   // 单条记忆文件的 CRUD 在 handleMemoryFile(files/:file 子路由)。
-  private async handleMemory(req: IncomingMessage, res: ServerResponse, agentId: string, target: 'memory' | 'user'): Promise<void> {
+  private handleMemory(req: IncomingMessage, res: ServerResponse, agentId: string, target: 'memory' | 'user'): Promise<void> {
     return handleMemoryImpl.call(this as unknown as AgentHandlersHost, req, res, agentId, target)
   }
 
-  private async handleMemoryUsage(req: IncomingMessage, res: ServerResponse, agentId: string, url: URL): Promise<void> {
+  private handleMemoryUsage(req: IncomingMessage, res: ServerResponse, agentId: string, url: URL): Promise<void> {
     return handleMemoryUsageImpl.call(this as unknown as AgentHandlersHost, req, res, agentId, url)
   }
 
   // GET /api/agents/:id/auto-dream-report → sanitized latest result/progress.
-  private async handleAutoDreamReport(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+  private handleAutoDreamReport(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
     return handleAutoDreamReportImpl.call(this as unknown as AgentHandlersHost, req, res, agentId)
   }
 
-  private async handleAutoDreamOptimizer(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+  private handleAutoDreamOptimizer(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
     return handleAutoDreamOptimizerImpl.call(this as unknown as AgentHandlersHost, req, res, agentId)
   }
 
-  private async handleAutoDreamOptimizerCancel(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+  private handleAutoDreamOptimizerCancel(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
     return handleAutoDreamOptimizerCancelImpl.call(this as unknown as AgentHandlersHost, req, res, agentId)
   }
 
-  private async handleAutoDreamOptimizerProposal(req: IncomingMessage, res: ServerResponse, agentId: string, proposalId: string, action: 'apply' | 'dismiss'): Promise<void> {
+  private handleAutoDreamOptimizerProposal(req: IncomingMessage, res: ServerResponse, agentId: string, proposalId: string, action: 'apply' | 'dismiss'): Promise<void> {
     return handleAutoDreamOptimizerProposalImpl.call(this as unknown as AgentHandlersHost, req, res, agentId, proposalId, action)
   }
 
@@ -6304,24 +6304,24 @@ export class Gateway {
   //
   // 单条记忆文件的 CRUD。文件名双保险:路由已限 [^/],这里再过 MEMORY_FILE_RE(防 `..`
   // 及非法字符穿越)——「API 层拒绝非法名」是读侧安全权威之一(见设计契约§安全)。
-  private async handleMemoryFile(req: IncomingMessage, res: ServerResponse, agentId: string, file: string): Promise<void> {
+  private handleMemoryFile(req: IncomingMessage, res: ServerResponse, agentId: string, file: string): Promise<void> {
     return handleMemoryFileImpl.call(this as unknown as AgentHandlersHost, req, res, agentId, file)
   }
 
   // GET /api/agents/:id/skills — list
-  private async handleSkillsList(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
+  private handleSkillsList(req: IncomingMessage, res: ServerResponse, agentId: string): Promise<void> {
     return handleSkillsListImpl.call(this as unknown as SkillHandlersHost, req, res, agentId)
   }
 
   // GET/PUT/DELETE /api/agents/:id/skills/:name
-  private async handleSkillItem(req: IncomingMessage, res: ServerResponse, agentId: string, skillName: string): Promise<void> {
+  private handleSkillItem(req: IncomingMessage, res: ServerResponse, agentId: string, skillName: string): Promise<void> {
     return handleSkillItemImpl.call(this as unknown as SkillHandlersHost, req, res, agentId, skillName)
   }
 
   // GET /api/skills — user-level skill library list.
   // Aggregates shared + all agents' legacy + marketplace hub (NOT per-agent seed),
   // so a user sees one unified "my skills" library regardless of which agent is active.
-  private async handleUserSkillsList(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  private handleUserSkillsList(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return handleUserSkillsListImpl.call(this as unknown as SkillHandlersHost, req, res)
   }
 
@@ -6335,27 +6335,27 @@ export class Gateway {
 
   // PUT/DELETE /api/skills/:name/files — 技能目录内辅助文件的写/删(编辑器)。
   // 路径白名单 references/|assets/|evals/|scripts/,单文件≤64KB;evals.json 过 schema。
-  private async _handleUserSkillFiles(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+  private _handleUserSkillFiles(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
     return _handleUserSkillFilesImpl.call(this as unknown as SkillHandlersHost, req, res, skillName)
   }
 
   // GET /api/skills/:name/history — 版本历史;POST /api/skills/:name/restore — 恢复。
   // 历史/恢复只覆盖 SKILL.md 正文(save() 快照机制),辅助文件不在快照范围。
-  private async _handleUserSkillHistory(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+  private _handleUserSkillHistory(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
     return _handleUserSkillHistoryImpl.call(this as unknown as SkillHandlersHost, req, res, skillName)
   }
 
-  private async _handleUserSkillRestore(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+  private _handleUserSkillRestore(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
     return _handleUserSkillRestoreImpl.call(this as unknown as SkillHandlersHost, req, res, skillName)
   }
 
-  private async validateSkillAgentScopeInput(input: unknown): Promise<string[] | { error: string }> {
+  private validateSkillAgentScopeInput(input: unknown): Promise<string[] | { error: string }> {
     return validateSkillAgentScopeInputImpl.call(this as unknown as SkillHandlersHost, input)
   }
 
   // GET/PUT/DELETE /api/skills/:name — user-level skill item. Writes/deletes go to
   // the shared library (delete also sweeps same-named legacy residue across agents).
-  private async handleUserSkillItem(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+  private handleUserSkillItem(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
     return handleUserSkillItemImpl.call(this as unknown as SkillHandlersHost, req, res, skillName)
   }
 
@@ -6365,17 +6365,17 @@ export class Gateway {
   // 对话框),run.usage 逐 turn 累计供前端实报;用例上限(≤5)即成本上限。
 
   /** GET: evals 文件 + 上次结果;PUT: 保存 evals(仅可写技能)。 */
-  private async _handleSkillEvalsFile(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+  private _handleSkillEvalsFile(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
     return _handleSkillEvalsFileImpl.call(this as unknown as SkillHandlersHost, req, res, skillName)
   }
 
   /** POST /api/skills/:name/eval-run — 启动评测(202 → runId,进度轮询 status)。 */
-  private async _handleSkillEvalStart(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+  private _handleSkillEvalStart(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
     return _handleSkillEvalStartImpl.call(this as unknown as SkillHandlersHost, req, res, skillName)
   }
 
   /** GET /api/skill-eval/:runId — run 状态(owner 校验,同训练 run 语义)。 */
-  private async _handleSkillEvalRunStatus(req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
+  private _handleSkillEvalRunStatus(req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
     return _handleSkillEvalRunStatusImpl.call(this as unknown as SkillHandlersHost, req, res, runId)
   }
 
@@ -6389,18 +6389,18 @@ export class Gateway {
    *         的可写性门同一权威(store.view(...).writable);
    *   409 = 同技能已有生成 or 评测在跑(生成/评测互斥,避免并跑扰乱与重复扣费)。
    */
-  private async _handleSkillEvalGenStart(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+  private _handleSkillEvalGenStart(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
     return _handleSkillEvalGenStartImpl.call(this as unknown as SkillHandlersHost, req, res, skillName)
   }
 
   /** GET /api/skill-eval-gen/:runId — 生成 run 状态(owner 校验,与评测 run 同语义)。 */
-  private async _handleSkillEvalGenStatus(req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
+  private _handleSkillEvalGenStatus(req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
     return _handleSkillEvalGenStatusImpl.call(this as unknown as SkillHandlersHost, req, res, runId)
   }
 
   /** GET /api/v5/release-jobs/:id — hydrate the in-chat release card after refresh. */
   private _handleReleaseJobStatus(req: IncomingMessage, res: ServerResponse, id: string): void {
-    return _handleReleaseJobStatusImpl.call(this as unknown as SkillHandlersHost, req, res, id)
+    _handleReleaseJobStatusImpl.call(this as unknown as SkillHandlersHost, req, res, id)
   }
 
   /**
@@ -6440,19 +6440,19 @@ export class Gateway {
   }
 
   /** 生成编排:采集素材 → 单个隔离 turn(deepseek,正常计费)→ 宽容解析+归一化+过格式权威。 */
-  private async _runSkillEvalGen(run: SkillEvalGenRun, input: { skillMd: string; description: string }): Promise<void> {
+  private _runSkillEvalGen(run: SkillEvalGenRun, input: { skillMd: string; description: string }): Promise<void> {
     return _runSkillEvalGenImpl.call(this as unknown as SkillHandlersHost, run, input)
   }
 
   /** 跑一个被测/评分 turn:一次性会话,收最终文本+用量,完了销毁会话释放资源。 */
-  private async _skillEvalTurn(sessionKey: string, userId: string, prompt: string, model: string, opts: {
+  private _skillEvalTurn(sessionKey: string, userId: string, prompt: string, model: string, opts: {
       skillEvalExclude?: string
       skillEvalDraft?: { name: string; dir: string }
     }): Promise<{ text: string; usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number } }> {
     return _skillEvalTurnImpl.call(this as unknown as SkillHandlersHost, sessionKey, userId, prompt, model, opts)
   }
 
-  private async _loadAutoDreamAuditDataset(input: {
+  private _loadAutoDreamAuditDataset(input: {
     agentId: string
     afterSeq: number | null
     policy: AutoDreamOptimizerPolicy
@@ -6460,11 +6460,11 @@ export class Gateway {
     return _loadAutoDreamAuditDatasetImpl.call(this as unknown as AgentHandlersHost, input)
   }
 
-  private async _runAutoDreamOptimizerModel(input: AutoDreamOptimizerModelRun, client: AutoDreamOptimizerClient): Promise<string> {
+  private _runAutoDreamOptimizerModel(input: AutoDreamOptimizerModelRun, client: AutoDreamOptimizerClient): Promise<string> {
     return _runAutoDreamOptimizerModelImpl.call(this as unknown as AgentHandlersHost, input, client)
   }
 
-  private async _hydrateAutoDreamOptimizerProposals(input: {
+  private _hydrateAutoDreamOptimizerProposals(input: {
     runId: string
     agentId: string
     proposals: AutoDreamOptimizerProposal[]
@@ -6472,7 +6472,7 @@ export class Gateway {
     return _hydrateAutoDreamOptimizerProposalsImpl.call(this as unknown as AgentHandlersHost, input)
   }
 
-  private async _applyAutoDreamOptimizerProposal(input: { agentId: string; proposal: AutoDreamOptimizerProposal }, client: AutoDreamOptimizerClient): Promise<{ ok: true; result?: string } | { ok: false; conflict: string }> {
+  private _applyAutoDreamOptimizerProposal(input: { agentId: string; proposal: AutoDreamOptimizerProposal }, client: AutoDreamOptimizerClient): Promise<{ ok: true; result?: string } | { ok: false; conflict: string }> {
     return _applyAutoDreamOptimizerProposalImpl.call(this as unknown as AgentHandlersHost, input, client)
   }
 
@@ -6481,12 +6481,12 @@ export class Gateway {
    * CCB process (`--bare --tools "" --strict-mcp-config`) with no ambient
    * persona/repo/memory/skills/MCP/resume context.
    */
-  private async _runAutoDreamModel(input: AutoDreamModelRun): Promise<string> {
+  private _runAutoDreamModel(input: AutoDreamModelRun): Promise<string> {
     return _runAutoDreamModelImpl.call(this as unknown as AgentHandlersHost, input)
   }
 
   /** 评测编排:逐 case 逐 arm 隔离跑 → 每 case 一个匿名 grader turn → benchmark。 */
-  private async _runSkillEval(run: SkillEvalRun, opts: { draftDir?: string }): Promise<void> {
+  private _runSkillEval(run: SkillEvalRun, opts: { draftDir?: string }): Promise<void> {
     return _runSkillEvalImpl.call(this as unknown as SkillHandlersHost, run, opts)
   }
 
@@ -6494,10 +6494,10 @@ export class Gateway {
   private _skillRegressionTimer: ReturnType<typeof setInterval> | null = null
 
   private _startSkillAutoRegression(): void {
-    return _startSkillAutoRegressionImpl.call(this as unknown as SkillHandlersHost)
+    _startSkillAutoRegressionImpl.call(this as unknown as SkillHandlersHost)
   }
 
-  private async _skillAutoRegressionTick(minGapMs: number): Promise<void> {
+  private _skillAutoRegressionTick(minGapMs: number): Promise<void> {
     return _skillAutoRegressionTickImpl.call(this as unknown as SkillHandlersHost, minGapMs)
   }
 
@@ -6608,46 +6608,46 @@ export class Gateway {
    * (DISTINCT session_key,供前端"已找到 N 条"提示)。任何环节失败/无数据 → `{[], 0}`
    * (训练照常,不注入失败案例小节)。内容主权不出容器:master 只回引用,摘录本体由本地 DB 组装。
    */
-  private async _collectSkillFeedbackScenarios(skillName: string): Promise<{ scenarios: FeedbackScenario[]; total: number }> {
+  private _collectSkillFeedbackScenarios(skillName: string): Promise<{ scenarios: FeedbackScenario[]; total: number }> {
     return _collectSkillFeedbackScenariosImpl.call(this as unknown as SkillHandlersHost, skillName)
   }
 
-  private async _handleSkillTrainStart(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
+  private _handleSkillTrainStart(req: IncomingMessage, res: ServerResponse, skillName: string): Promise<void> {
     return _handleSkillTrainStartImpl.call(this as unknown as SkillHandlersHost, req, res, skillName)
   }
 
   // GET /api/skill-training — 当前用户的训练 run 列表(startedAt 降序)。归属权威与
   // _ownedTrainRun 同一来源(getUserId):runId 不再只活在前端组件 state 里,刷新页面 /
   // gateway 重启后前端凭此找回 running(续轮询)或 diff_ready(续合并/修订)的 run。
-  private async _handleSkillTrainList(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  private _handleSkillTrainList(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return _handleSkillTrainListImpl.call(this as unknown as SkillHandlersHost, req, res)
   }
 
   // GET /api/skill-training/:runId — run status. DELETE — discard run + its drafts.
-  private async _handleSkillTrainRun(req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
+  private _handleSkillTrainRun(req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
     return _handleSkillTrainRunImpl.call(this as unknown as SkillHandlersHost, req, res, runId)
   }
 
   // GET /api/skill-training/:runId/drafts — list staged draft summaries.
-  private async _handleSkillTrainDrafts(req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
+  private _handleSkillTrainDrafts(req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
     return _handleSkillTrainDraftsImpl.call(this as unknown as SkillHandlersHost, req, res, runId)
   }
 
   // GET /api/skill-training/:runId/drafts/:name — draft + current authoritative
   // (the two diff sides). PUT — apply a manual user edit to the draft.
-  private async _handleSkillTrainDraftItem(req: IncomingMessage, res: ServerResponse, runId: string, skillName: string): Promise<void> {
+  private _handleSkillTrainDraftItem(req: IncomingMessage, res: ServerResponse, runId: string, skillName: string): Promise<void> {
     return _handleSkillTrainDraftItemImpl.call(this as unknown as SkillHandlersHost, req, res, runId, skillName)
   }
 
   // POST /api/skill-training/:runId/drafts/:name/comment — user comment → AI revises
   // the draft by continuing the SAME training session (async; status returns to running).
-  private async _handleSkillTrainComment(req: IncomingMessage, res: ServerResponse, runId: string, skillName: string): Promise<void> {
+  private _handleSkillTrainComment(req: IncomingMessage, res: ServerResponse, runId: string, skillName: string): Promise<void> {
     return _handleSkillTrainCommentImpl.call(this as unknown as SkillHandlersHost, req, res, runId, skillName)
   }
 
   // POST /api/skill-training/:runId/merge — promote draft(s) into the AUTHORITATIVE
   // library (the only write to live skills). Body {name?} merges one, else all.
-  private async _handleSkillTrainMerge(req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
+  private _handleSkillTrainMerge(req: IncomingMessage, res: ServerResponse, runId: string): Promise<void> {
     return _handleSkillTrainMergeImpl.call(this as unknown as SkillHandlersHost, req, res, runId)
   }
 
