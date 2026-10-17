@@ -503,10 +503,7 @@ function absentWorker(input: { looks: Array<string | Error>;
   const probe = { requestId: "box-parked", uid: 3n, accountId: 79n,
     runNonce: candidate.runNonce, leaseEpoch: candidate.leaseEpoch, linked: false };
   const worker = new BoxRemoteCleanupWorker({
-    journal: { listStoppedFailureProbeCandidates: async () => [probe],
-      claimStoppedFailureProbe: async () => true,
-      markFirstRoundStoppedFailure: async () => { throw new Error("no proof exists"); },
-      markToolChainStoppedFailure: async () => { throw new Error("no proof exists"); },
+    holds: {
       recordRunAbsence: async (args: { boot: string; requestId: string }) => {
         assert.equal(args.requestId, probe.requestId);
         sequence.push("record");
@@ -514,7 +511,11 @@ function absentWorker(input: { looks: Array<string | Error>;
         if (!seen) seen = { v: 1, atMs: 1_792_000_000_000, boot: args.boot };
         return prior;
       },
-      clearRunAbsence: async () => { sequence.push("clear"); seen = null; },
+      clearRunAbsence: async () => { sequence.push("clear"); seen = null; } } as never,
+    journal: { listStoppedFailureProbeCandidates: async () => [probe],
+      claimStoppedFailureProbe: async () => true,
+      markFirstRoundStoppedFailure: async () => { throw new Error("no proof exists"); },
+      markToolChainStoppedFailure: async () => { throw new Error("no proof exists"); },
       markRunExpiredUnproven: async (args: unknown) => {
         sequence.push("absent-close");
         closes.push(args);

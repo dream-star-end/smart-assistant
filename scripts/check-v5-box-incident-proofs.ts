@@ -81,6 +81,8 @@ type Api = {
   idleProofHandler: (deps: unknown) => RouteHandler;
   /** OCV5-488: the product's Box billing recovery for one row: it settles a handoff's completed calls. */
   settleBoxBilling: (db: Db, requestId: string, uid: bigint) => Promise<string>;
+  /** OCV5-488: the journal writes that release a Box run held by nothing. */
+  holds: (db: Db) => unknown;
   /** OCV5-488: the ops.box_hold_stuck alert's own query and row mapping. */
   boxHoldStuck: { sql: string; rows: (rows: unknown[]) => Array<{ requestId: string; absent: boolean }> };
   jsonError: (res: unknown, status: number, code: string, message: string, requestId: string) => void;
@@ -184,6 +186,7 @@ async function load(): Promise<Api> {
   const journal = await import(pathToFileURL(join(PROXY, "boxDurableJournal.ts")).href);
   const stop = await import(pathToFileURL(join(PROXY, "boxUserStopCoordinator.ts")).href);
   const holdStuck = await import(pathToFileURL(join(PROXY, "boxHoldStuck.ts")).href);
+  const holdRelease = await import(pathToFileURL(join(PROXY, "boxHoldRelease.ts")).href);
   const boxBilling = await import(pathToFileURL(join(CANDIDATE,
     "packages/commercial/src/billing/boxBillingRecovery.ts")).href);
   const billing = await import(pathToFileURL(join(PROXY, "boxBillingContext.ts")).href);
@@ -254,6 +257,7 @@ async function load(): Promise<Api> {
       read: replaySetup.createBoxReplayReader(root) }),
     stopHandler: stopRoute.makeBoxUserStopHandler, idleProofHandler: idleRoute.makeBoxIdleProofHandler,
     boxHoldStuck: { sql: holdStuck.BOX_HOLD_STUCK_SQL, rows: holdStuck.boxHoldStuckRows },
+    holds: (db) => new holdRelease.BoxHoldRelease({ query: db.query.bind(db) }),
     settleBoxBilling: (db, requestId, uid) => boxBilling.recoverBoxBillingRequest({ query: db.query.bind(db),
       connect: async () => ({ query: db.query.bind(db), release: () => {} }) }, requestId, uid),
     jsonError: shared.sendJsonError,
@@ -1845,14 +1849,14 @@ async function proveRecoveredToolExchange(api: Api, db: Db): Promise<string> {
  * user container has for reaching them. The gateway code under test calls
  * them with its own clients. */
 async function egressInternalRoutes(api: Api, journal: Journal, who: { uid: bigint; containerId: bigint },
-  target: unknown, readCapsule?: unknown, stopParked = false) {
+  target: unknown, readCapsule?: unknown, holds?: unknown) {
   const identity = { resolve: async () => ({ uid: who.uid, containerId: who.containerId, apiKey: null }) };
   // OCV5-488: production also stops a parked leaf from the idle route; the proofs of the
   // adapter's own stop leave it off so each proves its mechanism alone.
   const routes: Record<string, RouteHandler> = {
     "/internal/box/stop": api.stopHandler({ identity, journal, coordinator: api.stopCoordinator(journal, target) }),
     "/internal/box/idle-proof": api.idleProofHandler({ identity, journal, ...(readCapsule ? { readCapsule } : {}),
-      ...(stopParked ? { stopParked: { journal, coordinator: api.stopCoordinator(journal, target) } } : {}) }) };
+      ...(holds ? { stopParked: { journal: holds, coordinator: api.stopCoordinator(journal, target) } } : {}) }) };
   const calls: string[] = [];
   let idle: Promise<void> = Promise.resolve();
   const server = createServer((req, res) => {
@@ -3054,8 +3058,9 @@ async function proveWaitingHandoffSuperseded(api: Api, db: Db): Promise<string> 
 }
 
 /** The cleanup worker egress runs, on the real journal, reaching each run's own Box account. */
-function boxCleanupWorker(api: Api, journal: Journal, turns: ReadonlyArray<ReturnType<typeof boxTurn>>) {
-  return api.cleanupWorker({ journal, staleResumeProofWaitMs: 300,
+function boxCleanupWorker(api: Api, journal: Journal, turns: ReadonlyArray<ReturnType<typeof boxTurn>>,
+  holds?: unknown) {
+  return api.cleanupWorker({ journal, staleResumeProofWaitMs: 300, ...(holds ? { holds } : {}),
     resolver: { resolve: async (args: { requiredAccountId: bigint }) => {
       const turn = turns.find((item) => item.host.target.accountId === args.requiredAccountId);
       if (!turn) throw Object.assign(new Error("BOX_ACCOUNT_UNAVAILABLE"), { code: "BOX_ACCOUNT_UNAVAILABLE" });
@@ -3246,7 +3251,7 @@ async function proveProcessAbsentReleased(api: Api, db: Db): Promise<string> {
   if ((await journalRow(db, unsettled.requestId))?.state !== "inflight") fail("ABSENT_UNSETTLED_FIXTURE");
   const runs = [gone, rebooted, unsettled];
   const moneyBefore = await Promise.all([gone, rebooted].map((run) => money(db, run.who.uid)));
-  const worker = boxCleanupWorker(api, journal, runs.map((run) => run.turn));
+  const worker = boxCleanupWorker(api, journal, runs.map((run) => run.turn), api.holds(db));
   const round = async () => {
     for (const run of runs) await rearm(db, run.requestId);
     await worker.reconcileStoppedFailures(50);
@@ -3308,7 +3313,7 @@ async function proveProcessAbsentReleased(api: Api, db: Db): Promise<string> {
  * parked leaf on that read the way a browser Stop does, whatever ended the turn (here nothing the adapter
  * knows: no /internal/box/stop is ever sent). */
 async function proveIdleProofStopsParkedTurn(api: Api, db: Db): Promise<string> {
-  if (!api.egressSource.includes("stopParked: { journal: boxStopJournal, coordinator: boxStopCoordinator }")) {
+  if (!api.egressSource.includes("stopParked: { journal: new BoxHoldRelease(getPool()), coordinator: boxStopCoordinator }")) {
     fail("IDLE_STOP_NOT_WIRED_IN_EGRESS");
   }
   const journal = api.journal(db);
@@ -3318,7 +3323,7 @@ async function proveIdleProofStopsParkedTurn(api: Api, db: Db): Promise<string> 
     [who.uid.toString()]);
   const turn = boxTurn(api, db, journal, who, "box-idlestop", turnKey);
   await turn.first();
-  const routes = await egressInternalRoutes(api, journal, who, turn.host.target, undefined, true);
+  const routes = await egressInternalRoutes(api, journal, who, turn.host.target, undefined, api.holds(db));
   const dir = api.home;
   const counters = { submits: 0, shutdowns: 0 };
   const session = gatewaySession(api, "idle-stop-session", counters);

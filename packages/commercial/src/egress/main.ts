@@ -86,6 +86,7 @@ import { BoxUserStopCoordinator } from "../http/proxy/boxUserStopCoordinator.js"
 import { BoxCliVersionGate, gateBoxLaunchResolver } from "../http/proxy/boxCliVersion.js";
 import { makeBoxUserStopHandler } from "../http/proxy/boxUserStopHandler.js";
 import { makeBoxIdleProofHandler } from "../http/proxy/boxIdleProofHandler.js";
+import { BoxHoldRelease } from "../http/proxy/boxHoldRelease.js";
 import { startLatencyProber } from "./latencyProber.js";
 import { startRecoveryProber } from "./recoveryProber.js";
 import { snapshotInflight } from "../http/proxy/inflightTracker.js";
@@ -492,7 +493,7 @@ export async function startEgress(): Promise<void> {
     coordinator: boxStopCoordinator });
   const boxIdleProofHandler = makeBoxIdleProofHandler({ identity: identityStrategy,
     journal: boxStopJournal, readCapsule: boxReplayReader,
-    stopParked: { journal: boxStopJournal, coordinator: boxStopCoordinator } });
+    stopParked: { journal: new BoxHoldRelease(getPool()), coordinator: boxStopCoordinator } });
   // Which Box login an interactive session (box-claude-*) launches under, and what its turns
   // reported: the admin's selection plus the login health this process shares with the Box
   // model route. Independent of OC_BOX_MODEL_API: interactive sessions exist without that route.

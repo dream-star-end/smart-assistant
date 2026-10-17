@@ -56,6 +56,7 @@ import { reconcileBoxBillingBatch } from "./billing/boxBillingRecovery.js";
 import { BoxDurableJournal } from "./http/proxy/boxDurableJournal.js";
 import { createProductionBoxAccountResolver } from "./http/proxy/boxAccountResolver.js";
 import { BoxRemoteCleanupWorker } from "./http/proxy/boxRemoteCleanupWorker.js";
+import { BoxHoldRelease } from "./http/proxy/boxHoldRelease.js";
 import { createBoxReplayRecoveryWriter } from "./egress/boxReplaySetup.js";
 import {
   assertModelCatalogAdminPoolConfigured,
@@ -6295,6 +6296,7 @@ export async function registerCommercial(
       journal: new BoxDurableJournal(getPool()),
       resolver: createProductionBoxAccountResolver(),
       writeRecoveryMessage: createBoxReplayRecoveryWriter(process.env.OC_PLATFORM_ROOT),
+      holds: new BoxHoldRelease(getPool()),
       // OCV5-488: every automatic release of a run gone from the Box is told once.
       onProcessAbsentClosed: (closed) => safeEnqueueAlert({
         event_type: ALERT_EVENTS.OPS_BOX_HOLD_RELEASED, severity: "info",

@@ -6,12 +6,13 @@ import { BoxDurableJournalError, type BoxDurableJournal } from "./boxDurableJour
 import type { BoxIdleProof } from "./boxIdleChain.js";
 import type { BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
 import type { BoxUserStopCoordinator } from "./boxUserStopCoordinator.js";
+import type { BoxHoldRelease } from "./boxHoldRelease.js";
 import { rootLogger } from "../../logging/logger.js";
 
 type Journal = Pick<BoxDurableJournal, "readIdleProof">;
 type CapsuleReader = (pointer: BoxReplayMessagePointer) => Promise<unknown>;
 /** OCV5-488: stop a turn's leaf that is still parked on a tool handoff. */
-type ParkedStop = { journal: Pick<BoxDurableJournal, "findParkedHandoffRun">;
+type ParkedStop = { journal: Pick<BoxHoldRelease, "findParkedHandoffRun">;
   coordinator: Pick<BoxUserStopCoordinator, "requestStop"> };
 
 const idleLog = rootLogger.child({ subsys: "box-idle-proof" });
