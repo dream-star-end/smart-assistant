@@ -11,16 +11,19 @@ import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const serverSrc = readFileSync(join(here, '../server.ts'), 'utf8')
+// FINDINGS §7.5 2b: the /api/cron* dispatch lives in the WORKSPACE_API_ROUTES table.
+const routeSrc = readFileSync(join(here, '../routes/workspaceApi.ts'), 'utf8')
 const allowlistSrc = readFileSync(join(here, '../bridgeApiAllowlist.ts'), 'utf8')
 
 describe('GET /api/cron/channels 网关接线', () => {
   it('pathname 字面量写在 /api/cron/:id 匹配之前', () => {
-    const channelsAt = serverSrc.indexOf("url.pathname === '/api/cron/channels'")
-    const cronAt = serverSrc.indexOf("url.pathname === '/api/cron'")
-    const itemAt = serverSrc.indexOf("url.pathname.match(/^\\/api\\/cron\\/([a-zA-Z0-9_-]+)$/)")
-    assert.ok(channelsAt >= 0, 'server.ts 必须有 url.pathname === \'/api/cron/channels\'')
+    const channelsAt = routeSrc.indexOf("url.pathname === '/api/cron/channels'")
+    const cronAt = routeSrc.indexOf("url.pathname === '/api/cron'")
+    const itemAt = routeSrc.indexOf("url.pathname.match(/^\\/api\\/cron\\/([a-zA-Z0-9_-]+)$/)")
+    assert.ok(channelsAt >= 0, 'routes/workspaceApi.ts 必须有 url.pathname === \'/api/cron/channels\'')
     assert.ok(cronAt >= 0)
     assert.ok(itemAt > channelsAt, '/api/cron/channels 必须在 :id 正则之前,否则会被当成 job id')
+    assert.match(routeSrc, /io\.handleCronChannels\(/)
     assert.match(serverSrc, /handleCronChannels\(/)
     assert.match(serverSrc, /listCronDeliverChannels\(/)
   })

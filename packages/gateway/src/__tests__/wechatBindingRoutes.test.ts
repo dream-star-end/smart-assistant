@@ -19,7 +19,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const SERVER_TS = readFileSync(join(__dirname, '..', 'server.ts'), 'utf-8')
 
 function extractMethodBody(source: string, methodName: string): string {
-  const startRe = new RegExp(`^  (private|public|protected)?\\s*(async\\s+)?${methodName}\\b`, 'm')
+  // `(` after the name: the Gateway's route io adapters list `name: (...args) => …` too
+  const startRe = new RegExp(`^  (private|public|protected)?\\s*(async\\s+)?${methodName}\\(`, 'm')
   const startMatch = startRe.exec(source)
   if (!startMatch) throw new Error(`method ${methodName} not found`)
   const startIdx = startMatch.index
