@@ -5882,7 +5882,7 @@ export class SessionManager {
     }
   }
 
-  private async runOneTurnWithRetry(session: AgentSession, userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>, onEvent: (e: SessionStreamEvent) => void, requestId?: string, traceId?: string, collabAgentPolicy?: CollabAgentPolicy, modelAuthority?: TurnModelAuthority, clientMessageId?: string, dispatchContext?: AgentSession['_currentDispatch'], queueLifecycle?: {
+  private runOneTurnWithRetry(session: AgentSession, userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>, onEvent: (e: SessionStreamEvent) => void, requestId?: string, traceId?: string, collabAgentPolicy?: CollabAgentPolicy, modelAuthority?: TurnModelAuthority, clientMessageId?: string, dispatchContext?: AgentSession['_currentDispatch'], queueLifecycle?: {
       readonly queueTurn: true
       onTurnReserved(reservation: {
         turnIndex: number
@@ -5938,7 +5938,7 @@ export class SessionManager {
   // (auth 错误关键字分类已下沉 engine/ccbAdapter.ts —— 错误字符串是 CCB 底座私有
   //  知识;本层只消费 TurnSummary.errorKind === 'auth'。)
 
-  private async _runOneTurn(session: AgentSession, userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>, onEvent: (e: SessionStreamEvent) => void, requestId?: string, traceId?: string, collabAgentPolicy?: CollabAgentPolicy, assistantMessageId?: string, thinkingMessageId?: string, toolMessageIdFactory?: (blockId: string) => string, turnKey?: string, clientMessageId?: string, modelAuthority?: TurnModelAuthority, retryRuntimeEvents: DurableRuntimeEvent[] = [], retryAssistantSegments: SegmentRecord[] = [], retryThinkingSegments: SegmentRecord[] = [], retryTools: TurnToolEntry[] = [], retryStructuredBlocks: Array<Record<string, unknown>> = [], queueTurn = false, retryAuthErrors = true, retryPhantomErrors = true, retryTransientErrors = false, attemptOrdinal = 0, automaticRetryState?: AutomaticRetryState, modelSwitchTransition?: AgentSession['_modelSwitchTransition']): Promise<void> {
+  private _runOneTurn(session: AgentSession, userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>, onEvent: (e: SessionStreamEvent) => void, requestId?: string, traceId?: string, collabAgentPolicy?: CollabAgentPolicy, assistantMessageId?: string, thinkingMessageId?: string, toolMessageIdFactory?: (blockId: string) => string, turnKey?: string, clientMessageId?: string, modelAuthority?: TurnModelAuthority, retryRuntimeEvents: DurableRuntimeEvent[] = [], retryAssistantSegments: SegmentRecord[] = [], retryThinkingSegments: SegmentRecord[] = [], retryTools: TurnToolEntry[] = [], retryStructuredBlocks: Array<Record<string, unknown>> = [], queueTurn = false, retryAuthErrors = true, retryPhantomErrors = true, retryTransientErrors = false, attemptOrdinal = 0, automaticRetryState?: AutomaticRetryState, modelSwitchTransition?: AgentSession['_modelSwitchTransition']): Promise<void> {
     return _runOneTurnImpl.call(this as unknown as TurnRunnerHost, session, userTextOrBlocks, onEvent, requestId, traceId, collabAgentPolicy, assistantMessageId, thinkingMessageId, toolMessageIdFactory, turnKey, clientMessageId, modelAuthority, retryRuntimeEvents, retryAssistantSegments, retryThinkingSegments, retryTools, retryStructuredBlocks, queueTurn, retryAuthErrors, retryPhantomErrors, retryTransientErrors, attemptOrdinal, automaticRetryState, modelSwitchTransition)
   }
 
