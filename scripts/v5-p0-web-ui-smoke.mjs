@@ -10,7 +10,10 @@ import { CASES, TOTAL_TIMEOUT, parseOptions, tapResult } from "./lib/user-contra
 import { coldUiLogin, installTurnProbe, selectJourneyModel, sendContractTurn, contractEvidenceBase } from "./lib/user-contract-browser.mjs";
 
 const UI_CASES = CASES.slice(0, 2);
-let browser, page, current = 0, stepStart = performance.now();
+let browser;
+let page;
+let current = 0;
+let stepStart = performance.now();
 const timings = [];
 console.log(`TAP version 13\n1..${UI_CASES.length}`);
 let finishing = false;
