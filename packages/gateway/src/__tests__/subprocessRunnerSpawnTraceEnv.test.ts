@@ -159,7 +159,8 @@ test('structural: SubprocessRunnerOpts type declares traceId field', () => {
   // still be there but writing to a nonexistent opts key would be a
   // TypeScript error rather than a runtime no-op. This source-level check
   // adds belt to the tsc suspenders.
-  const path = new URL('../subprocessRunner.ts', import.meta.url).pathname
+  // SubprocessRunnerOpts lives in subprocessSpawnConfig.ts since OCV5-478 (re-exported by subprocessRunner.ts)
+  const path = new URL('../subprocessSpawnConfig.ts', import.meta.url).pathname
   const optsSrc = readFileSync(path, 'utf-8')
 
   const optsIdx = optsSrc.indexOf('export interface SubprocessRunnerOpts')
