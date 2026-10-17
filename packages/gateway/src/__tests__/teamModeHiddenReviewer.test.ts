@@ -57,7 +57,7 @@ describe('team mode preamble — 两策略(审议/执行)+ 队长自主送审纪
   })
 
   it('审查员不盲审:任务书从队长会话 _pendingAgentGroups 取证据,型号 ≠ 队长/panel', () => {
-    const src = readFileSync(SERVER_TS, 'utf8')
+    const src = readGatewaySource() // FINDINGS §7: server.ts + split-out modules
     assert.match(src, /parent\._pendingAgentGroups \?\? \[\]/)
     assert.match(src, /buildTeamReviewContext\(\{[\s\S]*mode: reviewMode[\s\S]*evidence,/)
     assert.match(src, /pickReviewerModel\(view, \{/)
@@ -66,7 +66,7 @@ describe('team mode preamble — 两策略(审议/执行)+ 队长自主送审纪
   })
 
   it('硬编排产物已整体退役(防复活:队长自主送审是现行唯一机制)', () => {
-    const src = readFileSync(SERVER_TS, 'utf8')
+    const src = readGatewaySource() // FINDINGS §7: server.ts + split-out modules
     assert.doesNotMatch(src, /finalHeld/)
     assert.doesNotMatch(src, /_runTeamReviewPass/)
     assert.doesNotMatch(src, /buildTeamReviewContinuation/)
@@ -92,7 +92,7 @@ describe('team mode hidden reviewer — 可见性守护(不变)', () => {
   })
 
   it('rejects direct user chat/message access while leaving delegate_task as the internal path', () => {
-    const src = readFileSync(SERVER_TS, 'utf8')
+    const src = readGatewaySource() // FINDINGS §7: server.ts + split-out modules
     assert.match(src, /if \(frame\.agentId && isHiddenSystemAgentId\(frame\.agentId\)\)/)
     assert.match(src, /if \(isHiddenSystemAgentId\(agent\.id\)\)/)
     assert.match(src, /bootAutoResume[\s\S]*isHiddenSystemAgentId\(agentId\)/)

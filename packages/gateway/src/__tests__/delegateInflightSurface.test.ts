@@ -1,3 +1,4 @@
+import { readGatewaySource } from './helpers/gatewaySource.js'
 import { installDelegateSandbox } from './helpers/delegateSandbox.js'
 const sandbox = installDelegateSandbox()
 
@@ -40,7 +41,8 @@ import {
 } from '../delegateSmFlag.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const serverSrc = readFileSync(join(here, '../server.ts'), 'utf8')
+// FINDINGS §7.6 S3: server.ts + split-out modules (delegate runtime/supervision moved out)
+const serverSrc = readGatewaySource()
 // OCV5-465: the client session routes live in routes/clientSessions.ts; server.ts dispatches to it.
 const sessionsSrc = readFileSync(join(here, '../routes/clientSessions.ts'), 'utf8')
 const PARENT = 'agent:main:webchat:dm:web-r2parent'
