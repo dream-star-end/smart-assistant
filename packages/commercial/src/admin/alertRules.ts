@@ -539,9 +539,9 @@ export const ruleBoxHoldStuck: PolledRule = {
       firing: true,
       dedupe_key: `${EVENTS.OPS_BOX_HOLD_STUCK}:${accounts.join(",")}`,
       title: `Box 占位未释放:${stuck.length} 条(账号 ${accounts.join(",")})`,
-      body: `${stuck.map((row) => `${row.requestId.slice(0, 12)} ${row.boxState} ${row.ageMin}min `
-        + (row.absent ? "Box 上已无进程" : "超过 4h15m 上限")).join("\n")}\n`
-        + "自动收口未生效。排查见 ocv5-box-model-route「Box 上的残留和排查」,不要直接改库。",
+      body: `${stuck.map((row) => `${row.requestId.slice(0, 12)} ${row.boxState} ${row.ageMin}min ${
+        row.absent ? "Box 上已无进程" : "超过 4h15m 上限"}`).join("\n")}
+自动收口未生效。排查见 ocv5-box-model-route「Box 上的残留和排查」,不要直接改库。`,
       payload: { count: stuck.length, accounts, requestIds: stuck.map((row) => row.requestId) },
     };
   },

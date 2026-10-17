@@ -497,7 +497,9 @@ test("OCV5-313 an expired run on a reachable Box is closed only when no proof ca
 const BOOT = "0f2c5d1e-1111-4222-8333-444455556666";
 function absentWorker(input: { looks: Array<string | Error>;
   prior?: { v: 1; atMs: number; boot: string }; closeError?: Error }) {
-  const sequence: string[] = [], closes: unknown[] = [], released: unknown[] = [];
+  const sequence: string[] = [];
+  const closes: unknown[] = [];
+  const released: unknown[] = [];
   let look = 0;
   let seen = input.prior ?? null;
   const probe = { requestId: "box-parked", uid: 3n, accountId: 79n,

@@ -225,7 +225,8 @@ export class BoxRemoteCleanupWorker {
    * alive, terminal or unreadable keeps it pending exactly as before. */
   private async closeAbsent(candidate: BoxStoppedFailureProbeCandidate,
     target: BoxResolvedTarget): Promise<boolean> {
-    const journal = this.deps.journal, holds = this.deps.holds;
+    const journal = this.deps.journal;
+    const holds = this.deps.holds;
     if (!holds || !journal.markRunExpiredUnproven) return false;
     let seen: BoxRunLiveness | null;
     let timer: ReturnType<typeof setTimeout> | undefined;

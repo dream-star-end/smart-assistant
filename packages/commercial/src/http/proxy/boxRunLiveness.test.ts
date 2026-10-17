@@ -21,7 +21,8 @@ async function exited(child: ChildProcess): Promise<void> {
 
 function runDirs() {
   const nonce = randomBytes(12).toString("hex");
-  const run = `/tmp/ocv5-289-run-${nonce}`, proof = `/tmp/ocv5-289-proof-${nonce}`;
+  const run = `/tmp/ocv5-289-run-${nonce}`;
+  const proof = `/tmp/ocv5-289-proof-${nonce}`;
   mkdirSync(run, { mode: 0o700 });
   mkdirSync(proof, { mode: 0o700 });
   return { nonce, run, proof, remove: () => {

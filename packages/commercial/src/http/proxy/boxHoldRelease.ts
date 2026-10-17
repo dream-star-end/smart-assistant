@@ -79,7 +79,8 @@ export class BoxHoldRelease {
           AND NOT (ctx ? 'boxTerminalProof')`,
       [input.uid.toString(), input.containerId.toString(),
         input.sessionId, input.turnKey]);
-    const row = found.rows[0], ctx = row?.ctx;
+    const row = found.rows[0];
+    const ctx = row?.ctx;
     if (found.rowCount !== 1 || !row || !ctx
       || !/^[A-Za-z0-9_-]{1,64}$/.test(row.request_id)
       || typeof ctx.boxAccountId !== "string"
