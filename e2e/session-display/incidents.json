@@ -7757,10 +7757,16 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/uiFence.test.ts",
           "assertion": "缩进代码块里的 ```ui 示例不动,后续正文保留(Codex r1)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerUiFenceNormalize.test.ts",
+          "assertion": "tape must carry the normalized text"
         }
       ],
       "coverageCommits": [
-        "7ef1370c"
+        "7ef1370c",
+        "753a51d5"
       ]
     }
   ]

@@ -248,6 +248,7 @@ import {
   formatTransientCircuitOpenError,
   resolveTransientBreakerThreshold,
 } from './transientRetryCircuit.js'
+import { normalizeAssistantOutputUiFences } from './uiFenceNormalize.js'
 
 async function computeSessionContextFingerprint(
   projectId: string | null | undefined,
@@ -7818,11 +7819,14 @@ export class SessionManager {
         if (result) {
           terminalPersistenceClaim = 'complete'
           flushTerminalBilling()
-          const completedAssistantRaw = combineRetryAssistantOutput(
-            retryAssistantSegments,
-            result.assistantText,
-            freezeSegments(result.assistantSegments, assistantMessageId),
-            Date.now(),
+          // OCV5-482: the stored turn gets a glued ```ui prediction fence on its own line.
+          const completedAssistantRaw = normalizeAssistantOutputUiFences(
+            combineRetryAssistantOutput(
+              retryAssistantSegments,
+              result.assistantText,
+              freezeSegments(result.assistantSegments, assistantMessageId),
+              Date.now(),
+            ),
           )
           const completedAssistantText = emptyCompletedTurnAssistantText({
             status: terminalOverride?.status ?? 'completed',
