@@ -21,6 +21,79 @@ export class BoxCliToolHandoffError extends Error {
 }
 
 interface Obj { [key: string]: unknown }
+/** OCV5-509: Claude Code repairs a streamed tool input before it records it
+ * (Khe in 2.1.299–2.1.302, for MCP tools too): a top-level string property that
+ * parses as JSON of another kind becomes the parsed value, then a literal
+ * `\uXXXX` in any string becomes the character — except in a string that looks
+ * like a Windows path, after an escaped backslash, or for a lone surrogate or
+ * control code — and `__proto__` keys are dropped. The upstream input stays the
+ * model's own; the CLI's record of it may differ by exactly these repairs (a
+ * script holding `[一-鿿]` failed every turn as
+ * BOX_TOOL_SNAPSHOT_MISMATCH, 2026-10-18). */
+const CLI_ESCAPED_UNICODE = /\\u([dD][89aAbB][0-9a-fA-F]{2})\\u([dD][c-fC-F][0-9a-fA-F]{2})|\\u([0-9a-fA-F]{4})/;
+const CLI_ESCAPED_UNICODE_ALL = new RegExp(CLI_ESCAPED_UNICODE.source, "g");
+const CLI_WINDOWS_PATH = /(?:^|[^A-Za-z])[A-Za-z]:[\\/]|(?:^|[\s"'=])\\\\[^\s\\/]+[\\/](?!\\)/;
+
+function cliRepairedString(value: string): string {
+  if (!value.includes("\\u") || !CLI_ESCAPED_UNICODE.test(value) || CLI_WINDOWS_PATH.test(value)) return value;
+  return value.replace(CLI_ESCAPED_UNICODE_ALL,
+    (match: string, high: string | undefined, low: string, single: string, offset: number) => {
+      let start = offset;
+      while (start > 0 && value[start - 1] === "\\") start--;
+      if ((offset - start) & 1) return match;
+      if (high !== undefined) return String.fromCharCode(Number.parseInt(high, 16), Number.parseInt(low, 16));
+      const code = Number.parseInt(single, 16);
+      if ((code >= 0xd800 && code <= 0xdfff) || code <= 31 || (code >= 127 && code <= 159)) return match;
+      return String.fromCharCode(code);
+    });
+}
+
+function cliRepaired(value: unknown): unknown {
+  if (typeof value === "string") return cliRepairedString(value);
+  if (Array.isArray(value)) return value.map(cliRepaired);
+  if (!value || typeof value !== "object") return value;
+  const out: Obj = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key !== "__proto__") out[key] = cliRepaired(item);
+  }
+  return out;
+}
+
+/** The CLI's top-level coercion: only a string that parses to a value of
+ * another kind, and a number only when it reads back as the same text. */
+function cliCoerced(value: string): unknown {
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { return undefined; }
+  if (typeof parsed === "boolean" || Array.isArray(parsed)
+    || (parsed !== null && typeof parsed === "object")) return parsed;
+  if (typeof parsed === "number" && Number.isFinite(parsed) && String(parsed) === value) return parsed;
+  return undefined;
+}
+
+function cliRecordedInputMatches(recorded: unknown, upstream: unknown): boolean {
+  if (isDeepStrictEqual(recorded, upstream)) return true;
+  if (!recorded || typeof recorded !== "object" || Array.isArray(recorded)
+    || !upstream || typeof upstream !== "object" || Array.isArray(upstream)) return false;
+  const kept = Object.keys(upstream).filter((key) => key !== "__proto__");
+  if (!isDeepStrictEqual(Object.keys(recorded).sort(), [...kept].sort())) return false;
+  return kept.every((key) => {
+    const model = (upstream as Obj)[key];
+    const seen = (recorded as Obj)[key];
+    if (isDeepStrictEqual(seen, cliRepaired(model))) return true;
+    if (typeof model !== "string" || typeof seen === "string") return false;
+    const coerced = cliCoerced(model);
+    return coerced !== undefined && isDeepStrictEqual(seen, cliRepaired(coerced));
+  });
+}
+
+/** A CLI snapshot block is the upstream block as the CLI records it. */
+function snapshotBlockMatches(observed: Obj, upstream: Obj | undefined): boolean {
+  if (!upstream) return false;
+  if (observed.type !== "tool_use" || upstream.type !== "tool_use") return isDeepStrictEqual(observed, upstream);
+  const { input: recorded, ...observedRest } = observed;
+  const { input: model, ...upstreamRest } = upstream;
+  return isDeepStrictEqual(observedRest, upstreamRest) && cliRecordedInputMatches(recorded, model);
+}
 function obj(value: unknown): Obj {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new BoxCliToolHandoffError("BOX_TOOL_STREAM_INVALID");
@@ -63,6 +136,9 @@ export interface BoxToolUse {
   readonly boxName: string;
   readonly clientName: string;
   readonly input: Obj;
+  /** OCV5-509: the input as the CLI recorded and calls the tool with, when its
+   * repair changed it (see cliRecordedInputMatches); `input` stays the model's. */
+  readonly cliInput?: Obj;
 }
 export interface BoxToolHandoffCandidate {
   readonly messageId: string;
@@ -795,11 +871,16 @@ export class BoxCliToolHandoffDecoder {
       }
       if (this.stopReason === "tool_use") {
         if (uses.length < 1) throw new BoxCliToolHandoffError("BOX_TOOL_USE_REQUIRED");
+        const recorded = this.recordedToolInputs();
         this.candidate = { messageId: this.messageId!,
           assistantContentHash: this.visibleAssistantContentHash(),
           assistantEchoHash: hashBoxAssistantEchoContent(this.visibleBlocks()),
           assistantNoCallerHash: hashBoxAssistantNoCallerContent(this.visibleBlocks()),
-          toolUses: uses,
+          toolUses: uses.map((use) => {
+            const cliInput = recorded.get(use.id);
+            return cliInput === undefined || isDeepStrictEqual(cliInput, use.input)
+              ? use : { ...use, cliInput };
+          }),
           // OCV5-328: the CLI runs the exposed calls first and answers these
           // itself afterwards; the next round must see exactly those answers.
           ...(mixed ? { rejectedToolUses: rejected.map((block) => ({
@@ -843,13 +924,11 @@ export class BoxCliToolHandoffDecoder {
       const next = new Set<number>();
       for (const position of covered) {
         if (content.length >= position && content.length <= blocks.length
-          && content.every((observed, i) =>
-            isDeepStrictEqual(observed, blocks[i]?.upstream))) {
+          && content.every((observed, i) => snapshotBlockMatches(observed, blocks[i]?.upstream))) {
           next.add(content.length);
         }
         if (position + content.length <= blocks.length
-          && content.every((observed, i) =>
-            isDeepStrictEqual(observed, blocks[position + i]?.upstream))) {
+          && content.every((observed, i) => snapshotBlockMatches(observed, blocks[position + i]?.upstream))) {
           next.add(position + content.length);
         }
       }
@@ -861,6 +940,20 @@ export class BoxCliToolHandoffDecoder {
     if (!covered.has(blocks.length)) {
       throw new BoxCliToolHandoffError("BOX_TOOL_SNAPSHOT_MISMATCH");
     }
+  }
+
+  /** The CLI's last record of each tool call, after verifySnapshot accepted it. */
+  private recordedToolInputs(): Map<string, Obj> {
+    const recorded = new Map<string, Obj>();
+    for (const content of this.snapshots) {
+      for (const block of content) {
+        if (block.type === "tool_use" && typeof block.id === "string" && block.input
+          && typeof block.input === "object" && !Array.isArray(block.input)) {
+          recorded.set(block.id, block.input as Obj);
+        }
+      }
+    }
+    return recorded;
   }
 
   private visibleAssistantContentHash(): string {

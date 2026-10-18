@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
-import { constants, existsSync, mkdirSync, openSync, readFileSync,
+import { chmodSync, constants, existsSync, mkdirSync, openSync, readFileSync,
   rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { makeBoxRunCleanup } from "./boxRunCleanup.js";
@@ -90,5 +90,35 @@ test("terminal private cleanup can retain only the native project transcript", (
     const removed = run(false);
     assert.equal(removed.status, 0, removed.stderr);
     assert.equal(existsSync(transcript), false);
+  } finally { f.close(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("OCV5-509 the CLI auto-memory folder in a run project is cleaned, anything else still refused", () => {
+  const f = fixture();
+  const root = `/tmp/ocv5-509-projects-${randomBytes(8).toString("hex")}`;
+  const project = `${root}/${f.cwd.replaceAll("/", "-")}`;
+  const run = () => {
+    const request = makeBoxRunCleanup(f.nonce, false);
+    const script = request.args[2]!.replace("/home/box/.claude/projects/", `${root}/`);
+    return spawnSync(request.command, ["-I", "-c", script, ...request.args.slice(3)],
+      { cwd: request.cwd, env: { ...process.env, ...request.environment },
+        encoding: "utf8", timeout: 5000 });
+  };
+  try {
+    mkdirSync(`${project}/memory`, { recursive: true, mode: 0o700 });
+    chmodSync(`${project}/memory`, 0o755);
+    writeFileSync(`${project}/12345678-1234-4123-8123-123456789abc.jsonl`, "history\n", { mode: 0o600 });
+    writeFileSync(`${project}/memory/MEMORY.md`, "private memory\n", { mode: 0o644 });
+    writeFileSync(`${f.cwd}/stdout.jsonl`, "private model output", { mode: 0o600 });
+    writeFileSync(`${f.cwd}/stderr.log`, "private stderr", { mode: 0o600 });
+    const cleaned = run();
+    assert.equal(cleaned.status, 0, cleaned.stderr);
+    assert.equal(existsSync(`${project}/memory`), false);
+    assert.equal(existsSync(`${project}/12345678-1234-4123-8123-123456789abc.jsonl`), false);
+    assert.equal(run().status, 0, "idempotent");
+    // only Markdown files: a nested folder or a link is not the CLI's and stays refused
+    mkdirSync(`${project}/memory/nested`, { recursive: true });
+    assert.equal(run().status, 126);
+    assert.equal(existsSync(`${project}/memory/nested`), true);
   } finally { f.close(); rmSync(root, { recursive: true, force: true }); }
 });
