@@ -2374,10 +2374,10 @@ async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<
   });
 }
 
-// [ocv5-509-refused-recovery-closed] PASS — a recovery paused before it ran ends its turn with a visible card, and an answered or exhausted chain is left alone
+// [ocv5-509-refused-recovery-closed] PASS — a recovery paused before it ran ends its turn with a visible card once nothing will run it on, and an answered chain is left alone
 async function proveRefusedRecoveryClosed(api: Api, database: unknown): Promise<string> {
   return withSessionsBackend(api, database, (backend, db) => refusedRecoveryProof({ backend, db,
-    close: (pool) => api.closeRefusedRecoveryChains(pool), model: MODEL }));
+    close: (pool) => api.closeRefusedRecoveryChains(pool), model: MODEL, takeover: false }));
 }
 
 // [ocv5-509-cli-repaired-tool-input] PASS — a tool call the CLI records and runs unicode-repaired hands off the model's own input, and any other difference is still refused

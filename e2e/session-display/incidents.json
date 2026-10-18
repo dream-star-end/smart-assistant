@@ -7392,7 +7392,7 @@
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-incident-proofs.ts",
-          "assertion": "[ocv5-509-refused-recovery-closed] PASS — a recovery paused before it ran ends its turn with a visible card, and an answered or exhausted chain is left alone"
+          "assertion": "[ocv5-509-refused-recovery-closed] PASS — a recovery paused before it ran ends its turn with a visible card once nothing will run it on, and an answered chain is left alone"
         }
       ]
     },
