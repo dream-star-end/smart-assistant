@@ -1,8 +1,8 @@
 # OCV5-500 非Codex链路首字计时验证
 
-**整体缓存硬门未通过，不能作为验收通过的PR交付。** Grok真实网页baseline/candidate cached read均1152，但原生总input从22535变22537，严格比例5.112047925449301%→5.111594267205041%，下降0.000453658244261个百分点。不得四舍五入抹平，也不追加付费请求挑样。受控API相同不能覆盖这项原生观察。
+**按用户20:39“无明显变差”口径，通过此已观察缓存对照。** 原严格比例门的未通过记录保留；用户明确接受命中1152不变、总input仅+2为噪声。 Grok真实网页baseline/candidate cached read均1152，但原生总input从22535变22537，严格比例5.112047925449301%→5.111594267205041%，下降0.000453658244261个百分点。不得四舍五入抹平，也不追加付费请求挑样。受控API相同不能覆盖这项原生观察。
 
-独立核对原生system和24项工具定义逐字相同；首个assistant之前5条输入42,615B只有一处会话working_directory不同，精确按各自存档值归一后全文SHA同为26517d92081e8f76de37e3b86d0947d849bf81cff4c016f56a345c79afbce3df。后端仍67d，不能证明前端代码破坏缓存；但未保存供应商完整wire/tokenizer，2token精确归因N/A，不据此豁免用户比例硬门。保留隔离草稿供查证，禁止合并/发布。安全独立证据见paid-evidence/grok-native-cache-comparison.json及最终账务审计。
+独立核对原生system和24项工具定义逐字相同；首个assistant之前5条输入42,615B只有一处会话working_directory不同，精确按各自存档值归一后全文SHA同为26517d92081e8f76de37e3b86d0947d849bf81cff4c016f56a345c79afbce3df。后端仍67d，不能证明前端代码破坏缓存；但未保存供应商完整wire/tokenizer，2token精确归因N/A，原严格门历史不改，当前依据用户20:39明确批准接受此噪声；后续各步骤仍附真实前后用量、按无明显变差判断。PR保持草稿，禁止合并/发布。安全独立证据见paid-evidence/grok-native-cache-comparison.json及最终账务审计。
 
 可见 process 正文双 rAF 补 paint；按 probe 对象 WeakSet 去重，取消不提前认领，晚到/替换 probe 使用最新引用。引擎/代理阶段时钟冻结 trace、model 和 process generation，不额外读取流，不改 system/tools/messages/cache_control。Grok relay 仅用本身 HTTP requestId/slot，不猜测平台 trace；AG relay 复用唯一 reader，不伪造正文/ready。
 

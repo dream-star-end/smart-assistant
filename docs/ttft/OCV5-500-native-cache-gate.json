@@ -20,5 +20,12 @@
     "native wire/tokenizer not retained",
     "candidate backend not deployed",
     "no further paid samples to select a better result"
-  ]
+  ],
+  "user_2039_acceptance": {
+    "criterion": "无明显变差",
+    "accepted": true,
+    "reason": "用户明确将cache_read1152不变、totalinput仅+2视为噪声并批准此对照",
+    "historical_strict_verdict_preserved": true,
+    "raw_numbers_unchanged": true
+  }
 }
