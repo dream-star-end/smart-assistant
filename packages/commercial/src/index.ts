@@ -1464,6 +1464,9 @@ export async function registerCommercial(
       sessionsStoreGeneration = decision.generation;
       const pgSessionsBackend = createPgSessionsBackend(getPool(), {
         expectedGeneration: decision.generation,
+        admissionRestartRecovery: {
+          releaseReservation: (ref) => releasePreCheck(preCheckRedis, ref).then(() => {}),
+        },
         onGoalUsageChanged: (userId, sessionId) => goalUsageRefreshRef.current(userId, sessionId),
         onAutomaticRecoveryDecision: (userId, sessionId, verdict) =>
           recoveryDecisionBroadcastRef.current(userId, sessionId, verdict),
@@ -6543,6 +6546,8 @@ export async function registerCommercial(
           },
         });
         const reconcilerDeps = {
+          recoverInterruptedAdmission: dispatchAdmissionBackend
+            ? (id: string) => dispatchAdmissionBackend!.recoverInterruptedAdmission(id) : undefined,
           pool: getPool(),
           container,
           stuckThresholdMs,
