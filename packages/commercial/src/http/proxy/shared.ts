@@ -1083,10 +1083,13 @@ interface SseEvent {
  */
 class UsageObserver {
   private buf = "";
+  private receivedAtMs: number | null = null;
+  firstTextAtMs: number | null = null;
   private latest: UsageObservation = { kind: "none" };
 
   /** 把 chunk 送进来(同时已经 byte-pass 给客户端)。 */
-  push(chunkText: string): void {
+  push(chunkText: string, receivedAtMs: number): void {
+    this.receivedAtMs = receivedAtMs;
     this.buf += chunkText;
     while (true) {
       const idx = this.findEventBoundary();
@@ -1125,13 +1128,26 @@ class UsageObserver {
   }
 
   private handleEvent(ev: SseEvent): void {
-    if (ev.event !== "message_start" && ev.event !== "message_delta") return;
+    const isUsage = ev.event === "message_start" || ev.event === "message_delta";
+    const observeText = this.firstTextAtMs === null &&
+      ["content_block_start", "content_block_delta", "message"].includes(ev.event);
+    if (!isUsage && !observeText) return;
     let parsed: unknown;
     try {
       parsed = JSON.parse(ev.data);
     } catch {
       return;
     }
+    if (this.firstTextAtMs === null && isObj(parsed)) {
+      const type = ev.event === "message" ? parsed.type : ev.event;
+      const block = type === "content_block_start" ? parsed.content_block : parsed.delta;
+      if (isObj(block) && ((type === "content_block_start" && block.type === "text") ||
+          (type === "content_block_delta" && block.type === "text_delta")) &&
+          typeof block.text === "string" && block.text.trim()) {
+        this.firstTextAtMs = this.receivedAtMs;
+      }
+    }
+    if (ev.event !== "message_start" && ev.event !== "message_delta") return;
     // message_start: { type, message: { ..., usage: {...}}}
     // message_delta: { type, delta:{...}, usage: {...}}
     const startUsage = ev.event === "message_start" ? extractUsageFromMessageStart(parsed) : null;
@@ -1216,6 +1232,8 @@ export interface PipeStreamResult {
   bytesOut: number;
   /** 第一字节 ms(performance.now / Date.now 相对值);未收到任何 chunk → null。 */
   firstByteAtMs: number | null;
+  /** First completed nonempty text event, at the chunk receipt boundary before backpressure. */
+  firstTextAtMs: number | null;
   /**
    * 中断/异常原因。null 表示流正常结束(EOF)。非 null 表示上游/下游中途断开,
    * 但 observation 仍然反映"已看到的部分 usage",caller 据此区分 partial vs aborted。
@@ -1252,7 +1270,8 @@ export async function pipeStreamWithUsageCapture(
         const { value, done } = await reader.read();
         if (done) break;
         if (!value || value.length === 0) continue;
-        if (firstByteAtMs === null) firstByteAtMs = Date.now();
+        const chunkReceivedAtMs = Date.now();
+        if (firstByteAtMs === null) firstByteAtMs = chunkReceivedAtMs;
         // 1) 字节透传 — write 失败 → 抛进外层 catch(下游已关连接)
         const wrote = res.write(value);
         bytesOut += value.length;
@@ -1275,7 +1294,7 @@ export async function pipeStreamWithUsageCapture(
         }
         // 2) 旁路 usage 提取(失败/异常都不影响 stream)
         try {
-          observer.push(decoder.decode(value, { stream: true }));
+          observer.push(decoder.decode(value, { stream: true }), chunkReceivedAtMs);
         } catch {
           // observer 内部解析失败不该传染主路径
         }
@@ -1288,7 +1307,7 @@ export async function pipeStreamWithUsageCapture(
     } catch {
       /* ignore */
     }
-    return { observation: observer.result(), bytesOut, firstByteAtMs, error };
+    return { observation: observer.result(), bytesOut, firstByteAtMs, firstTextAtMs: observer.firstTextAtMs, error };
   } finally {
     try {
       await reader.cancel();

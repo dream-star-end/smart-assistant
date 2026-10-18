@@ -1,3 +1,4 @@
+import { PassiveStageTiming } from './passiveStageTiming.js'
 import { fastServiceTierRoute } from '@openclaude/protocol'
 import {
   identityCompatEnvironment,
@@ -235,6 +236,8 @@ export class SubprocessRunner extends EventEmitter {
   /** Header bundle last written for the current turn. Cleared on shutdown. */
   private currentTurnHeaders: TurnUpstreamHeaders | undefined
   private spawnedExecutionDescriptor: CcbExecutionDescriptor | undefined
+  private spawnGeneration = 0
+  private processTiming: PassiveStageTiming | undefined
   private stdoutBuf = ''
   /** Running byte count for stderr within a single "line" window — caps runaway stderr. */
   private stderrBufBytes = 0
@@ -486,6 +489,10 @@ export class SubprocessRunner extends EventEmitter {
       )
     }
 
+    const timing = new PassiveStageTiming({ engine: 'ccb', traceId: this.opts.traceId,
+      sessionKey: this.opts.sessionKey, model: this.opts.model, generation: ++this.spawnGeneration },
+      (fields) => runnerLog.info('engine_process_timing', fields))
+    timing.once('prepare_started')
     this.starting = true
     this.closed = false
     this.officialAbortResultObserved = false
@@ -829,7 +836,9 @@ export class SubprocessRunner extends EventEmitter {
         )
       }
       const backend: TerminalBackend = createBackend(this.opts.config.terminal)
+      timing.once('spawn_requested')
       proc = ccbSpawnForTests ? ccbSpawnForTests(spawnOpts) : backend.spawn(spawnOpts)
+      timing.once('spawned')
     } catch (err) {
       this.starting = false
       // 见 449 catch 同理:spawn 抛错时 binding 字段已置位,清掉保不变量。
@@ -846,6 +855,7 @@ export class SubprocessRunner extends EventEmitter {
       this.starting = false
       return
     }
+    this.processTiming = timing
     this.proc = proc as unknown as ChildProcessWithoutNullStreams
     // Capture the resolver by value: a retired generation (official-cc abort
     // recycle) may close stdout after a newer process already owns the shared
@@ -897,13 +907,14 @@ export class SubprocessRunner extends EventEmitter {
       // descendant still owns stdout. Never parse those late bytes against a
       // newly spawned runner state.
       if (this.proc !== proc) return
-      this.handleStdout(chunk)
+      if (chunk.length > 0) timing.once('first_stdout')
+      this.handleStdout(chunk, timing)
     })
     proc.stdout.once('close', () => {
       // A process killed immediately after writing a complete JSON object may
       // omit the conventional trailing newline. Feed one delimiter through
       // the normal parser before declaring the stream drained.
-      if (this.proc === proc && this.stdoutBuf.length > 0) this.handleStdout('\n')
+      if (this.proc === proc && this.stdoutBuf.length > 0) this.handleStdout('\n', timing)
       stdoutClosed = true
       resolveThisDrain()
       if (this.resolveOutputDrain === resolveThisDrain) this.resolveOutputDrain = null
@@ -1051,7 +1062,7 @@ export class SubprocessRunner extends EventEmitter {
     })
   }
 
-  private handleStdout(chunk: string): void {
+  private handleStdout(chunk: string, timing = this.processTiming): void {
     this.lastActivityAt = Date.now()
 
     // Scan `chunk` in place rather than first concatenating the entire chunk
@@ -1080,6 +1091,9 @@ export class SubprocessRunner extends EventEmitter {
       if (trimmed) {
         try {
           const msg = JSON.parse(trimmed) as SdkMessage
+          if (msg.type === 'system' && (msg as { subtype?: string }).subtype === 'init') {
+            timing?.once('sdk_init_received')
+          }
           // OpenClaude telemetry side-channel: `_oc_telemetry` lines are
           // observability events, not SDK messages. Route them to the
           // dedicated 'telemetry' listener and skip the normal pipeline:
@@ -1180,6 +1194,10 @@ export class SubprocessRunner extends EventEmitter {
     authority?: TurnModelAuthority,
     turnKey?: string,
   ): Promise<void> {
+    const turnTiming = new PassiveStageTiming({ engine: 'ccb', traceId: this.opts.traceId,
+      sessionKey: this.opts.sessionKey, model: this.opts.model },
+      (fields) => runnerLog.info('engine_submit_timing', { ...fields, generation: this.spawnGeneration }))
+    turnTiming.once('submit_received')
     // 先解析 + 校验凭据:抛在这里 = 一行都没写 = 本 turn 没发出去(fail-closed)。
     // 也保证下方两次 write 之间**没有 await**(不给交叠 turn 插队的窗口)。
     const runtime = await resolveTurnRuntime(
@@ -1188,6 +1206,7 @@ export class SubprocessRunner extends EventEmitter {
       process.env,
       this.opts.authorityEngine ?? 'ccb',
     )
+    turnTiming.once('runtime_resolved')
     this.pinBoxNativeHarness(runtime.descriptor)
     if (isCcbAdvisorHermeticProfile(this.opts)) {
       await assertCcbAdvisorCatalogLock({
@@ -1247,7 +1266,9 @@ export class SubprocessRunner extends EventEmitter {
         )
       : null
 
+    turnTiming.once('recycle_complete')
     if (!this.proc) await this.start()
+    turnTiming.once('process_available')
     if (!this.proc) throw new Error('failed to start agent subprocess')
     this.refreshDelegateContext()
     const content = ccbStdinUserContent(userTextOrBlocks)
@@ -1267,6 +1288,7 @@ export class SubprocessRunner extends EventEmitter {
     // hot-updated in the stock process.
     if (envUpdateLine) await this.writeTurnLineOrDestroy(envUpdateLine, 'authority_env')
     await this.writeTurnLineOrDestroy(`${JSON.stringify(userMsg)}\n`, 'user_message')
+    turnTiming.once('user_stdin_written')
   }
 
   /**

@@ -358,6 +358,7 @@ export function makeAnthropicProxyHandler(
   );
 
   return async function handle(req, res, ctx) {
+    const proxyReceivedAt = performance.now();
     setSecurityHeaders(res);
     const requestId = ensureRequestId(req);
     res.setHeader(REQUEST_ID_HEADER, requestId);
@@ -419,6 +420,11 @@ export function makeAnthropicProxyHandler(
     const userLog = reqLog.child({
       uid: uid.toString(),
       containerId: containerIdBig === null ? null : containerIdBig.toString(),
+    });
+
+    userLog.info("proxy_stage_timing", { stage: "proxy_received", elapsedMs: performance.now() - proxyReceivedAt });
+    const stageTiming = (stage: string) => userLog.info("proxy_stage_timing", {
+      stage, elapsedMs: performance.now() - proxyReceivedAt,
     });
 
     // 1b) count_tokens(仅 allowCountTokens 实例):身份通过即答,不进限流/并发/授权 ——
@@ -1337,6 +1343,7 @@ export function makeAnthropicProxyHandler(
         // 内部:getBalance(PG) → atomicReserve(Lua: 清过期 + HVALS 求和 + 比 balance + HSET/ZADD)
         // balance > 0 即放行;余额 < 估算 cost 时 cap 到 balance(drain-to-zero by cap-to-balance)。
         // 真实 cost 由 finalize 阶段已有的 clamp 路径吃(settleUsageAndLedger)。
+        stageTiming("precheck_started");
         pre = await preCheckWithCost(deps.preCheckRedis, {
           userId: uid,
           requestId,
@@ -1363,6 +1370,7 @@ export function makeAnthropicProxyHandler(
         throw err;
       }
 
+      stageTiming("precheck_complete");
       if (pre.capped) {
         incrPrecheckCapped(body.model);
         userLog.info("precheck_capped", {
@@ -1408,6 +1416,7 @@ export function makeAnthropicProxyHandler(
           getSessionPinMode: deps.getSessionPinMode,
           listEnabledAccountGroupsForModel: deps.listEnabledAccountGroupsForModel,
         };
+      stageTiming("upstream_prepare_started");
       const pickRes = await pickUpstream(
         pickDeps,
         body,
@@ -1416,6 +1425,7 @@ export function makeAnthropicProxyHandler(
         uid,
         forceRepin,
       );
+      stageTiming("upstream_prepare_complete");
       if (!pickRes.ok) {
         // 释放失败仅告警不阻断(TTL 300s 自愈兜底);但 Redis 故障时预留泄漏必须可观测。
         await releasePreCheck(deps.preCheckRedis, pre.reservation).catch((e: unknown) => {
@@ -1823,6 +1833,7 @@ export function makeAnthropicProxyHandler(
 
       // 10-11) upstream round-trip(切到 proxy/core.ts):abort 绑定 + fetch +
       // SSE 透传 + finalize + post-commit 广播 + zeroize。release 责任已在 finalize。
+      stageTiming("roundtrip_enter");
       await runUpstreamRoundTrip({
         pgPool: deps.pgPool,
         fetchFn: route.kind === "box"

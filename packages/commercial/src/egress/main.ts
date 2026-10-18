@@ -644,13 +644,14 @@ export async function startEgress(): Promise<void> {
       });
     },
   });
-  const grokRelayHandler = makeGrokRelayHandler({ identityRepo });
+  const grokRelayHandler = makeGrokRelayHandler({ identityRepo, logger: log });
   const zcodeRelayHandler = makeZcodeRelayHandler({
     identityRepo,
     codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
   });
   const antigravityRelayHandler = makeAntigravityRelayHandler({
     identityRepo,
+    logger: log,
     clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
     pricing,
   });

@@ -1,3 +1,5 @@
+import type { Logger } from '../logging/logger.js'
+import { createPassiveRelayTiming } from './passiveRelayTiming.js'
 /**
  * Master/egress relay for the official Antigravity CLI (OCV5-415 P2).
  *
@@ -124,6 +126,7 @@ export interface AntigravityUsageRow {
 }
 
 export interface AntigravityRelayDeps {
+  logger?: Pick<Logger, 'info'>
   identityRepo: ContainerIdentityRepo
   /** OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET; empty → 503 ANTIGRAVITY_NOT_CONFIGURED. */
   clientSecret: string
@@ -391,6 +394,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
     })
 
   return async (req, res, ctx) => {
+    const receivedAt = performance.now()
     setSecurityHeaders(res)
     const requestId = ensureRequestId(req)
     res.setHeader(REQUEST_ID_HEADER, requestId)
@@ -434,6 +438,12 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       error(res, 404, 'ANTIGRAVITY_ROUTE_EXPIRED', requestId)
       return
     }
+    const stage = createPassiveRelayTiming(deps.logger, {
+      engine: 'antigravity', requestId, turnRequestId: route.requestId,
+      uid: String(identity.userId), model: route.modelId, rpc,
+    }, receivedAt)
+    stage('proxy_received')
+    stage('route_ready')
     if (!deps.clientSecret) {
       error(res, 503, 'ANTIGRAVITY_NOT_CONFIGURED', requestId)
       return
@@ -441,7 +451,9 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
     let body: Buffer | undefined
     if (method === 'POST') {
       try {
+        stage('body_read_started')
         body = await readLimited(req, generate ? MAX_GENERATE_BODY : MAX_METADATA_BODY)
+        stage('body_read_complete')
       } catch {
         error(res, 413, 'BODY_TOO_LARGE', requestId)
         return
@@ -475,6 +487,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         error(res, 403, 'ANTIGRAVITY_MODEL_NOT_ALLOWED', requestId)
         return
       }
+      stage('precheck_started')
       let spent: bigint | null
       try {
         spent = await meteredCost(route)
@@ -522,12 +535,15 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       slot.touchedAt = now()
       inflight.set(token, slot)
       reservation = { slot, estimate }
+      stage('precheck_complete')
     }
 
     let accessToken: Buffer | null = null
     try {
       try {
+        stage('auth_prepare_started')
         accessToken = await freshToken(route.accountId)
+        stage('auth_prepare_complete')
       } catch (err) {
         error(
           res,
@@ -546,6 +562,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         const value = req.headers[name]
         if (typeof value === 'string' && value.length <= 512) headers[name] = value
       }
+      stage('fetch_started')
       const upstream = await (deps.requestFn ?? request)(
         `${ANTIGRAVITY_UPSTREAM_BASE_URL}/v1internal:${rpc}${parsed.search}`,
         {
@@ -555,6 +572,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
           body,
         },
       )
+      stage('headers_received', { statusCode: upstream.statusCode })
       const classified = classifyAntigravityUpstream(upstream.statusCode, upstream.headers, now())
       // A 5xx on a generate call is the model's capacity (other models on the
       // account keep working): cool that model, not the whole account.
@@ -590,6 +608,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       // upstream either way) so usage is still recorded and the reservation freed.
       let downstreamOpen = true
       for await (const chunk of upstream.body) {
+        if ((chunk as Buffer).length > 0) stage('first_byte')
         tap?.push(chunk as Buffer)
         if (!downstreamOpen) continue
         if (res.destroyed || !res.write(chunk)) downstreamOpen = await drainedOrClosed(res)
@@ -636,8 +655,10 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         // A Stop may have settled the turn while this call was still streaming (OCV5-451).
         void refreshWaived(route).catch(() => {})
       }
+      stage('stream_complete')
       if (downstreamOpen) res.end()
     } catch (err) {
+      stage('relay_failed')
       if (res.headersSent) {
         res.destroy(err instanceof Error ? err : undefined)
       } else {

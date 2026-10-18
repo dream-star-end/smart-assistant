@@ -1,3 +1,4 @@
+import { PassiveStageTiming } from '../passiveStageTiming.js'
 import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 /**
  * First-class adapter for xAI's official Grok CLI. The CLI runs once per turn
@@ -360,6 +361,8 @@ function grokUserQuery(prompt: string): string {
 }
 
 interface GrokTurnContext {
+  timing: PassiveStageTiming
+  processTiming: PassiveStageTiming | null
   params: TurnParams
   startedAt: number
   proc: ChildProcessByStdio<null, Readable, Readable> | null
@@ -470,6 +473,10 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     let resolveSummary!: (summary: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((resolve) => { resolveSummary = resolve })
     const ctx: GrokTurnContext = {
+      processTiming: null,
+      timing: new PassiveStageTiming({ engine: 'grok', traceId: params.traceId,
+        sessionKey: this.opts.sessionKey, model: this.opts.model },
+        (fields) => log.info('engine_turn_timing', fields)),
       params,
       startedAt: Date.now(),
       proc: null,
@@ -677,6 +684,8 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     if (!spec) throw new Error('GROK_LAUNCH_SPEC_MISSING')
     const resume = opts.resume && Boolean(this.nativeId)
     const args = this.grokCliArgs(ctx, resume)
+    ctx.processTiming = ctx.timing.fork(ctx.spawnGeneration + 1)
+    ctx.processTiming.once('spawn_requested')
     let proc: ChildProcessByStdio<null, Readable, Readable>
     try {
       proc = spawn(spec.bin, args, { cwd: spec.cwd, env: spec.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
@@ -684,6 +693,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       cleanupPromptDir(ctx)
       throw err
     }
+    ctx.processTiming.once('spawned')
     ctx.proc = proc
     ctx.procClosed = false
     ctx.sawStdout = false
@@ -768,6 +778,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
   private noteStdout(ctx: GrokTurnContext): void {
     if (ctx.abandoned || ctx.terminal) return
     if (!ctx.sawStdout) {
+      ctx.processTiming?.once('first_stdout')
       ctx.sawStdout = true
       this.clearFirstStdoutTimer(ctx)
       this.ensureProcessKeepalive()
@@ -940,6 +951,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     if (type === 'text') {
       const text = asText(event.data)
       if (!text) return
+      if (text.trim()) ctx.timing.once('first_text')
       if (ctx.lastContentKind !== 'text') {
         ctx.assistantSegments.push({ index: ctx.assistantSegments.length, text: '', ts: Date.now(), eventOrdinal: ctx.params.nextDurableEventOrdinal?.() })
       }
@@ -961,6 +973,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
     if (type === 'thought') {
       const text = asText(event.data)
       if (!text) return
+      if (text.trim()) ctx.timing.once('first_thinking')
       if (ctx.lastContentKind !== 'thought') {
         ctx.thinkingSegments.push({ index: ctx.thinkingSegments.length, text: '', ts: Date.now(), eventOrdinal: ctx.params.nextDurableEventOrdinal?.() })
       }
