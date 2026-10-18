@@ -47,7 +47,7 @@ export interface AdmissionRestartRecoveryDeps {
   releaseReservation(ref: AbortedJournalRef): Promise<void>
 }
 export interface AdmissionRestartStorageDeps extends AdmissionRestartRecoveryDeps {
-  hydrate(q: Pool | PoolClient, sessionId: string, userId: string, source: MessageLike): Promise<MessageLike | null>
+  loadLatestSource(q: Pool | PoolClient, row: TurnDispatchRow, lock: boolean): Promise<MessageLike | null>
   advanceTimeline(q: PoolClient, sessionId: string, userId: string): Promise<void>
 }
 
@@ -77,25 +77,6 @@ function exactRequest(source: MessageLike, dispatch: TurnDispatchRow): Record<st
   return JSON.parse(Buffer.from(snapshotAdmissionRequest(request).wireBase64, 'base64').toString('utf8')) as Record<string, unknown>
 }
 
-async function latestSource(q: Pool | PoolClient, row: TurnDispatchRow,
-  deps: AdmissionRestartStorageDeps, lock: boolean): Promise<MessageLike | null> {
-  const result = await q.query<{ messages: string; deleted_at: string | null }>(
-    `SELECT messages,deleted_at FROM client_sessions WHERE id=$1 AND user_id=$2${lock ? ' FOR UPDATE' : ''}`,
-    [row.sessionId, `c:${row.userId}`],
-  )
-  const session = result.rows[0]
-  if (!session || session.deleted_at !== null) return null
-  let messages: MessageLike[]
-  try {
-    const parsed: unknown = JSON.parse(session.messages)
-    if (!Array.isArray(parsed)) return null
-    messages = parsed as MessageLike[]
-  } catch { return null }
-  const source = [...messages].reverse().find(item => item?.role === 'user')
-  if (source?.id !== row.clientMessageId) return null
-  return deps.hydrate(q, row.sessionId, `c:${row.userId}`, source)
-}
-
 const hasPersistedRejectedProof = (row: TurnDispatchRow): boolean =>
   row.outcome === 'not_accepted' && row.failureCode === 'DISPATCH_NOT_ACCEPTED'
 const isSourceFailure = (row: TurnDispatchRow | null): row is TurnDispatchRow =>
@@ -109,7 +90,7 @@ export async function recoverAdmissionAfterRestart(pool: Pool, dispatchId: strin
   deps: AdmissionRestartStorageDeps): Promise<boolean> {
   const original = await getDispatch(pool, dispatchId)
   if (!isSourceFailure(original)) return false
-  const initialSource = await latestSource(pool, original, deps, false)
+  const initialSource = await deps.loadLatestSource(pool, original, false)
   if (!initialSource || !exactRequest(initialSource, original)) return false
   const initialLineage = lineage(initialSource)
   if (!initialLineage) return false
@@ -123,7 +104,7 @@ export async function recoverAdmissionAfterRestart(pool: Pool, dispatchId: strin
     await client.query('BEGIN')
     await lockRecoveryRoot(client, { userId: original.userId,
       sessionId: original.sessionId, rootClientMessageId: initialLineage.root })
-    const source = await latestSource(client, original, deps, true)
+    const source = await deps.loadLatestSource(client, original, true)
     const row = await getDispatchForUpdate(client, dispatchId)
     if (!source || !isSourceFailure(row) || row.attemptNo !== original.attemptNo ||
         row.userId !== original.userId || row.sessionId !== original.sessionId ||

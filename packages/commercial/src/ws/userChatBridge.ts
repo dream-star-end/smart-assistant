@@ -4051,8 +4051,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       return state;
     };
 
-    /** The websocket send callback is the physical-transfer linearization
-     * point. Until it succeeds, cleanup may still terminalize this state. */
+    /** A successful websocket callback releases enrichment ownership. If
+     * cleanup wins first, exact inbox proof resolves the uncertain delivery. */
     const completeEnrichmentTransfer = (state: EnrichmentDispatchState | null): void => {
       if (state) acceptEnrichmentReceipt(state.record);
     };

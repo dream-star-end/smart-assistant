@@ -8936,6 +8936,26 @@ async function readPermissionPromptsForSession(
   }
 }
 
+async function loadAdmissionRestartSource(q: Pool | PoolClient,
+  row: { sessionId: string; userId: bigint; clientMessageId: string }, lock: boolean): Promise<MessageLike | null> {
+  const result = await q.query<{ messages: string; deleted_at: string | null }>(
+    `SELECT messages,deleted_at FROM client_sessions WHERE id=$1 AND user_id=$2${lock ? ' FOR UPDATE' : ''}`,
+    [row.sessionId, `c:${row.userId}`],
+  )
+  const session = result.rows[0]
+  if (!session || session.deleted_at !== null) return null
+  let messages: MessageLike[]
+  try {
+    const parsed: unknown = JSON.parse(session.messages)
+    if (!Array.isArray(parsed)) return null
+    messages = parsed as MessageLike[]
+  } catch { return null }
+  const source = [...messages].reverse().find(item => item?.role === 'user')
+  if (source?.id !== row.clientMessageId) return null
+  return hydrateRecoverySourceUser(q, row.sessionId, `c:${row.userId}`, source)
+}
+
+
 export function createPgSessionsBackend(
   pool: Pool,
   options: PgSessionsBackendOptions,
@@ -8944,7 +8964,7 @@ export function createPgSessionsBackend(
   const finalizeSingleflight = _createFinalizeSingleflight<LosslessTurnTapeFinalizeResult>();
 
   const admissionRestartDeps = options.admissionRestartRecovery ? {
-    ...options.admissionRestartRecovery, hydrate: hydrateRecoverySourceUser,
+    ...options.admissionRestartRecovery, loadLatestSource: loadAdmissionRestartSource,
     advanceTimeline: advanceClientTimelineIdentityInTransaction,
   } : undefined;
   const backend: PgSessionsBackend = {
