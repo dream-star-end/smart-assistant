@@ -1,4 +1,4 @@
-import { BoxAccountResolverError } from './boxAccountResolver.js';
+import { BoxAccountResolverError, BoxEgressNotConfiguredError } from './boxAccountResolver.js';
 import test from "node:test";
 import assert from "node:assert/strict";
 import { BoxTextFetch, BoxTextFetchError } from "./boxTextFetch.js";
@@ -762,7 +762,7 @@ for (const fast of ["0", "1"]) test(`box-claude-* launch the staged interactive 
 
 for (const code of ['BOX_UID_PROXY_UNAVAILABLE', 'BOX_UID_PROXY_INVALID']) {
   test(`configuration ${code} is preserved without staging or model launch`, async () => {
-    const f = fixture({ resolverError: new BoxAccountResolverError(code) });
+    const f = fixture({ resolverError: new BoxEgressNotConfiguredError(code as "BOX_UID_PROXY_UNAVAILABLE" | "BOX_UID_PROXY_INVALID", code.endsWith("INVALID") ? "invalid" : "missing") });
     await assert.rejects(f.service.fetch(input), (error: unknown) =>
       error instanceof BoxTextFetchError && error.code === code);
     assert.deepEqual(f.stages, []);
@@ -770,3 +770,27 @@ for (const code of ['BOX_UID_PROXY_UNAVAILABLE', 'BOX_UID_PROXY_INVALID']) {
     assert.deepEqual(f.journalCalls, []);
   });
 }
+
+test("unproven UID failures retain transient classification before staging", async () => {
+  const f = fixture({ resolverError: new BoxAccountResolverError("BOX_UID_PROXY_UNAVAILABLE") });
+  await assert.rejects(f.service.fetch(input), (error: unknown) =>
+    error instanceof BoxTextFetchError && error.code === "BOX_TARGET_UNAVAILABLE");
+  assert.deepEqual(f.stages, []);
+  assert.deepEqual(f.journalCalls, []);
+});
+
+test("authorized egress repair lets the same text task complete without rewriting its context", async () => {
+  const opts: { resolverError?: Error } = {
+    resolverError: new BoxEgressNotConfiguredError("BOX_UID_PROXY_UNAVAILABLE", "missing") };
+  const f = fixture(opts);
+  const before = JSON.stringify(input.canonicalBody);
+  await assert.rejects(f.service.fetch(input), BoxTextFetchError);
+  assert.deepEqual(f.stages, []);
+  assert.deepEqual(f.journalCalls, []);
+  Reflect.deleteProperty(opts, "resolverError"); // local fixture models an authorized configuration repair
+  const response = await f.service.fetch({ ...input, requestId: "req-289-after-repair" });
+  assert.match(await response.text(), /answer/);
+  assert.equal(f.launches.length, 1);
+  assert.equal(f.journalCalls.filter((call) => call === "complete").length, 1);
+  assert.equal(JSON.stringify(input.canonicalBody), before);
+});

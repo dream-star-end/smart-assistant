@@ -1,3 +1,4 @@
+import { BoxEgressNotConfiguredError } from "./boxAccountResolver.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -1072,4 +1073,22 @@ test("OCV5-384: a re-staged conversation carries the session's native context re
     if (previous === undefined) Reflect.deleteProperty(process.env, "OC_BOX_FAST_NATIVE");
     else process.env.OC_BOX_FAST_NATIVE = previous;
   }
+});
+
+test("tool task keeps its exact context across confirmed missing egress and authorized repair", async () => {
+  const f = fixture({ directFinal: true });
+  const resolve = f.deps.resolveTarget;
+  const failure = new BoxEgressNotConfiguredError("BOX_UID_PROXY_UNAVAILABLE", "missing");
+  f.deps.resolveTarget = async () => { throw failure; };
+  const before = JSON.stringify(f.input.canonicalBody);
+  await assert.rejects(runBoxToolFirstRound(f.input, f.deps), (error: unknown) => error === failure);
+  assert.deepEqual(f.sequence, []);
+  assert.deepEqual(f.nativeLookups, []);
+  assert.equal(f.launches, 0);
+  f.deps.resolveTarget = resolve;
+  const result = await runBoxToolFirstRound({ ...f.input, requestId: "box-after-repair" }, f.deps);
+  assert.equal(result.kind, "final");
+  assert.equal(f.launches, 1);
+  assert.match(f.emitted.join(""), /direct answer/);
+  assert.equal(JSON.stringify(f.input.canonicalBody), before);
 });

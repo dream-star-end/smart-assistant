@@ -1,3 +1,4 @@
+import { BoxEgressNotConfiguredError } from "./boxAccountResolver.js";
 /** Off-by-default Box text transport behind the existing internal Messages
  * identity/authority/precheck/finalizer. Account selection and durable lease
  * journal are injected; do not enable without the latter's production wiring.
@@ -282,9 +283,8 @@ export class BoxTextFetch {
         resolved = await race(pendingTarget);
       } catch (error) {
         if (error instanceof BoxTextFetchError) throw error;
-        const code = (error as { code?: unknown } | null)?.code;
-        if (code === "BOX_UID_PROXY_UNAVAILABLE" || code === "BOX_UID_PROXY_INVALID") {
-          throw new BoxTextFetchError(code);
+        if (error instanceof BoxEgressNotConfiguredError) {
+          throw new BoxTextFetchError(error.code);
         }
         throw new BoxTextFetchError("BOX_TARGET_UNAVAILABLE");
       }

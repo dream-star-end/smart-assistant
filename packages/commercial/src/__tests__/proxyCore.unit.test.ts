@@ -1,3 +1,4 @@
+import { BoxAccountResolverError, BoxEgressNotConfiguredError } from "../http/proxy/boxAccountResolver.js";
 import { decodeUpstreamRetryHint } from '@openclaude/protocol';
 import { BoxTextFetchError } from '../http/proxy/boxTextFetch.js';
 /**
@@ -1153,3 +1154,17 @@ for (const code of ['BOX_UID_PROXY_UNAVAILABLE', 'BOX_UID_PROXY_INVALID']) {
     assert.equal(session.zeroizeCount, 1);
   });
 }
+
+test("Tool lane proof fails without charging; an unproven UID read stays retryable", async () => {
+  for (const proven of [true, false]) {
+    const failure = proven
+      ? new BoxEgressNotConfiguredError("BOX_UID_PROXY_UNAVAILABLE", "missing")
+      : new BoxAccountResolverError("BOX_UID_PROXY_UNAVAILABLE");
+    const { ctx, res, finalize } = buildCtx({ fetchImpl: async () => { throw failure; } });
+    await runUpstreamRoundTrip(ctx);
+    assert.equal(res.statusCode, proven ? 409 : 500);
+    assert.equal(finalize.failClientCalls.length, proven ? 1 : 0);
+    assert.equal(finalize.failCalls.length, proven ? 0 : 1);
+    assert.equal(finalize.commitCalls.length, 0);
+  }
+});

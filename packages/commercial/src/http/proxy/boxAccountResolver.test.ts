@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { Dispatcher, ProxyAgent } from "undici";
 import type { AccountRow, AccountToken, CursorTokenSnapshot } from "../../account-pool/store.js";
-import { BoxAccountResolver, BoxAccountResolverError, boxUnboundProxy, readBoxUidProxy,
+import { BoxAccountResolver, BoxAccountResolverError, BoxEgressNotConfiguredError, boxUnboundProxy, readBoxUidProxy,
   type BoxAccountResolverDeps } from "./boxAccountResolver.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
 
@@ -25,7 +25,8 @@ function fixture() {
     cursor_credential_kind: "session", cursor_sand_access_state: "SAND_ACCESS_STATE_GRANTED",
     oauth_expires_at: new Date(now + 3_600_000), cooldown_until: null,
     cursor_sand_usage_pct: 0, cursor_sand_next_reset_at: null,
-    cursor_billing_cycle_end: null } as AccountRow;
+    cursor_billing_cycle_end: null, egress_proxy: null, egress_proxy_id: null,
+    egress_host_uuid: null } as AccountRow;
   const calls: string[] = [];
   const dispatchers: unknown[] = [];
   let made = 0;
@@ -42,7 +43,8 @@ function fixture() {
     refresh: Buffer.from("synthetic-refresh"), expires_at: new Date(now + 3_600_000) });
   const deps: BoxAccountResolverDeps = {
     now: () => now, random: () => 0,
-    list: async () => [row], account: async () => row,
+    list: async () => [row], recoveryScope: async () => ({ complete: true, accounts: [row] }),
+    account: async () => row,
     token: async () => accountToken(), snapshot: async () => snapshot(),
     egress: async () => route === "unbound" ? { kind: "unbound" }
       : { kind: "unavailable", reason: "synthetic disabled egress" },
@@ -288,7 +290,7 @@ test("only OC_BOX_UNBOUND_EGRESS=host gives up the per-user proxy file", () => {
 });
 
 for (const code of ['BOX_UID_PROXY_UNAVAILABLE', 'BOX_UID_PROXY_INVALID']) {
-  test(`missing per-user egress ${code} stops before account access`, async () => {
+  test(`missing per-user egress ${code} stops before Box control`, async () => {
     const f = fixture();
     const resolver = new BoxAccountResolver({ ...f.deps, uidProxy: () => {
       throw new BoxAccountResolverError(code);
@@ -299,3 +301,130 @@ for (const code of ['BOX_UID_PROXY_UNAVAILABLE', 'BOX_UID_PROXY_INVALID']) {
     assert.equal(f.getMade(), 0);
   });
 }
+
+for (const reason of ["missing", "invalid"] as const) {
+  test(`confirmed ${reason} egress stops only an authorized launch with no alternative`, async () => {
+    const f = fixture();
+    const code = reason === "missing" ? "BOX_UID_PROXY_UNAVAILABLE" : "BOX_UID_PROXY_INVALID";
+    const original = new BoxAccountResolverError(code, undefined, reason);
+    f.deps.uidProxy = () => { throw original; };
+    await assert.rejects(f.resolver.resolve({ ...f.args, allowWakeIfHibernated: true }),
+      (error: unknown) => error instanceof BoxEgressNotConfiguredError
+        && error.code === code && error.uidProxyFailure === reason);
+    for (const mode of [{}, { adminProbe: true }, { noLaunch: true },
+      { interactiveExecTarget: true }]) {
+      await assert.rejects(f.resolver.resolve({ ...f.args, ...mode }),
+        (error: unknown) => error === original);
+    }
+    assert.deepEqual(f.calls, []);
+    assert.equal(f.getMade(), 0);
+  });
+}
+
+test("bound or uncertain eligible alternatives retain the original recovery path without probing them", async () => {
+  for (const binding of [
+    { egress_proxy: undefined, egress_proxy_id: undefined, egress_host_uuid: undefined }, { egress_proxy: null, egress_proxy_id: 7n, egress_host_uuid: null },
+    { egress_proxy: "http://synthetic.invalid", egress_proxy_id: null, egress_host_uuid: null },
+    { egress_proxy: null, egress_proxy_id: null, egress_host_uuid: "synthetic-host" },
+  ]) {
+    const f = fixture();
+    const row = (await f.deps.list())[0]!;
+    const other = { ...row, id: 21n, ...binding } as AccountRow;
+    const original = new BoxAccountResolverError("BOX_UID_PROXY_UNAVAILABLE", undefined, "missing");
+    f.deps.list = async () => [row, other];
+    f.deps.uidProxy = () => { throw original; };
+    const token = f.deps.token;
+    const snapshot = f.deps.snapshot;
+    const egress = f.deps.egress;
+    const accesses: bigint[] = [];
+    f.deps.token = async (id) => { accesses.push(id); return token(id); };
+    f.deps.snapshot = async (id) => { accesses.push(id); return snapshot(id); };
+    f.deps.egress = async (id, value) => { accesses.push(id); return egress(id, value); };
+    await assert.rejects(f.resolver.resolve({ ...f.args, allowWakeIfHibernated: true }),
+      (error: unknown) => error === original);
+    assert.deepEqual(accesses, [20n, 20n, 20n], "never read another account's credentials or egress");
+    assert.deepEqual(f.calls, []);
+    assert.equal(f.getMade(), 0);
+    await assert.rejects(f.resolver.resolve({ ...f.args, allowWakeIfHibernated: true,
+      requiredAccountId: 20n }), (error: unknown) => error instanceof BoxEgressNotConfiguredError);
+  }
+});
+
+test("explicitly unbound alternatives allow proof, while a transient read can recover unchanged", async () => {
+  const f = fixture();
+  const row = (await f.deps.list())[0]!;
+  f.deps.list = async () => [row, { ...row, id: 21n, egress_proxy: null,
+    egress_proxy_id: null, egress_host_uuid: null }];
+  f.deps.uidProxy = () => { throw new BoxAccountResolverError("BOX_UID_PROXY_INVALID", undefined, "invalid"); };
+  await assert.rejects(f.resolver.resolve({ ...f.args, allowWakeIfHibernated: true }),
+    (error: unknown) => error instanceof BoxEgressNotConfiguredError);
+  const transient = new BoxAccountResolverError("BOX_UID_PROXY_UNAVAILABLE");
+  let reads = 0;
+  f.deps.uidProxy = () => { if (++reads === 1) throw transient; return "http://127.0.0.1:18888"; };
+  await assert.rejects(f.resolver.resolve({ ...f.args, allowWakeIfHibernated: true }),
+    (error: unknown) => error === transient);
+  assert.deepEqual(f.calls, []);
+  const target = await f.resolver.resolve({ ...f.args, allowWakeIfHibernated: true });
+  assert.equal(target.accountId, 20n);
+  assert.ok(reads > 1, "a fresh read can recover on the existing next attempt");
+  assert.deepEqual(f.calls.map((url) => url.split("/").at(-1)), ["GetSandBoxRunState", "EnsureSandBox"]);
+  await target.dispose?.();
+});
+
+test("a bound account cooling down can recover on the existing next attempt", async () => {
+  const f = fixture();
+  let clock = now;
+  const row = (await f.deps.list())[0]!;
+  const cooling = { ...row, id: 21n, cooldown_until: new Date(now + 1_000),
+    egress_proxy: null, egress_proxy_id: 7n, egress_host_uuid: null } as AccountRow;
+  const original = new BoxAccountResolverError("BOX_UID_PROXY_UNAVAILABLE", undefined, "missing");
+  let uidReads = 0;
+  const resolver = new BoxAccountResolver({ ...f.deps, now: () => clock,
+    list: async () => [cooling, row],
+    account: async (id) => id === 21n ? cooling : row,
+    snapshot: async (id) => ({ ...(await f.deps.snapshot(id))!, id }),
+    token: async (id) => ({ ...(await f.deps.token(id))!, id }),
+    egress: async (id, token) => id === 21n
+      ? { kind: "ready", dispatcher: undefined as never } : f.deps.egress(id, token),
+    uidProxy: () => { uidReads++; throw original; } });
+  await assert.rejects(resolver.resolve({ ...f.args, allowWakeIfHibernated: true }),
+    (error: unknown) => error === original);
+  assert.deepEqual(f.calls, []);
+  clock += 1_001;
+  const target = await resolver.resolve({ ...f.args, allowWakeIfHibernated: true });
+  assert.equal(target.accountId, 21n);
+  assert.equal(uidReads, 1, "the recovered bound route does not borrow the missing user exit");
+  await target.dispose?.();
+});
+
+test("production active-only selection retains half-open recovery and uncertain snapshot retries", async () => {
+  const f = fixture();
+  let clock = now;
+  const row = (await f.deps.list())[0]!;
+  let cooling = { ...row, id: 21n, status: "cooldown", cooldown_until: new Date(now + 1_000),
+    egress_proxy_id: 7n } as AccountRow;
+  const original = new BoxAccountResolverError("BOX_UID_PROXY_UNAVAILABLE", undefined, "missing");
+  const resolver = new BoxAccountResolver({ ...f.deps, now: () => clock,
+    list: async () => [cooling, row].filter((account) => account.status === "active"),
+    recoveryScope: async () => ({ complete: true, accounts: [cooling, row] }),
+    account: async (id) => id === 21n ? cooling : row,
+    snapshot: async (id) => ({ ...(await f.deps.snapshot(id))!, id }),
+    token: async (id) => ({ ...(await f.deps.token(id))!, id }),
+    egress: async (id, token) => id === 21n
+      ? { kind: "ready", dispatcher: undefined as never } : f.deps.egress(id, token),
+    uidProxy: () => { throw original; } });
+  await assert.rejects(resolver.resolve({ ...f.args, allowWakeIfHibernated: true }),
+    (error: unknown) => error === original);
+  clock += 1_001;
+  cooling = { ...cooling, status: "active", cooldown_until: null }; // existing health halfOpen
+  const target = await resolver.resolve({ ...f.args, allowWakeIfHibernated: true });
+  assert.equal(target.accountId, 21n);
+  await target.dispose?.();
+  for (const recoveryScope of [undefined, async () => { throw new Error("metadata unavailable"); },
+    async () => ({ complete: false, accounts: [] })]) {
+    const uncertain = new BoxAccountResolver({ ...f.deps, recoveryScope,
+      uidProxy: () => { throw original; } });
+    await assert.rejects(uncertain.resolve({ ...f.args, allowWakeIfHibernated: true }),
+      (error: unknown) => error === original);
+  }
+});

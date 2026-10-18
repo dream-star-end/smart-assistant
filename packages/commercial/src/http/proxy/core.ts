@@ -1,3 +1,4 @@
+import { BoxEgressNotConfiguredError } from "./boxAccountResolver.js";
 /**
  * V3 Phase 4(2026-05-18 anthropicProxy.ts 三层拆分 §4.6):upstream round-trip 核心。
  *
@@ -682,8 +683,9 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     else if (observed.kind === "partial") incrAnthropicProxySettle("partial");
     else incrAnthropicProxySettle("aborted");
   } catch (err) {
-    const boxEgressNotConfigured = err instanceof BoxTextFetchError &&
-      ["BOX_UID_PROXY_UNAVAILABLE", "BOX_UID_PROXY_INVALID"].includes(err.code);
+    const boxEgressNotConfigured = err instanceof BoxEgressNotConfiguredError
+      || (err instanceof BoxTextFetchError
+        && ["BOX_UID_PROXY_UNAVAILABLE", "BOX_UID_PROXY_INVALID"].includes(err.code));
     const continuationConflict = err instanceof BoxContinuationDecisionError
       || (err instanceof BoxDurableJournalError && isContinuationConflict(err.code));
     const boxCapacityHeld = isBoxApiModel(body.model)

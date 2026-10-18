@@ -374,6 +374,12 @@ describe('classifyRunError', () => {
     )
   })
 
+  it('confirmed Box egress failure keeps the shared model-unavailable message and switch action', () => {
+    const failure = classifyRunError('API Error: 409 {"error":{"code":"BOX_EGRESS_NOT_CONFIGURED"}}')
+    assert.equal(failure.code, 'model_not_available')
+    assert.equal(failure.message, classifiedMessageForCode('model_not_available'))
+  })
+
   it('unknown: 普通运行时错误', () => {
     const r = classifyRunError('TypeError: Cannot read property foo of undefined')
     assert.equal(r.code, 'unknown')

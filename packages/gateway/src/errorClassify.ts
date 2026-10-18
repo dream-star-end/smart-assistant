@@ -79,7 +79,7 @@ const PATTERNS: Array<{
   {
     re: /\bBOX_EGRESS_NOT_CONFIGURED\b/,
     code: 'model_not_available',
-    message: '模型出口未配置，请联系管理员',
+    message: '当前模型不可用，请切换模型后再试',
   },
   // 429 / RATE_LIMITED — Anthropic 直接返还,或本地 RATE_LIMITED reject
   {
