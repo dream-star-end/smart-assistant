@@ -279,7 +279,29 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
   semantic.messages.forEach((message, index) => {
     if ((message as { role?: unknown } | null)?.role === "user") lastUser = index;
   });
-  const messages = remapForeignToolIds(semantic.messages, lastUser).map(readMessage);
+  // CCB may append a separate deferred-tools reminder after normalizing user
+  // messages. Keep the current text-only user tail together: staging its goal
+  // as unanswered history makes Claude's resume loader insert "No response
+  // requested." before the reminder. A completed tool result is a history
+  // boundary; merging it into a fresh prompt would require a live continuation.
+  const isTextUser = (raw: unknown): boolean => {
+    const message = raw as { role?: unknown; content?: unknown } | null;
+    if (message?.role !== "user") return false;
+    if (typeof message.content === "string") return true;
+    return Array.isArray(message.content) && message.content.length > 0
+      && message.content.every((block) => block !== null && typeof block === "object"
+        && !Array.isArray(block) && block.type === "text" && typeof block.text === "string");
+  };
+  let currentStart = lastUser;
+  if (isTextUser(semantic.messages[lastUser])) {
+    for (let index = lastUser - 1; index >= 0; index--) {
+      const message = semantic.messages[index] as { role?: unknown; content?: unknown } | null;
+      if (message?.role === "system") continue;
+      if (!isTextUser(message)) break;
+      currentStart = index;
+    }
+  }
+  const messages = remapForeignToolIds(semantic.messages, currentStart).map(readMessage);
   let currentIndex = -1;
   for (let index = messages.length - 1; index >= 0; index--) {
     if (messages[index]?.role === "user") { currentIndex = index; break; }
@@ -288,6 +310,12 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
     throw new BoxMessagesShapeError("BOX_CURRENT_USER_REQUIRED");
   }
   let current = messages[currentIndex]!;
+  if (currentStart < currentIndex) {
+    current = { ...current, content: messages.slice(currentStart, currentIndex + 1)
+      .filter((message) => message.role === "user")
+      .flatMap((message) => typeof message.content === "string"
+        ? [{ type: "text", text: message.content }] : blocks(message.content)) };
+  }
   let resumed = false;
   let prompt: Block[] | null = null;
   if (blocks(current.content).some((block) => block.type === "tool_result")) {
@@ -333,7 +361,7 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
   for (const message of messages) {
     if (message.role === "system") promptParts.push(systemText(message.content));
   }
-  const history = messages.slice(0, currentIndex).filter((message) => message.role !== "system");
+  const history = messages.slice(0, currentStart).filter((message) => message.role !== "system");
   if (resumed) {
     history.push(current);
     current = { ...current, content: prompt ?? BOX_CLI_RESUME_PROMPT };
