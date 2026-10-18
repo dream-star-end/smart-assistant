@@ -14,8 +14,10 @@
 
 缺Box出口目录/文件作为显式、白名单、不可重试的配置错误贯穿resolver→Box fetch→proxy→CCB parser/engine→gateway。读取权限和符号链接校验保留；不泄露路径/凭据；真实网络/5xx仍走现有策略。拒绝前不启动Box，不把配置错误包装为供应商capacity。
 
-429继续透明自动重试，gateway为产品重试唯一owner（产品CLI maxRetries=0）。保留供应商Retry-After秒数和HTTP日期，通过结构化terminal/turn结果传播retryAfterMs，绝不解析自然语言/塞入prompt。等待至少Retry-After，否则指数退避+抖动。对429豁免same-error三次提前breaker，但共享最大重试次数、Stop/连接存活/取消约束仍有效；5xxbreaker不变。含CLI/proxy原有Retry-After解析的兼容修正，防止固定60秒掩盖有效日期，不多层重复sleep。
+429继续透明自动重试，实际HTTP owner proxy在原请求尚未输出前对可安全重放的静态API做窄重试。当前实际official-cc不是仓内fork，不能靠修改fork terminal sideband假装覆盖。保持CLI maxRetries=0，固定同一session/key/endpoint/headers/dispatcher与body字节，不改prompt。按现有parseRetryAfterMs支持秒/HTTP日期，delay=max(Retry-After,指数退避+抖动)，缺头走指数。最多10次HTTP尝试，总等待预算240秒，超过预算时不截短Retry-After提前重发，返回明确rate-limited exhausted。保留现有quota_exhausted分类及已声明fallback优先级。Box、nonreplayable和专用transport不纳入自动重发。
+
+中间429只上报已有pool健康结果，不finalize、不release、不换号；最终success只commit一次，最终failure只fail一次。等待共享现有ac.signal，可取消，取消后不得再发。预算比300秒软预留和30分钟journal/slot期限更短。最终429用明确机器错误code表明proxy已拥有重试预算；必须用实际官方CLI+loopback mock证明其在is_error terminal诊断中保留。gateway仅从error terminal诊断识别该机器码并停止外层重复重试，普通用户/assistant正文绝不能触发。若stock CLI丢弃该标记，停止此设计，不提交成已覆盖，另设计鉴权request-scoped sidechannel。其它engine现有自动重试不缩减；Grok/AG没有同样可重放API路径，不能以CCB结论冒称全引擎覆盖。
 
 ## 测试和收益
 
-fake clock/transport：秒/日期/缺失/无效Retry-After；3次429后成功；不早于供应商要求；指数+抖动；最大次数/Stop取消不再发；5xx原breaker；缺出口单次明确失败、无启动/无收费。成功TTFT预计0秒；缺出口同类失败可少等约7.828秒。429不再承诺少等8.374秒，按供应商恢复时刻可能更久但提高成功机会。风险中等，结构化sideband兼容和重试边界需要完整回归。
+fake clock/transport：秒/日期/缺失/无效Retry-After；3次429后成功；不早于供应商要求；指数+抖动；总等待预算/最大次数/Stop取消不再发；中间失败不结算、成功只扣一次；5xx原breaker；缺出口单次明确失败、无启动/无收费；stock CLI真实loopback mock（不接供应商）验证exhausted及配置机器码保留。成功TTFT预计0秒；缺出口同类失败可少等约7.828秒。429不再承诺少等8.374秒，按供应商恢复时刻可能更久但提高成功机会。风险中等，结构化sideband兼容和重试边界需要完整回归。
