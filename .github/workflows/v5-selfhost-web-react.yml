@@ -20,10 +20,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  web-react:
-    name: selfhost-web-react
+  # OCV5-497: shard across isolated runners; retain the existing worker/timeouts.
+  web-react-shards:
+    name: selfhost-web-react (${{ matrix.shard }}/2)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,8 +42,69 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Check shard tooling
+        run: node --test .github/scripts/web-react-shards.test.mjs
+
+      - name: Collect full web test inventory
+        if: matrix.shard == 1
+        working-directory: packages/web-react
+        run: node ../../node_modules/vitest/vitest.mjs list --filesOnly --json="$RUNNER_TEMP/web-react-inventory.json"
+
       - name: Run web-react unit tests
-        run: npm run test:web-react
+        run: npm run test --workspace packages/web-react -- --shard=${{ matrix.shard }}/2 --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/web-react-report.json"
+
+      - name: Upload shard report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-web-react-report-${{ matrix.shard }}
+          path: ${{ runner.temp }}/web-react-report.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload full inventory
+        if: ${{ always() && matrix.shard == 1 }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-web-react-inventory
+          path: ${{ runner.temp }}/web-react-inventory.json
+          if-no-files-found: error
+          retention-days: 7
+
+  web-react:
+    name: selfhost-web-react
+    if: ${{ always() }}
+    needs: web-react-shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every shard job to succeed
+        env:
+          SHARD_RESULT: ${{ needs.web-react-shards.result }}
+        run: test "$SHARD_RESULT" = success
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Download test evidence
+        uses: actions/download-artifact@v4
+        with:
+          pattern: selfhost-web-react-*
+          path: ${{ runner.temp }}/web-react-shards
+
+      - name: Verify complete test-file coverage
+        env:
+          SHARD_RESULT: ${{ needs.web-react-shards.result }}
+        run: |
+          node .github/scripts/check-web-react-shards.mjs "$SHARD_RESULT" \
+            "$RUNNER_TEMP/web-react-shards/selfhost-web-react-inventory/web-react-inventory.json" \
+            "$RUNNER_TEMP/web-react-shards/selfhost-web-react-report-1/web-react-report.json" \
+            "$RUNNER_TEMP/web-react-shards/selfhost-web-react-report-2/web-react-report.json"
 
   web-react-browser:
     # 与 v5-ci 的 web-react-browser 同一命令与同样的 runner 准备(CJK 字体 + 产物目录)。OCV5-355 清绿后加入:
