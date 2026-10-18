@@ -49,7 +49,7 @@ test('availability is captured per build, with undefined distinct from empty', (
 })
 
 test('complete prompts preserve current availability and exact warm rebuild output', async () => {
-  for (const provider of ['ccb', 'grok-build', 'antigravity'] as const) {
+  for (const provider of ['ccb', 'grok', 'antigravity'] as const) {
     const ctx = { agentId: 'nonexistent-sanitizer-test', provider, availableMcpTools: ['skill_view'] }
     const a = await buildPromptContext(ctx)
     const b = await buildPromptContext(ctx)

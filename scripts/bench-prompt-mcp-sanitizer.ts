@@ -19,7 +19,7 @@ function baseline(
 }
 
 const slots = Array.from({ length: 14 }, (_, i) =>
-  (`section${i}: ` + PLATFORM_MCP_TOOL_NAMES.map(n => `${n}(query)`).join(' 中文 ')).repeat(8))
+  (`section${i}: ${PLATFORM_MCP_TOOL_NAMES.map(n => `${n}(query)`).join(' 中文 ')}`).repeat(8))
 const results = []
 for (const [name, tools] of [['legacy', undefined], ['all', [...PLATFORM_MCP_TOOL_NAMES]], ['partial', ['skill_view', 'skill_search']]] as const) {
   const available = tools === undefined ? undefined : [...tools]
