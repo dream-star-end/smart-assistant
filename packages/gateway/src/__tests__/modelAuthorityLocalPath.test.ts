@@ -55,6 +55,7 @@ import {
   resolveLocalExecutionIfEnforced,
 } from '../server.js'
 import { SessionManager } from '../sessionManager.js'
+import { resolveTurnRuntime } from '../subprocessSpawnConfig.js'
 
 // ── 投影脚手架 ───────────────────────────────────────────────────────────────
 
@@ -1142,4 +1143,19 @@ describe('OCV5-477 billed_delegate / billed_advisor', () => {
       (err: unknown) => (err as { code?: string })?.code === 'DELEGATE_CODEX_UNSUPPORTED',
     )
   })
+})
+
+
+test('OCV5-518 local delegate forwards the catalog owner into the actual turn descriptor', async () => {
+  const model = 'box-api-claude-haiku-5-5'
+  installCatalog({ extraModels: [row(model, 'ccb', { provider_id: 'box_cli', supports_thinking: false,
+    supported_efforts: ['low'], context_owner: 'box-native-v1' })] })
+  const runtime = await resolveTurnRuntime(undefined, model, ON, 'ccb')
+  assert.equal(runtime.descriptor?.contextOwner, 'box-native-v1')
+  assert.equal(runtime.descriptor?.canonicalModel, model)
+  assert.equal(runtime.headers?.authority, undefined)
+  assert.equal(runtime.headers?.lease, undefined)
+  assert.ok(runtime.headers?.localCatalog)
+  const plain = await resolveTurnRuntime(undefined, 'glm-5.2', ON, 'ccb')
+  assert.equal(plain.descriptor?.contextOwner, undefined)
 })

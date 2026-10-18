@@ -14,10 +14,12 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, test } from 'node:test'
+
+import { MODEL_CATALOG_PROJECTION_FORMAT } from '@openclaude/protocol'
 
 import {
   AGENT_COST_OVERRIDE_TTL_MS,
@@ -674,4 +676,152 @@ test('late old epoch validation cannot overwrite a newer agent-override full fet
   assert.equal(finalView.projectionRevision, 'new')
   assert.equal(lookupCatalogAgentMultiplier(finalView, 'a'), '2.000')
   lkg.cleanup()
+})
+
+
+const BOX_OWNER_MODEL = 'box-api-claude-haiku-5-5'
+function boxOwnerBody(current: boolean) {
+  return { ...CATALOG_BODY,
+    ...(current ? { projection_format: MODEL_CATALOG_PROJECTION_FORMAT } : {}),
+    // Keep pricing on the legacy cache so a pricing upgrade cannot mask this test.
+    models: [{ ...CATALOG_BODY.models[0], model_id: BOX_OWNER_MODEL, provider_id: 'box_cli',
+      supports_thinking: false, supported_efforts: ['low'],
+      ...(current ? { context_owner: 'box-native-v1' } : {}) }] }
+}
+
+describe('OCV5-518 owner projection and cold LKG upgrade', () => {
+  test('same epoch and pricing automatically upgrade a legacy LKG and preserve owner across another cold start', async () => {
+    const lkg = tmpLkg()
+    try {
+      writeFileSync(lkg.path, JSON.stringify(boxOwnerBody(false)))
+      const calls: Call[] = []
+      const fetcher = fakeFetcher({ calls,
+        epoch: { status: 200, body: { epoch: '5', availability_revision: 'availability-1', projection_format: MODEL_CATALOG_PROJECTION_FORMAT } },
+        catalog: { status: 200, body: boxOwnerBody(true) } })
+      const client = new ModelCatalogClient({ env: ENV, lkgPath: lkg.path, fetcher })
+      const view = await client.getView()
+      assert.equal(view.resolve(BOX_OWNER_MODEL)?.contextOwner, 'box-native-v1')
+      assert.equal(view.projectionFormat, MODEL_CATALOG_PROJECTION_FORMAT)
+      assert.deepEqual(calls.map(c => c.path), [MODEL_CATALOG_EPOCH_PATH, MODEL_CATALOG_PATH])
+      const persisted = JSON.parse(readFileSync(lkg.path, 'utf8'))
+      assert.equal(persisted.models[0].context_owner, 'box-native-v1')
+      assert.equal(persisted.projection_format, MODEL_CATALOG_PROJECTION_FORMAT)
+      calls.length = 0
+      const cold = await new ModelCatalogClient({ env: ENV, lkgPath: lkg.path, fetcher }).getView()
+      assert.equal(cold.resolve(BOX_OWNER_MODEL)?.contextOwner, 'box-native-v1')
+      assert.deepEqual(calls.map(c => c.path), [MODEL_CATALOG_EPOCH_PATH])
+      const token = JSON.parse(Buffer.from(await client.getToken(), 'base64url').toString())
+      assert.deepEqual(token, { v: 1, kind: LOCAL_CATALOG_KIND, projectionRevision: CATALOG_BODY.projection_revision, securityEpoch: '5' })
+    } finally { lkg.cleanup() }
+  })
+
+  test('old-master response retains legacy format and upgrades after the master changes at the same epoch', async () => {
+    const lkg = tmpLkg()
+    let current = false
+    let full = 0
+    const response = (body: unknown) => ({ statusCode: 200,
+      body: (async function* () { yield Buffer.from(JSON.stringify(body)) })() })
+    try {
+      const client = new ModelCatalogClient({ env: ENV, lkgPath: lkg.path,
+        fetcher: (async (url: string) => {
+          if (url.includes(MODEL_CATALOG_EPOCH_PATH)) return response({ epoch: '5', availability_revision: 'availability-1', ...(current ? { projection_format: MODEL_CATALOG_PROJECTION_FORMAT } : {}) })
+          full++; return response(boxOwnerBody(current))
+        }) as any })
+      assert.equal((await client.getView()).projectionFormat, 1)
+      assert.equal((await client.getRoutingView()).resolve(BOX_OWNER_MODEL)?.contextOwner, undefined)
+      assert.equal(full, 1)
+      current = true
+      assert.equal((await client.getRoutingView()).resolve(BOX_OWNER_MODEL)?.contextOwner, 'box-native-v1')
+      assert.equal(full, 2)
+    } finally { lkg.cleanup() }
+  })
+
+  test('a new format state cannot reuse an earlier in-flight legacy full response', async () => {
+    const lkg = tmpLkg()
+    let full = 0
+    let releaseOld!: () => void
+    const oldGate = new Promise<void>(r => { releaseOld = r })
+    const response = (body: unknown) => ({ statusCode: 200,
+      body: (async function* () { yield Buffer.from(JSON.stringify(body)) })() })
+    try {
+      const client = new ModelCatalogClient({ env: ENV, lkgPath: lkg.path, now: () => AGENT_COST_OVERRIDE_TTL_MS + 1,
+        fetcher: (async (url: string) => {
+          if (url.includes(MODEL_CATALOG_EPOCH_PATH)) return response({ epoch: '5', availability_revision: 'availability-1', projection_format: MODEL_CATALOG_PROJECTION_FORMAT })
+          full++
+          if (full === 2) await oldGate
+          return response({ ...boxOwnerBody(full >= 3), agent_cost_overrides: { a: full >= 3 ? '2.000' : '1.000' } })
+        }) as any })
+      await client.getView()
+      // Force the independent override refresh to begin before the format probe.
+      ;(client as any).agentOverridesVerifiedAt = 0
+      const oldFull = client.lookupAgentCostMultiplier('a')
+      await new Promise(r => setTimeout(r, 0))
+      assert.equal(full, 2)
+      const routing = client.getRoutingView()
+      await new Promise(r => setTimeout(r, 0))
+      releaseOld()
+      await oldFull
+      const view = await routing
+      assert.equal(view.projectionFormat, MODEL_CATALOG_PROJECTION_FORMAT)
+      assert.equal(view.resolve(BOX_OWNER_MODEL)?.contextOwner, 'box-native-v1')
+      assert.equal(full, 3)
+    } finally { releaseOld?.(); lkg.cleanup() }
+  })
+
+  test('malformed or future projection formats and forged owner rows remain rejected', () => {
+    for (const projection_format of [null, '2', 0, 3]) {
+      assert.throws(() => parseCatalogResponse({ ...boxOwnerBody(true), projection_format }), ModelCatalogUnavailableError)
+    }
+    for (const extra of [{ context_owner: 'other' }, { provider_id: 'ark' }, { model_id: 'glm-5.2' }, { engine: 'codex' }]) {
+      const body = boxOwnerBody(true)
+      assert.throws(() => parseCatalogResponse({ ...body, models: [{ ...body.models[0], ...extra }] }), ModelCatalogUnavailableError)
+    }
+  })
+
+  test('format drift with an unavailable full response does not bless the legacy LKG', async () => {
+    const lkg = tmpLkg()
+    try {
+      writeFileSync(lkg.path, JSON.stringify(boxOwnerBody(false)))
+      const client = new ModelCatalogClient({ env: ENV, lkgPath: lkg.path,
+        fetcher: fakeFetcher({ epoch: { status: 200, body: { epoch: '5', projection_format: MODEL_CATALOG_PROJECTION_FORMAT } }, catalog: 'network-error' }) })
+      await assert.rejects(client.getView(), ModelCatalogUnavailableError)
+      assert.equal(JSON.parse(readFileSync(lkg.path, 'utf8')).projection_format, undefined)
+    } finally { lkg.cleanup() }
+  })
+})
+
+test('OCV5-518 format upgrade cannot reuse an in-flight snapshot with stale routing availability', async () => {
+  const lkg = tmpLkg()
+  let full = 0
+  let releaseOld!: () => void
+  const oldGate = new Promise<void>(resolve => { releaseOld = resolve })
+  const response = (body: unknown) => ({ statusCode: 200,
+    body: (async function* () { yield Buffer.from(JSON.stringify(body)) })() })
+  try {
+    const client = new ModelCatalogClient({ env: ENV, lkgPath: lkg.path,
+      now: () => AGENT_COST_OVERRIDE_TTL_MS + 1,
+      fetcher: (async (url: string) => {
+        if (url.includes(MODEL_CATALOG_EPOCH_PATH)) return response({ epoch: '5',
+          availability_revision: 'availability-2', projection_format: MODEL_CATALOG_PROJECTION_FORMAT })
+        full++
+        if (full === 2) await oldGate
+        const body = boxOwnerBody(full >= 2)
+        return response({ ...body, availability_revision: full >= 3 ? 'availability-2' : 'availability-1',
+          models: body.models.map(row => ({ ...row, available: full < 3 })),
+          agent_cost_overrides: { a: '1.000' } })
+      }) as any })
+    await client.getView()
+    ;(client as any).agentOverridesVerifiedAt = 0
+    const earlierFull = client.lookupAgentCostMultiplier('a')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    assert.equal(full, 2)
+    const routing = client.getRoutingView()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    releaseOld()
+    await earlierFull
+    const view = await routing
+    assert.equal(view.availabilityRevision, 'availability-2')
+    assert.equal(view.isRoutable(BOX_OWNER_MODEL), false)
+    assert.equal(full, 3)
+  } finally { releaseOld?.(); lkg.cleanup() }
 })
