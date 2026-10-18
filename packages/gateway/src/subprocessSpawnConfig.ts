@@ -591,6 +591,7 @@ export async function resolveTurnRuntime(
       supportsThinking: row.supportsThinking,
       supportsVision: row.supportsVision,
       supportedEfforts: [...row.supportedEfforts],
+      ...(row.contextOwner ? { contextOwner: row.contextOwner } : {}),
     },
   }
 }
