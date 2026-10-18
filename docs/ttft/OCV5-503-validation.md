@@ -16,3 +16,5 @@
 计划独立审查APPROVED；全diff独立审查、前缀等价、typecheck/lint、托管CI和真实缓存门仍需补齐。PR保持草稿，不能合并/发布或交为验收通过。
 
 远端证据：H/g500-ttft-approved-20261018/step4，H=/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308。
+
+独立复核修正：初版changed基准给candidate追加字符而baseline未追加，且调度与产品不同，不可用来判全部路径不变慢。现改同输入/同调度/交错配对，并包含静态布局动态slot。派生缓存改成惰性SHA与token accessor，避免为原本未估算的动态slot新增扫描，并保留final SHA在prompt_context_timing日志之后；新增缓存UTF8预算计数仍在日志前，性能以完整外层耗时为准。旧基准完整保留，不隐藏cold/churn/bypass结果；新实测待补。

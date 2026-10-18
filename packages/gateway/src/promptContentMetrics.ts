@@ -2,26 +2,18 @@ import { estimateModelHistoryTokens } from '@openclaude/protocol'
 
 export interface PromptContentMetrics {
   readonly bytes: number
-  readonly sha256: string
+  readonly sha256: Promise<string>
   readonly tokensEstimate: number
 }
 
-async function deriveMetrics(content: string): Promise<Readonly<PromptContentMetrics>> {
-  const data = new TextEncoder().encode(content)
-  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', data))
-  return Object.freeze({
-    bytes: data.byteLength,
-    sha256: Array.from(digest, (byte) => byte.toString(16).padStart(2, '0')).join(''),
-    tokensEstimate: estimateModelHistoryTokens(content),
-  })
+async function deriveSha256(content: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(content)))
+  return Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('')
 }
 
-/** Only pure derivatives of a complete, already-read string. No source/authority cache. */
+/** Pure derivatives only. Lazy access preserves the caller's original work/timing boundaries. */
 export class PromptContentMetricsCache {
-  private readonly entries = new Map<string, {
-    bytes: number
-    value: Promise<Readonly<PromptContentMetrics>>
-  }>()
+  private readonly entries = new Map<string, { bytes: number; value: Readonly<PromptContentMetrics> }>()
   private retainedBytes = 0
 
   constructor(private readonly maxEntries = 128, private readonly maxBytes = 2 * 1024 * 1024) {
@@ -31,7 +23,7 @@ export class PromptContentMetricsCache {
     }
   }
 
-  get(content: string): Promise<Readonly<PromptContentMetrics>> {
+  get(content: string): Readonly<PromptContentMetrics> {
     const found = this.entries.get(content)
     if (found) {
       this.entries.delete(content)
@@ -39,22 +31,34 @@ export class PromptContentMetricsCache {
       return found.value
     }
     const bytes = Buffer.byteLength(content, 'utf8')
-    if (this.maxEntries === 0 || bytes > this.maxBytes) return deriveMetrics(content)
+    let sha256: Promise<string> | undefined
+    let tokensEstimate: number | undefined
+    const entry = { bytes, value: Object.freeze({
+      bytes,
+      get sha256(): Promise<string> {
+        return sha256 ??= deriveSha256(content).catch((error: unknown) => {
+          removeFailedEntry()
+          throw error
+        })
+      },
+      get tokensEstimate(): number {
+        return tokensEstimate ??= estimateModelHistoryTokens(content)
+      },
+    }) }
+    const removeFailedEntry = () => {
+      // A retired in-flight calculation must never remove a newer entry.
+      if (this.entries.get(content) === entry) {
+        this.entries.delete(content)
+        this.retainedBytes -= bytes
+      }
+    }
+    if (this.maxEntries === 0 || bytes > this.maxBytes) return entry.value
     while (this.entries.size >= this.maxEntries || this.retainedBytes + bytes > this.maxBytes) {
       const oldest = this.entries.entries().next().value
       if (!oldest) break
       this.entries.delete(oldest[0])
       this.retainedBytes -= oldest[1].bytes
     }
-    const entry = { bytes, value: deriveMetrics(content) }
-    entry.value = entry.value.catch((error: unknown) => {
-      // An evicted in-flight calculation must never delete/repopulate a newer entry.
-      if (this.entries.get(content) === entry) {
-        this.entries.delete(content)
-        this.retainedBytes -= bytes
-      }
-      throw error
-    })
     this.entries.set(content, entry)
     this.retainedBytes += bytes
     return entry.value

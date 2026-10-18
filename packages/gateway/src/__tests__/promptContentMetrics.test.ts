@@ -10,14 +10,13 @@ test('exact UTF8 content derivatives, immutable values and single-flight hits', 
   const text = 'same prefix 中文 🐈\r\n'
   const first = cache.get(text)
   assert.equal(cache.get(text), first)
-  const value = await first
-  assert.deepEqual(value, {
-    bytes: Buffer.byteLength(text),
-    sha256: createHash('sha256').update(text).digest('hex'),
-    tokensEstimate: estimateModelHistoryTokens(text),
-  })
+  const value = first
+  assert.equal(cache.get(text).sha256, value.sha256)
+  assert.equal(value.bytes, Buffer.byteLength(text))
+  assert.equal(await value.sha256, createHash('sha256').update(text).digest('hex'))
+  assert.equal(value.tokensEstimate, estimateModelHistoryTokens(text))
   assert.ok(Object.isFrozen(value))
-  assert.notEqual((await cache.get(text + '.')).sha256, value.sha256)
+  assert.notEqual(await cache.get(text + '.').sha256, await value.sha256)
   assert.equal(await cache.get(text), value)
 })
 
@@ -25,11 +24,12 @@ test('LRU entry bound promotes hits and does not reinsert completed evictions', 
   const cache = new PromptContentMetricsCache(2, 1000)
   const a = cache.get('a')
   const b = cache.get('b')
+  const pending = [a.sha256, b.sha256]
   assert.equal(cache.get('a'), a)
   await cache.get('c')
   assert.equal(cache.get('a'), a)
   assert.notEqual(cache.get('b'), b)
-  await Promise.all([a, b])
+  await Promise.all(pending)
   assert.equal(cache.size.entries, 2)
 })
 
@@ -73,8 +73,8 @@ test('failed derivations are removed and a later call can recover', async (t) =>
     if (fail) return Promise.reject(new Error('injected digest failure'))
     return digest(...args)
   })
-  await assert.rejects(cache.get('retry'), /injected digest failure/)
+  await assert.rejects(cache.get('retry').sha256, /injected digest failure/)
   assert.deepEqual(cache.size, { entries: 0, bytes: 0 })
   fail = false
-  assert.equal((await cache.get('retry')).sha256, createHash('sha256').update('retry').digest('hex'))
+  assert.equal(await cache.get('retry').sha256, createHash('sha256').update('retry').digest('hex'))
 })

@@ -1974,21 +1974,21 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   if (resolvePromptUserRole(ctx) === 'admin') {
     content = stripBaselineRestrictions(content)
   }
-  const metrics = await Promise.all(effectiveSlots.map((slot) => promptContentMetrics.get(slot.content)))
-  const contentMetrics = await promptContentMetrics.get(content)
-  const applied: PromptSlotApplied[] = effectiveSlots.map((s, index) => {
+  const metrics = effectiveSlots.map((slot) => promptContentMetrics.get(slot.content))
+  const applied: PromptSlotApplied[] = await Promise.all(effectiveSlots.map(async (s, index) => {
     const metric = metrics[index]!
     const base: PromptSlotApplied = {
       name: s.name,
       bytes: metric.bytes,
-      sha256: metric.sha256,
+      sha256: await metric.sha256,
     }
     // Mutable turn metadata is never retained in the content-only cache.
     if ((s as ModelHintSlot).canonicalId !== undefined) {
       base.meta = { model_id: (s as ModelHintSlot).canonicalId }
     }
     return base
-  })
+  }))
+  const contentMetrics = promptContentMetrics.get(content)
   const slotTokensEstimate = Object.fromEntries(
     ['ENV', 'SOUL', 'USER', 'PROJECT', 'INTELLIGENT_UI', 'AGENTS', 'SKILLS',
       'SKILLS_LITERATURE', 'MEMORY', 'PROJECT_MEMORY', 'TOOLS', 'MODEL_HINT', 'RESEARCH', 'REPO']
@@ -2001,7 +2001,7 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   })
   return {
     content,
-    contentSha256: contentMetrics.sha256,
+    contentSha256: await contentMetrics.sha256,
     applied,
     intelligentUi,
     frozenProjectContext:
