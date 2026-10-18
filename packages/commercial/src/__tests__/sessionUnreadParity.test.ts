@@ -16,7 +16,10 @@ const rollback0240 = join(here, "../db/rollbacks/0240_client_session_last_read_a
 const migration0241 = join(here, "../db/migrations/0241_raise_last_read_watermark.sql");
 const rollback0241 = join(here, "../db/rollbacks/0241_raise_last_read_watermark.sql");
 const backendSrc = readFileSync(join(here, "../db/pgSessionsBackend.ts"), "utf8");
-const sqliteSrc = readFileSync(join(here, "../../../storage/src/sessionsDb.ts"), "utf8");
+// sessionsDb.ts plus the modules split out of it (OCV5-485): the SQLite side of the parity check
+const sqliteSrc = ["sessionsDb.ts", "sessionsDbProjects.ts", "sessionsDbSidebar.ts"]
+  .map((f) => readFileSync(join(here, "../../../storage/src", f), "utf8"))
+  .join("\n");
 const metadata = JSON.parse(
   readFileSync(join(here, "../../../../deploy/v5/release-metadata.json"), "utf8"),
 ) as { requiredMigrations: string[] };

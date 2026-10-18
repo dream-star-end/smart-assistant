@@ -1,1 +1,16 @@
-[]
+[
+  {
+    "path": "packages/web-react/src/App.tsx",
+    "maxLines": 4734,
+    "ticket": "OCV5-472",
+    "reason": "A1 split reverted (first-screen gzip budget exceeded by object-key plumbing); App.tsx is back at its pre-A1 size while A1 is redone with smaller per-domain hooks/components",
+    "expires": "2026-10-31"
+  },
+  {
+    "path": "scripts/check-v5-box-incident-proofs.ts",
+    "maxLines": 3648,
+    "ticket": "OCV5-491",
+    "reason": "verbatim port of the commercial Box incident proofs gate (OCV5-488); both trees keep the file identical for two-tree sync, so it is split in both trees together with the OCV5-491 selfhost Box catch-up; OCV5-488 PR-2 adds the process-absent and idle-stop proofs and PR-3 the container-rebuilt and any-refusal proofs",
+    "expires": "2026-11-16"
+  }
+]

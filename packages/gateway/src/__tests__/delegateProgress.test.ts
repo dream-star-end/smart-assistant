@@ -1,3 +1,4 @@
+import { readGatewaySource } from './helpers/gatewaySource.js'
 import * as assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -493,10 +494,8 @@ describe('parent live-row working-detail from delegate_progress', () => {
   })
 
   it('_runDelegateTaskCore emitProgress forwards parent working-detail on the existing turn_status channel', () => {
-    const src = readFileSync(
-      join(fileURLToPath(new URL('..', import.meta.url)), 'server.ts'),
-      'utf8',
-    )
+    // server.ts + split-out modules (FINDINGS §7.6: delegate runtime and turn frames moved out)
+    const src = readGatewaySource()
     assert.match(src, /formatDelegateParentWorkingDetail/)
     assert.match(src, /_buildTurnStatusFrame\([\s\S]{0,500}status: 'working'/)
   })

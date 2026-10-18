@@ -20,13 +20,11 @@ import {
   resolveProjectCwd,
   writeProjectInstructions,
 } from '@openclaude/storage'
-import { filterUserVisibleAgentsForManagement, isHiddenSystemAgentId } from '../agentVisibility.js'
 import { verifyJwt } from '../auth.js'
-import { ModelCatalogUnavailableError, getLocalCatalogView } from '../modelCatalogClient.js'
+import { ModelCatalogUnavailableError } from '../modelCatalogClient.js'
 import { previewProjectContext, summarizeProjectContext } from '../projectContextPreview.js'
 import { createActivity, listActivities } from './db/activity.js'
 import { createComment, listComments } from './db/comments.js'
-import { COST_GROUP_BY, queryCostStats, ymdRangeMs } from './db/costStats.js'
 import {
   TaskboardCrossProjectError,
   TaskboardCycleError,
@@ -41,22 +39,16 @@ import {
   isTaskboardError,
 } from './db/index.js'
 import {
-  createPipeline,
-  createStage,
   getDefaultPipeline,
   getPipeline,
   getStage,
   listPipelines,
   listStages,
-  reorderStages,
-  updatePipeline,
-  updateStage,
 } from './db/pipelines.js'
 import {
   archiveProject,
   createProject,
   getProject,
-  getProjectByKey,
   listProjects,
   updateProject,
 } from './db/projects.js'
@@ -76,16 +68,9 @@ import {
   type TaskboardUsage,
   getSettings,
   getUsage,
-  getUsageWithReferenceCosts,
-  updateSettings,
 } from './db/settings.js'
 import {
-  applyTemplate,
   applyTemplates,
-  createTemplateFromPipeline,
-  deleteTemplate,
-  getTemplate,
-  listTemplates,
 } from './db/templates.js'
 import {
   countTicketsByTypeForBoardDefault,
@@ -94,21 +79,15 @@ import {
   listTickets,
   updateTicket,
 } from './db/tickets.js'
-import { buildWeeklyReport, currentWeekPeriod, periodFromIsoWeek } from './db/weeklyReport.js'
 import {
   TICKET_STATUS_LABEL,
   type Actor,
   type AuthorKind,
-  GUARDRAIL_DEFAULTS,
   alignedLeaseTtlMs,
-  type OnFailureAction,
-  type OnSuccessAction,
   type PipelineStage,
   RELATION_KINDS,
   type RelationKind,
   type RunStatus,
-  STAGE_KINDS,
-  type StageKind,
   TICKET_PRIORITIES,
   TICKET_SEVERITIES,
   TICKET_SOURCES,
@@ -122,7 +101,6 @@ import {
   type TicketType,
   buildPatrolSessionKey,
 } from './domain.js'
-import { parseEntryCondition } from './entryCondition.js'
 import {
   listProjectWorkspaceDir,
   openProjectWorkspaceFile,
@@ -137,10 +115,48 @@ import {
   listAllowedMoves,
   publicStageRef,
 } from './moveIntent.js'
-import { zonedYmd } from './notify.js'
 import { hasOpenBlockers, listOpenBlockers } from './patrol.js'
 import { dispatchProjectMemory } from './projectMemoryHttp.js'
 import { TaskboardTransitionDenied, assertTransition } from './stateMachine.js'
+import {
+  type BoardAgent,
+  type TaskboardHttpContext,
+  sendJson,
+  sendError,
+  asString,
+  asNullableString,
+  asNullableNumber,
+  asBoolean,
+  asStringArray,
+  isUniqueConstraint,
+  resolveProject,
+} from './httpShared.js'
+import {
+  handleListPipelines,
+  handleCreatePipeline,
+  handleGetPipeline,
+  handlePatchPipeline,
+  handleListStages,
+  assertTemplatesValidForApply,
+  handleCreateStage,
+  handleGetStage,
+  handleReorderStages,
+  handlePatchStage,
+  handleGetRun,
+} from './httpPipelines.js'
+import {
+  handleListAgents,
+  handleGetSettings,
+  handlePatchSettings,
+  handleCostStats,
+  handleWeeklyReport,
+  handleListTemplates,
+  handleGetTemplate,
+  handleCreateTemplate,
+  handleDeleteTemplate,
+  handleApplyTemplate,
+} from './httpBoardAdmin.js'
+export type { BoardAgent, TaskboardHttpContext } from './httpShared.js'
 
 export type { TaskboardSettings, TaskboardUsage }
 
@@ -148,9 +164,6 @@ export type { TaskboardSettings, TaskboardUsage }
 
 /** 与 commercial `containerApiProxy` body 上限对齐,超限 413 而不是崩。 */
 export const TASKBOARD_MAX_BODY_BYTES = 512 * 1024
-
-/** 单次 run 允许配置的最大无活动窗口；活跃 run 没有 45 分钟墙钟上限。 */
-const DELEGATE_IDLE_TIMEOUT_MAX_SEC = 45 * 60
 
 const USER_ID = 'default'
 const HUMAN_ACTOR_ID = `user:${USER_ID}`
@@ -172,34 +185,6 @@ type TicketAction = (typeof TICKET_ACTIONS)[number]
 
 const TICKET_COLLECTIONS = ['runs', 'relations', 'comments', 'activity', 'timeline'] as const
 type TicketCollection = (typeof TICKET_COLLECTIONS)[number]
-
-// ── 上下文 / actor ──────────────────────────────────────────────────────────
-
-export interface BoardAgent {
-  id: string
-  name: string
-  model: string
-  description: string
-}
-
-export interface TaskboardHttpContext {
-  /** 显式传入的库。测试用临时目录;生产省略则走 getTaskboardDb()。null = 未初始化。 */
-  db?: TaskboardDb | null
-  /**
-   * 测试注入的 actor。生产不要设 —— 必须由 resolveActor / resolveTaskboardActor
-   * 从请求凭证推导,禁止调用方在 body 里自称。
-   */
-  actor?: Actor
-  resolveActor?: (req: IncomingMessage) => Actor
-  jwtSecret?: string
-  isCommercialJwt?: (token: string) => boolean
-  listAgents?: () => Promise<BoardAgent[]>
-  /**
-   * 阶段 model 覆盖是否在当前 catalog 投影里且 available。
-   * 测试注入;生产省略则走 getLocalCatalogView().isRoutable。
-   */
-  isAvailableStageModel?: (modelId: string) => boolean | Promise<boolean>
-}
 
 export interface ResolveActorOptions {
   jwtSecret?: string
@@ -360,20 +345,6 @@ class TaskboardMoveDenied extends Error {
   }
 }
 
-function sendJson(res: ServerResponse, code: number, body: unknown): void {
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
-  res.end(JSON.stringify(body))
-}
-
-function sendError(
-  res: ServerResponse,
-  code: number,
-  error: string,
-  extra?: Record<string, unknown>,
-): void {
-  sendJson(res, code, extra ? { error, ...extra } : { error })
-}
-
 function readBody(req: IncomingMessage, maxBytes: number): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
@@ -442,44 +413,6 @@ function requireExpectedVersion(body: Record<string, unknown>): number {
   return v
 }
 
-function asString(value: unknown): string | undefined {
-  return typeof value === 'string' ? value : undefined
-}
-
-function asNullableString(value: unknown): string | null | undefined {
-  if (value === undefined) return undefined
-  if (value === null) return null
-  if (typeof value === 'string') return value
-  throw new TaskboardValidationError('expected string or null')
-}
-
-function asNullableNumber(value: unknown): number | null | undefined {
-  if (value === undefined) return undefined
-  if (value === null) return null
-  if (typeof value === 'number' && Number.isFinite(value)) return value
-  throw new TaskboardValidationError('expected number or null')
-}
-
-function asBoolean(value: unknown): boolean | undefined {
-  if (value === undefined) return undefined
-  if (typeof value === 'boolean') return value
-  throw new TaskboardValidationError('expected boolean')
-}
-
-function asStringArray(value: unknown): string[] | undefined {
-  if (value === undefined) return undefined
-  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
-    throw new TaskboardValidationError('expected string[]')
-  }
-  return value
-}
-
-function asNullableStringArray(value: unknown): string[] | null | undefined {
-  if (value === undefined) return undefined
-  if (value === null) return null
-  return asStringArray(value)
-}
-
 function parseCsvEnums<T extends string>(
   raw: string | null,
   allowed: readonly T[],
@@ -496,16 +429,6 @@ function parseCsvEnums<T extends string>(
     }
   }
   return parts.length ? parts : undefined
-}
-
-function isUniqueConstraint(err: unknown, needle?: string): boolean {
-  const msg = err instanceof Error ? err.message : String(err)
-  if (!msg.includes('UNIQUE constraint failed')) return false
-  return needle ? msg.includes(needle) : true
-}
-
-function resolveProject(db: TaskboardDb, idOrKey: string) {
-  return getProject(db, idOrKey) ?? getProjectByKey(db, idOrKey)
 }
 
 function requireTicket(db: TaskboardDb, idOrIdent: string): Ticket {
@@ -2473,571 +2396,4 @@ function handlePatrol(
     sessionKey: result.run.sessionKey ?? '',
   })
   sendJson(res, 202, { ok: true, run: result.run, ticket: result.ticket })
-}
-
-// ── Pipeline / Stage ────────────────────────────────────────────────────────
-
-function handleListPipelines(res: ServerResponse, url: URL, db: TaskboardDb): void {
-  const projectRef = url.searchParams.get('projectId')
-  if (!projectRef) throw new TaskboardValidationError('projectId is required')
-  const project = resolveProject(db, projectRef)
-  if (!project) throw new TaskboardNotFound('project', projectRef)
-  sendJson(res, 200, { items: listPipelines(db, project.id) })
-}
-
-function handleCreatePipeline(
-  res: ServerResponse,
-  body: Record<string, unknown>,
-  db: TaskboardDb,
-): void {
-  const projectRef = asString(body.projectId)
-  const name = asString(body.name)
-  if (!projectRef || !name) throw new TaskboardValidationError('projectId and name are required')
-  const project = resolveProject(db, projectRef)
-  if (!project) throw new TaskboardNotFound('project', projectRef)
-  const typeRaw = asNullableString(body.ticketType)
-  if (typeRaw && !(TICKET_TYPES as readonly string[]).includes(typeRaw)) {
-    throw new TaskboardValidationError(`invalid ticketType: ${typeRaw}`)
-  }
-  const pipeline = createPipeline(db, {
-    projectId: project.id,
-    name,
-    ticketType: (typeRaw as TicketType | null | undefined) ?? null,
-    isDefault: asBoolean(body.isDefault) ?? false,
-  })
-  sendJson(res, 201, { ok: true, pipeline })
-}
-
-function handleGetPipeline(res: ServerResponse, db: TaskboardDb, id: string): void {
-  const pipeline = getPipeline(db, id)
-  if (!pipeline) throw new TaskboardNotFound('pipeline', id)
-  sendJson(res, 200, { pipeline, stages: listStages(db, pipeline.id) })
-}
-
-function handlePatchPipeline(
-  res: ServerResponse,
-  body: Record<string, unknown>,
-  db: TaskboardDb,
-  id: string,
-): void {
-  const typeRaw = asNullableString(body.ticketType)
-  if (typeRaw && !(TICKET_TYPES as readonly string[]).includes(typeRaw)) {
-    throw new TaskboardValidationError(`invalid ticketType: ${typeRaw}`)
-  }
-  const pipeline = updatePipeline(db, id, {
-    name: asString(body.name),
-    ticketType: typeRaw as TicketType | null | undefined,
-    isDefault: asBoolean(body.isDefault),
-  })
-  sendJson(res, 200, { ok: true, pipeline })
-}
-
-function handleListStages(res: ServerResponse, db: TaskboardDb, pipelineId: string): void {
-  if (!getPipeline(db, pipelineId)) throw new TaskboardNotFound('pipeline', pipelineId)
-  sendJson(res, 200, { items: listStages(db, pipelineId) })
-}
-
-function hasPatrolCron(cron: string | null | undefined): boolean {
-  return typeof cron === 'string' && cron.trim() !== ''
-}
-
-/** 巡检/熔断/超时等运维字段,以及会改写后续审查约束的内容字段:只许人改,agent 走 PATCH 带这些 key 一律 403。 */
-const STAGE_OPS_FIELDS = [
-  'patrolCron',
-  'patrolEnabled',
-  'patrolTimezone',
-  'quietHoursStart',
-  'quietHoursEnd',
-  'maxRunsPerDay',
-  'timeoutSec',
-  'maxRetries',
-  'circuitBreakerThreshold',
-  'autoClose',
-  'promptTemplate',
-  'toolsets',
-  'model',
-] as const
-
-function stagePatchTouchesOps(body: Record<string, unknown>): boolean {
-  return STAGE_OPS_FIELDS.some((key) => Object.hasOwn(body, key))
-}
-
-/** 空串 / 空白 = 清除覆盖。undefined = 请求没带这个字段。 */
-function normalizeStageModelInput(value: unknown): string | null | undefined {
-  const raw = asNullableString(value)
-  if (raw === undefined) return undefined
-  if (raw === null) return null
-  const trimmed = raw.trim()
-  return trimmed === '' ? null : trimmed
-}
-
-async function defaultIsAvailableStageModel(modelId: string): Promise<boolean> {
-  const view = await getLocalCatalogView()
-  return view.isRoutable(view.canonicalize(modelId))
-}
-
-async function assertStageModelAvailable(
-  modelId: string,
-  ctx: TaskboardHttpContext,
-): Promise<void> {
-  const ok = ctx.isAvailableStageModel
-    ? await ctx.isAvailableStageModel(modelId)
-    : await defaultIsAvailableStageModel(modelId)
-  if (!ok) throw new TaskboardValidationError(`model not available: ${modelId}`)
-}
-
-function validateStageWrite(input: {
-  kind?: StageKind
-  agentId?: string | null
-  promptTemplate?: string | null
-  patrolEnabled?: boolean
-  patrolCron?: string | null
-  entryCondition?: string | null
-  timeoutSec?: number
-}): void {
-  if (input.kind === 'ai') {
-    if (!input.agentId) throw new TaskboardValidationError('agentId is required for ai stages')
-    if (!input.promptTemplate) {
-      throw new TaskboardValidationError('promptTemplate is required for ai stages')
-    }
-  }
-  if (input.agentId && isHiddenSystemAgentId(input.agentId)) {
-    throw new TaskboardValidationError('hidden-reviewer cannot be bound to a stage')
-  }
-  if (input.kind === 'human' && (input.patrolEnabled || hasPatrolCron(input.patrolCron))) {
-    throw new TaskboardValidationError('human 阶段不能启用巡检或设置巡检 cron')
-  }
-  if (input.entryCondition != null && input.entryCondition.trim() !== '') {
-    const parsed = parseEntryCondition(input.entryCondition)
-    if (!parsed.ok) throw new TaskboardValidationError(parsed.error)
-  }
-  if (input.timeoutSec != null && input.timeoutSec > DELEGATE_IDLE_TIMEOUT_MAX_SEC) {
-    throw new TaskboardValidationError(`timeoutSec must be <= ${DELEGATE_IDLE_TIMEOUT_MAX_SEC}`)
-  }
-}
-
-async function assertTemplatesValidForApply(
-  db: TaskboardDb,
-  templateIds: string[],
-  ctx: TaskboardHttpContext,
-): Promise<void> {
-  for (const templateId of templateIds) {
-    const template = getTemplate(db, templateId)
-    if (!template) throw new TaskboardNotFound('template', templateId)
-    for (const stage of template.stages) {
-      validateStageWrite({
-        kind: stage.kind,
-        agentId: stage.agentId,
-        promptTemplate: stage.promptTemplate,
-        patrolEnabled: stage.patrolEnabled,
-        patrolCron: stage.patrolCron,
-        entryCondition: stage.entryCondition,
-        timeoutSec: stage.timeoutSec,
-      })
-      if (stage.model) await assertStageModelAvailable(stage.model, ctx)
-    }
-  }
-}
-
-function throwIfStageOrdinalConflict(err: unknown): void {
-  if (isUniqueConstraint(err, 'ordinal')) {
-    throw new TaskboardValidationError('同一流水线内阶段序号(ordinal)不能重复')
-  }
-}
-
-async function handleCreateStage(
-  res: ServerResponse,
-  body: Record<string, unknown>,
-  db: TaskboardDb,
-  pipelineId: string,
-  actor: Actor,
-  ctx: TaskboardHttpContext,
-): Promise<void> {
-  if (actor !== 'human') {
-    sendError(res, 403, 'forbidden', { code: 'forbidden' })
-    return
-  }
-  if (!getPipeline(db, pipelineId)) throw new TaskboardNotFound('pipeline', pipelineId)
-  const name = asString(body.name)
-  const kindRaw = asString(body.kind)
-  if (!name || !kindRaw) throw new TaskboardValidationError('name and kind are required')
-  if (!(STAGE_KINDS as readonly string[]).includes(kindRaw)) {
-    throw new TaskboardValidationError(`invalid kind: ${kindRaw}`)
-  }
-  const kind = kindRaw as StageKind
-  const existing = listStages(db, pipelineId)
-  const ordinal = typeof body.ordinal === 'number' ? body.ordinal : existing.length
-  const agentId = asNullableString(body.agentId) ?? null
-  const promptTemplate = asNullableString(body.promptTemplate) ?? null
-  const patrolEnabled = asBoolean(body.patrolEnabled)
-  const patrolCron = asNullableString(body.patrolCron) ?? null
-  const entryCondition = asNullableString(body.entryCondition)
-  const timeoutSec = typeof body.timeoutSec === 'number' ? body.timeoutSec : undefined
-  const model = normalizeStageModelInput(body.model) ?? null
-  if (model) await assertStageModelAvailable(model, ctx)
-  validateStageWrite({
-    kind,
-    agentId,
-    promptTemplate,
-    patrolEnabled,
-    patrolCron,
-    entryCondition,
-    timeoutSec,
-  })
-  let stage: PipelineStage
-  try {
-    stage = createStage(db, {
-      pipelineId,
-      ordinal,
-      name,
-      kind,
-      agentId,
-      model,
-      promptTemplate,
-      toolsets: asNullableStringArray(body.toolsets) ?? null,
-      effort: asNullableString(body.effort) ?? null,
-      patrolCron,
-      patrolEnabled,
-      patrolTimezone: asString(body.patrolTimezone),
-      quietHoursStart: asNullableNumber(body.quietHoursStart),
-      quietHoursEnd: asNullableNumber(body.quietHoursEnd),
-      maxRunsPerDay: typeof body.maxRunsPerDay === 'number' ? body.maxRunsPerDay : undefined,
-      timeoutSec,
-      maxRetries: typeof body.maxRetries === 'number' ? body.maxRetries : undefined,
-      circuitBreakerThreshold:
-        typeof body.circuitBreakerThreshold === 'number' ? body.circuitBreakerThreshold : undefined,
-      onSuccess: asString(body.onSuccess) as OnSuccessAction | undefined,
-      onFailure: asString(body.onFailure) as OnFailureAction | undefined,
-      entryCondition,
-      exitChecklist: asNullableString(body.exitChecklist),
-      requireHumanAck: asBoolean(body.requireHumanAck),
-      autoClose: asBoolean(body.autoClose),
-    })
-  } catch (err) {
-    throwIfStageOrdinalConflict(err)
-    throw err
-  }
-  sendJson(res, 201, { ok: true, stage })
-}
-
-function handleGetStage(res: ServerResponse, db: TaskboardDb, id: string): void {
-  const stage = getStage(db, id)
-  if (!stage) throw new TaskboardNotFound('stage', id)
-  sendJson(res, 200, { stage })
-}
-
-function handleReorderStages(
-  res: ServerResponse,
-  body: Record<string, unknown>,
-  db: TaskboardDb,
-  pipelineId: string,
-  actor: Actor,
-): void {
-  if (actor !== 'human') {
-    sendError(res, 403, 'forbidden', { code: 'forbidden' })
-    return
-  }
-  const raw = body.orderedIds
-  if (!Array.isArray(raw) || raw.some((id) => typeof id !== 'string' || !id.trim())) {
-    throw new TaskboardValidationError('orderedIds must be a non-empty string array')
-  }
-  const orderedIds = raw.map((id) => String(id))
-  try {
-    const items = reorderStages(db, pipelineId, orderedIds)
-    sendJson(res, 200, { ok: true, items })
-  } catch (err) {
-    throwIfStageOrdinalConflict(err)
-    throw err
-  }
-}
-
-async function handlePatchStage(
-  res: ServerResponse,
-  body: Record<string, unknown>,
-  db: TaskboardDb,
-  id: string,
-  actor: Actor,
-  ctx: TaskboardHttpContext,
-): Promise<void> {
-  const existing = getStage(db, id)
-  if (!existing) throw new TaskboardNotFound('stage', id)
-  if (actor !== 'human' && stagePatchTouchesOps(body)) {
-    sendError(res, 403, 'forbidden', { code: 'forbidden' })
-    return
-  }
-  const kind = (asString(body.kind) as StageKind | undefined) ?? existing.kind
-  const agentId =
-    body.agentId === undefined ? existing.agentId : (asNullableString(body.agentId) ?? null)
-  const promptTemplate =
-    body.promptTemplate === undefined
-      ? existing.promptTemplate
-      : (asNullableString(body.promptTemplate) ?? null)
-  const patrolEnabled = asBoolean(body.patrolEnabled) ?? existing.patrolEnabled
-  const patrolCron =
-    body.patrolCron === undefined ? existing.patrolCron : asNullableString(body.patrolCron)
-  const entryCondition = asNullableString(body.entryCondition)
-  const timeoutSec = typeof body.timeoutSec === 'number' ? body.timeoutSec : existing.timeoutSec
-  const model = Object.hasOwn(body, 'model') ? normalizeStageModelInput(body.model) : undefined
-  if (model && model !== existing.model) await assertStageModelAvailable(model, ctx)
-  validateStageWrite({
-    kind,
-    agentId,
-    promptTemplate,
-    patrolEnabled,
-    patrolCron,
-    entryCondition,
-    timeoutSec,
-  })
-  let stage: PipelineStage
-  try {
-    stage = updateStage(db, id, {
-      name: asString(body.name),
-      kind: asString(body.kind) as StageKind | undefined,
-      agentId: asNullableString(body.agentId),
-      model,
-      promptTemplate: asNullableString(body.promptTemplate),
-      toolsets: asNullableStringArray(body.toolsets),
-      effort: asNullableString(body.effort),
-      patrolCron: asNullableString(body.patrolCron),
-      patrolEnabled: asBoolean(body.patrolEnabled),
-      patrolTimezone: asString(body.patrolTimezone),
-      quietHoursStart: asNullableNumber(body.quietHoursStart),
-      quietHoursEnd: asNullableNumber(body.quietHoursEnd),
-      maxRunsPerDay: typeof body.maxRunsPerDay === 'number' ? body.maxRunsPerDay : undefined,
-      timeoutSec: typeof body.timeoutSec === 'number' ? body.timeoutSec : undefined,
-      maxRetries: typeof body.maxRetries === 'number' ? body.maxRetries : undefined,
-      circuitBreakerThreshold:
-        typeof body.circuitBreakerThreshold === 'number' ? body.circuitBreakerThreshold : undefined,
-      onSuccess: asString(body.onSuccess) as OnSuccessAction | undefined,
-      onFailure: asString(body.onFailure) as OnFailureAction | undefined,
-      entryCondition,
-      exitChecklist: asNullableString(body.exitChecklist),
-      requireHumanAck: asBoolean(body.requireHumanAck),
-      autoClose: asBoolean(body.autoClose),
-      ordinal: typeof body.ordinal === 'number' ? body.ordinal : undefined,
-    })
-  } catch (err) {
-    throwIfStageOrdinalConflict(err)
-    throw err
-  }
-  sendJson(res, 200, { ok: true, stage })
-}
-
-function handleGetRun(res: ServerResponse, db: TaskboardDb, id: string): void {
-  const run = getRun(db, id)
-  if (!run) throw new TaskboardNotFound('run', id)
-  sendJson(res, 200, { run })
-}
-
-// ── Agents / Settings ───────────────────────────────────────────────────────
-
-async function handleListAgents(res: ServerResponse, ctx: TaskboardHttpContext): Promise<void> {
-  let items: BoardAgent[]
-  if (ctx.listAgents) {
-    items = await ctx.listAgents()
-  } else {
-    const { readAgentsConfig } = await import('@openclaude/storage')
-    const cfg = await readAgentsConfig()
-    items = filterUserVisibleAgentsForManagement(cfg.agents).map((a) => ({
-      id: a.id,
-      name: a.displayName ?? a.id,
-      model: a.model ?? '',
-      description: a.greeting ?? '',
-    }))
-  }
-  items = filterUserVisibleAgentsForManagement(items)
-  sendJson(res, 200, { items })
-}
-
-function handleGetSettings(res: ServerResponse, db: TaskboardDb): void {
-  sendJson(res, 200, { ...getSettings(db), usage: getUsageWithReferenceCosts(db) })
-}
-
-function handlePatchSettings(
-  res: ServerResponse,
-  body: Record<string, unknown>,
-  db: TaskboardDb,
-  actor: Actor,
-): void {
-  if (actor !== 'human') {
-    sendError(res, 403, 'forbidden', { code: 'forbidden' })
-    return
-  }
-  const patch: Partial<TaskboardSettings> = {}
-  if (typeof body.maxConcurrentRuns === 'number') patch.maxConcurrentRuns = body.maxConcurrentRuns
-  if (typeof body.maxRunsPerDay === 'number') patch.maxRunsPerDay = body.maxRunsPerDay
-  if (body.maxCostPerDayUsd === null || typeof body.maxCostPerDayUsd === 'number') {
-    patch.maxCostPerDayUsd = body.maxCostPerDayUsd
-  }
-  if (typeof body.quietHoursStart === 'number') patch.quietHoursStart = body.quietHoursStart
-  if (typeof body.quietHoursEnd === 'number') patch.quietHoursEnd = body.quietHoursEnd
-  if (typeof body.circuitBreakerThreshold === 'number') {
-    patch.circuitBreakerThreshold = body.circuitBreakerThreshold
-  }
-  if (typeof body.maxStageLoops === 'number') patch.maxStageLoops = body.maxStageLoops
-  if (typeof body.maxRunsPerTick === 'number') patch.maxRunsPerTick = body.maxRunsPerTick
-  if (typeof body.patrolPaused === 'boolean') patch.patrolPaused = body.patrolPaused
-  const settings = updateSettings(db, patch)
-  sendJson(res, 200, { ok: true, ...settings, usage: getUsageWithReferenceCosts(db) })
-}
-
-// ── M4:成本统计 / 周报 / 流水线模板 ─────────────────────────────────────────
-
-const YMD_RE = /^\d{4}-\d{2}-\d{2}$/
-
-function requireYmd(raw: string | null, field: string): string | undefined {
-  if (raw == null || raw === '') return undefined
-  if (!YMD_RE.test(raw)) throw new TaskboardValidationError(`invalid ${field}: ${raw}`)
-  return raw
-}
-
-function addDaysYmd(ymd: string, delta: number): string {
-  const [y, m, d] = ymd.split('-').map(Number)
-  const utc = Date.UTC(y, m - 1, d) + delta * 86_400_000
-  const dt = new Date(utc)
-  const yy = dt.getUTCFullYear()
-  const mm = String(dt.getUTCMonth() + 1).padStart(2, '0')
-  const dd = String(dt.getUTCDate()).padStart(2, '0')
-  return `${yy}-${mm}-${dd}`
-}
-
-function handleCostStats(res: ServerResponse, url: URL, db: TaskboardDb): void {
-  const timeZone = asString(url.searchParams.get('timeZone') ?? undefined) ?? 'Asia/Shanghai'
-  const today = zonedYmd(new Date(), timeZone)
-  const fromYmd = requireYmd(url.searchParams.get('from'), 'from') ?? addDaysYmd(today, -6)
-  const toYmd = requireYmd(url.searchParams.get('to'), 'to') ?? today
-  if (fromYmd > toYmd) throw new TaskboardValidationError('from must be <= to')
-  const groupRaw = url.searchParams.get('groupBy')
-  const groupBy =
-    groupRaw == null || groupRaw === ''
-      ? undefined
-      : (COST_GROUP_BY as readonly string[]).includes(groupRaw)
-        ? (groupRaw as (typeof COST_GROUP_BY)[number])
-        : (() => {
-            throw new TaskboardValidationError(`invalid groupBy: ${groupRaw}`)
-          })()
-  const projectRef = url.searchParams.get('projectId')
-  const project = projectRef ? resolveProject(db, projectRef) : null
-  if (projectRef && !project) throw new TaskboardNotFound('project', projectRef)
-  const ticketRef = url.searchParams.get('ticketId')
-  const ticket = ticketRef ? getTicketByIdOrIdentifier(db, ticketRef) : null
-  if (ticketRef && !ticket) throw new TaskboardNotFound('ticket', ticketRef)
-  const stageId = url.searchParams.get('stageId') || undefined
-  const { fromMs, toMs } = ymdRangeMs(fromYmd, toYmd, timeZone)
-  const stats = queryCostStats(db, {
-    fromMs,
-    toMs,
-    projectId: project?.id,
-    ticketId: ticket?.id,
-    stageId,
-    groupBy,
-    timeZone,
-  })
-  sendJson(res, 200, {
-    from: fromYmd,
-    to: toYmd,
-    timeZone,
-    groupBy: groupBy ?? null,
-    totals: stats.totals,
-    buckets: stats.buckets,
-  })
-}
-
-function handleWeeklyReport(res: ServerResponse, url: URL, db: TaskboardDb): void {
-  const timeZone = asString(url.searchParams.get('timeZone') ?? undefined) ?? 'Asia/Shanghai'
-  const weekRaw = url.searchParams.get('week')
-  const fromRaw = requireYmd(url.searchParams.get('from'), 'from')
-  const toRaw = requireYmd(url.searchParams.get('to'), 'to')
-  let period = currentWeekPeriod(new Date(), timeZone)
-  if (weekRaw) {
-    const parsed = periodFromIsoWeek(weekRaw, timeZone)
-    if (!parsed) throw new TaskboardValidationError(`invalid week: ${weekRaw}`)
-    period = parsed
-  } else if (fromRaw && toRaw) {
-    if (fromRaw > toRaw) throw new TaskboardValidationError('from must be <= to')
-    const range = ymdRangeMs(fromRaw, toRaw, timeZone)
-    period = {
-      week: `${fromRaw}/${toRaw}`,
-      fromYmd: fromRaw,
-      toYmd: toRaw,
-      fromMs: range.fromMs,
-      toMs: range.toMs,
-      timeZone,
-    }
-  }
-  const projectRef = url.searchParams.get('projectId')
-  const project = projectRef ? resolveProject(db, projectRef) : null
-  if (projectRef && !project) throw new TaskboardNotFound('project', projectRef)
-  const report = buildWeeklyReport(db, {
-    fromMs: period.fromMs,
-    toMs: period.toMs,
-    fromYmd: period.fromYmd,
-    toYmd: period.toYmd,
-    week: period.week,
-    projectId: project?.id,
-    timeZone,
-  })
-  sendJson(res, 200, { report })
-}
-
-function handleListTemplates(res: ServerResponse, db: TaskboardDb): void {
-  sendJson(res, 200, { items: listTemplates(db) })
-}
-
-function handleGetTemplate(res: ServerResponse, db: TaskboardDb, id: string): void {
-  const template = getTemplate(db, id)
-  if (!template) throw new TaskboardNotFound('template', id)
-  sendJson(res, 200, { template })
-}
-
-function handleCreateTemplate(
-  res: ServerResponse,
-  body: Record<string, unknown>,
-  db: TaskboardDb,
-): void {
-  const pipelineId = asString(body.pipelineId)
-  if (!pipelineId) throw new TaskboardValidationError('pipelineId is required')
-  const template = createTemplateFromPipeline(db, {
-    pipelineId,
-    name: asString(body.name),
-    slug: asString(body.slug),
-  })
-  sendJson(res, 201, { ok: true, template })
-}
-
-function handleDeleteTemplate(res: ServerResponse, db: TaskboardDb, id: string): void {
-  deleteTemplate(db, id)
-  sendJson(res, 200, { ok: true })
-}
-
-async function handleApplyTemplate(
-  res: ServerResponse,
-  body: Record<string, unknown>,
-  db: TaskboardDb,
-  templateId: string,
-  actor: Actor,
-  ctx: TaskboardHttpContext,
-): Promise<void> {
-  if (actor !== 'human') {
-    sendError(res, 403, 'forbidden', { code: 'forbidden' })
-    return
-  }
-  await assertTemplatesValidForApply(db, [templateId], ctx)
-  const projectRef = asString(body.projectId)
-  if (!projectRef) throw new TaskboardValidationError('projectId is required')
-  const project = resolveProject(db, projectRef)
-  if (!project) throw new TaskboardNotFound('project', projectRef)
-  const asDefault = asBoolean(body.asDefault)
-  const result = applyTemplate(db, templateId, project.id, {
-    asDefault,
-  })
-  sendJson(res, 200, {
-    ok: true,
-    template: result.template,
-    pipeline: result.pipeline,
-    createdPipelines: result.createdPipelines,
-    createdStages: result.createdStages,
-    skippedPipelines: result.skippedPipelines,
-    skippedStages: result.skippedStages,
-  })
 }

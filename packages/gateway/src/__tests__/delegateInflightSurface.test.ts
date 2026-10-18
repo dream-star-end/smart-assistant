@@ -1,3 +1,4 @@
+import { readGatewaySource } from './helpers/gatewaySource.js'
 import { installDelegateSandbox } from './helpers/delegateSandbox.js'
 const sandbox = installDelegateSandbox()
 
@@ -40,7 +41,10 @@ import {
 } from '../delegateSmFlag.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const serverSrc = readFileSync(join(here, '../server.ts'), 'utf8')
+// FINDINGS §7.6 S3: server.ts + split-out modules (delegate runtime/supervision moved out)
+const serverSrc = readGatewaySource()
+// OCV5-465: the client session routes live in routes/clientSessions.ts; server.ts dispatches to it.
+const sessionsSrc = readFileSync(join(here, '../routes/clientSessions.ts'), 'utf8')
 const PARENT = 'agent:main:webchat:dm:web-r2parent'
 const SESS = 'web-r2parent'
 
@@ -272,20 +276,21 @@ describe('terminal fold + INC-20260827-PHASE-B-DEFER-VANISH', () => {
 describe('R2 gateway wiring (flag-off equivalent + read endpoint)', () => {
   it('GET /api/sessions/:id/inflight-delegates is a pathname.match literal', () => {
     assert.ok(
-      serverSrc.includes('/inflight-delegates$'),
+      sessionsSrc.includes('/inflight-delegates$'),
       'containerRouteInventory needs a pathname.match literal',
     )
-    assert.ok(serverSrc.includes("isDelegateInflightSurfaceEffective()"))
+    assert.ok(sessionsSrc.includes("isDelegateInflightSurfaceEffective()"))
+    // metrics path normalization stays in server.ts
     assert.ok(serverSrc.includes("'/api/sessions/:id/inflight-delegates'"))
-    assert.match(serverSrc, /handleInflightDelegatesRequest/)
+    assert.match(sessionsSrc, /handleInflightDelegatesRequest/)
     // OCV5-94: the read endpoint only needs existence, not the hydrated
     // tape body — loadSession must go through the cheap classify path.
-    assert.match(serverSrc, /clientSessionIsActive\(id, uid\)/)
+    assert.match(sessionsSrc, /clientSessionIsActive\(id, uid\)/)
     assert.doesNotMatch(
-      serverSrc.slice(serverSrc.indexOf('handleInflightDelegatesRequest('), serverSrc.indexOf('handleInflightDelegatesRequest(') + 1200),
+      sessionsSrc.slice(sessionsSrc.indexOf('handleInflightDelegatesRequest('), sessionsSrc.indexOf('handleInflightDelegatesRequest(') + 1200),
       /getClientSession\(/,
     )
-    assert.doesNotMatch(serverSrc, /enabled: false/)
+    assert.doesNotMatch(sessionsSrc, /enabled: false/)
   })
 
   it('turn_status working-detail path remains outside the inflight flag (dual-write / flag-off)', () => {

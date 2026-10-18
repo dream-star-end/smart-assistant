@@ -9,9 +9,13 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { readGatewaySource } from './helpers/gatewaySource.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const serverSrc = readFileSync(join(here, '../server.ts'), 'utf8')
+// OCV5-493: KNOWN_ROUTES / normalizePath moved with the HTTP entry to gatewayHttp.ts; read the source set.
+const serverSrc = readGatewaySource()
+// OCV5-465: the client session routes live in routes/clientSessions.ts; server.ts dispatches to it.
+const sessionsSrc = readFileSync(join(here, '../routes/clientSessions.ts'), 'utf8')
 // OCV5-376: the route branches live in routes/chatProjects.ts; server.ts dispatches to it.
 const routeSrc = readFileSync(join(here, '../routes/chatProjects.ts'), 'utf8')
 const allowlistSrc = readFileSync(join(here, '../bridgeApiAllowlist.ts'), 'utf8')
@@ -35,9 +39,9 @@ describe('chat-projects 网关接线', () => {
   })
 
   it('server.ts 在原位置(read-all 之后、project-assets 之前)把请求交给 handleChatProjectsHttp', () => {
-    const readAll = serverSrc.indexOf("url.pathname === '/api/sessions/read-all'")
-    const dispatch = serverSrc.indexOf('if (handleChatProjectsHttp(this.httpIo, req, res, url)) return')
-    const assets = serverSrc.indexOf('if (handleProjectAssetsHttp(this.httpIo, req, res, url)) return')
+    const readAll = sessionsSrc.indexOf("url.pathname === '/api/sessions/read-all'")
+    const dispatch = sessionsSrc.indexOf('if (handleChatProjectsHttp(io, req, res, url)) return true')
+    const assets = sessionsSrc.indexOf('if (handleProjectAssetsHttp(io, req, res, url)) return true')
     assert.ok(readAll >= 0 && dispatch > readAll && assets > dispatch)
   })
 
@@ -59,11 +63,11 @@ describe('chat-projects 网关接线', () => {
   })
 
   it('既有 PATCH /api/sessions/:id 接受 projectId 与 pinned', () => {
-    const clientSess = serverSrc.indexOf('const clientSessMatch')
+    const clientSess = sessionsSrc.indexOf('const clientSessMatch')
     assert.ok(clientSess >= 0, 'clientSessMatch 必须存在')
-    const patchBlock = serverSrc.slice(
-      serverSrc.indexOf('元数据专用更新', clientSess),
-      serverSrc.indexOf("if (req.method === 'DELETE')", clientSess),
+    const patchBlock = sessionsSrc.slice(
+      sessionsSrc.indexOf('元数据专用更新', clientSess),
+      sessionsSrc.indexOf("if (req.method === 'DELETE')", clientSess),
     )
     assert.match(patchBlock, /projectId/)
     assert.match(patchBlock, /pinned/)

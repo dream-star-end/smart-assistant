@@ -38,6 +38,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/runnerMandatoryMutatorParity.test.ts
  */
 
+import { readSessionManagerSource } from './helpers/sessionManagerSource.js'
 import * as assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -60,7 +61,8 @@ import { type EngineCreateOpts, createEngine, registeredEngines } from '../engin
 installFakeCursorWrapper()
 
 const here = dirname(fileURLToPath(import.meta.url))
-const sessionManagerSource = readFileSync(join(here, '..', 'sessionManager.ts'), 'utf8')
+// sessionManager.ts + the modules split out of it (FINDINGS §7.6 M1/M2: the submit path moved to sessionSubmit.ts)
+const sessionManagerSource = readSessionManagerSource()
 
 /** 硬调面:缺方法 = TypeError = 用户卡"思考中"。 */
 const HARD_CALLED_MUTATORS = [

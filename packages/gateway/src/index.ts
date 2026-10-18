@@ -1,4 +1,5 @@
 export * from './server.js'
+export * from './webRootOverlay.js'
 export * from './sessionManager.js'
 export * from './subprocessRunner.js'
 // M0 engine 适配层(EngineAdapter 契约 / 中立事件权威源 / registry / CCB 实现)

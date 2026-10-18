@@ -7,7 +7,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/staticFileCache.test.ts
  */
 import * as assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -109,6 +109,35 @@ describe('static file cache revalidates against disk mtime', () => {
     serve(file, 'no-cache', fakeReq(etag1), r3 as unknown as ServerResponse, 'text/html')
     assert.equal(r3.status, 200)
     assert.equal(r3.body.toString(), 'v2-longer-content')
+  })
+
+  it('serves the new webroot after an overlay symlink flip even when mtimes match (OCV5-489)', () => {
+    const root = mkdtempSync(join(tmpdir(), 'oc-static-overlay-'))
+    tmpDirs.push(root)
+    const a = join(root, 'a')
+    const b = join(root, 'b')
+    mkdirSync(a)
+    mkdirSync(b)
+    writeFileSync(join(a, 'index.html'), '<meta name="oc-build" content="aaaaaaaa">')
+    writeFileSync(join(b, 'index.html'), '<meta name="oc-build" content="bbbbbbbb">')
+    const same = new Date(Date.now() - 60_000)
+    utimesSync(join(a, 'index.html'), same, same)
+    utimesSync(join(b, 'index.html'), same, same)
+    const pointer = join(root, 'current')
+    symlinkSync(a, pointer)
+    const file = join(pointer, 'index.html')
+
+    const serve = makeServe()
+    const r1 = new ResRecorder()
+    serve(file, 'no-cache', fakeReq(), r1 as unknown as ServerResponse, 'text/html')
+    assert.ok(r1.body.toString().includes('aaaaaaaa'))
+
+    // P0-Web 原子换指针:同一路径变成另一个 inode,mtime 不变。
+    symlinkSync(b, join(root, 'current.tmp'))
+    renameSync(join(root, 'current.tmp'), pointer)
+    const r2 = new ResRecorder()
+    serve(file, 'no-cache', fakeReq(), r2 as unknown as ServerResponse, 'text/html')
+    assert.ok(r2.body.toString().includes('bbbbbbbb'), 'must follow the flipped overlay, not stale cache')
   })
 
   it('returns false for missing files so the caller falls through to fallback/404', () => {

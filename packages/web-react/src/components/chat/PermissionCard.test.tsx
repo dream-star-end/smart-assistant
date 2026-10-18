@@ -795,7 +795,8 @@ describe("跨包契约", () => {
   test("前端 TTL 必须等于 gateway 的 PENDING_PERMISSION_TTL_MS", () => {
     // vitest 下 import.meta.url 不是 file: scheme（vite 模块运行时），改从 cwd 向上找仓根 ——
     // CI 从仓根跑、本地从 packages/web-react 跑,两种 cwd 都要成立。
-    const rel = join("packages", "gateway", "src", "server.ts");
+    // OCV5-465: the constant moved out of server.ts into pendingPermissionSnapshot.ts.
+    const rel = join("packages", "gateway", "src", "pendingPermissionSnapshot.ts");
     let dir = process.cwd();
     let serverPath = "";
     for (let i = 0; i < 6 && !serverPath; i += 1) {

@@ -5,9 +5,18 @@ import { IdentityError, type IdentityStrategy } from "../../auth/proxyIdentity.j
 import { BoxDurableJournalError, type BoxDurableJournal } from "./boxDurableJournal.js";
 import type { BoxIdleProof } from "./boxIdleChain.js";
 import type { BoxReplayMessagePointer } from "./boxReplayMessageFile.js";
+import type { BoxUserStopCoordinator } from "./boxUserStopCoordinator.js";
+import type { BoxHoldRelease } from "./boxHoldRelease.js";
+import { rootLogger } from "../../logging/logger.js";
 
 type Journal = Pick<BoxDurableJournal, "readIdleProof">;
 type CapsuleReader = (pointer: BoxReplayMessagePointer) => Promise<unknown>;
+/** OCV5-488: stop a turn's leaf that is still parked on a tool handoff. */
+type ParkedStop = { journal: Pick<BoxHoldRelease, "findParkedHandoffRun">;
+  coordinator: Pick<BoxUserStopCoordinator, "requestStop"> };
+
+const idleLog = rootLogger.child({ subsys: "box-idle-proof" });
+const MAX_PARKED_STOPS = 8;
 
 function reply(res: ServerResponse, code: number, body: Record<string, unknown>): void {
   if (res.headersSent || res.destroyed) return;
@@ -31,7 +40,33 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
 }
 
 export function makeBoxIdleProofHandler(deps: {
-  identity: IdentityStrategy; journal: Journal; readCapsule?: CapsuleReader }) {
+  identity: IdentityStrategy; journal: Journal; readCapsule?: CapsuleReader;
+  stopParked?: ParkedStop }) {
+  const stopping = new Set<string>();
+  /** OCV5-488 (10-17 commercial uid 4): the container reads a turn's idle
+   * proof only after that turn ended on its side. A leaf of it still parked on
+   * a tool handoff (its continuation was refused, the runner died) can never
+   * be answered, yet held the session (IDLE_HISTORY_PENDING) and the account
+   * slot. Stop it as a browser Stop would: same container-scoped identity,
+   * same coordinator, proof-based close. Detached; a later poll of this proof
+   * reads the result. */
+  const stopParkedTurn = (input: { uid: bigint; containerId: bigint;
+    sessionId: string; turnKey: string }): void => {
+    const parked = deps.stopParked;
+    if (!parked) return;
+    const key = `${input.uid}:${input.containerId}:${input.sessionId}:${input.turnKey}`;
+    if (stopping.has(key) || stopping.size >= MAX_PARKED_STOPS) return;
+    stopping.add(key);
+    void (async () => {
+      const run = await parked.journal.findParkedHandoffRun(input);
+      if (!run) return;
+      const outcome = await parked.coordinator.requestStop(run);
+      idleLog.warn("box_parked_turn_stopped", { requestId: run.requestId,
+        accountId: run.accountId.toString(), outcome });
+    })().catch(() => {
+      idleLog.warn("box_parked_turn_stop_failed", { uid: input.uid.toString() });
+    }).finally(() => { stopping.delete(key); });
+  };
   return async (req: IncomingMessage, res: ServerResponse,
     ctx: { hostUuid: string; boundIp: string }): Promise<void> => {
     if (req.method !== "POST" || (req.url ?? "").split("?")[0] !== "/internal/box/idle-proof") {
@@ -78,6 +113,10 @@ export function makeBoxIdleProofHandler(deps: {
       reply(res, 503, { status: "pending", reason: "unavailable" }); return;
     }
     if (proof.status === "not_found") { reply(res, 404, { error: "NOT_FOUND" }); return; }
+    if (proof.status === "pending") {
+      stopParkedTurn({ uid: identity.uid, containerId: identity.containerId,
+        sessionId: body.session_id, turnKey: body.oc_turn_key });
+    }
     reply(res, 200, proof);
   };
 }

@@ -34,6 +34,7 @@
  * Run: npx tsx --test packages/gateway/src/__tests__/wechatInboundAdapterBinding.test.ts
  */
 
+import { gatewayMethodBody, readGatewaySource } from './helpers/gatewaySource.js'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -41,7 +42,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
-const SERVER_TS = readFileSync(join(__dirname, '..', 'server.ts'), 'utf-8')
+// server.ts + split-out modules (FINDINGS §7.6 S5: channel ingress moved to channelHandlers.ts)
+const SERVER_TS = readGatewaySource()
 
 /**
  * 抽取 handleWechatInbound 方法体源码(从 `private async handleWechatInbound`
@@ -51,7 +53,8 @@ const SERVER_TS = readFileSync(join(__dirname, '..', 'server.ts'), 'utf-8')
  * 起首的下一行(class 内 method 缩进固定 2 空格)。
  */
 function extractMethodBody(source: string, methodName: string): string {
-  const startRe = new RegExp(`^  (private|public|protected)?\\s*(async\\s+)?${methodName}\\b`, 'm')
+  // `(` after the name: the Gateway's route io adapters list `name: (...args) => …` too
+  const startRe = new RegExp(`^  (private|public|protected)?\\s*(async\\s+)?${methodName}\\(`, 'm')
   const startMatch = startRe.exec(source)
   if (!startMatch) {
     throw new Error(`method ${methodName} not found in source`)
@@ -65,13 +68,14 @@ function extractMethodBody(source: string, methodName: string): string {
   return source.slice(startIdx, endIdx)
 }
 
-const handleWechatInbound = extractMethodBody(SERVER_TS, 'handleWechatInbound')
-const handleStop = extractMethodBody(SERVER_TS, 'handleStop')
+// FINDINGS §7.6 S5: the WeChat/QQ ingress lives in channelHandlers.ts; the class keeps forwarders.
+const handleWechatInbound = gatewayMethodBody('handleWechatInbound')
+const handleStop = gatewayMethodBody('handleStop') // FINDINGS §7.6 S6: handleStop lives in wsConnection.ts
 
 // ── 基础前置:method 抽出来非空、且包含必要 keyword ──
 test('extractMethodBody finds handleWechatInbound and includes core skeleton', () => {
   assert.ok(handleWechatInbound.length > 200, 'method body must be non-trivial')
-  assert.match(handleWechatInbound, /private async handleWechatInbound/)
+  assert.match(handleWechatInbound, /(?:private async |export async function )handleWechatInbound/)
   assert.match(handleWechatInbound, /dispatchInbound\(/)
 })
 

@@ -38,12 +38,16 @@ import { BOX_MCP_TOOL_NAME, boxCatalogMatching } from "./boxToolCatalog.js";
 import { normalizeBoxResultImagesForCli } from "./boxToolResultImages.js";
 import { BOX_EXPIRED_UNPROVEN_STATE, BOX_OPERATOR_UNREACHABLE_CLOSED_STATE,
   isBoxExpiredCloseCause, isBoxUnknownPhase, parseBoxExpiredClose,
-  parseBoxOperatorUnreachableClose } from "./boxExpiredClose.js";
+  parseBoxOperatorUnreachableClose, BOX_ABSENCE_CONFIRM_MS, BOX_PROCESS_ABSENT_CAUSE,
+  isBoxBootId, parseBoxRunAbsent } from "./boxExpiredClose.js";
 
 const journalLog = rootLogger.child({ subsys: "box-journal" });
 const ACTIVE = ["reserved", "starting", "running", "unknown", "handoff", "resuming", "linked"];
 /** OCV5-322: past this age (from its first active row) a run cannot be alive. */
 export const BOX_RUN_EXPIRED_AFTER_MS = BOX_TOOL_MAX_WALL_MS + 15 * 60 * 1000;
+/** OCV5-488: a run younger than this may not have started its keeper yet;
+ * finding nothing of it on the Box is no evidence. */
+const BOX_ABSENCE_LAUNCH_GRACE_SEC = 180;
 
 export class BoxDurableJournalError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxDurableJournalError"; }
@@ -212,6 +216,9 @@ export interface BoxStoppedFailureProbeCandidate {
    * waits for tool results that no request will publish again.
    * OCV5-313: every launched detached-tool unknown leaf, whatever its phase. */
   readonly staleResume?: { readonly phase: BoxStaleResumePhase; readonly unknownForMs: number };
+  /** OCV5-488: a handoff leaf whose turn ran in a container that is no longer
+   * the user's active one (rebuilt, swept, removed), for over two minutes. */
+  readonly abandonedHandoff?: true;
   /** OCV5-313: the row is older than BOX_RUN_EXPIRED_AFTER_MS, so its run
    * cannot be alive any more (same rule as admission capacity). */
   readonly expired?: boolean;
@@ -279,7 +286,7 @@ function cleanupProofMatchesState(state: unknown, proof: BoxTerminalProof): bool
 
 // The listed Box models as SQL. The ids are fixed strings from the protocol
 // table (charset checked there), never request data.
-const BOX_MODEL_IDS_SQL = BOX_API_MODELS.map((m) => `'${m.id}'`).join(",");
+export const BOX_MODEL_IDS_SQL = BOX_API_MODELS.map((m) => `'${m.id}'`).join(",");
 /** The row's upstream id is the one its own canonical model maps to. */
 const BOX_MODEL_PAIR_SQL = `(${BOX_API_MODELS.map((m) =>
   `(ctx->>'model'='${m.id}' AND ctx->>'boxUpstreamModel'='${m.upstreamModel}')`).join(" OR ")})`;
@@ -320,7 +327,7 @@ const CLEANUP_MODE_FENCE = `(ctx->>'boxInvocationMode'='detached_tool'
     AND ctx->>'boxLaunchPermit'='true'
     AND ${BOX_MODEL_PAIR_SQL}
     AND (ctx->>'boxDetachedRunnerHash') ~ '^[a-f0-9]{64}$'))`;
-const STOP_MODE_FENCE = CLEANUP_MODE_FENCE;
+export const STOP_MODE_FENCE = CLEANUP_MODE_FENCE;
 function stoppedRunMode(ctx: Record<string, unknown>): boolean {
   return ctx.boxInvocationMode === "detached_tool"
     || (ctx.boxInvocationMode === "text" && ctx.boxLaunchPermit === true
@@ -329,7 +336,21 @@ function stoppedRunMode(ctx: Record<string, unknown>): boolean {
       && /^[a-f0-9]{64}$/.test(ctx.boxDetachedRunnerHash));
 }
 
-const STOP_PROBE_STATE_FENCE = `((state='inflight'
+/* OCV5-488 (user-approved deviation from a gateway keepalive lease, 10-17):
+ * whether the turn that handed a tool call to a Box run can still answer it
+ * is decided server-side. A user has at most one active container; a run
+ * whose turn ran in any other (rebuilt, swept, removed) can never be
+ * answered, while one in the active container is left alone however long
+ * its tools run. A keepalive would only cover containers already running a
+ * new runtime. */
+// lint-agent-containers-kind: allow — 按本行自己的 container_id 查它是否仍 active;与容器种类无关
+export const OWNER_CONTAINER_GONE = `(container_id IS NULL OR NOT EXISTS (
+  SELECT 1 FROM agent_containers ac
+   WHERE ac.id = request_finalize_journal.container_id AND ac.state = 'active'))`;
+/** A handoff this recent may belong to a container being replaced right now. */
+const BOX_ABANDONED_HANDOFF_GRACE_MS = 2 * 60_000;
+
+export const STOP_PROBE_STATE_FENCE = `((state='inflight'
   AND ctx->>'boxState' IN ('running','unknown','linked')
   AND NOT (ctx ? 'boxToolHandoff'))
   OR (state IN ('inflight','finalizing','committed')
@@ -2568,10 +2589,16 @@ export class BoxDurableJournal implements BoxJournalPort {
    * OCV5-312 operator close left in operator_unreachable_closed. */
   async markRunExpiredUnproven(input: Pick<BoxJournalAdmission,
     "requestId" | "uid" | "accountId" | "runNonce" | "leaseEpoch"> & {
-    cause: string; operatorClosed?: true; apply?: boolean }): Promise<BoxExpiredCloseResult> {
+    cause: string; operatorClosed?: true; apply?: boolean;
+    /** OCV5-488: instead of the age, the leaf's boxRunAbsent first look plus
+     * this second one (same boot id at least BOX_ABSENCE_CONFIRM_MS later, or
+     * another boot id) found nothing of the run on the Box. */
+    absence?: { boot: string } }): Promise<BoxExpiredCloseResult> {
     if (!/^[A-Za-z0-9_-]{1,64}$/.test(input.requestId) || input.uid <= 0n
       || input.accountId <= 0n || !/^[a-f0-9]{24}$/.test(input.runNonce)
-      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch) || !isBoxExpiredCloseCause(input.cause)) {
+      || !/^[a-f0-9]{32}$/.test(input.leaseEpoch) || !isBoxExpiredCloseCause(input.cause)
+      || (input.absence !== undefined && (input.cause !== BOX_PROCESS_ABSENT_CAUSE
+        || !isBoxBootId(input.absence.boot) || input.operatorClosed === true))) {
       throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_IDENTITY_INVALID");
     }
     const uid = input.uid.toString(), accountId = input.accountId.toString();
@@ -2585,7 +2612,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       await client.query("BEGIN");
       const lockedSessionId = await lockChainSession(client, input.uid, input.requestId);
       type Row = { request_id: string; state: string; final_credits: string | null;
-        failure_code: string | null; expired: boolean; ctx: Record<string, unknown> };
+        failure_code: string | null; expired: boolean; launched: boolean; now_ms: string;
+        ctx: Record<string, unknown> };
       const rows: Row[] = [];
       const seen = new Set<string>();
       let cursor: string | null = input.requestId;
@@ -2594,9 +2622,12 @@ export class BoxDurableJournal implements BoxJournalPort {
         seen.add(cursor);
         const found: { rows: Row[]; rowCount: number | null } = await client.query<Row>(
           `SELECT request_id,state,final_credits::text AS final_credits,failure_code,ctx,
-              created_at <= NOW() - make_interval(secs => $3::double precision) AS expired
+              created_at <= NOW() - make_interval(secs => $3::double precision) AS expired,
+              created_at <= NOW() - make_interval(secs => $4::double precision) AS launched,
+              (EXTRACT(EPOCH FROM NOW())*1000)::bigint::text AS now_ms
              FROM request_finalize_journal
-            WHERE request_id=$1 AND user_id=$2 FOR UPDATE`, [cursor, uid, expirySec]);
+            WHERE request_id=$1 AND user_id=$2 FOR UPDATE`,
+          [cursor, uid, expirySec, BOX_ABSENCE_LAUNCH_GRACE_SEC]);
         const row = found.rows[0];
         if (found.rowCount !== 1 || !row?.ctx || row.ctx.boxInvocationRecovery !== "v1"
           || !stoppedRunMode(row.ctx) || row.ctx.boxRunNonce !== input.runNonce
@@ -2684,7 +2715,18 @@ export class BoxDurableJournal implements BoxJournalPort {
         || basis.boxInvocationMode !== "detached_tool"
         || typeof basis.boxHandoffRevision !== "string"
         || !UUID_V4.test(basis.boxHandoffRevision)))) invalid();
-      if (!leaf.expired) throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_RUN_NOT_EXPIRED");
+      if (input.absence) {
+        const seen = parseBoxRunAbsent(basis.boxRunAbsent);
+        if (!leaf.launched || !seen || (seen.boot === input.absence.boot
+          && Number(leaf.now_ms) - seen.atMs < BOX_ABSENCE_CONFIRM_MS)) {
+          throw new BoxDurableJournalError("BOX_ABSENT_CLOSE_NOT_CONFIRMED");
+        }
+        // Calls the run completed before it vanished are settled first: the
+        // Box billing scan does not read expired rows. Nothing here bills.
+        if (rows.some((row) => row.ctx.boxToolHandoff !== undefined && row.state !== "committed")) {
+          throw new BoxDurableJournalError("BOX_ABSENT_CLOSE_BILLING_UNSETTLED");
+        }
+      } else if (!leaf.expired) throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_RUN_NOT_EXPIRED");
       if (!handoff) {
         const usage = await client.query(
           `SELECT 1 FROM usage_records WHERE request_id=$1 AND user_id=$2 LIMIT 1`,
@@ -2692,7 +2734,8 @@ export class BoxDurableJournal implements BoxJournalPort {
         if (usage.rowCount) throw new BoxDurableJournalError("BOX_EXPIRED_CLOSE_USAGE_CONFLICT");
       }
       const params = [leaf.request_id, uid, input.leaseEpoch, input.runNonce, actual,
-        BOX_EXPIRED_UNPROVEN_STATE, prior, input.cause, expirySec];
+        BOX_EXPIRED_UNPROVEN_STATE, prior, input.cause,
+        input.absence ? BOX_ABSENCE_LAUNCH_GRACE_SEC : expirySec];
       const marker = `ctx || jsonb_build_object('boxState',$6::text,
               'boxExpiredClose',jsonb_build_object('v',1,
                 'atMs',(EXTRACT(EPOCH FROM NOW())*1000)::bigint,
@@ -2700,7 +2743,8 @@ export class BoxDurableJournal implements BoxJournalPort {
       const fence = `request_id=$1 AND user_id=$2
             AND ctx->>'boxLeaseEpoch'=$3 AND ctx->>'boxRunNonce'=$4 AND ctx->>'boxState'=$5
             AND NOT (ctx ? 'boxTerminalProof') AND NOT (ctx ? 'boxResumeRequestId')
-            AND NOT (ctx ? 'settlementClaimId') AND NOT (ctx ? 'boxExpiredClose')
+            AND NOT (ctx ? 'settlementClaimId') AND NOT (ctx ? 'boxExpiredClose')${
+              input.absence ? "\n            AND ctx ? 'boxRunAbsent'" : ""}
             AND created_at <= NOW() - make_interval(secs => $9::double precision)`;
       const changed = handoff ? await client.query(
         `UPDATE request_finalize_journal SET ctx=${marker}
@@ -2737,11 +2781,12 @@ export class BoxDurableJournal implements BoxJournalPort {
    * pinned Box read returns a valid terminal marker; no paid call is retried. */
   async listStoppedFailureProbeCandidates(limit = 10): Promise<BoxStoppedFailureProbeCandidate[]> {
     const found = await this.pool.query<{ request_id: string; user_id: string;
-      state: string; unknown_for_ms: string; expired: boolean;
+      state: string; unknown_for_ms: string; expired: boolean; owner_gone: boolean;
       ctx: Record<string, unknown> }>(
       `SELECT request_id,user_id::text,state,ctx,
           GREATEST(0,(EXTRACT(EPOCH FROM (NOW()-updated_at))*1000))::bigint::text AS unknown_for_ms,
-          created_at <= NOW() - make_interval(secs => $2::double precision) AS expired
+          created_at <= NOW() - make_interval(secs => $2::double precision) AS expired,
+          ${OWNER_CONTAINER_GONE} AS owner_gone
         FROM request_finalize_journal
         WHERE ${STOP_PROBE_STATE_FENCE} AND ctx->>'boxInvocationRecovery'='v1'
           AND ${STOP_MODE_FENCE}
@@ -2792,12 +2837,18 @@ export class BoxDurableJournal implements BoxJournalPort {
         && isBoxUnknownPhase(ctx.boxUnknownPhase)
         && Number.isSafeInteger(unknownForMs)
         ? { phase: ctx.boxUnknownPhase, unknownForMs } : undefined;
+      // OCV5-488: a leaf parked on a tool handoff whose turn ran in a container
+      // that is no longer the user's active one can never be answered.
+      const abandonedHandoff = row.owner_gone === true && ctx.boxState === "handoff"
+        && ctx.boxToolHandoff !== undefined && Number.isSafeInteger(unknownForMs)
+        && unknownForMs >= BOX_ABANDONED_HANDOFF_GRACE_MS;
       const cliCwd = nativeKeeperCwd(ctx, ctx.boxRunNonce);
       candidates.push({ requestId: row.request_id, uid: BigInt(row.user_id),
         accountId: BigInt(ctx.boxAccountId), runNonce: ctx.boxRunNonce,
         leaseEpoch: ctx.boxLeaseEpoch, linked: ctx.boxOwnerRequestId !== undefined,
         ...(cliCwd ? { cliCwd } : {}),
         ...(staleResume ? { staleResume } : {}),
+        ...(abandonedHandoff ? { abandonedHandoff: true as const } : {}),
         ...(row.expired === true ? { expired: true } : {}) });
     }
     return candidates;

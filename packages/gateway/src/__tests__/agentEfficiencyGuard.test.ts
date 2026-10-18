@@ -1,6 +1,7 @@
 /**
  * Run: npx tsx --test packages/gateway/src/__tests__/agentEfficiencyGuard.test.ts
  */
+import { readSessionManagerSource } from './helpers/sessionManagerSource.js'
 import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -343,7 +344,8 @@ describe('session hook helpers + format', () => {
 
 describe('sessionManager mount contract', () => {
   it('hooks the existing tool_use_detected / submit / turn-end path', () => {
-    const src = readFileSync(new URL('../sessionManager.ts', import.meta.url), 'utf8')
+    // sessionManager.ts + split-out modules (FINDINGS §7.6 M1–M3)
+    const src = readSessionManagerSource()
     assert.match(src, /applyEfficiencyToolObservation/)
     assert.match(src, /prepareEfficiencyTurnNote/)
     assert.match(src, /finalizeEfficiencyTurn/)

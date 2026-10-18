@@ -7,7 +7,7 @@
  * (含刚注册 1 分钟的)都收到一条 "任务面板每日简报(0/0/0)" 站内信。
  *
  * 本门钉死三层:
- *   1. gateway server.ts 的巡检/通知启动包在 isTaskboardEnabled() 内;
+ *   1. gateway gatewayLifecycle.ts 的巡检/通知启动包在 isTaskboardEnabled() 内;
  *   2. master 两条容器 provision 路径(v3supervisor / supervisor)都 spread taskboardContainerEnv();
  *      taskboardContainerEnv 对 commercial flavor 与 flavor 判定失败均输出 OC_TASKBOARD_ENABLED=0;
  *   3. 简报在空面板(无任何票)时不发送(sendDigestForDate 先查 boardHasTickets)。
@@ -19,7 +19,7 @@ import { resolve } from 'node:path'
 const root = process.cwd()
 const read = (rel: string): string => readFileSync(resolve(root, rel), 'utf8')
 
-const server = read('packages/gateway/src/server.ts')
+const server = read('packages/gateway/src/gatewayLifecycle.ts')
 const feature = read('packages/gateway/src/taskboard/feature.ts')
 const notify = read('packages/gateway/src/taskboard/notify.ts')
 const taskboardEnv = read('packages/commercial/src/agent-sandbox/taskboardEnv.ts')
@@ -30,7 +30,7 @@ const sup = read('packages/commercial/src/agent-sandbox/supervisor.ts')
 assert.match(feature, /export function taskboardEnabledFromEnv\(raw: string \| undefined\): boolean \{\n  return raw !== '0'/)
 assert.match(server, /import \{ isTaskboardEnabled \} from '\.\/taskboard\/feature\.js'/)
 const gateAt = server.indexOf('if (isTaskboardEnabled()) {')
-assert.ok(gateAt > 0, 'server.ts must gate taskboard automation with isTaskboardEnabled()')
+assert.ok(gateAt > 0, 'gatewayLifecycle.ts must gate taskboard automation with isTaskboardEnabled()')
 for (const needle of ['new TaskboardNotifier(', 'new PatrolEngine(', 'this._taskboardTickTimer = setInterval(']) {
   const at = server.indexOf(needle)
   assert.ok(at > gateAt, `${needle} must come after the isTaskboardEnabled gate`)
