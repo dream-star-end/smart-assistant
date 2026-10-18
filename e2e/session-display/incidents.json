@@ -7879,9 +7879,16 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/ocWebSearch.test.ts",
           "assertion": "OCV5-510 oc-web search returns source URLs through the authenticated master proxy"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-ccb-mcp-availability.ts",
+          "assertion": "[ocv5-510-codex-web-search-cli] PASS — the real CLI restores container identity and returns a sourced result through MiniMax then Grok"
         }
       ],
-      "coverageCommits": []
+      "coverageCommits": [
+        "71a9e763"
+      ]
     }
   ]
 }
