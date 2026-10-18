@@ -1476,7 +1476,6 @@ export function App() {
       sessionEffort,
       contextTier,
       serviceTier,
-      collabMode,
       collabUi,
       collabAsDefault,
       sessions,
