@@ -91,7 +91,7 @@ export function antigravityAccountSupportsModel(models: AntigravityModelAvailabi
     const q = models[id]
     if (!q) return false
     if (q.remainingFraction !== 0) return true
-    const reset = q.resetTime === null ? NaN : Date.parse(q.resetTime)
+    const reset = q.resetTime === null ? Number.NaN : Date.parse(q.resetTime)
     return Number.isFinite(reset) && reset <= now
   })
 }
