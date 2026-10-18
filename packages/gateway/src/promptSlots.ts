@@ -57,7 +57,8 @@ import {
   type IdentityCompatAssets,
   type SkillStoreCompatOptions,
 } from '@openclaude/storage'
-import { AGENT_MODEL_AUTO, estimateModelHistoryTokens } from '@openclaude/protocol'
+import { AGENT_MODEL_AUTO } from '@openclaude/protocol'
+import { promptContentMetrics } from './promptContentMetrics.js'
 import { createLogger } from './logger.js'
 const promptTimingLog = createLogger({ module: 'promptTiming' })
 import { request as undiciRequest } from 'undici'
@@ -1733,16 +1734,6 @@ export interface PromptContextResult {
   frozenProjectContext?: FrozenProjectContextDigests
 }
 
-async function sha256Hex(s: string): Promise<string> {
-  const data = new TextEncoder().encode(s)
-  const buf = await crypto.subtle.digest('SHA-256', data)
-  const arr = new Uint8Array(buf)
-  let out = ''
-  for (let i = 0; i < arr.length; i++) {
-    out += arr[i].toString(16).padStart(2, '0')
-  }
-  return out
-}
 
 /**
  * Build the complete extra-prompt by assembling all slots in order.
@@ -1983,34 +1974,34 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   if (resolvePromptUserRole(ctx) === 'admin') {
     content = stripBaselineRestrictions(content)
   }
-  const applied: PromptSlotApplied[] = await Promise.all(
-    effectiveSlots.map(async (s) => {
-      const base: PromptSlotApplied = {
-        name: s.name,
-        bytes: Buffer.byteLength(s.content, 'utf-8'),
-        sha256: await sha256Hex(s.content),
-      }
-      // MODEL_HINT slot 带 canonicalId(provider 已归一化),透传到 meta.model_id
-      // 让 runner 用作 bounded Prom label。其它 slot 不需要 meta。
-      if ((s as ModelHintSlot).canonicalId !== undefined) {
-        base.meta = { model_id: (s as ModelHintSlot).canonicalId }
-      }
-      return base
-    }),
-  )
+  const metrics = await Promise.all(effectiveSlots.map((slot) => promptContentMetrics.get(slot.content)))
+  const contentMetrics = await promptContentMetrics.get(content)
+  const applied: PromptSlotApplied[] = effectiveSlots.map((s, index) => {
+    const metric = metrics[index]!
+    const base: PromptSlotApplied = {
+      name: s.name,
+      bytes: metric.bytes,
+      sha256: metric.sha256,
+    }
+    // Mutable turn metadata is never retained in the content-only cache.
+    if ((s as ModelHintSlot).canonicalId !== undefined) {
+      base.meta = { model_id: (s as ModelHintSlot).canonicalId }
+    }
+    return base
+  })
   const slotTokensEstimate = Object.fromEntries(
     ['ENV', 'SOUL', 'USER', 'PROJECT', 'INTELLIGENT_UI', 'AGENTS', 'SKILLS',
       'SKILLS_LITERATURE', 'MEMORY', 'PROJECT_MEMORY', 'TOOLS', 'MODEL_HINT', 'RESEARCH', 'REPO']
-      .map(name => [name, effectiveSlots.filter(slot => slot.name === name)
-        .reduce((sum, slot) => sum + estimateModelHistoryTokens(slot.content), 0)]),
+      .map(name => [name, effectiveSlots.reduce((sum, slot, index) =>
+        sum + (slot.name === name ? metrics[index]!.tokensEstimate : 0), 0)]),
   )
   promptTimingLog.info('prompt_context_timing', {
     sessionKey: ctx.sessionKey, elapsedMs: performance.now() - contextStartedAt,
-    tokensEstimate: estimateModelHistoryTokens(content), slotTokensEstimate,
+    tokensEstimate: contentMetrics.tokensEstimate, slotTokensEstimate,
   })
   return {
     content,
-    contentSha256: await sha256Hex(content),
+    contentSha256: contentMetrics.sha256,
     applied,
     intelligentUi,
     frozenProjectContext:
