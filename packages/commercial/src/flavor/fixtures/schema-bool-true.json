@@ -3,7 +3,7 @@
   "flavor": "commercial",
   "sourceCommit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "builder": "deploy-v5.sh",
-  "expectedHosts": ["kl-mirror", "ser135234097086"],
+  "expectedHosts": ["kl-mirror", "ser135234097086", "cj-volc-gz"],
   "expectedRoots": ["/opt/openclaude/openclaude-v5", "/opt/openclaude/openclaude-v5-b"],
   "expectedDbNames": ["openclaude"],
   "guardGeneration": 1
