@@ -106,7 +106,7 @@ type Api = {
   home: string;
   sessionsBackend: (pool: unknown) => SessionsBackend;
   /** OCV5-509: the reconciler sweep that closes a recovery chain paused before it ran. */
-  closeRefusedRecoveryChains: (pool: unknown) => Promise<number>;
+  closeRefusedRecoveryChains: (pool: unknown, limit?: number) => Promise<number>;
   tape: { version: number; partBytes: number };
   /** The Box CLI version gate and the exec transport its read goes through. */
   cliVersion: { gate: () => { read: (target: unknown) => Promise<string> };
@@ -280,7 +280,8 @@ async function load(): Promise<Api> {
       defaults: { permissionMode: "bypassPermissions", model: authority.BOX_NATIVE_CONTEXT_MODEL } }),
     home: process.env.OPENCLAUDE_HOME!,
     sessionsBackend: (pool) => sessionsBackend.createPgSessionsBackend(pool, { expectedGeneration: 1 }),
-    closeRefusedRecoveryChains: (pool) => sessionsBackend.closeRefusedRecoveryChains(pool),
+    closeRefusedRecoveryChains: (pool, limit) => sessionsBackend.closeRefusedRecoveryChains(pool,
+      limit === undefined ? {} : { limit }),
     tape: { version: protocol.LOSSLESS_TURN_TAPE_VERSION, partBytes: protocol.LOSSLESS_TURN_TAPE_PART_BYTES },
     cliVersion: { gate: () => new cliVersion.BoxCliVersionGate(), launchResolver: cliVersion.gateBoxLaunchResolver,
       transport: (fetchImpl) => new transport.BoxExecTransport({ execUrl: "https://box.invalid/agent.v1.ControlService/Exec",
@@ -2399,16 +2400,18 @@ async function proveRefusedRecoveryClosed(api: Api, database: unknown): Promise<
     };
     const last = async (sessionId: string) =>
       (await backend.getClientSession(sessionId, sessionUser))?.messages.at(-1) as Record<string, unknown> | undefined;
-    const refused = await chain("refused", "dispatch_not_accepted");
-    const policy = await chain("policy", "refused:UNAUTHORIZED_MODEL");
-    // the recovery row was answered after all: nothing to close
+    // the recovery row was answered after all: nothing to close, and (oldest) it must not hold the sweep up
     const answered = await chain("answered", "dispatch_not_accepted");
     const reply = await backend.appendServerAuthoredMessage(answered.sessionId, sessionUser,
       { id: "m-ocv5-509-answer", role: "assistant", text: "done", ts: 2, status: "completed", _source: "server" });
     if (!reply.applied) fail("REFUSED_RECOVERY_ANSWER_NOT_APPENDED");
+    const refused = await chain("refused", "dispatch_not_accepted");
+    const policy = await chain("policy", "refused:UNAUTHORIZED_MODEL");
     // a chain that ran and gave up has its own card; it is not this sweep's
     const exhausted = await chain("exhausted", "automatic_retry_exhausted");
-    if (await api.closeRefusedRecoveryChains(db) !== 2) fail("REFUSED_RECOVERY_NOT_CLOSED");
+    // one chain per sweep (Codex r1): each sweep reaches the next open chain
+    const swept = [await api.closeRefusedRecoveryChains(db, 1), await api.closeRefusedRecoveryChains(db, 1)];
+    if (!isDeepStrictEqual(swept, [1, 1])) fail(`REFUSED_RECOVERY_NOT_CLOSED_${swept.join(",")}`);
     for (const closed of [refused, policy]) {
       const card = await last(closed.sessionId);
       // what the client reads as the end of the turn (adoptPendingAutomaticRecoveryFromHistory)
