@@ -30,6 +30,7 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { provePendingUser } from "./lib/boxPendingUserProof.js";
+import { proveLocalCatalogOwner } from "./lib/boxLocalCatalogOwnerProof.js";
 const LIMIT_MS = 120_000;
 const CANDIDATE = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
 const PROXY = join(CANDIDATE, "packages/commercial/src/http/proxy");
@@ -38,6 +39,7 @@ const LIVE_ONLY = "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION";
 type Body = Record<string, unknown>;
 type Expected = { id: string; boxName: string; clientName: string; input: Record<string, unknown> };
 type Api = {
+  localCatalogOwner: (legacyWire: Body) => Promise<Record<string, unknown>>;
   gate: (body: Body, toolBridgeEnabled: boolean) => string | null;
   classify: (body: Body) => { classification: string; rejectCode: string | null; toolIds?: readonly string[];
     answeredToolIds?: readonly string[] };
@@ -223,7 +225,64 @@ async function load(): Promise<Api> {
   const protocol = await import(pathToFileURL(join(CANDIDATE, "packages/protocol/src/index.ts")).href);
   const sessionsBackend = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/db/pgSessionsBackend.ts")).href);
   const mapper = await import(pathToFileURL(join(PROXY, "boxMessagesMapper.ts")).href);
-  return { gate: gate.validateBoxRequest, classify: prepared.classifyBoxContinuation,
+  const localCatalog = await import(pathToFileURL(join(GATEWAY, "modelCatalogClient.ts")).href);
+  const spawnConfig = await import(pathToFileURL(join(GATEWAY, "subprocessSpawnConfig.ts")).href);
+  const modelSnapshot = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/billing/modelCatalog.ts")).href);
+  const catalogHttp = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/http/internalModelCatalog.ts")).href);
+  const containerIdentity = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/auth/containerIdentity.ts")).href);
+  return {
+    localCatalogOwner: async (legacyWire) => {
+      const model = "box-api-claude-haiku-5-5";
+      const snapshot = new modelSnapshot.ModelCatalogSnapshot({ entries: [{ entryId: 1, modelId: model,
+        engine: "ccb", providerId: "box_cli", upstreamModelId: null, contextWindow: 200000,
+        capabilityProfile: { supportsVision: false, reasoning: { supported: ["low"], codexModelDefault: null },
+          ccb: { capabilityZero: true, supportsThinking: false, contextOwner: "box-native-v1" } },
+        capabilitySchemaVersion: 1, state: "active", lockVersion: 0 }], aliases: new Map(),
+        pricing: new Map([[model, { modelId: model, displayName: model, inputPerMtok: 100n, outputPerMtok: 500n,
+          cacheReadPerMtok: 10n, cacheWritePerMtok: 100n, multiplier: "1.000", visibility: "public",
+          sortOrder: 1, defaultEffort: "low" }]]), securityEpoch: 5n });
+      const secret = "a".repeat(64), token = `oc-v3.7.${secret}`;
+      const authz = { role: "admin" as const, grantedModelIds: new Set<string>() };
+      const handler = catalogHttp.makeModelCatalogHandler({ identityRepo: {
+        async findActiveByHostAndBoundIp() { return { id: 7, user_id: 3, bound_ip: "127.0.0.1",
+          host_uuid: "fixture-518", secret_hash: containerIdentity.hashSecret(secret) }; },
+      }, catalog: { async assertFresh() { return snapshot; } }, loadUserModelAuthz: async () => authz,
+        readEpoch: async () => 5n, loadRoutingAvailability: async () => ({ unavailableProviderIds: new Set<string>(),
+          revision: "fixture-availability" }), loadAgentCostOverrides: async () => ({}) });
+      let fullFetches = 0, wireOwner: unknown;
+      const env = { OC_MODEL_AUTHORITY: "1", OPENCLAUDE_V3_MASTER_BASE_URL: "http://fixture.invalid",
+        OPENCLAUDE_V3_CONTAINER_TOKEN: token };
+      const lkgPath = join(process.env.OPENCLAUDE_HOME!, "ocv5-518-legacy-lkg.json");
+      writeFileSync(lkgPath, JSON.stringify(legacyWire));
+      const fetcher = (async (url: string, init: { headers: Record<string, string> }) => {
+        const path = new URL(url).pathname;
+        let text = "";
+        const res = { statusCode: 0, setHeader() {}, end(value?: string) { text = value ?? ""; } };
+        await handler({ method: "GET", url: path, headers: init.headers } as never, res as never,
+          { hostUuid: "fixture-518", boundIp: "127.0.0.1" });
+        if (path === protocol.MODEL_CATALOG_PATH) {
+          fullFetches += 1;
+          wireOwner = JSON.parse(text).models?.find((row: { model_id: string }) => row.model_id === model)?.context_owner;
+        }
+        return { statusCode: res.statusCode, body: (async function* () { yield Buffer.from(text); })() };
+      }) as never;
+      const client = new localCatalog.ModelCatalogClient({ env, lkgPath, fetcher });
+      localCatalog._setModelCatalogClientForTests(client);
+      try {
+        const runtime = await spawnConfig.resolveTurnRuntime(undefined, model, env, "ccb");
+        const view = await client.getView();
+        const cold = await new localCatalog.ModelCatalogClient({ env, lkgPath, fetcher }).getView();
+        const localToken = runtime.headers!.localCatalog!;
+        const gateDecision = await authorityGate.enforceModelAuthority({ catalog: { async assertFresh() { return snapshot; } },
+          keyring: null, headers: { [localCatalog.LOCAL_CATALOG_HEADER]: localToken }, uid: 3n, containerId: 7n,
+          model, loadUserModelAuthz: async () => authz });
+        return { wireOwner, descriptorOwner: runtime.descriptor?.contextOwner,
+          coldOwner: cold.resolve(model)?.contextOwner, projectionFormat: view.projectionFormat,
+          projectionRevision: view.projectionRevision, fullFetches,
+          token: JSON.parse(Buffer.from(localToken, "base64url").toString("utf8")), gateKind: gateDecision.authorityKind };
+      } finally { localCatalog._setModelCatalogClientForTests(null); }
+    },
+    gate: gate.validateBoxRequest, classify: prepared.classifyBoxContinuation,
     compile: (body: Body) => mapper.compileBoxCliSyntheticTurn(body, { cwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`, cliVersion: "2.1.280" }),
     match: matcher.matchBoxToolResults, fitForCli: images.normalizeBoxResultImagesForCli,
     echo: (expected) => new echo.BoxToolResultEcho(expected),
@@ -3616,7 +3675,7 @@ async function main(): Promise<void> {
   process.env.OPENCLAUDE_HOME = home;
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
-    provePendingUser(api), proveImageCaption(api), proveParallelImageCaption(api), proveForeignToolHistory(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
+    provePendingUser(api), await proveLocalCatalogOwner(api), proveImageCaption(api), proveParallelImageCaption(api), proveForeignToolHistory(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveMixedCallTurnCut(api),
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),
