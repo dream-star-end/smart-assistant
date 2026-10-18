@@ -5,7 +5,7 @@ No routing, provider, pricing, default-context, registration, or commercial prod
 
 ## Relay and correlation
 
-codex_upstream_timing records allowlisted numeric milestones for POST responses
+codex_relay_timing records allowlisted numeric milestones for POST responses
 and GET models. POST response inspection no longer depends on a supplier Content-Type.
 The bounded passive tap preserves every byte; a JSON/error body never becomes a fabricated delta.
 A delta must contain non-whitespace text. The existing 2 MiB request and 256 KiB event
@@ -20,7 +20,7 @@ failure/abort stages contain no upstream error text, URLs, queries, credentials 
 The dedicated downstream x-openclaude-relay-request-id is set after copying supplier headers.
 It cannot be replaced by a supplier and is never forwarded upstream. Existing x-request-id
 behavior is retained. The CLI's HTTP-completed SQLite metadata links this private ID to
-processUuid/threadId/turnId; kernel logs link the thread/turn to the user trace. Missing native
+processUuid/threadId/turnId; gateway runner logs link threadId to the user trace; CLI turnId is retained for serial-window association. Missing native
 session/conversation request headers remain missing: we do not fabricate or send session IDs
 to a provider. For a caller-selected test-account database:
 
