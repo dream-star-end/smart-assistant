@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
 import { test } from "node:test";
+import { createServer } from "node:http";
 import { buildHarnessPage, serveHarnessPage } from "./harness-page.mjs";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
 const { chromium } = createRequire(import.meta.url)("playwright-core");
@@ -19,20 +20,34 @@ test("OCV5-508 generated Markdown links download authenticated file bytes", { ti
     build.onLoad({ filter: /\/MarkdownImpl\.tsx$/ }, () => ({ contents: execFileSync("git", ["show", "98e728220:packages/web-react/src/components/MarkdownImpl.tsx"], { cwd: root, encoding: "utf8" }), loader: "tsx" }));
   } }] : [];
   await buildHarnessPage({ harness: "artifact-link-harness.tsx", assetDir: dir, plugins });
-  const server = await serveHarnessPage(dir);
+  const assets = await serveHarnessPage(dir);
+  let signs = [];
+  const bytes = "name,total\nA,42\n";
+  // A real HTTP attachment is required: route.fulfill plus aborting the probe fetch cancels Chromium's native download.
+  const http = createServer(async (req, res) => {
+    if (req.url === "/api/media-sign") {
+      let body = ""; for await (const chunk of req) body += chunk;
+      const { paths } = JSON.parse(body); signs.push(paths);
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify(Object.fromEntries(paths.map((p) => [p, "/api/media?signed=fixture"]))));
+      return;
+    }
+    if (req.url === "/api/media?signed=fixture") {
+      res.writeHead(200, { "content-type": "text/csv", "content-disposition": "attachment; filename*=UTF-8''%E6%8A%A5%E8%A1%A8%202026.csv", "content-length": String(Buffer.byteLength(bytes)) });
+      res.end(bytes); return;
+    }
+    const upstream = await fetch(new URL(req.url ?? "/", assets.url));
+    res.writeHead(upstream.status, Object.fromEntries(upstream.headers));
+    res.end(Buffer.from(await upstream.arrayBuffer()));
+  });
+  await new Promise((done) => http.listen(0, "127.0.0.1", done));
+  const server = { url: `http://127.0.0.1:${http.address().port}/` };
   const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
   try {
     for (const width of [1280, 390]) {
       const page = await browser.newPage({ viewport: { width, height: 844 }, acceptDownloads: true });
-      const signs = [];
+      signs = [];
       await page.route("https://example.test/preview.png", (route) => route.fulfill({ contentType: "image/svg+xml", body: '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="32"><text x="2" y="20">Report</text></svg>' }));
-      await page.route("**/api/media-sign", async (route) => {
-        const { paths } = route.request().postDataJSON(); signs.push(paths);
-        await route.fulfill({ json: Object.fromEntries(paths.map((p) => [p, `${server.url}api/media?signed=fixture`])) });
-      });
-      const bytes = "name,total\nA,42\n";
-      await page.route("**/api/media?signed=fixture", (route) => route.fulfill({ status: 200,
-        headers: { "content-type": "text/csv", "content-disposition": "attachment; filename*=UTF-8''%E6%8A%A5%E8%A1%A8%202026.csv", "content-length": String(Buffer.byteLength(bytes)) }, body: bytes }));
       await page.goto(server.url);
       const link = page.getByRole("link", { name: "下载季度报表", exact: true });
       await link.waitFor();
@@ -57,5 +72,5 @@ test("OCV5-508 generated Markdown links download authenticated file bytes", { ti
       if (shots) await download.saveAs(join(shots, `artifact-downloaded-${width}.csv`));
       await page.close();
     }
-  } finally { await browser.close(); await server.close(); }
+  } finally { await browser.close(); http.closeAllConnections(); await new Promise((done) => http.close(done)); await assets.close(); }
 });
