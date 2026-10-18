@@ -2375,10 +2375,10 @@ async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<
   });
 }
 
-// [ocv5-509-refused-recovery-closed] PASS — a recovery paused before it ran ends its turn with a visible card, and an answered or exhausted chain is left alone
+// [ocv5-509-refused-recovery-closed] PASS — a recovery paused before it ran ends its turn with a visible card once nothing will run it on, and an answered chain is left alone
 async function proveRefusedRecoveryClosed(api: Api, database: unknown): Promise<string> {
   return withSessionsBackend(api, database, (backend, db) => refusedRecoveryProof({ backend, db,
-    close: (pool) => api.closeRefusedRecoveryChains(pool), model: MODEL }));
+    close: (pool) => api.closeRefusedRecoveryChains(pool), model: MODEL, takeover: true }));
 }
 
 // [ocv5-337-foreign-tool-history] PASS — tool history from another model is admitted and staged under paired Box tool ids
