@@ -6,18 +6,8 @@ let _spawnFn: typeof spawn = spawn
 export function __setCodexAppServerSpawnForTests(fn: typeof spawn | null): void {
   _spawnFn = fn ?? spawn
 }
-export function _codexMemoryTurnEnv(
-  agentId: string,
-  sessionKey: string,
-  routing?: { gatewayPort?: number; contextFile?: string | null },
-): Record<string, string> {
-  return {
-    OC_AGENT_ID: agentId,
-    OC_SESSION_KEY: sessionKey,
-    ...(routing?.gatewayPort ? { OPENCLAUDE_GATEWAY_PORT: String(routing.gatewayPort) } : {}),
-    ...(routing?.contextFile ? { OPENCLAUDE_DELEGATE_CONTEXT_FILE: routing.contextFile } : {}),
-  }
-}
+import { _codexMemoryTurnEnv } from './codexMemoryTurnEnv.js'
+export { _codexMemoryTurnEnv } from './codexMemoryTurnEnv.js'
 import { EventEmitter } from 'node:events'
 import type { IntelligentUiApplied } from '../promptSlots.js'
 import {

@@ -6,9 +6,9 @@
 
 ## 用户路径
 
-已认证用户进入可见的 workspace、lane 准入成功后，页面并行发一个
-POST /api/agent/prepare，无须等 IndexedDB 会话记录完成。认证刷新不会取消同身份的在途请求；
-离开页面/切换账号会取消浏览器请求。StrictMode 重演可重发，但服务端按账号去重。
+用户登录或页面恢复认证、lane 准入成功且页面可见后，认证生命周期 hook 并行发一个
+POST /api/agent/prepare，无须等 IndexedDB 会话记录完成。token 刷新不会取消同身份的在途请求；
+关闭页面/切换账号会取消浏览器请求。StrictMode 重演可重发，但服务端按账号去重。
 正常 WebSocket 仍负责 hello、游标与消息，不引入第二条连接或修改握手、idleSweep 阈值。
 
 该提示只提前调用现有 ensureContainerEndpointReady，使用原 singleflight。
