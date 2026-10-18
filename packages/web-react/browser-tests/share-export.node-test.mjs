@@ -53,6 +53,10 @@ test("OCV5-507 sharing and Markdown downloads contain final answers and portable
         assert.ok(output.includes("print(42)"));
       }
       assert.ok(md.includes("生成销售报表"));
+      assert.ok(md.includes("## 助手（未完成）"));
+      assert.ok(md.includes("已交付的部分报告仍可导出。"));
+      assert.ok(!copy.includes("已交付的部分报告"));
+      assert.ok(!canvas.includes("已交付的部分报告"));
       await page.close();
     }
   } finally { await browser.close(); await server.close(); }

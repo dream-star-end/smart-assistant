@@ -1,7 +1,7 @@
 import { uiPlainText } from "../../components/iui/plainText";
 import type { ChatMessage } from "./model";
 
-import { selectShareMessages } from "./shareSelection";
+import { selectExportMessages } from "./shareSelection";
 import { publicArtifactText } from "./publicArtifactText";
 
 function pad(n: number): string {
@@ -23,13 +23,13 @@ function headingFor(role: ChatMessage["role"]): string {
 
 /**
  * 把当前内存窗消息编成会话导出 Markdown。
- * 与分享长图同口径，只收真实提问和最终回答；工具、思考和过程不导出。
+ * 收真实提问和最终回答；失败前已交付的部分正文标记未完成后保留，工具和思考不导出。
  * 异步:助手正文含 ```ui 组件时要等组件转换器的懒块加载。
  */
 export async function exportSessionMarkdown(messages: readonly ChatMessage[], sending = false): Promise<string> {
   const blocks: string[] = [];
-  for (const m of selectShareMessages(messages, "all", sending)) {
-    const lines = [`## ${headingFor(m.role)}`];
+  for (const m of selectExportMessages(messages, sending)) {
+    const lines = [`## ${headingFor(m.role)}${m.exportIncomplete ? "（未完成）" : ""}`];
     const when = formatExportTime(m.ts);
     if (when) lines.push(when);
     // Intelligent UI(OCV5-361):助手正文里的 ```ui 组件导出为等价 Markdown。

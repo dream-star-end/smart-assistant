@@ -10,5 +10,8 @@ const messages: ChatMessage[] = [
   { id: "thinking", role: "thinking", ts: 3, text: "内部思考fixture" },
   { id: "tool", role: "tool", ts: 4, text: "fixture", toolName: "Bash", inputPreview: "python hidden_tool_fixture.py --private-input" },
   { id: "answer", role: "assistant", ts: 5, text: "已生成：[下载销售表](/home/agent/.openclaude/generated/sales.csv)\n\n文件：`/home/agent/.openclaude/generated/sales.csv`\n\n```python\nprint(42)\n```" },
+  { id: "u2", role: "user", ts: 6, text: "继续完成下一节。" },
+  { id: "partial", role: "assistant", ts: 7, text: "已交付的部分报告仍可导出。", _clientMessageId: "u2" },
+  { id: "failure", role: "assistant", ts: 8, text: "", _errorCode: "MODEL_CONFIG_CHANGED_RETRY_TURN", _clientMessageId: "u2" },
 ];
 createRoot(document.getElementById("root")!).render(<ToastProvider><ShareDialog open onOpenChange={() => {}} messages={messages} sending={false} title="销售分析" agentName="全能助手" onExportMarkdown={async () => saveBlob(new Blob([await exportSessionMarkdown(messages)], { type: "text/markdown" }), "销售分析.md")} /></ToastProvider>);

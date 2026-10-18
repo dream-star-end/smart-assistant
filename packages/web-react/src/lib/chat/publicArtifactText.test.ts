@@ -21,6 +21,12 @@ describe("publicArtifactText", () => {
     const code = "```python\nopen('/home/agent/.openclaude/uploads/sales.csv')\n```\n\n`python /home/agent/.openclaude/generated/recalc.py --input /home/agent/.openclaude/uploads/sales.csv`\n\n[外站](https://example.test/home/agent/.openclaude/generated/sales.csv)\n\n/opt/project/input.csv\n\nhttps://example.test/download?file=/home/agent/.openclaude/generated/sales.csv";
     expect(await publicArtifactText(code)).toBe(code);
   });
+  test("keeps direct script invocations with positional arguments executable", async () => {
+    for (const command of ["/home/agent/.openclaude/generated/run.sh data.csv", "/root/.openclaude/generated/recalc.py 'file name.csv'"]) {
+      const text = `运行：\`${command}\``;
+      expect(await publicArtifactText(text)).toBe(text);
+    }
+  });
   test("shares and exports the same final content without changing original messages or user input", async () => {
     const user = "/home/agent/.openclaude/uploads/user-provided.csv";
     const messages: ChatMessage[] = [{ id: "u", role: "user", ts: 1, text: user }, { id: "a", role: "assistant", ts: 2, text: "完成：`/home/agent/.openclaude/generated/sales.csv`" }];
