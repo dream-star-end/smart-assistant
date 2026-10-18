@@ -1,3 +1,5 @@
+import type { SessionWorkspaceMode } from '@openclaude/protocol'
+import type { DraftPreparationHint } from '../agent-sandbox/draftPreparation.js'
 import type { EnginePreheatPreparation, EnginePreheatRequest } from './enginePreheatClient.js'
 
 export function makeEnginePreheatPreparation(deps: {
@@ -20,5 +22,24 @@ export function makeEnginePreheatPreparation(deps: {
       }
     } catch { /* An uncertain authorization/route never starts speculative work. */ }
     return null
+  }
+}
+
+
+/** Workspace policy is server-owned; no row is inserted for speculation. */
+export function makeDraftEnginePreparation(deps: {
+  loadWorkspaceMode: (uid: bigint, sessionId: string) => Promise<SessionWorkspaceMode | null>
+  preheat: (args: EnginePreheatRequest) => Promise<void>
+}): (uid: bigint, hint: DraftPreparationHint, isCurrent: () => boolean) => Promise<void> {
+  return async (uid, hint, isCurrent) => {
+    if (!isCurrent()) return
+    const mode = await deps.loadWorkspaceMode(uid, hint.sessionId)
+    if (!isCurrent()) return
+    await deps.preheat({
+      userId: 'c:'.concat(uid.toString()), sessionId: hint.sessionId,
+      agentId: hint.agentId, modelId: hint.modelId, effortLevel: hint.effortLevel,
+      // Same new-row contract as migration 0198. Existing owned rows retain their policy.
+      workspaceMode: mode ?? 'isolated_v1', codexOnly: true, isCurrent,
+    })
   }
 }

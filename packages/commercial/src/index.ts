@@ -1,5 +1,5 @@
 import { makeDraftPreparation, makePreparationReady, type DraftPreparationHint } from './agent-sandbox/draftPreparation.js';
-import { makeEnginePreheatPreparation } from './dispatch/enginePreheatPreparation.js';
+import { makeEnginePreheatPreparation, makeDraftEnginePreparation } from './dispatch/enginePreheatPreparation.js';
 import { makeWorkspacePreparation } from './agent-sandbox/workspacePreparation.js';
 import { isInMaintenance } from './middleware/maintenanceMode.js';
 import { HttpError } from './http/util.js';
@@ -4207,17 +4207,11 @@ export async function registerCommercial(
     enabled: () => process.env.OC_ENGINE_PREHEAT === '1',
     authorize: authorizePreparation,
     ensureReady: preparationReady,
-    prepareEngine: async (uid, hint, isCurrent) => {
-      if (!preheatUserContainer || !dispatchAdmissionBackend || !isCurrent()) return;
-      const userId = 'c:'.concat(uid.toString());
-      const mode = await dispatchAdmissionBackend.getClientSessionWorkspaceMode(hint.sessionId, userId);
-      if (!isCurrent()) return;
-      await preheatUserContainer({
-        userId, sessionId: hint.sessionId, agentId: hint.agentId, modelId: hint.modelId,
-        effortLevel: hint.effortLevel, workspaceMode: mode ?? 'isolated_v1',
-        codexOnly: true, isCurrent,
-      });
-    },
+    prepareEngine: preheatUserContainer && dispatchAdmissionBackend ? makeDraftEnginePreparation({
+      loadWorkspaceMode: (uid, sessionId) => dispatchAdmissionBackend!.getClientSessionWorkspaceMode(
+        sessionId, 'c:'.concat(uid.toString())),
+      preheat: preheatUserContainer,
+    }) : async () => {},
     observe: fields => rootLogger.info('draft_prepare', fields),
   }) : undefined;
   const prepareWorkspaceContainer = prepareContainer
