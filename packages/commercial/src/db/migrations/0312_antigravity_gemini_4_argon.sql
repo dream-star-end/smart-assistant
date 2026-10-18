@@ -5,7 +5,7 @@
 -- 50 platform credits/USD; preserve the Gemini subscription multiplier 1. No explicit cache writes.
 INSERT INTO model_catalog(model_id,engine,provider_id,upstream_model_id,context_window,
   capability_profile,capability_schema_version,state)
-VALUES ('antigravity-gemini-4-argon','antigravity','antigravity','gemini-4-argon-medium',1000000,
+VALUES ('antigravity-gemini-4-argon','antigravity','antigravity','gemini-4-argon-medium',1048576,
   '{"supports_vision":false,"reasoning":{"supported":["low","medium","high"],"codex_model_default":null},"ccb":{"capability_zero":false,"supports_thinking":false}}'::jsonb,
   1,'staged');
 INSERT INTO model_pricing(model_id,display_name,input_per_mtok,output_per_mtok,cache_read_per_mtok,
