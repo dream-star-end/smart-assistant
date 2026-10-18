@@ -1088,7 +1088,7 @@ class UsageObserver {
   private latest: UsageObservation = { kind: "none" };
 
   /** 把 chunk 送进来(同时已经 byte-pass 给客户端)。 */
-  push(chunkText: string, receivedAtMs: number): void {
+  push(chunkText: string, receivedAtMs = Date.now()): void {
     this.receivedAtMs = receivedAtMs;
     this.buf += chunkText;
     while (true) {
