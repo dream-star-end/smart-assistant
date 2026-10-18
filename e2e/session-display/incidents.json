@@ -7981,6 +7981,40 @@
           "assertion": "[ocv5-499-pending-user] PASS — the full delegated goal and late tool announcement reach the same current stdin without changing canonical bytes or completed tool history"
         }
       ]
+    },
+    {
+      "id": "INC-20261018-BOX-DELEGATE-CONTEXT-OWNER",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "OCV5-518：商业发布6f57e7215的uid247 Haiku委派真实Bash已算出571A1D288746T，随后BOX_TOOL_CONTEXT_CHANGED / continuation not republished导致答案未交付。现场两个raw canonical body未留存，不能倒推具体差异。非生产旧98e728220和6f57均经真实local catalog→delegate→CCB冷续接抓到仅工具公告丢失，真实journal及默认publisher均拒绝；证明该机制为既存问题。local catalog链漏发contextOwner，未启用已有CCB持久公告；修复贯通可信owner、按wire format自动升级旧LKG，保留v1 token/hash兼容、严格context/NULL dispatch/权限门。",
+      "rootFixCommit": "d63d8726",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalModelCatalog.test.ts",
+          "assertion": "projects only declared exact Box ownership from the fenced authorized catalog"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelCatalogClient.test.ts",
+          "assertion": "same epoch and pricing automatically upgrade a legacy LKG and preserve owner across another cold start"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelCatalogClient.test.ts",
+          "assertion": "OCV5-518 format upgrade cannot reuse an in-flight snapshot with stale routing availability"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelAuthorityLocalPath.test.ts",
+          "assertion": "OCV5-518 local delegate forwards the catalog owner into the actual turn descriptor"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-518-local-catalog-owner] PASS — the trusted owner reaches a cold delegate descriptor after legacy LKG upgrade while the original v1 token remains accepted"
+        }
+      ]
     }
   ]
 }
