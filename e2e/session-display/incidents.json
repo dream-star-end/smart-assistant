@@ -7873,7 +7873,7 @@
       "occurredAt": "2026-10-18",
       "severity": "P1",
       "symptom": "体验官A24：导出Markdown泄露工具调用及过程文本，分享最终答含平台内部资产路径。修复统一最终回答口径并只转换资产引用，保留有用源码和用户原文。",
-      "rootFixCommit": "2133a1217663",
+      "rootFixCommit": "2133a121",
       "regressions": [
         {
           "layer": "unit",
