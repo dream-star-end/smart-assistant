@@ -180,6 +180,7 @@ import {
   EMPTY_COLLAB_UI,
   advisorParentCapabilityAllowed,
   collaborationPutBody,
+  continuePrimaryWithoutAdvisor,
   docToUiState,
   isStaleCollabEpoch,
   keepCollabChoiceOnSaveFailure,
@@ -1300,6 +1301,45 @@ export function App() {
       let advisorModelForSend = collabUi.advisorModel;
       let configVersionForSend = collabUi.configVersion;
       let unavailableForSend = collabUi.advisorUnavailableReason;
+      let latestCollab = collabUi;
+      let recoveredAdvisor = false;
+      const recoveryEpoch = collabEpochRef.current;
+      const recoverySelection = selectedSessionIdRef.current;
+      const recoveryIdentity = auth?.snapshot().epoch;
+      const recoveryIsCurrent = () => collabEpochRef.current === recoveryEpoch
+        && selectedSessionIdRef.current === recoverySelection && auth?.snapshot().epoch === recoveryIdentity;
+      if (agent.id === "main" && modeForSend === "advisor"
+        && (!collabUi.advisorCatalogResolved || collabUi.advisorModels.length === 0 || collabUi.advisorUnavailableReason) && auth) {
+        // A single bounded reread can restore a temporarily stale advisor without
+        // choosing another model. Unknown catalog state is never treated as empty.
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 5000);
+        try {
+          const fresh = await api.getCollaborationConfig(auth, sessionId || undefined, { signal: controller.signal });
+          if (!recoveryIsCurrent()) return;
+          latestCollab = docToUiState(fresh);
+          modeForSend = latestCollab.mode;
+          advisorModelForSend = latestCollab.advisorModel;
+          configVersionForSend = latestCollab.configVersion;
+          unavailableForSend = latestCollab.advisorUnavailableReason;
+          applyCollabDoc(fresh);
+        } catch {
+          if (!recoveryIsCurrent()) return;
+          // A previous successfully resolved empty catalog remains distinct
+          // from initial/failed catalog loading; retain its safe solo fallback.
+        } finally { window.clearTimeout(timer); }
+      }
+      if (agent.id === "main" && continuePrimaryWithoutAdvisor(latestCollab)) {
+        recoveredAdvisor = true;
+        modeForSend = "solo";
+        advisorModelForSend = null;
+        configVersionForSend = "";
+        unavailableForSend = undefined;
+        setCollabUi({ ...latestCollab, mode: "solo", advisorModel: null, configVersion: "" });
+        setTeamModeState(false);
+        setCollabSaveError(null);
+        toast("顾问暂不可用，已由当前主模型继续处理", "info");
+      }
       if (!sessionId) {
         stopPreparing();
         sessionId = draftSessionId;
@@ -1317,14 +1357,14 @@ export function App() {
         };
         // 空会话态用户可能已在全能助手卡上开/关了团队模式;把当前 intent 落地为新会话的
         // per-session 键 —— 否则该会话只靠全局默认,会被其它会话的开关翻动(切走再回来变样)。
-        writeTeamMode(sessionId, collabMode === "team");
+        writeTeamMode(sessionId, modeForSend === "team");
         // 显式档位选择存在才落地(未选择 = 继续继承全局偏好,不写键)。
         if (sessionEffort !== undefined) writeSessionEffort(sessionId, sessionEffort);
         writeContextTier(sessionId, contextTier);
         writeSessionServiceTier(sessionId, serviceTier);
         sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
         if (modelId) sockRef.current?.setSessionModel(sessionId, modelId);
-        if (auth && (collabMode !== "solo" || collabAsDefault)) {
+        if (auth && !recoveredAdvisor && (modeForSend !== "solo" || collabAsDefault)) {
           const collabAuth = auth;
           const identityEpoch = collabAuth.snapshot().epoch;
           const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
@@ -1337,17 +1377,18 @@ export function App() {
               collabAuth,
               collaborationPutBody({
                 sessionId,
-                mode: collabMode,
+                mode: modeForSend,
                 advisorModel:
-                  collabMode === "advisor"
-                    ? (collabUi.advisorModel ?? recommendedAdvisorModel(collabUi))
+                  modeForSend === "advisor"
+                    ? (advisorModelForSend ?? recommendedAdvisorModel(latestCollab))
                     : null,
-                expectedRev: collabUi.rev,
+                expectedRev: latestCollab.rev,
                 asDefault: collabAsDefault,
               }),
             );
             if (collabAuth.snapshot().epoch !== identityEpoch) return;
             applyCollabDoc(doc);
+            latestCollab = docToUiState(doc);
             modeForSend = doc.session.mode;
             advisorModelForSend = doc.session.advisorModel;
             configVersionForSend = doc.session.configVersion;
@@ -1355,7 +1396,7 @@ export function App() {
           } catch (err) {
             if (collabAuth.snapshot().epoch !== identityEpoch) return;
             // Team still sends: it rides on the turn frame. Only advisor needs the saved config.
-            if (!keepCollabChoiceOnSaveFailure(collabMode)) {
+            if (!keepCollabChoiceOnSaveFailure(modeForSend)) {
               const msg = apiErrorMessage(err, "协作配置保存失败");
               setCollabSaveError(msg);
               toast(msg, "error");
@@ -1372,10 +1413,10 @@ export function App() {
         advisorModel: advisorModelForSend,
         configVersion: configVersionForSend,
         advisorUnavailableReason: unavailableForSend,
-        parentEngine: models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine,
-        advisorConsultParents: collabUi.advisorConsultParents,
-        advisorConsultAllowed: collabUi.advisorConsultAllowed,
-        advisorConsultParentReason: collabUi.advisorConsultParentReason,
+        parentEngine: models.find((row) => row.id === modelId)?.engine ?? latestCollab.parentEngine,
+        advisorConsultParents: latestCollab.advisorConsultParents,
+        advisorConsultAllowed: latestCollab.advisorConsultAllowed,
+        advisorConsultParentReason: latestCollab.advisorConsultParentReason,
       });
       if (sendCollab.blockedReason) {
         toast(sendCollab.blockedReason, "error");
@@ -1438,6 +1479,20 @@ export function App() {
         // OCV5-434 GPT Fast:只在当前模型支持且用户开着时随帧发送;不带 = 标准。
         ...(serviceTier === "fast" && supportsFastServiceTier(modelId) ? { serviceTier } : {}),
       });
+      if (recoveredAdvisor && auth) {
+        const recoveryAuth = auth;
+        const recoverySession = sessionId;
+        // Explicit solo already travelled with this turn. Persist only this
+        // session after sending; 404/CAS/network failure cannot discard it.
+        void (async () => {
+          if (!recoveryIsCurrent()) return;
+          const ensured = await sockRef.current?.ensureServerSession(recoverySession, agent.id, sessionTitle);
+          if (!ensured || !recoveryIsCurrent()) return;
+          await api.putCollaborationConfig(recoveryAuth, collaborationPutBody({
+            sessionId: recoverySession, mode: "solo", advisorModel: null, expectedRev: latestCollab.rev,
+          }));
+        })().catch(() => {});
+      }
       // 侧栏：提到顶 + 更新标题/时间/计数（计数仅作排序提示，权威消息在 WS service）。
       setSessions((c) => {
         const sid = sessionId!;

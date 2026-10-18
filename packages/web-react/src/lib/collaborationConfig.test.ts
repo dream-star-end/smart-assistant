@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   ADVISOR_PARENT_BLOCK_REASON,
   collaborationPutBody,
+  continuePrimaryWithoutAdvisor,
   docToUiState,
   isStaleCollabEpoch,
   keepCollabChoiceOnSaveFailure,
@@ -219,5 +220,17 @@ describe("keepCollabChoiceOnSaveFailure", () => {
 
   it("rolls advisor back: it cannot run without the saved config", () => {
     expect(keepCollabChoiceOnSaveFailure("advisor")).toBe(false);
+  });
+});
+
+
+describe("continuePrimaryWithoutAdvisor", () => {
+  it("OCV5-512 recovers only a resolved empty advisor catalog without choosing another model", () => {
+    expect(continuePrimaryWithoutAdvisor(docToUiState({ ...DOC, advisorModels: [] }))).toBe(true);
+    expect(continuePrimaryWithoutAdvisor(docToUiState(DOC))).toBe(false);
+    expect(continuePrimaryWithoutAdvisor(docToUiState({ ...DOC, advisorModels: undefined }))).toBe(false);
+    expect(continuePrimaryWithoutAdvisor(docToUiState({ ...DOC, advisorModels: [], advisorUnavailableReason: "catalog unavailable: temporary" }))).toBe(false);
+    expect(continuePrimaryWithoutAdvisor(docToUiState({ ...DOC, advisorModels: [], session: { ...DOC.session, mode: "solo" } }))).toBe(false);
+    expect(DOC.session.advisorModel).toBe("gpt-6-astra");
   });
 });
