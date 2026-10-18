@@ -1,0 +1,24 @@
+{
+  "strict_cache_gate_pass": false,
+  "model": "grok-build",
+  "baseline": {
+    "total_native_input": 22535,
+    "cache_read": 1152
+  },
+  "candidate": {
+    "total_native_input": 22537,
+    "cache_read": 1152
+  },
+  "ratio_formula": "cache_read/total_native_input",
+  "before_percent": 5.112047925449302,
+  "after_percent": 5.1115942672050405,
+  "raw_cache_read_unchanged": true,
+  "causal_code_regression_proven": false,
+  "stored_initial_input_difference": "one session working_directory; normalizing exact recorded directories makes all five initial rows byte equal",
+  "precise_two_token_attribution": null,
+  "limitations": [
+    "native wire/tokenizer not retained",
+    "candidate backend not deployed",
+    "no further paid samples to select a better result"
+  ]
+}
