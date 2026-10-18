@@ -34,6 +34,8 @@
  *   - 不做 colorized text:这是结构化 log,人眼看不下来用 jq 就行
  */
 
+import { measureLogWrite } from '@openclaude/protocol';
+
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error";
 
 const LEVEL_ORDER: Record<LogLevel, number> = {
@@ -238,7 +240,7 @@ export function createLogger(opts: LoggerOptions = {}): Logger {
   const level = LEVEL_ORDER[opts.level ?? parseLevel(process.env.LOG_LEVEL)];
   const base = opts.base ? (redact(opts.base) as Record<string, unknown>) : {};
   const out = opts.out ?? ((line: string) => {
-    process.stdout.write(line + "\n");
+    measureLogWrite(() => process.stdout.write(line + "\n"), Buffer.byteLength(line) + 1);
   });
   const now = opts.now ?? (() => new Date().toISOString());
   return new LoggerImpl(level, base, out, now);

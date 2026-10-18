@@ -2,6 +2,7 @@ import { makeEnginePreheatPreparation } from './dispatch/enginePreheatPreparatio
 import { makeWorkspacePreparation } from './agent-sandbox/workspacePreparation.js';
 import { isInMaintenance } from './middleware/maintenanceMode.js';
 import { HttpError } from './http/util.js';
+import { startLogTimingReporter } from './logging/logTimingReporter.js';
 import { setContentReviewAlerter } from '@openclaude/gateway'
 import { alertContentReview } from './admin/contentReviewAlert.js'
 /**
@@ -7084,6 +7085,7 @@ export async function registerCommercial(
 
   setContentReviewAlerter((event) => { void alertContentReview(event) })
 
+  const stopLogTiming = startLogTimingReporter(rootLogger);
   return {
     handle: async (req, res) => {
       // A Quick Tunnel reaches the same listener with a trycloudflare Host.
@@ -7106,6 +7108,7 @@ export async function registerCommercial(
       return false;
     },
     shutdown: async () => {
+      stopLogTiming();
       // P2:停 sessions GC sweeper —— 清 sweep timer、unlock advisory lease、还/销毁持锁连接
       // (否则残留 setInterval + 永不归还池的持锁连接会泄漏,且备 master 竞不到锁)。
       if (sessionsGcSweeper) {

@@ -95,7 +95,7 @@ export function codexResponseTiming(
         .map(line => line.slice(5).trimStart()).join('\n')
       if (!data || data === '[DONE]') return
       const value = obj(JSON.parse(data))
-      if (typeof value.delta === 'string' && value.delta.length > 0) {
+      if (typeof value.delta === 'string' && value.delta.trim().length > 0) {
         if (value.type === 'response.output_text.delta') once('first_text_delta')
         if (value.type === 'response.reasoning_text.delta' || value.type === 'response.reasoning_summary_text.delta') {
           once('first_reasoning_delta')
@@ -143,6 +143,24 @@ export function codexResponseTiming(
     flush(callback) {
       try { consume(decoder.end()); if (buffer && !skipping) event(buffer) } catch {}
       buffer = ''
+      callback()
+    },
+  })
+}
+
+/** Metadata-only tap for model directory bodies; never parses or logs their contents. */
+export function codexBodyTiming(
+  observe: TimingObserver, now: () => number = () => performance.now(), startedAt = now(),
+): Transform {
+  let bytes = 0
+  return new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      if (!bytes && chunk.length) emit(observe, { stage: 'first_body', elapsedMs: now() - startedAt })
+      bytes += chunk.length
+      callback(null, chunk)
+    },
+    flush(callback) {
+      emit(observe, { stage: 'body_complete', elapsedMs: now() - startedAt, bodyBytes: bytes })
       callback()
     },
   })

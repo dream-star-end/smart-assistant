@@ -795,3 +795,79 @@ describe('relayErrorShape (OCV5-365)', () => {
     assert.deepEqual(relayErrorShape(Object.assign(new Error('x'), { code: 'has spaces and a message' })), { errorName: 'Error' })
   })
 })
+
+describe('OCV5-496 relay timing integration', () => {
+  for (const [method, suffix, source, status] of [
+    ['POST', 'responses', 'data: {"type":"response.reasoning_text.delta","delta":"PRIVATE_REASON"}\n\ndata: {"type":"response.output_text.delta","delta":"PRIVATE_TEXT"}\n\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":17,"output_tokens":3}}}\n\n', 200],
+    ['POST', 'responses', '{"error":"PRIVATE_JSON"}', 503],
+    ['GET', 'models', '{"models":["PRIVATE_MODEL"]}', 200],
+  ] as const) {
+    test(`${method} ${suffix} without Content-Type preserves bytes/status and records real boundaries`, async () => {
+      const records: Array<Record<string, unknown>> = []
+      const logger = (await import('../logging/logger.js')).createLogger({
+        out: line => records.push(JSON.parse(line) as Record<string, unknown>),
+      })
+      let sentHeaders = new Headers()
+      const handler = makeCodexRelayHandler({
+        identityRepo: makeRepo(), db: makeDb(), upstreamBaseUrl: 'https://example.invalid/v1',
+        logger,
+        resolveDispatcher: async accountId => ({ accountId, proxyId: 4n, dispatcher: DISPATCHER }),
+        fetchImpl: (async (_input, init) => {
+          sentHeaders = new Headers(init?.headers)
+          await drainBody(init?.body)
+          return new Response(new TextEncoder().encode(source), { status,
+            headers: { 'x-request-id': 'UPSTREAM_OTHER_ID', 'x-openclaude-relay-request-id': 'SUPPLIER_FAKE' } })
+        }) as typeof fetch,
+      })
+      const server = createServer((req, res) => { void handler(req, res, CTX) })
+      const port = await listen(server)
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/v1/${suffix}`, {
+          method, headers: { authorization: `Bearer ${TOKEN}`,
+            [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer test-fixture-only',
+            'x-openclaude-relay-request-id': 'CLIENT_FAKE' },
+          ...(method === 'POST' ? { body: '{"input":[]}' } : {}),
+        })
+        assert.equal(response.status, status)
+        assert.equal(await response.text(), source)
+        assert.equal(response.headers.get('content-type'), null)
+        assert.equal(response.headers.get('x-request-id'), 'UPSTREAM_OTHER_ID')
+        assert.match(response.headers.get('x-openclaude-relay-request-id')!, /^[0-9a-f]{32}$/)
+        assert.equal(sentHeaders.has('x-openclaude-relay-request-id'), false)
+        const events = records.filter(r => r.msg === 'codex_relay_timing')
+        assert.ok(events.some(r => r.stage === 'upstream_dispatch'))
+        assert.ok(events.some(r => r.stage === 'headers' && r.contentType === 'missing'))
+        assert.ok(events.every(r => typeof r.elapsedMs === 'number' && Number(r.elapsedMs) >= 0))
+        assert.ok(events.every(r => r.operation === suffix))
+        assert.ok(events.every(r => r.requestId === response.headers.get('x-openclaude-relay-request-id')))
+        if (suffix === 'models') {
+          assert.ok(events.some(r => r.stage === 'body_complete' && r.bodyBytes === Buffer.byteLength(source)))
+          assert.ok(events.every(r => !String(r.stage).includes('delta')))
+        } else if (status === 200) {
+          assert.ok(events.some(r => r.stage === 'first_reasoning_delta'))
+          assert.ok(events.some(r => r.stage === 'first_text_delta'))
+          assert.ok(events.some(r => r.stage === 'usage' && r.inputTokens === 17))
+        } else assert.ok(events.every(r => !String(r.stage).includes('delta')))
+        assert.doesNotMatch(JSON.stringify(events), /PRIVATE|CLIENT_FAKE|SUPPLIER_FAKE|UPSTREAM_OTHER_ID/)
+      } finally { await close(server) }
+    })
+  }
+  test('model directory fetch failure has bounded failure timing without error content', async () => {
+    const events: Array<Record<string, unknown>> = []
+    const logger = (await import('../logging/logger.js')).createLogger({ out: line => events.push(JSON.parse(line)) })
+    const handler = makeCodexRelayHandler({ identityRepo: makeRepo(), db: makeDb(),
+      upstreamBaseUrl: 'https://example.invalid/v1', logger,
+      resolveDispatcher: async accountId => ({ accountId, proxyId: 4n, dispatcher: DISPATCHER }),
+      fetchImpl: (async () => { throw new Error('PRIVATE_SECRET_URL') }) as typeof fetch })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/v1/models`,
+        { headers: { authorization: `Bearer ${TOKEN}`, [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer fixture-only' } })
+      assert.equal(response.status, 502)
+      await response.text()
+      assert.ok(events.some(e => e.msg === 'codex_relay_timing' && e.stage === 'failed' && e.operation === 'models'))
+      assert.doesNotMatch(JSON.stringify(events), /PRIVATE_SECRET_URL/)
+    } finally { await close(server) }
+  })
+})

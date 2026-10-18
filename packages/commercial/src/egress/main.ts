@@ -1,3 +1,4 @@
+import { startLogTimingReporter } from '../logging/logTimingReporter.js';
 /**
  * V5 egress 进程(独立 systemd 服务 openclaude-v5-egress)——
  * 根治"master 部署重启掐断在飞 LLM 生成流"。
@@ -964,10 +965,12 @@ export async function startEgress(): Promise<void> {
     log.warn("desktop_tls_egress_not_started", { err: (err as Error)?.message });
   });
 
+  const stopLogTiming = startLogTimingReporter(rootLogger);
   let shuttingDown = false;
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    stopLogTiming();
     latencyProber?.stop();
     recoveryProber?.stop();
     if (boxCleanupTimer) clearInterval(boxCleanupTimer);
