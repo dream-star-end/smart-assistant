@@ -29,6 +29,8 @@ import { deflateSync } from "node:zlib";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
+import { proveRefusedRecoveryClosed as refusedRecoveryProof } from "./lib/boxRefusedRecoveryProof.js";
+import { misrecordedRun, proveCliRepairedToolInput, proveForeignToolHistory, rereadError } from "./lib/boxCliRepairProof.js";
 
 const LIMIT_MS = 120_000;
 const CANDIDATE = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
@@ -2372,88 +2374,15 @@ async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<
   });
 }
 
-/** INC-20261018-BOX-RECOVERY-REFUSED-STUCK, commercial u4 webmvc3iq5ff9hmmm (2026-10-17 23:30Z): after a Box 409 the
- * automatic 「从断点继续」 was refused by the container (DISPATCH_NOT_ACCEPTED); its job was paused and nothing ever
- * answered the recovery row, so every reload showed 「仍在处理中…」 under the not-started card for twelve hours.
- * A recovery paused before it ran closes its chain with a visible card while its row is still the last message. */
+/** INC-20261018-BOX-RECOVERY-REFUSED-STUCK: see scripts/lib/boxRefusedRecoveryProof.ts. */
 async function proveRefusedRecoveryClosed(api: Api, database: unknown): Promise<string> {
-  return withSessionsBackend(api, database, async (backend, db) => {
-    // biome-ignore lint/style/useSingleVarDeclarator: same shape as proveFinalizedTurnRecovery
-    const uid = 9n, sessionUser = "c:9";
-    const chain = async (name: string, pauseReason: string, text = "↻ 自动从断点继续") => {
-      // biome-ignore lint/style/useSingleVarDeclarator: same shape as proveFinalizedTurnRecovery
-      const sessionId = `s-ocv5-509-${name}`, root = `cm-ocv5-509-root-${name}`, recovery = `m-recover-ocv5509-${name}`;
-      const admitted = await backend.admitUserTurn({ uid, sessionUserId: sessionUser, sessionId, clientMessageId: recovery,
-        agentId: "main", model: MODEL, requestHash: "h".repeat(64), billingRequestId: `brq-${recovery}`,
-        dispatchId: randomUUID(), ownerId: "conn-A",
-        message: { id: recovery, role: "user", text, ts: 1,
-          _routing: { model: MODEL, effortLevel: null, teamMode: false }, _automaticRecovery: true,
-          _automaticRecoveryAttempt: 1, _recoveryOfClientMessageId: root, _automaticRecoveryRootClientMessageId: root } });
-      if (admitted.kind !== "admitted") fail(`REFUSED_RECOVERY_${name}_NOT_ADMITTED`);
-      await db.query(`INSERT INTO turn_recovery_jobs (user_id,session_id,root_client_message_id,source_client_message_id,
-          source_turn_key,error_code,recovery_mode,semantic_recovery_attempt,request_json,tape_sha256,status,pause_reason,
-          terminal_outcome) VALUES ($1,$2,$3,$3,$4,'engine_error','checkpoint',1,$5,$6,'paused',$7,'interrupted')`,
-        [uid.toString(), sessionId, root, "k".repeat(64), JSON.stringify({ clientMessageId: recovery }), "a".repeat(64),
-          pauseReason]);
-      return { sessionId, root, recovery };
-    };
-    const last = async (sessionId: string) =>
-      (await backend.getClientSession(sessionId, sessionUser))?.messages.at(-1) as Record<string, unknown> | undefined;
-    // the recovery row was answered after all: nothing to close, and (oldest) it must not hold the sweep up
-    const answered = await chain("answered", "dispatch_not_accepted");
-    const reply = await backend.appendServerAuthoredMessage(answered.sessionId, sessionUser,
-      { id: "m-ocv5-509-answer", role: "assistant", text: "done", ts: 2, status: "completed", _source: "server" });
-    if (!reply.applied) fail("REFUSED_RECOVERY_ANSWER_NOT_APPENDED");
-    const refused = await chain("refused", "dispatch_not_accepted");
-    // a lone surrogate the session writer keeps must not fail the sweep for every session (Codex r2, r3)
-    const policy = await chain("policy", "refused:UNAUTHORIZED_MODEL", "↻ 自动从断点继续\ud800");
-    if ((await backend.getClientSession(policy.sessionId, sessionUser) as { messages: Array<{ text?: unknown }> } | null)
-      ?.messages.at(-1)?.text !== "↻ 自动从断点继续\ud800") fail("REFUSED_RECOVERY_SURROGATE_NOT_STORED");
-    // a chain that ran and gave up has its own card; it is not this sweep's
-    const exhausted = await chain("exhausted", "automatic_retry_exhausted");
-    // one sweep reaches every open chain, the history with a lone surrogate too (Codex r1–r3)
-    if (await api.closeRefusedRecoveryChains(db) !== 2) fail("REFUSED_RECOVERY_NOT_CLOSED");
-    for (const closed of [refused, policy]) {
-      const card = await last(closed.sessionId);
-      // what the client reads as the end of the turn (adoptPendingAutomaticRecoveryFromHistory)
-      if (card?.id !== `m-recovery-giveup-${closed.root}` || card.role !== "assistant" || card._source !== "server"
-        || card.status !== "completed" || typeof card.text !== "string" || !card.text.trim()) {
-        fail(`REFUSED_RECOVERY_CARD_${closed.sessionId}_${String(card?.id)}`);
-      }
-    }
-    if ((await last(answered.sessionId))?.id !== "m-ocv5-509-answer") fail("REFUSED_RECOVERY_ANSWERED_TOUCHED");
-    if ((await last(exhausted.sessionId))?.id !== exhausted.recovery) fail("REFUSED_RECOVERY_EXHAUSTED_TOUCHED");
-    if (await api.closeRefusedRecoveryChains(db) !== 0) fail("REFUSED_RECOVERY_NOT_IDEMPOTENT");
-    return "[ocv5-509-refused-recovery-closed] PASS — a recovery paused before it ran ends its turn with a visible card, and an answered or exhausted chain is left alone";
-  });
+  return withSessionsBackend(api, database, (backend, db) => refusedRecoveryProof({ backend, db,
+    close: (pool) => api.closeRefusedRecoveryChains(pool), model: MODEL }));
 }
 
-/** INC-20261018-BOX-CLI-REPAIRED-TOOL-INPUT, commercial u4 webmvdqhzdqcghrvm (2026-10-18 11:27–12:34Z): every round
- * in which the model wrote its verification script failed at message_stop as BOX_TOOL_SNAPSHOT_MISMATCH, and each
- * re-read of it as 503 BOX_REPLAY_UNAVAILABLE, so the automatic recovery ran the same ten-minute call again and
- * again. Claude Code (2.1.299–2.1.302, MCP tools too) records and runs a streamed tool input after its own repair: a
- * literal `\uXXXX` such as a script's `[一-鿿]` becomes the character. The round must hand off the model's
- * own call; a record that differs in any other way is still refused. */
-async function proveCliRepairedToolInput(api: Api): Promise<string> {
-  const model = { value: "re.findall(r'[\\u4e00-\\u9fff]+', title)" };
-  const repaired = { value: "re.findall(r'[一-鿿]+', title)" };
-  const call = (recorded: unknown) => [start("msg_cjk"),
-    event({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_cjk_1", name: BOX_BASH, input: {} } }),
-    event({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(model) } }),
-    { type: "assistant", message: { id: "msg_cjk", model: CLI_MODEL, role: "assistant",
-      content: [{ type: "tool_use", id: "toolu_cjk_1", name: BOX_BASH, input: recorded }] } },
-    event({ type: "content_block_stop", index: 0 }), ...stop("tool_use", 9)];
-  const host = boxHost(api, spoolOf([cliInit, ...call(repaired)]), { pendingArguments: repaired });
-  const handed = await must("CLI_REPAIRED_ROUND", host.round());
-  if (handed.kind !== "tool_handoff" || host.count.launch !== 1) fail(`CLI_REPAIRED_NO_HANDOFF_${handed.kind}`);
-  const use = (host.handoffs.at(-1) as { toolUses: Array<{ input: unknown; cliInput?: unknown }> }).toolUses[0];
-  if (!isDeepStrictEqual(use?.input, model) || !isDeepStrictEqual(use?.cliInput, repaired)) fail("CLI_REPAIRED_WRONG_INPUT");
-  // the client runs what the model wrote
-  if (!host.sse().includes(JSON.stringify(JSON.stringify(model)).slice(1, -1))) fail("CLI_REPAIRED_CLIENT_INPUT");
-  const changed = boxHost(api, spoolOf([cliInit, ...call({ value: "re.findall(r'[a-z]+', title)" })]));
-  if (await codeOf(changed.round) !== "BOX_TOOL_SNAPSHOT_MISMATCH") fail("CLI_REPAIRED_OTHER_CHANGE_ACCEPTED");
-  return "[ocv5-509-cli-repaired-tool-input] PASS — a tool call the CLI records and runs unicode-repaired hands off the model's own input, and any other difference is still refused";
-}
+/** INC-20261018-BOX-CLI-REPAIRED-TOOL-INPUT: see scripts/lib/boxCliRepairProof.ts. */
+const proveCliRepaired = (api: Api) => proveCliRepairedToolInput({ boxHost: (spool, faults) => boxHost(api, spool, faults),
+  spoolOf, cliInit, start, event, stop, BOX_BASH, CLI_MODEL, must, codeOf });
 
 /** A Box for the resident CLI lane: an exec endpoint that really runs what the bridge sends (the product's
  * launch, write and stop scripts) around a stand-in for the Claude binary. `refuse.writes` makes the Box
@@ -3552,16 +3481,8 @@ async function proveAnyRefusalStopsParkedTurn(api: Api, db: Db): Promise<string[
   // OCV5-509: a re-read run the protocol refuses ends the turn like a refusal, so the parked run is stopped and
   // the automatic recovery can run the turn on, instead of the same 503 on every retry. The re-read: the CLI's
   // record of the call is not the streamed one, which no number of reads changes; a transport failure is not one.
-  const misrecorded = call("msg_b", 1, "toolu_good_1", BOX_BASH, [text("Using the bridge.")]).map((record) =>
-    (record as { type?: string }).type === "assistant" ? { type: "assistant", message: { id: "msg_b", model: CLI_MODEL,
-      role: "assistant", content: [text("Using the bridge."), { type: "tool_use", id: "toolu_good_1", name: BOX_BASH,
-        input: { value: "y" } }] } } : record);
-  let reread: unknown = null;
-  try {
-    const decoder = api.decoder(CLI_MODEL, CLI_TOOLS);
-    for (const record of [cliInit, start("msg_b", 30, 5), ...say("msg_b", 0, "Using the bridge."), ...misrecorded,
-      ...stop("tool_use", 9, 30)]) decoder.push(`${JSON.stringify(record)}\n`);
-  } catch (error) { reread = error; }
+  const reread = rereadError(api.decoder(CLI_MODEL, CLI_TOOLS),
+    misrecordedRun({ call, cliInit, start, say, stop, BOX_BASH, CLI_MODEL }));
   if (!api.replayRejection(reread) || api.replayRejection(api.transportError("BOX_EXEC_TIMEOUT"))) {
     fail("REPLAY_REJECTION_NOT_CLASSIFIED");
   }
@@ -3671,43 +3592,6 @@ function proveParallelImageCaption(api: Api): string {
   return "[ocv5-334-parallel-image-caption] PASS — one caption among parallel image results joins the image it describes";
 }
 
-/** INC-20261008-BOX-FOREIGN-TOOL-HISTORY, commercial u1870 10:28 CST: the session had run k3-256k, whose tool calls
- * carry ids like `tool_…`. Switched to box-api-claude-opus-5-5, every request was refused before launch with 400
- * BOX_REQUEST_UNSUPPORTED (BOX_BLOCK_UNSUPPORTED). History from another model is admitted with its tool calls renamed
- * pair by pair; a live tool exchange keeps the strict Box ids. */
-function proveForeignToolHistory(api: Api): string {
-  const history = (current: unknown): Body => ({ model: MODEL, stream: true, max_tokens: 64, tools: [tool("Bash"), tool("Read")],
-    messages: [{ role: "user", content: "list files" },
-      { role: "assistant", content: [{ type: "thinking", thinking: "plan", signature: "k3-signature" },
-        { type: "tool_use", id: "tool_Ab12Cd34Ef56", name: "Bash", input: { command: "ls" } }] },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: "tool_Ab12Cd34Ef56", content: "a" }] },
-      { role: "assistant", content: [{ type: "tool_use", id: "call_9", name: "Read", input: { file_path: "/a" } }] },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_9", content: "A" }] },
-      { role: "assistant", content: [text("done")] }, current] });
-  const admitted = api.gate(history({ role: "user", content: "now continue with Claude" }), true);
-  if (admitted !== null) fail(`FOREIGN_HISTORY_GATE_${admitted}`);
-  // what the Box CLI is given: the same history, each call paired under one stable toolu_ id
-  const staged = api.compile(history({ role: "user", content: "now continue with Claude" })).snapshotJsonl;
-  const again = api.compile(history({ role: "user", content: "now continue with Claude" })).snapshotJsonl;
-  const ids = staged.match(/toolu_oc[0-9a-f]{32}/g) ?? [];
-  if (ids.length !== 4 || new Set(ids).size !== 2 || staged.includes("tool_Ab12Cd34Ef56") || staged.includes("call_9")
-    || !isDeepStrictEqual(again.match(/toolu_oc[0-9a-f]{32}/g), ids)) fail(`FOREIGN_HISTORY_STAGED_${ids.length}`);
-  // a pure Box history is staged byte for byte as before
-  const box = api.compile({ model: MODEL, stream: true, max_tokens: 64, tools: [tool("Bash")], messages: [
-    { role: "assistant", content: [{ type: "tool_use", id: "toolu_keep_1", name: "Bash", input: {} }] },
-    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_keep_1", content: "x" }] },
-    { role: "assistant", content: [text("ok")] }, { role: "user", content: "next" }] }).snapshotJsonl;
-  if (!box.includes('"toolu_keep_1"') || box.includes("toolu_oc")) fail("FOREIGN_HISTORY_BOX_CHANGED");
-  const classified = api.classify(history({ role: "user", content: "now continue with Claude" }));
-  if (classified.classification !== "fresh") fail(`FOREIGN_HISTORY_CLASS_${classified.classification}`);
-  // a current tool result under a foreign id is no live Box exchange and stays refused
-  const live: Body = { model: MODEL, stream: true, max_tokens: 64, tools: [tool("Bash")], messages: [
-    { role: "user", content: "run" },
-    { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "Bash", input: {} }] },
-    { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" }] }] };
-  if (api.gate(live, true) === null || api.classify(live).classification === "continuation_candidate") fail("FOREIGN_LIVE_ADMITTED");
-  return "[ocv5-337-foreign-tool-history] PASS — tool history from another model is admitted and staged under paired Box tool ids";
-}
 
 async function cleanUp(): Promise<void> {
   const pending = [...cleanups];
@@ -3731,7 +3615,7 @@ async function main(): Promise<void> {
   process.env.OPENCLAUDE_HOME = home;
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
-    proveImageCaption(api), proveParallelImageCaption(api), proveForeignToolHistory(api), await proveCliRepairedToolInput(api),
+    proveImageCaption(api), proveParallelImageCaption(api), proveForeignToolHistory(api), await proveCliRepaired(api),
     await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveMixedCallTurnCut(api),
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
