@@ -454,6 +454,7 @@ export async function submit(
     modelSwitchInternal?: string
   },
 ): Promise<void> {
+  const submitStartedAt = performance.now()
   // Resolve/rebuild a warm legacy runner under the existing creation gate,
   // before taking the per-turn lock. Never change its durable session key.
   // prepareModelSwitch owns this runner while performing native compaction.
@@ -605,6 +606,7 @@ export async function submit(
   session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
   try {
     await prev
+    log.info('turn_pipeline_timing', { traceId, stage: 'submit_lock_acquired', elapsedMs: performance.now() - submitStartedAt })
     if (opts?.modelSwitchInternal === undefined) await this.applyIdleResetIfRequested(session)
     const pendingIdle = readPendingIdle(paths.home, session.sessionKey)
     const idleCandidate = readIdleCandidate(paths.home, session.sessionKey)
@@ -722,6 +724,7 @@ export async function submit(
     // CCB process(env is read at fork); 后续 turn CCB 内部 trace 接收待 S11c
     // stdin JSON-RPC 扩展。Lock 保证 setTraceId 与并发 submit() 串行,不会
     // 跨 turn 互踩。
+    log.info('turn_pipeline_timing', { traceId, stage: 'memory_barrier_acquired', elapsedMs: performance.now() - submitStartedAt })
     if (traceId !== undefined) session.runner.setTraceId(traceId)
     // 市场使用信号(skillUsageReporter)读点:本 turn 的 canonical traceId 落到 session,
     // 供 tool.called(hub skill_view)上报方在 turn 执行期同步取到评分归因键。**无条件**
@@ -1238,6 +1241,7 @@ export async function submit(
         }
       }, CHECK_INTERVAL)
     })
+    log.info('turn_pipeline_timing', { traceId, stage: 'context_ready', elapsedMs: performance.now() - submitStartedAt })
     logicalTurnRun = this.runOneTurnWithRetry(
       session,
       runnerPayload,

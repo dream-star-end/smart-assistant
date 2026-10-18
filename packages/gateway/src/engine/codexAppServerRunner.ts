@@ -1499,7 +1499,10 @@ export class CodexAppServerRunner extends EventEmitter {
           'features.multi_agent_v2=false',
         ]
       } else {
-        const overrides = await this.ensureLaunchOverrides(repoSnap)
+        const launchStartedAt = performance.now()
+    const overrides = await this.ensureLaunchOverrides(repoSnap)
+    log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+      stage: 'launch_context_ready', durationMs: performance.now() - launchStartedAt })
         if (overrides) argvOverrides = overrides.argvOverrides
       }
     } catch (err) {
@@ -1731,8 +1734,11 @@ export class CodexAppServerRunner extends EventEmitter {
     // are gated behind Codex's experimental API capability, so declare it
     // before any turn/start call. We call the proc fresh-spawned so writes
     // won't EPIPE.
+    const initializeStartedAt = performance.now()
     try {
       await this.sendRequest('initialize', this.buildInitializeParams())
+      log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+        stage: 'initialize_ready', durationMs: performance.now() - initializeStartedAt })
     } catch (err) {
       // A live but never-initialized app-server must not survive: later
       // ensureSpawned calls would see proc-alive and (historically) skip the
@@ -2346,6 +2352,18 @@ export class CodexAppServerRunner extends EventEmitter {
     automaticRetryState?: AutomaticRetryState,
   ): Promise<void> {
     const startedAt = Date.now()
+    const timingStartedAt = performance.now()
+    const seenDeltas = new Set<string>()
+    const observeFirstDelta = (message: any): void => {
+      const delta = message?.event?.delta
+      const stage = delta?.type === 'text_delta' && delta.text?.length ? 'first_text_delta'
+        : delta?.type === 'thinking_delta' && delta.thinking?.length ? 'first_reasoning_delta' : null
+      if (!stage || seenDeltas.has(stage) || message.session_id !== this.threadId) return
+      seenDeltas.add(stage)
+      log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+        stage, elapsedMs: performance.now() - timingStartedAt })
+    }
+    this.on('message', observeFirstDelta)
     this.activeRequestId = requestId
     this.forcedShutdownResultEmitted = false
     // Serial runner invariant: no reverse request from the previous turn may
@@ -2358,6 +2376,7 @@ export class CodexAppServerRunner extends EventEmitter {
     const repoSnap = this._currentRepoSnapshot()
     const effectiveCwd = this._applyRepoBindingFromSnapshot(repoSnap)
     log.info('codex app-server turn start', {
+      traceId: this.opts.traceId,
       sessionKey: this.opts.sessionKey,
       resumed: this.threadId != null,
       pid: this.proc?.pid ?? null,
@@ -2406,7 +2425,11 @@ export class CodexAppServerRunner extends EventEmitter {
         await this.shutdown()
         this.shuttingDown = false
       }
+      const reusedProcess = Boolean(this.proc && this.initialized && !this.staleProcGeneration)
       await this.ensureSpawned(repoSnap, effectiveCwd)
+      log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+        stage: 'engine_ready', reusedProcess, elapsedMs: performance.now() - timingStartedAt })
+      const threadStartedAt = performance.now()
       this.refreshDelegateContext()
 
       // Each fresh app-server proc must explicitly attach a thread before
@@ -2498,6 +2521,8 @@ export class CodexAppServerRunner extends EventEmitter {
         this.attached = true
       }
 
+      log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+        stage: 'thread_ready', durationMs: performance.now() - threadStartedAt, elapsedMs: performance.now() - timingStartedAt })
       await this.syncPlatformGoal()
 
       // ── attempt 循环 ──────────────────────────────────────────────────
@@ -2538,6 +2563,8 @@ export class CodexAppServerRunner extends EventEmitter {
 
         let tres: { turn?: { id?: string } } | undefined
         try {
+          log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+            stage: 'turn_start_sent', elapsedMs: performance.now() - timingStartedAt })
           tres = (await this.sendRequest('turn/start', this.buildTurnStartParams(prompt))) as
             | { turn?: { id?: string } }
             | undefined
@@ -2616,6 +2643,8 @@ export class CodexAppServerRunner extends EventEmitter {
           throw startErr
         }
 
+        log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
+          stage: 'turn_start_accepted', elapsedMs: performance.now() - timingStartedAt })
         const turnId = tres?.turn?.id
         if (typeof turnId !== 'string' || !turnId) {
           throw new Error('turn/start did not return turn.id')
@@ -2806,6 +2835,7 @@ export class CodexAppServerRunner extends EventEmitter {
       // Do NOT re-throw — drain() catches and rejects the queue entry, but
       // upstream sessionManager handles errors via the result message above.
     } finally {
+      this.off('message', observeFirstDelta)
       this.currentCollabAgentPolicy = undefined
       this.activeRequestId = undefined
       this.pendingStartInterrupt = false

@@ -189,6 +189,7 @@ export async function dispatchInbound(
 ): Promise<void> {
   // A few compatibility tests invoke this method with a minimal Gateway-shaped
   // object. Keep the flag-off/non-queue path independent of coordinator state.
+  const gatewayReceivedAt = performance.now()
   const promptQueueLifecycle = this._promptQueueLifecycleByFrame?.get(frame as object)
   const promptQueueExecutionFence = this._promptQueueExecutionFenceByFrame?.get(frame as object)
   // ── 一切入口无条件 strip `__oc_model_authority`(方案 §2 铁律)──────────────
@@ -2398,6 +2399,9 @@ export async function dispatchInbound(
       let clientTurnThrew = false
       let clientTurnError: unknown | undefined
       try {
+        this.log.info('turn_pipeline_timing', {
+          traceId: turnTraceId, stage: 'gateway_to_submit', elapsedMs: performance.now() - gatewayReceivedAt,
+        })
         const submitPromise = this.sessions.submit(
           session,
           payload,

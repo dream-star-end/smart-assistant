@@ -36,6 +36,7 @@ import {
  *     stage1/stage2 memory writer touch our MemoryStore.
  */
 import { createHash } from 'node:crypto'
+import { estimateModelHistoryTokens } from '@openclaude/protocol'
 import { resolve } from 'node:path'
 import { createLogger } from './logger.js'
 import { issueDelegateContextToken } from './delegateContext.js'
@@ -385,6 +386,7 @@ export interface CodexLaunchOverrides {
 export async function buildCodexLaunchOverrides(
   ctx: CodexLaunchOverridesContext,
 ): Promise<CodexLaunchOverrides> {
+  const contextStartedAt = performance.now()
   // Build the platform context (same 7-slot pipeline ccb uses), prepend the
   // codex-specific preamble. We do NOT add the preamble inside promptSlots
   // because that file is provider-agnostic and shouldn't carry adapter
@@ -439,6 +441,10 @@ export async function buildCodexLaunchOverrides(
   overridesLog.info('prompt_context_built', {
     agentId: ctx.agentId,
     backend: 'codex',
+    sessionKey: ctx.sessionKey,
+    elapsedMs: performance.now() - contextStartedAt,
+    preambleTokensEstimate: estimateModelHistoryTokens(preamble),
+    instructionsTokensEstimate: estimateModelHistoryTokens(instructionsContent),
     prompt_bytes: Buffer.byteLength(instructionsContent, 'utf8'),
     prompt_sha256: createHash('sha256')
       .update(instructionsContent, 'utf8')
