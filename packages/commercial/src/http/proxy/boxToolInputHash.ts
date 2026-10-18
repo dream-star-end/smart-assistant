@@ -10,6 +10,8 @@ export interface BoxToolUseDigest {
   readonly boxName: string;
   readonly clientName: string;
   readonly inputHash: string;
+  /** OCV5-509: hash of the CLI's repaired record of the input, when it differs. */
+  readonly cliInputHash?: string;
 }
 export function hashBoxToolInput(input: unknown): string {
   if (!input || typeof input !== "object" || Array.isArray(input)) {

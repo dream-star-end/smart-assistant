@@ -26,6 +26,7 @@ import {
   markGatewayShutdownEvidence,
 } from '../billing/finalizeJournalReconciler.js'
 import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBackend.js'
+import { closeRefusedRecoveryChains } from '../db/refusedRecoveryCards.js'
 import type { ContainerCallResult, DispatchIdentity } from './containerDispatchClient.js'
 import {
   classifyVisibleOrphan,
@@ -1614,6 +1615,7 @@ export interface TurnDispatchReconcilerHandle {
 export interface StartTurnDispatchReconcilerOptions extends TurnDispatchReconcilerDeps {
   /** Test seam; production pauses refused forwarded recovery jobs each tick. */
   pauseRefusedRecoveryJobs?: (pool: Pool) => Promise<number>
+  closeRefusedRecoveryChains?: (pool: Pool) => Promise<number>
   intervalMs?: number
   runOnStart?: boolean
   onError?: (err: unknown) => void
@@ -1654,6 +1656,10 @@ export function startTurnDispatchReconciler(
       // intent. Only remaining refused jobs need the legacy visible pause.
       const result = await runReconcileTick(opts)
       await (opts.pauseRefusedRecoveryJobs ?? pauseRecoveryJobsForRefusedDispatches)(opts.pool)
+        .catch(onError)
+      // OCV5-509: a paused recovery that never ran still ends the session in
+      // its unanswered recovery row; close the chain with a visible card.
+      await (opts.closeRefusedRecoveryChains ?? closeRefusedRecoveryChains)(opts.pool)
         .catch(onError)
       return result
     } catch (err) {

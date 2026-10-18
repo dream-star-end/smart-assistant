@@ -72,3 +72,15 @@ test("hidden calls of the same message are stored by id and name only", () => {
   bad([{ id: "toolu_H", name: "Read", input: { secret: "must-not-enter-PG" } }]);
   bad(Array.from({ length: 33 }, (_, i) => ({ id: `toolu_H${i}`, name: "Read" })));
 });
+
+test("OCV5-509 a call the CLI recorded repaired also stores the hash of that record", () => {
+  const repaired = evidence();
+  (repaired.toolUses[0] as Record<string, unknown>).cliInputHash = "b".repeat(64);
+  assert.deepEqual(parseBoxStoredToolHandoff(repaired), repaired);
+  const same = evidence();
+  (same.toolUses[0] as Record<string, unknown>).cliInputHash = "a".repeat(64);
+  assert.equal(parseBoxStoredToolHandoff(same), null);
+  const malformed = evidence();
+  (malformed.toolUses[0] as Record<string, unknown>).cliInputHash = "not-a-hash";
+  assert.equal(parseBoxStoredToolHandoff(malformed), null);
+});
