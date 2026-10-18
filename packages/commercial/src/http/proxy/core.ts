@@ -286,6 +286,24 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     // 这条流不会让 admin 改 proxy 时 hang(参 egressDispatcher.ts 注释)。
     if (session.dispatcher) fetchInit.dispatcher = session.dispatcher;
 
+    let fetchAttempt = 0;
+    const observedFetch = async (kind: string, fetcher: typeof fetch, endpoint: string,
+      init: RequestInit): Promise<Response> => {
+      const attempt = ++fetchAttempt;
+      const startedAt = performance.now();
+      userLog.info("proxy_fetch_timing", { requestId, model: body.model, provider: session.providerId,
+        attempt, kind, stage: "fetch_started", elapsedMs: 0 });
+      try {
+        const response = await fetcher(endpoint, init);
+        userLog.info("proxy_fetch_timing", { requestId, model: body.model, provider: session.providerId,
+          attempt, kind, stage: "headers_received", status: response.status, elapsedMs: performance.now() - startedAt });
+        return response;
+      } catch (error) {
+        userLog.info("proxy_fetch_timing", { requestId, model: body.model, provider: session.providerId,
+          attempt, kind, stage: "fetch_failed", elapsedMs: performance.now() - startedAt });
+        throw error;
+      }
+    };
     const fetchStartMs = Date.now();
     const roundTripFetch =
       session.transport === "gemini-go"
@@ -295,7 +313,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
           : session.transport === "openai-responses-go"
             ? createOpenAIResponsesGoFetch(fetchFn)
             : fetchFn;
-    let upstream = await roundTripFetch(session.endpoint, fetchInit);
+    let upstream = await observedFetch("primary", roundTripFetch, session.endpoint, fetchInit);
     let upstreamErrorPreview: string | null = null;
     if (upstream.status === 400) {
       try {
@@ -310,7 +328,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
             model: body.model,
             count: stripped.blocksStripped,
           });
-          upstream = await fetchFn(session.endpoint, {
+          upstream = await observedFetch("history_rewrite", fetchFn, session.endpoint, {
             ...fetchInit,
             body: serializeUpstreamBody(stripped.messages),
           });
@@ -347,7 +365,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
         session = fallback;
         const fallbackHeaders = buildSafeUpstreamHeaders(req.headers);
         session.applyUpstreamAuth(fallbackHeaders, body, userLog);
-        upstream = await fetchFn(session.endpoint, {
+        upstream = await observedFetch("declared_fallback", fetchFn, session.endpoint, {
           ...fetchInit,
           headers: fallbackHeaders,
           body: serializeUpstreamBody(session.sanitizeMessages(body.messages, body.model, userLog)),
@@ -548,6 +566,9 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       res,
       ac.signal,
     );
+    userLog.info("proxy_stream_timing", { requestId, model: body.model, provider: session.providerId,
+      firstByteMs: result.firstByteAtMs === null ? null : result.firstByteAtMs - fetchStartMs,
+      firstTextMs: result.firstTextAtMs === null ? null : result.firstTextAtMs - fetchStartMs });
     observed = result.observation;
     const streamEndMs = Date.now();
     // 2I-2 metrics:TTFT 是 fetch 起到第一字节;stream duration 是 fetch 起到最后一字节。

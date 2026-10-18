@@ -9,6 +9,7 @@
  * 上层（App）只需把 WS 引擎产出的 ChatMessage[] 与回调传进来。
  */
 import { returnStrayRowsToOwnerTurn } from "../lib/chat/order";
+import { FirstTextPaintCommitProbe } from "./chat/FirstTextPaintCommitProbe";
 import { ProcessDisclosure, artifactEvidenceKeys, isClearedGoalRecord, isErroredAssistant, isFoldableWorkRole, isHistoricalGoalRecord, isProcessMessage, processSections, promptShadowedToolIds } from "./chat/ProcessDisclosure";
 import { ChevronDown, ChevronRight, ChevronUp, Info, X } from "lucide-react";
 import {
@@ -114,40 +115,6 @@ import {
   tokenUsageSnapshot,
 } from "./chat/tokenUsage";
 
-function FirstTextPaintCommitProbe({ message, cb }: { message: ChatMessage; cb: CardCallbacks }) {
-  const probe = message._firstTextPaintProbe;
-  const reportedRef = useRef(new Set<string>());
-  useLayoutEffect(() => {
-    if (!probe || !cb.onFirstTextPaint || reportedRef.current.has(probe.traceId)) return;
-    if (
-      typeof requestAnimationFrame !== "function" ||
-      typeof cancelAnimationFrame !== "function"
-    ) return;
-    let first = 0;
-    let second = 0;
-    let cancelled = false;
-    first = requestAnimationFrame(() => {
-      second = requestAnimationFrame(() => {
-        if (cancelled) return;
-        reportedRef.current.add(probe.traceId);
-        cb.onFirstTextPaint?.({
-          traceId: probe.traceId,
-          sessionId: probe.sessionId,
-          clientMessageId: probe.clientMessageId,
-          latencyMs: Math.max(0, Date.now() - probe.startedAt),
-          backgroundAtFrame: probe.backgroundAtFrame,
-        });
-        delete message._firstTextPaintProbe;
-      });
-    });
-    return () => {
-      cancelled = true;
-      cancelAnimationFrame(first);
-      if (second) cancelAnimationFrame(second);
-    };
-  }, [probe, cb]);
-  return null;
-}
 
 type RendererProps = {
   message: ChatMessage;
@@ -265,7 +232,7 @@ export const MessageRenderer = memo(
       case "assistant":
         return (
           <>
-            <FirstTextPaintCommitProbe message={message} cb={cb} />
+            <FirstTextPaintCommitProbe message={message} onFirstTextPaint={cb.onFirstTextPaint} />
             <AssistantCard
               msg={message}
               ctx={ctx}
@@ -2698,6 +2665,7 @@ export function MessageList({
       return (
         <ProcessDisclosure
           sections={sections}
+          onFirstTextPaint={cb.onFirstTextPaint}
           active={it.active}
           open={open}
           setOpen={(next) => setDisclosure(it.key, next)}

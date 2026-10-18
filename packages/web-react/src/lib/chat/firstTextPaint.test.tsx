@@ -2,7 +2,8 @@ import "@testing-library/jest-dom/vitest";
 import { act, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { MessageRenderer } from "../../components/MessageRenderer";
+import { MessageList, MessageRenderer } from "../../components/MessageRenderer";
+import { FirstTextPaintCommitProbe } from "../../components/chat/FirstTextPaintCommitProbe";
 import type { CardCallbacks } from "../../components/chat/cards";
 import type { ChatMessage } from "./model";
 import { ChatSocket, type ChatSocketDeps } from "./socket";
@@ -232,4 +233,74 @@ describe("browser first-text paint telemetry", () => {
     act(flushAnimationFrame);
     expect(onFirstTextPaint).toHaveBeenCalledTimes(1);
   });
+});
+
+function animationFrames() {
+  let id = 0;
+  const callbacks = new Map<number, FrameRequestCallback>();
+  vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => { callbacks.set(++id, cb); return id; });
+  vi.stubGlobal("cancelAnimationFrame", (key: number) => callbacks.delete(key));
+  return () => act(() => {
+    const pending = [...callbacks.values()]; callbacks.clear();
+    for (const cb of pending) cb(0);
+  });
+}
+
+function probedMessage(): ChatMessage {
+  return { id: "body-probe", role: "assistant", text: "live process answer", ts: 2000,
+    _clientMessageId: "u-probe", _turnOwnerId: "u-probe",
+    _firstTextPaintProbe: { traceId: "d".repeat(32), sessionId: "s-probe",
+      clientMessageId: "u-probe", startedAt: 1000, backgroundAtFrame: false } };
+}
+
+test("MessageList reports live process narrative before final completion, once across remount", () => {
+  const flush = animationFrames();
+  const message = probedMessage();
+  const probe = message._firstTextPaintProbe!;
+  const onFirstTextPaint = vi.fn();
+  const prefix: ChatMessage[] = [
+    { id: "u-probe", role: "user", text: "hello", ts: 1000 },
+    { id: "thinking-probe", role: "thinking", text: "thinking", ts: 1500, _turnOwnerId: "u-probe" },
+  ];
+  const view = render(<MessageList processDisclosure messages={[...prefix, message]} sending
+    sessionId="s-probe" cb={{ onFirstTextPaint }} onRespondPermission={() => {}} />);
+  expect(screen.getByTestId("process-stage")).toHaveTextContent("live process answer");
+  flush();
+  expect(onFirstTextPaint).not.toHaveBeenCalled();
+  flush();
+  expect(onFirstTextPaint).toHaveBeenCalledTimes(1);
+  view.unmount();
+  render(<MessageRenderer message={{ ...message, _firstTextPaintProbe: probe }} sig="final"
+    isLast sending={false} inActiveTurn cb={{ onFirstTextPaint }} onRespondPermission={() => {}} />);
+  flush(); flush();
+  expect(onFirstTextPaint).toHaveBeenCalledTimes(1);
+});
+
+test("cancelled first frame can be reported after remount, simultaneous owners deduplicate", () => {
+  const flush = animationFrames();
+  const message = probedMessage();
+  const onFirstTextPaint = vi.fn();
+  const view = render(<FirstTextPaintCommitProbe message={message} onFirstTextPaint={onFirstTextPaint} />);
+  flush(); view.unmount();
+  render(<><FirstTextPaintCommitProbe message={message} onFirstTextPaint={onFirstTextPaint} />
+    <FirstTextPaintCommitProbe message={{ ...message }} onFirstTextPaint={onFirstTextPaint} /></>);
+  flush(); flush();
+  expect(onFirstTextPaint).toHaveBeenCalledTimes(1);
+});
+
+test("an old paint callback does not delete a replacement probe; empty/error bodies do not report", () => {
+  const flush = animationFrames();
+  const message = probedMessage();
+  const replacement = { ...message._firstTextPaintProbe!, traceId: "e".repeat(32) };
+  const onFirstTextPaint = vi.fn();
+  render(<FirstTextPaintCommitProbe message={message} onFirstTextPaint={onFirstTextPaint} />);
+  message._firstTextPaintProbe = replacement;
+  flush(); flush();
+  expect(message._firstTextPaintProbe).toBe(replacement);
+  const empty = { ...probedMessage(), text: " " };
+  const error = { ...probedMessage(), _isError: true };
+  render(<><FirstTextPaintCommitProbe message={empty} onFirstTextPaint={onFirstTextPaint} />
+    <FirstTextPaintCommitProbe message={error} onFirstTextPaint={onFirstTextPaint} /></>);
+  flush(); flush();
+  expect(onFirstTextPaint).toHaveBeenCalledTimes(1);
 });
