@@ -2407,6 +2407,9 @@ async function proveRefusedRecoveryClosed(api: Api, database: unknown): Promise<
     if (!reply.applied) fail("REFUSED_RECOVERY_ANSWER_NOT_APPENDED");
     const refused = await chain("refused", "dispatch_not_accepted");
     const policy = await chain("policy", "refused:UNAUTHORIZED_MODEL");
+    // a stored lone surrogate in a history must not fail the sweep for every session (Codex r2)
+    await db.query(`UPDATE client_sessions SET messages=replace(messages, '"text":"↻ 自动从断点继续"',
+      '"text":"↻ 自动从断点继续\\ud800"') WHERE id=$1`, [policy.sessionId]);
     // a chain that ran and gave up has its own card; it is not this sweep's
     const exhausted = await chain("exhausted", "automatic_retry_exhausted");
     // one chain per sweep (Codex r1): each sweep reaches the next open chain
