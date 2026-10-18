@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { boxPromptLayoutOf, compileBoxCliSyntheticTurn, BoxMessagesShapeError } from "./boxMessagesMapper.js";
 import type { ProxyBody } from "./shared.js";
+import { makeBoxTextPlan } from "./boxTextPlan.js";
 
 const args = { cwd: "/tmp/ocv5-289-run-aaaaaaaaaaaaaaaaaaaaaaaa", cliVersion: "2.1.280" };
 function body(messages: unknown[], system?: unknown): ProxyBody {
@@ -17,6 +18,120 @@ function code(input: ProxyBody): string {
 }
 
 describe("Box Messages → Claude CLI synthetic session boundary", () => {
+  it("one user keeps its original string or text blocks without a rewrite", () => {
+    for (const content of ["目标 α\n第二行", [{ type: "text", text: "目标 α" }, { type: "text", text: "context" }]]) {
+      const out = compileBoxCliSyntheticTurn(body([{ role: "user", content }]), args);
+      assert.deepEqual(JSON.parse(out.stdinJsonl).message.content, content);
+      assert.equal(out.snapshotJsonl, "");
+    }
+  });
+
+  it("assistant boundaries stop the pending user tail while system text is lifted", () => {
+    const out = compileBoxCliSyntheticTurn(body([
+      { role: "user", content: "earlier" }, { role: "assistant", content: "answered" },
+      { role: "user", content: "goal" }, { role: "system", content: "rules" },
+      { role: "user", content: "reminder" },
+    ]), args);
+    assert.deepEqual(out.snapshotJsonl.trim().split("\n").map((line) => JSON.parse(line).message.content),
+      ["earlier", "answered"]);
+    assert.deepEqual(JSON.parse(out.stdinJsonl).message.content,
+      [{ type: "text", text: "goal" }, { type: "text", text: "reminder" }]);
+    assert.equal(out.systemPrompt, "rules");
+    const single = compileBoxCliSyntheticTurn(body([
+      { role: "user", content: "earlier" }, { role: "assistant", content: "answered" },
+      { role: "user", content: "goal" },
+    ]), args);
+    assert.equal(JSON.parse(single.stdinJsonl).message.content, "goal");
+  });
+
+  it("pending text does not silently absorb unsupported media or malformed blocks", () => {
+    for (const content of [
+      [{ type: "text", text: "goal" }, { type: "image", source: { type: "base64", media_type: "image/png", data: "aA==" } }],
+      [{ type: "text", text: "goal" }, null], [],
+    ]) {
+      for (const messages of [
+        [{ role: "user", content }, { role: "user", content: "reminder" }],
+        [{ role: "user", content: "goal" }, { role: "user", content }],
+      ]) assert.throws(() => compileBoxCliSyntheticTurn(body(messages), args), BoxMessagesShapeError);
+    }
+  });
+
+  it("keeps a delegated goal and the late deferred-tools reminder in the same current turn", () => {
+    const goal = "[委派任务]\n目标: 逐字返回 delegate-goal-7f2f-marker\n上下文: context-独立-校验";
+    const reminder = "<system-reminder>\n<available-deferred-tools>SearchExtraTools</available-deferred-tools>\n</system-reminder>";
+    // claude.ts appends this meta user AFTER normalizeMessagesForAPI has run.
+    const input = body([
+      { role: "user", content: goal },
+      { role: "user", content: [{ type: "text", text: reminder }] },
+    ]);
+    const before = structuredClone(input);
+    const out = compileBoxCliSyntheticTurn(input, args);
+    assert.equal(out.snapshotJsonl, "", "a fresh task must not become an unanswered resume history");
+    assert.deepEqual(JSON.parse(out.stdinJsonl).message.content, [
+      { type: "text", text: goal }, { type: "text", text: reminder },
+    ]);
+    assert.deepEqual(input, before, "staging must not mutate the canonical request or its hashes");
+  });
+
+  it("keeps the whole current user tail after completed history while lifting system text", () => {
+    const out = compileBoxCliSyntheticTurn(body([
+      { role: "user", content: "earlier task" },
+      { role: "assistant", content: [{ type: "text", text: "earlier answer" }] },
+      { role: "user", content: [{ type: "text", text: "current-goal" }, { type: "text", text: "current-context" }] },
+      { role: "system", content: "lifted system" },
+      { role: "user", content: "late reminder" },
+    ]), args);
+    const history = out.snapshotJsonl.trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(history.map((row) => row.type), ["user", "assistant"]);
+    assert.deepEqual(JSON.parse(out.stdinJsonl).message.content, [
+      { type: "text", text: "current-goal" }, { type: "text", text: "current-context" },
+      { type: "text", text: "late reminder" },
+    ]);
+    assert.equal(out.systemPrompt, "lifted system");
+  });
+
+  it("leaves a completed tool result in history before a separate fresh prompt and reminder", () => {
+    const out = compileBoxCliSyntheticTurn(body([
+      { role: "user", content: "earlier task" },
+      { role: "assistant", content: [{ type: "tool_use", id: "call_completed", name: "Read", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_completed", content: "completed result" }] },
+      { role: "user", content: "fresh prompt" },
+      { role: "user", content: "late reminder" },
+    ]), args); // Default args: no resumeToolResults grant for a fresh request.
+    const history = out.snapshotJsonl.trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(history.map((row) => row.type), ["user", "assistant", "user"]);
+    assert.match(history[2].message.content[0].tool_use_id, /^toolu_oc[a-f0-9]{32}$/);
+    assert.equal(history[1].message.content[0].id, history[2].message.content[0].tool_use_id);
+    assert.deepEqual(JSON.parse(out.stdinJsonl).message.content, [
+      { type: "text", text: "fresh prompt" }, { type: "text", text: "late reminder" },
+    ]);
+  });
+
+  it("stages the complete delegated turn for both print and interactive Box runners", () => {
+    const input = { ...body([
+      { role: "user", content: [{ type: "text", text: "delegate goal 中文" }] },
+      { role: "user", content: [{ type: "text", text: "<available-deferred-tools>reminder</available-deferred-tools>" }] },
+    ]), model: "box-api-claude-haiku-5-5", stream: true } as ProxyBody;
+    const host = { host: Buffer.from("print('unused fixture')\n"), modFiles: "{}", modSha256: "c".repeat(64) };
+    for (const interactiveHost of [undefined, host]) {
+      // Construct only: this test never stages files remotely or launches a CLI.
+      const plan = makeBoxTextPlan({ body: input, upstreamModel: "claude-haiku-5-5",
+        supervisorAsset: Buffer.from("supervisor fixture"), keeperAsset: Buffer.from("keeper fixture"),
+        maxOutputTokensLimit: 128_000, ...(interactiveHost ? { interactiveHost } : {}) });
+      assert.equal(plan.snapshotHash, null, "a first delegated turn must start fresh");
+      assert.ok(plan.run.args.includes("--session-id"));
+      assert.ok(!plan.run.args.includes("--resume"));
+      const writes = plan.stageInputs.filter((step) =>
+        step.args[5]?.endsWith("/stdin.jsonl") && step.args[2]?.includes("base64.b64decode"));
+      const stdin = Buffer.concat(writes.flatMap((step) => step.args.slice(8)
+        .map((part) => Buffer.from(part, "base64")))).toString("utf8");
+      assert.deepEqual(JSON.parse(stdin).message.content, [
+        { type: "text", text: "delegate goal 中文" },
+        { type: "text", text: "<available-deferred-tools>reminder</available-deferred-tools>" },
+      ]);
+    }
+  });
+
   it("keeps current user in one stdin turn and lifts trailing CCB system text", () => {
     const output = compileBoxCliSyntheticTurn(body([
       { role: "user", content: [{ type: "text", text: "current" }] },
