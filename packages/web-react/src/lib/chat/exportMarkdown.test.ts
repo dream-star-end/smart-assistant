@@ -61,7 +61,7 @@ describe("exportSessionMarkdown", () => {
       msg({ id: "u", role: "user", text: "生成报告", _clientMessageId: "u", ts: 1 }),
       msg({ id: "tool", role: "tool", text: "PRIVATE_TOOL_OUTPUT", _clientMessageId: "u", ts: 2 }),
       msg({ id: "partial", role: "assistant", text: "已完成第一节：可用结论。", _clientMessageId: "u", ts: 3 }),
-      msg({ id: "error", role: "assistant", text: "PRIVATE_ERROR", _errorCode: "MODEL_CONFIG_CHANGED_RETRY_TURN", _clientMessageId: "u", ts: 4 }),
+      msg({ id: "error", role: "assistant", text: "", _errorCode: "MODEL_CONFIG_CHANGED_RETRY_TURN", _clientMessageId: "u", ts: 4 }),
     ];
     const snapshot = JSON.stringify(rows);
     const md = await exportSessionMarkdown(rows);
@@ -91,6 +91,12 @@ describe("exportSessionMarkdown", () => {
     expect(stopped).toContain("这是停止前已呈现的结果。");
     expect(stopped).toContain("助手（未完成）");
     expect(stopped).not.toContain("turn failed");
+    const internal = await exportSessionMarkdown([user, msg({ id: "internal", role: "assistant", text: '{"error":"PRIVATE_ERROR","stack":"secret"}', _errorCode: "ENGINE_ERROR", ts: 4 })]);
+    expect(internal).not.toContain("PRIVATE_ERROR");
+    expect(internal).not.toContain("secret");
+    const partial = await exportSessionMarkdown([user, msg({ id: "partial", role: "assistant", text: "已完成的合法正文。\n\n[turn failed: engine_error]", _errorCode: "ENGINE_ERROR", ts: 4 })]);
+    expect(partial).toContain("已完成的合法正文。");
+    expect(partial).not.toContain("turn failed");
   });
 
   test("空列表得到空串", async () => {
