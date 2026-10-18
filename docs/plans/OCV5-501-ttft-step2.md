@@ -14,10 +14,12 @@
 
 缺Box出口目录/文件作为显式、白名单、不可重试的配置错误贯穿resolver→Box fetch→proxy→CCB parser/engine→gateway。读取权限和符号链接校验保留；不泄露路径/凭据；真实网络/5xx仍走现有策略。拒绝前不启动Box，不把配置错误包装为供应商capacity。
 
-429继续透明自动重试，实际HTTP owner proxy在原请求尚未输出前对可安全重放的静态API做窄重试。当前实际official-cc不是仓内fork，不能靠修改fork terminal sideband假装覆盖。保持CLI maxRetries=0，固定同一session/key/endpoint/headers/dispatcher与body字节，不改prompt。按现有parseRetryAfterMs支持秒/HTTP日期，delay=max(Retry-After,指数退避+抖动)，缺头走指数。最多10次HTTP尝试，总等待预算240秒，超过预算时不截短Retry-After提前重发，返回明确rate-limited exhausted。保留现有quota_exhausted分类及已声明fallback优先级。Box、nonreplayable和专用transport不纳入自动重发。
+429继续透明自动重试，保留gateway现有单一共享最大10次预算与CLI maxRetries=0，不在proxy另建重发循环。actual official-cc 2.1.302隔离loopback已证明is_error终态保留api_error_status和API错误message内的明确机器标记；单靠fork sideband不覆盖本批实际产品。
 
-中间429只上报已有pool健康结果，不finalize、不release、不换号；最终success只commit一次，最终failure只fail一次。等待共享现有ac.signal，可取消，取消后不得再发。预算比300秒软预留和30分钟journal/slot期限更短。最终429用明确机器错误code表明proxy已拥有重试预算；必须用实际官方CLI+loopback mock证明其在is_error terminal诊断中保留。gateway仅从error terminal诊断识别该机器码并停止外层重复重试，普通用户/assistant正文绝不能触发。若stock CLI丢弃该标记，停止此设计，不提交成已覆盖，另设计鉴权request-scoped sidechannel。其它engine现有自动重试不缩减；Grok/AG没有同样可重放API路径，不能以CCB结论冒称全引擎覆盖。
+复用parseRetryAfterMs支持秒/HTTP日期；proxy保持标准Retry-After和retry_after_ms，并在错误message末尾附一个版本化、严格schema的机器envelope（base64url JSON，仅status=429与绝对retryNotBeforeMs），不含正文/鉴权。native CLI保留后，由gateway只在is_error终态且对应429时解析，不从用户/assistant/thinking正文提取、不解析自然语言。terminal→TurnResult→TurnSummary→typed retry error携带该安全字段。网关等max(现有指数+抖动, retryNotBefore-now)，对429豁免same-class3次提前breaker，仍尊重共享max10、Stop、native continuation safety与原5xx breaker。睡眠使用signal，可分段等避免大定时器溢出；不能截短Retry-After提前重发。非本代理来源且无有效hint的429继续指数退避+抖动。API_KEY/pool/quota分类、现有fallback与账务finalizer原逻辑不改。
+
+必须先用实际官方CLI+无外网loopback mock证明精确sendJsonError契约的hint终态保留，以及shutdown+resume后的下一次请求system/tools前缀相同、所有上游messages没有机器hint。若hint进入prompt或无法可靠提取，停止该设计，不交为通过。用户最终界面仍是既有rate_limited友好文案，机器信息不进入聊天正文。缺出口采用明确409机器码，避免官方CLI对400自动修复再发；用同mock证明一次请求/终态白名单可分类。
 
 ## 测试和收益
 
-fake clock/transport：秒/日期/缺失/无效Retry-After；3次429后成功；不早于供应商要求；指数+抖动；总等待预算/最大次数/Stop取消不再发；中间失败不结算、成功只扣一次；5xx原breaker；缺出口单次明确失败、无启动/无收费；stock CLI真实loopback mock（不接供应商）验证exhausted及配置机器码保留。成功TTFT预计0秒；缺出口同类失败可少等约7.828秒。429不再承诺少等8.374秒，按供应商恢复时刻可能更久但提高成功机会。风险中等，结构化sideband兼容和重试边界需要完整回归。
+fake clock/transport：秒/日期/缺失/无效Retry-After；3次429后成功；不早于供应商要求；指数+抖动；总等待预算/最大次数/Stop取消不再发；429失败journal正常aborted，成功轮按现有单次结算；5xx原breaker；缺出口单次明确失败、无启动/无收费；stock CLI真实loopback mock（不接供应商）验证exhausted及配置机器码保留。成功TTFT预计0秒；缺出口同类失败可少等约7.828秒。429不再承诺少等8.374秒，按供应商恢复时刻可能更久但提高成功机会。风险中等，结构化sideband兼容和重试边界需要完整回归。
