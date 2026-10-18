@@ -1,20 +1,13 @@
-# OCV5-503 内容派生缓存验证状态
+# OCV5-503 内容派生缓存验证
 
-用户批准范围：19:12实现；19:14所有步骤缓存不得下降。不合并不发布，商业版不操作。
+只缓存完整字符串的UTF8字节数、SHA256和纯token估算，128条/2MiB上限、精确内容key、LRU、SHA失败删除后可重试。读取来源、权限、技能/记忆/项目、工具可用性与可变applied meta每轮照常重建。system、工具、上下文顺序与内容均不变；惰性派生保留原slot/final SHA调度与日志边界。
 
-30项相关测试通过；固定37,083字节/14slot离线CPU基准250轮：baseline p50 4.090711ms，warm 0.016518ms，省约0.004074秒。cold/miss仍需计算，不能承诺整段TTFT收益。风险：2MiB UTF8/128条上限、完整内容key，源读取和可变meta不缓存。
+30项相关测试通过。16slot/44838字节、120次交错同输入配对离线CPU基准：warm p50 5.791080→0.116586ms（省0.005674秒）；cold 4.939641→5.927462ms；churn 5.243103→5.781514ms；超预算bypass 4.258706→5.124209ms。后3条增加约0.0005–0.0010秒；不能承诺所有路径更快，更不能把CPU微基准当整段TTFT。原始/修正基准均保留远端证据。
 
-## 缓存硬门
+## 上游缓存对照
 
-| 数据 | base 67d13462e | candidate | 结论 |
-|---|---|---|---|
-| 真正上游cache_read/input/cache_write | 待合法受控对照 | 待合法受控对照 | **未验收** |
-| cached tokens比例 | N/A | N/A | 无数据不记0%，不宣称非回归 |
+详见OCV5-503-cache-evidence.json。base/本候选/Step7各自运行自身源码导出完整受控body，46753字节逐字相同，21个完整平台MCP schema、remote IUI/model hint和目录固定，legacy布局。765自己的容器通过正式fresh local_catalog发3次真实DeepSeek调用：warmup I12672/R0/W0；未改代码基线I256/R12416/W0；candidate I256/R12416/W0。比例R/(I+R+W)：97.97979798%→97.97979798%，没有下降。三笔共享数据不按PR重复算调用或扣费；扣费2+1+1分已逐笔对账。
 
-将另保留完整prompt前缀字节/顺序对照作为补充，它不是上游用量证据。普通网页canary运行live而非本分支，不能冒称candidate。拟使用765自己容器的正式local_catalog静态API路径做候选请求的缓存连续性检查，若权限/环境不足则不绕过authority。Box/Grok/Gemini完整候选链尚无同等入口，不外推结论。新增付费请求暂0、扣费0，原测量175积分不是本PR实测。
+此结果证明受控平台上下文/请求的缓存连续性；不是原生CLI隐藏system、默认工具或765真实persona/memory的完整网页候选后端实测。未删功能凑相等；受控上下文本身未绑定项目/本地persona。候选后端未发布，网页TTFT收益未验。该边界须保留，不能把N/A当0或声称所有引擎全链路已验。
 
-计划独立审查APPROVED；全diff独立审查、前缀等价、typecheck/lint、托管CI和真实缓存门仍需补齐。PR保持草稿，不能合并/发布或交为验收通过。
-
-远端证据：H/g500-ttft-approved-20261018/step4，H=/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308。
-
-独立复核修正：初版changed基准给candidate追加字符而baseline未追加，且调度与产品不同，不可用来判全部路径不变慢。现改同输入/同调度/交错配对，并包含静态布局动态slot。派生缓存改成惰性SHA与token accessor，避免为原本未估算的动态slot新增扫描，并保留final SHA在prompt_context_timing日志之后；新增缓存UTF8预算计数仍在日志前，性能以完整外层耗时为准。旧基准完整保留，不隐藏cold/churn/bypass结果；新实测待补。
+计划审查、代码r1/r2通过；最终包含此证据的独立复审及当前head CI待收口。草稿PR，不合并不发布，商业版未操作。远端H/g500-ttft-approved-20261018/step4与paid-evidence。
