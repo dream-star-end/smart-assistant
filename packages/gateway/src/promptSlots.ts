@@ -358,19 +358,33 @@ function hasMcpTool(ctx: Pick<PromptSlotContext, 'availableMcpTools'>, name: str
   return ctx.availableMcpTools === undefined || ctx.availableMcpTools.includes(name)
 }
 
+const PLATFORM_MCP_CLAIM_PATTERNS = PLATFORM_MCP_TOOL_NAMES.map((tool) => ({
+  tool,
+  pattern: new RegExp(`\\b${tool.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b(?:\\([^\\n\\r]*?\\))?`, 'g'),
+}))
+
+/** Capture only this build's exact availability; preserve the original replacement order. */
+export function createMcpClaimSanitizer(
+  availableMcpTools: string[] | undefined,
+): (content: string) => string {
+  if (availableMcpTools === undefined) return (content) => content
+  const available = new Set(availableMcpTools)
+  const missing = PLATFORM_MCP_CLAIM_PATTERNS.filter(({ tool }) => !available.has(tool))
+  return (content) => {
+    let out = content
+    for (const { pattern } of missing) {
+      pattern.lastIndex = 0
+      out = out.replace(pattern, '（当前未注册）')
+    }
+    return out
+  }
+}
+
 export function sanitizeUnavailableMcpClaims(
   content: string,
   availableMcpTools: string[] | undefined,
 ): string {
-  if (availableMcpTools === undefined) return content
-  const available = new Set(availableMcpTools)
-  let out = content
-  for (const tool of PLATFORM_MCP_TOOL_NAMES) {
-    if (available.has(tool)) continue
-    const escaped = tool.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    out = out.replace(new RegExp(`\\b${escaped}\\b(?:\\([^\\n\\r]*?\\))?`, 'g'), '（当前未注册）')
-  }
-  return out
+  return createMcpClaimSanitizer(availableMcpTools)(content)
 }
 
 // ── 记忆注入预算(注入侧唯一权威,与存储写侧解耦)──
@@ -1968,9 +1982,10 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
     ctx.cacheLayout === 'static-first'
       ? staticFirstSlots(slots, agentsParts, memoryParts)
       : { slots, staticCount: -1 }
+  const sanitizeMcpClaims = createMcpClaimSanitizer(ctx.availableMcpTools)
   const effectiveSlots = ordered.slots.map((slot) => ({
     ...slot,
-    content: sanitizeUnavailableMcpClaims(slot.content, ctx.availableMcpTools),
+    content: sanitizeMcpClaims(slot.content),
   }))
   let content =
     ordered.staticCount < 0
