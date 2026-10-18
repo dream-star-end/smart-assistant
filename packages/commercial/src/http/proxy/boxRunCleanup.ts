@@ -16,6 +16,18 @@ def private_dir(path):
  if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o700:
   os.close(fd);raise SystemExit(126)
  return fd
+def clear_memory(parent):
+ fd=os.open('memory',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+ try:
+  if not stat.S_ISDIR(os.fstat(fd).st_mode) or os.fstat(fd).st_uid!=os.getuid():raise SystemExit(126)
+  for name in sorted(os.listdir(fd)):
+   if not re.fullmatch(r'(?!\.)[^/]{1,251}\.md',name):raise SystemExit(126)
+   st=os.stat(name,dir_fd=fd,follow_symlinks=False)
+   if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or st.st_nlink!=1:raise SystemExit(126)
+   os.unlink(name,dir_fd=fd)
+  os.fsync(fd)
+ finally:os.close(fd)
+ os.rmdir('memory',dir_fd=parent)
 def private_file(dfd,name):
  st=os.stat(name,dir_fd=dfd,follow_symlinks=False)
  if not stat.S_ISREG(st.st_mode) or st.st_uid!=os.getuid() or stat.S_IMODE(st.st_mode)!=0o600 or st.st_nlink!=1:
@@ -47,6 +59,9 @@ if keep=='0':
   try:
    pattern=re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.jsonl(?:\.part)?')
    for name in sorted(os.listdir(history)):
+    # OCV5-509: Claude Code's auto-memory folder (*.md only) went to every run
+    # project; refusing it left each cleanup pending and retried forever.
+    if name=='memory':clear_memory(history);continue
     if not pattern.fullmatch(name):raise SystemExit(126)
     private_file(history,name)
     os.unlink(name,dir_fd=history)

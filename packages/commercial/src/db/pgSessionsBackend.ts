@@ -411,7 +411,7 @@ async function automaticRecoveryCandidateCheapVerdict(
   return latestUser && latestUser.id === candidate.client_message_id ? "pass" : "transient";
 }
 
-async function withTx<T>(pool: Pool, fn: (client: PoolClient) => Promise<T>): Promise<T> {
+export async function withTx<T>(pool: Pool, fn: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect();
   let destroyed = false;
   try {
@@ -2160,19 +2160,21 @@ function replayMediaIsDurable(media: unknown[]): boolean {
  * ACK-loss replays harmless. */
 /** 恢复链放弃时给用户写一张可见终态卡。幂等 id = rootClientMessageId 级:
  * 同一根消息的多次放弃判定(并发 master/重复 finalize)只落一张卡。 */
-async function appendRecoveryGiveUpTerminalCard(
+export async function appendRecoveryGiveUpTerminalCard(
   client: PoolClient,
   input: {
     sessionId: string;
     sessionUserId: string;
     rootClientMessageId: string;
-    reason: "silent_no_progress" | "retry_exhausted";
+    reason: "silent_no_progress" | "retry_exhausted" | "recovery_refused";
   },
-): Promise<void> {
+): Promise<boolean> {
   const text = input.reason === "silent_no_progress"
     ? "自动恢复已停止：连续多次从断点恢复都没有取得进展，为避免重复执行已暂停。请直接再发一条消息继续，或新开一个会话。"
-    : "自动恢复已停止：已达到自动恢复次数上限。请直接再发一条消息继续，或新开一个会话。";
-  await pgAppendServerAuthoredCore(client, input.sessionId, input.sessionUserId, {
+    : input.reason === "recovery_refused"
+      ? "自动恢复已停止：从断点继续的那一轮没能开始执行（这一轮续接未计费）。请直接再发一条消息继续，或新开一个会话。"
+      : "自动恢复已停止：已达到自动恢复次数上限。请直接再发一条消息继续，或新开一个会话。";
+  const appended = await pgAppendServerAuthoredCore(client, input.sessionId, input.sessionUserId, {
     id: `m-recovery-giveup-${input.rootClientMessageId}`,
     role: "assistant",
     text,
@@ -2183,6 +2185,7 @@ async function appendRecoveryGiveUpTerminalCard(
     _source: "server",
     _clientMessageId: input.rootClientMessageId,
   });
+  return appended.applied;
 }
 
 /**
