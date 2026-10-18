@@ -1,6 +1,6 @@
 import * as assert from 'node:assert/strict'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -65,7 +65,8 @@ test('search fails explicitly without disclosing response bodies or identity', a
 
 test('Codex scrubbed env uses the paired container auth file; partial env never mixes identities', async () => {
   await fixture((_req, res) => ok(res), async (env, requests, dir) => {
-    await writeFile(join(dir, 'container-auth.json'), JSON.stringify({ masterBaseUrl: env.OPENCLAUDE_V3_MASTER_BASE_URL, containerToken: identity }))
+    await mkdir(join(dir, '.openclaude'));
+    await writeFile(join(dir, '.openclaude', 'container-auth.json'), JSON.stringify({ masterBaseUrl: env.OPENCLAUDE_V3_MASTER_BASE_URL, containerToken: identity }))
     const scrubbed = { HOME: dir, OPENCLAUDE_V3_MASTER_BASE_URL: 'http://127.0.0.1:1' }
     const result = await runOcWebCli(['search', 'news'], scrubbed)
     assert.equal(result.exitCode, 0, result.stderr)
