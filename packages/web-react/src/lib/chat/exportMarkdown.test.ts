@@ -15,11 +15,11 @@ function msg(partial: Partial<ChatMessage> & Pick<ChatMessage, "id" | "role">): 
 }
 
 describe("exportSessionMarkdown", () => {
-  test("只收 user/assistant/tool，按 ## 用户/助手 + 本地时间 + 正文", async () => {
+  test("只收真实提问和最终回答，按 ## 用户/助手 + 本地时间 + 正文", async () => {
     const md = await exportSessionMarkdown([
       msg({ id: "u1", role: "user", text: "你好" }),
       msg({ id: "t1", role: "thinking", text: "内部思考" }),
-      msg({ id: "a1", role: "assistant", text: "世界" }),
+      msg({ id: "process", role: "assistant", text: "正在处理" }),
       msg({
         id: "tool1",
         role: "tool",
@@ -27,14 +27,16 @@ describe("exportSessionMarkdown", () => {
         inputPreview: "ls -la",
         text: "ignored-body",
       }),
+      msg({ id: "a1", role: "assistant", text: "世界" }),
       msg({ id: "sys", role: "system", text: "系统提示" }),
     ]);
     expect(md).toContain("## 用户");
     expect(md).toContain("你好");
     expect(md).toContain("## 助手");
     expect(md).toContain("世界");
-    expect(md).toContain("## 工具");
-    expect(md).toContain("Bash ls -la");
+    expect(md).not.toContain("## 工具");
+    expect(md).not.toContain("Bash ls -la");
+    expect(md).not.toContain("正在处理");
     expect(md).not.toContain("内部思考");
     expect(md).not.toContain("系统提示");
     expect(md).not.toContain("ignored-body");
@@ -43,9 +45,15 @@ describe("exportSessionMarkdown", () => {
     expect(md).toContain(when);
   });
 
-  test("tool 缺 toolName/preview 时回落 tool", async () => {
+  test("只有工具过程时不产生可分享正文", async () => {
     const md = await exportSessionMarkdown([msg({ id: "t", role: "tool" })]);
-    expect(md).toContain("tool");
+    expect(md).toBe("");
+  });
+
+  test("正在生成时不导出尚未完成的回答", async () => {
+    const md = await exportSessionMarkdown([msg({ id: "u", role: "user", text: "问题" }), msg({ id: "a", role: "assistant", text: "尚未完成" })], true);
+    expect(md).toContain("问题");
+    expect(md).not.toContain("尚未完成");
   });
 
   test("空列表得到空串", async () => {
