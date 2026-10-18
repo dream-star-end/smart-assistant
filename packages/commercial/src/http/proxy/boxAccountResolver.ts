@@ -51,9 +51,21 @@ export function refuseBoxLaunch<T extends Pick<BoxExecTransport, "run">>(inner: 
 
 export class BoxAccountResolverError extends Error {
   /** Safe cause tag (error name and provision code only, never a message). */
-  constructor(readonly code: string, readonly causeTag?: string) {
+  constructor(readonly code: string, readonly causeTag?: string,
+    readonly uidProxyFailure?: "missing" | "invalid") {
     super(causeTag ? `${code} cause=${causeTag}` : code);
     this.name = "BoxAccountResolverError";
+  }
+}
+
+/** Only a confirmed configuration failure with no account-bound alternative in the
+ * current eligible scope may end the turn. Unmarked/temporary failures keep the
+ * gateway's existing recovery path; this proof never selects another account. */
+export class BoxEgressNotConfiguredError extends BoxAccountResolverError {
+  constructor(code: "BOX_UID_PROXY_UNAVAILABLE" | "BOX_UID_PROXY_INVALID",
+    reason: "missing" | "invalid") {
+    super(code, undefined, reason);
+    this.name = "BoxEgressNotConfiguredError";
   }
 }
 
@@ -70,6 +82,9 @@ type SnapshotGetter = (id: bigint) => Promise<CursorTokenSnapshot | null>;
 
 export interface BoxAccountResolverDeps {
   list: () => Promise<AccountRow[]>;
+  /** Failure-only metadata proof. Normal selection still uses list unchanged.
+   * Missing, failed or truncated snapshots cannot prove no automatic recovery. */
+  recoveryScope?: () => Promise<{ complete: boolean; accounts: readonly AccountRow[] }>;
   account: AccountGetter;
   token: TokenGetter;
   snapshot: SnapshotGetter;
@@ -142,28 +157,35 @@ class OwnedProxy {
 export function readBoxUidProxy(uid: bigint): string {
   if (uid <= 0n || uid > 1_000_000_000n) throw new BoxAccountResolverError("BOX_UID_INVALID");
   const dir = `/etc/openclaude/cursor-v5-u${uid}`;
-  const parent = lstatSync(dir);
-  if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== 0
-    || (parent.mode & 0o777) !== 0o700) throw new BoxAccountResolverError("BOX_UID_PROXY_INVALID");
   const path = join(dir, ".https-proxy");
   let fd: number | undefined;
   try {
+    const parent = lstatSync(dir);
+    if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== 0
+      || (parent.mode & 0o777) !== 0o700) throw new BoxAccountResolverError("BOX_UID_PROXY_INVALID", undefined, "invalid");
+
     fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const st = fstatSync(fd);
     if (!st.isFile() || st.uid !== 0 || (st.mode & 0o777) !== 0o600
       || st.nlink !== 1 || st.size < 1 || st.size > 2048) {
-      throw new BoxAccountResolverError("BOX_UID_PROXY_INVALID");
+      throw new BoxAccountResolverError("BOX_UID_PROXY_INVALID", undefined, "invalid");
     }
     const raw = readFileSync(fd, "utf8").trim();
-    const url = new URL(raw);
+    let url: URL;
+    try { url = new URL(raw); }
+    catch { throw new BoxAccountResolverError("BOX_UID_PROXY_INVALID", undefined, "invalid"); }
     if ((url.protocol !== "http:" && url.protocol !== "https:") || !url.hostname
       || url.search || url.hash || url.pathname !== "/") {
-      throw new BoxAccountResolverError("BOX_UID_PROXY_INVALID");
+      throw new BoxAccountResolverError("BOX_UID_PROXY_INVALID", undefined, "invalid");
     }
     return raw;
   } catch (error) {
     if (error instanceof BoxAccountResolverError) throw error;
-    throw new BoxAccountResolverError("BOX_UID_PROXY_UNAVAILABLE");
+    const code = (error as { code?: unknown } | null)?.code;
+    // Descriptor pressure, I/O errors and unknown failures may recover on the
+    // existing next attempt. Do not turn them into a terminal configuration error.
+    throw new BoxAccountResolverError("BOX_UID_PROXY_UNAVAILABLE", undefined,
+      code === "ENOENT" ? "missing" : code === "ENOTDIR" ? "invalid" : undefined);
   } finally { if (fd !== undefined) closeSync(fd); }
 }
 
@@ -409,8 +431,9 @@ export class BoxAccountResolver {
     loginScope?: BoxLoginScope; stickyKey?: string }, refused: ReadonlySet<string>): Promise<BoxResolvedTarget> {
     if (args.signal.aborted) throw new BoxAccountResolverError("BOX_RESOLVE_ABORTED");
     const now = this.deps.now ?? Date.now;
-    const rows = (await this.deps.list()).filter((row) => eligible(row, now())
-      && (args.requiredAccountId === undefined || row.id === args.requiredAccountId));
+    const scopedRows = (await this.deps.list()).filter((row) =>
+      args.requiredAccountId === undefined || row.id === args.requiredAccountId);
+    const rows = scopedRows.filter((row) => eligible(row, now()));
     let accountId: bigint;
     let profile = BOX_DEFAULT_PROFILE;
     // Cleanup, stop and observer paths pin an account and do not launch (they never wake a Box): a benched
@@ -468,7 +491,38 @@ export class BoxAccountResolver {
       let dispatcher: Dispatcher | undefined;
       if (route.kind === "ready") dispatcher = route.dispatcher;
       else {
-        const proxy = this.deps.uidProxy(args.uid);
+        let proxy: string | null;
+        try { proxy = this.deps.uidProxy(args.uid); }
+        catch (error) {
+          if (error instanceof BoxAccountResolverError
+            && (error.code === "BOX_UID_PROXY_UNAVAILABLE" || error.code === "BOX_UID_PROXY_INVALID")
+            && error.uidProxyFailure !== undefined
+            && args.allowWakeIfHibernated === true && !inspectOnly
+            // Reuse only the already-authorized candidate snapshot. A binding
+            // or missing metadata means recovery may exist: keep base behavior.
+            // Do not probe candidates, change affinity or move a native session.
+            // Eligibility can recover during the existing retry window. Use
+            // the original scoped metadata, not only this instant's selection.
+            && scopedRows.every((row) => row.id === accountId
+              || (row.egress_proxy === null && row.egress_proxy_id === null
+                && row.egress_host_uuid === null))) {
+            // Production's normal list contains only active accounts. Include
+            // cooldown members that the existing health actor can restore; do
+            // not mistake their absence for proof that recovery is impossible.
+            let recoveryScope: Awaited<ReturnType<NonNullable<BoxAccountResolverDeps["recoveryScope"]>>> | undefined;
+            try { recoveryScope = await this.deps.recoveryScope?.(); }
+            catch { /* An uncertain snapshot keeps the original retry path. */ }
+            if (recoveryScope?.complete === true && recoveryScope.accounts
+              .filter((row) => (args.requiredAccountId === undefined || row.id === args.requiredAccountId)
+                && row.provider === "cursor" && (row.status === "active" || row.status === "cooldown"))
+              .every((row) => row.status === "active"
+                && row.egress_proxy === null && row.egress_proxy_id === null
+                && row.egress_host_uuid === null)) {
+              throw new BoxEgressNotConfiguredError(error.code, error.uidProxyFailure);
+            }
+          }
+          throw error;
+        }
         if (proxy !== null) {
           proxyHash = digest([proxy]);
           const agent = this.deps.makeProxyAgent(proxy);
@@ -594,6 +648,10 @@ export function boxModelRouteLogins(rows: readonly BoxProfileRow[]): BoxProfileR
 export function createProductionBoxAccountResolver(): BoxAccountResolver {
   return new BoxAccountResolver({
     list: () => listAccounts({ provider: "cursor", status: "active", limit: 500 }),
+    recoveryScope: async () => {
+      const accounts = await listAccounts({ provider: "cursor", limit: 500 });
+      return { complete: accounts.length < 500, accounts };
+    },
     account: getAccount,
     token: (id) => getTokenForUse(id, undefined, { requireActiveStatus: true }),
     snapshot: getCursorTokenSnapshot,

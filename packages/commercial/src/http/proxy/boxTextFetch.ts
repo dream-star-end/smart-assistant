@@ -1,3 +1,4 @@
+import { BoxEgressNotConfiguredError } from "./boxAccountResolver.js";
 /** Off-by-default Box text transport behind the existing internal Messages
  * identity/authority/precheck/finalizer. Account selection and durable lease
  * journal are injected; do not enable without the latter's production wiring.
@@ -282,6 +283,9 @@ export class BoxTextFetch {
         resolved = await race(pendingTarget);
       } catch (error) {
         if (error instanceof BoxTextFetchError) throw error;
+        if (error instanceof BoxEgressNotConfiguredError) {
+          throw new BoxTextFetchError(error.code);
+        }
         throw new BoxTextFetchError("BOX_TARGET_UNAVAILABLE");
       }
       if (abort.signal.aborted || remaining() < MIN_RUN_BUDGET_MS) {

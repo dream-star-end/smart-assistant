@@ -57,7 +57,8 @@ import {
   type IdentityCompatAssets,
   type SkillStoreCompatOptions,
 } from '@openclaude/storage'
-import { AGENT_MODEL_AUTO, estimateModelHistoryTokens } from '@openclaude/protocol'
+import { AGENT_MODEL_AUTO } from '@openclaude/protocol'
+import { promptContentMetrics } from './promptContentMetrics.js'
 import { createLogger } from './logger.js'
 const promptTimingLog = createLogger({ module: 'promptTiming' })
 import { request as undiciRequest } from 'undici'
@@ -358,19 +359,33 @@ function hasMcpTool(ctx: Pick<PromptSlotContext, 'availableMcpTools'>, name: str
   return ctx.availableMcpTools === undefined || ctx.availableMcpTools.includes(name)
 }
 
+const PLATFORM_MCP_CLAIM_PATTERNS = PLATFORM_MCP_TOOL_NAMES.map((tool) => ({
+  tool,
+  pattern: new RegExp(`\\b${tool.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b(?:\\([^\\n\\r]*?\\))?`, 'g'),
+}))
+
+/** Capture only this build's exact availability; preserve the original replacement order. */
+export function createMcpClaimSanitizer(
+  availableMcpTools: string[] | undefined,
+): (content: string) => string {
+  if (availableMcpTools === undefined) return (content) => content
+  const available = new Set(availableMcpTools)
+  const missing = PLATFORM_MCP_CLAIM_PATTERNS.filter(({ tool }) => !available.has(tool))
+  return (content) => {
+    let out = content
+    for (const { pattern } of missing) {
+      pattern.lastIndex = 0
+      out = out.replace(pattern, '（当前未注册）')
+    }
+    return out
+  }
+}
+
 export function sanitizeUnavailableMcpClaims(
   content: string,
   availableMcpTools: string[] | undefined,
 ): string {
-  if (availableMcpTools === undefined) return content
-  const available = new Set(availableMcpTools)
-  let out = content
-  for (const tool of PLATFORM_MCP_TOOL_NAMES) {
-    if (available.has(tool)) continue
-    const escaped = tool.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    out = out.replace(new RegExp(`\\b${escaped}\\b(?:\\([^\\n\\r]*?\\))?`, 'g'), '（当前未注册）')
-  }
-  return out
+  return createMcpClaimSanitizer(availableMcpTools)(content)
 }
 
 // ── 记忆注入预算(注入侧唯一权威,与存储写侧解耦)──
@@ -1733,16 +1748,6 @@ export interface PromptContextResult {
   frozenProjectContext?: FrozenProjectContextDigests
 }
 
-async function sha256Hex(s: string): Promise<string> {
-  const data = new TextEncoder().encode(s)
-  const buf = await crypto.subtle.digest('SHA-256', data)
-  const arr = new Uint8Array(buf)
-  let out = ''
-  for (let i = 0; i < arr.length; i++) {
-    out += arr[i].toString(16).padStart(2, '0')
-  }
-  return out
-}
 
 /**
  * Build the complete extra-prompt by assembling all slots in order.
@@ -1968,9 +1973,10 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
     ctx.cacheLayout === 'static-first'
       ? staticFirstSlots(slots, agentsParts, memoryParts)
       : { slots, staticCount: -1 }
+  const sanitizeMcpClaims = createMcpClaimSanitizer(ctx.availableMcpTools)
   const effectiveSlots = ordered.slots.map((slot) => ({
     ...slot,
-    content: sanitizeUnavailableMcpClaims(slot.content, ctx.availableMcpTools),
+    content: sanitizeMcpClaims(slot.content),
   }))
   let content =
     ordered.staticCount < 0
@@ -1983,34 +1989,34 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
   if (resolvePromptUserRole(ctx) === 'admin') {
     content = stripBaselineRestrictions(content)
   }
-  const applied: PromptSlotApplied[] = await Promise.all(
-    effectiveSlots.map(async (s) => {
-      const base: PromptSlotApplied = {
-        name: s.name,
-        bytes: Buffer.byteLength(s.content, 'utf-8'),
-        sha256: await sha256Hex(s.content),
-      }
-      // MODEL_HINT slot 带 canonicalId(provider 已归一化),透传到 meta.model_id
-      // 让 runner 用作 bounded Prom label。其它 slot 不需要 meta。
-      if ((s as ModelHintSlot).canonicalId !== undefined) {
-        base.meta = { model_id: (s as ModelHintSlot).canonicalId }
-      }
-      return base
-    }),
-  )
+  const metrics = effectiveSlots.map((slot) => promptContentMetrics.get(slot.content))
+  const applied: PromptSlotApplied[] = await Promise.all(effectiveSlots.map(async (s, index) => {
+    const metric = metrics[index]!
+    const base: PromptSlotApplied = {
+      name: s.name,
+      bytes: metric.bytes,
+      sha256: await metric.sha256,
+    }
+    // Mutable turn metadata is never retained in the content-only cache.
+    if ((s as ModelHintSlot).canonicalId !== undefined) {
+      base.meta = { model_id: (s as ModelHintSlot).canonicalId }
+    }
+    return base
+  }))
+  const contentMetrics = promptContentMetrics.get(content)
   const slotTokensEstimate = Object.fromEntries(
     ['ENV', 'SOUL', 'USER', 'PROJECT', 'INTELLIGENT_UI', 'AGENTS', 'SKILLS',
       'SKILLS_LITERATURE', 'MEMORY', 'PROJECT_MEMORY', 'TOOLS', 'MODEL_HINT', 'RESEARCH', 'REPO']
-      .map(name => [name, effectiveSlots.filter(slot => slot.name === name)
-        .reduce((sum, slot) => sum + estimateModelHistoryTokens(slot.content), 0)]),
+      .map(name => [name, effectiveSlots.reduce((sum, slot, index) =>
+        sum + (slot.name === name ? metrics[index]!.tokensEstimate : 0), 0)]),
   )
   promptTimingLog.info('prompt_context_timing', {
     sessionKey: ctx.sessionKey, elapsedMs: performance.now() - contextStartedAt,
-    tokensEstimate: estimateModelHistoryTokens(content), slotTokensEstimate,
+    tokensEstimate: contentMetrics.tokensEstimate, slotTokensEstimate,
   })
   return {
     content,
-    contentSha256: await sha256Hex(content),
+    contentSha256: await contentMetrics.sha256,
     applied,
     intelligentUi,
     frozenProjectContext:
