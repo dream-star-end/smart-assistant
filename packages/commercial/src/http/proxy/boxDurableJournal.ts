@@ -1946,7 +1946,8 @@ export class BoxDurableJournal implements BoxJournalPort {
     let digests: BoxToolUseDigest[];
     try { digests = toolUses.map((use) => ({ id: use.id,
       boxName: use.boxName, clientName: use.clientName,
-      inputHash: hashBoxToolInput(use.input) })); }
+      inputHash: hashBoxToolInput(use.input),
+      ...(use.cliInput === undefined ? {} : { cliInputHash: hashBoxToolInput(use.cliInput) }) })); }
     catch { throw new BoxDurableJournalError("BOX_TOOL_HANDOFF_EVIDENCE_INVALID"); }
     const frozen = { version: 1, roundNo, messageId: candidate.messageId,
       assistantContentHash: candidate.assistantContentHash,
