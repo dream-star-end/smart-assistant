@@ -24,9 +24,7 @@ import { AgentPicker } from "./components/AgentPicker";
 import { AuthGate, type AuthMode } from "./components/AuthGate";
 import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
-import { saveBlob } from "./lib/chat/download";
 import { applyIntelligentUiSnapshot, useInputPredictionEnabled } from "./lib/intelligentUi";
-import { exportSessionMarkdown, sessionExportFilename } from "./lib/chat/exportMarkdown";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
 import { Composer, moveComposerAttachments, resetComposerAttachmentCache } from "./components/Composer";
 import { ComposerProjectPill } from "./components/ComposerProjectPill";
@@ -4481,15 +4479,6 @@ export function App() {
             sending={sending}
             title={activeSess?.title}
             agentName={agent.name || "助手"}
-            onExportMarkdown={async () => {
-              const md = await exportSessionMarkdown(wsMessages, sending);
-              saveBlob(
-                new Blob([md], {
-                  type: "text/markdown;charset=utf-8",
-                }),
-                sessionExportFilename(activeSess?.title),
-              );
-            }}
           />
         </LazyBoundary>
       )}
