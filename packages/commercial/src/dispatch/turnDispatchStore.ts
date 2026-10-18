@@ -395,10 +395,20 @@ export async function casRejectingToAccepted(
 ): Promise<TurnDispatchRow | null> {
   const now = input.now ?? Date.now()
   const res = await q.query<RawDispatchRow>(
-    `UPDATE turn_dispatches
-        SET status = 'accepted', accepted_at = COALESCE(accepted_at, $2), last_attempt_at = $2
-      WHERE dispatch_id = $1 AND status = 'rejecting'
-      RETURNING ${DISPATCH_COLUMNS}`,
+    `WITH accepted AS (
+       UPDATE turn_dispatches
+          SET status = 'accepted', accepted_at = COALESCE(accepted_at, $2), last_attempt_at = $2
+        WHERE dispatch_id = $1 AND status = 'rejecting'
+        RETURNING ${DISPATCH_COLUMNS}
+     ), receipt AS (
+       UPDATE turn_recovery_jobs j
+          SET status='forwarded',container_receipt_at=COALESCE(container_receipt_at,$2),
+              lease_owner=NULL,lease_until=NULL,updated_at=$2
+         FROM accepted a
+        WHERE j.dispatch_id=a.dispatch_id AND j.dispatch_attempt_no=a.attempt_no
+          AND j.status IN ('queued','leased','sent')
+        RETURNING j.job_id
+     ) SELECT * FROM accepted`,
     [input.dispatchId, new Date(now)],
   )
   return res.rows.length === 0 ? null : mapRow(res.rows[0]!)

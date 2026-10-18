@@ -777,6 +777,7 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   internal_error: "服务遇到内部错误，你的消息已保留，请重试。",
   auth_error: "认证状态异常，本轮未正常完成，请重新尝试。",
   service_restart: "服务正在更新，本轮已中断，请重试。",
+  admission_restart_unexecuted: "本轮尚未开始，消息已保留。自动恢复未完成时，可以重新尝试。",
   session_persist_unavailable: "消息已保留在本机，但暂时未能安全送达。请点下方“重试”原样发送。",
   session_deleted: "这个会话已被删除。请新建会话继续；在这里重试不会把它找回来。从回收站恢复后即可正常发送。",
   durable_dispatch_unavailable: "本轮派发未能接入执行通道，已中断。请点击重试。",

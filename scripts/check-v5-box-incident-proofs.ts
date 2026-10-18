@@ -29,7 +29,7 @@ import { deflateSync } from "node:zlib";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
-
+import { provePendingUser } from "./lib/boxPendingUserProof.js";
 const LIMIT_MS = 120_000;
 const CANDIDATE = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
 const PROXY = join(CANDIDATE, "packages/commercial/src/http/proxy");
@@ -42,7 +42,7 @@ type Api = {
   classify: (body: Body) => { classification: string; rejectCode: string | null; toolIds?: readonly string[];
     answeredToolIds?: readonly string[] };
   match: (body: Body, expected: readonly Expected[]) => ReadonlyArray<Matched>;
-  compile: (body: Body) => { snapshotJsonl: string };
+  compile: (body: Body) => { snapshotJsonl: string; stdinJsonl: string };
   fitForCli: (results: readonly Matched[]) => Promise<readonly Matched[]>;
   echo: (expected: readonly EchoExpected[]) => { accept: (raw: unknown) => void;
     verifyDeferred: () => Promise<void>; assertComplete: () => void };
@@ -3593,7 +3593,6 @@ function proveForeignToolHistory(api: Api): string {
   if (api.gate(live, true) === null || api.classify(live).classification === "continuation_candidate") fail("FOREIGN_LIVE_ADMITTED");
   return "[ocv5-337-foreign-tool-history] PASS — tool history from another model is admitted and staged under paired Box tool ids";
 }
-
 async function cleanUp(): Promise<void> {
   const pending = [...cleanups];
   cleanups.clear();
@@ -3602,6 +3601,7 @@ async function cleanUp(): Promise<void> {
   if (failed) throw failed.reason;
 }
 
+// [ocv5-499-pending-user] PASS — the full delegated goal and late tool announcement reach the same current stdin without changing canonical bytes or completed tool history
 async function main(): Promise<void> {
   const expectSha = parseArgs(process.argv);
   const deadline = setTimeout(() => {
@@ -3616,7 +3616,7 @@ async function main(): Promise<void> {
   process.env.OPENCLAUDE_HOME = home;
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
-    proveImageCaption(api), proveParallelImageCaption(api), proveForeignToolHistory(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
+    provePendingUser(api), proveImageCaption(api), proveParallelImageCaption(api), proveForeignToolHistory(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveMixedCallTurnCut(api),
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),
