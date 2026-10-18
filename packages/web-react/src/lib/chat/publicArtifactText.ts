@@ -45,7 +45,8 @@ export async function publicArtifactText(markdown: string): Promise<string> {
       if (relative) replacement = `\`${relative}\``;
       else return; // A command is not an artifact reference.
     } else if (node.type === "text") {
-      const text = raw.replace(/(?<![\w/:])\/(?:home\/agent|root)\/\.openclaude\/(?:generated|uploads)\/[^\s`<>\[\]()"']+/g, (path) => {
+      const text = raw.replace(/https?:\/\/[^\s<>]+|(?<![\w/:])\/(?:home\/agent|root)\/\.openclaude\/(?:generated|uploads)\/[^\s`<>\[\]()"']+/g, (path) => {
+        if (/^https?:\/\//.test(path)) return path;
         const clean = path.replace(/[.,;:!?，。；：！？]+$/, "");
         const relative = artifactRelative(clean);
         return relative === null ? path : relative + path.slice(clean.length);
