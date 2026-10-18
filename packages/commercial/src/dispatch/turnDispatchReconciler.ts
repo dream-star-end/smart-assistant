@@ -207,6 +207,8 @@ export async function abortNeverExecutedJournalForDispatch(
 
 export interface TurnDispatchReconcilerDeps {
   pool: Pool
+  /** Supported ACKed intent must be proven/requeued before the financial failure verdict. */
+  recoverInterruptedAdmission?: (dispatchId: string) => Promise<boolean>
   container: {
     cancelIfQueued?: (id: DispatchIdentity) => Promise<ContainerCallResult>
     rejectIfAbsent: (id: DispatchIdentity) => Promise<ContainerCallResult>
@@ -370,6 +372,7 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
   // late-tape 转 manual,要么先状态通知——绝不并发产出「失败状态 + 完整 tape」。
   const unnotified = await scanTerminalUnnotified(deps.pool, { limit })
   for (const scanned of unnotified) {
+    if (deps.recoverInterruptedAdmission && await deps.recoverInterruptedAdmission(scanned.dispatchId)) continue
     await settleTerminalUnnotified(deps, scanned, counts, enqueue, assess, now())
   }
 
@@ -1651,17 +1654,16 @@ export function startTurnDispatchReconciler(
     if (running) return empty // DB 卡时跳过重叠 tick
     running = true
     try {
-      // OCV5-377: a forwarded recovery job whose dispatch ended not_accepted
-      // gets no tape and would read "retrying" forever; pause it (best-effort,
-      // the next tick retries).
+      // First let exact-rejection recovery atomically hand off supported
+      // intent. Only remaining refused jobs need the legacy visible pause.
+      const result = await runReconcileTick(opts)
       await (opts.pauseRefusedRecoveryJobs ?? pauseRecoveryJobsForRefusedDispatches)(opts.pool)
         .catch(onError)
       // OCV5-509: a paused recovery that never ran still ends the session in
       // its unanswered recovery row; close the chain with a visible card.
       await (opts.closeRefusedRecoveryChains ?? closeRefusedRecoveryChains)(opts.pool)
         .catch(onError)
-      // jitter:错开双 master 抢先(leaderBundle 只 leader 跑,jitter 再防定时对齐踩踏)。
-      return await runReconcileTick(opts)
+      return result
     } catch (err) {
       onError(err)
       return empty
