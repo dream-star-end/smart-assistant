@@ -25,7 +25,10 @@ import {
   clearGatewayShutdownEvidenceByDispatchIds,
   markGatewayShutdownEvidence,
 } from '../billing/finalizeJournalReconciler.js'
-import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBackend.js'
+import {
+  advanceClientTimelineIdentityInTransaction,
+  closeRefusedRecoveryChains,
+} from '../db/pgSessionsBackend.js'
 import type { ContainerCallResult, DispatchIdentity } from './containerDispatchClient.js'
 import {
   classifyVisibleOrphan,
@@ -1611,6 +1614,7 @@ export interface TurnDispatchReconcilerHandle {
 export interface StartTurnDispatchReconcilerOptions extends TurnDispatchReconcilerDeps {
   /** Test seam; production pauses refused forwarded recovery jobs each tick. */
   pauseRefusedRecoveryJobs?: (pool: Pool) => Promise<number>
+  closeRefusedRecoveryChains?: (pool: Pool) => Promise<number>
   intervalMs?: number
   runOnStart?: boolean
   onError?: (err: unknown) => void
@@ -1651,6 +1655,10 @@ export function startTurnDispatchReconciler(
       // gets no tape and would read "retrying" forever; pause it (best-effort,
       // the next tick retries).
       await (opts.pauseRefusedRecoveryJobs ?? pauseRecoveryJobsForRefusedDispatches)(opts.pool)
+        .catch(onError)
+      // OCV5-509: a paused recovery that never ran still ends the session in
+      // its unanswered recovery row; close the chain with a visible card.
+      await (opts.closeRefusedRecoveryChains ?? closeRefusedRecoveryChains)(opts.pool)
         .catch(onError)
       // jitter:错开双 master 抢先(leaderBundle 只 leader 跑,jitter 再防定时对齐踩踏)。
       return await runReconcileTick(opts)
