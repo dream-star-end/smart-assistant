@@ -67,7 +67,7 @@ master 首正文是服务端在容器出站帧、发给浏览器之前记录的 
 
 Kimi／DeepSeek 本次实际使用 **official-cc harness**。追问在 context_ready 后仍有 `subprocess shutdown requested, harness=official-cc`，然后重新构建 prompt；每轮 authority headers／turnKey 改变使 spawn fingerprint 改变，官方 CLI 不能从 stdin 热更新鉴权，所以会 shutdown+resume。约5秒组合段不能直接归因某个固定5秒timeout。#845 草稿入口写死 codexOnly；即使放开它，official-cc 的 preheat 目前也明确 no-op，不能声称复制 Codex 预热就省5秒。
 
-平台 prompt_context 约9264–9421估算token，构建约0.1–0.3s；AGENTS约3.25–3.34K、INTELLIGENT_UI2.545K、SKILLS1.568K、TOOLS1.197K、MEMORY0.575K。账单输入还包含原生CLI系统提示／工具schema等，不能把约27–30K输入全部当作平台提示，也不能把token减少比例当作秒数减少比例。完整数字在 [gateway安全计时](./TTFT-OTHERS-20261018-evidence/gateway-timing.jsonl) 与账务逐行中。
+Kimi／DeepSeek 的平台 prompt_context 为9264／9421估算token，Grok／Gemini为9786；16条构建计时为63.957–182.511ms，p50 121.230ms。CCB组件示例：AGENTS约3.25–3.34K、INTELLIGENT_UI2.545K、SKILLS1.568K、TOOLS1.197K、MEMORY0.575K。账单输入还包含原生CLI系统提示／工具schema等，不能把约27–30K输入全部当作平台提示，也不能把token减少比例当作秒数减少比例。完整数字在 [gateway安全计时](./TTFT-OTHERS-20261018-evidence/gateway-timing.jsonl) 与账务逐行中。
 
 默认思考口径：网页均显式 effortLevel=null。目录default_effort为GLM=max、Grok普通/Fast=high、Gemini=medium，其余本轮ID为空。GLM可由API代理补默认；Gemini明确映射至medium模型。Grok的null经adapter不传--reasoning-effort，目录high没有在该路径自动注入，闭源CLI最终effective档未采集。DeepSeek Flash没有可用思考档，不能提出降到low来提速。
 
@@ -99,7 +99,7 @@ Kimi／DeepSeek 本次实际使用 **official-cc harness**。追问在 context_r
 | 1. 修正过程区首正文绘制计量，给非Codex补CLI spawn/ready、proxy收到、precheck、fetch/headers/首text边界 | 实际提速0s；纠正已验证DOM相对旧探针3–9.593s的延后；帧→旧探针差最大12.498s，两个典型DOM偏差为9.593/7.100s | 低；一次性trace标记需防重复与旧轮节点串联，不记录正文／凭据。先取得可靠启动预算。 |
 | 2. 对确定缺失的Box出口配置返回明确不可重试错误；对供应商429按明确重试语义／Retry-After处理，避免本轮同样原样连打 | 同类失败可少等Box **7.828s**、GLM **8.374s**（第一次到最后一次失败间隔），尝试3→1；成功TTFT收益0s／未测 | Box分类低风险；429策略中风险，过早终止可能损失瞬时限流后成功的机会，不能把普通网络波动／5xx一并禁重试。 |
 | 3. 单独批准账号765的Box正常出口开通／绑定，再复测首轮+追问 | 恢复可用性；成功TTFT目前未知，不能承诺省21.355s。若只做更早配置校验，确定缺失时失败可由21.355s降到一次校验时间，须实测 | 涉及配置／路由，必须另批；不借u3／cc1身份，不更改Box登录或全局出口策略，不以host fallback绕过现有要求。 |
-| 4. 先缓存／前置可复用的静态prompt与MCP投影；再拆分official-cc每轮约4.356–5.270s准备段 | 静态构建单独可省 **0–0.3s/轮**，上限来自现有构建时长；直接放开Codex式preheat对本轮official-cc收益0s | 静态缓存中低风险，要按权限、模型、工具／技能／记忆版本失效。不得删除AGENTS安全约束或将上轮鉴权复用。 |
+| 4. 先缓存／前置可复用的静态prompt与MCP投影；再拆分official-cc每轮约4.356–5.270s准备段 | 静态prompt构建单独可省 **0–0.18s/轮**，上限来自本批构建时长；MCP投影尚未独立量化；直接放开Codex式preheat对本轮official-cc收益0s | 静态缓存中低风险，要按权限、模型、工具／技能／记忆版本失效。不得删除AGENTS安全约束或将上轮鉴权复用。 |
 | 5. 如启动细分证明值得，再设计可安全换绑每轮authority的常驻CLI／本地代理协议 | 当前组合段给出 **0–约5.3s/轮的研究上限**；不是可兑现点估计，测清其中可消除比例后才报实施收益 | 高；跨权限、隔离、计费、停止、resume和并发，不能简单删shutdown/fingerprint；需证明旧轮令牌不泄漏、计费归属不串轮。 |
 | 6. 普通聊天提供用户明确选择的低思考／Fast档A/B | Fast本批观察差首轮3.210s、追问11.183s，非因果承诺；低思考收益本轮未测，可省0s，尚无可靠点估计 | 中；速度档增加费用，低思考可能影响复杂任务质量。只测支持的模型，显式会话选择，不改全局默认；Grok当前CLI真实默认档仍未知。 |
 | 7. 对轻量聊天评估按需加载智能UI／技能摘要 | 已证实收益0s，预期减少至多约2.5K UI说明及部分1.6K技能估算token；尚不能可靠折算秒数 | 中高；会改变界面生成、技能发现与回答能力，保留权限／隔离、记忆和必要工具；小流量A/B取得秒数后再决定。 |
@@ -122,7 +122,7 @@ Kimi／DeepSeek 本次实际使用 **official-cc harness**。追问在 context_r
 
 Box/GLM共6条journal均aborted、无usage／ledger；不能把precheck预留当实扣。其它CCB/Grok共14条journal committed，final_credits、usage、主ledger_id及所有桶一致。Antigravity按既有独立协议：**3条relay用量 → 2条antigravity_turns settled/success → 2条usage → 2条ledger**，不产生request_finalize_journal；不能以缺journal判为未收费，也不能为了凑三表人工补账。Gemini首轮checkpoint+agent合计32223输入／501输出，4积分；追问32785输入／531输出，5积分。
 
-Grok原生usage.json的modelCalls与events.jsonl loop_started总数4/3相符。原生input包含cache，DB已分开；输出已包含reasoning，未重复相加。共18个唯一模型dispatch，无手工重发；19个传输帧中另1个 `m-recover-1mfcxaeilrwsu` 没有新增dispatch或收费记录。26次执行尝试中包括3次未接触供应商的Box前置失败；确认送上游23次，其中成功20次、429三次。Codex背景仅目录GET，无推理POST，不混入本批模型调用。供应商现金实扣未取得。
+Grok原生usage.json的modelCalls与events.jsonl loop_started总数4/3相符。原生input包含cache，DB已分开；输出已包含reasoning，未重复相加。共18个唯一模型dispatch，无手工重发；19个传输帧中另1个 `m-recover-1mfcxaeilrwsu` 没有新增dispatch或收费记录。26次执行尝试中包括3次未接触供应商的Box前置失败；确认送上游23次，其中成功20次、429三次。Codex背景仅目录GET，无推理POST，不混入本批模型调用。调用数来自产品与原生CLI模型计数，不是逐包HTTP审计；供应商现金实扣未取得。
 
 钱包核验包括全账号ledger_count 1806→1822、每桶逐行balance_after与整个id区间集合；额外流水、桶差、选定集合出窗均0。最终在途dispatch=0，没有手工清理旧失败记录。Box/GLM最终被平台reconciler标为terminal/crashed、failure_code=SERVICE_RESTART；这不是本轮实施过重启的证据，报告保留其与浏览器原始错误的区别。
 
@@ -137,3 +137,5 @@ Box Opus/Sonnet、28个Go模型、旧cursor/Sand路线因普通账号界面不�
 远端证据：`H/g498-ttft-others-20261018`；交接：`H/CONTINUE-20261018-OCV5-498-TTFT-OTHERS.md`，H=`/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308`。只保存安全数字元数据、ID和代码，不包含口令、密钥、完整env、完整请求头或回答正文。独立复核结果保存在同名evidence目录。
 
 10:52:33Z 最终只读核对：个人版stable／slot A／candidate空，health依赖均正常，版本仍67d13462e、canonical clean、env键数121；10:52:35Z列车FREE。见[最终运行状态](./TTFT-OTHERS-20261018-evidence/final-operational-proof.json)和[执行次数核算](./TTFT-OTHERS-20261018-evidence/request-counts.json)。
+
+文档审阅：[草稿PR #846](https://github.com/dream-star-end/smart-assistant/pull/846)，分支`docs/v5-selfhost-ocv5-498-ttft-others`，不包含产品实现，待用户批准优化步骤。计时、账务及引擎方案三路只读独立复核通过，记录见[独立复核](./TTFT-OTHERS-20261018-evidence/independent-verification.md)。
