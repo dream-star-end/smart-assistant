@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # User explicitly approved uid765 only, 2026-10-18 19:12 and normal pool use 19:23.
 set -euo pipefail
+SELF_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 canonical=/opt/openclaude/openclaude-v5-selfhost
 expected=67d13462edea57d43e71aae2a97d51efddcff831
 [[ $(id -u) == 0 && $(hostname) == v3-dev-sg ]] || { echo BOUNDARY >&2; exit 1; }
@@ -21,6 +22,6 @@ acquire_selfhost_deploy_lock
 systemctl show -p ExecStart --value openclaude-v5-selfhost-cursor-proxy.service | \
   python3 -c 'import sys; assert "/etc/sing-box/openclaude-cursor-egress-proxy.json" in sys.stdin.read()'
 ss -Hltn 'sport = :18992' | python3 -c 'import sys; assert "172.31.0.1:18992" in sys.stdin.read()'
-python3 "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/boxUid765Egress.py"
+python3 "$SELF_DIR/boxUid765Egress.py"
 [[ $(readlink -f /opt/openclaude/openclaude-v5-selfhost-live) == "$live" ]] || exit 1
 printf 'OCV5-502 uid765 egress file complete; live unchanged %s\n' "$expected"
