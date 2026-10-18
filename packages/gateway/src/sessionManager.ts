@@ -1,3 +1,4 @@
+import type { PreheatPreparation } from './speculativePreheat.js'
 import { isBoxApiModel } from '@openclaude/protocol'
 import { getDesiredIntelligentUi, intelligentUiNeedsRestart, isIntelligentUiApplied } from './intelligentUiDesired.js'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
@@ -1995,8 +1996,8 @@ export class SessionManager {
     )
   }
 
-  preheatRunner(session: AgentSession): Promise<PreheatOutcome> {
-    return preheatRunnerImpl.call(this as unknown as SessionLifecycleHost, session)
+  preheatRunner(session: AgentSession, preparation?: PreheatPreparation): Promise<PreheatOutcome> {
+    return preheatRunnerImpl.call(this as unknown as SessionLifecycleHost, session, preparation)
   }
 
   submit(session: AgentSession, userTextOrBlocks: string | Array<{ type: string; [key: string]: unknown }>, onEvent: (e: SessionStreamEvent) => void, effortLevel?: string | null, model?: string, requestId?: string, traceId?: string, conversationMode?: 'default' | 'plan', opts?: {

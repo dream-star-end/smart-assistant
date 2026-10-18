@@ -311,3 +311,23 @@ describe('handleEnginePreheat', () => {
     assert.equal(statuses.length, 1, '失败不得再写响应')
   })
 })
+
+test('internal official marker is exact-shape and rejects route URLs or credentials', () => {
+  const base = { sessionId: 'webtest1234', agentId: 'main', modelId: 'gpt-6.1-sol' }
+  const valid = validateEnginePreheatBody({ ...base, codexRouteHint: { kind: 'official_oauth' } })
+  assert.equal(valid.ok, true)
+  for (const hint of [null, [], { kind: 'api_relay' }, { kind: 'official_oauth', token: 'PRIVATE' },
+    { kind: 'official_oauth', baseUrl: 'https://invalid.example' }]) {
+    assert.equal(validateEnginePreheatBody({ ...base, codexRouteHint: hint }).ok, false)
+  }
+})
+test('direct container Codex GET without a trusted route hint skips CLI preparation', async () => {
+  process.env.OC_ENGINE_PREHEAT = '1'
+  setContainerEnv()
+  Reflect.deleteProperty(process.env, 'OC_MODEL_AUTHORITY')
+  const { fake, calls } = makeFake()
+  invoke(fake, { agentId: 'main', modelId: 'gpt-6.1-sol' })
+  await settle()
+  assert.equal(calls.some(c => c.kind === 'getOrCreate' || c.kind === 'preheatRunner'), false)
+  assert.ok(calls.some(c => c.kind === 'log:engine_preheat_skipped'))
+})

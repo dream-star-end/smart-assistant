@@ -1191,6 +1191,12 @@ export const api = {
 
   // ── 对话前置（Agent 订阅 / 容器） ────────────────────────────────────
 
+  /** Workspace-open hint: no subscription, message, or model request. */
+  prepareWorkspace: (a: AuthSession, signal?: AbortSignal): Promise<{ accepted: boolean }> =>
+    jsonOrThrow<{ accepted: boolean }>(callWithRefresh(a, t => fetch('/api/agent/prepare', {
+      method: 'POST', headers: { Authorization: `Bearer ${t}` }, signal,
+    }))),
+
   /** Agent 订阅/容器状态（GET /api/agent/status，Bearer）。 */
   getAgentStatus: (a: AuthSession): Promise<AgentStatus> =>
     jsonOrThrow<{

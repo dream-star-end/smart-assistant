@@ -1,3 +1,6 @@
+import { runSessionPreheat, type SessionPreheatHost } from './sessionPreheat.js'
+export { runSessionPreheat, validateEnginePreheatBody } from './sessionPreheat.js'
+export type { EnginePreheatBody, EnginePreheatValidation, SessionPreheatHost } from './sessionPreheat.js'
 import { fetchIdentityCompatProjection, resolveRuntimeExecutionAgent } from '@openclaude/storage'
 import { handleChatProjectsHttp } from './routes/chatProjects.js'
 import type { GatewayHttpIo } from './routes/httpIo.js'
@@ -4729,92 +4732,6 @@ export function hasContainerCatalogEnv(env: NodeJS.ProcessEnv = process.env): bo
   )
 }
 
-const ENGINE_PREHEAT_SESSION_ID_RE = /^[a-zA-Z0-9_-]{8,50}$/
-const ENGINE_PREHEAT_AGENT_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/
-
-export type EnginePreheatBody = {
-  sessionId: string
-  agentId: string
-  modelId?: string
-}
-
-export type EnginePreheatValidation =
-  | { ok: true; payload: EnginePreheatBody }
-  | { ok: false; error: string }
-
-export function validateEnginePreheatBody(parsed: unknown): EnginePreheatValidation {
-  if (!parsed || typeof parsed !== 'object') {
-    return { ok: false, error: 'body must be a JSON object' }
-  }
-  const body = parsed as Record<string, unknown>
-  const sessionId = body.sessionId
-  if (typeof sessionId !== 'string' || !ENGINE_PREHEAT_SESSION_ID_RE.test(sessionId)) {
-    return { ok: false, error: 'sessionId required' }
-  }
-  const agentId = body.agentId
-  if (typeof agentId !== 'string' || !ENGINE_PREHEAT_AGENT_ID_RE.test(agentId)) {
-    return { ok: false, error: 'agentId required' }
-  }
-  if (isHiddenSystemAgentId(agentId)) {
-    return { ok: false, error: 'agentId required' }
-  }
-  let modelId: string | undefined
-  if (body.modelId !== undefined) {
-    if (typeof body.modelId !== 'string' || body.modelId.length === 0 || body.modelId.length > 128) {
-      return { ok: false, error: 'modelId invalid' }
-    }
-    modelId = body.modelId
-  }
-  return { ok: true, payload: { sessionId, agentId, ...(modelId ? { modelId } : {}) } }
-}
-
-export type SessionPreheatHost = {
-  log: { info: (msg: string, fields?: unknown) => void; warn: (msg: string, fields?: unknown, err?: unknown) => void }
-  sessions: {
-    getByKey: (key: string) => unknown
-    getOrCreate: (opts: Record<string, unknown>) => Promise<unknown>
-    preheatRunner: (session: unknown) => Promise<string>
-  }
-  _getAgentsConfig: () => Promise<{ agents: AgentDef[] }>
-  deps: { config: { defaults: { model: string } } }
-}
-
-/** 容器内真实预热:投影授权 → getOrCreate → preheatRunner。供 internal 口与容器 GET 钩子共用。 */
-export async function runSessionPreheat(
-  host: SessionPreheatHost,
-  sessId: string,
-  userId: string,
-  row: { agentId?: string; modelId?: string },
-): Promise<void> {
-  const aid = row.agentId || 'main'
-  if (isHiddenSystemAgentId(aid)) return
-  const sessionKey = `agent:${aid}:webchat:dm:${sessId}`
-  const cfg = await host._getAgentsConfig()
-  const agent = cfg.agents.find((a) => a.id === aid) ?? ({ id: aid } as AgentDef)
-  const preExec = await resolveLocalExecutionIfEnforced({
-    agent,
-    kind: 'prewarm',
-    ...(row.modelId ? { model: row.modelId } : {}),
-    defaultModel: host.deps.config.defaults.model,
-  })
-  let session = host.sessions.getByKey(sessionKey)
-  if (!session) {
-    const override = localExecutionOverride(preExec)
-    session = await host.sessions.getOrCreate({
-      sessionKey,
-      agent,
-      ...override,
-      ...(override.model === undefined && row.modelId ? { model: row.modelId } : {}),
-      channel: 'webchat',
-      peerId: sessId,
-      userId,
-    })
-  }
-  const outcome = await host.sessions.preheatRunner(session)
-  if (outcome !== 'started' && outcome !== 'already_running') {
-    host.log.info('engine_preheat_skipped', { sessionKey, outcome })
-  }
-}
 
 export function validateWechatInboundCompensateBody(
   parsed: unknown,

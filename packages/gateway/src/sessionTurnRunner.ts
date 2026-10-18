@@ -1,3 +1,4 @@
+import { consumeUnusedPreheat } from './speculativePreheat.js'
 /**
  * Session turn execution (one turn, retry wrapper)
  *
@@ -2134,6 +2135,9 @@ export async function _runOneTurn(
       sessionTotals: session,
       toolUseIdToName: session.toolUseIdToName,
     })
+    // Capacity is released only after an actual engine submission; cancellation/admission
+    // failures before this point keep the original unused-runner TTL.
+    consumeUnusedPreheat(this, session)
     turn = submittedTurn
     // OCV5-435: a Stop that arrived before this run existed ends it now,
     // through the same user-stop persistence as a Stop on a running turn.
