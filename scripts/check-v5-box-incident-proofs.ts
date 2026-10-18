@@ -51,6 +51,8 @@ type Api = {
     pollIntervalMs: number; retryDelaysMs?: readonly number[] }) => AsyncGenerator<{ text: string; endOffset: number }>;
   spoolAccess: () => unknown;
   transportError: (code: string) => Error;
+  /** OCV5-509: whether a failed replay re-read is the run's own deterministic refusal. */
+  replayRejection: (error: unknown) => boolean;
   firstRound: (input: unknown, deps: unknown) => Promise<{ kind: string }>;
   textFetch: (deps: unknown) => { fetch: (input: unknown) => Promise<Response> };
   registry: () => { open: (input: { uid: bigint; sessionId: string; accountId: bigint }) => unknown;
@@ -236,6 +238,7 @@ async function load(): Promise<Api> {
     pollSpool: poller.pollBoxSpoolLines,
     spoolAccess: () => access.makeBoxDetachedRunAccess({ runNonce: "a".repeat(24), detachedRunnerHash: "b".repeat(64) }),
     transportError: (code) => new transport.BoxExecTransportError(code, false),
+    replayRejection: observer.isBoxReplayRejection,
     firstRound: firstRound.runBoxToolFirstRound,
     textFetch: (deps) => new textFetch.BoxTextFetch(deps),
     registry: () => new registry.BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 600_000 }),
@@ -3543,7 +3546,21 @@ async function proveAnyRefusalStopsParkedTurn(api: Api, db: Db): Promise<string[
     fail(`REFUSAL_5XX_STOPPED_${transient.calls}_${transient.stops}_${transient.state}`);
   }
   // OCV5-509: a re-read run the protocol refuses ends the turn like a refusal, so the parked run is stopped and
-  // the automatic recovery can run the turn on, instead of the same 503 on every retry
+  // the automatic recovery can run the turn on, instead of the same 503 on every retry. The re-read: the CLI's
+  // record of the call is not the streamed one, which no number of reads changes; a transport failure is not one.
+  const misrecorded = call("msg_b", 1, "toolu_good_1", BOX_BASH, [text("Using the bridge.")]).map((record) =>
+    (record as { type?: string }).type === "assistant" ? { type: "assistant", message: { id: "msg_b", model: CLI_MODEL,
+      role: "assistant", content: [text("Using the bridge."), { type: "tool_use", id: "toolu_good_1", name: BOX_BASH,
+        input: { value: "y" } }] } } : record);
+  let reread: unknown = null;
+  try {
+    const decoder = api.decoder(CLI_MODEL, CLI_TOOLS);
+    for (const record of [cliInit, start("msg_b", 30, 5), ...say("msg_b", 0, "Using the bridge."), ...misrecorded,
+      ...stop("tool_use", 9, 30)]) decoder.push(`${JSON.stringify(record)}\n`);
+  } catch (error) { reread = error; }
+  if (!api.replayRejection(reread) || api.replayRejection(api.transportError("BOX_EXEC_TIMEOUT"))) {
+    fail("REPLAY_REJECTION_NOT_CLASSIFIED");
+  }
   const replayRejected = await endTurn(900_000_509n, "replay-rejected-409", 409, "BOX_REPLAY_REJECTED",
     "previous Box response was rejected");
   if (replayRejected.calls !== 1 || replayRejected.stops !== 1 || replayRejected.state !== "failed_stopped") {
