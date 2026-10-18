@@ -424,10 +424,13 @@ test('OCV5-508 artifact anchors reuse signing and retain their label', async () 
       <MarkdownImpl signMedia>{'[下载季度报表](/home/agent/.openclaude/generated/%E6%8A%A5%E8%A1%A8%202026.csv)'}</MarkdownImpl>
       <MarkdownImpl signMedia readOnly>{'[只读文件](/home/agent/.openclaude/generated/private.csv)'}</MarkdownImpl>
       <MarkdownImpl signMedia>{'[普通站内链接](/help/report.csv)'}</MarkdownImpl>
+      <MarkdownImpl signMedia>{'[![报告缩略图](https://example.test/preview.png)](/home/agent/.openclaude/generated/report.pdf)'}</MarkdownImpl>
     </MediaSignProvider>,
   );
   await waitFor(() => expect(screen.getByRole('link', { name: '下载季度报表' })).toHaveAttribute('href', '#'));
-  expect(sign).toHaveBeenCalledExactlyOnceWith(['/home/agent/.openclaude/generated/报表 2026.csv']);
+  expect(sign).toHaveBeenCalledExactlyOnceWith(['/home/agent/.openclaude/generated/报表 2026.csv', '/home/agent/.openclaude/generated/report.pdf']);
+  await waitFor(() => expect(screen.getByRole('link', { name: '下载 report.pdf' })).toHaveAttribute('href', '#'));
+  expect(screen.getByAltText('报告缩略图').closest('a')).toBeNull();
   expect(screen.getByRole('link', { name: '只读文件' })).toHaveAttribute('href', '/home/agent/.openclaude/generated/private.csv');
   expect(screen.getByRole('link', { name: '普通站内链接' })).toHaveAttribute('href', '/help/report.csv');
   expect(container.querySelector('a a')).toBeNull();

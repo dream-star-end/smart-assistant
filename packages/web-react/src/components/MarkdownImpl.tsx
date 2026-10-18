@@ -441,8 +441,13 @@ export default function MarkdownImpl({
           a: ({ children, href, node: _node, ...props }) => {
             const containerLocal = typeof href === "string" && isContainerPreviewUrl(href);
             const artifactPath = signMedia && !readOnly ? artifactDownloadPath(href) : null;
-            if (artifactPath && !hasMarkdownImage(children)) {
-              return <SignedFileCard src={artifactPath} filename={artifactPath.split("/").pop()} label={children} />;
+            if (artifactPath) {
+              const filename = artifactPath.split("/").pop();
+              // Linked thumbnails keep their viewer; downloading is a sibling action, never nested controls.
+              if (hasMarkdownImage(children)) {
+                return <span className="inline-flex max-w-full flex-col items-start gap-1">{children}<SignedFileCard src={artifactPath} filename={filename} label={`下载 ${filename}`} /></span>;
+              }
+              return <SignedFileCard src={artifactPath} filename={filename} label={children} />;
             }
             // 只读站内信中的链接图片把灯箱与原链接拆成两个同级动作，避免格式包装下仍出现
             // <a><button /></a> 非法嵌套和一次点击双重导航，同时不丢原链接功能。
