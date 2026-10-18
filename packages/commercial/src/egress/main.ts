@@ -60,6 +60,7 @@ import {
 import { assertPlatformDefaultModelConfigured, staticProviderKeysFromConfig } from "../http/proxy/staticProviderMeta.js";
 import {
   apiKeyPoolConfiguredServices,
+  selectApiKey,
   importEnvApiKeys,
   primeApiKeyPool,
   startApiKeyPoolCache,
@@ -596,7 +597,11 @@ export async function startEgress(): Promise<void> {
   // 与 latencyProber 同理挂 egress(真实推理出口,dispatcher/鉴权语义一致);只对
   // auto+degraded provider 发最小推理探活,成功才写 kind='final' 样本(model 带
   // probe: 前缀),恢复判定仍由 master scheduler 既有数学接管。零迁移。
-  const recoveryProber = startRecoveryProber({ staticProviderKeys, log });
+  const recoveryProber = startRecoveryProber({
+    resolveKey: async (providerId) =>
+      (await selectApiKey(providerId, `provider-recovery:${providerId}`))?.apiKey ?? null,
+    log,
+  });
 
   // self-host uuid 与 master 同权威(PG compute host 表)——identity 双因子里
   // hostUuid 参与 bearer 归属校验,两进程必须同值。取失败拒启(egress 无降级路径)。

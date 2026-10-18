@@ -7376,6 +7376,98 @@
           "assertion": "[ocv5-499-pending-user] PASS — the full delegated goal and late tool announcement reach the same current stdin without changing canonical bytes or completed tool history"
         }
       ]
+    },
+    {
+      "id": "INC-20261018-RECOVERY-POOL-IDENTITY",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "OCV5-500: personal release G1 failed before upstream inference because opencodego remained auto/degraded. Recovery probes repeatedly used an administrator-disabled env credential (401), although an active pool member existed. The background prober bypassed the same eligible-key pool used by user traffic; HTTP-only success also allowed incomplete responses to be counted as recovery. Existing G1 remains failed until an approved new-tip official release passes; no forced healthy or gate waiver.",
+      "rootFixCommit": "0aad5f26",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/egress/recoveryProber.test.ts",
+          "assertion": "selects an active pool identity even when the old raw-env identity is disabled"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/egress/recoveryProber.test.ts",
+          "assertion": "rejects ${name} without recovery evidence or leaking body"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-go-cache-contract.mjs",
+          "assertion": "G1 OpenCode Go prompt cache hits across turns"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261018-BOX-RECOVERY-REFUSED-STUCK",
+      "occurredAt": "2026-10-17",
+      "severity": "P1",
+      "symptom": "商业 u4 会话 webmvc3iq5ff9hmmm（box-api-claude-opus-5-5）：2026-10-17 23:29Z 一轮已跑完 Skill 与 Bash 并扣 130 积分，第三次模型请求被 Box egress 以 409 BOX_TOOL_RESULT_MISMATCH 拒绝（ccb normalizeToolInput 删掉 Bash 的 `cd <cwd> && ` 前缀后回传，Box 按模型原始输入哈希比对；ccb 侧由 119c2a10 修复，同日 05:42Z webmv6evixkgn33mp 同型）。ccb 以 ENGINE_ERROR 结束后自动「从断点继续」，该恢复 dispatch 被容器拒收（IDLE_HISTORY_PENDING → DISPATCH_NOT_ACCEPTED），恢复 job 只被置 paused（OCV5-377），没有写任何终态，会话最后一条仍是没有回复的「↻ 自动从断点继续」。前端 adoptPendingAutomaticRecoveryFromHistory 把它认作恢复在飞，每次刷新都在「消息未开始处理，已确认未计费」卡下显示「仍在处理中…」、停止按钮常亮，持续约 12 小时直到用户点停止（生产共 4 个会话同状态，2026-10-18 经批准用数据变更补写终态卡）。修复：reconciler 每个 tick 把「未开始执行就被暂停」（dispatch_not_accepted / refused:*）的恢复链，在其恢复行仍是最后一条消息时于会话行锁内补写恢复放弃卡；已有回复或已转入其它消息的会话、次数耗尽类暂停不动。",
+      "rootFixCommit": "c6027492",
+      "coverageCommits": [
+        "6b1403ee",
+        "af387e1c",
+        "e30093a7"
+      ],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-509-refused-recovery-closed] PASS — a recovery paused before it ran ends its turn with a visible card once nothing will run it on, and an answered chain is left alone"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261018-BOX-CLI-REPAIRED-TOOL-INPUT",
+      "occurredAt": "2026-10-18",
+      "severity": "P0",
+      "symptom": "商业 u4 会话 webmvdqhzdqcghrvm（box-api-claude-opus-5-5，2026-10-18 11:27–12:34Z）：模型要写核验脚本的每一轮都在 message_stop 处被拒为 BOX_TOOL_SNAPSHOT_MISMATCH，CCB 重试同一请求时 replay 重读同一 spool 又遇到同一拒绝，被包成 503 BOX_REPLAY_UNAVAILABLE（b95f0798… / e149b3e8…），自动恢复每次重跑约 10 分钟的同一调用，5 次运行全部失败，用户 12:35Z 停止（失败与 replay 均未扣费，成功 13 次 393 积分三账一致）。根因：Box 上的 Claude Code 2.1.299–2.1.302 对流式工具输入（含 MCP 工具）先做修复再记录与执行——能解析为其它 JSON 类型的顶层字符串换成解析值，字面 `\\uXXXX`（如脚本里的 `[\\u4e00-\\u9fff]`）换成真实字符（Windows 路径与被转义反斜杠除外），丢弃 `__proto__` 键；egress 用严格深比较拿 CLI 快照对上游原文，永远不等。另：这 5 次运行的清理因 run project 下 CLI 自动记忆的 memory 目录被拒（退出 126），日志已截断而 journal 永远停在 pending 重试。修复：快照比对按 CLI 这几项确定性修复判等价，其余任何差异照旧拒绝；候选带 CLI 记录版输入（cliInput），journal 同存其哈希，pending 调用两者皆认，客户端仍执行模型原文；replay 重读遇到确定性协议拒绝回 409 BOX_REPLAY_REJECTED（传输类仍 503），适配器按拒绝结束本轮并停掉挂起运行，自动恢复随即接续；清理删除 memory 目录（仅 Markdown 文件，其它形状仍拒）。",
+      "rootFixCommit": "f83fbaf6",
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-509-cli-repaired-tool-input] PASS — a tool call the CLI records and runs unicode-repaired hands off the model's own input, and any other difference is still refused"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-509-replay-rejection-ends-turn] PASS — a re-read Box run the protocol refuses ends the turn as a refusal and stops the parked run, not a retried 503"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.test.ts",
+          "assertion": "OCV5-509 a tool input the CLI records unicode-repaired hands off the input the model wrote"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.test.ts",
+          "assertion": "OCV5-509 a recorded tool input that differs in any other way is still a snapshot mismatch"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolResultPlan.test.ts",
+          "assertion": "OCV5-509 the CLI calls a tool with its repaired record of the input"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxStoredToolHandoff.test.ts",
+          "assertion": "OCV5-509 a call the CLI recorded repaired also stores the hash of that record"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolUnknownObserver.test.ts",
+          "assertion": "OCV5-509 a re-read run the decoder refuses is a replay rejection, not a transient"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRunCleanup.test.ts",
+          "assertion": "OCV5-509 the CLI auto-memory folder in a run project is cleaned, anything else still refused"
+        }
+      ]
     }
   ]
 }

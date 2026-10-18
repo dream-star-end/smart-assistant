@@ -4,7 +4,7 @@
 import { BoxCliCompaction, BoxCliCompactionError } from "./boxCliCompaction.js";
 import { boxCatalogMatching, compileBoxToolCatalog } from "./boxToolCatalog.js";
 import { deriveBoxCallFingerprint } from "./boxCallFingerprint.js";
-import { BoxCliToolHandoffDecoder } from "./boxCliToolHandoff.js";
+import { BoxCliToolHandoffDecoder, BoxCliToolHandoffError } from "./boxCliToolHandoff.js";
 import type { BoxToolProgressBinding } from "./boxToolProgress.js";
 import { makeBoxDetachedRunAccess } from "./boxDetachedRunAccess.js";
 import { BoxExecTransportError } from "./boxExecTransport.js";
@@ -22,6 +22,15 @@ import { withPublishedBoxResults } from "./boxPublishedResults.js";
 
 export class BoxToolUnknownObserverError extends Error {
   constructor(readonly code: string) { super(code); this.name = "BoxToolUnknownObserverError"; }
+}
+
+/** OCV5-509: the observer re-read a run whose own output the protocol refuses
+ * (decoder or observer evidence). Reading it again gives the same answer, so
+ * this is no transient 503: the caller ends the turn as a refusal, the adapter
+ * stops the parked run (OCV5-488) and the master's automatic recovery runs the
+ * turn on. A transport failure (BoxExecTransportError, poll errors) is not one. */
+export function isBoxReplayRejection(error: unknown): boolean {
+  return error instanceof BoxCliToolHandoffError || error instanceof BoxToolUnknownObserverError;
 }
 
 type Result = "pending" | "committed";
