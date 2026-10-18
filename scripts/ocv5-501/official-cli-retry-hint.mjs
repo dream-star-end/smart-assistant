@@ -14,6 +14,26 @@ function userTextContents(request){
   return Array.isArray(message.content)?message.content.filter(block=>block.type==='text').map(block=>block.text):[];
  });
 }
+// CLI may coalesce adjacent user messages or append a newline. Require every
+// original text byte sequence to survive in order without trimming/rewrite.
+function hasOrderedExactUserText(originalChunks,resumedChunks){
+ const haystack=Buffer.concat(resumedChunks.map(text=>Buffer.from(text,'utf8')));
+ let cursor=0;
+ for(const text of originalChunks){
+  const needle=Buffer.from(text,'utf8');
+  const offset=haystack.indexOf(needle,cursor);
+  if(offset<0)return false;
+  cursor=offset+needle.length;
+ }
+ return true;
+}
+// Local guard examples: coalescing is valid; losing a task or reversing the
+// original chunk order must still fail before any isolated HTTP/CLI fixture.
+assert.equal(hasOrderedExactUserText(
+ [fixturePrompt,fixtureContinuation],[fixturePrompt+'\n'+fixtureContinuation+'\n']),true);
+assert.equal(hasOrderedExactUserText([fixturePrompt],[fixtureContinuation]),false);
+assert.equal(hasOrderedExactUserText(
+ [fixturePrompt,fixtureContinuation],[fixtureContinuation+'\n'+fixturePrompt+'\n']),false);
 for(const name of ['control','hint','missing-egress']){
  const home=`${root}/${name}`;mkdirSync(home);mkdirSync(`${home}/cache`);mkdirSync(`${home}/config`);
  const captured=[];
@@ -76,7 +96,8 @@ for(const name of ['control','hint','missing-egress']){
  const resumedUserText=userTextContents(request);
  assert.ok(resumedUserText.some(text=>text.includes(fixtureContinuation)),`${name} continuation input missing`);
  assert.ok(originalUserText.some(text=>text.includes(fixturePrompt)),`${name} original task missing from first request`);
- for(const text of originalUserText)assert.ok(resumedUserText.includes(text),`${name} lost original user-task context during resume`);
+ assert.ok(resumedUserText.some(text=>text.includes(fixturePrompt)),name+' original task missing from resumed request');
+ assert.ok(hasOrderedExactUserText(originalUserText,resumedUserText),name+' lost or reordered exact original user-task text during resume');
  arms.push({name,httpPosts:captured.length,status,terminalRetainsHint:name==='hint',terminalRetainsCode:name==='missing-egress',
   repairedAfterFailure:name==='missing-egress',resumedSameSession:true,originalTaskContextPreserved:true,
   hintAbsentFromResumedPrompt:true,apiErrorsAbsentFromResumedPrompt:true,
@@ -93,4 +114,5 @@ for(const arm of [withHint,missingEgress]){
 }
 console.log(JSON.stringify({claudeVersion:'2.1.302',network:'none; loopback only',realUpstreamRequests:0,
  fullPromptAndHistoryEqual:true,missingEgressRepairedAndResumed:true,originalTaskContextPreserved:true,
+ contextGuardNegativeExamplesPass:true,
  arms:arms.map(({resumedRequest,...safe})=>safe)},null,2));

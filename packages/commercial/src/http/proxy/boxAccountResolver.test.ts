@@ -363,7 +363,7 @@ test("explicitly unbound alternatives allow proof, while a transient read can re
   f.deps.uidProxy = () => { if (++reads === 1) throw transient; return "http://127.0.0.1:18888"; };
   await assert.rejects(f.resolver.resolve({ ...f.args, allowWakeIfHibernated: true }),
     (error: unknown) => error === transient);
-  assert.deepEqual(f.calls, []);
+  assert.equal(f.calls.length, 0);
   const target = await f.resolver.resolve({ ...f.args, allowWakeIfHibernated: true });
   assert.equal(target.accountId, 20n);
   assert.ok(reads > 1, "a fresh read can recover on the existing next attempt");

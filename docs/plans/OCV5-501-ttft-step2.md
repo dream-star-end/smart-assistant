@@ -12,7 +12,7 @@
 
 ## 实现
 
-20:54复核后，只有确认UID出口文件缺失/非法、且本轮已授权且可选范围内其它账号明确均无绑定，才用共享证明类型贯穿resolver→Text/Tool fetch→proxy→CCB parser/engine→gateway，返回409 BOX_EGRESS_NOT_CONFIGURED。只复用现有候选快照，不额外读凭据、探测或选择账号、不改affinity、不迁移native session。requiredAccountId仍限定原范围。读文件临时EMFILE/EIO、未知原因、其它候选有绑定或元数据不完整，都保留基线transient自动恢复机会。管理员/维护/noLaunch/interactive target也保持原路径；不把此证明扩大成整个Box生态无可用路线。
+20:54复核后，只有确认UID出口文件缺失/非法、且本轮已授权且可选范围内其它账号明确均无绑定，才用共享证明类型贯穿resolver→Text/Tool fetch→proxy→CCB parser/engine→gateway，返回409 BOX_EGRESS_NOT_CONFIGURED。正常选择使用原有候选快照；失败时只补一次完整恢复范围元数据读取，不额外读凭据、探测或选择账号、不改affinity、不迁移native session。requiredAccountId仍限定原范围。读文件临时EMFILE/EIO、未知原因、其它候选有绑定或元数据不完整，都保留基线transient自动恢复机会。管理员/维护/noLaunch/interactive target也保持原路径；不把此证明扩大成整个Box生态无可用路线。
 
 读取权限和符号链接校验保留；不泄露路径/凭据；不启动Box、不记账号健康失败、不扣费。这个条件确实无路可用时，代码不能擅自配置出口或安全地替用户选择不同模型；保留原任务上下文及已有切换模型操作，授权修复后可用同模型、同上下文继续。不会为了减少错误耗时而牺牲原先能恢复的任务。
 
@@ -35,3 +35,12 @@ fake clock/transport：秒/日期/缺失/无效Retry-After；3次429后成功；
 冷却边界补充：一次原始账号快照保留requiredAccountId范围；只有无路证明时忽略cooldown检查可能自行恢复的合法绑定账号，正常选择仍用原eligible。夹具推进1.001秒后既有resolve选到恢复的绑定账号完成目标交接，未借UID出口。Session JWT没有服务端自动refresh路径，不把需管理员重新登录的expired账号冒称自动恢复。
 
 生产恢复范围：正常active列表/500上限完全不改。只在确认UID错误且当前快照无其它绑定时，补一次不读凭据的完整账号元数据查询；任意同pin范围cooldown账号、active绑定/未知字段、查询缺失/失败/截断均保持原重试。证明集不按瞬时Sand资格过滤，避免sweeper刷新资格时截断旧恢复机会。没有Box探测、账号重选或全局配置改动；正常成功路径没有新增查询。
+
+
+## 20:54最终验证收口
+
+f6d6079a8的403项相关回归全部通过，包含最终生产active-only/cooldown halfOpen、Text/真实Tool链、修复后原上下文完成；增量独立r1 APPROVED。后续产品源码不变，仅将测试空数组断言改为等价length=0，避免TS断言收窄never，以及收束官方CLI上下文夹具。
+
+官方CLI2.1.302固定镜像network-none三臂已通过：control429、hint429、缺出口409→模拟授权修复，各失败一次后同session恢复成功，恰2POST，system/tools/messages三臂逐字相等，无hint/错误进入上游。首个增强夹具失败因CLI将原15B用户块封为16B；隔离诊断证明原15B完整保留。现用UTF8原串按序完整保留判据（不trim/normalize），同时验证缺任务/倒序负例失败；不把真实continuation改成重发原prompt凑通过。真实供应商调用0，历史失败日志保留。
+
+测试夹具修正后的resolver回归、类型/lint、增量r2及最新head CI各自记录，不用f6批准冒充最终head。缓存仍以真实共享256/12416/0→同值及最终head完整body绑定为范围，不新增收费调用。
