@@ -325,7 +325,7 @@ export interface CommercialHttpDeps {
    */
   prewarmContainer?: (uid: bigint) => void;
   /** Authenticated workspace-open hint; bounded and never bills or submits a turn. */
-  prepareWorkspaceContainer?: (uid: bigint) => Promise<boolean>;
+  prepareWorkspaceContainer?: (uid: bigint, draft?: import("../agent-sandbox/draftPreparation.js").DraftPreparationHint) => Promise<boolean>;
   /**
    * v1.0.120 feat/codex-disable-rebind:admin 把 codex 账号从 active 改成
    * disabled 时,主动触发 fanout actor —— 把仍绑该账号的活跃容器 rebind 到

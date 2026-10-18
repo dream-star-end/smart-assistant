@@ -1,3 +1,13 @@
+export interface WorkspaceDraftHint {
+  viewId: string
+  revision: number
+  sessionId: string
+  agentId: string
+  modelId: string
+  effortLevel?: string | null
+  cancel?: boolean
+}
+
 import type {
   AgentCancelResult,
   AgentOpenResult,
@@ -1192,9 +1202,11 @@ export const api = {
   // ── 对话前置（Agent 订阅 / 容器） ────────────────────────────────────
 
   /** Workspace-open hint: no subscription, message, or model request. */
-  prepareWorkspace: (a: AuthSession, signal?: AbortSignal): Promise<{ accepted: boolean }> =>
+  prepareWorkspace: (a: AuthSession, signal?: AbortSignal, draft?: WorkspaceDraftHint): Promise<{ accepted: boolean }> =>
     jsonOrThrow<{ accepted: boolean }>(callWithRefresh(a, t => fetch('/api/agent/prepare', {
-      method: 'POST', headers: { Authorization: `Bearer ${t}` }, signal,
+      method: 'POST', headers: { Authorization: `Bearer ${t}`,
+        ...(draft ? { 'Content-Type': 'application/json' } : {}) }, signal,
+      ...(draft ? { body: JSON.stringify(draft) } : {}),
     }))),
 
   /** Agent 订阅/容器状态（GET /api/agent/status，Bearer）。 */

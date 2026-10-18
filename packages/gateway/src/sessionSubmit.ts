@@ -1447,6 +1447,7 @@ export async function _getOrCreateExclusive(
   const {
     promptQueueExecutionFence: _fence,
     modelSwitchId: _switchId,
+    preheatOnly: _preheatOnly,
     ...identityCreationOpts
   } = opts
   // Hermetic advisor/Auto-Dream sessions have no persona or identity overlay.
@@ -1496,6 +1497,9 @@ export async function _getOrCreateExclusive(
     )
   }
   let existing = this.sessions.get(opts.sessionKey)
+  // This runs under the creation gate. A late speculative lookup must not
+  // overwrite a real first turn that created its runner while projection awaited.
+  if (opts.preheatOnly && existing) return existing
   if (existing?._modelSwitchTransition) {
     const transition = existing._modelSwitchTransition
     if (

@@ -1,3 +1,5 @@
+import type { OpenClaudeConfig } from '@openclaude/storage';
+import { clearUnusedPreheats } from '../speculativePreheat.js';
 import { _buildSafeCodexRouteOverride } from '../routeOverrides.js';
 /**
  * CodexAdapter turn parity 测试(M1a)。
@@ -28,9 +30,9 @@ import type { spawn } from "node:child_process";
 import { paths } from "@openclaude/storage";
 
 import { CodexAdapter, buildCodexBillingEvent, classifyCodexErrorKind } from "../engine/codexAdapter.js";
-import { __setCodexAppServerSpawnForTests } from "../engine/codexAppServerRunner.js";
+import { __setCodexAppServerSpawnForTests, log as codexTimingLog } from "../engine/codexAppServerRunner.js";
 import { CREDIT_EXHAUSTED_DETAIL } from "../creditExhaustion.js";
-import { IDLE_TIMEOUT_TOOL_MS, shouldTripIdleWatchdog } from "../sessionManager.js";
+import { SessionManager, IDLE_TIMEOUT_TOOL_MS, shouldTripIdleWatchdog } from "../sessionManager.js";
 import { _setModelCatalogClientForTests } from "../modelCatalogClient.js";
 import { _setPlatformPricingLookupForTests } from "../usageCost.js";
 import { engineSessionId } from "../engine/engineSessionId.js";
@@ -1578,4 +1580,71 @@ describe("CodexAdapter.preheat — fresh volatile thread, zero inference RPC", (
     await turn.summary;
     await closePreheatHarness(h);
   });
+});
+
+describe("draft preheated thread timing truth", () => {
+  for (const warm of [false, true]) {
+    test(`thread_ready reports actual volatile claim warm=${warm}`, async (t) => {
+      const timing: Array<Record<string, unknown>> = [];
+      t.mock.method(codexTimingLog, 'info', (msg: string, fields: Record<string, unknown>) => {
+        if (msg === 'codex_turn_timing' && fields?.stage === 'thread_ready') timing.push(fields);
+      });
+      const h = makeHarness();
+      if (warm) {
+        await h.adapter.preheat();
+        assert.deepEqual(h.proc().written.map(r => r.method), ['initialize', 'thread/start']);
+        assert.deepEqual(h.billing, []);
+      }
+      const turn = beginTurn(h);
+      await waitForRequest(h, 'turn/start');
+      h.proc().notify('turn/completed', { turn: { id: 'turn-1', status: 'completed' } });
+      await turn.summary;
+      assert.equal(timing.length, 1);
+      assert.equal(timing[0].preheatedThreadClaimed, warm);
+      await closePreheatHarness(h);
+    });
+  }
+});
+
+test('draft isolated workspace preheat survives authoritative first-send creation and claims its thread', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'draft-preheat-contract-'));
+  const previous = process.env.OPENCLAUDE_DEFAULT_WORKSPACE;
+  process.env.OPENCLAUDE_DEFAULT_WORKSPACE = root;
+  const h = makeHarness();
+  const sm = new SessionManager({ defaults: { model: 'gpt-6.1-sol' },
+    gateway: { bind: '127.0.0.1', port: 0, accessToken: '' },
+    auth: { mode: 'subscription', claudeCodePath: '' }, sessions: { dbPath: '' },
+  } as unknown as OpenClaudeConfig);
+  Object.assign(sm, { _saveResumeMap: () => {} });
+  const claims: boolean[] = [];
+  t.mock.method(codexTimingLog, 'info', (msg: string, fields: Record<string, unknown>) => {
+    if (msg === 'codex_turn_timing' && fields?.stage === 'thread_ready') claims.push(fields.preheatedThreadClaimed === true);
+  });
+  const opts = { sessionKey: 'agent:main:webchat:dm:draft_contract_123', agent: { id: 'main' },
+    channel: 'webchat', peerId: 'draft_contract_123', model: 'gpt-6.1-sol',
+    workspaceMode: 'isolated_v1' as const, effortLevel: 'high' };
+  let actual: Harness | undefined;
+  try {
+    const warm = await sm.getOrCreate({ ...opts, preheatOnly: true });
+    actual = { ...h, adapter: warm.runner as CodexAdapter };
+    assert.equal(warm.workspaceCwd, join(root, 'sessions', opts.peerId));
+    assert.equal(await sm.preheatRunner(warm), 'started');
+    assert.deepEqual(h.proc().written.map(r => r.method), ['initialize', 'thread/start']);
+    assert.equal((warm.runner as CodexAdapter).effortLevel, 'high');
+    const real = await sm.getOrCreate({ ...opts, userId: 'c:42' });
+    assert.equal(real, warm);
+    const turn = beginTurn(actual);
+    await waitForRequest(actual, 'turn/start');
+    assert.equal(h.spawnCalls.length, 1);
+    assert.equal(h.proc().written.filter(r => r.method === 'thread/start').length, 1);
+    h.proc().notify('turn/completed', { turn: { id: 'turn-1', status: 'completed' } });
+    await turn.summary;
+    assert.deepEqual(claims, [true]);
+  } finally {
+    clearUnusedPreheats(sm);
+    if (actual && h.spawnCalls.length) await closePreheatHarness(actual);
+    if (previous === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_DEFAULT_WORKSPACE');
+    else process.env.OPENCLAUDE_DEFAULT_WORKSPACE = previous;
+    await rm(root, { recursive: true, force: true });
+  }
 });

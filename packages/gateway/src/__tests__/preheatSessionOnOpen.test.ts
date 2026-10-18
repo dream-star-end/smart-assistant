@@ -331,3 +331,23 @@ test('direct container Codex GET without a trusted route hint skips CLI preparat
   assert.equal(calls.some(c => c.kind === 'getOrCreate' || c.kind === 'preheatRunner'), false)
   assert.ok(calls.some(c => c.kind === 'log:engine_preheat_skipped'))
 })
+
+test('draft internal fields survive validation and reach creation without a durable chat row', async () => {
+  Reflect.deleteProperty(process.env, 'OC_MODEL_AUTHORITY')
+  const { fake, calls } = makeFake()
+  const statuses: number[] = []
+  const ext = Object.assign(fake, {
+    readBody: async () => JSON.stringify({ sessionId: 'webtest1234', agentId: 'main',
+      modelId: 'glm-5.3-zai', effortLevel: 'high', workspaceMode: 'isolated_v1' }),
+    sendJson: (_res: unknown, status: number) => { statuses.push(status) },
+  })
+  await (Gateway.prototype as unknown as { handleEnginePreheat: (req: unknown, res: unknown) => Promise<void> })
+    .handleEnginePreheat.call(ext, {}, {})
+  assert.deepEqual(statuses, [200])
+  await settle(40)
+  const created = calls.find(c => c.kind === 'getOrCreate')?.detail as Record<string, unknown>
+  assert.equal(created.peerId, 'webtest1234')
+  assert.equal(created.workspaceMode, 'isolated_v1')
+  assert.equal(created.effortLevel, 'high')
+  assert.equal(created.preheatOnly, true)
+})

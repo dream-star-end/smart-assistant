@@ -2555,13 +2555,14 @@ export class CodexAppServerRunner extends EventEmitter {
         this.attached = true
       }
 
+      const preheatedThreadClaimed = Boolean(this._unannouncedPreheatThread && this.threadId)
       if (this._unannouncedPreheatThread && this.threadId) {
         this._unannouncedPreheatThread = false
         this.emit('session_id', this.threadId)
       }
       this._preheatedSignature = null
       log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
-        stage: 'thread_ready', durationMs: performance.now() - threadStartedAt, elapsedMs: performance.now() - timingStartedAt })
+        stage: 'thread_ready', preheatedThreadClaimed, durationMs: performance.now() - threadStartedAt, elapsedMs: performance.now() - timingStartedAt })
       await this.syncPlatformGoal()
 
       // ── attempt 循环 ──────────────────────────────────────────────────

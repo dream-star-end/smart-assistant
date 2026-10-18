@@ -1098,6 +1098,8 @@ export async function handleEnginePreheat(
     {
       agentId: validated.payload.agentId,
       ...(validated.payload.modelId ? { modelId: validated.payload.modelId } : {}),
+      ...(validated.payload.effortLevel !== undefined ? { effortLevel: validated.payload.effortLevel } : {}),
+      ...(validated.payload.workspaceMode ? { workspaceMode: validated.payload.workspaceMode } : {}),
       ...(validated.payload.codexRouteHint ? { codexRouteHint: validated.payload.codexRouteHint } : {}),
     },
   ).catch((err) => {

@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { makeEnginePreheatPreparation } from '../dispatch/enginePreheatPreparation.js'
+import type { EnginePreheatRequest } from '../dispatch/enginePreheatClient.js'
+import { makeEnginePreheatPreparation, makeDraftEnginePreparation } from '../dispatch/enginePreheatPreparation.js'
 const args = { userId: 'c:3', sessionId: 'fixture-session', agentId: 'main', modelId: 'alias' }
 function fixture(groups: Array<{ id: bigint; kind: string }>, active = new Set([1n])) {
   const reads: string[] = []
@@ -47,4 +48,34 @@ test('fresh catalogue or account availability errors only skip the optimization'
   const prepare = makeEnginePreheatPreparation({ resolveAllowedModel: async () => { throw Error('unavailable') },
     listGroups: async () => [], hasOfficial: async () => true })
   assert.equal(await prepare(3n, args), null)
+})
+
+test('new-draft workspace mode uses server new-row policy, existing legacy remains legacy', async () => {
+  const sent: EnginePreheatRequest[] = []
+  let mode: 'legacy' | null = null
+  const prepare = makeDraftEnginePreparation({
+    loadWorkspaceMode: async (uid, sid) => { assert.equal(uid, 3n); assert.equal(sid, args.sessionId); return mode },
+    preheat: async value => { sent.push(value) },
+  })
+  const current = () => true
+  const hint = { ...args, modelId: 'alias', revision: 1, viewId: 'view_12345', effortLevel: 'high' }
+  await prepare(3n, hint, current)
+  assert.equal(sent[0].workspaceMode, 'isolated_v1')
+  assert.equal(sent[0].effortLevel, 'high')
+  assert.equal(sent[0].codexOnly, true)
+  assert.equal(sent[0].userId, 'c:3')
+  mode = 'legacy'
+  await prepare(3n, hint, current)
+  assert.equal(sent[1].workspaceMode, 'legacy')
+  let live = true
+  const delayed = makeDraftEnginePreparation({
+    loadWorkspaceMode: async () => { live = false; return null }, preheat: async value => { sent.push(value) },
+  })
+  await delayed(3n, hint, () => live)
+  assert.equal(sent.length, 2)
+})
+test('new-draft path refuses non-Codex even when legacy GET preparation allows it', async () => {
+  const prepare = makeEnginePreheatPreparation({ resolveAllowedModel: async () => ({ engine: 'ccb', canonicalModel: 'fixture-ccb' }),
+    listGroups: async () => { throw Error('must not read groups') }, hasOfficial: async () => true })
+  assert.equal(await prepare(3n, { ...args, codexOnly: true }), null)
 })

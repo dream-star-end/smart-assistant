@@ -36,3 +36,13 @@ test('matching model binds route immediately before initialization; a running en
   assert.equal(await preheatRunner.call(f.host, f.session, preparation), 'already_running')
   assert.deepEqual(f.events, [])
 })
+
+test('effective effort mismatch under lock skips without changing the runner', async () => {
+  const f = fixture()
+  Object.assign(f.runner, { effortLevel: 'medium' })
+  assert.equal(await preheatRunner.call(f.host, f.session, { ...preparation, effortLevel: 'high' }), 'skipped_busy')
+  assert.deepEqual(f.events, [])
+  clearUnusedPreheats(f.host)
+  assert.equal(await preheatRunner.call(f.host, f.session, { ...preparation, effortLevel: 'medium' }), 'started')
+  clearUnusedPreheats(f.host)
+})
