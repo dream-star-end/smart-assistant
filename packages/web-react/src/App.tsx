@@ -185,6 +185,7 @@ import {
   isStaleCollabEpoch,
   keepCollabChoiceOnSaveFailure,
   recommendedAdvisorModel,
+  refreshOriginalAdvisorForSend,
   sendCollabFields,
 } from "./lib/collaborationConfig";
 
@@ -1303,6 +1304,8 @@ export function App() {
       let unavailableForSend = collabUi.advisorUnavailableReason;
       let latestCollab = collabUi;
       let recoveredAdvisor = false;
+      let confirmedAdvisorRecovery = continuePrimaryWithoutAdvisor(collabUi);
+      let refreshedAdvisor = false;
       const recoveryEpoch = collabEpochRef.current;
       const recoverySelection = selectedSessionIdRef.current;
       const recoveryIdentity = auth?.snapshot().epoch;
@@ -1317,19 +1320,22 @@ export function App() {
         try {
           const fresh = await api.getCollaborationConfig(auth, sessionId || undefined, { signal: controller.signal });
           if (!recoveryIsCurrent()) return;
-          latestCollab = docToUiState(fresh);
+          const refreshed = refreshOriginalAdvisorForSend(collabUi, fresh,
+            models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine);
+          latestCollab = refreshed.state;
+          confirmedAdvisorRecovery = refreshed.continueSolo;
+          refreshedAdvisor = true;
           modeForSend = latestCollab.mode;
           advisorModelForSend = latestCollab.advisorModel;
           configVersionForSend = latestCollab.configVersion;
           unavailableForSend = latestCollab.advisorUnavailableReason;
-          applyCollabDoc(fresh);
         } catch {
           if (!recoveryIsCurrent()) return;
           // A previous successfully resolved empty catalog remains distinct
           // from initial/failed catalog loading; retain its safe solo fallback.
         } finally { window.clearTimeout(timer); }
       }
-      if (agent.id === "main" && continuePrimaryWithoutAdvisor(latestCollab)) {
+      if (agent.id === "main" && confirmedAdvisorRecovery) {
         recoveredAdvisor = true;
         modeForSend = "solo";
         advisorModelForSend = null;
@@ -1339,6 +1345,10 @@ export function App() {
         setTeamModeState(false);
         setCollabSaveError(null);
         toast("顾问暂不可用，已由当前主模型继续处理", "info");
+      } else if (refreshedAdvisor) {
+        setCollabUi(latestCollab);
+        setTeamModeState(false);
+        setCollabSaveError(null);
       }
       if (!sessionId) {
         stopPreparing();
