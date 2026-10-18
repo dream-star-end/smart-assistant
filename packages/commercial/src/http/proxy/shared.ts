@@ -1,3 +1,5 @@
+import { encodeUpstreamRetryHint } from "@openclaude/protocol";
+import { parseRetryAfterMs } from "../../account-pool/policy/outcome.js";
 /**
  * V3 Phase 4(2026-05-18 anthropicProxy.ts 三层拆分 §4.5):shared leaf 模块。
  *
@@ -2025,6 +2027,13 @@ export function sendJsonError(
   if (res.headersSent) return;
   const errorBody: Record<string, unknown> = { code, message };
   if (extraErrorFields) Object.assign(errorBody, extraErrorFields);
+  if (status === 429) {
+    const retryAfter = Object.entries(extraHeaders ?? {}).find(([name]) => name.toLowerCase() === "retry-after")?.[1];
+    const now = Date.now();
+    const delay = parseRetryAfterMs(retryAfter, new Date(now));
+    const hint = delay === null ? undefined : encodeUpstreamRetryHint(Math.ceil(now + delay));
+    if (hint) errorBody.message = `${message} ${hint}`;
+  }
   const body = JSON.stringify({
     error: errorBody,
     request_id: requestId,

@@ -1,3 +1,4 @@
+import { BoxEgressNotConfiguredError } from "./boxAccountResolver.js";
 /**
  * V3 Phase 4(2026-05-18 anthropicProxy.ts 三层拆分 §4.6):upstream round-trip 核心。
  *
@@ -26,7 +27,7 @@
  *     是不可移除的兜底,任何路径 return 都必经此 finally。
  */
 
-import { attachPoolOutcome, classifyHttpOutcome } from "../../account-pool/policy/outcome.js";
+import { attachPoolOutcome, classifyHttpOutcome, parseRetryAfterMs } from "../../account-pool/policy/outcome.js";
 import { reportApiKeyOutcome } from "../../account-pool/apiKeyPool.js";
 import type { Pool } from "pg";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -495,21 +496,19 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       //   - 配合容器 CLAUDE_CODE_MAX_RETRIES 收紧(见 v3supervisor.ts),放大被封顶。
       //   - 账号健康分已由上面 finalize.fail(RATE_LIMITED) 扣减,连续失败自动进 cooldown,
       //     无需在此额外切号(切号 = 规避限额,反而增封号风险)。
-      // Retry-After:优先取上游头;缺失给 60s 保守默认(Anthropic 5h 窗口下够温和)。
+      // Preserve valid seconds/HTTP-date headers; absent hints leave the gateway's
+      // single retry owner on its exponential backoff with jitter.
       if (upstream.status === 429) {
         const upstreamRetryAfter = upstream.headers.get("retry-after");
-        const retryAfterSec =
-          upstreamRetryAfter && /^\d+$/.test(upstreamRetryAfter.trim())
-            ? Math.max(1, parseInt(upstreamRetryAfter.trim(), 10))
-            : 60;
+        const retryAfterMs = parseRetryAfterMs(upstreamRetryAfter, new Date());
         sendJsonError(
           res,
           429,
           "UPSTREAM_RATE_LIMITED",
           "upstream rate limited; retry after the indicated delay",
           requestId,
-          { "Retry-After": String(retryAfterSec) },
-          { retry_after_ms: retryAfterSec * 1000 },
+          retryAfterMs === null || upstreamRetryAfter === null ? undefined : { "Retry-After": upstreamRetryAfter },
+          retryAfterMs === null ? undefined : { retry_after_ms: retryAfterMs },
         );
         return;
       }
@@ -705,6 +704,9 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     else if (observed.kind === "partial") incrAnthropicProxySettle("partial");
     else incrAnthropicProxySettle("aborted");
   } catch (err) {
+    const boxEgressNotConfigured = err instanceof BoxEgressNotConfiguredError
+      || (err instanceof BoxTextFetchError
+        && ["BOX_UID_PROXY_UNAVAILABLE", "BOX_UID_PROXY_INVALID"].includes(err.code));
     const continuationConflict = err instanceof BoxContinuationDecisionError
       || (err instanceof BoxDurableJournalError && isContinuationConflict(err.code));
     const boxCapacityHeld = isBoxApiModel(body.model)
@@ -721,7 +723,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
         ? (err as { code: string }).code : null) : null;
     // 客户端断流(req/res close → ac.abort → fetch AbortError)走 client_error。
     // 仅按 err 形状判定,见 isClientAbort 注释。
-    if (continuationConflict) {
+    if (boxEgressNotConfigured || continuationConflict) {
       await finalize.failClient(observed, err, "INVALID_REQUEST");
     } else if (boxCapacityHeld) {
       await finalize.failClient(observed, err, "INVALID_REQUEST");
@@ -742,12 +744,15 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
         model: body.model,
         ttftMs: null,
         streamMs: null,
-        outcome: continuationConflict || isClientAbort(err) ? "aborted" : "error",
+        outcome: boxEgressNotConfigured || continuationConflict || isClientAbort(err) ? "aborted" : "error",
       },
     );
     // 字节是否已 flush 决定怎么发错误
     if (!res.headersSent) {
-      if (continuationConflict) {
+      if (boxEgressNotConfigured) {
+        sendJsonError(res, 409, "BOX_EGRESS_NOT_CONFIGURED",
+          "BOX_EGRESS_NOT_CONFIGURED: model egress is not configured; contact administrator", requestId);
+      } else if (continuationConflict) {
         const code = err instanceof BoxContinuationDecisionError || err instanceof BoxDurableJournalError
           ? err.code : "BOX_PREPARED_REJECT";
         sendJsonError(res, 409, code, "continuation not republished", requestId);
