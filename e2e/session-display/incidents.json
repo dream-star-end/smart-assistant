@@ -7396,6 +7396,68 @@
         }
       ],
       "coverageCommits": []
+    },
+    {
+      "id": "INC-20261018-CODEX-WEB-SEARCH-CLI",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "体验官A25/A36：Codex缺少可发现的稳定搜索CLI，oc-web --help无search，Luna/Sol改用Bash抓Google/Bing/Baidu遇空结果及验证码。新增oc-web search，复用现有master搜索代理和成对容器身份回退；prompt/schema/cache输入不变。",
+      "rootFixCommit": "fb1fc232",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ocWebSearch.test.ts",
+          "assertion": "OCV5-510 oc-web search returns source URLs through the authenticated master proxy"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-ccb-mcp-availability.ts",
+          "assertion": "[ocv5-510-codex-web-search-cli] PASS — the real CLI restores container identity and returns a sourced result through MiniMax then Grok"
+        }
+      ],
+      "coverageCommits": [
+        "8708f22f"
+      ]
+    },
+    {
+      "id": "INC-20261018-ARTIFACT-LINK-DOWNLOAD",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "体验官B13：Markdown中generated绝对文件链接被当成网站路径，新标签404且暴露内部路径。平台资产锚点复用既有鉴权签名缓存与下载组件，普通链接和只读行为保留。",
+      "rootFixCommit": "f725358e",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MarkdownImpl.test.tsx",
+          "assertion": "OCV5-508 artifact anchors reuse signing and retain their label"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/artifact-link.node-test.mjs",
+          "assertion": "OCV5-508 generated Markdown links download authenticated file bytes"
+        }
+      ],
+      "coverageCommits": []
+    },
+    {
+      "id": "INC-20261018-SHARE-EXPORT-INTERNAL",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "体验官A24：导出Markdown泄露工具调用及过程文本，分享最终答含平台内部资产路径。修复统一最终回答口径并只转换资产引用，保留有用源码和用户原文。",
+      "rootFixCommit": "b602bab3",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/publicArtifactText.test.ts",
+          "assertion": "OCV5-507 exports readable artifact references without private platform roots"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/share-export.node-test.mjs",
+          "assertion": "OCV5-507 sharing and Markdown downloads contain final answers and portable artifact references"
+        }
+      ],
+      "coverageCommits": []
     }
   ]
 }

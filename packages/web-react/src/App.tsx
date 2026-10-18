@@ -4472,7 +4472,7 @@ export function App() {
             title={activeSess?.title}
             agentName={agent.name || "助手"}
             onExportMarkdown={async () => {
-              const md = await exportSessionMarkdown(wsMessages);
+              const md = await exportSessionMarkdown(wsMessages, sending);
               saveBlob(
                 new Blob([md], {
                   type: "text/markdown;charset=utf-8",

@@ -12,10 +12,13 @@ priority: 8
 ## 用法
 
 ```bash
+oc-web search "<关键词>"       # 搜索并返回带来源 URL 的结果；首路失败时内部自动换路
 oc-web extract <url>          # 抓公开 URL → 干净 Markdown（静态提取，保留重定向/DNS 在 SSRF 防护内）
 oc-web parse <绝对路径>        # 解析本地文件 → Markdown
 oc-web health                 # 检查解析器依赖是否可用
 ```
+
+`search` 直接接收查询词，返回带标题、URL、摘要的结果；下列 flag 用于 `extract` / `parse`。
 
 常用 flag：
 - `--json`：输出完整结构化 JSON（含 ok/blocked/error/final_url/http_status 等），便于你程序化判断；默认直接打印 Markdown 正文。
@@ -28,10 +31,10 @@ oc-web health                 # 检查解析器依赖是否可用
 
 ## 搜索 vs 提取的分工(反模式,生产实证)
 
-- **搜索一律用内置 WebSearch 工具**,拿到目标 URL 后再对**内容页**用 `oc-web extract`。
-- **绝不用 `oc-web extract` 抓搜索引擎结果页**(baidu/bing/sogou/google/brave/yahoo 的 `/search?...` URL):SERP 是重 JS+反爬页面,实测要么超时、要么返回与查询无关的垃圾内容(比拿不到更糟——会污染你的结论)。`site:xxx` 这类站内检索同样交给 WebSearch。
-- WebSearch 结果不足时的正确姿势:换关键词再搜、直接猜权威站点的内容页 URL、或如实告诉用户找不到;而不是去抓 SERP。
-- `extract` 返回 `blocked`/`parser timed out`:内容页可加 `--timeout-ms 60000` 重试一次;仍失败就换 WebSearch 或如实说明受阻,不要反复重试同一 URL。
+- 优先用可用的内置 WebSearch。工具缺失、调用失败或结果不足时，立即用 Bash 调 `oc-web search "关键词"` 继续搜索；该命令会在首个搜索服务失败、无有效结果或超时时自动换路。拿到来源 URL 后再对**内容页**用 `oc-web extract`，继续完成原任务。
+- **绝不用 `oc-web extract` 抓搜索引擎结果页**(baidu/bing/sogou/google/brave/yahoo 的 `/search?...` URL):SERP 是重 JS+反爬页面,实测要么超时、要么返回与查询无关的垃圾内容(比拿不到更糟——会污染你的结论)。`site:xxx` 这类站内检索同样可交给 WebSearch 或 `oc-web search`。
+- WebSearch 结果不足时先换关键词或用 `oc-web search` 补查。两种方式均无有效来源后，再说明已尝试的范围，继续处理现有材料或请用户提供具体数据源；不要猜 URL、编造检索结果或去抓 SERP。
+- `extract` 返回 `blocked`/`parser timed out`:内容页可加 `--timeout-ms 60000` 重试一次;仍失败就用 WebSearch / `oc-web search` 找其它可访问来源，继续任务；仍无来源时如实说明受阻,不要反复重试同一 URL。
 
 ## 路径与安全边界
 
@@ -44,7 +47,8 @@ oc-web health                 # 检查解析器依赖是否可用
 
 1. 用户给公开链接 → `oc-web extract <url>`，把返回的 Markdown 作为上下文回答，并标注来源。
 2. 用户上传了 PDF/Office/HTML → 用其容器内绝对路径 `oc-web parse <path>`，再基于解析文本回答。
-3. 需要判断是否被拦或拿元数据 → 加 `--json` 看 `blocked`/`http_status`/`final_url`。
+3. 用户要求检索实时事实、内置搜索不可用/失败 → `oc-web search "关键词"` → 采用返回的来源 URL，必要时 `extract` 内容页，再带来源回答。
+4. 需要判断是否被拦或拿元数据 → 加 `--json` 看 `blocked`/`http_status`/`final_url`。
 
 ## 工具调用纪律(重要)
 

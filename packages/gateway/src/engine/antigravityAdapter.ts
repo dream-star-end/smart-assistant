@@ -1,3 +1,4 @@
+import { PassiveStageTiming } from '../passiveStageTiming.js'
 import { identityCompatEnvironment } from '@openclaude/storage'
 /**
  * Official Google Antigravity CLI adapter (OCV5-415, experimental, hidden).
@@ -106,6 +107,7 @@ interface StepUsage {
 type AgyLine = Record<string, unknown> & { event?: unknown }
 
 interface TurnContext {
+  timing: PassiveStageTiming
   params: TurnParams
   startedAt: number
   proc: ChildProcessByStdio<Writable, Readable, Readable> | null
@@ -269,6 +271,9 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     let resolveSummary!: (summary: TurnSummary | null) => void
     const summary = new Promise<TurnSummary | null>((resolve) => { resolveSummary = resolve })
     const ctx: TurnContext = {
+      timing: new PassiveStageTiming({ engine: 'antigravity', generation: 1, traceId: params.traceId,
+        sessionKey: this.opts.sessionKey, model: this.currentModel },
+        (fields) => log.info('engine_turn_timing', { ...fields })),
       params,
       startedAt: Date.now(),
       proc: null,
@@ -423,12 +428,14 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     ctx: TurnContext,
     spec: { bin: string; args: string[]; env: NodeJS.ProcessEnv; cwd: string; line: string },
   ): void {
+    ctx.timing.once('spawn_requested')
     const proc = spawn(spec.bin, spec.args, {
       cwd: spec.cwd,
       env: spec.env,
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: true,
     })
+    ctx.timing.once('spawned')
     ctx.proc = proc
     this.emit('spawn', { resumed: spec.args.includes('--conversation'), argv: [...spec.args] })
     this.ensureKeepalive(ctx)
@@ -439,6 +446,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     proc.stdout.setEncoding('utf8')
     proc.stdout.on('data', (chunk: string) => {
       if (ctx.abandoned) return
+      if (chunk.length > 0) ctx.timing.once('first_stdout')
       this.lastActivityAt = Date.now()
       this.emit('activity')
       stdoutBuffer += chunk
@@ -564,6 +572,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     }
     if (ctx.terminal) return
     if (event.event === 'init') {
+      ctx.timing.once('cli_init_received')
       const id = asText(event.conversation_id)
       if (CONVERSATION_ID_RE.test(id)) ctx.conversationId = id
       return
@@ -610,6 +619,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   }
 
   private appendText(ctx: TurnContext, text: string): void {
+    if (text.trim()) ctx.timing.once('first_text')
     ctx.sawOutput = true
     if (!ctx.lastWasText) {
       ctx.assistantSegments.push({
