@@ -1,3 +1,4 @@
+import { useDraftSessionMaterialization } from "./hooks/useDraftSessionMaterialization";
 import { useDraftPreparation } from "./hooks/useDraftPreparation";
 import { createGoalStarter } from "./lib/goalStart";
 import {
@@ -29,9 +30,9 @@ import { saveBlob } from "./lib/chat/download";
 import { applyIntelligentUiSnapshot, useInputPredictionEnabled } from "./lib/intelligentUi";
 import { exportSessionMarkdown, sessionExportFilename } from "./lib/chat/exportMarkdown";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
-import { Composer, moveComposerAttachments, resetComposerAttachmentCache } from "./components/Composer";
+import { Composer, resetComposerAttachmentCache } from "./components/Composer";
 import { ComposerProjectPill } from "./components/ComposerProjectPill";
-import { accountDraftKey, moveDraft, NEW_COMPOSER_DRAFT_KEY, teardownComposerDrafts } from "./lib/composerDraft";
+import { accountDraftKey, NEW_COMPOSER_DRAFT_KEY, teardownComposerDrafts } from "./lib/composerDraft";
 import type { ImageAnnotationSource } from "./components/ImageAnnotationEditor";
 import {
   type ImageCommentSubmit,
@@ -1674,37 +1675,11 @@ export function App() {
     [image2Available, submitImageEdit, submitImageComment, image2UnavailableReason],
   );
 
-  // 会话物化:新建按钮本身只进入空白草稿态；GitHub 绑定 / 设定目标这类明确依赖
-  // per-session 身份的首轮前操作，才在用户确认操作时物化一个会话 id。
-  const ensureActiveSession = useCallback((): string | undefined => {
-    if (demo || !user) return activeId;
-    if (activeId) return activeId;
-    stopPreparing();
-    const id = draftSessionId;
-    const s: Session = {
-      id,
-      title: "新对话",
-      ownerUserId: user.id,
-      updatedAt: new Date().toISOString(),
-      messageCount: 0,
-      ...(modelId ? { modelId } : {}),
-    };
-    // 首轮前操作会紧接着 ensureServerSession/sendRepoBind；先把空白态显式模型写入
-    // ChatSession，确保建行 PUT 与后续首发都携带同一选择，不被 activeId effect 回落默认值。
-    writeTeamMode(id, collabMode === "team");
-    if (sessionEffort !== undefined) writeSessionEffort(id, sessionEffort);
-    writeContextTier(id, contextTier);
-    writeSessionServiceTier(id, serviceTier);
-    sockRef.current?.ensureSession(id, agent.id, "新对话");
-    if (modelId) sockRef.current?.setSessionModel(id, modelId);
-    setSessions((c) => [s, ...c]);
-    // This is an identity promotion, not navigation to another conversation. Preserve
-    // the unsent draft; normal send consumes/clears it in Composer instead.
-    moveDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, user.id), accountDraftKey(id, user.id));
-    moveComposerAttachments(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, user.id), accountDraftKey(id, user.id));
-    setActiveId(id);
-    return id;
-  }, [demo, user, activeId, agent.id, modelId, draftSessionId, stopPreparing, collabMode, sessionEffort, contextTier, serviceTier, setSessions, setActiveId]);
+  const ensureActiveSession = useDraftSessionMaterialization({
+    demo, userId: user?.id, activeId, draftSessionId, stopPreparing, agentId: agent.id, modelId,
+    teamMode: collabMode === "team", sessionEffort, contextTier, serviceTier,
+    sockRef, setSessions, setActiveId,
+  });
 
   // 打开 GitHub 绑定 modal:先确保有承载会话,否则「确认绑定」因 !sessionId 恒禁用
   // (输入框底部入口 → 发消息前即可绑定)。
