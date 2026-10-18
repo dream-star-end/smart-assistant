@@ -8,6 +8,7 @@
  * Google; never on the chat path. No token is logged or returned.
  */
 import { request } from 'undici'
+import { query } from '../db/queries.js'
 import { getFreshAntigravityAccessToken } from './antigravityOAuth.js'
 import { directEgressDispatcher } from './egressDispatcher.js'
 
@@ -34,6 +35,8 @@ export interface MemberQuota {
   updatedAt: string | null
   /** Why there is no (or partial) data; shown instead of an empty cell. */
   note: string | null
+  paidTier?: string | null
+  tierUpdatedAt?: string | null
 }
 
 interface Bucket {
@@ -74,20 +77,27 @@ export function parseQuotaSummary(body: unknown): QuotaWindow[] {
   return out
 }
 
+export type AntigravityModelAvailability = Record<string, { remainingFraction: number | null; resetTime: string | null }>
+
+export async function saveAntigravityMetadata(accountId: string, paidTier: string | null, models: AntigravityModelAvailability | null): Promise<void> {
+  await query(`UPDATE gemini_oauth_accounts SET paid_tier=$2, tier_updated_at=NOW(),
+    available_models=COALESCE($3::jsonb, available_models), updated_at=NOW() WHERE id=$1`,
+    [accountId, paidTier, models === null ? null : JSON.stringify(models)])
+}
+
 export interface AntigravityQuotaDeps {
   clientSecret: () => string
   freshToken?: (accountId: bigint) => Promise<Buffer>
   post?: (path: string, token: string, body: unknown) => Promise<{ status: number; json: unknown }>
   now?: () => number
+  saveMetadata?: typeof saveAntigravityMetadata
 }
 
 const cache = new Map<string, { at: number; value: MemberQuota }>()
-const projects = new Map<string, string>()
 
 /** Tests only. */
 export function _resetAntigravityQuotaCacheForTest(): void {
   cache.clear()
-  projects.clear()
 }
 
 async function defaultPost(path: string, token: string, body: unknown): Promise<{ status: number; json: unknown }> {
@@ -134,24 +144,39 @@ async function fetchQuota(accountId: string, deps: AntigravityQuotaDeps, now: nu
     return { windows: [], updatedAt: null, note: '登录凭证无法刷新，读不到额度（账号处于认证冷却时由恢复探测处理）' }
   }
   try {
-    let project = projects.get(accountId)
-    if (!project) {
-      const lca = await post('/v1internal:loadCodeAssist', token, { metadata: { ideType: 'ANTIGRAVITY' } })
-      const p = (lca.json as { cloudaicompanionProject?: string | { id?: string } } | null)?.cloudaicompanionProject
-      project = typeof p === 'string' ? p : p?.id
-      if (lca.status !== 200 || !project) {
-        return { windows: [], updatedAt: null, note: `上游未返回项目信息（loadCodeAssist HTTP ${lca.status}），读不到额度` }
-      }
-      projects.set(accountId, project)
+    // A tier upgrade must be visible without restarting the process. Reload on
+    // the existing ten-minute quota TTL, even when the project is unchanged.
+    const lca = await post('/v1internal:loadCodeAssist', token, { metadata: { ideType: 'ANTIGRAVITY' } })
+    const loaded = lca.json as { cloudaicompanionProject?: string | { id?: string }; paidTier?: { id?: string } } | null
+    const p = loaded?.cloudaicompanionProject
+    const project = typeof p === 'string' ? p : p?.id
+    if (lca.status !== 200 || !project) {
+      return { windows: [], updatedAt: null, note: `上游未返回项目信息（loadCodeAssist HTTP ${lca.status}），读不到额度` }
     }
+    const paidTier = typeof loaded?.paidTier?.id === 'string' ? loaded.paidTier.id.slice(0, 120) : null
+    const directory = await post('/v1internal:fetchAvailableModels', token, { project }).catch(() => null)
+    const rawModels = (directory?.json as { models?: Record<string, { quotaInfo?: { remainingFraction?: number; resetTime?: string } }> } | null)?.models
+    let models: AntigravityModelAvailability | null = null
+    if (directory?.status === 200 && rawModels && typeof rawModels === 'object' && !Array.isArray(rawModels)) {
+      models = {}
+      for (const [id, value] of Object.entries(rawModels)) {
+        if (!/^[a-zA-Z0-9._-]{1,128}$/.test(id)) continue
+        const q = value?.quotaInfo
+        models[id] = {
+          remainingFraction: typeof q?.remainingFraction === 'number' && Number.isFinite(q.remainingFraction) ? q.remainingFraction : null,
+          resetTime: typeof q?.resetTime === 'string' ? q.resetTime : null,
+        }
+      }
+    }
+    await (deps.saveMetadata ?? saveAntigravityMetadata)(accountId, paidTier, models)
     const q = await post('/v1internal:retrieveUserQuotaSummary', token, { project })
     if (q.status !== 200) {
-      if (q.status === 404 || q.status === 403) projects.delete(accountId)
       return { windows: [], updatedAt: null, note: `上游额度接口返回 HTTP ${q.status}` }
     }
     const windows = parseQuotaSummary(q.json)
     return {
       windows,
+      paidTier, tierUpdatedAt: new Date(now).toISOString(),
       updatedAt: new Date(now).toISOString(),
       note: windows.length === 0 ? '上游额度接口没有返回任何窗口' : null,
     }
