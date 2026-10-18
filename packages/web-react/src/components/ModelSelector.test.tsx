@@ -925,3 +925,41 @@ describe('ModelSelector OCV5-434 GPT Fast(turn 级 serviceTier,默认关)', () =
     }
   })
 })
+
+describe('OCV5-504 自选档说明保持默认与目录价格权威', () => {
+  it('Grok 两档各自展示目录倍率，目录更新立即生效且不会自动选档', async () => {
+    const models: PublicModel[] = [
+      { id: 'grok-build', display_name: 'Grok 4.7', cost_x: 3.4 },
+      { id: 'grok-build-fast', display_name: 'Grok 4.7 Fast', cost_x: 6.8 },
+    ]
+    const onSelect = vi.fn()
+    const view = render(<ModelSelector models={models} selectedId="grok-build" onSelect={onSelect} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(document.querySelector('[data-fast="false"]')).toHaveTextContent('3.4')
+    expect(document.querySelector('[data-fast="true"]')).toHaveTextContent('6.8')
+    expect(onSelect).not.toHaveBeenCalled()
+    view.rerender(<ModelSelector models={[models[0]!, { ...models[1]!, cost_x: 9.1 }]}
+      selectedId="grok-build" onSelect={onSelect} />)
+    expect(document.querySelector('[data-fast="true"]')).toHaveTextContent('9.1')
+    fireEvent.click(document.querySelector('[data-fast="true"]')!)
+    expect(onSelect).toHaveBeenCalledExactlyOnceWith('grok-build-fast')
+  })
+
+  it('未知价格不制造倍率，跟随档只发送null，未选择时不修改默认', async () => {
+    const onSelectEffort = vi.fn()
+    render(<ModelSelector models={[
+      { id: 'grok-build', display_name: 'Grok 4.7' },
+      { id: 'grok-build-fast', display_name: 'Grok 4.7 Fast' },
+    ]} selectedId="grok-build" onSelect={() => {}}
+      effortSupported={['low', 'high']} effortActive={null} onSelectEffort={onSelectEffort} />)
+    openMenu(screen.getByRole('button', { name: '选择对话模型' }))
+    await screen.findAllByRole('menuitem')
+    expect(document.querySelector('[data-fast="true"]')?.textContent).toBe('Fast')
+    expect(document.querySelector('[data-effort="medium"]')).toBeNull()
+    expect(onSelectEffort).not.toHaveBeenCalled()
+    expect(screen.getByText('较低档偏重响应速度，较高档偏重复杂任务。')).toBeInTheDocument()
+    fireEvent.click(document.querySelector('[data-effort="follow"]')!)
+    expect(onSelectEffort).toHaveBeenCalledExactlyOnceWith(null)
+  })
+})
