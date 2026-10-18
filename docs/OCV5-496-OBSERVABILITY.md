@@ -53,3 +53,12 @@ without network or file log writes. It is a local microbenchmark, not production
 Direct TTFT reduction expected: **0 seconds**. This step closes observation gaps for later
 decisions. Risks: bounded parser/counter overhead and slightly more fixed metadata log rows;
 no conclusion about the historical 51–151-second upstream waits is implied.
+
+Local measurement (2026-10-18, shared v5-dev): 100 measured streams per mode after20 warmups,
+200 frames /113600 bytes per stream, passthrough p50 0.593ms vs
+observed 1.791ms (difference 1.198ms).
+Maxima 55.176/61.259ms include scheduler noise.
+100000 numeric write-counter calls took 156.992ms total; no actual sink IO.
+Missing-Content-Type regression was also ablated: restoring the old header condition fails
+the integrated delta assertion; restoring the new code passes all63 targeted tests.
+Dependent commercial/gateway/protocol TypeScript build passed; changed-file lint adds no errors.

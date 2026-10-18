@@ -802,7 +802,7 @@ describe('OCV5-496 relay timing integration', () => {
     ['POST', 'responses', '{"error":"PRIVATE_JSON"}', 503],
     ['GET', 'models', '{"models":["PRIVATE_MODEL"]}', 200],
   ] as const) {
-    test(method + ' ' + suffix + ' without Content-Type preserves bytes/status and records real boundaries', async () => {
+    test(`${method} ${suffix} without Content-Type preserves bytes/status and records real boundaries`, async () => {
       const records: Array<Record<string, unknown>> = []
       const logger = (await import('../logging/logger.js')).createLogger({
         out: line => records.push(JSON.parse(line) as Record<string, unknown>),
@@ -822,8 +822,8 @@ describe('OCV5-496 relay timing integration', () => {
       const server = createServer((req, res) => { void handler(req, res, CTX) })
       const port = await listen(server)
       try {
-        const response = await fetch('http://127.0.0.1:' + port + CODEX_RELAY_PREFIX + '/v1/' + suffix, {
-          method, headers: { authorization: 'Bearer ' + TOKEN,
+        const response = await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/v1/${suffix}`, {
+          method, headers: { authorization: `Bearer ${TOKEN}`,
             [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer test-fixture-only',
             'x-openclaude-relay-request-id': 'CLIENT_FAKE' },
           ...(method === 'POST' ? { body: '{"input":[]}' } : {}),
@@ -862,8 +862,8 @@ describe('OCV5-496 relay timing integration', () => {
     const server = createServer((req, res) => { void handler(req, res, CTX) })
     const port = await listen(server)
     try {
-      const response = await fetch('http://127.0.0.1:' + port + CODEX_RELAY_PREFIX + '/v1/models',
-        { headers: { authorization: 'Bearer ' + TOKEN, [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer fixture-only' } })
+      const response = await fetch(`http://127.0.0.1:${port}${CODEX_RELAY_PREFIX}/v1/models`,
+        { headers: { authorization: `Bearer ${TOKEN}`, [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer fixture-only' } })
       assert.equal(response.status, 502)
       await response.text()
       assert.ok(events.some(e => e.msg === 'codex_relay_timing' && e.stage === 'failed' && e.operation === 'models'))

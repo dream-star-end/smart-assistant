@@ -4,7 +4,7 @@ import { Transform, Writable, Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { codexResponseTiming } from '../../packages/commercial/src/http/codexRelayTiming.js'
 import { measureLogWrite, takeLogWriteTimingSnapshot } from '@openclaude/protocol'
-const frame = Buffer.from('data: ' + JSON.stringify({ type: 'response.output_text.delta', delta: 'x'.repeat(512) }) + '\n\n')
+const frame = Buffer.from(`data: ${JSON.stringify({ type: 'response.output_text.delta', delta: 'x'.repeat(512) })}\n\n`)
 const chunks = Array.from({ length: 200 }, () => frame)
 const samples = { passthrough: [] as number[], observed: [] as number[] }
 for (let round = 0; round < 120; round++) {
