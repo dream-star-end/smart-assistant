@@ -815,7 +815,7 @@ export function ModelSelector({
               onSelect={() => rememberAndSelect(GROK_BUILD_MODEL_ID)}
               className="justify-between"
             >
-              <span>标准</span>
+              <span className="flex items-center gap-2"><span>标准</span><CostMark model={models.find((model) => model.id === GROK_BUILD_MODEL_ID)} /></span>
               {!grokBuildFastSelected(selectedId) && (
                 <Check size={14} className="shrink-0 text-accent" />
               )}
@@ -826,7 +826,7 @@ export function ModelSelector({
               onSelect={() => rememberAndSelect(GROK_BUILD_FAST_MODEL_ID)}
               className="justify-between"
             >
-              <span>Fast</span>
+              <span className="flex items-center gap-2"><span>Fast</span><CostMark model={models.find((model) => model.id === GROK_BUILD_FAST_MODEL_ID)} /></span>
               {grokBuildFastSelected(selectedId) && (
                 <Check size={14} className="shrink-0 text-accent" />
               )}
@@ -955,6 +955,7 @@ export function ModelSelector({
                   : (EFFORT_OPTIONS.find((o) => o.value === effortActive)?.label ?? effortActive)}
               </PickerSectionSummary>
             </PickerLabel>
+            <p className="px-2.5 py-1 text-caption text-muted">较低档偏重响应速度，较高档偏重复杂任务。</p>
             <PickerItem
               mode={mode}
               data-effort="follow"
