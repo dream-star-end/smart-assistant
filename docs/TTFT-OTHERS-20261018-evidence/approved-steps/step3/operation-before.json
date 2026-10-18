@@ -1,0 +1,14 @@
+{
+  "at": "2026-10-18T11:43:22.240301+00:00",
+  "uid": 765,
+  "objects": [
+    {
+      "exists": false
+    },
+    {
+      "exists": false
+    }
+  ],
+  "canonical": "67d13462edea57d43e71aae2a97d51efddcff831",
+  "live": "/opt/openclaude/openclaude-v5-selfhost-releases/rel-67d13462e-20261018-091329"
+}

@@ -1,0 +1,2 @@
+{"event": "observer_started", "at": "2026-10-18T12:16:43.918644+00:00", "user_id": 765, "query_since": "2026-10-18T12:15:00Z", "duration_seconds": 180, "query_interval_seconds": 1, "association_rule": "Only nonterminal journal state; exact nonce cwd or recorded native cwd; prior committed requests excluded."}
+{"event": "observer_finished", "at": "2026-10-18T12:19:44.460922+00:00", "started_at": "2026-10-18T12:16:43.918644+00:00", "journal_request_count": 0, "matched_request_count": 0, "model_requests_sent": 0}

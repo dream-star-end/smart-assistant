@@ -1,0 +1,8 @@
+{
+  "at": "2026-10-18T13:30:12.371906+00:00",
+  "pid": 2168164,
+  "reason": "Stop reviewer-added unrelated full web-react run so required targeted tests/CLI proof can proceed. No web-react files in this user2054 increment. Not counted as pass.",
+  "cwd": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-501-ttft-step2/packages/web-react",
+  "command": "node /var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-501-ttft-step2/node_modules/.bin/vitest run ",
+  "signal": "SIGINT"
+}

@@ -1,0 +1,252 @@
+// Operational observer: real UI login/send, no socket interception or payload rewriting.
+import { readFileSync, writeFileSync } from 'node:fs';
+import { appendFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
+import { execFileSync } from 'node:child_process';
+const source='/opt/openclaude/openclaude-v5-selfhost';
+const { launchJourneyBrowser, selectJourneyModel } = await import(pathToFileURL(source+'/scripts/lib/journey-browser.mjs'));
+const { coldUiLogin, newSession, clickSend } = await import(pathToFileURL(source+'/scripts/lib/user-contract-browser.mjs'));
+const dir=process.argv[2];
+const base='http://127.0.0.1:18790';
+const validId=x=>typeof x==='string' && /^[A-Za-z0-9_:-]{1,120}$/.test(x) ? x : null;
+const validModelId=x=>typeof x==='string'&&/^[A-Za-z0-9._:-]{1,128}$/.test(x)?x:null;
+const parse=raw=>{try{return JSON.parse(typeof raw==='string'?raw:raw.toString())}catch{return null}};
+const now=()=>Date.now();
+let writes=Promise.resolve(),writeFailure=null;
+const save=(name,x)=>{const data=JSON.stringify(x)+'\n';writes=writes.then(()=>appendFile(dir+'/'+name,data,{mode:0o600})).catch(error=>{writeFailure=error.name;process.exitCode=1})};
+const mode=process.argv[3]??'warm';
+if(!/^others-[abcd]$/.test(mode))throw new Error('invalid_mode');
+const fullPlan=JSON.parse(readFileSync(dir+'/plan-'+mode+'.json','utf8'));
+const plan=fullPlan;
+if(readFileSync(dir+'/browser-events.jsonl','utf8').trim().split('\n').filter(Boolean).map(JSON.parse).filter(x=>x.event==='sent').length+plan.reduce((a,x)=>a+x[2],0)>28)throw new Error('budget_exceeded');
+const prompts=['你好，简单介绍一下你能帮我做什么。','我今天想把工作安排得轻松一点，你有什么建议？',
+  '可以只保留最重要的三点吗？','好的，谢谢。再给我一句提醒吧。'];
+let initialContainerRunning=null;
+let phase='setup',active=null,browser,wsCounter=0,httpCounter=0;
+const sent=[];const paints=[];const sendsById=new Map();
+const httpStarts=new WeakMap();const metadataReads=[];
+const until=(f,ms,label)=>new Promise((resolve,reject)=>{
+  const started=now();const tick=()=>{const value=f();if(value)return resolve(value);
+    if(now()-started>ms)return reject(new Error(label));setTimeout(tick,100)};tick();
+});
+try {
+  const sql="BEGIN READ ONLY; SELECT json_build_object('role',(SELECT role FROM users WHERE id=765),'containers',(SELECT coalesce(json_agg(s),'[]'::json) FROM (SELECT id,state,docker_name,docker_id,container_internal_id FROM agent_containers WHERE user_id=765 AND (state='active' OR id IN (SELECT id FROM agent_containers WHERE user_id=765 ORDER BY id DESC LIMIT 10)) ORDER BY id DESC)s)); COMMIT;";
+  const raw=execFileSync('sudo',['-u','postgres','psql','-X','-A','-t','-d','openclaude_v5_selfhost','-c',sql],{encoding:'utf8'});
+  const snapshot=JSON.parse(raw.split('\n').filter(line=>line.trim()&&!['BEGIN','COMMIT'].includes(line.trim())).join('\n'));
+  save('browser-preconditions.jsonl',{at:now(),mode,...snapshot});
+  if(snapshot.role!=='user')throw new Error('not_ordinary_account');
+  if(mode==='cold-sol'&&snapshot.containers.some(x=>x.state!=='vanished'))throw new Error('container_not_reclaimed');
+  if(mode==='cold-sol'){
+    const checked=[];
+    for(const c of snapshot.containers){
+      const id=c.container_internal_id??c.docker_id??c.docker_name;
+      if(typeof id!=='string'||!(/^[0-9a-f]{12,64}$/.test(id)||/^oc-v5-u765(?:-[A-Za-z0-9_-]+)?$/.test(id)))throw new Error('cold_container_id_unverifiable');
+      try{
+        const running=execFileSync('docker',['inspect','--format','{{json .State.Running}}',id],{encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim()==='true';
+        checked.push({container_db_id:c.id,container_id:id,exists:true,running});
+        if(running)throw new Error('cold_old_container_still_running');
+      }catch(e){
+        if(e.message==='cold_old_container_still_running')throw e;
+        if(!/No such (object|container)/i.test(String(e.stderr??'')))throw new Error('cold_docker_inspection_failed');
+        checked.push({container_db_id:c.id,container_id:id,exists:false,running:false});
+      }
+    }
+    save('browser-preconditions.jsonl',{at:now(),mode,cold_docker_checks:checked});
+  }
+  if(mode!=='cold-sol'){
+    const activeContainers=snapshot.containers.filter(x=>x.state==='active');
+    let running=false;
+    for(const c of activeContainers){
+      const id=c.container_internal_id??c.docker_id??c.docker_name;
+      if(typeof id!=='string'||!(/^[0-9a-f]{12,64}$/.test(id)||/^oc-v5-u765(?:-[A-Za-z0-9_-]+)?$/.test(id)))continue;
+      try{if(execFileSync('docker',['inspect','--format','{{json .State.Running}}',id],{encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim()==='true')running=true}catch{}
+    }
+    save('browser-preconditions.jsonl',{at:now(),mode,active_container_count:activeContainers.length,docker_running:running});
+    initialContainerRunning=running;
+    if(!running)throw new Error('container_not_warm');
+  }
+  browser=await launchJourneyBrowser();
+  const context=await browser.newContext({viewport:{width:1366,height:900}});
+  const page=await context.newPage();
+  await page.exposeFunction('ttftDomMark',mark=>{
+    const row=sent.find(x=>x.clientMessageId===mark.clientMessageId);
+    if(!row||row.dom_first_text)return;
+    row.dom_first_text=mark;save('browser-events.jsonl',{event:'dom_first_text',traceId:row.traceId,sessionId:row.sessionId,...mark});
+  });
+  await page.addInitScript(()=>{
+    let active=null,scheduled=false,done=false,baseline=new WeakSet();
+    const visible=e=>{const r=e.getBoundingClientRect(),c=getComputedStyle(e);return e.isConnected&&e.getClientRects().length&&c.visibility!=='hidden'&&r.width>0&&r.height>0&&r.bottom>0&&r.top<innerHeight&&r.right>0&&r.left<innerWidth};
+    const scan=()=>{
+      scheduled=false;if(!active||done)return;
+      const processRow=[...document.querySelectorAll('[data-chat-virtual-key]')].find(e=>e.getAttribute('data-chat-virtual-key')==='process:'+active);
+      const node=processRow?.querySelector('[data-testid="process-stage"] .prose'),kind='process';
+      if(!node||!node.textContent?.trim()||!visible(node))return;
+      const scope=active,candidateAt=Date.now();
+      requestAnimationFrame(()=>requestAnimationFrame(()=>{
+        if(done||active!==scope||!node.textContent?.trim()||!visible(node))return;
+        done=true;const r=node.getBoundingClientRect();
+        window.ttftDomMark({clientMessageId:scope,at:Date.now(),candidate_at:candidateAt,performance_epoch_ms:performance.timeOrigin+performance.now(),kind,
+          virtual_key:node.closest('[data-chat-virtual-key]')?.getAttribute('data-chat-virtual-key')??null,
+          member_key:node.closest('[data-find-member]')?.getAttribute('data-find-member')??null,
+          char_count:node.textContent.trim().length,rect:{x:r.x,y:r.y,width:r.width,height:r.height}});
+      }));
+    };
+    window.__ttftArm=cmid=>{active=cmid;done=false;baseline=new WeakSet(document.querySelectorAll('[data-testid="assistant-row"] .prose'));if(!scheduled){scheduled=true;requestAnimationFrame(scan)}};
+    new MutationObserver(()=>{if(active&&!done&&!scheduled){scheduled=true;requestAnimationFrame(scan)}}).observe(document,{subtree:true,childList:true,characterData:true,attributes:true});
+  });
+  page.on('websocket',ws=>{
+    const ws_id=mode+'-'+(++wsCounter);save('browser-lifecycle.jsonl',{event:'ws_created',ws_id,at:now(),mode});
+    ws.on('close',()=>save('browser-lifecycle.jsonl',{event:'ws_closed',ws_id,at:now(),mode}));
+    ws.on('framesent',event=>{
+      const f=parse(event.payload);if(f?.type==='inbound.hello')save('browser-lifecycle.jsonl',{event:'inbound.hello',ws_id,at:now(),mode});if(f?.type!=='inbound.message')return;
+      const key=String(f.peer?.id)+'|'+String(f.clientMessageId);
+      const prior=sendsById.get(key);if(prior){prior.send_attempts++;if(!prior.ws_ids.includes(ws_id))prior.ws_ids.push(ws_id);save('browser-events.jsonl',{event:'resend',clientMessageId:prior.clientMessageId,attempt:prior.send_attempts,ws_id,at:now()});return;}
+      const row={ws_id,ws_ids:[ws_id],label:active?.label??null,round:active?.round??null,started_at:new Date().toISOString(),
+        model:active?.model??null,wire_model:validModelId(f.model),click_send_started_at:active?.click_send_started_at??null,payload_ts:typeof f.ts==='number'?f.ts:null,ws_sent_at:now(),
+        clientMessageId:validId(f.clientMessageId),sessionId:validId(f.peer?.id),traceId:null,
+        conversationMode:validId(f.conversationMode),collabMode:validId(f.collabMode),
+        effortLevel_present:Object.hasOwn(f,'effortLevel'),
+        effortLevel:f.effortLevel===null?null:validId(f.effortLevel),
+        input_strategy:active?.input_strategy??null,new_clicked_at:active?.new_clicked_at??null,
+        new_finished_at:active?.new_finished_at??null,model_selected_at:active?.model_selected_at??null,
+        compose_started_at:active?.compose_started_at??null,typing_finished_at:active?.typing_finished_at??null,
+        planned_read_ms:active?.planned_read_ms??0,planned_char_delay_ms:active?.planned_char_delay_ms??0,first_reasoning_at:null,first_text_at:null,final_at:null,error_code:null};
+      row.send_attempts=1;sendsById.set(key,row);
+      sent.push(row);save('browser-events.jsonl',{event:'sent',...row});metadataReads.push(page.evaluate(id=>window.__ttftArm?.(id),row.clientMessageId).catch(()=>{}));
+    });
+    ws.on('framereceived',event=>{
+      const f=parse(event.payload);if(!f)return;
+      if(['sys.cold_start','sys.relay_ready','relay_ready','relay.ready','hello','hello.ack'].includes(f.type))save('browser-lifecycle.jsonl',{event:f.type,ws_id,at:now(),mode});
+      const trace=typeof f.traceId==='string'&&/^[0-9a-f]{32}$/.test(f.traceId)?f.traceId:null;
+      const row=[...sent].reverse().find(x=>x.sessionId===f.peer?.id &&
+        (f.clientMessageId?x.clientMessageId===f.clientMessageId:trace&&x.traceId===trace));
+      if(!row || (row.traceId&&trace&&row.traceId!==trace))return;
+      if(!row.traceId&&trace&&f.clientMessageId===row.clientMessageId)row.traceId=trace;
+      if(f.type==='outbound.message'){
+        for(const [kind,key] of [['thinking','first_reasoning_at'],['text','first_text_at']]) {
+          if(!row[key]&&Array.isArray(f.blocks)&&f.blocks.some(b=>b?.kind===kind&&typeof b.text==='string'&&b.text.trim())){
+            row[key]=now();if(kind==='text')row.first_text_message_id=validId(f.blocks.find(b=>b?.kind==='text'&&typeof b.text==='string'&&b.text.trim())?.messageId);save('browser-events.jsonl',{event:key,clientMessageId:row.clientMessageId,traceId:row.traceId,at:row[key]});
+          }
+        }
+        if(f.isFinal===true){row.final_at=now();save('browser-events.jsonl',{event:'final',clientMessageId:row.clientMessageId,traceId:row.traceId,at:row.final_at});}
+      }
+      if(['outbound.error','outbound.turn_error','error'].includes(f.type)||f.error){
+        row.error_code=validId(f.error?.code??f.code)??'unspecified';row.final_at=now();
+      }
+    });
+  });
+  context.on('request',request=>{
+    if(new URL(request.url()).pathname!=='/api/client-errors')return;
+    let f;try{f=request.postDataJSON()}catch{return}
+    if(!/^FIRST_TEXT_PAINT(?:_AFTER_BACKGROUND)?$/.test(f?.code??''))return;
+    const p={event:'paint',at:now(),code:f.code,traceId:validId(f.trace_id),sessionId:validId(f.session_id),latency_ms:f.latency_ms};
+    paints.push(p);save('browser-events.jsonl',p);
+  });
+  context.on('request',request=>{
+    const path=new URL(request.url()).pathname;
+    const sessionMatch=path.match(/^\/api\/sessions\/([A-Za-z0-9_:-]{1,120})$/);
+    const endpoint=sessionMatch?'/api/sessions/:id':path;
+    if(!['/api/agent/prepare','/api/public/models','/api/models','/api/agent/models','/api/sessions/:id'].includes(endpoint))return;
+    let draft_hint=null;
+    if(endpoint==='/api/agent/prepare'&&request.method()==='POST'){
+      let body;try{body=request.postDataJSON()}catch{}
+      if(body&&typeof body==='object'&&validId(body.sessionId)){
+        draft_hint={viewId:validId(body.viewId),revision:Number.isSafeInteger(body.revision)?body.revision:null,
+          sessionId:validId(body.sessionId),agentId:validId(body.agentId),modelId:validModelId(body.modelId),
+          effortLevel_present:Object.hasOwn(body,'effortLevel'),
+          effortLevel:body.effortLevel===null?null:validId(body.effortLevel),cancel:body.cancel===true};
+      }
+    }
+    const started_at=now();const metadata={http_id:mode+'-h'+(++httpCounter),endpoint,started_at,
+      method:request.method(),sessionId:sessionMatch?.[1]??draft_hint?.sessionId??null,
+      ...(endpoint==='/api/agent/prepare'?{prepare_kind:draft_hint?'draft':'container',draft_hint}:{} )};
+    httpStarts.set(request,metadata);
+    save('browser-http-timing.jsonl',{event:'request',...metadata,mode});
+  });
+  context.on('response',response=>{
+    const r=httpStarts.get(response.request());if(!r)return;
+    save('browser-http-timing.jsonl',{event:'response_headers',...r,at:now(),elapsed_ms:now()-r.started_at,status:response.status(),mode});
+    if(r.endpoint==='/api/agent/prepare'){
+      metadataReads.push(Promise.race([
+        response.json().then(body=>{save('browser-http-timing.jsonl',{event:'prepare_ack',...r,at:now(),status:response.status(),accepted:typeof body?.accepted==='boolean'?body.accepted:null,mode});}).catch(()=>{}),
+        new Promise(resolve=>setTimeout(resolve,1000))
+      ]));
+    }
+  });
+  context.on('requestfinished',request=>{
+    const r=httpStarts.get(request);if(!r)return;
+    save('browser-http-timing.jsonl',{event:'request_finished',...r,at:now(),elapsed_ms:now()-r.started_at,mode});
+  });
+  context.on('requestfailed',request=>{
+    const r=httpStarts.get(request);if(!r)return;
+    save('browser-http-timing.jsonl',{event:'request_failed',...r,at:now(),elapsed_ms:now()-r.started_at,mode});
+  });
+  phase='ui_login';save('browser-lifecycle.jsonl',{event:'ui_login_started',at:now(),mode});
+  const password=readFileSync('/etc/openclaude/selfhost-canary.password','utf8').trim();
+  await coldUiLogin(page,{base,email:'v5-selfhost-canary@claudeai.chat'},password);
+  save('browser-lifecycle.jsonl',{event:'ui_login_finished',at:now(),mode});
+  for(const [label,model,rounds,inputStrategy] of plan){
+    phase=label;
+    const newClickedAt=now();
+    phase=label+'_new_session';await newSession(page);
+    const newFinishedAt=now();
+    save('browser-lifecycle.jsonl',{event:'new_session',label,model,at:newClickedAt,finished_at:newFinishedAt,input_strategy:inputStrategy,mode});
+    phase=label+'_select_model';
+    if(model==='k3-256k'){
+      await page.getByRole('button',{name:'选择对话模型'}).click();await page.getByRole('menu').waitFor({state:'visible'});
+      await page.locator('[data-model-id="k3-256k"], [data-model-id="kimi-k3"]').first().click();await page.getByRole('menu').waitFor({state:'hidden'});
+      await page.getByRole('button',{name:'选择对话模型'}).click();await page.getByRole('menu').waitFor({state:'visible'});
+      await page.locator('[data-context="standard"]').click();await page.getByRole('menu').waitFor({state:'hidden'});
+    }else if(model==='kimi-k3'||model==='grok-build-fast'){
+      await selectJourneyModel(page,model==='kimi-k3'?'k3-256k':'grok-build');
+      await page.getByRole('button',{name:'选择对话模型'}).click();await page.getByRole('menu').waitFor({state:'visible'});
+      await page.locator(model==='kimi-k3'?'[data-context="1m"]':'[data-fast="true"]').click();
+      if(model==='kimi-k3'){const confirm=page.getByRole('button',{name:'仍要切换',exact:true});await confirm.waitFor({state:'visible',timeout:10000});await confirm.click();}
+      await page.getByRole('menu').waitFor({state:'hidden'});
+    }else await selectJourneyModel(page,model);
+    const modelSelectedAt=now();
+    for(let round=1;round<=rounds;round++){
+      phase=label+'_round_'+round;
+      active={label,round,model,input_strategy:round===1?inputStrategy:'followup',
+        new_clicked_at:newClickedAt,new_finished_at:newFinishedAt,model_selected_at:modelSelectedAt,
+        planned_read_ms:round===1&&inputStrategy==='natural'?2000:0,
+        planned_char_delay_ms:round===1&&inputStrategy==='natural'?90:0};
+      const before=sent.length;
+      const rowsBefore=await page.getByTestId('assistant-row').count();
+      active.compose_started_at=now();
+      if(round===1&&inputStrategy==='natural'){
+        await page.waitForTimeout(2000);
+        await page.locator('textarea').first().pressSequentially(prompts[round-1],{delay:90});
+      }else await page.locator('textarea').first().fill(prompts[round-1]);
+      active.typing_finished_at=now();
+      const paidBoundary=execFileSync('sudo',['-u','postgres','psql','-XqAt','-d','openclaude_v5_selfhost','-c',"BEGIN READ ONLY; SELECT count(*) FROM request_finalize_journal WHERE user_id=765 AND created_at>='"+readFileSync(dir+'/release-since.txt','utf8').trim()+"'; COMMIT;"],{encoding:'utf8'}).trim();
+      if(Number(paidBoundary)>=28||sent.length>=28)throw new Error('budget_boundary_reached');
+      active.click_send_started_at=now();
+      await clickSend(page,()=>{});
+      const row=await until(()=>sent.slice(before).find(x=>x.label===label&&x.round===round),30000,'send_timeout');
+      if(row.wire_model&&row.wire_model!==model)throw new Error('wrong_model');
+      await until(()=>row.final_at,600000,'turn_timeout');
+      if(row.error_code){
+        row.ui_settled_at=now();row.container_scenario=round===1?'warm-container-new-conversation':'same-conversation-followup';
+        save('browser-turns.jsonl',row);console.log(JSON.stringify({label,round,traceId:row.traceId,error_code:row.error_code}));break;
+      }
+      await until(()=>paints.find(p=>p.traceId===row.traceId&&p.sessionId===row.sessionId),2000,'paint_timeout').catch(e=>{if(e.message!=='paint_timeout')throw e;row.paint_missing=true;});
+      await page.waitForFunction(before=>{
+        const rows=document.querySelectorAll('[data-testid=\"assistant-row\"]');
+        const last=rows[rows.length-1];return rows.length>before&&last&&!last.querySelector('.caret-blink')&&
+          !!document.querySelector('button[aria-label=\"发送\"]')&&!!last.querySelector('.prose')?.textContent?.trim();
+      },rowsBefore,{timeout:60000,polling:50});
+      if(!Number.isFinite(row.payload_ts)||!Number.isFinite(row.first_text_at)||row.first_text_at<row.payload_ts)throw new Error('invalid_timing');
+      if(await page.locator('[data-testid=\"assistant-row\"] [role=\"alert\"]').count())throw new Error('failure_card');
+      row.ui_settled_at=now();
+      row.container_scenario=round===1?'warm-container-new-conversation':'same-conversation-followup';
+      row.paint=paints.find(p=>p.traceId===row.traceId&&p.sessionId===row.sessionId)??null;
+      save('browser-turns.jsonl',row);
+      console.log(JSON.stringify({label,round,traceId:row.traceId,first_text_ms:row.first_text_at-row.payload_ts,paint_ms:row.paint?.latency_ms}));
+    }
+  }
+  writeFileSync(dir+'/browser-complete-'+mode+'.json',JSON.stringify({completed_at:new Date().toISOString(),turns:sent.length,plan})+'\n',{mode:0o600});
+}catch(error){
+  save('browser-failure.jsonl',{failed_at:new Date().toISOString(),phase,error_name:error.name,
+    safe_error_code:typeof error.message==='string'&&/^[a-z_]+$/.test(error.message)?error.message:error.message?.includes('strict mode violation')?'selector_not_unique':/Timeout|timeout/.test(error.message??'')?'observer_timeout':null,sent:sent.length,completed:sent.filter(x=>x.final_at).length});process.exitCode=1;
+}finally{save('browser-observed-turns-'+mode+'.jsonl',{at:now(),phase,turns:sent});await Promise.allSettled(metadataReads);await browser?.close();await writes;if(writeFailure)process.exitCode=1}

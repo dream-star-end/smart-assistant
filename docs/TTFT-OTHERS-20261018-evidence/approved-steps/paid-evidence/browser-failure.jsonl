@@ -1,0 +1,8 @@
+{"failed_at":"2026-10-18T11:50:26.124Z","phase":"box-restored-base_round_1","error_name":"Error","safe_error_code":"send_timeout","sent":0,"completed":0}
+{"failed_at":"2026-10-18T11:58:07.539Z","phase":"ui_login","error_name":"Error","safe_error_code":null,"sent":0,"completed":0}
+{"failed_at":"2026-10-18T12:18:44.501Z","phase":"box-step1-frontend_round_1","error_name":"Error","safe_error_code":"send_timeout","sent":0,"completed":0}
+{"failed_at":"2026-10-18T12:22:12.038Z","phase":"candidate-ws-preflight_select_model","error_name":"Error","safe_error_code":"candidate_websocket_missing","sent":0,"completed":0}
+{"failed_at":"2026-10-18T12:24:45.061Z","phase":"ui_login","error_name":"Error","safe_error_code":null,"sent":0,"completed":0}
+{"failed_at":"2026-10-18T12:28:03.921Z","phase":"candidate-ws-preflight_select_model","error_name":"Error","safe_error_code":"candidate_websocket_missing","sent":0,"completed":0}
+{"failed_at":"2026-10-18T12:29:22.875Z","phase":"candidate-ws-preflight_select_model","error_name":"Error","safe_error_code":"candidate_websocket_missing","sent":0,"completed":0}
+{"failed_at":"2026-10-18T12:29:55.653Z","phase":"candidate-ws-preflight_select_model","error_name":"Error","safe_error_code":"candidate_websocket_missing","sent":0,"completed":0}

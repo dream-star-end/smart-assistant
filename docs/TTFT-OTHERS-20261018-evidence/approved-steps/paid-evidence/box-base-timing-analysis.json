@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-10-18T12:24:54.707128+00:00",
+  "user_id": 765,
+  "model": "box-claude-haiku-5-5",
+  "scope": "Read-only analysis of two already-completed live baseline turns; no new supplier calls, no env/key reads, no runtime/config/code changes.",
+  "source_commit": "67d13462edea57d43e71aae2a97d51efddcff831",
+  "rows": [
+    {
+      "round": 1,
+      "request_id": "9fb1b32237ebf9ea4690f7dc119716ed",
+      "trace_id": "caaa64f434d2c4ff414b74b83284ccce",
+      "dispatch_id": "1839a58d-c156-4053-94c3-cbe2e82e6cd5",
+      "runtime_container_id": 1063,
+      "live_control_plane_commit": "67d13462e",
+      "live_runtime_source_commit": "67d13462edea57d43e71aae2a97d51efddcff831",
+      "browser": {
+        "first_text_ms": 27279,
+        "paint_probe_ms": 27746
+      },
+      "server_first_text_frame_ms": 26768,
+      "runtime_total_ms": 35804,
+      "runtime_tool_calls": 0,
+      "common_monotonic_segments_ms": {
+        "gateway_to_submit_ms": 470.69,
+        "submit_to_lock_acquired_ms": 23.222,
+        "lock_to_memory_barrier_ms": 104.529,
+        "memory_barrier_to_context_ready_ms": 191.559,
+        "submit_to_context_ready_ms": 319.31
+      },
+      "pipeline_log_anchors": [
+        {
+          "at": "2026-10-18T11:54:20.713Z",
+          "stage": "gateway_to_submit",
+          "elapsed_ms": 470.69033399998443
+        },
+        {
+          "at": "2026-10-18T11:54:20.739Z",
+          "stage": "submit_lock_acquired",
+          "elapsed_ms": 23.221735999977682
+        },
+        {
+          "at": "2026-10-18T11:54:20.843Z",
+          "stage": "memory_barrier_acquired",
+          "elapsed_ms": 127.75049899998703
+        },
+        {
+          "at": "2026-10-18T11:54:21.035Z",
+          "stage": "context_ready",
+          "elapsed_ms": 319.30990199997905
+        }
+      ],
+      "master_turn_start_log_at": "2026-10-18T11:54:19.851Z",
+      "gate_entry_sample_at_ms": 1792324475033,
+      "journal_created_at": "2026-10-18T19:54:35.747346+08:00",
+      "native_decision": {
+        "at": "2026-10-18T11:54:39.949Z",
+        "decision": "miss",
+        "reason_code": "no_candidate"
+      },
+      "native_cli_first_seen_upper_bound": {
+        "observed_at": "2026-10-18T11:54:44.234564+00:00",
+        "pid": 295032
+      },
+      "terminal_cli_pid": 295027,
+      "first_visible_database_write_at": "2026-10-18T19:54:46.615047+08:00",
+      "anchored_wall_intervals_ms": {
+        "master_turn_start_log_to_context_ready": 1184.0,
+        "context_ready_to_gate_entry_sample": 13998.0,
+        "gate_entry_sample_to_journal_created": 714.346,
+        "context_ready_to_journal_created": 14712.346,
+        "journal_created_to_native_decision": 4201.654,
+        "native_decision_to_first_visible_db_write": 6666.047,
+        "journal_created_to_first_visible_db_write": 10867.701
+      },
+      "upstream_performance": {
+        "request_id": "9fb1b32237ebf9ea4690f7dc119716ed",
+        "dispatch_id": "1839a58d-c156-4053-94c3-cbe2e82e6cd5",
+        "ttft_ms": 9373,
+        "stream_ms": 20065,
+        "outcome": "success",
+        "observed_at": "2026-10-18T19:54:55.838746+08:00",
+        "control_plane_commit": "67d13462e"
+      },
+      "same_browser_clock_text_to_paint_probe_ms": 467,
+      "browser_minus_server_latency_ms_non_network_pure": 511
+    },
+    {
+      "round": 2,
+      "request_id": "7bc938f2bcaee6111ae5a16d5bcff621",
+      "trace_id": "aa9c576e088257c59e76fe9e8e79c923",
+      "dispatch_id": "700dff14-4941-4a28-8e1c-6f06385a7734",
+      "runtime_container_id": 1063,
+      "live_control_plane_commit": "67d13462e",
+      "live_runtime_source_commit": "67d13462edea57d43e71aae2a97d51efddcff831",
+      "browser": {
+        "first_text_ms": 13243,
+        "paint_probe_ms": 13334
+      },
+      "server_first_text_frame_ms": 12990,
+      "runtime_total_ms": 21593,
+      "runtime_tool_calls": 0,
+      "common_monotonic_segments_ms": {
+        "gateway_to_submit_ms": 290.264,
+        "submit_to_lock_acquired_ms": 129.78,
+        "lock_to_memory_barrier_ms": 64.492,
+        "memory_barrier_to_context_ready_ms": 97.157,
+        "submit_to_context_ready_ms": 291.43
+      },
+      "pipeline_log_anchors": [
+        {
+          "at": "2026-10-18T11:55:00.626Z",
+          "stage": "gateway_to_submit",
+          "elapsed_ms": 290.26350800000364
+        },
+        {
+          "at": "2026-10-18T11:55:00.756Z",
+          "stage": "submit_lock_acquired",
+          "elapsed_ms": 129.7803000000422
+        },
+        {
+          "at": "2026-10-18T11:55:00.821Z",
+          "stage": "memory_barrier_acquired",
+          "elapsed_ms": 194.27227100002347
+        },
+        {
+          "at": "2026-10-18T11:55:00.918Z",
+          "stage": "context_ready",
+          "elapsed_ms": 291.4296570000006
+        }
+      ],
+      "master_turn_start_log_at": "2026-10-18T11:55:00.024Z",
+      "gate_entry_sample_at_ms": 1792324501027,
+      "journal_created_at": "2026-10-18T19:55:01.178759+08:00",
+      "native_decision": {
+        "at": "2026-10-18T11:55:03.457Z",
+        "decision": "resume",
+        "reason_code": "ok"
+      },
+      "native_cli_first_seen_upper_bound": {
+        "observed_at": "2026-10-18T11:55:09.267417+00:00",
+        "pid": 295706
+      },
+      "terminal_cli_pid": 295701,
+      "first_visible_database_write_at": "2026-10-18T19:55:13.014481+08:00",
+      "anchored_wall_intervals_ms": {
+        "master_turn_start_log_to_context_ready": 894.0,
+        "context_ready_to_gate_entry_sample": 109.0,
+        "gate_entry_sample_to_journal_created": 151.759,
+        "context_ready_to_journal_created": 260.759,
+        "journal_created_to_native_decision": 2278.241,
+        "native_decision_to_first_visible_db_write": 9557.481,
+        "journal_created_to_first_visible_db_write": 11835.722
+      },
+      "upstream_performance": {
+        "request_id": "7bc938f2bcaee6111ae5a16d5bcff621",
+        "dispatch_id": "700dff14-4941-4a28-8e1c-6f06385a7734",
+        "ttft_ms": 8069,
+        "stream_ms": 21031,
+        "outcome": "success",
+        "observed_at": "2026-10-18T19:55:22.261108+08:00",
+        "control_plane_commit": "67d13462e"
+      },
+      "same_browser_clock_text_to_paint_probe_ms": 91,
+      "browser_minus_server_latency_ms_non_network_pure": 253
+    }
+  ],
+  "sources": {
+    "browser": "paid-evidence/box-base-r2.log exact trace IDs; first_text_ms and paint_ms only",
+    "pipeline": "docker logs oc-v5-u765, 2026-10-18T11:54:10Z..11:55:35Z, exact trace IDs and four existing turn_pipeline_timing stage fields only",
+    "master": "/var/log/openclaude-v5-selfhost.log exact trace IDs and inbound-turn-start timestamp only",
+    "native_decision": "/var/log/openclaude-v5-selfhost-egress.log exact request IDs; box_native_decision timestamp and allowlisted enums only",
+    "database": "openclaude_v5_selfhost local postgres read-only SELECT; exact user_id and request/trace IDs; selected numeric/timestamp/ID fields only",
+    "process_first_seen": "paid-evidence/billing-agent-box-profile-observer-r2.jsonl filtered against audited request-to-pid mapping; observation is not spawn time",
+    "gate_timestamp_semantics": "live modelAuthorityGate.ts captures now at enforceModelAuthority entry and stores a.now as turnLeaseVerifiedAtMs after successful verification (lines365,652)",
+    "tup_semantics": "live http/proxy/core.ts:289,552-567; fetchStart to first nonempty SSE byte; Box injected fetch includes resolver/native decision/staging/launch. observed_at is async SQL NOW in ws/turnPerformance.ts:311",
+    "first_visible_semantics": "ws/turnPerformance.ts:250-255 records asynchronous SQL NOW, not the actual first-text frame timestamp"
+  },
+  "interpretation": {
+    "dominant_observed_cold_vs_followup_change": "context_ready to journal-created drops from 14.712346s to 0.260759s; the pre-authority-gate portion is 13.998s vs0.109s. This is a composite before-gate interval, not a proven CLI-only or provider-only duration.",
+    "native_reuse": "First request native miss/no_candidate; second native resume/ok. Audited native session reused while per-round terminal CLI pids differ; this proves transcript/native-session reuse, not one resident CLI process.",
+    "browser_latency_drop_ms": 14036,
+    "server_latency_drop_ms": 13778
+  },
+  "limitations": [
+    "No unpublished Step1 timing code was treated as live. Existing common stage logs have only the four trace-linked stages above.",
+    "The pre-authority-gate interval combines local prompt/MCP/CLI preparation, request emission/transport and early proxy identity/body handling; exact individual durations are unavailable.",
+    "The post-gate/pre-journal interval combines fenced auth/catalog, pricing, precheck, upstream preparation, dispatch lookup and journal admission; no individual live stage times exist.",
+    "Box native-decision to first text combines remaining native preflight/admission, remote staging/launch, native CLI/provider generation, polling/decoding and delivery; these cannot be separated from existing exact-ID logs.",
+    "TUP first byte is not first text and, for Box, is not pure supplier-network TTFT. Do not add its duration as a non-overlapping phase to the anchored wall intervals.",
+    "TUP observed_at is asynchronous DB insert time; observed_at minus stream_ms is not used to invent fetch-start or first-text timestamps.",
+    "first_visible_at is an asynchronous DB write anchor and may include DB scheduling/retry delay. Wall intervals ending there are approximate persistence-boundary intervals, not exact server first-text execution phases.",
+    "Browser and server latency differences include differing starts plus transport/scheduling and are not isolated network latency. Paint is the existing baseline probe, not an independent physical-paint proof.",
+    "Native transcript row timestamps occur after already-observed streaming text and are not used as first-text boundaries.",
+    "Process observer timestamps prove a process existed by that observation, not its exact spawn/ready time.",
+    "Two turns have different histories/output lengths and are not a controlled causal performance experiment."
+  ]
+}

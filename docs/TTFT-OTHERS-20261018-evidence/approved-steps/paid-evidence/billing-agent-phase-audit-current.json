@@ -1,0 +1,557 @@
+{
+  "since": "2026-10-18T11:43:00Z",
+  "usage": [
+    {
+      "id": 24963,
+      "model": "box-claude-haiku-5-5",
+      "price": {
+        "multiplier": "1.000",
+        "input_per_mtok": "100",
+        "output_per_mtok": "500",
+        "cache_read_per_mtok": "10",
+        "cache_write_per_mtok": "125"
+      },
+      "status": "success",
+      "ledger_id": 23116,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T11:54:55.846109+00:00",
+      "request_id": "9fb1b32237ebf9ea4690f7dc119716ed",
+      "dispatch_id": "1839a58d-c156-4053-94c3-cbe2e82e6cd5",
+      "cost_credits": 7,
+      "input_tokens": 2,
+      "output_tokens": 453,
+      "authority_kind": "bridge_signed",
+      "security_epoch": 200,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 47741,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502"
+    },
+    {
+      "id": 24964,
+      "model": "box-claude-haiku-5-5",
+      "price": {
+        "multiplier": "1.000",
+        "input_per_mtok": "100",
+        "output_per_mtok": "500",
+        "cache_read_per_mtok": "10",
+        "cache_write_per_mtok": "125"
+      },
+      "status": "success",
+      "ledger_id": 23117,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T11:55:22.264604+00:00",
+      "request_id": "7bc938f2bcaee6111ae5a16d5bcff621",
+      "dispatch_id": "700dff14-4941-4a28-8e1c-6f06385a7734",
+      "cost_credits": 1,
+      "input_tokens": 4,
+      "output_tokens": 819,
+      "authority_kind": "bridge_signed",
+      "security_epoch": 200,
+      "cache_read_tokens": 47725,
+      "cache_write_tokens": 493,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502"
+    },
+    {
+      "id": 24965,
+      "model": "grok-build",
+      "price": {
+        "multiplier": "2.000",
+        "input_per_mtok": "250",
+        "output_per_mtok": "1500",
+        "cache_read_per_mtok": "25",
+        "cache_write_per_mtok": "0"
+      },
+      "status": "success",
+      "ledger_id": 23118,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T12:01:35.745198+00:00",
+      "request_id": "cf33dfdbe6aadb349f611556a9b39a64",
+      "dispatch_id": "8c3c2ef4-a1a6-45e1-a700-2d59ab136d61",
+      "cost_credits": 14,
+      "input_tokens": 21383,
+      "output_tokens": 791,
+      "authority_kind": "bridge_signed",
+      "security_epoch": 200,
+      "cache_read_tokens": 1152,
+      "cache_write_tokens": 0,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502"
+    },
+    {
+      "id": 24966,
+      "model": "deepseek-v4-flash",
+      "price": {
+        "multiplier": "1.000",
+        "input_per_mtok": "112",
+        "output_per_mtok": "337",
+        "cache_read_per_mtok": "3",
+        "cache_write_per_mtok": "0"
+      },
+      "status": "success",
+      "ledger_id": 23119,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:47.837545+00:00",
+      "request_id": "ttft-g500-warmup-base-148ebbce1b554c1c82b9",
+      "dispatch_id": null,
+      "cost_credits": 2,
+      "input_tokens": 12672,
+      "output_tokens": 2,
+      "authority_kind": "local_catalog",
+      "security_epoch": 200,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502"
+    },
+    {
+      "id": 24967,
+      "model": "deepseek-v4-flash",
+      "price": {
+        "multiplier": "1.000",
+        "input_per_mtok": "112",
+        "output_per_mtok": "337",
+        "cache_read_per_mtok": "3",
+        "cache_write_per_mtok": "0"
+      },
+      "status": "success",
+      "ledger_id": 23120,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:50.178566+00:00",
+      "request_id": "ttft-g500-baseline-base-632928fda64a4ec2894e",
+      "dispatch_id": null,
+      "cost_credits": 1,
+      "input_tokens": 256,
+      "output_tokens": 2,
+      "authority_kind": "local_catalog",
+      "security_epoch": 200,
+      "cache_read_tokens": 12416,
+      "cache_write_tokens": 0,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502"
+    },
+    {
+      "id": 24968,
+      "model": "deepseek-v4-flash",
+      "price": {
+        "multiplier": "1.000",
+        "input_per_mtok": "112",
+        "output_per_mtok": "337",
+        "cache_read_per_mtok": "3",
+        "cache_write_per_mtok": "0"
+      },
+      "status": "success",
+      "ledger_id": 23121,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:52.315525+00:00",
+      "request_id": "ttft-g500-candidate-step4-a16cd33be9b24818a4d9",
+      "dispatch_id": null,
+      "cost_credits": 1,
+      "input_tokens": 256,
+      "output_tokens": 2,
+      "authority_kind": "local_catalog",
+      "security_epoch": 200,
+      "cache_read_tokens": 12416,
+      "cache_write_tokens": 0,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502"
+    }
+  ],
+  "wallet": {
+    "credits": 35155,
+    "ledger_count": 1828,
+    "ledger_max_id": 23121
+  },
+  "user_id": 765,
+  "journals": [
+    {
+      "model": "box-claude-haiku-5-5",
+      "state": "committed",
+      "usage_id": 24963,
+      "ledger_id": 23116,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T11:54:35.747346+00:00",
+      "request_id": "9fb1b32237ebf9ea4690f7dc119716ed",
+      "dispatch_id": "1839a58d-c156-4053-94c3-cbe2e82e6cd5",
+      "failure_code": null,
+      "final_credits": 7
+    },
+    {
+      "model": "box-claude-haiku-5-5",
+      "state": "committed",
+      "usage_id": 24964,
+      "ledger_id": 23117,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T11:55:01.178759+00:00",
+      "request_id": "7bc938f2bcaee6111ae5a16d5bcff621",
+      "dispatch_id": "700dff14-4941-4a28-8e1c-6f06385a7734",
+      "failure_code": null,
+      "final_credits": 1
+    },
+    {
+      "model": "grok-build",
+      "state": "committed",
+      "usage_id": 24965,
+      "ledger_id": 23118,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T12:01:17.735878+00:00",
+      "request_id": "cf33dfdbe6aadb349f611556a9b39a64",
+      "dispatch_id": "8c3c2ef4-a1a6-45e1-a700-2d59ab136d61",
+      "failure_code": null,
+      "final_credits": 14
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "state": "committed",
+      "usage_id": 24966,
+      "ledger_id": 23119,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:46.500041+00:00",
+      "request_id": "ttft-g500-warmup-base-148ebbce1b554c1c82b9",
+      "dispatch_id": null,
+      "failure_code": null,
+      "final_credits": 2
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "state": "committed",
+      "usage_id": 24967,
+      "ledger_id": 23120,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:49.401377+00:00",
+      "request_id": "ttft-g500-baseline-base-632928fda64a4ec2894e",
+      "dispatch_id": null,
+      "failure_code": null,
+      "final_credits": 1
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "state": "committed",
+      "usage_id": 24968,
+      "ledger_id": 23121,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:51.748359+00:00",
+      "request_id": "ttft-g500-candidate-step4-a16cd33be9b24818a4d9",
+      "dispatch_id": null,
+      "failure_code": null,
+      "final_credits": 1
+    }
+  ],
+  "dispatches": [
+    {
+      "model": "box-claude-haiku-5-5",
+      "status": "terminal",
+      "outcome": "completed",
+      "attempt_no": 1,
+      "session_id": "webmvdrpb3kkfxlzl",
+      "admitted_at": "2026-10-18T11:54:19.866+00:00",
+      "dispatch_id": "1839a58d-c156-4053-94c3-cbe2e82e6cd5",
+      "terminal_at": "2026-10-18T11:54:56.42+00:00",
+      "failure_code": null,
+      "client_message_id": "m-mvdrpfuc-1-53no",
+      "billing_request_id": "18684327a8c158d08ae4c2475d698216"
+    },
+    {
+      "model": "box-claude-haiku-5-5",
+      "status": "terminal",
+      "outcome": "completed",
+      "attempt_no": 1,
+      "session_id": "webmvdrpb3kkfxlzl",
+      "admitted_at": "2026-10-18T11:55:00.113+00:00",
+      "dispatch_id": "700dff14-4941-4a28-8e1c-6f06385a7734",
+      "terminal_at": "2026-10-18T11:55:22.392+00:00",
+      "failure_code": null,
+      "client_message_id": "m-mvdrqb2y-3-uysz",
+      "billing_request_id": "72c5760b5f51597ea9b78578f95a75e0"
+    },
+    {
+      "model": "grok-build",
+      "status": "terminal",
+      "outcome": "completed",
+      "attempt_no": 1,
+      "session_id": "webmvdry99ipkhmay",
+      "admitted_at": "2026-10-18T12:01:17.448+00:00",
+      "dispatch_id": "8c3c2ef4-a1a6-45e1-a700-2d59ab136d61",
+      "terminal_at": "2026-10-18T12:01:36.087+00:00",
+      "failure_code": null,
+      "client_message_id": "m-mvdrye30-1-pisa",
+      "billing_request_id": "cf33dfdbe6aadb349f611556a9b39a64"
+    }
+  ],
+  "observed_at": "2026-10-18T12:28:13.716016+00:00",
+  "bucket_latest": [
+    {
+      "id": 20554,
+      "delta": -20,
+      "bucket": "period",
+      "org_id": null,
+      "created_at": "2026-10-06T01:13:28.795248+00:00",
+      "balance_after": 0
+    },
+    {
+      "id": 23121,
+      "delta": -1,
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T12:03:52.315525+00:00",
+      "balance_after": 35155
+    }
+  ],
+  "all_new_ledger": [
+    {
+      "id": 23116,
+      "delta": -7,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24963",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T11:54:55.846109+00:00",
+      "balance_after": 35174
+    },
+    {
+      "id": 23117,
+      "delta": -1,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24964",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T11:55:22.264604+00:00",
+      "balance_after": 35173
+    },
+    {
+      "id": 23118,
+      "delta": -14,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24965",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T12:01:35.745198+00:00",
+      "balance_after": 35159
+    },
+    {
+      "id": 23119,
+      "delta": -2,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24966",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T12:03:47.837545+00:00",
+      "balance_after": 35157
+    },
+    {
+      "id": 23120,
+      "delta": -1,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24967",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T12:03:50.178566+00:00",
+      "balance_after": 35156
+    },
+    {
+      "id": 23121,
+      "delta": -1,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24968",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T12:03:52.315525+00:00",
+      "balance_after": 35155
+    }
+  ],
+  "browser_sent": [
+    {
+      "event": "sent",
+      "label": "box-restored-base",
+      "round": 1,
+      "model": "box-claude-haiku-5-5",
+      "ws_sent_at": 1792324459848,
+      "clientMessageId": "m-mvdrpfuc-1-53no",
+      "sessionId": "webmvdrpb3kkfxlzl"
+    },
+    {
+      "event": "sent",
+      "label": "box-restored-base",
+      "round": 2,
+      "model": "box-claude-haiku-5-5",
+      "ws_sent_at": 1792324500030,
+      "clientMessageId": "m-mvdrqb2y-3-uysz",
+      "sessionId": "webmvdrpb3kkfxlzl"
+    },
+    {
+      "event": "sent",
+      "label": "grok-step6-base",
+      "round": 1,
+      "model": "grok-build",
+      "ws_sent_at": 1792324877356,
+      "clientMessageId": "m-mvdrye30-1-pisa",
+      "sessionId": "webmvdry99ipkhmay"
+    }
+  ],
+  "browser_failures": [
+    {
+      "failed_at": "2026-10-18T11:50:26.124Z",
+      "phase": "box-restored-base_round_1",
+      "error_name": "Error",
+      "safe_error_code": "send_timeout",
+      "sent": 0,
+      "completed": 0
+    },
+    {
+      "failed_at": "2026-10-18T11:58:07.539Z",
+      "phase": "ui_login",
+      "error_name": "Error",
+      "safe_error_code": null,
+      "sent": 0,
+      "completed": 0
+    },
+    {
+      "failed_at": "2026-10-18T12:18:44.501Z",
+      "phase": "box-step1-frontend_round_1",
+      "error_name": "Error",
+      "safe_error_code": "send_timeout",
+      "sent": 0,
+      "completed": 0
+    },
+    {
+      "failed_at": "2026-10-18T12:22:12.038Z",
+      "phase": "candidate-ws-preflight_select_model",
+      "error_name": "Error",
+      "safe_error_code": "candidate_websocket_missing",
+      "sent": 0,
+      "completed": 0
+    },
+    {
+      "failed_at": "2026-10-18T12:24:45.061Z",
+      "phase": "ui_login",
+      "error_name": "Error",
+      "safe_error_code": null,
+      "sent": 0,
+      "completed": 0
+    },
+    {
+      "failed_at": "2026-10-18T12:28:03.921Z",
+      "phase": "candidate-ws-preflight_select_model",
+      "error_name": "Error",
+      "safe_error_code": "candidate_websocket_missing",
+      "sent": 0,
+      "completed": 0
+    }
+  ],
+  "failed_candidate_and_preflight_send_count": 0,
+  "all_browser_failures_have_zero_send": true,
+  "box_native": {
+    "native_transcript_path": "/home/box/.claude-account2/projects/-tmp-ocv5-289-run-01ff4cac24340ffd6ff0f557/e2143f99-8fe5-4231-bb02-ed7148c20f00.jsonl",
+    "unique_successful_assistant_message_ids": [
+      "msg_011Cg9f8vUfZkcgyVwSzZAxB",
+      "msg_011Cg9fAieZseb2fxzW3AAjS"
+    ],
+    "successful_calls": 2
+  },
+  "grok_native": {
+    "path": "/home/agent/.openclaude/grok-build/sessions/%2Fhome%2Fagent%2F.openclaude%2Fworkspace%2Fsessions%2Fwebmvdry99ipkhmay/01a14ee3-4c58-71a0-9c85-71df93138815/usage.json",
+    "turns": [
+      {
+        "turnNumber": 1,
+        "endedAt": "2026-10-18T12:01:35.629705967+00:00",
+        "inputTokens": 22535,
+        "outputTokens": 791,
+        "cachedReadTokens": 1152,
+        "cacheCreationTokens": 0,
+        "modelCalls": 1,
+        "primaryModelId": "grok-4.7-build"
+      }
+    ]
+  },
+  "api_successful_raw_request_ids": [
+    "ttft-g500-warmup-base-148ebbce1b554c1c82b9",
+    "ttft-g500-baseline-base-632928fda64a4ec2894e",
+    "ttft-g500-candidate-step4-a16cd33be9b24818a4d9"
+  ],
+  "supplier_success_budget": {
+    "original_successful_calls": 20,
+    "new_box": 2,
+    "new_grok": 1,
+    "new_api": 3,
+    "new_total": 6,
+    "new_limit": 10,
+    "new_remaining": 4,
+    "original_plus_new": 26,
+    "raw_api_call_evidence": "cache-probe.mts: 3 arms, 1 fetch per arm, no retry loop; all HTTP200 and successful usage chains"
+  },
+  "provider_failures": {
+    "aborted_journals": [],
+    "non_success_usage": [],
+    "noncompleted_dispatches": [],
+    "note": "No provider execution failure is evidenced in this phase. Browser UI/preflight failures have zero sends and created no extra dispatch, journal, usage, or ledger. This does not interpret unrelated provider health samples."
+  },
+  "wallet_before": {
+    "credits": 35181,
+    "ledger_max_id": 23115,
+    "ledger_count": 1822
+  },
+  "total_credits": 26,
+  "ledger_delta": -26,
+  "wallet_reconciles": true,
+  "ledger_ids_match_usage": true,
+  "all_journals_committed": true,
+  "independent_price_checks": [
+    {
+      "usage_id": 24963,
+      "unrounded": "6.194325000",
+      "expected": 7,
+      "actual": 7,
+      "matches": true
+    },
+    {
+      "usage_id": 24964,
+      "unrounded": "0.948775000",
+      "expected": 1,
+      "actual": 1,
+      "matches": true
+    },
+    {
+      "usage_id": 24965,
+      "unrounded": "13.12210000",
+      "expected": 14,
+      "actual": 14,
+      "matches": true
+    },
+    {
+      "usage_id": 24966,
+      "unrounded": "1.419938000",
+      "expected": 2,
+      "actual": 2,
+      "matches": true
+    },
+    {
+      "usage_id": 24967,
+      "unrounded": "0.066594000",
+      "expected": 1,
+      "actual": 1,
+      "matches": true
+    },
+    {
+      "usage_id": 24968,
+      "unrounded": "0.066594000",
+      "expected": 1,
+      "actual": 1,
+      "matches": true
+    }
+  ],
+  "prior_frozen_audit": "billing-agent-phase-audit-6calls.json",
+  "provider_identity_limit": "Static API OAuth account_id/api_key_id are NULL; catalog provider deepseek/upstream deepseek-flash is configuration evidence, without persisted per-request served-provider or key-member identity."
+}

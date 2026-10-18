@@ -1,0 +1,128 @@
+{
+  "observed_at": "2026-10-18T12:45:46.341165+00:00",
+  "network": "MockAgent disableNetConnect plus forbidden global fetch; zero provider requests",
+  "actual_cache_evidence": "shared-cache-evidence.json",
+  "comparison": "all final branch exports byte equal to paid baseline/candidate body",
+  "scope": "controlled platform fixture; not hidden native CLI or backend deployment",
+  "sources": [
+    {
+      "label": "base",
+      "source_head": "67d13462edea57d43e71aae2a97d51efddcff831",
+      "capture": "original paid-experiment baseline, preserved before canonical advanced; not re-exported from current canonical",
+      "body_bytes": 46753,
+      "body_sha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa",
+      "prompt_json_sha256": "76310ef9e5f54da8d49e9c051b8390e17914950958f374b0a1a6cb55df065518",
+      "content_sha256": "ed512e3b11eb6a46b280b47ee67fe53d64631d06a32c2528574fb8aca5122444",
+      "dependency_paths": {
+        "protocol": "/opt/openclaude/openclaude-v5-selfhost/packages/protocol",
+        "storage": "/opt/openclaude/openclaude-v5-selfhost/packages/storage"
+      },
+      "cold_warm_equal": true
+    },
+    {
+      "label": "step1",
+      "source_head": "c93d14d9356e3213739fae3dcfd491ae4dab1a92",
+      "body_bytes": 46753,
+      "body_sha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa",
+      "prompt_json_sha256": "76310ef9e5f54da8d49e9c051b8390e17914950958f374b0a1a6cb55df065518",
+      "content_sha256": "ed512e3b11eb6a46b280b47ee67fe53d64631d06a32c2528574fb8aca5122444",
+      "root": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-500-ttft-step1",
+      "dependency_paths": {
+        "protocol": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-500-ttft-step1/packages/protocol",
+        "storage": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-500-ttft-step1/packages/storage"
+      },
+      "clean_before_after": true,
+      "cold_warm_equal": true
+    },
+    {
+      "label": "step2",
+      "source_head": "dc8cf0d5e60052e0efcec0438bc9f45a597b48d2",
+      "body_bytes": 46753,
+      "body_sha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa",
+      "prompt_json_sha256": "76310ef9e5f54da8d49e9c051b8390e17914950958f374b0a1a6cb55df065518",
+      "content_sha256": "ed512e3b11eb6a46b280b47ee67fe53d64631d06a32c2528574fb8aca5122444",
+      "root": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-501-ttft-step2",
+      "dependency_paths": {
+        "protocol": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-501-ttft-step2/packages/protocol",
+        "storage": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-501-ttft-step2/packages/storage"
+      },
+      "clean_before_after": true,
+      "cold_warm_equal": true
+    },
+    {
+      "label": "step3",
+      "source_head": "ddfc60324e49d8344f61c2f9356a9891793c7830",
+      "body_bytes": 46753,
+      "body_sha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa",
+      "prompt_json_sha256": "76310ef9e5f54da8d49e9c051b8390e17914950958f374b0a1a6cb55df065518",
+      "content_sha256": "ed512e3b11eb6a46b280b47ee67fe53d64631d06a32c2528574fb8aca5122444",
+      "root": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-502-ttft-step3",
+      "dependency_paths": {
+        "protocol": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-502-ttft-step3/packages/protocol",
+        "storage": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-502-ttft-step3/packages/storage"
+      },
+      "clean_before_after": true,
+      "cold_warm_equal": true
+    },
+    {
+      "label": "step4",
+      "source_head": "429366fb0fb795e8927d370be734bf63a8b15e9d",
+      "body_bytes": 46753,
+      "body_sha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa",
+      "prompt_json_sha256": "76310ef9e5f54da8d49e9c051b8390e17914950958f374b0a1a6cb55df065518",
+      "content_sha256": "ed512e3b11eb6a46b280b47ee67fe53d64631d06a32c2528574fb8aca5122444",
+      "root": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-503-ttft-step4",
+      "dependency_paths": {
+        "protocol": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-503-ttft-step4/packages/protocol",
+        "storage": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-503-ttft-step4/packages/storage"
+      },
+      "clean_before_after": true,
+      "cold_warm_equal": true
+    },
+    {
+      "label": "step5",
+      "source_head": "0b2213a9e540f3101ac4cd361f7088b194b3b036",
+      "body_bytes": 46753,
+      "body_sha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa",
+      "prompt_json_sha256": "76310ef9e5f54da8d49e9c051b8390e17914950958f374b0a1a6cb55df065518",
+      "content_sha256": "ed512e3b11eb6a46b280b47ee67fe53d64631d06a32c2528574fb8aca5122444",
+      "root": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-506-ttft-step5",
+      "dependency_paths": {
+        "protocol": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-506-ttft-step5/packages/protocol",
+        "storage": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-506-ttft-step5/packages/storage"
+      },
+      "clean_before_after": true,
+      "cold_warm_equal": true
+    },
+    {
+      "label": "step6",
+      "source_head": "0d8c8c30f9d9a20d5cac7ab20eacce764b216845",
+      "body_bytes": 46753,
+      "body_sha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa",
+      "prompt_json_sha256": "76310ef9e5f54da8d49e9c051b8390e17914950958f374b0a1a6cb55df065518",
+      "content_sha256": "ed512e3b11eb6a46b280b47ee67fe53d64631d06a32c2528574fb8aca5122444",
+      "root": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-504-ttft-step6",
+      "dependency_paths": {
+        "protocol": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-504-ttft-step6/packages/protocol",
+        "storage": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-504-ttft-step6/packages/storage"
+      },
+      "clean_before_after": true,
+      "cold_warm_equal": true
+    },
+    {
+      "label": "step7",
+      "source_head": "59a40249e7536e3802052601cbc099864e288bc7",
+      "body_bytes": 46753,
+      "body_sha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa",
+      "prompt_json_sha256": "76310ef9e5f54da8d49e9c051b8390e17914950958f374b0a1a6cb55df065518",
+      "content_sha256": "ed512e3b11eb6a46b280b47ee67fe53d64631d06a32c2528574fb8aca5122444",
+      "root": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-505-ttft-step7",
+      "dependency_paths": {
+        "protocol": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-505-ttft-step7/packages/protocol",
+        "storage": "/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-505-ttft-step7/packages/storage"
+      },
+      "clean_before_after": true,
+      "cold_warm_equal": true
+    }
+  ]
+}

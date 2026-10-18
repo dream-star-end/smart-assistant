@@ -1,0 +1,24 @@
+{
+  "at": "2026-10-18T13:36:41.312783+00:00",
+  "reason": "Use supported wait-for-trains --no-lock before entering normal test-mutex; actual test lock remains enforced",
+  "drivers": [
+    {
+      "pid": 2179682,
+      "name": "pinned",
+      "wait_helper": 2179686,
+      "stopped_pending_wait_only": true
+    },
+    {
+      "pid": 2161962,
+      "name": "source",
+      "wait_helper": 2161964,
+      "stopped_pending_wait_only": true
+    },
+    {
+      "pid": 2263119,
+      "name": "diagnostic",
+      "wait_helper": 2263133,
+      "stopped_pending_wait_only": true
+    }
+  ]
+}

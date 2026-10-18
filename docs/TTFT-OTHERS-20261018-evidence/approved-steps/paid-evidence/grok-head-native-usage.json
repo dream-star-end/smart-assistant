@@ -1,0 +1,23 @@
+{
+  "arm": "candidate-step1",
+  "web_session_id": "webmvdt2e7fkvqfuq",
+  "native_session_id": "01a14f00-6a54-7250-8758-6f1dd6bfe578",
+  "native_run_path": "/home/agent/.openclaude/grok-build/sessions/%2Fhome%2Fagent%2F.openclaude%2Fworkspace%2Fsessions%2Fwebmvdt2e7fkvqfuq/01a14f00-6a54-7250-8758-6f1dd6bfe578",
+  "usage_path": "/home/agent/.openclaude/grok-build/sessions/%2Fhome%2Fagent%2F.openclaude%2Fworkspace%2Fsessions%2Fwebmvdt2e7fkvqfuq/01a14f00-6a54-7250-8758-6f1dd6bfe578/usage.json",
+  "events_path": "/home/agent/.openclaude/grok-build/sessions/%2Fhome%2Fagent%2F.openclaude%2Fworkspace%2Fsessions%2Fwebmvdt2e7fkvqfuq/01a14f00-6a54-7250-8758-6f1dd6bfe578/events.jsonl",
+  "turns": [
+    {
+      "turnNumber": 1,
+      "endedAt": "2026-10-18T12:33:36.298003039+00:00",
+      "inputTokens": 22537,
+      "outputTokens": 1541,
+      "cachedReadTokens": 1152,
+      "cacheCreationTokens": 0,
+      "reasoningTokens": 1196,
+      "totalTokens": 24078,
+      "modelCalls": 1,
+      "primaryModelId": "grok-4.7-build"
+    }
+  ],
+  "events_loop_started_total": 1
+}

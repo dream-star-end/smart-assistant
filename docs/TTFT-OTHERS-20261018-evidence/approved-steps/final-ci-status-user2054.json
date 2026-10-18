@@ -1,0 +1,1064 @@
+{
+  "observed_at": "2026-10-18T14:08:06.936333+00:00",
+  "all_seven_prs_current_head_14_success": true,
+  "all_draft_open_unmerged": true,
+  "prs": [
+    {
+      "headRefOid": "ddfc60324e49d8344f61c2f9356a9891793c7830",
+      "isDraft": true,
+      "mergeable": "MERGEABLE",
+      "mergedAt": null,
+      "number": 849,
+      "state": "OPEN",
+      "statusCheckRollup": [
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:51:50Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932889/job/117676885473",
+          "name": "selfhost-typecheck",
+          "startedAt": "2026-10-18T12:49:33Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:50:28Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932866/job/117676885382",
+          "name": "selfhost-gates",
+          "startedAt": "2026-10-18T12:48:29Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:04:17Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932883/job/117676885612",
+          "name": "selfhost-gateway (unit 1/4)",
+          "startedAt": "2026-10-18T13:00:44Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:56:07Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932870/job/117676885401",
+          "name": "selfhost-web-react",
+          "startedAt": "2026-10-18T12:43:54Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:03:15Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932883/job/117676885583",
+          "name": "selfhost-gateway (unit 2/4)",
+          "startedAt": "2026-10-18T12:59:37Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:43:06Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932883/job/117676885493",
+          "name": "selfhost-gateway (unit 3/4)",
+          "startedAt": "2026-10-18T12:39:19Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:00:14Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932883/job/117676885578",
+          "name": "selfhost-gateway (unit 4/4)",
+          "startedAt": "2026-10-18T12:57:15Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:10:14Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932883/job/117676885595",
+          "name": "selfhost-gateway (idle 1/3)",
+          "startedAt": "2026-10-18T13:00:16Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:02:36Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932883/job/117676885581",
+          "name": "selfhost-gateway (idle 2/3)",
+          "startedAt": "2026-10-18T12:57:11Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:51:19Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932883/job/117676885579",
+          "name": "selfhost-gateway (idle 3/3)",
+          "startedAt": "2026-10-18T12:47:50Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:52:23Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932889/job/117676885318",
+          "name": "selfhost-commercial-unit (known-failures diff gate)",
+          "startedAt": "2026-10-18T12:43:11Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:43:25Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932866/job/117676885176",
+          "name": "selfhost-watch-gate",
+          "startedAt": "2026-10-18T12:42:31Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:46:55Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932883/job/117676885457",
+          "name": "selfhost-v5-ops",
+          "startedAt": "2026-10-18T12:43:13Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:42:28Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127932870/job/117676885242",
+          "name": "selfhost-web-react-browser",
+          "startedAt": "2026-10-18T12:36:36Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        }
+      ],
+      "url": "https://github.com/dream-star-end/smart-assistant/pull/849"
+    },
+    {
+      "headRefOid": "429366fb0fb795e8927d370be734bf63a8b15e9d",
+      "isDraft": true,
+      "mergeable": "MERGEABLE",
+      "mergedAt": null,
+      "number": 850,
+      "state": "OPEN",
+      "statusCheckRollup": [
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:20:31Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032113/job/117671241214",
+          "name": "selfhost-typecheck",
+          "startedAt": "2026-10-18T12:18:12Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:18:18Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032090/job/117671241063",
+          "name": "selfhost-gates",
+          "startedAt": "2026-10-18T12:16:34Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:34:07Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032264/job/117671447675",
+          "name": "selfhost-gateway (unit 1/4)",
+          "startedAt": "2026-10-18T12:30:24Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:29:26Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032202/job/117671241537",
+          "name": "selfhost-web-react",
+          "startedAt": "2026-10-18T12:17:48Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:38:33Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032264/job/117671447709",
+          "name": "selfhost-gateway (unit 2/4)",
+          "startedAt": "2026-10-18T12:35:07Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:22:05Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032264/job/117671447536",
+          "name": "selfhost-gateway (unit 3/4)",
+          "startedAt": "2026-10-18T12:18:15Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:34:06Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032264/job/117671447696",
+          "name": "selfhost-gateway (unit 4/4)",
+          "startedAt": "2026-10-18T12:30:49Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:29:03Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032264/job/117671447605",
+          "name": "selfhost-gateway (idle 1/3)",
+          "startedAt": "2026-10-18T12:19:20Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:19:40Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032264/job/117671447542",
+          "name": "selfhost-gateway (idle 2/3)",
+          "startedAt": "2026-10-18T12:14:34Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:37:03Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032264/job/117671447681",
+          "name": "selfhost-gateway (idle 3/3)",
+          "startedAt": "2026-10-18T12:34:11Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:24:48Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032113/job/117671240942",
+          "name": "selfhost-commercial-unit (known-failures diff gate)",
+          "startedAt": "2026-10-18T12:17:45Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:22:54Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032090/job/117671241283",
+          "name": "selfhost-watch-gate",
+          "startedAt": "2026-10-18T12:22:01Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:15:22Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032264/job/117671447331",
+          "name": "selfhost-v5-ops",
+          "startedAt": "2026-10-18T12:12:00Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:25:40Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126032202/job/117671241767",
+          "name": "selfhost-web-react-browser",
+          "startedAt": "2026-10-18T12:19:41Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        }
+      ],
+      "url": "https://github.com/dream-star-end/smart-assistant/pull/850"
+    },
+    {
+      "headRefOid": "0d8c8c30f9d9a20d5cac7ab20eacce764b216845",
+      "isDraft": true,
+      "mergeable": "MERGEABLE",
+      "mergedAt": null,
+      "number": 851,
+      "state": "OPEN",
+      "statusCheckRollup": [
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:52:18Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937160/job/117676897447",
+          "name": "selfhost-typecheck",
+          "startedAt": "2026-10-18T12:50:30Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:50:56Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937087/job/117676897165",
+          "name": "selfhost-gates",
+          "startedAt": "2026-10-18T12:49:18Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:02:33Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937081/job/117676897078",
+          "name": "selfhost-gateway (unit 1/4)",
+          "startedAt": "2026-10-18T12:58:38Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:07:46Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937065/job/117676896954",
+          "name": "selfhost-web-react",
+          "startedAt": "2026-10-18T12:56:09Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:04:37Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937081/job/117676897223",
+          "name": "selfhost-gateway (unit 2/4)",
+          "startedAt": "2026-10-18T13:01:38Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:05:06Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937081/job/117676897175",
+          "name": "selfhost-gateway (unit 3/4)",
+          "startedAt": "2026-10-18T13:01:55Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:04:32Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937081/job/117676897206",
+          "name": "selfhost-gateway (unit 4/4)",
+          "startedAt": "2026-10-18T13:01:38Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:10:19Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937081/job/117676897196",
+          "name": "selfhost-gateway (idle 1/3)",
+          "startedAt": "2026-10-18T13:00:16Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:08:11Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937081/job/117676897227",
+          "name": "selfhost-gateway (idle 2/3)",
+          "startedAt": "2026-10-18T13:02:40Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:03:01Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937081/job/117676897158",
+          "name": "selfhost-gateway (idle 3/3)",
+          "startedAt": "2026-10-18T12:59:31Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:52:22Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937160/job/117676897187",
+          "name": "selfhost-commercial-unit (known-failures diff gate)",
+          "startedAt": "2026-10-18T12:43:59Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:46:19Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937087/job/117676896977",
+          "name": "selfhost-watch-gate",
+          "startedAt": "2026-10-18T12:45:26Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:55:59Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937081/job/117676896903",
+          "name": "selfhost-v5-ops",
+          "startedAt": "2026-10-18T12:52:06Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:51:47Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127937065/job/117676896826",
+          "name": "selfhost-web-react-browser",
+          "startedAt": "2026-10-18T12:46:02Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        }
+      ],
+      "url": "https://github.com/dream-star-end/smart-assistant/pull/851"
+    },
+    {
+      "headRefOid": "59a40249e7536e3802052601cbc099864e288bc7",
+      "isDraft": true,
+      "mergeable": "MERGEABLE",
+      "mergedAt": null,
+      "number": 852,
+      "state": "OPEN",
+      "statusCheckRollup": [
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:13:00Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035116/job/117671250044",
+          "name": "selfhost-typecheck",
+          "startedAt": "2026-10-18T12:10:48Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:28:00Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035121/job/117671250189",
+          "name": "selfhost-gates",
+          "startedAt": "2026-10-18T12:26:17Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:26:16Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035153/job/117671462503",
+          "name": "selfhost-gateway (unit 1/4)",
+          "startedAt": "2026-10-18T12:22:55Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:32:09Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035175/job/117671249997",
+          "name": "selfhost-web-react",
+          "startedAt": "2026-10-18T12:24:50Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:19:18Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035153/job/117671462448",
+          "name": "selfhost-gateway (unit 2/4)",
+          "startedAt": "2026-10-18T12:15:50Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:25:55Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035153/job/117671462488",
+          "name": "selfhost-gateway (unit 3/4)",
+          "startedAt": "2026-10-18T12:22:52Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:18:40Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035153/job/117671462455",
+          "name": "selfhost-gateway (unit 4/4)",
+          "startedAt": "2026-10-18T12:15:24Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:39:18Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035153/job/117671462468",
+          "name": "selfhost-gateway (idle 1/3)",
+          "startedAt": "2026-10-18T12:29:22Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:22:50Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035153/job/117671462481",
+          "name": "selfhost-gateway (idle 2/3)",
+          "startedAt": "2026-10-18T12:17:33Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:19:21Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035153/job/117671462545",
+          "name": "selfhost-gateway (idle 3/3)",
+          "startedAt": "2026-10-18T12:16:02Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:21:43Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035116/job/117671250188",
+          "name": "selfhost-commercial-unit (known-failures diff gate)",
+          "startedAt": "2026-10-18T12:12:49Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:15:44Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035121/job/117671250060",
+          "name": "selfhost-watch-gate",
+          "startedAt": "2026-10-18T12:14:51Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:13:11Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035153/job/117671462273",
+          "name": "selfhost-v5-ops",
+          "startedAt": "2026-10-18T12:09:29Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:33:19Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39126035175/job/117671250296",
+          "name": "selfhost-web-react-browser",
+          "startedAt": "2026-10-18T12:27:32Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        }
+      ],
+      "url": "https://github.com/dream-star-end/smart-assistant/pull/852"
+    },
+    {
+      "headRefOid": "0b2213a9e540f3101ac4cd361f7088b194b3b036",
+      "isDraft": true,
+      "mergeable": "MERGEABLE",
+      "mergedAt": null,
+      "number": 853,
+      "state": "OPEN",
+      "statusCheckRollup": [
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:44:46Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940550/job/117676906231",
+          "name": "selfhost-typecheck",
+          "startedAt": "2026-10-18T12:42:29Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:56:06Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940594/job/117676906274",
+          "name": "selfhost-gates",
+          "startedAt": "2026-10-18T12:54:16Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:08:24Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940616/job/117676906442",
+          "name": "selfhost-gateway (unit 1/4)",
+          "startedAt": "2026-10-18T13:04:34Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:00:43Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940546/job/117676906237",
+          "name": "selfhost-web-react",
+          "startedAt": "2026-10-18T12:49:24Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:08:33Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940616/job/117676906386",
+          "name": "selfhost-gateway (unit 2/4)",
+          "startedAt": "2026-10-18T13:05:37Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:11:14Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940616/job/117676906579",
+          "name": "selfhost-gateway (unit 3/4)",
+          "startedAt": "2026-10-18T13:07:26Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:09:07Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940616/job/117676906485",
+          "name": "selfhost-gateway (unit 4/4)",
+          "startedAt": "2026-10-18T13:06:17Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:12:55Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940616/job/117676906530",
+          "name": "selfhost-gateway (idle 1/3)",
+          "startedAt": "2026-10-18T13:06:17Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:12:13Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940616/job/117676906576",
+          "name": "selfhost-gateway (idle 2/3)",
+          "startedAt": "2026-10-18T13:06:53Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:10:39Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940616/job/117676906607",
+          "name": "selfhost-gateway (idle 3/3)",
+          "startedAt": "2026-10-18T13:07:48Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:49:23Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940550/job/117676906086",
+          "name": "selfhost-commercial-unit (known-failures diff gate)",
+          "startedAt": "2026-10-18T12:41:22Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:59:35Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940594/job/117676906572",
+          "name": "selfhost-watch-gate",
+          "startedAt": "2026-10-18T12:58:39Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:58:14Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940616/job/117676906324",
+          "name": "selfhost-v5-ops",
+          "startedAt": "2026-10-18T12:54:08Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:43:47Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39127940546/job/117676906050",
+          "name": "selfhost-web-react-browser",
+          "startedAt": "2026-10-18T12:39:28Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        }
+      ],
+      "url": "https://github.com/dream-star-end/smart-assistant/pull/853"
+    },
+    {
+      "headRefOid": "c93d14d9356e3213739fae3dcfd491ae4dab1a92",
+      "isDraft": true,
+      "mergeable": "MERGEABLE",
+      "mergedAt": null,
+      "number": 860,
+      "state": "OPEN",
+      "statusCheckRollup": [
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:03:25Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128399916/job/117678305752",
+          "name": "selfhost-typecheck",
+          "startedAt": "2026-10-18T13:01:32Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:46:36Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128400028/job/117678305323",
+          "name": "selfhost-gates",
+          "startedAt": "2026-10-18T12:44:56Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:01:54Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128399904/job/117678304722",
+          "name": "selfhost-gateway (unit 1/4)",
+          "startedAt": "2026-10-18T12:58:08Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:58:36Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128399914/job/117678305099",
+          "name": "selfhost-web-react",
+          "startedAt": "2026-10-18T12:46:21Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:00:14Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128399904/job/117678304620",
+          "name": "selfhost-gateway (unit 2/4)",
+          "startedAt": "2026-10-18T12:56:48Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:04:11Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128399904/job/117678304799",
+          "name": "selfhost-gateway (unit 3/4)",
+          "startedAt": "2026-10-18T13:00:34Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:01:36Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128399904/job/117678304801",
+          "name": "selfhost-gateway (unit 4/4)",
+          "startedAt": "2026-10-18T12:58:59Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:10:23Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128399904/job/117678304797",
+          "name": "selfhost-gateway (idle 1/3)",
+          "startedAt": "2026-10-18T13:03:17Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:06:16Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128399904/job/117678304763",
+          "name": "selfhost-gateway (idle 2/3)",
+          "startedAt": "2026-10-18T13:00:57Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:10:09Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128399904/job/117678304831",
+          "name": "selfhost-gateway (idle 3/3)",
+          "startedAt": "2026-10-18T13:06:34Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:59:30Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128399916/job/117678305585",
+          "name": "selfhost-commercial-unit (known-failures diff gate)",
+          "startedAt": "2026-10-18T12:50:52Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T12:53:19Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128400028/job/117678305447",
+          "name": "selfhost-watch-gate",
+          "startedAt": "2026-10-18T12:52:25Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:10:42Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128399904/job/117678304812",
+          "name": "selfhost-v5-ops",
+          "startedAt": "2026-10-18T13:06:41Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:07:24Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39128399914/job/117678305337",
+          "name": "selfhost-web-react-browser",
+          "startedAt": "2026-10-18T13:01:41Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        }
+      ],
+      "url": "https://github.com/dream-star-end/smart-assistant/pull/860"
+    },
+    {
+      "headRefOid": "8fb6a8be9c4a01e1cce730a969b9ff934bbd4346",
+      "isDraft": true,
+      "mergeable": "MERGEABLE",
+      "mergedAt": null,
+      "number": 861,
+      "state": "OPEN",
+      "statusCheckRollup": [
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:55:03Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39133401123/job/117693086238",
+          "name": "selfhost-typecheck",
+          "startedAt": "2026-10-18T13:52:46Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:55:00Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39133401127/job/117692972252",
+          "name": "selfhost-gates",
+          "startedAt": "2026-10-18T13:52:59Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T14:02:36Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39133401117/job/117693259135",
+          "name": "selfhost-gateway (unit 1/4)",
+          "startedAt": "2026-10-18T13:58:53Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T14:02:31Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39133401121/job/117693173122",
+          "name": "selfhost-web-react",
+          "startedAt": "2026-10-18T13:55:01Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T14:01:58Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39133401117/job/117693258981",
+          "name": "selfhost-gateway (unit 2/4)",
+          "startedAt": "2026-10-18T13:58:47Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T14:02:30Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39133401117/job/117693259021",
+          "name": "selfhost-gateway (unit 3/4)",
+          "startedAt": "2026-10-18T13:58:49Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T14:01:01Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39133401117/job/117693259024",
+          "name": "selfhost-gateway (unit 4/4)",
+          "startedAt": "2026-10-18T13:58:18Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T14:06:06Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39133401117/job/117693258927",
+          "name": "selfhost-gateway (idle 1/3)",
+          "startedAt": "2026-10-18T13:57:54Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T14:03:58Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39133401117/job/117693259049",
+          "name": "selfhost-gateway (idle 2/3)",
+          "startedAt": "2026-10-18T13:58:41Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T14:02:17Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39133401117/job/117693259066",
+          "name": "selfhost-gateway (idle 3/3)",
+          "startedAt": "2026-10-18T13:59:06Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T14:01:33Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39133401123/job/117693086094",
+          "name": "selfhost-commercial-unit (known-failures diff gate)",
+          "startedAt": "2026-10-18T13:52:35Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost commercial"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:52:49Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39133401127/job/117692972030",
+          "name": "selfhost-watch-gate",
+          "startedAt": "2026-10-18T13:51:55Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost gates"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T14:02:12Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39133401117/job/117693258766",
+          "name": "selfhost-v5-ops",
+          "startedAt": "2026-10-18T13:58:17Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost tests"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-10-18T13:58:28Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/dream-star-end/smart-assistant/actions/runs/39133401121/job/117693172933",
+          "name": "selfhost-web-react-browser",
+          "startedAt": "2026-10-18T13:52:53Z",
+          "status": "COMPLETED",
+          "workflowName": "V5 selfhost web-react"
+        }
+      ],
+      "url": "https://github.com/dream-star-end/smart-assistant/pull/861"
+    }
+  ]
+}

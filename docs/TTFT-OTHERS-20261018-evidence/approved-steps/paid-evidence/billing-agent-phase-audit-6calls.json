@@ -1,0 +1,526 @@
+{
+  "since": "2026-10-18T11:43:00Z",
+  "usage": [
+    {
+      "id": 24963,
+      "model": "box-claude-haiku-5-5",
+      "price": {
+        "upstream": null,
+        "multiplier": "1.000",
+        "input_per_mtok": "100",
+        "output_per_mtok": "500",
+        "cache_read_per_mtok": "10",
+        "cache_write_per_mtok": "125"
+      },
+      "status": "success",
+      "ledger_id": 23116,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T11:54:55.846109+00:00",
+      "request_id": "9fb1b32237ebf9ea4690f7dc119716ed",
+      "session_id": "webmvdrpb3kkfxlzl",
+      "dispatch_id": "1839a58d-c156-4053-94c3-cbe2e82e6cd5",
+      "cost_credits": 7,
+      "input_tokens": 2,
+      "output_tokens": 453,
+      "authority_kind": "bridge_signed",
+      "security_epoch": 200,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 47741,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502",
+      "projection_revision": null
+    },
+    {
+      "id": 24964,
+      "model": "box-claude-haiku-5-5",
+      "price": {
+        "upstream": null,
+        "multiplier": "1.000",
+        "input_per_mtok": "100",
+        "output_per_mtok": "500",
+        "cache_read_per_mtok": "10",
+        "cache_write_per_mtok": "125"
+      },
+      "status": "success",
+      "ledger_id": 23117,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T11:55:22.264604+00:00",
+      "request_id": "7bc938f2bcaee6111ae5a16d5bcff621",
+      "session_id": "webmvdrpb3kkfxlzl",
+      "dispatch_id": "700dff14-4941-4a28-8e1c-6f06385a7734",
+      "cost_credits": 1,
+      "input_tokens": 4,
+      "output_tokens": 819,
+      "authority_kind": "bridge_signed",
+      "security_epoch": 200,
+      "cache_read_tokens": 47725,
+      "cache_write_tokens": 493,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502",
+      "projection_revision": null
+    },
+    {
+      "id": 24965,
+      "model": "grok-build",
+      "price": {
+        "upstream": null,
+        "multiplier": "2.000",
+        "input_per_mtok": "250",
+        "output_per_mtok": "1500",
+        "cache_read_per_mtok": "25",
+        "cache_write_per_mtok": "0"
+      },
+      "status": "success",
+      "ledger_id": 23118,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T12:01:35.745198+00:00",
+      "request_id": "cf33dfdbe6aadb349f611556a9b39a64",
+      "session_id": "oceng-5cdb8862194c2cd776d9c6adc9ed1bd92cca21f103857744",
+      "dispatch_id": "8c3c2ef4-a1a6-45e1-a700-2d59ab136d61",
+      "cost_credits": 14,
+      "input_tokens": 21383,
+      "output_tokens": 791,
+      "authority_kind": "bridge_signed",
+      "security_epoch": 200,
+      "cache_read_tokens": 1152,
+      "cache_write_tokens": 0,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502",
+      "projection_revision": null
+    },
+    {
+      "id": 24966,
+      "model": "deepseek-v4-flash",
+      "price": {
+        "upstream": null,
+        "multiplier": "1.000",
+        "input_per_mtok": "112",
+        "output_per_mtok": "337",
+        "cache_read_per_mtok": "3",
+        "cache_write_per_mtok": "0"
+      },
+      "status": "success",
+      "ledger_id": 23119,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:47.837545+00:00",
+      "request_id": "ttft-g500-warmup-base-148ebbce1b554c1c82b9",
+      "session_id": "ttft-others-cache-20261018-g500",
+      "dispatch_id": null,
+      "cost_credits": 2,
+      "input_tokens": 12672,
+      "output_tokens": 2,
+      "authority_kind": "local_catalog",
+      "security_epoch": 200,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502",
+      "projection_revision": "04529735123ffbf9175081b16e2e69cb6282b0ce725c06133116ec988413da29"
+    },
+    {
+      "id": 24967,
+      "model": "deepseek-v4-flash",
+      "price": {
+        "upstream": null,
+        "multiplier": "1.000",
+        "input_per_mtok": "112",
+        "output_per_mtok": "337",
+        "cache_read_per_mtok": "3",
+        "cache_write_per_mtok": "0"
+      },
+      "status": "success",
+      "ledger_id": 23120,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:50.178566+00:00",
+      "request_id": "ttft-g500-baseline-base-632928fda64a4ec2894e",
+      "session_id": "ttft-others-cache-20261018-g500",
+      "dispatch_id": null,
+      "cost_credits": 1,
+      "input_tokens": 256,
+      "output_tokens": 2,
+      "authority_kind": "local_catalog",
+      "security_epoch": 200,
+      "cache_read_tokens": 12416,
+      "cache_write_tokens": 0,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502",
+      "projection_revision": "04529735123ffbf9175081b16e2e69cb6282b0ce725c06133116ec988413da29"
+    },
+    {
+      "id": 24968,
+      "model": "deepseek-v4-flash",
+      "price": {
+        "upstream": null,
+        "multiplier": "1.000",
+        "input_per_mtok": "112",
+        "output_per_mtok": "337",
+        "cache_read_per_mtok": "3",
+        "cache_write_per_mtok": "0"
+      },
+      "status": "success",
+      "ledger_id": 23121,
+      "account_id": null,
+      "api_key_id": null,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:52.315525+00:00",
+      "request_id": "ttft-g500-candidate-step4-a16cd33be9b24818a4d9",
+      "session_id": "ttft-others-cache-20261018-g500",
+      "dispatch_id": null,
+      "cost_credits": 1,
+      "input_tokens": 256,
+      "output_tokens": 2,
+      "authority_kind": "local_catalog",
+      "security_epoch": 200,
+      "cache_read_tokens": 12416,
+      "cache_write_tokens": 0,
+      "execution_revision": "d3ac1e0664905812131a7b69f5a934b441bcf1cd5d4c1ee9b1a1f447c9e6c502",
+      "projection_revision": "04529735123ffbf9175081b16e2e69cb6282b0ce725c06133116ec988413da29"
+    }
+  ],
+  "wallet": {
+    "credits": 35155,
+    "ledger_count": 1828,
+    "ledger_max_id": 23121
+  },
+  "user_id": 765,
+  "journals": [
+    {
+      "model": "box-claude-haiku-5-5",
+      "state": "committed",
+      "source": "ccb_proxy",
+      "usage_id": 24963,
+      "ledger_id": 23116,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T11:54:35.747346+00:00",
+      "request_id": "9fb1b32237ebf9ea4690f7dc119716ed",
+      "updated_at": "2026-10-18T11:55:04.332604+00:00",
+      "dispatch_id": "1839a58d-c156-4053-94c3-cbe2e82e6cd5",
+      "final_credits": 7,
+      "authority_kind": "bridge_signed"
+    },
+    {
+      "model": "box-claude-haiku-5-5",
+      "state": "committed",
+      "source": "ccb_proxy",
+      "usage_id": 24964,
+      "ledger_id": 23117,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T11:55:01.178759+00:00",
+      "request_id": "7bc938f2bcaee6111ae5a16d5bcff621",
+      "updated_at": "2026-10-18T11:55:22.307012+00:00",
+      "dispatch_id": "700dff14-4941-4a28-8e1c-6f06385a7734",
+      "final_credits": 1,
+      "authority_kind": "bridge_signed"
+    },
+    {
+      "model": "grok-build",
+      "state": "committed",
+      "source": "codex_bridge",
+      "usage_id": 24965,
+      "ledger_id": 23118,
+      "attempt_no": 1,
+      "created_at": "2026-10-18T12:01:17.735878+00:00",
+      "request_id": "cf33dfdbe6aadb349f611556a9b39a64",
+      "updated_at": "2026-10-18T12:01:35.883491+00:00",
+      "dispatch_id": "8c3c2ef4-a1a6-45e1-a700-2d59ab136d61",
+      "final_credits": 14,
+      "authority_kind": "bridge_signed"
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "state": "committed",
+      "source": "ccb_proxy",
+      "usage_id": 24966,
+      "ledger_id": 23119,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:46.500041+00:00",
+      "request_id": "ttft-g500-warmup-base-148ebbce1b554c1c82b9",
+      "updated_at": "2026-10-18T12:03:47.931139+00:00",
+      "dispatch_id": null,
+      "final_credits": 2,
+      "authority_kind": "local_catalog"
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "state": "committed",
+      "source": "ccb_proxy",
+      "usage_id": 24967,
+      "ledger_id": 23120,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:49.401377+00:00",
+      "request_id": "ttft-g500-baseline-base-632928fda64a4ec2894e",
+      "updated_at": "2026-10-18T12:03:50.190489+00:00",
+      "dispatch_id": null,
+      "final_credits": 1,
+      "authority_kind": "local_catalog"
+    },
+    {
+      "model": "deepseek-v4-flash",
+      "state": "committed",
+      "source": "ccb_proxy",
+      "usage_id": 24968,
+      "ledger_id": 23121,
+      "attempt_no": null,
+      "created_at": "2026-10-18T12:03:51.748359+00:00",
+      "request_id": "ttft-g500-candidate-step4-a16cd33be9b24818a4d9",
+      "updated_at": "2026-10-18T12:03:52.338326+00:00",
+      "dispatch_id": null,
+      "final_credits": 1,
+      "authority_kind": "local_catalog"
+    }
+  ],
+  "observed_at": "2026-10-18T12:06:50.219675+00:00",
+  "bucket_latest": [
+    {
+      "id": 20554,
+      "delta": -20,
+      "bucket": "period",
+      "org_id": null,
+      "created_at": "2026-10-06T01:13:28.795248+00:00",
+      "balance_after": 0
+    },
+    {
+      "id": 23121,
+      "delta": -1,
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T12:03:52.315525+00:00",
+      "balance_after": 35155
+    }
+  ],
+  "all_new_ledger": [
+    {
+      "id": 23116,
+      "delta": -7,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24963",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T11:54:55.846109+00:00",
+      "balance_after": 35174
+    },
+    {
+      "id": 23117,
+      "delta": -1,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24964",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T11:55:22.264604+00:00",
+      "balance_after": 35173
+    },
+    {
+      "id": 23118,
+      "delta": -14,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24965",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T12:01:35.745198+00:00",
+      "balance_after": 35159
+    },
+    {
+      "id": 23119,
+      "delta": -2,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24966",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T12:03:47.837545+00:00",
+      "balance_after": 35157
+    },
+    {
+      "id": 23120,
+      "delta": -1,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24967",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T12:03:50.178566+00:00",
+      "balance_after": 35156
+    },
+    {
+      "id": 23121,
+      "delta": -1,
+      "bucket": "wallet",
+      "org_id": null,
+      "reason": "chat",
+      "ref_id": "24968",
+      "ref_type": "usage_record",
+      "created_at": "2026-10-18T12:03:52.315525+00:00",
+      "balance_after": 35155
+    }
+  ],
+  "active_api_catalog": [
+    {
+      "state": "active",
+      "engine": "ccb",
+      "entry_id": 240,
+      "model_id": "deepseek-v4-flash",
+      "updated_at": "2026-10-17T06:52:13.319741+00:00",
+      "provider_id": "deepseek",
+      "upstream_model_id": "deepseek-flash"
+    }
+  ],
+  "wallet_before": {
+    "credits": 35181,
+    "ledger_max_id": 23115,
+    "ledger_count": 1822
+  },
+  "grok_native": {
+    "observed_at": "2026-10-18T12:06:49.933496+00:00",
+    "model": "grok-build",
+    "web_session_id": "webmvdry99ipkhmay",
+    "native_session_id": "01a14ee3-4c58-71a0-9c85-71df93138815",
+    "native_run_path": "/home/agent/.openclaude/grok-build/sessions/%2Fhome%2Fagent%2F.openclaude%2Fworkspace%2Fsessions%2Fwebmvdry99ipkhmay/01a14ee3-4c58-71a0-9c85-71df93138815",
+    "usage_path": "/home/agent/.openclaude/grok-build/sessions/%2Fhome%2Fagent%2F.openclaude%2Fworkspace%2Fsessions%2Fwebmvdry99ipkhmay/01a14ee3-4c58-71a0-9c85-71df93138815/usage.json",
+    "updatedAt": "2026-10-18T12:01:35.629705967+00:00",
+    "turns": [
+      {
+        "turnNumber": 1,
+        "endedAt": "2026-10-18T12:01:35.629705967+00:00",
+        "inputTokens": 22535,
+        "outputTokens": 791,
+        "cachedReadTokens": 1152,
+        "cacheCreationTokens": 0,
+        "reasoningTokens": 410,
+        "totalTokens": 23326,
+        "modelCalls": 1,
+        "primaryModelId": "grok-4.7-build"
+      }
+    ],
+    "events_loop_started": {
+      "None": 1
+    },
+    "events_loop_started_total": 1
+  },
+  "cache_results": [
+    {
+      "arm": "warmup-base",
+      "requestId": "ttft-g500-warmup-base-148ebbce1b554c1c82b9",
+      "status": 200,
+      "beganAt": 1792325025574,
+      "endedAt": 1792325027833,
+      "firstByteAt": 1792325026912,
+      "firstTextAt": 1792325027814,
+      "chars": 2,
+      "usage": {
+        "input_tokens": 12672,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 2
+      },
+      "bodyBytes": 46753,
+      "bodySha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa"
+    },
+    {
+      "arm": "baseline-base",
+      "requestId": "ttft-g500-baseline-base-632928fda64a4ec2894e",
+      "status": 200,
+      "beganAt": 1792325029337,
+      "endedAt": 1792325030173,
+      "firstByteAt": 1792325029848,
+      "firstTextAt": 1792325030156,
+      "chars": 2,
+      "usage": {
+        "input_tokens": 256,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 12416,
+        "output_tokens": 2
+      },
+      "bodyBytes": 46753,
+      "bodySha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa"
+    },
+    {
+      "arm": "candidate-step4-step7",
+      "requestId": "ttft-g500-candidate-step4-a16cd33be9b24818a4d9",
+      "status": 200,
+      "beganAt": 1792325031698,
+      "endedAt": 1792325032312,
+      "firstByteAt": 1792325032081,
+      "firstTextAt": 1792325032294,
+      "chars": 2,
+      "usage": {
+        "input_tokens": 256,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 12416,
+        "output_tokens": 2
+      },
+      "bodyBytes": 46753,
+      "bodySha256": "4c2b8a88feaf93a2a7f99783a8eb0f9353747aef40298105d9493e7156e174aa"
+    }
+  ],
+  "independent_price_checks": [
+    {
+      "usage_id": 24963,
+      "exact_unrounded_credits": "6.194325000",
+      "expected_credits": 7,
+      "actual_credits": 7,
+      "formula_matches": true,
+      "cache_read_ratio": "0"
+    },
+    {
+      "usage_id": 24964,
+      "exact_unrounded_credits": "0.948775000",
+      "expected_credits": 1,
+      "actual_credits": 1,
+      "formula_matches": true,
+      "cache_read_ratio": "0.9896935008917091783833105222"
+    },
+    {
+      "usage_id": 24965,
+      "exact_unrounded_credits": "13.12210000",
+      "expected_credits": 14,
+      "actual_credits": 14,
+      "formula_matches": true,
+      "cache_read_ratio": "0.05112047925449301087197692478"
+    },
+    {
+      "usage_id": 24966,
+      "exact_unrounded_credits": "1.419938000",
+      "expected_credits": 2,
+      "actual_credits": 2,
+      "formula_matches": true,
+      "cache_read_ratio": "0"
+    },
+    {
+      "usage_id": 24967,
+      "exact_unrounded_credits": "0.066594000",
+      "expected_credits": 1,
+      "actual_credits": 1,
+      "formula_matches": true,
+      "cache_read_ratio": "0.9797979797979797979797979798"
+    },
+    {
+      "usage_id": 24968,
+      "exact_unrounded_credits": "0.066594000",
+      "expected_credits": 1,
+      "actual_credits": 1,
+      "formula_matches": true,
+      "cache_read_ratio": "0.9797979797979797979797979798"
+    }
+  ],
+  "successful_supplier_calls": {
+    "box": 2,
+    "box_evidence": "billing-agent-box-base-audit.json: 2 unique native assistant message IDs",
+    "grok": 1,
+    "api": 3,
+    "api_evidence": "cache-probe.mts: exactly three arms, one raw fetch per arm; cache-results + 3 successful usage chains",
+    "total": 6
+  },
+  "provider_evidence_limit": "All three API usages have account_id/api_key_id NULL, expected for static local_catalog. Active catalog entry 240 configures provider deepseek and upstream deepseek-flash; per-request served provider is not persisted for undeclared-primary routes. No secret/key identity inferred.",
+  "total_credits": 26,
+  "ledger_delta": -26,
+  "wallet_reconciles": true,
+  "cache_body_identical": true
+}

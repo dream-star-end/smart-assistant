@@ -1,0 +1,143 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-10-18T12:39:48.922Z",
+  "kind": "independent read-only Grok native cache comparison",
+  "account_id": 765,
+  "model": "grok-build",
+  "source_runtime": "67d13462edea57d43e71aae2a97d51efddcff831",
+  "identity_evidence": "Native session files and browser-turn metadata independently read; billing request/session/dispatch identities confirmed by read-only usage_records query.",
+  "arms": {
+    "base": {
+      "web_session_id": "webmvdry99ipkhmay",
+      "native_session_id": "01a14ee3-4c58-71a0-9c85-71df93138815",
+      "trace_id": "b7cb3c0a655564e27c1282f439b1510c",
+      "request_id": "cf33dfdbe6aadb349f611556a9b39a64",
+      "billing_session_id": "oceng-5cdb8862194c2cd776d9c6adc9ed1bd92cca21f103857744",
+      "dispatch_id": "8c3c2ef4-a1a6-45e1-a700-2d59ab136d61",
+      "input_sha256": "69436dc59f3deb5b5a2e913ae4bbf74847467ee948df6c3b1c3a8e8c53dc92a0",
+      "input_tokens_including_cache": 22535,
+      "uncached_input_tokens": 21383,
+      "input_rows": 5,
+      "input_json_bytes": 42615,
+      "working_directory_occurrences": 1,
+      "working_directory_normalized_input_sha256": "26517d92081e8f76de37e3b86d0947d849bf81cff4c016f56a345c79afbce3df",
+      "build_timestamp_input_occurrences": 0,
+      "system_prompt_bytes": 4232,
+      "system_prompt_sha256": "7d0622f933164dbd46bdf638d0eab9253c995f8ec0cea05c52042189edd1bbab",
+      "tool_definitions_bytes": 46692,
+      "tool_definitions_count": 24,
+      "tool_definitions_sha256": "b865aa8be337d66b258eeb7914d582df0b93950065aba4dd54d3b6d517548743",
+      "platform_context_history_row_index": 3,
+      "platform_context_history_row_json_bytes": 36299,
+      "platform_context_history_row_sha256": "280e0bf372d3eec44bb296bce60ddb2092f8d2f1f1a206481956b80c332ca7f0",
+      "mcp": {
+        "total_servers": 1,
+        "succeeded": 1,
+        "failed": 0,
+        "auth_required": 0,
+        "total_tools": 22,
+        "is_reinit": false
+      },
+      "model_calls": 1,
+      "loop_started_count": 1,
+      "cache_read_tokens": 1152,
+      "cache_write_tokens": 0,
+      "cache_ratio": 0.05112047925449301,
+      "cache_ratio_percent": 5.112047925449302
+    },
+    "head": {
+      "web_session_id": "webmvdt2e7fkvqfuq",
+      "native_session_id": "01a14f00-6a54-7250-8758-6f1dd6bfe578",
+      "trace_id": "b2624e27f8744ffee56349ad8df71f42",
+      "request_id": "0b49402ba260fda1c18e4ea40d690834",
+      "billing_session_id": "oceng-a015aeaeab2acd04f876a6c78e502a646e0cf3e6a6333819",
+      "dispatch_id": "866d1514-04e6-4d32-ba47-699bf42f8216",
+      "input_sha256": "127276d7fbdca3c48568afe7bb5a0628594223025ac5658eb6364815276e8522",
+      "input_tokens_including_cache": 22537,
+      "uncached_input_tokens": 21385,
+      "input_rows": 5,
+      "input_json_bytes": 42615,
+      "working_directory_occurrences": 1,
+      "working_directory_normalized_input_sha256": "26517d92081e8f76de37e3b86d0947d849bf81cff4c016f56a345c79afbce3df",
+      "build_timestamp_input_occurrences": 0,
+      "system_prompt_bytes": 4232,
+      "system_prompt_sha256": "7d0622f933164dbd46bdf638d0eab9253c995f8ec0cea05c52042189edd1bbab",
+      "tool_definitions_bytes": 46692,
+      "tool_definitions_count": 24,
+      "tool_definitions_sha256": "b865aa8be337d66b258eeb7914d582df0b93950065aba4dd54d3b6d517548743",
+      "platform_context_history_row_index": 3,
+      "platform_context_history_row_json_bytes": 36299,
+      "platform_context_history_row_sha256": "280e0bf372d3eec44bb296bce60ddb2092f8d2f1f1a206481956b80c332ca7f0",
+      "mcp": {
+        "total_servers": 1,
+        "succeeded": 1,
+        "failed": 0,
+        "auth_required": 0,
+        "total_tools": 22,
+        "is_reinit": false
+      },
+      "model_calls": 1,
+      "loop_started_count": 1,
+      "cache_read_tokens": 1152,
+      "cache_write_tokens": 0,
+      "cache_ratio": 0.051115942672050406,
+      "cache_ratio_percent": 5.1115942672050405
+    }
+  },
+  "normalization": {
+    "scope": "Persisted initial system/user history rows, stopping before the first reasoning/assistant/output row.",
+    "exact_rule": "For each arm independently, replace only exact occurrences of its own prompt_context.json working_directory string with the identical literal <working_directory>. Do not normalize any other value or modify source files.",
+    "actual_directory_values_saved": false,
+    "matched_occurrences_per_arm": 1,
+    "normalized_inputs_equal": true,
+    "timestamp_normalization_used": false,
+    "build_timestamp_input_occurrences_per_arm": 0
+  },
+  "equalities": {
+    "native_system_prompt": true,
+    "native_tool_definitions": true,
+    "platform_context_history_row": true,
+    "initial_inputs_after_only_exact_working_directory_normalization": true
+  },
+  "strict_cache_gate": {
+    "formula": "cache_read / (uncached_input + cache_read + cache_write)",
+    "condition": "head ratio >= base ratio",
+    "base_ratio": 0.05112047925449301,
+    "head_ratio": 0.051115942672050406,
+    "delta_ratio": -0.000004536582442607462,
+    "delta_percentage_points": -0.0004536582442607462,
+    "passed": false,
+    "step1_acceptance_passed": false
+  },
+  "attribution": {
+    "observed_total_input_token_delta": 2,
+    "observed_uncached_input_token_delta": 2,
+    "observed_cache_read_token_delta": 0,
+    "persisted_input_difference": "One session working-directory occurrence; exact normalization makes all retained initial input rows equal.",
+    "exact_two_token_cause": "N/A",
+    "limitations": [
+      "Provider tokenizer and complete submitted HTTP wire were not retained; exact causal attribution of the two-token difference is not established.",
+      "Persisted native system/tools/history equality does not imply that every hidden provider input was captured.",
+      "Equal cached-read tokens do not imply an equal cache ratio.",
+      "This comparison does not waive the strict cache-ratio acceptance gate and does not justify additional sampling."
+    ]
+  },
+  "safety": {
+    "model_requests_issued_by_this_review": 0,
+    "product_files_modified": false,
+    "source_worktrees_modified": false,
+    "raw_text_saved": false,
+    "actual_working_directory_values_saved": false,
+    "tool_schema_content_saved": false,
+    "credentials_saved": false
+  },
+  "user_2039_acceptance": {
+    "criterion": "无明显变差",
+    "accepted": true,
+    "approved_at_local": "2026-10-18 20:39 UTC+8",
+    "authority": "用户明确放宽验收口径，由主代理转达。",
+    "reason": "用户接受本次cached-read仍为1152、总input仅增加2 token作为验收噪声，允许Step1按无明显变差通过；后续仍须附before/after证据。",
+    "scope": "仅修改验收政策；原始token计数、精确缓存比例、旧严格门false及精确2-token因果归因N/A均保留。",
+    "does_not_establish_exact_token_causality": true
+  }
+}

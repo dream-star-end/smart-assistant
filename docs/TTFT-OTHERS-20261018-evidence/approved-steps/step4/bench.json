@@ -1,0 +1,55 @@
+{
+  "fixtureBytes": 44838,
+  "slots": 16,
+  "scheduling": "slot hashes -> token estimates -> final hash; alternating paired order",
+  "results": [
+    {
+      "mode": "warm",
+      "iterations": 120,
+      "base": {
+        "p50Ms": 5.791079999999965,
+        "p95Ms": 20.441164999999273
+      },
+      "candidate": {
+        "p50Ms": 0.11658600000009756,
+        "p95Ms": 0.2674059999999372
+      }
+    },
+    {
+      "mode": "cold",
+      "iterations": 120,
+      "base": {
+        "p50Ms": 4.939640999999938,
+        "p95Ms": 26.092247999999927
+      },
+      "candidate": {
+        "p50Ms": 5.92746199999965,
+        "p95Ms": 12.497035999999753
+      }
+    },
+    {
+      "mode": "churn",
+      "iterations": 120,
+      "base": {
+        "p50Ms": 5.243103000000701,
+        "p95Ms": 14.69236599999931
+      },
+      "candidate": {
+        "p50Ms": 5.781513999998424,
+        "p95Ms": 18.70562400000017
+      }
+    },
+    {
+      "mode": "oversized",
+      "iterations": 120,
+      "base": {
+        "p50Ms": 4.2587059999987105,
+        "p95Ms": 19.232998000001317
+      },
+      "candidate": {
+        "p50Ms": 5.12420899999961,
+        "p95Ms": 25.90414899999996
+      }
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+本轮是用户20:54新增“任务完成不得退化”要求触发的代码增量审查，基线dc8cf0d5e60052e0efcec0438bc9f45a597b48d2已有全diff r3 APPROVED；原全diff审查和历史CI失败均保留。本增量最多3轮，须有具体P0/P1反例才阻断。
+
+确定性缺出口不等于所有UID错误：ENOENT/ENOTDIR/有效性失败标安全原因，临时EMFILE/EIO/未知仍原transient。无路证明复用一次已取候选快照，不额外读取凭据、探测、选择账号、写affinity或迁移native会话。绑定/元数据不完整候选保留基线恢复机会；已绑定但cooldown即将到期也保留（只在证明条件中忽略cooldown，正常选择不变）；requiredAccountId严格过滤，维护/noLaunch/interactive不扩大分类。
+
+Text/Tool共用明确证明，原始UID码本身不足以触发409。无路返回机器code BOX_EGRESS_NOT_CONFIGURED/零收费/无账号健康处罚；界面沿用同类既有共用model_not_available消息与切换入口。恢复真实配置必须已有用户/管理员授权；不擅自写配置或新增跨账号回退，不承诺可自动修复配置。夹具与network-none官方CLI验证修复后原任务上下文续接。
+
+不改system/tools/context内容或顺序，不新增付费请求。保留共享真实usage证据256/12416/0→同值及稳定body摘要，并补最终源码绑定；不冒称候选后端已上线。测试正在依规等他人列车/锁，未经完成不写通过。旧dc8 CI发现共享model_not_available文案被Box规则改变，此增量恢复共用文案并补原契约回归，未削原测试。
+
+生产补充反例已修：原list只列active，会漏status=cooldown被health halfOpen自动恢复的账号；Sand资格也可被usage sweeper刷新。现在正常active列表完全不改，只在确证UID错误失败分支追加一次完整metadata范围；任意同pin范围cooldown、active绑定/未知元数据、缺依赖/失败/截断均保持旧retry。证明不按瞬时eligible过滤，避免丢掉已存在的自动恢复机会。完整scope不含token/凭据；无新增选择/Box探测/affinity更新。Session JWT无自动refresh（已有明确代码反证）；disabled/banned仅人工恢复。
+
+r2只核对f6d6079a8之后新增差异。r1 APPROVED且产品源码完全没变：只修TS测试断言空数组deepEqual导致never收窄为等价length=0；CLI夹具严格保留原任务字节顺序（原15B完整包含于CLI恢复16B块，诊断已证；非任务丢失），并保留3臂完整system/tools/messages逐字相等，增加缺任务/倒序负例。network-none固定CLI候选已执行0退出，源SHA b94f25d767780f9257f7dff77682e346edbf816302cc77c87b3de96d4fec06dc与提交脚本一致。f6固定head前后clean403项全过，新测试文件20项回归也全过；原类型/lint门继续由根统一跑。
+
+本轮只读审查，不额外执行任何测试。上一轮审查额外全量web-react因与增量无网页代码关系且占测试锁由根安全中止，记录不算通过；必要related tests和CI均由根单独持锁统一验证。不要扩展测试范围或重复已过测试；只找新增diff可触发P0/P1。真实模型请求不增加，前缀内容/顺序及body字节不改。当前CI待验不能写通过。
+
+r3只审e43690cd0后的单文件4处string concat→等价template literal。r2 APPROVED；产品源码仍与f6完全相同，guard/fixture上下文判据/负例一字未改，仅biome指定模板风格。b94是e436已执行候选的历史hash，不冒充本次lint风格修正后新hash。直接biome及node-check已过；root将完整变更lint、最新script三臂mock及最新head body导出/CI核实。只读审查，不执行任何额外测试，不扩大范围；本轮max3，不按预算凑通过，有具体P0/P1则给反例。
