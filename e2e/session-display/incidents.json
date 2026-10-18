@@ -7873,7 +7873,7 @@
       "occurredAt": "2026-10-18",
       "severity": "P1",
       "symptom": "体验官A25/A36：Codex缺少可发现的稳定搜索CLI，oc-web --help无search，Luna/Sol改用Bash抓Google/Bing/Baidu遇空结果及验证码。新增oc-web search，复用现有master搜索代理和成对容器身份回退；prompt/schema/cache输入不变。",
-      "rootFixCommit": "051e6768d300",
+      "rootFixCommit": "051e6768",
       "regressions": [
         {
           "layer": "unit",
