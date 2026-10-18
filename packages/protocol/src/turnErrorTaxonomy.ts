@@ -109,6 +109,7 @@ export const TURN_ERROR_TAXONOMY = {
   model_config_changed_retry_turn: { retryable: false, cta: 'retry', expected: true, reportable: false },
   model_not_available: { retryable: false, cta: 'switch_model', expected: true, reportable: false },
   unresolved_agent_model: { retryable: false, cta: 'switch_model' },
+  admission_restart_unexecuted: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true, reportable: false },
   model_authority_unavailable: { retryable: true, automaticRecovery: true, cta: 'retry' },
   model_catalog_unavailable: { retryable: true, automaticRecovery: true, cta: 'retry' },
   unauthorized_model: { retryable: false, cta: 'switch_model', expected: true, reportable: false },
@@ -494,6 +495,7 @@ const PRE_EXECUTION_AUTOMATIC_RECOVERY_CODES: ReadonlySet<TurnErrorCode> = new S
   // Model/upstream/network errors are deliberately absent: the same code can
   // also occur on a continuation after a tool, so an empty tape alone cannot
   // prove that no external effect happened.
+  'admission_restart_unexecuted',
   'model_authority_unavailable',
   'model_catalog_unavailable',
   'codex_pool_busy',

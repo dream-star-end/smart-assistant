@@ -140,6 +140,16 @@ function makeFakePool(canned: Canned) {
     if (s.includes('FROM turn_dispatches') && s.includes('FOR UPDATE')) {
       return { rows: [rawRow()], rowCount: 1 }
     }
+    // The accepted proof and bound recovery receipt now commit in one DML
+    // CTE. Model that write as the same accepted row; real PG integration
+    // asserts its atomic job/dispatch effects and final task answer.
+    if (s.startsWith('WITH accepted AS ( UPDATE turn_dispatches') &&
+        s.includes("WHERE dispatch_id = $1 AND status = 'rejecting'") &&
+        s.includes('UPDATE turn_recovery_jobs')) {
+      recordWrite(s)
+      writeParams.push(params ?? [])
+      return { rows: [rawRow({ status: 'accepted' })], rowCount: 1 }
+    }
     if (s.startsWith('UPDATE') || s.startsWith('INSERT')) {
       recordWrite(s)
       writeParams.push(params ?? [])
