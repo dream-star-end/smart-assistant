@@ -117,7 +117,18 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
         const persistence = variant === "restore-original" ? null : page.waitForResponse((r) =>
           new URL(r.url()).pathname === "/api/collaboration-config" && r.request().method() === "PUT", { timeout: 10000 });
         if (persistence) void persistence.catch(() => {});
+        const notice = !red && variant !== "restore-original"
+          ? page.getByText(NOTICE, { exact: true }).first().waitFor({ timeout: 10000 }) : null;
+        if (notice) void notice.catch(() => {});
         await page.getByRole("button", { name: "发送", exact: true }).click();
+        if (notice) {
+          await notice;
+          current.noticeObserved = true;
+          if (evidence) {
+            mkdirSync(evidence, { recursive: true });
+            await page.screenshot({ path: join(evidence, `advisor-notice-${variant}-${saveStatus}-${width}-${number}.png`), fullPage: true });
+          }
+        }
         if (red && evidence) {
           mkdirSync(evidence, { recursive: true });
           await page.getByText("顾问引擎尚未完成无工具证明", { exact: true }).last().waitFor();
@@ -138,7 +149,7 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
         } else {
           assert.equal(f.collabMode, "solo");
           assert.equal(f.advisorModel, undefined); assert.equal(f.collabConfigVersion, undefined);
-          await page.getByText(NOTICE, { exact: true }).first().waitFor();
+          assert.equal(current.noticeObserved, true);
           await persistence;
           await page.getByRole("button", { name: /切换智能体/ }).click();
           assert.equal(await page.getByRole("button", { name: /主模型独立完成/ }).getAttribute("aria-pressed"), "true");
