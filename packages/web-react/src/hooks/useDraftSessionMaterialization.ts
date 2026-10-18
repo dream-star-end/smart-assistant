@@ -1,7 +1,7 @@
 import { useCallback, type Dispatch, type RefObject, type SetStateAction } from 'react'
 import type { CursorContextTier, ServiceTier } from '@openclaude/protocol'
 import type { Session } from '../lib/types'
-import type { ChatSocket } from '../lib/chat/socket'
+import type { UseChatSocket } from './useChatSocket'
 import type { PreferenceEffort } from '../lib/modelPreferences'
 import { accountDraftKey, moveDraft, NEW_COMPOSER_DRAFT_KEY } from '../lib/composerDraft'
 import { moveComposerAttachments } from '../components/Composer'
@@ -23,7 +23,7 @@ export function useDraftSessionMaterialization(args: {
   sessionEffort: PreferenceEffort | null | undefined
   contextTier: CursorContextTier
   serviceTier: ServiceTier | null
-  sockRef: RefObject<ChatSocket | null>
+  sockRef: RefObject<Pick<UseChatSocket, 'ensureSession' | 'setSessionModel'> | null>
   setSessions: Dispatch<SetStateAction<Session[]>>
   setActiveId: Dispatch<SetStateAction<string | undefined>>
 }): () => string | undefined {
