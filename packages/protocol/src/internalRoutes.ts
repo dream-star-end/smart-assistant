@@ -59,6 +59,9 @@ export const CODEX_RELAY_PREFIX = '/internal/v3/codex-relay'
 export const CODEX_TOKEN_REFRESH_PATH = '/internal/v3/codex/token-refresh'
 /** 识图后端(understand_image / oc-vision):容器交图片+问题,master 调 Grok 4.7 并计费。 */
 export const GROK_VISION_PATH = '/internal/v3/grok-vision'
+/** Existing authenticated master search proxies used by oc-web search. */
+export const MINIMAX_SEARCH_PATH = '/internal/v3/minimax-search'
+export const GROK_SEARCH_PATH = '/internal/v3/grok-search'
 export const TURN_LEASE_RENEW_PATH = '/internal/v3/turn-lease/renew'
 export const MODEL_CATALOG_PATH = '/internal/v3/model-catalog'
 export const MODEL_CATALOG_EPOCH_PATH = '/internal/v3/model-catalog-epoch'
@@ -265,6 +268,18 @@ export const INTERNAL_ROUTES = [
     match: 'exact',
     plane: 'v3',
     sources: ['gateway/src/mcpVisionServer.ts', 'commercial/src/grok/visionProxy.ts'],
+  },
+  {
+    path: MINIMAX_SEARCH_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/webSearchClient.ts', 'commercial/src/minimax/webSearchProxy.ts'],
+  },
+  {
+    path: GROK_SEARCH_PATH,
+    match: 'exact',
+    plane: 'v3',
+    sources: ['gateway/src/webSearchClient.ts', 'commercial/src/grok/webSearchProxy.ts'],
   },
   {
     path: MODEL_CATALOG_PATH,

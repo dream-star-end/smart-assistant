@@ -1,3 +1,4 @@
+import { GROK_SEARCH_PATH, MINIMAX_SEARCH_PATH } from '@openclaude/protocol'
 import { resolveConnectorEndpoint } from './ocConnectorsClient.js'
 
 export type WebSearchHit = { title: string; url: string; snippet: string; date?: string }
@@ -23,7 +24,7 @@ export async function searchWeb(query: string, timeoutMs: number, env: NodeJS.Pr
   try { endpoint = resolveConnectorEndpoint(env) } catch {
     return { ok: false, error: 'Search is unavailable: container identity is not configured.' }
   }
-  for (const path of ['/internal/v3/minimax-search', '/internal/v3/grok-search']) {
+  for (const path of [MINIMAX_SEARCH_PATH, GROK_SEARCH_PATH]) {
     try {
       const response = await fetch(`${endpoint.masterBaseUrl}${path}`, {
         method: 'POST', redirect: 'error', signal: AbortSignal.timeout(timeoutMs),
