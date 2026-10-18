@@ -1,0 +1,205 @@
+{
+  "before": {
+    "at": "2026-10-18T10:29:17.248593+00:00",
+    "user_id": 765,
+    "credits": 35356,
+    "ledger_max_id": 23094,
+    "ledger_count": 1806
+  },
+  "after": {
+    "at": "2026-10-18T10:48:15.002743+00:00",
+    "user_id": 765,
+    "credits": 35181,
+    "ledger_max_id": 23115,
+    "ledger_count": 1822
+  },
+  "ledger": [
+    {
+      "id": "23097",
+      "delta": -19,
+      "balance_after": 35337,
+      "reason": "chat",
+      "ref_type": "usage_record",
+      "ref_id": "24946",
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T18:30:43.263164+08:00"
+    },
+    {
+      "id": "23100",
+      "delta": -4,
+      "balance_after": 35333,
+      "reason": "chat",
+      "ref_type": "usage_record",
+      "ref_id": "24947",
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T18:31:07.705478+08:00"
+    },
+    {
+      "id": "23101",
+      "delta": -4,
+      "balance_after": 35329,
+      "reason": "chat",
+      "ref_type": "usage_record",
+      "ref_id": "24948",
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T18:31:29.180179+08:00"
+    },
+    {
+      "id": "23102",
+      "delta": -1,
+      "balance_after": 35328,
+      "reason": "chat",
+      "ref_type": "usage_record",
+      "ref_id": "24949",
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T18:31:45.611264+08:00"
+    },
+    {
+      "id": "23104",
+      "delta": -16,
+      "balance_after": 35312,
+      "reason": "chat",
+      "ref_type": "usage_record",
+      "ref_id": "24951",
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T18:34:53.942251+08:00"
+    },
+    {
+      "id": "23105",
+      "delta": -31,
+      "balance_after": 35281,
+      "reason": "chat",
+      "ref_type": "usage_record",
+      "ref_id": "24952",
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T18:35:43.20454+08:00"
+    },
+    {
+      "id": "23106",
+      "delta": -4,
+      "balance_after": 35277,
+      "reason": "chat",
+      "ref_type": "usage_record",
+      "ref_id": "24953",
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T18:36:12.464949+08:00"
+    },
+    {
+      "id": "23107",
+      "delta": -5,
+      "balance_after": 35272,
+      "reason": "chat",
+      "ref_type": "usage_record",
+      "ref_id": "24954",
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T18:36:29.370498+08:00"
+    },
+    {
+      "id": "23108",
+      "delta": -7,
+      "balance_after": 35265,
+      "reason": "chat",
+      "ref_type": "usage_record",
+      "ref_id": "24955",
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T18:38:36.204768+08:00"
+    },
+    {
+      "id": "23109",
+      "delta": -7,
+      "balance_after": 35258,
+      "reason": "chat",
+      "ref_type": "usage_record",
+      "ref_id": "24956",
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T18:39:06.971194+08:00"
+    },
+    {
+      "id": "23110",
+      "delta": -33,
+      "balance_after": 35225,
+      "reason": "chat",
+      "ref_type": "usage_record",
+      "ref_id": "24957",
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T18:39:42.613888+08:00"
+    },
+    {
+      "id": "23111",
+      "delta": -30,
+      "balance_after": 35195,
+      "reason": "chat",
+      "ref_type": "usage_record",
+      "ref_id": "24958",
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T18:40:11.546712+08:00"
+    },
+    {
+      "id": "23112",
+      "delta": -5,
+      "balance_after": 35190,
+      "reason": "chat",
+      "ref_type": "usage_record",
+      "ref_id": "24959",
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T18:42:02.596505+08:00"
+    },
+    {
+      "id": "23113",
+      "delta": -4,
+      "balance_after": 35186,
+      "reason": "chat",
+      "ref_type": "usage_record",
+      "ref_id": "24960",
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T18:42:31.094134+08:00"
+    },
+    {
+      "id": "23114",
+      "delta": -4,
+      "balance_after": 35182,
+      "reason": "chat",
+      "ref_type": "usage_record",
+      "ref_id": "24961",
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T18:42:53.691271+08:00"
+    },
+    {
+      "id": "23115",
+      "delta": -1,
+      "balance_after": 35181,
+      "reason": "chat",
+      "ref_type": "usage_record",
+      "ref_id": "24962",
+      "bucket": "wallet",
+      "org_id": null,
+      "created_at": "2026-10-18T18:43:10.59786+08:00"
+    }
+  ],
+  "all_bucket_delta": -175,
+  "wallet_delta": -175,
+  "non_wallet_rows": [],
+  "non_wallet_mismatches": [],
+  "unverified_non_wallet_rows": [],
+  "computed_after": 35181,
+  "row_mismatches": [],
+  "count_matches": true,
+  "balance_matches": true,
+  "extra_wallet_rows": [],
+  "selected_ledger_outside_window": []
+}

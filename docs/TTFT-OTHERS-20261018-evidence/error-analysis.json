@@ -1,0 +1,74 @@
+{
+  "observed_at": "2026-10-18T10:36:02.042634+00:00",
+  "failures": [
+    {
+      "ts": "2026-10-18T10:29:46.613Z",
+      "msg": "proxy_finalize_aborted",
+      "requestId": "6191a4b9044681a170d2ac323ffdaa09",
+      "uid": "765",
+      "codes": [
+        "BOX_TARGET_UNAVAILABLE",
+        "ENOENT"
+      ],
+      "http_status": null
+    },
+    {
+      "ts": "2026-10-18T10:29:49.622Z",
+      "msg": "proxy_finalize_aborted",
+      "requestId": "b9587d987a050673344d4979c7781e8d",
+      "uid": "765",
+      "codes": [
+        "BOX_TARGET_UNAVAILABLE",
+        "ENOENT"
+      ],
+      "http_status": null
+    },
+    {
+      "ts": "2026-10-18T10:29:54.441Z",
+      "msg": "proxy_finalize_aborted",
+      "requestId": "39a4319f5a53dc18572c192d68fb175f",
+      "uid": "765",
+      "codes": [
+        "BOX_TARGET_UNAVAILABLE",
+        "ENOENT"
+      ],
+      "http_status": null
+    },
+    {
+      "ts": "2026-10-18T10:30:07.708Z",
+      "msg": "proxy_finalize_aborted",
+      "requestId": "a7732aa58c72873dbd89758d01bd75dc",
+      "uid": "765",
+      "codes": [
+        "RATE_LIMITED"
+      ],
+      "http_status": 429
+    },
+    {
+      "ts": "2026-10-18T10:30:10.783Z",
+      "msg": "proxy_finalize_aborted",
+      "requestId": "91dd3aaa280df31c56a2c2aa155206fc",
+      "uid": "765",
+      "codes": [
+        "RATE_LIMITED"
+      ],
+      "http_status": 429
+    },
+    {
+      "ts": "2026-10-18T10:30:16.082Z",
+      "msg": "proxy_finalize_aborted",
+      "requestId": "c0c0d1f328045bd5d22b4f11d979fd4d",
+      "uid": "765",
+      "codes": [
+        "RATE_LIMITED"
+      ],
+      "http_status": 429
+    }
+  ],
+  "box_unbound_egress_key_present": false,
+  "required_uid765_proxy_directory_exists": false,
+  "required_uid765_proxy_file_exists": false,
+  "supplier_reached_for_box_failures": false,
+  "box_failure_boundary": "target_resolver_before_staging_and_launch",
+  "raw_reason_not_saved": true
+}

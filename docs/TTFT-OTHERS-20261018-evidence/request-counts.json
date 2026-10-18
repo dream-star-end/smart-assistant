@@ -1,0 +1,23 @@
+{
+  "planned_web_sends": 18,
+  "automatic_recovery_transport_frames": 1,
+  "all_transport_frames": 19,
+  "dispatches": 18,
+  "successful_dispatches": 16,
+  "journals": {
+    "aborted": 6,
+    "committed": 14
+  },
+  "grok_model_calls": {
+    "grok-build": 4,
+    "grok-build-fast": 3
+  },
+  "antigravity_relay_calls": 3,
+  "ccb_success_calls": 10,
+  "failed_execution_attempts": 6,
+  "box_prelaunch_failures": 3,
+  "model_execution_attempts": 26,
+  "supplier_requests": 23,
+  "successful_model_calls": 20,
+  "supplier_http429": 3
+}

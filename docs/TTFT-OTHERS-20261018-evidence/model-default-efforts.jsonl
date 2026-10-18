@@ -1,0 +1,8 @@
+{"observed_at" : "2026-10-18T10:48:20.703125+00:00", "model_id" : "antigravity-gemini-3.8-flash", "default_effort" : "medium"}
+{"observed_at" : "2026-10-18T10:48:20.703125+00:00", "model_id" : "box-claude-haiku-5-5", "default_effort" : null}
+{"observed_at" : "2026-10-18T10:48:20.703125+00:00", "model_id" : "deepseek-v4-flash", "default_effort" : null}
+{"observed_at" : "2026-10-18T10:48:20.703125+00:00", "model_id" : "glm-5.3-zai", "default_effort" : "max"}
+{"observed_at" : "2026-10-18T10:48:20.703125+00:00", "model_id" : "grok-build", "default_effort" : "high"}
+{"observed_at" : "2026-10-18T10:48:20.703125+00:00", "model_id" : "grok-build-fast", "default_effort" : "high"}
+{"observed_at" : "2026-10-18T10:48:20.703125+00:00", "model_id" : "k3-256k", "default_effort" : null}
+{"observed_at" : "2026-10-18T10:48:20.703125+00:00", "model_id" : "kimi-k3", "default_effort" : null}

@@ -1,0 +1,41 @@
+{
+  "observed_at": "2026-10-18T10:47:43.699600+00:00",
+  "sessions": [
+    {
+      "model": "grok-build-fast",
+      "sessionId": "webmvdp0sjw5bjvvt",
+      "native_session_id": "01a14e98-4045-7d92-8398-0c80d45f00b6",
+      "updatedAt": "2026-10-18T10:40:11.468642673+00:00",
+      "turns": [
+        {
+          "turnNumber": 1,
+          "endedAt": "2026-10-18T10:39:42.584682835+00:00",
+          "inputTokens": 22536,
+          "outputTokens": 1913,
+          "cachedReadTokens": 1152,
+          "cacheCreationTokens": 0,
+          "reasoningTokens": 1508,
+          "totalTokens": 24449,
+          "modelCalls": 1,
+          "primaryModelId": "grok-4.7-build-fast"
+        },
+        {
+          "turnNumber": 2,
+          "endedAt": "2026-10-18T10:40:11.468642673+00:00",
+          "inputTokens": 69132,
+          "outputTokens": 1955,
+          "cachedReadTokens": 56576,
+          "cacheCreationTokens": 0,
+          "reasoningTokens": 1567,
+          "totalTokens": 71087,
+          "modelCalls": 2,
+          "primaryModelId": "grok-4.7-build-fast"
+        }
+      ],
+      "events_loop_started": {
+        "None": 3
+      },
+      "events_loop_started_total": 3
+    }
+  ]
+}

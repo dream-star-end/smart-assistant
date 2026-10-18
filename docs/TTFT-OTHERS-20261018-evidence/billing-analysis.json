@@ -1,0 +1,733 @@
+{
+  "all_unsettled_window_journals": [],
+  "unsettled_selected_journals": [],
+  "attempt_coverage": [
+    {
+      "sessionId": "webmvdooaphxbb7s8",
+      "clientMessageId": "m-mvdoofb4-1-5kfo",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "ab49ed0f-e9e0-41d6-a846-ff3f75d3248d"
+      ]
+    },
+    {
+      "sessionId": "webmvdoow151g8cdj",
+      "clientMessageId": "m-mvdop0jm-2-zeua",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "8fec677a-c3d0-4ac5-8a2f-9cb8f4378d39"
+      ]
+    },
+    {
+      "sessionId": "webmvdopcknkjfxra",
+      "clientMessageId": "m-mvdopgpp-3-px7p",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "887672c7-8d41-43b4-b4f1-94c6873091df"
+      ]
+    },
+    {
+      "sessionId": "webmvdopcknkjfxra",
+      "clientMessageId": "m-mvdoq05s-6-ketq",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "8b3d5d43-18ce-4116-bdb8-701795085129"
+      ]
+    },
+    {
+      "sessionId": "webmvdoqibz54juzj",
+      "clientMessageId": "m-mvdoqpfl-9-bv55",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "4fbc87ac-6979-4cc5-82af-a0d52ba98d93"
+      ]
+    },
+    {
+      "sessionId": "webmvdoqibz54juzj",
+      "clientMessageId": "m-mvdor0uj-c-7pgu",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "abf59653-ce01-4cb1-b3d6-ca7aacdce24c"
+      ]
+    },
+    {
+      "sessionId": "webmvdoow151g8cdj",
+      "clientMessageId": "m-recover-1mfcxaeilrwsu",
+      "dispatch_count": 0,
+      "dispatch_ids": []
+    },
+    {
+      "sessionId": "webmvdoujrz75qrze",
+      "clientMessageId": "m-mvdous77-2-qmqj",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "8bb71961-84c0-4766-ac71-489000edc87f"
+      ]
+    },
+    {
+      "sessionId": "webmvdoujrz75qrze",
+      "clientMessageId": "m-mvdovf9z-5-0mpf",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "69ad7fd2-b3d7-4901-ab9c-950559a0aca1"
+      ]
+    },
+    {
+      "sessionId": "webmvdowexdlxuyp0",
+      "clientMessageId": "m-mvdowlul-g-da8t",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "176d7ea6-111e-4559-9353-bb666c089c7c"
+      ]
+    },
+    {
+      "sessionId": "webmvdowexdlxuyp0",
+      "clientMessageId": "m-mvdox17s-i-pc9t",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "60961ac2-9114-4f54-b2e6-70d132f77bee"
+      ]
+    },
+    {
+      "sessionId": "webmvdozf6dwiwlzg",
+      "clientMessageId": "m-mvdozkm2-1-jqcn",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "92f1c6d3-f3bf-4830-919c-a4281b1f6567"
+      ]
+    },
+    {
+      "sessionId": "webmvdozf6dwiwlzg",
+      "clientMessageId": "m-mvdp0465-4-tfpq",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "c160e427-f876-4496-8e1a-6cf5769b749d"
+      ]
+    },
+    {
+      "sessionId": "webmvdp0sjw5bjvvt",
+      "clientMessageId": "m-mvdp111q-7-6iqv",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "6012b788-215a-42f7-bb9d-93ed278dfb31"
+      ]
+    },
+    {
+      "sessionId": "webmvdp0sjw5bjvvt",
+      "clientMessageId": "m-mvdp1k9k-a-k0m4",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "a179d25f-9138-404f-a3d1-1967e00c2fa8"
+      ]
+    },
+    {
+      "sessionId": "webmvdp3w4f6jb5zw",
+      "clientMessageId": "m-mvdp41a4-1-nwa6",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "21578d31-fa61-4a41-b201-49ad7e10de01"
+      ]
+    },
+    {
+      "sessionId": "webmvdp3w4f6jb5zw",
+      "clientMessageId": "m-mvdp4key-4-3ywg",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "622fc975-4464-467a-be11-7431d2def41d"
+      ]
+    },
+    {
+      "sessionId": "webmvdp55uy1pn32d",
+      "clientMessageId": "m-mvdp5d76-7-c4y3",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "5c78f8c4-08b0-45f2-a2db-af8302791047"
+      ]
+    },
+    {
+      "sessionId": "webmvdp55uy1pn32d",
+      "clientMessageId": "m-mvdp5q8r-a-drtt",
+      "dispatch_count": 1,
+      "dispatch_ids": [
+        "09ed2d25-a9e6-4468-8c7c-eb0e3e248242"
+      ]
+    }
+  ],
+  "rows": [
+    {
+      "id": "24946",
+      "scope": "ordinary_web",
+      "request_id": "7880cd6066ce3fd4965cc7ff1ca8cb8d",
+      "model": "k3-256k",
+      "status": "success",
+      "expected_raw": 19,
+      "usage_raw": 19,
+      "debit_raw": 19,
+      "refund_raw": 0,
+      "net_raw": 19,
+      "waived": null,
+      "wouldHaveCharged": null,
+      "verification_run_id": null,
+      "clamped": false,
+      "journal_count": 1,
+      "journal_states": [
+        "committed"
+      ],
+      "journal_raw": [
+        19
+      ],
+      "ledger_buckets": [
+        "wallet"
+      ],
+      "primary_ledger_valid": true,
+      "journal_matches": true,
+      "settlement_path": "request_finalize_journal",
+      "gross_matches": true,
+      "formula_matches": true,
+      "formula_result": "PASS",
+      "three_way_result": "PASS"
+    },
+    {
+      "id": "24947",
+      "scope": "ordinary_web",
+      "request_id": "f66b29cb7bf989e6ee6c3b1a3024e4f9",
+      "model": "k3-256k",
+      "status": "success",
+      "expected_raw": 4,
+      "usage_raw": 4,
+      "debit_raw": 4,
+      "refund_raw": 0,
+      "net_raw": 4,
+      "waived": null,
+      "wouldHaveCharged": null,
+      "verification_run_id": null,
+      "clamped": false,
+      "journal_count": 1,
+      "journal_states": [
+        "committed"
+      ],
+      "journal_raw": [
+        4
+      ],
+      "ledger_buckets": [
+        "wallet"
+      ],
+      "primary_ledger_valid": true,
+      "journal_matches": true,
+      "settlement_path": "request_finalize_journal",
+      "gross_matches": true,
+      "formula_matches": true,
+      "formula_result": "PASS",
+      "three_way_result": "PASS"
+    },
+    {
+      "id": "24948",
+      "scope": "ordinary_web",
+      "request_id": "dc8bd62ff9138aa9f02357ca0ca8786b",
+      "model": "deepseek-v4-flash",
+      "status": "success",
+      "expected_raw": 4,
+      "usage_raw": 4,
+      "debit_raw": 4,
+      "refund_raw": 0,
+      "net_raw": 4,
+      "waived": null,
+      "wouldHaveCharged": null,
+      "verification_run_id": null,
+      "clamped": false,
+      "journal_count": 1,
+      "journal_states": [
+        "committed"
+      ],
+      "journal_raw": [
+        4
+      ],
+      "ledger_buckets": [
+        "wallet"
+      ],
+      "primary_ledger_valid": true,
+      "journal_matches": true,
+      "settlement_path": "request_finalize_journal",
+      "gross_matches": true,
+      "formula_matches": true,
+      "formula_result": "PASS",
+      "three_way_result": "PASS"
+    },
+    {
+      "id": "24949",
+      "scope": "ordinary_web",
+      "request_id": "69d7ad525145e70d9067b0ae15eb0efb",
+      "model": "deepseek-v4-flash",
+      "status": "success",
+      "expected_raw": 1,
+      "usage_raw": 1,
+      "debit_raw": 1,
+      "refund_raw": 0,
+      "net_raw": 1,
+      "waived": null,
+      "wouldHaveCharged": null,
+      "verification_run_id": null,
+      "clamped": false,
+      "journal_count": 1,
+      "journal_states": [
+        "committed"
+      ],
+      "journal_raw": [
+        1
+      ],
+      "ledger_buckets": [
+        "wallet"
+      ],
+      "primary_ledger_valid": true,
+      "journal_matches": true,
+      "settlement_path": "request_finalize_journal",
+      "gross_matches": true,
+      "formula_matches": true,
+      "formula_result": "PASS",
+      "three_way_result": "PASS"
+    },
+    {
+      "id": "24951",
+      "scope": "ordinary_web",
+      "request_id": "02735cab433e7a166b71ee3f1b817653",
+      "model": "grok-build",
+      "status": "success",
+      "expected_raw": 16,
+      "usage_raw": 16,
+      "debit_raw": 16,
+      "refund_raw": 0,
+      "net_raw": 16,
+      "waived": null,
+      "wouldHaveCharged": null,
+      "verification_run_id": null,
+      "clamped": false,
+      "journal_count": 1,
+      "journal_states": [
+        "committed"
+      ],
+      "journal_raw": [
+        16
+      ],
+      "ledger_buckets": [
+        "wallet"
+      ],
+      "primary_ledger_valid": true,
+      "journal_matches": true,
+      "settlement_path": "request_finalize_journal",
+      "gross_matches": true,
+      "formula_matches": true,
+      "formula_result": "PASS",
+      "three_way_result": "PASS"
+    },
+    {
+      "id": "24952",
+      "scope": "ordinary_web",
+      "request_id": "01e032b3a97fbea6b1222131885dd8e3",
+      "model": "grok-build",
+      "status": "success",
+      "expected_raw": 31,
+      "usage_raw": 31,
+      "debit_raw": 31,
+      "refund_raw": 0,
+      "net_raw": 31,
+      "waived": null,
+      "wouldHaveCharged": null,
+      "verification_run_id": null,
+      "clamped": false,
+      "journal_count": 1,
+      "journal_states": [
+        "committed"
+      ],
+      "journal_raw": [
+        31
+      ],
+      "ledger_buckets": [
+        "wallet"
+      ],
+      "primary_ledger_valid": true,
+      "journal_matches": true,
+      "settlement_path": "request_finalize_journal",
+      "gross_matches": true,
+      "formula_matches": true,
+      "formula_result": "PASS",
+      "three_way_result": "PASS"
+    },
+    {
+      "id": "24953",
+      "scope": "ordinary_web",
+      "request_id": "b05bafd7af8b27c0baa394d266990f6c",
+      "model": "antigravity-gemini-3.8-flash",
+      "status": "success",
+      "expected_raw": 4,
+      "usage_raw": 4,
+      "debit_raw": 4,
+      "refund_raw": 0,
+      "net_raw": 4,
+      "waived": null,
+      "wouldHaveCharged": null,
+      "verification_run_id": null,
+      "clamped": false,
+      "journal_count": 0,
+      "journal_states": [],
+      "journal_raw": [],
+      "ledger_buckets": [
+        "wallet"
+      ],
+      "primary_ledger_valid": true,
+      "journal_matches": true,
+      "settlement_path": "antigravity_turns",
+      "antigravity_turn_count": 1,
+      "antigravity_relay_count": 2,
+      "antigravity_relay_totals": {
+        "input_tokens": 32223,
+        "cache_read_tokens": 0,
+        "output_tokens": 501
+      },
+      "antigravity_tokens_match": true,
+      "gross_matches": true,
+      "formula_matches": true,
+      "formula_result": "PASS",
+      "three_way_result": "PASS"
+    },
+    {
+      "id": "24954",
+      "scope": "ordinary_web",
+      "request_id": "7d1ee4fc721426f2ca7b8931041f1a6c",
+      "model": "antigravity-gemini-3.8-flash",
+      "status": "success",
+      "expected_raw": 5,
+      "usage_raw": 5,
+      "debit_raw": 5,
+      "refund_raw": 0,
+      "net_raw": 5,
+      "waived": null,
+      "wouldHaveCharged": null,
+      "verification_run_id": null,
+      "clamped": false,
+      "journal_count": 0,
+      "journal_states": [],
+      "journal_raw": [],
+      "ledger_buckets": [
+        "wallet"
+      ],
+      "primary_ledger_valid": true,
+      "journal_matches": true,
+      "settlement_path": "antigravity_turns",
+      "antigravity_turn_count": 1,
+      "antigravity_relay_count": 1,
+      "antigravity_relay_totals": {
+        "input_tokens": 32785,
+        "cache_read_tokens": 0,
+        "output_tokens": 531
+      },
+      "antigravity_tokens_match": true,
+      "gross_matches": true,
+      "formula_matches": true,
+      "formula_result": "PASS",
+      "three_way_result": "PASS"
+    },
+    {
+      "id": "24955",
+      "scope": "ordinary_web",
+      "request_id": "c065e766796899c592abe7ce2d15b1c6",
+      "model": "kimi-k3",
+      "status": "success",
+      "expected_raw": 7,
+      "usage_raw": 7,
+      "debit_raw": 7,
+      "refund_raw": 0,
+      "net_raw": 7,
+      "waived": null,
+      "wouldHaveCharged": null,
+      "verification_run_id": null,
+      "clamped": false,
+      "journal_count": 1,
+      "journal_states": [
+        "committed"
+      ],
+      "journal_raw": [
+        7
+      ],
+      "ledger_buckets": [
+        "wallet"
+      ],
+      "primary_ledger_valid": true,
+      "journal_matches": true,
+      "settlement_path": "request_finalize_journal",
+      "gross_matches": true,
+      "formula_matches": true,
+      "formula_result": "PASS",
+      "three_way_result": "PASS"
+    },
+    {
+      "id": "24956",
+      "scope": "ordinary_web",
+      "request_id": "d5ac250d5fd113f7b1b40973a386c3dd",
+      "model": "kimi-k3",
+      "status": "success",
+      "expected_raw": 7,
+      "usage_raw": 7,
+      "debit_raw": 7,
+      "refund_raw": 0,
+      "net_raw": 7,
+      "waived": null,
+      "wouldHaveCharged": null,
+      "verification_run_id": null,
+      "clamped": false,
+      "journal_count": 1,
+      "journal_states": [
+        "committed"
+      ],
+      "journal_raw": [
+        7
+      ],
+      "ledger_buckets": [
+        "wallet"
+      ],
+      "primary_ledger_valid": true,
+      "journal_matches": true,
+      "settlement_path": "request_finalize_journal",
+      "gross_matches": true,
+      "formula_matches": true,
+      "formula_result": "PASS",
+      "three_way_result": "PASS"
+    },
+    {
+      "id": "24957",
+      "scope": "ordinary_web",
+      "request_id": "ae82b397b941276bf662d1a190449eaa",
+      "model": "grok-build-fast",
+      "status": "success",
+      "expected_raw": 33,
+      "usage_raw": 33,
+      "debit_raw": 33,
+      "refund_raw": 0,
+      "net_raw": 33,
+      "waived": null,
+      "wouldHaveCharged": null,
+      "verification_run_id": null,
+      "clamped": false,
+      "journal_count": 1,
+      "journal_states": [
+        "committed"
+      ],
+      "journal_raw": [
+        33
+      ],
+      "ledger_buckets": [
+        "wallet"
+      ],
+      "primary_ledger_valid": true,
+      "journal_matches": true,
+      "settlement_path": "request_finalize_journal",
+      "gross_matches": true,
+      "formula_matches": true,
+      "formula_result": "PASS",
+      "three_way_result": "PASS"
+    },
+    {
+      "id": "24958",
+      "scope": "ordinary_web",
+      "request_id": "b1dea70c405dc74bd549860c71f85fc2",
+      "model": "grok-build-fast",
+      "status": "success",
+      "expected_raw": 30,
+      "usage_raw": 30,
+      "debit_raw": 30,
+      "refund_raw": 0,
+      "net_raw": 30,
+      "waived": null,
+      "wouldHaveCharged": null,
+      "verification_run_id": null,
+      "clamped": false,
+      "journal_count": 1,
+      "journal_states": [
+        "committed"
+      ],
+      "journal_raw": [
+        30
+      ],
+      "ledger_buckets": [
+        "wallet"
+      ],
+      "primary_ledger_valid": true,
+      "journal_matches": true,
+      "settlement_path": "request_finalize_journal",
+      "gross_matches": true,
+      "formula_matches": true,
+      "formula_result": "PASS",
+      "three_way_result": "PASS"
+    },
+    {
+      "id": "24959",
+      "scope": "ordinary_web",
+      "request_id": "1dbb6f320203d7533b8223d68fbee405",
+      "model": "k3-256k",
+      "status": "success",
+      "expected_raw": 5,
+      "usage_raw": 5,
+      "debit_raw": 5,
+      "refund_raw": 0,
+      "net_raw": 5,
+      "waived": null,
+      "wouldHaveCharged": null,
+      "verification_run_id": null,
+      "clamped": false,
+      "journal_count": 1,
+      "journal_states": [
+        "committed"
+      ],
+      "journal_raw": [
+        5
+      ],
+      "ledger_buckets": [
+        "wallet"
+      ],
+      "primary_ledger_valid": true,
+      "journal_matches": true,
+      "settlement_path": "request_finalize_journal",
+      "gross_matches": true,
+      "formula_matches": true,
+      "formula_result": "PASS",
+      "three_way_result": "PASS"
+    },
+    {
+      "id": "24960",
+      "scope": "ordinary_web",
+      "request_id": "a0220fb0e939168106685d1488134576",
+      "model": "k3-256k",
+      "status": "success",
+      "expected_raw": 4,
+      "usage_raw": 4,
+      "debit_raw": 4,
+      "refund_raw": 0,
+      "net_raw": 4,
+      "waived": null,
+      "wouldHaveCharged": null,
+      "verification_run_id": null,
+      "clamped": false,
+      "journal_count": 1,
+      "journal_states": [
+        "committed"
+      ],
+      "journal_raw": [
+        4
+      ],
+      "ledger_buckets": [
+        "wallet"
+      ],
+      "primary_ledger_valid": true,
+      "journal_matches": true,
+      "settlement_path": "request_finalize_journal",
+      "gross_matches": true,
+      "formula_matches": true,
+      "formula_result": "PASS",
+      "three_way_result": "PASS"
+    },
+    {
+      "id": "24961",
+      "scope": "ordinary_web",
+      "request_id": "e1b189b2b6e58bb87d550bd80a314e3e",
+      "model": "deepseek-v4-flash",
+      "status": "success",
+      "expected_raw": 4,
+      "usage_raw": 4,
+      "debit_raw": 4,
+      "refund_raw": 0,
+      "net_raw": 4,
+      "waived": null,
+      "wouldHaveCharged": null,
+      "verification_run_id": null,
+      "clamped": false,
+      "journal_count": 1,
+      "journal_states": [
+        "committed"
+      ],
+      "journal_raw": [
+        4
+      ],
+      "ledger_buckets": [
+        "wallet"
+      ],
+      "primary_ledger_valid": true,
+      "journal_matches": true,
+      "settlement_path": "request_finalize_journal",
+      "gross_matches": true,
+      "formula_matches": true,
+      "formula_result": "PASS",
+      "three_way_result": "PASS"
+    },
+    {
+      "id": "24962",
+      "scope": "ordinary_web",
+      "request_id": "0af8689f9918d088127d80185d795a33",
+      "model": "deepseek-v4-flash",
+      "status": "success",
+      "expected_raw": 1,
+      "usage_raw": 1,
+      "debit_raw": 1,
+      "refund_raw": 0,
+      "net_raw": 1,
+      "waived": null,
+      "wouldHaveCharged": null,
+      "verification_run_id": null,
+      "clamped": false,
+      "journal_count": 1,
+      "journal_states": [
+        "committed"
+      ],
+      "journal_raw": [
+        1
+      ],
+      "ledger_buckets": [
+        "wallet"
+      ],
+      "primary_ledger_valid": true,
+      "journal_matches": true,
+      "settlement_path": "request_finalize_journal",
+      "gross_matches": true,
+      "formula_matches": true,
+      "formula_result": "PASS",
+      "three_way_result": "PASS"
+    }
+  ],
+  "summary": {
+    "ordinary_web": {
+      "usage_rows": 16,
+      "expected_raw": 175,
+      "usage_raw": 175,
+      "debit_raw": 175,
+      "refund_raw": 0,
+      "net_raw": 175,
+      "three_way_failures": [],
+      "formula_failures": [],
+      "exception_ids": []
+    }
+  },
+  "dispatch_usage_exceptions": [
+    {
+      "dispatch_id": "ab49ed0f-e9e0-41d6-a846-ff3f75d3248d",
+      "request_id": "e4e2d573df4d098be7ed00c1bca9e251",
+      "scope": "ordinary_web",
+      "status": "terminal",
+      "outcome": "crashed",
+      "usage_rows": 0
+    },
+    {
+      "dispatch_id": "8fec677a-c3d0-4ac5-8a2f-9cb8f4378d39",
+      "request_id": "87b582d6002fe3f214aa9ae78083c673",
+      "scope": "ordinary_web",
+      "status": "terminal",
+      "outcome": "crashed",
+      "usage_rows": 0
+    },
+    {
+      "sessionId": "webmvdoow151g8cdj",
+      "clientMessageId": "m-recover-1mfcxaeilrwsu",
+      "scope": "ordinary_web",
+      "issue": "browser_attempt_without_dispatch"
+    }
+  ],
+  "ledger_scope": "all usage_record buckets; refunds separate",
+  "units": "raw product unit = user points; admin CNY = raw/100; supplier cash not verified"
+}
