@@ -1,6 +1,6 @@
 -- OCV5-515: exact Google Ultra directory models (2026-10-18).
 -- USD list prices: Sonnet 2/10/.10, Opus 4/20/.20 per million tokens;
--- existing Antigravity convention = 50 credits/USD, multiplier 2. No cache writes upstream.
+-- existing Antigravity convention = 50 stored fen/USD (100 fen = 1 displayed credit), multiplier 2. No cache writes upstream.
 -- Existing 4.6 entries are disabled through audited catalog operations after cutover;
 -- historical usage/model ids are never rewritten. New entries are born staged.
 INSERT INTO model_catalog(model_id, engine, provider_id, upstream_model_id, context_window,
