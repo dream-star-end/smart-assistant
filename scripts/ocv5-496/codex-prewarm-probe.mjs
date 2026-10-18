@@ -80,14 +80,17 @@ for (let round = 1; round <= 3; round++) {
     await rpc('initialize', { clientInfo: { name: 'g496-offline-prewarm', version: '1.0.0' }, capabilities: { experimentalApi: true } })
     const initialized = performance.now()
     proc.stdin.write('{"jsonrpc":"2.0","method":"initialized","params":{}}\n')
+    const initializeOnly = await status()
     stage = 'thread/start'
     const thread = await rpc('thread/start', { approvalPolicy: 'never', sandbox: 'read-only', cwd: home, model: 'gpt-6.1-sol' })
     const ready = performance.now()
     const before = await status()
-    await new Promise(r => setTimeout(r, 2000))
+    await new Promise(r => setTimeout(r, 10000))
     const after = await status()
     const result = { round, initializeMs: initialized - started, threadMs: ready - initialized,
-      readyMs: ready - started, processCount: after.processCount, rssKiB: after.rssKiB, idleWindowMs: performance.now() - ready,
+      readyMs: ready - started, initializeOnlyRssKiB: initializeOnly.rssKiB, initializeOnlyProcesses: initializeOnly.processCount,
+      threadRssDeltaKiB: after.rssKiB - initializeOnly.rssKiB,
+      processCount: after.processCount, rssKiB: after.rssKiB, idleWindowMs: performance.now() - ready,
       idleCpuTicks: after.cpuTicks - before.cpuTicks, freshThread: typeof thread?.thread?.id === 'string', ...counts }
     if (!result.freshThread || counts.inferencePosts !== 0) throw Error('PREWARM_NO_INFERENCE_CONTRACT_FAILED')
     rounds.push(result)

@@ -12,7 +12,7 @@ vi.mock('../lib/api', async importOriginal => {
 afterEach(() => { cleanup(); vi.clearAllMocks(); vi.restoreAllMocks() })
 test('login starts preparation after lane decision before any chat hydration; balance refresh does not repeat it', async () => {
   vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
-  const user = { id: '42', email: 'fixture@example.invalid', role: 'user' } as User
+  const user: Awaited<ReturnType<typeof api.getMe>> = { id: '42', email: 'fixture@example.invalid', role: 'user', displayName: 'Fixture', roles: [], lane: null }
   vi.mocked(api.login).mockResolvedValueOnce({ accessToken: 'fixture-only', user, lane: null } as Awaited<ReturnType<typeof api.login>>)
   vi.mocked(api.getMe).mockResolvedValue(user)
   const { result } = renderHook(() => useAuth({ demo: false, initialUser: null, onClearAuth: () => {} }))
