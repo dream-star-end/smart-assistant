@@ -7376,6 +7376,30 @@
           "assertion": "[ocv5-499-pending-user] PASS — the full delegated goal and late tool announcement reach the same current stdin without changing canonical bytes or completed tool history"
         }
       ]
+    },
+    {
+      "id": "INC-20261018-RECOVERY-POOL-IDENTITY",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "OCV5-500: personal release G1 failed before upstream inference because opencodego remained auto/degraded. Recovery probes repeatedly used an administrator-disabled env credential (401), although an active pool member existed. The background prober bypassed the same eligible-key pool used by user traffic; HTTP-only success also allowed incomplete responses to be counted as recovery. Existing G1 remains failed until an approved new-tip official release passes; no forced healthy or gate waiver.",
+      "rootFixCommit": "0aad5f26",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/egress/recoveryProber.test.ts",
+          "assertion": "selects an active pool identity even when the old raw-env identity is disabled"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/egress/recoveryProber.test.ts",
+          "assertion": "rejects ${name} without recovery evidence or leaking body"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/v5-go-cache-contract.mjs",
+          "assertion": "G1 OpenCode Go prompt cache hits across turns"
+        }
+      ]
     }
   ]
 }
