@@ -2525,3 +2525,41 @@ test('OCV5-179 identity: slow readiness cannot be overtaken on the same raw peer
     assert.equal(rig.containerSeen.some(s=>s.includes('inbound.message')),false,'late readiness must not execute after cleanup');
   } finally {release();await stopRig(rig);}
 });
+
+
+test("OCV5-511 exact replay snapshot commits before ACK and survives shutdown during delayed enrichment", async () => {
+  let admitted: AdmitUserTurnInput | undefined;
+  let releaseHistory!: (rows: unknown[]) => void;
+  let historyStarted = false;
+  const gate = new Promise<unknown[]>((resolve) => { releaseHistory = resolve; });
+  const queries: Array<{ sql: string; params: unknown[] }> = [];
+  const rig = await startRig({ attest: "yes", durableDispatch: true,
+    pgPool: { query: async (sql: string, params: unknown[] = []) => {
+      queries.push({ sql, params }); return { rows: [], rowCount: 1 };
+    } },
+    admitUserTurn: async (input) => { admitted = input; return fakeAdmittedDispatch(input); },
+    loadMasterSessionMessages: async () => { historyStarted = true; return gate; },
+  });
+  try {
+    const ws = await openClient(rig.port);
+    const received = frameCollector(ws);
+    ws.send(inboundFrame({ clientMessageId: "cm-511-shutdown", idempotencyKey: "web:cm-511-shutdown:0",
+      peer: { id: "sess-511-shutdown", kind: "dm" }, model: "glm-5.2", serviceTier: "fast",
+      contextTier: "1m", collabMode: "advisor", advisorModel: "gpt-6-astra", conversationMode: "plan" }));
+    const ack = await received.next();
+    assert.equal(ack.type, "outbound.ack");
+    assert.ok(admitted?.message._admissionRestartRequest, "snapshot supplied to transactional admission before ACK");
+    const snapshot = admitted.message._admissionRestartRequest as { version: number; wireBase64: string };
+    assert.equal(snapshot.version, 1);
+    const request = JSON.parse(Buffer.from(snapshot.wireBase64, "base64").toString("utf8"));
+    assert.equal(request.serviceTier, "fast"); assert.equal(request.contextTier, "1m");
+    assert.equal(request.collabMode, "advisor"); assert.equal(request.advisorModel, "gpt-6-astra");
+    assert.equal(request.conversationMode, "plan");
+    await waitFor(() => historyStarted);
+    await rig.bridge.shutdown();
+    await waitFor(() => queries.some(q => q.params[2] === "bridge_closed_during_admission"));
+    releaseHistory([]);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(rig.containerSeen.some(row => row.includes('"clientMessageId":"cm-511-shutdown"')), false);
+  } finally { releaseHistory([]); await stopRig(rig); }
+});

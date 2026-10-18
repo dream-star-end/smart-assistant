@@ -1409,6 +1409,7 @@ export async function registerCommercial(
   let losslessTurnTapeStorage: LosslessTurnTapeStorage | undefined;
   // durable turn dispatch(RFC §2):受理、tape-state 与真实终态读需 DispatchAdmissionBackend 面。
   let dispatchAdmissionBackend: DispatchAdmissionBackend | undefined;
+  let admissionRestartContainer: ReturnType<typeof makeContainerDispatchClient> | undefined;
   const goalUsageRefreshRef: {
     current: (userId: string, sessionId: string) => void | Promise<void>;
   } = { current: () => { /* GoalState service is assembled below. */ } };
@@ -1464,6 +1465,11 @@ export async function registerCommercial(
       sessionsStoreGeneration = decision.generation;
       const pgSessionsBackend = createPgSessionsBackend(getPool(), {
         expectedGeneration: decision.generation,
+        admissionRestartRecovery: {
+          rejectIfAbsent: (id) => admissionRestartContainer?.rejectIfAbsent(id)
+            ?? Promise.resolve({ kind: "unreachable" as const, detail: "not_initialized" }),
+          releaseReservation: (ref) => releasePreCheck(preCheckRedis, ref).then(() => {}),
+        },
         onGoalUsageChanged: (userId, sessionId) => goalUsageRefreshRef.current(userId, sessionId),
         onAutomaticRecoveryDecision: (userId, sessionId, verdict) =>
           recoveryDecisionBroadcastRef.current(userId, sessionId, verdict),
@@ -3578,6 +3584,12 @@ export async function registerCommercial(
       wechatLiveLinkKey = undefined;
     }
   }
+
+  if (runtimeChannel === "v5") admissionRestartContainer = makeContainerDispatchClient({
+    transport: makeNodeHttpContainerTransport(), desktopTransport: makeDesktopContainerTransport(),
+    bridgeSecret: bridgeSecret ?? "",
+    resolveRunningEndpoint: (id) => bridgeSecret ? resolveDispatchEndpoint(id) : Promise.resolve(null),
+  });
 
   // 服务端缩略图磁盘缓存 —— 与 mediaSignKey 同生命周期(依赖 signed media 管线)。
   // 落 OPENCLAUDE_HOME/media-thumb-cache/,启动清零(init)。缺 mediaSignKey → 不装配,
@@ -6543,6 +6555,8 @@ export async function registerCommercial(
           },
         });
         const reconcilerDeps = {
+          recoverInterruptedAdmission: dispatchAdmissionBackend
+            ? (id: string) => dispatchAdmissionBackend!.recoverInterruptedAdmission(id) : undefined,
           pool: getPool(),
           container,
           stuckThresholdMs,

@@ -204,6 +204,8 @@ export async function abortNeverExecutedJournalForDispatch(
 
 export interface TurnDispatchReconcilerDeps {
   pool: Pool
+  /** Supported ACKed intent must be proven/requeued before the financial failure verdict. */
+  recoverInterruptedAdmission?: (dispatchId: string) => Promise<boolean>
   container: {
     cancelIfQueued?: (id: DispatchIdentity) => Promise<ContainerCallResult>
     rejectIfAbsent: (id: DispatchIdentity) => Promise<ContainerCallResult>
@@ -367,6 +369,7 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
   // late-tape 转 manual,要么先状态通知——绝不并发产出「失败状态 + 完整 tape」。
   const unnotified = await scanTerminalUnnotified(deps.pool, { limit })
   for (const scanned of unnotified) {
+    if (deps.recoverInterruptedAdmission && await deps.recoverInterruptedAdmission(scanned.dispatchId)) continue
     await settleTerminalUnnotified(deps, scanned, counts, enqueue, assess, now())
   }
 

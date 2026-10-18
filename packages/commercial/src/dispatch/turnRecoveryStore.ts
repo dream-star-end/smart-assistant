@@ -10,11 +10,13 @@ export interface AutomaticRecoveryJobInput {
   sessionId: string
   rootClientMessageId: string
   sourceClientMessageId: string
+  /** Finalized turn key, or dispatch:<uuid>:<attempt> for a rejected-inbox proof. */
   sourceTurnKey: string
   errorCode: string
   recoveryMode: 'replay' | 'checkpoint'
   semanticRecoveryAttempt: number
   request: Record<string, unknown>
+  /** Legacy column name: SHA256 of the tape, or the exact dispatch rejection proof. */
   tapeSha256: string
 }
 
@@ -93,6 +95,20 @@ export async function enqueueAutomaticRecoveryJob(
   return result.rowCount === 1
 }
 
+/** Dispatch-proof replay preserves exact JSON bytes (including NUL escapes),
+ * while leaving clientMessageId queryable by Stop/refund SQL. Legacy tape
+ * recovery rows keep their ordinary request_json representation. */
+export function decodeRecoveryRequest(stored: Record<string, unknown>, source: string): Record<string, unknown> {
+  if (!source.startsWith('dispatch:') || stored._admissionRestartWireVersion !== 1) return stored
+  if (typeof stored._admissionRestartWire !== 'string') throw new Error('invalid admission restart wire')
+  const request: unknown = JSON.parse(Buffer.from(stored._admissionRestartWire, 'base64').toString('utf8'))
+  if (!request || typeof request !== 'object' || Array.isArray(request) ||
+      (request as Record<string, unknown>).clientMessageId !== stored.clientMessageId) {
+    throw new Error('admission restart wire identity mismatch')
+  }
+  return request as Record<string, unknown>
+}
+
 export async function claimDueRecoveryJobs(
   pool: Pool,
   input: { userId: bigint; ownerId: string; leaseMs: number; limit?: number },
@@ -151,7 +167,7 @@ export async function claimDueRecoveryJobs(
     recoveryMode: row.recovery_mode,
     semanticRecoveryAttempt: row.semantic_recovery_attempt,
     transportWaitAttempt: row.transport_wait_attempt,
-    request: row.request_json,
+    request: decodeRecoveryRequest(row.request_json, row.source_turn_key),
     leaseOwner: input.ownerId,
     leaseEpoch: Number(row.lease_epoch),
   }))

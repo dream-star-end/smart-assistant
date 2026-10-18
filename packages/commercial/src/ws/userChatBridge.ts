@@ -41,6 +41,7 @@ import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { desktopAllowsEngine } from "./containerTransportKind.js";
+import { snapshotAdmissionRequest } from "../dispatch/admissionRestartRecovery.js";
 import { randomUUID, randomBytes } from "node:crypto";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { Pool } from "pg";
@@ -4608,6 +4609,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ...(displayText !== modelText ? { _modelText: modelText } : {}),
           ...(replyTo ? { _replyTo: replyTo } : {}),
           _routing: routing,
+          _admissionRestartRequest: snapshotAdmissionRequest(frameObj),
         };
         if (useDispatchAdmission && deps.admitUserTurn) {
           // ── durable turn dispatch 受理(RFC §2.1)── 替代 persist retry loop。
