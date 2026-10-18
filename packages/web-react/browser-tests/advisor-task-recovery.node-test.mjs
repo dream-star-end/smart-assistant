@@ -7,11 +7,12 @@ import { createRequire } from "node:module";
 import { test } from "node:test";
 import { buildHarnessPage, exactSwap } from "./harness-page.mjs";
 import { startPreviewServer } from "./process-disclosure-app-server.mjs";
-import { BOARD_SESSION } from "./process-disclosure-story.mjs";
+import { BOARD_SESSION, WAIT_SESSION } from "./process-disclosure-story.mjs";
 import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.mjs";
 const { chromium } = createRequire(import.meta.url)("playwright-core");
 const red = process.env.OC_UX_ADVISOR_RED === "1";
 const evidence = process.env.OC_UX_EVIDENCE_DIR;
+const navigationOnly = process.env.OC_UX_ADVISOR_NAV_ONLY === "1";
 const NOTICE = "顾问暂不可用，已由当前主模型继续处理";
 const FILE = "任务材料.txt";
 const FILE_URL = "/api/media/g512-input.txt";
@@ -57,7 +58,9 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
   });
   const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
   try {
-    for (const width of [1280, 390]) for (const [variant, saveStatus] of [["empty", 200], ["empty", 503], ["empty", 409], ["fresh-team", 200], ["fresh-advisor", 200], ["restore-original", 200]]) {
+    for (const width of [1280, 390]) for (const [variant, saveStatus, navigate = false] of [["empty", 200], ["empty", 503], ["empty", 409], ["fresh-team", 200], ["fresh-advisor", 200], ["restore-original", 200], ["empty", 200, true], ["restore-original", 200, true]]) {
+      if (navigationOnly && !navigate) continue;
+      const label = `${navigate ? "navigate-" : ""}${variant}`;
       scenario = { inbounds: [], calls: [], uploads: [], getCount: 0, mode: "advisor", rev: 7, refreshForSend: false };
       preview.store.board = []; preview.store.older = []; preview.store.revision++;
       const current = scenario;
@@ -84,6 +87,10 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
         if (req.method() === "GET") {
           current.getCount++;
           current.calls.push({ method: "GET", sessionId: url.searchParams.get("sessionId") });
+          if (navigate && current.refreshForSend && url.searchParams.get("sessionId") === BOARD_SESSION && !current.refreshBlocked) {
+            current.refreshBlocked = true;
+            await new Promise((resolve) => { current.releaseRefresh = resolve; current.refreshStarted?.(); });
+          }
           return route.fulfill({ json: doc() });
         }
         const body = req.postDataJSON();
@@ -114,19 +121,36 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
         await page.locator('input[type="file"]').first().setInputFiles({ name: FILE, mimeType: "text/plain", buffer: BYTES });
         await page.getByText(FILE, { exact: true }).first().waitFor();
         current.refreshForSend = true;
-        const persistence = variant === "restore-original" ? null : page.waitForResponse((r) =>
+        const persistence = navigate || variant === "restore-original" ? null : page.waitForResponse((r) =>
           new URL(r.url()).pathname === "/api/collaboration-config" && r.request().method() === "PUT", { timeout: 10000 });
         if (persistence) void persistence.catch(() => {});
-        const notice = !red && variant !== "restore-original"
+        const notice = !navigate && !red && variant !== "restore-original"
           ? page.getByText(NOTICE, { exact: true }).first().waitFor({ timeout: 10000 }) : null;
         if (notice) void notice.catch(() => {});
+        const blocked = navigate ? new Promise((resolve) => { current.refreshStarted = resolve; }) : null;
         await page.getByRole("button", { name: "发送", exact: true }).click();
+        if (navigate) {
+          await blocked;
+          await page.evaluate((sid) => { history.pushState(null, "", `/s/${sid}`); dispatchEvent(new PopStateEvent("popstate")); }, WAIT_SESSION);
+          await page.waitForURL(`**/s/${WAIT_SESSION}`);
+          await page.getByPlaceholder(/对话/).fill("G512_B_DRAFT_MUST_SURVIVE");
+          current.releaseRefresh();
+          const deadline = Date.now() + 10000;
+          while (current.inbounds.length < number && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+          assert.equal(current.inbounds.length, number, "navigation must not drop the already submitted original-session task");
+          assert.ok(page.url().endsWith(`/s/${WAIT_SESSION}`), "background send must not steal current-session focus");
+          assert.equal(await page.getByPlaceholder(/对话/).inputValue(), "G512_B_DRAFT_MUST_SURVIVE");
+          assert.equal(await page.getByText(NOTICE, { exact: true }).count(), 0, "A recovery must not overwrite B mode/notice");
+          if (evidence) { mkdirSync(evidence, { recursive: true }); await page.screenshot({ path: join(evidence, `advisor-${label}-B-draft-${width}.png`), fullPage: true }); }
+          await page.evaluate((sid) => { history.pushState(null, "", `/s/${sid}`); dispatchEvent(new PopStateEvent("popstate")); }, BOARD_SESSION);
+          await page.waitForURL(`**/s/${BOARD_SESSION}`);
+        }
         if (notice) {
           await notice;
           current.noticeObserved = true;
           if (evidence) {
             mkdirSync(evidence, { recursive: true });
-            await page.screenshot({ path: join(evidence, `advisor-notice-${variant}-${saveStatus}-${width}-${number}.png`), fullPage: true });
+            await page.screenshot({ path: join(evidence, `advisor-notice-${label}-${saveStatus}-${width}-${number}.png`), fullPage: true });
           }
         }
         if (red && evidence) {
@@ -149,17 +173,19 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
         } else {
           assert.equal(f.collabMode, "solo");
           assert.equal(f.advisorModel, undefined); assert.equal(f.collabConfigVersion, undefined);
-          assert.equal(current.noticeObserved, true);
-          await persistence;
+          assert.equal(current.noticeObserved, !navigate ? true : undefined);
+          if (persistence) await persistence;
+          if (!navigate) {
           await page.getByRole("button", { name: /切换智能体/ }).click();
           assert.equal(await page.getByRole("button", { name: /主模型独立完成/ }).getAttribute("aria-pressed"), "true");
           assert.equal(await page.getByRole("button", { name: /队长切换为/ }).getAttribute("aria-pressed"), "false");
           await page.keyboard.press("Escape");
+          }
         }
         assert.ok(current.getCount >= 2, "send rereads the formerly unavailable catalog before recovery");
         if (evidence) {
           mkdirSync(evidence, { recursive: true });
-          await page.screenshot({ path: join(evidence, `advisor-after-${variant}-${saveStatus}-${width}-${number}.png`), fullPage: true });
+          await page.screenshot({ path: join(evidence, `advisor-after-${label}-${saveStatus}-${width}-${number}.png`), fullPage: true });
         }
       };
       try {
@@ -174,8 +200,8 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
         for (const c of current.calls.filter((c) => c.method === "PUT")) {
           assert.equal(c.body.asDefault, undefined); assert.equal(c.body.mode, "solo");
         }
-        if (evidence) writeFileSync(join(evidence, `advisor-${variant}-${saveStatus}-${width}.json`), JSON.stringify(current, null, 2));
-      } finally { await context.close(); }
+        if (evidence) writeFileSync(join(evidence, `advisor-${label}-${saveStatus}-${width}.json`), JSON.stringify(current, null, 2));
+      } finally { current.releaseRefresh?.(); await context.close(); }
     }
   } finally { await browser.close(); for (const ws of preview.wss.clients) ws.terminate(); await new Promise((done) => preview.wss.close(done)); await new Promise((done) => preview.server.close(done)); }
 });

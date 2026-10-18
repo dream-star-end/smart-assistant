@@ -1295,30 +1295,32 @@ export function App() {
         if (rewriteTarget) sendImplicitRatingRef.current?.(rewriteTarget, { reason: "改写重发" });
       }
       // 非 demo：经真实 WS 引擎发送（inbound.message）。确保有会话承载本轮（peer.id）。
-      let sessionId = target?.sessionId ?? activeId;
+      const originalSessionId = target?.sessionId ?? activeId;
+      let sessionId = originalSessionId ?? draftSessionId;
       let createdSession: Session | null = null;
       const recoveryEpoch = collabEpochRef.current;
       const recoverySelection = selectedSessionIdRef.current;
       const recoveryIdentity = auth?.snapshot().epoch;
+      const recoveryIdentityIsCurrent = () => auth?.snapshot().epoch === recoveryIdentity;
       const recoveryIsCurrent = () => collabEpochRef.current === recoveryEpoch
-        && selectedSessionIdRef.current === recoverySelection && auth?.snapshot().epoch === recoveryIdentity;
+        && selectedSessionIdRef.current === recoverySelection && (!target || target.sessionId === recoverySelection) && recoveryIdentityIsCurrent();
+      if (!originalSessionId) stopPreparing();
       const recovery = await prepareAdvisorSend({
-        agentId: agent.id, original: collabUi, auth, sessionId,
+        agentId: agent.id, original: collabUi, auth, sessionId: originalSessionId,
         parentEngine: models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine,
-        isCurrent: recoveryIsCurrent,
+        isCurrent: recoveryIdentityIsCurrent,
         update: (state, recovered) => {
+          if (!recoveryIsCurrent()) return;
           setCollabUi(state);
           setTeamModeState(false);
           setCollabSaveError(null);
           if (recovered) toast("顾问暂不可用，已由当前主模型继续处理", "info");
         },
       });
-      if (!recovery || !recoveryIsCurrent()) return;
+      if (!recovery || !recoveryIdentityIsCurrent()) return;
       let latestCollab = recovery.state;
       const recoveredAdvisor = recovery.recoveredAdvisor;
-      if (!sessionId) {
-        stopPreparing();
-        sessionId = draftSessionId;
+      if (!originalSessionId) {
         createdSession = {
           id: sessionId,
           title: sessionTitle,
@@ -1351,7 +1353,7 @@ export function App() {
           try {
             const doc = await saveInitialCollaboration(auth, sessionId, latestCollab, collabAsDefault, identityEpoch);
             if (!doc || collabAuth.snapshot().epoch !== identityEpoch) return;
-            applyCollabDoc(doc);
+            if (recoveryIsCurrent()) applyCollabDoc(doc);
             latestCollab = docToUiState(doc);
           } catch (err) {
             if (collabAuth.snapshot().epoch !== identityEpoch) return;
@@ -1365,7 +1367,7 @@ export function App() {
           }
         }
         setSessions((c) => [createdSession!, ...c]);
-        setActiveId(sessionId);
+        if (recoveryIsCurrent()) setActiveId(sessionId);
       }
       const sendCollab = sendCollabFields({
         ...latestCollab, agentId: agent.id,
