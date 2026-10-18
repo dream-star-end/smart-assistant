@@ -49,7 +49,8 @@ import {
   PLATFORM_DEFAULT_MODEL,
   PLATFORM_HIDDEN_REVIEWER_MODEL,
 } from "../platformDefaults.js";
-import { DEFAULT_CODEX_ENGINE_MODEL } from "@openclaude/protocol";
+import { DEFAULT_CODEX_ENGINE_MODEL, MODEL_CATALOG_PROJECTION_FORMAT } from "@openclaude/protocol";
+import { BOX_NATIVE_CONTEXT_ROUTE_READY, issueBoxNativeContextOwner } from "./proxy/boxNativeContextOwner.js";
 import { rootLogger, type Logger } from "../logging/logger.js";
 import {
   REQUEST_ID_HEADER,
@@ -133,6 +134,8 @@ export interface WireModelRow {
   capability_zero: boolean;
   supports_thinking: boolean;
   default_effort: string | null;
+  /** CCB persistence hint issued from the same fenced catalog, not a signed authority. */
+  context_owner?: "box-native-v1";
   /** Missing on an old master means available=true to rolling-upgrade clients. */
   available?: boolean;
   /** model_pricing 四维 + multiplier。旧 master 可缺席。 */
@@ -144,6 +147,7 @@ export interface WireModelRow {
 }
 
 export interface WireCatalogResponse {
+  projection_format?: number;
   models: WireModelRow[];
   projection_revision: string;
   availability_revision?: string;
@@ -206,7 +210,8 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
       sendJson(
         res,
         200,
-        { epoch: epoch.toString(), availability_revision: availability.revision },
+        { epoch: epoch.toString(), availability_revision: availability.revision,
+          projection_format: MODEL_CATALOG_PROJECTION_FORMAT },
         { [REQUEST_ID_HEADER]: requestId, [SECURITY_EPOCH_HEADER]: epoch.toString() },
       );
       return;
@@ -263,8 +268,14 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
       }
     }
     const body: WireCatalogResponse = {
+      projection_format: MODEL_CATALOG_PROJECTION_FORMAT,
       models: snapshot.listForUser(scope).map((r) => {
         const p = snapshot.billingPricingFor(r.modelId);
+        const declared = snapshot.resolve(r.modelId)?.capabilityProfile.ccb.contextOwner;
+        const contextOwner = r.engine === "ccb" ? issueBoxNativeContextOwner({
+          canonicalModel: r.modelId, providerId: r.providerId, declared,
+          routeReady: BOX_NATIVE_CONTEXT_ROUTE_READY,
+        }) : undefined;
         return {
           model_id: r.modelId,
           display_name: r.displayName,
@@ -276,6 +287,7 @@ export function makeModelCatalogHandler(deps: ModelCatalogHandlerDeps): ModelCat
           capability_zero: r.capabilityZero,
           supports_thinking: r.supportsThinking,
           default_effort: r.defaultEffort,
+          ...(contextOwner ? { context_owner: contextOwner } : {}),
           available:
             r.providerId === null || !availability.unavailableProviderIds.has(r.providerId),
           ...(p
