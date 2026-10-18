@@ -22,8 +22,8 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
   const dir = mkdtempSync(join(tmpdir(), "oc-advisor-recovery-"));
   const swaps = { count: 0 };
   await buildHarnessPage({ harness: "goal-start-harness.tsx", assetDir: dir,
-    plugins: red ? [exactSwap("disable-advisor-task-recovery", /\/App\.tsx$/,
-      'if (agent.id === "main" && confirmedAdvisorRecovery) {', "if (false) {", swaps)] : [] });
+    plugins: red ? [exactSwap("disable-advisor-task-recovery", /\/lib\/collaborationSend\.ts$/,
+      'if (recoveredAdvisor) {', "if (false) {", swaps)] : [] });
   assert.equal(swaps.count, red ? 1 : 0);
   const preview = await startPreviewServer(dir);
   preview.wss.removeAllListeners("connection");
