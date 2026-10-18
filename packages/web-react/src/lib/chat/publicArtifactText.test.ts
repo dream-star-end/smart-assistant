@@ -18,7 +18,7 @@ describe("publicArtifactText", () => {
     expect(await publicArtifactText("[下载][report]\n\n[report]: /home/agent/.openclaude/generated/sales.csv")).not.toContain(".openclaude");
   });
   test("keeps useful source code, command inline code, ordinary URLs and non-platform paths verbatim", async () => {
-    const code = "```python\nopen('/home/agent/.openclaude/uploads/sales.csv')\n```\n\n`python /home/agent/.openclaude/generated/recalc.py --input /home/agent/.openclaude/uploads/sales.csv`\n\n[外站](https://example.test/home/agent/.openclaude/generated/sales.csv)\n\n/opt/project/input.csv";
+    const code = "```python\nopen('/home/agent/.openclaude/uploads/sales.csv')\n```\n\n`python /home/agent/.openclaude/generated/recalc.py --input /home/agent/.openclaude/uploads/sales.csv`\n\n[外站](https://example.test/home/agent/.openclaude/generated/sales.csv)\n\n/opt/project/input.csv\n\nhttps://example.test/download?file=/home/agent/.openclaude/generated/sales.csv";
     expect(await publicArtifactText(code)).toBe(code);
   });
   test("shares and exports the same final content without changing original messages or user input", async () => {
