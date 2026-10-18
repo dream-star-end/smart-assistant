@@ -231,6 +231,7 @@ async function load(): Promise<Api> {
     attemptOnce: async () => fail("GATEWAY_SINK_USED") });
   const protocol = await import(pathToFileURL(join(CANDIDATE, "packages/protocol/src/index.ts")).href);
   const sessionsBackend = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/db/pgSessionsBackend.ts")).href);
+  const refusedCards = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/db/refusedRecoveryCards.ts")).href);
   const mapper = await import(pathToFileURL(join(PROXY, "boxMessagesMapper.ts")).href);
   return { gate: gate.validateBoxRequest, classify: prepared.classifyBoxContinuation,
     compile: (body: Body) => mapper.compileBoxCliSyntheticTurn(body, { cwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`, cliVersion: "2.1.280" }),
@@ -283,7 +284,7 @@ async function load(): Promise<Api> {
       defaults: { permissionMode: "bypassPermissions", model: authority.BOX_NATIVE_CONTEXT_MODEL } }),
     home: process.env.OPENCLAUDE_HOME!,
     sessionsBackend: (pool) => sessionsBackend.createPgSessionsBackend(pool, { expectedGeneration: 1 }),
-    closeRefusedRecoveryChains: (pool) => sessionsBackend.closeRefusedRecoveryChains(pool),
+    closeRefusedRecoveryChains: (pool) => refusedCards.closeRefusedRecoveryChains(pool),
     tape: { version: protocol.LOSSLESS_TURN_TAPE_VERSION, partBytes: protocol.LOSSLESS_TURN_TAPE_PART_BYTES },
     cliVersion: { gate: () => new cliVersion.BoxCliVersionGate(), launchResolver: cliVersion.gateBoxLaunchResolver,
       transport: (fetchImpl) => new transport.BoxExecTransport({ execUrl: "https://box.invalid/agent.v1.ControlService/Exec",
@@ -705,8 +706,7 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
   spoolRead?: (call: number) => void;
   pendingRead?: (call: number) => void;
   proofRead?: (call: number) => void;
-  /** OCV5-509: the arguments the CLI called the tool with (default: the model's). */
-  pendingArguments?: unknown;
+  pendingArguments?: unknown; // OCV5-509: the arguments the CLI called the tool with (default: the model's)
   /** OCV5-488: what the read-only liveness probe finds of the run on the Box (default: alive). */
   liveness?: { state: string; boot: string };
   capacityWaitMs?: number;
@@ -2381,6 +2381,7 @@ async function proveRefusedRecoveryClosed(api: Api, database: unknown): Promise<
     close: (pool) => api.closeRefusedRecoveryChains(pool), model: MODEL }));
 }
 
+// [ocv5-337-foreign-tool-history] PASS — tool history from another model is admitted and staged under paired Box tool ids
 // [ocv5-509-cli-repaired-tool-input] PASS — a tool call the CLI records and runs unicode-repaired hands off the model's own input, and any other difference is still refused
 const proveCliRepaired = (api: Api) => proveCliRepairedToolInput({ boxHost: (spool, faults) => boxHost(api, spool, faults),
   spoolOf, cliInit, start, event, stop, BOX_BASH, CLI_MODEL, must, codeOf });

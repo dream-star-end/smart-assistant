@@ -25,10 +25,8 @@ import {
   clearGatewayShutdownEvidenceByDispatchIds,
   markGatewayShutdownEvidence,
 } from '../billing/finalizeJournalReconciler.js'
-import {
-  advanceClientTimelineIdentityInTransaction,
-  closeRefusedRecoveryChains,
-} from '../db/pgSessionsBackend.js'
+import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBackend.js'
+import { closeRefusedRecoveryChains } from '../db/refusedRecoveryCards.js'
 import type { ContainerCallResult, DispatchIdentity } from './containerDispatchClient.js'
 import {
   classifyVisibleOrphan,
