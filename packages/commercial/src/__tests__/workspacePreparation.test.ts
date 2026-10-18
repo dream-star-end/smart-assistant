@@ -41,7 +41,7 @@ test('even a failing warning sink cannot reject background preparation', async (
 test('workspace HTTP hint authenticates JWT before waking and cannot select another user', async () => {
   const jwtSecret = 'isolated-workspace-hint-fixture-'.repeat(2)
   const wakes: bigint[] = []
-  const deps = { jwtSecret, prepareWorkspaceContainer: async (uid: bigint) => { wakes.push(uid); return true } } as Parameters<typeof handleWorkspacePrepare>[3]
+  const deps = { jwtSecret, prepareWorkspaceContainer: async (uid: bigint) => { wakes.push(uid); return true } } as unknown as Parameters<typeof handleWorkspacePrepare>[3]
   let response = ''
   const res = { statusCode: 0, setHeader: () => {}, end: (body: string) => { response = body } } as unknown as ServerResponse
   const context = {} as Parameters<typeof handleWorkspacePrepare>[2]
@@ -58,7 +58,7 @@ test('workspace HTTP hint authenticates JWT before waking and cannot select anot
 test('HTTP preparation propagates admission denial without an accepted response', async () => {
   const jwtSecret = 'isolated-workspace-denial-fixture-'.repeat(2)
   const { token } = await signAccess({ sub: '42', role: 'user' }, jwtSecret)
-  const deps = { jwtSecret, prepareWorkspaceContainer: async () => { throw Error('MAINTENANCE') } } as Parameters<typeof handleWorkspacePrepare>[3]
+  const deps = { jwtSecret, prepareWorkspaceContainer: async () => { throw Error('MAINTENANCE') } } as unknown as Parameters<typeof handleWorkspacePrepare>[3]
   let ended = false
   const res = { setHeader: () => {}, end: () => { ended = true } } as unknown as ServerResponse
   await assert.rejects(handleWorkspacePrepare({ headers: { authorization: 'Bearer '.concat(token) } } as IncomingMessage,

@@ -1517,6 +1517,8 @@ describe("CodexAdapter.preheat — fresh volatile thread, zero inference RPC", (
     });
     await h.adapter.preheat();
     const old = h.proc();
+    // Match live ChildProcess state used by the shutdown signal guard.
+    Object.assign(old, { exitCode: null, signalCode: null });
     h.adapter.setModel("gpt-6-luna");
     const turn = beginTurn(h);
     await waitFor(() => old.killed);

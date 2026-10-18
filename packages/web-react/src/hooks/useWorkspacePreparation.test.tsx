@@ -2,10 +2,12 @@ import { StrictMode } from 'react'
 import { act, cleanup, renderHook } from '@testing-library/react'
 import { afterEach, expect, test, vi } from 'vitest'
 import type { AuthSession } from '../lib/types'
+import { createMemoryAuthSession } from '../lib/authSession'
 import { api } from '../lib/api'
 import { useWorkspacePreparation } from './useWorkspacePreparation'
 vi.mock('../lib/api', () => ({ api: { prepareWorkspace: vi.fn(() => Promise.resolve({ accepted: true })) } }))
-const auth = { accessToken: 'fixture-only' } as AuthSession
+const auth = createMemoryAuthSession(() => {})
+auth.commitToken(auth.beginIdentity(), 'fixture-only')
 afterEach(() => { cleanup(); vi.clearAllMocks(); vi.restoreAllMocks() })
 test('visible authenticated workspace prepares before hydration and only once per identity', () => {
   vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
