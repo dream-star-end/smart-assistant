@@ -79,7 +79,7 @@ test("deploy gate missing credential fails closed without executing node", () =>
   assert.match(out, /rc=1/); assert.doesNotMatch(out, /NODE_MUST_NOT_RUN/);
 });
 test("new gate is within forward smoke before smoked and absent from rollback", () => {
-  assert.match(shellFunction("cutover_smoke_against_release"), /user_contract_gate \|\| \{ cutover_fail "[^"]+"; return 1; \}/);
+  assert.match(shellFunction("cutover_smoke_against_release"), /user_contract_gate "\$rel" \|\| \{ cutover_fail "[^"]+"; return 1; \}/);
   assert.doesNotMatch(shellFunction("cutover_smoke_healthz_only"), /user_contract_gate/);
   assert.doesNotMatch(shellFunction("cmd_smoke"), /user_contract_gate/);
   const fn = shellFunction("user_contract_gate");
@@ -151,4 +151,39 @@ test("OCV5-460: the smoke fails C3 when any continuation turn read an offloaded 
   const smoke = readFileSync(new URL("../v5-user-contract-smoke.mjs", import.meta.url), "utf8");
   assert.match(smoke, /const run = await runContinuationTurns\(/);
   assert.match(smoke, /for \(const sent of run\.sent \?\? \[\]\) \{\n\s+const reads = offloadedRequestReads\(probe\.received, sent\);\n\s+if \(reads\.length\) throw new Error/);
+});
+
+// The user-approved OCV5-496 exception is per candidate SHA and only concerns G1.
+test("OCV5-496: exact-SHA approval skips only Go and keeps other verdicts", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ocv5-496-gate-"));
+  const pw = join(dir, "pw"), policy = join(dir, "policy");
+  const sha = "a".repeat(40);
+  writeFileSync(pw, "x");
+  const gate = shellFunction("user_contract_gate").replace("/etc/openclaude/selfhost-canary.password", pw);
+  const functions = [shellFunction("selfhost_policy_get"), shellFunction("go_cache_user_waiver_matches"), gate].join("\n");
+  const run = (want: string, actual: string | null, smokeRc = 0, goRc = 1, stopRc = 0) => {
+    writeFileSync(policy, `OC_V5_SELFHOST_SKIP_GO_CACHE_SHA=${want}\n`, { mode: 0o600 });
+    writeFileSync(join(dir, ".complete"), JSON.stringify(actual === null ? {} : { sourceCommit: actual }));
+    return execFileSync("bash", ["-c", `${functions}
+      unset OC_V5_SELFHOST_SKIP_GO_CACHE_SHA
+      SELFHOST_POLICY_FILE="$1"; SCRIPT_DIR=/s; V5_PORT=1
+      cutover_clog(){ echo "$*"; }
+      node(){ echo "RUN $1"; case "$1" in *prewarm*) return 0;; *user-contract-smoke*) return ${smokeRc};; *go-cache*) return ${goRc};; *stop-before-start*) return ${stopRc};; esac; }
+      user_contract_gate "$2"; echo rc=$?
+    `, "gate", policy, dir], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  };
+  for (const [want, actual] of [["", sha], ["a", sha], ["b".repeat(40), sha], [sha, "c".repeat(40)], [sha, null]]) {
+    const result = run(want!, actual);
+    assert.match(result, /RUN \/s\/v5-go-cache-contract\.mjs\nrc=1/);
+    assert.doesNotMatch(result, /经用户批准跳过|RUN .*stop-before-start/);
+  }
+  const approved = run(sha, sha);
+  assert.match(approved, /RUN \/s\/v5-user-contract-smoke\.mjs/);
+  assert.match(approved, /经用户批准跳过，原因是 Go 无额度/);
+  assert.match(approved, /RUN \/s\/v5-stop-before-start-contract\.mjs\nrc=0/);
+  assert.doesNotMatch(approved, /RUN .*go-cache/);
+  const smokeFailed = run(sha, sha, 1);
+  assert.match(smokeFailed, /rc=1/);
+  assert.doesNotMatch(smokeFailed, /经用户批准跳过|RUN .*stop-before-start/);
+  assert.match(run(sha, sha, 0, 1, 1), /RUN \/s\/v5-stop-before-start-contract\.mjs\nrc=1/);
 });

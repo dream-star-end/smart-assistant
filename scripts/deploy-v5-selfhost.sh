@@ -2040,7 +2040,8 @@ assert_ssh_rule_before_drop() {
 }
 
 # Fail closed; the caller owns the existing compensation/exit path.
-user_contract_gate() {
+user_contract_gate() { # <candidate release>
+  local rel="${1:-}"
   local password_file=/etc/openclaude/selfhost-canary.password
   [[ -f "$password_file" && -r "$password_file" && -s "$password_file" ]] \
     || { echo "FATAL: user contract canary password missing/unreadable/empty: $password_file" >&2; return 1; }
@@ -2058,10 +2059,14 @@ user_contract_gate() {
     node "$SCRIPT_DIR/v5-user-contract-smoke.mjs" || return 1
   # OCV5-432: a real multi-turn OpenCode Go chat must read the upstream prompt cache
   # (INC-20261015-GO-CACHE-PREFIX wrote the whole prompt every request and read 0).
-  V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
-    V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
-    V5_CANARY_PASSWORD_FILE="$password_file" \
-    node "$SCRIPT_DIR/v5-go-cache-contract.mjs" || return 1
+  if [[ -n "$rel" ]] && go_cache_user_waiver_matches "$rel"; then
+    cutover_clog "  ⚠ G1 Go 缓存实测: 经用户批准跳过，原因是 Go 无额度 (OCV5-496; sourceCommit=$(jq -r '.sourceCommit' "$rel/.complete"))"
+  else
+    V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
+      V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
+      V5_CANARY_PASSWORD_FILE="$password_file" \
+      node "$SCRIPT_DIR/v5-go-cache-contract.mjs" || return 1
+  fi
   # OCV5-435: a Stop sent while the turn's engine is still starting must stop that turn
   # (INC-20261015-PRESTART-STOP-LOST answered it TURN_NOT_ACTIVE and the turn ran unseen).
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
@@ -2402,7 +2407,7 @@ cutover_smoke_against_release() { # <rel>
     cutover_clog "  ✓ egress 双槽拓扑一致:active=$want"
   fi
   # Must pass before either branch persists phase=smoked (survivor invariant).
-  user_contract_gate || { cutover_fail "cutover smoke: 用户契约门禁(C1–C3 + G1 Go 缓存)失败"; return 1; }
+  user_contract_gate "$rel" || { cutover_fail "cutover smoke: 用户契约门禁(C1–C3 + G1 Go 缓存)失败"; return 1; }
 }
 
 cutover_smoke_healthz_only() {
@@ -2568,6 +2573,16 @@ selfhost_policy_get() { # <key> → 值(可为空)。告警走 stderr,stdout 只
     fi
   fi
   printf '%s' "$v"
+}
+
+# OCV5-496: explicit user approval for one personal release with an unfunded Go key.
+# Bind only G1 to the candidate source SHA; another release defaults to the full gate.
+go_cache_user_waiver_matches() { # <rel>
+  local want sha
+  want="$(selfhost_policy_get OC_V5_SELFHOST_SKIP_GO_CACHE_SHA)"
+  [[ "$want" =~ ^[0-9a-f]{40}$ ]] || return 1
+  sha="$(jq -er '.sourceCommit' "$1/.complete" 2>/dev/null || true)"
+  [[ "$sha" == "$want" ]]
 }
 
 gate_fail_policy() { # → rollback|stay;非法值按 rollback(保持旧行为)
