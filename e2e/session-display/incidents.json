@@ -7221,10 +7221,16 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/ocv5-477-collab-404-app.node-test.mjs",
           "assertion": "solo must stick after a 404 save"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-477-advisor-error-clears-app.node-test.mjs",
+          "assertion": "no stale save error after a successful save"
         }
       ],
       "coverageCommits": [
-        "7d838973"
+        "7d838973",
+        "a318d84b"
       ]
     },
     {
