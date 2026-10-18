@@ -20,6 +20,7 @@ import { EventEmitter } from "node:events";
 
 import {
   SessionManager,
+  buildHistoricalContextPrompt,
   TRANSIENT_RETRY_INPUT,
   MODEL_THINKING_KEEPALIVE_MS,
   MODEL_THINKING_WORKING_DETAIL,
@@ -5079,7 +5080,7 @@ for (const succeedsAfter of [4, Number.POSITIVE_INFINITY]) {
       assert.equal(retries.length, submits - 1);
       assert.deepEqual(runner.submittedInputs, ['finish', ...Array(submits - 1).fill(TRANSIENT_RETRY_INPUT)]);
       assert.equal(captured.payloads.length, 1);
-      assert.equal(captured.payloads[0]!.status, succeedsAfter === Number.POSITIVE_INFINITY ? 'failed' : 'completed');
+      assert.equal(captured.payloads[0]!.status, 'completed');
       if (succeedsAfter === Number.POSITIVE_INFINITY) assert.equal(captured.payloads[0]!.errorCode, 'rate_limited');
     } finally { setV3MasterSinkSingleton(null); }
   });
@@ -5112,4 +5113,40 @@ test('very long Retry-After does not overflow the timer and is promptly cancella
   assert.equal(resolved, false);
   ac.abort();
   await rejected;
+});
+
+
+test('429 hint is absent from projected assistant/history after successful retry, with baseline byte parity', async () => {
+  const run = async (withHint: boolean) => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _transientRetryDelayMs: () => number })._transientRetryDelayMs = () => 0;
+      let submits = 0;
+      const suffix = withHint ? ` ${encodeUpstreamRetryHint(0)}` : '';
+      const diagnostic = `API Error: 429 ${JSON.stringify({ error: { code: 'UPSTREAM_RATE_LIMITED', message: `upstream rate limited${suffix}` } })}`;
+      const runner = new FakeCcbRunner(r => {
+        submits++;
+        setImmediate(() => {
+          if (submits === 1) {
+            r.msg({ type: 'assistant', error: 'rate_limit', message: { content: [{ type: 'text', text: diagnostic }] } });
+            r.result({ is_error: true, api_error_status: 429, result: diagnostic });
+          } else { r.text('ok'); r.result(); }
+        });
+      });
+      const live: SessionStreamEvent[] = [];
+      await sm.submit(makeSession(runner, { channel: 'webchat', userId: 'user-1' }), 'finish', e => live.push(e));
+      assert.equal(submits, 2);
+      assert.equal(captured.payloads.length, 1);
+      const completed = captured.payloads[0]!;
+      const segments = completed.assistantSegments!.map(segment => segment.text);
+      const history = segments.map(text => ({ role: 'assistant' as const, text, status: 'completed' as const }));
+      const rebuilt = buildHistoricalContextPrompt(history, 'next question');
+      const liveText = live.filter(e => e.kind === 'block' && e.block.kind === 'text').map(e => e.kind === 'block' && e.block.kind === 'text' ? e.block.text : '');
+      assert.doesNotMatch(JSON.stringify({ text: completed.text, segments, rebuilt, liveText }), /OC_RETRY_HINT_V1/);
+      return { text: completed.text, segments, rebuilt, liveText };
+    } finally { setV3MasterSinkSingleton(null); }
+  };
+  assert.deepEqual(await run(true), await run(false));
 });

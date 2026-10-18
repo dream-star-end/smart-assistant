@@ -28,3 +28,10 @@ export function decodeUpstreamRetryHint(diagnostic: string): Readonly<UpstreamRe
     return undefined
   }
 }
+
+/** Strip machine metadata only at a known API-error presentation boundary.
+ * Ordinary assistant/user/tool text must never be passed here. */
+export function stripUpstreamRetryHint(diagnostic: string): string {
+  return diagnostic.replace(/ ?OC_RETRY_HINT_V1:[A-Za-z0-9_-]{1,256}(?![A-Za-z0-9_-])/g,
+    token => decodeUpstreamRetryHint(token.trim()) ? '' : token)
+}

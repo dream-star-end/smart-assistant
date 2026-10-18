@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { encodeUpstreamRetryHint, decodeUpstreamRetryHint } from '../upstreamRetryHint.js'
+import { encodeUpstreamRetryHint, decodeUpstreamRetryHint, stripUpstreamRetryHint } from '../upstreamRetryHint.js'
 
 test('429 deadline roundtrip, repeated identical hints and safe long timers', () => {
   for (const deadline of [0, Date.now() + 10_000, Date.now() + 2 ** 32]) {
@@ -19,4 +19,11 @@ test('malformed, conflicting, non-429 and extra fields never create a deadline',
   }
   assert.equal(encodeUpstreamRetryHint(-1), undefined)
   assert.equal(encodeUpstreamRetryHint(Number.POSITIVE_INFINITY), undefined)
+})
+
+test('error presentation removes only valid machine metadata, restoring pre-hint diagnostic bytes', () => {
+  const original = 'API Error: 429 {"message":"rate limited"}'
+  const withHint = original.replace('rate limited', `rate limited ${encodeUpstreamRetryHint(0)}`)
+  assert.equal(stripUpstreamRetryHint(withHint), original)
+  assert.equal(stripUpstreamRetryHint('OC_RETRY_HINT_V1:broken'), 'OC_RETRY_HINT_V1:broken')
 })

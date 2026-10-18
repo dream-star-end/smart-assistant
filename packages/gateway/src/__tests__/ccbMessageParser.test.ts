@@ -1564,3 +1564,12 @@ describe('429 error-only retry hints', () => {
     assert.equal(p.getResult().retryHint, undefined)
   })
 })
+
+it('ordinary model text containing a valid marker remains verbatim and creates no retry metadata', () => {
+  const text = `explain ${encodeUpstreamRetryHint(0)}`
+  const p = createParser()
+  p.parser.parse({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text } } } as never)
+  p.parser.parse({ type: 'result', is_error: false } as never)
+  assert.equal(p.getResult().assistantText, text)
+  assert.equal(p.getResult().retryHint, undefined)
+})

@@ -10,6 +10,7 @@ import {
   type CallTokenUsageSnapshot,
   type UpstreamRetryHint,
   decodeUpstreamRetryHint,
+  stripUpstreamRetryHint,
   type OutboundContentBlock,
   type TurnTokenUsageSnapshot,
   isToolExitCode,
@@ -1344,6 +1345,10 @@ export class CcbMessageParser {
         typeof c.text === 'string' &&
         c.text.length > 0
       ) {
+        // Restore the pre-hint API diagnostic before UI/persistence/history.
+        // Native raw protocol retention remains lossless; model text is untouched.
+        const text = stripUpstreamRetryHint(c.text)
+        if (!text) continue
         // Only accumulate into assistantBuf for main-agent turns (mirrors
         // _handleStreamEvent's text_delta rule). Subagent error text is
         // still surfaced to the UI but not merged into the parent's buffer.
@@ -1354,7 +1359,7 @@ export class CcbMessageParser {
             this.currentTextSegmentIndex++
             this.pendingTextSegmentBumpOnNextText = false
           }
-          this.assistantBuf += c.text
+          this.assistantBuf += text
           let cur = this.assistantSegments[this.assistantSegments.length - 1]
           if (!cur || cur.index !== this.currentTextSegmentIndex) {
             cur = {
@@ -1365,9 +1370,9 @@ export class CcbMessageParser {
             }
             this.assistantSegments.push(cur)
           }
-          cur.text += c.text
+          cur.text += text
         }
-        const textBlock: Record<string, unknown> = { kind: 'text', text: c.text }
+        const textBlock: Record<string, unknown> = { kind: 'text', text }
         if (parentToolUseId) textBlock.parentToolUseId = parentToolUseId
         // V3 v7 — stamp canonical id on main-agent text (synthetic-error
         // path included; client treats it as part of the same row that
@@ -1563,7 +1568,7 @@ export class CcbMessageParser {
     const rawErrorClass = (msg as any).errorClass
     const errorClass: ClassifiedErrorCode | undefined =
       typeof rawErrorClass === 'string' ? (rawErrorClass as ClassifiedErrorCode) : undefined
-    const errorDetail = isError
+    const rawErrorDetail = isError
       ? JSON.stringify({
           subtype: (msg as any).subtype,
           result: (msg as any).result,
@@ -1572,8 +1577,9 @@ export class CcbMessageParser {
         })
       : undefined
     const apiErrorStatus = (msg as { api_error_status?: unknown }).api_error_status
-    const retryHint = isError && errorDetail && (apiErrorStatus === undefined || apiErrorStatus === 429)
-      ? decodeUpstreamRetryHint(errorDetail) : undefined
+    const retryHint = isError && rawErrorDetail && (apiErrorStatus === undefined || apiErrorStatus === 429)
+      ? decodeUpstreamRetryHint(rawErrorDetail) : undefined
+    const errorDetail = rawErrorDetail === undefined ? undefined : stripUpstreamRetryHint(rawErrorDetail)
     const staleResumeId =
       Array.isArray(errorsField) &&
       errorsField.some(
