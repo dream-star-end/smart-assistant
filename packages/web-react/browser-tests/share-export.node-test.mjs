@@ -32,6 +32,7 @@ test("OCV5-507 sharing and Markdown downloads contain final answers and portable
       });
       await page.goto(server.url);
       await page.getByRole("button", { name: "复制文字", exact: true }).waitFor();
+      await page.getByRole("radio", { name: "全部", exact: true }).click();
       await page.getByRole("button", { name: "复制文字", exact: true }).click();
       await page.waitForFunction(() => window.__copied?.includes("销售"));
       const event = page.waitForEvent("download");
