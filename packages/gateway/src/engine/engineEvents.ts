@@ -1,3 +1,4 @@
+import type { UpstreamRetryHint } from '@openclaude/protocol'
 /**
  * engineEvents — Engine 适配层的中立事件/汇总类型(权威源)。
  *
@@ -329,6 +330,7 @@ export interface TurnIncompleteDiagnostics {
  * 异常终态(error/exit/timeout 强制 finish)resolve null,与旧 onFinish(null) 对齐。
  */
 export interface TurnSummary {
+  retryHint?: Readonly<UpstreamRetryHint>
   usage: {
     cost: number
     inputTokens: number

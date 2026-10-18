@@ -21,7 +21,8 @@ import {
 } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import type { ChatMessage } from "../../lib/chat/model";
-import { ProgressiveMarkdown, RecoveredStepContext } from "./cards";
+import { FirstTextPaintCommitProbe } from "./FirstTextPaintCommitProbe";
+import { type CardCallbacks, ProgressiveMarkdown, RecoveredStepContext } from "./cards";
 import { normalizeToolForDisplay, parseCodexTypeName, stripShellWrapperForDisplay, type ToolInput } from "../tool/format";
 import { detectOcCli, resolveToolMeta } from "../tool/meta";
 import { resolveToolStatus } from "../tool/status";
@@ -1043,7 +1044,9 @@ function groupNode(messages: readonly ChatMessage[], current: boolean): { Icon: 
 const shellToggleClass =
   "group/shell -mx-1.5 flex min-h-10 w-[calc(100%+0.75rem)] items-center gap-2.5 rounded-lg px-1.5 py-1.5 text-left transition-colors duration-150 hover:bg-hover/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent [@media(hover:none)]:min-h-11";
 
-function StageText({ message, live = false }: { message: ChatMessage; live?: boolean }) {
+function StageText({ message, live = false, onFirstTextPaint }: {
+  message: ChatMessage; live?: boolean; onFirstTextPaint?: CardCallbacks["onFirstTextPaint"];
+}) {
   // Same suppression as AssistantCard: an unpublished fallback must not
   // reappear just because the row was grouped into the process. The body
   // itself is ProgressiveMarkdown, the final answer's renderer, with no
@@ -1059,6 +1062,7 @@ function StageText({ message, live = false }: { message: ChatMessage; live?: boo
       data-find-member={timelineMessageKey(message)}
       className="min-w-0"
     >
+      <FirstTextPaintCommitProbe message={message} onFirstTextPaint={onFirstTextPaint} />
       <ProgressiveMarkdown text={text} live={live} />
     </div>
   );
@@ -1095,6 +1099,7 @@ function NarrativeDot() {
 
 export function ProcessDisclosure<T>({
   sections,
+  onFirstTextPaint,
   active,
   open,
   setOpen,
@@ -1111,6 +1116,7 @@ export function ProcessDisclosure<T>({
   turnEndedAt,
 }: {
   sections: ProcessSection<T>[];
+  onFirstTextPaint?: CardCallbacks["onFirstTextPaint"];
   active: boolean;
   open: boolean;
   setOpen: (open: boolean) => void;
@@ -1199,7 +1205,7 @@ export function ProcessDisclosure<T>({
         return (
           <div key={keyOf(item)} className="space-y-1">
             {rows.map((message) => (
-              <StageText key={message.id} message={message} live={isLive} />
+              <StageText key={message.id} message={message} live={isLive} onFirstTextPaint={onFirstTextPaint} />
             ))}
           </div>
         );
