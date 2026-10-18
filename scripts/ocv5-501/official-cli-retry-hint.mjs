@@ -30,10 +30,10 @@ function hasOrderedExactUserText(originalChunks,resumedChunks){
 // Local guard examples: coalescing is valid; losing a task or reversing the
 // original chunk order must still fail before any isolated HTTP/CLI fixture.
 assert.equal(hasOrderedExactUserText(
- [fixturePrompt,fixtureContinuation],[fixturePrompt+'\n'+fixtureContinuation+'\n']),true);
+ [fixturePrompt,fixtureContinuation],[`${fixturePrompt}\n${fixtureContinuation}\n`]),true);
 assert.equal(hasOrderedExactUserText([fixturePrompt],[fixtureContinuation]),false);
 assert.equal(hasOrderedExactUserText(
- [fixturePrompt,fixtureContinuation],[fixtureContinuation+'\n'+fixturePrompt+'\n']),false);
+ [fixturePrompt,fixtureContinuation],[`${fixtureContinuation}\n${fixturePrompt}\n`]),false);
 for(const name of ['control','hint','missing-egress']){
  const home=`${root}/${name}`;mkdirSync(home);mkdirSync(`${home}/cache`);mkdirSync(`${home}/config`);
  const captured=[];
@@ -96,8 +96,8 @@ for(const name of ['control','hint','missing-egress']){
  const resumedUserText=userTextContents(request);
  assert.ok(resumedUserText.some(text=>text.includes(fixtureContinuation)),`${name} continuation input missing`);
  assert.ok(originalUserText.some(text=>text.includes(fixturePrompt)),`${name} original task missing from first request`);
- assert.ok(resumedUserText.some(text=>text.includes(fixturePrompt)),name+' original task missing from resumed request');
- assert.ok(hasOrderedExactUserText(originalUserText,resumedUserText),name+' lost or reordered exact original user-task text during resume');
+ assert.ok(resumedUserText.some(text=>text.includes(fixturePrompt)),`${name} original task missing from resumed request`);
+ assert.ok(hasOrderedExactUserText(originalUserText,resumedUserText),`${name} lost or reordered exact original user-task text during resume`);
  arms.push({name,httpPosts:captured.length,status,terminalRetainsHint:name==='hint',terminalRetainsCode:name==='missing-egress',
   repairedAfterFailure:name==='missing-egress',resumedSameSession:true,originalTaskContextPreserved:true,
   hintAbsentFromResumedPrompt:true,apiErrorsAbsentFromResumedPrompt:true,
