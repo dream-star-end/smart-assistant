@@ -31,6 +31,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { provePendingUser } from "./lib/boxPendingUserProof.js";
 import { proveLocalCatalogOwner } from "./lib/boxLocalCatalogOwnerProof.js";
+import { proveRefusedRecoveryClosed as refusedRecoveryProof } from "./lib/boxRefusedRecoveryProof.js";
+import { misrecordedRun, proveCliRepairedToolInput, proveForeignToolHistory, rereadError } from "./lib/boxCliRepairProof.js";
+
 const LIMIT_MS = 120_000;
 const CANDIDATE = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
 const PROXY = join(CANDIDATE, "packages/commercial/src/http/proxy");
@@ -53,6 +56,8 @@ type Api = {
     pollIntervalMs: number; retryDelaysMs?: readonly number[] }) => AsyncGenerator<{ text: string; endOffset: number }>;
   spoolAccess: () => unknown;
   transportError: (code: string) => Error;
+  /** OCV5-509: whether a failed replay re-read is the run's own deterministic refusal. */
+  replayRejection: (error: unknown) => boolean;
   firstRound: (input: unknown, deps: unknown) => Promise<{ kind: string }>;
   textFetch: (deps: unknown) => { fetch: (input: unknown) => Promise<Response> };
   registry: () => { open: (input: { uid: bigint; sessionId: string; accountId: bigint }) => unknown;
@@ -105,6 +110,8 @@ type Api = {
   sessionManager: { submit: (...args: unknown[]) => Promise<unknown> };
   home: string;
   sessionsBackend: (pool: unknown) => SessionsBackend;
+  /** OCV5-509: the reconciler sweep that closes a recovery chain paused before it ran. */
+  closeRefusedRecoveryChains: (pool: unknown) => Promise<number>;
   tape: { version: number; partBytes: number };
   /** The Box CLI version gate and the exec transport its read goes through. */
   cliVersion: { gate: () => { read: (target: unknown) => Promise<string> };
@@ -131,7 +138,9 @@ type PrelaunchReceipt = PrelaunchIdentity & { identityHash: string };
 type SessionsBackend = { admitUserTurn: (input: unknown) => Promise<{ kind: string }>;
   stageLosslessTurnTapePart: (userId: string, request: unknown, bytes: Buffer) => Promise<unknown>;
   finalizeLosslessTurnTape: (userId: string, request: unknown) => Promise<{ applied: string }>;
-  getClientSession: (sessionId: string, userId: string) => Promise<{ messages: Array<{ id?: string }> } | null> };
+  getClientSession: (sessionId: string, userId: string) => Promise<{ messages: Array<{ id?: string }> } | null>;
+  appendServerAuthoredMessage: (sessionId: string, userId: string, message: Record<string, unknown> & { id: string; role: string }) =>
+    Promise<{ applied: boolean }> };
 type RouteHandler = (req: unknown, res: unknown, ctx: { hostUuid: string; boundIp: string }) => Promise<void>;
 type IdleOp = { runnerKilledAt?: number; disposition?: string; abandonReason?: string; [key: string]: unknown };
 type IdleFiles = { IDLE_STOPPED_GRACE_MS: number;
@@ -224,6 +233,7 @@ async function load(): Promise<Api> {
     attemptOnce: async () => fail("GATEWAY_SINK_USED") });
   const protocol = await import(pathToFileURL(join(CANDIDATE, "packages/protocol/src/index.ts")).href);
   const sessionsBackend = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/db/pgSessionsBackend.ts")).href);
+  const refusedCards = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/db/refusedRecoveryCards.ts")).href);
   const mapper = await import(pathToFileURL(join(PROXY, "boxMessagesMapper.ts")).href);
   const localCatalog = await import(pathToFileURL(join(GATEWAY, "modelCatalogClient.ts")).href);
   const spawnConfig = await import(pathToFileURL(join(GATEWAY, "subprocessSpawnConfig.ts")).href);
@@ -291,6 +301,7 @@ async function load(): Promise<Api> {
     pollSpool: poller.pollBoxSpoolLines,
     spoolAccess: () => access.makeBoxDetachedRunAccess({ runNonce: "a".repeat(24), detachedRunnerHash: "b".repeat(64) }),
     transportError: (code) => new transport.BoxExecTransportError(code, false),
+    replayRejection: observer.isBoxReplayRejection,
     firstRound: firstRound.runBoxToolFirstRound,
     textFetch: (deps) => new textFetch.BoxTextFetch(deps),
     registry: () => new registry.BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 600_000 }),
@@ -332,6 +343,7 @@ async function load(): Promise<Api> {
       defaults: { permissionMode: "bypassPermissions", model: authority.BOX_NATIVE_CONTEXT_MODEL } }),
     home: process.env.OPENCLAUDE_HOME!,
     sessionsBackend: (pool) => sessionsBackend.createPgSessionsBackend(pool, { expectedGeneration: 1 }),
+    closeRefusedRecoveryChains: (pool) => refusedCards.closeRefusedRecoveryChains(pool),
     tape: { version: protocol.LOSSLESS_TURN_TAPE_VERSION, partBytes: protocol.LOSSLESS_TURN_TAPE_PART_BYTES },
     cliVersion: { gate: () => new cliVersion.BoxCliVersionGate(), launchResolver: cliVersion.gateBoxLaunchResolver,
       transport: (fetchImpl) => new transport.BoxExecTransport({ execUrl: "https://box.invalid/agent.v1.ControlService/Exec",
@@ -753,6 +765,7 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
   spoolRead?: (call: number) => void;
   pendingRead?: (call: number) => void;
   proofRead?: (call: number) => void;
+  pendingArguments?: unknown; // OCV5-509: the arguments the CLI called the tool with (default: the model's)
   /** OCV5-488: what the read-only liveness probe finds of the run on the Box (default: alive). */
   liveness?: { state: string; boot: string };
   capacityWaitMs?: number;
@@ -809,7 +822,7 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
     if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("pending.")) {
       faults.pendingRead?.(++count.pendingRead);
       return reply(JSON.stringify({ version: 1, modelToolUseId: args[4], mcpRequestId: 7,
-        name: "Bash", arguments: { value: "x" } }));
+        name: "Bash", arguments: faults.pendingArguments ?? { value: "x" } }));
     }
     if (args.length === 5 && /^[a-f0-9]{24}$/.test(args[3] ?? "") && /^[a-f0-9]{32}$/.test(args[4] ?? "")) {
       // the keeper is asked to stop: a CLI still waiting for tool results stops, one that already exited does not
@@ -2421,6 +2434,17 @@ async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<
   });
 }
 
+// [ocv5-509-refused-recovery-closed] PASS — a recovery paused before it ran ends its turn with a visible card once nothing will run it on, and an answered chain is left alone
+async function proveRefusedRecoveryClosed(api: Api, database: unknown): Promise<string> {
+  return withSessionsBackend(api, database, (backend, db) => refusedRecoveryProof({ backend, db,
+    close: (pool) => api.closeRefusedRecoveryChains(pool), model: MODEL, takeover: true }));
+}
+
+// [ocv5-337-foreign-tool-history] PASS — tool history from another model is admitted and staged under paired Box tool ids
+// [ocv5-509-cli-repaired-tool-input] PASS — a tool call the CLI records and runs unicode-repaired hands off the model's own input, and any other difference is still refused
+const proveCliRepaired = (api: Api) => proveCliRepairedToolInput({ boxHost: (spool, faults) => boxHost(api, spool, faults),
+  spoolOf, cliInit, start, event, stop, BOX_BASH, CLI_MODEL, must, codeOf });
+
 /** A Box for the resident CLI lane: an exec endpoint that really runs what the bridge sends (the product's
  * launch, write and stop scripts) around a stand-in for the Claude binary. `refuse.writes` makes the Box
  * answer a stdin write with exit 1 without running it. */
@@ -3476,7 +3500,7 @@ async function proveContainerRebuiltStopsParkedTurn(api: Api, db: Db): Promise<s
  * answers before the request reaches Box stops the parked turn (a 4xx in egress' error shape, except 408, 429
  * and BOX_REPLAY_PENDING). A 5xx or timeout does not: the run may still finish, and the cleanup worker's
  * success recovery then delivers its answer, which a stop would throw away. */
-async function proveAnyRefusalStopsParkedTurn(api: Api, db: Db): Promise<string> {
+async function proveAnyRefusalStopsParkedTurn(api: Api, db: Db): Promise<string[]> {
   const journal = api.journal(db);
   const endTurn = async (uid: bigint, label: string, status: number, code: string, message: string) => {
     const who = { uid, containerId: uid - 900_000_000n, sessionId: `session-${label}` };
@@ -3515,7 +3539,21 @@ async function proveAnyRefusalStopsParkedTurn(api: Api, db: Db): Promise<string>
   if (transient.calls !== 0 || transient.stops !== 0 || transient.state !== "handoff") {
     fail(`REFUSAL_5XX_STOPPED_${transient.calls}_${transient.stops}_${transient.state}`);
   }
-  return "[ocv5-488-any-refusal-stops-parked-turn] PASS — a refusal before Box of any code stops the parked Box turn, and a 5xx leaves the run to finish and deliver its answer";
+  // OCV5-509: a re-read run the protocol refuses ends the turn like a refusal, so the parked run is stopped and
+  // the automatic recovery can run the turn on, instead of the same 503 on every retry. The re-read: the CLI's
+  // record of the call is not the streamed one, which no number of reads changes; a transport failure is not one.
+  const reread = rereadError(api.decoder(CLI_MODEL, CLI_TOOLS),
+    misrecordedRun({ call, cliInit, start, say, stop, BOX_BASH, CLI_MODEL }));
+  if (!api.replayRejection(reread) || api.replayRejection(api.transportError("BOX_EXEC_TIMEOUT"))) {
+    fail("REPLAY_REJECTION_NOT_CLASSIFIED");
+  }
+  const replayRejected = await endTurn(900_000_509n, "replay-rejected-409", 409, "BOX_REPLAY_REJECTED",
+    "previous Box response was rejected");
+  if (replayRejected.calls !== 1 || replayRejected.stops !== 1 || replayRejected.state !== "failed_stopped") {
+    fail(`REPLAY_REJECTED_NOT_STOPPED_${replayRejected.calls}_${replayRejected.stops}_${replayRejected.state}`);
+  }
+  return ["[ocv5-488-any-refusal-stops-parked-turn] PASS — a refusal before Box of any code stops the parked Box turn, and a 5xx leaves the run to finish and deliver its answer",
+    "[ocv5-509-replay-rejection-ends-turn] PASS — a re-read Box run the protocol refuses ends the turn as a refusal and stops the parked run, not a retried 503"];
 }
 
 /** Things this run created outside its own memory. */
@@ -3615,43 +3653,7 @@ function proveParallelImageCaption(api: Api): string {
   return "[ocv5-334-parallel-image-caption] PASS — one caption among parallel image results joins the image it describes";
 }
 
-/** INC-20261008-BOX-FOREIGN-TOOL-HISTORY, commercial u1870 10:28 CST: the session had run k3-256k, whose tool calls
- * carry ids like `tool_…`. Switched to box-api-claude-opus-5-5, every request was refused before launch with 400
- * BOX_REQUEST_UNSUPPORTED (BOX_BLOCK_UNSUPPORTED). History from another model is admitted with its tool calls renamed
- * pair by pair; a live tool exchange keeps the strict Box ids. */
-function proveForeignToolHistory(api: Api): string {
-  const history = (current: unknown): Body => ({ model: MODEL, stream: true, max_tokens: 64, tools: [tool("Bash"), tool("Read")],
-    messages: [{ role: "user", content: "list files" },
-      { role: "assistant", content: [{ type: "thinking", thinking: "plan", signature: "k3-signature" },
-        { type: "tool_use", id: "tool_Ab12Cd34Ef56", name: "Bash", input: { command: "ls" } }] },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: "tool_Ab12Cd34Ef56", content: "a" }] },
-      { role: "assistant", content: [{ type: "tool_use", id: "call_9", name: "Read", input: { file_path: "/a" } }] },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_9", content: "A" }] },
-      { role: "assistant", content: [text("done")] }, current] });
-  const admitted = api.gate(history({ role: "user", content: "now continue with Claude" }), true);
-  if (admitted !== null) fail(`FOREIGN_HISTORY_GATE_${admitted}`);
-  // what the Box CLI is given: the same history, each call paired under one stable toolu_ id
-  const staged = api.compile(history({ role: "user", content: "now continue with Claude" })).snapshotJsonl;
-  const again = api.compile(history({ role: "user", content: "now continue with Claude" })).snapshotJsonl;
-  const ids = staged.match(/toolu_oc[0-9a-f]{32}/g) ?? [];
-  if (ids.length !== 4 || new Set(ids).size !== 2 || staged.includes("tool_Ab12Cd34Ef56") || staged.includes("call_9")
-    || !isDeepStrictEqual(again.match(/toolu_oc[0-9a-f]{32}/g), ids)) fail(`FOREIGN_HISTORY_STAGED_${ids.length}`);
-  // a pure Box history is staged byte for byte as before
-  const box = api.compile({ model: MODEL, stream: true, max_tokens: 64, tools: [tool("Bash")], messages: [
-    { role: "assistant", content: [{ type: "tool_use", id: "toolu_keep_1", name: "Bash", input: {} }] },
-    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_keep_1", content: "x" }] },
-    { role: "assistant", content: [text("ok")] }, { role: "user", content: "next" }] }).snapshotJsonl;
-  if (!box.includes('"toolu_keep_1"') || box.includes("toolu_oc")) fail("FOREIGN_HISTORY_BOX_CHANGED");
-  const classified = api.classify(history({ role: "user", content: "now continue with Claude" }));
-  if (classified.classification !== "fresh") fail(`FOREIGN_HISTORY_CLASS_${classified.classification}`);
-  // a current tool result under a foreign id is no live Box exchange and stays refused
-  const live: Body = { model: MODEL, stream: true, max_tokens: 64, tools: [tool("Bash")], messages: [
-    { role: "user", content: "run" },
-    { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "Bash", input: {} }] },
-    { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" }] }] };
-  if (api.gate(live, true) === null || api.classify(live).classification === "continuation_candidate") fail("FOREIGN_LIVE_ADMITTED");
-  return "[ocv5-337-foreign-tool-history] PASS — tool history from another model is admitted and staged under paired Box tool ids";
-}
+
 async function cleanUp(): Promise<void> {
   const pending = [...cleanups];
   cleanups.clear();
@@ -3676,7 +3678,8 @@ async function main(): Promise<void> {
   process.env.OPENCLAUDE_HOME = home;
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
-    provePendingUser(api), await proveLocalCatalogOwner(api), proveImageCaption(api), proveParallelImageCaption(api), proveForeignToolHistory(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
+    provePendingUser(api), await proveLocalCatalogOwner(api), proveImageCaption(api), proveParallelImageCaption(api),
+    proveForeignToolHistory(api), await proveCliRepaired(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveMixedCallTurnCut(api),
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),
@@ -3690,8 +3693,8 @@ async function main(): Promise<void> {
       await proveUpstreamRefusal(api, db), await proveNativeResumedStop(api, db),
       await proveOutputLimitResume(api, db),
       await proveProcessAbsentReleased(api, db), await proveIdleProofStopsParkedTurn(api, db),
-      await proveContainerRebuiltStopsParkedTurn(api, db), await proveAnyRefusalStopsParkedTurn(api, db)]),
-    ...await proveFinalizedTurnRecovery(api, database)];
+      await proveContainerRebuiltStopsParkedTurn(api, db), ...await proveAnyRefusalStopsParkedTurn(api, db)]),
+    ...await proveFinalizedTurnRecovery(api, database), await proveRefusedRecoveryClosed(api, database)];
   await cleanUp();
   clearTimeout(deadline);
   process.stdout.write(`${JSON.stringify({ ok: true, expectSha, candidate: CANDIDATE, proofs })}\n`);

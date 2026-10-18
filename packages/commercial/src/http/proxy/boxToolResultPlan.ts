@@ -61,9 +61,11 @@ export function parseBoxPendingCall(raw: string,
   }
   const x = value as Record<string, unknown>;
   let sameArguments = false;
+  // OCV5-509: the CLI calls the tool with its repaired record of the input.
   try { sameArguments = "inputHash" in expected
-    ? hashBoxToolInput(x.arguments) === expected.inputHash
-    : isDeepStrictEqual(x.arguments, expected.input); }
+    ? [expected.inputHash, expected.cliInputHash].includes(hashBoxToolInput(x.arguments))
+    : isDeepStrictEqual(x.arguments, expected.input)
+      || (expected.cliInput !== undefined && isDeepStrictEqual(x.arguments, expected.cliInput)); }
   catch { sameArguments = false; }
   if (Object.keys(x).sort().join(",") !== "arguments,mcpRequestId,modelToolUseId,name,version"
     || x.version !== 1 || x.modelToolUseId !== expected.id

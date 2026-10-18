@@ -13,6 +13,7 @@ import type {
   ToolUseBlockParam,
 } from '@anthropic-ai/sdk/resources/index.mjs'
 import { randomUUID, type UUID } from 'crypto'
+import isEqual from 'lodash-es/isEqual.js'
 import isObject from 'lodash-es/isObject.js'
 import last from 'lodash-es/last.js'
 import {
@@ -2289,6 +2290,13 @@ function relocateToolReferenceSiblings(
   return result
 }
 
+/**
+ * Private key on a stored tool_use block: the input exactly as the model
+ * wrote it, present only when normalizeToolInput changed it. Never sent to an
+ * API; normalizeMessagesForAPI echoes it in place of the corrected input.
+ */
+export const MODEL_TOOL_INPUT_KEY = '_modelToolInput'
+
 export function normalizeMessagesForAPI(
   messages: Message[],
   tools: Tools = [],
@@ -2518,22 +2526,29 @@ export function normalizeMessagesForAPI(
               ).map(block => {
                 if (typeof block === 'string') return block
                 if (block.type === 'tool_use') {
-                  const toolUseBlk = block as ToolUseBlock
+                  const {
+                    [MODEL_TOOL_INPUT_KEY]: modelInput,
+                    ...blockWithoutModelInput
+                  } = block as ToolUseBlock & Record<string, unknown>
+                  const toolUseBlk = blockWithoutModelInput as ToolUseBlock
                   const tool = tools.find(t =>
                     toolMatchesName(t, toolUseBlk.name),
                   )
+                  const echoedInput = isObject(modelInput)
+                    ? modelInput
+                    : toolUseBlk.input
                   const normalizedInput = tool
                     ? normalizeToolInputForAPI(
                         tool,
-                        toolUseBlk.input as Record<string, unknown>,
+                        echoedInput as Record<string, unknown>,
                       )
-                    : toolUseBlk.input
+                    : echoedInput
                   const canonicalName = tool?.name ?? toolUseBlk.name
 
                   // When tool search is enabled, preserve all fields including 'caller'
                   if (searchExtraToolsEnabled) {
                     return {
-                      ...block,
+                      ...toolUseBlk,
                       name: canonicalName,
                       input: normalizedInput,
                     }
@@ -2543,7 +2558,7 @@ export function normalizeMessagesForAPI(
                   // like 'caller', but preserve other provider metadata attached to
                   // the block (for example Gemini thought signatures on tool_use).
                   const { caller: _caller, ...toolUseRest } =
-                    block as ToolUseBlock &
+                    toolUseBlk as ToolUseBlock &
                       Record<string, unknown> & { caller?: unknown }
                   return {
                     ...toolUseRest,
@@ -3029,6 +3044,7 @@ export function normalizeContentFromAPI(
         }
 
         // Then apply tool-specific corrections
+        const modelInput = normalizedInput
         if (typeof normalizedInput === 'object' && normalizedInput !== null) {
           const tool = findToolByName(tools, contentBlock.name)
           if (tool) {
@@ -3045,9 +3061,17 @@ export function normalizeContentFromAPI(
           }
         }
 
+        // OCV5-509: the corrected input is what runs and what is shown, but
+        // the API is sent back the call exactly as the model wrote it (see
+        // normalizeMessagesForAPI). A Box continuation compares that echo with
+        // the model's own call; a Bash `cd <cwd> && ` stripped here was refused
+        // as BOX_TOOL_RESULT_MISMATCH.
         return {
           ...contentBlock,
           input: normalizedInput,
+          ...(isObject(modelInput) && !isEqual(modelInput, normalizedInput)
+            ? { [MODEL_TOOL_INPUT_KEY]: modelInput }
+            : {}),
         }
       }
       case 'text':
