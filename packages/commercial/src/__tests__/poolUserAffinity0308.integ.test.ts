@@ -339,7 +339,7 @@ describe("new model availability requires affirmative account evidence (OCV5-516
     const ids=await query<{ id:string; paid_tier:string }>('SELECT id::text,paid_tier FROM gemini_oauth_accounts ORDER BY id');
     const ultra=ids.rows.find((r)=>r.paid_tier==='g1-ultra-lite-tier')!.id;
     await saveAntigravityMetadata(ultra,'g1-ultra-lite-tier',Object.fromEntries(['low','medium','high'].map((effort)=>[
-      'claude-sonnet-5-5-'+effort,{ remainingFraction:1,resetTime:null },
+      `claude-sonnet-5-5-${effort}`,{ remainingFraction:1,resetTime:null },
     ])));
     assert.equal((await pickAntigravityAccount({ userId:3n,modelId:'antigravity-claude-sonnet-5.5' }))?.accountId.toString(),ultra);
     await reportAntigravityOutcome(BigInt(ultra),{kind:'rate_limited',retryAfterMs:60000},'test');
