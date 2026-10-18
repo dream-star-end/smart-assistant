@@ -14,7 +14,7 @@
 
 只给uid765创建root:root 0700目录/etc/openclaude/cursor-v5-u765和root:root 0600单链接普通文件.https-proxy。文件值只能从已运行个人版openclaude-v5-selfhost-cursor-proxy.service对应配置的明确inbound解析，不借u3/cc1、不改Box登录/全局pool/模型catalog/路由、不重启服务。assert-first、不可覆盖既有对象；在官方selfhost人工变更租约回调中执行，审计前后元数据和live SHA。
 
-用户已允许开通后“同账号、同非cc1登录、未改代码”作为缓存对照，开通前N/A。当前pool account2优先并非硬隔离，可能溢出default，因此不能仅靠偏好做真实调用。必须先有不改变全局策略的受支持非cc1隔离入口，缺失则只完成出口开通，真实首轮/追问与缓存门标未通过。
+用户19:12批准最小开通；19:14缓存硬门；19:后续允许恢复后同账号未改代码基线（开通前N/A）；19:23明确允许正常登录池溢出default，不再为隔离阻塞。按真实网页照常测试并记录actual login，缓存比较尽量保持同login，跨login不冒称严格对照。不改变任何登录池或路由配置。
 
 ## 测试和收益
 
