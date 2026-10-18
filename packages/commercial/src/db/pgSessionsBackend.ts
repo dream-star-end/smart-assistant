@@ -1098,6 +1098,11 @@ function deferredUserReplayMetadata(message: MessageLike): MessageLike {
     ...(typeof message._idem === "string" && message._idem.length <= 256
       ? { _idem: message._idem }
       : {}),
+    // Recovery admission re-reads the hot row before dispatch takeover; these
+    // small server-owned lineage fields must survive payload deferral too.
+    ...Object.fromEntries(["_recoveryOfClientMessageId", "_recoveryMode", "_automaticRecovery",
+      "_automaticRecoveryRootClientMessageId", "_automaticRecoveryAttempt", "_automaticRecoveryMax"]
+      .filter(key => message[key] !== undefined).map(key => [key, message[key]])),
     _deferredRetryEligible: retryEligible,
   };
 }

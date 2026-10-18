@@ -99,9 +99,11 @@ async function latestSource(q: Pool | PoolClient, row: TurnDispatchRow,
   return deps.hydrate(q, row.sessionId, `c:${row.userId}`, source)
 }
 
+const hasPersistedRejectedProof = (row: TurnDispatchRow): boolean =>
+  row.outcome === 'not_accepted' && row.failureCode === 'DISPATCH_NOT_ACCEPTED'
 const isSourceFailure = (row: TurnDispatchRow | null): row is TurnDispatchRow =>
-  row !== null && row.status === 'terminal' && row.failureCode === SOURCE_FAILURE &&
-  row.outcome === 'executed_error' && row.acceptedAt === null && row.agentContainerId !== null
+  row !== null && row.status === 'terminal' && row.acceptedAt === null && row.agentContainerId !== null &&
+  ((row.failureCode === SOURCE_FAILURE && row.outcome === 'executed_error') || hasPersistedRejectedProof(row))
 
 /** True means a supported request is waiting for proof or has a durable job;
  * the ordinary failure reconciler must defer its no-billing/manual verdict.
@@ -116,7 +118,12 @@ export async function recoverAdmissionAfterRestart(pool: Pool, dispatchId: strin
   if (!initialLineage) return false
   let proof: ContainerCallResult
   try {
-    proof = await deps.rejectIfAbsent({
+    // The existing reconciler writes this exact code only after a durable
+    // rejected tombstone (resolveRejecting). A detached drain bridge or a
+    // killed cleanup may already have reached that boundary before reconnect.
+    // Reuse the persisted exact-identity proof even if its old container was
+    // subsequently reaped; never treat mere absence/unreachability as proof.
+    proof = hasPersistedRejectedProof(original) ? { kind: 'ok', state: 'rejected' } : await deps.rejectIfAbsent({
       uid: original.userId, dispatchId, attemptNo: original.attemptNo,
       sessionId: original.sessionId, clientMessageId: original.clientMessageId,
       agentContainerId: original.agentContainerId, runtimeKind: original.runtimeKind,
@@ -167,6 +174,7 @@ export async function recoverAdmissionAfterRestart(pool: Pool, dispatchId: strin
     const proofDigest = createHash('sha256').update(JSON.stringify({
       dispatchId, attemptNo: row.attemptNo, requestHash: row.requestHash,
       snapshot: source._admissionRestartRequest, state: proof.state,
+      proofSource: hasPersistedRejectedProof(original) ? 'reconciled_dispatch' : 'container_tombstone',
     })).digest('hex')
     const stopped = await client.query(
       `SELECT 1 FROM turn_control_requests WHERE user_id=$1 AND session_id=$2 AND kind='stop'
@@ -212,8 +220,9 @@ export async function reconcileAdmissionRestarts(pool: Pool, userId: bigint, lim
   deps: AdmissionRestartStorageDeps): Promise<number> {
   const candidates = await pool.query<{ dispatch_id: string; attempt_no: number }>(
     `SELECT dispatch_id,attempt_no FROM turn_dispatches d
-      WHERE user_id=$1 AND status='terminal' AND outcome='executed_error'
-        AND failure_code=$2 AND accepted_at IS NULL
+      WHERE user_id=$1 AND status='terminal' AND accepted_at IS NULL
+        AND ((outcome='executed_error' AND failure_code=$2)
+          OR (outcome='not_accepted' AND failure_code='DISPATCH_NOT_ACCEPTED'))
         AND NOT EXISTS (SELECT 1 FROM turn_recovery_jobs j
           WHERE j.user_id=d.user_id AND j.session_id=d.session_id
             AND j.source_client_message_id=d.client_message_id)

@@ -8,9 +8,9 @@ import { createPgSessionsBackend, type PgSessionsBackend } from '../db/pgSession
 import { snapshotAdmissionRequest, ADMISSION_RESTART_UNEXECUTED } from '../dispatch/admissionRestartRecovery.js'
 import type { ContainerCallResult, DispatchIdentity } from '../dispatch/containerDispatchClient.js'
 import { casToTerminal, getDispatch } from '../dispatch/turnDispatchStore.js'
-import { claimDueRecoveryJobs } from '../dispatch/turnRecoveryStore.js'
+import { claimDueRecoveryJobs, releaseRecoveryPreReceipt } from '../dispatch/turnRecoveryStore.js'
 import { admitDurableControl } from '../dispatch/turnControlStore.js'
-import { runReconcileTick } from '../dispatch/turnDispatchReconciler.js'
+import { runReconcileTick, runShutdownDispatchHandoff } from '../dispatch/turnDispatchReconciler.js'
 import { truncateAllForTest, useDedicatedTestDatabase } from './helpers/db.js'
 
 const fixture = useDedicatedTestDatabase('ocv5_511_admission_restart_test')
@@ -56,7 +56,7 @@ function wire(text = 'complete input\u0000including exact NUL'): Record<string, 
   }
 }
 
-async function seed(options: { request?: Record<string, unknown>; snapshot?: boolean; optimistic?: boolean; journal?: string } = {}) {
+async function seed(options: { request?: Record<string, unknown>; snapshot?: boolean; optimistic?: boolean; journal?: string; terminal?: boolean } = {}) {
   const request = options.request ?? wire()
   const content = request.content as Record<string, unknown>
   const message = { id: sourceId, role: 'user', text: String(content.text), ts: Date.now(),
@@ -79,7 +79,7 @@ async function seed(options: { request?: Record<string, unknown>; snapshot?: boo
   if (options.journal) await getPool().query(`INSERT INTO request_finalize_journal
     (request_id,user_id,ctx,precheck_credits,state,dispatch_id)
     VALUES ($1,$2,'{}',50,$3,$4)`, [d.billingRequestId, uid.toString(), options.journal, d.dispatchId])
-  await casToTerminal(getPool(), { dispatchId: d.dispatchId, outcome: 'executed_error',
+  if (options.terminal !== false) await casToTerminal(getPool(), { dispatchId: d.dispatchId, outcome: 'executed_error',
     failureCode: 'bridge_closed_during_admission', clientNotified: false, expectedEpoch: d.leaseEpoch })
   return { d, request }
 }
@@ -285,5 +285,56 @@ test('OCV5-511 an older session Stop does not suppress a later accepted intent',
     rootClientMessageId: null, kind: 'stop', payload: { type: 'inbound.control', action: 'stop' } })
   await getPool().query("UPDATE turn_control_requests SET created_at=NOW()-INTERVAL '1 day'")
   assert.equal(await backend.recoverInterruptedAdmission(d.dispatchId), true)
+  assert.equal((await jobs()).length, 1)
+})
+
+test('OCV5-511 shutdown handoff rejection of a detached preparing bridge remains recoverable after container reap', async t => {
+  if (fixture.skipIfUnavailable(t)) return
+  const { d } = await seed({ journal: 'inflight', terminal: false })
+  const result = await runShutdownDispatchHandoff({ pool: getPool(), budgetMs: 1500,
+    markJournals: async () => 0,
+    container: { rejectIfAbsent: async () => ({ kind: 'ok', state: 'rejected' }),
+      getDispatchState: async () => ({ kind: 'ok', state: 'rejected' }) } })
+  assert.equal(result.timedOut, false)
+  const rejected = await getDispatch(getPool(), d.dispatchId)
+  assert.equal(rejected?.outcome, 'not_accepted'); assert.equal(rejected?.failureCode, 'DISPATCH_NOT_ACCEPTED')
+  proof = { kind: 'unreachable', detail: 'old container reaped after its durable tombstone committed' }
+  assert.equal(await backend.reconcileAutomaticRecoveryJobs(uid), 1)
+  assert.equal((await jobs()).length, 1)
+  assert.equal(proofCalls.length, 0, 'persisted exact rejected proof is already authoritative')
+})
+
+test('OCV5-511 deferred automatic replay preserves lineage across pre-receipt transport retry', async t => {
+  if (fixture.skipIfUnavailable(t)) return
+  const { d } = await seed({ request: wire('x'.repeat(150_000)) })
+  assert.equal(await backend.recoverInterruptedAdmission(d.dispatchId), true)
+  const [first] = await claimDueRecoveryJobs(getPool(), { userId: uid, ownerId: 'master-one', leaseMs: 60_000 })
+  assert.ok(first)
+  const admit = (job: typeof first, ownerId: string) => {
+    const r = job.request, cmid = String(r.clientMessageId)
+    const recovery = (r.content as { recovery: NonNullable<Parameters<PgSessionsBackend['admitUserTurn']>[0]['recovery']> }).recovery
+    return backend.admitUserTurn({ uid, sessionUserId: `c:${uid}`, sessionId,
+      clientMessageId: cmid, agentId: 'main', model: 'gpt-6-sol', ownerId,
+      requestHash: computeDispatchRequestHash(r.content as DispatchRequestContent),
+      billingRequestId: randomUUID().replaceAll('-', ''), dispatchId: randomUUID(),
+      agentContainerId: 511, runtimeKind: 'docker', recovery,
+      recoveryJob: { jobId: job.jobId, leaseOwner: job.leaseOwner, leaseEpoch: job.leaseEpoch },
+      message: { id: cmid, role: 'user', text: String((r.content as Record<string, unknown>).text), ts: Date.now(),
+        _admissionRestartRequest: snapshotAdmissionRequest(r) } })
+  }
+  const initial = await admit(first, 'bridge-one')
+  assert.equal(initial.kind, 'admitted')
+  if (initial.kind !== 'admitted') return
+  assert.equal(await releaseRecoveryPreReceipt(getPool(), { job: first,
+    dispatchId: initial.dispatch.dispatchId, dispatchOwner: initial.dispatch.ownerId!,
+    dispatchLeaseEpoch: initial.dispatch.leaseEpoch }), true)
+  await getPool().query('UPDATE turn_recovery_jobs SET next_attempt_at=NOW()')
+  const [retry] = await claimDueRecoveryJobs(getPool(), { userId: uid, ownerId: 'master-two', leaseMs: 60_000 })
+  assert.ok(retry)
+  const resumed = await admit(retry, 'bridge-two')
+  assert.equal(resumed.kind, 'admitted', 'must not reject deferred row with identity_reused')
+  if (resumed.kind !== 'admitted') return
+  assert.equal(resumed.dispatch.dispatchId, initial.dispatch.dispatchId)
+  assert.equal(resumed.dispatch.billingRequestId, initial.dispatch.billingRequestId)
   assert.equal((await jobs()).length, 1)
 })
