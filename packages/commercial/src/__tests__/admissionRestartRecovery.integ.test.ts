@@ -24,11 +24,15 @@ const sourceId = 'cm-admission-restart-source'
 
 beforeEach(async () => {
   if (!fixture.available) return
-  await truncateAllForTest(['users', 'client_sessions', 'request_finalize_journal', 'usage_records', 'credit_ledger'])
+  await truncateAllForTest(['turn_recovery_jobs', 'turn_control_requests', 'turn_dispatches',
+    'client_session_turn_tapes', 'client_sessions', 'request_finalize_journal',
+    'usage_records', 'credit_ledger', 'users'])
   const pool = getPool()
   uid = BigInt((await pool.query<{ id: string }>(
     "INSERT INTO users(email,password_hash,credits,role) VALUES ('admission-restart@test.local','stub',1000,'user') RETURNING id::text",
   )).rows[0].id)
+  await pool.query(`INSERT INTO agent_containers(id,user_id,secret_hash,state,runtime_channel)
+    VALUES (511,$1,$2,'active','v5')`, [uid.toString(), Buffer.alloc(32)])
   await pool.query(`INSERT INTO sessions_store_migration_state
     (singleton,authority,generation,cutover_id,source_digest,completed_at)
     VALUES (true,'pg_authoritative',1,'test','test',1)
@@ -59,14 +63,15 @@ function wire(text = 'complete input\u0000including exact NUL'): Record<string, 
 async function seed(options: { request?: Record<string, unknown>; snapshot?: boolean; optimistic?: boolean; journal?: string; terminal?: boolean } = {}) {
   const request = options.request ?? wire()
   const content = request.content as Record<string, unknown>
-  const message = { id: sourceId, role: 'user', text: String(content.text), ts: Date.now(),
+  const message = { id: sourceId, role: 'user', text: String(content.displayText ?? content.text),
+    _modelText: String(content.text), ts: Date.now(),
     _routing: { model: request.model },
     ...(options.snapshot === false ? {} : { _admissionRestartRequest: snapshotAdmissionRequest(request) }),
   } as MessageLike & { id: string }
   if (options.optimistic) {
     await backend.upsertClientSession({ id: sessionId, userId: `c:${uid}`, agentId: 'main', title: 'optimistic',
       pinned: false, createdAt: Date.now(), lastAt: Date.now(), updatedAt: Date.now(),
-      messages: [{ id: sourceId, role: 'user', text: String(content.text), ts: Date.now() }] })
+      messages: [{ id: sourceId, role: 'user', text: String(content.displayText ?? content.text), ts: Date.now() }] })
   }
   const admitted = await backend.admitUserTurn({ uid, sessionUserId: `c:${uid}`, sessionId,
     clientMessageId: sourceId, agentId: 'main', model: 'gpt-6-sol',
