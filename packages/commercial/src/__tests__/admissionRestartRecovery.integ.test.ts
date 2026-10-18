@@ -25,8 +25,15 @@ beforeEach(async () => {
   if (!fixture.available) return
   await truncateAllForTest(['turn_recovery_jobs', 'turn_control_requests', 'turn_dispatches',
     'client_session_turn_tapes', 'client_sessions', 'request_finalize_journal',
-    'usage_records', 'credit_ledger', 'users'])
+    'usage_records', 'credit_ledger'])
   const pool = getPool()
+  assert.equal((await pool.query<{ db: string }>('SELECT current_database() AS db')).rows[0].db,
+    'ocv5_511_admission_restart_test')
+  // TRUNCATE users CASCADE resets hundreds of unrelated tables/sequences on
+  // every case. Delete this fixture's actual rows instead; keep real FK rules
+  // and monotonically fresh uid ownership. The container FK is RESTRICT.
+  await pool.query("DELETE FROM agent_containers WHERE id=511 AND user_id IN (SELECT id FROM users WHERE email='admission-restart@test.local')")
+  await pool.query("DELETE FROM users WHERE email='admission-restart@test.local'")
   uid = BigInt((await pool.query<{ id: string }>(
     "INSERT INTO users(email,password_hash,credits,role) VALUES ('admission-restart@test.local','stub',1000,'user') RETURNING id::text",
   )).rows[0].id)
