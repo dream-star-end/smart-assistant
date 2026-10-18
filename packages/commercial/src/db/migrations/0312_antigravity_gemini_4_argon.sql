@@ -2,7 +2,7 @@
 -- OCV5-517: verified with the official 1.4.0 CLI consumer user-agent on 2026-10-18.
 -- Ultra-lite generates Argon successfully; current Pro explicitly advertises disabled Argon.
 -- Official introductory USD/MTok through 2026-11-30: input 2, output 10, implicit cache .10.
--- 50 platform credits/USD; preserve the Gemini subscription multiplier 1. No explicit cache writes.
+-- 50 stored fen/USD (100 fen = 1 displayed credit); preserve the Gemini subscription multiplier 1. No explicit cache writes.
 INSERT INTO model_catalog(model_id,engine,provider_id,upstream_model_id,context_window,
   capability_profile,capability_schema_version,state)
 VALUES ('antigravity-gemini-4-argon','antigravity','antigravity','gemini-4-argon-medium',1048576,
