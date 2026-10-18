@@ -136,5 +136,5 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
         if (evidence) writeFileSync(join(evidence, "advisor-" + saveStatus + "-" + width + ".json"), JSON.stringify(current, null, 2));
       } finally { await context.close(); }
     }
-  } finally { await browser.close(); await preview.close(); }
+  } finally { await browser.close(); for (const ws of preview.wss.clients) ws.terminate(); await new Promise((done) => preview.wss.close(done)); await new Promise((done) => preview.server.close(done)); }
 });
