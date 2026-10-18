@@ -699,6 +699,8 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
   spoolRead?: (call: number) => void;
   pendingRead?: (call: number) => void;
   proofRead?: (call: number) => void;
+  /** OCV5-509: the arguments the CLI called the tool with (default: the model's). */
+  pendingArguments?: unknown;
   /** OCV5-488: what the read-only liveness probe finds of the run on the Box (default: alive). */
   liveness?: { state: string; boot: string };
   capacityWaitMs?: number;
@@ -755,7 +757,7 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
     if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("pending.")) {
       faults.pendingRead?.(++count.pendingRead);
       return reply(JSON.stringify({ version: 1, modelToolUseId: args[4], mcpRequestId: 7,
-        name: "Bash", arguments: { value: "x" } }));
+        name: "Bash", arguments: faults.pendingArguments ?? { value: "x" } }));
     }
     if (args.length === 5 && /^[a-f0-9]{24}$/.test(args[3] ?? "") && /^[a-f0-9]{32}$/.test(args[4] ?? "")) {
       // the keeper is asked to stop: a CLI still waiting for tool results stops, one that already exited does not
@@ -2419,6 +2421,33 @@ async function proveRefusedRecoveryClosed(api: Api, database: unknown): Promise<
   });
 }
 
+/** INC-20261018-BOX-CLI-REPAIRED-TOOL-INPUT, commercial u4 webmvdqhzdqcghrvm (2026-10-18 11:27–12:34Z): every round
+ * in which the model wrote its verification script failed at message_stop as BOX_TOOL_SNAPSHOT_MISMATCH, and each
+ * re-read of it as 503 BOX_REPLAY_UNAVAILABLE, so the automatic recovery ran the same ten-minute call again and
+ * again. Claude Code (2.1.299–2.1.302, MCP tools too) records and runs a streamed tool input after its own repair: a
+ * literal `\uXXXX` such as a script's `[一-鿿]` becomes the character. The round must hand off the model's
+ * own call; a record that differs in any other way is still refused. */
+async function proveCliRepairedToolInput(api: Api): Promise<string> {
+  const model = { value: "re.findall(r'[\\u4e00-\\u9fff]+', title)" };
+  const repaired = { value: "re.findall(r'[一-鿿]+', title)" };
+  const call = (recorded: unknown) => [start("msg_cjk"),
+    event({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_cjk_1", name: BOX_BASH, input: {} } }),
+    event({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(model) } }),
+    { type: "assistant", message: { id: "msg_cjk", model: CLI_MODEL, role: "assistant",
+      content: [{ type: "tool_use", id: "toolu_cjk_1", name: BOX_BASH, input: recorded }] } },
+    event({ type: "content_block_stop", index: 0 }), ...stop("tool_use", 9)];
+  const host = boxHost(api, spoolOf([cliInit, ...call(repaired)]), { pendingArguments: repaired });
+  const handed = await must("CLI_REPAIRED_ROUND", host.round());
+  if (handed.kind !== "tool_handoff" || host.count.launch !== 1) fail(`CLI_REPAIRED_NO_HANDOFF_${handed.kind}`);
+  const use = (host.handoffs.at(-1) as { toolUses: Array<{ input: unknown; cliInput?: unknown }> }).toolUses[0];
+  if (!isDeepStrictEqual(use?.input, model) || !isDeepStrictEqual(use?.cliInput, repaired)) fail("CLI_REPAIRED_WRONG_INPUT");
+  // the client runs what the model wrote
+  if (!host.sse().includes(JSON.stringify(JSON.stringify(model)).slice(1, -1))) fail("CLI_REPAIRED_CLIENT_INPUT");
+  const changed = boxHost(api, spoolOf([cliInit, ...call({ value: "re.findall(r'[a-z]+', title)" })]));
+  if (await codeOf(changed.round) !== "BOX_TOOL_SNAPSHOT_MISMATCH") fail("CLI_REPAIRED_OTHER_CHANGE_ACCEPTED");
+  return "[ocv5-509-cli-repaired-tool-input] PASS — a tool call the CLI records and runs unicode-repaired hands off the model's own input, and any other difference is still refused";
+}
+
 /** A Box for the resident CLI lane: an exec endpoint that really runs what the bridge sends (the product's
  * launch, write and stop scripts) around a stand-in for the Claude binary. `refuse.writes` makes the Box
  * answer a stdin write with exit 1 without running it. */
@@ -3474,7 +3503,7 @@ async function proveContainerRebuiltStopsParkedTurn(api: Api, db: Db): Promise<s
  * answers before the request reaches Box stops the parked turn (a 4xx in egress' error shape, except 408, 429
  * and BOX_REPLAY_PENDING). A 5xx or timeout does not: the run may still finish, and the cleanup worker's
  * success recovery then delivers its answer, which a stop would throw away. */
-async function proveAnyRefusalStopsParkedTurn(api: Api, db: Db): Promise<string> {
+async function proveAnyRefusalStopsParkedTurn(api: Api, db: Db): Promise<string[]> {
   const journal = api.journal(db);
   const endTurn = async (uid: bigint, label: string, status: number, code: string, message: string) => {
     const who = { uid, containerId: uid - 900_000_000n, sessionId: `session-${label}` };
@@ -3513,7 +3542,15 @@ async function proveAnyRefusalStopsParkedTurn(api: Api, db: Db): Promise<string>
   if (transient.calls !== 0 || transient.stops !== 0 || transient.state !== "handoff") {
     fail(`REFUSAL_5XX_STOPPED_${transient.calls}_${transient.stops}_${transient.state}`);
   }
-  return "[ocv5-488-any-refusal-stops-parked-turn] PASS — a refusal before Box of any code stops the parked Box turn, and a 5xx leaves the run to finish and deliver its answer";
+  // OCV5-509: a re-read run the protocol refuses ends the turn like a refusal, so the parked run is stopped and
+  // the automatic recovery can run the turn on, instead of the same 503 on every retry
+  const replayRejected = await endTurn(900_000_509n, "replay-rejected-409", 409, "BOX_REPLAY_REJECTED",
+    "previous Box response was rejected");
+  if (replayRejected.calls !== 1 || replayRejected.stops !== 1 || replayRejected.state !== "failed_stopped") {
+    fail(`REPLAY_REJECTED_NOT_STOPPED_${replayRejected.calls}_${replayRejected.stops}_${replayRejected.state}`);
+  }
+  return ["[ocv5-488-any-refusal-stops-parked-turn] PASS — a refusal before Box of any code stops the parked Box turn, and a 5xx leaves the run to finish and deliver its answer",
+    "[ocv5-509-replay-rejection-ends-turn] PASS — a re-read Box run the protocol refuses ends the turn as a refusal and stops the parked run, not a retried 503"];
 }
 
 /** Things this run created outside its own memory. */
@@ -3680,7 +3717,8 @@ async function main(): Promise<void> {
   process.env.OPENCLAUDE_HOME = home;
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
-    proveImageCaption(api), proveParallelImageCaption(api), proveForeignToolHistory(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
+    proveImageCaption(api), proveParallelImageCaption(api), proveForeignToolHistory(api), await proveCliRepairedToolInput(api),
+    await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveMixedCallTurnCut(api),
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),
@@ -3692,7 +3730,7 @@ async function main(): Promise<void> {
       await proveAnsweredExchangePrompt(api, db), await proveWaitingHandoffSuperseded(api, db), await proveResumeUnsentParked(api, db),
       await proveUnknownNeverClosed(api, db), await proveNativeResumedStop(api, db),
       await proveProcessAbsentReleased(api, db), await proveIdleProofStopsParkedTurn(api, db),
-      await proveContainerRebuiltStopsParkedTurn(api, db), await proveAnyRefusalStopsParkedTurn(api, db)]),
+      await proveContainerRebuiltStopsParkedTurn(api, db), ...await proveAnyRefusalStopsParkedTurn(api, db)]),
     ...await proveFinalizedTurnRecovery(api, database), await proveRefusedRecoveryClosed(api, database)];
   await cleanUp();
   clearTimeout(deadline);

@@ -128,6 +128,7 @@ import { validateBoxRequest } from "./boxRequestGate.js";
 import { waitForBoxReplay } from "./boxReplayWait.js";
 import { boxRequestTailShape, prepareBoxContinuation, type PreparedContinuation } from "./boxPreparedContinuation.js";
 import { BoxDurableJournalError } from "./boxDurableJournal.js";
+import { isBoxReplayRejection } from "./boxToolUnknownObserver.js";
 import { BOX_INTERNAL_ENDPOINT, isBoxRouteModelName } from "./upstream.js";
 import { prepareBoxSwitch, relabelBoxSwitchSession, type BoxSwitchOutcome } from "./boxSwitchCompaction.js";
 import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js";
@@ -1034,6 +1035,12 @@ export function makeAnthropicProxyHandler(
               && (error.code === "BOX_AUTHORITY_REJECTED"
                 || error.code === "BOX_AUTHORITY_MALFORMED")) {
               sendJsonError(res, 409, error.code, "authority binding rejected", requestId);
+              return;
+            }
+            if (isBoxReplayRejection(error)) {
+              userLog.warn("proxy_box_replay_rejected", { err: errSummary(error) });
+              sendJsonError(res, 409, "BOX_REPLAY_REJECTED",
+                "previous Box response was rejected", requestId);
               return;
             }
             userLog.warn("proxy_box_replay_unavailable", { err: errSummary(error) });
