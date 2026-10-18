@@ -1286,7 +1286,7 @@ export function App() {
       }
       // 非 demo：经真实 WS 引擎发送（inbound.message）。确保有会话承载本轮（peer.id）。
       const originalSessionId = target?.sessionId ?? activeId;
-      let sessionId = originalSessionId ?? genWsSessionId();
+      const sessionId = originalSessionId ?? genWsSessionId();
       let createdSession: Session | null = null;
       const recoveryEpoch = collabEpochRef.current;
       const recoverySelection = selectedSessionIdRef.current;

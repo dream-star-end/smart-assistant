@@ -12,6 +12,8 @@ import { resolveBrowserExecutable } from "../../../scripts/lib/resolve-browser.m
 const { chromium } = createRequire(import.meta.url)("playwright-core");
 const red = process.env.OC_UX_ADVISOR_RED === "1";
 const evidence = process.env.OC_UX_EVIDENCE_DIR;
+const catalogOnly = process.env.OC_UX_ADVISOR_CATALOG_ONLY === "1";
+const catalogRed = process.env.OC_UX_ADVISOR_CATALOG_RED === "1";
 const navigationOnly = process.env.OC_UX_ADVISOR_NAV_ONLY === "1";
 const NOTICE = "顾问暂不可用，已由当前主模型继续处理";
 const FILE = "任务材料.txt";
@@ -24,8 +26,9 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
   const swaps = { count: 0 };
   await buildHarnessPage({ harness: "goal-start-harness.tsx", assetDir: dir,
     plugins: red ? [exactSwap("disable-advisor-task-recovery", /\/lib\/collaborationSend\.ts$/,
-      'if (recoveredAdvisor) {', "if (false) {", swaps)] : [] });
-  assert.equal(swaps.count, red ? 1 : 0);
+      'if (recoveredAdvisor) {', "if (false) {", swaps)] : catalogRed ? [exactSwap("disable-blocked-catalog-recovery", /\/lib\/collaborationSend\.ts$/,
+      "continueSolo ||= blockedUnknownAdvisor", "continueSolo ||= false", swaps)] : [] });
+  assert.equal(swaps.count, red || catalogRed ? 1 : 0);
   const preview = await startPreviewServer(dir);
   preview.wss.removeAllListeners("connection");
   let scenario;
@@ -58,8 +61,11 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
   });
   const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
   try {
-    for (const width of [1280, 390]) for (const [variant, saveStatus, navigate = false] of [["empty", 200], ["empty", 503], ["empty", 409], ["fresh-team", 200], ["fresh-advisor", 200], ["restore-original", 200], ["empty", 200, true], ["restore-original", 200, true]]) {
+    for (const width of [1280, 390]) for (const [variant, saveStatus, navigate = false] of [["catalog-unknown", 200], ["catalog-reread-503", 503], ["empty", 200], ["empty", 503], ["empty", 409], ["fresh-team", 200], ["fresh-advisor", 200], ["restore-original", 200], ["empty", 200, true], ["restore-original", 200, true]]) {
       if (navigationOnly && !navigate) continue;
+      const catalogUnavailable = variant.startsWith("catalog-");
+      if (catalogOnly && !catalogUnavailable) continue;
+      const unavailableReason = catalogUnavailable ? "catalog unavailable: fixture unavailable" : "顾问引擎尚未完成无工具证明";
       const label = `${navigate ? "navigate-" : ""}${variant}`;
       scenario = { inbounds: [], calls: [], uploads: [], getCount: 0, mode: "advisor", rev: 7, refreshForSend: false };
       preview.store.board = []; preview.store.older = []; preview.store.revision++;
@@ -71,9 +77,9 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
       const doc = (refresh = true) => ({ rev: current.rev, defaultMode: "advisor", defaultAdvisorModel: "gpt-6-astra",
         session: { mode: current.mode, advisorModel: current.mode === "advisor" ? "gpt-6-astra" : null,
           configVersion: current.mode === "advisor" ? "v1:advisor:gpt-6-astra" : "v1:solo:", source: "session" },
-        advisorModels: [], advisorUnavailableReason: "顾问引擎尚未完成无工具证明",
+        advisorModels: [], advisorUnavailableReason: unavailableReason,
         advisorConsultParents: ["ccb"], advisorConsultAllowed: true, parentEngine: "ccb",
-        ...(refresh && current.refreshForSend && variant !== "empty" ? {
+        ...(refresh && current.refreshForSend && ["fresh-team", "fresh-advisor", "restore-original"].includes(variant) ? {
           session: { mode: variant === "fresh-team" ? "team" : "advisor",
             advisorModel: variant === "fresh-team" ? null : variant === "fresh-advisor" ? "other-advisor" : "gpt-6-astra",
             configVersion: `v1:advisor:${variant === "fresh-advisor" ? "other-advisor" : "gpt-6-astra"}`, source: "session" },
@@ -91,6 +97,8 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
             current.refreshBlocked = true;
             await new Promise((resolve) => { current.releaseRefresh = resolve; current.refreshStarted?.(); });
           }
+          if (current.refreshForSend && variant === "catalog-reread-503")
+            return route.fulfill({ status: 503, json: { error: { message: "fixture catalog unavailable" } } });
           return route.fulfill({ json: doc() });
         }
         const body = req.postDataJSON();
@@ -111,7 +119,7 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
       const boot = async () => {
         await page.waitForURL(`**/s/${BOARD_SESSION}`);
         await page.getByRole("button", { name: /切换智能体/ }).click();
-        await page.getByRole("dialog").getByText("顾问引擎尚未完成无工具证明", { exact: true }).first().waitFor();
+        await page.getByRole("dialog").getByText(unavailableReason, { exact: true }).first().waitFor();
         await page.keyboard.press("Escape");
         await page.getByRole("dialog").waitFor({ state: "hidden" });
       };
@@ -124,7 +132,7 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
         const persistence = navigate || variant === "restore-original" ? null : page.waitForResponse((r) =>
           new URL(r.url()).pathname === "/api/collaboration-config" && r.request().method() === "PUT", { timeout: 10000 });
         if (persistence) void persistence.catch(() => {});
-        const notice = !navigate && !red && variant !== "restore-original"
+        const notice = !navigate && !red && !catalogRed && variant !== "restore-original"
           ? page.getByText(NOTICE, { exact: true }).first().waitFor({ timeout: 10000 }) : null;
         if (notice) void notice.catch(() => {});
         const blocked = navigate ? new Promise((resolve) => { current.refreshStarted = resolve; }) : null;
@@ -144,6 +152,12 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
           if (evidence) { mkdirSync(evidence, { recursive: true }); await page.screenshot({ path: join(evidence, `advisor-${label}-B-draft-${width}.png`), fullPage: true }); }
           await page.evaluate((sid) => { history.pushState(null, "", `/s/${sid}`); dispatchEvent(new PopStateEvent("popstate")); }, BOARD_SESSION);
           await page.waitForURL(`**/s/${BOARD_SESSION}`);
+        }
+        if (catalogUnavailable) {
+          const deadline = Date.now() + 10000;
+          while (current.inbounds.length < number && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+          if (catalogRed && evidence) { mkdirSync(evidence, { recursive: true }); await page.screenshot({ path: join(evidence, `advisor-catalog-before-${label}-${width}.png`), fullPage: true }); }
+          assert.equal(current.inbounds.length, number, "catalog failure must continue the submitted original main task exactly once");
         }
         if (notice) {
           await notice;
@@ -191,6 +205,7 @@ test("OCV5-512 unavailable advisor continues the same main task with its attachm
       try {
         await page.goto(preview.url); await boot(); await submit(1);
         if (saveStatus !== 200) {
+          current.refreshForSend = false;
           await page.reload(); await boot();
           assert.equal(current.inbounds.length, 1, "reload does not resend the old task");
           await submit(2);
