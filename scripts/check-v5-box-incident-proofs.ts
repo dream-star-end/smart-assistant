@@ -103,6 +103,8 @@ type Api = {
   sessionManager: { submit: (...args: unknown[]) => Promise<unknown> };
   home: string;
   sessionsBackend: (pool: unknown) => SessionsBackend;
+  /** OCV5-509: the reconciler sweep that closes a recovery chain paused before it ran. */
+  closeRefusedRecoveryChains: (pool: unknown) => Promise<number>;
   tape: { version: number; partBytes: number };
   /** The Box CLI version gate and the exec transport its read goes through. */
   cliVersion: { gate: () => { read: (target: unknown) => Promise<string> };
@@ -129,7 +131,9 @@ type PrelaunchReceipt = PrelaunchIdentity & { identityHash: string };
 type SessionsBackend = { admitUserTurn: (input: unknown) => Promise<{ kind: string }>;
   stageLosslessTurnTapePart: (userId: string, request: unknown, bytes: Buffer) => Promise<unknown>;
   finalizeLosslessTurnTape: (userId: string, request: unknown) => Promise<{ applied: string }>;
-  getClientSession: (sessionId: string, userId: string) => Promise<{ messages: Array<{ id?: string }> } | null> };
+  getClientSession: (sessionId: string, userId: string) => Promise<{ messages: Array<{ id?: string }> } | null>;
+  appendServerAuthoredMessage: (sessionId: string, userId: string, message: Record<string, unknown> & { id: string; role: string }) =>
+    Promise<{ applied: boolean }> };
 type RouteHandler = (req: unknown, res: unknown, ctx: { hostUuid: string; boundIp: string }) => Promise<void>;
 type IdleOp = { runnerKilledAt?: number; disposition?: string; abandonReason?: string; [key: string]: unknown };
 type IdleFiles = { IDLE_STOPPED_GRACE_MS: number;
@@ -273,6 +277,7 @@ async function load(): Promise<Api> {
       defaults: { permissionMode: "bypassPermissions", model: authority.BOX_NATIVE_CONTEXT_MODEL } }),
     home: process.env.OPENCLAUDE_HOME!,
     sessionsBackend: (pool) => sessionsBackend.createPgSessionsBackend(pool, { expectedGeneration: 1 }),
+    closeRefusedRecoveryChains: (pool) => sessionsBackend.closeRefusedRecoveryChains(pool),
     tape: { version: protocol.LOSSLESS_TURN_TAPE_VERSION, partBytes: protocol.LOSSLESS_TURN_TAPE_PART_BYTES },
     cliVersion: { gate: () => new cliVersion.BoxCliVersionGate(), launchResolver: cliVersion.gateBoxLaunchResolver,
       transport: (fetchImpl) => new transport.BoxExecTransport({ execUrl: "https://box.invalid/agent.v1.ControlService/Exec",
@@ -2362,6 +2367,58 @@ async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<
   });
 }
 
+/** INC-20261018-BOX-RECOVERY-REFUSED-STUCK, commercial u4 webmvc3iq5ff9hmmm (2026-10-17 23:30Z): after a Box 409 the
+ * automatic 「从断点继续」 was refused by the container (DISPATCH_NOT_ACCEPTED); its job was paused and nothing ever
+ * answered the recovery row, so every reload showed 「仍在处理中…」 under the not-started card for twelve hours.
+ * A recovery paused before it ran closes its chain with a visible card while its row is still the last message. */
+async function proveRefusedRecoveryClosed(api: Api, database: unknown): Promise<string> {
+  return withSessionsBackend(api, database, async (backend, db) => {
+    // biome-ignore lint/style/useSingleVarDeclarator: same shape as proveFinalizedTurnRecovery
+    const uid = 9n, sessionUser = "c:9";
+    const chain = async (name: string, pauseReason: string) => {
+      // biome-ignore lint/style/useSingleVarDeclarator: same shape as proveFinalizedTurnRecovery
+      const sessionId = `s-ocv5-509-${name}`, root = `cm-ocv5-509-root-${name}`, recovery = `m-recover-ocv5509-${name}`;
+      const admitted = await backend.admitUserTurn({ uid, sessionUserId: sessionUser, sessionId, clientMessageId: recovery,
+        agentId: "main", model: MODEL, requestHash: "h".repeat(64), billingRequestId: `brq-${recovery}`,
+        dispatchId: randomUUID(), ownerId: "conn-A",
+        message: { id: recovery, role: "user", text: "↻ 自动从断点继续", ts: 1,
+          _routing: { model: MODEL, effortLevel: null, teamMode: false }, _automaticRecovery: true,
+          _automaticRecoveryAttempt: 1, _recoveryOfClientMessageId: root, _automaticRecoveryRootClientMessageId: root } });
+      if (admitted.kind !== "admitted") fail(`REFUSED_RECOVERY_${name}_NOT_ADMITTED`);
+      await db.query(`INSERT INTO turn_recovery_jobs (user_id,session_id,root_client_message_id,source_client_message_id,
+          source_turn_key,error_code,recovery_mode,semantic_recovery_attempt,request_json,tape_sha256,status,pause_reason,
+          terminal_outcome) VALUES ($1,$2,$3,$3,$4,'engine_error','checkpoint',1,$5,$6,'paused',$7,'interrupted')`,
+        [uid.toString(), sessionId, root, "k".repeat(64), JSON.stringify({ clientMessageId: recovery }), "a".repeat(64),
+          pauseReason]);
+      return { sessionId, root, recovery };
+    };
+    const last = async (sessionId: string) =>
+      (await backend.getClientSession(sessionId, sessionUser))?.messages.at(-1) as Record<string, unknown> | undefined;
+    const refused = await chain("refused", "dispatch_not_accepted");
+    const policy = await chain("policy", "refused:UNAUTHORIZED_MODEL");
+    // the recovery row was answered after all: nothing to close
+    const answered = await chain("answered", "dispatch_not_accepted");
+    const reply = await backend.appendServerAuthoredMessage(answered.sessionId, sessionUser,
+      { id: "m-ocv5-509-answer", role: "assistant", text: "done", ts: 2, status: "completed", _source: "server" });
+    if (!reply.applied) fail("REFUSED_RECOVERY_ANSWER_NOT_APPENDED");
+    // a chain that ran and gave up has its own card; it is not this sweep's
+    const exhausted = await chain("exhausted", "automatic_retry_exhausted");
+    if (await api.closeRefusedRecoveryChains(db) !== 2) fail("REFUSED_RECOVERY_NOT_CLOSED");
+    for (const closed of [refused, policy]) {
+      const card = await last(closed.sessionId);
+      // what the client reads as the end of the turn (adoptPendingAutomaticRecoveryFromHistory)
+      if (card?.id !== `m-recovery-giveup-${closed.root}` || card.role !== "assistant" || card._source !== "server"
+        || card.status !== "completed" || typeof card.text !== "string" || !card.text.trim()) {
+        fail(`REFUSED_RECOVERY_CARD_${closed.sessionId}_${String(card?.id)}`);
+      }
+    }
+    if ((await last(answered.sessionId))?.id !== "m-ocv5-509-answer") fail("REFUSED_RECOVERY_ANSWERED_TOUCHED");
+    if ((await last(exhausted.sessionId))?.id !== exhausted.recovery) fail("REFUSED_RECOVERY_EXHAUSTED_TOUCHED");
+    if (await api.closeRefusedRecoveryChains(db) !== 0) fail("REFUSED_RECOVERY_NOT_IDEMPOTENT");
+    return "[ocv5-509-refused-recovery-closed] PASS — a recovery paused before it ran ends its turn with a visible card, and an answered or exhausted chain is left alone";
+  });
+}
+
 /** A Box for the resident CLI lane: an exec endpoint that really runs what the bridge sends (the product's
  * launch, write and stop scripts) around a stand-in for the Claude binary. `refuse.writes` makes the Box
  * answer a stdin write with exit 1 without running it. */
@@ -3636,7 +3693,7 @@ async function main(): Promise<void> {
       await proveUnknownNeverClosed(api, db), await proveNativeResumedStop(api, db),
       await proveProcessAbsentReleased(api, db), await proveIdleProofStopsParkedTurn(api, db),
       await proveContainerRebuiltStopsParkedTurn(api, db), await proveAnyRefusalStopsParkedTurn(api, db)]),
-    ...await proveFinalizedTurnRecovery(api, database)];
+    ...await proveFinalizedTurnRecovery(api, database), await proveRefusedRecoveryClosed(api, database)];
   await cleanUp();
   clearTimeout(deadline);
   process.stdout.write(`${JSON.stringify({ ok: true, expectSha, candidate: CANDIDATE, proofs })}\n`);

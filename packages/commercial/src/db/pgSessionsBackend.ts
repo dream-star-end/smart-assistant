@@ -2119,13 +2119,15 @@ async function appendRecoveryGiveUpTerminalCard(
     sessionId: string;
     sessionUserId: string;
     rootClientMessageId: string;
-    reason: "silent_no_progress" | "retry_exhausted";
+    reason: "silent_no_progress" | "retry_exhausted" | "recovery_refused";
   },
-): Promise<void> {
+): Promise<boolean> {
   const text = input.reason === "silent_no_progress"
     ? "自动恢复已停止：连续多次从断点恢复都没有取得进展，为避免重复执行已暂停。请直接再发一条消息继续，或新开一个会话。"
-    : "自动恢复已停止：已达到自动恢复次数上限。请直接再发一条消息继续，或新开一个会话。";
-  await pgAppendServerAuthoredCore(client, input.sessionId, input.sessionUserId, {
+    : input.reason === "recovery_refused"
+      ? "自动恢复已停止：从断点继续的那一轮没能开始执行（这一轮续接未计费）。请直接再发一条消息继续，或新开一个会话。"
+      : "自动恢复已停止：已达到自动恢复次数上限。请直接再发一条消息继续，或新开一个会话。";
+  const appended = await pgAppendServerAuthoredCore(client, input.sessionId, input.sessionUserId, {
     id: `m-recovery-giveup-${input.rootClientMessageId}`,
     role: "assistant",
     text,
@@ -2136,6 +2138,74 @@ async function appendRecoveryGiveUpTerminalCard(
     _source: "server",
     _clientMessageId: input.rootClientMessageId,
   });
+  return appended.applied;
+}
+
+/**
+ * OCV5-509: a recovery paused before it ever ran — its dispatch refused by the
+ * container (dispatch_not_accepted) or the recovery itself refused (refused:*) —
+ * gets no tape, so nothing ever answers its "↻ 自动从断点继续" row and the
+ * client reads that unanswered row as a recovery still in flight ("仍在处理中…"
+ * across reloads, Stop lit). Close each such chain with the give-up card, but
+ * only while that row is still the session's last message: a session the user
+ * has moved on in is left alone. Idempotent (the card id is per root).
+ */
+export async function closeRefusedRecoveryChains(
+  pool: Pool,
+  input: { limit?: number } = {},
+): Promise<number> {
+  const jobs = (
+    await pool.query<{
+      user_id: string;
+      session_id: string;
+      root_client_message_id: string;
+      recovery_message_id: string | null;
+    }>(
+      `SELECT user_id::text AS user_id, session_id, root_client_message_id,
+              request_json->>'clientMessageId' AS recovery_message_id
+         FROM turn_recovery_jobs
+        WHERE status='paused'
+          AND (pause_reason='dispatch_not_accepted' OR pause_reason LIKE 'refused:%')
+          AND updated_at > NOW() - INTERVAL '1 day'
+        ORDER BY updated_at
+        LIMIT $1`,
+      [input.limit ?? 50],
+    )
+  ).rows;
+  let closed = 0;
+  for (const job of jobs) {
+    if (!isClientMessageId(job.recovery_message_id)) continue;
+    const sessionUserId = `c:${job.user_id}`;
+    const appended = await withTx(pool, async (client) => {
+      const row = (
+        await client.query<{ messages: string }>(
+          `SELECT messages FROM client_sessions
+            WHERE id=$1 AND user_id=$2 AND deleted_at IS NULL FOR UPDATE`,
+          [job.session_id, sessionUserId],
+        )
+      ).rows[0];
+      let last: MessageLike | undefined;
+      try {
+        const parsed = row ? JSON.parse(row.messages) : undefined;
+        last = Array.isArray(parsed) ? parsed.at(-1) : undefined;
+      } catch {
+        return false;
+      }
+      if (
+        last?.id !== job.recovery_message_id ||
+        last.role !== "user" ||
+        last._automaticRecovery !== true
+      ) return false;
+      return appendRecoveryGiveUpTerminalCard(client, {
+        sessionId: job.session_id,
+        sessionUserId,
+        rootClientMessageId: job.root_client_message_id,
+        reason: "recovery_refused",
+      });
+    });
+    if (appended) closed += 1;
+  }
+  return closed;
 }
 
 /**
