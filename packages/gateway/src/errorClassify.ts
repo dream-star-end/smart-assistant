@@ -76,6 +76,11 @@ const PATTERNS: Array<{
     code: 'auth_error',
     message: '模型服务认证失败，请重新登录或检查凭据后重试',
   },
+  {
+    re: /\bBOX_EGRESS_NOT_CONFIGURED\b/,
+    code: 'model_not_available',
+    message: '当前模型不可用，请切换模型后再试',
+  },
   // 429 / RATE_LIMITED — Anthropic 直接返还,或本地 RATE_LIMITED reject
   {
     re: /(?:\b429\b|rate[_ ]?limit(?:ed)?|RATE_LIMITED)/i,

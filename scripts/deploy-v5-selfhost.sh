@@ -3001,7 +3001,7 @@ cmd_cutover() {
       || die "写 .prev-release 失败。尚未覆盖 unit。"
     cutover_clog "  .prev-release=$prev_val"
   fi
-
+  cutover_wait_for_user_idle || return 1
   # 第一次覆盖 installed unit 之前:明确 phase/mutated,并武装 survivor。
   cutover_persist_phase "pre-install"
   if [[ "$DRY" != 1 ]]; then

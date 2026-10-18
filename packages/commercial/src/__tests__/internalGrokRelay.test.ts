@@ -62,8 +62,10 @@ describe('internal Grok relay', () => {
   test('injects the selected subscription bearer and uses only that account egress dispatcher', async () => {
     const captured: { url?: string; headers?: Headers; dispatcher?: unknown; body?: string } = {}
     const statusCalls: Array<[bigint, number]> = []
+    const stages: Array<Record<string, unknown>> = []
     const handler = makeGrokRelayHandler({
       identityRepo: repo(),
+      logger: { info: (_message, fields) => { stages.push(fields!) } },
       resolveContext: async ({ token, containerId, userId }) => {
         assert.equal(token, ROUTE_TOKEN)
         assert.equal(containerId, 11)
@@ -124,6 +126,7 @@ describe('internal Grok relay', () => {
       })
       assert.equal(response.status, 201)
       assert.equal(await response.text(), 'relay-ok')
+      assert.deepEqual(stages.map(s => s.stage), ['proxy_received', 'route_ready', 'upstream_prepare_started', 'upstream_prepare_complete', 'fetch_started', 'headers_received', 'stream_complete'])
       assert.equal(captured.url, `${GROK_OFFICIAL_UPSTREAM_BASE_URL}/chat/completions?stream=true`)
       assert.equal(captured.headers?.get('authorization'), 'Bearer real-xai-oauth-token')
       assert.equal(captured.headers?.get('content-type'), 'application/json')

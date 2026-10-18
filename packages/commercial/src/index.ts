@@ -2474,6 +2474,7 @@ export async function registerCommercial(
       });
       const grokRelayHandler: GrokRelayHandler = makeGrokRelayHandler({
         identityRepo,
+        logger: rootLogger.child({ subsys: "grokRelay" }),
         // Per-request account feedback through the shared health tracker:
         // 401/403/429/5xx count toward the same 3-strike cooldown as CCB, and
         // cooldownRecoveryActor half-opens the row 10 minutes later. Previously
@@ -2525,6 +2526,7 @@ export async function registerCommercial(
       });
       const antigravityRelayHandler: AntigravityRelayHandler = makeAntigravityRelayHandler({
         identityRepo,
+        logger: rootLogger.child({ subsys: "antigravityRelay" }),
         clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
         pricing,
       });
