@@ -102,7 +102,7 @@ describe("paidTier and model metadata refresh (OCV5-516)", () => {
       saveMetadata: async (...args: [string, string | null, unknown]) => { saved.push(args); },
       post: async (path: string) => {
         if (path.endsWith('loadCodeAssist')) return { status: 200, json: { cloudaicompanionProject: 'p', paidTier: { id: tier } } };
-        if (path.endsWith('fetchAvailableModels')) return { status: directoryStatus, json: { models: { 'gpt-oss-120b-medium': { quotaInfo: { remainingFraction: 0.5, resetTime: '2030-01-01T00:00:00Z' } } } } };
+        if (path.endsWith('fetchAvailableModels')) return { status: directoryStatus, json: { models: { 'gpt-oss-120b-medium': { quotaInfo: { remainingFraction: 0.5, resetTime: '2030-01-01T00:00:00Z' } }, 'gemini-4-argon-disabled': { disabled: true } } } };
         return { status: 200, json: SUMMARY };
       },
     };
@@ -110,6 +110,7 @@ describe("paidTier and model metadata refresh (OCV5-516)", () => {
     await antigravityAccountQuota('1', deps);
     assert.equal(saved.length, 1);
     assert.equal(saved[0][1], 'g1-pro-tier');
+    assert.deepEqual(Object.keys(saved[0][2] as object), ['gpt-oss-120b-medium'], 'disabled directory entries never become eligible');
     now += ANTIGRAVITY_QUOTA_TTL_MS + 1;
     tier = 'g1-ultra-lite-tier'; directoryStatus = 503;
     const next = await antigravityAccountQuota('1', deps);
