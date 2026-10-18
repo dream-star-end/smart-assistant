@@ -208,3 +208,22 @@ export function sendCollabFields(input: {
 export function continuePrimaryWithoutAdvisor(state: CollabUiState): boolean {
   return state.mode === "advisor" && state.advisorCatalogResolved === true && state.advisorModels.length === 0;
 }
+
+/** Refresh availability, never inherit another endpoint's new team or advisor choice. */
+export function refreshOriginalAdvisorForSend(original: CollabUiState, doc: CollaborationConfigDoc, parentEngine?: string): {
+  state: CollabUiState; continueSolo: boolean;
+} {
+  const fresh = docToUiState(doc);
+  const originalAdvisor = original.advisorModel;
+  const restored = original.mode === "advisor" && fresh.mode === "advisor" && !!originalAdvisor && fresh.advisorModel === originalAdvisor
+    && !!fresh.configVersion && !fresh.advisorUnavailableReason
+    && fresh.advisorModels.some((row) => row.id === originalAdvisor)
+    && advisorParentCapabilityAllowed({ ...fresh, parentEngine: parentEngine ?? fresh.parentEngine });
+  if (restored) return { state: fresh, continueSolo: false };
+  const state = { ...fresh, mode: original.mode, advisorModel: originalAdvisor, configVersion: "" };
+  return {
+    state,
+    continueSolo: continuePrimaryWithoutAdvisor(original)
+      || continuePrimaryWithoutAdvisor({ ...fresh, mode: original.mode }),
+  };
+}
