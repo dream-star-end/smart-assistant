@@ -7395,7 +7395,10 @@
           "assertion": "OCV5-512 unavailable advisor continues the same main task with its attachment"
         }
       ],
-      "coverageCommits": []
+      "coverageCommits": [
+        "21b091ed558937ab2f5b7b90595f289d2af25708",
+        "50b16144815638e17b024d79f67c39c244054102"
+      ]
     },
     {
       "id": "INC-20261018-CODEX-WEB-SEARCH-CLI",
