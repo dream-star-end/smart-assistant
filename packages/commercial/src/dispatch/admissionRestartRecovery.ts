@@ -8,14 +8,12 @@ import {
   turnRecoveryAttemptIdentity, type DispatchRequestContent,
 } from '@openclaude/protocol'
 import type { MessageLike } from '@openclaude/storage'
-import type { ContainerCallResult, DispatchIdentity } from './containerDispatchClient.js'
 import { getDispatch, getDispatchForUpdate, type TurnDispatchRow } from './turnDispatchStore.js'
 import { abortNeverExecutedJournalForDispatch, assessDispatchBilling,
   type AbortedJournalRef } from './turnDispatchReconciler.js'
 import { enqueueAutomaticRecoveryJob, lockRecoveryRoot } from './turnRecoveryStore.js'
 
 export const ADMISSION_RESTART_UNEXECUTED = 'admission_restart_unexecuted'
-const SOURCE_FAILURE = 'bridge_closed_during_admission'
 const REQUEST_FIELDS = [
   'type', 'idempotencyKey', 'channel', 'peer', 'agentId', 'replyToId', 'effortLevel',
   'model', 'modelSwitchId', 'contextTier', 'serviceTier', 'teamMode', 'collabMode',
@@ -46,7 +44,6 @@ export function snapshotAdmissionRequest(frame: Record<string, unknown>): Admiss
 }
 
 export interface AdmissionRestartRecoveryDeps {
-  rejectIfAbsent(id: DispatchIdentity): Promise<ContainerCallResult>
   releaseReservation(ref: AbortedJournalRef): Promise<void>
 }
 export interface AdmissionRestartStorageDeps extends AdmissionRestartRecoveryDeps {
@@ -60,7 +57,7 @@ function lineage(source: MessageLike): { root: string; attempt: number } | null 
   const previous = source._automaticRecovery === true
     ? source._automaticRecoveryAttempt : 0
   if (!isClientMessageId(root) || !Number.isSafeInteger(previous) ||
-      typeof previous !== 'number' || previous < 0 || previous >= AUTOMATIC_TURN_RETRY_MAX) return null
+      typeof previous !== 'number' || previous < 0 || previous > AUTOMATIC_TURN_RETRY_MAX) return null
   return { root, attempt: previous + 1 }
 }
 
@@ -103,11 +100,11 @@ const hasPersistedRejectedProof = (row: TurnDispatchRow): boolean =>
   row.outcome === 'not_accepted' && row.failureCode === 'DISPATCH_NOT_ACCEPTED'
 const isSourceFailure = (row: TurnDispatchRow | null): row is TurnDispatchRow =>
   row !== null && row.status === 'terminal' && row.acceptedAt === null && row.agentContainerId !== null &&
-  ((row.failureCode === SOURCE_FAILURE && row.outcome === 'executed_error') || hasPersistedRejectedProof(row))
+  hasPersistedRejectedProof(row)
 
-/** True means a supported request is waiting for proof or has a durable job;
- * the ordinary failure reconciler must defer its no-billing/manual verdict.
- * False leaves unsupported/unsafe failures under existing reconciliation. */
+/** True means exact no-execution proof has a durable successor job. Unknown
+ * execution remains open/rejecting in the ordinary inbox reconciler, which
+ * keeps probing and lets accepted work finish under its original identity. */
 export async function recoverAdmissionAfterRestart(pool: Pool, dispatchId: string,
   deps: AdmissionRestartStorageDeps): Promise<boolean> {
   const original = await getDispatch(pool, dispatchId)
@@ -116,25 +113,6 @@ export async function recoverAdmissionAfterRestart(pool: Pool, dispatchId: strin
   if (!initialSource || !exactRequest(initialSource, original)) return false
   const initialLineage = lineage(initialSource)
   if (!initialLineage) return false
-  let proof: ContainerCallResult
-  try {
-    // The existing reconciler writes this exact code only after a durable
-    // rejected tombstone (resolveRejecting). A detached drain bridge or a
-    // killed cleanup may already have reached that boundary before reconnect.
-    // Reuse the persisted exact-identity proof even if its old container was
-    // subsequently reaped; never treat mere absence/unreachability as proof.
-    proof = hasPersistedRejectedProof(original) ? { kind: 'ok', state: 'rejected' } : await deps.rejectIfAbsent({
-      uid: original.userId, dispatchId, attemptNo: original.attemptNo,
-      sessionId: original.sessionId, clientMessageId: original.clientMessageId,
-      agentContainerId: original.agentContainerId, runtimeKind: original.runtimeKind,
-    })
-  } catch { return Date.now() - (original.terminalAt?.getTime() ?? 0) < 60_000 }
-  // A vanished original container or persistent transport outage must not
-  // suppress the existing visible failure forever. No negative proof is
-  // inferred: after this short restart grace, ordinary reconciliation owns it.
-  if (proof.kind !== 'ok') return Date.now() - (original.terminalAt?.getTime() ?? 0) < 60_000
-  if (proof.state !== 'rejected') return false
-
   // No network call is made under these locks. The tombstone has permanently
   // fenced delayed sends of the old identity before a new cmid can be minted.
   const client = await pool.connect()
@@ -160,44 +138,66 @@ export async function recoverAdmissionAfterRestart(pool: Pool, dispatchId: strin
     if (tapes.rowCount) return false
     reservations = await abortNeverExecutedJournalForDispatch(client, dispatchId)
     if (await assessDispatchBilling(client, dispatchId) !== 'not_billed') return false
-    const identity = turnRecoveryAttemptIdentity(row.sessionId, next.root, next.attempt)
-    const content = request.content as Record<string, unknown>
-    request.content = { ...content, recovery: {
-      sourceClientMessageId: row.clientMessageId, mode: 'replay', automatic: true,
-      rootClientMessageId: next.root, attempt: next.attempt, max: AUTOMATIC_TURN_RETRY_MAX,
-    } }
-    request.clientMessageId = identity.clientMessageId
-    request.idempotencyKey = identity.idempotencyKey
-    request.ts = Date.now()
-    // This is a dispatch-proof origin, not a fabricated lossless tape. The
-    // existing jobs digest column records the actual immutable input/proof.
-    const proofDigest = createHash('sha256').update(JSON.stringify({
-      dispatchId, attemptNo: row.attemptNo, requestHash: row.requestHash,
-      snapshot: source._admissionRestartRequest, state: proof.state,
-      proofSource: hasPersistedRejectedProof(original) ? 'reconciled_dispatch' : 'container_tombstone',
-    })).digest('hex')
+    const oldJobs = await client.query<{ status: string; pause_reason: string | null }>(
+      `SELECT status,pause_reason FROM turn_recovery_jobs
+        WHERE dispatch_id=$1 AND dispatch_attempt_no=$2 AND user_id=$3 AND session_id=$4
+          AND root_client_message_id=$5 AND semantic_recovery_attempt=$6 FOR UPDATE`,
+      [dispatchId, row.attemptNo, row.userId.toString(), row.sessionId, next.root, next.attempt - 1],
+    )
+    if (oldJobs.rows.some(job => job.status === 'cancelled' ||
+        (job.status === 'paused' && job.pause_reason !== 'dispatch_not_accepted'))) return false
     const stopped = await client.query(
       `SELECT 1 FROM turn_control_requests WHERE user_id=$1 AND session_id=$2 AND kind='stop'
         AND (root_client_message_id=$3 OR (root_client_message_id IS NULL AND created_at >= $4)) LIMIT 1`,
       [row.userId.toString(), row.sessionId, next.root, row.admittedAt],
     )
-    inserted = !stopped.rowCount && await enqueueAutomaticRecoveryJob(client, {
-      userId: row.userId, sessionId: row.sessionId, rootClientMessageId: next.root,
-      sourceClientMessageId: row.clientMessageId,
-      sourceTurnKey: `dispatch:${dispatchId}:${row.attemptNo}`,
-      errorCode: ADMISSION_RESTART_UNEXECUTED, recoveryMode: 'replay',
-      semanticRecoveryAttempt: next.attempt,
-      // JSONB cannot store legal JSON text escapes such as \u0000. Preserve
-      // the exact wire as bytes; retain cmid for existing Stop/refund SQL.
-      request: { clientMessageId: request.clientMessageId, _admissionRestartWireVersion: 1,
-        _admissionRestartWire: Buffer.from(JSON.stringify(request)).toString('base64') },
-      tapeSha256: proofDigest,
-    })
+    if (!stopped.rowCount && next.attempt <= AUTOMATIC_TURN_RETRY_MAX) {
+      const identity = turnRecoveryAttemptIdentity(row.sessionId, next.root, next.attempt)
+      const content = request.content as Record<string, unknown>
+      request.content = { ...content, recovery: {
+        sourceClientMessageId: row.clientMessageId, mode: 'replay', automatic: true,
+        rootClientMessageId: next.root, attempt: next.attempt, max: AUTOMATIC_TURN_RETRY_MAX,
+      } }
+      request.clientMessageId = identity.clientMessageId
+      request.idempotencyKey = identity.idempotencyKey
+      request.ts = Date.now()
+      // A real exact dispatch rejection proof, not a fabricated turn tape.
+      const proofDigest = createHash('sha256').update(JSON.stringify({
+        dispatchId, attemptNo: row.attemptNo, requestHash: row.requestHash,
+        snapshot: source._admissionRestartRequest, state: 'rejected',
+        proofSource: 'reconciled_dispatch',
+      })).digest('hex')
+      inserted = await enqueueAutomaticRecoveryJob(client, {
+        userId: row.userId, sessionId: row.sessionId, rootClientMessageId: next.root,
+        sourceClientMessageId: row.clientMessageId,
+        sourceTurnKey: `dispatch:${dispatchId}:${row.attemptNo}`,
+        errorCode: ADMISSION_RESTART_UNEXECUTED, recoveryMode: 'replay',
+        semanticRecoveryAttempt: next.attempt,
+        request: { clientMessageId: request.clientMessageId, _admissionRestartWireVersion: 1,
+          _admissionRestartWire: Buffer.from(JSON.stringify(request)).toString('base64') },
+        tapeSha256: proofDigest,
+      })
+    }
+    if (inserted || next.attempt > AUTOMATIC_TURN_RETRY_MAX) {
+      // Retire only the exact proven rejected delivery. Root/Stop locks make
+      // retirement and successor publication one atomic handoff. Completed /
+      // interrupted is delivery settlement, not a claim the user's task ended.
+      await client.query(
+        `UPDATE turn_recovery_jobs SET status=$7,terminal_outcome='interrupted',
+          pause_reason=$8,lease_owner=NULL,lease_until=NULL,updated_at=NOW()
+          WHERE dispatch_id=$1 AND dispatch_attempt_no=$2 AND user_id=$3 AND session_id=$4
+            AND root_client_message_id=$5 AND semantic_recovery_attempt=$6
+            AND (status IN ('queued','leased','sent','forwarded')
+              OR (status='paused' AND pause_reason='dispatch_not_accepted'))`,
+        [dispatchId, row.attemptNo, row.userId.toString(), row.sessionId, next.root, next.attempt - 1,
+          inserted ? 'completed' : 'paused', inserted ? null : 'automatic_retry_exhausted'],
+      )
+    }
     // Stop/paused lineage may veto enqueue. Still commit the exact no-execution
     // compensation; ordinary failure visibility then remains authoritative.
     await client.query(
       `UPDATE turn_dispatches SET outcome='not_accepted',failure_code=$2 WHERE dispatch_id=$1`,
-      [dispatchId, inserted ? ADMISSION_RESTART_UNEXECUTED : SOURCE_FAILURE],
+      [dispatchId, inserted ? ADMISSION_RESTART_UNEXECUTED : 'DISPATCH_NOT_ACCEPTED'],
     )
     await deps.advanceTimeline(client, row.sessionId, `c:${row.userId}`)
     await client.query('COMMIT')
@@ -221,12 +221,11 @@ export async function reconcileAdmissionRestarts(pool: Pool, userId: bigint, lim
   const candidates = await pool.query<{ dispatch_id: string; attempt_no: number }>(
     `SELECT dispatch_id,attempt_no FROM turn_dispatches d
       WHERE user_id=$1 AND status='terminal' AND accepted_at IS NULL
-        AND ((outcome='executed_error' AND failure_code=$2)
-          OR (outcome='not_accepted' AND failure_code='DISPATCH_NOT_ACCEPTED'))
+        AND outcome='not_accepted' AND failure_code='DISPATCH_NOT_ACCEPTED'
         AND NOT EXISTS (SELECT 1 FROM turn_recovery_jobs j
           WHERE j.user_id=d.user_id AND j.session_id=d.session_id
             AND j.source_client_message_id=d.client_message_id)
-      ORDER BY terminal_at DESC LIMIT $3`, [userId.toString(), SOURCE_FAILURE, limit],
+      ORDER BY terminal_at DESC LIMIT $2`, [userId.toString(), limit],
   )
   let scheduled = 0
   for (const row of candidates.rows) {

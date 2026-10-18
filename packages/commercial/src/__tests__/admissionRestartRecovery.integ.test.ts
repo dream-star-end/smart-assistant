@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict'
 import { beforeEach, test } from 'node:test'
-import { randomUUID } from 'node:crypto'
-import { computeDispatchRequestHash, type DispatchRequestContent } from '@openclaude/protocol'
+import { createHash, randomUUID } from 'node:crypto'
+import { computeDispatchRequestHash, LOSSLESS_TURN_TAPE_VERSION, type DispatchRequestContent } from '@openclaude/protocol'
 import type { MessageLike } from '@openclaude/storage'
 import { getPool } from '../db/index.js'
 import { createPgSessionsBackend, type PgSessionsBackend } from '../db/pgSessionsBackend.js'
 import { snapshotAdmissionRequest, ADMISSION_RESTART_UNEXECUTED } from '../dispatch/admissionRestartRecovery.js'
-import type { ContainerCallResult, DispatchIdentity } from '../dispatch/containerDispatchClient.js'
-import { casToTerminal, getDispatch } from '../dispatch/turnDispatchStore.js'
+import type { ContainerCallResult } from '../dispatch/containerDispatchClient.js'
+import { casAdmittedToRejecting, casToTerminal, getDispatch } from '../dispatch/turnDispatchStore.js'
 import { claimDueRecoveryJobs, releaseRecoveryPreReceipt } from '../dispatch/turnRecoveryStore.js'
 import { admitDurableControl } from '../dispatch/turnControlStore.js'
 import { runReconcileTick, runShutdownDispatchHandoff } from '../dispatch/turnDispatchReconciler.js'
@@ -17,7 +17,6 @@ const fixture = useDedicatedTestDatabase('ocv5_511_admission_restart_test')
 let backend: PgSessionsBackend
 let uid: bigint
 let proof: ContainerCallResult = { kind: 'ok', state: 'rejected' }
-let proofCalls: DispatchIdentity[]
 let releases: Array<{ userId: string; requestId: string }>
 const sessionId = 's-admission-restart'
 const sourceId = 'cm-admission-restart-source'
@@ -38,10 +37,9 @@ beforeEach(async () => {
     VALUES (true,'pg_authoritative',1,'test','test',1)
     ON CONFLICT (singleton) DO UPDATE SET authority='pg_authoritative',generation=1,
       cutover_id='test',source_digest='test',completed_at=1`)
-  proof = { kind: 'ok', state: 'rejected' }; proofCalls = []; releases = []
+  proof = { kind: 'ok', state: 'rejected' }; releases = []
   backend = createPgSessionsBackend(pool, { expectedGeneration: 1,
     admissionRestartRecovery: {
-      rejectIfAbsent: async (id) => { proofCalls.push(id); return proof },
       releaseReservation: async (ref) => { releases.push(ref) },
     },
   })
@@ -84,12 +82,47 @@ async function seed(options: { request?: Record<string, unknown>; snapshot?: boo
   if (options.journal) await getPool().query(`INSERT INTO request_finalize_journal
     (request_id,user_id,ctx,precheck_credits,state,dispatch_id)
     VALUES ($1,$2,'{}',50,$3,$4)`, [d.billingRequestId, uid.toString(), options.journal, d.dispatchId])
-  if (options.terminal !== false) await casToTerminal(getPool(), { dispatchId: d.dispatchId, outcome: 'executed_error',
-    failureCode: 'bridge_closed_during_admission', clientNotified: false, expectedEpoch: d.leaseEpoch })
+  if (options.terminal !== false) await casToTerminal(getPool(), { dispatchId: d.dispatchId, outcome: 'not_accepted',
+    failureCode: 'DISPATCH_NOT_ACCEPTED', clientNotified: false, expectedEpoch: d.leaseEpoch })
   return { d, request }
 }
 
 async function jobs() { return (await getPool().query('SELECT * FROM turn_recovery_jobs')).rows }
+
+async function completeTask(dispatchId: string, clientMessageId: string) {
+  const turnKey = createHash('sha256').update(dispatchId).digest('hex')
+  const createdAt = Date.now()
+  const bytes = Buffer.from(JSON.stringify({ sessionId, agentId: 'main', turnIndex: 1,
+    status: 'completed', turnKey, clientMessageId, text: 'task finished automatically',
+    createdAt, usage: { inputTokens: 1, outputTokens: 2 } }))
+  const hash = createHash('sha256').update(bytes).digest('hex')
+  const base = { protocolVersion: LOSSLESS_TURN_TAPE_VERSION, sessionId, agentId: 'main',
+    turnIndex: 1, status: 'completed' as const, turnKey, tapeId: turnKey, tapeSha256: hash,
+    totalBytes: bytes.length, partCount: 1, createdAt }
+  await backend.stageLosslessTurnTapePart(`c:${uid}`, { ...base, action: 'part', partIndex: 0,
+    partSha256: hash, data: bytes.toString('base64') }, bytes, { dispatchId, attemptNo: 1 })
+  assert.equal((await backend.finalizeLosslessTurnTape(`c:${uid}`,
+    { ...base, action: 'finalize', dispatchId, attemptNo: 1 })).applied, 'finalized')
+  const page = await backend.readClientTimelinePage(sessionId, `c:${uid}`, null, 100)
+  assert.ok(JSON.stringify(page).includes('task finished automatically'))
+}
+
+type Job = Awaited<ReturnType<typeof claimDueRecoveryJobs>>[number]
+async function admitJob(job: Job, ownerId = 'recovery-bridge') {
+  const r = job.request, content = r.content as Record<string, unknown>, cmid = String(r.clientMessageId)
+  const recovery = (r.content as { recovery: NonNullable<Parameters<PgSessionsBackend['admitUserTurn']>[0]['recovery']> }).recovery
+  const result = await backend.admitUserTurn({ uid, sessionUserId: `c:${uid}`, sessionId,
+    clientMessageId: cmid, agentId: 'main', model: 'gpt-6-sol', ownerId,
+    requestHash: computeDispatchRequestHash(r.content as DispatchRequestContent),
+    billingRequestId: randomUUID().replaceAll('-', ''), dispatchId: randomUUID(),
+    agentContainerId: 511, runtimeKind: 'docker', recovery,
+    recoveryJob: { jobId: job.jobId, leaseOwner: job.leaseOwner, leaseEpoch: job.leaseEpoch },
+    message: { id: cmid, role: 'user', text: String(content.displayText ?? content.text),
+      _modelText: String(content.text), ts: Date.now(), _admissionRestartRequest: snapshotAdmissionRequest(r) } })
+  assert.equal(result.kind, 'admitted')
+  if (result.kind !== 'admitted') throw new Error('job admission failed')
+  return result.dispatch
+}
 
 // OCV5-511: this is an actual no-tape PG source,
 // not a fabricated finalized tape or a test-only alternative scheduler.
@@ -100,8 +133,6 @@ test('OCV5-511 ACKed no-tape intent survives restart with exact routing and one 
   assert.equal(await backend.reconcileAutomaticRecoveryJobs(uid), 1)
   assert.equal(await backend.reconcileAutomaticRecoveryJobs(uid), 0)
   assert.equal((await jobs()).length, 1)
-  assert.deepEqual(proofCalls[0], { uid, dispatchId: d.dispatchId, attemptNo: d.attemptNo,
-    sessionId, clientMessageId: sourceId, agentContainerId: 511, runtimeKind: 'docker' })
   const original = await getDispatch(getPool(), d.dispatchId)
   assert.equal(original?.outcome, 'not_accepted')
   assert.equal(original?.failureCode, ADMISSION_RESTART_UNEXECUTED)
@@ -153,28 +184,34 @@ test('OCV5-511 oversized intent hydrates the existing byte sidecar without trunc
   assert.deepEqual({ ...(job.request.content as object), recovery: undefined }, { ...(request.content as object), recovery: undefined })
 })
 
-test('OCV5-511 running queued staged absent unknown or failed proof never authorizes a second execution', async t => {
+test('OCV5-511 unknown beyond sixty seconds automatically resumes the original running task and delivers its answer', async t => {
   if (fixture.skipIfUnavailable(t)) return
-  const { d } = await seed()
-  for (const state of ['running', 'queued', 'recovery_pending', 'sink_staged', 'sink_stage_failed', 'terminal', 'absent'] as const) {
-    proof = { kind: 'ok', state }
-    assert.equal(await backend.recoverInterruptedAdmission(d.dispatchId), false, state)
-    assert.equal((await jobs()).length, 0)
-  }
-  for (const kind of ['unreachable', 'error'] as const) {
-    proof = { kind, detail: 'temporarily unavailable' }
-    assert.equal(await backend.recoverInterruptedAdmission(d.dispatchId), true)
-  }
-  await getPool().query("UPDATE turn_dispatches SET terminal_at=NOW()-INTERVAL '2 minutes' WHERE dispatch_id=$1", [d.dispatchId])
-  assert.equal(await backend.recoverInterruptedAdmission(d.dispatchId), false, 'persistent lost container remains fail-visible')
+  const { d } = await seed({ terminal: false, journal: 'inflight' })
+  await casAdmittedToRejecting(getPool(), { dispatchId: d.dispatchId, expectedEpoch: d.leaseEpoch, ownerId: 'closed-bridge' })
+  proof = { kind: 'unreachable', detail: 'temporary restart outage' }
+  const tick = (now = Date.now()) => runReconcileTick({ pool: getPool(), now: () => now,
+    recoverInterruptedAdmission: id => backend.recoverInterruptedAdmission(id),
+    container: { rejectIfAbsent: async () => proof, getDispatchState: async () => proof } })
+  await tick(Date.now() + 120_000)
+  assert.equal((await getDispatch(getPool(), d.dispatchId))?.status, 'rejecting')
   assert.equal((await jobs()).length, 0)
+  assert.equal((await getPool().query('SELECT state FROM request_finalize_journal')).rows[0].state, 'inflight')
+  assert.deepEqual(releases, [])
+  proof = { kind: 'ok', state: 'running' }
+  await tick()
+  const accepted = await getDispatch(getPool(), d.dispatchId)
+  assert.equal(accepted?.status, 'accepted'); assert.equal(accepted?.billingRequestId, d.billingRequestId)
+  await completeTask(d.dispatchId, sourceId)
+  assert.equal((await getDispatch(getPool(), d.dispatchId))?.outcome, 'completed')
+  assert.equal((await getPool().query('SELECT count(*)::int AS n FROM turn_dispatches')).rows[0].n, 1)
+  assert.equal((await jobs()).length, 0); assert.deepEqual(releases, [])
+  assert.notEqual((await getPool().query('SELECT state FROM request_finalize_journal')).rows[0].state, 'aborted')
 })
 
 test('OCV5-511 legacy missing snapshot and changed source content hash remain fail-closed', async t => {
   if (fixture.skipIfUnavailable(t)) return
   const { d } = await seed({ snapshot: false })
   assert.equal(await backend.recoverInterruptedAdmission(d.dispatchId), false)
-  assert.equal(proofCalls.length, 0)
   const snapshot = snapshotAdmissionRequest(wire('different original content'))
   const messages = JSON.parse((await getPool().query('SELECT messages FROM client_sessions WHERE id=$1', [sessionId])).rows[0].messages)
   messages[0]._admissionRestartRequest = snapshot
@@ -249,7 +286,6 @@ test('OCV5-511 newer user intent and deleted sessions are never replayed', async
   await backend.appendServerAuthoredMessage(sessionId, `c:${uid}`,
     { id: 'cm-newer-intent', role: 'user', text: 'do something else', ts: Date.now() })
   assert.equal(await backend.recoverInterruptedAdmission(d.dispatchId), false)
-  assert.equal(proofCalls.length, 0)
   await getPool().query('UPDATE client_sessions SET deleted_at=$2 WHERE id=$1', [sessionId, Date.now()])
   assert.equal(await backend.recoverInterruptedAdmission(d.dispatchId), false)
   assert.equal((await jobs()).length, 0)
@@ -306,7 +342,6 @@ test('OCV5-511 shutdown handoff rejection of a detached preparing bridge remains
   proof = { kind: 'unreachable', detail: 'old container reaped after its durable tombstone committed' }
   assert.equal(await backend.reconcileAutomaticRecoveryJobs(uid), 1)
   assert.equal((await jobs()).length, 1)
-  assert.equal(proofCalls.length, 0, 'persisted exact rejected proof is already authoritative')
 })
 
 test('OCV5-511 deferred automatic replay preserves lineage across pre-receipt transport retry', async t => {
@@ -342,4 +377,67 @@ test('OCV5-511 deferred automatic replay preserves lineage across pre-receipt tr
   assert.equal(resumed.dispatch.dispatchId, initial.dispatch.dispatchId)
   assert.equal(resumed.dispatch.billingRequestId, initial.dispatch.billingRequestId)
   assert.equal((await jobs()).length, 1)
+})
+
+
+for (const state of ['queued', 'sink_staged'] as const) {
+  test(`OCV5-511 exact ${state} proof continues the original task through its completed answer`, async t => {
+    if (fixture.skipIfUnavailable(t)) return
+    const { d } = await seed({ terminal: false, journal: 'inflight' })
+    await casAdmittedToRejecting(getPool(), { dispatchId: d.dispatchId, expectedEpoch: d.leaseEpoch, ownerId: 'handoff' })
+    await runReconcileTick({ pool: getPool(), container: {
+      rejectIfAbsent: async () => ({ kind: 'ok', state }), getDispatchState: async () => ({ kind: 'ok', state }) } })
+    assert.equal((await getDispatch(getPool(), d.dispatchId))?.status, 'accepted')
+    await completeTask(d.dispatchId, sourceId)
+    assert.equal((await getDispatch(getPool(), d.dispatchId))?.outcome, 'completed')
+    assert.equal((await getPool().query('SELECT count(*)::int AS n FROM turn_dispatches')).rows[0].n, 1)
+    assert.equal((await jobs()).length, 0); assert.deepEqual(releases, [])
+  })
+}
+
+test('OCV5-511 send-unknown queued recovery job follows exact running proof and completes without another claim', async t => {
+  if (fixture.skipIfUnavailable(t)) return
+  const { d } = await seed()
+  await backend.recoverInterruptedAdmission(d.dispatchId)
+  const [job] = await claimDueRecoveryJobs(getPool(), { userId: uid, ownerId: 'master', leaseMs: 60_000 })
+  const child = await admitJob(job)
+  assert.equal(await releaseRecoveryPreReceipt(getPool(), { job, dispatchId: child.dispatchId,
+    dispatchOwner: child.ownerId!, dispatchLeaseEpoch: child.leaseEpoch }), true)
+  await casAdmittedToRejecting(getPool(), { dispatchId: child.dispatchId, expectedEpoch: child.leaseEpoch, ownerId: 'handoff' })
+  await getPool().query('UPDATE turn_recovery_jobs SET next_attempt_at=NOW()')
+  assert.deepEqual(await claimDueRecoveryJobs(getPool(), { userId: uid, ownerId: 'must-wait-for-proof', leaseMs: 60_000 }), [])
+  await runReconcileTick({ pool: getPool(), container: {
+    rejectIfAbsent: async () => ({ kind: 'ok', state: 'running' }), getDispatchState: async () => ({ kind: 'ok', state: 'running' }) } })
+  assert.equal((await getDispatch(getPool(), child.dispatchId))?.status, 'accepted')
+  assert.equal((await jobs())[0].status, 'forwarded')
+  await completeTask(child.dispatchId, child.clientMessageId)
+  assert.equal((await jobs())[0].status, 'completed')
+  assert.equal((await getDispatch(getPool(), child.dispatchId))?.outcome, 'completed')
+  assert.equal((await getPool().query('SELECT count(*)::int AS n FROM turn_dispatches')).rows[0].n, 2)
+})
+
+test('OCV5-511 a permanently rejected automatic identity hands off once and its successor finishes the task', async t => {
+  if (fixture.skipIfUnavailable(t)) return
+  const { d } = await seed()
+  await backend.recoverInterruptedAdmission(d.dispatchId)
+  const [first] = await claimDueRecoveryJobs(getPool(), { userId: uid, ownerId: 'master', leaseMs: 60_000 })
+  const child = await admitJob(first)
+  await casToTerminal(getPool(), { dispatchId: child.dispatchId, outcome: 'not_accepted',
+    failureCode: 'DISPATCH_NOT_ACCEPTED', clientNotified: false, expectedEpoch: child.leaseEpoch })
+  assert.deepEqual(await claimDueRecoveryJobs(getPool(), { userId: uid, ownerId: 'no-tombstone-retry', leaseMs: 60_000 }), [])
+  assert.equal(await backend.recoverInterruptedAdmission(child.dispatchId), true)
+  assert.equal(await backend.recoverInterruptedAdmission(child.dispatchId), false)
+  const all = await jobs()
+  assert.equal(all.length, 2)
+  assert.equal(all.find(row => row.job_id === first.jobId)?.status, 'completed')
+  const [next] = await claimDueRecoveryJobs(getPool(), { userId: uid, ownerId: 'next', leaseMs: 60_000 })
+  assert.notEqual(next.request.clientMessageId, first.request.clientMessageId)
+  assert.equal(next.semanticRecoveryAttempt, 2)
+  const successor = await admitJob(next, 'next-bridge')
+  await casAdmittedToRejecting(getPool(), { dispatchId: successor.dispatchId, expectedEpoch: successor.leaseEpoch, ownerId: 'probe' })
+  await runReconcileTick({ pool: getPool(), container: {
+    rejectIfAbsent: async () => ({ kind: 'ok', state: 'running' }), getDispatchState: async () => ({ kind: 'ok', state: 'running' }) } })
+  await completeTask(successor.dispatchId, successor.clientMessageId)
+  assert.equal((await getDispatch(getPool(), successor.dispatchId))?.outcome, 'completed')
+  assert.ok((await jobs()).every(row => row.status === 'completed'))
 })

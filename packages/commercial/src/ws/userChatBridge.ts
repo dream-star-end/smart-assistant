@@ -175,6 +175,7 @@ import {
 import { mintDispatchEnvelope } from "../dispatch/dispatchSigner.js";
 import {
   casAdmittedToAccepted,
+  casAdmittedToRejecting,
   casToManualReconcile,
   casToTerminal,
   getDispatchByLogicalKey,
@@ -3916,13 +3917,26 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       state: EnrichmentDispatchState,
       failureCode: string,
     ): boolean => {
+      const wasTransferring = state.phase === "transferring";
       if (!claimEnrichmentTerminalization(state)) return false;
       const record = state.record;
       const pool = deps.pgPool;
       void (async (): Promise<void> => {
         try {
           if (!pool) return;
-          if (record.recoveryJob) {
+          if (failureCode === "bridge_closed_during_admission" &&
+              (!record.recoveryJob || wasTransferring)) {
+            // A send can reach the durable inbox before its local callback.
+            // Keep the task open until exact proof resolves ownership: live
+            // work continues; a rejected tombstone schedules a fresh identity.
+            await casAdmittedToRejecting(pool, {
+              dispatchId: record.dispatchId,
+              expectedEpoch: record.leaseEpoch,
+              ownerId: "bridge-admission-handoff",
+            });
+          } else if (record.recoveryJob) {
+            // Still enriching: no physical send occurred. Reuse this transport
+            // identity without spending another semantic attempt.
             await releaseRecoveryPreReceipt(pool, {
               job: record.recoveryJob,
               dispatchId: record.dispatchId,
@@ -8325,23 +8339,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 void (async () => {
                   let persisted = false;
                   try {
-                    if (rec.recoveryJob) {
-                      persisted = await releaseRecoveryPreReceipt(pool, {
-                        job: rec.recoveryJob,
-                        dispatchId: rec.dispatchId,
-                        dispatchOwner: rec.leaseOwnerId,
-                        dispatchLeaseEpoch: rec.leaseEpoch,
-                      });
-                    } else {
-                      persisted = await casToTerminal(pool, {
-                        dispatchId: rec.dispatchId,
-                        outcome: "not_accepted",
-                        failureCode: "DISPATCH_NOT_ACCEPTED",
-                        clientNotified: false,
-                        fromStatuses: ["admitted"],
-                        expectedEpoch: rec.leaseEpoch,
-                      }) !== null;
-                    }
+                    // A rejected tombstone permanently fences this delivery;
+                    // retrying it as a transport wait can never execute. The
+                    // recovery scheduler atomically hands off to a new cmid.
+                    persisted = await casToTerminal(pool, {
+                      dispatchId: rec.dispatchId,
+                      outcome: "not_accepted",
+                      failureCode: "DISPATCH_NOT_ACCEPTED",
+                      clientNotified: false,
+                      fromStatuses: ["admitted"],
+                      expectedEpoch: rec.leaseEpoch,
+                    }) !== null;
                   } catch (err) {
                     bridgeLog?.warn("user-chat-bridge: rejected receipt convergence failed", {
                       dispatchId: rec.dispatchId,

@@ -135,6 +135,12 @@ export async function claimDueRecoveryJobs(
           AND candidate.next_attempt_at<=NOW()
           AND (candidate.status='queued' OR candidate.lease_until<NOW())
           AND NOT EXISTS (
+            SELECT 1 FROM turn_dispatches bound
+             WHERE bound.dispatch_id=candidate.dispatch_id
+               AND bound.attempt_no=candidate.dispatch_attempt_no
+               AND bound.status<>'admitted'
+          )
+          AND NOT EXISTS (
             SELECT 1 FROM turn_recovery_jobs paused
              WHERE paused.user_id=candidate.user_id
                AND paused.session_id=candidate.session_id

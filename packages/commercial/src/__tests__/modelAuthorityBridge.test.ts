@@ -2036,7 +2036,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
     }
   });
 
-  test("R4-B6 container close during enrichment still terminalizes immediately", async () => {
+  test("R4-B6 container close during enrichment immediately hands ownership to durable proof", async () => {
     const queries: { sql: string; params: unknown[] }[] = [];
     const pgPool = {
       query: async (sql: string, params: unknown[] = []) => {
@@ -2068,7 +2068,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       await waitFor(() => historyStarted);
       for (const container of rig.containerWss.clients) container.close(1011, "test close");
       await waitFor(
-        () => queries.some((q) => q.params[2] === "bridge_closed_during_admission"),
+        () => queries.some((q) => q.params[1] === "bridge-admission-handoff"),
         1_500,
       );
       releaseHistory!([]);
@@ -2147,7 +2147,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       await waitFor(() => bindingStarted);
       for (const container of rig.containerWss.clients) container.close(1011, "post lookup close");
       await waitFor(
-        () => queries.some((q) => q.params[2] === "bridge_closed_during_admission"),
+        () => queries.some((q) => q.params[1] === "bridge-admission-handoff"),
         1_500,
       );
       releaseBinding();
@@ -2557,7 +2557,7 @@ test("OCV5-511 exact replay snapshot commits before ACK and survives shutdown du
     assert.equal(request.conversationMode, "plan");
     await waitFor(() => historyStarted);
     await rig.bridge.shutdown();
-    await waitFor(() => queries.some(q => q.params[2] === "bridge_closed_during_admission"));
+    await waitFor(() => queries.some(q => q.params[1] === "bridge-admission-handoff"));
     releaseHistory([]);
     await new Promise(resolve => setTimeout(resolve, 50));
     assert.equal(rig.containerSeen.some(row => row.includes('"clientMessageId":"cm-511-shutdown"')), false);
