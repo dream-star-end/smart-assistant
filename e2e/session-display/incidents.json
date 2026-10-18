@@ -7353,7 +7353,7 @@
       "occurredAt": "2026-10-18",
       "severity": "P1",
       "symptom": "体验官B13：Markdown中generated绝对文件链接被当成网站路径，新标签404且暴露内部路径。平台资产锚点复用既有鉴权签名缓存与下载组件，普通链接和只读行为保留。",
-      "rootFixCommit": "f725358e93d2",
+      "rootFixCommit": "f725358e",
       "regressions": [
         {
           "layer": "unit",
