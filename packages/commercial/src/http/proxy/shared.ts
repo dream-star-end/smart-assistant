@@ -30,7 +30,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import type { Pool } from "pg";
-import { getStaticProvider, isBoxApiModel, type StaticProviderKeys } from "@openclaude/protocol";
+import { getStaticProvider, isBoxApiModel, staticRouteFallback, type StaticProviderKeys } from "@openclaude/protocol";
 
 import { type Logger } from "../../logging/logger.js";
 import {
@@ -73,7 +73,7 @@ export const DEFAULT_UPSTREAM_ENDPOINT = "https://api.anthropic.com/v1/messages"
 // @openclaude/protocol 的 STATIC_KEY_PROVIDERS 注册表(commercial+gateway 共享)。
 // 下面这些导出仅为**保护现有 caller**(anthropicProxy 测试 / DeepSeek Pro 直连路径)
 // 而保留的 thin re-export,值从注册表派生、与历史逐字节一致。新代码请直接用注册表。
-// 平台直连的 deepseek-v4-flash 任务请用 OPENCODE_GO_UPSTREAM_ENDPOINT,不要再用本 DeepSeek 端点。
+// 平台直连的 deepseek-v4-flash 任务请用 fetchPlatformFlash(OpenCode Go 优先，DeepSeek 官方回落)。
 
 /**
  * DeepSeek 的 anthropic 兼容端点。命中 `isDeepseekModel`(大小写敏感前缀)后切到这里,
@@ -88,8 +88,8 @@ export function isDeepseekModel(modelId: string): boolean {
 
 /**
  * OpenCode Go(Zen 网关 Go 档) anthropic 兼容端点。
- * 平台直连的 `deepseek-v4-flash` 任务(市场审核 / 语音润色 / 知识星球自动回复)走这里,
- * 与用户聊天同一条上游;不要再打 api.deepseek.com。
+ * 平台直连的 `deepseek-v4-flash` 任务(市场审核 / 语音润色 / 知识星球自动回复)经 fetchPlatformFlash
+ * 先走这里，与用户聊天同一条主上游。
  */
 export const OPENCODE_GO_UPSTREAM_ENDPOINT = getStaticProvider("opencodego").upstreamEndpoint;
 
@@ -105,6 +105,57 @@ export function openCodeGoAuthHeaders(
     "Content-Type": "application/json",
     Accept: accept,
   };
+}
+
+let platformFlashFallbackKey: string | undefined;
+
+/** OCV5-482:平台直连 flash 的回落 key(DEEPSEEK_API_KEY),master 启动时注入一次。 */
+export function setPlatformFlashFallbackKey(key: string | undefined): void {
+  platformFlashFallbackKey = key?.trim() ? key.trim() : undefined;
+}
+
+/**
+ * OCV5-482:平台直连 `deepseek-v4-flash`。OpenCode Go 优先;Go 无 key、网络失败或回 401/402/403/429/5xx
+ * (如周额度用尽)且有回落 key 时，同一请求改发 DeepSeek 官方(protocol staticRouteFallback)。
+ */
+export async function fetchPlatformFlash(
+  fetchImpl: (input: string, init: RequestInit) => Promise<Response>,
+  input: {
+    goKey?: string;
+    body: Record<string, unknown>;
+    accept?: string;
+    init: Omit<RequestInit, "method" | "headers" | "body">;
+  },
+): Promise<Response> {
+  const fallback = staticRouteFallback("opencodego", String(input.body.model ?? ""));
+  const fallbackKey = fallback ? platformFlashFallbackKey : undefined;
+  if (input.goKey) {
+    try {
+      const res = await fetchImpl(OPENCODE_GO_UPSTREAM_ENDPOINT, {
+        ...input.init,
+        method: "POST",
+        headers: openCodeGoAuthHeaders(input.goKey, input.accept),
+        body: JSON.stringify(input.body),
+      });
+      const unusable = res.status === 401 || res.status === 402 || res.status === 403
+        || res.status === 429 || res.status >= 500;
+      if (!fallbackKey || !unusable) return res;
+      await res.body?.cancel().catch(() => {});
+    } catch (err) {
+      if (!fallbackKey || input.init.signal?.aborted) throw err;
+    }
+  }
+  if (!fallback || !fallbackKey) throw new Error("platform flash: no usable upstream key");
+  return fetchImpl(getStaticProvider(fallback.providerId).upstreamEndpoint, {
+    ...input.init,
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${fallbackKey}`,
+      "Content-Type": "application/json",
+      Accept: input.accept ?? "application/json",
+    },
+    body: JSON.stringify({ ...input.body, model: fallback.upstreamModel }),
+  });
 }
 
 /** MiniMax Token Plan 的 Anthropic 兼容端点(完整 /v1/messages)。 */

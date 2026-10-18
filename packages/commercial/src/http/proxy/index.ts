@@ -55,6 +55,7 @@ import { checkRateLimit, type RateLimitConfig } from "../../middleware/rateLimit
 import {
   UnroutableProviderError,
   checkCapabilityWithinCeiling,
+  pickStaticFallbackUpstream,
   pickUpstream,
   providerCapabilityCeiling,
   releaseUpstreamSession,
@@ -70,7 +71,7 @@ import {
   type ModelAuthorityDecision,
 } from "./modelAuthorityGate.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
-import { findRouteProviderForModel, isClassifierSideQuery, resolveCursorPublicModel } from "@openclaude/protocol";
+import { findRouteProviderForModel, getStaticProvider, isClassifierSideQuery, resolveCursorPublicModel, staticRouteFallback, type StaticRouteFallback } from "@openclaude/protocol";
 import { applyFastServiceTierPricing } from "./fastServiceTier.js";
 import {
   getDegradedProviders,
@@ -741,6 +742,8 @@ export function makeAnthropicProxyHandler(
       // degraded 权威 = provider_ops 健康列(effectiveHealth 派生,与 pricing.enabled/visibility
       // 正交,红线②)。只治理静态 provider;OAuth/claude 归 account-pool。fail-soft:读失败空集放行。
       // 不做隐式换模型(红线①):只 503 + 建议同类可用清单,用户/客户端自己换。
+      // OCV5-482:主 provider 降级但声明了健康的回落上游 → 不 503,下面选路由时直接走回落上游。
+      let healthFallback: StaticRouteFallback | undefined;
       if (process.env.OC_PROVIDER_HEALTH_ENFORCE === "1") {
         // provider 归属:catalog 判定生效时以 catalog 的 provider_id 为准(数据驱动);
         // legacy 期仍走 matchesRoute 推断。
@@ -749,7 +752,12 @@ export function makeAnthropicProxyHandler(
           : findRouteProviderForModel(body.model)?.id;
         if (providerId) {
           const degradedSet = await getHealthDegradedProviders();
-          if (degradedSet.has(providerId)) {
+          const fallback = gate && degradedSet.has(providerId)
+            ? staticRouteFallback(providerId, gate.descriptor.upstreamModelId ?? body.model)
+            : undefined;
+          if (fallback && !degradedSet.has(fallback.providerId)) {
+            healthFallback = fallback;
+          } else if (degradedSet.has(providerId)) {
             const deniedModelIds = await deniedModelIdsForAlternatives(deps, gate, uid);
             const alts = degradedAlternatives({
               gate,
@@ -869,6 +877,19 @@ export function makeAnthropicProxyHandler(
           return;
         }
         throw err;
+      }
+      if (healthFallback && route.kind === "static") {
+        userLog.info("proxy_static_fallback", {
+          model: body.model,
+          provider: route.provider.id,
+          fallback: healthFallback.providerId,
+          reason: "provider_degraded",
+        });
+        route = {
+          kind: "static",
+          provider: getStaticProvider(healthFallback.providerId),
+          upstreamModel: healthFallback.upstreamModel,
+        };
       }
 
       // 5c') 能力上限:catalog 声明的 capability ⊆ provider **机制**上限(方案 §4)。
@@ -1378,8 +1399,7 @@ export function makeAnthropicProxyHandler(
         typeof forceRepinHeader === "string" &&
         (forceRepinHeader === "1" || forceRepinHeader.toLowerCase() === "true");
 
-      const pickRes = await pickUpstream(
-        {
+      const pickDeps: Parameters<typeof pickUpstream>[0] = {
           scheduler: deps.scheduler,
           refreshDeps: deps.refreshDeps,
           staticProviderKeys: deps.staticProviderKeys,
@@ -1394,7 +1414,9 @@ export function makeAnthropicProxyHandler(
           // 30s TTL cache,admin UI 改完立即 invalidate 本机进程的 cache。
           getSessionPinMode: deps.getSessionPinMode,
           listEnabledAccountGroupsForModel: deps.listEnabledAccountGroupsForModel,
-        },
+        };
+      const pickRes = await pickUpstream(
+        pickDeps,
         body,
         route,
         userLog,
@@ -1830,6 +1852,20 @@ export function makeAnthropicProxyHandler(
         uid,
         body,
         session,
+        // OCV5-482:主上游 session 且声明了回落上游 → core 在主上游拒绝时同请求重试回落上游;
+        // 这类路由(含已在回落上游上的)把实际服务的上游记进扣费快照。
+        ...(() => {
+          if (route.kind !== "static") return {};
+          const staticRoute = route;
+          const primary = session.providerId === staticRoute.provider.id;
+          const declared = staticRouteFallback(staticRoute.provider.id, session.upstreamModel) !== undefined;
+          return {
+            recordServedUpstream: healthFallback !== undefined || !primary || declared,
+            ...(primary && declared
+              ? { fallbackSession: () => pickStaticFallbackUpstream(pickDeps, body, staticRoute, userLog, uid) }
+              : {}),
+          };
+        })(),
         noHistoryRewriteRetry: route.kind === "box",
         ...(boxPrepared?.sessionId && boxPrepared.turnKey ? { onBoxRefusal: (code: string) =>
           rememberBoxRefusal({ uid, sessionId: boxPrepared!.sessionId!,
