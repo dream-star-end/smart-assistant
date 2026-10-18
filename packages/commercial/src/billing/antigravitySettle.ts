@@ -21,6 +21,8 @@ export interface AntigravityUsageTotals {
   thoughtsTokens: bigint
   cachedTokens: bigint
   calls: number
+  /** Server-observed HTTP 200 retirement banner, persisted as relay status 410. */
+  retired?: boolean
 }
 
 export const EMPTY_ANTIGRAVITY_USAGE: AntigravityUsageTotals = Object.freeze({
@@ -57,10 +59,11 @@ export async function sumAntigravityRelayUsage(
     thoughts: string | null
     cached: string | null
     calls: string
+    retired: boolean | null
   }>(
     `SELECT SUM(prompt_tokens)::text AS prompt, SUM(candidates_tokens)::text AS candidates,
             SUM(thoughts_tokens)::text AS thoughts, SUM(cached_tokens)::text AS cached,
-            COUNT(*)::text AS calls
+            COUNT(*)::text AS calls, BOOL_OR(status_code = 410) AS retired
        FROM antigravity_relay_usage WHERE request_id = $1 AND user_id = $2`,
     [requestId, userId.toString()],
   )
@@ -72,6 +75,7 @@ export async function sumAntigravityRelayUsage(
     thoughtsTokens: BigInt(row.thoughts ?? '0'),
     cachedTokens: BigInt(row.cached ?? '0'),
     calls: Number(row.calls),
+    retired: row.retired === true,
   }
 }
 
@@ -95,14 +99,16 @@ export function planAntigravitySettle(args: {
 } {
   const usage = mapAntigravityUsage(args.totals)
   const { cost_credits, snapshot } = computeCost(usage, args.pricing)
-  const engineOk = args.engineStatus === 'success'
+  const effectiveStatus = args.totals.retired ? 'error' : args.engineStatus
+  const engineOk = effectiveStatus === 'success'
   const waivedNoOutput = engineOk && BigInt(usage.output_tokens) === 0n && cost_credits > 0n
   const costCredits = engineOk && !waivedNoOutput ? cost_credits : 0n
   const snapshotJson = JSON.stringify({
     ...snapshot,
-    antigravity_status: args.engineStatus,
+    antigravity_status: effectiveStatus,
+    ...(args.totals.retired ? { antigravity_terminal_code: 'ANTIGRAVITY_MODEL_RETIRED' } : {}),
     antigravity_calls: args.totals.calls,
-    ...(args.terminalCode ? { antigravity_terminal_code: args.terminalCode } : {}),
+    ...(!args.totals.retired && args.terminalCode ? { antigravity_terminal_code: args.terminalCode } : {}),
     ...(waivedNoOutput ? { waived: 'no_output', wouldHaveCharged: cost_credits.toString() } : {}),
     ...(!engineOk && cost_credits > 0n
       ? { waived: 'antigravity_engine_not_success', wouldHaveCharged: cost_credits.toString() }
@@ -143,7 +149,7 @@ export async function settleAntigravityTurn(args: {
   })
   // A call that recorded its row between the sum above and this write would
   // otherwise be missed: its relay refresh found no usage row to update yet.
-  if (args.engineStatus !== 'success') {
+  if (args.engineStatus !== 'success' || totals.retired) {
     await refreshWaivedAntigravityUsage({
       pool: args.pool,
       pricing: args.pricing,
