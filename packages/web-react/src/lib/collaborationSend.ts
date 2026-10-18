@@ -14,7 +14,7 @@ export async function prepareAdvisorSend(input: {
   agentId: string
   original: CollabUiState
   auth: Auth | null
-  sessionId: string | null
+  sessionId: string | null | undefined
   parentEngine?: string
   isCurrent: () => boolean
   update: (state: CollabUiState, recovered: boolean) => void
