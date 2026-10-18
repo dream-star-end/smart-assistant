@@ -141,7 +141,7 @@ export async function runOcWebCli(argv: string[], env: NodeJS.ProcessEnv = proce
       if (maxChars === undefined || !Number.isInteger(maxChars) || maxChars < 1) return usageError('--max-chars must be a positive integer')
       const result = await searchWeb(positional[0].trim(), timeout, env)
       if (!result.ok) return formatResult(result, asJson)
-      const markdown = result.results.map((hit, i) => `${i + 1}. ${hit.title}\n${hit.url}\n${hit.date ? hit.date + '\n' : ''}${hit.snippet}`).join('\n\n').slice(0, maxChars)
+      const markdown = result.results.map((hit, i) => `${i + 1}. ${hit.title}\n${hit.url}\n${hit.date ? `${hit.date}\n` : ''}${hit.snippet}`).join('\n\n').slice(0, maxChars)
       return formatResult({ ...result, markdown }, asJson)
     }
     if (command === 'extract') {

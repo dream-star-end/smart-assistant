@@ -54,7 +54,7 @@ for (const scenario of ['http-error', 'empty', 'invalid-json', 'invalid-urls', '
 }
 
 test('search fails explicitly without disclosing response bodies or identity', async () => {
-  await fixture((_req, res) => { res.writeHead(500); res.end(identity + ' private upstream detail') }, async (env, requests) => {
+  await fixture((_req, res) => { res.writeHead(500); res.end(`${identity} private upstream detail`) }, async (env, requests) => {
     const result = await runOcWebCli(['search', 'news', '--json'], env)
     assert.equal(result.exitCode, 1)
     assert.equal(JSON.parse(result.stdout).ok, false)
