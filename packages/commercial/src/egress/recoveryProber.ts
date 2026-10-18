@@ -40,12 +40,12 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { request } from 'undici'
 import { STATIC_KEY_PROVIDERS, type StaticKeyProviderSpec } from '@openclaude/protocol'
-import { STATIC_PROVIDER_META } from '../http/proxy/staticProviderMeta.js'
+import { request } from 'undici'
 import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
 import { query as _query } from '../db/queries.js'
 import { recordProviderProbeSuccess as _recordSuccess } from '../http/proxy/providerHealthSink.js'
+import { STATIC_PROVIDER_META } from '../http/proxy/staticProviderMeta.js'
 
 const PROBE_TIMEOUT_MS = 30_000
 const PROBE_MAX_TOKENS = 512
@@ -148,7 +148,7 @@ export async function requestRecoveryProbe(
   const headers = buildRecoveryProbeHeaders(spec, key)
 
   let statusCode: number | null = null
-  let error: string | null = null
+  const error: string | null = null
   let model = ''
   for (const candidate of probeCandidates(spec)) {
     model = candidate

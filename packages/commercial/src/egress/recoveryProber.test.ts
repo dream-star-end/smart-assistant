@@ -8,14 +8,14 @@
 
 import assert from 'node:assert/strict'
 import { afterEach, describe, test } from 'node:test'
+import { type StaticProviderKeys, getStaticProvider } from '@openclaude/protocol'
 import {
-  buildRecoveryProbeHeaders,
-  startRecoveryProber,
-  requestRecoveryProbe,
   type RecoveryProbeRequest,
   type RecoveryProbeResult,
+  buildRecoveryProbeHeaders,
+  requestRecoveryProbe,
+  startRecoveryProber,
 } from './recoveryProber.js'
-import { getStaticProvider, type StaticProviderKeys } from '@openclaude/protocol'
 
 const logState = { infos: [] as string[], warns: [] as string[] }
 const fakeLog = {
@@ -222,8 +222,8 @@ describe('recovery probe pool identity', () => {
   })
 
   test('null or throwing pool resolution sends nothing and continues other providers', async () => {
-    const selected: string[] = [],
-      sent: string[] = []
+    const selected: string[] = []
+    const sent: string[] = []
     const h = startRecoveryProber({
       resolveKey: async (provider) => {
         selected.push(provider)
@@ -258,9 +258,9 @@ describe('recovery probe pool identity', () => {
   })
 
   test('concurrent runNow shares one in-flight key selection and probe', async () => {
-    let release!: () => void,
-      selections = 0,
-      probes = 0
+    let release!: () => void
+    let selections = 0
+    let probes = 0
     const paused = new Promise<void>((resolve) => {
       release = resolve
     })
@@ -284,8 +284,8 @@ describe('recovery probe pool identity', () => {
     })
     assert.ok(h)
     try {
-      const a = h.runNow(),
-        b = h.runNow()
+      const a = h.runNow()
+      const b = h.runNow()
       assert.equal(a, b)
       release()
       await Promise.all([a, b])
