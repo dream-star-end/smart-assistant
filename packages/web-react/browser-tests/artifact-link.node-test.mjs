@@ -25,6 +25,7 @@ test("OCV5-508 generated Markdown links download authenticated file bytes", { ti
     for (const width of [1280, 390]) {
       const page = await browser.newPage({ viewport: { width, height: 844 }, acceptDownloads: true });
       const signs = [];
+      await page.route("https://example.test/preview.png", (route) => route.fulfill({ contentType: "image/svg+xml", body: '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="32"><text x="2" y="20">Report</text></svg>' }));
       await page.route("**/api/media-sign", async (route) => {
         const { paths } = route.request().postDataJSON(); signs.push(paths);
         await route.fulfill({ json: Object.fromEntries(paths.map((p) => [p, `${server.url}api/media?signed=fixture`])) });
@@ -47,9 +48,11 @@ test("OCV5-508 generated Markdown links download authenticated file bytes", { ti
       const download = await downloadEvent;
       assert.equal(download.suggestedFilename(), "报表 2026.csv");
       assert.equal(readFileSync(await download.path(), "utf8"), bytes);
-      assert.deepEqual(signs, [["/home/agent/.openclaude/generated/报表 2026.csv"]], "same path shares signing cache; readOnly does not sign");
+      assert.deepEqual(signs, [["/home/agent/.openclaude/generated/报表 2026.csv", "/home/agent/.openclaude/generated/report.pdf"]], "same path shares signing cache; readOnly does not sign");
       assert.equal(await page.getByRole("link", { name: "帮助文档" }).getAttribute("href"), "/help/report.csv");
       assert.equal(await page.getByRole("link", { name: "只读文件" }).getAttribute("href"), "/home/agent/.openclaude/generated/%E6%8A%A5%E8%A1%A8%202026.csv");
+      assert.equal(await page.getByRole("link", { name: "下载 report.pdf" }).getAttribute("href"), "#");
+      assert.equal(await page.getByAltText("报告缩略图").evaluate((el) => el.closest("a")), null);
       assert.equal(await page.locator("a a").count(), 0);
       if (shots) await download.saveAs(join(shots, `artifact-downloaded-${width}.csv`));
       await page.close();
