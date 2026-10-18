@@ -31,7 +31,7 @@ import {
   underRateCap,
   type AffinityAction,
 } from './policy/affinity.js'
-import { healthWeight } from './policy/select.js'
+import { healthWeight, rankWRH } from './policy/select.js'
 
 export type AntigravityPoolOutcome =
   | { kind: 'success' }
@@ -83,7 +83,7 @@ export function isAntigravityUltra(tier: string | null | undefined): boolean {
 export function antigravityAccountSupportsModel(models: AntigravityModelAvailability | null | undefined, modelId: string, now: number): boolean {
   // Preserve existing legacy accounts until their first background refresh.
   // Newly introduced Claude 5.5 must have affirmative directory evidence.
-  if (!models) return !/^antigravity-claude-.*-5\.5$/.test(modelId)
+  if (!models) return modelId === 'antigravity-gemini-3.8-flash' || modelId === 'antigravity-gpt-oss-120b'
   let ids = antigravityAllowedUpstreamModels(modelId).filter((id) => !(ANTIGRAVITY_AUX_UPSTREAM_MODELS as readonly string[]).includes(id))
   if (modelId === 'antigravity-gemini-3.8-flash' && models['gemini-3.8-flash-tiered']) ids = ['gemini-3.8-flash-tiered']
   if (ids.length === 0) return false
@@ -155,7 +155,8 @@ export async function pickAntigravityAccount(
     usable.push(row)
   }
   if (usable.length === 0) return null
-  const tier = (r: typeof usable[number]): number => r.status === 'cooldown' ? 2 : isAntigravityUltra(r.paid_tier) ? 0 : 1
+  // Prefer healthy Ultra; an active but degraded member remains a last resort.
+  const tier = (r: typeof usable[number]): number => r.status === 'cooldown' ? 3 : r.health_score < 80 ? 2 : isAntigravityUltra(r.paid_tier) ? 0 : 1
   usable.sort((a, b) => tier(a) - tier(b))
   if (deps.userId === undefined || deps.userId === null) {
     return { accountId: BigInt(usable[0].id), email: usable[0].email }
@@ -206,7 +207,13 @@ export async function pickAntigravityAccount(
     // Affinity is best-effort: the store failing must not block a turn (legacy order serves).
     resolved = null
   }
-  const preferred = resolved ? candidates.find((r) => r.id === resolved!.member.id) ?? candidates[0] : candidates[0]
+  // Spill does not create a second persistent binding. Rendezvous ranking
+  // keeps an old Pro user's spill stable across multiple Ultra accounts, even
+  // as last_used_at changes, so the prompt cache can warm on one account.
+  const stableSpill = resolved?.action === 'spill' ? rankWRH(candidates, {
+    key: deps.userId.toString(), id: (r) => r.id, weight: (r) => healthWeight(r.health_score),
+  })[0] : undefined
+  const preferred = stableSpill ?? (resolved ? candidates.find((r) => r.id === resolved!.member.id) ?? candidates[0] : candidates[0])
   let row = preferred
   if (deps.reserveToken) {
     // Atomic check-and-reserve: a concurrent turn may have filled the preferred

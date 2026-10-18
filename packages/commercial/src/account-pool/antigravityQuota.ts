@@ -19,7 +19,7 @@ export const ANTIGRAVITY_QUOTA_TTL_MS = 10 * 60 * 1000
  * without this user-agent loadCodeAssist answers allowedTiers/ineligibleTiers
  * only (no project), so the quota call cannot be made. Matches the pinned CLI.
  */
-export const ANTIGRAVITY_QUOTA_USER_AGENT = 'antigravity/1.4.0'
+export const ANTIGRAVITY_QUOTA_USER_AGENT = 'antigravity/cli/1.4.0 (aidev_client; os_type=linux; arch=amd64; cl=1000494485; auth_method=consumer)'
 const TIMEOUT_MS = 8_000
 
 export interface QuotaWindow {
@@ -155,12 +155,12 @@ async function fetchQuota(accountId: string, deps: AntigravityQuotaDeps, now: nu
     }
     const paidTier = typeof loaded?.paidTier?.id === 'string' ? loaded.paidTier.id.slice(0, 120) : null
     const directory = await post('/v1internal:fetchAvailableModels', token, { project }).catch(() => null)
-    const rawModels = (directory?.json as { models?: Record<string, { quotaInfo?: { remainingFraction?: number; resetTime?: string } }> } | null)?.models
+    const rawModels = (directory?.json as { models?: Record<string, { disabled?: boolean; quotaInfo?: { remainingFraction?: number; resetTime?: string } }> } | null)?.models
     let models: AntigravityModelAvailability | null = null
     if (directory?.status === 200 && rawModels && typeof rawModels === 'object' && !Array.isArray(rawModels)) {
       models = {}
       for (const [id, value] of Object.entries(rawModels)) {
-        if (!/^[a-zA-Z0-9._-]{1,128}$/.test(id)) continue
+        if (!/^[a-zA-Z0-9._-]{1,128}$/.test(id) || value?.disabled === true) continue
         const q = value?.quotaInfo
         models[id] = {
           remainingFraction: typeof q?.remainingFraction === 'number' && Number.isFinite(q.remainingFraction) ? q.remainingFraction : null,
