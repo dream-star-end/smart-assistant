@@ -184,6 +184,7 @@ import {
   recommendedAdvisorModel,
   sendCollabFields,
 } from "./lib/collaborationConfig";
+import { prepareAdvisorSend, persistRecoveredAdvisor, saveInitialCollaboration } from "./lib/collaborationSend";
 
 import { clearSessionEffort, writeSessionEffort } from "./lib/sessionEffort";
 import { clearContextTierForSession, writeContextTier } from "./lib/sessionContextTier";
@@ -1284,14 +1285,31 @@ export function App() {
         if (rewriteTarget) sendImplicitRatingRef.current?.(rewriteTarget, { reason: "改写重发" });
       }
       // 非 demo：经真实 WS 引擎发送（inbound.message）。确保有会话承载本轮（peer.id）。
-      let sessionId = target?.sessionId ?? activeId;
+      const originalSessionId = target?.sessionId ?? activeId;
+      const sessionId = originalSessionId ?? genWsSessionId();
       let createdSession: Session | null = null;
-      let modeForSend = collabMode;
-      let advisorModelForSend = collabUi.advisorModel;
-      let configVersionForSend = collabUi.configVersion;
-      let unavailableForSend = collabUi.advisorUnavailableReason;
-      if (!sessionId) {
-        sessionId = genWsSessionId();
+      const recoveryEpoch = collabEpochRef.current;
+      const recoverySelection = selectedSessionIdRef.current;
+      const recoveryIdentity = auth?.snapshot().epoch;
+      const recoveryIdentityIsCurrent = () => auth?.snapshot().epoch === recoveryIdentity;
+      const recoveryIsCurrent = () => collabEpochRef.current === recoveryEpoch
+        && selectedSessionIdRef.current === recoverySelection && (!target || target.sessionId === recoverySelection) && recoveryIdentityIsCurrent();
+      const recovery = await prepareAdvisorSend({
+        agentId: agent.id, original: collabUi, auth, sessionId: originalSessionId,
+        parentEngine: models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine,
+        isCurrent: recoveryIdentityIsCurrent,
+        update: (state, recovered) => {
+          if (!recoveryIsCurrent()) return;
+          setCollabUi(state);
+          setTeamModeState(false);
+          setCollabSaveError(null);
+          if (recovered) toast("顾问暂不可用，已由当前主模型继续处理", "info");
+        },
+      });
+      if (!recovery || !recoveryIdentityIsCurrent()) return;
+      let latestCollab = recovery.state;
+      const recoveredAdvisor = recovery.recoveredAdvisor;
+      if (!originalSessionId) {
         createdSession = {
           id: sessionId,
           title: sessionTitle,
@@ -1306,14 +1324,14 @@ export function App() {
         };
         // 空会话态用户可能已在全能助手卡上开/关了团队模式;把当前 intent 落地为新会话的
         // per-session 键 —— 否则该会话只靠全局默认,会被其它会话的开关翻动(切走再回来变样)。
-        writeTeamMode(sessionId, collabMode === "team");
+        writeTeamMode(sessionId, latestCollab.mode === "team");
         // 显式档位选择存在才落地(未选择 = 继续继承全局偏好,不写键)。
         if (sessionEffort !== undefined) writeSessionEffort(sessionId, sessionEffort);
         writeContextTier(sessionId, contextTier);
         writeSessionServiceTier(sessionId, serviceTier);
         sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
         if (modelId) sockRef.current?.setSessionModel(sessionId, modelId);
-        if (auth && (collabMode !== "solo" || collabAsDefault)) {
+        if (auth && !recoveredAdvisor && (latestCollab.mode !== "solo" || collabAsDefault)) {
           const collabAuth = auth;
           const identityEpoch = collabAuth.snapshot().epoch;
           const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
@@ -1322,29 +1340,14 @@ export function App() {
             return;
           }
           try {
-            const doc = await api.putCollaborationConfig(
-              collabAuth,
-              collaborationPutBody({
-                sessionId,
-                mode: collabMode,
-                advisorModel:
-                  collabMode === "advisor"
-                    ? (collabUi.advisorModel ?? recommendedAdvisorModel(collabUi))
-                    : null,
-                expectedRev: collabUi.rev,
-                asDefault: collabAsDefault,
-              }),
-            );
-            if (collabAuth.snapshot().epoch !== identityEpoch) return;
-            applyCollabDoc(doc);
-            modeForSend = doc.session.mode;
-            advisorModelForSend = doc.session.advisorModel;
-            configVersionForSend = doc.session.configVersion;
-            unavailableForSend = doc.advisorUnavailableReason;
+            const doc = await saveInitialCollaboration(auth, sessionId, latestCollab, collabAsDefault, identityEpoch);
+            if (!doc || collabAuth.snapshot().epoch !== identityEpoch) return;
+            if (recoveryIsCurrent()) applyCollabDoc(doc);
+            latestCollab = docToUiState(doc);
           } catch (err) {
             if (collabAuth.snapshot().epoch !== identityEpoch) return;
             // Team still sends: it rides on the turn frame. Only advisor needs the saved config.
-            if (!keepCollabChoiceOnSaveFailure(collabMode)) {
+            if (!keepCollabChoiceOnSaveFailure(latestCollab.mode)) {
               const msg = apiErrorMessage(err, "协作配置保存失败");
               setCollabSaveError(msg);
               toast(msg, "error");
@@ -1353,18 +1356,11 @@ export function App() {
           }
         }
         setSessions((c) => [createdSession!, ...c]);
-        setActiveId(sessionId);
+        if (recoveryIsCurrent()) setActiveId(sessionId);
       }
       const sendCollab = sendCollabFields({
-        agentId: agent.id,
-        mode: modeForSend,
-        advisorModel: advisorModelForSend,
-        configVersion: configVersionForSend,
-        advisorUnavailableReason: unavailableForSend,
-        parentEngine: models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine,
-        advisorConsultParents: collabUi.advisorConsultParents,
-        advisorConsultAllowed: collabUi.advisorConsultAllowed,
-        advisorConsultParentReason: collabUi.advisorConsultParentReason,
+        ...latestCollab, agentId: agent.id,
+        parentEngine: models.find((row) => row.id === modelId)?.engine ?? latestCollab.parentEngine,
       });
       if (sendCollab.blockedReason) {
         toast(sendCollab.blockedReason, "error");
@@ -1427,6 +1423,10 @@ export function App() {
         // OCV5-434 GPT Fast:只在当前模型支持且用户开着时随帧发送;不带 = 标准。
         ...(serviceTier === "fast" && supportsFastServiceTier(modelId) ? { serviceTier } : {}),
       });
+      if (recoveredAdvisor && auth) void persistRecoveredAdvisor({
+        auth, sessionId, rev: latestCollab.rev, isCurrent: recoveryIsCurrent,
+        ensureSession: (recoverySession) => sockRef.current?.ensureServerSession(recoverySession, agent.id, sessionTitle),
+      });
       // 侧栏：提到顶 + 更新标题/时间/计数（计数仅作排序提示，权威消息在 WS service）。
       setSessions((c) => {
         const sid = sessionId!;
@@ -1478,7 +1478,6 @@ export function App() {
       sessionEffort,
       contextTier,
       serviceTier,
-      collabMode,
       collabUi,
       collabAsDefault,
       sessions,

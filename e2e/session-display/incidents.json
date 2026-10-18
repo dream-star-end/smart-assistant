@@ -7869,6 +7869,29 @@
       ]
     },
     {
+      "id": "INC-20261018-ADVISOR-UNAVAILABLE-TASK",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "体验官B1追加复核：已存顾问会话在无可用顾问时阻断主任务。修复先有界重读，只恢复原顾问；已确认不可用则保留正文、附件和主模型继续同次任务，不继承另一端团队或新顾问，不等待协作保存成功。",
+      "rootFixCommit": "7d3b63cc",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/collaborationConfig.test.ts",
+          "assertion": "OCV5-512 recovers only a resolved empty advisor catalog without choosing another model"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/advisor-task-recovery.node-test.mjs",
+          "assertion": "OCV5-512 unavailable advisor continues the same main task with its attachment"
+        }
+      ],
+      "coverageCommits": [
+        "dfc0a21a",
+        "5c7a7d93"
+      ]
+    },
+    {
       "id": "INC-20261018-CODEX-WEB-SEARCH-CLI",
       "occurredAt": "2026-10-18",
       "severity": "P1",

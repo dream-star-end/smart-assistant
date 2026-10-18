@@ -853,7 +853,7 @@ export const api = {
       ),
     ),
 
-  getCollaborationConfig: (a: AuthSession, sessionId?: string) =>
+  getCollaborationConfig: (a: AuthSession, sessionId?: string, opts?: { signal?: AbortSignal }) =>
     jsonOrThrow<{
       rev: number
       defaultMode: "solo" | "advisor" | "team"
@@ -874,7 +874,7 @@ export const api = {
       callWithRefresh(a, (t) =>
         fetch(
           `/api/collaboration-config${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ""}`,
-          { credentials: "include", headers: bearerHeaders(t) },
+          { credentials: "include", headers: bearerHeaders(t), signal: opts?.signal },
         ),
       ),
     ),
