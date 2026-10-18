@@ -2150,10 +2150,7 @@ async function appendRecoveryGiveUpTerminalCard(
  * only while that row is still the session's last message: a session the user
  * has moved on in is left alone. Idempotent (the card id is per root).
  */
-export async function closeRefusedRecoveryChains(
-  pool: Pool,
-  input: { limit?: number } = {},
-): Promise<number> {
+export async function closeRefusedRecoveryChains(pool: Pool): Promise<number> {
   const jobs = (
     await pool.query<{
       user_id: string;
@@ -2161,10 +2158,11 @@ export async function closeRefusedRecoveryChains(
       root_client_message_id: string;
       recovery_message_id: string | null;
     }>(
-      // Only chains whose session still ends in their recovery row: a closed or
-      // answered chain drops out, so a full page never starves a later one.
-      // json, not jsonb: jsonb refuses a stored lone surrogate (`\ud800`) anywhere
-      // in the history and would fail the whole sweep (Codex r2).
+      // Every such chain of the last day whose card is not written yet: no page
+      // to starve a later chain (Codex r1). The history is not parsed in SQL —
+      // json and jsonb both refuse a stored lone surrogate (`\ud800`), which
+      // would fail the sweep for every session (Codex r2, r3); the last-row
+      // check below runs per session under its row lock.
       `SELECT j.user_id::text AS user_id, j.session_id, j.root_client_message_id,
               j.request_json->>'clientMessageId' AS recovery_message_id
          FROM turn_recovery_jobs j
@@ -2173,15 +2171,14 @@ export async function closeRefusedRecoveryChains(
         WHERE j.status='paused'
           AND (j.pause_reason='dispatch_not_accepted' OR j.pause_reason LIKE 'refused:%')
           AND j.updated_at > NOW() - INTERVAL '1 day'
-          AND CASE WHEN strpos(s.messages, j.request_json->>'clientMessageId') > 0
-            THEN (s.messages::json -> -1 ->> 'id') = j.request_json->>'clientMessageId'
-            ELSE false END
-        ORDER BY j.updated_at
-        LIMIT $1`,
-      [input.limit ?? 50],
+          AND strpos(s.messages, '"m-recovery-giveup-' || j.root_client_message_id || '"') = 0
+        ORDER BY j.updated_at`,
     )
   ).rows;
   let closed = 0;
+  // One session's failure must not hold up the chains after it: each runs on
+  // its own and the first error is reported once all were tried.
+  let failure: unknown;
   for (const job of jobs) {
     if (!isClientMessageId(job.recovery_message_id)) continue;
     const sessionUserId = `c:${job.user_id}`;
@@ -2211,9 +2208,13 @@ export async function closeRefusedRecoveryChains(
         rootClientMessageId: job.root_client_message_id,
         reason: "recovery_refused",
       });
+    }).catch((error: unknown) => {
+      failure ??= error;
+      return false;
     });
     if (appended) closed += 1;
   }
+  if (failure !== undefined) throw failure;
   return closed;
 }
 

@@ -106,7 +106,7 @@ type Api = {
   home: string;
   sessionsBackend: (pool: unknown) => SessionsBackend;
   /** OCV5-509: the reconciler sweep that closes a recovery chain paused before it ran. */
-  closeRefusedRecoveryChains: (pool: unknown, limit?: number) => Promise<number>;
+  closeRefusedRecoveryChains: (pool: unknown) => Promise<number>;
   tape: { version: number; partBytes: number };
   /** The Box CLI version gate and the exec transport its read goes through. */
   cliVersion: { gate: () => { read: (target: unknown) => Promise<string> };
@@ -280,8 +280,7 @@ async function load(): Promise<Api> {
       defaults: { permissionMode: "bypassPermissions", model: authority.BOX_NATIVE_CONTEXT_MODEL } }),
     home: process.env.OPENCLAUDE_HOME!,
     sessionsBackend: (pool) => sessionsBackend.createPgSessionsBackend(pool, { expectedGeneration: 1 }),
-    closeRefusedRecoveryChains: (pool, limit) => sessionsBackend.closeRefusedRecoveryChains(pool,
-      limit === undefined ? {} : { limit }),
+    closeRefusedRecoveryChains: (pool) => sessionsBackend.closeRefusedRecoveryChains(pool),
     tape: { version: protocol.LOSSLESS_TURN_TAPE_VERSION, partBytes: protocol.LOSSLESS_TURN_TAPE_PART_BYTES },
     cliVersion: { gate: () => new cliVersion.BoxCliVersionGate(), launchResolver: cliVersion.gateBoxLaunchResolver,
       transport: (fetchImpl) => new transport.BoxExecTransport({ execUrl: "https://box.invalid/agent.v1.ControlService/Exec",
@@ -2412,9 +2411,8 @@ async function proveRefusedRecoveryClosed(api: Api, database: unknown): Promise<
       '"text":"↻ 自动从断点继续\\ud800"') WHERE id=$1`, [policy.sessionId]);
     // a chain that ran and gave up has its own card; it is not this sweep's
     const exhausted = await chain("exhausted", "automatic_retry_exhausted");
-    // one chain per sweep (Codex r1): each sweep reaches the next open chain
-    const swept = [await api.closeRefusedRecoveryChains(db, 1), await api.closeRefusedRecoveryChains(db, 1)];
-    if (!isDeepStrictEqual(swept, [1, 1])) fail(`REFUSED_RECOVERY_NOT_CLOSED_${swept.join(",")}`);
+    // one sweep reaches every open chain, the history with a lone surrogate too (Codex r1–r3)
+    if (await api.closeRefusedRecoveryChains(db) !== 2) fail("REFUSED_RECOVERY_NOT_CLOSED");
     for (const closed of [refused, policy]) {
       const card = await last(closed.sessionId);
       // what the client reads as the end of the turn (adoptPendingAutomaticRecoveryFromHistory)
