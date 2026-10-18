@@ -182,7 +182,8 @@
     "0308_pool_user_affinity",
     "0309_box_profile_quota_windows",
     "0310_antigravity_claude_55",
-    "0311_antigravity_paid_tier"
+    "0311_antigravity_paid_tier",
+    "0312_antigravity_gemini_4_argon"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

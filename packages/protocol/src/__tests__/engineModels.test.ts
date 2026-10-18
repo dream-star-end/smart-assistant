@@ -555,6 +555,7 @@ describe('Antigravity CLI engine model authority (OCV5-415)', () => {
   test('canonical ids stay separate from the 1.3.4 `agy models` ids', () => {
     assert.deepEqual(ANTIGRAVITY_ENGINE_MODEL_IDS, [
       'antigravity-gemini-3.8-flash',
+      'antigravity-gemini-4-argon',
       'antigravity-claude-sonnet-5.5',
       'antigravity-claude-opus-5.5',
       'antigravity-gpt-oss-120b',
@@ -594,5 +595,20 @@ describe('Antigravity CLI engine model authority (OCV5-415)', () => {
       'gemini-3.5-flash-lite',
     ])
     assert.deepEqual(antigravityAllowedUpstreamModels('antigravity-gemini-3.1-pro'), [])
+  })
+})
+
+
+describe('Gemini 4 Argon account-verified CLI model authority (OCV5-517)', () => {
+  test('all three choices map to the exact CLI id and retain the explicit medium default', () => {
+    for (const effort of ['low','medium','high']) {
+      assert.equal(antigravityCliModelId('antigravity-gemini-4-argon',effort),'gemini-4-argon-'+effort)
+    }
+    assert.equal(antigravityCliModelId('antigravity-gemini-4-argon',undefined),'gemini-4-argon-medium')
+    assert.deepEqual(modelReasoningPolicy('antigravity-gemini-4-argon').supported,['low','medium','high'])
+    assert.deepEqual(antigravityAllowedUpstreamModels('antigravity-gemini-4-argon'),[
+      'gemini-4-argon-low','gemini-4-argon-medium','gemini-4-argon-high','gemini-3.5-flash-lite',
+    ])
+    assert.equal(isAntigravityEngineModel('gemini-4-argon-medium'),false)
   })
 })
