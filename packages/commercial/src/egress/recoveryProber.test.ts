@@ -8,7 +8,7 @@
 
 import assert from 'node:assert/strict'
 import { afterEach, describe, test } from 'node:test'
-import { type StaticProviderKeys, getStaticProvider } from '@openclaude/protocol'
+import { getStaticProvider } from '@openclaude/protocol'
 import {
   type RecoveryProbeRequest,
   type RecoveryProbeResult,
@@ -23,7 +23,7 @@ const fakeLog = {
   warn: (msg: string) => logState.warns.push(msg),
 }
 
-const keys: StaticProviderKeys = {
+const keys: Record<string, string | undefined> = {
   opencodego: 'sk-opencodego',
   ark: 'sk-ark',
 }
