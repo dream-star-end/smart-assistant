@@ -156,7 +156,8 @@ test("OCV5-460: the smoke fails C3 when any continuation turn read an offloaded 
 // The user-approved OCV5-496 exception is per candidate SHA and only concerns G1.
 test("OCV5-496: exact-SHA approval skips only Go and keeps other verdicts", () => {
   const dir = mkdtempSync(join(tmpdir(), "ocv5-496-gate-"));
-  const pw = join(dir, "pw"), policy = join(dir, "policy");
+  const pw = join(dir, "pw");
+  const policy = join(dir, "policy");
   const sha = "a".repeat(40);
   writeFileSync(pw, "x");
   const gate = shellFunction("user_contract_gate").replace("/etc/openclaude/selfhost-canary.password", pw);
