@@ -1,3 +1,4 @@
+import { makeEnginePreheatPreparation } from './dispatch/enginePreheatPreparation.js';
 import { makeWorkspacePreparation } from './agent-sandbox/workspacePreparation.js';
 import { isInMaintenance } from './middleware/maintenanceMode.js';
 import { HttpError } from './http/util.js';
@@ -684,7 +685,7 @@ import {
 } from "./qqbot/receiver.js";
 import { createPgIdentityRepo } from "./auth/containerIdentity.js";
 import { makeContainerIdentityStrategy } from "./auth/proxyIdentity.js";
-import { makeLoadUserModelAuthz } from "./auth/userModelAuthz.js";
+import { makeLoadUserModelAuthz, scopeFromAuthz } from "./auth/userModelAuthz.js";
 import { getProviderRoutingAvailability } from "./admin/providerHealthGate.js";
 import { makePgApiKeyRepo } from "./auth/apiKeyRepo.js";
 import { makeApiKeyIdentityStrategy, resolveApiKeyIdentity } from "./auth/apiKeyIdentity.js";
@@ -7281,6 +7282,24 @@ export async function registerCommercial(
       ? makeEnginePreheatClient({
           transport: makeNodeHttpContainerTransport(),
           bridgeSecret,
+          resolvePreparation: makeEnginePreheatPreparation({
+            resolveAllowedModel: async (uid, modelId) => {
+              const active = (await getPool().query<{ status: string }>(
+                'SELECT status FROM users WHERE id = $1', [uid.toString()],
+              )).rows[0];
+              if (active?.status !== 'active') return null;
+              const cache = peekModelCatalogCache();
+              if (!cache) return null;
+              const snapshot = await cache.assertFresh();
+              const canonical = snapshot.aliasToCanonical(modelId);
+              const authz = await loadUserModelAuthz(uid, snapshot.securityEpoch);
+              if (!snapshot.canUseModel(scopeFromAuthz(uid, authz), canonical)) return null;
+              const descriptor = snapshot.resolve(canonical);
+              return descriptor ? { engine: descriptor.engine, canonicalModel: descriptor.canonicalModel } : null;
+            },
+            listGroups: modelId => listEnabledGroupsForModel({ modelId, provider: 'codex' }),
+            hasOfficial: groupId => hasActiveOfficialOAuthAccountInGroup(groupId, 'codex'),
+          }),
           resolveRunningEndpoint: async (uid) => {
             const r = await getPool().query<{
               id: string;

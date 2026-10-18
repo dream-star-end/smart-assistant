@@ -1,4 +1,4 @@
-import { reserveUnusedPreheat, armUnusedPreheat, consumeUnusedPreheat, clearUnusedPreheats } from './speculativePreheat.js'
+import { type PreheatPreparation, reserveUnusedPreheat, armUnusedPreheat, consumeUnusedPreheat, clearUnusedPreheats } from './speculativePreheat.js'
 /**
  * Session runner lifecycle: preheat, repo-change recycle, eviction loop, shutdown/destroy, idle drain, execution target and model switch
  *
@@ -91,6 +91,7 @@ function isPreheatDeadline(err: unknown): boolean {
 export async function preheatRunner(
   this: SessionLifecycleHost,
   session: AgentSession,
+  preparation?: PreheatPreparation,
 ): Promise<PreheatOutcome> {
   if (session._plannedTeardown || session._replacing) return 'skipped_teardown'
   const runner = session.runner
@@ -128,6 +129,14 @@ export async function preheatRunner(
         this._promptQueueHolds(session)
       ) {
         return 'skipped_busy'
+      }
+      if (preparation) {
+        const configurable = session.runner as typeof session.runner & {
+          setCodexRoute?: (route: PreheatPreparation['codexRoute']) => void
+        }
+        if (configurable.engineId !== 'codex' || configurable.model !== preparation.model ||
+          typeof configurable.setCodexRoute !== 'function') return 'skipped_busy'
+        configurable.setCodexRoute(preparation.codexRoute)
       }
       const deadlineMs = resolveEnginePreheatDeadlineMs()
       try {

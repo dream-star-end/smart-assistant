@@ -1,3 +1,4 @@
+import { _buildSafeCodexRouteOverride } from '../routeOverrides.js';
 /**
  * CodexAdapter turn parity 测试(M1a)。
  *
@@ -1555,6 +1556,26 @@ describe("CodexAdapter.preheat — fresh volatile thread, zero inference RPC", (
     kernel._startNewThread = original;
     await h.adapter.preheat();
     assert.equal(h.spawnCalls.length, 2);
+    await closePreheatHarness(h);
+  });
+  test("same authoritative official route preserves the preheated process through the real first turn", async () => {
+    const route = () => _buildSafeCodexRouteOverride({
+      agent: { id: "main" }, model: "gpt-6.1-sol",
+      authority: { canonicalModel: "gpt-6.1-sol", engine: "codex" },
+      rawRoute: { kind: "official_oauth" }, officialRelayPort: 18789,
+    })!;
+    const h = makeHarness({ model: "gpt-6.1-sol" });
+    h.adapter.setCodexRoute(route());
+    await h.adapter.preheat();
+    assert.equal(h.proc().written.some(r => r.method === "turn/start" || r.method === "thread/resume"), false);
+    assert.deepEqual(h.sessionIds, []);
+    h.adapter.setCodexRoute(route());
+    const turn = beginTurn(h);
+    await waitForRequest(h, "turn/start");
+    assert.equal(h.spawnCalls.length, 1);
+    assert.equal(h.proc().written.filter(r => r.method === "thread/start").length, 1);
+    h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
     await closePreheatHarness(h);
   });
 });

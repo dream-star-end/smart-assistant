@@ -1,4 +1,7 @@
+import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import type { AgentSession } from './sessionTypes.js'
+
+export type PreheatPreparation = { model: string; codexRoute: CodexProviderConfigOverride }
 
 type Host = { sessions: Map<string, AgentSession>; _promptQueueHolds: (session: AgentSession) => boolean }
 type Reservation = { session: AgentSession; runner: AgentSession['runner']; timer?: ReturnType<typeof setTimeout> }

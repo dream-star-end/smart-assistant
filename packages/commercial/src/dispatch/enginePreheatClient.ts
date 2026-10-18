@@ -20,6 +20,7 @@ export interface EnginePreheatClientDeps {
   bridgeSecret: string
   /** 只解析当前 running 容器;不在跑 → null(绝不 provision)。 */
   resolveRunningEndpoint: (uid: bigint) => Promise<RunningContainerEndpoint | null>
+  resolvePreparation?: (uid: bigint, args: EnginePreheatRequest) => Promise<EnginePreheatPreparation | null>
   timeoutMs?: number
 }
 
@@ -28,6 +29,11 @@ export interface EnginePreheatRequest {
   sessionId: string
   agentId: string
   modelId?: string
+}
+
+export type EnginePreheatPreparation = {
+  modelId?: string
+  codexRouteHint?: { kind: 'official_oauth' }
 }
 
 /** JWT / gateway getUserId 的 `c:<uid>` 或裸数字 → bigint;个人版 default 等返回 null。 */
@@ -50,6 +56,12 @@ export function makeEnginePreheatClient(
     if (!deps.bridgeSecret) return
     const uid = parseUidFromGatewayUserId(args.userId)
     if (uid === null) return
+    let preparation: EnginePreheatPreparation | null
+    try {
+      preparation = deps.resolvePreparation
+        ? await deps.resolvePreparation(uid, args) : { modelId: args.modelId }
+    } catch { return }
+    if (!preparation) return
 
     let endpoint: RunningContainerEndpoint | null
     try {
@@ -70,7 +82,9 @@ export function makeEnginePreheatClient(
     const body = JSON.stringify({
       sessionId: args.sessionId,
       agentId: args.agentId,
-      ...(args.modelId ? { modelId: args.modelId } : {}),
+      ...(preparation.modelId ? { modelId: preparation.modelId } : {}),
+      ...(preparation.codexRouteHint?.kind === 'official_oauth'
+        ? { codexRouteHint: { kind: 'official_oauth' } } : {}),
     })
 
     try {

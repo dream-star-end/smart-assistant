@@ -19,18 +19,20 @@ for (let round = 1; round <= 3; round++) {
   })
   await new Promise(r => server.listen(0, '127.0.0.1', r))
   const port = server.address().port
-  const home = '/tmp/g496-probe-' + round
-  await mkdir(home + '/codex', { recursive: true })
+  const home = `/tmp/g496-probe-${round}`
+  await mkdir(`${home}/codex`, { recursive: true })
   const args = ['app-server', '-c', 'model="gpt-6.1-sol"', '-c', 'model_provider="probe"',
     '-c', 'model_providers.probe.name="Isolated probe"',
-    '-c', 'model_providers.probe.base_url="http://127.0.0.1:' + port + '/v1"',
+    '-c', `model_providers.probe.base_url="http://127.0.0.1:${port}/v1"`,
     '-c', 'model_providers.probe.wire_api="responses"',
     '-c', 'model_providers.probe.requires_openai_auth=false',
     '-c', 'check_for_update_on_startup=false', '--listen', 'stdio://']
   const proc = spawn('codex', args, { cwd: home, env: {
-    PATH: process.env.PATH, HOME: home, CODEX_HOME: home + '/codex', RUST_LOG: 'warn',
+    PATH: process.env.PATH, HOME: home, CODEX_HOME: `${home}/codex`, RUST_LOG: 'warn',
   }, stdio: ['pipe', 'pipe', 'pipe'] })
-  let stderr = '', id = 0, stage = 'initialize'
+  let stderr = ''
+  let id = 0
+  let stage = 'initialize'
   const pending = new Map()
   proc.stderr.on('data', b => { if (stderr.length < 65536) stderr += b.toString() })
   const lines = createInterface({ input: proc.stdout })
@@ -53,15 +55,15 @@ for (let round = 1; round <= 3; round++) {
     const key = ++id
     const timer = setTimeout(() => { pending.delete(key); reject(Error('RPC_TIMEOUT')) }, 20000)
     pending.set(key, { resolve, reject, timer })
-    proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: key, method, params }) + '\n')
+    proc.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: key, method, params })}\n`)
   })
   const status = async () => {
     // npm CLI launchers may retain a Node parent; measure the complete owned tree.
     const visit = async pid => {
       try {
-        const s = await readFile('/proc/' + pid + '/status', 'utf8')
-        const stat = (await readFile('/proc/' + pid + '/stat', 'utf8')).replace(/^.*\) /, '').split(' ')
-        const children = (await readFile('/proc/' + pid + '/task/' + pid + '/children', 'utf8')).trim().split(/\s+/).filter(Boolean)
+        const s = await readFile(`/proc/${pid}/status`, 'utf8')
+        const stat = (await readFile(`/proc/${pid}/stat`, 'utf8')).replace(/^.*\) /, '').split(' ')
+        const children = (await readFile(`/proc/${pid}/task/${pid}/children`, 'utf8')).trim().split(/\s+/).filter(Boolean)
         const totals = { processCount: 1, rssKiB: Number(s.match(/^VmRSS:\s+(\d+)/m)?.[1] || 0),
           cpuTicks: Number(stat[11]) + Number(stat[12]) }
         for (const child of children) {
