@@ -1858,6 +1858,8 @@ export class SessionManager {
      *
      *  既存 session 的 effort 切换走 submit(effortLevel) — 在那里和 turn 入队
      *  原子串行,避免 getOrCreate→submit 之间的窗口期被另一条并发消息覆盖。 */
+    /** Speculation may create a missing identity, but never replace/mutate a real one. */
+    preheatOnly?: boolean
     effortLevel?: string | null
     /** Accepted queue grant fence acquired before any session/preflight work. */
     promptQueueExecutionFence?: PromptQueueExecutionFence

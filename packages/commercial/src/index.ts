@@ -1,3 +1,4 @@
+import { makeDraftPreparation, makePreparationReady, type DraftPreparationHint } from './agent-sandbox/draftPreparation.js';
 import { makeEnginePreheatPreparation } from './dispatch/enginePreheatPreparation.js';
 import { makeWorkspacePreparation } from './agent-sandbox/workspacePreparation.js';
 import { isInMaintenance } from './middleware/maintenanceMode.js';
@@ -4133,9 +4134,59 @@ export async function registerCommercial(
   const ensureContainerReady: ((uid: bigint) => Promise<void>) | undefined =
     ensureContainerEndpointReady;
 
-  const prepareWorkspaceContainer = ensureContainerEndpointReady
-    ? makeWorkspacePreparation({
-        authorize: async uid => {
+  const preheatUserContainer = bridgeSecret
+      ? makeEnginePreheatClient({
+          transport: makeNodeHttpContainerTransport(),
+          bridgeSecret,
+          resolvePreparation: makeEnginePreheatPreparation({
+            resolveAllowedModel: async (uid, modelId) => {
+              const active = (await getPool().query<{ status: string }>(
+                'SELECT status FROM users WHERE id = $1', [uid.toString()],
+              )).rows[0];
+              if (active?.status !== 'active') return null;
+              const cache = peekModelCatalogCache();
+              if (!cache) return null;
+              const snapshot = await cache.assertFresh();
+              const canonical = snapshot.aliasToCanonical(modelId);
+              const authz = await loadUserModelAuthz(uid, snapshot.securityEpoch);
+              if (!snapshot.canUseModel(scopeFromAuthz(uid, authz), canonical)) return null;
+              const descriptor = snapshot.resolve(canonical);
+              return descriptor ? { engine: descriptor.engine, canonicalModel: descriptor.canonicalModel } : null;
+            },
+            listGroups: modelId => listEnabledGroupsForModel({ modelId, provider: 'codex' }),
+            hasOfficial: groupId => hasActiveOfficialOAuthAccountInGroup(groupId, 'codex'),
+          }),
+          resolveRunningEndpoint: async (uid) => {
+            const r = await getPool().query<{
+              id: string;
+              bound_ip: string | null;
+              port: number | null;
+              host_name: string | null;
+            }>(
+              `SELECT ac.id::text AS id, host(ac.bound_ip) AS bound_ip, ac.port,
+                      ch.name AS host_name
+                 FROM agent_containers ac
+                 LEFT JOIN compute_hosts ch ON ch.id = ac.host_uuid
+                WHERE ac.user_id = $1 AND ac.state = 'active' AND ac.runtime_channel = $2
+                  AND ac.runtime_kind = 'docker'
+                  AND ac.bound_ip IS NOT NULL AND ac.port IS NOT NULL
+                ORDER BY ac.updated_at DESC LIMIT 1`,
+              [uid.toString(), getRuntimeChannel()],
+            );
+            const row = r.rows[0];
+            if (!row || !row.bound_ip || row.port === null) return null;
+            const isRemoteHost = row.host_name !== null && row.host_name !== "self";
+            return {
+              host: row.bound_ip,
+              port: Number(row.port),
+              containerId: Number(row.id),
+              ...(isRemoteHost ? { tunnel: { kind: "remote-host" as const } } : {}),
+            };
+          },
+        })
+      : undefined;
+
+  const authorizePreparation = async (uid: bigint): Promise<void> => {
           const row = (await getPool().query<{ status: string; role: string }>(
             'SELECT status, role FROM users WHERE id = $1', [uid.toString()],
           )).rows[0];
@@ -4146,10 +4197,31 @@ export async function registerCommercial(
           const catalog = peekModelCatalogCache();
           const snapshot = catalog ? await catalog.assertFresh() : null;
           await loadUserModelAuthz(uid, snapshot?.securityEpoch);
-        },
-        ensureReady: ensureContainerEndpointReady,
-        warn: fields => rootLogger.warn('workspace_prepare', fields),
-      })
+        };
+  const preparationReady = ensureContainerEndpointReady ? makePreparationReady(ensureContainerEndpointReady) : undefined;
+  const prepareContainer = preparationReady ? makeWorkspacePreparation({
+    authorize: authorizePreparation, ensureReady: preparationReady,
+    warn: fields => rootLogger.warn('workspace_prepare', fields),
+  }) : undefined;
+  const prepareDraft = preparationReady ? makeDraftPreparation({
+    enabled: () => process.env.OC_ENGINE_PREHEAT === '1',
+    authorize: authorizePreparation,
+    ensureReady: preparationReady,
+    prepareEngine: async (uid, hint, isCurrent) => {
+      if (!preheatUserContainer || !dispatchAdmissionBackend || !isCurrent()) return;
+      const userId = 'c:'.concat(uid.toString());
+      const mode = await dispatchAdmissionBackend.getClientSessionWorkspaceMode(hint.sessionId, userId);
+      if (!isCurrent()) return;
+      await preheatUserContainer({
+        userId, sessionId: hint.sessionId, agentId: hint.agentId, modelId: hint.modelId,
+        effortLevel: hint.effortLevel, workspaceMode: mode ?? 'isolated_v1',
+        codexOnly: true, isCurrent,
+      });
+    },
+    observe: fields => rootLogger.info('draft_prepare', fields),
+  }) : undefined;
+  const prepareWorkspaceContainer = prepareContainer
+    ? (uid: bigint, draft?: DraftPreparationHint) => draft ? prepareDraft!(uid, draft) : prepareContainer(uid)
     : undefined;
 
   // 邮箱验证成功 → fire-and-forget 触发 v3 容器 pre-warm(p50=215s"验证 → 首消息"间隔
@@ -7281,57 +7353,7 @@ export async function registerCommercial(
           }
         }
       : undefined,
-    preheatUserContainer: bridgeSecret
-      ? makeEnginePreheatClient({
-          transport: makeNodeHttpContainerTransport(),
-          bridgeSecret,
-          resolvePreparation: makeEnginePreheatPreparation({
-            resolveAllowedModel: async (uid, modelId) => {
-              const active = (await getPool().query<{ status: string }>(
-                'SELECT status FROM users WHERE id = $1', [uid.toString()],
-              )).rows[0];
-              if (active?.status !== 'active') return null;
-              const cache = peekModelCatalogCache();
-              if (!cache) return null;
-              const snapshot = await cache.assertFresh();
-              const canonical = snapshot.aliasToCanonical(modelId);
-              const authz = await loadUserModelAuthz(uid, snapshot.securityEpoch);
-              if (!snapshot.canUseModel(scopeFromAuthz(uid, authz), canonical)) return null;
-              const descriptor = snapshot.resolve(canonical);
-              return descriptor ? { engine: descriptor.engine, canonicalModel: descriptor.canonicalModel } : null;
-            },
-            listGroups: modelId => listEnabledGroupsForModel({ modelId, provider: 'codex' }),
-            hasOfficial: groupId => hasActiveOfficialOAuthAccountInGroup(groupId, 'codex'),
-          }),
-          resolveRunningEndpoint: async (uid) => {
-            const r = await getPool().query<{
-              id: string;
-              bound_ip: string | null;
-              port: number | null;
-              host_name: string | null;
-            }>(
-              `SELECT ac.id::text AS id, host(ac.bound_ip) AS bound_ip, ac.port,
-                      ch.name AS host_name
-                 FROM agent_containers ac
-                 LEFT JOIN compute_hosts ch ON ch.id = ac.host_uuid
-                WHERE ac.user_id = $1 AND ac.state = 'active' AND ac.runtime_channel = $2
-                  AND ac.runtime_kind = 'docker'
-                  AND ac.bound_ip IS NOT NULL AND ac.port IS NOT NULL
-                ORDER BY ac.updated_at DESC LIMIT 1`,
-              [uid.toString(), getRuntimeChannel()],
-            );
-            const row = r.rows[0];
-            if (!row || !row.bound_ip || row.port === null) return null;
-            const isRemoteHost = row.host_name !== null && row.host_name !== "self";
-            return {
-              host: row.bound_ip,
-              port: Number(row.port),
-              containerId: Number(row.id),
-              ...(isRemoteHost ? { tunnel: { kind: "remote-host" as const } } : {}),
-            };
-          },
-        })
-      : undefined,
+    preheatUserContainer,
     // remote-host media push hook(2026-05-16 hotfix):用户容器调度到 remote
     // compute host 时,master 收到 /api/uploads → 本地暂存 → 调本 hook 把字节
     // 推到 host 上的 docker volume(/var/lib/docker/volumes/oc-v3-data-u<uid>/

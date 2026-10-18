@@ -1,3 +1,4 @@
+import { useDraftPreparation } from "./hooks/useDraftPreparation";
 import { createGoalStarter } from "./lib/goalStart";
 import {
   lazy,
@@ -126,7 +127,7 @@ import {
   useAppRoute,
 } from "./hooks/useAppRoute";
 import { useAuth } from "./hooks/useAuth";
-import { genWsSessionId, useSessionList } from "./hooks/useSessionList";
+import { useSessionList } from "./hooks/useSessionList";
 import { useChatProjects } from "./hooks/useChatProjects";
 import { useUnreadSessions } from "./hooks/useUnreadSessions";
 import { useSidebarWidth } from "./hooks/useSidebarWidth";
@@ -1224,6 +1225,15 @@ export function App() {
   const { sessionEffort, setSessionEffort, contextTier, setContextTier, serviceTier, setServiceTier } =
     useSessionEngineOptions(activeId);
 
+  const { draftSessionId, stopPreparing } = useDraftPreparation({
+    auth, userId: user?.id ?? null, activeId, agentId: agent.id, modelId,
+    effortLevel: effortForModel(models, effectiveEffortModelId(modelId, false),
+      sessionEffort !== undefined ? sessionEffort : preferenceEffort),
+    enabled: !demo && laneReady && view === "app" && serverListSettled && !activeId &&
+      !draftProjectId && !projectHome && !boardOpen && collabMode === "solo" && serviceTier !== "fast" &&
+      !!modelId && isCodexEngineModel(modelId) && models.some(m => m.id === modelId),
+  });
+
   // Async goal saves can finish after navigation; only consume the selected draft's project.
   const selectedSessionIdRef = useRef(activeId);
   selectedSessionIdRef.current = activeId;
@@ -1290,7 +1300,8 @@ export function App() {
       let configVersionForSend = collabUi.configVersion;
       let unavailableForSend = collabUi.advisorUnavailableReason;
       if (!sessionId) {
-        sessionId = genWsSessionId();
+        stopPreparing();
+        sessionId = draftSessionId;
         createdSession = {
           id: sessionId,
           title: sessionTitle,
@@ -1467,6 +1478,8 @@ export function App() {
     // 仅为满足 lint(跨 hook 返回值 biome 不再推断稳定性),不改变 send 的重建时机。
     [
       activeId,
+      draftSessionId,
+      stopPreparing,
       auth,
       demo,
       user,
@@ -1666,7 +1679,8 @@ export function App() {
   const ensureActiveSession = useCallback((): string | undefined => {
     if (demo || !user) return activeId;
     if (activeId) return activeId;
-    const id = genWsSessionId();
+    stopPreparing();
+    const id = draftSessionId;
     const s: Session = {
       id,
       title: "新对话",
@@ -1677,6 +1691,10 @@ export function App() {
     };
     // 首轮前操作会紧接着 ensureServerSession/sendRepoBind；先把空白态显式模型写入
     // ChatSession，确保建行 PUT 与后续首发都携带同一选择，不被 activeId effect 回落默认值。
+    writeTeamMode(id, collabMode === "team");
+    if (sessionEffort !== undefined) writeSessionEffort(id, sessionEffort);
+    writeContextTier(id, contextTier);
+    writeSessionServiceTier(id, serviceTier);
     sockRef.current?.ensureSession(id, agent.id, "新对话");
     if (modelId) sockRef.current?.setSessionModel(id, modelId);
     setSessions((c) => [s, ...c]);
@@ -1686,7 +1704,7 @@ export function App() {
     moveComposerAttachments(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, user.id), accountDraftKey(id, user.id));
     setActiveId(id);
     return id;
-  }, [demo, user, activeId, agent.id, modelId, setSessions, setActiveId]);
+  }, [demo, user, activeId, agent.id, modelId, draftSessionId, stopPreparing, collabMode, sessionEffort, contextTier, serviceTier, setSessions, setActiveId]);
 
   // 打开 GitHub 绑定 modal:先确保有承载会话,否则「确认绑定」因 !sessionId 恒禁用
   // (输入框底部入口 → 发消息前即可绑定)。

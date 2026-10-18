@@ -208,3 +208,30 @@ test('uncertain preparation never even resolves a running endpoint', async () =>
   await post({ userId: 'c:3', sessionId: 'webtest1234', agentId: 'main', modelId: 'gpt-6.1-sol' })
   assert.equal(transport.calls, 0)
 })
+
+test('draft HMAC handoff carries effective effort and server workspace mode; stale lookup never sends', async () => {
+  const bodies: unknown[] = []
+  const transport = recordingTransport({ onCall: c => bodies.push(JSON.parse(c.body!)) })
+  let current = true
+  const post = makeEnginePreheatClient({
+    bridgeSecret: SECRET, transport,
+    resolvePreparation: async () => ({ modelId: 'gpt-6.1-sol', codexRouteHint: { kind: 'official_oauth' } }),
+    resolveRunningEndpoint: async () => ({ host: '127.0.0.1', port: 3000, containerId: 7 }),
+  })
+  const args = { userId: 'c:42', sessionId: 'draft_12345', agentId: 'main', modelId: 'gpt-6.1-sol',
+    effortLevel: 'high', workspaceMode: 'isolated_v1' as const, codexOnly: true, isCurrent: () => current }
+  await post(args)
+  assert.deepEqual(bodies, [{ sessionId: args.sessionId, agentId: 'main', modelId: args.modelId,
+    effortLevel: 'high', workspaceMode: 'isolated_v1', codexRouteHint: { kind: 'official_oauth' } }])
+  current = false
+  await post(args)
+  assert.equal(bodies.length, 1)
+  const stale = makeEnginePreheatClient({
+    bridgeSecret: SECRET, transport,
+    resolvePreparation: async () => ({ modelId: 'gpt-6.1-sol' }),
+    resolveRunningEndpoint: async () => { current = false; return { host: '127.0.0.1', port: 3000, containerId: 7 } },
+  })
+  current = true
+  await stale(args)
+  assert.equal(bodies.length, 1)
+})

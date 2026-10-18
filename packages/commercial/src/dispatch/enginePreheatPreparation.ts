@@ -10,7 +10,7 @@ export function makeEnginePreheatPreparation(deps: {
     try {
       const model = await deps.resolveAllowedModel(uid, args.modelId)
       if (!model) return null
-      if (model.engine !== 'codex') return { modelId: model.canonicalModel }
+      if (model.engine !== 'codex') return args.codexOnly ? null : { modelId: model.canonicalModel }
       for (const group of await deps.listGroups(model.canonicalModel)) {
         // Never skip a preferred API group or mint a route token for speculation.
         if (group.kind !== 'official_oauth') return null

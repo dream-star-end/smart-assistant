@@ -132,9 +132,11 @@ export async function preheatRunner(
       }
       if (preparation) {
         const configurable = session.runner as typeof session.runner & {
+          effortLevel?: string
           setCodexRoute?: (route: PreheatPreparation['codexRoute']) => void
         }
         if (configurable.engineId !== 'codex' || configurable.model !== preparation.model ||
+          ('effortLevel' in preparation && configurable.effortLevel !== preparation.effortLevel) ||
           typeof configurable.setCodexRoute !== 'function') return 'skipped_busy'
         configurable.setCodexRoute(preparation.codexRoute)
       }

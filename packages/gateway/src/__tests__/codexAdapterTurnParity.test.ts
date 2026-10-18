@@ -28,7 +28,7 @@ import type { spawn } from "node:child_process";
 import { paths } from "@openclaude/storage";
 
 import { CodexAdapter, buildCodexBillingEvent, classifyCodexErrorKind } from "../engine/codexAdapter.js";
-import { __setCodexAppServerSpawnForTests } from "../engine/codexAppServerRunner.js";
+import { __setCodexAppServerSpawnForTests, log as codexTimingLog } from "../engine/codexAppServerRunner.js";
 import { CREDIT_EXHAUSTED_DETAIL } from "../creditExhaustion.js";
 import { IDLE_TIMEOUT_TOOL_MS, shouldTripIdleWatchdog } from "../sessionManager.js";
 import { _setModelCatalogClientForTests } from "../modelCatalogClient.js";
@@ -1578,4 +1578,28 @@ describe("CodexAdapter.preheat — fresh volatile thread, zero inference RPC", (
     await turn.summary;
     await closePreheatHarness(h);
   });
+});
+
+describe("draft preheated thread timing truth", () => {
+  for (const warm of [false, true]) {
+    test("thread_ready reports actual volatile claim warm=" + warm, async (t) => {
+      const timing: Array<Record<string, unknown>> = [];
+      t.mock.method(codexTimingLog, 'info', (msg: string, fields: Record<string, unknown>) => {
+        if (msg === 'codex_turn_timing' && fields?.stage === 'thread_ready') timing.push(fields);
+      });
+      const h = makeHarness();
+      if (warm) {
+        await h.adapter.preheat();
+        assert.deepEqual(h.proc().written.map(r => r.method), ['initialize', 'thread/start']);
+        assert.deepEqual(h.billing, []);
+      }
+      const turn = beginTurn(h);
+      await waitForRequest(h, 'turn/start');
+      h.proc().notify('turn/completed', { turn: { id: 'turn-1', status: 'completed' } });
+      await turn.summary;
+      assert.equal(timing.length, 1);
+      assert.equal(timing[0].preheatedThreadClaimed, warm);
+      await closePreheatHarness(h);
+    });
+  }
 });

@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { handleWorkspacePrepare } from '../http/agent.js'
 import { signAccess } from '../auth/jwt.js'
@@ -49,7 +50,7 @@ test('workspace HTTP hint authenticates JWT before waking and cannot select anot
     (err: unknown) => (err as { status?: number }).status === 401)
   assert.deepEqual(wakes, [])
   const { token } = await signAccess({ sub: '42', role: 'user' }, jwtSecret)
-  const req = { headers: { authorization: 'Bearer '.concat(token) }, url: '/api/agent/prepare?userId=999' } as IncomingMessage
+  const req = Object.assign(Readable.from([]), { headers: { authorization: 'Bearer '.concat(token) }, url: '/api/agent/prepare?userId=999' }) as IncomingMessage
   await handleWorkspacePrepare(req, res, context, deps)
   assert.deepEqual(wakes, [42n])
   assert.equal(res.statusCode, 202)
@@ -61,7 +62,7 @@ test('HTTP preparation propagates admission denial without an accepted response'
   const deps = { jwtSecret, prepareWorkspaceContainer: async () => { throw Error('MAINTENANCE') } } as unknown as Parameters<typeof handleWorkspacePrepare>[3]
   let ended = false
   const res = { setHeader: () => {}, end: () => { ended = true } } as unknown as ServerResponse
-  await assert.rejects(handleWorkspacePrepare({ headers: { authorization: 'Bearer '.concat(token) } } as IncomingMessage,
+  await assert.rejects(handleWorkspacePrepare(Object.assign(Readable.from([]), { headers: { authorization: 'Bearer '.concat(token) } }) as IncomingMessage,
     res, {} as Parameters<typeof handleWorkspacePrepare>[2], deps), /MAINTENANCE/)
   assert.equal(ended, false)
 })
