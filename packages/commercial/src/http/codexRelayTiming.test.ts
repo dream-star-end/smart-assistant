@@ -35,7 +35,7 @@ test('oversize request and malformed JSON never truncate transport or expose con
 
 test('SSE split at every byte preserves UTF8/CRLF and separates body, reasoning, text, usage', async () => {
   const event = (data: unknown) => `data: ${JSON.stringify(data)}\r\n\r\n`
-  const source = Buffer.from(`: keepalive\r\n\r\n${event({type:'response.created'})}${event({type:'response.output_text.delta',delta:''})}${event({type:'response.reasoning_summary_text.delta',delta:'PRIVATE_THINKING'})}${event({type:'response.output_text.delta',delta:'你好PRIVATE_TEXT'})}${event({type:'response.output_text.delta',delta:'more'})}${event({type:'response.completed',response:{usage:{input_tokens:17000,output_tokens:22,
+  const source = Buffer.from(`: keepalive\r\n\r\n${event({type:'response.created'})}${event({type:'response.output_text.delta',delta:'  '})}${event({type:'response.reasoning_summary_text.delta',delta:'PRIVATE_THINKING'})}${event({type:'response.output_text.delta',delta:'你好PRIVATE_TEXT'})}${event({type:'response.output_text.delta',delta:'more'})}${event({type:'response.completed',response:{usage:{input_tokens:17000,output_tokens:22,
       input_tokens_details:{cached_tokens:15000}, output_tokens_details:{reasoning_tokens:12},
       secret:'PRIVATE_USAGE',attribution:{request_fields:{instructions:{input_tokens:9000}}}}}})}`)
   const events: TimingFields[] = []
