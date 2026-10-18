@@ -2380,13 +2380,13 @@ async function proveRefusedRecoveryClosed(api: Api, database: unknown): Promise<
   return withSessionsBackend(api, database, async (backend, db) => {
     // biome-ignore lint/style/useSingleVarDeclarator: same shape as proveFinalizedTurnRecovery
     const uid = 9n, sessionUser = "c:9";
-    const chain = async (name: string, pauseReason: string) => {
+    const chain = async (name: string, pauseReason: string, text = "↻ 自动从断点继续") => {
       // biome-ignore lint/style/useSingleVarDeclarator: same shape as proveFinalizedTurnRecovery
       const sessionId = `s-ocv5-509-${name}`, root = `cm-ocv5-509-root-${name}`, recovery = `m-recover-ocv5509-${name}`;
       const admitted = await backend.admitUserTurn({ uid, sessionUserId: sessionUser, sessionId, clientMessageId: recovery,
         agentId: "main", model: MODEL, requestHash: "h".repeat(64), billingRequestId: `brq-${recovery}`,
         dispatchId: randomUUID(), ownerId: "conn-A",
-        message: { id: recovery, role: "user", text: "↻ 自动从断点继续", ts: 1,
+        message: { id: recovery, role: "user", text, ts: 1,
           _routing: { model: MODEL, effortLevel: null, teamMode: false }, _automaticRecovery: true,
           _automaticRecoveryAttempt: 1, _recoveryOfClientMessageId: root, _automaticRecoveryRootClientMessageId: root } });
       if (admitted.kind !== "admitted") fail(`REFUSED_RECOVERY_${name}_NOT_ADMITTED`);
@@ -2405,10 +2405,10 @@ async function proveRefusedRecoveryClosed(api: Api, database: unknown): Promise<
       { id: "m-ocv5-509-answer", role: "assistant", text: "done", ts: 2, status: "completed", _source: "server" });
     if (!reply.applied) fail("REFUSED_RECOVERY_ANSWER_NOT_APPENDED");
     const refused = await chain("refused", "dispatch_not_accepted");
-    const policy = await chain("policy", "refused:UNAUTHORIZED_MODEL");
-    // a stored lone surrogate in a history must not fail the sweep for every session (Codex r2)
-    await db.query(`UPDATE client_sessions SET messages=replace(messages, '"text":"↻ 自动从断点继续"',
-      '"text":"↻ 自动从断点继续\\ud800"') WHERE id=$1`, [policy.sessionId]);
+    // a lone surrogate the session writer keeps must not fail the sweep for every session (Codex r2, r3)
+    const policy = await chain("policy", "refused:UNAUTHORIZED_MODEL", "↻ 自动从断点继续\ud800");
+    if ((await backend.getClientSession(policy.sessionId, sessionUser) as { messages: Array<{ text?: unknown }> } | null)
+      ?.messages.at(-1)?.text !== "↻ 自动从断点继续\ud800") fail("REFUSED_RECOVERY_SURROGATE_NOT_STORED");
     // a chain that ran and gave up has its own card; it is not this sweep's
     const exhausted = await chain("exhausted", "automatic_retry_exhausted");
     // one sweep reaches every open chain, the history with a lone surrogate too (Codex r1–r3)
