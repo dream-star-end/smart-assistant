@@ -60,9 +60,9 @@ for (let round = 1; round <= 3; round++) {
     const visit = async pid => {
       try {
         const s = await readFile('/proc/' + pid + '/status', 'utf8')
-        const stat = (await readFile('/proc/' + pid + '/stat', 'utf8')).replace(/^.*\\) /, '').split(' ')
-        const children = (await readFile('/proc/' + pid + '/task/' + pid + '/children', 'utf8')).trim().split(/\\s+/).filter(Boolean)
-        const totals = { processCount: 1, rssKiB: Number(s.match(/^VmRSS:\\s+(\\d+)/m)?.[1] || 0),
+        const stat = (await readFile('/proc/' + pid + '/stat', 'utf8')).replace(/^.*\) /, '').split(' ')
+        const children = (await readFile('/proc/' + pid + '/task/' + pid + '/children', 'utf8')).trim().split(/\s+/).filter(Boolean)
+        const totals = { processCount: 1, rssKiB: Number(s.match(/^VmRSS:\s+(\d+)/m)?.[1] || 0),
           cpuTicks: Number(stat[11]) + Number(stat[12]) }
         for (const child of children) {
           const values = await visit(child)
