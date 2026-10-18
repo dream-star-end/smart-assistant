@@ -140,3 +140,17 @@ seed/技能/配置准备只占约0.4秒。不能据此把生产12.470秒按同�
 两段较长窗口仍是首个TS marker前的入口/npx/静态模块载入，以及exec node后至监听；
 平台seed/技能/配置本身合计约0.4秒。当前标记不能把首个窗口继续归因到单个import。
 未来用户批准发布且自然重建测试容器后，才能采集同一普通网页路径的现网细分分布。
+
+### 默认seed和平台MCP的资源对照
+
+另用同一现网预编译kernel，默认seed、无用户持久卷，在隔离容器内连续做3组仅初始化→thread/start配对；
+每段观察10秒，配置真实默认openclaude_memory bundle。instructions为13245字符、估算6005token，
+缺普通账号记忆及断网不可用的远端IUI槽，因此不是17k真实首轮上下文复刻。
+RPC白名单仅initialize/thread/start；GET models、推理POST和其它provider HTTP均0。
+
+仅初始化10秒后RSS中位138.734MiB，thread/start后10秒为248.594MiB，进程由2增至3。
+每组配对RSS增量p50/最大109.336/109.859MiB，PSS增量68.259/68.829MiB。
+这是实质的短时增长，不能以裸CLI的约30MiB增量代替。
+thread/start RPC p50/最慢54.650/70.103ms不表示后台MCP已就绪；
+随后10秒CPU包含MCP启动，不能当稳定闲置CPU。较长稳定窗口及shutdown后的逐PID复核另列完整报告。
+cap1/TTL60限制未用驻留，不能消除这段峰值；更多可见页面触发的整容器占用仍须在未来获批canary中观察。
