@@ -1,18 +1,11 @@
-# OCV5-505 工具说明等价计算验证状态
+# OCV5-505 MCP文案处理验证
 
-用户批准范围：19:12实现；19:14所有步骤缓存不得下降。不合并不发布，商业版不操作。
+仅把原先每slot重复的Set/RegExp构造移为每次完整prompt构建一次。工具名单、正则语义/顺序/全局lastIndex、undefined与空集合语义、文本与所有功能保留；不删MCP、schema、checkpoint或技能，不改变注册、发现或默认行为。
 
-19项相关测试通过。固定68,576字节/14slot离线基准1500轮：partial baseline p50 2.410642ms→candidate 1.995267ms，省约0.000415秒；legacy/all-tools亦未观察到变慢。全工具、说明、顺序保持，不做摘要删减。
+19项相关测试首轮通过；覆盖全部工具边界、中文/CRLF/嵌套括号、随机子集、重复调用与完整prompt。fixture已改为真实provider=grok，并继续跑最终回归。14slot/68576字节、1500轮离线基准：partial p50 2.410642→1.995267ms（省0.000415秒）、all-tools 0.025780→0.002786ms、legacy 0.002473→0.001497ms；无观测到CPU路径变慢。host长尾噪声很大，不承诺整段TTFT收益。
 
-## 缓存硬门
+## 上游缓存对照
 
-| 数据 | base 67d13462e | candidate | 结论 |
-|---|---|---|---|
-| 真正上游cache_read/input/cache_write | 待合法受控对照 | 待合法受控对照 | **未验收** |
-| cached tokens比例 | N/A | N/A | 无数据不记0%，不宣称非回归 |
+详见OCV5-505-cache-evidence.json。base/Step4/本候选各自源码输出的完整受控body46753字节逐字相同，完整21个已配置平台MCP schema、remote IUI/model hint和目录固定，顺序/内容/cache_control均相同。765正式fresh local_catalog真实DeepSeek调用的未改代码基线与candidate均I256/R12416/W0；R/(I+R+W)=97.97979798%→97.97979798%，未下降。另1次warmup I12672/R0/W0；三笔总扣4分、按共享实验一次计数。
 
-将另保留完整prompt前缀字节/顺序对照作为补充，它不是上游用量证据。普通网页canary运行live而非本分支，不能冒称candidate。拟使用765自己容器的正式local_catalog静态API路径做候选请求的缓存连续性检查，若权限/环境不足则不绕过authority。Box/Grok/Gemini完整候选链尚无同等入口，不外推结论。新增付费请求暂0、扣费0，原测量175积分不是本PR实测。
-
-计划独立审查APPROVED；全diff独立审查、前缀等价、typecheck/lint、托管CI和真实缓存门仍需补齐。PR保持草稿，不能合并/发布或交为验收通过。
-
-远端证据：H/g500-ttft-approved-20261018/step7，H=/var/lib/docker/volumes/oc-v5-data-u3/_data/workspace/ocv5-308。
+受控对照未复现原生CLI隐藏system/默认工具、765真实persona/memory，不能声称候选后端完整网页TTFT/全部引擎已验。代码保持所有功能，性能数据的覆盖边界单列，未覆盖不算通过。计划/代码r1独立审查通过；最终复审/当前head CI待收口。草稿，不合并不发布，商业版不动。证据H/g500-ttft-approved-20261018/step7与paid-evidence。
