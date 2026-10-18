@@ -1,6 +1,7 @@
-import { isFoldableWorkRole } from "../../components/chat/ProcessDisclosure";
+import { assistantCarriesDeliverable, isFoldableWorkRole } from "../../components/chat/ProcessDisclosure";
 import type { ChatMessage } from "./model";
 import { isAutoContinueMsg, isRecoveryControlUserTurn } from "./pure";
+import { errorPresentation } from "./render";
 
 export type ShareRange = "last" | "last3" | "all";
 
@@ -66,11 +67,12 @@ function after(a: Order, b: Order): boolean {
  * 最后一行是错误卡、状态记录、降级合并行或工具/思考等工作行时,这一轮没有可分享的回答 ——
  * 宁可只分享问题,也不把「正在读取 …」这类过程文本当答案。`sending` 时进行中那一轮不收回答。
  */
-export function selectShareMessages(
+function selectConversationMessages(
   messages: readonly ChatMessage[],
   range: ShareRange,
-  sending = false,
-): ChatMessage[] {
+  sending: boolean,
+  includeInterrupted: boolean,
+): ExportMessage[] {
   // 恢复控制行 → 它所恢复的那条消息。
   const parent = new Map<string, string>();
   for (const m of messages) {
@@ -89,14 +91,14 @@ export function selectShareMessages(
   };
 
   // tail = 按 after 排序的最后一行;lastIndex = 数组里最后一行。两者一致才认这条回答。
-  type Turn = { user: ChatMessage | null; tail: { m: ChatMessage; order: Order } | null; lastIndex: ChatMessage | null };
-  const turns: Turn[] = [{ user: null, tail: null, lastIndex: null }];
+  type Turn = { user: ChatMessage | null; tail: { m: ChatMessage; order: Order } | null; lastIndex: ChatMessage | null; lastBody: { m: ChatMessage; order: Order } | null; deliverables: ChatMessage[]; embedded: ExportMessage | null };
+  const turns: Turn[] = [{ user: null, tail: null, lastIndex: null, lastBody: null, deliverables: [], embedded: null }];
   const byKey = new Map<string, Turn>();
   const rows = messages.filter((m) => !hiddenInChat(m));
   const positional: Turn[] = [];
   for (const m of rows) {
     if (m.role === "user" && m.status !== "queued" && (m.text ?? "").trim()) {
-      const turn: Turn = { user: m, tail: null, lastIndex: null };
+      const turn: Turn = { user: m, tail: null, lastIndex: null, lastBody: null, deliverables: [], embedded: null };
       turns.push(turn);
       byKey.set(m.id, turn);
       if (m._clientMessageId) byKey.set(m._clientMessageId, turn);
@@ -110,13 +112,39 @@ export function selectShareMessages(
     const order = orderOf(m, i);
     if (!turn.tail || after(order, turn.tail.order)) turn.tail = { m, order };
     turn.lastIndex = m;
+    if (includeInterrupted && isAnswerBody(m) && assistantCarriesDeliverable(m)) turn.deliverables.push(m);
+    if (includeInterrupted && m.role === "assistant" && (m._errorCode || m._isError || m.error)) {
+      const visible = errorPresentation(m._errorCode, m.text, m._errorDetail, m.usage?.waived === true).bodyText || m._stopCopyText;
+      if (visible?.trim()) turn.embedded = { ...m, text: visible, exportIncomplete: true };
+    }
+    if (isAnswerBody(m)) turn.lastBody = { m, order };
+    else if (isFoldableWorkRole(m)) turn.lastBody = null;
   });
   const live = sending ? turns[turns.length - 1] : null;
-  const body: ChatMessage[] = [];
+  const body: ExportMessage[] = [];
   for (const t of turns) {
     if (t.user) body.push(t.user);
     // 两种顺序说法不一时宁可只分享问题(不确定哪条才是最后一行,就不冒险把过程当答案)。
-    if (t !== live && t.tail && t.tail.m === t.lastIndex && isAnswerBody(t.tail.m)) body.push(t.tail.m);
+    const final = t !== live && t.tail?.m === t.lastIndex && t.tail && isAnswerBody(t.tail.m) ? t.tail.m : null;
+    if (!includeInterrupted) {
+      if (final) body.push(final);
+      continue;
+    }
+    // Generated artifacts remain visible above the process fold even if
+    // later tools run. Preserve those delivered results in Markdown too.
+    const candidates: ExportMessage[] = t.deliverables.map((m) => final ? m : { ...m, exportIncomplete: true });
+    if (final) candidates.push(final);
+    else if (t !== live && t.tail?.m === t.lastIndex && t.tail
+      && (t.tail.m._errorCode || t.tail.m._isError || t.tail.m.error)) {
+      if (t.lastBody && after(t.tail.order, t.lastBody.order)) candidates.push({ ...t.lastBody.m, exportIncomplete: true });
+      if (t.embedded?.id === t.tail.m.id) candidates.push(t.embedded);
+    }
+    const included = new Set<string>();
+    for (const m of candidates) {
+      if (included.has(m.id)) continue;
+      included.add(m.id);
+      body.push(m);
+    }
   }
   if (range === "all") return body;
   const userIdx: number[] = [];
@@ -126,4 +154,17 @@ export function selectShareMessages(
   if (userIdx.length === 0) return body;
   const rounds = range === "last" ? 1 : 3;
   return body.slice(userIdx[Math.max(0, userIdx.length - rounds)]);
+}
+
+
+type ExportMessage = ChatMessage & { exportIncomplete?: boolean };
+
+/** Sharing keeps its existing final-answer-only contract. */
+export function selectShareMessages(messages: readonly ChatMessage[], range: ShareRange, sending = false): ChatMessage[] {
+  return selectConversationMessages(messages, range, sending, false);
+}
+
+/** Markdown also preserves visible partial output immediately before failure. */
+export function selectExportMessages(messages: readonly ChatMessage[], sending = false): ExportMessage[] {
+  return selectConversationMessages(messages, "all", sending, true);
 }

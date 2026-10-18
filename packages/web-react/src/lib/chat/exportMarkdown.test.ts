@@ -56,6 +56,43 @@ describe("exportSessionMarkdown", () => {
     expect(md).not.toContain("尚未完成");
   });
 
+  test("preserves visible output before a terminal failure as incomplete, without error or process data", async () => {
+    const rows = [
+      msg({ id: "u", role: "user", text: "生成报告", _clientMessageId: "u", ts: 1 }),
+      msg({ id: "tool", role: "tool", text: "PRIVATE_TOOL_OUTPUT", _clientMessageId: "u", ts: 2 }),
+      msg({ id: "partial", role: "assistant", text: "已完成第一节：可用结论。", _clientMessageId: "u", ts: 3 }),
+      msg({ id: "error", role: "assistant", text: "PRIVATE_ERROR", _errorCode: "MODEL_CONFIG_CHANGED_RETRY_TURN", _clientMessageId: "u", ts: 4 }),
+    ];
+    const snapshot = JSON.stringify(rows);
+    const md = await exportSessionMarkdown(rows);
+    expect(md).toContain("## 助手（未完成）");
+    expect(md).toContain("已完成第一节：可用结论。");
+    expect(md).not.toContain("PRIVATE_");
+    expect(JSON.stringify(rows)).toBe(snapshot);
+    const { selectShareMessages } = await import("./shareSelection");
+    expect(selectShareMessages(rows, "all")).toEqual([rows[0]]);
+    expect(await exportSessionMarkdown([rows[0]!, rows[2]!, rows[1]!, rows[3]!])).not.toContain("可用结论");
+    expect(await exportSessionMarkdown(rows, true)).not.toContain("可用结论");
+  });
+
+  test("keeps delivered file links across later tools and preserves same-row stopped output", async () => {
+    const user = msg({ id: "u", role: "user", text: "生成文件", ts: 1 });
+    const file = msg({ id: "file", role: "assistant", text: "[下载](/home/agent/.openclaude/generated/sales.csv)", ts: 2 });
+    const tool = msg({ id: "tool", role: "tool", text: "PRIVATE_TOOL", ts: 3 });
+    const error = msg({ id: "error", role: "assistant", text: "", _errorCode: "MODEL_CONFIG_CHANGED_RETRY_TURN", ts: 4 });
+    const failed = await exportSessionMarkdown([user, file, tool, error]);
+    expect(failed).toContain("下载（sales.csv）");
+    expect(failed).toContain("助手（未完成）");
+    expect(failed).not.toContain("PRIVATE_TOOL");
+    const finished = await exportSessionMarkdown([user, file, tool, msg({ id: "final", role: "assistant", text: "验证完成。", ts: 4 })]);
+    expect(finished).toContain("下载（sales.csv）");
+    expect(finished).toContain("验证完成。");
+    const stopped = await exportSessionMarkdown([user, msg({ id: "stopped", role: "assistant", text: "这是停止前已呈现的结果。\n\n[turn failed: user_cancelled]", _errorCode: "user_cancelled", ts: 4 })]);
+    expect(stopped).toContain("这是停止前已呈现的结果。");
+    expect(stopped).toContain("助手（未完成）");
+    expect(stopped).not.toContain("turn failed");
+  });
+
   test("空列表得到空串", async () => {
     expect(await exportSessionMarkdown([])).toBe("");
   });

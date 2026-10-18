@@ -41,6 +41,9 @@ export async function publicArtifactText(markdown: string): Promise<string> {
         replacement = label.includes(relative) ? label : label ? `${label}（${relative}）` : relative;
       } else if (node.type === "link") return; // Preserve ordinary URLs and their labels verbatim.
     } else if (node.type === "inlineCode") {
+      // A direct script invocation is executable code even when its first
+      // token happens to live in generated/. Keep positional arguments intact.
+      if (/^\S+\.(?:sh|bash|py|js|mjs|cjs|ts|rb|pl|ps1|bat|cmd|exe|run)\s+\S/i.test(node.value ?? "")) return;
       const relative = artifactRelative(node.value ?? "");
       if (relative) replacement = `\`${relative}\``;
       else return; // A command is not an artifact reference.
