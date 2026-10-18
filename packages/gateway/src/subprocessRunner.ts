@@ -491,7 +491,7 @@ export class SubprocessRunner extends EventEmitter {
 
     const timing = new PassiveStageTiming({ engine: 'ccb', traceId: this.opts.traceId,
       sessionKey: this.opts.sessionKey, model: this.opts.model, generation: ++this.spawnGeneration },
-      (fields) => runnerLog.info('engine_process_timing', fields))
+      (fields) => runnerLog.info('engine_process_timing', { ...fields }))
     timing.once('prepare_started')
     this.starting = true
     this.closed = false

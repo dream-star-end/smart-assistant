@@ -272,8 +272,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     const summary = new Promise<TurnSummary | null>((resolve) => { resolveSummary = resolve })
     const ctx: TurnContext = {
       timing: new PassiveStageTiming({ engine: 'antigravity', generation: 1, traceId: params.traceId,
-        sessionKey: this.opts.sessionKey, model: this.opts.model },
-        (fields) => log.info('engine_turn_timing', fields)),
+        sessionKey: this.opts.sessionKey, model: this.currentModel },
+        (fields) => log.info('engine_turn_timing', { ...fields })),
       params,
       startedAt: Date.now(),
       proc: null,
