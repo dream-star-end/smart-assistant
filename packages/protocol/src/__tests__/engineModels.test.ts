@@ -602,7 +602,7 @@ describe('Antigravity CLI engine model authority (OCV5-415)', () => {
 describe('Gemini 4 Argon account-verified CLI model authority (OCV5-517)', () => {
   test('all three choices map to the exact CLI id and retain the explicit medium default', () => {
     for (const effort of ['low','medium','high']) {
-      assert.equal(antigravityCliModelId('antigravity-gemini-4-argon',effort),'gemini-4-argon-'+effort)
+      assert.equal(antigravityCliModelId('antigravity-gemini-4-argon',effort),`gemini-4-argon-${effort}`)
     }
     assert.equal(antigravityCliModelId('antigravity-gemini-4-argon',undefined),'gemini-4-argon-medium')
     assert.deepEqual(modelReasoningPolicy('antigravity-gemini-4-argon').supported,['low','medium','high'])
