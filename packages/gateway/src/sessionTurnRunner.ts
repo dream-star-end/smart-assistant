@@ -1,3 +1,4 @@
+import type { UpstreamRetryHint } from '@openclaude/protocol'
 import { consumeUnusedPreheat } from './speculativePreheat.js'
 /**
  * Session turn execution (one turn, retry wrapper)
@@ -158,7 +159,7 @@ function throwIfLogicalTurnCancelled(signal: AbortSignal | undefined): void {
   throw signal.reason instanceof Error ? signal.reason : new Error('logical turn cancelled')
 }
 
-function waitForRetryDelay(ms: number, signal: AbortSignal | undefined): Promise<void> {
+function waitForRetryChunk(ms: number, signal: AbortSignal | undefined): Promise<void> {
   throwIfLogicalTurnCancelled(signal)
   if (!signal) return new Promise((resolve) => setTimeout(resolve, ms))
   return new Promise<void>((resolve, reject) => {
@@ -172,6 +173,16 @@ function waitForRetryDelay(ms: number, signal: AbortSignal | undefined): Promise
     }, ms)
     signal.addEventListener('abort', onAbort, { once: true })
   })
+}
+
+/** Long Retry-After dates must never overflow Node's timer into a 1ms retry. */
+export async function waitForRetryDelay(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  throwIfLogicalTurnCancelled(signal)
+  const deadline = Date.now() + ms
+  do {
+    await waitForRetryChunk(Math.min(60_000, Math.max(0, deadline - Date.now())), signal)
+    throwIfLogicalTurnCancelled(signal)
+  } while (Date.now() < deadline)
 }
 
 /**
@@ -269,6 +280,9 @@ function terminalUsageForPersistence(args: {
  * provider context-overflow diagnostic, so replaying the same user turn with
  * a smaller master-history suffix cannot duplicate observable work. */
 class SafeCcbContextRebuildRetryError extends Error {}
+class Upstream429RetryError extends Error {
+  constructor(message: string, readonly hint: Readonly<UpstreamRetryHint>) { super(message) }
+}
 
 // (auth 错误关键字分类已下沉 engine/ccbAdapter.ts —— 错误字符串是 CCB 底座私有
 //  知识;本层只消费 TurnSummary.errorKind === 'auth'。)
@@ -1346,7 +1360,9 @@ export async function _runOneTurn(
           reject(
             contextOverflowIsSafeToRetry && session.providerTag === 'ccb'
               ? new SafeCcbContextRebuildRetryError(retryError)
-              : new Error(retryError),
+              : result.retryHint
+                ? new Upstream429RetryError(retryError, result.retryHint)
+                : new Error(retryError),
           ),
         )
         return
@@ -2499,7 +2515,7 @@ export async function runOneTurnWithRetry(
           errorClass,
           resolveTransientBreakerThreshold(),
         )
-        if (breaker.open) {
+        if (breaker.open && errorClass !== 'rate_limited') {
           log.warn('transient retry circuit open', {
             sessionKey: session.sessionKey,
             errorClass,
@@ -2512,7 +2528,9 @@ export async function runOneTurnWithRetry(
           })
         }
       }
-      const delay = this._transientRetryDelayMs(retryState.attempt)
+      const delay = Math.max(this._transientRetryDelayMs(retryState.attempt),
+        errorClass === 'rate_limited' && err instanceof Upstream429RetryError
+          ? Math.max(0, err.hint.retryNotBeforeMs - Date.now()) : 0)
       log.warn('transient error, retrying', {
         sessionKey: session.sessionKey,
         attempt: retryState.attempt + 1,

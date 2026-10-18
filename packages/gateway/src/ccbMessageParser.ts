@@ -8,6 +8,8 @@
 import { performance } from 'node:perf_hooks'
 import {
   type CallTokenUsageSnapshot,
+  type UpstreamRetryHint,
+  decodeUpstreamRetryHint,
   type OutboundContentBlock,
   type TurnTokenUsageSnapshot,
   isToolExitCode,
@@ -165,6 +167,8 @@ function normalizeTurnRetry(raw: unknown): TurnRetryMeta | null {
 
 /** Accumulated turn result stats */
 export interface TurnResult {
+  /** Safe metadata from an API-error terminal only; never from message content. */
+  retryHint?: Readonly<UpstreamRetryHint>
   cost: number
   inputTokens: number
   outputTokens: number
@@ -1567,6 +1571,9 @@ export class CcbMessageParser {
           ...(terminalReason !== undefined ? { terminal_reason: terminalReason } : {}),
         })
       : undefined
+    const apiErrorStatus = (msg as { api_error_status?: unknown }).api_error_status
+    const retryHint = isError && errorDetail && (apiErrorStatus === undefined || apiErrorStatus === 429)
+      ? decodeUpstreamRetryHint(errorDetail) : undefined
     const staleResumeId =
       Array.isArray(errorsField) &&
       errorsField.some(
@@ -1588,6 +1595,7 @@ export class CcbMessageParser {
       assistantText: this.assistantBuf,
       thinkingText: this.thinkingBuf,
       isError,
+      ...(retryHint ? { retryHint } : {}),
       ...(errorClass !== undefined ? { errorClass } : {}),
       ...(errorDetail !== undefined ? { errorDetail } : {}),
       stopReason,

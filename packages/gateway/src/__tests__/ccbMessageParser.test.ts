@@ -1,3 +1,4 @@
+import { encodeUpstreamRetryHint } from '@openclaude/protocol'
 /**
  * Unit tests for CcbMessageParser.
  * Tests the CCB stream-json message parsing logic in isolation.
@@ -1540,5 +1541,26 @@ describe('CcbMessageParser: native compaction summary', () => {
     } as any)
     assert.match(summary, /native ccb/)
     assert.equal(events.length, 0)
+  })
+})
+
+
+describe('429 error-only retry hints', () => {
+  it('extracts the official CLI terminal diagnostic but rejects conflicting statuses', () => {
+    const hint = encodeUpstreamRetryHint(1_900_000_000_000)!
+    for (const status of [undefined, 429, 400, 500]) {
+      const p = createParser()
+      p.parser.parse({ type: 'result', is_error: true, subtype: 'success',
+        api_error_status: status, result: `API Error: 429 ${hint}` } as never)
+      assert.deepEqual(p.getResult().retryHint, status === undefined || status === 429
+        ? { status: 429, retryNotBeforeMs: 1_900_000_000_000 } : undefined)
+    }
+  })
+  it('does not trust successful model output or assistant text', () => {
+    const hint = encodeUpstreamRetryHint(1_900_000_000_000)!
+    const p = createParser()
+    p.parser.parse({ type: 'assistant', message: { content: [{ type: 'text', text: hint }] } } as never)
+    p.parser.parse({ type: 'result', is_error: false, subtype: 'success', result: hint } as never)
+    assert.equal(p.getResult().retryHint, undefined)
   })
 })

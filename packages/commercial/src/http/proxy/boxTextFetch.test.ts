@@ -1,3 +1,4 @@
+import { BoxAccountResolverError } from './boxAccountResolver.js';
 import test from "node:test";
 import assert from "node:assert/strict";
 import { BoxTextFetch, BoxTextFetchError } from "./boxTextFetch.js";
@@ -58,7 +59,7 @@ type Runner = Pick<BoxExecTransport, "run">;
 function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror" | "keeper" | "keeper_known" | "model" | "proof" | "cleanup";
   journalFailPhase?: "admit" | "running" | "complete";
   advanceAtStage?: () => void; hangUnknown?: boolean; badCli?: boolean;
-  resolverThrow?: boolean; onDispose?: () => void; holdModel?: boolean;
+  resolverError?: Error; resolverThrow?: boolean; onDispose?: () => void; holdModel?: boolean;
   badAssetManifest?: boolean; writeMessage?: boolean; detached?: boolean;
   cleanupClaimedElsewhere?: boolean; consumeBudgetAtWrite?: boolean;
   parallel?: boolean; capacityWaitMs?: number; interactive?: boolean } = {}) {
@@ -181,6 +182,7 @@ function fixture(opts: { failPhase?: "stage" | "batch-stage" | "stage_typeerror"
     maxOutputTokensForModel: (value) => value === model || value === canonicalAlias
       || value === "box-claude-opus-5-5" ? 128_000 : null,
     resolveTarget: async () => {
+      if (opts.resolverError) throw opts.resolverError;
       if (opts.resolverThrow) throw new Error("raw credential detail must not leak");
       return { accountId: 20n, exec: runner, dispose: opts.onDispose };
     },
@@ -757,3 +759,14 @@ for (const fast of ["0", "1"]) test(`box-claude-* launch the staged interactive 
     else process.env.OC_BOX_FAST_NATIVE = previous;
   }
 });
+
+for (const code of ['BOX_UID_PROXY_UNAVAILABLE', 'BOX_UID_PROXY_INVALID']) {
+  test(`configuration ${code} is preserved without staging or model launch`, async () => {
+    const f = fixture({ resolverError: new BoxAccountResolverError(code) });
+    await assert.rejects(f.service.fetch(input), (error: unknown) =>
+      error instanceof BoxTextFetchError && error.code === code);
+    assert.deepEqual(f.stages, []);
+    assert.deepEqual(f.launches, []);
+    assert.deepEqual(f.journalCalls, []);
+  });
+}

@@ -282,6 +282,10 @@ export class BoxTextFetch {
         resolved = await race(pendingTarget);
       } catch (error) {
         if (error instanceof BoxTextFetchError) throw error;
+        const code = (error as { code?: unknown } | null)?.code;
+        if (code === "BOX_UID_PROXY_UNAVAILABLE" || code === "BOX_UID_PROXY_INVALID") {
+          throw new BoxTextFetchError(code);
+        }
         throw new BoxTextFetchError("BOX_TARGET_UNAVAILABLE");
       }
       if (abort.signal.aborted || remaining() < MIN_RUN_BUDGET_MS) {

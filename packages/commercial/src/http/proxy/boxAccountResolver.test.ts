@@ -286,3 +286,16 @@ test("only OC_BOX_UNBOUND_EGRESS=host gives up the per-user proxy file", () => {
     assert.equal(boxUnboundProxy(env), readBoxUidProxy, JSON.stringify(env));
   }
 });
+
+for (const code of ['BOX_UID_PROXY_UNAVAILABLE', 'BOX_UID_PROXY_INVALID']) {
+  test(`missing per-user egress ${code} stops before account access`, async () => {
+    const f = fixture();
+    const resolver = new BoxAccountResolver({ ...f.deps, uidProxy: () => {
+      throw new BoxAccountResolverError(code);
+    } });
+    await assert.rejects(resolver.resolve(f.args), (error: unknown) =>
+      error instanceof BoxAccountResolverError && error.code === code);
+    assert.deepEqual(f.calls, []);
+    assert.equal(f.getMade(), 0);
+  });
+}

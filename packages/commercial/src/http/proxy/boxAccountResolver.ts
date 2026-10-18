@@ -142,12 +142,13 @@ class OwnedProxy {
 export function readBoxUidProxy(uid: bigint): string {
   if (uid <= 0n || uid > 1_000_000_000n) throw new BoxAccountResolverError("BOX_UID_INVALID");
   const dir = `/etc/openclaude/cursor-v5-u${uid}`;
-  const parent = lstatSync(dir);
-  if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== 0
-    || (parent.mode & 0o777) !== 0o700) throw new BoxAccountResolverError("BOX_UID_PROXY_INVALID");
   const path = join(dir, ".https-proxy");
   let fd: number | undefined;
   try {
+    const parent = lstatSync(dir);
+    if (!parent.isDirectory() || parent.isSymbolicLink() || parent.uid !== 0
+      || (parent.mode & 0o777) !== 0o700) throw new BoxAccountResolverError("BOX_UID_PROXY_INVALID");
+
     fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const st = fstatSync(fd);
     if (!st.isFile() || st.uid !== 0 || (st.mode & 0o777) !== 0o600

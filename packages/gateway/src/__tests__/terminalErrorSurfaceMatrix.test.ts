@@ -79,9 +79,9 @@ const SCENARIOS: readonly Scenario[] = [
   {
     code: 'rate_limited',
     sample: '429 Too Many Requests',
-    attempts: 3,
-    persistEngineClass: false,
-    why: '账号限流可自动续跑,但同类连续 3 次后熔断,避免 5xx/限流风暴空烧',
+    attempts: 11,
+    persistEngineClass: true,
+    why: '429 透明自动续跑,遵守共享预算：首次加最多10次重试；5xx仍保留三次熔断',
   },
   {
     code: 'model_capacity',

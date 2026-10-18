@@ -322,6 +322,7 @@ function buildTurnSummary(
     ...(result.terminalReason !== undefined ? { terminalReason: result.terminalReason } : {}),
     numTurns: result.numTurns,
     isError: result.isError,
+    ...(result.retryHint ? { retryHint: result.retryHint } : {}),
     ...(nativeCompactionSummary ? { nativeCompactionSummary } : {}),
     ...(nativeIdleReceipt ? { nativeIdleReceipt } : {}),
     ...(errorKind ? { errorKind } : {}),

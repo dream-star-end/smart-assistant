@@ -1,3 +1,5 @@
+import { encodeUpstreamRetryHint } from '@openclaude/protocol';
+import { waitForRetryDelay } from '../sessionTurnRunner.js';
 /**
  * SessionManager × EngineAdapter turn 编排回归测试(M0)。
  *
@@ -1460,8 +1462,8 @@ describe("crash/interrupt partial persistence", () => {
       setImmediate(() => r.result({
         is_error: true,
         subtype: "error_during_execution",
-        result: "Selected model is at capacity. Please try a different model.",
-        errorClass: "model_capacity",
+        result: `API Error: 429 ${encodeUpstreamRetryHint(Date.now() + 2 ** 32)}`,
+        api_error_status: 429,
       }));
     });
     const session = makeSession(runner);
@@ -5050,4 +5052,64 @@ describe("preheatRunner", () => {
       else process.env.OC_ENGINE_PREHEAT_DEADLINE_MS = prev;
     }
   });
+});
+
+
+for (const succeedsAfter of [4, Number.POSITIVE_INFINITY]) {
+  test(`429 uses shared retry budget beyond three failures: ${succeedsAfter}`, async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _transientRetryDelayMs: () => number })._transientRetryDelayMs = () => 0;
+      let submits = 0;
+      const runner = new FakeCcbRunner(r => {
+        submits++;
+        setImmediate(() => {
+          if (submits <= succeedsAfter) r.result({ is_error: true, api_error_status: 429,
+            result: `API Error: 429 ${encodeUpstreamRetryHint(Date.now())}` });
+          else { r.text('ok'); r.result(); }
+        });
+      });
+      const session = makeSession(runner, { channel: 'webchat', userId: 'user-1' });
+      const events: SessionStreamEvent[] = [];
+      await sm.submit(session, 'finish', e => events.push(e));
+      const retries = events.filter(e => e.kind === 'turn_status' && typeof e.status === 'object' && e.status?.status === 'retrying');
+      assert.equal(submits, succeedsAfter === Number.POSITIVE_INFINITY ? 11 : 5);
+      assert.equal(retries.length, submits - 1);
+      assert.deepEqual(runner.submittedInputs, ['finish', ...Array(submits - 1).fill(TRANSIENT_RETRY_INPUT)]);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, succeedsAfter === Number.POSITIVE_INFINITY ? 'failed' : 'completed');
+      if (succeedsAfter === Number.POSITIVE_INFINITY) assert.equal(captured.payloads[0]!.errorCode, 'rate_limited');
+    } finally { setV3MasterSinkSingleton(null); }
+  });
+}
+test('429 cannot retry before upstream deadline, even when exponential delay is shorter', async () => {
+  const sm = new SessionManager(makeConfigStub());
+  (sm as unknown as { _transientRetryDelayMs: () => number })._transientRetryDelayMs = () => 5;
+  const submittedAt: number[] = [];
+  let deadline = 0;
+  const runner = new FakeCcbRunner(r => {
+    submittedAt.push(Date.now());
+    setImmediate(() => {
+      if (submittedAt.length === 1) {
+        deadline = Date.now() + 80;
+        r.result({ is_error: true, api_error_status: 429,
+          result: `API Error: 429 ${encodeUpstreamRetryHint(deadline)}` });
+      } else { r.text('ok'); r.result(); }
+    });
+  });
+  await sm.submit(makeSession(runner), 'finish', () => {});
+  assert.equal(submittedAt.length, 2);
+  assert.ok(submittedAt[1]! >= deadline);
+});
+test('very long Retry-After does not overflow the timer and is promptly cancellable', async () => {
+  const ac = new AbortController();
+  let resolved = false;
+  const waiting = waitForRetryDelay(2 ** 31 + 100, ac.signal).then(() => { resolved = true; });
+  const rejected = assert.rejects(waiting, /abort/i);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(resolved, false);
+  ac.abort();
+  await rejected;
 });

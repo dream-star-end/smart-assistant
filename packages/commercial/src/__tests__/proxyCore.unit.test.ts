@@ -1,3 +1,5 @@
+import { decodeUpstreamRetryHint } from '@openclaude/protocol';
+import { BoxTextFetchError } from '../http/proxy/boxTextFetch.js';
 /**
  * V3 Phase 4 — `http/proxy/core.ts` 单元测试。
  *
@@ -530,7 +532,7 @@ describe("runUpstreamRoundTrip — upstream non-2xx 分支", () => {
     assert.equal(res.responseHeaders["retry-after"], "42", "Retry-After 从上游透传");
   });
 
-  test("上游 429 无 Retry-After → 429 + 默认 60s Retry-After", async () => {
+  test("上游 429 无 Retry-After → 网关指数退避、不虚构60秒等待", async () => {
     const { ctx, res } = buildCtx({
       fetchImpl: async () =>
         new Response('{"type":"error","error":{"type":"rate_limit_error"}}', { status: 429 }),
@@ -538,7 +540,8 @@ describe("runUpstreamRoundTrip — upstream non-2xx 分支", () => {
     await runUpstreamRoundTrip(ctx);
 
     assert.equal(res.statusCode, 429);
-    assert.equal(res.responseHeaders["retry-after"], "60", "缺上游头时给 60s 保守默认");
+    assert.equal(res.responseHeaders["retry-after"], undefined);
+    assert.equal(decodeUpstreamRetryHint(res.bodyText()), undefined);
   });
 
   test("Moonshot billing-cycle 403 → durable block + non-retryable 400,且不扣费", async () => {
@@ -1124,3 +1127,29 @@ describe("runUpstreamRoundTrip — static route fallback (OCV5-482)", () => {
     assert.equal(finalize.failClientCalls.length, 1);
   });
 });
+
+
+test('429 HTTP-date keeps exact header and carries absolute error-only deadline', async () => {
+  const deadline = new Date(Date.now() + 120_000).toUTCString();
+  const { ctx, res } = buildCtx({ fetchImpl: async () => new Response('rate limited', {
+    status: 429, headers: { 'Retry-After': deadline },
+  }) });
+  await runUpstreamRoundTrip(ctx);
+  assert.equal(res.responseHeaders['retry-after'], deadline);
+  const response = JSON.parse(res.bodyText()) as { error: { message: string } };
+  assert.deepEqual(decodeUpstreamRetryHint(response.error.message), {
+    status: 429, retryNotBeforeMs: Date.parse(deadline),
+  });
+});
+for (const code of ['BOX_UID_PROXY_UNAVAILABLE', 'BOX_UID_PROXY_INVALID']) {
+  test(`Box configuration ${code} fails explicitly without health penalty or charge`, async () => {
+    const { ctx, res, finalize, session } = buildCtx({ fetchImpl: async () => { throw new BoxTextFetchError(code); } });
+    await runUpstreamRoundTrip(ctx);
+    assert.equal(res.statusCode, 409);
+    assert.equal(JSON.parse(res.bodyText()).error.code, 'BOX_EGRESS_NOT_CONFIGURED');
+    assert.equal(finalize.failClientCalls.length, 1);
+    assert.equal(finalize.failCalls.length, 0);
+    assert.equal(finalize.commitCalls.length, 0);
+    assert.equal(session.zeroizeCount, 1);
+  });
+}
