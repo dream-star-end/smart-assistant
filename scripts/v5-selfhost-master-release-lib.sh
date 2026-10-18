@@ -1415,3 +1415,39 @@ cleanup_cutover_unit_snap() {
       ;;
   esac
 }
+
+# OCV5-513: wait after the build, before arming recovery or changing live units.
+# This is an idle snapshot, not an admission fence; new arrivals can still race.
+cutover_wait_for_user_idle() {
+  local counts started=$SECONDS deadline=$((SECONDS + 600))
+  if [[ "$DRY" == 1 ]]; then
+    cutover_clog "  [dry-run] 切换前等待全部用户回合结束(只读,最多 600s;不查询数据库)"
+    return 0
+  fi
+  while :; do
+    if ! counts="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
+BEGIN READ ONLY;
+SET LOCAL statement_timeout = '5s';
+SELECT
+  (SELECT count(*) FROM turn_dispatches WHERE status IN ('admitted','accepted','rejecting')),
+  (SELECT count(*) FROM request_finalize_journal j
+   WHERE j.state NOT IN ('aborted','committed') AND NOT EXISTS (
+     SELECT 1 FROM turn_dispatches d WHERE d.dispatch_id=j.dispatch_id
+       AND d.status='terminal' AND d.terminal_at IS NOT NULL));
+COMMIT;")"; then
+      cutover_clog "  ✗ 无法只读确认用户空闲;拒绝切换,旧 master 继续运行"
+      return 1
+    fi
+    if [[ ! "$counts" =~ ^[0-9]+\|[0-9]+$ ]]; then
+      cutover_clog "  ✗ 空闲查询结果无效;拒绝切换,旧 master 继续运行"
+      return 1
+    fi
+    cutover_clog "  idle snapshot UTC=$(date -u +%FT%TZ) open_dispatches=${counts%|*} unclassified_journals=${counts#*|} elapsed=$((SECONDS - started))s"
+    [[ "$counts" == '0|0' ]] && return 0
+    if (( SECONDS >= deadline )); then
+      cutover_clog "  ✗ 等待空闲 600s 超时;拒绝切换,旧 master 继续运行"
+      return 1
+    fi
+    sleep 5
+  done
+}
