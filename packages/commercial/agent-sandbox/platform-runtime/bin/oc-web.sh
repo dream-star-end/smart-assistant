@@ -19,6 +19,7 @@ if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "help" ]; then
 Usage: oc-web <command> [options]
 
 Commands:
+  search <query>       Search the web with source URLs (quote the query)
   extract <url>        Fetch a public URL and extract clean Markdown
   parse <file>         Parse a local uploaded/generated file into Markdown
   health               Check parser dependency availability

@@ -16,6 +16,7 @@
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { extractUrl, healthCheck, parseFile } from './mcpWebContextServer.js'
+import { searchWeb } from './webSearchClient.js'
 
 export type OcWebCliResult = {
   exitCode: number
@@ -33,6 +34,7 @@ const USAGE = [
   'Usage: oc-web <command> [options]',
   '',
   'Commands:',
+  '  search <query>       Search the web with source URLs (quote the query)',
   '  extract <url>        Fetch a public URL and extract clean Markdown',
   '  parse <file>         Parse a local uploaded/generated file into Markdown',
   '  health               Check parser dependency availability',
@@ -119,7 +121,7 @@ function usageError(message: string): OcWebCliResult {
   return { exitCode: 2, stdout: '', stderr: `oc-web: ${message}\n` }
 }
 
-export async function runOcWebCli(argv: string[]): Promise<OcWebCliResult> {
+export async function runOcWebCli(argv: string[], env: NodeJS.ProcessEnv = process.env): Promise<OcWebCliResult> {
   const [command, ...rest] = argv
   if (!command) return { exitCode: 2, stdout: '', stderr: `${USAGE}\n` }
   if (command === 'help' || command === '--help' || command === '-h') {
@@ -131,6 +133,17 @@ export async function runOcWebCli(argv: string[]): Promise<OcWebCliResult> {
   const asJson = flags.json === true
 
   try {
+    if (command === 'search') {
+      if (positional.length !== 1 || !positional[0].trim() || positional[0].trim().length > 1000) return usageError('search requires one quoted <query> of 1–1000 characters')
+      const timeout = flags['timeout-ms'] === undefined ? 30_000 : numFlag(flags['timeout-ms'])
+      if (timeout === undefined || !Number.isInteger(timeout) || timeout < 1 || timeout > 120_000) return usageError('--timeout-ms must be an integer from 1 to 120000')
+      const maxChars = flags['max-chars'] === undefined ? 16_000 : numFlag(flags['max-chars'])
+      if (maxChars === undefined || !Number.isInteger(maxChars) || maxChars < 1) return usageError('--max-chars must be a positive integer')
+      const result = await searchWeb(positional[0].trim(), timeout, env)
+      if (!result.ok) return formatResult(result, asJson)
+      const markdown = result.results.map((hit, i) => `${i + 1}. ${hit.title}\n${hit.url}\n${hit.date ? hit.date + '\n' : ''}${hit.snippet}`).join('\n\n').slice(0, maxChars)
+      return formatResult({ ...result, markdown }, asJson)
+    }
     if (command === 'extract') {
       if (positional.length === 0) return usageError('extract requires a <url>')
       if (positional.length > 1) return usageError('extract takes a single <url>')
