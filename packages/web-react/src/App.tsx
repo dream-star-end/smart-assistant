@@ -1,3 +1,4 @@
+import { useWorkspacePreparation } from './hooks/useWorkspacePreparation';
 import { createGoalStarter } from "./lib/goalStart";
 import {
   lazy,
@@ -2169,6 +2170,7 @@ export function App() {
 
   // 对话前置态机：检查订阅/容器、引导开通、轮询容器至就绪。gate.access=false 时由
   // AgentGate 面板占据对话区并禁用 Composer；gate.ready 是 P4 useChatSocket 连接的硬前置。
+  useWorkspacePreparation(auth, inWorkspace && !demo && laneReady, demo ? null : (user?.id ?? null));
   const gate = useAgentGate(auth, inWorkspace && !demo);
 
   // P4 真实 WS 对话引擎。gate.ready（容器 running）是连接硬前置；refreshMe 供

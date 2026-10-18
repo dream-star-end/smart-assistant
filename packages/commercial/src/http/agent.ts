@@ -235,3 +235,16 @@ export async function handleAgentCancel(
     throw err;
   }
 }
+
+/** Explicit POST: status GET remains read-only and legacy subscription open is never used. */
+export async function handleWorkspacePrepare(
+  req: IncomingMessage, res: ServerResponse, _ctx: RequestContext, deps: CommercialHttpDepsWithAgent,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  if (!deps.prepareWorkspaceContainer) {
+    sendJson(res, 202, { accepted: false });
+    return;
+  }
+  const accepted = await deps.prepareWorkspaceContainer(BigInt(user.id));
+  sendJson(res, 202, { accepted });
+}

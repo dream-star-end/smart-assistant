@@ -1220,6 +1220,13 @@ export class CodexAppServerRunner extends EventEmitter {
     // proc, drain queue, but allow subsequent submit() to respawn. effort
     // switching and auth-token refresh paths rely on this.
     this.shuttingDown = true
+    this._preheatGeneration++
+    this._preheatPromise = null
+    this._preheatedSignature = null
+    if (this._unannouncedPreheatThread) {
+      this._unannouncedPreheatThread = false
+      this.clearSessionId()
+    }
     // Hung initialize/preheat shares _spawnPromise with submit(). Drop it and
     // reject pending JSON-RPC before waiting for the process so waiters fail
     // closed instead of inheriting a never-settling handshake.
@@ -1381,6 +1388,15 @@ export class CodexAppServerRunner extends EventEmitter {
    * while initialize is pending returned early and could proceed before the
    * app-server finished the handshake (preheat + submit race). */
   private _spawnPromise: Promise<void> | null = null
+  private _preheatPromise: Promise<void> | null = null
+  private _preheatGeneration = 0
+  private _unannouncedPreheatThread = false
+  private _preheatedSignature: string | null = null
+
+  private preheatSignature(snap: RepoSnapshot | null, cwd: string): string {
+    return JSON.stringify([this.opts.model ?? '', this.effortLevel, this.codexRouteSignature(),
+      snap?.selectionVersion ?? 0, cwd])
+  }
   private recycleInflight: Promise<void> | null = null
 
   /**
@@ -1431,20 +1447,36 @@ export class CodexAppServerRunner extends EventEmitter {
     }
   }
 
-  /** Session-open preheat: spawn + initialize the long-lived app-server so a
-   * cold first turn skips the 5-8s boot. Resolves repo snapshot/cwd through
-   * the SAME path as runTurn. Deliberately no thread/start / thread/resume /
-   * turn/start — zero upstream LLM calls, zero billing. */
+  /** Prepare only process + fresh thread. Never resume/compact/turn/start.
+   * A speculative thread remains volatile until a real turn claims it. */
   async preheat(): Promise<void> {
-    const repoSnap = this._currentRepoSnapshot()
-    const effectiveCwd = this._applyRepoBindingFromSnapshot(repoSnap)
-    await this.ensureSpawned(repoSnap, effectiveCwd)
+    if (this._preheatPromise) return this._preheatPromise
+    if (this.processing || this.queue.length || this._preheatedSignature !== null) return
+    const generation = this._preheatGeneration
+    const work = (async () => {
+      const repoSnap = this._currentRepoSnapshot()
+      const effectiveCwd = this._applyRepoBindingFromSnapshot(repoSnap)
+      const signature = this.preheatSignature(repoSnap, effectiveCwd)
+      await this.ensureSpawned(repoSnap, effectiveCwd)
+      if (generation !== this._preheatGeneration) throw new Error('CODEX_PREHEAT_STALE')
+      if (!this.threadId && !this.attached) {
+        await this._startNewThread(effectiveCwd, generation)
+        if (generation !== this._preheatGeneration) throw new Error('CODEX_PREHEAT_STALE')
+        this.attached = true
+      }
+      this._preheatedSignature = signature
+    })()
+    this._preheatPromise = work
+    try { await work } finally {
+      if (this._preheatPromise === work) this._preheatPromise = null
+    }
   }
 
   private async _ensureSpawnedInternal(
     repoSnap: RepoSnapshot | null,
     effectiveCwd: string,
   ): Promise<void> {
+    let generation = this._preheatGeneration
     if (this.proc && !this.proc.killed && this.initialized) return
     if (this.proc && !this.proc.killed && !this.initialized) {
       // In-flight initialize is fully covered by the shared _spawnPromise, so
@@ -1455,6 +1487,8 @@ export class CodexAppServerRunner extends EventEmitter {
         sessionKey: this.opts.sessionKey,
       })
       await this.shutdown()
+      if (this._preheatGeneration !== generation + 1) throw new Error('CODEX_SPAWN_STALE')
+      generation = this._preheatGeneration
     }
     // Clear any partial-line residue from a prior proc (Codex review
     // #019dde20 BLOCKER round 3): stdoutBuf is runner-scoped, so without
@@ -1589,6 +1623,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // Phase 5:spawn cwd 用 effectiveCwd(ready 时 = repo workspaceDir,其它 = opts.cwd)。
     // 虽然 codex app-server 本质是个 JSON-RPC 服务,proc 自身 cwd 大多数子命令不直接用,
     // 但保持与 thread/start.cwd 一致避免任何"哪边是真值"的混淆。
+    if (generation !== this._preheatGeneration) throw new Error('CODEX_SPAWN_STALE')
     const proc = _spawnFn('codex', args, {
       cwd: effectiveCwd,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -2123,7 +2158,7 @@ export class CodexAppServerRunner extends EventEmitter {
    *  diffed against the old thread's baseline → underbilling or clamp-to-zero.
    *  Resetting all three here is a no-op on the cold-start path (they're
    *  already null on construction) and load-bearing on the self-heal path. */
-  private async _startNewThread(effectiveCwd: string): Promise<void> {
+  private async _startNewThread(effectiveCwd: string, preheatGeneration?: number): Promise<void> {
     // Phase 5:effectiveCwd 由 runTurn 顶部一次取的 snapshot 折算而来,
     // 与 ensureSpawned cwd / launch overrides 的 REPO slot 保持一致。
     const res = (await this.sendRequest('thread/start', {
@@ -2136,6 +2171,9 @@ export class CodexAppServerRunner extends EventEmitter {
     if (typeof tid !== 'string' || !tid) {
       throw new Error('thread/start did not return thread.id')
     }
+    if (preheatGeneration !== undefined && preheatGeneration !== this._preheatGeneration) {
+      throw new Error('CODEX_PREHEAT_STALE')
+    }
     this.threadId = tid
     this.priorTurnTotal = null
     this.activeTurnTotal = null
@@ -2146,7 +2184,8 @@ export class CodexAppServerRunner extends EventEmitter {
     // sessionManager listens for this and writes the new id (+ provider tag)
     // to resume-map.json, so the *next* turn against this sessionKey resumes
     // against the fresh thread instead of looping back into -32600.
-    this.emit('session_id', tid)
+    if (preheatGeneration === undefined) this.emit('session_id', tid)
+    else this._unannouncedPreheatThread = true
   }
 
   /** turn-retry 批 — 每个 attempt 起点集中复位 per-attempt 态。**保留
@@ -2353,6 +2392,8 @@ export class CodexAppServerRunner extends EventEmitter {
   ): Promise<void> {
     const startedAt = Date.now()
     const timingStartedAt = performance.now()
+    // Join speculative preparation; a failed warmup falls back to normal preparation.
+    if (this._preheatPromise) await this._preheatPromise.catch(() => {})
     const seenDeltas = new Set<string>()
     const observeFirstDelta = (message: any): void => {
       const delta = message?.event?.delta
@@ -2374,7 +2415,7 @@ export class CodexAppServerRunner extends EventEmitter {
     // thread/resume / launch overrides 四个消费点。任何中途读 snapshot 的写法
     // 都会出现撕裂窗口(spawn cwd 用了 ready,attach cwd 拿到 cloning 之类)。
     const repoSnap = this._currentRepoSnapshot()
-    const effectiveCwd = this._applyRepoBindingFromSnapshot(repoSnap)
+    let effectiveCwd = this._applyRepoBindingFromSnapshot(repoSnap)
     log.info('codex app-server turn start', {
       traceId: this.opts.traceId,
       sessionKey: this.opts.sessionKey,
@@ -2400,8 +2441,10 @@ export class CodexAppServerRunner extends EventEmitter {
       if (
         this.proc &&
         !this.proc.killed &&
-        this.spawnedProviderSignature !== null &&
-        this.spawnedProviderSignature !== this.codexRouteSignature()
+        ((this.spawnedProviderSignature !== null &&
+          this.spawnedProviderSignature !== this.codexRouteSignature()) ||
+          (this._preheatedSignature !== null &&
+            this._preheatedSignature !== this.preheatSignature(repoSnap, effectiveCwd)))
       ) {
         // Route changes require a fresh Codex app-server process because
         // provider/base_url are launch-time CLI args. Do not let this restart
@@ -2411,6 +2454,7 @@ export class CodexAppServerRunner extends EventEmitter {
         this.queue = []
         try {
           await this.shutdown()
+          effectiveCwd = this._applyRepoBindingFromSnapshot(repoSnap)
         } finally {
           if (queuedTurns.length > 0) {
             this.queue = queuedTurns.concat(this.queue)
@@ -2521,6 +2565,11 @@ export class CodexAppServerRunner extends EventEmitter {
         this.attached = true
       }
 
+      if (this._unannouncedPreheatThread && this.threadId) {
+        this._unannouncedPreheatThread = false
+        this.emit('session_id', this.threadId)
+      }
+      this._preheatedSignature = null
       log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
         stage: 'thread_ready', durationMs: performance.now() - threadStartedAt, elapsedMs: performance.now() - timingStartedAt })
       await this.syncPlatformGoal()

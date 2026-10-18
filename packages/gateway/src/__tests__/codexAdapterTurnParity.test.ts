@@ -1439,36 +1439,120 @@ describe("CodexAdapter — turn/start 窄路径自动重试(end-to-end)", () => 
   });
 });
 
-// ── 会话打开预热(preheat,INC-20260824)────────────────────────────────────
+// ── Speculative session-open preparation (OCV5-496) ─────────────────────
+async function closePreheatHarness(h: Harness): Promise<void> {
+  const proc = h.proc();
+  const closing = h.adapter.shutdown();
+  setImmediate(() => { proc.emit('exit', 0, null); proc.emit('close', 0, null); });
+  await closing;
+}
 
-describe("CodexAdapter.preheat — spawn+initialize、零 thread/turn RPC", () => {
-  test("preheat 只 spawn + initialize;后续首 turn 复用同一进程再 thread/start", async () => {
+describe("CodexAdapter.preheat — fresh volatile thread, zero inference RPC", () => {
+  test("fresh thread is prepared once, unannounced until real turn, then reused", async () => {
     const h = makeHarness();
-    await h.adapter.preheat();
-
-    assert.equal(h.spawnCalls.length, 1, "preheat 必须 spawn 恰好一个 app-server");
-    assert.ok(
-      h.proc().written.some((r) => r.method === "initialize"),
-      "preheat 必须完成 initialize 握手",
-    );
-    for (const forbidden of ["thread/start", "thread/resume", "turn/start"]) {
-      assert.equal(
-        h.proc().written.some((r) => r.method === forbidden),
-        false,
-        `preheat 不得发 ${forbidden}(零上游 LLM 调用/零计费边界)`,
-      );
-    }
-
-    // 并发 preheat 共享同一 in-flight,不再 spawn 第二个进程。
     await Promise.all([h.adapter.preheat(), h.adapter.preheat()]);
     assert.equal(h.spawnCalls.length, 1);
-
-    // 预热后的首 turn:复用同一进程,走正常 thread/start → turn/start。
+    assert.equal(h.proc().written.filter(r => r.method === "thread/start").length, 1);
+    assert.deepEqual(h.sessionIds, []);
+    for (const forbidden of ["thread/resume", "turn/start", "thread/compact/start"]) {
+      assert.equal(h.proc().written.some(r => r.method === forbidden), false);
+    }
+    assert.deepEqual(h.billing, []);
+    await h.adapter.preheat();
     const turn = beginTurn(h, { requestId: "req-preheat" });
     await waitForRequest(h, "turn/start");
-    assert.equal(h.spawnCalls.length, 1, "首 turn 不得重复 spawn");
+    assert.equal(h.spawnCalls.length, 1);
+    assert.equal(h.proc().written.filter(r => r.method === "thread/start").length, 1);
+    assert.deepEqual(h.sessionIds, ["thr-new-1"]);
     h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
     await turn.summary;
-    await h.adapter.shutdown();
+    await closePreheatHarness(h);
+  });
+  test("historical thread is not resumed or rewritten by speculative preparation", async () => {
+    const h = makeHarness({ resumeSessionId: "historical-thread" });
+    await h.adapter.preheat();
+    assert.equal(h.proc().written.some(r => r.method === "thread/start" || r.method === "thread/resume"), false);
+    assert.deepEqual(h.sessionIds, []);
+    await closePreheatHarness(h);
+  });
+  test("unused shutdown discards volatile thread instead of resuming it later", async () => {
+    const h = makeHarness();
+    await h.adapter.preheat();
+    await closePreheatHarness(h);
+    assert.deepEqual(h.sessionIds, []);
+    const turn = beginTurn(h);
+    await waitForRequest(h, "turn/start");
+    assert.equal(h.spawnCalls.length, 2);
+    assert.equal(h.proc().written.some(r => r.method === "thread/resume"), false);
+    h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+    await closePreheatHarness(h);
+  });
+  test("submit joins an in-flight fresh thread instead of creating a second one", async () => {
+    const h = makeHarness({}, (p, req) => {
+      if (req.method === "initialize") p.respondTo(req.id, {});
+      else if (req.method === "turn/start") p.respondTo(req.id, { turn: { id: "turn-1" } });
+    });
+    const warm = h.adapter.preheat();
+    const thread = await waitForRequest(h, "thread/start");
+    const turn = beginTurn(h);
+    await new Promise(r => setImmediate(r));
+    assert.equal(h.proc().written.some(r => r.method === "turn/start"), false);
+    h.proc().respondTo(thread.id, { thread: { id: "warm-thread" } });
+    await warm;
+    await waitForRequest(h, "turn/start");
+    assert.equal(h.proc().written.filter(r => r.method === "thread/start").length, 1);
+    assert.deepEqual(h.sessionIds, ["warm-thread"]);
+    h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+    await closePreheatHarness(h);
+  });
+
+  test("model change discards silent warm thread before starting the real turn", async () => {
+    let threadNo = 0;
+    const h = makeHarness({}, (p, req) => {
+      if (req.method === "initialize") p.respondTo(req.id, {});
+      else if (req.method === "thread/start") p.respondTo(req.id, { thread: { id: `fresh-${++threadNo}` } });
+      else if (req.method === "turn/start") p.respondTo(req.id, { turn: { id: "turn-1" } });
+    });
+    await h.adapter.preheat();
+    const old = h.proc();
+    h.adapter.setModel("gpt-6-luna");
+    const turn = beginTurn(h);
+    await waitFor(() => old.killed);
+    old.emit("exit", 0, null); old.emit("close", 0, null);
+    await waitFor(() => h.spawnCalls.length === 2 && h.proc().written.some(r => r.method === "turn/start"));
+    const fresh = h.proc().written.find(r => r.method === "thread/start")!;
+    assert.equal((fresh.params as Record<string, unknown>).model, "gpt-6-luna");
+    assert.equal(h.proc().written.some(r => r.method === "thread/resume"), false);
+    assert.deepEqual(h.sessionIds, ["fresh-2"]);
+    h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+    await closePreheatHarness(h);
+  });
+  test("shutdown at completed thread boundary fences late warm state and permits new preheat", async () => {
+    const h = makeHarness();
+    const kernel = (h.adapter as unknown as { kernel: any }).kernel;
+    const original = kernel._startNewThread.bind(kernel);
+    let reached = () => {};
+    let release = () => {};
+    const boundary = new Promise<void>(r => { reached = r; });
+    const pause = new Promise<void>(r => { release = r; });
+    kernel._startNewThread = async (...args: unknown[]) => {
+      await original(...args); reached(); await pause;
+    };
+    const warm = h.adapter.preheat();
+    const rejected = assert.rejects(warm, /CODEX_PREHEAT_STALE/);
+    await boundary;
+    await closePreheatHarness(h);
+    release();
+    await rejected;
+    assert.equal(kernel.attached, false);
+    assert.equal(kernel._preheatedSignature, null);
+    assert.deepEqual(h.sessionIds, []);
+    kernel._startNewThread = original;
+    await h.adapter.preheat();
+    assert.equal(h.spawnCalls.length, 2);
+    await closePreheatHarness(h);
   });
 });

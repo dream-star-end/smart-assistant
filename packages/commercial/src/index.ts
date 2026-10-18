@@ -1,3 +1,6 @@
+import { makeWorkspacePreparation } from './agent-sandbox/workspacePreparation.js';
+import { isInMaintenance } from './middleware/maintenanceMode.js';
+import { HttpError } from './http/util.js';
 import { setContentReviewAlerter } from '@openclaude/gateway'
 import { alertContentReview } from './admin/contentReviewAlert.js'
 /**
@@ -4128,6 +4131,25 @@ export async function registerCommercial(
   const ensureContainerReady: ((uid: bigint) => Promise<void>) | undefined =
     ensureContainerEndpointReady;
 
+  const prepareWorkspaceContainer = ensureContainerEndpointReady
+    ? makeWorkspacePreparation({
+        authorize: async uid => {
+          const row = (await getPool().query<{ status: string; role: string }>(
+            'SELECT status, role FROM users WHERE id = $1', [uid.toString()],
+          )).rows[0];
+          if (!row || row.status !== 'active') throw new HttpError(403, 'FORBIDDEN', 'account is not active');
+          if (row.role !== 'admin' && await isInMaintenance()) {
+            throw new HttpError(503, 'MAINTENANCE', 'service is in maintenance');
+          }
+          const catalog = peekModelCatalogCache();
+          const snapshot = catalog ? await catalog.assertFresh() : null;
+          await loadUserModelAuthz(uid, snapshot?.securityEpoch);
+        },
+        ensureReady: ensureContainerEndpointReady,
+        warn: fields => rootLogger.warn('workspace_prepare', fields),
+      })
+    : undefined;
+
   // 邮箱验证成功 → fire-and-forget 触发 v3 容器 pre-warm(p50=215s"验证 → 首消息"间隔
   // 覆盖 docker run 冷启,首条消息命中 running)。
   // 失败自动再试 1 次(间隔 5s,见 makePrewarmContainer);两次都失败才记 friction。
@@ -4383,6 +4405,7 @@ export async function registerCommercial(
     // HIGH#6:admin/containers v3 行的 stop/remove/restart 走这条 dispatch
     v3Supervisor: v3Deps,
     prewarmContainer,
+    prepareWorkspaceContainer,
     // v1.0.191 — /api/media-signed 冷启动护栏。装配端做了 per-uid singleflight 合并,
     // 见上方 ensureContainerReady 构造闭包注释。
     ensureContainerReady,

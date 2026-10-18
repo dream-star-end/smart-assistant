@@ -918,6 +918,9 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
     }
   })
   this.log.info('server started', { bind: listenOpts.host, port: listenOpts.port })
+  if (process.env.OPENCLAUDE_TRUST_BRIDGE_IP) {
+    this.log.info('container_boot_timing', { stage: 'gateway_listening', processUptimeMs: process.uptime() * 1000 })
+  }
 
   // Auto-resume: proactively continue interrupted webchat sessions after gateway restart
   this.bootAutoResume().catch((err) => this.log.error('auto-resume boot failed', undefined, err))

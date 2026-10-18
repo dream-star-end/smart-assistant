@@ -1,3 +1,4 @@
+import { reserveUnusedPreheat, armUnusedPreheat, consumeUnusedPreheat, clearUnusedPreheats } from './speculativePreheat.js'
 /**
  * Session runner lifecycle: preheat, repo-change recycle, eviction loop, shutdown/destroy, idle drain, execution target and model switch
  *
@@ -105,7 +106,10 @@ export async function preheatRunner(
   const existing = this._preheatInFlight.get(session.sessionKey)
   if (existing) return existing
   if (this._preheatActive >= 1) return 'skipped_cap'
+  const reservation = reserveUnusedPreheat(this, session)
+  if (reservation !== 'reserved') return reservation
   this._preheatActive += 1
+  let preserveUnused = false
   const startedAt = Date.now()
   // `run` never rejects: concurrent callers share this promise via the map,
   // and a rejected shared promise would escape the first caller's handling.
@@ -141,6 +145,7 @@ export async function preheatRunner(
         try {
           await session.runner.shutdown()
         } catch (shutdownErr) {
+          preserveUnused = true
           log.warn(
             'engine_preheat shutdown after deadline failed',
             {
@@ -152,6 +157,7 @@ export async function preheatRunner(
         return 'failed'
       }
       session.lastUsedAt = Date.now()
+      armUnusedPreheat(this, session)
       log.info('engine_preheat', {
         sessionKey: session.sessionKey,
         engine: runner.engineId,
@@ -167,6 +173,9 @@ export async function preheatRunner(
         spawn_ms: Date.now() - startedAt,
         err: String(err),
       })
+      if ((session._activeTurnCount ?? 0) === 0) {
+        await session.runner.shutdown().catch(() => { preserveUnused = true })
+      } else preserveUnused = true
       return 'failed'
     } finally {
       release()
@@ -174,7 +183,12 @@ export async function preheatRunner(
   })()
   this._preheatInFlight.set(session.sessionKey, run)
   try {
-    return await run
+    const result = await run
+    if (result !== 'started') {
+      if (preserveUnused) armUnusedPreheat(this, session)
+      else consumeUnusedPreheat(this, session)
+    }
+    return result
   } finally {
     this._preheatActive -= 1
     if (this._preheatInFlight.get(session.sessionKey) === run) {
@@ -388,6 +402,7 @@ export function startEvictionLoop(this: SessionLifecycleHost, intervalMs = 60_00
 }
 
 export async function shutdownAll(this: SessionLifecycleHost): Promise<void> {
+  clearUnusedPreheats(this)
   // Persist resume map BEFORE killing subprocesses — ensures state survives restart
   // (runner.shutdown() sets shuttingDown=true so the exit handler won't call _saveResumeMap)
   this._saveResumeMap()
