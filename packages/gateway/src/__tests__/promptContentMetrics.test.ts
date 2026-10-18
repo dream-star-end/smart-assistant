@@ -16,7 +16,7 @@ test('exact UTF8 content derivatives, immutable values and single-flight hits', 
   assert.equal(await value.sha256, createHash('sha256').update(text).digest('hex'))
   assert.equal(value.tokensEstimate, estimateModelHistoryTokens(text))
   assert.ok(Object.isFrozen(value))
-  assert.notEqual(await cache.get(text + '.').sha256, await value.sha256)
+  assert.notEqual(await cache.get(`${text}.`).sha256, await value.sha256)
   assert.equal(await cache.get(text), value)
 })
 

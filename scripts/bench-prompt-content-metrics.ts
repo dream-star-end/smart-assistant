@@ -4,7 +4,7 @@ import { estimateModelHistoryTokens } from '@openclaude/protocol'
 import { PromptContentMetricsCache } from '../packages/gateway/src/promptContentMetrics.js'
 
 const fixture = Array.from({ length: 16 }, (_, i) => ({
-  text: `${i}:` + '工具 instructions 中文 🐈\n'.repeat(50 + i * 5),
+  text: `${i}:${'工具 instructions 中文 🐈\n'.repeat(50 + i * 5)}`,
   estimate: i < 14, // static-first AGENTS_DYNAMIC/MEMORY_INDEX were never token-estimated.
 }))
 async function sha(content: string) {
@@ -31,9 +31,10 @@ const results = []
 for (const mode of ['warm', 'cold', 'churn', 'oversized']) {
   const cache = new PromptContentMetricsCache(128, mode === 'oversized' ? 1 : 2 * 1024 * 1024)
   assert.deepEqual(await candidate(fixture, cache), await baseline(fixture))
-  const base: number[] = [], head: number[] = []
+  const base: number[] = []
+  const head: number[] = []
   for (let i = 0; i < 120; i++) {
-    const slots = mode === 'churn' ? fixture.map(s => ({ ...s, text: s.text + i })) : fixture
+    const slots = mode === 'churn' ? fixture.map(s => ({ ...s, text: `${s.text}${i}` })) : fixture
     const currentCache = mode === 'cold' ? new PromptContentMetricsCache() : cache
     const run = async (kind: 'base' | 'head') => {
       const start = performance.now()
