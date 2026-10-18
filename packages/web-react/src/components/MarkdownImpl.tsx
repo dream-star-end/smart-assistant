@@ -24,6 +24,7 @@ import {
   type ReactNode,
 } from "react";
 import { isContainerPreviewUrl } from "@openclaude/protocol/containerPreview";
+import { artifactDownloadPath } from "../lib/chat/artifactDownloadPath";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { cn } from "../lib/utils";
 import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, ZoomableImage } from "./chat/media";
@@ -439,6 +440,10 @@ export default function MarkdownImpl({
           },
           a: ({ children, href, node: _node, ...props }) => {
             const containerLocal = typeof href === "string" && isContainerPreviewUrl(href);
+            const artifactPath = signMedia && !readOnly ? artifactDownloadPath(href) : null;
+            if (artifactPath && !hasMarkdownImage(children)) {
+              return <SignedFileCard src={artifactPath} filename={artifactPath.split("/").pop()} label={children} />;
+            }
             // 只读站内信中的链接图片把灯箱与原链接拆成两个同级动作，避免格式包装下仍出现
             // <a><button /></a> 非法嵌套和一次点击双重导航，同时不丢原链接功能。
             if (readOnly && hasMarkdownImage(children)) {

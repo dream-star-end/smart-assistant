@@ -634,7 +634,7 @@ export function useSignedDownload(src: string | null, name: string) {
 
 /** markdown 行内/正文里的容器文件路径 → 可下载文件卡(doc-card)。非媒体文件(txt/docx/pdf/zip…)。
  * 经 /api/media-sign 把容器路径换成同源签名 URL；小文件原生 <a download>，大文件 fetch 流式带进度。 */
-export function SignedFileCard({ src, filename }: { src?: string; filename?: string }) {
+export function SignedFileCard({ src, filename, label }: { src?: string; filename?: string; label?: React.ReactNode }) {
   // resolved 只做占位门(容器冷启签不出→不可点)与锚点 href 装饰;真正的下载 URL 由
   // useSignedDownload 在**点击时**解析(挂载时 URL 5min 即过期,冻结它=410 死循环)。
   const { url: resolved } = useSignedSrc(typeof src === "string" ? src : null);
@@ -646,7 +646,7 @@ export function SignedFileCard({ src, filename }: { src?: string; filename?: str
       <FileText size={16} />
     </span>
   );
-  const nameLabel = <span className="min-w-0 flex-1 truncate text-body text-fg">{name}</span>;
+  const nameLabel = <span className="min-w-0 flex-1 truncate text-body text-fg">{label ?? name}</span>;
 
   // 未签名(容器冷启)：占位，不可点。
   if (!resolved) {

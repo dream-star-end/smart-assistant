@@ -1,6 +1,6 @@
 import '@testing-library/jest-dom/vitest'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import MarkdownImpl from './MarkdownImpl'
 import { cachedCodeLanguage } from '../lib/codeLanguageDetect'
 
@@ -414,3 +414,21 @@ describe('MarkdownImpl 代码高亮(OCV5-421)', () => {
     expect(container.querySelector('[node]')).toBeNull()
   })
 })
+
+
+test('OCV5-508 artifact anchors reuse signing and retain their label', async () => {
+  const { MediaSignProvider } = await import('./chat/media');
+  const sign = vi.fn(async (paths: string[]) => Object.fromEntries(paths.map((path) => [path, '/api/media?signature=fixture'])));
+  const { container } = render(
+    <MediaSignProvider sign={sign} authKey="fixture">
+      <MarkdownImpl signMedia>{'[下载季度报表](/home/agent/.openclaude/generated/%E6%8A%A5%E8%A1%A8%202026.csv)'}</MarkdownImpl>
+      <MarkdownImpl signMedia readOnly>{'[只读文件](/home/agent/.openclaude/generated/private.csv)'}</MarkdownImpl>
+      <MarkdownImpl signMedia>{'[普通站内链接](/help/report.csv)'}</MarkdownImpl>
+    </MediaSignProvider>,
+  );
+  await waitFor(() => expect(screen.getByRole('link', { name: '下载季度报表' })).toHaveAttribute('href', '#'));
+  expect(sign).toHaveBeenCalledExactlyOnceWith(['/home/agent/.openclaude/generated/报表 2026.csv']);
+  expect(screen.getByRole('link', { name: '只读文件' })).toHaveAttribute('href', '/home/agent/.openclaude/generated/private.csv');
+  expect(screen.getByRole('link', { name: '普通站内链接' })).toHaveAttribute('href', '/help/report.csv');
+  expect(container.querySelector('a a')).toBeNull();
+});
