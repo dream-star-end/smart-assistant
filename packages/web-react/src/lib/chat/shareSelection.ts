@@ -127,4 +127,3 @@ export function selectShareMessages(
   const rounds = range === "last" ? 1 : 3;
   return body.slice(userIdx[Math.max(0, userIdx.length - rounds)]);
 }
-
