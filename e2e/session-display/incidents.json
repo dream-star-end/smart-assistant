@@ -7867,6 +7867,26 @@
           "assertion": "OCV5-488 any refusal before Box qualifies; retried, still-resolving and 5xx results do not"
         }
       ]
+    },
+    {
+      "id": "INC-20261018-SHARE-EXPORT-INTERNAL",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "体验官A24：导出Markdown泄露工具调用及过程文本，分享最终答含平台内部资产路径。修复统一最终回答口径并只转换资产引用，保留有用源码和用户原文。",
+      "rootFixCommit": "2133a1217663",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/publicArtifactText.test.ts",
+          "assertion": "OCV5-507 exports readable artifact references without private platform roots"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/share-export.node-test.mjs",
+          "assertion": "OCV5-507 sharing and Markdown downloads contain final answers and portable artifact references"
+        }
+      ],
+      "coverageCommits": []
     }
   ]
 }
