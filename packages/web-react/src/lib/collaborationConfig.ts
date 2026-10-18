@@ -35,6 +35,8 @@ export type CollabUiState = {
   configVersion: string;
   source: "session" | "default";
   advisorModels: AdvisorModelOption[];
+  /** False for an initial/omitted catalog or a successful response reporting catalog-read failure. */
+  advisorCatalogResolved?: boolean;
   advisorUnavailableReason?: string;
   advisorConsultParents: string[];
   advisorConsultParentReason?: string;
@@ -49,6 +51,7 @@ export const EMPTY_COLLAB_UI: CollabUiState = {
   configVersion: "",
   source: "default",
   advisorModels: [],
+  advisorCatalogResolved: false,
   advisorConsultParents: [],
 };
 
@@ -72,6 +75,7 @@ export function docToUiState(doc: CollaborationConfigDoc): CollabUiState {
     configVersion: doc.session.configVersion,
     source: doc.session.source,
     advisorModels: Array.isArray(doc.advisorModels) ? doc.advisorModels : [],
+    advisorCatalogResolved: Array.isArray(doc.advisorModels) && !/^catalog unavailable(?::|$)/i.test(doc.advisorUnavailableReason ?? ""),
     advisorUnavailableReason: doc.advisorUnavailableReason,
     advisorConsultParents: Array.isArray(doc.advisorConsultParents) ? doc.advisorConsultParents : [],
     advisorConsultParentReason: doc.advisorConsultParentReason,
@@ -197,4 +201,10 @@ export function sendCollabFields(input: {
     advisorModel: model,
     collabConfigVersion: version,
   };
+}
+
+
+/** Only a resolved empty catalog proves that the former advisor cannot run. */
+export function continuePrimaryWithoutAdvisor(state: CollabUiState): boolean {
+  return state.mode === "advisor" && state.advisorCatalogResolved === true && state.advisorModels.length === 0;
 }
