@@ -2374,13 +2374,13 @@ async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<
   });
 }
 
-/** INC-20261018-BOX-RECOVERY-REFUSED-STUCK: see scripts/lib/boxRefusedRecoveryProof.ts. */
+// [ocv5-509-refused-recovery-closed] PASS — a recovery paused before it ran ends its turn with a visible card, and an answered or exhausted chain is left alone
 async function proveRefusedRecoveryClosed(api: Api, database: unknown): Promise<string> {
   return withSessionsBackend(api, database, (backend, db) => refusedRecoveryProof({ backend, db,
     close: (pool) => api.closeRefusedRecoveryChains(pool), model: MODEL }));
 }
 
-/** INC-20261018-BOX-CLI-REPAIRED-TOOL-INPUT: see scripts/lib/boxCliRepairProof.ts. */
+// [ocv5-509-cli-repaired-tool-input] PASS — a tool call the CLI records and runs unicode-repaired hands off the model's own input, and any other difference is still refused
 const proveCliRepaired = (api: Api) => proveCliRepairedToolInput({ boxHost: (spool, faults) => boxHost(api, spool, faults),
   spoolOf, cliInit, start, event, stop, BOX_BASH, CLI_MODEL, must, codeOf });
 
