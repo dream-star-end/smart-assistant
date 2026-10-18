@@ -2161,13 +2161,20 @@ export async function closeRefusedRecoveryChains(
       root_client_message_id: string;
       recovery_message_id: string | null;
     }>(
-      `SELECT user_id::text AS user_id, session_id, root_client_message_id,
-              request_json->>'clientMessageId' AS recovery_message_id
-         FROM turn_recovery_jobs
-        WHERE status='paused'
-          AND (pause_reason='dispatch_not_accepted' OR pause_reason LIKE 'refused:%')
-          AND updated_at > NOW() - INTERVAL '1 day'
-        ORDER BY updated_at
+      // Only chains whose session still ends in their recovery row: a closed or
+      // answered chain drops out, so a full page never starves a later one.
+      `SELECT j.user_id::text AS user_id, j.session_id, j.root_client_message_id,
+              j.request_json->>'clientMessageId' AS recovery_message_id
+         FROM turn_recovery_jobs j
+         JOIN client_sessions s
+           ON s.id=j.session_id AND s.user_id='c:'||j.user_id::text AND s.deleted_at IS NULL
+        WHERE j.status='paused'
+          AND (j.pause_reason='dispatch_not_accepted' OR j.pause_reason LIKE 'refused:%')
+          AND j.updated_at > NOW() - INTERVAL '1 day'
+          AND CASE WHEN strpos(s.messages, j.request_json->>'clientMessageId') > 0
+            THEN (s.messages::jsonb -> -1 ->> 'id') = j.request_json->>'clientMessageId'
+            ELSE false END
+        ORDER BY j.updated_at
         LIMIT $1`,
       [input.limit ?? 50],
     )
