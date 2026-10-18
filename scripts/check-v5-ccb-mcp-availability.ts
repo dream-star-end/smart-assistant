@@ -12,6 +12,8 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
+import { proveWebSearchCli } from "./lib/webSearchCliProof.js";
+
 import { MEMORY_MCP_TOOL_NAMES } from "../packages/mcp-memory/src/toolNames.js";
 
 const root = resolve(process.cwd());
@@ -273,6 +275,10 @@ assert.ok(
   selfhostRelease.includes("check-v5-ccb-mcp-availability.ts"),
   "v5-selfhost-master-release-lib.sh must invoke check-v5-ccb-mcp-availability.ts",
 );
+
+// OCV5-510: prove a discoverable search tool exists for Codex's scrubbed process environment.
+await proveWebSearchCli(root, join(root, "packages/gateway/src/ocWebCli.ts"));
+console.log("[ocv5-510-codex-web-search-cli] PASS — the real CLI restores container identity and returns a sourced result through MiniMax then Grok");
 
 console.log(
   "[ccb-mcp-availability] PASS — CCB prompt advertises built-in openclaude-memory tools; ExecuteExtraTool wrapper unwraps to inner MCP tool",

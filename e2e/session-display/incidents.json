@@ -7887,6 +7887,97 @@
         }
       ],
       "coverageCommits": []
+    },
+    {
+      "id": "INC-20261018-CODEX-WEB-SEARCH-CLI",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "体验官A25/A36：Codex缺少可发现的稳定搜索CLI，oc-web --help无search，Luna/Sol改用Bash抓Google/Bing/Baidu遇空结果及验证码。新增oc-web search，复用现有master搜索代理和成对容器身份回退；prompt/schema/cache输入不变。",
+      "rootFixCommit": "051e6768",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ocWebSearch.test.ts",
+          "assertion": "OCV5-510 oc-web search returns source URLs through the authenticated master proxy"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-ccb-mcp-availability.ts",
+          "assertion": "[ocv5-510-codex-web-search-cli] PASS — the real CLI restores container identity and returns a sourced result through MiniMax then Grok"
+        }
+      ],
+      "coverageCommits": [
+        "71a9e763"
+      ]
+    },
+    {
+      "id": "INC-20261018-ARTIFACT-LINK-DOWNLOAD",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "体验官B13：Markdown中generated绝对文件链接被当成网站路径，新标签404且暴露内部路径。平台资产锚点复用既有鉴权签名缓存与下载组件，普通链接和只读行为保留。",
+      "rootFixCommit": "7a99da55",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MarkdownImpl.test.tsx",
+          "assertion": "OCV5-508 artifact anchors reuse signing and retain their label"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/artifact-link.node-test.mjs",
+          "assertion": "OCV5-508 generated Markdown links download authenticated file bytes"
+        }
+      ],
+      "coverageCommits": []
+    },
+    {
+      "id": "INC-20261018-SHARE-EXPORT-INTERNAL",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "体验官A24：导出Markdown泄露工具调用及过程文本，分享最终答含平台内部资产路径。修复统一最终回答口径并只转换资产引用，保留有用源码和用户原文。",
+      "rootFixCommit": "2133a121",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/publicArtifactText.test.ts",
+          "assertion": "OCV5-507 exports readable artifact references without private platform roots"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/share-export.node-test.mjs",
+          "assertion": "OCV5-507 sharing and Markdown downloads contain final answers and portable artifact references"
+        }
+      ],
+      "coverageCommits": []
+    },
+    {
+      "id": "INC-20261018-BOX-DELEGATE-EMPTY-CURRENT",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "OCV5-499：商业 uid247 的两次 Haiku 委派（UTC 2026-10-17 17:02，request 267d69b53fd82f9785e073c66bb60292 / c16c4ac9f35cb324061459e49daaec77）回答消息为空。CCB 在 normalize 后追加 deferred-tools user 公告；Box mapper 只选最后 user 为 stdin，完整目标落入未回答历史，原生恢复插入 No response requested。两份原生记录已证明，未将该证据归给 uid1931。修复按 Sol 方案保留末尾纯文本 user 段于同一当前 stdin，system 继续提升，assistant/工具结果阻断合并；Astra纯文本限制和单user/边界用例一并移植。个人版共享 mapper，独立验证；uid765出口身份缺失的ENOENT为不同故障。",
+      "rootFixCommit": "dec598ed",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
+          "assertion": "keeps a delegated goal and the late deferred-tools reminder in the same current turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
+          "assertion": "one user keeps its original string or text blocks without a rewrite"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
+          "assertion": "assistant boundaries stop the pending user tail while system text is lifted"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-499-pending-user] PASS — the full delegated goal and late tool announcement reach the same current stdin without changing canonical bytes or completed tool history"
+        }
+      ]
     }
   ]
 }

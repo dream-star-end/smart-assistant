@@ -600,6 +600,11 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     ),
   },
   'oc-web': {
+    search: async () => {
+      const result = await runOcWebCli(['search'])
+      assert.equal(result.exitCode, 2)
+      assert.match(result.stderr, /search requires one quoted/)
+    },
     extract: async () => {
       const result = await runOcWebCli(['extract'])
       assert.equal(result.exitCode, 2)
