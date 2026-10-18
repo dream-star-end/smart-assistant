@@ -64,6 +64,7 @@ import {
 } from '../billing/imageBilling.js'
 import { InsufficientCreditsError as LedgerInsufficientCreditsError } from '../billing/ledger.js'
 
+import { codexRequestTiming, codexResponseTiming } from './codexRelayTiming.js'
 import { CODEX_RELAY_PREFIX } from '@openclaude/protocol'
 
 export { CODEX_RELAY_PREFIX }
@@ -806,6 +807,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
 
   return async function handle(req, res, ctx) {
     setSecurityHeaders(res)
+    const relayReceivedAt = performance.now()
     const requestId = ensureRequestId(req)
     res.setHeader(REQUEST_ID_HEADER, requestId)
 
@@ -1111,7 +1113,13 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     req.once('aborted', abort)
     res.once('close', abort)
 
+    const safeThreadHeader = (key: string): string | null => {
+      const value = req.headers[key]
+      return typeof value === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value) ? value : null
+    }
     const relayLog = userLog.child({
+      codexSessionId: safeThreadHeader('session_id'),
+      codexConversationId: safeThreadHeader('conversation_id'),
       codexAccountId: egress ? String(egress.accountId) : null,
       relayCredentialId: routeContext ? String(routeContext.credential.id) : null,
       proxyId: egress ? String(egress.proxyId) : null,
@@ -1316,6 +1324,11 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
       }
     }
 
+    let upstreamStartedAt = 0
+    const observeTiming = (fields: Record<string, number | string | null>): void => {
+      relayLog.info('codex_relay_timing', fields)
+    }
+    const observeResponses = method === 'POST' && mappedSuffix === '/responses' && !needsBailianVisionCompat
     try {
       const headers = buildUpstreamHeaders(req)
       if (imageRequestContentType) headers.set('content-type', imageRequestContentType)
@@ -1329,7 +1342,9 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
         headers,
         body: method === 'GET' || method === 'HEAD'
           ? undefined
-          : imageRequestBody ?? responsesRequestBody ?? (req as unknown as BodyInit),
+          : imageRequestBody ?? responsesRequestBody ?? (observeResponses
+            ? req.pipe(codexRequestTiming(observeTiming, () => performance.now(), relayReceivedAt)) as unknown as BodyInit
+            : req as unknown as BodyInit),
         dispatcher: egress?.dispatcher,
         duplex: 'half',
         signal: controller.signal,
@@ -1371,6 +1386,8 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
           activeImageAttemptNo = attempt.attemptNo
           relayLog.info('image_upstream_attempt_started', { attempt: attempt.attemptNo })
         }
+        upstreamStartedAt = performance.now()
+        if (observeResponses) observeTiming({ stage: 'upstream_dispatch', elapsedMs: upstreamStartedAt - relayReceivedAt })
         return fetchImpl(mappedUrl.url, init)
       }
       let upstream = await fetchUpstream()
@@ -1395,6 +1412,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
           upstream = await fetchUpstream()
         }
       }
+      if (observeResponses) observeTiming({ stage: 'headers', elapsedMs: performance.now() - upstreamStartedAt })
       relayLog.info('relay_upstream_response', {
         status: upstream.status,
         forwardedCodexTurnState: outgoingHeaders.has('x-codex-turn-state'),
@@ -1546,7 +1564,11 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
         body.on('error', reject)
         res.on('error', reject)
         res.on('finish', resolve)
-        body.pipe(res)
+        if (observeResponses && upstream.headers.get('content-type')?.includes('text/event-stream')) {
+          const tap = codexResponseTiming(observeTiming, () => performance.now(), upstreamStartedAt)
+          tap.on('error', reject)
+          body.pipe(tap).pipe(res)
+        } else body.pipe(res)
       })
     } catch (err) {
       if (deps.preCheckRedis && imageReservation) await releasePreCheck(deps.preCheckRedis, imageReservation).catch(() => {})

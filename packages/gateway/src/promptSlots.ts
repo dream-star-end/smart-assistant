@@ -57,7 +57,9 @@ import {
   type IdentityCompatAssets,
   type SkillStoreCompatOptions,
 } from '@openclaude/storage'
-import { AGENT_MODEL_AUTO } from '@openclaude/protocol'
+import { AGENT_MODEL_AUTO, estimateModelHistoryTokens } from '@openclaude/protocol'
+import { createLogger } from './logger.js'
+const promptTimingLog = createLogger({ module: 'promptTiming' })
 import { request as undiciRequest } from 'undici'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
@@ -1785,6 +1787,7 @@ function staticFirstSlots(
 }
 
 export async function buildPromptContext(ctx: PromptSlotContext): Promise<PromptContextResult> {
+  const contextStartedAt = performance.now()
   const slots: PromptSlot[] = []
   let resolved = ctx.projectContext
   if (resolved === undefined && isProjectContextEnabled()) {
@@ -1995,6 +1998,16 @@ export async function buildPromptContext(ctx: PromptSlotContext): Promise<Prompt
       return base
     }),
   )
+  const slotTokensEstimate = Object.fromEntries(
+    ['ENV', 'SOUL', 'USER', 'PROJECT', 'INTELLIGENT_UI', 'AGENTS', 'SKILLS',
+      'SKILLS_LITERATURE', 'MEMORY', 'PROJECT_MEMORY', 'TOOLS', 'MODEL_HINT', 'RESEARCH', 'REPO']
+      .map(name => [name, effectiveSlots.filter(slot => slot.name === name)
+        .reduce((sum, slot) => sum + estimateModelHistoryTokens(slot.content), 0)]),
+  )
+  promptTimingLog.info('prompt_context_timing', {
+    sessionKey: ctx.sessionKey, elapsedMs: performance.now() - contextStartedAt,
+    tokensEstimate: estimateModelHistoryTokens(content), slotTokensEstimate,
+  })
   return {
     content,
     contentSha256: await sha256Hex(content),
