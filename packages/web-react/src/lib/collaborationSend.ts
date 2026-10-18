@@ -44,12 +44,18 @@ export async function prepareAdvisorSend(input: {
       refreshed = true
     } catch {
       if (!isCurrent()) return null
-      // Previously confirmed empty remains distinct from an unknown/failed catalog.
+      // Retain the submitted intent; recover a still-blocked catalog below.
     } finally {
       window.clearTimeout(timer)
     }
   }
   if (!isCurrent()) return null
+  const blockedUnknownAdvisor =
+    input.agentId === 'main' &&
+    original.mode === 'advisor' &&
+    !state.advisorCatalogResolved &&
+    !!state.advisorUnavailableReason
+  continueSolo ||= blockedUnknownAdvisor
   const recoveredAdvisor = input.agentId === 'main' && continueSolo
   if (recoveredAdvisor) {
     state = { ...state, mode: 'solo', advisorModel: null, configVersion: '' }
