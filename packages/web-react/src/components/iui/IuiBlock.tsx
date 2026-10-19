@@ -7,7 +7,7 @@
  *   3. 组件渲染异常 → 组件级错误边界,显示该组件的 Markdown 版本。
  */
 import { Component, type ReactNode, useMemo } from "react";
-import { isNextBlockCode } from "../../lib/inputPrediction";
+import { isNextBlockCode } from "../../lib/nextBlock";
 import { CalculatorBlock } from "./CalculatorBlock";
 import { ChartBlock } from "./ChartBlock";
 import { KvBlock, ProgressBlock, RouteBlock } from "./InfoBlocks";
