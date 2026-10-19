@@ -20,3 +20,5 @@
 `jieyouHttpClient.ts`是私有预登录客户端：parse5按name解析真实表单/hidden/验证码路径，lifetime必须从实际选项显式选取，不猜CMS值；每实例独立tough-cookie jar并逐跳选cookie，HTTP不发送Secure cookie。只收同站点受pin约束的请求，GET最多3次重定向，challenge一次消费、POST绝不自动跟跳/重放。close中止在途并清空jar。原始page/response/cookie snapshot是私有证据，不得作为模型结果或公开管理API返回；snapshot并不证明登录成功。当前没有实现真实身份/错误分类、LiteratureLoginSession适配或DB保存，须测试账号校准。
 
 parse5/tough-cookie已显式加入commercial runtime依赖，锁定现有8.0.1/6.0.1及原有传递版本；没有借dev依赖冒充生产可用，也未修改无关web包锁项。未来正常发布staging npm ci处理依赖，本轮未部署。
+
+真实公开页（2026-10-19）使用<table><form>旧布局，parse5修复树后form为空、控件都不在其后代。解析器因此使用固定8.0.1 Parser的实际form指针，在节点插入时记录input/img归属；不扫描全页猜关联。真实关闭标签之后的控件、template和script/comment伪标签不会并入；本站未观察到的显式form=覆盖先拒绝。这一小适配依赖parse5 internal API，升级必须过旧布局/关闭边界回归。公开GET解析成功也不是登录成功或市场可用证明。

@@ -1,6 +1,6 @@
 /** Private pre-login HTTP driver. Raw pages/cookies are never model-facing results. */
 import { randomUUID } from 'node:crypto'
-import { type DefaultTreeAdapterMap, parse } from 'parse5'
+import { type DefaultTreeAdapterMap, Parser, type Token } from 'parse5'
 import { CookieJar } from 'tough-cookie'
 import { type CaptchaImage, captchaAnswer, normalizeCaptchaImage } from './captcha.js'
 import { parseLiteratureCredentials } from './credentials.js'
@@ -52,22 +52,46 @@ function elements(root: Node): Element[] {
   }
   return output
 }
+/** parse5's pinned parser form pointer survives legacy <table><form> tree repair.
+ * DOM ancestry alone loses these controls. Capture actual inserted nodes, not a
+ * whole-page guess. This small internal-API adapter is guarded by layout tests.
+ */
+class JieyouFormParser extends Parser<DefaultTreeAdapterMap> {
+  readonly owners = new WeakMap<Element, Element>()
+  override _attachElementToTree(
+    element: Element,
+    location: Token.LocationWithAttributes | null,
+  ): void {
+    super._attachElementToTree(element, location)
+    if (
+      element.namespaceURI === 'http://www.w3.org/1999/xhtml' &&
+      ['input', 'img'].includes(element.tagName) &&
+      this.formElement &&
+      this.openElements.tmplCount === 0
+    )
+      this.owners.set(element, this.formElement)
+  }
+}
 /** Public HTML structure only; values must come from the current page, never CMS defaults. */
 export function parseJieyouLoginForm(html: string, baseUrl = LOGIN_URL): JieyouLoginForm {
   if (typeof html !== 'string' || !html.length || Buffer.byteLength(html) > 1024 * 1024) invalid()
   const base = literatureUrl(baseUrl)
-  const tree = elements(parse(html))
+  const parser = new JieyouFormParser()
+  parser.tokenizer.write(html, true)
+  const tree = elements(parser.document)
+  // This fixed site has no explicit form-owner overrides, including external controls.
+  if (tree.some((e) => e.tagName === 'input' && attr(e, 'form') !== undefined)) invalid()
   const candidates = tree
     .filter((e) => e.tagName === 'form')
-    .map((form) => ({
-      form,
-      inputs: elements(form).filter((e) => e.tagName === 'input'),
-    }))
+    .map((form) => {
+      const scope = tree.filter((e) => parser.owners.get(e) === form)
+      return { form, scope, inputs: scope.filter((e) => e.tagName === 'input') }
+    })
     .filter(({ inputs }) =>
       ['username', 'password', 'key'].every((name) => inputs.some((e) => attr(e, 'name') === name)),
     )
   if (candidates.length !== 1) invalid()
-  const { form, inputs } = candidates[0]
+  const { form, inputs, scope } = candidates[0]
   if (
     attr(form, 'method')?.toLowerCase() !== 'post' ||
     (attr(form, 'enctype') && attr(form, 'enctype') !== 'application/x-www-form-urlencoded')
@@ -123,7 +147,7 @@ export function parseJieyouLoginForm(html: string, baseUrl = LOGIN_URL): JieyouL
     attr(submits[0], 'disabled') !== undefined
   )
     invalid()
-  const images = elements(form)
+  const images = scope
     .filter((e) => e.tagName === 'img')
     .flatMap((e) => {
       try {

@@ -331,3 +331,40 @@ test('a timed-out POST is never replayed and its challenge remains consumed', as
   await assert.rejects(f.client.submit(input, signal()), code('CHALLENGE_STALE'))
   assert.equal(submits, 1)
 })
+
+test('legacy table form keeps its parser-associated controls after DOM tree repair', () => {
+  const legacy = FORM.replace(
+    '<form method="post" action=',
+    '<table><form method="post" action=',
+  ).replace('</form></html>', '</form></table></html>')
+  const normal = parseJieyouLoginForm(FORM)
+  assert.deepEqual(parseJieyouLoginForm(legacy), normal)
+  const inert = legacy.replace(
+    '<input type="text" name="key">',
+    `<script>const inert = '</form><input name="username">';</script>
+     <template><input name="username"><form method="post"></form></template>
+     <input type="text" name="key">`,
+  )
+  assert.deepEqual(parseJieyouLoginForm(inert), normal)
+})
+
+test('a real closing form excludes later same-table controls from the login owner', () => {
+  const legacy = FORM.replace('<form method="post" action=', '<table><form method="post" action=')
+    .replace('<input type="text" name="key">', '')
+    .replace('</form></html>', '</form><input type="text" name="key"></table></html>')
+  assert.throws(() => parseJieyouLoginForm(legacy), code('RESPONSE_INVALID'))
+})
+
+test('explicit form-owner overrides are rejected instead of assigned to the parser pointer', () => {
+  assert.throws(
+    () => parseJieyouLoginForm(`${FORM}<input form="login" name="key">`),
+    code('RESPONSE_INVALID'),
+  )
+  assert.throws(
+    () =>
+      parseJieyouLoginForm(
+        FORM.replace('name="username" id=', 'name="username" form="another-form" id='),
+      ),
+    code('RESPONSE_INVALID'),
+  )
+})

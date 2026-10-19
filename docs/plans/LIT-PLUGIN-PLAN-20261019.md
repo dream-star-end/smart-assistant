@@ -61,6 +61,10 @@
 
 先验证原生HTTP是否足够；若足够，在如实签入HTTP例外/会话类型的固定官方driver执行分支内复用安装/审核/租户/lease/CAS门，不必为了静态表单先引浏览器。若真实库需JS，再实现受限浏览器HTTP relay。不能从新产品HTTP路由直接绕过runtime校验开跑。依赖锁变更沿正规发布staging npm ci处理，不手改生产安装。
 
+## 公开页实测带来的解析修正
+
+54项fixture通过后，一次真实匿名GET发现旧表格表单的DOM归属差异：parse5将form置为table内空元素，12个控件都在form外。已补实际结构元数据（无字段值/Cookie），并通过独立修正方案预审。按锁定parse5版本的解析时form指针关联真实控件，保留唯一form、精确地址/字段/重复拒绝；不靠全页扫描或正则猜归属。internal API局限明确，升级需回归。新增旧表格、真实关闭边界、script/template伪标签与显式归属覆盖测试；仍无账号、真实登录POST或检索下载。
+
 ## 商业体系与拆分细化（16:46决定后的现行版本）
 
 - 服务端采用官方managed-browser/固定driver和受签工件，而非用户上传任意JS。现有本机plugin.json不支持browser/http组件，声明HTTP蓝图也不能表达等待验证码的登录生命周期。工具沿app-connectors→oc-plugin catalog/list/call→容器双因子RPC→安装/签名/账户lease→受限worker，不假定所有模型自动原生注册工具。
