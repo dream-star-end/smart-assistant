@@ -17,6 +17,8 @@
  * (antigravityModelCooldown.ts).
  */
 import type { Pool } from 'pg'
+import { ANTIGRAVITY_AUX_UPSTREAM_MODELS, antigravityAllowedUpstreamModels } from '@openclaude/protocol'
+import type { AntigravityModelAvailability } from './antigravityQuota.js'
 import { getPool } from '../db/index.js'
 import { query } from '../db/queries.js'
 import type { PoolOutcome } from './policy/outcome.js'
@@ -29,7 +31,7 @@ import {
   underRateCap,
   type AffinityAction,
 } from './policy/affinity.js'
-import { healthWeight } from './policy/select.js'
+import { healthWeight, rankWRH } from './policy/select.js'
 
 export type AntigravityPoolOutcome =
   | { kind: 'success' }
@@ -72,6 +74,28 @@ export function classifyAntigravityUpstream(
   return { kind: 'client_error' }
 }
 
+
+/** Only known paid tiers are ranked; the 'lite' spelling still denotes Ultra. */
+export function isAntigravityUltra(tier: string | null | undefined): boolean {
+  return tier === 'g1-ultra-tier' || tier === 'g1-ultra-lite-tier'
+}
+
+export function antigravityAccountSupportsModel(models: AntigravityModelAvailability | null | undefined, modelId: string, now: number): boolean {
+  // Preserve existing legacy accounts until their first background refresh.
+  // Newly introduced Claude 5.5 must have affirmative directory evidence.
+  if (!models) return modelId === 'antigravity-gemini-3.8-flash' || modelId === 'antigravity-gpt-oss-120b'
+  let ids = antigravityAllowedUpstreamModels(modelId).filter((id) => !(ANTIGRAVITY_AUX_UPSTREAM_MODELS as readonly string[]).includes(id))
+  if (modelId === 'antigravity-gemini-3.8-flash' && models['gemini-3.8-flash-tiered']) ids = ['gemini-3.8-flash-tiered']
+  if (ids.length === 0) return false
+  return ids.every((id) => {
+    const q = models[id]
+    if (!q) return false
+    if (q.remainingFraction !== 0) return true
+    const reset = q.resetTime === null ? Number.NaN : Date.parse(q.resetTime)
+    return Number.isFinite(reset) && reset <= now
+  })
+}
+
 export interface AntigravityAccountPick {
   accountId: bigint
   email: string
@@ -98,6 +122,7 @@ export async function pickAntigravityAccount(
     pool?: Pick<Pool, 'query'>
     skip?: (accountId: bigint) => Promise<boolean>
     userId?: bigint | null
+    modelId?: string
     /**
      * Reserve an in-flight unit for this turn under this token (the requestId) as
      * part of the pick, with no await between the cap check and the reservation.
@@ -112,8 +137,11 @@ export async function pickAntigravityAccount(
     email: string
     health_score: number
     last_used_at: Date | null
+    paid_tier: string | null
+    status: string
+    available_models: AntigravityModelAvailability | null
   }>(
-    `SELECT id::text AS id, email, health_score, last_used_at FROM gemini_oauth_accounts
+    `SELECT id::text AS id, email, health_score, last_used_at, paid_tier, status, available_models FROM gemini_oauth_accounts
       WHERE disabled_by IS NULL
         AND (status = 'active'
              OR (status = 'cooldown' AND cooldown_until <= NOW()
@@ -122,10 +150,14 @@ export async function pickAntigravityAccount(
   )
   const usable: typeof res.rows = []
   for (const row of res.rows) {
+    if (deps.modelId && !antigravityAccountSupportsModel(row.available_models, deps.modelId, Date.now())) continue
     if (deps.skip && (await deps.skip(BigInt(row.id)))) continue
     usable.push(row)
   }
   if (usable.length === 0) return null
+  // Prefer healthy Ultra; an active but degraded member remains a last resort.
+  const tier = (r: typeof usable[number]): number => r.status === 'cooldown' ? 3 : r.health_score < 80 ? 2 : isAntigravityUltra(r.paid_tier) ? 0 : 1
+  usable.sort((a, b) => tier(a) - tier(b))
   if (deps.userId === undefined || deps.userId === null) {
     return { accountId: BigInt(usable[0].id), email: usable[0].email }
   }
@@ -137,7 +169,9 @@ export async function pickAntigravityAccount(
       inflightCount(ANTIGRAVITY_AFFINITY_SERVICE, r.id) < caps.antigravityInflight &&
       underRateCap(ANTIGRAVITY_AFFINITY_SERVICE, r.id, caps.antigravityRatePerMin),
   )
-  const candidates = open.length > 0 ? open : usable
+  const uncapped = open.length > 0 ? open : usable
+  const bestTier = Math.min(...uncapped.map(tier))
+  const candidates = uncapped.filter((r) => tier(r) === bestTier)
   let resolved: Awaited<ReturnType<typeof resolveAffinity>> = null
   try {
     resolved = await resolveAffinity({
@@ -173,7 +207,13 @@ export async function pickAntigravityAccount(
     // Affinity is best-effort: the store failing must not block a turn (legacy order serves).
     resolved = null
   }
-  const preferred = resolved ? candidates.find((r) => r.id === resolved!.member.id) ?? candidates[0] : candidates[0]
+  // Spill does not create a second persistent binding. Rendezvous ranking
+  // keeps an old Pro user's spill stable across multiple Ultra accounts, even
+  // as last_used_at changes, so the prompt cache can warm on one account.
+  const stableSpill = resolved?.action === 'spill' ? rankWRH(candidates, {
+    key: deps.userId.toString(), id: (r) => r.id, weight: (r) => healthWeight(r.health_score),
+  })[0] : undefined
+  const preferred = stableSpill ?? (resolved ? candidates.find((r) => r.id === resolved!.member.id) ?? candidates[0] : candidates[0])
   let row = preferred
   if (deps.reserveToken) {
     // Atomic check-and-reserve: a concurrent turn may have filled the preferred
@@ -181,7 +221,7 @@ export async function pickAntigravityAccount(
     // Order over every usable account (not only the ones that passed the cap
     // filter before the awaits above): capacity freed meanwhile is seen here.
     const order = [preferred.id, ...usable.filter((r) => r.id !== preferred.id)
-      .sort((a, b) => inflightCount(ANTIGRAVITY_AFFINITY_SERVICE, a.id) - inflightCount(ANTIGRAVITY_AFFINITY_SERVICE, b.id))
+      .sort((a, b) => tier(a) - tier(b) || inflightCount(ANTIGRAVITY_AFFINITY_SERVICE, a.id) - inflightCount(ANTIGRAVITY_AFFINITY_SERVICE, b.id))
       .map((r) => r.id)]
     const id = reserveInflight(
       ANTIGRAVITY_AFFINITY_SERVICE,

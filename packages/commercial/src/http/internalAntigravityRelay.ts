@@ -185,6 +185,22 @@ function count(value: unknown): number {
 export class AntigravityUsageTap {
   private pending = ''
   private truncated = false
+  private noticeText = ''
+  private normalResult = false
+
+  /** Hold only a possible upstream retirement banner, never a normal answer. */
+  get mayBeRetirementNotice(): boolean {
+    if (this.normalResult) return false
+    const text = this.noticeText.trimStart()
+    return ['Sonnet 4.6', 'Opus 4.6', 'Sonnet 5.5', 'Opus 5.5'].some((name) => {
+      const lead = `Claude ${name} is no longer available. Please switch to Claude `
+      return lead.startsWith(text) || text.startsWith(lead)
+    })
+  }
+
+  get retired(): boolean {
+    return !this.normalResult && /^Claude (?:Sonnet|Opus) [0-9.]+ is no longer available\. Please switch to Claude (?:Sonnet|Opus) [0-9.]+\.$/.test(this.noticeText.trim())
+  }
   usage: { prompt: number; candidates: number; thoughts: number; cached: number } | null = null
 
   /** `sse` for streamGenerateContent, `json` for one generateContent response body. */
@@ -232,7 +248,6 @@ export class AntigravityUsageTap {
   }
 
   private scanPayload(payload: string): void {
-    if (!payload.includes('usageMetadata')) return
     let parsed: unknown
     try {
       parsed = JSON.parse(payload)
@@ -244,6 +259,25 @@ export class AntigravityUsageTap {
       outer?.response && typeof outer.response === 'object'
         ? (outer.response as Record<string, unknown>)
         : outer
+    const candidates = inner?.candidates
+    if (Array.isArray(candidates)) {
+      for (const candidate of candidates) {
+        if (!candidate || typeof candidate !== 'object') continue
+        if (candidate.finishReason) this.normalResult = true
+        const parts = candidate.content?.parts
+        if (!Array.isArray(parts)) continue
+        for (const part of parts) {
+          if (part.thought || part.functionCall || part.inlineData) this.normalResult = true
+          if (typeof part.text === 'string' && !part.thought) {
+            this.noticeText += part.text
+            if (this.noticeText.length > 512) {
+              this.normalResult = true
+              this.noticeText = this.noticeText.slice(0, 512)
+            }
+          }
+        }
+      }
+    }
     const meta = inner?.usageMetadata
     if (!meta || typeof meta !== 'object') return
     const m = meta as Record<string, unknown>
@@ -554,7 +588,8 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
           body,
         },
       )
-      const classified = classifyAntigravityUpstream(upstream.statusCode, upstream.headers, now())
+      const reportStatus = (status: number): void => {
+      const classified = classifyAntigravityUpstream(status, upstream.headers, now())
       // A 5xx on a generate call is the model's capacity (other models on the
       // account keep working): cool that model, not the whole account.
       const outcome: AntigravityPoolOutcome =
@@ -564,7 +599,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       void reportOutcome(
         route.accountId,
         outcome,
-        outcome.kind === 'success' ? null : `antigravity_http_${upstream.statusCode}`,
+        outcome.kind === 'success' ? null : `antigravity_http_${status}`,
       ).catch(() => {})
       if (
         generate &&
@@ -575,6 +610,8 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
           void reportModelOutcome(route.accountId, route.modelId, modelOk).catch(() => {})
         }
       }
+      }
+      if (!generate) reportStatus(upstream.statusCode)
       res.statusCode = upstream.statusCode
       for (const [rawKey, rawValue] of Object.entries(upstream.headers)) {
         if (!HOP.has(rawKey.toLowerCase()) && rawValue !== undefined) {
@@ -588,14 +625,29 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       // that never comes: keep reading Google to the end (the call is billed
       // upstream either way) so usage is still recorded and the reservation freed.
       let downstreamOpen = true
+      let holding = !!tap && upstream.statusCode < 400
+      const held: Buffer[] = []
+      let heldBytes = 0
       for await (const chunk of upstream.body) {
         tap?.push(chunk as Buffer)
+        if (holding) {
+          held.push(chunk as Buffer)
+          heldBytes += (chunk as Buffer).length
+          if (tap!.mayBeRetirementNotice && heldBytes <= 64 * 1024) continue
+          holding = false
+          const first = Buffer.concat(held)
+          held.length = 0
+          if (res.destroyed || !res.write(first)) downstreamOpen = await drainedOrClosed(res)
+          continue
+        }
         if (!downstreamOpen) continue
         if (res.destroyed || !res.write(chunk)) downstreamOpen = await drainedOrClosed(res)
       }
       if (tap) {
         tap.end()
         const usage = tap.usage
+        const effectiveStatus = tap.retired ? 410 : upstream.statusCode
+        reportStatus(effectiveStatus)
         // Record before ending the response: the CLI only finishes the turn
         // after this stream ends, so settlement always sees the row.
         const row: AntigravityUsageRow = {
@@ -606,7 +658,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
           routeModelId: route.modelId,
           upstreamModel,
           requestType,
-          statusCode: upstream.statusCode,
+          statusCode: effectiveStatus,
           promptTokens: usage?.prompt ?? 0,
           candidatesTokens: usage?.candidates ?? 0,
           thoughtsTokens: usage?.thoughts ?? 0,
@@ -634,6 +686,17 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
         }
         // A Stop may have settled the turn while this call was still streaming (OCV5-451).
         void refreshWaived(route).catch(() => {})
+        if (tap.retired) {
+          if (!res.headersSent) {
+            // Discard held upstream bytes and their encoding headers.
+            for (const name of res.getHeaderNames()) {
+              if (!['x-request-id', 'x-content-type-options', 'x-frame-options', 'referrer-policy'].includes(name)) res.removeHeader(name)
+            }
+            error(res, 410, 'ANTIGRAVITY_MODEL_RETIRED', requestId)
+          } else res.destroy(new Error('ANTIGRAVITY_MODEL_RETIRED'))
+          return
+        }
+        if (holding && held.length > 0 && downstreamOpen) res.write(Buffer.concat(held))
       }
       if (downstreamOpen) res.end()
     } catch (err) {
