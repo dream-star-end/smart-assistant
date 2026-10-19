@@ -18,7 +18,8 @@ name="${1:?usage: test-mutex.sh <lock-name> '<command>'}"
 cmd="${2:?usage: test-mutex.sh <lock-name> '<command>'}"
 lock="/var/lock/oc-test-${name}.lock"
 
-exec 9>"$lock" 2>/dev/null || {
+# Scope the open-error redirect so children keep the caller's stderr.
+{ exec 9>"$lock"; } 2>/dev/null || {
   # 无 /var/lock 写权限的环境(某些 CI 沙箱)降级为直接执行——单树环境本就无并发。
   echo "[test-mutex] 无法打开 $lock,视为单树环境直接执行" >&2
   exec bash -c "$cmd"
