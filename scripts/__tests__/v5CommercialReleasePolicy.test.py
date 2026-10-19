@@ -201,6 +201,72 @@ commercial_policy_restore_disabled_current
             self.assertFalse(m.health(server.server_port))
         finally:server.shutdown();thread.join();server.server_close()
 
+    def test_actual_automatic_saga_compensation_closes_original_lineage(self):
+        script=r'''set -eu
+source "$1/scripts/lib/v5-commercial-release-policy.sh"
+CP_ROOT="$2"; KL_HOST=fixture; V5_ENV=env; OC_HOTCFG_PLATFORM_ROOT=platform; ACTIVE_SRC=live; ACTIVE_UNIT=unit
+commercial_policy_authority_status(){
+  if [[ "$STATE" == original ]]; then echo original
+  elif [[ "${1:-}" == before && "$STATE" == reverted ]]; then echo applied
+  else echo unknown; fi
+}
+commercial_policy_rmt(){
+  local fn="$1"; shift
+  case "$fn" in
+    commercial_policy_verified_history) echo missing ;;
+    commercial_policy_compensated_history) echo VERIFIED_REVERSE_HISTORY >> "$CP_ROOT/calls" ;;
+    commercial_policy_restore_disabled_current) : ;;
+    commercial_policy_py) case "$1" in
+      field) case "$2" in before.masterRelease) echo old ;; target.masterRelease) echo new ;; options.restartEgress) echo false ;; operationId) echo op ;; esac ;;
+      verify) : ;;
+      archive-direction) echo '' ;;
+      resolve) printf 'RESOLVE %s %s\n' "$2" "$3" >> "$CP_ROOT/calls" ;;
+      *) return 79 ;;
+    esac ;;
+    *) return 79 ;;
+  esac
+}
+ssh(){ shift; bash -c "$*"; }
+commercial_policy_required_gates(){ echo "ALL_OLD_GATES $1" >> "$CP_ROOT/calls"; }
+commercial_policy_complete_compensation
+'''
+        for state,expected in [('original',['ALL_OLD_GATES old','RESOLVE before original']),('reverted',['VERIFIED_REVERSE_HISTORY','ALL_OLD_GATES old','RESOLVE before reverted'])]:
+            journal=self.policy/'calls'
+            if journal.exists():journal.unlink()
+            env=os.environ.copy();env['STATE']=state
+            result=subprocess.run(['bash','-s','--',str(REPO),str(self.policy)],input=script,text=True,capture_output=True,env=env)
+            self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+            self.assertEqual(journal.read_text().splitlines(),expected)
+
+    def test_actual_forward_retry_failure_restores_service_and_keeps_failed_context(self):
+        script=r'''set -eu
+source "$1/scripts/lib/v5-commercial-release-policy.sh"
+CP_ROOT="$2"; EGRESS_SLOT_PREDRAIN_SEC=0
+commercial_policy_rmt(){
+  case "$1" in
+    commercial_policy_py) echo old ;;
+    commercial_policy_reverse_unavailable) echo PROVED_OUTAGE >> "$CP_ROOT/calls" ;;
+    *) return 79 ;;
+  esac
+}
+egress_slots_remote(){
+  case "$1" in
+    policy-state) echo unavailable ;;
+    restore) echo FORWARD_FREE_SLOT >> "$CP_ROOT/calls"; return "$FAULT" ;;
+    converge) echo UNEXPECTED_ACCEPT >> "$CP_ROOT/calls" ;;
+  esac
+}
+commercial_policy_reverse_dead_egress(){ echo "RESTORE_OLD $1" >> "$CP_ROOT/calls"; }
+commercial_policy_resume_egress new
+'''
+        for fault,code,expected in [('1',78,['FORWARD_FREE_SLOT','PROVED_OUTAGE','RESTORE_OLD old']),('86',86,['FORWARD_FREE_SLOT'])]:
+            journal=self.policy/'calls'
+            if journal.exists():journal.unlink()
+            env=os.environ.copy();env['FAULT']=fault
+            result=subprocess.run(['bash','-s','--',str(REPO),str(self.policy)],input=script,text=True,capture_output=True,env=env)
+            self.assertEqual(result.returncode,code,result.stdout+result.stderr)
+            self.assertEqual(journal.read_text().splitlines(),expected)
+
     def test_unknown_authority_is_not_a_rollback_trigger(self):
         self.prepare()
         with patch.object(m,'unit_info',return_value=('active','123',str(self.new))), patch.object(m,'health',return_value=True):

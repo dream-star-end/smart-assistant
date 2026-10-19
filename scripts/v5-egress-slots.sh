@@ -162,6 +162,7 @@ cmd_flip() {
     die "slot $target failed to start; ${cur:+slot $cur still serving}"
   fi
   wait_shared_port || die "shared port not reachable after slot $target started"
+  [[ "${CP_EGRESS_POLICY:-0}" != 1 ]] || commercial_policy_remote_owner || return 86
   if [[ -n "$cur" ]]; then
     # Close the old listener first (ms), then stop the service without blocking (it drains).
     # Stopping both in one job would keep the old .socket until the drain ends: a black hole.
@@ -171,6 +172,7 @@ cmd_flip() {
     systemctl stop --no-block "$old_svc"
     systemctl disable "$old_sock" "$old_svc" >/dev/null 2>&1 || true
   fi
+  [[ "${CP_EGRESS_POLICY:-0}" != 1 ]] || commercial_policy_remote_owner || return 86
   systemctl enable "$new_sock" "$new_svc" >/dev/null 2>&1 || true
   wait_shared_port || die "shared port not reachable after closing slot ${cur:-none}"
   assert_no_orphan_listener
@@ -280,6 +282,14 @@ cmd_converge() {
     othercwd="$(readlink -f "/proc/$otherpid/cwd")" || return 79
     [[ "$othercwd" == "$before" ]] || return 79
   elif [[ "$otherpid" != 0 ]]; then return 79; fi
+  commercial_policy_remote_owner || return 86
+  # Persist the healthy target before disabling its predecessor, including half-finished flips.
+  systemctl enable "$(unit "$target" socket)" "$(unit "$target" service)" >/dev/null || return 79
+  local enabled kind
+  for kind in socket service; do
+    enabled="$(systemctl is-enabled "$(unit "$target" "$kind")")" || return 79
+    [[ "$enabled" == enabled ]] || return 79
+  done
   commercial_policy_remote_owner || return 86
   systemctl stop --job-mode=ignore-dependencies "$(unit "$other" socket)" || return 79
   if [[ "$otherpid" != 0 ]]; then systemctl stop --no-block "$(unit "$other" service)" || return 79; fi

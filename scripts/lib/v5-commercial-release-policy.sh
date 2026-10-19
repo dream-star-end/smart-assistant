@@ -160,7 +160,16 @@ commercial_policy_resume_egress() {
   case "$selection" in
     target\ *) : ;;
     before\ *) activate_egress_release "$rel" "$before" || return $? ;;
-    unavailable) egress_slots_remote flip "$EGRESS_SLOT_PREDRAIN_SEC" || return $? ;;
+    unavailable)
+      local forward_rc=0
+      egress_slots_remote restore "$EGRESS_SLOT_PREDRAIN_SEC" || forward_rc=$?
+      if [[ "$forward_rc" != 0 ]]; then
+        [[ "$forward_rc" != 86 ]] || return 86
+        # A retry must restore task service if this exact operation still has no listener.
+        commercial_policy_rmt commercial_policy_reverse_unavailable || return $?
+        commercial_policy_reverse_dead_egress "$before" || return $?
+        return 78 # old egress is usable; new master and failed context stay in place
+      fi ;;
     *) return 79 ;;
   esac
   egress_slots_remote converge "$rel" "$before" || return $?
@@ -266,14 +275,23 @@ commercial_policy_rollback() {
   echo '✓ actual user impairment recovered by original guarded N1 rollback'
 }
 commercial_policy_complete_compensation() {
-  local before target restart_egress egress_before current status direction
+  local before target restart_egress egress_before current status direction authority
   before="$(commercial_policy_rmt commercial_policy_py field before.masterRelease)" || return $?
   target="$(commercial_policy_rmt commercial_policy_py field target.masterRelease)" || return $?
   commercial_policy_rmt commercial_policy_restore_disabled_current || return $?
   commercial_policy_rmt commercial_policy_py verify before "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$ACTIVE_SRC" "$ACTIVE_UNIT" >/dev/null || return $?
-  status="$(commercial_policy_authority_status before)" || return $?
-  [[ "$status" == applied ]] || return 79
-  commercial_policy_rmt commercial_policy_compensated_history || return $?
+  status="$(commercial_policy_authority_status)" || return $?
+  if [[ "$status" == original ]]; then
+    # The original saga already restored service before state/history were committed.
+    status="$(commercial_policy_rmt commercial_policy_verified_history)" || return $?
+    [[ "$status" == missing ]] || return 79
+    authority=original
+  else
+    status="$(commercial_policy_authority_status before)" || return $?
+    [[ "$status" == applied ]] || return 79
+    commercial_policy_rmt commercial_policy_compensated_history || return $?
+    authority=reverted
+  fi
   restart_egress="$(commercial_policy_rmt commercial_policy_py field options.restartEgress)" || return $?
   if [[ "$restart_egress" == true ]]; then
     egress_before="$(commercial_policy_rmt commercial_policy_py field options.egressBefore)" || return $?
@@ -301,7 +319,7 @@ commercial_policy_complete_compensation() {
   ssh "$KL_HOST" "test ! -e '$CP_ROOT/$op.rollback-recovery'" || return 79
   BUILT_RELEASE="$before"
   commercial_policy_required_gates "$before" || return $?
-  commercial_policy_rmt commercial_policy_py resolve before reverted "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$ACTIVE_SRC" "$ACTIVE_UNIT" || return $?
+  commercial_policy_rmt commercial_policy_py resolve before "$authority" "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$ACTIVE_SRC" "$ACTIVE_UNIT" || return $?
 }
 commercial_policy_reverse_egress() {
   local COMMERCIAL_FAILURE_POLICY=""
