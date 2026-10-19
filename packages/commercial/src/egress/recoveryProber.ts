@@ -6,11 +6,13 @@
  * 上游早已恢复也永久 degraded(设计死角)。本恢复器在 provider 处于
  * health_mode='auto' 且 health_status='degraded' 期间,周期性发**真实最小推理请求**
  * (1 轮 "ping",max_tokens=512 给思考模型留头部):
- *   - 探活 2xx → 写一条 kind='final' 成功样本(model 带 `probe:` 前缀区分人工流量)
+ *   - 完整成功推理响应 → 写一条 kind='final' 成功样本(model 带 `probe:` 前缀区分人工流量)
  *     → scheduler 既有恢复数学直接接管(默认 60s 周期 + 5min 恢复窗 → 上游恢复后
  *     最迟约 5-6 分钟自动转 healthy);
  *   - 探活非 2xx / 网络错误 → **不写样本**(缺成功样本 = 不恢复,判定与写失败样本
  *     完全等价),失败细节进 egress 日志 recovery_probe_failed(status/error/model)。
+ *
+ * 鉴权只从用户流量同源的 active API-key pool 选择,不绕过管理员停用的 env 成员。
  *
  * 与 latencyProber 的口径**故意不同**:后者是 transport 语义(GET,任何 HTTP 响应都算
  * ok),不能用于恢复判定 —— 否则 ark 型 429 容量错误会被 transport 探活误判恢复,造成
@@ -37,50 +39,47 @@
  *      OC_PROVIDER_HEALTH_RECOVERY_PROBE_INTERVAL_MS 调周期(缺省 60s,夹 [15s, 1h])。
  */
 
-import { randomUUID } from "node:crypto";
-import { request } from "undici";
-import {
-  STATIC_KEY_PROVIDERS,
-  type StaticKeyProviderSpec,
-  type StaticProviderKeys,
-} from "@openclaude/protocol";
-import { STATIC_PROVIDER_META } from "../http/proxy/staticProviderMeta.js";
-import { directEgressDispatcher } from "../account-pool/egressDispatcher.js";
-import { query as _query } from "../db/queries.js";
-import { recordProviderProbeSuccess as _recordSuccess } from "../http/proxy/providerHealthSink.js";
+import { randomUUID } from 'node:crypto'
+import { STATIC_KEY_PROVIDERS, type StaticKeyProviderSpec } from '@openclaude/protocol'
+import { request } from 'undici'
+import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
+import { query as _query } from '../db/queries.js'
+import { recordProviderProbeSuccess as _recordSuccess } from '../http/proxy/providerHealthSink.js'
+import { STATIC_PROVIDER_META } from '../http/proxy/staticProviderMeta.js'
 
-const PROBE_TIMEOUT_MS = 30_000;
-const PROBE_MAX_TOKENS = 512;
+const PROBE_TIMEOUT_MS = 30_000
+const PROBE_MAX_TOKENS = 512
+const PROBE_MAX_BODY_BYTES = 256 * 1024
 
 export interface RecoveryProbeResult {
-  ok: boolean;
-  statusCode: number | null;
-  error: string | null;
+  ok: boolean
+  statusCode: number | null
+  error: string | null
   /** 终态探活实际使用的上游 model 字面量(成功时写样本 model 列,供 admin 观察)。 */
-  model: string;
+  model: string
 }
 
 export interface RecoveryProberHandle {
-  stop(): void;
+  stop(): void
   /** 手动跑一轮(测试/运维用);上轮未结束时复用同一 in-flight promise。 */
-  runNow(): Promise<void>;
+  runNow(): Promise<void>
 }
 
 export type RecoveryProbeRequest = (
   spec: StaticKeyProviderSpec,
   key: string,
-) => Promise<RecoveryProbeResult>;
+) => Promise<RecoveryProbeResult>
 
 interface RecoveryProberDeps {
-  query?: typeof _query;
-  probeRequest?: RecoveryProbeRequest;
+  query?: typeof _query
+  probeRequest?: RecoveryProbeRequest
   /** 只记成功样本;失败由日志承载(缺成功样本=不恢复,判定等价)。 */
-  recordSuccess?: (providerId: string, model: string) => void;
+  recordSuccess?: (providerId: string, model: string) => void
 }
 
 function probeCandidates(spec: StaticKeyProviderSpec): string[] {
-  const rewritten = spec.inboundModelIds.map((m) => spec.upstreamModelForRequest?.(m) ?? m);
-  return [...new Set(rewritten)];
+  const rewritten = spec.inboundModelIds.map((m) => spec.upstreamModelForRequest?.(m) ?? m)
+  return [...new Set(rewritten)]
 }
 
 /**
@@ -94,144 +93,210 @@ export function buildRecoveryProbeHeaders(
   key: string,
 ): Record<string, string> {
   const headers: Record<string, string> = {
-    "content-type": "application/json",
-    "anthropic-version": "2023-06-01",
-  };
-  if (spec.authScheme === "x-api-key") headers["x-api-key"] = key;
-  else headers.authorization = `Bearer ${key}`;
-  if (spec.sessionIdHeader) headers[spec.sessionIdHeader] = randomUUID();
-  return headers;
+    'content-type': 'application/json',
+    'anthropic-version': '2023-06-01',
+  }
+  if (spec.authScheme === 'x-api-key') headers['x-api-key'] = key
+  else headers.authorization = `Bearer ${key}`
+  if (spec.sessionIdHeader) headers[spec.sessionIdHeader] = randomUUID()
+  return headers
 }
 
-async function defaultProbeRequest(
+/** Accept only a complete non-streaming Messages inference result, never an HTTP-only success. */
+function completedInference(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const message = value as Record<string, unknown>
+  if (message.error != null || message.type !== 'message' || message.role !== 'assistant')
+    return false
+  if (!['end_turn', 'max_tokens', 'stop_sequence'].includes(String(message.stop_reason)))
+    return false
+  const usage = message.usage as Record<string, unknown> | undefined
+  if (
+    !usage ||
+    !Number.isSafeInteger(usage.input_tokens) ||
+    Number(usage.input_tokens) < 0 ||
+    !Number.isSafeInteger(usage.output_tokens) ||
+    Number(usage.output_tokens) <= 0
+  )
+    return false
+  return (
+    Array.isArray(message.content) &&
+    message.content.length > 0 &&
+    message.content.every((block: unknown) => {
+      if (!block || typeof block !== 'object' || Array.isArray(block)) return false
+      const b = block as Record<string, unknown>
+      const text =
+        b.type === 'text'
+          ? b.text
+          : b.type === 'thinking'
+            ? b.thinking
+            : b.type === 'redacted_thinking'
+              ? b.data
+              : undefined
+      return typeof text === 'string' && text.trim().length > 0
+    })
+  )
+}
+
+export async function requestRecoveryProbe(
   spec: StaticKeyProviderSpec,
   key: string,
+  send: typeof request = request,
 ): Promise<RecoveryProbeResult> {
-  const meta = STATIC_PROVIDER_META[spec.id];
-  const dispatcher = meta.egress === "direct" ? directEgressDispatcher() : undefined;
-  const headers = buildRecoveryProbeHeaders(spec, key);
+  const meta = STATIC_PROVIDER_META[spec.id]
+  const dispatcher = meta.egress === 'direct' ? directEgressDispatcher() : undefined
+  const headers = buildRecoveryProbeHeaders(spec, key)
 
-  let statusCode: number | null = null;
-  let error: string | null = null;
-  let model = "";
+  let statusCode: number | null = null
+  const error: string | null = null
+  let model = ''
   for (const candidate of probeCandidates(spec)) {
-    model = candidate;
+    model = candidate
     try {
-      const res = await request(spec.upstreamEndpoint, {
-        method: "POST",
+      const res = await send(spec.upstreamEndpoint, {
+        method: 'POST',
         dispatcher,
         headers,
         body: JSON.stringify({
           model,
           max_tokens: PROBE_MAX_TOKENS,
-          messages: [{ role: "user", content: "ping" }],
+          messages: [{ role: 'user', content: 'ping' }],
         }),
         headersTimeout: PROBE_TIMEOUT_MS,
         bodyTimeout: PROBE_TIMEOUT_MS,
-      });
-      statusCode = res.statusCode;
-      await res.body.dump().catch(() => {});
-      // 真实推理成功(2xx)才背书恢复;401/429/5xx 直接定性失败;400/404 可能只是该
-      // model 字面量退役 → 换下一个候选。
+      })
+      statusCode = res.statusCode
+      const chunks: Buffer[] = []
+      let bytes = 0
+      try {
+        for await (const chunk of res.body) {
+          const data = Buffer.from(chunk)
+          bytes += data.length
+          if (bytes > PROBE_MAX_BODY_BYTES) {
+            res.body.destroy()
+            return { ok: false, statusCode, error: 'probe_response_too_large', model }
+          }
+          chunks.push(data)
+        }
+      } catch {
+        res.body.destroy()
+        return { ok: false, statusCode, error: 'probe_response_read_failed', model }
+      }
+      // A 2xx status alone can conceal an error envelope or a truncated inference.
       if (res.statusCode >= 200 && res.statusCode < 300) {
-        return { ok: true, statusCode, error: null, model };
+        let value: unknown
+        try {
+          value = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+        } catch {
+          /* invalid inference */
+        }
+        const ok = completedInference(value)
+        return { ok, statusCode, error: ok ? null : 'probe_response_invalid', model }
       }
       if (res.statusCode !== 400 && res.statusCode !== 404) {
-        return { ok: false, statusCode, error, model };
+        return { ok: false, statusCode, error, model }
       }
-    } catch (err) {
-      error = String((err as Error)?.message ?? err).slice(0, 200);
-      return { ok: false, statusCode: null, error, model };
+    } catch {
+      // Never put response text, credentials, or transport exception messages in logs.
+      return { ok: false, statusCode: null, error: 'probe_transport_failed', model }
     }
   }
-  return { ok: false, statusCode, error, model };
+  return { ok: false, statusCode, error, model }
 }
 
-export function startRecoveryProber(
-  opts: {
-    staticProviderKeys: StaticProviderKeys;
-    log: {
-      info: (msg: string, extra?: Record<string, unknown>) => void;
-      warn: (msg: string, extra?: Record<string, unknown>) => void;
-    };
-    _deps?: RecoveryProberDeps;
-  },
-): RecoveryProberHandle | null {
-  if (process.env.OC_PROVIDER_HEALTH_RECOVERY_PROBE_DISABLED === "1") {
-    opts.log.info("recovery_prober_disabled");
-    return null;
+export function startRecoveryProber(opts: {
+  /** Same eligible pool as user traffic; no raw-env fallback for disabled/absent members. */
+  resolveKey: (providerId: string) => Promise<string | null>
+  log: {
+    info: (msg: string, extra?: Record<string, unknown>) => void
+    warn: (msg: string, extra?: Record<string, unknown>) => void
   }
-  const raw = Number(process.env.OC_PROVIDER_HEALTH_RECOVERY_PROBE_INTERVAL_MS ?? 60_000);
+  _deps?: RecoveryProberDeps
+}): RecoveryProberHandle | null {
+  if (process.env.OC_PROVIDER_HEALTH_RECOVERY_PROBE_DISABLED === '1') {
+    opts.log.info('recovery_prober_disabled')
+    return null
+  }
+  const raw = Number(process.env.OC_PROVIDER_HEALTH_RECOVERY_PROBE_INTERVAL_MS ?? 60_000)
   const intervalMs = Math.min(
     Math.max(Number.isFinite(raw) && raw > 0 ? raw : 60_000, 15_000),
     3_600_000,
-  );
+  )
 
-  const q = opts._deps?.query ?? _query;
-  const probeRequest = opts._deps?.probeRequest ?? defaultProbeRequest;
-  const recordSuccess = opts._deps?.recordSuccess ?? _recordSuccess;
-  const log = opts.log;
+  const q = opts._deps?.query ?? _query
+  const probeRequest = opts._deps?.probeRequest ?? requestRecoveryProbe
+  const recordSuccess = opts._deps?.recordSuccess ?? _recordSuccess
+  const log = opts.log
 
-  const byId = new Map<string, StaticKeyProviderSpec>(
-    STATIC_KEY_PROVIDERS.map((p) => [p.id, p]),
-  );
+  const byId = new Map<string, StaticKeyProviderSpec>(STATIC_KEY_PROVIDERS.map((p) => [p.id, p]))
 
-  let stopped = false;
-  let inflight: Promise<void> | null = null;
+  let stopped = false
+  let inflight: Promise<void> | null = null
 
   async function runTick(): Promise<void> {
     const r = await q<{ provider_id: string; health_status: string | null; health_mode: string }>(
-      "SELECT provider_id, health_status, health_mode FROM provider_ops",
-    );
+      'SELECT provider_id, health_status, health_mode FROM provider_ops',
+    )
     for (const row of r.rows) {
-      if (stopped) return;
+      if (stopped) return
       // 过滤在代码而非 SQL:单测可注入任意 ops 行;全表 ≤9 行,无谓再压查询。
-      if (row.health_mode !== "auto" || row.health_status !== "degraded") continue;
-      const spec = byId.get(row.provider_id);
-      if (!spec) continue; // 非静态 provider(account-pool 体系)不在本系统治理面
-      const key = opts.staticProviderKeys[spec.id];
-      if (!key) continue; // 缺 key 无法探活:保持降级(与 proxy not_configured 拒绝口径一致)
-      const res = await probeRequest(spec, key);
+      if (row.health_mode !== 'auto' || row.health_status !== 'degraded') continue
+      const spec = byId.get(row.provider_id)
+      if (!spec) continue // 非静态 provider(account-pool 体系)不在本系统治理面
+      let key: string | null
+      try {
+        key = await opts.resolveKey(spec.id)
+      } catch {
+        log.warn('recovery_probe_key_unavailable', { provider: spec.id })
+        continue
+      }
+      if (stopped) return
+      if (!key) continue
+      const res = await probeRequest(spec, key)
       if (res.ok) {
-        recordSuccess(spec.id, res.model);
-        log.info("recovery_probe_ok", { provider: spec.id, status: res.statusCode, model: res.model });
+        recordSuccess(spec.id, res.model)
+        log.info('recovery_probe_ok', {
+          provider: spec.id,
+          status: res.statusCode,
+          model: res.model,
+        })
       } else {
-        log.warn("recovery_probe_failed", {
+        log.warn('recovery_probe_failed', {
           provider: spec.id,
           status: res.statusCode,
           error: res.error,
           model: res.model,
-        });
+        })
       }
     }
   }
 
   function scheduleTick(): Promise<void> {
-    if (inflight) return inflight; // in-flight guard:极端超时一轮可 9×30s,防 tick 重叠
+    if (inflight) return inflight // in-flight guard:极端超时一轮可 9×30s,防 tick 重叠
     inflight = runTick()
       .catch((err: unknown) => {
-        log.warn("recovery_prober_tick_failed", {
+        log.warn('recovery_prober_tick_failed', {
           err: String((err as Error)?.message ?? err),
-        });
+        })
       })
       .finally(() => {
-        inflight = null;
-      });
-    return inflight;
+        inflight = null
+      })
+    return inflight
   }
 
   const timer = setInterval(() => {
-    if (!stopped) void scheduleTick();
-  }, intervalMs);
-  timer.unref?.();
-  void scheduleTick(); // runOnStart:部署后处于降级中的 provider 立即开始积累恢复证据
+    if (!stopped) void scheduleTick()
+  }, intervalMs)
+  timer.unref?.()
+  void scheduleTick() // runOnStart:部署后处于降级中的 provider 立即开始积累恢复证据
 
-  log.info("recovery_prober_started", { intervalMs, providers: STATIC_KEY_PROVIDERS.length });
+  log.info('recovery_prober_started', { intervalMs, providers: STATIC_KEY_PROVIDERS.length })
   return {
     stop() {
-      stopped = true;
-      clearInterval(timer);
+      stopped = true
+      clearInterval(timer)
     },
     runNow: scheduleTick,
-  };
+  }
 }

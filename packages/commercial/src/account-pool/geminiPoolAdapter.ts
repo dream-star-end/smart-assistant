@@ -12,7 +12,8 @@ import {
   type AntigravityOAuthDeps,
 } from './antigravityOAuth.js'
 import { query } from '../db/queries.js'
-import { antigravityAccountQuota, type AntigravityQuotaDeps } from './antigravityQuota.js'
+import { ANTIGRAVITY_QUOTA_TTL_MS, antigravityAccountQuota, type AntigravityQuotaDeps } from './antigravityQuota.js'
+import { isAntigravityUltra } from './antigravityPool.js'
 import type { CooldownReason } from './policy/outcome.js'
 import type { DueProbe, PoolAdapter, PoolMemberView, ProbeResult } from './policy/registry.js'
 import {
@@ -32,10 +33,27 @@ export interface GeminiPoolAdapterDeps {
 
 export function createGeminiPoolAdapter(deps: GeminiPoolAdapterDeps): PoolAdapter {
   const freshToken = deps.freshToken ?? ((id, oauth) => getFreshAntigravityAccessToken(id, oauth))
+  const quotaDeps: AntigravityQuotaDeps = { clientSecret: deps.clientSecret }
+  const readQuota = deps.quota ?? ((id: string) => antigravityAccountQuota(id, quotaDeps))
+  let refreshAt = 0
+  let refreshing = false
+  const refreshMetadata = async (): Promise<void> => {
+    if (refreshing || Date.now() < refreshAt || !deps.clientSecret()) return
+    refreshing = true
+    refreshAt = Date.now() + ANTIGRAVITY_QUOTA_TTL_MS
+    try {
+      const rows = await query<{ id: string }>('SELECT id::text AS id FROM gemini_oauth_accounts WHERE disabled_by IS NULL ORDER BY id')
+      for (const row of rows.rows) await readQuota(row.id)
+    } finally { refreshing = false }
+  }
   return {
     name: 'gemini-oauth',
     memberKind: 'account',
-    halfOpenDue: () => halfOpenTableMembers(GEMINI_OAUTH_MEMBERS),
+    halfOpenDue: () => {
+      // Reuse the one recovery actor's timer; never put metadata HTTP on the chat path.
+      void refreshMetadata().catch(() => {})
+      return halfOpenTableMembers(GEMINI_OAUTH_MEMBERS)
+    },
     listDueProbes: (limit: number): Promise<DueProbe[]> => listDueTableProbes(GEMINI_OAUTH_MEMBERS, limit),
     async probe(m: DueProbe): Promise<ProbeResult> {
       const clientSecret = deps.clientSecret()
@@ -57,6 +75,8 @@ export function createGeminiPoolAdapter(deps: GeminiPoolAdapterDeps): PoolAdapte
     async listMembers(): Promise<PoolMemberView[]> {
       const res = await query<{
         id: string
+        paid_tier: string | null
+        tier_updated_at: Date | null
         label: string
         email: string
         status: string
@@ -68,12 +88,10 @@ export function createGeminiPoolAdapter(deps: GeminiPoolAdapterDeps): PoolAdapte
         last_error: string | null
         last_used_at: Date | null
       }>(
-        `SELECT id::text AS id, label, email, status, disabled_by, health_score, cooldown_reason, cooldown_until,
+        `SELECT id::text AS id, paid_tier, tier_updated_at, label, email, status, disabled_by, health_score, cooldown_reason, cooldown_until,
                 next_probe_at, last_error, last_used_at
            FROM gemini_oauth_accounts ORDER BY id`,
       )
-      const quotaDeps: AntigravityQuotaDeps = { clientSecret: deps.clientSecret }
-      const readQuota = deps.quota ?? ((id: string) => antigravityAccountQuota(id, quotaDeps))
       const quotas = await Promise.all(res.rows.map((r) => readQuota(r.id)))
       return res.rows.map((r, i) => ({
         service: 'gemini',
@@ -89,7 +107,7 @@ export function createGeminiPoolAdapter(deps: GeminiPoolAdapterDeps): PoolAdapte
         nextProbeAt: r.next_probe_at?.toISOString() ?? null,
         lastError: r.last_error ? r.last_error.slice(0, 160) : null,
         lastUsedAt: r.last_used_at?.toISOString() ?? null,
-        hints: { plan: 'Antigravity', name: r.label !== r.email ? r.label : null, manage: 'antigravity' },
+        hints: { plan: isAntigravityUltra(r.paid_tier) ? 'Google AI Ultra (Antigravity)' : r.paid_tier === 'g1-pro-tier' ? 'Google AI Pro (Antigravity)' : 'Antigravity · 等级未知', paid_tier: r.paid_tier, tier_updated_at: r.tier_updated_at?.toISOString() ?? null, name: r.label !== r.email ? r.label : null, manage: 'antigravity' },
         quota: quotas[i],
       }))
     },
