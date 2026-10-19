@@ -7907,10 +7907,16 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-ccb-mcp-availability.ts",
           "assertion": "[ocv5-510-codex-web-search-cli] PASS — the real CLI restores container identity and returns a sourced result through MiniMax then Grok"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ocWebSearch.test.ts",
+          "assertion": "search keeps Grok source-only URLs after MiniMax failure"
         }
       ],
       "coverageCommits": [
-        "71a9e763"
+        "71a9e763",
+        "18c38333"
       ]
     },
     {
