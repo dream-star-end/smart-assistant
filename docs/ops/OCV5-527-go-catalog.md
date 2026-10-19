@@ -31,7 +31,7 @@
 | opencode-grok-4.6 | active / x1.000 | disabled（倍率保留） | 同系列已有更新版本 |
 | opencode-grok-4.7 | active / x1.000 | disabled（倍率保留） | 其它路线已提供同模型：grok-build / grok；另有cursor同版本各档位 |
 | qwen3.7-plus-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
-| muse-spark-1.3-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
+| qwen3.8-flash-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
 | qwen3.8-max-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
 | space-bunny-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
 | step-5-preview-free-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
