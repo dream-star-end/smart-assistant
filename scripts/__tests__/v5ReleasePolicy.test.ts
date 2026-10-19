@@ -67,3 +67,16 @@ test('actual failed cleanup resumes through receipt, reader and ride settlement'
   assert.match(out, /PASS phase-repair-failure-holds witness=/)
   assert.match(out, /PASS total=2 failed=0/)
 })
+
+
+test('actual runtime history readers drain large files and preserve upstream failures (5 tests)', () => {
+  const r = spawnSync('python3', [path.join(here, 'v5RuntimeHistoryDrain.test.py')], {
+    encoding: 'utf8', env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
+  })
+  const out = r.stdout + r.stderr
+  assert.equal(r.status, 0, out)
+  assert.match(out, /Ran 5 tests/)
+  assert.match(out, /test_large_last_and_nth_drain_without_revalidating_older_rows/)
+  assert.match(out, /\bOK\b/)
+  console.log(out.trim())
+})
