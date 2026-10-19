@@ -7068,12 +7068,13 @@
       "id": "INC-20261015-PRESTART-STOP-LOST",
       "occurredAt": "2026-10-15",
       "severity": "P2",
-      "symptom": "个人版 GPT-6-Astra 会话（webmv9omkexy7xfyl）发出消息 4 秒后浏览器发停止，此时引擎冷启动尚未起来（11 秒），网关按 clientMessageId 找不到运行中的 turn，回 TURN_NOT_ACTIVE，master 把停止记为终态；turn 随后照常启动，Codex 调 request_user_input 提问，会话快照因该轮有停止把提问投影成 cancelled/user_stop，前端加载后把卡片判为已结束不显示，网关补推被僵尸卡守卫丢弃；引擎一直 waiting_for_user，第二条消息被堵（OCV5-435；真聊复现 g435amv9pv5fh 发出后 250ms 点停止；canary 合同在修复前 5/5 红：停止回 TURN_NOT_ACTIVE、该轮按 turn_completed 落账）。修复：网关从 ws 受理到 turn 结束跟踪本轮，引擎未起时到达的停止登记精确的启动前停止围栏并回 applied，引擎 run 创建即按用户停止收尾（interrupted / USER_CANCELLED）；精确命中但终态持久化尚未建立的停止同样登记围栏；抢在消息之前到达的停止仍回 TURN_NOT_ACTIVE，但登记 30 秒短围栏，消息一到即停。",
+      "symptom": "个人版 GPT-6-Astra 会话（webmv9omkexy7xfyl）发出消息 4 秒后浏览器发停止，此时引擎冷启动尚未起来（11 秒），网关按 clientMessageId 找不到运行中的 turn，回 TURN_NOT_ACTIVE，master 把停止记为终态；turn 随后照常启动，Codex 调 request_user_input 提问，会话快照因该轮有停止把提问投影成 cancelled/user_stop，前端加载后把卡片判为已结束不显示，网关补推被僵尸卡守卫丢弃；引擎一直 waiting_for_user，第二条消息被堵（OCV5-435；真聊复现 g435amv9pv5fh 发出后 250ms 点停止；canary 合同在修复前 5/5 红：停止回 TURN_NOT_ACTIVE、该轮按 turn_completed 落账）。修复：网关从 ws 受理到 turn 结束跟踪本轮，引擎未起时到达的停止登记精确的启动前停止围栏并回 applied，引擎 run 创建即按用户停止收尾（interrupted / USER_CANCELLED）；精确命中但终态持久化尚未建立的停止同样登记围栏；抢在消息之前到达的停止仍回 TURN_NOT_ACTIVE，但登记 30 秒短围栏，消息一到即停。 OCV5-522 发布验收补齐同一启动前Stop链的计费收尾：同步围栏先置interrupting而微任务未绑定billing owner，真实取消result进入parser却丢计费帧，留下durable inflight。修复在提交前同步绑定计费归属并拒绝跨RID迟到result；保留真实终态及usage，未合成免单。",
       "rootFixCommit": "b2d263c9",
       "coverageCommits": [
         "44e04ac6",
         "693212d9",
-        "74b6c0c2"
+        "74b6c0c2",
+        "c8743712"
       ],
       "regressions": [
         {
@@ -7115,6 +7116,26 @@
           "layer": "deploy-gate",
           "path": "scripts/v5-stop-before-start-contract.mjs",
           "assertion": "S1 Stop sent while the engine starts ends the turn before the model answers"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "OCV5-522: same-stack Stop before engine start retains exactly one owned terminal billing"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "OCV5-522: a synchronous kernel result has billing ownership before submit returns"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "OCV5-522: a stale result from A cannot bill or finish the routed turn B"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "OCV5-522: a genuine success racing Stop retains its actual positive usage"
         }
       ]
     },
