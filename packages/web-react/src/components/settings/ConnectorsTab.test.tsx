@@ -3036,7 +3036,7 @@ test('文献市场回跳不将已保存但runtime未启用的账号误报为登�
   mockedGetConnectors.mockResolvedValue(catalog())
   mockedPluginManagement.mockResolvedValue({
     catalog: [{ ...knowledgePlanetPlugin(), slug: 'literature-db', label: '文献数据库', actions: [{ id: 'search', description: '检索文献', readOnly: true }] }],
-    accounts: [{ id: '9524', provider: 'literature-db', displayName: '文献数据库', accountHint: '', status: 'active', versionId: '101', revision: 1, executable: false, writeControl: null } as RuntimePluginAccount],
+    accounts: [{ id: '9524', provider: 'literature-db', pluginType: 'managed-browser', actions: [], displayName: '文献数据库', accountHint: '', status: 'active', versionId: '101', executable: false, writeControl: null } satisfies RuntimePluginAccount],
   })
   render(<ConnectorsTab auth={auth} autoAuthorizePluginSlug="literature-db" onAutoAuthorizeConsumed={() => {}} />)
   expect(await screen.findByText('文献数据库登录已保存，检索暂未启用。')).toBeInTheDocument()
