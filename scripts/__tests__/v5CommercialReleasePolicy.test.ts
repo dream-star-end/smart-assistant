@@ -19,9 +19,19 @@ test('real shared saga precise red and green faults',()=>{
   assert.match(run('bash','v5-release-policy-red-drill.sh'), /POLICY_RED_GREEN ablated=1 actual=0 faultHits=1:1/)
 })
 test('commercial data adapter and actual outer paths',()=>{
-  assert.match(run('python3','v5CommercialReleasePolicy.test.py'), /Ran 24 tests/)
+  const output = run('python3','v5CommercialReleasePolicy.test.py')
+  assert.match(output, /Ran 25 tests/)
+  assert.match(output, /test_actual_keep_failed_reopens_only_weibo_gate_closed_by_this_deploy .*ok/)
+  console.log(output.trim())
 })
 
 test('real commercial egress exact convergence and outage restoration',()=>{
   assert.match(run('python3','v5CommercialEgressRecovery.test.py'), /Ran 9 tests/)
+})
+
+test('actual history readers drain large input and preserve read and append failures',()=>{
+  const output = run('python3','v5RuntimeHistoryDrain.test.py')
+  assert.match(output, /Ran 5 tests/)
+  assert.match(output, /test_large_last_and_nth_drain_without_revalidating_older_rows .*ok/)
+  console.log(output.trim())
 })
