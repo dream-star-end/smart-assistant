@@ -85,7 +85,7 @@ import {
 import { PermissionToolReopenContext, ToolCardSlot } from "./chat/toolCardSlot";
 import { reopenPermissionUi } from "../lib/chat/permissionPopupCoordinator";
 import { TurnActivity, type TurnActivityInfo } from "./chat/TurnActivity";
-import { currentTurnStartIndex, splitStoppedNarration, turnFinalAssistantFlags, turnRatingFlags, turnRecoveryParents } from "./chat/turnSegment";
+import { currentTurnStartIndex, projectVisibleAssistantRows, splitStoppedNarration, turnFinalAssistantFlags, turnRatingFlags, turnRecoveryParents } from "./chat/turnSegment";
 import {
   captureVisibleVirtualRowAnchor,
   correctedScrollTop,
@@ -2170,7 +2170,8 @@ export function MessageList({
   // OCV5-313: view-only — rows of an earlier finished turn that a refresh merge left under a later
   // user go back to their own turn before grouping, so they never fold into the newest 处理过程.
   // OCV5-459: a Stop stamped on mid-turn narration splits into that narration (a step) and the stop row.
-  const renderableMessages = splitStoppedNarration(returnStrayRowsToOwnerTurn(safeMessages.filter(
+  const turnLineageParents = turnRecoveryParents(safeMessages);
+  const renderableMessages = projectVisibleAssistantRows(splitStoppedNarration(returnStrayRowsToOwnerTurn(safeMessages.filter(
     (m) =>
       !(m as ChatMessage & { _historyProjection?: unknown })._historyProjection &&
       typeof m.id === "string" &&
@@ -2194,7 +2195,7 @@ export function MessageList({
       !isRedundantRuntimeEnvelope(m) &&
       !isTurnStatusSuppressedByTape(m, resolvedDispatchTurnIds) &&
       !isErrorCardSupersededByTurnStatus(m, statusRecordTurnIds),
-  )));
+  ))), turnLineageParents);
   const visibleUserIds = new Set(
     renderableMessages
       .filter((message) => message.role === "user")
@@ -2203,7 +2204,6 @@ export function MessageList({
   // OCV5-390: lineage for the turn's single answer / action row (turnSegment). The control user rows that
   // link a recovery or 从断点继续 child to its source are filtered out of the rendered list, so it is taken
   // from the full list here, keyed by both the row id and its client message id (they can differ).
-  const turnLineageParents = turnRecoveryParents(safeMessages);
   const recoveryParents = new Map(
     safeMessages
       .filter(
