@@ -22,3 +22,8 @@
 parse5/tough-cookie已显式加入commercial runtime依赖，锁定现有8.0.1/6.0.1及原有传递版本；没有借dev依赖冒充生产可用，也未修改无关web包锁项。未来正常发布staging npm ci处理依赖，本轮未部署。
 
 真实公开页（2026-10-19）使用<table><form>旧布局，parse5修复树后form为空、控件都不在其后代。解析器因此使用固定8.0.1 Parser的实际form指针，在节点插入时记录input/img归属；不扫描全页猜关联。真实关闭标签之后的控件、template和script/comment伪标签不会并入；本站未观察到的显式form=覆盖先拒绝。这一小适配依赖parse5 internal API，升级必须过旧布局/关闭边界回归。公开GET解析成功也不是登录成功或市场可用证明。
+
+
+`platformUsage.ts`提供平台费用专用Postgres begin/finish sink：所有本地校验/选key通过后，必须先COMMIT新的reservation才准一次fetch。同IDbegin重复拒绝；全局500/用户20次UTC日上限，同用户operation最多4次全生命周期（受信服务配置，可收紧）。未知、拒绝、取消和进程崩溃均占额度，不自动退款；六分量usage未知留NULL，不能视为零成本。finish校验owner/operation/provider/model，完全相同重放幂等，冲突不覆盖。删除用户仅匿名保留global计数，解绑/卸载也不能退额度。未声称全局并发限制、token硬额度或精确货币账单；没有任何用户钱包/ledger调用。
+
+新增0313迁移与空表rollback仅供评审，未apply生产。rollback拒绝丢弃已存在的用量；先停服务并保留审计历史才可另行批准清理。个人0310–0312已占，未来商业apply必须先解决小号合并/迁移顺序。本批仍没有已鉴权setup/runtime入口创建这个meter，尚未配置政策批准路由，也没有付费模型调用。refusal仍立即锁存，异步finish失败时reservation留unknown；不冒充完整供应商用量durable消息队列。

@@ -9,6 +9,7 @@ import {
   type OfficialCaptchaBinding,
   type OfficialCaptchaDependencies,
   type OfficialCaptchaRoute,
+  type PlatformCaptchaBegin,
   type PlatformCaptchaUsage,
   createCatalogCaptchaResolver,
   createOfficialCaptchaReader,
@@ -70,6 +71,7 @@ function fixture(config = binding()) {
     response(config.provider === 'anthropic' ? claude() : gemini())
   const calls: { input: string; init: RequestInit }[] = []
   const events: Readonly<PlatformCaptchaUsage>[] = []
+  const begun: Readonly<PlatformCaptchaBegin>[] = []
   const keys: string[] = []
   const health: { member: string; outcome: PoolOutcome }[] = []
   const deps: OfficialCaptchaDependencies = {
@@ -82,10 +84,14 @@ function fixture(config = binding()) {
     reportOutcome: async (member, outcome) => {
       health.push({ member, outcome })
     },
+    beginPlatformUsage: async (event) => {
+      begun.push(event)
+    },
     recordPlatformUsage: async (event) => {
       events.push(event)
     },
     fetchImpl: async (input, init) => {
+      assert.equal(begun.length, calls.length + 1, 'admission must commit before fetch')
       calls.push({ input: String(input), init: init! })
       return handler(input, init)
     },
@@ -95,6 +101,7 @@ function fixture(config = binding()) {
     deps,
     calls,
     events,
+    begun,
     keys,
     health,
     route: (value: OfficialCaptchaRoute | null) => {
@@ -142,6 +149,10 @@ test('Claude official request uses only fixed image protocol and the platform AP
     totalTokens: 19,
   })
   assert.notEqual(f.events[0].requestId, f.events[1].requestId)
+  assert.deepEqual(
+    f.events.map((e) => e.requestId),
+    f.begun.map((e) => e.requestId),
+  )
   assert(!JSON.stringify(f.events).includes('1234'))
   assert(!JSON.stringify(f.events).includes('synthetic-fixture-api-key'))
 })
@@ -425,6 +436,7 @@ test('HTTP rate limits report pool health once and never replay a paid request',
 test('meter failure prevents success and dependency class methods retain their receiver', async () => {
   const f = fixture()
   class Dependencies implements OfficialCaptchaDependencies {
+    beginPlatformUsage = f.deps.beginPlatformUsage
     resolveRoute = f.deps.resolveRoute
     selectKey = f.deps.selectKey
     reportOutcome = f.deps.reportOutcome
@@ -446,6 +458,9 @@ test('prototype dependency methods never fall through to a real pool or fetch', 
   const f = fixture()
   class Dependencies implements OfficialCaptchaDependencies {
     calls = 0
+    async beginPlatformUsage() {
+      this.calls++
+    }
     async resolveRoute() {
       this.calls++
       return {
@@ -477,7 +492,7 @@ test('prototype dependency methods never fall through to a real pool or fetch', 
     ),
     '1234',
   )
-  assert.equal(deps.calls, 5)
+  assert.equal(deps.calls, 6)
   assert.equal(f.calls.length, 0)
 })
 
@@ -512,4 +527,41 @@ test('rejecting a non-JSON response immediately cancels an unfinished response b
   assert.equal(cancelled, 1)
   assert.equal(f.events[0].outcome, 'invalid')
   assert.equal(f.calls.length, 1)
+})
+
+test('failed durable admission prevents any provider request or health report', async () => {
+  const f = fixture()
+  f.deps.beginPlatformUsage = async () => {
+    throw new LiteratureError('RATE_LIMITED')
+  }
+  await assert.rejects(f.reader().recognize(await request()), code('MODEL_UNAVAILABLE'))
+  assert.equal(f.calls.length, 0)
+  assert.equal(f.events.length, 0)
+  assert.equal(f.health.length, 0)
+})
+
+test('cancellation while admission commits late never dispatches a provider request', async () => {
+  const f = fixture()
+  const controller = new AbortController()
+  let release!: () => void
+  let entered!: () => void
+  const enteredPromise = new Promise<void>((resolve) => {
+    entered = resolve
+  })
+  f.deps.beginPlatformUsage = async (event) => {
+    f.begun.push(event)
+    entered()
+    await new Promise<void>((resolve) => {
+      release = resolve
+    })
+  }
+  const pending = f.reader().recognize(await request(controller.signal))
+  await enteredPromise
+  controller.abort()
+  await assert.rejects(pending, code('CANCELLED'))
+  release()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(f.begun.length, 1)
+  assert.equal(f.calls.length, 0)
+  assert.equal(f.events.length, 0)
 })

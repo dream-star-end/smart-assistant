@@ -47,9 +47,12 @@ export interface PlatformCaptchaUsage {
   outcome: 'success' | 'refused' | 'invalid' | 'http_error' | 'network_error' | 'cancelled'
   usage: CaptchaTokenUsage | null
 }
+export type PlatformCaptchaBegin = Pick<PlatformCaptchaUsage, 'requestId' | 'provider' | 'model'>
 export interface OfficialCaptchaDependencies {
   /** Must assert catalog freshness and recheck the exact policy binding on EVERY call. */
   resolveRoute(signal: AbortSignal): Promise<OfficialCaptchaRoute | null>
+  /** Must commit a NEW platform quota reservation before any provider request. */
+  beginPlatformUsage(event: Readonly<PlatformCaptchaBegin>): Promise<void>
   /** Platform expense only. Never charge the installing user's model wallet. */
   recordPlatformUsage(event: Readonly<PlatformCaptchaUsage>): Promise<void>
   selectKey?: (service: 'claude' | 'gemini', stickyKey: string) => Promise<SelectedApiKey | null>
@@ -253,6 +256,7 @@ export function createOfficialCaptchaReader(
   const deps = {
     ...dependencies,
     resolveRoute: dependencies.resolveRoute?.bind(dependencies),
+    beginPlatformUsage: dependencies.beginPlatformUsage?.bind(dependencies),
     recordPlatformUsage: dependencies.recordPlatformUsage?.bind(dependencies),
     selectKey: dependencies.selectKey?.bind(dependencies),
     reportOutcome: dependencies.reportOutcome?.bind(dependencies),
@@ -266,6 +270,7 @@ export function createOfficialCaptchaReader(
     !modelValid(binding.provider, binding.upstreamModel, true) ||
     !/^[A-Za-z0-9_-]{1,128}$/.test(operationKey) ||
     typeof deps.resolveRoute !== 'function' ||
+    typeof deps.beginPlatformUsage !== 'function' ||
     typeof deps.recordPlatformUsage !== 'function' ||
     !Number.isInteger(timeout) ||
     timeout < 1 ||
@@ -283,6 +288,7 @@ export function createOfficialCaptchaReader(
       request.signal.addEventListener('abort', abort, { once: true })
       const timer = setTimeout(abort, timeout)
       const signal = controller.signal
+      const requestId = randomUUID()
       let selected: SelectedApiKey | null = null
       let attempted = false
       let received = false
@@ -367,6 +373,15 @@ export function createOfficialCaptchaReader(
           headers['x-api-key'] = selected.apiKey
           headers['anthropic-version'] = '2023-06-01'
         } else headers['x-goog-api-key'] = selected.apiKey
+        await stage(() =>
+          deps.beginPlatformUsage(
+            Object.freeze({
+              requestId,
+              provider: binding.provider,
+              model: binding.model,
+            }),
+          ),
+        )
         const response = await stage(() => {
           attempted = true
           return (deps.fetchImpl ?? fetch)(url, {
@@ -421,7 +436,7 @@ export function createOfficialCaptchaReader(
             .then(() => (deps.reportOutcome ?? reportApiKeyOutcome)(memberId, reportedHealth))
             .catch(() => {})
           const event = Object.freeze({
-            requestId: randomUUID(),
+            requestId,
             provider: binding.provider,
             model: binding.model,
             outcome: observedRefusal ? ('refused' as const) : outcome,
