@@ -4,7 +4,7 @@ import { getStaticProvider } from "@openclaude/protocol";
 import { scopedApiKeyPoolWiring, type ApiKeyPoolWiring } from "./apiKeyPoolWiring.js";
 import { pickUpstream, validateUpstreamConfig, type PickUpstreamDeps } from "./upstream.js";
 import { rootLogger } from "../../logging/logger.js";
-import { proveGoPoolWiring } from "../../../../../scripts/lib/goPoolWiringProof.js";
+import { proveGoPoolWiring } from "../../__tests__/goPoolWiringProof.js";
 
 const log = rootLogger.child({ subsys: "apiKeyPoolWiring.test" });
 const scheduler: PickUpstreamDeps["scheduler"] = {
