@@ -3665,6 +3665,7 @@ async function cleanUp(): Promise<void> {
 
 // [ocv5-499-pending-user] PASS — the full delegated goal and late tool announcement reach the same current stdin without changing canonical bytes or completed tool history
 // [ocv5-518-local-catalog-owner] PASS — the trusted owner reaches a cold delegate descriptor after legacy LKG upgrade while the original v1 token remains accepted
+// [ocv5-520-go-pool-wiring] PASS — ordinary Go uses an enabled pool identity instead of disabled static credentials while request bytes and session headers stay stable
 async function main(): Promise<void> {
   const expectSha = parseArgs(process.argv);
   const deadline = setTimeout(() => {

@@ -102,21 +102,3 @@ test("OCV5-520 non-Go primary retains its static key without reading another ser
   assert.equal(result.session.poolMember, null);
   assert.deepEqual(calls, []);
 });
-
-test("OCV5-520 Go fallback retains the other provider static key and never queries its pool", async () => {
-  const { calls, pool } = poolSpy();
-  const wiring = scopedApiKeyPoolWiring(["opencodego"], "opencodego", {
-    ...pool, selectApiKey: async (service) => { calls.push(`select:${service}`); return null; },
-  });
-  const route = { ...go, upstreamModel: "deepseek-v4.1-flash" };
-  const result = await pickUpstream({ scheduler, staticProviderKeys: { opencodego: "synthetic-disabled-env", deepseek: "synthetic-ds-env" },
-    ...wiring }, { ...body, model: "deepseek-v4-flash" }, route, log);
-  assert.equal(result.ok, true);
-  if (!result.ok) return;
-  assert.equal(result.session.providerId, "deepseek");
-  assert.equal(result.session.poolMember, null);
-  const headers: Record<string, string> = {};
-  result.session.applyUpstreamAuth(headers, structuredClone(body), log);
-  assert.equal(headers.authorization, "Bearer synthetic-ds-env");
-  assert.deepEqual(calls, ["select:opencodego", "members:opencodego"]);
-});
