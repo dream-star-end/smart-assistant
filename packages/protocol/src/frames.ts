@@ -1074,6 +1074,9 @@ export const OutboundError = Type.Object({
     Type.Literal('session_persist_unavailable'),
     Type.Literal('project_context_unavailable'),
   ]),
+  /** Explicit server decision for a rejection that never entered a runner
+   * and cannot schedule automatic recovery. Manual retry semantics are unchanged. */
+  recoveryDisposition: Type.Optional(Type.Literal('terminal')),
   /** 简短人类文案,前端直接渲染。 */
   message: Type.String(),
   /** 折叠区「查看详情」内容。**不下发上游原始错误串**:原文只进服务端日志;
