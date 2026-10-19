@@ -127,6 +127,12 @@ describe('0307 antigravity engine schema', () => {
         visibility: 'public',
       },
       {
+        model_id: 'antigravity-gemini-4-argon',
+        state: 'staged',
+        enabled: false,
+        visibility: 'public',
+      },
+      {
         model_id: 'antigravity-gpt-oss-120b',
         state: 'staged',
         enabled: false,
@@ -512,5 +518,17 @@ describe('OCV5-515 authoritative retirement waiver', () => {
         price_snapshot->>'antigravity_terminal_code' AS code FROM usage_records WHERE request_id=$1`, [requestId])
     assert.deepEqual(rows.rows, [{ cost: '0', status: 'error', ledger_id: null, code: 'ANTIGRAVITY_MODEL_RETIRED' }])
     assert.equal((await query('SELECT 1 FROM credit_ledger WHERE user_id=$1', [uid.toString()])).rowCount, 0)
+  })
+})
+
+
+describe('Gemini 4 Argon staged pricing (OCV5-517)', () => {
+  test('new public family stays staged with explicit medium effort and verified introductory rates', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const r=await query(`SELECT c.state,c.upstream_model_id,c.context_window,p.enabled,p.visibility,p.default_effort,
+      p.input_per_mtok::text AS input,p.output_per_mtok::text AS output,p.cache_read_per_mtok::text AS cached
+      FROM model_catalog c JOIN model_pricing p USING(model_id) WHERE c.model_id='antigravity-gemini-4-argon'`)
+    assert.deepEqual(r.rows,[{ state:'staged',upstream_model_id:'gemini-4-argon-medium',context_window:1048576,
+      enabled:false,visibility:'public',default_effort:'medium',input:'100',output:'500',cached:'5' }])
   })
 })
