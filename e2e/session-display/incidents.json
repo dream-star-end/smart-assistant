@@ -8119,6 +8119,40 @@
           "assertion": "[codex-native-identity-headers] PASS — native session and thread headers survive the relay without changing authentication or private header filtering"
         }
       ]
+    },
+    {
+      "id": "INC-20261019-RECOVERABLE-ERROR-RED-CARD",
+      "occurredAt": "2026-10-19",
+      "severity": "P1",
+      "symptom": "OCV5-523：用户16:21反馈Box错误先出红卡、随后恢复执行。个人16:20:52 problem_card/engine_error/recovered遥测；Box路线B错误后下一轮完成（不能当作同turn自动成功证据）。源码原生assistant_error直接外发，而运行器稍后才判重试；浏览器旧恢复也先画卡。修复以现有运行器终态/主控恢复任务为权威，重试只走模型繁忙正在重试活动行；确定拒绝或耗尽才红卡。",
+      "rootFixCommit": "f20d2e8109585d5a72d8c48c4b32515fcf920945",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "INC-20261019-RECOVERABLE-ERROR-RED-CARD: recovered attempts never publish an error"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "INC-20261019-RECOVERABLE-ERROR-RED-CARD: terminal failure publishes exactly one error"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "INC-20261019-RECOVERABLE-ERROR-RED-CARD: cold history waits for the durable job and exact empty snapshot releases terminal"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "INC-20261019-RECOVERABLE-ERROR-RED-CARD: timeline returns the exact active recovery without request payload"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/retry-error-ui.node-test.mjs",
+          "assertion": "INC-20261019-RECOVERABLE-ERROR-RED-CARD: real App retries stay soft and only terminal failures paint a card"
+        }
+      ]
     }
   ]
 }
