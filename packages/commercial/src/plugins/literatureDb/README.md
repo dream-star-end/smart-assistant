@@ -37,3 +37,5 @@ parse5/tough-cookie已显式加入commercial runtime依赖，锁定现有8.0.1/6
 `builtinArtifact.ts/builtinContract.ts`定义尚未上架的0.1.0固定search/download接口（有界查询、opaque文献/平台文件编号，不收发任意URL/凭据）。compiler仅完整artifact hash匹配才生成本站HTTP transport/state discriminator；复制slug/driver不够。旧artifact不生成新字段，compiler version仍1。loader还要求平台review_source及原有效签名/功能核验/未撤销条件。
 
 `accounts.ts`仅为该精确HTTP合同选择严格Cookie state，复用现有connections AEAD/AAD、bind锁/安装授权、generation/revision/CAS和撤销；原browser解密API及secure:true/HTTPS验证器保留，HTTP有专用解密器，不能走旧browser版本迁移。最终HTTP提交额外重新检查平台来源，防止审核来源在执行期间变化。此片只保存合成Cookie，不保存用户名/密码；未来真实setup需要另接凭据密文事务与会话TTL。没有市场seed、runtime driver注册、对外路由或真实身份判断，合同存在不代表可安装/可执行。integ中functionalVerified:true只指独立临时DB里的合成fixture，绝不是真实站点验收。
+
+`LiteratureLoginManager`现在只接受每operation的同步solver factory；它收到冻结的owner副本和manager内部生成的真实operationId，在session open前构造一次。一个manager仍统一执行容量/频控，不能按operation新建manager；生产factory必须用同一userId+operationId绑定所有reader与持久化meter。自动重试复用局部solver和预算，取消/绝对期限已到时不构造reader；factory失败用原清理路径释放占用。仅合成官方fetch+独立DB用例证明两个用户交错和重试归属，尚无生产setup接线。

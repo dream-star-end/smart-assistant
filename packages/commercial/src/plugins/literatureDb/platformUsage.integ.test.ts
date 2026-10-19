@@ -8,7 +8,9 @@ import { truncateAllForTest, useDedicatedTestDatabase } from '../../__tests__/he
 import { getPool } from '../../db/index.js'
 import { runMigrations } from '../../db/migrate.js'
 import { query } from '../../db/queries.js'
+import { LiteratureCaptchaSolver } from './captcha.js'
 import { LiteratureError } from './errors.js'
+import { LiteratureLoginManager } from './login.js'
 import { type PlatformCaptchaUsage, createOfficialCaptchaReader } from './officialCaptchaReader.js'
 import { PostgresPlatformCaptchaMeter } from './platformUsage.js'
 
@@ -307,4 +309,80 @@ test('migration rollback refuses retained usage and an empty-table rollback can 
   }
   await runMigrations()
   await meter().beginPlatformUsage(begin())
+})
+
+test('one manager meters interleaved tenant operations under their actual IDs across retries', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const image = {
+    data: await sharp({ create: { width: 47, height: 20, channels: 3, background: '#666666' } })
+      .png()
+      .toBuffer(),
+    mediaType: 'image/png' as const,
+  }
+  const config = {
+    provider: 'anthropic' as const,
+    model: 'claude-fixture',
+    upstreamModel: 'claude-fixture-001',
+    usageApproved: true,
+  }
+  const before = await walletSnapshot()
+  let factories = 0
+  const manager = new LiteratureLoginManager(({ owner, operationId }) => {
+    factories++
+    const m = new PostgresPlatformCaptchaMeter({ userId: owner.userId, operationKey: operationId })
+    const reader = createOfficialCaptchaReader(config, operationId, {
+      resolveRoute: async () => ({
+        ...config,
+        active: true,
+        supportsVision: true,
+        transport: 'official-api',
+      }),
+      selectKey: async () => ({
+        service: 'claude',
+        memberId: 'fixture-member',
+        apiKey: 'synthetic-fixture-api-key',
+      }),
+      beginPlatformUsage: (event) => m.beginPlatformUsage(event),
+      recordPlatformUsage: (event) => m.recordPlatformUsage(event),
+      reportOutcome: async () => {},
+      fetchImpl: async () => {
+        await new Promise((resolve) => setImmediate(resolve))
+        return new Response(
+          JSON.stringify({
+            content: [{ type: 'text', text: '1234' }],
+            usage: { input_tokens: 4, output_tokens: 2 },
+          }),
+          { headers: { 'content-type': 'application/json' } },
+        )
+      },
+    })
+    return new LiteratureCaptchaSolver([reader])
+  })
+  t.after(() => manager.close())
+  function open(retry: boolean) {
+    let submits = 0
+    return async () => ({
+      challenge: async () => image,
+      submit: async () =>
+        retry && submits++ === 0 ? ('captcha_invalid' as const) : ('authenticated' as const),
+      probe: async () => false,
+      snapshot: async () => ({}),
+      close: async () => {},
+    })
+  }
+  const a = manager.start({ userId, accountId: '1' }, open(true), async () => {})
+  const b = manager.start({ userId: otherId, accountId: '1' }, open(false), async () => {})
+  assert.equal((await manager.settled(userId, a.operationId)).status, 'authenticated')
+  assert.equal((await manager.settled(otherId, b.operationId)).status, 'authenticated')
+  assert.equal(factories, 2)
+  const rows = (
+    await query<{ user_id: number; operation_key: string; count: number }>(
+      'SELECT user_id,operation_key,COUNT(*)::int AS count FROM literature_captcha_requests GROUP BY user_id,operation_key ORDER BY user_id',
+    )
+  ).rows
+  assert.deepEqual(rows, [
+    { user_id: userId, operation_key: a.operationId, count: 2 },
+    { user_id: otherId, operation_key: b.operationId, count: 1 },
+  ])
+  assert.deepEqual(await walletSnapshot(), before)
 })

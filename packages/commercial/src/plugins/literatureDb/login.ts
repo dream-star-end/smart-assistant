@@ -26,6 +26,13 @@ export interface LiteratureLoginSession {
 export type LoginOwner =
   | { userId: number; accountId: string; kind?: 'account' }
   | { userId: number; kind: 'setup'; site: typeof LITERATURE_SITE }
+export type OperationSolverFactory = (
+  context: Readonly<{
+    owner: Readonly<LoginOwner>
+    operationId: string
+  }>,
+) => LiteratureCaptchaSolver
+
 export type LoginPersistenceContext = LoginOwner & {
   operationId: string
   signal: AbortSignal
@@ -118,7 +125,7 @@ export class LiteratureLoginManager {
   private readonly now: () => number
   private closed = false
   constructor(
-    private readonly solver: LiteratureCaptchaSolver,
+    private readonly createSolver: OperationSolverFactory,
     options: LiteratureLoginOptions = {},
   ) {
     this.hourlyMaximum = bounded(options.maxStartsPerHour ?? 6, 1, 60)
@@ -198,6 +205,24 @@ export class LiteratureLoginManager {
     open: (signal: AbortSignal) => Promise<LiteratureLoginSession>,
   ): Promise<void> {
     const signal = op.controller.signal
+    // Preserve a cancellation boundary before constructing any per-owner readers.
+    await Promise.resolve()
+    if (!this.current(op)) return
+    if (this.now() >= op.expiresAt) {
+      await this.expire(op)
+      return
+    }
+    const solver = this.createSolver(
+      Object.freeze({
+        owner: Object.freeze({ ...op.owner }),
+        operationId: op.view.operationId,
+      }),
+    )
+    if (!this.current(op)) return
+    if (this.now() >= op.expiresAt) {
+      await this.expire(op)
+      return
+    }
     // Publish every returned handle before checking cancellation. The one closing
     // barrier below owns cleanup, including late openers and cleanup failures.
     const opening = Promise.resolve()
@@ -223,7 +248,7 @@ export class LiteratureLoginManager {
         let answer: string
         try {
           const image = await abortable(session.challenge(automatic.signal), automatic.signal)
-          answer = await this.solver.solve(image, budget, automatic.signal)
+          answer = await solver.solve(image, budget, automatic.signal)
         } catch (error) {
           if (!this.current(op)) return
           if (

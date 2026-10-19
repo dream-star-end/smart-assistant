@@ -17,10 +17,19 @@ import {
   sealLiteratureCredentials,
 } from './credentials.js'
 import { LiteratureError } from './errors.js'
-import { LiteratureLoginManager, type LiteratureLoginSession, type LoginOutcome } from './login.js'
+import {
+  LiteratureLoginManager,
+  type LiteratureLoginOptions,
+  type LiteratureLoginSession,
+  type LoginOutcome,
+  type OperationSolverFactory,
+} from './login.js'
 import { LITERATURE_SITE, literatureUrl, pinLiteratureRequest } from './policy.js'
 import { LiteratureHttpTransport, literatureSocketOptions } from './transport.js'
 
+function createManager(solver: LiteratureCaptchaSolver, options?: LiteratureLoginOptions) {
+  return new LiteratureLoginManager(() => solver, options)
+}
 const owner = { userId: 17, accountId: '42' }
 const signal = () => new AbortController().signal
 const resolver: DnsResolver = { resolve4: async () => ['93.184.216.34'], resolve6: async () => [] }
@@ -261,7 +270,7 @@ test('model total-call budget, malformed answer and ignored cancellation are bou
 })
 
 test('successful login persists private state once and closes before reporting success', async (t) => {
-  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  const manager = createManager(new LiteratureCaptchaSolver([local()]))
   t.after(() => manager.close())
   const f = fixture(await image())
   let release!: () => void
@@ -283,7 +292,7 @@ test('successful login persists private state once and closes before reporting s
 })
 
 test('four failed automatic submissions refresh challenges then allow one manual answer', async (t) => {
-  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  const manager = createManager(new LiteratureCaptchaSolver([local()]))
   t.after(() => manager.close())
   const f = fixture(await image(), [
     'captcha_invalid',
@@ -311,7 +320,7 @@ test('four failed automatic submissions refresh challenges then allow one manual
 })
 
 test('wrong manual answer terminates and never prompts or submits again', async (t) => {
-  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([]))
+  const manager = createManager(new LiteratureCaptchaSolver([]))
   t.after(() => manager.close())
   const f = fixture(await image(), ['captcha_invalid'])
   const op = manager.start(owner, async () => f.session, f.persist)
@@ -326,7 +335,7 @@ test('wrong manual answer terminates and never prompts or submits again', async 
 
 for (const outcome of ['credentials_invalid', 'blocked'] as const) {
   test(`${outcome} stops automatic login after one submission`, async (t) => {
-    const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+    const manager = createManager(new LiteratureCaptchaSolver([local()]))
     t.after(() => manager.close())
     const f = fixture(await image(), [outcome])
     const op = manager.start(owner, async () => f.session, f.persist)
@@ -339,7 +348,7 @@ for (const outcome of ['credentials_invalid', 'blocked'] as const) {
 }
 
 test('unknown POST outcome probes once; never blindly repeats a possibly accepted login', async (t) => {
-  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  const manager = createManager(new LiteratureCaptchaSolver([local()]))
   t.after(() => manager.close())
   const f = fixture(await image(), ['unknown'])
   const op = manager.start(owner, async () => f.session, f.persist)
@@ -349,7 +358,7 @@ test('unknown POST outcome probes once; never blindly repeats a possibly accepte
 })
 
 test('unknown accepted POST recovers via probe and persists only once', async (t) => {
-  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  const manager = createManager(new LiteratureCaptchaSolver([local()]))
   t.after(() => manager.close())
   const f = fixture(await image(), ['unknown'])
   f.session.probe = async () => true
@@ -361,7 +370,7 @@ test('unknown accepted POST recovers via probe and persists only once', async (t
 
 test('challenge expiry and per-account/global capacity are enforced', async (t) => {
   let clock = 1000
-  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([]), {
+  const manager = createManager(new LiteratureCaptchaSolver([]), {
     capacity: 1,
     now: () => clock,
   })
@@ -383,7 +392,7 @@ test('challenge expiry and per-account/global capacity are enforced', async (t) 
 })
 
 test('cancellation fences a late successful submission and releases only after cleanup', async (t) => {
-  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  const manager = createManager(new LiteratureCaptchaSolver([local()]))
   t.after(() => manager.close())
   const f = fixture(await image())
   let submit!: (value: LoginOutcome) => void
@@ -401,7 +410,7 @@ test('cancellation fences a late successful submission and releases only after c
 })
 
 test('cancelling a late opener keeps the account occupied until its handle is closed', async (t) => {
-  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  const manager = createManager(new LiteratureCaptchaSolver([local()]))
   t.after(() => manager.close())
   const f = fixture(await image())
   let opened!: (session: LiteratureLoginSession) => void
@@ -425,7 +434,7 @@ test('cancelling a late opener keeps the account occupied until its handle is cl
 test('automatic deadline preserves a live session for manual input', async (t) => {
   const pic = await image()
   const solver = new LiteratureCaptchaSolver([cloud(() => new Promise(() => {}))])
-  const manager = new LiteratureLoginManager(solver, { autoBudgetMs: 5 })
+  const manager = createManager(solver, { autoBudgetMs: 5 })
   t.after(() => manager.close())
   const f = fixture(pic)
   const op = manager.start(owner, async () => f.session, f.persist)
@@ -551,7 +560,7 @@ test('cloud refusal is latched across every challenge in one login budget', asyn
 })
 
 test('shutdown waits for cleanup which cancellation has already begun', async () => {
-  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([]))
+  const manager = createManager(new LiteratureCaptchaSolver([]))
   const f = fixture(await image())
   let release!: () => void
   f.session.close = async () =>
@@ -574,7 +583,7 @@ test('shutdown waits for cleanup which cancellation has already begun', async ()
 })
 
 test('failed cleanup preserves account and capacity fencing and makes shutdown fail visibly', async () => {
-  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([]), { capacity: 1 })
+  const manager = createManager(new LiteratureCaptchaSolver([]), { capacity: 1 })
   const f = fixture(await image())
   f.session.close = async () => {
     throw new Error('synthetic-private-worker-details')
@@ -593,7 +602,7 @@ test('failed cleanup preserves account and capacity fencing and makes shutdown f
 
 test('manual challenge never extends the absolute operation lifetime', async (t) => {
   let clock = 1000
-  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([]), {
+  const manager = createManager(new LiteratureCaptchaSolver([]), {
     now: () => clock,
     operationTtlMs: 60000,
     manualTtlMs: 120000,
@@ -612,7 +621,7 @@ test('manual challenge never extends the absolute operation lifetime', async (t)
 
 test('per-account hourly admission limits survive completed operations', async (t) => {
   let clock = 1000
-  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]), {
+  const manager = createManager(new LiteratureCaptchaSolver([local()]), {
     maxStartsPerHour: 2,
     now: () => clock,
   })
@@ -647,7 +656,7 @@ test('pre-cancelled recognition consumes the already-started image rejection', a
 })
 
 test('a late opener with failed cleanup retains its account fence and fails shutdown', async () => {
-  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  const manager = createManager(new LiteratureCaptchaSolver([local()]))
   const f = fixture(await image())
   let opened!: (session: LiteratureLoginSession) => void
   f.session.close = async () => {
@@ -671,7 +680,7 @@ test('a late opener with failed cleanup retains its account fence and fails shut
 })
 
 test('first setup has its own tenant identity and passes no fictional account ID to persistence', async (t) => {
-  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  const manager = createManager(new LiteratureCaptchaSolver([local()]))
   t.after(() => manager.close())
   const pending = { userId: 17, kind: 'setup' as const, site: LITERATURE_SITE }
   const f = fixture(await image())
@@ -694,7 +703,7 @@ test('first setup has its own tenant identity and passes no fictional account ID
 })
 
 test('pending setup capacity and start quotas aggregate by tenant and site', async (t) => {
-  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]), {
+  const manager = createManager(new LiteratureCaptchaSolver([local()]), {
     maxStartsPerHour: 1,
   })
   t.after(() => manager.close())
@@ -723,7 +732,7 @@ test('pending setup capacity and start quotas aggregate by tenant and site', asy
 })
 
 test('setup owner cannot forge an account or choose another site or rate bucket', async (t) => {
-  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  const manager = createManager(new LiteratureCaptchaSolver([local()]))
   t.after(() => manager.close())
   const f = fixture(await image())
   for (const invalid of [
@@ -738,4 +747,125 @@ test('setup owner cannot forge an account or choose another site or rate bucket'
       code('INVALID_INPUT'),
     )
   assert.equal(f.calls.challenges, 0)
+})
+
+test('solver factories receive immutable tenant and actual operation identity once per run', async (t) => {
+  const contexts: Parameters<OperationSolverFactory>[0][] = []
+  const manager = new LiteratureLoginManager((context) => {
+    contexts.push(context)
+    assert(Object.isFrozen(context))
+    assert(Object.isFrozen(context.owner))
+    assert.equal(Reflect.set(context.owner, 'userId', 999), false)
+    return new LiteratureCaptchaSolver([
+      local(async () => {
+        await new Promise((resolve) => setImmediate(resolve))
+        return '1234'
+      }),
+    ])
+  })
+  t.after(() => manager.close())
+  const pic = await image()
+  const a = fixture(pic)
+  const b = fixture(pic)
+  const first = manager.start(owner, async () => a.session, a.persist)
+  const second = manager.start({ ...owner, userId: 18 }, async () => b.session, b.persist)
+  assert.equal((await manager.settled(17, first.operationId)).status, 'authenticated')
+  assert.equal((await manager.settled(18, second.operationId)).status, 'authenticated')
+  assert.deepEqual(
+    contexts.map((c) => [c.owner.userId, c.operationId]),
+    [
+      [17, first.operationId],
+      [18, second.operationId],
+    ],
+  )
+})
+
+test('automatic retries reuse one operation solver and identity', async (t) => {
+  let factories = 0
+  const manager = new LiteratureLoginManager(() => {
+    factories++
+    return new LiteratureCaptchaSolver([local()])
+  })
+  t.after(() => manager.close())
+  const f = fixture(await image(), ['captcha_invalid', 'authenticated'])
+  const op = manager.start(owner, async () => f.session, f.persist)
+  assert.equal((await manager.settled(17, op.operationId)).status, 'authenticated')
+  assert.equal(factories, 1)
+  assert.equal(f.calls.submits.length, 2)
+})
+
+test('busy, cancelled and rate-limited operations do not construct tenant readers', async (t) => {
+  let factories = 0
+  let opened = 0
+  const manager = new LiteratureLoginManager(
+    () => {
+      factories++
+      return new LiteratureCaptchaSolver([local()])
+    },
+    { maxStartsPerHour: 1 },
+  )
+  t.after(() => manager.close())
+  const f = fixture(await image())
+  const open = async () => {
+    opened++
+    return f.session
+  }
+  const op = manager.start(owner, open, f.persist)
+  assert.throws(() => manager.start(owner, open, f.persist), code('ACCOUNT_BUSY'))
+  await manager.cancel(17, op.operationId)
+  assert.equal((await manager.settled(17, op.operationId)).status, 'cancelled')
+  assert.throws(() => manager.start(owner, open, f.persist), code('RATE_LIMITED'))
+  assert.equal(factories, 0)
+  assert.equal(opened, 0)
+})
+
+test('solver factory failure releases capacity without opening a private session', async (t) => {
+  let factories = 0
+  let opened = 0
+  const manager = new LiteratureLoginManager(
+    () => {
+      if (++factories === 1) throw new Error('synthetic factory failure')
+      return new LiteratureCaptchaSolver([local()])
+    },
+    { capacity: 1 },
+  )
+  t.after(() => manager.close())
+  const f = fixture(await image())
+  const open = async () => {
+    opened++
+    return f.session
+  }
+  const failed = manager.start(owner, open, f.persist)
+  assert.equal((await manager.settled(17, failed.operationId)).status, 'failed')
+  assert.equal(opened, 0)
+  const next = manager.start({ ...owner, accountId: '43' }, open, f.persist)
+  assert.equal((await manager.settled(17, next.operationId)).status, 'authenticated')
+  assert.equal(opened, 1)
+})
+
+test('absolute expiry before the factory microtask opens no reader or session', async (t) => {
+  let now = 1000
+  let factories = 0
+  let opened = 0
+  const manager = new LiteratureLoginManager(
+    () => {
+      factories++
+      return new LiteratureCaptchaSolver([local()])
+    },
+    { now: () => now, operationTtlMs: 1000 },
+  )
+  t.after(() => manager.close())
+  const f = fixture(await image())
+  const op = manager.start(
+    owner,
+    async () => {
+      opened++
+      return f.session
+    },
+    f.persist,
+  )
+  now = 2001
+  assert.equal((await manager.settled(17, op.operationId)).status, 'expired')
+  assert.equal(factories, 0)
+  assert.equal(opened, 0)
 })
