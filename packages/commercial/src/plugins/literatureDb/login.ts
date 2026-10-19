@@ -33,6 +33,7 @@ export type OperationSolverFactory = (
   }>,
 ) => LiteratureCaptchaSolver
 
+/** Entering the callback starts the save phase; cancellation thereafter waits for its result. */
 export type LoginPersistenceContext = LoginOwner & {
   operationId: string
   signal: AbortSignal
@@ -58,6 +59,8 @@ interface Operation {
   timer: ReturnType<typeof setTimeout>
   manualUsed: boolean
   closing?: Promise<void>
+  sessionClosing?: Promise<void>
+  completing?: Promise<void>
   finishedAt?: number
   expiresAt: number
 }
@@ -305,16 +308,29 @@ export class LiteratureLoginManager {
       const signal = op.controller.signal
       const state = await abortable(op.session!.snapshot(signal), signal)
       if (!this.current(op)) return true
-      await abortable(
-        op.persist(state, {
-          ...op.owner,
-          operationId: op.view.operationId,
-          signal,
-          isCurrent: () => this.current(op),
-        }),
-        signal,
-      )
-      if (this.current(op)) await this.finish(op, 'authenticated')
+      await this.closeSession(op)
+      if (!this.current(op)) return true
+      if (this.now() >= op.expiresAt) {
+        await this.expire(op)
+        return true
+      }
+      clearTimeout(op.timer)
+      // Publish the cancellation barrier before invoking the persistence callback.
+      // AbortSignal cannot undo a COMMIT that the callback may already have sent.
+      op.completing = Promise.resolve().then(async () => {
+        try {
+          await op.persist(state, {
+            ...op.owner,
+            operationId: op.view.operationId,
+            signal,
+            isCurrent: () => this.current(op),
+          })
+          await this.finish(op, 'authenticated')
+        } catch {
+          await this.fail(op, 'PERSISTENCE_UNCERTAIN')
+        }
+      })
+      await op.completing
       return true
     }
     if (outcome === 'credentials_invalid') {
@@ -398,6 +414,9 @@ export class LiteratureLoginManager {
     })
     return this.settled(userId, id)
   }
+  private closeSession(op: Operation): Promise<void> {
+    return (op.sessionClosing ??= Promise.resolve().then(() => op.session?.close()))
+  }
   private async finish(
     op: Operation,
     status: LiteratureLoginView['status'],
@@ -425,7 +444,7 @@ export class LiteratureLoginManager {
             /* Any returned handle is still closed below. */
           }
         }
-        await op.session?.close()
+        await this.closeSession(op)
         if (status === 'authenticated') op.view.status = 'authenticated'
       } catch {
         op.view.status = 'failed'
@@ -443,11 +462,16 @@ export class LiteratureLoginManager {
     if (!op.closing) await this.finish(op, 'failed', code)
   }
   private async expire(op: Operation): Promise<void> {
+    if (op.completing) {
+      await op.completing
+      return
+    }
     await this.finish(op, 'expired', 'TIMEOUT')
   }
   async cancel(userId: number, id: string): Promise<LiteratureLoginView> {
     const op = this.get(userId, id)
-    if (this.current(op)) await this.finish(op, 'cancelled', 'CANCELLED')
+    if (op.completing) await op.completing
+    else if (this.current(op)) await this.finish(op, 'cancelled', 'CANCELLED')
     return this.view(op)
   }
   async close(): Promise<void> {
@@ -455,6 +479,7 @@ export class LiteratureLoginManager {
     await Promise.all(
       [...this.operations.values()].map(
         (op) =>
+          op.completing ??
           op.closing ??
           (this.current(op) ? this.finish(op, 'cancelled', 'CANCELLED') : Promise.resolve()),
       ),

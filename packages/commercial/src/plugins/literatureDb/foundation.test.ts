@@ -292,6 +292,8 @@ test('successful login persists private state once and closes before reporting s
   const op = manager.start(owner, async () => f.session, f.persist)
   while (!release) await new Promise((resolve) => setImmediate(resolve))
   assert.equal(manager.status(owner.userId, op.operationId).status, 'running')
+  assert.equal(f.calls.persisted, 0)
+  assert.throws(() => manager.start(owner, async () => f.session, f.persist), code('ACCOUNT_BUSY'))
   release()
   const done = await manager.settled(owner.userId, op.operationId)
   assert.equal(done.status, 'authenticated')
@@ -920,4 +922,198 @@ test('stored password seals require canonical bounded base64 and reject accessor
   ])
     assert.throws(() => parseSerializedLiteratureCredentials(invalid), code('SECRET_INVALID'))
   assert.equal(accessorRead, false)
+})
+
+function deferred() {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+test('cancellation during authenticated session drain never starts persistence', async (t) => {
+  const manager = createManager(new LiteratureCaptchaSolver([local()]))
+  const f = fixture(await image())
+  const closing = deferred()
+  f.session.close = async () => {
+    f.calls.closed++
+    await closing.promise
+  }
+  t.after(async () => {
+    closing.resolve()
+    await manager.close()
+  })
+  const op = manager.start(owner, async () => f.session, f.persist)
+  while (!f.calls.closed) await new Promise((resolve) => setImmediate(resolve))
+  let cancelled = false
+  const cancel = manager.cancel(owner.userId, op.operationId).then((view) => {
+    cancelled = true
+    return view
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(cancelled, false)
+  assert.equal(f.calls.persisted, 0)
+  closing.resolve()
+  assert.equal((await cancel).status, 'cancelled')
+  await manager.settled(owner.userId, op.operationId)
+  assert.equal(f.calls.persisted, 0)
+  assert.equal(f.calls.closed, 1)
+})
+
+test('absolute expiry reached during session drain prevents the save phase', async (t) => {
+  let now = 1000
+  const manager = createManager(new LiteratureCaptchaSolver([local()]), {
+    now: () => now,
+    operationTtlMs: 60_000,
+  })
+  const f = fixture(await image())
+  const closing = deferred()
+  f.session.close = async () => {
+    f.calls.closed++
+    await closing.promise
+  }
+  t.after(async () => {
+    closing.resolve()
+    await manager.close()
+  })
+  const op = manager.start(owner, async () => f.session, f.persist)
+  while (!f.calls.closed) await new Promise((resolve) => setImmediate(resolve))
+  now = 61_001
+  closing.resolve()
+  assert.equal((await manager.settled(owner.userId, op.operationId)).status, 'expired')
+  assert.equal(f.calls.persisted, 0)
+  assert.equal(f.calls.closed, 1)
+})
+
+test('authenticated cleanup failure holds capacity and never stores an account', async () => {
+  const manager = createManager(new LiteratureCaptchaSolver([local()]), { capacity: 1 })
+  const f = fixture(await image())
+  f.session.close = async () => {
+    f.calls.closed++
+    throw new Error('synthetic private close detail')
+  }
+  const op = manager.start(owner, async () => f.session, f.persist)
+  assert.equal((await manager.settled(owner.userId, op.operationId)).errorCode, 'CLEANUP_FAILED')
+  assert.equal(f.calls.persisted, 0)
+  assert.equal(f.calls.closed, 1)
+  assert.throws(() => manager.start(owner, async () => f.session, f.persist), code('ACCOUNT_BUSY'))
+  await assert.rejects(manager.close(), code('CLEANUP_FAILED'))
+})
+
+test('cancel and shutdown wait for an entered save and return its authenticated outcome', async (t) => {
+  const manager = createManager(new LiteratureCaptchaSolver([local()]), { capacity: 1 })
+  const f = fixture(await image())
+  const begun = deferred()
+  const saved = deferred()
+  let saveSignal!: AbortSignal
+  t.after(async () => {
+    saved.resolve()
+    await manager.close()
+  })
+  const op = manager.start(
+    owner,
+    async () => f.session,
+    async (state, context) => {
+      saveSignal = context.signal
+      begun.resolve()
+      await saved.promise
+      await f.persist(state)
+    },
+  )
+  await begun.promise
+  assert.equal(f.calls.closed, 1)
+  assert.throws(() => manager.start(owner, async () => f.session, f.persist), code('ACCOUNT_BUSY'))
+  assert.throws(
+    () => manager.start({ ...owner, accountId: '43' }, async () => f.session, f.persist),
+    code('CAPACITY'),
+  )
+  let cancelled = false
+  let shutdown = false
+  const cancel = manager.cancel(owner.userId, op.operationId).then((view) => {
+    cancelled = true
+    return view
+  })
+  const close = manager.close().then(() => {
+    shutdown = true
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(cancelled, false)
+  assert.equal(shutdown, false)
+  assert.equal(saveSignal.aborted, false)
+  assert.equal(manager.status(owner.userId, op.operationId).status, 'running')
+  saved.resolve()
+  assert.equal((await cancel).status, 'authenticated')
+  await close
+  assert.equal(f.calls.persisted, 1)
+  assert.equal(f.calls.closed, 1)
+})
+
+test('operation expiry cannot abort an entered save or release its owner early', async (t) => {
+  const f = fixture(await image())
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const manager = createManager(new LiteratureCaptchaSolver([local()]), { operationTtlMs: 60_000 })
+  const begun = deferred()
+  const saved = deferred()
+  let saveSignal!: AbortSignal
+  t.after(async () => {
+    saved.resolve()
+    await manager.close()
+  })
+  const op = manager.start(
+    owner,
+    async () => f.session,
+    async (state, context) => {
+      saveSignal = context.signal
+      begun.resolve()
+      await saved.promise
+      await f.persist(state)
+    },
+  )
+  await begun.promise
+  t.mock.timers.tick(60_001)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(manager.status(owner.userId, op.operationId).status, 'running')
+  assert.equal(saveSignal.aborted, false)
+  assert.throws(() => manager.start(owner, async () => f.session, f.persist), code('ACCOUNT_BUSY'))
+  saved.resolve()
+  assert.equal((await manager.settled(owner.userId, op.operationId)).status, 'authenticated')
+  assert.equal(f.calls.persisted, 1)
+  assert.equal(f.calls.closed, 1)
+})
+
+test('a save error after a possible commit is reported as uncertain instead of cancelled', async (t) => {
+  const manager = createManager(new LiteratureCaptchaSolver([local()]))
+  const f = fixture(await image())
+  const begun = deferred()
+  const acknowledged = deferred()
+  t.after(async () => {
+    acknowledged.resolve()
+    await manager.close()
+  })
+  const op = manager.start(
+    owner,
+    async () => f.session,
+    async (state) => {
+      await f.persist(state)
+      begun.resolve()
+      await acknowledged.promise
+      throw new Error('synthetic private database confirmation detail')
+    },
+  )
+  await begun.promise
+  let cancelled = false
+  const cancel = manager.cancel(owner.userId, op.operationId).then((view) => {
+    cancelled = true
+    return view
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(cancelled, false)
+  acknowledged.resolve()
+  const result = await cancel
+  assert.equal(result.status, 'failed')
+  assert.equal(result.errorCode, 'PERSISTENCE_UNCERTAIN')
+  assert.equal(f.calls.persisted, 1)
+  assert.equal(f.calls.closed, 1)
+  assert(!JSON.stringify(result).includes('synthetic private'))
 })

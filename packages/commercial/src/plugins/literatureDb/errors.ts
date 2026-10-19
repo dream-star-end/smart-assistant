@@ -18,6 +18,7 @@ export type LiteratureErrorCode =
   | 'RESPONSE_INVALID'
   | 'RESPONSE_TOO_LARGE'
   | 'LOGIN_FAILED'
+  | 'PERSISTENCE_UNCERTAIN'
   | 'CLEANUP_FAILED'
 export class LiteratureError extends Error {
   constructor(readonly code: LiteratureErrorCode) {
