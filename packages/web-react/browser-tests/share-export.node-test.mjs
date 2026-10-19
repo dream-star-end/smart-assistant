@@ -59,6 +59,13 @@ test("OCV5-507 sharing and Markdown downloads contain final answers and portable
       assert.ok(md.includes("已交付的部分报告仍可导出。"));
       assert.ok(!copy.includes("已交付的部分报告"));
       assert.ok(!canvas.includes("已交付的部分报告"));
+      assert.ok(md.includes("停止前文件（stopped.csv）"), "stopped-row deliverables survive later tools in the actual Markdown download");
+      assert.ok(!copy.includes("stopped.csv"));
+      assert.ok(!canvas.includes("stopped.csv"));
+      for (const output of [md, copy, canvas]) {
+        assert.ok(!output.includes("PRIVATE_POST_STOP_TOOL"));
+        assert.ok(!output.includes("turn failed"));
+      }
       await page.close();
     }
   } finally { await browser.close(); await server.close(); }

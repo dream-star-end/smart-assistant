@@ -99,6 +99,29 @@ describe("exportSessionMarkdown", () => {
     expect(partial).not.toContain("turn failed");
   });
 
+  test("keeps a delivered file on a stopped assistant row before later tools", async () => {
+    const rows = [
+      msg({ id: "u", role: "user", text: "生成文件", _clientMessageId: "u", _orderSeq: 1, ts: 1 }),
+      msg({ id: "file", role: "assistant", text: "已生成：[下载](/home/agent/.openclaude/generated/sales.csv)\n\n[turn failed: user_cancelled]", _errorCode: "USER_CANCELLED", _clientMessageId: "u", _orderSeq: 2, ts: 2 }),
+      msg({ id: "tool", role: "tool", text: "PRIVATE_TOOL_OUTPUT", _clientMessageId: "u", _orderSeq: 3, ts: 3 }),
+    ];
+    const snapshot = JSON.stringify(rows);
+    const md = await exportSessionMarkdown(rows);
+    expect(md).toContain("下载（sales.csv）");
+    expect(md).toContain("## 助手（未完成）");
+    expect(md).not.toContain("PRIVATE_TOOL_OUTPUT");
+    expect(md).not.toContain("turn failed");
+    expect(JSON.stringify(rows)).toBe(snapshot);
+    const { selectShareMessages } = await import("./shareSelection");
+    expect(selectShareMessages(rows, "all")).toEqual([rows[0]]);
+    const internal = await exportSessionMarkdown([rows[0]!, msg({
+      id: "internal", role: "assistant", text: '{"error":"PRIVATE_ERROR","path":"/home/agent/.openclaude/generated/secret.csv"}',
+      _errorCode: "ENGINE_ERROR", _clientMessageId: "u", _orderSeq: 2, ts: 2,
+    }), rows[2]!]);
+    expect(internal).not.toContain("PRIVATE_ERROR");
+    expect(internal).not.toContain("secret.csv");
+  });
+
   test("空列表得到空串", async () => {
     expect(await exportSessionMarkdown([])).toBe("");
   });
