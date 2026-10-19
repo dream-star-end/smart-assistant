@@ -2740,6 +2740,7 @@ export function enterDeferredRecoverySoftState(sess: ChatSession, clientMessageI
   const source = clientMessageId
     ? sess.messages.find((m) => m.role === "user" && m.id === clientMessageId)
     : undefined;
+  if (source && source.status !== "replied") source.status = "sent";
   const sourceAttempt = typeof source?._automaticRecoveryAttempt === "number" &&
       Number.isSafeInteger(source._automaticRecoveryAttempt) &&
       source._automaticRecoveryAttempt >= 1
@@ -2823,7 +2824,8 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     ...(frame.clientMessageId ? { clientMessageId: frame.clientMessageId } : {}),
     ...(typeof frame.traceId === "string" && frame.traceId ? { traceId: frame.traceId } : {}),
   };
-  if (isSilentTurnErrorCode(normalized)) {
+  const terminalDecision = frame.recoveryDisposition === "terminal";
+  if (terminalDecision || isSilentTurnErrorCode(normalized)) {
     effects.discardDeferredTerminalError?.(sess.id, paint.clientMessageId);
   }
   if (
@@ -2837,7 +2839,7 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
   // Master 拥有恢复且错误可自动恢复:红卡延后,本轮保持软状态直到 master 裁决。遥测仍照常上报。
   if (
     !userCancelled &&
-    supportsAutomaticTurnRecovery(normalized) &&
+    !terminalDecision && supportsAutomaticTurnRecovery(normalized) &&
     effects.deferTerminalErrorForRecovery?.(sess.id, paint) === true
   ) {
     sess._deferredTerminalErrorClientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
@@ -2890,7 +2892,7 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     });
   }
   if (normalized === "insufficient_credits") effects.refreshBalance?.();
-  if (supportsAutomaticTurnRecovery(normalized)) {
+  if (!terminalDecision && supportsAutomaticTurnRecovery(normalized)) {
     effects.scheduleAutomaticRecovery?.(sess.id, frame.clientMessageId);
   }
 }

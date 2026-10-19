@@ -111,6 +111,15 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(node.className).not.toContain("text-warning");
   });
 
+  test("OCV5-523: a queued recovery keeps the shared retry hint during admission", () => {
+    renderTA({
+      dispatch: { phase: "sending", queued: 1, serviceStarting: false },
+      turnStatus: { kind: "retrying", attempt: 1, max: 10, retryAt: Date.now() },
+    });
+    expect(screen.getByLabelText("生成中").textContent).toContain("模型繁忙，正在重试…");
+    expect(screen.queryByText("正在发送…")).not.toBeInTheDocument();
+  });
+
   test("连接恢复与 Stop 复用活动行，不冒充模型重试", () => {
     const { unmount } = render(
       <TurnActivity info={{
