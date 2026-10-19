@@ -204,3 +204,71 @@ test('an unrelated expired deletion does not exhaust a full live-cookie budget',
   )
   assert.equal(exportJieyouAccountState(jar).cookies.length, 64)
 })
+
+test('expired outside-domain deletion cannot erase same-name host or parent session cookies', () => {
+  const now = Date.now()
+  const jar = restoreJieyouCookieJar(state())
+  acceptJieyouCookie(
+    jar,
+    'sid=synthetic-parent; Domain=jieyoutsg.com; Path=/e/',
+    LITERATURE_SITE,
+    now,
+  )
+  const before = exportJieyouAccountState(jar, now)
+  for (const header of [
+    'sid=deleted; Domain=stale.invalid; Path=/e/; Max-Age=0; Expires=Wed, 21 Oct 2037 07:28:00 GMT',
+    'sid=deleted; Domain=stale.invalid; Path=/e/; Expires=Thu, 01 Jan 1970 00:00:00 GMT',
+  ]) {
+    acceptJieyouCookie(jar, header, LITERATURE_SITE, now)
+    assert.deepEqual(exportJieyouAccountState(jar, now), before)
+  }
+})
+
+test('outside-domain live cookies and malformed Max-Age cannot use the expired-deletion exception', () => {
+  const now = Date.now()
+  const jar = restoreJieyouCookieJar(state())
+  const before = exportJieyouAccountState(jar, now)
+  for (const header of [
+    'sid=foreign; Domain=stale.invalid; Path=/e/',
+    'sid=foreign; Domain=stale.invalid; Path=/e/; Max-Age=60; Expires=Thu, 01 Jan 1970 00:00:00 GMT',
+    'sid=deleted; Domain=stale.invalid; Path=/e/; Max-Age=-1; Max-Age=1',
+    'sid=deleted; Domain=stale.invalid; Path=/e/; Max-Age=-0.5',
+  ]) {
+    assert.throws(() => acceptJieyouCookie(jar, header, LITERATURE_SITE, now), validError)
+    assert.deepEqual(exportJieyouAccountState(jar, now), before)
+  }
+})
+
+test('same-site host and parent expiration still delete their exact cookies', () => {
+  const now = Date.now()
+  const jar = restoreJieyouCookieJar(state())
+  acceptJieyouCookie(
+    jar,
+    'sid=synthetic-parent; Domain=jieyoutsg.com; Path=/e/',
+    LITERATURE_SITE,
+    now,
+  )
+  acceptJieyouCookie(jar, 'sid=deleted; Path=/e/; Max-Age=0', LITERATURE_SITE, now)
+  assert.equal(exportJieyouAccountState(jar, now).cookies.length, 1)
+  assert.equal(exportJieyouAccountState(jar, now).cookies[0].domain, 'jieyoutsg.com')
+  acceptJieyouCookie(
+    jar,
+    'sid=deleted; Domain=jieyoutsg.com; Path=/e/; Max-Age=0',
+    LITERATURE_SITE,
+    now,
+  )
+  assert.equal(exportJieyouAccountState(jar, now).cookies.length, 0)
+})
+
+test('an empty or dot Domain attribute retains normal host-only deletion semantics', () => {
+  for (const domain of ['', '.']) {
+    const jar = restoreJieyouCookieJar(state())
+    acceptJieyouCookie(
+      jar,
+      `sid=deleted; Domain=${domain}; Path=/e/; Max-Age=0`,
+      LITERATURE_SITE,
+      Date.now(),
+    )
+    assert.equal(exportJieyouAccountState(jar).cookies.length, 0)
+  }
+})

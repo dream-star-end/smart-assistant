@@ -1,5 +1,5 @@
 /** Private HTTP cookie state. Never deserialize untrusted tough-cookie store/options. */
-import { Cookie, CookieJar } from 'tough-cookie'
+import { Cookie, CookieJar, canonicalDomain } from 'tough-cookie'
 import { LiteratureError } from './errors.js'
 import { LITERATURE_SITE, literatureUrl } from './policy.js'
 
@@ -144,6 +144,21 @@ export function acceptJieyouCookie(
     const expiry = value.maxAge <= 0 ? 0 : time(receivedAt + value.maxAge * 1000)
     value.expires = new Date(expiry)
     value.maxAge = null
+  }
+  // This site's anonymous page emits a stale deletion for an unrelated domain.
+  // It has no authority over this jar. Ignore only an already-expired explicit
+  // outside-domain deletion, after applying Max-Age precedence above.
+  const domain = value.domain ? canonicalDomain(value.domain) : null
+  if (
+    domain &&
+    domain !== HOST &&
+    domain !== 'jieyoutsg.com' &&
+    value.expires instanceof Date &&
+    Number.isFinite(value.expires.getTime()) &&
+    value.expires.getTime() <= receivedAt
+  ) {
+    exportJieyouAccountState(jar, receivedAt)
+    return
   }
   try {
     jar.setCookieSync(value, target.href, {

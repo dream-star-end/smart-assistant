@@ -563,3 +563,39 @@ test('cancellation before request socket assignment still waits for the created 
   assert(created.every((socket) => socket.closed))
   assert(f.requests.every((request) => request.closed))
 })
+
+test('public-page stale foreign deletion leaves the client able to fetch a bound challenge', async () => {
+  const f = await fixture((req, res) => {
+    if (req.url!.startsWith('/e/ShowKey/')) {
+      void picture.then((png) => {
+        res.writeHead(200, { 'content-type': 'image/png' })
+        res.end(png)
+      })
+      return
+    }
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'set-cookie': [
+        'session=synthetic-session; Path=/; HttpOnly',
+        'obsolete=deleted; Path=/; Max-Age=-1',
+        'obsolete=deleted; Domain=stale.invalid; Path=/; Max-Age=-1',
+        'obsolete=deleted; Path=/; Max-Age=-1',
+      ],
+    })
+    res.end(FORM)
+  })
+  try {
+    await f.client.loadLoginPage(signal())
+    const challenge = await f.client.getChallenge(signal())
+    assert(challenge.image.data.length > 0)
+    assert.equal(f.paths.length, 2)
+    assert.equal(f.cookies[1], 'session=synthetic-session')
+    const state = f.client.exportPrivateCookies()
+    assert.equal(state.cookies.length, 1)
+    assert.equal(state.cookies[0].domain, 'www.jieyoutsg.com')
+    assert.equal(state.cookies[0].name, 'session')
+    assert.equal(f.posted.length, 0)
+  } finally {
+    await f.close()
+  }
+})
