@@ -695,6 +695,74 @@ export const TOOLS = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'oc_bash',
+    description: [
+      '在 MCP 进程里同步执行一条 shell 命令,返回 stdout、stderr 和 exit。',
+      '默认等待 60000ms,最短 1000ms,最长 170000ms。超时才算工具错误;非零退出码写在文本里,不是协议错误。',
+      'Antigravity 原生 run_command 前台最多等 10000ms 就会转后台。需要跑完再继续时用本工具,不要用 run_command 的 WaitMsBeforeAsync。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: '交给 bash -lc 的命令' },
+        cwd: { type: 'string', description: '工作目录;不填则用 MCP 进程当前目录' },
+        timeout_ms: {
+          type: 'number',
+          minimum: 1000,
+          maximum: 170000,
+          description: '等待毫秒数,默认 60000,范围 1000–170000',
+        },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'oc_grep',
+    description: [
+      '用 rg 按内容搜索文件。pattern 作为独立参数,不会拼进 shell。',
+      '默认最多 80 条命中,上限 200。没有命中时返回 no matches。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: '搜索模式(rg 正则)' },
+        path: { type: 'string', description: '文件或目录;不填则用当前目录' },
+        glob: { type: 'string', description: '可选 glob,例如 *.ts' },
+        max_matches: {
+          type: 'number',
+          minimum: 1,
+          maximum: 200,
+          description: '最多返回多少条,默认 80,上限 200',
+        },
+      },
+      required: ['pattern'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'oc_glob',
+    description: [
+      '用 rg --files 按文件名查找。跳过 .git。',
+      '默认最多 200 条,上限 500。没有命中时返回 no matches。',
+    ].join('\n'),
+    inputSchema: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: '文件名 glob,例如 **/*.ts' },
+        path: { type: 'string', description: '搜索目录;不填则用当前目录' },
+        max_results: {
+          type: 'number',
+          minimum: 1,
+          maximum: 500,
+          description: '最多返回多少个路径,默认 200,上限 500',
+        },
+      },
+      required: ['pattern'],
+      additionalProperties: false,
+    },
+  },
 ]
 
 /**
