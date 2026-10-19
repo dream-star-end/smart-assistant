@@ -1,0 +1,631 @@
+import assert from 'node:assert/strict'
+import { once } from 'node:events'
+import {
+  type RequestListener,
+  type RequestOptions,
+  createServer,
+  request as httpRequest,
+} from 'node:http'
+import test from 'node:test'
+import sharp from 'sharp'
+import type { DnsResolver } from '../../connectors/outboundPolicy.js'
+import { normalizeHttpsOrigin } from '../../connectors/outboundPolicy.js'
+import { type CaptchaImage, type CaptchaReader, LiteratureCaptchaSolver } from './captcha.js'
+import {
+  openLiteratureCredentials,
+  parseLiteratureCredentials,
+  sealLiteratureCredentials,
+} from './credentials.js'
+import { LiteratureError } from './errors.js'
+import { LiteratureLoginManager, type LiteratureLoginSession, type LoginOutcome } from './login.js'
+import { LITERATURE_SITE, literatureUrl, pinLiteratureRequest } from './policy.js'
+import { LiteratureHttpTransport, literatureSocketOptions } from './transport.js'
+
+const owner = { userId: 17, accountId: '42' }
+const signal = () => new AbortController().signal
+const resolver: DnsResolver = { resolve4: async () => ['93.184.216.34'], resolve6: async () => [] }
+const env = { OPENCLAUDE_KMS_KEY: Buffer.alloc(32, 19).toString('base64') }
+const credentials = {
+  schemaVersion: 1,
+  username: 'fixture-user',
+  password: 'synthetic-fixture-password',
+}
+function code(expected: string) {
+  return (error: unknown) => error instanceof LiteratureError && error.code === expected
+}
+async function image(): Promise<CaptchaImage> {
+  return {
+    mediaType: 'image/png',
+    data: await sharp({ create: { width: 47, height: 20, channels: 3, background: '#666666' } })
+      .png()
+      .toBuffer(),
+  }
+}
+function local(recognize: CaptchaReader['recognize'] = async () => '1234'): CaptchaReader {
+  return { provider: 'local-ocr', model: 'ddddocr', usageApproved: true, recognize }
+}
+function cloud(recognize: CaptchaReader['recognize']): CaptchaReader {
+  return { provider: 'anthropic', model: 'claude-fixture', usageApproved: true, recognize }
+}
+function fixture(pic: CaptchaImage, outcomes: LoginOutcome[] = ['authenticated']) {
+  const calls = { challenges: 0, submits: [] as string[], closed: 0, persisted: 0, probes: 0 }
+  const session: LiteratureLoginSession = {
+    challenge: async () => {
+      calls.challenges++
+      return pic
+    },
+    submit: async (answer) => {
+      calls.submits.push(answer)
+      return outcomes.shift() ?? 'captcha_invalid'
+    },
+    probe: async () => {
+      calls.probes++
+      return false
+    },
+    snapshot: async () => ({ privateState: 'fixture-cookie' }),
+    close: async () => {
+      calls.closed++
+    },
+  }
+  const persist = async (state: unknown) => {
+    assert.deepEqual(state, { privateState: 'fixture-cookie' })
+    calls.persisted++
+  }
+  return { session, calls, persist }
+}
+async function httpFixture(handler: RequestListener) {
+  const server = createServer(handler)
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const address = server.address()
+  assert(address && typeof address === 'object')
+  const options: RequestOptions[] = []
+  const transport = new LiteratureHttpTransport({
+    resolver,
+    timeoutMs: 1000,
+    requestFactory: (input, callback) => {
+      options.push(input)
+      // Only this test adapter changes the socket. Production policy has no allowPrivate flag.
+      return httpRequest({ ...input, hostname: '127.0.0.1', port: address.port }, callback)
+    },
+  })
+  return {
+    transport,
+    options,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  }
+}
+
+test('HTTP exception is exact-site and does not relax shared HTTPS policy', async () => {
+  assert.equal(literatureUrl(`${LITERATURE_SITE}/e/member/login/`).hostname, 'www.jieyoutsg.com')
+  assert.equal(literatureUrl('https://www.jieyoutsg.com:443/').port, '')
+  assert.throws(() => normalizeHttpsOrigin(LITERATURE_SITE))
+  for (const url of [
+    'http://jieyoutsg.com/',
+    'http://x.jieyoutsg.com/',
+    'http://www.jieyoutsg.com.evil.test/',
+    'http://www.jieyoutsg.com:8080/',
+    'http://user:pass@www.jieyoutsg.com/',
+    'http://127.0.0.1/',
+    'http://169.254.169.254/',
+    'ws://www.jieyoutsg.com/',
+    'http://www.jieyoutsg.com/#fragment',
+    'http://www.jieyoutsg.com/\r\nCookie:injected',
+  ]) {
+    assert.throws(() => literatureUrl(url), code('OUTBOUND_BLOCKED'))
+  }
+  await assert.rejects(
+    pinLiteratureRequest(LITERATURE_SITE, {
+      resolve4: async () => ['93.184.216.34', '127.0.0.1'],
+      resolve6: async () => [],
+    }),
+    code('OUTBOUND_BLOCKED'),
+  )
+  await assert.rejects(
+    pinLiteratureRequest(LITERATURE_SITE, {
+      resolve4: async () => ['93.184.216.34'],
+      resolve6: async () => ['::1'],
+    }),
+    code('OUTBOUND_BLOCKED'),
+  )
+})
+
+test('credential AEAD rejects cross-user/account/seed swaps and omits plaintext', () => {
+  const sealed = sealLiteratureCredentials(credentials, owner, env)
+  assert.deepEqual(openLiteratureCredentials(sealed, owner, env), credentials)
+  assert(!sealed.ciphertext.includes(Buffer.from(credentials.password)))
+  assert.notDeepEqual(sealed.nonce, sealLiteratureCredentials(credentials, owner, env).nonce)
+  for (const scope of [
+    { ...owner, userId: 18 },
+    { ...owner, accountId: '43' },
+  ])
+    assert.throws(() => openLiteratureCredentials(sealed, scope, env), code('SECRET_INVALID'))
+  assert.throws(
+    () => openLiteratureCredentials({ ...sealed, aadSeed: 'invalid' }, owner, env),
+    code('SECRET_INVALID'),
+  )
+  const corrupt = Buffer.from(sealed.ciphertext)
+  corrupt[0] = corrupt[0]! ^ 1
+  assert.throws(
+    () => openLiteratureCredentials({ ...sealed, ciphertext: corrupt }, owner, env),
+    code('SECRET_INVALID'),
+  )
+  assert.throws(
+    () => parseLiteratureCredentials({ ...credentials, cookie: 'no' }),
+    code('SECRET_INVALID'),
+  )
+  assert.throws(
+    () => parseLiteratureCredentials({ ...credentials, password: 'secret\r\n' }),
+    (error: unknown) => error instanceof Error && error.message === 'SECRET_INVALID',
+  )
+})
+
+test('multimodal is preferred; only cropped normalized pixels and fixed prompt leave boundary', async () => {
+  const log: string[] = []
+  const solver = new LiteratureCaptchaSolver([
+    local(async () => {
+      log.push('local')
+      return '9999'
+    }),
+    cloud(async (input) => {
+      log.push('cloud')
+      assert.equal(input.maxOutputTokens, 64)
+      assert.deepEqual(Object.keys(input).sort(), ['image', 'maxOutputTokens', 'prompt', 'signal'])
+      assert.equal(input.image.mediaType, 'image/png')
+      return ' 1234 '
+    }),
+  ])
+  assert.equal(
+    await solver.solve(await image(), { cloudCalls: 0, maxCloudCalls: 2 }, signal()),
+    '1234',
+  )
+  assert.deepEqual(log, ['cloud'])
+})
+
+test('OpenAI/aliases/unapproved routes never invoke a model; local fallback remains available', async () => {
+  let cloudCalls = 0
+  const forbidden = [
+    {
+      ...cloud(async () => {
+        cloudCalls++
+        return '1234'
+      }),
+      model: 'gpt-5',
+    },
+    {
+      ...cloud(async () => {
+        cloudCalls++
+        return '1234'
+      }),
+      usageApproved: false,
+    },
+    {
+      ...cloud(async () => {
+        cloudCalls++
+        return '1234'
+      }),
+      provider: 'openai' as CaptchaReader['provider'],
+    },
+  ]
+  const solver = new LiteratureCaptchaSolver([...forbidden, local()])
+  assert.equal(
+    await solver.solve(await image(), { cloudCalls: 0, maxCloudCalls: 2 }, signal()),
+    '1234',
+  )
+  assert.equal(cloudCalls, 0)
+})
+
+test('provider refusal does not rotate cloud providers or disguise purpose', async () => {
+  let secondCloud = 0
+  const solver = new LiteratureCaptchaSolver([
+    cloud(async () => {
+      throw new LiteratureError('MODEL_REFUSED')
+    }),
+    {
+      provider: 'google',
+      model: 'gemini-fixture',
+      usageApproved: true,
+      recognize: async () => {
+        secondCloud++
+        return '0000'
+      },
+    },
+    local(),
+  ])
+  assert.equal(
+    await solver.solve(await image(), { cloudCalls: 0, maxCloudCalls: 2 }, signal()),
+    '1234',
+  )
+  assert.equal(secondCloud, 0)
+})
+
+test('model total-call budget, malformed answer and ignored cancellation are bounded', async () => {
+  let calls = 0
+  const solver = new LiteratureCaptchaSolver([
+    cloud(async () => {
+      calls++
+      return '<script>secret</script>'
+    }),
+    local(),
+  ])
+  const budget = { cloudCalls: 0, maxCloudCalls: 2 }
+  const pic = await image()
+  for (let i = 0; i < 4; i++) assert.equal(await solver.solve(pic, budget, signal()), '1234')
+  assert.equal(calls, 2)
+  const slow = new LiteratureCaptchaSolver([cloud(() => new Promise(() => {})), local()], 5)
+  assert.equal(await slow.solve(pic, { cloudCalls: 0, maxCloudCalls: 1 }, signal()), '1234')
+  await assert.rejects(
+    solver.solve({ data: Buffer.from('not-an-image'), mediaType: 'image/png' }, budget, signal()),
+    code('INVALID_INPUT'),
+  )
+})
+
+test('successful login persists private state once and closes before reporting success', async (t) => {
+  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  t.after(() => manager.close())
+  const f = fixture(await image())
+  let release!: () => void
+  f.session.close = async () => {
+    f.calls.closed++
+    await new Promise<void>((resolve) => {
+      release = resolve
+    })
+  }
+  const op = manager.start(owner, async () => f.session, f.persist)
+  while (!release) await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(manager.status(owner.userId, op.operationId).status, 'running')
+  release()
+  const done = await manager.settled(owner.userId, op.operationId)
+  assert.equal(done.status, 'authenticated')
+  assert.equal(f.calls.persisted, 1)
+  assert.equal(f.calls.closed, 1)
+  assert(!JSON.stringify(done).includes('fixture-cookie'))
+})
+
+test('four failed automatic submissions refresh challenges then allow one manual answer', async (t) => {
+  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  t.after(() => manager.close())
+  const f = fixture(await image(), [
+    'captcha_invalid',
+    'captcha_invalid',
+    'captcha_invalid',
+    'captcha_invalid',
+    'authenticated',
+  ])
+  const op = manager.start(owner, async () => f.session, f.persist)
+  const waiting = await manager.settled(owner.userId, op.operationId)
+  assert.equal(waiting.status, 'manual_required')
+  assert.equal(waiting.automaticSubmissions, 4)
+  assert.equal(f.calls.challenges, 5)
+  assert.equal(f.calls.closed, 0)
+  assert.throws(() => manager.image(18, op.operationId, waiting.challengeId!), code('NOT_FOUND'))
+  assert.throws(() => manager.image(17, op.operationId, 'old-challenge'), code('CHALLENGE_STALE'))
+  const first = manager.answer(17, op.operationId, waiting.challengeId!, '5678')
+  assert.throws(
+    () => manager.answer(17, op.operationId, waiting.challengeId!, '5678'),
+    code('CHALLENGE_STALE'),
+  )
+  assert.equal((await first).status, 'authenticated')
+  assert.deepEqual(f.calls.submits, ['1234', '1234', '1234', '1234', '5678'])
+  assert.equal(f.calls.persisted, 1)
+})
+
+test('wrong manual answer terminates and never prompts or submits again', async (t) => {
+  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([]))
+  t.after(() => manager.close())
+  const f = fixture(await image(), ['captcha_invalid'])
+  const op = manager.start(owner, async () => f.session, f.persist)
+  const waiting = await manager.settled(17, op.operationId)
+  assert.equal(
+    (await manager.answer(17, op.operationId, waiting.challengeId!, '1234')).errorCode,
+    'LOGIN_FAILED',
+  )
+  assert.equal(f.calls.submits.length, 1)
+  assert.equal(f.calls.closed, 1)
+})
+
+for (const outcome of ['credentials_invalid', 'blocked'] as const) {
+  test(`${outcome} stops automatic login after one submission`, async (t) => {
+    const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+    t.after(() => manager.close())
+    const f = fixture(await image(), [outcome])
+    const op = manager.start(owner, async () => f.session, f.persist)
+    const done = await manager.settled(17, op.operationId)
+    assert.equal(done.status, 'failed')
+    assert.equal(f.calls.submits.length, 1)
+    assert.equal(f.calls.closed, 1)
+    assert.equal(f.calls.persisted, 0)
+  })
+}
+
+test('unknown POST outcome probes once; never blindly repeats a possibly accepted login', async (t) => {
+  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  t.after(() => manager.close())
+  const f = fixture(await image(), ['unknown'])
+  const op = manager.start(owner, async () => f.session, f.persist)
+  assert.equal((await manager.settled(17, op.operationId)).errorCode, 'SUBMISSION_UNCERTAIN')
+  assert.equal(f.calls.submits.length, 1)
+  assert.equal(f.calls.probes, 1)
+})
+
+test('unknown accepted POST recovers via probe and persists only once', async (t) => {
+  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  t.after(() => manager.close())
+  const f = fixture(await image(), ['unknown'])
+  f.session.probe = async () => true
+  const op = manager.start(owner, async () => f.session, f.persist)
+  assert.equal((await manager.settled(17, op.operationId)).status, 'authenticated')
+  assert.equal(f.calls.submits.length, 1)
+  assert.equal(f.calls.persisted, 1)
+})
+
+test('challenge expiry and per-account/global capacity are enforced', async (t) => {
+  let clock = 1000
+  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([]), {
+    capacity: 1,
+    now: () => clock,
+  })
+  t.after(() => manager.close())
+  const f = fixture(await image())
+  const op = manager.start(owner, async () => f.session, f.persist)
+  const waiting = await manager.settled(17, op.operationId)
+  assert.throws(() => manager.start(owner, async () => f.session, f.persist), code('ACCOUNT_BUSY'))
+  assert.throws(
+    () => manager.start({ ...owner, accountId: '43' }, async () => f.session, f.persist),
+    code('CAPACITY'),
+  )
+  clock = waiting.challengeExpiresAt!
+  assert.throws(
+    () => manager.answer(17, op.operationId, waiting.challengeId!, '1234'),
+    code('CHALLENGE_STALE'),
+  )
+  assert.equal(f.calls.submits.length, 0)
+})
+
+test('cancellation fences a late successful submission and releases only after cleanup', async (t) => {
+  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  t.after(() => manager.close())
+  const f = fixture(await image())
+  let submit!: (value: LoginOutcome) => void
+  f.session.submit = async () =>
+    new Promise((resolve) => {
+      submit = resolve
+    })
+  const op = manager.start(owner, async () => f.session, f.persist)
+  while (!submit) await new Promise((resolve) => setImmediate(resolve))
+  await manager.cancel(17, op.operationId)
+  submit('authenticated')
+  assert.equal((await manager.settled(17, op.operationId)).status, 'cancelled')
+  assert.equal(f.calls.persisted, 0)
+  assert.equal(f.calls.closed, 1)
+})
+
+test('cancelling a late opener keeps the account occupied until its handle is closed', async (t) => {
+  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  t.after(() => manager.close())
+  const f = fixture(await image())
+  let opened!: (session: LiteratureLoginSession) => void
+  const op = manager.start(
+    owner,
+    () =>
+      new Promise((resolve) => {
+        opened = resolve
+      }),
+    f.persist,
+  )
+  while (!opened) await new Promise((resolve) => setImmediate(resolve))
+  const cancel = manager.cancel(17, op.operationId)
+  assert.throws(() => manager.start(owner, async () => f.session, f.persist), code('ACCOUNT_BUSY'))
+  opened(f.session)
+  await cancel
+  assert.equal(f.calls.closed, 1)
+  assert.equal(f.calls.persisted, 0)
+})
+
+test('automatic deadline preserves a live session for manual input', async (t) => {
+  const pic = await image()
+  const solver = new LiteratureCaptchaSolver([cloud(() => new Promise(() => {}))])
+  const manager = new LiteratureLoginManager(solver, { autoBudgetMs: 5 })
+  t.after(() => manager.close())
+  const f = fixture(pic)
+  const op = manager.start(owner, async () => f.session, f.persist)
+  const waiting = await manager.settled(17, op.operationId)
+  assert.equal(waiting.status, 'manual_required')
+  assert.equal(f.calls.closed, 0)
+  assert.equal(f.calls.submits.length, 0)
+})
+
+test('single-hop HTTP reaches the fixture with the original Host and preserves Set-Cookie arrays', async (t) => {
+  const seen: string[] = []
+  const f = await httpFixture((req, res) => {
+    seen.push(req.headers.host ?? '')
+    res.setHeader('Set-Cookie', ['a=1; Expires=Wed, 21 Oct 2037 07:28:00 GMT', 'b=2'])
+    res.end('fixture-page')
+  })
+  t.after(f.close)
+  const r = await f.transport.request({
+    url: `${LITERATURE_SITE}/e/member/login/`,
+    signal: signal(),
+  })
+  assert.equal(r.body.toString(), 'fixture-page')
+  assert.equal(r.headers['set-cookie']?.length, 2)
+  assert.deepEqual(seen, ['www.jieyoutsg.com'])
+  assert.equal(f.options[0]!.hostname, '93.184.216.34')
+  assert.equal(f.options[0]!.agent, false)
+  const tls = literatureSocketOptions(
+    literatureUrl('https://www.jieyoutsg.com/'),
+    { ip: '93.184.216.34', family: 4 },
+    'GET',
+  )
+  assert.equal(tls.servername, 'www.jieyoutsg.com')
+  assert.equal(tls.rejectUnauthorized, true)
+})
+
+test('POST redirects are returned without replay and unsafe redirects are rejected', async (t) => {
+  let received = 0
+  const f = await httpFixture((req, res) => {
+    received++
+    req.resume()
+    res.writeHead(307, { Location: '/next' })
+    res.end()
+  })
+  t.after(f.close)
+  const r = await f.transport.request({
+    url: `${LITERATURE_SITE}/e/member/doaction.php`,
+    method: 'POST',
+    body: Buffer.from('username=synthetic&password=fixture'),
+    signal: signal(),
+  })
+  assert.equal(r.redirect, `${LITERATURE_SITE}/next`)
+  assert.equal(received, 1)
+  const evil = await httpFixture((_req, res) => {
+    res.writeHead(302, { Location: '//evil.test/' })
+    res.end()
+  })
+  t.after(evil.close)
+  await assert.rejects(
+    evil.transport.request({ url: LITERATURE_SITE, signal: signal() }),
+    code('OUTBOUND_BLOCKED'),
+  )
+})
+
+test('transport rejects header injection and fails truncated or oversized bodies', async (t) => {
+  const f = await httpFixture((_req, res) => {
+    res.writeHead(200, { 'Content-Length': 100 })
+    res.end('short')
+  })
+  t.after(f.close)
+  await assert.rejects(
+    f.transport.request({ url: LITERATURE_SITE, cookie: 'a=1\r\nInjected:true', signal: signal() }),
+    code('INVALID_INPUT'),
+  )
+  assert.equal(f.options.length, 0)
+  // A mismatched length response must not be accepted as a page.
+  await assert.rejects(f.transport.request({ url: LITERATURE_SITE, signal: signal() }))
+  const large = await httpFixture((_req, res) => {
+    res.end(Buffer.alloc(1024 * 1024 + 1))
+  })
+  t.after(large.close)
+  await assert.rejects(
+    large.transport.request({ url: LITERATURE_SITE, signal: signal() }),
+    code('RESPONSE_TOO_LARGE'),
+  )
+})
+
+test('class-based inference adapters retain their method and receiver', async () => {
+  class Reader implements CaptchaReader {
+    provider = 'google' as const
+    model = 'gemini-fixture'
+    usageApproved = true
+    calls = 0
+    async recognize() {
+      this.calls++
+      return '1234'
+    }
+  }
+  const reader = new Reader()
+  assert.equal(
+    await new LiteratureCaptchaSolver([reader]).solve(
+      await image(),
+      { cloudCalls: 0, maxCloudCalls: 1 },
+      signal(),
+    ),
+    '1234',
+  )
+  assert.equal(reader.calls, 1)
+})
+
+test('cloud refusal is latched across every challenge in one login budget', async () => {
+  let calls = 0
+  const solver = new LiteratureCaptchaSolver([
+    cloud(async () => {
+      calls++
+      throw new LiteratureError('MODEL_REFUSED')
+    }),
+    local(),
+  ])
+  const budget = { cloudCalls: 0, maxCloudCalls: 4 }
+  const pic = await image()
+  for (let i = 0; i < 4; i++) assert.equal(await solver.solve(pic, budget, signal()), '1234')
+  assert.equal(calls, 1)
+})
+
+test('shutdown waits for cleanup which cancellation has already begun', async () => {
+  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([]))
+  const f = fixture(await image())
+  let release!: () => void
+  f.session.close = async () =>
+    new Promise<void>((resolve) => {
+      release = resolve
+    })
+  const op = manager.start(owner, async () => f.session, f.persist)
+  await manager.settled(17, op.operationId)
+  const cancel = manager.cancel(17, op.operationId)
+  let closed = false
+  const closing = manager.close().then(() => {
+    closed = true
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(closed, false)
+  release()
+  await cancel
+  await closing
+  assert.equal(closed, true)
+})
+
+test('failed cleanup preserves account and capacity fencing and makes shutdown fail visibly', async () => {
+  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([]), { capacity: 1 })
+  const f = fixture(await image())
+  f.session.close = async () => {
+    throw new Error('synthetic-private-worker-details')
+  }
+  const op = manager.start(owner, async () => f.session, f.persist)
+  await manager.settled(17, op.operationId)
+  assert.equal((await manager.cancel(17, op.operationId)).errorCode, 'CLEANUP_FAILED')
+  assert.throws(() => manager.start(owner, async () => f.session, f.persist), code('ACCOUNT_BUSY'))
+  assert.throws(
+    () => manager.start({ ...owner, accountId: '43' }, async () => f.session, f.persist),
+    code('CAPACITY'),
+  )
+  await assert.rejects(manager.close(), code('CLEANUP_FAILED'))
+  assert(!JSON.stringify(manager.status(17, op.operationId)).includes('synthetic-private'))
+})
+
+test('manual challenge never extends the absolute operation lifetime', async (t) => {
+  let clock = 1000
+  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([]), {
+    now: () => clock,
+    operationTtlMs: 60000,
+    manualTtlMs: 120000,
+  })
+  t.after(() => manager.close())
+  const f = fixture(await image())
+  const op = manager.start(owner, async () => f.session, f.persist)
+  const waiting = await manager.settled(17, op.operationId)
+  assert.equal(waiting.challengeExpiresAt, 61000)
+  clock = 61001
+  assert.throws(
+    () => manager.answer(17, op.operationId, waiting.challengeId!, '1234'),
+    code('CHALLENGE_STALE'),
+  )
+})
+
+test('per-account hourly admission limits survive completed operations', async (t) => {
+  let clock = 1000
+  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]), {
+    maxStartsPerHour: 2,
+    now: () => clock,
+  })
+  t.after(() => manager.close())
+  const pic = await image()
+  for (let i = 0; i < 2; i++) {
+    const f = fixture(pic)
+    const op = manager.start(owner, async () => f.session, f.persist)
+    assert.equal((await manager.settled(17, op.operationId)).status, 'authenticated')
+  }
+  const f = fixture(pic)
+  assert.throws(() => manager.start(owner, async () => f.session, f.persist), code('RATE_LIMITED'))
+  clock += 3_600_001
+  const next = manager.start(owner, async () => f.session, f.persist)
+  assert.equal((await manager.settled(17, next.operationId)).status, 'authenticated')
+})

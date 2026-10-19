@@ -28,8 +28,8 @@
 1. policy.ts：固定site origin为http://www.jieyoutsg.com:80；拒user-info、额外端口/裸域/子域/相似域/非http(s)协议；HTTPS该host也可用。每次请求/重定向都校验，复用resolvePinnedAddress全部A/AAAA公网检查，执行连接固定到已验IP。允许GET/HEAD/POST，绝不从用户输入扩展域名。
 2. credentials.ts：严格versioned username/password schema；复用AEAD和loadKmsKey/zeroBuffer，AAD绑定userId/accountId/site随机seed。先提供可测seal/open接口，后续只通过现有账户绑定/撤权事务持久化；不能另建无授权凭据旁路，也不能提前声称已经持久保存用户账号。未知字段拒绝，秘值不入异常。
 3. captcha.ts：窄inference adapter只有provider/model/图像/signal，平台配置用途核对后启用。OpenAI/GPT路线硬拒，不接任意URL，图片字节/尺寸/格式和答案长度/字符限制；固定诚实用途提示、无工具/无账号/无历史，超时/拒绝不无限重试。注入本地OCR作为可选首选/兜底。识别预算按请求数/超时控制，后续真实平台推理还须资源计量，不对免费安装用户暗扣。
-4. login.ts：持有原session的多用户operation manager，原始图片仅通过user/op/challenge鉴权取用；每账号单飞、全局容量、随机挑战ID、TTL、一次消费；自动最多4次提交，captcha明确错才重试、每次新图。未知提交结果先probe，禁止盲重发。两次读同挑战、重复答案、跨租户请求、取消、超时、关机均可验证。人工只输入/提交一次，失败明示；private session负责保存成功state并在关闭前确认完成，错误输出只白名单code。
-5. transport.ts：受固定policy约束的原始HTTP/HTTPS表单客户端（不执行网页JS），连接用已验pin，cookie严格限制到该host并防header注入，重定向逐跳验证；POST不能携口令跨origin或被307自动重发，读字节/超时受限；没有为fixture放开生产私网。后续真实worker可沿同策略实现浏览器absolute-form HTTP relay，保留network=none与broker，不复用微博只支持CONNECT的relay冒称HTTP浏览器可用。
+4. login.ts：持有原session的多用户operation manager，原始图片仅通过user/op/challenge鉴权取用；每账号单飞、默认每账号每小时最多6个登录operation、全局容量、随机挑战ID、TTL、一次消费；自动最多4次提交，captcha明确错才重试、每次新图。未知提交结果先probe，禁止盲重发。两次读同挑战、重复答案、跨租户请求、取消、超时、关机均可验证。人工只输入/提交一次，失败明示；private session负责保存成功state并在关闭前确认完成，错误输出只白名单code。
+5. transport.ts：受固定policy约束的原始HTTP/HTTPS表单客户端（不执行网页JS），连接用已验pin，防cookie头注入并保留Set-Cookie数组给私有session；本层只执行单跳请求并验证Location，不自动跟跳或重发POST，session后续按domain/path/secure选择cookie、逐跳重验和重新pin，读字节/超时受限；没有为fixture放开生产私网。后续真实worker可沿同策略实现浏览器absolute-form HTTP relay，保留network=none与broker，不复用微博只支持CONNECT的relay冒称HTTP浏览器可用。
 
 第一阶段是真实可调用/测试的登录底座，不是已经完成产品接线。尚不把它当runtime已支持HTTP、市场已可装或网站已可用。
 
