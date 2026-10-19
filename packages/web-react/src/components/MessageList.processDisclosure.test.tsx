@@ -2497,3 +2497,20 @@ describe("OCV5-370 过程摘要上的详情面板入口", () => {
     expect(screen.queryByTestId("process-pane-changes")).not.toBeInTheDocument();
   });
 });
+
+test("OCV5-525: hidden next tail leaves the task summary visible outside the steps", async () => {
+  const rows = [
+    row("u525", "user", "接手任务", { status: "replied" }),
+    row("work525", "tool", "终端", { toolName: "Bash", inputJson: { command: "probe" }, output: "ok", _completed: true, _clientMessageId: "u525" }),
+    row("summary525", "assistant", "方案已复核，修改已推送。", { _clientMessageId: "u525" }),
+    row("approval525", "tool", "审批卡", { toolName: "ExecuteExtraTool", _completed: true, output: "ok", _clientMessageId: "u525" }),
+    row("prediction525", "assistant", '```ui\n{"type":"next","text":"通过"}\n```', { _clientMessageId: "u525" }),
+  ];
+  const view = renderList(rows);
+  const summary = await screen.findByText("方案已复核，修改已推送。");
+  expect(summary.closest('[data-testid="process-disclosure"]')).toBeNull();
+  expect(screen.getAllByTestId("assistant-row")).toHaveLength(1);
+  view.rerender(<MessageList processDisclosure messages={JSON.parse(JSON.stringify(rows))} sending={false} sessionId="session-a" cb={{}} onRespondPermission={() => {}} />);
+  expect(await screen.findByText("方案已复核，修改已推送。")).toBeInTheDocument();
+  expect(screen.getAllByTestId("assistant-row")).toHaveLength(1);
+});
