@@ -14,6 +14,10 @@
 #                          listeners, stop the slots, enable --now the legacy unit.
 # Exit 0 on success; every failure leaves the serving process as it was, if any.
 set -Eeuo pipefail
+if [[ "${CP_EGRESS_POLICY:-0}" == 1 ]]; then
+  source "$CP_BUNDLE/lib/v5-commercial-release-policy.sh"
+  commercial_policy_remote_owner || exit 86
+fi
 LEGACY=openclaude-v5-egress.service
 SOCK_TPL=openclaude-v5-egress@.socket
 SVC_TPL=openclaude-v5-egress@.service
@@ -86,6 +90,10 @@ assert_no_orphan_listener() {
 # Both slots active (an earlier flip was killed half way): stop the older one completely while
 # the newer keeps serving, so exactly one slot serves and the other is free to start again.
 settle_both_active() {
+  if [[ "${CP_EGRESS_POLICY:-0}" == 1 && "$(state "$(unit A service)")" == active && "$(state "$(unit B service)")" == active ]]; then
+    echo '✗ policy: two active egress slots require exact recovery; no mtime-based stop' >&2
+    return 79
+  fi
   if [[ "$(state "$(unit A service)")" == active && "$(state "$(unit B service)")" == active ]]; then
     local ta tb older
     ta="$(systemctl show -p ActiveEnterTimestampMonotonic --value "$(unit A service)")"
@@ -104,7 +112,7 @@ cmd_flip() {
   [[ "$predrain" =~ ^[0-9]+$ ]] || die "predrain must be seconds"
   [[ -f "/etc/systemd/system/$SVC_TPL" && -f "/etc/systemd/system/$SOCK_TPL" ]] || die "slot templates not installed"
   [[ "$(sysctl -n net.ipv4.tcp_migrate_req 2>/dev/null || echo 0)" == 1 ]] || die "tcp_migrate_req is not 1"
-  settle_both_active
+  settle_both_active || return $?
   if [[ "$(state "$(unit A service)")" == active ]]; then cur=A; target=B
   elif [[ "$(state "$(unit B service)")" == active ]]; then cur=B; target=A
   else target=A; fi
@@ -112,6 +120,10 @@ cmd_flip() {
   # One-time migration: the legacy unit holds a plain bind on the shared port. Wait (bounded) for
   # its in-flight streams to finish while it keeps serving, then stop it.
   st="$(state "$LEGACY")"
+  if [[ "${CP_EGRESS_POLICY:-0}" == 1 && ( "$st" == active || "$st" == activating || "$st" == deactivating ) ]]; then
+    echo '✗ policy: legacy migration needs a separate adapter; existing service retained' >&2
+    return 79
+  fi
   if [[ "$st" == active || "$st" == activating || "$st" == deactivating ]]; then
     for (( i = 0; i < predrain; i += 5 )); do
       left="$(legacy_inflight)"
@@ -131,8 +143,12 @@ cmd_flip() {
       || die "slot $target did not finish draining"
   fi
   echo "  egress-slots: starting slot $target${cur:+ (serving: $cur)}" >&2
+  [[ "${CP_EGRESS_POLICY:-0}" != 1 ]] || commercial_policy_egress_target "$target" || return $?
   if ! systemctl start "$new_sock" || ! systemctl start "$new_svc" || ! wait_slot_ready "$target"; then
     tail -n 40 /var/log/openclaude-v5-egress.log >&2 || true
+    if [[ "${CP_EGRESS_POLICY:-0}" == 1 ]]; then
+      commercial_policy_egress_failure "$target" || return $?
+    fi
     systemctl stop --job-mode=ignore-dependencies "$new_sock" 2>/dev/null || true
     systemctl stop "$new_svc" 2>/dev/null || true
     if (( migrated )); then
@@ -148,6 +164,7 @@ cmd_flip() {
   if [[ -n "$cur" ]]; then
     # Close the old listener first (ms), then stop the service without blocking (it drains).
     # Stopping both in one job would keep the old .socket until the drain ends: a black hole.
+    [[ "${CP_EGRESS_POLICY:-0}" != 1 ]] || commercial_policy_remote_owner || return 86
     old_sock="$(unit "$cur" socket)"; old_svc="$(unit "$cur" service)"
     systemctl stop --job-mode=ignore-dependencies "$old_sock"
     systemctl stop --no-block "$old_svc"
@@ -169,7 +186,7 @@ port_free() { ! ss -Hltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; }
 cmd_legacy() {
   local s i restore=""
   # Codex r3 P1: never drain both slots at once, or a failed legacy start has nothing to restore.
-  settle_both_active
+  settle_both_active || return $?
   for s in A B; do
     systemctl stop --job-mode=ignore-dependencies "$(unit "$s" socket)" 2>/dev/null || true
   done

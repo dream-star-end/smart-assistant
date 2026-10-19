@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(here, '../..')
 const deploy = path.join(root, 'scripts/deploy-v5.sh')
+const commercialPolicy = path.join(root, 'scripts/lib/v5-commercial-release-policy.sh')
 const selfhostDeploy = path.join(root, 'scripts/deploy-v5-selfhost.sh')
 const branchPolicy = path.join(root, 'scripts/v5-branch-policy.sh')
 const deploySurfaceCheck = path.join(root, 'scripts/v5-deploy-surface-check.mjs')
@@ -2223,7 +2224,7 @@ describe('v5 release safety lanes', () => {
     )
     assert.ok(build.indexOf('harden_release_baseline "$staging"') < build.indexOf('publish_strong_release'))
     assert.match(source, /activate_release\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
-    assert.match(source, /activate_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$BUILT_RELEASE"/)
+    assert.match(await readFile(commercialPolicy, 'utf8'), /activate_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$BUILT_RELEASE"/)
     assert.match(source, /rollback_runtime_tuple\(\)[\s\S]*?verify_release_baseline_security "\$master"/)
     assert.match(source, /ROLLBACK_LEGACY_BASELINE_OK=1 smoke "\$ACTIVE_PORT"/)
     assert.match(source, /verify_release_baseline_security\(\)[\s\S]*ROLLBACK_LEGACY_BASELINE_OK/)
@@ -3349,7 +3350,8 @@ describe('v5 release safety lanes', () => {
     const source = await readFile(deploy, 'utf8')
     // 地板挂在**全部**激活/回滚路径:传统激活、hotcfg tuple、tuple 回滚、P3 candidate。
     for (const fn of ['activate_release', 'activate_runtime_tuple', 'rollback_runtime_tuple', 'canary']) {
-      const body = source.match(new RegExp(`(?:^|\\n)${fn}\\(\\) \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? ''
+      const functionSource = fn === 'activate_runtime_tuple' ? await readFile(commercialPolicy, 'utf8') : source
+      const body = functionSource.match(new RegExp(`(?:^|\\n)${fn}\\(\\) \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? ''
       assert.match(body, /assert_model_authority_floor/, `${fn} 未挂兼容地板`)
       assert.match(body, /assert_lossless_turn_tape_floor/, `${fn} 未挂 lossless tape 兼容地板`)
     }
@@ -4280,7 +4282,7 @@ describe('v5 release safety lanes', () => {
       /if \[\[ -n "\$TARGET_RUNTIME_IMAGE" \]\]; then[\s\S]*RUNTIME_IMAGE_REF="\$TARGET_RUNTIME_IMAGE"[\s\S]*RUNTIME_IMAGE_ID=.*docker image inspect/,
     )
     assert.match(
-      source,
+      await readFile(commercialPolicy, 'utf8'),
       /hotcfg_rmt oc_hotcfg_activate_saga[\s\S]*"\$image" "\$image_id" "\$release" "\$bundle_val"/,
     )
   })

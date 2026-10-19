@@ -171,6 +171,7 @@ RUNTIME_LIB="$SCRIPT_DIR/v5-runtime-release-lib.sh"
 [ -f "$RUNTIME_LIB" ] || { echo "FATAL: 缺 runtime release lib: $RUNTIME_LIB" >&2; exit 1; }
 # shellcheck source=scripts/v5-runtime-release-lib.sh
 source "$RUNTIME_LIB"
+source "$SCRIPT_DIR/lib/v5-commercial-release-policy.sh"
 FLAVOR_LIB="$SCRIPT_DIR/lib/assert-flavor.sh"
 if [[ -f "$FLAVOR_LIB" ]]; then
   # shellcheck source=scripts/lib/assert-flavor.sh
@@ -366,6 +367,7 @@ for arg in "$@"; do
     # 【不】重启它(这正是解耦目的);仅 egress 相关代码(anthropicProxy/账号池/
     # 计费 finalize/egress/*)变更时显式带本 flag。重启走 SIGTERM drain。
     --egress) RESTART_EGRESS=1 ;;
+    --failure-policy=*) COMMERCIAL_FAILURE_POLICY="${arg#*=}" ;;
     *) echo "未知参数: $arg" >&2; exit 2 ;;
   esac
 done
@@ -465,6 +467,13 @@ if [[ -n "$TARGET_RUNTIME_IMAGE$TARGET_RUNTIME_IMAGE_ID" ]]; then
     || { echo "✗ --runtime-image-id 必须是 sha256:64位小写hex" >&2; exit 2; }
   [[ "$DISABLE_RELEASE_FLAG" != 1 ]] \
     || { echo "✗ 在线 slim image 切换不能同时 --disable-runtime-release" >&2; exit 2; }
+fi
+
+if [[ -n "$COMMERCIAL_FAILURE_POLICY" ]]; then
+  [[ "$COMMERCIAL_FAILURE_POLICY" == user-impact-only && ( "$MODE" == deploy || "$MODE" == recover ) ]] \
+    || { echo '✗ --failure-policy=user-impact-only supports normal deploy or exact-context recover only' >&2; exit 2; }
+  [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" != 1 ]] \
+    || { echo '✗ setup-first requires its own policy adapter; no exposure performed' >&2; exit 2; }
 fi
 
 run() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] $*"; else eval "$@"; fi; }
@@ -2551,6 +2560,14 @@ REMOTE
 
 assert_no_deploy_recovery_marker() {
   [[ "$DRY" == 1 ]] && return 0
+  if [[ "$MODE" != recover ]] && ! ssh "$KL_HOST" "test ! -e '$CP_ROOT/active.json' && test ! -L '$CP_ROOT/active.json'"; then
+    echo '✗ unresolved commercial release policy context; exact-context recover required' >&2
+    return 79
+  fi
+  if [[ "$MODE" == recover ]] && ! commercial_policy_enabled && ! ssh "$KL_HOST" "test ! -e '$CP_ROOT/active.json' && test ! -L '$CP_ROOT/active.json'"; then
+    echo '✗ typed context requires --recover --failure-policy=user-impact-only' >&2
+    return 79
+  fi
   if [[ "$MODE" != "recover" ]] && ! ssh "$KL_HOST" "test ! -e '$DEPLOY_RECOVERY_MARKER'"; then
     echo "✗ 检测到未收敛的人工恢复标记:$KL_HOST:$DEPLOY_RECOVERY_MARKER" >&2
     ssh "$KL_HOST" "sed -n '1,20p' '$DEPLOY_RECOVERY_MARKER'" 2>/dev/null | sed 's/^/  /' >&2 || true
@@ -6025,6 +6042,10 @@ hotcfg_ship_lib() {
 # stdout = 该函数 stdout(如 bundleRev / releaseDir),供 $(...) 捕获;lib 的日志走 stderr。
 hotcfg_rmt() {
   local fn="$1"; shift
+  if commercial_policy_enabled && [[ "$fn" == oc_hotcfg_activate_saga ]]; then
+    commercial_policy_rmt "$fn" "$@"
+    return $?
+  fi
   hotcfg_ship_lib || return 1
   ssh "$KL_HOST" "bash -s -- $(printf '%q ' "$@")" <<RLIB
 set -Eeuo pipefail
@@ -6447,94 +6468,7 @@ build_hotcfg_state_hooks() {  # $1=target master release
     "$V5_ENV" "$revert_sql" "$status_sql"
 }
 
-activate_runtime_tuple() {
-  echo "── 激活 runtime tuple saga ──"
-  if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] saga: [pre-state(首启)]→[canary validate-only]→extra_apply(master symlink→$BUILT_RELEASE)→env tuple(四键恒写,禁用轴空值)→[flip current]→restart→smoke→history commit"
-    return 0
-  fi
-  assert_commercial_flavor_on_target "$BUILT_RELEASE" || return 1
-  assert_release_marker "$BUILT_RELEASE" || return 1
-  assert_release_required_migrations "$BUILT_RELEASE" || return 1
-  assert_release_baseline_security "$BUILT_RELEASE" || return 1
-  # hotcfg 路径的 master symlink 翻转走 saga 的 extra_apply,**不经 activate_release** →
-  # 两个 capability 门必须在这里显式再挂一次(否则开了 hotcfg 就等于绕过了所有制品守卫)。
-  # 容器 tuple 面由 lib 的 assert_tuple_viable ③ 在 saga 内覆盖(release MANIFEST / 镜像 label)。
-  assert_release_capability_for_sessions_pg "$BUILT_RELEASE"
-  assert_lossless_turn_tape_floor "$BUILT_RELEASE"
-  assert_model_authority_floor "$BUILT_RELEASE"
-  local prev_src old_prev="" image image_id release bundle_val flip_rev restart_cmd smoke_cmd extra_apply extra_revert prev_apply="" prev_revert=""
-  prev_src="$(bg_current_release "$ACTIVE_SRC")"
-  [[ -n "$prev_src" ]] || { echo "✗ hotcfg 激活前无法解析 slot=$ACTIVE_SLOT 当前 release" >&2; return 1; }
-  assert_web_storage_rollback_transition \
-    "$prev_src" "${ACTIVE_STATE_PREVIOUS_RELEASE:-}" "$BUILT_RELEASE" \
-    "runtime hotcfg master activation" || return 1
-  assert_release_marker "$prev_src" || {
-    echo "✗ hotcfg 激活前 exact predecessor marker 无效:$prev_src" >&2; return 1;
-  }
-  assert_direct_turn_timeline_pair "$prev_src" "$BUILT_RELEASE" "runtime hotcfg activation" || return 1
-  # M7c:快照翻转**前**的 .prev-release 指针内容,失败恢复时一并还原(否则 saga 失败一次丢 rollback 指针)。
-  if [[ "$ACTIVE_SLOT" == A ]]; then
-    old_prev="$(ssh "$KL_HOST" "cat '$RELEASES_ROOT/.prev-release' 2>/dev/null || true")"
-    prev_apply="printf '%s\\n' '$prev_src' > '$RELEASES_ROOT/.prev-release.tmp' && mv -f '$RELEASES_ROOT/.prev-release.tmp' '$RELEASES_ROOT/.prev-release';"
-    if [[ -n "$old_prev" ]]; then
-      prev_revert="printf '%s\\n' '$old_prev' > '$RELEASES_ROOT/.prev-release.tmp' && mv -f '$RELEASES_ROOT/.prev-release.tmp' '$RELEASES_ROOT/.prev-release';"
-    else
-      prev_revert="rm -f '$RELEASES_ROOT/.prev-release';"
-    fi
-  fi
-  # image / image_id **恒写**:release 轴启用则用刚 inspect 的;否则从 env 取 image 并 inspect 出 id(供 stale/label/canary)。
-  if hotcfg_release_axis_on; then
-    image="$RUNTIME_IMAGE_REF"; image_id="$RUNTIME_IMAGE_ID"; release="$BUILT_RUNTIME_RELEASE"
-  else
-    if [[ "$DISABLE_RELEASE_FLAG" == 1 && -n "$EMERG_IMAGE" ]]; then
-      # R3-B1:禁用 release 轴时显式切换到内嵌源码镜像(tuple 可行性守卫要求 embed_source≠0;
-      # ID 就地核验,tag 漂移在此拦下而非等 saga)。
-      image="$EMERG_IMAGE"
-      image_id="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}' '$image'" 2>/dev/null || true)"
-      [[ "$image_id" == "$EMERG_IMAGE_ID" ]] \
-        || { echo "✗ --image 的 immutable ID($image_id)与 --image-id($EMERG_IMAGE_ID)不符" >&2; return 1; }
-    else
-      image="$(ssh "$KL_HOST" "grep '^OC_RUNTIME_IMAGE=' '$V5_ENV' | tail -n1 | cut -d= -f2-")"
-      image_id="$(ssh "$KL_HOST" "docker image inspect --format '{{.Id}}' '$image'" 2>/dev/null || true)"
-    fi
-    # R2-B1:release 轴禁用/未启用 → 传**空串**(恒写 OC_RUNTIME_RELEASE=,值空=禁用,--disable 后即稳态)。
-    # 注:saga 内 oc_hotcfg_assert_tuple_viable 会对"镜像 embed_source=0 + 空 release"fail-loud(R3-B1)。
-    release=""
-  fi
-  # This activation introduces a v2 writer together with its capable master.
-  # Prove the actual target tuple before any saga side effect, even before the
-  # first tape exists; metadata-only declarations are insufficient.
-  assert_lossless_runtime_tuple_capability "$image_id" "$release" || return 1
-  # bundle 轴:启用则翻新 rev + 写新绝对路径;禁用/未启用 → flip_rev 空(不翻 current)+ 写空值(R2-B1)。
-  if hotcfg_bundle_axis_on; then
-    flip_rev="$BUILT_BUNDLE_REV"; bundle_val="$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"
-  else
-    flip_rev=""; bundle_val=""
-  fi
-  restart_cmd="systemctl restart '$ACTIVE_UNIT'"
-  # 远端核心健康门(fail-closed):ok=true + channel=v5 + sessionsDb=ok(与 smoke() 深度探活同不变量)。
-  # 全量 smoke(调度器白名单等第二道防线)在 saga 提交后由 deploy() 另跑本地 smoke() 兜底。
-  smoke_cmd="$(hotcfg_core_smoke_cmd)"
-  # extra:master 源码 symlink 翻转(先原子落 .prev-release=prev_src,再 ln+mv -T);
-  # revert(M7c):**先还原 .prev-release=old_prev**(翻转前快照),再翻回 master symlink=prev_src。
-  extra_apply="$prev_apply rm -f '$ACTIVE_SRC.hotlink'; ln -s '$BUILT_RELEASE' '$ACTIVE_SRC.hotlink'; mv -T '$ACTIVE_SRC.hotlink' '$ACTIVE_SRC'"
-  extra_revert="$prev_revert rm -f '$ACTIVE_SRC.hotlink'; ln -s '$prev_src' '$ACTIVE_SRC.hotlink'; mv -T '$ACTIVE_SRC.hotlink' '$ACTIVE_SRC'"
-  build_hotcfg_state_hooks "$BUILT_RELEASE"
-  # M7a:masterRelease=$BUILT_RELEASE(本次激活的 master 蓝绿 release)进 history,rollback 从同一条取回对齐。
-  # R2-B2:prev_master=$prev_src(激活前 live master)供首次启用的 pre-state 记录。
-  hotcfg_rmt oc_hotcfg_activate_saga \
-    "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$flip_rev" "$OC_HOTCFG_HISTORY" \
-    "$image" "$image_id" "$release" "$bundle_val" \
-    "$restart_cmd" "$smoke_cmd" "$extra_apply" "$extra_revert" "$BUILT_RELEASE" "$prev_src" \
-    "$HOTCFG_STATE_COMMIT_CMD" "$HOTCFG_STATE_REVERT_CMD" "$DEPLOY_RECOVERY_MARKER" "joint" \
-    || { echo "✗ 激活 saga 失败,已自动回滚旧 tuple(env/current/master 源码/.prev-release/重启旧 master)" >&2; return 1; }
-  ACTIVE_STATE_PREVIOUS_RELEASE="$ACTIVE_STATE_RELEASE"
-  ACTIVE_STATE_RELEASE="$BUILT_RELEASE"
-  ACTIVE_STATE_LOCK_VERSION=$((ACTIVE_STATE_LOCK_VERSION + 1))
-  echo "  ✓ runtime tuple 激活并提交 history(release=${release:-<none>} bundle=${flip_rev:-<unchanged>} master=$BUILT_RELEASE)"
-  run "sleep 3"
-}
+# activate_runtime_tuple is defined in the mandatory commercial policy library.
 
 # ── 4. gc_runtime_artifacts:best-effort GC(§1.4)。失败只告警不回滚。──
 gc_runtime_artifacts() {
@@ -7087,6 +7021,10 @@ EGRESS_READY_LAST_STATE=""; EGRESS_READY_LAST_PID=""; EGRESS_READY_LAST_CWD=""; 
 egress_slots_remote() { # <active|install <rel>|flip [predrain-sec]|legacy>
   local a q args=""
   for a in "$@"; do printf -v q '%q' "$a"; args+=" $q"; done
+  if commercial_policy_enabled && [[ "$1" != active ]]; then
+    commercial_policy_rmt commercial_policy_egress "$@"
+    return $?
+  fi
   ssh "$KL_HOST" "bash -s --$args" < "$SCRIPT_DIR/v5-egress-slots.sh"
 }
 
@@ -8257,6 +8195,7 @@ weibo_plugin_finish_or_seed() { # <release> <previous> <hotcfg:0|1> <egress-swit
   if weibo_plugin_seed "$release"; then
     return 0
   fi
+  commercial_policy_failure weibo-seed || return $?
   echo "✗ Weibo Plugin 发布/迁移失败；执行门保持关闭，开始 source+DB 对称补偿" >&2
   require_mutation_lease_for_compensation "weibo-seed-compensation" || exit 86
   weibo_compensate_deploy "$release" "$previous" "$hotcfg" "$egress_switched" "$previous_egress" "$wb_had_previous" \
@@ -8312,8 +8251,14 @@ activate_egress_release() {
     fi
     echo "✗ egress 新 release 活体/进程 cwd/capability 未就绪，尝试回切 $prev" >&2
   else
+    local egress_rc=$?; [[ "$egress_rc" != 86 ]] || return 86
     echo "✗ egress 新 release 启动失败（双槽:新槽未就绪时旧槽仍在服务），尝试回切 $prev" >&2
   fi
+
+  local egress_user_impairment=1
+  if commercial_policy_enabled; then if commercial_policy_rmt commercial_policy_egress_unavailable "$reldir"; then egress_user_impairment=0; else egress_user_impairment=$?; fi; else egress_user_impairment=0; fi
+  [[ "$egress_user_impairment" != 86 ]] || return 86
+  [[ "$egress_user_impairment" == 0 ]] || commercial_policy_failure egress-activation || return $?
 
   # 新 unit 的 WorkingDirectory 是稳定独立指针，所以回切先原子翻回旧 release。
   # 旧进程仍在服务时(新槽没起来)指针翻回即可；否则在旧 release 上再翻一次槽(或 legacy restart)。
@@ -8426,6 +8371,9 @@ deploy() {
     echo "✗ production-mutation lease 失活;跳过 maintenance cleanup，crash-stop(live 未改)" >&2
     exit 86
   fi
+  if commercial_policy_enabled && [[ "$DRY" != 1 && "$hc_any" != 1 ]]; then
+    echo '✗ user-impact-only requires runtime saga; direct activation not attempted' >&2; exit 2
+  fi
   echo "── Knowledge Planet Plugin:关闭跨版本执行门──"
   local kp_deploy_bracket=1
   if ! knowledge_planet_plugin_close_gate "$BUILT_RELEASE"; then
@@ -8503,7 +8451,9 @@ deploy() {
   fi
   local wb_deploy_bracket="$WEIBO_DEPLOY_BRACKET" wb_had_previous_plugin="$WEIBO_HAD_PREVIOUS_PLUGIN"
   if [[ "$hc_any" == 1 ]]; then
-    if ! activate_runtime_tuple; then
+    if activate_runtime_tuple; then :; else
+      local activation_rc=$?
+      case "$activation_rc" in 78|79) commercial_policy_keep_failed "$activation_rc"; exit $? ;; 86) exit 86 ;; esac
       require_mutation_lease_for_compensation "runtime-tuple-activation-recovery" || exit 86
       if [[ "$kp_had_previous_plugin" == 1 ]]; then
         if [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" == 1 ]]; then
@@ -8557,6 +8507,7 @@ deploy() {
       if activate_egress_release "$BUILT_RELEASE" "$egress_prev_release"; then
         egress_switched=1
       else
+        local egress_activation_rc=$?; case "$egress_activation_rc" in 78|79|86) exit "$egress_activation_rc" ;; esac
         validation_failure="egress activation failed"
       fi
     fi
@@ -8596,6 +8547,7 @@ deploy() {
     fi
   fi
   if [[ -n "$validation_failure" ]]; then
+    commercial_policy_failure validation || exit $?
     echo "✗ $validation_failure；Plugin 门仍关闭，开始 source/DB 对称补偿" >&2
     # F7:补偿(恢复旧稳态)前 复核 lease,缩小与自愈 host-action 并发窗;失活则 crash-stop，禁止无 lease 补偿。
     require_mutation_lease_for_compensation "deploy-validation-compensation" || exit 86
@@ -8627,9 +8579,10 @@ deploy() {
     weibo_plugin_finish_or_seed "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
       "$egress_switched" "$egress_prev_release" "$wb_deploy_bracket" \
       "$wb_had_previous_plugin" "$kp_had_previous_plugin" "$kp_setup_plugin_version_id" \
-      || exit 1
+      || exit $?
     end_planned_maintenance
     smoke_sourcemap_sealed || exit 1
+    commercial_policy_finish || exit $?
     gc_releases
     [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
     echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT,knowledge-planet=setup-first)。"
@@ -8640,9 +8593,10 @@ deploy() {
     weibo_plugin_finish_or_seed "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
       "$egress_switched" "$egress_prev_release" "$wb_deploy_bracket" \
       "$wb_had_previous_plugin" "$kp_had_previous_plugin" \
-      || exit 1
+      || exit $?
     end_planned_maintenance
     smoke_sourcemap_sealed || exit 1
+    commercial_policy_finish || exit $?
     gc_releases
     [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
     echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT,knowledge-planet=zero-touch)。"
@@ -8650,6 +8604,7 @@ deploy() {
   fi
   echo "── Knowledge Planet Plugin:消费加密交接 + 绑定账号 + 官方发布/install 升级 + 旧 Skill 加法迁移──"
   if ! knowledge_planet_plugin_seed "$BUILT_RELEASE"; then
+    commercial_policy_failure knowledge-planet-seed || exit $?
     echo "✗ Knowledge Planet Plugin 发布/迁移失败；执行门保持关闭，开始 source+DB 对称补偿" >&2
     # F7:同上,补偿前 复核 lease(helper 幂等,与上方 validation 补偿可安全连调)。
     require_mutation_lease_for_compensation "deploy-validation-compensation" || exit 86
@@ -8668,9 +8623,10 @@ deploy() {
   weibo_plugin_finish_or_seed "$BUILT_RELEASE" "$kp_previous_release" "$hc_any" \
     "$egress_switched" "$egress_prev_release" "$wb_deploy_bracket" \
     "$wb_had_previous_plugin" "$kp_had_previous_plugin" \
-    || exit 1
+    || exit $?
   end_planned_maintenance
   smoke_sourcemap_sealed || exit 1
+  commercial_policy_finish || exit $?
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts   # best-effort(§1.4:失败只告警不回滚)
   echo "✓ deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"
@@ -8963,6 +8919,7 @@ deploy_dist() {
   end_planned_maintenance
   # dist(纯前端)是 UI 回归的最高发面(2026-07-18 附件事故即 --dist 上线),E2E 旅程门必跑。
   smoke_sourcemap_sealed || exit 1
+  commercial_policy_finish || exit $?
   gc_releases
   [[ "$hc_any" == 1 ]] && gc_runtime_artifacts
   echo "✓ dist deploy 完成(release=$BUILT_RELEASE,slot=$ACTIVE_SLOT)。"
@@ -11194,6 +11151,11 @@ abort_continue() {
 # ═════════ --recover:崩溃重跑,按 (phase, transition_step) 走 §8 恢复矩阵 ═════════
 recover() {
   echo "══ v5 --recover(按 §8 恢复矩阵从 (phase, transition_step) 续作)══"
+  if commercial_policy_enabled; then
+    resolve_active_lane
+    commercial_policy_recover
+    return $?
+  fi
   ds_snapshot
   local p="$DS_phase" s="$DS_transition_step" cand="${DS_candidate_slot:-}" old="$DS_active_slot"
   OP="${DS_operation_id:-p3-recover-$$}"
