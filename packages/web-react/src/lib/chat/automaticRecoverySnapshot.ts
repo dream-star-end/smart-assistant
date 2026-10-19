@@ -30,12 +30,16 @@ export function applyAutomaticRecoverySnapshot(
         isServerAuthoredRow(message));
       if (child || sess._cancelledAutomaticRecoveryIds?.[cmid] === true) continue;
       const job = recoveries.find((item) => item.sourceClientMessageId === cmid);
-      if (!job) {
+      // Phase A is visible before Phase B atomically decides recovery. Only
+      // this response can say whether an empty job set is authoritative.
+      const decisionPending = incoming.some((message) => message._clientMessageId === cmid &&
+        message._automaticRecoveryDecisionPending === true);
+      if (!job && !decisionPending) {
         sess._automaticRecoveryDecisions = { ...(sess._automaticRecoveryDecisions ?? {}), [cmid]: true };
         effects.settle(cmid, "declined");
         continue;
       }
-      if (sess._cancelledAutomaticRecoveryIds?.[job.rootClientMessageId] === true) continue;
+      if (sess._cancelledAutomaticRecoveryIds?.[job?.rootClientMessageId ?? cmid] === true) continue;
       // A later user intent or an ACKed child owns the UI, even if this older
       // snapshot completed after the live adoption.
       const index = sess.messages.findIndex((message) => message.role === "user" && message.id === cmid);
@@ -50,7 +54,7 @@ export function applyAutomaticRecoverySnapshot(
       error._errorCardSnapshot = undefined;
       sess._deferredTerminalErrorClientMessageId = cmid;
       enterDeferredRecoverySoftState(sess, cmid);
-      sess._turnStatus = { kind: "retrying", attempt: job.attempt, max: AUTOMATIC_TURN_RETRY_MAX, retryAt: Date.now() };
+      sess._turnStatus = { kind: "retrying", attempt: job?.attempt ?? 1, max: AUTOMATIC_TURN_RETRY_MAX, retryAt: Date.now() };
     }
   }
 

@@ -6818,7 +6818,31 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       createdAt: 1_783_950_100_000,
       usage: { inputTokens: 1, outputTokens: 1 },
     });
-    await stageAndFinalize(CUSER, tape);
+    assert.ok(sourceAdmission.kind === "admitted");
+    const dispatch = { dispatchId: sourceAdmission.dispatch.dispatchId,
+      dispatchAttemptNo: sourceAdmission.dispatch.attemptNo };
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(CUSER, { ...part.request, ...dispatch }, part.bytes);
+    }
+    const finalize = { ...tape.finalize, ...dispatch };
+    await backend.finalizeLosslessTurnTape(CUSER, {
+      ...finalize,
+      settlement: { billingAnchorId: `srv-${sessionId}-main-t1`, engineBillings: [],
+        text: "temporary upstream failure", ts: 1_783_950_100_000, errorCode: "upstream_failed" },
+    }, { materialize: false });
+    for (const snapshot of [
+      await backend.getClientSession(sessionId, CUSER, { view: "timeline" }),
+      await backend.getClientSessionPartial(sessionId, CUSER, 0, { view: "timeline" }),
+    ]) {
+      assert.deepEqual(snapshot?.automaticRecoveries, []);
+      const source = (snapshot?.messages as MessageLike[]).find((row) =>
+        row._clientMessageId === sourceClientMessageId && row._errorCode);
+      assert.equal(source?._automaticRecoveryDecisionPending, true,
+        "INC-20261019-RECOVERABLE-ERROR-RED-CARD: visible phase A cannot decide recovery before materialization");
+    }
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM turn_recovery_jobs
+      WHERE user_id=$1 AND session_id=$2`, [UID, sessionId])).rows[0].n, 0);
+    await backend.finalizeLosslessTurnTape(CUSER, finalize);
     const jobs = await pool.query<{
       recovery_mode: string;
       error_code: string;
@@ -6848,6 +6872,8 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       errorCode: "upstream_failed", mode: "checkpoint", attempt: 1,
     }];
     const full = await backend.getClientSession(sessionId, CUSER, { view: "timeline" });
+    assert.ok((full?.messages as MessageLike[]).some((row) =>
+      row._clientMessageId === sourceClientMessageId && row._automaticRecoveryDecisionPending === false));
     assert.deepEqual(full?.automaticRecoveries, expected,
       "INC-20261019-RECOVERABLE-ERROR-RED-CARD: timeline returns the exact active recovery without request payload");
     assert.deepEqual((await backend.getClientSessionPartial(sessionId, CUSER, 0,

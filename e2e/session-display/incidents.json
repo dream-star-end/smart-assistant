@@ -900,7 +900,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T29 自动重试只显示中性的进行中状态（无模型繁忙、无 n/10）；重试成功保持实时可见"
+          "assertion": "T29 自动恢复统一显示模型繁忙正在重试；重试成功保持实时可见"
         }
       ]
     },
@@ -924,7 +924,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T29 自动重试只显示中性的进行中状态（无模型繁忙、无 n/10）；重试成功保持实时可见"
+          "assertion": "T29 自动恢复统一显示模型繁忙正在重试；重试成功保持实时可见"
         },
         {
           "layer": "integration",
@@ -1255,7 +1255,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T29 自动重试只显示中性的进行中状态（无模型繁忙、无 n/10）；重试成功保持实时可见"
+          "assertion": "T29 自动恢复统一显示模型繁忙正在重试；重试成功保持实时可见"
         }
       ]
     },
