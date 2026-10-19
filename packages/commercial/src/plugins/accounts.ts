@@ -1,3 +1,8 @@
+import { type JieyouAccountState, parseJieyouAccountState } from './literatureDb/accountState.js'
+import {
+  isLiteratureHttpContract,
+  isLiteratureHttpIdentity,
+} from './literatureDb/builtinContract.js'
 /** Encrypted account storage for managed-browser Plugins (connections table, strict v1 envelope). */
 
 import { randomUUID } from 'node:crypto'
@@ -68,6 +73,28 @@ export interface PluginAccountEnvelopeV1 {
   driverVersion: string
   accountInstanceId: string
   storageState: BrowserStorageStateV1
+}
+
+export interface LiteratureHttpAccountEnvelopeV1
+  extends Omit<PluginAccountEnvelopeV1, 'storageState'> {
+  storageState: JieyouAccountState
+}
+type StoredPluginAccountEnvelope = Omit<PluginAccountEnvelopeV1, 'storageState'> & {
+  storageState: BrowserStorageStateV1 | JieyouAccountState
+}
+
+function validateAccountStorageState(
+  input: unknown,
+  contract: ManagedBrowserPluginContractV1,
+): StoredPluginAccountEnvelope['storageState'] {
+  if (isLiteratureHttpContract(contract)) {
+    try {
+      return parseJieyouAccountState(input)
+    } catch {
+      throw new PluginAccountError('INVALID_STATE', 'HTTP account state failed validation')
+    }
+  }
+  return validateBrowserStorageState(input, contract)
 }
 
 function stateInvalid(message: string): never {
@@ -143,6 +170,8 @@ export function validateBrowserStorageState(
   input: unknown,
   contract: ManagedBrowserPluginContractV1,
 ): BrowserStorageStateV1 {
+  if (contract.runtime.transport !== undefined)
+    stateInvalid('HTTP account state cannot use the browser state validator')
   let serialized: string
   try {
     serialized = JSON.stringify(input)
@@ -246,10 +275,10 @@ export function validateBrowserStorageState(
   return state
 }
 
-function validateEnvelope(
+function validateStoredEnvelope(
   input: unknown,
   contract: ManagedBrowserPluginContractV1,
-): PluginAccountEnvelopeV1 {
+): StoredPluginAccountEnvelope {
   const value = dataObject(input, 'Plugin account envelope')
   exactKeys(
     value,
@@ -278,7 +307,7 @@ function validateEnvelope(
     driverId: contract.runtime.driverId,
     driverVersion: contract.runtime.driverVersion,
     accountInstanceId: value.accountInstanceId,
-    storageState: validateBrowserStorageState(value.storageState, contract),
+    storageState: validateAccountStorageState(value.storageState, contract),
   }
 }
 
@@ -318,7 +347,7 @@ const ACCOUNT_COLS = `id::text AS id, user_id::int AS user_id, provider, display
   status, meta, revoked_at`
 
 function encryptEnvelope(
-  envelope: PluginAccountEnvelopeV1,
+  envelope: StoredPluginAccountEnvelope,
   userId: number,
   slug: string,
   aadSeed: string,
@@ -334,11 +363,11 @@ function encryptEnvelope(
   }
 }
 
-export function decryptPluginAccountEnvelope(
+function decryptStoredPluginAccountEnvelope(
   row: PluginAccountRow,
   contract: ManagedBrowserPluginContractV1,
   env: NodeJS.ProcessEnv = process.env,
-): PluginAccountEnvelopeV1 {
+): StoredPluginAccountEnvelope {
   if (row.secret_enc === null || row.secret_nonce === null)
     throw new PluginAccountError('ACCOUNT_REVOKED', 'Plugin account has no secret')
   const key = loadKmsKey(env)
@@ -350,7 +379,7 @@ export function decryptPluginAccountEnvelope(
       key,
       connectionAad(row.aad_seed, row.user_id, row.provider),
     )
-    return validateEnvelope(JSON.parse(plaintext.toString('utf8')), contract)
+    return validateStoredEnvelope(JSON.parse(plaintext.toString('utf8')), contract)
   } catch (error) {
     if (error instanceof PluginAccountError) throw error
     throw new PluginAccountError('SECRET_INVALID', 'Plugin account secret failed validation')
@@ -358,6 +387,28 @@ export function decryptPluginAccountEnvelope(
     if (plaintext) zeroBuffer(plaintext)
     zeroBuffer(key)
   }
+}
+
+/** Existing browser API deliberately retains its strict browser return type. */
+export function decryptPluginAccountEnvelope(
+  row: PluginAccountRow,
+  contract: ManagedBrowserPluginContractV1,
+  env: NodeJS.ProcessEnv = process.env,
+): PluginAccountEnvelopeV1 {
+  if (contract.runtime.transport !== undefined)
+    throw new PluginAccountError('SECRET_INVALID', 'HTTP state requires its dedicated decryptor')
+  const envelope = decryptStoredPluginAccountEnvelope(row, contract, env)
+  return { ...envelope, storageState: validateBrowserStorageState(envelope.storageState, contract) }
+}
+export function decryptLiteratureHttpAccountEnvelope(
+  row: PluginAccountRow,
+  contract: ManagedBrowserPluginContractV1,
+  env: NodeJS.ProcessEnv = process.env,
+): LiteratureHttpAccountEnvelopeV1 {
+  if (!isLiteratureHttpContract(contract))
+    throw new PluginAccountError('SECRET_INVALID', 'HTTP account contract pin mismatch')
+  const envelope = decryptStoredPluginAccountEnvelope(row, contract, env)
+  return { ...envelope, storageState: parseJieyouAccountState(envelope.storageState) }
 }
 
 /**
@@ -388,7 +439,7 @@ export async function migrateManagedBrowserPluginAccountVersionFenced(input: {
       'INVALID_STATE',
       'Plugin account transition would change canonical storage state',
     )
-  const envelope: PluginAccountEnvelopeV1 = {
+  const envelope: StoredPluginAccountEnvelope = {
     schemaVersion: 1,
     pluginType: 'managed-browser',
     driverId: input.to.contract.runtime.driverId,
@@ -554,7 +605,7 @@ export async function bindManagedBrowserPluginAccount(
           'INVALID_STATE',
           'write authorization reset requires a fenced account refresh',
         )
-      const storageState = validateBrowserStorageState(input.storageState, verified.contract)
+      const storageState = validateAccountStorageState(input.storageState, verified.contract)
       const existing = await client.query<PluginAccountRow>(
         `SELECT ${ACCOUNT_COLS} FROM connections
           WHERE user_id = $1 AND provider = $2 AND revoked_at IS NULL
@@ -576,7 +627,11 @@ export async function bindManagedBrowserPluginAccount(
           current.auth_contract_version !== verified.contract.account.contractVersion
         )
           throw new PluginAccountError('ACCOUNT_STALE', 'existing Plugin account pin mismatch')
-        const currentEnvelope = decryptPluginAccountEnvelope(current, verified.contract, input.env)
+        const currentEnvelope = decryptStoredPluginAccountEnvelope(
+          current,
+          verified.contract,
+          input.env,
+        )
         const identicalState =
           JSON.stringify(currentEnvelope.storageState) === JSON.stringify(storageState)
         const replacementReplay =
@@ -631,7 +686,7 @@ export async function bindManagedBrowserPluginAccount(
         }
         if (input.existing === 'refresh-fenced') {
           const aadSeed = randomUUID()
-          const envelope: PluginAccountEnvelopeV1 = {
+          const envelope: StoredPluginAccountEnvelope = {
             schemaVersion: 1,
             pluginType: 'managed-browser',
             driverId: verified.contract.runtime.driverId,
@@ -700,7 +755,7 @@ export async function bindManagedBrowserPluginAccount(
           )
         const accountInstanceId = input.replacementAccountInstanceId!
         const aadSeed = randomUUID()
-        const envelope: PluginAccountEnvelopeV1 = {
+        const envelope: StoredPluginAccountEnvelope = {
           schemaVersion: 1,
           pluginType: 'managed-browser',
           driverId: verified.contract.runtime.driverId,
@@ -762,7 +817,7 @@ export async function bindManagedBrowserPluginAccount(
         input.env ?? process.env,
       )
       const aadSeed = randomUUID()
-      const envelope: PluginAccountEnvelopeV1 = {
+      const envelope: StoredPluginAccountEnvelope = {
         schemaVersion: 1,
         pluginType: 'managed-browser',
         driverId: verified.contract.runtime.driverId,
@@ -858,13 +913,18 @@ export async function fencePluginAccountInvocation(input: {
 export async function commitPluginAccountState(input: {
   row: PluginAccountRow
   verified: VerifiedRuntimePluginContract
-  envelope: PluginAccountEnvelopeV1
+  envelope: PluginAccountEnvelopeV1 | LiteratureHttpAccountEnvelopeV1
   runner: QueryRunner
   env?: NodeJS.ProcessEnv
 }): Promise<string> {
   if (input.verified.pluginType !== 'managed-browser')
     throw new PluginAccountError('INVALID_STATE', 'runtime Plugin is not accountful')
-  const envelope = validateEnvelope(input.envelope, input.verified.contract)
+  if (
+    input.verified.contract.runtime.transport !== undefined &&
+    !isLiteratureHttpIdentity({ ...input.verified, contract: input.verified.contract })
+  )
+    throw new PluginAccountError('INVALID_STATE', 'HTTP account identity pin mismatch')
+  const envelope = validateStoredEnvelope(input.envelope, input.verified.contract)
   const aadSeed = randomUUID()
   const encrypted = encryptEnvelope(
     envelope,
@@ -894,6 +954,7 @@ export async function commitPluginAccountState(input: {
              AND v.security_review_state = 'security_approved'
              AND v.functional_verify_state = 'verified'
              AND v.exec_revoked_at IS NULL
+             AND ($14::boolean = FALSE OR v.review_source = 'platform')
              AND l.kind = 'connector' AND l.plugin_type = 'managed-browser'
              AND l.state = 'active' AND l.current_approved_version_id = v.id
         )
@@ -912,6 +973,7 @@ export async function commitPluginAccountState(input: {
       aadSeed,
       input.verified.contract.account.contractVersion,
       input.verified.artifactHash,
+      isLiteratureHttpContract(input.verified.contract),
     ],
   )
   if (updated.rowCount !== 1)

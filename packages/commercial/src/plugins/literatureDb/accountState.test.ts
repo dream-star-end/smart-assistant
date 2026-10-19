@@ -191,3 +191,16 @@ test('pre-epoch cookie deletion preserves unrelated valid session state', () => 
   )
   assert(jar.getCookieStringSync(`${LITERATURE_SITE}/e/member/`).includes('sid=synthetic-cookie'))
 })
+
+test('an unrelated expired deletion does not exhaust a full live-cookie budget', () => {
+  const jar = createJieyouCookieJar()
+  for (let i = 0; i < 64; i++)
+    acceptJieyouCookie(jar, `sid${i}=x; Path=/`, LITERATURE_SITE, Date.now())
+  acceptJieyouCookie(
+    jar,
+    'obsolete=; Path=/other/; Expires=Wed, 31 Dec 1969 23:59:59 GMT',
+    LITERATURE_SITE,
+    Date.now(),
+  )
+  assert.equal(exportJieyouAccountState(jar).cookies.length, 64)
+})

@@ -33,3 +33,7 @@ parse5/tough-cookie已显式加入commercial runtime依赖，锁定现有8.0.1/6
 首次setup在LoginOwner中使用`kind:setup + userId + 固定site`，与真实accountId分开；并发与每小时起次按用户和站点聚合，operation ID由manager生成。首次登录成功后的真实账号分配/加密凭据持久化仍须受信bind事务，不伪造accountId或预建active账号。当前未开放setup路由。
 
 本地验证仅可使用任务专有临时PostgreSQL实例和私有网络命名空间；即使使用dedicated数据库helper，也须将其base/admin连接指向该独立实例，禁止默认共享测试库。详见H交接和独立runner审计证据。
+
+`builtinArtifact.ts/builtinContract.ts`定义尚未上架的0.1.0固定search/download接口（有界查询、opaque文献/平台文件编号，不收发任意URL/凭据）。compiler仅完整artifact hash匹配才生成本站HTTP transport/state discriminator；复制slug/driver不够。旧artifact不生成新字段，compiler version仍1。loader还要求平台review_source及原有效签名/功能核验/未撤销条件。
+
+`accounts.ts`仅为该精确HTTP合同选择严格Cookie state，复用现有connections AEAD/AAD、bind锁/安装授权、generation/revision/CAS和撤销；原browser解密API及secure:true/HTTPS验证器保留，HTTP有专用解密器，不能走旧browser版本迁移。最终HTTP提交额外重新检查平台来源，防止审核来源在执行期间变化。此片只保存合成Cookie，不保存用户名/密码；未来真实setup需要另接凭据密文事务与会话TTL。没有市场seed、runtime driver注册、对外路由或真实身份判断，合同存在不代表可安装/可执行。integ中functionalVerified:true只指独立临时DB里的合成fixture，绝不是真实站点验收。

@@ -151,6 +151,8 @@ export function acceptJieyouCookie(
       ignoreError: false,
       now: new Date(receivedAt),
     })
+    // Garbage-collect expired cookies at every path before applying the live-state budget.
+    jar.getCookiesSync('https://www.jieyoutsg.com/', { http: true, allPaths: true })
     // Validate the complete result, including cookies that do not match the current path.
     exportJieyouAccountState(jar, receivedAt)
   } catch (error) {
