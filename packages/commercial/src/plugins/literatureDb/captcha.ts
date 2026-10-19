@@ -12,6 +12,8 @@ export interface CaptchaReader {
   model: string
   /** Server configuration confirms this exact provider/route/use; never request input. */
   usageApproved: boolean
+  /** Trusted local worker settles only after its owned process has really closed. */
+  drainsOnAbort?: true
   recognize(input: {
     image: CaptchaImage
     prompt: string
@@ -85,6 +87,7 @@ export class LiteratureCaptchaSolver {
           provider: reader.provider,
           model: reader.model,
           usageApproved: reader.usageApproved,
+          drainsOnAbort: reader.provider === 'local-ocr' ? reader.drainsOnAbort : undefined,
           recognize: reader.recognize.bind(reader),
         }
       })
@@ -113,20 +116,19 @@ export class LiteratureCaptchaSolver {
       signal.addEventListener('abort', abort, { once: true })
       const timer = setTimeout(abort, this.timeoutMs)
       try {
+        const recognition = Promise.resolve().then(() =>
+          reader.recognize({
+            image: { data: Buffer.from(clean.data), mediaType: clean.mediaType },
+            prompt: CAPTCHA_PROMPT,
+            maxOutputTokens: 64,
+            signal: controller.signal,
+          }),
+        )
         return captchaAnswer(
-          await abortable(
-            Promise.resolve().then(() =>
-              reader.recognize({
-                image: { data: Buffer.from(clean.data), mediaType: clean.mediaType },
-                prompt: CAPTCHA_PROMPT,
-                maxOutputTokens: 64,
-                signal: controller.signal,
-              }),
-            ),
-            controller.signal,
-          ),
+          await (reader.drainsOnAbort ? recognition : abortable(recognition, controller.signal)),
         )
       } catch (error) {
+        if (error instanceof LiteratureError && error.code === 'CLEANUP_FAILED') throw error
         if (signal.aborted) throw new LiteratureError('CANCELLED')
         if (error instanceof LiteratureError && error.code === 'MODEL_REFUSED')
           budget.cloudRefused = true

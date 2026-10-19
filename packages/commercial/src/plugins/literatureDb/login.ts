@@ -53,6 +53,7 @@ interface Operation {
   controller: AbortController
   session?: LiteratureLoginSession
   opening?: Promise<LiteratureLoginSession>
+  solving?: Promise<string>
   challenge?: { id: string; image: CaptchaImage; expiresAt: number }
   persist(state: unknown, context: LoginPersistenceContext): Promise<void>
   done: Promise<void>
@@ -179,8 +180,13 @@ export class LiteratureLoginManager {
     }
     this.operations.set(id, op)
     this.accounts.add(key)
-    op.done = this.run(op, open).catch(async () => {
-      await this.fail(op, 'LOGIN_FAILED')
+    op.done = this.run(op, open).catch(async (error) => {
+      await this.fail(
+        op,
+        error instanceof LiteratureError && error.code === 'CLEANUP_FAILED'
+          ? 'CLEANUP_FAILED'
+          : 'LOGIN_FAILED',
+      )
     })
     return this.view(op)
   }
@@ -251,8 +257,15 @@ export class LiteratureLoginManager {
         let answer: string
         try {
           const image = await abortable(session.challenge(automatic.signal), automatic.signal)
-          answer = await solver.solve(image, budget, automatic.signal)
+          const solving = solver.solve(image, budget, automatic.signal)
+          op.solving = solving
+          try {
+            answer = await solving
+          } finally {
+            if (op.solving === solving) op.solving = undefined
+          }
         } catch (error) {
+          if (error instanceof LiteratureError && error.code === 'CLEANUP_FAILED') throw error
           if (!this.current(op)) return
           if (
             automatic.signal.aborted ||
@@ -428,6 +441,7 @@ export class LiteratureLoginManager {
     }
     clearTimeout(op.timer)
     op.challenge = undefined
+    const solving = op.solving
     op.controller.abort()
     op.view = {
       operationId: op.view.operationId,
@@ -444,7 +458,20 @@ export class LiteratureLoginManager {
             /* Any returned handle is still closed below. */
           }
         }
-        await this.closeSession(op)
+        const drained = await Promise.allSettled([
+          this.closeSession(op),
+          solving ?? Promise.resolve(),
+        ])
+        if (
+          drained.some(
+            (result, index) =>
+              result.status === 'rejected' &&
+              (index === 0 ||
+                (result.reason instanceof LiteratureError &&
+                  result.reason.code === 'CLEANUP_FAILED')),
+          )
+        )
+          throw new LiteratureError('CLEANUP_FAILED')
         if (status === 'authenticated') op.view.status = 'authenticated'
       } catch {
         op.view.status = 'failed'

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { type ChildProcess, spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { createWriteStream } from 'node:fs'
 import { mkdtemp, rm, stat } from 'node:fs/promises'
@@ -15,7 +16,7 @@ import type { Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Writable } from 'node:stream'
-import test from 'node:test'
+import test, { type TestContext } from 'node:test'
 import sharp from 'sharp'
 import type { DnsResolver } from '../../connectors/outboundPolicy.js'
 import { normalizeHttpsOrigin } from '../../connectors/outboundPolicy.js'
@@ -28,6 +29,7 @@ import {
   serializeSealedLiteratureCredentials,
 } from './credentials.js'
 import { LiteratureError } from './errors.js'
+import { type LocalCaptchaReaderOptions, createLocalCaptchaReader } from './localCaptchaReader.js'
 import {
   LiteratureLoginManager,
   type LiteratureLoginOptions,
@@ -1502,4 +1504,351 @@ test('stream results preserve status without asserting PDF validity or following
     assert.equal(target.sink.closed, true)
     assert(f.sockets.every((socket) => socket.closed))
   }
+})
+
+function latch() {
+  let release!: () => void
+  const promise = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  return { promise, release }
+}
+function localProcessFixture(t: TestContext, source: string) {
+  const ready = latch()
+  let child: ChildProcess | undefined
+  let closed = false
+  let closePromise: Promise<void> | undefined
+  const spawnProcess: NonNullable<LocalCaptchaReaderOptions['spawnProcess']> = (
+    file,
+    args,
+    options,
+  ) => {
+    assert.equal(file, '/task-ocr-bundle/venv/bin/python')
+    assert.deepEqual(args, ['-I', '-B', '/task-ocr-bundle/runner.py'])
+    assert.deepEqual(Object.keys(options.env ?? {}).sort(), [
+      'LANG',
+      'MKL_NUM_THREADS',
+      'OMP_NUM_THREADS',
+      'OPENBLAS_NUM_THREADS',
+      'PATH',
+    ])
+    assert.equal(options.shell, false)
+    assert.equal(options.detached, true)
+    assert.deepEqual(options.stdio, ['pipe', 'pipe', 'ignore'])
+    child = spawn(process.execPath, ['-e', source], options)
+    closePromise = new Promise((resolve) =>
+      child!.once('close', () => {
+        closed = true
+        resolve()
+      }),
+    )
+    child.stdout!.once('data', () => ready.release())
+    return child
+  }
+  t.after(async () => {
+    if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    await closePromise
+  })
+  return { spawnProcess, ready: ready.promise, child: () => child!, closed: () => closed }
+}
+const fixturePixels = `
+const input = [];
+process.stdin.on('data', b => input.push(b));
+process.stdin.on('end', () => {
+  const png = Buffer.concat(input);
+  if (!png.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) process.exit(2);
+  if (process.env.G524_SYNTHETIC_SECRET) process.exit(3);
+  BODY
+});`
+function workerSource(body: string) {
+  return fixturePixels.replace('BODY', body)
+}
+
+test('local OCR success waits for physical close and preserves the shared worker slot', async (t) => {
+  const f = localProcessFixture(
+    t,
+    workerSource(`
+    process.on('SIGUSR2', () => process.exit(0));
+    setInterval(() => {}, 1000);
+    process.stderr.write('synthetic private diagnostic');
+    process.stdout.write(JSON.stringify({v:1,answer:'AB12'}));
+  `),
+  )
+  const reader = createLocalCaptchaReader({
+    bundleRoot: '/task-ocr-bundle',
+    spawnProcess: f.spawnProcess,
+  })
+  const pic = await image()
+  let completed = false
+  const result = reader
+    .recognize({ image: pic, prompt: 'fixed', maxOutputTokens: 64, signal: signal() })
+    .then((answer) => {
+      completed = true
+      return answer
+    })
+  await f.ready
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(completed, false)
+  assert.equal(f.closed(), false)
+  const other = createLocalCaptchaReader({
+    bundleRoot: '/task-ocr-bundle',
+    spawnProcess: f.spawnProcess,
+  })
+  await assert.rejects(
+    other.recognize({ image: pic, prompt: 'fixed', maxOutputTokens: 64, signal: signal() }),
+    code('CAPACITY'),
+  )
+  f.child().kill('SIGUSR2')
+  assert.equal(await result, 'AB12')
+  assert.equal(f.closed(), true)
+})
+
+test('local OCR rejects malformed or oversized private output and failed spawn without leaking it', async (t) => {
+  const pic = await image()
+  for (const output of [
+    'private-invalid-output',
+    '{"v":1,"answer":"1234","extra":true}',
+    '{"v":1,"answer":" 12 "}',
+    'x'.repeat(257),
+  ]) {
+    const f = localProcessFixture(
+      t,
+      workerSource(`process.stdout.write(${JSON.stringify(output)});`),
+    )
+    const reader = createLocalCaptchaReader({
+      bundleRoot: '/task-ocr-bundle',
+      spawnProcess: f.spawnProcess,
+    })
+    await assert.rejects(
+      reader.recognize({ image: pic, prompt: 'fixed', maxOutputTokens: 64, signal: signal() }),
+      code('MODEL_UNAVAILABLE'),
+    )
+    assert.equal(f.closed(), true)
+  }
+  const missing = createLocalCaptchaReader({ bundleRoot: '/g524-nonexistent-ocr-bundle' })
+  await assert.rejects(
+    missing.recognize({ image: pic, prompt: 'fixed', maxOutputTokens: 64, signal: signal() }),
+    code('MODEL_UNAVAILABLE'),
+  )
+})
+
+test('local OCR cancellation reaps a TERM-ignoring child before returning or freeing capacity', async (t) => {
+  const f = localProcessFixture(
+    t,
+    workerSource(`
+    process.on('SIGTERM', () => {});
+    setInterval(() => {}, 1000);
+    process.stdout.write(JSON.stringify({v:1,answer:'AB12'}));
+  `),
+  )
+  const reader = createLocalCaptchaReader({
+    bundleRoot: '/task-ocr-bundle',
+    spawnProcess: f.spawnProcess,
+  })
+  const pic = await image()
+  const controller = new AbortController()
+  const work = reader.recognize({
+    image: pic,
+    prompt: 'fixed',
+    maxOutputTokens: 64,
+    signal: controller.signal,
+  })
+  const rejected = assert.rejects(work, code('CANCELLED'))
+  await f.ready
+  controller.abort()
+  assert.equal(f.closed(), false)
+  await assert.rejects(
+    reader.recognize({ image: pic, prompt: 'fixed', maxOutputTokens: 64, signal: signal() }),
+    code('CAPACITY'),
+  )
+  await rejected
+  assert.equal(f.closed(), true)
+  assert.equal(f.child().signalCode, 'SIGKILL')
+  let spawned = false
+  const never = createLocalCaptchaReader({
+    bundleRoot: '/task-ocr-bundle',
+    spawnProcess: () => {
+      spawned = true
+      throw new Error('private')
+    },
+  })
+  await assert.rejects(
+    never.recognize({
+      image: pic,
+      prompt: 'fixed',
+      maxOutputTokens: 64,
+      signal: controller.signal,
+    }),
+    code('CANCELLED'),
+  )
+  assert.equal(spawned, false)
+})
+
+test('local OCR wall timeout waits for its actual process close', async (t) => {
+  const f = localProcessFixture(t, workerSource('setInterval(() => {}, 1000);'))
+  const reader = createLocalCaptchaReader({
+    bundleRoot: '/task-ocr-bundle',
+    spawnProcess: f.spawnProcess,
+    timeoutMs: 20,
+  })
+  await assert.rejects(
+    reader.recognize({
+      image: await image(),
+      prompt: 'fixed',
+      maxOutputTokens: 64,
+      signal: signal(),
+    }),
+    code('TIMEOUT'),
+  )
+  assert.equal(f.closed(), true)
+})
+
+async function drainingLogin(t: TestContext, closeFails = false) {
+  const entered = latch()
+  const aborted = latch()
+  const reap = latch()
+  const f = fixture(await image())
+  if (closeFails)
+    f.session.close = async () => {
+      f.calls.closed++
+      throw new Error('private')
+    }
+  const reader: CaptchaReader = {
+    ...local(async ({ signal }) => {
+      entered.release()
+      signal.addEventListener('abort', aborted.release, { once: true })
+      await reap.promise
+      throw new LiteratureError('CANCELLED')
+    }),
+    drainsOnAbort: true,
+  }
+  const manager = createManager(new LiteratureCaptchaSolver([reader]), { capacity: 1 })
+  t.after(async () => {
+    reap.release()
+    await manager.close().catch(() => {})
+  })
+  const op = manager.start(owner, async () => f.session, f.persist)
+  await entered.promise
+  return { f, manager, op, aborted: aborted.promise, reap: reap.release }
+}
+
+test('login cancel keeps owner and capacity until the local solver actually drains', async (t) => {
+  const f = await drainingLogin(t)
+  let done = false
+  const cancelling = f.manager.cancel(17, f.op.operationId).then((view) => {
+    done = true
+    return view
+  })
+  await f.aborted
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(done, false)
+  assert.throws(
+    () => f.manager.start(owner, async () => f.f.session, f.f.persist),
+    code('ACCOUNT_BUSY'),
+  )
+  assert.throws(
+    () => f.manager.start({ userId: 18, accountId: '43' }, async () => f.f.session, f.f.persist),
+    code('CAPACITY'),
+  )
+  f.reap()
+  assert.equal((await cancelling).status, 'cancelled')
+  assert.equal(f.f.calls.submits.length, 0)
+  assert.equal(f.f.calls.persisted, 0)
+  assert.equal(f.f.calls.closed, 1)
+})
+
+test('login expiry keeps local solver cleanup in its owner barrier', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const f = await drainingLogin(t)
+  t.mock.timers.tick(300_000)
+  await f.aborted
+  assert.equal(f.manager.status(17, f.op.operationId).status, 'expired')
+  assert.throws(
+    () => f.manager.start(owner, async () => f.f.session, f.f.persist),
+    code('ACCOUNT_BUSY'),
+  )
+  let done = false
+  const closing = f.manager.close().then(() => {
+    done = true
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(done, false)
+  f.reap()
+  await closing
+  assert.equal(f.f.calls.submits.length, 0)
+  assert.equal(f.f.calls.persisted, 0)
+  assert.equal(f.f.calls.closed, 1)
+})
+
+test('login shutdown waits for local solver cleanup without late submission or save', async (t) => {
+  const f = await drainingLogin(t)
+  let done = false
+  const closing = f.manager.close().then(() => {
+    done = true
+  })
+  await f.aborted
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(done, false)
+  f.reap()
+  await closing
+  assert.equal(f.manager.status(17, f.op.operationId).status, 'cancelled')
+  assert.equal(f.f.calls.submits.length, 0)
+  assert.equal(f.f.calls.persisted, 0)
+  assert.equal(f.f.calls.closed, 1)
+})
+
+test('session cleanup failure still waits for the local solver and retains owner', async (t) => {
+  const f = await drainingLogin(t, true)
+  let done = false
+  const cancelling = f.manager.cancel(17, f.op.operationId).then((view) => {
+    done = true
+    return view
+  })
+  await f.aborted
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(done, false)
+  f.reap()
+  assert.equal((await cancelling).errorCode, 'CLEANUP_FAILED')
+  assert.throws(
+    () => f.manager.start(owner, async () => f.f.session, f.f.persist),
+    code('ACCOUNT_BUSY'),
+  )
+  await assert.rejects(f.manager.close(), code('CLEANUP_FAILED'))
+})
+
+test('automatic budget cannot hide a local CLEANUP_FAILED or enter manual fallback', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const entered = latch()
+  const f = fixture(await image())
+  const reader: CaptchaReader = {
+    ...local(
+      ({ signal }) =>
+        new Promise((_resolve, reject) => {
+          entered.release()
+          signal.addEventListener('abort', () => reject(new LiteratureError('CLEANUP_FAILED')), {
+            once: true,
+          })
+        }),
+    ),
+    drainsOnAbort: true,
+  }
+  const manager = createManager(new LiteratureCaptchaSolver([reader]), {
+    autoBudgetMs: 5,
+    capacity: 1,
+  })
+  const op = manager.start(owner, async () => f.session, f.persist)
+  await entered.promise
+  t.mock.timers.tick(5)
+  const view = await manager.settled(17, op.operationId)
+  assert.equal(view.status, 'failed')
+  assert.equal(view.errorCode, 'CLEANUP_FAILED')
+  assert.throws(() => manager.start(owner, async () => f.session, f.persist), code('ACCOUNT_BUSY'))
+  assert.throws(
+    () => manager.start({ userId: 18, accountId: '43' }, async () => f.session, f.persist),
+    code('CAPACITY'),
+  )
+  assert.equal(f.calls.challenges, 1)
+  assert.equal(f.calls.submits.length, 0)
+  assert.equal(f.calls.persisted, 0)
+  await assert.rejects(manager.close(), code('CLEANUP_FAILED'))
 })

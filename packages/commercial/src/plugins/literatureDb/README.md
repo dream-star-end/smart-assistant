@@ -41,3 +41,24 @@ parse5/tough-cookie已显式加入commercial runtime依赖，锁定现有8.0.1/6
 `LiteratureLoginManager`现在只接受每operation的同步solver factory；它收到冻结的owner副本和manager内部生成的真实operationId，在session open前构造一次。一个manager仍统一执行容量/频控，不能按operation新建manager；生产factory必须用同一userId+operationId绑定所有reader与持久化meter。自动重试复用局部solver和预算，取消/绝对期限已到时不构造reader；factory失败用原清理路径释放占用。仅合成官方fetch+独立DB用例证明两个用户交错和重试归属，尚无生产setup接线。
 
 `requestToSink` 是内部单跳有界原始流：固定25MiB实际字节上限，保留DNS/pin、Host/SNI、TLS、期限和不跟跳/POST不重放语义。pipeline向独占Writable传播背压；成功、错误与取消都等待consumer、sink清理和物理socket关闭。sink必须是新建的受信流；有原生资源的sink保留默认autoDestroy/emitClose并在`_destroy`排空自己的I/O（如原生fs.WriteStream）；本层不接受文件路径，失败partial由调用方删除。status/headers/bytes不是有效PDF或artifact证明，格式/账号/租约/ready发布仍未接线；旧buffer路径仍默认1MiB、最大8MiB。
+
+The offline CPU reader uses a trusted, server-owned absolute bundle root containing
+`venv/bin/python` (Python 3.12) and `runner.py` copied from `localCaptchaRunner.py`.
+Build the Linux x86_64 bundle from the eight exact wheels in
+`localCaptchaRequirements.lock`; verify complete wheel hashes before an offline
+`--no-index --require-hashes --only-binary=:all: --no-deps` install, run `pip check`,
+and preserve every wheel's LICENSE/NOTICE. Never install or download models at
+request time. The worker also checks its pinned model, charset and SDK source.
+A development bundle or synthetic smoke does not prove target-site accuracy.
+Production bundle/configuration and marketplace activation require separate approval.
+
+Each recognition owns one short-lived process, private pixel stdin and <=256B JSON
+stdout. It inherits no service environment or credentials. Limits are 15s wall,
+10s CPU time and 2GiB virtual address space, with one worker slot per service process.
+The pinned SDK lacks a SessionOptions hook, so only this worker temporarily supplies
+ORT's explicit single-thread session options and restores the original constructor.
+The limits and actual resource use must be verified for the target bundle; address
+space is not a promise about RSS or a platform-wide CPU quota. Cancellation sends
+TERM then KILL after 100ms and waits for actual process/stdio close before releasing
+capacity. Login cancellation, expiry and shutdown also wait for that local cleanup;
+cloud readers retain bounded cancellation even if they ignore their signal.
