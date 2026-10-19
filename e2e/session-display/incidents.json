@@ -1372,7 +1372,7 @@
         {
           "layer": "unit",
           "path": "packages/web-react/src/components/chat/turnActivity.test.tsx",
-          "assertion": "OCV5-390: retrying → only the neutral in-progress line, no busy wording, counter or warning colour"
+          "assertion": "OCV5-523: retrying → one model-busy retry hint, no counter or warning colour"
         },
         {
           "layer": "browser",
