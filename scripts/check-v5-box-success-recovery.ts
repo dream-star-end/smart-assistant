@@ -46,6 +46,7 @@ const BEHAVIOR = [
   "unknown worker_complete closed through reconcileBatch to a readable capsule and this-round usage",
   "intermediate handoff stayed pending without capsule or CAS",
   "a just-finished run keeps its native pointer: cleanup waits until the pointer is attached",
+  "[ocv5-520-go-pool-wiring] PASS — ordinary Go uses an enabled pool identity instead of disabled static credentials while request bytes and session headers stay stable",
 ];
 const HOLD_PY = [
   "import os, signal, sys, time",
@@ -743,6 +744,11 @@ async function runWorker(argv: string[]): Promise<void> {
   assertPinnedModules(ROOT);
   emit(`box success recovery gate: candidate ${sha} database ${db.config.database} host ${db.config.host}`);
   await runBusiness(ROOT, ledger, db.config);
+  // OCV5-520: import product code only inside the existing scrubbed worker.
+  const { proveGoPoolWiring } = await import("../packages/commercial/src/__tests__/goPoolWiringProof.js");
+  const goReceipt = await proveGoPoolWiring();
+  assert.equal(goReceipt, BEHAVIOR[3]);
+  emit(goReceipt);
 }
 
 function parseFormal(argv: string[]): string {
