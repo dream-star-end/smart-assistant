@@ -113,13 +113,17 @@ test('parser rejects ambiguous, unrecognised and off-site login structures', () 
     FORM.replace('name="enews"', 'name="unexpected-secret-field"'),
     FORM.replace('value="fixture-month"', 'value="fixture-none"'),
     FORM.replace('type="password" name="password"', 'type="text" name="password"'),
-    FORM.replace('method="post"', 'method="get"'),
+    FORM.replace('<form method="post" action=', '<form method="get" action='),
     FORM.replace('../../ShowKey/?v=login', 'https://evil.test/e/ShowKey/?v=login'),
     FORM + FORM,
     `${FORM}<div>${'<span></span>'.repeat(20_001)}</div>`,
   ]
-  for (const html of invalid)
-    assert.throws(() => parseJieyouLoginForm(html), code('RESPONSE_INVALID'))
+  for (const [index, html] of invalid.entries())
+    assert.throws(
+      () => parseJieyouLoginForm(html),
+      code('RESPONSE_INVALID'),
+      `invalid fixture ${index}`,
+    )
   assert.throws(
     () =>
       parseJieyouLoginForm(
@@ -323,7 +327,7 @@ test('a timed-out POST is never replayed and its challenge remains consumed', as
   t.after(() => f.client.close())
   const challenge = await f.client.getChallenge(signal())
   const input = { ...challenge, credentials, answer: '1234', lifetime: 'fixture-none' }
-  await assert.rejects(f.client.submit(input, signal()), code('TIMEOUT'))
+  await assert.rejects(f.client.submit(input, signal()), code('SUBMISSION_UNCERTAIN'))
   await assert.rejects(f.client.submit(input, signal()), code('CHALLENGE_STALE'))
   assert.equal(submits, 1)
 })
