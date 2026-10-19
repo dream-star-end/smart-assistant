@@ -7685,6 +7685,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/proxyUpstream.unit.test.ts",
           "assertion": "OCV5-527 Step catalog and static routes use the renamed chat upstream"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "[ocv5-527-step-chat] PASS — stable Step pricing identity selects the current chat upstream for static and catalog routes"
         }
       ]
     }

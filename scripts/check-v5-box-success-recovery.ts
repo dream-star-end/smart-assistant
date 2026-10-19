@@ -47,6 +47,7 @@ const BEHAVIOR = [
   "intermediate handoff stayed pending without capsule or CAS",
   "a just-finished run keeps its native pointer: cleanup waits until the pointer is attached",
   "[ocv5-520-go-pool-wiring] PASS — ordinary Go uses an enabled pool identity instead of disabled static credentials while request bytes and session headers stay stable",
+  "[ocv5-527-step-chat] PASS — stable Step pricing identity selects the current chat upstream for static and catalog routes",
 ];
 const HOLD_PY = [
   "import os, signal, sys, time",
@@ -749,6 +750,31 @@ async function runWorker(argv: string[]): Promise<void> {
   const goReceipt = await proveGoPoolWiring();
   assert.equal(goReceipt, BEHAVIOR[3]);
   emit(goReceipt);
+  // OCV5-527: the renamed Step upstream rejects /messages. Exercise the candidate
+  // proxy under the same scrub, using synthetic credentials and no network.
+  const { getStaticProvider } = await import("../packages/protocol/src/index.js");
+  const { selectUpstreamRoute, pickUpstream } = await import("../packages/commercial/src/http/proxy/upstream.js");
+  const { rootLogger } = await import("../packages/commercial/src/logging/logger.js");
+  const stepModel = "step-5-preview-free-go";
+  const go = getStaticProvider("opencodego");
+  assert.equal(go.upstreamModelForRequest?.(stepModel), "step-5-preview", "STEP_RENAMED_UPSTREAM");
+  assert.equal(go.canonicalizeForPricing(stepModel), stepModel, "STEP_STABLE_PRICING");
+  const scheduler = {
+    pick: async () => { throw new Error("STEP_UNEXPECTED_OAUTH_PICK"); },
+    release: async () => { throw new Error("STEP_UNEXPECTED_OAUTH_RELEASE"); },
+  };
+  for (const route of [selectUpstreamRoute(stepModel),
+    selectUpstreamRoute(stepModel, { providerId: "opencodego", upstreamModelId: "step-5-preview" })]) {
+    const selected = await pickUpstream({ scheduler, staticProviderKeys: { opencodego: "synthetic-step-key" } },
+      { model: stepModel, max_tokens: 1, messages: [{ role: "user", content: "proof" }] },
+      route, rootLogger.child({ subsys: "step-chat-proof" }));
+    assert.equal(selected.ok, true, "STEP_NOT_PREPARED");
+    if (!selected.ok) throw new Error("STEP_NOT_PREPARED");
+    assert.equal(selected.session.providerId, "opencodego", "STEP_PROVIDER");
+    assert.equal(selected.session.upstreamModel, "step-5-preview", "STEP_PROXY_UPSTREAM");
+    assert.equal(selected.session.transport, "openai-chat-go", "STEP_CHAT_TRANSPORT");
+  }
+  emit(BEHAVIOR[4]!);
 }
 
 function parseFormal(argv: string[]): string {
