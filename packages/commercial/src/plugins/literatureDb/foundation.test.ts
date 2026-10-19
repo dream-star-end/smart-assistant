@@ -1,14 +1,20 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
+import { createWriteStream } from 'node:fs'
+import { mkdtemp, rm, stat } from 'node:fs/promises'
 import {
   Agent as HttpAgent,
   type RequestListener,
   type RequestOptions,
+  type ServerResponse,
   createServer,
   globalAgent,
   request as httpRequest,
 } from 'node:http'
 import type { Socket } from 'node:net'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { Writable } from 'node:stream'
 import test from 'node:test'
 import sharp from 'sharp'
 import type { DnsResolver } from '../../connectors/outboundPolicy.js'
@@ -30,7 +36,11 @@ import {
   type OperationSolverFactory,
 } from './login.js'
 import { LITERATURE_SITE, literatureUrl, pinLiteratureRequest } from './policy.js'
-import { LiteratureHttpTransport, literatureSocketOptions } from './transport.js'
+import {
+  LiteratureHttpTransport,
+  type LiteratureTransportOptions,
+  literatureSocketOptions,
+} from './transport.js'
 
 function createManager(solver: LiteratureCaptchaSolver, options?: LiteratureLoginOptions) {
   return new LiteratureLoginManager(() => solver, options)
@@ -87,7 +97,10 @@ function fixture(pic: CaptchaImage, outcomes: LoginOutcome[] = ['authenticated']
   }
   return { session, calls, persist }
 }
-async function httpFixture(handler: RequestListener) {
+async function httpFixture(
+  handler: RequestListener,
+  settings: Pick<LiteratureTransportOptions, 'timeoutMs' | 'maxResponseBytes'> = {},
+) {
   const server = createServer(handler)
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
@@ -98,6 +111,7 @@ async function httpFixture(handler: RequestListener) {
   const transport = new LiteratureHttpTransport({
     resolver,
     timeoutMs: 1000,
+    ...settings,
     requestFactory: (input, callback) => {
       options.push(input)
       // Only this test adapter changes the socket. Production policy has no allowPrivate flag.
@@ -1116,4 +1130,364 @@ test('a save error after a possible commit is reported as uncertain instead of c
   assert.equal(f.calls.persisted, 1)
   assert.equal(f.calls.closed, 1)
   assert(!JSON.stringify(result).includes('synthetic private'))
+})
+
+// A native chunked response; the producer also honours backpressure and client destruction.
+function streamFixtureBody(response: ServerResponse, size: number) {
+  const chunk = Buffer.alloc(64 * 1024, 0x61)
+  let remaining = size
+  const push = () => {
+    while (remaining > 0 && !response.destroyed) {
+      const part = chunk.subarray(0, Math.min(chunk.length, remaining))
+      remaining -= part.length
+      if (!response.write(part)) {
+        response.once('drain', push)
+        return
+      }
+    }
+    if (!response.destroyed) response.end()
+  }
+  push()
+}
+function countingSink(options: { emitClose?: boolean } = {}) {
+  let bytes = 0
+  let writes = 0
+  const sink = new Writable({
+    ...options,
+    write(chunk: Buffer, _encoding, callback) {
+      bytes += chunk.length
+      writes++
+      callback()
+    },
+  })
+  return { sink, bytes: () => bytes, writes: () => writes }
+}
+function streamGate() {
+  let release!: () => void
+  const promise = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  return { promise, release }
+}
+const immediate = () => new Promise<void>((resolve) => setImmediate(resolve))
+
+test('streaming transfers 12MiB and the exact 25MiB boundary to closed private files', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'ocv5-524-stream-'))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  for (const mib of [12, 25]) {
+    const size = mib * 1024 * 1024
+    const f = await httpFixture((_req, res) => streamFixtureBody(res, size), { timeoutMs: 5000 })
+    t.after(f.close)
+    const path = join(directory, `${mib}.partial`)
+    const sink = createWriteStream(path, { flags: 'wx', mode: 0o600 })
+    const r = await f.transport.requestToSink({ url: LITERATURE_SITE, signal: signal() }, sink)
+    assert.equal(r.status, 200)
+    assert.equal(r.bytes, size)
+    assert.equal('body' in r, false)
+    assert.equal(sink.closed, true)
+    assert.equal(Reflect.get(sink, 'fd'), null)
+    const file = await stat(path)
+    assert.equal(file.size, size)
+    assert.equal(file.mode & 0o777, 0o600)
+    assert.equal(f.options.length, 1)
+    assert(f.sockets.every((socket) => socket.closed))
+  }
+})
+
+test('streaming enforces declared and actual chunked 25MiB limits before forwarding excess bytes', async (t) => {
+  const maximum = 25 * 1024 * 1024
+  for (const declared of [false, true]) {
+    const f = await httpFixture(
+      (_req, res) => {
+        if (declared) {
+          res.writeHead(200, { 'content-length': maximum + 1 })
+          res.end('short')
+        } else streamFixtureBody(res, maximum + 1)
+      },
+      { timeoutMs: 5000 },
+    )
+    t.after(f.close)
+    const target = countingSink()
+    await assert.rejects(
+      f.transport.requestToSink({ url: LITERATURE_SITE, signal: signal() }, target.sink),
+      code('RESPONSE_TOO_LARGE'),
+    )
+    assert(target.bytes() <= maximum)
+    if (declared) assert.equal(target.bytes(), 0)
+    else assert(target.bytes() > 0)
+    assert.equal(target.sink.closed, true)
+    assert(f.sockets.every((socket) => socket.closed))
+  }
+})
+
+test('streaming does not raise the existing 8MiB buffer ceiling', async (t) => {
+  const f = await httpFixture((_req, res) => streamFixtureBody(res, 12 * 1024 * 1024), {
+    maxResponseBytes: 8 * 1024 * 1024,
+    timeoutMs: 5000,
+  })
+  t.after(f.close)
+  await assert.rejects(
+    f.transport.request({ url: LITERATURE_SITE, signal: signal() }),
+    code('RESPONSE_TOO_LARGE'),
+  )
+  assert(f.sockets.every((socket) => socket.closed))
+})
+
+test('a stalled Writable backpressures streaming instead of queueing the entire response', async (t) => {
+  const size = 12 * 1024 * 1024
+  const f = await httpFixture((_req, res) => streamFixtureBody(res, size), { timeoutMs: 5000 })
+  t.after(f.close)
+  const entered = streamGate()
+  let first!: (error?: Error | null) => void
+  let writes = 0
+  let bytes = 0
+  const sink = new Writable({
+    highWaterMark: 1,
+    write(chunk: Buffer, _encoding, callback) {
+      bytes += chunk.length
+      writes++
+      if (writes === 1) {
+        first = callback
+        entered.release()
+      } else callback()
+    },
+  })
+  let settled = false
+  const reading = f.transport.requestToSink({ url: LITERATURE_SITE, signal: signal() }, sink)
+  void reading.then(
+    () => {
+      settled = true
+    },
+    () => {
+      settled = true
+    },
+  )
+  await entered.promise
+  try {
+    for (let i = 0; i < 12; i++) await immediate()
+    assert.equal(writes, 1)
+    assert(sink.writableLength <= 128 * 1024)
+    assert.equal(settled, false)
+  } finally {
+    first()
+  }
+  assert.equal((await reading).bytes, size)
+  assert.equal(bytes, size)
+  assert.equal(sink.closed, true)
+  assert(f.sockets.every((socket) => socket.closed))
+})
+
+test('stream cancellation waits for in-flight sink I/O destruction and physical socket close', async (t) => {
+  const f = await httpFixture((_req, res) => res.write('partial'))
+  t.after(f.close)
+  const entered = streamGate()
+  const destroying = streamGate()
+  let finishWrite!: (error?: Error | null) => void
+  let finishDestroy!: (error?: Error | null) => void
+  let writes = 0
+  const sink = new Writable({
+    write(_chunk, _encoding, callback) {
+      writes++
+      finishWrite = callback
+      entered.release()
+    },
+    destroy(_error, callback) {
+      // Like native file streams, this trusted sink drains its pending I/O before close.
+      finishDestroy = callback
+      destroying.release()
+    },
+  })
+  const abort = new AbortController()
+  let settled = false
+  const reading = f.transport.requestToSink({ url: LITERATURE_SITE, signal: abort.signal }, sink)
+  void reading.then(
+    () => {
+      settled = true
+    },
+    () => {
+      settled = true
+    },
+  )
+  await entered.promise
+  abort.abort()
+  await destroying.promise
+  try {
+    assert.equal(settled, false)
+  } finally {
+    finishWrite()
+    finishDestroy()
+  }
+  await assert.rejects(reading, code('CANCELLED'))
+  assert.equal(sink.closed, true)
+  assert(f.sockets.every((socket) => socket.closed))
+  await immediate()
+  assert.equal(writes, 1)
+})
+
+test('stream deadlines include stalled bodies and never replay a timed-out POST', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  for (const method of ['GET', 'POST'] as const) {
+    let requests = 0
+    const f = await httpFixture(
+      (req, res) => {
+        requests++
+        req.resume()
+        res.write('partial')
+      },
+      { timeoutMs: 30 },
+    )
+    t.after(f.close)
+    const entered = streamGate()
+    const sink = new Writable({
+      write(_chunk, _encoding, callback) {
+        entered.release()
+        callback()
+      },
+    })
+    const reading = f.transport.requestToSink(
+      {
+        url: LITERATURE_SITE,
+        method,
+        ...(method === 'POST' ? { body: Buffer.from('password=synthetic') } : {}),
+        signal: signal(),
+      },
+      sink,
+    )
+    const rejected = assert.rejects(
+      reading,
+      code(method === 'POST' ? 'SUBMISSION_UNCERTAIN' : 'TIMEOUT'),
+    )
+    await entered.promise
+    t.mock.timers.tick(30)
+    await rejected
+    assert.equal(requests, 1)
+    assert.equal(sink.closed, true)
+    assert(f.sockets.every((socket) => socket.closed))
+  }
+})
+
+test('sink failure during DNS cancels the hop and consumes a late DNS answer', async () => {
+  const resolving = streamGate()
+  let answer!: (value: string[]) => void
+  let requests = 0
+  const transport = new LiteratureHttpTransport({
+    resolver: {
+      resolve4: () => {
+        resolving.release()
+        return new Promise((resolve) => {
+          answer = resolve
+        })
+      },
+      resolve6: async () => [],
+    },
+    requestFactory: () => {
+      requests++
+      throw new Error('must not connect')
+    },
+  })
+  const target = countingSink()
+  const reading = transport.requestToSink({ url: LITERATURE_SITE, signal: signal() }, target.sink)
+  const rejected = assert.rejects(reading, code('RESPONSE_INVALID'))
+  await resolving.promise
+  target.sink.destroy(new Error('ENOSPC /synthetic/private/password'))
+  await rejected
+  answer(['93.184.216.34'])
+  await immediate()
+  assert.equal(requests, 0)
+  assert.equal(target.sink.closed, true)
+})
+
+test('sink write failure and truncated responses close both sides with sanitised errors', async (t) => {
+  for (const failure of ['disk', 'upstream']) {
+    const f = await httpFixture((_req, res) => {
+      if (failure === 'upstream') {
+        res.writeHead(200, { 'content-length': 100 })
+        res.end('short')
+      } else res.end('synthetic-body')
+    })
+    t.after(f.close)
+    const sink = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback(failure === 'disk' ? new Error('ENOSPC /private/synthetic-secret') : undefined)
+      },
+    })
+    await assert.rejects(
+      f.transport.requestToSink(
+        { url: LITERATURE_SITE, cookie: 'session=synthetic', signal: signal() },
+        sink,
+      ),
+      (error: unknown) => error instanceof LiteratureError && error.message === 'RESPONSE_INVALID',
+    )
+    assert.equal(sink.closed, true)
+    assert(f.sockets.every((socket) => socket.closed))
+  }
+})
+
+test('streaming owns sink cleanup even before a valid request can start', async () => {
+  let requests = 0
+  const transport = new LiteratureHttpTransport({
+    resolver,
+    requestFactory: () => {
+      requests++
+      throw new Error('must not connect')
+    },
+  })
+  const abort = new AbortController()
+  abort.abort()
+  for (const input of [
+    { url: LITERATURE_SITE, signal: abort.signal },
+    { url: LITERATURE_SITE, cookie: 'bad\r\nheader', signal: signal() },
+    { url: 'http://evil.test/', signal: signal() },
+  ]) {
+    const target = countingSink({ emitClose: false })
+    await assert.rejects(
+      transport.requestToSink(input, target.sink),
+      (error: unknown) =>
+        error instanceof LiteratureError &&
+        ['CANCELLED', 'INVALID_INPUT', 'OUTBOUND_BLOCKED'].includes(error.code),
+    )
+    assert.equal(target.sink.closed, true)
+    assert.equal(target.bytes(), 0)
+  }
+  assert.equal(requests, 0)
+})
+
+test('stream results preserve status without asserting PDF validity or following redirects', async (t) => {
+  for (const kind of ['html', 'redirect', 'unsafe']) {
+    let requests = 0
+    const f = await httpFixture((req, res) => {
+      requests++
+      req.resume()
+      res.writeHead(kind === 'html' ? 200 : 307, {
+        ...(kind === 'html'
+          ? { 'content-type': 'text/html' }
+          : { location: kind === 'unsafe' ? '//evil.test/' : '/next' }),
+      })
+      res.end('<html>synthetic login page</html>')
+    })
+    t.after(f.close)
+    const target = countingSink({ emitClose: false })
+    const reading = f.transport.requestToSink(
+      {
+        url: LITERATURE_SITE,
+        method: 'POST',
+        body: Buffer.from('password=synthetic'),
+        signal: signal(),
+      },
+      target.sink,
+    )
+    if (kind === 'unsafe') {
+      await assert.rejects(reading, code('OUTBOUND_BLOCKED'))
+      assert.equal(target.bytes(), 0)
+    } else {
+      const result = await reading
+      assert.equal(result.status, kind === 'html' ? 200 : 307)
+      assert.equal(result.bytes, target.bytes())
+      assert.equal(result.redirect, kind === 'redirect' ? `${LITERATURE_SITE}/next` : undefined)
+      assert.equal('artifactId' in result, false)
+    }
+    assert.equal(requests, 1)
+    assert.equal(target.sink.closed, true)
+    assert(f.sockets.every((socket) => socket.closed))
+  }
 })

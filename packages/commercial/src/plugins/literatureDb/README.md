@@ -1,6 +1,6 @@
 # 文献数据库登录底座（OCV5-524）
 
-这一阶段是未上架的内部底座，不是已经可安装使用的插件。生产HTTP路由、账号绑定/撤销事务、worker/driver、前端、平台推理服务启用与计量持久化、登录后检索/下载尚未接线；不能把这些接口的fixture通过当真实站点验收。
+这一阶段是未上架的内部底座，不是已经可安装使用的插件。生产HTTP路由、worker/driver、前端、平台推理服务启用、登录后检索/下载尚未接线；不能把这些接口的fixture通过当真实站点验收。
 
 - `policy.ts` 仅允许精确的 `www.jieyoutsg.com` HTTP80 / HTTPS443，使用共享公网DNS校验。通用HTTPS规则未改。
 - `transport.ts` 用已验IP执行一个原生HTTP(S)请求，Host/SNI保留原域，使用一次性Agent，总超时包括DNS，响应限字节。它不跟跳、不重放POST；私有session必须逐跳选择Cookie（尤其不能把Secure cookie降级到HTTP）、重新pin并判断登录结果。Set-Cookie数组不合并拆逗号。
@@ -17,7 +17,7 @@
 
 供应商拒绝路径必须立即返回给solver锁存；用量sink/健康报告异步消费，不能等待挂住的sink让外层15秒期限覆盖拒绝。普通成功必须等sink确认后才返回答案；取消后meter仍被调度且迟到拒绝被消费，但当前没有持久化队列，不能宣称进程崩溃时的供应商用量已经完整入库。该队列/预算是服务启用前的接线依赖。
 
-`jieyouHttpClient.ts`是私有预登录客户端：parse5按name解析真实表单/hidden/验证码路径，lifetime必须从实际选项显式选取，不猜CMS值；每实例独立tough-cookie jar并逐跳选cookie，HTTP不发送Secure cookie。只收同站点受pin约束的请求，GET最多3次重定向，challenge一次消费、POST绝不自动跟跳/重放。close中止在途并清空jar。原始page/response/cookie snapshot是私有证据，不得作为模型结果或公开管理API返回；snapshot并不证明登录成功。当前没有实现真实身份/错误分类、LiteratureLoginSession适配或DB保存，须测试账号校准。
+`jieyouHttpClient.ts`是私有预登录客户端：parse5按name解析真实表单/hidden/验证码路径，lifetime必须从实际选项显式选取，不猜CMS值；每实例独立tough-cookie jar并逐跳选cookie，HTTP不发送Secure cookie。只收同站点受pin约束的请求，GET最多3次重定向，challenge一次消费、POST绝不自动跟跳/重放。close中止在途并清空jar。原始page/response/cookie snapshot是私有证据，不得作为模型结果或公开管理API返回；snapshot并不证明登录成功。当前没有实现真实身份/错误分类或LiteratureLoginSession适配；Cookie与凭据DB事务已提供内部接口，真实会话保存仍须测试账号校准。
 
 parse5/tough-cookie已显式加入commercial runtime依赖，锁定现有8.0.1/6.0.1及原有传递版本；没有借dev依赖冒充生产可用，也未修改无关web包锁项。未来正常发布staging npm ci处理依赖，本轮未部署。
 
@@ -36,6 +36,8 @@ parse5/tough-cookie已显式加入commercial runtime依赖，锁定现有8.0.1/6
 
 `builtinArtifact.ts/builtinContract.ts`定义尚未上架的0.1.0固定search/download接口（有界查询、opaque文献/平台文件编号，不收发任意URL/凭据）。compiler仅完整artifact hash匹配才生成本站HTTP transport/state discriminator；复制slug/driver不够。旧artifact不生成新字段，compiler version仍1。loader还要求平台review_source及原有效签名/功能核验/未撤销条件。
 
-`accounts.ts`仅为该精确HTTP合同选择严格Cookie state，复用现有connections AEAD/AAD、bind锁/安装授权、generation/revision/CAS和撤销；原browser解密API及secure:true/HTTPS验证器保留，HTTP有专用解密器，不能走旧browser版本迁移。最终HTTP提交额外重新检查平台来源，防止审核来源在执行期间变化。此片只保存合成Cookie，不保存用户名/密码；未来真实setup需要另接凭据密文事务与会话TTL。没有市场seed、runtime driver注册、对外路由或真实身份判断，合同存在不代表可安装/可执行。integ中functionalVerified:true只指独立临时DB里的合成fixture，绝不是真实站点验收。
+`accounts.ts`仅为该精确HTTP合同选择严格Cookie state，复用现有connections AEAD/AAD、bind锁/安装授权、generation/revision/CAS和撤销；原browser解密API及secure:true/HTTPS验证器保留，HTTP有专用解密器，不能走旧browser版本迁移。最终HTTP提交额外重新检查平台来源，防止审核来源在执行期间变化。固定HTTP envelope现可同事务保存绑定真实connectionId的credentialSeal；refresh保留、replace默认清旧、replay保留最新seal，revoke擦除密文。真实setup和会话TTL仍待接线，未保存真实用户凭据。没有市场seed、runtime driver注册、对外路由或真实身份判断，合同存在不代表可安装/可执行。integ中functionalVerified:true只指独立临时DB里的合成fixture，绝不是真实站点验收。
 
 `LiteratureLoginManager`现在只接受每operation的同步solver factory；它收到冻结的owner副本和manager内部生成的真实operationId，在session open前构造一次。一个manager仍统一执行容量/频控，不能按operation新建manager；生产factory必须用同一userId+operationId绑定所有reader与持久化meter。自动重试复用局部solver和预算，取消/绝对期限已到时不构造reader；factory失败用原清理路径释放占用。仅合成官方fetch+独立DB用例证明两个用户交错和重试归属，尚无生产setup接线。
+
+`requestToSink` 是内部单跳有界原始流：固定25MiB实际字节上限，保留DNS/pin、Host/SNI、TLS、期限和不跟跳/POST不重放语义。pipeline向独占Writable传播背压；成功、错误与取消都等待consumer、sink清理和物理socket关闭。sink必须是新建的受信流；有原生资源的sink保留默认autoDestroy/emitClose并在`_destroy`排空自己的I/O（如原生fs.WriteStream）；本层不接受文件路径，失败partial由调用方删除。status/headers/bytes不是有效PDF或artifact证明，格式/账号/租约/ready发布仍未接线；旧buffer路径仍默认1MiB、最大8MiB。
