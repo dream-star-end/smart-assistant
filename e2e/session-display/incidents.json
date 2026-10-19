@@ -8125,7 +8125,7 @@
       "occurredAt": "2026-10-19",
       "severity": "P1",
       "symptom": "个人版test1 Opus5.5回合65步后最终答复空白。完整总结已在tape203，末条208仅隐藏ui next输入预测；raw非空final判定把总结折叠、预测却不渲染。两版共用逻辑。按实际可见内容选择最终回答并保留输入预测及终态费用元数据。",
-      "rootFixCommit": "73f14cf7",
+      "rootFixCommit": "250bac04",
       "regressions": [
         {
           "layer": "unit",
