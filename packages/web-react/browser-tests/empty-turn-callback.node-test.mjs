@@ -61,7 +61,9 @@ test("INC-20260923-EMPTY-TURN-NO-REPLY: actual Gateway engine terminal and callb
       const context=await browser.newContext({viewport:{width,height:950},isMobile:width===390,hasTouch:width===390});
       const page=await context.newPage();const errors=[];page.on("pageerror",e=>errors.push(e.message));
       const start=wires.length;
-      let holdTerminalReads=false,closing=false,terminalMessages;
+      let holdTerminalReads=false;
+      let closing=false;
+      let terminalMessages;
       let releaseTerminalReads;
       const terminalReady=new Promise(resolve=>{releaseTerminalReads=resolve;});
       // The WS side is the actual Gateway; provide the missing Master HTTP
