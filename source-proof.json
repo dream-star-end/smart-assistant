@@ -1,0 +1,212 @@
+{
+  "checkedAt": "2026-10-19T14:48:38.948599+00:00",
+  "selfhost": "7a4efbcb86755dadd6f9f561b87d6cd0cf1d351b",
+  "commercial": "1b718b6a0629d0244581bd798431c4fb85e8cf30",
+  "selfhostBase": "4a469294bba1077899827d67a38dfef151409316",
+  "commercialBase": "aac216f867327b7dbfa34d04f431552bf6281c22",
+  "productionFiles": 21,
+  "fullFilesIdentical": 17,
+  "ticketPatchFilesIdentical": 21,
+  "editionDifferenceFilesUnchanged": 21,
+  "combinedTicketPatchSha256": "66353b7b8a0acbbf33a43d917c95b96bcaf193b688c95b2b527afbc8f4453660",
+  "coreRetryProductionFiles": 15,
+  "coreRetryPatchSha256": "85ee9d6cda90d47357e68c16cf10dd7e5f81e57610a7cef488cfa872e2a4281c",
+  "normalization": "git diff --unified=0; remove only diff/index/path/hunk-location/file-mode headers; retain every added/removed code byte. Full contextual diffs are separately preserved.",
+  "files": [
+    {
+      "path": "packages/gateway/src/sessionTurnRunner.ts",
+      "fullFileIdentical": false,
+      "selfhostSha256": "694dfe5e69fa94d784c089e83663a7dbd9ef890c25df0b20a79e34847aa0c336",
+      "commercialSha256": "6be144ef3ca3c2c6d565a0e4cf9a61536524b9f4dbe841a2a103745fb1f17fd9",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "0245e0f2393f2a74fd58a4f09c8bc39720e54ec78dbf7d82ee7962dd45c52fbe",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/gateway/src/turnFrames.ts",
+      "fullFileIdentical": true,
+      "selfhostSha256": "3491bfc509f989f126a11d3b600bd614c85e718bab3f2c456495dace21965e54",
+      "commercialSha256": "3491bfc509f989f126a11d3b600bd614c85e718bab3f2c456495dace21965e54",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "4aec1c84cce4a7849c229b1d566a22438b0d7204f41e905fe4176b55f2145230",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/protocol/src/turnErrorTaxonomy.ts",
+      "fullFileIdentical": false,
+      "selfhostSha256": "16cee4d778897bb229913b6e3d1d4e020fb81d310a8f101e0816d99f27f1ee85",
+      "commercialSha256": "648c85334f990fc76f6fa06a5df4a3cd5189808b408f656ad3186777aa16a688",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "98de5b33f0a94619770ae063209898bbcd429f153c3ea52d5c5256209b275ea5",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/protocol/src/frames.ts",
+      "fullFileIdentical": true,
+      "selfhostSha256": "d00e9a1b563c257054b7da017edfa54dd4e61f97a02f509a132c28ef4b4b79f0",
+      "commercialSha256": "d00e9a1b563c257054b7da017edfa54dd4e61f97a02f509a132c28ef4b4b79f0",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "76d7c635714505527addf65d5ba1b5c43c0fbb3554c935f9eb61aba71227d7c0",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/storage/src/sessionsDb.ts",
+      "fullFileIdentical": true,
+      "selfhostSha256": "c620f41f18b4429bec3f543ede0b658eb3f3629ced403c44b398bd58bcbc01f7",
+      "commercialSha256": "c620f41f18b4429bec3f543ede0b658eb3f3629ced403c44b398bd58bcbc01f7",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "156d1b3e5f31b29edaa2dc023d5bb7985f1c4b307371306fadec4f2d738d2778",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/commercial/src/db/pgSessionsBackend.ts",
+      "fullFileIdentical": false,
+      "selfhostSha256": "f5689ea615384d8e9b465fcf6a3b3caae08bff665a90c4202d995254b6042fac",
+      "commercialSha256": "ad2e3861f290a5f3194f21bb55a295390b202e6a80ac7d2b29fed7d4999f15e3",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "03dff628928f4d948d8294627c60aa97768d59c3252c463f70147fddf5dc73c7",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/web-react/src/hooks/useChatSocket.ts",
+      "fullFileIdentical": true,
+      "selfhostSha256": "3ee1af8148697ad77e7e440cc290b7ab525e3de8929b5f421cb7cdfc04593625",
+      "commercialSha256": "3ee1af8148697ad77e7e440cc290b7ab525e3de8929b5f421cb7cdfc04593625",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "f6d7192a5ebcb0333287e951ffce6a69da1aab7ed013dd979bfc34a3268ee0fc",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/web-react/src/hooks/useSessionList.ts",
+      "fullFileIdentical": true,
+      "selfhostSha256": "fdebec0e827adc45f4a206d8015c2ce76a96bfd21fb98c2a4f4f68a61364bbdd",
+      "commercialSha256": "fdebec0e827adc45f4a206d8015c2ce76a96bfd21fb98c2a4f4f68a61364bbdd",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "8cf7472a9dc6672681cf07887f97eed9e9e9b598abc2f3e78e6182395ab6aed9",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/web-react/src/lib/chat/socket.ts",
+      "fullFileIdentical": true,
+      "selfhostSha256": "1016653eac174392b3fdb77a85bea13c4fe9333f8bcb87de7d3f54b9d702ac4f",
+      "commercialSha256": "1016653eac174392b3fdb77a85bea13c4fe9333f8bcb87de7d3f54b9d702ac4f",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "bf9eacd40c62291b6ff5b2230d359bbe4fbaf94b7941406059483ee3b6c58df3",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/web-react/src/lib/chat/reducer.ts",
+      "fullFileIdentical": true,
+      "selfhostSha256": "7f1744a8ab220cd21b4dbea423cfcbb69a23651362f1ac9f9d160d53888f9647",
+      "commercialSha256": "7f1744a8ab220cd21b4dbea423cfcbb69a23651362f1ac9f9d160d53888f9647",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "231ed1a54d7d390be9c328e74f462e61aca8d46292eef22571414c1582610f68",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/web-react/src/lib/chat/model.ts",
+      "fullFileIdentical": true,
+      "selfhostSha256": "39e20e1c074c94a417f0ad41137122a514f7df1862c988979dd8a59697f37b84",
+      "commercialSha256": "39e20e1c074c94a417f0ad41137122a514f7df1862c988979dd8a59697f37b84",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "bff5a0ab96f61b50cbcc8b9271cec8a0f778a01c4be5ccde8e4e2309c0fb665b",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/web-react/src/lib/chat/render.ts",
+      "fullFileIdentical": false,
+      "selfhostSha256": "c95c03f24d311ef64f3692bb919e4c3dd32e451b57d165e49e65600a3aefddad",
+      "commercialSha256": "7a11fc70eac6507d10ccacba6fc51e714a96798307f2a5fef95434a3b04c6e66",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "addb5b1bdd3f01608ed414eba5dee61a0dcd7edf2730ade1194b3957d8754a8d",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/web-react/src/lib/chat/automaticRecoverySnapshot.ts",
+      "fullFileIdentical": true,
+      "selfhostSha256": "6a9906423152f82e662f890a9520909e3298fff2cee19ecc1c089a7d7ea74e60",
+      "commercialSha256": "6a9906423152f82e662f890a9520909e3298fff2cee19ecc1c089a7d7ea74e60",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "2e9899cccd4c3f29e3d606e71668ed88bd8aa430dd1a078416b04a2af438c3f1",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/web-react/src/lib/types.ts",
+      "fullFileIdentical": true,
+      "selfhostSha256": "0ca9d281030a41c2ff8c99eb96a3ae960c9e6163d4720d3da484c3bbc3500da4",
+      "commercialSha256": "0ca9d281030a41c2ff8c99eb96a3ae960c9e6163d4720d3da484c3bbc3500da4",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "ef7e04137acc85f624f9ee94a0604c5725338b5fd1ce2c730ada12224a318fbd",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/web-react/src/components/chat/TurnActivity.tsx",
+      "fullFileIdentical": true,
+      "selfhostSha256": "507ef57df6c7081db8ad0674008842ff74ff1fbc0262c89776376b121a136575",
+      "commercialSha256": "507ef57df6c7081db8ad0674008842ff74ff1fbc0262c89776376b121a136575",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "32c256784bfea9c5da79a57cb471d6160adc706b9d15f8a1d502ae0927ee7518",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/web-react/src/components/iui/IuiBlock.tsx",
+      "fullFileIdentical": true,
+      "selfhostSha256": "4e60ce1f7f9a0bd7b7ebf5a8b4292904fb2b3fbe9b4759fd83746ed51e8deedb",
+      "commercialSha256": "4e60ce1f7f9a0bd7b7ebf5a8b4292904fb2b3fbe9b4759fd83746ed51e8deedb",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "697b64cea699eab6d81f5a7c8ec470c13642fee2e276f7972475000a79b4f42e",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/web-react/src/components/iui/toMarkdown.ts",
+      "fullFileIdentical": true,
+      "selfhostSha256": "53335c0fe78965b317a26f6355240cc3a9c7ff218403792fdd9b98c8be59ede6",
+      "commercialSha256": "53335c0fe78965b317a26f6355240cc3a9c7ff218403792fdd9b98c8be59ede6",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "697b64cea699eab6d81f5a7c8ec470c13642fee2e276f7972475000a79b4f42e",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/web-react/src/lib/assistantVisibleContent.ts",
+      "fullFileIdentical": true,
+      "selfhostSha256": "320470a9b5da8e7587a71dc43998d2ffd3642c09a4557ed3befc0b0b75ba8e68",
+      "commercialSha256": "320470a9b5da8e7587a71dc43998d2ffd3642c09a4557ed3befc0b0b75ba8e68",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "03761b2fcfe2dd4fa117ae483f5a8124b1512e3a7c90e147569b71c969665db9",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/web-react/src/lib/inputPrediction.ts",
+      "fullFileIdentical": true,
+      "selfhostSha256": "7dc13697ac3807adaa3bfc4cbf8b2856548367dcb525bc5760fd80ca9320ae45",
+      "commercialSha256": "7dc13697ac3807adaa3bfc4cbf8b2856548367dcb525bc5760fd80ca9320ae45",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "ec2c8c5c37d3e1710448e118e093ab29334aa117e31611cc0c3809a428f27f75",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/web-react/src/lib/nextBlock.ts",
+      "fullFileIdentical": true,
+      "selfhostSha256": "6b95b09cc4163ff8bcdf018f3ff68c72f25c9e104d980dfe5040a84cde3454e5",
+      "commercialSha256": "6b95b09cc4163ff8bcdf018f3ff68c72f25c9e104d980dfe5040a84cde3454e5",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "cba8d1c64ebbed872ea3ddee2187616f57e6e059bd0bb260269faf8cbd286860",
+      "editionDeltaUnchanged": true
+    },
+    {
+      "path": "packages/web-react/vite.config.ts",
+      "fullFileIdentical": true,
+      "selfhostSha256": "807997d34edf7f6c3605e3f500bae819bfa55bf60000244560b0132b03cfc0a6",
+      "commercialSha256": "807997d34edf7f6c3605e3f500bae819bfa55bf60000244560b0132b03cfc0a6",
+      "ticketPatchIdentical": true,
+      "ticketPatchSha256": "3075b38e195188b3175321e6fb759bf02a377699641160f1a5d3830dec159a65",
+      "editionDeltaUnchanged": true
+    }
+  ],
+  "rawArtifactSha256": {
+    "selfhost-task.patch": "c2ac35b1695b39e758bf4ba7e006712a3a957228191c45bf2607e6c8a345d968",
+    "commercial-task.patch": "3437df05cd7c85b8d7ae33cf40d505fa654a74b9b14a67e1e0e491f756341843",
+    "edition-before.patch": "46862c0a931c7e01b82d6067b16ba4a9fb4aecaa2631475fb477362c405fae6e",
+    "edition-after.patch": "dde285f069857a9499822d1c826a6699d38a85cd7a60b321d3bf4507795d44eb"
+  }
+}
