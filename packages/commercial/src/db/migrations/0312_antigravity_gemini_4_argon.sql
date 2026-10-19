@@ -11,4 +11,4 @@ VALUES ('antigravity-gemini-4-argon','antigravity','antigravity','gemini-4-argon
 INSERT INTO model_pricing(model_id,display_name,input_per_mtok,output_per_mtok,cache_read_per_mtok,
   cache_write_per_mtok,multiplier,enabled,sort_order,visibility,extra_system_prompt,default_effort,lock_version)
 VALUES ('antigravity-gemini-4-argon','Gemini 4 Argon (Antigravity)',100,500,5,0,'1',FALSE,
-  (SELECT COALESCE(MAX(sort_order),100)+1 FROM model_pricing),'public',NULL,'medium',0);
+  (SELECT COALESCE(MAX(sort_order),100)+1 FROM model_pricing),'admin',NULL,'medium',0);
