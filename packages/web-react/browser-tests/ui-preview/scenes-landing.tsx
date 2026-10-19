@@ -12,8 +12,7 @@
 import { type ReactNode, useEffect } from 'react'
 
 import { AuthGate } from '../../src/components/AuthGate'
-import { DesktopEnrollPage } from '../../src/components/DesktopEnrollPage'
-import { enrollNavigation } from '../../src/components/DesktopEnrollPageContent'
+import { DesktopEnrollPage, enrollNavigation } from '../../src/components/DesktopEnrollPage'
 import { Landing } from '../../src/components/Landing'
 import { LegalPage } from '../../src/components/LegalPage'
 import { createMemoryAuthSession } from '../../src/lib/authSession'
