@@ -270,7 +270,7 @@ export function ConnectorsTab({
       setCardNotice({
         slug: autoAuthorizePluginSlug,
         tone: 'warning',
-        text: plugin?.slug === 'literature-db' ? '文献数据库登录已失效，请点击账号行上的「重新登录」。' : `${plugin?.label ?? '插件'}账号的登录已失效，点击账号行上的「重新扫码授权」即可恢复。`,
+        text: plugin?.slug === 'literature-db' ? (pluginAccountState(staleAccount, plugin).needsReauth ? '文献数据库登录已失效，请点击账号行上的「重新登录」。' : '文献数据库登录已保存，检索暂未启用。') : `${plugin?.label ?? '插件'}账号的登录已失效，点击账号行上的「重新扫码授权」即可恢复。`,
       })
       return
     }

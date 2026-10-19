@@ -76,9 +76,14 @@ test('unavailable service does not collect or submit a password', async () => {
   expect(api.startLiteratureSetup).not.toHaveBeenCalled()
 })
 test('relink submits a private form once with its exact target and clears the displayed password', async () => {
+  let submitted: unknown
+  vi.mocked(api.startLiteratureSetup).mockImplementation(async (_auth, input) => {
+    submitted = structuredClone(input)
+    return operation()
+  })
   mount('7')
   await start()
-  expect(api.startLiteratureSetup).toHaveBeenCalledWith(expect.anything(), {
+  expect(submitted).toEqual({
     username: 'synthetic-user',
     password: 'synthetic-password',
     acceptTerms: true,

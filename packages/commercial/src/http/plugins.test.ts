@@ -787,7 +787,8 @@ describe('private literature setup routes', () => {
       (e: unknown) => {
         assert(e instanceof HttpError)
         assert.equal(e.status, 500)
-        assert(!JSON.stringify({ message: e.message, ...e }).includes(privateValue))
+        assert(!e.message.includes(privateValue))
+        assert(!JSON.stringify(e).includes(privateValue))
         return true
       },
     )
