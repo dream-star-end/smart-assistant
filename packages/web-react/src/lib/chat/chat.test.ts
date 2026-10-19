@@ -6633,6 +6633,7 @@ describe("ChatSocket interrupted continuation", () => {
       oldRows[1],
       {
         ...oldRows[2],
+        _errorCardSnapshot: expect.objectContaining({ disposition: "card" }),
         _recoverySkippedNotice: "未从断点继续：会话已有更新，原任务仍已保留。请在最新消息后再试。",
       },
     ]);
@@ -7131,7 +7132,7 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
   });
 
   /** 起一条 master 拥有自动恢复、已 admitted 的在飞 turn,再喂一条可自动恢复的 outbound.error。 */
-  function deferredErrorFixture(sessId: string, opts: { masterOwns?: boolean } = {}) {
+  function deferredErrorFixture(sessId: string, opts: { masterOwns?: boolean; earlyDecision?: boolean } = {}) {
     vi.useFakeTimers();
     vi.stubGlobal("WebSocket", FakeWS as unknown as typeof WebSocket);
     const sock = makeSocket({ syncSession: async () => {} });
@@ -7150,6 +7151,11 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
       type: "outbound.ack", admitted: true, peer: { id: sessId, kind: "dm" }, clientMessageId: user.id,
     }) });
     ws.sent.length = 0;
+    if (opts.earlyDecision !== undefined) ws.onmessage?.({ data: JSON.stringify({
+      type: "sys.recovery_decision", peer: { id: sessId, kind: "dm" },
+      sourceClientMessageId: user.id, errorCode: "model_capacity", scheduled: opts.earlyDecision,
+      reason: "exhausted", attempt: 1, max: 10,
+    }) });
     ws.onmessage?.({ data: JSON.stringify({
       type: "outbound.error", peer: { id: sessId, kind: "dm" }, clientMessageId: user.id,
       code: "model_capacity", message: "at capacity", frameSeq: 1, ts: Date.now(),
@@ -7180,12 +7186,107 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
     sock.stop();
   });
 
-  test("legacy gateway (master does not own recovery) still paints the red card immediately", () => {
+  test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: legacy recovery waits for its exact tape before painting", () => {
     const { sock, session, user } = deferredErrorFixture("s-defer-legacy", { masterOwns: false });
+    expect(errorCards(session)).toHaveLength(0);
+    expect(session._sendingInFlight).toBe(true);
+    expect(user.status).toBe("sent");
+    expect(isRetryingTurnStatus(session._turnStatus)).toBe(true);
+    sock.stop();
+  });
+
+  test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: declined before live error still paints one terminal card", () => {
+    const { sock, session } = deferredErrorFixture("s-early-decline", { earlyDecision: false });
     expect(errorCards(session)).toHaveLength(1);
-    expect(errorCards(session)[0]).toMatchObject({ _errorCode: "model_capacity", _clientMessageId: user.id });
     expect(session._sendingInFlight).toBe(false);
-    expect(user.status).toBe("error");
+    expect(session._deferredTerminalErrorClientMessageId).toBeUndefined();
+    sock.stop();
+  });
+
+  test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: scheduled before live error stays soft", () => {
+    const { sock, session } = deferredErrorFixture("s-early-scheduled", { earlyDecision: true });
+    expect(errorCards(session)).toHaveLength(0);
+    expect(session._sendingInFlight).toBe(true);
+    vi.advanceTimersByTime(60_000);
+    expect(errorCards(session)).toHaveLength(0);
+    sock.stop();
+  });
+
+  test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: a queued new intent releases a declined legacy soft turn", async () => {
+    const { sock, session, user } = deferredErrorFixture("s-legacy-next", { masterOwns: false });
+    session.messages.push({ id: "m-next-intent", role: "user", text: "next", ts: Date.now(), status: "queued" });
+    await (sock as any).autoRecoverTerminalTurn(session.id, user.id);
+    expect(errorCards(session)).toHaveLength(1);
+    expect(session._deferredTerminalErrorClientMessageId).toBeUndefined();
+    expect(session._activeClientMessageId).not.toBe(user.id);
+    sock.stop();
+  });
+
+  test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: cold history waits for the durable job and exact empty snapshot releases terminal", () => {
+    const sock = makeSocket({ syncSession: async () => {} });
+    const id = "s-cold-recovery-job", cmid = "m-cold-recovery-source";
+    const rows: ChatMessage[] = [
+      { id: cmid, role: "user", text: "finish", ts: 1, status: "error", _source: "server",
+        _routing: { model: "box-api-claude-opus-5-5", teamMode: false } },
+      { id: "cold-error", role: "assistant", text: "", ts: 2, _source: "server",
+        _clientMessageId: cmid, _errorCode: "engine_error", _turnTapeId: "cold-tape",
+        _turnTapeComplete: true, _dispatchOutcome: "error" },
+    ];
+    const job = { sourceClientMessageId: cmid, rootClientMessageId: cmid,
+      clientMessageId: "m-cold-child", errorCode: "engine_error", mode: "checkpoint" as const, attempt: 1 };
+    sock.applyServerMessages(id, "main", structuredClone(rows), true, 2, { automaticRecoveries: [job] });
+    const session = sock.sessions.get(id)!;
+    expect(session.messages.find((m) => m.id === "cold-error")?._errorHeldForRecovery).toBe(true);
+    expect(session.messages.some((m) => m._errorCardSnapshot?.disposition === "card")).toBe(false);
+    expect(session._sendingInFlight).toBe(true);
+    const stored = sock.toStored(id)!;
+    const reload = makeSocket({ syncSession: async () => {} });
+    reload.loadStored(JSON.parse(JSON.stringify(stored)));
+    const restored = reload.sessions.get(id)!;
+    expect(restored._sendingInFlight).toBe(true);
+    // An incremental page without the exact source cannot decide its outcome.
+    reload.applyServerMessages(id, "main", [], false, 2, { automaticRecoveries: [] });
+    expect(restored._deferredTerminalErrorClientMessageId).toBe(cmid);
+    reload.applyServerMessages(id, "main", structuredClone(rows), true, 2, { automaticRecoveries: [] });
+    expect(restored.messages.filter((m) => m._errorCardSnapshot?.disposition === "card")).toHaveLength(1);
+    expect(restored._sendingInFlight).toBe(false);
+    reload.applyServerMessages(id, "main", structuredClone(rows), true, 2, { automaticRecoveries: [] });
+    expect(restored.messages.filter((m) => m._errorCardSnapshot?.disposition === "card")).toHaveLength(1);
+    sock.stop(); reload.stop();
+  });
+
+  test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: a failed authority read stays soft and keeps reconciling", async () => {
+    const { sock, session, user } = deferredErrorFixture("s-legacy-read-fail", { masterOwns: false });
+    const sync = vi.fn(async () => false);
+    (sock as any).deps.syncSession = sync;
+    await (sock as any).autoRecoverTerminalTurn(session.id, user.id);
+    expect(sync.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(session._reconciling).toBe(true);
+    expect(session._sendingInFlight).toBe(true);
+    expect(errorCards(session)).toHaveLength(0);
+    sock.stop();
+  });
+
+  test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: Stop with a queued new prompt never materializes the source error", async () => {
+    const { sock, session, user } = deferredErrorFixture("s-legacy-stop-queue", { masterOwns: false });
+    sock.sendMessage({ sessId: session.id, agentId: "main", text: "next task", model: "kimi-k3-ark" });
+    sock.stopTurn(session.id);
+    await (sock as any).autoRecoverTerminalTurn(session.id, user.id);
+    expect(session._cancelledAutomaticRecoveryIds?.[user.id]).toBe(true);
+    expect(errorCards(session)).toHaveLength(0);
+    sock.stop();
+  });
+
+  test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: exact clean completion settles a deferred source", () => {
+    const { sock, session, user } = deferredErrorFixture("s-defer-clean");
+    sock.applyServerMessages(session.id, "main", [
+      { ...user, status: "replied", _source: "server" },
+      { id: "clean-final", role: "assistant", text: "done", ts: Date.now(), _source: "server",
+        _clientMessageId: user.id, _turnTapeId: "clean-tape", _turnTapeComplete: true, _dispatchOutcome: "completed" },
+    ], true, 2, { automaticRecoveries: [] });
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._deferredTerminalErrorClientMessageId).toBeUndefined();
+    expect(errorCards(session)).toHaveLength(0);
     sock.stop();
   });
 
@@ -7384,28 +7485,28 @@ describe("ChatSocket problem card reporting", () => {
     return { sock, ws, session, user, reports };
   }
 
-  test("legacy owner reports one failed/immediate/red", () => {
+  test("legacy owner reports one pending/deferred/soft until the exact recovery decision", () => {
     const { sock, user, reports } = problemCardFixture("s-pc-legacy", { masterOwns: false });
     expect(reports).toHaveLength(1);
     expect(reports[0]).toMatchObject({
       sessionId: "s-pc-legacy",
       rootCmid: user.id,
       code: "upstream_failed",
-      outcome: "failed",
-      path: "immediate",
-      presentation: "red",
+      outcome: "pending",
+      path: "deferred",
+      presentation: "soft",
     });
     sock.stop();
   });
 
-  test("expected code immediate uses presentation yellow", () => {
+  test("recoverable capacity uses the same pending soft presentation", () => {
     const { sock, reports } = problemCardFixture("s-pc-yellow", { masterOwns: false, code: "model_capacity" });
     expect(reports).toHaveLength(1);
     expect(reports[0]).toMatchObject({
       code: "model_capacity",
-      outcome: "failed",
-      path: "immediate",
-      presentation: "yellow",
+      outcome: "pending",
+      path: "deferred",
+      presentation: "soft",
     });
     sock.stop();
   });
@@ -7527,7 +7628,8 @@ describe("ChatSocket problem card reporting", () => {
       type: "outbound.error", peer: { id: "s-pc-dedupe", kind: "dm" }, clientMessageId: user.id,
       code: "upstream_failed", message: "boom again", frameSeq: 2, ts: Date.now(),
     }) });
-    expect(reports.filter((r) => r.path === "immediate")).toHaveLength(1);
+    expect(reports.filter((r) => r.path === "deferred")).toHaveLength(1);
+    expect(reports.some((r) => r.outcome === "failed")).toBe(false);
     sock.stop();
 
     const second = problemCardFixture("s-pc-paths");
@@ -8867,7 +8969,7 @@ describe("ChatSocket safeWsSend backpressure (§2) + offline enqueue (§10)", ()
       channel: "webchat",
       peer: { id: "s1", kind: "dm" },
       clientMessageId: failedId,
-      code: "upstream_failed",
+      code: "bad_request",
       message: "upstream failed",
       isFinal: false,
       frameSeq: 1,

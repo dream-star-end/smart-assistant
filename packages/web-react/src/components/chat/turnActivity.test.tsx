@@ -98,15 +98,15 @@ describe("TurnActivity（激活 computeTypingLabel 死代码：阶段反馈接�
     expect(screen.getByText("等待你确认后继续")).toBeTruthy();
   });
 
-  test("OCV5-390: retrying → only the neutral in-progress line, no busy wording, counter or warning colour", () => {
+  test("OCV5-523: retrying → one model-busy retry hint, no counter or warning colour", () => {
     renderTA({
       startedAt: Date.now(),
       turnStatus: { kind: "retrying", attempt: 2, max: 3, retryAt: Date.now() + 4500 },
     });
     const node = screen.getByLabelText("生成中");
     const t = node.textContent ?? "";
-    expect(t).toContain("仍在处理中…");
-    expect(t).not.toMatch(/模型繁忙|重试|\d+\/10|后重试/);
+    expect(t).toContain("模型繁忙，正在重试…");
+    expect(t).not.toMatch(/\d+\/10|后重试/);
     expect(node.className).toContain("text-muted");
     expect(node.className).not.toContain("text-warning");
   });

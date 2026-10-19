@@ -25,6 +25,7 @@ import {
   applyTurnUsage,
   AUTO_CONTINUE_PROMPT,
   expireGenPlaceholdersAgainstServerRows,
+  enterDeferredRecoverySoftState,
   normalizeDelegateCards,
   normalizeGoalCards,
   paintDeferredTerminalError,
@@ -109,6 +110,8 @@ import {
   safeSessionKeyForAgent,
   isRecoveryControlUserTurn,
   problemCardPresentation,
+  friendlyBridgeErrorMessage,
+  safeBridgeErrorDetail,
   REPORT_EXEMPT_TURN_ERR_CODES,
   shouldAutoContinueEmptyTurn,
   SYNC_DEBOUNCE_MS,
@@ -147,6 +150,7 @@ import type {
 } from "./frames";
 import { incidentStore } from "../incidentStore";
 import {
+  type AutomaticTurnRecoverySnapshot,
   AUTOMATIC_TURN_RETRY_MAX,
   assessTurnRecoveryTape,
   DEFAULT_CODEX_ENGINE_MODEL,
@@ -983,6 +987,7 @@ export class ChatSocket {
     clientMessageId?: string;
     timer: ReturnType<typeof setTimeout>;
     decided: boolean;
+    masterOwned?: boolean;
   }>();
   /** 问题卡去重：`${sessId}:${rootCmid}:${outcome}:${path}` 同键只报一次。*/
   private readonly reportedProblemCards = new Set<string>();
@@ -3070,11 +3075,16 @@ export class ChatSocket {
     return true;
   }
 
-  private deferTerminalErrorForRecovery(sessId: string, paint: DeferredTerminalErrorPaint): boolean {
-    if (!this.masterOwnsAutomaticRecovery) return false;
+  private deferTerminalErrorForRecovery(
+    sessId: string,
+    paint: DeferredTerminalErrorPaint,
+    masterOwned = this.masterOwnsAutomaticRecovery,
+  ): boolean {
+    if (!masterOwned && !this.deps.syncSession) return false;
     const sess = this.sessions.get(sessId);
     if (!sess) return false;
     const clientMessageId = paint.clientMessageId ?? sess._activeClientMessageId;
+    if (!isClientMessageId(clientMessageId)) return false;
     // 用户已对该血统按过停止:master 不会再调度,也不该让用户看到"正在重试中"。
     if (clientMessageId && sess._cancelledAutomaticRecoveryIds?.[clientMessageId] === true) return false;
     if (clientMessageId && sess._automaticRecoveryDecisions?.[clientMessageId] === true) return false;
@@ -3088,8 +3098,9 @@ export class ChatSocket {
       }
     }
     const timer = setTimeout(() => this.materializePendingRecoveryError(sessId, "decision_timeout"), RECOVERY_DECISION_GRACE_MS);
-    this.pendingRecoveryErrors.set(sessId, { paint, clientMessageId, timer, decided: false });
+    this.pendingRecoveryErrors.set(sessId, { paint, clientMessageId, timer, decided: false, masterOwned });
     this.stashProblemCardSourceCode(sessId, clientMessageId, paint.normalized);
+    if (!masterOwned) setTimeout(() => void this.autoRecoverTerminalTurn(sessId, clientMessageId), 0);
     return true;
   }
 
@@ -3118,6 +3129,11 @@ export class ChatSocket {
       }
       return;
     }
+    // Persistence can broadcast this before the live terminal error.
+    sess._automaticRecoveryDecisions = {
+      ...(sess._automaticRecoveryDecisions ?? {}), [frame.sourceClientMessageId]: true,
+    };
+    this.deps.persistSession?.(sessId);
     if (matchesPending) {
       const reason = typeof frame.reason === "string" && /^[a-z0-9_]{1,48}$/.test(frame.reason)
         ? frame.reason
@@ -3423,6 +3439,15 @@ export class ChatSocket {
     sess.messages = sess.messages.filter((message, index) =>
       index !== userIndex &&
       message._genPlaceholder?.afterUserMsgId !== clientMessageId);
+    if (attachedToError && !hadCommittedCard && sourceClientMessageId) {
+      const source = sess.messages.find((message) => message.role === "assistant" &&
+        message._clientMessageId === sourceClientMessageId && !!message._errorCode);
+      if (source) paintDeferredTerminalError(sess, {
+        normalized: normalizeTurnErrorCode(source._errorCode),
+        text: source.text || friendlyBridgeErrorMessage(source._errorCode),
+        clientMessageId: sourceClientMessageId,
+      }, this.effects());
+    }
     this.deps.persistSession?.(sessId);
     this.scheduleNotify();
     return true;
@@ -4262,6 +4287,51 @@ export class ChatSocket {
   }
 
 
+  /** Jobs and finalized source rows share one PG read snapshot. */
+  private applyAutomaticRecoverySnapshot(
+    sess: ChatSession,
+    incoming: ChatMessage[],
+    recoveries: AutomaticTurnRecoverySnapshot[] | undefined,
+  ): void {
+    if (!Array.isArray(recoveries)) return;
+    const terminals = detectServerTerminalTurns(incoming);
+    for (const [cmid, kind] of terminals) {
+      if (kind === "completed" && !incoming.some((message) => message._clientMessageId === cmid && message._errorCode)) {
+        this.settlePendingRecoveryError(sess.id, cmid, "adopted");
+        continue;
+      }
+      const error = sess.messages.find((message) => message.role === "assistant" &&
+        message._clientMessageId === cmid && !!message._errorCode);
+      if (!error || !supportsAutomaticTurnRecovery(error._errorCode!)) continue;
+      const child = sess.messages.some((message) => message.role === "user" &&
+        message._automaticRecovery === true && message._recoveryOfClientMessageId === cmid &&
+        isServerAuthoredRow(message));
+      if (child || sess._cancelledAutomaticRecoveryIds?.[cmid] === true) continue;
+      const job = recoveries.find((item) => item.sourceClientMessageId === cmid);
+      if (!job) {
+        sess._automaticRecoveryDecisions = { ...(sess._automaticRecoveryDecisions ?? {}), [cmid]: true };
+        this.settlePendingRecoveryError(sess.id, cmid, "declined", "decision_declined");
+        continue;
+      }
+      if (sess._cancelledAutomaticRecoveryIds?.[job.rootClientMessageId] === true) continue;
+      // A later user intent or an ACKed child owns the UI, even if this older
+      // snapshot completed after the live adoption.
+      const index = sess.messages.findIndex((message) => message.role === "user" && message.id === cmid);
+      if (index < 0 || sess.messages.slice(index + 1).some((message) => message.role === "user")) continue;
+      if (sess._sendingInFlight && sess._activeClientMessageId && sess._activeClientMessageId !== cmid) continue;
+      const normalized = normalizeTurnErrorCode(error._errorCode);
+      const paint: DeferredTerminalErrorPaint = {
+        normalized, text: friendlyBridgeErrorMessage(normalized),
+        clientMessageId: cmid, detail: safeBridgeErrorDetail(normalized),
+      };
+      if (!this.deferTerminalErrorForRecovery(sess.id, paint, true)) continue;
+      error._errorCardSnapshot = undefined;
+      sess._deferredTerminalErrorClientMessageId = cmid;
+      enterDeferredRecoverySoftState(sess, cmid);
+      sess._turnStatus = { kind: "retrying", attempt: job.attempt, max: AUTOMATIC_TURN_RETRY_MAX, retryAt: Date.now() };
+    }
+  }
+
   /** 刷新后继续等裁决。历史失败 tape 不能自行把源轮提交成错误卡。 */
   private restoreDeferredTerminalError(s: ChatSession, stored: StoredSession): void {
     const cmid = stored._deferredTerminalErrorClientMessageId;
@@ -4351,6 +4421,7 @@ export class ChatSocket {
         status: string;
       };
       permissionPrompts?: PermissionPromptSnapshotPayload;
+      automaticRecoveries?: AutomaticTurnRecoverySnapshot[];
     },
   ): void {
     const s = this.ensureSession(sessId, agentId || this.deps.defaultAgentId || "main");
@@ -4512,6 +4583,7 @@ export class ChatSocket {
     if (!s._sendingInFlight || settlingActiveTurn) {
       s.messages = repairPostFinalProcessOrder(s.messages);
     }
+    this.applyAutomaticRecoverySnapshot(s, msgs, archive?.automaticRecoveries);
     freezeErrorCardSnapshots(
       s.messages,
       s._deferredTerminalErrorClientMessageId,
@@ -4538,7 +4610,7 @@ export class ChatSocket {
     if (
       !this.masterOwnsAutomaticRecovery &&
       tailRecoverableError &&
-      s._deferredTerminalErrorClientMessageId !== tailRecoverableError._clientMessageId &&
+      this.pendingRecoveryErrors.get(s.id)?.masterOwned !== true &&
       s._automaticRecoveryDecisions?.[recoveryDecisionKey] !== true
     ) {
       setTimeout(
@@ -5695,16 +5767,16 @@ export class ChatSocket {
     target: InterruptedContinuationTarget,
     agentId: string,
     automatic: boolean,
-  ): void {
-    if (sess._sendingInFlight) return;
+  ): boolean {
+    if (sess._sendingInFlight) return false;
     if (
       automatic &&
       sess._cancelledAutomaticRecoveryIds?.[target.user.id] === true
     ) {
-      return;
+      return false;
     }
     const routing = normalizeRetiredRouting(target.user._routing);
-    if (!routing) return;
+    if (!routing) return false;
     const resolvedAgentId = sess.agentId || agentId;
     void this.ensureServerSessionOnce(sess, resolvedAgentId);
     const replay = target.mode === "replay"
@@ -5797,6 +5869,7 @@ export class ChatSocket {
       this.ensureGenPlaceholder(sess, replay.imageEdit, true, userMsg.id);
     }
     this.dispatchPayload(sess, userMsg, payload);
+    return true;
   }
 
   private async autoRecoverTerminalTurn(
@@ -5804,20 +5877,33 @@ export class ChatSocket {
     clientMessageId?: string,
   ): Promise<void> {
     if (this.masterOwnsAutomaticRecovery) return;
+    const expected = this.pendingRecoveryErrors.get(sessId);
+    if (expected?.masterOwned) return;
+    const ownsPending = () => !!expected && this.pendingRecoveryErrors.get(sessId) === expected;
     const pendingKey = `${sessId}\0${clientMessageId ?? "tail"}`;
     const beforeSync = this.sessions.get(sessId);
+    const decline = () => {
+      if (!ownsPending()) return;
+      const sess = this.sessions.get(sessId);
+      if (!sess) return;
+      if (clientMessageId) sess._automaticRecoveryDecisions = {
+        ...(sess._automaticRecoveryDecisions ?? {}), [clientMessageId]: true,
+      };
+      const root = this.problemCardRootCmid(sess, clientMessageId);
+      const cancelled = !!clientMessageId && sess._cancelledAutomaticRecoveryIds?.[clientMessageId] === true ||
+        !!root && sess._cancelledAutomaticRecoveryIds?.[root] === true;
+      this.materializePendingRecoveryError(sessId, cancelled ? "stop_fenced" : "decision_declined");
+    };
     if (beforeSync?._automaticRecoveryDecisions?.[clientMessageId ?? "tail"] === true) return;
     if (beforeSync && clientMessageId) {
       const sourceUserIndex = beforeSync.messages.findIndex((message) =>
         message.role === "user" && message.id === clientMessageId);
-      if (
-        sourceUserIndex >= 0 &&
-        beforeSync.messages.slice(sourceUserIndex + 1).some((message) => message.role === "user")
-      ) {
+      if (sourceUserIndex >= 0 && beforeSync.messages.slice(sourceUserIndex + 1).some((message) =>
+        message.role === "user")) {
         beforeSync._automaticRecoveryDecisions = {
-          ...(beforeSync._automaticRecoveryDecisions ?? {}),
-          [clientMessageId]: true,
+          ...(beforeSync._automaticRecoveryDecisions ?? {}), [clientMessageId]: true,
         };
+        decline();
         this.deps.persistSession?.(sessId);
         return;
       }
@@ -5825,32 +5911,48 @@ export class ChatSocket {
     if (this.automaticRecoveryPending.has(pendingKey)) return;
     this.automaticRecoveryPending.add(pendingKey);
     try {
-      await this.deps.syncSession?.(
-        sessId,
-        clientMessageId ? { clientMessageId } : undefined,
-      );
+      const synced = await this.deps.syncSession?.(sessId, {
+        ...(clientMessageId ? { clientMessageId } : {}),
+        isCurrent: () => !expected || ownsPending(),
+      });
+      if (synced === false) {
+        if (ownsPending()) this.startContinuousReconcile(sessId, undefined, { clientMessageId });
+        return;
+      }
+      if (expected && !ownsPending()) return;
       const sess = this.sessions.get(sessId);
-      if (!sess || sess._sendingInFlight || sess._dispatchPaused) return;
+      if (!sess) return;
+      const ownsSoftTurn = ownsPending() &&
+        (!sess._activeClientMessageId || sess._activeClientMessageId === clientMessageId);
+      if (sess._sendingInFlight && !ownsSoftTurn) return;
       const error = [...sess.messages].reverse().find((message) =>
-        message.role === "assistant" &&
-        !!message._errorCode &&
+        message.role === "assistant" && !!message._errorCode && isServerAuthoredRow(message) &&
         (clientMessageId === undefined || message._clientMessageId === clientMessageId));
-      if (!error) return;
+      if (!error) {
+        if (ownsPending()) this.startContinuousReconcile(sessId, undefined, { clientMessageId });
+        return;
+      }
+      if (sess._dispatchPaused) { decline(); return; }
       const target = automaticTurnRecoveryTarget(sess.messages, error, sess.id);
-      if (!target) return;
+      if (!target) { decline(); return; }
       if (sess._cancelledAutomaticRecoveryIds?.[target.user.id] === true) return;
       if (sess._automaticRecoveryDecisions?.[target.user.id] === true) return;
       sess._automaticRecoveryDecisions = {
-        ...(sess._automaticRecoveryDecisions ?? {}),
-        [target.user.id]: true,
+        ...(sess._automaticRecoveryDecisions ?? {}), [target.user.id]: true,
       };
-      this.deps.persistSession?.(sess.id);
-      this.dispatchTurnRecovery(
-        sess,
-        target,
-        sess.agentId || this.deps.defaultAgentId || "main",
-        true,
+      if (ownsSoftTurn) {
+        sess._sendingInFlight = false;
+        sess._activeClientMessageId = undefined;
+      }
+      const dispatched = this.dispatchTurnRecovery(
+        sess, target, sess.agentId || this.deps.defaultAgentId || "main", true,
       );
+      if (dispatched) this.settlePendingRecoveryError(sessId, clientMessageId, "adopted");
+      else decline();
+      this.deps.persistSession?.(sess.id);
+    } catch {
+      // A failed read is not a terminal decision; normal reconciliation retries.
+      if (ownsPending()) this.startContinuousReconcile(sessId, undefined, { clientMessageId });
     } finally {
       this.automaticRecoveryPending.delete(pendingKey);
     }
@@ -6324,7 +6426,8 @@ export class ChatSocket {
     // enqueueAutomaticRecoveryJob 的 NOT EXISTS(stop) 守卫会拒绝再入队。这条控制**不**进入
     // _stopSettlement / 「正在停止…」态:服务端回执只是幂等收尾,不应再挂住 composer。
     const deferred = this.pendingRecoveryErrors.get(sessId);
-    if (deferred && pending.length === 0) {
+    if (deferred && pending.length === 0 &&
+      (!sess._activeClientMessageId || sess._activeClientMessageId === deferred.clientMessageId)) {
       const lineageId = deferred.clientMessageId ?? sess._activeClientMessageId;
       let rootId: string | undefined;
       if (lineageId) {

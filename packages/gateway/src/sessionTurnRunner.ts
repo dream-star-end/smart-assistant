@@ -470,6 +470,7 @@ export async function _runOneTurn(
 
     // Buffer 'final' event — only forward to client after auth check passes
     let pendingFinal: SessionStreamEvent | null = null
+    let pendingAttemptError: Extract<EngineEvent, { kind: 'error' }> | null = null
     let observedFinalMeta: EngineFinalMeta | undefined
     let terminalEngineBilling: EngineBillingEvent | undefined
     let terminalExternalBilling: EngineExternalBillingEvent | undefined
@@ -750,6 +751,14 @@ export async function _runOneTurn(
       if (e.kind === 'final') {
         observedFinalMeta = e.meta ? { ...e.meta } : undefined
         pendingFinal = e
+        return
+      }
+      if (e.kind === 'error') {
+        // Native errors describe an attempt, not the logical turn. The adapter
+        // keeps their raw runtime events for the tape. Only the acknowledged
+        // result/partial terminal below may publish a user-facing error; a
+        // retry (or a later successful result) must never flash a red card.
+        pendingAttemptError = e
         return
       }
       onEvent(e)
@@ -1761,7 +1770,7 @@ export async function _runOneTurn(
           terminalOverride !== null || result.isError || result.errorDetail !== undefined
         if (completedHasError) {
           terminalErrorForClient =
-            terminalOverride?.reason ?? result.errorDetail ?? 'engine reported an error'
+            terminalOverride?.reason ?? result.errorDetail ?? pendingAttemptError?.error ?? 'engine reported an error'
           // E4.2 — gateway 权威终态码透传:handleExit/tape 已正确分类的
           // RUNNER_CRASHED / SERVICE_RESTART(以及 USER_CANCELLED、tape
           // AUTH_ERROR / ENGINE_ERROR)不再被 server 侧原文正则压成
