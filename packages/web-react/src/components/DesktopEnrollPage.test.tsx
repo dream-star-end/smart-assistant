@@ -9,7 +9,7 @@ import {
   enrollNavigation,
   parseEnrollmentId,
   parsePublicName,
-} from "./DesktopEnrollPage";
+} from "./DesktopEnrollPageContent";
 
 const UUID = "550e8400-e29b-41d4-a716-446655440000";
 const CODE = "c".repeat(64);
