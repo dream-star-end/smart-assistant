@@ -6,7 +6,7 @@
 # **不提供 wait 子命令**:阻塞等待是守护进程的事,不是会话的事。
 #
 # 用法:
-#   oc-lease register --resource deploy:selfhost --mode ride --sha <40hex> [--ticket OCV5-xx] [--callback auto|none] [--owner TAG]
+#   oc-lease register --resource deploy:selfhost --mode ride --sha <40hex> [--ticket OCV5-xx] [--callback auto|none [--release-policy user-impact-only]] [--owner TAG]
 #   oc-lease status   [--resource R] [--id ID] [--json]
 #   oc-lease cancel   --id ID [--owner TAG]
 #   oc-lease train    list | resolve --id TR --as committed|failed --reason "..."
@@ -30,8 +30,14 @@ detect_session_key() {
 
 cmd_register() {
   local resource="" mode="ride" sha="" ticket="" callback="auto" owner="" uid="${OC_USER_ID:-}"
+  local release_policy="" requested_mode=legacy result_meta=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --release-policy)
+        [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || lease_die '--release-policy 缺值'
+        [[ -z "$release_policy" ]] || lease_die '--release-policy 不能重复'
+        [[ "$2" == user-impact-only ]] || lease_die '非法 --release-policy'
+        release_policy="$2"; requested_mode=user-impact-only; shift 2 ;;
       --resource) resource="${2:-}"; shift 2 ;;
       --mode) mode="${2:-}"; shift 2 ;;
       --sha) sha="${2:-}"; shift 2 ;;
@@ -60,6 +66,11 @@ cmd_register() {
   if ! lease_sha_contained "$sha" "$tip"; then
     echo "✗ 拒绝登记:${sha:0:12} 不在 origin/$LEASE_BRANCH(tip ${tip:0:12})上。先 push/ff-merge 再来。" >&2
     exit 3
+  fi
+
+  if [[ -n "$release_policy" ]]; then
+    [[ "$sha" == "$tip" ]] || lease_die 'release-policy 必须绑定当前完整 publisher tip SHA'
+    result_meta="$(jq -cn --arg sha "$sha" '{request:{releasePolicy:{schema:1,mode:"user-impact-only",sourceSha:$sha}}}')" || lease_die 'policy request 创建失败'
   fi
 
   # 2) live 已含 → 不建 lease,直接告知。
@@ -98,29 +109,58 @@ cmd_register() {
     cb_note="回调:none(不唤醒会话；${ticket:+面板评论 $ticket}${ticket:-仅 worker 日志/status})"
   fi
 
-  # 4) 幂等:同 resource+sha+owner 已有 open lease → 返回旧 id。
-  local existing
-  existing="$(lease_sql "SELECT id FROM lease WHERE resource='$(lease_q "$resource")' AND want_sha='$sha'
-                          AND owner='$(lease_q "$owner")' AND status IN ('registered','granted') LIMIT 1;")"
-  if [[ -n "$existing" ]]; then
-    echo "= 已存在登记 $existing(同 sha/同 owner),不重复建。"
-    echo "▶ 请立即收口本回合;结果会以新回合/面板评论送达,不要再查。"
-    return 0
-  fi
-
-  local id now
-  id="$(lease_new_id ls)"; now="$(lease_now)"
-  lease_tx <<SQL
+  # Registration and exact policy idempotency share one SQLite transaction.
+local id now receipt selected_id inserted lp_views
+id="$(lease_new_id ls)"; now="$(lease_now)"
+lp_views="$(lease_policy_views_sql "$resource")" || lease_die 'policy SQL准备失败'
+receipt="$(lease_tx <<SQL
+.bail on
 BEGIN IMMEDIATE;
-INSERT INTO lease(id,resource,mode,status,owner,owner_uid,callback_session_key,want_sha,ticket_ref,
-                  notify_deadline,created_at,updated_at)
-VALUES('$id','$(lease_q "$resource")','$mode','registered','$(lease_q "$owner")','$(lease_q "$uid")',
-       $( [[ -n "$sk" ]] && printf "'%s'" "$(lease_q "$sk")" || printf NULL ),
-       '$sha',$( [[ -n "$ticket" ]] && printf "'%s'" "$ticket" || printf NULL ),
-       strftime('%Y-%m-%dT%H:%M:%SZ','now','+${LEASE_NOTIFY_DEADLINE_SECONDS} seconds'),'$now','$now');
-$(lease_event_sql "$id" registered "$owner" "resource=$resource sha=$sha ticket=${ticket:-} cb=${sk:-${ticket:-log}}")
+$lp_views
+-- Reject malformed/same-SHA mixed mode before either insertion or idempotent return.
+INSERT INTO _lp_guard SELECT CASE WHEN NOT EXISTS (
+ SELECT 1 FROM _lp_open WHERE want_sha='$sha' AND policy_mode<>'$requested_mode'
+) THEN 1 ELSE 0 END;
+CREATE TEMP TABLE _lp_existing AS SELECT id,owner_uid FROM _lp_open
+ WHERE want_sha='$sha' AND owner='$(lease_q "$owner")';
+INSERT INTO _lp_guard SELECT CASE WHEN
+ (SELECT count(*) FROM _lp_existing)<=1 AND NOT EXISTS (
+  SELECT 1 FROM _lp_existing WHERE owner_uid<>'$(lease_q "$uid")'
+ ) THEN 1 ELSE 0 END;
+-- New explicit request cannot retrofit a running train. Identical existing request
+-- remains a pure idempotent return and does not change callbacks or binding.
+INSERT INTO _lp_guard SELECT CASE WHEN '$requested_mode'='legacy'
+ OR EXISTS(SELECT 1 FROM _lp_existing)
+ OR NOT EXISTS(SELECT 1 FROM train WHERE resource='$(lease_q "$resource")'
+               AND status NOT IN ('committed','failed')) THEN 1 ELSE 0 END;
+CREATE TEMP TABLE _lp_registration AS SELECT
+ COALESCE((SELECT id FROM _lp_existing),'$id') AS id,
+ NOT EXISTS(SELECT 1 FROM _lp_existing) AS inserted;
+INSERT INTO lease(id,resource,mode,status,owner,owner_uid,callback_session_key,want_sha,
+ ticket_ref,notify_deadline,result_json,created_at,updated_at)
+SELECT '$id','$(lease_q "$resource")','$mode','registered','$(lease_q "$owner")',
+ '$(lease_q "$uid")',
+ $( [[ -n "$sk" ]] && printf "'%s'" "$(lease_q "$sk")" || printf NULL ),
+ '$sha',$( [[ -n "$ticket" ]] && printf "'%s'" "$(lease_q "$ticket")" || printf NULL ),
+ strftime('%Y-%m-%dT%H:%M:%SZ','now','+${LEASE_NOTIFY_DEADLINE_SECONDS} seconds'),
+ $( [[ -n "$result_meta" ]] && printf "'%s'" "$(lease_q "$result_meta")" || printf NULL ),
+ '$now','$now' WHERE (SELECT inserted FROM _lp_registration)=1;
+INSERT INTO event(subject_id,event,actor,detail,created_at)
+ SELECT '$id','registered','$(lease_q "$owner")',
+ 'resource=$(lease_q "$resource") sha=$sha policy=$requested_mode ticket=$(lease_q "$ticket")',
+ '$now' WHERE (SELECT inserted FROM _lp_registration)=1;
 COMMIT;
+SELECT json_object('id',id,'inserted',inserted) FROM _lp_registration;
 SQL
+)" || lease_die '登记拒绝: request 不一致、混合 policy、迟到绑定或元数据/事务失败'
+selected_id="$(jq -er '.id' <<<"$receipt")" || lease_die '非法登记 receipt'
+inserted="$(jq -er '.inserted|tostring' <<<"$receipt")" || lease_die '非法登记 receipt'
+if [[ "$inserted" == 0 ]]; then
+ echo "= 已存在登记 $selected_id(同 sha/同 owner/同 policy),不重复建。"
+ echo '▶ 结果沿原回调送达，不改回调归属。'
+ return 0
+fi
+id="$selected_id"
   echo "✓ lease $id 已登记:$resource/$mode want=${sha:0:12} owner=$owner"
   echo "  $cb_note"
   echo "  当前: origin tip ${tip:0:12};live ${live_sha:-未知/未committed}"

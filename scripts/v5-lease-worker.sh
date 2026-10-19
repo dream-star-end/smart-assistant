@@ -72,6 +72,22 @@ reconcile_trains() {
       finish_train "$id" failed "planned 超 ${LEASE_TRAIN_PLANNED_STALE_SECONDS}s 无执行器(spawn 前崩溃)" "$ev"
       continue
     fi
+    # Typed hold is authoritative even when the old survivor looks green.
+    if lease_release_policy_held; then
+      finish_train "$id" failed "unresolved release-policy operation; candidate retained; no automatic rerun" "$ev"
+      continue
+    fi
+    local policy_kind policy_doc
+    policy_doc="$(train_field "$id" evidence_json)" || continue
+    [[ -n "$policy_doc" ]] || policy_doc='{}'
+    policy_kind="$(jq -er '
+      if type!="object" then "invalid"
+      elif has("releasePolicy") or has("releasePolicyAcceptance") or has("releasePolicyOwner")
+      then "policy" else "legacy" end' <<<"$policy_doc")" || policy_kind=invalid
+    if [[ "$policy_kind" != legacy ]]; then
+      wlog "policy train $id lacks owner terminal acceptance; no live-SHA inference"
+      continue
+    fi
     # 执行器已死,看权威证据
     if live_sha="$(lease_live_committed_sha)" && lease_sha_contained "$target" "$live_sha" && [[ "$live_sha" == "$target" ]]; then
       finish_train "$id" committed "执行器退出;live committed sourceCommit=$live_sha 等于 target(对账结算)" "$ev"
@@ -86,10 +102,12 @@ reconcile_trains() {
 }
 
 finish_train() { # <id> <status> <reason> <evidence_json>
-  local now; now="$(lease_now)"
+  local now evidence_merge; now="$(lease_now)"
+  evidence_merge="$(lease_json_object_merge_sql evidence_json "$4")" || return 1
   lease_tx <<SQL || { wlog "finish_train $1 写失败,放弃"; return 1; }
+.bail on
 BEGIN IMMEDIATE;
-UPDATE train SET status='$2', reason='$(lease_q "$3")', evidence_json='$(lease_q "$4")',
+UPDATE train SET status='$2', reason='$(lease_q "$3")', evidence_json=$evidence_merge,
        rel_path=$( [[ "$2" == committed ]] && printf "'%s'" "$(lease_q "$(lease_live_rel_path)")" || printf 'rel_path' ),
        finished_at='$now', updated_at='$now'
  WHERE id='$1' AND status NOT IN ('committed','failed');
@@ -170,9 +188,13 @@ describe_blocker() {
 transition_with_outbox() { # <id> <from> <to> <detail> <body>
   local id="$1" from="$2" to="$3" detail="$4" body="$5" tk tt
   IFS=$'\t' read -r tk tt < <(lease_callback_target "$id")
+  local result_patch result_merge
+  result_patch="$(jq -cn --arg d "$detail" '{detail:$d}')" || return 1
+  result_merge="$(lease_json_object_merge_sql result_json "$result_patch")" || return 1
   lease_tx <<SQL || { wlog "transition $id $from→$to 写失败"; return 1; }
+.bail on
 BEGIN IMMEDIATE;
-UPDATE lease SET status='$to', result_json='$(lease_q "$(jq -cn --arg d "$detail" '{detail:$d}')")', updated_at='$(lease_now)'
+UPDATE lease SET status='$to', result_json=$result_merge, updated_at='$(lease_now)'
  WHERE id='$id' AND status='$from';
 $(lease_outbox_sql "lease:$id:$to" "$id" "$to" "$tk" "$tt" "$body")
 $(lease_event_sql "$id" "$to" "$ACTOR" "$detail")
@@ -193,20 +215,39 @@ SQL
 
 # ---------- 4 结算 ----------
 settle_rides() {
-  local live_sha rel rows id want same
+  local live_sha rel rows id want same policy_mode bound views
   live_sha="$(lease_live_committed_sha)" || { wlog "live 非 committed,本 tick 不结算"; return 0; }
   rel="$(lease_live_rel_path)"
-  rows="$(lease_sql "SELECT id||'|'||want_sha FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';")"
+  views="$(lease_policy_views_sql "$RESOURCE")" || return 0
+  rows="$(lease_tx <<SQL
+.bail on
+BEGIN;
+$views
+SELECT id||'|'||want_sha||'|'||policy_mode FROM _lp_open WHERE status='registered' ORDER BY seq;
+ROLLBACK;
+SQL
+)" || return 0
   [[ -n "$rows" ]] || return 0
-  same="$(lease_sql "SELECT group_concat(substr(want_sha,1,7),' ') FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';")"
-  while IFS='|' read -r id want; do
+  same="$(lease_sql "SELECT group_concat(substr(want_sha,1,7),' ') FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';")" || return 0
+  while IFS='|' read -r id want policy_mode; do
     [[ -n "$id" ]] || continue
+    case "$policy_mode" in
+      legacy) : ;;
+      user-impact-only)
+        # Explicit but UNBOUND requests never settle from old same-SHA live.
+        bound="$(lease_sql "SELECT json_extract(result_json,'$.releasePolicyBinding.trainId') FROM lease WHERE id='$(lease_q "$id")';")" || continue
+        lease_valid_train_id "$bound" || { wlog "explicit ride $id awaits exact train binding"; continue; }
+        lease_policy_archive_accepted "$bound" "$want" historical "$rel" "$id" || continue
+        ;;
+      *) wlog "ride $id invalid policy metadata; no settlement"; continue ;;
+    esac
     if lease_sha_contained "$want" "$live_sha"; then
       transition_with_outbox "$id" registered satisfied "live=$rel sourceCommit=$live_sha ⊇ $want" \
         "$(lease_body_satisfied "$id" "$want" "$rel" "$live_sha" "$same")"
     fi
   done <<<"$rows"
 }
+
 
 # ---------- 5 发车 ----------
 # OCV5-439:发版主工作树落后 origin tip 时只做 fast-forward。检出的不是发版分支 / 有未提交改动 /
@@ -245,6 +286,7 @@ SQL
 }
 
 dispatch_train() {
+  lease_release_policy_held && { wlog "unresolved release policy blocks dispatch"; return 0; }
   local pending open tip miss id now logf
   pending="$(lease_sql "SELECT COUNT(*) FROM lease WHERE resource='$RESOURCE' AND status='registered' AND mode='ride';")"
   [[ "$pending" -gt 0 ]] || return 0
@@ -297,10 +339,16 @@ dispatch_train() {
   id="$(lease_new_id tr)"; now="$(lease_now)"
   mkdir -p "$WORKER_LOG_DIR"; logf="$WORKER_LOG_DIR/$id.log"
   # 先 insert(planned),再 spawn;唯一部分索引保证同 resource 只有一班 open。
-  lease_tx <<SQL || { wlog "insert train 失败(可能并发已有 open),不发车"; exec 8>&-; return 0; }
+local lp_views lp_bind
+lp_views="$(lease_policy_views_sql "$RESOURCE")" || { exec 8>&-; return 0; }
+lp_bind="$(lease_policy_bind_sql "$id" "$tip" "$ACTOR")" || { exec 8>&-; return 0; }
+lease_tx <<SQL || { wlog 'insert/bind train 拒绝；不发车'; exec 8>&-; return 0; }
+.bail on
 BEGIN IMMEDIATE;
+$lp_views
 INSERT INTO train(id,resource,target_sha,status,owner,log_path,created_at,updated_at)
 VALUES('$id','$RESOURCE','$tip','planned','$ACTOR','$(lease_q "$logf")','$now','$now');
+$lp_bind
 $(lease_event_sql "$id" train-planned "$ACTOR" "target=$tip rides=$pending")
 COMMIT;
 SQL

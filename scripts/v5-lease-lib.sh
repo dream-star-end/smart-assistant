@@ -189,7 +189,22 @@ lease_callback_target() { # <lease_id> → 打印 "kind\ttarget"
 # ---------- 权威事实读取(只读) ----------
 
 # live 当前 sourceCommit;survivor 未 committed 时返回空(不可据以结算)。
+# A context is a durable unresolved-operation barrier. Only reliable ENOENT
+# clears it; damaged data, links, permissions and probe errors retain the hold.
+lease_release_policy_held() {
+  ! python3 - "${OC_V5_RELEASE_POLICY_CONTEXT:-/var/lib/openclaude-v5-selfhost/release-policy/unresolved.json}" <<'LP_PRESENCE'
+import os,sys,pathlib
+q=pathlib.PurePath(sys.argv[1])
+if not q.is_absolute() or ".." in q.parts:sys.exit(2)
+try:os.lstat(q)
+except FileNotFoundError:sys.exit(0)
+except OSError:sys.exit(1)
+sys.exit(1)
+LP_PRESENCE
+}
+
 lease_live_committed_sha() {
+  lease_release_policy_held && return 1
   local live sha
   [[ -L "$LEASE_LIVE_LINK" ]] || return 1
   live="$(readlink -f -- "$LEASE_LIVE_LINK" 2>/dev/null || true)"
@@ -205,6 +220,7 @@ lease_live_committed_sha() {
       *) return 1 ;;
     esac
   fi
+  lease_policy_current_live_accepted "$sha" "$live" || return 1
   printf '%s\n' "$sha"
 }
 
@@ -314,4 +330,258 @@ lease_callback_post() { # <suffix: empty|/validate> <json>
   printf '%s' "$2" | curl --noproxy '*' -sS -m 20 \
     --config <(printf 'header = "X-OC-Lease-Secret: %s"\n' "$secret") \
     -H 'Content-Type: application/json' -w '\n%{http_code}' --data-binary @- "$url$1"
+}
+
+# Explicit per-target release policy transport, on existing JSON metadata.
+lease_policy_views_sql() { # resource
+  local resource_q; resource_q="$(lease_q "$1")"
+  cat <<SQL
+CREATE TEMP TABLE _lp_guard(ok INTEGER NOT NULL CHECK(ok=1));
+CREATE TEMP VIEW _lp_open AS
+WITH docs AS (
+ SELECT seq,id,resource,mode,status,owner,owner_uid,want_sha,
+        COALESCE(result_json,'{}') AS doc
+ FROM lease WHERE resource='$resource_q' AND mode='ride'
+   AND status IN ('registered','granted')
+)
+SELECT *, CASE
+ WHEN json_valid(doc)<>1 THEN 'invalid'
+ WHEN json_type(doc)<>'object' THEN 'invalid'
+ WHEN json_type(doc,'$.request.releasePolicy') IS NULL THEN
+   CASE WHEN json_type(doc,'$.releasePolicyBinding') IS NULL THEN 'legacy' ELSE 'invalid' END
+ WHEN json_type(doc,'$.request.releasePolicy')='object'
+  AND json_type(doc,'$.request.releasePolicy.schema')='integer'
+  AND json_extract(doc,'$.request.releasePolicy.schema')=1
+  AND json_type(doc,'$.request.releasePolicy.mode')='text'
+  AND json_extract(doc,'$.request.releasePolicy.mode')='user-impact-only'
+  AND json_type(doc,'$.request.releasePolicy.sourceSha')='text'
+  AND json_extract(doc,'$.request.releasePolicy.sourceSha')=want_sha
+  AND (SELECT count(*) FROM json_each(doc,'$.request.releasePolicy'))=3
+  AND NOT EXISTS (SELECT 1 FROM json_each(doc,'$.request.releasePolicy')
+                  WHERE key NOT IN ('schema','mode','sourceSha'))
+ THEN 'user-impact-only' ELSE 'invalid' END AS policy_mode
+FROM docs;
+SQL
+}
+
+lease_policy_bind_sql() { # train_id target_sha actor; call AFTER row insert or for existing row
+  local id="$1" target="$2" actor="$3" iq tq aq nowq
+  lease_valid_train_id "$id" && lease_valid_sha "$target" || return 2
+  iq="$(lease_q "$id")"; tq="$(lease_q "$target")"; aq="$(lease_q "$actor")"
+  nowq="$(lease_q "$(lease_now)")"
+  cat <<SQL
+-- Current official train must still be mutable and bound to this exact source.
+INSERT INTO _lp_guard SELECT CASE WHEN
+ (SELECT count(*) FROM train WHERE id='$iq' AND resource='deploy:selfhost'
+  AND target_sha='$tq' AND status IN ('planned','building'))=1 THEN 1 ELSE 0 END;
+INSERT INTO _lp_guard SELECT CASE WHEN NOT EXISTS (
+ SELECT 1 FROM _lp_open WHERE status='registered' AND policy_mode='invalid'
+) THEN 1 ELSE 0 END;
+-- Explicit requests may never fall through to legacy after tip advances.
+INSERT INTO _lp_guard SELECT CASE WHEN NOT EXISTS (
+ SELECT 1 FROM _lp_open WHERE status='registered'
+  AND policy_mode='user-impact-only' AND want_sha<>'$tq'
+) THEN 1 ELSE 0 END;
+-- Same-SHA mixed policy can also arrive from an old registrar: recheck here.
+INSERT INTO _lp_guard SELECT CASE WHEN NOT EXISTS (
+ SELECT want_sha FROM _lp_open WHERE status='registered'
+ GROUP BY want_sha HAVING count(DISTINCT policy_mode)>1
+) THEN 1 ELSE 0 END;
+CREATE TEMP TABLE _lp_selected AS SELECT * FROM _lp_open
+ WHERE status='registered' AND policy_mode='user-impact-only' AND want_sha='$tq';
+-- Immutable request and mutable consumption receipt are separate nodes.
+INSERT INTO _lp_guard SELECT CASE WHEN NOT EXISTS (
+ SELECT 1 FROM _lp_selected WHERE
+  json_type(doc,'$.releasePolicyBinding') IS NOT NULL AND
+  CASE WHEN json_type(doc,'$.releasePolicyBinding')='object'
+    AND json_type(doc,'$.releasePolicyBinding.schema')='integer'
+    AND json_extract(doc,'$.releasePolicyBinding.schema')=1
+    AND json_type(doc,'$.releasePolicyBinding.trainId')='text'
+    AND json_extract(doc,'$.releasePolicyBinding.trainId')='$iq'
+    AND json_type(doc,'$.releasePolicyBinding.sourceSha')='text'
+    AND json_extract(doc,'$.releasePolicyBinding.sourceSha')='$tq'
+    AND (SELECT count(*) FROM json_each(doc,'$.releasePolicyBinding'))=3
+    AND NOT EXISTS(SELECT 1 FROM json_each(doc,'$.releasePolicyBinding')
+                   WHERE key NOT IN ('schema','trainId','sourceSha'))
+  THEN 0 ELSE 1 END=1
+) THEN 1 ELSE 0 END;
+CREATE TEMP TABLE _lp_snapshot AS
+ SELECT json_object('schema',1,'mode','user-impact-only','sourceSha','$tq',
+                    'leaseIds',json((SELECT json_group_array(id)
+                                   FROM (SELECT id FROM _lp_selected ORDER BY seq)))) AS doc
+ WHERE EXISTS (SELECT 1 FROM _lp_selected);
+-- Reject malformed existing metadata; do not silently overwrite it.
+INSERT INTO _lp_guard SELECT CASE WHEN
+ evidence_json IS NULL THEN 1
+ WHEN json_valid(evidence_json)<>1 THEN 0
+ WHEN json_type(evidence_json)='object' THEN 1 ELSE 0 END
+ FROM train WHERE id='$iq';
+CREATE TEMP TABLE _lp_previous AS SELECT
+ json_type(COALESCE(evidence_json,'{}'),'$.releasePolicy') AS policy_type,
+ json_extract(COALESCE(evidence_json,'{}'),'$.releasePolicy') AS doc
+ FROM train WHERE id='$iq';
+-- Existing frozen snapshot must match, not be replaced by a new request set.
+INSERT INTO _lp_guard SELECT CASE WHEN
+ (p.policy_type IS NULL AND NOT EXISTS(SELECT 1 FROM _lp_snapshot))
+ OR (EXISTS(SELECT 1 FROM _lp_snapshot) AND (
+   p.policy_type IS NULL OR (
+    p.policy_type='object'
+    AND json_type(p.doc,'$.schema')='integer'
+    AND json_extract(p.doc,'$.schema')=1
+    AND json_extract(p.doc,'$.mode')='user-impact-only'
+    AND json_extract(p.doc,'$.sourceSha')='$tq'
+    AND (SELECT count(*) FROM json_each(p.doc))=4
+    AND NOT EXISTS(SELECT 1 FROM json_each(p.doc)
+                   WHERE key NOT IN ('schema','mode','sourceSha','leaseIds'))
+    AND json_type(p.doc,'$.leaseIds')='array'
+    AND json(json_extract(p.doc,'$.leaseIds'))=
+        json((SELECT json_extract(doc,'$.leaseIds') FROM _lp_snapshot))
+   )
+ )) THEN 1 ELSE 0 END FROM _lp_previous p;
+UPDATE lease SET
+ result_json=json_set(result_json,'$.releasePolicyBinding',
+   json_object('schema',1,'trainId','$iq','sourceSha','$tq')),
+ updated_at='$nowq' WHERE id IN (SELECT id FROM _lp_selected);
+UPDATE train SET
+ evidence_json=json_set(COALESCE(evidence_json,'{}'),'$.releasePolicy',
+                       json((SELECT doc FROM _lp_snapshot))),
+ updated_at='$nowq'
+ WHERE id='$iq' AND EXISTS(SELECT 1 FROM _lp_snapshot);
+INSERT INTO event(subject_id,event,actor,detail,created_at)
+ SELECT '$iq','release-policy-bound','$aq','mode=user-impact-only sha=$tq','$nowq'
+ WHERE EXISTS(SELECT 1 FROM _lp_snapshot)
+ AND (SELECT policy_type FROM _lp_previous) IS NULL;
+SQL
+}
+
+lease_json_object_merge_sql() { # column patch_json -> SQL expr; precompute/capture failure
+ local column="$1" patch="$2" pq
+ [[ "$column" == result_json || "$column" == evidence_json ]] || return 2
+ jq -e 'type=="object"' <<<"$patch" >/dev/null || return 2
+ pq="$(lease_q "$patch")"
+ # Deliberately malformed json in invalid branch raises SQL error; .bail on rolls back.
+ cat <<SQL
+CASE WHEN $column IS NULL THEN json('$pq')
+ WHEN json_valid($column)<>1 THEN json('!invalid-existing-metadata')
+ WHEN json_type($column)<>'object' THEN json('!nonobject-existing-metadata')
+ ELSE json_patch($column,json('$pq')) END
+SQL
+}
+
+lease_policy_archive_accepted() { # train sha scope live_rel [ride_id]
+  local train="$1" sha="$2" scope="$3" live_rel="$4" ride_id="${5:-}" libdir
+  lease_valid_train_id "$train" && lease_valid_sha "$sha" || return 1
+  [[ "$scope" == current || "$scope" == historical ]] || return 1
+  [[ -z "$ride_id" ]] || lease_valid_id "$ride_id" || return 1
+  libdir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || return 1
+  python3 -B - "$libdir/lib/v5-release-policy.py" "$LEASE_DB" \
+    "${OC_V5_RELEASE_POLICY_CONTEXT:-/var/lib/openclaude-v5-selfhost/release-policy/unresolved.json}" \
+    "$train" "$sha" "$scope" "$live_rel" "$ride_id" <<'POLICY_ARCHIVE_ACCEPTED'
+import hashlib,importlib.util,json,os,pathlib,sqlite3,stat,sys
+helper,db,active_name,train,sha,scope,live_name,ride=sys.argv[1:]
+try:
+    spec=importlib.util.spec_from_file_location('v5_release_policy_reader',helper)
+    p=importlib.util.module_from_spec(spec);spec.loader.exec_module(p)
+    active=pathlib.Path(active_name)
+    p.absolute(str(active),'active context')
+    def absent():
+        # Only reliable ENOENT permits a reader through. Broken symlink,
+        # permission failure, corrupt active file etc. all remain a barrier.
+        try:active.lstat()
+        except FileNotFoundError:return
+        raise p.PolicyError('active intent still present')
+    absent()
+    con=sqlite3.connect(pathlib.Path(db).resolve().as_uri()+'?mode=ro',uri=True)
+    con.row_factory=sqlite3.Row
+    row=con.execute("SELECT * FROM train WHERE id=? AND resource='deploy:selfhost'",(train,)).fetchone()
+    p.require(row is not None and row['target_sha']==sha and row['status']=='committed','train is not accepted')
+    e=json.loads(row['evidence_json']);p.require(isinstance(e,dict),'train evidence is not an object')
+    policy=e['releasePolicy'];owner=e['releasePolicyOwner'];expect=e['releasePolicyAcceptance']
+    p.require(isinstance(policy,dict) and set(policy)=={'schema','mode','sourceSha','leaseIds'}
+        and type(policy['schema']) is int and policy['schema']==1
+        and policy['mode']=='user-impact-only' and policy['sourceSha']==sha
+        and isinstance(policy['leaseIds'],list),'train policy differs')
+    p.require(isinstance(owner,dict) and isinstance(owner.get('nonce'),str),'owner receipt missing')
+    p.require(isinstance(expect,dict) and set(expect)=={'schema','operationId','candidateSha','nonce','targetStackSha256','resolution'}
+        and type(expect['schema']) is int and expect['schema']==1
+        and expect['operationId']==train and expect['candidateSha']==sha
+        and expect['nonce']==owner['nonce'] and expect['resolution']=='forward','frozen expectation differs')
+    p.digest(expect['targetStackSha256'],'expected target stack')
+    if ride:
+        r=con.execute("SELECT want_sha,result_json FROM lease WHERE id=? AND resource='deploy:selfhost' AND mode='ride'",(ride,)).fetchone()
+        p.require(r is not None and r['want_sha']==sha and ride in policy['leaseIds'],'ride not consumed by this train')
+        doc=json.loads(r['result_json']);b=doc['releasePolicyBinding'];request=doc['request']['releasePolicy']
+        p.require(isinstance(request,dict) and set(request)=={'schema','mode','sourceSha'}
+            and type(request['schema']) is int and request['schema']==1
+            and request['mode']=='user-impact-only' and request['sourceSha']==sha,'explicit request changed')
+        p.require(isinstance(b,dict) and set(b)=={'schema','trainId','sourceSha'}
+            and type(b['schema']) is int and b['schema']==1
+            and b['trainId']==train and b['sourceSha']==sha,'ride binding differs')
+    # Fixed operation-bound path only: never glob, latest archive, or SHA search.
+    archive=active.with_name(active.name+'.resolved.'+train+'.json')
+    c=p.load(archive,train)
+    p.require(c['edition']=='selfhost' and c['policy']=='user-impact-only'
+        and c['candidateSha']==sha and c['owner']=={'deploymentId':train,'nonce':expect['nonce']}
+        and c['phase']=='resolved' and c['resolution']=='forward','archive identity/direction differs')
+    p.require(c['target'].get('sourceCommit')==sha
+        and p.stack_digest(c['target'])==expect['targetStackSha256'],'target stack differs')
+    o=c['observations']
+    p.require(o.get('identity')=='exact' and o.get('service')=='usable'
+        and o.get('allRequiredPassed') is True and o.get('lineageCoherent') is True
+        and o.get('verifiedDirection')=='target'
+        and o.get('verifiedStackSha256')==expect['targetStackSha256']
+        and o.get('authority') in ('unobserved','applied','original','reverted'),'acceptance proof incomplete')
+    if scope=='current':
+        live=pathlib.Path(live_name).resolve(strict=True)
+        p.require(str(live)==c['target']['masterRelease'] and row['rel_path']==str(live),'archive is not this live target')
+        raw=(live/'.complete').read_bytes();manifest=json.loads(raw)
+        p.require(manifest.get('sourceCommit')==sha
+            and hashlib.sha256(raw).hexdigest()==c['target'].get('sourceDigest'),'live manifest differs')
+    # Finish an unlink-after-ACK-loss cleanup without another database ACK cycle.
+    # Recheck the exact file bytes loaded under the trusted private parent.
+    fd=os.open(archive,os.O_RDONLY|os.O_NOFOLLOW)
+    try:
+        info=os.fstat(fd)
+        p.require(stat.S_ISREG(info.st_mode) and info.st_uid==os.geteuid()
+            and not info.st_mode&0o077 and info.st_size<=65536,'archive metadata changed')
+        with os.fdopen(fd,'rb',closefd=False) as f:again=json.load(f)
+        p.require(again==c,'archive changed during verification')
+        os.fsync(fd)
+    finally:os.close(fd)
+    p.sync_directory(archive.parent)
+    absent()
+except Exception:
+    # No manifest, nonce, env/tuple values or other users' content in logs.
+    print('release-policy acceptance not verified',file=sys.stderr)
+    sys.exit(1)
+POLICY_ARCHIVE_ACCEPTED
+}
+
+# Add this NEW worker function. It selects a train record, never an archive.
+# Current rel_path is authoritative when present. Fall back to latest exact
+# target train only to prevent missing/broken policy metadata being legacy-green.
+lease_policy_current_live_accepted() { # live_sha live_rel
+  local sha="$1" rel="$2" row id policy_kind bound_count
+  [[ -f "$LEASE_DB" ]] || return 0
+  row="$(lease_sql_json "SELECT id,evidence_json,rel_path,
+    EXISTS(SELECT 1 FROM lease l WHERE l.resource='deploy:selfhost' AND l.mode='ride'
+      AND l.want_sha=train.target_sha AND CASE WHEN json_valid(l.result_json)
+      THEN json_extract(l.result_json,'$.releasePolicyBinding.trainId')=train.id ELSE 0 END) AS bound_policy_ride
+    FROM train
+    WHERE resource='deploy:selfhost' AND target_sha='$(lease_q "$sha")'
+    ORDER BY CASE WHEN rel_path='$(lease_q "$rel")' THEN 0 ELSE 1 END,seq DESC LIMIT 1;")" || return 1
+  [[ "$row" == '[]' || -z "$row" ]] && return 0 # Existing legacy bootstrap.
+  id="$(jq -er '.[0].id' <<<"$row")" || return 1
+  policy_kind="$(jq -er '
+    .[0] as $t | ($t.evidence_json // "{}" | fromjson) as $e |
+    if ($e|type)!="object" then "invalid"
+    elif $t.bound_policy_ride==1 or ($e|has("releasePolicy")) or ($e|has("releasePolicyAcceptance"))
+      or ($e|has("releasePolicyOwner")) then "policy" else "legacy" end' <<<"$row")" || return 1
+  bound_count="$(lease_sql "SELECT COUNT(*) FROM lease WHERE CASE WHEN json_valid(result_json) THEN json_extract(result_json,'$.releasePolicyBinding.trainId') ELSE NULL END='$(lease_q "$id")';")" || return 1
+  [[ "$bound_count" == 0 ]] || policy_kind=policy
+  case "$policy_kind" in
+    legacy) return 0 ;;
+    policy) lease_policy_archive_accepted "$id" "$sha" current "$rel" ;;
+    *) return 1 ;;
+  esac
 }

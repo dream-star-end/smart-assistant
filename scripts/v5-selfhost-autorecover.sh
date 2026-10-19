@@ -81,6 +81,7 @@ ar_incident_active() { # 输出原因列表;无事件则空
 # 这里的事件是 autorecover-resolved,所以搭车会自动重发 = 重跑被打断的列车;24h 内超过 AR_RERUN_MAX 次
 # 就不再重跑,把在途搭车失败回调给登记它的会话 / 工单,并标记需要升级。
 ar_resolve_trains() {
+  lease_release_policy_held && return 75
   local id target n rid detail
   while read -r id; do
     [[ -n "$id" ]] || continue
@@ -219,6 +220,7 @@ ar_enabled() {
 }
 
 autorecover_tick() {
+  lease_release_policy_held && { ar_log "release-policy hold: no automatic recovery"; return 0; }
   local why now rc out attempts last mode delay
   ar_enabled || return 0
   mkdir -p -- "$AR_STATE_DIR" || return 0

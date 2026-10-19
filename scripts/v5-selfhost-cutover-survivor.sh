@@ -17,6 +17,20 @@ SURVIVOR_MASTER_UNIT="${SURVIVOR_MASTER_UNIT:-openclaude-v5-selfhost.service}"
 SURVIVOR_EGRESS_UNIT="${SURVIVOR_EGRESS_UNIT:-openclaude-v5-selfhost-egress.service}"
 SURVIVOR_EGRESS_SLOT_TPL="${SURVIVOR_EGRESS_SLOT_TPL:-openclaude-v5-selfhost-egress@.service}"
 
+# Reliable absence only; installed recovery scripts do not import a helper.
+release_policy_context_absent() {
+  python3 - "${OC_V5_RELEASE_POLICY_CONTEXT:-/var/lib/openclaude-v5-selfhost/release-policy/unresolved.json}" <<'POLICY_PRESENCE'
+import os,sys,pathlib
+q=pathlib.PurePath(sys.argv[1])
+if not q.is_absolute() or ".." in q.parts:sys.exit(2)
+try:os.lstat(q)
+except FileNotFoundError:sys.exit(0)
+except OSError:sys.exit(2)
+sys.exit(1)
+POLICY_PRESENCE
+}
+
+
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) survivor: $*"; }
 
 # 原子落盘:写临时文件 → fsync → rename → fsync 目录。executor 被杀后仍可读。
@@ -227,6 +241,7 @@ do_restore() {
 }
 
 maybe_restore() {
+  release_policy_context_absent || { log "release-policy hold: no automatic restore or success"; return 75; }
   local phase
   if [[ -f "$SURVIVOR_COMMITTED" ]]; then
     log "已 committed,不恢复"
@@ -261,8 +276,10 @@ maybe_restore() {
 }
 
 watch_loop() {
+  release_policy_context_absent || { log "release-policy hold: no automatic restore or success"; return 75; }
   local i pid
   for ((i = 0; i < SURVIVOR_MAX_LOOPS; i++)); do
+    release_policy_context_absent || { log "release-policy hold: poll exits unresolved"; return 75; }
     if [[ -f "$SURVIVOR_COMMITTED" ]]; then
       log "committed,解除监视"
       exit 0
@@ -288,6 +305,7 @@ arm_via_systemd() { # <executor-pid> <backup-dir>
     --collect \
     --property=Description='v5-selfhost cutover window watch survivor' \
     --property=Restart=no \
+    --setenv=OC_V5_RELEASE_POLICY_CONTEXT="${OC_V5_RELEASE_POLICY_CONTEXT:-/var/lib/openclaude-v5-selfhost/release-policy/unresolved.json}" \
     --setenv=SURVIVOR_STATE="$SURVIVOR_STATE" \
     --setenv=SURVIVOR_COMMITTED="$SURVIVOR_COMMITTED" \
     --setenv=SURVIVOR_RESTORE="$SURVIVOR_RESTORE" \
@@ -296,6 +314,7 @@ arm_via_systemd() { # <executor-pid> <backup-dir>
     --on-active="${timeout_s}s" \
     --collect \
     --property=Description='v5-selfhost cutover window timeout survivor' \
+    --setenv=OC_V5_RELEASE_POLICY_CONTEXT="${OC_V5_RELEASE_POLICY_CONTEXT:-/var/lib/openclaude-v5-selfhost/release-policy/unresolved.json}" \
     --setenv=SURVIVOR_STATE="$SURVIVOR_STATE" \
     --setenv=SURVIVOR_COMMITTED="$SURVIVOR_COMMITTED" \
     --setenv=SURVIVOR_RESTORE="$SURVIVOR_RESTORE" \
