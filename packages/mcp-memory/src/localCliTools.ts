@@ -8,6 +8,9 @@
  * pattern is never interpolated into a shell.
  *
  * A stdio MCP server handles one request at a time, so the timeout is capped.
+ * index.ts lists and dispatches these tools only when isLocalCliToolEnabled
+ * is true (OPENCLAUDE_ENGINE=antigravity). Other engines keep their native
+ * shell so this path cannot bypass PreToolUse.
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 import { constants as fsConstants } from 'node:fs'
@@ -16,12 +19,29 @@ import { delimiter } from 'node:path'
 
 export const OC_BASH_DEFAULT_TIMEOUT_MS = 60_000
 export const OC_BASH_MIN_TIMEOUT_MS = 1_000
-export const OC_BASH_MAX_TIMEOUT_MS = 180_000
+/** Antigravity CLI 1.4.0 cancels an MCP tools/call at 180s. Stay under that so our timeout fires first and returns partial output. */
+export const OC_BASH_MAX_TIMEOUT_MS = 170_000
 export const OC_BASH_MAX_OUTPUT_BYTES = 200 * 1024
 export const OC_GREP_DEFAULT_MAX_MATCHES = 80
 export const OC_GREP_MAX_MATCHES = 200
 export const OC_GLOB_DEFAULT_MAX_RESULTS = 200
 export const OC_GLOB_MAX_RESULTS = 500
+
+/** Names gated by isLocalCliToolEnabled. Keep in lockstep with toolDefs. */
+export const LOCAL_CLI_TOOL_NAMES = ['oc_bash', 'oc_grep', 'oc_glob'] as const
+
+export type LocalCliToolName = (typeof LOCAL_CLI_TOOL_NAMES)[number]
+
+const LOCAL_CLI_TOOL_NAME_SET: ReadonlySet<string> = new Set(LOCAL_CLI_TOOL_NAMES)
+
+export function isLocalCliToolName(name: string): name is LocalCliToolName {
+  return LOCAL_CLI_TOOL_NAME_SET.has(name)
+}
+
+/** True only for the already-normalized engine id `antigravity`. */
+export function isLocalCliToolEnabled(engineId: string): boolean {
+  return engineId === 'antigravity'
+}
 
 const RG_CANDIDATES = ['/usr/bin/rg', '/usr/local/bin/rg', '/run/oc/platform/current/bin/rg']
 const KILL_GRACE_MS = 400
@@ -128,7 +148,7 @@ export function ocGlobArgv(rg: string, input: { pattern: string; path?: string }
     '--color',
     'never',
   ]
-  if (input.path) args.push(input.path)
+  if (input.path) args.push('--', input.path)
   return args
 }
 
@@ -153,6 +173,45 @@ function killGroup(child: ChildProcess, signal: NodeJS.Signals): void {
   }
 }
 
+/** Group leaders of detached oc_* children. The MCP timer dies with this process. */
+const activeProcessGroups = new Set<number>()
+let processGroupCleanupInstalled = false
+
+function killTrackedProcessGroups(signal: NodeJS.Signals): void {
+  for (const pid of activeProcessGroups) {
+    try {
+      process.kill(-pid, signal)
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+function installProcessGroupCleanup(): void {
+  if (processGroupCleanupInstalled) return
+  processGroupCleanupInstalled = true
+  process.on('exit', () => {
+    killTrackedProcessGroups('SIGKILL')
+  })
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    const onSignal = () => {
+      killTrackedProcessGroups('SIGKILL')
+      process.removeListener(sig, onSignal)
+      process.kill(process.pid, sig)
+    }
+    process.on(sig, onSignal)
+  }
+}
+
+function trackProcessGroup(pid: number): void {
+  activeProcessGroups.add(pid)
+  installProcessGroupCleanup()
+}
+
+function untrackProcessGroup(pid: number | undefined): void {
+  if (pid && pid > 0) activeProcessGroups.delete(pid)
+}
+
 /** `detached` puts the child in its own process group so a timeout can signal `bash -lc` and its sleep/rg child. */
 export function runCaptured(spec: RunCapturedSpec): Promise<RunCapturedResult> {
   return new Promise((resolve) => {
@@ -170,6 +229,7 @@ export function runCaptured(spec: RunCapturedSpec): Promise<RunCapturedResult> {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: process.env,
       })
+      if (child.pid && child.pid > 0) trackProcessGroup(child.pid)
     } catch (err) {
       finish({
         stdout: '',
@@ -218,14 +278,20 @@ export function runCaptured(spec: RunCapturedSpec): Promise<RunCapturedResult> {
       ...extra,
     })
 
+    const forget = () => untrackProcessGroup(child.pid)
     child.on('error', (err) => {
       clearTimeout(timer)
       if (killTimer) clearTimeout(killTimer)
+      forget()
       finish(snapshot({ spawnError: err.message }))
     })
     child.on('close', (code, signal) => {
+      // The shell can close while a TERM-ignoring descendant has redirected its pipes.
+      // Finish timeout escalation before dropping this process group.
+      if (timedOut) killGroup(child, 'SIGKILL')
       clearTimeout(timer)
       if (killTimer) clearTimeout(killTimer)
+      forget()
       finish(snapshot({ exitCode: code, signal }))
     })
   })
