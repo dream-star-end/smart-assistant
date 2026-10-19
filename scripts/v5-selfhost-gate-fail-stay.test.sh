@@ -23,6 +23,11 @@ chmod 0755 "$BASE/bin/systemctl"
 install -m 0755 "$SURVIVOR_SRC" "$BASE/survivor.sh"
 
 {
+  # Load the production libraries before the existing observation-only stubs.
+  # This includes actual owner guards, terminal functions and JSON merge SQL.
+  printf 'SCRIPT_DIR=%q\n' "$DIR"
+  printf 'source %q\n' "$DIR/v5-lease-lib.sh"
+  printf 'source %q\n' "$DIR/lib/v5-selfhost-release-policy.sh"
   echo 'log() { echo "$*"; }'
   echo 'die() { echo "DIE $*"; exit 1; }'
   echo 'lease_now() { echo 2026-10-14T00:00:00Z; }'
@@ -33,7 +38,7 @@ install -m 0755 "$SURVIVOR_SRC" "$BASE/survivor.sh"
   echo 'cutover_compensate() { echo "COMPENSATE $1" >>"$C/compensate.log"; return 1; }'
   for f in cutover_clog cutover_fail cutover_survivor_script cutover_persist_phase selfhost_policy_get \
     gate_fail_policy stay_window_sec gate_fail_drill_armed cutover_gate_against_release \
-    write_stay_maintenance clear_stay_maintenance deploy_alert cutover_keep_failed lease_train_finish \
+    write_stay_maintenance clear_stay_maintenance deploy_alert cutover_keep_failed \
     proc_starttime_of activate_tuple_joint; do
     body="$(fn "$f")"
     [[ -n "$body" ]] || { echo "missing function $f" >&2; exit 1; }
@@ -45,6 +50,8 @@ setup() {
   C="$BASE/$1"
   mkdir -p "$C/watch" "$C/run" "$C/releases/rel-new"
   export C PATH="$BASE/bin:$PATH"
+  export OC_V5_RELEASE_POLICY_CONTEXT="$C/run/release-policy/unresolved.json"
+  export OC_V5_LEASE_DB="$C/run/lease.db"
   export CUTOVER_LOG="$C/cutover.log" LEASE_SQL_LOG="$C/lease.sql"
   export SURVIVOR_STATE="$C/run/survivor.state" SURVIVOR_COMMITTED="$C/run/survivor.committed"
   export CUTOVER_SURVIVOR_SCRIPT="$BASE/survivor.sh"

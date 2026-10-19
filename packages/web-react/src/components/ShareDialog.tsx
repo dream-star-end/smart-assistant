@@ -105,7 +105,7 @@ export function ShareDialog({
   );
   const filename = shareImageFilename(title);
   const handleExportMarkdown = onExportMarkdown ?? (async () => {
-    const md = await exportSessionMarkdown(messages);
+    const md = await exportSessionMarkdown(messages, sending);
     saveBlob(new Blob([md], { type: "text/markdown;charset=utf-8" }), sessionExportFilename(title));
   });
 

@@ -117,6 +117,8 @@ RUNTIME_LIB="$SCRIPT_DIR/v5-runtime-release-lib.sh"
 # shellcheck source=scripts/v5-runtime-release-lib.sh
 # shellcheck disable=SC1091
 source "$RUNTIME_LIB"
+# Explicit per-train policy; legacy invocations keep the original default.
+source "$SCRIPT_DIR/lib/v5-selfhost-release-policy.sh"
 MASTER_RELEASE_LIB="$SCRIPT_DIR/v5-selfhost-master-release-lib.sh"
 
 DRY=0
@@ -135,6 +137,7 @@ CUTOVER_TUPLE_BUNDLE=""
 # 人工直跑 --deploy 时脚本自己登记一条 manual train,让 worker 能对账、不会在同一窗口再发一班。
 LEASE_TRAIN_ID=""
 LEASE_TARGET_SHA=""
+RELEASE_POLICY_RESUME=0
 LEASE_LIB="$SCRIPT_DIR/v5-lease-lib.sh"
 # Incident trailer 发布前快检(2026-09-09):selfhost 此前从不跑 trailer 门,坏 trailer 一律
 # 上线后才被 CI 发现,已上线源提交不可 amend,只能一次次冻结 tip(已冻 18 条)。这里在构建
@@ -202,6 +205,13 @@ own_instance_present() {
 
 cleanup_selfhost_deploy() {
   local exit_rc=$?
+  # Owner loss forbids successor state/holder writes from this invocation.
+  [[ "$exit_rc" == 86 ]] && return 86
+  if release_policy_enabled && ! release_policy_require_owner; then
+    trap - EXIT
+    exit 86
+  fi
+  if [[ "$exit_rc" != 0 ]]; then release_policy_abort_unexposed || true; fi
   # 后台 runtime release 段必须先收尾,再释放锁/train(否则下一次 deploy 可能与它并发写 runtime-releases)。
   if declare -F reap_runtime_release_bg >/dev/null 2>&1; then reap_runtime_release_bg || true; fi
   # 函数定义在后面;参数校验阶段的 die 也会进这里,此时函数尚不存在。
@@ -386,6 +396,7 @@ t=open("/proc/%d/stat"%int(sys.argv[1])).read(); print(t[t.rfind(")")+2:].split(
 acquire_selfhost_deploy_lock() {
   local lock wait_s interval waited info holder_line starttime
   if [[ "${OC_V5_SELFHOST_DEPLOY_LOCK_HELD:-}" == 1 ]]; then
+    release_policy_mutation_barrier || exit "$?"
     log "  ↻ 本进程链已持 selfhost 发布锁,跳过加锁(可重入)"
     return 0
   fi
@@ -420,6 +431,7 @@ acquire_selfhost_deploy_lock() {
       waited=$((waited + interval))
     done
   fi
+  release_policy_mutation_barrier || exit "$?"
   SELFHOST_DEPLOY_LOCK_HOLDER="${lock}.holder"
   starttime="$(proc_starttime_of "$$")" \
     || die "无法读取 /proc/$$/stat starttime(看护靠它防 PID reuse)"
@@ -462,6 +474,8 @@ usage() {
   --release=PATH        仅配合 --cutover:指定候选 rel-* 绝对路径(默认=sourceCommit 等于 HEAD 的最新完整 release)
   --allow-dirty         仅配合 --deploy:工作区有未提交改动时仍部署(默认拒绝,防脏 platform 进全员容器)
   --platform-from-head  仅配合 --deploy/--bootstrap:平台 bundle 从 git archive 取已提交的 platform-runtime(默认仍拷工作树)
+  --resume-release-policy --lease-train=ID --target-sha=SHA
+                        仅核对/补齐同 operation 历史与验收;不切流、不重启,未知现场保持阻塞
   --lease-train=ID --target-sha=SHA
                         仅配合 --deploy:由 v5-lease-worker 发车时传入;HEAD 必须精确等于 SHA,否则拒绝。
                         人工直跑 --deploy 会自动登记 manual train(有 open train 时拒绝并行发布)。见 scripts/oc-lease.sh
@@ -504,6 +518,7 @@ for arg in "$@"; do
     --platform-from-head) PLATFORM_FROM_HEAD=1 ;;
     --force-npm-ci) FORCE_NPM_CI=1 ;;
     --release=*) CUTOVER_RELEASE="${arg#--release=}" ;;
+    --resume-release-policy) RELEASE_POLICY_RESUME=1 ;;
     --lease-train=*) LEASE_TRAIN_ID="${arg#--lease-train=}" ;;
     --target-sha=*) LEASE_TARGET_SHA="${arg#--target-sha=}" ;;
     --preflight|--bootstrap|--deploy|--smoke|--status|--build-master-only|--cutover|--p0-web|--p0-web-revert|--p0-web-status)
@@ -523,6 +538,10 @@ for arg in "$@"; do
 done
 
 [[ -n "$MODE" ]] || { usage >&2; exit 2; }
+if [[ "$RELEASE_POLICY_RESUME" == 1 ]]; then
+  [[ "$MODE" == deploy && -n "$LEASE_TRAIN_ID" && -n "$LEASE_TARGET_SHA" && "$DRY" != 1 ]] \
+    || die "--resume-release-policy requires --deploy --lease-train=<original> --target-sha=<original>; no dry-run"
+fi
 [[ "$FORCE_ENV" == 1 && "$MODE" != "bootstrap" ]] && die "--force-env 只能与 --bootstrap 同用"
 [[ "$ALLOW_DIRTY" == 1 && "$MODE" != "deploy" ]] && die "--allow-dirty 只能与 --deploy 同用"
 [[ "$PLATFORM_FROM_HEAD" == 1 && "$MODE" != "deploy" && "$MODE" != "bootstrap" ]] \
@@ -554,6 +573,14 @@ fi
 [[ "$REPO_ROOT" == /opt/openclaude/openclaude-v5-selfhost ]] \
   || die "必须在 /opt/openclaude/openclaude-v5-selfhost 内执行(当前 REPO_ROOT=$REPO_ROOT)。补救: cd 到该 worktree 再跑。"
 
+if [[ "$DRY" != 1 ]]; then
+  case "$MODE" in
+    deploy|bootstrap|build-master-only|cutover|p0-web|p0-web-revert)
+      if [[ "$RELEASE_POLICY_RESUME" != 1 ]]; then
+        release_policy_context_present && { log "unresolved release-policy context blocks mutation"; exit 79; }
+      fi ;;
+  esac
+fi
 maybe_acquire_selfhost_deploy_lock
 
 # ── 只读检查 ─────────────────────────────────────────────────────────────
@@ -1239,23 +1266,23 @@ sync_boot_scripts_from() {
     echo "  [dry-run] install $hostnet_src + $sshgate_src + flavor helper → $BOOT_SCRIPT_DIR"
     return 0
   fi
-  mkdir -p -- "$BOOT_SCRIPT_DIR/scripts/lib"
-  tmp="$(mktemp -d -- "$BOOT_SCRIPT_DIR/.staging.XXXXXX")"
-  mkdir -p -- "$tmp/scripts/lib"
-  install -m 0755 "$hostnet_src" "$tmp/setup-host-net.sh"
-  install -m 0755 "$sshgate_src" "$tmp/sshgate-insert.sh"
-  mv -f -- "$tmp/setup-host-net.sh" "$BOOT_SCRIPT_DIR/setup-host-net.sh"
-  mv -f -- "$tmp/sshgate-insert.sh" "$BOOT_SCRIPT_DIR/sshgate-insert.sh"
+  mkdir -p -- "$BOOT_SCRIPT_DIR/scripts/lib" || return 1
+  tmp="$(mktemp -d -- "$BOOT_SCRIPT_DIR/.staging.XXXXXX")" || return 1
+  mkdir -p -- "$tmp/scripts/lib" || return 1
+  install -m 0755 "$hostnet_src" "$tmp/setup-host-net.sh" || return 1
+  install -m 0755 "$sshgate_src" "$tmp/sshgate-insert.sh" || return 1
+  mv -f -- "$tmp/setup-host-net.sh" "$BOOT_SCRIPT_DIR/setup-host-net.sh" || return 1
+  mv -f -- "$tmp/sshgate-insert.sh" "$BOOT_SCRIPT_DIR/sshgate-insert.sh" || return 1
   if [[ "$have_flavor" == 1 ]]; then
-    install -m 0755 "$flavor_lib_src" "$tmp/scripts/lib/assert-flavor.sh"
-    install -m 0644 "$flavor_rules_src" "$tmp/scripts/lib/flavor-rules.json"
-    mv -f -- "$tmp/scripts/lib/assert-flavor.sh" "$BOOT_SCRIPT_DIR/scripts/lib/assert-flavor.sh"
-    mv -f -- "$tmp/scripts/lib/flavor-rules.json" "$BOOT_SCRIPT_DIR/scripts/lib/flavor-rules.json"
+    install -m 0755 "$flavor_lib_src" "$tmp/scripts/lib/assert-flavor.sh" || return 1
+    install -m 0644 "$flavor_rules_src" "$tmp/scripts/lib/flavor-rules.json" || return 1
+    mv -f -- "$tmp/scripts/lib/assert-flavor.sh" "$BOOT_SCRIPT_DIR/scripts/lib/assert-flavor.sh" || return 1
+    mv -f -- "$tmp/scripts/lib/flavor-rules.json" "$BOOT_SCRIPT_DIR/scripts/lib/flavor-rules.json" || return 1
     log "  ✓ 已同步开机脚本 → $BOOT_SCRIPT_DIR (from $src; flavor helper included)"
   else
     log "  ⚠ src $src 无 flavor helper, boot 仅同步 hostnet/sshgate (setup-host-net will skip flavor check)"
   fi
-  rm -rf -- "$tmp"
+  rm -rf -- "$tmp" || return 1
 }
 
 # OCV5-404:08-18 装上的 watch.sh 一直没被替换,9 月的双槽改动从没到过宿主,停用后也没人发现。
@@ -1530,67 +1557,6 @@ SQL
     log "  ⚠ 人工发布已登记为 manual train $LEASE_TRAIN_ID(worker 据此对账;搭车会话将在 committed 后自动结算)"
   fi
   LEASE_TRAIN_ACTIVE=1
-}
-
-# 终态:成功由 cmd_deploy 末尾调 committed;失败由 EXIT trap 调(未 committed 即 failed/recovery_required)。
-lease_train_finish() { # <committed|failed> <reason>
-  [[ "${LEASE_TRAIN_ACTIVE:-0}" == 1 && -n "$LEASE_TRAIN_ID" ]] || return 0
-  LEASE_TRAIN_ACTIVE=0
-  local st="$1" reason="$2" rel="" ev
-  if [[ "$st" == failed ]]; then
-    # 本班已动 unit 但未 committed(被 SIGTERM/die 打断在中途)→ 交给 survivor,并要人工确认;不自动重发。
-    # 只看本班:没动过 unit 时 state 里是上一班留下的 phase,不能据此判(OCV5-420)。
-    local phase=""
-    if [[ "${CUTOVER_MUTATED:-0}" == 1 ]]; then
-      phase="$(survivor_state_phase)"
-      # kept-failed(OCV5-418)是有意留在新版的确定性失败,不是需人工恢复的半截 mutation。
-      case "${phase:-}" in armed|pre-install|pre-mutation|smoked|committed|kept-failed) ;; *) st=recovery_required ;; esac
-    fi
-    # 补偿本身失败:survivor --disarm 会把 phase 写成 committed,所以单独带标记(OCV5-420)。
-    [[ "${CUTOVER_RECOVERY_REQUIRED:-0}" == 1 ]] && st=recovery_required
-    rel="${CUTOVER_KEPT_FAILED_REL:-}"
-  else
-    rel="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
-  fi
-  ev="$(jq -cn --arg rel "$rel" --arg log "${CUTOVER_LOG:-}" --arg phase "${CUTOVER_PHASE:-}" '{live:$rel,cutover_log:$log,phase:$phase}')"
-  lease_tx <<SQL || { echo "⚠ train $LEASE_TRAIN_ID 终态 $st 写失败;worker 将按 executor 退出对账" >&2; return 0; }
-BEGIN IMMEDIATE;
-UPDATE train SET status='$st', reason='$(lease_q "$reason")', rel_path=$( [[ -n "$rel" ]] && printf "'%s'" "$(lease_q "$rel")" || printf NULL ),
-       evidence_json='$(lease_q "$ev")', finished_at='$(lease_now)', updated_at='$(lease_now)'
- WHERE id='$LEASE_TRAIN_ID' AND status NOT IN ('committed','failed');
-$(lease_event_sql "$LEASE_TRAIN_ID" "train-$st" "deploy:$$" "$reason")
-$( [[ "$st" == recovery_required ]] && lease_train_alert_sql "$LEASE_TRAIN_ID" "$reason (phase=${phase:-?} cutover_log=${CUTOVER_LOG:-?})" )
-COMMIT;
-SQL
-  echo "  🎫 lease train $LEASE_TRAIN_ID → $st"
-  if [[ "$st" == recovery_required ]]; then
-    deploy_alert deploy_recovery_required "$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)" \
-      "个人版列车 $LEASE_TRAIN_ID 未完成也未干净回滚(phase=${phase:-?}),已标 recovery_required,发车暂停。现场:${CUTOVER_LOG:-?}。autorecover 接管:现场稳定绿后自动结束本班并重跑,否则退避兜底,仍失败自动开工单派给 AI。"
-  fi
-}
-
-# survivor state 是 KEY=VALUE(phase=…);兼容旧 JSON。读不到返回空。
-survivor_state_phase() {
-  local f="${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" p=""
-  [[ -f "$f" && ! -L "$f" ]] || return 0
-  p="$(sed -n 's/^phase=//p' "$f" 2>/dev/null | head -n1)"
-  [[ -n "$p" ]] || p="$(jq -er '.phase // empty' "$f" 2>/dev/null || true)"
-  printf '%s' "$p"
-}
-
-# 与 worker enqueue_train_alert 同一落点:最近一条在途 ride 的工单,没有则 log。只输出 SQL,随终态同事务。
-lease_train_alert_sql() { # <train_id> <reason>
-  local tk
-  tk="$(lease_sql "SELECT ticket_ref FROM lease WHERE resource='deploy:selfhost' AND status='registered' AND ticket_ref IS NOT NULL ORDER BY seq DESC LIMIT 1;" 2>/dev/null || true)"
-  lease_outbox_sql "train:$1:recovery_required" "$1" train_alert "$( [[ -n "$tk" ]] && echo ticket || echo log )" "${tk:--}" \
-    "$(lease_body_train_alert "$1" recovery_required "$2")"
-}
-
-lease_train_on_exit() {
-  local rc="${1:-$?}"
-  if [[ "${LEASE_TRAIN_ACTIVE:-0}" == 1 ]]; then
-    lease_train_finish failed "deploy 进程退出 rc=$rc 未到 committed"
-  fi
 }
 
 runtime_caps_from_metadata() {
@@ -1980,7 +1946,7 @@ activate_tuple() {
 # joint: 四元组 + masterRelease=候选 rel 绝对路径 + transitionKind=joint。
 # 失败只 return,由 cutover 统一补偿(symlink/unit 两级)。不 die。
 activate_tuple_joint() { # <master-rel> <prev-master-or-none>
-  local master_rel="$1" prev_master="$2" image_id bundle_val restart_cmd smoke_cmd prev_arg
+  local master_rel="$1" prev_master="$2" image_id bundle_val restart_cmd smoke_cmd prev_arg policy_adapter="" extra_apply="" extra_revert="" saga_rc=0
   image_id="${RUNTIME_IMAGE_ID:-}"
   bundle_val="${CUTOVER_TUPLE_BUNDLE:-$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV}"
   [[ -n "$image_id" ]] || { cutover_clog "joint: 缺 RUNTIME_IMAGE_ID"; return 1; }
@@ -1998,13 +1964,22 @@ activate_tuple_joint() { # <master-rel> <prev-master-or-none>
   fi
   cutover_clog "  oc_hotcfg_activate_saga transitionKind=joint masterRelease=$master_rel prev=${prev_arg:-<empty>}"
   mkdir -p "$(dirname "$OC_HOTCFG_HISTORY")"
+  if release_policy_enabled; then
+    policy_adapter=release_policy_saga_adapter
+    extra_apply="release_policy_flip_live $(printf '%q' "$master_rel")"
+    extra_revert="release_policy_restore_live_before $(printf '%q' "$prev_arg")"
+  fi
   oc_hotcfg_activate_saga \
     "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$BUILT_BUNDLE_REV" "$OC_HOTCFG_HISTORY" \
     "$RUNTIME_IMAGE" "$image_id" "$BUILT_RUNTIME_RELEASE" "$bundle_val" \
     "$restart_cmd" "$smoke_cmd" \
-    "" "" "$master_rel" "$prev_arg" \
-    "" "" "" "joint" \
-    || { cutover_clog "joint activate_saga 失败(lib 已尝试回滚 env/current)"; return 1; }
+    "$extra_apply" "$extra_revert" "$master_rel" "$prev_arg" \
+    "" "" "" "joint" "$policy_adapter" \
+    || saga_rc=$?
+  if [[ "$saga_rc" != 0 ]]; then
+    cutover_clog "joint activate_saga failed rc=$saga_rc policy=${RELEASE_POLICY_MODE:-legacy}"
+    return "$saga_rc"
+  fi
   cutover_clog "  ✓ joint tuple 已写入 $V5_ENV masterRelease=$master_rel"
 }
 
@@ -2279,6 +2254,13 @@ $out
 
 cmd_deploy() {
   local sha dirty
+  if [[ "$RELEASE_POLICY_RESUME" == 1 ]]; then
+    local recovery_rc=0
+    release_policy_recover_forward || recovery_rc=$?
+    [[ "$recovery_rc" == 0 ]] || exit "$recovery_rc"
+    log "✓ same-operation policy recovery verified; no serving pointer changed"
+    return 0
+  fi
   log "══ v5 selfhost --deploy(不可变 master + 容器制品 + joint 翻转) ══"
   log "流程: 构建 master release(staging vite) → runtime-release → platform bundle"
   log "      → 复用 --cutover 同一套状态机翻转(survivor / 两级回滚 / 候选 snapshot unit)"
@@ -2302,6 +2284,10 @@ $dirty
     fi
     log "$dirty"
   fi
+  sha="$(source_commit)"
+  local policy_bind_rc=0
+  release_policy_bind_official_train_request "$sha" || policy_bind_rc=$?
+  [[ "$policy_bind_rc" == 0 ]] || exit "$policy_bind_rc"
   [[ -f "$V5_ENV" ]] || die "缺 $V5_ENV,这不是更新路径。补救: 首次安装走 --bootstrap;本机已有实例则检查 env 是否被挪走。"
   ensure_selfhost_env_keys
   docker network inspect openclaude-v5-net >/dev/null 2>&1 \
@@ -2315,7 +2301,7 @@ $dirty
   refresh_ccb_proxy_path
   ensure_model_authority
   sha="$(source_commit)"
-  lease_train_begin "$sha"
+  [[ "${RELEASE_POLICY_CLAIMED:-0}" == 1 ]] || lease_train_begin "$sha"
   assert_fix_trailers "$sha"
   assert_p0_web_overlay_contained "$sha"
   log "── source=$sha 构建三面制品(失败则 live 不动) ──"
@@ -2432,9 +2418,13 @@ cutover_survivor_script() {
 # phase 必须在覆盖第一个 unit 之前落盘;写失败不得 || true 吞掉。
 cutover_persist_phase() {
   local phase="$1" state script
+  release_policy_guard_owner || return 86
   CUTOVER_PHASE="$phase"
   state="${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}"
-  [[ -f "$state" && ! -L "$state" ]] || return 0
+  if [[ ! -f "$state" || -L "$state" ]]; then
+    if release_policy_enabled && [[ "$phase" != pre-install ]]; then return 79; fi
+    return 0
+  fi
   script="$(cutover_survivor_script)"
   [[ -x "$script" ]] || { cutover_clog "缺 survivor 脚本 $script,无法持久化 phase=$phase"; return 1; }
   SURVIVOR_STATE="$state" bash "$script" --set-phase "$phase"
@@ -2444,12 +2434,13 @@ cutover_persist_phase_or_compensate() { # <phase> <reason>
   local phase="$1" reason="$2"
   if ! cutover_persist_phase "$phase"; then
     cutover_compensate "persist-phase-${reason}"
-    return 1
+    return $?
   fi
 }
 
 cutover_arm_survivor() { # <backup-dir>
   local backup="$1" script src
+  release_policy_guard_owner || return 86
   src="$SCRIPT_DIR/v5-selfhost-cutover-survivor.sh"
   [[ -f "$src" ]] || { cutover_clog "缺仓库 survivor 脚本 $src"; return 1; }
   mkdir -p -- "$BREAKGLASS_ROOT"
@@ -2467,6 +2458,7 @@ cutover_arm_survivor() { # <backup-dir>
 cutover_disarm_survivor() {
   local script
   script="$(cutover_survivor_script)"
+  release_policy_guard_owner || return 86
   if [[ "${CUTOVER_SURVIVOR_ARMED:-0}" == 1 && -x "$script" ]]; then
     bash "$script" --disarm || return 1
   fi
@@ -2538,7 +2530,15 @@ cutover_rollback_inplace() { # <failed-rel> <backup-dir>
 }
 
 cutover_compensate() { # <reason>
-  local reason="$1"
+  local reason="$1" policy_rc=0
+  if release_policy_enabled; then
+    release_policy_failure "$reason" || policy_rc=$?
+    case "$policy_rc" in
+      0) : ;;
+      78|79|86) release_policy_keep_failed "${CUTOVER_REL:-}" "$reason" "$policy_rc"; return $? ;;
+      *) return 79 ;;
+    esac
+  fi
   cutover_clog "补偿: reason=$reason mutated=${CUTOVER_MUTATED:-0} phase=${CUTOVER_PHASE:-?}"
   if [[ "${CUTOVER_MUTATED:-0}" != 1 ]]; then
     cutover_clog "尚未覆盖 installed unit,无需回滚"
@@ -2553,6 +2553,11 @@ cutover_compensate() { # <reason>
     CUTOVER_RECOVERY_REQUIRED=1
     cutover_persist_phase compensate-failed \
       || cutover_clog "  ⚠ 无法落盘 phase=compensate-failed(列车仍记 recovery_required)"
+  fi
+  if release_policy_enabled; then
+    [[ "$rb_rc" == 0 ]] || return 79
+    release_policy_finish_compensation
+    return $?
   fi
   return 1
 }
@@ -2624,7 +2629,14 @@ cutover_gate_against_release() { # <rel>
     cutover_fail "门禁失败演练:策略文件指定本 sourceCommit,真实门禁已通过,按演练判失败" || true
     rc=99
   fi
-  [[ "$rc" == 0 ]] && return 0
+  if [[ "$rc" == 0 ]]; then
+    release_policy_enabled && RELEASE_POLICY_GATES_PASSED=1
+    return 0
+  fi
+  if release_policy_enabled; then
+    CUTOVER_GATE_FAILED=smoke
+    return "$rc"
+  fi
   if [[ "$(gate_fail_policy)" == stay ]]; then
     if [[ "$rc" == 99 ]]; then CUTOVER_GATE_FAILED="drill"; else CUTOVER_GATE_FAILED="smoke"; fi
     cutover_clog "  ⚠ 门禁失败 policy=stay:不回滚运行面,保留 $rel 现场(${CUTOVER_GATE_FAILED}: ${CUTOVER_LAST_FAIL:-?})"
@@ -2680,7 +2692,7 @@ cutover_keep_failed() { # <rel>
     CUTOVER_KEPT_FAILED_REL=""
     cutover_clog "  ✗ 无法落盘 phase=kept-failed,退回原补偿路径"
     cutover_compensate "persist-phase-kept-failed"
-    return 1
+    return $?
   fi
   if [[ "${CUTOVER_SURVIVOR_ARMED:-0}" == 1 ]]; then
     if bash "$(cutover_survivor_script)" --disarm-kept; then
@@ -2982,6 +2994,12 @@ cmd_cutover() {
     prev_val="none"
   fi
 
+  if release_policy_enabled && [[ "$DRY" != 1 ]]; then
+    [[ "${CUTOVER_JOINT:-0}" == 1 && "$prev_val" != none ]] || return 2
+    release_policy_install_guards "$rel" "$prev_val" || return $?
+    release_policy_prepare_candidate "$rel" "$prev_val" || return $?
+  fi
+
   step=4
   cutover_clog "STEP $step 备份当前 master+egress unit"
   if [[ "$DRY" == 1 ]]; then
@@ -2993,18 +3011,20 @@ cmd_cutover() {
     fi
     cutover_clog "  [dry-run] 第一次覆盖 unit 前武装宿主 survivor(独立 systemd-run,不依赖网关)"
   else
+    release_policy_guard_owner || return 86
     backup_installed_units_for_cutover backup \
       || die "备份 installed unit 失败。尚未覆盖 unit,worktree-current 未指向坏备份。"
     CUTOVER_BACKUP="$backup"
     cutover_clog "  backup=$backup"
+    release_policy_guard_owner || return 86
     write_prev_release_file "$prev_val" \
       || die "写 .prev-release 失败。尚未覆盖 unit。"
     cutover_clog "  .prev-release=$prev_val"
   fi
   cutover_wait_for_user_idle || return 1
   # 第一次覆盖 installed unit 之前:明确 phase/mutated,并武装 survivor。
-  cutover_persist_phase "pre-install"
   if [[ "$DRY" != 1 ]]; then
+    cutover_persist_phase "pre-install"
     cutover_arm_survivor "$backup" \
       || die "武装 survivor 失败。尚未覆盖 unit。"
     # phase=mutated 必须在覆盖第一个 unit 之前 durable 落盘。
@@ -3026,29 +3046,33 @@ cmd_cutover() {
     fi
     cutover_clog "  [dry-run] systemctl daemon-reload"
   else
+    release_policy_guard_owner || return 86
     if ! install_unit "$unit_snap/$V5_EGRESS_UNIT"; then
       cutover_compensate "install-egress-unit"
-      return 1
+      return $?
     fi
     # 双槽模板(候选自带才装;旧候选无模板 rc=2 → 保留 installed 的旧模板文件不动,
     # egress_slot_flip 会按 live 是否自带模板决定走槽还是 legacy)。
+    release_policy_guard_owner || return 86
     install_egress_slot_units_from "$unit_snap"
     case $? in
       0) cutover_clog "  ✓ 双槽 egress 模板 + sysctl 已装" ;;
       2) cutover_clog "  · 候选无双槽 egress 模板,翻转后走 legacy 单 unit" ;;
-      *) cutover_compensate "install-egress-slot-units"; return 1 ;;
+      *) cutover_compensate "install-egress-slot-units"; return $? ;;
     esac
-    cutover_persist_phase_or_compensate "units-partial" "units-partial" || return 1
+    cutover_persist_phase_or_compensate "units-partial" "units-partial" || return $?
+    release_policy_guard_owner || return 86
     if ! install_unit "$unit_snap/$V5_UNIT"; then
       cutover_compensate "install-master-unit"
-      return 1
+      return $?
     fi
-    cutover_persist_phase_or_compensate "units-installed" "units-installed" || return 1
+    cutover_persist_phase_or_compensate "units-installed" "units-installed" || return $?
+    release_policy_guard_owner || return 86
     if ! systemctl daemon-reload; then
       cutover_compensate "daemon-reload"
-      return 1
+      return $?
     fi
-    cutover_persist_phase_or_compensate "reloaded" "reloaded" || return 1
+    cutover_persist_phase_or_compensate "reloaded" "reloaded" || return $?
   fi
 
   step=6
@@ -3056,11 +3080,12 @@ cmd_cutover() {
   if [[ "$DRY" == 1 ]]; then
     cutover_clog "  [dry-run] printf until=<epoch> > $CUTOVER_GRACE_FILE"
   else
+    release_policy_guard_owner || return 86
     if ! write_cutover_grace; then
       cutover_compensate "write-grace"
-      return 1
+      return $?
     fi
-    cutover_persist_phase_or_compensate "grace" "grace" || return 1
+    cutover_persist_phase_or_compensate "grace" "grace" || return $?
   fi
 
   if [[ "$CUTOVER_HAS_MIGRATION" == 1 ]]; then
@@ -3068,11 +3093,12 @@ cmd_cutover() {
     if [[ "$DRY" == 1 ]]; then
       cutover_clog "  [dry-run] 对着 $rel 跑 migration runner(失败则不翻转,不回滚 schema)"
     else
+      release_policy_guard_owner || return 86
       if ! run_migrations_from_release "$rel"; then
         cutover_compensate "migration-apply"
-        return 1
+        return $?
       fi
-      cutover_persist_phase_or_compensate "migrated" "migrated" || return 1
+      cutover_persist_phase_or_compensate "migrated" "migrated" || return $?
     fi
   fi
 
@@ -3080,12 +3106,14 @@ cmd_cutover() {
   cutover_clog "STEP $step 原子挂 live symlink $MASTER_LIVE_LINK → $rel"
   if [[ "$DRY" == 1 ]]; then
     cutover_clog "  [dry-run] ln -s $rel ${MASTER_LIVE_LINK}.newlink.\$\$ && mv -T ${MASTER_LIVE_LINK}.newlink.\$\$ $MASTER_LIVE_LINK"
+  elif release_policy_enabled && [[ "${CUTOVER_JOINT:-0}" == 1 ]]; then
+    cutover_clog "  policy joint: live flip is guarded inside the real saga after prechecks"
   else
     if ! atomic_flip_live_symlink "$rel"; then
       cutover_compensate "symlink-flip"
-      return 1
+      return $?
     fi
-    cutover_persist_phase_or_compensate "symlink-flipped" "symlink-flipped" || return 1
+    cutover_persist_phase_or_compensate "symlink-flipped" "symlink-flipped" || return $?
   fi
 
   step=8
@@ -3095,16 +3123,28 @@ cmd_cutover() {
       cutover_clog "  [dry-run] activate_saga joint image=$RUNTIME_IMAGE release=$BUILT_RUNTIME_RELEASE bundle=$CUTOVER_TUPLE_BUNDLE master=$rel prev=$prev_val"
       cutover_clog "  [dry-run] smoke 含 healthz + GET / oc-build == $expected_build + egress-health"
     else
-      if ! activate_tuple_joint "$rel" "$prev_val"; then
+      local joint_rc=0
+      activate_tuple_joint "$rel" "$prev_val" || joint_rc=$?
+      if [[ "$joint_rc" != 0 ]]; then
+        if release_policy_enabled; then
+          case "$joint_rc" in
+            86) return 86 ;;
+            78|79) release_policy_keep_failed "$rel" joint-activate "$joint_rc"; return $? ;;
+            1)
+              if [[ "${RELEASE_POLICY_OUTCOME:-}" == COMPENSATE_USER_IMPAIRMENT || "${RELEASE_POLICY_OUTCOME:-}" == PREPARATION_ABORT ]]; then
+                release_policy_finish_compensation; return $?
+              fi ;;
+          esac
+        fi
         cutover_compensate "joint-activate"
-        return 1
+        return $?
       fi
       if [[ -n "$CUTOVER_GATE_FAILED" ]]; then
         cutover_keep_failed "$rel"
         return 1
       fi
-      cutover_persist_phase_or_compensate "restarted" "restarted" || return 1
-      cutover_persist_phase_or_compensate "smoked" "smoked" || return 1
+      cutover_persist_phase_or_compensate "restarted" "restarted" || return $?
+      cutover_persist_phase_or_compensate "smoked" "smoked" || return $?
     fi
   else
     cutover_clog "STEP $step 按现有顺序重启(先 egress 槽翻转/就绪、等 ${V5_EGRESS_BIND}:${V5_EGRESS_PORT} 可连、再 master)"
@@ -3113,9 +3153,9 @@ cmd_cutover() {
     else
       if ! eval "$(egress_then_master_restart_cmd)"; then
         cutover_compensate "restart"
-        return 1
+        return $?
       fi
-      cutover_persist_phase_or_compensate "restarted" "restarted" || return 1
+      cutover_persist_phase_or_compensate "restarted" "restarted" || return $?
     fi
 
     step=9
@@ -3127,13 +3167,13 @@ cmd_cutover() {
     else
       if ! cutover_gate_against_release "$rel"; then
         cutover_compensate "smoke"
-        return 1
+        return $?
       fi
       if [[ -n "$CUTOVER_GATE_FAILED" ]]; then
         cutover_keep_failed "$rel"
         return 1
       fi
-      cutover_persist_phase_or_compensate "smoked" "smoked" || return 1
+      cutover_persist_phase_or_compensate "smoked" "smoked" || return $?
     fi
   fi
 
@@ -3154,6 +3194,15 @@ cmd_cutover() {
     cutover_clog "  log=$CUTOVER_LOG"
     return 0
   fi
+  if release_policy_enabled; then
+    local finalize_rc=0
+    release_policy_finalize_forward "$rel" || finalize_rc=$?
+    if [[ "$finalize_rc" != 0 ]]; then
+      [[ "$finalize_rc" == 86 ]] && return 86
+      release_policy_keep_failed "$rel" finalization "$finalize_rc"
+      return $?
+    fi
+  else
   cutover_persist_phase "committed" \
     || die "无法持久化 phase=committed。smoke 已通过,拒绝报告成功(survivor 仍可能误恢复)。"
   cutover_disarm_survivor \
@@ -3163,6 +3212,7 @@ cmd_cutover() {
   sync_boot_scripts_from "$rel"
   sync_watch_from "$rel" \
     || cutover_clog "  ⚠ 看护同步失败(仅告警,不回滚;--smoke 会因看护漂移失败)"
+  fi
   # 收尾 GC(镜像 deploy-v5.sh gc_releases/oc_hotcfg_gc 同款:仅告警,不回滚)。
   # master release:引用感知 v5-release-gc.sh,keep 3(OCV5-376:当前 + 上一个 + 一个回滚点;根盘曾 96%,
   # <8GiB 时发布拒绝构建);live/.prev-release/unit cwd/

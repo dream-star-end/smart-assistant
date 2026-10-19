@@ -68,7 +68,7 @@ describe("AgentPicker 团队模式开关文案（知情同意）", () => {
 describe("AgentPicker 三态协作", () => {
   it("onCollabModeChange 时渲染单人/顾问/团队三选一", async () => {
     const onCollabModeChange = vi.fn();
-    renderPicker({ onCollabModeChange, collabMode: "solo" });
+    renderPicker({ onCollabModeChange, collabMode: "solo", advisorModels: [{ id: "gpt-6-astra", label: "GPT-6-Astra", engine: "codex" }] });
     const advisor = await screen.findByRole("button", { name: /主模型不变/ });
     fireEvent.click(advisor);
     expect(onCollabModeChange).toHaveBeenCalledWith("advisor");
@@ -77,7 +77,7 @@ describe("AgentPicker 三态协作", () => {
   it("点顾问只走 onCollabModeChange，不再链式 onToggleTeamMode(false) 把 App 打回 solo", async () => {
     const onCollabModeChange = vi.fn();
     const onToggleTeamMode = vi.fn();
-    renderPicker({ onCollabModeChange, onToggleTeamMode, collabMode: "solo" });
+    renderPicker({ onCollabModeChange, onToggleTeamMode, collabMode: "solo", advisorModels: [{ id: "gpt-6-astra", label: "GPT-6-Astra", engine: "codex" }] });
     fireEvent.click(await screen.findByRole("button", { name: /主模型不变/ }));
     expect(onCollabModeChange).toHaveBeenCalledTimes(1);
     expect(onCollabModeChange).toHaveBeenCalledWith("advisor");
@@ -107,6 +107,7 @@ describe("AgentPicker 三态协作", () => {
       collabMode: "solo",
       advisorConsultParents: ["ccb"],
       parentEngine: "ccb",
+      advisorModels: [{ id: "gpt-6-astra", label: "GPT-6-Astra", engine: "codex" }],
       advisorConsultAllowed: false,
       advisorConsultParentReason: "当前模型不能向顾问提问。把顶栏模型换成 GLM 或 MiniMax 后再试。",
     });
@@ -123,8 +124,17 @@ describe("AgentPicker 三态协作", () => {
       advisorModels: [],
       advisorUnavailableReason: "顾问引擎尚未证明无工具隔离",
     });
-    expect(await screen.findByText(/尚未证明无工具隔离/)).toBeInTheDocument();
+    expect((await screen.findAllByText(/尚未证明无工具隔离/)).length).toBeGreaterThan(0);
     expect(screen.queryByLabelText("选择顾问型号")).toBeNull();
+  });
+
+  it("OCV5-477: 没有顾问型号时顾问置灰并写明原因，点击不发起切换", async () => {
+    const onCollabModeChange = vi.fn();
+    renderPicker({ onCollabModeChange, collabMode: "solo", advisorModels: [] });
+    const advisor = await screen.findByRole("button", { name: /暂时没有可用的顾问型号/ });
+    expect(advisor).toBeDisabled();
+    fireEvent.click(advisor);
+    expect(onCollabModeChange).not.toHaveBeenCalled();
   });
 
   it("已配置顾问不在目录时警告并保持空选，不静默显示第一项", async () => {
