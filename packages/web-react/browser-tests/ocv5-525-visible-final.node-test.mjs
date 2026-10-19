@@ -75,8 +75,21 @@ test("OCV5-525: completed summary stays visible when the last assistant is only 
         await page.reload();
         await page.getByText(summary, { exact: true }).waitFor();
         assert.equal(await page.getByTestId("assistant-row").count(), 1);
+        // First open of the lazy share dialog must retain the Markdown download on both layouts.
+        if (width === 390) {
+          await page.locator('button[data-product-control][aria-label="更多操作"]').click();
+          await page.getByRole("menuitem", { name: "分享", exact: true }).click();
+        } else {
+          await page.getByRole("button", { name: "分享会话", exact: true }).click();
+        }
+        const [download] = await Promise.all([
+          page.waitForEvent("download"),
+          page.getByRole("button", { name: "导出 Markdown", exact: true }).click(),
+        ]);
+        assert.equal(download.suggestedFilename(), "库存看板.md");
+        assert.ok(readFileSync(await download.path(), "utf8").includes(summary), "cold lazy export includes the actual final answer");
         assert.deepEqual(errors, []);
-        console.log("VISIBLE_FINAL_RECEIPT", JSON.stringify({ width, red, ablations, visibleSummary: true, replay: true, prediction: "通过" }));
+        console.log("VISIBLE_FINAL_RECEIPT", JSON.stringify({ width, red, ablations, visibleSummary: true, replay: true, prediction: "通过", markdownExport: true }));
       } finally { await context.close(); }
     });
   } finally {
