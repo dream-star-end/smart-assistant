@@ -58,6 +58,7 @@ import {
   directEgressDispatcher,
 } from "../../account-pool/egressDispatcher.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
+import { getHealthDegradedProviders } from "../../admin/providerHealthGate.js";
 import type { SelectedApiKey } from "../../account-pool/apiKeyPool.js";
 import {
   findRouteProviderForModel,
@@ -481,6 +482,8 @@ export interface PickUpstreamDeps {
   apiKeyPoolHasMembers?: (service: string) => boolean;
   /** OAuth 上游 URL 覆盖;undefined → DEFAULT_UPSTREAM_ENDPOINT。测试 seam。 */
   upstreamEndpoint?: string;
+  /** OCV5-482: health-degraded static providers (test seam; default reads the provider health gate). */
+  healthDegradedProviders?: () => Promise<Set<string>>;
   /**
    * Dispatcher 工厂 test seam(同 Phase 2 recordHostRequest 模式)。
    * Production wiring **不**注入,upstream 层走默认 `getDispatcherForAccount`,
@@ -1089,8 +1092,9 @@ export async function pickUpstream(
 
 /**
  * OCV5-482: a session on the static route's declared fallback upstream (protocol staticRouteFallback),
- * or null when none is declared or the fallback has no usable key. Key rules match the primary:
- * the fallback provider's pool first, its env key only when that pool has no members.
+ * or null when none is declared, the fallback is health-degraded while the health gate is enforced,
+ * or the fallback has no usable key. Key rules match the primary: the fallback provider's pool first,
+ * its env key only when that pool has no members.
  */
 export async function pickStaticFallbackUpstream(
   deps: PickUpstreamDeps,
@@ -1101,6 +1105,12 @@ export async function pickStaticFallbackUpstream(
 ): Promise<PreparedUpstreamSession | null> {
   const fallback = staticRouteFallback(route.provider.id, route.upstreamModel ?? body.model);
   if (!fallback) return null;
+  // Every fallback entry (empty primary pool, primary refusal) honours the same health gate as the primary.
+  if (process.env.OC_PROVIDER_HEALTH_ENFORCE === "1"
+    && (await (deps.healthDegradedProviders ?? getHealthDegradedProviders)()).has(fallback.providerId)) {
+    log.info("proxy_static_fallback_skipped", { provider: route.provider.id, fallback: fallback.providerId, reason: "fallback_degraded" });
+    return null;
+  }
   const spec = getStaticProvider(fallback.providerId);
   let pooled: SelectedApiKey | null = null;
   if (deps.selectApiKey) {

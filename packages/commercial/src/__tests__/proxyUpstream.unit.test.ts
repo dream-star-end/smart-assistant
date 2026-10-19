@@ -30,6 +30,7 @@ import {
   selectUpstreamRoute,
   validateUpstreamConfig,
   pickUpstream,
+  pickStaticFallbackUpstream,
   releaseUpstreamSession,
   formatIsoDateInTimezone,
   rewriteReminderDatesInMessages,
@@ -2499,5 +2500,35 @@ describe("pickUpstream — static route fallback (OCV5-482)", () => {
       { kind: "static" as const, provider: getStaticProvider("opencodego"), upstreamModel: "qwen3.7-plus" }, log);
     assert.equal(b.ok, false);
     if (!b.ok) assert.equal(b.error.kind, "pool_unavailable");
+  });
+
+  test("health gate enforced: a degraded fallback provider serves no entry (pool-empty or primary refusal)", async () => {
+    const prev = process.env.OC_PROVIDER_HEALTH_ENFORCE;
+    process.env.OC_PROVIDER_HEALTH_ENFORCE = "1";
+    try {
+      for (const degraded of [new Set(["deepseek"]), new Set<string>()]) {
+        const sched = makeScheduler({});
+        const deps = {
+          scheduler: sched.scheduler,
+          staticProviderKeys: {},
+          selectApiKey: async (service: string) => (service === "deepseek" ? { service, memberId: "1", apiKey: "DS-KEY" } : null),
+          apiKeyPoolHasMembers: () => true,
+          healthDegradedProviders: async () => degraded,
+        };
+        const pooled = await pickUpstream(deps, bodyFor("deepseek-v4-flash"), GO_FLASH_ROUTE, log);
+        const refused = await pickStaticFallbackUpstream(deps, bodyFor("deepseek-v4-flash"), GO_FLASH_ROUTE, log);
+        if (degraded.has("deepseek")) {
+          assert.equal(pooled.ok, false);
+          if (!pooled.ok) assert.equal(pooled.error.kind, "pool_unavailable");
+          assert.equal(refused, null);
+        } else {
+          assert.equal(pooled.ok && pooled.session.providerId, "deepseek");
+          assert.equal(refused?.providerId, "deepseek");
+        }
+      }
+    } finally {
+      if (prev === undefined) delete process.env.OC_PROVIDER_HEALTH_ENFORCE;
+      else process.env.OC_PROVIDER_HEALTH_ENFORCE = prev;
+    }
   });
 });
