@@ -349,6 +349,7 @@ test('one manager meters interleaved tenant operations under their actual IDs ac
         await new Promise((resolve) => setImmediate(resolve))
         return new Response(
           JSON.stringify({
+            stop_reason: 'end_turn',
             content: [{ type: 'text', text: '1234' }],
             usage: { input_tokens: 4, output_tokens: 2 },
           }),
