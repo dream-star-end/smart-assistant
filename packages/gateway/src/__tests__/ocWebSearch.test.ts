@@ -95,3 +95,32 @@ test('search rejects invalid input and help advertises search without starting n
     assert.equal(requests.length, 0)
   })
 })
+
+for (const format of ['json', 'markdown']) {
+  test(`search keeps Grok source-only URLs after MiniMax failure in ${format}`, async () => {
+    const sourceUrl = 'https://www.pbc.gov.cn/a'
+    await fixture((req, res) => {
+      if (req.url !== '/internal/v3/grok-search') {
+        res.writeHead(503); res.end(`${identity} private upstream detail`); return
+      }
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ organic: [
+        { title: '', url: sourceUrl, snippet: '' },
+        { title: '', url: '', snippet: '' },
+        { title: '', url: 'javascript:alert(1)', snippet: '' },
+      ] }))
+    }, async (env, requests) => {
+      const result = await runOcWebCli(['search', 'news', ...(format === 'json' ? ['--json'] : [])], env)
+      assert.equal(result.exitCode, 0, result.stderr)
+      if (format === 'json') {
+        assert.deepEqual(JSON.parse(result.stdout).results, [{ title: sourceUrl, url: sourceUrl, snippet: '' }])
+      } else {
+        assert.ok(result.stdout.includes(`1. ${sourceUrl}\n${sourceUrl}`))
+      }
+      assert.deepEqual(requests.map((r) => r.path), ['/internal/v3/minimax-search', '/internal/v3/grok-search'])
+      assert.ok(!result.stdout.includes('javascript:'))
+      assert.ok(!result.stdout.includes(identity))
+      assert.ok(!result.stdout.includes('private upstream detail'))
+    })
+  })
+}
