@@ -3,6 +3,7 @@
  * (packages/commercial/src/http/{handlers,agent}.ts)。
  */
 import type {
+  AutomaticTurnRecoverySnapshot,
   MarketplaceArtifactKind,
   MarketplaceCapabilityInstallOutcome,
   MarketplaceCapabilityReadiness,
@@ -502,6 +503,7 @@ export type SessionDetail = {
   archivedCount?: number;
   /** 已归档的最大 `_orderSeq` 水位；字段名为滚动兼容保留。缺省=0。*/
   archivedThroughSeq?: number;
+  automaticRecoveries?: AutomaticTurnRecoverySnapshot[];
   openDispatch?: {
     dispatchId: string;
     clientMessageId: string;

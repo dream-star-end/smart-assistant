@@ -365,6 +365,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
           timelineSnapshotMaxSeq: detail.timelineSnapshotMaxSeq,
           invalidateHistoryCache: detail._historyRevisionUnsupported === true,
           openDispatch: detail.openDispatch,
+          automaticRecoveries: detail.automaticRecoveries,
           permissionPrompts: detail.permissionPrompts,
         });
         // Canonical GET is enough to dismiss the history skeleton. Journal
@@ -404,6 +405,7 @@ export function useSessionList(opts: UseSessionListOptions): UseSessionList {
                   timelineHasMore: tapeDetail.timelineHasMore,
                   timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
                   invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
+                  automaticRecoveries: tapeDetail.automaticRecoveries,
                   permissionPrompts: tapeDetail.permissionPrompts,
                 });
               },

@@ -6818,7 +6818,31 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       createdAt: 1_783_950_100_000,
       usage: { inputTokens: 1, outputTokens: 1 },
     });
-    await stageAndFinalize(CUSER, tape);
+    assert.ok(sourceAdmission.kind === "admitted");
+    const dispatch = { dispatchId: sourceAdmission.dispatch.dispatchId,
+      attemptNo: sourceAdmission.dispatch.attemptNo };
+    for (const part of tape.parts) {
+      await backend.stageLosslessTurnTapePart(CUSER, part.request, part.bytes, dispatch);
+    }
+    const finalize = { ...tape.finalize, ...dispatch };
+    await backend.finalizeLosslessTurnTape(CUSER, {
+      ...finalize,
+      settlement: { billingAnchorId: `srv-${sessionId}-main-t1`, engineBillings: [],
+        text: "temporary upstream failure", ts: 1_783_950_100_000, errorCode: "upstream_failed" },
+    }, { materialize: false });
+    for (const snapshot of [
+      await backend.getClientSession(sessionId, CUSER, { view: "timeline" }),
+      await backend.getClientSessionPartial(sessionId, CUSER, 0, { view: "timeline" }),
+    ]) {
+      assert.deepEqual(snapshot?.automaticRecoveries, []);
+      const source = (snapshot?.messages as MessageLike[]).find((row) =>
+        row._clientMessageId === sourceClientMessageId && row._errorCode);
+      assert.equal(source?._automaticRecoveryDecisionPending, true,
+        "INC-20261019-RECOVERABLE-ERROR-RED-CARD: visible phase A cannot decide recovery before materialization");
+    }
+    assert.equal((await pool.query(`SELECT count(*)::int AS n FROM turn_recovery_jobs
+      WHERE user_id=$1 AND session_id=$2`, [UID, sessionId])).rows[0].n, 0);
+    await backend.finalizeLosslessTurnTape(CUSER, finalize);
     const jobs = await pool.query<{
       recovery_mode: string;
       error_code: string;
@@ -6840,6 +6864,33 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(request.content?.recovery?.mode, "checkpoint");
     assert.match(request.content?.text ?? "", /先查询其当前可观察状态/);
     assert.doesNotMatch(request.content?.text ?? "", /deploy\.sh/);
+    // INC-20261019-RECOVERABLE-ERROR-RED-CARD: a cold browser reads recovery
+    // authority in the same timeline snapshot, before the child is admitted.
+    const expected = [{
+      sourceClientMessageId, rootClientMessageId: sourceClientMessageId,
+      clientMessageId: jobs.rows[0]!.request_json.clientMessageId,
+      errorCode: "upstream_failed", mode: "checkpoint", attempt: 1,
+    }];
+    const full = await backend.getClientSession(sessionId, CUSER, { view: "timeline" });
+    assert.ok((full?.messages as MessageLike[]).some((row) =>
+      row._clientMessageId === sourceClientMessageId && row._automaticRecoveryDecisionPending === false));
+    assert.deepEqual(full?.automaticRecoveries, expected,
+      "INC-20261019-RECOVERABLE-ERROR-RED-CARD: timeline returns the exact active recovery without request payload");
+    assert.deepEqual((await backend.getClientSessionPartial(sessionId, CUSER, 0,
+      { view: "timeline" }))?.automaticRecoveries, expected);
+    assert.equal((await backend.getClientSession(sessionId, CUSER))?.automaticRecoveries, undefined,
+      "non-snapshot legacy read cannot claim negative recovery authority");
+    assert.equal(await backend.getClientSession(sessionId, "c:999999", { view: "timeline" }), null);
+    for (const status of ["leased", "sent", "forwarded", "paused", "cancelled", "completed", "manual_reconcile"]) {
+      await pool.query(`UPDATE turn_recovery_jobs SET status=$4
+        WHERE user_id=$1 AND session_id=$2 AND source_client_message_id=$3`,
+        [UID, sessionId, sourceClientMessageId, status]);
+      const snapshot = await backend.getClientSessionPartial(sessionId, CUSER, 0, { view: "timeline" });
+      assert.deepEqual(snapshot?.automaticRecoveries,
+        ["leased", "sent", "forwarded"].includes(status) ? expected : [], status);
+      assert.ok((snapshot?.messages as MessageLike[]).some((row) => row._clientMessageId === sourceClientMessageId && row._errorCode),
+        "the source terminal stays immutable while the recovery job changes");
+    }
   });
 
   // OCV5-317 (#b6df9aee): the live Box Claude tape — Bash and Skill finished,
