@@ -28,6 +28,7 @@ function isAnswerBody(m: ChatMessage): boolean {
     !m.error &&
     !m._turnStatusRecord &&
     !m._genPlaceholder &&
+    !m._hideUnpublishedFallback &&
     !m._displayDegraded &&
     m._displayDegradeReason === undefined &&
     (m.text ?? "").trim().length > 0
@@ -113,7 +114,7 @@ function selectConversationMessages(
     if (!turn.tail || after(order, turn.tail.order)) turn.tail = { m, order };
     turn.lastIndex = m;
     if (includeInterrupted && isAnswerBody(m) && assistantCarriesDeliverable(m)) turn.deliverables.push(m);
-    if (includeInterrupted && m.role === "assistant" && (m._errorCode || m._isError || m.error)) {
+    if (includeInterrupted && m.role === "assistant" && !m._hideUnpublishedFallback && (m._errorCode || m._isError || m.error)) {
       const visible = errorPresentation(m._errorCode, m.text, m._errorDetail, m.usage?.waived === true).bodyText || m._stopCopyText;
       if (visible?.trim()) {
         const partial: ExportMessage = { ...m, text: visible, exportIncomplete: true };
@@ -141,7 +142,11 @@ function selectConversationMessages(
     // later tools run. Preserve those delivered results in Markdown too.
     const candidates: ExportMessage[] = t.deliverables.map((m) => final ? m : { ...m, exportIncomplete: true });
     if (final) candidates.push(final);
-    else if (t !== live && t.tail?.m === t.lastIndex && t.tail
+    else if (t === live && t.tail?.m === t.lastIndex && t.tail && isAnswerBody(t.tail.m)) {
+      // Preserve the visible snapshot without presenting it as a completed turn.
+      // A later work row still excludes earlier process narration.
+      candidates.push({ ...t.tail.m, exportIncomplete: true });
+    } else if (t !== live && t.tail?.m === t.lastIndex && t.tail
       && (t.tail.m._errorCode || t.tail.m._isError || t.tail.m.error)) {
       if (t.lastBody && after(t.tail.order, t.lastBody.order)) candidates.push({ ...t.lastBody.m, exportIncomplete: true });
       if (t.embedded?.id === t.tail.m.id) candidates.push(t.embedded);
@@ -171,7 +176,7 @@ export function selectShareMessages(messages: readonly ChatMessage[], range: Sha
   return selectConversationMessages(messages, range, sending, false);
 }
 
-/** Markdown also preserves visible partial output immediately before failure. */
+/** Markdown preserves visible live snapshots and partial output before failure. */
 export function selectExportMessages(messages: readonly ChatMessage[], sending = false): ExportMessage[] {
   return selectConversationMessages(messages, "all", sending, true);
 }

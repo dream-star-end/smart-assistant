@@ -7548,6 +7548,11 @@
           "layer": "unit",
           "path": "packages/web-react/src/lib/chat/exportMarkdown.test.ts",
           "assertion": "keeps a delivered file on a stopped assistant row before later tools"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/exportMarkdown.test.ts",
+          "assertion": "keeps visible live answer snapshots as incomplete without sharing unfinished answers"
         }
       ],
       "coverageCommits": [
