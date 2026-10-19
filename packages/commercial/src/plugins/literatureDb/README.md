@@ -16,3 +16,7 @@
 明确供应商拒绝优先于答案/缺usage/计量超时，不能通过换provider继续。body最多64KiB、一次fetch、禁止跟跳、总计15秒，错误不含raw响应。meter事件只含本地随机ID、provider/model、整数usage和结果分类，不含图像/答案/key。Gemini prompt包含缓存子集；Claude缓存输入分量分开。密钥池返回JS string只能缩短引用，不能声称可靠清零。
 
 供应商拒绝路径必须立即返回给solver锁存；用量sink/健康报告异步消费，不能等待挂住的sink让外层15秒期限覆盖拒绝。普通成功必须等sink确认后才返回答案；取消后meter仍被调度且迟到拒绝被消费，但当前没有持久化队列，不能宣称进程崩溃时的供应商用量已经完整入库。该队列/预算是服务启用前的接线依赖。
+
+`jieyouHttpClient.ts`是私有预登录客户端：parse5按name解析真实表单/hidden/验证码路径，lifetime必须从实际选项显式选取，不猜CMS值；每实例独立tough-cookie jar并逐跳选cookie，HTTP不发送Secure cookie。只收同站点受pin约束的请求，GET最多3次重定向，challenge一次消费、POST绝不自动跟跳/重放。close中止在途并清空jar。原始page/response/cookie snapshot是私有证据，不得作为模型结果或公开管理API返回；snapshot并不证明登录成功。当前没有实现真实身份/错误分类、LiteratureLoginSession适配或DB保存，须测试账号校准。
+
+parse5/tough-cookie已显式加入commercial runtime依赖，锁定现有8.0.1/6.0.1及原有传递版本；没有借dev依赖冒充生产可用，也未修改无关web包锁项。未来正常发布staging npm ci处理依赖，本轮未部署。

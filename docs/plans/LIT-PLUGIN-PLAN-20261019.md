@@ -55,6 +55,12 @@
 
 [官方图片API适配预审方案](OCV5-524-OFFICIAL-CAPTCHA-ADAPTER-PLAN.md)已通过独立方案审查后实施；固定Claude/Gemini官方协议、每次从既有平台API-key池选key、不env回退，显式平台用量sink，不扣免费插件用户。当前目录只有可核验的官方Claude机制；Gemini Go不支持图片且不是官方generateContent，不将其伪装为已接线。本批Google仅协议fixture，不新增目录/生产配置。Claude默认fresh resolver读取唯一catalog cache的assertFresh、精确ccb/anthropic/vision与model/upstream绑定；目录可路由不等于用途批准，两者均需当前有效。
 
+## 第三批：私有预登录客户端
+
+[第三批实施预审](OCV5-524-JIEYOU-HTTP-CLIENT-PLAN.md)已APPROVED后实现真实HTTP私有客户端：parse5解析表单、显式runtime CookieJar、同会话挑战、逐跳pin/选cookie、一次性POST、取消与资源预算。hidden/lifetime/Submit值运行时取，不用未归档的CMS默认常量。尚未向目标站提交凭据/POST，也未把返回200/Cookie/退出链接认作成功。该客户端尚不等于整个LiteratureLoginSession或产品接线；账号到位后校准实际身份/错误页及下游。
+
+先验证原生HTTP是否足够；若足够，在如实签入HTTP例外/会话类型的固定官方driver执行分支内复用安装/审核/租户/lease/CAS门，不必为了静态表单先引浏览器。若真实库需JS，再实现受限浏览器HTTP relay。不能从新产品HTTP路由直接绕过runtime校验开跑。依赖锁变更沿正规发布staging npm ci处理，不手改生产安装。
+
 ## 商业体系与拆分细化（16:46决定后的现行版本）
 
 - 服务端采用官方managed-browser/固定driver和受签工件，而非用户上传任意JS。现有本机plugin.json不支持browser/http组件，声明HTTP蓝图也不能表达等待验证码的登录生命周期。工具沿app-connectors→oc-plugin catalog/list/call→容器双因子RPC→安装/签名/账户lease→受限worker，不假定所有模型自动原生注册工具。
