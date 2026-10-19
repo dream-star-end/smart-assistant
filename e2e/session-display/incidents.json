@@ -8084,6 +8084,28 @@
           "assertion": "OCV5-509 the CLI auto-memory folder in a run project is cleaned, anything else still refused"
         }
       ]
+    },
+    {
+      "id": "INC-20261019-CODEX-NATIVE-IDENTITY-HEADERS",
+      "occurredAt": "2026-10-19",
+      "severity": "P1",
+      "symptom": "原生Codex送出的session-id/thread-id被relay白名单丢弃，破坏ChatGPT缓存亲和及线程元数据契约。保留两个非凭证ID及旧版头，不改变请求正文、鉴权、账户路由或私有头过滤；全部缓存异常是否闭环仍须真实上线验证。",
+      "rootFixCommit": "c5211e85",
+      "coverageCommits": [
+        "c5211e85"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalCodexRelay.test.ts",
+          "assertion": "handler:official 路径仅透传安全的 Codex 路由头,并返回上游 turn state"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-codex-chatgpt-ws.ts",
+          "assertion": "[codex-native-identity-headers] PASS — native session and thread headers survive the relay without changing authentication or private header filtering"
+        }
+      ]
     }
   ]
 }
