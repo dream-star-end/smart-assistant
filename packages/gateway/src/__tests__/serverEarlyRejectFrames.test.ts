@@ -84,7 +84,7 @@ describe('_buildEngineErrorFrame — turn 终态 wire', () => {
 })
 
 describe('_earlyRejectErrorFrames — 结构化双帧', () => {
-  test('INC-20261019-RECOVERABLE-ERROR-RED-CARD: rejection before a runner explicitly ends automatic recovery', () => {
+  it('INC-20261019-RECOVERABLE-ERROR-RED-CARD: rejection before a runner explicitly ends automatic recovery', () => {
     const [error] = _earlyRejectErrorFrames({
       sessionKey: 'agent:main:webchat:dm:early-reject', channel: 'webchat',
       peer: { id: 'early-reject', kind: 'dm' }, userId: 'c:3', traceId: 'a'.repeat(32),
