@@ -167,15 +167,13 @@ export class LiteratureLoginManager {
     open: (signal: AbortSignal) => Promise<LiteratureLoginSession>,
   ): Promise<void> {
     const signal = op.controller.signal
-    // If an opener resolves after cancellation it still owns cleanup of that late handle.
+    // Publish every returned handle before checking cancellation. The one closing
+    // barrier below owns cleanup, including late openers and cleanup failures.
     const opening = Promise.resolve()
       .then(() => open(signal))
-      .then(async (session) => {
-        if (signal.aborted) {
-          await session.close()
-          throw new LiteratureError('CANCELLED')
-        }
+      .then((session) => {
         op.session = session
+        if (signal.aborted) throw new LiteratureError('CANCELLED')
         return session
       })
     op.opening = opening
@@ -362,7 +360,7 @@ export class LiteratureLoginManager {
           try {
             await op.opening
           } catch {
-            /* Late opener owns its cleanup. */
+            /* Any returned handle is still closed below. */
           }
         }
         await op.session?.close()

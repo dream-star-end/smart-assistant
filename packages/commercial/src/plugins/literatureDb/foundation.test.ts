@@ -629,3 +629,43 @@ test('per-account hourly admission limits survive completed operations', async (
   const next = manager.start(owner, async () => f.session, f.persist)
   assert.equal((await manager.settled(17, next.operationId)).status, 'authenticated')
 })
+
+test('pre-cancelled recognition consumes the already-started image rejection', async () => {
+  const controller = new AbortController()
+  controller.abort()
+  const solver = new LiteratureCaptchaSolver([local()])
+  await assert.rejects(
+    solver.solve(
+      { data: Buffer.from('bad image'), mediaType: 'image/png' },
+      { cloudCalls: 0, maxCloudCalls: 0 },
+      controller.signal,
+    ),
+    code('CANCELLED'),
+  )
+  // Node's test runner reports an orphan rejection on the next turn as a failure.
+  await new Promise((resolve) => setImmediate(resolve))
+})
+
+test('a late opener with failed cleanup retains its account fence and fails shutdown', async () => {
+  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  const f = fixture(await image())
+  let opened!: (session: LiteratureLoginSession) => void
+  f.session.close = async () => {
+    throw new Error('fixture-private-close-error')
+  }
+  const op = manager.start(
+    owner,
+    () =>
+      new Promise((resolve) => {
+        opened = resolve
+      }),
+    f.persist,
+  )
+  while (!opened) await new Promise((resolve) => setImmediate(resolve))
+  const cancel = manager.cancel(17, op.operationId)
+  opened(f.session)
+  assert.equal((await cancel).errorCode, 'CLEANUP_FAILED')
+  assert.throws(() => manager.start(owner, async () => f.session, f.persist), code('ACCOUNT_BUSY'))
+  await assert.rejects(manager.close(), code('CLEANUP_FAILED'))
+  assert.equal(f.calls.persisted, 0)
+})

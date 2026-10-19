@@ -28,7 +28,11 @@ export class LiteratureError extends Error {
 
 /** Race cancellation even if an inference client ignores AbortSignal. */
 export function abortable<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) return Promise.reject(new LiteratureError('CANCELLED'))
+  if (signal.aborted) {
+    // The caller already started work; consume its eventual rejection as well.
+    void work.catch(() => {})
+    return Promise.reject(new LiteratureError('CANCELLED'))
+  }
   return new Promise((resolve, reject) => {
     const aborted = () => {
       cleanup()
