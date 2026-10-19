@@ -19,5 +19,5 @@ test('api domain parts are disjoint and exposed on api by reference', () => {
     }
   }
   expect(seen.size).toBe(150)
-  expect(Object.keys(api)).toHaveLength(240)
+  expect(Object.keys(api)).toHaveLength(241)
 })

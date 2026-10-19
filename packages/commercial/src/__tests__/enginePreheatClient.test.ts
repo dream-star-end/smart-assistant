@@ -185,3 +185,53 @@ describe('makeEnginePreheatClient', () => {
     assert.equal(transport.calls, 0)
   })
 })
+
+test('authorized preparation forwards only the fixed official hint and canonical model', async () => {
+  let seen: string | null = null
+  const transport = recordingTransport({ onCall: info => { seen = info.body } })
+  const post = makeEnginePreheatClient({ transport, bridgeSecret: SECRET,
+    resolveRunningEndpoint: async () => ({ host: '127.0.0.1', port: 18789, containerId: CONTAINER_ID }),
+    resolvePreparation: async (uid, args) => {
+      assert.equal(uid, 3n); assert.equal(args.modelId, 'alias')
+      return { modelId: 'gpt-6.1-sol', codexRouteHint: { kind: 'official_oauth', token: 'PRIVATE', baseUrl: 'PRIVATE' } } as never
+    } })
+  await post({ userId: 'c:3', sessionId: 'webtest1234', agentId: 'main', modelId: 'alias' })
+  assert.equal(transport.calls, 1)
+  assert.deepEqual(JSON.parse(seen ?? '{}'), { sessionId: 'webtest1234', agentId: 'main', modelId: 'gpt-6.1-sol',
+    codexRouteHint: { kind: 'official_oauth' } })
+  assert.doesNotMatch(seen ?? '', /PRIVATE|token|baseUrl/)
+})
+test('uncertain preparation never even resolves a running endpoint', async () => {
+  const transport = recordingTransport({})
+  const post = makeEnginePreheatClient({ transport, bridgeSecret: SECRET, resolvePreparation: async () => null,
+    resolveRunningEndpoint: async () => { throw Error('must not resolve endpoint') } })
+  await post({ userId: 'c:3', sessionId: 'webtest1234', agentId: 'main', modelId: 'gpt-6.1-sol' })
+  assert.equal(transport.calls, 0)
+})
+
+test('draft HMAC handoff carries effective effort and server workspace mode; stale lookup never sends', async () => {
+  const bodies: unknown[] = []
+  const transport = recordingTransport({ onCall: c => bodies.push(JSON.parse(c.body!)) })
+  let current = true
+  const post = makeEnginePreheatClient({
+    bridgeSecret: SECRET, transport,
+    resolvePreparation: async () => ({ modelId: 'gpt-6.1-sol', codexRouteHint: { kind: 'official_oauth' } }),
+    resolveRunningEndpoint: async () => ({ host: '127.0.0.1', port: 3000, containerId: 7 }),
+  })
+  const args = { userId: 'c:42', sessionId: 'draft_12345', agentId: 'main', modelId: 'gpt-6.1-sol',
+    effortLevel: 'high', workspaceMode: 'isolated_v1' as const, codexOnly: true, isCurrent: () => current }
+  await post(args)
+  assert.deepEqual(bodies, [{ sessionId: args.sessionId, agentId: 'main', modelId: args.modelId,
+    effortLevel: 'high', workspaceMode: 'isolated_v1', codexRouteHint: { kind: 'official_oauth' } }])
+  current = false
+  await post(args)
+  assert.equal(bodies.length, 1)
+  const stale = makeEnginePreheatClient({
+    bridgeSecret: SECRET, transport,
+    resolvePreparation: async () => ({ modelId: 'gpt-6.1-sol' }),
+    resolveRunningEndpoint: async () => { current = false; return { host: '127.0.0.1', port: 3000, containerId: 7 } },
+  })
+  current = true
+  await stale(args)
+  assert.equal(bodies.length, 1)
+})

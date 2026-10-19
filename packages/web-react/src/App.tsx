@@ -1,3 +1,5 @@
+import { useDraftSessionMaterialization } from "./hooks/useDraftSessionMaterialization";
+import { useDraftPreparation } from "./hooks/useDraftPreparation";
 import { createGoalStarter } from "./lib/goalStart";
 import {
   lazy,
@@ -26,9 +28,9 @@ import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
 import { applyIntelligentUiSnapshot, useInputPredictionEnabled } from "./lib/intelligentUi";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
-import { Composer, moveComposerAttachments, resetComposerAttachmentCache } from "./components/Composer";
+import { Composer, resetComposerAttachmentCache } from "./components/Composer";
 import { ComposerProjectPill } from "./components/ComposerProjectPill";
-import { accountDraftKey, moveDraft, NEW_COMPOSER_DRAFT_KEY, teardownComposerDrafts } from "./lib/composerDraft";
+import { accountDraftKey, NEW_COMPOSER_DRAFT_KEY, teardownComposerDrafts } from "./lib/composerDraft";
 import type { ImageAnnotationSource } from "./components/ImageAnnotationEditor";
 import {
   type ImageCommentSubmit,
@@ -124,7 +126,7 @@ import {
   useAppRoute,
 } from "./hooks/useAppRoute";
 import { useAuth } from "./hooks/useAuth";
-import { genWsSessionId, useSessionList } from "./hooks/useSessionList";
+import { useSessionList } from "./hooks/useSessionList";
 import { useChatProjects } from "./hooks/useChatProjects";
 import { useUnreadSessions } from "./hooks/useUnreadSessions";
 import { useSidebarWidth } from "./hooks/useSidebarWidth";
@@ -1224,6 +1226,15 @@ export function App() {
   const { sessionEffort, setSessionEffort, contextTier, setContextTier, serviceTier, setServiceTier } =
     useSessionEngineOptions(activeId);
 
+  const { draftSessionId, stopPreparing } = useDraftPreparation({
+    auth, userId: user?.id ?? null, activeId, agentId: agent.id, modelId,
+    effortLevel: effortForModel(models, effectiveEffortModelId(modelId, false),
+      sessionEffort !== undefined ? sessionEffort : preferenceEffort),
+    enabled: !demo && laneReady && view === "app" && serverListSettled && !activeId &&
+      !draftProjectId && !projectHome && !boardOpen && collabMode === "solo" && serviceTier !== "fast" &&
+      !!modelId && isCodexEngineModel(modelId) && models.some(m => m.id === modelId),
+  });
+
   // Async goal saves can finish after navigation; only consume the selected draft's project.
   const selectedSessionIdRef = useRef(activeId);
   selectedSessionIdRef.current = activeId;
@@ -1284,7 +1295,7 @@ export function App() {
       }
       // 非 demo：经真实 WS 引擎发送（inbound.message）。确保有会话承载本轮（peer.id）。
       const originalSessionId = target?.sessionId ?? activeId;
-      const sessionId = originalSessionId ?? genWsSessionId();
+      const sessionId = originalSessionId ?? draftSessionId;
       let createdSession: Session | null = null;
       const recoveryEpoch = collabEpochRef.current;
       const recoverySelection = selectedSessionIdRef.current;
@@ -1292,6 +1303,7 @@ export function App() {
       const recoveryIdentityIsCurrent = () => auth?.snapshot().epoch === recoveryIdentity;
       const recoveryIsCurrent = () => collabEpochRef.current === recoveryEpoch
         && selectedSessionIdRef.current === recoverySelection && (!target || target.sessionId === recoverySelection) && recoveryIdentityIsCurrent();
+      if (!originalSessionId) stopPreparing();
       const recovery = await prepareAdvisorSend({
         agentId: agent.id, original: collabUi, auth, sessionId: originalSessionId,
         parentEngine: models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine,
@@ -1466,6 +1478,8 @@ export function App() {
     // 仅为满足 lint(跨 hook 返回值 biome 不再推断稳定性),不改变 send 的重建时机。
     [
       activeId,
+      draftSessionId,
+      stopPreparing,
       auth,
       demo,
       user,
@@ -1659,32 +1673,11 @@ export function App() {
     [image2Available, submitImageEdit, submitImageComment, image2UnavailableReason],
   );
 
-  // 会话物化:新建按钮本身只进入空白草稿态；GitHub 绑定 / 设定目标这类明确依赖
-  // per-session 身份的首轮前操作，才在用户确认操作时物化一个会话 id。
-  const ensureActiveSession = useCallback((): string | undefined => {
-    if (demo || !user) return activeId;
-    if (activeId) return activeId;
-    const id = genWsSessionId();
-    const s: Session = {
-      id,
-      title: "新对话",
-      ownerUserId: user.id,
-      updatedAt: new Date().toISOString(),
-      messageCount: 0,
-      ...(modelId ? { modelId } : {}),
-    };
-    // 首轮前操作会紧接着 ensureServerSession/sendRepoBind；先把空白态显式模型写入
-    // ChatSession，确保建行 PUT 与后续首发都携带同一选择，不被 activeId effect 回落默认值。
-    sockRef.current?.ensureSession(id, agent.id, "新对话");
-    if (modelId) sockRef.current?.setSessionModel(id, modelId);
-    setSessions((c) => [s, ...c]);
-    // This is an identity promotion, not navigation to another conversation. Preserve
-    // the unsent draft; normal send consumes/clears it in Composer instead.
-    moveDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, user.id), accountDraftKey(id, user.id));
-    moveComposerAttachments(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, user.id), accountDraftKey(id, user.id));
-    setActiveId(id);
-    return id;
-  }, [demo, user, activeId, agent.id, modelId, setSessions, setActiveId]);
+  const ensureActiveSession = useDraftSessionMaterialization({
+    demo, userId: user?.id, activeId, draftSessionId, stopPreparing, agentId: agent.id, modelId,
+    teamMode: collabMode === "team", sessionEffort, contextTier, serviceTier,
+    sockRef, setSessions, setActiveId,
+  });
 
   // 打开 GitHub 绑定 modal:先确保有承载会话,否则「确认绑定」因 !sessionId 恒禁用
   // (输入框底部入口 → 发消息前即可绑定)。

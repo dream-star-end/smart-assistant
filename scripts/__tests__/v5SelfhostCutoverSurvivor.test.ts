@@ -297,9 +297,11 @@ exit 0
 
   test("tier1_rollback: restart_egress_for_live failure does not restart master", () => {
     const watch = readFileSync(path.join(root, "scripts/v5-selfhost-watch.sh"), "utf8");
-    const tier1 = extractBashFunction(watch, "tier1_rollback");
-    const restart = extractBashFunction(watch, "restart_egress_for_live");
     withTempDir("ocv5-161-tier1-", (dir) => {
+      // Source exact production bytes from a private directory: its main guard
+      // suppresses dispatch and there is no installed watch.env beside it.
+      const watchScript = path.join(dir, "watch.sh");
+      writeExec(watchScript, watch);
       const live = path.join(dir, "live");
       mkdirSync(path.join(live, "deploy/v5-selfhost"), { recursive: true });
       writeFileSync(path.join(live, "deploy/v5-selfhost/openclaude-v5-selfhost-egress@.service"), "# fixture\n");
@@ -331,18 +333,37 @@ exit 0
       writeExec(path.join(bin, "timeout"), "#!/bin/sh\nexit 0\n");
       const got = runBash(
         [
+          'source "$WATCH_POLICY_SOURCE"',
           "prev_release_is_valid() { return 0; }",
           "is_true_dry() { return 1; }",
           'wlog() { echo "$*"; }',
           "write_grace() { :; }",
           "atomic_flip_live() { :; }",
-          restart,
-          tier1,
           "tier1_rollback",
         ].join("\n"),
         {
           PATH: `${bin}${path.delimiter}${process.env.PATH ?? "/usr/bin:/bin"}`,
           SYSTEMCTL_LOG: log,
+          WATCH_POLICY_SOURCE: watchScript,
+          OC_V5_RELEASE_POLICY_CONTEXT: path.join(dir, "policy", "unresolved.json"),
+          WATCH_LOCK: path.join(dir, "deploy.lock"),
+          WATCH_RUN_DIR: path.join(dir, "run"),
+          WATCH_MAINT: path.join(dir, "planned-maintenance"),
+          WATCH_GRACE: path.join(dir, "cutover-grace"),
+          WATCH_FAIL_COUNT: path.join(dir, "fail-count"),
+          WATCH_DISARM: path.join(dir, "watch-disarmed"),
+          WATCH_LOG: path.join(dir, "watch.log"),
+          WATCH_RESTORE: path.join(dir, "restore.sh"),
+          WATCH_BACKUP_CURRENT: path.join(dir, "unit-backups", "current"),
+          WATCH_MANUAL_RECOVERY: path.join(dir, "manual-recovery"),
+          WATCH_STATUS: path.join(dir, "watch-status"),
+          WATCH_NOTIFY_STATE: path.join(dir, "notify-state"),
+          WATCH_INSTALLED_BIN: watchScript,
+          WATCH_PG_BACKUP_STATUS: path.join(dir, "pg-backup-status.json"),
+          WATCH_DISK_PATH: dir,
+          WATCH_ALERT_BIN: "",
+          WATCH_MASTER_URL: "http://127.0.0.1:1/fixture-master",
+          WATCH_EGRESS_URL: "http://127.0.0.1:1/fixture-egress",
           SOCKET_STOP_RC: "5",
           WATCH_DRY: "0",
           WATCH_SKIP_ACTIONS: "0",
@@ -354,7 +375,7 @@ exit 0
         },
       );
       const logged = readFileSync(log, "utf8");
-      assert.notEqual(got.status, 0, `upper layer must propagate; status=${got.status} log=${logged}`);
+      assert.equal(got.status, 1, `egress failure must propagate through the protected entry; status=${got.status} log=${logged} err=${got.stderr}`);
       assert.match(logged, /stop --job-mode=ignore-dependencies openclaude-v5-selfhost-egress@A\.socket/);
       assert.doesNotMatch(logged, /stop --no-block /, `must not drain service after socket fail: ${logged}`);
       assert.doesNotMatch(logged, /restart openclaude-v5-selfhost\.service/, `must not restart master: ${logged}`);

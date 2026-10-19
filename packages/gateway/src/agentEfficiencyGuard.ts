@@ -64,6 +64,8 @@ export interface EfficiencySessionState {
   _efficiencyBudget?: VerificationBudget
   sessionKey?: string
   model?: string
+  /** Live engine id (for example `antigravity`). Absent keeps the generic Read/Grep/Glob wording. */
+  providerTag?: string
 }
 
 export const DEFAULT_VERIFICATION_BUDGET_MS = 15 * 60_000
@@ -216,7 +218,7 @@ export function hasEfficiencyEscape(command: string): boolean {
   return command.includes(EFFICIENCY_ESCAPE_TOKEN)
 }
 
-export function suggestAlternative(hit: LintHit): string {
+export function suggestAlternative(hit: LintHit, engine?: string): string {
   switch (hit.code) {
     case 'sleep_ge_60':
       return '替代: `nohup <长任务> >/tmp/oc-job.log 2>&1 & echo $!; tail -n 50 /tmp/oc-job.log`'
@@ -225,6 +227,9 @@ export function suggestAlternative(hit: LintHit): string {
     case 'heartbeat_loop':
       return '替代: 后台跑任务并 `tail` 日志,不要 `while true` + renew/heartbeat'
     case 'local_file_via_shell':
+      if (engine === 'antigravity') {
+        return '替代: MCP `oc_grep` / `oc_glob`（call_mcp_tool, ServerName `openclaude-memory`）读容器内文件;宿主文件才用 `host cat/rg`;长命令用 `oc_bash`'
+      }
       return '替代: 用原生 Read/Grep/Glob 读容器内文件;宿主文件才用 `host cat/rg`'
     case 'fable_direct_edit':
       return '替代: `delegate_task`/`oc-memory delegate --model grok-build --allow-self` 把写码交给 Grok Build'
@@ -233,7 +238,7 @@ export function suggestAlternative(hit: LintHit): string {
   }
 }
 
-export function lintBashCommand(command: string, mode: GuardMode = 'warn'): LintHit[] {
+export function lintBashCommand(command: string, mode: GuardMode = 'warn', engine?: string): LintHit[] {
   if (mode === 'off' || !command) return []
   const hits: LintHit[] = []
   const act = actionOf(mode)
@@ -289,8 +294,9 @@ export function lintBashCommand(command: string, mode: GuardMode = 'warn'): Lint
     hits.push({
       code: 'local_file_via_shell',
       action: act,
-      message:
-        `本容器内文件请用原生 Read/Grep/Glob,不要 \`${read[1].trim()}\` 隔空读。host 读宿主文件可以保留。`,
+      message: engine === 'antigravity'
+        ? `本容器内文件请用 MCP oc_grep / oc_glob（call_mcp_tool, ServerName openclaude-memory），不要 \`${read[1].trim()}\` 隔空读。宿主文件仍用 host。长命令用 oc_bash。`
+        : `本容器内文件请用原生 Read/Grep/Glob,不要 \`${read[1].trim()}\` 隔空读。host 读宿主文件可以保留。`,
     })
     break
   }
@@ -331,6 +337,7 @@ export function observeToolUse(
   tool: { name: string; input?: Record<string, unknown> },
   mode: GuardMode = 'warn',
   model?: string,
+  engine?: string,
 ): LintHit[] {
   if (mode === 'off') return []
   const hits: LintHit[] = []
@@ -339,7 +346,7 @@ export function observeToolUse(
 
   if (command) {
     state.bashCount++
-    hits.push(...lintBashCommand(command, mode))
+    hits.push(...lintBashCommand(command, mode, engine))
   }
 
   if (isEditWriteTool(tool) && isDesignFamilyModel(model)) {
@@ -523,7 +530,7 @@ export function applyEfficiencyToolObservation(
   if (mode === 'off') return []
   const state = (session._efficiencyTurn ??= createTurnGuardState())
   state.toolCount = toolCount
-  const hits = observeToolUse(state, tool, mode, session.model)
+  const hits = observeToolUse(state, tool, mode, session.model, session.providerTag)
   if (hits.length) {
     session._efficiencyPendingHits = [...(session._efficiencyPendingHits ?? []), ...hits]
   }

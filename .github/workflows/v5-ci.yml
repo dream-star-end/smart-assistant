@@ -151,6 +151,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install ripgrep (mcp-memory oc_grep / oc_glob)
+        if: ${{ matrix.name == 'storage' }}
+        run: command -v rg >/dev/null || (sudo apt-get update && sudo apt-get install -y --no-install-recommends ripgrep)
+
       - name: Run ${{ matrix.name }}
         env:
           TUTORIAL_HISTORY_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || '' }}

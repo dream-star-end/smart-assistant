@@ -456,6 +456,7 @@ export async function submit(
     modelSwitchInternal?: string
   },
 ): Promise<void> {
+  const submitStartedAt = performance.now()
   // Resolve/rebuild a warm legacy runner under the existing creation gate,
   // before taking the per-turn lock. Never change its durable session key.
   // prepareModelSwitch owns this runner while performing native compaction.
@@ -607,6 +608,7 @@ export async function submit(
   session._activeTurnCount = (session._activeTurnCount ?? 0) + 1
   try {
     await prev
+    log.info('turn_pipeline_timing', { traceId, stage: 'submit_lock_acquired', elapsedMs: performance.now() - submitStartedAt })
     if (opts?.modelSwitchInternal === undefined) await this.applyIdleResetIfRequested(session)
     const pendingIdle = readPendingIdle(paths.home, session.sessionKey)
     const idleCandidate = readIdleCandidate(paths.home, session.sessionKey)
@@ -724,6 +726,7 @@ export async function submit(
     // CCB process(env is read at fork); 后续 turn CCB 内部 trace 接收待 S11c
     // stdin JSON-RPC 扩展。Lock 保证 setTraceId 与并发 submit() 串行,不会
     // 跨 turn 互踩。
+    log.info('turn_pipeline_timing', { traceId, stage: 'memory_barrier_acquired', elapsedMs: performance.now() - submitStartedAt })
     if (traceId !== undefined) session.runner.setTraceId(traceId)
     // 市场使用信号(skillUsageReporter)读点:本 turn 的 canonical traceId 落到 session,
     // 供 tool.called(hub skill_view)上报方在 turn 执行期同步取到评分归因键。**无条件**
@@ -781,7 +784,7 @@ export async function submit(
       // 已让 runner 死,窗口期内不会产生新 metrics —— session.model 提前对齐安全。
       // 最后兜底用 glm-5.3-zai(平台默认、v5 合法的静态 key 模型)。
       // 不再硬编码 claude-opus-4-7 —— Claude 官方模型已下线,那会造出非法默认 → spawn 失败。
-      session.model = desiredModel ?? this.config.defaults.model ?? 'glm-5.3'
+      session.model = desiredModel ?? this.config.defaults.model ?? 'glm-5.3-zai'
     }
     if (toolsetsChanged) {
       maybeSetToolsets.call(session.runner, desiredToolsets)
@@ -1240,6 +1243,7 @@ export async function submit(
         }
       }, CHECK_INTERVAL)
     })
+    log.info('turn_pipeline_timing', { traceId, stage: 'context_ready', elapsedMs: performance.now() - submitStartedAt })
     logicalTurnRun = this.runOneTurnWithRetry(
       session,
       runnerPayload,
@@ -1446,6 +1450,7 @@ export async function _getOrCreateExclusive(
   const {
     promptQueueExecutionFence: _fence,
     modelSwitchId: _switchId,
+    preheatOnly: _preheatOnly,
     ...identityCreationOpts
   } = opts
   // Hermetic advisor/Auto-Dream sessions have no persona or identity overlay.
@@ -1495,6 +1500,9 @@ export async function _getOrCreateExclusive(
     )
   }
   let existing = this.sessions.get(opts.sessionKey)
+  // This runs under the creation gate. A late speculative lookup must not
+  // overwrite a real first turn that created its runner while projection awaited.
+  if (opts.preheatOnly && existing) return existing
   if (existing?._modelSwitchTransition) {
     const transition = existing._modelSwitchTransition
     if (

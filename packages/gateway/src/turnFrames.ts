@@ -240,6 +240,7 @@ export function _earlyRejectErrorFrames(args: {
     channel: args.channel,
     peer: args.peer,
     code: args.code,
+    recoveryDisposition: 'terminal',
     message: args.message,
     isFinal: false,
     traceId: args.traceId,

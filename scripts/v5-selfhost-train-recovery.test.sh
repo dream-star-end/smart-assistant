@@ -25,6 +25,11 @@ chmod 0755 "$BASE/bin/systemctl"
 install -m 0755 "$SURVIVOR_SRC" "$BASE/survivor.sh"
 
 {
+  # Load the production libraries before the existing observation-only stubs.
+  # This includes actual owner guards, terminal functions and JSON merge SQL.
+  printf 'SCRIPT_DIR=%q\n' "$DIR"
+  printf 'source %q\n' "$DIR/v5-lease-lib.sh"
+  printf 'source %q\n' "$DIR/lib/v5-selfhost-release-policy.sh"
   echo 'log() { echo "$*"; }'
   echo 'die() { echo "DIE $*"; exit 1; }'
   echo 'lease_now() { echo 2026-10-14T00:00:00Z; }'
@@ -35,25 +40,27 @@ install -m 0755 "$SURVIVOR_SRC" "$BASE/survivor.sh"
   echo 'lease_body_train_alert() { echo "BODY $1 $2 $3"; }'
   echo 'lease_outbox_sql() { echo "OUTBOX key=$1 subject=$2 kind=$3 target_kind=$4 target=$5 body=$6"; }'
   for f in cutover_clog cutover_survivor_script cutover_persist_phase cutover_disarm_survivor cutover_compensate \
-    deploy_alert lease_train_finish survivor_state_phase lease_train_alert_sql; do
+    deploy_alert; do
     body="$(fn_of "$DEPLOY" "$f")"
     [[ -n "$body" ]] || { echo "missing function $f" >&2; exit 1; }
     printf '%s\n' "$body"
   done
-  body="$(fn_of "$LEASE_LIB" lease_live_committed_sha)"
-  [[ -n "$body" ]] || { echo "missing lease_live_committed_sha" >&2; exit 1; }
-  printf '%s\n' "$body"
 } >"$BASE/fns.sh"
 
 setup() {
   C="$BASE/$1"
   mkdir -p "$C/watch" "$C/run" "$C/rel"
   export C PATH="$BASE/bin:$PATH"
+  export OC_V5_RELEASE_POLICY_CONTEXT="$C/run/release-policy/unresolved.json"
+  export OC_V5_LEASE_DB="$C/run/lease.db"
   export CUTOVER_LOG="$C/cutover.log" LEASE_SQL_LOG="$C/lease.sql"
   export SURVIVOR_STATE="$C/run/survivor.state" SURVIVOR_COMMITTED="$C/run/survivor.committed"
   export CUTOVER_SURVIVOR_SCRIPT="$BASE/survivor.sh" V5_WATCH_DIR="$C/watch"
   export MASTER_LIVE_LINK="$C/live" LEASE_LIVE_LINK="$C/live"
   export LEASE_SURVIVOR_STATE="$SURVIVOR_STATE"
+  export OC_V5_LEASE_LIVE_LINK="$C/live"
+  export OC_V5_LEASE_SURVIVOR_STATE="$SURVIVOR_STATE"
+  export OC_V5_LEASE_SURVIVOR_COMMITTED="$SURVIVOR_COMMITTED"
   unset FAKE_RIDE_TICKET
   printf '{"sourceCommit":"%s"}\n' "$(printf 'c%.0s' {1..40})" >"$C/rel/.complete"
   ln -sfn "$C/rel" "$C/live"

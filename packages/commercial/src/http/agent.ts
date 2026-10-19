@@ -1,3 +1,4 @@
+import { parseDraftPreparation } from '../agent-sandbox/draftPreparation.js';
 /**
  * T-53 — Agent 订阅 HTTP 路由。
  *
@@ -27,7 +28,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type Docker from "dockerode";
-import { HttpError, sendJson } from "./util.js";
+import { HttpError, readJsonBody, sendJson } from "./util.js";
 import { requireAuth } from "./auth.js";
 import {
   openAgentSubscription,
@@ -234,4 +235,23 @@ export async function handleAgentCancel(
     }
     throw err;
   }
+}
+
+/** Explicit POST: status GET remains read-only and legacy subscription open is never used. */
+export async function handleWorkspacePrepare(
+  req: IncomingMessage, res: ServerResponse, _ctx: RequestContext, deps: CommercialHttpDepsWithAgent,
+): Promise<void> {
+  const user = await requireAuth(req, deps.jwtSecret);
+  if (!deps.prepareWorkspaceContainer) {
+    sendJson(res, 202, { accepted: false });
+    return;
+  }
+  const body = await readJsonBody(req, 4 * 1024);
+  let draft: ReturnType<typeof parseDraftPreparation> | undefined;
+  if (body !== undefined) {
+    try { draft = parseDraftPreparation(body); }
+    catch { throw new HttpError(400, 'VALIDATION', 'invalid draft preparation'); }
+  }
+  const accepted = await deps.prepareWorkspaceContainer(BigInt(user.id), draft);
+  sendJson(res, 202, { accepted });
 }

@@ -132,13 +132,13 @@ export function TurnActivity({ info }: { info: TurnActivityInfo }) {
   if (recoveryKind === "stopping") {
     text = "正在停止…";
     cls = "stopping";
+  } else if (retry) {
+    // OCV5-523: all automatic recovery shares this activity row. Only a
+    // confirmed terminal failure becomes an error card.
+    text = "模型繁忙，正在重试…";
+    cls = "retrying";
   } else if (info.dispatch) {
     ({ text, cls } = dispatchActivityLabel(info.dispatch));
-  } else if (retry) {
-    // OCV5-390: a retry in progress is still just work in progress for the user; no "busy", no counter.
-    // The failure card appears only when the retries are used up.
-    text = "仍在处理中…";
-    cls = "retrying";
   } else if (
     (recoveryKind === "waiting-service" || recoveryKind === "retrying") &&
     !info.hasVisibleProcess

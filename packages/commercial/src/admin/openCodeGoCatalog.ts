@@ -244,6 +244,34 @@ const rows: Array<Omit<GoCatalogModel, 'upstreamModelId'>> = [
     sortOrder: 322,
     defaultEffort: null,
   },
+  // 2026-10-20 page (fetched 01:38 Taipei): paid Step 5 Preview and two limited-time free models.
+  {
+    modelId: 'step-5-preview-go',
+    displayName: 'Step 5 Preview (Go)',
+    contextWindow: 1_000_000,
+    supportsThinking: false,
+    usd: { input: '1.00', output: '2.70', cacheRead: '0.10', cacheWrite: null },
+    sortOrder: 329,
+    defaultEffort: null,
+  },
+  {
+    modelId: 'minimax-m3.1-flash-free-go',
+    displayName: 'MiniMax M3.1 Flash Free (Go)',
+    contextWindow: 1_000_000,
+    supportsThinking: false,
+    usd: { input: '0', output: '0', cacheRead: '0', cacheWrite: null },
+    sortOrder: 330,
+    defaultEffort: null,
+  },
+  {
+    modelId: 'beam-free-go',
+    displayName: 'Beam Free (Go)',
+    contextWindow: 1_048_576,
+    supportsThinking: false,
+    usd: { input: '0', output: '0', cacheRead: '0', cacheWrite: null },
+    sortOrder: 331,
+    defaultEffort: null,
+  },
   // Phase 3 (Responses bridge). Grok ≤200K and Luna ≤272K tiers: windows capped at the boundary.
   {
     modelId: 'opencode-grok-4.7',

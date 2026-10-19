@@ -627,11 +627,39 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect(chatLike.length).toBe(0)
   })
 
+  test('ordinary New prepares a memory draft then first send uses that exact identity and effective effort', async () => {
+    const sendSpy = vi.spyOn(ChatSocket.prototype, 'sendMessage')
+    fetchMock = routedFetch({
+      models: { models: [{ id: 'gpt-6.1-sol', display_name: 'GPT-6.1-Sol', supported_efforts: ['low', 'high'] }] },
+      preferences: { prefs: { default_model: 'gpt-6.1-sol', default_effort: 'high' } },
+    })
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    render(<App />)
+    await loginViaUi()
+    const drafts = () => fetchMock.mock.calls.filter(([url, init]) =>
+      String(url) === '/api/agent/prepare' && !!(init as RequestInit)?.body)
+      .map(([, init]) => JSON.parse(String((init as RequestInit).body)) as Record<string, unknown>)
+    await waitFor(() => expect(drafts().filter(h => !h.cancel).length).toBeGreaterThan(0))
+    const prepared = drafts().filter(h => !h.cancel).at(-1)!
+    expect(prepared).toMatchObject({ modelId: 'gpt-6.1-sol', effortLevel: 'high' })
+    expect(fetchMock.mock.calls.some(([url, init]) =>
+      /\/api\/sessions\/[^/]+$/.test(String(url)) && (init as RequestInit)?.method === 'PUT')).toBe(false)
+    fireEvent.click(screen.getAllByRole('button', { name: /新建会话/ })[0]!)
+    expect(drafts().filter(h => !h.cancel).at(-1)?.sessionId).toBe(prepared.sessionId)
+    const ta = await screen.findByPlaceholderText('和「全能助手」对话…')
+    fireEvent.change(ta, { target: { value: '你好' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    await waitFor(() => expect(sendSpy).toHaveBeenCalledWith(expect.objectContaining({
+      sessId: prepared.sessionId, model: prepared.modelId, effortLevel: prepared.effortLevel,
+    })))
+    expect(drafts().some(h => h.sessionId === prepared.sessionId && h.cancel === true)).toBe(true)
+  })
+
   test.each([false, true])('goal auto-start keeps its session/model when navigation during save=%s', async (navigate) => {
     const sendSpy = vi.spyOn(ChatSocket.prototype, 'sendMessage')
     let releaseSave!: () => void
     const saveGate = new Promise<void>((resolve) => { releaseSave = resolve })
-    const base = routedFetch()
+    const base = routedFetch({ preferences: { prefs: { default_effort: 'high' } } })
     const mutations: string[] = []
     const sessionBodies: Array<Record<string, unknown>> = []
     const patchBodies: Array<Record<string, unknown>> = []
@@ -731,6 +759,7 @@ describe('Aurora v5 skeleton — auth → workspace', () => {
     expect(sendSpy).toHaveBeenCalledWith(expect.objectContaining({
       sessId: decodeURIComponent(String(savedGoalUrl).split('/').at(-1)!),
       model: 'gpt-5.6-terra',
+      effortLevel: 'high',
       text: '先设目标再执行',
     }))
     // fc1219307 (INC-20260923-QUEUE-ABOVE-COMPOSER): a prompt the socket has not started yet is

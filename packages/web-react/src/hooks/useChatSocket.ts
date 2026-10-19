@@ -155,6 +155,7 @@ export type UseChatSocket = {
     timelineHasMore?: boolean;
     timelineSnapshotMaxSeq?: number;
     invalidateHistoryCache?: boolean;
+    automaticRecoveries?: import("@openclaude/protocol").AutomaticTurnRecoverySnapshot[];
     openDispatch?: {
       dispatchId: string;
       clientMessageId: string;
@@ -459,6 +460,7 @@ export function useChatSocket(opts: {
                 timelineSnapshotMaxSeq: detail.timelineSnapshotMaxSeq,
                 invalidateHistoryCache: detail._historyRevisionUnsupported === true,
                 openDispatch: detail.openDispatch,
+                automaticRecoveries: detail.automaticRecoveries,
                 permissionPrompts: detail.permissionPrompts,
               },
             );
@@ -498,6 +500,7 @@ export function useChatSocket(opts: {
                   timelineHasMore: tapeDetail.timelineHasMore,
                   timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
                   invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
+                  automaticRecoveries: tapeDetail.automaticRecoveries,
                   permissionPrompts: tapeDetail.permissionPrompts,
                 },
               );
@@ -831,6 +834,7 @@ export function useChatSocket(opts: {
         timelineSnapshotMaxSeq: p.timelineSnapshotMaxSeq,
         invalidateHistoryCache: p.invalidateHistoryCache,
         openDispatch: p.openDispatch,
+        automaticRecoveries: p.automaticRecoveries,
         permissionPrompts: p.permissionPrompts,
       });
       persistRef.current(p.sessId); // 合并后落地（含推进的 _maxSeq 游标 + 归档水位/计数）
@@ -879,6 +883,7 @@ export function useChatSocket(opts: {
               timelineCursor: tapeDetail.timelineCursor,
               timelineHasMore: tapeDetail.timelineHasMore,
               timelineSnapshotMaxSeq: tapeDetail.timelineSnapshotMaxSeq,
+              automaticRecoveries: tapeDetail.automaticRecoveries,
               invalidateHistoryCache: tapeDetail._historyRevisionUnsupported === true,
             },
           );

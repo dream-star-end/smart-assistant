@@ -15,6 +15,7 @@ delete process.env.OPENCLAUDE_VERIFICATION_BUDGET_MS
 
 const {
   lintBashCommand,
+  suggestAlternative,
   observeToolUse,
   createTurnGuardState,
   classifyUserEfficiencyIntent,
@@ -339,6 +340,38 @@ describe('session hook helpers + format', () => {
     assert.equal(resolveGuardMode(), 'deny')
     delete process.env.OPENCLAUDE_EFFICIENCY_GUARD
     assert.equal(resolveGuardMode(), 'warn')
+  })
+})
+
+describe('antigravity local-file wording', () => {
+  const sample = 'rg efficiency packages/gateway/src/promptSlots.ts'
+
+  it('points shell reads at oc_grep / oc_glob / oc_bash', () => {
+    const hits = lintBashCommand(sample, 'warn', 'antigravity')
+    const hit = hits.find((h) => h.code === 'local_file_via_shell')
+    assert.ok(hit)
+    assert.match(hit.message, /oc_grep/)
+    assert.match(hit.message, /oc_glob/)
+    assert.match(hit.message, /oc_bash/)
+    assert.match(suggestAlternative(hit, 'antigravity'), /oc_bash/)
+  })
+
+  it('keeps the native Read/Grep/Glob wording when engine is absent', () => {
+    const hits = lintBashCommand(sample)
+    const hit = hits.find((h) => h.code === 'local_file_via_shell')
+    assert.ok(hit)
+    assert.match(hit.message, /原生 Read\/Grep\/Glob/)
+    assert.equal(hit.message.includes('oc_grep'), false)
+  })
+
+  it('applyEfficiencyToolObservation follows providerTag', () => {
+    const agy: EfficiencySessionState = { providerTag: 'antigravity' }
+    applyEfficiencyToolObservation(agy, { name: 'Bash', input: { command: sample } }, 1)
+    assert.match(agy._efficiencyPendingHits?.[0]?.message ?? '', /oc_grep/)
+    const plain: EfficiencySessionState = {}
+    applyEfficiencyToolObservation(plain, { name: 'Bash', input: { command: sample } }, 1)
+    assert.match(plain._efficiencyPendingHits?.[0]?.message ?? '', /原生 Read\/Grep\/Glob/)
+    assert.equal((plain._efficiencyPendingHits?.[0]?.message ?? '').includes('oc_grep'), false)
   })
 })
 

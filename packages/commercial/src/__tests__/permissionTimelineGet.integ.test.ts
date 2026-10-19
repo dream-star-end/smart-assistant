@@ -91,6 +91,19 @@ before(async () => {
       stream_key TEXT,
       created_at TIMESTAMPTZ
     );
+    CREATE TABLE turn_recovery_jobs (
+      job_id TEXT PRIMARY KEY,
+      user_id BIGINT NOT NULL,
+      session_id TEXT NOT NULL,
+      source_client_message_id TEXT NOT NULL,
+      root_client_message_id TEXT NOT NULL,
+      request_json JSONB NOT NULL,
+      error_code TEXT NOT NULL,
+      recovery_mode TEXT NOT NULL,
+      semantic_recovery_attempt INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
     CREATE TABLE turn_permission_requests (
       user_id BIGINT NOT NULL,
       request_id TEXT NOT NULL,
@@ -189,6 +202,7 @@ describe('OCV5-185 timeline GET permission snapshot on borrowed client', () => {
       permissionLookupIds: ['req-cjk'],
     } as never)
     assert.ok(sess, 'session row must exist')
+    assert.deepEqual(sess.automaticRecoveries, [])
     assert.equal(borrowedConnects, 0)
     const snap = (sess as { permissionPrompts?: {
       completeness: string
@@ -219,6 +233,7 @@ describe('OCV5-185 timeline GET permission snapshot on borrowed client', () => {
       permissionLookupIds: ['req-pending'],
     } as never)
     assert.ok(partial)
+    assert.deepEqual(partial.automaticRecoveries, [])
     assert.equal(borrowedConnects, 0)
     const snap = (partial as { permissionPrompts?: {
       completeness: string

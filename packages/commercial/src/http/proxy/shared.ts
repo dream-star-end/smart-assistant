@@ -1,3 +1,5 @@
+import { encodeUpstreamRetryHint } from "@openclaude/protocol";
+import { parseRetryAfterMs } from "../../account-pool/policy/outcome.js";
 /**
  * V3 Phase 4(2026-05-18 anthropicProxy.ts 三层拆分 §4.5):shared leaf 模块。
  *
@@ -30,7 +32,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import type { Pool } from "pg";
-import { getStaticProvider, isBoxApiModel, type StaticProviderKeys } from "@openclaude/protocol";
+import { getStaticProvider, isBoxApiModel, staticRouteFallback, type StaticProviderKeys } from "@openclaude/protocol";
 
 import { type Logger } from "../../logging/logger.js";
 import {
@@ -73,7 +75,7 @@ export const DEFAULT_UPSTREAM_ENDPOINT = "https://api.anthropic.com/v1/messages"
 // @openclaude/protocol 的 STATIC_KEY_PROVIDERS 注册表(commercial+gateway 共享)。
 // 下面这些导出仅为**保护现有 caller**(anthropicProxy 测试 / DeepSeek Pro 直连路径)
 // 而保留的 thin re-export,值从注册表派生、与历史逐字节一致。新代码请直接用注册表。
-// 平台直连的 deepseek-v4-flash 任务请用 OPENCODE_GO_UPSTREAM_ENDPOINT,不要再用本 DeepSeek 端点。
+// 平台直连的 deepseek-v4-flash 任务请用 fetchPlatformFlash(OpenCode Go 优先，DeepSeek 官方回落)。
 
 /**
  * DeepSeek 的 anthropic 兼容端点。命中 `isDeepseekModel`(大小写敏感前缀)后切到这里,
@@ -88,8 +90,8 @@ export function isDeepseekModel(modelId: string): boolean {
 
 /**
  * OpenCode Go(Zen 网关 Go 档) anthropic 兼容端点。
- * 平台直连的 `deepseek-v4-flash` 任务(市场审核 / 语音润色 / 知识星球自动回复)走这里,
- * 与用户聊天同一条上游;不要再打 api.deepseek.com。
+ * 平台直连的 `deepseek-v4-flash` 任务(市场审核 / 语音润色 / 知识星球自动回复)经 fetchPlatformFlash
+ * 先走这里，与用户聊天同一条主上游。
  */
 export const OPENCODE_GO_UPSTREAM_ENDPOINT = getStaticProvider("opencodego").upstreamEndpoint;
 
@@ -105,6 +107,57 @@ export function openCodeGoAuthHeaders(
     "Content-Type": "application/json",
     Accept: accept,
   };
+}
+
+let platformFlashFallbackKey: string | undefined;
+
+/** OCV5-482:平台直连 flash 的回落 key(DEEPSEEK_API_KEY),master 启动时注入一次。 */
+export function setPlatformFlashFallbackKey(key: string | undefined): void {
+  platformFlashFallbackKey = key?.trim() ? key.trim() : undefined;
+}
+
+/**
+ * OCV5-482:平台直连 `deepseek-v4-flash`。OpenCode Go 优先;Go 无 key、网络失败或回 401/402/403/429/5xx
+ * (如周额度用尽)且有回落 key 时，同一请求改发 DeepSeek 官方(protocol staticRouteFallback)。
+ */
+export async function fetchPlatformFlash(
+  fetchImpl: (input: string, init: RequestInit) => Promise<Response>,
+  input: {
+    goKey?: string;
+    body: Record<string, unknown>;
+    accept?: string;
+    init: Omit<RequestInit, "method" | "headers" | "body">;
+  },
+): Promise<Response> {
+  const fallback = staticRouteFallback("opencodego", String(input.body.model ?? ""));
+  const fallbackKey = fallback ? platformFlashFallbackKey : undefined;
+  if (input.goKey) {
+    try {
+      const res = await fetchImpl(OPENCODE_GO_UPSTREAM_ENDPOINT, {
+        ...input.init,
+        method: "POST",
+        headers: openCodeGoAuthHeaders(input.goKey, input.accept),
+        body: JSON.stringify(input.body),
+      });
+      const unusable = res.status === 401 || res.status === 402 || res.status === 403
+        || res.status === 429 || res.status >= 500;
+      if (!fallbackKey || !unusable) return res;
+      await res.body?.cancel().catch(() => {});
+    } catch (err) {
+      if (!fallbackKey || input.init.signal?.aborted) throw err;
+    }
+  }
+  if (!fallback || !fallbackKey) throw new Error("platform flash: no usable upstream key");
+  return fetchImpl(getStaticProvider(fallback.providerId).upstreamEndpoint, {
+    ...input.init,
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${fallbackKey}`,
+      "Content-Type": "application/json",
+      Accept: input.accept ?? "application/json",
+    },
+    body: JSON.stringify({ ...input.body, model: fallback.upstreamModel }),
+  });
 }
 
 /** MiniMax Token Plan 的 Anthropic 兼容端点(完整 /v1/messages)。 */
@@ -1032,10 +1085,13 @@ interface SseEvent {
  */
 class UsageObserver {
   private buf = "";
+  private receivedAtMs: number | null = null;
+  firstTextAtMs: number | null = null;
   private latest: UsageObservation = { kind: "none" };
 
   /** 把 chunk 送进来(同时已经 byte-pass 给客户端)。 */
-  push(chunkText: string): void {
+  push(chunkText: string, receivedAtMs = Date.now()): void {
+    this.receivedAtMs = receivedAtMs;
     this.buf += chunkText;
     while (true) {
       const idx = this.findEventBoundary();
@@ -1074,13 +1130,26 @@ class UsageObserver {
   }
 
   private handleEvent(ev: SseEvent): void {
-    if (ev.event !== "message_start" && ev.event !== "message_delta") return;
+    const isUsage = ev.event === "message_start" || ev.event === "message_delta";
+    const observeText = this.firstTextAtMs === null &&
+      ["content_block_start", "content_block_delta", "message"].includes(ev.event);
+    if (!isUsage && !observeText) return;
     let parsed: unknown;
     try {
       parsed = JSON.parse(ev.data);
     } catch {
       return;
     }
+    if (this.firstTextAtMs === null && isObj(parsed)) {
+      const type = ev.event === "message" ? parsed.type : ev.event;
+      const block = type === "content_block_start" ? parsed.content_block : parsed.delta;
+      if (isObj(block) && ((type === "content_block_start" && block.type === "text") ||
+          (type === "content_block_delta" && block.type === "text_delta")) &&
+          typeof block.text === "string" && block.text.trim()) {
+        this.firstTextAtMs = this.receivedAtMs;
+      }
+    }
+    if (ev.event !== "message_start" && ev.event !== "message_delta") return;
     // message_start: { type, message: { ..., usage: {...}}}
     // message_delta: { type, delta:{...}, usage: {...}}
     const startUsage = ev.event === "message_start" ? extractUsageFromMessageStart(parsed) : null;
@@ -1165,6 +1234,8 @@ export interface PipeStreamResult {
   bytesOut: number;
   /** 第一字节 ms(performance.now / Date.now 相对值);未收到任何 chunk → null。 */
   firstByteAtMs: number | null;
+  /** First completed nonempty text event, at the chunk receipt boundary before backpressure. */
+  firstTextAtMs: number | null;
   /**
    * 中断/异常原因。null 表示流正常结束(EOF)。非 null 表示上游/下游中途断开,
    * 但 observation 仍然反映"已看到的部分 usage",caller 据此区分 partial vs aborted。
@@ -1201,7 +1272,8 @@ export async function pipeStreamWithUsageCapture(
         const { value, done } = await reader.read();
         if (done) break;
         if (!value || value.length === 0) continue;
-        if (firstByteAtMs === null) firstByteAtMs = Date.now();
+        const chunkReceivedAtMs = Date.now();
+        if (firstByteAtMs === null) firstByteAtMs = chunkReceivedAtMs;
         // 1) 字节透传 — write 失败 → 抛进外层 catch(下游已关连接)
         const wrote = res.write(value);
         bytesOut += value.length;
@@ -1224,7 +1296,7 @@ export async function pipeStreamWithUsageCapture(
         }
         // 2) 旁路 usage 提取(失败/异常都不影响 stream)
         try {
-          observer.push(decoder.decode(value, { stream: true }));
+          observer.push(decoder.decode(value, { stream: true }), chunkReceivedAtMs);
         } catch {
           // observer 内部解析失败不该传染主路径
         }
@@ -1237,7 +1309,7 @@ export async function pipeStreamWithUsageCapture(
     } catch {
       /* ignore */
     }
-    return { observation: observer.result(), bytesOut, firstByteAtMs, error };
+    return { observation: observer.result(), bytesOut, firstByteAtMs, firstTextAtMs: observer.firstTextAtMs, error };
   } finally {
     try {
       await reader.cancel();
@@ -1774,9 +1846,10 @@ export interface AnthropicProxyDeps {
   staticProviderKeys?: StaticProviderKeys;
   /**
    * OCV5-424:启用静态 provider 的 API-key 服务池(pool_api_keys,多 key + 共享策略)。
-   * production wiring 置 true;测试/外部 API-key proxy 不置 → 只用 env key(旧行为)。
+   * true enables all services; a service list limits pool use (ordinary egress: Go only).
+   * Tests/external proxies leave this unset to retain their static keys.
    */
-  apiKeyPoolEnabled?: boolean;
+  apiKeyPoolEnabled?: boolean | readonly string[];
   /**
    * 模型执行 catalog(模型权威批次 · 方案 §1.2/§4)。**注入 = 本进程参与 catalog 判定**。
    *
@@ -1955,6 +2028,13 @@ export function sendJsonError(
   if (res.headersSent) return;
   const errorBody: Record<string, unknown> = { code, message };
   if (extraErrorFields) Object.assign(errorBody, extraErrorFields);
+  if (status === 429) {
+    const retryAfter = Object.entries(extraHeaders ?? {}).find(([name]) => name.toLowerCase() === "retry-after")?.[1];
+    const now = Date.now();
+    const delay = parseRetryAfterMs(retryAfter, new Date(now));
+    const hint = delay === null ? undefined : encodeUpstreamRetryHint(Math.ceil(now + delay));
+    if (hint) errorBody.message = `${message} ${hint}`;
+  }
   const body = JSON.stringify({
     error: errorBody,
     request_id: requestId,

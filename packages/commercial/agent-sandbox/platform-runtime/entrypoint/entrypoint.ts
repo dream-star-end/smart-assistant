@@ -58,6 +58,7 @@ import { CODEX_ENGINE_MODELS } from "/opt/openclaude/packages/protocol/src/engin
 // fallback),platformBundle.ts 与本文件同目录同步 COPY/bundle,故 `./` 在两处都解析得到。
 // 该模块**不进 commercial tsc 编译图**(与 entrypoint.ts 同,靠 entrypointPlatform.test.ts 守护)。
 import {
+  createContainerBootTiming,
   assertVolumeAncestryNoSymlink,
   buildSeedAgent,
   decidePersonaWrite,
@@ -80,6 +81,10 @@ import {
 // 默认从文件位置沿父链找 node_modules,/usr/local/lib/openclaude/ 父链没 node_modules,
 // 直接 import "yaml" 会 MODULE_NOT_FOUND。createRequire 锚到 /opt/openclaude/package.json
 // 把 resolution 起点显式拉到工作区根。
+const bootTiming = createContainerBootTiming(fields => {
+  process.stdout.write(JSON.stringify({ msg: 'container_boot_timing', ...fields }).concat('\n'));
+});
+bootTiming('module_loaded');
 const requireFromOC = createRequire("/opt/openclaude/package.json");
 const YAML: typeof import("yaml") = requireFromOC("yaml");
 
@@ -199,6 +204,7 @@ function assertDirWithinVolume(dir: string, volumeRoot: string): void {
   }
 }
 
+bootTiming('seed_validated');
 // ───────────────────────────────────────────────
 // 1. 环境变量清洗
 // ───────────────────────────────────────────────
@@ -492,6 +498,7 @@ if ((process.env.OC_ENTRYPOINT_VALIDATE_ONLY || "").trim() === "1") {
 
 // Debian `/etc/profile` 会在 `bash -lc` 中重置 Dockerfile 注入的 PATH，导致 Codex
 // 看不到 `/run/oc/platform/current/bin`。用户 profile 会稳定把 `~/.local/bin` 加回
+bootTiming('env_ready');
 // PATH，因此为 platform-bundle 新增但镜像尚未内置的 CLI 安装保留名链接。
 // Cursor/Grok spawn 另钉 PATH=/usr/local/bin:/usr/bin:/bin 且不传 HOME，login shell
 // 的 ~/.profile 加不回去，所以同一批 CLI 还要在 /usr/local/bin 留指向 bundle 的只读软链。
@@ -612,6 +619,7 @@ try {
   );
 }
 
+bootTiming('cli_links_ready');
 // ── D2 持久化(2026-05-09): bootstrap 用户级 npm / pip 配置 ──
 // 目标:让用户在容器内的 npm install -g / pip install --user / pipx 行为
 // 跨容器重启保留(配 supervisor 5-volume 全套持久化)。
@@ -671,6 +679,7 @@ try {
   );
 }
 
+bootTiming('package_config_ready');
 // ── codex system skills seed(image_gen / document-writing 等内建 tool 必需)──
 // codex 0.125 把 image_gen 等内建工具实现成 `~/.codex/skills/.system/imagegen/`
 // system skill。codex CLI 启动时会 populate 这个目录,但实测耗时 1-2s,
@@ -726,6 +735,7 @@ try {
   );
 }
 
+bootTiming('codex_skills_ready');
 // ── (2) 平台自有 codex skill overlay(runtime hotcfg §2c)──
 // 镜像 codex 原生 skill(上面 skip-if-exists)之后,叠加 **bundle 里平台自有** 的 codex skill
 // (如 document-writing)。平台 skill 走 **hash 不一致即覆写**:平台更新版本时旧的 skip-if-exists
@@ -775,6 +785,7 @@ try {
   );
 }
 
+bootTiming('platform_overlay_ready');
 // ───────────────────────────────────────────────
 // 2. 个人版 openclaude.json 首次启动 bootstrap
 // ───────────────────────────────────────────────
@@ -1476,10 +1487,12 @@ try {
   console.error(`[entrypoint] WARN: 写 openclaude.json/agents.yaml 失败: ${(err as Error).message}`);
 }
 
+bootTiming('config_agents_ready');
 // ───────────────────────────────────────────────
 // 3. spawn npm run gateway + 信号转发 + 退出码透传
 // ───────────────────────────────────────────────
 
+bootTiming('gateway_spawn');
 const child = spawn("npm", ["run", "gateway"], {
   cwd: "/opt/openclaude",
   env: cleanEnv,

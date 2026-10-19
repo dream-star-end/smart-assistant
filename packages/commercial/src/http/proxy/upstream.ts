@@ -58,10 +58,12 @@ import {
   directEgressDispatcher,
 } from "../../account-pool/egressDispatcher.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
+import { getHealthDegradedProviders } from "../../admin/providerHealthGate.js";
 import type { SelectedApiKey } from "../../account-pool/apiKeyPool.js";
 import {
   findRouteProviderForModel,
   getStaticProvider,
+  staticRouteFallback,
   isOpenCodeGoChatUpstream,
   isOpenCodeGoResponsesUpstream,
   isOpenCodeGoFastUpstream,
@@ -355,6 +357,8 @@ export interface PreparedUpstreamSession {
   readonly endpoint: string;
   /** Exact, trusted static-provider transport selection, never a client flag. */
   readonly transport?: "gemini-go" | "openai-chat-go" | "openai-responses-go";
+  /** Static-key provider that serves this session (OCV5-482: may be the route's fallback). */
+  readonly providerId?: string;
   /**
    * **转发给上游的 model 名**(模型权威批次 §1.3)。
    *
@@ -479,6 +483,8 @@ export interface PickUpstreamDeps {
   apiKeyPoolHasMembers?: (service: string) => boolean;
   /** OAuth 上游 URL 覆盖;undefined → DEFAULT_UPSTREAM_ENDPOINT。测试 seam。 */
   upstreamEndpoint?: string;
+  /** OCV5-482: health-degraded static providers (test seam; default reads the provider health gate). */
+  healthDegradedProviders?: () => Promise<Set<string>>;
   /**
    * Dispatcher 工厂 test seam(同 Phase 2 recordHostRequest 模式)。
    * Production wiring **不**注入,upstream 层走默认 `getDispatcherForAccount`,
@@ -576,6 +582,7 @@ function makeStaticKeyUpstream(
     pinnedUserId: null,
     personaTimezone: null,
     endpoint: spec.upstreamEndpoint,
+    providerId: spec.id,
     ...(spec.id === "opencodego" && upstreamModel.toLowerCase() === "gemini-4-argon-contributor"
       ? { transport: "gemini-go" as const }
       : spec.id === "opencodego" && isOpenCodeGoChatUpstream(upstreamModel)
@@ -1028,6 +1035,12 @@ export async function pickUpstream(
       }
     }
     if (!pooled && deps.selectApiKey && deps.apiKeyPoolHasMembers?.(route.provider.id) === true) {
+      // OCV5-482:声明了回落上游的路由，本池暂无可用成员时由回落上游接手(池恢复后自动回主上游)。
+      const fallback = await pickStaticFallbackUpstream(deps, body, route, log, userId);
+      if (fallback) {
+        log.info("proxy_static_fallback", { provider: route.provider.id, fallback: fallback.providerId, reason: "pool_unavailable" });
+        return { ok: true, session: fallback };
+      }
       // 池里有成员但都不可用:env key 也已导入为池成员,回落它会绕过管理员停用与冷却。
       return {
         ok: false,
@@ -1076,6 +1089,51 @@ export async function pickUpstream(
       route.upstreamModel ?? body.model,
     ),
   };
+}
+
+/**
+ * OCV5-482: a session on the static route's declared fallback upstream (protocol staticRouteFallback),
+ * or null when none is declared, the fallback is health-degraded while the health gate is enforced,
+ * or the fallback has no usable key. Key rules match the primary: the fallback provider's pool first,
+ * its env key only when that pool has no members.
+ */
+export async function pickStaticFallbackUpstream(
+  deps: PickUpstreamDeps,
+  body: ProxyBody,
+  route: Extract<UpstreamRoute, { kind: "static" }>,
+  log: Logger,
+  userId?: bigint,
+): Promise<PreparedUpstreamSession | null> {
+  const fallback = staticRouteFallback(route.provider.id, route.upstreamModel ?? body.model);
+  if (!fallback) return null;
+  // Every fallback entry (empty primary pool, primary refusal) honours the same health gate as the primary.
+  if (process.env.OC_PROVIDER_HEALTH_ENFORCE === "1"
+    && (await (deps.healthDegradedProviders ?? getHealthDegradedProviders)()).has(fallback.providerId)) {
+    log.info("proxy_static_fallback_skipped", { provider: route.provider.id, fallback: fallback.providerId, reason: "fallback_degraded" });
+    return null;
+  }
+  const spec = getStaticProvider(fallback.providerId);
+  let pooled: SelectedApiKey | null = null;
+  if (deps.selectApiKey) {
+    try {
+      pooled = await deps.selectApiKey(
+        spec.id,
+        extractSessionId(body.metadata) ?? (userId !== undefined ? `u:${userId.toString()}` : randomUUID()),
+        userId,
+      );
+    } catch (err) {
+      log.warn("proxy_api_key_pool_select_failed", { provider: spec.id, err: errSummary(err) });
+    }
+  }
+  if (!pooled && deps.selectApiKey && deps.apiKeyPoolHasMembers?.(spec.id) === true) return null;
+  const apiKey = pooled?.apiKey ?? deps.staticProviderKeys?.[spec.id] ?? "";
+  if (!apiKey) return null;
+  return makeStaticKeyUpstream(
+    spec,
+    apiKey,
+    fallback.upstreamModel,
+    pooled ? { service: pooled.service, memberId: pooled.memberId } : null,
+  );
 }
 
 /** OAuth 订阅号层(原 pickUpstream 主体,OCV5-424 抽出以便接 API-key 层)。 */
