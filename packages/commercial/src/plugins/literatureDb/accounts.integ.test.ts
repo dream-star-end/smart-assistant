@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { after, before, beforeEach, test } from 'node:test'
+import { setImmediate as nextTurn } from 'node:timers/promises'
+import sharp from 'sharp'
 import { truncateAllForTest, useDedicatedTestDatabase } from '../../__tests__/helpers/db.js'
 import { revokeDeclarativeConnection } from '../../connectors/engine/binding.js'
 import { revokeConnection } from '../../connectors/store.js'
@@ -34,7 +36,10 @@ import {
 import { LITERATURE_PLUGIN_ARTIFACT } from './builtinArtifact.js'
 import { COMPILED_LITERATURE_PLUGIN, LITERATURE_PLUGIN_CONTRACT } from './builtinContract.js'
 import { sealLiteratureCredentials, serializeSealedLiteratureCredentials } from './credentials.js'
+import { LiteratureError } from './errors.js'
+import type { LiteratureLoginSession } from './login.js'
 import { LITERATURE_SITE } from './policy.js'
+import { LiteratureSetupService, type LiteratureSetupView } from './setupService.js'
 
 const db = useDedicatedTestDatabase('ocv5_literature_accounts_test')
 const env = { ...process.env, OPENCLAUDE_KMS_KEY: randomBytes(32).toString('base64') }
@@ -968,4 +973,242 @@ test('Cookie CAS is non-sliding and rejects altered or expired proof without a d
     code('SESSION_EXPIRED'),
   )
   assert.deepEqual(await snapshot(row.id), unchanged)
+})
+
+async function fixtureLoginSession(
+  outcome: 'authenticated' | 'credentials_invalid' = 'authenticated',
+): Promise<LiteratureLoginSession> {
+  const data = await sharp({ create: { width: 47, height: 20, channels: 3, background: 'white' } })
+    .png()
+    .toBuffer()
+  return {
+    challenge: async () => ({ data, mediaType: 'image/png' }),
+    submit: async () => outcome,
+    probe: async () => outcome === 'authenticated',
+    snapshot: async () => state('service-synthetic-cookie'),
+    close: async () => {},
+  }
+}
+const syntheticReader = () => [
+  {
+    provider: 'local-ocr' as const,
+    model: 'ddddocr',
+    usageApproved: true,
+    recognize: async () => '1234',
+  },
+]
+async function untilSetup(
+  service: LiteratureSetupService,
+  userId: number,
+  id: string,
+  expected: LiteratureSetupView['status'],
+) {
+  for (let n = 0; n < 200; n++) {
+    const view = await service.status(userId, id)
+    if (view.status === expected) return view
+    if (!['running', 'manual_required'].includes(view.status))
+      assert.fail(`Unexpected synthetic setup terminal ${view.status}/${view.errorCode}`)
+    await nextTurn()
+  }
+  assert.fail('Synthetic setup did not reach its expected state')
+}
+function syntheticLeaseRedis() {
+  const values = new Map<string, string | number>()
+  return {
+    async eval(script: string, _keys: number, ...args: Array<string | number>) {
+      const key = String(args[0])
+      const token = args[1]!
+      if (script.includes("'NX'")) {
+        if (values.has(key)) return 0
+        values.set(key, token)
+        return 1
+      }
+      if (values.get(key) !== token) return 0
+      if (script.includes("'DEL'")) values.delete(key)
+      return 1
+    },
+  }
+}
+
+test('private setup runs through a real encrypted bind and exposes no submitted credentials', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await ready()
+  const service = new LiteratureSetupService({
+    pool: getPool(),
+    env,
+    readers: syntheticReader,
+    createSession: () => fixtureLoginSession(),
+  })
+  t.after(() => service.close())
+  const started = await service.start(f.a, { ...password(), acceptTerms: true })
+  const view = await untilSetup(service, f.a, started.operationId, 'authenticated')
+  assert(view.accountId)
+  assert.equal(view.agentReady, false)
+  assert.equal(view.automaticSubmissions, 1)
+  const row = await readRow(view.accountId, f.a)
+  assert.deepEqual(
+    decryptLiteratureHttpAccountCredentials(row, f.verified.contract, env),
+    password(),
+  )
+  assert.equal(
+    decryptLiteratureHttpAccountEnvelope(row, f.verified.contract, env).storageState.cookies[0]
+      .value,
+    'service-synthetic-cookie',
+  )
+  const serialized = JSON.stringify({ started, view, rowMeta: row.meta })
+  for (const secret of [password().username, password().password, 'service-synthetic-cookie'])
+    assert(!serialized.includes(secret))
+  for (const action of [
+    () => service.status(f.b, started.operationId),
+    () => service.cancel(f.b, started.operationId),
+    () => service.image(f.b, started.operationId, randomUUID()),
+    () => service.answer(f.b, started.operationId, randomUUID(), '1234'),
+  ])
+    await assert.rejects(
+      action,
+      (e: unknown) => e instanceof LiteratureError && e.code === 'NOT_FOUND',
+    )
+  await revokePluginAccountFenced({ row, runner: getPool() })
+  assert.equal((await service.status(f.a, started.operationId)).status, 'failed')
+  assert.equal((await service.cancel(f.a, started.operationId)).status, 'failed')
+})
+
+test('manual setup image is owner-bound and an answer is consumed exactly once before saving', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await ready()
+  let submitted = 0
+  const service = new LiteratureSetupService({
+    pool: getPool(),
+    env,
+    createSession: async () => {
+      const session = await fixtureLoginSession()
+      return {
+        ...session,
+        submit: async () => {
+          submitted++
+          return 'authenticated'
+        },
+      }
+    },
+  })
+  t.after(() => service.close())
+  const started = await service.start(f.a, { ...password(), acceptTerms: true })
+  const manual = await untilSetup(service, f.a, started.operationId, 'manual_required')
+  assert.equal(manual.automaticSubmissions, 0)
+  assert(manual.challengeId)
+  assert.equal(
+    (await service.image(f.a, manual.operationId, manual.challengeId)).mediaType,
+    'image/png',
+  )
+  await assert.rejects(
+    () => service.image(f.b, manual.operationId, manual.challengeId!),
+    (e: unknown) => e instanceof LiteratureError && e.code === 'NOT_FOUND',
+  )
+  await service.answer(f.a, manual.operationId, manual.challengeId, '1234')
+  await assert.rejects(
+    () => service.answer(f.a, manual.operationId, manual.challengeId!, '1234'),
+    (e: unknown) => e instanceof LiteratureError && e.code === 'CHALLENGE_STALE',
+  )
+  await untilSetup(service, f.a, manual.operationId, 'authenticated')
+  assert.equal(submitted, 1)
+})
+
+test('failed relink and cancelled manual relink leave the old encrypted account unchanged', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await passwordAccount()
+  const before = await snapshot(f.row.id)
+  const failed = new LiteratureSetupService({
+    pool: getPool(),
+    env,
+    redis: syntheticLeaseRedis(),
+    readers: syntheticReader,
+    createSession: () => fixtureLoginSession('credentials_invalid'),
+  })
+  t.after(() => failed.close())
+  const first = await failed.start(f.a, {
+    ...password('new-but-failed'),
+    acceptTerms: true,
+    accountId: f.row.id,
+  })
+  const result = await untilSetup(failed, f.a, first.operationId, 'failed')
+  assert.equal(result.errorCode, 'CREDENTIALS_INVALID')
+  assert.deepEqual(await snapshot(f.row.id), before)
+  const cancelled = new LiteratureSetupService({
+    pool: getPool(),
+    env,
+    redis: syntheticLeaseRedis(),
+    createSession: () => fixtureLoginSession(),
+  })
+  t.after(() => cancelled.close())
+  const second = await cancelled.start(f.a, {
+    ...password('not-saved'),
+    acceptTerms: true,
+    accountId: f.row.id,
+  })
+  await untilSetup(cancelled, f.a, second.operationId, 'manual_required')
+  assert.equal((await cancelled.cancel(f.a, second.operationId)).status, 'cancelled')
+  assert.deepEqual(await snapshot(f.row.id), before)
+})
+
+test('expired account can privately relink into a new instance with fresh proof and newly sealed password', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await passwordAccount()
+  const old = decryptLiteratureHttpAccountEnvelope(f.row, f.verified.contract, env)
+  t.mock.method(Date, 'now', () => old.sessionExpiresAt)
+  const service = new LiteratureSetupService({
+    pool: getPool(),
+    env,
+    redis: syntheticLeaseRedis(),
+    readers: syntheticReader,
+    createSession: () => fixtureLoginSession(),
+  })
+  t.after(() => service.close())
+  const start = await service.start(f.a, {
+    ...password('fresh-private-password'),
+    acceptTerms: true,
+    accountId: f.row.id,
+  })
+  const result = await untilSetup(service, f.a, start.operationId, 'authenticated')
+  assert.equal(result.accountId, f.row.id)
+  const row = await readRow(f.row.id, f.a)
+  const current = decryptLiteratureHttpAccountEnvelope(row, f.verified.contract, env)
+  assert.notEqual(current.accountInstanceId, old.accountInstanceId)
+  assert.equal(current.sessionVerifiedAt, old.sessionExpiresAt)
+  assert.equal(current.sessionExpiresAt - current.sessionVerifiedAt, LITERATURE_SESSION_MAX_MS)
+  assert.deepEqual(
+    decryptLiteratureHttpAccountCredentials(row, f.verified.contract, env),
+    password('fresh-private-password'),
+  )
+})
+
+test('withdrawn installation cancels the private session before a manual answer can be sent', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await ready()
+  let submitted = 0
+  let closed = 0
+  const service = new LiteratureSetupService({
+    pool: getPool(),
+    env,
+    createSession: async () => {
+      const session = await fixtureLoginSession()
+      return {
+        ...session,
+        submit: async () => {
+          submitted++
+          return 'authenticated'
+        },
+        close: async () => {
+          closed++
+        },
+      }
+    },
+  })
+  t.after(() => service.close())
+  const start = await service.start(f.a, { ...password(), acceptTerms: true })
+  const manual = await untilSetup(service, f.a, start.operationId, 'manual_required')
+  await recordUninstall(f.a, 'literature-db')
+  await assert.rejects(() => service.answer(f.a, start.operationId, manual.challengeId!, '1234'))
+  assert.equal((await service.cancel(f.a, start.operationId)).status, 'cancelled')
+  assert.equal(submitted, 0)
+  assert.equal(closed, 1)
 })

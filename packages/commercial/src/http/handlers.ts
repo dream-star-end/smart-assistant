@@ -1,3 +1,4 @@
+import type { LiteratureSetupService } from '../plugins/literatureDb/setupService.js'
 /**
  * T-16 — /api/auth/* + /api/me 业务 handler 函数。
  *
@@ -120,6 +121,7 @@ import type { GoalStateService } from '../goal/goalStateService.js'
 import type { MediaGenerationService } from '../media-generation/service.js'
 
 export interface CommercialHttpDeps {
+  literatureSetup?: LiteratureSetupService
   jwtSecret: string | Uint8Array;
   /** Durable local H3 jobs and long-form storyboard projects. */
   mediaGeneration?: MediaGenerationService;

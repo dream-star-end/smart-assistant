@@ -647,3 +647,22 @@ export function effectiveDisabledOf(snap: unknown, local: readonly LocalPlugin[]
   for (const p of local ?? []) if (p.enabled === false) out.add(p.name);
   return out;
 }
+
+
+export interface LiteratureSetupCapability {
+  available: boolean
+  reasonCode: string | null
+  maxAutomaticSubmissions: number
+  maxStartsPerHour: number
+  operationTtlMs: number
+}
+export interface LiteratureSetupView {
+  operationId: string
+  status: 'running' | 'manual_required' | 'authenticated' | 'failed' | 'cancelled' | 'expired'
+  automaticSubmissions: number
+  challengeId?: string
+  challengeExpiresAt?: number
+  errorCode?: string
+  accountId?: string
+  agentReady: boolean
+}

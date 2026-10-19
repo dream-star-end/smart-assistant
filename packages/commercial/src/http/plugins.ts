@@ -1,4 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { LiteratureSetupService } from '../plugins/literatureDb/setupService.js'
+import { dispatchLiteratureSetup } from './literatureSetup.js'
 
 import { PluginAccountLeaseError } from '../plugins/accountLease.js'
 import { PluginAccountError } from '../plugins/accounts.js'
@@ -21,6 +23,7 @@ import type { CommercialHttpDeps, RequestContext } from './handlers.js'
 import { HttpError, readJsonBody, sendJson } from './util.js'
 
 export interface PluginHttpDeps {
+  literatureSetup?: LiteratureSetupService
   pluginRuntime?: PluginRuntimeFacade
   knowledgePlanetSetup?: KnowledgePlanetSetupManager
   weiboSetup?: WeiboSetupManager
@@ -233,6 +236,11 @@ export async function dispatchPluginsRoute(
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'x.invalid'}`)
   const path = url.pathname
   const method = req.method ?? 'GET'
+
+  if (path === '/api/plugins/literature-db/setup' || path.startsWith('/api/plugins/literature-db/setup/')) {
+    await dispatchLiteratureSetup(req, res, userId, deps.literatureSetup, path)
+    return
+  }
 
   if (method === 'GET' && (path === '/api/plugins' || path === '/api/plugins/management')) {
     sendJson(res, 200, await runtime(deps).management(userId))

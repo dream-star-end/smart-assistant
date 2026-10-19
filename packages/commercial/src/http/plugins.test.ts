@@ -661,3 +661,135 @@ describe('Plugin management HTTP dispatcher', () => {
     )
   })
 })
+
+describe('private literature setup routes', () => {
+  test('Bearer authentication and availability are checked before reading credentials', async () => {
+    const req = await request('POST', '/api/plugins/literature-db/setup', {
+      username: 'synthetic',
+      password: 'synthetic-private',
+    })
+    Reflect.deleteProperty(req.headers, 'authorization')
+    await assert.rejects(
+      dispatchPluginsRoute(req, response(), {} as any, deps()),
+      (e: unknown) => e instanceof HttpError && e.status === 401,
+    )
+    assert.equal(req.readableDidRead, false)
+    const unavailable = await request('POST', '/api/plugins/literature-db/setup', {
+      password: 'synthetic-private',
+    })
+    await assert.rejects(
+      dispatchPluginsRoute(unavailable, response(), {} as any, deps()),
+      (e: unknown) => e instanceof HttpError && e.status === 503,
+    )
+    assert.equal(unavailable.readableDidRead, false)
+  })
+  test('fixed JSON schema rejects unsupported type, oversized body and authority fields', async () => {
+    let starts = 0
+    const dependency = deps({
+      literatureSetup: {
+        assertAvailable: async () => {},
+        start: async () => {
+          starts++
+        },
+      },
+    })
+    for (const [input, contentType, status] of [
+      [{ username: 'fixture', password: 'fixture', acceptTerms: true }, 'text/plain', 415],
+      [
+        { username: 'fixture', password: 'x'.repeat(9000), acceptTerms: true },
+        'application/json',
+        413,
+      ],
+      [
+        { username: 'fixture', password: 'fixture', acceptTerms: true, userId: 99 },
+        'application/json',
+        400,
+      ],
+      [
+        {
+          username: 'fixture',
+          password: 'fixture',
+          acceptTerms: true,
+          sessionExpiresAt: Date.now() + 1,
+        },
+        'application/json',
+        400,
+      ],
+    ] as const) {
+      const req = await request('POST', '/api/plugins/literature-db/setup', input)
+      req.headers['content-type'] = contentType
+      await assert.rejects(
+        dispatchPluginsRoute(req, response(), {} as any, dependency),
+        (e: unknown) => e instanceof HttpError && e.status === status,
+      )
+    }
+    assert.equal(starts, 0)
+  })
+  test('private form uses server identity, and image responses stay authenticated and uncached', async () => {
+    const req = await request('POST', '/api/plugins/literature-db/setup', {
+      username: 'fixture',
+      password: 'fixture',
+      acceptTerms: true,
+      accountId: '7',
+    })
+    req.headers['content-type'] = 'application/json; charset=utf-8'
+    let captured: unknown
+    const res = response()
+    const dependency = deps({
+      literatureSetup: {
+        assertAvailable: async () => {},
+        start: async (userId: number, input: unknown) => {
+          captured = { userId, input }
+          return { operationId: SESSION, status: 'running', agentReady: false }
+        },
+        image: async (userId: number, operationId: string, challengeId: string) => {
+          assert.deepEqual([userId, operationId, challengeId], [42, SESSION, SESSION])
+          return { mediaType: 'image/png', data: Buffer.from('synthetic-png') }
+        },
+      },
+    })
+    await dispatchPluginsRoute(req, res, {} as any, dependency)
+    assert.deepEqual(captured, {
+      userId: 42,
+      input: { username: 'fixture', password: 'fixture', acceptTerms: true, accountId: '7' },
+    })
+    assert.equal(res.statusCode, 202)
+    const png = response()
+    await dispatchPluginsRoute(
+      await request(
+        'GET',
+        `/api/plugins/literature-db/setup/${SESSION}/challenges/${SESSION}/image`,
+      ),
+      png,
+      {} as any,
+      dependency,
+    )
+    assert.equal(png.headers.get('cache-control'), 'no-store, private')
+    assert.equal(png.headers.get('x-content-type-options'), 'nosniff')
+    assert.equal(png.headers.get('content-length'), String(png.bytes.length))
+  })
+  test('unexpected upstream errors are replaced before HTTP logging or response construction', async () => {
+    const privateValue = 'synthetic-private-upstream-content'
+    const req = await request('GET', '/api/plugins/literature-db/setup')
+    await assert.rejects(
+      dispatchPluginsRoute(
+        req,
+        response(),
+        {} as any,
+        deps({
+          literatureSetup: {
+            capability: async () => {
+              throw new Error(privateValue)
+            },
+          },
+        }),
+      ),
+      (e: unknown) => {
+        assert(e instanceof HttpError)
+        assert.equal(e.status, 500)
+        assert(!JSON.stringify({ message: e.message, ...e }).includes(privateValue))
+        return true
+      },
+    )
+  })
+})

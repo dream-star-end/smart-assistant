@@ -579,6 +579,7 @@ import { KnowledgePlanetAutomationService } from './plugins/knowledgePlanetAutom
 import { startKnowledgePlanetAutomationScheduler } from './plugins/knowledgePlanetAutomationScheduler.js'
 import { WeiboDockerService, createWeiboRuntimeRegistries } from './plugins/weibo.js'
 import { WeiboSetupManager } from './plugins/weiboSetup.js'
+import { LiteratureSetupService } from './plugins/literatureDb/setupService.js'
 import { ZhihuDockerService, createZhihuRuntimeRegistries } from './plugins/zhihu.js'
 import { ZhihuSetupManager } from './plugins/zhihuSetup.js'
 import {
@@ -1703,6 +1704,7 @@ export async function registerCommercial(
   let biliAccountService: BiliAccountDockerService | undefined
   let biliAccountSetup: BiliAccountSetupManager | undefined
   let knowledgePlanetAutomation: KnowledgePlanetAutomationService | undefined
+  const literatureSetup = new LiteratureSetupService({ redis })
   let pluginFacade: PluginRuntimeFacade
   if (runtimeChannel === 'v5' && cfg.OC_RUNTIME_IMAGE_ID) {
     const pluginDocker = cfg.AGENT_DOCKER_SOCKET
@@ -4334,6 +4336,7 @@ export async function registerCommercial(
     pluginRuntime: pluginFacade,
     knowledgePlanetSetup,
     weiboSetup,
+    literatureSetup,
     zhihuSetup,
     biliAccountSetup,
     knowledgePlanetAutomation,
@@ -7110,9 +7113,10 @@ export async function registerCommercial(
       try { await cursorExternalRoute?.close(); } catch { /* ignore */ }
       // Managed setup/action workers must drain while PG/Redis and Docker control are alive.
       try {
-        await Promise.all([
+        await Promise.allSettled([
           knowledgePlanetSetup?.closeAndDrain(),
           weiboSetup?.closeAndDrain(),
+          literatureSetup.close(),
           zhihuSetup?.closeAndDrain(),
           biliAccountSetup?.closeAndDrain(),
         ])
