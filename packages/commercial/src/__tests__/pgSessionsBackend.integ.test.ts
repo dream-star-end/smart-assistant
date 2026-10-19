@@ -6822,7 +6822,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     const dispatch = { dispatchId: sourceAdmission.dispatch.dispatchId,
       attemptNo: sourceAdmission.dispatch.attemptNo };
     for (const part of tape.parts) {
-      await backend.stageLosslessTurnTapePart(CUSER, { ...part.request, ...dispatch }, part.bytes);
+      await backend.stageLosslessTurnTapePart(CUSER, part.request, part.bytes, dispatch);
     }
     const finalize = { ...tape.finalize, ...dispatch };
     await backend.finalizeLosslessTurnTape(CUSER, {
