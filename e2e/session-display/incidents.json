@@ -7691,6 +7691,9 @@
           "path": "scripts/check-v5-box-success-recovery.ts",
           "assertion": "[ocv5-527-step-chat] PASS — stable Step pricing identity selects the current chat upstream for static and catalog routes"
         }
+      ],
+      "coverageCommits": [
+        "3b43dee6"
       ]
     }
   ]
