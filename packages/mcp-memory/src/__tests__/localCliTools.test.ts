@@ -11,6 +11,9 @@ import {
   handleOcBash,
   handleOcGlob,
   handleOcGrep,
+  isLocalCliToolEnabled,
+  isLocalCliToolName,
+  LOCAL_CLI_TOOL_NAMES,
   OC_BASH_MAX_TIMEOUT_MS,
   OC_BASH_MIN_TIMEOUT_MS,
   ocGlobArgv,
@@ -115,5 +118,19 @@ describe('oc_grep / oc_glob', () => {
     const globbed = await handleOcGlob({ pattern: '*.ts' }, { rgBin: null })
     assert.equal(globbed.isError, true)
     assert.match(globbed.content[0]!.text, /找不到 rg/)
+  })
+})
+
+describe('isLocalCliToolEnabled', () => {
+  it('is true only for the antigravity engine id', () => {
+    assert.equal(isLocalCliToolEnabled('antigravity'), true)
+    for (const engine of ['', 'grok', 'cursor', 'ccb', 'codex', 'Antigravity']) {
+      assert.equal(isLocalCliToolEnabled(engine), false, JSON.stringify(engine))
+    }
+    assert.deepEqual([...LOCAL_CLI_TOOL_NAMES], ['oc_bash', 'oc_grep', 'oc_glob'])
+    assert.equal(isLocalCliToolName('oc_bash'), true)
+    assert.equal(isLocalCliToolName('oc_grep'), true)
+    assert.equal(isLocalCliToolName('oc_glob'), true)
+    assert.equal(isLocalCliToolName('skill_list'), false)
   })
 })

@@ -8,6 +8,9 @@
  * pattern is never interpolated into a shell.
  *
  * A stdio MCP server handles one request at a time, so the timeout is capped.
+ * index.ts lists and dispatches these tools only when isLocalCliToolEnabled
+ * is true (OPENCLAUDE_ENGINE=antigravity). Other engines keep their native
+ * shell so this path cannot bypass PreToolUse.
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 import { constants as fsConstants } from 'node:fs'
@@ -22,6 +25,22 @@ export const OC_GREP_DEFAULT_MAX_MATCHES = 80
 export const OC_GREP_MAX_MATCHES = 200
 export const OC_GLOB_DEFAULT_MAX_RESULTS = 200
 export const OC_GLOB_MAX_RESULTS = 500
+
+/** Names gated by isLocalCliToolEnabled. Keep in lockstep with toolDefs. */
+export const LOCAL_CLI_TOOL_NAMES = ['oc_bash', 'oc_grep', 'oc_glob'] as const
+
+export type LocalCliToolName = (typeof LOCAL_CLI_TOOL_NAMES)[number]
+
+const LOCAL_CLI_TOOL_NAME_SET: ReadonlySet<string> = new Set(LOCAL_CLI_TOOL_NAMES)
+
+export function isLocalCliToolName(name: string): name is LocalCliToolName {
+  return LOCAL_CLI_TOOL_NAME_SET.has(name)
+}
+
+/** True only for the already-normalized engine id `antigravity`. */
+export function isLocalCliToolEnabled(engineId: string): boolean {
+  return engineId === 'antigravity'
+}
 
 const RG_CANDIDATES = ['/usr/bin/rg', '/usr/local/bin/rg', '/run/oc/platform/current/bin/rg']
 const KILL_GRACE_MS = 400
