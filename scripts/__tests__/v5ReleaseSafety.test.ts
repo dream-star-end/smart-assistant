@@ -7227,9 +7227,10 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
       'reclaim 必须能在 recovery marker 存在时照跑',
     )
 
+    // Ordinary writes retain the marker fence; exact confirmed-impact N1 is the approved exception.
     assert.match(
       source,
-      /if \[\[ "\$MODE" != "recover" \]\] && ! ssh "\$KL_HOST" "test ! -e '\$DEPLOY_RECOVERY_MARKER'"/,
+      /if \[\[ "\$MODE" != "recover" && "\$policy_rollback" != 1 \]\] && ! ssh "\$KL_HOST" "test ! -e '\$DEPLOY_RECOVERY_MARKER'"/,
     )
     const recover = source.match(/^recover\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? ''
     assert.match(recover, /stable\)[\s\S]*smoke "\$ACTIVE_PORT"[\s\S]*clear_deploy_recovery_marker_after_stable_recover/)
