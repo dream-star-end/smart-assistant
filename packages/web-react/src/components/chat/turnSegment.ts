@@ -347,7 +347,8 @@ export function projectVisibleAssistantRows(messages: ChatMessage[],
   });
   const projected = messages.slice();
   const hidden = new Set<number>();
-  const latestMetadata = new Map<number, number>();
+  const latestUsage = new Map<number, number>();
+  const latestTruncation = new Map<number, number>();
   messages.forEach((message, index) => {
     if (message.role !== "assistant" || !message.text.trim() || hasVisibleAssistantContent(message.text) ||
       message._errorCode || message.error || message._payloadDeferred || message._turnStatusRecord ||
@@ -357,16 +358,25 @@ export function projectVisibleAssistantRows(messages: ChatMessage[],
     if (answerIndex === undefined) return;
     hidden.add(index);
     if (!followsInTimeline(message, index, messages[answerIndex]!, answerIndex)) return;
-    if (!message.usage && !message._truncated) return;
-    const previous = latestMetadata.get(answerIndex);
-    if (previous !== undefined && !followsInTimeline(message, index, messages[previous]!, previous)) return;
-    latestMetadata.set(answerIndex, index);
-    const answer = projected[answerIndex]!;
-    projected[answerIndex] = {
-      ...answer,
-      ...(message.usage ? { usage: { ...answer.usage, ...message.usage } } : {}),
-      ...(message._truncated ? { _truncated: message._truncated } : {}),
-    };
+    if (message.usage) {
+      const previous = latestUsage.get(answerIndex);
+      if (previous === undefined || followsInTimeline(message, index, messages[previous]!, previous)) {
+        latestUsage.set(answerIndex, index);
+      }
+    }
+    if (message._truncated) {
+      const previous = latestTruncation.get(answerIndex);
+      if (previous === undefined || followsInTimeline(message, index, messages[previous]!, previous)) {
+        latestTruncation.set(answerIndex, index);
+      }
+    }
   });
+  for (const [answerIndex, sourceIndex] of latestUsage) {
+    const answer = projected[answerIndex]!;
+    projected[answerIndex] = { ...answer, usage: { ...answer.usage, ...messages[sourceIndex]!.usage } };
+  }
+  for (const [answerIndex, sourceIndex] of latestTruncation) {
+    projected[answerIndex] = { ...projected[answerIndex]!, _truncated: messages[sourceIndex]!._truncated };
+  }
   return projected.filter((_, index) => !hidden.has(index));
 }

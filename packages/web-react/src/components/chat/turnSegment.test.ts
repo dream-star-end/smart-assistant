@@ -392,3 +392,16 @@ test("OCV5-525: recovery lineage keeps one visible answer and the child's termin
   expect(projected.filter((m) => m.role === "assistant")).toHaveLength(1);
   expect(projected[1]?.usage?.costCredits).toBe("583");
 });
+
+test("OCV5-525: late truncation and earlier charge snapshots transfer independently in shuffled history", () => {
+  const owner = { _clientMessageId: "u525" };
+  const user = mk("user", { id: "u525" });
+  const answer = mk("assistant", { ...owner, text: "总结", _orderSeq: 1 });
+  const truncation = mk("assistant", { ...owner, text: '```ui\n{"type":"next","text":"通过"}\n```', _orderSeq: 3, _truncated: "pause_turn" });
+  const charge = mk("assistant", { ...owner, text: '```ui\n{"type":"next","text":"通过"}\n```', _orderSeq: 2, usage: { costCredits: "583", traceId: "t" } });
+  for (const controls of [[truncation, charge], [charge, truncation]]) {
+    const projected = projectVisibleAssistantRows([user, answer, ...controls]);
+    expect(projected[1]?.usage).toEqual(charge.usage);
+    expect(projected[1]?._truncated).toBe("pause_turn");
+  }
+});
