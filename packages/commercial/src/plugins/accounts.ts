@@ -46,6 +46,7 @@ export class PluginAccountError extends Error {
     | 'ACCOUNT_STALE'
     | 'ACCOUNT_REVOKED'
     | 'SECRET_INVALID'
+    | 'SESSION_EXPIRED'
 
   constructor(code: PluginAccountError['code'], message: string = code) {
     super(message)
@@ -84,13 +85,24 @@ export interface PluginAccountEnvelopeV1 {
   storageState: BrowserStorageStateV1
 }
 
+export interface LiteratureSessionLifetime {
+  sessionVerifiedAt: number
+  sessionExpiresAt: number
+}
+
+/** Platform retention cap; upstream authentication may expire earlier. */
+export const LITERATURE_SESSION_MAX_MS = 24 * 60 * 60 * 1000
+
 export interface LiteratureHttpAccountEnvelopeV1
-  extends Omit<PluginAccountEnvelopeV1, 'storageState'> {
+  extends Omit<PluginAccountEnvelopeV1, 'storageState'>,
+    LiteratureSessionLifetime {
   storageState: JieyouAccountState
   credentialSeal?: SerializedLiteratureCredentials
 }
 type StoredPluginAccountEnvelope = Omit<PluginAccountEnvelopeV1, 'storageState'> & {
   storageState: BrowserStorageStateV1 | JieyouAccountState
+  sessionVerifiedAt?: number
+  sessionExpiresAt?: number
   credentialSeal?: SerializedLiteratureCredentials
 }
 
@@ -301,6 +313,44 @@ export function validateBrowserStorageState(
   return state
 }
 
+function parseLiteratureSession(input: unknown): LiteratureSessionLifetime {
+  const value = dataObject(input, 'Literature session lifetime')
+  exactKeys(value, ['sessionVerifiedAt', 'sessionExpiresAt'], 'Literature session lifetime')
+  const { sessionVerifiedAt: verified, sessionExpiresAt: expires } = value
+  if (
+    typeof verified !== 'number' ||
+    typeof expires !== 'number' ||
+    !Number.isSafeInteger(verified) ||
+    !Number.isSafeInteger(expires) ||
+    verified < 0 ||
+    verified >= expires ||
+    expires > 8_640_000_000_000_000 ||
+    expires - verified > LITERATURE_SESSION_MAX_MS
+  )
+    stateInvalid('Invalid literature session lifetime')
+  return { sessionVerifiedAt: verified, sessionExpiresAt: expires }
+}
+
+function storedLiteratureSession(envelope: StoredPluginAccountEnvelope): LiteratureSessionLifetime {
+  try {
+    return parseLiteratureSession({
+      sessionVerifiedAt: envelope.sessionVerifiedAt,
+      sessionExpiresAt: envelope.sessionExpiresAt,
+    })
+  } catch {
+    throw new PluginAccountError('SECRET_INVALID', 'Invalid literature session lifetime')
+  }
+}
+
+function assertLiveLiteratureSession(session: LiteratureSessionLifetime, fresh = false): void {
+  const now = Date.now()
+  if (session.sessionVerifiedAt > now || session.sessionExpiresAt <= now)
+    throw new PluginAccountError(
+      fresh ? 'INVALID_STATE' : 'SESSION_EXPIRED',
+      'Literature session is not current',
+    )
+}
+
 function validateStoredEnvelope(
   input: unknown,
   contract: ManagedBrowserPluginContractV1,
@@ -315,7 +365,9 @@ function validateStoredEnvelope(
       'driverVersion',
       'accountInstanceId',
       'storageState',
-      ...(isLiteratureHttpContract(contract) ? ['credentialSeal'] : []),
+      ...(isLiteratureHttpContract(contract)
+        ? ['credentialSeal', 'sessionVerifiedAt', 'sessionExpiresAt']
+        : []),
     ],
     'Plugin account envelope',
   )
@@ -336,7 +388,11 @@ function validateStoredEnvelope(
       throw new PluginAccountError('SECRET_INVALID', 'Plugin credential seal failed validation')
     }
   }
+  const session = isLiteratureHttpContract(contract)
+    ? storedLiteratureSession(value as StoredPluginAccountEnvelope)
+    : undefined
   return {
+    ...session,
     schemaVersion: 1,
     pluginType: 'managed-browser',
     driverId: contract.runtime.driverId,
@@ -436,7 +492,7 @@ export function decryptPluginAccountEnvelope(
   const envelope = decryptStoredPluginAccountEnvelope(row, contract, env)
   return { ...envelope, storageState: validateBrowserStorageState(envelope.storageState, contract) }
 }
-export function decryptLiteratureHttpAccountEnvelope(
+function decryptStoredLiteratureHttpAccountEnvelope(
   row: PluginAccountRow,
   contract: ManagedBrowserPluginContractV1,
   env: NodeJS.ProcessEnv = process.env,
@@ -444,7 +500,30 @@ export function decryptLiteratureHttpAccountEnvelope(
   if (!isLiteratureHttpContract(contract))
     throw new PluginAccountError('SECRET_INVALID', 'HTTP account contract pin mismatch')
   const envelope = decryptStoredPluginAccountEnvelope(row, contract, env)
-  return { ...envelope, storageState: parseJieyouAccountState(envelope.storageState) }
+  return {
+    ...envelope,
+    ...storedLiteratureSession(envelope),
+    storageState: parseJieyouAccountState(envelope.storageState),
+  }
+}
+
+export function decryptLiteratureHttpAccountEnvelope(
+  row: PluginAccountRow,
+  contract: ManagedBrowserPluginContractV1,
+  env: NodeJS.ProcessEnv = process.env,
+): LiteratureHttpAccountEnvelopeV1 {
+  const envelope = decryptStoredLiteratureHttpAccountEnvelope(row, contract, env)
+  assertLiveLiteratureSession(envelope)
+  return envelope
+}
+
+/** Private relink identity only; expired cookies must not prevent a new login. */
+export function decryptLiteratureHttpAccountInstanceId(
+  row: PluginAccountRow,
+  contract: ManagedBrowserPluginContractV1,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return decryptStoredLiteratureHttpAccountEnvelope(row, contract, env).accountInstanceId
 }
 
 /** Private login input only. Callers must already hold the account trust/lease fence. */
@@ -453,7 +532,7 @@ export function decryptLiteratureHttpAccountCredentials(
   contract: ManagedBrowserPluginContractV1,
   env: NodeJS.ProcessEnv = process.env,
 ): LiteratureCredentials | undefined {
-  const envelope = decryptLiteratureHttpAccountEnvelope(row, contract, env)
+  const envelope = decryptStoredLiteratureHttpAccountEnvelope(row, contract, env)
   if (!envelope.credentialSeal) return undefined
   const seal = envelope.credentialSeal
   try {
@@ -626,6 +705,8 @@ interface ManagedBrowserPluginAccountBindInput {
   resetWriteAuthorization?: boolean
   /** Trusted setup-only input, accepted only by the fixed HTTP Plugin. Never a runtime tool field. */
   literatureCredentials?: LiteratureCredentialChange
+  /** Trusted positive login proof only; never accepted from HTTP or tool request bodies. */
+  literatureSession?: LiteratureSessionLifetime
 }
 
 export interface ManagedBrowserPluginAccountBindResult {
@@ -701,6 +782,12 @@ export async function bindManagedBrowserPluginAccount(
       const requiresHttp = assertAccountContractPin(verified)
       const change = credentialChange(input.literatureCredentials)
       if (change && !requiresHttp) stateInvalid('Credentials require the fixed HTTP Plugin')
+      if (input.literatureSession !== undefined && !requiresHttp)
+        stateInvalid('Session lifetime requires the fixed HTTP Plugin')
+      const requestedSession =
+        input.literatureSession === undefined
+          ? undefined
+          : parseLiteratureSession(input.literatureSession)
       const storageState = validateAccountStorageState(input.storageState, verified.contract)
       const existing = await client.query<PluginAccountRow>(
         `SELECT ${ACCOUNT_COLS} FROM connections
@@ -748,7 +835,27 @@ export async function bindManagedBrowserPluginAccount(
             'ACCOUNT_STALE',
             'managed-browser Plugin handoff account identity changed',
           )
-        if (replacementReplay || (input.existing !== 'replace' && identicalState && !change)) {
+        const currentSession = requiresHttp ? storedLiteratureSession(currentEnvelope) : undefined
+        const sameSession =
+          requestedSession === undefined ||
+          (requestedSession.sessionVerifiedAt === currentSession?.sessionVerifiedAt &&
+            requestedSession.sessionExpiresAt === currentSession?.sessionExpiresAt)
+        if (input.existing === 'reuse-identical' && !sameSession)
+          stateInvalid('Session renewal requires a fenced account update')
+        const session = requiresHttp
+          ? replacementReplay
+            ? currentSession
+            : input.existing === 'replace'
+              ? requestedSession
+              : (requestedSession ?? currentSession)
+          : undefined
+        if (requiresHttp && !session) stateInvalid('A verified literature session is required')
+        if (session)
+          assertLiveLiteratureSession(session, !replacementReplay && requestedSession !== undefined)
+        if (
+          replacementReplay ||
+          (input.existing !== 'replace' && identicalState && !change && sameSession)
+        ) {
           const reused = await client.query<{ id: string }>(
             `UPDATE connections
                 SET status = 'active', last_error_code = NULL, last_verified_at = NOW(),
@@ -791,6 +898,7 @@ export async function bindManagedBrowserPluginAccount(
             driverVersion: verified.contract.runtime.driverVersion,
             accountInstanceId: currentEnvelope.accountInstanceId,
             storageState,
+            ...session,
           }
           const seal = changedCredentialSeal(
             change,
@@ -868,6 +976,7 @@ export async function bindManagedBrowserPluginAccount(
           driverVersion: verified.contract.runtime.driverVersion,
           accountInstanceId,
           storageState,
+          ...session,
         }
         const seal = changedCredentialSeal(change, undefined, input.userId, current.id, input.env)
         if (seal) envelope.credentialSeal = seal
@@ -919,6 +1028,9 @@ export async function bindManagedBrowserPluginAccount(
           'ACCOUNT_STALE',
           'managed-browser Plugin handoff account disappeared',
         )
+      if (requiresHttp && !requestedSession)
+        stateInvalid('A verified literature session is required')
+      if (requestedSession) assertLiveLiteratureSession(requestedSession, true)
       const accountInstanceId = randomUUID()
       const accountKey = computeAccountKey(
         `plugin-account-v1:${verified.slug}:single`,
@@ -932,6 +1044,7 @@ export async function bindManagedBrowserPluginAccount(
         driverVersion: verified.contract.runtime.driverVersion,
         accountInstanceId,
         storageState,
+        ...requestedSession,
       }
       const encrypted = encryptEnvelope(envelope, input.userId, verified.slug, aadSeed, input.env)
       const inserted = await client.query<{ id: string }>(
@@ -1056,6 +1169,14 @@ export async function commitPluginAccountState(input: {
       JSON.stringify(envelope.credentialSeal) !== JSON.stringify(previous.credentialSeal)
     )
       throw new PluginAccountError('INVALID_STATE', 'Cookie commit cannot change credentials')
+    const session = storedLiteratureSession(previous)
+    if (
+      envelope.sessionVerifiedAt !== session.sessionVerifiedAt ||
+      envelope.sessionExpiresAt !== session.sessionExpiresAt
+    )
+      throw new PluginAccountError('INVALID_STATE', 'Cookie commit cannot renew a session')
+    assertLiveLiteratureSession(session)
+    Object.assign(envelope, session)
     if (previous.credentialSeal) envelope.credentialSeal = previous.credentialSeal
   }
   const aadSeed = randomUUID()

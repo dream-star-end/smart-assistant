@@ -8,11 +8,13 @@ import { getPool } from '../../db/index.js'
 import { query } from '../../db/queries.js'
 import { installApprovedVersion, recordUninstall } from '../../marketplace/marketplaceDb.js'
 import {
+  LITERATURE_SESSION_MAX_MS,
   PluginAccountError,
   bindManagedBrowserPluginAccount,
   commitPluginAccountState,
   decryptLiteratureHttpAccountCredentials,
   decryptLiteratureHttpAccountEnvelope,
+  decryptLiteratureHttpAccountInstanceId,
   decryptPluginAccountEnvelope,
   fencePluginAccountInvocation,
   getPluginAccount,
@@ -57,6 +59,9 @@ function state(value = 'synthetic-private-cookie') {
   const jar = createJieyouCookieJar()
   acceptJieyouCookie(jar, `sid=${value}; Path=/; HttpOnly`, LITERATURE_SITE, Date.now())
   return exportJieyouAccountState(jar)
+}
+function session(now = Date.now()) {
+  return { sessionVerifiedAt: now - 1000, sessionExpiresAt: now + 60 * 60 * 1000 }
 }
 async function user(role = 'user') {
   const r = await query<{ id: string }>(
@@ -121,6 +126,7 @@ async function installed() {
     versionId: f.versionId,
     storageState: state(),
     existing: 'reject',
+    literatureSession: session(),
     env,
   })
   const row = await getPluginAccount(bound.id, f.a, getPool())
@@ -350,6 +356,7 @@ async function passwordAccount() {
     versionId: f.versionId,
     storageState: state(),
     existing: 'reject',
+    literatureSession: session(),
     literatureCredentials: { action: 'set', credentials: password() },
     env,
   })
@@ -382,6 +389,7 @@ test('password creation binds its seal to the real returned account ID without p
     versionId: f.versionId,
     storageState: state(),
     existing: 'reject',
+    literatureSession: session(),
     env,
   })
   // Outer AAD does not include connectionId; the independent inner seal must reject this swap.
@@ -414,6 +422,7 @@ test('failure while adding a password rolls back the newly inserted account atom
         versionId: f.versionId,
         storageState: state(),
         existing: 'reject',
+        literatureSession: session(),
         literatureCredentials: { action: 'set', credentials: password() },
         env,
       }),
@@ -434,6 +443,7 @@ test('failure while adding a password rolls back the newly inserted account atom
     versionId: f.versionId,
     storageState: state(),
     existing: 'reject',
+    literatureSession: session(),
     literatureCredentials: { action: 'set', credentials: password() },
     env,
   })
@@ -579,6 +589,7 @@ test('replacement drops prior credentials, accepts a new seal and cannot replay 
     versionId: f.versionId,
     storageState: state('replacement-one'),
     existing: 'replace',
+    literatureSession: session(),
     expectedExistingAccountInstanceId: f.bound.accountInstanceId,
     replacementAccountInstanceId: randomUUID(),
     env,
@@ -590,6 +601,7 @@ test('replacement drops prior credentials, accepts a new seal and cannot replay 
     versionId: f.versionId,
     storageState: state('replacement-two'),
     existing: 'replace' as const,
+    literatureSession: session(),
     expectedExistingAccountInstanceId: first.accountInstanceId,
     replacementAccountInstanceId: randomUUID(),
     literatureCredentials: {
@@ -690,4 +702,270 @@ test('unfenced password mutation is rejected before changing the stored secret',
     code('INVALID_STATE'),
   )
   assert.deepEqual(await snapshot(f.row.id), unchanged)
+})
+
+test('HTTP first bind requires explicit fresh bounded proof and never creates rows for invalid proof', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await ready()
+  const now = Date.now()
+  const good = session(now)
+  const invalid = [
+    undefined,
+    {},
+    { ...good, extra: true },
+    { ...good, sessionVerifiedAt: Number.NaN },
+    { ...good, sessionExpiresAt: now },
+    { sessionVerifiedAt: now + 1, sessionExpiresAt: now + 1000 },
+    { sessionVerifiedAt: now, sessionExpiresAt: now + LITERATURE_SESSION_MAX_MS + 1 },
+  ]
+  t.mock.method(Date, 'now', () => now)
+  for (const proof of invalid) {
+    await assert.rejects(
+      bindManagedBrowserPluginAccount({
+        userId: f.a,
+        versionId: f.versionId,
+        storageState: state(),
+        existing: 'reject',
+        literatureSession: proof as typeof good,
+        literatureCredentials: { action: 'set', credentials: password() },
+        env,
+      }),
+      code('INVALID_STATE'),
+    )
+    assert.equal(
+      (
+        await query("SELECT id FROM connections WHERE user_id=$1 AND provider='literature-db'", [
+          f.a,
+        ])
+      ).rowCount,
+      0,
+    )
+  }
+})
+
+test('absolute HTTP expiry blocks active cookies at the boundary while preserving private relink identity and password', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await passwordAccount()
+  const envelope = decryptLiteratureHttpAccountEnvelope(f.row, f.verified.contract, env)
+  t.mock.method(Date, 'now', () => envelope.sessionExpiresAt - 1)
+  assert.equal(
+    decryptLiteratureHttpAccountEnvelope(f.row, f.verified.contract, env).sessionExpiresAt,
+    envelope.sessionExpiresAt,
+  )
+  t.mock.method(Date, 'now', () => envelope.sessionExpiresAt)
+  assert.throws(
+    () => decryptLiteratureHttpAccountEnvelope(f.row, f.verified.contract, env),
+    code('SESSION_EXPIRED'),
+  )
+  assert.equal(
+    decryptLiteratureHttpAccountInstanceId(f.row, f.verified.contract, env),
+    f.bound.accountInstanceId,
+  )
+  assert.deepEqual(
+    decryptLiteratureHttpAccountCredentials(f.row, f.verified.contract, env),
+    password(),
+  )
+  assert.throws(
+    () =>
+      decryptLiteratureHttpAccountCredentials({ ...f.row, user_id: f.b }, f.verified.contract, env),
+    code('SECRET_INVALID'),
+  )
+  assert.throws(
+    () =>
+      decryptLiteratureHttpAccountInstanceId(
+        { ...f.row, secret_enc: null },
+        f.verified.contract,
+        env,
+      ),
+    code('ACCOUNT_REVOKED'),
+  )
+})
+
+test('same-cookie fresh proof refreshes the encrypted lifetime and invalidates old worker generation', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await installed()
+  const old = await fencePluginAccountInvocation({
+    connectionId: f.row.id,
+    userId: f.a,
+    expectedRevision: f.row.revision,
+    verified: f.verified,
+    runner: getPool(),
+  })
+  const original = decryptLiteratureHttpAccountEnvelope(old, f.verified.contract, env)
+  const proof = {
+    sessionVerifiedAt: original.sessionVerifiedAt + 1,
+    sessionExpiresAt: original.sessionExpiresAt + 1,
+  }
+  const refreshed = await bindManagedBrowserPluginAccount({
+    userId: f.a,
+    versionId: f.versionId,
+    storageState: original.storageState,
+    existing: 'refresh-fenced',
+    expectedExistingAccountInstanceId: f.bound.accountInstanceId,
+    literatureSession: proof,
+    env,
+  })
+  assert.equal(refreshed.outcome, 'refreshed')
+  const current = decryptLiteratureHttpAccountEnvelope(
+    await readRow(f.row.id, f.a),
+    f.verified.contract,
+    env,
+  )
+  assert.equal(current.sessionVerifiedAt, proof.sessionVerifiedAt)
+  assert.equal(current.sessionExpiresAt, proof.sessionExpiresAt)
+  await assert.rejects(
+    commitPluginAccountState({
+      row: old,
+      verified: f.verified,
+      envelope: original,
+      runner: getPool(),
+      env,
+    }),
+    code('ACCOUNT_STALE'),
+  )
+})
+
+test('fenced cookie and password refresh without fresh proof preserve the original lifetime', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await passwordAccount()
+  const original = decryptLiteratureHttpAccountEnvelope(f.row, f.verified.contract, env)
+  await bindManagedBrowserPluginAccount({
+    userId: f.a,
+    versionId: f.versionId,
+    storageState: state('changed-cookie'),
+    existing: 'refresh-fenced',
+    expectedExistingAccountInstanceId: f.bound.accountInstanceId,
+    literatureCredentials: { action: 'set', credentials: password('changed-password') },
+    env,
+  })
+  const current = decryptLiteratureHttpAccountEnvelope(
+    await readRow(f.row.id, f.a),
+    f.verified.contract,
+    env,
+  )
+  assert.equal(current.sessionVerifiedAt, original.sessionVerifiedAt)
+  assert.equal(current.sessionExpiresAt, original.sessionExpiresAt)
+  assert(!JSON.stringify(f.row.meta).includes(String(original.sessionExpiresAt)))
+})
+
+test('ordinary reuse cannot renew proof and expired reuse or refresh cannot revive relink-required status', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await installed()
+  const original = decryptLiteratureHttpAccountEnvelope(f.row, f.verified.contract, env)
+  const input = { userId: f.a, versionId: f.versionId, storageState: original.storageState, env }
+  await assert.rejects(
+    bindManagedBrowserPluginAccount({
+      ...input,
+      existing: 'reuse-identical',
+      literatureSession: {
+        sessionVerifiedAt: original.sessionVerifiedAt + 1,
+        sessionExpiresAt: original.sessionExpiresAt + 1,
+      },
+    }),
+    code('INVALID_STATE'),
+  )
+  await markPluginAccountRelinkRequiredFenced({
+    row: f.row,
+    verified: f.verified,
+    runner: getPool(),
+  })
+  const before = await snapshot(f.row.id)
+  t.mock.method(Date, 'now', () => original.sessionExpiresAt)
+  await assert.rejects(
+    bindManagedBrowserPluginAccount({ ...input, existing: 'reuse-identical' }),
+    code('SESSION_EXPIRED'),
+  )
+  await assert.rejects(
+    bindManagedBrowserPluginAccount({
+      ...input,
+      existing: 'refresh-fenced',
+      expectedExistingAccountInstanceId: f.bound.accountInstanceId,
+    }),
+    code('SESSION_EXPIRED'),
+  )
+  assert.deepEqual(await snapshot(f.row.id), before)
+  assert.equal((await readRow(f.row.id, f.a, true)).status, 'error')
+})
+
+test('old replacement replay retains newer same-cookie proof and password even after old proof expires', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await passwordAccount()
+  const now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  const p1 = { sessionVerifiedAt: now, sessionExpiresAt: now + 1000 }
+  const replacement = {
+    userId: f.a,
+    versionId: f.versionId,
+    storageState: state('replaced-cookie'),
+    existing: 'replace' as const,
+    expectedExistingAccountInstanceId: f.bound.accountInstanceId,
+    replacementAccountInstanceId: randomUUID(),
+    literatureSession: p1,
+    literatureCredentials: { action: 'set' as const, credentials: password('old-replay-password') },
+    env,
+  }
+  const replaced = await bindManagedBrowserPluginAccount(replacement)
+  const p2 = { sessionVerifiedAt: now, sessionExpiresAt: now + 5000 }
+  await bindManagedBrowserPluginAccount({
+    ...replacement,
+    existing: 'refresh-fenced',
+    expectedExistingAccountInstanceId: replaced.accountInstanceId,
+    replacementAccountInstanceId: undefined,
+    literatureSession: p2,
+    literatureCredentials: { action: 'set', credentials: password('newer-password') },
+  })
+  t.mock.method(Date, 'now', () => now + 1000)
+  assert.equal((await bindManagedBrowserPluginAccount(replacement)).outcome, 'reused')
+  const row = await readRow(f.row.id, f.a)
+  const envelope = decryptLiteratureHttpAccountEnvelope(row, f.verified.contract, env)
+  assert.equal(envelope.sessionVerifiedAt, p2.sessionVerifiedAt)
+  assert.equal(envelope.sessionExpiresAt, p2.sessionExpiresAt)
+  assert.deepEqual(
+    decryptLiteratureHttpAccountCredentials(row, f.verified.contract, env),
+    password('newer-password'),
+  )
+  const before = await snapshot(row.id)
+  t.mock.method(Date, 'now', () => p2.sessionExpiresAt)
+  await assert.rejects(bindManagedBrowserPluginAccount(replacement), code('SESSION_EXPIRED'))
+  assert.deepEqual(await snapshot(row.id), before)
+})
+
+test('Cookie CAS is non-sliding and rejects altered or expired proof without a database write', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await installed()
+  let row = await fencePluginAccountInvocation({
+    connectionId: f.row.id,
+    userId: f.a,
+    expectedRevision: f.row.revision,
+    verified: f.verified,
+    runner: getPool(),
+  })
+  const original = decryptLiteratureHttpAccountEnvelope(row, f.verified.contract, env)
+  const input = { verified: f.verified, runner: getPool(), env }
+  const before = await snapshot(row.id)
+  for (const changed of [
+    { ...original, sessionExpiresAt: original.sessionExpiresAt + 1 },
+    { ...original, sessionVerifiedAt: original.sessionVerifiedAt + 1 },
+  ])
+    await assert.rejects(
+      commitPluginAccountState({ ...input, row, envelope: changed }),
+      code('INVALID_STATE'),
+    )
+  assert.deepEqual(await snapshot(row.id), before)
+  await commitPluginAccountState({
+    ...input,
+    row,
+    envelope: { ...original, storageState: state('committed-cookie') },
+  })
+  row = await readRow(row.id, f.a)
+  const current = decryptLiteratureHttpAccountEnvelope(row, f.verified.contract, env)
+  assert.equal(current.sessionExpiresAt, original.sessionExpiresAt)
+  assert.equal(current.sessionVerifiedAt, original.sessionVerifiedAt)
+  const unchanged = await snapshot(row.id)
+  t.mock.method(Date, 'now', () => original.sessionExpiresAt)
+  await assert.rejects(
+    commitPluginAccountState({ ...input, row, envelope: current }),
+    code('SESSION_EXPIRED'),
+  )
+  assert.deepEqual(await snapshot(row.id), unchanged)
 })
