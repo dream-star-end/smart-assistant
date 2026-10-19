@@ -18,6 +18,6 @@ test('api domain parts are disjoint and exposed on api by reference', () => {
       expect(api[key as keyof typeof api], `api.${key}`).toBe(obj[key as keyof typeof obj])
     }
   }
-  expect(seen.size).toBe(150)
-  expect(Object.keys(api)).toHaveLength(240)
+  expect(seen.size).toBe(156)
+  expect(Object.keys(api)).toHaveLength(246)
 })
