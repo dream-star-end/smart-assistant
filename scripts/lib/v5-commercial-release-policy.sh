@@ -175,6 +175,22 @@ commercial_policy_resume_egress() {
   egress_slots_remote converge "$rel" "$before" || return $?
   wait_for_egress_release_ready "$rel" 0 30 || return 79
 }
+# Seed already opens the verified listing after account/handoff binding. Restore
+# only the current approved gate after failure; keep the release unaccepted.
+commercial_policy_promote_plugin() {
+  local plugin="$1" rel="$2" failed=0
+  assert_mutation_lease_alive "policy-$plugin-close" || return 86
+  "${plugin}_plugin_close_gate" "$rel" || failed=1
+  if [[ "$failed" == 0 ]]; then
+    assert_mutation_lease_alive "policy-$plugin-seed" || return 86
+    "${plugin}_plugin_seed" "$rel" || failed=1
+  fi
+  if [[ "$failed" == 1 ]]; then
+    assert_mutation_lease_alive "policy-$plugin-restore-current" || return 86
+    "${plugin}_plugin_open_gate_current" "$rel" || return 79
+    return 79
+  fi
+}
 commercial_policy_required_gates() {
   local rel="$1" with_dist
   BUILT_RELEASE_SOURCE_COMMIT="$(commercial_policy_rmt commercial_policy_py source-for-release "$rel")" || return $?
@@ -191,8 +207,8 @@ commercial_policy_required_gates() {
   verify_public_surface deploy || return 79
   knowledge_planet_plugin_advisory_gate "$rel" || return 79
   weibo_plugin_advisory_gate "$rel" || return 79
-  if [[ "$KP_PLUGIN_PROMOTE" == 1 ]]; then knowledge_planet_plugin_seed "$rel" || return 79; fi
-  if [[ "$WB_PLUGIN_PROMOTE" == 1 ]]; then weibo_plugin_seed "$rel" || return 79; fi
+  if [[ "$KP_PLUGIN_PROMOTE" == 1 ]]; then commercial_policy_promote_plugin knowledge_planet "$rel" || return $?; fi
+  if [[ "$WB_PLUGIN_PROMOTE" == 1 ]]; then commercial_policy_promote_plugin weibo "$rel" || return $?; fi
   end_planned_maintenance || return 79
   smoke_sourcemap_sealed || return 79
 }

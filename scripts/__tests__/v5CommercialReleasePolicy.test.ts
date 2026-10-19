@@ -20,7 +20,7 @@ test('real shared saga precise red and green faults',()=>{
 })
 test('commercial data adapter and actual outer paths',()=>{
   const output = run('python3','v5CommercialReleasePolicy.test.py')
-  assert.match(output, /Ran 25 tests/)
+  assert.match(output, /Ran 26 tests/)
   assert.match(output, /test_actual_keep_failed_reopens_only_weibo_gate_closed_by_this_deploy .*ok/)
   console.log(output.trim())
 })
