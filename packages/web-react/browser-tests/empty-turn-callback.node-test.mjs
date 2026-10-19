@@ -19,7 +19,7 @@ const { chromium } = require("playwright-core");
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "../../..");
 function files(dir) { return readdirSync(dir, { withFileTypes: true }).flatMap(e => e.name==="node_modules" ? [] : e.isDirectory() ? files(join(dir,e.name)) : [join(dir,e.name)]); }
-const inputs = [...files(resolve(here, "../src")), ...files(here), ...files(join(root,"packages/gateway/src")), ...files(join(root,"packages/storage/src")), ...files(join(root,"packages/protocol/src"))].sort();
+const inputs = [...files(resolve(here, "../src")), ...files(here), ...files(join(root,"packages/gateway/src")), ...files(join(root,"packages/storage/src")), ...files(join(root,"packages/protocol/src")), join(root,"packages/commercial/src/http/losslessTurnTape.ts")].sort();
 const hashes = () => Object.fromEntries(inputs.map(p=>[p,createHash("sha256").update(readFileSync(p)).digest("hex")]));
 const before = hashes();
 const digest = createHash("sha256").update(JSON.stringify(before)).digest("hex");
@@ -61,9 +61,28 @@ test("INC-20260923-EMPTY-TURN-NO-REPLY: actual Gateway engine terminal and callb
       const context=await browser.newContext({viewport:{width,height:950},isMobile:width===390,hasTouch:width===390});
       const page=await context.newPage();const errors=[];page.on("pageerror",e=>errors.push(e.message));
       const start=wires.length;
+      let holdTerminalReads=false,closing=false,terminalMessages;
+      let releaseTerminalReads;
+      const terminalReady=new Promise(resolve=>{releaseTerminalReads=resolve;});
+      // The WS side is the actual Gateway; provide the missing Master HTTP
+      // boundary only after observing the soft recovery state below.
+      await page.route("**/api/sessions/**",async route=>{
+        try {
+          const response=await route.fetch();
+          const path=new URL(route.request().url()).pathname;
+          if(!holdTerminalReads||![`/api/sessions/${BOARD_SESSION}`,`/api/sessions/${BOARD_SESSION}/timeline`].includes(path))return await route.fulfill({response});
+          await terminalReady;
+          if(closing)return;
+          const body=await response.json();
+          Object.assign(body,{messages:terminalMessages,automaticRecoveries:[],historyRevision:preview.store.revision+1,
+            snapshotMaxSeq:terminalMessages.length,timelineSnapshotMaxSeq:terminalMessages.length});
+          await route.fulfill({response,json:body});
+        } catch(error) { if(!closing)throw error; }
+      });
       try {
         await page.goto(preview.url);
         await page.getByPlaceholder(/对话/).fill("EMPTY_REAL_COMPOSER_REQUEST");
+        holdTerminalReads=mode==="empty";
         await page.getByRole("button",{name:"发送",exact:true}).click();
         await until("actual engine terminal delivery",()=>wires.slice(start).some(f=>f.isFinal));
         const snap=await control("/snapshot",{peer:BOARD_SESSION});
@@ -75,9 +94,16 @@ test("INC-20260923-EMPTY-TURN-NO-REPLY: actual Gateway engine terminal and callb
         const cmid=wires.slice(start).find(f=>f.isFinal)?.clientMessageId;
         assert.equal(leaf.clientMessageId,cmid,"actual sink and actual wire share owner");
         if(mode==="empty") {
-          // Gather UI receipt before terminal oracle so negative control distinguishes fake success.
-          const title=page.getByText("模型服务暂时中断",{exact:true});
-          await until("App consumes actual terminal",async()=>await title.count()>0||await page.getByText("这轮没有回复",{exact:true}).count()>0);
+          const title=page.getByText(/^(模型服务暂时中断|这轮没有回复)$/);
+          await page.getByText("模型繁忙，正在重试…",{exact:true}).waitFor();
+          assert.equal(await title.count(),0,"recoverable NO_RESPONSE must not paint before the authoritative decision");
+          assert.equal(await page.getByRole("button",{name:"停止",exact:true}).count(),1);
+          terminalMessages=snap.terminalMessages;
+          assert.ok(terminalMessages.some(message=>message._errorCode===leaf.errorCode&&message._clientMessageId===cmid),"HTTP terminal is projected from the actual persisted payload");
+          releaseTerminalReads();
+          // A finalized source plus an empty recovery list is a definite decline.
+          // Preserve the original incident's UI and durable-terminal oracles.
+          await until("App consumes actual terminal",async()=>await title.count()>0);
           const ui={errorTitles:await title.count(),fakeBody:await page.getByText("本轮未能产出可见回复，已结束，可重试或继续",{exact:true}).count(),ratings:await page.locator('[aria-label="点赞"],[aria-label="点踩"]').count(),operations:await page.getByTestId("assistant-row").getByRole("button",{name:"更多操作",exact:true}).count()};
           receipts.push({width,mode,baseline,ui,snap,wire:wires.slice(start)});
           assert.equal(leaf.status,"crashed","empty must not be a persisted successful turn");
@@ -107,7 +133,7 @@ test("INC-20260923-EMPTY-TURN-NO-REPLY: actual Gateway engine terminal and callb
         }
         assert.deepEqual(errors,[]);
         assert.deepEqual(await control("/failures"),[]);
-      } finally {await context.close();}
+      } finally {closing=true;releaseTerminalReads();await context.close();}
     });
     await t.test("stopped duplicate suppressed while different summary and session scope admit real turns",async()=>{
       const p1="wsess-0123456789abc101",p2="wsess-0123456789abc102";
