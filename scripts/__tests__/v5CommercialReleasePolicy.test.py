@@ -62,6 +62,120 @@ class CommercialPolicyTest(unittest.TestCase):
     def failure(self, authority='applied'):
         return self.action('failure','state',authority,str(self.env),str(self.platform),str(self.live),'test.service')
 
+    def test_actual_required_gates_bracket_plugin_promotion_and_restore_service(self):
+        # Source the real gate chain, substituting only external facts/commands.
+        script = r'''set -eu
+source "$1"
+FIXTURE="$2"; ACTIVE_PORT=18795; KL_HOST=fixture; DRY=0; fence_count=0
+COMMERCIAL_FAILURE_POLICY=user-impact-only
+printf active > "$FIXTURE/knowledge_planet.state"
+printf active > "$FIXTURE/weibo.state"
+printf 'held original operation' > "$FIXTURE/marker"
+event(){ printf '%s\n' "$*" >> "$FIXTURE/calls"; }
+commercial_policy_rmt(){
+  case "$*" in
+    'commercial_policy_py source-for-release new') printf '%040d\n' 2 ;;
+    'commercial_policy_py field options.withDist') echo true ;;
+    *) return 79 ;;
+  esac
+}
+ssh(){ echo abcdef123456; }
+smoke(){ event SMOKE; }
+minimum_functional_core(){ event REAL_TURN_E2E; }
+dist_handshake_smoke(){ event DIST; }
+verify_public_surface(){ event PUBLIC; }
+knowledge_planet_plugin_advisory_gate(){ event KP_ADVISORY; KP_PLUGIN_PROMOTE="${PROMOTE_KP:-1}"; }
+weibo_plugin_advisory_gate(){ event WB_ADVISORY; WB_PLUGIN_PROMOTE="${PROMOTE_WB:-1}"; }
+assert_mutation_lease_alive(){
+  fence_count=$((fence_count+1)); event "FENCE $1"
+  [[ "$fence_count" != "${FENCE_LOST:-0}" ]]
+}
+close_plugin(){
+  event "CLOSE $1"; printf official-gate > "$FIXTURE/$1.state"
+  [[ "${FAULT:-}" != "$1-close" ]]
+}
+seed_plugin(){
+  event "SEED $1"
+  if [[ "$(cat "$FIXTURE/$1.state")" != official-gate ]]; then
+    event LISTING_TRUST_MISMATCH; return 1
+  fi
+  [[ "${FAULT:-}" != "$1-seed" ]] || return 1
+  event "BIND_AND_VERIFIED_OPEN $1"; printf active > "$FIXTURE/$1.state"
+}
+open_current(){
+  event "RESTORE_CURRENT $1"
+  [[ "${RESTORE_FAIL:-0}" != 1 ]] || return 1
+  printf active > "$FIXTURE/$1.state"
+}
+knowledge_planet_plugin_close_gate(){ close_plugin knowledge_planet; }
+knowledge_planet_plugin_seed(){ seed_plugin knowledge_planet; }
+knowledge_planet_plugin_open_gate_current(){ open_current knowledge_planet; }
+weibo_plugin_close_gate(){ close_plugin weibo; }
+weibo_plugin_seed(){ seed_plugin weibo; }
+weibo_plugin_open_gate_current(){ open_current weibo; }
+end_planned_maintenance(){ event END_MAINTENANCE; }
+smoke_sourcemap_sealed(){ event SOURCEMAP; }
+rc=0; commercial_policy_required_gates new || rc=$?
+if [[ "$rc" == 0 ]]; then event ACCEPTANCE_CAN_CONTINUE; fi
+exit "$rc"
+'''
+        lib = REPO / 'scripts/lib/v5-commercial-release-policy.sh'
+        old = self.root/'missing-close-policy.sh'
+        source = lib.read_text()
+        source = source.replace('commercial_policy_promote_plugin knowledge_planet "$rel" || return $?',
+                                'knowledge_planet_plugin_seed "$rel" || return 79')
+        source = source.replace('commercial_policy_promote_plugin weibo "$rel" || return $?',
+                                'weibo_plugin_seed "$rel" || return 79')
+        old.write_text(source)
+        cases = [
+            ('promote', {}, 0, None),
+            ('noop', {'PROMOTE_KP':'0','PROMOTE_WB':'0'}, 0, None),
+            ('kp-close', {'FAULT':'knowledge_planet-close'}, 79, 'knowledge_planet'),
+            ('kp-seed', {'FAULT':'knowledge_planet-seed'}, 79, 'knowledge_planet'),
+            ('wb-close', {'FAULT':'weibo-close'}, 79, 'weibo'),
+            ('wb-seed', {'FAULT':'weibo-seed'}, 79, 'weibo'),
+            ('restore-failed', {'FAULT':'knowledge_planet-seed','RESTORE_FAIL':'1'}, 79, None),
+            ('lost-before-close', {'FENCE_LOST':'1'}, 86, None),
+            ('lost-before-seed', {'FENCE_LOST':'2'}, 86, None),
+            ('lost-before-restore', {'FAULT':'knowledge_planet-seed','FENCE_LOST':'3'}, 86, None),
+            ('old-missing-close-red', {}, 79, None),
+        ]
+        for name, extra, expected, restored in cases:
+            with self.subTest(name=name):
+                folder = self.root/name; folder.mkdir()
+                env=os.environ.copy();env.update(extra)
+                r=subprocess.run(['bash','-s','--',str(old if name.endswith('-red') else lib),str(folder)],
+                                 input=script,text=True,capture_output=True,env=env)
+                self.assertEqual(r.returncode, expected, r.stdout+r.stderr)
+                calls=(folder/'calls').read_text().splitlines()
+                self.assertEqual((folder/'marker').read_text(),'held original operation')
+                self.assertEqual(calls[:6], ['SMOKE','REAL_TURN_E2E','DIST','PUBLIC','KP_ADVISORY','WB_ADVISORY'])
+                if name == 'promote':
+                    for plugin in ['knowledge_planet','weibo']:
+                        self.assertLess(calls.index('CLOSE '+plugin),calls.index('SEED '+plugin))
+                        self.assertIn('BIND_AND_VERIFIED_OPEN '+plugin,calls)
+                        self.assertEqual((folder/(plugin+'.state')).read_text(),'active')
+                    self.assertEqual(calls[-3:],['END_MAINTENANCE','SOURCEMAP','ACCEPTANCE_CAN_CONTINUE'])
+                elif name == 'noop':
+                    self.assertFalse(any(x.startswith(('CLOSE ','SEED ','RESTORE_CURRENT ','FENCE ')) for x in calls))
+                    self.assertEqual(calls[-3:],['END_MAINTENANCE','SOURCEMAP','ACCEPTANCE_CAN_CONTINUE'])
+                else:
+                    self.assertNotIn('ACCEPTANCE_CAN_CONTINUE',calls)
+                    self.assertNotIn('END_MAINTENANCE',calls)
+                    self.assertNotIn('SOURCEMAP',calls)
+                    if restored:
+                        self.assertIn('RESTORE_CURRENT '+restored,calls)
+                        self.assertEqual((folder/(restored+'.state')).read_text(),'active')
+                    if name == 'restore-failed':
+                        self.assertIn('RESTORE_CURRENT knowledge_planet',calls)
+                        self.assertEqual((folder/'knowledge_planet.state').read_text(),'official-gate')
+                    if name.startswith('lost-'):
+                        self.assertTrue(calls[-1].startswith('FENCE '))
+                        self.assertNotIn('RESTORE_CURRENT knowledge_planet',calls)
+                    if name.endswith('-red'):
+                        self.assertIn('LISTING_TRUST_MISMATCH',calls)
+                        self.assertNotIn('CLOSE knowledge_planet',calls)
+
     def test_healthy_history_or_external_gate_failure_keeps_service(self):
         self.prepare()
         with patch.object(m,'unit_info',return_value=('active','123',str(self.new))), patch.object(m,'health',return_value=True):
