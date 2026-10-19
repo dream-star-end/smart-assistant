@@ -7519,6 +7519,38 @@
       "coverageCommits": [
         "09284d9a"
       ]
+    },
+    {
+      "id": "INC-20261019-PREDICTION-HIDES-FINAL",
+      "occurredAt": "2026-10-19",
+      "severity": "P1",
+      "symptom": "个人版test1 Opus5.5回合65步后最终答复空白。完整总结已在tape203，末条208仅隐藏ui next输入预测；raw非空final判定把总结折叠、预测却不渲染。两版共用逻辑。按实际可见内容选择最终回答并保留输入预测及终态费用元数据。",
+      "rootFixCommit": "73f14cf7",
+      "coverageCommits": [
+        "b6e7f80c"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
+          "assertion": "standalone input prediction never displaces the completed task summary"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
+          "assertion": "OCV5-525: view projection preserves total charge, trace, delegates and truncation without changing call usage"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
+          "assertion": "OCV5-525: late truncation and earlier charge snapshots transfer independently in shuffled history"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-525-visible-final.node-test.mjs",
+          "assertion": "OCV5-525: completed summary stays visible when the last assistant is only input prediction"
+        }
+      ]
     }
   ]
 }
