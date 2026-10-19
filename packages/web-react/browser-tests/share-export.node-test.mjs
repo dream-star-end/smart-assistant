@@ -38,6 +38,7 @@ test("OCV5-507 sharing and Markdown downloads contain final answers and portable
       const event = page.waitForEvent("download");
       await page.getByRole("button", { name: "导出 Markdown" }).click();
       const download = await event;
+      assert.equal(download.suggestedFilename(), "销售分析.md");
       const md = readFileSync(await download.path(), "utf8");
       const copy = await page.evaluate(() => window.__copied);
       const canvas = await page.evaluate(() => window.__canvasText.join("\n"));
