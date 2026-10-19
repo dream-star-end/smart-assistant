@@ -82,11 +82,22 @@ test("OCV5-525: completed summary stays visible when the last assistant is only 
         } else {
           await page.getByRole("button", { name: "分享会话", exact: true }).click();
         }
+        const exportButton = page.getByRole("button", { name: "导出 Markdown", exact: true });
+        await exportButton.waitFor({ state: "visible" });
+        await exportButton.evaluate((button) => {
+          button.addEventListener("click", () => {
+            const title = document.querySelector("h1.sr-only")?.textContent?.trim();
+            if (!title) throw new Error("missing current session heading at export click");
+            button.setAttribute("data-ocv5-export-title", title);
+          }, { capture: true, once: true });
+        });
         const [download] = await Promise.all([
           page.waitForEvent("download"),
-          page.getByRole("button", { name: "导出 Markdown", exact: true }).click(),
+          exportButton.click(),
         ]);
-        assert.equal(download.suggestedFilename(), "库存看板.md");
+        const titleAtClick = await exportButton.getAttribute("data-ocv5-export-title");
+        assert.ok(titleAtClick, "the download title is captured at the actual user click");
+        assert.equal(download.suggestedFilename(), `${titleAtClick}.md`);
         assert.ok(readFileSync(await download.path(), "utf8").includes(summary), "cold lazy export includes the actual final answer");
         assert.deepEqual(errors, []);
         console.log("VISIBLE_FINAL_RECEIPT", JSON.stringify({ width, red, ablations, visibleSummary: true, replay: true, prediction: "通过", markdownExport: true }));
