@@ -606,6 +606,10 @@ describe('internalCodexRelay official chatgpt upstream(B5)', () => {
           [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer chatgpt-access-token',
           'chatgpt-account-id': 'acc-uuid-1',
           originator: 'codex_cli_rs',
+          'session-id': '11111111-1111-4111-8111-111111111111',
+          'thread-id': '22222222-2222-4222-8222-222222222222',
+          session_id: 'legacy-session',
+          conversation_id: 'legacy-conversation',
           'x-codex-turn-state': 'request-turn-state',
           'x-openai-internal-codex-responses-lite': 'true',
           'x-codex-installation-id': 'must-not-leave-relay',
@@ -621,6 +625,11 @@ describe('internalCodexRelay official chatgpt upstream(B5)', () => {
       assert.equal(captured.headers?.get('authorization'), 'Bearer chatgpt-access-token')
       assert.equal(captured.headers?.get('chatgpt-account-id'), 'acc-uuid-1')
       assert.equal(captured.headers?.get('originator'), 'codex_cli_rs')
+      assert.equal(captured.headers?.get('session-id'), '11111111-1111-4111-8111-111111111111')
+      assert.equal(captured.headers?.get('thread-id'), '22222222-2222-4222-8222-222222222222')
+      assert.equal(captured.headers?.get('session_id'), 'legacy-session')
+      assert.equal(captured.headers?.get('conversation_id'), 'legacy-conversation')
+      assert.equal(captured.headers?.has('connection'), false)
       assert.equal(captured.headers?.get('x-codex-turn-state'), 'request-turn-state')
       assert.equal(captured.headers?.get('x-openai-internal-codex-responses-lite'), 'true')
       assert.equal(captured.headers?.has('x-codex-installation-id'), false)
