@@ -6846,6 +6846,31 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     assert.equal(request.content?.recovery?.mode, "checkpoint");
     assert.match(request.content?.text ?? "", /先查询其当前可观察状态/);
     assert.doesNotMatch(request.content?.text ?? "", /deploy\.sh/);
+    // INC-20261019-RECOVERABLE-ERROR-RED-CARD: a cold browser reads recovery
+    // authority in the same timeline snapshot, before the child is admitted.
+    const expected = [{
+      sourceClientMessageId, rootClientMessageId: sourceClientMessageId,
+      clientMessageId: jobs.rows[0]!.request_json.clientMessageId,
+      errorCode: "upstream_failed", mode: "checkpoint", attempt: 1,
+    }];
+    const full = await backend.getClientSession(sessionId, CUSER, { view: "timeline" });
+    assert.deepEqual(full?.automaticRecoveries, expected,
+      "INC-20261019-RECOVERABLE-ERROR-RED-CARD: timeline returns the exact active recovery without request payload");
+    assert.deepEqual((await backend.getClientSessionPartial(sessionId, CUSER, 0,
+      { view: "timeline" }))?.automaticRecoveries, expected);
+    assert.equal((await backend.getClientSession(sessionId, CUSER))?.automaticRecoveries, undefined,
+      "non-snapshot legacy read cannot claim negative recovery authority");
+    assert.equal(await backend.getClientSession(sessionId, "c:999999", { view: "timeline" }), null);
+    for (const status of ["leased", "sent", "forwarded", "paused", "cancelled", "completed", "manual_reconcile"]) {
+      await pool.query(`UPDATE turn_recovery_jobs SET status=$4
+        WHERE user_id=$1 AND session_id=$2 AND source_client_message_id=$3`,
+        [UID, sessionId, sourceClientMessageId, status]);
+      const snapshot = await backend.getClientSessionPartial(sessionId, CUSER, 0, { view: "timeline" });
+      assert.deepEqual(snapshot?.automaticRecoveries,
+        ["leased", "sent", "forwarded"].includes(status) ? expected : [], status);
+      assert.ok(snapshot?.messages.some((row) => row._clientMessageId === sourceClientMessageId && row._errorCode),
+        "the source terminal stays immutable while the recovery job changes");
+    }
   });
 
   // OCV5-317 (#b6df9aee): the live Box Claude tape — Bash and Skill finished,

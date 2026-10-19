@@ -8835,6 +8835,43 @@ export async function commitVisibleLosslessTurnPhaseA(
 }
 
 
+/** Read only scalar recovery metadata, never the stored prompt/attachments.
+ * Call only inside the timeline's REPEATABLE READ transaction: absence and
+ * finalized source rows must describe the same committed state. */
+async function readAutomaticRecoveriesForSession(
+  queryable: PoolClient,
+  sessionId: string,
+  userId: string,
+): Promise<{ automaticRecoveries: NonNullable<ClientSession["automaticRecoveries"]> }> {
+  const uid = /^c:([1-9][0-9]*)$/.exec(userId);
+  if (!uid) return { automaticRecoveries: [] };
+  const result = await queryable.query<{
+    source_client_message_id: string;
+    root_client_message_id: string;
+    client_message_id: string;
+    error_code: string;
+    recovery_mode: 'replay' | 'checkpoint';
+    semantic_recovery_attempt: number;
+  }>(
+    `SELECT source_client_message_id,root_client_message_id,
+            request_json->>'clientMessageId' AS client_message_id,
+            error_code,recovery_mode,semantic_recovery_attempt
+       FROM turn_recovery_jobs
+      WHERE user_id=$1::bigint AND session_id=$2
+        AND status IN ('queued','leased','sent','forwarded')
+      ORDER BY created_at,job_id`,
+    [uid[1], sessionId],
+  );
+  return { automaticRecoveries: result.rows.map((row) => ({
+    sourceClientMessageId: row.source_client_message_id,
+    rootClientMessageId: row.root_client_message_id,
+    clientMessageId: row.client_message_id,
+    errorCode: row.error_code,
+    mode: row.recovery_mode,
+    attempt: row.semantic_recovery_attempt,
+  })) };
+}
+
 async function readOpenDispatchForSession(
   queryable: Pool | PoolClient,
   sessionId: string,
@@ -11836,6 +11873,9 @@ export function createPgSessionsBackend(
           // 实际合计为准，读尽后不会留下“还有 N 条”的幽灵按钮。
           archivedCount: bigIntNum(row.archived_count, "archived chunk message count"),
           archivedThroughSeq: archivedThroughOrderSeq,
+          ...(snapshotClient
+            ? await readAutomaticRecoveriesForSession(snapshotClient, row.id, row.user_id)
+            : {}),
           ...(await readOpenDispatchForSession(queryable, row.id, row.user_id)),
           ...(await readPermissionPromptsForSession(
             queryable,
@@ -11972,6 +12012,9 @@ export function createPgSessionsBackend(
             timelineCursor: page.nextCursor,
             timelineHasMore: page.hasMore,
             timelineSnapshotMaxSeq: page.snapshotMaxSeq,
+            ...(snapshotClient
+              ? await readAutomaticRecoveriesForSession(snapshotClient, row.id, row.user_id)
+              : {}),
             ...(row.model_id ? { modelId: row.model_id } : {}),
             totalMessageCount: page.messages.length + archivedCount,
             maxSeq: page.snapshotMaxSeq,
