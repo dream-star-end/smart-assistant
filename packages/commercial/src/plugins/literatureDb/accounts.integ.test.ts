@@ -100,7 +100,7 @@ async function installed() {
   for (const userId of [f.a, f.b])
     await installApprovedVersion({
       userId,
-      versionId: f.versionId,
+      versionId: String(f.versionId),
       agentIds: ['main'],
       scopeMode: 'replace',
     })
@@ -191,6 +191,27 @@ test('HTTP cookie commits require the newest generation and exact wrapper hash',
     commitPluginAccountState({
       ...input,
       verified: { ...f.verified, execContractHash: 'a'.repeat(64) },
+    }),
+    code('INVALID_STATE'),
+  )
+  const altered = structuredClone(f.verified.contract)
+  Reflect.deleteProperty(altered.runtime, 'transport')
+  const downgraded = { ...f.verified, contract: altered }
+  await assert.rejects(
+    commitPluginAccountState({
+      ...input,
+      verified: downgraded,
+      envelope: { ...envelope, storageState: { cookies: [], origins: [] } },
+    }),
+    code('INVALID_STATE'),
+  )
+  await assert.rejects(
+    fencePluginAccountInvocation({
+      connectionId: f.row.id,
+      userId: f.a,
+      expectedRevision: f.row.revision,
+      verified: downgraded,
+      runner: getPool(),
     }),
     code('INVALID_STATE'),
   )

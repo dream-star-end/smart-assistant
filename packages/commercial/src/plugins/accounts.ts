@@ -1,4 +1,5 @@
 import { type JieyouAccountState, parseJieyouAccountState } from './literatureDb/accountState.js'
+import { LITERATURE_PLUGIN_ARTIFACT_HASH } from './literatureDb/builtinArtifact.js'
 import {
   isLiteratureHttpContract,
   isLiteratureHttpIdentity,
@@ -81,6 +82,21 @@ export interface LiteratureHttpAccountEnvelopeV1
 }
 type StoredPluginAccountEnvelope = Omit<PluginAccountEnvelopeV1, 'storageState'> & {
   storageState: BrowserStorageStateV1 | JieyouAccountState
+}
+
+/** A transport flag is data being checked, never the authority for choosing its policy. */
+function assertAccountContractPin(
+  verified: Extract<VerifiedRuntimePluginContract, { pluginType: 'managed-browser' }>,
+  row?: PluginAccountRow,
+): boolean {
+  const requiresHttp =
+    verified.artifactHash === LITERATURE_PLUGIN_ARTIFACT_HASH ||
+    verified.contract.artifactHash === LITERATURE_PLUGIN_ARTIFACT_HASH ||
+    verified.contract.runtime.transport !== undefined ||
+    row?.spec_hash.toString('hex') === LITERATURE_PLUGIN_ARTIFACT_HASH
+  if (requiresHttp && !isLiteratureHttpIdentity({ ...verified, contract: verified.contract }))
+    throw new PluginAccountError('INVALID_STATE', 'HTTP account identity pin mismatch')
+  return requiresHttp
 }
 
 function validateAccountStorageState(
@@ -605,6 +621,7 @@ export async function bindManagedBrowserPluginAccount(
           'INVALID_STATE',
           'write authorization reset requires a fenced account refresh',
         )
+      assertAccountContractPin(verified)
       const storageState = validateAccountStorageState(input.storageState, verified.contract)
       const existing = await client.query<PluginAccountRow>(
         `SELECT ${ACCOUNT_COLS} FROM connections
@@ -882,6 +899,7 @@ export async function fencePluginAccountInvocation(input: {
 }): Promise<PluginAccountRow> {
   if (input.verified.pluginType !== 'managed-browser')
     throw new PluginAccountError('INVALID_STATE', 'runtime Plugin is not accountful')
+  assertAccountContractPin(input.verified)
   await assertRuntimePluginInstallEntitlement(input.userId, input.verified, input.runner, {
     requireCurrent: true,
   })
@@ -919,11 +937,7 @@ export async function commitPluginAccountState(input: {
 }): Promise<string> {
   if (input.verified.pluginType !== 'managed-browser')
     throw new PluginAccountError('INVALID_STATE', 'runtime Plugin is not accountful')
-  if (
-    input.verified.contract.runtime.transport !== undefined &&
-    !isLiteratureHttpIdentity({ ...input.verified, contract: input.verified.contract })
-  )
-    throw new PluginAccountError('INVALID_STATE', 'HTTP account identity pin mismatch')
+  const requiresHttp = assertAccountContractPin(input.verified, input.row)
   const envelope = validateStoredEnvelope(input.envelope, input.verified.contract)
   const aadSeed = randomUUID()
   const encrypted = encryptEnvelope(
@@ -973,7 +987,7 @@ export async function commitPluginAccountState(input: {
       aadSeed,
       input.verified.contract.account.contractVersion,
       input.verified.artifactHash,
-      isLiteratureHttpContract(input.verified.contract),
+      requiresHttp,
     ],
   )
   if (updated.rowCount !== 1)
