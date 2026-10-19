@@ -46,17 +46,19 @@ describe("Antigravity quota", () => {
     assert.deepEqual(parseQuotaSummary(null), []);
   });
 
-  it("loads the project once, caches 10 minutes, and keeps the last windows when a refresh fails", async () => {
+  it("refreshes the project and tier every 10 minutes, and keeps the last windows when a refresh fails", async () => {
     let now = 1_000_000;
     const calls: string[] = [];
     let quotaStatus = 200;
     const deps = {
       clientSecret: () => "secret",
+      saveMetadata: async () => {},
       freshToken: async () => Buffer.from("tok"),
       now: () => now,
       post: async (path: string, _t: string, body: unknown) => {
         calls.push(path);
         if (path.endsWith("loadCodeAssist")) return { status: 200, json: { cloudaicompanionProject: "proj-1" } };
+        if (path.endsWith("fetchAvailableModels")) return { status: 200, json: { models: {} } };
         assert.deepEqual(body, { project: "proj-1" });
         return { status: quotaStatus, json: quotaStatus === 200 ? SUMMARY : null };
       },
@@ -65,13 +67,13 @@ describe("Antigravity quota", () => {
     assert.equal(first.windows.length, 4);
     assert.equal(first.note, null);
     await antigravityAccountQuota("1", deps);
-    assert.deepEqual(calls, ["/v1internal:loadCodeAssist", "/v1internal:retrieveUserQuotaSummary"], "cached");
+    assert.deepEqual(calls, ["/v1internal:loadCodeAssist", "/v1internal:fetchAvailableModels", "/v1internal:retrieveUserQuotaSummary"], "cached");
     now += ANTIGRAVITY_QUOTA_TTL_MS + 1;
     quotaStatus = 503;
     const stale = await antigravityAccountQuota("1", deps);
     assert.equal(stale.windows.length, 4, "last good windows kept");
     assert.equal(stale.note, "上游额度接口返回 HTTP 503");
-    assert.equal(calls.filter((c) => c.endsWith("loadCodeAssist")).length, 1, "project reused");
+    assert.equal(calls.filter((c) => c.endsWith("loadCodeAssist")).length, 2, "tier refreshes with quota TTL");
   });
 
   it("says why there is no quota instead of returning nothing", async () => {
@@ -84,5 +86,36 @@ describe("Antigravity quota", () => {
     });
     assert.match(dead.note ?? "", /登录凭证无法刷新/);
     assert.deepEqual(dead.windows, []);
+  });
+});
+
+
+describe("paidTier and model metadata refresh (OCV5-516)", () => {
+  it("persists upgrades on TTL and keeps known models when the directory fails", async () => {
+    _resetAntigravityQuotaCacheForTest();
+    let now = 1000000;
+    let tier = 'g1-pro-tier';
+    let directoryStatus = 200;
+    const saved: unknown[][] = [];
+    const deps = {
+      clientSecret: () => 'secret', freshToken: async () => Buffer.from('tok'), now: () => now,
+      saveMetadata: async (...args: [string, string | null, unknown]) => { saved.push(args); },
+      post: async (path: string) => {
+        if (path.endsWith('loadCodeAssist')) return { status: 200, json: { cloudaicompanionProject: 'p', paidTier: { id: tier } } };
+        if (path.endsWith('fetchAvailableModels')) return { status: directoryStatus, json: { models: { 'gpt-oss-120b-medium': { quotaInfo: { remainingFraction: 0.5, resetTime: '2030-01-01T00:00:00Z' } }, 'gemini-4-argon-disabled': { disabled: true } } } };
+        return { status: 200, json: SUMMARY };
+      },
+    };
+    await antigravityAccountQuota('1', deps);
+    await antigravityAccountQuota('1', deps);
+    assert.equal(saved.length, 1);
+    assert.equal(saved[0][1], 'g1-pro-tier');
+    assert.deepEqual(Object.keys(saved[0][2] as object), ['gpt-oss-120b-medium'], 'disabled directory entries never become eligible');
+    now += ANTIGRAVITY_QUOTA_TTL_MS + 1;
+    tier = 'g1-ultra-lite-tier'; directoryStatus = 503;
+    const next = await antigravityAccountQuota('1', deps);
+    assert.equal(next.paidTier, tier);
+    assert.equal(saved[1][1], tier);
+    assert.equal(saved[1][2], null, 'SQL COALESCE preserves last valid directory');
   });
 });

@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { compileBoxToolCatalog } from "./boxToolCatalog.js";
 import type { BoxDurableJournal, BoxReplayIdentity } from "./boxDurableJournal.js";
-import { observeBoxToolUnknown } from "./boxToolUnknownObserver.js";
+import { isBoxReplayRejection, observeBoxToolUnknown } from "./boxToolUnknownObserver.js";
+import { BoxExecTransportError } from "./boxExecTransport.js";
 import type { ProxyBody } from "./shared.js";
 
 const model = "claude-opus-5-5";
@@ -242,4 +243,29 @@ test("observer skips a bound heartbeat and still rejects the outer session", asy
   const unbound = { ...linked, nativeSessionId: undefined, priorToolUses: undefined };
   await assert.rejects(() => observeBoxToolUnknown({ identity: unbound, canonicalBody: body,
     upstreamModel: model }, deps), /BOX_TOOL_RECORD_INVALID/);
+});
+
+test("OCV5-509 a re-read run the decoder refuses is a replay rejection, not a transient", async () => {
+  const mismatched = common.map((record) => (record as { type?: string }).type === "assistant"
+    ? { ...record, message: { ...(record as { message: object }).message,
+      content: [{ ...use, input: { value: "y" } }] } } : record);
+  const raw = Buffer.from(mismatched.map((record) => `${JSON.stringify(record)}\n`).join(""));
+  const target = { accountId: 20n, dispose: () => {},
+    exec: { run: async (request: { args: string[] }) => {
+      if (request.args[5] === "--read") {
+        const offset = Number(request.args[7]);
+        const bytes = raw.subarray(offset);
+        return { stdout: JSON.stringify({ data: bytes.toString("base64"),
+          offset: offset + bytes.length }), stderrBytes: 0, exitCode: 0 };
+      }
+      throw new Error("unexpected remote operation");
+    } } };
+  const refused = await observeBoxToolUnknown({ identity, canonicalBody: body, upstreamModel: model }, {
+    resolveTarget: async () => target as never,
+    writeMessage: async () => { throw new Error("must not write"); },
+    journal: {} as never }).then(() => null, (error: unknown) => error);
+  assert.ok(refused instanceof Error && refused.message === "BOX_TOOL_SNAPSHOT_MISMATCH");
+  assert.equal(isBoxReplayRejection(refused), true);
+  assert.equal(isBoxReplayRejection(new BoxExecTransportError("BOX_EXEC_TIMEOUT", false)), false);
+  assert.equal(isBoxReplayRejection(new Error("poll failed")), false);
 });
