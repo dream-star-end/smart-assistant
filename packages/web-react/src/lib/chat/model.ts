@@ -359,6 +359,8 @@ export type ChatMessage = {
   _appliedFrameSeqRanges?: Array<[number, number]>;
   /** hydration 的 complete-anchor 分支盖章：该 tape 已完整原子落库（同步权威传播的作证前提）。 */
   _turnTapeComplete?: boolean;
+  /** Visible tape head precedes the atomic materialization/recovery decision. */
+  _automaticRecoveryDecisionPending?: boolean;
   /** 该行在同一 lossless turn tape 内的持久 record ordinal。多个展开行共享 `_orderSeq`，
    *  其内部顺序必须以本字段为准，不能依赖会回拨/碰撞的 wall-clock `ts`。 */
   _turnTapeOrdinal?: number;

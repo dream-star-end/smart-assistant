@@ -1,4 +1,4 @@
-import { isNextBlockCode } from "./inputPrediction";
+import { isNextBlockCode } from "./nextBlock";
 import { normalizeInlineUiFences } from "./uiFence";
 
 /** Match the Markdown renderer's hidden input controls without loading the IUI schema.

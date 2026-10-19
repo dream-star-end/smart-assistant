@@ -1,6 +1,7 @@
 import { Copy, Download, FileDown, ImageIcon, Share2 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { saveBlob } from "../lib/chat/download";
+import { exportSessionMarkdown, sessionExportFilename } from "../lib/chat/exportMarkdown";
 import type { ChatMessage } from "../lib/chat/model";
 import {
   prepareShareMessages,
@@ -103,6 +104,10 @@ export function ShareDialog({
     [snapshot, range],
   );
   const filename = shareImageFilename(title);
+  const handleExportMarkdown = onExportMarkdown ?? (async () => {
+    const md = await exportSessionMarkdown(messages);
+    saveBlob(new Blob([md], { type: "text/markdown;charset=utf-8" }), sessionExportFilename(title));
+  });
 
   useEffect(() => {
     if (!open) return;
@@ -230,16 +235,14 @@ export function ShareDialog({
         </div>
         <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
           <p className="text-meta text-muted">{env.touch && !env.inApp && card.state === "ready" ? "也可以长按图片直接保存或转发。" : ""}</p>
-          {onExportMarkdown && (
-            <button
-              type="button"
-              onClick={() => void onExportMarkdown()}
-              className="inline-flex min-h-11 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-1 text-meta text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              <FileDown size={14} />
-              导出 Markdown
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => void handleExportMarkdown()}
+            className="inline-flex min-h-11 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-1 text-meta text-muted outline-none hover:text-fg focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <FileDown size={14} />
+            导出 Markdown
+          </button>
         </div>
       </div>
     </Modal>
