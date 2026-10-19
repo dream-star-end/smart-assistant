@@ -7955,9 +7955,16 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/share-export.node-test.mjs",
           "assertion": "OCV5-507 sharing and Markdown downloads contain final answers and portable artifact references"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/exportMarkdown.test.ts",
+          "assertion": "keeps a delivered file on a stopped assistant row before later tools"
         }
       ],
-      "coverageCommits": []
+      "coverageCommits": [
+        "e609ce73"
+      ]
     },
     {
       "id": "INC-20261018-BOX-DELEGATE-EMPTY-CURRENT",
