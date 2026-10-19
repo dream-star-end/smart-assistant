@@ -490,3 +490,26 @@ test('known rate-limit health survives a stalled platform meter', async () => {
   assert.deepEqual(f.health[0].outcome, { kind: 'rate_limited', retryAfterMs: 3000 })
   assert.equal(f.calls.length, 1)
 })
+
+test('rejecting a non-JSON response immediately cancels an unfinished response body', async () => {
+  const f = fixture()
+  let cancelled = 0
+  f.handler(
+    async () =>
+      new Response(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(new TextEncoder().encode('<html>unfinished fixture'))
+          },
+          cancel() {
+            cancelled++
+          },
+        }),
+        { headers: { 'content-type': 'text/html' } },
+      ),
+  )
+  await assert.rejects(f.reader().recognize(await request()), code('RESPONSE_INVALID'))
+  assert.equal(cancelled, 1)
+  assert.equal(f.events[0].outcome, 'invalid')
+  assert.equal(f.calls.length, 1)
+})

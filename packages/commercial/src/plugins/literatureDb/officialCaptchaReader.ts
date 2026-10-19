@@ -218,8 +218,11 @@ async function jsonBody(response: Response, signal: AbortSignal): Promise<Record
   if (
     !response.body ||
     !/^application\/json(?:\s*;|$)/i.test(response.headers.get('content-type') ?? '')
-  )
+  ) {
+    // Rejecting headers must also release a response whose body never finishes.
+    void response.body?.cancel().catch(() => {})
     throw new LiteratureError('RESPONSE_INVALID')
+  }
   const reader = response.body.getReader()
   const chunks: Uint8Array[] = []
   let size = 0
