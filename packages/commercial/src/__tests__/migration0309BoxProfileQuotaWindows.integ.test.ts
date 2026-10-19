@@ -60,6 +60,7 @@ describe("0309 box_claude_profiles quota windows", () => {
     if (db.skipIfUnavailable(t)) return;
     // Roll back the real 0309 boundary, even when the full chain has later migrations.
     await resetAndMigrateBefore("0310");
+    await login("rollback-boundary", "default");
     const block = /-- BEGIN TESTED MANUAL ROLLBACK 0309\n([\s\S]*?)-- END TESTED MANUAL ROLLBACK 0309/.exec(await readFile(sqlPath, "utf8"))![1]!;
     await query(block.split("\n").map((line) => line.replace(/^-- ?/, "")).join("\n"));
     assert.deepEqual(await listBoxProfileQuotas(), []);
