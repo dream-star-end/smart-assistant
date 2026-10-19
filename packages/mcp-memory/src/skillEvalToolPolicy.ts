@@ -26,6 +26,10 @@ export const SKILL_EVAL_BLOCKED_TOOL_NAMES = [
   'ask_user',
   'present_options',
   'project_search',
+  // Antigravity host tools run commands or read the workspace outside the eval fence.
+  'oc_bash',
+  'oc_grep',
+  'oc_glob',
 ] as const satisfies readonly MemoryMcpToolName[]
 
 const blocked = new Set<string>(SKILL_EVAL_BLOCKED_TOOL_NAMES)
