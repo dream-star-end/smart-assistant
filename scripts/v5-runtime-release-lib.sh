@@ -843,24 +843,26 @@ oc_hotcfg__history_verify_line() {
 
 # 返回最后一条 checksum 通过的 committed 条目(归一化 JSON 单行)到 stdout;无则空。
 oc_hotcfg_history_last_committed() {
-  local hist="$1" line out
+  local hist="$1" line out found=0
   [ -f "$hist" ] || return 0
-  # 逆序遍历,首个校验通过者即结果
+  # 找到后仍消费完 tac,避免大 history 的上游 SIGPIPE;不再校验更早条目。
   tac "$hist" 2>/dev/null | while IFS= read -r line; do
+    [ "$found" = 0 ] || continue
     [ -n "$line" ] || continue
-    if out="$(oc_hotcfg__history_verify_line "$line")"; then printf '%s\n' "$out"; break; fi
+    if out="$(oc_hotcfg__history_verify_line "$line")"; then printf '%s\n' "$out"; found=1; fi
   done
 }
 
 # 取倒数第 N 条 checksum 通过的 committed 条目(N=1 即 last,N=2 即上一条)。归一化 JSON 单行到 stdout。
 oc_hotcfg_history_nth_committed() {
-  local hist="$1" n="${2:-1}" cnt=0 line out
+  local hist="$1" n="${2:-1}" cnt=0 line out found=0
   [ -f "$hist" ] || return 0
   tac "$hist" 2>/dev/null | while IFS= read -r line; do
+    [ "$found" = 0 ] || continue
     [ -n "$line" ] || continue
     out="$(oc_hotcfg__history_verify_line "$line")" || continue
     cnt=$((cnt+1))
-    if [ "$cnt" -eq "$n" ]; then printf '%s\n' "$out"; break; fi
+    if [ "$cnt" -eq "$n" ]; then printf '%s\n' "$out"; found=1; fi
   done
 }
 

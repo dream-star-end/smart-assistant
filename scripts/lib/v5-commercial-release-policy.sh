@@ -556,7 +556,14 @@ commercial_policy_keep_failed() { # restore compatible target Plugin access with
   commercial_policy_rmt commercial_policy_py verify target "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$ACTIVE_SRC" "$ACTIVE_UNIT" >/dev/null || return $?
   knowledge_planet_plugin_open_gate_to_release "$BUILT_RELEASE" "$BUILT_RELEASE" || return 79
   assert_mutation_lease_alive policy-keep-weibo || return 86
-  weibo_plugin_open_gate_to_release "$BUILT_RELEASE" "$BUILT_RELEASE" || return 79
+  case "$WEIBO_DEPLOY_BRACKET" in
+    1) weibo_plugin_open_gate_to_release "$BUILT_RELEASE" "$BUILT_RELEASE" || return 79 ;;
+    0)
+      weibo_plugin_advisory_gate "$BUILT_RELEASE" || return 79
+      [[ "$WB_PIN_ALIGNED" == 1 ]] || return 79
+      ;;
+    *) return 79 ;;
+  esac
   return "$original_rc"
 }
 

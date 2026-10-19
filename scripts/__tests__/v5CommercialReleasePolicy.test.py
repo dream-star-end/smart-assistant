@@ -347,6 +347,49 @@ commercial_policy_verified_history
             self.action('clear-accepted-marker',str(self.env),str(self.platform),str(self.live),'test.service')
         self.assertFalse(self.marker.exists())
 
+    def test_actual_keep_failed_reopens_only_weibo_gate_closed_by_this_deploy(self):
+        script = r'''set -euo pipefail
+source "$1/scripts/lib/v5-commercial-release-policy.sh"
+CALLS="$2"; V5_ENV=env; OC_HOTCFG_PLATFORM_ROOT=platform; ACTIVE_SRC=live; ACTIVE_UNIT=unit
+BUILT_RELEASE=/target; WB_PIN_ALIGNED=1
+assert_mutation_lease_alive(){ printf 'OWNER %s\n' "$1" >> "$CALLS"; }
+commercial_policy_rmt(){ printf 'VERIFY %s\n' "$*" >> "$CALLS"; }
+knowledge_planet_plugin_open_gate_to_release(){ printf 'KP %s\n' "$*" >> "$CALLS"; }
+weibo_plugin_advisory_gate(){
+  printf 'ADVISORY %s\n' "$*" >> "$CALLS"
+  WB_PIN_ALIGNED=0
+  [[ "$ADVISORY" != failed ]] || return 1
+  if [[ "$ADVISORY" == noop ]]; then WB_PIN_ALIGNED=1; fi
+}
+weibo_plugin_open_gate_to_release(){
+  printf 'WB_OPEN %s\n' "$*" >> "$CALLS"
+  [[ "$WEIBO_DEPLOY_BRACKET" == 1 && "$ADVISORY" != open-failed ]]
+}
+weibo_plugin_close_gate(){ echo WB_CLOSE >> "$CALLS"; }
+weibo_plugin_seed_candidate(){ echo WB_SEED >> "$CALLS"; }
+commercial_policy_keep_failed "$ORIGINAL_RC"
+'''
+        cases = [('0', 'noop', 78, 78, 'ADVISORY /target'),
+                 ('0', 'noop', 79, 79, 'ADVISORY /target'),
+                 ('1', 'noop', 78, 78, 'WB_OPEN /target /target'),
+                 ('1', 'open-failed', 78, 79, 'WB_OPEN /target /target'),
+                 ('0', 'promote', 78, 79, 'ADVISORY /target'),
+                 ('0', 'failed', 78, 79, 'ADVISORY /target'),
+                 ('unknown', 'noop', 78, 79, None)]
+        for bracket, advisory, original, expected, last in cases:
+            with self.subTest(bracket=bracket, advisory=advisory, original=original):
+                calls = self.root / 'keep-failed-calls'
+                if calls.exists(): calls.unlink()
+                env = os.environ.copy()
+                env.update(WEIBO_DEPLOY_BRACKET=bracket, ADVISORY=advisory, ORIGINAL_RC=str(original))
+                result = subprocess.run(['bash', '-s', '--', str(REPO), str(calls)], input=script,
+                                        text=True, capture_output=True, env=env)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                wanted = ['OWNER policy-keep-service', 'VERIFY commercial_policy_py verify target env platform live unit',
+                          'KP /target /target', 'OWNER policy-keep-weibo']
+                if last is not None: wanted.append(last)
+                self.assertEqual(calls.read_text().splitlines(), wanted)
+
     def test_actual_outer_propagates_typed_saga_rc_without_old_plugin_reopen(self):
         source=(REPO/'scripts/deploy-v5.sh').read_text()
         begin=source.index('  if [[ "$hc_any" == 1 ]]; then\n    if activate_runtime_tuple;')
