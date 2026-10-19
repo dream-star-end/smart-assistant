@@ -40,8 +40,8 @@ function record(input: unknown, keys: readonly string[]): Record<string, unknown
   }
   return result
 }
-function time(value: number): number {
-  if (!Number.isSafeInteger(value) || value < 0 || value > 8_640_000_000_000_000) invalid()
+function time(value: number, minimum = 0): number {
+  if (!Number.isSafeInteger(value) || value < minimum || value > 8_640_000_000_000_000) invalid()
   return value
 }
 function cookie(input: unknown): HttpCookie {
@@ -77,7 +77,7 @@ function cookie(input: unknown): HttpCookie {
     (v.expiresAt !== null && typeof v.expiresAt !== 'number')
   )
     invalid()
-  if (v.expiresAt !== null) time(v.expiresAt as number)
+  if (v.expiresAt !== null) time(v.expiresAt as number, -8_640_000_000_000_000)
   if (v.name.startsWith('__Secure-') && !v.secure) invalid()
   if (v.name.startsWith('__Host-') && (!v.secure || !v.hostOnly || v.path !== '/')) invalid()
   return v as unknown as HttpCookie
@@ -131,6 +131,12 @@ export function acceptJieyouCookie(
   const target = literatureUrl(url)
   if (typeof header !== 'string' || Buffer.byteLength(header) > 4096 || /[\0\r\n]/.test(header))
     invalid()
+  const ages = header
+    .split(';')
+    .slice(1)
+    .filter((part) => /^\s*max-age(?:\s*=|\s*$)/i.test(part))
+  if (ages.length > 1 || (ages.length === 1 && !/^\s*max-age\s*=\s*-?[0-9]+\s*$/i.test(ages[0])))
+    invalid()
   const value = Cookie.parse(header)
   if (!value) invalid()
   if (value.maxAge !== null) {
@@ -159,7 +165,11 @@ export function exportJieyouAccountState(jar: CookieJar, now = Date.now()): Jiey
   const cookies = serialized.cookies.map((v) => {
     if (v.maxAge !== undefined && v.maxAge !== null) invalid()
     const expiresAt =
-      v.expires === undefined || v.expires === 'Infinity' ? null : Date.parse(v.expires)
+      v.expires === undefined || v.expires === 'Infinity'
+        ? null
+        : typeof v.expires === 'string'
+          ? Date.parse(v.expires)
+          : invalid()
     return {
       name: v.key ?? '',
       value: v.value ?? '',

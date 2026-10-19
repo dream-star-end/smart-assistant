@@ -175,3 +175,19 @@ test('invalid or overflowing relative lifetimes and cookie prefixes fail closed'
       validError,
     )
 })
+
+test('pre-epoch cookie deletion preserves unrelated valid session state', () => {
+  const jar = restoreJieyouCookieJar(state())
+  acceptJieyouCookie(
+    jar,
+    'obsolete=; Path=/; Expires=Wed, 31 Dec 1969 23:59:59 GMT',
+    LITERATURE_SITE,
+    Date.now(),
+  )
+  const snapshot = exportJieyouAccountState(jar)
+  assert.deepEqual(
+    snapshot.cookies.map((v) => v.name),
+    ['sid'],
+  )
+  assert(jar.getCookieStringSync(`${LITERATURE_SITE}/e/member/`).includes('sid=synthetic-cookie'))
+})
