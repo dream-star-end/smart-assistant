@@ -369,7 +369,7 @@ test('invalid, partial and tool responses never become a CAPTCHA answer', async 
   }
 })
 
-test('response byte cap, bad JSON and stalled body remain bounded and sanitised', async () => {
+test('response byte cap, bad JSON and stalled body remain bounded and sanitised', async (t) => {
   for (const [text, expected] of [
     ['x'.repeat(65537), 'RESPONSE_TOO_LARGE'],
     ['{', 'MODEL_UNAVAILABLE'],
@@ -381,22 +381,35 @@ test('response byte cap, bad JSON and stalled body remain bounded and sanitised'
   }
   const f = fixture()
   f.deps.timeoutMs = 30
+  t.mock.timers.enable({ apis: ['setTimeout'] })
   let cancelled = 0
-  f.handler(
-    async () =>
-      new Response(
-        new ReadableStream({
-          start(c) {
-            c.enqueue(new TextEncoder().encode('{'))
-          },
-          cancel() {
-            cancelled++
-          },
-        }),
-        { headers: { 'content-type': 'application/json' } },
-      ),
+  let body!: ReadableStream<Uint8Array>
+  f.handler(async () => {
+    body = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('{'))
+      },
+      cancel() {
+        cancelled++
+      },
+    })
+    return new Response(body, { headers: { 'content-type': 'application/json' } })
+  })
+  const reading = f.reader().recognize(await request())
+  let finished = false
+  void reading.then(
+    () => {
+      finished = true
+    },
+    () => {
+      finished = true
+    },
   )
-  await assert.rejects(f.reader().recognize(await request()), code('TIMEOUT'))
+  while (!body?.locked && !finished) await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(f.calls.length, 1)
+  assert.equal(body?.locked, true)
+  t.mock.timers.tick(30)
+  await assert.rejects(reading, code('TIMEOUT'))
   assert.equal(cancelled, 1)
   assert.equal(f.events[0].outcome, 'cancelled')
 })
