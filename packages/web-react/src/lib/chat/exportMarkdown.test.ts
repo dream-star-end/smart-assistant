@@ -144,6 +144,25 @@ describe("exportSessionMarkdown", () => {
     expect(internal).not.toContain("secret.csv");
   });
 
+  test("keeps completed visible summaries before tool and prediction-only tails", async () => {
+    const user = msg({ id: "u", role: "user", text: "复核任务", status: "replied", _clientMessageId: "u", ts: 1 });
+    const summary = msg({ id: "summary", role: "assistant", text: "方案已复核，修改已推送。", _clientMessageId: "u", ts: 2 });
+    const tool = msg({ id: "tool", role: "tool", text: "PRIVATE_TOOL", _clientMessageId: "u", ts: 3 });
+    const prediction = msg({ id: "prediction", role: "assistant", text: '```ui\n{"type":"next","text":"PREDICTION_ONLY"}\n```', _clientMessageId: "u", ts: 4 });
+    const rows = [user, summary, tool, prediction];
+    const snapshot = JSON.stringify(rows);
+    const md = await exportSessionMarkdown(rows);
+    expect(md).toContain(summary.text);
+    expect(md).not.toContain("未完成");
+    expect(md).not.toContain("PRIVATE_TOOL");
+    expect(md).not.toContain("PREDICTION_ONLY");
+    expect(JSON.stringify(rows)).toBe(snapshot);
+    expect(await exportSessionMarkdown(rows, true)).not.toContain(summary.text);
+    expect(await exportSessionMarkdown([user, summary, tool])).not.toContain(summary.text);
+    expect(await exportSessionMarkdown([user, summary, tool, { ...prediction, _errorCode: "ENGINE_ERROR" }])).not.toContain(summary.text);
+    expect(await exportSessionMarkdown([user, { ...summary, _hideUnpublishedFallback: true }, tool, prediction])).not.toContain(summary.text);
+  });
+
   test("空列表得到空串", async () => {
     expect(await exportSessionMarkdown([])).toBe("");
   });
