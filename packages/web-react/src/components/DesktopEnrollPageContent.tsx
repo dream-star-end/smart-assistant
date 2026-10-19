@@ -135,17 +135,17 @@ export function DesktopEnrollPage({ auth }: { auth: AuthSession }) {
               </Alert>
             ) : phase === "returning" ? (
               <>
-                <p role="status" className="text-body text-fg">
+                <output className="block text-body text-fg">
                   正在返回 {BRAND.nameEn}…
-                </p>
+                </output>
                 <Button type="button" variant="primary" className="w-full" onClick={reopenApp}>
                   打开 {BRAND.nameEn}
                 </Button>
               </>
             ) : phase === "done-no-link" ? (
-              <p role="status" className="text-body text-fg">
+              <output className="block text-body text-fg">
                 确认成功，请回到应用继续。
-              </p>
+              </output>
             ) : (
               <>
                 <p className="text-body leading-6 text-fg">
