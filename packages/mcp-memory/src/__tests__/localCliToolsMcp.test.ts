@@ -31,7 +31,7 @@ function childEnv(engine: string | null, home: string): Record<string, string> {
   ]) {
     delete env[key]
   }
-  if (engine === null) delete env.OPENCLAUDE_ENGINE
+  if (engine === null) Reflect.deleteProperty(env, 'OPENCLAUDE_ENGINE')
   else env.OPENCLAUDE_ENGINE = engine
   env.HOME = home
   env.OPENCLAUDE_HOME = home

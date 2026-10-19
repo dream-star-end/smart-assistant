@@ -7557,11 +7557,6 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/openAiChatGoBridge.test.ts",
           "assertion": "later system messages stay in place, so every request extends the previous one (OCV5-432)"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/v5-go-cache-contract.mjs",
-          "assertion": "G1 OpenCode Go prompt cache hits across turns"
         }
       ],
       "proofPending": {
@@ -7615,11 +7610,6 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/codexTurnRetry.test.ts",
           "assertion": "Stop while starting, then shutdown rejects the start → USER_CANCELLED, not CODEX_ERROR"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/v5-stop-before-start-contract.mjs",
-          "assertion": "S1 Stop sent while the engine starts ends the turn before the model answers"
         }
       ],
       "proofPending": {
@@ -7653,11 +7643,6 @@
           "layer": "deploy-gate",
           "path": "scripts/check-v5-grok-cli-compatibility.ts",
           "assertion": "the user's words reach the model's context inline, not as a file to read"
-        },
-        {
-          "layer": "deploy-gate",
-          "path": "scripts/v5-user-contract-smoke.mjs",
-          "assertion": "C3 the model answers from the user's message in its context, never from an offloaded request file"
         }
       ]
     },
@@ -8230,8 +8215,8 @@
         },
         {
           "layer": "deploy-gate",
-          "path": "scripts/v5-go-cache-contract.mjs",
-          "assertion": "G1 OpenCode Go prompt cache hits across turns"
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "[ocv5-500-recovery-pool-identity] PASS — recovery probes authenticate with the eligible pool identity, send nothing without one, and heal only on a completed inference"
         }
       ]
     },
