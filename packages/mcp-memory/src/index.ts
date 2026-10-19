@@ -88,6 +88,7 @@ import {
 import { type ReminderJobView, formatReminderList } from './reminderFormat.js'
 import { rejectClientAssignedResumeIds, resolveReminderResume } from './reminderResume.js'
 import { handleProjectSearch, shouldListProjectSearch } from './projectFileSearch.js'
+import { handleOcBash, handleOcGlob, handleOcGrep } from './localCliTools.js'
 import { filterSkillEvalTools, isSkillEvalBlockedTool } from './skillEvalToolPolicy.js'
 // Tool 定义(TOOLS / SKILL_PROPOSE_TOOL)抽到 ./toolDefs.ts(纯数据模块,无副作用),
 // 让「TOOLS ↔ toolNames.ts」锁步单测能直接 import 校验,而不触发本入口模块顶层的
@@ -300,6 +301,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         return await handleTaskApprove(args as any)
       case 'project_search':
         return await handleProjectSearch(args as any)
+      case 'oc_bash':
+        return await handleOcBash(args)
+      case 'oc_grep':
+        return await handleOcGrep(args)
+      case 'oc_glob':
+        return await handleOcGlob(args)
       case 'ask_user':
         return await handleAskUser(args as any)
       case 'present_options': {

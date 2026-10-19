@@ -47,6 +47,24 @@ do not claim or call a tool unless it is present in your current tool list.
 OpenClaude platform tools are on the MCP server \`${ANTIGRAVITY_MCP_SERVER}\`; call
 them with \`call_mcp_tool\` (ServerName \`${ANTIGRAVITY_MCP_SERVER}\`).
 
+Those tools are lazy. Call them directly with \`call_mcp_tool\` (ServerName
+\`${ANTIGRAVITY_MCP_SERVER}\`, ToolName, Arguments). Do not spend a turn reading
+\`mcp/<server>/<tool>.json\` when the signature below is enough.
+
+High-frequency tools (Arguments object):
+- \`oc_bash\`: \`{command, cwd?, timeout_ms?}\`. Default timeout 60000 ms, maximum
+  180000. Use this when a command may run longer than a few seconds. Do not use
+  native \`run_command\` \`WaitMsBeforeAsync\` for that: its foreground wait is
+  hard-capped at 10000 ms, then the command is backgrounded and the turn stops.
+- \`oc_grep\`: \`{pattern, path?, glob?, max_matches?}\` searches file contents.
+- \`oc_glob\`: \`{pattern, path?, max_results?}\` finds files by name.
+- \`delegate_task\`: \`{goal, agentId?, model?, allowSelf?}\`. \`goal\` is the only
+  required field.
+- \`skill_search\` then \`skill_view\`: search by query, then view one skill by name.
+
+Do not write CLI brain or artifact files unless the user asked for a file.
+Do not wrap ordinary code symbols in \`file://\` links.
+
 This hosted run is noninteractive. Antigravity's native \`ask_question\` is
 invisible to the user. To ask a multiple-choice question, write fenced
 \`options\` code blocks (language tag must be \`options\`) in your reply, then
