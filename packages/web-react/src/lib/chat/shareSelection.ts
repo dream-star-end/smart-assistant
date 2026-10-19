@@ -91,7 +91,7 @@ function selectConversationMessages(
   };
 
   // tail = 按 after 排序的最后一行;lastIndex = 数组里最后一行。两者一致才认这条回答。
-  type Turn = { user: ChatMessage | null; tail: { m: ChatMessage; order: Order } | null; lastIndex: ChatMessage | null; lastBody: { m: ChatMessage; order: Order } | null; deliverables: ChatMessage[]; embedded: ExportMessage | null };
+  type Turn = { user: ChatMessage | null; tail: { m: ChatMessage; order: Order } | null; lastIndex: ChatMessage | null; lastBody: { m: ChatMessage; order: Order } | null; deliverables: ExportMessage[]; embedded: ExportMessage | null };
   const turns: Turn[] = [{ user: null, tail: null, lastIndex: null, lastBody: null, deliverables: [], embedded: null }];
   const byKey = new Map<string, Turn>();
   const rows = messages.filter((m) => !hiddenInChat(m));
@@ -115,7 +115,14 @@ function selectConversationMessages(
     if (includeInterrupted && isAnswerBody(m) && assistantCarriesDeliverable(m)) turn.deliverables.push(m);
     if (includeInterrupted && m.role === "assistant" && (m._errorCode || m._isError || m.error)) {
       const visible = errorPresentation(m._errorCode, m.text, m._errorDetail, m.usage?.waived === true).bodyText || m._stopCopyText;
-      if (visible?.trim()) turn.embedded = { ...m, text: visible, exportIncomplete: true };
+      if (visible?.trim()) {
+        const partial: ExportMessage = { ...m, text: visible, exportIncomplete: true };
+        turn.embedded = partial;
+        // A stop stamp can precede later work rows. Keep already delivered files
+        // from the visible body without promoting errors or process narration.
+        if (isAnswerBody({ ...partial, _errorCode: undefined, _isError: false, error: undefined })
+          && assistantCarriesDeliverable(partial)) turn.deliverables.push(partial);
+      }
     }
     if (isAnswerBody(m)) turn.lastBody = { m, order };
     else if (isFoldableWorkRole(m)) turn.lastBody = null;
