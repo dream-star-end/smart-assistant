@@ -85,6 +85,12 @@ export function AgentPicker({
   // 服务端下发的原因文案优先;前端兜底句统一走 collaborationConfig 常量(OCV5-220),
   // 与 sendCollabFields 同源,不再带「一期 / CCB」这类内部代号(审计 C-32 的诉求由常量兑现)。
   const advisorBlockReason = advisorConsultParentReason || ADVISOR_PARENT_BLOCK_REASON
+  // OCV5-477: with no advisor model to pick, clicking 顾问 could only send a save the server
+  // rejects. Disable it and say why instead.
+  const advisorDisabled = advisorBlocked || advisorModels.length === 0
+  const advisorDisabledReason = advisorBlocked
+    ? advisorBlockReason
+    : advisorUnavailableReason || ADVISOR_UNAVAILABLE_REASON
   const [agents, setAgents] = useState<Agent[]>([MAIN_AGENT])
   const [loading, setLoading] = useState(false)
   const advisorSelectId = useId()
@@ -187,10 +193,10 @@ export function AgentPicker({
                 data-product-feature="advisor-mode"
                 data-product-control
                 aria-pressed={mode === 'advisor'}
-                disabled={advisorBlocked}
-                title={advisorBlocked ? advisorBlockReason : undefined}
+                disabled={advisorDisabled}
+                title={advisorDisabled ? advisorDisabledReason : undefined}
                 onClick={() => {
-                  if (advisorBlocked) return
+                  if (advisorDisabled) return
                   onCollabModeChange('advisor')
                 }}
                 className={cn(
@@ -205,7 +211,7 @@ export function AgentPicker({
                   顾问
                 </span>
                 <span className="mt-0.5 block text-[11px] leading-snug">
-                  {advisorBlocked ? advisorBlockReason : ADVISOR_ENABLED_HINT}
+                  {advisorDisabled ? advisorDisabledReason : ADVISOR_ENABLED_HINT}
                 </span>
               </button>
               <button

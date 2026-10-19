@@ -105,15 +105,19 @@ test("commercial 404 collaboration-config: solo/team stay selectable and team st
       await page.getByTestId("queued-send-row").filter({ hasText: "团队首发在 404 下也要发出" }).waitFor();
 
       await page.getByRole("button", { name: /切换智能体/ }).click();
-      const advisorPut = putDone();
-      await page.getByRole("button", { name: /主模型不变/ }).click();
-      await advisorPut;
+      // No advisor model (config GET 404): 顾问 is disabled with the reason, no doomed save is sent.
+      const advisorBtn = page.locator('[data-product-feature="advisor-mode"]');
+      assert.equal(await advisorBtn.isDisabled(), true, "advisor must be disabled without a model");
+      assert.match(await advisorBtn.innerText(), /暂时没有可用的顾问型号/);
+      const putsBefore = calls.filter((row) => row.kind === "collab" && row.method === "PUT").length;
+      await advisorBtn.click({ force: true });
+      await page.waitForTimeout(300);
+      assert.equal(calls.filter((row) => row.kind === "collab" && row.method === "PUT").length, putsBefore);
       const soloPut = putDone();
       await page.getByRole("button", { name: /主模型独立完成/ }).click();
       await soloPut;
       await page.waitForTimeout(200);
       assert.equal(await pressed(/主模型独立完成/), "true", "solo must stick after a 404 save");
-      assert.equal(await pressed(/主模型不变/), "false");
       assert.equal(await page.getByRole("dialog").getByText(/协作配置保存失败/).count(), 0, "no inline save error once solo is picked");
 
       const teamPut = putDone();
@@ -121,7 +125,7 @@ test("commercial 404 collaboration-config: solo/team stay selectable and team st
       await teamPut;
       await page.waitForTimeout(200);
       assert.equal(await pressed(/队长切换为/), "true", "team must stick after a 404 save");
-      assert.ok(calls.filter((row) => row.kind === "collab" && row.method === "PUT").length >= 4);
+      assert.ok(calls.filter((row) => row.kind === "collab" && row.method === "PUT").length >= 3);
       assert.deepEqual(errors, []);
     } catch (error) {
       console.error("page errors:", errors, "calls:", calls, "body:", (await page.locator("body").innerText()).slice(-2000));
