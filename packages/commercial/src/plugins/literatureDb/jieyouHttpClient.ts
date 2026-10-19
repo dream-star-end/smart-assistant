@@ -1,7 +1,14 @@
 /** Private pre-login HTTP driver. Raw pages/cookies are never model-facing results. */
 import { randomUUID } from 'node:crypto'
 import { type DefaultTreeAdapterMap, Parser, type Token } from 'parse5'
-import { CookieJar } from 'tough-cookie'
+import type { CookieJar } from 'tough-cookie'
+import {
+  type JieyouAccountState,
+  acceptJieyouCookie,
+  createJieyouCookieJar,
+  exportJieyouAccountState,
+  restoreJieyouCookieJar,
+} from './accountState.js'
 import { type CaptchaImage, captchaAnswer, normalizeCaptchaImage } from './captcha.js'
 import { parseLiteratureCredentials } from './credentials.js'
 import { LiteratureError, abortable } from './errors.js'
@@ -18,7 +25,10 @@ export interface JieyouLoginForm {
   readonly action: string
   readonly captchaUrl: string
   readonly hidden: readonly Field[]
-  readonly lifetimes: readonly { readonly value: string; readonly checked: boolean }[]
+  readonly lifetimes: readonly {
+    readonly value: string
+    readonly checked: boolean
+  }[]
   readonly submitValue: string
 }
 export interface JieyouPrivateResponse {
@@ -85,7 +95,11 @@ export function parseJieyouLoginForm(html: string, baseUrl = LOGIN_URL): JieyouL
     .filter((e) => e.tagName === 'form')
     .map((form) => {
       const scope = tree.filter((e) => parser.owners.get(e) === form)
-      return { form, scope, inputs: scope.filter((e) => e.tagName === 'input') }
+      return {
+        form,
+        scope,
+        inputs: scope.filter((e) => e.tagName === 'input'),
+      }
     })
     .filter(({ inputs }) =>
       ['username', 'password', 'key'].every((name) => inputs.some((e) => attr(e, 'name') === name)),
@@ -133,7 +147,10 @@ export function parseJieyouLoginForm(html: string, baseUrl = LOGIN_URL): JieyouL
   if (radios.length < 1 || radios.length > 8) invalid()
   const lifetimes = radios.map((e) => {
     if (attr(e, 'type')?.toLowerCase() !== 'radio' || attr(e, 'disabled') !== undefined) invalid()
-    return Object.freeze({ value: value(e), checked: attr(e, 'checked') !== undefined })
+    return Object.freeze({
+      value: value(e),
+      checked: attr(e, 'checked') !== undefined,
+    })
   })
   if (
     new Set(lifetimes.map((e) => e.value)).size !== lifetimes.length ||
@@ -173,16 +190,21 @@ export function parseJieyouLoginForm(html: string, baseUrl = LOGIN_URL): JieyouL
 
 /** One caller/owner per instance. Installation, lease and persistence remain control-plane duties. */
 export class JieyouHttpClient {
-  private readonly jar = new CookieJar(undefined, {
-    rejectPublicSuffixes: true,
-    allowSpecialUseDomain: false,
-  })
+  private readonly jar: CookieJar
   private form?: JieyouLoginForm
   private challenge?: string
   private busy = false
   private closed = false
   private active?: AbortController
-  constructor(private readonly transport = new LiteratureHttpTransport()) {}
+  constructor(
+    private readonly transport = new LiteratureHttpTransport(),
+    options: { initialState?: unknown } = {},
+  ) {
+    this.jar =
+      options.initialState === undefined
+        ? createJieyouCookieJar()
+        : restoreJieyouCookieJar(options.initialState)
+  }
   private check(signal: AbortSignal): void {
     if (this.closed || signal.aborted) throw new LiteratureError('CANCELLED')
   }
@@ -219,12 +241,9 @@ export class JieyouHttpClient {
       for (const cookie of headers) {
         if (typeof cookie !== 'string' || Buffer.byteLength(cookie) > 4096)
           throw new LiteratureError('RESPONSE_TOO_LARGE')
-        this.jar.setCookieSync(cookie, url, { ignoreError: false })
+        acceptJieyouCookie(this.jar, cookie, url, Date.now())
       }
-      const state = this.jar.serializeSync()
-      if (!state) invalid()
-      if ((state.cookies?.length ?? 0) > 64 || Buffer.byteLength(JSON.stringify(state)) > 32 * 1024)
-        throw new LiteratureError('RESPONSE_TOO_LARGE')
+      exportJieyouAccountState(this.jar)
     } catch (error) {
       this.jar.removeAllCookiesSync()
       this.form = undefined
@@ -305,7 +324,12 @@ export class JieyouHttpClient {
   }
   /** Exactly one POST; returns private evidence, NOT an authenticated verdict. */
   submit(
-    input: { challengeId: string; credentials: unknown; answer: string; lifetime: string },
+    input: {
+      challengeId: string
+      credentials: unknown
+      answer: string
+      lifetime: string
+    },
     signal: AbortSignal,
   ): Promise<JieyouPrivateResponse> {
     return this.run(signal, async (s) => {
@@ -334,16 +358,10 @@ export class JieyouHttpClient {
     })
   }
   /** Private cookie evidence only; it proves neither login success nor account ownership. */
-  exportPrivateCookies(): {
-    schemaVersion: 1
-    origin: string
-    jar: NonNullable<ReturnType<CookieJar['serializeSync']>>
-  } {
+  exportPrivateCookies(): JieyouAccountState {
     if (this.closed) throw new LiteratureError('CANCELLED')
     if (this.busy) throw new LiteratureError('ACCOUNT_BUSY')
-    const jar = this.jar.serializeSync()
-    if (!jar) invalid()
-    return { schemaVersion: 1, origin: LITERATURE_SITE, jar }
+    return exportJieyouAccountState(this.jar)
   }
   /** Seals state and signals cancellation; the future session adapter must await transport drain. */
   close(): void {

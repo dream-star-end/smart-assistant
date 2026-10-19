@@ -8,6 +8,7 @@ import {
   normalizeCaptchaImage,
 } from './captcha.js'
 import { LiteratureError, type LiteratureErrorCode, abortable } from './errors.js'
+import { LITERATURE_SITE } from './policy.js'
 
 export type LoginOutcome =
   | 'authenticated'
@@ -22,11 +23,10 @@ export interface LiteratureLoginSession {
   snapshot(signal: AbortSignal): Promise<unknown>
   close(): Promise<void>
 }
-export interface LoginOwner {
-  userId: number
-  accountId: string
-}
-export interface LoginPersistenceContext extends LoginOwner {
+export type LoginOwner =
+  | { userId: number; accountId: string; kind?: 'account' }
+  | { userId: number; kind: 'setup'; site: typeof LITERATURE_SITE }
+export type LoginPersistenceContext = LoginOwner & {
   operationId: string
   signal: AbortSignal
   isCurrent(): boolean
@@ -64,10 +64,40 @@ export interface LiteratureLoginOptions {
   autoBudgetMs?: number
   now?: () => number
 }
-function ownerKey(o: LoginOwner): string {
-  if (!Number.isSafeInteger(o.userId) || o.userId < 1 || !/^[1-9][0-9]{0,18}$/.test(o.accountId))
+function loginOwner(input: LoginOwner): LoginOwner {
+  if (!input || typeof input !== 'object' || Object.getPrototypeOf(input) !== Object.prototype)
     throw new LiteratureError('INVALID_INPUT')
-  return `${o.userId}:${o.accountId}`
+  const descriptors = Object.getOwnPropertyDescriptors(input)
+  if (
+    Reflect.ownKeys(descriptors).some(
+      (key) => typeof key !== 'string' || !('value' in descriptors[key]),
+    )
+  )
+    throw new LiteratureError('INVALID_INPUT')
+  const owner = Object.fromEntries(Object.entries(descriptors).map(([k, v]) => [k, v.value]))
+  if (!Number.isSafeInteger(owner.userId) || owner.userId < 1)
+    throw new LiteratureError('INVALID_INPUT')
+  if (owner.kind === 'setup') {
+    if (
+      owner.site !== LITERATURE_SITE ||
+      Object.keys(owner).sort().join(',') !== 'kind,site,userId'
+    )
+      throw new LiteratureError('INVALID_INPUT')
+    return { userId: owner.userId, kind: 'setup', site: LITERATURE_SITE }
+  }
+  if (
+    (owner.kind !== undefined && owner.kind !== 'account') ||
+    typeof owner.accountId !== 'string' ||
+    !/^[1-9][0-9]{0,18}$/.test(owner.accountId) ||
+    Object.keys(owner).some((key) => !['userId', 'accountId', 'kind'].includes(key))
+  )
+    throw new LiteratureError('INVALID_INPUT')
+  return { userId: owner.userId, accountId: owner.accountId, kind: 'account' }
+}
+function ownerKey(owner: LoginOwner): string {
+  return owner.kind === 'setup'
+    ? `${owner.userId}:setup:${owner.site}`
+    : `${owner.userId}:account:${owner.accountId}`
 }
 function bounded(value: number, min: number, max: number): number {
   if (!Number.isInteger(value) || value < min || value > max)
@@ -105,6 +135,7 @@ export class LiteratureLoginManager {
     open: (signal: AbortSignal) => Promise<LiteratureLoginSession>,
     persist: Operation['persist'],
   ): LiteratureLoginView {
+    owner = loginOwner(owner)
     const key = ownerKey(owner)
     if (this.closed) throw new LiteratureError('CANCELLED')
     for (const [id, op] of this.operations) {
@@ -183,7 +214,10 @@ export class LiteratureLoginManager {
     const stopAutomatic = () => automatic.abort()
     signal.addEventListener('abort', stopAutomatic, { once: true })
     const timer = setTimeout(stopAutomatic, this.autoBudget)
-    const budget: CaptchaBudget = { cloudCalls: 0, maxCloudCalls: this.cloudMaximum }
+    const budget: CaptchaBudget = {
+      cloudCalls: 0,
+      maxCloudCalls: this.cloudMaximum,
+    }
     try {
       for (let i = 0; i < this.maximum && this.now() < deadline; i++) {
         let answer: string
@@ -309,7 +343,10 @@ export class LiteratureLoginManager {
       this.now() >= op.challenge.expiresAt
     )
       throw new LiteratureError('CHALLENGE_STALE')
-    return { mediaType: op.challenge.image.mediaType, data: Buffer.from(op.challenge.image.data) }
+    return {
+      mediaType: op.challenge.image.mediaType,
+      data: Buffer.from(op.challenge.image.data),
+    }
   }
   answer(
     userId: number,

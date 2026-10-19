@@ -27,11 +27,17 @@ const FORM = `<html><script>const inert='<form method="post">';</script>
 <img src="../../ShowKey/?v=login">
 <input type="submit" name="Submit" value="synthetic-submit">
 </form></html>`
-const credentials = { schemaVersion: 1, username: 'fixture+user', password: 'synthetic&+= 密码' }
+const credentials = {
+  schemaVersion: 1,
+  username: 'fixture+user',
+  password: 'synthetic&+= 密码',
+}
 const signal = () => new AbortController().signal
 const code = (expected: string) => (error: unknown) =>
   error instanceof LiteratureError && error.code === expected
-const picture = sharp({ create: { width: 47, height: 20, channels: 3, background: '#666666' } })
+const picture = sharp({
+  create: { width: 47, height: 20, channels: 3, background: '#666666' },
+})
   .png()
   .toBuffer()
 type Handler = (request: IncomingMessage, response: ServerResponse) => void
@@ -75,7 +81,10 @@ async function fixture(handler?: Handler, timeoutMs = 1000) {
   const address = server.address()
   assert(address && typeof address === 'object')
   const transport = new LiteratureHttpTransport({
-    resolver: { resolve4: async () => ['93.184.216.34'], resolve6: async () => [] },
+    resolver: {
+      resolve4: async () => ['93.184.216.34'],
+      resolve6: async () => [],
+    },
     timeoutMs,
     requestFactory: (options, callback) =>
       httpRequest({ ...options, hostname: '127.0.0.1', port: address.port }, callback),
@@ -147,7 +156,12 @@ test('same private jar reaches challenge; Secure/path/expired cookies never leak
   assert(!/secure=|elsewhere=|expired=/.test(f.cookies[1]))
   await assert.rejects(
     f.client.submit(
-      { challengeId: first.challengeId, credentials, answer: '1234', lifetime: 'fixture-none' },
+      {
+        challengeId: first.challengeId,
+        credentials,
+        answer: '1234',
+        lifetime: 'fixture-none',
+      },
       signal(),
     ),
     code('CHALLENGE_STALE'),
@@ -287,7 +301,7 @@ test('cookie count budget clears partial state instead of retaining an oversized
   t.after(() => f.close())
   t.after(() => f.client.close())
   await assert.rejects(f.client.loadLoginPage(signal()), code('RESPONSE_TOO_LARGE'))
-  assert.equal(f.client.exportPrivateCookies().jar.cookies.length, 0)
+  assert.equal(f.client.exportPrivateCookies().cookies.length, 0)
 })
 
 test('close cancels in-flight requests and concurrent operations cannot mix challenges', async (t) => {
@@ -326,7 +340,12 @@ test('a timed-out POST is never replayed and its challenge remains consumed', as
   t.after(() => f.close())
   t.after(() => f.client.close())
   const challenge = await f.client.getChallenge(signal())
-  const input = { ...challenge, credentials, answer: '1234', lifetime: 'fixture-none' }
+  const input = {
+    ...challenge,
+    credentials,
+    answer: '1234',
+    lifetime: 'fixture-none',
+  }
   await assert.rejects(f.client.submit(input, signal()), code('SUBMISSION_UNCERTAIN'))
   await assert.rejects(f.client.submit(input, signal()), code('CHALLENGE_STALE'))
   assert.equal(submits, 1)
@@ -367,4 +386,25 @@ test('explicit form-owner overrides are rejected instead of assigned to the pars
       ),
     code('RESPONSE_INVALID'),
   )
+})
+
+test('restored HTTP state sends only the matching private cookies and remains client-local', async (t) => {
+  const f = await fixture()
+  t.after(() => f.close())
+  t.after(() => f.client.close())
+  await f.client.getChallenge(signal())
+  const restored = new JieyouHttpClient(f.transport, {
+    initialState: f.client.exportPrivateCookies(),
+  })
+  t.after(() => restored.close())
+  const start = f.cookies.length
+  await restored.getChallenge(signal())
+  assert(f.cookies[start].includes('session=synthetic-session'))
+  assert(!f.cookies[start].includes('secure='))
+  assert(!f.cookies[start].includes('elsewhere='))
+  const separate = new JieyouHttpClient(f.transport)
+  t.after(() => separate.close())
+  const separateStart = f.cookies.length
+  await separate.getChallenge(signal())
+  assert.equal(f.cookies[separateStart], '')
 })

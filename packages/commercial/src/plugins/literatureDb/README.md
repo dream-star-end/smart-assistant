@@ -27,3 +27,9 @@ parse5/tough-cookie已显式加入commercial runtime依赖，锁定现有8.0.1/6
 `platformUsage.ts`提供平台费用专用Postgres begin/finish sink：所有本地校验/选key通过后，必须先COMMIT新的reservation才准一次fetch。同IDbegin重复拒绝；全局500/用户20次UTC日上限，同用户operation最多4次全生命周期（受信服务配置，可收紧）。未知、拒绝、取消和进程崩溃均占额度，不自动退款；六分量usage未知留NULL，不能视为零成本。finish校验owner/operation/provider/model，完全相同重放幂等，冲突不覆盖。删除用户仅匿名保留global计数，解绑/卸载也不能退额度。未声称全局并发限制、token硬额度或精确货币账单；没有任何用户钱包/ledger调用。
 
 新增0313迁移与空表rollback仅供评审，未apply生产。rollback拒绝丢弃已存在的用量；先停服务并保留审计历史才可另行批准清理。个人0310–0312已占，未来商业apply必须先解决小号合并/迁移顺序。本批仍没有已鉴权setup/runtime入口创建这个meter，尚未配置政策批准路由，也没有付费模型调用。refusal仍立即锁存，异步finish失败时reservation留unknown；不冒充完整供应商用量durable消息队列。
+
+`accountState.ts`定义独立的`jieyou-http-cookies-v1`私有格式，不导入tough-cookie的jar options/store。仅允许精确本站及显式父域cookie，校验own data fields、64条/32KiB限额、属性/前缀/绝对日期，恢复时新建固定严格jar；旧通用browser secure/HTTPS验证器不变。客户端收cookie时将Max-Age按本次receipt转为绝对expires，读取或恢复不会延期；Session cookie仍为session标记，后续持久化服务必须另加会话TTL。raw cookie jar格式没有真实用户迁移负担，直接拒绝。codec只证明状态格式，不证明身份。
+
+首次setup在LoginOwner中使用`kind:setup + userId + 固定site`，与真实accountId分开；并发与每小时起次按用户和站点聚合，operation ID由manager生成。首次登录成功后的真实账号分配/加密凭据持久化仍须受信bind事务，不伪造accountId或预建active账号。当前未开放setup路由。
+
+本地验证仅可使用任务专有临时PostgreSQL实例和私有网络命名空间；即使使用dedicated数据库helper，也须将其base/admin连接指向该独立实例，禁止默认共享测试库。详见H交接和独立runner审计证据。

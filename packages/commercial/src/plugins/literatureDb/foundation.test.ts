@@ -669,3 +669,73 @@ test('a late opener with failed cleanup retains its account fence and fails shut
   await assert.rejects(manager.close(), code('CLEANUP_FAILED'))
   assert.equal(f.calls.persisted, 0)
 })
+
+test('first setup has its own tenant identity and passes no fictional account ID to persistence', async (t) => {
+  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  t.after(() => manager.close())
+  const pending = { userId: 17, kind: 'setup' as const, site: LITERATURE_SITE }
+  const f = fixture(await image())
+  let persisted = false
+  const op = manager.start(
+    pending,
+    async () => f.session,
+    async (_state, context) => {
+      assert.equal(context.kind, 'setup')
+      assert.equal(context.userId, 17)
+      assert(!('accountId' in context))
+      assert.equal(context.operationId, op.operationId)
+      assert(context.isCurrent())
+      persisted = true
+    },
+  )
+  assert.throws(() => manager.status(18, op.operationId), code('NOT_FOUND'))
+  assert.equal((await manager.settled(17, op.operationId)).status, 'authenticated')
+  assert(persisted)
+})
+
+test('pending setup capacity and start quotas aggregate by tenant and site', async (t) => {
+  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]), {
+    maxStartsPerHour: 1,
+  })
+  t.after(() => manager.close())
+  const pending = { userId: 17, kind: 'setup' as const, site: LITERATURE_SITE }
+  const f = fixture(await image())
+  const op = manager.start(pending, async () => f.session, f.persist)
+  assert.throws(
+    () => manager.start({ ...pending }, async () => f.session, f.persist),
+    code('ACCOUNT_BUSY'),
+  )
+  const existing = fixture(await image())
+  const parallel = manager.start(owner, async () => existing.session, existing.persist)
+  assert.equal((await manager.settled(17, op.operationId)).status, 'authenticated')
+  assert.equal((await manager.settled(17, parallel.operationId)).status, 'authenticated')
+  assert.throws(
+    () => manager.start({ ...pending }, async () => f.session, f.persist),
+    code('RATE_LIMITED'),
+  )
+  const other = fixture(await image())
+  const otherOp = manager.start(
+    { ...pending, userId: 18 },
+    async () => other.session,
+    other.persist,
+  )
+  assert.equal((await manager.settled(18, otherOp.operationId)).status, 'authenticated')
+})
+
+test('setup owner cannot forge an account or choose another site or rate bucket', async (t) => {
+  const manager = new LiteratureLoginManager(new LiteratureCaptchaSolver([local()]))
+  t.after(() => manager.close())
+  const f = fixture(await image())
+  for (const invalid of [
+    { userId: 17, kind: 'setup', site: LITERATURE_SITE, accountId: '42' },
+    { userId: 17, kind: 'setup', site: 'http://jieyoutsg.com' },
+    { userId: 17, kind: 'setup', site: LITERATURE_SITE, setupId: 'arbitrary' },
+    { userId: 17, accountId: '0' },
+    { userId: 17, accountId: '42', kind: 'unknown' },
+  ])
+    assert.throws(
+      () => manager.start(invalid as never, async () => f.session, f.persist),
+      code('INVALID_INPUT'),
+    )
+  assert.equal(f.calls.challenges, 0)
+})
