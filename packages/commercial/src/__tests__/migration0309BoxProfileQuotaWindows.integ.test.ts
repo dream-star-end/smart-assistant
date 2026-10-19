@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { runMigrations } from "../db/migrate.js";
 import { query } from "../db/queries.js";
 import { generatePersona } from "../account-pool/persona.js";
-import { useDedicatedTestDatabase } from "./helpers/db.js";
+import { resetAndMigrateBefore, useDedicatedTestDatabase } from "./helpers/db.js";
 import { listBoxProfileQuotas, writeBoxProfileHealth } from "../http/proxy/boxClaudeProfileStore.js";
 import { collectBoxClaude } from "../http/admin/boxClaudePool.js";
 
@@ -58,6 +58,8 @@ describe("0309 box_claude_profiles quota windows", () => {
 
   test("the rollback block drops the columns; the reader and writer degrade; the migration applies again", { timeout: 240000 }, async (t) => {
     if (db.skipIfUnavailable(t)) return;
+    // Roll back the real 0309 boundary, even when the full chain has later migrations.
+    await resetAndMigrateBefore("0310");
     const block = /-- BEGIN TESTED MANUAL ROLLBACK 0309\n([\s\S]*?)-- END TESTED MANUAL ROLLBACK 0309/.exec(await readFile(sqlPath, "utf8"))![1]!;
     await query(block.split("\n").map((line) => line.replace(/^-- ?/, "")).join("\n"));
     assert.deepEqual(await listBoxProfileQuotas(), []);
