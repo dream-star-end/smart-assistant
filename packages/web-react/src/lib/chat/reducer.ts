@@ -2579,7 +2579,7 @@ export function applyCallUsage(sess: ChatSession, frame: OutboundCallUsageWire):
  * completed on tape. Hydrate/replay would otherwise append a phantom red card
  * at the end of a finished session. Never suppress the active in-flight turn.
  */
-export function shouldSuppressStaleOutboundError(sess: ChatSession, frame: OutboundErrorWire): boolean {
+export function shouldSuppressStaleOutboundError(sess: ChatSession, frame: { clientMessageId?: string }): boolean {
   const cmid = typeof frame.clientMessageId === "string" && frame.clientMessageId
     ? frame.clientMessageId
     : undefined;
@@ -2589,6 +2589,10 @@ export function shouldSuppressStaleOutboundError(sess: ChatSession, frame: Outbo
   if (cmid && sess.messages.some((m) => m._clientMessageId === cmid && isCompletedTapeAssistant(m))) {
     return true;
   }
+  if (cmid && sess.messages.some((message) =>
+    message.role === "user" && message._automaticRecovery === true &&
+    message._recoveryOfClientMessageId === cmid &&
+    (message._source === "server" || !!message._turnTapeId))) return true;
   if (sess._sendingInFlight) return false;
   if (!cmid) {
     return sess.messages.some(isCompletedTapeAssistant);
@@ -2698,7 +2702,8 @@ export function paintDeferredTerminalError(sess: ChatSession, paint: DeferredTer
   const cmid = paint.clientMessageId;
   if (cmid) {
     const adopted = sess.messages.some((m) =>
-      m.role === "user" && m._automaticRecovery === true && m._recoveryOfClientMessageId === cmid);
+      m.role === "user" && m._automaticRecovery === true && m._recoveryOfClientMessageId === cmid &&
+      (m._source === "server" || !!m._turnTapeId));
     if (adopted) return false;
     const existing = sess.messages.find((m) =>
       m.role === "assistant" && m._clientMessageId === cmid && !!m._errorCode);
@@ -2731,10 +2736,11 @@ function problemCardRootCmid(sess: ChatSession, cmid: string | undefined): strin
  * retrying。attempt 按源轮血统推导(源 user 行已是恢复子轮 → 其 attempt+1,否则 1);后续
  * `sys.recovery_decision` / `outbound.ack{recovery}` 带权威 attempt 再覆盖。
  */
-function enterDeferredRecoverySoftState(sess: ChatSession, clientMessageId: string | undefined): void {
+export function enterDeferredRecoverySoftState(sess: ChatSession, clientMessageId: string | undefined): void {
   const source = clientMessageId
     ? sess.messages.find((m) => m.role === "user" && m.id === clientMessageId)
     : undefined;
+  if (source && source.status !== "replied") source.status = "sent";
   const sourceAttempt = typeof source?._automaticRecoveryAttempt === "number" &&
       Number.isSafeInteger(source._automaticRecoveryAttempt) &&
       source._automaticRecoveryAttempt >= 1
@@ -2818,7 +2824,8 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     ...(frame.clientMessageId ? { clientMessageId: frame.clientMessageId } : {}),
     ...(typeof frame.traceId === "string" && frame.traceId ? { traceId: frame.traceId } : {}),
   };
-  if (isSilentTurnErrorCode(normalized)) {
+  const terminalDecision = frame.recoveryDisposition === "terminal";
+  if (terminalDecision || isSilentTurnErrorCode(normalized)) {
     effects.discardDeferredTerminalError?.(sess.id, paint.clientMessageId);
   }
   if (
@@ -2832,7 +2839,7 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
   // Master 拥有恢复且错误可自动恢复:红卡延后,本轮保持软状态直到 master 裁决。遥测仍照常上报。
   if (
     !userCancelled &&
-    supportsAutomaticTurnRecovery(normalized) &&
+    !terminalDecision && supportsAutomaticTurnRecovery(normalized) &&
     effects.deferTerminalErrorForRecovery?.(sess.id, paint) === true
   ) {
     sess._deferredTerminalErrorClientMessageId = frame.clientMessageId ?? sess._activeClientMessageId;
@@ -2885,7 +2892,7 @@ export function applyOutboundError(sess: ChatSession, frame: OutboundErrorWire, 
     });
   }
   if (normalized === "insufficient_credits") effects.refreshBalance?.();
-  if (supportsAutomaticTurnRecovery(normalized)) {
+  if (!terminalDecision && supportsAutomaticTurnRecovery(normalized)) {
     effects.scheduleAutomaticRecovery?.(sess.id, frame.clientMessageId);
   }
 }
