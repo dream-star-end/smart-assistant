@@ -1,44 +1,31 @@
-## 2026-10-19 20:09 用户变更：x0.2 + 跨路线去重（取代上节方案）
+## 2026-10-19 20:26 用户确认后的最终执行方案
 
-当前29个active Go模型 → 保留14个、停用15个（旧版本9个+跨路线重复6个）。倍率下限x0.2；全部原为x1.000，故14个保留模型仍x1.000，价格变更0项。历史7条disabled/retired保持。
+以界面cost_x为准，内部multiplier全部保持1.000。Go29启用→14保留/15停用，保留中8项x0.1、3项x0.0调整到x0.2；Hy4原x0.2、KimiCode原x0.4、QwenMax原x0.7保持。
 
-先选每条产品线最新版本，再剔除已在其它启用路线提供的同模型；不会因为最新版在别处提供而回填过时Go版本。Contributor是渠道标签，Argon不同effort/context不视为不同模型；Fast/思考档位也不另造模型。Flash/Pro/Max/Plus/Code等明确产品定位仍分系列。
+cost_x基线仍为deepseek-v4-pro原单价225/675/7/0，未修改。对已有非零价模型按相同系数抬高四轴单价，取整数分向上取整，使实际混合成本不低于基线0.2倍且界面四舍五入为x0.2。原四轴全零的LongCat/Step使用基线0.2倍向上取整：45/135/2/0。Muse原非零价但界面舍入x0.0，本次提高到显示x0.2。收费后的LongCat/Step显示名移除Free，保留模型ID及上游-free名称以兼容历史。
 
-| 模型ID | 变更前 | 变更后 | 原因 |
-|---|---|---|---|
-| claude-haiku-5-5-go | active / x1.000 | disabled（倍率保留） | 其它路线已提供同模型：box-claude-haiku-5-5 / box_cli |
-| gemini-4-argon-contributor | active / x1.000 | disabled（倍率保留） | 其它路线已提供同模型：antigravity-gemini-4-argon / antigravity（Contributor是渠道标签） |
-| glm-5.2-go | active / x1.000 | disabled（倍率保留） | 同系列已有更新版本 |
-| glm-5.3-flash-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
-| glm-5.3-go | active / x1.000 | disabled（倍率保留） | 其它路线已提供同模型：glm-5.3-zai / zai |
-| hy3-go | active / x1.000 | disabled（倍率保留） | 同系列已有更新版本 |
-| hy4-preview-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
-| kimi-k2.6-go | active / x1.000 | disabled（倍率保留） | 同系列已有更新版本 |
-| kimi-k2.7-code-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
-| kimi-k3-go | active / x1.000 | disabled（倍率保留） | 其它路线已提供同模型：kimi-k3、k3-256k / moonshot |
-| longcat-2.0-go | active / x1.000 | disabled（倍率保留） | 同系列已有更新版本 |
-| longcat-2.5-preview-free-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
-| mimo-v2.5-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
-| mimo-v2.5-pro-go | active / x1.000 | disabled（倍率保留） | 同系列已有更新版本 |
-| mimo-v2.6-flash-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
-| mimo-v2.6-pro-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
-| minimax-m2.7-go | active / x1.000 | disabled（倍率保留） | 同系列已有更新版本 |
-| minimax-m3-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
-| muse-spark-1.2-go | active / x1.000 | disabled（倍率保留） | 同系列已有更新版本 |
-| muse-spark-1.3-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
-| opencode-gpt-5.6-luna | active / x1.000 | disabled（倍率保留） | 同系列已有更新版本 |
-| opencode-gpt-6-luna | active / x1.000 | disabled（倍率保留） | 其它路线已提供同模型：gpt-6-luna、gpt-6-luna-1m / codex |
-| opencode-grok-4.6 | active / x1.000 | disabled（倍率保留） | 同系列已有更新版本 |
-| opencode-grok-4.7 | active / x1.000 | disabled（倍率保留） | 其它路线已提供同模型：grok-build / grok；另有cursor同版本各档位 |
-| qwen3.7-plus-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
-| qwen3.8-flash-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
-| qwen3.8-max-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
-| space-bunny-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
-| step-5-preview-free-go | active / x1.000 | active / x1.000 | 当前系列最新，且其它启用路线无同模型 |
+价格单位为积分/百万token（输入/输出/缓存读/缓存写）；内部倍率不变。
 
-发现实际依赖：selfhost发布G1门固定要求opencode-gpt-6-luna在canary目录中。直接停用它会导致后续每次发布必失败。因此本票PR把真实Go缓存契约改为固定保留模型Muse Spark 1.3，并保持3轮、缓存命中率>=0.5、原超时、真实WS、逐sessionusage检查及不允许模型覆盖的规则。原Luna零命中形态回归仍保留；源代码特定Responses回归不删。先在现有目录实测Muse缓存，证明替代适用，再发布此门变更，最后停用重复目录。不能先停Luna，也不跳过G1。
-如果Muse无法满足缓存契约，停在已推分支并报告，不降低门槛、不用旧Go模型凑数。商用门脚本不变，商业目录不变。
+| 保留模型 | UI前→后 | 单价前 | 单价后 | 内部倍率 |
+|---|---|---|---|---|
+| glm-5.3-flash-go | x0.1 → x0.2 | 7/25/1/0 | 26/93/4/0 | 1.000 |
+| hy4-preview-go | x0.2 → x0.2 | 41/125/2/0 | 41/125/2/0 | 1.000 |
+| kimi-k2.7-code-go | x0.4 → x0.4 | 47/200/9/0 | 47/200/9/0 | 1.000 |
+| longcat-2.5-preview-free-go | x0.0 → x0.2 | 0/0/0/0 | 45/135/2/0 | 1.000 |
+| mimo-v2.5-go | x0.1 → x0.2 | 7/14/1/0 | 27/53/4/0 | 1.000 |
+| mimo-v2.6-flash-go | x0.1 → x0.2 | 7/14/1/0 | 27/53/4/0 | 1.000 |
+| mimo-v2.6-pro-go | x0.1 → x0.2 | 21/43/1/0 | 42/85/2/0 | 1.000 |
+| minimax-m3-go | x0.1 → x0.2 | 15/60/3/0 | 22/85/5/0 | 1.000 |
+| muse-spark-1.3-go | x0.0 → x0.2 | 5/10/1/0 | 22/44/5/0 | 1.000 |
+| qwen3.7-plus-go | x0.1 → x0.2 | 20/80/2/25 | 31/123/4/39 | 1.000 |
+| qwen3.8-flash-go | x0.1 → x0.2 | 7/23/1/10 | 26/86/4/38 | 1.000 |
+| qwen3.8-max-go | x0.7 → x0.7 | 100/300/12/125 | 100/300/12/125 | 1.000 |
+| space-bunny-go | x0.1 → x0.2 | 7/30/1/0 | 26/110/4/0 | 1.000 |
+| step-5-preview-free-go | x0.0 → x0.2 | 0/0/0/0 | 45/135/2/0 | 1.000 |
 
-补充独立分析：Muse1.3与Go Luna同走Responses桥。历史修复前Muse真实3轮ratio约0.319，原0.3会错误放行；修复后约0.664。因此将固定阈值提高到0.5，并将真实旧/新用量形态写入回归。一次缓存逐出约0.333将按新严格门失败，更新过期断言，不放宽请求数或超时。
+停用15项：claude-haiku-5-5-go, gemini-4-argon-contributor, glm-5.2-go, glm-5.3-go, hy3-go, kimi-k2.6-go, kimi-k3-go, longcat-2.0-go, mimo-v2.5-pro-go, minimax-m2.7-go, muse-spark-1.2-go, opencode-gpt-5.6-luna, opencode-gpt-6-luna, opencode-grok-4.6, opencode-grok-4.7。
 
-本文件为操作规划；实际目录状态、审计号、验证收据以本票CONTINUE和g527证据目录为准。源码提交不执行目录变更。
+用live的patchPricing一次提交每项四轴单价与if_match_lock_version；共11项价格patch。同原disableEntry流程停15项；每项均有审计。其它路线价格/目录、基线不变，不删历史。
+Muse收费不影响缓存token比率计算：G1仍要求3轮、缓存读比例>=0.5及真实Responses桥。预验如在调价前发生，保留其当时冻结价格；发布后调价后的Muse调用按新单价核账，不把旧价格收据冒充新价格验证。
+
+本PR仅迁移缓存契约；目录与价格将通过live admin API执行，证据见OCV5-527交接文件。PR生效前不停Go Luna。
