@@ -19,5 +19,9 @@ test('real shared saga precise red and green faults',()=>{
   assert.match(run('bash','v5-release-policy-red-drill.sh'), /POLICY_RED_GREEN ablated=1 actual=0 faultHits=1:1/)
 })
 test('commercial data adapter and actual outer paths',()=>{
-  assert.match(run('python3','v5CommercialReleasePolicy.test.py'), /Ran 14 tests/)
+  assert.match(run('python3','v5CommercialReleasePolicy.test.py'), /Ran 22 tests/)
+})
+
+test('real commercial egress exact convergence and outage restoration',()=>{
+  assert.match(run('python3','v5CommercialEgressRecovery.test.py'), /Ran 8 tests/)
 })

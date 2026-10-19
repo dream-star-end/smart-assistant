@@ -52,12 +52,12 @@ class CommercialPolicyTest(unittest.TestCase):
         with contextlib.redirect_stdout(out): m.main(name, list(args))
         return out.getvalue().strip()
 
-    def prepare(self):
+    def prepare(self,bundle=""):
         self.action('prepare',json.dumps(self.options),str(self.snap),'',str(self.env),str(self.platform),str(self.hist),
-                    'new','new-id','/new','',str(self.new),str(self.old),'joint')
+                    'new','new-id','/new',bundle,str(self.new),str(self.old),'joint')
         self.action('arm')
         self.live.unlink(); self.live.symlink_to(self.new)
-        self.env.write_text('OC_RUNTIME_IMAGE=new\nOC_RUNTIME_IMAGE_ID=new-id\nOC_RUNTIME_RELEASE=/new\nOC_PLATFORM_BUNDLE=\n')
+        self.env.write_text('OC_RUNTIME_IMAGE=new\nOC_RUNTIME_IMAGE_ID=new-id\nOC_RUNTIME_RELEASE=/new\nOC_PLATFORM_BUNDLE='+bundle+'\n')
 
     def failure(self, authority='applied'):
         return self.action('failure','state',authority,str(self.env),str(self.platform),str(self.live),'test.service')
@@ -80,6 +80,126 @@ class CommercialPolicyTest(unittest.TestCase):
         self.prepare()
         with patch.object(m,'unit_info',return_value=('failed','0','')):
             self.assertEqual(self.failure(),'COMPENSATE_USER_IMPAIRMENT')
+
+    def test_operation_bound_attempt_can_use_fresh_alternate_slot(self):
+        self.prepare()
+        self.action('egress-attempt','B')
+        self.assertEqual(self.action('egress-slot'),'B')
+        c,d=m.context();receipt=self.policy/(c['operationId']+'.egress.json')
+        receipt.write_text(json.dumps(dict(operationId='alien',slot='B')))
+        with self.assertRaises(m.p.PolicyError):self.action('egress-slot')
+
+    def test_exact_operator_evidence_can_recover_degraded_healthy_process(self):
+        self.prepare()
+        with patch.object(m,'unit_info',return_value=('active','123',str(self.new))),patch.object(m,'health',return_value=True):
+            args=['operator','applied',str(self.env),str(self.platform),str(self.live),'test.service','a'*64]
+            self.assertEqual(self.action('failure',*args),'COMPENSATE_USER_IMPAIRMENT')
+            self.env.write_text('OC_RUNTIME_IMAGE=alien\n')
+            self.assertEqual(self.action('failure',*args),'HOLD_UNKNOWN')
+
+    def test_before_history_must_match_actual_frozen_tuple(self):
+        self.prepare()
+        row=dict(image='old',image_id='old-id',release='/old',bundle='')
+        self.action('rollback-before-check',json.dumps(row))
+        row['release']='/earlier-unrelated-history'
+        with self.assertRaises(m.p.PolicyError):self.action('rollback-before-check',json.dumps(row))
+
+    def test_verify_identity_allows_dead_exact_master_but_not_alien_tuple(self):
+        self.prepare()
+        self.action('verify-identity','target',str(self.env),str(self.platform),str(self.live))
+        self.env.write_text('OC_RUNTIME_IMAGE=alien\n')
+        with self.assertRaises(m.p.PolicyError):self.action('verify-identity','target',str(self.env),str(self.platform),str(self.live))
+
+    def test_actual_policy_rollback_preserves_context_and_calls_original_guards(self):
+        # Run the real controller, replacing only external facts/old publisher entrypoint.
+        script=r'''set -eu
+source "$1/scripts/lib/v5-commercial-release-policy.sh"
+DRY=0; CP_ROOT="$2"; DEPLOY_RECOVERY_MARKER="$2/manual"; KL_HOST=fixture
+V5_ENV=env; OC_HOTCFG_PLATFORM_ROOT=platform; ACTIVE_SRC=live; ACTIVE_UNIT=unit
+commercial_policy_ship(){ :; }
+# Dispatcher for the real shell verification function.
+function commercial_policy_rmt() {
+  local fn="$1"; shift
+  if [[ "$fn" == commercial_policy_verified_history ]]; then echo missing; return; fi
+  case "${2:-}" in
+    target.masterRelease) echo new ;;
+    history.path) echo history ;;
+    operationId) echo op ;;
+    *) case "$1" in failure) echo "${DECISION:-COMPENSATE_USER_IMPAIRMENT}" ;; verify-identity|rollback-marker) return "${IDENTITY_RC:-0}" ;; rollback-before-check) return "${N1_RC:-0}" ;; esac ;;
+  esac
+}
+commercial_policy_authority_status(){ echo applied; }
+hotcfg_rmt(){ echo '{}'; }
+commercial_policy_reconcile_metadata(){ echo RECONCILE >> "$CP_ROOT/calls"; }
+rollback(){
+  [[ "$COMMERCIAL_FAILURE_POLICY" == '' && "$DEPLOY_RECOVERY_MARKER" == "$CP_ROOT/op.rollback-recovery" && "$ROLLBACK_N" == 1 ]]
+  [[ -f "$CP_ROOT/manual" && -f "$CP_ROOT/active.json" ]]
+  echo ORIGINAL_ROLLBACK >> "$CP_ROOT/calls"
+}
+ssh(){ shift; bash -c "$*"; }
+commercial_policy_complete_compensation(){ echo FULL_OLD_GATES >> "$CP_ROOT/calls"; }
+commercial_policy_rollback
+'''
+        self.marker.write_text('original typed evidence')
+        (self.policy/'manual').write_text('original typed evidence')
+        (self.policy/'active.json').write_text('original context')
+        for env_add,expected,calls in [({},0,['RECONCILE','ORIGINAL_ROLLBACK','FULL_OLD_GATES']),({'DECISION':'KEEP_FAILED'},79,[]),({'IDENTITY_RC':'86'},86,[]),({'N1_RC':'79'},79,[])]:
+            journal=self.policy/'calls'
+            if journal.exists():journal.unlink()
+            env=os.environ.copy();env.update(env_add)
+            result=subprocess.run(['bash','-s','--',str(REPO),str(self.policy)],input=script,text=True,capture_output=True,env=env)
+            self.assertEqual(result.returncode,expected,result.stdout+result.stderr)
+            self.assertEqual(journal.read_text().splitlines() if journal.exists() else [],calls)
+            self.assertEqual((self.policy/'manual').read_text(),'original typed evidence')
+
+    def test_disabled_predecessor_current_has_exact_repair_plan(self):
+        bundle=self.platform/'bundles/new';bundle.mkdir(parents=True)
+        self.prepare(str(bundle))
+        self.live.unlink();self.live.symlink_to(self.old)
+        self.env.write_text(self.snap.read_text())
+        current=self.platform/'current';current.symlink_to('bundles/new')
+        with patch.object(m,'unit_info',return_value=('active','123',str(self.old))),patch.object(m,'health',return_value=True):
+            plan=self.action('before-current-plan',str(self.env),str(self.platform),str(self.live),'unit')
+            self.assertEqual(json.loads(plan),dict(needed=True,target=''))
+            current.unlink();current.symlink_to('bundles/unrelated')
+            with self.assertRaises(m.p.PolicyError):self.action('before-current-plan',str(self.env),str(self.platform),str(self.live),'unit')
+            current.unlink();current.symlink_to('bundles/new')
+        planfile=self.root/'verified-plan';planfile.write_text(plan)
+        script='''set -eu
+source "$1/scripts/v5-runtime-release-lib.sh"
+source "$1/scripts/lib/v5-commercial-release-policy.sh"
+OC_HOTCFG_PLATFORM_ROOT="$2"; OC_HOTCFG_ENV_FILE=env; CP_LIVE=live; CP_UNIT=unit
+commercial_policy_remote_owner(){ :; }
+commercial_policy_py(){ cat "$PLANFILE"; }
+commercial_policy_restore_disabled_current
+'''
+        env=os.environ.copy();env['PLANFILE']=str(planfile)
+        result=subprocess.run(['bash','-s','--',str(REPO),str(self.platform)],input=script,text=True,capture_output=True,env=env)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+        self.assertFalse(current.is_symlink())
+        self.assertEqual(m.stack(self.live,self.env,self.platform,'B',self.port),m.context()[0]['before'])
+
+    def test_source_binding_uses_frozen_direction_without_head_fallback(self):
+        self.prepare()
+        self.assertEqual(self.action('source-for-release',str(self.new)),'2'*40)
+        self.assertEqual(self.action('source-for-release',str(self.old)),'1'*40)
+        with self.assertRaises(m.p.PolicyError):self.action('source-for-release','/another/release')
+
+    def test_health_observer_uses_actual_commercial_deps_schema(self):
+        from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+        from threading import Thread
+        response=dict(ok=True,channel='v5',deps=dict(sessionsDb='ok',pg='ok',redis='ok'))
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(inner):
+                inner.send_response(200);inner.end_headers();inner.wfile.write(json.dumps(response).encode())
+            def log_message(inner,*args):pass
+        server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
+        thread=Thread(target=server.serve_forever,daemon=True);thread.start()
+        try:
+            self.assertTrue(m.health(server.server_port))
+            response['deps']['sessionsDb']='unavailable';response['sessionsDb']='ok'
+            self.assertFalse(m.health(server.server_port))
+        finally:server.shutdown();thread.join();server.server_close()
 
     def test_unknown_authority_is_not_a_rollback_trigger(self):
         self.prepare()

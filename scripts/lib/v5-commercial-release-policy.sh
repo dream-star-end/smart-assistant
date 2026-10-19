@@ -104,17 +104,16 @@ commercial_policy_failure() { # allow existing compensation only on explicit dir
   return "$rc"
 }
 
-commercial_policy_finish() { # caller has passed every original required gate/finalizer
+commercial_policy_finish() { # caller passed all original required gates/finalizers
   commercial_policy_enabled || return 0
   [[ "$DRY" == 1 ]] && return 0
   local status
   status="$(commercial_policy_authority_status)" || return $?
   [[ "$status" == applied ]] || return 79
-  [[ "$(commercial_policy_rmt commercial_policy_verified_history)" == applied ]] || return $?
+  status="$(commercial_policy_rmt commercial_policy_verified_history)" || return $?
+  [[ "$status" == applied ]] || return 79
   hotcfg_rmt oc_hotcfg_history_last_committed "$OC_HOTCFG_HISTORY" >/dev/null || return 79
-  if [[ "$RESTART_EGRESS" == 1 ]]; then
-    [[ "$(egress_running_cwd)" == "$BUILT_RELEASE" ]] && wait_for_egress_release_ready "$BUILT_RELEASE" 0 30 || return 79
-  fi
+  if [[ "$RESTART_EGRESS" == 1 ]]; then commercial_policy_resume_egress "$BUILT_RELEASE" || return $?; fi
   commercial_policy_rmt commercial_policy_py resolve target applied "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$ACTIVE_SRC" "$ACTIVE_UNIT" || return $?
 }
 
@@ -125,22 +124,19 @@ commercial_policy_authority_status() {
   previous="$(commercial_policy_rmt commercial_policy_py field options.authority.activeRelease)" || return $?
   older="$(commercial_policy_rmt commercial_policy_py field options.authority.previousRelease)" || return $?
   target="$(commercial_policy_rmt commercial_policy_py field target.masterRelease)" || return $?
-  sql="$(ds_stable_release_status_sql "$lock" "$slot" "$previous" "$older" "$target")" || return 79
+  if [[ "${1:-target}" == before ]]; then
+    sql="$(ds_stable_release_status_sql "$((lock+1))" "$slot" "$target" "$previous" "$previous")" || return 79
+  else sql="$(ds_stable_release_status_sql "$lock" "$slot" "$previous" "$older" "$target")" || return 79; fi
   ds_exec <<<"$sql" | tr -d '[:space:]'
 }
 
-commercial_policy_recover() {
-  [[ "$DRY" == 1 ]] && { echo '  [dry-run] exact commercial policy context: reconcile metadata forward, rerun all original gates, then resolve'; return 0; }
-  commercial_policy_ship || return $?
-  local rel status tuple hist previous kind with_dist restart_egress
-  rel="$(commercial_policy_rmt commercial_policy_py field target.masterRelease)" || return $?
-  [[ "$(commercial_policy_rmt commercial_policy_py field options.bundleDigest)" == "$CP_CODE_DIGEST" ]] || return $?
-  [[ "$(commercial_policy_rmt commercial_policy_py field options.queueId)" == "${OC_V5_RELEASE_QUEUE_ID:-}" ]] || return $?
-  commercial_policy_rmt commercial_policy_py verify target "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$ACTIVE_SRC" "$ACTIVE_UNIT" >/dev/null || return $?
+commercial_policy_reconcile_metadata() { # physical target proof is caller's prerequisite
+  local rel="$1" status tuple hist previous kind
   status="$(commercial_policy_authority_status)" || return $?
   if [[ "$status" == original ]]; then
     ACTIVE_STATE_LOCK_VERSION="$(commercial_policy_rmt commercial_policy_py field options.authority.lockVersion)" || return $?
     ACTIVE_STATE_RELEASE="$(commercial_policy_rmt commercial_policy_py field options.authority.activeRelease)" || return $?
+    assert_mutation_lease_alive policy-metadata-reconcile || return 86
     ds_commit_active_release "$rel" || return 79
     status="$(commercial_policy_authority_status)" || return $?
   fi
@@ -152,27 +148,29 @@ commercial_policy_recover() {
     previous="$(commercial_policy_rmt commercial_policy_py field before.masterRelease)" || return $?
     kind="$(commercial_policy_rmt commercial_policy_py field history.transitionKind)" || return $?
     commercial_policy_rmt oc_hotcfg_history_append "$hist" "$(jq -r '.OC_RUNTIME_IMAGE' <<<"$tuple")" "$(jq -r '.OC_RUNTIME_IMAGE_ID' <<<"$tuple")" \
-      "$(jq -r '.OC_RUNTIME_RELEASE' <<<"$tuple")" "$(jq -r '.OC_PLATFORM_BUNDLE' <<<"$tuple")" "$rel" "" "$kind" "$previous" || return 79
+      "$(jq -r '.OC_RUNTIME_RELEASE' <<<"$tuple")" "$(jq -r '.OC_PLATFORM_BUNDLE' <<<"$tuple")" "$rel" "" "$kind" "$previous" || return $?
   fi
-  [[ "$(commercial_policy_rmt commercial_policy_verified_history)" == applied ]] || return $?
+  status="$(commercial_policy_rmt commercial_policy_verified_history)" || return $?
+  [[ "$status" == applied ]] || return 79
+}
+commercial_policy_resume_egress() {
+  local rel="$1" before selection
+  before="$(commercial_policy_rmt commercial_policy_py field options.egressBefore)" || return $?
+  selection="$(egress_slots_remote policy-state "$rel" "$before")" || return $?
+  case "$selection" in
+    target\ *) : ;;
+    before\ *) activate_egress_release "$rel" "$before" || return $? ;;
+    unavailable) egress_slots_remote flip "$EGRESS_SLOT_PREDRAIN_SEC" || return $? ;;
+    *) return 79 ;;
+  esac
+  egress_slots_remote converge "$rel" "$before" || return $?
+  wait_for_egress_release_ready "$rel" 0 30 || return 79
+}
+commercial_policy_required_gates() {
+  local rel="$1" with_dist
+  BUILT_RELEASE_SOURCE_COMMIT="$(commercial_policy_rmt commercial_policy_py source-for-release "$rel")" || return $?
   BUILT_RELEASE="$rel"
-  restart_egress="$(commercial_policy_rmt commercial_policy_py field options.restartEgress)" || return $?
   with_dist="$(commercial_policy_rmt commercial_policy_py field options.withDist)" || return $?
-  if [[ "$restart_egress" == true ]]; then
-    RESTART_EGRESS=1
-    if [[ "$(egress_running_cwd)" != "$rel" ]]; then
-      local expected_egress
-      expected_egress="$(commercial_policy_rmt commercial_policy_py field options.egressBefore)" || return $?
-      [[ "$(egress_running_cwd)" == "$expected_egress" ]] || return 79
-      activate_egress_release "$rel" "$expected_egress" || return $?
-    fi
-    wait_for_egress_release_ready "$rel" 0 30 || return 79
-  fi
-  if [[ "$(commercial_policy_rmt commercial_policy_py archived)" == true ]]; then
-    commercial_policy_rmt commercial_policy_py clear-accepted-marker "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$ACTIVE_SRC" "$ACTIVE_UNIT" || return $?
-    echo "✓ commercial policy receipt cleanup recovered(release=$rel)"
-    return 0
-  fi
   smoke "$ACTIVE_PORT" || return 79
   minimum_functional_core deploy "$rel" "$ACTIVE_PORT" || return 79
   if [[ "$with_dist" == true ]]; then
@@ -182,16 +180,201 @@ commercial_policy_recover() {
     dist_handshake_smoke "$ACTIVE_PORT" || return 79
   fi
   verify_public_surface deploy || return 79
-  # The original seed commands are idempotent official reconcilers. Never substitute DB writes.
   knowledge_planet_plugin_advisory_gate "$rel" || return 79
   weibo_plugin_advisory_gate "$rel" || return 79
   if [[ "$KP_PLUGIN_PROMOTE" == 1 ]]; then knowledge_planet_plugin_seed "$rel" || return 79; fi
   if [[ "$WB_PLUGIN_PROMOTE" == 1 ]]; then weibo_plugin_seed "$rel" || return 79; fi
   end_planned_maintenance || return 79
   smoke_sourcemap_sealed || return 79
+}
+commercial_policy_recover() {
+  [[ "$DRY" == 1 ]] && { echo '  [dry-run] exact policy: recover service, reconcile real metadata, rerun all original gates'; return 0; }
+  commercial_policy_ship || return $?
+  local rel status queue direction restart_egress rc=0
+  rel="$(commercial_policy_rmt commercial_policy_py field target.masterRelease)" || return $?
+  queue="$(commercial_policy_rmt commercial_policy_py field options.queueId)" || return $?
+  [[ "$queue" == "${OC_V5_RELEASE_QUEUE_ID:-}" ]] || return 79
+  direction="$(commercial_policy_rmt commercial_policy_py archive-direction)" || return $?
+  if [[ "$direction" == before ]]; then
+    commercial_policy_complete_compensation || return $?
+    return 0
+  fi
+  if commercial_policy_rmt commercial_policy_py before-current-plan "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$ACTIVE_SRC" "$ACTIVE_UNIT" >/dev/null; then
+    commercial_policy_complete_compensation || return $?
+    return 0
+  else rc=$?; [[ "$rc" != 86 ]] || return 86; fi
+  if commercial_policy_rmt commercial_policy_py verify target "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$ACTIVE_SRC" "$ACTIVE_UNIT" >/dev/null; then :
+  else rc=$?; [[ "$rc" != 86 ]] || return 86; commercial_policy_rollback; return $?; fi
+  commercial_policy_reconcile_metadata "$rel" || return $?
+  BUILT_RELEASE="$rel"
+  restart_egress="$(commercial_policy_rmt commercial_policy_py field options.restartEgress)" || return $?
+  if [[ "$restart_egress" == true ]]; then RESTART_EGRESS=1; commercial_policy_resume_egress "$rel" || return $?; fi
+  if [[ "$direction" == target ]]; then
+    commercial_policy_rmt commercial_policy_py clear-accepted-marker "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$ACTIVE_SRC" "$ACTIVE_UNIT" || return $?
+    echo "✓ exact commercial acceptance receipt cleanup recovered"
+    return 0
+  fi
+  commercial_policy_required_gates "$rel" || return $?
   commercial_policy_finish || return $?
   clear_deploy_recovery_marker_after_stable_recover || return 79
   echo "✓ commercial policy recovered forward(release=$rel)"
+}
+# Read-only admission exception: only this operation's exact typed marker. In-flight fencing
+# remains unconditional in assert_no_deploy_recovery_marker; authority follows under the lease.
+commercial_policy_rollback_preflight() {
+  ssh "$KL_HOST" bash -s -- "$CP_ROOT/active.json" "$DEPLOY_RECOVERY_MARKER" <<'POLICY_PREFLIGHT'
+set -eu
+python3 -B - "$@" <<'CHECK'
+import json,sys
+from pathlib import Path
+c=json.loads(Path(sys.argv[1]).read_text());m=json.loads(Path(sys.argv[2]).read_text())
+assert c['edition']=='commercial' and c['policy']=='user-impact-only'
+assert m==dict(policy='user-impact-only',operationId=c['operationId'])
+CHECK
+POLICY_PREFLIGHT
+}
+commercial_policy_rollback() {
+  [[ "$DRY" == 1 ]] && { echo '  [dry-run] confirmed-user-impact N1 rollback under original guards'; return 0; }
+  commercial_policy_ship || return $?
+  commercial_policy_rmt commercial_policy_py rollback-marker || return $?
+  commercial_policy_rmt commercial_policy_py verify-identity target "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$ACTIVE_SRC" || return $?
+  local rel hist status row decision expected_egress restart_egress op
+  rel="$(commercial_policy_rmt commercial_policy_py field target.masterRelease)" || return $?
+  status="$(commercial_policy_authority_status)" || return $?
+  [[ "$status" == original || "$status" == applied ]] || return 79
+  decision="$(commercial_policy_rmt commercial_policy_py failure operator-rollback "$status" "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$ACTIVE_SRC" "$ACTIVE_UNIT" "${CP_USER_IMPACT_EVIDENCE:-}")" || return $?
+  [[ "$decision" == COMPENSATE_USER_IMPAIRMENT ]] || { echo '✗ rollback requires actual candidate-bound user impairment' >&2; return 79; }
+  hist="$(commercial_policy_rmt commercial_policy_py field history.path)" || return $?
+  status="$(commercial_policy_rmt commercial_policy_verified_history)" || return $?
+  if [[ "$status" == missing ]]; then row="$(hotcfg_rmt oc_hotcfg_history_last_committed "$hist")" || return 79
+  elif [[ "$status" == applied ]]; then row="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$hist" 2)" || return 79
+  else return 79; fi
+  commercial_policy_rmt commercial_policy_py rollback-before-check "$row" || return $?
+  # Repair records of the observed target only, never claim a successful candidate acceptance.
+  commercial_policy_reconcile_metadata "$rel" || return $?
+  row="$(hotcfg_rmt oc_hotcfg_history_nth_committed "$hist" 2)" || return 79
+  commercial_policy_rmt commercial_policy_py rollback-before-check "$row" || return $?
+  op="$(commercial_policy_rmt commercial_policy_py field operationId)" || return $?
+  local original_marker="$DEPLOY_RECOVERY_MARKER" rollback_marker="$CP_ROOT/$op.rollback-recovery"
+  # The shared saga still has a recovery marker: isolated per operation, never blank/bypassed.
+  local COMMERCIAL_FAILURE_POLICY="" DEPLOY_RECOVERY_MARKER="$rollback_marker" ROLLBACK_N=1
+  rollback || return $?
+  ssh "$KL_HOST" "test ! -e '$rollback_marker'" || return 79
+  # Re-enable typed checks in this function's scope; original context/manual evidence survived.
+  COMMERCIAL_FAILURE_POLICY=user-impact-only; DEPLOY_RECOVERY_MARKER="$original_marker"
+  commercial_policy_complete_compensation || return $?
+  echo '✓ actual user impairment recovered by original guarded N1 rollback'
+}
+commercial_policy_complete_compensation() {
+  local before target restart_egress egress_before current status direction
+  before="$(commercial_policy_rmt commercial_policy_py field before.masterRelease)" || return $?
+  target="$(commercial_policy_rmt commercial_policy_py field target.masterRelease)" || return $?
+  commercial_policy_rmt commercial_policy_restore_disabled_current || return $?
+  commercial_policy_rmt commercial_policy_py verify before "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$ACTIVE_SRC" "$ACTIVE_UNIT" >/dev/null || return $?
+  status="$(commercial_policy_authority_status before)" || return $?
+  [[ "$status" == applied ]] || return 79
+  commercial_policy_rmt commercial_policy_compensated_history || return $?
+  restart_egress="$(commercial_policy_rmt commercial_policy_py field options.restartEgress)" || return $?
+  if [[ "$restart_egress" == true ]]; then
+    egress_before="$(commercial_policy_rmt commercial_policy_py field options.egressBefore)" || return $?
+    current="$(egress_running_cwd)" || return 79
+    if [[ "$current" == "$target" ]]; then
+      # Exactly converge the healthy target before asking the original reverse activation.
+      egress_slots_remote stabilize-before-reverse "$target" "$egress_before" || return $?
+      commercial_policy_reverse_egress "$egress_before" "$target" || return $?
+    elif [[ "$current" != "$egress_before" ]]; then
+      commercial_policy_rmt commercial_policy_reverse_unavailable || return $?
+      commercial_policy_reverse_dead_egress "$egress_before" || return $?
+    else
+      commercial_policy_rmt commercial_policy_reverse_pointer "$egress_before" || return $?
+    fi
+    egress_slots_remote converge "$egress_before" "$target" || return $?
+    wait_for_egress_release_ready "$egress_before" 0 30 || return 79
+  fi
+  direction="$(commercial_policy_rmt commercial_policy_py archive-direction)" || return $?
+  if [[ "$direction" == before ]]; then
+    commercial_policy_rmt commercial_policy_py clear-accepted-marker "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$ACTIVE_SRC" "$ACTIVE_UNIT" || return $?
+    return 0
+  fi
+  local op
+  op="$(commercial_policy_rmt commercial_policy_py field operationId)" || return $?
+  ssh "$KL_HOST" "test ! -e '$CP_ROOT/$op.rollback-recovery'" || return 79
+  BUILT_RELEASE="$before"
+  commercial_policy_required_gates "$before" || return $?
+  commercial_policy_rmt commercial_policy_py resolve before reverted "$V5_ENV" "$OC_HOTCFG_PLATFORM_ROOT" "$ACTIVE_SRC" "$ACTIVE_UNIT" || return $?
+}
+commercial_policy_reverse_egress() {
+  local COMMERCIAL_FAILURE_POLICY=""
+  activate_egress_release "$1" "$2"
+}
+commercial_policy_reverse_dead_egress() {
+  local rel="$1" COMMERCIAL_FAILURE_POLICY="" CP_EGRESS_RESTORE=1
+  require_mutation_lease_for_compensation policy-egress-outage-restore || return 86
+  assert_release_marker "$rel" egress || return 79
+  commercial_policy_rmt commercial_policy_reverse_pointer "$rel" || return $?
+  egress_restart_in_place && wait_for_egress_release_ready "$rel" 0 60 || return 79
+}
+commercial_policy_restore_disabled_current() {
+  commercial_policy_remote_owner || return 86
+  local plan target current="$OC_HOTCFG_PLATFORM_ROOT/current"
+  plan="$(commercial_policy_py before-current-plan "$OC_HOTCFG_ENV_FILE" "$OC_HOTCFG_PLATFORM_ROOT" "$CP_LIVE" "$CP_UNIT")" || return $?
+  [[ "$(jq -r .needed <<<"$plan")" == true ]] || return 0
+  target="$(jq -r .target <<<"$plan")" || return 79
+  commercial_policy_remote_owner || return 86
+  if [[ -n "$target" ]]; then
+    rm -f "$current.policy-link" || return 79
+    ln -s "$target" "$current.policy-link" || return 79
+    mv -T "$current.policy-link" "$current" || return 79
+  else rm -f "$current" || return 79; fi
+  oc_hotcfg_fsync_path "$OC_HOTCFG_PLATFORM_ROOT" || return 79
+}
+commercial_policy_reverse_unavailable() {
+  commercial_policy_remote_owner || return 86
+  local before target pointer slot state pid cwd
+  before="$(commercial_policy_py field options.egressBefore)" || return $?
+  target="$(commercial_policy_py field target.masterRelease)" || return $?
+  pointer="$(readlink -f /opt/openclaude/openclaude-v5-egress)" || return 79
+  [[ "$pointer" == "$target" || "$pointer" == "$before" ]] || return 79
+  state="$(systemctl is-active openclaude-v5-egress.service 2>/dev/null || true)"
+  [[ "$state" == inactive || "$state" == failed ]] || return 79
+  for slot in A B; do
+    state="$(systemctl is-active "openclaude-v5-egress@$slot.service" 2>/dev/null || true)"
+    [[ "$state" == failed || "$state" == inactive || "$state" == deactivating ]] || return 79
+    pid="$(systemctl show -p MainPID --value "openclaude-v5-egress@$slot.service")" || return 79
+    if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+      cwd="$(readlink -f "/proc/$pid/cwd")" || return 79
+      [[ "$cwd" == "$before" || "$cwd" == "$target" ]] || return 79
+    elif [[ "$pid" != 0 ]]; then return 79; fi
+  done
+  commercial_policy_port_refused || return $?
+}
+
+commercial_policy_reverse_pointer() {
+  commercial_policy_remote_owner || return 86
+  local rel="$1" before target pointer
+  before="$(commercial_policy_py field options.egressBefore)" || return $?
+  target="$(commercial_policy_py field target.masterRelease)" || return $?
+  pointer="$(readlink -f /opt/openclaude/openclaude-v5-egress)" || return 79
+  [[ "$rel" == "$before" && ( "$pointer" == "$target" || "$pointer" == "$before" ) ]] || return 79
+  commercial_policy_remote_owner || return 86
+  rm -f /opt/openclaude/openclaude-v5-egress.policy-link || return 79
+  ln -s "$rel" /opt/openclaude/openclaude-v5-egress.policy-link || return 79
+  mv -T /opt/openclaude/openclaude-v5-egress.policy-link /opt/openclaude/openclaude-v5-egress || return 79
+  oc_hotcfg_fsync_path /opt/openclaude || return 79
+  systemctl daemon-reload || return 79
+}
+
+commercial_policy_compensated_history() {
+  commercial_policy_remote_owner || return 86
+  commercial_policy_py compensated-history-status >/dev/null || return $?
+  local hist one two
+  hist="$(commercial_policy_py field history.path)" || return $?
+  one="$(tail -n 2 "$hist" | head -n1)" || return 79
+  two="$(tail -n1 "$hist")" || return 79
+  one="$(oc_hotcfg__history_verify_line "$one")" || return 79
+  two="$(oc_hotcfg__history_verify_line "$two")" || return 79
+  jq -e --argjson one "$one" '.schemaVer==3 and ((.preState//false)==false) and .seq==($one.seq+1)' <<<"$two" >/dev/null || return 79
+  commercial_policy_remote_owner || return 86
 }
 
 commercial_policy_egress() {
@@ -200,8 +383,9 @@ commercial_policy_egress() {
 }
 commercial_policy_egress_failure() { # proven failed target only; a private-health timeout is not proof
   commercial_policy_remote_owner || return 86
-  local target_unit="openclaude-v5-egress@$1.service" state pid
-  [[ "$1" == "$(commercial_policy_py field options.egressTargetSlot)" ]] || return 79
+  local target_unit="openclaude-v5-egress@$1.service" state pid attempt
+  attempt="$(commercial_policy_py egress-slot)" || return $?
+  [[ "$1" == "$attempt" ]] || return 79
   state="$(systemctl is-active "$target_unit" 2>/dev/null || true)"
   pid="$(systemctl show "$target_unit" -p MainPID --value 2>/dev/null || true)"
   if [[ "$state" == failed && "$pid" == 0 ]]; then return 0; fi
@@ -221,7 +405,11 @@ commercial_policy_verified_history() {
       if prior="$(oc_hotcfg__history_verify_line "$line")"; then break; fi
       prior=""
     done < <(head -n -1 -- "$hist" | tac)
-    expected=$(( $(jq -r '.seq // 0' <<<"${prior:-{}}") + 1 ))
+    expected=1
+    if [[ -n "$prior" ]]; then
+      expected="$(jq -er '.seq // 0' <<<"$prior")" || return 79
+      expected=$((expected+1))
+    fi
     jq -e '.schemaVer==3 and ((.preState // false)==false)' <<<"$verified" >/dev/null || return 79
     [[ "$(jq -r .seq <<<"$verified")" == "$expected" ]] || return 79
   fi
@@ -357,9 +545,9 @@ commercial_policy_keep_failed() { # restore compatible target Plugin access with
 commercial_policy_egress_unavailable() { # actual user impairment, never inferred from a gate timeout
   commercial_policy_remote_owner || return 86
   local expected="$1" target slot state pid
-  target="$(commercial_policy_py field target.masterRelease)" || return 79
+  target="$(commercial_policy_py field target.masterRelease)" || return $?
   [[ "$expected" == "$target" && "$(readlink -f /opt/openclaude/openclaude-v5-egress)" == "$target" ]] || return 1
-  slot="$(commercial_policy_py field options.egressTargetSlot)" || return 79
+  slot="$(commercial_policy_py egress-slot)" || return $?
   [[ "$slot" == A || "$slot" == B ]] || return 1
   state="$(systemctl is-active "openclaude-v5-egress@$slot.service" 2>/dev/null || true)"
   pid="$(systemctl show "openclaude-v5-egress@$slot.service" -p MainPID --value 2>/dev/null || true)"
@@ -376,7 +564,50 @@ EGRESS_IMPACT
   return "$rc"
 }
 
+commercial_policy_port_refused() {
+  local rc=0
+  python3 -B - <<'EGRESS_REFUSED' || rc=$?
+import errno,socket,sys
+try:
+    with socket.create_connection(('172.31.0.1',18892),timeout=3):sys.exit(79)
+except OSError as error:sys.exit(0 if error.errno==errno.ECONNREFUSED else 79)
+EGRESS_REFUSED
+  commercial_policy_remote_owner || return 86
+  return "$rc"
+}
 commercial_policy_egress_target() {
   commercial_policy_remote_owner || return 86
-  [[ "$1" == "$(commercial_policy_py field options.egressTargetSlot)" ]] || return 79
+  local target="$1" cur="$2" before info
+  [[ "$target" == A || "$target" == B ]] || return 79
+  before="$(commercial_policy_py field options.egressBefore)" || return $?
+  if [[ -n "$cur" ]]; then
+    [[ "$cur" != "$target" ]] || return 79
+    info="$(policy_slot_identity "$cur")" || return 79
+    [[ "$(awk '{print $2}' <<<"$info")" == "$before" ]] || return 79
+    wait_slot_ready "$cur" && policy_unique_listener "$(awk '{print $1}' <<<"$info")" || return 79
+  else commercial_policy_port_refused || return $?; fi
+  commercial_policy_remote_owner || return 86
+  commercial_policy_py egress-attempt "$target" || return $?
+  local actual_attempt
+  actual_attempt="$(commercial_policy_py egress-slot)" || return $?
+  [[ "$actual_attempt" == "$target" ]] || return 79
+}
+
+build_hotcfg_state_hooks() {  # $1=target master release
+  local target="$1" apply_sql revert_sql status_sql next_lock
+  next_lock=$((ACTIVE_STATE_LOCK_VERSION + 1))
+  apply_sql="$(ds_stable_release_commit_sql "$ACTIVE_STATE_LOCK_VERSION" "$ACTIVE_SLOT" "$ACTIVE_STATE_RELEASE" "$target")"
+  revert_sql="$(ds_stable_release_revert_sql "$next_lock" "$ACTIVE_SLOT" "$target" "$ACTIVE_STATE_RELEASE" "$ACTIVE_STATE_PREVIOUS_RELEASE")"
+  status_sql="$(ds_stable_release_status_sql "$ACTIVE_STATE_LOCK_VERSION" "$ACTIVE_SLOT" \
+    "$ACTIVE_STATE_RELEASE" "$ACTIVE_STATE_PREVIOUS_RELEASE" "$target")"
+  # commit 三态协议:0=applied(含“UPDATE 已提交但回执丢失后回读确认”)；10=original 确认；
+  # 11=unknown。命令包在子 shell，避免 exit/return 穿透调用 saga。
+  printf -v HOTCFG_STATE_COMMIT_CMD \
+    '( set -a; . %q; if out="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q 2>/dev/null)" && [ -n "$out" ]; then exit 0; fi; for i in 1 2 3; do status="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q 2>/dev/null || true)"; status="$(printf %%s "$status" | tr -d "[:space:]")"; case "$status" in applied) exit 0 ;; original) exit 10 ;; esac; sleep 1; done; exit 11 )' \
+    "$V5_ENV" "$apply_sql" "$status_sql"
+  # revert 是幂等 reconcile：无论 apply 明确成功、回执不明或明确未命中，只有回读确认
+  # original/reverted 才返回 0；PG 不可读/竞争/alien state 均返回 11，让 saga 保持新运行面。
+  printf -v HOTCFG_STATE_REVERT_CMD \
+    '( set -a; . %q; for i in 1 2 3; do out="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q 2>/dev/null || true)"; [ -n "$out" ] && exit 0; status="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q 2>/dev/null || true)"; status="$(printf %%s "$status" | tr -d "[:space:]")"; case "$status" in original|reverted) exit 0 ;; esac; sleep 1; done; exit 11 )' \
+    "$V5_ENV" "$revert_sql" "$status_sql"
 }

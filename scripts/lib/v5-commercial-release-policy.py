@@ -35,9 +35,9 @@ def context():
         operation = marker['operationId']
         c = p.load(ACTIVE.with_name(ACTIVE.name + '.resolved.' + operation + '.json'), operation)
         o = c['observations']
-        p.require(c['phase'] == 'resolved' and c['resolution'] == 'forward' and o.get('allRequiredPassed') is True
-                  and o.get('lineageCoherent') is True and o.get('verifiedDirection') == 'target'
-                  and o.get('verifiedStackSha256') == p.stack_digest(c['target']), 'archive is not exact forward acceptance')
+        p.require(c['phase'] == 'resolved' and c['resolution'] in ['forward', 'compensated'] and o.get('allRequiredPassed') is True
+                  and o.get('lineageCoherent') is True and o.get('verifiedDirection') == ('target' if c['resolution'] == 'forward' else 'before')
+                  and o.get('verifiedStackSha256') == p.stack_digest(c[o['verifiedDirection']]), 'archive is not exact acceptance')
     d = descriptor(operation)
     p.require(c['edition'] == 'commercial' and d['operationId'] == operation, 'wrong commercial operation')
     for key in ['candidateSha', 'owner', 'before', 'target', 'history']:
@@ -98,7 +98,7 @@ def health(port):
     try:
         with urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:' + str(port) + '/healthz', timeout=4) as response:
             body = json.load(response)
-        return body.get('ok') is True and body.get('channel') == 'v5' and body.get('sessionsDb') == 'ok'
+        return body.get('ok') is True and body.get('channel') == 'v5' and body.get('deps', {}).get('sessionsDb') == 'ok'
     except (OSError, ValueError):
         return False
 
@@ -187,6 +187,12 @@ def main(action, a):
         return
     c, d = context()
     operation = c['operationId']
+    if action == 'archive-direction':
+        print('target' if c.get('resolution') == 'forward' else 'before' if c.get('resolution') == 'compensated' else '')
+        return
+    if action == 'rollback-marker':
+        p.require(json.loads(MARKER.read_text()) == {'policy':p.POLICY,'operationId':operation}, 'not the exact policy marker')
+        return
     if action == 'archived':
         print('true' if c['phase'] == 'resolved' else 'false')
         return
@@ -201,7 +207,7 @@ def main(action, a):
         owner()
         p.checkpoint(ACTIVE, operation, dict(phase='exposure-armed', mayHaveServed=True))
     elif action == 'failure':
-        stage, authority, env, root, live, unit = a
+        stage, authority, env, root, live, unit, *evidence = a
         identity, service = 'unknown', 'unknown'
         try:
             actual = stack(live, env, root, c['target']['slot'], c['target']['port'])
@@ -222,6 +228,9 @@ def main(action, a):
             except OSError as error:
                 if state == 'failed' and error.errno == errno.ECONNREFUSED:
                     facts.update(service='unavailable', impact=dict(kind='local-service-unavailable', candidateSha=c['candidateSha'], masterRelease=c['target']['masterRelease'], unitState='failed', loopbackError='ECONNREFUSED', port=c['target']['port']))
+        if evidence and evidence[0]:
+            p.require(re.fullmatch(r'[0-9a-f]{64}', evidence[0]), 'invalid operator evidence digest')
+            facts['impact'] = dict(kind='operator-confirmed',candidateSha=c['candidateSha'],masterRelease=c['target']['masterRelease'],evidenceSha256=evidence[0])
         owner()
         decision = p.decide(c, facts)
         try:
@@ -230,6 +239,39 @@ def main(action, a):
         except (OSError, p.PolicyError):
             decision = 'HOLD_UNKNOWN'
         print(decision)
+    elif action == 'egress-attempt':
+        p.require(a[0] in ['A','B'], 'invalid attempt slot')
+        p.atomic_write(ROOT / (operation+'.egress.json'),dict(operationId=operation,slot=a[0]))
+    elif action == 'egress-slot':
+        receipt=json.loads((ROOT/(operation+'.egress.json')).read_text())
+        p.require(receipt.get('operationId')==operation and receipt.get('slot') in ['A','B'], 'wrong egress attempt')
+        print(receipt['slot'])
+    elif action == 'source-for-release':
+        matches=[t['sourceCommit'] for t in [c['before'],c['target']] if t['masterRelease']==a[0]]
+        p.require(len(matches)==1, 'release is not exact frozen direction')
+        print(matches[0])
+    elif action == 'before-current-plan':
+        env,root,live,unit=a;t=c['before']
+        actual=stack(live,env,root,t['slot'],t['port'])
+        actual_current=actual.pop('currentTarget');wanted=dict(t);wanted.pop('currentTarget')
+        p.require(actual==wanted, 'not the exact predecessor stack')
+        needed=actual_current!=t['currentTarget']
+        if needed:
+            p.require(t['tuple']['OC_PLATFORM_BUNDLE']=='', 'enabled predecessor current differs')
+            p.require(actual_current==c['target']['currentTarget'], 'current belongs to another transition')
+        one=unit_info(unit)
+        p.require(one[0]=='active' and one[2]==t['masterRelease'] and health(t['port']), 'predecessor master not usable')
+        owner()
+        print(json.dumps(dict(needed=needed,target=t['currentTarget'])))
+    elif action == 'verify-identity':
+        direction, env, root, live = a
+        t=c[direction]
+        p.require(stack(live,env,root,t['slot'],t['port'])==t, 'physical stack differs from '+direction)
+    elif action == 'rollback-before-check':
+        row=json.loads(a[0]); t=c['before']['tuple']
+        p.require(d['history']['transitionKind']=='joint', 'operator policy rollback requires joint history')
+        wanted=dict(image=t['OC_RUNTIME_IMAGE'],image_id=t['OC_RUNTIME_IMAGE_ID'],release=t['OC_RUNTIME_RELEASE'],bundle=t['OC_PLATFORM_BUNDLE'])
+        p.require(all(row.get(k)==v for k,v in wanted.items()), 'official N1 tuple differs from frozen predecessor')
     elif action == 'verify':
         direction, env, root, live, unit = a
         print(verify(c, direction, env, root, live, unit))
@@ -243,9 +285,17 @@ def main(action, a):
         p.resolve(ACTIVE, operation, 'forward' if direction == 'target' else 'compensated')
         clear_marker(operation)
     elif action == 'clear-accepted-marker':
-        p.require(c['phase'] == 'resolved' and c['resolution'] == 'forward', 'archive not accepted')
-        verify(c, 'target', *a)
+        p.require(c['phase'] == 'resolved' and c['resolution'] in ['forward','compensated'], 'archive not accepted')
+        verify(c, 'target' if c['resolution']=='forward' else 'before', *a)
         clear_marker(operation)
+    elif action == 'compensated-history-status':
+        raw=Path(c['history']['path']).read_bytes(); lines=raw.splitlines(keepends=True)
+        p.require(len(lines)>=2 and hashlib.sha256(b''.join(lines[:-2])).hexdigest()==c['history']['predecessorSha256'], 'compensated history prefix differs')
+        for rawrow, direction, previous in [(lines[-2],'target',c['before']['masterRelease']),(lines[-1],'before',c['target']['masterRelease'])]:
+            row=json.loads(rawrow);t=c[direction];v=t['tuple']
+            wanted=dict(image=v['OC_RUNTIME_IMAGE'],image_id=v['OC_RUNTIME_IMAGE_ID'],release=v['OC_RUNTIME_RELEASE'],bundle=v['OC_PLATFORM_BUNDLE'],masterRelease=t['masterRelease'],previousMasterRelease=previous,transitionKind='joint')
+            p.require(all(row.get(k)==val for k,val in wanted.items()), 'compensated history identity differs')
+        print('reverted')
     elif action == 'history-status':
         raw = Path(c['history']['path']).read_bytes()
         before = c['history']['predecessorSha256']

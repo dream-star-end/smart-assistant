@@ -269,6 +269,7 @@ assert_overrides_no_remove_keys() {
   [ "$bad" = 0 ] || exit 1
 }
 
+CP_USER_IMPACT_EVIDENCE=""
 DRY=0; MODE="deploy"; ROLLBACK_N=1; RESTART_EGRESS=0; WITH_DIST=0; ALLOW_UNVERIFIED_CI=0; HOT_CONFIG=0; HOT_CONFIG_FORCE=0
 DEFER_KNOWLEDGE_PLANET_UPGRADE=0
 KNOWLEDGE_PLANET_VERIFY_USER=""
@@ -367,6 +368,7 @@ for arg in "$@"; do
     # 【不】重启它(这正是解耦目的);仅 egress 相关代码(anthropicProxy/账号池/
     # 计费 finalize/egress/*)变更时显式带本 flag。重启走 SIGTERM drain。
     --egress) RESTART_EGRESS=1 ;;
+    --user-impact-evidence=*) CP_USER_IMPACT_EVIDENCE="${arg#*=}" ;;
     --failure-policy=*) COMMERCIAL_FAILURE_POLICY="${arg#*=}" ;;
     *) echo "未知参数: $arg" >&2; exit 2 ;;
   esac
@@ -470,11 +472,13 @@ if [[ -n "$TARGET_RUNTIME_IMAGE$TARGET_RUNTIME_IMAGE_ID" ]]; then
 fi
 
 if [[ -n "$COMMERCIAL_FAILURE_POLICY" ]]; then
-  [[ "$COMMERCIAL_FAILURE_POLICY" == user-impact-only && ( "$MODE" == deploy || "$MODE" == recover ) ]] \
-    || { echo '✗ --failure-policy=user-impact-only supports normal deploy or exact-context recover only' >&2; exit 2; }
+  [[ "$COMMERCIAL_FAILURE_POLICY" == user-impact-only && ( "$MODE" == deploy || "$MODE" == recover || ( "$MODE" == rollback && "$ROLLBACK_N" == 1 ) ) ]] \
+    || { echo '✗ --failure-policy=user-impact-only supports normal deploy, exact-context recover, or confirmed-impact N1 rollback only' >&2; exit 2; }
   [[ "$DEFER_KNOWLEDGE_PLANET_UPGRADE" != 1 ]] \
     || { echo '✗ setup-first requires its own policy adapter; no exposure performed' >&2; exit 2; }
 fi
+
+[[ -z "$CP_USER_IMPACT_EVIDENCE" || ( "$MODE" == rollback && "$COMMERCIAL_FAILURE_POLICY" == user-impact-only && "$CP_USER_IMPACT_EVIDENCE" =~ ^[0-9a-f]{64}$ ) ]] || { echo "invalid operator user-impact evidence" >&2; exit 2; }
 
 run() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] $*"; else eval "$@"; fi; }
 sshk() { if [[ "$DRY" == 1 ]]; then echo "  [dry-run] ssh $KL_HOST '$*'"; else ssh "$KL_HOST" "$@"; fi; }
@@ -2560,7 +2564,12 @@ REMOTE
 
 assert_no_deploy_recovery_marker() {
   [[ "$DRY" == 1 ]] && return 0
-  if [[ "$MODE" != recover ]] && ! ssh "$KL_HOST" "test ! -e '$CP_ROOT/active.json' && test ! -L '$CP_ROOT/active.json'"; then
+  local policy_rollback=0
+  if [[ "$MODE" == rollback ]] && commercial_policy_enabled; then
+    commercial_policy_rollback_preflight || return $?
+    policy_rollback=1
+  fi
+  if [[ "$MODE" != recover && "$policy_rollback" != 1 ]] && ! ssh "$KL_HOST" "test ! -e '$CP_ROOT/active.json' && test ! -L '$CP_ROOT/active.json'"; then
     echo '✗ unresolved commercial release policy context; exact-context recover required' >&2
     return 79
   fi
@@ -2568,7 +2577,7 @@ assert_no_deploy_recovery_marker() {
     echo '✗ typed context requires --recover --failure-policy=user-impact-only' >&2
     return 79
   fi
-  if [[ "$MODE" != "recover" ]] && ! ssh "$KL_HOST" "test ! -e '$DEPLOY_RECOVERY_MARKER'"; then
+  if [[ "$MODE" != "recover" && "$policy_rollback" != 1 ]] && ! ssh "$KL_HOST" "test ! -e '$DEPLOY_RECOVERY_MARKER'"; then
     echo "✗ 检测到未收敛的人工恢复标记:$KL_HOST:$DEPLOY_RECOVERY_MARKER" >&2
     ssh "$KL_HOST" "sed -n '1,20p' '$DEPLOY_RECOVERY_MARKER'" 2>/dev/null | sed 's/^/  /' >&2 || true
     echo "  禁止任何新写 lane；先核对 deploy_state、A/B symlink/unit 与 runtime tuple，再走官方 --recover 收敛并清除。" >&2
@@ -6449,24 +6458,7 @@ hotcfg_core_smoke_cmd() {
 # bash 内执行，严格复用 v5-deploy-state-lib.sh 生成的 SQL；commit 落空/PG 错误会触发 hotcfg
 # 原有的 env/current/symlink/unit 全补偿，history 写失败则再用 revert SQL 恢复原 release 血缘。
 HOTCFG_STATE_COMMIT_CMD=""; HOTCFG_STATE_REVERT_CMD=""
-build_hotcfg_state_hooks() {  # $1=target master release
-  local target="$1" apply_sql revert_sql status_sql next_lock
-  next_lock=$((ACTIVE_STATE_LOCK_VERSION + 1))
-  apply_sql="$(ds_stable_release_commit_sql "$ACTIVE_STATE_LOCK_VERSION" "$ACTIVE_SLOT" "$ACTIVE_STATE_RELEASE" "$target")"
-  revert_sql="$(ds_stable_release_revert_sql "$next_lock" "$ACTIVE_SLOT" "$target" "$ACTIVE_STATE_RELEASE" "$ACTIVE_STATE_PREVIOUS_RELEASE")"
-  status_sql="$(ds_stable_release_status_sql "$ACTIVE_STATE_LOCK_VERSION" "$ACTIVE_SLOT" \
-    "$ACTIVE_STATE_RELEASE" "$ACTIVE_STATE_PREVIOUS_RELEASE" "$target")"
-  # commit 三态协议:0=applied(含“UPDATE 已提交但回执丢失后回读确认”)；10=original 确认；
-  # 11=unknown。命令包在子 shell，避免 exit/return 穿透调用 saga。
-  printf -v HOTCFG_STATE_COMMIT_CMD \
-    '( set -a; . %q; if out="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q 2>/dev/null)" && [ -n "$out" ]; then exit 0; fi; for i in 1 2 3; do status="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q 2>/dev/null || true)"; status="$(printf %%s "$status" | tr -d "[:space:]")"; case "$status" in applied) exit 0 ;; original) exit 10 ;; esac; sleep 1; done; exit 11 )' \
-    "$V5_ENV" "$apply_sql" "$status_sql"
-  # revert 是幂等 reconcile：无论 apply 明确成功、回执不明或明确未命中，只有回读确认
-  # original/reverted 才返回 0；PG 不可读/竞争/alien state 均返回 11，让 saga 保持新运行面。
-  printf -v HOTCFG_STATE_REVERT_CMD \
-    '( set -a; . %q; for i in 1 2 3; do out="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q 2>/dev/null || true)"; [ -n "$out" ] && exit 0; status="$(psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAq -c %q 2>/dev/null || true)"; status="$(printf %%s "$status" | tr -d "[:space:]")"; case "$status" in original|reverted) exit 0 ;; esac; sleep 1; done; exit 11 )' \
-    "$V5_ENV" "$revert_sql" "$status_sql"
-}
+# build_hotcfg_state_hooks is defined in the mandatory commercial policy library.
 
 # activate_runtime_tuple is defined in the mandatory commercial policy library.
 
@@ -7037,7 +7029,8 @@ egress_running_cwd() {
 # templates are installed, else the legacy unit's restart.
 egress_restart_in_place() {
   if ssh "$KL_HOST" "test -f '/etc/systemd/system/$V5_EGRESS_SLOT_SERVICE_TPL'"; then
-    egress_slots_remote flip "$EGRESS_SLOT_PREDRAIN_SEC"
+    if [[ "${CP_EGRESS_RESTORE:-0}" == 1 ]]; then egress_slots_remote restore "$EGRESS_SLOT_PREDRAIN_SEC"
+    else egress_slots_remote flip "$EGRESS_SLOT_PREDRAIN_SEC"; fi
   else
     ssh "$KL_HOST" "systemctl restart '$V5_EGRESS_UNIT'"
   fi
@@ -8260,6 +8253,7 @@ activate_egress_release() {
   [[ "$egress_user_impairment" != 86 ]] || return 86
   [[ "$egress_user_impairment" == 0 ]] || commercial_policy_failure egress-activation || return $?
 
+  local COMMERCIAL_FAILURE_POLICY="" CP_EGRESS_RESTORE=1 # scoped confirmed-impairment restoration
   # 新 unit 的 WorkingDirectory 是稳定独立指针，所以回切先原子翻回旧 release。
   # 旧进程仍在服务时(新槽没起来)指针翻回即可；否则在旧 release 上再翻一次槽(或 legacy restart)。
   require_mutation_lease_for_compensation "egress-release-compensation" || exit 86
@@ -11709,7 +11703,7 @@ run_selected_mode() { # [mode]
     offline-recycle) assert_not_bluegreen_for_cutover; offline_recycle ;;
     stage)     assert_not_bluegreen_for_cutover; stage ;;
     activate-staged) assert_not_bluegreen_for_cutover; activate_staged ;;
-    rollback)  rollback ;;
+    rollback)  if commercial_policy_enabled; then commercial_policy_rollback; else rollback; fi ;;
     reclaim-mutation-lease) reclaim_production_mutation_lease ;;
     reclaim-mutation-inflight) reclaim_mutation_lane_inflight ;;
     canary)    canary ;;
