@@ -3609,6 +3609,7 @@ async function cleanUp(): Promise<void> {
  * (OCV5-368). OCV5-491 brings the fixes to selfhost and calls them again.
  * Nothing here counts them as passed. */
 // [ocv5-499-pending-user] PASS — the full delegated goal and late tool announcement reach the same current stdin without changing canonical bytes or completed tool history
+// [ocv5-520-go-pool-wiring] PASS — ordinary Go uses an enabled pool identity instead of disabled static credentials while request bytes and session headers stay stable
 async function main(): Promise<void> {
   const expectSha = parseArgs(process.argv);
   const deadline = setTimeout(() => {
