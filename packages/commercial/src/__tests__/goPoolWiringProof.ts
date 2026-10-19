@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { getStaticProvider } from "@openclaude/protocol";
-import { scopedApiKeyPoolWiring, type ApiKeyPoolWiring } from "../../packages/commercial/src/http/proxy/apiKeyPoolWiring.js";
-import { pickUpstream, validateUpstreamConfig, type PickUpstreamDeps } from "../../packages/commercial/src/http/proxy/upstream.js";
-import { rootLogger } from "../../packages/commercial/src/logging/logger.js";
+import { scopedApiKeyPoolWiring, type ApiKeyPoolWiring } from "../http/proxy/apiKeyPoolWiring.js";
+import { pickUpstream, validateUpstreamConfig, type PickUpstreamDeps } from "../http/proxy/upstream.js";
+import { rootLogger } from "../logging/logger.js";
 
 /** OCV5-520: synthetic credentials only, no network/DB. Exercise the candidate's
  * ordinary Go wiring and real auth builder, including stable request bytes. */

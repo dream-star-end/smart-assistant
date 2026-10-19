@@ -31,7 +31,6 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { provePendingUser } from "./lib/boxPendingUserProof.js";
 import { proveLocalCatalogOwner } from "./lib/boxLocalCatalogOwnerProof.js";
-import { proveGoPoolWiring } from "./lib/goPoolWiringProof.js";
 import { proveRefusedRecoveryClosed as refusedRecoveryProof } from "./lib/boxRefusedRecoveryProof.js";
 import { misrecordedRun, proveCliRepairedToolInput, proveForeignToolHistory, rereadError } from "./lib/boxCliRepairProof.js";
 
@@ -3665,7 +3664,6 @@ async function cleanUp(): Promise<void> {
 
 // [ocv5-499-pending-user] PASS — the full delegated goal and late tool announcement reach the same current stdin without changing canonical bytes or completed tool history
 // [ocv5-518-local-catalog-owner] PASS — the trusted owner reaches a cold delegate descriptor after legacy LKG upgrade while the original v1 token remains accepted
-// [ocv5-520-go-pool-wiring] PASS — ordinary Go uses an enabled pool identity instead of disabled static credentials while request bytes and session headers stay stable
 async function main(): Promise<void> {
   const expectSha = parseArgs(process.argv);
   const deadline = setTimeout(() => {
@@ -3679,7 +3677,7 @@ async function main(): Promise<void> {
   cleanups.add(() => rmSync(home, { recursive: true, force: true }));
   process.env.OPENCLAUDE_HOME = home;
   const api = await load();
-  const proofs = [await proveGoPoolWiring(), proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
+  const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
     provePendingUser(api), await proveLocalCatalogOwner(api), proveImageCaption(api), proveParallelImageCaption(api),
     proveForeignToolHistory(api), await proveCliRepaired(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveMixedCallTurnCut(api),

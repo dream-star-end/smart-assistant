@@ -8104,7 +8104,7 @@
         },
         {
           "layer": "deploy-gate",
-          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "path": "scripts/check-v5-box-success-recovery.ts",
           "assertion": "[ocv5-520-go-pool-wiring] PASS — ordinary Go uses an enabled pool identity instead of disabled static credentials while request bytes and session headers stay stable"
         }
       ]
