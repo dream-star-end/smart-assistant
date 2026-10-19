@@ -31,6 +31,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { provePendingUser } from "./lib/boxPendingUserProof.js";
 import { proveLocalCatalogOwner } from "./lib/boxLocalCatalogOwnerProof.js";
+import { proveGoPoolWiring } from "./lib/goPoolWiringProof.js";
 import { proveRefusedRecoveryClosed as refusedRecoveryProof } from "./lib/boxRefusedRecoveryProof.js";
 import { misrecordedRun, proveCliRepairedToolInput, proveForeignToolHistory, rereadError } from "./lib/boxCliRepairProof.js";
 
@@ -3677,7 +3678,7 @@ async function main(): Promise<void> {
   cleanups.add(() => rmSync(home, { recursive: true, force: true }));
   process.env.OPENCLAUDE_HOME = home;
   const api = await load();
-  const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
+  const proofs = [await proveGoPoolWiring(), proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
     provePendingUser(api), await proveLocalCatalogOwner(api), proveImageCaption(api), proveParallelImageCaption(api),
     proveForeignToolHistory(api), await proveCliRepaired(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveMixedCallTurnCut(api),
