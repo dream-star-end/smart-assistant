@@ -4,6 +4,14 @@ import {
   isLiteratureHttpContract,
   isLiteratureHttpIdentity,
 } from './literatureDb/builtinContract.js'
+import {
+  type LiteratureCredentials,
+  type SerializedLiteratureCredentials,
+  openLiteratureCredentials,
+  parseSerializedLiteratureCredentials,
+  sealLiteratureCredentials,
+  serializeSealedLiteratureCredentials,
+} from './literatureDb/credentials.js'
 /** Encrypted account storage for managed-browser Plugins (connections table, strict v1 envelope). */
 
 import { randomUUID } from 'node:crypto'
@@ -79,9 +87,11 @@ export interface PluginAccountEnvelopeV1 {
 export interface LiteratureHttpAccountEnvelopeV1
   extends Omit<PluginAccountEnvelopeV1, 'storageState'> {
   storageState: JieyouAccountState
+  credentialSeal?: SerializedLiteratureCredentials
 }
 type StoredPluginAccountEnvelope = Omit<PluginAccountEnvelopeV1, 'storageState'> & {
   storageState: BrowserStorageStateV1 | JieyouAccountState
+  credentialSeal?: SerializedLiteratureCredentials
 }
 
 /** A transport flag is data being checked, never the authority for choosing its policy. */
@@ -305,6 +315,7 @@ function validateStoredEnvelope(
       'driverVersion',
       'accountInstanceId',
       'storageState',
+      ...(isLiteratureHttpContract(contract) ? ['credentialSeal'] : []),
     ],
     'Plugin account envelope',
   )
@@ -317,6 +328,14 @@ function validateStoredEnvelope(
     !UUID_RE.test(value.accountInstanceId)
   )
     throw new PluginAccountError('SECRET_INVALID', 'Plugin account envelope contract mismatch')
+  let credentialSeal: SerializedLiteratureCredentials | undefined
+  if (value.credentialSeal !== undefined) {
+    try {
+      credentialSeal = parseSerializedLiteratureCredentials(value.credentialSeal)
+    } catch {
+      throw new PluginAccountError('SECRET_INVALID', 'Plugin credential seal failed validation')
+    }
+  }
   return {
     schemaVersion: 1,
     pluginType: 'managed-browser',
@@ -324,6 +343,7 @@ function validateStoredEnvelope(
     driverVersion: contract.runtime.driverVersion,
     accountInstanceId: value.accountInstanceId,
     storageState: validateAccountStorageState(value.storageState, contract),
+    ...(credentialSeal ? { credentialSeal } : {}),
   }
 }
 
@@ -425,6 +445,61 @@ export function decryptLiteratureHttpAccountEnvelope(
     throw new PluginAccountError('SECRET_INVALID', 'HTTP account contract pin mismatch')
   const envelope = decryptStoredPluginAccountEnvelope(row, contract, env)
   return { ...envelope, storageState: parseJieyouAccountState(envelope.storageState) }
+}
+
+/** Private login input only. Callers must already hold the account trust/lease fence. */
+export function decryptLiteratureHttpAccountCredentials(
+  row: PluginAccountRow,
+  contract: ManagedBrowserPluginContractV1,
+  env: NodeJS.ProcessEnv = process.env,
+): LiteratureCredentials | undefined {
+  const envelope = decryptLiteratureHttpAccountEnvelope(row, contract, env)
+  if (!envelope.credentialSeal) return undefined
+  const seal = envelope.credentialSeal
+  try {
+    return openLiteratureCredentials(
+      {
+        schemaVersion: 1,
+        aadSeed: seal.aadSeed,
+        ciphertext: Buffer.from(seal.ciphertext, 'base64'),
+        nonce: Buffer.from(seal.nonce, 'base64'),
+      },
+      { userId: row.user_id, accountId: row.id },
+      env,
+    )
+  } catch {
+    throw new PluginAccountError('SECRET_INVALID', 'Plugin credentials failed validation')
+  }
+}
+
+type LiteratureCredentialChange = { action: 'set'; credentials: unknown } | { action: 'clear' }
+function credentialChange(value: unknown): LiteratureCredentialChange | undefined {
+  if (value === undefined) return undefined
+  const o = dataObject(value, 'Plugin credential change')
+  if (o.action === 'clear') {
+    exactKeys(o, ['action'], 'Plugin credential change')
+    return { action: 'clear' }
+  }
+  if (o.action !== 'set') stateInvalid('Plugin credential change action is invalid')
+  exactKeys(o, ['action', 'credentials'], 'Plugin credential change')
+  return { action: 'set', credentials: o.credentials }
+}
+function changedCredentialSeal(
+  change: LiteratureCredentialChange | undefined,
+  current: SerializedLiteratureCredentials | undefined,
+  userId: number,
+  accountId: string,
+  env?: NodeJS.ProcessEnv,
+): SerializedLiteratureCredentials | undefined {
+  if (!change) return current
+  if (change.action === 'clear') return undefined
+  try {
+    return serializeSealedLiteratureCredentials(
+      sealLiteratureCredentials(change.credentials, { userId, accountId }, env),
+    )
+  } catch {
+    throw new PluginAccountError('SECRET_INVALID', 'Plugin credentials failed validation')
+  }
 }
 
 /**
@@ -549,6 +624,8 @@ interface ManagedBrowserPluginAccountBindInput {
   replacementAccountInstanceId?: string
   /** A fresh interactive login may belong to another upstream identity; drop prior write grants. */
   resetWriteAuthorization?: boolean
+  /** Trusted setup-only input, accepted only by the fixed HTTP Plugin. Never a runtime tool field. */
+  literatureCredentials?: LiteratureCredentialChange
 }
 
 export interface ManagedBrowserPluginAccountBindResult {
@@ -621,7 +698,9 @@ export async function bindManagedBrowserPluginAccount(
           'INVALID_STATE',
           'write authorization reset requires a fenced account refresh',
         )
-      assertAccountContractPin(verified)
+      const requiresHttp = assertAccountContractPin(verified)
+      const change = credentialChange(input.literatureCredentials)
+      if (change && !requiresHttp) stateInvalid('Credentials require the fixed HTTP Plugin')
       const storageState = validateAccountStorageState(input.storageState, verified.contract)
       const existing = await client.query<PluginAccountRow>(
         `SELECT ${ACCOUNT_COLS} FROM connections
@@ -636,6 +715,8 @@ export async function bindManagedBrowserPluginAccount(
           'managed-browser Plugin already has an active account',
         )
       if (current) {
+        if (change && input.existing !== 'refresh-fenced' && input.existing !== 'replace')
+          stateInvalid('Credentials require a fenced account update')
         if (
           current.connector_version_id !== String(verified.versionId) ||
           current.provider !== verified.slug ||
@@ -667,7 +748,7 @@ export async function bindManagedBrowserPluginAccount(
             'ACCOUNT_STALE',
             'managed-browser Plugin handoff account identity changed',
           )
-        if (replacementReplay || (input.existing !== 'replace' && identicalState)) {
+        if (replacementReplay || (input.existing !== 'replace' && identicalState && !change)) {
           const reused = await client.query<{ id: string }>(
             `UPDATE connections
                 SET status = 'active', last_error_code = NULL, last_verified_at = NOW(),
@@ -711,6 +792,14 @@ export async function bindManagedBrowserPluginAccount(
             accountInstanceId: currentEnvelope.accountInstanceId,
             storageState,
           }
+          const seal = changedCredentialSeal(
+            change,
+            currentEnvelope.credentialSeal,
+            input.userId,
+            current.id,
+            input.env,
+          )
+          if (seal) envelope.credentialSeal = seal
           const encrypted = encryptEnvelope(
             envelope,
             input.userId,
@@ -780,6 +869,8 @@ export async function bindManagedBrowserPluginAccount(
           accountInstanceId,
           storageState,
         }
+        const seal = changedCredentialSeal(change, undefined, input.userId, current.id, input.env)
+        if (seal) envelope.credentialSeal = seal
         const encrypted = encryptEnvelope(envelope, input.userId, verified.slug, aadSeed, input.env)
         const replaced = await client.query<{ id: string }>(
           `UPDATE connections
@@ -867,7 +958,20 @@ export async function bindManagedBrowserPluginAccount(
           verified.contract.account.contractVersion,
         ],
       )
-      return { id: inserted.rows[0]!.id, accountInstanceId, outcome: 'created' as const }
+      const id = inserted.rows[0]!.id
+      const seal = changedCredentialSeal(change, undefined, input.userId, id, input.env)
+      if (seal) {
+        envelope.credentialSeal = seal
+        const saved = encryptEnvelope(envelope, input.userId, verified.slug, aadSeed, input.env)
+        const updated = await client.query(
+          `UPDATE connections SET secret_enc = $4, secret_nonce = $5
+            WHERE id = $1::bigint AND user_id = $2 AND provider = $3 AND aad_seed = $6::uuid`,
+          [id, input.userId, verified.slug, saved.ciphertext, saved.nonce, aadSeed],
+        )
+        if (updated.rowCount !== 1)
+          throw new PluginAccountError('ACCOUNT_STALE', 'Plugin credential creation failed')
+      }
+      return { id, accountInstanceId, outcome: 'created' as const }
     }, pool)
   } catch (error) {
     if (
@@ -939,6 +1043,21 @@ export async function commitPluginAccountState(input: {
     throw new PluginAccountError('INVALID_STATE', 'runtime Plugin is not accountful')
   const requiresHttp = assertAccountContractPin(input.verified, input.row)
   const envelope = validateStoredEnvelope(input.envelope, input.verified.contract)
+  if (requiresHttp) {
+    const previous = decryptStoredPluginAccountEnvelope(
+      input.row,
+      input.verified.contract,
+      input.env,
+    )
+    if (envelope.accountInstanceId !== previous.accountInstanceId)
+      throw new PluginAccountError('ACCOUNT_STALE', 'Plugin account instance changed')
+    if (
+      envelope.credentialSeal !== undefined &&
+      JSON.stringify(envelope.credentialSeal) !== JSON.stringify(previous.credentialSeal)
+    )
+      throw new PluginAccountError('INVALID_STATE', 'Cookie commit cannot change credentials')
+    if (previous.credentialSeal) envelope.credentialSeal = previous.credentialSeal
+  }
   const aadSeed = randomUUID()
   const encrypted = encryptEnvelope(
     envelope,

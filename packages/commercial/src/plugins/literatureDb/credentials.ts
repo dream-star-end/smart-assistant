@@ -97,3 +97,58 @@ export function openLiteratureCredentials(
     if (plaintext) zeroBuffer(plaintext)
   }
 }
+
+/** JSON representation lives only inside the encrypted HTTP account envelope. */
+export interface SerializedLiteratureCredentials {
+  schemaVersion: 1
+  aadSeed: string
+  ciphertext: string
+  nonce: string
+}
+export function parseSerializedLiteratureCredentials(
+  value: unknown,
+): SerializedLiteratureCredentials {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype ||
+    Object.keys(value).sort().join(',') !== 'aadSeed,ciphertext,nonce,schemaVersion' ||
+    Object.values(Object.getOwnPropertyDescriptors(value)).some((d) => !Object.hasOwn(d, 'value'))
+  )
+    throw new LiteratureError('SECRET_INVALID')
+  const o = value as Record<string, unknown>
+  if (
+    o.schemaVersion !== 1 ||
+    typeof o.aadSeed !== 'string' ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(o.aadSeed)
+  )
+    throw new LiteratureError('SECRET_INVALID')
+  for (const [key, minimum, maximum] of [
+    ['ciphertext', 17, 8192],
+    ['nonce', 12, 12],
+  ] as const) {
+    const raw = o[key]
+    if (typeof raw !== 'string' || raw.length > Math.ceil(maximum / 3) * 4)
+      throw new LiteratureError('SECRET_INVALID')
+    const bytes = Buffer.from(raw, 'base64')
+    if (bytes.length < minimum || bytes.length > maximum || bytes.toString('base64') !== raw)
+      throw new LiteratureError('SECRET_INVALID')
+  }
+  return {
+    schemaVersion: 1,
+    aadSeed: o.aadSeed,
+    ciphertext: o.ciphertext as string,
+    nonce: o.nonce as string,
+  }
+}
+export function serializeSealedLiteratureCredentials(
+  value: SealedLiteratureCredentials,
+): SerializedLiteratureCredentials {
+  return parseSerializedLiteratureCredentials({
+    schemaVersion: value.schemaVersion,
+    aadSeed: value.aadSeed,
+    ciphertext: value.ciphertext.toString('base64'),
+    nonce: value.nonce.toString('base64'),
+  })
+}

@@ -17,7 +17,9 @@ import { type CaptchaImage, type CaptchaReader, LiteratureCaptchaSolver } from '
 import {
   openLiteratureCredentials,
   parseLiteratureCredentials,
+  parseSerializedLiteratureCredentials,
   sealLiteratureCredentials,
+  serializeSealedLiteratureCredentials,
 } from './credentials.js'
 import { LiteratureError } from './errors.js'
 import {
@@ -885,4 +887,37 @@ test('absolute expiry before the factory microtask opens no reader or session', 
   assert.equal((await manager.settled(17, op.operationId)).status, 'expired')
   assert.equal(factories, 0)
   assert.equal(opened, 0)
+})
+
+test('stored password seals require canonical bounded base64 and reject accessors or extra fields', () => {
+  const seal = serializeSealedLiteratureCredentials({
+    schemaVersion: 1,
+    aadSeed: '00000000-0000-4000-8000-000000000001',
+    ciphertext: Buffer.alloc(64, 7),
+    nonce: Buffer.alloc(12, 2),
+  })
+  assert.deepEqual(parseSerializedLiteratureCredentials(seal), seal)
+  let accessorRead = false
+  const accessor = { ...seal }
+  Object.defineProperty(accessor, 'ciphertext', {
+    enumerable: true,
+    get: () => {
+      accessorRead = true
+      return seal.ciphertext
+    },
+  })
+  for (const invalid of [
+    { ...seal, extra: true },
+    { ...seal, schemaVersion: 2 },
+    { ...seal, aadSeed: '00000000-0000-1000-8000-000000000001' },
+    { ...seal, nonce: Buffer.alloc(11).toString('base64') },
+    { ...seal, ciphertext: Buffer.alloc(16).toString('base64') },
+    { ...seal, ciphertext: Buffer.alloc(8193).toString('base64') },
+    { ...seal, ciphertext: `${seal.ciphertext}\n` },
+    { ...seal, ciphertext: seal.ciphertext.replace(/=+$/, '') },
+    Object.assign(Object.create(null), seal),
+    accessor,
+  ])
+    assert.throws(() => parseSerializedLiteratureCredentials(invalid), code('SECRET_INVALID'))
+  assert.equal(accessorRead, false)
 })

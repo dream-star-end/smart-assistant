@@ -2,17 +2,21 @@ import assert from 'node:assert/strict'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { after, before, beforeEach, test } from 'node:test'
 import { truncateAllForTest, useDedicatedTestDatabase } from '../../__tests__/helpers/db.js'
+import { revokeDeclarativeConnection } from '../../connectors/engine/binding.js'
+import { revokeConnection } from '../../connectors/store.js'
 import { getPool } from '../../db/index.js'
 import { query } from '../../db/queries.js'
-import { installApprovedVersion } from '../../marketplace/marketplaceDb.js'
+import { installApprovedVersion, recordUninstall } from '../../marketplace/marketplaceDb.js'
 import {
   PluginAccountError,
   bindManagedBrowserPluginAccount,
   commitPluginAccountState,
+  decryptLiteratureHttpAccountCredentials,
   decryptLiteratureHttpAccountEnvelope,
   decryptPluginAccountEnvelope,
   fencePluginAccountInvocation,
   getPluginAccount,
+  markPluginAccountRelinkRequiredFenced,
   revokePluginAccountFenced,
 } from '../accounts.js'
 import {
@@ -27,6 +31,7 @@ import {
 } from './accountState.js'
 import { LITERATURE_PLUGIN_ARTIFACT } from './builtinArtifact.js'
 import { COMPILED_LITERATURE_PLUGIN, LITERATURE_PLUGIN_CONTRACT } from './builtinContract.js'
+import { sealLiteratureCredentials, serializeSealedLiteratureCredentials } from './credentials.js'
 import { LITERATURE_SITE } from './policy.js'
 
 const db = useDedicatedTestDatabase('ocv5_literature_accounts_test')
@@ -95,7 +100,7 @@ async function fixture(official = true) {
     })
   return { a, b, versionId }
 }
-async function installed() {
+async function ready() {
   const f = await fixture()
   for (const userId of [f.a, f.b])
     await installApprovedVersion({
@@ -107,6 +112,10 @@ async function installed() {
   const verified = await loadVerifiedRuntimePluginContract(f.versionId, getPool(), { env })
   assert.equal(verified.pluginType, 'managed-browser')
   if (verified.pluginType !== 'managed-browser') throw new Error('fixture subtype')
+  return { ...f, verified }
+}
+async function installed() {
+  const f = await ready()
   const bound = await bindManagedBrowserPluginAccount({
     userId: f.a,
     versionId: f.versionId,
@@ -116,7 +125,7 @@ async function installed() {
   })
   const row = await getPluginAccount(bound.id, f.a, getPool())
   assert(row)
-  return { ...f, verified, bound, row }
+  return { ...f, bound, row }
 }
 async function snapshot(id: string) {
   return (
@@ -327,4 +336,358 @@ test('revoked HTTP credentials cannot be resurrected by a late state commit', as
   assert.deepEqual(await snapshot(row.id), unchanged)
   assert.equal(unchanged[0].secret_enc, null)
   assert.equal(unchanged[0].secret_nonce, null)
+})
+
+const password = (value = 'synthetic-password-one') => ({
+  schemaVersion: 1,
+  username: 'synthetic-lit-owner',
+  password: value,
+})
+async function passwordAccount() {
+  const f = await ready()
+  const bound = await bindManagedBrowserPluginAccount({
+    userId: f.a,
+    versionId: f.versionId,
+    storageState: state(),
+    existing: 'reject',
+    literatureCredentials: { action: 'set', credentials: password() },
+    env,
+  })
+  const row = await getPluginAccount(bound.id, f.a, getPool())
+  assert(row)
+  return { ...f, bound, row }
+}
+async function readRow(id: string, userId: number, includeError = false) {
+  const row = await getPluginAccount(id, userId, getPool(), { includeError })
+  assert(row)
+  return row
+}
+
+test('password creation binds its seal to the real returned account ID without public plaintext', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await passwordAccount()
+  const secret = decryptLiteratureHttpAccountCredentials(f.row, f.verified.contract, env)
+  assert.deepEqual(secret, password())
+  const publicValues = JSON.stringify({
+    result: f.bound,
+    meta: f.row.meta,
+    name: f.row.display_name,
+  })
+  for (const value of [password().username, password().password]) {
+    assert(!publicValues.includes(value))
+    assert(!f.row.secret_enc!.includes(Buffer.from(value)))
+  }
+  const other = await bindManagedBrowserPluginAccount({
+    userId: f.b,
+    versionId: f.versionId,
+    storageState: state(),
+    existing: 'reject',
+    env,
+  })
+  // Outer AAD does not include connectionId; the independent inner seal must reject this swap.
+  assert.throws(
+    () =>
+      decryptLiteratureHttpAccountCredentials({ ...f.row, id: other.id }, f.verified.contract, env),
+    code('SECRET_INVALID'),
+  )
+  assert.throws(
+    () =>
+      decryptLiteratureHttpAccountCredentials({ ...f.row, user_id: f.b }, f.verified.contract, env),
+    code('SECRET_INVALID'),
+  )
+})
+
+test('failure while adding a password rolls back the newly inserted account atomically', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await ready()
+  await query(`CREATE FUNCTION public.ocv5_524_fail_credential_update() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.provider = 'literature-db' THEN RAISE EXCEPTION 'synthetic credential update failure' USING ERRCODE = 'P5241'; END IF;
+      RETURN NEW;
+    END $$`)
+  try {
+    await query(`CREATE TRIGGER ocv5_524_fail_credential_update BEFORE UPDATE OF secret_enc,secret_nonce ON public.connections
+      FOR EACH ROW EXECUTE FUNCTION public.ocv5_524_fail_credential_update()`)
+    await assert.rejects(
+      bindManagedBrowserPluginAccount({
+        userId: f.a,
+        versionId: f.versionId,
+        storageState: state(),
+        existing: 'reject',
+        literatureCredentials: { action: 'set', credentials: password() },
+        env,
+      }),
+      (error: unknown) =>
+        Boolean(error && typeof error === 'object' && 'code' in error && error.code === 'P5241'),
+    )
+    const rows = await query('SELECT id FROM connections WHERE user_id=$1 AND provider=$2', [
+      f.a,
+      'literature-db',
+    ])
+    assert.equal(rows.rowCount, 0)
+  } finally {
+    await query('DROP TRIGGER IF EXISTS ocv5_524_fail_credential_update ON public.connections')
+    await query('DROP FUNCTION public.ocv5_524_fail_credential_update()')
+  }
+  const created = await bindManagedBrowserPluginAccount({
+    userId: f.a,
+    versionId: f.versionId,
+    storageState: state(),
+    existing: 'reject',
+    literatureCredentials: { action: 'set', credentials: password() },
+    env,
+  })
+  const row = await readRow(created.id, f.a)
+  assert.deepEqual(
+    decryptLiteratureHttpAccountCredentials(row, f.verified.contract, env),
+    password(),
+  )
+})
+
+test('fenced same-cookie password updates and clears persist, while ordinary refresh preserves the seal', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await passwordAccount()
+  const change = (input: { action: 'set'; credentials: unknown } | { action: 'clear' }) =>
+    bindManagedBrowserPluginAccount({
+      userId: f.a,
+      versionId: f.versionId,
+      storageState: state(),
+      existing: 'refresh-fenced',
+      expectedExistingAccountInstanceId: f.bound.accountInstanceId,
+      literatureCredentials: input,
+      env,
+    })
+  const updated = await change({ action: 'set', credentials: password('synthetic-password-two') })
+  assert.equal(updated.outcome, 'refreshed')
+  let row = await readRow(f.row.id, f.a)
+  assert(Number(row.secret_generation) > Number(f.row.secret_generation))
+  assert.deepEqual(
+    decryptLiteratureHttpAccountCredentials(row, f.verified.contract, env),
+    password('synthetic-password-two'),
+  )
+  const originalSeal = decryptLiteratureHttpAccountEnvelope(
+    row,
+    f.verified.contract,
+    env,
+  ).credentialSeal
+  await bindManagedBrowserPluginAccount({
+    userId: f.a,
+    versionId: f.versionId,
+    storageState: state('synthetic-refresh-cookie'),
+    existing: 'refresh-fenced',
+    expectedExistingAccountInstanceId: f.bound.accountInstanceId,
+    env,
+  })
+  row = await readRow(f.row.id, f.a)
+  assert.deepEqual(
+    decryptLiteratureHttpAccountEnvelope(row, f.verified.contract, env).credentialSeal,
+    originalSeal,
+  )
+  await change({ action: 'clear' })
+  row = await readRow(f.row.id, f.a)
+  assert.equal(decryptLiteratureHttpAccountCredentials(row, f.verified.contract, env), undefined)
+})
+
+test('cookie commits preserve the authoritative password and reject credential or instance changes', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await passwordAccount()
+  let row = await fencePluginAccountInvocation({
+    connectionId: f.row.id,
+    userId: f.a,
+    expectedRevision: f.row.revision,
+    verified: f.verified,
+    runner: getPool(),
+  })
+  const envelope = decryptLiteratureHttpAccountEnvelope(row, f.verified.contract, env)
+  const { credentialSeal, ...cookieOnly } = envelope
+  await commitPluginAccountState({
+    row,
+    verified: f.verified,
+    envelope: cookieOnly,
+    runner: getPool(),
+    env,
+  })
+  row = await readRow(f.row.id, f.a)
+  assert.deepEqual(
+    decryptLiteratureHttpAccountEnvelope(row, f.verified.contract, env).credentialSeal,
+    credentialSeal,
+  )
+  const injected = serializeSealedLiteratureCredentials(
+    sealLiteratureCredentials(
+      password('injected-synthetic-password'),
+      { userId: f.a, accountId: row.id },
+      env,
+    ),
+  )
+  const unchanged = await snapshot(row.id)
+  await assert.rejects(
+    commitPluginAccountState({
+      row,
+      verified: f.verified,
+      envelope: { ...envelope, credentialSeal: injected },
+      runner: getPool(),
+      env,
+    }),
+    code('INVALID_STATE'),
+  )
+  await assert.rejects(
+    commitPluginAccountState({
+      row,
+      verified: f.verified,
+      envelope: { ...envelope, accountInstanceId: randomUUID() },
+      runner: getPool(),
+      env,
+    }),
+    code('ACCOUNT_STALE'),
+  )
+  assert.deepEqual(await snapshot(row.id), unchanged)
+  const old = await fencePluginAccountInvocation({
+    connectionId: row.id,
+    userId: f.a,
+    expectedRevision: row.revision,
+    verified: f.verified,
+    runner: getPool(),
+  })
+  await bindManagedBrowserPluginAccount({
+    userId: f.a,
+    versionId: f.versionId,
+    storageState: state(),
+    existing: 'refresh-fenced',
+    expectedExistingAccountInstanceId: f.bound.accountInstanceId,
+    literatureCredentials: { action: 'set', credentials: password('newer-synthetic-password') },
+    env,
+  })
+  const latest = await snapshot(row.id)
+  await assert.rejects(
+    commitPluginAccountState({
+      row: old,
+      verified: f.verified,
+      envelope,
+      runner: getPool(),
+      env,
+    }),
+    code('ACCOUNT_STALE'),
+  )
+  assert.deepEqual(await snapshot(row.id), latest)
+})
+
+test('replacement drops prior credentials, accepts a new seal and cannot replay an old password over a newer one', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await passwordAccount()
+  const first = await bindManagedBrowserPluginAccount({
+    userId: f.a,
+    versionId: f.versionId,
+    storageState: state('replacement-one'),
+    existing: 'replace',
+    expectedExistingAccountInstanceId: f.bound.accountInstanceId,
+    replacementAccountInstanceId: randomUUID(),
+    env,
+  })
+  let row = await readRow(first.id, f.a)
+  assert.equal(decryptLiteratureHttpAccountCredentials(row, f.verified.contract, env), undefined)
+  const replacement = {
+    userId: f.a,
+    versionId: f.versionId,
+    storageState: state('replacement-two'),
+    existing: 'replace' as const,
+    expectedExistingAccountInstanceId: first.accountInstanceId,
+    replacementAccountInstanceId: randomUUID(),
+    literatureCredentials: {
+      action: 'set' as const,
+      credentials: password('replacement-synthetic-password'),
+    },
+    env,
+  }
+  const second = await bindManagedBrowserPluginAccount(replacement)
+  await bindManagedBrowserPluginAccount({
+    userId: f.a,
+    versionId: f.versionId,
+    storageState: state('replacement-two'),
+    existing: 'refresh-fenced',
+    expectedExistingAccountInstanceId: second.accountInstanceId,
+    literatureCredentials: { action: 'set', credentials: password('latest-synthetic-password') },
+    env,
+  })
+  assert.equal((await bindManagedBrowserPluginAccount(replacement)).outcome, 'reused')
+  row = await readRow(second.id, f.a)
+  assert.deepEqual(
+    decryptLiteratureHttpAccountCredentials(row, f.verified.contract, env),
+    password('latest-synthetic-password'),
+  )
+})
+
+test('cookie relink-required status preserves the remembered encrypted password', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await passwordAccount()
+  const row = await fencePluginAccountInvocation({
+    connectionId: f.row.id,
+    userId: f.a,
+    expectedRevision: f.row.revision,
+    verified: f.verified,
+    runner: getPool(),
+  })
+  const before = decryptLiteratureHttpAccountEnvelope(row, f.verified.contract, env).credentialSeal
+  await markPluginAccountRelinkRequiredFenced({ row, verified: f.verified, runner: getPool() })
+  const expired = await readRow(row.id, f.a, true)
+  assert.equal(expired.status, 'error')
+  assert.deepEqual(
+    decryptLiteratureHttpAccountEnvelope(expired, f.verified.contract, env).credentialSeal,
+    before,
+  )
+  assert.deepEqual(
+    decryptLiteratureHttpAccountCredentials(expired, f.verified.contract, env),
+    password(),
+  )
+})
+
+for (const method of ['plugin', 'connector', 'declarative'] as const) {
+  test(`password-bearing accounts are erased by ${method} revoke and late commits cannot revive them`, async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const f = await passwordAccount()
+    const row = await fencePluginAccountInvocation({
+      connectionId: f.row.id,
+      userId: f.a,
+      expectedRevision: f.row.revision,
+      verified: f.verified,
+      runner: getPool(),
+    })
+    const envelope = decryptLiteratureHttpAccountEnvelope(row, f.verified.contract, env)
+    if (method === 'plugin') await revokePluginAccountFenced({ row, runner: getPool() })
+    else if (method === 'connector') await revokeConnection(row.id, f.a, getPool())
+    else await revokeDeclarativeConnection(row.id, f.a, getPool())
+    const erased = await snapshot(row.id)
+    assert.equal(erased[0].secret_enc, null)
+    assert.equal(erased[0].secret_nonce, null)
+    await assert.rejects(
+      commitPluginAccountState({
+        row,
+        verified: f.verified,
+        envelope,
+        runner: getPool(),
+        env,
+      }),
+      code('ACCOUNT_STALE'),
+    )
+    assert.deepEqual(await snapshot(row.id), erased)
+    await recordUninstall(f.a, 'literature-db')
+    assert.deepEqual(await snapshot(row.id), erased)
+  })
+}
+
+test('unfenced password mutation is rejected before changing the stored secret', async (t) => {
+  if (db.skipIfUnavailable(t)) return
+  const f = await passwordAccount()
+  const unchanged = await snapshot(f.row.id)
+  await assert.rejects(
+    bindManagedBrowserPluginAccount({
+      userId: f.a,
+      versionId: f.versionId,
+      storageState: state(),
+      existing: 'reuse-identical',
+      literatureCredentials: { action: 'set', credentials: password('must-not-be-saved') },
+      env,
+    }),
+    code('INVALID_STATE'),
+  )
+  assert.deepEqual(await snapshot(f.row.id), unchanged)
 })
