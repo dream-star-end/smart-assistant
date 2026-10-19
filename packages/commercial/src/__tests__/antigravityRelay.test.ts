@@ -256,7 +256,7 @@ describe('Antigravity relay handler', () => {
   })
 
   test('title generation model is allowed and metered on the turn', async () => {
-    const token = await mintRoute('antigravity-claude-sonnet-4.6')
+    const token = await mintRoute('antigravity-claude-sonnet-5.5')
     const { status, captured } = await relay(
       `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`,
       { body: generateBody('gemini-3.5-flash-lite', 'checkpoint') },
@@ -264,7 +264,7 @@ describe('Antigravity relay handler', () => {
     )
     assert.equal(status, 200)
     assert.equal(captured.usage[0]?.upstreamModel, 'gemini-3.5-flash-lite')
-    assert.equal(captured.usage[0]?.routeModelId, 'antigravity-claude-sonnet-4.6')
+    assert.equal(captured.usage[0]?.routeModelId, 'antigravity-claude-sonnet-5.5')
   })
 
   test('web search: non-streaming generateContent is forwarded and metered from its JSON body', async () => {
@@ -938,5 +938,58 @@ describe('Antigravity settlement math', () => {
     })
     assert.equal(silent.costCredits, 0n)
     assert.match(silent.snapshotJson, /no_output/)
+  })
+})
+
+
+describe('Google retirement banners are errors, never successful paid answers (OCV5-515)', () => {
+  const notice = 'Claude Sonnet 4.6 is no longer available. Please switch to Claude Sonnet 5.5.'
+  const event = (text: string, complete = false) => `data: ${JSON.stringify({ response: {
+    candidates: [{ content: { parts: [{ text }] }, ...(complete ? { finishReason: 'STOP' } : {}) }],
+    ...(complete ? { usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 10 } } : {}),
+  } })}\n\n`
+
+  test('a banner split between SSE events/chunks becomes 410 before any answer is forwarded', async () => {
+    const token = await mintRoute()
+    const wire = event(notice.slice(0, 21)) + event(notice.slice(21))
+    const result = await relay(
+      `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`,
+      { body: generateBody('gemini-3.8-flash-low') },
+      { status: 200, body: [wire.slice(0, 17), wire.slice(17, 99), wire.slice(99)] },
+    )
+    assert.equal(result.status, 410)
+    assert.match(result.text, /ANTIGRAVITY_MODEL_RETIRED/)
+    assert.ok(!result.text.includes('Please switch'))
+    assert.equal(result.captured.usage[0]?.statusCode, 410)
+    assert.ok(!result.captured.outcomes.some((x) => x.outcome.kind === 'success'))
+  })
+
+  test('a normal completed answer quoting exactly the banner remains successful', async () => {
+    const token = await mintRoute()
+    const wire = event(notice, true)
+    const result = await relay(
+      `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`,
+      { body: generateBody('gemini-3.8-flash-low') }, { status: 200, body: [wire] },
+    )
+    assert.equal(result.status, 200)
+    assert.equal(result.text, wire)
+    assert.equal(result.captured.usage[0]?.statusCode, 200)
+  })
+
+  test('JSON retirement banners are errors too; title usage cannot make the turn billable', async () => {
+    const token = await mintRoute()
+    const body = JSON.stringify({ response: { candidates: [{ content: { parts: [{ text: notice }] } }] } })
+    const result = await relay(
+      `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:generateContent`,
+      { body: generateBody('gemini-3.5-flash-lite', 'web_search') }, { status: 200, body: [body] },
+    )
+    assert.equal(result.status, 410)
+    const plan = planAntigravitySettle({ engineStatus: 'success',
+      totals: { promptTokens: 1000n, candidatesTokens: 50n, thoughtsTokens: 0n, cachedTokens: 0n, calls: 2, retired: true },
+      pricing: { input_per_mtok: 100n, output_per_mtok: 500n, cache_read_per_mtok: 5n, cache_write_per_mtok: 0n, multiplier: '2' } as ModelPricing,
+    })
+    assert.equal(plan.costCredits, 0n)
+    assert.equal(plan.settleStatus, 'error')
+    assert.equal(JSON.parse(plan.snapshotJson).antigravity_terminal_code, 'ANTIGRAVITY_MODEL_RETIRED')
   })
 })

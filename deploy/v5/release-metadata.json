@@ -177,7 +177,8 @@
     "0306_pool_policy",
     "0307_antigravity_engine",
     "0308_pool_user_affinity",
-    "0309_box_profile_quota_windows"
+    "0309_box_profile_quota_windows",
+    "0310_antigravity_claude_55"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
