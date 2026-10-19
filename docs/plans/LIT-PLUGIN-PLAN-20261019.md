@@ -51,6 +51,41 @@
 
 开发依赖模块、worker/setup、UI、检索、下载、上架证明仍按原约22–35人日估算，依真实入口复杂度调整；第一阶段范围缩小不代表整个插件已经完成。发布路径若变更先个人版验证，但个人发布/生产迁移也需批准；本轮无任何部署授权。进度写H/CONTINUE-20261019-OCV5-524-lit-plugin-plan.md，PR保留draft，拿到账号继续真实适配；上架/发布前汇报。
 
+## 第二批无账号实现与后续验收边界
+
+[官方图片API适配预审方案](OCV5-524-OFFICIAL-CAPTCHA-ADAPTER-PLAN.md)已通过独立方案审查后实施；固定Claude/Gemini官方协议、每次从既有平台API-key池选key、不env回退，显式平台用量sink，不扣免费插件用户。当前目录只有可核验的官方Claude机制；Gemini Go不支持图片且不是官方generateContent，不将其伪装为已接线。本批Google仅协议fixture，不新增目录/生产配置。Claude默认fresh resolver读取唯一catalog cache的assertFresh、精确ccb/anthropic/vision与model/upstream绑定；目录可路由不等于用途批准，两者均需当前有效。
+
+## 商业体系与拆分细化（16:46决定后的现行版本）
+
+- 服务端采用官方managed-browser/固定driver和受签工件，而非用户上传任意JS。现有本机plugin.json不支持browser/http组件，声明HTTP蓝图也不能表达等待验证码的登录生命周期。工具沿app-connectors→oc-plugin catalog/list/call→容器双因子RPC→安装/签名/账户lease→受限worker，不假定所有模型自动原生注册工具。
+- 市场install固定版本/hash与agent作用域；账号connections保存受限storageState，现有严格schema不能塞password/HTTP cookie。新字段或envelope必须显式版本，维持锁序、generation/CAS、撤权和兼容性，管理API不投影secret。新账号setup draft与真实connectionId分开，INSERT RETURNING id后同事务seal/write，不能bind返回后另事务补密码。
+- 微博可复用attach stdin、日志白名单、签名/审核/lease；验证码停止、QR setup和返回即清理不能照搬为字符challenge。下载不走stdout大JSON。现有通用安装未实现插件购买/按次扣费/作者分成；第一期确定免费，不新增钱包扣款。
+
+| 识别方案 | 本站成功率 | 成本与延迟 | 当前采用及限制 |
+|---|---|---|---|
+| 本地ddddocr | 未测，单张公开样本不能保证4位数字 | 无按次API费；CPU/内存/初始化成本，预热≤1秒仅目标 | 可快速首选/兜底，固定依赖与模型；尚未安装或测真实OCR |
+| 平台非OpenAI多模态 | 未测；字符对不代表登录成功 | 按实际图片输入/输出token和请求数计平台成本；单次15秒超时，不是实测延迟 | 用户优先路线，逐模型/机制/用途核对；只发裁剪图、无账号/历史/tools，明确拒绝停止云尝试 |
+| 第三方打码 | 无本站独立验证 | 按挑战尝试数、非检索次数；公开报价不等于端到端SLA | 默认关闭，不作为第一期依赖，另核供应商处理地区/留存和用途 |
+
+本地说明：[ddddocr](https://github.com/sml2h3/ddddocr)、[MIT许可证](https://github.com/sml2h3/ddddocr/blob/master/LICENSE)。第三方调研参考：[2Captcha报价](https://2captcha.com/pricing)、[Anti-Captcha图像任务](https://anti-captcha.com/apidoc/task-types/ImageToTextTask)，2026-10-19调研原报价普通字符图约US$0.50–1/千次，未采购、未实测。真实模型成本应记录输入、输出、缓存、拒绝和失败尝试，再除以成功登录数；没有已批准目录与用量样本时不猜单次成本/成功率。
+
+无头浏览器拟固定出口、每账户独立context/profile/cookie jar、单飞lease；不轮换IP规避封禁。每用户/账号/站点节流与全局CPU/内存/下载字节配额独立，403/429/冻结即停。当前HTTP原生客户端不执行JS；是否需要Playwright及具体下游脚本，等账号实测。若需浏览器，必须实现HTTP absolute-form受限relay和network=none隔离，不能沿微博443 CONNECT改端口冒称完成。当前微博--no-sandbox，新增sandbox能力未验证。用户接受本站HTTP最后一段明文风险；例外精确白名单，不关闭TLS证书验证。
+
+| 里程碑/提交批次 | 人日估算 | 退出条件 |
+|---|---:|---|
+| A 无账号底座与明确API协议（当前PR883） | 3–5 | 合成机密/模拟网络、定向测试、独审、CI；不宣称可安装 |
+| B 账号/setup事务、worker私有通道、管理中心 | 5–7 | 真实隔离DB与浏览器夹具；撤权/租户/generation围栏，秘密不入聊天/日志 |
+| C 获准账号登录及首个实际库检索/detail | 4–6 | 真实身份标记、字段/分页与用户同账号浏览器对照；不猜第三方域名 |
+| D 单篇下载artifact | 3–5 | opaque recordId、逐跳白名单、magic/MIME/hash/大小、归属；HTML伪PDF拒绝，CAJ单列 |
+| E 市场/模型CLI/真实证明/发布准备 | 4–6 | 免费install→绑定→自然语言检索→下载，CCB/Codex各实验；尚未获批不开放listing |
+| F 独审修正、CI与低频观察 | 3–6 | 独审APPROVED、适用CI全过、用户真实验收；另报商业上架/发布批准 |
+
+仍按完整首库约22–35工程人日评估，实际下游复杂度和等待账号时间另计。当前使用同一任务WT/PR继续；后续独立子票按一票一WT一PR拆，保持依赖顺序，不以拆分绕开完整机密/协议边界。若改发布脚本/seed门/队列/部署补偿，其发布路径部分先个人版验证，整套商业插件不必个人版先上；个人版发布同样要批准。
+
+真实验收仅接收v5-dev凭据文件绝对路径（不要贴用户名/口令/Cookie），受控loader使用文件而不cat给模型。账号到位后低频确定正向身份标记，公开登录页本身就有退出链接，不能以退出链接/200/有Cookie判登录成功。先用用户指定代表性检索词和少量可下载文献，分别记录验证码接受率、完整登录率、检索/下载分子分母、P50/P95/人工率和403/429。若按篇扣站方额度须用户确认，不充值、不盲重试未知购买/下载结果。
+
+建议小样本验收目标：至少20次分时代表性检索中19次成功、至少3篇获准文件可打开且hash匹配；不为凑样本刷验证码，强制错误/429/封禁在fixture测。统计目标待样本实测收敛，20次不能承诺99%长期SLA。跨用户隔离、AAD调包、撤权/CAS、挑战重放、POST丢响应、DNS重绑定、私网跳转、artifact越权与超限都要自动测试；真实双账号未获提供就明确列缺口，不借cc1。发布前再给候选SHA/工件/镜像/迁移/env生效面、真实证明、回滚/停用路径和未覆盖项，等待批准。
+
 ## 12. 固定代码证据索引
 
 以下均为同一商业SHA；链接指向私有仓库，需已有访问权限。行号用于定位，证据是代码行为本身。
