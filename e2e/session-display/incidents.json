@@ -7468,6 +7468,30 @@
           "assertion": "OCV5-509 the CLI auto-memory folder in a run project is cleaned, anything else still refused"
         }
       ]
+    },
+    {
+      "id": "INC-20261019-GO-POOL-WIRING",
+      "occurredAt": "2026-10-19",
+      "severity": "P1",
+      "symptom": "OCV5-520: personal G1 on 0f2c686bc failed HTTP401 because ordinary egress omitted API-key pool wiring and used an expired static env identity even though that identity was admin-disabled and another enabled member authenticated. The same missing wiring exists in commercial egress. Ordinary Go now honors its existing pool; other providers and request prefixes remain unchanged. Commercial has a separate expired sole member and still needs valid credentials; code wiring alone is not a claim of commercial authentication recovery.",
+      "rootFixCommit": "0abced60",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/apiKeyPoolWiring.test.ts",
+          "assertion": "OCV5-520 ordinary Go uses its enabled pool identity and preserves request bytes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/apiKeyPoolWiring.test.ts",
+          "assertion": "OCV5-520 nonempty Go pool rejects null or failed selection without using the env key"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "[ocv5-520-go-pool-wiring] PASS — ordinary Go uses an enabled pool identity instead of disabled static credentials while request bytes and session headers stay stable"
+        }
+      ]
     }
   ]
 }
