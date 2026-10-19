@@ -687,6 +687,7 @@ describe("crash/interrupt partial persistence", () => {
               text: `attempt ${attempt} plan`,
               partial: false,
             });
+            r.msg({ type: "assistant_error", error: "BOX_TOOL_SNAPSHOT_MISMATCH: retryable attempt" });
             r.result({
               is_error: true,
               subtype: "error_during_execution",
@@ -715,6 +716,8 @@ describe("crash/interrupt partial persistence", () => {
       );
 
       assert.equal(submits, 4, "initial attempt + three automatic retries before success");
+      assert.equal(events.filter((event) => event.kind === "error").length, 0,
+        "INC-20261019-RECOVERABLE-ERROR-RED-CARD: recovered attempts never publish an error");
       assert.deepEqual(runner.submittedInputs, [
         "finish the task",
         TRANSIENT_RETRY_INPUT,
@@ -3164,13 +3167,35 @@ describe("crash/interrupt partial persistence", () => {
           },
         ],
       );
-      assert.ok(
-        events.some((event) => event.kind === "error" && event.error === payload.errorDetail),
-        "error-only result must remain visible live and after refresh",
-      );
+      const terminalErrors = events.filter((event) => event.kind === "error");
+      assert.equal(terminalErrors.length, 1,
+        "INC-20261019-RECOVERABLE-ERROR-RED-CARD: terminal failure publishes exactly one error");
+      assert.equal(terminalErrors[0]?.kind === "error" && terminalErrors[0].error, payload.errorDetail,
+        "error-only result must remain visible live and after refresh");
     } finally {
       setV3MasterSinkSingleton(null);
     }
+  });
+
+  test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: native diagnostic followed by success never publishes an error", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => setImmediate(() => {
+        r.msg({ type: "assistant_error", error: "BOX_REPLAY_UNAVAILABLE: recovered inside engine" });
+        r.text("task completed");
+        r.result();
+      }));
+      await runOneTurn(sm, makeSession(runner, { channel: "webchat", userId: "user-1" }), events);
+      assert.equal(events.filter((event) => event.kind === "error").length, 0);
+      assert.equal(events.filter((event) => event.kind === "final").length, 1);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.errorCode, undefined);
+      assert.ok(captured.payloads[0]!.runtimeEvents?.some((event) =>
+        (event.payload as { type?: string }).type === "assistant_error"), "raw diagnostic stays durable");
+    } finally { setV3MasterSinkSingleton(null); }
   });
 
   test("审计 R3:runner result 帧带 errorClass → sessionManager onEvent kind:'error' 透传同值(链路不再断)", async () => {

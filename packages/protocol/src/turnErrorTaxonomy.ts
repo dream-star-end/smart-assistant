@@ -31,6 +31,18 @@ export type TurnErrorCta =
   | 'new_session'
   | 'none'
 
+/** Active durable recovery jobs projected with the exact session timeline snapshot.
+ * An omitted list is an older backend; an empty list proves absence only for
+ * terminal source rows returned in that same snapshot. No request payload. */
+export interface AutomaticTurnRecoverySnapshot {
+  sourceClientMessageId: string
+  rootClientMessageId: string
+  clientMessageId: string
+  errorCode: string
+  mode: 'replay' | 'checkpoint'
+  attempt: number
+}
+
 export interface TurnErrorSemantics {
   /** 瞬时错误:同请求稍后重试有意义(自动重试资格的必要非充分条件)。 */
   retryable: boolean
