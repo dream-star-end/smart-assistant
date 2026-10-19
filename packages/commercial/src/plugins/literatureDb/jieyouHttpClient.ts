@@ -196,6 +196,8 @@ export class JieyouHttpClient {
   private busy = false
   private closed = false
   private active?: AbortController
+  private draining?: Promise<void>
+  private closing?: Promise<void>
   constructor(
     private readonly transport = new LiteratureHttpTransport(),
     options: { initialState?: unknown } = {},
@@ -216,19 +218,25 @@ export class JieyouHttpClient {
     this.active = controller
     const abort = () => controller.abort()
     signal.addEventListener('abort', abort, { once: true })
+    const underlying = Promise.resolve().then(() => {
+      this.check(controller.signal)
+      return work(controller.signal)
+    })
+    // Consume the operation's result here only for cleanup; its error is still returned below.
+    const drained = underlying.then(
+      () => undefined,
+      () => undefined,
+    )
+    this.draining = drained
     try {
-      return await abortable(
-        Promise.resolve().then(() => {
-          this.check(controller.signal)
-          return work(controller.signal)
-        }),
-        controller.signal,
-      )
+      return await abortable(underlying, controller.signal)
     } catch (error) {
       if (error instanceof LiteratureError) throw error
       throw new LiteratureError('RESPONSE_INVALID')
     } finally {
+      await drained
       signal.removeEventListener('abort', abort)
+      this.draining = undefined
       this.active = undefined
       this.busy = false
     }
@@ -363,12 +371,13 @@ export class JieyouHttpClient {
     if (this.busy) throw new LiteratureError('ACCOUNT_BUSY')
     return exportJieyouAccountState(this.jar)
   }
-  /** Seals state and signals cancellation; the future session adapter must await transport drain. */
-  close(): void {
+  /** Synchronously seals state; completion proves all active HTTP connections have closed. */
+  close(): Promise<void> {
     this.closed = true
     this.active?.abort()
     this.jar.removeAllCookiesSync()
     this.form = undefined
     this.challenge = undefined
+    return (this.closing ??= this.draining ?? Promise.resolve())
   }
 }

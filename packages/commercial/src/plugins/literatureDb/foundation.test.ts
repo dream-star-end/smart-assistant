@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import {
+  Agent as HttpAgent,
   type RequestListener,
   type RequestOptions,
   createServer,
+  globalAgent,
   request as httpRequest,
 } from 'node:http'
+import type { Socket } from 'node:net'
 import test from 'node:test'
 import sharp from 'sharp'
 import type { DnsResolver } from '../../connectors/outboundPolicy.js'
@@ -89,18 +92,22 @@ async function httpFixture(handler: RequestListener) {
   const address = server.address()
   assert(address && typeof address === 'object')
   const options: RequestOptions[] = []
+  const sockets: Socket[] = []
   const transport = new LiteratureHttpTransport({
     resolver,
     timeoutMs: 1000,
     requestFactory: (input, callback) => {
       options.push(input)
       // Only this test adapter changes the socket. Production policy has no allowPrivate flag.
-      return httpRequest({ ...input, hostname: '127.0.0.1', port: address.port }, callback)
+      const request = httpRequest({ ...input, hostname: '127.0.0.1', port: address.port }, callback)
+      request.once('socket', (socket) => sockets.push(socket))
+      return request
     },
   })
   return {
     transport,
     options,
+    sockets,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   }
 }
@@ -457,10 +464,14 @@ test('single-hop HTTP reaches the fixture with the original Host and preserves S
     signal: signal(),
   })
   assert.equal(r.body.toString(), 'fixture-page')
+  assert.equal(f.sockets.length, 1)
+  assert(f.sockets.every((socket) => socket.closed))
   assert.equal(r.headers['set-cookie']?.length, 2)
   assert.deepEqual(seen, ['www.jieyoutsg.com'])
   assert.equal(f.options[0]!.hostname, '93.184.216.34')
-  assert.equal(f.options[0]!.agent, false)
+  assert(f.options[0]!.agent instanceof HttpAgent)
+  assert.notEqual(f.options[0]!.agent, globalAgent)
+  assert.equal(f.options[0]!.agent.options.keepAlive, false)
   const tls = literatureSocketOptions(
     literatureUrl('https://www.jieyoutsg.com/'),
     { ip: '93.184.216.34', family: 4 },
@@ -496,6 +507,8 @@ test('POST redirects are returned without replay and unsafe redirects are reject
     evil.transport.request({ url: LITERATURE_SITE, signal: signal() }),
     code('OUTBOUND_BLOCKED'),
   )
+  assert.equal(evil.sockets.length, 1)
+  assert(evil.sockets.every((socket) => socket.closed))
 })
 
 test('transport rejects header injection and fails truncated or oversized bodies', async (t) => {
@@ -511,6 +524,8 @@ test('transport rejects header injection and fails truncated or oversized bodies
   assert.equal(f.options.length, 0)
   // A mismatched length response must not be accepted as a page.
   await assert.rejects(f.transport.request({ url: LITERATURE_SITE, signal: signal() }))
+  assert.equal(f.sockets.length, 1)
+  assert(f.sockets.every((socket) => socket.closed))
   const large = await httpFixture((_req, res) => {
     res.end(Buffer.alloc(1024 * 1024 + 1))
   })
@@ -519,6 +534,8 @@ test('transport rejects header injection and fails truncated or oversized bodies
     large.transport.request({ url: LITERATURE_SITE, signal: signal() }),
     code('RESPONSE_TOO_LARGE'),
   )
+  assert.equal(large.sockets.length, 1)
+  assert(large.sockets.every((socket) => socket.closed))
 })
 
 test('class-based inference adapters retain their method and receiver', async () => {

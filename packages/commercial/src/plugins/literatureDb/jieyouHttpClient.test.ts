@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import {
+  type ClientRequest,
+  Agent as HttpAgent,
   type IncomingMessage,
+  type RequestOptions,
   type ServerResponse,
   createServer,
   request as httpRequest,
 } from 'node:http'
+import type { Socket } from 'node:net'
 import test from 'node:test'
 import sharp from 'sharp'
 import { LiteratureError } from './errors.js'
@@ -41,10 +45,16 @@ const picture = sharp({
   .png()
   .toBuffer()
 type Handler = (request: IncomingMessage, response: ServerResponse) => void
-async function fixture(handler?: Handler, timeoutMs = 1000) {
+async function fixture(
+  handler?: Handler,
+  timeoutMs = 1000,
+  afterRequest?: (request: ClientRequest, options: RequestOptions) => void,
+) {
   const paths: string[] = []
   const cookies: string[] = []
   const posted: string[] = []
+  const requests: ClientRequest[] = []
+  const sockets: Socket[] = []
   const server = createServer((req, res) => {
     paths.push(req.url!)
     cookies.push(req.headers.cookie ?? '')
@@ -86,16 +96,36 @@ async function fixture(handler?: Handler, timeoutMs = 1000) {
       resolve6: async () => [],
     },
     timeoutMs,
-    requestFactory: (options, callback) =>
-      httpRequest({ ...options, hostname: '127.0.0.1', port: address.port }, callback),
+    requestFactory: (options, callback) => {
+      const request = httpRequest(
+        { ...options, hostname: '127.0.0.1', port: address.port },
+        callback,
+      )
+      requests.push(request)
+      request.on('socket', (socket) => sockets.push(socket))
+      afterRequest?.(request, options)
+      return request
+    },
   })
+  const clients: JieyouHttpClient[] = []
+  const createClient = (options: { initialState?: unknown } = {}) => {
+    const client = new JieyouHttpClient(transport, options)
+    clients.push(client)
+    return client
+  }
   return {
-    client: new JieyouHttpClient(transport),
+    client: createClient(),
+    createClient,
+    requests,
+    sockets,
     transport,
     paths,
     cookies,
     posted,
-    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    close: async () => {
+      await Promise.all(clients.map((client) => client.close()))
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    },
   }
 }
 
@@ -235,12 +265,9 @@ test('independent clients never share cookies even when their requests overlap',
       res.end(FORM)
     }
   })
-  const second = new JieyouHttpClient(f.transport)
+  const second = f.createClient()
   t.after(() => f.close())
-  t.after(() => {
-    f.client.close()
-    second.close()
-  })
+  t.after(() => Promise.all([f.client.close(), second.close()]))
   await Promise.all([f.client.getChallenge(signal()), second.getChallenge(signal())])
   assert.deepEqual(observed.sort(), ['sid=fixture-1', 'sid=fixture-2'])
 })
@@ -309,14 +336,25 @@ test('close cancels in-flight requests and concurrent operations cannot mix chal
   const arrived = new Promise<void>((resolve) => {
     received = resolve
   })
-  const f = await fixture((_req, _res) => received())
+  const f = await fixture((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' })
+    res.write('<html>incomplete synthetic response')
+    received()
+  })
   t.after(() => f.close())
   t.after(() => f.client.close())
   const loading = f.client.loadLoginPage(signal())
   await arrived
   await assert.rejects(f.client.getChallenge(signal()), code('ACCOUNT_BUSY'))
-  f.client.close()
-  await assert.rejects(loading, code('CANCELLED'))
+  const rejected = assert.rejects(loading, code('CANCELLED'))
+  const closing = f.client.close()
+  assert.equal(f.client.close(), closing)
+  await closing
+  assert.equal(f.requests.length, 1)
+  assert(f.requests.every((request) => request.closed))
+  assert.equal(f.sockets.length, 1)
+  assert(f.sockets.every((socket) => socket.closed))
+  await rejected
   await assert.rejects(f.client.loadLoginPage(signal()), code('CANCELLED'))
   assert.throws(() => f.client.exportPrivateCookies(), code('CANCELLED'))
 })
@@ -349,6 +387,8 @@ test('a timed-out POST is never replayed and its challenge remains consumed', as
   await assert.rejects(f.client.submit(input, signal()), code('SUBMISSION_UNCERTAIN'))
   await assert.rejects(f.client.submit(input, signal()), code('CHALLENGE_STALE'))
   assert.equal(submits, 1)
+  assert(f.requests.every((request) => request.closed))
+  assert(f.sockets.every((socket) => socket.closed))
 })
 
 test('legacy table form keeps its parser-associated controls after DOM tree repair', () => {
@@ -393,7 +433,7 @@ test('restored HTTP state sends only the matching private cookies and remains cl
   t.after(() => f.close())
   t.after(() => f.client.close())
   await f.client.getChallenge(signal())
-  const restored = new JieyouHttpClient(f.transport, {
+  const restored = f.createClient({
     initialState: f.client.exportPrivateCookies(),
   })
   t.after(() => restored.close())
@@ -402,9 +442,124 @@ test('restored HTTP state sends only the matching private cookies and remains cl
   assert(f.cookies[start].includes('session=synthetic-session'))
   assert(!f.cookies[start].includes('secure='))
   assert(!f.cookies[start].includes('elsewhere='))
-  const separate = new JieyouHttpClient(f.transport)
+  const separate = f.createClient()
   t.after(() => separate.close())
   const separateStart = f.cookies.length
   await separate.getChallenge(signal())
   assert.equal(f.cookies[separateStart], '')
+})
+
+test('successful hops complete only after native request and socket close, with distinct agents', async (t) => {
+  const agents: HttpAgent[] = []
+  const f = await fixture(undefined, 1000, (_request, options) => {
+    assert(options.agent instanceof HttpAgent)
+    agents.push(options.agent)
+  })
+  t.after(() => f.close())
+  await f.client.getChallenge(signal())
+  assert.equal(f.requests.length, 2)
+  assert.equal(f.sockets.length, 2)
+  assert(f.requests.every((request) => request.closed))
+  assert(f.sockets.every((socket) => socket.closed))
+  assert.notEqual(agents[0], agents[1])
+  assert(agents.every((agent) => agent.options.keepAlive === false))
+})
+
+test('closing one client drains its socket without cancelling another on the same transport', async (t) => {
+  let firstArrived!: () => void
+  let secondArrived!: () => void
+  const firstReceived = new Promise<void>((resolve) => {
+    firstArrived = resolve
+  })
+  const secondReceived = new Promise<void>((resolve) => {
+    secondArrived = resolve
+  })
+  let secondResponse!: ServerResponse
+  let count = 0
+  const f = await fixture((_req, res) => {
+    if (++count === 1) firstArrived()
+    else {
+      secondResponse = res
+      secondArrived()
+    }
+  })
+  t.after(() => f.close())
+  const second = f.createClient()
+  const firstLoading = f.client.loadLoginPage(signal())
+  const rejected = assert.rejects(firstLoading, code('CANCELLED'))
+  await firstReceived
+  const secondLoading = second.loadLoginPage(signal())
+  await secondReceived
+  await f.client.close()
+  await rejected
+  assert.equal(f.sockets.length, 2)
+  assert.equal(f.sockets[0].closed, true)
+  assert.equal(f.sockets[1].closed, false)
+  secondResponse.writeHead(200, { 'content-type': 'text/html' })
+  secondResponse.end(FORM)
+  await secondLoading
+  assert.equal(f.sockets[1].closed, true)
+})
+
+test('close during unresolved DNS prevents native requests even after a late answer', async (t) => {
+  let resolveDns!: (addresses: string[]) => void
+  let dnsStarted!: () => void
+  const started = new Promise<void>((resolve) => {
+    dnsStarted = resolve
+  })
+  const addresses = new Promise<string[]>((resolve) => {
+    resolveDns = resolve
+  })
+  let requests = 0
+  const client = new JieyouHttpClient(
+    new LiteratureHttpTransport({
+      resolver: {
+        resolve4: () => {
+          dnsStarted()
+          return addresses
+        },
+        resolve6: async () => [],
+      },
+      requestFactory: () => {
+        requests++
+        throw new Error('must not dispatch')
+      },
+    }),
+  )
+  t.after(() => client.close())
+  const loading = client.loadLoginPage(signal())
+  const rejected = assert.rejects(loading, code('CANCELLED'))
+  await started
+  await client.close()
+  await rejected
+  resolveDns(['93.184.216.34'])
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(requests, 0)
+})
+
+test('cancellation before request socket assignment still waits for the created socket close', async (t) => {
+  const controller = new AbortController()
+  const created: Socket[] = []
+  let assigned = 0
+  const f = await fixture(undefined, 1000, (request, options) => {
+    assert(options.agent instanceof HttpAgent)
+    for (const group of Object.values(options.agent.sockets))
+      for (const socket of group ?? []) created.push(socket)
+    request.once('socket', () => {
+      assigned++
+    })
+    controller.abort()
+  })
+  t.after(() => f.close())
+  await assert.rejects(
+    f.transport.request({
+      url: 'http://www.jieyoutsg.com/e/member/login/',
+      signal: controller.signal,
+    }),
+    code('CANCELLED'),
+  )
+  assert.equal(assigned, 0)
+  assert.equal(created.length, 1)
+  assert(created.every((socket) => socket.closed))
+  assert(f.requests.every((request) => request.closed))
 })

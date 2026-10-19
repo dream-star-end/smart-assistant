@@ -1,12 +1,14 @@
 /** A single pinned HTTP(S) hop. No scripts, redirects, implicit proxy, or POST replay. */
 import {
   type ClientRequest,
+  Agent as HttpAgent,
   type IncomingHttpHeaders,
   type IncomingMessage,
   type RequestOptions,
   request as httpRequest,
 } from 'node:http'
-import { request as httpsRequest } from 'node:https'
+import { Agent as HttpsAgent, request as httpsRequest } from 'node:https'
+import type { Duplex } from 'node:stream'
 import type { DnsResolver, PinnedAddress } from '../../connectors/outboundPolicy.js'
 import { LiteratureError, abortable } from './errors.js'
 import {
@@ -108,18 +110,45 @@ export class LiteratureHttpTransport {
       timedOut = true
       controller.abort()
     }, this.timeout)
+    let request: ClientRequest | undefined
+    let requestClosed = Promise.resolve()
+    let agent: HttpAgent | undefined
+    const sockets = new Map<Duplex, Promise<void>>()
+    const capture = (socket: Duplex) => {
+      if (!sockets.has(socket))
+        sockets.set(
+          socket,
+          socket.closed
+            ? Promise.resolve()
+            : new Promise<void>((resolve) => socket.once('close', () => resolve())),
+        )
+    }
     try {
       // The deadline includes DNS; abort races a resolver that ignores cancellation.
       const { url, pin } = await abortable(
         pinLiteratureRequest(input.url, this.options.resolver),
         controller.signal,
       )
+      if (controller.signal.aborted) throw new LiteratureError('CANCELLED')
+      // Capture before Agent.oncreate assigns the socket to the request. Cancellation in that
+      // window may emit request.close without ever emitting request.socket.
+      agent =
+        url.protocol === 'http:'
+          ? new HttpAgent({ keepAlive: false })
+          : new HttpsAgent({ keepAlive: false })
+      const connect = agent.createConnection.bind(agent)
+      agent.createConnection = (options, callback) => {
+        const socket = connect(options, callback)
+        if (socket) capture(socket)
+        return socket
+      }
       return await new Promise<LiteratureHttpResponse>((resolve, reject) => {
-        const request = (
+        const current = (
           this.options.requestFactory ?? (url.protocol === 'http:' ? httpRequest : httpsRequest)
         )(
           {
             ...literatureSocketOptions(url, pin, method, input.body, input.cookie),
+            agent,
             signal: controller.signal,
           },
           (response) => {
@@ -129,7 +158,7 @@ export class LiteratureHttpTransport {
               const chunk = Buffer.from(raw)
               size += chunk.length
               if (size > this.maximum) {
-                request.destroy(new LiteratureError('RESPONSE_TOO_LARGE'))
+                current.destroy(new LiteratureError('RESPONSE_TOO_LARGE'))
                 return
               }
               chunks.push(chunk)
@@ -160,7 +189,13 @@ export class LiteratureHttpTransport {
             })
           },
         )
-        request.once('error', (error: Error) =>
+        request = current
+        requestClosed = current.closed
+          ? Promise.resolve()
+          : new Promise<void>((resolveClose) => current.once('close', () => resolveClose()))
+        current.on('socket', capture)
+        if (current.socket) capture(current.socket)
+        current.once('error', (error: Error) =>
           reject(
             error instanceof LiteratureError
               ? error
@@ -169,7 +204,7 @@ export class LiteratureHttpTransport {
                 ),
           ),
         )
-        request.end(input.body)
+        current.end(input.body)
       })
     } catch (error) {
       if (input.signal.aborted) throw new LiteratureError('CANCELLED')
@@ -180,6 +215,12 @@ export class LiteratureHttpTransport {
     } finally {
       clearTimeout(timer)
       input.signal.removeEventListener('abort', cancelled)
+      request?.destroy()
+      agent?.destroy()
+      for (const socket of sockets.keys()) socket.destroy()
+      await requestClosed
+      // Request.close can precede the physical socket.close; take this snapshot afterwards.
+      await Promise.all(sockets.values())
     }
   }
 }
