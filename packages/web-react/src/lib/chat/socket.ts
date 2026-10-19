@@ -10,6 +10,7 @@
  * drain 逐条复刻；帧翻译委托 reducer.ts（§7-§11）。
  */
 import type { MessageReplyQuote } from "@openclaude/protocol";
+import { applyAutomaticRecoverySnapshot } from "./automaticRecoverySnapshot";
 import {
   applyCostCharged,
   applyCostWaived,
@@ -25,7 +26,6 @@ import {
   applyTurnUsage,
   AUTO_CONTINUE_PROMPT,
   expireGenPlaceholdersAgainstServerRows,
-  enterDeferredRecoverySoftState,
   normalizeDelegateCards,
   normalizeGoalCards,
   paintDeferredTerminalError,
@@ -4287,51 +4287,6 @@ export class ChatSocket {
   }
 
 
-  /** Jobs and finalized source rows share one PG read snapshot. */
-  private applyAutomaticRecoverySnapshot(
-    sess: ChatSession,
-    incoming: ChatMessage[],
-    recoveries: AutomaticTurnRecoverySnapshot[] | undefined,
-  ): void {
-    if (!Array.isArray(recoveries)) return;
-    const terminals = detectServerTerminalTurns(incoming);
-    for (const [cmid, kind] of terminals) {
-      if (kind === "completed" && !incoming.some((message) => message._clientMessageId === cmid && message._errorCode)) {
-        this.settlePendingRecoveryError(sess.id, cmid, "adopted");
-        continue;
-      }
-      const error = sess.messages.find((message) => message.role === "assistant" &&
-        message._clientMessageId === cmid && !!message._errorCode);
-      if (!error || !supportsAutomaticTurnRecovery(error._errorCode!)) continue;
-      const child = sess.messages.some((message) => message.role === "user" &&
-        message._automaticRecovery === true && message._recoveryOfClientMessageId === cmid &&
-        isServerAuthoredRow(message));
-      if (child || sess._cancelledAutomaticRecoveryIds?.[cmid] === true) continue;
-      const job = recoveries.find((item) => item.sourceClientMessageId === cmid);
-      if (!job) {
-        sess._automaticRecoveryDecisions = { ...(sess._automaticRecoveryDecisions ?? {}), [cmid]: true };
-        this.settlePendingRecoveryError(sess.id, cmid, "declined", "decision_declined");
-        continue;
-      }
-      if (sess._cancelledAutomaticRecoveryIds?.[job.rootClientMessageId] === true) continue;
-      // A later user intent or an ACKed child owns the UI, even if this older
-      // snapshot completed after the live adoption.
-      const index = sess.messages.findIndex((message) => message.role === "user" && message.id === cmid);
-      if (index < 0 || sess.messages.slice(index + 1).some((message) => message.role === "user")) continue;
-      if (sess._sendingInFlight && sess._activeClientMessageId && sess._activeClientMessageId !== cmid) continue;
-      const normalized = normalizeTurnErrorCode(error._errorCode);
-      const paint: DeferredTerminalErrorPaint = {
-        normalized, text: friendlyBridgeErrorMessage(normalized),
-        clientMessageId: cmid, detail: safeBridgeErrorDetail(normalized),
-      };
-      if (!this.deferTerminalErrorForRecovery(sess.id, paint, true)) continue;
-      error._errorCardSnapshot = undefined;
-      sess._deferredTerminalErrorClientMessageId = cmid;
-      enterDeferredRecoverySoftState(sess, cmid);
-      sess._turnStatus = { kind: "retrying", attempt: job.attempt, max: AUTOMATIC_TURN_RETRY_MAX, retryAt: Date.now() };
-    }
-  }
-
   /** 刷新后继续等裁决。历史失败 tape 不能自行把源轮提交成错误卡。 */
   private restoreDeferredTerminalError(s: ChatSession, stored: StoredSession): void {
     const cmid = stored._deferredTerminalErrorClientMessageId;
@@ -4583,7 +4538,10 @@ export class ChatSocket {
     if (!s._sendingInFlight || settlingActiveTurn) {
       s.messages = repairPostFinalProcessOrder(s.messages);
     }
-    this.applyAutomaticRecoverySnapshot(s, msgs, archive?.automaticRecoveries);
+    applyAutomaticRecoverySnapshot(s, msgs, archive?.automaticRecoveries, {
+      defer: (paint) => this.deferTerminalErrorForRecovery(s.id, paint, true),
+      settle: (cmid, outcome) => this.settlePendingRecoveryError(s.id, cmid, outcome, "decision_declined"),
+    });
     freezeErrorCardSnapshots(
       s.messages,
       s._deferredTerminalErrorClientMessageId,

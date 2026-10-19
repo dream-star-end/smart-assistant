@@ -6862,7 +6862,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
       const snapshot = await backend.getClientSessionPartial(sessionId, CUSER, 0, { view: "timeline" });
       assert.deepEqual(snapshot?.automaticRecoveries,
         ["leased", "sent", "forwarded"].includes(status) ? expected : [], status);
-      assert.ok(snapshot?.messages.some((row) => row._clientMessageId === sourceClientMessageId && row._errorCode),
+      assert.ok((snapshot?.messages as MessageLike[]).some((row) => row._clientMessageId === sourceClientMessageId && row._errorCode),
         "the source terminal stays immutable while the recovery job changes");
     }
   });

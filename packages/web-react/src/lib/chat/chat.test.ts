@@ -7239,6 +7239,7 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
     expect(session.messages.find((m) => m.id === "cold-error")?._errorHeldForRecovery).toBe(true);
     expect(session.messages.some((m) => m._errorCardSnapshot?.disposition === "card")).toBe(false);
     expect(session._sendingInFlight).toBe(true);
+    expect(session.messages.find((message) => message.id === cmid)?.status).toBe("sent");
     const stored = sock.toStored(id)!;
     const reload = makeSocket({ syncSession: async () => {} });
     reload.loadStored(JSON.parse(JSON.stringify(stored)));
@@ -7253,6 +7254,23 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
     reload.applyServerMessages(id, "main", structuredClone(rows), true, 2, { automaticRecoveries: [] });
     expect(restored.messages.filter((m) => m._errorCardSnapshot?.disposition === "card")).toHaveLength(1);
     sock.stop(); reload.stop();
+  });
+
+  test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: explicit pre-run rejection is terminal without a recovery tape", () => {
+    const { sock, ws, session, user } = deferredErrorFixture("s-pre-run-terminal", { masterOwns: false });
+    ws.onmessage?.({ data: JSON.stringify({
+      type: "outbound.error", peer: { id: session.id, kind: "dm" },
+      code: "upstream_failed", message: "模型服务暂时不可用", recoveryDisposition: "terminal",
+      frameSeq: 2, ts: Date.now(),
+    }) });
+    expect(errorCards(session)).toHaveLength(1);
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._deferredTerminalErrorClientMessageId).toBeUndefined();
+    expect(sock.toStored(session.id)?._deferredTerminalErrorPaint).toBeUndefined();
+    vi.advanceTimersByTime(60_000);
+    expect(session._sendingInFlight).toBe(false);
+    expect(session._activeClientMessageId).not.toBe(user.id);
+    sock.stop();
   });
 
   test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: a failed authority read stays soft and keeps reconciling", async () => {

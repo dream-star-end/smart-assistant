@@ -84,6 +84,14 @@ describe('_buildEngineErrorFrame — turn 终态 wire', () => {
 })
 
 describe('_earlyRejectErrorFrames — 结构化双帧', () => {
+  test('INC-20261019-RECOVERABLE-ERROR-RED-CARD: rejection before a runner explicitly ends automatic recovery', () => {
+    const [error] = _earlyRejectErrorFrames({
+      sessionKey: 'agent:main:webchat:dm:early-reject', channel: 'webchat',
+      peer: { id: 'early-reject', kind: 'dm' }, userId: 'c:3', traceId: 'a'.repeat(32),
+      code: 'upstream_failed', message: '模型目录暂不可用', legacyErrorText: '[error] MODEL_CATALOG_UNAVAILABLE',
+    });
+    assert.equal(error.recoveryDisposition, 'terminal');
+  });
   const frames = _earlyRejectErrorFrames({
     sessionKey: 'sk-1',
     channel: 'webchat',
