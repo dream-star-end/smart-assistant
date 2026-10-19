@@ -26,6 +26,7 @@ import {
   type AffinityCandidate,
   type BoundMemberState,
 } from "../account-pool/policy/affinity.js";
+import { saveAntigravityMetadata } from "../account-pool/antigravityQuota.js";
 import { pickAntigravityAccount, reportAntigravityOutcome } from "../account-pool/antigravityPool.js";
 import { invalidateApiKeyPoolCache, selectApiKey, upsertApiKey } from "../account-pool/apiKeyPool.js";
 import { configureAffinitySettings, inflightCount, noteAdmission, releaseInflight } from "../account-pool/policy/affinity.js";
@@ -257,5 +258,91 @@ describe("per-member caps (Codex r1)", () => {
     noteAdmission("claude", b.id.toString());
     const got = await s.pick({ mode: "agent", provider: "claude", sessionId: "new", userId: 78n });
     assert.equal(got.account_id, b.id, "falls through to the idle account instead of AccountPoolBusyError");
+  });
+});
+
+
+describe("Antigravity Ultra preference (OCV5-516)", () => {
+  async function seed() {
+    const ids: string[] = [];
+    for (const [email, tier] of [["pro@example.test", "g1-pro-tier"], ["ultra@example.test", "g1-ultra-lite-tier"]]) {
+      const row = await query<{ id: string }>(`INSERT INTO gemini_oauth_accounts
+        (label,email,refresh_token_enc,refresh_token_nonce) VALUES ($1,$1,$2,$3) RETURNING id::text`,
+        [email, randomBytes(48), randomBytes(12)]);
+      ids.push(row.rows[0].id);
+      await saveAntigravityMetadata(ids.at(-1)!, tier, { 'gpt-oss-120b-medium': { remainingFraction: 1, resetTime: null } });
+    }
+    return { pro: ids[0], ultra: ids[1] };
+  }
+  test("an old Pro binding spills to healthy Ultra on every turn without rotating or rebinding", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const { pro, ultra } = await seed();
+    await query('UPDATE gemini_oauth_accounts SET paid_tier=NULL WHERE id=$1', [ultra]);
+    const old = await pickAntigravityAccount({ userId: 3n });
+    assert.equal(old?.accountId.toString(), pro);
+    await query("UPDATE gemini_oauth_accounts SET paid_tier='g1-ultra-lite-tier' WHERE id=$1", [ultra]);
+    for (let i=0; i<3; i++) {
+      const next = await pickAntigravityAccount({ userId: 3n, modelId: 'antigravity-gpt-oss-120b' });
+      assert.equal(next?.accountId.toString(), ultra);
+      assert.equal(next?.affinity, 'spill');
+    }
+    assert.equal((await readAffinity('antigravity', 3n))?.memberId, pro);
+    assert.equal((await pickAntigravityAccount())?.accountId.toString(), ultra);
+    // Multiple Ultra members must not turn the old Pro binding into LRU rotation.
+    await query(`INSERT INTO gemini_oauth_accounts (label,email,refresh_token_enc,refresh_token_nonce,paid_tier)
+      VALUES ('second','second-ultra@example.test',$1,$2,'g1-ultra-tier')`, [randomBytes(48),randomBytes(12)]);
+    const stable = (await pickAntigravityAccount({ userId: 3n }))?.accountId;
+    assert.ok(stable);
+    for (let i=0; i<3; i++) {
+      await query('UPDATE gemini_oauth_accounts SET last_used_at=NOW() WHERE id=$1', [stable.toString()]);
+      assert.equal((await pickAntigravityAccount({ userId: 3n }))?.accountId, stable);
+    }
+  });
+  test("quota exhaustion and cooldown fall back to Pro, then recover automatically", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const { pro, ultra } = await seed();
+    const args = { userId: 3n, modelId: 'antigravity-gpt-oss-120b' };
+    assert.equal((await pickAntigravityAccount(args))?.accountId.toString(), ultra);
+    await saveAntigravityMetadata(ultra, 'g1-ultra-lite-tier', { 'gpt-oss-120b-medium': { remainingFraction: 0, resetTime: '2099-01-01T00:00:00Z' } });
+    assert.equal((await pickAntigravityAccount(args))?.accountId.toString(), pro);
+    await saveAntigravityMetadata(ultra, 'g1-ultra-lite-tier', { 'gpt-oss-120b-medium': { remainingFraction: 0, resetTime: '2000-01-01T00:00:00Z' } });
+    assert.equal((await pickAntigravityAccount(args))?.accountId.toString(), ultra);
+    await query('UPDATE gemini_oauth_accounts SET health_score=20 WHERE id=$1', [ultra]);
+    assert.equal((await pickAntigravityAccount(args))?.accountId.toString(), pro, 'degraded Ultra falls back before making another model call');
+    await query('UPDATE gemini_oauth_accounts SET health_score=100 WHERE id=$1', [ultra]);
+    await reportAntigravityOutcome(BigInt(ultra), { kind: 'rate_limited', retryAfterMs: 60_000 }, 'test');
+    assert.equal((await pickAntigravityAccount(args))?.accountId.toString(), pro);
+  });
+  test("unsupported accounts are excluded and concurrent Ultra overflow uses Pro", async (t) => {
+    if (skipIfNoDb(t)) return;
+    const { pro, ultra } = await seed();
+    configureAffinitySettings(async () => ({ maxUsersPerSubscription: 8, ratePerMin: 100, antigravityInflight: 1, antigravityRatePerMin: 100 }));
+    const args = { userId: 3n, modelId: 'antigravity-gpt-oss-120b' };
+    const picks = await Promise.all(['ultra-one','ultra-two'].map((reserveToken) => pickAntigravityAccount({ ...args, reserveToken })));
+    assert.deepEqual(picks.map((r) => r?.accountId.toString()).sort(), [pro, ultra].sort());
+    for (const key of ['ultra-one','ultra-two']) releaseInflight(key);
+    await saveAntigravityMetadata(ultra, 'g1-ultra-lite-tier', {});
+    assert.equal((await pickAntigravityAccount(args))?.accountId.toString(), pro);
+    await saveAntigravityMetadata(pro, 'g1-pro-tier', {});
+    assert.equal(await pickAntigravityAccount(args), null);
+  });
+});
+
+
+describe("new model availability requires affirmative account evidence (OCV5-516)", () => {
+  test("an Ultra-only Claude family never falls back to unknown Pro metadata", async (t) => {
+    if (skipIfNoDb(t)) return;
+    for (const [email,tier] of [['unknown-pro@example.test','g1-pro-tier'],['known-ultra@example.test','g1-ultra-lite-tier']]) {
+      await query(`INSERT INTO gemini_oauth_accounts(label,email,refresh_token_enc,refresh_token_nonce,paid_tier)
+        VALUES ($1,$1,$2,$3,$4)`, [email,randomBytes(48),randomBytes(12),tier]);
+    }
+    const ids=await query<{ id:string; paid_tier:string }>('SELECT id::text,paid_tier FROM gemini_oauth_accounts ORDER BY id');
+    const ultra=ids.rows.find((r)=>r.paid_tier==='g1-ultra-lite-tier')!.id;
+    await saveAntigravityMetadata(ultra,'g1-ultra-lite-tier',Object.fromEntries(['low','medium','high'].map((effort)=>[
+      `claude-sonnet-5-5-${effort}`,{ remainingFraction:1,resetTime:null },
+    ])));
+    assert.equal((await pickAntigravityAccount({ userId:3n,modelId:'antigravity-claude-sonnet-5.5' }))?.accountId.toString(),ultra);
+    await reportAntigravityOutcome(BigInt(ultra),{kind:'rate_limited',retryAfterMs:60000},'test');
+    assert.equal(await pickAntigravityAccount({ userId:3n,modelId:'antigravity-claude-sonnet-5.5' }),null);
   });
 });

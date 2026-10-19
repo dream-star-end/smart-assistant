@@ -54,6 +54,7 @@ export async function admitAntigravityTurn(
   const coolingUntil = deps.modelCoolingUntil ?? antigravityModelCoolingUntil
   const account = await (deps.pick ?? pickAntigravityAccount)({
     userId: args.userId,
+    modelId: args.modelId,
     reserveToken: args.requestId,
     skip: async (accountId) => {
       // A KV hiccup must not block admission: treat the model as usable.
