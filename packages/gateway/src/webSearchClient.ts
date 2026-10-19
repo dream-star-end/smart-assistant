@@ -10,9 +10,9 @@ function hitsFrom(body: unknown): WebSearchHit[] {
   for (const row of (body as { organic: unknown[] }).organic) {
     if (!row || typeof row !== 'object') continue
     const item = row as Record<string, unknown>
-    if (typeof item.title !== 'string' || !item.title.trim() || typeof item.url !== 'string') continue
+    if (typeof item.title !== 'string' || typeof item.url !== 'string') continue
     try { if (!['http:', 'https:'].includes(new URL(item.url).protocol)) continue } catch { continue }
-    hits.push({ title: item.title.slice(0, 512), url: item.url, snippet: typeof item.snippet === 'string' ? item.snippet.slice(0, 4000) : '', ...(typeof item.date === 'string' ? { date: item.date.slice(0, 80) } : {}) })
+    hits.push({ title: (item.title.trim() || item.url).slice(0, 512), url: item.url, snippet: typeof item.snippet === 'string' ? item.snippet.slice(0, 4000) : '', ...(typeof item.date === 'string' ? { date: item.date.slice(0, 80) } : {}) })
     if (hits.length === 10) break
   }
   return hits

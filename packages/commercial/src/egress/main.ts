@@ -584,6 +584,8 @@ export async function startEgress(): Promise<void> {
       });
     },
     staticProviderKeys,
+    // OCV5-520: honor Go pool disables/rotation without changing other providers.
+    apiKeyPoolEnabled: ["opencodego"],
     getPhase6AccountUuidEnforce,
     getSessionPinMode,
     listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
