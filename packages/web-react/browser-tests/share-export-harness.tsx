@@ -11,5 +11,8 @@ const messages: ChatMessage[] = [
   { id: "u2", role: "user", ts: 6, text: "继续完成下一节。" },
   { id: "partial", role: "assistant", ts: 7, text: "已交付的部分报告仍可导出。", _clientMessageId: "u2" },
   { id: "failure", role: "assistant", ts: 8, text: "", _errorCode: "MODEL_CONFIG_CHANGED_RETRY_TURN", _clientMessageId: "u2" },
+  { id: "u3", role: "user", ts: 9, text: "请保留中断前的交付。" },
+  { id: "stopped-file", role: "assistant", ts: 10, text: "已交付：[停止前文件](/home/agent/.openclaude/generated/stopped.csv)\n\n[turn failed: user_cancelled]", _errorCode: "USER_CANCELLED", _clientMessageId: "u3" },
+  { id: "post-stop-tool", role: "tool", ts: 11, text: "PRIVATE_POST_STOP_TOOL", _clientMessageId: "u3" },
 ];
 createRoot(document.getElementById("root")!).render(<ToastProvider><ShareDialog open onOpenChange={() => {}} messages={messages} sending={false} title="销售分析" agentName="全能助手" /></ToastProvider>);
