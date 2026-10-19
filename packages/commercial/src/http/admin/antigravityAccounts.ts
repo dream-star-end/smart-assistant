@@ -106,7 +106,7 @@ export async function handleAdminAntigravityAccountsList(
 ): Promise<void> {
   await requireAdmin(req, deps.jwtSecret)
   const rows = await getPool().query(
-    `SELECT id::text AS id, label, email, status, health_score, cooldown_until, cooldown_reason,
+    `SELECT id::text AS id, label, email, paid_tier, tier_updated_at, status, health_score, cooldown_until, cooldown_reason,
             backoff_level, disabled_by, success_count::text AS success_count,
             fail_count::text AS fail_count, last_error, last_used_at, created_at, updated_at
        FROM gemini_oauth_accounts ORDER BY id`,

@@ -570,3 +570,52 @@ test("a model safety stop is the named, final refusal code, not an invalid stop"
       && error.message === BOX_CLI_MODEL_REFUSED, String(allowFinal));
   }
 });
+
+// OCV5-509 (commercial u4, 2026-10-18 11:27–12:34Z): every round that wrote a
+// script failed at message_stop as BOX_TOOL_SNAPSHOT_MISMATCH, and each replay
+// of it as 503. Claude Code 2.1.302 records a streamed tool input after its
+// own repair: a literal `\uXXXX` becomes the character. The stream keeps the
+// model's text, which is what is handed off.
+function repairedRound(input: Record<string, unknown>, recorded: Record<string, unknown>) {
+  const id = "toolu_509_script";
+  return [
+    { type: "system", subtype: "init", tools: [boxName], mcp_servers: [{}] },
+    event({ type: "message_start", message: { id: "msg_509", model,
+      role: "assistant", content: [], usage: { input_tokens: 2, output_tokens: 0 } } }),
+    event({ type: "content_block_start", index: 0,
+      content_block: { type: "tool_use", id, name: boxName, input: {} } }),
+    event({ type: "content_block_delta", index: 0,
+      delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } }),
+    { type: "assistant", message: { id: "msg_509", model,
+      role: "assistant", content: [{ type: "tool_use", id, name: boxName, input: recorded }] } },
+    event({ type: "content_block_stop", index: 0 }),
+    event({ type: "message_delta", delta: { stop_reason: "tool_use" },
+      usage: { output_tokens: 8, input_tokens: 2 } }),
+    event({ type: "message_stop" }),
+  ];
+}
+function decodeRound(records: unknown[]) {
+  const decoder = new BoxCliToolHandoffDecoder(model, catalog);
+  let candidate: ReturnType<BoxCliToolHandoffDecoder["push"]>["candidate"] = null;
+  for (const line of lines(records)) candidate = decoder.push(line).candidate ?? candidate;
+  return candidate;
+}
+const cjk = { value: "re.findall(r'[\\u4e00-\\u9fff]+', title)" };
+
+test("OCV5-509 a tool input the CLI records unicode-repaired hands off the input the model wrote", () => {
+  const candidate = decodeRound(repairedRound(cjk, { value: "re.findall(r'[\u4e00-\u9fff]+', title)" }));
+  assert.ok(candidate);
+  assert.deepEqual(candidate.toolUses.map((item) => item.input), [cjk]);
+});
+
+test("OCV5-509 a recorded tool input that differs in any other way is still a snapshot mismatch", () => {
+  assert.throws(() => decodeRound(repairedRound(cjk, { value: "re.findall(r'[a-z]+', title)" })),
+    (error: unknown) => error instanceof BoxCliToolHandoffError && error.code === "BOX_TOOL_SNAPSHOT_MISMATCH");
+  assert.throws(() => decodeRound(repairedRound(cjk, { ...cjk, extra: true })),
+    (error: unknown) => error instanceof BoxCliToolHandoffError && error.code === "BOX_TOOL_SNAPSHOT_MISMATCH");
+  // the CLI leaves an escape in a Windows path alone, so a repaired one is not its record
+  const windows = { value: "type C:\\users\\u0041dmin.txt" };
+  assert.ok(decodeRound(repairedRound(windows, windows)));
+  assert.throws(() => decodeRound(repairedRound(windows, { value: "type C:\\usersAdmin.txt" })),
+    (error: unknown) => error instanceof BoxCliToolHandoffError && error.code === "BOX_TOOL_SNAPSHOT_MISMATCH");
+});

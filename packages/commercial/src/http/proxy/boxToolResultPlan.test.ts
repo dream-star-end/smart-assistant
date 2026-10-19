@@ -133,3 +133,19 @@ test("replacing the run-directory parent with a symlink cannot redirect WRITE or
     rmSync(decoy, { recursive: true, force: true });
   }
 });
+
+test("OCV5-509 the CLI calls a tool with its repaired record of the input", () => {
+  const model = { value: "[\\u4e00-\\u9fff]" };
+  const recorded = { value: "[一-鿿]" };
+  const call = (args: unknown) => JSON.stringify({ version: 1, modelToolUseId: use.id,
+    mcpRequestId: 77, name: "t0", arguments: args });
+  const live = { ...use, input: model, cliInput: recorded };
+  assert.equal(parseBoxPendingCall(call(recorded), live).modelToolUseId, use.id);
+  assert.equal(parseBoxPendingCall(call(model), live).modelToolUseId, use.id);
+  assert.throws(() => parseBoxPendingCall(call({ value: "[a-z]" }), live), /BOX_PENDING_INVALID/);
+  const stored = { id: use.id, boxName: use.boxName, clientName: use.clientName,
+    inputHash: hashBoxToolInput(model), cliInputHash: hashBoxToolInput(recorded) };
+  assert.equal(parseBoxPendingCall(call(recorded), stored).modelToolUseId, use.id);
+  assert.throws(() => parseBoxPendingCall(call(recorded), { ...stored, cliInputHash: undefined }),
+    /BOX_PENDING_INVALID/);
+});
