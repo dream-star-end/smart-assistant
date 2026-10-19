@@ -471,7 +471,7 @@ test('single-hop HTTP reaches the fixture with the original Host and preserves S
   assert.equal(f.options[0]!.hostname, '93.184.216.34')
   assert(f.options[0]!.agent instanceof HttpAgent)
   assert.notEqual(f.options[0]!.agent, globalAgent)
-  assert.equal(f.options[0]!.agent.options.keepAlive, false)
+  assert.equal(Reflect.get(f.options[0]!.agent, 'keepAlive'), false)
   const tls = literatureSocketOptions(
     literatureUrl('https://www.jieyoutsg.com/'),
     { ip: '93.184.216.34', family: 4 },

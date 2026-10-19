@@ -462,7 +462,7 @@ test('successful hops complete only after native request and socket close, with 
   assert(f.requests.every((request) => request.closed))
   assert(f.sockets.every((socket) => socket.closed))
   assert.notEqual(agents[0], agents[1])
-  assert(agents.every((agent) => agent.options.keepAlive === false))
+  assert(agents.every((agent) => Reflect.get(agent, 'keepAlive') === false))
 })
 
 test('closing one client drains its socket without cancelling another on the same transport', async (t) => {
