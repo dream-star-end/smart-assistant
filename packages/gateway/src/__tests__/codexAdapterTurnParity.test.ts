@@ -712,6 +712,103 @@ describe("CodexAdapter — 事件映射 parity(fake-SDK 不出边界)", () => {
 });
 
 describe("CodexAdapter — interrupt / approval / 崩溃", () => {
+  test("OCV5-522: same-stack Stop before engine start retains exactly one owned terminal billing", async () => {
+    const h = makeHarness();
+    const order: string[] = [];
+    const turnKey = "c".repeat(64);
+    h.adapter.on("billing", () => order.push("billing"));
+    const turn = beginTurn(h, { requestId: "req-immediate-stop", turnKey });
+    assert.equal(h.adapter.interrupt(), true);
+    void turn.summary.then(() => order.push("summary"));
+    const summary = await turn.summary;
+    assert.ok(summary);
+    assert.equal(summary.isError, true);
+    assert.equal(summary.stopReason, "interrupted");
+    assert.equal(h.proc().written.some((r) => r.method === "turn/start"), false);
+    assert.equal(h.billing.length, 1, "the real pre-start cancellation result must retain its billing");
+    assert.equal(h.billing[0].requestId, "req-immediate-stop");
+    assert.equal(h.billing[0].turnKey, turnKey);
+    assert.equal(h.billing[0].engineSessionId, engineSessionId(SESSION_KEY));
+    assert.equal(h.billing[0].status, "error");
+    assert.equal(h.billing[0].terminalCode, "USER_CANCELLED");
+    assert.equal(h.billing[0].usage, undefined, "preserve the original no-usage frame without synthesizing tokens");
+    assert.deepEqual(order, ["billing", "summary"]);
+    assert.deepEqual(await h.adapter.writeDelegateTerminal({} as never, "late child"), {
+      ok: false, processAlive: true,
+    });
+  });
+
+  test("OCV5-522: a synchronous kernel result has billing ownership before submit returns", async () => {
+    const h = makeHarness();
+    const kernel = (h.adapter as unknown as { kernel: { submit: (...args: unknown[]) => Promise<void>; emit: (event: string, msg: unknown) => boolean } }).kernel;
+    kernel.submit = async () => {
+      kernel.emit("message", {
+        type: "result", subtype: "success", is_error: false,
+        requestId: "req-synchronous", result: "", num_turns: 1,
+        duration_ms: 1, total_cost_usd: 0,
+        usage: { input_tokens: 7, output_tokens: 2 },
+      });
+    };
+    const turn = beginTurn(h, { requestId: "req-synchronous" });
+    const summary = await turn.summary;
+    assert.ok(summary);
+    assert.equal(summary.isError, false);
+    assert.equal(h.billing.length, 1);
+    assert.equal(h.billing[0].requestId, "req-synchronous");
+    assert.equal(h.billing[0].status, "success");
+    assert.equal(h.billing[0].usage?.output_tokens, 2);
+  });
+
+  test("OCV5-522: a stale result from A cannot bill or finish the routed turn B", async () => {
+    const h = makeHarness();
+    const first = beginTurn(h, { requestId: "req-owner-a" });
+    await waitForRequest(h, "turn/start");
+    h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await first.summary;
+    assert.equal(h.billing.length, 1);
+    const second = beginTurn(h, { requestId: "req-owner-b" });
+    await waitFor(() => h.proc().written.filter((r) => r.method === "turn/start").length === 2);
+    let secondFinished = false;
+    void second.summary.then(() => { secondFinished = true; });
+    const kernel = (h.adapter as unknown as { kernel: { emit: (event: string, msg: unknown) => boolean } }).kernel;
+    kernel.emit("message", {
+      type: "result", subtype: "success", is_error: false,
+      requestId: "req-owner-a", result: "", num_turns: 1,
+      duration_ms: 3, total_cost_usd: 0,
+      usage: { input_tokens: 999, output_tokens: 99 },
+    });
+    await Promise.resolve();
+    assert.equal(secondFinished, false, "a foreign result must not finalize the current parser");
+    assert.equal(h.billing.length, 1, "a duplicate foreign result must not create another billing");
+    h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await second.summary;
+    assert.equal(h.billing.length, 2);
+    assert.equal(h.billing[1].requestId, "req-owner-b");
+  });
+
+  test("OCV5-522: a genuine success racing Stop retains its actual positive usage", async () => {
+    const h = makeHarness();
+    const turn = beginTurn(h, { requestId: "req-stop-success" });
+    await waitForRequest(h, "turn/start");
+    const tid = { threadId: "thr-new-1", turnId: "turn-1" };
+    h.proc().notify("thread/tokenUsage/updated", {
+      ...tid,
+      tokenUsage: {
+        last: { cachedInputTokens: 0, inputTokens: 10, outputTokens: 4, reasoningOutputTokens: 0, totalTokens: 14 },
+        total: { cachedInputTokens: 0, inputTokens: 10, outputTokens: 4, reasoningOutputTokens: 0, totalTokens: 14 },
+      },
+    });
+    assert.equal(h.adapter.interrupt(), true);
+    h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    const summary = await turn.summary;
+    assert.ok(summary);
+    assert.equal(summary.isError, false);
+    assert.equal(h.billing.length, 1);
+    assert.equal(h.billing[0].status, "success");
+    assert.equal(h.billing[0].terminalCode, undefined);
+    assert.equal(h.billing[0].usage?.output_tokens, 4);
+  });
+
   test("interrupt:活跃 turn → turn/interrupt 请求;interrupted 终态仍带 usage billing", async () => {
     const h = makeHarness();
     const turn = beginTurn(h, { requestId: "req-int" });

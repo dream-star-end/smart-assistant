@@ -94,6 +94,7 @@ const CODEX_PHANTOM_SIGNALS: Readonly<PhantomSignals> = Object.freeze({
 
 /** per-turn 上下文(parser + 本 turn 最近一条 result error 原文)。 */
 interface CodexTurnContext {
+  requestId?: string
   parser: CcbMessageParser
   lastErrorText: string | null
   onEvent: (event: EngineEvent) => void
@@ -438,6 +439,8 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
         return
       }
       if (turn && msg && typeof msg === 'object' && msg.type === 'result') {
+        // A delayed result belongs to its submitted request, never the next parser.
+        if (turn.requestId && typeof msg.requestId === 'string' && msg.requestId !== turn.requestId) return
         if (msg.is_error === true && typeof msg.result === 'string') {
           turn.lastErrorText = msg.result
         }
@@ -448,6 +451,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
         if (
           typeof requestId === 'string' &&
           requestId.length > 0 &&
+          requestId === turn.requestId &&
           this._activeTurn === turn &&
           !turn.parser.finalized
         ) {
@@ -526,6 +530,7 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
       resolveSummary = res
     })
     const ctx: CodexTurnContext = {
+      ...(params.requestId ? { requestId: params.requestId } : {}),
       parser: null as unknown as CcbMessageParser,
       lastErrorText: null,
       onEvent: params.onEvent,
@@ -575,6 +580,8 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     })
     ctx.parser = parser
     this._routeTurn = ctx
+    // Billing ownership starts before submit can synchronously return a result or Stop.
+    this._activeTurn = ctx
     this._interrupting = false
     // kernel.submit() covers the full turn, so do not wait for it to arm
     // stdout routing. InlinePush eligibility is kernel.hasIngestedParentTurn
@@ -605,16 +612,8 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     } catch (err) {
       submitted = Promise.reject(err)
     }
-    let rejectedEarly = false
     void submitted.catch(() => {
-      rejectedEarly = true
       if (this._activeTurn === ctx) this._activeTurn = null
-    })
-    queueMicrotask(() => {
-      if (rejectedEarly) return
-      if (this._routeTurn === ctx && !ctx.parser.finalized && !this._interrupting) {
-        this._activeTurn = ctx
-      }
     })
     return {
       submitted,

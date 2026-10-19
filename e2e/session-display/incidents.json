@@ -7573,7 +7573,8 @@
       "coverageCommits": [
         "44e04ac6",
         "693212d9",
-        "74b6c0c2"
+        "74b6c0c2",
+        "c8743712"
       ],
       "regressions": [
         {
@@ -7610,6 +7611,26 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/codexTurnRetry.test.ts",
           "assertion": "Stop while starting, then shutdown rejects the start → USER_CANCELLED, not CODEX_ERROR"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "OCV5-522: same-stack Stop before engine start retains exactly one owned terminal billing"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "OCV5-522: a synchronous kernel result has billing ownership before submit returns"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "OCV5-522: a stale result from A cannot bill or finish the routed turn B"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "OCV5-522: a genuine success racing Stop retains its actual positive usage"
         }
       ],
       "proofPending": {
