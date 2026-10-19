@@ -539,6 +539,16 @@ test('transport rejects header injection and fails truncated or oversized bodies
     f.transport.request({ url: LITERATURE_SITE, cookie: 'a=1\r\nInjected:true', signal: signal() }),
     code('INVALID_INPUT'),
   )
+  const stopped = new AbortController()
+  stopped.abort()
+  await assert.rejects(
+    f.transport.request({
+      url: LITERATURE_SITE,
+      cookie: 'a=1\r\nInjected:true',
+      signal: stopped.signal,
+    }),
+    code('INVALID_INPUT'),
+  )
   assert.equal(f.options.length, 0)
   // A mismatched length response must not be accepted as a page.
   await assert.rejects(f.transport.request({ url: LITERATURE_SITE, signal: signal() }))
@@ -1434,18 +1444,20 @@ test('streaming owns sink cleanup even before a valid request can start', async 
   })
   const abort = new AbortController()
   abort.abort()
-  for (const input of [
-    { url: LITERATURE_SITE, signal: abort.signal },
-    { url: LITERATURE_SITE, cookie: 'bad\r\nheader', signal: signal() },
-    { url: 'http://evil.test/', signal: signal() },
+  for (const { input, expected } of [
+    { input: { url: LITERATURE_SITE, signal: abort.signal }, expected: 'CANCELLED' },
+    {
+      input: { url: LITERATURE_SITE, cookie: 'bad\r\nheader', signal: signal() },
+      expected: 'INVALID_INPUT',
+    },
+    { input: { url: 'http://evil.test/', signal: signal() }, expected: 'OUTBOUND_BLOCKED' },
+    {
+      input: { url: LITERATURE_SITE, cookie: 'bad\r\nheader', signal: abort.signal },
+      expected: 'INVALID_INPUT',
+    },
   ]) {
     const target = countingSink({ emitClose: false })
-    await assert.rejects(
-      transport.requestToSink(input, target.sink),
-      (error: unknown) =>
-        error instanceof LiteratureError &&
-        ['CANCELLED', 'INVALID_INPUT', 'OUTBOUND_BLOCKED'].includes(error.code),
-    )
+    await assert.rejects(transport.requestToSink(input, target.sink), code(expected))
     assert.equal(target.sink.closed, true)
     assert.equal(target.bytes(), 0)
   }

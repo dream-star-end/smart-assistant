@@ -282,6 +282,8 @@ export class LiteratureHttpTransport {
         current.end(input.body)
       })
     } catch (error) {
+      // Preserve the original input-validation precedence, including pre-cancelled calls.
+      if (error instanceof LiteratureError && error.code === 'INVALID_INPUT') throw error
       if (input.signal.aborted) throw new LiteratureError('CANCELLED')
       if (timedOut)
         throw new LiteratureError(method === 'POST' ? 'SUBMISSION_UNCERTAIN' : 'TIMEOUT')
