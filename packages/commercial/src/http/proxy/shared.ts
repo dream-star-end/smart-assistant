@@ -1774,9 +1774,10 @@ export interface AnthropicProxyDeps {
   staticProviderKeys?: StaticProviderKeys;
   /**
    * OCV5-424:启用静态 provider 的 API-key 服务池(pool_api_keys,多 key + 共享策略)。
-   * production wiring 置 true;测试/外部 API-key proxy 不置 → 只用 env key(旧行为)。
+   * true enables all services; a service list limits pool use (ordinary egress: Go only).
+   * Tests/external proxies leave this unset to retain their static keys.
    */
-  apiKeyPoolEnabled?: boolean;
+  apiKeyPoolEnabled?: boolean | readonly string[];
   /**
    * 模型执行 catalog(模型权威批次 · 方案 §1.2/§4)。**注入 = 本进程参与 catalog 判定**。
    *

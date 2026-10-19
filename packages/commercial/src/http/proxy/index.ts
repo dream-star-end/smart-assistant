@@ -70,6 +70,7 @@ import {
   type ModelAuthorityDecision,
 } from "./modelAuthorityGate.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
+import { scopedApiKeyPoolWiring } from "./apiKeyPoolWiring.js";
 import { findRouteProviderForModel, isClassifierSideQuery, resolveCursorPublicModel } from "@openclaude/protocol";
 import { applyFastServiceTierPricing } from "./fastServiceTier.js";
 import {
@@ -1069,11 +1070,18 @@ export function makeAnthropicProxyHandler(
           return;
         }
       }
+      const poolWiring = scopedApiKeyPoolWiring(
+        deps.apiKeyPoolEnabled,
+        route.kind === "static" ? route.provider.id : undefined,
+        {
+          apiKeyPoolConfigured: (service) => apiKeyPoolConfiguredServices().has(service),
+          selectApiKey: (service, sticky, userId) => selectApiKey(service, sticky, undefined, { userId }),
+          apiKeyPoolHasMembers,
+        },
+      );
       const cfgErr = validateUpstreamConfig(route, {
         staticProviderKeys: deps.staticProviderKeys,
-        apiKeyPoolConfigured: deps.apiKeyPoolEnabled
-          ? (service) => apiKeyPoolConfiguredServices().has(service)
-          : undefined,
+        apiKeyPoolConfigured: poolWiring.apiKeyPoolConfigured,
         boxConfigured: process.env.OC_BOX_MODEL_API === "1" && deps.boxModel !== undefined,
       });
       if (cfgErr) {
@@ -1383,8 +1391,8 @@ export function makeAnthropicProxyHandler(
           scheduler: deps.scheduler,
           refreshDeps: deps.refreshDeps,
           staticProviderKeys: deps.staticProviderKeys,
-          selectApiKey: deps.apiKeyPoolEnabled ? (service, sticky, userId) => selectApiKey(service, sticky, undefined, { userId }) : undefined,
-          apiKeyPoolHasMembers: deps.apiKeyPoolEnabled ? apiKeyPoolHasMembers : undefined,
+          selectApiKey: poolWiring.selectApiKey,
+          apiKeyPoolHasMembers: poolWiring.apiKeyPoolHasMembers,
           upstreamEndpoint: deps.upstreamEndpoint,
           // Phase 6 account_uuid 锚定 flag(plan §3.0)— v1.0.207 起从 system_settings
           // 表读取的 getter,handler 透传给 pickUpstream;入口 await 一次冻结到
