@@ -47,9 +47,9 @@ export async function proveGoPoolWiring(): Promise<string> {
   assert.deepEqual(calls, [["opencodego", body.metadata.session_id, 765n]]);
   assert.equal(JSON.stringify(nextBody), JSON.stringify(oldBody), "GO_REQUEST_BYTES_CHANGED");
   assert.equal(headers["x-opencode-session"], body.metadata.session_id, "GO_SESSION_HEADER_CHANGED");
-  delete headers["x-api-key"];
-  delete oldHeaders["x-api-key"];
-  assert.deepEqual(headers, oldHeaders, "GO_NON_AUTH_HEADERS_CHANGED");
+  const withoutAuth = (input: Record<string, string>) =>
+    Object.fromEntries(Object.entries(input).filter(([name]) => name !== "x-api-key"));
+  assert.deepEqual(withoutAuth(headers), withoutAuth(oldHeaders), "GO_NON_AUTH_HEADERS_CHANGED");
   const unavailable = scopedApiKeyPoolWiring(["opencodego"], "opencodego", {
     ...pool, selectApiKey: async () => null,
   });
