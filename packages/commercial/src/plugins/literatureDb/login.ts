@@ -54,6 +54,7 @@ interface Operation {
   session?: LiteratureLoginSession
   opening?: Promise<LiteratureLoginSession>
   solving?: Promise<string>
+  cleanupFailed?: boolean
   challenge?: { id: string; image: CaptchaImage; expiresAt: number }
   persist(state: unknown, context: LoginPersistenceContext): Promise<void>
   done: Promise<void>
@@ -265,7 +266,11 @@ export class LiteratureLoginManager {
             if (op.solving === solving) op.solving = undefined
           }
         } catch (error) {
-          if (error instanceof LiteratureError && error.code === 'CLEANUP_FAILED') throw error
+          if (error instanceof LiteratureError && error.code === 'CLEANUP_FAILED') {
+            // Latch in this same continuation, before run.catch or cancel can race.
+            op.cleanupFailed = true
+            throw error
+          }
           if (!this.current(op)) return
           if (
             automatic.signal.aborted ||
@@ -463,6 +468,7 @@ export class LiteratureLoginManager {
           solving ?? Promise.resolve(),
         ])
         if (
+          op.cleanupFailed ||
           drained.some(
             (result, index) =>
               result.status === 'rejected' &&
@@ -498,6 +504,7 @@ export class LiteratureLoginManager {
   async cancel(userId: number, id: string): Promise<LiteratureLoginView> {
     const op = this.get(userId, id)
     if (op.completing) await op.completing
+    else if (op.closing) await op.closing
     else if (this.current(op)) await this.finish(op, 'cancelled', 'CANCELLED')
     return this.view(op)
   }

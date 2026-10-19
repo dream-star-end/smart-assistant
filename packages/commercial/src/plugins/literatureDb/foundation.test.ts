@@ -1807,8 +1807,16 @@ test('session cleanup failure still waits for the local solver and retains owner
   await f.aborted
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(done, false)
+  let retryDone = false
+  const again = f.manager.cancel(17, f.op.operationId).then((view) => {
+    retryDone = true
+    return view
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(retryDone, false)
   f.reap()
   assert.equal((await cancelling).errorCode, 'CLEANUP_FAILED')
+  assert.equal((await again).errorCode, 'CLEANUP_FAILED')
   assert.throws(
     () => f.manager.start(owner, async () => f.f.session, f.f.persist),
     code('ACCOUNT_BUSY'),
@@ -1850,5 +1858,50 @@ test('automatic budget cannot hide a local CLEANUP_FAILED or enter manual fallba
   assert.equal(f.calls.challenges, 1)
   assert.equal(f.calls.submits.length, 0)
   assert.equal(f.calls.persisted, 0)
+  await assert.rejects(manager.close(), code('CLEANUP_FAILED'))
+})
+
+test('local cleanup failure remains latched when cancellation follows the solver rejection', async (t) => {
+  const entered = latch()
+  let rejectReader!: (error: unknown) => void
+  const f = fixture(await image())
+  const reader: CaptchaReader = {
+    ...local(
+      () =>
+        new Promise<string>((_resolve, reject) => {
+          rejectReader = reject
+          entered.release()
+        }),
+    ),
+    drainsOnAbort: true,
+  }
+  const manager = createManager(new LiteratureCaptchaSolver([reader]), { capacity: 1 })
+  t.after(async () => {
+    await manager.close().catch(() => {})
+  })
+  const op = manager.start(owner, async () => f.session, f.persist)
+  await entered.promise
+  // Let all recognize/solve reactions attach, then reproduce the review interleaving.
+  await new Promise((resolve) => setImmediate(resolve))
+  rejectReader(new LiteratureError('CLEANUP_FAILED'))
+  const cancelled = await new Promise<ReturnType<typeof manager.cancel>>((resolve) => {
+    queueMicrotask(() =>
+      queueMicrotask(() =>
+        queueMicrotask(() => {
+          resolve(manager.cancel(17, op.operationId))
+        }),
+      ),
+    )
+  })
+  assert.equal(cancelled.status, 'failed')
+  assert.equal(cancelled.errorCode, 'CLEANUP_FAILED')
+  assert.throws(() => manager.start(owner, async () => f.session, f.persist), code('ACCOUNT_BUSY'))
+  assert.throws(
+    () => manager.start({ userId: 18, accountId: '43' }, async () => f.session, f.persist),
+    code('CAPACITY'),
+  )
+  assert.equal(f.calls.submits.length, 0)
+  assert.equal(f.calls.persisted, 0)
+  assert.equal(f.calls.closed, 1)
   await assert.rejects(manager.close(), code('CLEANUP_FAILED'))
 })
