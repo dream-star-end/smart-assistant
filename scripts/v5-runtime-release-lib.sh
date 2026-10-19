@@ -396,8 +396,9 @@ oc_hotcfg_flip_current() {
   [ -d "$root/bundles/$rev" ] || { oc_hotcfg__die "flip_current: 目标 bundle 不存在 bundles/$rev"; return 1; }
   tmp="$root/.current.$$.$RANDOM"
   rm -f "$tmp"
-  ln -s "bundles/$rev" "$tmp"      # 相对目标
-  mv -T "$tmp" "$root/current"     # 原子替换
+  ln -s "bundles/$rev" "$tmp" || return 1 # 相对目标
+  mv -T "$tmp" "$root/current" || return 1 # 原子替换
+  oc_hotcfg_fsync_path "$root" || return 1
 }
 
 # ─────────────────────────── release 依赖缓存键(§3.1)───────────────────────────
@@ -641,13 +642,15 @@ oc_hotcfg_env_write_tuple() {
     k="${keys[$i]}"; v="${vals[$i]}"
     if grep -Eq "^[[:space:]]*${k}=" "$tmp"; then
       # 替换(用 | 作分隔避免路径 / 冲突;值不含 | 假设成立,路径/镜像 ref 不含 |)
-      sed -i "s|^[[:space:]]*${k}=.*|${k}=${v}|" "$tmp"
+      sed -i "s|^[[:space:]]*${k}=.*|${k}=${v}|" "$tmp" || return 1
     else
-      printf '%s=%s\n' "$k" "$v" >> "$tmp"
+      printf '%s=%s\n' "$k" "$v" >> "$tmp" || return 1
     fi
   done
   chmod --reference="$env_file" "$tmp" 2>/dev/null || true
-  mv -f "$tmp" "$env_file"
+  oc_hotcfg_fsync_path "$tmp" || return 1
+  mv -f "$tmp" "$env_file" || return 1
+  oc_hotcfg_fsync_path "$(dirname "$env_file")" || return 1
   oc_hotcfg__log "env tuple 写入(备份 $env_file.bak-$ts)"
 }
 
@@ -672,12 +675,14 @@ oc_hotcfg_env_restore_tuple() {
     [ -n "$line" ] || continue
     k="${line%%=*}"; v="${line#*=}"
     # 先删该键所有行
-    sed -i "/^[[:space:]]*${k}=/d" "$tmp"
+    sed -i "/^[[:space:]]*${k}=/d" "$tmp" || return 1
     # <UNSET> 表示原本无此键 → 保持删除;否则 append 原值
-    [ "$v" = "<UNSET>" ] || printf '%s=%s\n' "$k" "$v" >> "$tmp"
+    [ "$v" = "<UNSET>" ] || printf '%s=%s\n' "$k" "$v" >> "$tmp" || return 1
   done < "$snap_file"
   chmod --reference="$env_file" "$tmp" 2>/dev/null || true
-  mv -f "$tmp" "$env_file"
+  oc_hotcfg_fsync_path "$tmp" || return 1
+  mv -f "$tmp" "$env_file" || return 1
+  oc_hotcfg_fsync_path "$(dirname "$env_file")" || return 1
   oc_hotcfg__log "env tuple 已复原"
 }
 
@@ -878,31 +883,45 @@ oc_hotcfg_env_tuple_json() {  # $1=env_file $2=master_release
 # masterRelease(M7)= 激活时 master 蓝绿 release 目录名;rollback 从同一条记录取回对齐 master 源码。
 # $7 传字面 "prestate" → 条目附 preState:true(布尔仅供审计)且 transitionKind=prestate
 # 进入 checksum；恢复语义由四键+master+kind+parent 共同承载。
+oc_hotcfg_fsync_path() {
+  python3 - "$1" <<'OC_FSYNC'
+import os,sys
+fd=os.open(sys.argv[1], os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+OC_FSYNC
+}
+
 oc_hotcfg_history_append() {
   local hist="$1" image="$2" image_id="$3" release="$4" bundle="$5" master="${6:-}" flag="${7:-}"
   local kind="${8:-joint}" previous="${9:-}"
   local last seq ts sum line dir prestate=false
   if [ "$flag" = prestate ]; then prestate=true; kind=prestate; fi
   case "$kind" in joint|master-only|tuple-only|prestate) : ;; *) oc_hotcfg__die "history_append: 非法 transitionKind=$kind"; return 1 ;; esac
-  last="$(oc_hotcfg_history_last_committed "$hist")"
+  last="$(oc_hotcfg_history_last_committed "$hist")" || return 1
   if [ -n "$last" ]; then seq=$(( $(jq -r '.seq' <<<"$last") + 1 )); else seq=1; fi
-  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  sum="$(oc_hotcfg_history_checksum 3 "$seq" "$ts" "$image" "$image_id" "$release" "$bundle" "$master" "$kind" "$previous")"
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)" || return 1
+  sum="$(oc_hotcfg_history_checksum 3 "$seq" "$ts" "$image" "$image_id" "$release" "$bundle" "$master" "$kind" "$previous")" || return 1
   line="$(jq -cn --argjson schemaVer 3 --argjson seq "$seq" --arg ts "$ts" \
     --arg image "$image" --arg image_id "$image_id" --arg release "$release" --arg bundle "$bundle" \
     --arg masterRelease "$master" --arg transitionKind "$kind" --arg previousMasterRelease "$previous" \
     --arg checksum "$sum" --argjson preState "$prestate" \
     '{schemaVer:$schemaVer, seq:$seq, ts:$ts, image:$image, image_id:$image_id, release:$release, bundle:$bundle, masterRelease:$masterRelease, transitionKind:$transitionKind, previousMasterRelease:$previousMasterRelease, checksum:$checksum}
-     + (if $preState then {preState:true} else {} end)')"
-  dir="$(dirname "$hist")"; mkdir -p "$dir"
+     + (if $preState then {preState:true} else {} end)')" || return 1
+  dir="$(dirname "$hist")" || return 1
+  mkdir -p "$dir" || return 1
   local tmp="$hist.append.$$"
   # 先把已有内容复制进 tmp 再追加,tmp fsync 后 rename(整文件原子替换,防半写)
-  if [ -f "$hist" ]; then cp -a "$hist" "$tmp"; else : > "$tmp"; fi
-  printf '%s\n' "$line" >> "$tmp"
-  # fsync tmp 与目录
-  { command -v sync >/dev/null && sync "$tmp" 2>/dev/null; } || sync || true
-  mv -f "$tmp" "$hist"
-  sync "$dir" 2>/dev/null || sync || true
+  if [ -f "$hist" ]; then cp -a "$hist" "$tmp" || return 1; else : > "$tmp" || return 1; fi
+  printf '%s\n' "$line" >> "$tmp" || return 1
+  # Each operation must propagate failure even when Bash errexit is disabled
+  # by a caller's if/||. A visible rename with a lost ACK remains a failure.
+  oc_hotcfg_fsync_path "$tmp" || return 1
+  mv -f "$tmp" "$hist" || return 1
+  oc_hotcfg_fsync_path "$dir" || return 1
+  [ "$(tail -n 1 -- "$hist")" = "$line" ] || return 1
   oc_hotcfg__log "history 追加 committed tuple seq=$seq"
 }
 
@@ -1145,6 +1164,22 @@ oc_hotcfg_activate_saga() {
   local restart_cmd="$9" smoke_cmd="${10}"
   local extra_apply="${11:-}" extra_revert="${12:-}" master_release="${13:-}" prev_master_release="${14:-}"
   local commit_apply="${15:-}" commit_revert="${16:-}" recovery_marker="${17:-}" transition_kind="${18:-joint}"
+  # Optional trusted caller function. Its data-only context is persisted by
+  # prepare/arm before exposure. Failure codes cross shells without globals:
+  # 78 kept failure, 79 unresolved/unknown, 86 fencing loss. Only rc=0 from
+  # failure explicitly authorizes the existing guarded compensation.
+  local policy_adapter="${19:-}"
+  if [ -n "$policy_adapter" ]; then
+    if [[ ! "$policy_adapter" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || [ "$(type -t "$policy_adapter")" != function ]; then
+      oc_hotcfg__die "activate_saga: invalid policy adapter (pre-exposure)"
+      return 1
+    fi
+  fi
+  _hotcfg_policy_owner() {
+    [ -z "$policy_adapter" ] && return 0
+    "$policy_adapter" owner || return 86
+  }
+  _hotcfg_policy_owner || return 86
   case "$transition_kind" in joint|master-only|tuple-only) : ;; *) oc_hotcfg__die "activate_saga: 非法 transition_kind=$transition_kind"; return 1 ;; esac
 
   # 上一次外部权威提交若处于 unknown，禁止覆盖现场证据或开始另一轮激活。
@@ -1179,6 +1214,7 @@ oc_hotcfg_activate_saga() {
     pre_image_id="$(oc_hotcfg_env_get "$env_file" OC_RUNTIME_IMAGE_ID)"
     pre_release="$(oc_hotcfg_env_get "$env_file" OC_RUNTIME_RELEASE)"
     pre_bundle="$(oc_hotcfg_env_get "$env_file" OC_PLATFORM_BUNDLE)"
+    _hotcfg_policy_owner || return 86
     if ! oc_hotcfg_history_append "$hist" "$pre_image" "$pre_image_id" "$pre_release" "$pre_bundle" "$prev_master_release" prestate prestate ""; then
       oc_hotcfg__die "activate_saga: pre-state history 记录写入失败(现场未动,拒绝继续激活)"; return 1
     fi
@@ -1186,6 +1222,7 @@ oc_hotcfg_activate_saga() {
   fi
 
   # 1) 快照旧现场(旧 env 四键 + 旧 current 目标)
+  _hotcfg_policy_owner || return 86
   local snap; snap="$(mktemp)"
   oc_hotcfg_env_snapshot_tuple "$env_file" > "$snap"
   local old_current=""
@@ -1225,6 +1262,7 @@ oc_hotcfg_activate_saga() {
   # history 写在最后一步,其失败同样走本回滚 → 满足"trap 持续到 history fsync 成功后才解除"。
   _hotcfg_saga_rollback() {
     local rb_failed=0 old_image_id old_release
+    _hotcfg_policy_owner || return 86
     # Check before deploy_state or any runtime compensation. Once restart was
     # attempted, the candidate may have finalized the first v2 tape. The old
     # stack therefore has to prove reader+writer support unconditionally; a
@@ -1243,6 +1281,7 @@ oc_hotcfg_activate_saga() {
     # deploy_state 是 release 血缘权威。只要提交已尝试且未明确 original，就先用幂等
     # reconcile 钩子把 applied/不确定回执裁决并收敛到 old；未确认前绝不回切运行面。
     if [ "$commit_state" = applied ] || [ "$commit_state" = uncertain ]; then
+      _hotcfg_policy_owner || return 86
       if [ -z "$commit_revert" ] || ! eval "$commit_revert"; then
         _hotcfg_mark_manual_recovery "deploy_state commit/revert 无法确认(old 未证实,commit_state=$commit_state)"
         return 1
@@ -1251,6 +1290,7 @@ oc_hotcfg_activate_saga() {
     fi
     echo "⚠ [hotcfg] 激活 saga 失败且 deploy_state=old 已确认 → 回滚运行面并 restart 旧 master" >&2
     export HOTCFG_SAGA_ROLLING_BACK=1
+    _hotcfg_policy_owner || return 86
     if [ "$current_done" = 1 ]; then
       if [ -n "$old_current" ]; then
         local t="$platform_root/.current.rb.$$"
@@ -1259,9 +1299,13 @@ oc_hotcfg_activate_saga() {
       else
         rm -f "$platform_root/current" 2>/dev/null || rb_failed=1
       fi
+      oc_hotcfg_fsync_path "$platform_root" || rb_failed=1
     fi
+    _hotcfg_policy_owner || return 86
     if [ "$env_done" = 1 ]; then oc_hotcfg_env_restore_tuple "$env_file" "$snap" || rb_failed=1; fi
+    _hotcfg_policy_owner || return 86
     if [ "$extra_done" = 1 ] && [ -n "$extra_revert" ]; then eval "$extra_revert" || rb_failed=1; fi
+    _hotcfg_policy_owner || return 86
     eval "$restart_cmd" || rb_failed=1
     # 回滚后的旧现场也必须过与新现场同强度 smoke；否则不能把“命令跑过”当作已收敛。
     eval "$smoke_cmd" || rb_failed=1
@@ -1269,39 +1313,80 @@ oc_hotcfg_activate_saga() {
       _hotcfg_mark_manual_recovery "deploy_state 已恢复 old，但 env/current/master/restart/smoke 至少一项补偿失败"
       return 1
     fi
+    _hotcfg_policy_owner || return 86
     rm -f "$snap"
     return 0
   }
 
+  _hotcfg_saga_failed() {
+    local stage="$1" decision_rc=0
+    if [ -n "$policy_adapter" ]; then
+      "$policy_adapter" failure "$stage" "$commit_state" || decision_rc=$?
+      case "$decision_rc" in
+        0) : ;; # Explicit, candidate-bound user impairment or pre-exposure.
+        78|79|86) return "$decision_rc" ;;
+        *) oc_hotcfg__die "release policy observation failed; retaining unresolved intent"; return 79 ;;
+      esac
+    fi
+    local rollback_rc=0
+    _hotcfg_saga_rollback || rollback_rc=$?
+    [ "$rollback_rc" = 86 ] && return 86
+    if [ -n "$policy_adapter" ] && [ "$rollback_rc" != 0 ]; then return 79; fi
+    return 1
+  }
+  if [ -n "$policy_adapter" ]; then
+    local prepare_rc=0
+    "$policy_adapter" prepare "$snap" "$old_current" "$env_file" "$platform_root" "$hist" \
+      "$image" "$image_id" "$release" "$bundle_value" "$master_release" "$prev_master_release" "$transition_kind" || prepare_rc=$?
+    if [ "$prepare_rc" != 0 ]; then
+      [ "$prepare_rc" = 86 ] && return 86
+      rm -f "$snap"
+      return "$prepare_rc"
+    fi
+    # Arm before the first source/tuple write, including partial apply errors.
+    local arm_rc=0
+    "$policy_adapter" arm || arm_rc=$?
+    if [ "$arm_rc" != 0 ]; then
+      [ "$arm_rc" = 86 ] && return 86
+      rm -f "$snap"
+      return 79
+    fi
+  fi
+
   # 2) extra:master 源码 symlink 翻转(可选,由 deploy-v5.sh 注入)
   if [ -n "$extra_apply" ]; then
     # apply 可能在多条命令中途失败；先标记 attempted，让补偿钩子也覆盖“部分生效”现场。
+    _hotcfg_policy_owner || return 86
     extra_done=1
-    if ! eval "$extra_apply"; then _hotcfg_saga_rollback; return 1; fi
+    if ! eval "$extra_apply"; then _hotcfg_saga_failed source; return $?; fi
   fi
   # 3) 写 env tuple
+  _hotcfg_policy_owner || return 86
+  env_done=1 # Attempted: rename may have become visible despite a lost ACK.
   if ! oc_hotcfg_env_write_tuple "$env_file" "$image" "$image_id" "$release" "$bundle_value"; then
-    _hotcfg_saga_rollback; return 1; fi
-  env_done=1
+    _hotcfg_saga_failed env; return $?; fi
   # 4) 翻 current(仅 bundle 机制启用时;flip_rev 空 → 跳过)
   if [ -n "$flip_rev" ]; then
-    if ! oc_hotcfg_flip_current "$flip_rev" "$platform_root"; then _hotcfg_saga_rollback; return 1; fi
-    current_done=1
+    _hotcfg_policy_owner || return 86
+    current_done=1 # Attempted, including rename-then-error.
+    if ! oc_hotcfg_flip_current "$flip_rev" "$platform_root"; then _hotcfg_saga_failed current; return $?; fi
   fi
   # 5) restart 新 master
+  _hotcfg_policy_owner || return 86
   [ "$lossless_writer_candidate" = 1 ] && lossless_writer_may_have_served=1
   if ! eval "$restart_cmd"; then
     echo "⚠ [hotcfg] restart_cmd 失败;摘录 egress/master 最近日志" >&2
     journalctl -u openclaude-v5-selfhost-egress.service -u 'openclaude-v5-selfhost-egress@*' -n 40 --no-pager >&2 || true
     journalctl -u openclaude-v5-selfhost.service -n 20 --no-pager >&2 || true
     tail -n 80 /var/log/openclaude-v5-selfhost-egress.log >&2 || true
-    _hotcfg_saga_rollback; return 1; fi
+    _hotcfg_saga_failed restart; return $?; fi
   # 6) smoke
   if ! eval "$smoke_cmd"; then
     echo "⚠ [hotcfg] forward smoke_cmd 失败 (HOTCFG_SAGA_ROLLING_BACK=${HOTCFG_SAGA_ROLLING_BACK:-})" >&2
-    _hotcfg_saga_rollback; return 1; fi
+    _hotcfg_saga_failed smoke; return $?; fi
   # 6.5) 可选外部权威提交(P3=deploy_state release CAS)。失败仍回滚 symlink/env/current+旧 master；
   #       成功后 history 若失败，commit_revert 与其它现场一起补偿。
+  _hotcfg_policy_owner || return 86
   if [ -n "$commit_apply" ]; then
     # hook rc:0=applied；10=not-applied 且 original 已确认；其它=unknown。
     # unknown 仍交给幂等 commit_revert 做最终 reconcile；失败则停止运行面补偿并落恢复标记。
@@ -1310,15 +1395,17 @@ oc_hotcfg_activate_saga() {
     else
       local commit_rc=$?
       if [ "$commit_rc" = 10 ]; then commit_state=old; else commit_state=uncertain; fi
-      _hotcfg_saga_rollback || true
-      return 1
+      _hotcfg_saga_failed state
+      return $?
     fi
   fi
   # 7) commit:history append(fsync,含 masterRelease)。写失败仍触发回滚(覆盖到 history fsync+外部权威)
+  _hotcfg_policy_owner || return 86
   if ! oc_hotcfg_history_append "$hist" "$image" "$image_id" "$release" "$bundle_value" "$master_release" "" "$transition_kind" "$prev_master_release"; then
-    _hotcfg_saga_rollback; return 1; fi
+    _hotcfg_saga_failed history; return $?; fi
   # 8) 提交成功 → 轮转 env.bak(m6:只在 commit 成功路径,保留最近 10 份;失败现场备份最近 → 恒保留)
-  oc_hotcfg_rotate_env_baks "$env_file" 10 || true
+  _hotcfg_policy_owner || return 86
+  if [ -z "$policy_adapter" ]; then oc_hotcfg_rotate_env_baks "$env_file" 10 || true; fi
   rm -f "$snap"
   oc_hotcfg__log "激活 saga 提交完成 kind=$transition_kind image_id=$image_id release=$release bundle=${flip_rev:-<unchanged>} master=${master_release:-<unchanged>} parent=${prev_master_release:-<none>}"
   return 0
