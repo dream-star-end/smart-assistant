@@ -7224,7 +7224,8 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
 
   test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: cold history waits for the durable job and exact empty snapshot releases terminal", () => {
     const sock = makeSocket({ syncSession: async () => {} });
-    const id = "s-cold-recovery-job", cmid = "m-cold-recovery-source";
+    const id = "s-cold-recovery-job";
+    const cmid = "m-cold-recovery-source";
     const rows: ChatMessage[] = [
       { id: cmid, role: "user", text: "finish", ts: 1, status: "error", _source: "server",
         _routing: { model: "box-api-claude-opus-5-5", teamMode: false } },
