@@ -16,7 +16,6 @@
 
 import type { InputPrediction } from "./inputCompletion";
 import { normalizeInlineUiFences } from "./uiFence";
-import { NEXT_TYPES } from "./nextBlock";
 
 export { isNextBlockCode } from "./nextBlock";
 
@@ -30,6 +29,7 @@ const MAX_PREDICTION_CHARS = 80;
 const MAX_HISTORY = 50;
 
 const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})[ \t]*([^\s`]*)/;
+const NEXT_TYPES = new Set(["next", "prediction"]);
 const SUGGESTION_TYPES = new Set(["suggestions", "followups", "follow_up"]);
 
 /** 一个 ui 块 → 对象;解析不了 → null。容忍模型常见的尾逗号。 */

@@ -1,5 +1,4 @@
 /** Synchronous display/export matcher; the prediction parser stays on demand. */
-export const NEXT_TYPES = new Set(["next", "prediction"]);
 const NEXT_HEAD = '{"type":"next"';
 
 /**
@@ -9,7 +8,6 @@ const NEXT_HEAD = '{"type":"next"';
 export function isNextBlockCode(code: string, partial = false): boolean {
   const compact = code.replace(/\s+/g, "");
   if (partial && NEXT_HEAD.startsWith(compact)) return true;
-  const m = /^\{"type":"([a-z_]+)"/i.exec(compact);
-  return !!m && NEXT_TYPES.has(m[1]!.toLowerCase());
+  return /^\{"type":"(?:next|prediction)"/i.test(compact);
 }
 
