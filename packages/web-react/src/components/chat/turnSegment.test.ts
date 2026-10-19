@@ -5,7 +5,7 @@
  */
 import { describe, expect, test } from "vitest";
 import type { ChatMessage } from "../../lib/chat/model";
-import { currentTurnSettled, currentTurnStartIndex, splitStoppedNarration, turnFinalAssistantFlags } from "./turnSegment";
+import { currentTurnSettled, currentTurnStartIndex, projectVisibleAssistantRows, splitStoppedNarration, turnFinalAssistantFlags } from "./turnSegment";
 
 function mk(role: ChatMessage["role"], extra: Partial<ChatMessage> = {}): ChatMessage {
   return { id: Math.random().toString(36), role, text: "", ts: 1000, ...extra };
@@ -320,4 +320,88 @@ describe("stopped turn narration (OCV5-459)", () => {
     ];
     expect(finals(msgs)).toEqual([1]);
   });
+});
+
+describe("OCV5-525 visible final answer", () => {
+  test("standalone input prediction never displaces the completed task summary", () => {
+    const messages = [
+      mk("user", { id: "u525", text: "接手任务" }),
+      mk("assistant", { text: "方案已复核，修改已推送。", _clientMessageId: "u525", _orderSeq: 203 }),
+      mk("tool", { toolName: "Bash", _completed: true, _clientMessageId: "u525", _orderSeq: 206 }),
+      mk("assistant", { text: '```ui\n{"type":"next","text":"通过"}\n```', _clientMessageId: "u525", _orderSeq: 208 }),
+    ];
+    expect(finals(messages)).toEqual([1]);
+    expect(finals([messages[0]!, messages[3]!, messages[1]!, messages[2]!])).toEqual([2]);
+  });
+  test("legacy prediction-only tail is not an answer; mixed prose and visible UI still are", () => {
+    const hidden = '```ui\n{"type":"prediction","text":"通过"}\n```';
+    expect(finals([mk("user"), mk("assistant", { text: "总结" }), mk("assistant", { text: hidden })])).toEqual([1]);
+    expect(finals([mk("user"), mk("assistant", { text: hidden })])).toEqual([]);
+    for (const text of [`总结\n${hidden}`, '```ui\n{"type":"suggestions","items":["继续"]}\n```', '```json\n{"type":"next","text":"示例"}\n```']) {
+      expect(finals([mk("user"), mk("assistant", { text })])).toEqual([1]);
+    }
+  });
+});
+
+test("OCV5-525: view projection preserves total charge, trace, delegates and truncation without changing call usage", () => {
+  const usage = { costCredits: "583", traceId: "trace525", delegates: [{ agentId: "reviewer", costCredits: "560" }] };
+  const ownCall = { callId: "call203", targetIds: ["answer525"], usage: { inputTokens: 2, outputTokens: 800, totalTokens: 802 } };
+  const messages = [
+    mk("user", { id: "u525" }),
+    mk("assistant", { id: "answer525", text: "完整总结", _clientMessageId: "u525", _callUsage: ownCall }),
+    mk("assistant", { text: '```ui\n{"type":"next","text":"通过"}\n```', _clientMessageId: "u525", usage, _truncated: "pause_turn" }),
+  ];
+  const before = JSON.stringify(messages);
+  const projected = projectVisibleAssistantRows(messages);
+  expect(projected).toHaveLength(2);
+  expect(projected[1]?.usage).toEqual(usage);
+  expect(projected[1]?._callUsage).toBe(ownCall);
+  expect(projected[1]?._truncated).toBe("pause_turn");
+  expect(projected[1]?.id).toBe("answer525");
+  expect(JSON.stringify(messages)).toBe(before);
+});
+
+test("OCV5-525: projection never replaces a newer final snapshot with an older prediction", () => {
+  const control = (seq: number, costCredits: string) => mk("assistant", { text: '```ui\n{"type":"next","text":"通过"}\n```', _clientMessageId: "u525", _orderSeq: seq, usage: { costCredits } });
+  const user = mk("user", { id: "u525" });
+  const answer = mk("assistant", { text: "总结", _clientMessageId: "u525", _orderSeq: 10, usage: { costCredits: "100" } });
+  expect(projectVisibleAssistantRows([user, control(2, "20"), answer])[1]?.usage?.costCredits).toBe("100");
+  expect(projectVisibleAssistantRows([user, control(30, "300"), answer, control(20, "200")])[1]?.usage?.costCredits).toBe("300");
+  const onlyControl = [user, control(2, "20")];
+  expect(projectVisibleAssistantRows(onlyControl)).toEqual(onlyControl);
+});
+
+test("OCV5-525: shared tape order uses record ordinal even when timestamps run backwards", () => {
+  const shared = { _clientMessageId: "u525", _turnTapeId: "tape525", _orderSeq: 9 };
+  const messages = [
+    mk("user", { id: "u525" }),
+    mk("assistant", { ...shared, text: "总结", _turnTapeOrdinal: 203, ts: 3000, usage: { costCredits: "100" } }),
+    mk("assistant", { ...shared, text: '```ui\n{"type":"next","text":"通过"}\n```', _turnTapeOrdinal: 208, ts: 2000, usage: { costCredits: "583" } }),
+  ];
+  expect(projectVisibleAssistantRows(messages)[1]?.usage?.costCredits).toBe("583");
+});
+
+test("OCV5-525: recovery lineage keeps one visible answer and the child's terminal usage", () => {
+  const rows = [
+    mk("user", { id: "source525" }),
+    mk("assistant", { text: "完整总结", _clientMessageId: "source525" }),
+    mk("user", { id: "child525", _automaticRecovery: true, _recoveryOfClientMessageId: "source525" }),
+    mk("assistant", { text: '```ui\n{"type":"next","text":"通过"}\n```', _clientMessageId: "child525", usage: { costCredits: "583" } }),
+  ];
+  const projected = projectVisibleAssistantRows(rows);
+  expect(projected.filter((m) => m.role === "assistant")).toHaveLength(1);
+  expect(projected[1]?.usage?.costCredits).toBe("583");
+});
+
+test("OCV5-525: late truncation and earlier charge snapshots transfer independently in shuffled history", () => {
+  const owner = { _clientMessageId: "u525" };
+  const user = mk("user", { id: "u525" });
+  const answer = mk("assistant", { ...owner, text: "总结", _orderSeq: 1 });
+  const truncation = mk("assistant", { ...owner, text: '```ui\n{"type":"next","text":"通过"}\n```', _orderSeq: 3, _truncated: "pause_turn" });
+  const charge = mk("assistant", { ...owner, text: '```ui\n{"type":"next","text":"通过"}\n```', _orderSeq: 2, usage: { costCredits: "583", traceId: "t" } });
+  for (const controls of [[truncation, charge], [charge, truncation]]) {
+    const projected = projectVisibleAssistantRows([user, answer, ...controls]);
+    expect(projected[1]?.usage).toEqual(charge.usage);
+    expect(projected[1]?._truncated).toBe("pause_turn");
+  }
 });

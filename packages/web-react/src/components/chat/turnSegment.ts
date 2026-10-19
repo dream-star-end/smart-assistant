@@ -12,6 +12,7 @@
  *    卡,历史段渲染只读卡 → 翻历史会话仍能看到当时的计划与完成状态。
  */
 import { normalizeTurnErrorCode } from "@openclaude/protocol";
+import { hasVisibleAssistantContent } from "../../lib/assistantVisibleContent";
 import type { ChatMessage } from "../../lib/chat/model";
 import { errorPresentation, isCollapsedAnchorTerminalEvidence } from "../../lib/chat/render";
 
@@ -142,6 +143,18 @@ export function turnRatingFlags(messages: readonly ChatMessage[], finals: readon
  * 每轮各自的末条都被标记(**不是**"全会话末条"):翻历史会话时每轮末条仍可补评;而一轮内模型
  * 产出的多段中间文本回复不再各自带一行"这条回复怎么样?",消除噪音(boss 07-11)。
  */
+const orderTuple = (m: ChatMessage, index: number): [number, number, number] => [
+  typeof m._orderSeq === "number" && Number.isSafeInteger(m._orderSeq) && m._orderSeq > 0
+    ? m._orderSeq
+    : 0,
+  typeof m.ts === "number" && Number.isFinite(m.ts) ? m.ts : 0,
+  index,
+];
+const tupleAfter = (a: [number, number, number], b: [number, number, number]): boolean =>
+  a[0] > b[0] ||
+  (a[0] === b[0] && (a[1] > b[1] || (a[1] === b[1] && a[2] > b[2])));
+
+
 export function turnFinalAssistantFlags(messages: ChatMessage[],
   parents?: ReadonlyMap<string, string>): boolean[] {
   const flags = new Array<boolean>(messages.length).fill(false);
@@ -149,22 +162,11 @@ export function turnFinalAssistantFlags(messages: ChatMessage[],
     !!m &&
     m.role === "assistant" &&
     typeof m.text === "string" &&
-    m.text.trim().length > 0 &&
+    hasVisibleAssistantContent(m.text) &&
     !m._errorCode &&
     // Process control 显式排除:它是终态存在证据，不是末条 assistant 正文，
     // 绝不挂评分卡。其正文尚未展开;展开后由真 tape 展开行(独立行)承接末条评分。
     !m._turnTapeProcess;
-  const orderTuple = (m: ChatMessage, index: number): [number, number, number] => [
-    typeof m._orderSeq === "number" && Number.isSafeInteger(m._orderSeq) && m._orderSeq > 0
-      ? m._orderSeq
-      : 0,
-    typeof m.ts === "number" && Number.isFinite(m.ts) ? m.ts : 0,
-    index,
-  ];
-  const tupleAfter = (a: [number, number, number], b: [number, number, number]): boolean =>
-    a[0] > b[0] ||
-    (a[0] === b[0] && (a[1] > b[1] || (a[1] === b[1] && a[2] > b[2])));
-
   const rootOf = turnLineageRoot(messages, parents);
   // Durable/live rows carry the exact user message id that owns their turn.
   // Grouping on it is independent of a temporarily polluted array order.
@@ -317,4 +319,64 @@ export function splitStoppedNarration(messages: ChatMessage[]): ChatMessage[] {
     if (tail) out.push(...tail);
   }
   return out;
+}
+
+function followsInTimeline(a: ChatMessage, ai: number, b: ChatMessage, bi: number): boolean {
+  const ao = a._turnTapeOrdinal ?? a._recordOrdinal;
+  const bo = b._turnTapeOrdinal ?? b._recordOrdinal;
+  if (a._turnTapeId && a._turnTapeId === b._turnTapeId &&
+    typeof ao === "number" && typeof bo === "number" && ao !== bo) return ao > bo;
+  return tupleAfter(orderTuple(a, ai), orderTuple(b, bi));
+}
+
+/** View-only: input predictions belong to the Composer. Keep the terminal aggregate usage on the
+ * visible answer, while preserving its own call usage, identity and immutable tape coordinates.
+ * Raw rows remain untouched for persistence, recovery/terminal evidence and input prediction. */
+export function projectVisibleAssistantRows(messages: ChatMessage[],
+  parents?: ReadonlyMap<string, string>): ChatMessage[] {
+  const finalFlags = turnFinalAssistantFlags(messages, parents);
+  const rootOf = turnLineageRoot(messages, parents);
+  let segment = "head";
+  const ownerKeys = messages.map((message) => {
+    if (message.role === "user") segment = message.id;
+    return message._clientMessageId ? rootOf(message._clientMessageId) : segment;
+  });
+  const finalByOwner = new Map<string, number>();
+  finalFlags.forEach((isFinal, index) => {
+    if (isFinal) finalByOwner.set(ownerKeys[index]!, index);
+  });
+  const projected = messages.slice();
+  const hidden = new Set<number>();
+  const latestUsage = new Map<number, number>();
+  const latestTruncation = new Map<number, number>();
+  messages.forEach((message, index) => {
+    if (message.role !== "assistant" || !message.text.trim() || hasVisibleAssistantContent(message.text) ||
+      message._errorCode || message.error || message._payloadDeferred || message._turnStatusRecord ||
+      message._dispatchTerminal || message._turnTapeProcess) return;
+    const answerIndex = finalByOwner.get(ownerKeys[index]!);
+    // With no visible answer retain the row, including its charge/status metadata.
+    if (answerIndex === undefined) return;
+    hidden.add(index);
+    if (!followsInTimeline(message, index, messages[answerIndex]!, answerIndex)) return;
+    if (message.usage) {
+      const previous = latestUsage.get(answerIndex);
+      if (previous === undefined || followsInTimeline(message, index, messages[previous]!, previous)) {
+        latestUsage.set(answerIndex, index);
+      }
+    }
+    if (message._truncated) {
+      const previous = latestTruncation.get(answerIndex);
+      if (previous === undefined || followsInTimeline(message, index, messages[previous]!, previous)) {
+        latestTruncation.set(answerIndex, index);
+      }
+    }
+  });
+  for (const [answerIndex, sourceIndex] of latestUsage) {
+    const answer = projected[answerIndex]!;
+    projected[answerIndex] = { ...answer, usage: { ...answer.usage, ...messages[sourceIndex]!.usage } };
+  }
+  for (const [answerIndex, sourceIndex] of latestTruncation) {
+    projected[answerIndex] = { ...projected[answerIndex]!, _truncated: messages[sourceIndex]!._truncated };
+  }
+  return projected.filter((_, index) => !hidden.has(index));
 }
