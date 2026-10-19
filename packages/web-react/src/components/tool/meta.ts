@@ -281,6 +281,9 @@ const MCP_OP_META: Record<string, ToolMeta> = {
   "openclaude-memory:task_approve": { icon: ListChecks, label: "批准任务单" },
   "openclaude-memory:present_task_approval": { icon: ShieldCheck, label: "任务审批卡" },
   "openclaude-memory:project_search": { icon: Search, label: "搜索项目文件" },
+  "openclaude-memory:oc_bash": { icon: Terminal, label: "执行命令" },
+  "openclaude-memory:oc_grep": { icon: Search, label: "搜索内容" },
+  "openclaude-memory:oc_glob": { icon: FolderOpen, label: "查找文件" },
   // codex 内建 MCP 资源清单(op 无摘要,空态即全部信息)。
   "codex:list_mcp_resources": { icon: Boxes, label: "MCP 资源列表" },
   "codex:list_mcp_resource_templates": { icon: Layers, label: "MCP 资源模板" },
@@ -755,6 +758,9 @@ function mcpSummary(server: string, op: string, input: Record<string, unknown>):
     if (op === "request_review" || op === "ask_user") {
       return (asStr(input.question) || asStr(input.prompt) || asStr(input.goal)).slice(0, 60);
     }
+    if (op === "oc_bash") return asStr(input.command).slice(0, 80);
+    if (op === "oc_grep") return asStr(input.pattern) || asStr(input.path);
+    if (op === "oc_glob") return asStr(input.pattern);
     // 未登记 op 不直显内部标识符(T-28):标签已由 resolveToolMeta 人话化,摘要留空。canonical 这里
     // `return op` 会把蛇形名漏到折叠态摘要,与 meta.test「不直显内部标识符」冲突,取审计侧。
     return "";

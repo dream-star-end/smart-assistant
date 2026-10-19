@@ -514,8 +514,8 @@ export class CodexAdapter extends EventEmitter implements EngineAdapter {
     return this.kernel.start()
   }
 
-  /** Session-open preheat = spawn + initialize the long-lived app-server
-   * (no thread/turn RPCs → zero upstream LLM calls / billing). */
+  /** Session-open preheat = spawn + initialize + a fresh volatile thread in the long-lived app-server
+   * (no resume/turn/compact RPCs → zero upstream LLM calls / billing). */
   preheat(): Promise<void> {
     return this.kernel.preheat()
   }

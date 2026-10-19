@@ -36,10 +36,18 @@ export const PLATFORM_MEMORY_MCP_TOOLS = [
  * Regular-session memory-MCP tools these engines' prompts do not advertise
  * (unchanged by OCV5-452). Train-only tools (MEMORY_MCP_TRAIN_ONLY_TOOL_NAMES)
  * are outside this contract.
+ *
+ * oc_bash / oc_grep / oc_glob stay registered: Antigravity's CLI lists every
+ * MCP tool itself, and its preamble tells the model to call them. Grok and
+ * ZCode already have native shell and search, so their prompts do not advertise
+ * these three.
  */
 export const PLATFORM_MEMORY_MCP_TOOLS_NOT_ADVERTISED = [
   'delegate_wait',
   'ask_user',
   'present_options',
   'project_search',
+  'oc_bash',
+  'oc_grep',
+  'oc_glob',
 ] as const

@@ -1,3 +1,5 @@
+import { encodeUpstreamRetryHint } from '@openclaude/protocol';
+import { waitForRetryDelay } from '../sessionTurnRunner.js';
 /**
  * SessionManager × EngineAdapter turn 编排回归测试(M0)。
  *
@@ -18,6 +20,7 @@ import { EventEmitter } from "node:events";
 
 import {
   SessionManager,
+  buildHistoricalContextPrompt,
   TRANSIENT_RETRY_INPUT,
   MODEL_THINKING_KEEPALIVE_MS,
   MODEL_THINKING_WORKING_DETAIL,
@@ -717,6 +720,7 @@ describe("crash/interrupt partial persistence", () => {
               text: `attempt ${attempt} plan`,
               partial: false,
             });
+            r.msg({ type: "assistant_error", error: "BOX_TOOL_SNAPSHOT_MISMATCH: retryable attempt" });
             r.result({
               is_error: true,
               subtype: "error_during_execution",
@@ -744,7 +748,9 @@ describe("crash/interrupt partial persistence", () => {
         requestId,
       );
 
-      assert.equal(submits, 3, "initial attempt + two automatic retries before success");
+      assert.equal(submits, 4, "initial attempt + three automatic retries before success");
+      assert.equal(events.filter((event) => event.kind === "error").length, 0,
+        "INC-20261019-RECOVERABLE-ERROR-RED-CARD: recovered attempts never publish an error");
       assert.deepEqual(runner.submittedInputs, [
         "finish the task",
         TRANSIENT_RETRY_INPUT,
@@ -1491,8 +1497,8 @@ describe("crash/interrupt partial persistence", () => {
       setImmediate(() => r.result({
         is_error: true,
         subtype: "error_during_execution",
-        result: "Selected model is at capacity. Please retry later.",
-        errorClass: "model_capacity",
+        result: `API Error: 429 ${encodeUpstreamRetryHint(Date.now() + 2 ** 32)}`,
+        api_error_status: 429,
       }));
     });
     const session = makeSession(runner);
@@ -3189,13 +3195,35 @@ describe("crash/interrupt partial persistence", () => {
           },
         ],
       );
-      assert.ok(
-        events.some((event) => event.kind === "error" && event.error === payload.errorDetail),
-        "error-only result must remain visible live and after refresh",
-      );
+      const terminalErrors = events.filter((event) => event.kind === "error");
+      assert.equal(terminalErrors.length, 1,
+        "INC-20261019-RECOVERABLE-ERROR-RED-CARD: terminal failure publishes exactly one error");
+      assert.equal(terminalErrors[0]?.kind === "error" && terminalErrors[0].error, payload.errorDetail,
+        "error-only result must remain visible live and after refresh");
     } finally {
       setV3MasterSinkSingleton(null);
     }
+  });
+
+  test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: native diagnostic followed by success never publishes an error", async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      const events: SessionStreamEvent[] = [];
+      const runner = new FakeCcbRunner((r) => setImmediate(() => {
+        r.msg({ type: "assistant_error", error: "BOX_REPLAY_UNAVAILABLE: recovered inside engine" });
+        r.text("task completed");
+        r.result();
+      }));
+      await runOneTurn(sm, makeSession(runner, { channel: "webchat", userId: "user-1" }), events);
+      assert.equal(events.filter((event) => event.kind === "error").length, 0);
+      assert.equal(events.filter((event) => event.kind === "final").length, 1);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.errorCode, undefined);
+      assert.ok(captured.payloads[0]!.runtimeEvents?.some((event) =>
+        (event.payload as { type?: string }).type === "assistant_error"), "raw diagnostic stays durable");
+    } finally { setV3MasterSinkSingleton(null); }
   });
 
   test("审计 R3:runner result 帧带 errorClass → sessionManager onEvent kind:'error' 透传同值(链路不再断)", async () => {
@@ -5086,4 +5114,100 @@ describe("preheatRunner", () => {
       else process.env.OC_ENGINE_PREHEAT_DEADLINE_MS = prev;
     }
   });
+});
+
+
+for (const succeedsAfter of [4, Number.POSITIVE_INFINITY]) {
+  test(`429 uses shared retry budget beyond three failures: ${succeedsAfter}`, async () => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _transientRetryDelayMs: () => number })._transientRetryDelayMs = () => 0;
+      let submits = 0;
+      const runner = new FakeCcbRunner(r => {
+        submits++;
+        setImmediate(() => {
+          if (submits <= succeedsAfter) r.result({ is_error: true, api_error_status: 429,
+            result: `API Error: 429 ${encodeUpstreamRetryHint(Date.now())}` });
+          else { r.text('ok'); r.result(); }
+        });
+      });
+      const session = makeSession(runner, { channel: 'webchat', userId: 'user-1' });
+      const events: SessionStreamEvent[] = [];
+      await sm.submit(session, 'finish', e => events.push(e));
+      const retries = events.filter(e => e.kind === 'turn_status' && typeof e.status === 'object' && e.status?.status === 'retrying');
+      assert.equal(submits, succeedsAfter === Number.POSITIVE_INFINITY ? 11 : 5);
+      assert.equal(retries.length, submits - 1);
+      assert.deepEqual(runner.submittedInputs, ['finish', ...Array(submits - 1).fill(TRANSIENT_RETRY_INPUT)]);
+      assert.equal(captured.payloads.length, 1);
+      assert.equal(captured.payloads[0]!.status, 'completed');
+      if (succeedsAfter === Number.POSITIVE_INFINITY) assert.equal(captured.payloads[0]!.errorCode, 'rate_limited');
+    } finally { setV3MasterSinkSingleton(null); }
+  });
+}
+test('429 cannot retry before upstream deadline, even when exponential delay is shorter', async () => {
+  const sm = new SessionManager(makeConfigStub());
+  (sm as unknown as { _transientRetryDelayMs: () => number })._transientRetryDelayMs = () => 5;
+  const submittedAt: number[] = [];
+  let deadline = 0;
+  const runner = new FakeCcbRunner(r => {
+    submittedAt.push(Date.now());
+    setImmediate(() => {
+      if (submittedAt.length === 1) {
+        deadline = Date.now() + 80;
+        r.result({ is_error: true, api_error_status: 429,
+          result: `API Error: 429 ${encodeUpstreamRetryHint(deadline)}` });
+      } else { r.text('ok'); r.result(); }
+    });
+  });
+  await sm.submit(makeSession(runner), 'finish', () => {});
+  assert.equal(submittedAt.length, 2);
+  assert.ok(submittedAt[1]! >= deadline);
+});
+test('very long Retry-After does not overflow the timer and is promptly cancellable', async () => {
+  const ac = new AbortController();
+  let resolved = false;
+  const waiting = waitForRetryDelay(2 ** 31 + 100, ac.signal).then(() => { resolved = true; });
+  const rejected = assert.rejects(waiting, /abort/i);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(resolved, false);
+  ac.abort();
+  await rejected;
+});
+
+
+test('429 hint is absent from projected assistant/history after successful retry, with baseline byte parity', async () => {
+  const run = async (withHint: boolean) => {
+    const captured = makeCapturingSink();
+    setV3MasterSinkSingleton(captured.sink);
+    try {
+      const sm = new SessionManager(makeConfigStub());
+      (sm as unknown as { _transientRetryDelayMs: () => number })._transientRetryDelayMs = () => 0;
+      let submits = 0;
+      const suffix = withHint ? ` ${encodeUpstreamRetryHint(0)}` : '';
+      const diagnostic = `API Error: 429 ${JSON.stringify({ error: { code: 'UPSTREAM_RATE_LIMITED', message: `upstream rate limited${suffix}` } })}`;
+      const runner = new FakeCcbRunner(r => {
+        submits++;
+        setImmediate(() => {
+          if (submits === 1) {
+            r.msg({ type: 'assistant', error: 'rate_limit', message: { content: [{ type: 'text', text: diagnostic }] } });
+            r.result({ is_error: true, api_error_status: 429, result: diagnostic });
+          } else { r.text('ok'); r.result(); }
+        });
+      });
+      const live: SessionStreamEvent[] = [];
+      await sm.submit(makeSession(runner, { channel: 'webchat', userId: 'user-1' }), 'finish', e => live.push(e));
+      assert.equal(submits, 2);
+      assert.equal(captured.payloads.length, 1);
+      const completed = captured.payloads[0]!;
+      const segments = completed.assistantSegments!.map(segment => segment.text);
+      const history = segments.map(text => ({ role: 'assistant' as const, text, status: 'completed' as const }));
+      const rebuilt = buildHistoricalContextPrompt(history, 'next question');
+      const liveText = live.filter(e => e.kind === 'block' && e.block.kind === 'text').map(e => e.kind === 'block' && e.block.kind === 'text' ? e.block.text : '');
+      assert.doesNotMatch(JSON.stringify({ text: completed.text, segments, rebuilt, liveText }), /OC_RETRY_HINT_V1/);
+      return { text: completed.text, segments, rebuilt, liveText };
+    } finally { setV3MasterSinkSingleton(null); }
+  };
+  assert.deepEqual(await run(true), await run(false));
 });

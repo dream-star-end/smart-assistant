@@ -311,3 +311,43 @@ describe('handleEnginePreheat', () => {
     assert.equal(statuses.length, 1, '失败不得再写响应')
   })
 })
+
+test('internal official marker is exact-shape and rejects route URLs or credentials', () => {
+  const base = { sessionId: 'webtest1234', agentId: 'main', modelId: 'gpt-6.1-sol' }
+  const valid = validateEnginePreheatBody({ ...base, codexRouteHint: { kind: 'official_oauth' } })
+  assert.equal(valid.ok, true)
+  for (const hint of [null, [], { kind: 'api_relay' }, { kind: 'official_oauth', token: 'PRIVATE' },
+    { kind: 'official_oauth', baseUrl: 'https://invalid.example' }]) {
+    assert.equal(validateEnginePreheatBody({ ...base, codexRouteHint: hint }).ok, false)
+  }
+})
+test('direct container Codex GET without a trusted route hint skips CLI preparation', async () => {
+  process.env.OC_ENGINE_PREHEAT = '1'
+  setContainerEnv()
+  Reflect.deleteProperty(process.env, 'OC_MODEL_AUTHORITY')
+  const { fake, calls } = makeFake()
+  invoke(fake, { agentId: 'main', modelId: 'gpt-6.1-sol' })
+  await settle()
+  assert.equal(calls.some(c => c.kind === 'getOrCreate' || c.kind === 'preheatRunner'), false)
+  assert.ok(calls.some(c => c.kind === 'log:engine_preheat_skipped'))
+})
+
+test('draft internal fields survive validation and reach creation without a durable chat row', async () => {
+  Reflect.deleteProperty(process.env, 'OC_MODEL_AUTHORITY')
+  const { fake, calls } = makeFake()
+  const statuses: number[] = []
+  const ext = Object.assign(fake, {
+    readBody: async () => JSON.stringify({ sessionId: 'webtest1234', agentId: 'main',
+      modelId: 'glm-5.3-zai', effortLevel: 'high', workspaceMode: 'isolated_v1' }),
+    sendJson: (_res: unknown, status: number) => { statuses.push(status) },
+  })
+  await (Gateway.prototype as unknown as { handleEnginePreheat: (req: unknown, res: unknown) => Promise<void> })
+    .handleEnginePreheat.call(ext, {}, {})
+  assert.deepEqual(statuses, [200])
+  await settle(40)
+  const created = calls.find(c => c.kind === 'getOrCreate')?.detail as Record<string, unknown>
+  assert.equal(created.peerId, 'webtest1234')
+  assert.equal(created.workspaceMode, 'isolated_v1')
+  assert.equal(created.effortLevel, 'high')
+  assert.equal(created.preheatOnly, true)
+})

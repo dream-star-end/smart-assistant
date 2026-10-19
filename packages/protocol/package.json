@@ -65,6 +65,11 @@
       "types": "./src/containerPreviewAuth.ts",
       "openclaude-precompiled": "./dist/containerPreviewAuth.js",
       "default": "./src/containerPreviewAuth.ts"
+    },
+    "./nodeLogTiming": {
+      "types": "./src/nodeLogTiming.ts",
+      "openclaude-precompiled": "./dist/nodeLogTiming.js",
+      "default": "./src/nodeLogTiming.ts"
     }
   },
   "dependencies": {

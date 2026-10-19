@@ -2,6 +2,7 @@ import { assistantCarriesDeliverable, isFoldableWorkRole } from "../../component
 import type { ChatMessage } from "./model";
 import { isAutoContinueMsg, isRecoveryControlUserTurn } from "./pure";
 import { errorPresentation } from "./render";
+import { hasVisibleAssistantContent } from "../assistantVisibleContent";
 
 export type ShareRange = "last" | "last3" | "all";
 
@@ -28,6 +29,7 @@ function isAnswerBody(m: ChatMessage): boolean {
     !m.error &&
     !m._turnStatusRecord &&
     !m._genPlaceholder &&
+    !m._hideUnpublishedFallback &&
     !m._displayDegraded &&
     m._displayDegradeReason === undefined &&
     (m.text ?? "").trim().length > 0
@@ -91,14 +93,14 @@ function selectConversationMessages(
   };
 
   // tail = 按 after 排序的最后一行;lastIndex = 数组里最后一行。两者一致才认这条回答。
-  type Turn = { user: ChatMessage | null; tail: { m: ChatMessage; order: Order } | null; lastIndex: ChatMessage | null; lastBody: { m: ChatMessage; order: Order } | null; deliverables: ExportMessage[]; embedded: ExportMessage | null };
-  const turns: Turn[] = [{ user: null, tail: null, lastIndex: null, lastBody: null, deliverables: [], embedded: null }];
+  type Turn = { user: ChatMessage | null; tail: { m: ChatMessage; order: Order } | null; lastIndex: ChatMessage | null; lastBody: { m: ChatMessage; order: Order } | null; visibleBody: { m: ChatMessage; order: Order } | null; deliverables: ExportMessage[]; embedded: ExportMessage | null };
+  const turns: Turn[] = [{ user: null, tail: null, lastIndex: null, lastBody: null, visibleBody: null, deliverables: [], embedded: null }];
   const byKey = new Map<string, Turn>();
   const rows = messages.filter((m) => !hiddenInChat(m));
   const positional: Turn[] = [];
   for (const m of rows) {
     if (m.role === "user" && m.status !== "queued" && (m.text ?? "").trim()) {
-      const turn: Turn = { user: m, tail: null, lastIndex: null, lastBody: null, deliverables: [], embedded: null };
+      const turn: Turn = { user: m, tail: null, lastIndex: null, lastBody: null, visibleBody: null, deliverables: [], embedded: null };
       turns.push(turn);
       byKey.set(m.id, turn);
       if (m._clientMessageId) byKey.set(m._clientMessageId, turn);
@@ -113,7 +115,7 @@ function selectConversationMessages(
     if (!turn.tail || after(order, turn.tail.order)) turn.tail = { m, order };
     turn.lastIndex = m;
     if (includeInterrupted && isAnswerBody(m) && assistantCarriesDeliverable(m)) turn.deliverables.push(m);
-    if (includeInterrupted && m.role === "assistant" && (m._errorCode || m._isError || m.error)) {
+    if (includeInterrupted && m.role === "assistant" && !m._hideUnpublishedFallback && (m._errorCode || m._isError || m.error)) {
       const visible = errorPresentation(m._errorCode, m.text, m._errorDetail, m.usage?.waived === true).bodyText || m._stopCopyText;
       if (visible?.trim()) {
         const partial: ExportMessage = { ...m, text: visible, exportIncomplete: true };
@@ -124,6 +126,8 @@ function selectConversationMessages(
           && assistantCarriesDeliverable(partial)) turn.deliverables.push(partial);
       }
     }
+    if (includeInterrupted && isAnswerBody(m) && hasVisibleAssistantContent(m.text ?? "")
+      && (!turn.visibleBody || after(order, turn.visibleBody.order))) turn.visibleBody = { m, order };
     if (isAnswerBody(m)) turn.lastBody = { m, order };
     else if (isFoldableWorkRole(m)) turn.lastBody = null;
   });
@@ -132,7 +136,11 @@ function selectConversationMessages(
   for (const t of turns) {
     if (t.user) body.push(t.user);
     // 两种顺序说法不一时宁可只分享问题(不确定哪条才是最后一行,就不冒险把过程当答案)。
-    const final = t !== live && t.tail?.m === t.lastIndex && t.tail && isAnswerBody(t.tail.m) ? t.tail.m : null;
+    let final = t !== live && t.tail?.m === t.lastIndex && t.tail && isAnswerBody(t.tail.m) ? t.tail.m : null;
+    // The completed view hides input prediction blocks and keeps its last visible answer,
+    // even when a late tool precedes the prediction. Export that same delivered answer.
+    if (includeInterrupted && t !== live && t.user?.status === "replied" && final
+      && !hasVisibleAssistantContent(final.text ?? "")) final = t.visibleBody?.m ?? null;
     if (!includeInterrupted) {
       if (final) body.push(final);
       continue;
@@ -141,7 +149,11 @@ function selectConversationMessages(
     // later tools run. Preserve those delivered results in Markdown too.
     const candidates: ExportMessage[] = t.deliverables.map((m) => final ? m : { ...m, exportIncomplete: true });
     if (final) candidates.push(final);
-    else if (t !== live && t.tail?.m === t.lastIndex && t.tail
+    else if (t === live && t.tail?.m === t.lastIndex && t.tail && isAnswerBody(t.tail.m)) {
+      // Preserve the visible snapshot without presenting it as a completed turn.
+      // A later work row still excludes earlier process narration.
+      candidates.push({ ...t.tail.m, exportIncomplete: true });
+    } else if (t !== live && t.tail?.m === t.lastIndex && t.tail
       && (t.tail.m._errorCode || t.tail.m._isError || t.tail.m.error)) {
       if (t.lastBody && after(t.tail.order, t.lastBody.order)) candidates.push({ ...t.lastBody.m, exportIncomplete: true });
       if (t.embedded?.id === t.tail.m.id) candidates.push(t.embedded);
@@ -171,7 +183,7 @@ export function selectShareMessages(messages: readonly ChatMessage[], range: Sha
   return selectConversationMessages(messages, range, sending, false);
 }
 
-/** Markdown also preserves visible partial output immediately before failure. */
+/** Markdown preserves visible live snapshots and partial output before failure. */
 export function selectExportMessages(messages: readonly ChatMessage[], sending = false): ExportMessage[] {
   return selectConversationMessages(messages, "all", sending, true);
 }

@@ -888,6 +888,11 @@ export function freezeErrorCardSnapshots(
     }
   }
   for (const message of messages) {
+    // The source was delivered; an automatic continuation is not a failed
+    // send. Keep its transport label consistent with the held error card.
+    if (message.role === "user" && recoveringSources.has(message.id) && message.status === "error") {
+      message.status = "sent";
+    }
     if (message._errorCardSnapshot?.disposition === "card") {
       message._errorHeldForRecovery = undefined;
       continue;

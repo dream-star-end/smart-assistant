@@ -59,6 +59,20 @@ WATCH_PG_BACKUP_STATUS="${WATCH_PG_BACKUP_STATUS:-/var/lib/openclaude-v5-selfhos
 WATCH_PG_BACKUP_MAX_AGE_SEC="${WATCH_PG_BACKUP_MAX_AGE_SEC:-129600}"
 WATCH_STUB_DISK_AVAIL_BYTES="${WATCH_STUB_DISK_AVAIL_BYTES:-}"
 
+# Reliable absence only; installed recovery scripts do not import a helper.
+release_policy_context_absent() {
+  python3 - "${OC_V5_RELEASE_POLICY_CONTEXT:-/var/lib/openclaude-v5-selfhost/release-policy/unresolved.json}" <<'POLICY_PRESENCE'
+import os,sys,pathlib
+q=pathlib.PurePath(sys.argv[1])
+if not q.is_absolute() or ".." in q.parts:sys.exit(2)
+try:os.lstat(q)
+except FileNotFoundError:sys.exit(0)
+except OSError:sys.exit(2)
+sys.exit(1)
+POLICY_PRESENCE
+}
+
+
 wlog() {
   local msg
   msg="$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"
@@ -490,7 +504,7 @@ write_grace() {
   printf 'until=%s\n' "$until_ts" >"$WATCH_GRACE"
 }
 
-tier1_rollback() {
+tier1_rollback_legacy() {
   local prev
   prev="$(tr -d '[:space:]' <"${WATCH_RELEASES_ROOT}/.prev-release" 2>/dev/null || true)"
   if ! prev_release_is_valid; then
@@ -544,7 +558,7 @@ restart_egress_for_live() {
   fi
 }
 
-tier2_restore_units() {
+tier2_restore_units_legacy() {
   wlog "tier2 准备恢复备份 unit ← $WATCH_BACKUP_CURRENT dry=$WATCH_DRY"
   if [[ ! -d "$WATCH_BACKUP_CURRENT" ]]; then
     wlog "tier2 备份目录不存在"
@@ -767,6 +781,13 @@ observe_while_suppressed() {
 }
 
 watch_once() {
+  if ! release_policy_context_absent; then
+    local policy_health=red
+    if compound_green; then policy_health=green; fi
+    wlog "release-policy hold: observe only, retain operation and markers"
+    emit_watch_status false release-policy-hold true "$policy_health" || true
+    return 0
+  fi
   local count reason loud
   WATCH_LAST_MASTER_BODY=""
 
@@ -820,7 +841,14 @@ watch_once() {
   wlog "达到阈值,进入两级兜底"
   watch_alert critical rollback_start "复合健康连续红 ${count}/${WATCH_FAIL_THRESHOLD}，开始两级兜底（tier1 回切上一份 release → tier2 恢复 unit）$(is_true_dry && echo '（WATCH_DRY 演练）')。"
   if prev_release_is_valid; then
-    if tier1_rollback; then
+    local policy_tier_rc=0
+    tier1_rollback || policy_tier_rc=$?
+    if [[ "$policy_tier_rc" == 75 ]]; then
+      wlog "恢复锁忙或 policy hold,本拍等待"
+      emit_watch_status false recovery-wait true red || true
+      return 0
+    fi
+    if [[ "$policy_tier_rc" == 0 ]]; then
       sleep 3
       if [[ "$WATCH_SKIP_ACTIONS" == 1 ]] || is_true_dry || compound_green; then
         if is_true_dry || [[ "$WATCH_SKIP_ACTIONS" == 1 ]]; then
@@ -842,7 +870,14 @@ watch_once() {
     watch_alert warning tier1_skipped "没有上一份合法 release，跳过 tier1，直接 tier2。"
   fi
 
-  if tier2_restore_units; then
+  local policy_tier2_rc=0
+  tier2_restore_units || policy_tier2_rc=$?
+  if [[ "$policy_tier2_rc" == 75 ]]; then
+    wlog "恢复锁忙或 policy hold,本拍等待"
+    emit_watch_status false recovery-wait true red || true
+    return 0
+  fi
+  if [[ "$policy_tier2_rc" == 0 ]]; then
     sleep 3
     if [[ "$WATCH_SKIP_ACTIONS" == 1 ]] || is_true_dry; then
       wlog "tier2 dry 完成"
@@ -922,6 +957,7 @@ rearm_preconditions() {
 }
 
 watch_rearm() {
+  release_policy_context_absent || { rearm_refuse "release-policy operation unresolved"; return 75; }
   local old_count dst
   if [[ ! -e "$WATCH_DISARM" && ! -L "$WATCH_DISARM" ]]; then
     wlog "rearm: 无停用标记,看护已武装"
@@ -941,6 +977,11 @@ watch_rearm() {
   if ! flock -n 8; then
     exec 8<&-
     rearm_refuse "发布锁被占用(有 --deploy 或另一个 --rearm 在跑)"; return 1
+  fi
+  if ! release_policy_context_absent; then
+    exec 8<&-
+    rearm_refuse "release-policy operation unresolved"
+    return 75
   fi
   if ! rearm_preconditions; then
     exec 8<&-
@@ -973,6 +1014,7 @@ watch_rearm() {
 # --probe-only 只探测、只在绿时清标记,不动现场(兜底次数用完后的周期探测)。
 # 退出码:0 绿(标记已清);1 仍红;3 外部依赖/需修代码类,未回切;75 现在不能动(锁/窗口/演练模式)。
 watch_autoclear_markers() { # <how>
+  release_policy_context_absent || return 75
   local how="$1" ts dst cleared=""
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
   if [[ -f "$WATCH_MANUAL_RECOVERY" && ! -L "$WATCH_MANUAL_RECOVERY" ]]; then
@@ -1009,6 +1051,7 @@ watch_stable_green() {
 }
 
 watch_auto_recover() { # [--probe-only]
+  release_policy_context_absent || { echo "AUTORECOVER_WAIT release-policy-hold"; return 75; }
   local probe_only=0 loud tier=""
   [[ "${1:-}" == --probe-only ]] && probe_only=1
   if is_true_dry; then echo "AUTORECOVER_SKIP dry"; return 75; fi
@@ -1019,6 +1062,7 @@ watch_auto_recover() { # [--probe-only]
   [[ -f "$WATCH_LOCK" && ! -L "$WATCH_LOCK" ]] || { echo "AUTORECOVER_SKIP lockfile"; return 75; }
   exec 8<>"$WATCH_LOCK" || { echo "AUTORECOVER_SKIP lockfile"; return 75; }
   if ! flock -n 8; then exec 8<&-; echo "AUTORECOVER_SKIP lock"; return 75; fi
+  if ! release_policy_context_absent; then exec 8<&-; echo "AUTORECOVER_WAIT release-policy-hold"; return 75; fi
   if maint_is_live_exemption || in_cutover_grace; then
     exec 8<&-; echo "AUTORECOVER_SKIP window"; return 75
   fi
@@ -1323,8 +1367,46 @@ usage_watch() {
 EOF
 }
 
+watch_policy_mutation() { # trusted local function
+  local callback="$1" rc=0 policy_fd="" existing=0
+  release_policy_context_absent || return 75
+  if is_true_dry || [[ "$WATCH_SKIP_ACTIONS" == 1 ]]; then "$callback"; return $?; fi
+  # Auto-recovery already owns fd8. Verify that exact open-file lock instead
+  # of acquiring a different fd and deadlocking against the same invocation.
+  if python3 - "$$" "$WATCH_LOCK" <<'WATCH_OWNED'
+import os,re,sys
+try:
+ a=os.stat('/proc/'+sys.argv[1]+'/fd/8');b=os.stat(sys.argv[2],follow_symlinks=False)
+ assert (a.st_dev,a.st_ino)==(b.st_dev,b.st_ino)
+ assert re.search(r'^lock:\s+.*\bFLOCK\s+ADVISORY\s+WRITE\s+',open('/proc/'+sys.argv[1]+'/fdinfo/8').read(),re.M)
+except (OSError,AssertionError):sys.exit(1)
+WATCH_OWNED
+  then existing=1; fi
+  if [[ "$existing" == 0 ]]; then
+    mkdir -p -- "$(dirname -- "$WATCH_LOCK")" || return 75
+    if [[ ! -e "$WATCH_LOCK" && ! -L "$WATCH_LOCK" ]]; then
+      ( umask 077; set -C; : >"$WATCH_LOCK" ) 2>/dev/null || return 75
+    fi
+    [[ -f "$WATCH_LOCK" && ! -L "$WATCH_LOCK" ]] || return 75
+    exec {policy_fd}<>"$WATCH_LOCK" || return 75
+    if ! flock -n "$policy_fd"; then exec {policy_fd}>&-; return 75; fi
+  fi
+  if release_policy_context_absent; then "$callback" || rc=$?; else rc=75; fi
+  if [[ -n "$policy_fd" ]]; then exec {policy_fd}>&-; fi
+  return "$rc"
+}
+tier1_rollback() { watch_policy_mutation tier1_rollback_legacy; }
+tier2_restore_units() { watch_policy_mutation tier2_restore_units_legacy; }
+
+watch_release_policy_probe() {
+  local context="${OC_V5_RELEASE_POLICY_CONTEXT:-/var/lib/openclaude-v5-selfhost/release-policy/unresolved.json}"
+  if release_policy_context_absent; then printf 'release-policy-probe-v1 absent %s\n' "$context"; return 0; fi
+  printf 'release-policy-probe-v1 hold %s\n' "$context"; return 75
+}
+
 main() {
   case "${1:-}" in
+    --release-policy-probe) watch_release_policy_probe ;;
     -h|--help) usage_watch; exit 0 ;;
     --selftest) watch_selftest ;;
     # 本拍(含 set -e 中断)结束时投递已入队告警;保留原退出码。不用 `|| rc=$?`,

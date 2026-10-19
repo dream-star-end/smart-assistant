@@ -62,9 +62,10 @@ function successSampleRate(): number {
  * kind='final' → ok=true 且按 successSampleRate 抽样;其余 → ok=false 全记。
  * model 非静态 provider(OAuth/未知)→ 直接丢弃。
  */
-export function recordProviderHealthSample(model: string, kind: HealthSampleKind): void {
+export function recordProviderHealthSample(model: string, kind: HealthSampleKind, providerId?: string): void {
   try {
-    const spec = findRouteProviderForModel(model);
+    // OCV5-482:session 已知实际服务的静态 provider(含回落上游)时以它为准，否则按 model 推断。
+    const spec = providerId !== undefined ? { id: providerId } : findRouteProviderForModel(model);
     if (!spec) return; // 只治理静态 provider
     if (kind === "final" && randomImpl() >= successSampleRate()) return;
     if (buffer.length >= MAX_BUFFER) buffer.shift(); // 防内存失控:丢最老

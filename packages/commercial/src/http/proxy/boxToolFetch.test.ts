@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { BoxEgressNotConfiguredError } from "./boxAccountResolver.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { BoxToolFetch } from "./boxToolFetch.js";
@@ -734,4 +736,28 @@ test("OCV5-328 a stream the decoder rejects stops the run like a rejected echo",
   assert.deepEqual(calls, ["continuation", "stop"]);
   assert.deepEqual(identity, { requestId: "box-next", uid: 3n, accountId: claim.accountId,
     runNonce: claim.runNonce, leaseEpoch: claim.leaseEpoch });
+});
+
+test("real ToolFetch and first-round chain preserve proven no-egress error before admission", async () => {
+  const failure = new BoxEgressNotConfiguredError("BOX_UID_PROXY_UNAVAILABLE", "missing");
+  const asset = (name: string) => readFileSync(
+    new URL(`../../../../../scripts/ocv5-289/${name}`, import.meta.url));
+  let resolved = 0;
+  let unknown = 0;
+  const inherited = process.env.OC_INSTANCE_ID;
+  process.env.OC_INSTANCE_ID = "box-test";
+  try {
+    const service = new BoxToolFetch({ supervisorAsset: asset("box_supervisor.py"),
+      keeperAsset: asset("box_keeper.py"), virtualMcpAsset: asset("box_virtual_mcp.py"),
+      detachedRunnerAsset: asset("box_detached_runner.py"), journal: journal(),
+      maxOutputTokensForModel: () => 128_000,
+      resolveTarget: async () => { resolved++; throw failure; },
+      onUnknown: async () => { unknown++; } });
+    await assert.rejects(service.fetch(call(firstBody)), (error: unknown) => error === failure);
+    assert.equal(resolved, 1);
+    assert.equal(unknown, 0);
+  } finally {
+    if (inherited === undefined) Reflect.deleteProperty(process.env, "OC_INSTANCE_ID");
+    else process.env.OC_INSTANCE_ID = inherited;
+  }
 });

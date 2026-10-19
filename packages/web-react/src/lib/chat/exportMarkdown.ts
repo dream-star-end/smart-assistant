@@ -23,7 +23,7 @@ function headingFor(role: ChatMessage["role"]): string {
 
 /**
  * 把当前内存窗消息编成会话导出 Markdown。
- * 收真实提问和最终回答；失败前已交付的部分正文标记未完成后保留，工具和思考不导出。
+ * 收真实提问和最终回答；可见的进行中或失败前部分正文标记未完成后保留，工具和思考不导出。
  * 异步:助手正文含 ```ui 组件时要等组件转换器的懒块加载。
  */
 export async function exportSessionMarkdown(messages: readonly ChatMessage[], sending = false): Promise<string> {

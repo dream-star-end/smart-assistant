@@ -1,12 +1,14 @@
 // OCV5-432: pure policy for the selfhost release's OpenCode Go prompt-cache check.
 // Importing this module never opens a socket or reads secrets.
-// Fixed on purpose (Codex r1): the proof is about this model's cache; no override.
-export const GO_CACHE_MODEL = 'opencode-gpt-6-luna'
+// OCV5-527: Go Luna is retired as a duplicate of Codex Luna. Keep the proof on a retained
+// model using the same Responses bridge. Fixed on purpose; no model override.
+export const GO_CACHE_MODEL = 'muse-spark-1.3-go'
 export const GO_CACHE_TURNS = 3
 // Each later turn re-sends the earlier prompt, so with a working cache roughly (n-1)/n of the
-// prompt tokens are cache reads (3 turns ≈ 0.67). The OCV5-432 defect read exactly 0. 0.3
-// still passes when the upstream evicts one entry, never when the prefix is unstable.
-export const GO_CACHE_MIN_RATIO = 0.3
+// prompt tokens are cache reads (3 turns ≈ 0.67). Before OCV5-432, Muse read only part
+// of the unstable prefix (0.319 in real usage), so the former Luna threshold 0.3 would
+// wrongly pass. Require 0.5 for Muse; one full cache eviction now fails this check.
+export const GO_CACHE_MIN_RATIO = 0.5
 
 export function goCachePrompts(nonce) {
   if (!/^[a-f0-9]{8,32}$/.test(nonce)) throw new Error('Invalid go-cache nonce')

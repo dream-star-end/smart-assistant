@@ -1,3 +1,4 @@
+import { startLogTimingReporter } from '@openclaude/protocol/nodeLogTiming'
 /**
  * Gateway lifecycle: start-up, shutdown, boot auto-resume, turn-dispatch inbox recovery, notifier and scheduler ticks
  *
@@ -143,6 +144,8 @@ export interface GatewayLifecycleHost {
   webhookRouter: Gateway['webhookRouter']
   wss: Gateway['wss']
 }
+
+const logTimingStops = new WeakMap<object, () => void>()
 
 export async function start(this: GatewayLifecycleHost): Promise<void> {
   const { config } = this.deps
@@ -917,13 +920,19 @@ export async function start(this: GatewayLifecycleHost): Promise<void> {
       this.httpServer.listen(listenOpts.port, listenOpts.host, () => res())
     }
   })
+  if (!logTimingStops.has(this)) logTimingStops.set(this, startLogTimingReporter(this.log))
   this.log.info('server started', { bind: listenOpts.host, port: listenOpts.port })
+  if (process.env.OPENCLAUDE_TRUST_BRIDGE_IP) {
+    this.log.info('container_boot_timing', { stage: 'gateway_listening', processUptimeMs: process.uptime() * 1000 })
+  }
 
   // Auto-resume: proactively continue interrupted webchat sessions after gateway restart
   this.bootAutoResume().catch((err) => this.log.error('auto-resume boot failed', undefined, err))
 }
 
 export async function _doShutdown(this: GatewayLifecycleHost, exit: boolean): Promise<void> {
+  logTimingStops.get(this)?.()
+  logTimingStops.delete(this)
   this.log.info('shutting down')
 
   // ── Stage 1: stop accepting new traffic ──

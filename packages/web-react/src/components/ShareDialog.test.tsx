@@ -167,6 +167,8 @@ describe("ShareDialog", () => {
     live[1].text = "第一轮更新回答";
     live.push(
       msg({ id: "u4", role: "user", text: "第四轮问题" }),
+      msg({ id: "process4", role: "assistant", text: "PRIVATE_PROCESS", _clientMessageId: "u4" }),
+      msg({ id: "tool4", role: "tool", text: "PRIVATE_TOOL", _clientMessageId: "u4" }),
       msg({ id: "a4", role: "assistant", text: "第四轮进行中回答", _clientMessageId: "u4" }),
     );
     view.rerender(
@@ -196,7 +198,10 @@ describe("ShareDialog", () => {
     expect(markdown).toContain("第一轮更新回答");
     expect(markdown).toContain("第四轮问题");
     expect(markdown).not.toContain("第一轮原回答");
-    expect(markdown).not.toContain("第四轮进行中回答");
+    expect(markdown).toContain("第四轮进行中回答");
+    expect(markdown).toContain("## 助手（未完成）");
+    expect(markdown).not.toContain("PRIVATE_PROCESS");
+    expect(markdown).not.toContain("PRIVATE_TOOL");
   });
 
   it("桌面浏览器即使支持系统分享也不显示「分享…」,保存图片为主按钮", async () => {
@@ -252,5 +257,6 @@ describe("ShareDialog", () => {
     expect(link.closest("[data-share-body]")).not.toBeNull();
     fireEvent.click(link);
     expect(onExportMarkdown).toHaveBeenCalledTimes(1);
+    expect(saveBlob).not.toHaveBeenCalled();
   });
 });

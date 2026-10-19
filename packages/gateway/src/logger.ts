@@ -5,6 +5,8 @@
  * Each log entry carries optional traceId, agentId, sessionKey for correlation.
  */
 
+import { measureLogWrite } from '@openclaude/protocol'
+
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 
 const LEVEL_NUM: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 }
@@ -51,9 +53,9 @@ function write(level: LogLevel, msg: string, ctx?: LogContext, error?: unknown):
 
   const line = JSON.stringify(entry)
   if (level === 'error' || level === 'warn') {
-    process.stderr.write(line + '\n')
+    measureLogWrite(() => process.stderr.write(line + '\n'), Buffer.byteLength(line) + 1)
   } else {
-    process.stdout.write(line + '\n')
+    measureLogWrite(() => process.stdout.write(line + '\n'), Buffer.byteLength(line) + 1)
   }
 }
 
