@@ -22,7 +22,6 @@ import { AgentGate } from "./components/AgentGate";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import { AgentPicker } from "./components/AgentPicker";
 import { AuthGate, type AuthMode } from "./components/AuthGate";
-import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
 import { applyIntelligentUiSnapshot, useInputPredictionEnabled } from "./lib/intelligentUi";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
@@ -227,6 +226,8 @@ import type { SaveToProjectRequest } from "./components/project/SaveToProjectDia
 // 常驻,再次打开无回退闪烁。发新版后旧标签页拉不到旧 chunk 时由 ChunkErrorBoundary 兜底,
 // 提示刷新而非白屏——见 components/ChunkErrorBoundary）。
 type PredictInput = typeof import("./lib/inputPrediction").predictInput;
+const loadDesktopEnrollPage = () => import("./components/DesktopEnrollPage");
+const DesktopEnrollPage = lazy(() => loadDesktopEnrollPage().then((m) => ({ default: m.DesktopEnrollPage })));
 const Landing = lazy(() => import("./components/Landing").then((m) => ({ default: m.Landing })));
 const SettingsCenter = lazy(() =>
   import("./components/SettingsCenter").then((m) => ({ default: m.SettingsCenter })),
@@ -365,6 +366,10 @@ export function App() {
   // （会话 /s/<id> + 面板 ?panel=）的解析见 readLocationRoute；此后 URL 是状态的 replaceState 单向镜像。
   const urlRoute = readLocationRoute(location);
   const { params, demo, resetToken, desktopEnroll, routingEnabled } = urlRoute;
+  // Only this route needs enrollment UI; load it while authentication is in progress.
+  useEffect(() => {
+    if (desktopEnroll) void loadDesktopEnrollPage().catch(() => {});
+  }, [desktopEnroll]);
   // 会话深链恢复未决标记：resolve 前 useSessionList 暂停"自动选中上次会话"
   // （URL 指定 > 最近会话）；resolve/放弃后置 null。
   const [pendingRouteSession, setPendingRouteSession] = useState<string | null>(() =>
@@ -3410,7 +3415,11 @@ export function App() {
   }
 
   if (desktopEnroll && auth) {
-    return <DesktopEnrollPage auth={auth} />;
+    return (
+      <LazyBoundary fallback={<SplashFallback />}>
+        <DesktopEnrollPage auth={auth} />
+      </LazyBoundary>
+    );
   }
 
   const showEmpty = demo ? messages.length === 0 && !busy : wsMessages.length === 0 && !wsSending;
