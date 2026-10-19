@@ -16,6 +16,7 @@ import {
   MODEL_HISTORY_EXACT_SUFFIX_MARKER,
   resolveModelHistoryContextWindow,
   type LiveUnitsPage,
+  type AutomaticTurnRecoverySnapshot,
 } from '@openclaude/protocol'
 import Database from 'better-sqlite3'
 // 引擎中立的写路径决策层(RFC D6b);与本文件构成运行时环(见 clientSessionsPlan.ts 顶注)。
@@ -2082,6 +2083,8 @@ export interface ClientSession {
   // 值是 `_orderSeq` 水位。旧行/无归档 → 0。
   archivedCount?: number
   archivedThroughSeq?: number
+  /** Same read snapshot as the terminal timeline; undefined is not negative evidence. */
+  automaticRecoveries?: AutomaticTurnRecoverySnapshot[]
   /** In-flight durable dispatch for this session, if any (rev2 P0). */
   openDispatch?: {
     dispatchId: string
