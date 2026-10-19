@@ -6820,7 +6820,7 @@ describe("durable turn dispatch(RFC §2.1 受理 / §2.4 收敛 / §2.5 状态�
     });
     assert.ok(sourceAdmission.kind === "admitted");
     const dispatch = { dispatchId: sourceAdmission.dispatch.dispatchId,
-      dispatchAttemptNo: sourceAdmission.dispatch.attemptNo };
+      attemptNo: sourceAdmission.dispatch.attemptNo };
     for (const part of tape.parts) {
       await backend.stageLosslessTurnTapePart(CUSER, { ...part.request, ...dispatch }, part.bytes);
     }
