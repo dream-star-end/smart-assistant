@@ -7587,6 +7587,34 @@
       "coverageCommits": []
     },
     {
+      "id": "INC-20261018-CODEX-WEB-SEARCH-CLI",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "体验官A25/A36：Codex缺少可发现的稳定搜索CLI，oc-web --help无search，Luna/Sol改用Bash抓Google/Bing/Baidu遇空结果及验证码。新增oc-web search，复用现有master搜索代理和成对容器身份回退；prompt/schema/cache输入不变。",
+      "rootFixCommit": "fb1fc232",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ocWebSearch.test.ts",
+          "assertion": "OCV5-510 oc-web search returns source URLs through the authenticated master proxy"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-ccb-mcp-availability.ts",
+          "assertion": "[ocv5-510-codex-web-search-cli] PASS — the real CLI restores container identity and returns a sourced result through MiniMax then Grok"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ocWebSearch.test.ts",
+          "assertion": "search keeps Grok source-only URLs after MiniMax failure"
+        }
+      ],
+      "coverageCommits": [
+        "8708f22f",
+        "4eaaf4f2"
+      ]
+    },
+    {
       "id": "INC-20261019-PREDICTION-HIDES-FINAL",
       "occurredAt": "2026-10-19",
       "severity": "P1",
