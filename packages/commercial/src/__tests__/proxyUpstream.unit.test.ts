@@ -2527,7 +2527,7 @@ describe("pickUpstream — static route fallback (OCV5-482)", () => {
         }
       }
     } finally {
-      if (prev === undefined) delete process.env.OC_PROVIDER_HEALTH_ENFORCE;
+      if (prev === undefined) Reflect.deleteProperty(process.env, "OC_PROVIDER_HEALTH_ENFORCE");
       else process.env.OC_PROVIDER_HEALTH_ENFORCE = prev;
     }
   });
