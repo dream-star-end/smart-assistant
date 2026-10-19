@@ -286,6 +286,9 @@ export function runCaptured(spec: RunCapturedSpec): Promise<RunCapturedResult> {
       finish(snapshot({ spawnError: err.message }))
     })
     child.on('close', (code, signal) => {
+      // The shell can close while a TERM-ignoring descendant has redirected its pipes.
+      // Finish timeout escalation before dropping this process group.
+      if (timedOut) killGroup(child, 'SIGKILL')
       clearTimeout(timer)
       if (killTimer) clearTimeout(killTimer)
       forget()

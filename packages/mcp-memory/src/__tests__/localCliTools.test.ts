@@ -2,7 +2,7 @@
  * Run: npx tsx --test packages/mcp-memory/src/__tests__/localCliTools.test.ts
  */
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
@@ -86,6 +86,39 @@ describe('oc_bash', () => {
     assert.equal(result.isError, undefined)
     assert.match(result.content[0]!.text, /exit=0/)
     assert.match(result.content[0]!.text, /capped/)
+  })
+
+  it('kills a detached descendant ignoring TERM after the shell closes on timeout', { timeout: 8_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-cli-timeout-'))
+    const pidFile = join(dir, 'child.pid')
+    let pid: number | undefined
+    const running = (childPid: number): boolean => {
+      try {
+        const stat = readFileSync(`/proc/${childPid}/stat`, 'utf8')
+        return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0] !== 'Z'
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false
+        throw err
+      }
+    }
+    try {
+      const result = await handleOcBash({
+        command: `bash -c 'trap "" TERM; echo $$ > "${pidFile}"; exec sleep 30' >/dev/null 2>&1 & wait`,
+        timeout_ms: 1000,
+      })
+      pid = Number(readFileSync(pidFile, 'utf8').trim())
+      assert.ok(Number.isInteger(pid) && pid > 0)
+      assert.equal(result.isError, true)
+      assert.match(result.content[0]!.text, /timed out/)
+      const deadline = Date.now() + 2_000
+      while (running(pid) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20))
+      assert.equal(running(pid), false, 'TERM-ignoring child must not survive the timed-out shell')
+    } finally {
+      if (pid && running(pid)) {
+        try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+      }
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   it('kills a sleep that outlives the timeout', async () => {
