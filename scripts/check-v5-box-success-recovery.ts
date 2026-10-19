@@ -998,7 +998,7 @@ async function runWorker(argv: string[]): Promise<void> {
   // OCV5-520: import product code only inside the existing scrubbed worker.
   const { proveGoPoolWiring } = await import("../packages/commercial/src/__tests__/goPoolWiringProof.js");
   const goReceipt = await proveGoPoolWiring();
-  assert.equal(goReceipt, BEHAVIOR[3]);
+  assert.equal(goReceipt, BEHAVIOR[4]);
   emit(goReceipt);
 }
 
