@@ -14,6 +14,10 @@
 #                          listeners, stop the slots, enable --now the legacy unit.
 # Exit 0 on success; every failure leaves the serving process as it was, if any.
 set -Eeuo pipefail
+if [[ "${CP_EGRESS_POLICY:-0}" == 1 ]]; then
+  source "$CP_BUNDLE/lib/v5-commercial-release-policy.sh"
+  commercial_policy_remote_owner || exit 86
+fi
 LEGACY=openclaude-v5-egress.service
 SOCK_TPL=openclaude-v5-egress@.socket
 SVC_TPL=openclaude-v5-egress@.service
@@ -86,6 +90,10 @@ assert_no_orphan_listener() {
 # Both slots active (an earlier flip was killed half way): stop the older one completely while
 # the newer keeps serving, so exactly one slot serves and the other is free to start again.
 settle_both_active() {
+  if [[ "${CP_EGRESS_POLICY:-0}" == 1 && "$(state "$(unit A service)")" == active && "$(state "$(unit B service)")" == active ]]; then
+    echo '✗ policy: two active egress slots require exact recovery; no mtime-based stop' >&2
+    return 79
+  fi
   if [[ "$(state "$(unit A service)")" == active && "$(state "$(unit B service)")" == active ]]; then
     local ta tb older
     ta="$(systemctl show -p ActiveEnterTimestampMonotonic --value "$(unit A service)")"
@@ -104,14 +112,19 @@ cmd_flip() {
   [[ "$predrain" =~ ^[0-9]+$ ]] || die "predrain must be seconds"
   [[ -f "/etc/systemd/system/$SVC_TPL" && -f "/etc/systemd/system/$SOCK_TPL" ]] || die "slot templates not installed"
   [[ "$(sysctl -n net.ipv4.tcp_migrate_req 2>/dev/null || echo 0)" == 1 ]] || die "tcp_migrate_req is not 1"
-  settle_both_active
+  settle_both_active || return $?
   if [[ "$(state "$(unit A service)")" == active ]]; then cur=A; target=B
   elif [[ "$(state "$(unit B service)")" == active ]]; then cur=B; target=A
+  elif [[ "${EGRESS_RESTORE_FREE_SLOT:-0}" == 1 && "$(state "$(unit A service)")" == deactivating && "$(state "$(unit B service)")" =~ ^(inactive|failed)$ ]]; then target=B
   else target=A; fi
   new_sock="$(unit "$target" socket)"; new_svc="$(unit "$target" service)"
   # One-time migration: the legacy unit holds a plain bind on the shared port. Wait (bounded) for
   # its in-flight streams to finish while it keeps serving, then stop it.
   st="$(state "$LEGACY")"
+  if [[ "${CP_EGRESS_POLICY:-0}" == 1 && ( "$st" == active || "$st" == activating || "$st" == deactivating ) ]]; then
+    echo '✗ policy: legacy migration needs a separate adapter; existing service retained' >&2
+    return 79
+  fi
   if [[ "$st" == active || "$st" == activating || "$st" == deactivating ]]; then
     for (( i = 0; i < predrain; i += 5 )); do
       left="$(legacy_inflight)"
@@ -131,8 +144,12 @@ cmd_flip() {
       || die "slot $target did not finish draining"
   fi
   echo "  egress-slots: starting slot $target${cur:+ (serving: $cur)}" >&2
+  [[ "${CP_EGRESS_POLICY:-0}" != 1 ]] || commercial_policy_egress_target "$target" "$cur" || return $?
   if ! systemctl start "$new_sock" || ! systemctl start "$new_svc" || ! wait_slot_ready "$target"; then
     tail -n 40 /var/log/openclaude-v5-egress.log >&2 || true
+    if [[ "${CP_EGRESS_POLICY:-0}" == 1 ]]; then
+      commercial_policy_egress_failure "$target" || return $?
+    fi
     systemctl stop --job-mode=ignore-dependencies "$new_sock" 2>/dev/null || true
     systemctl stop "$new_svc" 2>/dev/null || true
     if (( migrated )); then
@@ -145,14 +162,17 @@ cmd_flip() {
     die "slot $target failed to start; ${cur:+slot $cur still serving}"
   fi
   wait_shared_port || die "shared port not reachable after slot $target started"
+  [[ "${CP_EGRESS_POLICY:-0}" != 1 ]] || commercial_policy_remote_owner || return 86
   if [[ -n "$cur" ]]; then
     # Close the old listener first (ms), then stop the service without blocking (it drains).
     # Stopping both in one job would keep the old .socket until the drain ends: a black hole.
+    [[ "${CP_EGRESS_POLICY:-0}" != 1 ]] || commercial_policy_remote_owner || return 86
     old_sock="$(unit "$cur" socket)"; old_svc="$(unit "$cur" service)"
     systemctl stop --job-mode=ignore-dependencies "$old_sock"
     systemctl stop --no-block "$old_svc"
     systemctl disable "$old_sock" "$old_svc" >/dev/null 2>&1 || true
   fi
+  [[ "${CP_EGRESS_POLICY:-0}" != 1 ]] || commercial_policy_remote_owner || return 86
   systemctl enable "$new_sock" "$new_svc" >/dev/null 2>&1 || true
   wait_shared_port || die "shared port not reachable after closing slot ${cur:-none}"
   assert_no_orphan_listener
@@ -169,7 +189,7 @@ port_free() { ! ss -Hltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; }
 cmd_legacy() {
   local s i restore=""
   # Codex r3 P1: never drain both slots at once, or a failed legacy start has nothing to restore.
-  settle_both_active
+  settle_both_active || return $?
   for s in A B; do
     systemctl stop --job-mode=ignore-dependencies "$(unit "$s" socket)" 2>/dev/null || true
   done
@@ -198,9 +218,99 @@ cmd_legacy() {
   die "legacy egress failed to start and no slot could be restored: :$PORT may be closed"
 }
 
+# Exact operation recovery: timestamps never select which revision may accept new turns.
+policy_slot_identity() {
+  local s="$1" pid invocation ticks cwd
+  [[ "$(state "$(unit "$s" service)")" == active ]] || return 1
+  pid="$(systemctl show -p MainPID --value "$(unit "$s" service)")" || return 79
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 79
+  cwd="$(readlink -f "/proc/$pid/cwd")" || return 79
+  invocation="$(systemctl show -p InvocationID --value "$(unit "$s" service)")" || return 79
+  ticks="$(python3 -B -c 'import sys; s=open(sys.argv[1]).read(); print(s[s.rfind(")")+2:].split()[19])' "/proc/$pid/stat")" || return 79
+  [[ "$invocation" =~ ^[0-9a-f]{32}$ && "$ticks" =~ ^[0-9]+$ ]] || return 79
+  printf '%s %s %s %s\n' "$pid" "$cwd" "$invocation" "$ticks"
+}
+policy_unique_listener() {
+  local expected="$1" out line ids found=0
+  assert_no_orphan_listener || return 79
+  out="$(ss -Hltnp "sport = :$PORT")" || return 79
+  while IFS= read -r line; do
+    ids="$(grep -oE '"node",pid=[0-9]+' <<<"$line" | sed 's/.*=//')" || return 79
+    [[ -n "$ids" ]] || return 79
+    while IFS= read -r pid; do [[ "$pid" == "$expected" ]] || return 79; found=1; done <<<"$ids"
+  done <<<"$out"
+  [[ "$found" == 1 ]]
+}
+cmd_policy_state() {
+  [[ "${CP_EGRESS_POLICY:-0}" == 1 ]] || return 79
+  commercial_policy_remote_owner || return 86
+  local rel="$1" before="$2" s info count=0 old="" target=""
+  [[ "$(state "$LEGACY")" =~ ^(inactive|failed)$ ]] || return 79
+  for s in A B; do
+    [[ "$(state "$(unit "$s" service)")" == active ]] || continue
+    count=$((count+1)); info="$(policy_slot_identity "$s")" || return 79
+    case "$(awk '{print $2}' <<<"$info")" in
+      "$rel") [[ -z "$target" ]] || return 79; target="$s" ;;
+      "$before") old="$s" ;;
+      *) return 79 ;;
+    esac
+  done
+  commercial_policy_remote_owner || return 86
+  if [[ -n "$target" ]]; then printf 'target %s\n' "$target"
+  elif [[ "$count" == 1 && -n "$old" ]]; then
+    wait_slot_ready "$old" && policy_unique_listener "$(awk '{print $1}' <<<"$info")" || return 79
+    commercial_policy_remote_owner || return 86
+    printf 'before %s\n' "$old"
+  elif [[ "$count" == 0 ]]; then
+    commercial_policy_port_refused || return $?
+    printf 'unavailable\n'
+  else return 79; fi
+}
+cmd_converge() {
+  [[ "${CP_EGRESS_POLICY:-0}" == 1 ]] || return 79
+  local rel="$1" before="$2" pointer_expected="${3:-$1}" selection target other identity after pid otherpid othercwd
+  selection="$(cmd_policy_state "$rel" "$before")" || return $?
+  [[ "$selection" == target\ * ]] || return 79
+  target="${selection#target }"; [[ "$target" == A ]] && other=B || other=A
+  [[ "$(readlink -f /opt/openclaude/openclaude-v5-egress)" == "$pointer_expected" ]] || return 79
+  identity="$(policy_slot_identity "$target")" || return 79
+  pid="$(awk '{print $1}' <<<"$identity")"
+  wait_slot_ready "$target" && wait_shared_port || return 79
+  [[ "$(policy_slot_identity "$target")" == "$identity" ]] || return 79
+  otherpid="$(systemctl show -p MainPID --value "$(unit "$other" service)")" || return 79
+  if [[ "$otherpid" =~ ^[1-9][0-9]*$ ]]; then
+    othercwd="$(readlink -f "/proc/$otherpid/cwd")" || return 79
+    [[ "$othercwd" == "$before" ]] || return 79
+  elif [[ "$otherpid" != 0 ]]; then return 79; fi
+  commercial_policy_remote_owner || return 86
+  # Persist the healthy target before disabling its predecessor, including half-finished flips.
+  systemctl enable "$(unit "$target" socket)" "$(unit "$target" service)" >/dev/null || return 79
+  local enabled kind
+  for kind in socket service; do
+    enabled="$(systemctl is-enabled "$(unit "$target" "$kind")")" || return 79
+    [[ "$enabled" == enabled ]] || return 79
+  done
+  commercial_policy_remote_owner || return 86
+  systemctl stop --job-mode=ignore-dependencies "$(unit "$other" socket)" || return 79
+  if [[ "$otherpid" != 0 ]]; then systemctl stop --no-block "$(unit "$other" service)" || return 79; fi
+  systemctl disable "$(unit "$other" socket)" "$(unit "$other" service)" >/dev/null 2>&1 || true
+  wait_shared_port && policy_unique_listener "$pid" || return 79
+  after="$(policy_slot_identity "$target")" || return 79
+  [[ "$after" == "$identity" && "$(readlink -f /opt/openclaude/openclaude-v5-egress)" == "$pointer_expected" ]] || return 79
+  commercial_policy_remote_owner || return 86
+  echo "  ✓ exact egress listener: $target $rel"
+}
+
 case "${1:-}" in
   active) cmd_active ;;
   install) shift; cmd_install "$@" ;;
+  restore) EGRESS_RESTORE_FREE_SLOT=1; shift; cmd_flip "$@" ;;
+  policy-state) shift; cmd_policy_state "$@" ;;
+  stabilize-before-reverse)
+    shift; pointer="$(readlink -f /opt/openclaude/openclaude-v5-egress)"
+    [[ "$pointer" == "$1" || "$pointer" == "$2" ]] || exit 79
+    cmd_converge "$1" "$2" "$pointer" ;;
+  converge) shift; [[ "$#" == 2 ]] || exit 79; cmd_converge "$@" ;;
   flip) shift; cmd_flip "$@" ;;
   legacy) cmd_legacy ;;
   *) echo "usage: v5-egress-slots.sh active|install <rel>|flip [predrain-sec]|legacy" >&2; exit 2 ;;
