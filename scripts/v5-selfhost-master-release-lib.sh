@@ -15,8 +15,6 @@ MASTER_STAGING_INO=""
 # 发布门的私有 TMPDIR(tsx 编译缓存落在里面)。同样不继承环境,理由同 MASTER_STAGING。
 MASTER_GATE_TMPDIR=""
 MASTER_GATE_TMP_PREFIX="${MASTER_GATE_TMP_PREFIX:-/tmp/oc-selfhost-gate-tmp}"
-# 共享 tsx 缓存(/tmp/tsx-<euid>)里超过这个分钟数没写过的条目在每次构建前删掉。
-TSX_SHARED_CACHE_MAX_AGE_MIN="${TSX_SHARED_CACHE_MAX_AGE_MIN:-2880}"
 BUILT_MASTER_RELEASE="${BUILT_MASTER_RELEASE:-}"
 MASTER_DEPS_MODE="${MASTER_DEPS_MODE:-}"
 MASTER_DEPS_ELAPSED_S="${MASTER_DEPS_ELAPSED_S:-}"
@@ -165,24 +163,6 @@ sweep_stale_master_gate_tmpdirs() {
     mlog "  清理残留的门临时目录(pid $pid 已退出): $d"
     rm -rf -- "$d"
   done
-}
-
-# 共享缓存仍被 live master / egress / 迁移和开发机上的测试使用,不能整个删。
-# 只删 TSX_SHARED_CACHE_MAX_AGE_MIN 分钟内没写过的普通缓存文件:tsx 读缓存失败时
-# 当作未命中重新编译,所以删掉正在用的条目也只是多编译一次。失败不挡发布。
-prune_shared_tsx_cache() {
-  local dir before after
-  dir="${TMPDIR:-/tmp}/tsx-$(id -u)"
-  [[ -d "$dir" && ! -L "$dir" ]] || return 0
-  [[ "$TSX_SHARED_CACHE_MAX_AGE_MIN" =~ ^[0-9]+$ ]] || {
-    mlog "  TSX_SHARED_CACHE_MAX_AGE_MIN 不是整数,跳过共享 tsx 缓存清理"
-    return 0
-  }
-  before="$(find "$dir" -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9]+-[0-9a-f]+' 2>/dev/null | wc -l)"
-  find "$dir" -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9]+-[0-9a-f]+' \
-    -mmin +"$TSX_SHARED_CACHE_MAX_AGE_MIN" -delete 2>/dev/null || true
-  after="$(find "$dir" -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9]+-[0-9a-f]+' 2>/dev/null | wc -l)"
-  mlog "  共享 tsx 缓存 $dir: ${before} → ${after} 个条目(删掉 ${TSX_SHARED_CACHE_MAX_AGE_MIN} 分钟内没写过的)"
 }
 
 # 商业版 release_artifact_digest 的本地化抄本(无 SSH)。.complete 不计入。
@@ -657,8 +637,8 @@ build_master_release() {
     return 0
   fi
 
+  # Shared tsx cache belongs to live services and other work; only private gate dirs are cleaned.
   assert_master_releases_disk
-  prune_shared_tsx_cache
   command -v python3 >/dev/null 2>&1 || die "缺少 python3(算 artifact digest 需要)"
   command -v npm >/dev/null 2>&1 || die "缺少 npm"
   command -v jq >/dev/null 2>&1 || die "缺少 jq"
