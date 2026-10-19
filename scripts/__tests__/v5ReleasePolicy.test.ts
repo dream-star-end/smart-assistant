@@ -41,7 +41,7 @@ test('actual outer caller preserves holds and dry-run boundaries', () => {
 })
 
 test('real SQLite exact archive acceptance and ride binding', () => {
-  assert.match(focused('python3', 'v5LeasePolicyAcceptance.test.py'), /PASS total=41 failed=0/)
+  assert.match(focused('python3', 'v5LeasePolicyAcceptance.test.py'), /PASS total=42 failed=0/)
 })
 
 test('production resume adapter refuses stale live and reuses exact acceptance', () => {
@@ -59,4 +59,11 @@ test('actual bootstrap readers and post-lock mutation barrier', () => {
 test('actual registrar and native binding preserve exact request ownership', () => {
   assert.match(focused('python3', 'v5SelfhostPolicyBind.test.py'),
     /PASS actual register \/ native SQL \/ early PID0-race \/ legacy \/ rejection cases/)
+})
+
+test('actual failed cleanup resumes through receipt, reader and ride settlement', () => {
+  const out = focused('python3', 'v5SelfhostPolicyPhaseReplay.test.py')
+  assert.match(out, /PASS keep-resume-reader-settle witness=/)
+  assert.match(out, /PASS phase-repair-failure-holds witness=/)
+  assert.match(out, /PASS total=2 failed=0/)
 })

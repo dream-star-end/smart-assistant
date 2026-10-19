@@ -12,6 +12,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+# Direct execution must not write bytecode into the checked-out helper tree.
+sys.dont_write_bytecode = True
 HELPER = Path(__file__).resolve().parents[1] / "lib/v5-release-policy.py"
 spec = importlib.util.spec_from_file_location("v5_release_policy", HELPER)
 policy = importlib.util.module_from_spec(spec)

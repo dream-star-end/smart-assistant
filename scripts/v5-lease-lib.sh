@@ -474,7 +474,7 @@ lease_policy_archive_accepted() { # train sha scope live_rel [ride_id]
   [[ "$scope" == current || "$scope" == historical ]] || return 1
   [[ -z "$ride_id" ]] || lease_valid_id "$ride_id" || return 1
   libdir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || return 1
-  python3 - "$libdir/lib/v5-release-policy.py" "$LEASE_DB" \
+  python3 -B - "$libdir/lib/v5-release-policy.py" "$LEASE_DB" \
     "${OC_V5_RELEASE_POLICY_CONTEXT:-/var/lib/openclaude-v5-selfhost/release-policy/unresolved.json}" \
     "$train" "$sha" "$scope" "$live_rel" "$ride_id" <<'POLICY_ARCHIVE_ACCEPTED'
 import hashlib,importlib.util,json,os,pathlib,sqlite3,stat,sys

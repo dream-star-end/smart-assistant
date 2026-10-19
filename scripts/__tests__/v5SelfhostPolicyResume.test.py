@@ -29,7 +29,8 @@ def source_functions(destination):
     lines = CALLER.read_text().splitlines(keepends=True)
     out = []
     for name in ["lease_train_load_lib", "proc_starttime_of",
-                 "survivor_state_phase", "lease_train_finish",
+                 "cutover_clog", "cutover_survivor_script", "cutover_persist_phase",
+                 "deploy_alert",
                  "egress_live_release_has_slots"]:
         starts = [i for i, line in enumerate(lines)
                   if line.startswith(name + "() {")]
@@ -128,7 +129,8 @@ def adapter_environment(f, serving):
                P521_TRAIN=fmod.TRAIN, P521_SHA=f.sha,
                P521_ENV=str(envfile), P521_PLATFORM=str(platform),
                P521_FORBIDDEN=str(forbidden), P521_SYSTEMCTL_READS=str(reads),
-               P521_PROCESS_MAP=str(process_map))
+               P521_PROCESS_MAP=str(process_map),
+               CUTOVER_SURVIVOR_SCRIPT=str(SCRIPTS / "v5-selfhost-cutover-survivor.sh"))
     return env, fnfile, procs, forbidden, reads
 
 

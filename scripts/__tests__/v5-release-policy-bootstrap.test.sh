@@ -24,12 +24,12 @@ export PYTHONDONTWRITEBYTECODE=1 TMPDIR="$WORK"
 export OC_V5_RELEASE_POLICY_CONTEXT="$WORK/unresolved.json"
 # This is a function library, directly sourced, not a deploy entrypoint.
 source "$POLICY_SCRIPT"
-# Its survivor_state_phase dependency is the real deploy function. Extract only
-# its parser-accepted definition; never source the deploy CLI top-level.
+# Its survivor_state_phase dependency now lives in the real policy library.
+# Extract that parser-accepted definition; never source the deploy CLI top-level.
 python3 - "$DEPLOY_SCRIPT" "$POLICY_SCRIPT" "$WORK" <<'EXTRACT'
 from pathlib import Path
 import sys,re,subprocess,json,hashlib
-source,policy,out=map(Path,sys.argv[1:]);lines=source.read_text().splitlines(keepends=True)
+source,policy,out=map(Path,sys.argv[1:]);lines=policy.read_text().splitlines(keepends=True)
 name='survivor_state_phase'
 starts=[i for i,line in enumerate(lines) if re.match(r'^'+name+r'\s*\(\s*\)\s*\{',line)]
 assert len(starts)==1,'actual survivor definition absent/ambiguous'
@@ -44,7 +44,7 @@ assert body is not None,'cannot extract actual complete survivor definition'
 (out/'survivor_state_phase.sh').write_text(body)
 (out/'sources.json').write_text(json.dumps({'policy':{'path':str(policy),'sha256':hashlib.sha256(policy.read_bytes()).hexdigest()},
  'deploy':{'path':str(source),'sha256':hashlib.sha256(source.read_bytes()).hexdigest()},
- 'survivor':{'start':start+1,'end':end,'sha256':hashlib.sha256(body.encode()).hexdigest()},
+ 'survivor':{'path':str(policy),'start':start+1,'end':end,'sha256':hashlib.sha256(body.encode()).hexdigest()},
  'unchangedFunctions':['release_policy_unit_stamp','release_policy_drain_reader','release_policy_rejected_phase']},indent=2)+'\n')
 EXTRACT
 source "$WORK/survivor_state_phase.sh"

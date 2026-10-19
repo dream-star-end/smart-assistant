@@ -36,8 +36,8 @@ from pathlib import Path
 import subprocess,re,sys,json,hashlib,difflib
 out=Path(sys.argv[1]);sources=list(map(Path,sys.argv[2:]))
 groups=[
- ['activate_tuple_joint','cmd_cutover','cutover_gate_against_release','cutover_clog','cutover_fail','survivor_state_phase','cutover_persist_phase_or_compensate','selfhost_policy_get','gate_fail_policy','stay_window_sec','gate_fail_drill_armed'],
- ['release_policy_enabled','release_policy_guard_owner','release_policy_flip_live','release_policy_restore_live_before','release_policy_rejected_phase','release_policy_bind_official_train_request','release_policy_context_present'],
+ ['activate_tuple_joint','cmd_cutover','cutover_gate_against_release','cutover_clog','cutover_fail','cutover_persist_phase_or_compensate','selfhost_policy_get','gate_fail_policy','stay_window_sec','gate_fail_drill_armed'],
+ ['survivor_state_phase','release_policy_enabled','release_policy_guard_owner','release_policy_flip_live','release_policy_restore_live_before','release_policy_rejected_phase','release_policy_bind_official_train_request','release_policy_context_present'],
  ['atomic_flip_live_symlink','write_prev_release_file'],
  ['policy_drill_adapter']]
 manifest=[]

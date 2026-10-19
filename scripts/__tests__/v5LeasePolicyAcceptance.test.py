@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -255,6 +256,124 @@ class Fixture:
         return release
 
 
+def immutable_tree(root):
+    """All directory/file/link identities except atime, which reading may change."""
+    result = {}
+    for path in [root, *sorted(root.rglob("*"))]:
+        info = path.lstat()
+        if stat.S_ISREG(info.st_mode):
+            content = hashlib.sha256(path.read_bytes()).hexdigest()
+        elif stat.S_ISDIR(info.st_mode):
+            content = None
+        elif stat.S_ISLNK(info.st_mode):
+            content = os.readlink(path)
+        else:
+            raise AssertionError("unexpected fixture tree entry type")
+        result[str(path.relative_to(root))] = (
+            info.st_mode, info.st_uid, info.st_gid, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns, content)
+    return result
+
+
+def readonly_no_ambient_bytecode(f):
+    # New, owned target release; keep it writable so EACCES cannot hide this bug.
+    # These are exact source bytes, not a copied/fake acceptance predicate.
+    scripts = f.target / "scripts"
+    helper_dir = scripts / "lib"
+    helper_dir.mkdir(parents=True, mode=0o700)
+    copied_lib = scripts / "v5-lease-lib.sh"
+    copied_helper = helper_dir / "v5-release-policy.py"
+    copied_adapter = helper_dir / "v5-selfhost-release-policy.sh"
+    for source, target in [(LIB, copied_lib), (HELPER, copied_helper),
+                           (SCRIPTS / "lib/v5-selfhost-release-policy.sh", copied_adapter)]:
+        shutil.copy2(source, target)
+        need(target.read_bytes() == source.read_bytes(), "not exact production source bytes")
+    need(os.access(helper_dir, os.W_OK), "bytecode test requires writable owned helper dir")
+    need(not list(f.target.rglob("__pycache__")) and not list(f.target.rglob("*.pyc")),
+         "new fixture must begin without bytecode/cache directories")
+
+    clean_env = f.env.copy()
+    for key in ["PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX", "PYTHONPATH", "PYTHONHOME",
+                "DATABASE_URL"]:
+        clean_env.pop(key, None)
+    need("PYTHONDONTWRITEBYTECODE" not in clean_env and "PYTHONPYCACHEPREFIX" not in clean_env,
+         "qualifying reader invocation must have no ambient bytecode suppression/redirect")
+    clean_env.update(MASTER_RELEASES_ROOT=str(f.root), MASTER_LIVE_LINK=str(f.live))
+
+    # Prove this actual child interpreter can create a real .pyc under this env.
+    # This writes only a sacrificial control module outside the sealed target.
+    control = f.root / "bytecode-positive-control"
+    control.mkdir(mode=0o700)
+    module = control / "cache_control.py"
+    module.write_text("value = 521\n")
+    result = command(["python3", "-c", """
+import importlib.util,pathlib,sys
+assert not sys.dont_write_bytecode, 'child bytecode disabled before reader test'
+path=pathlib.Path(sys.argv[1])
+spec=importlib.util.spec_from_file_location('bytecode_positive_control',path)
+module=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert pathlib.Path(importlib.util.cache_from_source(str(path))).is_file(), 'no real pyc control'
+""", str(module)], clean_env)
+    need(result.returncode == 0 and bool(list(control.rglob("*.pyc"))),
+         "real default-bytecode positive control did not create pyc")
+
+    # Use the real master artifact digest, not an imitation or an exclude list.
+    master_lib = SCRIPTS / "v5-selfhost-master-release-lib.sh"
+    def artifact_digest():
+        result = command(["bash", "-euo", "pipefail", "-c",
+                          'source "$1"; release_artifact_digest "$2"',
+                          "fixture", str(master_lib), str(f.target)], clean_env)
+        value = result.stdout.strip()
+        need(result.returncode == 0 and len(value) == 64 and
+             all(c in "0123456789abcdef" for c in value), "actual artifact digest failed")
+        return value
+
+    before_tree = immutable_tree(f.target)
+    before_digest = artifact_digest()
+    before_complete = (f.target / ".complete").read_bytes()
+    before_sql = f.snapshot()
+    original_env = f.env
+    f.env = clean_env
+    try:
+        # The actual reader and loader execute in the exact copied production
+        # shared library under a new shell whose PYTHONDONTWRITEBYTECODE is absent.
+        # Repeat after the cold read; no deletion/repair of caches between reads.
+        for _ in range(2):
+            f.probe(True, "lease_policy_archive_accepted", TRAIN, f.sha,
+                    "current", f.target, RIDE, lib=copied_lib)
+            need(immutable_tree(f.target) == before_tree,
+                 "acceptance reader mutated sealed release directory tree")
+            need(artifact_digest() == before_digest,
+                 "acceptance reader changed real release artifact digest")
+            need((f.target / ".complete").read_bytes() == before_complete,
+                 "acceptance reader changed manifest bytes")
+            need(f.snapshot() == before_sql, "acceptance reader mutated SQLite rows")
+
+        # The other production dynamic-import entry already owns a command-local
+        # suppression. Exercise its real field reader without global suppression.
+        # A valid owned active snapshot is setup outside the target release only.
+        shutil.copy2(f.archive, f.active)
+        adapter_env = clean_env.copy()
+        adapter_env["SCRIPT_DIR"] = str(scripts)
+        result = command(["bash", "-euo", "pipefail", "-c", """
+source "$1"
+RELEASE_POLICY_CONTEXT="$2"
+RELEASE_POLICY_OPERATION="$3"
+release_policy_py field phase
+""", "fixture", str(copied_adapter), str(f.active), TRAIN], adapter_env)
+        need(result.returncode == 0 and result.stdout.strip() == "resolved",
+             "actual selfhost policy field reader failed")
+        need(immutable_tree(f.target) == before_tree and artifact_digest() == before_digest,
+             "selfhost policy import mutated sealed release tree/digest")
+        need((f.target / ".complete").read_bytes() == before_complete and f.snapshot() == before_sql,
+             "readonly imports mutated manifest or SQLite rows")
+    finally:
+        f.env = original_env
+    need(not list(f.target.rglob("__pycache__")) and not list(f.target.rglob("*.pyc")),
+         "readonly imports added a cache directory/file")
+
+
 def main():
     failures = 0
     cases = []
@@ -263,6 +382,7 @@ def main():
         cases.append((name, fn, options))
 
     case("accepted_exact_archive", lambda f: f.probe(True))
+    case("readonly_import_no_ambient_bytecode", readonly_no_ambient_bytecode)
     case("legacy_without_policy_unchanged", lambda f: f.probe(True), legacy=True, explicit=False)
 
     def presence(f, shape):
