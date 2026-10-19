@@ -43,11 +43,14 @@ describe('rg argv', () => {
   it('oc_glob uses --files and skips .git', () => {
     assert.deepEqual(
       ocGlobArgv('/usr/bin/rg', { pattern: '*.ts', path: 'src' }),
-      ['/usr/bin/rg', '--files', '--hidden', '--iglob', '*.ts', '--glob', '!.git/**', '--color', 'never', 'src'],
+      ['/usr/bin/rg', '--files', '--hidden', '--iglob', '*.ts', '--glob', '!.git/**', '--color', 'never', '--', 'src'],
     )
+    const noPath = ocGlobArgv('/usr/bin/rg', { pattern: '*.ts' })
+    assert.equal(noPath.includes('--'), false)
+    assert.equal(noPath.includes('src'), false)
     assert.deepEqual(
-      ocGlobArgv('/usr/bin/rg', { pattern: '*.ts' }).includes('src'),
-      false,
+      ocGlobArgv('/usr/bin/rg', { pattern: '*', path: '--glob=!*' }).slice(-2),
+      ['--', '--glob=!*'],
     )
   })
 })
@@ -123,6 +126,15 @@ describe('oc_grep / oc_glob', () => {
     const files = await handleOcGlob({ pattern: 'note.ts', path: dir })
     assert.equal(files.isError, undefined)
     assert.match(files.content[0]!.text, /note\.ts/)
+  })
+
+  it('does not treat a path that looks like an rg flag as an option', async () => {
+    const result = await handleOcGlob({ pattern: '*', path: '--glob=!*' })
+    assert.equal(result.isError, true)
+    const text = result.content[0]!.text
+    assert.match(text, /No such file|os error/)
+    assert.doesNotMatch(text, /^package\.json$/m)
+    assert.doesNotMatch(text, /^bun\.lock$/m)
   })
 
   it('errors when rg is missing', async () => {

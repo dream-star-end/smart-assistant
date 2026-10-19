@@ -148,7 +148,7 @@ export function ocGlobArgv(rg: string, input: { pattern: string; path?: string }
     '--color',
     'never',
   ]
-  if (input.path) args.push(input.path)
+  if (input.path) args.push('--', input.path)
   return args
 }
 
@@ -173,6 +173,45 @@ function killGroup(child: ChildProcess, signal: NodeJS.Signals): void {
   }
 }
 
+/** Group leaders of detached oc_* children. The MCP timer dies with this process. */
+const activeProcessGroups = new Set<number>()
+let processGroupCleanupInstalled = false
+
+function killTrackedProcessGroups(signal: NodeJS.Signals): void {
+  for (const pid of activeProcessGroups) {
+    try {
+      process.kill(-pid, signal)
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+function installProcessGroupCleanup(): void {
+  if (processGroupCleanupInstalled) return
+  processGroupCleanupInstalled = true
+  process.on('exit', () => {
+    killTrackedProcessGroups('SIGKILL')
+  })
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    const onSignal = () => {
+      killTrackedProcessGroups('SIGKILL')
+      process.removeListener(sig, onSignal)
+      process.kill(process.pid, sig)
+    }
+    process.on(sig, onSignal)
+  }
+}
+
+function trackProcessGroup(pid: number): void {
+  activeProcessGroups.add(pid)
+  installProcessGroupCleanup()
+}
+
+function untrackProcessGroup(pid: number | undefined): void {
+  if (pid && pid > 0) activeProcessGroups.delete(pid)
+}
+
 /** `detached` puts the child in its own process group so a timeout can signal `bash -lc` and its sleep/rg child. */
 export function runCaptured(spec: RunCapturedSpec): Promise<RunCapturedResult> {
   return new Promise((resolve) => {
@@ -190,6 +229,7 @@ export function runCaptured(spec: RunCapturedSpec): Promise<RunCapturedResult> {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: process.env,
       })
+      if (child.pid && child.pid > 0) trackProcessGroup(child.pid)
     } catch (err) {
       finish({
         stdout: '',
@@ -238,14 +278,17 @@ export function runCaptured(spec: RunCapturedSpec): Promise<RunCapturedResult> {
       ...extra,
     })
 
+    const forget = () => untrackProcessGroup(child.pid)
     child.on('error', (err) => {
       clearTimeout(timer)
       if (killTimer) clearTimeout(killTimer)
+      forget()
       finish(snapshot({ spawnError: err.message }))
     })
     child.on('close', (code, signal) => {
       clearTimeout(timer)
       if (killTimer) clearTimeout(killTimer)
+      forget()
       finish(snapshot({ exitCode: code, signal }))
     })
   })
