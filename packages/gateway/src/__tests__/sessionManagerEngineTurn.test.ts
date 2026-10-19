@@ -748,7 +748,7 @@ describe("crash/interrupt partial persistence", () => {
         requestId,
       );
 
-      assert.equal(submits, 4, "initial attempt + three automatic retries before success");
+      assert.equal(submits, 3, "initial attempt + two automatic retries before success");
       assert.equal(events.filter((event) => event.kind === "error").length, 0,
         "INC-20261019-RECOVERABLE-ERROR-RED-CARD: recovered attempts never publish an error");
       assert.deepEqual(runner.submittedInputs, [
