@@ -376,13 +376,13 @@ test('one manager meters interleaved tenant operations under their actual IDs ac
   assert.equal((await manager.settled(otherId, b.operationId)).status, 'authenticated')
   assert.equal(factories, 2)
   const rows = (
-    await query<{ user_id: number; operation_key: string; count: number }>(
-      'SELECT user_id,operation_key,COUNT(*)::int AS count FROM literature_captcha_requests GROUP BY user_id,operation_key ORDER BY user_id',
+    await query<{ user_id: string; operation_key: string; count: number }>(
+      'SELECT user_id::text AS user_id,operation_key,COUNT(*)::int AS count FROM literature_captcha_requests GROUP BY user_id,operation_key ORDER BY literature_captcha_requests.user_id',
     )
   ).rows
   assert.deepEqual(rows, [
-    { user_id: userId, operation_key: a.operationId, count: 2 },
-    { user_id: otherId, operation_key: b.operationId, count: 1 },
+    { user_id: String(userId), operation_key: a.operationId, count: 2 },
+    { user_id: String(otherId), operation_key: b.operationId, count: 1 },
   ])
   assert.deepEqual(await walletSnapshot(), before)
 })
