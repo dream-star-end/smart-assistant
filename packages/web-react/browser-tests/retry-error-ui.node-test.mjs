@@ -15,20 +15,22 @@ const { build } = require("esbuild");
 const { chromium } = require("playwright-core");
 const here = dirname(fileURLToPath(import.meta.url));
 const red = process.env.OC_RETRY_ERROR_UI_RED ?? "";
-assert.ok(["", "legacy", "history"].includes(red));
+assert.ok(["", "legacy", "history", "phase-a"].includes(red));
 let transforms = 0;
 async function until(label, check, timeout = 15000) {
   const end = Date.now() + timeout;
   while (Date.now() < end) { if (await check()) return; await new Promise((done) => setTimeout(done, 30)); }
   throw new Error(`${label}: timed out`);
 }
-function sourceRows(id, exhausted = false) {
+function historyMode(mode) { return mode === "cold" || mode === "phase-a"; }
+function sourceRows(id, exhausted = false, decisionPending = false) {
   return [
     { id, role: "user", text: "请完成核验任务", ts: 1, status: "error", _source: "server",
       _routing: { model: "box-api-claude-opus-5-5", teamMode: false, effortLevel: "high" } },
     { id: `thinking-${id}`, role: "thinking", text: "已完成第一步核验", ts: 2, _source: "server", _clientMessageId: id, _turnTapeId: `tape-${id}` },
     { id: `error-${id}`, role: "assistant", text: "", ts: 3, _source: "server", _clientMessageId: id,
       _turnTapeId: `tape-${id}`, _turnTapeComplete: true, _dispatchOutcome: "error", _errorCode: "engine_error",
+      _automaticRecoveryDecisionPending: decisionPending,
       ...(exhausted ? { _automaticRetryRootClientMessageId: id, _automaticRetryAttempt: 10, _automaticRetryMax: 10 } : {}) },
   ];
 }
@@ -45,13 +47,18 @@ test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: real App retries stay soft and on
     alias: { "node:crypto": join(here, "stubs/node-crypto.js") },
     define: { "process.env.NODE_ENV": '"production"', "import.meta.env": '{"MODE":"production","PROD":true,"DEV":false}' },
     plugins: red ? [{ name: "remove-one-real-retry-ui-fix", setup(b) {
-      b.onLoad({ filter: /\/lib\/chat\/socket\.ts$/ }, ({ path }) => {
+      b.onLoad({ filter: /\/lib\/chat\/(socket|automaticRecoverySnapshot)\.ts$/ }, ({ path }) => {
+        if ((red === "phase-a") !== path.endsWith("/automaticRecoverySnapshot.ts")) return;
         let contents = readFileSync(path, "utf8");
         const needle = red === "legacy"
           ? "    if (!masterOwned && !this.deps.syncSession) return false;"
-          : "    applyAutomaticRecoverySnapshot(s, msgs, archive?.automaticRecoveries, {";
+          : red === "history" ? "    applyAutomaticRecoverySnapshot(s, msgs, archive?.automaticRecoveries, {"
+          : "      if (!job && !decisionPending) {";
         assert.equal(contents.split(needle).length - 1, 1);
-        contents = contents.replace(needle, red === "legacy" ? "    if (!masterOwned) return false;" : "    applyAutomaticRecoverySnapshot(s, msgs, undefined, {");
+        const replacement = red === "legacy" ? "    if (!masterOwned) return false;"
+          : red === "history" ? "    applyAutomaticRecoverySnapshot(s, msgs, undefined, {"
+          : "      if (!job) {";
+        contents = contents.replace(needle, replacement);
         transforms += 1;
         return { contents, loader: "ts" };
       });
@@ -67,7 +74,7 @@ test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: real App retries stay soft and on
   preview.wss.on("connection", (ws) => {
     const peer = { id: BOARD_SESSION, kind: "dm" };
     const send = (frame) => ws.readyState === 1 && ws.send(JSON.stringify(frame));
-    const ready = () => send({ type: "sys.relay_ready", ...(scenario.mode === "cold" ? { automaticRecoveryOwner: "master-v1" } : {}) });
+    const ready = () => send({ type: "sys.relay_ready", ...(historyMode(scenario.mode) ? { automaticRecoveryOwner: "master-v1" } : {}) });
     ready();
     ws.on("message", (raw) => {
       const frame = JSON.parse(String(raw));
@@ -104,10 +111,10 @@ test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: real App retries stay soft and on
   let browser;
   try {
     browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ["--no-sandbox"] });
-    for (const width of [1280, 390]) for (const mode of ["success", "terminal", "cold"]) {
+    for (const width of [1280, 390]) for (const mode of ["success", "terminal", "cold", "phase-a"]) {
       await t.test(`${width} ${mode}`, async () => {
-        scenario = { mode, source: mode === "cold" ? "m-cold-proof-source" : null, sends: 0, seq: 0, active: true, hold: false, releaseReads: [] };
-        preview.store.board = mode === "cold" ? sourceRows(scenario.source) : [];
+        scenario = { mode, source: historyMode(mode) ? `m-${mode}-proof-source` : null, sends: 0, seq: 0, active: true, decisionPending: mode === "phase-a", hold: false, releaseReads: [] };
+        preview.store.board = historyMode(mode) ? sourceRows(scenario.source, false, scenario.decisionPending) : [];
         preview.store.older = []; preview.store.revision += 1; preview.store.detailDelayUntil = 0;
         const context = await browser.newContext({ viewport: { width, height: 950 }, isMobile: width === 390, hasTouch: width === 390 });
         const page = await context.newPage(); const pageErrors = [];
@@ -118,9 +125,9 @@ test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: real App retries stay soft and on
             const isDetail = new URL(route.request().url()).pathname === `/api/sessions/${BOARD_SESSION}`;
             if (isDetail && scenario.hold) await new Promise((done) => scenario.releaseReads.push(done));
             const response = await route.fetch();
-            if (scenario.mode !== "cold" || !isDetail) return await route.fulfill({ response });
+            if (!historyMode(scenario.mode) || !isDetail) return await route.fulfill({ response });
             const body = await response.json();
-            body.automaticRecoveries = scenario.active ? [{ sourceClientMessageId: scenario.source,
+            body.automaticRecoveries = scenario.active && !scenario.decisionPending ? [{ sourceClientMessageId: scenario.source,
               rootClientMessageId: scenario.source, clientMessageId: "m-cold-proof-child", errorCode: "engine_error", mode: "checkpoint", attempt: 1 }] : [];
             await route.fulfill({ response, json: body });
           } catch (error) { if (!closing) throw error; }
@@ -128,7 +135,7 @@ test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: real App retries stay soft and on
         const shot = (stage) => page.screenshot({ path: join(shots, `retry-error-${red || "green"}-${width}-${mode}-${stage}.png`), fullPage: true });
         try {
           await page.goto(preview.url);
-          if (mode !== "cold") {
+          if (!historyMode(mode)) {
             await page.getByPlaceholder(/对话/).fill("请完成核验任务");
             await page.getByRole("button", { name: "发送", exact: true }).click();
           }
@@ -141,10 +148,19 @@ test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: real App retries stay soft and on
           assert.equal(await page.getByText("发送失败", { exact: true }).count(), 0, "a recovering source is not a failed send");
           scenario.hold = false;
           for (const done of scenario.releaseReads.splice(0)) done();
-          if (mode === "cold") {
+          if (historyMode(mode)) {
             await page.reload();
             await page.getByText("模型繁忙，正在重试…", { exact: true }).waitFor();
             assert.equal(await page.getByText("任务执行失败", { exact: true }).count(), 0);
+            if (mode === "phase-a") {
+              scenario.decisionPending = false;
+              preview.store.board = sourceRows(scenario.source);
+              preview.store.revision += 1;
+              await page.reload();
+              await page.getByText("模型繁忙，正在重试…", { exact: true }).waitFor();
+              assert.equal(await page.getByText("任务执行失败", { exact: true }).count(), 0,
+                "phase B job adoption never flashes a terminal card");
+            }
             scenario.active = false;
             await page.reload();
           }

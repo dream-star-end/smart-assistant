@@ -7240,6 +7240,7 @@ function unifiedTimelineTapeFallbackMessages(
     _orderSeq: unit.orderSeq,
     _timelineRecord: true,
     _timelineUnitKey: `tape-fallback:${unit.tapeId}`,
+    _automaticRecoveryDecisionPending: unit.header?.finalizedAt === null,
     _displayDegraded: true,
     _displayDegradeReason: reason,
     _dispatchOutcome: unit.header?.status,
@@ -7416,6 +7417,7 @@ async function hydrateUnifiedTimelineTapeUnits(
       // Non-display terminal evidence for the owning finalized tape. Every
       // real record carries it so a latest page can converge a lost final WS
       // even when the tape contains only plan/goal/runtime-event roles.
+      _automaticRecoveryDecisionPending: header.finalizedAt === null,
       _dispatchOutcome: header.status,
       _turnKey: header.turnKey,
       ...(header.clientMessageId && typeof record._clientMessageId !== "string"

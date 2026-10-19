@@ -7257,6 +7257,30 @@ describe("ChatSocket deferred terminal error (master 自动恢复裁决,红卡�
     sock.stop(); reload.stop();
   });
 
+  test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: visible phase A is not a negative recovery decision", () => {
+    const sock = makeSocket({ syncSession: async () => {} });
+    const id = "s-phase-a-recovery";
+    const cmid = "m-phase-a-recovery";
+    const rows = [
+      { id: cmid, role: "user", text: "finish", ts: 1, status: "error", _source: "server" },
+      { id: "phase-a-error", role: "assistant", text: "", ts: 2, _source: "server",
+        _clientMessageId: cmid, _errorCode: "engine_error", _turnTapeId: "phase-a-tape",
+        _turnTapeComplete: true, _dispatchOutcome: "error", _automaticRecoveryDecisionPending: true },
+    ] as ChatMessage[];
+    sock.applyServerMessages(id, "main", structuredClone(rows), true, 2, { automaticRecoveries: [] });
+    const session = sock.sessions.get(id)!;
+    expect(errorCards(session)).toHaveLength(0);
+    expect(isRetryingTurnStatus(session._turnStatus)).toBe(true);
+    expect(session._sendingInFlight).toBe(true);
+    sock.applyServerMessages(id, "main", structuredClone(rows), true, 2, { automaticRecoveries: [] });
+    expect(errorCards(session)).toHaveLength(0);
+    const finalized = rows.map((row) => ({ ...row, _automaticRecoveryDecisionPending: false }));
+    sock.applyServerMessages(id, "main", finalized, true, 3, { automaticRecoveries: [] });
+    expect(errorCards(session)).toHaveLength(1);
+    expect(session._sendingInFlight).toBe(false);
+    sock.stop();
+  });
+
   test("INC-20261019-RECOVERABLE-ERROR-RED-CARD: explicit pre-run rejection is terminal without a recovery tape", () => {
     const { sock, ws, session, user } = deferredErrorFixture("s-pre-run-terminal", { masterOwns: false });
     ws.onmessage?.({ data: JSON.stringify({
