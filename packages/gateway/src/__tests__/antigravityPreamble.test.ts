@@ -15,6 +15,8 @@ describe('ANTIGRAVITY_PREAMBLE local CLI hints', () => {
   it('names oc_bash/oc_grep/oc_glob and does not invent an eager config key', () => {
     const text = ANTIGRAVITY_PREAMBLE
     assert.match(text, /oc_bash/)
+    assert.match(text, /170000/)
+    assert.equal(text.includes('180000'), false)
     assert.match(text, /oc_grep/)
     assert.match(text, /oc_glob/)
     assert.match(text, /call_mcp_tool/)

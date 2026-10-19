@@ -699,7 +699,7 @@ export const TOOLS = [
     name: 'oc_bash',
     description: [
       '在 MCP 进程里同步执行一条 shell 命令,返回 stdout、stderr 和 exit。',
-      '默认等待 60000ms,最短 1000ms,最长 180000ms。超时才算工具错误;非零退出码写在文本里,不是协议错误。',
+      '默认等待 60000ms,最短 1000ms,最长 170000ms。超时才算工具错误;非零退出码写在文本里,不是协议错误。',
       'Antigravity 原生 run_command 前台最多等 10000ms 就会转后台。需要跑完再继续时用本工具,不要用 run_command 的 WaitMsBeforeAsync。',
     ].join('\n'),
     inputSchema: {
@@ -710,8 +710,8 @@ export const TOOLS = [
         timeout_ms: {
           type: 'number',
           minimum: 1000,
-          maximum: 180000,
-          description: '等待毫秒数,默认 60000,范围 1000–180000',
+          maximum: 170000,
+          description: '等待毫秒数,默认 60000,范围 1000–170000',
         },
       },
       required: ['command'],

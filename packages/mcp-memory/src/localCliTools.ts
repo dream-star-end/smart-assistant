@@ -19,7 +19,8 @@ import { delimiter } from 'node:path'
 
 export const OC_BASH_DEFAULT_TIMEOUT_MS = 60_000
 export const OC_BASH_MIN_TIMEOUT_MS = 1_000
-export const OC_BASH_MAX_TIMEOUT_MS = 180_000
+/** Antigravity CLI 1.4.0 cancels an MCP tools/call at 180s. Stay under that so our timeout fires first and returns partial output. */
+export const OC_BASH_MAX_TIMEOUT_MS = 170_000
 export const OC_BASH_MAX_OUTPUT_BYTES = 200 * 1024
 export const OC_GREP_DEFAULT_MAX_MATCHES = 80
 export const OC_GREP_MAX_MATCHES = 200

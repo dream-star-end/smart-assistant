@@ -53,7 +53,7 @@ Those tools are lazy. Call them directly with \`call_mcp_tool\` (ServerName
 
 High-frequency tools (Arguments object):
 - \`oc_bash\`: \`{command, cwd?, timeout_ms?}\`. Default timeout 60000 ms, maximum
-  180000. Use this when a command may run longer than a few seconds. Do not use
+  170000. Use this when a command may run longer than a few seconds. Do not use
   native \`run_command\` \`WaitMsBeforeAsync\` for that: its foreground wait is
   hard-capped at 10000 ms, then the command is backgrounded and the turn stops.
 - \`oc_grep\`: \`{pattern, path?, glob?, max_matches?}\` searches file contents.

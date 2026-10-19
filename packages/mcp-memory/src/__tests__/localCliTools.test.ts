@@ -24,10 +24,11 @@ import {
 describe('clampInt', () => {
   it('falls back, floors, and clamps', () => {
     assert.equal(clampInt(undefined, 60_000, OC_BASH_MIN_TIMEOUT_MS, OC_BASH_MAX_TIMEOUT_MS), 60_000)
-    assert.equal(clampInt('nope', 60_000, 1_000, 180_000), 60_000)
-    assert.equal(clampInt(500, 60_000, 1_000, 180_000), 1_000)
-    assert.equal(clampInt(999_999, 60_000, 1_000, 180_000), 180_000)
-    assert.equal(clampInt(1500.9, 60_000, 1_000, 180_000), 1500)
+    assert.equal(clampInt('nope', 60_000, 1_000, 170_000), 60_000)
+    assert.equal(clampInt(500, 60_000, 1_000, 170_000), 1_000)
+    assert.equal(clampInt(999_999, 60_000, OC_BASH_MIN_TIMEOUT_MS, OC_BASH_MAX_TIMEOUT_MS), 170_000)
+    assert.equal(OC_BASH_MAX_TIMEOUT_MS, 170_000)
+    assert.equal(clampInt(1500.9, 60_000, 1_000, 170_000), 1500)
   })
 })
 
@@ -69,6 +70,19 @@ describe('oc_bash', () => {
     const result = await handleOcBash({ command: 'exit 7' })
     assert.equal(result.isError, undefined)
     assert.match(result.content[0]!.text, /exit=7/)
+  })
+
+  it('caps timeout_ms 999999 at 170000 and still returns a short command', async () => {
+    assert.equal(
+      clampInt(999_999, 60_000, OC_BASH_MIN_TIMEOUT_MS, OC_BASH_MAX_TIMEOUT_MS),
+      170_000,
+    )
+    const started = Date.now()
+    const result = await handleOcBash({ command: 'echo capped', timeout_ms: 999_999 })
+    assert.ok(Date.now() - started < 5_000, 'must not sleep the requested timeout')
+    assert.equal(result.isError, undefined)
+    assert.match(result.content[0]!.text, /exit=0/)
+    assert.match(result.content[0]!.text, /capped/)
   })
 
   it('kills a sleep that outlives the timeout', async () => {
