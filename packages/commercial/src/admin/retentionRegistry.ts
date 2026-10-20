@@ -58,6 +58,8 @@ export const BESPOKE_SWEEPER_TABLES: Readonly<Record<string, string>> = {
   // 批D D3 新增:session_goals 终态离场,由 auditRetentionSweeper tick 驱动
   // (sweepTerminalSessionGoals,见 auditRetention.ts)。
   session_goals: "auditRetentionSweeper.sweepTerminalSessionGoals (admin/auditRetention.ts)",
+  // OCV5-537(DAT-8):0066 声明却从未实现的 7 天清理,现由同一 tick 执行。
+  wechat_audit: "auditRetentionSweeper.sweepWechatAudit (admin/auditRetention.ts)",
   // tape-projected live frames are unreachable once tape records exist;
   // pruneProjectedLiveFrames is the dedicated DELETE path (not age-based TTL).
   client_session_live_frames: "pruneProjectedLiveFrames (db/liveTurnFrames.ts)",
@@ -70,6 +72,9 @@ export const BESPOKE_SWEEPER_TABLES: Readonly<Record<string, string>> = {
  * (来自全表调研;新增此类表须显式补进本清单,反向门才放行。)
  */
 export const DURABLE_TABLES: readonly string[] = [
+  // OCV5-537(DAT-8):用户对单条响应的 👍/👎(含可选评论),随用户删除级联;是质量反馈信号,
+  // 技能差评归因按 90 天窗口读取。体量小(个人版 331 行),不做时间 TTL。
+  "response_rating",
   "account_group_models",
   "account_groups",
   "admin_alert_channels",
@@ -267,26 +272,6 @@ export const DURABLE_TABLES: readonly string[] = [
 export const DEFERRED_TABLES: Readonly<
   Record<string, { owner: string; dueDate: string; note: string }>
 > = {
-  marketplace_skill_usage_events: {
-    owner: "marketplace/growth",
-    dueDate: "2026-09-30",
-    note: "技能使用埋点事件流,量随市场增长。TTL(如聚合后清)还是永久留作排名/推荐信号,待产品裁定。",
-  },
-  response_rating: {
-    owner: "product/quality",
-    dueDate: "2026-09-30",
-    note: "每条响应 👍/👎 评分。是否 TTL,还是永久留作模型训练信号,待裁定。",
-  },
-  // 批D D3 反向门首个命中的不一致:声明了 sweeper 却从未实现。
-  wechat_audit: {
-    owner: "wechat/im",
-    dueDate: "2026-09-30",
-    note:
-      "入站原始 payload 审计。0066 迁移与旧注释都声称『daemon 定期 DELETE WHERE received_at < NOW-7d』," +
-      "但全仓无任何 DELETE FROM wechat_audit —— 声明的 7d sweeper 从未实现(实际无界增长)。" +
-      "且 received_at 是 BIGINT epoch-ms(非 timestamptz),用不了通用 TTL 策略,需 bespoke epoch-ms 清理。" +
-      "7d 是否仍适用待 wechat 子系统确认后补真实 sweeper,再从 deferred 转 bespoke-sweeper。",
-  },
 };
 
 function buildRetentionRegistry(): Readonly<Record<string, RetentionDisposition>> {

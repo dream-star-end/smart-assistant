@@ -70,6 +70,9 @@ export const AUDIT_RETENTION_POLICIES: readonly RetentionPolicy[] = [
   // pool_events_at_idx serves the sweep).
   { table: "pool_events", column: "at", days: 30 },
   { table: "response_rating_nudges", column: "updated_at", days: 180 },
+  // OCV5-537(DAT-8):技能使用埋点。最长读窗 90 天(internalSkillFeedback FEEDBACK_WINDOW_DAYS),
+  // 排名/漏斗读 30 天;留 180 天 = 最长读窗 ×2。
+  { table: "marketplace_skill_usage_events", column: "created_at", days: 180 },
   { table: "telemetry_readiness_evidence", column: "created_at", days: 180 },
   { table: "memory_usage_events", column: "observed_at", days: 30 },
   { table: "image_generation_attempts", column: "started_at", days: 30, predicate: "outcome<>'pending'" },
@@ -213,6 +216,8 @@ export interface AuditRetentionSweeperOptions {
   purgeFn?: (p: RetentionPolicy) => Promise<number>;
   /** 测试用注入:覆盖 session_goals 终态清理(默认 = sweepTerminalSessionGoals)。 */
   sessionGoalsPurgeFn?: () => Promise<number>;
+  /** 测试用注入:覆盖 wechat_audit 7 天清理(默认 = sweepWechatAudit)。 */
+  wechatAuditPurgeFn?: () => Promise<number>;
 }
 
 function defaultOnError(table: string, err: unknown): void {
@@ -298,6 +303,31 @@ export async function sweepTerminalSessionGoals(
   return r.rowCount ?? 0;
 }
 
+/** wechat_audit 保留窗口(天)与单 tick 批量上限。 */
+export const WECHAT_AUDIT_SWEEP_DAYS = 7;
+export const WECHAT_AUDIT_SWEEP_BATCH = 5000;
+
+/**
+ * OCV5-537(DAT-8):wechat_audit 入站原始 payload 审计的 7 天离场。0066 迁移与旧注释一直声称
+ * "daemon 定期 DELETE WHERE received_at < NOW-7d",但从未实现(无界增长)。received_at 是
+ * BIGINT epoch-ms,用不了单列 timestamptz TTL,故按 session_goals 的做法挂在本 tick 内。
+ * 7 天之后 (account_id, message_id) 去重随之失效,与 0066 的原始设计一致。
+ */
+export async function sweepWechatAudit(
+  runQuery: (sql: string, params: unknown[]) => Promise<{ rowCount: number | null }>,
+  days = WECHAT_AUDIT_SWEEP_DAYS,
+  batch = WECHAT_AUDIT_SWEEP_BATCH,
+): Promise<number> {
+  const sql = `
+    DELETE FROM wechat_audit
+     WHERE ctid IN (
+       SELECT ctid FROM wechat_audit
+        WHERE received_at < (EXTRACT(EPOCH FROM NOW()) * 1000)::bigint - $1::bigint * 86400000
+        LIMIT $2)`;
+  const r = await runQuery(sql, [String(days), batch]);
+  return r.rowCount ?? 0;
+}
+
 export function startAuditRetentionSweeper(
   opts: AuditRetentionSweeperOptions = {},
 ): AuditRetentionSweeperHandle {
@@ -307,6 +337,8 @@ export function startAuditRetentionSweeper(
   const sessionGoalsPurgeFn =
     opts.sessionGoalsPurgeFn ??
     (() => sweepTerminalSessionGoals((sql, params) => query(sql, params)));
+  const wechatAuditPurgeFn =
+    opts.wechatAuditPurgeFn ?? (() => sweepWechatAudit((sql, params) => query(sql, params)));
   const policies = resolveRetentionPolicies(opts.overrides);
   let stopped = false;
   let inflight: Promise<Record<string, number>> | null = null;
@@ -329,6 +361,14 @@ export function startAuditRetentionSweeper(
       } catch (err) {
         onError("session_goals", err);
         deleted["session_goals"] = -1;
+      }
+    }
+    if (!stopped) {
+      try {
+        deleted.wechat_audit = await wechatAuditPurgeFn();
+      } catch (err) {
+        onError("wechat_audit", err);
+        deleted.wechat_audit = -1;
       }
     }
     const summary = Object.entries(deleted)
