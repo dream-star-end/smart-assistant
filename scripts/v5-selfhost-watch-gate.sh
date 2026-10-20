@@ -27,6 +27,7 @@ WATCH_GATE_TESTS=(
   v5-selfhost-train-recovery.test.sh
   v5-selfhost-watch-autorecover.test.sh
   v5-selfhost-autorecover.test.sh
+  v5-selfhost-env-drift.test.sh
 )
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

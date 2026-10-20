@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# OCV5-535(FINDINGS DEP-7)env 模板与漂移检查测试:
+#  ① 模板覆盖 deploy-v5-selfhost.sh 写入的每个键(bootstrap 模板、ensure_env_kv、运行四元组、provider 透传规则);
+#  ② 漂移检查的行为(MISSING 拒绝、UNDECLARED 告警、pattern 放行、从不打印值)。只写 mktemp 目录。
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$DIR/.." && pwd)"
+DEPLOY="$DIR/deploy-v5-selfhost.sh"
+TEMPLATE="${ENV_TEMPLATE:-$ROOT/deploy/v5-selfhost/commercial-v5-selfhost.env.template}"
+DRIFT="$DIR/v5-selfhost-env-drift.sh"
+pass=0
+fail=0
+ok() { pass=$((pass + 1)); echo "PASS $*"; }
+bad() { fail=$((fail + 1)); echo "FAIL $*"; }
+BASE="$(mktemp -d "${TMPDIR:-/tmp}/v5-selfhost-env-drift.XXXXXX")"
+trap 'rm -rf "$BASE"' EXIT
+
+declared="$(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$TEMPLATE" | sed 's/=$//' | sort -u)"
+required="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=.*#.*@required' "$TEMPLATE" | sed -E 's/=.*//' | sort -u)"
+deploy_managed="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=.*#.*@deploy' "$TEMPLATE" | sed -E 's/=.*//' | sort -u)"
+absent() { comm -23 <(printf '%s\n' "$1" | sed '/^$/d' | sort -u) <(printf '%s\n' "$2" | sort -u); }
+
+# T1 bootstrap 模板(write_env_file 的 heredoc)里的每个键
+boot="$(awk '/^write_env_file\(\) \{/{f=1} f && /cat >"\$tmp" <<EOF/{g=1; next} g && /^EOF$/{exit} g{print}' "$DEPLOY" \
+  | grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' | sed 's/=$//')"
+[[ "$(wc -l <<<"$boot")" -ge 30 ]] || bad "T1 未能从 write_env_file 读出 bootstrap 键(只读到 $(wc -l <<<"$boot") 个)"
+miss="$(absent "$boot" "$declared")"
+[[ -z "$miss" ]] && ok "T1 bootstrap 写入的键全部登记" || bad "T1 bootstrap 键未登记: $(tr '\n' ' ' <<<"$miss")"
+
+# T2 每次 --deploy 由 ensure_env_kv 写的键:登记且标 @required @deploy
+ens="$(grep -ohE 'ensure_env_kv "\$V5_ENV" [A-Za-z_][A-Za-z0-9_]*' "$DIR"/*.sh "$DIR"/lib/*.sh | awk '{print $3}' | sort -u)"
+[[ -n "$ens" ]] || bad "T2 未找到 ensure_env_kv 调用"
+miss="$(absent "$ens" "$(comm -12 <(printf '%s\n' "$required") <(printf '%s\n' "$deploy_managed"))")"
+[[ -z "$miss" ]] && ok "T2 ensure_env_kv 写的键全部 @required @deploy" || bad "T2 未按 @required @deploy 登记: $(tr '\n' ' ' <<<"$miss")"
+
+# T3 运行四元组
+# shellcheck disable=SC1091
+tuple="$(OC_HOTCFG_HISTORY=/nonexistent bash -c 'source "$1" >/dev/null 2>&1; printf "%s\n" "${OC_HOTCFG_TUPLE_KEYS[@]}"' _ "$DIR/v5-runtime-release-lib.sh")"
+miss="$(absent "$tuple" "$required")"
+[[ -n "$tuple" && -z "$miss" ]] && ok "T3 运行四元组 4 键 @required" || bad "T3 四元组未登记为 @required: $miss"
+
+# T4 provider 透传规则与 @allow-pattern 是同一份集合
+code_pat="$(awk '/^append_provider_keys\(\) \{/{f=1} f && /printf .%s\\n. "\$line"/{exit} f{print}' "$DEPLOY" \
+  | grep -E '^\s+[A-Z*_|]+\)$' | tail -1 | tr -d ' )' | tr '|' '\n' | sort -u)"
+tpl_pat="$(sed -nE 's/^#[[:space:]]*@allow-pattern[[:space:]]+//p' "$TEMPLATE" | tr ' ' '\n' | sed '/^$/d' | sort -u)"
+if [[ -n "$code_pat" && "$code_pat" == "$tpl_pat" ]]; then ok "T4 @allow-pattern 与 append_provider_keys 一致"
+else bad "T4 pattern 不一致: code=[$(tr '\n' ' ' <<<"$code_pat")] template=[$(tr '\n' ' ' <<<"$tpl_pat")]"; fi
+
+# T5 模板里 @secret 键永远不带值
+leaked="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=[^ #].*@secret' "$TEMPLATE" | sed -E 's/=.*//' || true)"
+[[ -z "$leaked" ]] && ok "T5 @secret 键在模板里均为空值" || bad "T5 模板里 @secret 键带了值: $leaked"
+
+# D* 漂移检查行为
+mkenv() { # 由模板生成一份完整的假现网 env,值换成哨兵
+  grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$TEMPLATE" | sed 's/$/SENTINEL-VALUE-must-not-print/' >"$1"
+}
+E="$BASE/env"
+mkenv "$E"
+out="$(bash "$DRIFT" --env "$E" --template "$TEMPLATE")" && [[ "$out" == "ENV_DRIFT missing=0 undeclared=0" ]] \
+  && ok "D1 完整 env 无漂移" || bad "D1: $out"
+grep -v '^DATABASE_URL=' "$E" >"$E.2"
+if out="$(bash "$DRIFT" --env "$E.2" --template "$TEMPLATE")"; then bad "D2 缺 @required 应退出 1"
+elif [[ "$out" == *"MISSING DATABASE_URL"* && "$out" == *"missing=1"* ]]; then ok "D2 缺 @required 键 → MISSING 并退出 1"
+else bad "D2: $out"; fi
+{ cat "$E"; echo 'OC_BRAND_NEW_FLAG=SENTINEL-VALUE-must-not-print'; echo 'GEMINI_API_KEY=SENTINEL-VALUE-must-not-print'; } >"$E.3"
+out="$(bash "$DRIFT" --env "$E.3" --template "$TEMPLATE")" && [[ "$out" == *"UNDECLARED OC_BRAND_NEW_FLAG"* \
+  && "$out" != *"GEMINI_API_KEY"* && "$out" == *"undeclared=1"* ]] \
+  && ok "D3 未登记键告警不拒绝;provider pattern 键放行" || bad "D3: $out"
+all="$(bash "$DRIFT" --env "$E.2" --template "$TEMPLATE" 2>&1; bash "$DRIFT" --env "$E.3" --template "$TEMPLATE" 2>&1)" || true
+[[ "$all" != *SENTINEL* ]] && ok "D4 输出从不包含 env 值" || bad "D4 输出泄露了值"
+if bash "$DRIFT" --env "$BASE/nope" --template "$TEMPLATE" >/dev/null 2>&1; then bad "D5 env 不可读应退出 2"
+else [[ $? == 2 ]] && ok "D5 env 不可读 → 退出 2" || bad "D5 退出码"; fi
+
+# W* 接线
+grep -qE 'v5-selfhost-env-drift\.sh' "$DEPLOY" && grep -qE '^  ensure_selfhost_env_keys$' "$DEPLOY" \
+  && awk '/^cmd_deploy\(\) \{/{f=1} f && /ensure_selfhost_env_keys/{e=NR} f && /assert_env_key_drift/{d=NR} f && /^}/{exit} END{exit !(e && d && d>e)}' "$DEPLOY" \
+  && ok "W1 --deploy 在补齐 @deploy 键之后跑漂移检查" || bad "W1 --deploy 未接漂移检查"
+
+echo "env drift tests: $pass passed, $fail failed"
+[[ "$fail" == 0 ]]

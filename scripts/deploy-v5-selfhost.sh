@@ -974,6 +974,21 @@ EOF
   log "  ✓ 已写入 $V5_ENV (mode 600;密钥未打印)"
 }
 
+# OCV5-535(FINDINGS DEP-7):env 键漂移。只比键名,不读出值。缺 @required 键拒绝发布(此前要到启动或
+# 运行期才暴露);未登记键只告警(新键先登记到 deploy/v5-selfhost/commercial-v5-selfhost.env.template)。
+assert_env_key_drift() {
+  local out rc=0
+  log "── env 键漂移检查(对照 deploy/v5-selfhost/commercial-v5-selfhost.env.template,只比键名)──"
+  out="$(bash "$SCRIPT_DIR/v5-selfhost-env-drift.sh" --env "$V5_ENV" \
+    --template "$REPO_ROOT/deploy/v5-selfhost/commercial-v5-selfhost.env.template" 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/  /'
+  case "$rc" in
+    0) ;;
+    1) die "env 缺少 @required 键(见上方 MISSING 行)。补救: 按模板补齐后再发布;不要绕过本检查。" ;;
+    *) die "env 漂移检查无法运行(rc=$rc)。fail-closed。" ;;
+  esac
+}
+
 ensure_home_config() {
   local json="$V5_HOME/openclaude.json" token
   log "── HOME $V5_HOME / openclaude.json ──"
@@ -2166,6 +2181,8 @@ cmd_status() {
   log "  gate-fail:   policy=$(gate_fail_policy 2>/dev/null) survivor-phase=$(sed -n 's/^phase=//p' "${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" 2>/dev/null | head -n1 || true) maint=$(sed -n 's/^until=//p' "$V5_WATCH_MAINT" 2>/dev/null | head -n1 || true)"
   if [[ -f "$V5_ENV" ]]; then
     log "  OC_SESSIONS_STORE=$(oc_hotcfg_env_get "$V5_ENV" OC_SESSIONS_STORE)"
+    log "  env keys:    $(bash "$SCRIPT_DIR/v5-selfhost-env-drift.sh" --env "$V5_ENV" --quiet \
+      --template "$REPO_ROOT/deploy/v5-selfhost/commercial-v5-selfhost.env.template" 2>&1 | tail -n1 || true)"
   fi
   log "  personal:     $(status_unit_state "$PERSONAL_UNIT" n/a)"
   if docker network inspect openclaude-v5-net >/dev/null 2>&1; then
@@ -2288,6 +2305,7 @@ $dirty
   cutover_adopt_inflight_request "$sha" || exit "$?"
   [[ -f "$V5_ENV" ]] || die "缺 $V5_ENV,这不是更新路径。补救: 首次安装走 --bootstrap;本机已有实例则检查 env 是否被挪走。"
   ensure_selfhost_env_keys
+  assert_env_key_drift
   docker network inspect openclaude-v5-net >/dev/null 2>&1 \
     || die "openclaude-v5-net 不存在。补救: 不要在 --deploy 里建网;确认 bootstrap 做过或手工恢复该网。"
   [[ -L "$MASTER_LIVE_LINK" ]] \
