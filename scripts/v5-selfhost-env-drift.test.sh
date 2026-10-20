@@ -8,6 +8,7 @@ export LC_ALL=C
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$DIR/.." && pwd)"
 DEPLOY="$DIR/deploy-v5-selfhost.sh"
+ENVLIB="$DIR/lib/v5-selfhost-env.sh"
 TEMPLATE="${ENV_TEMPLATE:-$ROOT/deploy/v5-selfhost/commercial-v5-selfhost.env.template}"
 DRIFT="$DIR/v5-selfhost-env-drift.sh"
 pass=0
@@ -23,7 +24,7 @@ deploy_managed="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=.*#.*@deploy' "$TEMPLATE" | s
 absent() { comm -23 <(printf '%s\n' "$1" | sed '/^$/d' | sort -u) <(printf '%s\n' "$2" | sort -u); }
 
 # T1 bootstrap 模板(write_env_file 的 heredoc)里的每个键
-boot="$(awk '/^write_env_file\(\) \{/{f=1} f && /cat >"\$tmp" <<EOF/{g=1; next} g && /^EOF$/{exit} g{print}' "$DEPLOY" \
+boot="$(awk '/^write_env_file\(\) \{/{f=1} f && /cat >"\$tmp" <<EOF/{g=1; next} g && /^EOF$/{exit} g{print}' "$ENVLIB" \
   | grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' | sed 's/=$//')"
 [[ "$(wc -l <<<"$boot")" -ge 30 ]] || bad "T1 未能从 write_env_file 读出 bootstrap 键(只读到 $(wc -l <<<"$boot") 个)"
 miss="$(absent "$boot" "$declared")"
@@ -48,7 +49,7 @@ miss="$(absent "$tuple" "$deploy_managed")"; extra="$(comm -12 <(printf '%s\n' "
 [[ -n "$tuple" && -z "$miss" && -z "$extra" ]] && ok "T3 运行四元组 4 键 @deploy 且不 @required(切流时才写)" || bad "T3 四元组登记不对: 缺=[$miss] 多余 required=[$extra]"
 
 # T4 provider 透传规则与 @allow-pattern 是同一份集合
-code_pat="$(awk '/^append_provider_keys\(\) \{/{f=1} f && /printf .%s\\n. "\$line"/{exit} f{print}' "$DEPLOY" \
+code_pat="$(awk '/^append_provider_keys\(\) \{/{f=1} f && /printf .%s\\n. "\$line"/{exit} f{print}' "$ENVLIB" \
   | grep -E '^\s+[A-Z*_|]+\)$' | tail -1 | tr -d ' )' | tr '|' '\n' | sort -u)"
 tpl_pat="$(sed -nE 's/^#[[:space:]]*@allow-pattern[[:space:]]+//p' "$TEMPLATE" | tr ' ' '\n' | sed '/^$/d' | sort -u)"
 if [[ -n "$code_pat" && "$code_pat" == "$tpl_pat" ]]; then ok "T4 @allow-pattern 与 append_provider_keys 一致"

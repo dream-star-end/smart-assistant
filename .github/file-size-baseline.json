@@ -19,7 +19,7 @@
     "packages/web/public/modules/main.js": 3733,
     "packages/web/public/modules/messages.js": 3663,
     "packages/web/public/modules/websocket.js": 4841,
-    "scripts/deploy-v5-selfhost.sh": 3153,
+    "scripts/deploy-v5-selfhost.sh": 3079,
     "scripts/deploy-v5.sh": 11929,
     "scripts/generate-v5-tutorial-media.ts": 3313
   }
