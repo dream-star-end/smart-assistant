@@ -35,9 +35,9 @@ describe("deferred retention decisions expire (DAT-8)", () => {
       sweeper: "auditRetentionSweeper.sweepWechatAudit (admin/auditRetention.ts)",
     });
     assert.deepEqual(RETENTION_REGISTRY.response_rating, { kind: "durable" });
-    assert.deepEqual(RETENTION_REGISTRY.marketplace_skill_usage_events, { kind: "ttl" });
-    const p = AUDIT_RETENTION_POLICIES.find((x) => x.table === "marketplace_skill_usage_events");
-    assert.ok(p && p.column === "created_at" && p.days >= 180, "TTL at least 2x the 90-day reader window");
+    // Marketplace rating aggregates join usage events to ratings over the full history, so no TTL.
+    assert.deepEqual(RETENTION_REGISTRY.marketplace_skill_usage_events, { kind: "durable" });
+    assert.equal(AUDIT_RETENTION_POLICIES.some((x) => x.table === "marketplace_skill_usage_events"), false);
   });
 });
 

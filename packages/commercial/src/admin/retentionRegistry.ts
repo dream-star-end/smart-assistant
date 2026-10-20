@@ -75,6 +75,10 @@ export const DURABLE_TABLES: readonly string[] = [
   // OCV5-537(DAT-8):用户对单条响应的 👍/👎(含可选评论),随用户删除级联;是质量反馈信号,
   // 技能差评归因按 90 天窗口读取。体量小(个人版 331 行),不做时间 TTL。
   "response_rating",
+  // OCV5-537(DAT-8):技能使用埋点。上架评分聚合按 trace_id 关联 response_rating 读**全部历史**
+  // (marketplace/marketplaceDb.ts 的 catalog 与 detail 两处 rt 聚合),时间 TTL 会让已展示的评分
+  // 消失;因此不做 TTL。要控体量,先把评分归因落成聚合表再谈清理(Phase 3)。个人版 2.4k 行。
+  "marketplace_skill_usage_events",
   "account_group_models",
   "account_groups",
   "admin_alert_channels",
