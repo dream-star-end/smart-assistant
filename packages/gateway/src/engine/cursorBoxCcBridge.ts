@@ -288,6 +288,7 @@ class BoxSession {
   private exitCode = 1
   private sawExit = false
   private stopRequested = false
+  private failedWriteCleanup: Promise<void> | undefined
   private readonly signals = new BoxLoginSignalTap()
   private readonly abort = new AbortController()
   /** Set once the session gave up before READY: later lines go back to the bridge. */
@@ -344,10 +345,12 @@ class BoxSession {
       // The interactive host would otherwise keep its tmux session until this
       // chat's next launch reaps it; end it now (best effort, as stop()).
       const stopper = new AbortController()
-      setTimeout(() => stopper.abort(), STOP_EXEC_TIMEOUT_MS).unref?.()
-      void postExec(this.control, boxCcStopExec(this.control), this.o.fetchImpl, stopper.signal)
-        .then((response) => response.arrayBuffer())
+      const timer = setTimeout(() => stopper.abort(), STOP_EXEC_TIMEOUT_MS)
+      timer.unref?.()
+      this.failedWriteCleanup = postExec(this.control, boxCcStopExec(this.control), this.o.fetchImpl, stopper.signal)
+        .then(async (response) => { await response.arrayBuffer() })
         .catch(() => undefined)
+        .finally(() => clearTimeout(timer))
       this.abort.abort()
     }
   }
@@ -504,6 +507,7 @@ class BoxSession {
       }
     } finally {
       this.abort.abort()
+      if (this.failedWriteCleanup) await this.failedWriteCleanup
     }
     if (!this.readySeen && !this.sawStdout && !this.stopRequested && !this.o.abort.signal.aborted) {
       // The host never got a line, so nothing ran.
