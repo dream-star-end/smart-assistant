@@ -475,6 +475,40 @@ describe('exact turn waiver + targeted inbox (integ)', () => {
     assert.deepEqual(net.rows, [{ total: '0', receipts: '1' }])
   })
 
+  test('OCV5-529: settlement after a waiver reports the settled zero, also on the idempotent replay', async (t) => {
+    if (skipIfNoPg(t)) return
+    const { userId } = await createUsers(1_000n)
+    const turnKey = 'c'.repeat(64)
+    await applyTurnWaiver(getPool(), { userId, turnKey, reason: 'idle_timeout' })
+    const args = {
+      userId,
+      accountId: null,
+      requestId: 'waived-after-epoch-bump',
+      model: 'test',
+      usage: { input_tokens: 10, output_tokens: 5, cache_read_tokens: 0, cache_write_tokens: 0 },
+      snapshotJson: '{}',
+      costCredits: 4n,
+      status: 'success' as const,
+      sessionId: 'ccb-529',
+      turnKey,
+    }
+    const first = await settleUsageAndLedger(getPool(), args)
+    // the journal finalizer records settledCostCredits; it must be the waived 0, not the 4 passed in
+    assert.equal(first.settledCostCredits, 0n)
+    assert.equal(first.ledgerId, null)
+    const replay = await settleUsageAndLedger(getPool(), args)
+    assert.equal(replay.commitDisposition, 'existing')
+    assert.equal(replay.settledCostCredits, 0n)
+    const usage = await query<{ cost_credits: string }>(
+      'SELECT cost_credits::text AS cost_credits FROM usage_records WHERE user_id=$1 AND request_id=$2',
+      [userId.toString(), args.requestId],
+    )
+    assert.deepEqual(usage.rows, [{ cost_credits: '0' }])
+
+    const charged = await settleUsageAndLedger(getPool(), { ...args, requestId: 'not-waived', turnKey: 'd'.repeat(64) })
+    assert.equal(charged.settledCostCredits, 4n)
+  })
+
   test('one automatic-recovery lineage shares one receipt and later positive refund updates it', async (t) => {
     if (skipIfNoPg(t)) return
     const { userId } = await createUsers(1_000n)

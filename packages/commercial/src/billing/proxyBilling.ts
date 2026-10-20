@@ -548,10 +548,13 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
       return runAbort(obs, err, "BILLING_FAILED", settlementClaimId ?? undefined);
     }
 
+    // OCV5-529: a turn waiver applied while this request was in flight zeroes the
+    // charge inside the settle transaction; record what was actually settled.
+    const settledCredits = settled.settledCostCredits ?? effectiveCredits;
     try {
       await finalizeInflightJournal(deps.pgPool, {
         requestId: ctx.requestId,
-        finalCredits: effectiveCredits,
+        finalCredits: settledCredits,
         ledgerId: settled.ledgerId,
         usageId: settled.usageId,
         settlementClaimId,
@@ -564,22 +567,25 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
       // usage row by request_id and completes this journal CAS later.
     }
     ctx.log.info("proxy_finalize_committed", {
-      finalCredits: effectiveCredits.toString(),
+      finalCredits: settledCredits.toString(),
       kind: obs.kind,
       usage: usageToLog(usage),
       clamped: settled.clamped,
       ...(waivedNoOutput ? { waived: "no_output", wouldHaveCharged: cost_credits.toString() } : {}),
+      ...(settledCredits < effectiveCredits
+        ? { waived: "settle_waiver", wouldHaveCharged: effectiveCredits.toString() }
+        : {}),
     });
     // 2I-2: billing_debit 三态语义重新对齐(Codex 审核结论):
     //   * success      = obs.kind='final' + cost>0 + 余额 >= cost (足额扣款)
     //   * insufficient = obs.kind='final' + cost>0 + 余额 < cost (debit 被夹到 0,欠费)
     //   * (不计数)    = obs.kind='partial' (status='billing_failed' 路径不走 ledger debit,settle 计 partial)
     //   * error        = settle 写库失败 (catch 块)
-    if (status === "success" && effectiveCredits > 0n) {
+    if (status === "success" && settledCredits > 0n) {
       incrBillingDebit(settled.clamped ? "insufficient" : "success");
     }
     return {
-      finalCredits: effectiveCredits,
+      finalCredits: settledCredits,
       debitedCredits: settled.debitedCredits,
       attributionCredits: settled.attributionCredits,
       state: "committed",
@@ -720,6 +726,13 @@ export interface SettleResult {
    *   - commit_proven: COMMIT itself errored, independent read proved the row
    */
   commitDisposition?: "new_commit" | "existing" | "commit_proven";
+  /**
+   * OCV5-529: the cost_credits actually written to usage_records. A turn waiver or
+   * verification sponsorship found inside the settle transaction makes this 0 even
+   * when the caller passed costCredits > 0; the journal and logs must record this
+   * value, not the pre-settle amount. Optional so historical test doubles stay valid.
+   */
+  settledCostCredits?: bigint;
 }
 
 /** COMMIT returned an error and independent reads could not yet prove whether
@@ -943,6 +956,7 @@ export async function settleUsageAndLedger(
           // 同上:余额可能被别的并发请求改过,无法还原当时的 balance_after。
           balanceAfter: null,
           commitDisposition: "existing",
+          settledCostCredits: settled.costCredits,
         };
       }
       throw err;
@@ -1015,6 +1029,7 @@ export async function settleUsageAndLedger(
       attributionCredits,
       balanceAfter,
       commitDisposition: "new_commit",
+      settledCostCredits,
     };
   } catch (err) {
     try {
@@ -1039,6 +1054,7 @@ export async function settleUsageAndLedger(
               attributionCredits: settled.attributionCredits,
               balanceAfter: null,
               commitDisposition: "commit_proven",
+              settledCostCredits: settled.costCredits,
             };
           }
         } catch {
