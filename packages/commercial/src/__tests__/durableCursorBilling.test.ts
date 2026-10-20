@@ -121,7 +121,7 @@ function makeFakePool(opts: FakePoolOptions = {}): FakePoolControl {
         const row = committedUsage.get(usageKey(params?.[0], params?.[1]));
         if (!row) return { rows: [], rowCount: 0 };
         return {
-          rows: [{ id: row.id, ledger_id: null, attribution_credits: null }],
+          rows: [{ id: row.id, ledger_id: null, attribution_credits: null, cost_credits: "0" }],
           rowCount: 1,
         };
       }

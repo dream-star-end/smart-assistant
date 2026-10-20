@@ -337,6 +337,7 @@ function makeFakePool(opts: { userBalance?: bigint; periodCredits?: bigint | nul
             id: "100",
             ledger_id: "200",
             attribution_credits: attributionCredits.get(requestId) ?? null,
+            cost_credits: attributionCredits.get(requestId) ?? "0",
           }],
           rowCount: 1,
         };
