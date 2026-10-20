@@ -669,6 +669,7 @@ build_master_release() {
     die "archive 后缺 deploy/v5/release-metadata.json"
   }
 
+  tsum_mark B 2>/dev/null || :
   t0="$(date +%s)"
   donor="$(find_master_release_donor "$staging/package-lock.json" || true)"
   if [[ -n "$donor" && -d "$donor/node_modules" ]]; then
@@ -702,6 +703,7 @@ build_master_release() {
     die "无法创建发布门私有 TMPDIR(${MASTER_GATE_TMP_PREFIX}.$$.*)"
   fi
   mlog "  发布门 TMPDIR=$MASTER_GATE_TMPDIR(tsx 缓存只属于本次构建,门跑完即删)"
+  tsum_mark C.box-success-recovery 2>/dev/null || :
   mlog "  Box success recovery behavioral gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
   if [[ ! -f "$staging/scripts/check-v5-box-success-recovery.ts" ]]; then
     cleanup_master_staging
@@ -714,6 +716,7 @@ build_master_release() {
     cleanup_master_staging
     die "pinned Box success recovery behavioral gate 失败"
   fi
+  tsum_mark C.box-continuation 2>/dev/null || :
   mlog "  Box multitool continuation gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
   if [[ ! -f "$staging/scripts/check-v5-box-continuation.ts" ]]; then
     cleanup_master_staging
@@ -724,6 +727,7 @@ build_master_release() {
     cleanup_master_staging
     die "pinned Box multitool continuation gate 失败"
   fi
+  tsum_mark C.box-incident-proofs 2>/dev/null || :
   mlog "  Box incident proofs gate (OCV5-488) @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
   if [[ ! -f "$staging/scripts/check-v5-box-incident-proofs.ts" ]]; then
     cleanup_master_staging
@@ -736,31 +740,37 @@ build_master_release() {
     cleanup_master_staging
     die "pinned Box incident proofs gate (OCV5-488) 失败"
   fi
+  tsum_mark C.cursor-sand 2>/dev/null || :
   mlog "  Cursor Sand InferenceService contract gate @ pinned staging"
   if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts ); then
     cleanup_master_staging
     die "pinned Cursor Sand InferenceService contract gate 失败"
   fi
+  tsum_mark C.ccb-mcp 2>/dev/null || :
   mlog "  CCB MCP availability contract gate @ pinned staging"
   if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-ccb-mcp-availability.ts ); then
     cleanup_master_staging
     die "pinned CCB MCP availability contract gate 失败"
   fi
+  tsum_mark C.delegate-billing 2>/dev/null || :
   mlog "  delegate engine billing requestId contract gate @ pinned staging"
   if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-delegate-billing-requestid.ts ); then
     cleanup_master_staging
     die "pinned delegate engine billing requestId contract gate 失败"
   fi
+  tsum_mark C.callback-ws 2>/dev/null || :
   mlog "  callback payload hash WS proof @ pinned staging"
   if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" node scripts/check-v5-callback-payload-hash.mjs ); then
     cleanup_master_staging
     die "pinned callback payload hash WS proof 失败"
   fi
+  tsum_mark C.cron-submit 2>/dev/null || :
   mlog "  cron submit durability + execution-heartbeat proof @ pinned staging"
   if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-cron-submit-boundary.ts ); then
     cleanup_master_staging
     die "pinned cron submit durability boundary gate 失败"
   fi
+  tsum_mark C.session-rootfix 2>/dev/null || :
   mlog "  session unavailable / data-safety rootfix contract gate @ pinned staging"
   if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-session-unavailable-rootfix.ts ); then
     cleanup_master_staging
@@ -771,6 +781,7 @@ build_master_release() {
   # OCV5-418:门禁失败 stay 路径(survivor kept-failed / 维护窗口 / 列车 failed / 告警)同样先在 staging 跑。
   # OCV5-420:中途退出 / 补偿失败的列车终态(recovery_required、不结算搭车)同样先在 staging 跑。
   # OCV5-420 二期:autorecover(不等人,自动恢复/重跑/升级派 AI)与 watch.sh --auto-recover 同样先在 staging 跑。
+  tsum_mark C.watch-gate 2>/dev/null || :
   mlog "  selfhost watch selftest + disarm-observe / lock / rearm / gate-fail-stay behavior @ pinned staging"
   # OCV5-447:清单只在 scripts/v5-selfhost-watch-gate.sh 一处,PR CI(v5-selfhost-gates.yml)跑同一份。
   if [[ ! -f "$staging/scripts/v5-selfhost-watch-gate.sh" ]]; then
@@ -784,6 +795,7 @@ build_master_release() {
   fi
   cleanup_master_gate_tmpdir
 
+  tsum_mark D 2>/dev/null || :
   t0="$(date +%s)"
   web_key="$(master_web_dist_key "$full_sha" || true)"
   web_donor=""
@@ -826,6 +838,7 @@ build_master_release() {
     die "写 $WEB_DIST_REUSE_RECORD 失败"
   fi
 
+  tsum_mark P.mcp-bundle 2>/dev/null || :
   # openclaude-memory MCP server 预编译 CJS(dist/ 被 gitignore,git archive 不带产物,
   # 必须在 staging 构建;缺产物则引擎回落 tsx ~7s 冷启动路径,故 fail-loud)。
   if [[ -f "$staging/packages/mcp-memory/scripts/build-oc-memory-mcp.sh" ]]; then
@@ -840,6 +853,7 @@ build_master_release() {
     }
   fi
 
+  tsum_mark P.seal 2>/dev/null || :
   # 构建期缓存不进 artifact。rm 只丢掉本树的目录项;硬链文件 nlink>1 时 donor 仍在。
   rm -rf -- \
     "$staging/node_modules/.vite" \

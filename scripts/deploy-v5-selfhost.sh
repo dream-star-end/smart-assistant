@@ -186,6 +186,8 @@ source "$MASTER_RELEASE_LIB"
 source "$SCRIPT_DIR/lib/v5-selfhost-env.sh"
 # shellcheck source=lib/v5-selfhost-rollback.sh
 source "$SCRIPT_DIR/lib/v5-selfhost-rollback.sh"
+# shellcheck source=lib/v5-selfhost-train-summary.sh
+source "$SCRIPT_DIR/lib/v5-selfhost-train-summary.sh"   # OCV5-539: <trainId>.summary.json, record only
 # P0-Web 前端热切换(OCV5-489):overlay 指针根 + 纯函数库 + --p0-web* 编排。
 WEB_OVERLAY_ROOT="${OC_V5_WEB_OVERLAY_ROOT:-/var/lib/openclaude-v5-selfhost/web-overlay}"
 # shellcheck source=scripts/v5-web-overlay-lib.sh
@@ -214,6 +216,7 @@ own_instance_present() {
 
 cleanup_selfhost_deploy() {
   local exit_rc=$?
+  tsum_finish "$exit_rc" 2>/dev/null || :
   # Owner loss forbids successor state/holder writes from this invocation.
   [[ "$exit_rc" == 86 ]] && return 86
   if release_policy_enabled && ! release_policy_require_owner; then
@@ -1860,6 +1863,7 @@ user_contract_gate() { # <candidate release>
   local password_file=/etc/openclaude/selfhost-canary.password
   [[ -f "$password_file" && -r "$password_file" && -s "$password_file" ]] \
     || { echo "FATAL: user contract canary password missing/unreadable/empty: $password_file" >&2; return 1; }
+  tsum_mark F.prewarm 2>/dev/null || :
   # OCV5-429: the cutover may recycle the canary container onto the new runtime tuple (or it was
   # idle-swept); its cold start outlasts C2's 20s window. Warm it first (same UI login, no message,
   # wait for relay_ready). Not part of the verdict: a prewarm that never gets ready only warns.
@@ -1868,10 +1872,12 @@ user_contract_gate() { # <candidate release>
     V5_CANARY_PASSWORD_FILE="$password_file" \
     node "$SCRIPT_DIR/v5-user-contract-prewarm.mjs" \
     || echo "  ⚠ canary 预热未就绪,门禁照跑(由 C1–C3 判定)" >&2
+  tsum_mark F.C1-C3 2>/dev/null || :
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
     V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
     V5_CANARY_PASSWORD_FILE="$password_file" V5_CONTRACT_COST=live \
     node "$SCRIPT_DIR/v5-user-contract-smoke.mjs" || return 1
+  tsum_mark F.G1 2>/dev/null || :
   # OCV5-432: a real multi-turn OpenCode Go chat must read the upstream prompt cache
   # (INC-20261015-GO-CACHE-PREFIX wrote the whole prompt every request and read 0).
   if [[ -n "$rel" ]] && go_cache_user_waiver_matches "$rel"; then
@@ -1882,6 +1888,7 @@ user_contract_gate() { # <candidate release>
       V5_CANARY_PASSWORD_FILE="$password_file" \
       node "$SCRIPT_DIR/v5-go-cache-contract.mjs" || return 1
   fi
+  tsum_mark F.S1 2>/dev/null || :
   # OCV5-435: a Stop sent while the turn's engine is still starting must stop that turn
   # (INC-20261015-PRESTART-STOP-LOST answered it TURN_NOT_ACTIVE and the turn ran unseen).
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
@@ -2103,6 +2110,7 @@ cmd_deploy() {
     log "✓ same-operation policy recovery verified; no serving pointer changed"
     return 0
   fi
+  tsum_init 2>/dev/null || :
   log "══ v5 selfhost --deploy(不可变 master + 容器制品 + joint 翻转) ══"
   log "流程: 构建 master release(staging vite) → runtime-release → platform bundle"
   log "      → 复用 --cutover 同一套状态机翻转(survivor / 两级回滚 / 候选 snapshot unit)"
@@ -2158,7 +2166,9 @@ $dirty
     [[ -f "$BUILT_MASTER_RELEASE/.complete" ]] || die "缺 .complete: $BUILT_MASTER_RELEASE"
     log "  ✓ master release=$BUILT_MASTER_RELEASE donor 优先 live,不吃工作树/.poisoned"
   fi
+  tsum_mark P.runtime-wait 2>/dev/null || :
   collect_runtime_release_bg "$sha"
+  tsum_mark P.platform-bundle 2>/dev/null || :
   build_platform_bundle "$sha"
   CUTOVER_TUPLE_BUNDLE="$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"
   DEPLOY_BUILT_RELEASE="$BUILT_MASTER_RELEASE"
@@ -2377,6 +2387,7 @@ cutover_rollback_inplace() { # <failed-rel> <backup-dir>
 
 cutover_compensate() { # <reason>
   local reason="$1" policy_rc=0
+  tsum_mark X.compensate 2>/dev/null || :
   if release_policy_enabled; then
     release_policy_failure "$reason" || policy_rc=$?
     case "$policy_rc" in
@@ -2801,6 +2812,7 @@ cmd_cutover() {
   fi
   CUTOVER_REL="$rel"
   cutover_clog "STEP $step 候选 release=$rel"
+  tsum_mark E1 2>/dev/null || :
   cutover_clog "  跑静态门 + digest 复算 + tsx 自检(只读,dry-run 也跑)"
   assert_master_release_static_gate "$rel" "$head"
   assert_master_release_tsx_selfcheck "$rel"
@@ -2824,6 +2836,7 @@ cmd_cutover() {
   fi
 
   step=3
+  tsum_mark E2 2>/dev/null || :
   if [[ "${CUTOVER_ROLLBACK:-0}" == 1 ]]; then
     cutover_clog "STEP $step 回退 schema 门(只读;回退不跑迁移、不回滚 schema)"
     rollback_schema_gate "$rel" "$(readlink -f -- "$MASTER_LIVE_LINK")" \
@@ -2852,6 +2865,7 @@ cmd_cutover() {
     prev_val="none"
   fi
 
+  tsum_mark E3.prep 2>/dev/null || :
   if release_policy_enabled && [[ "$DRY" != 1 ]]; then
     [[ "${CUTOVER_JOINT:-0}" == 1 && "$prev_val" != none ]] || return 2
     release_policy_install_guards "$rel" "$prev_val" || return $?
@@ -2879,6 +2893,7 @@ cmd_cutover() {
       || die "写 .prev-release 失败。尚未覆盖 unit。"
     cutover_clog "  .prev-release=$prev_val"
   fi
+  tsum_mark E3.wait-idle 2>/dev/null || :
   cutover_wait_for_user_idle || return 1
   # 第一次覆盖 installed unit 之前:明确 phase/mutated,并武装 survivor。
   if [[ "$DRY" != 1 ]]; then
@@ -2893,6 +2908,7 @@ cmd_cutover() {
   fi
 
   step=5
+  tsum_mark E3.units 2>/dev/null || :
   cutover_clog "STEP $step 从候选 snapshot 装 live unit + daemon-reload"
   if [[ "$DRY" == 1 ]]; then
     cutover_clog "  [dry-run] install $unit_snap/$V5_UNIT → /etc/systemd/system/$V5_UNIT"
@@ -2952,6 +2968,7 @@ cmd_cutover() {
       cutover_clog "  [dry-run] 对着 $rel 跑 migration runner(失败则不翻转,不回滚 schema)"
     else
       release_policy_guard_owner || return 86
+      tsum_mark E2.apply 2>/dev/null || :
       if ! run_migrations_from_release "$rel"; then
         cutover_compensate "migration-apply"
         return $?
@@ -2961,6 +2978,7 @@ cmd_cutover() {
   fi
 
   step=7
+  tsum_mark E4 2>/dev/null || :
   cutover_clog "STEP $step 原子挂 live symlink $MASTER_LIVE_LINK → $rel"
   if [[ "$DRY" == 1 ]]; then
     cutover_clog "  [dry-run] ln -s $rel ${MASTER_LIVE_LINK}.newlink.\$\$ && mv -T ${MASTER_LIVE_LINK}.newlink.\$\$ $MASTER_LIVE_LINK"
@@ -3036,6 +3054,7 @@ cmd_cutover() {
   fi
 
   step=10
+  tsum_mark G 2>/dev/null || :
   cutover_clog "STEP $step 失败则走统一补偿(本步仅在失败路径执行)"
   if [[ "$DRY" == 1 ]]; then
     cutover_clog "  [dry-run] 覆盖 unit 前: 武装独立 systemd-run survivor + 先落盘 phase=mutated"
