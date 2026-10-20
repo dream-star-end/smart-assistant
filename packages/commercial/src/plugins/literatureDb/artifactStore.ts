@@ -80,6 +80,14 @@ export function sanitizeLiteraturePdfFilename(raw: string): string {
   return `${truncated}.pdf`
 }
 
+function normalizePdfNames(text: string): string {
+  return text.replace(/\/[^\s()<>\[\]{}/%]+/g, (nameToken) =>
+    nameToken.replace(/#([0-9A-Fa-f]{2})/g, (_, hex: string) =>
+      String.fromCharCode(Number.parseInt(hex, 16)),
+    ),
+  )
+}
+
 function rc4Transform(key: Buffer, input: Buffer): Buffer {
   const s = new Uint8Array(256)
   for (let i = 0; i < 256; i++) s[i] = i
@@ -215,9 +223,11 @@ function parseTrailerFirstId(text: string): Buffer | null {
  * without prompting for a user password.
  */
 export function isPermittedEmptyPasswordEncryptDict(
-  encryptDict: string,
+  rawEncryptDict: string,
   fileId: Buffer | null,
 ): boolean {
+  const encryptDict = normalizePdfNames(rawEncryptDict)
+  if (!/\/Filter\s*\/Standard(?![A-Za-z])/.test(encryptDict)) return false
   if (/\/Filter\s*\/(?!Standard(?![A-Za-z]))[A-Za-z0-9_.+-]+/.test(encryptDict)) return false
   if (/\/SubFilter\s*\//.test(encryptDict)) return false
   const vMatch = /\/V\s+(\d+)\b/.exec(encryptDict)
@@ -289,14 +299,6 @@ export function isPermittedEmptyPasswordEncryptDict(
   return false
 }
 
-/**
- * Fast synchronous structural check before isolated worker metadata check:
- * - Must start with %PDF-1.x or %PDF-2.x and not contain HTML/script tags in header
- * - Must have valid %%EOF and xref table or /Type /XRef stream (tolerating small WebVPN metadata byte drift)
- * - Must have a valid /Catalog -> /Pages -> /Page tree
- * - Rejects dangerous actions/payloads (/JS, /JavaScript, /Launch, /EmbeddedFiles, etc.)
- * - Rejects password-protected /Encrypt PDFs, while allowing Standard empty-user-password permission-only PDFs
- */
 export function validatePdfStructureSync(data: Buffer): boolean {
   if (!Buffer.isBuffer(data) || data.length < 64 || data.length > LITERATURE_ARTIFACT_MAX_BYTES)
     return false
@@ -400,14 +402,84 @@ export function validatePdfStructureSync(data: Buffer): boolean {
       if (endstreamIdx < 0) return null
       const realEndobj = findPdfKeyword('endobj', endstreamIdx + 9)
       if (realEndobj < 0) return null
-      return { num, gen, body: dictBody }
+      return { num, gen, body: normalizePdfNames(dictBody) }
     }
-    return { num, gen, body: preEndobj }
+    return { num, gen, body: normalizePdfNames(preEndobj) }
   }
 
   const objMap = new Map<string, string>()
+  const scannedObjMap = new Map<string, string>()
+  const scannedDicts: string[] = []
   const trailerTexts: string[] = []
   let rootObjKey: string | null = null
+
+  // Scan all top-level obj..endobj dictionaries and /ObjStm streams across the file
+  // so unreferenced or hybrid-xref objects cannot hide dangerous actions or /Encrypt
+  const allObjRe = /\b(\d+)\s+(\d+)\s+obj\b([\s\S]*?)\bendobj\b/g
+  let om: RegExpExecArray | null
+  while ((om = allObjRe.exec(fullStr)) !== null) {
+    const id = Number.parseInt(om[1]!, 10)
+    const gen = Number.parseInt(om[2]!, 10)
+    const fullBody = om[3]!
+    const streamMatch = /(?:^|[^A-Za-z0-9_/])(stream[\r\n])/.exec(fullBody)
+    const dictOnly = normalizePdfNames(
+      streamMatch?.[1]
+        ? fullBody.slice(0, streamMatch.index + streamMatch[0].length - streamMatch[1].length)
+        : fullBody,
+    )
+    scannedDicts.push(dictOnly)
+    if (!scannedObjMap.has(`${id}:${gen}`)) {
+      scannedObjMap.set(`${id}:${gen}`, dictOnly)
+    }
+    if (/\/Type\s*\/ObjStm(?![A-Za-z])/.test(dictOnly)) {
+      const nMatch = /\/N\s+(\d+)\b/.exec(dictOnly)
+      const firstMatch = /\/First\s+(\d+)\b/.exec(dictOnly)
+      const streamIdx = fullBody.indexOf('stream')
+      const endstreamIdx = fullBody.lastIndexOf('endstream')
+      if (!nMatch?.[1] || !firstMatch?.[1] || streamIdx < 0 || endstreamIdx <= streamIdx) {
+        return false
+      }
+      const n = Number.parseInt(nMatch[1], 10)
+      const first = Number.parseInt(firstMatch[1], 10)
+      let rawPos = om.index + om[0].indexOf('stream') + 6
+      if (data[rawPos] === 13 && data[rawPos + 1] === 10) rawPos += 2
+      else if (data[rawPos] === 10 || data[rawPos] === 13) rawPos += 1
+      let rawEnd = om.index + om[0].lastIndexOf('endstream')
+      while (rawEnd > rawPos && (data[rawEnd - 1] === 10 || data[rawEnd - 1] === 13)) {
+        rawEnd--
+      }
+      if (rawEnd <= rawPos) return false
+      try {
+        const inflated = zlib.inflateSync(data.subarray(rawPos, rawEnd), {
+          maxOutputLength: 8 * 1024 * 1024,
+        })
+        const headerStr = inflated.subarray(0, first).toString('latin1').trim()
+        const pairs = headerStr.split(/\s+/)
+        const offsets: Array<{ id: number; rel: number }> = []
+        for (let p = 0; p + 1 < pairs.length && offsets.length < n; p += 2) {
+          offsets.push({
+            id: Number.parseInt(pairs[p]!, 10),
+            rel: Number.parseInt(pairs[p + 1]!, 10),
+          })
+        }
+        for (let j = 0; j < offsets.length; j++) {
+          const startByte = first + offsets[j]!.rel
+          const endByte =
+            j + 1 < offsets.length ? first + offsets[j + 1]!.rel : inflated.length
+          if (startByte >= first && endByte >= startByte && endByte <= inflated.length) {
+            const innerDict = normalizePdfNames(
+              inflated.subarray(startByte, endByte).toString('latin1'),
+            )
+            scannedDicts.push(innerDict)
+            scannedObjMap.set(`${offsets[j]!.id}:0`, innerDict)
+          }
+        }
+      } catch {
+        // Un-inflatable /ObjStm (e.g. encrypted object stream hiding dictionaries) is rejected
+        return false
+      }
+    }
+  }
 
   const xrefSearchStart = Math.max(0, startXrefOffset - 64)
   const xrefSearchWindow = fullStr.slice(xrefSearchStart, Math.min(data.length, startXrefOffset + 128))
@@ -432,8 +504,9 @@ export function validatePdfStructureSync(data: Buffer): boolean {
       const trailerIdx = xrefText.search(/\btrailer(?:\s|<<)/)
       if (trailerIdx < 0) return false
       const tablePart = xrefText.slice(0, trailerIdx).trim()
-      const trailerPart = xrefText.slice(trailerIdx)
+      const trailerPart = normalizePdfNames(xrefText.slice(trailerIdx))
       trailerTexts.push(trailerPart)
+      if (/\/XRefStm\b/.test(trailerPart)) return false
 
       if (!/^xref(?:\s|$)/.test(tablePart)) return false
       const afterXref = tablePart.replace(/^xref\s*/, '')
@@ -464,6 +537,7 @@ export function validatePdfStructureSync(data: Buffer): boolean {
               const parsed = extractObjAtOffset(off, objId, gen)
               if (!parsed) return false
               objMap.set(objKey, parsed.body)
+              scannedDicts.push(parsed.body)
             }
             entriesParsed++
           }
@@ -482,106 +556,47 @@ export function validatePdfStructureSync(data: Buffer): boolean {
       curXrefOff = prevMatch?.[1] ? Number.parseInt(prevMatch[1], 10) : null
     }
   } else {
+    for (const [k, v] of scannedObjMap) objMap.set(k, v)
     const xrefObj = extractObjAtOffset(startXrefOffset)
     if (!xrefObj || !/\/Type\s*\/XRef(?![A-Za-z])/.test(xrefObj.body)) return false
     trailerTexts.push(xrefObj.body)
+    const normalizedTail = normalizePdfNames(tail)
     const rm =
-      /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(xrefObj.body) ?? /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(tail)
+      /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(xrefObj.body) ??
+      /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(normalizedTail)
     if (!rm?.[1] || !rm[2]) return false
     rootObjKey = `${Number.parseInt(rm[1], 10)}:${Number.parseInt(rm[2], 10)}`
-
-    const objRe = /\b(\d+)\s+(\d+)\s+obj\b([\s\S]*?)\bendobj\b/g
-    let m: RegExpExecArray | null
-    while ((m = objRe.exec(fullStr)) !== null) {
-      const id = Number.parseInt(m[1]!, 10)
-      const gen = Number.parseInt(m[2]!, 10)
-      const fullBody = m[3]!
-      const streamMatch = /(?:^|[^A-Za-z0-9_/])(stream[\r\n])/.exec(fullBody)
-      const dictOnly = streamMatch?.[1]
-        ? fullBody.slice(0, streamMatch.index + streamMatch[0].length - streamMatch[1].length)
-        : fullBody
-      objMap.set(`${id}:${gen}`, dictOnly)
-      if (/\/Type\s*\/ObjStm(?![A-Za-z])/.test(dictOnly)) {
-        const nMatch = /\/N\s+(\d+)\b/.exec(dictOnly)
-        const firstMatch = /\/First\s+(\d+)\b/.exec(dictOnly)
-        const streamIdx = fullBody.indexOf('stream')
-        const endstreamIdx = fullBody.lastIndexOf('endstream')
-        if (nMatch?.[1] && firstMatch?.[1] && streamIdx >= 0 && endstreamIdx > streamIdx) {
-          const n = Number.parseInt(nMatch[1], 10)
-          const first = Number.parseInt(firstMatch[1], 10)
-          let rawPos = m.index + m[0].indexOf('stream') + 6
-          if (data[rawPos] === 13 && data[rawPos + 1] === 10) rawPos += 2
-          else if (data[rawPos] === 10 || data[rawPos] === 13) rawPos += 1
-          let rawEnd = m.index + m[0].lastIndexOf('endstream')
-          while (rawEnd > rawPos && (data[rawEnd - 1] === 10 || data[rawEnd - 1] === 13)) {
-            rawEnd--
-          }
-          if (rawEnd > rawPos) {
-            try {
-              const inflated = zlib.inflateSync(data.subarray(rawPos, rawEnd), {
-                maxOutputLength: 8 * 1024 * 1024,
-              })
-              const headerStr = inflated.subarray(0, first).toString('latin1').trim()
-              const pairs = headerStr.split(/\s+/)
-              const offsets: Array<{ id: number; rel: number }> = []
-              for (let p = 0; p + 1 < pairs.length && offsets.length < n; p += 2) {
-                offsets.push({
-                  id: Number.parseInt(pairs[p]!, 10),
-                  rel: Number.parseInt(pairs[p + 1]!, 10),
-                })
-              }
-              for (let j = 0; j < offsets.length; j++) {
-                const startByte = first + offsets[j]!.rel
-                const endByte =
-                  j + 1 < offsets.length ? first + offsets[j + 1]!.rel : inflated.length
-                if (startByte >= first && endByte >= startByte && endByte <= inflated.length) {
-                  objMap.set(
-                    `${offsets[j]!.id}:0`,
-                    inflated.subarray(startByte, endByte).toString('latin1'),
-                  )
-                }
-              }
-            } catch {
-              // ignore individual compressed stream failure
-            }
-          }
-        }
-      }
-    }
   }
 
   for (const tText of trailerTexts) {
     if (DANGEROUS_PDF_TOKEN_RE.test(tText)) return false
   }
-  for (const objBody of objMap.values()) {
-    if (DANGEROUS_PDF_TOKEN_RE.test(objBody)) return false
+  for (const dictText of scannedDicts) {
+    if (DANGEROUS_PDF_TOKEN_RE.test(dictText)) return false
   }
 
   const combinedTrailers = trailerTexts.join('\n')
   const hasEncryptToken =
     /\/Encrypt(?![A-Za-z])/.test(combinedTrailers) ||
-    Array.from(objMap.values()).some((b) => /\/Encrypt(?![A-Za-z])/.test(b))
+    scannedDicts.some((b) => /\/Encrypt(?![A-Za-z])/.test(b))
 
   if (hasEncryptToken) {
-    let encryptDictBody: string | null = null
-    const encRefMatch = /\/Encrypt\s+(\d+)\s+(\d+)\s+R\b/.exec(combinedTrailers)
-    if (encRefMatch?.[1] && encRefMatch[2]) {
-      const encKey = `${Number.parseInt(encRefMatch[1], 10)}:${Number.parseInt(encRefMatch[2], 10)}`
-      encryptDictBody = objMap.get(encKey) ?? null
-      if (!encryptDictBody) {
-        const directRe = new RegExp(
-          `\\b${Number.parseInt(encRefMatch[1], 10)}\\s+${Number.parseInt(encRefMatch[2], 10)}\\s+obj\\b([\\s\\S]*?)\\bendobj\\b`,
-        )
-        const dm = directRe.exec(fullStr)
-        if (dm?.[1]) encryptDictBody = dm[1]
-      }
-    } else {
-      const inlineEncMatch = /\/Encrypt\s*<<([\s\S]*?)>>/.exec(combinedTrailers)
-      if (inlineEncMatch?.[1]) encryptDictBody = inlineEncMatch[1]
-    }
-    if (!encryptDictBody) return false
+    const encRefs = Array.from(combinedTrailers.matchAll(/\/Encrypt\s+(\d+)\s+(\d+)\s+R\b/g))
+    const inlineEncs = Array.from(combinedTrailers.matchAll(/\/Encrypt\s*<<([\s\S]*?)>>/g))
+    if (encRefs.length === 0 && inlineEncs.length === 0) return false
     const fileId = parseTrailerFirstId(combinedTrailers) ?? parseTrailerFirstId(tail)
-    if (!isPermittedEmptyPasswordEncryptDict(encryptDictBody, fileId)) return false
+    for (const ref of encRefs) {
+      const encKey = `${Number.parseInt(ref[1]!, 10)}:${Number.parseInt(ref[2]!, 10)}`
+      const encryptDictBody = objMap.get(encKey) ?? null
+      if (!encryptDictBody || !isPermittedEmptyPasswordEncryptDict(encryptDictBody, fileId)) {
+        return false
+      }
+    }
+    for (const inl of inlineEncs) {
+      if (!inl[1] || !isPermittedEmptyPasswordEncryptDict(inl[1], fileId)) {
+        return false
+      }
+    }
   }
 
   if (rootObjKey === null || !objMap.has(rootObjKey)) return false
@@ -629,7 +644,7 @@ export function validatePdfStructureSync(data: Buffer): boolean {
   return pageCount > 0
 }
 
-const WORKER_SCRIPT = "\nconst { parentPort, workerData } = require('node:worker_threads');\nconst crypto = require('node:crypto');\nconst zlib = require('node:zlib');\nconst LITERATURE_ARTIFACT_MAX_BYTES = 26214400;\nconst PDF_ENCRYPT_PAD = Buffer.from([\n  0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,\n  0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80, 0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a,\n]);\nconst DANGEROUS_PDF_TOKEN_RE =\n  /\\/(?:JS|JavaScript|Launch|EmbeddedFiles|RichMedia|SubmitForm|ImportData|GoToE|GoToR)(?![A-Za-z])/;\n\nfunction rc4Transform(key, input) {\n  const s = new Uint8Array(256);\n  for (let i = 0; i < 256; i++) s[i] = i;\n  let j = 0;\n  for (let i = 0; i < 256; i++) {\n    j = (j + s[i] + key[i % key.length]) & 0xff;\n    const tmp = s[i];\n    s[i] = s[j];\n    s[j] = tmp;\n  }\n  const out = Buffer.allocUnsafe(input.length);\n  let i = 0;\n  j = 0;\n  for (let k = 0; k < input.length; k++) {\n    i = (i + 1) & 0xff;\n    j = (j + s[i]) & 0xff;\n    const tmp = s[i];\n    s[i] = s[j];\n    s[j] = tmp;\n    out[k] = input[k] ^ s[(s[i] + s[j]) & 0xff];\n  }\n  return out;\n}\n\nfunction decodePdfLiteralBytes(strContent) {\n  const out = [];\n  let i = 0;\n  while (i < strContent.length) {\n    const ch = strContent.charCodeAt(i);\n    if (ch === 92) {\n      i++;\n      if (i >= strContent.length) break;\n      const esc = strContent.charCodeAt(i);\n      if (esc === 110) { out.push(10); i++; }\n      else if (esc === 114) { out.push(13); i++; }\n      else if (esc === 116) { out.push(9); i++; }\n      else if (esc === 98) { out.push(8); i++; }\n      else if (esc === 102) { out.push(12); i++; }\n      else if (esc === 40 || esc === 41 || esc === 92) { out.push(esc); i++; }\n      else if (esc === 13) {\n        i++;\n        if (i < strContent.length && strContent.charCodeAt(i) === 10) i++;\n      } else if (esc === 10) {\n        i++;\n      } else if (esc >= 48 && esc <= 55) {\n        let oct = strContent[i];\n        i++;\n        for (let k = 0; k < 2 && i < strContent.length; k++) {\n          const c2 = strContent.charCodeAt(i);\n          if (c2 >= 48 && c2 <= 55) { oct += strContent[i]; i++; }\n          else break;\n        }\n        out.push(Number.parseInt(oct, 8) & 0xff);\n      } else {\n        out.push(esc & 0xff);\n        i++;\n      }\n    } else {\n      out.push(ch & 0xff);\n      i++;\n    }\n  }\n  return Buffer.from(out);\n}\n\nfunction parsePdfStringField(dictBody, key) {\n  const keyRe = new RegExp('\\\\/' + key + '(?![A-Za-z0-9_])\\\\s*');\n  const m = keyRe.exec(dictBody);\n  if (!m) return null;\n  const pos = m.index + m[0].length;\n  if (pos >= dictBody.length) return null;\n  if (dictBody[pos] === '<' && dictBody[pos + 1] !== '<') {\n    const end = dictBody.indexOf('>', pos + 1);\n    if (end < 0) return null;\n    let hex = dictBody.slice(pos + 1, end).replace(/\\s+/g, '');\n    if (hex.length % 2 === 1) hex += '0';\n    if (!/^[0-9a-fA-F]*$/.test(hex)) return null;\n    return Buffer.from(hex, 'hex');\n  }\n  if (dictBody[pos] === '(') {\n    let depth = 1;\n    let i = pos + 1;\n    while (i < dictBody.length && depth > 0) {\n      const ch = dictBody.charCodeAt(i);\n      if (ch === 92) { i += 2; continue; }\n      if (ch === 40) depth++;\n      else if (ch === 41) depth--;\n      i++;\n    }\n    if (depth !== 0) return null;\n    return decodePdfLiteralBytes(dictBody.slice(pos + 1, i - 1));\n  }\n  return null;\n}\n\nfunction parseTrailerFirstId(text) {\n  const m = /\\/ID\\s*\\[\\s*(<([0-9a-fA-F\\s]*)>|\\(((?:\\\\.|[^\\\\)])*)\\))/.exec(text);\n  if (!m) return null;\n  if (m[2] !== undefined) {\n    let hex = m[2].replace(/\\s+/g, '');\n    if (hex.length % 2 === 1) hex += '0';\n    return Buffer.from(hex, 'hex');\n  }\n  if (m[3] !== undefined) {\n    return decodePdfLiteralBytes(m[3]);\n  }\n  return null;\n}\n\nfunction isPermittedEmptyPasswordEncryptDict(encryptDict, fileId) {\n  if (/\\/Filter\\s*\\/(?!Standard(?![A-Za-z]))[A-Za-z0-9_.+-]+/.test(encryptDict)) return false;\n  if (/\\/SubFilter\\s*\\//.test(encryptDict)) return false;\n  const vMatch = /\\/V\\s+(\\d+)\\b/.exec(encryptDict);\n  const rMatch = /\\/R\\s+(\\d+)\\b/.exec(encryptDict);\n  const pMatch = /\\/P\\s+(-?\\d+)\\b/.exec(encryptDict);\n  if (!rMatch || !rMatch[1] || !pMatch || !pMatch[1]) return false;\n  const v = vMatch && vMatch[1] ? Number.parseInt(vMatch[1], 10) : 1;\n  const r = Number.parseInt(rMatch[1], 10);\n  const pSigned = Number.parseInt(pMatch[1], 10);\n  if (!Number.isSafeInteger(pSigned)) return false;\n\n  const oVal = parsePdfStringField(encryptDict, 'O');\n  const uVal = parsePdfStringField(encryptDict, 'U');\n  if (!oVal || !uVal) return false;\n\n  if (r === 2 || r === 3 || r === 4) {\n    if (v !== 1 && v !== 2 && v !== 4) return false;\n    if (oVal.length < 32 || uVal.length < 32) return false;\n    const lenMatch = /\\/Length\\s+(\\d+)\\b/.exec(encryptDict);\n    let keyByteLen = 5;\n    if (r >= 3) {\n      const bitLen = lenMatch && lenMatch[1] ? Number.parseInt(lenMatch[1], 10) : 128;\n      if (bitLen < 40 || bitLen > 128 || bitLen % 8 !== 0) return false;\n      keyByteLen = bitLen / 8;\n    }\n    const pBuf = Buffer.allocUnsafe(4);\n    pBuf.writeInt32LE(pSigned | 0, 0);\n\n    const md5 = crypto.createHash('md5');\n    md5.update(PDF_ENCRYPT_PAD);\n    md5.update(oVal.subarray(0, 32));\n    md5.update(pBuf);\n    if (fileId && fileId.length > 0) md5.update(fileId);\n    if (r >= 4 && /\\/EncryptMetadata\\s+false\\b/.test(encryptDict)) {\n      md5.update(Buffer.from([0xff, 0xff, 0xff, 0xff]));\n    }\n    let digest = md5.digest();\n    if (r >= 3) {\n      for (let i = 0; i < 50; i++) {\n        digest = crypto.createHash('md5').update(digest.subarray(0, keyByteLen)).digest();\n      }\n    }\n    const encKey = digest.subarray(0, keyByteLen);\n    if (r === 2) {\n      const expectedU = rc4Transform(encKey, PDF_ENCRYPT_PAD);\n      return expectedU.equals(uVal.subarray(0, 32));\n    }\n    if (!fileId || fileId.length === 0) return false;\n    const stepHash = crypto.createHash('md5').update(PDF_ENCRYPT_PAD).update(fileId).digest();\n    let cur = rc4Transform(encKey, stepHash);\n    const xorKey = Buffer.allocUnsafe(encKey.length);\n    for (let i = 1; i <= 19; i++) {\n      for (let j = 0; j < encKey.length; j++) xorKey[j] = encKey[j] ^ i;\n      cur = rc4Transform(xorKey, cur);\n    }\n    return cur.equals(uVal.subarray(0, 16));\n  }\n\n  if (r === 5 && v === 5) {\n    if (uVal.length < 48) return false;\n    const expectedU = crypto.createHash('sha256').update(uVal.subarray(32, 40)).digest();\n    return expectedU.equals(uVal.subarray(0, 32));\n  }\n  return false;\n}\n\nfunction check(data) {\n  if (!Buffer.isBuffer(data) || data.length < 64 || data.length > LITERATURE_ARTIFACT_MAX_BYTES) return false;\n  const head = data.subarray(0, Math.min(data.length, 1024)).toString('latin1');\n  if (!/^%PDF-[12]\\.\\d[\\r\\n]/.test(head)) return false;\n  if (/<(?:!doctype|html|head|body|script|iframe)\\b/i.test(head)) return false;\n\n  const fullStr = data.toString('latin1');\n  const tailLen = Math.min(data.length, 65536);\n  const tail = data.subarray(data.length - tailLen).toString('latin1');\n  const startxrefMatches = Array.from(tail.matchAll(/\\bstartxref[\\r\\n\\s]+(\\d+)[\\r\\n\\s]+%%EOF/g));\n  if (startxrefMatches.length === 0) return false;\n  const lastMatch = startxrefMatches[startxrefMatches.length - 1];\n  const startXrefOffset = Number.parseInt(lastMatch[1], 10);\n  if (!Number.isSafeInteger(startXrefOffset) || startXrefOffset <= 8 || startXrefOffset >= data.length - 16) return false;\n\n  const findPdfKeyword = (kw, fromIdx) => {\n    let pos = fromIdx;\n    while (pos < fullStr.length) {\n      const idx = fullStr.indexOf(kw, pos);\n      if (idx < 0) return -1;\n      const prev = idx > 0 ? fullStr.charCodeAt(idx - 1) : 32;\n      const next = idx + kw.length < fullStr.length ? fullStr.charCodeAt(idx + kw.length) : 32;\n      const prevIsToken = prev === 47 || (prev >= 48 && prev <= 57) || (prev >= 65 && prev <= 90) || (prev >= 97 && prev <= 122) || prev === 95;\n      const nextIsToken = (next >= 48 && next <= 57) || (next >= 65 && next <= 90) || (next >= 97 && next <= 122) || next === 95;\n      if (!prevIsToken && !nextIsToken) return idx;\n      pos = idx + 1;\n    }\n    return -1;\n  };\n\n  const extractObjAtOffset = (offset, expectedNum, expectedGen) => {\n    if (offset <= 0 || offset >= data.length - 16) return null;\n    const winStart = Math.max(0, offset - 64);\n    const winEnd = Math.min(data.length, offset + 160);\n    const windowStr = fullStr.slice(winStart, winEnd);\n    let bodyStart = -1;\n    let num = expectedNum !== undefined ? expectedNum : -1;\n    let gen = expectedGen !== undefined ? expectedGen : -1;\n\n    if (expectedNum !== undefined && expectedGen !== undefined) {\n      const exactHead = fullStr.slice(offset, Math.min(data.length, offset + 96));\n      const exactMatch = /^[\\r\\n\\s]*(\\d+)\\s+(\\d+)\\s+obj\\b/.exec(exactHead);\n      if (exactMatch && Number.parseInt(exactMatch[1], 10) === expectedNum && Number.parseInt(exactMatch[2], 10) === expectedGen) {\n        bodyStart = offset + exactMatch[0].length;\n      } else {\n        const driftRe = new RegExp('(?:^|[^0-9])(' + expectedNum + ')\\\\s+(' + expectedGen + ')\\\\s+obj\\\\b');\n        const dm = driftRe.exec(windowStr);\n        if (!dm) return null;\n        bodyStart = winStart + dm.index + dm[0].length;\n      }\n    } else {\n      const exactHead = fullStr.slice(offset, Math.min(data.length, offset + 96));\n      const exactMatch = /^[\\r\\n\\s]*(\\d+)\\s+(\\d+)\\s+obj\\b/.exec(exactHead);\n      if (exactMatch) {\n        num = Number.parseInt(exactMatch[1], 10);\n        gen = Number.parseInt(exactMatch[2], 10);\n        bodyStart = offset + exactMatch[0].length;\n      } else {\n        const driftMatch = /(?:^|[\\r\\n\\s])(\\d+)\\s+(\\d+)\\s+obj\\b/.exec(windowStr);\n        if (!driftMatch) return null;\n        num = Number.parseInt(driftMatch[1], 10);\n        gen = Number.parseInt(driftMatch[2], 10);\n        bodyStart = winStart + driftMatch.index + driftMatch[0].length;\n      }\n    }\n\n    const firstEndobj = findPdfKeyword('endobj', bodyStart);\n    if (firstEndobj < 0) return null;\n    const preEndobj = fullStr.slice(bodyStart, firstEndobj);\n    const streamMatch = /(?:^|[^A-Za-z0-9_/])(stream[\\r\\n])/.exec(preEndobj);\n    if (streamMatch && streamMatch[1]) {\n      const streamRelIdx = streamMatch.index + streamMatch[0].length - streamMatch[1].length;\n      const dictBody = preEndobj.slice(0, streamRelIdx);\n      const endstreamIdx = findPdfKeyword('endstream', bodyStart + streamRelIdx + 6);\n      if (endstreamIdx < 0) return null;\n      const realEndobj = findPdfKeyword('endobj', endstreamIdx + 9);\n      if (realEndobj < 0) return null;\n      return { num, gen, body: dictBody };\n    }\n    return { num, gen, body: preEndobj };\n  };\n\n  const objMap = new Map();\n  const trailerTexts = [];\n  let rootObjKey = null;\n\n  const xrefSearchStart = Math.max(0, startXrefOffset - 64);\n  const xrefSearchWindow = fullStr.slice(xrefSearchStart, Math.min(data.length, startXrefOffset + 128));\n  const xrefKwMatch = /(?:^|[\\r\\n\\s])(xref)(?=[\\r\\n\\s])/.exec(xrefSearchWindow);\n\n  if (xrefKwMatch && xrefKwMatch[1]) {\n    const firstXrefOff = xrefSearchStart + xrefKwMatch.index + xrefKwMatch[0].length - xrefKwMatch[1].length;\n    const visitedXref = new Set();\n    let curXrefOff = firstXrefOff;\n    while (curXrefOff !== null && !visitedXref.has(curXrefOff) && visitedXref.size < 8) {\n      visitedXref.add(curXrefOff);\n      if (curXrefOff <= 0 || curXrefOff >= data.length - 16) return false;\n      const winStart = Math.max(0, curXrefOff - 64);\n      const winCheck = fullStr.slice(winStart, Math.min(data.length, curXrefOff + 128));\n      const xm = /(?:^|[\\r\\n\\s])(xref)(?=[\\r\\n\\s])/.exec(winCheck);\n      if (!xm || !xm[1]) return false;\n      const actualXrefOff = winStart + xm.index + xm[0].length - xm[1].length;\n      const xrefText = data.subarray(actualXrefOff, Math.min(data.length, actualXrefOff + 524288)).toString('latin1');\n      const trailerIdx = xrefText.search(/\\btrailer(?:\\s|<<)/);\n      if (trailerIdx < 0) return false;\n      const tablePart = xrefText.slice(0, trailerIdx).trim();\n      const trailerPart = xrefText.slice(trailerIdx);\n      trailerTexts.push(trailerPart);\n\n      if (!/^xref(?:\\s|$)/.test(tablePart)) return false;\n      const afterXref = tablePart.replace(/^xref\\s*/, '');\n      const lines = afterXref.split(/[\\r\\n]+/).map((l) => l.trim()).filter(Boolean);\n      let idx = 0;\n      let entriesParsed = 0;\n      while (idx < lines.length) {\n        const subMatch = /^(\\d+)\\s+(\\d+)$/.exec(lines[idx]);\n        if (!subMatch) return false;\n        const firstId = Number.parseInt(subMatch[1], 10);\n        const count = Number.parseInt(subMatch[2], 10);\n        idx++;\n        if (idx + count > lines.length) return false;\n        for (let k = 0; k < count; k++) {\n          const entryLine = lines[idx + k];\n          const em = /^(\\d{10})\\s+(\\d{5})\\s+([nf])$/.exec(entryLine);\n          if (!em) return false;\n          if (em[3] === 'n') {\n            const off = Number.parseInt(em[1], 10);\n            const gen = Number.parseInt(em[2], 10);\n            const objId = firstId + k;\n            if (objId === 0 || off === 0) continue;\n            const objKey = String(objId) + ':' + String(gen);\n            if (!objMap.has(objKey)) {\n              const parsed = extractObjAtOffset(off, objId, gen);\n              if (!parsed) return false;\n              objMap.set(objKey, parsed.body);\n            }\n            entriesParsed++;\n          }\n        }\n        idx += count;\n      }\n      if (entriesParsed === 0 && visitedXref.size === 1) return false;\n\n      if (rootObjKey === null) {\n        const rm = /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(trailerPart);\n        if (rm) rootObjKey = String(Number.parseInt(rm[1], 10)) + ':' + String(Number.parseInt(rm[2], 10));\n      }\n      const prevMatch = /\\/Prev\\s+(\\d+)\\b/.exec(trailerPart);\n      curXrefOff = prevMatch ? Number.parseInt(prevMatch[1], 10) : null;\n    }\n  } else {\n    const xrefObj = extractObjAtOffset(startXrefOffset);\n    if (!xrefObj || !/\\/Type\\s*\\/XRef(?![A-Za-z])/.test(xrefObj.body)) return false;\n    trailerTexts.push(xrefObj.body);\n    const rm = /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(xrefObj.body) || /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(tail);\n    if (!rm) return false;\n    rootObjKey = String(Number.parseInt(rm[1], 10)) + ':' + String(Number.parseInt(rm[2], 10));\n\n    const objRe = /\\b(\\d+)\\s+(\\d+)\\s+obj\\b([\\s\\S]*?)\\bendobj\\b/g;\n    let m;\n    while ((m = objRe.exec(fullStr)) !== null) {\n      const id = Number.parseInt(m[1], 10);\n      const gen = Number.parseInt(m[2], 10);\n      const fullBody = m[3];\n      const streamMatch = /(?:^|[^A-Za-z0-9_/])(stream[\\r\\n])/.exec(fullBody);\n      const dictOnly = streamMatch && streamMatch[1] ? fullBody.slice(0, streamMatch.index + streamMatch[0].length - streamMatch[1].length) : fullBody;\n      objMap.set(String(id) + ':' + String(gen), dictOnly);\n      if (/\\/Type\\s*\\/ObjStm(?![A-Za-z])/.test(dictOnly)) {\n        const nMatch = /\\/N\\s+(\\d+)\\b/.exec(dictOnly);\n        const firstMatch = /\\/First\\s+(\\d+)\\b/.exec(dictOnly);\n        const streamIdx = fullBody.indexOf('stream');\n        const endstreamIdx = fullBody.lastIndexOf('endstream');\n        if (nMatch && firstMatch && streamIdx >= 0 && endstreamIdx > streamIdx) {\n          const n = Number.parseInt(nMatch[1], 10);\n          const first = Number.parseInt(firstMatch[1], 10);\n          let rawPos = m.index + m[0].indexOf('stream') + 6;\n          if (data[rawPos] === 13 && data[rawPos + 1] === 10) rawPos += 2;\n          else if (data[rawPos] === 10 || data[rawPos] === 13) rawPos += 1;\n          let rawEnd = m.index + m[0].lastIndexOf('endstream');\n          while (rawEnd > rawPos && (data[rawEnd - 1] === 10 || data[rawEnd - 1] === 13)) rawEnd--;\n          if (rawEnd > rawPos) {\n            try {\n              const inflated = zlib.inflateSync(data.subarray(rawPos, rawEnd), { maxOutputLength: 8 * 1024 * 1024 });\n              const headerStr = inflated.subarray(0, first).toString('latin1').trim();\n              const pairs = headerStr.split(/\\s+/);\n              const offsets = [];\n              for (let p = 0; p + 1 < pairs.length && offsets.length < n; p += 2) {\n                offsets.push({ id: Number.parseInt(pairs[p], 10), rel: Number.parseInt(pairs[p + 1], 10) });\n              }\n              for (let j = 0; j < offsets.length; j++) {\n                const startByte = first + offsets[j].rel;\n                const endByte = j + 1 < offsets.length ? first + offsets[j + 1].rel : inflated.length;\n                if (startByte >= first && endByte >= startByte && endByte <= inflated.length) {\n                  objMap.set(String(offsets[j].id) + ':0', inflated.subarray(startByte, endByte).toString('latin1'));\n                }\n              }\n            } catch {}\n          }\n        }\n      }\n    }\n  }\n\n  for (const tText of trailerTexts) {\n    if (DANGEROUS_PDF_TOKEN_RE.test(tText)) return false;\n  }\n  for (const objBody of objMap.values()) {\n    if (DANGEROUS_PDF_TOKEN_RE.test(objBody)) return false;\n  }\n\n  const combinedTrailers = trailerTexts.join('\\n');\n  const hasEncryptToken =\n    /\\/Encrypt(?![A-Za-z])/.test(combinedTrailers) ||\n    Array.from(objMap.values()).some((b) => /\\/Encrypt(?![A-Za-z])/.test(b));\n\n  if (hasEncryptToken) {\n    let encryptDictBody = null;\n    const encRefMatch = /\\/Encrypt\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(combinedTrailers);\n    if (encRefMatch && encRefMatch[1] && encRefMatch[2]) {\n      const encKey = String(Number.parseInt(encRefMatch[1], 10)) + ':' + String(Number.parseInt(encRefMatch[2], 10));\n      encryptDictBody = objMap.get(encKey) || null;\n      if (!encryptDictBody) {\n        const directRe = new RegExp('\\\\b' + Number.parseInt(encRefMatch[1], 10) + '\\\\s+' + Number.parseInt(encRefMatch[2], 10) + '\\\\s+obj\\\\b([\\\\s\\\\S]*?)\\\\bendobj\\\\b');\n        const dm = directRe.exec(fullStr);\n        if (dm && dm[1]) encryptDictBody = dm[1];\n      }\n    } else {\n      const inlineEncMatch = /\\/Encrypt\\s*<<([\\s\\S]*?)>>/.exec(combinedTrailers);\n      if (inlineEncMatch && inlineEncMatch[1]) encryptDictBody = inlineEncMatch[1];\n    }\n    if (!encryptDictBody) return false;\n    const fileId = parseTrailerFirstId(combinedTrailers) || parseTrailerFirstId(tail);\n    if (!isPermittedEmptyPasswordEncryptDict(encryptDictBody, fileId)) return false;\n  }\n\n  if (rootObjKey === null || !objMap.has(rootObjKey)) return false;\n  const catalogBody = objMap.get(rootObjKey);\n  if (!/\\/Type\\s*\\/Catalog(?![A-Za-z])/.test(catalogBody)) return false;\n  const pagesRefMatch = /\\/Pages\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(catalogBody);\n  if (!pagesRefMatch) return false;\n  const rootPagesKey = String(Number.parseInt(pagesRefMatch[1], 10)) + ':' + String(Number.parseInt(pagesRefMatch[2], 10));\n\n  const visitedNodes = new Set();\n  const queue = [rootPagesKey];\n  let pageCount = 0;\n  while (queue.length > 0 && visitedNodes.size < 500) {\n    const curKey = queue.shift();\n    if (visitedNodes.has(curKey)) return false;\n    visitedNodes.add(curKey);\n    const nodeBody = objMap.get(curKey);\n    if (!nodeBody) return false;\n    if (/\\/Type\\s*\\/Pages(?![A-Za-z])/.test(nodeBody)) {\n      const countMatch = /\\/Count\\s+([1-9]\\d*)\\b/.exec(nodeBody);\n      if (!countMatch) return false;\n      let kidsSource = nodeBody;\n      const directKidsMatch = /\\/Kids\\s*\\[([\\s\\S]*?)\\]/.exec(nodeBody);\n      if (directKidsMatch && directKidsMatch[1] !== undefined) {\n        kidsSource = directKidsMatch[1];\n      } else {\n        const indirectKidsRef = /\\/Kids\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(nodeBody);\n        if (!indirectKidsRef) return false;\n        const kidsKey = String(Number.parseInt(indirectKidsRef[1], 10)) + ':' + String(Number.parseInt(indirectKidsRef[2], 10));\n        const kidsArrayBody = objMap.get(kidsKey);\n        if (!kidsArrayBody) return false;\n        kidsSource = kidsArrayBody;\n      }\n      const kidRefs = Array.from(kidsSource.matchAll(/(\\d+)\\s+(\\d+)\\s+R\\b/g));\n      if (kidRefs.length === 0) return false;\n      for (const kr of kidRefs) {\n        queue.push(String(Number.parseInt(kr[1], 10)) + ':' + String(Number.parseInt(kr[2], 10)));\n      }\n    } else if (/\\/Type\\s*\\/Page(?![A-Za-z])/.test(nodeBody)) {\n      pageCount++;\n    } else {\n      return false;\n    }\n  }\n  return pageCount > 0;\n}\nconst data = Buffer.from(workerData);\nparentPort.postMessage({ ok: check(data) });\n"
+const WORKER_SCRIPT = "\nconst { parentPort, workerData } = require('node:worker_threads');\nconst crypto = require('node:crypto');\nconst zlib = require('node:zlib');\nconst LITERATURE_ARTIFACT_MAX_BYTES = 26214400;\nconst PDF_ENCRYPT_PAD = Buffer.from([\n  0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,\n  0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80, 0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a,\n]);\nconst DANGEROUS_PDF_TOKEN_RE =\n  /\\/(?:JS|JavaScript|Launch|EmbeddedFiles|RichMedia|SubmitForm|ImportData|GoToE|GoToR)(?![A-Za-z])/;\n\nfunction normalizePdfNames(text) {\n  return text.replace(/\\/[^\\s()<>[\\]{}/%]+/g, (nameToken) =>\n    nameToken.replace(/#([0-9A-Fa-f]{2})/g, (_, hex) =>\n      String.fromCharCode(Number.parseInt(hex, 16)),\n    ),\n  );\n}\n\nfunction rc4Transform(key, input) {\n  const s = new Uint8Array(256);\n  for (let i = 0; i < 256; i++) s[i] = i;\n  let j = 0;\n  for (let i = 0; i < 256; i++) {\n    j = (j + s[i] + key[i % key.length]) & 0xff;\n    const tmp = s[i];\n    s[i] = s[j];\n    s[j] = tmp;\n  }\n  const out = Buffer.allocUnsafe(input.length);\n  let i = 0;\n  j = 0;\n  for (let k = 0; k < input.length; k++) {\n    i = (i + 1) & 0xff;\n    j = (j + s[i]) & 0xff;\n    const tmp = s[i];\n    s[i] = s[j];\n    s[j] = tmp;\n    out[k] = input[k] ^ s[(s[i] + s[j]) & 0xff];\n  }\n  return out;\n}\n\nfunction decodePdfLiteralBytes(strContent) {\n  const out = [];\n  let i = 0;\n  while (i < strContent.length) {\n    const ch = strContent.charCodeAt(i);\n    if (ch === 92) {\n      i++;\n      if (i >= strContent.length) break;\n      const esc = strContent.charCodeAt(i);\n      if (esc === 110) { out.push(10); i++; }\n      else if (esc === 114) { out.push(13); i++; }\n      else if (esc === 116) { out.push(9); i++; }\n      else if (esc === 98) { out.push(8); i++; }\n      else if (esc === 102) { out.push(12); i++; }\n      else if (esc === 40 || esc === 41 || esc === 92) { out.push(esc); i++; }\n      else if (esc === 13) {\n        i++;\n        if (i < strContent.length && strContent.charCodeAt(i) === 10) i++;\n      } else if (esc === 10) {\n        i++;\n      } else if (esc >= 48 && esc <= 55) {\n        let oct = strContent[i];\n        i++;\n        for (let k = 0; k < 2 && i < strContent.length; k++) {\n          const c2 = strContent.charCodeAt(i);\n          if (c2 >= 48 && c2 <= 55) { oct += strContent[i]; i++; }\n          else break;\n        }\n        out.push(Number.parseInt(oct, 8) & 0xff);\n      } else {\n        out.push(esc & 0xff);\n        i++;\n      }\n    } else {\n      out.push(ch & 0xff);\n      i++;\n    }\n  }\n  return Buffer.from(out);\n}\n\nfunction parsePdfStringField(dictBody, key) {\n  const keyRe = new RegExp('\\\\/' + key + '(?![A-Za-z0-9_])\\\\s*');\n  const m = keyRe.exec(dictBody);\n  if (!m) return null;\n  const pos = m.index + m[0].length;\n  if (pos >= dictBody.length) return null;\n  if (dictBody[pos] === '<' && dictBody[pos + 1] !== '<') {\n    const end = dictBody.indexOf('>', pos + 1);\n    if (end < 0) return null;\n    let hex = dictBody.slice(pos + 1, end).replace(/\\s+/g, '');\n    if (hex.length % 2 === 1) hex += '0';\n    if (!/^[0-9a-fA-F]*$/.test(hex)) return null;\n    return Buffer.from(hex, 'hex');\n  }\n  if (dictBody[pos] === '(') {\n    let depth = 1;\n    let i = pos + 1;\n    while (i < dictBody.length && depth > 0) {\n      const ch = dictBody.charCodeAt(i);\n      if (ch === 92) { i += 2; continue; }\n      if (ch === 40) depth++;\n      else if (ch === 41) depth--;\n      i++;\n    }\n    if (depth !== 0) return null;\n    return decodePdfLiteralBytes(dictBody.slice(pos + 1, i - 1));\n  }\n  return null;\n}\n\nfunction parseTrailerFirstId(text) {\n  const m = /\\/ID\\s*\\[\\s*(<([0-9a-fA-F\\s]*)>|\\(((?:\\\\.|[^\\\\)])*)\\))/.exec(text);\n  if (!m) return null;\n  if (m[2] !== undefined) {\n    let hex = m[2].replace(/\\s+/g, '');\n    if (hex.length % 2 === 1) hex += '0';\n    return Buffer.from(hex, 'hex');\n  }\n  if (m[3] !== undefined) {\n    return decodePdfLiteralBytes(m[3]);\n  }\n  return null;\n}\n\nfunction isPermittedEmptyPasswordEncryptDict(rawEncryptDict, fileId) {\n  const encryptDict = normalizePdfNames(rawEncryptDict);\n  if (!/\\/Filter\\s*\\/Standard(?![A-Za-z])/.test(encryptDict)) return false;\n  if (/\\/Filter\\s*\\/(?!Standard(?![A-Za-z]))[A-Za-z0-9_.+-]+/.test(encryptDict)) return false;\n  if (/\\/SubFilter\\s*\\//.test(encryptDict)) return false;\n  const vMatch = /\\/V\\s+(\\d+)\\b/.exec(encryptDict);\n  const rMatch = /\\/R\\s+(\\d+)\\b/.exec(encryptDict);\n  const pMatch = /\\/P\\s+(-?\\d+)\\b/.exec(encryptDict);\n  if (!rMatch || !rMatch[1] || !pMatch || !pMatch[1]) return false;\n  const v = vMatch && vMatch[1] ? Number.parseInt(vMatch[1], 10) : 1;\n  const r = Number.parseInt(rMatch[1], 10);\n  const pSigned = Number.parseInt(pMatch[1], 10);\n  if (!Number.isSafeInteger(pSigned)) return false;\n\n  const oVal = parsePdfStringField(encryptDict, 'O');\n  const uVal = parsePdfStringField(encryptDict, 'U');\n  if (!oVal || !uVal) return false;\n\n  if (r === 2 || r === 3 || r === 4) {\n    if (v !== 1 && v !== 2 && v !== 4) return false;\n    if (oVal.length < 32 || uVal.length < 32) return false;\n    const lenMatch = /\\/Length\\s+(\\d+)\\b/.exec(encryptDict);\n    let keyByteLen = 5;\n    if (r >= 3) {\n      const bitLen = lenMatch && lenMatch[1] ? Number.parseInt(lenMatch[1], 10) : 128;\n      if (bitLen < 40 || bitLen > 128 || bitLen % 8 !== 0) return false;\n      keyByteLen = bitLen / 8;\n    }\n    const pBuf = Buffer.allocUnsafe(4);\n    pBuf.writeInt32LE(pSigned | 0, 0);\n\n    const md5 = crypto.createHash('md5');\n    md5.update(PDF_ENCRYPT_PAD);\n    md5.update(oVal.subarray(0, 32));\n    md5.update(pBuf);\n    if (fileId && fileId.length > 0) md5.update(fileId);\n    if (r >= 4 && /\\/EncryptMetadata\\s+false\\b/.test(encryptDict)) {\n      md5.update(Buffer.from([0xff, 0xff, 0xff, 0xff]));\n    }\n    let digest = md5.digest();\n    if (r >= 3) {\n      for (let i = 0; i < 50; i++) {\n        digest = crypto.createHash('md5').update(digest.subarray(0, keyByteLen)).digest();\n      }\n    }\n    const encKey = digest.subarray(0, keyByteLen);\n    if (r === 2) {\n      const expectedU = rc4Transform(encKey, PDF_ENCRYPT_PAD);\n      return expectedU.equals(uVal.subarray(0, 32));\n    }\n    if (!fileId || fileId.length === 0) return false;\n    const stepHash = crypto.createHash('md5').update(PDF_ENCRYPT_PAD).update(fileId).digest();\n    let cur = rc4Transform(encKey, stepHash);\n    const xorKey = Buffer.allocUnsafe(encKey.length);\n    for (let i = 1; i <= 19; i++) {\n      for (let j = 0; j < encKey.length; j++) xorKey[j] = encKey[j] ^ i;\n      cur = rc4Transform(xorKey, cur);\n    }\n    return cur.equals(uVal.subarray(0, 16));\n  }\n\n  if (r === 5 && v === 5) {\n    if (uVal.length < 48) return false;\n    const expectedU = crypto.createHash('sha256').update(uVal.subarray(32, 40)).digest();\n    return expectedU.equals(uVal.subarray(0, 32));\n  }\n  return false;\n}\n\nfunction check(data) {\n  if (!Buffer.isBuffer(data) || data.length < 64 || data.length > LITERATURE_ARTIFACT_MAX_BYTES) return false;\n  const head = data.subarray(0, Math.min(data.length, 1024)).toString('latin1');\n  if (!/^%PDF-[12]\\.\\d[\\r\\n]/.test(head)) return false;\n  if (/<(?:!doctype|html|head|body|script|iframe)\\b/i.test(head)) return false;\n\n  const fullStr = data.toString('latin1');\n  const tailLen = Math.min(data.length, 65536);\n  const tail = data.subarray(data.length - tailLen).toString('latin1');\n  const startxrefMatches = Array.from(tail.matchAll(/\\bstartxref[\\r\\n\\s]+(\\d+)[\\r\\n\\s]+%%EOF/g));\n  if (startxrefMatches.length === 0) return false;\n  const lastMatch = startxrefMatches[startxrefMatches.length - 1];\n  const startXrefOffset = Number.parseInt(lastMatch[1], 10);\n  if (!Number.isSafeInteger(startXrefOffset) || startXrefOffset <= 8 || startXrefOffset >= data.length - 16) return false;\n\n  const findPdfKeyword = (kw, fromIdx) => {\n    let pos = fromIdx;\n    while (pos < fullStr.length) {\n      const idx = fullStr.indexOf(kw, pos);\n      if (idx < 0) return -1;\n      const prev = idx > 0 ? fullStr.charCodeAt(idx - 1) : 32;\n      const next = idx + kw.length < fullStr.length ? fullStr.charCodeAt(idx + kw.length) : 32;\n      const prevIsToken = prev === 47 || (prev >= 48 && prev <= 57) || (prev >= 65 && prev <= 90) || (prev >= 97 && prev <= 122) || prev === 95;\n      const nextIsToken = (next >= 48 && next <= 57) || (next >= 65 && next <= 90) || (next >= 97 && next <= 122) || next === 95;\n      if (!prevIsToken && !nextIsToken) return idx;\n      pos = idx + 1;\n    }\n    return -1;\n  };\n\n  const extractObjAtOffset = (offset, expectedNum, expectedGen) => {\n    if (offset <= 0 || offset >= data.length - 16) return null;\n    const winStart = Math.max(0, offset - 64);\n    const winEnd = Math.min(data.length, offset + 160);\n    const windowStr = fullStr.slice(winStart, winEnd);\n    let bodyStart = -1;\n    let num = expectedNum !== undefined ? expectedNum : -1;\n    let gen = expectedGen !== undefined ? expectedGen : -1;\n\n    if (expectedNum !== undefined && expectedGen !== undefined) {\n      const exactHead = fullStr.slice(offset, Math.min(data.length, offset + 96));\n      const exactMatch = /^[\\r\\n\\s]*(\\d+)\\s+(\\d+)\\s+obj\\b/.exec(exactHead);\n      if (exactMatch && Number.parseInt(exactMatch[1], 10) === expectedNum && Number.parseInt(exactMatch[2], 10) === expectedGen) {\n        bodyStart = offset + exactMatch[0].length;\n      } else {\n        const driftRe = new RegExp('(?:^|[^0-9])(' + expectedNum + ')\\\\s+(' + expectedGen + ')\\\\s+obj\\\\b');\n        const dm = driftRe.exec(windowStr);\n        if (!dm) return null;\n        bodyStart = winStart + dm.index + dm[0].length;\n      }\n    } else {\n      const exactHead = fullStr.slice(offset, Math.min(data.length, offset + 96));\n      const exactMatch = /^[\\r\\n\\s]*(\\d+)\\s+(\\d+)\\s+obj\\b/.exec(exactHead);\n      if (exactMatch) {\n        num = Number.parseInt(exactMatch[1], 10);\n        gen = Number.parseInt(exactMatch[2], 10);\n        bodyStart = offset + exactMatch[0].length;\n      } else {\n        const driftMatch = /(?:^|[\\r\\n\\s])(\\d+)\\s+(\\d+)\\s+obj\\b/.exec(windowStr);\n        if (!driftMatch) return null;\n        num = Number.parseInt(driftMatch[1], 10);\n        gen = Number.parseInt(driftMatch[2], 10);\n        bodyStart = winStart + driftMatch.index + driftMatch[0].length;\n      }\n    }\n\n    const firstEndobj = findPdfKeyword('endobj', bodyStart);\n    if (firstEndobj < 0) return null;\n    const preEndobj = fullStr.slice(bodyStart, firstEndobj);\n    const streamMatch = /(?:^|[^A-Za-z0-9_/])(stream[\\r\\n])/.exec(preEndobj);\n    if (streamMatch && streamMatch[1]) {\n      const streamRelIdx = streamMatch.index + streamMatch[0].length - streamMatch[1].length;\n      const dictBody = preEndobj.slice(0, streamRelIdx);\n      const endstreamIdx = findPdfKeyword('endstream', bodyStart + streamRelIdx + 6);\n      if (endstreamIdx < 0) return null;\n      const realEndobj = findPdfKeyword('endobj', endstreamIdx + 9);\n      if (realEndobj < 0) return null;\n      return { num, gen, body: normalizePdfNames(dictBody) };\n    }\n    return { num, gen, body: normalizePdfNames(preEndobj) };\n  };\n\n  const objMap = new Map();\n  const scannedObjMap = new Map();\n  const scannedDicts = [];\n  const trailerTexts = [];\n  let rootObjKey = null;\n\n  const allObjRe = /\\b(\\d+)\\s+(\\d+)\\s+obj\\b([\\s\\S]*?)\\bendobj\\b/g;\n  let om;\n  while ((om = allObjRe.exec(fullStr)) !== null) {\n    const id = Number.parseInt(om[1], 10);\n    const gen = Number.parseInt(om[2], 10);\n    const fullBody = om[3];\n    const streamMatch = /(?:^|[^A-Za-z0-9_/])(stream[\\r\\n])/.exec(fullBody);\n    const dictOnly = normalizePdfNames(\n      streamMatch && streamMatch[1] ? fullBody.slice(0, streamMatch.index + streamMatch[0].length - streamMatch[1].length) : fullBody,\n    );\n    scannedDicts.push(dictOnly);\n    if (!scannedObjMap.has(String(id) + ':' + String(gen))) {\n      scannedObjMap.set(String(id) + ':' + String(gen), dictOnly);\n    }\n    if (/\\/Type\\s*\\/ObjStm(?![A-Za-z])/.test(dictOnly)) {\n      const nMatch = /\\/N\\s+(\\d+)\\b/.exec(dictOnly);\n      const firstMatch = /\\/First\\s+(\\d+)\\b/.exec(dictOnly);\n      const streamIdx = fullBody.indexOf('stream');\n      const endstreamIdx = fullBody.lastIndexOf('endstream');\n      if (!nMatch || !firstMatch || streamIdx < 0 || endstreamIdx <= streamIdx) return false;\n      const n = Number.parseInt(nMatch[1], 10);\n      const first = Number.parseInt(firstMatch[1], 10);\n      let rawPos = om.index + om[0].indexOf('stream') + 6;\n      if (data[rawPos] === 13 && data[rawPos + 1] === 10) rawPos += 2;\n      else if (data[rawPos] === 10 || data[rawPos] === 13) rawPos += 1;\n      let rawEnd = om.index + om[0].lastIndexOf('endstream');\n      while (rawEnd > rawPos && (data[rawEnd - 1] === 10 || data[rawEnd - 1] === 13)) rawEnd--;\n      if (rawEnd <= rawPos) return false;\n      try {\n        const inflated = zlib.inflateSync(data.subarray(rawPos, rawEnd), { maxOutputLength: 8 * 1024 * 1024 });\n        const headerStr = inflated.subarray(0, first).toString('latin1').trim();\n        const pairs = headerStr.split(/\\s+/);\n        const offsets = [];\n        for (let p = 0; p + 1 < pairs.length && offsets.length < n; p += 2) {\n          offsets.push({ id: Number.parseInt(pairs[p], 10), rel: Number.parseInt(pairs[p + 1], 10) });\n        }\n        for (let j = 0; j < offsets.length; j++) {\n          const startByte = first + offsets[j].rel;\n          const endByte = j + 1 < offsets.length ? first + offsets[j + 1].rel : inflated.length;\n          if (startByte >= first && endByte >= startByte && endByte <= inflated.length) {\n            const innerDict = normalizePdfNames(inflated.subarray(startByte, endByte).toString('latin1'));\n            scannedDicts.push(innerDict);\n            scannedObjMap.set(String(offsets[j].id) + ':0', innerDict);\n          }\n        }\n      } catch {\n        return false;\n      }\n    }\n  }\n\n  const xrefSearchStart = Math.max(0, startXrefOffset - 64);\n  const xrefSearchWindow = fullStr.slice(xrefSearchStart, Math.min(data.length, startXrefOffset + 128));\n  const xrefKwMatch = /(?:^|[\\r\\n\\s])(xref)(?=[\\r\\n\\s])/.exec(xrefSearchWindow);\n\n  if (xrefKwMatch && xrefKwMatch[1]) {\n    const firstXrefOff = xrefSearchStart + xrefKwMatch.index + xrefKwMatch[0].length - xrefKwMatch[1].length;\n    const visitedXref = new Set();\n    let curXrefOff = firstXrefOff;\n    while (curXrefOff !== null && !visitedXref.has(curXrefOff) && visitedXref.size < 8) {\n      visitedXref.add(curXrefOff);\n      if (curXrefOff <= 0 || curXrefOff >= data.length - 16) return false;\n      const winStart = Math.max(0, curXrefOff - 64);\n      const winCheck = fullStr.slice(winStart, Math.min(data.length, curXrefOff + 128));\n      const xm = /(?:^|[\\r\\n\\s])(xref)(?=[\\r\\n\\s])/.exec(winCheck);\n      if (!xm || !xm[1]) return false;\n      const actualXrefOff = winStart + xm.index + xm[0].length - xm[1].length;\n      const xrefText = data.subarray(actualXrefOff, Math.min(data.length, actualXrefOff + 524288)).toString('latin1');\n      const trailerIdx = xrefText.search(/\\btrailer(?:\\s|<<)/);\n      if (trailerIdx < 0) return false;\n      const tablePart = xrefText.slice(0, trailerIdx).trim();\n      const trailerPart = normalizePdfNames(xrefText.slice(trailerIdx));\n      trailerTexts.push(trailerPart);\n      if (/\\/XRefStm\\b/.test(trailerPart)) return false;\n\n      if (!/^xref(?:\\s|$)/.test(tablePart)) return false;\n      const afterXref = tablePart.replace(/^xref\\s*/, '');\n      const lines = afterXref.split(/[\\r\\n]+/).map((l) => l.trim()).filter(Boolean);\n      let idx = 0;\n      let entriesParsed = 0;\n      while (idx < lines.length) {\n        const subMatch = /^(\\d+)\\s+(\\d+)$/.exec(lines[idx]);\n        if (!subMatch) return false;\n        const firstId = Number.parseInt(subMatch[1], 10);\n        const count = Number.parseInt(subMatch[2], 10);\n        idx++;\n        if (idx + count > lines.length) return false;\n        for (let k = 0; k < count; k++) {\n          const entryLine = lines[idx + k];\n          const em = /^(\\d{10})\\s+(\\d{5})\\s+([nf])$/.exec(entryLine);\n          if (!em) return false;\n          if (em[3] === 'n') {\n            const off = Number.parseInt(em[1], 10);\n            const gen = Number.parseInt(em[2], 10);\n            const objId = firstId + k;\n            if (objId === 0 || off === 0) continue;\n            const objKey = String(objId) + ':' + String(gen);\n            if (!objMap.has(objKey)) {\n              const parsed = extractObjAtOffset(off, objId, gen);\n              if (!parsed) return false;\n              objMap.set(objKey, parsed.body);\n              scannedDicts.push(parsed.body);\n            }\n            entriesParsed++;\n          }\n        }\n        idx += count;\n      }\n      if (entriesParsed === 0 && visitedXref.size === 1) return false;\n\n      if (rootObjKey === null) {\n        const rm = /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(trailerPart);\n        if (rm) rootObjKey = String(Number.parseInt(rm[1], 10)) + ':' + String(Number.parseInt(rm[2], 10));\n      }\n      const prevMatch = /\\/Prev\\s+(\\d+)\\b/.exec(trailerPart);\n      curXrefOff = prevMatch ? Number.parseInt(prevMatch[1], 10) : null;\n    }\n  } else {\n    for (const [k, v] of scannedObjMap) objMap.set(k, v);\n    const xrefObj = extractObjAtOffset(startXrefOffset);\n    if (!xrefObj || !/\\/Type\\s*\\/XRef(?![A-Za-z])/.test(xrefObj.body)) return false;\n    trailerTexts.push(xrefObj.body);\n    const normalizedTail = normalizePdfNames(tail);\n    const rm = /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(xrefObj.body) || /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(normalizedTail);\n    if (!rm) return false;\n    rootObjKey = String(Number.parseInt(rm[1], 10)) + ':' + String(Number.parseInt(rm[2], 10));\n  }\n\n  for (const tText of trailerTexts) {\n    if (DANGEROUS_PDF_TOKEN_RE.test(tText)) return false;\n  }\n  for (const dictText of scannedDicts) {\n    if (DANGEROUS_PDF_TOKEN_RE.test(dictText)) return false;\n  }\n\n  const combinedTrailers = trailerTexts.join('\\n');\n  const hasEncryptToken =\n    /\\/Encrypt(?![A-Za-z])/.test(combinedTrailers) ||\n    scannedDicts.some((b) => /\\/Encrypt(?![A-Za-z])/.test(b));\n\n  if (hasEncryptToken) {\n    const encRefs = Array.from(combinedTrailers.matchAll(/\\/Encrypt\\s+(\\d+)\\s+(\\d+)\\s+R\\b/g));\n    const inlineEncs = Array.from(combinedTrailers.matchAll(/\\/Encrypt\\s*<<([\\s\\S]*?)>>/g));\n    if (encRefs.length === 0 && inlineEncs.length === 0) return false;\n    const fileId = parseTrailerFirstId(combinedTrailers) || parseTrailerFirstId(tail);\n    for (const ref of encRefs) {\n      const encKey = String(Number.parseInt(ref[1], 10)) + ':' + String(Number.parseInt(ref[2], 10));\n      const encryptDictBody = objMap.get(encKey) || null;\n      if (!encryptDictBody || !isPermittedEmptyPasswordEncryptDict(encryptDictBody, fileId)) {\n        return false;\n      }\n    }\n    for (const inl of inlineEncs) {\n      if (!inl[1] || !isPermittedEmptyPasswordEncryptDict(inl[1], fileId)) {\n        return false;\n      }\n    }\n  }\n\n  if (rootObjKey === null || !objMap.has(rootObjKey)) return false;\n  const catalogBody = objMap.get(rootObjKey);\n  if (!/\\/Type\\s*\\/Catalog(?![A-Za-z])/.test(catalogBody)) return false;\n  const pagesRefMatch = /\\/Pages\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(catalogBody);\n  if (!pagesRefMatch) return false;\n  const rootPagesKey = String(Number.parseInt(pagesRefMatch[1], 10)) + ':' + String(Number.parseInt(pagesRefMatch[2], 10));\n\n  const visitedNodes = new Set();\n  const queue = [rootPagesKey];\n  let pageCount = 0;\n  while (queue.length > 0 && visitedNodes.size < 500) {\n    const curKey = queue.shift();\n    if (visitedNodes.has(curKey)) return false;\n    visitedNodes.add(curKey);\n    const nodeBody = objMap.get(curKey);\n    if (!nodeBody) return false;\n    if (/\\/Type\\s*\\/Pages(?![A-Za-z])/.test(nodeBody)) {\n      const countMatch = /\\/Count\\s+([1-9]\\d*)\\b/.exec(nodeBody);\n      if (!countMatch) return false;\n      let kidsSource = nodeBody;\n      const directKidsMatch = /\\/Kids\\s*\\[([\\s\\S]*?)\\]/.exec(nodeBody);\n      if (directKidsMatch && directKidsMatch[1] !== undefined) {\n        kidsSource = directKidsMatch[1];\n      } else {\n        const indirectKidsRef = /\\/Kids\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(nodeBody);\n        if (!indirectKidsRef) return false;\n        const kidsKey = String(Number.parseInt(indirectKidsRef[1], 10)) + ':' + String(Number.parseInt(indirectKidsRef[2], 10));\n        const kidsArrayBody = objMap.get(kidsKey);\n        if (!kidsArrayBody) return false;\n        kidsSource = kidsArrayBody;\n      }\n      const kidRefs = Array.from(kidsSource.matchAll(/(\\d+)\\s+(\\d+)\\s+R\\b/g));\n      if (kidRefs.length === 0) return false;\n      for (const kr of kidRefs) {\n        queue.push(String(Number.parseInt(kr[1], 10)) + ':' + String(Number.parseInt(kr[2], 10)));\n      }\n    } else if (/\\/Type\\s*\\/Page(?![A-Za-z])/.test(nodeBody)) {\n      pageCount++;\n    } else {\n      return false;\n    }\n  }\n  return pageCount > 0;\n}\nconst data = Buffer.from(workerData);\nparentPort.postMessage({ ok: check(data) });\n"
 
 export async function validatePdfInIsolatedWorker(
   data: Buffer,
