@@ -22,7 +22,8 @@ import {
 } from './delegateCutover.js'
 import { resolveDelegateLedgerRetentionMs } from './delegateDurable.js'
 import { nextDelegateReconcileAt, reconcileDelegateJobsOnBoot } from './delegateReconciler.js'
-import type { Gateway, RunDelegateInput } from './server.js'
+import type { Gateway } from './server.js'
+import type { RunDelegateInput } from './delegatePolicy.js'
 
 export interface DelegateSupervisionHost {
   _armDelegateReconcileFollowup: Gateway['_armDelegateReconcileFollowup']

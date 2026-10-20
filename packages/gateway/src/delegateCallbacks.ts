@@ -52,7 +52,8 @@ import { dispatchJobTerminalNotify, retryPendingNotifies } from './delegateNotif
 import { parseParentEngine } from './jobTerminal.js'
 import { delegateCallbackMessageId, persistDelegateJobSnapshots } from './delegateCompleter.js'
 import { getTurnDispatchState, normalizeDispatchUserId } from './turnDispatchInbox.js'
-import type { Gateway, RunDelegateInput } from './server.js'
+import type { Gateway } from './server.js'
+import type { RunDelegateInput } from './delegatePolicy.js'
 
 export interface DelegateCallbacksHost {
   _acquireSyntheticTurnBarrier: Gateway['_acquireSyntheticTurnBarrier']

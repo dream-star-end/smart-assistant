@@ -24,13 +24,8 @@ import { readConfig, writeConfig } from '@openclaude/storage'
 import { checkToken, verifyJwt } from './auth.js'
 import { httpRequestsTotal, httpRequestDuration } from './metrics.js'
 import { isFileAllowed, isFileBlocked } from './gatewayFilePolicy.js'
-import {
-  CLAUDE_OAUTH_USER_AGENT,
-  shouldLogHttpAccess,
-  JWT_TTL_SECONDS,
-  mimeFor,
-  staticCacheControl,
-} from './server.js'
+import { CLAUDE_OAUTH_USER_AGENT, JWT_TTL_SECONDS } from './server.js'
+import { shouldLogHttpAccess, mimeFor, staticCacheControl } from './httpUploadStatic.js'
 import type { Gateway } from './server.js'
 
 export interface GatewayHttpHost {

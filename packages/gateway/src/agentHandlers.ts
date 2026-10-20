@@ -49,11 +49,8 @@ import {
 } from './autoDreamOptimizer.js'
 import type { AutoDreamOptimizerClient } from './autoDreamOptimizerClient.js'
 import { AutoDreamPolicyClient, type AutoDreamOptimizerPolicy } from './autoDreamPolicy.js'
-import {
-  resolveLocalExecutionIfEnforced,
-  localExecutionOverride,
-  normalizeAutoDreamSchedule,
-} from './server.js'
+import { resolveLocalExecutionIfEnforced, localExecutionOverride } from './server.js'
+import { normalizeAutoDreamSchedule } from './autoDreamSchedule.js'
 import type { Gateway } from './server.js'
 
 export interface AgentHandlersHost {

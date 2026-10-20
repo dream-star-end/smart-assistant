@@ -109,25 +109,10 @@ import {
   type ReviewEvidenceItem,
   type TeamReviewMode,
 } from './teamMode.js'
-import {
-  DELEGATE_DEFAULT_PREFERRED_MODELS,
-  DELEGATE_GROK_FALLBACK_MODEL,
-  assertKnownExplicitDelegateModel,
-  resolveLocalExecutionIfEnforced,
-  localExecutionOverride,
-  DELEGATE_QUEUE_MAX_WAITERS,
-  MAX_HIDDEN_DELEGATIONS_PER_TURN,
-  MEMBER_DELEGATIONS_PER_TURN_DEFAULT,
-  PerTurnDelegationGuard,
-  resolveDelegateParentClientSessionId,
-  _buildTurnStatusFrame,
-} from './server.js'
-import type {
-  Gateway,
-  LocalExecutionDecision,
-  DelegateGateBlock,
-  RunDelegateInput,
-} from './server.js'
+import { resolveLocalExecutionIfEnforced, localExecutionOverride, _buildTurnStatusFrame } from './server.js'
+import { DELEGATE_DEFAULT_PREFERRED_MODELS, DELEGATE_GROK_FALLBACK_MODEL, assertKnownExplicitDelegateModel, DELEGATE_QUEUE_MAX_WAITERS, MAX_HIDDEN_DELEGATIONS_PER_TURN, MEMBER_DELEGATIONS_PER_TURN_DEFAULT, PerTurnDelegationGuard, resolveDelegateParentClientSessionId } from './delegatePolicy.js'
+import type { Gateway, LocalExecutionDecision } from './server.js'
+import type { DelegateGateBlock, RunDelegateInput } from './delegatePolicy.js'
 
 export interface DelegateRuntimeHost {
   _acquireDelegateGrokRoute: Gateway['_acquireDelegateGrokRoute']

@@ -58,21 +58,8 @@ import {
   runDurableDispatchAdmission,
 } from './turnDispatchInbox.js'
 import { _pendingPermissionCatchupFrames } from './pendingPermissionSnapshot.js'
-import {
-  ALLOWED_INBOUND_MODELS,
-  resolveLocalExecutionIfEnforced,
-  localExecutionOverride,
-  makePeerKey,
-  _parseConnectionTraceIdFromUpgrade,
-  _stripPrivateRoutingFields,
-  _turnStatusWireFields,
-  preparedModelSwitchCatchupFrame,
-  _matchActiveTurnReplayCandidate,
-  _unservedActiveTurnReplay,
-  _noteActiveTurnReplayServed,
-  _shouldPushTurnInterruptedFinal,
-  _shouldInterruptUnknownInFlight,
-} from './server.js'
+import { resolveLocalExecutionIfEnforced, localExecutionOverride, makePeerKey, _parseConnectionTraceIdFromUpgrade, _stripPrivateRoutingFields, _turnStatusWireFields, preparedModelSwitchCatchupFrame, _matchActiveTurnReplayCandidate, _unservedActiveTurnReplay, _noteActiveTurnReplayServed, _shouldPushTurnInterruptedFinal, _shouldInterruptUnknownInFlight } from './server.js'
+import { ALLOWED_INBOUND_MODELS } from './delegatePolicy.js'
 import type { Gateway } from './server.js'
 
 export interface WsConnectionHost {

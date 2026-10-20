@@ -127,6 +127,7 @@ export async function _maybeAutoEvalTrainRun(this: SkillTrainRunsHost, trainRunI
   const draft = await this.skillDrafts.readDraft(trainRunId, tr.skillName).catch(() => null)
   if (!draft || draft.record.op === 'delete') return
   const store = buildUserSkillStore()
+  // biome-ignore lint/style/useConst: moved verbatim from server.ts (OCV5-533)
   let evalsRaw =
     draft.evalsJson ??
     ((await store.view(tr.skillName, 'evals/evals.json', { includePlatform: false })) as

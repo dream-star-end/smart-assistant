@@ -23,15 +23,11 @@ import {
   rejectTurnDispatchIfAbsent,
   cancelQueuedTurnDispatchExact,
 } from './turnDispatchInbox.js'
-import {
-  V3_WECHAT_OUTBOUND_ADAPTER_ID,
-  V3_QQBOT_OUTBOUND_ADAPTER_ID,
-  ALLOWED_INBOUND_MODELS,
-  validateEnginePreheatBody,
-  runSessionPreheat,
-  validateWechatInboundCompensateBody,
-} from './server.js'
-import type { Gateway, WechatStartOutcome, SessionPreheatHost } from './server.js'
+import { V3_WECHAT_OUTBOUND_ADAPTER_ID, V3_QQBOT_OUTBOUND_ADAPTER_ID, validateEnginePreheatBody, runSessionPreheat } from './server.js'
+import { ALLOWED_INBOUND_MODELS } from './delegatePolicy.js'
+import { validateWechatInboundCompensateBody } from './wechatInboundCompensate.js'
+import type { Gateway, SessionPreheatHost } from './server.js'
+import type { WechatStartOutcome } from './wechatInboundCompensate.js'
 
 export interface ChannelHandlersHost {
   _getIdempotencyEntry: Gateway['_getIdempotencyEntry']

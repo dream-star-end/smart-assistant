@@ -13,8 +13,9 @@ import { getClientSession } from '@openclaude/storage'
 import { ADVISOR_CONSULT_PARENT_ENGINES, ADVISOR_CONSULT_PARENT_REASON, advisorConsultParentGate } from './advisorMode.js'
 import { parseTrustedCollabParentHeaders } from './bridgeApiAllowlist.js'
 import { getLocalCatalogView } from './modelCatalogClient.js'
-import { DELEGATE_QUEUE_MAX_WAITERS } from './server.js'
-import type { Gateway, DelegateGateBlock } from './server.js'
+import { DELEGATE_QUEUE_MAX_WAITERS } from './delegatePolicy.js'
+import type { Gateway } from './server.js'
+import type { DelegateGateBlock } from './delegatePolicy.js'
 
 export interface DelegateGuardHost {
   _activeDelegations: Gateway['_activeDelegations']

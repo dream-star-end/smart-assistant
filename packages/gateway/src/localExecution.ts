@@ -21,7 +21,7 @@ import {
   type LocalCatalogView,
 } from './modelCatalogClient.js'
 import { suggestDelegateModels } from './delegateModelCatalogPrompt.js'
-import { ALLOWED_INBOUND_MODELS, assertKnownExplicitDelegateModel } from './server.js'
+import { ALLOWED_INBOUND_MODELS, assertKnownExplicitDelegateModel } from './delegatePolicy.js'
 import type { LiveRunnerSessionView } from './server.js'
 
 /**

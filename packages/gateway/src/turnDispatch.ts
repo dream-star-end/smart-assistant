@@ -8,7 +8,7 @@
  */
 import { randomBytes } from 'node:crypto'
 import { type InboundFrame, isClientMessageId } from '@openclaude/protocol'
-import { WebSocket } from 'ws'
+import type { WebSocket } from 'ws'
 import { removeSendToAgentIntent } from './sendToAgentIntentStore.js'
 import type { DelegateJobSnapshot } from './delegateJobs.js'
 import { parseParentEngine } from './jobTerminal.js'
