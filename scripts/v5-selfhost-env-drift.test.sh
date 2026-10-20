@@ -97,6 +97,11 @@ out="$(bash "$DRIFT" --env "$E.7" --template "$TEMPLATE")" && [[ "$out" == "ENV_
 out="$(bash "$DRIFT" --env "$E.8" --template "$TEMPLATE")" && [[ "$out" == "ENV_DRIFT missing=0 undeclared=0" && "$out" != *SENTINEL* ]] \
   && ok "D8 多段引号、注释续行、引号后续行都不产生键" || bad "D8: $out"
 
+# D9 CRLF:反斜杠+CR 是续行,单引号值跨 CRLF 行;值片段不得被当成键(Codex P1:通用换行会改变续行边界)
+{ cat "$E"; printf 'OC_JEV_API_KEY=abc\\\r\nOC_CHATGPT_PROXY_TLS_KEY='"'"'first\r\nSENTINEL_SECRET_MATERIAL=x\r\nlast'"'"'\r\n'; } >"$E.9"
+out="$(bash "$DRIFT" --env "$E.9" --template "$TEMPLATE")" && [[ "$out" == "ENV_DRIFT missing=0 undeclared=0" && "$out" != *SENTINEL* ]] \
+  && ok "D9 CRLF 续行与跨行单引号值不产生键" || bad "D9: $out"
+
 # W* 接线
 grep -qE 'v5-selfhost-env-drift\.sh' "$DEPLOY" \
   && awk '/^cmd_deploy\(\) \{/{f=1} f && /^  ensure_selfhost_env_keys$/{e=NR} f && /^  ensure_model_authority$/{m=NR} f && /^  assert_env_key_drift$/{d=NR} f && /^}/{exit} END{exit !(e && m && d && d>e && d>m)}' "$DEPLOY" \

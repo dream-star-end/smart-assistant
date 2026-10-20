@@ -33,7 +33,8 @@ keys_of() {
 import re, sys
 NEWLINE, COMMENTS, WS = "\n\r", "#;", " \t\n\r"
 valid = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-data = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+# newline="": 保留原始 CR/LF;通用换行会把 CRLF 折成 LF,改变 systemd 的续行边界(Codex P1)
+data = open(sys.argv[1], encoding="utf-8", errors="replace", newline="").read()
 state, key = "PRE_KEY", ""
 def emit():
     k = key.rstrip(" \t")
