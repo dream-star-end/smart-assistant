@@ -57,10 +57,12 @@ export function _notifyDispatchHooks(this: TurnDispatchHost) {
   }
 }
 
-export async function _acquireSyntheticTurnBarrier(this: TurnDispatchHost, sessionKey: string): Promise<{
+export type AcquireSyntheticTurnBarrierResult = {
     owner: string
     release: () => void
-  }> {
+  }
+
+export async function _acquireSyntheticTurnBarrier(this: TurnDispatchHost, sessionKey: string): Promise<AcquireSyntheticTurnBarrierResult> {
   const barriers = (this._syntheticTurnBarriers ??= new Map())
   for (;;) {
     const existing = barriers.get(sessionKey)
@@ -216,17 +218,19 @@ export async function _dispatchAdmittedClientTurn(this: TurnDispatchHost, frame:
   }
 }
 
-/** Record an authoritative settlement for later replay to late duplicates.
- *  `answers` is carried so that a 3rd tab hitting the already-settled
- *  replay path still sees the collected AskUserQuestion answers. */
-export function _recordSettlement(this: TurnDispatchHost, requestId: string, entry: {
+export type RecordSettlementEntry = {
       behavior: 'allow' | 'deny'
       channel: string
       peer: { id: string; kind: 'dm' | 'group' }
       sessionKey: string
       userId: string
       answers?: Record<string, string>
-    }): void {
+    }
+
+/** Record an authoritative settlement for later replay to late duplicates.
+ *  `answers` is carried so that a 3rd tab hitting the already-settled
+ *  replay path still sees the collected AskUserQuestion answers. */
+export function _recordSettlement(this: TurnDispatchHost, requestId: string, entry: RecordSettlementEntry): void {
   // FIFO evict (Map preserves insertion order) to cap memory under burst load.
   while (this._recentSettlements.size >= RECENT_SETTLEMENT_MAX) {
     const oldestKey = this._recentSettlements.keys().next().value
@@ -236,15 +240,17 @@ export function _recordSettlement(this: TurnDispatchHost, requestId: string, ent
   this._recentSettlements.set(requestId, { ...entry, ts: Date.now() })
 }
 
-/** Look up a recent settlement, honoring TTL (returns null if expired). */
-export function _lookupSettlement(this: TurnDispatchHost, requestId: string): {
+export type LookupSettlementResult = {
     behavior: 'allow' | 'deny'
     channel: string
     peer: { id: string; kind: 'dm' | 'group' }
     sessionKey: string
     userId: string
     answers?: Record<string, string>
-  } | null {
+  } | null
+
+/** Look up a recent settlement, honoring TTL (returns null if expired). */
+export function _lookupSettlement(this: TurnDispatchHost, requestId: string): LookupSettlementResult {
   const e = this._recentSettlements.get(requestId)
   if (!e) return null
   if (Date.now() - e.ts > RECENT_SETTLEMENT_TTL_MS) {

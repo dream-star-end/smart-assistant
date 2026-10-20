@@ -80,9 +80,7 @@ export function _dropDelegateInflightSurface(this: DelegateSupervisionHost, jobI
   this._forgetDelegateInflight(jobId)
 }
 
-export function _touchDelegateInflightSurface(
-  this: DelegateSupervisionHost,
-  input: {
+export type TouchDelegateInflightSurfaceInput = {
     jobId?: string
     progressRunId?: string
     parentSessionKey?: string
@@ -95,7 +93,11 @@ export function _touchDelegateInflightSurface(
     nested?: boolean
     ownerRunId?: string
     preserveIdentity?: boolean
-  },
+  }
+
+export function _touchDelegateInflightSurface(
+  this: DelegateSupervisionHost,
+  input: TouchDelegateInflightSurfaceInput,
 ): void {
   if (!isDelegateInflightSurfaceEffective()) return
   try {

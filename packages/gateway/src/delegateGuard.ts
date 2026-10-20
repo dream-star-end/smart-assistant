@@ -45,6 +45,11 @@ function parseDelegateMemoryPressureRatio(): number {
     : DELEGATE_MEMORY_PRESSURE_DEFAULT_RATIO
 }
 
+export type CheckDelegateResourceGateOpts = {
+    parentBucketKey?: string
+    isReview?: boolean
+  }
+
 /** 两道资源闸共用的判定。并发在前 —— 与历史行为的拒绝优先级一致
  *  (旧代码并发 429 判在内存 503 之前)。
  *
@@ -53,10 +58,7 @@ function parseDelegateMemoryPressureRatio(): number {
  *   - per-parent:非 review 委派按父分桶计数,单父超上限即 concurrency block(进排队);
  *     review 委派豁免此桶(它有独立保留槽,不受某父 fan-out 挤占)。
  *   缺 parentBucketKey(cron/webhook 父不在内存)→ 只受全局闸,不分桶(与既有行为一致)。 */
-export function _checkDelegateResourceGate(this: DelegateGuardHost, opts?: {
-    parentBucketKey?: string
-    isReview?: boolean
-  }): DelegateGateBlock | null {
+export function _checkDelegateResourceGate(this: DelegateGuardHost, opts?: CheckDelegateResourceGateOpts): DelegateGateBlock | null {
   const isReview = opts?.isReview === true
   const globalCap = delegateConcurrencyCap(isReview)
   if (this._activeDelegations >= globalCap) {
@@ -80,12 +82,14 @@ export function _checkDelegateResourceGate(this: DelegateGuardHost, opts?: {
   return null
 }
 
-export function _formatDelegateConcurrencyReject(this: DelegateGuardHost, opts: {
+export type FormatDelegateConcurrencyRejectOpts = {
     isReview: boolean
     parentBucketKey?: string
     waitedS?: number
     queueFull?: boolean
-  }): string {
+  }
+
+export function _formatDelegateConcurrencyReject(this: DelegateGuardHost, opts: FormatDelegateConcurrencyRejectOpts): string {
   const perParentMax = getDelegateMaxPerParent()
   const perParentInUse =
     !opts.isReview && opts.parentBucketKey
@@ -179,12 +183,14 @@ export async function _loadClientSession(this: DelegateGuardHost, sessionId: str
   return getClientSession(sessionId, userId)
 }
 
-export async function _parentEngineForCollabSession(this: DelegateGuardHost, input: {
+export type ParentEngineForCollabSessionInput = {
     sessionId: string
     userId: string
     req: IncomingMessage
     url: URL
-  }): Promise<{ missing: boolean; agentId?: string; engine?: string }> {
+  }
+
+export async function _parentEngineForCollabSession(this: DelegateGuardHost, input: ParentEngineForCollabSessionInput): Promise<{ missing: boolean; agentId?: string; engine?: string }> {
   const bridgeVerified = this.checkBridgeBypass(input.req, input.url)
   if (bridgeVerified) {
     const trusted = parseTrustedCollabParentHeaders(input.req.headers as Record<string, unknown>)
@@ -211,10 +217,12 @@ export async function _parentEngineForCollabSession(this: DelegateGuardHost, inp
   return { missing: false, agentId, engine }
 }
 
-export function _collaborationCapabilityFields(this: DelegateGuardHost, input: {
+export type CollaborationCapabilityFieldsInput = {
     sessionId?: string
     engine?: string
-  }): Record<string, unknown> {
+  }
+
+export function _collaborationCapabilityFields(this: DelegateGuardHost, input: CollaborationCapabilityFieldsInput): Record<string, unknown> {
   const gate = advisorConsultParentGate(input.engine)
   return {
     advisorConsultParents: [...ADVISOR_CONSULT_PARENT_ENGINES],
@@ -231,12 +239,14 @@ export function _consultWaitMs(this: DelegateGuardHost): number {
   return Number.isFinite(raw) && raw > 0 ? raw : 30_000
 }
 
-export function _consultJobFailedState(this: DelegateGuardHost, view: {
+export type ConsultJobFailedStateView = {
     status: string
     state?: string
     failure_class?: string
     httpStatus?: number
-  }): 'failed' | 'cancelled' | null {
+  }
+
+export function _consultJobFailedState(this: DelegateGuardHost, view: ConsultJobFailedStateView): 'failed' | 'cancelled' | null {
   if (view.status === 'expired') return 'failed'
   if (view.status === 'failed') {
     return view.state === 'cancelled' || view.failure_class === 'cancelled' ? 'cancelled' : 'failed'

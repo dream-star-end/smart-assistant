@@ -548,13 +548,15 @@ export async function handleMemoryFile(
   this.sendError(res, 405, 'method not allowed')
 }
 
-export async function _loadAutoDreamAuditDataset(
-  this: AgentHandlersHost,
-  input: {
+export type LoadAutoDreamAuditDatasetInput = {
     agentId: string
     afterSeq: number | null
     policy: AutoDreamOptimizerPolicy
-  },
+  }
+
+export async function _loadAutoDreamAuditDataset(
+  this: AgentHandlersHost,
+  input: LoadAutoDreamAuditDatasetInput,
 ): Promise<AutoDreamAuditDataset> {
   const successWindow = await listAutoDreamSuccessfulSessionsBetween({
     agentId: input.agentId,
@@ -789,13 +791,15 @@ export async function _runAutoDreamOptimizerModel(
   }
 }
 
-export async function _hydrateAutoDreamOptimizerProposals(
-  this: AgentHandlersHost,
-  input: {
+export type HydrateAutoDreamOptimizerProposalsInput = {
     runId: string
     agentId: string
     proposals: AutoDreamOptimizerProposal[]
-  },
+  }
+
+export async function _hydrateAutoDreamOptimizerProposals(
+  this: AgentHandlersHost,
+  input: HydrateAutoDreamOptimizerProposalsInput,
 ): Promise<AutoDreamOptimizerProposal[]> {
   const policy = await new AutoDreamPolicyClient().get({ fresh: true })
   if (!policy.enabled || policy.mode !== 'optimizer_v2') {

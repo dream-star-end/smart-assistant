@@ -30,20 +30,10 @@ import type { IncomingMessage, ServerResponse, createServer } from 'node:http'
 import type { ChannelAdapter } from '@openclaude/plugin-sdk'
 import {
   type InboundFrame,
-  type OutboundCodexBilling,
-  type OutboundExternalEngineBilling,
-  type OutboundCallUsage,
-  type OutboundError,
   type OutboundMessage,
-  type OutboundTurnStatus,
-  type OutboundTurnUsage,
-  type SysContextRebuilt,
-  type DurableCodexBilling,
-  type GoalStateSnapshot,
   shouldServeInline,
 } from '@openclaude/protocol'
 import type {
-  DelegateFailureClass,
   JobTerminal,
 } from '@openclaude/protocol'
 import {
@@ -87,10 +77,6 @@ import {
   filterUserVisibleRoutesForManagement,
   userVisibleDefaultAgentId,
 } from './agentVisibility.js'
-import type {
-  buildAdvisorSnapshot,
-  AdvisorConsultExecution,
-} from './advisorMode.js'
 import type { AdvisorConsultStore } from './advisorConsultStore.js'
 import type {
   AdvisorConfigStore,
@@ -216,7 +202,6 @@ import {
   type AutoDreamOptimizerProposal,
 } from './autoDreamOptimizer.js'
 import { AutoDreamOptimizerClient } from './autoDreamOptimizerClient.js'
-import type { AutoDreamOptimizerPolicy } from './autoDreamPolicy.js'
 import { GATEWAY_PENDING_PERMISSION_TTL_MS } from './pendingPermissionSnapshot.js'
 import { type AgentHandlersHost, handleAgentsCollection as handleAgentsCollectionImpl, handleAgentItem as handleAgentItemImpl, handlePersona as handlePersonaImpl, handleMemory as handleMemoryImpl, handleMemoryUsage as handleMemoryUsageImpl, handleAutoDreamReport as handleAutoDreamReportImpl, handleAutoDreamOptimizer as handleAutoDreamOptimizerImpl, handleAutoDreamOptimizerCancel as handleAutoDreamOptimizerCancelImpl, handleAutoDreamOptimizerProposal as handleAutoDreamOptimizerProposalImpl, handleMemoryFile as handleMemoryFileImpl, _loadAutoDreamAuditDataset as _loadAutoDreamAuditDatasetImpl, _runAutoDreamOptimizerModel as _runAutoDreamOptimizerModelImpl, _hydrateAutoDreamOptimizerProposals as _hydrateAutoDreamOptimizerProposalsImpl, _applyAutoDreamOptimizerProposal as _applyAutoDreamOptimizerProposalImpl, _runAutoDreamModel as _runAutoDreamModelImpl } from './agentHandlers.js'
 import { type SkillHandlersHost, handleSkillsList as handleSkillsListImpl, handleSkillItem as handleSkillItemImpl, handleUserSkillsList as handleUserSkillsListImpl, _handleUserSkillFiles as _handleUserSkillFilesImpl, _handleUserSkillHistory as _handleUserSkillHistoryImpl, _handleUserSkillRestore as _handleUserSkillRestoreImpl, validateSkillAgentScopeInput as validateSkillAgentScopeInputImpl, handleUserSkillItem as handleUserSkillItemImpl, _handleSkillEvalsFile as _handleSkillEvalsFileImpl, _handleSkillEvalStart as _handleSkillEvalStartImpl, _handleSkillEvalRunStatus as _handleSkillEvalRunStatusImpl, _handleSkillEvalGenStart as _handleSkillEvalGenStartImpl, _handleSkillEvalGenStatus as _handleSkillEvalGenStatusImpl, _handleReleaseJobStatus as _handleReleaseJobStatusImpl, _runSkillEvalGen as _runSkillEvalGenImpl, _skillEvalTurn as _skillEvalTurnImpl, _runSkillEval as _runSkillEvalImpl, _startSkillAutoRegression as _startSkillAutoRegressionImpl, _skillAutoRegressionTick as _skillAutoRegressionTickImpl, _collectSkillFeedbackScenarios as _collectSkillFeedbackScenariosImpl, _handleSkillTrainStart as _handleSkillTrainStartImpl, _handleSkillTrainList as _handleSkillTrainListImpl, _handleSkillTrainRun as _handleSkillTrainRunImpl, _handleSkillTrainDrafts as _handleSkillTrainDraftsImpl, _handleSkillTrainDraftItem as _handleSkillTrainDraftItemImpl, _handleSkillTrainComment as _handleSkillTrainCommentImpl, _handleSkillTrainMerge as _handleSkillTrainMergeImpl } from './skillHandlers.js'
@@ -261,6 +246,18 @@ import type { DelegateGateBlock, RunDelegateInput } from './delegatePolicy.js'
 export { COMPENSATE_SESSION_ID_RE, COMPENSATE_BINDING_USER_ID_RE, COMPENSATE_TRACE_ID_MAX_LEN, validateWechatInboundCompensateBody } from './wechatInboundCompensate.js'
 export type { WechatStartOutcome, WechatInboundCompensatePayload, WechatInboundCompensateValidation } from './wechatInboundCompensate.js'
 import type { WechatStartOutcome } from './wechatInboundCompensate.js'
+import type { UpdateWechatIdempotencyPatch } from './channelHandlers.js'
+import type { ResolveMediaDirsResult } from './httpMiscHandlers.js'
+import type { SkillEvalTurnOpts } from './skillHandlers.js'
+import type { HydrateAutoDreamOptimizerProposalsInput, LoadAutoDreamAuditDatasetInput } from './agentHandlers.js'
+import type { TouchDelegateInflightSurfaceInput } from './delegateSupervision.js'
+import type { CheckDelegateResourceGateOpts, CollaborationCapabilityFieldsInput, ConsultJobFailedStateView, FormatDelegateConcurrencyRejectOpts, ParentEngineForCollabSessionInput } from './delegateGuard.js'
+import type { ApplyDelegateCapacityRejectArgs, ReleaseDelegateSlotOpts, ResolveDelegateParentArgs, ResolveDelegateParentResult, ResolveDelegateProgressTargetArgs, TryReserveDelegateSlotOpts, WaitForDelegateCapacityArgs, WaitForDelegateCapacityResult } from './delegateRuntime.js'
+import type { AdviceFromConsultRecord, InvocationFromLiveConsultToolParent, PresentExistingConsultInput, ResolveAdvisorConsultExecutionResult, SpawnAdvisorConsultInput, SpawnAdvisorConsultResult, SpawnCcbAdvisorConsultInput, SpawnCcbAdvisorConsultResult } from './advisorHandlers.js'
+import type { AcquireSyntheticTurnBarrierResult, LookupSettlementResult, RecordSettlementEntry } from './turnDispatch.js'
+import type { InjectCcbLocalAgentCallbackArgs, InjectSendToAgentCallbackArgs, SendToAgentCallbackTurnAlreadyQueuedArgs } from './delegateCallbacks.js'
+import type { AutoResumeFromHelloPeers, DeliverOut, HandleStopFrame } from './wsConnection.js'
+import type { BroadcastPermissionSettledPayload, CompensateInWindowAskUserAnswerPending, FinishInWindowAskUserWaitArgs, HandlePermissionResponseFrame, HydrateDetachedAskUserPendingFrame, PatchDetachedAskUserResolvedPending, PersistDetachedAskUserCardArgs, SubmitDetachedAskUserAnswerPending } from './askUserPermissions.js'
 // Moved to ./httpUploadStatic.js (FINDINGS §7.6, OCV5-533); re-exported for existing importers.
 export { MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, SAFE_UPLOAD_EXTENSION_RE, mimeFor, staticCacheControl, shouldLogHttpAccess } from './httpUploadStatic.js'
 // Moved to ./autoDreamSchedule.js (FINDINGS §7.6, OCV5-533); re-exported for existing importers.
@@ -536,14 +533,7 @@ export class Gateway {
     if (key) this._seenIdempotencyKeys.set(key, { ts: Date.now(), ...(wechat ? { wechat } : {}) })
   }
 
-  private _updateWechatIdempotency(key: string, patch: Partial<{
-      started: boolean
-      completed: boolean
-      traceId: string
-      sessionKey: string
-      peerId: string
-      agentId: string
-    }>): void {
+  private _updateWechatIdempotency(key: string, patch: UpdateWechatIdempotencyPatch): void {
     _updateWechatIdempotencyImpl.call(this as unknown as ChannelHandlersHost, key, patch)
   }
 
@@ -1317,22 +1307,7 @@ export class Gateway {
    *   invalid-uid  → 401 (token has bad sub form; shouldn't happen post-getUserId)
    */
   private _resolveMediaDirs(userId: string): Promise<
-    | { kind: 'legacy'; uploads: string; generated: string }
-    | { kind: 'ok'; uid: number; uploads: string; generated: string }
-    | {
-        kind: 'fail'
-        reason: 'remote-host'
-        uid: number
-        hostUuid: string
-        uploads: string
-        generated: string
-        logCtx: Record<string, unknown>
-      }
-    | {
-        kind: 'fail'
-        reason: 'invalid-uid' | 'not-ready' | 'volume-missing' | 'ambiguous' | 'daemon-error'
-        logCtx: Record<string, unknown>
-      }
+    ResolveMediaDirsResult
   > {
     return _resolveMediaDirsImpl.call(this as unknown as HttpMiscHandlersHost, userId)
   }
@@ -1711,18 +1686,11 @@ export class Gateway {
   }
 
   /** 跑一个被测/评分 turn:一次性会话,收最终文本+用量,完了销毁会话释放资源。 */
-  private _skillEvalTurn(sessionKey: string, userId: string, prompt: string, model: string, opts: {
-      skillEvalExclude?: string
-      skillEvalDraft?: { name: string; dir: string }
-    }): Promise<{ text: string; usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number } }> {
+  private _skillEvalTurn(sessionKey: string, userId: string, prompt: string, model: string, opts: SkillEvalTurnOpts): Promise<{ text: string; usage?: { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number } }> {
     return _skillEvalTurnImpl.call(this as unknown as SkillHandlersHost, sessionKey, userId, prompt, model, opts)
   }
 
-  private _loadAutoDreamAuditDataset(input: {
-    agentId: string
-    afterSeq: number | null
-    policy: AutoDreamOptimizerPolicy
-  }): Promise<AutoDreamAuditDataset> {
+  private _loadAutoDreamAuditDataset(input: LoadAutoDreamAuditDatasetInput): Promise<AutoDreamAuditDataset> {
     return _loadAutoDreamAuditDatasetImpl.call(this as unknown as AgentHandlersHost, input)
   }
 
@@ -1730,11 +1698,7 @@ export class Gateway {
     return _runAutoDreamOptimizerModelImpl.call(this as unknown as AgentHandlersHost, input, client)
   }
 
-  private _hydrateAutoDreamOptimizerProposals(input: {
-    runId: string
-    agentId: string
-    proposals: AutoDreamOptimizerProposal[]
-  }): Promise<AutoDreamOptimizerProposal[]> {
+  private _hydrateAutoDreamOptimizerProposals(input: HydrateAutoDreamOptimizerProposalsInput): Promise<AutoDreamOptimizerProposal[]> {
     return _hydrateAutoDreamOptimizerProposalsImpl.call(this as unknown as AgentHandlersHost, input)
   }
 
@@ -1955,20 +1919,7 @@ export class Gateway {
     _dropDelegateInflightSurfaceImpl.call(this as unknown as DelegateSupervisionHost, jobId)
   }
 
-  private _touchDelegateInflightSurface(input: {
-    jobId?: string
-    progressRunId?: string
-    parentSessionKey?: string
-    agentId: string
-    goal?: string
-    state?: import('@openclaude/protocol').DelegateJobState
-    liveHint?: string
-    runId?: string
-    userId?: string
-    nested?: boolean
-    ownerRunId?: string
-    preserveIdentity?: boolean
-  }): void {
+  private _touchDelegateInflightSurface(input: TouchDelegateInflightSurfaceInput): void {
     _touchDelegateInflightSurfaceImpl.call(this as unknown as DelegateSupervisionHost, input)
   }
 
@@ -2089,28 +2040,19 @@ export class Gateway {
    *   - per-parent:非 review 委派按父分桶计数,单父超上限即 concurrency block(进排队);
    *     review 委派豁免此桶(它有独立保留槽,不受某父 fan-out 挤占)。
    *   缺 parentBucketKey(cron/webhook 父不在内存)→ 只受全局闸,不分桶(与既有行为一致)。 */
-  private _checkDelegateResourceGate(opts?: {
-    parentBucketKey?: string
-    isReview?: boolean
-  }): DelegateGateBlock | null {
+  private _checkDelegateResourceGate(opts?: CheckDelegateResourceGateOpts): DelegateGateBlock | null {
     return _checkDelegateResourceGateImpl.call(this as unknown as DelegateGuardHost, opts)
   }
 
   /** 预占一个并发名额(判定+自增在同一同步段,单线程下原子,等待者间无超发);
    *  被闸拦截则返回原因、不占名额。P2 债C:非 review + 有父桶 → 同步 bump per-parent 运行计数。 */
-  private _tryReserveDelegateSlot(opts?: {
-    parentBucketKey?: string
-    isReview?: boolean
-  }): DelegateGateBlock | null {
+  private _tryReserveDelegateSlot(opts?: TryReserveDelegateSlotOpts): DelegateGateBlock | null {
     return _tryReserveDelegateSlotImpl.call(this as unknown as DelegateRuntimeHost, opts)
   }
 
   /** 释放一个已预占的并发名额(全局 + per-parent)。所有过闸后的路径必须经此释放,
    *  与 _tryReserveDelegateSlot 的增量口径严格对称(否则 per-parent 计数漂移锁死后续委派)。 */
-  private _releaseDelegateSlot(opts?: {
-    parentBucketKey?: string
-    isReview?: boolean
-  }): void {
+  private _releaseDelegateSlot(opts?: ReleaseDelegateSlotOpts): void {
     _releaseDelegateSlotImpl.call(this as unknown as DelegateRuntimeHost, opts)
   }
 
@@ -2130,18 +2072,8 @@ export class Gateway {
    * - 用户 Stop 级联经 _delegateQueueWaiters 回调即时唤醒 → 'aborted';
    * - 无放行顺序保证(非 FIFO):等待者靠轮询抢占,依赖公平性的场景目前不存在。
    */
-  private _waitForDelegateCapacity(args: {
-    sessionKey: string
-    /** P2 债C/3.5 — per-parent 分桶键(队长会话 sessionKey);缺省 → 只走全局闸。 */
-    parentBucketKey?: string
-    /** P2 债C — review 委派:走保留槽、豁免 per-parent 桶。 */
-    isReview?: boolean
-    onQueued?: (blocked: DelegateGateBlock) => void
-  }): Promise<
-    | { status: 'ok' }
-    | { status: 'queue_full'; blocked: DelegateGateBlock }
-    | { status: 'timeout'; blocked: DelegateGateBlock; waitedMs: number }
-    | { status: 'aborted'; waitedMs: number }
+  private _waitForDelegateCapacity(args: WaitForDelegateCapacityArgs): Promise<
+    WaitForDelegateCapacityResult
   > {
     return _waitForDelegateCapacityImpl.call(this as unknown as DelegateRuntimeHost, args)
   }
@@ -2168,12 +2100,7 @@ export class Gateway {
     return _admitDelegateCreateImpl.call(this as unknown as DelegateRuntimeHost, sessionKey, opts)
   }
 
-  private _formatDelegateConcurrencyReject(opts: {
-    isReview: boolean
-    parentBucketKey?: string
-    waitedS?: number
-    queueFull?: boolean
-  }): string {
+  private _formatDelegateConcurrencyReject(opts: FormatDelegateConcurrencyRejectOpts): string {
     return _formatDelegateConcurrencyRejectImpl.call(this as unknown as DelegateGuardHost, opts)
   }
 
@@ -2183,12 +2110,7 @@ export class Gateway {
    * settle vs claim exclusive; this just chooses drop / fail / already-dispatched
    * on the production write path (not later in the async `.then`).
    */
-  private _applyDelegateCapacityReject(input: RunDelegateInput, args: {
-      httpStatus: number
-      message: string
-      failureClass?: DelegateFailureClass
-      drop: boolean
-    }): DelegateTaskResult {
+  private _applyDelegateCapacityReject(input: RunDelegateInput, args: ApplyDelegateCapacityRejectArgs): DelegateTaskResult {
     return _applyDelegateCapacityRejectImpl.call(this as unknown as DelegateRuntimeHost, input, args)
   }
 
@@ -2204,23 +2126,11 @@ export class Gateway {
    * 追溯纯逻辑在 resolveDelegateProgressRouting(delegateProgress.ts,可单测);本方法只做
    * SessionManager → 追溯所需最小会话视图的适配。断链/环/超深一律返回 null(丢弃,不抛错)。
    */
-  private _resolveDelegateProgressTarget(args: {
-    parentSessionKey?: unknown
-    sourceAgent?: unknown
-  }): DelegateProgressRouting | null {
+  private _resolveDelegateProgressTarget(args: ResolveDelegateProgressTargetArgs): DelegateProgressRouting | null {
     return _resolveDelegateProgressTargetImpl.call(this as unknown as DelegateRuntimeHost, args)
   }
 
-  private _resolveDelegateParent(args: {
-    parentSessionKey?: unknown
-    sourceAgent?: unknown
-  }): {
-    sessionKey: string
-    repoSessionId?: string
-    workspaceMode: 'legacy' | 'isolated_v1'
-    billingParentTurnKey?: string
-    platformGoal?: GoalStateSnapshot | null
-  } | null {
+  private _resolveDelegateParent(args: ResolveDelegateParentArgs): ResolveDelegateParentResult {
     return _resolveDelegateParentImpl.call(this as unknown as DelegateRuntimeHost, args)
   }
 
@@ -2282,12 +2192,7 @@ export class Gateway {
     return _loadClientSessionImpl.call(this as unknown as DelegateGuardHost, sessionId, userId)
   }
 
-  private _parentEngineForCollabSession(input: {
-    sessionId: string
-    userId: string
-    req: IncomingMessage
-    url: URL
-  }): Promise<{ missing: boolean; agentId?: string; engine?: string }> {
+  private _parentEngineForCollabSession(input: ParentEngineForCollabSessionInput): Promise<{ missing: boolean; agentId?: string; engine?: string }> {
     return _parentEngineForCollabSessionImpl.call(this as unknown as DelegateGuardHost, input)
   }
 
@@ -2295,10 +2200,7 @@ export class Gateway {
     _projectAdvisorConsultSettledImpl.call(this as unknown as AdvisorHandlersHost, billing)
   }
 
-  private _collaborationCapabilityFields(input: {
-    sessionId?: string
-    engine?: string
-  }): Record<string, unknown> {
+  private _collaborationCapabilityFields(input: CollaborationCapabilityFieldsInput): Record<string, unknown> {
     return _collaborationCapabilityFieldsImpl.call(this as unknown as DelegateGuardHost, input)
   }
 
@@ -2306,19 +2208,11 @@ export class Gateway {
     return _consultWaitMsImpl.call(this as unknown as DelegateGuardHost)
   }
 
-  private _adviceFromConsult(record: {
-    advice?: string | null
-    jobId?: string | null
-  }): string {
+  private _adviceFromConsult(record: AdviceFromConsultRecord): string {
     return _adviceFromConsultImpl.call(this as unknown as AdvisorHandlersHost, record)
   }
 
-  private _consultJobFailedState(view: {
-    status: string
-    state?: string
-    failure_class?: string
-    httpStatus?: number
-  }): 'failed' | 'cancelled' | null {
+  private _consultJobFailedState(view: ConsultJobFailedStateView): 'failed' | 'cancelled' | null {
     return _consultJobFailedStateImpl.call(this as unknown as DelegateGuardHost, view)
   }
 
@@ -2338,11 +2232,7 @@ export class Gateway {
     return _presentConsultBodyImpl.call(this as unknown as AdvisorHandlersHost, current, extra)
   }
 
-  private _presentExistingConsult(input: {
-    record: import('./advisorConsultStore.js').AdvisorConsultRecord
-    question: string
-    concern: string
-  }): Promise<{ status: number; body: Record<string, unknown> }> {
+  private _presentExistingConsult(input: PresentExistingConsultInput): Promise<{ status: number; body: Record<string, unknown> }> {
     return _presentExistingConsultImpl.call(this as unknown as AdvisorHandlersHost, input)
   }
 
@@ -2350,9 +2240,7 @@ export class Gateway {
     return _freezeAdvisorTurnImpl.call(this as unknown as AdvisorHandlersHost, requested)
   }
 
-  private _invocationFromLiveConsultTool(parent: {
-    runner?: { getPartialSnapshot?: () => { completedTools?: unknown[] } }
-  } | undefined): Promise<{ ok: true; invocationId: string } | { ok: false; reason: 'none' | 'ambiguous' }> {
+  private _invocationFromLiveConsultTool(parent: InvocationFromLiveConsultToolParent): Promise<{ ok: true; invocationId: string } | { ok: false; reason: 'none' | 'ambiguous' }> {
     return _invocationFromLiveConsultToolImpl.call(this as unknown as AdvisorHandlersHost, parent)
   }
 
@@ -2365,26 +2253,12 @@ export class Gateway {
   }
 
   private _resolveAdvisorConsultExecution(advisorModel: string): Promise<
-    | { ok: true; value: AdvisorConsultExecution }
-    | { ok: false; error: string; status: number }
+    ResolveAdvisorConsultExecutionResult
   > {
     return _resolveAdvisorConsultExecutionImpl.call(this as unknown as AdvisorHandlersHost, advisorModel)
   }
 
-  private _spawnCcbAdvisorConsult(input: {
-    consultId: string
-    parent: AgentSession
-    originTurnKey: string
-    snapshot: ReturnType<typeof buildAdvisorSnapshot>
-    execution: AdvisorConsultExecution
-    abort?: AbortController
-    unregister?: (() => void) | null
-  }): Promise<{
-    state: string
-    advice: string
-    jobId?: string
-    error?: string
-  }> {
+  private _spawnCcbAdvisorConsult(input: SpawnCcbAdvisorConsultInput): Promise<SpawnCcbAdvisorConsultResult> {
     return _spawnCcbAdvisorConsultImpl.call(this as unknown as AdvisorHandlersHost, input)
   }
 
@@ -2392,23 +2266,7 @@ export class Gateway {
     return _advisorConsultRouteOverrideImpl.call(this as unknown as AdvisorHandlersHost, route, model)
   }
 
-  private _spawnAdvisorConsult(input: {
-    consultId: string
-    parent: AgentSession
-    originTurnKey: string
-    snapshot: ReturnType<typeof buildAdvisorSnapshot>
-    requestId: string
-    billingApi: typeof defaultDelegateEngineBilling
-    abort?: AbortController
-    unregister?: (() => void) | null
-    codexRoute: import('./engine/codexShared.js').CodexProviderConfigOverride
-  }): Promise<{
-    state: string
-    advice: string
-    jobId?: string
-    error?: string
-    usage?: DurableCodexBilling['usage']
-  }> {
+  private _spawnAdvisorConsult(input: SpawnAdvisorConsultInput): Promise<SpawnAdvisorConsultResult> {
     return _spawnAdvisorConsultImpl.call(this as unknown as AdvisorHandlersHost, input)
   }
 
@@ -2508,10 +2366,7 @@ export class Gateway {
     return injectCronOriginSessionImpl.call(this as unknown as CronTaskWebhookHost, job, delivery, override)
   }
 
-  private _acquireSyntheticTurnBarrier(sessionKey: string): Promise<{
-    owner: string
-    release: () => void
-  }> {
+  private _acquireSyntheticTurnBarrier(sessionKey: string): Promise<AcquireSyntheticTurnBarrierResult> {
     return _acquireSyntheticTurnBarrierImpl.call(this as unknown as TurnDispatchHost, sessionKey)
   }
 
@@ -2557,14 +2412,7 @@ export class Gateway {
    * bounded backoff as send_to_agent. Parent CCB process already dead
    * is not covered.
    */
-  private injectCcbLocalAgentCallback(args: {
-    sessionKey: string
-    userId?: string
-    taskId: string
-    status?: string
-    outputFile?: string
-    summary?: string
-  }): Promise<CronOriginFireResult> {
+  private injectCcbLocalAgentCallback(args: InjectCcbLocalAgentCallbackArgs): Promise<CronOriginFireResult> {
     return injectCcbLocalAgentCallbackImpl.call(this as unknown as DelegateCallbacksHost, args)
   }
 
@@ -2589,18 +2437,7 @@ export class Gateway {
    * send_to_agent 完成后注入父 webchat：等父 turn 不在飞，再写 user 行并
    * dispatchInbound 新开父 turn。不走 lastActiveChannel 的 📨 WS 旁路。
    */
-  private injectSendToAgentCallback(args: {
-    parentSessionKey?: string
-    jobId: string
-    agentId: string
-    goal: string
-    output?: string
-    error?: string
-    userId?: string
-    clientMessageId?: string
-    /** Stage 2 notifier: one try, BUSY returns to pending instead of 12-then-fallback. */
-    once?: boolean
-  }): Promise<CronOriginFireResult> {
+  private injectSendToAgentCallback(args: InjectSendToAgentCallbackArgs): Promise<CronOriginFireResult> {
     return injectSendToAgentCallbackImpl.call(this as unknown as DelegateCallbacksHost, args)
   }
 
@@ -2616,13 +2453,7 @@ export class Gateway {
     return trySendToAgentCallbackDispatchImpl.call(this as unknown as DelegateCallbacksHost, args)
   }
 
-  private _sendToAgentCallbackTurnAlreadyQueued(args: {
-    jobId: string
-    userId: string
-    sessionKey: string
-    sessionId: string
-    clientMessageId: string
-  }): Promise<boolean> {
+  private _sendToAgentCallbackTurnAlreadyQueued(args: SendToAgentCallbackTurnAlreadyQueuedArgs): Promise<boolean> {
     return _sendToAgentCallbackTurnAlreadyQueuedImpl.call(this as unknown as DelegateCallbacksHost, args)
   }
 
@@ -2872,32 +2703,12 @@ export class Gateway {
     return _dispatchAdmittedClientTurnImpl.call(this as unknown as TurnDispatchHost, frame)
   }
 
-  private handleStop(frame: {
-    type: 'inbound.control.stop'
-    channel: string
-    peer: { id: string; kind: 'dm' | 'group' }
-    agentId?: string
-    sessionKey?: string
-    clientMessageId?: string
-  }): Promise<boolean> {
+  private handleStop(frame: HandleStopFrame): Promise<boolean> {
     return handleStopImpl.call(this as unknown as WsConnectionHost, frame)
   }
 
   /** Handle permission approval/denial from the web frontend */
-  private handlePermissionResponse(frame: {
-    type: 'inbound.permission_response'
-    channel: string
-    peer: { id: string; kind: 'dm' | 'group' }
-    agentId?: string
-    requestId: string
-    behavior: 'allow' | 'deny'
-    message?: string
-    /** Optional client-supplied tool input override (currently only used by
-     *  AskUserQuestion to carry user-selected `answers` + `annotations`).
-     *  Sanitized via `sanitizeAskUserQuestionUpdatedInput` before being
-     *  forwarded to CCB; untrusted client fields are dropped. */
-    updatedInput?: Record<string, unknown>
-  }): Promise<void> {
+  private handlePermissionResponse(frame: HandlePermissionResponseFrame): Promise<void> {
     return handlePermissionResponseImpl.call(this as unknown as AskUserPermissionsHost, frame)
   }
 
@@ -2906,15 +2717,7 @@ export class Gateway {
    *  other tabs render the collected answers in the permission card, and
    *  lets the sender tab keep its optimistic state in sync if we later
    *  switch semantics (e.g. if answers get server-side post-processing). */
-  private _broadcastPermissionSettled(peerKey: string, payload: {
-      sessionKey: string
-      channel: string
-      peer: { id: string; kind: 'dm' | 'group' }
-      requestId: string
-      behavior: 'allow' | 'deny'
-      reason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed' | 'user_stop'
-      answers?: Record<string, string>
-    }): void {
+  private _broadcastPermissionSettled(peerKey: string, payload: BroadcastPermissionSettledPayload): void {
     _broadcastPermissionSettledImpl.call(this as unknown as AskUserPermissionsHost, peerKey, payload)
   }
 
@@ -2962,26 +2765,12 @@ export class Gateway {
   /** Record an authoritative settlement for later replay to late duplicates.
    *  `answers` is carried so that a 3rd tab hitting the already-settled
    *  replay path still sees the collected AskUserQuestion answers. */
-  private _recordSettlement(requestId: string, entry: {
-      behavior: 'allow' | 'deny'
-      channel: string
-      peer: { id: string; kind: 'dm' | 'group' }
-      sessionKey: string
-      userId: string
-      answers?: Record<string, string>
-    }): void {
+  private _recordSettlement(requestId: string, entry: RecordSettlementEntry): void {
     _recordSettlementImpl.call(this as unknown as TurnDispatchHost, requestId, entry)
   }
 
   /** Look up a recent settlement, honoring TTL (returns null if expired). */
-  private _lookupSettlement(requestId: string): {
-    behavior: 'allow' | 'deny'
-    channel: string
-    peer: { id: string; kind: 'dm' | 'group' }
-    sessionKey: string
-    userId: string
-    answers?: Record<string, string>
-  } | null {
+  private _lookupSettlement(requestId: string): LookupSettlementResult {
     return _lookupSettlementImpl.call(this as unknown as TurnDispatchHost, requestId)
   }
 
@@ -3009,20 +2798,7 @@ export class Gateway {
    * same dispatchInbound path used after timeout. `tryClaimDelivery` is the
    * synchronous one-shot so HTTP success and compensation cannot both fire.
    */
-  private _finishInWindowAskUserWait(args: {
-    req: IncomingMessage
-    res: ServerResponse
-    waiter: AskUserWaiter
-    result: { status: 'answered'; answer: AskUserWaiterAnswer }
-    requestId: string
-    pending: {
-      sessionKey: string
-      userId: string
-      channel: string
-      peer: { id: string; kind: 'dm' | 'group' }
-    }
-    clientGone: boolean
-  }): Promise<void> {
+  private _finishInWindowAskUserWait(args: FinishInWindowAskUserWaitArgs): Promise<void> {
     return _finishInWindowAskUserWaitImpl.call(this as unknown as AskUserPermissionsHost, args)
   }
 
@@ -3030,34 +2806,15 @@ export class Gateway {
    * In-window answer could not be written back to the MCP HTTP caller.
    * Reuse the timeout-then-answer path: tape user-answer row + dispatchInbound.
    */
-  private _compensateInWindowAskUserAnswer(pending: {
-      sessionKey: string
-      userId: string
-      channel: string
-      peer: { id: string; kind: 'dm' | 'group' }
-    }, requestId: string, answer: AskUserWaiterAnswer): Promise<void> {
+  private _compensateInWindowAskUserAnswer(pending: CompensateInWindowAskUserAnswerPending, requestId: string, answer: AskUserWaiterAnswer): Promise<void> {
     return _compensateInWindowAskUserAnswerImpl.call(this as unknown as AskUserPermissionsHost, pending, requestId, answer)
   }
 
-  private _persistDetachedAskUserCard(args: {
-    requestId: string
-    questions: Array<Record<string, unknown>>
-    sessionKey: string
-    userId: string
-    channel: string
-    peer: { id: string; kind: 'dm' | 'group' }
-    expiresAt: number
-    agentId: string
-  }): Promise<void> {
+  private _persistDetachedAskUserCard(args: PersistDetachedAskUserCardArgs): Promise<void> {
     return _persistDetachedAskUserCardImpl.call(this as unknown as AskUserPermissionsHost, args)
   }
 
-  private _patchDetachedAskUserResolved(pending: {
-      peer: { id: string; kind?: 'dm' | 'group' }
-      userId: string
-      sessionKey: string
-      channel?: string
-    }, requestId: string, patch: Record<string, unknown>, userAnswer?: { id: string; text: string; ts?: number }): Promise<void> {
+  private _patchDetachedAskUserResolved(pending: PatchDetachedAskUserResolvedPending, requestId: string, patch: Record<string, unknown>, userAnswer?: { id: string; text: string; ts?: number }): Promise<void> {
     return _patchDetachedAskUserResolvedImpl.call(this as unknown as AskUserPermissionsHost, pending, requestId, patch, userAnswer)
   }
 
@@ -3065,24 +2822,11 @@ export class Gateway {
     return _loadDetachedAskUserCardImpl.call(this as unknown as AskUserPermissionsHost, sessionId, userId, requestId)
   }
 
-  private _hydrateDetachedAskUserPending(frame: {
-    requestId: string
-    channel: string
-    peer: { id: string; kind: 'dm' | 'group' }
-    /** Stashed by the WS entrypoint from the authenticated connection, never
-     *  from the client frame — this is the only user identity we can trust
-     *  once the in-memory pending entry is gone (restart / TTL rebuild). */
-    _userId?: unknown
-  }): Promise<ReturnType<typeof pendingFromDetachedAskUserMessage>> {
+  private _hydrateDetachedAskUserPending(frame: HydrateDetachedAskUserPendingFrame): Promise<ReturnType<typeof pendingFromDetachedAskUserMessage>> {
     return _hydrateDetachedAskUserPendingImpl.call(this as unknown as AskUserPermissionsHost, frame)
   }
 
-  private async _submitDetachedAskUserAnswer(pending: {
-      sessionKey: string
-      userId: string
-      channel: string
-      peer: { id: string; kind: 'dm' | 'group' }
-    }, text: string, requestId: string, clientMessageId: string = buildDetachedAskUserAnswerMessageId(requestId)): Promise<void> {
+  private async _submitDetachedAskUserAnswer(pending: SubmitDetachedAskUserAnswerPending, text: string, requestId: string, clientMessageId: string = buildDetachedAskUserAnswerMessageId(requestId)): Promise<void> {
     return _submitDetachedAskUserAnswerImpl.call(this as unknown as AskUserPermissionsHost, pending, text, requestId, clientMessageId)
   }
 
@@ -3171,14 +2915,7 @@ export class Gateway {
     return handleEnginePreheatImpl.call(this as unknown as ChannelHandlersHost, req, res)
   }
 
-  private autoResumeFromHello(peers: Array<{
-      peerId: string
-      agentId: string
-      inFlight?: boolean
-      lastFrameSeq?: number
-      resumeActiveTurnCandidateMessageIds?: unknown
-      inFlightClientMessageId?: string
-    }>, ws: WebSocket): Promise<void> {
+  private autoResumeFromHello(peers: AutoResumeFromHelloPeers, ws: WebSocket): Promise<void> {
     return autoResumeFromHelloImpl.call(this as unknown as WsConnectionHost, peers, ws)
   }
 
@@ -3204,14 +2941,7 @@ export class Gateway {
    * 四个成员上都有(交集字段),所以 narrowing 不需要,直接读即可。
    */
   private deliver(out:
-      | OutboundMessage
-      | OutboundError
-      | OutboundCodexBilling
-      | OutboundExternalEngineBilling
-      | OutboundTurnStatus
-      | OutboundTurnUsage
-      | OutboundCallUsage
-      | SysContextRebuilt, adapter?: ChannelAdapter): void {
+      DeliverOut, adapter?: ChannelAdapter): void {
     deliverImpl.call(this as unknown as WsConnectionHost, out, adapter)
   }
 }

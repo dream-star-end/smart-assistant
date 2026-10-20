@@ -54,17 +54,19 @@ function wechatPeerIdFromSessionKey(sessionKey: string | undefined): string | un
   return /^agent:[^:]+:webchat:dm:(wsess-[0-9a-f]{16})$/.exec(sessionKey)?.[1]
 }
 
-export function _updateWechatIdempotency(
-  this: ChannelHandlersHost,
-  key: string,
-  patch: Partial<{
+export type UpdateWechatIdempotencyPatch = Partial<{
     started: boolean
     completed: boolean
     traceId: string
     sessionKey: string
     peerId: string
     agentId: string
-  }>,
+  }>
+
+export function _updateWechatIdempotency(
+  this: ChannelHandlersHost,
+  key: string,
+  patch: UpdateWechatIdempotencyPatch,
 ): void {
   const entry = this._getIdempotencyEntry(key)
   if (!entry?.wechat) return
