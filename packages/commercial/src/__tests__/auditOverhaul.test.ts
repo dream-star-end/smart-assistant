@@ -287,6 +287,7 @@ describe("auditRetention — 政策注册表与 sweeper", () => {
       },
       // 批D D3:注入 session_goals 终态清理(默认会打真 query,单测里注入避免碰 DB)。
       sessionGoalsPurgeFn: async () => 7,
+      wechatAuditPurgeFn: async () => 0,
       onError: (table) => { errs.push(table); },
     });
     try {
@@ -323,6 +324,7 @@ describe("auditRetention — 政策注册表与 sweeper", () => {
         return 1;
       },
       sessionGoalsPurgeFn: async () => 0,
+      wechatAuditPurgeFn: async () => 0,
     });
 
     await entered;
@@ -347,6 +349,7 @@ describe("auditRetention — 政策注册表与 sweeper", () => {
       intervalMs: 60_000,
       purgeFn: async () => 0,
       sessionGoalsPurgeFn: async () => { throw new Error("goals boom"); },
+      wechatAuditPurgeFn: async () => 0,
       onError: (table) => { errs.push(table); },
     });
     try {
