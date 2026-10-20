@@ -176,7 +176,7 @@ test('an early claimed train keeps its exact source when shared HEAD advances du
   const start = deploy.indexOf('  ensure_model_authority\n', deploy.indexOf('cmd_deploy()'))
   const end = deploy.indexOf('  build_master_release "$sha"', start)
   assert.ok(start > 0 && end > start)
-  const actual = deploy.slice(start, end) + '  build_master_release "$sha"\n'
+  const actual = `${deploy.slice(start, end)}  build_master_release "$sha"\n`
   const a = 'a'.repeat(40)
   const b = 'b'.repeat(40)
   for (const active of [0, 1]) {
