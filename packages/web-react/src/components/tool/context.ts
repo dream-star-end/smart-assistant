@@ -22,6 +22,8 @@ export type ToolCardActions = {
   onOpenTasks?: () => void;
   /** 论文卡动作（scansci 下载 PDF / 生成引用）。 */
   onPaperAction?: (action: "download" | "citation", identifier: string) => void;
+  /** 文献数据库插件 PDF 产物受鉴权下载（返回 Blob 触发浏览器保存）。 */
+  downloadLiteratureArtifact?: (artifactId: string) => Promise<Blob>;
   /**
    * 连接器写操作确认卡（oc-connect，human-in-the-loop）：详情拉取 + 批准/拒绝。
    * 需登录鉴权（Bearer），由 App 绑定 authRef 注入；无 provider（demo/未登录）时

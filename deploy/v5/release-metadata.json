@@ -184,7 +184,8 @@
     "0310_antigravity_claude_55",
     "0311_antigravity_paid_tier",
     "0312_antigravity_gemini_4_argon",
-    "0313_selfhost_go_beam_minimax31"
+    "0313_selfhost_go_beam_minimax31",
+    "0316_commercial_literature_captcha_requests"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

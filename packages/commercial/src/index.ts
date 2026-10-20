@@ -586,6 +586,7 @@ import { KnowledgePlanetAutomationService } from './plugins/knowledgePlanetAutom
 import { startKnowledgePlanetAutomationScheduler } from './plugins/knowledgePlanetAutomationScheduler.js'
 import { WeiboDockerService, createWeiboRuntimeRegistries } from './plugins/weibo.js'
 import { WeiboSetupManager } from './plugins/weiboSetup.js'
+import { createCommercialLiteratureRuntime } from './plugins/literatureDb/jieyouLoginSession.js'
 import { ZhihuDockerService, createZhihuRuntimeRegistries } from './plugins/zhihu.js'
 import { ZhihuSetupManager } from './plugins/zhihuSetup.js'
 import {
@@ -1709,6 +1710,7 @@ export async function registerCommercial(
   let biliAccountService: BiliAccountDockerService | undefined
   let biliAccountSetup: BiliAccountSetupManager | undefined
   let knowledgePlanetAutomation: KnowledgePlanetAutomationService | undefined
+  const { literatureSetup, literatureArtifacts, literatureHttp, literatureRelogin } = createCommercialLiteratureRuntime({ runtimeChannel, redis })
   let pluginFacade: PluginRuntimeFacade
   if (runtimeChannel === 'v5' && cfg.OC_RUNTIME_IMAGE_ID) {
     const pluginDocker = cfg.AGENT_DOCKER_SOCKET
@@ -1771,6 +1773,8 @@ export async function registerCommercial(
       redis,
       browserRuntime,
       knowledgePlanetMedia: knowledgePlanetMediaDeps,
+      literatureHttp,
+      literatureRelogin,
       pluginEnablement: PREFS_PLUGIN_ENABLEMENT,
     })
     knowledgePlanetSetup = new KnowledgePlanetSetupManager(knowledgePlanetService, {
@@ -1790,7 +1794,7 @@ export async function registerCommercial(
     })
     knowledgePlanetAutomation = new KnowledgePlanetAutomationService(pluginFacade)
   } else {
-    pluginFacade = new PluginRuntimeFacade({ redis, pluginEnablement: PREFS_PLUGIN_ENABLEMENT })
+    pluginFacade = new PluginRuntimeFacade({ redis, literatureHttp, literatureRelogin, pluginEnablement: PREFS_PLUGIN_ENABLEMENT })
   }
 
   // T-53: 装配 agent 运行时(image + seccomp + rpc dir + lifecycle scheduler)。
@@ -4430,6 +4434,8 @@ export async function registerCommercial(
     pluginRuntime: pluginFacade,
     knowledgePlanetSetup,
     weiboSetup,
+    literatureSetup,
+    literatureArtifacts,
     zhihuSetup,
     biliAccountSetup,
     knowledgePlanetAutomation,
@@ -7207,9 +7213,11 @@ export async function registerCommercial(
       try { await cursorExternalRoute?.close(); } catch { /* ignore */ }
       // Managed setup/action workers must drain while PG/Redis and Docker control are alive.
       try {
-        await Promise.all([
+        await Promise.allSettled([
           knowledgePlanetSetup?.closeAndDrain(),
           weiboSetup?.closeAndDrain(),
+          literatureSetup.close(),
+          Promise.resolve().then(() => literatureArtifacts?.close()),
           zhihuSetup?.closeAndDrain(),
           biliAccountSetup?.closeAndDrain(),
         ])
