@@ -18,102 +18,147 @@ import json
 import re
 import sys
 
-COMPAT_RE = re.compile(r"--\s*compat:\s*(\S.*?)\s*$", re.I | re.M)
+# The reason must be on the same line as `-- compat:` (no newline in between).
+COMPAT_RE = re.compile(r"--[ \t]*compat:[ \t]*(\S[^\n]*?)[ \t]*$", re.I | re.M)
 
 
-def split_statements(text):
-    """Split SQL into statements, honouring '...' strings, "..." identifiers, $tag$ bodies, -- and
-    /* */ comments. Returns (statements, error); each statement is (start_line, leading_comments, body)."""
-    out = []
-    i, n = 0, len(text)
-    line = 1
-    buf = []
-    lead = []          # comments seen before the statement's first code character
-    start_line = None
-    error = None
-
-    def flush():
-        nonlocal buf, lead, start_line
-        body = "".join(buf).strip()
-        if body:
-            out.append((start_line or line, "".join(lead), body))
-        buf, lead, start_line = [], [], None
-
+def tokenize(text):
+    """One pass over PostgreSQL text. Yields (kind, value, line): kind is "comment", "string" (any
+    quoted literal, E'..' with backslash escapes, $tag$ bodies), "ident" ("quoted" identifiers),
+    "semi" or "code". Raises ValueError on an unterminated literal or comment."""
+    i, n, line = 0, len(text), 1
     while i < n:
         c = text[i]
-        if c == "-" and text.startswith("--", i):
+        start_line = line
+        if text.startswith("--", i):
             j = text.find("\n", i)
             j = n if j < 0 else j
-            (buf if buf and "".join(buf).strip() else lead).append(text[i:j] + "\n")
+            yield "comment", text[i:j], start_line
             i = j
             continue
-        if c == "/" and text.startswith("/*", i):
-            j = text.find("*/", i + 2)
-            if j < 0:
-                error = f"unterminated block comment at line {line}"
-                break
-            seg = text[i:j + 2]
-            (buf if buf and "".join(buf).strip() else lead).append(seg)
+        if text.startswith("/*", i):
+            depth, j = 1, i + 2          # PostgreSQL block comments nest
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth += 1; j += 2
+                elif text.startswith("*/", j):
+                    depth -= 1; j += 2
+                else:
+                    j += 1
+            if depth:
+                raise ValueError(f"unterminated block comment at line {start_line}")
+            seg = text[i:j]
             line += seg.count("\n")
-            i = j + 2
+            yield "comment", seg, start_line
+            i = j
             continue
-        if c in "'\"":
-            j = i + 1
+        if c == "'" or (c in "eE" and text.startswith("'", i + 1) and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_"))):
+            esc = c in "eE"
+            j = i + (2 if esc else 1)
             while j < n:
-                if text[j] == c:
-                    if j + 1 < n and text[j + 1] == c:
+                if esc and text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == "'":
+                    if j + 1 < n and text[j + 1] == "'":
                         j += 2
                         continue
                     break
                 j += 1
             if j >= n:
-                error = f"unterminated quote at line {line}"
-                break
+                raise ValueError(f"unterminated string at line {start_line}")
             seg = text[i:j + 1]
-            if start_line is None:
-                start_line = line
-            buf.append(seg)
             line += seg.count("\n")
+            yield "string", seg, start_line
+            i = j + 1
+            continue
+        if c == '"':
+            j = text.find('"', i + 1)
+            while j >= 0 and text.startswith('""', j):
+                j = text.find('"', j + 2)
+            if j < 0:
+                raise ValueError(f"unterminated identifier at line {start_line}")
+            seg = text[i:j + 1]
+            line += seg.count("\n")
+            yield "ident", seg, start_line
             i = j + 1
             continue
         if c == "$":
             m = re.match(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$", text[i:])
-            if m:
+            if m and not (i > 0 and (text[i - 1].isalnum() or text[i - 1] == "_")):
                 tag = m.group(0)
                 j = text.find(tag, i + len(tag))
                 if j < 0:
-                    error = f"unterminated {tag} body at line {line}"
-                    break
+                    raise ValueError(f"unterminated {tag} body at line {start_line}")
                 seg = text[i:j + len(tag)]
-                if start_line is None:
-                    start_line = line
-                buf.append(seg)
                 line += seg.count("\n")
+                yield "string", seg, start_line
                 i = j + len(tag)
                 continue
         if c == ";":
-            buf.append(c)
-            flush()
+            yield "semi", c, start_line
             i += 1
             continue
-        if c == "\n":
-            line += 1
-        if not c.isspace() and start_line is None:
-            start_line = line
-        buf.append(c)
-        i += 1
-    if error is None:
-        flush()
-    return out, error
+        j = i + 1
+        while j < n:
+            d = text[j]
+            if d in "';\"$" or text.startswith(("--", "/*"), j):
+                break
+            if d in "eE" and text.startswith("'", j + 1) and not (text[j - 1].isalnum() or text[j - 1] == "_"):
+                break
+            j += 1
+        seg = text[i:j]
+        line += seg.count("\n")
+        yield "code", seg, start_line
+        i = j
 
 
-def code_only(body):
-    """Statement text with comments and string/dollar-quoted contents blanked (keywords only)."""
-    s = re.sub(r"/\*.*?\*/", " ", body, flags=re.S)
-    s = re.sub(r"--[^\n]*", " ", s)
-    s = re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$.*?\$\1\$", " $BODY$ ", s, flags=re.S)
-    s = re.sub(r"'(?:[^']|'')*'", "''", s)
-    return re.sub(r"\s+", " ", s).strip()
+def split_statements(text):
+    """Statements as (start_line, leading_comments, code_text): code_text keeps keywords and blanks
+    every literal ('' for strings, "" for identifiers is kept as written, $BODY$ for dollar bodies);
+    leading_comments are the comments between the previous statement and this one's first token."""
+    out, lead, code, start, bodies = [], [], [], None, []
+    for kind, val, line in tokenize(text):
+        if kind == "semi":
+            if code:
+                out.append((start, "\n".join(lead), re.sub(r"\s+", " ", "".join(code)).strip(), bodies))
+            lead, code, start, bodies = [], [], None, []
+            continue
+        if kind == "comment":
+            if not "".join(code).strip():
+                lead.append(val)
+            code.append(" ")
+            continue
+        if kind == "string":
+            if val.startswith("$"):
+                bodies.append(re.sub(r"^\$[A-Za-z0-9_]*\$|\$[A-Za-z0-9_]*\$$", "", val))
+            code.append(" $BODY$ " if val.startswith("$") else " '' ")
+        else:
+            code.append(val)
+        if start is None and val.strip():
+            start = line + val[:len(val) - len(val.lstrip())].count("\n")
+    if "".join(code).strip():
+        out.append((start, "\n".join(lead), re.sub(r"\s+", " ", "".join(code)).strip(), bodies))
+    return out
+
+
+def body_kinds(bodies):
+    """Kinds found in dollar-quoted bodies (DO blocks, functions), so the reviewer sees what the
+    procedural code does. The statement is already a candidate on its own; this only adds detail."""
+    kinds = set()
+    for b in bodies:
+        try:
+            inner = split_statements(b)
+        except ValueError:
+            kinds.add("unparseable-body")
+            continue
+        for _s, _l, code, sub in inner:
+            u = code.upper()
+            kinds |= {k for k, rx in RULES if re.search(rx, u)}
+            if re.match(r"^ALTER\s+TABLE\b", u):
+                kinds |= alter_table_kinds(u)
+            kinds |= body_kinds(sub)
+    return kinds
 
 
 RULES = [
@@ -128,22 +173,32 @@ RULES = [
     ("trigger", r"\b(?:CREATE|ALTER|DROP)\s+(?:OR\s+REPLACE\s+)?(?:CONSTRAINT\s+)?TRIGGER\b|\b(?:ENABLE|DISABLE)\s+TRIGGER\b"),
     ("function", r"\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\b"),
     ("replace-view", r"\bCREATE\s+OR\s+REPLACE\s+(?:VIEW|RULE)\b"),
-    ("update", r"(?:^|\)\s*|\bWITH\b.*\b)UPDATE\s+(?!OF\b)[\w\".]+\s+(?:AS\s+\w+\s+)?SET\b|\bDO\s+UPDATE\b"),
-    ("delete", r"(?:^|\)\s*|\bWITH\b.*\b)DELETE\s+FROM\b"),
+    ("update", r"\bUPDATE\s+(?:ONLY\s+)?(?!OF\b)[\w\".]+\s+(?:(?:AS\s+)?\w+\s+)?SET\b|\bDO\s+UPDATE\b"),
+    ("delete", r"\bDELETE\s+FROM\b"),
     ("truncate", r"^TRUNCATE\b"),
     ("dynamic-or-procedural", r"^DO\b|\bEXECUTE\b(?!\s+(?:FUNCTION|PROCEDURE)\b)|\bCALL\b"),
     ("revoke", r"^REVOKE\b"),
     ("policy", r"\b(?:CREATE|ALTER)\s+POLICY\b|\b(?:ENABLE|FORCE)\s+ROW\s+LEVEL\s+SECURITY\b"),
 ]
 # Statement forms that are additive by themselves (a new table, a plain index, a seed row...).
-# Anything else with no rule hit is "unclassified" (fail closed, needs a declaration).
+# A statement starting any other way is a candidate: by its leading keyword when known
+# (LEADING), otherwise "unclassified" (fail closed). RULES then add what they find inside.
 ADDITIVE_START = re.compile(
-    r"^(?:CREATE\s+(?:TABLE|INDEX|SEQUENCE|SCHEMA|EXTENSION|TYPE|VIEW)\b|CREATE\s+(?:UNIQUE\s+)?INDEX\b|INSERT\b|"
+    r"^(?:CREATE\s+(?:TABLE|INDEX|SEQUENCE|SCHEMA|EXTENSION|VIEW)\b|CREATE\s+TYPE\b|CREATE\s+UNIQUE\s+INDEX\b|INSERT\b|"
     r"COMMENT\s+ON\b|GRANT\b|SELECT\b|SET\b|BEGIN\b|START\s+TRANSACTION\b|COMMIT\b|ANALYZE\b|LOCK\b|"
-    r"CREATE\s+TEMP(?:ORARY)?\s+TABLE\b|"
-    r"ALTER\s+TABLE\b|ALTER\s+TYPE\s+[\w\".]+\s+ADD\s+VALUE\b|"
-    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE|TRIGGER|VIEW|RULE)\b|CREATE\s+CONSTRAINT\s+TRIGGER\b|"
-    r"DROP\b|UPDATE\b|DELETE\b|WITH\b|DO\b|TRUNCATE\b|CALL\b|ALTER\s+TYPE\b|REVOKE\b)")
+    r"CREATE\s+TEMP(?:ORARY)?\s+TABLE\b|ALTER\s+TABLE\b|ALTER\s+TYPE\s+[\w\".]+\s+ADD\s+VALUE\b|"
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE|TRIGGER|VIEW|RULE)\b|CREATE\s+CONSTRAINT\s+TRIGGER\b)")
+LEADING = [
+    ("drop-object", r"^DROP\b"),
+    ("update", r"^UPDATE\b"),
+    ("delete", r"^DELETE\b"),
+    ("truncate", r"^TRUNCATE\b"),
+    ("cte", r"^WITH\b"),
+    ("dynamic-or-procedural", r"^(?:DO|CALL|EXECUTE|PREPARE)\b"),
+    ("revoke", r"^REVOKE\b"),
+    ("alter-type", r"^ALTER\s+(?:TYPE|DOMAIN)\b"),
+    ("alter-other", r"^ALTER\b"),
+]
 
 
 def alter_table_kinds(u):
@@ -176,14 +231,13 @@ def alter_table_kinds(u):
 
 
 def classify(body):
-    u = code_only(body).upper()
+    u = body.upper()
     kinds = {k for k, rx in RULES if re.search(rx, u)}
     if re.match(r"^ALTER\s+TABLE\b", u):
         kinds |= alter_table_kinds(u)
-    if re.match(r"^ALTER\s+TYPE\b", u) and not re.match(r"^ALTER\s+TYPE\s+[\w\".]+\s+ADD\s+VALUE\b", u):
-        kinds.add("alter-type")
     if not ADDITIVE_START.match(u):
-        kinds.add("unclassified")
+        lead = [k for k, rx in LEADING if re.match(rx, u)]
+        kinds.add(lead[0] if lead else "unclassified")
     return sorted(kinds)
 
 
@@ -193,19 +247,20 @@ def check_file(path):
     except OSError as e:
         print(json.dumps({"file": path, "error": str(e)}))
         return None
-    stmts, error = split_statements(text)
     found = []
-    if error:
-        found.append({"file": path, "line": 0, "kinds": ["unparseable"], "declared": False, "reason": None, "snippet": error})
+    try:
+        stmts = split_statements(text)
+    except ValueError as e:
+        found.append({"file": path, "line": 0, "kinds": ["unparseable"], "declared": False, "reason": None, "snippet": str(e)})
         return found
-    for start, lead, body in stmts:
-        kinds = classify(body)
+    for start, lead, body, bodies in stmts:
+        kinds = sorted(set(classify(body)) | body_kinds(bodies)) if bodies else classify(body)
         if not kinds:
             continue
         reasons = COMPAT_RE.findall(lead)
         reason = reasons[-1] if reasons else None
         found.append({"file": path, "line": start, "kinds": kinds, "declared": bool(reason), "reason": reason,
-                      "snippet": code_only(body)[:160]})
+                      "snippet": body[:160]})
     return found
 
 

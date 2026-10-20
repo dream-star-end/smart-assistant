@@ -63,6 +63,14 @@ red "SET DEFAULT on existing column" "ALTER TABLE t ALTER COLUMN a SET DEFAULT '
 red "unknown statement" "VACUUM t;" unclassified
 red "REVOKE" "REVOKE ALL ON TABLE t FROM app;" revoke
 red "replace view" "CREATE OR REPLACE VIEW v AS SELECT 1;" replace-view
+# Codex r1 repros (false negatives that must be red).
+red "UPDATE with an alias" "UPDATE t x SET a = 1;" update
+red "UPDATE ONLY" "UPDATE ONLY t SET a = 1;" update
+red "any DROP, e.g. DROP DOMAIN" "DROP DOMAIN old_type CASCADE;" drop-object
+red "a '--' inside a string does not hide the rest" "ALTER TABLE t ADD COLUMN b text DEFAULT '--', ALTER COLUMN a SET NOT NULL;" set-not-null
+red "ALTER DOMAIN" "ALTER DOMAIN d SET NOT NULL;" alter-type
+red "WITH ... INSERT" "WITH s AS (SELECT 1) INSERT INTO t SELECT * FROM s;" cte
+red "DO block shows what its body does" "DO \$\$ BEGIN ALTER TABLE t ADD CONSTRAINT c CHECK (a > 0); END \$\$;" add-constraint
 # Additive forms stay green.
 green "new table with NOT NULL/UNIQUE inside" "CREATE TABLE IF NOT EXISTS t (id bigint PRIMARY KEY, a text NOT NULL UNIQUE);"
 green "plain index" "CREATE INDEX IF NOT EXISTS t_a ON t (a);"
@@ -80,6 +88,14 @@ printf '%s\n' "-- compat: covers the first one only" "UPDATE t SET a = 1;" "UPDA
 out="$(python3 "$DET" "$T/m.sql")"; rc=$?
 [[ "$rc" == 1 && "$(jq -s 'map(.declared)' <<<"$out" | tr -d ' \n')" == "[true,false]" ]] \
   && ok "a declaration covers only the statement right after it" || bad "declaration scope (rc=$rc)"
+printf '%s\n' "-- compat: only notes.body is new" "UPDATE notes SET body = E'can\\'t';" "UPDATE t SET a = 1;" "INSERT INTO notes VALUES (E'won\\'t');" >"$T/m.sql"
+out="$(python3 "$DET" "$T/m.sql")"; rc=$?
+[[ "$rc" == 1 && "$(jq -s 'map([.line, .declared])' <<<"$out" | tr -d ' \n')" == "[[2,true],[3,false]]" ]] \
+  && ok "E'..' backslash escapes do not merge statements (Codex r1)" || bad "E-string escapes (rc=$rc): $out"
+printf '%s\n' "-- compat:" "-- unrelated comment" "UPDATE t SET a = 1;" >"$T/m.sql"
+python3 "$DET" "$T/m.sql" >/dev/null; [[ $? == 1 ]] && ok "an empty reason does not borrow the next comment line (Codex r1)" || bad "empty reason next line"
+printf '%s\n' "/* outer /* nested */ still a comment; DROP TABLE x; */ CREATE INDEX i ON t (a);" >"$T/m.sql"
+python3 "$DET" "$T/m.sql" >/dev/null; [[ $? == 0 ]] && ok "nested block comments are comments" || bad "nested comments"
 printf '%s\n' "-- compat:" "UPDATE t SET a = 1;" >"$T/m.sql"
 python3 "$DET" "$T/m.sql" >/dev/null; [[ $? == 1 ]] && ok "an empty reason is not a declaration" || bad "empty reason"
 printf '%s\n' "UPDATE t SET a = 1; -- compat: trailing comment belongs to the next statement" >"$T/m.sql"
