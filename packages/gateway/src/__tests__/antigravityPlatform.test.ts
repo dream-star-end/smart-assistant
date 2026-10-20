@@ -45,8 +45,12 @@ test('launch HOME profile gives a login shell the selfhost host wrapper', async 
       cleanupAntigravityLaunch(projection)
     }
   } finally {
-    if (previousHome === undefined) process.env.OPENCLAUDE_HOME = undefined
-    else process.env.OPENCLAUDE_HOME = previousHome
+    if (previousHome === undefined) {
+      // biome-ignore lint/performance/noDelete: assigning undefined stores the string "undefined"
+      delete process.env.OPENCLAUDE_HOME
+    } else {
+      process.env.OPENCLAUDE_HOME = previousHome
+    }
     await rm(root, { recursive: true, force: true })
   }
 })
