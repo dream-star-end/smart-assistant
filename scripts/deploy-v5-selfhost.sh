@@ -133,6 +133,11 @@ DEPLOY_BUILT_RELEASE=""
 DEPLOY_BUILT_SOURCE_COMMIT=""
 CUTOVER_JOINT=0
 CUTOVER_TUPLE_BUNDLE=""
+# OCV5-534 --rollback 的已验证身份只由 cmd_rollback 设置;绝不从环境继承(否则 --cutover 可伪造回退身份绕过 HEAD 校验与迁移门)。
+CUTOVER_ROLLBACK=0
+ROLLBACK_SHA=""
+ROLLBACK_FROM=""
+ROLLBACK_ORIG_PREV=""
 # Lease Center(OCV5-131):worker 发车时传 --lease-train=<tr-*> --target-sha=<sha>;
 # 人工直跑 --deploy 时脚本自己登记一条 manual train,让 worker 能对账、不会在同一窗口再发一班。
 LEASE_TRAIN_ID=""
@@ -214,6 +219,9 @@ cleanup_selfhost_deploy() {
     exit 86
   fi
   if [[ "$exit_rc" != 0 ]]; then release_policy_abort_unexposed || true; fi
+  if [[ "$exit_rc" != 0 ]] && declare -F rollback_restore_prev_if_unchanged >/dev/null 2>&1; then
+    rollback_restore_prev_if_unchanged || true
+  fi
   # 后台 runtime release 段必须先收尾,再释放锁/train(否则下一次 deploy 可能与它并发写 runtime-releases)。
   if declare -F reap_runtime_release_bg >/dev/null 2>&1; then reap_runtime_release_bg || true; fi
   # 函数定义在后面;参数校验阶段的 die 也会进这里,此时函数尚不存在。
@@ -3080,6 +3088,19 @@ cmd_cutover() {
   cutover_clog "✓ --cutover 完成 live → $rel"
 }
 
+# cmd_cutover 在等空闲之前就把 .prev-release 改成当前 live。回退没生效(切流前失败,或被补偿切回原 live)
+# 时把它恢复成原来的上一版,否则下一次 --rollback 会因“上一版就是 live”被拒。只在仍持锁的 EXIT 里调用。
+rollback_restore_prev_if_unchanged() {
+  [[ "${CUTOVER_ROLLBACK:-0}" == 1 && "$DRY" != 1 && -n "$ROLLBACK_FROM" && -n "$ROLLBACK_ORIG_PREV" ]] || return 0
+  [[ "$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)" == "$ROLLBACK_FROM" ]] || return 0
+  [[ "$(tr -d '[:space:]' <"$MASTER_RELEASES_ROOT/.prev-release" 2>/dev/null || true)" != "$ROLLBACK_ORIG_PREV" ]] || return 0
+  if write_prev_release_file "$ROLLBACK_ORIG_PREV"; then
+    log "  回退未生效,live 仍是 $ROLLBACK_FROM:已把 .prev-release 恢复为 $ROLLBACK_ORIG_PREV"
+  else
+    log "  ⚠ 回退未生效,但恢复 .prev-release=$ROLLBACK_ORIG_PREV 失败;下次回退前请人工核对"
+  fi
+}
+
 # OCV5-534(FINDINGS DEP-6):官方回退入口。只解析目标与只读门,翻转完全复用 cmd_cutover 的 joint
 # 状态机(survivor、两级补偿、C1–C3/G1 门、stay 策略都不变),不是第二份切流逻辑。
 cmd_rollback() {
@@ -3089,6 +3110,9 @@ cmd_rollback() {
   [[ -f "$V5_ENV" ]] || die "缺 $V5_ENV,这不是已安装实例。"
   live="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
   rollback_resolve_target || die "回退目标不成立,未改任何东西。现场: live=${live:-?} .prev-release 与 $OC_HOTCFG_HISTORY"
+  CUTOVER_ROLLBACK=1
+  ROLLBACK_FROM="$live"
+  ROLLBACK_ORIG_PREV="$ROLLBACK_MASTER"
   log "  live   = $live"
   log "  目标   = $ROLLBACK_MASTER (sourceCommit ${ROLLBACK_SHA:0:12})"
   log "  四元组 = image=$ROLLBACK_IMAGE id=${ROLLBACK_IMAGE_ID:7:12} runtime=${ROLLBACK_RUNTIME_RELEASE##*/} bundle=${ROLLBACK_BUNDLE##*/}"
@@ -3103,7 +3127,6 @@ cmd_rollback() {
   DEPLOY_BUILT_RELEASE="$ROLLBACK_MASTER"
   DEPLOY_BUILT_SOURCE_COMMIT="$ROLLBACK_SHA"
   CUTOVER_JOINT=1
-  CUTOVER_ROLLBACK=1
   log "── 进入 --cutover 翻转窗口(同一套状态机) release=$ROLLBACK_MASTER ──"
   cmd_cutover
   lease_train_finish committed "rollback committed live=$ROLLBACK_MASTER from=$live"

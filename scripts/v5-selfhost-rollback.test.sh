@@ -135,6 +135,40 @@ unset OC_V5_ALLOW_BREAKING_MIGRATION
 setup s7; printf '0001_a\n0002_b\n0003_c\n0004_ghost\n' >"$C/applied.txt"
 gate_refuses "S7 applied migration with no source" "0004_ghost"
 
+setup s8
+sql_file_has_breaking_ddl() { echo "Traceback: boom" >&2; return 2; }
+gate_refuses "S8 detector error (rc 2) fails closed" "检测器对 0003_c 异常(rc=2)"
+sql_file_has_breaking_ddl() { echo "Traceback: crash" >&2; return 1; }
+gate_refuses "S9 detector crash with rc 1 fails closed" "检测器对 0003_c 异常(rc=1)"
+# shellcheck disable=SC1091
+source "$DIR/lib/v5-migration-ddl.sh"
+
+# P* 回退没生效时恢复 .prev-release(Codex r1 P1)
+eval "$(fn rollback_restore_prev_if_unchanged)"
+log() { :; }
+export DRY=0 CUTOVER_ROLLBACK=1
+setup p1
+ROLLBACK_FROM="$MASTER_RELEASES_ROOT/rel-l"; ROLLBACK_ORIG_PREV="$MASTER_RELEASES_ROOT/rel-p"
+printf '%s\n' "$ROLLBACK_FROM" >"$MASTER_RELEASES_ROOT/.prev-release"   # cmd_cutover 已改写,随后失败,live 未变
+rollback_restore_prev_if_unchanged
+[[ "$(cat "$MASTER_RELEASES_ROOT/.prev-release")" == "$ROLLBACK_ORIG_PREV" ]] \
+  && rollback_resolve_target 2>/dev/null && [[ "$ROLLBACK_MASTER" == "$MASTER_RELEASES_ROOT/rel-p" ]] \
+  && ok "P1 failed rollback restores .prev-release; a retry resolves the same target" || bad "P1 restore"
+setup p2
+ROLLBACK_FROM="$MASTER_RELEASES_ROOT/rel-l"; ROLLBACK_ORIG_PREV="$MASTER_RELEASES_ROOT/rel-p"
+ln -sfn "$MASTER_RELEASES_ROOT/rel-p" "$MASTER_LIVE_LINK"
+printf '%s\n' "$ROLLBACK_FROM" >"$MASTER_RELEASES_ROOT/.prev-release"   # 回退已生效(含 stay 保留)
+rollback_restore_prev_if_unchanged
+[[ "$(cat "$MASTER_RELEASES_ROOT/.prev-release")" == "$MASTER_RELEASES_ROOT/rel-l" ]] \
+  && ok "P2 effective rollback keeps .prev-release = rolled-back-from (roll forward possible)" || bad "P2"
+export CUTOVER_ROLLBACK=0
+
+# E* 回退身份不从环境继承(Codex r1 P1)
+pre="$(awk '/^for arg in "\$@"; do$/{exit} {print}' "$DEPLOY")"
+for v in CUTOVER_ROLLBACK=0 'ROLLBACK_SHA=""' 'ROLLBACK_FROM=""' 'ROLLBACK_ORIG_PREV=""'; do
+  grep -qxF -- "$v" <<<"$pre" && ok "E1 $v reset before argument parsing" || bad "E1 $v not reset at top level"
+done
+
 # W* 接线:回退模式下 cmd_cutover 走回退 schema 门而不是迁移门/迁移 runner
 step3="$(awk '/^cmd_cutover\(\) \{/{f=1} f && /step=3/{g=1} g{print} g && /^  fi$/{exit}' "$DEPLOY")"
 if [[ "$step3" == *'CUTOVER_ROLLBACK:-0}" == 1'*'rollback_schema_gate'*'CUTOVER_HAS_MIGRATION=0'*'gate_cutover_migrations'* ]]; then

@@ -1260,7 +1260,7 @@ rollback_resolve_target() {
 #    (旧代码可能还读被删/改名的列);OC_V5_ALLOW_BREAKING_MIGRATION 对回退无效;
 # ③ COMMERCIAL_AUTO_MIGRATE=0:旧 migrate.ts 规则 (a) 见到目录里没有的已 applied 版本会拒绝,master 起不来。
 rollback_schema_gate() { # <prev-rel> <live-rel>
-  local prev="$1" live="$2" gap applied v sql hit auto newer=0
+  local prev="$1" live="$2" gap applied v sql hit auto out rc r newer=0
   if ! gap="$(read_required_migration_gap "$prev")"; then
     mlog "回退 schema 门: requiredMigrations↔schema_migrations 比对失败(fail-closed)"
     return 1
@@ -1281,8 +1281,18 @@ rollback_schema_gate() { # <prev-rel> <live-rel>
     newer=$((newer + 1))
     sql="$live/packages/commercial/src/db/migrations/$v.sql"
     [[ -f "$sql" ]] || { mlog "回退 schema 门: 库里已 applied 的 $v 在上一版和 live 里都没有原文,来源不明,拒绝"; return 1; }
-    if hit="$(sql_file_has_breaking_ddl "$sql")"; then
+    # 检测器 rc 0=破坏性,1=未命中;但 python 异常也是 rc 1,所以只有“rc 1 且无任何输出”才算安全,其余 fail-closed。
+    out="$( { r=0; sql_file_has_breaking_ddl "$sql" || r=$?; printf '\nrc=%s' "$r"; } 2>&1 )"
+    rc="${out##*rc=}"
+    hit="${out%$'\n'rc=*}"
+    hit="${hit//$'\n'/ }"
+    hit="${hit## }"; hit="${hit%% }"
+    if [[ "$rc" == 0 ]]; then
       mlog "回退 schema 门: 上一版之后 applied 的 $v 含破坏性 DDL($hit),旧代码可能读不到,拒绝回退。改走前滚修复。"
+      return 1
+    fi
+    if [[ "$rc" != 1 || -n "$hit" ]]; then
+      mlog "回退 schema 门: 破坏性 DDL 检测器对 $v 异常(rc=$rc),无法证明兼容,拒绝回退(fail-closed)"
       return 1
     fi
     mlog "  回退 schema 门: 上一版之后 applied 的 $v 为非破坏性 DDL,旧代码可共存"
