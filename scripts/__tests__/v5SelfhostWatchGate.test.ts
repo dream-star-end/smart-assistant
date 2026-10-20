@@ -26,6 +26,7 @@ describe('selfhost watch gate list', () => {
     'v5-selfhost-watch-alert.test.sh',
     'v5-selfhost-gate-fail-stay.test.sh',
     'v5-selfhost-train-recovery.test.sh',
+    'v5-selfhost-rollback.test.sh',
     'v5-selfhost-watch-autorecover.test.sh',
     'v5-selfhost-autorecover.test.sh',
     'v5-selfhost-env-drift.test.sh',

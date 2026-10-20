@@ -30,6 +30,8 @@ source "$DIR/v5-runtime-release-lib.sh"
 source "$DIR/lib/v5-migration-ddl.sh"
 # shellcheck disable=SC1091
 source "$DIR/v5-selfhost-master-release-lib.sh"
+# shellcheck disable=SC1091
+source "$DIR/lib/v5-selfhost-rollback.sh"
 fn() { awk -v n="$1() {" 'index($0, n) == 1 {f=1} f {print} f && /^}/ {exit}' "$DEPLOY"; }
 eval "$(fn cutover_expected_source_commit)"
 
@@ -144,7 +146,6 @@ gate_refuses "S9 detector crash with rc 1 fails closed" "检测器对 0003_c 异
 source "$DIR/lib/v5-migration-ddl.sh"
 
 # P* 回退没生效时恢复 .prev-release(Codex r1 P1)
-eval "$(fn rollback_restore_prev_if_unchanged)"
 log() { :; }
 export DRY=0 CUTOVER_ROLLBACK=1
 setup p1
