@@ -144,5 +144,9 @@ cmd_rollback() {
   log "── 进入 --cutover 翻转窗口(同一套状态机) release=$ROLLBACK_MASTER ──"
   cmd_cutover
   lease_train_finish committed "rollback committed live=$ROLLBACK_MASTER from=$live"
+  if [[ "$DRY" == 1 ]]; then   # OCV5-541: a dry run changed nothing; say what a real run would do
+    log "✓ --rollback --dry-run 计划结束,未改任何东西:实际执行会把 live → $ROLLBACK_MASTER,.prev-release → $live"
+    return 0
+  fi
   log "✓ --rollback 完成 live → $ROLLBACK_MASTER(.prev-release 现指向 $live;再跑一次 --rollback 即前滚回去)"
 }
