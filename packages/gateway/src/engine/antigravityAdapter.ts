@@ -365,6 +365,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       repoSnapshot,
       projectBound: Boolean(this.opts.projectId),
     })
+    const hostBin = probeEnvFacts().hostBin
     const projection = projectAntigravityPlatform({
       credential: {
         accessToken: route.accessToken,
@@ -392,6 +393,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       skillEvalExclude: this.opts.skillEvalExclude,
       skillEvalDraft: this.opts.skillEvalDraft,
       skillTrainRunId: this.opts.skillTrainRunId,
+      hostBin,
     })
     ctx.projection = projection
     const prompt = await this.composePrompt(ctx.params, repoSnapshot, projection.advertisedMcpTools, cwdDecision)
@@ -408,7 +410,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     }
     const env: NodeJS.ProcessEnv = {
       ...isolatedEnv,
-      PATH: antigravitySpawnPath(),
+      PATH: antigravitySpawnPath(hostBin),
       HOME: projection.launchHome,
       XDG_CACHE_HOME: projection.cacheDir,
       OC_AGENT_ID: this.opts.agentId,

@@ -22,7 +22,7 @@
  */
 import { randomBytes } from 'node:crypto'
 import { chmodSync, lstatSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { type IdentityCompatRuntimeContext, identityCompatEnvironment } from '@openclaude/storage'
 
 import { paths } from '@openclaude/storage'
@@ -127,6 +127,8 @@ export interface AntigravityPlatformInput {
   skillEvalExclude?: string
   skillEvalDraft?: { name: string; dir: string }
   skillTrainRunId?: string
+  /** Selfhost host wrapper; its directory is added to the launch login-shell PATH. */
+  hostBin?: string | null
 }
 
 function writePrivate(path: string, value: string): void {
@@ -166,6 +168,13 @@ export function projectAntigravityPlatform(
   const stable = antigravityStableCliDir(root)
   const cacheDir = privateDir(join(root, 'cache'))
   const launchHome = privateDir(join(root, 'launch', randomBytes(8).toString('hex')))
+  // The CLI resolves a login-shell PATH, and this launch HOME is empty. Give
+  // it the selfhost host wrapper directory so `host 'cmd'` survives that
+  // resolution (OCV5-530); commercial turns pass no hostBin.
+  const hostDir = input.hostBin ? dirname(input.hostBin) : null
+  if (hostDir && /^\/[A-Za-z0-9._/-]+$/.test(hostDir)) {
+    writePrivate(join(launchHome, '.profile'), `export PATH='${hostDir}':"$PATH"\n`)
+  }
   const cliDir = privateDir(join(launchHome, '.gemini', 'antigravity-cli'))
   const configDir = privateDir(join(launchHome, '.gemini', 'config'))
   linkShared(join(stable, 'conversations'), join(cliDir, 'conversations'))
