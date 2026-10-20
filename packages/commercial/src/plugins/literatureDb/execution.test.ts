@@ -139,6 +139,26 @@ test('validatePdfStructureSync and validatePdfInIsolatedWorker accept valid PDFs
   assert.equal(validatePdfStructureSync(mismatchedGenerationPdf), false)
   assert.equal(await validatePdfInIsolatedWorker(mismatchedGenerationPdf, signal), false)
 
+  const fontNameWithEndobjSubstringPdf = (() => {
+    const header = '%PDF-1.4\n'
+    const obj1 = '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n'
+    const obj2 = '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n'
+    const obj3 =
+      '3 0 obj\n<< /Resources << /Font << /Fendobject 4 0 R /endobj 4 0 R >> >> /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n'
+    const obj4 = '4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n'
+    const o1 = header.length
+    const o2 = o1 + obj1.length
+    const o3 = o2 + obj2.length
+    const o4 = o3 + obj3.length
+    const xrefOffset = o4 + obj4.length
+    const pad = (n: number) => String(n).padStart(10, '0')
+    const xref = `xref\n0 5\n0000000000 65535 f \n${pad(o1)} 00000 n \n${pad(o2)} 00000 n \n${pad(o3)} 00000 n \n${pad(o4)} 00000 n \n`
+    const trailer = `trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`
+    return Buffer.from(header + obj1 + obj2 + obj3 + obj4 + xref + trailer, 'latin1')
+  })()
+  assert.equal(validatePdfStructureSync(fontNameWithEndobjSubstringPdf), true)
+  assert.equal(await validatePdfInIsolatedWorker(fontNameWithEndobjSubstringPdf, signal), true)
+
   const largeImageStreamPdf = (() => {
     const header = '%PDF-1.4\n'
     const obj1 = '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n'

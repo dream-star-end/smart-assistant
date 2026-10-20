@@ -95,6 +95,30 @@ export function validatePdfStructureSync(data: Buffer): boolean {
     return false
   }
 
+  const findPdfKeyword = (kw: string, fromIdx: number): number => {
+    let pos = fromIdx
+    while (pos < fullStr.length) {
+      const idx = fullStr.indexOf(kw, pos)
+      if (idx < 0) return -1
+      const prev = idx > 0 ? fullStr.charCodeAt(idx - 1) : 32
+      const next = idx + kw.length < fullStr.length ? fullStr.charCodeAt(idx + kw.length) : 32
+      const prevIsToken =
+        prev === 47 ||
+        (prev >= 48 && prev <= 57) ||
+        (prev >= 65 && prev <= 90) ||
+        (prev >= 97 && prev <= 122) ||
+        prev === 95
+      const nextIsToken =
+        (next >= 48 && next <= 57) ||
+        (next >= 65 && next <= 90) ||
+        (next >= 97 && next <= 122) ||
+        next === 95
+      if (!prevIsToken && !nextIsToken) return idx
+      pos = idx + kw.length
+    }
+    return -1
+  }
+
   const extractObjAtOffset = (
     offset: number,
     expectedNum?: number,
@@ -109,15 +133,16 @@ export function validatePdfStructureSync(data: Buffer): boolean {
     if (expectedNum !== undefined && num !== expectedNum) return null
     if (expectedGen !== undefined && gen !== expectedGen) return null
     const bodyStart = offset + hm[0].length
-    const firstEndobj = fullStr.indexOf('endobj', bodyStart)
+    const firstEndobj = findPdfKeyword('endobj', bodyStart)
     if (firstEndobj < 0) return null
     const preEndobj = fullStr.slice(bodyStart, firstEndobj)
-    const streamMatch = /\bstream[\r\n]/.exec(preEndobj)
-    if (streamMatch) {
-      const dictBody = preEndobj.slice(0, streamMatch.index)
-      const endstreamIdx = fullStr.indexOf('endstream', bodyStart + streamMatch.index + 6)
+    const streamMatch = /(?:^|[^A-Za-z0-9_/])(stream[\r\n])/.exec(preEndobj)
+    if (streamMatch?.[1]) {
+      const streamRelIdx = streamMatch.index + streamMatch[0].length - streamMatch[1].length
+      const dictBody = preEndobj.slice(0, streamRelIdx)
+      const endstreamIdx = findPdfKeyword('endstream', bodyStart + streamRelIdx + 6)
       if (endstreamIdx < 0) return null
-      const realEndobj = fullStr.indexOf('endobj', endstreamIdx + 9)
+      const realEndobj = findPdfKeyword('endobj', endstreamIdx + 9)
       if (realEndobj < 0) return null
       return { num, gen, body: dictBody }
     }
@@ -318,6 +343,21 @@ function check(buf) {
   const startXrefOffset = Number.parseInt(lastMatch[1], 10);
   if (!Number.isSafeInteger(startXrefOffset) || startXrefOffset <= 8 || startXrefOffset >= buf.length - 16) return false;
 
+  const findPdfKeyword = (kw, fromIdx) => {
+    let pos = fromIdx;
+    while (pos < fullStr.length) {
+      const idx = fullStr.indexOf(kw, pos);
+      if (idx < 0) return -1;
+      const prev = idx > 0 ? fullStr.charCodeAt(idx - 1) : 32;
+      const next = idx + kw.length < fullStr.length ? fullStr.charCodeAt(idx + kw.length) : 32;
+      const prevIsToken = prev === 47 || (prev >= 48 && prev <= 57) || (prev >= 65 && prev <= 90) || (prev >= 97 && prev <= 122) || prev === 95;
+      const nextIsToken = (next >= 48 && next <= 57) || (next >= 65 && next <= 90) || (next >= 97 && next <= 122) || next === 95;
+      if (!prevIsToken && !nextIsToken) return idx;
+      pos = idx + kw.length;
+    }
+    return -1;
+  };
+
   const extractObjAtOffset = (offset, expectedNum, expectedGen) => {
     if (offset <= 0 || offset >= buf.length - 10) return null;
     const headSlice = fullStr.slice(offset, Math.min(fullStr.length, offset + 128));
@@ -328,15 +368,16 @@ function check(buf) {
     if (expectedNum !== undefined && num !== expectedNum) return null;
     if (expectedGen !== undefined && gen !== expectedGen) return null;
     const bodyStart = offset + hm[0].length;
-    const firstEndobj = fullStr.indexOf('endobj', bodyStart);
+    const firstEndobj = findPdfKeyword('endobj', bodyStart);
     if (firstEndobj < 0) return null;
     const preEndobj = fullStr.slice(bodyStart, firstEndobj);
-    const streamMatch = /\\bstream[\\r\\n]/.exec(preEndobj);
-    if (streamMatch) {
-      const dictBody = preEndobj.slice(0, streamMatch.index);
-      const endstreamIdx = fullStr.indexOf('endstream', bodyStart + streamMatch.index + 6);
+    const streamMatch = /(?:^|[^A-Za-z0-9_/])(stream[\\r\\n])/.exec(preEndobj);
+    if (streamMatch && streamMatch[1]) {
+      const streamRelIdx = streamMatch.index + streamMatch[0].length - streamMatch[1].length;
+      const dictBody = preEndobj.slice(0, streamRelIdx);
+      const endstreamIdx = findPdfKeyword('endstream', bodyStart + streamRelIdx + 6);
       if (endstreamIdx < 0) return null;
-      const realEndobj = fullStr.indexOf('endobj', endstreamIdx + 9);
+      const realEndobj = findPdfKeyword('endobj', endstreamIdx + 9);
       if (realEndobj < 0) return null;
       return { num, gen, body: dictBody };
     }
