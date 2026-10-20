@@ -1,12 +1,5 @@
 [
   {
-    "path": "packages/web-react/src/App.tsx",
-    "maxLines": 4734,
-    "ticket": "OCV5-472",
-    "reason": "A1 split reverted (first-screen gzip budget exceeded by object-key plumbing); App.tsx is back at its pre-A1 size while A1 is redone with smaller per-domain hooks/components",
-    "expires": "2026-10-31"
-  },
-  {
     "path": "scripts/check-v5-box-incident-proofs.ts",
     "maxLines": 3648,
     "ticket": "OCV5-491",
