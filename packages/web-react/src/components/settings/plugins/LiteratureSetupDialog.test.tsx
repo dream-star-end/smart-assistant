@@ -219,3 +219,39 @@ test('a missing operation during cancel allows close and leaves saved-account re
   expect(f.onBound).not.toHaveBeenCalled()
   expect(api.startLiteratureSetup).toHaveBeenCalledTimes(1)
 })
+
+test('manual captcha input renders visible mobile-safe control styling and submits on Enter', async () => {
+  vi.mocked(api.startLiteratureSetup).mockResolvedValue({
+    ...operation('manual_required'),
+    automaticSubmissions: 0,
+    challengeId: 'challenge-mobile',
+  })
+  vi.mocked(api.getLiteratureSetup).mockResolvedValue({
+    ...operation('manual_required'),
+    automaticSubmissions: 0,
+    challengeId: 'challenge-mobile',
+  })
+  vi.mocked(api.getLiteratureSetupImage).mockResolvedValue(new Blob(['fixture-png']))
+  vi.mocked(api.answerLiteratureSetup).mockResolvedValue({
+    ...operation('authenticated'),
+    accountId: '42',
+    agentReady: true,
+  })
+  const f = mount()
+  await start()
+  expect(await screen.findByText('请输入下方图形验证码完成登录。')).toBeInTheDocument()
+  await screen.findByAltText('网站登录验证码')
+  const captchaInput = screen.getByLabelText('验证码') as HTMLInputElement
+  expect(captchaInput).toHaveAttribute('placeholder', '请输入上方验证码')
+  expect(captchaInput).toHaveAttribute('autocapitalize', 'off')
+  expect(captchaInput).toHaveAttribute('autocorrect', 'off')
+  expect(captchaInput).toHaveAttribute('enterkeyhint', 'done')
+  expect(captchaInput.className).toContain('border-border-control')
+  expect(captchaInput.className).toContain('bg-surface')
+  expect(captchaInput.className).toContain('text-base')
+  fireEvent.change(captchaInput, { target: { value: '8032' } })
+  fireEvent.keyDown(captchaInput, { key: 'Enter' })
+  await waitFor(() =>
+    expect(api.answerLiteratureSetup).toHaveBeenCalledWith(f.auth, 'op-fixture', 'challenge-mobile', '8032'),
+  )
+})
