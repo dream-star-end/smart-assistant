@@ -733,4 +733,27 @@ test('validatePdfStructureSync and LiteratureArtifactStore allow empty-password 
   })()
   assert.equal(validatePdfStructureSync(driftedPdf), true)
   assert.equal(await validatePdfInIsolatedWorker(driftedPdf, signal), true)
+
+  // 5. Hybrid-xref PDF with valid /XRefStm is accepted, while broken /XRefStm is rejected
+  const buildHybridXrefPdf = (xrefStmType: string) => {
+    const header = '%PDF-1.5\n'
+    const obj1 = '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n'
+    const obj2 = '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n'
+    const obj3 = '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n'
+    const obj4 = `4 0 obj\n<< /Type ${xrefStmType} /Size 5 /W [1 2 1] /Length 4 >>\nstream\n\x01\x00\x00\x00\nendstream\nendobj\n`
+    const o1 = header.length
+    const o2 = o1 + obj1.length
+    const o3 = o2 + obj2.length
+    const o4 = o3 + obj3.length
+    const xrefOffset = o4 + obj4.length
+    const xref = `xref\n0 4\n0000000000 65535 f \n${pad(o1)} 00000 n \n${pad(o2)} 00000 n \n${pad(o3)} 00000 n \n`
+    const trailer = `trailer\n<< /Size 5 /Root 1 0 R /XRefStm ${o4} >>\nstartxref\n${xrefOffset}\n%%EOF\n`
+    return Buffer.from(header + obj1 + obj2 + obj3 + obj4 + xref + trailer, 'latin1')
+  }
+  const validHybridPdf = buildHybridXrefPdf('/XRef')
+  assert.equal(validatePdfStructureSync(validHybridPdf), true)
+  assert.equal(await validatePdfInIsolatedWorker(validHybridPdf, signal), true)
+  const invalidHybridPdf = buildHybridXrefPdf('/NotXRef')
+  assert.equal(validatePdfStructureSync(invalidHybridPdf), false)
+  assert.equal(await validatePdfInIsolatedWorker(invalidHybridPdf, signal), false)
 })
