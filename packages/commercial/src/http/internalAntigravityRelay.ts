@@ -69,7 +69,8 @@ export const ANTIGRAVITY_UPSTREAM_BASE_URL = 'https://daily-cloudcode-pa.googlea
  */
 const GENERATE_METHODS = new Set(['streamGenerateContent', 'generateContent'])
 const STREAMING_GENERATE = 'streamGenerateContent'
-/** Every `/v1internal:*` method the pinned 1.3.4 CLI calls (probe 2026-10-14). */
+/** Every `/v1internal:*` method the pinned CLI calls (1.3.4 probe 2026-10-14; the 1.4.0
+ * binary names the same 65 `v1internal:` methods, OCV5-470 probe 2026-10-17). */
 const METADATA_METHODS = new Set([
   'loadCodeAssist',
   'fetchUserInfo',
