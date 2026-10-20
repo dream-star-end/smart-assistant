@@ -222,7 +222,9 @@ export const DEFAULT_SECONDARY_UTILITY_MODEL = 'deepseek-v4-flash'
  *  2026-09-03: sub-tasks default to grok-build (platform delegate_task) with
  *  glm-5.3-zai as the fallback; CCB Agent sub-agents cannot reach grok (no
  *  Anthropic-compatible grok backend), so they pin the fallback directly. */
-export const DEFAULT_CCB_SUBAGENT_MODEL = 'glm-5.3-zai'
+// 2026-10-20: the Z.AI route is unavailable; sub-agents pin the platform default instead
+// (it is also the secondary utility model, so the aux set dedupes to one id).
+export const DEFAULT_CCB_SUBAGENT_MODEL = 'deepseek-v4-flash'
 
 export function isCcbRoutableSubagentModel(model: string | undefined): boolean {
   if (typeof model !== 'string') return false

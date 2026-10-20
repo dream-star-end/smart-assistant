@@ -146,22 +146,25 @@ function makeSnapshot(auxState: "active" | "disabled" | "absent" = "active"): Mo
       },
     }),
   );
-  // CCB 子 agent 默认钉(glm-5.3-zai)是平台 aux 集第二成员;platformAuxModels 对所有声明
-  // 成员 fail-closed,所以夹具必须常驻它 —— 用 auxState 只演练首位成员(deepseek)的缺失/禁用。
-  entries.push(
-    entry({
-      entryId: 4,
-      modelId: DEFAULT_CCB_SUBAGENT_MODEL,
-      providerId: "zai",
-      contextWindow: 200_000,
-    }),
-  );
   const pricing = new Map([
     ["glm-5.2", price("glm-5.2")],
     ["gpt-5.6-sol", price("gpt-5.6-sol")],
     ["kimi-k3", price("kimi-k3")],
-    [DEFAULT_CCB_SUBAGENT_MODEL, price(DEFAULT_CCB_SUBAGENT_MODEL)],
   ]);
+  // CCB 子 agent 默认钉是平台 aux 集第二成员;platformAuxModels 对所有声明成员 fail-closed。它与
+  // 次级模型不同时夹具常驻它,auxState 只演练首位成员(deepseek)的缺失/禁用。2026-10-20 起二者同为
+  // deepseek-v4-flash,不能另插一行,否则 disabled/absent 场景仍有可签发的行。
+  if (DEFAULT_CCB_SUBAGENT_MODEL !== DEFAULT_SECONDARY_UTILITY_MODEL) {
+    entries.push(
+      entry({
+        entryId: 4,
+        modelId: DEFAULT_CCB_SUBAGENT_MODEL,
+        providerId: "zai",
+        contextWindow: 200_000,
+      }),
+    );
+    pricing.set(DEFAULT_CCB_SUBAGENT_MODEL, price(DEFAULT_CCB_SUBAGENT_MODEL));
+  }
   if (auxState !== "absent") {
     entries.push(
       entry({
@@ -793,7 +796,7 @@ describe("bridge 模型执行权威 — 签发注入(容器已 attest)", () => {
     const lease = verifyTurnLease(bundle.lease, keyring, Date.now());
     // 权威源 = gateway DEFAULT_SECONDARY_UTILITY_MODEL(容器 ANTHROPIC_SMALL_FAST_MODEL 的实际取值)
     // + DEFAULT_CCB_SUBAGENT_MODEL(容器 CLAUDE_CODE_SUBAGENT_MODEL 的默认钉);platformAuxModels 排序输出。
-    const expectedAux = [DEFAULT_SECONDARY_UTILITY_MODEL, DEFAULT_CCB_SUBAGENT_MODEL].sort();
+    const expectedAux = [...new Set([DEFAULT_SECONDARY_UTILITY_MODEL, DEFAULT_CCB_SUBAGENT_MODEL])].sort();
     assert.deepEqual([...(payload.auxModels ?? [])], expectedAux);
     // lease 必须同值:WebFetch 常发生在 turn 中段,那时只有 lease 在飞
     assert.deepEqual([...(lease.auxModels ?? [])], expectedAux);
