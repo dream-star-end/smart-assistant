@@ -48,6 +48,7 @@ const BEHAVIOR = [
   "a just-finished run keeps its native pointer: cleanup waits until the pointer is attached",
   "[ocv5-520-go-pool-wiring] PASS — ordinary Go uses an enabled pool identity instead of disabled static credentials while request bytes and session headers stay stable",
   "[ocv5-527-step-chat] PASS — stable Step pricing identity selects the current chat upstream for static and catalog routes",
+  "[ocv5-530-agy-host-path] PASS — Antigravity launch login shell resolves only the selfhost host wrapper; neighbouring user shims stay off PATH",
 ];
 const HOLD_PY = [
   "import os, signal, sys, time",
@@ -777,6 +778,37 @@ async function runWorker(argv: string[]): Promise<void> {
     assert.equal(selected.session.transport, "openai-chat-go", "STEP_CHAT_TRANSPORT");
   }
   emit(BEHAVIOR[4]!);
+  // OCV5-530: Antigravity commands run through `bash -lc`, where /etc/profile
+  // resets PATH. Project a candidate launch HOME under this worker's private
+  // OPENCLAUDE_HOME and prove the login shell finds host but not other shims.
+  const { cleanupAntigravityLaunch, projectAntigravityPlatform } = await import(
+    "../packages/gateway/src/engine/antigravityPlatform.js");
+  const shimDir = join(home, ".local", "bin");
+  mkdirSync(shimDir, { recursive: true, mode: 0o700 });
+  for (const name of ["host", "sh"]) {
+    writeFileSync(join(shimDir, name), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+  }
+  const agy = projectAntigravityPlatform({
+    credential: { accessToken: "synthetic-agy-token", accessTokenExpiresAt: "2026-10-20T00:00:00Z" },
+    agentId: "main", sessionKey: "agent:main:webchat:dm:agy-host-proof", gatewayPort: 18789,
+    gatewayToken: "", delegationDepth: 0, hostBin: join(shimDir, "host"),
+  });
+  try {
+    assert.ok(agy.hostPathDir, "AGY_HOST_DIR_MISSING");
+    assert.deepEqual(readdirSync(agy.hostPathDir), ["host"], "AGY_HOST_DIR_EXTRA");
+    const shell = spawnSync("/bin/bash", ["-lc", "command -v host; command -v sh"], {
+      encoding: "utf8", env: { HOME: agy.launchHome, PATH: "/usr/local/bin:/usr/bin:/bin" }, timeout: PY_TIMEOUT_MS,
+    });
+    assert.equal(shell.status, 0, "AGY_LOGIN_SHELL");
+    const [hostPath, shPath] = shell.stdout.trim().split("\n");
+    assert.equal(realpathSync(hostPath ?? ""), realpathSync(join(shimDir, "host")), "AGY_HOST_UNRESOLVED");
+    assert.ok(!(shPath ?? "").startsWith(shimDir), "AGY_USER_SHIM_SHADOWS");
+  } finally {
+    cleanupAntigravityLaunch(agy);
+    rmSync(join(home, ".local"), { recursive: true, force: true });
+  }
+  assert.equal(existsSync(agy.launchHome), false, "AGY_LAUNCH_RESIDUE");
+  emit(BEHAVIOR[5]!);
 }
 
 function parseFormal(argv: string[]): string {

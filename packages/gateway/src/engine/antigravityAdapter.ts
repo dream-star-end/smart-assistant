@@ -45,6 +45,7 @@ import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
 import { buildCodexEnv } from './codexShared.js'
 import { createLogger } from '../logger.js'
+import { probeEnvFacts } from '../envProbe.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
@@ -71,6 +72,18 @@ const KEEPALIVE_INTERVAL_MS = 30_000
 /** After `result`, wait this long for the process to exit so trailing
  * stderr (soft-deny / empty-run notices) is read before the turn settles. */
 const RESULT_SETTLE_MS = 5_000
+
+/** Sandboxed resolution set; user-writable PATH entries stay out. */
+const ANTIGRAVITY_SPAWN_PATH = '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin'
+
+/**
+ * Selfhost keeps the host wrapper in the persistent agent home, outside the
+ * sandboxed PATH. The projection links just that wrapper into a private launch
+ * dir, so `host 'cmd'` resolves without trusting ~/.local/bin (OCV5-530).
+ */
+function antigravitySpawnPath(hostPathDir: string | null): string {
+  return hostPathDir ? `${hostPathDir}:${ANTIGRAVITY_SPAWN_PATH}` : ANTIGRAVITY_SPAWN_PATH
+}
 
 let timingTestHooks: { keepaliveMs?: number; resultSettleMs?: number } | null = null
 const STDERR_MAX_CHARS = 64 * 1024
@@ -374,6 +387,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       skillEvalExclude: this.opts.skillEvalExclude,
       skillEvalDraft: this.opts.skillEvalDraft,
       skillTrainRunId: this.opts.skillTrainRunId,
+      hostBin: probeEnvFacts().hostBin,
     })
     ctx.projection = projection
     const prompt = await this.composePrompt(ctx.params, repoSnapshot, projection.advertisedMcpTools, cwdDecision)
@@ -390,7 +404,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     }
     const env: NodeJS.ProcessEnv = {
       ...isolatedEnv,
-      PATH: '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin',
+      PATH: antigravitySpawnPath(projection.hostPathDir),
       HOME: projection.launchHome,
       XDG_CACHE_HOME: projection.cacheDir,
       OC_AGENT_ID: this.opts.agentId,
