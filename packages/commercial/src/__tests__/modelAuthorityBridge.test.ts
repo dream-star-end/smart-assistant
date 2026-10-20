@@ -146,22 +146,25 @@ function makeSnapshot(auxState: "active" | "disabled" | "absent" = "active"): Mo
       },
     }),
   );
-  // CCB 子 agent 默认钉(2026-10-20 起与次级模型同为 deepseek-v4-flash)是平台 aux 集第二成员;platformAuxModels 对所有声明
-  // 成员 fail-closed,所以夹具必须常驻它 —— 用 auxState 只演练首位成员(deepseek)的缺失/禁用。
-  entries.push(
-    entry({
-      entryId: 4,
-      modelId: DEFAULT_CCB_SUBAGENT_MODEL,
-      providerId: "scnet",
-      contextWindow: 200_000,
-    }),
-  );
   const pricing = new Map([
     ["glm-5.2", price("glm-5.2")],
     ["gpt-5.6-sol", price("gpt-5.6-sol")],
     ["kimi-k3", price("kimi-k3")],
-    [DEFAULT_CCB_SUBAGENT_MODEL, price(DEFAULT_CCB_SUBAGENT_MODEL)],
   ]);
+  // CCB 子 agent 默认钉是平台 aux 集第二成员;platformAuxModels 对所有声明成员 fail-closed。它与
+  // 次级模型不同时夹具常驻它,auxState 只演练首位成员(deepseek)的缺失/禁用。2026-10-20 起二者同为
+  // deepseek-v4-flash,不能另插一行,否则 disabled/absent 场景仍有可签发的行。
+  if (DEFAULT_CCB_SUBAGENT_MODEL !== DEFAULT_SECONDARY_UTILITY_MODEL) {
+    entries.push(
+      entry({
+        entryId: 4,
+        modelId: DEFAULT_CCB_SUBAGENT_MODEL,
+        providerId: "scnet",
+        contextWindow: 200_000,
+      }),
+    );
+    pricing.set(DEFAULT_CCB_SUBAGENT_MODEL, price(DEFAULT_CCB_SUBAGENT_MODEL));
+  }
   if (auxState !== "absent") {
     entries.push(
       entry({
