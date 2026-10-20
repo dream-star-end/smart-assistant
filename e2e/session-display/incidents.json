@@ -7727,6 +7727,42 @@
       "coverageCommits": [
         "3b43dee6"
       ]
+    },
+    {
+      "id": "INC-20261020-AGY-HOST-PATH",
+      "occurredAt": "2026-10-20",
+      "severity": "P2",
+      "symptom": "个人版 Antigravity 回合的 ENV 写着 host=yes，但 `host hostname` 报 command not found，查不了现网版本。适配器把 CLI 的 PATH 写死成沙箱目录，漏了 ~/.local/bin/host；CLI 的命令又走 bash -lc，/etc/profile 会重置 PATH。修法：只把探测到的 host 包装链接进私有 launch 目录，放进 spawn PATH 和 launch HOME 的 .profile；~/.local/bin 其它用户可写的 shim 不进 PATH；没有 host 包装（商业版）时行为不变。",
+      "rootFixCommit": "4f831104",
+      "coverageCommits": [
+        "04d795d7",
+        "a59b05b0",
+        "ff300cba",
+        "dd370efa",
+        "525222df"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityAdapter.test.ts",
+          "assertion": "puts the selfhost host wrapper on the CLI PATH (OCV5-530)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityPlatform.test.ts",
+          "assertion": "launch HOME profile gives a login shell the selfhost host wrapper"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityPlatform.test.ts",
+          "assertion": "launch HOME stays unchanged without a host wrapper (commercial)"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "[ocv5-530-agy-host-path] PASS — Antigravity launch login shell resolves only the selfhost host wrapper; neighbouring user shims stay off PATH"
+        }
+      ]
     }
   ]
 }
