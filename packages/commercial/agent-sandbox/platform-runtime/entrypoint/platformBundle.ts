@@ -664,3 +664,21 @@ export function decideSystemCliLinkAction(args: {
   }
   return "preserve";
 }
+
+export type ContainerBootStage = 'module_loaded' | 'seed_validated' | 'env_ready' |
+  'cli_links_ready' | 'package_config_ready' | 'codex_skills_ready' |
+  'platform_overlay_ready' | 'config_agents_ready' | 'gateway_spawn'
+/** Fixed startup milestones only; no paths, configuration values or contents. */
+export function createContainerBootTiming(
+  emit: (fields: { stage: ContainerBootStage; elapsedMs: number; stageMs: number; tsEpochMs: number }) => void,
+  now: () => number = () => performance.now(), wall: () => number = Date.now,
+): (stage: ContainerBootStage) => void {
+  const start = now()
+  let previous = start
+  return stage => {
+    const at = now()
+    const fields = { stage, elapsedMs: at - start, stageMs: at - previous, tsEpochMs: wall() }
+    previous = at
+    try { emit(fields) } catch { /* observation never changes boot or fail-closed guards */ }
+  }
+}

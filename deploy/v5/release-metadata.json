@@ -178,7 +178,12 @@
     "0307_antigravity_engine",
     "0308_pool_user_affinity",
     "0309_box_profile_quota_windows",
-    "0313_commercial_literature_captcha_requests"
+    "0310_antigravity_claude_55",
+    "0311_antigravity_paid_tier",
+    "0312_antigravity_gemini_4_argon",
+    "0313_commercial_overnight_catalog_20261020",
+    "0314_commercial_muse_spark_go",
+    "0316_commercial_literature_captcha_requests"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

@@ -55,6 +55,7 @@ import { checkRateLimit, type RateLimitConfig } from "../../middleware/rateLimit
 import {
   UnroutableProviderError,
   checkCapabilityWithinCeiling,
+  pickStaticFallbackUpstream,
   pickUpstream,
   providerCapabilityCeiling,
   releaseUpstreamSession,
@@ -70,7 +71,8 @@ import {
   type ModelAuthorityDecision,
 } from "./modelAuthorityGate.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
-import { findRouteProviderForModel, isClassifierSideQuery, resolveCursorPublicModel } from "@openclaude/protocol";
+import { scopedApiKeyPoolWiring } from "./apiKeyPoolWiring.js";
+import { findRouteProviderForModel, getStaticProvider, isClassifierSideQuery, resolveCursorPublicModel, staticRouteFallback, type StaticRouteFallback } from "@openclaude/protocol";
 import { applyFastServiceTierPricing } from "./fastServiceTier.js";
 import {
   getDegradedProviders,
@@ -358,6 +360,7 @@ export function makeAnthropicProxyHandler(
   );
 
   return async function handle(req, res, ctx) {
+    const proxyReceivedAt = performance.now();
     setSecurityHeaders(res);
     const requestId = ensureRequestId(req);
     res.setHeader(REQUEST_ID_HEADER, requestId);
@@ -419,6 +422,11 @@ export function makeAnthropicProxyHandler(
     const userLog = reqLog.child({
       uid: uid.toString(),
       containerId: containerIdBig === null ? null : containerIdBig.toString(),
+    });
+
+    userLog.info("proxy_stage_timing", { stage: "proxy_received", elapsedMs: performance.now() - proxyReceivedAt });
+    const stageTiming = (stage: string) => userLog.info("proxy_stage_timing", {
+      stage, elapsedMs: performance.now() - proxyReceivedAt,
     });
 
     // 1b) count_tokens(仅 allowCountTokens 实例):身份通过即答,不进限流/并发/授权 ——
@@ -741,6 +749,8 @@ export function makeAnthropicProxyHandler(
       // degraded 权威 = provider_ops 健康列(effectiveHealth 派生,与 pricing.enabled/visibility
       // 正交,红线②)。只治理静态 provider;OAuth/claude 归 account-pool。fail-soft:读失败空集放行。
       // 不做隐式换模型(红线①):只 503 + 建议同类可用清单,用户/客户端自己换。
+      // OCV5-482:主 provider 降级但声明了健康的回落上游 → 不 503,下面选路由时直接走回落上游。
+      let healthFallback: StaticRouteFallback | undefined;
       if (process.env.OC_PROVIDER_HEALTH_ENFORCE === "1") {
         // provider 归属:catalog 判定生效时以 catalog 的 provider_id 为准(数据驱动);
         // legacy 期仍走 matchesRoute 推断。
@@ -749,7 +759,12 @@ export function makeAnthropicProxyHandler(
           : findRouteProviderForModel(body.model)?.id;
         if (providerId) {
           const degradedSet = await getHealthDegradedProviders();
-          if (degradedSet.has(providerId)) {
+          const fallback = gate && degradedSet.has(providerId)
+            ? staticRouteFallback(providerId, gate.descriptor.upstreamModelId ?? body.model)
+            : undefined;
+          if (fallback && !degradedSet.has(fallback.providerId)) {
+            healthFallback = fallback;
+          } else if (degradedSet.has(providerId)) {
             const deniedModelIds = await deniedModelIdsForAlternatives(deps, gate, uid);
             const alts = degradedAlternatives({
               gate,
@@ -869,6 +884,19 @@ export function makeAnthropicProxyHandler(
           return;
         }
         throw err;
+      }
+      if (healthFallback && route.kind === "static") {
+        userLog.info("proxy_static_fallback", {
+          model: body.model,
+          provider: route.provider.id,
+          fallback: healthFallback.providerId,
+          reason: "provider_degraded",
+        });
+        route = {
+          kind: "static",
+          provider: getStaticProvider(healthFallback.providerId),
+          upstreamModel: healthFallback.upstreamModel,
+        };
       }
 
       // 5c') 能力上限:catalog 声明的 capability ⊆ provider **机制**上限(方案 §4)。
@@ -1069,11 +1097,18 @@ export function makeAnthropicProxyHandler(
           return;
         }
       }
+      const poolWiring = scopedApiKeyPoolWiring(
+        deps.apiKeyPoolEnabled,
+        route.kind === "static" ? route.provider.id : undefined,
+        {
+          apiKeyPoolConfigured: (service) => apiKeyPoolConfiguredServices().has(service),
+          selectApiKey: (service, sticky, userId) => selectApiKey(service, sticky, undefined, { userId }),
+          apiKeyPoolHasMembers,
+        },
+      );
       const cfgErr = validateUpstreamConfig(route, {
         staticProviderKeys: deps.staticProviderKeys,
-        apiKeyPoolConfigured: deps.apiKeyPoolEnabled
-          ? (service) => apiKeyPoolConfiguredServices().has(service)
-          : undefined,
+        apiKeyPoolConfigured: poolWiring.apiKeyPoolConfigured,
         boxConfigured: process.env.OC_BOX_MODEL_API === "1" && deps.boxModel !== undefined,
       });
       if (cfgErr) {
@@ -1323,6 +1358,7 @@ export function makeAnthropicProxyHandler(
         // 内部:getBalance(PG) → atomicReserve(Lua: 清过期 + HVALS 求和 + 比 balance + HSET/ZADD)
         // balance > 0 即放行;余额 < 估算 cost 时 cap 到 balance(drain-to-zero by cap-to-balance)。
         // 真实 cost 由 finalize 阶段已有的 clamp 路径吃(settleUsageAndLedger)。
+        stageTiming("precheck_started");
         pre = await preCheckWithCost(deps.preCheckRedis, {
           userId: uid,
           requestId,
@@ -1349,6 +1385,7 @@ export function makeAnthropicProxyHandler(
         throw err;
       }
 
+      stageTiming("precheck_complete");
       if (pre.capped) {
         incrPrecheckCapped(body.model);
         userLog.info("precheck_capped", {
@@ -1378,13 +1415,12 @@ export function makeAnthropicProxyHandler(
         typeof forceRepinHeader === "string" &&
         (forceRepinHeader === "1" || forceRepinHeader.toLowerCase() === "true");
 
-      const pickRes = await pickUpstream(
-        {
+      const pickDeps: Parameters<typeof pickUpstream>[0] = {
           scheduler: deps.scheduler,
           refreshDeps: deps.refreshDeps,
           staticProviderKeys: deps.staticProviderKeys,
-          selectApiKey: deps.apiKeyPoolEnabled ? (service, sticky, userId) => selectApiKey(service, sticky, undefined, { userId }) : undefined,
-          apiKeyPoolHasMembers: deps.apiKeyPoolEnabled ? apiKeyPoolHasMembers : undefined,
+          selectApiKey: poolWiring.selectApiKey,
+          apiKeyPoolHasMembers: poolWiring.apiKeyPoolHasMembers,
           upstreamEndpoint: deps.upstreamEndpoint,
           // Phase 6 account_uuid 锚定 flag(plan §3.0)— v1.0.207 起从 system_settings
           // 表读取的 getter,handler 透传给 pickUpstream;入口 await 一次冻结到
@@ -1394,13 +1430,17 @@ export function makeAnthropicProxyHandler(
           // 30s TTL cache,admin UI 改完立即 invalidate 本机进程的 cache。
           getSessionPinMode: deps.getSessionPinMode,
           listEnabledAccountGroupsForModel: deps.listEnabledAccountGroupsForModel,
-        },
+        };
+      stageTiming("upstream_prepare_started");
+      const pickRes = await pickUpstream(
+        pickDeps,
         body,
         route,
         userLog,
         uid,
         forceRepin,
       );
+      stageTiming("upstream_prepare_complete");
       if (!pickRes.ok) {
         // 释放失败仅告警不阻断(TTL 300s 自愈兜底);但 Redis 故障时预留泄漏必须可观测。
         await releasePreCheck(deps.preCheckRedis, pre.reservation).catch((e: unknown) => {
@@ -1808,6 +1848,7 @@ export function makeAnthropicProxyHandler(
 
       // 10-11) upstream round-trip(切到 proxy/core.ts):abort 绑定 + fetch +
       // SSE 透传 + finalize + post-commit 广播 + zeroize。release 责任已在 finalize。
+      stageTiming("roundtrip_enter");
       await runUpstreamRoundTrip({
         pgPool: deps.pgPool,
         fetchFn: route.kind === "box"
@@ -1830,6 +1871,20 @@ export function makeAnthropicProxyHandler(
         uid,
         body,
         session,
+        // OCV5-482:主上游 session 且声明了回落上游 → core 在主上游拒绝时同请求重试回落上游;
+        // 这类路由(含已在回落上游上的)把实际服务的上游记进扣费快照。
+        ...(() => {
+          if (route.kind !== "static") return {};
+          const staticRoute = route;
+          const primary = session.providerId === staticRoute.provider.id;
+          const declared = staticRouteFallback(staticRoute.provider.id, session.upstreamModel) !== undefined;
+          return {
+            recordServedUpstream: healthFallback !== undefined || !primary || declared,
+            ...(primary && declared
+              ? { fallbackSession: () => pickStaticFallbackUpstream(pickDeps, body, staticRoute, userLog, uid) }
+              : {}),
+          };
+        })(),
         noHistoryRewriteRetry: route.kind === "box",
         ...(boxPrepared?.sessionId && boxPrepared.turnKey ? { onBoxRefusal: (code: string) =>
           rememberBoxRefusal({ uid, sessionId: boxPrepared!.sessionId!,

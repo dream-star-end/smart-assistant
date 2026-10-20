@@ -64,6 +64,7 @@ import {
 } from '../billing/imageBilling.js'
 import { InsufficientCreditsError as LedgerInsufficientCreditsError } from '../billing/ledger.js'
 
+import { codexRequestTiming, codexResponseTiming, codexBodyTiming } from './codexRelayTiming.js'
 import { CODEX_RELAY_PREFIX } from '@openclaude/protocol'
 import { buildUpstreamHeaders, CODEX_UPSTREAM_AUTH_HEADER, HOP_BY_HOP_HEADERS } from './codexUpstreamHeaders.js'
 
@@ -317,13 +318,14 @@ function mapRouteContextUrl(
   return { url: upstream.toString(), upstreamHost: upstream.host, upstreamPath: upstream.pathname }
 }
 
-function copyResponseHeaders(from: Headers, res: ServerResponse): void {
+function copyResponseHeaders(from: Headers, res: ServerResponse, requestId: string): void {
   from.forEach((value, rawKey) => {
     const key = rawKey.toLowerCase()
     if (HOP_BY_HOP_HEADERS.has(key)) return
     if (key === 'content-length') return
     res.setHeader(rawKey, value)
   })
+  res.setHeader('x-openclaude-relay-request-id', requestId)
 }
 
 /** relay_fetch_failed 的安全诊断字段:错误名 + node/undici 系统 code(含 cause),不含 message。 */
@@ -745,6 +747,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
 
   return async function handle(req, res, ctx) {
     setSecurityHeaders(res)
+    const relayReceivedAt = performance.now()
     const requestId = ensureRequestId(req)
     res.setHeader(REQUEST_ID_HEADER, requestId)
 
@@ -1050,7 +1053,13 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     req.once('aborted', abort)
     res.once('close', abort)
 
+    const safeThreadHeader = (key: string): string | null => {
+      const value = req.headers[key]
+      return typeof value === 'string' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(value) ? value : null
+    }
     const relayLog = userLog.child({
+      codexSessionId: safeThreadHeader('session_id'),
+      codexConversationId: safeThreadHeader('conversation_id'),
       codexAccountId: egress ? String(egress.accountId) : null,
       relayCredentialId: routeContext ? String(routeContext.credential.id) : null,
       proxyId: egress ? String(egress.proxyId) : null,
@@ -1255,6 +1264,20 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
       }
     }
 
+    let upstreamStartedAt = 0
+    const observeResponses = method === 'POST' && mappedSuffix === '/responses' && !needsBailianVisionCompat
+    const observeModels = method === 'GET' && mappedSuffix === '/models'
+    const observeRequest = observeResponses || observeModels
+    const observeTiming = (fields: Record<string, number | string | null>): void => {
+      try {
+        relayLog.info('codex_relay_timing', {
+          operation: observeModels ? 'models' : 'responses',
+          timeOrigin: fields.stage === 'upstream_dispatch' || String(fields.stage).startsWith('request_')
+            ? 'relay_received' : 'fetch_invoked',
+          ...fields,
+        })
+      } catch { /* observation must never change transport or billing */ }
+    }
     try {
       const headers = buildUpstreamHeaders(req)
       if (imageRequestContentType) headers.set('content-type', imageRequestContentType)
@@ -1268,7 +1291,9 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
         headers,
         body: method === 'GET' || method === 'HEAD'
           ? undefined
-          : imageRequestBody ?? responsesRequestBody ?? (req as unknown as BodyInit),
+          : imageRequestBody ?? responsesRequestBody ?? (observeResponses
+            ? req.pipe(codexRequestTiming(observeTiming, () => performance.now(), relayReceivedAt)) as unknown as BodyInit
+            : req as unknown as BodyInit),
         dispatcher: egress?.dispatcher,
         duplex: 'half',
         signal: controller.signal,
@@ -1310,7 +1335,11 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
           activeImageAttemptNo = attempt.attemptNo
           relayLog.info('image_upstream_attempt_started', { attempt: attempt.attemptNo })
         }
-        return fetchImpl(mappedUrl.url, init)
+        upstreamStartedAt = performance.now()
+        const fetchInvokedAtMs = Date.now()
+        const pending = fetchImpl(mappedUrl.url, init)
+        if (observeRequest) observeTiming({ stage: 'upstream_dispatch', atEpochMs: fetchInvokedAtMs, elapsedMs: upstreamStartedAt - relayReceivedAt })
+        return pending
       }
       let upstream = await fetchUpstream()
       if (isImageRequest && upstream.status === 429) {
@@ -1334,6 +1363,12 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
           upstream = await fetchUpstream()
         }
       }
+      if (observeRequest) observeTiming({ stage: 'headers', elapsedMs: performance.now() - upstreamStartedAt,
+        status: upstream.status,
+        contentType: !upstream.headers.has('content-type') ? 'missing'
+          : upstream.headers.get('content-type')?.toLowerCase().includes('text/event-stream') ? 'sse'
+          : upstream.headers.get('content-type')?.toLowerCase().includes('application/json') ? 'json' : 'other',
+      })
       relayLog.info('relay_upstream_response', {
         status: upstream.status,
         forwardedCodexTurnState: outgoingHeaders.has('x-codex-turn-state'),
@@ -1467,7 +1502,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
         return
       }
       res.statusCode = upstream.status
-      copyResponseHeaders(upstream.headers, res)
+      copyResponseHeaders(upstream.headers, res, requestId)
       if (egress !== null && upstream.status === 401 && hadContainerUpstreamAuth) {
         // fail-closed:容器自带的上游 Authorization 被上游拒 → 只记日志、401 原样
         // 透传。不允许在这里换 DB token 重试 —— 那会静默掩盖 codex CLI auth 行为
@@ -1477,6 +1512,7 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
         })
       }
       if (!upstream.body) {
+        if (observeRequest) observeTiming({ stage: 'body_complete', elapsedMs: performance.now() - upstreamStartedAt, bodyBytes: 0 })
         res.end()
         return
       }
@@ -1485,11 +1521,22 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
         body.on('error', reject)
         res.on('error', reject)
         res.on('finish', resolve)
-        body.pipe(res)
+        if (observeResponses) {
+          const tap = codexResponseTiming(observeTiming, () => performance.now(), upstreamStartedAt)
+          tap.on('error', reject)
+          body.pipe(tap).pipe(res)
+        } else if (observeModels) {
+          const tap = codexBodyTiming(observeTiming, () => performance.now(), upstreamStartedAt)
+          tap.on('error', reject)
+          body.pipe(tap).pipe(res)
+        } else body.pipe(res)
       })
     } catch (err) {
       if (deps.preCheckRedis && imageReservation) await releasePreCheck(deps.preCheckRedis, imageReservation).catch(() => {})
       const aborted = controller.signal.aborted
+      if (observeRequest && upstreamStartedAt) observeTiming({
+        stage: aborted ? 'aborted' : 'failed', elapsedMs: performance.now() - upstreamStartedAt,
+      })
       const stableFailureCode = aborted
         ? 'IMAGE_CLIENT_ABORT'
         : imageFailureCode

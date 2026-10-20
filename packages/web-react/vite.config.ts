@@ -224,6 +224,7 @@ export default defineConfig(() => {
               },
               {
                 name: "lucide-vendor",
+                tags: ["$initial"],
                 test: /node_modules[\\/]lucide-react[\\/]/,
                 priority: 15,
               },

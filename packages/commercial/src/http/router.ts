@@ -261,7 +261,7 @@ import {
   handleAdminStatsRevenueByDay,
   handleAdminStatsSignupsByDay,
 } from './adminStats.js'
-import { handleAgentCancel, handleAgentOpen, handleAgentStatus } from './agent.js'
+import { handleAgentCancel, handleAgentOpen, handleAgentStatus, handleWorkspacePrepare } from './agent.js'
 import { dispatchPluginsRoute } from './plugins.js'
 // V3 CC 外接 plan Phase 4(2026-05-18):用户自管 CC API key 的管理面 endpoints。
 import {
@@ -832,6 +832,7 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     // T-53 Agent 订阅
     { method: 'POST', path: '/api/agent/open', handler: handleAgentOpen },
     { method: 'GET', path: '/api/agent/status', handler: handleAgentStatus },
+    { method: 'POST', path: '/api/agent/prepare', handler: handleWorkspacePrepare },
     { method: 'POST', path: '/api/agent/cancel', handler: handleAgentCancel },
     { method: 'POST', path: '/api/container-preview/ticket', handler: handleCreateContainerPreviewTicket },
     { method: 'POST', path: '/api/container-preview/heartbeat', handler: handleHeartbeatContainerPreview },

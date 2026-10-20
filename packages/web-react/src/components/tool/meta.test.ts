@@ -39,6 +39,9 @@ describe("MCP_OP_META 锁步 openclaude-memory 工具名单(漏登记 → 「记
   test("request_review / skill_propose 补齐后有明确标签", () => {
     expect(resolveToolMeta("mcp__openclaude-memory__request_review").label).toBe("申请质量审查");
     expect(resolveToolMeta("mcp__openclaude-memory__skill_propose").label).toBe("提议技能");
+    expect(resolveToolMeta("mcp__openclaude-memory__oc_bash").label).toBe("执行命令");
+    expect(resolveToolMeta("mcp__openclaude-memory__oc_grep").label).toBe("搜索内容");
+    expect(resolveToolMeta("mcp__openclaude-memory__oc_glob").label).toBe("查找文件");
   });
 });
 

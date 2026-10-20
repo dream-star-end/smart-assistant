@@ -58,15 +58,14 @@ describe("0309 box_claude_profiles quota windows", () => {
 
   test("the rollback block drops the columns; the reader and writer degrade; the migration applies again", { timeout: 240000 }, async (t) => {
     if (db.skipIfUnavailable(t)) return;
-    // Roll back the real 0309 boundary, even when the full chain has later migrations.
-    await resetAndMigrateBefore("0310");
-    await login("rollback-boundary", "default");
+    // Later migrations exist: roll back and re-apply 0309 as the latest one, as it was released.
+    const through0309 = await resetAndMigrateBefore("0310");
     const block = /-- BEGIN TESTED MANUAL ROLLBACK 0309\n([\s\S]*?)-- END TESTED MANUAL ROLLBACK 0309/.exec(await readFile(sqlPath, "utf8"))![1]!;
     await query(block.split("\n").map((line) => line.replace(/^-- ?/, "")).join("\n"));
     assert.deepEqual(await listBoxProfileQuotas(), []);
     const id = await login("q3", "default");
     await writeBoxProfileHealth(id, "default", state(Date.now(), { fiveHour: { utilization: 0.1, resetsAtMs: null } }));
-    assert.ok((await runMigrations()).applied.includes("0309_box_profile_quota_windows"));
-    assert.deepEqual((await runMigrations()).applied, []);
+    assert.ok((await runMigrations({ dir: through0309 })).applied.includes("0309_box_profile_quota_windows"));
+    assert.deepEqual((await runMigrations({ dir: through0309 })).applied, []);
   });
 });

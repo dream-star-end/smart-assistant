@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { randomBytes } from 'node:crypto'
 // OCV5-432 release gate (selfhost, after C1–C3): a real multi-turn chat on an OpenCode Go
-// /responses model must read the upstream prompt cache. The canary logs in through the
+// /responses model (Muse Spark 1.3 since OCV5-527) must read the upstream prompt cache. The canary logs in through the
 // product API, runs three plain turns in one new session over the real chat socket, then
 // reads its own per-session usage (GET /api/me/usage). The defect this proves gone
-// (INC-20261015-GO-CACHE-PREFIX) wrote the whole prompt on every request and read 0.
+// (INC-20261015-GO-CACHE-PREFIX) read 0 on Luna and only a partial prefix on Muse.
 // Prints TAP only; never prints credentials, tokens or response bodies.
 import { readFileSync } from 'node:fs'
 import { performance } from 'node:perf_hooks'

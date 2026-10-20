@@ -61,7 +61,7 @@ describe('OpenCode Go /messages models', () => {
   })
 
   it('chat-only upstreams are flagged for the bridge; /messages ones are not', () => {
-    assert.equal(Object.keys(OPENCODE_GO_CHAT_MODELS).length, 14)
+    assert.equal(Object.keys(OPENCODE_GO_CHAT_MODELS).length, 17)
     for (const upstream of Object.values(OPENCODE_GO_CHAT_MODELS))
       assert.equal(isOpenCodeGoChatUpstream(upstream), true, upstream)
     assert.equal(isOpenCodeGoChatUpstream('GLM-5.3'), true)

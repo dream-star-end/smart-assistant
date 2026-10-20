@@ -30,6 +30,7 @@ import {
   selectUpstreamRoute,
   validateUpstreamConfig,
   pickUpstream,
+  pickStaticFallbackUpstream,
   releaseUpstreamSession,
   formatIsoDateInTimezone,
   rewriteReminderDatesInMessages,
@@ -2446,5 +2447,107 @@ describe("pickUpstream — API-key 服务池(OCV5-424)", () => {
       kind: "static_not_configured",
       providerId: "bailian",
     });
+  });
+});
+
+// ─── OCV5-482:静态路由回落上游(OpenCode Go → DeepSeek 官方) ─────────────────────
+
+describe("pickUpstream — static route fallback (OCV5-482)", () => {
+  const GO_FLASH_ROUTE = {
+    kind: "static" as const,
+    provider: getStaticProvider("opencodego"),
+    upstreamModel: "deepseek-v4.1-flash",
+  };
+
+  test("Go 池无可用成员 → DeepSeek 官方池接手,上游 model 改为 deepseek-flash", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      {
+        scheduler: sched.scheduler,
+        staticProviderKeys: {},
+        selectApiKey: async (service) => (service === "deepseek" ? { service, memberId: "1", apiKey: "DS-KEY" } : null),
+        apiKeyPoolHasMembers: () => true,
+      },
+      bodyFor("deepseek-v4-flash"),
+      GO_FLASH_ROUTE,
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    assert.equal(res.session.providerId, "deepseek");
+    assert.equal(res.session.endpoint, "https://api.deepseek.com/anthropic/v1/messages");
+    assert.equal(res.session.upstreamModel, "deepseek-flash");
+    assert.deepEqual(res.session.poolMember, { service: "deepseek", memberId: "1" });
+    const headers: Record<string, string> = {};
+    res.session.applyUpstreamAuth(headers, { metadata: {} } as never, log);
+    assert.equal(headers.authorization, "Bearer DS-KEY");
+    assert.equal(sched.pickCalls, 0);
+  });
+
+  test("Go 池可用 → 仍走 Go 主上游", async () => {
+    const sched = makeScheduler({});
+    const res = await pickUpstream(
+      {
+        scheduler: sched.scheduler,
+        staticProviderKeys: {},
+        selectApiKey: async (service) => ({ service, memberId: service === "opencodego" ? "5" : "1", apiKey: "K" }),
+        apiKeyPoolHasMembers: () => true,
+      },
+      bodyFor("deepseek-v4-flash"),
+      GO_FLASH_ROUTE,
+      log,
+    );
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    assert.equal(res.session.providerId, "opencodego");
+    assert.equal(res.session.endpoint, "https://opencode.ai/zen/go/v1/messages");
+    assert.equal(res.session.upstreamModel, "deepseek-v4.1-flash");
+  });
+
+  test("回落池也无可用成员 / 未声明回落的 Go 型号 → pool_unavailable", async () => {
+    const sched = makeScheduler({});
+    const deps = {
+      scheduler: sched.scheduler,
+      staticProviderKeys: { deepseek: "ENV-KEY" },
+      selectApiKey: async () => null,
+      apiKeyPoolHasMembers: () => true,
+    };
+    const a = await pickUpstream(deps, bodyFor("deepseek-v4-flash"), GO_FLASH_ROUTE, log);
+    assert.equal(a.ok, false);
+    if (!a.ok) assert.equal(a.error.kind, "pool_unavailable");
+    const b = await pickUpstream(deps, bodyFor("qwen3.7-plus"),
+      { kind: "static" as const, provider: getStaticProvider("opencodego"), upstreamModel: "qwen3.7-plus" }, log);
+    assert.equal(b.ok, false);
+    if (!b.ok) assert.equal(b.error.kind, "pool_unavailable");
+  });
+
+  test("health gate enforced: a degraded fallback provider serves no entry (pool-empty or primary refusal)", async () => {
+    const prev = process.env.OC_PROVIDER_HEALTH_ENFORCE;
+    process.env.OC_PROVIDER_HEALTH_ENFORCE = "1";
+    try {
+      for (const degraded of [new Set(["deepseek"]), new Set<string>()]) {
+        const sched = makeScheduler({});
+        const deps = {
+          scheduler: sched.scheduler,
+          staticProviderKeys: {},
+          selectApiKey: async (service: string) => (service === "deepseek" ? { service, memberId: "1", apiKey: "DS-KEY" } : null),
+          apiKeyPoolHasMembers: () => true,
+          healthDegradedProviders: async () => degraded,
+        };
+        const pooled = await pickUpstream(deps, bodyFor("deepseek-v4-flash"), GO_FLASH_ROUTE, log);
+        const refused = await pickStaticFallbackUpstream(deps, bodyFor("deepseek-v4-flash"), GO_FLASH_ROUTE, log);
+        if (degraded.has("deepseek")) {
+          assert.equal(pooled.ok, false);
+          if (!pooled.ok) assert.equal(pooled.error.kind, "pool_unavailable");
+          assert.equal(refused, null);
+        } else {
+          assert.equal(pooled.ok && pooled.session.providerId, "deepseek");
+          assert.equal(refused?.providerId, "deepseek");
+        }
+      }
+    } finally {
+      if (prev === undefined) Reflect.deleteProperty(process.env, "OC_PROVIDER_HEALTH_ENFORCE");
+      else process.env.OC_PROVIDER_HEALTH_ENFORCE = prev;
+    }
   });
 });

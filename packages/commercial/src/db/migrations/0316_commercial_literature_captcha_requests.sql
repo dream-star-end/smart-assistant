@@ -1,4 +1,4 @@
--- order-dependency: none Independent new platform CAPTCHA table; 0310-0312 model migrations have no schema dependency. Apply any lower-number commercial candidates first.
+-- order-dependency: 0315_commercial_reviewer_off_zai
 -- OCV5-524: free plugin inference uses platform request quotas, never user wallet debits.
 -- Reservations are counted even if the provider result/usage is unknown. No automatic refunds.
 -- Additive: old binaries ignore this table. No service is activated by this migration.

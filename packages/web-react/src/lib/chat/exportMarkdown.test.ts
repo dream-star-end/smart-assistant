@@ -50,10 +50,32 @@ describe("exportSessionMarkdown", () => {
     expect(md).toBe("");
   });
 
-  test("正在生成时不导出尚未完成的回答", async () => {
-    const md = await exportSessionMarkdown([msg({ id: "u", role: "user", text: "问题" }), msg({ id: "a", role: "assistant", text: "尚未完成" })], true);
+  test("keeps visible live answer snapshots as incomplete without sharing unfinished answers", async () => {
+    const rows = [msg({ id: "u", role: "user", text: "问题" }), msg({ id: "a", role: "assistant", text: "已得到的可用回答" })];
+    const snapshot = JSON.stringify(rows);
+    const md = await exportSessionMarkdown(rows, true);
     expect(md).toContain("问题");
-    expect(md).not.toContain("尚未完成");
+    expect(md).toContain("## 助手（未完成）");
+    expect(md).toContain("已得到的可用回答");
+    expect(JSON.stringify(rows)).toBe(snapshot);
+    const { selectShareMessages } = await import("./shareSelection");
+    expect(selectShareMessages(rows, "all", true)).toEqual([rows[0]]);
+  });
+
+  test("excludes live tool tails and explicitly hidden unpublished output", async () => {
+    const user = msg({ id: "u", role: "user", text: "生成报告", _clientMessageId: "u", ts: 1 });
+    const process = msg({ id: "process", role: "assistant", text: "PRIVATE_PROCESS", _clientMessageId: "u", ts: 2 });
+    for (const role of ["tool", "thinking"] as const) {
+      const md = await exportSessionMarkdown([user, process, msg({ id: "tail", role, text: "PRIVATE_WORK", _clientMessageId: "u", ts: 3 })], true);
+      expect(md).toContain("生成报告");
+      expect(md).not.toContain("PRIVATE_");
+    }
+    for (const flags of [{ _hideUnpublishedFallback: true }, { _turnStatusRecord: true }]) {
+      const hidden = msg({ id: "hidden", role: "assistant", text: "PRIVATE_HIDDEN", _clientMessageId: "u", ts: 3, ...flags });
+      expect(await exportSessionMarkdown([user, hidden], true)).not.toContain("PRIVATE_");
+    }
+    const unpublishedFile = msg({ id: "hidden-file", role: "assistant", text: "PRIVATE_HIDDEN [下载](/home/agent/.openclaude/generated/private.csv)", _hideUnpublishedFallback: true, _clientMessageId: "u", ts: 3 });
+    expect(await exportSessionMarkdown([user, unpublishedFile], true)).not.toContain("private.csv");
   });
 
   test("preserves visible output before a terminal failure as incomplete, without error or process data", async () => {
@@ -97,6 +119,48 @@ describe("exportSessionMarkdown", () => {
     const partial = await exportSessionMarkdown([user, msg({ id: "partial", role: "assistant", text: "已完成的合法正文。\n\n[turn failed: engine_error]", _errorCode: "ENGINE_ERROR", ts: 4 })]);
     expect(partial).toContain("已完成的合法正文。");
     expect(partial).not.toContain("turn failed");
+  });
+
+  test("keeps a delivered file on a stopped assistant row before later tools", async () => {
+    const rows = [
+      msg({ id: "u", role: "user", text: "生成文件", _clientMessageId: "u", _orderSeq: 1, ts: 1 }),
+      msg({ id: "file", role: "assistant", text: "已生成：[下载](/home/agent/.openclaude/generated/sales.csv)\n\n[turn failed: user_cancelled]", _errorCode: "USER_CANCELLED", _clientMessageId: "u", _orderSeq: 2, ts: 2 }),
+      msg({ id: "tool", role: "tool", text: "PRIVATE_TOOL_OUTPUT", _clientMessageId: "u", _orderSeq: 3, ts: 3 }),
+    ];
+    const snapshot = JSON.stringify(rows);
+    const md = await exportSessionMarkdown(rows);
+    expect(md).toContain("下载（sales.csv）");
+    expect(md).toContain("## 助手（未完成）");
+    expect(md).not.toContain("PRIVATE_TOOL_OUTPUT");
+    expect(md).not.toContain("turn failed");
+    expect(JSON.stringify(rows)).toBe(snapshot);
+    const { selectShareMessages } = await import("./shareSelection");
+    expect(selectShareMessages(rows, "all")).toEqual([rows[0]]);
+    const internal = await exportSessionMarkdown([rows[0]!, msg({
+      id: "internal", role: "assistant", text: '{"error":"PRIVATE_ERROR","path":"/home/agent/.openclaude/generated/secret.csv"}',
+      _errorCode: "ENGINE_ERROR", _clientMessageId: "u", _orderSeq: 2, ts: 2,
+    }), rows[2]!]);
+    expect(internal).not.toContain("PRIVATE_ERROR");
+    expect(internal).not.toContain("secret.csv");
+  });
+
+  test("keeps completed visible summaries before tool and prediction-only tails", async () => {
+    const user = msg({ id: "u", role: "user", text: "复核任务", status: "replied", _clientMessageId: "u", ts: 1 });
+    const summary = msg({ id: "summary", role: "assistant", text: "方案已复核，修改已推送。", _clientMessageId: "u", ts: 2 });
+    const tool = msg({ id: "tool", role: "tool", text: "PRIVATE_TOOL", _clientMessageId: "u", ts: 3 });
+    const prediction = msg({ id: "prediction", role: "assistant", text: '```ui\n{"type":"next","text":"PREDICTION_ONLY"}\n```', _clientMessageId: "u", ts: 4 });
+    const rows = [user, summary, tool, prediction];
+    const snapshot = JSON.stringify(rows);
+    const md = await exportSessionMarkdown(rows);
+    expect(md).toContain(summary.text);
+    expect(md).not.toContain("未完成");
+    expect(md).not.toContain("PRIVATE_TOOL");
+    expect(md).not.toContain("PREDICTION_ONLY");
+    expect(JSON.stringify(rows)).toBe(snapshot);
+    expect(await exportSessionMarkdown(rows, true)).not.toContain(summary.text);
+    expect(await exportSessionMarkdown([user, summary, tool])).not.toContain(summary.text);
+    expect(await exportSessionMarkdown([user, summary, tool, { ...prediction, _errorCode: "ENGINE_ERROR" }])).not.toContain(summary.text);
+    expect(await exportSessionMarkdown([user, { ...summary, _hideUnpublishedFallback: true }, tool, prediction])).not.toContain(summary.text);
   });
 
   test("空列表得到空串", async () => {

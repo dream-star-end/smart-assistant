@@ -1,3 +1,9 @@
+import { makeDraftPreparation, makePreparationReady, type DraftPreparationHint } from './agent-sandbox/draftPreparation.js';
+import { makeEnginePreheatPreparation, makeDraftEnginePreparation } from './dispatch/enginePreheatPreparation.js';
+import { makeWorkspacePreparation } from './agent-sandbox/workspacePreparation.js';
+import { isInMaintenance } from './middleware/maintenanceMode.js';
+import { HttpError } from './http/util.js';
+import { startLogTimingReporter } from './logging/logTimingReporter.js';
 import { setContentReviewAlerter } from '@openclaude/gateway'
 import { alertContentReview } from './admin/contentReviewAlert.js'
 /**
@@ -77,6 +83,7 @@ import { PricingCache, createModelHintProvider, type ModelPricing } from "./bill
 import { applyTurnWaiver } from "./billing/refund.js";
 import { canUseModel } from "./billing/authzModels.js";
 import { ALLOWED_INBOUND_MODELS, setModelHintProvider, setLiteratureSkillProvider, setHostStaticProviderKeys } from "@openclaude/gateway";
+import { setPlatformFlashFallbackKey } from "./http/proxy/shared.js";
 import { getPreferences, patchPreferences } from "./user/preferences.js";
 import { getLiteratureSkillConfig } from "./admin/literatureConfig.js";
 import {
@@ -681,7 +688,7 @@ import {
 } from "./qqbot/receiver.js";
 import { createPgIdentityRepo } from "./auth/containerIdentity.js";
 import { makeContainerIdentityStrategy } from "./auth/proxyIdentity.js";
-import { makeLoadUserModelAuthz } from "./auth/userModelAuthz.js";
+import { makeLoadUserModelAuthz, scopeFromAuthz } from "./auth/userModelAuthz.js";
 import { getProviderRoutingAvailability } from "./admin/providerHealthGate.js";
 import { makePgApiKeyRepo } from "./auth/apiKeyRepo.js";
 import { makeApiKeyIdentityStrategy, resolveApiKeyIdentity } from "./auth/apiKeyIdentity.js";
@@ -1631,6 +1638,8 @@ export async function registerCommercial(
   // (见 gateway/hostStaticProviders + subprocessRunner 注入点)。个人版不 import commercial →
   // seam 恒 null = 整块 no-op,settings.json 继续掌权。与 setModelHintProvider 同注册/清理生命周期。
   setHostStaticProviderKeys(buildHostStaticProviderKeys(cfg));
+  // OCV5-482:平台直连 flash(市场审核/语音润色/知识星球)Go 不可用时回落 DeepSeek 官方。
+  setPlatformFlashFallbackKey(cfg.DEEPSEEK_API_KEY);
 
   // 0069 — SKILLS_LITERATURE slot 反向钩子:容器 spawn 重建 system prompt 时读窄配置,
   // admin 改完下次 spawn 自然生效(无 cache / 无 LISTEN/NOTIFY,见 0069 migration 注释)。
@@ -2470,6 +2479,7 @@ export async function registerCommercial(
       });
       const grokRelayHandler: GrokRelayHandler = makeGrokRelayHandler({
         identityRepo,
+        logger: rootLogger.child({ subsys: "grokRelay" }),
         // Per-request account feedback through the shared health tracker:
         // 401/403/429/5xx count toward the same 3-strike cooldown as CCB, and
         // cooldownRecoveryActor half-opens the row 10 minutes later. Previously
@@ -2517,6 +2527,7 @@ export async function registerCommercial(
       });
       const antigravityRelayHandler: AntigravityRelayHandler = makeAntigravityRelayHandler({
         identityRepo,
+        logger: rootLogger.child({ subsys: "antigravityRelay" }),
         clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
         pricing,
       });
@@ -4126,6 +4137,90 @@ export async function registerCommercial(
   const ensureContainerReady: ((uid: bigint) => Promise<void>) | undefined =
     ensureContainerEndpointReady;
 
+  const preheatUserContainer = bridgeSecret
+      ? makeEnginePreheatClient({
+          transport: makeNodeHttpContainerTransport(),
+          bridgeSecret,
+          resolvePreparation: makeEnginePreheatPreparation({
+            resolveAllowedModel: async (uid, modelId) => {
+              const active = (await getPool().query<{ status: string }>(
+                'SELECT status FROM users WHERE id = $1', [uid.toString()],
+              )).rows[0];
+              if (active?.status !== 'active') return null;
+              const cache = peekModelCatalogCache();
+              if (!cache) return null;
+              const snapshot = await cache.assertFresh();
+              const canonical = snapshot.aliasToCanonical(modelId);
+              const authz = await loadUserModelAuthz(uid, snapshot.securityEpoch);
+              if (!snapshot.canUseModel(scopeFromAuthz(uid, authz), canonical)) return null;
+              const descriptor = snapshot.resolve(canonical);
+              return descriptor ? { engine: descriptor.engine, canonicalModel: descriptor.canonicalModel } : null;
+            },
+            listGroups: modelId => listEnabledGroupsForModel({ modelId, provider: 'codex' }),
+            hasOfficial: groupId => hasActiveOfficialOAuthAccountInGroup(groupId, 'codex'),
+          }),
+          resolveRunningEndpoint: async (uid) => {
+            const r = await getPool().query<{
+              id: string;
+              bound_ip: string | null;
+              port: number | null;
+              host_name: string | null;
+            }>(
+              `SELECT ac.id::text AS id, host(ac.bound_ip) AS bound_ip, ac.port,
+                      ch.name AS host_name
+                 FROM agent_containers ac
+                 LEFT JOIN compute_hosts ch ON ch.id = ac.host_uuid
+                WHERE ac.user_id = $1 AND ac.state = 'active' AND ac.runtime_channel = $2
+                  AND ac.runtime_kind = 'docker'
+                  AND ac.bound_ip IS NOT NULL AND ac.port IS NOT NULL
+                ORDER BY ac.updated_at DESC LIMIT 1`,
+              [uid.toString(), getRuntimeChannel()],
+            );
+            const row = r.rows[0];
+            if (!row || !row.bound_ip || row.port === null) return null;
+            const isRemoteHost = row.host_name !== null && row.host_name !== "self";
+            return {
+              host: row.bound_ip,
+              port: Number(row.port),
+              containerId: Number(row.id),
+              ...(isRemoteHost ? { tunnel: { kind: "remote-host" as const } } : {}),
+            };
+          },
+        })
+      : undefined;
+
+  const authorizePreparation = async (uid: bigint): Promise<void> => {
+          const row = (await getPool().query<{ status: string; role: string }>(
+            'SELECT status, role FROM users WHERE id = $1', [uid.toString()],
+          )).rows[0];
+          if (!row || row.status !== 'active') throw new HttpError(403, 'FORBIDDEN', 'account is not active');
+          if (row.role !== 'admin' && await isInMaintenance()) {
+            throw new HttpError(503, 'MAINTENANCE', 'service is in maintenance');
+          }
+          const catalog = peekModelCatalogCache();
+          const snapshot = catalog ? await catalog.assertFresh() : null;
+          await loadUserModelAuthz(uid, snapshot?.securityEpoch);
+        };
+  const preparationReady = ensureContainerEndpointReady ? makePreparationReady(ensureContainerEndpointReady) : undefined;
+  const prepareContainer = preparationReady ? makeWorkspacePreparation({
+    authorize: authorizePreparation, ensureReady: preparationReady,
+    warn: fields => rootLogger.warn('workspace_prepare', fields),
+  }) : undefined;
+  const prepareDraft = preparationReady ? makeDraftPreparation({
+    enabled: () => process.env.OC_ENGINE_PREHEAT === '1',
+    authorize: authorizePreparation,
+    ensureReady: preparationReady,
+    prepareEngine: preheatUserContainer && dispatchAdmissionBackend ? makeDraftEnginePreparation({
+      loadWorkspaceMode: (uid, sessionId) => dispatchAdmissionBackend!.getClientSessionWorkspaceMode(
+        sessionId, 'c:'.concat(uid.toString())),
+      preheat: preheatUserContainer,
+    }) : async () => {},
+    observe: fields => rootLogger.info('draft_prepare', fields),
+  }) : undefined;
+  const prepareWorkspaceContainer = prepareContainer
+    ? (uid: bigint, draft?: DraftPreparationHint) => draft ? prepareDraft!(uid, draft) : prepareContainer(uid)
+    : undefined;
+
   // 邮箱验证成功 → fire-and-forget 触发 v3 容器 pre-warm(p50=215s"验证 → 首消息"间隔
   // 覆盖 docker run 冷启,首条消息命中 running)。
   // 失败自动再试 1 次(间隔 5s,见 makePrewarmContainer);两次都失败才记 friction。
@@ -4382,6 +4477,7 @@ export async function registerCommercial(
     // HIGH#6:admin/containers v3 行的 stop/remove/restart 走这条 dispatch
     v3Supervisor: v3Deps,
     prewarmContainer,
+    prepareWorkspaceContainer,
     // v1.0.191 — /api/media-signed 冷启动护栏。装配端做了 per-uid singleflight 合并,
     // 见上方 ensureContainerReady 构造闭包注释。
     ensureContainerReady,
@@ -7061,6 +7157,7 @@ export async function registerCommercial(
 
   setContentReviewAlerter((event) => { void alertContentReview(event) })
 
+  const stopLogTiming = startLogTimingReporter(rootLogger);
   return {
     handle: async (req, res) => {
       // A Quick Tunnel reaches the same listener with a trycloudflare Host.
@@ -7083,6 +7180,7 @@ export async function registerCommercial(
       return false;
     },
     shutdown: async () => {
+      stopLogTiming();
       // P2:停 sessions GC sweeper —— 清 sweep timer、unlock advisory lease、还/销毁持锁连接
       // (否则残留 setInterval + 永不归还池的持锁连接会泄漏,且备 master 竞不到锁)。
       if (sessionsGcSweeper) {
@@ -7256,39 +7354,7 @@ export async function registerCommercial(
           }
         }
       : undefined,
-    preheatUserContainer: bridgeSecret
-      ? makeEnginePreheatClient({
-          transport: makeNodeHttpContainerTransport(),
-          bridgeSecret,
-          resolveRunningEndpoint: async (uid) => {
-            const r = await getPool().query<{
-              id: string;
-              bound_ip: string | null;
-              port: number | null;
-              host_name: string | null;
-            }>(
-              `SELECT ac.id::text AS id, host(ac.bound_ip) AS bound_ip, ac.port,
-                      ch.name AS host_name
-                 FROM agent_containers ac
-                 LEFT JOIN compute_hosts ch ON ch.id = ac.host_uuid
-                WHERE ac.user_id = $1 AND ac.state = 'active' AND ac.runtime_channel = $2
-                  AND ac.runtime_kind = 'docker'
-                  AND ac.bound_ip IS NOT NULL AND ac.port IS NOT NULL
-                ORDER BY ac.updated_at DESC LIMIT 1`,
-              [uid.toString(), getRuntimeChannel()],
-            );
-            const row = r.rows[0];
-            if (!row || !row.bound_ip || row.port === null) return null;
-            const isRemoteHost = row.host_name !== null && row.host_name !== "self";
-            return {
-              host: row.bound_ip,
-              port: Number(row.port),
-              containerId: Number(row.id),
-              ...(isRemoteHost ? { tunnel: { kind: "remote-host" as const } } : {}),
-            };
-          },
-        })
-      : undefined,
+    preheatUserContainer,
     // remote-host media push hook(2026-05-16 hotfix):用户容器调度到 remote
     // compute host 时,master 收到 /api/uploads → 本地暂存 → 调本 hook 把字节
     // 推到 host 上的 docker volume(/var/lib/docker/volumes/oc-v3-data-u<uid>/

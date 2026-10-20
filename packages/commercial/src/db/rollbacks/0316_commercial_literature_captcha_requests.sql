@@ -5,10 +5,10 @@ LOCK TABLE schema_migrations IN SHARE ROW EXCLUSIVE MODE;
 LOCK TABLE literature_captcha_requests IN ACCESS EXCLUSIVE MODE;
 DO $$
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version = '0313_commercial_literature_captcha_requests') THEN
-    RAISE EXCEPTION '0313_commercial_literature_captcha_requests is not applied';
+  IF NOT EXISTS (SELECT 1 FROM schema_migrations WHERE version = '0316_commercial_literature_captcha_requests') THEN
+    RAISE EXCEPTION '0316_commercial_literature_captcha_requests is not applied';
   END IF;
-  IF EXISTS (SELECT 1 FROM schema_migrations WHERE version > '0313_commercial_literature_captcha_requests') THEN
+  IF EXISTS (SELECT 1 FROM schema_migrations WHERE version > '0316_commercial_literature_captcha_requests') THEN
     RAISE EXCEPTION 'a later migration is applied; roll that back first';
   END IF;
   IF EXISTS (SELECT 1 FROM literature_captcha_requests) THEN
@@ -16,5 +16,5 @@ BEGIN
   END IF;
 END $$;
 DROP TABLE literature_captcha_requests;
-DELETE FROM schema_migrations WHERE version = '0313_commercial_literature_captcha_requests';
+DELETE FROM schema_migrations WHERE version = '0316_commercial_literature_captcha_requests';
 COMMIT;

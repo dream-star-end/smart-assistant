@@ -17,7 +17,7 @@ import { decryptToBuffer, encrypt } from '../crypto/aead.js'
 import { loadKmsKey, zeroBuffer } from '../crypto/keys.js'
 import { getPool } from '../db/index.js'
 import { tx } from '../db/queries.js'
-import { OPENCODE_GO_UPSTREAM_ENDPOINT, openCodeGoAuthHeaders } from '../http/proxy/shared.js'
+import { fetchPlatformFlash } from '../http/proxy/shared.js'
 import { disabledPluginSet } from './enablement.js'
 import { KNOWLEDGE_PLANET_AUTOMATION_DISCLAIMER_VERSION } from './knowledgePlanetAutomation.js'
 import { KNOWLEDGE_PLANET_PLUGIN_SLUG } from './knowledgePlanetContract.js'
@@ -811,10 +811,9 @@ async function callReplyModel(input: {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), MODEL_TIMEOUT_MS)
     try {
-      const response = await input.fetchImpl(OPENCODE_GO_UPSTREAM_ENDPOINT, {
-        method: 'POST',
-        headers: openCodeGoAuthHeaders(input.apiKey),
-        body: JSON.stringify({
+      const response = await fetchPlatformFlash(input.fetchImpl, {
+        goKey: input.apiKey,
+        body: {
           model: KNOWLEDGE_PLANET_AUTOMATION_MODEL,
           max_tokens: MODEL_MAX_TOKENS,
           temperature: 0.2,
@@ -833,10 +832,12 @@ async function callReplyModel(input: {
               ].join('\n\n'),
             },
           ],
-        }),
-        signal: controller.signal,
-        ...(input.dispatcher ? { dispatcher: input.dispatcher } : {}),
-      } as RequestInit & { dispatcher?: Dispatcher })
+        },
+        init: {
+          signal: controller.signal,
+          ...(input.dispatcher ? { dispatcher: input.dispatcher } : {}),
+        } as RequestInit & { dispatcher?: Dispatcher },
+      })
       if (!response.ok) throw new Error(`Knowledge Planet automation model HTTP ${response.status}`)
       responseJson = await response.json()
     } finally {

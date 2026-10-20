@@ -537,3 +537,35 @@ describe("prepared native model handoff fencing", () => {
     assert.match(withHints, /<current_user_message>\ncontinue/);
   });
 });
+
+describe("draft speculative identity creation", () => {
+  test("isolated_v1 new draft and real first send reuse the exact runner", async () => {
+    const { sm } = makeSm();
+    const opts = { sessionKey: KEY, agent: { id: 'main', cwd: process.cwd() } as AgentDef,
+      channel: 'webchat', peerId: 'switch-peer', model: 'gpt-6.1-sol',
+      workspaceMode: 'isolated_v1' as const, effortLevel: 'high' };
+    const warm = await sm.getOrCreate({ ...opts, preheatOnly: true });
+    let shutdown = 0;
+    warm.runner.shutdown = async () => { shutdown++ };
+    const first = await sm.getOrCreate(opts);
+    assert.equal(first, warm);
+    assert.equal(first.runner, warm.runner);
+    assert.equal(first.workspaceMode, 'isolated_v1');
+    assert.equal(shutdown, 0);
+    assert.equal('preheatOnly' in (first._identityCreationOpts ?? {}), false);
+  });
+  test("late draft preparation never replaces or mutates a real-created session", async () => {
+    const { sm } = makeSm();
+    const opts = { sessionKey: KEY, agent: { id: 'main', cwd: process.cwd() } as AgentDef,
+      channel: 'webchat', peerId: 'switch-peer', model: 'gpt-6.1-sol',
+      workspaceMode: 'isolated_v1' as const, effortLevel: 'high', userId: 'c:42' };
+    const real = await sm.getOrCreate(opts);
+    const before = { runner: real.runner, model: real.runner.model, workspaceMode: real.workspaceMode,
+      lastUsedAt: real.lastUsedAt, identity: real._identityCreationOpts, userId: real.userId };
+    const late = await sm.getOrCreate({ ...opts, model: 'gpt-6-luna', effortLevel: 'low',
+      workspaceMode: 'legacy', preheatOnly: true, userId: 'c:999' });
+    assert.equal(late, real);
+    assert.deepEqual({ runner: real.runner, model: real.runner.model, workspaceMode: real.workspaceMode,
+      lastUsedAt: real.lastUsedAt, identity: real._identityCreationOpts, userId: real.userId }, before);
+  });
+});

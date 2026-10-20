@@ -434,6 +434,8 @@ export async function shouldRetainBoxPrecheck(pool: Pool, requestId: string,
  */
 export type FinalizerHandle = {
   commit: (obs: UsageObservation) => Promise<FinalizeOutcome>;
+  /** OCV5-482: provider/model that actually served, kept in usage_records.price_snapshot.upstream. */
+  setUpstream?: (upstream: { provider: string; model: string }) => void;
   fail: (obs: UsageObservation, err: unknown, failureCode?: JournalFailureCode) => Promise<FinalizeOutcome>;
   /**
    * 与 fail 同写库 + 写 abort journal,但 scheduler.release 走 client_error,
@@ -446,6 +448,7 @@ export type FinalizerHandle = {
 export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): FinalizerHandle {
   let done: FinalizeOutcome | null = null;
   let inflight: Promise<FinalizeOutcome> | null = null;
+  let servedUpstream: { provider: string; model: string } | null = null;
 
   async function runCommit(obs: UsageObservation): Promise<FinalizeOutcome> {
     if (obs.kind === "none") {
@@ -501,6 +504,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
         usage,
         snapshotJson: JSON.stringify({
           ...snapshot,
+          ...(servedUpstream ? { upstream: servedUpstream } : {}),
           ...(waivedNoOutput
             ? { waived: "no_output", wouldHaveCharged: cost_credits.toString() }
             : {}),
@@ -669,6 +673,7 @@ export function makeFinalizer(deps: FinalizeDeps, ctx: FinalizeContext): Finaliz
 
   return {
     commit: (obs) => runFinalizeAndRelease(() => runCommit(obs), "success", null),
+    setUpstream: (upstream) => { servedUpstream = upstream; },
     fail: (obs, err, failureCode) =>
       runFinalizeAndRelease(() => runAbort(obs, err, failureCode), "failure", errMessageShort(err), readPoolOutcome(err)),
     failClient: (obs, err, failureCode) =>

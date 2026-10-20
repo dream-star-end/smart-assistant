@@ -1,3 +1,6 @@
+import type { OpenClaudeConfig } from '@openclaude/storage';
+import { clearUnusedPreheats } from '../speculativePreheat.js';
+import { _buildSafeCodexRouteOverride } from '../routeOverrides.js';
 /**
  * CodexAdapter turn parity 测试(M1a)。
  *
@@ -27,9 +30,9 @@ import type { spawn } from "node:child_process";
 import { paths } from "@openclaude/storage";
 
 import { CodexAdapter, buildCodexBillingEvent, classifyCodexErrorKind } from "../engine/codexAdapter.js";
-import { __setCodexAppServerSpawnForTests } from "../engine/codexAppServerRunner.js";
+import { __setCodexAppServerSpawnForTests, log as codexTimingLog } from "../engine/codexAppServerRunner.js";
 import { CREDIT_EXHAUSTED_DETAIL } from "../creditExhaustion.js";
-import { IDLE_TIMEOUT_TOOL_MS, shouldTripIdleWatchdog } from "../sessionManager.js";
+import { SessionManager, IDLE_TIMEOUT_TOOL_MS, shouldTripIdleWatchdog } from "../sessionManager.js";
 import { _setModelCatalogClientForTests } from "../modelCatalogClient.js";
 import { _setPlatformPricingLookupForTests } from "../usageCost.js";
 import { engineSessionId } from "../engine/engineSessionId.js";
@@ -709,6 +712,103 @@ describe("CodexAdapter — 事件映射 parity(fake-SDK 不出边界)", () => {
 });
 
 describe("CodexAdapter — interrupt / approval / 崩溃", () => {
+  test("OCV5-522: same-stack Stop before engine start retains exactly one owned terminal billing", async () => {
+    const h = makeHarness();
+    const order: string[] = [];
+    const turnKey = "c".repeat(64);
+    h.adapter.on("billing", () => order.push("billing"));
+    const turn = beginTurn(h, { requestId: "req-immediate-stop", turnKey });
+    assert.equal(h.adapter.interrupt(), true);
+    void turn.summary.then(() => order.push("summary"));
+    const summary = await turn.summary;
+    assert.ok(summary);
+    assert.equal(summary.isError, true);
+    assert.equal(summary.stopReason, "interrupted");
+    assert.equal(h.proc().written.some((r) => r.method === "turn/start"), false);
+    assert.equal(h.billing.length, 1, "the real pre-start cancellation result must retain its billing");
+    assert.equal(h.billing[0].requestId, "req-immediate-stop");
+    assert.equal(h.billing[0].turnKey, turnKey);
+    assert.equal(h.billing[0].engineSessionId, engineSessionId(SESSION_KEY));
+    assert.equal(h.billing[0].status, "error");
+    assert.equal(h.billing[0].terminalCode, "USER_CANCELLED");
+    assert.equal(h.billing[0].usage, undefined, "preserve the original no-usage frame without synthesizing tokens");
+    assert.deepEqual(order, ["billing", "summary"]);
+    assert.deepEqual(await h.adapter.writeDelegateTerminal({} as never, "late child"), {
+      ok: false, processAlive: true,
+    });
+  });
+
+  test("OCV5-522: a synchronous kernel result has billing ownership before submit returns", async () => {
+    const h = makeHarness();
+    const kernel = (h.adapter as unknown as { kernel: { submit: (...args: unknown[]) => Promise<void>; emit: (event: string, msg: unknown) => boolean } }).kernel;
+    kernel.submit = async () => {
+      kernel.emit("message", {
+        type: "result", subtype: "success", is_error: false,
+        requestId: "req-synchronous", result: "", num_turns: 1,
+        duration_ms: 1, total_cost_usd: 0,
+        usage: { input_tokens: 7, output_tokens: 2 },
+      });
+    };
+    const turn = beginTurn(h, { requestId: "req-synchronous" });
+    const summary = await turn.summary;
+    assert.ok(summary);
+    assert.equal(summary.isError, false);
+    assert.equal(h.billing.length, 1);
+    assert.equal(h.billing[0].requestId, "req-synchronous");
+    assert.equal(h.billing[0].status, "success");
+    assert.equal(h.billing[0].usage?.output_tokens, 2);
+  });
+
+  test("OCV5-522: a stale result from A cannot bill or finish the routed turn B", async () => {
+    const h = makeHarness();
+    const first = beginTurn(h, { requestId: "req-owner-a" });
+    await waitForRequest(h, "turn/start");
+    h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await first.summary;
+    assert.equal(h.billing.length, 1);
+    const second = beginTurn(h, { requestId: "req-owner-b" });
+    await waitFor(() => h.proc().written.filter((r) => r.method === "turn/start").length === 2);
+    let secondFinished = false;
+    void second.summary.then(() => { secondFinished = true; });
+    const kernel = (h.adapter as unknown as { kernel: { emit: (event: string, msg: unknown) => boolean } }).kernel;
+    kernel.emit("message", {
+      type: "result", subtype: "success", is_error: false,
+      requestId: "req-owner-a", result: "", num_turns: 1,
+      duration_ms: 3, total_cost_usd: 0,
+      usage: { input_tokens: 999, output_tokens: 99 },
+    });
+    await Promise.resolve();
+    assert.equal(secondFinished, false, "a foreign result must not finalize the current parser");
+    assert.equal(h.billing.length, 1, "a duplicate foreign result must not create another billing");
+    h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await second.summary;
+    assert.equal(h.billing.length, 2);
+    assert.equal(h.billing[1].requestId, "req-owner-b");
+  });
+
+  test("OCV5-522: a genuine success racing Stop retains its actual positive usage", async () => {
+    const h = makeHarness();
+    const turn = beginTurn(h, { requestId: "req-stop-success" });
+    await waitForRequest(h, "turn/start");
+    const tid = { threadId: "thr-new-1", turnId: "turn-1" };
+    h.proc().notify("thread/tokenUsage/updated", {
+      ...tid,
+      tokenUsage: {
+        last: { cachedInputTokens: 0, inputTokens: 10, outputTokens: 4, reasoningOutputTokens: 0, totalTokens: 14 },
+        total: { cachedInputTokens: 0, inputTokens: 10, outputTokens: 4, reasoningOutputTokens: 0, totalTokens: 14 },
+      },
+    });
+    assert.equal(h.adapter.interrupt(), true);
+    h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    const summary = await turn.summary;
+    assert.ok(summary);
+    assert.equal(summary.isError, false);
+    assert.equal(h.billing.length, 1);
+    assert.equal(h.billing[0].status, "success");
+    assert.equal(h.billing[0].terminalCode, undefined);
+    assert.equal(h.billing[0].usage?.output_tokens, 4);
+  });
+
   test("interrupt:活跃 turn → turn/interrupt 请求;interrupted 终态仍带 usage billing", async () => {
     const h = makeHarness();
     const turn = beginTurn(h, { requestId: "req-int" });
@@ -1439,36 +1539,209 @@ describe("CodexAdapter — turn/start 窄路径自动重试(end-to-end)", () => 
   });
 });
 
-// ── 会话打开预热(preheat,INC-20260824)────────────────────────────────────
+// ── Speculative session-open preparation (OCV5-496) ─────────────────────
+async function closePreheatHarness(h: Harness): Promise<void> {
+  const proc = h.proc();
+  const closing = h.adapter.shutdown();
+  setImmediate(() => { proc.emit('exit', 0, null); proc.emit('close', 0, null); });
+  await closing;
+}
 
-describe("CodexAdapter.preheat — spawn+initialize、零 thread/turn RPC", () => {
-  test("preheat 只 spawn + initialize;后续首 turn 复用同一进程再 thread/start", async () => {
+describe("CodexAdapter.preheat — fresh volatile thread, zero inference RPC", () => {
+  test("fresh thread is prepared once, unannounced until real turn, then reused", async () => {
     const h = makeHarness();
-    await h.adapter.preheat();
-
-    assert.equal(h.spawnCalls.length, 1, "preheat 必须 spawn 恰好一个 app-server");
-    assert.ok(
-      h.proc().written.some((r) => r.method === "initialize"),
-      "preheat 必须完成 initialize 握手",
-    );
-    for (const forbidden of ["thread/start", "thread/resume", "turn/start"]) {
-      assert.equal(
-        h.proc().written.some((r) => r.method === forbidden),
-        false,
-        `preheat 不得发 ${forbidden}(零上游 LLM 调用/零计费边界)`,
-      );
-    }
-
-    // 并发 preheat 共享同一 in-flight,不再 spawn 第二个进程。
     await Promise.all([h.adapter.preheat(), h.adapter.preheat()]);
     assert.equal(h.spawnCalls.length, 1);
-
-    // 预热后的首 turn:复用同一进程,走正常 thread/start → turn/start。
+    assert.equal(h.proc().written.filter(r => r.method === "thread/start").length, 1);
+    assert.deepEqual(h.sessionIds, []);
+    for (const forbidden of ["thread/resume", "turn/start", "thread/compact/start"]) {
+      assert.equal(h.proc().written.some(r => r.method === forbidden), false);
+    }
+    assert.deepEqual(h.billing, []);
+    await h.adapter.preheat();
     const turn = beginTurn(h, { requestId: "req-preheat" });
     await waitForRequest(h, "turn/start");
-    assert.equal(h.spawnCalls.length, 1, "首 turn 不得重复 spawn");
+    assert.equal(h.spawnCalls.length, 1);
+    assert.equal(h.proc().written.filter(r => r.method === "thread/start").length, 1);
+    assert.deepEqual(h.sessionIds, ["thr-new-1"]);
     h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
     await turn.summary;
-    await h.adapter.shutdown();
+    await closePreheatHarness(h);
   });
+  test("historical thread is not resumed or rewritten by speculative preparation", async () => {
+    const h = makeHarness({ resumeSessionId: "historical-thread" });
+    await h.adapter.preheat();
+    assert.equal(h.proc().written.some(r => r.method === "thread/start" || r.method === "thread/resume"), false);
+    assert.deepEqual(h.sessionIds, []);
+    await closePreheatHarness(h);
+  });
+  test("unused shutdown discards volatile thread instead of resuming it later", async () => {
+    const h = makeHarness();
+    await h.adapter.preheat();
+    await closePreheatHarness(h);
+    assert.deepEqual(h.sessionIds, []);
+    const turn = beginTurn(h);
+    await waitForRequest(h, "turn/start");
+    assert.equal(h.spawnCalls.length, 2);
+    assert.equal(h.proc().written.some(r => r.method === "thread/resume"), false);
+    h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+    await closePreheatHarness(h);
+  });
+  test("submit joins an in-flight fresh thread instead of creating a second one", async () => {
+    const h = makeHarness({}, (p, req) => {
+      if (req.method === "initialize") p.respondTo(req.id, {});
+      else if (req.method === "turn/start") p.respondTo(req.id, { turn: { id: "turn-1" } });
+    });
+    const warm = h.adapter.preheat();
+    const thread = await waitForRequest(h, "thread/start");
+    const turn = beginTurn(h);
+    await new Promise(r => setImmediate(r));
+    assert.equal(h.proc().written.some(r => r.method === "turn/start"), false);
+    h.proc().respondTo(thread.id, { thread: { id: "warm-thread" } });
+    await warm;
+    await waitForRequest(h, "turn/start");
+    assert.equal(h.proc().written.filter(r => r.method === "thread/start").length, 1);
+    assert.deepEqual(h.sessionIds, ["warm-thread"]);
+    h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+    await closePreheatHarness(h);
+  });
+
+  test("model change discards silent warm thread before starting the real turn", async () => {
+    let threadNo = 0;
+    const h = makeHarness({}, (p, req) => {
+      if (req.method === "initialize") p.respondTo(req.id, {});
+      else if (req.method === "thread/start") p.respondTo(req.id, { thread: { id: `fresh-${++threadNo}` } });
+      else if (req.method === "turn/start") p.respondTo(req.id, { turn: { id: "turn-1" } });
+    });
+    await h.adapter.preheat();
+    const old = h.proc();
+    // Match live ChildProcess state used by the shutdown signal guard.
+    Object.assign(old, { exitCode: null, signalCode: null });
+    h.adapter.setModel("gpt-6-luna");
+    const turn = beginTurn(h);
+    await waitFor(() => old.killed);
+    old.emit("exit", 0, null); old.emit("close", 0, null);
+    await waitFor(() => h.spawnCalls.length === 2 && h.proc().written.some(r => r.method === "turn/start"));
+    const fresh = h.proc().written.find(r => r.method === "thread/start")!;
+    assert.equal((fresh.params as Record<string, unknown>).model, "gpt-6-luna");
+    assert.equal(h.proc().written.some(r => r.method === "thread/resume"), false);
+    assert.deepEqual(h.sessionIds, ["fresh-2"]);
+    h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+    await closePreheatHarness(h);
+  });
+  test("shutdown at completed thread boundary fences late warm state and permits new preheat", async () => {
+    const h = makeHarness();
+    const kernel = (h.adapter as unknown as { kernel: any }).kernel;
+    const original = kernel._startNewThread.bind(kernel);
+    let reached = () => {};
+    let release = () => {};
+    const boundary = new Promise<void>(r => { reached = r; });
+    const pause = new Promise<void>(r => { release = r; });
+    kernel._startNewThread = async (...args: unknown[]) => {
+      await original(...args); reached(); await pause;
+    };
+    const warm = h.adapter.preheat();
+    const rejected = assert.rejects(warm, /CODEX_PREHEAT_STALE/);
+    await boundary;
+    await closePreheatHarness(h);
+    release();
+    await rejected;
+    assert.equal(kernel.attached, false);
+    assert.equal(kernel._preheatedSignature, null);
+    assert.deepEqual(h.sessionIds, []);
+    kernel._startNewThread = original;
+    await h.adapter.preheat();
+    assert.equal(h.spawnCalls.length, 2);
+    await closePreheatHarness(h);
+  });
+  test("same authoritative official route preserves the preheated process through the real first turn", async () => {
+    const route = () => _buildSafeCodexRouteOverride({
+      agent: { id: "main" }, model: "gpt-6.1-sol",
+      authority: { canonicalModel: "gpt-6.1-sol", engine: "codex" },
+      rawRoute: { kind: "official_oauth" }, officialRelayPort: 18789,
+    })!;
+    const h = makeHarness({ model: "gpt-6.1-sol" });
+    h.adapter.setCodexRoute(route());
+    await h.adapter.preheat();
+    assert.equal(h.proc().written.some(r => r.method === "turn/start" || r.method === "thread/resume"), false);
+    assert.deepEqual(h.sessionIds, []);
+    h.adapter.setCodexRoute(route());
+    const turn = beginTurn(h);
+    await waitForRequest(h, "turn/start");
+    assert.equal(h.spawnCalls.length, 1);
+    assert.equal(h.proc().written.filter(r => r.method === "thread/start").length, 1);
+    h.proc().notify("turn/completed", { turn: { id: "turn-1", status: "completed" } });
+    await turn.summary;
+    await closePreheatHarness(h);
+  });
+});
+
+describe("draft preheated thread timing truth", () => {
+  for (const warm of [false, true]) {
+    test(`thread_ready reports actual volatile claim warm=${warm}`, async (t) => {
+      const timing: Array<Record<string, unknown>> = [];
+      t.mock.method(codexTimingLog, 'info', (msg: string, fields: Record<string, unknown>) => {
+        if (msg === 'codex_turn_timing' && fields?.stage === 'thread_ready') timing.push(fields);
+      });
+      const h = makeHarness();
+      if (warm) {
+        await h.adapter.preheat();
+        assert.deepEqual(h.proc().written.map(r => r.method), ['initialize', 'thread/start']);
+        assert.deepEqual(h.billing, []);
+      }
+      const turn = beginTurn(h);
+      await waitForRequest(h, 'turn/start');
+      h.proc().notify('turn/completed', { turn: { id: 'turn-1', status: 'completed' } });
+      await turn.summary;
+      assert.equal(timing.length, 1);
+      assert.equal(timing[0].preheatedThreadClaimed, warm);
+      await closePreheatHarness(h);
+    });
+  }
+});
+
+test('draft isolated workspace preheat survives authoritative first-send creation and claims its thread', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'draft-preheat-contract-'));
+  const previous = process.env.OPENCLAUDE_DEFAULT_WORKSPACE;
+  process.env.OPENCLAUDE_DEFAULT_WORKSPACE = root;
+  const h = makeHarness();
+  const sm = new SessionManager({ defaults: { model: 'gpt-6.1-sol' },
+    gateway: { bind: '127.0.0.1', port: 0, accessToken: '' },
+    auth: { mode: 'subscription', claudeCodePath: '' }, sessions: { dbPath: '' },
+  } as unknown as OpenClaudeConfig);
+  Object.assign(sm, { _saveResumeMap: () => {} });
+  const claims: boolean[] = [];
+  t.mock.method(codexTimingLog, 'info', (msg: string, fields: Record<string, unknown>) => {
+    if (msg === 'codex_turn_timing' && fields?.stage === 'thread_ready') claims.push(fields.preheatedThreadClaimed === true);
+  });
+  const opts = { sessionKey: 'agent:main:webchat:dm:draft_contract_123', agent: { id: 'main' },
+    channel: 'webchat', peerId: 'draft_contract_123', model: 'gpt-6.1-sol',
+    workspaceMode: 'isolated_v1' as const, effortLevel: 'high' };
+  let actual: Harness | undefined;
+  try {
+    const warm = await sm.getOrCreate({ ...opts, preheatOnly: true });
+    actual = { ...h, adapter: warm.runner as CodexAdapter };
+    assert.equal(warm.workspaceCwd, join(root, 'sessions', opts.peerId));
+    assert.equal(await sm.preheatRunner(warm), 'started');
+    assert.deepEqual(h.proc().written.map(r => r.method), ['initialize', 'thread/start']);
+    assert.equal((warm.runner as CodexAdapter).effortLevel, 'high');
+    const real = await sm.getOrCreate({ ...opts, userId: 'c:42' });
+    assert.equal(real, warm);
+    const turn = beginTurn(actual);
+    await waitForRequest(actual, 'turn/start');
+    assert.equal(h.spawnCalls.length, 1);
+    assert.equal(h.proc().written.filter(r => r.method === 'thread/start').length, 1);
+    h.proc().notify('turn/completed', { turn: { id: 'turn-1', status: 'completed' } });
+    await turn.summary;
+    assert.deepEqual(claims, [true]);
+  } finally {
+    clearUnusedPreheats(sm);
+    if (actual && h.spawnCalls.length) await closePreheatHarness(actual);
+    if (previous === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_DEFAULT_WORKSPACE');
+    else process.env.OPENCLAUDE_DEFAULT_WORKSPACE = previous;
+    await rm(root, { recursive: true, force: true });
+  }
 });
