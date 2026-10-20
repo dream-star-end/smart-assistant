@@ -136,6 +136,58 @@ jobs:
       - name: Detector and check tests
         run: bash scripts/v5-migration-compat.test.sh
 
+  # OCV5-543(第三阶段 §5):架构护栏规则 1–4。报告期(1–2 周)只输出新增/增长/过期的违规身份,不拦;
+  # 脚本缺失、解析失败、modules.json 不合法、基线缺失照样红(fail-closed)。强制期改为 --enforce。
+  architecture:
+    name: architecture
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve comparison base
+        id: base
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            ref="origin/$BASE_REF"
+          elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            ref="$BEFORE"
+          else
+            ref="origin/feat/v5-selfhost"
+          fi
+          git rev-parse --verify "$ref^{commit}" >/dev/null
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Architecture guardrails (report period)
+        run: npx tsx scripts/check-architecture.ts --base "${{ steps.base.outputs.ref }}" --json "$RUNNER_TEMP/architecture.json"
+
+      - name: Checker tests
+        run: npx tsx --test scripts/__tests__/checkArchitecture.test.ts
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: architecture-report
+          path: ${{ runner.temp }}/architecture.json
+          if-no-files-found: ignore
+
   # OCV5-447:列车 pinned staging 跑的 watch / autorecover 行为门,PR 上先跑同一份清单
   # (scripts/v5-selfhost-watch-gate.sh)。此前只有列车跑,watch 改动要等一趟列车失败才知道。
   watch-gate:
