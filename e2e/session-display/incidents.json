@@ -7689,6 +7689,33 @@
           "assertion": "OCV5-525: completed summary stays visible when the last assistant is only input prediction"
         }
       ]
+    },
+    {
+      "id": "INC-20261020-GO-STEP-RENAMED-CHAT",
+      "occurredAt": "2026-10-20",
+      "severity": "P1",
+      "symptom": "OCV5-527 personal catalog acceptance found that Go removed step-5-preview-free and serves step-5-preview only on Chat completions. The stable local model ID must map to the current upstream and select its Chat bridge; the actual catalog upstream is switched separately after release. Active-member metadata and protocol probes confirmed messages 400 ModelProtocolUnsupported and Chat 200.",
+      "rootFixCommit": "e690a9e6",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/openCodeGoModels.test.ts",
+          "assertion": "OCV5-527 stable Step id uses the renamed chat-only upstream"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/proxyUpstream.unit.test.ts",
+          "assertion": "OCV5-527 Step catalog and static routes use the renamed chat upstream"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "[ocv5-527-step-chat] PASS — stable Step pricing identity selects the current chat upstream for static and catalog routes"
+        }
+      ],
+      "coverageCommits": [
+        "3b43dee6"
+      ]
     }
   ]
 }

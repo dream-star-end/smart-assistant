@@ -169,7 +169,7 @@ export const OPENCODE_GO_CHAT_MODELS: Readonly<Record<string, string>> = {
   'hy3-go': 'hy3',
   'longcat-2.0-go': 'longcat-2.0',
   'longcat-2.5-preview-free-go': 'longcat-2.5-preview-free',
-  'step-5-preview-free-go': 'step-5-preview-free',
+  'step-5-preview-free-go': 'step-5-preview',
 }
 
 const OPENCODE_GO_CHAT_UPSTREAMS = new Set(Object.values(OPENCODE_GO_CHAT_MODELS))
