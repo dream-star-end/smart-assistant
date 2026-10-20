@@ -1,6 +1,5 @@
 import crypto from 'node:crypto'
 import http from 'node:http'
-import https from 'node:https'
 import { type DnsResolver, resolvePinnedAddress } from '../../connectors/outboundPolicy.js'
 import { type JieyouAccountState, parseJieyouAccountState } from './accountState.js'
 import {
@@ -8,7 +7,7 @@ import {
   type LiteratureArtifactStore,
   type StagedLiteratureArtifact,
 } from './artifactStore.js'
-import { LiteratureError } from './errors.js'
+import { LiteratureError, abortable } from './errors.js'
 import { JieyouHttpClient } from './jieyouHttpClient.js'
 import { hasJieyouMemberAuthCookies } from './jieyouLoginSession.js'
 import { LiteratureHttpTransport } from './transport.js'
@@ -56,16 +55,8 @@ export const JIEYOU_WANFANG_ENTRY_PATH = '/e/action/ShowInfo.php?classid=79&id=2
 export const JIEYOU_SPRINGER_WEBVPN_ENTRY_PATH = '/e/action/ShowInfo.php?classid=209&id=1781'
 export const SPRINGER_WEBVPN_PREFIX =
   '/https/77726476706e69737468656265737421fcfe4f976923784277068ea98a1b203a54'
-export const JIEYOU_NATURE_ENTRY_PATH = '/e/action/ShowInfo.php?classid=209&id=1644'
-export const NATURE_ORIGIN = 'https://www.nature.com'
-
-const ALLOWED_DOWNSTREAM_HOSTS = new Set([
-  'www.jieyoutsg.com',
-  'jieyoutsg.com',
-  'webvpn.ustb.booktsg.com',
-  'www.nature.com',
-  'idp.nature.com',
-])
+const ALLOWED_DOWNSTREAM_HOSTS = new Set(['webvpn.ustb.booktsg.com'])
+const DOWNSTREAM_HOP_TIMEOUT_MS = 15_000
 
 const DOCUMENT_ID_TTL_MS = 60 * 60 * 1000 // 1 hour
 
@@ -296,52 +287,6 @@ export function parseSpringerSearchHtml(html: string, limit: number): ParsedWanf
   return [...fullAccessPapers, ...otherPapers].slice(0, limit)
 }
 
-export function parseNatureSearchHtml(html: string, limit: number): ParsedWanfangPaper[] {
-  const papers: ParsedWanfangPaper[] = []
-  const seenIds = new Set<string>()
-  const cardRe = /<article\b[\s\S]*?<\/article>/gi
-  let m: RegExpExecArray | null
-  while ((m = cardRe.exec(html)) !== null && papers.length < limit) {
-    const card = m[0]
-    const linkMatch = /href="[^"]*\/articles\/([a-zA-Z0-9_-]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(card)
-    if (!linkMatch?.[1] || !linkMatch[2]) continue
-    const articleId = linkMatch[1].trim()
-    if (!articleId || seenIds.has(articleId)) continue
-    const title = decodeHtmlEntities(linkMatch[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim())
-    if (!title) continue
-    seenIds.add(articleId)
-    const authors = Array.from(card.matchAll(/itemprop="name"[^>]*>([^<]+)<\/span>/gi))
-      .map((am) => decodeHtmlEntities(am[1]!.trim()))
-      .filter(Boolean)
-    const dateMatch = /datetime="(\d{4})(?:-\d{2}-\d{2})?"/i.exec(card)
-    const parsedYear = dateMatch?.[1] ? Number(dateMatch[1]) : undefined
-    const year =
-      parsedYear !== undefined && parsedYear >= 1500 && parsedYear <= 2100 ? parsedYear : undefined
-    const journalMatch =
-      /data-track-action="search result"[\s\S]*?<div[^>]*c-meta__item[^>]*>([^<]+)<\/div>/i.exec(
-        card,
-      )
-    const journal = journalMatch?.[1] ? decodeHtmlEntities(journalMatch[1].trim()) : 'Nature Portfolio'
-    const summaryMatch = /<div[^>]*c-card__summary[^>]*>([\s\S]*?)<\/div>/i.exec(card)
-    const snippet = summaryMatch?.[1]
-      ? decodeHtmlEntities(summaryMatch[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim()).slice(
-          0,
-          300,
-        )
-      : undefined
-    papers.push({
-      id: `nat_${articleId}`,
-      title,
-      authors,
-      journal,
-      ...(year !== undefined ? { year } : {}),
-      ...(snippet ? { snippet } : {}),
-      hasFulltext: true,
-    })
-  }
-  return papers
-}
-
 export function isChineseLiteratureQuery(query: string): boolean {
   return /\p{Script=Han}/u.test(query)
 }
@@ -427,36 +372,68 @@ export type DownstreamHttpRequester = (input: {
   readonly signal: AbortSignal
 }) => Promise<RawDownstreamResponse>
 
+function withDeadline<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      void work.catch(() => {})
+      reject(new LiteratureError('TIMEOUT'))
+    }, timeoutMs)
+    work.then(
+      (val) => {
+        clearTimeout(timer)
+        resolve(val)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
+}
+
 export function createPinnedDownstreamRequester(
   resolver?: DnsResolver,
+  hopTimeoutMs = DOWNSTREAM_HOP_TIMEOUT_MS,
 ): DownstreamHttpRequester {
   return async ({ url, method, headers, body, maxBytes, signal }) => {
     if (signal.aborted) throw new LiteratureError('CANCELLED')
     const hostname = url.hostname.toLowerCase()
     if (
+      url.origin !== WANFANG_WEBVPN_ORIGIN ||
       !ALLOWED_DOWNSTREAM_HOSTS.has(hostname) ||
       url.username ||
       url.password ||
       url.hash ||
-      !['http:', 'https:'].includes(url.protocol)
+      url.protocol !== 'http:'
     ) {
       throw new LiteratureError('OUTBOUND_BLOCKED')
     }
     let pin: Awaited<ReturnType<typeof resolvePinnedAddress>>
     try {
-      pin = await resolvePinnedAddress(hostname, resolver)
-    } catch {
+      pin = await abortable(
+        withDeadline(resolvePinnedAddress(hostname, resolver), hopTimeoutMs),
+        signal,
+      )
+    } catch (err) {
+      if (signal.aborted || (err instanceof LiteratureError && err.code === 'CANCELLED')) {
+        throw new LiteratureError('CANCELLED')
+      }
+      if (err instanceof LiteratureError && err.code === 'TIMEOUT') {
+        throw err
+      }
       throw new LiteratureError('OUTBOUND_BLOCKED')
     }
-    const isHttps = url.protocol === 'https:'
-    const mod = isHttps ? https : http
-    const port = url.port ? Number(url.port) : isHttps ? 443 : 80
+    if (signal.aborted) throw new LiteratureError('CANCELLED')
+    const isHttps = false
+    const mod = http
+    const port = url.port ? Number(url.port) : 80
 
     return await new Promise<RawDownstreamResponse>((resolve, reject) => {
       let settled = false
       const finish = (err?: unknown, res?: RawDownstreamResponse) => {
         if (settled) return
         settled = true
+        clearTimeout(timer)
         signal.removeEventListener('abort', onAbort)
         if (err) reject(err)
         else resolve(res!)
@@ -465,6 +442,10 @@ export function createPinnedDownstreamRequester(
         req.destroy()
         finish(new LiteratureError('CANCELLED'))
       }
+      const timer = setTimeout(() => {
+        req.destroy()
+        finish(new LiteratureError('TIMEOUT'))
+      }, hopTimeoutMs)
       const pinnedLookup = (
         _hostname: string,
         options: unknown,
@@ -514,10 +495,23 @@ export function createPinnedDownstreamRequester(
               body: Buffer.concat(chunks),
             })
           })
+          res.on('close', () => {
+            if (!settled && !res.complete) {
+              finish(
+                signal.aborted
+                  ? new LiteratureError('CANCELLED')
+                  : new LiteratureError('RESPONSE_INVALID'),
+              )
+            }
+          })
           res.on('error', (err) => finish(err))
         },
       )
       signal.addEventListener('abort', onAbort, { once: true })
+      if (signal.aborted) {
+        onAbort()
+        return
+      }
       req.on('error', () => {
         if (signal.aborted) {
           finish(new LiteratureError('CANCELLED'))
@@ -737,8 +731,7 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     }
 
     const html = res.body.toString('utf8')
-    const springerParsed = parseSpringerSearchHtml(html, pageSize)
-    const parsed = springerParsed.length > 0 ? springerParsed : parseNatureSearchHtml(html, pageSize)
+    const parsed = parseSpringerSearchHtml(html, pageSize)
     const items: LiteratureHttpSearchItem[] = parsed.slice(0, pageSize).map((item) => {
       this.rememberTitle(item.id, item.title)
       return {
@@ -768,53 +761,6 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     }
   }
 
-  private async followNatureRedirects(
-    initialUrl: URL,
-    signal: AbortSignal,
-    maxBytes: number,
-  ): Promise<RawDownstreamResponse> {
-    const cookieMap = new Map<string, string>()
-    let currentUrl = initialUrl
-    for (let hop = 0; hop < 6; hop++) {
-      const cookieHeader = Array.from(cookieMap.entries())
-        .filter(([, v]) => v !== '')
-        .map(([k, v]) => `${k}=${v}`)
-        .join('; ')
-      const res = await this.requester({
-        url: currentUrl,
-        method: 'GET',
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-          Referer: 'https://www.nature.com/ncomms/',
-          ...(cookieHeader ? { Cookie: cookieHeader } : {}),
-        },
-        maxBytes,
-        signal,
-      })
-      const setCookieRaw = res.headers['set-cookie']
-      const setCookies = Array.isArray(setCookieRaw)
-        ? setCookieRaw
-        : typeof setCookieRaw === 'string'
-          ? [setCookieRaw]
-          : []
-      for (const sc of setCookies) {
-        const m = /^([^=;\s]+)=([^;]*)/.exec(sc)
-        if (m?.[1] && m[2] !== undefined && m[2] !== '' && !/Max-Age=0/i.test(sc)) {
-          cookieMap.set(m[1], m[2])
-        }
-      }
-      if (res.statusCode >= 300 && res.statusCode < 400) {
-        const loc = typeof res.headers.location === 'string' ? res.headers.location : ''
-        if (!loc) throw new LiteratureError('RESPONSE_INVALID')
-        currentUrl = new URL(loc, currentUrl)
-        continue
-      }
-      return res
-    }
-    throw new LiteratureError('OUTBOUND_BLOCKED')
-  }
-
   private async executeDownload(
     input: LiteratureHttpReadExecutionInput,
     initialState: JieyouAccountState,
@@ -831,9 +777,6 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
 
     if (paperId.startsWith('sp_')) {
       return await this.executeEnglishSpringerDownload(input, initialState, paperId, title)
-    }
-    if (paperId.startsWith('nat_')) {
-      return await this.executeEnglishDownload(input, initialState, paperId.slice(4), title)
     }
 
     const updatedState = await this.verifyMemberSessionOnEntry(
@@ -863,6 +806,9 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     let nextLocation = typeof hop1Res.headers.location === 'string' ? hop1Res.headers.location : ''
     for (let hop = 0; hop < 4 && nextLocation; hop++) {
       const nextUrl = new URL(nextLocation, WANFANG_WEBVPN_ORIGIN)
+      if (nextUrl.origin !== WANFANG_WEBVPN_ORIGIN) {
+        throw new LiteratureError('OUTBOUND_BLOCKED')
+      }
       const txParam = nextUrl.searchParams.get('transaction')
       if (txParam) {
         transactionId = txParam
@@ -930,7 +876,11 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
       if (res.statusCode >= 300 && res.statusCode < 400) {
         const loc = typeof res.headers.location === 'string' ? res.headers.location : ''
         if (!loc) throw new LiteratureError('RESPONSE_INVALID')
-        currentUrl = new URL(loc, currentUrl)
+        const nextUrl = new URL(loc, currentUrl)
+        if (nextUrl.origin !== WANFANG_WEBVPN_ORIGIN) {
+          throw new LiteratureError('OUTBOUND_BLOCKED')
+        }
+        currentUrl = nextUrl
         continue
       }
       return res
@@ -981,27 +931,6 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     }
 
     return await this.stagePdfResponse(input, updatedState, pdfRes, title, paperId)
-  }
-
-  private async executeEnglishDownload(
-    input: LiteratureHttpReadExecutionInput,
-    initialState: JieyouAccountState,
-    articleId: string,
-    title: string,
-  ): Promise<LiteratureHttpReadExecutionOutput> {
-    const updatedState = await this.verifyMemberSessionOnEntry(
-      initialState,
-      JIEYOU_NATURE_ENTRY_PATH,
-      input.signal,
-    )
-
-    const pdfUrl = new URL(`/articles/${encodeURIComponent(articleId)}.pdf`, NATURE_ORIGIN)
-    const pdfRes = await this.followNatureRedirects(
-      pdfUrl,
-      input.signal,
-      LITERATURE_ARTIFACT_MAX_BYTES,
-    )
-    return await this.stagePdfResponse(input, updatedState, pdfRes, title, `nat_${articleId}`)
   }
 
   private async stagePdfResponse(

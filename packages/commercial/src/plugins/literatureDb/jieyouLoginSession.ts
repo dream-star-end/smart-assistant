@@ -195,6 +195,13 @@ export async function reloginJieyouAutomatically(input: {
         const storageState = (await session.snapshot(input.signal)) as JieyouAccountState
         return { storageState, verifiedAt: Date.now() }
       }
+      if (outcome === 'unknown') {
+        if (await session.probe(input.signal)) {
+          const storageState = (await session.snapshot(input.signal)) as JieyouAccountState
+          return { storageState, verifiedAt: Date.now() }
+        }
+        throw new LiteratureError('LOGIN_FAILED')
+      }
       if (outcome === 'credentials_invalid') {
         throw new LiteratureError('CREDENTIALS_INVALID')
       }

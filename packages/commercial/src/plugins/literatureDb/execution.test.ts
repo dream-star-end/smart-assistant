@@ -22,6 +22,7 @@ import {
   WANFANG_WEBVPN_FULLTEXT_PREFIX,
   WANFANG_WEBVPN_GRPC_PATH,
   WanfangLiteratureHttpExecutor,
+  createPinnedDownstreamRequester,
   mintScopedDocumentId,
   parseSpringerSearchHtml,
   verifyScopedDocumentId,
@@ -34,10 +35,20 @@ import {
 import { LITERATURE_SITE } from './policy.js'
 import { validateRuntimePluginJson } from '../contracts.js'
 
-const VALID_PDF = Buffer.from(
-  '%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [] /Count 1 >>\nendobj\nxref\n0 3\n0000000000 65535 f \ntrailer\n<< /Root 1 0 R /Size 3 >>\nstartxref\n110\n%%EOF\n',
-  'latin1',
-)
+const VALID_PDF = (() => {
+  const header = '%PDF-1.4\n'
+  const obj1 = '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n'
+  const obj2 = '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n'
+  const obj3 = '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n'
+  const o1 = header.length
+  const o2 = o1 + obj1.length
+  const o3 = o2 + obj2.length
+  const xrefOffset = o3 + obj3.length
+  const pad = (n: number) => String(n).padStart(10, '0')
+  const xref = `xref\n0 4\n0000000000 65535 f \n${pad(o1)} 00000 n \n${pad(o2)} 00000 n \n${pad(o3)} 00000 n \n`
+  const trailer = `trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`
+  return Buffer.from(header + obj1 + obj2 + obj3 + xref + trailer, 'latin1')
+})()
 
 function buildAuthenticatedState() {
   const jar = createJieyouCookieJar()
@@ -91,6 +102,12 @@ test('validatePdfStructureSync and validatePdfInIsolatedWorker accept valid PDFs
   assert.equal(await validatePdfInIsolatedWorker(VALID_PDF, signal), true)
 
   assert.equal(validatePdfStructureSync(Buffer.from('<html>not a pdf</html>')), false)
+  const fakeHtmlWithPdfMarkers = Buffer.from(
+    '%PDF-1.7\n<!-- filler bytes over 64 chars --> /Type /Page /Count 1 \n%%EOF\n',
+    'latin1',
+  )
+  assert.equal(validatePdfStructureSync(fakeHtmlWithPdfMarkers), false)
+  assert.equal(await validatePdfInIsolatedWorker(fakeHtmlWithPdfMarkers, signal), false)
   assert.equal(
     await validatePdfInIsolatedWorker(
       Buffer.from('%PDF-1.4\nmissing eof marker without trailer'),
@@ -238,6 +255,37 @@ test('jieyouLoginSession classifies responses and reloginJieyouAutomatically ret
   assert.equal(attempts, 2)
   assert.equal(closed, 1)
   assert.deepEqual(relogin.storageState, authState)
+
+  let unknownSubmits = 0
+  let unknownProbes = 0
+  const recovered = await reloginJieyouAutomatically({
+    credentials: { schemaVersion: 1, username: 'u1', password: 'p1' },
+    readers: [
+      {
+        provider: 'local-ocr',
+        model: 'ddddocr-1.6.1-common-old',
+        usageApproved: true,
+        recognize: async () => 'abcd',
+      },
+    ],
+    signal: new AbortController().signal,
+    createSession: async () => ({
+      challenge: async () => ({ mediaType: 'image/png', data: png }),
+      submit: async () => {
+        unknownSubmits++
+        return 'unknown'
+      },
+      probe: async () => {
+        unknownProbes++
+        return true
+      },
+      snapshot: async () => authState,
+      close: async () => {},
+    }),
+  })
+  assert.equal(unknownSubmits, 1)
+  assert.equal(unknownProbes, 1)
+  assert.deepEqual(recovered.storageState, authState)
 })
 
 test('WanfangLiteratureHttpExecutor executes both Chinese (Wanfang) and English (Springer paid subscription) search + download', async () => {
@@ -375,4 +423,29 @@ test('WanfangLiteratureHttpExecutor executes both Chinese (Wanfang) and English 
   enDl.stagedArtifact?.publish()
   validateRuntimePluginJson(LITERATURE_DOWNLOAD_OUTPUT_SCHEMA, enDl.data, 'result')
   assert(store.read(11, enDl.data.artifactId as string))
+})
+
+test('createPinnedDownstreamRequester aborts during DNS and enforces hop timeout', async () => {
+  const ac = new AbortController()
+  let resolveDns: ((ips: string[]) => void) | undefined
+  const requester = createPinnedDownstreamRequester(
+    async () =>
+      await new Promise<string[]>((resolve) => {
+        resolveDns = resolve
+      }),
+    80,
+  )
+  const pending = requester({
+    url: new URL('http://webvpn.ustb.booktsg.com/search'),
+    method: 'GET',
+    headers: {},
+    maxBytes: 1024,
+    signal: ac.signal,
+  })
+  ac.abort()
+  await assert.rejects(
+    pending,
+    (err: unknown) => err instanceof LiteratureError && err.code === 'CANCELLED',
+  )
+  resolveDns?.(['8.8.8.8'])
 })

@@ -73,29 +73,149 @@ export function sanitizeLiteraturePdfFilename(raw: string): string {
 export function validatePdfStructureSync(data: Buffer): boolean {
   if (!Buffer.isBuffer(data) || data.length < 64 || data.length > LITERATURE_ARTIFACT_MAX_BYTES)
     return false
-  const header = data.subarray(0, 8).toString('latin1')
-  if (!/^%PDF-[12]\.\d/.test(header)) return false
-  const tailSlice = data.subarray(Math.max(0, data.length - 8192)).toString('latin1')
-  if (!tailSlice.includes('%%EOF')) return false
-  const latin = data.toString('latin1')
-  if (!/\/Type\s*\/Pages?\b/.test(latin) && !/\/Count\s+[1-9]\d*/.test(latin) && !/\/Type\s*\/ObjStm\b/.test(latin) && !/\/Linearized\b/.test(latin)) return false
+  const head = data.subarray(0, Math.min(data.length, 1024)).toString('latin1')
+  if (!/^%PDF-[12]\.\d[\r\n]/.test(head)) return false
+  if (/<(?:!doctype|html|head|body|script|iframe|div)\b/i.test(head)) return false
+
+  const tailLen = Math.min(data.length, 16384)
+  const tail = data.subarray(data.length - tailLen).toString('latin1')
+  if (/\/Encrypt\b/.test(tail)) return false
+
+  const startxrefMatches = Array.from(
+    tail.matchAll(/\bstartxref[\r\n\s]+(\d+)[\r\n\s]+%%EOF/g),
+  )
+  if (startxrefMatches.length === 0) return false
+  const lastMatch = startxrefMatches[startxrefMatches.length - 1]!
+  const xrefOffset = Number.parseInt(lastMatch[1]!, 10)
+  if (!Number.isSafeInteger(xrefOffset) || xrefOffset <= 8 || xrefOffset >= data.length - 16) {
+    return false
+  }
+
+  const atXref = data
+    .subarray(xrefOffset, Math.min(data.length, xrefOffset + 8192))
+    .toString('latin1')
+  const fullStr = data.toString('latin1')
+
+  let rootNum: string | null = null
+  if (/^\s*xref[\r\n\s]+\d+\s+\d+/.test(atXref)) {
+    const trailerIdx = atXref.indexOf('trailer')
+    const trailerSource = trailerIdx >= 0 ? atXref.slice(trailerIdx) : tail
+    const rootMatch =
+      /\btrailer\b[\s\S]*?<<[\s\S]*?\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(
+        trailerSource,
+      ) ?? /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(tail)
+    if (!rootMatch?.[1]) return false
+    rootNum = rootMatch[1]
+    const inUseEntries = Array.from(atXref.matchAll(/\b(\d{10})\s+\d{5}\s+n\b/g))
+    if (inUseEntries.length === 0) return false
+    let verifiedObjAtOffset = 0
+    for (const entry of inUseEntries.slice(0, 10)) {
+      const off = Number.parseInt(entry[1]!, 10)
+      if (off > 0 && off < data.length - 10) {
+        const probe = data.subarray(off, Math.min(data.length, off + 64)).toString('latin1')
+        if (/^\s*\d+\s+\d+\s+obj\b/.test(probe)) verifiedObjAtOffset++
+      }
+    }
+    if (verifiedObjAtOffset === 0) return false
+  } else {
+    const xrefObjMatch =
+      /^\s*(\d+)\s+(\d+)\s+obj\b[\s\S]{1,4096}?<<([\s\S]{1,4096}?)>>/.exec(atXref)
+    if (!xrefObjMatch?.[3]) return false
+    const dict = xrefObjMatch[3]
+    if (!/\/Type\s*\/XRef\b/.test(dict)) return false
+    const rootMatch =
+      /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(dict) ??
+      /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(tail)
+    if (!rootMatch?.[1]) return false
+    rootNum = rootMatch[1]
+  }
+
+  const hasObjStm = /\/Type\s*\/ObjStm\b/.test(fullStr) || /\/Linearized\b/.test(fullStr)
+  if (!hasObjStm) {
+    const rootRe = new RegExp(
+      `\\b${rootNum}\\s+\\d+\\s+obj\\b[\\s\\S]{1,2048}?\\/Type\\s*\\/Catalog\\b`,
+    )
+    if (!rootRe.test(fullStr)) return false
+    if (
+      !/\/Type\s*\/Pages\b[\s\S]{1,2048}?\/Count\s+[1-9]\d*/.test(fullStr) &&
+      !/\/Count\s+[1-9]\d*[\s\S]{1,2048}?\/Type\s*\/Pages\b/.test(fullStr)
+    ) {
+      return false
+    }
+    if (!/\/Type\s*\/Page\b(?!s)/.test(fullStr)) return false
+  } else {
+    const objMatches = fullStr.match(/\b\d+\s+\d+\s+obj\b/g)
+    if (!objMatches || objMatches.length < 3) return false
+  }
   return true
 }
 
 const WORKER_SCRIPT = `
 const { parentPort, workerData } = require('node:worker_threads');
-const bytes = Buffer.from(workerData);
+const data = Buffer.from(workerData);
 function check(buf) {
   if (buf.length < 64 || buf.length > 26214400) return false;
-  const head = buf.subarray(0, 8).toString('latin1');
-  if (!/^%PDF-[12]\\.\\d/.test(head)) return false;
-  const tail = buf.subarray(Math.max(0, buf.length - 8192)).toString('latin1');
-  if (!tail.includes('%%EOF')) return false;
-  const str = buf.toString('latin1');
-  if (!/\\/Type\\s*\\/Pages?\\b/.test(str) && !/\\/Count\\s+[1-9]\\d*/.test(str) && !/\\/Type\\s*\\/ObjStm\\b/.test(str) && !/\\/Linearized\\b/.test(str)) return false;
+  const head = buf.subarray(0, Math.min(buf.length, 1024)).toString('latin1');
+  if (!/^%PDF-[12]\\.\\d[\\r\\n]/.test(head)) return false;
+  if (/<(?:!doctype|html|head|body|script|iframe|div)\\b/i.test(head)) return false;
+
+  const tailLen = Math.min(buf.length, 16384);
+  const tail = buf.subarray(buf.length - tailLen).toString('latin1');
+  if (/\\/Encrypt\\b/.test(tail)) return false;
+
+  const startxrefMatches = Array.from(tail.matchAll(/\\bstartxref[\\r\\n\\s]+(\\d+)[\\r\\n\\s]+%%EOF/g));
+  if (startxrefMatches.length === 0) return false;
+  const lastMatch = startxrefMatches[startxrefMatches.length - 1];
+  const xrefOffset = Number.parseInt(lastMatch[1], 10);
+  if (!Number.isSafeInteger(xrefOffset) || xrefOffset <= 8 || xrefOffset >= buf.length - 16) return false;
+
+  const atXref = buf.subarray(xrefOffset, Math.min(buf.length, xrefOffset + 8192)).toString('latin1');
+  const fullStr = buf.toString('latin1');
+
+  let rootNum = null;
+  if (/^\\s*xref[\\r\\n\\s]+\\d+\\s+\\d+/.test(atXref)) {
+    const trailerIdx = atXref.indexOf('trailer');
+    const trailerSource = trailerIdx >= 0 ? atXref.slice(trailerIdx) : tail;
+    const rootMatch = /\\btrailer\\b[\\s\\S]*?<<[\\s\\S]*?\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(trailerSource) || /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(tail);
+    if (!rootMatch || !rootMatch[1]) return false;
+    rootNum = rootMatch[1];
+    const inUseEntries = Array.from(atXref.matchAll(/\\b(\\d{10})\\s+\\d{5}\\s+n\\b/g));
+    if (inUseEntries.length === 0) return false;
+    let verifiedObjAtOffset = 0;
+    for (const entry of inUseEntries.slice(0, 10)) {
+      const off = Number.parseInt(entry[1], 10);
+      if (off > 0 && off < buf.length - 10) {
+        const probe = buf.subarray(off, Math.min(buf.length, off + 64)).toString('latin1');
+        if (/^\\s*\\d+\\s+\\d+\\s+obj\\b/.test(probe)) verifiedObjAtOffset++;
+      }
+    }
+    if (verifiedObjAtOffset === 0) return false;
+  } else {
+    const xrefObjMatch = /^\\s*(\\d+)\\s+(\\d+)\\s+obj\\b[\\s\\S]{1,4096}?<<([\\s\\S]{1,4096}?)>>/.exec(atXref);
+    if (!xrefObjMatch || !xrefObjMatch[3]) return false;
+    const dict = xrefObjMatch[3];
+    if (!/\\/Type\\s*\\/XRef\\b/.test(dict)) return false;
+    const rootMatch = /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(dict) || /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(tail);
+    if (!rootMatch || !rootMatch[1]) return false;
+    rootNum = rootMatch[1];
+  }
+
+  const hasObjStm = /\\/Type\\s*\\/ObjStm\\b/.test(fullStr) || /\\/Linearized\\b/.test(fullStr);
+  if (!hasObjStm) {
+    const rootRe = new RegExp('\\\\b' + rootNum + '\\\\s+\\\\d+\\\\s+obj\\\\b[\\\\s\\\\S]{1,2048}?\\/Type\\\\s*\\/Catalog\\\\b');
+    if (!rootRe.test(fullStr)) return false;
+    if (!/\\/Type\\s*\\/Pages\\b[\\s\\S]{1,2048}?\\/Count\\s+[1-9]\\d*/.test(fullStr) &&
+        !/\\/Count\\s+[1-9]\\d*[\\s\\S]{1,2048}?\\/Type\\s*\\/Pages\\b/.test(fullStr)) {
+      return false;
+    }
+    if (!/\\/Type\\s*\\/Page\\b(?!s)/.test(fullStr)) return false;
+  } else {
+    const objMatches = fullStr.match(/\\b\\d+\\s+\\d+\\s+obj\\b/g);
+    if (!objMatches || objMatches.length < 3) return false;
+  }
   return true;
 }
-parentPort.postMessage({ ok: check(bytes) });
+parentPort.postMessage({ ok: check(data) });
 `
 
 export async function validatePdfInIsolatedWorker(
