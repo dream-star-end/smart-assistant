@@ -53,23 +53,21 @@ for line in open(sys.argv[1], encoding="utf-8", errors="replace").read().split("
     if not m:
         continue
     print(m.group(1))
-    val, j, q = m.group(2), 0, None
-    while j < len(val):
-        c = val[j]
-        if q is None:
-            if c in "\"'":
-                q = c
-            elif c == "#" and (j == 0 or val[j - 1].isspace()):
+    # systemd 规则:只有值的第一个字符是引号时才是带引号的值(可跨行);值中间的引号是普通字符。
+    val = m.group(2).lstrip()
+    if val[:1] in ("'", '"'):
+        q, j, closed = val[0], 1, False
+        while j < len(val):
+            c = val[j]
+            if c == "\\" and q == '"':
+                j += 2
+                continue
+            if c == q:
+                closed = True
                 break
-            elif c == "\\":
-                j += 1
-        elif c == "\\" and q == '"':
             j += 1
-        elif c == q:
-            q = None
-        j += 1
-    if q:
-        quote = q
+        if not closed:
+            quote = q
     elif val.endswith("\\"):
         cont = True
 PY

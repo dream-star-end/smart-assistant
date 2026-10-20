@@ -86,6 +86,11 @@ else [[ $? == 2 ]] && ok "D5 env 不可读 → 退出 2" || bad "D5 退出码"; 
 out="$(bash "$DRIFT" --env "$E.6" --template "$TEMPLATE")" && [[ "$out" == "ENV_DRIFT missing=0 undeclared=0" && "$out" != *SENTINEL* ]] \
   && ok "D6 多行引号值与续行内容不被当成键" || bad "D6: $out"
 
+# D7 未加引号值中间的引号是普通字符,不得开启跨行(Codex r2 P1)
+{ cat "$E"; printf "OC_JEV_API_KEY=abc'def\nOC_CHATGPT_PROXY_TLS_KEY='first\nSENTINEL_SECRET_MATERIAL=\nlast'\n"; } >"$E.7"
+out="$(bash "$DRIFT" --env "$E.7" --template "$TEMPLATE")" && [[ "$out" == "ENV_DRIFT missing=0 undeclared=0" && "$out" != *SENTINEL* ]] \
+  && ok "D7 值中间的引号不开启跨行;其后的多行引号值仍整体跳过" || bad "D7: $out"
+
 # W* 接线
 grep -qE 'v5-selfhost-env-drift\.sh' "$DEPLOY" \
   && awk '/^cmd_deploy\(\) \{/{f=1} f && /^  ensure_selfhost_env_keys$/{e=NR} f && /^  ensure_model_authority$/{m=NR} f && /^  assert_env_key_drift$/{d=NR} f && /^}/{exit} END{exit !(e && m && d && d>e && d>m)}' "$DEPLOY" \
