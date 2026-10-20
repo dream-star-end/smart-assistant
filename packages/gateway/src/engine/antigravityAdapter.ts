@@ -28,6 +28,7 @@ import { identityCompatEnvironment } from '@openclaude/storage'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
+import { dirname } from 'node:path'
 import type { Readable, Writable } from 'node:stream'
 import { existsSync, readFileSync } from 'node:fs'
 import {
@@ -45,6 +46,7 @@ import { type EngineCreateOpts, registerEngine } from './registry.js'
 import { BINARY_BLOCK_OMITTED_NOTICE, countBinaryInputBlocks, isBinaryInputBlock } from './promptInput.js'
 import { buildCodexEnv } from './codexShared.js'
 import { createLogger } from '../logger.js'
+import { probeEnvFacts } from '../envProbe.js'
 import { detachChildStdio, killProcessGroup, shutdownTimeoutMs, waitForCloseWithin } from '../processGroupShutdown.js'
 import { decideEngineCwd } from '../engineCwd.js'
 import { persistRunContextSnapshot } from '../runContextPersist.js'
@@ -71,6 +73,22 @@ const KEEPALIVE_INTERVAL_MS = 30_000
 /** After `result`, wait this long for the process to exit so trailing
  * stderr (soft-deny / empty-run notices) is read before the turn settles. */
 const RESULT_SETTLE_MS = 5_000
+
+/** Sandboxed resolution set; user-writable PATH entries stay out. */
+const ANTIGRAVITY_SPAWN_PATH = '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin'
+
+/**
+ * Selfhost puts the host wrapper in the persistent agent home, outside the
+ * sandboxed PATH. Add only that wrapper's directory when the probe found it,
+ * so `host 'cmd'` resolves for the CLI's shell (OCV5-530).
+ */
+function antigravitySpawnPath(hostBin: string | null = probeEnvFacts().hostBin): string {
+  if (!hostBin) return ANTIGRAVITY_SPAWN_PATH
+  const hostDir = dirname(hostBin)
+  return ANTIGRAVITY_SPAWN_PATH.split(':').includes(hostDir)
+    ? ANTIGRAVITY_SPAWN_PATH
+    : `${hostDir}:${ANTIGRAVITY_SPAWN_PATH}`
+}
 
 let timingTestHooks: { keepaliveMs?: number; resultSettleMs?: number } | null = null
 const STDERR_MAX_CHARS = 64 * 1024
@@ -390,7 +408,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     }
     const env: NodeJS.ProcessEnv = {
       ...isolatedEnv,
-      PATH: '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin',
+      PATH: antigravitySpawnPath(),
       HOME: projection.launchHome,
       XDG_CACHE_HOME: projection.cacheDir,
       OC_AGENT_ID: this.opts.agentId,

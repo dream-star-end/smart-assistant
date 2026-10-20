@@ -9,7 +9,7 @@
  */
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
-import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { describe, test } from 'node:test'
@@ -23,6 +23,7 @@ import {
   validateAntigravityRoute,
 } from '../engine/antigravityAdapter.js'
 import { antigravityProductToolInput, antigravityProductToolName } from '../engine/antigravityToolNormalize.js'
+import { resetEnvFactsCache } from '../envProbe.js'
 import type { EngineEvent } from '../engine/engineEvents.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
 import type { TurnSummary } from '../engine/engineEvents.js'
@@ -285,6 +286,31 @@ describe('AntigravityAdapter', () => {
       assert.ok(events.some((e) => e.kind === 'tool_result_detected'))
       assert.deepEqual(await readdir(path.join(root, 'launch')), [], 'launch HOME is removed after the turn')
     } finally {
+      await h.restore()
+    }
+  })
+
+  test('puts the selfhost host wrapper on the CLI PATH (OCV5-530)', async () => {
+    const h = await harness()
+    try {
+      const hostDir = path.join(h.dir, '.local', 'bin')
+      await mkdir(hostDir, { recursive: true })
+      const hostBin = path.join(hostDir, 'host')
+      await writeFile(hostBin, '#!/bin/sh\nexit 0\n')
+      await chmod(hostBin, 0o755)
+      resetEnvFactsCache()
+      h.adapter.setAntigravityRoute(ROUTE)
+      const { summary } = await runTurn(h, 'tool-success.ndjson')
+      const cap = JSON.parse(await readFile(h.capture, 'utf8'))
+      assert.ok(summary)
+      assert.ok(
+        cap.env.PATH.split(':').includes(hostDir),
+        `expected ${hostDir} on the CLI PATH, got ${cap.env.PATH}`,
+      )
+      const prompt = JSON.parse(cap.stdin.trim()).message.content as string
+      assert.ok(prompt.includes('host=yes'), 'ENV slot should advertise the host channel')
+    } finally {
+      resetEnvFactsCache()
       await h.restore()
     }
   })
