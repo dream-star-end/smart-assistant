@@ -568,7 +568,15 @@ test('public-page stale foreign deletion leaves the client able to fetch a bound
   const f = await fixture((req, res) => {
     if (req.url!.startsWith('/e/ShowKey/')) {
       void picture.then((png) => {
-        res.writeHead(200, { 'content-type': 'image/png' })
+        // Real ShowKey shape: host copies plus a live copy for another CMS domain.
+        res.writeHead(200, {
+          'content-type': 'image/png',
+          'set-cookie': [
+            'checkloginkey=synthetic-key; path=/',
+            'checkloginkey=synthetic-key; path=/; domain=other-cms.invalid',
+            'checkloginkey=synthetic-key; path=/',
+          ],
+        })
         res.end(png)
       })
       return
@@ -591,9 +599,13 @@ test('public-page stale foreign deletion leaves the client able to fetch a bound
     assert.equal(f.paths.length, 2)
     assert.equal(f.cookies[1], 'session=synthetic-session')
     const state = f.client.exportPrivateCookies()
-    assert.equal(state.cookies.length, 1)
-    assert.equal(state.cookies[0].domain, 'www.jieyoutsg.com')
-    assert.equal(state.cookies[0].name, 'session')
+    assert.deepEqual(
+      state.cookies.map((c) => [c.domain, c.name]).sort(),
+      [
+        ['www.jieyoutsg.com', 'checkloginkey'],
+        ['www.jieyoutsg.com', 'session'],
+      ],
+    )
     assert.equal(f.posted.length, 0)
   } finally {
     await f.close()

@@ -224,13 +224,27 @@ test('expired outside-domain deletion cannot erase same-name host or parent sess
   }
 })
 
-test('outside-domain live cookies and malformed Max-Age cannot use the expired-deletion exception', () => {
+test('outside-domain live cookies are ignored: never stored, never sent', () => {
   const now = Date.now()
   const jar = restoreJieyouCookieJar(state())
   const before = exportJieyouAccountState(jar, now)
   for (const header of [
     'sid=foreign; Domain=stale.invalid; Path=/e/',
     'sid=foreign; Domain=stale.invalid; Path=/e/; Max-Age=60; Expires=Thu, 01 Jan 1970 00:00:00 GMT',
+    // Observed on the real ShowKey response (2026-10-20): live copy for another CMS domain.
+    'captchakey=synthetic; path=/; domain=other-cms.invalid',
+  ]) {
+    acceptJieyouCookie(jar, header, LITERATURE_SITE, now)
+    assert.deepEqual(exportJieyouAccountState(jar, now), before)
+    assert(!jar.getCookieStringSync(LITERATURE_SITE, { http: true }).includes('foreign'))
+  }
+})
+
+test('malformed Max-Age is rejected even on an outside-domain cookie', () => {
+  const now = Date.now()
+  const jar = restoreJieyouCookieJar(state())
+  const before = exportJieyouAccountState(jar, now)
+  for (const header of [
     'sid=deleted; Domain=stale.invalid; Path=/e/; Max-Age=-1; Max-Age=1',
     'sid=deleted; Domain=stale.invalid; Path=/e/; Max-Age=-0.5',
   ]) {

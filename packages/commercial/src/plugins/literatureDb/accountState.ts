@@ -145,18 +145,12 @@ export function acceptJieyouCookie(
     value.expires = new Date(expiry)
     value.maxAge = null
   }
-  // This site's anonymous page emits a stale deletion for an unrelated domain.
-  // It has no authority over this jar. Ignore only an already-expired explicit
-  // outside-domain deletion, after applying Max-Age precedence above.
+  // This site's CMS also emits cookies for an unrelated domain (an expired
+  // deletion on the public page, a live copy of the captcha key on ShowKey).
+  // RFC 6265 5.3 step 6: a Domain that does not domain-match the request host
+  // makes the user agent ignore the cookie entirely. It is never stored or sent.
   const domain = value.domain ? canonicalDomain(value.domain) : null
-  if (
-    domain &&
-    domain !== HOST &&
-    domain !== 'jieyoutsg.com' &&
-    value.expires instanceof Date &&
-    Number.isFinite(value.expires.getTime()) &&
-    value.expires.getTime() <= receivedAt
-  ) {
+  if (domain && domain !== HOST && domain !== 'jieyoutsg.com') {
     exportJieyouAccountState(jar, receivedAt)
     return
   }
