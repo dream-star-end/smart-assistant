@@ -16,9 +16,23 @@ function list(): string[] {
 }
 
 describe('selfhost watch gate list', () => {
-  test('lists the ten watch/autorecover behaviour tests, all present', () => {
+  // The exact list, not just its length: a test cannot be swapped out or dropped unnoticed.
+  const REQUIRED = [
+    'v5-selfhost-watch-selftest.sh',
+    'v5-selfhost-watch-disarm-observe.test.sh',
+    'v5-selfhost-watch-lock.test.sh',
+    'v5-selfhost-watch-rearm.test.sh',
+    'v5-selfhost-watch-sync.test.sh',
+    'v5-selfhost-watch-alert.test.sh',
+    'v5-selfhost-gate-fail-stay.test.sh',
+    'v5-selfhost-train-recovery.test.sh',
+    'v5-selfhost-watch-autorecover.test.sh',
+    'v5-selfhost-autorecover.test.sh',
+    'v5-selfhost-env-drift.test.sh',
+  ]
+  test('lists exactly the watch/autorecover and release-tooling behaviour tests, all present', () => {
     const names = list()
-    assert.equal(names.length, 10, names.join(','))
+    assert.deepEqual(names, REQUIRED)
     assert.equal(new Set(names).size, names.length)
     for (const n of names) {
       assert.match(
