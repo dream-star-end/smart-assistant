@@ -190,8 +190,9 @@ const PLATFORM_GENERAL_AGENTS: PlatformAgentDef[] = [
       // glm-5.3-zai(dec0f651e),但本预设漏切,新装用户一开口就 400 —— 这里补齐。
       // **改 body 必须 bump version**:approvePlatformVersion 的 artifact hash
       // 守卫会拒批同版本不同 body(DUPLICATE_VERSION 吞掉→hash 不一致→current 永不前移)。
-      version: '1.0.4',
-      model: 'glm-5.3-zai',
+      // 1.0.5(2026-10-20):Z.AI 线路不可用,改钉平台默认 deepseek-v4-flash(先 Go 后官方)。
+      version: '1.0.5',
+      model: 'deepseek-v4-flash',
       toolsets: ['core'],
       capabilities: [],
       skillDeps: [],

@@ -172,7 +172,7 @@ esac
   const wrapper = join(dir, 'oc-cursor')
   const rewritten = readFileSync(sourceWrapper, 'utf8')
     .replace(
-      'cursor_bin=/opt/cursor-agent/versions/2026.08.11-e8db854/cursor-agent',
+      'cursor_bin=/opt/cursor-agent/versions/2026.10.16-e3cb207/cursor-agent',
       `cursor_bin=${fakeBin}`,
     )
     .replace('auth_file=/run/oc/cursor-auth/api-key', `auth_file=${auth}`)
@@ -208,19 +208,19 @@ describe('oc-cursor wrapper', () => {
     const source = readFileSync(dockerfile, 'utf8')
     const buildSource = readFileSync(buildImageScript, 'utf8')
     const wrapperSource = readFileSync(sourceWrapper, 'utf8')
-    assert.match(source, /OC_CURSOR_AGENT_VERSION=2026\.08\.11-e8db854/)
+    assert.match(source, /OC_CURSOR_AGENT_VERSION=2026\.10\.16-e3cb207/)
     assert.match(source, /ARG OC_INCLUDE_CURSOR=0/)
     assert.match(source, /if \[ "\$OC_INCLUDE_CURSOR" = "1" \]/)
     assert.match(
       source,
-      /OC_CURSOR_AGENT_SHA256=bfff4bf6f4e9dd30c1d0ef0a70b6077b074015dd2948e4c50685d53afdcfce5a/,
+      /OC_CURSOR_AGENT_SHA256=3aa3f48cd7a3909a98c9b3f2a4085f0c021088bf826690b22c61f424c843e552/,
     )
     assert.match(source, /sha256sum -c -/)
     assert.match(source, /chmod -R a-w "\$install_root"/)
     assert.match(source, /cursor-agent --version/)
     assert.match(source, /patch-cursor-agent-sand\.mjs/)
     assert.match(source, /OPENCLAUDE_SCOPED_SAND_V1/)
-    assert.match(buildSource, /CURSOR_AGENT_VERSION="2026\.08\.11-e8db854"/)
+    assert.match(buildSource, /CURSOR_AGENT_VERSION="2026\.10\.16-e3cb207"/)
     assert.match(
       wrapperSource,
       /\/usr\/bin\/sudo -n \/usr\/bin\/test -f "\$auth_file" 2>\/dev\/null/,
@@ -228,7 +228,7 @@ describe('oc-cursor wrapper', () => {
     assert.doesNotMatch(wrapperSource, /\[ -e "\$auth_file" \]/)
     assert.match(
       buildSource,
-      /CURSOR_AGENT_SHA256="bfff4bf6f4e9dd30c1d0ef0a70b6077b074015dd2948e4c50685d53afdcfce5a"/,
+      /CURSOR_AGENT_SHA256="3aa3f48cd7a3909a98c9b3f2a4085f0c021088bf826690b22c61f424c843e552"/,
     )
     assert.match(buildSource, /oc\.runtime\.include_cursor=\$\{OC_INCLUDE_CURSOR:-0\}/)
     assert.match(buildSource, /OC_INCLUDE_CURSOR=\$\{OC_INCLUDE_CURSOR:-0\}/)
