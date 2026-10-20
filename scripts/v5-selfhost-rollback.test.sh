@@ -145,6 +145,17 @@ gate_refuses "S9 detector crash with rc 1 fails closed" "检测器对 0003_c 异
 # shellcheck disable=SC1091
 source "$DIR/lib/v5-migration-ddl.sh"
 
+# S10–S13 OCV5-542:兼容候选必须有声明;检测器异常 fail-closed
+setup s10; printf 'UPDATE t SET a = 1;\n' >"$MASTER_RELEASES_ROOT/rel-l/packages/commercial/src/db/migrations/0003_c.sql"
+gate_refuses "S10 newer migration with an undeclared UPDATE" "未声明兼容性的候选语句(line 1 [update])"
+setup s11; printf 'ALTER TABLE cron_jobs ALTER COLUMN next_fire_at SET NOT NULL;\n' >"$MASTER_RELEASES_ROOT/rel-l/packages/commercial/src/db/migrations/0003_c.sql"
+gate_refuses "S11 Codex r8 SET NOT NULL is refused" "[set-not-null]"
+setup s12; printf -- '-- compat: backfills a column old code never reads\nUPDATE t SET a = 1;\n' >"$MASTER_RELEASES_ROOT/rel-l/packages/commercial/src/db/migrations/0003_c.sql"
+if out="$(rollback_schema_gate "$MASTER_RELEASES_ROOT/rel-p" "$MASTER_RELEASES_ROOT/rel-l" 2>&1)"; then ok "S12 declared candidate passes"; else bad "S12: $out"; fi
+setup s13; ROLLBACK_COMPAT_DETECTOR="$C/missing.py"
+gate_refuses "S13 compat detector missing fails closed" "兼容候选检测器对 0003_c 异常"
+ROLLBACK_COMPAT_DETECTOR="$DIR/lib/v5-migration-compat.py"
+
 # P* 回退没生效时恢复 .prev-release(Codex r1 P1)
 log() { :; }
 export DRY=0 CUTOVER_ROLLBACK=1

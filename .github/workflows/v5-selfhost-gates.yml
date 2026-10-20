@@ -91,6 +91,51 @@ jobs:
       - name: Two-tree divergence (report only until the unified sync)
         run: npx tsx scripts/check-v5-two-tree-divergence.ts --against origin/feat/v5-aurora-rewrite
 
+  # OCV5-542(第三阶段 §9.3 第 3 条):本阶段迁移只做加法。新增/改动的迁移里每条兼容候选语句
+  # 都要有 -- compat: 声明,PR 描述要有 "## Migration compatibility" 一节逐个点名;任何一项缺失即红。
+  # 独立的必过 job,不是上面 precheck 的 warning。
+  migration-compat:
+    name: selfhost-migration-compat
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve comparison base
+        id: base
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            ref="origin/$BASE_REF"
+          elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            ref="$BEFORE"
+          else
+            ref="origin/feat/v5-selfhost"
+          fi
+          git rev-parse --verify "$ref^{commit}" >/dev/null
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Additive-only migrations (blocking)
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            printf '%s\n' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
+            bash scripts/v5-selfhost-migration-compat-check.sh --base "${{ steps.base.outputs.ref }}" --pr-body-file "$RUNNER_TEMP/pr-body.md"
+          else
+            bash scripts/v5-selfhost-migration-compat-check.sh --base "${{ steps.base.outputs.ref }}"
+          fi
+
+      - name: Detector and check tests
+        run: bash scripts/v5-migration-compat.test.sh
+
   # OCV5-447:列车 pinned staging 跑的 watch / autorecover 行为门,PR 上先跑同一份清单
   # (scripts/v5-selfhost-watch-gate.sh)。此前只有列车跑,watch 改动要等一趟列车失败才知道。
   watch-gate:
