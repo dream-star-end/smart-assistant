@@ -706,8 +706,11 @@ test('validatePdfStructureSync and LiteratureArtifactStore allow empty-password 
   // 3. Dangerous PDF actions/content (/JS, /JavaScript, /Launch, /EmbeddedFiles) must be rejected
   for (const dangerousEntry of [
     '/OpenAction << /S /JavaScript /JS (app.alert(1)) >>',
+    '/OpenAction << /S /Java#53cript /J#53 (app.alert(1)) >>',
     '/AA << /O << /S /Launch /F (cmd.exe) >> >>',
+    '/AA << /O << /S /Laun#63h /F (cmd.exe) >> >>',
     '/Names << /EmbeddedFiles << /Names [] >> >>',
+    '/Names << /Embedded#46iles << /Names [] >> >>',
   ]) {
     const dangerousPdf = buildEncryptedPdf(emptyUserPassUHex, dangerousEntry)
     assert.equal(validatePdfStructureSync(dangerousPdf), false)
