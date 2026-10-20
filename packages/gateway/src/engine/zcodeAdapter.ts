@@ -60,6 +60,8 @@ const EMPTY_SIGNALS: PhantomSignals = { apiState: 'unknown', skipReason: null }
 const ZCODE_HOTCFG_WRAPPER_BIN = '/run/oc/platform/current/bin/oc-zcode'
 const ZCODE_IMAGE_WRAPPER_BIN = '/usr/local/bin/oc-zcode'
 const ZCODE_IMAGE_BIN = '/opt/zcode-cli/versions/0.16.9/zcode.cjs'
+/** Previous image's CLI: a container keeps its image until recycled while this code arrives first. */
+const ZCODE_PREVIOUS_IMAGE_BIN = '/opt/zcode-cli/versions/0.16.3/zcode.cjs'
 
 export interface ZcodeRouteOverride {
   baseUrl: string
@@ -199,6 +201,7 @@ function resolveZcodeBin(
   if (hotConfigAvailable) return ZCODE_HOTCFG_WRAPPER_BIN
   if (existsSync(ZCODE_IMAGE_WRAPPER_BIN)) return ZCODE_IMAGE_WRAPPER_BIN
   if (existsSync(ZCODE_IMAGE_BIN)) return ZCODE_IMAGE_BIN
+  if (existsSync(ZCODE_PREVIOUS_IMAGE_BIN)) return ZCODE_PREVIOUS_IMAGE_BIN
   throw new Error('ZCODE_BIN_UNAVAILABLE: experimental community CLI is not installed')
 }
 

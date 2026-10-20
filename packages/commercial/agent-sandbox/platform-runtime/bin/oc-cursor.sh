@@ -47,6 +47,9 @@ for required_tool in /usr/bin/sudo /usr/bin/test /bin/cat /bin/ls \
 done
 
 cursor_bin=/opt/cursor-agent/versions/2026.10.16-e3cb207/cursor-agent
+# platform/current reaches a running container before its image is recycled: a container
+# created from the previous image keeps that image's pinned CLI (and its own Sand marker).
+[ -x "$cursor_bin" ] || cursor_bin=/opt/cursor-agent/versions/2026.08.11-e8db854/cursor-agent
 cursor_probe_bin=/usr/bin/curl
 cursor_probe_url=https://api2.cursor.sh
 cursor_select_budget=45

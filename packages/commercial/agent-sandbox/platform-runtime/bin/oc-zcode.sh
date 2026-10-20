@@ -53,6 +53,9 @@ if [ "$test_mode" -eq 1 ]; then
   auth_file=$test_auth
 else
   zcode_cjs=/opt/zcode-cli/versions/0.16.9/zcode.cjs
+  # A container from the previous image (not yet recycled) only has 0.16.3; it ignores
+  # the provider model list this launcher now writes.
+  [ -f "$zcode_cjs" ] || zcode_cjs=/opt/zcode-cli/versions/0.16.3/zcode.cjs
   node_bin=/usr/local/bin/node
   auth_file=""
   [ -f "$zcode_cjs" ] || die "experimental community CLI is not installed"
