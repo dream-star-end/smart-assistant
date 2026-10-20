@@ -1400,6 +1400,17 @@ cleanup_cutover_unit_snap() {
 # This is an idle snapshot, not an admission fence; new arrivals can still race.
 cutover_wait_for_user_idle() {
   local counts started=$SECONDS deadline=$((SECONDS + 600))
+  if [[ "${ALLOW_INFLIGHT:-0}" == 1 ]]; then
+    [[ "${PG_DB:-}" == openclaude_v5_selfhost ]] || { cutover_clog "  ✗ --allow-inflight 仅用于 selfhost"; return 1; }
+    if [[ "$DRY" != 1 ]]; then
+      if ! lease_train_load_lib || ! lease_inflight_train_allowed "${LEASE_TRAIN_ID:-}" "${LEASE_TARGET_SHA:-}"; then
+        cutover_clog "  ✗ --allow-inflight 缺少正式列车的精确源授权;拒绝切换"
+        return 1
+      fi
+    fi
+    cutover_clog "  --allow-inflight: 跳过个人版600s空闲/在途检查;用户已接受在途回合可能中断"
+    return 0
+  fi
   if [[ "$DRY" == 1 ]]; then
     cutover_clog "  [dry-run] 切换前等待全部用户回合结束(只读,最多 600s;不查询数据库)"
     return 0

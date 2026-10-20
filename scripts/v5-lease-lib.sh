@@ -332,6 +332,78 @@ lease_callback_post() { # <suffix: empty|/validate> <json>
     -H 'Content-Type: application/json' -w '\n%{http_code}' --data-binary @- "$url$1"
 }
 
+# Selfhost-only, explicit exact-source permission to interrupt user turns.
+lease_inflight_views_sql() {
+  cat <<'SQL'
+CREATE TEMP VIEW _li_open AS SELECT *, CASE
+ WHEN json_type(doc,'$.request.cutover') IS NULL THEN 'wait'
+ WHEN json_type(doc,'$.request.cutover')='object'
+  AND json_type(doc,'$.request.cutover.schema')='integer'
+  AND json_extract(doc,'$.request.cutover.schema')=1
+  AND json_type(doc,'$.request.cutover.allowInflight')='true'
+  AND json_type(doc,'$.request.cutover.sourceSha')='text'
+  AND json_extract(doc,'$.request.cutover.sourceSha')=want_sha
+  AND (SELECT count(*) FROM json_each(doc,'$.request.cutover'))=3
+ THEN 'allow' ELSE 'invalid' END AS inflight_mode FROM _lp_open;
+INSERT INTO _lp_guard SELECT CASE WHEN NOT EXISTS(
+ SELECT 1 FROM _li_open WHERE inflight_mode='invalid') THEN 1 ELSE 0 END;
+SQL
+}
+
+lease_inflight_bind_sql() { # train_id target_sha actor; same transaction as train creation
+  local iq tq aq nowq
+  lease_valid_train_id "$1" && lease_valid_sha "$2" || return 2
+  iq="$(lease_q "$1")"; tq="$(lease_q "$2")"; aq="$(lease_q "$3")"; nowq="$(lease_q "$(lease_now)")"
+  lease_inflight_views_sql
+  cat <<SQL
+INSERT INTO _lp_guard SELECT CASE WHEN
+ (SELECT count(*) FROM train WHERE id='$iq' AND resource='deploy:selfhost'
+  AND target_sha='$tq' AND status='planned')=1 THEN 1 ELSE 0 END;
+INSERT INTO _lp_guard SELECT CASE WHEN NOT EXISTS(
+ SELECT 1 FROM _li_open WHERE status='registered' AND inflight_mode='allow'
+  AND want_sha<>'$tq') AND
+ (SELECT count(DISTINCT inflight_mode) FROM _li_open WHERE status='registered')<=1
+ THEN 1 ELSE 0 END;
+CREATE TEMP TABLE _li_selected AS SELECT id,seq FROM _li_open
+ WHERE status='registered' AND inflight_mode='allow';
+UPDATE train SET evidence_json=json_set(COALESCE(evidence_json,'{}'),'$.cutover',
+ json_object('schema',1,'sourceSha','$tq','allowInflight',json('true'),
+ 'leaseIds',json((SELECT json_group_array(id) FROM (SELECT id FROM _li_selected ORDER BY seq)))))
+ WHERE id='$iq' AND EXISTS(SELECT 1 FROM _li_selected);
+INSERT INTO event(subject_id,event,actor,detail,created_at)
+ SELECT '$iq','cutover-inflight-allowed','$aq','--allow-inflight sha=$tq','$nowq'
+ WHERE EXISTS(SELECT 1 FROM _li_selected);
+SQL
+}
+
+lease_inflight_train_allowed() { # validate frozen snapshot and original requests; no writes
+  local iq tq doc ids expected actual
+  lease_valid_train_id "$1" && lease_valid_sha "$2" || return 1
+  iq="$(lease_q "$1")"; tq="$(lease_q "$2")"
+  doc="$(lease_sql "SELECT json_extract(evidence_json,'$.cutover') FROM train
+   WHERE id='$iq' AND resource='deploy:selfhost' AND target_sha='$tq'
+    AND status IN ('planned','building','smoked')
+    AND json_type(evidence_json,'$.cutover.schema')='integer';")" || return 1
+  [[ -n "$doc" ]] || return 1
+  jq -e --arg sha "$2" '
+   type=="object" and keys==["allowInflight","leaseIds","schema","sourceSha"]
+   and .schema==1 and .allowInflight==true and .sourceSha==$sha
+   and (.leaseIds|type)=="array" and (.leaseIds|length)>0
+   and all(.leaseIds[];type=="string")
+   and (.leaseIds|length)==(.leaseIds|unique|length)' <<<"$doc" >/dev/null || return 1
+  ids="$(jq -c .leaseIds <<<"$doc")"; expected="$(jq -r '.leaseIds|length' <<<"$doc")"
+  actual="$(lease_sql "SELECT count(*) FROM lease WHERE resource='deploy:selfhost'
+   AND mode='ride' AND want_sha='$tq' AND status='registered'
+   AND id IN (SELECT value FROM json_each('$(lease_q "$ids")'))
+   AND json_type(result_json,'$.request.cutover')='object'
+   AND json_type(result_json,'$.request.cutover.schema')='integer'
+   AND json_extract(result_json,'$.request.cutover.schema')=1
+   AND json_type(result_json,'$.request.cutover.allowInflight')='true'
+   AND json_extract(result_json,'$.request.cutover.sourceSha')='$tq'
+   AND (SELECT count(*) FROM json_each(result_json,'$.request.cutover'))=3;")" || return 1
+  [[ "$actual" == "$expected" ]]
+}
+
 # Explicit per-target release policy transport, on existing JSON metadata.
 lease_policy_views_sql() { # resource
   local resource_q; resource_q="$(lease_q "$1")"

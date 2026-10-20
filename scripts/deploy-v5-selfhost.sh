@@ -123,7 +123,7 @@ MASTER_RELEASE_LIB="$SCRIPT_DIR/v5-selfhost-master-release-lib.sh"
 
 DRY=0
 FORCE_ENV=0
-ALLOW_DIRTY=0
+ALLOW_DIRTY=0; ALLOW_INFLIGHT=0
 PLATFORM_FROM_HEAD=0
 FORCE_NPM_CI=0
 MODE=""
@@ -454,7 +454,6 @@ maybe_acquire_selfhost_deploy_lock() {
       ;;
   esac
 }
-
 usage() {
   cat <<'EOF'
 用法: scripts/deploy-v5-selfhost.sh --preflight|--bootstrap|--deploy|--build-master-only|--cutover|--smoke|--status [--dry-run] [--force-env] [--allow-dirty] [--platform-from-head] [--force-npm-ci] [--release=PATH]
@@ -472,6 +471,7 @@ usage() {
   --status              打印当前状态(含 live / .prev-release / 四元组)
   --dry-run             与上述组合:打印将执行的命令,不改任何东西
   --release=PATH        仅配合 --cutover:指定候选 rel-* 绝对路径(默认=sourceCommit 等于 HEAD 的最新完整 release)
+  --allow-inflight      仅selfhost正式列车的精确源授权:跳过600s空闲检查,接受在途回合中断;其余门不变
   --allow-dirty         仅配合 --deploy:工作区有未提交改动时仍部署(默认拒绝,防脏 platform 进全员容器)
   --platform-from-head  仅配合 --deploy/--bootstrap:平台 bundle 从 git archive 取已提交的 platform-runtime(默认仍拷工作树)
   --resume-release-policy --lease-train=ID --target-sha=SHA
@@ -509,11 +509,11 @@ usage() {
   scripts/deploy-v5-selfhost.sh --smoke
 EOF
 }
-
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY=1 ;;
     --force-env) FORCE_ENV=1 ;;
+    --allow-inflight) ALLOW_INFLIGHT=1 ;;
     --allow-dirty) ALLOW_DIRTY=1 ;;
     --platform-from-head) PLATFORM_FROM_HEAD=1 ;;
     --force-npm-ci) FORCE_NPM_CI=1 ;;
