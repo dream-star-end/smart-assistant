@@ -22,7 +22,7 @@
  */
 import { randomBytes } from 'node:crypto'
 import { chmodSync, lstatSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { type IdentityCompatRuntimeContext, identityCompatEnvironment } from '@openclaude/storage'
 
 import { paths } from '@openclaude/storage'
@@ -100,6 +100,11 @@ export interface AntigravityPlatformProjection {
   root: string
   /** Per-launch HOME passed to the CLI; remove with cleanupAntigravityLaunch. */
   launchHome: string
+  /**
+   * Private launch dir whose only entry is a `host` link to the selfhost host
+   * wrapper; prepend it to PATH. Null without a wrapper (commercial).
+   */
+  hostPathDir: string | null
   cacheDir: string
   advertisedMcpTools: string[]
   delegateContextFile: string | null
@@ -127,7 +132,7 @@ export interface AntigravityPlatformInput {
   skillEvalExclude?: string
   skillEvalDraft?: { name: string; dir: string }
   skillTrainRunId?: string
-  /** Selfhost host wrapper; its directory is added to the launch login-shell PATH. */
+  /** Selfhost host wrapper; exposed alone via `hostPathDir` on the launch PATH. */
   hostBin?: string | null
 }
 
@@ -139,6 +144,24 @@ function writePrivate(path: string, value: string): void {
 function privateDir(path: string): string {
   mkdirSync(path, { recursive: true, mode: 0o700 })
   return path
+}
+
+/** Single-quoted in .profile and joined into PATH: no quotes, colons or spaces. */
+const SAFE_PATH_DIR_RE = /^\/[A-Za-z0-9._/-]+$/
+
+/**
+ * The CLI resolves commands through a login shell, and Debian /etc/profile
+ * resets PATH there, so the empty launch HOME gets a .profile too (OCV5-530).
+ * Only the wrapper is linked: the rest of the user-writable ~/.local/bin
+ * (ssh, pgrep, python shims) must not shadow the sandboxed system tools.
+ */
+function projectHostPathDir(launchHome: string, hostBin: string | null | undefined): string | null {
+  if (!hostBin || !isAbsolute(hostBin)) return null
+  const dir = join(launchHome, '.oc-host-bin')
+  if (!SAFE_PATH_DIR_RE.test(dir)) return null
+  symlinkSync(hostBin, join(privateDir(dir), 'host'))
+  writePrivate(join(launchHome, '.profile'), `export PATH='${dir}':"$PATH"\n`)
+  return dir
 }
 
 export function antigravityRoot(): string {
@@ -168,13 +191,8 @@ export function projectAntigravityPlatform(
   const stable = antigravityStableCliDir(root)
   const cacheDir = privateDir(join(root, 'cache'))
   const launchHome = privateDir(join(root, 'launch', randomBytes(8).toString('hex')))
-  // The CLI resolves a login-shell PATH, and this launch HOME is empty. Give
-  // it the selfhost host wrapper directory so `host 'cmd'` survives that
-  // resolution (OCV5-530); commercial turns pass no hostBin.
-  const hostDir = input.hostBin ? dirname(input.hostBin) : null
-  if (hostDir && /^\/[A-Za-z0-9._/-]+$/.test(hostDir)) {
-    writePrivate(join(launchHome, '.profile'), `export PATH='${hostDir}':"$PATH"\n`)
-  }
+  // Commercial turns pass no hostBin and keep the sandboxed PATH.
+  const hostPathDir = projectHostPathDir(launchHome, input.hostBin)
   const cliDir = privateDir(join(launchHome, '.gemini', 'antigravity-cli'))
   const configDir = privateDir(join(launchHome, '.gemini', 'config'))
   linkShared(join(stable, 'conversations'), join(cliDir, 'conversations'))
@@ -253,7 +271,7 @@ export function projectAntigravityPlatform(
     join(configDir, 'mcp_config.json'),
     `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`,
   )
-  return { root, launchHome, cacheDir, advertisedMcpTools, delegateContextFile }
+  return { root, launchHome, hostPathDir, cacheDir, advertisedMcpTools, delegateContextFile }
 }
 
 /** Remove one launch HOME. Never follows the shared symlinks. */

@@ -68,6 +68,7 @@ function replay() {
     oauthTokenMode: fs.statSync(process.env.HOME + '/.gemini/antigravity-cli/antigravity-oauth-token').mode & 0o777,
     mcp: fs.readFileSync(process.env.HOME + '/.gemini/config/mcp_config.json', 'utf8'),
     profile: fs.existsSync(process.env.HOME + '/.profile') ? fs.readFileSync(process.env.HOME + '/.profile', 'utf8') : null,
+    hostLink: fs.existsSync(process.env.HOME + '/.oc-host-bin/host') ? fs.readlinkSync(process.env.HOME + '/.oc-host-bin/host') : null,
     conversationsIsLink: fs.lstatSync(process.env.HOME + '/.gemini/antigravity-cli/conversations').isSymbolicLink(),
   }))
   if (process.env.FAKE_AGY_STDERR) process.stderr.write(fs.readFileSync(process.env.FAKE_AGY_STDERR, 'utf8'))
@@ -304,14 +305,12 @@ describe('AntigravityAdapter', () => {
       const { summary } = await runTurn(h, 'tool-success.ndjson')
       const cap = JSON.parse(await readFile(h.capture, 'utf8'))
       assert.ok(summary)
-      assert.ok(
-        cap.env.PATH.split(':').includes(hostDir),
-        `expected ${hostDir} on the CLI PATH, got ${cap.env.PATH}`,
-      )
-      assert.ok(
-        typeof cap.profile === 'string' && cap.profile.includes(`export PATH='${hostDir}':`),
-        `expected launch .profile to prepend ${hostDir}, got ${String(cap.profile)}`,
-      )
+      const launchBin = path.join(cap.env.HOME, '.oc-host-bin')
+      const pathDirs = cap.env.PATH.split(':')
+      assert.equal(pathDirs[0], launchBin, `expected ${launchBin} first on the CLI PATH, got ${cap.env.PATH}`)
+      assert.ok(!pathDirs.includes(hostDir), 'user-writable ~/.local/bin must stay off the CLI PATH')
+      assert.equal(cap.hostLink, hostBin, 'launch PATH dir links only the probed host wrapper')
+      assert.equal(cap.profile, `export PATH='${launchBin}':"$PATH"\n`)
       const prompt = JSON.parse(cap.stdin.trim()).message.content as string
       assert.ok(prompt.includes('host=yes'), 'ENV slot should advertise the host channel')
     } finally {

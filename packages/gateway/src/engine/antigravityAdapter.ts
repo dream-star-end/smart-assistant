@@ -28,7 +28,6 @@ import { identityCompatEnvironment } from '@openclaude/storage'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
-import { dirname } from 'node:path'
 import type { Readable, Writable } from 'node:stream'
 import { existsSync, readFileSync } from 'node:fs'
 import {
@@ -78,16 +77,12 @@ const RESULT_SETTLE_MS = 5_000
 const ANTIGRAVITY_SPAWN_PATH = '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin'
 
 /**
- * Selfhost puts the host wrapper in the persistent agent home, outside the
- * sandboxed PATH. Add only that wrapper's directory when the probe found it,
- * so `host 'cmd'` resolves for the CLI's shell (OCV5-530).
+ * Selfhost keeps the host wrapper in the persistent agent home, outside the
+ * sandboxed PATH. The projection links just that wrapper into a private launch
+ * dir, so `host 'cmd'` resolves without trusting ~/.local/bin (OCV5-530).
  */
-function antigravitySpawnPath(hostBin: string | null = probeEnvFacts().hostBin): string {
-  if (!hostBin) return ANTIGRAVITY_SPAWN_PATH
-  const hostDir = dirname(hostBin)
-  return ANTIGRAVITY_SPAWN_PATH.split(':').includes(hostDir)
-    ? ANTIGRAVITY_SPAWN_PATH
-    : `${hostDir}:${ANTIGRAVITY_SPAWN_PATH}`
+function antigravitySpawnPath(hostPathDir: string | null): string {
+  return hostPathDir ? `${hostPathDir}:${ANTIGRAVITY_SPAWN_PATH}` : ANTIGRAVITY_SPAWN_PATH
 }
 
 let timingTestHooks: { keepaliveMs?: number; resultSettleMs?: number } | null = null
@@ -365,7 +360,6 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       repoSnapshot,
       projectBound: Boolean(this.opts.projectId),
     })
-    const hostBin = probeEnvFacts().hostBin
     const projection = projectAntigravityPlatform({
       credential: {
         accessToken: route.accessToken,
@@ -393,7 +387,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       skillEvalExclude: this.opts.skillEvalExclude,
       skillEvalDraft: this.opts.skillEvalDraft,
       skillTrainRunId: this.opts.skillTrainRunId,
-      hostBin,
+      hostBin: probeEnvFacts().hostBin,
     })
     ctx.projection = projection
     const prompt = await this.composePrompt(ctx.params, repoSnapshot, projection.advertisedMcpTools, cwdDecision)
@@ -410,7 +404,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     }
     const env: NodeJS.ProcessEnv = {
       ...isolatedEnv,
-      PATH: antigravitySpawnPath(hostBin),
+      PATH: antigravitySpawnPath(projection.hostPathDir),
       HOME: projection.launchHome,
       XDG_CACHE_HOME: projection.cacheDir,
       OC_AGENT_ID: this.opts.agentId,
