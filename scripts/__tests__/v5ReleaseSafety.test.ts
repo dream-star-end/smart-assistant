@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.resolve(here, '../..')
 const deploy = path.join(root, 'scripts/deploy-v5.sh')
+const commercialPolicy = path.join(root, 'scripts/lib/v5-commercial-release-policy.sh')
 const selfhostDeploy = path.join(root, 'scripts/deploy-v5-selfhost.sh')
 const branchPolicy = path.join(root, 'scripts/v5-branch-policy.sh')
 const deploySurfaceCheck = path.join(root, 'scripts/v5-deploy-surface-check.mjs')
@@ -102,6 +103,7 @@ describe('V5 branch deployment policy', () => {
 
 async function runTurnCanaryFixture(
   mode: 'foreign-then-success' | 'foreign-only' | 'own-error' | 'ccb-final-cost-tape-text' | 'ccb-final-cost-empty-session',
+  answer = '2',
 ): Promise<{ code: number | null; stdout: string; stderr: string; elapsedMs: number }> {
   const dir = await mkdtemp(path.join(tmpdir(), 'v5-turn-canary-'))
   dirs.push(dir)
@@ -122,7 +124,7 @@ async function runTurnCanaryFixture(
     if (req.method === 'GET' && req.url?.startsWith('/api/sessions/')) {
       res.writeHead(200, { 'Content-Type': 'application/json' })
       if (mode === 'ccb-final-cost-tape-text') {
-        res.end(JSON.stringify({ messages: [{ role: 'assistant', text: '2' }] }))
+        res.end(JSON.stringify({ messages: [{ role: 'assistant', text: answer }] }))
       } else if (mode === 'ccb-final-cost-empty-session') {
         res.end(JSON.stringify({ messages: [{ role: 'assistant', text: '' }] }))
       } else {
@@ -194,7 +196,7 @@ async function runTurnCanaryFixture(
         channel: 'webchat',
         peer: inbound.peer,
         clientMessageId: inbound.clientMessageId,
-        blocks: [{ kind: 'text', text: '2' }],
+        blocks: [{ kind: 'text', text: answer }],
         isFinal: false,
       }))
       ws.send(JSON.stringify({
@@ -2222,7 +2224,7 @@ describe('v5 release safety lanes', () => {
     )
     assert.ok(build.indexOf('harden_release_baseline "$staging"') < build.indexOf('publish_strong_release'))
     assert.match(source, /activate_release\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
-    assert.match(source, /activate_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$BUILT_RELEASE"/)
+    assert.match(await readFile(commercialPolicy, 'utf8'), /activate_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$BUILT_RELEASE"/)
     assert.match(source, /rollback_runtime_tuple\(\)[\s\S]*?verify_release_baseline_security "\$master"/)
     assert.match(source, /ROLLBACK_LEGACY_BASELINE_OK=1 smoke "\$ACTIVE_PORT"/)
     assert.match(source, /verify_release_baseline_security\(\)[\s\S]*ROLLBACK_LEGACY_BASELINE_OK/)
@@ -3348,7 +3350,8 @@ describe('v5 release safety lanes', () => {
     const source = await readFile(deploy, 'utf8')
     // 地板挂在**全部**激活/回滚路径:传统激活、hotcfg tuple、tuple 回滚、P3 candidate。
     for (const fn of ['activate_release', 'activate_runtime_tuple', 'rollback_runtime_tuple', 'canary']) {
-      const body = source.match(new RegExp(`(?:^|\\n)${fn}\\(\\) \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? ''
+      const functionSource = fn === 'activate_runtime_tuple' ? await readFile(commercialPolicy, 'utf8') : source
+      const body = functionSource.match(new RegExp(`(?:^|\\n)${fn}\\(\\) \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? ''
       assert.match(body, /assert_model_authority_floor/, `${fn} 未挂兼容地板`)
       assert.match(body, /assert_lossless_turn_tape_floor/, `${fn} 未挂 lossless tape 兼容地板`)
     }
@@ -4280,7 +4283,7 @@ describe('v5 release safety lanes', () => {
       /if \[\[ -n "\$TARGET_RUNTIME_IMAGE" \]\]; then[\s\S]*RUNTIME_IMAGE_REF="\$TARGET_RUNTIME_IMAGE"[\s\S]*RUNTIME_IMAGE_ID=.*docker image inspect/,
     )
     assert.match(
-      source,
+      await readFile(commercialPolicy, 'utf8'),
       /hotcfg_rmt oc_hotcfg_activate_saga[\s\S]*"\$image" "\$image_id" "\$release" "\$bundle_val"/,
     )
   })
@@ -7225,9 +7228,10 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
       'reclaim 必须能在 recovery marker 存在时照跑',
     )
 
+    // Ordinary writes retain the marker fence; exact confirmed-impact N1 is the approved exception.
     assert.match(
       source,
-      /if \[\[ "\$MODE" != "recover" \]\] && ! ssh "\$KL_HOST" "test ! -e '\$DEPLOY_RECOVERY_MARKER'"/,
+      /if \[\[ "\$MODE" != "recover" && "\$policy_rollback" != 1 \]\] && ! ssh "\$KL_HOST" "test ! -e '\$DEPLOY_RECOVERY_MARKER'"/,
     )
     const recover = source.match(/^recover\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? ''
     assert.match(recover, /stable\)[\s\S]*smoke "\$ACTIVE_PORT"[\s\S]*clear_deploy_recovery_marker_after_stable_recover/)
@@ -8504,7 +8508,7 @@ wait $!
     assert.doesNotMatch(beforeAttempt, /let saw(Text|Final|Cost|Error)/)
     assert.match(source.slice(attemptAt), /let answerText = ''/)
     assert.match(source.slice(attemptAt), /answerText \+= b\.text/)
-    assert.match(source.slice(attemptAt), /finalText = answerText\.trim\(\)/)
+    assert.match(source.slice(attemptAt), /finalText = answerTextForExactCheck\(answerText\.trim\(\)\)/)
     assert.match(source.slice(attemptAt), /let finalText = ''/)
     assert.match(source.slice(attemptAt), /resolve\(\{ reason, sawText, sawFinal, sawCost, sawError, finalText, textVia \}\)/)
     assert.match(source, /extractAssistantText/)
@@ -8528,6 +8532,29 @@ wait $!
       foreignOnly.elapsedMs < 900,
       `foreign frames incorrectly refreshed the 60ms silence timer (${foreignOnly.elapsedMs}ms)`,
     )
+  })
+
+  test('OCV5-482: real-turn canary drops only one trailing well-formed ui next block before the exact check', async () => {
+    const next = '```ui\n{"type":"next","text":"再算一下 2+2"}\n```'
+    const trailing = await runTurnCanaryFixture('foreign-then-success', `2\n\n${next}`)
+    assert.equal(trailing.code, 0, trailing.stderr || trailing.stdout)
+    assert.match(trailing.stdout, /TURN_OK model=grok-build exact_text=2 final=true cost_charged=true via=ws/)
+
+    const tape = await runTurnCanaryFixture('ccb-final-cost-tape-text', `2\n${next}`)
+    assert.equal(tape.code, 0, tape.stderr || tape.stdout)
+    assert.match(tape.stdout, /via=tape/)
+
+    for (const bad of [
+      '2```ui{"type":"next","text":"x"}\n```',
+      `${next}\n2`,
+      `2\n${next}\n${next}`,
+      '2\n```ui\n{"type":"choices","text":"x"}\n```',
+      '2\n```ui\n{"type":"next","text":"x"\n```',
+    ]) {
+      const failed = await runTurnCanaryFixture('foreign-then-success', bad)
+      assert.equal(failed.code, 1, `must stay a failure: ${JSON.stringify(bad)}\n${failed.stdout}`)
+      assert.match(failed.stderr, /TURN_INCOMPLETE.*exact_text/)
+    }
   })
 
   test('real-turn canary accepts tape assistant text when CCB final+cost omit WS blocks', async () => {

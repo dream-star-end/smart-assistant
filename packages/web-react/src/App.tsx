@@ -1,3 +1,5 @@
+import { useDraftSessionMaterialization } from "./hooks/useDraftSessionMaterialization";
+import { useDraftPreparation } from "./hooks/useDraftPreparation";
 import { createGoalStarter } from "./lib/goalStart";
 import {
   lazy,
@@ -24,13 +26,11 @@ import { AgentPicker } from "./components/AgentPicker";
 import { AuthGate, type AuthMode } from "./components/AuthGate";
 import { DesktopEnrollPage } from "./components/DesktopEnrollPage";
 import { ChatHeader } from "./components/ChatHeader";
-import { saveBlob } from "./lib/chat/download";
 import { applyIntelligentUiSnapshot, useInputPredictionEnabled } from "./lib/intelligentUi";
-import { exportSessionMarkdown, sessionExportFilename } from "./lib/chat/exportMarkdown";
 import { ProjectScopeProvider } from "./hooks/useProjectScope";
-import { Composer, moveComposerAttachments, resetComposerAttachmentCache } from "./components/Composer";
+import { Composer, resetComposerAttachmentCache } from "./components/Composer";
 import { ComposerProjectPill } from "./components/ComposerProjectPill";
-import { accountDraftKey, moveDraft, NEW_COMPOSER_DRAFT_KEY, teardownComposerDrafts } from "./lib/composerDraft";
+import { accountDraftKey, NEW_COMPOSER_DRAFT_KEY, teardownComposerDrafts } from "./lib/composerDraft";
 import type { ImageAnnotationSource } from "./components/ImageAnnotationEditor";
 import {
   type ImageCommentSubmit,
@@ -46,7 +46,6 @@ import { deriveActivePlanStep, type TurnActivityInfo } from "./components/chat/T
 import { EmptyState, greetingName } from "./components/EmptyState";
 import { type ChatError, ErrorBanner } from "./components/ErrorBanner";
 import { SessionTimelineBoundary } from "./components/SessionTimelineBoundary";
-import { sessionHistorySurface } from "./lib/chat/historyLoadState";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { RepoStatusBanner } from "./components/github/RepoStatusBanner";
 import { PendingPaymentRecovery } from "./components/payment/PendingPaymentRecovery";
@@ -64,7 +63,7 @@ import type { OrgSection } from "./components/OrgCenter";
 import type { MarketplaceKind, MarketplaceTab } from "./components/MarketplaceCenter";
 import { AssistantMessage, UserMessage } from "./components/Message";
 import { MessageList, type MessageListArchive } from "./components/MessageRenderer";
-import { MessageListSkeleton, shouldShowHistorySkeleton } from "./components/chat/HistorySkeleton";
+import { MessageListSkeleton } from "./components/chat/HistorySkeleton";
 import { TurnCostReminder } from "./components/chat/TurnCostReminder";
 import {
   captureVisibleVirtualRowAnchor,
@@ -102,12 +101,13 @@ import { Sidebar } from "./components/Sidebar";
 import { Alert, Button, Sheet, Spinner, useConfirm, usePrompt } from "./components/ui";
 import { BootSplash } from "./components/BootSplash";
 import { useAgentGate } from "./hooks/useAgentGate";
+import { useHistorySkeleton } from "./hooks/useHistorySkeleton";
 import {
   type BoardViewParam,
-  type PanelParam,
   parseBoardView,
   parseBoardTicket,
   parseBoardTicketType,
+  activePanelOf,
   parsePanelParam,
   parseProjectPath,
   parseSessionPath,
@@ -118,13 +118,15 @@ import {
   parseTutorialTopic,
   parseTutorialWork,
   preferredBoardView,
+  readLocationRoute,
+  replaceSearchParams,
   type ProjectRoute,
   type TutorialTab,
   type TutorialWorkId,
   useAppRoute,
 } from "./hooks/useAppRoute";
 import { useAuth } from "./hooks/useAuth";
-import { genWsSessionId, useSessionList } from "./hooks/useSessionList";
+import { useSessionList } from "./hooks/useSessionList";
 import { useChatProjects } from "./hooks/useChatProjects";
 import { useUnreadSessions } from "./hooks/useUnreadSessions";
 import { useSidebarWidth } from "./hooks/useSidebarWidth";
@@ -178,9 +180,11 @@ import {
   collaborationPutBody,
   docToUiState,
   isStaleCollabEpoch,
+  keepCollabChoiceOnSaveFailure,
   recommendedAdvisorModel,
   sendCollabFields,
 } from "./lib/collaborationConfig";
+import { prepareAdvisorSend, persistRecoveredAdvisor, saveInitialCollaboration } from "./lib/collaborationSend";
 
 import { clearSessionEffort, writeSessionEffort } from "./lib/sessionEffort";
 import { clearContextTierForSession, writeContextTier } from "./lib/sessionContextTier";
@@ -358,38 +362,11 @@ function replyQuoteText(message: ChatMessage): string {
 }
 
 
-// 冷会话骨架屏窗口（见 HistorySkeleton.shouldShowHistorySkeleton）：
-//  - GRACE：meta 未知（深链/列表未落定）时的兜底窗，过后放行 EmptyState。
-//  - CAP：确知有历史但迟迟不到（getSession 慢/失败）的安全封顶，防骨架永停。
-const HISTORY_SKELETON_GRACE_MS = 800;
-const HISTORY_SKELETON_CAP_MS = 8000;
-
 export function App() {
-  const params = new URLSearchParams(location.search);
-  const demo = params.get("demo") === "1";
-  // 密码重置邮件链接：/reset-password?token=…（gateway SPA fallback 对无扩展名路径回退
-  // index.html，故 SPA 能接住）。启动即检测 → 直接进入 AuthGate 的 reset 模式。
-  const resetToken =
-    !demo && location.pathname === "/reset-password"
-      ? params.get("token") || undefined
-      : undefined;
-  // 桌面 enrollment 确认页：/desktop/enroll?enrollment_id=（gateway SPA fallback 无扩展名回退
-  // index.html，与 /reset-password 同族）。demo 模式不启用。
-  const desktopEnroll = !demo && location.pathname === "/desktop/enroll";
-  // P7 最小路由（无路由库）：demo / reset-password / desktop/enroll 特判不启用。boot 时一次性解析
-  // URL 深链（会话 /s/<id> + 面板 ?panel=），此后 URL 是状态的 replaceState 单向镜像。
-  const routingEnabled = !demo && !resetToken && !desktopEnroll;
-  const bootPanel = routingEnabled ? parsePanelParam(params) : null;
-  const bootTutorialCommunity = routingEnabled ? parseTutorialCommunity(params) : null;
-  const bootTutorialCase = routingEnabled ? parseTutorialCase(params) : null;
-  const bootTutorialTopic = routingEnabled && !bootTutorialCase && !bootTutorialCommunity
-    ? parseTutorialTopic(params)
-    : null;
-  // 教程中心一级页签 / 精选作品 / 目标步骤深链（tutorials 审计 TU-17）：解析函数自带互斥，
-  // 有 topic/case/community 时 tab、work 为 null；step 只跟 topic。
-  const bootTutorialTab = routingEnabled ? parseTutorialTab(params) : null;
-  const bootTutorialWork = routingEnabled ? parseTutorialWork(params) : null;
-  const bootTutorialStep = routingEnabled ? parseTutorialStep(params) : null;
+  // P7 最小路由（无路由库）：特判页（demo / reset-password / desktop/enroll）与启动深链
+  // （会话 /s/<id> + 面板 ?panel=）的解析见 readLocationRoute；此后 URL 是状态的 replaceState 单向镜像。
+  const urlRoute = readLocationRoute(location);
+  const { params, demo, resetToken, desktopEnroll, routingEnabled } = urlRoute;
   // 会话深链恢复未决标记：resolve 前 useSessionList 暂停"自动选中上次会话"
   // （URL 指定 > 最近会话）；resolve/放弃后置 null。
   const [pendingRouteSession, setPendingRouteSession] = useState<string | null>(() =>
@@ -498,7 +475,7 @@ export function App() {
   );
   // 面板深链：boot 读到 ?panel= 即以打开态初始化（工作区渲染后即呈现；未登录深链则
   // 登录后呈现）。打开/关闭经 useAppRoute 同步回 query。
-  const [settingsOpen, setSettingsOpen] = useState(bootPanel === "settings");
+  const [settingsOpen, setSettingsOpen] = useState(urlRoute.panel === "settings");
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("account");
   const [messageFeedback, setMessageFeedback] = useState<FeedbackContext | null>(null);
   const messageFeedbackTriggerRef = useRef<HTMLElement | null>(null);
@@ -518,22 +495,22 @@ export function App() {
   const [liveMediaJob, setLiveMediaJob] = useState<MediaGenerationJob | null>(null);
   const [repoModalOpen, setRepoModalOpen] = useState(false);
   const repoModalMounted = useMountedOnce(repoModalOpen);
-  const [manageOpen, setManageOpen] = useState(bootPanel === "manage");
+  const [manageOpen, setManageOpen] = useState(urlRoute.panel === "manage");
   const [manageTab, setManageTab] = useState<ManageTab>(DEFAULT_MANAGE_TAB);
   const [manageAutoAuthorizePluginSlug, setManageAutoAuthorizePluginSlug] = useState<
     string | null
   >(null);
-  const [marketplaceOpen, setMarketplaceOpen] = useState(bootPanel === "market");
-  const [orgOpen, setOrgOpen] = useState(bootPanel === "org");
+  const [marketplaceOpen, setMarketplaceOpen] = useState(urlRoute.panel === "market");
+  const [orgOpen, setOrgOpen] = useState(urlRoute.panel === "org");
   const [orgSection, setOrgSection] = useState<OrgSection>("overview");
-  const [tutorialOpen, setTutorialOpen] = useState(bootPanel === "help");
-  const [tutorialTopic, setTutorialTopic] = useState<ProductFeatureId | null>(bootTutorialTopic);
-  const [tutorialCase, setTutorialCase] = useState<TutorialCaseId | null>(bootTutorialCase);
-  const [tutorialCommunity, setTutorialCommunity] = useState<string | null>(bootTutorialCommunity);
+  const [tutorialOpen, setTutorialOpen] = useState(urlRoute.panel === "help");
+  const [tutorialTopic, setTutorialTopic] = useState<ProductFeatureId | null>(urlRoute.tutorialTopic);
+  const [tutorialCase, setTutorialCase] = useState<TutorialCaseId | null>(urlRoute.tutorialCase);
+  const [tutorialCommunity, setTutorialCommunity] = useState<string | null>(urlRoute.tutorialCommunity);
   // 一级页签（null = 案例展厅，不进 URL）/ 精选作品 / 功能教程目标步骤：镜像到 ?tab= / ?work= / ?step=。
-  const [tutorialTab, setTutorialTab] = useState<TutorialTab | null>(bootTutorialTab);
-  const [tutorialWork, setTutorialWork] = useState<TutorialWorkId | null>(bootTutorialWork);
-  const [tutorialStep, setTutorialStep] = useState<number | null>(bootTutorialStep);
+  const [tutorialTab, setTutorialTab] = useState<TutorialTab | null>(urlRoute.tutorialTab);
+  const [tutorialWork, setTutorialWork] = useState<TutorialWorkId | null>(urlRoute.tutorialWork);
+  const [tutorialStep, setTutorialStep] = useState<number | null>(urlRoute.tutorialStep);
   const [marketplaceTab, setMarketplaceTab] = useState<MarketplaceTab>("browse");
   const [marketplaceBrowseKind, setMarketplaceBrowseKind] = useState<MarketplaceKind>("skill");
   // 「在对话中创建」技能/智能体:关市场 → 新会话 → Composer 预填引导模板(用户改后发送)。
@@ -1143,17 +1120,22 @@ export function App() {
       // Empty composer has no sessionId. Skipping PUT avoids the old asDefault/!sessionId
       // default-write path; first send persists against the minted session id.
       if (!activeId && !asDefault) return;
+      // Solo/team keep the user's pick on a failed save (see keepCollabChoiceOnSaveFailure);
+      // only advisor rolls back, so a failing save can never pin the session to advisor.
+      // Inline error only (cleared on the next save): an error toast never auto-dismisses.
+      const failSave = (msg: string) => {
+        if (keepCollabChoiceOnSaveFailure(mode)) return;
+        setCollabUi(previous);
+        setTeamModeState(previous.mode === "team");
+        setCollabSaveError(msg);
+      };
       if (activeId && sockRef.current) {
         if (modelId) sockRef.current.setSessionModel(activeId, modelId);
         const title =
           sessions.find((session) => session.id === activeId)?.title || "新对话";
         const ensured = await sockRef.current.ensureServerSession(activeId, agent.id, title);
         if (!ensured) {
-          setCollabUi(previous);
-          setTeamModeState(previous.mode === "team");
-          const msg = "会话尚未创建成功，请检查网络后重试";
-          setCollabSaveError(msg);
-          toast(msg, "error");
+          failSave("会话尚未创建成功，请检查网络后重试");
           return;
         }
       }
@@ -1186,19 +1168,11 @@ export function App() {
           } catch (rereadErr) {
             if (isStaleCollabEpoch(epoch, collabEpochRef.current)) return;
             if (collabAuth.snapshot().epoch !== identityEpoch) return;
-            const msg = apiErrorMessage(rereadErr, "协作配置冲突后重读失败");
-            setCollabUi(previous);
-            setTeamModeState(previous.mode === "team");
-            setCollabSaveError(msg);
-            toast(msg, "error");
+            failSave(apiErrorMessage(rereadErr, "协作配置冲突后重读失败"));
             return;
           }
         }
-        setCollabUi(previous);
-        setTeamModeState(previous.mode === "team");
-        const msg = apiErrorMessage(err, "协作配置保存失败");
-        setCollabSaveError(msg);
-        toast(msg, "error");
+        failSave(apiErrorMessage(err, "协作配置保存失败"));
       }
     },
     [activeId, agent.id, applyCollabDoc, auth, collabUi, demo, modelId, models, sessions, toast],
@@ -1251,6 +1225,15 @@ export function App() {
   // 本会话的思考档位与上下文档位(hooks/useSessionEngineOptions,原位调用)。
   const { sessionEffort, setSessionEffort, contextTier, setContextTier, serviceTier, setServiceTier } =
     useSessionEngineOptions(activeId);
+
+  const { draftSessionId, stopPreparing } = useDraftPreparation({
+    auth, userId: user?.id ?? null, activeId, agentId: agent.id, modelId,
+    effortLevel: effortForModel(models, effectiveEffortModelId(modelId, false),
+      sessionEffort !== undefined ? sessionEffort : preferenceEffort),
+    enabled: !demo && laneReady && view === "app" && serverListSettled && !activeId &&
+      !draftProjectId && !projectHome && !boardOpen && collabMode === "solo" && serviceTier !== "fast" &&
+      !!modelId && isCodexEngineModel(modelId) && models.some(m => m.id === modelId),
+  });
 
   // Async goal saves can finish after navigation; only consume the selected draft's project.
   const selectedSessionIdRef = useRef(activeId);
@@ -1311,14 +1294,32 @@ export function App() {
         if (rewriteTarget) sendImplicitRatingRef.current?.(rewriteTarget, { reason: "改写重发" });
       }
       // 非 demo：经真实 WS 引擎发送（inbound.message）。确保有会话承载本轮（peer.id）。
-      let sessionId = target?.sessionId ?? activeId;
+      const originalSessionId = target?.sessionId ?? activeId;
+      const sessionId = originalSessionId ?? draftSessionId;
       let createdSession: Session | null = null;
-      let modeForSend = collabMode;
-      let advisorModelForSend = collabUi.advisorModel;
-      let configVersionForSend = collabUi.configVersion;
-      let unavailableForSend = collabUi.advisorUnavailableReason;
-      if (!sessionId) {
-        sessionId = genWsSessionId();
+      const recoveryEpoch = collabEpochRef.current;
+      const recoverySelection = selectedSessionIdRef.current;
+      const recoveryIdentity = auth?.snapshot().epoch;
+      const recoveryIdentityIsCurrent = () => auth?.snapshot().epoch === recoveryIdentity;
+      const recoveryIsCurrent = () => collabEpochRef.current === recoveryEpoch
+        && selectedSessionIdRef.current === recoverySelection && (!target || target.sessionId === recoverySelection) && recoveryIdentityIsCurrent();
+      if (!originalSessionId) stopPreparing();
+      const recovery = await prepareAdvisorSend({
+        agentId: agent.id, original: collabUi, auth, sessionId: originalSessionId,
+        parentEngine: models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine,
+        isCurrent: recoveryIdentityIsCurrent,
+        update: (state, recovered) => {
+          if (!recoveryIsCurrent()) return;
+          setCollabUi(state);
+          setTeamModeState(false);
+          setCollabSaveError(null);
+          if (recovered) toast("顾问暂不可用，已由当前主模型继续处理", "info");
+        },
+      });
+      if (!recovery || !recoveryIdentityIsCurrent()) return;
+      let latestCollab = recovery.state;
+      const recoveredAdvisor = recovery.recoveredAdvisor;
+      if (!originalSessionId) {
         createdSession = {
           id: sessionId,
           title: sessionTitle,
@@ -1333,14 +1334,14 @@ export function App() {
         };
         // 空会话态用户可能已在全能助手卡上开/关了团队模式;把当前 intent 落地为新会话的
         // per-session 键 —— 否则该会话只靠全局默认,会被其它会话的开关翻动(切走再回来变样)。
-        writeTeamMode(sessionId, collabMode === "team");
+        writeTeamMode(sessionId, latestCollab.mode === "team");
         // 显式档位选择存在才落地(未选择 = 继续继承全局偏好,不写键)。
         if (sessionEffort !== undefined) writeSessionEffort(sessionId, sessionEffort);
         writeContextTier(sessionId, contextTier);
         writeSessionServiceTier(sessionId, serviceTier);
         sockRef.current?.ensureSession(sessionId, agent.id, sessionTitle);
         if (modelId) sockRef.current?.setSessionModel(sessionId, modelId);
-        if (auth && (collabMode !== "solo" || collabAsDefault)) {
+        if (auth && !recoveredAdvisor && (latestCollab.mode !== "solo" || collabAsDefault)) {
           const collabAuth = auth;
           const identityEpoch = collabAuth.snapshot().epoch;
           const ensured = await sockRef.current?.ensureServerSession(sessionId, agent.id, sessionTitle);
@@ -1349,46 +1350,27 @@ export function App() {
             return;
           }
           try {
-            const doc = await api.putCollaborationConfig(
-              collabAuth,
-              collaborationPutBody({
-                sessionId,
-                mode: collabMode,
-                advisorModel:
-                  collabMode === "advisor"
-                    ? (collabUi.advisorModel ?? recommendedAdvisorModel(collabUi))
-                    : null,
-                expectedRev: collabUi.rev,
-                asDefault: collabAsDefault,
-              }),
-            );
-            if (collabAuth.snapshot().epoch !== identityEpoch) return;
-            applyCollabDoc(doc);
-            modeForSend = doc.session.mode;
-            advisorModelForSend = doc.session.advisorModel;
-            configVersionForSend = doc.session.configVersion;
-            unavailableForSend = doc.advisorUnavailableReason;
+            const doc = await saveInitialCollaboration(auth, sessionId, latestCollab, collabAsDefault, identityEpoch);
+            if (!doc || collabAuth.snapshot().epoch !== identityEpoch) return;
+            if (recoveryIsCurrent()) applyCollabDoc(doc);
+            latestCollab = docToUiState(doc);
           } catch (err) {
             if (collabAuth.snapshot().epoch !== identityEpoch) return;
-            const msg = apiErrorMessage(err, "协作配置保存失败");
-            setCollabSaveError(msg);
-            toast(msg, "error");
-            return;
+            // Team still sends: it rides on the turn frame. Only advisor needs the saved config.
+            if (!keepCollabChoiceOnSaveFailure(latestCollab.mode)) {
+              const msg = apiErrorMessage(err, "协作配置保存失败");
+              setCollabSaveError(msg);
+              toast(msg, "error");
+              return;
+            }
           }
         }
         setSessions((c) => [createdSession!, ...c]);
-        setActiveId(sessionId);
+        if (recoveryIsCurrent()) setActiveId(sessionId);
       }
       const sendCollab = sendCollabFields({
-        agentId: agent.id,
-        mode: modeForSend,
-        advisorModel: advisorModelForSend,
-        configVersion: configVersionForSend,
-        advisorUnavailableReason: unavailableForSend,
-        parentEngine: models.find((row) => row.id === modelId)?.engine ?? collabUi.parentEngine,
-        advisorConsultParents: collabUi.advisorConsultParents,
-        advisorConsultAllowed: collabUi.advisorConsultAllowed,
-        advisorConsultParentReason: collabUi.advisorConsultParentReason,
+        ...latestCollab, agentId: agent.id,
+        parentEngine: models.find((row) => row.id === modelId)?.engine ?? latestCollab.parentEngine,
       });
       if (sendCollab.blockedReason) {
         toast(sendCollab.blockedReason, "error");
@@ -1451,6 +1433,10 @@ export function App() {
         // OCV5-434 GPT Fast:只在当前模型支持且用户开着时随帧发送;不带 = 标准。
         ...(serviceTier === "fast" && supportsFastServiceTier(modelId) ? { serviceTier } : {}),
       });
+      if (recoveredAdvisor && auth) void persistRecoveredAdvisor({
+        auth, sessionId, rev: latestCollab.rev, isCurrent: recoveryIsCurrent,
+        ensureSession: (recoverySession) => sockRef.current?.ensureServerSession(recoverySession, agent.id, sessionTitle),
+      });
       // 侧栏：提到顶 + 更新标题/时间/计数（计数仅作排序提示，权威消息在 WS service）。
       setSessions((c) => {
         const sid = sessionId!;
@@ -1492,6 +1478,8 @@ export function App() {
     // 仅为满足 lint(跨 hook 返回值 biome 不再推断稳定性),不改变 send 的重建时机。
     [
       activeId,
+      draftSessionId,
+      stopPreparing,
       auth,
       demo,
       user,
@@ -1502,7 +1490,6 @@ export function App() {
       sessionEffort,
       contextTier,
       serviceTier,
-      collabMode,
       collabUi,
       collabAsDefault,
       sessions,
@@ -1686,32 +1673,11 @@ export function App() {
     [image2Available, submitImageEdit, submitImageComment, image2UnavailableReason],
   );
 
-  // 会话物化:新建按钮本身只进入空白草稿态；GitHub 绑定 / 设定目标这类明确依赖
-  // per-session 身份的首轮前操作，才在用户确认操作时物化一个会话 id。
-  const ensureActiveSession = useCallback((): string | undefined => {
-    if (demo || !user) return activeId;
-    if (activeId) return activeId;
-    const id = genWsSessionId();
-    const s: Session = {
-      id,
-      title: "新对话",
-      ownerUserId: user.id,
-      updatedAt: new Date().toISOString(),
-      messageCount: 0,
-      ...(modelId ? { modelId } : {}),
-    };
-    // 首轮前操作会紧接着 ensureServerSession/sendRepoBind；先把空白态显式模型写入
-    // ChatSession，确保建行 PUT 与后续首发都携带同一选择，不被 activeId effect 回落默认值。
-    sockRef.current?.ensureSession(id, agent.id, "新对话");
-    if (modelId) sockRef.current?.setSessionModel(id, modelId);
-    setSessions((c) => [s, ...c]);
-    // This is an identity promotion, not navigation to another conversation. Preserve
-    // the unsent draft; normal send consumes/clears it in Composer instead.
-    moveDraft(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, user.id), accountDraftKey(id, user.id));
-    moveComposerAttachments(accountDraftKey(NEW_COMPOSER_DRAFT_KEY, user.id), accountDraftKey(id, user.id));
-    setActiveId(id);
-    return id;
-  }, [demo, user, activeId, agent.id, modelId, setSessions, setActiveId]);
+  const ensureActiveSession = useDraftSessionMaterialization({
+    demo, userId: user?.id, activeId, draftSessionId, stopPreparing, agentId: agent.id, modelId,
+    teamMode: collabMode === "team", sessionEffort, contextTier, serviceTier,
+    sockRef, setSessions, setActiveId,
+  });
 
   // 打开 GitHub 绑定 modal:先确保有承载会话,否则「确认绑定」因 !sessionId 恒禁用
   // (输入框底部入口 → 发消息前即可绑定)。
@@ -2064,14 +2030,7 @@ export function App() {
       sp.delete("connector_error");
       touched = true;
     }
-    if (touched) {
-      const q = sp.toString();
-      window.history.replaceState(
-        {},
-        "",
-        window.location.pathname + (q ? `?${q}` : "") + window.location.hash,
-      );
-    }
+    if (touched) replaceSearchParams(sp);
   }, [demo, toast]);
 
   // 组织邀请接受流:URL 带 ?orgInvite=<token>。已登录 → 确认弹层 → accept → 刷新 /api/me;
@@ -2097,8 +2056,7 @@ export function App() {
       // 无论接受与否都清掉 query,避免刷新重复弹层。
       const sp = new URLSearchParams(window.location.search);
       sp.delete("orgInvite");
-      const q = sp.toString();
-      window.history.replaceState({}, "", window.location.pathname + (q ? `?${q}` : "") + window.location.hash);
+      replaceSearchParams(sp);
       if (!ok) return;
       try {
         await api.acceptOrgInvitation(a, token);
@@ -2477,22 +2435,23 @@ export function App() {
     // chat.version 是就地 mutation 会话的变更权威信号（同引用，须显式入依赖才随帧刷新）。
   }, [demo, activeSess, teamLeaderActive, agent.name, wsMessages, chat.version, chat.dispatchStatus]);
 
-  // ── 冷会话加载骨架屏窗口计时 ──────────────────────────────────────────
-  // activeId 变化即重置两个截止标记；GRACE 用于 meta 未知（深链）分支，CAP 是安全封顶。
-  // 骨架本身随 wsMessages 到达（cachedCount>0）立即隐藏，计时器只做「永不停」兜底。
-  const [historyGraceExpired, setHistoryGraceExpired] = useState(false);
-  const [historyCapExpired, setHistoryCapExpired] = useState(false);
-  useEffect(() => {
-    setHistoryGraceExpired(false);
-    setHistoryCapExpired(false);
-    if (demo || !activeId) return;
-    const t1 = setTimeout(() => setHistoryGraceExpired(true), HISTORY_SKELETON_GRACE_MS);
-    const t2 = setTimeout(() => setHistoryCapExpired(true), HISTORY_SKELETON_CAP_MS);
-    return () => {
-      clearTimeout(t1);
-      clearTimeout(t2);
-    };
-  }, [demo, activeId]);
+  // 对话前置门：非 demo 且尚无访问权（容器未就绪/未订阅/出错等）→ 由 AgentGate 占据对话区
+  // 并禁用 Composer。demo 与已就绪（ready|dormant）放行正常对话。
+  const gated = !demo && !gate.access;
+  // 冷会话加载骨架（计时器 + 派生，见 hooks/useHistorySkeleton）。须在下方 boot/登录等早返回之前调用。
+  const { loadingHistory, historySurface } = useHistorySkeleton({
+    demo,
+    activeId,
+    sessions,
+    gated,
+    wsMessageCount: wsMessages.length,
+    wsSending,
+    demoMessageCount: messages.length,
+    demoBusy: busy,
+    serverListSettled,
+    historyLoading,
+    historyError,
+  });
 
   // 会话级 transient 软提示（"较长时间未收到新内容…"）：非消息卡片、不落库；随快照读回。
   const transientNotice = !demo && activeId ? chat.getTransientNotice(activeId) : null;
@@ -3207,18 +3166,14 @@ export function App() {
   }, [inWorkspace, sending, stopTurn]);
 
   // ── P7 最小路由接线：URL 单向镜像（会话路径 + 面板 query）/ popstate / 深链恢复 ──
-  // 面板深链单选优先级：教程 > 设置 > 市场 > 管理 > 组织（同一时刻仅镜像一个顶层中心）。
-  const activePanel: PanelParam | null = tutorialOpen
-    ? "help"
-    : settingsOpen
-      ? "settings"
-      : marketplaceOpen
-        ? "market"
-        : manageOpen
-          ? "manage"
-          : orgOpen
-            ? "org"
-            : null;
+  // 面板深链单选优先级见 activePanelOf（同一时刻仅镜像一个顶层中心）。
+  const activePanel = activePanelOf({
+    help: tutorialOpen,
+    settings: settingsOpen,
+    market: marketplaceOpen,
+    manage: manageOpen,
+    org: orgOpen,
+  });
   const routeProjectIds = useMemo(() => projects.map((p) => p.id), [projects]);
   useAppRoute({
     enabled: routingEnabled,
@@ -3452,10 +3407,6 @@ export function App() {
   }
 
   const showEmpty = demo ? messages.length === 0 && !busy : wsMessages.length === 0 && !wsSending;
-  // 对话前置门：非 demo 且尚无访问权（容器未就绪/未订阅/出错等）→ 由 AgentGate 占据对话区
-  // 并禁用 Composer。demo 与已就绪（ready|dormant）放行正常对话。
-  const gated = !demo && !gate.access;
-
   // ── 输入框上方的全局横幅栈(shell 审计 S-06)──────────────────────────────
   // 五种横幅原先各自按条件挂载、互不知情,断线 + 休眠 + 新版本 + 发送失败同时成立时 390px
   // 屏上横幅吃掉 ~560px。这里先算出"此刻成立的有哪些",交给 resolveBanners 按优先级裁决:
@@ -3469,32 +3420,6 @@ export function App() {
   if (!demo && !gated && activeSess?._turnCostReminderCredits) activeBannerKinds.push("cost");
   const bannerStack = resolveBanners(activeBannerKinds, bannersExpanded);
   const showBanner = (kind: BannerKind) => bannerStack.visible.includes(kind);
-
-  // 冷会话加载骨架：切换/深链到本地无缓存会话、getSession 拉取期间显示消息形骨架，
-  // 取代「空白 → 突然填满」。meta（messageCount）取自侧栏当前选中会话，metaKnown
-  // 需 listSessions 已落定且命中列表（否则视为深链未决走 800ms 兜底窗）。
-  const activeMeta = !demo && activeId ? sessions.find((s) => s.id === activeId) : undefined;
-  const loadingHistory =
-    !demo &&
-    shouldShowHistorySkeleton({
-      selected: !!activeId,
-      gated,
-      cachedCount: wsMessages.length,
-      sending: wsSending,
-      knownMessageCount: activeMeta?.messageCount ?? 0,
-      metaKnown: serverListSettled && !!activeMeta,
-      loading: historyLoading,
-      graceExpired: historyGraceExpired,
-      capExpired: historyCapExpired,
-    });
-  const historySurface = sessionHistorySurface({
-    gated,
-    loadingHistory,
-    hasMessages: demo ? messages.length > 0 : wsMessages.length > 0,
-    sending: demo ? busy : wsSending,
-    knownNonEmpty: (activeMeta?.messageCount ?? 0) > 0,
-    historyError: !demo && historyError !== null,
-  });
 
   // 更早对话仍只靠显式按钮，滚动不发请求。
   // 本轮处理步骤按游标自动补齐，不在过程区放「加载更早的处理步骤」。
@@ -4547,15 +4472,6 @@ export function App() {
             sending={sending}
             title={activeSess?.title}
             agentName={agent.name || "助手"}
-            onExportMarkdown={async () => {
-              const md = await exportSessionMarkdown(wsMessages);
-              saveBlob(
-                new Blob([md], {
-                  type: "text/markdown;charset=utf-8",
-                }),
-                sessionExportFilename(activeSess?.title),
-              );
-            }}
           />
         </LazyBoundary>
       )}

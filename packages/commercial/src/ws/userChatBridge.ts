@@ -41,6 +41,7 @@ import { inboundSessionKey, observeUserContentReview } from '@openclaude/gateway
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import { desktopAllowsEngine } from "./containerTransportKind.js";
+import { snapshotAdmissionRequest } from "../dispatch/admissionRestartRecovery.js";
 import { randomUUID, randomBytes } from "node:crypto";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { Pool } from "pg";
@@ -174,6 +175,7 @@ import {
 import { mintDispatchEnvelope } from "../dispatch/dispatchSigner.js";
 import {
   casAdmittedToAccepted,
+  casAdmittedToRejecting,
   casToManualReconcile,
   casToTerminal,
   getDispatchByLogicalKey,
@@ -994,6 +996,8 @@ export interface UserChatBridgeDeps {
    * 未注入(v3 / 测试)或返回 null → 不发帧,零行为变化。
    */
   getFrontendBuildId?: () => string | null;
+  /** 可选:build id 变化后给已连 socket 补发帧的轮询间隔(默认 15s;测试注入)。 */
+  frontendBuildReannounceMs?: number;
   /** 可选:每用户最大并发(默认 3)。 */
   maxPerUser?: number;
   /** 可选:单帧上限(双向,默认 1MB)。 */
@@ -2322,6 +2326,29 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
     60_000,
   );
   ringPruneTimer.unref?.();
+
+  /**
+   * P0-Web(OCV5-489):前端构建目录热切换不重启 master,已连着的客户端收不到 accept 帧。
+   * 定时读探针,build id 变了就给所有已开 socket 补发一帧 sys.frontend_build;客户端
+   * reload governor 照旧只在安全点(无在飞 turn / 无草稿附件 / 输入空闲)软刷新。
+   * best-effort:探针返回 null 或发送失败都静默跳过。
+   */
+  let announcedFrontendBuild: string | null = null;
+  try { announcedFrontendBuild = deps.getFrontendBuildId?.() ?? null; } catch { /* best-effort */ }
+  const frontendBuildTimer: NodeJS.Timeout | null = deps.getFrontendBuildId
+    ? setInterval(() => {
+        let build: string | null = null;
+        try { build = deps.getFrontendBuildId?.() ?? null; } catch { return; }
+        if (!build || build === announcedFrontendBuild) return;
+        announcedFrontendBuild = build;
+        const frame = JSON.stringify({ type: "sys.frontend_build", build });
+        for (const client of wss.clients) {
+          if (client.readyState !== WebSocket.OPEN) continue;
+          try { client.send(frame); } catch { /* best-effort */ }
+        }
+      }, deps.frontendBuildReannounceMs ?? 15_000)
+    : null;
+  frontendBuildTimer?.unref?.();
 
   /**
    * uid(string) → 该用户当前持有的所有正在正常桥接中的 user WS 集合。
@@ -3890,13 +3917,26 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       state: EnrichmentDispatchState,
       failureCode: string,
     ): boolean => {
+      const wasTransferring = state.phase === "transferring";
       if (!claimEnrichmentTerminalization(state)) return false;
       const record = state.record;
       const pool = deps.pgPool;
       void (async (): Promise<void> => {
         try {
           if (!pool) return;
-          if (record.recoveryJob) {
+          if (failureCode === "bridge_closed_during_admission" &&
+              (!record.recoveryJob || wasTransferring)) {
+            // A send can reach the durable inbox before its local callback.
+            // Keep the task open until exact proof resolves ownership: live
+            // work continues; a rejected tombstone schedules a fresh identity.
+            await casAdmittedToRejecting(pool, {
+              dispatchId: record.dispatchId,
+              expectedEpoch: record.leaseEpoch,
+              ownerId: "bridge-admission-handoff",
+            });
+          } else if (record.recoveryJob) {
+            // Still enriching: no physical send occurred. Reuse this transport
+            // identity without spending another semantic attempt.
             await releaseRecoveryPreReceipt(pool, {
               job: record.recoveryJob,
               dispatchId: record.dispatchId,
@@ -4011,8 +4051,8 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
       return state;
     };
 
-    /** The websocket send callback is the physical-transfer linearization
-     * point. Until it succeeds, cleanup may still terminalize this state. */
+    /** A successful websocket callback releases enrichment ownership. If
+     * cleanup wins first, exact inbox proof resolves the uncertain delivery. */
     const completeEnrichmentTransfer = (state: EnrichmentDispatchState | null): void => {
       if (state) acceptEnrichmentReceipt(state.record);
     };
@@ -4583,6 +4623,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
           ...(displayText !== modelText ? { _modelText: modelText } : {}),
           ...(replyTo ? { _replyTo: replyTo } : {}),
           _routing: routing,
+          _admissionRestartRequest: snapshotAdmissionRequest(frameObj),
         };
         if (useDispatchAdmission && deps.admitUserTurn) {
           // ── durable turn dispatch 受理(RFC §2.1)── 替代 persist retry loop。
@@ -8298,23 +8339,17 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
                 void (async () => {
                   let persisted = false;
                   try {
-                    if (rec.recoveryJob) {
-                      persisted = await releaseRecoveryPreReceipt(pool, {
-                        job: rec.recoveryJob,
-                        dispatchId: rec.dispatchId,
-                        dispatchOwner: rec.leaseOwnerId,
-                        dispatchLeaseEpoch: rec.leaseEpoch,
-                      });
-                    } else {
-                      persisted = await casToTerminal(pool, {
-                        dispatchId: rec.dispatchId,
-                        outcome: "not_accepted",
-                        failureCode: "DISPATCH_NOT_ACCEPTED",
-                        clientNotified: false,
-                        fromStatuses: ["admitted"],
-                        expectedEpoch: rec.leaseEpoch,
-                      }) !== null;
-                    }
+                    // A rejected tombstone permanently fences this delivery;
+                    // retrying it as a transport wait can never execute. The
+                    // recovery scheduler atomically hands off to a new cmid.
+                    persisted = await casToTerminal(pool, {
+                      dispatchId: rec.dispatchId,
+                      outcome: "not_accepted",
+                      failureCode: "DISPATCH_NOT_ACCEPTED",
+                      clientNotified: false,
+                      fromStatuses: ["admitted"],
+                      expectedEpoch: rec.leaseEpoch,
+                    }) !== null;
                   } catch (err) {
                     bridgeLog?.warn("user-chat-bridge: rejected receipt convergence failed", {
                       dispatchId: rec.dispatchId,
@@ -10407,6 +10442,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
 
   async function shutdown(reason = "server shutting down"): Promise<void> {
     clearInterval(ringPruneTimer);
+    if (frontendBuildTimer) clearInterval(frontendBuildTimer);
     clearInterval(controlDrainTimer);
     clearInterval(recoveryDrainTimer);
     registry.closeAll(reason);

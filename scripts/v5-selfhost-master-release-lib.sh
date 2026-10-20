@@ -15,8 +15,6 @@ MASTER_STAGING_INO=""
 # 发布门的私有 TMPDIR(tsx 编译缓存落在里面)。同样不继承环境,理由同 MASTER_STAGING。
 MASTER_GATE_TMPDIR=""
 MASTER_GATE_TMP_PREFIX="${MASTER_GATE_TMP_PREFIX:-/tmp/oc-selfhost-gate-tmp}"
-# 共享 tsx 缓存(/tmp/tsx-<euid>)里超过这个分钟数没写过的条目在每次构建前删掉。
-TSX_SHARED_CACHE_MAX_AGE_MIN="${TSX_SHARED_CACHE_MAX_AGE_MIN:-2880}"
 BUILT_MASTER_RELEASE="${BUILT_MASTER_RELEASE:-}"
 MASTER_DEPS_MODE="${MASTER_DEPS_MODE:-}"
 MASTER_DEPS_ELAPSED_S="${MASTER_DEPS_ELAPSED_S:-}"
@@ -165,24 +163,6 @@ sweep_stale_master_gate_tmpdirs() {
     mlog "  清理残留的门临时目录(pid $pid 已退出): $d"
     rm -rf -- "$d"
   done
-}
-
-# 共享缓存仍被 live master / egress / 迁移和开发机上的测试使用,不能整个删。
-# 只删 TSX_SHARED_CACHE_MAX_AGE_MIN 分钟内没写过的普通缓存文件:tsx 读缓存失败时
-# 当作未命中重新编译,所以删掉正在用的条目也只是多编译一次。失败不挡发布。
-prune_shared_tsx_cache() {
-  local dir before after
-  dir="${TMPDIR:-/tmp}/tsx-$(id -u)"
-  [[ -d "$dir" && ! -L "$dir" ]] || return 0
-  [[ "$TSX_SHARED_CACHE_MAX_AGE_MIN" =~ ^[0-9]+$ ]] || {
-    mlog "  TSX_SHARED_CACHE_MAX_AGE_MIN 不是整数,跳过共享 tsx 缓存清理"
-    return 0
-  }
-  before="$(find "$dir" -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9]+-[0-9a-f]+' 2>/dev/null | wc -l)"
-  find "$dir" -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9]+-[0-9a-f]+' \
-    -mmin +"$TSX_SHARED_CACHE_MAX_AGE_MIN" -delete 2>/dev/null || true
-  after="$(find "$dir" -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9]+-[0-9a-f]+' 2>/dev/null | wc -l)"
-  mlog "  共享 tsx 缓存 $dir: ${before} → ${after} 个条目(删掉 ${TSX_SHARED_CACHE_MAX_AGE_MIN} 分钟内没写过的)"
 }
 
 # 商业版 release_artifact_digest 的本地化抄本(无 SSH)。.complete 不计入。
@@ -657,8 +637,8 @@ build_master_release() {
     return 0
   fi
 
+  # Shared tsx cache belongs to live services and other work; only private gate dirs are cleaned.
   assert_master_releases_disk
-  prune_shared_tsx_cache
   command -v python3 >/dev/null 2>&1 || die "缺少 python3(算 artifact digest 需要)"
   command -v npm >/dev/null 2>&1 || die "缺少 npm"
   command -v jq >/dev/null 2>&1 || die "缺少 jq"
@@ -743,6 +723,18 @@ build_master_release() {
       npx --no-install tsx scripts/check-v5-box-continuation.ts --expect-sha "$full_sha" ); then
     cleanup_master_staging
     die "pinned Box multitool continuation gate 失败"
+  fi
+  mlog "  Box incident proofs gate (OCV5-488) @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
+  if [[ ! -f "$staging/scripts/check-v5-box-incident-proofs.ts" ]]; then
+    cleanup_master_staging
+    die "新候选缺 scripts/check-v5-box-incident-proofs.ts"
+  fi
+  # 与 success recovery 门同一个显式 loopback *_test DSN;Box 只在 exec 端点模拟。
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH \
+      TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
+      npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$full_sha" ); then
+    cleanup_master_staging
+    die "pinned Box incident proofs gate (OCV5-488) 失败"
   fi
   mlog "  Cursor Sand InferenceService contract gate @ pinned staging"
   if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts ); then
@@ -1402,4 +1394,40 @@ cleanup_cutover_unit_snap() {
       rm -rf -- "$snap"
       ;;
   esac
+}
+
+# OCV5-513: wait after the build, before arming recovery or changing live units.
+# This is an idle snapshot, not an admission fence; new arrivals can still race.
+cutover_wait_for_user_idle() {
+  local counts started=$SECONDS deadline=$((SECONDS + 600))
+  if [[ "$DRY" == 1 ]]; then
+    cutover_clog "  [dry-run] 切换前等待全部用户回合结束(只读,最多 600s;不查询数据库)"
+    return 0
+  fi
+  while :; do
+    if ! counts="$(psql_as_postgres -d "dbname=$PG_DB connect_timeout=5" -qAt -c "
+BEGIN READ ONLY;
+SET LOCAL statement_timeout = '5s';
+SELECT
+  (SELECT count(*) FROM turn_dispatches WHERE status IN ('admitted','accepted','rejecting')),
+  (SELECT count(*) FROM request_finalize_journal j
+   WHERE j.state NOT IN ('aborted','committed') AND NOT EXISTS (
+     SELECT 1 FROM turn_dispatches d WHERE d.dispatch_id=j.dispatch_id
+       AND d.status='terminal' AND d.terminal_at IS NOT NULL));
+COMMIT;")"; then
+      cutover_clog "  ✗ 无法只读确认用户空闲;拒绝切换,旧 master 继续运行"
+      return 1
+    fi
+    if [[ ! "$counts" =~ ^[0-9]+\|[0-9]+$ ]]; then
+      cutover_clog "  ✗ 空闲查询结果无效;拒绝切换,旧 master 继续运行"
+      return 1
+    fi
+    cutover_clog "  idle snapshot UTC=$(date -u +%FT%TZ) open_dispatches=${counts%|*} unclassified_journals=${counts#*|} elapsed=$((SECONDS - started))s"
+    [[ "$counts" == '0|0' ]] && return 0
+    if (( SECONDS >= deadline )); then
+      cutover_clog "  ✗ 等待空闲 600s 超时;拒绝切换,旧 master 继续运行"
+      return 1
+    fi
+    sleep 5
+  done
 }

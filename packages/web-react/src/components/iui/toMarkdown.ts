@@ -4,7 +4,8 @@
  * 四个用处:开关关闭时的渲染、消息复制、会话导出、组件渲染失败时的兜底。
  * 输出是普通 GFM(表格、列表、引用),任何 Markdown 阅读器都能读。
  */
-import { isNextBlockCode } from "../../lib/inputPrediction";
+import { isNextBlockCode } from "../../lib/nextBlock";
+import { normalizeInlineUiFences } from "../../lib/uiFence";
 import { biliToMarkdown } from "./biliMarkdown";
 import { computeOutputs } from "./formula";
 import { marketToMarkdown } from "./marketMarkdown";
@@ -395,7 +396,7 @@ const FENCE_OPEN = /^( {0,3})(`{3,}|~{3,})[ \t]*([^\s`]*)[^\n`]*$/;
  */
 export function uiFencesToMarkdown(text: string, streaming = false): string {
   if (!text.includes("```ui") && !text.includes("~~~ui")) return text;
-  const lines = text.split("\n");
+  const lines = normalizeInlineUiFences(text).split("\n");
   const out: string[] = [];
   let i = 0;
   while (i < lines.length) {

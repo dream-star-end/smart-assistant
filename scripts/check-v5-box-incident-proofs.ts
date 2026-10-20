@@ -29,6 +29,10 @@ import { deflateSync } from "node:zlib";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
+import { provePendingUser } from "./lib/boxPendingUserProof.js";
+import { proveLocalCatalogOwner } from "./lib/boxLocalCatalogOwnerProof.js";
+import { proveRefusedRecoveryClosed as refusedRecoveryProof } from "./lib/boxRefusedRecoveryProof.js";
+import { misrecordedRun, proveCliRepairedToolInput, proveForeignToolHistory, rereadError } from "./lib/boxCliRepairProof.js";
 
 const LIMIT_MS = 120_000;
 const CANDIDATE = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
@@ -38,11 +42,12 @@ const LIVE_ONLY = "BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION";
 type Body = Record<string, unknown>;
 type Expected = { id: string; boxName: string; clientName: string; input: Record<string, unknown> };
 type Api = {
+  localCatalogOwner: (legacyWire: Body) => Promise<Record<string, unknown>>;
   gate: (body: Body, toolBridgeEnabled: boolean) => string | null;
   classify: (body: Body) => { classification: string; rejectCode: string | null; toolIds?: readonly string[];
     answeredToolIds?: readonly string[] };
   match: (body: Body, expected: readonly Expected[]) => ReadonlyArray<Matched>;
-  compile: (body: Body) => { snapshotJsonl: string };
+  compile: (body: Body) => { snapshotJsonl: string; stdinJsonl: string };
   fitForCli: (results: readonly Matched[]) => Promise<readonly Matched[]>;
   echo: (expected: readonly EchoExpected[]) => { accept: (raw: unknown) => void;
     verifyDeferred: () => Promise<void>; assertComplete: () => void };
@@ -51,6 +56,8 @@ type Api = {
     pollIntervalMs: number; retryDelaysMs?: readonly number[] }) => AsyncGenerator<{ text: string; endOffset: number }>;
   spoolAccess: () => unknown;
   transportError: (code: string) => Error;
+  /** OCV5-509: whether a failed replay re-read is the run's own deterministic refusal. */
+  replayRejection: (error: unknown) => boolean;
   firstRound: (input: unknown, deps: unknown) => Promise<{ kind: string }>;
   textFetch: (deps: unknown) => { fetch: (input: unknown) => Promise<Response> };
   registry: () => { open: (input: { uid: bigint; sessionId: string; accountId: bigint }) => unknown;
@@ -79,7 +86,15 @@ type Api = {
   replayStore: (root: string) => { write: unknown; read: unknown };
   stopHandler: (deps: unknown) => RouteHandler;
   idleProofHandler: (deps: unknown) => RouteHandler;
+  /** OCV5-488: the product's Box billing recovery for one row: it settles a handoff's completed calls. */
+  settleBoxBilling: (db: Db, requestId: string, uid: bigint) => Promise<string>;
+  /** OCV5-488: the journal writes that release a Box run held by nothing. */
+  holds: (db: Db) => unknown;
+  /** OCV5-488: the ops.box_hold_stuck alert's own query and row mapping. */
+  boxHoldStuck: { sql: string; rows: (rows: unknown[]) => Array<{ requestId: string; absent: boolean }> };
   jsonError: (res: unknown, status: number, code: string, message: string, requestId: string) => void;
+  /** egress' model authority gate reject, as /v1/messages serializes it. */
+  gateReject: (kind: string, detail: string) => { status: number; code: string; clientMessage: string };
   /** The box-resident Claude CLI lane (box-claude-*): the gateway runner and its stdio bridge. */
   boxCli: { runner: (opts: unknown) => { submit: (text: string, requestId: undefined, authority: unknown,
       turnKey: string) => Promise<void>; updateTurnLease: (lease: string) => Promise<void> };
@@ -95,6 +110,8 @@ type Api = {
   sessionManager: { submit: (...args: unknown[]) => Promise<unknown> };
   home: string;
   sessionsBackend: (pool: unknown) => SessionsBackend;
+  /** OCV5-509: the reconciler sweep that closes a recovery chain paused before it ran. */
+  closeRefusedRecoveryChains: (pool: unknown) => Promise<number>;
   tape: { version: number; partBytes: number };
   /** The Box CLI version gate and the exec transport its read goes through. */
   cliVersion: { gate: () => { read: (target: unknown) => Promise<string> };
@@ -121,7 +138,9 @@ type PrelaunchReceipt = PrelaunchIdentity & { identityHash: string };
 type SessionsBackend = { admitUserTurn: (input: unknown) => Promise<{ kind: string }>;
   stageLosslessTurnTapePart: (userId: string, request: unknown, bytes: Buffer) => Promise<unknown>;
   finalizeLosslessTurnTape: (userId: string, request: unknown) => Promise<{ applied: string }>;
-  getClientSession: (sessionId: string, userId: string) => Promise<{ messages: Array<{ id?: string }> } | null> };
+  getClientSession: (sessionId: string, userId: string) => Promise<{ messages: Array<{ id?: string }> } | null>;
+  appendServerAuthoredMessage: (sessionId: string, userId: string, message: Record<string, unknown> & { id: string; role: string }) =>
+    Promise<{ applied: boolean }> };
 type RouteHandler = (req: unknown, res: unknown, ctx: { hostUuid: string; boundIp: string }) => Promise<void>;
 type IdleOp = { runnerKilledAt?: number; disposition?: string; abandonReason?: string; [key: string]: unknown };
 type IdleFiles = { IDLE_STOPPED_GRACE_MS: number;
@@ -177,6 +196,10 @@ async function load(): Promise<Api> {
   const observe = await import(pathToFileURL(join(PROXY, "boxDetachedTextObserve.ts")).href);
   const journal = await import(pathToFileURL(join(PROXY, "boxDurableJournal.ts")).href);
   const stop = await import(pathToFileURL(join(PROXY, "boxUserStopCoordinator.ts")).href);
+  const holdStuck = await import(pathToFileURL(join(PROXY, "boxHoldStuck.ts")).href);
+  const holdRelease = await import(pathToFileURL(join(PROXY, "boxHoldRelease.ts")).href);
+  const boxBilling = await import(pathToFileURL(join(CANDIDATE,
+    "packages/commercial/src/billing/boxBillingRecovery.ts")).href);
   const billing = await import(pathToFileURL(join(PROXY, "boxBillingContext.ts")).href);
   const toolFetch = await import(pathToFileURL(join(PROXY, "boxToolFetch.ts")).href);
   const replay = await import(pathToFileURL(join(PROXY, "boxReplayCompleted.ts")).href);
@@ -187,6 +210,7 @@ async function load(): Promise<Api> {
   const stopRoute = await import(pathToFileURL(join(PROXY, "boxUserStopHandler.ts")).href);
   const idleRoute = await import(pathToFileURL(join(PROXY, "boxIdleProofHandler.ts")).href);
   const shared = await import(pathToFileURL(join(PROXY, "shared.ts")).href);
+  const authorityGate = await import(pathToFileURL(join(PROXY, "modelAuthorityGate.ts")).href);
   const cliVersion = await import(pathToFileURL(join(PROXY, "boxCliVersion.ts")).href);
   const prelaunch = await import(pathToFileURL(join(PROXY, "boxPrelaunchControl.ts")).href);
   const stageFiles = await import(pathToFileURL(join(PROXY, "boxStageFiles.ts")).href);
@@ -209,8 +233,66 @@ async function load(): Promise<Api> {
     attemptOnce: async () => fail("GATEWAY_SINK_USED") });
   const protocol = await import(pathToFileURL(join(CANDIDATE, "packages/protocol/src/index.ts")).href);
   const sessionsBackend = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/db/pgSessionsBackend.ts")).href);
+  const refusedCards = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/db/refusedRecoveryCards.ts")).href);
   const mapper = await import(pathToFileURL(join(PROXY, "boxMessagesMapper.ts")).href);
-  return { gate: gate.validateBoxRequest, classify: prepared.classifyBoxContinuation,
+  const localCatalog = await import(pathToFileURL(join(GATEWAY, "modelCatalogClient.ts")).href);
+  const spawnConfig = await import(pathToFileURL(join(GATEWAY, "subprocessSpawnConfig.ts")).href);
+  const modelSnapshot = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/billing/modelCatalog.ts")).href);
+  const catalogHttp = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/http/internalModelCatalog.ts")).href);
+  const containerIdentity = await import(pathToFileURL(join(CANDIDATE, "packages/commercial/src/auth/containerIdentity.ts")).href);
+  return {
+    localCatalogOwner: async (legacyWire) => {
+      const model = "box-api-claude-haiku-5-5";
+      const snapshot = new modelSnapshot.ModelCatalogSnapshot({ entries: [{ entryId: 1, modelId: model,
+        engine: "ccb", providerId: "box_cli", upstreamModelId: null, contextWindow: 200000,
+        capabilityProfile: { supportsVision: false, reasoning: { supported: ["low"], codexModelDefault: null },
+          ccb: { capabilityZero: true, supportsThinking: false, contextOwner: "box-native-v1" } },
+        capabilitySchemaVersion: 1, state: "active", lockVersion: 0 }], aliases: new Map(),
+        pricing: new Map([[model, { modelId: model, displayName: model, inputPerMtok: 100n, outputPerMtok: 500n,
+          cacheReadPerMtok: 10n, cacheWritePerMtok: 100n, multiplier: "1.000", visibility: "public",
+          sortOrder: 1, defaultEffort: "low" }]]), securityEpoch: 5n });
+      const secret = "a".repeat(64), token = `oc-v3.7.${secret}`;
+      const authz = { role: "admin" as const, grantedModelIds: new Set<string>() };
+      const handler = catalogHttp.makeModelCatalogHandler({ identityRepo: {
+        async findActiveByHostAndBoundIp() { return { id: 7, user_id: 3, bound_ip: "127.0.0.1",
+          host_uuid: "fixture-518", secret_hash: containerIdentity.hashSecret(secret) }; },
+      }, catalog: { async assertFresh() { return snapshot; } }, loadUserModelAuthz: async () => authz,
+        readEpoch: async () => 5n, loadRoutingAvailability: async () => ({ unavailableProviderIds: new Set<string>(),
+          revision: "fixture-availability" }), loadAgentCostOverrides: async () => ({}) });
+      let fullFetches = 0, wireOwner: unknown;
+      const env = { OC_MODEL_AUTHORITY: "1", OPENCLAUDE_V3_MASTER_BASE_URL: "http://fixture.invalid",
+        OPENCLAUDE_V3_CONTAINER_TOKEN: token };
+      const lkgPath = join(process.env.OPENCLAUDE_HOME!, "ocv5-518-legacy-lkg.json");
+      writeFileSync(lkgPath, JSON.stringify(legacyWire));
+      const fetcher = (async (url: string, init: { headers: Record<string, string> }) => {
+        const path = new URL(url).pathname;
+        let text = "";
+        const res = { statusCode: 0, setHeader() {}, end(value?: string) { text = value ?? ""; } };
+        await handler({ method: "GET", url: path, headers: init.headers } as never, res as never,
+          { hostUuid: "fixture-518", boundIp: "127.0.0.1" });
+        if (path === protocol.MODEL_CATALOG_PATH) {
+          fullFetches += 1;
+          wireOwner = JSON.parse(text).models?.find((row: { model_id: string }) => row.model_id === model)?.context_owner;
+        }
+        return { statusCode: res.statusCode, body: (async function* () { yield Buffer.from(text); })() };
+      }) as never;
+      const client = new localCatalog.ModelCatalogClient({ env, lkgPath, fetcher });
+      localCatalog._setModelCatalogClientForTests(client);
+      try {
+        const runtime = await spawnConfig.resolveTurnRuntime(undefined, model, env, "ccb");
+        const view = await client.getView();
+        const cold = await new localCatalog.ModelCatalogClient({ env, lkgPath, fetcher }).getView();
+        const localToken = runtime.headers!.localCatalog!;
+        const gateDecision = await authorityGate.enforceModelAuthority({ catalog: { async assertFresh() { return snapshot; } },
+          keyring: null, headers: { [localCatalog.LOCAL_CATALOG_HEADER]: localToken }, uid: 3n, containerId: 7n,
+          model, loadUserModelAuthz: async () => authz });
+        return { wireOwner, descriptorOwner: runtime.descriptor?.contextOwner,
+          coldOwner: cold.resolve(model)?.contextOwner, projectionFormat: view.projectionFormat,
+          projectionRevision: view.projectionRevision, fullFetches,
+          token: JSON.parse(Buffer.from(localToken, "base64url").toString("utf8")), gateKind: gateDecision.authorityKind };
+      } finally { localCatalog._setModelCatalogClientForTests(null); }
+    },
+    gate: gate.validateBoxRequest, classify: prepared.classifyBoxContinuation,
     compile: (body: Body) => mapper.compileBoxCliSyntheticTurn(body, { cwd: `/tmp/ocv5-289-run-${"a".repeat(24)}`, cliVersion: "2.1.280" }),
     match: matcher.matchBoxToolResults, fitForCli: images.normalizeBoxResultImagesForCli,
     echo: (expected) => new echo.BoxToolResultEcho(expected),
@@ -219,6 +301,7 @@ async function load(): Promise<Api> {
     pollSpool: poller.pollBoxSpoolLines,
     spoolAccess: () => access.makeBoxDetachedRunAccess({ runNonce: "a".repeat(24), detachedRunnerHash: "b".repeat(64) }),
     transportError: (code) => new transport.BoxExecTransportError(code, false),
+    replayRejection: observer.isBoxReplayRejection,
     firstRound: firstRound.runBoxToolFirstRound,
     textFetch: (deps) => new textFetch.BoxTextFetch(deps),
     registry: () => new registry.BoxInvocationRegistry({ maxPerUser: 1, maxPerAccount: 1, leaseMs: 600_000 }),
@@ -243,7 +326,12 @@ async function load(): Promise<Api> {
     replayStore: (root) => ({ write: replaySetup.createBoxReplayWriter(true, root),
       read: replaySetup.createBoxReplayReader(root) }),
     stopHandler: stopRoute.makeBoxUserStopHandler, idleProofHandler: idleRoute.makeBoxIdleProofHandler,
+    boxHoldStuck: { sql: holdStuck.BOX_HOLD_STUCK_SQL, rows: holdStuck.boxHoldStuckRows },
+    holds: (db) => new holdRelease.BoxHoldRelease({ query: db.query.bind(db) }),
+    settleBoxBilling: (db, requestId, uid) => boxBilling.recoverBoxBillingRequest({ query: db.query.bind(db),
+      connect: async () => ({ query: db.query.bind(db), release: () => {} }) }, requestId, uid),
     jsonError: shared.sendJsonError,
+    gateReject: (kind: string, detail: string) => new authorityGate.ModelGateReject(kind, detail),
     boxCli: { runner: (opts) => new boxRunner.SubprocessRunner(opts), bridge: boxBridge.runBoxCcBridge },
     ccbAdapter: (runner) => new ccb.CcbAdapter({}, runner),
     fetchIdleProof: idleClient.fetchBoxIdleProof,
@@ -255,6 +343,7 @@ async function load(): Promise<Api> {
       defaults: { permissionMode: "bypassPermissions", model: authority.BOX_NATIVE_CONTEXT_MODEL } }),
     home: process.env.OPENCLAUDE_HOME!,
     sessionsBackend: (pool) => sessionsBackend.createPgSessionsBackend(pool, { expectedGeneration: 1 }),
+    closeRefusedRecoveryChains: (pool) => refusedCards.closeRefusedRecoveryChains(pool),
     tape: { version: protocol.LOSSLESS_TURN_TAPE_VERSION, partBytes: protocol.LOSSLESS_TURN_TAPE_PART_BYTES },
     cliVersion: { gate: () => new cliVersion.BoxCliVersionGate(), launchResolver: cliVersion.gateBoxLaunchResolver,
       transport: (fetchImpl) => new transport.BoxExecTransport({ execUrl: "https://box.invalid/agent.v1.ControlService/Exec",
@@ -676,6 +765,9 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
   spoolRead?: (call: number) => void;
   pendingRead?: (call: number) => void;
   proofRead?: (call: number) => void;
+  pendingArguments?: unknown; // OCV5-509: the arguments the CLI called the tool with (default: the model's)
+  /** OCV5-488: what the read-only liveness probe finds of the run on the Box (default: alive). */
+  liveness?: { state: string; boot: string };
   capacityWaitMs?: number;
   signal?: AbortSignal;
   /** The durable journal on real Postgres instead of the in-memory one. */
@@ -689,7 +781,8 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
   const emitted: string[] = [];
   /** What each handoff recorded in the journal (the claim the next round is built from). */
   const handoffs: unknown[] = [];
-  const count = { admit: 0, launch: 0, spoolRead: 0, pendingRead: 0, proofRead: 0, stop: 0 };
+  const count = { admit: 0, launch: 0, spoolRead: 0, pendingRead: 0, proofRead: 0, stop: 0, look: 0 };
+  // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   let nonce = "", epoch = "", controlHash = "", disposed = false;
   const epochs = new Map<string, string>();
   const stopped = new Set<string>();
@@ -729,13 +822,17 @@ function boxHost(api: Api, initialSpool: Buffer, faults: {
     if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("pending.")) {
       faults.pendingRead?.(++count.pendingRead);
       return reply(JSON.stringify({ version: 1, modelToolUseId: args[4], mcpRequestId: 7,
-        name: "Bash", arguments: { value: "x" } }));
+        name: "Bash", arguments: faults.pendingArguments ?? { value: "x" } }));
     }
     if (args.length === 5 && /^[a-f0-9]{24}$/.test(args[3] ?? "") && /^[a-f0-9]{32}$/.test(args[4] ?? "")) {
       // the keeper is asked to stop: a CLI still waiting for tool results stops, one that already exited does not
       count.stop++;
       if (faults.real?.proofReason === undefined && !faults.real?.stopIgnored) stopped.add(args[3]!);
       return reply("stop-requested\n");
+    }
+    if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("/proc/sys/kernel/random/boot_id")) {
+      count.look++;
+      return reply(`${faults.liveness?.state ?? "alive"} ${faults.liveness?.boot ?? PROOF_BOOT}\n`);
     }
     if (args[0] === "-I" && args[1] === "-c" && args[2]?.includes("terminal.json")) {
       faults.proofRead?.(++count.proofRead);
@@ -923,6 +1020,7 @@ function boxTextHost(api: Api, capacityWaitMs: number) {
     messages: [{ role: "user", content: "synthetic text only" }] };
   const output = spoolOf(TEXT_ANSWER).toString("utf8");
   const calls: string[] = [];
+  // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   let proofDir = "", leaseEpoch = "";
   const run = async (request: ExecRequest, options: { onStdout?: (chunk: string) => void }): Promise<ExecReply> => {
     const args = request.args;
@@ -1067,6 +1165,7 @@ async function proveCliRejectedCall(api: Api): Promise<string> {
   }
   // the production window is 45s, with backoff, and returns the first rejection unchanged
   if (api.capacityWaitMs !== 45_000) fail("CAPACITY_WINDOW_NOT_45S");
+  // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   let clock = 0, attempts = 0;
   const first = slotHeld();
   const lasted = await api.waitCapacity(() => { attempts++; throw attempts === 1 ? first : slotHeld(); },
@@ -1284,13 +1383,21 @@ async function withJournalDatabase<T>(config: unknown, run: (db: Db) => Promise<
       const sql = statement.replace(/^\s*--.*$/gm, "").trim();
       if (sql) await client.query(sql);
     }
+    // ids of the settled rows, as the billing recovery integ test numbers them (OCV5-488)
+    for (const table of ["usage", "ledger"]) await client.query(`CREATE TEMP SEQUENCE box_recovery_${table}_id_seq`);
+    await client.query("ALTER TABLE pg_temp.usage_records ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_recovery_usage_id_seq'::regclass)");
+    await client.query("ALTER TABLE pg_temp.credit_ledger ALTER COLUMN id SET DEFAULT nextval('pg_temp.box_recovery_ledger_id_seq'::regclass)");
     await client.query(`CREATE TEMP TABLE turn_dispatches (dispatch_id uuid PRIMARY KEY,
       user_id bigint NOT NULL, status text NOT NULL)`);
+    // OCV5-488: the cleanup worker asks whether a row's container is still the user's active one
+    await client.query(`CREATE TEMP TABLE agent_containers (id bigint PRIMARY KEY,
+      user_id bigint NOT NULL, state text NOT NULL)`);
     const shadow = await client.query(`SELECT n.nspname AS schema FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE c.oid = ANY (ARRAY[to_regclass('request_finalize_journal'), to_regclass('usage_records'),
-        to_regclass('users'), to_regclass('credit_ledger'), to_regclass('turn_dispatches')])`);
-    if (shadow.rows.length !== 5 || shadow.rows.some((row: { schema: string }) => !/^pg_temp(?:_\d+)?$/.test(row.schema))) {
+        to_regclass('users'), to_regclass('credit_ledger'), to_regclass('turn_dispatches'),
+        to_regclass('agent_containers')])`);
+    if (shadow.rows.length !== 6 || shadow.rows.some((row: { schema: string }) => !/^pg_temp(?:_\d+)?$/.test(row.schema))) {
       fail("JOURNAL_TABLES_NOT_SESSION_LOCAL");
     }
     return await run(client as Db);
@@ -1310,8 +1417,12 @@ async function prechecked(api: Api, db: Db, row: { requestId: string; uid: bigin
     boxInvocationRecovery: "v1", billingPricing: JOURNAL_PRICING,
     boxBillingContext: api.billingContext({ sessionId: row.sessionId, turnKey: row.turnKey,
       ...(row.dispatchId ? { dispatchId: row.dispatchId, attemptNo: 1 } : {}) }) })]);
+  // the request came from this container, so it is the user's active one
+  await db.query(`INSERT INTO agent_containers(id,user_id,state) VALUES ($1,$2,'active')
+    ON CONFLICT (id) DO NOTHING`, [row.containerId.toString(), row.uid.toString()]);
 }
 const journalRow = async (db: Db, requestId: string) => (await db.query(
+  // biome-ignore lint/style/noUnusedTemplateLiteral: moved verbatim from the commercial copy of this file (OCV5-488)
   `SELECT state,failure_code,final_credits::text AS credits,ctx FROM request_finalize_journal WHERE request_id=$1`,
   [requestId])).rows[0] as { state: string; failure_code: string | null; credits: string | null;
     ctx: Record<string, unknown> } | undefined;
@@ -1558,11 +1669,14 @@ function boxTurn(api: Api, db: Db, journal: Journal, who: { uid: bigint; contain
     /** The CLI stays alive waiting: no terminal proof exists until its keeper is told to stop. */
     parked?: "until-stopped" | "unreadable";
     /** The Box account cannot be reached for a continuation publish. */
-    unreachable?: { active: boolean } } = {}) {
+    unreachable?: { active: boolean };
+    /** OCV5-488: what a liveness look finds of this run on the Box. */
+    liveness?: { state: string; boot: string } } = {}) {
   const cut = { active: false };
-  const { parked, unreachable, ...hostOptions } = options;
+  const { parked, unreachable, liveness, ...hostOptions } = options;
   const host: ReturnType<typeof boxHost> = boxHost(api, spoolOf([cliInit, ...BRIDGE_CALL]), {
     ...(parked ? { proofRead: () => { if (parked === "unreadable" || host.count.stop === 0) throw api.transportError("BOX_EXEC_REMOTE_EXIT"); } } : {}),
+    ...(liveness ? { liveness } : {}),
     // the exec stream of a continuation is cut in a way a re-read cannot repair
     spoolRead: () => { if (cut.active) throw api.transportError("BOX_EXEC_HTTP_500"); },
     real: { journal, ...who, accountId: who.containerId, requestId: `${name}-1`, turnKey, ...hostOptions } });
@@ -1646,10 +1760,12 @@ async function proveReplayPendingAfterCut(api: Api, db: Db): Promise<string> {
     if ((await journalRow(db, "box-cut-2"))?.ctx.boxState !== "terminal") fail("REPLAY_LEAF_NOT_SETTLED");
     // production waits 240s in 3s steps, inside CCB's 300s fallback timeout, and the handler uses it
     const wait = /pendingWait: \{ budgetMs: ([0-9_]+), intervalMs: ([0-9_]+) \}/.exec(api.egressSource);
+    // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
     const budgetMs = Number(wait?.[1]?.replaceAll("_", "")), intervalMs = Number(wait?.[2]?.replaceAll("_", ""));
     if (!(budgetMs >= 120_000 && budgetMs < 300_000 && intervalMs >= 1000 && intervalMs <= 10_000)) fail("REPLAY_PRODUCTION_WAIT");
     if (!/replay\.kind === "pending" && pendingWait\)[\s\S]{0,400}waitForBoxReplay\(replay, lookupReplay,\s*\{ \.\.\.pendingWait/
       .test(api.proxySource)) fail("REPLAY_HANDLER_NOT_WAITING");
+    // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
     let clock = 0, polls = 0;
     const still = await api.waitReplay({ kind: "pending" }, async () => { polls++; return { kind: "pending" }; },
       { budgetMs, intervalMs, signal: new AbortController().signal, now: () => clock,
@@ -1677,6 +1793,7 @@ async function proveReplayPendingAfterCut(api: Api, db: Db): Promise<string> {
     const sweeper = api.cleanupWorker({ journal, writeRecoveryMessage: store.write,
       resolver: { resolve: async () => unseen.host.target } });
     const swept = await sweeper.reconcileStoppedFailures();
+    // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
     const leaf = await journalRow(db, "box-unseen-2"), parent = await journalRow(db, "box-unseen-1");
     if (swept.recovered !== 1 || leaf?.state !== "aborted" || leaf.credits !== "0"
       || leaf.ctx.boxState !== "failed_stopped" || leaf.ctx.boxStopOutcome !== "rejected_stream"
@@ -1741,6 +1858,7 @@ async function proveRecoveredToolExchange(api: Api, db: Db): Promise<string> {
   if (turn.host.count.stop !== 1 || turn.host.count.launch !== 2) {
     fail(`RECOVERED_EXCHANGE_STOP_${turn.host.count.stop}_LAUNCH_${turn.host.count.launch}`);
   }
+  // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   const orphan = await journalRow(db, "box-rec-1"), fresh = await journalRow(db, "box-rec-2");
   if (orphan?.ctx.boxState !== "failed_stopped" || orphan.ctx.boxRecoveredBy !== "box-rec-2"
     || (orphan.ctx.boxTerminalProof as { reason?: string } | undefined)?.reason !== "keeper_stopped") {
@@ -1810,11 +1928,14 @@ async function proveRecoveredToolExchange(api: Api, db: Db): Promise<string> {
  * user container has for reaching them. The gateway code under test calls
  * them with its own clients. */
 async function egressInternalRoutes(api: Api, journal: Journal, who: { uid: bigint; containerId: bigint },
-  target: unknown, readCapsule?: unknown) {
+  target: unknown, readCapsule?: unknown, holds?: unknown) {
   const identity = { resolve: async () => ({ uid: who.uid, containerId: who.containerId, apiKey: null }) };
+  // OCV5-488: production also stops a parked leaf from the idle route; the proofs of the
+  // adapter's own stop leave it off so each proves its mechanism alone.
   const routes: Record<string, RouteHandler> = {
     "/internal/box/stop": api.stopHandler({ identity, journal, coordinator: api.stopCoordinator(journal, target) }),
-    "/internal/box/idle-proof": api.idleProofHandler({ identity, journal, ...(readCapsule ? { readCapsule } : {}) }) };
+    "/internal/box/idle-proof": api.idleProofHandler({ identity, journal, ...(readCapsule ? { readCapsule } : {}),
+      ...(holds ? { stopParked: { journal: holds, coordinator: api.stopCoordinator(journal, target) } } : {}) }) };
   const calls: string[] = [];
   let idle: Promise<void> = Promise.resolve();
   const server = createServer((req, res) => {
@@ -1957,6 +2078,58 @@ async function proveRejectBlocksNextMessage(api: Api, db: Db): Promise<string> {
   return "[ocv5-315-reject-blocks-next-message] PASS — a rejected continuation stops the parked Box turn and the next message passes submit";
 }
 
+// INC-20261017-CONFIG-CHANGE-PINS-BOX-SESSION, live #49fab402 (commercial uid 4):
+// a catalog change bumped the global model security epoch mid-turn. The next
+// continuation never reached Box: egress' authority gate answered it 409
+// MODEL_CONFIG_CHANGED_RETRY_TURN. Claude Code ended the turn, the handed-off
+// Box CLI stayed parked, and every next message of the session was refused
+// ("消息未开始处理") until the 4 h deadline. That reject must stop it as well.
+async function proveConfigChangedBlocksNextMessage(api: Api, db: Db): Promise<string> {
+  const journal = api.journal(db);
+  const who = { uid: 900_000_486n, containerId: 486n, sessionId: "session-config-changed" };
+  const turnKey = "4860".repeat(16);
+  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'config-changed@test.invalid','unused',10000)",
+    [who.uid.toString()]);
+  const turn = boxTurn(api, db, journal, who, "box-cfg", turnKey);
+  await turn.first();
+  // the gate's own reject, serialized the way /v1/messages answers it
+  const reject = api.gateReject("config_changed", "epoch drift (bridge): token=225 snapshot=226");
+  let wire = "";
+  api.jsonError({ headersSent: false, writeHead: () => {}, setHeader: () => {}, end: (body: string) => { wire = body; } },
+    reject.status, reject.code, reject.clientMessage, "49fab4020000000000000000000000ff");
+  if (reject.status !== 409 || !wire.includes("MODEL_CONFIG_CHANGED_RETRY_TURN")) fail(`CONFIG_WIRE_${reject.status}`);
+  const routes = await egressInternalRoutes(api, journal, who, turn.host.target);
+  const dir = api.home;
+  const counters = { submits: 0, shutdowns: 0 };
+  const session = gatewaySession(api, "config-changed-session", counters);
+  api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: session.sessionKey, sessionId: who.sessionId, turnKey });
+  try {
+    if ((await api.fetchIdleProof({ sessionId: who.sessionId, turnKey })).status !== "pending") fail("CONFIG_NOT_PARKED");
+    if (await submitMessage(api, session) !== "IDLE_HISTORY_PENDING") fail("CONFIG_PARKED_TURN_DID_NOT_BLOCK");
+    const runner = Object.assign(new EventEmitter(), { model: MODEL, sessionId: who.sessionId,
+      setConsultTurn: () => {}, submit: async () => {}, interrupt: () => true });
+    const adapter = api.ccbAdapter(runner);
+    const ccbTurn = adapter.submitTurn({ input: "continue", turnKey, onEvent: () => {},
+      sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map() });
+    await ccbTurn.submitted;
+    runner.emit("message", { type: "result", subtype: "success", is_error: true, result: `API Error: 409 ${wire}` });
+    if ((await ccbTurn.summary)?.isError !== true) fail("CONFIG_TURN_NOT_ENDED");
+    await routes.settled();
+    if (routes.calls.filter((path) => path === "/internal/box/stop").length !== 1) {
+      fail(`CONFIG_PARKED_TURN_NOT_STOPPED_${routes.calls.join(",")}`);
+    }
+    const parked = await journalRow(db, "box-cfg-1");
+    if (parked?.ctx.boxState !== "failed_stopped" || turn.host.count.stop !== 1) fail(`CONFIG_ROW_${String(parked?.ctx.boxState)}`);
+    const idle = await api.fetchIdleProof({ sessionId: who.sessionId, turnKey });
+    if (idle.status !== "failed") fail(`CONFIG_IDLE_${idle.status}`);
+    if (await submitMessage(api, session) !== "admitted") fail("CONFIG_NEXT_MESSAGE_STILL_BLOCKED");
+    if (api.idle.readIdleCandidate(dir, session.sessionKey) !== undefined || counters.submits !== 0) fail("CONFIG_CANDIDATE_KEPT");
+  } finally {
+    await routes.close();
+  }
+  return "[ocv5-486-config-change-pins-box-session] PASS — a config-changed continuation reject stops the parked Box turn and the next message passes submit";
+}
+
 // INC-20261003-BOX-IDLE-NO-SUMMARY-STRANDS-SESSION: a session's idle compaction
 // was dispatched; CCB's compact fallback request carried `temperature: 1`,
 // egress refused it (BOX_PARAMETER_UNMAPPED) and CCB ended the idle turn
@@ -2037,6 +2210,7 @@ async function proveIdleNoSummary(api: Api, db: Db): Promise<string> {
       fail(`IDLE_STRANDED_OP_${String(released?.disposition)}`);
     }
     // the incident's own shape: after the slot switch egress knows neither the source nor the idle turn
+    // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
     const lost = "idle-lost-source", lostSource = "2".repeat(64);
     const lostTurn = createHash("sha256").update(`${lost}:${revision}`).digest("hex");
     api.idle.startIdleOp({ dir, sessionKey: lost, sourceSessionId: who.sessionId, sourceTurnKey: lostSource,
@@ -2140,6 +2314,7 @@ async function withSessionsBackend<T>(api: Api, config: unknown,
 // continuation itself, with a short budget, and only when nothing is open.
 async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<string[]> {
   return withSessionsBackend(api, database, async (backend, db) => {
+    // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
     const uid = 9n, sessionUser = "c:9";
     const settled = [
       { blockId: "toolu_317_bash", toolName: "Bash", inputJson: { command: "git status --short" }, output: "M a.ts", completed: true },
@@ -2151,6 +2326,7 @@ async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<
       recoveryAttempt?: number; text?: string; runtimeEvents?: unknown[]; outputTokens?: number;
       /** Frames still in the live stream of this message when the tape is finalized. */
       liveFrames?: unknown[][] }) => {
+      // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
       const sessionId = `s-ocv5-317-${name}`, clientMessageId = `cm-ocv5-317-${name}`;
       const turnKey = createHash("sha256").update(`ocv5-317:${name}:${++turns}`).digest("hex");
       const admitted = await backend.admitUserTurn({ uid, sessionUserId: sessionUser, sessionId, clientMessageId,
@@ -2163,6 +2339,7 @@ async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<
       if (admitted.kind !== "admitted") fail(`SETTLED_${name}_NOT_ADMITTED`);
       const hash = (bytes: Buffer | string) => createHash("sha256").update(bytes).digest("hex");
       if (shape.liveFrames) {
+        // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
         const sessionKey = `agent:main:webchat:dm:${sessionId}`, streamKey = `legacy:621:${sessionKey}`;
         await db.query(`INSERT INTO client_session_live_streams
           (stream_key,session_id,user_id,client_message_id,source,projection_source,terminal_status)
@@ -2247,6 +2424,7 @@ async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<
       recoveryAttempt: attempt, outputTokens: 0, text: 'API Error: 409 {"error":{"code":"BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION"}}',
       runtimeEvents: [{ ordinal: 1, observedAt: 1_783_950_170_100, source: "ccb",
         payload: { type: "result", is_error: true, num_turns: 1 } }] });
+    // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
     const retried = await empty(2), stopped = await empty(3);
     if (!isDeepStrictEqual(retried.jobs.map((job) => job.split("#")[1]), ["3"]) || stopped.jobs.length !== 0) {
       fail(`ANSWERED_EMPTY_RECOVERY_BUDGET_${retried.jobs.join(",")}_${stopped.jobs.join(",")}`);
@@ -2255,6 +2433,17 @@ async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<
       "[ocv5-321-leftover-tool-frames] PASS — settled tools whose live frames are still present pair by id and the checkpoint continuation is scheduled"];
   });
 }
+
+// [ocv5-509-refused-recovery-closed] PASS — a recovery paused before it ran ends its turn with a visible card once nothing will run it on, and an answered chain is left alone
+async function proveRefusedRecoveryClosed(api: Api, database: unknown): Promise<string> {
+  return withSessionsBackend(api, database, (backend, db) => refusedRecoveryProof({ backend, db,
+    close: (pool) => api.closeRefusedRecoveryChains(pool), model: MODEL, takeover: true }));
+}
+
+// [ocv5-337-foreign-tool-history] PASS — tool history from another model is admitted and staged under paired Box tool ids
+// [ocv5-509-cli-repaired-tool-input] PASS — a tool call the CLI records and runs unicode-repaired hands off the model's own input, and any other difference is still refused
+const proveCliRepaired = (api: Api) => proveCliRepairedToolInput({ boxHost: (spool, faults) => boxHost(api, spool, faults),
+  spoolOf, cliInit, start, event, stop, BOX_BASH, CLI_MODEL, must, codeOf });
 
 /** A Box for the resident CLI lane: an exec endpoint that really runs what the bridge sends (the product's
  * launch, write and stop scripts) around a stand-in for the Claude binary. `refuse.writes` makes the Box
@@ -2357,6 +2546,7 @@ function boxCliBridge(api: Api, box: Awaited<ReturnType<typeof boxCliBox>>, tag:
   const stdin = new PassThrough();
   const stdout = new PassThrough();
   const stderr = new PassThrough();
+  // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   let out = "", err = "";
   stdout.on("data", (chunk: Buffer) => { out += chunk.toString("utf8"); });
   stderr.on("data", (chunk: Buffer) => { err += chunk.toString("utf8"); });
@@ -2928,6 +3118,7 @@ async function proveWaitingHandoffSuperseded(api: Api, db: Db): Promise<string> 
   if (turn.host.count.stop !== 1 || turn.host.count.launch !== 2) {
     fail(`SUPERSEDED_STOP_${turn.host.count.stop}_LAUNCH_${turn.host.count.launch}`);
   }
+  // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   const waiting = await journalRow(db, "box-sup-1"), fresh = await journalRow(db, "box-sup-2");
   if (waiting?.ctx.boxState !== "failed_stopped" || waiting.ctx.boxRecoveredBy !== "box-sup-2") {
     fail(`SUPERSEDED_WAITING_${String(waiting?.ctx.boxState)}_${String(waiting?.ctx.boxRecoveredBy)}`);
@@ -2957,8 +3148,9 @@ async function proveWaitingHandoffSuperseded(api: Api, db: Db): Promise<string> 
 }
 
 /** The cleanup worker egress runs, on the real journal, reaching each run's own Box account. */
-function boxCleanupWorker(api: Api, journal: Journal, turns: ReadonlyArray<ReturnType<typeof boxTurn>>) {
-  return api.cleanupWorker({ journal, staleResumeProofWaitMs: 300,
+function boxCleanupWorker(api: Api, journal: Journal, turns: ReadonlyArray<ReturnType<typeof boxTurn>>,
+  holds?: unknown) {
+  return api.cleanupWorker({ journal, staleResumeProofWaitMs: 300, ...(holds ? { holds } : {}),
     resolver: { resolve: async (args: { requiredAccountId: bigint }) => {
       const turn = turns.find((item) => item.host.target.accountId === args.requiredAccountId);
       if (!turn) throw Object.assign(new Error("BOX_ACCOUNT_UNAVAILABLE"), { code: "BOX_ACCOUNT_UNAVAILABLE" });
@@ -3098,6 +3290,272 @@ async function proveUnknownNeverClosed(api: Api, db: Db): Promise<string> {
   return "[ocv5-313-unknown-never-closed] PASS — the 2.1.288 image echo continues and an abandoned unknown run is stopped or expired so its session continues";
 }
 
+const PROOF_BOOT = "6c1e2f3a-4b5c-4d6e-8f70-8192a3b4c5d6";
+/** The worker probes a row at most every 2 minutes; make the next probe due now. */
+const rearm = (db: Db, requestId: string) => db.query(
+  "UPDATE request_finalize_journal SET ctx=ctx - 'boxStopProbeAfterMs' WHERE request_id=$1", [requestId]);
+/** The first look that found the run gone was taken this much earlier. */
+const lookedEarlier = (db: Db, requestId: string, ms: number) => db.query(
+  `UPDATE request_finalize_journal SET ctx=jsonb_set(ctx,'{boxRunAbsent,atMs}',
+     to_jsonb((ctx->'boxRunAbsent'->>'atMs')::bigint - $2::bigint)) WHERE request_id=$1`, [requestId, ms]);
+
+/** INC-20261017-BOX-HELD-NO-PROCESS, commercial account 79 (10-17 07:10-08:28Z): three handoff leaves of uid 4
+ * held the account after their CLIs were gone from the Box. No terminal proof could be read
+ * (BOX_EXEC_REMOTE_EXIT), the leaves were neither stale resumes nor 4 h 15 min old, so every probe logged
+ * box_stop_probe_pending until an operator closed them by hand. The cleanup worker now looks at the Box:
+ * nothing of the run on two looks a minute apart, or across a reboot, closes it as an expired run is closed,
+ * money untouched. A leaf whose completed calls are not settled yet is not closed, and the alert's own
+ * query reports it. */
+async function proveProcessAbsentReleased(api: Api, db: Db): Promise<string> {
+  const journal = api.journal(db);
+  const turnKey = "e".repeat(64);
+  const park = async (uid: bigint, label: string) => {
+    const who = { uid, containerId: uid - 900_000_000n, sessionId: `session-${label}` };
+    await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,$2,'unused',10000)",
+      [uid.toString(), `${label}@test.invalid`]);
+    const look = { state: "alive", boot: PROOF_BOOT };
+    const turn = boxTurn(api, db, journal, who, `box-${label}`, turnKey, undefined,
+      { parked: "unreadable", liveness: look });
+    await turn.first();
+    const requestId = `box-${label}-1`;
+    if ((await journalRow(db, requestId))?.ctx.boxState !== "handoff") fail(`ABSENT_${label}_FIXTURE`);
+    // past the launch grace and the live finalizer's grace; nowhere near the 4 h 15 min ceiling
+    await aged(db, requestId, "10 minutes", true);
+    return { who, turn, look, requestId };
+  };
+  const gone = await park(900_000_488n, "gone");
+  const rebooted = await park(900_000_489n, "rebooted");
+  // the product's own billing recovery settles the calls these rounds completed (10-17: 1943 credits)
+  const billed = new Map<string, Awaited<ReturnType<typeof journalRow>>>();
+  for (const run of [gone, rebooted]) {
+    const outcome = await api.settleBoxBilling(db, run.requestId, run.who.uid);
+    if (outcome !== "settled") fail(`ABSENT_${run.requestId}_SETTLE_${outcome}`);
+    const row = await journalRow(db, run.requestId);
+    if (row?.state !== "committed" || row.ctx.boxState !== "handoff") {
+      fail(`ABSENT_${run.requestId}_NOT_SETTLED_${String(row?.state)}`);
+    }
+    billed.set(run.requestId, row);
+  }
+  // this one's completed calls are not settled yet: closing it would hide them from the billing scan
+  const unsettled = await park(900_000_490n, "unsettled");
+  if ((await journalRow(db, unsettled.requestId))?.state !== "inflight") fail("ABSENT_UNSETTLED_FIXTURE");
+  const runs = [gone, rebooted, unsettled];
+  const moneyBefore = await Promise.all([gone, rebooted].map((run) => money(db, run.who.uid)));
+  const worker = boxCleanupWorker(api, journal, runs.map((run) => run.turn), api.holds(db));
+  const round = async () => {
+    for (const run of runs) await rearm(db, run.requestId);
+    await worker.reconcileStoppedFailures(50);
+  };
+  const state = async (requestId: string) => (await journalRow(db, requestId))?.ctx;
+  // the CLIs are alive and waiting: nothing is recorded or closed
+  await round();
+  for (const run of runs) {
+    const ctx = await state(run.requestId);
+    if (ctx?.boxState !== "handoff" || ctx.boxRunAbsent !== undefined || run.turn.host.count.look !== 1) {
+      fail(`ABSENT_ALIVE_${run.requestId}_${String(ctx?.boxState)}_${run.turn.host.count.look}`);
+    }
+  }
+  // the CLIs are gone: a first look only records
+  for (const run of runs) run.look.state = "absent";
+  await round();
+  for (const run of runs) {
+    const ctx = await state(run.requestId);
+    if (ctx?.boxState !== "handoff" || ctx.boxRunAbsent === undefined) fail(`ABSENT_FIRST_LOOK_${run.requestId}`);
+  }
+  // within the minute the same boot confirms nothing; a reboot of the Box confirms at once
+  rebooted.look.boot = "6c1e2f3a-4b5c-4d6e-8f70-000000000488";
+  await round();
+  if ((await state(gone.requestId))?.boxState !== "handoff") fail("ABSENT_CLOSED_WITHIN_A_MINUTE");
+  // a minute later the same boot confirms too
+  await lookedEarlier(db, gone.requestId, 61_000);
+  await lookedEarlier(db, unsettled.requestId, 61_000);
+  await round();
+  for (const run of [gone, rebooted]) {
+    const row = await journalRow(db, run.requestId);
+    const close = row?.ctx.boxExpiredClose as { cause?: string; priorBoxState?: string } | undefined;
+    const before = billed.get(run.requestId);
+    if (row?.ctx.boxState !== "expired_unproven" || close?.cause !== "box_process_absent"
+      || close.priorBoxState !== "handoff" || row.state !== before?.state || row.credits !== before?.credits
+      || run.turn.host.count.stop !== 0) {
+      fail(`ABSENT_NOT_RELEASED_${run.requestId}_${String(row?.ctx.boxState)}_${String(close?.cause)}_${row?.state}_${row?.credits}`);
+    }
+  }
+  // closing changed no money: same usage, ledger and wallets as right after settlement
+  const moneyAfter = await Promise.all([gone, rebooted].map((run) => money(db, run.who.uid)));
+  if (!isDeepStrictEqual(moneyBefore, moneyAfter)) fail(`ABSENT_MONEY_${JSON.stringify([moneyBefore, moneyAfter])}`);
+  for (const run of [gone, rebooted]) {
+    await sessionReleased(api, db, journal, run.who, turnKey, `ABSENT_${run.requestId.toUpperCase().replaceAll("-", "_")}`);
+  }
+  // unsettled: still held, and ten minutes on the alert's own query names it
+  if ((await state(unsettled.requestId))?.boxState !== "handoff") fail("ABSENT_UNSETTLED_CLOSED");
+  await lookedEarlier(db, unsettled.requestId, 10 * 60_000);
+  const stuck = api.boxHoldStuck.rows((await db.query(api.boxHoldStuck.sql)).rows);
+  const named = stuck.find((row) => row.requestId === unsettled.requestId);
+  if (!named?.absent || stuck.some((row) => row.requestId === gone.requestId || row.requestId === rebooted.requestId)) {
+    fail(`ABSENT_ALERT_${stuck.map((row) => row.requestId).join(",")}`);
+  }
+  return "[ocv5-488-process-absent-released] PASS — a parked run whose processes are gone from the Box is released on two looks without its age or any money change, and an unsettled one is held and alerted";
+}
+
+/** INC-20261017-BOX-HELD-NO-PROCESS, the session side: the turn had ended in uid 4's container while its Box
+ * CLI stayed parked on the handoff, and each next message read that turn's idle proof as pending and was
+ * refused. A container reads a turn's idle proof only once that turn ended on its side, so egress stops the
+ * parked leaf on that read the way a browser Stop does, whatever ended the turn (here nothing the adapter
+ * knows: no /internal/box/stop is ever sent). */
+async function proveIdleProofStopsParkedTurn(api: Api, db: Db): Promise<string> {
+  if (!api.egressSource.includes("stopParked: { journal: new BoxHoldRelease(getPool()), coordinator: boxStopCoordinator }")) {
+    fail("IDLE_STOP_NOT_WIRED_IN_EGRESS");
+  }
+  const journal = api.journal(db);
+  const who = { uid: 900_000_491n, containerId: 491n, sessionId: "session-idle-stop" };
+  const turnKey = "4910".repeat(16);
+  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'idle-stop@test.invalid','unused',10000)",
+    [who.uid.toString()]);
+  const turn = boxTurn(api, db, journal, who, "box-idlestop", turnKey);
+  await turn.first();
+  const routes = await egressInternalRoutes(api, journal, who, turn.host.target, undefined, api.holds(db));
+  const dir = api.home;
+  const counters = { submits: 0, shutdowns: 0 };
+  const session = gatewaySession(api, "idle-stop-session", counters);
+  api.idle.writeIdleCandidate(dir, { v: 1, sessionKey: session.sessionKey, sessionId: who.sessionId, turnKey });
+  try {
+    // the first message reads the pending proof; egress starts the stop on that read
+    const first = await submitMessage(api, session);
+    let leaf = await journalRow(db, "box-idlestop-1");
+    for (let i = 0; i < 400 && leaf?.ctx.boxState !== "failed_stopped"; i++) {
+      await tick(25);
+      leaf = await journalRow(db, "box-idlestop-1");
+    }
+    await routes.settled();
+    if (routes.calls.includes("/internal/box/stop") || turn.host.count.stop !== 1
+      || leaf?.ctx.boxState !== "failed_stopped") {
+      fail(`IDLE_STOP_${first}_${turn.host.count.stop}_${String(leaf?.ctx.boxState)}_${routes.calls.join(",")}`);
+    }
+    const idle = await api.fetchIdleProof({ sessionId: who.sessionId, turnKey });
+    if (idle.status !== "failed") fail(`IDLE_STOP_IDLE_${idle.status}`);
+    if (await submitMessage(api, session) !== "admitted") fail("IDLE_STOP_NEXT_MESSAGE_STILL_BLOCKED");
+  } finally {
+    await routes.close();
+  }
+  return "[ocv5-488-idle-proof-stops-parked-turn] PASS — a turn the container has ended stops its parked Box leaf on the next idle read and the next message passes";
+}
+
+/** INC-20261017-BOX-HELD-NO-PROCESS, the container side (commercial uid 4, 10-17): the deploy at 07:53 rebuilt
+ * oc-v5-u4 while its turns' Box CLIs were parked on tool handoffs. Nothing could answer them any more, nothing
+ * stopped them, and the user's next messages from the new container waited out the held session.
+ * OCV5-488 deviation (user-approved 10-17): the plan's gateway keepalive lease is replaced by a server-side
+ * check. A user has at most one active container; a handoff leaf whose turn ran in any other one is
+ * abandoned. A keepalive would only cover containers already running a new runtime, and a rebuilt container
+ * is exactly the one that never sends it. A leaf in the active container is never stopped by this, however
+ * long its tools run. */
+async function proveContainerRebuiltStopsParkedTurn(api: Api, db: Db): Promise<string> {
+  const journal = api.journal(db);
+  const who = { uid: 900_000_492n, containerId: 492n, sessionId: "session-rebuilt" };
+  const turnKey = "4920".repeat(16);
+  await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,'rebuilt@test.invalid','unused',10000)",
+    [who.uid.toString()]);
+  const turn = boxTurn(api, db, journal, who, "box-rebuilt", turnKey, undefined, { parked: "until-stopped" });
+  await turn.first();
+  const leafId = "box-rebuilt-1";
+  // the tools have been running for ten minutes: long, but legitimate while the container lives
+  await aged(db, leafId, "10 minutes");
+  const worker = boxCleanupWorker(api, journal, [turn], api.holds(db));
+  await rearm(db, leafId);
+  await worker.reconcileStoppedFailures(50);
+  if (turn.host.count.stop !== 0 || (await journalRow(db, leafId))?.ctx.boxState !== "handoff") {
+    fail(`REBUILT_LIVE_CONTAINER_STOPPED_${turn.host.count.stop}`);
+  }
+  // the deploy rebuilds the container: the old one vanishes, a new one is the user's active container
+  const rebuilt = { ...who, containerId: 493n };
+  await db.query("UPDATE agent_containers SET state='vanished' WHERE id=$1", [who.containerId.toString()]);
+  await db.query("INSERT INTO agent_containers(id,user_id,state) VALUES ($1,$2,'active')",
+    [rebuilt.containerId.toString(), who.uid.toString()]);
+  const nextFrom = async (requestId: string) => {
+    await prechecked(api, db, { ...rebuilt, requestId, turnKey: "d".repeat(64) });
+    return boxHost(api, spoolOf([cliInit, ...FINAL_ANSWER]), { capacityWaitMs: 500,
+      real: { journal, ...rebuilt, accountId: who.containerId, requestId, turnKey: "d".repeat(64) } });
+  };
+  // as on 10-17: the new container's next message finds the session still held by the parked run
+  const blocked = await codeOf(async () => (await nextFrom("rebuilt-before")).round());
+  if (blocked !== "BOX_CAPACITY_HELD") fail(`REBUILT_NOT_HELD_${blocked}`);
+  await rearm(db, leafId);
+  await worker.reconcileStoppedFailures(50);
+  const leaf = await journalRow(db, leafId);
+  if (turn.host.count.stop !== 1 || leaf?.ctx.boxState !== "failed_stopped"
+    || leaf.ctx.boxAbandonedHandoffStop === undefined) {
+    fail(`REBUILT_NOT_STOPPED_${turn.host.count.stop}_${String(leaf?.ctx.boxState)}`);
+  }
+  const idle = await journal.readIdleProof({ ...who, turnKey });
+  if (idle.status !== "failed") fail(`REBUILT_IDLE_${idle.status}`);
+  const next = await nextFrom("rebuilt-after");
+  if ((await must("REBUILT_NEXT_MESSAGE", next.round())).kind !== "final" || !next.sse().includes("done")) {
+    fail("REBUILT_NEXT_MESSAGE_NO_ANSWER");
+  }
+  return "[ocv5-488-container-rebuilt-stops-parked-turn] PASS — a handoff whose container was rebuilt is stopped and the new container's next message runs, while one in the active container is left alone";
+}
+
+/** INC-20261017-BOX-HELD-NO-PROCESS, the turn side. OCV5-315 and OCV5-486 each added one exact reject to the
+ * adapter's stop (409 BOX_* "continuation rejected", then the authority gate's config_changed), and the next
+ * unlisted refusal would pin a session again. OCV5-488 deviation (user-approved 10-17): any refusal egress
+ * answers before the request reaches Box stops the parked turn (a 4xx in egress' error shape, except 408, 429
+ * and BOX_REPLAY_PENDING). A 5xx or timeout does not: the run may still finish, and the cleanup worker's
+ * success recovery then delivers its answer, which a stop would throw away. */
+async function proveAnyRefusalStopsParkedTurn(api: Api, db: Db): Promise<string[]> {
+  const journal = api.journal(db);
+  const endTurn = async (uid: bigint, label: string, status: number, code: string, message: string) => {
+    const who = { uid, containerId: uid - 900_000_000n, sessionId: `session-${label}` };
+    const turnKey = createHash("sha256").update(label).digest("hex");
+    await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,$2,'unused',10000)",
+      [uid.toString(), `${label}@test.invalid`]);
+    const turn = boxTurn(api, db, journal, who, `box-${label}`, turnKey);
+    await turn.first();
+    // egress' own answer, serialized the way /v1/messages sends it
+    let wire = "";
+    api.jsonError({ headersSent: false, writeHead: () => {}, setHeader: () => {}, end: (body: string) => { wire = body; } },
+      status, code, message, "4880000000000000000000000000000a");
+    const routes = await egressInternalRoutes(api, journal, who, turn.host.target);
+    try {
+      const runner = Object.assign(new EventEmitter(), { model: MODEL, sessionId: who.sessionId,
+        setConsultTurn: () => {}, submit: async () => {}, interrupt: () => true });
+      const ccbTurn = api.ccbAdapter(runner).submitTurn({ input: "continue", turnKey, onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 }, toolUseIdToName: new Map() });
+      await ccbTurn.submitted;
+      runner.emit("message", { type: "result", subtype: "success", is_error: true, result: `API Error: ${status} ${wire}` });
+      if ((await ccbTurn.summary)?.isError !== true) fail(`REFUSAL_${label}_TURN_NOT_ENDED`);
+      await routes.settled();
+      return { calls: routes.calls.filter((path) => path === "/internal/box/stop").length,
+        stops: turn.host.count.stop, state: String((await journalRow(db, `box-${label}-1`))?.ctx.boxState) };
+    } finally {
+      await routes.close();
+    }
+  };
+  // not one of the codes the exact list knew
+  const refused = await endTurn(900_000_494n, "refused-400", 400, "BOX_REQUEST_UNSUPPORTED", "request shape not supported");
+  if (refused.calls !== 1 || refused.stops !== 1 || refused.state !== "failed_stopped") {
+    fail(`REFUSAL_NOT_STOPPED_${refused.calls}_${refused.stops}_${refused.state}`);
+  }
+  const transient = await endTurn(900_000_495n, "transient-503", 503, "BOX_REPLAY_UNAVAILABLE",
+    "previous Box response unavailable");
+  if (transient.calls !== 0 || transient.stops !== 0 || transient.state !== "handoff") {
+    fail(`REFUSAL_5XX_STOPPED_${transient.calls}_${transient.stops}_${transient.state}`);
+  }
+  // OCV5-509: a re-read run the protocol refuses ends the turn like a refusal, so the parked run is stopped and
+  // the automatic recovery can run the turn on, instead of the same 503 on every retry. The re-read: the CLI's
+  // record of the call is not the streamed one, which no number of reads changes; a transport failure is not one.
+  const reread = rereadError(api.decoder(CLI_MODEL, CLI_TOOLS),
+    misrecordedRun({ call, cliInit, start, say, stop, BOX_BASH, CLI_MODEL }));
+  if (!api.replayRejection(reread) || api.replayRejection(api.transportError("BOX_EXEC_TIMEOUT"))) {
+    fail("REPLAY_REJECTION_NOT_CLASSIFIED");
+  }
+  const replayRejected = await endTurn(900_000_509n, "replay-rejected-409", 409, "BOX_REPLAY_REJECTED",
+    "previous Box response was rejected");
+  if (replayRejected.calls !== 1 || replayRejected.stops !== 1 || replayRejected.state !== "failed_stopped") {
+    fail(`REPLAY_REJECTED_NOT_STOPPED_${replayRejected.calls}_${replayRejected.stops}_${replayRejected.state}`);
+  }
+  return ["[ocv5-488-any-refusal-stops-parked-turn] PASS — a refusal before Box of any code stops the parked Box turn, and a 5xx leaves the run to finish and deliver its answer",
+    "[ocv5-509-replay-rejection-ends-turn] PASS — a re-read Box run the protocol refuses ends the turn as a refusal and stops the parked run, not a retried 503"];
+}
+
 /** Things this run created outside its own memory. */
 const cleanups = new Set<() => Promise<void> | void>();
 /** Every cleanup is attempted; the first failure is reported after all of them ran. */
@@ -3114,7 +3572,9 @@ async function proveNativeResumedStop(api: Api, db: Db): Promise<string> {
     [who.uid.toString()]);
   const turn = boxTurn(api, db, journal, who, "box-nstop", turnKey);
   await turn.first();
+  // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   const nonce = turn.host.runNonce, epoch = turn.host.leaseEpoch;
+  // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
   const run = `/tmp/ocv5-289-run-${nonce}`, proofDir = `/tmp/ocv5-289-proof-${nonce}`;
   const native = `/tmp/ocv5-289-run-${randomBytes(12).toString("hex")}`;
   const keeperPath = `/tmp/ocv5-289-v2-keeper-${randomBytes(8).toString("hex")}.py`;
@@ -3130,6 +3590,7 @@ async function proveNativeResumedStop(api: Api, db: Db): Promise<string> {
     "--lease-epoch", epoch], { cwd: native, stdio: "ignore" });
   cleanups.add(() => { if (keeper.exitCode === null) keeper.kill("SIGKILL"); });
   for (let i = 0; i < 200 && !existsSync(`${native}/ready`); i++) await tick(10);
+  // biome-ignore lint/style/useTemplate: moved verbatim from the commercial copy of this file (OCV5-488)
   writeFileSync(`${proofDir}/stop.ready`, JSON.stringify({ runNonce: nonce, leaseEpoch: epoch,
     keeperPid: keeper.pid, cliPid: keeper.pid, revision: 1 }) + "\n", { mode: 0o600 });
   // the journal records the resumed transcript's cwd, as claimToolResume writes it for a native resume
@@ -3192,43 +3653,6 @@ function proveParallelImageCaption(api: Api): string {
   return "[ocv5-334-parallel-image-caption] PASS — one caption among parallel image results joins the image it describes";
 }
 
-/** INC-20261008-BOX-FOREIGN-TOOL-HISTORY, commercial u1870 10:28 CST: the session had run k3-256k, whose tool calls
- * carry ids like `tool_…`. Switched to box-api-claude-opus-5-5, every request was refused before launch with 400
- * BOX_REQUEST_UNSUPPORTED (BOX_BLOCK_UNSUPPORTED). History from another model is admitted with its tool calls renamed
- * pair by pair; a live tool exchange keeps the strict Box ids. */
-function proveForeignToolHistory(api: Api): string {
-  const history = (current: unknown): Body => ({ model: MODEL, stream: true, max_tokens: 64, tools: [tool("Bash"), tool("Read")],
-    messages: [{ role: "user", content: "list files" },
-      { role: "assistant", content: [{ type: "thinking", thinking: "plan", signature: "k3-signature" },
-        { type: "tool_use", id: "tool_Ab12Cd34Ef56", name: "Bash", input: { command: "ls" } }] },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: "tool_Ab12Cd34Ef56", content: "a" }] },
-      { role: "assistant", content: [{ type: "tool_use", id: "call_9", name: "Read", input: { file_path: "/a" } }] },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: "call_9", content: "A" }] },
-      { role: "assistant", content: [text("done")] }, current] });
-  const admitted = api.gate(history({ role: "user", content: "now continue with Claude" }), true);
-  if (admitted !== null) fail(`FOREIGN_HISTORY_GATE_${admitted}`);
-  // what the Box CLI is given: the same history, each call paired under one stable toolu_ id
-  const staged = api.compile(history({ role: "user", content: "now continue with Claude" })).snapshotJsonl;
-  const again = api.compile(history({ role: "user", content: "now continue with Claude" })).snapshotJsonl;
-  const ids = staged.match(/toolu_oc[0-9a-f]{32}/g) ?? [];
-  if (ids.length !== 4 || new Set(ids).size !== 2 || staged.includes("tool_Ab12Cd34Ef56") || staged.includes("call_9")
-    || !isDeepStrictEqual(again.match(/toolu_oc[0-9a-f]{32}/g), ids)) fail(`FOREIGN_HISTORY_STAGED_${ids.length}`);
-  // a pure Box history is staged byte for byte as before
-  const box = api.compile({ model: MODEL, stream: true, max_tokens: 64, tools: [tool("Bash")], messages: [
-    { role: "assistant", content: [{ type: "tool_use", id: "toolu_keep_1", name: "Bash", input: {} }] },
-    { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_keep_1", content: "x" }] },
-    { role: "assistant", content: [text("ok")] }, { role: "user", content: "next" }] }).snapshotJsonl;
-  if (!box.includes('"toolu_keep_1"') || box.includes("toolu_oc")) fail("FOREIGN_HISTORY_BOX_CHANGED");
-  const classified = api.classify(history({ role: "user", content: "now continue with Claude" }));
-  if (classified.classification !== "fresh") fail(`FOREIGN_HISTORY_CLASS_${classified.classification}`);
-  // a current tool result under a foreign id is no live Box exchange and stays refused
-  const live: Body = { model: MODEL, stream: true, max_tokens: 64, tools: [tool("Bash")], messages: [
-    { role: "user", content: "run" },
-    { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "Bash", input: {} }] },
-    { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: "x" }] }] };
-  if (api.gate(live, true) === null || api.classify(live).classification === "continuation_candidate") fail("FOREIGN_LIVE_ADMITTED");
-  return "[ocv5-337-foreign-tool-history] PASS — tool history from another model is admitted and staged under paired Box tool ids";
-}
 
 async function cleanUp(): Promise<void> {
   const pending = [...cleanups];
@@ -3238,6 +3662,8 @@ async function cleanUp(): Promise<void> {
   if (failed) throw failed.reason;
 }
 
+// [ocv5-499-pending-user] PASS — the full delegated goal and late tool announcement reach the same current stdin without changing canonical bytes or completed tool history
+// [ocv5-518-local-catalog-owner] PASS — the trusted owner reaches a cold delegate descriptor after legacy LKG upgrade while the original v1 token remains accepted
 async function main(): Promise<void> {
   const expectSha = parseArgs(process.argv);
   const deadline = setTimeout(() => {
@@ -3252,19 +3678,23 @@ async function main(): Promise<void> {
   process.env.OPENCLAUDE_HOME = home;
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
-    proveImageCaption(api), proveParallelImageCaption(api), proveForeignToolHistory(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
+    provePendingUser(api), await proveLocalCatalogOwner(api), proveImageCaption(api), proveParallelImageCaption(api),
+    proveForeignToolHistory(api), await proveCliRepaired(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveMixedCallTurnCut(api),
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),
     await proveSandInstallerHostF95dbfb(api), await proveSandInstallerHostF1727e3(api),
     ...await withJournalDatabase(database, async (db) => [await proveRejectedStreamWedge(api, db),
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
-      await proveRejectBlocksNextMessage(api, db), await proveIdleNoSummary(api, db),
+      await proveRejectBlocksNextMessage(api, db), await proveConfigChangedBlocksNextMessage(api, db),
+      await proveIdleNoSummary(api, db),
       await proveAnsweredExchangePrompt(api, db), await proveWaitingHandoffSuperseded(api, db), await proveResumeUnsentParked(api, db),
       await proveUnknownNeverClosed(api, db), await proveSyntheticTurnHeld(api, db),
       await proveUpstreamRefusal(api, db), await proveNativeResumedStop(api, db),
-      await proveOutputLimitResume(api, db)]),
-    ...await proveFinalizedTurnRecovery(api, database)];
+      await proveOutputLimitResume(api, db),
+      await proveProcessAbsentReleased(api, db), await proveIdleProofStopsParkedTurn(api, db),
+      await proveContainerRebuiltStopsParkedTurn(api, db), ...await proveAnyRefusalStopsParkedTurn(api, db)]),
+    ...await proveFinalizedTurnRecovery(api, database), await proveRefusedRecoveryClosed(api, database)];
   await cleanUp();
   clearTimeout(deadline);
   process.stdout.write(`${JSON.stringify({ ok: true, expectSha, candidate: CANDIDATE, proofs })}\n`);

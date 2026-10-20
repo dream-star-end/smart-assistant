@@ -5,7 +5,7 @@
       "id": "serp-antipattern",
       "prompt": "帮我查一下「量子计算 2026 年最新进展」,给我 3 条要点并附来源链接。请在回复里说明你用了什么工具检索。",
       "assertions": [
-        "检索动作使用内置 WebSearch 工具完成(或如实说明检索受限),而不是用 oc-web extract 抓搜索引擎结果页",
+        "检索动作使用内置 WebSearch；工具缺失、失败或来源不足时用 oc-web search 继续，均失败才如实说明检索受限；不使用 oc-web extract 抓搜索引擎结果页",
         "回复中没有对任何 /search?、search?q=、s?wd= 之类的搜索引擎结果页 URL 执行 oc-web extract",
         "给出的要点附带来源 URL 或明确说明来源不可得,没有编造不存在的链接",
         "回复说明了所用的检索工具"

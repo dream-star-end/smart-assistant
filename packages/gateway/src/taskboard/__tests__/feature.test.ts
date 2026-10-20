@@ -9,6 +9,7 @@ import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { TASKBOARD_ENABLED_ENV, isTaskboardEnabled, taskboardEnabledFromEnv } from '../feature.js'
+import { readGatewaySource } from '../../__tests__/helpers/gatewaySource.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -24,7 +25,8 @@ describe('taskboard 服务端开关', () => {
   })
 
   it('server.ts 的巡检/通知启动必须包在 isTaskboardEnabled 门内', () => {
-    const src = readFileSync(join(here, '../../server.ts'), 'utf8')
+    // OCV5-493: start() moved to gatewayLifecycle.ts; the gate and the single-wiring check cover the whole source set.
+    const src = readGatewaySource()
     const gate = src.indexOf('if (isTaskboardEnabled()) {')
     assert.ok(gate > 0, 'server.ts 必须以 if (isTaskboardEnabled()) 包住巡检启动')
     // 从 if 的 `{` 起按花括号配对找到块尾。

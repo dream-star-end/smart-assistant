@@ -8,6 +8,7 @@
  *
  * Run: npx tsx --test packages/gateway/src/__tests__/liveSessionList.test.ts
  */
+import { readSessionManagerSource } from './helpers/sessionManagerSource.js'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -95,19 +96,21 @@ describe('isTempSessionKey', () => {
 
 describe('接线未漂移', () => {
   test('/api/sessions 走 filterUserVisibleLiveSessions,且调用 isPatrolSessionKey', () => {
-    const source = readFileSync(join(here, '..', 'server.ts'), 'utf8')
+    // OCV5-465: the /api/sessions route and its filter moved to routes/clientSessions.ts.
+    const source = readFileSync(join(here, '..', 'routes', 'clientSessions.ts'), 'utf8')
     const start = source.indexOf("if (url.pathname === '/api/sessions') {")
     const end = source.indexOf("if (url.pathname === '/api/sessions/list'", start)
     assert.ok(start >= 0, 'GET /api/sessions handler missing')
     assert.ok(end > start, 'GET /api/sessions/list marker missing')
     const block = source.slice(start, end)
     assert.match(block, /filterUserVisibleLiveSessions\(/)
-    assert.match(source, /import \{ isPatrolSessionKey \} from '\.\/taskboard\/domain\.js'/)
+    assert.match(source, /import \{ isPatrolSessionKey \} from '\.\.\/taskboard\/domain\.js'/)
     assert.match(source, /if \(isPatrolSessionKey\(s\.sessionKey\)\) return false/)
   })
 
   test('LRU 驱逐使用 isTempSessionKey', () => {
-    const source = readFileSync(join(here, '..', 'sessionManager.ts'), 'utf8')
+    // sessionManager.ts + split-out modules (FINDINGS §7.6 M3: eviction lives in sessionLifecycle.ts)
+    const source = readSessionManagerSource()
     assert.match(source, /const isTempSession = isTempSessionKey\(key\)/)
     assert.match(source, /isPatrolSessionKey\(sessionKey\)/)
   })

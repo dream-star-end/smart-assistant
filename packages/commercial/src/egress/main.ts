@@ -1,3 +1,4 @@
+import { startLogTimingReporter } from '../logging/logTimingReporter.js';
 /**
  * V5 egress 进程(独立 systemd 服务 openclaude-v5-egress)——
  * 根治"master 部署重启掐断在飞 LLM 生成流"。
@@ -59,6 +60,7 @@ import {
 import { assertPlatformDefaultModelConfigured, staticProviderKeysFromConfig } from "../http/proxy/staticProviderMeta.js";
 import {
   apiKeyPoolConfiguredServices,
+  selectApiKey,
   importEnvApiKeys,
   primeApiKeyPool,
   startApiKeyPoolCache,
@@ -86,6 +88,7 @@ import { BoxUserStopCoordinator } from "../http/proxy/boxUserStopCoordinator.js"
 import { BoxCliVersionGate, gateBoxLaunchResolver } from "../http/proxy/boxCliVersion.js";
 import { makeBoxUserStopHandler } from "../http/proxy/boxUserStopHandler.js";
 import { makeBoxIdleProofHandler } from "../http/proxy/boxIdleProofHandler.js";
+import { BoxHoldRelease } from "../http/proxy/boxHoldRelease.js";
 import { startLatencyProber } from "./latencyProber.js";
 import { startRecoveryProber } from "./recoveryProber.js";
 import { snapshotInflight } from "../http/proxy/inflightTracker.js";
@@ -491,7 +494,8 @@ export async function startEgress(): Promise<void> {
     journal: boxStopJournal,
     coordinator: boxStopCoordinator });
   const boxIdleProofHandler = makeBoxIdleProofHandler({ identity: identityStrategy,
-    journal: boxStopJournal, readCapsule: boxReplayReader });
+    journal: boxStopJournal, readCapsule: boxReplayReader,
+    stopParked: { journal: new BoxHoldRelease(getPool()), coordinator: boxStopCoordinator } });
   // Which Box login an interactive session (box-claude-*) launches under, and what its turns
   // reported: the admin's selection plus the login health this process shares with the Box
   // model route. Independent of OC_BOX_MODEL_API: interactive sessions exist without that route.
@@ -580,6 +584,8 @@ export async function startEgress(): Promise<void> {
       });
     },
     staticProviderKeys,
+    // OCV5-520: honor Go pool disables/rotation without changing other providers.
+    apiKeyPoolEnabled: ["opencodego"],
     getPhase6AccountUuidEnforce,
     getSessionPinMode,
     listEnabledAccountGroupsForModel: listEnabledGroupsForModel,
@@ -593,7 +599,11 @@ export async function startEgress(): Promise<void> {
   // 与 latencyProber 同理挂 egress(真实推理出口,dispatcher/鉴权语义一致);只对
   // auto+degraded provider 发最小推理探活,成功才写 kind='final' 样本(model 带
   // probe: 前缀),恢复判定仍由 master scheduler 既有数学接管。零迁移。
-  const recoveryProber = startRecoveryProber({ staticProviderKeys, log });
+  const recoveryProber = startRecoveryProber({
+    resolveKey: async (providerId) =>
+      (await selectApiKey(providerId, `provider-recovery:${providerId}`))?.apiKey ?? null,
+    log,
+  });
 
   // self-host uuid 与 master 同权威(PG compute host 表)——identity 双因子里
   // hostUuid 参与 bearer 归属校验,两进程必须同值。取失败拒启(egress 无降级路径)。
@@ -641,13 +651,14 @@ export async function startEgress(): Promise<void> {
       });
     },
   });
-  const grokRelayHandler = makeGrokRelayHandler({ identityRepo });
+  const grokRelayHandler = makeGrokRelayHandler({ identityRepo, logger: log });
   const zcodeRelayHandler = makeZcodeRelayHandler({
     identityRepo,
     codingPlanKey: cfg.ZAI_CODING_PLAN_KEY ?? "",
   });
   const antigravityRelayHandler = makeAntigravityRelayHandler({
     identityRepo,
+    logger: log,
     clientSecret: cfg.OC_ANTIGRAVITY_OAUTH_CLIENT_SECRET ?? "",
     pricing,
   });
@@ -962,10 +973,12 @@ export async function startEgress(): Promise<void> {
     log.warn("desktop_tls_egress_not_started", { err: (err as Error)?.message });
   });
 
+  const stopLogTiming = startLogTimingReporter(rootLogger);
   let shuttingDown = false;
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    stopLogTiming();
     latencyProber?.stop();
     recoveryProber?.stop();
     if (boxCleanupTimer) clearInterval(boxCleanupTimer);

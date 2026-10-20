@@ -152,6 +152,58 @@ describe("ShareDialog", () => {
     expect(last.messages.map((m) => m.text)).toEqual(["整理客户名单", "整理好了，共 12 位。"]);
   });
 
+  it("默认 Markdown 导出使用实时完整消息和标题,不受图片快照和范围影响", async () => {
+    renderShareCard.mockResolvedValue({ blob: new Blob(["png"]), layout: {} });
+    const live = [
+      msg({ id: "u1", role: "user", text: "第一轮问题" }),
+      msg({ id: "a1", role: "assistant", text: "第一轮原回答", _clientMessageId: "u1" }),
+      msg({ id: "u2", role: "user", text: "第二轮问题" }),
+      msg({ id: "a2", role: "assistant", text: "第二轮回答", _clientMessageId: "u2" }),
+      msg({ id: "u3", role: "user", text: "第三轮问题" }),
+      msg({ id: "a3", role: "assistant", text: "第三轮回答", _clientMessageId: "u3" }),
+    ];
+    const view = open({ messages: live });
+    await screen.findByRole("img", { name: "分享长图预览" });
+    live[1].text = "第一轮更新回答";
+    live.push(
+      msg({ id: "u4", role: "user", text: "第四轮问题" }),
+      msg({ id: "process4", role: "assistant", text: "PRIVATE_PROCESS", _clientMessageId: "u4" }),
+      msg({ id: "tool4", role: "tool", text: "PRIVATE_TOOL", _clientMessageId: "u4" }),
+      msg({ id: "a4", role: "assistant", text: "第四轮进行中回答", _clientMessageId: "u4" }),
+    );
+    view.rerender(
+      <ToastProvider>
+        <ShareDialog open onOpenChange={() => {}} messages={live} sending title="新/标题" agentName="全能助手" />
+      </ToastProvider>,
+    );
+    fireEvent.click(screen.getByRole("radio", { name: "最近三轮" }));
+    await waitFor(() => {
+      const image = renderShareCard.mock.calls.at(-1)?.[0] as { messages: { text: string }[] };
+      expect(image.messages.map((m) => m.text)).toEqual([
+        "第一轮问题", "第一轮原回答", "第二轮问题", "第二轮回答", "第三轮问题", "第三轮回答",
+      ]);
+    });
+    fireEvent.click(screen.getByRole("button", { name: /导出 Markdown/ }));
+    await waitFor(() => expect(saveBlob).toHaveBeenCalledTimes(1));
+    const [blob, filename] = saveBlob.mock.calls[0] as [Blob, string];
+    expect(filename).toBe("新_标题.md");
+    expect(blob.type).toBe("text/markdown;charset=utf-8");
+    const markdown = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsText(blob);
+    });
+    expect(markdown).toContain("第一轮问题");
+    expect(markdown).toContain("第一轮更新回答");
+    expect(markdown).toContain("第四轮问题");
+    expect(markdown).not.toContain("第一轮原回答");
+    expect(markdown).toContain("第四轮进行中回答");
+    expect(markdown).toContain("## 助手（未完成）");
+    expect(markdown).not.toContain("PRIVATE_PROCESS");
+    expect(markdown).not.toContain("PRIVATE_TOOL");
+  });
+
   it("桌面浏览器即使支持系统分享也不显示「分享…」,保存图片为主按钮", async () => {
     renderShareCard.mockResolvedValue({ blob: new Blob(["png"], { type: "image/png" }), layout: {} });
     env({ touch: false, share: vi.fn(async () => {}) });
@@ -205,5 +257,6 @@ describe("ShareDialog", () => {
     expect(link.closest("[data-share-body]")).not.toBeNull();
     fireEvent.click(link);
     expect(onExportMarkdown).toHaveBeenCalledTimes(1);
+    expect(saveBlob).not.toHaveBeenCalled();
   });
 });

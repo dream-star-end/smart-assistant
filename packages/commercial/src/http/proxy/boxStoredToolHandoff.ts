@@ -62,8 +62,12 @@ export function parseBoxStoredToolHandoff(raw: unknown): BoxStoredToolHandoff | 
     || !record(raw.usage)) return null;
   const ids = new Set<string>();
   for (const item of raw.toolUses) {
-    if (!record(item) || Object.keys(item).sort().join(",") !==
-        "boxName,clientName,id,inputHash"
+    if (!record(item) || !["boxName,clientName,id,inputHash",
+        "boxName,cliInputHash,clientName,id,inputHash"]
+        .includes(Object.keys(item).sort().join(","))
+      || (item.cliInputHash !== undefined
+        && (typeof item.cliInputHash !== "string" || !/^[a-f0-9]{64}$/.test(item.cliInputHash)
+          || item.cliInputHash === item.inputHash))
       || typeof item.id !== "string" || !/^toolu_[A-Za-z0-9_-]{1,120}$/.test(item.id)
       || ids.has(item.id)
       || typeof item.boxName !== "string"

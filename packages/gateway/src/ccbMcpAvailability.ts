@@ -49,6 +49,9 @@ export const CCB_SKILL_EVAL_HIDDEN_PLATFORM_TOOLS = [
   'ask_user',
   'present_options',
   'project_search',
+  'oc_bash',
+  'oc_grep',
+  'oc_glob',
 ] as const
 
 const SKILL_TRAIN_HIDDEN_PLATFORM_TOOLS = ['skill_save', 'skill_delete'] as const

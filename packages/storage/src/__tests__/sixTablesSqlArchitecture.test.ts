@@ -58,10 +58,16 @@ const SQL_CONTEXT = new RegExp(
 // 白名单(相对 REPO_ROOT 的 POSIX 路径)。理由见文件顶注。
 const WHITELIST = new Set<string>([
   "packages/storage/src/sessionsDb.ts",
+  // sessionsDb.ts 的拆分模块(OCV5-485):同一 SQLite sessions 权威,只是按职责分文件。
+  "packages/storage/src/sessionsDbProjects.ts",
+  "packages/storage/src/sessionsDbSidebar.ts",
   "packages/storage/src/wechatBindings.ts",
   "packages/storage/src/clientSessionsPlan.ts",
   "packages/storage/src/sessionsMigrate.ts",
   "packages/commercial/src/db/pgSessionsBackend.ts",
+  // OCV5-509: the refused-recovery card sweep, split out of pgSessionsBackend for its size cap;
+  // it writes only through the backend card writer under the session row lock.
+  "packages/commercial/src/db/refusedRecoveryCards.ts",
   // Durable live-turn frame journal 是 commercial PG sessions backend 的拆分模块；它在同一
   // 事务内校验 client_sessions 租户归属并读写新的 live stream/frame 表，不能经另一个
   // backend 调用拆开 ownership snapshot。

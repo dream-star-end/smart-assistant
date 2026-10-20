@@ -1,3 +1,4 @@
+import { useWorkspacePreparation } from './useWorkspacePreparation';
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, cancelAuthRefresh, isAuthRecoveryTransient } from "../lib/api";
 import { publishAuthLogout, subscribeAuthLogout } from "../lib/authBroadcast";
@@ -159,6 +160,7 @@ export function useAuth(opts: UseAuthOptions): UseAuth {
 
   // cohort lane 就绪闸（P3 RFC D1）：已认证 + lane 决策达成（或 3s 兜底）才放行 WS 连接。
   const laneReady = useLaneGate(authed, laneSignal);
+  useWorkspacePreparation(auth, !demo && laneReady, user?.id ?? null);
   const lane = laneSignal?.lane ?? null;
 
   const login = useCallback(

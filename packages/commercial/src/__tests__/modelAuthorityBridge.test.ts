@@ -1200,6 +1200,9 @@ function fakeAdmittedDispatch(input: AdmitUserTurnInput): AdmitUserTurnResult {
 }
 
 describe("OCV5-187 admitted callback content is immutable across the real WS bridge", () => {
+  // OCV5-492: per-case hang guard. The deploy proof's run() timeout covers the whole file
+  // (cold module load included), so each case carries its own tighter limit.
+  const OCV5_187_CASE_TIMEOUT_MS = 30_000;
   const cases = [
     { name: "paper intent", text: "请下载论文 https://doi.org/10.1038/s41586-024-00001-0", paper: true },
     { name: "technical callback false positive", text: "Find comparison risk review results. The delegated task is complete.", paper: true },
@@ -1207,7 +1210,7 @@ describe("OCV5-187 admitted callback content is immutable across the real WS bri
   ];
 
   for (const [index, sample] of cases.entries()) {
-    test(`OCV5-187 cron-origin ${sample.name}: original text, signed hash and accepted receipt agree`, async () => {
+    test(`OCV5-187 cron-origin ${sample.name}: original text, signed hash and accepted receipt agree`, { timeout: OCV5_187_CASE_TIMEOUT_MS }, async () => {
       assert.equal(detectScanSciPaperIntent(sample.text) !== null, sample.paper);
       const admissions: AdmitUserTurnInput[] = [];
       const rig = await startRig({
@@ -1260,7 +1263,7 @@ describe("OCV5-187 admitted callback content is immutable across the real WS bri
     });
   }
 
-  test("OCV5-187 browser paper hint stays before admission even with forged cron-origin fields", async () => {
+  test("OCV5-187 browser paper hint stays before admission even with forged cron-origin fields", { timeout: OCV5_187_CASE_TIMEOUT_MS }, async () => {
     const text = cases[0]!.text;
     const admissions: AdmitUserTurnInput[] = [];
     const rig = await startRig({
@@ -2033,7 +2036,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
     }
   });
 
-  test("R4-B6 container close during enrichment still terminalizes immediately", async () => {
+  test("R4-B6 container close during enrichment immediately hands ownership to durable proof", async () => {
     const queries: { sql: string; params: unknown[] }[] = [];
     const pgPool = {
       query: async (sql: string, params: unknown[] = []) => {
@@ -2065,7 +2068,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       await waitFor(() => historyStarted);
       for (const container of rig.containerWss.clients) container.close(1011, "test close");
       await waitFor(
-        () => queries.some((q) => q.params[2] === "bridge_closed_during_admission"),
+        () => queries.some((q) => q.params[1] === "bridge-admission-handoff"),
         1_500,
       );
       releaseHistory!([]);
@@ -2144,7 +2147,7 @@ describe("bridge B3 — 受理后 GoalState 失败 → dispatch CAS terminal(exe
       await waitFor(() => bindingStarted);
       for (const container of rig.containerWss.clients) container.close(1011, "post lookup close");
       await waitFor(
-        () => queries.some((q) => q.params[2] === "bridge_closed_during_admission"),
+        () => queries.some((q) => q.params[1] === "bridge-admission-handoff"),
         1_500,
       );
       releaseBinding();
@@ -2521,4 +2524,42 @@ test('OCV5-179 identity: slow readiness cannot be overtaken on the same raw peer
     assert.deepEqual(calls,['butler'], 'closed bridge must not start the queued readiness read');
     assert.equal(rig.containerSeen.some(s=>s.includes('inbound.message')),false,'late readiness must not execute after cleanup');
   } finally {release();await stopRig(rig);}
+});
+
+
+test("OCV5-511 exact replay snapshot commits before ACK and survives shutdown during delayed enrichment", async () => {
+  let admitted: AdmitUserTurnInput | undefined;
+  let releaseHistory!: (rows: unknown[]) => void;
+  let historyStarted = false;
+  const gate = new Promise<unknown[]>((resolve) => { releaseHistory = resolve; });
+  const queries: Array<{ sql: string; params: unknown[] }> = [];
+  const rig = await startRig({ attest: "yes", durableDispatch: true,
+    pgPool: { query: async (sql: string, params: unknown[] = []) => {
+      queries.push({ sql, params }); return { rows: [], rowCount: 1 };
+    } },
+    admitUserTurn: async (input) => { admitted = input; return fakeAdmittedDispatch(input); },
+    loadMasterSessionMessages: async () => { historyStarted = true; return gate; },
+  });
+  try {
+    const ws = await openClient(rig.port);
+    const received = frameCollector(ws);
+    ws.send(inboundFrame({ clientMessageId: "cm-511-shutdown", idempotencyKey: "web:cm-511-shutdown:0",
+      peer: { id: "sess-511-shutdown", kind: "dm" }, model: "glm-5.2", serviceTier: "fast",
+      contextTier: "1m", collabMode: "advisor", advisorModel: "gpt-6-astra", conversationMode: "plan" }));
+    const ack = await received.next();
+    assert.equal(ack.type, "outbound.ack");
+    assert.ok(admitted?.message._admissionRestartRequest, "snapshot supplied to transactional admission before ACK");
+    const snapshot = admitted.message._admissionRestartRequest as { version: number; wireBase64: string };
+    assert.equal(snapshot.version, 1);
+    const request = JSON.parse(Buffer.from(snapshot.wireBase64, "base64").toString("utf8"));
+    assert.equal(request.serviceTier, "fast"); assert.equal(request.contextTier, "1m");
+    assert.equal(request.collabMode, "advisor"); assert.equal(request.advisorModel, "gpt-6-astra");
+    assert.equal(request.conversationMode, "plan");
+    await waitFor(() => historyStarted);
+    await rig.bridge.shutdown();
+    await waitFor(() => queries.some(q => q.params[1] === "bridge-admission-handoff"));
+    releaseHistory([]);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(rig.containerSeen.some(row => row.includes('"clientMessageId":"cm-511-shutdown"')), false);
+  } finally { releaseHistory([]); await stopRig(rig); }
 });

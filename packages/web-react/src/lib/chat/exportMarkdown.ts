@@ -1,7 +1,8 @@
 import { uiPlainText } from "../../components/iui/plainText";
 import type { ChatMessage } from "./model";
 
-const EXPORT_ROLES = new Set<ChatMessage["role"]>(["user", "assistant", "tool"]);
+import { selectExportMessages } from "./shareSelection";
+import { publicArtifactText } from "./publicArtifactText";
 
 function pad(n: number): string {
   return String(n).padStart(2, "0");
@@ -20,34 +21,22 @@ function headingFor(role: ChatMessage["role"]): string {
   return "工具";
 }
 
-function toolSummary(m: ChatMessage): string {
-  const name = (m.toolName ?? "").trim() || "tool";
-  const preview = (m.inputPreview ?? "").trim();
-  return preview ? `${name} ${preview}` : name;
-}
-
 /**
  * 把当前内存窗消息编成会话导出 Markdown。
- * 只收 user / assistant / tool；thinking、过程卡等跳过。
+ * 收真实提问和最终回答；可见的进行中或失败前部分正文标记未完成后保留，工具和思考不导出。
  * 异步:助手正文含 ```ui 组件时要等组件转换器的懒块加载。
  */
-export async function exportSessionMarkdown(messages: readonly ChatMessage[]): Promise<string> {
+export async function exportSessionMarkdown(messages: readonly ChatMessage[], sending = false): Promise<string> {
   const blocks: string[] = [];
-  for (const m of messages) {
-    if (!EXPORT_ROLES.has(m.role)) continue;
-    const lines = [`## ${headingFor(m.role)}`];
+  for (const m of selectExportMessages(messages, sending)) {
+    const lines = [`## ${headingFor(m.role)}${m.exportIncomplete ? "（未完成）" : ""}`];
     const when = formatExportTime(m.ts);
     if (when) lines.push(when);
     // Intelligent UI(OCV5-361):助手正文里的 ```ui 组件导出为等价 Markdown。
-    lines.push(m.role === "tool" ? toolSummary(m) : m.role === "assistant" ? await uiPlainText(m.text ?? "") : m.text ?? "");
+    lines.push(m.role === "assistant" ? await publicArtifactText(await uiPlainText(m.text ?? "")) : m.text ?? "");
     blocks.push(lines.join("\n"));
   }
   return blocks.length ? `${blocks.join("\n\n")}\n` : "";
 }
 
-/** `<会话标题>.md`；空标题回落「新对话」，去掉路径分隔符。 */
-export function sessionExportFilename(title: string | null | undefined): string {
-  const raw = (title ?? "").trim() || "新对话";
-  const safe = raw.replace(/[\\/]/g, "_");
-  return `${safe}.md`;
-}
+export { sessionExportFilename } from "./exportFilename";

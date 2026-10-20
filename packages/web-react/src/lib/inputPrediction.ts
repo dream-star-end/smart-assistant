@@ -15,6 +15,9 @@
  */
 
 import type { InputPrediction } from "./inputCompletion";
+import { normalizeInlineUiFences } from "./uiFence";
+
+export { isNextBlockCode } from "./nextBlock";
 
 export type { InputPrediction, InputPredictionSource } from "./inputCompletion";
 
@@ -28,18 +31,6 @@ const MAX_HISTORY = 50;
 const FENCE_OPEN = /^ {0,3}(`{3,}|~{3,})[ \t]*([^\s`]*)/;
 const NEXT_TYPES = new Set(["next", "prediction"]);
 const SUGGESTION_TYPES = new Set(["suggestions", "followups", "follow_up"]);
-const NEXT_HEAD = '{"type":"next"';
-
-/**
- * 这个 ui 块是不是输入预测(不显示)。`partial` = 还在流式生成:类型名还没写完、但可能是 next 时
- * 也算,免得块尾先闪出一个骨架再消失。
- */
-export function isNextBlockCode(code: string, partial = false): boolean {
-  const compact = code.replace(/\s+/g, "");
-  if (partial && NEXT_HEAD.startsWith(compact)) return true;
-  const m = /^\{"type":"([a-z_]+)"/i.exec(compact);
-  return !!m && NEXT_TYPES.has(m[1]!.toLowerCase());
-}
 
 /** 一个 ui 块 → 对象;解析不了 → null。容忍模型常见的尾逗号。 */
 function parseBlock(code: string): Record<string, unknown> | null {
@@ -63,7 +54,7 @@ function textOf(v: unknown): string {
 /** 回答里已闭合的 ```ui 块(按出现顺序);其它语言的围栏(含其中的 ```ui 字样)跳过。 */
 function uiBlocksOf(text: string): Record<string, unknown>[] {
   if (!text.includes("```ui") && !text.includes("~~~ui")) return [];
-  const lines = text.split("\n");
+  const lines = normalizeInlineUiFences(text).split("\n");
   const blocks: Record<string, unknown>[] = [];
   let i = 0;
   while (i < lines.length) {

@@ -36,7 +36,11 @@ describe("sessionHistorySurface", () => {
 test("App.tsx routes GET failure + messageCount through sessionHistorySurface, not EmptyState", () => {
   const here = dirname(fileURLToPath(import.meta.url));
   const source = readFileSync(join(here, "../../App.tsx"), "utf8");
-  expect(source).toContain("sessionHistorySurface");
+  // OCV5-466: the derivation lives in hooks/useHistorySkeleton; App consumes its historySurface.
+  const hookSource = readFileSync(join(here, "../../hooks/useHistorySkeleton.ts"), "utf8");
+  expect(source).toContain("useHistorySkeleton({");
+  expect(hookSource).toContain("sessionHistorySurface({");
+  expect(hookSource).toContain("historyError: !demo && input.historyError !== null");
   expect(source).toContain('historySurface === "error"');
   expect(source).toContain("retryHistory(activeId)");
   const errorIdx = source.indexOf('historySurface === "error"');

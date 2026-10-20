@@ -117,17 +117,42 @@ test('OCV5-315 a Box continuation reject settles the parked Box turn once', asyn
   }
 })
 
-test('OCV5-315 only the exact continuation reject qualifies', () => {
+// OCV5-486: egress' authority gate (modelAuthorityGate config_changed) body.
+const CONFIG_CHANGED_MESSAGE = 'model configuration changed, please retry in a new turn'
+
+// OCV5-488 (user-approved, 10-17): every refusal egress answers a continuation
+// with before it reaches Box parks the CLI the same way, so the code no longer
+// matters. What OCV5-315 guarded stays guarded: a call still resolving, a
+// retried status and any 5xx keep their own recovery (the run may finish and
+// its answer be delivered), and only egress' own error shape at the start counts.
+test('OCV5-488 any refusal before Box qualifies; retried, still-resolving and 5xx results do not', () => {
   const detail = (result: unknown, extra: Record<string, unknown> = {}) =>
     JSON.stringify({ subtype: 'success', result, ...extra })
-  assert.equal(isBoxContinuationRejectedDetail(detail(rejected('BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION'))), true)
-  assert.equal(isBoxContinuationRejectedDetail(detail(rejected('BOX_PREPARED_CATALOG_MISSING'))), true)
+  const status = (code: number, name: string, message = 'refused') =>
+    `API Error: ${code} {"error":{"code":"${name}","message":"${message}"}}`
+  for (const refusal of [
+    detail(rejected('BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION')),
+    detail(rejected('BOX_PREPARED_CATALOG_MISSING')),
+    detail(rejected('MODEL_CONFIG_CHANGED_RETRY_TURN', CONFIG_CHANGED_MESSAGE)),
+    // formerly refused by the exact list; each is answered before any Box call
+    detail(rejected('BOX_AUTHORITY_REJECTED', 'authority binding rejected')),
+    detail('API Error: 409 {"error":{"code":"OTHER","message":"continuation rejected"}}'),
+    detail(rejected('MODEL_CONFIG_CHANGED_RETRY_TURN', 'continuation rejected')),
+    detail(rejected('MODEL_AUTHORITY_INVALID', CONFIG_CHANGED_MESSAGE)),
+    detail(status(400, 'BOX_REQUEST_UNSUPPORTED', 'request shape not supported')),
+    detail(status(403, 'NOT_AUTHORIZED', 'model not authorized')),
+  ]) {
+    assert.equal(isBoxContinuationRejectedDetail(refusal), true, String(refusal))
+  }
   for (const other of [
     detail(rejected('BOX_REPLAY_PENDING', 'previous Box call still resolving')),
-    detail(rejected('BOX_AUTHORITY_REJECTED', 'authority binding rejected')),
+    detail(status(408, 'REQUEST_TIMEOUT')),
+    detail(status(429, 'RATE_LIMITED')),
+    detail(status(500, 'BOX_EXEC_HTTP_500')),
     detail('API Error: 503 {"error":{"code":"BOX_REPLAY_UNAVAILABLE","message":"continuation rejected"}}'),
-    detail('API Error: 409 {"error":{"code":"OTHER","message":"continuation rejected"}}'),
+    detail(`API Error: 503 {"error":{"code":"MODEL_CONFIG_CHANGED_RETRY_TURN","message":"${CONFIG_CHANGED_MESSAGE}"}}`),
     detail('the model said: API Error: 409 {"error":{"code":"BOX_X","message":"continuation rejected"}}'),
+    detail('API Error: 400 Bad Request'),
     detail(null),
     'not json continuation rejected',
     undefined,
@@ -153,4 +178,41 @@ test('OCV5-315 a non-Box model never notifies Box on a reject-shaped result', as
     await turn.summary
     assert.equal(sent, 0)
   } finally { globalThis.fetch = oldFetch }
+})
+
+// OCV5-486 live #49fab402: a catalog change (epoch bump) mid-turn rejected the
+// Box continuation at the authority gate; the parked CLI pinned the session.
+test('OCV5-486 a config-changed continuation reject settles the parked Box turn once', async () => {
+  const vars = ['ANTHROPIC_BASE_URL', 'OPENCLAUDE_V3_MASTER_BASE_URL',
+    'OPENCLAUDE_V3_CONTAINER_TOKEN'] as const
+  const saved = Object.fromEntries(vars.map((key) => [key, process.env[key]]))
+  const oldFetch = globalThis.fetch
+  process.env.ANTHROPIC_BASE_URL = 'http://172.31.0.1:18892'
+  process.env.OPENCLAUDE_V3_MASTER_BASE_URL = 'http://172.31.0.1:18892'
+  process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = 'oc-v3.1.synthetic'
+  const runner = new FakeRunner()
+  const bodies: unknown[] = []
+  globalThis.fetch = (async (url, init) => {
+    assert.equal(String(url), 'http://172.31.0.1:18892/internal/box/stop')
+    bodies.push(JSON.parse(String(init?.body)))
+    return new Response(JSON.stringify({ status: 'stopped' }), { status: 200 })
+  }) as typeof fetch
+  try {
+    const adapter = new CcbAdapter({} as never, runner as unknown as SubprocessRunner)
+    const turn = adapter.submitTurn({ input: 'synthetic', turnKey: 'e'.repeat(64),
+      onEvent: () => {}, sessionTotals: { totalCostUSD: 0, turns: 0 },
+      toolUseIdToName: new Map() })
+    await turn.submitted
+    runner.emit('message', { type: 'result', subtype: 'success', is_error: true,
+      result: rejected('MODEL_CONFIG_CHANGED_RETRY_TURN', CONFIG_CHANGED_MESSAGE) })
+    assert.equal((await turn.summary)?.isError, true)
+    await adapter.shutdown().catch(() => {})
+    assert.deepEqual(bodies, [{ session_id: runner.sessionId, oc_turn_key: 'e'.repeat(64) }])
+  } finally {
+    globalThis.fetch = oldFetch
+    for (const key of vars) {
+      if (saved[key] === undefined) delete process.env[key]
+      else process.env[key] = saved[key]
+    }
+  }
 })

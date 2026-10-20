@@ -26,6 +26,7 @@ const aliases = Object.fromEntries(["storage","protocol"].map(name => { const pa
 assert.equal((await import("@openclaude/storage")).getClientSession, storage.getClientSession, "fixture and Gateway storage must be the same module instance");
 const { CcbAdapter } = await import("../../gateway/src/engine/ccbAdapter.js");
 const { setV3MasterSinkSingleton } = await import("../../gateway/src/v3MasterSink.js");
+const { materializeLosslessTurn } = await import("../../commercial/src/http/losslessTurnTape.js");
 const { getCcbLocalAgentCallbackState } = await import("../../gateway/src/ccbLocalAgentCallback.js");
 const home = process.env.OPENCLAUDE_HOME!;
 const agent = { id: "main", model: "glm-5.2" };
@@ -103,7 +104,18 @@ async function settled(peer: string) {
 }
 async function snapshot(peer: string) {
   const p = peers.get(peer)!;
-  return { sessionKey: p.session.sessionKey, turns: p.session.turns, inputCount: p.runner.submittedInputs.length, inputs: p.runner.submittedInputs, active: [p.session._activeTurnCount ?? 0, p.session._activeClientTurnCount ?? 0], originalStarted: p.originalStarted, payloads: JSON.parse(readFileSync(durableFile, "utf8")).filter((x: any) => x.sessionId === peer || x.sessionKey === p.session.sessionKey || x.peerId === peer), allPayloads: payloads, stored: await storage.getClientSession(peer, "1") };
+  const leaf = payloads.filter((item) => item.sessionId === peer).at(-1);
+  // This isolated sink has no PG scheduler. Project the actual acknowledged
+  // payload, including a broken/completed negative control, without inventing
+  // a terminal error or changing the real Gateway frames.
+  const terminalMessages = leaf ? materializeLosslessTurn(leaf).records.map((item, index) => ({
+    ...item.payload, _source: "server", _seq: index + 1, _orderSeq: index + 1,
+    _timelineRecord: true, _timelineUnitKey: `fixture:${leaf.turnKey}:${item.id}`,
+    _clientMessageId: leaf.clientMessageId, _turnTapeId: leaf.turnKey,
+    _turnTapeComplete: true, _dispatchOutcome: leaf.status,
+    _automaticRecoveryDecisionPending: false,
+  })) : [];
+  return { terminalMessages, sessionKey: p.session.sessionKey, turns: p.session.turns, inputCount: p.runner.submittedInputs.length, inputs: p.runner.submittedInputs, active: [p.session._activeTurnCount ?? 0, p.session._activeClientTurnCount ?? 0], originalStarted: p.originalStarted, payloads: JSON.parse(readFileSync(durableFile, "utf8")).filter((x: any) => x.sessionId === peer || x.sessionKey === p.session.sessionKey || x.peerId === peer), allPayloads: payloads, stored: await storage.getClientSession(peer, "1") };
 }
 writeFileSync(durableFile, "[]");
 const failures: string[] = [];

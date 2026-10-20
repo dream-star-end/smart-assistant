@@ -2,9 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   ADVISOR_PARENT_BLOCK_REASON,
   collaborationPutBody,
+  continuePrimaryWithoutAdvisor,
   docToUiState,
   isStaleCollabEpoch,
+  keepCollabChoiceOnSaveFailure,
   recommendedAdvisorModel,
+  refreshOriginalAdvisorForSend,
   sendCollabFields,
   type CollaborationConfigDoc,
 } from "./collaborationConfig";
@@ -207,5 +210,51 @@ describe("recommendedAdvisorModel", () => {
         advisorModels: [],
       }),
     ).toBeNull();
+  });
+});
+
+describe("keepCollabChoiceOnSaveFailure", () => {
+  it("keeps solo/team after a failed save so the user is never locked into advisor", () => {
+    expect(keepCollabChoiceOnSaveFailure("solo")).toBe(true);
+    expect(keepCollabChoiceOnSaveFailure("team")).toBe(true);
+  });
+
+  it("rolls advisor back: it cannot run without the saved config", () => {
+    expect(keepCollabChoiceOnSaveFailure("advisor")).toBe(false);
+  });
+});
+
+
+describe("continuePrimaryWithoutAdvisor", () => {
+  it("OCV5-512 recovers only a resolved empty advisor catalog without choosing another model", () => {
+    expect(continuePrimaryWithoutAdvisor(docToUiState({ ...DOC, advisorModels: [] }))).toBe(true);
+    expect(continuePrimaryWithoutAdvisor(docToUiState(DOC))).toBe(false);
+    expect(continuePrimaryWithoutAdvisor(docToUiState({ ...DOC, advisorModels: undefined }))).toBe(false);
+    expect(continuePrimaryWithoutAdvisor(docToUiState({ ...DOC, advisorModels: [], advisorUnavailableReason: "catalog unavailable: temporary" }))).toBe(false);
+    expect(continuePrimaryWithoutAdvisor(docToUiState({ ...DOC, advisorModels: [], session: { ...DOC.session, mode: "solo" } }))).toBe(false);
+    expect(DOC.session.advisorModel).toBe("gpt-6-astra");
+  });
+});
+
+describe("refreshOriginalAdvisorForSend", () => {
+  it("freezes the original advisor across another endpoint's team or advisor change", () => {
+    const original = docToUiState({ ...DOC, advisorModels: [] });
+    for (const session of [
+      { ...DOC.session, mode: "team" as const, advisorModel: null },
+      { ...DOC.session, advisorModel: "other-advisor" },
+    ]) {
+      const refreshed = refreshOriginalAdvisorForSend(original, {
+        ...DOC, session, advisorModels: [{ id: "other-advisor", label: "Other", engine: "codex" }],
+      });
+      expect(refreshed.continueSolo).toBe(true);
+      expect(refreshed.state.mode).toBe("advisor");
+      expect(refreshed.state.advisorModel).toBe(original.advisorModel);
+      expect(refreshed.state.configVersion).toBe("");
+    }
+    const restored = refreshOriginalAdvisorForSend(original, DOC);
+    expect(restored.continueSolo).toBe(false);
+    expect(restored.state.advisorModel).toBe("gpt-6-astra");
+    expect(restored.state.configVersion).toBe(DOC.session.configVersion);
+    expect(original.advisorModels).toEqual([]);
   });
 });

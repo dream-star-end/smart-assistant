@@ -9,7 +9,11 @@ import { describe, test } from 'node:test'
 
 describe('direct tape reads do not impose a conversation-length rate ceiling', () => {
   test('record pages and exact payload streaming have no tape-specific token bucket', () => {
-    const source = readFileSync(new URL('../server.ts', import.meta.url), 'utf8')
+    // OCV5-465: the tape record routes moved to routes/clientSessions.ts; a limiter in
+    // either file would count, so check both.
+    const source =
+      readFileSync(new URL('../server.ts', import.meta.url), 'utf8') +
+      readFileSync(new URL('../routes/clientSessions.ts', import.meta.url), 'utf8')
 
     assert.doesNotMatch(source, /tapeRecordsRateLimiter/)
     assert.doesNotMatch(source, /tapeRecordChunkRateLimiter/)

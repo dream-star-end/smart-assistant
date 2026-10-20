@@ -14,16 +14,14 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { gatewayMethodBody } from './helpers/gatewaySource.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SERVER_TS = join(HERE, '..', 'server.ts')
 
+// OCV5-493: bootAutoResume moved to gatewayLifecycle.ts; read it from the Gateway source set.
 function bootAutoResumeBody(): string {
-  const src = readFileSync(SERVER_TS, 'utf8')
-  const start = src.indexOf('private async bootAutoResume(): Promise<void> {')
-  assert.ok(start >= 0, 'bootAutoResume not found')
-  const end = src.indexOf('\n  }\n', start)
-  return src.slice(start, end)
+  return gatewayMethodBody('bootAutoResume')
 }
 
 describe('bootAutoResume yields between sessions (OCV5-428)', () => {

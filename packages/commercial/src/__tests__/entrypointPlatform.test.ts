@@ -93,8 +93,8 @@ describe("platform-seed.yaml schema v2 + validatePlatformSeed", () => {
     assert.equal(main.displayName, "全能助手");
     assert.equal(main.toolsets, undefined, "main declares no toolsets (matches legacy inline shape)");
     const hr = byId("hidden-reviewer");
-    assert.equal(hr.model, "glm-5.3");
-    assert.equal(hr.provider, "scnet");
+    assert.equal(hr.model, "glm-5.3-zai");
+    assert.equal(hr.provider, "zai");
     assert.equal(hr.persona, "personas/hidden-reviewer.md");
     assert.equal(hr.forcePersona, true, "裁决词汇必须每 boot 强制刷新");
     assert.equal(hr.permissionMode, "bypassPermissions");
@@ -968,4 +968,18 @@ exec npx --no-install tsx packages/mcp-memory/src/ocMemoryCli.ts "$@"
       rmSync(dir, { recursive: true, force: true });
     }
   });
+});
+
+test("boot timing records adjacent numeric milestones without contents and cannot fail boot", () => {
+  const events: unknown[] = [];
+  const clock = [10, 11, 18, 20];
+  const mark = pb.createContainerBootTiming((e: unknown) => events.push(e), () => clock.shift(), () => 100);
+  mark('module_loaded'); mark('seed_validated'); mark('gateway_spawn');
+  assert.deepEqual(events, [
+    { stage: 'module_loaded', elapsedMs: 1, stageMs: 1, tsEpochMs: 100 },
+    { stage: 'seed_validated', elapsedMs: 8, stageMs: 7, tsEpochMs: 100 },
+    { stage: 'gateway_spawn', elapsedMs: 10, stageMs: 2, tsEpochMs: 100 },
+  ]);
+  const throwing = pb.createContainerBootTiming(() => { throw Error('sink failed') });
+  assert.doesNotThrow(() => throwing('module_loaded'));
 });

@@ -1,3 +1,6 @@
+import { BoxAccountResolverError, BoxEgressNotConfiguredError } from "../http/proxy/boxAccountResolver.js";
+import { decodeUpstreamRetryHint } from '@openclaude/protocol';
+import { BoxTextFetchError } from '../http/proxy/boxTextFetch.js';
 /**
  * V3 Phase 4 — `http/proxy/core.ts` 单元测试。
  *
@@ -530,7 +533,7 @@ describe("runUpstreamRoundTrip — upstream non-2xx 分支", () => {
     assert.equal(res.responseHeaders["retry-after"], "42", "Retry-After 从上游透传");
   });
 
-  test("上游 429 无 Retry-After → 429 + 默认 60s Retry-After", async () => {
+  test("上游 429 无 Retry-After → 网关指数退避、不虚构60秒等待", async () => {
     const { ctx, res } = buildCtx({
       fetchImpl: async () =>
         new Response('{"type":"error","error":{"type":"rate_limit_error"}}', { status: 429 }),
@@ -538,7 +541,8 @@ describe("runUpstreamRoundTrip — upstream non-2xx 分支", () => {
     await runUpstreamRoundTrip(ctx);
 
     assert.equal(res.statusCode, 429);
-    assert.equal(res.responseHeaders["retry-after"], "60", "缺上游头时给 60s 保守默认");
+    assert.equal(res.responseHeaders["retry-after"], undefined);
+    assert.equal(decodeUpstreamRetryHint(res.bodyText()), undefined);
   });
 
   test("Moonshot billing-cycle 403 → durable block + non-retryable 400,且不扣费", async () => {
@@ -1051,3 +1055,116 @@ describe("runUpstreamRoundTrip — finally 兜底不变量", () => {
   assert.equal(finalize.commitCalls.length,1);
   assert.deepEqual(finalize.commitCalls[0], {kind:'final', usage:{input_tokens:20n,output_tokens:10n,cache_read_tokens:80n,cache_write_tokens:0n}});
  });
+
+// ─── OCV5-482:主上游拒绝时同请求改发回落上游 ───────────────────────────────
+
+describe("runUpstreamRoundTrip — static route fallback (OCV5-482)", () => {
+  const GO_LIMIT = '{"type":"error","error":{"type":"GoUsageLimitError","message":"Go usage limit exceeded"}}';
+  function fallbackSpy() {
+    const spy = makeSession({ endpoint: "https://api.deepseek.com/anthropic/v1/messages", upstreamModel: "deepseek-flash" });
+    (spy.session as { providerId?: string }).providerId = "deepseek";
+    return spy;
+  }
+
+  test("Go 周额度 429 → 回落上游重试一次,正常结算并记实际上游", async () => {
+    const calls: Array<[string, unknown]> = [];
+    const fb = fallbackSpy();
+    const { ctx, session, finalize } = buildCtx({
+      bodyModel: "deepseek-v4-flash",
+      sessionOver: { endpoint: "https://opencode.ai/zen/go/v1/messages", upstreamModel: "deepseek-v4.1-flash" },
+      fetchImpl: async (url, init) => {
+        calls.push([url, (JSON.parse(String(init.body)) as { model?: unknown }).model]);
+        return calls.length === 1 ? new Response(GO_LIMIT, { status: 429 }) : sseFullResponse();
+      },
+      finalizerOutcome: { state: "committed", debitedCredits: 0n },
+    });
+    const served: Array<{ provider: string; model: string }> = [];
+    ctx.finalize = { ...ctx.finalize, setUpstream: (u) => served.push(u) };
+    ctx.fallbackSession = async () => fb.session;
+    ctx.recordServedUpstream = true;
+    await runUpstreamRoundTrip(ctx);
+    assert.deepEqual(calls, [
+      ["https://opencode.ai/zen/go/v1/messages", "deepseek-v4.1-flash"],
+      ["https://api.deepseek.com/anthropic/v1/messages", "deepseek-flash"],
+    ]);
+    assert.equal(finalize.commitCalls.length, 1);
+    assert.equal(finalize.failCalls.length, 0);
+    assert.deepEqual(served, [{ provider: "deepseek", model: "deepseek-flash" }]);
+    assert.equal(ctx.body.model, "deepseek-v4-flash", "计费 canonical model 不变");
+    assert.equal(session.zeroizeCount, 1, "主上游 session 换下时零化");
+    assert.equal(fb.zeroizeCount, 1, "回落 session 在 finally 零化");
+    assert.equal(fb.applyAuthCalls, 1);
+  });
+
+  test("回落上游不可用 → 主上游 429 原样透传", async () => {
+    let fetches = 0;
+    const { ctx, res, finalize } = buildCtx({
+      bodyModel: "deepseek-v4-flash",
+      fetchImpl: async () => {
+        fetches += 1;
+        return new Response(GO_LIMIT, { status: 429, headers: { "Retry-After": "30" } });
+      },
+    });
+    ctx.fallbackSession = async () => null;
+    await runUpstreamRoundTrip(ctx);
+    assert.equal(fetches, 1);
+    assert.equal(res.statusCode, 429);
+    assert.equal(res.responseHeaders["retry-after"], "30");
+    assert.equal(finalize.failCalls.length, 1);
+  });
+
+  test("主上游 400 不触发回落", async () => {
+    let asked = 0;
+    const { ctx, finalize } = buildCtx({
+      bodyModel: "deepseek-v4-flash",
+      fetchImpl: async () => new Response('{"type":"error","error":{"type":"invalid_request_error"}}', { status: 400 }),
+    });
+    ctx.fallbackSession = async () => {
+      asked += 1;
+      return null;
+    };
+    await runUpstreamRoundTrip(ctx);
+    assert.equal(asked, 0);
+    assert.equal(finalize.failClientCalls.length, 1);
+  });
+});
+
+
+test('429 HTTP-date keeps exact header and carries absolute error-only deadline', async () => {
+  const deadline = new Date(Date.now() + 120_000).toUTCString();
+  const { ctx, res } = buildCtx({ fetchImpl: async () => new Response('rate limited', {
+    status: 429, headers: { 'Retry-After': deadline },
+  }) });
+  await runUpstreamRoundTrip(ctx);
+  assert.equal(res.responseHeaders['retry-after'], deadline);
+  const response = JSON.parse(res.bodyText()) as { error: { message: string } };
+  assert.deepEqual(decodeUpstreamRetryHint(response.error.message), {
+    status: 429, retryNotBeforeMs: Date.parse(deadline),
+  });
+});
+for (const code of ['BOX_UID_PROXY_UNAVAILABLE', 'BOX_UID_PROXY_INVALID']) {
+  test(`Box configuration ${code} fails explicitly without health penalty or charge`, async () => {
+    const { ctx, res, finalize, session } = buildCtx({ fetchImpl: async () => { throw new BoxTextFetchError(code); } });
+    await runUpstreamRoundTrip(ctx);
+    assert.equal(res.statusCode, 409);
+    assert.equal(JSON.parse(res.bodyText()).error.code, 'BOX_EGRESS_NOT_CONFIGURED');
+    assert.equal(finalize.failClientCalls.length, 1);
+    assert.equal(finalize.failCalls.length, 0);
+    assert.equal(finalize.commitCalls.length, 0);
+    assert.equal(session.zeroizeCount, 1);
+  });
+}
+
+test("Tool lane proof fails without charging; an unproven UID read stays retryable", async () => {
+  for (const proven of [true, false]) {
+    const failure = proven
+      ? new BoxEgressNotConfiguredError("BOX_UID_PROXY_UNAVAILABLE", "missing")
+      : new BoxAccountResolverError("BOX_UID_PROXY_UNAVAILABLE");
+    const { ctx, res, finalize } = buildCtx({ fetchImpl: async () => { throw failure; } });
+    await runUpstreamRoundTrip(ctx);
+    assert.equal(res.statusCode, proven ? 409 : 500);
+    assert.equal(finalize.failClientCalls.length, proven ? 1 : 0);
+    assert.equal(finalize.failCalls.length, proven ? 0 : 1);
+    assert.equal(finalize.commitCalls.length, 0);
+  }
+});

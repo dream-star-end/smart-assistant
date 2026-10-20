@@ -1,6 +1,7 @@
 /**
  * Run: npx tsx --test packages/gateway/src/__tests__/agentEfficiencyGuard.test.ts
  */
+import { readSessionManagerSource } from './helpers/sessionManagerSource.js'
 import assert from 'node:assert/strict'
 import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -14,6 +15,7 @@ delete process.env.OPENCLAUDE_VERIFICATION_BUDGET_MS
 
 const {
   lintBashCommand,
+  suggestAlternative,
   observeToolUse,
   createTurnGuardState,
   classifyUserEfficiencyIntent,
@@ -341,9 +343,42 @@ describe('session hook helpers + format', () => {
   })
 })
 
+describe('antigravity local-file wording', () => {
+  const sample = 'rg efficiency packages/gateway/src/promptSlots.ts'
+
+  it('points shell reads at oc_grep / oc_glob / oc_bash', () => {
+    const hits = lintBashCommand(sample, 'warn', 'antigravity')
+    const hit = hits.find((h) => h.code === 'local_file_via_shell')
+    assert.ok(hit)
+    assert.match(hit.message, /oc_grep/)
+    assert.match(hit.message, /oc_glob/)
+    assert.match(hit.message, /oc_bash/)
+    assert.match(suggestAlternative(hit, 'antigravity'), /oc_bash/)
+  })
+
+  it('keeps the native Read/Grep/Glob wording when engine is absent', () => {
+    const hits = lintBashCommand(sample)
+    const hit = hits.find((h) => h.code === 'local_file_via_shell')
+    assert.ok(hit)
+    assert.match(hit.message, /原生 Read\/Grep\/Glob/)
+    assert.equal(hit.message.includes('oc_grep'), false)
+  })
+
+  it('applyEfficiencyToolObservation follows providerTag', () => {
+    const agy: EfficiencySessionState = { providerTag: 'antigravity' }
+    applyEfficiencyToolObservation(agy, { name: 'Bash', input: { command: sample } }, 1)
+    assert.match(agy._efficiencyPendingHits?.[0]?.message ?? '', /oc_grep/)
+    const plain: EfficiencySessionState = {}
+    applyEfficiencyToolObservation(plain, { name: 'Bash', input: { command: sample } }, 1)
+    assert.match(plain._efficiencyPendingHits?.[0]?.message ?? '', /原生 Read\/Grep\/Glob/)
+    assert.equal((plain._efficiencyPendingHits?.[0]?.message ?? '').includes('oc_grep'), false)
+  })
+})
+
 describe('sessionManager mount contract', () => {
   it('hooks the existing tool_use_detected / submit / turn-end path', () => {
-    const src = readFileSync(new URL('../sessionManager.ts', import.meta.url), 'utf8')
+    // sessionManager.ts + split-out modules (FINDINGS §7.6 M1–M3)
+    const src = readSessionManagerSource()
     assert.match(src, /applyEfficiencyToolObservation/)
     assert.match(src, /prepareEfficiencyTurnNote/)
     assert.match(src, /finalizeEfficiencyTurn/)

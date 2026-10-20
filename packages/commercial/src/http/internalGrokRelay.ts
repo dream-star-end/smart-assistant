@@ -1,3 +1,5 @@
+import type { Logger } from '../logging/logger.js'
+import { createPassiveRelayTiming } from './passiveRelayTiming.js'
 /** Master-side relay for official Grok CLI subscription traffic. */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { pipeline } from 'node:stream/promises'
@@ -7,7 +9,7 @@ import {
   verifyContainerIdentity,
   type ContainerIdentityRepo,
 } from '../auth/containerIdentity.js'
-import { resolveGrokRouteContext } from '../account-pool/groups.js'
+import { hasInflightDelegateGrokBilling, resolveGrokRouteContext } from '../account-pool/groups.js'
 import { getFreshGrokAccessToken } from '../account-pool/grokOAuth.js'
 import type { AccountHealthTracker } from '../account-pool/health.js'
 import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
@@ -138,6 +140,8 @@ function grokRelayPublicMessage(code: string): string {
       return 'grok slot lease lost'
     case 'UNAUTHORIZED':
       return 'grok relay unauthorized'
+    case 'GROK_DELEGATE_NOT_BILLED':
+      return 'grok delegate route has no admitted billing'
     default:
       return `grok relay error (${code})`
   }
@@ -181,7 +185,9 @@ function upstreamHeaders(req: IncomingMessage, accessToken: Buffer, modelId: str
 
 export function makeGrokRelayHandler(deps: {
   identityRepo: ContainerIdentityRepo
+  logger?: Pick<Logger, 'info'>
   resolveContext?: typeof resolveGrokRouteContext
+  hasDelegateBilling?: typeof hasInflightDelegateGrokBilling
   freshToken?: typeof getFreshGrokAccessToken
   resolveDispatcher?: (accountId: bigint) => Promise<{ dispatcher: Dispatcher }>
   requestFn?: typeof request
@@ -189,6 +195,7 @@ export function makeGrokRelayHandler(deps: {
   renewSlot?: (accountId: bigint, slotId: string) => boolean
 }): GrokRelayHandler {
   return async (req, res, ctx) => {
+    const receivedAt = performance.now()
     setSecurityHeaders(res)
     const requestId = ensureRequestId(req)
     res.setHeader(REQUEST_ID_HEADER, requestId)
@@ -211,6 +218,20 @@ export function makeGrokRelayHandler(deps: {
       userId: BigInt(identity.userId),
     })
     if (!context || !GROK_RELAY_MODEL_IDS.has(context.modelId)) { error(res, 404, 'GROK_ROUTE_EXPIRED', requestId); return }
+    if (context.kind === 'delegate') {
+      const billed = await (deps.hasDelegateBilling ?? hasInflightDelegateGrokBilling)({
+        token: match[1]!,
+        containerId: identity.containerId,
+        userId: BigInt(identity.userId),
+      })
+      if (!billed) { error(res, 403, 'GROK_DELEGATE_NOT_BILLED', requestId); return }
+    }
+    const stage = createPassiveRelayTiming(deps.logger, {
+      engine: 'grok', requestId, uid: String(identity.userId),
+      model: context.modelId, slotId: context.slotId,
+    }, receivedAt)
+    stage('proxy_received')
+    stage('route_ready')
     let accessToken: Buffer | null = null
     if (deps.renewSlot && !deps.renewSlot(context.accountId, context.slotId)) {
       error(res, 409, 'GROK_SLOT_LEASE_LOST', requestId)
@@ -230,15 +251,19 @@ export function makeGrokRelayHandler(deps: {
       // Same selfhost workaround as device auth: xAI is reachable from the
       // master host, but the bound sing-box egress is IPv6-only and RST.
       // Explicit direct Agent also bypasses the process-global EnvHttpProxyAgent.
+      stage('upstream_prepare_started')
       const route = await (deps.resolveDispatcher ?? (async () =>
         ({ dispatcher: directEgressDispatcher() })))(context.accountId)
       accessToken = await (deps.freshToken ?? getFreshGrokAccessToken)(context.accountId)
+      stage('upstream_prepare_complete')
+      stage('fetch_started')
       const upstream = await (deps.requestFn ?? request)(`${GROK_OFFICIAL_UPSTREAM_BASE_URL}${suffix}${parsed.search}`, {
         method: method as 'GET' | 'POST',
         dispatcher: route.dispatcher,
         headers: upstreamHeaders(req, accessToken, context.modelId),
         body: method === 'GET' ? undefined : req,
       })
+      stage('headers_received', { statusCode: upstream.statusCode })
       res.statusCode = upstream.statusCode
       for (const [rawKey, rawValue] of Object.entries(upstream.headers)) {
         const key = rawKey.toLowerCase()
@@ -262,7 +287,9 @@ export function makeGrokRelayHandler(deps: {
       })
       void recordStatus(context.accountId, upstream.statusCode).catch(() => {})
       await pipeline(upstream.body, res)
+      stage('stream_complete')
     } catch (err) {
+      stage('relay_failed')
       if (res.headersSent) {
         res.destroy(err instanceof Error ? err : undefined)
       } else {

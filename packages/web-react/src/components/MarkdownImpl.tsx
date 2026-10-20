@@ -24,6 +24,7 @@ import {
   type ReactNode,
 } from "react";
 import { isContainerPreviewUrl } from "@openclaude/protocol/containerPreview";
+import { artifactDownloadPath } from "../lib/chat/artifactDownloadPath";
 import { PRODUCT_CAPABILITIES } from "../lib/productCapabilities";
 import { cn } from "../lib/utils";
 import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, ZoomableImage } from "./chat/media";
@@ -32,6 +33,7 @@ import { CodeBlock } from "./CodeBlock";
 import { OptionsBlock, ChartBlock, HtmlPreview, MermaidBlock } from "./RichBlocks";
 import { IuiBlock } from "./iui/IuiBlock";
 import { uiFencesToMarkdown } from "./iui/toMarkdown";
+import { normalizeInlineUiFences } from "../lib/uiFence";
 import { useIntelligentUiEnabled } from "../lib/intelligentUi";
 import type { MarkdownProps } from "./Markdown";
 import { normalizeMathDelimiters, unclosedDisplayMathStart } from "./mathDelimiters";
@@ -438,6 +440,15 @@ export default function MarkdownImpl({
           },
           a: ({ children, href, node: _node, ...props }) => {
             const containerLocal = typeof href === "string" && isContainerPreviewUrl(href);
+            const artifactPath = signMedia && !readOnly ? artifactDownloadPath(href) : null;
+            if (artifactPath) {
+              const filename = artifactPath.split("/").pop();
+              // Linked thumbnails keep their viewer; downloading is a sibling action, never nested controls.
+              if (hasMarkdownImage(children)) {
+                return <span className="inline-flex max-w-full flex-col items-start gap-1">{children}<SignedFileCard src={artifactPath} filename={filename} label={`下载 ${filename}`} /></span>;
+              }
+              return <SignedFileCard src={artifactPath} filename={filename} label={children} />;
+            }
             // 只读站内信中的链接图片把灯箱与原链接拆成两个同级动作，避免格式包装下仍出现
             // <a><button /></a> 非法嵌套和一次点击双重导航，同时不丢原链接功能。
             if (readOnly && hasMarkdownImage(children)) {
@@ -525,7 +536,9 @@ export default function MarkdownImpl({
         components={components}
       >
         {typeof children === "string"
-          ? normalizeMathDelimiters(iuiEnabled ? source : uiFencesToMarkdown(source, !!live))
+          ? normalizeMathDelimiters(
+              iuiEnabled ? normalizeInlineUiFences(source) : uiFencesToMarkdown(source, !!live),
+            )
           : children}
       </ReactMarkdown>
       {heldMath >= 0 && (

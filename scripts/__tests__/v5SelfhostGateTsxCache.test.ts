@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
@@ -16,7 +16,7 @@ function fn(name: string): string {
   return m[0];
 }
 
-const fns = ["create_master_gate_tmpdir", "cleanup_master_gate_tmpdir", "sweep_stale_master_gate_tmpdirs", "prune_shared_tsx_cache"]
+const fns = ["create_master_gate_tmpdir", "cleanup_master_gate_tmpdir", "sweep_stale_master_gate_tmpdirs"]
   .map(fn)
   .join("\n");
 
@@ -25,7 +25,6 @@ function run(dir: string, body: string, env: Record<string, string> = {}) {
     'mlog() { echo "$*" >&2; }',
     `MASTER_GATE_TMP_PREFIX=${JSON.stringify(path.join(dir, "gate"))}`,
     'MASTER_GATE_TMPDIR=""',
-    'TSX_SHARED_CACHE_MAX_AGE_MIN="${TSX_SHARED_CACHE_MAX_AGE_MIN:-2880}"',
     fns,
     body,
   ].join("\n");
@@ -60,11 +59,32 @@ describe("selfhost release gates use a per-build tsx cache (OCV5-357)", () => {
     assert.match(box, /if \(process\.env\.TMPDIR\) allowed\.add\("TMPDIR"\);/);
     assert.match(box, /\.\.\.\(process\.env\.TMPDIR \? \{ TMPDIR: process\.env\.TMPDIR \} : \{\}\),\n {6}\.\.\.extra,/);
     const cb = readFileSync(path.join(root, "scripts/check-v5-callback-payload-hash.mjs"), "utf8");
-    assert.match(cb, /OC_TEST_MUTEX_TIMEOUT: '90',\n\s+\.\.\.\(process\.env\.TMPDIR \? \{ TMPDIR: process\.env\.TMPDIR \} : \{\}\) \},/);
+    assert.match(cb, /OC_TEST_MUTEX_TIMEOUT: '240',\n\s+\.\.\.\(process\.env\.TMPDIR \? \{ TMPDIR: process\.env\.TMPDIR \} : \{\}\) \},/);
     // The others already give their workers a TMPDIR under os.tmpdir(), which is the private dir.
     for (const f of ["check-v5-cursor-sand-inference.ts", "check-v5-delegate-billing-requestid.ts", "check-v5-cron-submit-boundary.ts", "check-v5-session-unavailable-rootfix.ts"]) {
       assert.match(readFileSync(path.join(root, "scripts", f), "utf8"), /TMPDIR/, f);
     }
+  });
+
+  test("OCV5-492: callback proof limits nest — per-case < file run() < mutex execution < supervisor timer", () => {
+    const cb = readFileSync(path.join(root, "scripts/check-v5-callback-payload-hash.mjs"), "utf8");
+    const ms = (re: RegExp) => {
+      const m = cb.match(re);
+      assert.ok(m, String(re));
+      return Number(m[1]!.replaceAll("_", ""));
+    };
+    const fileMs = ms(/forceExit: false,\n(?:\s*\/\/[^\n]*\n)*\s*timeout: ([\d_]+),/);
+    const mutexMs = ms(/OC_TEST_MUTEX_TIMEOUT: '(\d+)'/) * 1000;
+    const timerMs = ms(/const timer = setTimeout\(stop, ([\d_]+)\);/);
+    const bridge = readFileSync(path.join(root, "packages/commercial/src/__tests__/modelAuthorityBridge.test.ts"), "utf8");
+    const caseMs = Number(bridge.match(/const OCV5_187_CASE_TIMEOUT_MS = ([\d_]+);/)?.[1]?.replaceAll("_", ""));
+    // Every OCV5-187 case carries the per-case guard (three generated cron-origin cases + the browser case).
+    assert.equal(bridge.match(/test\([^\n]*OCV5-187[^\n]*\{ timeout: OCV5_187_CASE_TIMEOUT_MS \}/g)?.length, 2);
+    assert.ok(caseMs > 0 && caseMs < fileMs, `per-case ${caseMs} < file ${fileMs}`);
+    // An idle cold run of the file is ~12.4 s; the file bound must leave room for a loaded host.
+    assert.ok(fileMs >= 120_000, `file bound ${fileMs} covers cold load under contention`);
+    assert.ok(fileMs + 30_000 <= mutexMs, `file ${fileMs} + worker start-up < mutex ${mutexMs}`);
+    assert.ok(1_800_000 + mutexMs <= timerMs, `mutex wait 1800 s + execution ${mutexMs} <= timer ${timerMs}`);
   });
 
   test("every failure path cleans the gate dir: cleanup_master_staging calls it first", () => {
@@ -128,28 +148,36 @@ test -z "$MASTER_GATE_TMPDIR" && echo cleared`,
     for (const d of [live, odd, target, `${prefix}.999999998.lnk`]) assert.ok(existsSync(d), d);
   });
 
-  test("shared cache prune deletes only old tsx cache files", (t) => {
+  test("build preflight preserves shared cache and still stops at the disk or prerequisite gate", (t) => {
     const dir = fixture(t);
+    // This is an owned fake TMPDIR, never the host's shared cache.
     const cache = path.join(dir, `tsx-${process.getuid?.()}`);
     mkdirSync(cache);
     const old = path.join(cache, "17915-" + "a".repeat(40));
-    const fresh = path.join(cache, "17915-" + "b".repeat(40));
-    const pipe = path.join(cache, "123.pipe");
-    const other = path.join(cache, "keep-me");
-    for (const f of [old, fresh, pipe, other]) writeFileSync(f, "{}");
+    writeFileSync(old, "warm-cache");
     const threeDaysAgo = Date.now() / 1000 - 3 * 86400;
-    for (const f of [old, pipe, other]) utimesSync(f, threeDaysAgo, threeDaysAgo);
-    const r = run(dir, "prune_shared_tsx_cache");
-    assert.equal(r.status, 0, r.stderr);
-    assert.deepEqual(readdirSync(cache).sort(), ["123.pipe", "17915-" + "b".repeat(40), "keep-me"].sort());
-    assert.match(r.stderr, /2 → 1 个条目/);
-  });
-
-  test("shared cache prune never fails the build on a bad threshold", (t) => {
-    const dir = fixture(t);
-    mkdirSync(path.join(dir, `tsx-${process.getuid?.()}`));
-    const r = run(dir, "prune_shared_tsx_cache; echo after", { TSX_SHARED_CACHE_MAX_AGE_MIN: "soon" });
-    assert.equal(r.status, 0, r.stderr);
-    assert.match(r.stdout, /after/);
+    utimesSync(old, threeDaysAgo, threeDaysAgo);
+    for (const diskOk of [false, true]) {
+      const r = run(dir, [
+        fn("build_master_release"),
+        `REPO_ROOT=${JSON.stringify(root)}`,
+        `MASTER_RELEASES_ROOT=${JSON.stringify(path.join(dir, "releases"))}`,
+        'DRY=0',
+        // Tripwire for the removed legacy call, including accidental reintroduction.
+        'prune_shared_tsx_cache() { echo unexpected-shared-prune; exit 91; }',
+        diskOk
+          ? 'assert_master_releases_disk() { echo disk-checked; }'
+          : 'assert_master_releases_disk() { echo disk-blocked; exit 72; }',
+        // Stop before staging/build/any actual npm invocation.
+        'command() { echo prerequisite-checked; return 1; }',
+        'die() { echo "$*" >&2; exit 73; }',
+        'build_master_release',
+      ].join("\n"));
+      assert.equal(r.status, diskOk ? 73 : 72, r.stderr + r.stdout);
+      assert.match(r.stdout, diskOk ? /disk-checked/ : /disk-blocked/);
+      assert.doesNotMatch(r.stdout, /unexpected-shared-prune/);
+      assert.equal(readFileSync(old, "utf8"), "warm-cache");
+      assert.equal(existsSync(path.join(dir, "releases")), false);
+    }
   });
 });

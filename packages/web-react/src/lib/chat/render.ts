@@ -593,6 +593,7 @@ const ERROR_LABELS: Record<string, string> = {
   internal_error: "服务内部错误",
   auth_error: "认证状态异常",
   service_restart: "服务重启，本轮已中断",
+  admission_restart_unexecuted: "任务尚未开始",
   session_persist_unavailable: "消息暂未安全送达",
   session_deleted: "会话已删除",
   durable_dispatch_unavailable: "派发未能接入执行通道",
@@ -887,6 +888,11 @@ export function freezeErrorCardSnapshots(
     }
   }
   for (const message of messages) {
+    // The source was delivered; an automatic continuation is not a failed
+    // send. Keep its transport label consistent with the held error card.
+    if (message.role === "user" && recoveringSources.has(message.id) && message.status === "error") {
+      message.status = "sent";
+    }
     if (message._errorCardSnapshot?.disposition === "card") {
       message._errorHeldForRecovery = undefined;
       continue;

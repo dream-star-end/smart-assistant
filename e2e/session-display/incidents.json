@@ -921,7 +921,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T29 自动重试只显示中性的进行中状态（无模型繁忙、无 n/10）；重试成功保持实时可见"
+          "assertion": "T29 自动恢复统一显示模型繁忙正在重试；重试成功保持实时可见"
         }
       ],
       "coverageCommits": []
@@ -944,14 +944,14 @@
           "assertion": "retrying API error attempt stays non-terminal and the next successful attempt streams live"
         },
         {
-          "layer": "browser",
-          "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T29 自动重试只显示中性的进行中状态（无模型繁忙、无 n/10）；重试成功保持实时可见"
-        },
-        {
           "layer": "integration",
           "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
           "assertion": "unified timeline hides only a recovered API Error attempt and preserves its immutable audit rows"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/run.mjs",
+          "assertion": "T29 自动恢复统一显示模型繁忙正在重试；重试成功保持实时可见"
         }
       ]
     },
@@ -1283,7 +1283,7 @@
         {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
-          "assertion": "T29 自动重试只显示中性的进行中状态（无模型繁忙、无 n/10）；重试成功保持实时可见"
+          "assertion": "T29 自动恢复统一显示模型繁忙正在重试；重试成功保持实时可见"
         }
       ]
     },
@@ -1398,11 +1398,6 @@
           "assertion": "durable journal rebuilds once, then appends only records after the shared cursor"
         },
         {
-          "layer": "unit",
-          "path": "packages/web-react/src/components/chat/turnActivity.test.tsx",
-          "assertion": "OCV5-390: retrying → only the neutral in-progress line, no busy wording, counter or warning colour"
-        },
-        {
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T31 journal page1→WS N→page2(N)：已响应思考/工具/正文各恰好一次"
@@ -1411,6 +1406,11 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T35 Composer 是唯一 Stop 入口，停止结算中原按钮禁用且不重复提交"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnActivity.test.tsx",
+          "assertion": "OCV5-523: retrying → one model-busy retry hint, no counter or warning colour"
         }
       ],
       "coverageCommits": []
@@ -5783,6 +5783,11 @@
           "layer": "browser",
           "path": "packages/web-react/browser-tests/run.mjs",
           "assertion": "T13 工具卡触控尺寸、键盘交互、渐进列表与移动宽度"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/ToolCard.test.tsx",
+          "assertion": "工具卡表头默认至少 44px 高(min-h-11),不是 40px"
         }
       ]
     },
@@ -5926,7 +5931,7 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/engine/ccbAdapterBoxStop.test.ts",
-          "assertion": "OCV5-315 only the exact continuation reject qualifies"
+          "assertion": "OCV5-488 any refusal before Box qualifies; retried, still-resolving and 5xx results do not"
         }
       ]
     },
@@ -6428,6 +6433,11 @@
           "layer": "unit",
           "path": "packages/commercial/src/http/proxy/boxToolFirstRound.test.ts",
           "assertion": "anyWritten.kind === \"final\" && anyWritten.nativePointer?.cliVersion, \"2.1.999\""
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliVersion.test.ts",
+          "assertion": "boxCliNativeResumeVerified(\"2.1.999\"), true"
         }
       ]
     },
@@ -7563,7 +7573,8 @@
       "coverageCommits": [
         "44e04ac6",
         "693212d9",
-        "74b6c0c2"
+        "74b6c0c2",
+        "c8743712"
       ],
       "regressions": [
         {
@@ -7600,6 +7611,26 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/codexTurnRetry.test.ts",
           "assertion": "Stop while starting, then shutdown rejects the start → USER_CANCELLED, not CODEX_ERROR"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "OCV5-522: same-stack Stop before engine start retains exactly one owned terminal billing"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "OCV5-522: a synchronous kernel result has billing ownership before submit returns"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "OCV5-522: a stale result from A cannot bill or finish the routed turn B"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/codexAdapterTurnParity.test.ts",
+          "assertion": "OCV5-522: a genuine success racing Stop retains its actual positive usage"
         }
       ],
       "proofPending": {
@@ -7687,6 +7718,588 @@
       "coverageCommits": [
         "eda1105b",
         "f65e85e2"
+      ]
+    },
+    {
+      "id": "INC-20261017-COLLAB-MODE-LOCK",
+      "occurredAt": "2026-10-17",
+      "severity": "P0",
+      "symptom": "商业版全能助手协作方式：选「顾问」提示暂时没有可用的顾问型号，红字「协作配置保存失败（追踪号 50e024e47bcd4ccd9500877225074562）」，之后切回单人/团队也切不了，无法发送。根因：商业容器 /api/collaboration-config 是 selfhost-only 恒 404；前端保存失败回滚到 previous，连点后 previous 已是顾问，于是永远回滚到顾问。个人版无顾问型号时 PUT 400 同样锁死。修复：单人/团队是每轮帧字段，保存失败保留用户选择、首发不拦截；只有顾问回滚。",
+      "rootFixCommit": "e0921a6f",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/collaborationConfig.test.ts",
+          "assertion": "keeps solo/team after a failed save so the user is never locked into advisor"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/collaborationConfig.test.ts",
+          "assertion": "rolls advisor back: it cannot run without the saved config"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-477-collab-404-app.node-test.mjs",
+          "assertion": "solo must stick after a 404 save"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelAuthorityLocalPath.test.ts",
+          "assertion": "billed_delegate runs a grok member without the selfhost exemption"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/collaborationConfigHttp.test.ts",
+          "assertion": "commercial (no exemption) serves and saves collaboration-config"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalGrokRelay.test.ts",
+          "assertion": "OCV5-477: a delegate route with no admitted billing is refused before upstream traffic"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-477-advisor-error-clears-app.node-test.mjs",
+          "assertion": "no stale save error after a successful save"
+        }
+      ],
+      "coverageCommits": [
+        "84ab6a18",
+        "0fab8a0d",
+        "7d838973"
+      ]
+    },
+    {
+      "id": "INC-20261017-INLINE-UI-FENCE",
+      "occurredAt": "2026-10-17",
+      "severity": "P1",
+      "symptom": "官方 DeepSeek(deepseek-v4-flash)把输入预测块紧贴正文写成 2```ui{\"type\":\"next\",…}，CommonMark 只在行首开围栏，聊天页把整块当行内代码显示原始 JSON，输入预测也丢失。商业热修 #809 第二次重发被真实对话门挡下(g477-deploy2-journal.log)。修复：渲染、ui→Markdown 转换、输入预测前统一把贴行的 ui 开/收围栏挪到单独一行。",
+      "rootFixCommit": "4f305612",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/uiFence.test.ts",
+          "assertion": "贴在正文后的 ui 块挪到单独一行,JSON 离开围栏行"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/uiFence.test.ts",
+          "assertion": "输入预测与 Markdown 转换都认得贴行的块"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-482-inline-ui-fence.node-test.mjs",
+          "assertion": "an inline ```ui next block never reaches the screen"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/uiFence.test.ts",
+          "assertion": "缩进代码块里的 ```ui 示例不动,后续正文保留(Codex r1)"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerUiFenceNormalize.test.ts",
+          "assertion": "tape must carry the normalized text"
+        }
+      ],
+      "coverageCommits": [
+        "7ef1370c",
+        "753a51d5",
+        "1e7dbd6a",
+        "a8f82025"
+      ]
+    },
+    {
+      "id": "INC-20261017-CONFIG-CHANGE-PINS-BOX-SESSION",
+      "occurredAt": "2026-10-17",
+      "severity": "P0",
+      "symptom": "商业（2026-10-17，#49fab402）：uid 4 会话 webmvbypkb8b255w1 全能助手 Box Claude Opus 5.5 最高档，一轮执行 68 步后显示『模型配置已更新，请重发』（中断前 44 次已完成调用计 1943 积分，被拒那次未计费），之后『请继续』等每条消息都显示『消息未开始处理，已确认未计费』。根因：07:10:13Z 管理端下线 DeepSeek V4 Pro（审计 3332）同事务 bump 全局 model_security_epoch，egress 授权门对该回合下一次 Box 续接回 409 MODEL_CONFIG_CHANGED_RETRY_TURN（未到 Box）；Claude Code 以此结束回合，但交出工具调用的 Box CLI 仍挂起等结果，idle proof 恒 pending，会话之后每条消息 IDLE_HISTORY_PENDING，直到 4 小时期限。OCV5-315 的内部 Box Stop 只认 409 BOX_* continuation rejected。修复：授权门的 config_changed 精确拒绝同样走内部 Box Stop，链收为已证明停止的失败，下一条消息正常开始；非 Box 模型与其它错误码不变。",
+      "rootFixCommit": "3464641e",
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-486-config-change-pins-box-session] PASS — a config-changed continuation reject stops the parked Box turn and the next message passes submit"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/engine/ccbAdapterBoxStop.test.ts",
+          "assertion": "OCV5-486 a config-changed continuation reject settles the parked Box turn once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/engine/ccbAdapterBoxStop.test.ts",
+          "assertion": "OCV5-488 any refusal before Box qualifies; retried, still-resolving and 5xx results do not"
+        }
+      ],
+      "coverageCommits": [
+        "1e3de7fd",
+        "d882229c"
+      ]
+    },
+    {
+      "id": "INC-20261017-BOX-HELD-NO-PROCESS",
+      "occurredAt": "2026-10-17",
+      "severity": "P0",
+      "symptom": "商业（2026-10-17 07:10–08:28Z）：账号 79 被 uid 4 的 3 条 Box handoff 叶子（1022999…/232016…/91fe2b3f…）占住，Box 上已无 claude 进程。清理 worker 读不到 terminal proof（BOX_EXEC_REMOTE_EXIT），这些叶子既不是 stale resume、也没到 4h15m，于是每 2 分钟打一次 box_stop_probe_pending 却不释放；会话每条消息 IDLE_HISTORY_PENDING，账号上其它请求 BOX_CAPACITY_HELD，最后人工在生产租约下标 expired_unproven 释放。两周内同类第 13 起，此前每次只补一条退出路径。修复（OCV5-488 PR-2）：清理 worker 读不到 proof 时用只读探针看 Box 上该 run 的进程，同一 bootId 下相隔 1 分钟两次都不在（或 Box 重启过）即按 expired 两种形态收口，金额不动、计费未结算的链先不关；容器读到某回合 idle proof 为 pending 且该回合叶子仍停在 handoff 时，egress 按浏览器 Stop 的同一路径停掉它；新增 ops.box_hold_stuck 轮询告警与 ops.box_hold_released 通报。",
+      "rootFixCommit": "e18d0045",
+      "coverageCommits": [
+        "8b963c41"
+      ],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-488-process-absent-released] PASS — a parked run whose processes are gone from the Box is released on two looks without its age or any money change, and an unsettled one is held and alerted"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-488-idle-proof-stops-parked-turn] PASS — a turn the container has ended stops its parked Box leaf on the next idle read and the next message passes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
+          "assertion": "OCV5-488 a run seen gone on two looks is closed without waiting for its age"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
+          "assertion": "OCV5-488 the journal's refusal keeps the run pending and releases nothing"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRunLiveness.test.ts",
+          "assertion": "OCV5-488 a keeper naming the run is alive; once it is gone the run is absent"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/alertRules.test.ts",
+          "assertion": "a run held past what the closers allow fires once per account set"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-488-container-rebuilt-stops-parked-turn] PASS — a handoff whose container was rebuilt is stopped and the new container's next message runs, while one in the active container is left alone"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-488-any-refusal-stops-parked-turn] PASS — a refusal before Box of any code stops the parked Box turn, and a 5xx leaves the run to finish and deliver its answer"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRemoteCleanupWorker.test.ts",
+          "assertion": "OCV5-488 a handoff whose container is gone: intent, keeper stop, proof, then the existing CAS"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/engine/ccbAdapterBoxStop.test.ts",
+          "assertion": "OCV5-488 any refusal before Box qualifies; retried, still-resolving and 5xx results do not"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261018-ADVISOR-UNAVAILABLE-TASK",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "体验官B1追加复核：已存顾问会话在无可用顾问时阻断主任务。修复先有界重读，只恢复原顾问；已确认不可用则保留正文、附件和主模型继续同次任务，不继承另一端团队或新顾问，不等待协作保存成功。",
+      "rootFixCommit": "7d3b63cc",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/collaborationConfig.test.ts",
+          "assertion": "OCV5-512 recovers only a resolved empty advisor catalog without choosing another model"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/advisor-task-recovery.node-test.mjs",
+          "assertion": "OCV5-512 unavailable advisor continues the same main task with its attachment"
+        }
+      ],
+      "coverageCommits": [
+        "dfc0a21a",
+        "5c7a7d93",
+        "f975f711",
+        "21b091ed",
+        "50b16144"
+      ]
+    },
+    {
+      "id": "INC-20261018-CODEX-WEB-SEARCH-CLI",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "体验官A25/A36：Codex缺少可发现的稳定搜索CLI，oc-web --help无search，Luna/Sol改用Bash抓Google/Bing/Baidu遇空结果及验证码。新增oc-web search，复用现有master搜索代理和成对容器身份回退；prompt/schema/cache输入不变。",
+      "rootFixCommit": "051e6768",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ocWebSearch.test.ts",
+          "assertion": "OCV5-510 oc-web search returns source URLs through the authenticated master proxy"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-ccb-mcp-availability.ts",
+          "assertion": "[ocv5-510-codex-web-search-cli] PASS — the real CLI restores container identity and returns a sourced result through MiniMax then Grok"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/ocWebSearch.test.ts",
+          "assertion": "search keeps Grok source-only URLs after MiniMax failure"
+        }
+      ],
+      "coverageCommits": [
+        "71a9e763",
+        "18c38333",
+        "fb1fc232",
+        "8708f22f",
+        "4eaaf4f2"
+      ]
+    },
+    {
+      "id": "INC-20261018-ARTIFACT-LINK-DOWNLOAD",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "体验官B13：Markdown中generated绝对文件链接被当成网站路径，新标签404且暴露内部路径。平台资产锚点复用既有鉴权签名缓存与下载组件，普通链接和只读行为保留。",
+      "rootFixCommit": "7a99da55",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/MarkdownImpl.test.tsx",
+          "assertion": "OCV5-508 artifact anchors reuse signing and retain their label"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/artifact-link.node-test.mjs",
+          "assertion": "OCV5-508 generated Markdown links download authenticated file bytes"
+        }
+      ],
+      "coverageCommits": [
+        "f725358e"
+      ]
+    },
+    {
+      "id": "INC-20261018-SHARE-EXPORT-INTERNAL",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "体验官A24：导出Markdown泄露工具调用及过程文本，分享最终答含平台内部资产路径。修复统一最终回答口径并只转换资产引用，保留有用源码和用户原文。",
+      "rootFixCommit": "2133a121",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/publicArtifactText.test.ts",
+          "assertion": "OCV5-507 exports readable artifact references without private platform roots"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/share-export.node-test.mjs",
+          "assertion": "OCV5-507 sharing and Markdown downloads contain final answers and portable artifact references"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/exportMarkdown.test.ts",
+          "assertion": "keeps a delivered file on a stopped assistant row before later tools"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/exportMarkdown.test.ts",
+          "assertion": "keeps visible live answer snapshots as incomplete without sharing unfinished answers"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/exportMarkdown.test.ts",
+          "assertion": "keeps completed visible summaries before tool and prediction-only tails"
+        }
+      ],
+      "coverageCommits": [
+        "e609ce73",
+        "b602bab3",
+        "09284d9a",
+        "a8108634",
+        "a3d8ddf5"
+      ]
+    },
+    {
+      "id": "INC-20261018-BOX-DELEGATE-EMPTY-CURRENT",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "OCV5-499：商业 uid247 的两次 Haiku 委派（UTC 2026-10-17 17:02，request 267d69b53fd82f9785e073c66bb60292 / c16c4ac9f35cb324061459e49daaec77）回答消息为空。CCB 在 normalize 后追加 deferred-tools user 公告；Box mapper 只选最后 user 为 stdin，完整目标落入未回答历史，原生恢复插入 No response requested。两份原生记录已证明，未将该证据归给 uid1931。修复按 Sol 方案保留末尾纯文本 user 段于同一当前 stdin，system 继续提升，assistant/工具结果阻断合并；Astra纯文本限制和单user/边界用例一并移植。个人版共享 mapper，独立验证；uid765出口身份缺失的ENOENT为不同故障。",
+      "rootFixCommit": "dec598ed",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
+          "assertion": "keeps a delegated goal and the late deferred-tools reminder in the same current turn"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
+          "assertion": "one user keeps its original string or text blocks without a rewrite"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxMessagesMapper.test.ts",
+          "assertion": "assistant boundaries stop the pending user tail while system text is lifted"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-499-pending-user] PASS — the full delegated goal and late tool announcement reach the same current stdin without changing canonical bytes or completed tool history"
+        }
+      ],
+      "coverageCommits": [
+        "42cc42f4"
+      ]
+    },
+    {
+      "id": "INC-20261018-BOX-DELEGATE-CONTEXT-OWNER",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "OCV5-518：商业发布6f57e7215的uid247 Haiku委派真实Bash已算出571A1D288746T，随后BOX_TOOL_CONTEXT_CHANGED / continuation not republished导致答案未交付。现场两个raw canonical body未留存，不能倒推具体差异。非生产旧98e728220和6f57均经真实local catalog→delegate→CCB冷续接抓到仅工具公告丢失，真实journal及默认publisher均拒绝；证明该机制为既存问题。local catalog链漏发contextOwner，未启用已有CCB持久公告；修复贯通可信owner、按wire format自动升级旧LKG，保留v1 token/hash兼容、严格context/NULL dispatch/权限门。",
+      "rootFixCommit": "d63d8726",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalModelCatalog.test.ts",
+          "assertion": "projects only declared exact Box ownership from the fenced authorized catalog"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelCatalogClient.test.ts",
+          "assertion": "same epoch and pricing automatically upgrade a legacy LKG and preserve owner across another cold start"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelCatalogClient.test.ts",
+          "assertion": "OCV5-518 format upgrade cannot reuse an in-flight snapshot with stale routing availability"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/modelAuthorityLocalPath.test.ts",
+          "assertion": "OCV5-518 local delegate forwards the catalog owner into the actual turn descriptor"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-518-local-catalog-owner] PASS — the trusted owner reaches a cold delegate descriptor after legacy LKG upgrade while the original v1 token remains accepted"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261018-BOX-RECOVERY-REFUSED-STUCK",
+      "occurredAt": "2026-10-17",
+      "severity": "P1",
+      "symptom": "商业 u4 会话 webmvc3iq5ff9hmmm（box-api-claude-opus-5-5）：2026-10-17 23:29Z 一轮已跑完 Skill 与 Bash 并扣 130 积分，第三次模型请求被 Box egress 以 409 BOX_TOOL_RESULT_MISMATCH 拒绝（ccb normalizeToolInput 删掉 Bash 的 `cd <cwd> && ` 前缀后回传，Box 按模型原始输入哈希比对；ccb 侧由 119c2a10 修复，同日 05:42Z webmv6evixkgn33mp 同型）。ccb 以 ENGINE_ERROR 结束后自动「从断点继续」，该恢复 dispatch 被容器拒收（IDLE_HISTORY_PENDING → DISPATCH_NOT_ACCEPTED），恢复 job 只被置 paused（OCV5-377），没有写任何终态，会话最后一条仍是没有回复的「↻ 自动从断点继续」。前端 adoptPendingAutomaticRecoveryFromHistory 把它认作恢复在飞，每次刷新都在「消息未开始处理，已确认未计费」卡下显示「仍在处理中…」、停止按钮常亮，持续约 12 小时直到用户点停止（生产共 4 个会话同状态，2026-10-18 经批准用数据变更补写终态卡）。修复：reconciler 每个 tick 把「未开始执行就被暂停」（dispatch_not_accepted / refused:*）的恢复链，在其恢复行仍是最后一条消息时于会话行锁内补写恢复放弃卡；已有回复或已转入其它消息的会话、次数耗尽类暂停不动。",
+      "rootFixCommit": "181e38b7",
+      "coverageCommits": [
+        "a345239b",
+        "e825c8fa",
+        "4b8e1a38",
+        "ec394e0a",
+        "c6027492",
+        "6b1403ee",
+        "af387e1c",
+        "e30093a7"
+      ],
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-509-refused-recovery-closed] PASS — a recovery paused before it ran ends its turn with a visible card once nothing will run it on, and an answered chain is left alone"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261018-BOX-CLI-REPAIRED-TOOL-INPUT",
+      "occurredAt": "2026-10-18",
+      "severity": "P0",
+      "symptom": "商业 u4 会话 webmvdqhzdqcghrvm（box-api-claude-opus-5-5，2026-10-18 11:27–12:34Z）：模型要写核验脚本的每一轮都在 message_stop 处被拒为 BOX_TOOL_SNAPSHOT_MISMATCH，CCB 重试同一请求时 replay 重读同一 spool 又遇到同一拒绝，被包成 503 BOX_REPLAY_UNAVAILABLE（b95f0798… / e149b3e8…），自动恢复每次重跑约 10 分钟的同一调用，5 次运行全部失败，用户 12:35Z 停止（失败与 replay 均未扣费，成功 13 次 393 积分三账一致）。根因：Box 上的 Claude Code 2.1.299–2.1.302 对流式工具输入（含 MCP 工具）先做修复再记录与执行——能解析为其它 JSON 类型的顶层字符串换成解析值，字面 `\\uXXXX`（如脚本里的 `[\\u4e00-\\u9fff]`）换成真实字符（Windows 路径与被转义反斜杠除外），丢弃 `__proto__` 键；egress 用严格深比较拿 CLI 快照对上游原文，永远不等。另：这 5 次运行的清理因 run project 下 CLI 自动记忆的 memory 目录被拒（退出 126），日志已截断而 journal 永远停在 pending 重试。修复：快照比对按 CLI 这几项确定性修复判等价，其余任何差异照旧拒绝；候选带 CLI 记录版输入（cliInput），journal 同存其哈希，pending 调用两者皆认，客户端仍执行模型原文；replay 重读遇到确定性协议拒绝回 409 BOX_REPLAY_REJECTED（传输类仍 503），适配器按拒绝结束本轮并停掉挂起运行，自动恢复随即接续；清理删除 memory 目录（仅 Markdown 文件，其它形状仍拒）。",
+      "rootFixCommit": "312b60cc",
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-509-cli-repaired-tool-input] PASS — a tool call the CLI records and runs unicode-repaired hands off the model's own input, and any other difference is still refused"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-509-replay-rejection-ends-turn] PASS — a re-read Box run the protocol refuses ends the turn as a refusal and stops the parked run, not a retried 503"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.test.ts",
+          "assertion": "OCV5-509 a tool input the CLI records unicode-repaired hands off the input the model wrote"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxCliToolHandoff.test.ts",
+          "assertion": "OCV5-509 a recorded tool input that differs in any other way is still a snapshot mismatch"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolResultPlan.test.ts",
+          "assertion": "OCV5-509 the CLI calls a tool with its repaired record of the input"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxStoredToolHandoff.test.ts",
+          "assertion": "OCV5-509 a call the CLI recorded repaired also stores the hash of that record"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxToolUnknownObserver.test.ts",
+          "assertion": "OCV5-509 a re-read run the decoder refuses is a replay rejection, not a transient"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxRunCleanup.test.ts",
+          "assertion": "OCV5-509 the CLI auto-memory folder in a run project is cleaned, anything else still refused"
+        }
+      ],
+      "coverageCommits": [
+        "f83fbaf6"
+      ]
+    },
+    {
+      "id": "INC-20261019-CODEX-NATIVE-IDENTITY-HEADERS",
+      "occurredAt": "2026-10-19",
+      "severity": "P1",
+      "symptom": "原生Codex送出的session-id/thread-id被relay白名单丢弃，破坏ChatGPT缓存亲和及线程元数据契约。保留两个非凭证ID及旧版头，不改变请求正文、鉴权、账户路由或私有头过滤；全部缓存异常是否闭环仍须真实上线验证。",
+      "rootFixCommit": "c5211e85",
+      "coverageCommits": [
+        "c5211e85"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/internalCodexRelay.test.ts",
+          "assertion": "handler:official 路径仅透传安全的 Codex 路由头,并返回上游 turn state"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-codex-chatgpt-ws.ts",
+          "assertion": "[codex-native-identity-headers] PASS — native session and thread headers survive the relay without changing authentication or private header filtering"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261019-PREDICTION-HIDES-FINAL",
+      "occurredAt": "2026-10-19",
+      "severity": "P1",
+      "symptom": "个人版test1 Opus5.5回合65步后最终答复空白。完整总结已在tape203，末条208仅隐藏ui next输入预测；raw非空final判定把总结折叠、预测却不渲染。两版共用逻辑。按实际可见内容选择最终回答并保留输入预测及终态费用元数据。",
+      "rootFixCommit": "250bac04",
+      "coverageCommits": [
+        "5bba6e6f",
+        "73f14cf7",
+        "b6e7f80c"
+      ],
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
+          "assertion": "standalone input prediction never displaces the completed task summary"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
+          "assertion": "OCV5-525: view projection preserves total charge, trace, delegates and truncation without changing call usage"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/components/chat/turnSegment.test.ts",
+          "assertion": "OCV5-525: late truncation and earlier charge snapshots transfer independently in shuffled history"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/ocv5-525-visible-final.node-test.mjs",
+          "assertion": "OCV5-525: completed summary stays visible when the last assistant is only input prediction"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261018-RECOVERY-POOL-IDENTITY",
+      "occurredAt": "2026-10-18",
+      "severity": "P1",
+      "symptom": "OCV5-500: personal release G1 failed before upstream inference because opencodego remained auto/degraded. Recovery probes repeatedly used an administrator-disabled env credential (401), although an active pool member existed. The background prober bypassed the same eligible-key pool used by user traffic; HTTP-only success also allowed incomplete responses to be counted as recovery. Existing G1 remains failed until an approved new-tip official release passes; no forced healthy or gate waiver.",
+      "rootFixCommit": "0aad5f26",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/egress/recoveryProber.test.ts",
+          "assertion": "selects an active pool identity even when the old raw-env identity is disabled"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/egress/recoveryProber.test.ts",
+          "assertion": "rejects ${name} without recovery evidence or leaking body"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "[ocv5-500-recovery-pool-identity] PASS — recovery probes authenticate with the eligible pool identity, send nothing without one, and heal only on a completed inference"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261019-GO-POOL-WIRING",
+      "occurredAt": "2026-10-19",
+      "severity": "P1",
+      "symptom": "OCV5-520: personal G1 on 0f2c686bc failed HTTP401 because ordinary egress omitted API-key pool wiring and used an expired static env identity even though that identity was admin-disabled and another enabled member authenticated. The same missing wiring exists in commercial egress. Ordinary Go now honors its existing pool; other providers and request prefixes remain unchanged. Commercial has a separate expired sole member and still needs valid credentials; code wiring alone is not a claim of commercial authentication recovery.",
+      "rootFixCommit": "0abced60",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/apiKeyPoolWiring.test.ts",
+          "assertion": "OCV5-520 ordinary Go uses its enabled pool identity and preserves request bytes"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/apiKeyPoolWiring.test.ts",
+          "assertion": "OCV5-520 nonempty Go pool rejects null or failed selection without using the env key"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "[ocv5-520-go-pool-wiring] PASS — ordinary Go uses an enabled pool identity instead of disabled static credentials while request bytes and session headers stay stable"
+        }
+      ]
+    },
+    {
+      "id": "INC-20261019-RECOVERABLE-ERROR-RED-CARD",
+      "occurredAt": "2026-10-19",
+      "severity": "P1",
+      "symptom": "OCV5-523：用户16:21反馈Box错误先出红卡、随后恢复执行。个人16:20:52 problem_card/engine_error/recovered遥测；该CCB/box_cli模型错误后下一轮完成（不能当作同turn自动成功证据）。源码原生assistant_error直接外发，而运行器稍后才判重试；浏览器旧恢复也先画卡。修复以现有运行器终态/主控恢复任务为权威，重试只走模型繁忙正在重试活动行；确定拒绝或耗尽才红卡。",
+      "rootFixCommit": "f3fc3c07",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "INC-20261019-RECOVERABLE-ERROR-RED-CARD: recovered attempts never publish an error"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/sessionManagerEngineTurn.test.ts",
+          "assertion": "INC-20261019-RECOVERABLE-ERROR-RED-CARD: terminal failure publishes exactly one error"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/web-react/src/lib/chat/chat.test.ts",
+          "assertion": "INC-20261019-RECOVERABLE-ERROR-RED-CARD: cold history waits for the durable job and exact empty snapshot releases terminal"
+        },
+        {
+          "layer": "integration",
+          "path": "packages/commercial/src/__tests__/pgSessionsBackend.integ.test.ts",
+          "assertion": "INC-20261019-RECOVERABLE-ERROR-RED-CARD: timeline returns the exact active recovery without request payload"
+        },
+        {
+          "layer": "browser",
+          "path": "packages/web-react/browser-tests/retry-error-ui.node-test.mjs",
+          "assertion": "INC-20261019-RECOVERABLE-ERROR-RED-CARD: real App retries stay soft and only terminal failures paint a card"
+        }
+      ],
+      "coverageCommits": [
+        "f20d2e81"
       ]
     }
   ]

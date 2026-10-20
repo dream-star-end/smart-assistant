@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { BoxRemoteCleanupWorker } from "./boxRemoteCleanupWorker.js";
+import { BoxDurableJournalError } from "./boxDurableJournal.js";
 
 const candidate = { requestId: "box-final", uid: 3n, accountId: 20n,
   runNonce: "a".repeat(24), leaseEpoch: "b".repeat(32),
@@ -518,4 +519,161 @@ test("INC-20261006 a finished first round with a synthetic CLI turn closes as an
     outcome: { status: "undeliverable", reason: "BOX_RECOVERY_INTERMEDIATE_HANDOFF" } });
   assert.deepEqual(await handoff.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
   assert.deepEqual(handoff.sequence, ["recover"]);
+});
+
+// OCV5-488 (10-17 commercial account 79): three handoff leaves held their
+// account for 78 min after their CLIs were gone. No proof could be read, the
+// leaves were neither stale nor expired, so every probe stayed pending.
+const BOOT = "0f2c5d1e-1111-4222-8333-444455556666";
+function absentWorker(input: { looks: Array<string | Error>;
+  prior?: { v: 1; atMs: number; boot: string }; closeError?: Error }) {
+  const sequence: string[] = [];
+  const closes: unknown[] = [];
+  const released: unknown[] = [];
+  let look = 0;
+  let seen = input.prior ?? null;
+  const probe = { requestId: "box-parked", uid: 3n, accountId: 79n,
+    runNonce: candidate.runNonce, leaseEpoch: candidate.leaseEpoch, linked: false };
+  const worker = new BoxRemoteCleanupWorker({
+    holds: {
+      recordRunAbsence: async (args: { boot: string; requestId: string }) => {
+        assert.equal(args.requestId, probe.requestId);
+        sequence.push("record");
+        const prior = seen;
+        if (!seen) seen = { v: 1, atMs: 1_792_000_000_000, boot: args.boot };
+        return prior;
+      },
+      clearRunAbsence: async () => { sequence.push("clear"); seen = null; } } as never,
+    journal: { listStoppedFailureProbeCandidates: async () => [probe],
+      claimStoppedFailureProbe: async () => true,
+      markFirstRoundStoppedFailure: async () => { throw new Error("no proof exists"); },
+      markToolChainStoppedFailure: async () => { throw new Error("no proof exists"); },
+      markRunExpiredUnproven: async (args: unknown) => {
+        sequence.push("absent-close");
+        closes.push(args);
+        if (input.closeError) throw input.closeError;
+        return { action: "closed", shape: "billed_handoff", priorBoxState: "handoff", ancestors: 0 };
+      },
+      listRemoteCleanupCandidates: async () => [],
+      claimRemoteCleanup: async () => false,
+      markRemoteCleaned: async () => { throw new Error("must not clean"); } } as never,
+    resolver: { resolve: async () => ({ accountId: 79n, exec: { run: async (request: { args: string[] }) => {
+      if (request.args.at(-1)?.startsWith("/tmp/ocv5-289-proof-")) {
+        sequence.push("proof-read");
+        throw Object.assign(new Error("BOX_EXEC_REMOTE_EXIT"), { code: "BOX_EXEC_REMOTE_EXIT" });
+      }
+      assert.ok(request.args[2]?.includes("boot_id"), "only the read-only liveness probe runs");
+      assert.equal(request.args[3], candidate.runNonce);
+      sequence.push("look");
+      const out = input.looks[look++] ?? "";
+      if (out instanceof Error) throw out;
+      return { stdout: out, stderrBytes: 0, exitCode: 0 };
+    } }, dispose: async () => { sequence.push("dispose"); } }) as never } as never,
+    onProcessAbsentClosed: (closed) => { released.push(closed); },
+  });
+  return { worker, sequence, closes, released, probe };
+}
+
+test("OCV5-488 a run seen gone on two looks is closed without waiting for its age", async () => {
+  const f = absentWorker({ looks: [`absent ${BOOT}\n`, `absent ${BOOT}\n`] });
+  // first look: recorded, still held
+  assert.deepEqual(await f.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+  assert.deepEqual(f.sequence, ["proof-read", "look", "record", "dispose"]);
+  assert.deepEqual(f.closes, []);
+  // second look: the journal's own fences (a minute apart, billing settled) decide
+  assert.deepEqual(await f.worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
+  assert.deepEqual(f.sequence.slice(4), ["proof-read", "look", "record", "absent-close", "dispose"]);
+  assert.deepEqual(f.closes, [{ requestId: "box-parked", uid: 3n, accountId: 79n,
+    runNonce: candidate.runNonce, leaseEpoch: candidate.leaseEpoch,
+    cause: "box_process_absent", absence: { boot: BOOT } }]);
+  assert.deepEqual(f.released, [{ requestId: "box-parked", accountId: 79n,
+    shape: "billed_handoff", rebooted: false }]);
+});
+
+test("OCV5-488 a reboot between the looks confirms at once", async () => {
+  const f = absentWorker({ prior: { v: 1, atMs: 1_792_000_000_000, boot: BOOT },
+    looks: ["absent 9e8d7c6b-0000-4000-8000-000000000001\n"] });
+  assert.deepEqual(await f.worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
+  assert.deepEqual(f.released, [{ requestId: "box-parked", accountId: 79n,
+    shape: "billed_handoff", rebooted: true }]);
+});
+
+test("OCV5-488 alive clears the earlier look; terminal, unreadable or malformed looks prove nothing", async () => {
+  const alive = absentWorker({ prior: { v: 1, atMs: 1, boot: BOOT }, looks: [`alive ${BOOT}\n`] });
+  assert.deepEqual(await alive.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+  assert.deepEqual(alive.sequence, ["proof-read", "look", "clear", "dispose"]);
+  for (const out of [`terminal ${BOOT}\n`, new Error("BOX_EXEC_REMOTE_EXIT"), "absent\n", `absent ${BOOT}\nalive ${BOOT}\n`]) {
+    const f = absentWorker({ prior: { v: 1, atMs: 1, boot: BOOT }, looks: [out] });
+    assert.deepEqual(await f.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+    assert.deepEqual(f.sequence, ["proof-read", "look", "dispose"], String(out));
+    assert.deepEqual(f.closes, []);
+  }
+});
+
+test("OCV5-488 the journal's refusal keeps the run pending and releases nothing", async () => {
+  for (const code of ["BOX_ABSENT_CLOSE_NOT_CONFIRMED", "BOX_ABSENT_CLOSE_BILLING_UNSETTLED",
+    "BOX_EXPIRED_CLOSE_CHAIN_INVALID"]) {
+    const f = absentWorker({ prior: { v: 1, atMs: 1, boot: BOOT }, looks: [`absent ${BOOT}\n`],
+      closeError: new BoxDurableJournalError(code) });
+    assert.deepEqual(await f.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 }, code);
+    assert.deepEqual(f.released, [], code);
+  }
+});
+
+// OCV5-488 (10-17 commercial uid 4): its container was rebuilt at 07:53 while
+// three of its turns' CLIs stayed parked on their handoffs; nothing could
+// answer them any more and nothing stopped them.
+function abandonedWorker(input: { abandoned: boolean; intent?: boolean }) {
+  const sequence: string[] = [];
+  const probe = { requestId: "box-abandoned", uid: 4n, accountId: 79n,
+    runNonce: candidate.runNonce, leaseEpoch: candidate.leaseEpoch, linked: false,
+    ...(input.abandoned ? { abandonedHandoff: true as const } : {}) };
+  const stoppedProof = { ...candidate.proof, reason: "keeper_stopped" as const };
+  let stopped = false;
+  const worker = new BoxRemoteCleanupWorker({
+    staleResumeProofWaitMs: 50,
+    holds: { recordAbandonedHandoffStop: async (args: { requestId: string }) => {
+      assert.equal(args.requestId, probe.requestId);
+      sequence.push("intent"); return input.intent ?? true;
+    } } as never,
+    journal: { listStoppedFailureProbeCandidates: async () => [probe],
+      claimStoppedFailureProbe: async () => true,
+      markFirstRoundStoppedFailure: async ({ proof }: { proof: unknown }) => {
+        assert.deepEqual(proof, stoppedProof); sequence.push("first-round-CAS");
+      },
+      markToolChainStoppedFailure: async () => { throw new Error("wrong round"); },
+      listRemoteCleanupCandidates: async () => [],
+      claimRemoteCleanup: async () => false,
+      markRemoteCleaned: async () => { throw new Error("must not clean"); } } as never,
+    resolver: { resolve: async () => ({ accountId: 79n, exec: { run: async (request: { args: string[] }) => {
+      if (request.args.at(-1)?.startsWith("/tmp/ocv5-289-proof-")) {
+        sequence.push("proof-read");
+        if (!stopped) throw Object.assign(new Error("BOX_EXEC_REMOTE_EXIT"), { code: "BOX_EXEC_REMOTE_EXIT" });
+        return { stdout: `${JSON.stringify(stoppedProof)}\n`, stderrBytes: 0, exitCode: 0 };
+      }
+      assert.deepEqual(request.args.slice(-2), [candidate.runNonce, candidate.leaseEpoch],
+        "stop is bound to the original nonce/epoch keeper");
+      sequence.push("keeper-stop");
+      stopped = true;
+      return { stdout: "stop-requested\n", stderrBytes: 0, exitCode: 0 };
+    } }, dispose: async () => { sequence.push("dispose"); } }) as never } as never,
+  });
+  return { worker, sequence };
+}
+
+test("OCV5-488 a handoff whose container is gone: intent, keeper stop, proof, then the existing CAS", async () => {
+  const f = abandonedWorker({ abandoned: true });
+  assert.deepEqual(await f.worker.reconcileBatch(), { cleaned: 0, pending: 0, orphaned: 0 });
+  assert.deepEqual(f.sequence, ["proof-read", "intent", "keeper-stop", "proof-read",
+    "first-round-CAS", "dispose"]);
+});
+
+test("OCV5-488 a handoff in the active container is never stopped, however long its tools run", async () => {
+  const f = abandonedWorker({ abandoned: false });
+  assert.deepEqual(await f.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+  assert.deepEqual(f.sequence, ["proof-read", "dispose"]);
+  // the container came back between listing and the intent: no signal is sent
+  const raced = abandonedWorker({ abandoned: true, intent: false });
+  assert.deepEqual(await raced.worker.reconcileBatch(), { cleaned: 0, pending: 1, orphaned: 0 });
+  assert.deepEqual(raced.sequence, ["proof-read", "intent", "dispose"]);
 });

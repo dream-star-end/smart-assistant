@@ -4,7 +4,7 @@
  */
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, renameSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFrontendBuildProbe } from "../ws/frontendBuild.js";
@@ -46,6 +46,31 @@ describe("createFrontendBuildProbe", () => {
 
     // TTL 过后:stat 发现 mtime 变 → 重读到新值
     t += 2;
+    assert.equal(probe(), "bbbbbbbbbbbbbbbb");
+  });
+
+  test("P0-Web 指针换到另一份 webroot:mtime 相同也按 inode 感知新 build", () => {
+    // OCV5-489:distDir 是 overlay 符号链接,换指向后 index.html 是另一个文件;
+    // cp -a 会保留 mtime,只比 mtime 会一直返回旧 id。
+    const root = mkdtempSync(join(tmpdir(), "fe-build-overlay-"));
+    const a = join(root, "a");
+    const b = join(root, "b");
+    mkdirSync(a);
+    mkdirSync(b);
+    writeIndex(a, "aaaaaaaaaaaaaaaa");
+    writeIndex(b, "bbbbbbbbbbbbbbbb");
+    const same = new Date(1_700_000_000_000);
+    utimesSync(join(a, "index.html"), same, same);
+    utimesSync(join(b, "index.html"), same, same);
+    const pointer = join(root, "current");
+    symlinkSync(a, pointer);
+    let t = 1_000_000;
+    const probe = createFrontendBuildProbe(pointer, { ttlMs: 5_000, now: () => t });
+    assert.equal(probe(), "aaaaaaaaaaaaaaaa");
+
+    symlinkSync(b, join(root, "current.tmp"));
+    renameSync(join(root, "current.tmp"), pointer);
+    t += 5_001;
     assert.equal(probe(), "bbbbbbbbbbbbbbbb");
   });
 });

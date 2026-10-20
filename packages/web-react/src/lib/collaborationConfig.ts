@@ -35,6 +35,8 @@ export type CollabUiState = {
   configVersion: string;
   source: "session" | "default";
   advisorModels: AdvisorModelOption[];
+  /** False for an initial/omitted catalog or a successful response reporting catalog-read failure. */
+  advisorCatalogResolved?: boolean;
   advisorUnavailableReason?: string;
   advisorConsultParents: string[];
   advisorConsultParentReason?: string;
@@ -49,6 +51,7 @@ export const EMPTY_COLLAB_UI: CollabUiState = {
   configVersion: "",
   source: "default",
   advisorModels: [],
+  advisorCatalogResolved: false,
   advisorConsultParents: [],
 };
 
@@ -72,12 +75,22 @@ export function docToUiState(doc: CollaborationConfigDoc): CollabUiState {
     configVersion: doc.session.configVersion,
     source: doc.session.source,
     advisorModels: Array.isArray(doc.advisorModels) ? doc.advisorModels : [],
+    advisorCatalogResolved: Array.isArray(doc.advisorModels) && !/^catalog unavailable(?::|$)/i.test(doc.advisorUnavailableReason ?? ""),
     advisorUnavailableReason: doc.advisorUnavailableReason,
     advisorConsultParents: Array.isArray(doc.advisorConsultParents) ? doc.advisorConsultParents : [],
     advisorConsultParentReason: doc.advisorConsultParentReason,
     advisorConsultAllowed: doc.advisorConsultAllowed,
     parentEngine: doc.parentEngine,
   };
+}
+
+/**
+ * A failed collaboration-config save must never lock the user out of solo/team.
+ * Those two modes travel per turn on the send frame and need no server-side config,
+ * so the user's pick stays; only advisor depends on the saved config and rolls back.
+ */
+export function keepCollabChoiceOnSaveFailure(mode: CollabMode): boolean {
+  return mode !== "advisor";
 }
 
 /** Ignore in-flight GET/PUT that started before a newer user action or session switch. */
@@ -187,5 +200,30 @@ export function sendCollabFields(input: {
     collabMode: "advisor",
     advisorModel: model,
     collabConfigVersion: version,
+  };
+}
+
+
+/** Only a resolved empty catalog proves that the former advisor cannot run. */
+export function continuePrimaryWithoutAdvisor(state: CollabUiState): boolean {
+  return state.mode === "advisor" && state.advisorCatalogResolved === true && state.advisorModels.length === 0;
+}
+
+/** Refresh availability, never inherit another endpoint's new team or advisor choice. */
+export function refreshOriginalAdvisorForSend(original: CollabUiState, doc: CollaborationConfigDoc, parentEngine?: string): {
+  state: CollabUiState; continueSolo: boolean;
+} {
+  const fresh = docToUiState(doc);
+  const originalAdvisor = original.advisorModel;
+  const restored = original.mode === "advisor" && fresh.mode === "advisor" && !!originalAdvisor && fresh.advisorModel === originalAdvisor
+    && !!fresh.configVersion && !fresh.advisorUnavailableReason
+    && fresh.advisorModels.some((row) => row.id === originalAdvisor)
+    && advisorParentCapabilityAllowed({ ...fresh, parentEngine: parentEngine ?? fresh.parentEngine });
+  if (restored) return { state: fresh, continueSolo: false };
+  const state = { ...fresh, mode: original.mode, advisorModel: originalAdvisor, configVersion: "" };
+  return {
+    state,
+    continueSolo: continuePrimaryWithoutAdvisor(original)
+      || continuePrimaryWithoutAdvisor({ ...fresh, mode: original.mode }),
   };
 }

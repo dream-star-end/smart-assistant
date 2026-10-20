@@ -62,8 +62,10 @@ describe('internal Grok relay', () => {
   test('injects the selected subscription bearer and uses only that account egress dispatcher', async () => {
     const captured: { url?: string; headers?: Headers; dispatcher?: unknown; body?: string } = {}
     const statusCalls: Array<[bigint, number]> = []
+    const stages: Array<Record<string, unknown>> = []
     const handler = makeGrokRelayHandler({
       identityRepo: repo(),
+      logger: { info: (_message, fields) => { stages.push(fields!) } },
       resolveContext: async ({ token, containerId, userId }) => {
         assert.equal(token, ROUTE_TOKEN)
         assert.equal(containerId, 11)
@@ -124,6 +126,7 @@ describe('internal Grok relay', () => {
       })
       assert.equal(response.status, 201)
       assert.equal(await response.text(), 'relay-ok')
+      assert.deepEqual(stages.map(s => s.stage), ['proxy_received', 'route_ready', 'upstream_prepare_started', 'upstream_prepare_complete', 'fetch_started', 'headers_received', 'stream_complete'])
       assert.equal(captured.url, `${GROK_OFFICIAL_UPSTREAM_BASE_URL}/chat/completions?stream=true`)
       assert.equal(captured.headers?.get('authorization'), 'Bearer real-xai-oauth-token')
       assert.equal(captured.headers?.get('content-type'), 'application/json')
@@ -164,6 +167,62 @@ describe('internal Grok relay', () => {
       })
       assert.equal(response.status, 409)
       assert.equal(upstreamCalls, 0)
+    } finally {
+      await close(server)
+    }
+  })
+
+  test('OCV5-477: a delegate route with no admitted billing is refused before upstream traffic', async () => {
+    for (const billed of [false, true]) {
+      let upstreamCalls = 0
+      const billingChecks: Array<{ token: string; containerId: number; userId: bigint }> = []
+      const handler = makeGrokRelayHandler({
+        identityRepo: repo(),
+        resolveContext: async () => ({ modelId: 'grok-build', accountId: 53n, slotId: 'slot-53', kind: 'delegate' }),
+        hasDelegateBilling: async (args) => { billingChecks.push(args); return billed },
+        // Billed requests then stop at the slot check, which proves they passed the billing gate.
+        renewSlot: () => false,
+        requestFn: (async () => { upstreamCalls += 1; throw new Error('must not call') }) as never,
+      })
+      const server = createServer((req, res) => { void handler(req, res, CTX) })
+      const port = await listen(server)
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}${GROK_RELAY_PREFIX}/route/${ROUTE_TOKEN}/v1/chat/completions`, {
+          method: 'POST',
+          headers: { authorization: `Bearer ${CONTAINER_TOKEN}`, 'content-type': 'application/json' },
+          body: '{}',
+        })
+        assert.equal(response.status, billed ? 409 : 403)
+        if (!billed) {
+          const payload = await response.json() as { error?: { code?: string } }
+          assert.equal(payload.error?.code, 'GROK_DELEGATE_NOT_BILLED')
+        }
+        assert.deepEqual(billingChecks, [{ token: ROUTE_TOKEN, containerId: 11, userId: 42n }])
+        assert.equal(upstreamCalls, 0)
+      } finally {
+        await close(server)
+      }
+    }
+  })
+
+  test('bridge routes do not consult delegate billing', async () => {
+    let billingChecks = 0
+    const handler = makeGrokRelayHandler({
+      identityRepo: repo(),
+      resolveContext: async () => ({ modelId: 'grok-build', accountId: 53n, slotId: 'slot-53', kind: 'bridge' }),
+      hasDelegateBilling: async () => { billingChecks += 1; return false },
+      renewSlot: () => false,
+    })
+    const server = createServer((req, res) => { void handler(req, res, CTX) })
+    const port = await listen(server)
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}${GROK_RELAY_PREFIX}/route/${ROUTE_TOKEN}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${CONTAINER_TOKEN}`, 'content-type': 'application/json' },
+        body: '{}',
+      })
+      assert.equal(response.status, 409)
+      assert.equal(billingChecks, 0)
     } finally {
       await close(server)
     }

@@ -28,6 +28,7 @@ import {
   ruleRateLimitSpike,
   ruleLoginFailureSpike,
   defaultPolledRules,
+  ruleBoxHoldStuck,
   type RuleSnapshot,
 } from "../admin/alertRules.js";
 import { EVENTS } from "../admin/alertEvents.js";
@@ -335,11 +336,12 @@ describe("service pool rules (OCV5-424)", () => {
 });
 
 describe("defaultPolledRules", () => {
-  test("包含 7 条默认规则", () => {
+  test("包含 8 条默认规则", () => {
     const rules = defaultPolledRules();
-    assert.equal(rules.length, 7);
+    assert.equal(rules.length, 8);
     const ids = rules.map((r) => r.id).sort();
     assert.deepEqual(ids, [
+      EVENTS.OPS_BOX_HOLD_STUCK,
       EVENTS.ACCOUNT_POOL_ALL_DOWN,
       EVENTS.ACCOUNT_POOL_LOW_CAPACITY,
       EVENTS.ACCOUNT_POOL_NOT_CONFIGURED,
@@ -354,5 +356,28 @@ describe("defaultPolledRules", () => {
     for (const r of defaultPolledRules()) {
       assert.equal(r.id, r.event_type, `${r.id} id/event_type mismatch`);
     }
+  });
+});
+
+// OCV5-488 (10-17 commercial account 79): three Box runs held their account
+// for 78 min with nothing of them left on the Box; only warn logs said so.
+describe("ruleBoxHoldStuck", () => {
+  test("a run held past what the closers allow fires once per account set", () => {
+    const out = ruleBoxHoldStuck.evaluate(baseSnapshot({ boxHoldStuck: [
+      { requestId: "1022999abcdef0123", accountId: "79", boxState: "handoff", ageMin: 41, absent: true },
+      { requestId: "91fe2b3f00000000", accountId: "79", boxState: "handoff", ageMin: 291, absent: false },
+    ] }));
+    assert.equal(out.firing, true);
+    if (!out.firing) return;
+    assert.equal(out.dedupe_key, `${EVENTS.OPS_BOX_HOLD_STUCK}:79`);
+    assert.match(out.title, /2 条\(账号 79\)/);
+    assert.match(out.body, /1022999abcde handoff 41min Box 上已无进程/);
+    assert.match(out.body, /91fe2b3f0000 handoff 291min 超过 4h15m 上限/);
+    assert.deepEqual(out.payload.requestIds, ["1022999abcdef0123", "91fe2b3f00000000"]);
+  });
+
+  test("nothing stuck resolves; an unreadable snapshot keeps the rule's state", () => {
+    assert.equal(ruleBoxHoldStuck.evaluate(baseSnapshot({ boxHoldStuck: [] })).firing, false);
+    assert.throws(() => ruleBoxHoldStuck.evaluate(baseSnapshot()), /box hold snapshot unavailable/);
   });
 });

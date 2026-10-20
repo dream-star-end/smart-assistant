@@ -227,7 +227,9 @@ describe('delegate core wires send_to_agent grok mint', () => {
   test('_runDelegateTaskCore uses agentModel when minting', async () => {
     const { readFileSync } = await import('node:fs')
     const { fileURLToPath } = await import('node:url')
-    const src = readFileSync(fileURLToPath(new URL('../server.ts', import.meta.url)), 'utf8')
+    // FINDINGS §7.6 S3: server.ts + split-out modules (delegate runtime moved to delegateRuntime.ts)
+    const { readGatewaySource } = await import('./helpers/gatewaySource.js')
+    const src = readGatewaySource()
     assert.match(src, /shouldMintDelegateGrokRoute\(/)
     assert.match(src, /agentModel: execAgent\.model/)
     assert.match(src, /delegateGrokMintModelId\(/)

@@ -19,6 +19,27 @@ export function isBoxExpiredCloseCause(value: unknown): value is string {
   return typeof value === "string" && CAUSE.test(value);
 }
 
+/** OCV5-488: cause of a close whose evidence is not the run's age but two
+ * looks at the Box (boxRunLiveness) that found nothing of the run. */
+export const BOX_PROCESS_ABSENT_CAUSE = "box_process_absent";
+/** The second look must come this long after the first under the same boot
+ * id; a different boot id (the Box rebooted) confirms at once. */
+export const BOX_ABSENCE_CONFIRM_MS = 60_000;
+
+export function isBoxBootId(value: unknown): value is string {
+  return typeof value === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
+}
+
+export interface BoxRunAbsent { readonly v: 1; readonly atMs: number; readonly boot: string }
+/** Only the exact first-look marker recordRunAbsence writes. */
+export function parseBoxRunAbsent(raw: unknown): BoxRunAbsent | null {
+  const marker = record(raw);
+  if (!marker || Object.keys(marker).sort().join(",") !== "atMs,boot,v"
+    || marker.v !== 1 || !epochMs(marker.atMs) || !isBoxBootId(marker.boot)) return null;
+  return marker as unknown as BoxRunAbsent;
+}
+
 function record(raw: unknown): Record<string, unknown> | null {
   return raw && typeof raw === "object" && !Array.isArray(raw)
     ? raw as Record<string, unknown> : null;

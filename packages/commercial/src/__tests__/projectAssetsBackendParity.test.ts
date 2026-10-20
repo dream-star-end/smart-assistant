@@ -13,7 +13,10 @@ import { fileURLToPath } from 'node:url'
 const here = dirname(fileURLToPath(import.meta.url))
 const migration = join(here, '../db/migrations/0237_project_assets.sql')
 const backendSrc = readFileSync(join(here, '../db/pgSessionsBackend.ts'), 'utf8')
-const sqliteSrc = readFileSync(join(here, '../../../storage/src/sessionsDb.ts'), 'utf8')
+// sessionsDb.ts plus the modules split out of it (OCV5-485): the SQLite side of the parity check
+const sqliteSrc = ['sessionsDb.ts', 'sessionsDbProjects.ts', 'sessionsDbSidebar.ts']
+  .map((f) => readFileSync(join(here, '../../../storage/src', f), 'utf8'))
+  .join('\n')
 const metadata = JSON.parse(
   readFileSync(join(here, '../../../../deploy/v5/release-metadata.json'), 'utf8'),
 ) as { requiredMigrations: string[] }

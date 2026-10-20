@@ -47,6 +47,8 @@ const BEHAVIOR = [
   "intermediate handoff stayed pending without capsule or CAS",
   "staged history and system use current catalog aliases; rejected first round is proven failed with zero charge, idle failed, and next admission succeeds",
   "a just-finished run keeps its native pointer: cleanup waits until the pointer is attached",
+  "[ocv5-520-go-pool-wiring] PASS — ordinary Go uses an enabled pool identity instead of disabled static credentials while request bytes and session headers stay stable",
+  "[ocv5-500-recovery-pool-identity] PASS — recovery probes authenticate with the eligible pool identity, send nothing without one, and heal only on a completed inference",
 ];
 const HOLD_PY = [
   "import os, signal, sys, time",
@@ -994,6 +996,15 @@ async function runWorker(argv: string[]): Promise<void> {
   assertPinnedModules(ROOT);
   emit(`box success recovery gate: candidate ${sha} database ${db.config.database} host ${db.config.host}`);
   await runBusiness(ROOT, ledger, db.config);
+  // OCV5-520: import product code only inside the existing scrubbed worker.
+  const { proveGoPoolWiring } = await import("../packages/commercial/src/__tests__/goPoolWiringProof.js");
+  const goReceipt = await proveGoPoolWiring();
+  assert.equal(goReceipt, BEHAVIOR[4]);
+  emit(goReceipt);
+  const { proveRecoveryPoolIdentity } = await import("../packages/commercial/src/__tests__/recoveryPoolIdentityProof.js");
+  const recoveryReceipt = await proveRecoveryPoolIdentity();
+  assert.equal(recoveryReceipt, BEHAVIOR[5]);
+  emit(recoveryReceipt);
 }
 
 function parseFormal(argv: string[]): string {

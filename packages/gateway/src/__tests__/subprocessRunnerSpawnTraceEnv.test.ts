@@ -154,6 +154,8 @@ test('oracle rejects duplicating the trace helper spread', () => {
   assert.match(result.reason, /_buildCcbSpawnTraceEnv\(this\.opts\.traceId\) exactly once/)
 })
 
+const optsSrc = readFileSync(new URL('../subprocessSpawnConfig.ts', import.meta.url), 'utf-8')
+
 function traceIdContract(source: string): boolean {
   const file = ts.createSourceFile('subprocessRunner.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
   const declarations = file.statements.filter(ts.isInterfaceDeclaration).filter((node) => node.name.text === 'SubprocessRunnerOpts')
@@ -163,14 +165,14 @@ function traceIdContract(source: string): boolean {
 }
 
 test('structural: SubprocessRunnerOpts type declares traceId field', () => {
-  assert.equal(traceIdContract(src), true, 'exact SubprocessRunnerOpts must declare optional string traceId')
+  assert.equal(traceIdContract(optsSrc), true, 'exact SubprocessRunnerOpts must declare optional string traceId')
 })
 
 test('trace opts oracle rejects missing, misplaced, required or non-string traceId', () => {
-  const file = ts.createSourceFile('subprocessRunner.ts', src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const file = ts.createSourceFile('subprocessSpawnConfig.ts', optsSrc, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
   const declaration = file.statements.find((node): node is ts.InterfaceDeclaration => ts.isInterfaceDeclaration(node) && node.name.text === 'SubprocessRunnerOpts')!
   const field = declaration.members.find((node): node is ts.PropertySignature => ts.isPropertySignature(node) && ts.isIdentifier(node.name) && node.name.text === 'traceId')!
-  const prefix = src.slice(0, field.getStart(file)), suffix = src.slice(field.end)
+  const prefix = optsSrc.slice(0, field.getStart(file)), suffix = optsSrc.slice(field.end)
   for (const replacement of ['', 'traceId: string', 'traceId?: number']) {
     assert.equal(traceIdContract(prefix + replacement + suffix), false, replacement || 'removed')
   }
