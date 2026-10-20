@@ -1,22 +1,18 @@
 import { runSessionPreheat, type SessionPreheatHost } from './sessionPreheat.js'
 export { runSessionPreheat, validateEnginePreheatBody } from './sessionPreheat.js'
 export type { EnginePreheatBody, EnginePreheatValidation, SessionPreheatHost } from './sessionPreheat.js'
-import { fetchIdentityCompatProjection, resolveRuntimeExecutionAgent } from '@openclaude/storage'
-import { handleChatProjectsHttp } from './routes/chatProjects.js'
+import { fetchIdentityCompatProjection } from '@openclaude/storage'
 import type { GatewayHttpIo } from './routes/httpIo.js'
 // Moved with its only caller; re-exported for existing importers.
 export { _buildHealthzDeps } from './routes/system.js'
-import { PRE_AUTH_ROUTES, type PreAuthRoutesIo } from './routes/preAuth.js'
-import { PLATFORM_ROUTES, type PlatformRoutesIo } from './routes/platform.js'
-import { SYSTEM_ROUTES, type SystemRoutesIo } from './routes/system.js'
-import { APP_CONFIG_ROUTES, type AppConfigRoutesIo } from './routes/appConfig.js'
-import { AGENT_ROUTES, type AgentRoutesIo } from './routes/agents.js'
-import { WORKSPACE_API_ROUTES, type WorkspaceApiRoutesIo } from './routes/workspaceApi.js'
-import { dispatchRoutes } from './routes/routeTable.js'
-import {
-  type ClientSessionsHttpIo,
-  clientSessionIsActive,
-  handleClientSessionsHttp,
+import type { PreAuthRoutesIo } from './routes/preAuth.js'
+import type { PlatformRoutesIo } from './routes/platform.js'
+import type { SystemRoutesIo } from './routes/system.js'
+import type { AppConfigRoutesIo } from './routes/appConfig.js'
+import type { AgentRoutesIo } from './routes/agents.js'
+import type { WorkspaceApiRoutesIo } from './routes/workspaceApi.js'
+import type {
+  ClientSessionsHttpIo,
 } from './routes/clientSessions.js'
 // Moved with the client session routes; re-exported for existing importers.
 export {
@@ -25,41 +21,20 @@ export {
   _parseArchiveQuery,
   _immutableRecordIdHeaders,
 } from './routes/clientSessions.js'
-import { handleProjectAssetsHttp } from './routes/projectAssets.js'
-import { saveUserSkill } from './userSkillWrite.js'
 import { resolveIdentityCompat, assertIdentityCompatReady } from '@openclaude/protocol'
-import { readServerFeatures } from '@openclaude/protocol'
-import { createHash, randomBytes, createHmac, timingSafeEqual } from 'node:crypto'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import {
-  constants as fsConstants,
-  chmodSync,
-  chownSync,
-  closeSync,
-  createWriteStream,
-  existsSync,
   fchmodSync,
   fchownSync,
-  fstatSync,
   linkSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  readdirSync,
-  realpathSync,
   statSync,
-  unlink,
-  unlinkSync,
 } from 'node:fs'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
-import type { IncomingHttpHeaders, IncomingMessage, ServerResponse, createServer } from 'node:http'
+import type { IncomingMessage, ServerResponse, createServer } from 'node:http'
 import { isIPv4 } from 'node:net'
-import { basename, dirname, extname, join, relative, resolve } from 'node:path'
-import sharp from 'sharp'
-import { isOutpaintAspect, normalizeImageEditMask, type OutpaintAspect, orientedImageDimensions, outpaintTargetDimensions } from './imageEdit.js'
-import type { ChannelAdapter, ChannelContext } from '@openclaude/plugin-sdk'
+import { extname, join } from 'node:path'
+import type { ChannelAdapter } from '@openclaude/plugin-sdk'
 import {
   type InboundFrame,
-  type InboundMessage,
   type OutboundCodexBilling,
   type OutboundExternalEngineBilling,
   type OutboundCallUsage,
@@ -68,54 +43,19 @@ import {
   type OutboundTurnStatus,
   type OutboundTurnUsage,
   type SysContextRebuilt,
-  type Peer,
-  type AgentGroupStatus,
-  type DurableAgentGroup,
   type DurableCodexBilling,
-  type DurableGoalUsageRecord,
   type GoalStateSnapshot,
-  type DurableRuntimeEvent,
-  type ReviewVerdict,
-  REVIEW_VERDICT_PASS,
-  REVIEW_VERDICT_NEEDS_FIX,
-  newTraceId,
-  parseSessionWorkspaceMode,
-  parseTraceIdCandidate,
   STATIC_KEY_INBOUND_MODEL_IDS,
   CODEX_ENGINE_MODEL_IDS,
   GROK_ENGINE_MODEL_IDS,
   CURSOR_ENGINE_MODEL_IDS,
   ZCODE_ENGINE_MODEL_IDS,
-  PLATFORM_REASONING_EFFORTS,
-  AGENT_MODEL_AUTO,
-  ADVISOR_AGENT_ID,
-  normalizeCollabMode,
-  collabConfigVersionOf,
-  MAX_ATTACHMENTS_PER_MESSAGE,
-  AUTOMATIC_TURN_RETRY_MAX,
-  AUTHORITY_TURN_MAX_LIFETIME_MS,
-  isCodexEngineModel,
-  isGrokEngineModel,
-  isCursorEngineModel,
-  isZcodeEngineModel,
-  isAntigravityEngineModel,
   isClientMessageId,
-  isDisplayableServerMessage,
-  isPersistedClientMessageId,
-  turnErrorSemantics,
-  formatMessageReplyPrompt,
-  normalizeMessageReplyQuote,
   shouldServeInline,
-  stripDispatchAuthorityField,
-  isLiveUnitsEnabled,
-  type PromptQueueMutationFrame,
-  TURN_CANCEL_IF_QUEUED_PATH,
 } from '@openclaude/protocol'
-import {
-  failureClassFromLocalExecutionCode,
-  isDelegateTerminalState,
-  type DelegateFailureClass,
-  type JobTerminal,
+import type {
+  DelegateFailureClass,
+  JobTerminal,
 } from '@openclaude/protocol'
 import {
   delegateConcurrencyCap,
@@ -123,438 +63,140 @@ import {
   getDelegateMaxConcurrent,
   getDelegateReviewReservedSlots,
 } from './delegateCapacity.js'
-import {
-  classifiedMessageForCode,
-  classifyDelegateOutputError,
-  classifyRunError,
-} from './errorClassify.js'
-import { parseCreditBudgetFen } from './creditExhaustion.js'
-import {
-  CONSULT_INVOCATION_HEADER,
-  DELEGATE_CONTEXT_HEADER,
-  hashConsultTurnToken,
-  inspectConsultTurnToken,
-  verifyDelegateContextToken,
-} from './delegateContext.js'
-import { checkLocalBridge, isHealthzFileProxyReady } from './localBridgeAuth.js'
-import { resolveGatewayListen } from './gatewayBind.js'
-import { resolveOpenedPath } from './openedPath.js'
-import {
-  hasResolvedPrefix,
-  isPathStrictlyUnder,
-  isPathWithinRoot,
-  openclaudeTempPrefix,
-  trustedContainerHome,
-} from './pathAcl.js'
-import { defaultReleaseJobDir, isReleaseJobId, publicReleaseJob, readReleaseJob } from './releaseJobStore.js'
 import { ContainerPreviewHandler } from './containerPreview.js'
 import {
   PROMPT_QUEUE_DISPATCH_CANCEL_TYPE,
-  PROMPT_QUEUE_DISPATCH_RESULT_TYPE,
-  PROMPT_QUEUE_GRANT_FIELD,
   PromptQueueCoordinator,
   type PromptQueueDispatchRequest,
   type PromptQueueDispatchCancel,
-  type PromptQueueDispatchControl,
   type PromptQueueSessionContext,
   type PromptQueueTurnLifecycle,
 } from './promptQueueCoordinator.js'
 import type { AgentSession, PromptQueueExecutionFence } from './sessionManager.js'
-import { resolveChatRunWorkspace } from './projectWorkspace.js'
-import { createRunContextDescriptor, webchatRunId } from './runContextPersist.js'
 import {
   HttpPromptQueueClient,
   readPromptQueueClientConfig,
 } from './promptQueueClient.js'
-// 合成首帧降级兜底模型的 routable 自检(MAJOR-1):兜底模型在当前进程形态下不可路由
-// (host 无对应平台静态 key)时**不降级**,保持 CODEX_BILLING_GUARD fail-closed。
-import { isHostRoutableStaticModel } from './hostStaticProviders.js'
 import {
   parseSkillEvalsJson,
-  serializeSkillEvals,
-  type SkillEvalCase,
-  type SkillEvalsFile,
   type AgentDef,
   type AgentsConfig,
-  MemoryDir,
-  MEMORY_FILE_RE,
-  readUserProfile,
-  writeUserProfile,
   type OpenClaudeConfig,
-  SkillStore,
   SkillDraftStore,
   TaskStore,
-  buildAgentSkillStore,
   buildUserSkillStore,
-  parseFrontmatter,
-  validateSkillAgentScope,
   paths,
   readAgentsConfig,
   readConfig,
   searchSessions,
   loadSessionTurns,
-  loadSessionEvents,
-  loadSessionUsage,
-  listAutoDreamAuditSessions,
-  listAutoDreamSuccessfulSessionsBetween,
-  getMemoryUsageDashboard,
-  recordMemoryUsageEvent,
   syncMarketplaceHub,
-  updateAgentsConfig,
-  isMarketplacePersonaTarget,
-  writeConfig,
-  getUsageSummary,
-  queryEvents,
-  listClientSessions,
-  classifyClientSessions,
   getClientSession,
-  getClientSessionPartial,
-  readArchivedMessages,
-  readClientSessionLiveFrames,
-  readClientSessionLiveUnits,
-  readLiveOrTapeFramePayload,
-  readClientTimelinePage,
-  encodeClientTimelineCursor,
-  decodeClientTimelineCursor,
-  ClientTimelineCursorStaleError,
-  listTurnTapeRecords,
-  readTapeRecordPayloadChunk,
-  readUserMessagePayload,
-  upsertClientSession,
-  appendServerAuthoredMessage,
-  appendServerAuthoredMessageDurable,
-  patchServerAuthoredMessage,
-  deleteClientSession,
-  patchClientSessionMeta,
-  searchClientSessions,
-  batchClientSessions,
-  markClientSessionRead,
-  markAllClientSessionsRead,
-  parseSessionBatchInput,
-  parseIncludeArchivedFlag,
-  parseOptionalPositiveInt,
-  SESSION_SEARCH_Q_MAX,
-  SESSION_SEARCH_LIMIT_DEFAULT,
-  SESSION_SEARCH_LIMIT_MAX,
-  SESSION_LIST_LIMIT_MAX,
-  recordAutoDreamSuccessfulSession,
-  listUnclaimedSessions,
-  claimSession,
-  probeSessionsDb,
-  countRuntimeRecycleUnsafeTurnDispatches,
-  turnDispatchInboxStats,
 } from '@openclaude/storage'
 import {
   DETACHED_ASK_USER_TTL_MS,
-  agentIdFromAskUserSessionKey,
   buildDetachedAskUserAnswerMessageId,
-  buildDetachedAskUserAnsweredResult,
-  buildDetachedAskUserPersistMessage,
-  buildDetachedAskUserPostedResult,
-  buildDetachedAskUserResolvedSinkPayload,
-  buildDetachedAskUserSinkPayload,
-  buildDetachedAskUserSkippedResult,
-  findDetachedAskUserCardInMessages,
-  formatAskUserAnswerMessage,
-  isDetachedAskUserPending,
-  isDetachedAskUserRequestId,
   type pendingFromDetachedAskUserMessage,
 } from './detachedAskUser.js'
-import {
-  type AskUserWaiter,
-  askUserHttpUnwritable,
-  askUserHttpWriteSucceeded,
-  resolveAskUserWaitMs,
-  type AskUserWaiterAnswer,
+import type {
+  AskUserWaiter,
+  AskUserWaiterAnswer,
 } from './askUserWaiter.js'
-import { fetchAskUserPermissionCard, getV3MasterSinkOrNull, readV3MasterSinkConfig } from './v3MasterSink.js'
 import {
   filterUserVisibleAgentsForManagement,
-  filterUserVisibleByAgentField,
   filterUserVisibleRoutesForManagement,
   isHiddenSystemAgentId,
-  isTeamReviewExecution,
   userVisibleDefaultAgentId,
 } from './agentVisibility.js'
-import { listCollaboratorAgents } from './collaboratorAgents.js'
 import {
-  advisorPreamble,
-  advisorExecutionFromSnapshotJson,
   type buildAdvisorSnapshot,
-  collectAuthorizedArtifacts,
-  formatAdvisorConsultPrompt,
   ADVISOR_CONSULT_PARENT_ENGINES,
   ADVISOR_CONSULT_PARENT_REASON,
   advisorConsultParentGate,
-  advisorCanonicalModelId,
-  assertAdvisorModelAllowed,
-  CCB_ADVISOR_PROFILE_VERSION,
-  coerceHistoryMessages,
-  historyFromSessionMessages,
-  isAdvisorConsultParentEngine,
-  isAdvisorEngineOpen,
-  uniquePendingConsultInvocationId,
-  isCcbAdvisorModelProven,
-  listProvenAdvisorModels,
-  matchConsultIdentity,
-  openAdvisorEngines,
-  parentAuthorizedArtifactTexts,
-  stripAdvisorPreambleFromInjected,
   type AdvisorConsultExecution,
 } from './advisorMode.js'
-import { type AdvisorConsultStore, hashEvidence, mintConsultId } from './advisorConsultStore.js'
-import {
-  type AdvisorConfigStore,
-  CollaborationConfigError,
-  resolveSessionCollab,
+import type { AdvisorConsultStore } from './advisorConsultStore.js'
+import type {
+  AdvisorConfigStore,
 } from './advisorConfigStore.js'
 import type {
-  GatewayEngineErrorEvent,
-  GatewayStreamEvent,
-  GatewayTerminalErrorCode,
-  GatewayTurnPhase,
   SessionStreamEvent,
-  TurnRetryMeta,
 } from './ccbMessageParser.js'
 import { type SkillTrainRun, SkillTrainJobStore } from './skillTrainJobs.js'
 import {
   type SkillEvalRun,
   SkillEvalJobStore,
-  armsForMode,
 } from './skillEvalJobs.js'
-import {
-  type GraderArmInput,
-  type SkillEvalCaseResult,
-  addUsage,
-  buildEvalCasePrompt,
-  buildGraderPrompt,
-  computeBenchmark,
-  emptyUsage,
-  gradesToAssertions,
-  parseGraderJson,
-} from './skillEval.js'
 import { SkillEvalGenJobStore, type SkillEvalGenRun } from './skillEvalGenJobs.js'
 import {
   MAX_SESSION_EXCERPTS,
   SESSION_EXCERPT_MAX_CHARS,
-  buildGeneratePrompt,
-  buildGenerationNote,
   buildSessionExcerpt,
   buildSessionSearchQuery,
-  finalizeGeneratedCases,
   selectUsageSessionHits,
   type GenSessionExcerpt,
 } from './skillEvalGen.js'
 import {
-  MAX_FEEDBACK_SCENARIOS,
   SKILL_TRAIN_DEFAULT_MODEL,
-  SKILL_TRAIN_EFFORT,
-  buildFeedbackScenariosSection,
-  buildSkillTrainPrompt,
-  normalizeSkillTrainArgs,
   type FeedbackScenario,
 } from './skillTrain.js'
 import { WebSocket, type WebSocketServer } from 'ws'
-import { checkToken, verifyPassword, signJwt, verifyJwt, type JwtPayload } from './auth.js'
-import {
-  type CronScheduler,
-  backfillCronOccurrenceDelegateJobs,
-  type CronDeliveryContext,
-  type CronJob,
+import type {
+  CronScheduler,
+  CronDeliveryContext,
+  CronJob,
 } from './cron.js'
-import { listCronDeliverChannels } from './cronChannels.js'
-import { deliverCronOutput, type CronDeliverDeps } from './cronDeliver.js'
-import {
-  deriveFixedBoardProjectId,
-  filterCronJobsForBoard,
-  type CronProjectPorts,
+import type {
+  CronProjectPorts,
 } from './cronProject.js'
-import {
-  buildCronOriginResumeText,
-  cronOriginClientMessageId,
-  cronOriginIdempotencyKey,
-  decideCronOriginDispatchAfterPersist,
-  parseOriginWebchatSessionKey,
-  resolveCronOriginInjectPayload,
-  type CronOriginFireResult,
+import type {
+  CronOriginFireResult,
 } from './cronOriginSession.js'
-import { getProject } from './taskboard/db/projects.js'
 import {
-  buildSendToAgentCallbackText,
-  callbackPayloadFromDurableJob,
-  decideCallbackDispatchAfterPersist,
-  isSendToAgentCallbackComplete,
-  sendToAgentCallbackClientMessageId,
-  sendToAgentCallbackIdempotencyKey,
-} from './sendToAgentCallback.js'
-import {
-  abandonCcbLocalAgentInject,
-  ackCcbTaskNotificationDelivered,
-  beginCcbLocalAgentInject,
-  buildCcbLocalAgentCallbackText,
-  ccbLocalAgentCallbackClientMessageId,
-  ccbLocalAgentCallbackIdempotencyKey,
   clearCcbLocalAgentPendingForSession,
-  completeCcbLocalAgentInject,
-  evaluateCcbLocalAgentInjectLimit,
-  failCcbLocalAgentInject,
-  getCcbLocalAgentCallbackState,
-  finalizeCcbLocalAgentPendingInjections,
-  noteCcbLocalAgentFinalizeRoundExhausted,
-  noteCcbTaskNotification,
-  noteForegroundBashToolResult,
-  sessionHasInFlightTurn,
   type CcbLocalAgentNotification,
 } from './ccbLocalAgentCallback.js'
-import { runBoundedOriginInjectBackoff } from './originInjectBackoff.js'
 import {
-  persistSendToAgentIntent,
-  recoverInterruptedSendToAgentIntents,
   removeSendToAgentIntent,
   type SendToAgentIntent,
 } from './sendToAgentIntentStore.js'
-import {
-  postCronOriginInject,
-  readV3CronOriginInjectConfig,
-} from './v3CronOriginInject.js'
-import { handleTaskboardApi, resolveTaskboardActor, setPatrolExecutionHandler } from './taskboard/http.js'
-import { getTaskboardDb } from './taskboard/db/index.js'
-import { isPatrolSessionKey } from './taskboard/domain.js'
-import { isTaskboardEnabled } from './taskboard/feature.js'
 import type { PatrolEngine } from './taskboard/patrol.js'
-import { TaskboardNotifier } from './taskboard/notify.js'
-import { sendV3WechatProactive, readV3WechatProactiveConfig } from './v3WechatProactive.js'
-import { sendV3QqProactive, readV3QqProactiveConfig } from './v3QqProactive.js'
-import { postInboxMessage, postInboxMessageDurable } from './v3InboxPost.js'
-import { postInboxAlert, postInboxAlertDurable } from './v3InboxAlert.js'
-import { parseDocument } from './documentParser.js'
-import {
-  makeDelegateProgressBlock,
-  makeDelegateUsageProgressBlock,
-  makeDelegateBlockPassthrough,
-  coalesceDelegateTranscript,
-  DELEGATE_TRANSCRIPT_WARN_BYTES,
-  estimateTranscriptBytes,
-  resolveDelegateProgressRouting,
-  toNestedDelegateProgressLine,
-  formatDelegateParentWorkingDetail,
-  type DelegateProgressBlock,
-  type DelegateProgressRouting,
+import { postInboxMessage } from './v3InboxPost.js'
+import type {
+  DelegateProgressRouting,
 } from './delegateProgress.js'
-import {
-  getDelegateTimeoutReason,
-  resolveDelegateTimeoutConfig,
-  type DelegateTimeoutConfig,
+import type {
+  DelegateTimeoutConfig,
 } from './delegateTimeout.js'
-import {
-  type DelegateJobStore,
-  DELEGATE_LEASE_HEARTBEAT_MAX_BEATS,
-  DELEGATE_LEASE_HEARTBEAT_MS,
-  DELEGATE_REAP_INTERVAL_MS,
-  resolveDelegateHeartbeatTimeoutMs,
-  resolveDelegateJobTtlMs,
-  resolveDelegateWaitMs,
-  type DelegateJobHttpResult,
-  type DelegateJobSnapshot,
+import type {
+  DelegateJobStore,
+  DelegateJobHttpResult,
+  DelegateJobSnapshot,
 } from './delegateJobs.js'
-import { type DelegateResumeRegistry, DELEGATE_RESUME_OCCUPIED_MESSAGE } from './delegateResume.js'
-import {
-  isDelegateCutoverEffective,
-  isDelegateDurableEffective,
-  isDelegateInflightSurfaceEffective,
-  isDelegateNotifierEffective,
-  isDelegateSmEnabled,
-  resolveDelegateCallbackOwner,
-} from './delegateSmFlag.js'
-import {
-  type DelegateInflightSurfaceStore,
-  handleInflightDelegatesRequest,
+import type { DelegateResumeRegistry } from './delegateResume.js'
+import type {
+  DelegateInflightSurfaceStore,
 } from './delegateInflightSurface.js'
+import type { DefaultEngineNotifier } from './engineNotifier.js'
 import {
-  beginDelegateCutover,
-  endDelegateCutover,
-  isDelegateRunnerIdle,
-  resolveDelegateCutoverFreezeMs,
-} from './delegateCutover.js'
-import { type DefaultEngineNotifier, writeInlinePushForSession, type InlinePushSession } from './engineNotifier.js'
-import { resolveParentTapeIngestState, type ParentTapeIngestState } from './delegateNotifyTape.js'
-import {
-  delayUntilNextNotifyRetry,
-  dispatchJobTerminalNotify,
-  retryPendingNotifies,
-} from './delegateNotifyDispatch.js'
-import {
-  formatJobTerminalMarkdown,
-  injectPayloadFromJobTerminal,
-  isJobTerminalFailure,
   parseParentEngine,
 } from './jobTerminal.js'
-import {
-  openDelegateDurableDb,
-  resolveDelegateLedgerRetentionMs,
-} from './delegateDurable.js'
-import {
-  nextDelegateReconcileAt,
-  reconcileDelegateJobsOnBoot,
-  restoreResumeOccupancyFromJobs,
-} from './delegateReconciler.js'
-import {
-  delegateCallbackMessageId,
-  persistDelegateJobSnapshots,
-  restoreDelegateJobSnapshots,
-} from './delegateCompleter.js'
-import {
-  DELEGATE_GOAL_REQUIRED_ERROR,
-  isPlatformAgentId,
-  parseDelegateAllowSelf,
-  parseDelegateModel,
-  rejectSelfDelegate,
-} from './delegateModel.js'
-import { EMPTY_COMPLETED_TURN_NOTICE, hasPlatedAssistantOutput } from './emptyCompletedTurn.js'
-import {
-  rebindOutboundClientMessageId,
-  resolveDelegateProgressBinding,
-} from './terminalStreamFence.js'
-import {
-  type acquireDelegateGrokRoute,
-  delegateGrokMintModelId,
-  shouldMintDelegateGrokRoute,
-  type DelegateGrokRouteLease,
+import type {
+  acquireDelegateGrokRoute,
 } from './delegateGrokRoute.js'
-import {
-  type defaultDelegateEngineBilling,
-  mapDelegateEngineBillingError,
-  resolveDelegateEngineBillingEngine,
-  shouldAdmitDelegateEngineBilling,
-  type DelegateEngineBillingAdmission,
-  type DelegateEngineBillingClient,
+import type {
+  defaultDelegateEngineBilling,
+  DelegateEngineBillingClient,
 } from './delegateEngineBilling.js'
-import { parseAdvisorAdmitRoute, type AdvisorAdmitRouteOk } from './advisorCodexRoute.js'
+import type { AdvisorAdmitRouteOk } from './advisorCodexRoute.js'
 import type { DelegateOwnerTurnLocator } from './delegateLateCompletion.js'
-import { eventBus, createEvent } from './eventBus.js'
-import { startEventPersistence } from './eventPersist.js'
-import { startMemoryTurnObserver } from './memoryTurnObserver.js'
-import { startMemoryUsageReporter } from './memoryUsageReporter.js'
-import { parseByteRange, serveFileFdWithRange } from './httpRange.js'
-import { createLogger, type Logger } from './logger.js'
+import { createLogger } from './logger.js'
 import {
-  startMetricsCollection,
-  serializeMetrics,
-  httpRequestsTotal,
-  httpRequestDuration,
-  wsConnectionsTotal,
-  sessionsActive,
-  outboundRingReplayHitTotal,
-  outboundRingReplayMissTotal,
   outboundRingEvictedTotal,
   outboundRingSizeBytes,
-  delegateNotifyTotal,
-  delegateNotifyLatencyMs,
 } from './metrics.js'
 import { RateLimiter } from './rateLimit.js'
-import { USER_PROFILE_INJECT_MAX_CHARS } from './promptSlots.js'
 import { matchBridgeApiAllowlist, parseTrustedCollabParentHeaders } from './bridgeApiAllowlist.js'
-import { handleOpenAIRequest } from './openaiCompat.js'
 import { DEFAULT_RING_CONFIG, OutboundRingBuffer, type EvictionStats } from './outboundRing.js'
 import { Router } from './router.js'
 import { RunLog } from './runLog.js'
@@ -565,82 +207,25 @@ import {
 } from './sessionRepoWorkspace.js'
 import {
   SessionManager,
-  isCommercialManagedRuntime,
-  lookupRecentTerminal,
-  parseVerificationVerdict,
   persistInterruptedPromptQueueTurn,
-  PRE_ADMISSION_STOP_TTL_MS,
   messageSendAttempt,
   preStartStopKey,
-  stopControlSendAttempt,
-  type PromptQueueExternalTurnReservation,
 } from './sessionManager.js'
 import type { WebhookRouter } from './webhooks.js'
-import { inferAgentForModel } from './inferAgentForModel.js'
-import {
-  capMarketplaceToolsets,
-  mergeOnDemandToolsets,
-  resolveDelegateToolsets,
-} from './toolsetIntent.js'
-import { projectCcbExecutionDescriptor, resolveOpenClaudeVisionEntry } from './subprocessRunner.js'
-import {
-  handleV3CodexRelayLocal,
-  readV3CodexRelayConfig,
-  V3_CODEX_RELAY_PREFIX,
-} from './v3CodexRelay.js'
-import {
-  handleV5GrokRelayLocal,
-  readV5GrokRelayConfig,
-  V5_GROK_RELAY_PREFIX,
-} from './v5GrokRelay.js'
-import {
-  handleV5ZcodeRelayLocal,
-  readV5ZcodeRelayConfig,
-  V5_ZCODE_RELAY_PREFIX,
-} from './v5ZcodeRelay.js'
-import {
-  handleV5AntigravityRelayLocal,
-  readV5AntigravityRelayConfig,
-  V5_ANTIGRAVITY_RELAY_PREFIX,
-} from './v5AntigravityRelay.js'
-import type { AntigravityRouteOverride } from './engine/antigravityAdapter.js'
-import {
-  handleV3MarketplaceRelayLocal,
-  readV3MarketplaceRelayConfig,
-  V3_MARKETPLACE_LOCAL_RELAY_PREFIX,
-} from './v3MarketplaceRelay.js'
+import { resolveOpenClaudeVisionEntry } from './subprocessRunner.js'
 import {
   buildSkillTrainCompleteNotice,
-  decideSkillLocalRelay,
-  SKILL_LOCAL_RELAY_PREFIX,
 } from './ocSkillLocalRelay.js'
-import { handleProjectSearchLocal, PROJECT_SEARCH_LOCAL_PATH } from './projectSearchLocal.js'
-import {
-  startToolFailureReporter,
-  type ToolFailureReporter,
+import type {
+  ToolFailureReporter,
 } from './v3ToolFailureReporter.js'
-import {
-  fetchUserSkillFeedbackRefs,
-  startSkillUsageReporter,
-  type SkillFeedbackRef,
-} from './skillUsageReporter.js'
-import {
-  startSkillShadowReporter,
-  type SkillShadowReporter,
+import type {
+  SkillShadowReporter,
 } from './skillShadowReporter.js'
-import { resolveEngine } from './engine/registry.js'
 import {
-  AuthorityRejected,
-  MODEL_AUTHORITY_FIELD,
   ModelAuthorityConsumer,
-  attachTurnAuthority,
-  buildContainerAttestFrame,
   getTurnAuthority,
-  isEngineLocalTurnExempt,
-  isModelAuthorityRequired,
-  stripModelAuthorityField,
   type ConnectionAuthorityContext,
-  type TurnExecutionDescriptor,
 } from './modelAuthority.js'
 import {
   DISPATCH_AUTHORITY_FIELD,
@@ -649,72 +234,33 @@ import {
   type DispatchTurnContext,
   type admitTurnDispatch,
   attachDispatchContext,
-  buildSyntheticCrashedTapePayload,
   buildTurnDispatchReceiptFrame,
-  buildTurnDispatchStateResponse,
-  durableTurnDispatchCapabilities,
-  getDispatchContext,
-  getTurnDispatchState,
-  getTurnDispatchStateByDispatch,
-  inboxSinkStageFailedByDispatch,
-  inboxSinkStagedByDispatch,
-  isInboundBypassMethodAllowed,
-  isTurnDispatchLive,
-  normalizeDispatchUserId,
-  queryMasterTapeState,
-  recoverTurnDispatchInboxOnBoot,
-  rejectTurnDispatchIfAbsent,
-  cancelQueuedTurnDispatchExact,
-  resolveInboxTerminalAck,
-  runDurableDispatchAdmission,
 } from './turnDispatchInbox.js'
 import type { RuntimeRecycleDrainCoordinator } from './runtimeRecycleDrain.js'
 import {
-  LocalExecutionRejected,
-  ModelCatalogUnavailableError,
   getLocalCatalogView,
   localExecutionRejectCode,
-  type LocalCatalogView,
   type LocalExecutionRejectCode,
 } from './modelCatalogClient.js'
-import { suggestDelegateModels } from './delegateModelCatalogPrompt.js'
-import { resolveDelegateCostUsd } from './usageCost.js'
-import {
-  buildTeamPreamble,
-  buildTeamReviewContext,
-  parseTeamReviewMode,
-  pickDeliberationPanel,
-  pickReviewerModel,
-  type DeliberationPanelMember,
-  type ReviewEvidenceItem,
-  type TeamReviewMode,
-} from './teamMode.js'
-import type { CodexProviderConfigOverride } from './engine/codexShared.js'
 import {
   OPENCLAUDE_VISION_MCP_ID,
   OPENCLAUDE_VISION_TOOLS,
-  isTextOnlyDefinite,
   shouldEnableOpenClaudeVision,
 } from './mcpVisionServer.js'
-import { buildImageAttachmentHint } from './imageAttachmentHint.js'
 import {
-  AUTO_DREAM_PROPOSAL_JSON_SCHEMA,
   AutoDreamService,
-  AutoDreamStructuredOutputCollector,
   formatAutoDreamReceipt,
-  isAutoDreamSuccessfulTurn,
   type AutoDreamModelRun,
 } from './autoDream.js'
 import {
-  AUTO_DREAM_OPTIMIZER_JSON_SCHEMA,
   AutoDreamOptimizerService,
   type AutoDreamAuditDataset,
   type AutoDreamOptimizerModelRun,
   type AutoDreamOptimizerProposal,
 } from './autoDreamOptimizer.js'
 import { AutoDreamOptimizerClient } from './autoDreamOptimizerClient.js'
-import { AutoDreamPolicyClient, type AutoDreamOptimizerPolicy } from './autoDreamPolicy.js'
-import { GATEWAY_PENDING_PERMISSION_TTL_MS, _isBlockingUserInputTool, _permissionRequestExpiresAt, _pendingPermissionCatchupFrames, parsePermissionLookupQuery, attachPermissionSnapshotIfMissing } from './pendingPermissionSnapshot.js'
+import type { AutoDreamOptimizerPolicy } from './autoDreamPolicy.js'
+import { GATEWAY_PENDING_PERMISSION_TTL_MS } from './pendingPermissionSnapshot.js'
 import { type AgentHandlersHost, handleAgentsCollection as handleAgentsCollectionImpl, handleAgentItem as handleAgentItemImpl, handlePersona as handlePersonaImpl, handleMemory as handleMemoryImpl, handleMemoryUsage as handleMemoryUsageImpl, handleAutoDreamReport as handleAutoDreamReportImpl, handleAutoDreamOptimizer as handleAutoDreamOptimizerImpl, handleAutoDreamOptimizerCancel as handleAutoDreamOptimizerCancelImpl, handleAutoDreamOptimizerProposal as handleAutoDreamOptimizerProposalImpl, handleMemoryFile as handleMemoryFileImpl, _loadAutoDreamAuditDataset as _loadAutoDreamAuditDatasetImpl, _runAutoDreamOptimizerModel as _runAutoDreamOptimizerModelImpl, _hydrateAutoDreamOptimizerProposals as _hydrateAutoDreamOptimizerProposalsImpl, _applyAutoDreamOptimizerProposal as _applyAutoDreamOptimizerProposalImpl, _runAutoDreamModel as _runAutoDreamModelImpl } from './agentHandlers.js'
 import { type SkillHandlersHost, handleSkillsList as handleSkillsListImpl, handleSkillItem as handleSkillItemImpl, handleUserSkillsList as handleUserSkillsListImpl, _handleUserSkillFiles as _handleUserSkillFilesImpl, _handleUserSkillHistory as _handleUserSkillHistoryImpl, _handleUserSkillRestore as _handleUserSkillRestoreImpl, validateSkillAgentScopeInput as validateSkillAgentScopeInputImpl, handleUserSkillItem as handleUserSkillItemImpl, _handleSkillEvalsFile as _handleSkillEvalsFileImpl, _handleSkillEvalStart as _handleSkillEvalStartImpl, _handleSkillEvalRunStatus as _handleSkillEvalRunStatusImpl, _handleSkillEvalGenStart as _handleSkillEvalGenStartImpl, _handleSkillEvalGenStatus as _handleSkillEvalGenStatusImpl, _handleReleaseJobStatus as _handleReleaseJobStatusImpl, _runSkillEvalGen as _runSkillEvalGenImpl, _skillEvalTurn as _skillEvalTurnImpl, _runSkillEval as _runSkillEvalImpl, _startSkillAutoRegression as _startSkillAutoRegressionImpl, _skillAutoRegressionTick as _skillAutoRegressionTickImpl, _collectSkillFeedbackScenarios as _collectSkillFeedbackScenariosImpl, _handleSkillTrainStart as _handleSkillTrainStartImpl, _handleSkillTrainList as _handleSkillTrainListImpl, _handleSkillTrainRun as _handleSkillTrainRunImpl, _handleSkillTrainDrafts as _handleSkillTrainDraftsImpl, _handleSkillTrainDraftItem as _handleSkillTrainDraftItemImpl, _handleSkillTrainComment as _handleSkillTrainCommentImpl, _handleSkillTrainMerge as _handleSkillTrainMergeImpl } from './skillHandlers.js'
 import { type DelegateCallbacksHost, _dispatchDelegateNotify as _dispatchDelegateNotifyImpl, _adoptOrphanedStdoutWaitDelegates as _adoptOrphanedStdoutWaitDelegatesImpl, _retryDelegateNotifies as _retryDelegateNotifiesImpl, _persistSendToAgentIntent as _persistSendToAgentIntentImpl, _deliverInterruptedSendToAgentIntent as _deliverInterruptedSendToAgentIntentImpl, _persistInterruptedSendToAgentCallbacks as _persistInterruptedSendToAgentCallbacksImpl, _ensureDurableSendToAgentCallback as _ensureDurableSendToAgentCallbackImpl, handleCcbLocalAgentNotification as handleCcbLocalAgentNotificationImpl, handleCcbLocalAgentDelivered as handleCcbLocalAgentDeliveredImpl, flushCcbLocalAgentPendingOnFinalize as flushCcbLocalAgentPendingOnFinalizeImpl, queueCcbLocalAgentInject as queueCcbLocalAgentInjectImpl, injectCcbLocalAgentCallback as injectCcbLocalAgentCallbackImpl, tryCcbLocalAgentCallbackDispatch as tryCcbLocalAgentCallbackDispatchImpl, _queueSendToAgentCallback as _queueSendToAgentCallbackImpl, injectSendToAgentCallback as injectSendToAgentCallbackImpl, trySendToAgentCallbackDispatch as trySendToAgentCallbackDispatchImpl, _sendToAgentCallbackTurnAlreadyQueued as _sendToAgentCallbackTurnAlreadyQueuedImpl } from './delegateCallbacks.js'
@@ -730,8 +276,8 @@ import { type WsConnectionHost, handleWsConnection as handleWsConnectionImpl, au
 // Moved to ./gatewayFilePolicy.js (FINDINGS §7.6, OCV5-484); re-exported for existing importers.
 export { FILE_BLOCKED_PATTERNS, isFileAllowed, FILE_ALLOWED_DIRS, MIME_MAP, uploadExtForMime, UPLOAD_MIME_TO_EXT, isUploadMimeAllowed, makeUserScopedMediaPredicate, COMMERCIAL_USER_VOLUME_MEDIA_GATE, MEDIA_EXTENSIONS, TRUSTED_CONTAINER_HOME, isTrustedContainerFileServeEnabled, OPT_OPENCLAUDE_EXPORT_RE, TEMP_PREFIX, isFileBlocked, safeUploadExtension } from './gatewayFilePolicy.js'
 export type { UserMediaLocationLike, UploadFsOps } from './gatewayFilePolicy.js'
-import { isFileAllowed, MIME_MAP, isFileBlocked } from './gatewayFilePolicy.js'
-import type { UserMediaLocationLike, UploadFsOps } from './gatewayFilePolicy.js'
+import { MIME_MAP } from './gatewayFilePolicy.js'
+import type { UploadFsOps } from './gatewayFilePolicy.js'
 // Moved to ./localExecution.js (FINDINGS §7.6, OCV5-484); re-exported for existing importers.
 export { decideLocalExecution, resolveLocalExecutionIfEnforced, localExecutionOverride, resolveExecutionModel, EXECUTION_MODEL_FALLBACK_ROUTE, resolveSyntheticTurnModel, downgradeSyntheticCodex, readLiveRunnerModel, peekLiveRunnerModel, liveSessionModelUnusableReason, liveSessionReuseSkipReason, EXECUTION_MODEL_FALLBACK, SYNTHETIC_TURN_NON_CODEX_MODEL_DEFAULT, TICKETLESS_INBOUND_LIVE_SESSION_FALLBACK_WARN, TICKETLESS_LIVE_SESSION_REPLACING_REASON } from './localExecution.js'
 export type { LocalExecutionDecision, LocalTurnKind, SyntheticTurnModel } from './localExecution.js'
