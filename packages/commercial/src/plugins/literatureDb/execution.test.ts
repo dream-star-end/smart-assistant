@@ -528,3 +528,118 @@ test('createPinnedDownstreamRequester aborts during DNS and enforces hop timeout
   assert.equal(dnsCalls, 1)
   resolveDns?.(['8.8.8.8'])
 })
+
+test('createPinnedDownstreamRequester keeps active byte stream alive past hopTimeoutMs, enforces total ceiling, and supports loopback proxy with direct fallback', async () => {
+  const http = await import('node:http')
+  let mode: 'progress' | 'trickle-cap' | 'stall' = 'progress'
+  const srv = http.createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream' })
+    if (mode === 'stall') return
+    let sent = 0
+    const iv = setInterval(() => {
+      sent++
+      res.write(Buffer.from(`chunk-${sent};`))
+      if (mode === 'progress' && sent >= 3) {
+        clearInterval(iv)
+        res.end()
+      }
+    }, 30)
+    res.on('close', () => clearInterval(iv))
+  })
+  await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve))
+  const port = (srv.address() as { port: number }).port
+  const seenTargets: Array<{ hostname: string; port: number; path: string }> = []
+  let failProxyWith502 = false
+  const localRequest: typeof http.request = ((options: any, cb: any) => {
+    seenTargets.push({ hostname: options.hostname, port: options.port, path: options.path })
+    if (options.port === 29999 && failProxyWith502) {
+      return http.request({ ...options, hostname: '127.0.0.1', port: 1 }, cb)
+    }
+    return http.request({ ...options, hostname: '127.0.0.1', port, lookup: undefined }, cb)
+  }) as any
+  const resolver = {
+    resolve4: async () => ['8.8.8.8'],
+    resolve6: async () => [],
+  }
+  try {
+    // 1. Active stream (~90ms total) exceeds hopTimeoutMs (55ms) but resets on each 30ms chunk:
+    mode = 'progress'
+    const progressReq = createPinnedDownstreamRequester(resolver, 55, 500, localRequest, '')
+    const okRes = await progressReq({
+      url: new URL('http://webvpn.ustb.booktsg.com/stream'),
+      method: 'GET',
+      headers: {},
+      maxBytes: 1024,
+      signal: new AbortController().signal,
+    })
+    assert.equal(okRes.statusCode, 200)
+    assert.equal(okRes.body.toString('utf8'), 'chunk-1;chunk-2;chunk-3;')
+
+    // 2. Loopback proxy succeeds on first try when healthy:
+    seenTargets.length = 0
+    const proxyReq = createPinnedDownstreamRequester(
+      resolver,
+      55,
+      500,
+      localRequest,
+      'http://127.0.0.1:29999',
+    )
+    const proxyRes = await proxyReq({
+      url: new URL('http://webvpn.ustb.booktsg.com/stream'),
+      method: 'GET',
+      headers: {},
+      maxBytes: 1024,
+      signal: new AbortController().signal,
+    })
+    assert.equal(proxyRes.statusCode, 200)
+    assert.equal(seenTargets.length, 1)
+    assert.equal(seenTargets[0]?.port, 29999)
+    assert.equal(seenTargets[0]?.path, 'http://webvpn.ustb.booktsg.com/stream')
+
+    // 3. Loopback proxy failure automatically falls back to direct pinned connection:
+    seenTargets.length = 0
+    failProxyWith502 = true
+    const fallbackRes = await proxyReq({
+      url: new URL('http://webvpn.ustb.booktsg.com/stream'),
+      method: 'GET',
+      headers: {},
+      maxBytes: 1024,
+      signal: new AbortController().signal,
+    })
+    assert.equal(fallbackRes.statusCode, 200)
+    assert.equal(seenTargets.length, 2)
+    assert.equal(seenTargets[0]?.port, 29999)
+    assert.equal(seenTargets[1]?.port, 80)
+    assert.equal(seenTargets[1]?.path, '/stream')
+
+    // 4. Infinite trickle exceeds maxTotalTimeoutMs (95ms):
+    mode = 'trickle-cap'
+    const capReq = createPinnedDownstreamRequester(resolver, 55, 95, localRequest, '')
+    await assert.rejects(
+      capReq({
+        url: new URL('http://webvpn.ustb.booktsg.com/stream'),
+        method: 'GET',
+        headers: {},
+        maxBytes: 1024 * 1024,
+        signal: new AbortController().signal,
+      }),
+      (err: unknown) => err instanceof LiteratureError && err.code === 'TIMEOUT',
+    )
+
+    // 5. Stalled stream exceeds hopTimeoutMs (55ms):
+    mode = 'stall'
+    const stallReq = createPinnedDownstreamRequester(resolver, 55, 500, localRequest, '')
+    await assert.rejects(
+      stallReq({
+        url: new URL('http://webvpn.ustb.booktsg.com/stream'),
+        method: 'GET',
+        headers: {},
+        maxBytes: 1024,
+        signal: new AbortController().signal,
+      }),
+      (err: unknown) => err instanceof LiteratureError && err.code === 'TIMEOUT',
+    )
+  } finally {
+    await new Promise<void>((resolve) => srv.close(() => resolve()))
+  }
+})

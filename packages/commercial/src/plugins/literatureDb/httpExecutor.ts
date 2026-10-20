@@ -44,22 +44,32 @@ export interface LiteratureHttpReadExecutor {
 }
 
 export const WANFANG_WEBVPN_ORIGIN = 'http://webvpn.ustb.booktsg.com'
+
 export const WANFANG_WEBVPN_GRPC_PATH =
   '/https/77726476706e69737468656265737421f4b9569d2936695e790c88b8991b203a7c11579c/Detail.DetailService/getRelatedPaper?vpn-12-o2-d.wanfangdata.com.cn'
+
 export const WANFANG_WEBVPN_DOWNLOAD_PREFIX =
   '/https/77726476706e69737468656265737421ffe452d2303166567f068ea89941227b8b47969ef4a4/file/download/perio_'
+
 export const WANFANG_WEBVPN_FULLTEXT_PREFIX =
   '/https/77726476706e69737468656265737421ffe452d2303166567f068ea89941227b8b47969ef4a4/NewFulltext'
+
 export const WANFANG_SEED_PAPER_ID = 'dgjsxb202616022'
+
 export const JIEYOU_WANFANG_ENTRY_PATH = '/e/action/ShowInfo.php?classid=79&id=2837'
+
 export const JIEYOU_SPRINGER_WEBVPN_ENTRY_PATH = '/e/action/ShowInfo.php?classid=209&id=1781'
+
 export const SPRINGER_WEBVPN_PREFIX =
   '/https/77726476706e69737468656265737421fcfe4f976923784277068ea98a1b203a54'
 const ALLOWED_DOWNSTREAM_HOSTS = new Set(['webvpn.ustb.booktsg.com'])
-const DOWNSTREAM_HOP_TIMEOUT_MS = 15_000
 
+export const DOWNSTREAM_HOP_TIMEOUT_MS = 30_000
+
+export const DOWNSTREAM_MAX_TOTAL_TIMEOUT_MS = 105_000
+const BROWSER_UA =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
 const DOCUMENT_ID_TTL_MS = 60 * 60 * 1000 // 1 hour
-
 function encodeVarint(val: number): Buffer {
   const bytes: number[] = []
   let v = val >>> 0
@@ -70,12 +80,10 @@ function encodeVarint(val: number): Buffer {
   bytes.push(v)
   return Buffer.from(bytes)
 }
-
 function encodeStringField(fieldNo: number, str: string): Buffer {
   const b = Buffer.from(str, 'utf8')
   return Buffer.concat([encodeVarint((fieldNo << 3) | 2), encodeVarint(b.length), b])
 }
-
 function encodeVarintField(fieldNo: number, val: number): Buffer {
   return Buffer.concat([encodeVarint((fieldNo << 3) | 0), encodeVarint(val)])
 }
@@ -100,7 +108,6 @@ export function buildWanfangRelatedPaperGrpcFrame(
   payload.copy(frame, 5)
   return frame
 }
-
 function readVarint(buf: Buffer, pos: number): [number, number] {
   let result = 0
   let shift = 0
@@ -124,7 +131,6 @@ export interface ParsedWanfangPaper {
   readonly snippet?: string
   readonly hasFulltext: boolean
 }
-
 function parseSinglePeriodicalProto(perio: Buffer): ParsedWanfangPaper | null {
   let q = 0
   let id = ''
@@ -176,7 +182,6 @@ function parseSinglePeriodicalProto(perio: Buffer): ParsedWanfangPaper | null {
     hasFulltext,
   }
 }
-
 const PERIODICAL_MARKER = Buffer.from('\x0a\x0aPeriodical\xba\x06', 'latin1')
 
 export function parseWanfangRelatedPaperGrpcResponse(raw: Buffer): ParsedWanfangPaper[] {
@@ -201,7 +206,6 @@ export function parseWanfangRelatedPaperGrpcResponse(raw: Buffer): ParsedWanfang
   }
   return papers
 }
-
 function decodeHtmlEntities(input: string): string {
   return input
     .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(Number.parseInt(hex, 16)))
@@ -232,16 +236,17 @@ export function parseSpringerSearchHtml(html: string, limit: number): ParsedWanf
       continue
     }
     const title = decodeHtmlEntities(
-      linkMatch[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim(),
+      linkMatch[2]
+        .replace(/<[^>]+>/g, '')
+        .replace(/\s+/g, ' ')
+        .trim(),
     )
     if (!title) continue
     seenIds.add(paperId)
-
     const entitlementMatch = /<div[^>]*data-test="entitlements"[^>]*>([\s\S]*?)<\/div>/i.exec(card)
     const entitlement = entitlementMatch?.[1]
       ? decodeHtmlEntities(entitlementMatch[1].replace(/<[^>]+>/g, '').trim()).toLowerCase()
       : ''
-
     const authorsMatch = /<span[^>]*data-test="authors"[^>]*>([\s\S]*?)<\/span>/i.exec(card)
     const authors = authorsMatch?.[1]
       ? decodeHtmlEntities(authorsMatch[1].replace(/<[^>]+>/g, '').trim())
@@ -249,26 +254,29 @@ export function parseSpringerSearchHtml(html: string, limit: number): ParsedWanf
           .map((a) => a.replace(/\.{2,}/g, '').trim())
           .filter(Boolean)
       : []
-
     const journalMatch = /<a[^>]*data-test="parent"[^>]*>([\s\S]*?)<\/a>/i.exec(card)
     const journal = journalMatch?.[1]
-      ? decodeHtmlEntities(journalMatch[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim())
+      ? decodeHtmlEntities(
+          journalMatch[1]
+            .replace(/<[^>]+>/g, '')
+            .replace(/\s+/g, ' ')
+            .trim(),
+        )
       : 'Springer Nature'
-
     const pubMatch = /<span[^>]*data-test="published"[^>]*>([\s\S]*?)<\/span>/i.exec(card)
     const yearMatch = pubMatch?.[1] ? /\b(19\d\d|20\d\d)\b/.exec(pubMatch[1]) : null
     const parsedYear = yearMatch?.[1] ? Number(yearMatch[1]) : undefined
     const year =
       parsedYear !== undefined && parsedYear >= 1500 && parsedYear <= 2100 ? parsedYear : undefined
-
     const descMatch = /<div[^>]*data-test="description"[^>]*>([\s\S]*?)<\/div>/i.exec(card)
     const snippet = descMatch?.[1]
-      ? decodeHtmlEntities(descMatch[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim()).slice(
-          0,
-          300,
-        )
+      ? decodeHtmlEntities(
+          descMatch[1]
+            .replace(/<[^>]+>/g, '')
+            .replace(/\s+/g, ' ')
+            .trim(),
+        ).slice(0, 300)
       : undefined
-
     const item: ParsedWanfangPaper = {
       id: paperId,
       title,
@@ -290,11 +298,11 @@ export function parseSpringerSearchHtml(html: string, limit: number): ParsedWanf
 export function isChineseLiteratureQuery(query: string): boolean {
   return /\p{Script=Han}/u.test(query)
 }
-
 /**
  * Mints a documentId matching `^[A-Za-z0-9-]{16,128}$` (builtinArtifact opaqueId constraint)
  * bound via HMAC-SHA256 to ownerUserId + accountInstanceId + expiration + paperId.
  */
+
 export function mintScopedDocumentId(
   secret: Buffer,
   input: {
@@ -336,7 +344,11 @@ export function verifyScopedDocumentId(
     throw new LiteratureError('INVALID_INPUT')
   }
   const macInput = `v1\0${expected.ownerUserId}\0${expected.accountInstanceId}\0${expB36}\0${pidHex}`
-  const expectedMacHex = crypto.createHmac('sha256', secret).update(macInput).digest('hex').slice(0, 32)
+  const expectedMacHex = crypto
+    .createHmac('sha256', secret)
+    .update(macInput)
+    .digest('hex')
+    .slice(0, 32)
   const providedBuf = Buffer.from(macHex, 'hex')
   const expectedBuf = Buffer.from(expectedMacHex, 'hex')
   if (
@@ -371,7 +383,6 @@ export type DownstreamHttpRequester = (input: {
   readonly maxBytes: number
   readonly signal: AbortSignal
 }) => Promise<RawDownstreamResponse>
-
 function withDeadline<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -390,11 +401,37 @@ function withDeadline<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
     )
   })
 }
+function parseLoopbackProxyUrl(raw?: string): { hostname: string; port: number } | null {
+  const trimmed = raw?.trim()
+  if (!trimmed) return null
+  try {
+    const u = new URL(trimmed)
+    if (
+      u.protocol !== 'http:' ||
+      u.username ||
+      u.password ||
+      u.hash ||
+      (u.pathname && u.pathname !== '/')
+    )
+      return null
+    const host = u.hostname.toLowerCase()
+    if (host !== '127.0.0.1' && host !== 'localhost') return null
+    const port = Number(u.port)
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null
+    return { hostname: host === 'localhost' ? '127.0.0.1' : host, port }
+  } catch {
+    return null
+  }
+}
 
 export function createPinnedDownstreamRequester(
   resolver?: DnsResolver,
   hopTimeoutMs = DOWNSTREAM_HOP_TIMEOUT_MS,
+  maxTotalTimeoutMs = DOWNSTREAM_MAX_TOTAL_TIMEOUT_MS,
+  requestImpl: typeof http.request = http.request,
+  proxyUrl = process.env.LITERATURE_DOWNSTREAM_PROXY_URL,
 ): DownstreamHttpRequester {
+  const proxy = parseLoopbackProxyUrl(proxyUrl)
   return async ({ url, method, headers, body, maxBytes, signal }) => {
     if (signal.aborted) throw new LiteratureError('CANCELLED')
     const hostname = url.hostname.toLowerCase()
@@ -418,110 +455,130 @@ export function createPinnedDownstreamRequester(
       if (signal.aborted || (err instanceof LiteratureError && err.code === 'CANCELLED')) {
         throw new LiteratureError('CANCELLED')
       }
-      if (err instanceof LiteratureError && err.code === 'TIMEOUT') {
-        throw err
-      }
+      if (err instanceof LiteratureError && err.code === 'TIMEOUT') throw err
       throw new LiteratureError('OUTBOUND_BLOCKED')
     }
     if (signal.aborted) throw new LiteratureError('CANCELLED')
-    const isHttps = false
-    const mod = http
     const port = url.port ? Number(url.port) : 80
-
-    return await new Promise<RawDownstreamResponse>((resolve, reject) => {
-      let settled = false
-      const finish = (err?: unknown, res?: RawDownstreamResponse) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        signal.removeEventListener('abort', onAbort)
-        if (err) reject(err)
-        else resolve(res!)
-      }
-      const onAbort = () => {
-        req.destroy()
-        finish(new LiteratureError('CANCELLED'))
-      }
-      const timer = setTimeout(() => {
-        req.destroy()
-        finish(new LiteratureError('TIMEOUT'))
-      }, hopTimeoutMs)
-      const pinnedLookup = (
-        _hostname: string,
-        options: unknown,
-        cb: (
-          err: NodeJS.ErrnoException | null,
-          address: string | Array<{ address: string; family: number }>,
-          family?: number,
-        ) => void,
-      ) => {
-        if (typeof options === 'object' && options !== null && (options as { all?: boolean }).all) {
-          cb(null, [{ address: pin.ip, family: pin.family }])
-          return
-        }
-        cb(null, pin.ip, pin.family)
-      }
-      const req = mod.request(
-        {
-          protocol: url.protocol,
-          hostname: url.hostname,
-          port,
-          method,
-          path: `${url.pathname}${url.search}`,
-          headers: {
-            Host: url.host,
-            ...headers,
-            ...(body ? { 'Content-Length': String(body.length) } : {}),
-          },
-          lookup: pinnedLookup as never,
-          ...(isHttps ? { servername: url.hostname } : {}),
-        },
-        (res) => {
-          const chunks: Buffer[] = []
-          let total = 0
-          res.on('data', (chunk: Buffer) => {
-            total += chunk.length
-            if (total > maxBytes) {
-              req.destroy()
-              finish(new LiteratureError('RESPONSE_TOO_LARGE'))
-              return
-            }
-            chunks.push(chunk)
-          })
-          res.on('end', () => {
-            finish(undefined, {
-              statusCode: res.statusCode ?? 0,
-              headers: res.headers,
-              body: Buffer.concat(chunks),
-            })
-          })
-          res.on('close', () => {
-            if (!settled && !res.complete) {
-              finish(
-                signal.aborted
-                  ? new LiteratureError('CANCELLED')
-                  : new LiteratureError('RESPONSE_INVALID'),
-              )
-            }
-          })
-          res.on('error', (err) => finish(err))
-        },
-      )
-      signal.addEventListener('abort', onAbort, { once: true })
-      if (signal.aborted) {
-        onAbort()
+    const pinnedLookup = (
+      _hostname: string,
+      options: unknown,
+      cb: (
+        err: NodeJS.ErrnoException | null,
+        address: string | Array<{ address: string; family: number }>,
+        family?: number,
+      ) => void,
+    ) => {
+      if (typeof options === 'object' && options !== null && (options as { all?: boolean }).all) {
+        cb(null, [{ address: pin.ip, family: pin.family }])
         return
       }
-      req.on('error', () => {
-        if (signal.aborted) {
+      cb(null, pin.ip, pin.family)
+    }
+    const runAttempt = (viaProxy: { hostname: string; port: number } | null) =>
+      new Promise<RawDownstreamResponse>((resolve, reject) => {
+        let settled = false
+        let idleTimer: ReturnType<typeof setTimeout> | undefined
+        const finish = (err?: unknown, res?: RawDownstreamResponse) => {
+          if (settled) return
+          settled = true
+          clearTimeout(idleTimer)
+          clearTimeout(totalTimer)
+          signal.removeEventListener('abort', onAbort)
+          if (err) reject(err)
+          else resolve(res!)
+        }
+        const onTimeout = () => {
+          req.destroy()
+          finish(new LiteratureError('TIMEOUT'))
+        }
+        const armIdleTimer = () => {
+          clearTimeout(idleTimer)
+          idleTimer = setTimeout(onTimeout, hopTimeoutMs)
+        }
+        const onAbort = () => {
+          req.destroy()
           finish(new LiteratureError('CANCELLED'))
+        }
+        armIdleTimer()
+        const totalTimer = setTimeout(onTimeout, Math.max(hopTimeoutMs, maxTotalTimeoutMs))
+        const req = requestImpl(
+          {
+            protocol: 'http:',
+            hostname: viaProxy ? viaProxy.hostname : url.hostname,
+            port: viaProxy ? viaProxy.port : port,
+            method,
+            path: viaProxy ? url.toString() : `${url.pathname}${url.search}`,
+            headers: {
+              Host: url.host,
+              ...headers,
+              ...(body ? { 'Content-Length': String(body.length) } : {}),
+            },
+            ...(viaProxy ? {} : { lookup: pinnedLookup as never }),
+          },
+          (res) => {
+            armIdleTimer()
+            const chunks: Buffer[] = []
+            let total = 0
+            res.on('data', (chunk: Buffer) => {
+              if (chunk.length > 0) armIdleTimer()
+              total += chunk.length
+              if (total > maxBytes) {
+                req.destroy()
+                finish(new LiteratureError('RESPONSE_TOO_LARGE'))
+                return
+              }
+              chunks.push(chunk)
+            })
+            res.on('end', () => {
+              finish(undefined, {
+                statusCode: res.statusCode ?? 0,
+                headers: res.headers,
+                body: Buffer.concat(chunks),
+              })
+            })
+            res.on('close', () => {
+              if (!settled && !res.complete) {
+                finish(
+                  signal.aborted
+                    ? new LiteratureError('CANCELLED')
+                    : new LiteratureError('RESPONSE_INVALID'),
+                )
+              }
+            })
+            res.on('error', (err) => finish(err))
+          },
+        )
+        signal.addEventListener('abort', onAbort, { once: true })
+        if (signal.aborted) {
+          onAbort()
           return
         }
-        finish(new LiteratureError('RESPONSE_INVALID'))
+        req.on('error', () => {
+          finish(
+            signal.aborted
+              ? new LiteratureError('CANCELLED')
+              : new LiteratureError('RESPONSE_INVALID'),
+          )
+        })
+        if (body) req.write(body)
+        req.end()
       })
-      if (body) req.write(body)
-      req.end()
-    })
+    if (proxy) {
+      try {
+        const proxyRes = await runAttempt(proxy)
+        if (![502, 503, 504].includes(proxyRes.statusCode)) return proxyRes
+      } catch (err) {
+        if (
+          signal.aborted ||
+          (err instanceof LiteratureError &&
+            (err.code === 'CANCELLED' || err.code === 'RESPONSE_TOO_LARGE'))
+        ) {
+          throw err
+        }
+      }
+    }
+    return await runAttempt(null)
   }
 }
 
@@ -543,12 +600,15 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
   private readonly resolver: DnsResolver | undefined
   private readonly requester: DownstreamHttpRequester
   private readonly verifyMemberSessionOverride?:
-    | ((initialState: JieyouAccountState, entryPath: string, signal: AbortSignal) => Promise<JieyouAccountState>)
+    | ((
+        initialState: JieyouAccountState,
+        entryPath: string,
+        signal: AbortSignal,
+      ) => Promise<JieyouAccountState>)
     | undefined
   private readonly tokenSecret: Buffer
   private readonly now: () => number
   private readonly titleCache = new Map<string, string>()
-
   constructor(options: WanfangLiteratureHttpExecutorOptions) {
     this.artifactStore = options.artifactStore
     this.resolver = options.resolver
@@ -557,7 +617,37 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     this.tokenSecret = options.tokenSecret ?? crypto.randomBytes(32)
     this.now = options.now ?? (() => Date.now())
   }
-
+  private buildSearchOutput(
+    parsed: ParsedWanfangPaper[],
+    pageSize: number,
+    page: number,
+    input: LiteratureHttpReadExecutionInput,
+    storageState: JieyouAccountState,
+  ): LiteratureHttpReadExecutionOutput {
+    const items: LiteratureHttpSearchItem[] = parsed.slice(0, pageSize).map((item) => {
+      this.rememberTitle(item.id, item.title)
+      return {
+        documentId: mintScopedDocumentId(this.tokenSecret, {
+          ownerUserId: String(input.ownerUserId ?? 1),
+          accountInstanceId: input.accountInstanceId,
+          paperId: item.id,
+          title: item.title,
+          nowMs: this.now(),
+        }),
+        title: item.title.slice(0, 512),
+        ...(item.authors.length > 0
+          ? { authors: item.authors.slice(0, 20).map((a) => a.slice(0, 128)) }
+          : {}),
+        ...(item.year !== undefined ? { year: item.year } : {}),
+        ...(item.journal ? { source: item.journal.slice(0, 128) } : {}),
+        ...(item.snippet ? { snippet: item.snippet.slice(0, 2048) } : {}),
+      }
+    })
+    return {
+      storageState,
+      data: { items, nextPage: items.length >= pageSize && page < 10000 ? page + 1 : 0 },
+    }
+  }
   private rememberTitle(paperId: string, title: string): void {
     if (this.titleCache.size >= 500) {
       const oldest = this.titleCache.keys().next().value
@@ -565,7 +655,6 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     }
     this.titleCache.set(paperId, title)
   }
-
   async executeRead(
     input: LiteratureHttpReadExecutionInput,
   ): Promise<LiteratureHttpReadExecutionOutput> {
@@ -574,7 +663,6 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     if (!hasJieyouMemberAuthCookies(validState)) {
       throw new LiteratureError('SESSION_EXPIRED')
     }
-
     if (input.actionId === 'search') {
       return await this.executeSearch(input, validState)
     }
@@ -583,7 +671,6 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     }
     throw new LiteratureError('INVALID_INPUT')
   }
-
   private async verifyMemberSessionOnEntry(
     initialState: JieyouAccountState,
     entryPath: string,
@@ -611,7 +698,6 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
       await client.close()
     }
   }
-
   private async executeSearch(
     input: LiteratureHttpReadExecutionInput,
     initialState: JieyouAccountState,
@@ -627,25 +713,21 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     const pageSize = Math.max(1, Math.min(20, Math.trunc(rawPageSize)))
     const rawPage = typeof input.params.page === 'number' ? input.params.page : 1
     const page = Math.max(1, Math.min(10000, Math.trunc(rawPage)))
-
     if (!isChineseLiteratureQuery(query)) {
       return await this.executeEnglishSearch(input, initialState, query, pageSize, page)
     }
-
     const updatedState = await this.verifyMemberSessionOnEntry(
       initialState,
       JIEYOU_WANFANG_ENTRY_PATH,
       input.signal,
     )
-
     const grpcUrl = new URL(WANFANG_WEBVPN_GRPC_PATH, WANFANG_WEBVPN_ORIGIN)
     const grpcFrame = buildWanfangRelatedPaperGrpcFrame(query, pageSize, page)
     const res = await this.requester({
       url: grpcUrl,
       method: 'POST',
       headers: {
-        'User-Agent':
-          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'User-Agent': BROWSER_UA,
         Referer: 'http://www.jieyoutsg.com/',
         Origin: WANFANG_WEBVPN_ORIGIN,
         'Content-Type': 'application/grpc-web+proto',
@@ -657,7 +739,6 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
       maxBytes: 2 * 1024 * 1024,
       signal: input.signal,
     })
-
     if (res.statusCode === 401 || res.statusCode === 403) {
       throw new LiteratureError('SESSION_EXPIRED')
     }
@@ -667,37 +748,9 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     if (res.statusCode !== 200) {
       throw new LiteratureError('RESPONSE_INVALID')
     }
-
     const parsed = parseWanfangRelatedPaperGrpcResponse(res.body)
-    const items: LiteratureHttpSearchItem[] = parsed.slice(0, pageSize).map((item) => {
-      this.rememberTitle(item.id, item.title)
-      return {
-        documentId: mintScopedDocumentId(this.tokenSecret, {
-          ownerUserId: String(input.ownerUserId ?? 1),
-          accountInstanceId: input.accountInstanceId,
-          paperId: item.id,
-          title: item.title,
-          nowMs: this.now(),
-        }),
-        title: item.title.slice(0, 512),
-        ...(item.authors.length > 0
-          ? { authors: item.authors.slice(0, 20).map((a) => a.slice(0, 128)) }
-          : {}),
-        ...(item.year !== undefined ? { year: item.year } : {}),
-        ...(item.journal ? { source: item.journal.slice(0, 128) } : {}),
-        ...(item.snippet ? { snippet: item.snippet.slice(0, 2048) } : {}),
-      }
-    })
-
-    return {
-      storageState: updatedState,
-      data: {
-        items,
-        nextPage: items.length >= pageSize && page < 10000 ? page + 1 : 0,
-      },
-    }
+    return this.buildSearchOutput(parsed, pageSize, page, input, updatedState)
   }
-
   private async executeEnglishSearch(
     input: LiteratureHttpReadExecutionInput,
     initialState: JieyouAccountState,
@@ -710,7 +763,6 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
       JIEYOU_SPRINGER_WEBVPN_ENTRY_PATH,
       input.signal,
     )
-
     const searchUrl = new URL(`${SPRINGER_WEBVPN_PREFIX}/search`, WANFANG_WEBVPN_ORIGIN)
     searchUrl.searchParams.set('new-search', 'true')
     searchUrl.searchParams.set('query', query)
@@ -718,7 +770,6 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     if (page > 1) {
       searchUrl.searchParams.set('page', String(page))
     }
-
     const res = await this.followUstbWebvpnRedirects(searchUrl, input.signal, 2 * 1024 * 1024)
     if (res.statusCode === 401 || res.statusCode === 403) {
       throw new LiteratureError('SESSION_EXPIRED')
@@ -729,79 +780,44 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     if (res.statusCode !== 200) {
       throw new LiteratureError('RESPONSE_INVALID')
     }
-
     const html = res.body.toString('utf8')
     const parsed = parseSpringerSearchHtml(html, pageSize)
-    const items: LiteratureHttpSearchItem[] = parsed.slice(0, pageSize).map((item) => {
-      this.rememberTitle(item.id, item.title)
-      return {
-        documentId: mintScopedDocumentId(this.tokenSecret, {
-          ownerUserId: String(input.ownerUserId ?? 1),
-          accountInstanceId: input.accountInstanceId,
-          paperId: item.id,
-          title: item.title,
-          nowMs: this.now(),
-        }),
-        title: item.title.slice(0, 512),
-        ...(item.authors.length > 0
-          ? { authors: item.authors.slice(0, 20).map((a) => a.slice(0, 128)) }
-          : {}),
-        ...(item.year !== undefined ? { year: item.year } : {}),
-        ...(item.journal ? { source: item.journal.slice(0, 128) } : {}),
-        ...(item.snippet ? { snippet: item.snippet.slice(0, 2048) } : {}),
-      }
-    })
-
-    return {
-      storageState: updatedState,
-      data: {
-        items,
-        nextPage: items.length >= pageSize && page < 10000 ? page + 1 : 0,
-      },
-    }
+    return this.buildSearchOutput(parsed, pageSize, page, input, updatedState)
   }
-
   private async executeDownload(
     input: LiteratureHttpReadExecutionInput,
     initialState: JieyouAccountState,
   ): Promise<LiteratureHttpReadExecutionOutput> {
-    const rawDocId = typeof input.params.documentId === 'string' ? input.params.documentId.trim() : ''
+    const rawDocId =
+      typeof input.params.documentId === 'string' ? input.params.documentId.trim() : ''
     if (!rawDocId) throw new LiteratureError('INVALID_INPUT')
-
     const { paperId } = verifyScopedDocumentId(this.tokenSecret, rawDocId, {
       ownerUserId: String(input.ownerUserId ?? 1),
       accountInstanceId: input.accountInstanceId,
       nowMs: this.now(),
     })
     const title = this.titleCache.get(paperId) ?? paperId
-
     if (paperId.startsWith('sp_')) {
       return await this.executeEnglishSpringerDownload(input, initialState, paperId, title)
     }
-
     const updatedState = await this.verifyMemberSessionOnEntry(
       initialState,
       JIEYOU_WANFANG_ENTRY_PATH,
       input.signal,
     )
-
     const hop1Url = new URL(
       `${WANFANG_WEBVPN_DOWNLOAD_PREFIX}${encodeURIComponent(paperId)}.aspx`,
       WANFANG_WEBVPN_ORIGIN,
     )
-    const hop1Res = await this.requester({
-      url: hop1Url,
-      method: 'GET',
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        Referer: 'http://www.jieyoutsg.com/',
-        Cookie: 'authdomain=123123',
-      },
-      maxBytes: 256 * 1024,
-      signal: input.signal,
-    })
-
+    const getVpn = (url: URL, maxBytes: number, ref = `${WANFANG_WEBVPN_ORIGIN}/`) =>
+      this.requester({
+        url,
+        method: 'GET',
+        headers: { 'User-Agent': BROWSER_UA, Referer: ref, Cookie: 'authdomain=123123' },
+        maxBytes,
+        signal: input.signal,
+      })
+    const hop1Res = await getVpn(hop1Url, 256 * 1024, 'http://www.jieyoutsg.com/')
     let transactionId = ''
     let nextLocation = typeof hop1Res.headers.location === 'string' ? hop1Res.headers.location : ''
     for (let hop = 0; hop < 4 && nextLocation; hop++) {
@@ -814,46 +830,19 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
         transactionId = txParam
         break
       }
-      const hopRes = await this.requester({
-        url: nextUrl,
-        method: 'GET',
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-          Referer: `${WANFANG_WEBVPN_ORIGIN}/`,
-          Cookie: 'authdomain=123123',
-        },
-        maxBytes: 256 * 1024,
-        signal: input.signal,
-      })
+      const hopRes = await getVpn(nextUrl, 256 * 1024)
       nextLocation = typeof hopRes.headers.location === 'string' ? hopRes.headers.location : ''
     }
-
     if (!transactionId) {
       throw new LiteratureError('RESPONSE_INVALID')
     }
-
     const fulltextUrl = new URL(WANFANG_WEBVPN_FULLTEXT_PREFIX, WANFANG_WEBVPN_ORIGIN)
     fulltextUrl.searchParams.set('type', 'perio')
     fulltextUrl.searchParams.set('resourceId', paperId)
     fulltextUrl.searchParams.set('transaction', transactionId)
-
-    const pdfRes = await this.requester({
-      url: fulltextUrl,
-      method: 'GET',
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        Referer: `${WANFANG_WEBVPN_ORIGIN}/`,
-        Cookie: 'authdomain=123123',
-      },
-      maxBytes: LITERATURE_ARTIFACT_MAX_BYTES,
-      signal: input.signal,
-    })
-
+    const pdfRes = await getVpn(fulltextUrl, LITERATURE_ARTIFACT_MAX_BYTES)
     return await this.stagePdfResponse(input, updatedState, pdfRes, title, paperId)
   }
-
   private async followUstbWebvpnRedirects(
     initialUrl: URL,
     signal: AbortSignal,
@@ -865,8 +854,7 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
         url: currentUrl,
         method: 'GET',
         headers: {
-          'User-Agent':
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+          'User-Agent': BROWSER_UA,
           Referer: `${WANFANG_WEBVPN_ORIGIN}/`,
           Cookie: 'authdomain=123123',
         },
@@ -887,7 +875,6 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     }
     throw new LiteratureError('OUTBOUND_BLOCKED')
   }
-
   private async executeEnglishSpringerDownload(
     input: LiteratureHttpReadExecutionInput,
     initialState: JieyouAccountState,
@@ -900,39 +887,40 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
       throw new LiteratureError('INVALID_INPUT')
     }
     const doi = `${rawDoi.slice(0, slashIdx)}/${rawDoi.slice(slashIdx + 1)}`
-
     const updatedState = await this.verifyMemberSessionOnEntry(
       initialState,
       JIEYOU_SPRINGER_WEBVPN_ENTRY_PATH,
       input.signal,
     )
-
-    const pdfUrl = new URL(`${SPRINGER_WEBVPN_PREFIX}/content/pdf/${doi}.pdf`, WANFANG_WEBVPN_ORIGIN)
+    const pdfUrl = new URL(
+      `${SPRINGER_WEBVPN_PREFIX}/content/pdf/${doi}.pdf`,
+      WANFANG_WEBVPN_ORIGIN,
+    )
     let pdfRes = await this.requester({
       url: pdfUrl,
       method: 'GET',
       headers: {
-        'User-Agent':
-          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        'User-Agent': BROWSER_UA,
         Referer: `${WANFANG_WEBVPN_ORIGIN}${SPRINGER_WEBVPN_PREFIX}/article/${doi}`,
         Cookie: 'authdomain=123123',
       },
       maxBytes: LITERATURE_ARTIFACT_MAX_BYTES,
       signal: input.signal,
     })
-
     if (pdfRes.statusCode >= 300 && pdfRes.statusCode < 400) {
       const warmSearchUrl = new URL(`${SPRINGER_WEBVPN_PREFIX}/search`, WANFANG_WEBVPN_ORIGIN)
       warmSearchUrl.searchParams.set('new-search', 'true')
       warmSearchUrl.searchParams.set('query', doi)
       warmSearchUrl.searchParams.set('content-type', 'Article')
       await this.followUstbWebvpnRedirects(warmSearchUrl, input.signal, 2 * 1024 * 1024)
-      pdfRes = await this.followUstbWebvpnRedirects(pdfUrl, input.signal, LITERATURE_ARTIFACT_MAX_BYTES)
+      pdfRes = await this.followUstbWebvpnRedirects(
+        pdfUrl,
+        input.signal,
+        LITERATURE_ARTIFACT_MAX_BYTES,
+      )
     }
-
     return await this.stagePdfResponse(input, updatedState, pdfRes, title, paperId)
   }
-
   private async stagePdfResponse(
     input: LiteratureHttpReadExecutionInput,
     updatedState: JieyouAccountState,
@@ -949,29 +937,28 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     if (pdfRes.statusCode !== 200) {
       throw new LiteratureError('RESPONSE_INVALID')
     }
-
     const contentType = String(pdfRes.headers['content-type'] ?? '').toLowerCase()
     if (contentType.includes('text/html')) {
       throw new LiteratureError('SESSION_EXPIRED')
     }
-
     const safeTitle =
       title
         .replace(/[\\/:*?"<>|\r\n]+/g, '_')
         .trim()
         .slice(0, 200) || fallbackId
     const filename = safeTitle.toLowerCase().endsWith('.pdf') ? safeTitle : `${safeTitle}.pdf`
-
-    const numericUserId = typeof input.userId === 'number' && Number.isSafeInteger(input.userId) && input.userId > 0
-      ? input.userId
-      : (Number(input.ownerUserId) > 0 ? Number(input.ownerUserId) : 1)
+    const numericUserId =
+      typeof input.userId === 'number' && Number.isSafeInteger(input.userId) && input.userId > 0
+        ? input.userId
+        : Number(input.ownerUserId) > 0
+          ? Number(input.ownerUserId)
+          : 1
     const staged = await this.artifactStore.stagePdf({
       userId: numericUserId,
       filename,
       data: pdfRes.body,
       signal: input.signal,
     })
-
     return {
       storageState: updatedState,
       stagedArtifact: staged,
