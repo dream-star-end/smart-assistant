@@ -91,6 +91,12 @@ out="$(bash "$DRIFT" --env "$E.6" --template "$TEMPLATE")" && [[ "$out" == "ENV_
 out="$(bash "$DRIFT" --env "$E.7" --template "$TEMPLATE")" && [[ "$out" == "ENV_DRIFT missing=0 undeclared=0" && "$out" != *SENTINEL* ]] \
   && ok "D7 值中间的引号不开启跨行;其后的多行引号值仍整体跳过" || bad "D7: $out"
 
+# D8 引号闭合后的再一段引号、注释里的反斜杠续行、引号后的续行(Codex r3 P1;systemd env-file.c 语义)
+{ cat "$E"; printf "OC_CHATGPT_PROXY_TLS_KEY='first' 'second\nSENTINEL_SECRET_MATERIAL=\nlast'\n"
+  printf '# comment continues \\\nSENTINEL_IN_COMMENT=x\nOC_JEV_API_KEY="a" \\\nSENTINEL_CONT2=y\n'; } >"$E.8"
+out="$(bash "$DRIFT" --env "$E.8" --template "$TEMPLATE")" && [[ "$out" == "ENV_DRIFT missing=0 undeclared=0" && "$out" != *SENTINEL* ]] \
+  && ok "D8 多段引号、注释续行、引号后续行都不产生键" || bad "D8: $out"
+
 # W* 接线
 grep -qE 'v5-selfhost-env-drift\.sh' "$DEPLOY" \
   && awk '/^cmd_deploy\(\) \{/{f=1} f && /^  ensure_selfhost_env_keys$/{e=NR} f && /^  ensure_model_authority$/{m=NR} f && /^  assert_env_key_drift$/{d=NR} f && /^}/{exit} END{exit !(e && m && d && d>e && d>m)}' "$DEPLOY" \

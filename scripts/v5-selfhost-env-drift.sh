@@ -25,51 +25,72 @@ done
 [[ -r "$env_file" ]] || { echo "env 不可读: $env_file" >&2; exit 2; }
 [[ -r "$template" ]] || { echo "模板不可读: $template" >&2; exit 2; }
 
-# 只取键名;值从不离开解析器。按 systemd EnvironmentFile 的语义切逻辑行:引号里的值可以跨行,
-# 行尾反斜杠续行;跨出来的那些物理行属于上一个值,绝不能当成键(否则会把值的一部分打进日志)。
+# 只取键名;值从不离开解析器。逐字符移植 systemd src/basic/env-file.c 的状态机(PRE_KEY/KEY/PRE_VALUE/
+# VALUE/VALUE_ESCAPE/单双引号/COMMENT),所以引号段、引号闭合后的再次引号、反斜杠续行、注释续行都与
+# systemd 读这个文件时一致;值里的任何内容都不会被当成键。只输出合法变量名。
 keys_of() {
   python3 - "$1" <<'PY' | sort -u
 import re, sys
-assign = re.compile(r'\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$')
-quote = None
-cont = False
-for line in open(sys.argv[1], encoding="utf-8", errors="replace").read().split("\n"):
-    if quote:
-        j = 0
-        while j < len(line):
-            c = line[j]
-            if c == "\\" and quote == '"':
-                j += 2
-                continue
-            if c == quote:
-                quote = None
-                break
-            j += 1
-        continue
-    if cont:
-        cont = line.endswith("\\")
-        continue
-    m = assign.match(line)
-    if not m:
-        continue
-    print(m.group(1))
-    # systemd 规则:只有值的第一个字符是引号时才是带引号的值(可跨行);值中间的引号是普通字符。
-    val = m.group(2).lstrip()
-    if val[:1] in ("'", '"'):
-        q, j, closed = val[0], 1, False
-        while j < len(val):
-            c = val[j]
-            if c == "\\" and q == '"':
-                j += 2
-                continue
-            if c == q:
-                closed = True
-                break
-            j += 1
-        if not closed:
-            quote = q
-    elif val.endswith("\\"):
-        cont = True
+NEWLINE, COMMENTS, WS = "\n\r", "#;", " \t\n\r"
+valid = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+data = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+state, key = "PRE_KEY", ""
+def emit():
+    k = key.rstrip(" \t")
+    if valid.match(k):
+        print(k)
+for c in data:
+    if state == "PRE_KEY":
+        if c in COMMENTS:
+            state = "COMMENT"
+        elif c not in WS:
+            state, key = "KEY", c
+    elif state == "KEY":
+        if c in NEWLINE:
+            state, key = "PRE_KEY", ""
+        elif c == "=":
+            state = "PRE_VALUE"
+        else:
+            key += c
+    elif state == "PRE_VALUE":
+        if c in NEWLINE:
+            emit()
+            state, key = "PRE_KEY", ""
+        elif c == "'":
+            state = "SINGLE_QUOTE_VALUE"
+        elif c == '"':
+            state = "DOUBLE_QUOTE_VALUE"
+        elif c == "\\":
+            state = "VALUE_ESCAPE"
+        elif c not in WS:
+            state = "VALUE"
+    elif state == "VALUE":
+        if c in NEWLINE:
+            emit()
+            state, key = "PRE_KEY", ""
+        elif c == "\\":
+            state = "VALUE_ESCAPE"
+    elif state == "VALUE_ESCAPE":
+        state = "VALUE"
+    elif state == "SINGLE_QUOTE_VALUE":
+        if c == "'":
+            state = "PRE_VALUE"
+    elif state == "DOUBLE_QUOTE_VALUE":
+        if c == '"':
+            state = "PRE_VALUE"
+        elif c == "\\":
+            state = "DOUBLE_QUOTE_VALUE_ESCAPE"
+    elif state == "DOUBLE_QUOTE_VALUE_ESCAPE":
+        state = "DOUBLE_QUOTE_VALUE"
+    elif state == "COMMENT":
+        if c == "\\":
+            state = "COMMENT_ESCAPE"
+        elif c in NEWLINE:
+            state = "PRE_KEY"
+    elif state == "COMMENT_ESCAPE":
+        state = "COMMENT"
+if state in ("PRE_VALUE", "VALUE", "VALUE_ESCAPE", "SINGLE_QUOTE_VALUE", "DOUBLE_QUOTE_VALUE", "DOUBLE_QUOTE_VALUE_ESCAPE"):
+    emit()
 PY
 }
 
