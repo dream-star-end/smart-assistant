@@ -3030,3 +3030,17 @@ describe("ConnectorsTab 公开接口插件（OCV5-402：authMode none，如 B �
     expect(within(card).queryByRole("button", { name: "启用" })).not.toBeInTheDocument();
   });
 });
+
+
+test('文献市场回跳不将已保存但runtime未启用的账号误报为登录失效', async () => {
+  mockedGetConnectors.mockResolvedValue(catalog())
+  mockedPluginManagement.mockResolvedValue({
+    catalog: [{ ...knowledgePlanetPlugin(), slug: 'literature-db', label: '文献数据库', actions: [{ id: 'search', description: '检索文献', readOnly: true }] }],
+    accounts: [{ id: '9524', provider: 'literature-db', pluginType: 'managed-browser', actions: [], displayName: '文献数据库', accountHint: '', status: 'active', versionId: '101', executable: false, writeControl: null } satisfies RuntimePluginAccount],
+  })
+  render(<ConnectorsTab auth={auth} autoAuthorizePluginSlug="literature-db" onAutoAuthorizeConsumed={() => {}} />)
+  expect(await screen.findByText('文献数据库登录已保存，检索暂未启用。')).toBeInTheDocument()
+  expect(screen.queryByText(/文献数据库登录已失效/)).not.toBeInTheDocument()
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  expect(mockedPluginRevoke).not.toHaveBeenCalled()
+})

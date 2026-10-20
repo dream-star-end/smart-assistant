@@ -1,4 +1,8 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { LiteratureArtifactStore } from '../plugins/literatureDb/artifactStore.js'
+import { LiteratureError } from '../plugins/literatureDb/errors.js'
+import type { LiteratureSetupService } from '../plugins/literatureDb/setupService.js'
+import { dispatchLiteratureSetup } from './literatureSetup.js'
 
 import { PluginAccountLeaseError } from '../plugins/accountLease.js'
 import { PluginAccountError } from '../plugins/accounts.js'
@@ -21,6 +25,8 @@ import type { CommercialHttpDeps, RequestContext } from './handlers.js'
 import { HttpError, readJsonBody, sendJson } from './util.js'
 
 export interface PluginHttpDeps {
+  literatureSetup?: LiteratureSetupService
+  literatureArtifacts?: LiteratureArtifactStore
   pluginRuntime?: PluginRuntimeFacade
   knowledgePlanetSetup?: KnowledgePlanetSetupManager
   weiboSetup?: WeiboSetupManager
@@ -233,6 +239,45 @@ export async function dispatchPluginsRoute(
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'x.invalid'}`)
   const path = url.pathname
   const method = req.method ?? 'GET'
+
+  if (path === '/api/plugins/literature-db/setup' || path.startsWith('/api/plugins/literature-db/setup/')) {
+    await dispatchLiteratureSetup(req, res, userId, deps.literatureSetup, path)
+    return
+  }
+
+  if (path.startsWith('/api/plugins/literature-db/artifacts/')) {
+    res.setHeader('Cache-Control', 'no-store, private')
+    res.setHeader('Pragma', 'no-cache')
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    if (method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED', 'Method not allowed')
+    const match = /^\/api\/plugins\/literature-db\/artifacts\/([A-Za-z0-9-]{16,128})$/.exec(path)
+    if (!match) throw new HttpError(400, 'INVALID_INPUT', 'Invalid literature artifact id')
+    if (!deps.literatureArtifacts)
+      throw new HttpError(503, 'UNAVAILABLE', 'Literature artifact store is unavailable')
+    let found: ReturnType<NonNullable<typeof deps.literatureArtifacts>['read']> = null
+    try {
+      found = deps.literatureArtifacts.read(userId, match[1])
+    } catch (error) {
+      if (error instanceof LiteratureError && error.code === 'CAPACITY')
+        throw new HttpError(429, 'CAPACITY', 'Literature artifact store is busy')
+      throw error
+    }
+    if (!found) throw new HttpError(404, 'NOT_FOUND', 'Literature artifact not found or expired')
+    const asciiFallback = found.filename
+      .replace(/[^\x20-\x7e]/g, '_')
+      .replace(/["\\]/g, '_')
+      .trim() || 'literature-document.pdf'
+    const encodedFilename = encodeURIComponent(found.filename)
+    res.statusCode = 200
+    res.setHeader('Content-Type', 'application/pdf')
+    res.setHeader('Content-Length', found.bytes)
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodedFilename}`,
+    )
+    res.end(found.data)
+    return
+  }
 
   if (method === 'GET' && (path === '/api/plugins' || path === '/api/plugins/management')) {
     sendJson(res, 200, await runtime(deps).management(userId))
