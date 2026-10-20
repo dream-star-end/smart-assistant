@@ -133,6 +133,11 @@ DEPLOY_BUILT_RELEASE=""
 DEPLOY_BUILT_SOURCE_COMMIT=""
 CUTOVER_JOINT=0
 CUTOVER_TUPLE_BUNDLE=""
+# OCV5-534 --rollback 的已验证身份只由 cmd_rollback 设置;绝不从环境继承(否则 --cutover 可伪造回退身份绕过 HEAD 校验与迁移门)。
+CUTOVER_ROLLBACK=0
+ROLLBACK_SHA=""
+ROLLBACK_FROM=""
+ROLLBACK_ORIG_PREV=""
 # Lease Center(OCV5-131):worker 发车时传 --lease-train=<tr-*> --target-sha=<sha>;
 # 人工直跑 --deploy 时脚本自己登记一条 manual train,让 worker 能对账、不会在同一窗口再发一班。
 LEASE_TRAIN_ID=""
@@ -179,6 +184,8 @@ die() {
 source "$MASTER_RELEASE_LIB"
 # shellcheck source=lib/v5-selfhost-env.sh
 source "$SCRIPT_DIR/lib/v5-selfhost-env.sh"
+# shellcheck source=lib/v5-selfhost-rollback.sh
+source "$SCRIPT_DIR/lib/v5-selfhost-rollback.sh"
 # P0-Web 前端热切换(OCV5-489):overlay 指针根 + 纯函数库 + --p0-web* 编排。
 WEB_OVERLAY_ROOT="${OC_V5_WEB_OVERLAY_ROOT:-/var/lib/openclaude-v5-selfhost/web-overlay}"
 # shellcheck source=scripts/v5-web-overlay-lib.sh
@@ -214,6 +221,9 @@ cleanup_selfhost_deploy() {
     exit 86
   fi
   if [[ "$exit_rc" != 0 ]]; then release_policy_abort_unexposed || true; fi
+  if [[ "$exit_rc" != 0 ]] && declare -F rollback_restore_prev_if_unchanged >/dev/null 2>&1; then
+    rollback_restore_prev_if_unchanged || true
+  fi
   # 后台 runtime release 段必须先收尾,再释放锁/train(否则下一次 deploy 可能与它并发写 runtime-releases)。
   if declare -F reap_runtime_release_bg >/dev/null 2>&1; then reap_runtime_release_bg || true; fi
   # 函数定义在后面;参数校验阶段的 die 也会进这里,此时函数尚不存在。
@@ -450,7 +460,7 @@ acquire_selfhost_deploy_lock() {
 # --build-master-only / --cutover 持锁,避免与别人的 --deploy 撞车。
 maybe_acquire_selfhost_deploy_lock() {
   case "$MODE" in
-    deploy|bootstrap|build-master-only|cutover)
+    deploy|bootstrap|build-master-only|cutover|rollback)
       [[ "$DRY" == 1 ]] && return 0
       acquire_selfhost_deploy_lock
       ;;
@@ -458,7 +468,7 @@ maybe_acquire_selfhost_deploy_lock() {
 }
 usage() {
   cat <<'EOF'
-用法: scripts/deploy-v5-selfhost.sh --preflight|--bootstrap|--deploy|--build-master-only|--cutover|--smoke|--status [--dry-run] [--force-env] [--allow-dirty] [--platform-from-head] [--force-npm-ci] [--release=PATH]
+用法: scripts/deploy-v5-selfhost.sh --preflight|--bootstrap|--deploy|--build-master-only|--cutover|--rollback|--smoke|--status [--dry-run] [--force-env] [--allow-dirty] [--platform-from-head] [--force-npm-ci] [--release=PATH]
 
 日常发布(另一位 agent 请看这里):
   scripts/deploy-v5-selfhost.sh --deploy
@@ -469,6 +479,9 @@ usage() {
   --deploy              常规发布:构建不可变 master release(staging 内 vite)+容器制品,再走 --cutover 同一套翻转状态机
   --build-master-only   只建一份不可变 master rel-*(不迁库/不装 unit/不切 symlink/不重启)
   --cutover             手动逃生:已有 rel-* 时只做翻转(静态门+迁移门+备份+survivor+装 unit+symlink+重启+smoke)
+  --rollback            退回 .prev-release 及它当时的运行四元组(一次一步;不跑迁移、不回滚 schema;
+                        上一版之后有破坏性迁移、history 血缘断开、制品已回收时拒绝)。走同一套 joint
+                        状态机与门禁,登记 manual train;先 --rollback --dry-run 看计划
   --smoke               只读健康检查(含个人版回归;live 存在时比对 release dist oc-build)
   --status              打印当前状态(含 live / .prev-release / 四元组)
   --dry-run             与上述组合:打印将执行的命令,不改任何东西
@@ -507,6 +520,7 @@ usage() {
   scripts/deploy-v5-selfhost.sh --deploy --allow-dirty --platform-from-head
   scripts/deploy-v5-selfhost.sh --build-master-only
   scripts/deploy-v5-selfhost.sh --cutover --dry-run
+  scripts/deploy-v5-selfhost.sh --rollback --dry-run
   scripts/deploy-v5-selfhost.sh --cutover --release=/opt/openclaude/openclaude-v5-selfhost-releases/rel-...
   scripts/deploy-v5-selfhost.sh --smoke
 EOF
@@ -523,7 +537,7 @@ for arg in "$@"; do
     --resume-release-policy) RELEASE_POLICY_RESUME=1 ;;
     --lease-train=*) LEASE_TRAIN_ID="${arg#--lease-train=}" ;;
     --target-sha=*) LEASE_TARGET_SHA="${arg#--target-sha=}" ;;
-    --preflight|--bootstrap|--deploy|--smoke|--status|--build-master-only|--cutover|--p0-web|--p0-web-revert|--p0-web-status)
+    --preflight|--bootstrap|--deploy|--smoke|--status|--build-master-only|--cutover|--rollback|--p0-web|--p0-web-revert|--p0-web-status)
       [[ -z "$MODE" ]] || die "只能指定一个主模式(已有 --$MODE,又收到 $arg)"
       MODE="${arg#--}"
       ;;
@@ -577,7 +591,7 @@ fi
 
 if [[ "$DRY" != 1 ]]; then
   case "$MODE" in
-    deploy|bootstrap|build-master-only|cutover|p0-web|p0-web-revert)
+    deploy|bootstrap|build-master-only|cutover|rollback|p0-web|p0-web-revert)
       if [[ "$RELEASE_POLICY_RESUME" != 1 ]]; then
         release_policy_context_present && { log "unresolved release-policy context blocks mutation"; exit 79; }
       fi ;;
@@ -2738,6 +2752,11 @@ SQL
 # Only an internally built, from-head invocation owns a pinned expected source.
 # Legacy worktree-platform deploy and standalone cutover keep their current-HEAD gate.
 cutover_expected_source_commit() {
+  if [[ "${CUTOVER_ROLLBACK:-0}" == 1 ]]; then
+    [[ "${ROLLBACK_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || die "回退缺已验证的目标 sourceCommit,拒绝切流"
+    printf "%s\n" "$ROLLBACK_SHA"
+    return 0
+  fi
   if [[ -n "${DEPLOY_BUILT_RELEASE:-}" && "${PLATFORM_FROM_HEAD:-0}" == 1 ]]; then
     [[ "${DEPLOY_BUILT_SOURCE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]] \
       || die "本次构建缺已验证 sourceCommit,拒绝切流"
@@ -2805,8 +2824,15 @@ cmd_cutover() {
   fi
 
   step=3
+  if [[ "${CUTOVER_ROLLBACK:-0}" == 1 ]]; then
+    cutover_clog "STEP $step 回退 schema 门(只读;回退不跑迁移、不回滚 schema)"
+    rollback_schema_gate "$rel" "$(readlink -f -- "$MASTER_LIVE_LINK")" \
+      || die "回退 schema 门不通过。尚未改任何东西。"
+    CUTOVER_HAS_MIGRATION=0
+  else
   cutover_clog "STEP $step 迁移门(DB 缺口权威;git diff fail-closed;不用工作树 .complete)"
   gate_cutover_migrations "$rel"
+  fi
   if [[ "$CUTOVER_HAS_MIGRATION" == 1 ]]; then
     cutover_clog "  HAS_MIGRATION=1 → apply 与翻转必须同一把锁、同一窗口"
     if [[ "$DRY" == 1 ]]; then
@@ -3070,6 +3096,7 @@ case "$MODE" in
   deploy) cmd_deploy ;;
   build-master-only) cmd_build_master_only ;;
   cutover) cmd_cutover ;;
+  rollback) cmd_rollback ;;
   smoke) cmd_smoke ;;
   status) cmd_status ;;
   p0-web) cmd_p0_web ;;
