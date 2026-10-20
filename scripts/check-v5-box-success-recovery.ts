@@ -38,7 +38,7 @@ const ACTIVE = new Set(["reserved", "starting", "running", "unknown", "handoff",
 const PY_TIMEOUT_MS = 5_000;
 const SHADOW_TABLES = ["request_finalize_journal", "usage_records", "pending_usage_patches",
   "users", "user_subscriptions", "org_memberships", "orgs", "org_subscriptions",
-  "turn_waivers", "client_sessions", "chat_projects", "credit_ledger"];
+  "turn_waivers", "client_sessions", "chat_projects", "credit_ledger", "agent_containers"];
 const MODEL = "claude-opus-5-5";
 const TOOL_NAME = "mcp__ocbridge__t0";
 const RUNNER_HASH = "d".repeat(64);
@@ -633,6 +633,8 @@ async function runBusiness(root: string, ledger: string, db: DbConfig): Promise<
         if (!trimmed || !/create\s+temp\s+table/i.test(trimmed)) continue;
         await client.query(trimmed);
       }
+      await client.query(`CREATE TEMP TABLE agent_containers
+        (id bigint PRIMARY KEY, user_id bigint NOT NULL, state text NOT NULL)`);
     }
     const check = await client.query(
       `SELECT name, n.nspname AS schema, current_database() AS db
