@@ -113,8 +113,14 @@ export function scanImports(src) {
   }
   const side = /(?:^|[;\n}])\s*import\s+(['"])([^'"\n]+)\1/g;
   while ((m = side.exec(code))) refs.push({ spec: m[2], kind: "value", form: "import-side-effect" });
-  const dyn = /\b(import|require)\s*\(\s*(['"])([^'"\n]+)\2\s*\)/g;
-  while ((m = dyn.exec(code))) refs.push({ spec: m[3], kind: "value", form: m[1] === "import" ? "dynamic-import" : "require" });
+  // `import("x")` is also TypeScript's type-position import (`import("x").Foo`, `typeof import("x")`):
+  // those are type references, not runtime edges. A runtime dynamic import is awaited or chained with
+  // .then/.catch/.finally.
+  const dyn = /(\btypeof\s+)?\b(import|require)\s*\(\s*(['"])([^'"\n]+)\3\s*\)(\s*\.\s*([A-Za-z_$][\w$]*))?/g;
+  while ((m = dyn.exec(code))) {
+    const typePos = m[2] === "import" && (m[1] || (m[6] && !["then", "catch", "finally"].includes(m[6])));
+    refs.push({ spec: m[4], kind: typePos ? "type" : "value", form: m[2] === "import" ? (typePos ? "import-type" : "dynamic-import") : "require" });
+  }
   return refs;
 }
 

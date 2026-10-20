@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # OCV5-540: plan §1.7 database facts (trace linkage and which tables carry trace_id), read-only.
-# Usage (root on v5-dev): bash scripts/arch-measure/trace-facts.sh [env-file]
-# The DSN is read from the env file into the environment, never printed; the session is
-# read-only (default_transaction_read_only=on), so no statement here can write.
+# Usage (root on v5-dev): bash scripts/arch-measure/trace-facts.sh [database]
+# Connects as the local postgres role over the Unix socket (peer auth), the way the rollback schema
+# gate reads schema_migrations, so no password or DSN is ever on a command line or in this process's
+# arguments. The session is read-only (default_transaction_read_only=on): no statement here can write.
 set -euo pipefail
-ENV_FILE="${1:-/etc/openclaude/commercial-v5-selfhost.env}"
-[[ -r "$ENV_FILE" ]] || { echo "cannot read $ENV_FILE" >&2; exit 2; }
-DATABASE_URL="$(sed -nE 's/^DATABASE_URL=//p' "$ENV_FILE" | tail -1 | sed -E 's/^"(.*)"$/\1/; s/^'\''(.*)'\''$/\1/')"
-[[ -n "$DATABASE_URL" ]] || { echo "no DATABASE_URL in $ENV_FILE" >&2; exit 2; }
+DB="${1:-${PG_DB:-openclaude_v5_selfhost}}"
+[[ "$DB" =~ ^[A-Za-z0-9_]+$ ]] || { echo "bad database name: $DB" >&2; exit 2; }
 export PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=15000'
-psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 -P pager=off <<'SQL'
+sudo -u postgres --preserve-env=PGOPTIONS psql -d "$DB" -X -q -v ON_ERROR_STOP=1 -P pager=off <<'SQL'
 \echo '# §1.7 turn_traces.dispatch_id fill rate, last 7 days (plan: 1,828 / 1,843)'
 SELECT count(*) AS traces, count(dispatch_id) AS with_dispatch
   FROM turn_traces WHERE created_at > now() - interval '7 days';

@@ -23,7 +23,8 @@ function refs(f) {
 const pkgOfSpec = (spec) => {
   const m = /^@openclaude\/([a-z0-9-]+)/.exec(spec);
   if (!m) return null;
-  return m[1] === "wechat" ? "channels/wechat" : m[1];
+  // channel packages are named @openclaude/channel-<x> and live in packages/channels/<x>
+  return m[1].startsWith("channel-") ? `channels/${m[1].slice("channel-".length)}` : m[1];
 };
 
 // ── §1.2 package edges (value), and the commercial → gateway edge count ──
@@ -39,7 +40,9 @@ for (const [p, files] of filesOf) {
 const pg = new Map(PKG_DIRS.map((p) => [p, new Set()]));
 for (const k of pkgEdges.keys()) { const [a, b] = k.split("→"); pg.get(a)?.add(b); }
 add("pkg.valueEdges", [...pkgEdges.keys()].sort().join(" "), "package-level value edges (§1.2)");
-add("pkg.cycles", scc(pg).filter((c) => c.length > 1).length, "package-level non-trivial SCCs (§1.2, expect 0)");
+const pkgComps = scc(pg).filter((c) => c.length > 1);
+add("pkg.cycles", pkgComps.length, "package-level non-trivial value SCCs (§1.2 says none)");
+add("pkg.cycleMembers", pkgComps.map((c) => c.join("+")).join(" ") || "-", "members of each package-level cycle");
 let cg = 0; let cgv = 0;
 for (const f of filesOf.get("commercial")) for (const r of refs(f)) {
   if (!/^@openclaude\/gateway(\/|$)/.test(r.spec)) continue;

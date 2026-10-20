@@ -9,10 +9,10 @@
 | `crosscut.mjs` | §1.5、§1.6、§1.8 的词法计数（鉴权调用、`user_id = $n`、校验库、出站、`console.*`、中文串、`HttpError`、计费写语句、裸 `BEGIN`、特判、env 读取） | 任何 checkout；`--strip` 先去注释 |
 | `trains.mjs` | §1.9、§8.1：读 OCV5-539 的 `<trainId>.summary.json`，按阶段字母求 p50/p90、门禁逐个、缓存命中、失败所在阶段；`--check-last 10` 是 P0a 的退出检查 | v5-dev（`/opt/openclaude/tmp/lease-trains`） |
 | `logs.mjs` | §1.7 日志形状：JSON 占比、带 traceId 的行、warn/error 带不带 id、用户键名混用 | v5-dev，root |
-| `trace-facts.sh` | §1.7 库表事实：`turn_traces.dispatch_id` 填充率、`request_id = billing_request_id`、哪些表有 `trace_id` 列、最近一个 crashed 回合（附录 A.3 演练的起点） | v5-dev，root；只读会话 |
+| `trace-facts.sh` | §1.7 库表事实（经本机 postgres 角色的 Unix socket 连接，命令行上没有口令）：`turn_traces.dispatch_id` 填充率、`request_id = billing_request_id`、哪些表有 `trace_id` 列、最近一个 crashed 回合（附录 A.3 演练的起点） | v5-dev，root；只读会话 |
 | `host.sh` | §1.7 日志位置与轮转、容器日志驱动、§1.9 `lease.db` 列车状态与分钟数 | v5-dev，root |
 
-口径（与方案 §1 序言一致）：“非测试”= `.ts/.tsx`，排除 `*.test.*` 与 `__tests__/`；包的行数按整个包目录算（例如 commercial 含 `agent-sandbox/`）。值导入跳过 `import type`/`export type`。commercial 目录图：每个顶层目录一个节点，根目录文件合成 `_root`，去掉 `index.ts`（组装根）的出边，Tarjan 求 SCC。
+口径（与方案 §1 序言一致）：“非测试”= `.ts/.tsx`，排除 `*.test.*` 与 `__tests__/`；包的行数按整个包目录算（例如 commercial 含 `agent-sandbox/`）。值导入跳过 `import type`/`export type`，以及类型位置的 `import("x").T` / `typeof import("x")`。commercial 目录图：每个顶层目录一个节点，根目录文件合成 `_root`，去掉 `index.ts`（组装根）的出边，Tarjan 求 SCC。
 
 ## 对照：方案 §1 的数字 vs 脚本在 `3ef8d1d3d` 上的输出
 
@@ -26,18 +26,19 @@
 | web-react 行数 | 约 21 万 | 211,319 | 一致 |
 | `egress/main.ts` 行数；直接值导入 commercial 文件 | 1,023；64（http 33、account-pool 7、billing 6、auth 4） | 1,023；64（同） | 一致（是直接导入，不是传递闭包；闭包另给 360） |
 | storage 被引用文件 | gateway 100、commercial 37、mcp-memory 7、cli 5、wechat 4 | 同 | 一致 |
+| 包级值依赖环 | 无 | 0 | 一致（渠道包按 `@openclaude/channel-*` → `packages/channels/*` 映射，有反例测试） |
 | commercial→gateway 边 / 其中值导入 | 35 / 15 | 35 / 15 | 一致 |
 | protocol 的 `node:*` 导入 | 5 | 6 | 偏差：方案漏了 `dispatchAuthority.ts` 的 `node:crypto` |
 | web-react import protocol 的文件 / 经根桶 | 59 / 43 | 63 / 44（src 内 60） | 偏差：脚本含 `browser-tests/` 3 个文件 |
 | commercial 目录图节点 / 边 / 非平凡 SCC / 最大 SCC | 51 / 275 / 1 / 38 | 51 / 275 / 1 / 38 | 一致，SCC 外的 13 个目录名单也一致 |
-| 文件级值导入环 | 4 | 4 | 一致 |
+| 文件级值导入环 | 4 | 3 | 偏差（方案错）：方案把类型位置的 `import("…").Type` 算成了值导入，其中一个“环”实际没有运行时依赖（Codex r1 指出） |
 | billing→http；db→上层；auth/billing/dispatch→ws | 8；10；4 | 语句数 值/全部：7/9；9/9；3/4 | 偏差：方案混用了值导入与全部导入；以脚本输出的两列为准 |
 | http→admin | 128 条边 | 128（值）/ 130 | 一致 |
 | `index.ts` 值依赖的目录 | 42 | 43（含 `_root`） | 偏差：口径差一个 `_root` |
 | http / http/proxy / index.ts / pgSessionsBackend 行数 | 73,893 / 约 3 万 / 7,780 / 13,978 | 73,893 / 29,651 / 7,780 / 13,978 | 一致 |
 | gateway 根目录文件 | 227 | 229 | 偏差 2：方案的排除规则未记录；以脚本为准 |
 | `server.ts` 行数；反向引用 31（值 20，不含 index 19；仅类型 11） | 2,981；31/20/19/11 | 同 | 一致 |
-| gateway 最大值导入环 | 29 | 29 | 一致 |
+| gateway 最大值导入环 | 29 | 28 | 偏差（方案错）：同上，类型位置的 `import()` 不是运行时边 |
 | engine/ 反向依赖 logger / remoteTarget / subprocessRunner / promptSlots | 13 / 8 / 7 / 7 | 13 / 8 / 6 / 7 | 偏差 1：方案把一个 `import()` 或类型导入算进去了；脚本按 import 语句计 |
 | `socket.ts` / `App.tsx` | 6,706 / 2,813 | 同 | 一致 |
 | 组件直接 `fetch` | 9 个文件 12 处 | 9 个文件 13 处 | 偏差 1 |
@@ -63,4 +64,4 @@
 | §1.7 日志、库表事实 | 见 §1.7 | `logs.mjs`、`trace-facts.sh` 现场重跑 | 现网数据，随时间变化 |
 | §1.9 列车阶段耗时 | 推算值（无 `summary.json`） | `trains.mjs` 读 `summary.json` | OCV5-539 上线后用实测替代推算；§8.1 规定 2 周后重算目标 |
 
-结论：结构类数字（依赖图、SCC、环、反向引用、行数）全部逐字复现；词法计数类有偏差的，方案原文本来就是 `rg` 下限估计，以后统一以这些脚本的输出为基线。P0b 的 `check-architecture.ts` 会用 TypeScript 符号解析重新给出规则 3 的违规基线，届时这里的正则计数只作为参考。
+结论：结构类数字（依赖图、SCC、反向引用、行数）逐字复现，只有两个环的大小因方案把类型位置的 `import()` 算成值导入而偏大（4→3、29→28），以脚本为准；词法计数类有偏差的，方案原文本来就是 `rg` 下限估计，以后统一以这些脚本的输出为基线。P0b 的 `check-architecture.ts` 会用 TypeScript 符号解析重新给出规则 3 的违规基线，届时这里的正则计数只作为参考。

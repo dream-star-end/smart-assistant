@@ -34,6 +34,18 @@ test("scanImports: value vs type, re-exports, side effects, dynamic, require", (
   ]);
 });
 
+test("scanImports: import(\"x\") in type position is a type reference, not a runtime edge (Codex r1)", () => {
+  const src = [
+    'let a: import("./t1.js").Foo;',
+    'type B = typeof import("./t2.js");',
+    'const c = await import("./v1.js");',
+    'import("./v2.js").then((m) => m.run());',
+    'const d = (await import("./v3.js")).default;',
+  ].join("\n");
+  const got = scanImports(src).map((r) => `${r.kind}:${r.spec}`).sort();
+  assert.deepEqual(got, ["type:./t1.js", "type:./t2.js", "value:./v1.js", "value:./v2.js", "value:./v3.js"]);
+});
+
 test("scanImports stays linear on a large file without imports", () => {
   const big = "export function f() { return 1; }\n".repeat(20000);
   const t0 = Date.now();
@@ -97,4 +109,18 @@ test("trains.mjs --check-last: complete vs incomplete summaries", (t) => {
   const j = JSON.parse(run("--json").stdout);
   assert.equal(j.success, 2);
   assert.deepEqual(j.failedPhases, { "C.g3": 1 });
+});
+
+test("deps.mjs maps @openclaude/channel-* to packages/channels/* so a package cycle is seen (Codex r1)", (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), "arch-deps-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const put = (rel, text) => { mkdirSync(path.dirname(path.join(root, rel)), { recursive: true }); writeFileSync(path.join(root, rel), text); };
+  put("packages/gateway/src/a.ts", 'import { x } from "@openclaude/channel-wechat";\nexport const y = x;\n');
+  put("packages/channels/wechat/src/b.ts", 'import { y } from "@openclaude/gateway";\nexport const x = y;\n');
+  put("packages/commercial/src/index.ts", "export {};\n");
+  const r = spawnSync(process.execPath, [path.join(here, "../arch-measure/deps.mjs"), "--root", root, "--json"], { encoding: "utf8" });
+  assert.equal(r.status, 0, r.stderr);
+  const rows = Object.fromEntries(JSON.parse(r.stdout).rows.map((x) => [x.id, x.value]));
+  assert.equal(rows["pkg.cycles"], 1);
+  assert.equal(rows["pkg.cycleMembers"], "channels/wechat+gateway");
 });
