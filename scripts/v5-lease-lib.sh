@@ -350,7 +350,7 @@ INSERT INTO _lp_guard SELECT CASE WHEN NOT EXISTS(
 SQL
 }
 
-lease_inflight_bind_sql() { # train_id target_sha actor; same transaction as train creation
+lease_inflight_bind_sql() { # train_id target_sha actor; worker creation or locked executor adoption
   local iq tq aq nowq
   lease_valid_train_id "$1" && lease_valid_sha "$2" || return 2
   iq="$(lease_q "$1")"; tq="$(lease_q "$2")"; aq="$(lease_q "$3")"; nowq="$(lease_q "$(lease_now)")"
@@ -358,7 +358,7 @@ lease_inflight_bind_sql() { # train_id target_sha actor; same transaction as tra
   cat <<SQL
 INSERT INTO _lp_guard SELECT CASE WHEN
  (SELECT count(*) FROM train WHERE id='$iq' AND resource='deploy:selfhost'
-  AND target_sha='$tq' AND status='planned')=1 THEN 1 ELSE 0 END;
+  AND target_sha='$tq' AND status IN ('planned','building'))=1 THEN 1 ELSE 0 END;
 INSERT INTO _lp_guard SELECT CASE WHEN NOT EXISTS(
  SELECT 1 FROM _li_open WHERE status='registered' AND inflight_mode='allow'
   AND want_sha<>'$tq') AND
@@ -366,13 +366,22 @@ INSERT INTO _lp_guard SELECT CASE WHEN NOT EXISTS(
  THEN 1 ELSE 0 END;
 CREATE TEMP TABLE _li_selected AS SELECT id,seq FROM _li_open
  WHERE status='registered' AND inflight_mode='allow';
+CREATE TEMP TABLE _li_expected AS SELECT json_object('schema',1,'sourceSha','$tq',
+ 'allowInflight',json('true'),'leaseIds',json((SELECT json_group_array(id)
+ FROM (SELECT id FROM _li_selected ORDER BY seq)))) AS doc
+ WHERE EXISTS(SELECT 1 FROM _li_selected);
+INSERT INTO _lp_guard SELECT CASE WHEN
+ json_type(COALESCE(evidence_json,'{}'),'$.cutover') IS NULL OR
+ (json_type(evidence_json,'$.cutover')='object' AND
+  json(json_extract(evidence_json,'$.cutover'))=(SELECT json(doc) FROM _li_expected))
+ THEN 1 ELSE 0 END FROM train WHERE id='$iq';
 UPDATE train SET evidence_json=json_set(COALESCE(evidence_json,'{}'),'$.cutover',
- json_object('schema',1,'sourceSha','$tq','allowInflight',json('true'),
- 'leaseIds',json((SELECT json_group_array(id) FROM (SELECT id FROM _li_selected ORDER BY seq)))))
- WHERE id='$iq' AND EXISTS(SELECT 1 FROM _li_selected);
+ json((SELECT doc FROM _li_expected))) WHERE id='$iq'
+ AND json_type(COALESCE(evidence_json,'{}'),'$.cutover') IS NULL
+ AND EXISTS(SELECT 1 FROM _li_expected);
 INSERT INTO event(subject_id,event,actor,detail,created_at)
  SELECT '$iq','cutover-inflight-allowed','$aq','--allow-inflight sha=$tq','$nowq'
- WHERE EXISTS(SELECT 1 FROM _li_selected);
+ WHERE changes()=1;
 SQL
 }
 

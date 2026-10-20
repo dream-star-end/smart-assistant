@@ -1396,6 +1396,56 @@ cleanup_cutover_unit_snap() {
   esac
 }
 
+# Bootstrap the new executor even when the installed live worker predates the flag.
+# Only the typed, exact-source registration can authorize this local CLI state.
+cutover_adopt_inflight_request() { # <captured HEAD>
+  local head="$1" views bind selected owner
+  [[ "$DRY" == 1 ]] && return 0
+  [[ "${PG_DB:-}" == openclaude_v5_selfhost ]] || return 2
+  if [[ -z "${LEASE_TRAIN_ID:-}" ]]; then
+    [[ "${ALLOW_INFLIGHT:-0}" == 0 ]] && return 0
+    return 2
+  fi
+  lease_train_load_lib || return 2
+  lease_valid_train_id "$LEASE_TRAIN_ID" && lease_valid_sha "$head" || return 2
+  [[ "$head" == "$LEASE_TARGET_SHA" ]] || return 2
+  views="$(lease_policy_views_sql deploy:selfhost)" || return 2
+  bind="$(lease_inflight_bind_sql "$LEASE_TRAIN_ID" "$head" "deploy:$$")" || return 2
+  # Validate the complete immutable binding before claiming or changing metadata.
+  selected="$(lease_tx <<SQL
+.bail on
+BEGIN IMMEDIATE;
+$views
+$bind
+SELECT count(*) FROM _li_selected;
+ROLLBACK;
+SQL
+)" || return 2
+  if [[ "$selected" == 0 ]]; then
+    [[ "${ALLOW_INFLIGHT:-0}" == 0 ]] && return 0
+    return 2
+  fi
+  [[ "$selected" =~ ^[1-9][0-9]*$ ]] || return 2
+  owner="$(train_field "$LEASE_TRAIN_ID" owner)" || return 2
+  [[ "$owner" =~ ^worker:[1-9][0-9]*$ ]] || return 2
+  release_policy_lock_is_owned || return 86
+  [[ "${LEASE_TRAIN_ACTIVE:-0}" == 1 ]] || lease_train_begin "$head"
+  lease_tx <<SQL || return 2
+.bail on
+BEGIN IMMEDIATE;
+$views
+INSERT INTO _lp_guard SELECT CASE WHEN (SELECT count(*) FROM train
+ WHERE id='$(lease_q "$LEASE_TRAIN_ID")' AND resource='deploy:selfhost'
+ AND target_sha='$head' AND status='building' AND executor_pid=$$
+ AND owner='$(lease_q "$owner")')=1 THEN 1 ELSE 0 END;
+$bind
+COMMIT;
+SQL
+  lease_inflight_train_allowed "$LEASE_TRAIN_ID" "$head" || return 2
+  ALLOW_INFLIGHT=1
+  log "  --allow-inflight: adopted exact-source registered permission; 用户 11:48 授权个人版不等在途请求"
+}
+
 # OCV5-513: wait after the build, before arming recovery or changing live units.
 # This is an idle snapshot, not an admission fence; new arrivals can still race.
 cutover_wait_for_user_idle() {

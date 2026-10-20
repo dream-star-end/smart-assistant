@@ -123,7 +123,7 @@ test('real registration, SQL binding and both worker spawn paths keep permission
     encoding: 'utf8', timeout: 120_000, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
   })
   assert.equal(r.status, 0, r.stderr + r.stdout)
-  assert.match(r.stdout, /PASS selfhost inflight registration, binding and worker argv/)
+  assert.match(r.stdout, /PASS selfhost inflight registration, frozen binding, old-worker adoption and worker argv/)
 })
 
 test('selfhost CLI accepts the explicit argument and never inherits permission from env', () => {
@@ -167,5 +167,35 @@ test('commercial deployment rejects the parameter without invoking external oper
     assert.equal(existsSync(spy), false)
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('an early claimed train keeps its exact source when shared HEAD advances during auxiliary setup', () => {
+  const deploy = readFileSync(path.join(root, 'scripts/deploy-v5-selfhost.sh'), 'utf8')
+  const start = deploy.indexOf('  ensure_model_authority\n', deploy.indexOf('cmd_deploy()'))
+  const end = deploy.indexOf('  build_master_release "$sha"', start)
+  assert.ok(start > 0 && end > start)
+  const actual = deploy.slice(start, end) + '  build_master_release "$sha"\n'
+  const a = 'a'.repeat(40)
+  const b = 'b'.repeat(40)
+  for (const active of [0, 1]) {
+    const r = spawnSync('bash', ['-c', `set -Eeuo pipefail
+sha=${a}; LEASE_TRAIN_ACTIVE=${active}; BUILT_MASTER_RELEASE=fixture
+source_commit() { echo ${b}; }
+ensure_model_authority() { :; }
+lease_train_begin() { echo "CLAIM:$1"; }
+assert_fix_trailers() { :; }
+assert_p0_web_overlay_contained() { :; }
+log() { :; }
+start_runtime_release_bg() { echo "RUNTIME:$1"; }
+build_master_release() { echo "MASTER:$1"; }
+${actual}`], { encoding: 'utf8' })
+    assert.equal(r.status, 0, r.stderr)
+    const expected = active ? a : b
+    assert.match(r.stdout, new RegExp(`RUNTIME:${expected}`))
+    assert.match(r.stdout, new RegExp(`MASTER:${expected}`))
+    if (active) assert.doesNotMatch(r.stdout, /CLAIM:/)
+    else assert.match(r.stdout, new RegExp(`CLAIM:${b}`))
   }
 })
