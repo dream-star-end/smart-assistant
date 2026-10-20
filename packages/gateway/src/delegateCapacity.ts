@@ -42,6 +42,17 @@ export function getDelegateReviewReservedSlots(): number {
   return Math.min(parsed, Math.max(0, max - 1))
 }
 
+/**
+ * P2 债C/3.5 — 单父会话(队长)并行 fan-out 上限。非 review 委派按父分桶计数,
+ * 超上限进排队;review 委派豁免此桶(有独立保留槽)。消"一个队长把全局槽占光"。
+ * env OPENCLAUDE_DELEGATE_MAX_PER_PARENT 可配(下限 1,取整,否则 3),调用时读取。
+ * 原 Gateway.MAX_CONCURRENT_DELEGATIONS_PER_PARENT 静态 getter,原样搬来(OCV5-533)。
+ */
+export function getDelegateMaxPerParent(): number {
+  const raw = Number(process.env.OPENCLAUDE_DELEGATE_MAX_PER_PARENT)
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 3
+}
+
 export function delegateConcurrencyCap(isReview: boolean): number {
   const max = getDelegateMaxConcurrent()
   return isReview ? max : max - getDelegateReviewReservedSlots()
