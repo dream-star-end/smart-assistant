@@ -7,6 +7,7 @@
 # 输出: 每个问题一行 `MISSING <KEY>` / `UNDECLARED <KEY>`,末行 `ENV_DRIFT missing=N undeclared=M`。
 # 退出: 0 无 MISSING(UNDECLARED 只告警);1 有 @required 键缺失;2 用法或文件不可读。
 set -euo pipefail
+export LC_ALL=C
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 env_file="/etc/openclaude/commercial-v5-selfhost.env"
@@ -24,8 +25,55 @@ done
 [[ -r "$env_file" ]] || { echo "env 不可读: $env_file" >&2; exit 2; }
 [[ -r "$template" ]] || { echo "模板不可读: $template" >&2; exit 2; }
 
-# 只取键名;注释行与空行跳过。值从不进入任何变量。
-keys_of() { grep -oE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=' "$1" | sed -E 's/^[[:space:]]*//; s/=$//' | sort -u; }
+# 只取键名;值从不离开解析器。按 systemd EnvironmentFile 的语义切逻辑行:引号里的值可以跨行,
+# 行尾反斜杠续行;跨出来的那些物理行属于上一个值,绝不能当成键(否则会把值的一部分打进日志)。
+keys_of() {
+  python3 - "$1" <<'PY' | sort -u
+import re, sys
+assign = re.compile(r'\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$')
+quote = None
+cont = False
+for line in open(sys.argv[1], encoding="utf-8", errors="replace").read().split("\n"):
+    if quote:
+        j = 0
+        while j < len(line):
+            c = line[j]
+            if c == "\\" and quote == '"':
+                j += 2
+                continue
+            if c == quote:
+                quote = None
+                break
+            j += 1
+        continue
+    if cont:
+        cont = line.endswith("\\")
+        continue
+    m = assign.match(line)
+    if not m:
+        continue
+    print(m.group(1))
+    val, j, q = m.group(2), 0, None
+    while j < len(val):
+        c = val[j]
+        if q is None:
+            if c in "\"'":
+                q = c
+            elif c == "#" and (j == 0 or val[j - 1].isspace()):
+                break
+            elif c == "\\":
+                j += 1
+        elif c == "\\" and q == '"':
+            j += 1
+        elif c == q:
+            q = None
+        j += 1
+    if q:
+        quote = q
+    elif val.endswith("\\"):
+        cont = True
+PY
+}
 
 declared="$(keys_of "$template")"
 required="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=.*#.*@required' "$template" | sed -E 's/=.*//' | sort -u)"

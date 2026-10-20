@@ -2305,7 +2305,6 @@ $dirty
   cutover_adopt_inflight_request "$sha" || exit "$?"
   [[ -f "$V5_ENV" ]] || die "缺 $V5_ENV,这不是更新路径。补救: 首次安装走 --bootstrap;本机已有实例则检查 env 是否被挪走。"
   ensure_selfhost_env_keys
-  assert_env_key_drift
   docker network inspect openclaude-v5-net >/dev/null 2>&1 \
     || die "openclaude-v5-net 不存在。补救: 不要在 --deploy 里建网;确认 bootstrap 做过或手工恢复该网。"
   [[ -L "$MASTER_LIVE_LINK" ]] \
@@ -2316,6 +2315,7 @@ $dirty
   install_aux_units
   refresh_ccb_proxy_path
   ensure_model_authority
+  assert_env_key_drift
   if [[ "${LEASE_TRAIN_ACTIVE:-0}" != 1 ]]; then
     sha="$(source_commit)"
     lease_train_begin "$sha"
