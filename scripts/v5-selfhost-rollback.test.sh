@@ -181,5 +181,17 @@ grep -qE '^  rollback\) cmd_rollback ;;$' "$DEPLOY" && ok "W2 --rollback dispatc
 grep -qE '^    deploy\|bootstrap\|build-master-only\|cutover\|rollback\)$' "$DEPLOY" \
   && ok "W3 --rollback takes the deploy lock" || bad "W3 lock"
 
+# OCV5-541:dry-run 结束只报计划,不报“完成”
+tail_rb="$(awk '/^cmd_rollback\(\) \{/{f=1} f{print} f && /^\}$/{exit}' "$DIR/lib/v5-selfhost-rollback.sh")"
+dry_line="$(grep -n -- '--rollback --dry-run 计划结束' <<<"$tail_rb" | cut -d: -f1)"
+done_line="$(grep -n -- '✓ --rollback 完成' <<<"$tail_rb" | cut -d: -f1)"
+guard_line="$(grep -nE '^  if \[\[ "\$DRY" == 1 \]\]; then' <<<"$tail_rb" | tail -1 | cut -d: -f1)"
+if [[ -n "$dry_line" && -n "$done_line" && -n "$guard_line" ]] && (( guard_line < dry_line && dry_line < done_line )) \
+  && sed -n "${dry_line},${done_line}p" <<<"$tail_rb" | grep -qE '^    return 0$'; then
+  ok "W4 --rollback --dry-run ends with a plan line and returns before the 完成 line"
+else
+  bad "W4 dry-run end message"
+fi
+
 echo "rollback tests: $pass passed, $fail failed"
 [[ "$fail" == 0 ]]
