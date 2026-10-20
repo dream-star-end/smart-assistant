@@ -108,6 +108,28 @@ test('validatePdfStructureSync and validatePdfInIsolatedWorker accept valid PDFs
   )
   assert.equal(validatePdfStructureSync(fakeHtmlWithPdfMarkers), false)
   assert.equal(await validatePdfInIsolatedWorker(fakeHtmlWithPdfMarkers, signal), false)
+
+  const buildCustomPdf = (catalogPagesRef: string, pagesDict: string) => {
+    const header = '%PDF-1.4\n'
+    const obj1 = `1 0 obj\n<< /Type /Catalog /Pages ${catalogPagesRef} >>\nendobj\n`
+    const obj2 = `2 0 obj\n${pagesDict}\nendobj\n`
+    const obj3 = '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n'
+    const o1 = header.length
+    const o2 = o1 + obj1.length
+    const o3 = o2 + obj2.length
+    const xrefOffset = o3 + obj3.length
+    const pad = (n: number) => String(n).padStart(10, '0')
+    const xref = `xref\n0 4\n0000000000 65535 f \n${pad(o1)} 00000 n \n${pad(o2)} 00000 n \n${pad(o3)} 00000 n \n`
+    const trailer = `trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`
+    return Buffer.from(header + obj1 + obj2 + obj3 + xref + trailer, 'latin1')
+  }
+  const compactPdf = buildCustomPdf('2 0 R', '<</Type/Pages/Count 1/Kids[3 0 R]>>')
+  assert.equal(validatePdfStructureSync(compactPdf), true)
+  assert.equal(await validatePdfInIsolatedWorker(compactPdf, signal), true)
+
+  const brokenPagesRefPdf = buildCustomPdf('999 0 R', '<</Type/Pages/Count 1/Kids[3 0 R]>>')
+  assert.equal(validatePdfStructureSync(brokenPagesRefPdf), false)
+  assert.equal(await validatePdfInIsolatedWorker(brokenPagesRefPdf, signal), false)
   assert.equal(
     await validatePdfInIsolatedWorker(
       Buffer.from('%PDF-1.4\nmissing eof marker without trailer'),
@@ -428,11 +450,17 @@ test('WanfangLiteratureHttpExecutor executes both Chinese (Wanfang) and English 
 test('createPinnedDownstreamRequester aborts during DNS and enforces hop timeout', async () => {
   const ac = new AbortController()
   let resolveDns: ((ips: string[]) => void) | undefined
+  let dnsCalls = 0
   const requester = createPinnedDownstreamRequester(
-    async () =>
-      await new Promise<string[]>((resolve) => {
-        resolveDns = resolve
-      }),
+    {
+      resolve4: async () => {
+        dnsCalls++
+        return await new Promise<string[]>((resolve) => {
+          resolveDns = resolve
+        })
+      },
+      resolve6: async () => [],
+    },
     80,
   )
   const pending = requester({
@@ -447,5 +475,6 @@ test('createPinnedDownstreamRequester aborts during DNS and enforces hop timeout
     pending,
     (err: unknown) => err instanceof LiteratureError && err.code === 'CANCELLED',
   )
+  assert.equal(dnsCalls, 1)
   resolveDns?.(['8.8.8.8'])
 })

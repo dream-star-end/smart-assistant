@@ -1,3 +1,4 @@
+import zlib from 'node:zlib'
 /**
  * Process-local, owner-scoped in-memory PDF artifact store for Literature Plugin (OCV5-524).
  *
@@ -75,145 +76,390 @@ export function validatePdfStructureSync(data: Buffer): boolean {
     return false
   const head = data.subarray(0, Math.min(data.length, 1024)).toString('latin1')
   if (!/^%PDF-[12]\.\d[\r\n]/.test(head)) return false
-  if (/<(?:!doctype|html|head|body|script|iframe|div)\b/i.test(head)) return false
+  if (/<(?:!doctype|html|head|body|script|iframe)\b/i.test(head)) return false
 
-  const tailLen = Math.min(data.length, 16384)
+  const fullStr = data.toString('latin1')
+  if (/\/Encrypt(?![A-Za-z])/.test(fullStr)) return false
+
+  const tailLen = Math.min(data.length, 65536)
   const tail = data.subarray(data.length - tailLen).toString('latin1')
-  if (/\/Encrypt\b/.test(tail)) return false
-
   const startxrefMatches = Array.from(
     tail.matchAll(/\bstartxref[\r\n\s]+(\d+)[\r\n\s]+%%EOF/g),
   )
   if (startxrefMatches.length === 0) return false
   const lastMatch = startxrefMatches[startxrefMatches.length - 1]!
-  const xrefOffset = Number.parseInt(lastMatch[1]!, 10)
-  if (!Number.isSafeInteger(xrefOffset) || xrefOffset <= 8 || xrefOffset >= data.length - 16) {
+  const startXrefOffset = Number.parseInt(lastMatch[1]!, 10)
+  if (
+    !Number.isSafeInteger(startXrefOffset) ||
+    startXrefOffset <= 8 ||
+    startXrefOffset >= data.length - 16
+  ) {
     return false
   }
 
-  const atXref = data
-    .subarray(xrefOffset, Math.min(data.length, xrefOffset + 8192))
-    .toString('latin1')
-  const fullStr = data.toString('latin1')
+  const extractObjAtOffset = (
+    offset: number,
+    expectedNum?: number,
+    expectedGen?: number,
+  ): { num: number; gen: number; body: string } | null => {
+    if (offset <= 0 || offset >= data.length - 10) return null
+    const slice = data.subarray(offset, Math.min(data.length, offset + 262144)).toString('latin1')
+    const m = /^[\r\n\s]*(\d+)\s+(\d+)\s+obj\b([\s\S]*?)\bendobj\b/.exec(slice)
+    if (!m?.[1] || !m[2] || m[3] === undefined) return null
+    const num = Number.parseInt(m[1], 10)
+    const gen = Number.parseInt(m[2], 10)
+    if (expectedNum !== undefined && num !== expectedNum) return null
+    if (expectedGen !== undefined && gen !== expectedGen) return null
+    return { num, gen, body: m[3] }
+  }
 
-  let rootNum: string | null = null
-  if (/^\s*xref[\r\n\s]+\d+\s+\d+/.test(atXref)) {
-    const trailerIdx = atXref.indexOf('trailer')
-    const trailerSource = trailerIdx >= 0 ? atXref.slice(trailerIdx) : tail
-    const rootMatch =
-      /\btrailer\b[\s\S]*?<<[\s\S]*?\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(
-        trailerSource,
-      ) ?? /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(tail)
-    if (!rootMatch?.[1]) return false
-    rootNum = rootMatch[1]
-    const inUseEntries = Array.from(atXref.matchAll(/\b(\d{10})\s+\d{5}\s+n\b/g))
-    if (inUseEntries.length === 0) return false
-    let verifiedObjAtOffset = 0
-    for (const entry of inUseEntries.slice(0, 10)) {
-      const off = Number.parseInt(entry[1]!, 10)
-      if (off > 0 && off < data.length - 10) {
-        const probe = data.subarray(off, Math.min(data.length, off + 64)).toString('latin1')
-        if (/^\s*\d+\s+\d+\s+obj\b/.test(probe)) verifiedObjAtOffset++
+  const objMap = new Map<number, string>()
+  let rootObjNum: number | null = null
+
+  const probeAtStartXref = data
+    .subarray(startXrefOffset, Math.min(data.length, startXrefOffset + 128))
+    .toString('latin1')
+  if (/^[\r\n\s]*xref[\r\n\s]/.test(probeAtStartXref)) {
+    const visitedXref = new Set<number>()
+    let curXrefOff: number | null = startXrefOffset
+    while (curXrefOff !== null && !visitedXref.has(curXrefOff) && visitedXref.size < 8) {
+      visitedXref.add(curXrefOff)
+      if (curXrefOff <= 0 || curXrefOff >= data.length - 16) return false
+      const xrefText = data
+        .subarray(curXrefOff, Math.min(data.length, curXrefOff + 524288))
+        .toString('latin1')
+      const trailerIdx = xrefText.search(/\btrailer(?:\s|<<)/)
+      if (trailerIdx < 0) return false
+      const tablePart = xrefText.slice(0, trailerIdx)
+      const trailerPart = xrefText.slice(trailerIdx)
+
+      const lines = tablePart
+        .split(/[\r\n]+/)
+        .map((l) => l.trim())
+        .filter(Boolean)
+      if (lines[0] !== 'xref') return false
+      let idx = 1
+      let entriesParsed = 0
+      while (idx < lines.length) {
+        const subMatch = /^(\d+)\s+(\d+)$/.exec(lines[idx]!)
+        if (!subMatch?.[1] || !subMatch[2]) return false
+        const firstId = Number.parseInt(subMatch[1], 10)
+        const count = Number.parseInt(subMatch[2], 10)
+        idx++
+        if (idx + count > lines.length) return false
+        for (let k = 0; k < count; k++) {
+          const entryLine = lines[idx + k]!
+          const em = /^(\d{10})\s+(\d{5})\s+([nf])$/.exec(entryLine)
+          if (!em?.[1] || !em[2] || !em[3]) return false
+          if (em[3] === 'n') {
+            const off = Number.parseInt(em[1], 10)
+            const gen = Number.parseInt(em[2], 10)
+            const objId = firstId + k
+            if (!objMap.has(objId)) {
+              const parsed = extractObjAtOffset(off, objId, gen)
+              if (!parsed) return false
+              objMap.set(objId, parsed.body)
+            }
+            entriesParsed++
+          }
+        }
+        idx += count
+      }
+      if (entriesParsed === 0 && visitedXref.size === 1) return false
+
+      if (rootObjNum === null) {
+        const rm = /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(trailerPart)
+        if (rm?.[1]) rootObjNum = Number.parseInt(rm[1], 10)
+      }
+      const prevMatch = /\/Prev\s+(\d+)\b/.exec(trailerPart)
+      curXrefOff = prevMatch?.[1] ? Number.parseInt(prevMatch[1], 10) : null
+    }
+  } else {
+    const xrefObj = extractObjAtOffset(startXrefOffset)
+    if (!xrefObj || !/\/Type\s*\/XRef(?![A-Za-z])/.test(xrefObj.body)) return false
+    const rm =
+      /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(xrefObj.body) ??
+      /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(tail)
+    if (!rm?.[1]) return false
+    rootObjNum = Number.parseInt(rm[1], 10)
+
+    const objRe = /\b(\d+)\s+(\d+)\s+obj\b([\s\S]*?)\bendobj\b/g
+    let m: RegExpExecArray | null
+    while ((m = objRe.exec(fullStr)) !== null) {
+      const id = Number.parseInt(m[1]!, 10)
+      const body = m[3]!
+      objMap.set(id, body)
+      if (/\/Type\s*\/ObjStm(?![A-Za-z])/.test(body)) {
+        const nMatch = /\/N\s+(\d+)\b/.exec(body)
+        const firstMatch = /\/First\s+(\d+)\b/.exec(body)
+        const streamIdx = body.indexOf('stream')
+        const endstreamIdx = body.lastIndexOf('endstream')
+        if (nMatch?.[1] && firstMatch?.[1] && streamIdx >= 0 && endstreamIdx > streamIdx) {
+          const n = Number.parseInt(nMatch[1], 10)
+          const first = Number.parseInt(firstMatch[1], 10)
+          let rawPos = m.index + m[0].indexOf('stream') + 6
+          if (data[rawPos] === 13 && data[rawPos + 1] === 10) rawPos += 2
+          else if (data[rawPos] === 10 || data[rawPos] === 13) rawPos += 1
+          let rawEnd = m.index + m[0].lastIndexOf('endstream')
+          while (rawEnd > rawPos && (data[rawEnd - 1] === 10 || data[rawEnd - 1] === 13)) {
+            rawEnd--
+          }
+          if (rawEnd > rawPos) {
+            try {
+              const inflated = zlib.inflateSync(data.subarray(rawPos, rawEnd), {
+                maxOutputLength: 8 * 1024 * 1024,
+              })
+              const headerStr = inflated.subarray(0, first).toString('latin1').trim()
+              const pairs = headerStr.split(/\s+/)
+              const offsets: Array<{ id: number; rel: number }> = []
+              for (let p = 0; p + 1 < pairs.length && offsets.length < n; p += 2) {
+                offsets.push({
+                  id: Number.parseInt(pairs[p]!, 10),
+                  rel: Number.parseInt(pairs[p + 1]!, 10),
+                })
+              }
+              for (let j = 0; j < offsets.length; j++) {
+                const startByte = first + offsets[j]!.rel
+                const endByte =
+                  j + 1 < offsets.length ? first + offsets[j + 1]!.rel : inflated.length
+                if (startByte >= first && endByte >= startByte && endByte <= inflated.length) {
+                  objMap.set(
+                    offsets[j]!.id,
+                    inflated.subarray(startByte, endByte).toString('latin1'),
+                  )
+                }
+              }
+            } catch {
+              // ignore individual compressed stream failure
+            }
+          }
+        }
       }
     }
-    if (verifiedObjAtOffset === 0) return false
-  } else {
-    const xrefObjMatch =
-      /^\s*(\d+)\s+(\d+)\s+obj\b[\s\S]{1,4096}?<<([\s\S]{1,4096}?)>>/.exec(atXref)
-    if (!xrefObjMatch?.[3]) return false
-    const dict = xrefObjMatch[3]
-    if (!/\/Type\s*\/XRef\b/.test(dict)) return false
-    const rootMatch =
-      /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(dict) ??
-      /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(tail)
-    if (!rootMatch?.[1]) return false
-    rootNum = rootMatch[1]
   }
 
-  const hasObjStm = /\/Type\s*\/ObjStm\b/.test(fullStr) || /\/Linearized\b/.test(fullStr)
-  if (!hasObjStm) {
-    const rootRe = new RegExp(
-      `\\b${rootNum}\\s+\\d+\\s+obj\\b[\\s\\S]{1,2048}?\\/Type\\s*\\/Catalog\\b`,
-    )
-    if (!rootRe.test(fullStr)) return false
-    if (
-      !/\/Type\s*\/Pages\b[\s\S]{1,2048}?\/Count\s+[1-9]\d*/.test(fullStr) &&
-      !/\/Count\s+[1-9]\d*[\s\S]{1,2048}?\/Type\s*\/Pages\b/.test(fullStr)
-    ) {
+  if (rootObjNum === null || !objMap.has(rootObjNum)) return false
+  const catalogBody = objMap.get(rootObjNum)!
+  if (!/\/Type\s*\/Catalog(?![A-Za-z])/.test(catalogBody)) return false
+  const pagesRefMatch = /\/Pages\s+(\d+)\s+(\d+)\s+R\b/.exec(catalogBody)
+  if (!pagesRefMatch?.[1]) return false
+  const rootPagesId = Number.parseInt(pagesRefMatch[1], 10)
+
+  const visitedNodes = new Set<number>()
+  const queue: number[] = [rootPagesId]
+  let pageCount = 0
+  while (queue.length > 0 && visitedNodes.size < 500) {
+    const curId = queue.shift()!
+    if (visitedNodes.has(curId)) continue
+    visitedNodes.add(curId)
+    const nodeBody = objMap.get(curId)
+    if (!nodeBody) return false
+    if (/\/Type\s*\/Pages(?![A-Za-z])/.test(nodeBody)) {
+      const countMatch = /\/Count\s+([1-9]\d*)\b/.exec(nodeBody)
+      if (!countMatch?.[1]) return false
+      let kidsSource = nodeBody
+      const directKidsMatch = /\/Kids\s*\[([\s\S]*?)\]/.exec(nodeBody)
+      if (directKidsMatch?.[1] !== undefined) {
+        kidsSource = directKidsMatch[1]
+      } else {
+        const indirectKidsRef = /\/Kids\s+(\d+)\s+(\d+)\s+R\b/.exec(nodeBody)
+        if (!indirectKidsRef?.[1]) return false
+        const kidsArrayBody = objMap.get(Number.parseInt(indirectKidsRef[1], 10))
+        if (!kidsArrayBody) return false
+        kidsSource = kidsArrayBody
+      }
+      const kidRefs = Array.from(kidsSource.matchAll(/(\d+)\s+(\d+)\s+R\b/g))
+      if (kidRefs.length === 0) return false
+      for (const kr of kidRefs) {
+        queue.push(Number.parseInt(kr[1]!, 10))
+      }
+    } else if (/\/Type\s*\/Page(?![A-Za-z])/.test(nodeBody)) {
+      pageCount++
+    } else {
       return false
     }
-    if (!/\/Type\s*\/Page\b(?!s)/.test(fullStr)) return false
-  } else {
-    const objMatches = fullStr.match(/\b\d+\s+\d+\s+obj\b/g)
-    if (!objMatches || objMatches.length < 3) return false
   }
-  return true
+  return pageCount > 0
 }
 
 const WORKER_SCRIPT = `
 const { parentPort, workerData } = require('node:worker_threads');
+const zlib = require('node:zlib');
 const data = Buffer.from(workerData);
 function check(buf) {
-  if (buf.length < 64 || buf.length > 26214400) return false;
+  if (!Buffer.isBuffer(buf) || buf.length < 64 || buf.length > 26214400) return false;
   const head = buf.subarray(0, Math.min(buf.length, 1024)).toString('latin1');
   if (!/^%PDF-[12]\\.\\d[\\r\\n]/.test(head)) return false;
-  if (/<(?:!doctype|html|head|body|script|iframe|div)\\b/i.test(head)) return false;
+  if (/<(?:!doctype|html|head|body|script|iframe)\\b/i.test(head)) return false;
 
-  const tailLen = Math.min(buf.length, 16384);
+  const fullStr = buf.toString('latin1');
+  if (/\\/Encrypt(?![A-Za-z])/.test(fullStr)) return false;
+
+  const tailLen = Math.min(buf.length, 65536);
   const tail = buf.subarray(buf.length - tailLen).toString('latin1');
-  if (/\\/Encrypt\\b/.test(tail)) return false;
-
   const startxrefMatches = Array.from(tail.matchAll(/\\bstartxref[\\r\\n\\s]+(\\d+)[\\r\\n\\s]+%%EOF/g));
   if (startxrefMatches.length === 0) return false;
   const lastMatch = startxrefMatches[startxrefMatches.length - 1];
-  const xrefOffset = Number.parseInt(lastMatch[1], 10);
-  if (!Number.isSafeInteger(xrefOffset) || xrefOffset <= 8 || xrefOffset >= buf.length - 16) return false;
+  const startXrefOffset = Number.parseInt(lastMatch[1], 10);
+  if (!Number.isSafeInteger(startXrefOffset) || startXrefOffset <= 8 || startXrefOffset >= buf.length - 16) return false;
 
-  const atXref = buf.subarray(xrefOffset, Math.min(buf.length, xrefOffset + 8192)).toString('latin1');
-  const fullStr = buf.toString('latin1');
+  const extractObjAtOffset = (offset, expectedNum, expectedGen) => {
+    if (offset <= 0 || offset >= buf.length - 10) return null;
+    const slice = buf.subarray(offset, Math.min(buf.length, offset + 262144)).toString('latin1');
+    const m = /^[\\r\\n\\s]*(\\d+)\\s+(\\d+)\\s+obj\\b([\\s\\S]*?)\\bendobj\\b/.exec(slice);
+    if (!m || !m[1] || !m[2] || m[3] === undefined) return null;
+    const num = Number.parseInt(m[1], 10);
+    const gen = Number.parseInt(m[2], 10);
+    if (expectedNum !== undefined && num !== expectedNum) return null;
+    if (expectedGen !== undefined && gen !== expectedGen) return null;
+    return { num, gen, body: m[3] };
+  };
 
-  let rootNum = null;
-  if (/^\\s*xref[\\r\\n\\s]+\\d+\\s+\\d+/.test(atXref)) {
-    const trailerIdx = atXref.indexOf('trailer');
-    const trailerSource = trailerIdx >= 0 ? atXref.slice(trailerIdx) : tail;
-    const rootMatch = /\\btrailer\\b[\\s\\S]*?<<[\\s\\S]*?\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(trailerSource) || /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(tail);
-    if (!rootMatch || !rootMatch[1]) return false;
-    rootNum = rootMatch[1];
-    const inUseEntries = Array.from(atXref.matchAll(/\\b(\\d{10})\\s+\\d{5}\\s+n\\b/g));
-    if (inUseEntries.length === 0) return false;
-    let verifiedObjAtOffset = 0;
-    for (const entry of inUseEntries.slice(0, 10)) {
-      const off = Number.parseInt(entry[1], 10);
-      if (off > 0 && off < buf.length - 10) {
-        const probe = buf.subarray(off, Math.min(buf.length, off + 64)).toString('latin1');
-        if (/^\\s*\\d+\\s+\\d+\\s+obj\\b/.test(probe)) verifiedObjAtOffset++;
+  const objMap = new Map();
+  let rootObjNum = null;
+
+  const probeAtStartXref = buf.subarray(startXrefOffset, Math.min(buf.length, startXrefOffset + 128)).toString('latin1');
+  if (/^[\\r\\n\\s]*xref[\\r\\n\\s]/.test(probeAtStartXref)) {
+    const visitedXref = new Set();
+    let curXrefOff = startXrefOffset;
+    while (curXrefOff !== null && !visitedXref.has(curXrefOff) && visitedXref.size < 8) {
+      visitedXref.add(curXrefOff);
+      if (curXrefOff <= 0 || curXrefOff >= buf.length - 16) return false;
+      const xrefText = buf.subarray(curXrefOff, Math.min(buf.length, curXrefOff + 524288)).toString('latin1');
+      const trailerIdx = xrefText.search(/\\btrailer(?:\\s|<<)/);
+      if (trailerIdx < 0) return false;
+      const tablePart = xrefText.slice(0, trailerIdx);
+      const trailerPart = xrefText.slice(trailerIdx);
+
+      const lines = tablePart.split(/[\\r\\n]+/).map((l) => l.trim()).filter(Boolean);
+      if (lines[0] !== 'xref') return false;
+      let idx = 1;
+      let entriesParsed = 0;
+      while (idx < lines.length) {
+        const subMatch = /^(\\d+)\\s+(\\d+)$/.exec(lines[idx]);
+        if (!subMatch) return false;
+        const firstId = Number.parseInt(subMatch[1], 10);
+        const count = Number.parseInt(subMatch[2], 10);
+        idx++;
+        if (idx + count > lines.length) return false;
+        for (let k = 0; k < count; k++) {
+          const entryLine = lines[idx + k];
+          const em = /^(\\d{10})\\s+(\\d{5})\\s+([nf])$/.exec(entryLine);
+          if (!em) return false;
+          if (em[3] === 'n') {
+            const off = Number.parseInt(em[1], 10);
+            const gen = Number.parseInt(em[2], 10);
+            const objId = firstId + k;
+            if (!objMap.has(objId)) {
+              const parsed = extractObjAtOffset(off, objId, gen);
+              if (!parsed) return false;
+              objMap.set(objId, parsed.body);
+            }
+            entriesParsed++;
+          }
+        }
+        idx += count;
+      }
+      if (entriesParsed === 0 && visitedXref.size === 1) return false;
+
+      if (rootObjNum === null) {
+        const rm = /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(trailerPart);
+        if (rm) rootObjNum = Number.parseInt(rm[1], 10);
+      }
+      const prevMatch = /\\/Prev\\s+(\\d+)\\b/.exec(trailerPart);
+      curXrefOff = prevMatch ? Number.parseInt(prevMatch[1], 10) : null;
+    }
+  } else {
+    const xrefObj = extractObjAtOffset(startXrefOffset);
+    if (!xrefObj || !/\\/Type\\s*\\/XRef(?![A-Za-z])/.test(xrefObj.body)) return false;
+    const rm = /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(xrefObj.body) || /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(tail);
+    if (!rm) return false;
+    rootObjNum = Number.parseInt(rm[1], 10);
+
+    const objRe = /\\b(\\d+)\\s+(\\d+)\\s+obj\\b([\\s\\S]*?)\\bendobj\\b/g;
+    let m;
+    while ((m = objRe.exec(fullStr)) !== null) {
+      const id = Number.parseInt(m[1], 10);
+      const body = m[3];
+      objMap.set(id, body);
+      if (/\\/Type\\s*\\/ObjStm(?![A-Za-z])/.test(body)) {
+        const nMatch = /\\/N\\s+(\\d+)\\b/.exec(body);
+        const firstMatch = /\\/First\\s+(\\d+)\\b/.exec(body);
+        const streamIdx = body.indexOf('stream');
+        const endstreamIdx = body.lastIndexOf('endstream');
+        if (nMatch && firstMatch && streamIdx >= 0 && endstreamIdx > streamIdx) {
+          const n = Number.parseInt(nMatch[1], 10);
+          const first = Number.parseInt(firstMatch[1], 10);
+          let rawPos = m.index + m[0].indexOf('stream') + 6;
+          if (buf[rawPos] === 13 && buf[rawPos + 1] === 10) rawPos += 2;
+          else if (buf[rawPos] === 10 || buf[rawPos] === 13) rawPos += 1;
+          let rawEnd = m.index + m[0].lastIndexOf('endstream');
+          while (rawEnd > rawPos && (buf[rawEnd - 1] === 10 || buf[rawEnd - 1] === 13)) rawEnd--;
+          if (rawEnd > rawPos) {
+            try {
+              const inflated = zlib.inflateSync(buf.subarray(rawPos, rawEnd), { maxOutputLength: 8 * 1024 * 1024 });
+              const headerStr = inflated.subarray(0, first).toString('latin1').trim();
+              const pairs = headerStr.split(/\\s+/);
+              const offsets = [];
+              for (let p = 0; p + 1 < pairs.length && offsets.length < n; p += 2) {
+                offsets.push({ id: Number.parseInt(pairs[p], 10), rel: Number.parseInt(pairs[p + 1], 10) });
+              }
+              for (let j = 0; j < offsets.length; j++) {
+                const startByte = first + offsets[j].rel;
+                const endByte = j + 1 < offsets.length ? first + offsets[j + 1].rel : inflated.length;
+                if (startByte >= first && endByte >= startByte && endByte <= inflated.length) {
+                  objMap.set(offsets[j].id, inflated.subarray(startByte, endByte).toString('latin1'));
+                }
+              }
+            } catch {}
+          }
+        }
       }
     }
-    if (verifiedObjAtOffset === 0) return false;
-  } else {
-    const xrefObjMatch = /^\\s*(\\d+)\\s+(\\d+)\\s+obj\\b[\\s\\S]{1,4096}?<<([\\s\\S]{1,4096}?)>>/.exec(atXref);
-    if (!xrefObjMatch || !xrefObjMatch[3]) return false;
-    const dict = xrefObjMatch[3];
-    if (!/\\/Type\\s*\\/XRef\\b/.test(dict)) return false;
-    const rootMatch = /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(dict) || /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(tail);
-    if (!rootMatch || !rootMatch[1]) return false;
-    rootNum = rootMatch[1];
   }
 
-  const hasObjStm = /\\/Type\\s*\\/ObjStm\\b/.test(fullStr) || /\\/Linearized\\b/.test(fullStr);
-  if (!hasObjStm) {
-    const rootRe = new RegExp('\\\\b' + rootNum + '\\\\s+\\\\d+\\\\s+obj\\\\b[\\\\s\\\\S]{1,2048}?\\/Type\\\\s*\\/Catalog\\\\b');
-    if (!rootRe.test(fullStr)) return false;
-    if (!/\\/Type\\s*\\/Pages\\b[\\s\\S]{1,2048}?\\/Count\\s+[1-9]\\d*/.test(fullStr) &&
-        !/\\/Count\\s+[1-9]\\d*[\\s\\S]{1,2048}?\\/Type\\s*\\/Pages\\b/.test(fullStr)) {
+  if (rootObjNum === null || !objMap.has(rootObjNum)) return false;
+  const catalogBody = objMap.get(rootObjNum);
+  if (!/\\/Type\\s*\\/Catalog(?![A-Za-z])/.test(catalogBody)) return false;
+  const pagesRefMatch = /\\/Pages\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(catalogBody);
+  if (!pagesRefMatch) return false;
+  const rootPagesId = Number.parseInt(pagesRefMatch[1], 10);
+
+  const visitedNodes = new Set();
+  const queue = [rootPagesId];
+  let pageCount = 0;
+  while (queue.length > 0 && visitedNodes.size < 500) {
+    const curId = queue.shift();
+    if (visitedNodes.has(curId)) continue;
+    visitedNodes.add(curId);
+    const nodeBody = objMap.get(curId);
+    if (!nodeBody) return false;
+    if (/\\/Type\\s*\\/Pages(?![A-Za-z])/.test(nodeBody)) {
+      const countMatch = /\\/Count\\s+([1-9]\\d*)\\b/.exec(nodeBody);
+      if (!countMatch) return false;
+      let kidsSource = nodeBody;
+      const directKidsMatch = /\\/Kids\\s*\\[([\\s\\S]*?)\\]/.exec(nodeBody);
+      if (directKidsMatch && directKidsMatch[1] !== undefined) {
+        kidsSource = directKidsMatch[1];
+      } else {
+        const indirectKidsRef = /\\/Kids\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(nodeBody);
+        if (!indirectKidsRef) return false;
+        const kidsArrayBody = objMap.get(Number.parseInt(indirectKidsRef[1], 10));
+        if (!kidsArrayBody) return false;
+        kidsSource = kidsArrayBody;
+      }
+      const kidRefs = Array.from(kidsSource.matchAll(/(\\d+)\\s+(\\d+)\\s+R\\b/g));
+      if (kidRefs.length === 0) return false;
+      for (const kr of kidRefs) {
+        queue.push(Number.parseInt(kr[1], 10));
+      }
+    } else if (/\\/Type\\s*\\/Page(?![A-Za-z])/.test(nodeBody)) {
+      pageCount++;
+    } else {
       return false;
     }
-    if (!/\\/Type\\s*\\/Page\\b(?!s)/.test(fullStr)) return false;
-  } else {
-    const objMatches = fullStr.match(/\\b\\d+\\s+\\d+\\s+obj\\b/g);
-    if (!objMatches || objMatches.length < 3) return false;
   }
-  return true;
+  return pageCount > 0;
 }
 parentPort.postMessage({ ok: check(data) });
 `
