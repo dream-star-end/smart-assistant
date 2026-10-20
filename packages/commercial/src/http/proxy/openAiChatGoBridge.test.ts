@@ -16,6 +16,7 @@ import {
   decodeChatToolId,
   encodeChatToolId,
 } from './openAiChatGoBridge.js'
+import { type BoundWebSearch, WebSearchError } from './webSearchServerTool.js'
 
 type Obj = Record<string, unknown>
 
@@ -45,6 +46,14 @@ async function events(chunks: Array<Obj | '[DONE]'>): Promise<Obj[]> {
   return out
 }
 
+function parseAnthropicSse(text: string): Obj[] {
+  return text
+    .split(/\n\n/)
+    .map((chunk) => chunk.split(/\n/).find((line) => line.startsWith('data: ')))
+    .filter((line): line is string => Boolean(line))
+    .map((line) => JSON.parse(line.slice(6)) as Obj)
+}
+
 const usageChunk = {
   choices: [],
   usage: {
@@ -52,6 +61,35 @@ const usageChunk = {
     completion_tokens: 41,
     prompt_tokens_details: { cached_tokens: 7000 },
   },
+}
+
+function webSearchBody(extra: Obj = {}): Obj {
+  return {
+    model: 'glm-5.3',
+    max_tokens: 1024,
+    system: 'You are an assistant for performing a web search tool use',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'Perform a web search for the query: Claude Fable 5.5 release date',
+          },
+        ],
+      },
+    ],
+    tools: [
+      {
+        type: 'web_search_20250305',
+        name: 'web_search',
+        max_uses: 8,
+        allowed_domains: ['example.com'],
+        blocked_domains: ['spam.example.com'],
+      },
+    ],
+    ...extra,
+  }
 }
 
 // OCV5-432: the shape CCB actually sends (captured 2026-10-15). A preamble system message
@@ -217,16 +255,44 @@ describe('request conversion', () => {
         ),
       /no matching tool call/,
     )
+    // The official Claude Code WebSearch server tool is stripped instead of
+    // rejecting the whole request; other server tools still fail closed.
+    const stripped = anthropicToOpenAIChat({
+      ...m('x'),
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      tool_choice: { type: 'tool', name: 'web_search' },
+    })
+    assert.equal('tools' in stripped, false)
+    assert.equal('tool_choice' in stripped, false)
     assert.throws(
       () =>
         anthropicToOpenAIChat({
           ...m('x'),
-          tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+          tools: [{ type: 'web_fetch_20250910', name: 'web_fetch' }],
         }),
       /server tools/,
     )
     assert.throws(() => anthropicToOpenAIChat(m([{ type: 'text', text: '' }])), /nonempty content/)
     assert.throws(() => anthropicToOpenAIChat({ messages: [] }), /requires a model/)
+  })
+
+  test('mixed web_search + function tools keep only function tools and relax a forced search', () => {
+    const mixed = anthropicToOpenAIChat({
+      model: 'glm-5.3',
+      messages: [{ role: 'user', content: 'search then read' }],
+      tools: [
+        { type: 'web_search_20250305', name: 'web_search' },
+        { name: 'Read', input_schema: { type: 'object', properties: {} } },
+      ],
+      tool_choice: { type: 'tool', name: 'web_search' },
+    })
+    assert.deepEqual(mixed.tools, [
+      {
+        type: 'function',
+        function: { name: 'Read', parameters: { type: 'object', properties: {} } },
+      },
+    ])
+    assert.equal(mixed.tool_choice, 'auto')
   })
 
   test('tool ids round-trip and stay inside the Anthropic id alphabet', () => {
@@ -488,5 +554,161 @@ describe('fetch wrapper', () => {
     })
     assert.equal(bad.status, 400)
     assert.equal(called, false)
+  })
+
+  test('fulfills the WebSearch side request with platform results instead of a 400', async () => {
+    let upstreamCalled = false
+    let seen: { spec: Parameters<BoundWebSearch>[0]; signal?: AbortSignal } | undefined
+    const webSearch: BoundWebSearch = async (spec, signal) => {
+      seen = { spec, signal }
+      return [
+        { title: 'Fable docs', url: 'https://docs.example.com/fable', pageAge: '2026-10-01' },
+        { title: 'Blocked', url: 'https://spam.example.com/x' },
+        { title: 'Other site', url: 'https://other.test/fable' },
+        { title: 'Bad URL', url: 'not-a-url' },
+      ]
+    }
+    const bridge = createOpenAIChatGoFetch(
+      (async () => {
+        upstreamCalled = true
+        return new Response('')
+      }) as unknown as typeof fetch,
+      { webSearch },
+    )
+    const r = await bridge('x', {
+      method: 'POST',
+      headers: { 'x-api-key': 'GO-KEY' },
+      body: JSON.stringify(webSearchBody()),
+    })
+    assert.equal(r.status, 200)
+    const events = parseAnthropicSse(await r.text())
+    assert.equal(upstreamCalled, false, 'the search side request never hits the Go model')
+    assert.equal(seen!.spec.name, 'web_search')
+    assert.equal(seen!.spec.query, 'Claude Fable 5.5 release date')
+    assert.deepEqual(seen!.spec.allowedDomains, ['example.com'])
+    assert.deepEqual(seen!.spec.blockedDomains, ['spam.example.com'])
+    assert.deepEqual(
+      events.map((e) => e.type),
+      [
+        'message_start',
+        'content_block_start',
+        'content_block_delta',
+        'content_block_stop',
+        'content_block_start',
+        'content_block_stop',
+        'message_delta',
+        'message_stop',
+      ],
+    )
+    const toolUse = events[1]!.content_block as Obj
+    assert.equal(toolUse.type, 'server_tool_use')
+    assert.equal(toolUse.name, 'web_search')
+    assert.match(toolUse.id as string, /^srvtoolu_ws_/)
+    assert.deepEqual(JSON.parse((events[2]!.delta as Obj).partial_json as string), {
+      query: 'Claude Fable 5.5 release date',
+    })
+    const result = events[4]!.content_block as Obj
+    assert.equal(result.type, 'web_search_tool_result')
+    assert.equal(result.tool_use_id, toolUse.id)
+    assert.deepEqual(result.content, [
+      {
+        type: 'web_search_result',
+        title: 'Fable docs',
+        url: 'https://docs.example.com/fable',
+        encrypted_content: '',
+        page_age: '2026-10-01',
+      },
+    ])
+    const delta = events[6]!.delta as Obj
+    assert.equal(delta.stop_reason, 'end_turn')
+    assert.deepEqual((events[6]!.usage as Obj).server_tool_use, {
+      web_search_requests: 1,
+      web_fetch_requests: 0,
+    })
+  })
+
+  test('a failed search returns the protocol error block, not an empty result or a 400', async () => {
+    const webSearch: BoundWebSearch = async () => {
+      throw new WebSearchError('too_many_requests', 'web search rate limited')
+    }
+    const r = await createOpenAIChatGoFetch(
+      (async () => new Response('')) as unknown as typeof fetch,
+      {
+        webSearch,
+      },
+    )('x', {
+      method: 'POST',
+      headers: { 'x-api-key': 'GO-KEY' },
+      body: JSON.stringify(webSearchBody()),
+    })
+    assert.equal(r.status, 200)
+    const result = parseAnthropicSse(await r.text()).find(
+      (e) =>
+        e.type === 'content_block_start' &&
+        (e.content_block as Obj).type === 'web_search_tool_result',
+    )!.content_block as Obj
+    assert.deepEqual(result.content, {
+      type: 'web_search_tool_result_error',
+      error_code: 'too_many_requests',
+      error_message: 'web search rate limited',
+    })
+  })
+
+  test('without an executor the side request reports search unavailable, without a model call', async () => {
+    let upstreamCalled = false
+    const fetchImpl = (async () => {
+      upstreamCalled = true
+      return new Response('')
+    }) as unknown as typeof fetch
+    const r = await createOpenAIChatGoFetch(fetchImpl)('x', {
+      method: 'POST',
+      headers: { 'x-api-key': 'GO-KEY' },
+      body: JSON.stringify(webSearchBody()),
+    })
+    assert.equal(r.status, 200)
+    const result = parseAnthropicSse(await r.text()).find(
+      (e) =>
+        e.type === 'content_block_start' &&
+        (e.content_block as Obj).type === 'web_search_tool_result',
+    )!.content_block as Obj
+    assert.deepEqual(result.content, {
+      type: 'web_search_tool_result_error',
+      error_code: 'unavailable',
+      error_message: 'web search is not configured for this route',
+    })
+    assert.equal(upstreamCalled, false)
+  })
+
+  test('mixed requests without an executor still strip the tool and reach the model', async () => {
+    let seen: Obj | undefined
+    const fetchImpl = (async (_url: string, init: RequestInit) => {
+      seen = JSON.parse(String(init.body))
+      return new Response(
+        sse([
+          { choices: [{ index: 0, delta: { content: 'no search here' }, finish_reason: 'stop' }] },
+          usageChunk,
+          '[DONE]',
+        ]),
+        { status: 200 },
+      )
+    }) as unknown as typeof fetch
+    const r = await createOpenAIChatGoFetch(fetchImpl)('x', {
+      method: 'POST',
+      headers: { 'x-api-key': 'GO-KEY' },
+      body: JSON.stringify(
+        webSearchBody({
+          tools: [
+            { type: 'web_search_20250305', name: 'web_search' },
+            { name: 'Read', input_schema: { type: 'object' } },
+          ],
+          messages: [{ role: 'user', content: 'read this file' }],
+        }),
+      ),
+    })
+    assert.equal(r.status, 200)
+    assert.deepEqual(seen!.tools, [
+      { type: 'function', function: { name: 'Read', parameters: { type: 'object' } } },
+    ])
+    assert.match(await r.text(), /no search here/)
   })
 })

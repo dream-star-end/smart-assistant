@@ -1,11 +1,23 @@
 import { randomUUID } from 'node:crypto'
 
+import {
+  type GoBridgeOptions,
+  WebSearchError,
+  isWebSearchServerTool,
+  webSearchResponse,
+  webSearchToolSpec,
+} from './webSearchServerTool.js'
+
 /**
  * OCV5-425 phase 2: Anthropic Messages ↔ OpenAI chat completions for the OpenCode Go models that
  * only answer on /chat/completions (GLM, Kimi K2.x, MiMo, LongCat, Hy, Step). Same shape as
  * geminiGoBridge: convert the request, stream the answer back as Anthropic SSE, and map usage so
  * the proxy meters it. Reasoning is billed (completion_tokens include it) but not surfaced as
- * Anthropic thinking: there is no signature to give it. Server web search is not offered.
+ * Anthropic thinking: there is no signature to give it.
+ *
+ * Server-side web search is not offered by the upstream. The official Claude Code WebSearch side
+ * request is fulfilled by the platform search proxies (see webSearchServerTool.ts); a mixed
+ * request keeps only its function tools so it reaches the model instead of failing with 400.
  */
 
 export type Obj = Record<string, unknown>
@@ -180,10 +192,14 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
   const effort = chatReasoningEffort(body.output_config)
   if (effort) out.reasoning_effort = effort
   const tools = Array.isArray(body.tools) ? body.tools.map(obj) : []
-  if (tools.some(isServerTool))
+  const searchNames = new Set(
+    tools.filter(isWebSearchServerTool).map((t) => (typeof t.name === 'string' ? t.name : '')),
+  )
+  const functionTools = tools.filter((t) => !isWebSearchServerTool(t))
+  if (functionTools.some(isServerTool))
     throw new Error('OpenCode Go chat models do not offer server tools (web search)')
-  if (tools.length) {
-    out.tools = tools.map((t) => {
+  if (functionTools.length) {
+    out.tools = functionTools.map((t) => {
       if (typeof t.name !== 'string' || t.input_schema === undefined)
         throw new Error('unsupported OpenCode Go tool declaration')
       return {
@@ -196,8 +212,13 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
       }
     })
     const choice = body.tool_choice === undefined ? { type: 'auto' } : obj(body.tool_choice)
-    out.tool_choice =
-      choice.type === 'auto'
+    // A force-search choice points at the stripped server tool; the remaining
+    // function tools decide for themselves.
+    const forcedSearch =
+      choice.type === 'tool' && typeof choice.name === 'string' && searchNames.has(choice.name)
+    out.tool_choice = forcedSearch
+      ? 'auto'
+      : choice.type === 'auto'
         ? 'auto'
         : choice.type === 'none'
           ? 'none'
@@ -406,13 +427,34 @@ export async function* chatToAnthropicEvents(
   }
 }
 
-export function createOpenAIChatGoFetch(fetchImpl: typeof fetch): typeof fetch {
+export function createOpenAIChatGoFetch(
+  fetchImpl: typeof fetch,
+  options?: GoBridgeOptions,
+): typeof fetch {
   return async (_input, init) => {
     let body: Obj
     let model: string
     try {
       if (typeof init?.body !== 'string') throw new Error('OpenCode Go bridge requires a JSON body')
       const anthropic = obj(JSON.parse(init.body))
+      if (typeof anthropic.model !== 'string' || !anthropic.model)
+        throw new Error('OpenCode Go requires a model')
+      const search = webSearchToolSpec(anthropic)
+      if (search) {
+        options?.onLocalFulfillment?.()
+        return webSearchResponse({
+          model: anthropic.model,
+          spec: search,
+          // No executor = this route has no platform search. Say so explicitly
+          // instead of spending a model call whose answer the WebSearch adapter
+          // would discard.
+          search:
+            options?.webSearch ??
+            (async () => {
+              throw new WebSearchError('unavailable', 'web search is not configured for this route')
+            }),
+        })
+      }
       body = anthropicToOpenAIChat(anthropic)
       model = body.model as string
     } catch (error) {

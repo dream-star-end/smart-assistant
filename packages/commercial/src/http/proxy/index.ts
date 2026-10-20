@@ -1871,6 +1871,18 @@ export function makeAnthropicProxyHandler(
         uid,
         body,
         session,
+        // Official Claude Code WebSearch sends a side request with the Anthropic
+        // server tool web_search_*. The egress process fulfills it through the
+        // master search proxies using this request's container identity.
+        webSearch: deps.webSearch
+          ? (input, signal) =>
+              deps.webSearch!(input, {
+                authorization: req.headers.authorization,
+                hostUuid: ctx.hostUuid,
+                boundIp: ctx.boundIp,
+                signal,
+              })
+          : undefined,
         // OCV5-482:主上游 session 且声明了回落上游 → core 在主上游拒绝时同请求重试回落上游;
         // 这类路由(含已在回落上游上的)把实际服务的上游记进扣费快照。
         ...(() => {
