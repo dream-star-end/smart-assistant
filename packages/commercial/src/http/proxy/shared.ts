@@ -1757,6 +1757,13 @@ export interface AnthropicProxyDeps {
   rateLimitRedis: RateLimitRedis;
   /** 注入 fetch(测试用)。 */
   fetchImpl?: typeof fetch;
+  /**
+   * Platform executor for Anthropic server-side `web_search_*` tools (official
+   * Claude Code WebSearch side requests) on the OpenCode Go chat/responses
+   * bridges. Omitted (master without egress) → the tool is stripped and the
+   * request still reaches the model instead of failing with 400.
+   */
+  webSearch?: import("./webSearchServerTool.js").WebSearchExecutor;
   /** Optional, off-by-default Box CLI model transport. The proxy retains
    * identity/authority/precheck/finalizer; this component owns only the Box
    * invocation and its independent cross-HTTP account-capacity lease. */

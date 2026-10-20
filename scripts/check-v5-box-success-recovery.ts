@@ -49,6 +49,7 @@ const BEHAVIOR = [
   "[ocv5-520-go-pool-wiring] PASS — ordinary Go uses an enabled pool identity instead of disabled static credentials while request bytes and session headers stay stable",
   "[ocv5-527-step-chat] PASS — stable Step pricing identity selects the current chat upstream for static and catalog routes",
   "[ocv5-530-agy-host-path] PASS — Antigravity launch login shell resolves only the selfhost host wrapper; neighbouring user shims stay off PATH",
+  "[go-websearch-server-tool] PASS — official WebSearch side requests on Go chat/responses bridges are answered from platform search with zero usage and no upstream call; mixed requests keep only function tools",
 ];
 const HOLD_PY = [
   "import os, signal, sys, time",
@@ -809,6 +810,64 @@ async function runWorker(argv: string[]): Promise<void> {
   }
   assert.equal(existsSync(agy.launchHome), false, "AGY_LAUNCH_RESIDUE");
   emit(BEHAVIOR[5]!);
+  // INC-20261020-GO-WEBSEARCH-SERVER-TOOL: official Claude Code sends WebSearch as a
+  // side request carrying the web_search_20250305 server tool. The Go bridges used to
+  // throw (400). Prove the candidate bridges answer it from the injected platform
+  // search, with zero usage and without touching the model upstream (no network).
+  const { anthropicToOpenAIChat, createOpenAIChatGoFetch } = await import(
+    "../packages/commercial/src/http/proxy/openAiChatGoBridge.js");
+  const { anthropicToOpenAIResponses, createOpenAIResponsesGoFetch } = await import(
+    "../packages/commercial/src/http/proxy/openAiResponsesGoBridge.js");
+  const wsQuery = "go websearch release proof";
+  const wsTool = { type: "web_search_20250305", name: "web_search", max_uses: 8 };
+  const wsSide = JSON.stringify({
+    model: "muse-spark-1.3-go", max_tokens: 64, stream: true,
+    messages: [{ role: "user", content: [{ type: "text", text: `Perform a web search for the query: ${wsQuery}` }] }],
+    tools: [wsTool],
+  });
+  const wsBridges = [["chat", createOpenAIChatGoFetch], ["responses", createOpenAIResponsesGoFetch]] as const;
+  for (const [label, create] of wsBridges) {
+    const queries: string[] = [];
+    let local = 0;
+    const noUpstream = (async () => { throw new Error(`WS_UNEXPECTED_UPSTREAM_${label}`); }) as unknown as typeof fetch;
+    const bridged = create(noUpstream, {
+      webSearch: async (spec) => {
+        queries.push(spec.query);
+        return [{ title: "Proof hit", url: "https://example.com/ws-proof", pageAge: null }];
+      },
+      onLocalFulfillment: () => { local += 1; },
+    });
+    const res = await bridged("https://opencode.ai/inference/go/v1/proof", { method: "POST", body: wsSide });
+    assert.equal(res.status, 200, `WS_STATUS_${label}`);
+    const frames = (await res.text()).split("\n\n")
+      .map((chunk) => chunk.split("\n").find((line) => line.startsWith("data: ")))
+      .filter((line): line is string => Boolean(line))
+      .map((line) => JSON.parse(line.slice(6)) as Record<string, any>);
+    assert.deepEqual(queries, [wsQuery], `WS_QUERY_${label}`);
+    assert.equal(local, 1, `WS_LOCAL_FULFILLMENT_${label}`);
+    const blocks = frames.filter((f) => f.type === "content_block_start").map((f) => f.content_block);
+    assert.equal(blocks[0]?.type, "server_tool_use", `WS_SERVER_TOOL_USE_${label}`);
+    assert.equal(blocks[1]?.type, "web_search_tool_result", `WS_RESULT_BLOCK_${label}`);
+    assert.ok(Array.isArray(blocks[1]?.content) && blocks[1].content[0]?.url === "https://example.com/ws-proof",
+      `WS_RESULT_HITS_${label}`);
+    for (const usage of [frames.find((f) => f.type === "message_start")?.message?.usage,
+      frames.find((f) => f.type === "message_delta")?.usage]) {
+      assert.ok(usage, `WS_USAGE_MISSING_${label}`);
+      for (const key of ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]) {
+        assert.equal(usage[key], 0, `WS_NONZERO_USAGE_${label}_${key}`);
+      }
+    }
+  }
+  const wsMixed = {
+    model: "muse-spark-1.3-go", messages: [{ role: "user", content: "search then read" }],
+    tools: [wsTool, { name: "Read", input_schema: { type: "object", properties: {} } }],
+  };
+  for (const [label, convert] of [["chat", anthropicToOpenAIChat], ["responses", anthropicToOpenAIResponses]] as const) {
+    const converted = convert(wsMixed) as { tools?: unknown[] };
+    assert.equal(converted.tools?.length, 1, `WS_MIXED_TOOLS_${label}`);
+    assert.ok(!JSON.stringify(converted.tools).includes("web_search"), `WS_MIXED_SERVER_TOOL_${label}`);
+  }
+  emit(BEHAVIOR[6]!);
 }
 
 function parseFormal(argv: string[]): string {

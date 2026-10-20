@@ -10,6 +10,13 @@ import {
   toolResultText,
   webSearchResultText,
 } from './openAiChatGoBridge.js'
+import {
+  type GoBridgeOptions,
+  WebSearchError,
+  isWebSearchServerTool,
+  webSearchResponse,
+  webSearchToolSpec,
+} from './webSearchServerTool.js'
 
 /**
  * OCV5-425 phase 3: Anthropic Messages ↔ OpenAI Responses for the OpenCode Go models that only
@@ -18,6 +25,9 @@ import {
  * work without replaying reasoning items), text streamed live, function calls emitted as complete
  * tool_use blocks, usage mapped for the proxy meter. Reasoning (summaries and encrypted items) is
  * billed through output_tokens but not surfaced as Anthropic thinking.
+ *
+ * Server-side web search is fulfilled on the proxy like the chat bridge; mixed requests keep only
+ * their function tools and reach the model instead of failing with 400.
  */
 
 export const OPENAI_RESPONSES_GO_ENDPOINT = 'https://opencode.ai/inference/go/v1/responses'
@@ -136,10 +146,14 @@ export function anthropicToOpenAIResponses(body: Obj): Obj {
   const effort = responsesReasoningEffort(body.output_config)
   if (effort) out.reasoning = { effort }
   const tools = Array.isArray(body.tools) ? body.tools.map(obj) : []
-  if (tools.some(isServerTool))
+  const searchNames = new Set(
+    tools.filter(isWebSearchServerTool).map((t) => (typeof t.name === 'string' ? t.name : '')),
+  )
+  const functionTools = tools.filter((t) => !isWebSearchServerTool(t))
+  if (functionTools.some(isServerTool))
     throw new Error('OpenCode Go responses models do not offer server tools (web search)')
-  if (tools.length) {
-    out.tools = tools.map((t) => {
+  if (functionTools.length) {
+    out.tools = functionTools.map((t) => {
       if (typeof t.name !== 'string' || t.input_schema === undefined)
         throw new Error('unsupported OpenCode Go tool declaration')
       return {
@@ -150,8 +164,13 @@ export function anthropicToOpenAIResponses(body: Obj): Obj {
       }
     })
     const choice = body.tool_choice === undefined ? { type: 'auto' } : obj(body.tool_choice)
-    out.tool_choice =
-      choice.type === 'auto'
+    // A force-search choice points at the stripped server tool; the remaining
+    // function tools decide for themselves.
+    const forcedSearch =
+      choice.type === 'tool' && typeof choice.name === 'string' && searchNames.has(choice.name)
+    out.tool_choice = forcedSearch
+      ? 'auto'
+      : choice.type === 'auto'
         ? 'auto'
         : choice.type === 'none'
           ? 'none'
@@ -354,13 +373,35 @@ export async function* responsesToAnthropicEvents(
   }
 }
 
-export function createOpenAIResponsesGoFetch(fetchImpl: typeof fetch): typeof fetch {
+export function createOpenAIResponsesGoFetch(
+  fetchImpl: typeof fetch,
+  options?: GoBridgeOptions,
+): typeof fetch {
   return async (_input, init) => {
     let body: Obj
     let model: string
     try {
       if (typeof init?.body !== 'string') throw new Error('OpenCode Go bridge requires a JSON body')
-      body = anthropicToOpenAIResponses(obj(JSON.parse(init.body)))
+      const anthropic = obj(JSON.parse(init.body))
+      if (typeof anthropic.model !== 'string' || !anthropic.model)
+        throw new Error('OpenCode Go requires a model')
+      const search = webSearchToolSpec(anthropic)
+      if (search) {
+        options?.onLocalFulfillment?.()
+        return webSearchResponse({
+          model: anthropic.model,
+          spec: search,
+          // No executor = this route has no platform search. Say so explicitly
+          // instead of spending a model call whose answer the WebSearch adapter
+          // would discard.
+          search:
+            options?.webSearch ??
+            (async () => {
+              throw new WebSearchError('unavailable', 'web search is not configured for this route')
+            }),
+        })
+      }
+      body = anthropicToOpenAIResponses(anthropic)
       model = body.model as string
     } catch (error) {
       return new Response(

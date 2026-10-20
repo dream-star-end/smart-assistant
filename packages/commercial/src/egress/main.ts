@@ -124,6 +124,7 @@ import {
 import { V3_AGENT_GID, V3_AGENT_UID } from "../agent-sandbox/constants.js";
 import { CostEventSink } from "./costEventSink.js";
 import { makeForwarder } from "./forwarder.js";
+import { makeMasterWebSearch } from "./masterWebSearch.js";
 import { shutdownDurableMetricRollups } from "../admin/durableMetricRollups.js";
 import { computeListenPlan, type SlotHealthBody } from "./listenPlan.js";
 import { startDesktopTlsListener } from "../http/desktopTlsListener.js";
@@ -233,6 +234,9 @@ export async function startEgress(): Promise<void> {
   const controlBaseUrl = `http://${controlBind}:${controlPort}`;
   const costSink = new CostEventSink({ controlBaseUrl, secret });
   await costSink.init();
+  // Official Claude Code WebSearch side requests on the OpenCode Go bridges are
+  // fulfilled through the master search proxies with the caller's identity.
+  const webSearch = makeMasterWebSearch({ controlBaseUrl, logger: log });
 
   // 静态 key 解析表 —— proxyHandler 与延迟探测器(0105)共用同一份,防两处漂移。
   const staticProviderKeys = staticProviderKeysFromConfig(cfg);
@@ -542,6 +546,7 @@ export async function startEgress(): Promise<void> {
     identity: identityStrategy,
     loadUserModelAuthz,
     rateLimitRedis,
+    webSearch,
     concurrencyLimiter: sharedProxyConcurrency,
     fallbackLimiter: sharedProxyFallback,
     ...(boxProxyConcurrency ? { boxConcurrencyLimiter: boxProxyConcurrency } : {}),

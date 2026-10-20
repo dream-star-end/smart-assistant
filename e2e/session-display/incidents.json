@@ -7763,6 +7763,35 @@
           "assertion": "[ocv5-530-agy-host-path] PASS — Antigravity launch login shell resolves only the selfhost host wrapper; neighbouring user shims stay off PATH"
         }
       ]
+    },
+    {
+      "id": "INC-20261020-GO-WEBSEARCH-SERVER-TOOL",
+      "occurredAt": "2026-10-20",
+      "severity": "P1",
+      "symptom": "Personal uid 3 asked Muse Spark 1.3 Contributor (muse-spark-1.3-go) a question needing a web search. The official Claude Code WebSearch side request carries the Anthropic server tool web_search_20250305; the OpenCode Go responses bridge threw on any server tool, so the egress answered 400 'The upstream provider rejected this request' in 0.76ms (request 6e99c269ee1099e16d7a0a7c833a4d84, 2026-10-20 15:32:15Z). The chat bridge had the same throw, so every Go chat/responses model failed WebSearch under the official harness.",
+      "rootFixCommit": "4695704c",
+      "regressions": [
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/openAiChatGoBridge.test.ts",
+          "assertion": "fulfills the WebSearch side request with platform results instead of a 400"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/openAiResponsesGoBridge.test.ts",
+          "assertion": "fulfills the WebSearch side request with platform results instead of a 400"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/egress/masterWebSearch.test.ts",
+          "assertion": "MiniMax failure falls back to Grok; both failing surfaces the last error"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-success-recovery.ts",
+          "assertion": "[go-websearch-server-tool] PASS — official WebSearch side requests on Go chat/responses bridges are answered from platform search with zero usage and no upstream call; mixed requests keep only function tools"
+        }
+      ]
     }
   ]
 }
