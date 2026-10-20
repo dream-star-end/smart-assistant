@@ -349,6 +349,7 @@ $lp_views
 INSERT INTO train(id,resource,target_sha,status,owner,log_path,created_at,updated_at)
 VALUES('$id','$RESOURCE','$tip','planned','$ACTOR','$(lease_q "$logf")','$now','$now');
 $lp_bind
+$(lease_inflight_bind_sql "$id" "$tip" "$ACTOR")
 $(lease_event_sql "$id" train-planned "$ACTOR" "target=$tip rides=$pending")
 COMMIT;
 SQL
@@ -362,6 +363,11 @@ SQL
   # 锁:transient unit 无法继承 fd 8 → 这里先释放,让执行器自己走脚本原生 flock 路径;
   # 双发防线仍是 train 唯一开放索引 + 本 tick 已确认锁空。
   local pid
+  local deploy_args=(--deploy --lease-train="$id" --target-sha="$tip" --allow-dirty --platform-from-head)
+  if lease_inflight_train_allowed "$id" "$tip"; then
+    deploy_args+=(--allow-inflight)
+    wlog "train $id --allow-inflight: explicit exact-source authorization; user turns may be interrupted"
+  fi
   if [[ -n "${INVOCATION_ID:-}" ]] && command -v systemd-run >/dev/null 2>&1; then
     exec 8>&-
     local unit="oc-v5-lease-train-${id#tr-}"
@@ -370,7 +376,7 @@ SQL
          --setenv=OC_V5_LEASE_TRAIN_ID="$id" --setenv=OC_V5_LEASE_DB="$LEASE_DB" \
          --setenv=HOME=/root --setenv=PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
          --property=StandardOutput="file:$logf" --property=StandardError="file:$logf" \
-         "$DEPLOY_BIN" --deploy --lease-train="$id" --target-sha="$tip" --allow-dirty --platform-from-head; then
+         "$DEPLOY_BIN" "${deploy_args[@]}"; then
       finish_train "$id" failed "systemd-run 启动失败" '{}'
       return 0
     fi
@@ -382,7 +388,7 @@ SQL
     [[ -n "$pid" && "$pid" != 0 ]] || { wlog "拿不到 $unit MainPID(可能已秒退),交给对账"; pid=0; }
   else
     OC_V5_SELFHOST_DEPLOY_LOCK_HELD=1 OC_V5_LEASE_TRAIN_ID="$id" OC_V5_LEASE_DB="$LEASE_DB" \
-      setsid nohup "$DEPLOY_BIN" --deploy --lease-train="$id" --target-sha="$tip" --allow-dirty --platform-from-head \
+      setsid nohup "$DEPLOY_BIN" "${deploy_args[@]}" \
         >"$logf" 2>&1 </dev/null 8>&8 211>&- 212>&- &
     pid=$!
     exec 8>&-   # worker 放手;锁随执行器进程生命周期

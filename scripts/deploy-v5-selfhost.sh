@@ -123,7 +123,7 @@ MASTER_RELEASE_LIB="$SCRIPT_DIR/v5-selfhost-master-release-lib.sh"
 
 DRY=0
 FORCE_ENV=0
-ALLOW_DIRTY=0
+ALLOW_DIRTY=0; ALLOW_INFLIGHT=0
 PLATFORM_FROM_HEAD=0
 FORCE_NPM_CI=0
 MODE=""
@@ -454,7 +454,6 @@ maybe_acquire_selfhost_deploy_lock() {
       ;;
   esac
 }
-
 usage() {
   cat <<'EOF'
 用法: scripts/deploy-v5-selfhost.sh --preflight|--bootstrap|--deploy|--build-master-only|--cutover|--smoke|--status [--dry-run] [--force-env] [--allow-dirty] [--platform-from-head] [--force-npm-ci] [--release=PATH]
@@ -472,6 +471,7 @@ usage() {
   --status              打印当前状态(含 live / .prev-release / 四元组)
   --dry-run             与上述组合:打印将执行的命令,不改任何东西
   --release=PATH        仅配合 --cutover:指定候选 rel-* 绝对路径(默认=sourceCommit 等于 HEAD 的最新完整 release)
+  --allow-inflight      仅selfhost正式列车的精确源授权:跳过600s空闲检查,接受在途回合中断;其余门不变
   --allow-dirty         仅配合 --deploy:工作区有未提交改动时仍部署(默认拒绝,防脏 platform 进全员容器)
   --platform-from-head  仅配合 --deploy/--bootstrap:平台 bundle 从 git archive 取已提交的 platform-runtime(默认仍拷工作树)
   --resume-release-policy --lease-train=ID --target-sha=SHA
@@ -509,11 +509,11 @@ usage() {
   scripts/deploy-v5-selfhost.sh --smoke
 EOF
 }
-
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY=1 ;;
     --force-env) FORCE_ENV=1 ;;
+    --allow-inflight) ALLOW_INFLIGHT=1 ;;
     --allow-dirty) ALLOW_DIRTY=1 ;;
     --platform-from-head) PLATFORM_FROM_HEAD=1 ;;
     --force-npm-ci) FORCE_NPM_CI=1 ;;
@@ -1509,13 +1509,11 @@ source_commit() {
 # 入口要求捕获的 HEAD 与已验证 train target 相同；之后三面传同一 immutable SHA。
 # 只有 platform-from-head 路径可跨共享 HEAD 前进继续切流，工作树 platform 仍走旧 strict 门。
 lease_train_enabled() { [[ -n "$LEASE_TRAIN_ID" || -f "$LEASE_LIB" ]]; }
-
 lease_train_load_lib() {
   [[ -f "$LEASE_LIB" ]] || return 1
   # shellcheck disable=SC1090
   source "$LEASE_LIB"
 }
-
 # 进入 --deploy:worker 列车 → CAS planned/building→building 并记 pid;人工直跑 → 插 manual train(有 open train 则拒)。
 lease_train_begin() {
   lease_train_load_lib || { [[ -z "$LEASE_TRAIN_ID" ]] && return 0; die "缺 $LEASE_LIB,无法校验 --lease-train"; }
@@ -1558,7 +1556,6 @@ SQL
   fi
   LEASE_TRAIN_ACTIVE=1
 }
-
 runtime_caps_from_metadata() {
   local sha="$1"
   git -C "$REPO_ROOT" show "${sha}:deploy/v5/release-metadata.json" \
@@ -2288,6 +2285,7 @@ $dirty
   local policy_bind_rc=0
   release_policy_bind_official_train_request "$sha" || policy_bind_rc=$?
   [[ "$policy_bind_rc" == 0 ]] || exit "$policy_bind_rc"
+  cutover_adopt_inflight_request "$sha" || exit "$?"
   [[ -f "$V5_ENV" ]] || die "缺 $V5_ENV,这不是更新路径。补救: 首次安装走 --bootstrap;本机已有实例则检查 env 是否被挪走。"
   ensure_selfhost_env_keys
   docker network inspect openclaude-v5-net >/dev/null 2>&1 \
@@ -2300,8 +2298,10 @@ $dirty
   install_aux_units
   refresh_ccb_proxy_path
   ensure_model_authority
-  sha="$(source_commit)"
-  [[ "${RELEASE_POLICY_CLAIMED:-0}" == 1 ]] || lease_train_begin "$sha"
+  if [[ "${LEASE_TRAIN_ACTIVE:-0}" != 1 ]]; then
+    sha="$(source_commit)"
+    lease_train_begin "$sha"
+  fi
   assert_fix_trailers "$sha"
   assert_p0_web_overlay_contained "$sha"
   log "── source=$sha 构建三面制品(失败则 live 不动) ──"
