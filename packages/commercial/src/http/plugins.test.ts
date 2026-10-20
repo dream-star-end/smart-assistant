@@ -1,3 +1,4 @@
+import { LiteratureError } from '../plugins/literatureDb/errors.js'
 import assert from 'node:assert/strict'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
@@ -658,6 +659,89 @@ describe('Plugin management HTTP dispatcher', () => {
       ),
       (error: unknown) =>
         error instanceof HttpError && error.status === 429 && error.code === 'CAPACITY_EXCEEDED',
+    )
+  })
+  test('literature PDF artifact download enforces user ownership, no-store headers, and status codes', async () => {
+    const validId = 'litpdf-1234567890abcdef1234567890abcdef'
+    const pdfBytes = Buffer.from('%PDF-1.4\n1 0 obj<<>>endobj\n%%EOF\n')
+    const store = {
+      read: (uid: number, id: string) => {
+        if (uid === 42 && id === validId) {
+          return {
+            artifactId: validId,
+            filename: '深度学习研究_2026.pdf',
+            mimeType: 'application/pdf' as const,
+            bytes: pdfBytes.length,
+            data: pdfBytes,
+          }
+        }
+        return null
+      },
+    }
+    const res = response()
+    await dispatchPluginsRoute(
+      await request('GET', `/api/plugins/literature-db/artifacts/${validId}`),
+      res,
+      {} as any,
+      deps({ literatureArtifacts: store }),
+    )
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.headers.get('content-type'), 'application/pdf')
+    assert.equal(res.headers.get('cache-control'), 'no-store, private')
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff')
+    assert.match(res.headers.get('content-disposition') ?? '', /attachment; filename=/)
+    assert.deepEqual(res.bytes, pdfBytes)
+
+    await assert.rejects(
+      dispatchPluginsRoute(
+        await request('POST', `/api/plugins/literature-db/artifacts/${validId}`),
+        response(),
+        {} as any,
+        deps({ literatureArtifacts: store }),
+      ),
+      (e: unknown) => e instanceof HttpError && e.status === 405,
+    )
+    await assert.rejects(
+      dispatchPluginsRoute(
+        await request('GET', '/api/plugins/literature-db/artifacts/bad_id!'),
+        response(),
+        {} as any,
+        deps({ literatureArtifacts: store }),
+      ),
+      (e: unknown) => e instanceof HttpError && e.status === 400,
+    )
+    await assert.rejects(
+      dispatchPluginsRoute(
+        await request('GET', `/api/plugins/literature-db/artifacts/${validId}`),
+        response(),
+        {} as any,
+        deps(),
+      ),
+      (e: unknown) => e instanceof HttpError && e.status === 503,
+    )
+    await assert.rejects(
+      dispatchPluginsRoute(
+        await request('GET', '/api/plugins/literature-db/artifacts/litpdf-ffffffffffffffffffffffffffffffff'),
+        response(),
+        {} as any,
+        deps({ literatureArtifacts: store }),
+      ),
+      (e: unknown) => e instanceof HttpError && e.status === 404,
+    )
+    await assert.rejects(
+      dispatchPluginsRoute(
+        await request('GET', `/api/plugins/literature-db/artifacts/${validId}`),
+        response(),
+        {} as any,
+        deps({
+          literatureArtifacts: {
+            read: () => {
+              throw new LiteratureError('CAPACITY')
+            },
+          },
+        }),
+      ),
+      (e: unknown) => e instanceof HttpError && e.status === 429,
     )
   })
 })

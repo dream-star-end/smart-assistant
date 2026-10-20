@@ -15,12 +15,17 @@ import { buildWriteSummary } from '../connectors/service.js'
 import { ConnectorSpecError } from '../connectors/spec/types.js'
 import { getPool } from '../db/index.js'
 import { tx } from '../db/queries.js'
-import { type PluginLeaseRedis, acquirePluginAccountLease } from './accountLease.js'
+import { PluginAccountLeaseError, type PluginLeaseRedis, acquirePluginAccountLease } from './accountLease.js'
 import {
+  LITERATURE_SESSION_MAX_MS,
   PluginAccountError,
   type PluginAccountRow,
   assertRuntimePluginInstallEntitlement,
+  bindManagedBrowserPluginAccount,
   commitPluginAccountState,
+  decryptLiteratureHttpAccountCredentials,
+  decryptLiteratureHttpAccountEnvelope,
+  decryptLiteratureHttpAccountInstanceId,
   decryptPluginAccountEnvelope,
   fencePluginAccountInvocation,
   getPluginAccount,
@@ -28,7 +33,19 @@ import {
   revokePluginAccountFenced,
 } from './accounts.js'
 import { ManagedBrowserRuntime } from './browserRuntime.js'
-import { RuntimePluginContractError, validateRuntimePluginJson } from './contracts.js'
+import {
+  RuntimePluginContractError,
+  coerceIntegerStringParams,
+  validateRuntimePluginJson,
+} from './contracts.js'
+import { type JieyouAccountState, parseJieyouAccountState } from './literatureDb/accountState.js'
+import { isLiteratureHttpIdentity } from './literatureDb/builtinContract.js'
+import type { LiteratureCredentials } from './literatureDb/credentials.js'
+import { LiteratureError } from './literatureDb/errors.js'
+import type {
+  LiteratureHttpExecuteOutput,
+  LiteratureHttpReadExecutor,
+} from './literatureDb/httpExecutor.js'
 import { KNOWLEDGE_PLANET_PLUGIN_SLUG } from './knowledgePlanetContract.js'
 import {
   type KnowledgePlanetMediaDeps,
@@ -317,6 +334,13 @@ export class PluginRuntimeFacade {
        * catalog（Agent 可调用目录）隐藏已停用插件。管理视图（management）不隐藏：用户要能看到并重新打开。
        */
       pluginEnablement?: PluginEnablement
+      literatureHttp?: LiteratureHttpReadExecutor
+      literatureRelogin?: (input: {
+        userId: number
+        accountId: string
+        credentials: LiteratureCredentials
+        signal: AbortSignal
+      }) => Promise<{ storageState: JieyouAccountState; verifiedAt: number }>
     } = {},
   ) {
     this.pool = opts.pool ?? getPool()
@@ -327,6 +351,14 @@ export class PluginRuntimeFacade {
         expectedOwnerUid: 0,
         ...(opts.resolver ? { resolver: opts.resolver } : {}),
       })
+  }
+
+  private supportsManagedRuntime(
+    verified: Extract<VerifiedRuntimePluginContract, { pluginType: 'managed-browser' }>,
+  ): boolean {
+    if (isLiteratureHttpIdentity(verified)) return Boolean(this.opts.literatureHttp)
+    if (verified.contract.runtime.transport !== undefined) return false
+    return this.browser.supportsContract(verified.contract)
   }
 
   private async loadManagedTarget(
@@ -350,7 +382,7 @@ export class PluginRuntimeFacade {
       throw new PluginRuntimeFacadeError('TARGET_NOT_FOUND', 'Plugin account subtype mismatch')
     if ((await this.opts.pluginEnablement?.disabledSet(userId))?.has(verified.slug))
       throw new PluginRuntimeFacadeError('PLUGIN_DISABLED', `Plugin ${verified.slug} is disabled by the user`)
-    if (!this.browser.supportsContract(verified.contract))
+    if (!this.supportsManagedRuntime(verified))
       throw new PluginRuntimeFacadeError(
         'RUNTIME_UNAVAILABLE',
         'managed-browser Plugin runtime unavailable',
@@ -445,7 +477,12 @@ export class PluginRuntimeFacade {
         verified.artifactHash !== candidate.account_artifact_hash ||
         verified.execContractHash !== candidate.account_exec_contract_hash ||
         verified.contract.account.contractVersion !== candidate.auth_contract_version ||
-        !this.browser.supportsContract(verified.contract)
+        !this.supportsManagedRuntime(verified)
+      )
+        return null
+      if (
+        isLiteratureHttpIdentity(verified) &&
+        (await this.opts.pluginEnablement?.disabledSet(userId))?.has(verified.slug)
       )
         return null
       return 'managed-browser'
@@ -491,7 +528,7 @@ export class PluginRuntimeFacade {
     for (const row of rows) {
       const item = verified.get(Number(row.id))
       if (!item || item.pluginType !== row.plugin_type) continue
-      if (item.pluginType === 'managed-browser' && !this.browser.supportsContract(item.contract))
+      if (item.pluginType === 'managed-browser' && !this.supportsManagedRuntime(item))
         continue
       out.push({
         versionId: row.id,
@@ -569,7 +606,7 @@ export class PluginRuntimeFacade {
       [...verified.values()]
         .filter(
           (item) =>
-            item.pluginType !== 'managed-browser' || this.browser.supportsContract(item.contract),
+            item.pluginType !== 'managed-browser' || this.supportsManagedRuntime(item),
         )
         .map((item) => String(item.versionId)),
     )
@@ -672,6 +709,7 @@ export class PluginRuntimeFacade {
 
   async list(userId: number): Promise<RuntimePluginTargetEntry[]> {
     const catalog = await this.catalog(userId)
+    const enabledCatalogVersionIds = new Set(catalog.map((item) => item.versionId))
     const localTargets: RuntimePluginTargetEntry[] = catalog
       .filter((item) => item.pluginType === 'sandboxed-local')
       .map((item) => ({
@@ -727,7 +765,8 @@ export class PluginRuntimeFacade {
       if (
         !item ||
         item.pluginType !== 'managed-browser' ||
-        !this.browser.supportsContract(item.contract)
+        !this.supportsManagedRuntime(item) ||
+        (isLiteratureHttpIdentity(item) && !enabledCatalogVersionIds.has(row.connector_version_id))
       )
         continue
       const writeControl = writeControlFor(row.provider, item.contract.actions, row)
@@ -1941,9 +1980,12 @@ export class PluginRuntimeFacade {
       this.pool,
       { env: this.opts.env },
     )
-    if (initialVerified.pluginType !== 'managed-browser')
+    if (initialVerified.pluginType !== 'managed-browser' || initialVerified.slug !== initialRow.provider)
       throw new PluginRuntimeFacadeError('TARGET_NOT_FOUND', 'Plugin account subtype mismatch')
-    if (!this.browser.supportsContract(initialVerified.contract))
+    if (isLiteratureHttpIdentity(initialVerified)) {
+      return this.callLiteratureHttpRead(input, initialRow, initialVerified)
+    }
+    if (!this.supportsManagedRuntime(initialVerified))
       throw new PluginRuntimeFacadeError(
         'RUNTIME_UNAVAILABLE',
         'managed-browser Plugin runtime unavailable',
@@ -2031,6 +2073,291 @@ export class PluginRuntimeFacade {
       })
       // The DB CAS above is the success commit point. No fallible gate follows it.
       return executed.result
+    } finally {
+      await lease.release()
+    }
+  }
+
+  private async callLiteratureHttpRead(
+    input: {
+      userId: number
+      targetId: string
+      actionId: string
+      params: Record<string, unknown>
+    },
+    initialRow: PluginAccountRow,
+    initialVerified: Extract<VerifiedRuntimePluginContract, { pluginType: 'managed-browser' }>,
+  ): Promise<unknown> {
+    if ((await this.opts.pluginEnablement?.disabledSet(input.userId))?.has(initialVerified.slug))
+      throw new PluginRuntimeFacadeError(
+        'PLUGIN_DISABLED',
+        `Plugin ${initialVerified.slug} is disabled by the user`,
+      )
+    if (!this.opts.literatureHttp || !this.supportsManagedRuntime(initialVerified))
+      throw new PluginRuntimeFacadeError(
+        'RUNTIME_UNAVAILABLE',
+        'managed-browser Plugin runtime unavailable',
+      )
+    const action = initialVerified.contract.actions.find((item) => item.id === input.actionId)
+    if (!action) throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin action not found')
+    if (action.effect !== 'read')
+      throw new PluginRuntimeFacadeError(
+        'WRITE_REQUIRES_CONFIRMATION',
+        'Plugin writes require an approved confirmation',
+      )
+    const coercedParams = coerceIntegerStringParams(action.params, input.params) as Record<
+      string,
+      unknown
+    >
+    validateRuntimePluginJson(action.params, coercedParams, 'params')
+
+    const lease = await acquirePluginAccountLease(this.opts.redis, input.targetId, {
+      hardTimeoutMs: action.timeoutSeconds * 1000,
+    })
+    try {
+      const verified = await loadVerifiedRuntimePluginContract(
+        Number(initialRow.connector_version_id),
+        this.pool,
+        { env: this.opts.env },
+      )
+      if (
+        verified.pluginType !== 'managed-browser' ||
+        verified.artifactHash !== initialVerified.artifactHash ||
+        verified.execContractHash !== initialVerified.execContractHash ||
+        !isLiteratureHttpIdentity(verified) ||
+        !this.supportsManagedRuntime(verified)
+      )
+        throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin contract changed before invoke')
+
+      let fencedRow = await fencePluginAccountInvocation({
+        connectionId: input.targetId,
+        userId: input.userId,
+        expectedRevision: initialRow.revision,
+        verified,
+        runner: this.pool,
+      })
+
+      const tryAutoRelogin = async () => {
+        const accountInstanceId = decryptLiteratureHttpAccountInstanceId(
+          fencedRow,
+          verified.contract,
+          this.opts.env,
+        )
+        const credentials = decryptLiteratureHttpAccountCredentials(
+          fencedRow,
+          verified.contract,
+          this.opts.env,
+        )
+        if (!credentials || !this.opts.literatureRelogin) {
+          await lease.assertHeld()
+          await markPluginAccountRelinkRequiredFenced({
+            row: fencedRow,
+            verified,
+            runner: this.pool,
+          })
+          throw new PluginRuntimeFacadeError('RELINK_REQUIRED', 'Plugin account login has expired')
+        }
+        let relogin: { storageState: JieyouAccountState; verifiedAt: number }
+        try {
+          relogin = await this.opts.literatureRelogin({
+            userId: input.userId,
+            accountId: input.targetId,
+            credentials,
+            signal: lease.signal,
+          })
+        } catch (err) {
+          if (lease.signal.aborted) throw err
+          await lease.assertHeld()
+          await markPluginAccountRelinkRequiredFenced({
+            row: fencedRow,
+            verified,
+            runner: this.pool,
+          })
+          throw new PluginRuntimeFacadeError('RELINK_REQUIRED', 'Plugin account login has expired')
+        }
+        await lease.assertHeld()
+        await bindManagedBrowserPluginAccount({
+          userId: input.userId,
+          versionId: verified.versionId,
+          storageState: relogin.storageState,
+          existing: 'refresh-fenced',
+          expectedExistingAccountInstanceId: accountInstanceId,
+          literatureSession: {
+            sessionVerifiedAt: relogin.verifiedAt,
+            sessionExpiresAt: relogin.verifiedAt + LITERATURE_SESSION_MAX_MS,
+          },
+          env: this.opts.env,
+          pool: this.pool,
+        })
+        const refreshedRow = await getPluginAccount(input.targetId, input.userId, this.pool)
+        if (!refreshedRow)
+          throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin account disappeared')
+        fencedRow = await fencePluginAccountInvocation({
+          connectionId: input.targetId,
+          userId: input.userId,
+          expectedRevision: refreshedRow.revision,
+          verified,
+          runner: this.pool,
+        })
+        return decryptLiteratureHttpAccountEnvelope(fencedRow, verified.contract, this.opts.env)
+      }
+
+      let envelope: ReturnType<typeof decryptLiteratureHttpAccountEnvelope>
+      let reloginUsed = false
+      try {
+        envelope = decryptLiteratureHttpAccountEnvelope(fencedRow, verified.contract, this.opts.env)
+      } catch (error) {
+        if (error instanceof PluginAccountError && error.code === 'SESSION_EXPIRED') {
+          reloginUsed = true
+          envelope = await tryAutoRelogin()
+        } else {
+          throw error
+        }
+      }
+
+      const executor = this.opts.literatureHttp
+      const runOnce = async (
+        env: ReturnType<typeof decryptLiteratureHttpAccountEnvelope>,
+      ): Promise<LiteratureHttpExecuteOutput> => {
+        const remainingMs = env.sessionExpiresAt - Date.now()
+        if (remainingMs <= 0) throw new LiteratureError('SESSION_EXPIRED')
+        const combined = new AbortController()
+        let ttlLatched = false
+        const timer = setTimeout(
+          () => {
+            ttlLatched = true
+            combined.abort(new LiteratureError('SESSION_EXPIRED'))
+          },
+          Math.min(remainingMs, action.timeoutSeconds * 1000),
+        )
+        const onLeaseAbort = () => combined.abort(lease.signal.reason)
+        if (lease.signal.aborted) {
+          clearTimeout(timer)
+          throw lease.signal.reason
+        }
+        lease.signal.addEventListener('abort', onLeaseAbort, { once: true })
+        try {
+          const out = await executor.executeRead({
+            actionId: action.id as 'search' | 'download',
+            params: coercedParams,
+            userId: input.userId,
+            ownerUserId: String(input.userId),
+            accountInstanceId: env.accountInstanceId,
+            storageState: env.storageState,
+            signal: combined.signal,
+          })
+          if (ttlLatched) {
+            out.stagedArtifact?.discard()
+            throw new LiteratureError('SESSION_EXPIRED')
+          }
+          return out
+        } catch (err) {
+          if (ttlLatched) throw new LiteratureError('SESSION_EXPIRED')
+          throw err
+        } finally {
+          clearTimeout(timer)
+          lease.signal.removeEventListener('abort', onLeaseAbort)
+        }
+      }
+
+      let executed: LiteratureHttpExecuteOutput
+      try {
+        executed = await runOnce(envelope)
+      } catch (error) {
+        if (error instanceof LiteratureError && error.code === 'SESSION_EXPIRED') {
+          if (!reloginUsed) {
+            reloginUsed = true
+            envelope = await tryAutoRelogin()
+            try {
+              executed = await runOnce(envelope)
+            } catch (retryErr) {
+              if (retryErr instanceof LiteratureError && retryErr.code === 'SESSION_EXPIRED') {
+                await lease.assertHeld()
+                await markPluginAccountRelinkRequiredFenced({
+                  row: fencedRow,
+                  verified,
+                  runner: this.pool,
+                })
+                throw new PluginRuntimeFacadeError(
+                  'RELINK_REQUIRED',
+                  'Plugin account login has expired',
+                )
+              }
+              if (retryErr instanceof LiteratureError && retryErr.code === 'CAPACITY')
+                throw new PluginRuntimeFacadeError(
+                  'RUNTIME_BUSY',
+                  'Literature artifact capacity is full',
+                )
+              throw retryErr
+            }
+          } else {
+            await lease.assertHeld()
+            await markPluginAccountRelinkRequiredFenced({
+              row: fencedRow,
+              verified,
+              runner: this.pool,
+            })
+            throw new PluginRuntimeFacadeError(
+              'RELINK_REQUIRED',
+              'Plugin account login has expired',
+            )
+          }
+        } else if (error instanceof LiteratureError && error.code === 'CAPACITY') {
+          throw new PluginRuntimeFacadeError(
+            'RUNTIME_BUSY',
+            'Literature artifact capacity is full',
+          )
+        } else {
+          throw error
+        }
+      }
+
+      try {
+        validateRuntimePluginJson(action.result, executed.data, 'result')
+        const nextStorageState = parseJieyouAccountState(executed.storageState)
+        const current = await loadVerifiedRuntimePluginContract(verified.versionId, this.pool, {
+          env: this.opts.env,
+        })
+        if (
+          current.pluginType !== 'managed-browser' ||
+          current.artifactHash !== verified.artifactHash ||
+          current.execContractHash !== verified.execContractHash ||
+          !isLiteratureHttpIdentity(current) ||
+          !this.supportsManagedRuntime(current)
+        )
+          throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin contract changed during invoke')
+        if ((await this.opts.pluginEnablement?.disabledSet(input.userId))?.has(current.slug))
+          throw new PluginRuntimeFacadeError(
+            'PLUGIN_DISABLED',
+            `Plugin ${current.slug} is disabled by the user`,
+          )
+        await assertRuntimePluginInstallEntitlement(input.userId, current, this.pool, {
+          requireCurrent: true,
+        })
+        if (Date.now() >= envelope.sessionExpiresAt) {
+          await lease.assertHeld()
+          await markPluginAccountRelinkRequiredFenced({
+            row: fencedRow,
+            verified: current,
+            runner: this.pool,
+          })
+          throw new PluginRuntimeFacadeError('RELINK_REQUIRED', 'Plugin account login has expired')
+        }
+        await lease.assertHeld()
+        await commitPluginAccountState({
+          row: fencedRow,
+          verified: current,
+          envelope: { ...envelope, storageState: nextStorageState },
+          runner: this.pool,
+          env: this.opts.env,
+        })
+      } catch (postError) {
+        executed.stagedArtifact?.discard()
+        throw postError
+      }
+
+      executed.stagedArtifact?.publish()
+      return executed.data
     } finally {
       await lease.release()
     }

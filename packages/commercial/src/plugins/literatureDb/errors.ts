@@ -20,6 +20,7 @@ export type LiteratureErrorCode =
   | 'LOGIN_FAILED'
   | 'PERSISTENCE_UNCERTAIN'
   | 'CLEANUP_FAILED'
+  | 'SESSION_EXPIRED'
 export class LiteratureError extends Error {
   constructor(readonly code: LiteratureErrorCode) {
     super(code)

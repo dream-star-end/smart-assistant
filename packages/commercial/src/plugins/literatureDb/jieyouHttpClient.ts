@@ -365,6 +365,10 @@ export class JieyouHttpClient {
       }
     })
   }
+  /** Bounded GET on the fixed site using this client's private cookie jar. */
+  getMemberPage(pathOrUrl: string, signal: AbortSignal): Promise<JieyouPrivateResponse> {
+    return this.run(signal, (s) => this.get(literatureUrl(pathOrUrl, LITERATURE_SITE).href, s))
+  }
   /** Private cookie evidence only; it proves neither login success nor account ownership. */
   exportPrivateCookies(): JieyouAccountState {
     if (this.closed) throw new LiteratureError('CANCELLED')

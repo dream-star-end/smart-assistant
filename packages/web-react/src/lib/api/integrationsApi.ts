@@ -83,6 +83,16 @@ export const integrationsApi = {
     jsonOrThrow<LiteratureSetupView>(callWithRefresh(a, (t) => fetch(`/api/plugins/literature-db/setup/${encodeURIComponent(operationId)}`, {
       method: 'DELETE', credentials: 'include', headers: bearerHeaders(t),
     }))),
+  async downloadLiteratureArtifact(a: AuthSession, artifactId: string): Promise<Blob> {
+    const res = await callWithRefresh(a, (t) => fetch(`/api/plugins/literature-db/artifacts/${encodeURIComponent(artifactId)}`, {
+      credentials: 'include', headers: { ...bearerHeaders(t), Accept: 'application/pdf' },
+    }));
+    assertAuthResponseCurrent(res);
+    if (!res.ok) await throwApi(res);
+    const pdf = await res.blob();
+    assertAuthResponseCurrent(res);
+    return pdf;
+  },
 
   // 社区教程 admin 审核 + 教程评测(/api/admin/tutorials/*)已整体迁往 lib/api/admin.ts
   // (adminApi),管理后台页直接 import;用户端无调用点,故此处不再保留代理。
