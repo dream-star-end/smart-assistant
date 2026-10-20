@@ -6,7 +6,7 @@ import type {
   RuntimePluginCatalogEntry,
 } from '../../../lib/connectors'
 import type { AuthSession } from '../../../lib/types'
-import { Alert, Button, Modal, Spinner } from '../../ui'
+import { Alert, Button, Input, Modal, Spinner } from '../../ui'
 
 const pending = (value: LiteratureSetupView | null) =>
   value?.status === 'running' || value?.status === 'manual_required'
@@ -343,22 +343,23 @@ export function LiteratureSetupDialog({
         )}
         {!view && capability?.available && (
           <>
-            <label>
+            <label className="flex flex-col gap-1.5 text-sm font-medium text-fg">
               网站账号
-              <input
+              <Input
                 aria-label="网站账号"
-                className="w-full rounded border bg-transparent p-2"
                 autoComplete="off"
+                autoCapitalize="off"
+                autoCorrect="off"
+                spellCheck={false}
                 maxLength={256}
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
               />
             </label>
-            <label>
+            <label className="flex flex-col gap-1.5 text-sm font-medium text-fg">
               网站密码
-              <input
+              <Input
                 aria-label="网站密码"
-                className="w-full rounded border bg-transparent p-2"
                 type="password"
                 autoComplete="off"
                 maxLength={512}
@@ -379,18 +380,43 @@ export function LiteratureSetupDialog({
         )}
         {view?.status === 'manual_required' && (
           <>
-            <p>自动识别多次未通过，请输入这一次验证码。</p>
+            <p>
+              {view.automaticSubmissions > 0
+                ? '自动识别多次未通过，请输入这一次验证码。'
+                : '请输入下方图形验证码完成登录。'}
+            </p>
             {image && run.current.epoch === epoch && (
-              <img src={image} alt="网站登录验证码" width={188} height={80} />
+              <img
+                src={image}
+                alt="网站登录验证码"
+                width={188}
+                height={80}
+                className="h-20 w-[188px] rounded border border-border-control bg-surface object-contain"
+              />
             )}
-            <input
-              aria-label="验证码"
-              autoComplete="off"
-              maxLength={8}
-              value={answer}
-              disabled={answered}
-              onChange={(e) => setAnswer(e.target.value)}
-            />
+            <label className="flex flex-col gap-1.5 text-sm font-medium text-fg">
+              验证码
+              <Input
+                aria-label="验证码"
+                placeholder="请输入上方验证码"
+                autoComplete="off"
+                autoCapitalize="off"
+                autoCorrect="off"
+                spellCheck={false}
+                inputMode="text"
+                enterKeyHint="done"
+                maxLength={8}
+                value={answer}
+                disabled={answered}
+                onChange={(e) => setAnswer(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !answered && image && answer) {
+                    e.preventDefault()
+                    void submitAnswer()
+                  }
+                }}
+              />
+            </label>
             <Button
               size="sm"
               loading={busy}

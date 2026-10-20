@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { LiteratureArtifactStore } from './artifactStore.js'
 import { WanfangLiteratureHttpExecutor } from './httpExecutor.js'
@@ -216,15 +217,32 @@ export async function reloginJieyouAutomatically(input: {
 }
 
 
+export const DEFAULT_LITERATURE_CAPTCHA_BUNDLE_ROOT =
+  '/opt/openclaude/literature-captcha-bundle'
+
+export function resolveLiteratureCaptchaBundleRoot(
+  env: NodeJS.ProcessEnv = process.env,
+  hasFile: (filePath: string) => boolean = existsSync,
+): string | undefined {
+  const raw = env.OPENCLAUDE_LITERATURE_CAPTCHA_BUNDLE_ROOT
+  if (raw !== undefined) {
+    const trimmed = raw.trim()
+    return trimmed && path.isAbsolute(trimmed) ? trimmed : undefined
+  }
+  const python = path.join(DEFAULT_LITERATURE_CAPTCHA_BUNDLE_ROOT, 'venv/bin/python')
+  const runner = path.join(DEFAULT_LITERATURE_CAPTCHA_BUNDLE_ROOT, 'runner.py')
+  return hasFile(python) && hasFile(runner)
+    ? DEFAULT_LITERATURE_CAPTCHA_BUNDLE_ROOT
+    : undefined
+}
+
 export function createCommercialLiteratureRuntime(input: {
   runtimeChannel: string
   redis: LiteratureSetupOptions['redis']
+  env?: NodeJS.ProcessEnv
 }) {
-  const bundleRoot = process.env.OPENCLAUDE_LITERATURE_CAPTCHA_BUNDLE_ROOT?.trim()
-  const readers =
-    bundleRoot && path.isAbsolute(bundleRoot)
-      ? () => [createLocalCaptchaReader({ bundleRoot })]
-      : () => []
+  const bundleRoot = resolveLiteratureCaptchaBundleRoot(input.env)
+  const readers = bundleRoot ? () => [createLocalCaptchaReader({ bundleRoot })] : () => []
   const literatureArtifacts =
     input.runtimeChannel === 'v5' ? new LiteratureArtifactStore() : undefined
   const literatureHttp =

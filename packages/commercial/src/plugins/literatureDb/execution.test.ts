@@ -33,9 +33,11 @@ import {
   verifyScopedDocumentId,
 } from './httpExecutor.js'
 import {
+  DEFAULT_LITERATURE_CAPTCHA_BUNDLE_ROOT,
   classifyJieyouLoginPost,
   hasJieyouMemberAuthCookies,
   reloginJieyouAutomatically,
+  resolveLiteratureCaptchaBundleRoot,
 } from './jieyouLoginSession.js'
 import { LITERATURE_SITE } from './policy.js'
 
@@ -781,4 +783,40 @@ test('validatePdfStructureSync and LiteratureArtifactStore allow empty-password 
   })()
   assert.equal(validatePdfStructureSync(shadowedHybridPdf), false)
   assert.equal(await validatePdfInIsolatedWorker(shadowedHybridPdf, signal), false)
+})
+
+test('resolveLiteratureCaptchaBundleRoot honors env override and falls back to default bundle root when present', () => {
+  assert.equal(
+    resolveLiteratureCaptchaBundleRoot(
+      { OPENCLAUDE_LITERATURE_CAPTCHA_BUNDLE_ROOT: '/custom/ocr-bundle' },
+      () => false,
+    ),
+    '/custom/ocr-bundle',
+  )
+  assert.equal(
+    resolveLiteratureCaptchaBundleRoot(
+      { OPENCLAUDE_LITERATURE_CAPTCHA_BUNDLE_ROOT: '' },
+      () => true,
+    ),
+    undefined,
+  )
+  assert.equal(
+    resolveLiteratureCaptchaBundleRoot(
+      { OPENCLAUDE_LITERATURE_CAPTCHA_BUNDLE_ROOT: 'relative/path' },
+      () => true,
+    ),
+    undefined,
+  )
+  const expectedFiles = new Set([
+    `${DEFAULT_LITERATURE_CAPTCHA_BUNDLE_ROOT}/venv/bin/python`,
+    `${DEFAULT_LITERATURE_CAPTCHA_BUNDLE_ROOT}/runner.py`,
+  ])
+  assert.equal(
+    resolveLiteratureCaptchaBundleRoot({}, (file) => expectedFiles.has(file)),
+    DEFAULT_LITERATURE_CAPTCHA_BUNDLE_ROOT,
+  )
+  assert.equal(
+    resolveLiteratureCaptchaBundleRoot({}, (file) => file.endsWith('runner.py')),
+    undefined,
+  )
 })
