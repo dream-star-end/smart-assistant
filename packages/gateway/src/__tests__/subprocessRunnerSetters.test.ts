@@ -136,13 +136,13 @@ describe('SubprocessRunner.model getter / setModel', () => {
     assert.equal(resolveExecutionModel('deepseek-v4-pro', undefined), 'deepseek-v4-pro')
     // 已下线的 Claude(marketplace manifest / seed / delegate 里 stale)→ 降级到平台默认,
     // 不会以不可路由的 --model spawn。
-    assert.equal(resolveExecutionModel('claude-opus-4-7', undefined), 'glm-5.3-zai')
-    assert.equal(resolveExecutionModel('claude-sonnet-4-6', 'claude-haiku-4-5'), 'glm-5.3-zai')
+    assert.equal(resolveExecutionModel('claude-opus-4-7', undefined), 'deepseek-v4-flash')
+    assert.equal(resolveExecutionModel('claude-sonnet-4-6', 'claude-haiku-4-5'), 'deepseek-v4-flash')
     // preferred 非法但 fallback 合法 → 用 fallback。
     assert.equal(resolveExecutionModel('claude-opus-4-7', 'MiniMax-M3'), 'MiniMax-M3')
-    // 两者都缺/非法 → 平台默认 glm-5.3-zai。
-    assert.equal(resolveExecutionModel(undefined, null), 'glm-5.3-zai')
-    assert.equal(resolveExecutionModel('some-unknown-model', undefined), 'glm-5.3-zai')
+    // 两者都缺/非法 → 平台默认 deepseek-v4-flash(2026-10-20 起;Z.AI 不可用)。
+    assert.equal(resolveExecutionModel(undefined, null), 'deepseek-v4-flash')
+    assert.equal(resolveExecutionModel('some-unknown-model', undefined), 'deepseek-v4-flash')
     assert.throws(
       () => resolveExecutionModel('some-unknown-model', undefined, undefined, { explicit: true }),
       (err: unknown) => (err as { code?: string })?.code === 'DELEGATE_MODEL_UNKNOWN',
@@ -329,33 +329,32 @@ describe('CCB subagent model env (CLAUDE_CODE_SUBAGENT_MODEL)', () => {
     assert.equal(resolveCcbSubagentModel('grok-build'), DEFAULT_CCB_SUBAGENT_MODEL)
   })
 
-  it('cursor-* parents fall back to the CCB sub-agent default (glm-5.3-zai) — a member of the platform aux set the turn-lease gate admits', () => {
+  it('cursor-* parents fall back to the CCB sub-agent default (deepseek-v4-flash) — a member of the platform aux set the turn-lease gate admits', () => {
     // egress modelAuthorityGate allowed set = {lease.canonicalModel} ∪ PLATFORM_AUX_MODEL_IDS
     // (= [DEFAULT_SECONDARY_UTILITY_MODEL, DEFAULT_CCB_SUBAGENT_MODEL]). The pin
-    // is decoupled from the secondary utility model (deepseek stays the
-    // ANTHROPIC_SMALL_FAST_MODEL); OPENCLAUDE_SECONDARY_MODEL no longer moves it.
-    assert.equal(DEFAULT_CCB_SUBAGENT_MODEL, 'glm-5.3-zai')
+    // has its own constant, decoupled from the secondary utility model: since 2026-10-20 (Z.AI
+    // unavailable) both name deepseek-v4-flash, but OPENCLAUDE_SECONDARY_MODEL still does not move it.
+    assert.equal(DEFAULT_CCB_SUBAGENT_MODEL, 'deepseek-v4-flash')
     assert.equal(DEFAULT_SECONDARY_UTILITY_MODEL, 'deepseek-v4-flash')
-    assert.notEqual(DEFAULT_CCB_SUBAGENT_MODEL, DEFAULT_SECONDARY_UTILITY_MODEL)
     const prevSub = process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL
     const prevSec = process.env.OPENCLAUDE_SECONDARY_MODEL
     delete process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL
     delete process.env.OPENCLAUDE_SECONDARY_MODEL
     try {
-      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'glm-5.3-zai')
+      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'deepseek-v4-flash')
       assert.deepEqual(
         _buildCcbSubagentModelEnv({ sessionModel: 'cursor-fable-5.1-high', routing: 'settings-default' }),
-        { CLAUDE_CODE_SUBAGENT_MODEL: 'glm-5.3-zai' },
+        { CLAUDE_CODE_SUBAGENT_MODEL: 'deepseek-v4-flash' },
       )
       // Secondary-utility override does NOT move the sub-agent pin any more.
       process.env.OPENCLAUDE_SECONDARY_MODEL = 'deepseek-v4-lite'
-      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'glm-5.3-zai')
+      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'deepseek-v4-flash')
       assert.equal(_buildSecondaryUtilityModelEnv().ANTHROPIC_SMALL_FAST_MODEL, 'deepseek-v4-lite')
       // Dedicated ops override for the sub-agent pin still works (must be routable).
-      process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL = 'deepseek-v4-flash'
-      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'deepseek-v4-flash')
+      process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL = 'kimi-k2.7-code'
+      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'kimi-k2.7-code')
       process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL = 'haiku'
-      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'glm-5.3-zai')
+      assert.equal(resolveCcbSubagentModel('cursor-fable-5.1-high'), 'deepseek-v4-flash')
     } finally {
       if (prevSub === undefined) delete process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL
       else process.env.OPENCLAUDE_CCB_SUBAGENT_MODEL = prevSub

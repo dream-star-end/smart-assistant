@@ -26,7 +26,7 @@ import {
 
 const PINNED: Record<string, string> = {
   'office-assistant@1.0.3': '932778674a9a5579f16f3ead635d86db214d6970478d24c9e61157c1038bba1e',
-  'coding-assistant@1.0.4': '48a6b31028c7701ed19a7593777a51935acaf9ea8372bd5fb9fd056f924cc4c9',
+  'coding-assistant@1.0.5': 'c327ca5291da19a59293dd0fbbc6100603fe511c0be556dabb85c295d2a9c5c7',
   'general-assistant@1.0.1': '396cc0515cae85f424992c650625c3dfdf1eec856e24e6888499643a94269c3b',
   'research-assistant@1.0.2': '715567a658045f1d0af2200ea874f23b90799c756d20be82b3dfa6079df7f46d',
 }

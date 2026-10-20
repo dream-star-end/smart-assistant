@@ -20,8 +20,8 @@ const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
     // 须与 entrypoint.ts main / platformDefaults 一致。ark glm-5.3 不再做默认。
     displayName: '全能助手',
     avatarEmoji: '🧠',
-    model: 'glm-5.3-zai',
-    provider: 'zai',
+    model: 'deepseek-v4-flash',
+    provider: 'opencodego',
   },
   {
     id: 'researcher',
@@ -42,8 +42,8 @@ const COMMERCIAL_FALLBACK_AGENTS = Object.freeze([
     id: 'coder',
     displayName: '代码工程师',
     avatarEmoji: '🛠️',
-    model: 'glm-5.3-zai',
-    provider: 'zai',
+    model: 'deepseek-v4-flash',
+    provider: 'opencodego',
   },
   {
     id: 'reviewer',
