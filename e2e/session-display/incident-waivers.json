@@ -337,6 +337,12 @@
       "reason": "OCV5-453: backport of commercial 51790b628. getFreshAntigravityAccessToken loads the KMS key before checking out a pool client, so a key failure can no longer strand the client and hang pool.end(). Latent: selfhost has its KMS key, no user report; found through a commercial CI integ timeout. Unit test red without the fix.",
       "approvedBy": "user 2026-10-16 「开始回挂 cc3-sync 的连接泄漏修复 51790b628……到个人版」，按规范写 Incident: none 豁免（cc3 antigravity 会话）",
       "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "cceebbc1e62545947fd2311e6c78bc0979128fe4",
+      "reason": "OCV5-529: when a turn waiver zeroes a charge inside settleUsageAndLedger, the finalizers now write the settled 0 into request_finalize_journal and the committed log instead of the pre-settle amount. Bookkeeping only: users were already waived (usage 0, no ledger); no charge, wallet or message changes. Found during the cc3 catalog canary on 2026-10-20 (4 rows all-time, all turn_auto_waive).",
+      "approvedBy": "butler 2026-10-20 16:42 「扣费漏洞……单独开一个工单……修复 PR 走正常审查和 CI，两个版本都要查」（cc3-catalog 会话），按规范写 Incident: none 豁免",
+      "expiresAt": "2026-11-19"
     }
   ]
 }
