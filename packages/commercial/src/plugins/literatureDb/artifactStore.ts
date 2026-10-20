@@ -1,4 +1,3 @@
-import zlib from 'node:zlib'
 /**
  * Process-local, owner-scoped in-memory PDF artifact store for Literature Plugin (OCV5-524).
  *
@@ -11,6 +10,7 @@ import zlib from 'node:zlib'
  */
 import { randomUUID } from 'node:crypto'
 import { Worker } from 'node:worker_threads'
+import zlib from 'node:zlib'
 import { LiteratureError, abortable } from './errors.js'
 
 export const LITERATURE_ARTIFACT_MAX_BYTES = 26_214_400
@@ -83,9 +83,7 @@ export function validatePdfStructureSync(data: Buffer): boolean {
 
   const tailLen = Math.min(data.length, 65536)
   const tail = data.subarray(data.length - tailLen).toString('latin1')
-  const startxrefMatches = Array.from(
-    tail.matchAll(/\bstartxref[\r\n\s]+(\d+)[\r\n\s]+%%EOF/g),
-  )
+  const startxrefMatches = Array.from(tail.matchAll(/\bstartxref[\r\n\s]+(\d+)[\r\n\s]+%%EOF/g))
   if (startxrefMatches.length === 0) return false
   const lastMatch = startxrefMatches[startxrefMatches.length - 1]!
   const startXrefOffset = Number.parseInt(lastMatch[1]!, 10)
@@ -103,18 +101,31 @@ export function validatePdfStructureSync(data: Buffer): boolean {
     expectedGen?: number,
   ): { num: number; gen: number; body: string } | null => {
     if (offset <= 0 || offset >= data.length - 10) return null
-    const slice = data.subarray(offset, Math.min(data.length, offset + 262144)).toString('latin1')
-    const m = /^[\r\n\s]*(\d+)\s+(\d+)\s+obj\b([\s\S]*?)\bendobj\b/.exec(slice)
-    if (!m?.[1] || !m[2] || m[3] === undefined) return null
-    const num = Number.parseInt(m[1], 10)
-    const gen = Number.parseInt(m[2], 10)
+    const headSlice = fullStr.slice(offset, Math.min(fullStr.length, offset + 128))
+    const hm = /^[\r\n\s]*(\d+)\s+(\d+)\s+obj\b/.exec(headSlice)
+    if (!hm?.[1] || !hm[2]) return null
+    const num = Number.parseInt(hm[1], 10)
+    const gen = Number.parseInt(hm[2], 10)
     if (expectedNum !== undefined && num !== expectedNum) return null
     if (expectedGen !== undefined && gen !== expectedGen) return null
-    return { num, gen, body: m[3] }
+    const bodyStart = offset + hm[0].length
+    const firstEndobj = fullStr.indexOf('endobj', bodyStart)
+    if (firstEndobj < 0) return null
+    const preEndobj = fullStr.slice(bodyStart, firstEndobj)
+    const streamMatch = /\bstream[\r\n]/.exec(preEndobj)
+    if (streamMatch) {
+      const dictBody = preEndobj.slice(0, streamMatch.index)
+      const endstreamIdx = fullStr.indexOf('endstream', bodyStart + streamMatch.index + 6)
+      if (endstreamIdx < 0) return null
+      const realEndobj = fullStr.indexOf('endobj', endstreamIdx + 9)
+      if (realEndobj < 0) return null
+      return { num, gen, body: dictBody }
+    }
+    return { num, gen, body: preEndobj }
   }
 
-  const objMap = new Map<number, string>()
-  let rootObjNum: number | null = null
+  const objMap = new Map<string, string>()
+  let rootObjKey: string | null = null
 
   const probeAtStartXref = data
     .subarray(startXrefOffset, Math.min(data.length, startXrefOffset + 128))
@@ -155,10 +166,11 @@ export function validatePdfStructureSync(data: Buffer): boolean {
             const off = Number.parseInt(em[1], 10)
             const gen = Number.parseInt(em[2], 10)
             const objId = firstId + k
-            if (!objMap.has(objId)) {
+            const objKey = `${objId}:${gen}`
+            if (!objMap.has(objKey)) {
               const parsed = extractObjAtOffset(off, objId, gen)
               if (!parsed) return false
-              objMap.set(objId, parsed.body)
+              objMap.set(objKey, parsed.body)
             }
             entriesParsed++
           }
@@ -167,9 +179,11 @@ export function validatePdfStructureSync(data: Buffer): boolean {
       }
       if (entriesParsed === 0 && visitedXref.size === 1) return false
 
-      if (rootObjNum === null) {
+      if (rootObjKey === null) {
         const rm = /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(trailerPart)
-        if (rm?.[1]) rootObjNum = Number.parseInt(rm[1], 10)
+        if (rm?.[1] && rm[2]) {
+          rootObjKey = `${Number.parseInt(rm[1], 10)}:${Number.parseInt(rm[2], 10)}`
+        }
       }
       const prevMatch = /\/Prev\s+(\d+)\b/.exec(trailerPart)
       curXrefOff = prevMatch?.[1] ? Number.parseInt(prevMatch[1], 10) : null
@@ -178,17 +192,17 @@ export function validatePdfStructureSync(data: Buffer): boolean {
     const xrefObj = extractObjAtOffset(startXrefOffset)
     if (!xrefObj || !/\/Type\s*\/XRef(?![A-Za-z])/.test(xrefObj.body)) return false
     const rm =
-      /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(xrefObj.body) ??
-      /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(tail)
-    if (!rm?.[1]) return false
-    rootObjNum = Number.parseInt(rm[1], 10)
+      /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(xrefObj.body) ?? /\/Root\s+(\d+)\s+(\d+)\s+R\b/.exec(tail)
+    if (!rm?.[1] || !rm[2]) return false
+    rootObjKey = `${Number.parseInt(rm[1], 10)}:${Number.parseInt(rm[2], 10)}`
 
     const objRe = /\b(\d+)\s+(\d+)\s+obj\b([\s\S]*?)\bendobj\b/g
     let m: RegExpExecArray | null
     while ((m = objRe.exec(fullStr)) !== null) {
       const id = Number.parseInt(m[1]!, 10)
+      const gen = Number.parseInt(m[2]!, 10)
       const body = m[3]!
-      objMap.set(id, body)
+      objMap.set(`${id}:${gen}`, body)
       if (/\/Type\s*\/ObjStm(?![A-Za-z])/.test(body)) {
         const nMatch = /\/N\s+(\d+)\b/.exec(body)
         const firstMatch = /\/First\s+(\d+)\b/.exec(body)
@@ -224,7 +238,7 @@ export function validatePdfStructureSync(data: Buffer): boolean {
                   j + 1 < offsets.length ? first + offsets[j + 1]!.rel : inflated.length
                 if (startByte >= first && endByte >= startByte && endByte <= inflated.length) {
                   objMap.set(
-                    offsets[j]!.id,
+                    `${offsets[j]!.id}:0`,
                     inflated.subarray(startByte, endByte).toString('latin1'),
                   )
                 }
@@ -238,21 +252,21 @@ export function validatePdfStructureSync(data: Buffer): boolean {
     }
   }
 
-  if (rootObjNum === null || !objMap.has(rootObjNum)) return false
-  const catalogBody = objMap.get(rootObjNum)!
+  if (rootObjKey === null || !objMap.has(rootObjKey)) return false
+  const catalogBody = objMap.get(rootObjKey)!
   if (!/\/Type\s*\/Catalog(?![A-Za-z])/.test(catalogBody)) return false
   const pagesRefMatch = /\/Pages\s+(\d+)\s+(\d+)\s+R\b/.exec(catalogBody)
-  if (!pagesRefMatch?.[1]) return false
-  const rootPagesId = Number.parseInt(pagesRefMatch[1], 10)
+  if (!pagesRefMatch?.[1] || !pagesRefMatch[2]) return false
+  const rootPagesKey = `${Number.parseInt(pagesRefMatch[1], 10)}:${Number.parseInt(pagesRefMatch[2], 10)}`
 
-  const visitedNodes = new Set<number>()
-  const queue: number[] = [rootPagesId]
+  const visitedNodes = new Set<string>()
+  const queue: string[] = [rootPagesKey]
   let pageCount = 0
   while (queue.length > 0 && visitedNodes.size < 500) {
-    const curId = queue.shift()!
-    if (visitedNodes.has(curId)) continue
-    visitedNodes.add(curId)
-    const nodeBody = objMap.get(curId)
+    const curKey = queue.shift()!
+    if (visitedNodes.has(curKey)) return false
+    visitedNodes.add(curKey)
+    const nodeBody = objMap.get(curKey)
     if (!nodeBody) return false
     if (/\/Type\s*\/Pages(?![A-Za-z])/.test(nodeBody)) {
       const countMatch = /\/Count\s+([1-9]\d*)\b/.exec(nodeBody)
@@ -263,15 +277,16 @@ export function validatePdfStructureSync(data: Buffer): boolean {
         kidsSource = directKidsMatch[1]
       } else {
         const indirectKidsRef = /\/Kids\s+(\d+)\s+(\d+)\s+R\b/.exec(nodeBody)
-        if (!indirectKidsRef?.[1]) return false
-        const kidsArrayBody = objMap.get(Number.parseInt(indirectKidsRef[1], 10))
+        if (!indirectKidsRef?.[1] || !indirectKidsRef[2]) return false
+        const kidsKey = `${Number.parseInt(indirectKidsRef[1], 10)}:${Number.parseInt(indirectKidsRef[2], 10)}`
+        const kidsArrayBody = objMap.get(kidsKey)
         if (!kidsArrayBody) return false
         kidsSource = kidsArrayBody
       }
       const kidRefs = Array.from(kidsSource.matchAll(/(\d+)\s+(\d+)\s+R\b/g))
       if (kidRefs.length === 0) return false
       for (const kr of kidRefs) {
-        queue.push(Number.parseInt(kr[1]!, 10))
+        queue.push(`${Number.parseInt(kr[1]!, 10)}:${Number.parseInt(kr[2]!, 10)}`)
       }
     } else if (/\/Type\s*\/Page(?![A-Za-z])/.test(nodeBody)) {
       pageCount++
@@ -305,18 +320,31 @@ function check(buf) {
 
   const extractObjAtOffset = (offset, expectedNum, expectedGen) => {
     if (offset <= 0 || offset >= buf.length - 10) return null;
-    const slice = buf.subarray(offset, Math.min(buf.length, offset + 262144)).toString('latin1');
-    const m = /^[\\r\\n\\s]*(\\d+)\\s+(\\d+)\\s+obj\\b([\\s\\S]*?)\\bendobj\\b/.exec(slice);
-    if (!m || !m[1] || !m[2] || m[3] === undefined) return null;
-    const num = Number.parseInt(m[1], 10);
-    const gen = Number.parseInt(m[2], 10);
+    const headSlice = fullStr.slice(offset, Math.min(fullStr.length, offset + 128));
+    const hm = /^[\\r\\n\\s]*(\\d+)\\s+(\\d+)\\s+obj\\b/.exec(headSlice);
+    if (!hm || !hm[1] || !hm[2]) return null;
+    const num = Number.parseInt(hm[1], 10);
+    const gen = Number.parseInt(hm[2], 10);
     if (expectedNum !== undefined && num !== expectedNum) return null;
     if (expectedGen !== undefined && gen !== expectedGen) return null;
-    return { num, gen, body: m[3] };
+    const bodyStart = offset + hm[0].length;
+    const firstEndobj = fullStr.indexOf('endobj', bodyStart);
+    if (firstEndobj < 0) return null;
+    const preEndobj = fullStr.slice(bodyStart, firstEndobj);
+    const streamMatch = /\\bstream[\\r\\n]/.exec(preEndobj);
+    if (streamMatch) {
+      const dictBody = preEndobj.slice(0, streamMatch.index);
+      const endstreamIdx = fullStr.indexOf('endstream', bodyStart + streamMatch.index + 6);
+      if (endstreamIdx < 0) return null;
+      const realEndobj = fullStr.indexOf('endobj', endstreamIdx + 9);
+      if (realEndobj < 0) return null;
+      return { num, gen, body: dictBody };
+    }
+    return { num, gen, body: preEndobj };
   };
 
   const objMap = new Map();
-  let rootObjNum = null;
+  let rootObjKey = null;
 
   const probeAtStartXref = buf.subarray(startXrefOffset, Math.min(buf.length, startXrefOffset + 128)).toString('latin1');
   if (/^[\\r\\n\\s]*xref[\\r\\n\\s]/.test(probeAtStartXref)) {
@@ -350,10 +378,11 @@ function check(buf) {
             const off = Number.parseInt(em[1], 10);
             const gen = Number.parseInt(em[2], 10);
             const objId = firstId + k;
-            if (!objMap.has(objId)) {
+            const objKey = String(objId) + ':' + String(gen);
+            if (!objMap.has(objKey)) {
               const parsed = extractObjAtOffset(off, objId, gen);
               if (!parsed) return false;
-              objMap.set(objId, parsed.body);
+              objMap.set(objKey, parsed.body);
             }
             entriesParsed++;
           }
@@ -362,9 +391,9 @@ function check(buf) {
       }
       if (entriesParsed === 0 && visitedXref.size === 1) return false;
 
-      if (rootObjNum === null) {
+      if (rootObjKey === null) {
         const rm = /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(trailerPart);
-        if (rm) rootObjNum = Number.parseInt(rm[1], 10);
+        if (rm) rootObjKey = String(Number.parseInt(rm[1], 10)) + ':' + String(Number.parseInt(rm[2], 10));
       }
       const prevMatch = /\\/Prev\\s+(\\d+)\\b/.exec(trailerPart);
       curXrefOff = prevMatch ? Number.parseInt(prevMatch[1], 10) : null;
@@ -374,14 +403,15 @@ function check(buf) {
     if (!xrefObj || !/\\/Type\\s*\\/XRef(?![A-Za-z])/.test(xrefObj.body)) return false;
     const rm = /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(xrefObj.body) || /\\/Root\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(tail);
     if (!rm) return false;
-    rootObjNum = Number.parseInt(rm[1], 10);
+    rootObjKey = String(Number.parseInt(rm[1], 10)) + ':' + String(Number.parseInt(rm[2], 10));
 
     const objRe = /\\b(\\d+)\\s+(\\d+)\\s+obj\\b([\\s\\S]*?)\\bendobj\\b/g;
     let m;
     while ((m = objRe.exec(fullStr)) !== null) {
       const id = Number.parseInt(m[1], 10);
+      const gen = Number.parseInt(m[2], 10);
       const body = m[3];
-      objMap.set(id, body);
+      objMap.set(String(id) + ':' + String(gen), body);
       if (/\\/Type\\s*\\/ObjStm(?![A-Za-z])/.test(body)) {
         const nMatch = /\\/N\\s+(\\d+)\\b/.exec(body);
         const firstMatch = /\\/First\\s+(\\d+)\\b/.exec(body);
@@ -408,7 +438,7 @@ function check(buf) {
                 const startByte = first + offsets[j].rel;
                 const endByte = j + 1 < offsets.length ? first + offsets[j + 1].rel : inflated.length;
                 if (startByte >= first && endByte >= startByte && endByte <= inflated.length) {
-                  objMap.set(offsets[j].id, inflated.subarray(startByte, endByte).toString('latin1'));
+                  objMap.set(String(offsets[j].id) + ':0', inflated.subarray(startByte, endByte).toString('latin1'));
                 }
               }
             } catch {}
@@ -418,21 +448,21 @@ function check(buf) {
     }
   }
 
-  if (rootObjNum === null || !objMap.has(rootObjNum)) return false;
-  const catalogBody = objMap.get(rootObjNum);
+  if (rootObjKey === null || !objMap.has(rootObjKey)) return false;
+  const catalogBody = objMap.get(rootObjKey);
   if (!/\\/Type\\s*\\/Catalog(?![A-Za-z])/.test(catalogBody)) return false;
   const pagesRefMatch = /\\/Pages\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(catalogBody);
   if (!pagesRefMatch) return false;
-  const rootPagesId = Number.parseInt(pagesRefMatch[1], 10);
+  const rootPagesKey = String(Number.parseInt(pagesRefMatch[1], 10)) + ':' + String(Number.parseInt(pagesRefMatch[2], 10));
 
   const visitedNodes = new Set();
-  const queue = [rootPagesId];
+  const queue = [rootPagesKey];
   let pageCount = 0;
   while (queue.length > 0 && visitedNodes.size < 500) {
-    const curId = queue.shift();
-    if (visitedNodes.has(curId)) continue;
-    visitedNodes.add(curId);
-    const nodeBody = objMap.get(curId);
+    const curKey = queue.shift();
+    if (visitedNodes.has(curKey)) return false;
+    visitedNodes.add(curKey);
+    const nodeBody = objMap.get(curKey);
     if (!nodeBody) return false;
     if (/\\/Type\\s*\\/Pages(?![A-Za-z])/.test(nodeBody)) {
       const countMatch = /\\/Count\\s+([1-9]\\d*)\\b/.exec(nodeBody);
@@ -444,14 +474,15 @@ function check(buf) {
       } else {
         const indirectKidsRef = /\\/Kids\\s+(\\d+)\\s+(\\d+)\\s+R\\b/.exec(nodeBody);
         if (!indirectKidsRef) return false;
-        const kidsArrayBody = objMap.get(Number.parseInt(indirectKidsRef[1], 10));
+        const kidsKey = String(Number.parseInt(indirectKidsRef[1], 10)) + ':' + String(Number.parseInt(indirectKidsRef[2], 10));
+        const kidsArrayBody = objMap.get(kidsKey);
         if (!kidsArrayBody) return false;
         kidsSource = kidsArrayBody;
       }
       const kidRefs = Array.from(kidsSource.matchAll(/(\\d+)\\s+(\\d+)\\s+R\\b/g));
       if (kidRefs.length === 0) return false;
       for (const kr of kidRefs) {
-        queue.push(Number.parseInt(kr[1], 10));
+        queue.push(String(Number.parseInt(kr[1], 10)) + ':' + String(Number.parseInt(kr[2], 10)));
       }
     } else if (/\\/Type\\s*\\/Page(?![A-Za-z])/.test(nodeBody)) {
       pageCount++;
@@ -666,8 +697,7 @@ export class LiteratureArtifactStore {
    * Synchronous owner-scoped read for GET /api/plugins/literature-db/artifacts/:artifactId.
    */
   read(userId: number, artifactId: string): PublishedLiteratureArtifact | null {
-    if (!Number.isSafeInteger(userId) || userId <= 0 || !OPAQUE_ID_RE.test(artifactId))
-      return null
+    if (!Number.isSafeInteger(userId) || userId <= 0 || !OPAQUE_ID_RE.test(artifactId)) return null
     if (this.permitBusy) throw new LiteratureError('CAPACITY')
     const now = this.now()
     this.sweep(now)

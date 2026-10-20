@@ -13,8 +13,13 @@ import {
 } from './artifactStore.js'
 import { LITERATURE_PLUGIN_CONTRACT } from './builtinContract.js'
 
-const LITERATURE_SEARCH_OUTPUT_SCHEMA = LITERATURE_PLUGIN_CONTRACT.actions.find((a) => a.id === 'search')!.result
-const LITERATURE_DOWNLOAD_OUTPUT_SCHEMA = LITERATURE_PLUGIN_CONTRACT.actions.find((a) => a.id === 'download')!.result
+const LITERATURE_SEARCH_OUTPUT_SCHEMA = LITERATURE_PLUGIN_CONTRACT.actions.find(
+  (a) => a.id === 'search',
+)!.result
+const LITERATURE_DOWNLOAD_OUTPUT_SCHEMA = LITERATURE_PLUGIN_CONTRACT.actions.find(
+  (a) => a.id === 'download',
+)!.result
+import { validateRuntimePluginJson } from '../contracts.js'
 import { LiteratureError } from './errors.js'
 import {
   SPRINGER_WEBVPN_PREFIX,
@@ -33,7 +38,6 @@ import {
   reloginJieyouAutomatically,
 } from './jieyouLoginSession.js'
 import { LITERATURE_SITE } from './policy.js'
-import { validateRuntimePluginJson } from '../contracts.js'
 
 const VALID_PDF = (() => {
   const header = '%PDF-1.4\n'
@@ -130,6 +134,34 @@ test('validatePdfStructureSync and validatePdfInIsolatedWorker accept valid PDFs
   const brokenPagesRefPdf = buildCustomPdf('999 0 R', '<</Type/Pages/Count 1/Kids[3 0 R]>>')
   assert.equal(validatePdfStructureSync(brokenPagesRefPdf), false)
   assert.equal(await validatePdfInIsolatedWorker(brokenPagesRefPdf, signal), false)
+
+  const mismatchedGenerationPdf = buildCustomPdf('2 1 R', '<</Type/Pages/Count 1/Kids[3 0 R]>>')
+  assert.equal(validatePdfStructureSync(mismatchedGenerationPdf), false)
+  assert.equal(await validatePdfInIsolatedWorker(mismatchedGenerationPdf, signal), false)
+
+  const largeImageStreamPdf = (() => {
+    const header = '%PDF-1.4\n'
+    const obj1 = '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n'
+    const obj2 = '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n'
+    const obj3 =
+      '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>\nendobj\n'
+    const imgData = 'A'.repeat(512 * 600)
+    const obj4 = `4 0 obj\n<< /Type /XObject /Subtype /Image /Width 512 /Height 600 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length ${imgData.length} >>\nstream\n${imgData}\nendstream\nendobj\n`
+    const contentData = 'q 512 0 0 600 0 0 cm /Im0 Do Q'
+    const obj5 = `5 0 obj\n<< /Length ${contentData.length} >>\nstream\n${contentData}\nendstream\nendobj\n`
+    const o1 = header.length
+    const o2 = o1 + obj1.length
+    const o3 = o2 + obj2.length
+    const o4 = o3 + obj3.length
+    const o5 = o4 + obj4.length
+    const xrefOffset = o5 + obj5.length
+    const pad = (n: number) => String(n).padStart(10, '0')
+    const xref = `xref\n0 6\n0000000000 65535 f \n${pad(o1)} 00000 n \n${pad(o2)} 00000 n \n${pad(o3)} 00000 n \n${pad(o4)} 00000 n \n${pad(o5)} 00000 n \n`
+    const trailer = `trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`
+    return Buffer.from(header + obj1 + obj2 + obj3 + obj4 + obj5 + xref + trailer, 'latin1')
+  })()
+  assert.equal(validatePdfStructureSync(largeImageStreamPdf), true)
+  assert.equal(await validatePdfInIsolatedWorker(largeImageStreamPdf, signal), true)
   assert.equal(
     await validatePdfInIsolatedWorker(
       Buffer.from('%PDF-1.4\nmissing eof marker without trailer'),
@@ -383,9 +415,7 @@ test('WanfangLiteratureHttpExecutor executes both Chinese (Wanfang) and English 
           body: Buffer.from(springerHtml, 'utf8'),
         }
       }
-      if (
-        url.pathname === `${SPRINGER_WEBVPN_PREFIX}/content/pdf/10.1007/s11128-026-05359-y.pdf`
-      ) {
+      if (url.pathname === `${SPRINGER_WEBVPN_PREFIX}/content/pdf/10.1007/s11128-026-05359-y.pdf`) {
         return {
           statusCode: 200,
           headers: { 'content-type': 'application/pdf' },
