@@ -663,11 +663,11 @@ describe("openclaude-runtime entrypoint env-scrub policy", () => {
 
   test("web agents fallback uses MiniMax-M3 (platform default) instead of an unsupported Claude default", () => {
     const src = readFileSync(WEB_AGENTS_MODULE_PATH, "utf-8");
-    // main 队长 = glm-5.3-zai/zai(2026-08-22);researcher 仍 MiniMax-M3/minimax;coder = glm-5.3-zai/zai。
+    // main 队长与 coder = deepseek-v4-flash/opencodego(2026-10-20 Z.AI 不可用);researcher 仍 MiniMax-M3/minimax。
     assert.match(src, /model:\s*'MiniMax-M3'/, "web fallback must still have MiniMax-M3 (researcher)");
     assert.match(src, /provider:\s*'minimax'/, "web fallback must still have minimax provider (researcher)");
-    assert.match(src, /model:\s*'glm-5\.3-zai'/, "web fallback main/coder must use glm-5.3-zai");
-    assert.match(src, /provider:\s*'zai'/, "web fallback main/coder must use zai provider");
+    assert.match(src, /model:\s*'deepseek-v4-flash'/, "web fallback main/coder must use deepseek-v4-flash");
+    assert.match(src, /provider:\s*'opencodego'/, "web fallback main/coder must use the opencodego provider");
     assert.match(src, /id:\s*'scientist'/, "web fallback must include the scientist agent");
     assert.match(src, /displayName:\s*'科研分析师'/, "web fallback scientist display name must match runtime seed");
     // scholar(P2 综述写手)三权威源同步:web fallback 必含,与 entrypoint seed 一致
@@ -751,11 +751,11 @@ describe("模型权威阶段 A 一致性锚:platform-seed 声明 == master 常�
     assert.equal(agents.codex?.runnerKind, "app-server", "codex runner 必须是 app-server");
     assert.equal(agents["hidden-reviewer"]?.forcePersona, true, "隐藏审查员 persona 必须每 boot 强刷(裁决词同步)");
 
-    // 当前期望值(2026-09-04 起 deepseek-v4-flash / opencodego;隐藏审查员仍 glm-5.3-zai)。
+    // 当前期望值(2026-09-04 起 deepseek-v4-flash / opencodego;隐藏审查员 2026-10-20 起同为 deepseek-v4-flash)。
     assert.equal(PLATFORM_DEFAULT_MODEL, "deepseek-v4-flash");
     assert.equal(PLATFORM_DEFAULT_PROVIDER, "opencodego");
-    assert.equal(PLATFORM_HIDDEN_REVIEWER_MODEL, "glm-5.3-zai");
-    assert.equal(PLATFORM_HIDDEN_REVIEWER_PROVIDER, "zai");
+    assert.equal(PLATFORM_HIDDEN_REVIEWER_MODEL, "deepseek-v4-flash");
+    assert.equal(PLATFORM_HIDDEN_REVIEWER_PROVIDER, "opencodego");
   });
 
   test("dev fallback 内置声明 == platformDefaults(无 bundle 的 dev 路径也不许漂)", async () => {

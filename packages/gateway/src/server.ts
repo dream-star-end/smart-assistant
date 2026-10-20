@@ -809,7 +809,7 @@ export const ALLOWED_INBOUND_MODELS = new Set<string>([
  * DELEGATE_GROK_FALLBACK_MODEL(日志 delegate_grok_fallback)。显式 model 完全不受影响。
  */
 export const DELEGATE_DEFAULT_PREFERRED_MODELS = ['grok-build'] as const
-export const DELEGATE_GROK_FALLBACK_MODEL = 'glm-5.3-zai'
+export const DELEGATE_GROK_FALLBACK_MODEL = 'deepseek-v4-flash'
 
 /**
  * Fail-loud for an explicit delegate `--model` slug against the baked inbound set.

@@ -380,9 +380,9 @@ export function resolveExecutionModel(
 
 /** 平台执行模型兜底:V5 当前合法的静态 key 平台默认。 */
 export const EXECUTION_MODEL_FALLBACK_ROUTE = [
+  'deepseek-v4-flash',
   'glm-5.3-zai',
   'MiniMax-M3',
-  'deepseek-v4-flash',
 ] as const
 
 export function resolveSyntheticTurnModel(

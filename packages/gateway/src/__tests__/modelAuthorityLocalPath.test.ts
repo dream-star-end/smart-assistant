@@ -376,7 +376,7 @@ describe('② flag 开 + catalog 可用 → engine/model 取投影', () => {
     assert.equal(inherited.canonicalModel, 'glm-5.2')
   })
 
-  test('agent 默认也不可用时按 glm → MiniMax → DeepSeek Flash 多级路由', () => {
+  test('agent 默认也不可用时按 DeepSeek Flash → glm → MiniMax 多级路由(2026-10-20 Z.AI 不可用后 DeepSeek 居首)', () => {
     const d = decideLocalExecution({
       view: view([
         row('glm-5.2', 'ccb', { available: false }),
@@ -388,7 +388,7 @@ describe('② flag 开 + catalog 可用 → engine/model 取投影', () => {
       defaultModel: 'glm-5.2',
       kind: 'turn',
     })
-    assert.equal(d.canonicalModel, 'MiniMax-M3')
+    assert.equal(d.canonicalModel, 'deepseek-v4-flash')
   })
 
   test('测试账号投影没有 deepseek-v4-pro 时自动跳过，其他模型仍可路由', () => {
@@ -775,10 +775,10 @@ describe('⑥ cron/synthetic 的 codex 意图 → 降级为非 codex(既有语�
   })
 })
 
-// ── ⑦ delegate 默认 grok-build 优先 → mint 失败回落 glm-5.3-zai ─────────────
+// ── ⑦ delegate 默认 grok-build 优先 → mint 失败回落 deepseek-v4-flash ─────────────
 
-describe('⑦ delegate 默认模型:grok-build 优先,mint 失败同请求回落 glm-5.3-zai,显式指定不变', () => {
-  const GROK_ROWS = [row('grok-build', 'grok'), row('glm-5.3-zai', 'ccb', { provider_id: 'zai' })]
+describe('⑦ delegate 默认模型:grok-build 优先,mint 失败同请求回落 deepseek-v4-flash,显式指定不变', () => {
+  const GROK_ROWS = [row('grok-build', 'grok'), row('deepseek-v4-flash', 'ccb', { provider_id: 'opencodego' }), row('glm-5.3-zai', 'ccb', { provider_id: 'zai' })]
 
   function withFlags<T>(flags: { authority: boolean; exempt: boolean }, fn: () => Promise<T>): Promise<T> {
     const prev = process.env.OC_MODEL_AUTHORITY
@@ -821,7 +821,7 @@ describe('⑦ delegate 默认模型:grok-build 优先,mint 失败同请求回落
     })
   })
 
-  test('默认 + mint 失败(409)→ 不拒,同请求回落 glm-5.3-zai(ccb),记 delegate_grok_fallback,无 grokRoute', async () => {
+  test('默认 + mint 失败(409)→ 不拒,同请求回落 deepseek-v4-flash(ccb),记 delegate_grok_fallback,无 grokRoute', async () => {
     installCatalog({ extraModels: GROK_ROWS })
     await withFlags({ authority: true, exempt: true }, async () => {
       const gw = makeDelegateGateway()
@@ -830,15 +830,15 @@ describe('⑦ delegate 默认模型:grok-build 优先,mint 失败同请求回落
       assert.equal(r.status, 200, JSON.stringify(r.body))
       assert.equal(gw.sessions.getOrCreateCalls, 1, '回落仍只创建一次 runner')
       const opts = gw.sessions.getOrCreateArgs[0]
-      assert.equal(opts.model, 'glm-5.3-zai')
-      assert.equal(opts.agent?.model, 'glm-5.3-zai', 'execAgent 同步改成回落模型')
+      assert.equal(opts.model, 'deepseek-v4-flash')
+      assert.equal(opts.agent?.model, 'deepseek-v4-flash', 'execAgent 同步改成回落模型')
       assert.equal(opts.executionAuthority?.engine, 'ccb')
-      assert.equal(opts.executionAuthority?.canonicalModel, 'glm-5.3-zai')
+      assert.equal(opts.executionAuthority?.canonicalModel, 'deepseek-v4-flash')
       assert.equal(gw.sessions.submitExtras[0]?.grokRoute, undefined, '回落后不注入 grokRoute')
       const fb = gw._testWarns.find((w: any) => w.msg === 'delegate_grok_fallback')
       assert.ok(fb, '必须记 delegate_grok_fallback')
       assert.equal(fb.fields?.from, 'grok-build')
-      assert.equal(fb.fields?.to, 'glm-5.3-zai')
+      assert.equal(fb.fields?.to, 'deepseek-v4-flash')
       assert.equal(fb.fields?.httpStatus, 409)
       assert.equal(
         gw._testWarns.some((w: any) => w.msg === 'delegate_grok_route_denied'),

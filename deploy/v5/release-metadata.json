@@ -182,7 +182,8 @@
     "0311_antigravity_paid_tier",
     "0312_antigravity_gemini_4_argon",
     "0313_commercial_overnight_catalog_20261020",
-    "0314_commercial_muse_spark_go"
+    "0314_commercial_muse_spark_go",
+    "0315_commercial_reviewer_off_zai"
   ],
   "capabilities": [
     "sessions-store-pg-v1",
