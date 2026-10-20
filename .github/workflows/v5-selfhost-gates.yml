@@ -104,6 +104,10 @@ jobs:
       - name: Watch behaviour gate (same list as the train)
         run: bash scripts/v5-selfhost-watch-gate.sh --log-dir "$RUNNER_TEMP/watch-gate"
 
+      # OCV5-539:列车 summary.json 记录器(只记录,不参与列车判定,所以不进 watch 门清单)。
+      - name: Train summary recorder
+        run: bash scripts/v5-selfhost-train-summary.test.sh
+
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
