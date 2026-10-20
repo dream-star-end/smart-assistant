@@ -49,6 +49,8 @@ describe('OpenCode Go pricing', () => {
       'longcat-2.0-go': [15, 60, 1, 0], // $0.30 / $1.20 / $0.006
       'longcat-2.5-preview-free-go': [0, 0, 0, 0], // Free (limited time)
       'step-5-preview-free-go': [0, 0, 0, 0], // Free (limited time)
+      'minimax-m3.1-flash-free-go': [0, 0, 0, 0], // Free (limited time)
+      'beam-free-go': [0, 0, 0, 0], // Free (limited time)
       'opencode-grok-4.7': [100, 300, 25, 0], // ≤200K $2 / $6 / $0.50
       'opencode-grok-4.6': [100, 300, 25, 0],
       'opencode-gpt-6-luna': [5, 25, 1, 6], // ≤272K $0.10 / $0.50 / $0.01 / $0.125
