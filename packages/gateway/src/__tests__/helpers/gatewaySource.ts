@@ -38,6 +38,15 @@ export const GATEWAY_SOURCE_FILES: readonly string[] = [
   'gatewayLifecycle.ts',
   'gatewayHttp.ts',
   'sessionRepoBinding.ts',
+  'turnDispatch.ts',
+  'promptQueueDispatch.ts',
+  'delegateGuard.ts',
+  'skillTrainRuns.ts',
+  'agentMessage.ts',
+  'delegatePolicy.ts',
+  'wechatInboundCompensate.ts',
+  'autoDreamSchedule.ts',
+  'httpUploadStatic.ts',
 ]
 
 export function readGatewaySource(): string {

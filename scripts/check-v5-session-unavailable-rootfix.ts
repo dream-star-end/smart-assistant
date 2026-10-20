@@ -45,6 +45,15 @@ const gatewaySource = [
   'gatewayLifecycle.ts',
   'gatewayHttp.ts',
   'sessionRepoBinding.ts',
+  'turnDispatch.ts',
+  'promptQueueDispatch.ts',
+  'delegateGuard.ts',
+  'skillTrainRuns.ts',
+  'agentMessage.ts',
+  'delegatePolicy.ts',
+  'wechatInboundCompensate.ts',
+  'autoDreamSchedule.ts',
+  'httpUploadStatic.ts',
 ]
   .map((f) => readFileSync(join(root, 'packages/gateway/src', f), 'utf8'))
   .join('\n')
