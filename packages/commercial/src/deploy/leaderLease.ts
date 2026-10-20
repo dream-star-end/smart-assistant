@@ -94,6 +94,29 @@ export interface LeaderLeaseOptions {
   selfStartTicks?: number;
   /** predecessor 存活判定(测试注入);默认读 /proc/<pid>/stat 校验 start_ticks。 */
   isProcessAlive?: (pid: number, startTicks: number) => boolean;
+  /** 短连接 ACK 失败后的重试间隔(测试注入);默认 ACK_SHORT_CONN_RETRY_DELAYS_MS。 */
+  ackShortConnRetryDelaysMs?: readonly number[];
+}
+
+/**
+ * ROB-8:一次 PG 连接重置就让 leader fail-stop(10-10 06:14:05 实例)。短连接 ACK 是幂等的
+ * (epoch/instance 条件 UPDATE),先有界重试 3 次(间隔 250ms、1s,总计远小于后继 45s liveness),
+ * 全部失败才交给调用方 fail-stop。
+ */
+export const ACK_SHORT_CONN_RETRY_DELAYS_MS: readonly number[] = [250, 1_000];
+
+export async function writeAckShortConnWithRetry(
+  attempt: () => Promise<boolean>,
+  delaysMs: readonly number[],
+  log: { warn: (m: string, meta?: unknown) => void },
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<boolean> {
+  for (let i = 0; ; i++) {
+    if (await attempt()) return true;
+    if (i >= delaysMs.length) return false;
+    log.warn("[leaderLease] 短连接 ACK 失败,稍后重试", { attempt: i + 1, of: delaysMs.length + 1, retryInMs: delaysMs[i] });
+    await sleep(delaysMs[i]);
+  }
 }
 
 export interface LeaderLeaseController {
@@ -686,6 +709,14 @@ export function createLeaderLeaseController(opts: LeaderLeaseOptions): LeaderLea
    * (交接已完成,ACK 无意义);仅真实 DB 错误返回 false → 调用方 fail-stop。
    */
   async function writeAckShortConn(epoch: number): Promise<boolean> {
+    return writeAckShortConnWithRetry(
+      () => writeAckShortConnOnce(epoch),
+      opts.ackShortConnRetryDelaysMs ?? ACK_SHORT_CONN_RETRY_DELAYS_MS,
+      log,
+    );
+  }
+
+  async function writeAckShortConnOnce(epoch: number): Promise<boolean> {
     let c: PoolClient | null = null;
     try {
       c = await opts.pool.connect();

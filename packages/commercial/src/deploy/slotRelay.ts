@@ -22,6 +22,7 @@ export interface SlotRelayLocal {
 
 export interface SlotRelayLogger {
   warn(message: string, meta?: unknown): void;
+  info?(message: string, meta?: unknown): void;
 }
 
 function validUid(value: unknown): value is string {
@@ -127,6 +128,17 @@ export function createSlotRelayClient(opts: ClientOptions): SlotRelayClient {
   const requestTimeoutMs = opts.requestTimeoutMs ?? 500;
   const totalBudgetMs = opts.totalBudgetMs ?? 2_000;
   const log = opts.logger;
+  // ROB-7:个人版只跑一个槽,另一个口每次 fanout 都 ECONNREFUSED(每天几百行同一条 warn)。
+  // 只在口的状态变化时各记一次:第一次失败记 unavailable,之后静默计数,恢复时记 recovered(带静默条数)。
+  const peerDown = new Map<number, { suppressed: number }>();
+  const markUp = (port: number): void => {
+    const down = peerDown.get(port);
+    if (!down) return;
+    peerDown.delete(port);
+    const meta = { port, suppressedFailures: down.suppressed };
+    if (log?.info) log.info("slot relay peer recovered", meta);
+    else log?.warn("slot relay peer recovered", meta);
+  };
 
   async function post(
     port: number,
@@ -166,6 +178,7 @@ export function createSlotRelayClient(opts: ClientOptions): SlotRelayClient {
           chunks.push(chunk);
         });
         res.on("end", () => {
+          markUp(port);
           if (res.statusCode !== 200) return done([]);
           try {
             const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
@@ -183,7 +196,20 @@ export function createSlotRelayClient(opts: ClientOptions): SlotRelayClient {
       });
       req.setTimeout(requestTimeoutMs, () => req.destroy(new Error("SLOT_RELAY_TIMEOUT")));
       req.on("error", (err) => {
-        if (!signal.aborted) log?.warn("slot relay peer unavailable", { port, path, err: err.message });
+        if (!signal.aborted) {
+          const down = peerDown.get(port);
+          if (down) {
+            down.suppressed += 1;
+          } else {
+            peerDown.set(port, { suppressed: 0 });
+            log?.warn("slot relay peer unavailable", {
+              port,
+              path,
+              err: err.message,
+              note: "logged once per outage; recovery is logged as slot relay peer recovered",
+            });
+          }
+        }
         done([]);
       });
       req.end(data);
