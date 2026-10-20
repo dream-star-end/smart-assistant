@@ -756,4 +756,29 @@ test('validatePdfStructureSync and LiteratureArtifactStore allow empty-password 
   const invalidHybridPdf = buildHybridXrefPdf('/NotXRef')
   assert.equal(validatePdfStructureSync(invalidHybridPdf), false)
   assert.equal(await validatePdfInIsolatedWorker(invalidHybridPdf, signal), false)
+
+  // 6. Earlier dummy empty-password 4 0 obj cannot shadow later xref-targeted locked 4 0 obj in /XRefStm PDF
+  const shadowedHybridPdf = (() => {
+    const header = '%PDF-1.5\n'
+    const obj1 = '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n'
+    const obj2 = '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n'
+    const obj3 = '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n'
+    const oHex = '68d1431b5b2a08c20f9e529b1957bb364b78a4726e0236e270da6c92d8f016be'
+    const dummyObj4 = `4 0 obj\n<</Filter /Standard/U <${emptyUserPassUHex}>/O <${oHex}>/P 2100/V 2/Length 128 /R 3>>\nendobj\n`
+    const realLockedObj4 = `4 0 obj\n<</Filter /Standard/U <${nonEmptyUserPassUHex}>/O <${oHex}>/P 2100/V 2/Length 128 /R 3>>\nendobj\n`
+    const obj5 = '5 0 obj\n<< /Type /XRef /Size 6 /W [1 2 1] /Length 4 >>\nstream\n\x01\x00\x00\x00\nendstream\nendobj\n'
+    const o1 = header.length
+    const o2 = o1 + obj1.length
+    const o3 = o2 + obj2.length
+    const o4Dummy = o3 + obj3.length
+    const o4Real = o4Dummy + dummyObj4.length
+    const o5 = o4Real + realLockedObj4.length
+    const xrefOffset = o5 + obj5.length
+    const fileIdHex = '1210121610131116111515161312E000'
+    const xref = `xref\n0 6\n0000000000 65535 f \n${pad(o1)} 00000 n \n${pad(o2)} 00000 n \n${pad(o3)} 00000 n \n${pad(o4Real)} 00000 n \n${pad(o5)} 00000 n \n`
+    const trailer = `trailer\n<< /Size 6 /Root 1 0 R /XRefStm ${o5} /ID[<${fileIdHex}><${fileIdHex}>] /Encrypt 4 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`
+    return Buffer.from(header + obj1 + obj2 + obj3 + dummyObj4 + realLockedObj4 + obj5 + xref + trailer, 'latin1')
+  })()
+  assert.equal(validatePdfStructureSync(shadowedHybridPdf), false)
+  assert.equal(await validatePdfInIsolatedWorker(shadowedHybridPdf, signal), false)
 })
