@@ -198,7 +198,7 @@ async function fetchConversationFromMappingInPage(page, fallbackConvId = null) {
   const fetched = await page
     .evaluate(async (knownId) => {
       const m = location.pathname.match(/\/c\/([a-z0-9_-]{8,128})/i)
-      const convId = (m && m[1]) || knownId || null
+      const convId = m?.[1] || knownId || null
       if (!convId) return { conv: null, convId: null }
       try {
         let token = null

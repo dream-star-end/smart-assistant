@@ -558,13 +558,15 @@ export async function selectProTierInPage(page, { requestedTier = 'pro' } = {}) 
     throw new TierLimitError(preLimit)
   }
 
-  const switcher = page
-    .locator(
-      '[data-testid="model-switcher-dropdown-button"], button[aria-label="Select ChatGPT model"]',
-    )
-    .first()
-  if (typeof switcher.waitFor === 'function') {
-    await switcher.waitFor({ state: 'visible', timeout: 15_000 }).catch(() => {})
+  let switcher = page.locator('[data-testid="model-switcher-dropdown-button"]').first()
+  if ((await switcher.count()) === 0) {
+    const altLoc = page.locator('button[aria-label="Select ChatGPT model"]')
+    if (altLoc && typeof altLoc.first === 'function') {
+      switcher = altLoc.first()
+      if (typeof switcher.waitFor === 'function') {
+        await switcher.waitFor({ state: 'visible', timeout: 15_000 }).catch(() => {})
+      }
+    }
   }
   if ((await switcher.count()) === 0) {
     throw new Error(
@@ -695,11 +697,15 @@ export async function uploadAttachmentsToComposer(
  * so Enter does not prematurely submit the turn.
  */
 export async function typeMultilinePreservingAttachments(page, text) {
-  const composer = page
-    .locator(
-      '#prompt-textarea, div.ProseMirror[contenteditable="true"], [role="textbox"][contenteditable="true"]',
+  let composer = page.locator('#prompt-textarea').first()
+  if (typeof composer.count === 'function' && (await composer.count()) === 0) {
+    const altComposer = page.locator(
+      'div.ProseMirror[contenteditable="true"], [role="textbox"][contenteditable="true"]',
     )
-    .first()
+    if (altComposer && typeof altComposer.first === 'function') {
+      composer = altComposer.first()
+    }
+  }
   await composer.click()
   const lines = String(text ?? '').split(/\r?\n/)
   for (let i = 0; i < lines.length; i++) {
