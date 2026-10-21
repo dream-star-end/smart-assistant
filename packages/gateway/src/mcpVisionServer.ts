@@ -80,20 +80,6 @@ export function visionBackendLabel(): string {
   return backend === 'grok' ? GROK_VISION_MODEL : STATIC_VISION_MODEL
 }
 
-/**
- * 该 model 是否为**纯文本静态模型**(命中 protocol 静态 provider 注册表,且该 spec
- * `supportsVision !== true` —— 即 false/undefined 都算纯文本)。
- *
- * **单一权威源 = protocol staticKeyProviders 的 supportsVision**(有 snapshot + 双侧
- * 测试守护)。此前 gateway 侧另用字面量 allowlist(deepseek/glm-5.1/5.2/qwen/kimi)
- * 决定给谁注入 understand_image,是第二权威源:新增纯文本静态模型时若忘同步这里,
- * 就会"发图无识图工具"。现改为从 findRouteProviderForModel 派生 —— 与实际路由到静态
- * 上游的判定同源,新增静态模型自动生效,漂移不可能再发生。
- *
- * 注意用 findRouteProviderForModel(而非 provider 字面量):它的 matchesRoute 就是
- * "这个 model 是否真的路由到该静态上游"的权威。不命中(codex/claude/gpt 等非静态
- * provider,或未注册模型)→ 返回 false,由调用方决定默认。
- */
 export type VisionToolArgs = {
   image_file?: unknown
   image_source?: unknown

@@ -786,7 +786,7 @@ async function buildAgentsSlotParts(
   // 平台静态能力文案(`# Platform capabilities` 头部 + 多媒体/微信/富内容/子 Agent/
   // 浏览器/网页提取诸段)已上移 platform bundle(商业版真热),商业版权威 =
   // prompts/platform-capabilities.md,个人版权威 = 下方 PLATFORM_CAPABILITIES_FALLBACK。
-  // 非原生多模态模型已从目录下线,微信/图片提示只剩原生读图一种形态。
+  // 不再提供 OCR/识图 CLI 兜底,微信/图片提示只剩原生读图一种形态。
   const staticHeader = getPlatformPrompt(
     'platform-capabilities',
     PLATFORM_CAPABILITIES_FALLBACK,
