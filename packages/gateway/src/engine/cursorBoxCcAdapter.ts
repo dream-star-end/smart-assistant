@@ -196,6 +196,6 @@ async function prepareControl(
   sessionKey: string,
   holder: { path: string | null },
 ): Promise<string> {
-  if (!holder.path) holder.path = await writeBoxCcControlFile({ selection, sessionKey })
+  holder.path = await writeBoxCcControlFile({ selection, sessionKey })
   return holder.path
 }

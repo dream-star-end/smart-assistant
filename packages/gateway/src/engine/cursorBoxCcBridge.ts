@@ -43,6 +43,7 @@ import {
   inlineGptWebAttachmentsInUserLine,
   isBoxGptWebModelArgv,
   loadBoxGptWebMod,
+  materializeGptWebOutputAttachmentsInStdoutLine,
   remoteInteractiveGptWebArgs,
 } from './cursorBoxGptWeb.js'
 
@@ -166,7 +167,8 @@ export async function runBoxCcBridge(opts: {
   const onAbort = (): void => abort.abort()
   opts.signal?.addEventListener('abort', onAbort)
   const holdMax = positiveInt(env.OC_BOX_INTERACTIVE_HOLD_MAX_BYTES) ?? 64 * 1024 * 1024
-  const out = new StdoutLines(opts.stdout)
+  const out = new StdoutLines(opts.stdout, env)
+  const maxAttempts = isGptWeb ? 4 : LAUNCH_ATTEMPTS
 
   // stdin -> the current session; lines that arrive between sessions wait in `carry`.
   let current: BoxSession | null = null
@@ -251,7 +253,7 @@ export async function runBoxCcBridge(opts: {
         await login.report({ accountId, profile, lines: [], unsafe: true }).catch(() => false)
         memory.forget()
       }
-      if (outcome.retryable && attempt < LAUNCH_ATTEMPTS && !stdinEnded && !abort.signal.aborted) {
+      if (outcome.retryable && attempt < maxAttempts && !stdinEnded && !abort.signal.aborted) {
         opts.stderr.write(`BOX_INTERACTIVE_RETRY ${outcome.why}\n`)
         continue
       }
@@ -289,17 +291,29 @@ function sessionIdOf(args: readonly string[]): string {
  * (shown to the user as assistant text, or as a failed result's text) is reworded neutrally. */
 class StdoutLines {
   private buf = ''
-  constructor(private readonly stdout: NodeJS.WritableStream) {}
+  constructor(
+    private readonly stdout: NodeJS.WritableStream,
+    private readonly env?: NodeJS.ProcessEnv,
+  ) {}
+  private transformLine(line: string): string {
+    if (!line) return line
+    return materializeGptWebOutputAttachmentsInStdoutLine(neutralLine(line), { env: this.env })
+  }
   write(data: string): void {
     this.buf += data
     const cut = this.buf.lastIndexOf('\n')
     if (cut < 0) return
     const whole = this.buf.slice(0, cut + 1)
     this.buf = this.buf.slice(cut + 1)
-    this.stdout.write(whole.split('\n').map(neutralLine).join('\n'))
+    this.stdout.write(
+      whole
+        .split('\n')
+        .map((l) => this.transformLine(l))
+        .join('\n'),
+    )
   }
   flush(): void {
-    if (this.buf) this.stdout.write(neutralLine(this.buf))
+    if (this.buf) this.stdout.write(this.transformLine(this.buf))
     this.buf = ''
   }
   /** A failed result for the waiting turn, in the CLI's own result shape (the parser finalizes it). */
@@ -389,6 +403,8 @@ class BoxSession {
   private readonly abort = new AbortController()
   /** Set once the session gave up before READY: later lines go back to the bridge. */
   private gaveUp = false
+  /** In-flight user turn line for box-gpt-6-astra-pro so mid-turn stream disconnects can reconnect and resume. */
+  private activeGptWebUserLine: string | null = null
 
   constructor(
     private readonly o: {
@@ -450,11 +466,15 @@ class BoxSession {
 
   private async writeLine(line: string): Promise<void> {
     try {
-      const payload = isBoxGptWebModelArgv(this.o.args)
+      const isGptWeb = isBoxGptWebModelArgv(this.o.args)
+      const payload = isGptWeb
         ? inlineGptWebAttachmentsInUserLine(line, { env: this.o.env })
         : line
       for (const body of boxCcWriteExecs(this.control, payload, ++this.lineSeq))
         await this.writeExec(body)
+      if (isGptWeb && TOP_TYPE.exec(line)?.[1] === 'user') {
+        this.activeGptWebUserLine = line
+      }
     } catch (err) {
       if (this.abort.signal.aborted) return
       const message = err instanceof Error ? err.message : 'BOX_CC_WRITE_FAILED'
@@ -640,7 +660,11 @@ class BoxSession {
           if (event.kind === 'stdout' && event.data) {
             this.sawStdout = true
             this.o.out.write(event.data)
-            for (const end of this.signals.push(event.data)) await this.onTurnEnd(end.rotate)
+            const ends = this.signals.push(event.data)
+            if (ends.length > 0) {
+              this.activeGptWebUserLine = null
+            }
+            for (const end of ends) await this.onTurnEnd(end.rotate)
           } else if (event.kind === 'stderr' && event.data) {
             this.o.stderr.write(event.data)
             if (this.held && !this.abandoned) {
@@ -663,6 +687,18 @@ class BoxSession {
     } catch (error) {
       this.hostStreamEnded = true
       if (!this.stopRequested && !this.o.abort.signal.aborted) {
+        if (isBoxGptWebModelArgv(this.o.args) && this.activeGptWebUserLine !== null) {
+          const resumeLine = this.activeGptWebUserLine
+          this.activeGptWebUserLine = null
+          this.gaveUp = true
+          return {
+            kind: 'not_ready',
+            why: 'gpt_web_stream_disconnected_mid_turn',
+            unsafe: false,
+            retryable: true,
+            held: [resumeLine, ...(this.held ?? [])],
+          }
+        }
         if (this.readySeen || this.sawStdout) throw error
         // The launch itself failed before anything ran (an exec error): like a host that never came up.
         const why = error instanceof Error ? error.message : 'launch_failed'
@@ -680,6 +716,24 @@ class BoxSession {
         unsafe,
         retryable: this.abandoned !== 'held_overflow',
       })
+    }
+    if (
+      isBoxGptWebModelArgv(this.o.args) &&
+      this.activeGptWebUserLine !== null &&
+      !this.stopRequested &&
+      !this.o.abort.signal.aborted &&
+      (!this.sawExit || this.exitCode !== 0)
+    ) {
+      const resumeLine = this.activeGptWebUserLine
+      this.activeGptWebUserLine = null
+      this.gaveUp = true
+      return {
+        kind: 'not_ready',
+        why: 'gpt_web_stream_ended_mid_turn',
+        unsafe: false,
+        retryable: true,
+        held: [resumeLine, ...(this.held ?? [])],
+      }
     }
     const rest = this.signals.take()
     if (rest.length > 0)

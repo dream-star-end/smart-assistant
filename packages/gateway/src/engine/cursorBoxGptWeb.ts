@@ -9,9 +9,9 @@
  * Node built-ins only: the bridge is spawned as plain node.
  */
 import { createHash } from 'node:crypto'
-import { readFileSync, realpathSync, statSync } from 'node:fs'
+import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, join, resolve, sep } from 'node:path'
+import { basename, extname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   BOX_CC_HOME,
@@ -170,6 +170,203 @@ export function validateBoxGptWebLoopbackProxy(proxyUrl: string | undefined | nu
 export function defaultTrustedUploadRoots(env: NodeJS.ProcessEnv = {}): string[] {
   const ocHome = env.OPENCLAUDE_HOME ?? join(homedir(), '.openclaude')
   return [join(ocHome, 'uploads')]
+}
+
+export function defaultGeneratedOutputDir(env: NodeJS.ProcessEnv = {}): string {
+  const ocHome = env.OPENCLAUDE_HOME ?? join(homedir(), '.openclaude')
+  return join(ocHome, 'generated')
+}
+
+export interface GptWebOutputAttachmentPayload {
+  name?: string
+  sandboxUrl?: string
+  sandboxPath?: string
+  fileId?: string
+  mimeType?: string
+  size?: number
+  base64?: string
+}
+
+export interface MaterializedGptWebOutputArtifact {
+  name: string
+  sandboxUrl?: string
+  sandboxPath?: string
+  fileId?: string
+  mimeType?: string
+  mediaUrl: string
+  generatedPath: string
+  containerGeneratedPath: string
+  isImage: boolean
+}
+
+const MIME_EXT_MAP: Record<string, string> = {
+  'text/html': '.html',
+  'text/plain': '.txt',
+  'text/markdown': '.md',
+  'text/csv': '.csv',
+  'application/json': '.json',
+  'application/pdf': '.pdf',
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+  'image/svg+xml': '.svg',
+}
+
+function sanitizeOutputFilename(rawName: string | undefined, mimeType?: string): string {
+  const base = basename(String(rawName || 'output')).replace(/[^a-zA-Z0-9._-]/g, '_')
+  const cleaned = base.replace(/\.{2,}/g, '_').replace(/^[._-]+/, '') || 'output'
+  const existingExt = extname(cleaned)
+  if (existingExt && /^\.[a-zA-Z0-9]{1,10}$/.test(existingExt)) {
+    return cleaned.slice(0, 120)
+  }
+  const normalizedMime = String(mimeType || '')
+    .split(';')[0]
+    ?.trim()
+    .toLowerCase()
+  const fallbackExt = (normalizedMime && MIME_EXT_MAP[normalizedMime]) || '.bin'
+  return `${cleaned.slice(0, 110)}${fallbackExt}`
+}
+
+function rewriteTextWithMaterializedArtifacts(
+  text: string,
+  artifacts: readonly MaterializedGptWebOutputArtifact[],
+): string {
+  if (!artifacts.length) return text
+  let out = text
+  for (const art of artifacts) {
+    if (art.sandboxUrl) {
+      out = out.split(art.sandboxUrl).join(art.mediaUrl)
+    }
+    if (art.sandboxPath) {
+      out = out.split(`sandbox:${art.sandboxPath}`).join(art.mediaUrl)
+    }
+    out = out.split(`sandbox:/mnt/data/${art.name}`).join(art.mediaUrl)
+  }
+
+  const missingDeliverables = artifacts.filter(
+    (art) => !out.includes(art.containerGeneratedPath),
+  )
+  if (missingDeliverables.length > 0) {
+    const lines: string[] = ['', '', '---', '**已取回 Pro 生成的文件（可直接点击下载）：**']
+    for (const art of missingDeliverables) {
+      if (art.isImage && !out.includes(`(${art.mediaUrl})`)) {
+        lines.push(`![${art.name}](${art.mediaUrl})`)
+      }
+      lines.push(`- [${art.name}](${art.mediaUrl}) (\`${art.containerGeneratedPath}\`)`)
+    }
+    out = `${out.trimEnd()}\n${lines.join('\n')}`
+  }
+  return out
+}
+
+/**
+ * Intercepts a Route B stdout JSON line from `host.mjs`, materializes any `outputAttachments`
+ * into both `~/.openclaude/uploads/<sha256>.<ext>` (served by `/api/media/<sha256>.<ext>`) and
+ * `~/.openclaude/generated/<safeName>` (collected by `collectSessionOutputAssets` into the
+ * Personal Edition Outputs panel), and rewrites `sandbox:/...` links in `text_delta`,
+ * `assistant`, and `result` frames.
+ */
+export function materializeGptWebOutputAttachmentsInStdoutLine(
+  line: string,
+  opts?: {
+    env?: NodeJS.ProcessEnv
+    uploadsDir?: string
+    generatedDir?: string
+  },
+): string {
+  if (!line || !line.includes('"outputAttachments"')) return line
+  const trimmed = line.trim()
+  if (!trimmed.startsWith('{')) return line
+  let parsed: Record<string, any>
+  try {
+    parsed = JSON.parse(trimmed) as Record<string, any>
+  } catch {
+    return line
+  }
+  if (!parsed || typeof parsed !== 'object') return line
+  const rawList = parsed.outputAttachments
+  delete parsed.outputAttachments
+  if (!Array.isArray(rawList) || rawList.length === 0) {
+    return JSON.stringify(parsed)
+  }
+
+  const uploadsDir =
+    opts?.uploadsDir ?? defaultTrustedUploadRoots(opts?.env)[0] ?? join(homedir(), '.openclaude', 'uploads')
+  const generatedDir = opts?.generatedDir ?? defaultGeneratedOutputDir(opts?.env)
+
+  try {
+    mkdirSync(uploadsDir, { recursive: true, mode: 0o700 })
+    mkdirSync(generatedDir, { recursive: true, mode: 0o700 })
+  } catch {}
+
+  const materialized: MaterializedGptWebOutputArtifact[] = []
+  for (const item of rawList as GptWebOutputAttachmentPayload[]) {
+    if (!item || typeof item.base64 !== 'string' || !item.base64) continue
+    let buf: Buffer
+    try {
+      buf = Buffer.from(item.base64, 'base64')
+    } catch {
+      continue
+    }
+    if (buf.byteLength === 0) continue
+
+    const safeName = sanitizeOutputFilename(item.name, item.mimeType)
+    const ext = extname(safeName).toLowerCase() || '.bin'
+    const digest = createHash('sha256').update(buf).digest('hex')
+    const casFilename = `${digest}${ext}`
+    const casPath = join(uploadsDir, casFilename)
+    const genPath = join(generatedDir, safeName)
+
+    try {
+      writeFileSync(casPath, buf, { mode: 0o600 })
+    } catch {}
+    try {
+      writeFileSync(genPath, buf, { mode: 0o600 })
+    } catch {}
+
+    const isImage =
+      /^image\//i.test(String(item.mimeType || '')) ||
+      /\.(png|jpe?g|gif|webp|svg)$/i.test(safeName)
+
+    materialized.push({
+      name: safeName,
+      ...(item.sandboxUrl ? { sandboxUrl: item.sandboxUrl } : {}),
+      ...(item.sandboxPath ? { sandboxPath: item.sandboxPath } : {}),
+      ...(item.fileId ? { fileId: item.fileId } : {}),
+      ...(item.mimeType ? { mimeType: item.mimeType } : {}),
+      mediaUrl: `/api/media/${casFilename}`,
+      generatedPath: genPath,
+      containerGeneratedPath: `/home/agent/.openclaude/generated/${safeName}`,
+      isImage,
+    })
+  }
+
+  if (materialized.length === 0) {
+    return JSON.stringify(parsed)
+  }
+
+  if (
+    parsed.type === 'stream_event' &&
+    parsed.event?.type === 'content_block_delta' &&
+    parsed.event?.delta?.type === 'text_delta' &&
+    typeof parsed.event.delta.text === 'string'
+  ) {
+    parsed.event.delta.text = rewriteTextWithMaterializedArtifacts(
+      parsed.event.delta.text,
+      materialized,
+    )
+  } else if (parsed.type === 'assistant' && Array.isArray(parsed.message?.content)) {
+    for (const block of parsed.message.content) {
+      if (block && block.type === 'text' && typeof block.text === 'string') {
+        block.text = rewriteTextWithMaterializedArtifacts(block.text, materialized)
+      }
+    }
+  } else if (parsed.type === 'result' && typeof parsed.result === 'string') {
+    parsed.result = rewriteTextWithMaterializedArtifacts(parsed.result, materialized)
+  }
+
+  return JSON.stringify(parsed)
 }
 
 function resolveTrustedUploadFile(
@@ -370,6 +567,12 @@ export function boxGptWebInteractiveLaunchExec(
     OC_BOX_GPT_WEB_PROFILE: profile,
     ...(env.OC_BOX_GPT_WEB_CDP_PORT
       ? { OC_BOX_GPT_WEB_CDP_PORT: env.OC_BOX_GPT_WEB_CDP_PORT }
+      : {}),
+    ...(env.OC_BOX_GPT_WEB_MAX_TIMEOUT_MS
+      ? { OC_BOX_GPT_WEB_MAX_TIMEOUT_MS: env.OC_BOX_GPT_WEB_MAX_TIMEOUT_MS }
+      : {}),
+    ...(env.OC_BOX_GPT_WEB_STALL_TIMEOUT_MS
+      ? { OC_BOX_GPT_WEB_STALL_TIMEOUT_MS: env.OC_BOX_GPT_WEB_STALL_TIMEOUT_MS }
       : {}),
     OC_BOX_GPT_WEB_CORE_MJS: mod.chatgptWebCoreMjs,
     OC_BOX_GPT_WEB_HOST_MJS: mod.hostMjs,

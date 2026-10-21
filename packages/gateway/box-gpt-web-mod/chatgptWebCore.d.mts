@@ -56,6 +56,16 @@ export function saveSessionConversationId(
   sessionId: string,
   conversationId: string,
 ): void
+export function loadActiveTurnState(
+  profileDir: string,
+  sessionId: string,
+): Record<string, any> | null
+export function saveActiveTurnState(
+  profileDir: string,
+  sessionId: string,
+  state: Record<string, any>,
+): void
+export function clearActiveTurnState(profileDir: string, sessionId: string): void
 export function syncPageToSessionConversation(
   page: any,
   opts: { profileDir: string; sessionId: string; initScript?: string },
@@ -125,16 +135,127 @@ export class SseAccumulator {
   feedDataLine(raw: string): void
 }
 
+export const DEFAULT_BASE_TIMEOUT_MS: number
+export const DEFAULT_STEP_EXTEND_MS: number
+export const DEFAULT_MAX_TIMEOUT_MS: number
+export const DEFAULT_STALL_WINDOW_MS: number
+
 export function extractAssistantFromMapping(
   conv: any,
   opts?: { baselineNodeId?: string | null },
 ): { text: string; messageId: string } | null
+
+export function inspectExistingTurnInConversation(
+  conv: any,
+  opts?: { promptText?: string; baselineNodeId?: string | null },
+): {
+  status: 'not_found' | 'in_progress' | 'completed'
+  baselineNodeId: string | null
+  userNodeId: string | null
+  reply: { text: string; messageId: string } | null
+}
+
+export function extractTurnProgressFromMapping(
+  conv: any,
+  opts?: { baselineNodeId?: string | null },
+): {
+  thinkingSteps: Array<{ key: string; text: string }>
+  liveFinalText: string
+  finishedFinal: { text: string; messageId: string } | null
+  currentNode: string | null
+}
+
+export function extractLiveProgressFromDomInPage(page: any): Promise<{
+  stopBtn: boolean
+  activeThinking: boolean
+  statusLines: string[]
+}>
+
+export function safeStreamableTextLength(text: string): number
+
+export class TurnProgressStreamer {
+  stepTextByKey: Map<string, string>
+  seenDomPhaseKeys: Set<string>
+  emittedFinalText: string
+  lastThinkingEmitAt: number
+  constructor(opts?: { nowFn?: () => number })
+  ingestMappingProgress(progress: {
+    thinkingSteps?: Array<{ key: string; text: string }>
+    liveFinalText?: string
+    finishedFinal?: { text: string; messageId: string } | null
+  }): { thinkingDeltas: string[]; textDeltas: string[] }
+  ingestDomProgress(
+    domProgress: { stopBtn?: boolean; activeThinking?: boolean; statusLines?: string[] },
+    opts?: { now?: number; startedAt?: number; heartbeatIntervalMs?: number },
+  ): { thinkingDeltas: string[] }
+  consumeIncrementalFinalText(fullText: string, opts?: { finalFlush?: boolean }): string
+}
+
+export function classifyApprovalCard(opts?: {
+  text?: string
+  buttons?: Array<string | { index?: number; label?: string }>
+}): {
+  decision: 'allow_this_chat' | 'deny'
+  buttonIndex: number | null
+  buttonLabel: string
+  targetHost: string | null
+  summary: string
+  announcement: string
+}
+
+export function inspectAndHandleApprovalCardInPage(page: any): Promise<{
+  handled: boolean
+  decision?: 'allow_this_chat' | 'deny'
+  buttonIndex?: number | null
+  buttonLabel?: string
+  targetHost?: string | null
+  summary?: string
+  announcement?: string
+}>
+
+export interface GptWebOutputArtifactRef {
+  name: string
+  sandboxUrl?: string
+  sandboxPath?: string
+  fileId?: string
+  mimeType?: string
+  messageId?: string | null
+}
+
+export interface GptWebDownloadedArtifact {
+  name: string
+  sandboxUrl?: string
+  sandboxPath?: string
+  fileId?: string
+  mimeType?: string
+  size: number
+  base64: string
+}
+
+export function extractTurnOutputArtifactRefs(opts?: {
+  text?: string
+  conv?: any
+  baselineNodeId?: string | null
+  finalMessageId?: string | null
+  maxFiles?: number
+}): GptWebOutputArtifactRef[]
+
+export function downloadTurnOutputArtifactsInPage(
+  page: any,
+  opts?: {
+    convId?: string | null
+    finalMessageId?: string | null
+    artifactRefs?: GptWebOutputArtifactRef[]
+    maxBytesPerFile?: number
+  },
+): Promise<GptWebDownloadedArtifact[]>
 
 export function computeAdaptiveDeadline(opts: {
   startedAt: number
   now: number
   lastActivityAt: number
   stopVisible: boolean
+  activeThinkingVisible?: boolean
   stopGoneSince?: number | null
   hasFinalText?: boolean
   baseTimeoutMs?: number
@@ -155,19 +276,30 @@ export function formatStreamJsonSystemInit(opts: {
   model?: string
   cwd?: string
 }): string
+export function formatStreamJsonMessageStart(opts?: {
+  messageId?: string
+  model?: string
+}): string
+export function formatStreamJsonThinkingBlockStart(opts?: { index?: number }): string
+export function formatStreamJsonContentBlockStop(opts?: { index?: number }): string
 export function formatStreamJsonThinkingDelta(thinking: string): string
-export function formatStreamJsonTextDelta(text: string): string
+export function formatStreamJsonTextDelta(
+  text: string,
+  opts?: { outputAttachments?: GptWebDownloadedArtifact[] | null },
+): string
 export function formatStreamJsonAssistantMessage(opts: {
   messageId?: string
   model?: string
   text?: string
   thinking?: string
+  outputAttachments?: GptWebDownloadedArtifact[] | null
 }): string
 export function formatStreamJsonResult(opts: {
   sessionId: string
   resultText?: string
   isError?: boolean
   durationMs?: number
+  outputAttachments?: GptWebDownloadedArtifact[] | null
 }): string
 export function formatStreamJsonControlResponse(opts: {
   requestId: string

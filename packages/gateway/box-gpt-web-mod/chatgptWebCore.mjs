@@ -508,6 +508,55 @@ export function saveSessionConversationId(profileDir, sessionId, conversationId)
   } catch {}
 }
 
+const ACTIVE_TURNS_FILENAME = 'oc-active-turns.json'
+
+export function loadActiveTurnState(profileDir, sessionId) {
+  if (!profileDir || !sessionId) return null
+  try {
+    const raw = fs.readFileSync(path.join(profileDir, ACTIVE_TURNS_FILENAME), 'utf8')
+    const parsed = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    const entry = parsed[sessionId]
+    return entry && typeof entry === 'object' ? entry : null
+  } catch {
+    return null
+  }
+}
+
+export function saveActiveTurnState(profileDir, sessionId, state) {
+  if (!profileDir || !sessionId || !state || typeof state !== 'object') return
+  try {
+    fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 })
+    const file = path.join(profileDir, ACTIVE_TURNS_FILENAME)
+    let map = {}
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'))
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) map = parsed
+    } catch {}
+    map[sessionId] = {
+      ...state,
+      updatedAt: Date.now(),
+    }
+    const tmp = `${file}.tmp.${process.pid}`
+    fs.writeFileSync(tmp, JSON.stringify(map, null, 2), { mode: 0o600 })
+    fs.renameSync(tmp, file)
+  } catch {}
+}
+
+export function clearActiveTurnState(profileDir, sessionId) {
+  if (!profileDir || !sessionId) return
+  try {
+    const file = path.join(profileDir, ACTIVE_TURNS_FILENAME)
+    const raw = fs.readFileSync(file, 'utf8')
+    const map = JSON.parse(raw)
+    if (!map || typeof map !== 'object' || !(sessionId in map)) return
+    delete map[sessionId]
+    const tmp = `${file}.tmp.${process.pid}`
+    fs.writeFileSync(tmp, JSON.stringify(map, null, 2), { mode: 0o600 })
+    fs.renameSync(tmp, file)
+  } catch {}
+}
+
 /**
  * Ensures the browser tab is bound to the ChatGPT conversation belonging to `sessionId`.
  * - If `sessionId` has a recorded conversationId, navigates to `https://chatgpt.com/c/<convId>`.
@@ -1203,36 +1252,855 @@ export function extractAssistantFromMapping(conv, { baselineNodeId = null } = {}
 /**
  * Deterministic adaptive timeout & Stream-Rescue state machine for Pro long-thinking turns.
  */
+export const DEFAULT_BASE_TIMEOUT_MS = 600_000
+export const DEFAULT_STEP_EXTEND_MS = 120_000
+export const DEFAULT_MAX_TIMEOUT_MS = 6 * 60 * 60 * 1000 // 6 hours
+export const DEFAULT_STALL_WINDOW_MS = 300_000 // 5 minutes without thinking indicator or progress
+
+/**
+ * Inspects a conversation mapping tree to determine if a turn with `promptText` was
+ * already submitted (e.g. before a transient disconnect) and whether it is still in_progress
+ * or already completed.
+ */
+export function inspectExistingTurnInConversation(
+  conv,
+  { promptText = '', baselineNodeId = null } = {},
+) {
+  const targetPrompt = String(promptText ?? '').trim()
+  if (!conv || !conv.mapping || !targetPrompt) {
+    return { status: 'not_found', baselineNodeId: null, userNodeId: null, reply: null }
+  }
+  let cur = conv.current_node
+  const visited = new Set()
+  let latestUserNode = null
+  let latestUserNodeId = null
+  while (cur && conv.mapping[cur] && !visited.has(cur)) {
+    visited.add(cur)
+    const node = conv.mapping[cur]
+    const m = node.message
+    if (m?.author?.role === 'user') {
+      latestUserNode = node
+      latestUserNodeId = cur
+      break
+    }
+    if (baselineNodeId && cur === baselineNodeId) {
+      break
+    }
+    cur = node.parent
+  }
+  if (!latestUserNode || !latestUserNodeId) {
+    return { status: 'not_found', baselineNodeId: null, userNodeId: null, reply: null }
+  }
+  const userParts = (latestUserNode.message?.content?.parts || [])
+    .map((p) => (typeof p === 'string' ? p : p && typeof p.text === 'string' ? p.text : ''))
+    .join('\n')
+    .trim()
+  if (userParts !== targetPrompt) {
+    return { status: 'not_found', baselineNodeId: null, userNodeId: null, reply: null }
+  }
+  const effectiveBaseline = latestUserNode.parent || null
+  const reply = extractAssistantFromMapping(conv, { baselineNodeId: effectiveBaseline })
+  if (reply?.text) {
+    return {
+      status: 'completed',
+      baselineNodeId: effectiveBaseline,
+      userNodeId: latestUserNodeId,
+      reply,
+    }
+  }
+  return {
+    status: 'in_progress',
+    baselineNodeId: effectiveBaseline,
+    userNodeId: latestUserNodeId,
+    reply: null,
+  }
+}
+
+/**
+ * Extracts chronological intermediate thinking/commentary/tool steps and any in-progress or
+ * finished final assistant text from a /backend-api/conversation/<id> mapping object.
+ */
+export function extractTurnProgressFromMapping(conv, { baselineNodeId = null } = {}) {
+  if (!conv || !conv.mapping) {
+    return {
+      thinkingSteps: [],
+      liveFinalText: '',
+      finishedFinal: null,
+      currentNode: null,
+    }
+  }
+  const chain = []
+  let cur = conv.current_node
+  const visited = new Set()
+  while (cur && conv.mapping[cur] && !visited.has(cur)) {
+    if (baselineNodeId && cur === baselineNodeId) break
+    visited.add(cur)
+    const node = conv.mapping[cur]
+    const m = node.message
+    if (m?.author?.role === 'user') break
+    chain.push({ id: cur, node })
+    cur = node.parent
+  }
+  chain.reverse()
+
+  const thinkingSteps = []
+  let liveFinalText = ''
+  let finishedFinal = null
+
+  for (const { id: nodeId, node } of chain) {
+    const m = node.message
+    if (!m) continue
+    const role = m.author?.role
+    const ct = m.content?.content_type
+    const ch = m.channel
+    const recipient = m.recipient
+
+    if (role === 'assistant') {
+      if (ct === 'thoughts' && Array.isArray(m.content?.thoughts)) {
+        for (let i = 0; i < m.content.thoughts.length; i++) {
+          const t = m.content.thoughts[i]
+          const summary = String(t?.summary || '').trim()
+          const body = String(t?.content || '').trim()
+          const combined = summary && body ? `${summary}: ${body}` : summary || body
+          if (combined) {
+            thinkingSteps.push({ key: `${nodeId}:thought:${i}`, text: combined })
+          }
+        }
+        continue
+      }
+      if (ct === 'reasoning_recap') {
+        const recap = String(
+          m.content?.content || (m.content?.parts || []).join('') || '',
+        ).trim()
+        if (recap) {
+          thinkingSteps.push({ key: `${nodeId}:recap`, text: `[${recap}]` })
+        }
+        continue
+      }
+      if (
+        ch === 'commentary' ||
+        ch === 'analysis' ||
+        ch === 'thoughts' ||
+        (recipient && recipient !== 'all')
+      ) {
+        if (ct === 'code' || (recipient && recipient !== 'all')) {
+          const rawCode = String(
+            m.content?.text ||
+              (m.content?.parts || [])
+                .map((p) => (typeof p === 'string' ? p : p?.text || ''))
+                .join('') ||
+              '',
+          ).trim()
+          const firstLine = rawCode.split(/\r?\n/)[0]?.slice(0, 160) || ''
+          const label =
+            recipient && recipient !== 'all' ? `[工具 ${recipient}]` : '[执行命令]'
+          thinkingSteps.push({
+            key: `${nodeId}:code`,
+            text: firstLine ? `${label} ${firstLine}` : label,
+          })
+        } else if (ct === 'text' || ct === 'multimodal_text') {
+          const txt = (m.content?.parts || [])
+            .map((p) => (typeof p === 'string' ? p : p && typeof p.text === 'string' ? p.text : ''))
+            .join('')
+            .trim()
+          if (txt) {
+            thinkingSteps.push({ key: `${nodeId}:commentary`, text: txt })
+          }
+        }
+        continue
+      }
+      if ((!ch || ch === 'final') && (ct === 'text' || ct === 'multimodal_text')) {
+        const txt = (m.content?.parts || [])
+          .map((p) => (typeof p === 'string' ? p : p && typeof p.text === 'string' ? p.text : ''))
+          .join('')
+        if (txt) {
+          liveFinalText = txt
+          if (!m.status || m.status === 'finished_successfully') {
+            finishedFinal = { text: txt, messageId: m.id || nodeId }
+          }
+        }
+      }
+    } else if (role === 'tool') {
+      const toolName = String(m.author?.name || 'tool').trim()
+      thinkingSteps.push({
+        key: `${nodeId}:tool_done`,
+        text: `[工具完成: ${toolName}]`,
+      })
+    }
+  }
+
+  return {
+    thinkingSteps,
+    liveFinalText,
+    finishedFinal,
+    currentNode: conv.current_node || null,
+  }
+}
+
+/**
+ * Reads live thinking/working/subagent/command indicators from the ChatGPT Web DOM.
+ */
+export async function extractLiveProgressFromDomInPage(page) {
+  if (!page || typeof page.evaluate !== 'function') {
+    return { stopBtn: false, activeThinking: false, statusLines: [] }
+  }
+  return page
+    .evaluate(() => {
+      if (typeof document === 'undefined') {
+        return { stopBtn: false, activeThinking: false, statusLines: [] }
+      }
+      const stopBtn = Boolean(
+        document.querySelector('[data-testid="stop-button"], button[aria-label*="Stop"]'),
+      )
+      const articles = document.querySelectorAll(
+        'article[data-turn="assistant"], [data-message-author-role="assistant"]',
+      )
+      const scope = articles.length > 0 ? articles[articles.length - 1] : document.querySelector('main')
+      const statusLines = []
+      if (scope) {
+        const candidates = scope.querySelectorAll(
+          'button, summary, [data-testid*="thought"], [role="status"], span, div',
+        )
+        const statusRe =
+          /^(Working(\s+for\b.*)?|Thinking(\b.*)?|Pro thinking(\b.*)?|Running command(\b.*)?|Ran command(\b.*)?|Subagents(\b.*)?|Searching(\b.*)?|Reading(\b.*)?|Browsing(\b.*)?|正在思考.*|正在运行.*)$/i
+        const seen = new Set()
+        for (const el of candidates) {
+          if (el.children && el.children.length > 4) continue
+          const txt = (el.textContent || '').replace(/\s+/g, ' ').trim()
+          if (!txt || txt.length > 140 || seen.has(txt)) continue
+          if (statusRe.test(txt)) {
+            seen.add(txt)
+            statusLines.push(txt)
+          }
+        }
+      }
+      const activeThinking = Boolean(
+        stopBtn ||
+          (statusLines.length > 0 && !statusLines.every((s) => /^Thought for\b/i.test(s))),
+      )
+      return { stopBtn, activeThinking, statusLines }
+    })
+    .catch(() => ({ stopBtn: false, activeThinking: false, statusLines: [] }))
+}
+
+/**
+ * Computes how much of `text` can be safely streamed as `text_delta` before turn completion
+ * without leaking a raw `sandbox:/...` link before output attachments are downloaded & rewritten.
+ */
+export function safeStreamableTextLength(text) {
+  const s = String(text ?? '')
+  if (!s) return 0
+  const sandboxIdx = s.indexOf('sandbox:')
+  if (sandboxIdx >= 0) {
+    const before = s.slice(0, sandboxIdx)
+    const openBracket = before.lastIndexOf('[')
+    if (openBracket >= 0 && before.slice(openBracket).includes('](')) {
+      return openBracket
+    }
+    const openParen = before.lastIndexOf('(')
+    if (openParen >= 0 && sandboxIdx - openParen <= 2) {
+      return openParen
+    }
+    return sandboxIdx
+  }
+  const tailBracket = s.lastIndexOf('[')
+  if (tailBracket >= 0 && s.length - tailBracket < 240) {
+    const tail = s.slice(tailBracket)
+    if (!tail.includes(')')) {
+      return tailBracket
+    }
+  }
+  return s.length
+}
+
+/**
+ * Stateful deduplicator that converts mapping & DOM snapshots into incremental
+ * `thinking_delta` and `text_delta` strings.
+ */
+export class TurnProgressStreamer {
+  constructor({ nowFn = () => Date.now() } = {}) {
+    this.nowFn = nowFn
+    this.stepTextByKey = new Map()
+    this.seenDomPhaseKeys = new Set()
+    this.emittedFinalText = ''
+    this.lastThinkingEmitAt = nowFn()
+  }
+
+  ingestMappingProgress(progress) {
+    const thinkingDeltas = []
+    const textDeltas = []
+    if (!progress || typeof progress !== 'object') {
+      return { thinkingDeltas, textDeltas }
+    }
+    for (const step of progress.thinkingSteps || []) {
+      if (!step || !step.key || !step.text) continue
+      const prev = this.stepTextByKey.get(step.key) || ''
+      if (!prev) {
+        this.stepTextByKey.set(step.key, step.text)
+        thinkingDeltas.push(`${step.text}\n\n`)
+        this.lastThinkingEmitAt = this.nowFn()
+      } else if (step.text.length > prev.length && step.text.startsWith(prev)) {
+        const suffix = step.text.slice(prev.length)
+        this.stepTextByKey.set(step.key, step.text)
+        thinkingDeltas.push(suffix)
+        this.lastThinkingEmitAt = this.nowFn()
+      }
+    }
+    if (progress.liveFinalText) {
+      const delta = this.consumeIncrementalFinalText(progress.liveFinalText, {
+        finalFlush: Boolean(progress.finishedFinal),
+      })
+      if (delta) {
+        textDeltas.push(delta)
+      }
+    }
+    return { thinkingDeltas, textDeltas }
+  }
+
+  ingestDomProgress(
+    domProgress,
+    { now = this.nowFn(), startedAt = now, heartbeatIntervalMs = 25_000 } = {},
+  ) {
+    const thinkingDeltas = []
+    if (!domProgress || typeof domProgress !== 'object') {
+      return { thinkingDeltas }
+    }
+    for (const rawLine of domProgress.statusLines || []) {
+      const line = String(rawLine || '').trim()
+      if (!line) continue
+      const isPureTimer = /^(Working(\s+for\b.*)?|Thinking|Pro thinking|正在思考.*)$/i.test(line)
+      const phaseKey = isPureTimer ? 'phase:working' : `status:${line}`
+      if (!this.seenDomPhaseKeys.has(phaseKey)) {
+        this.seenDomPhaseKeys.add(phaseKey)
+        thinkingDeltas.push(`[Pro 状态] ${line}\n`)
+        this.lastThinkingEmitAt = now
+      }
+    }
+    if (
+      thinkingDeltas.length === 0 &&
+      (domProgress.stopBtn || domProgress.activeThinking) &&
+      now - this.lastThinkingEmitAt >= heartbeatIntervalMs
+    ) {
+      const elapsedSec = Math.max(1, Math.round((now - startedAt) / 1000))
+      const mins = Math.floor(elapsedSec / 60)
+      const secs = elapsedSec % 60
+      const label = mins > 0 ? `${mins}m${String(secs).padStart(2, '0')}s` : `${secs}s`
+      thinkingDeltas.push(`[Pro 仍在思考/执行中 · 已耗时 ${label}]\n`)
+      this.lastThinkingEmitAt = now
+    }
+    return { thinkingDeltas }
+  }
+
+  consumeIncrementalFinalText(fullText, { finalFlush = false } = {}) {
+    const text = String(fullText ?? '')
+    if (!text) return ''
+    if (!finalFlush) {
+      const safeLen = safeStreamableTextLength(text)
+      if (safeLen > this.emittedFinalText.length && text.startsWith(this.emittedFinalText)) {
+        const delta = text.slice(this.emittedFinalText.length, safeLen)
+        this.emittedFinalText = text.slice(0, safeLen)
+        return delta
+      }
+      return ''
+    }
+    if (text.startsWith(this.emittedFinalText)) {
+      const delta = text.slice(this.emittedFinalText.length)
+      this.emittedFinalText = text
+      return delta
+    }
+    this.emittedFinalText = text
+    return text
+  }
+}
+
+/**
+ * Classifies a ChatGPT Web approval card ([data-codex-approval-surface="true"]) under Scheme A:
+ * - Local loopback site preview (127.0.0.1 / localhost / [::1]) -> click "Allow for this chat" / "允许此聊天"
+ *   (NEVER "Allow all relevant sites" / "允许所有相关网站").
+ * - Everything else (including Auto-review workspace exposure or external domains) -> click "Deny" / "拒绝".
+ */
+export function classifyApprovalCard({ text = '', buttons = [] } = {}) {
+  const raw = String(text ?? '').replace(/\s+/g, ' ').trim()
+  const summary = raw.slice(0, 140) || '未知授权卡片'
+  const isBlockedSurface = /auto-review|公开暴露|publicly\s+expos|expose\s+workspace/i.test(raw)
+
+  const loopbackMatches = [
+    ...raw.matchAll(/(?:https?:\/\/)?((?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?)/gi),
+  ].map((m) => m[1])
+
+  const urlHostMatches = [
+    ...raw.matchAll(/https?:\/\/([^/\s:?#)"'`]+)/gi),
+    ...raw.matchAll(/\b((?:[a-z0-9-]+\.)+[a-z]{2,}|(?:\d{1,3}\.){3}\d{1,3})(?::\d{1,5})?\b/gi),
+  ].map((m) => m[1].toLowerCase())
+
+  const isLoopbackHost = (h) => {
+    const clean = String(h || '')
+      .toLowerCase()
+      .replace(/:\d+$/, '')
+    return clean === '127.0.0.1' || clean === 'localhost' || clean === '[::1]'
+  }
+
+  const nonLoopbackHosts = urlHostMatches.filter((h) => !isLoopbackHost(h))
+  const isPreviewContext =
+    /(preview your site|cloud browser to access|使用云浏览器访问|预览您的网站|\bSites\b|访问\s*(?:127\.0\.0\.1|localhost|\[::1\]))/i.test(
+      raw,
+    )
+
+  const normButtons = Array.isArray(buttons)
+    ? buttons.map((b, i) => ({
+        index: typeof b?.index === 'number' ? b.index : i,
+        label: String(typeof b === 'string' ? b : b?.label ?? '')
+          .replace(/\s+/g, ' ')
+          .trim(),
+      }))
+    : []
+
+  if (
+    !isBlockedSurface &&
+    isPreviewContext &&
+    loopbackMatches.length > 0 &&
+    nonLoopbackHosts.length === 0
+  ) {
+    const allowChatBtn = normButtons.find(
+      (b) =>
+        /(Allow for this chat|允许此聊天)/i.test(b.label) &&
+        !/(all relevant|所有相关|all sites|所有网站|always|始终)/i.test(b.label),
+    )
+    if (allowChatBtn) {
+      const targetHost = loopbackMatches[0]
+      return {
+        decision: 'allow_this_chat',
+        buttonIndex: allowChatBtn.index,
+        buttonLabel: allowChatBtn.label,
+        targetHost,
+        summary,
+        announcement: `\n[Pro 授权卡片] 检测到本地预览授权请求（${targetHost}），已按白名单自动点击「${allowChatBtn.label}」。\n`,
+      }
+    }
+  }
+
+  const denyBtn =
+    normButtons.find(
+      (b) =>
+        /^(Deny|Reject|Refuse|Block|Cancel|Dismiss|Close|拒绝|阻止|取消|关闭)$/i.test(b.label) &&
+        !/(Allow|允许)/i.test(b.label),
+    ) ||
+    normButtons.find(
+      (b) =>
+        /(Deny|Reject|Refuse|Block|Cancel|Dismiss|拒绝|阻止|取消)/i.test(b.label) &&
+        !/(Allow|允许)/i.test(b.label),
+    ) ||
+    null
+
+  const label = denyBtn ? denyBtn.label : '拒绝'
+  return {
+    decision: 'deny',
+    buttonIndex: denyBtn ? denyBtn.index : null,
+    buttonLabel: label,
+    targetHost: nonLoopbackHosts[0] || loopbackMatches[0] || null,
+    summary,
+    announcement: `\n[Pro 授权卡片] 检测到非白名单授权卡片（${summary}），已按策略自动点击「${label}」。\n`,
+  }
+}
+
+/**
+ * Detects any visible [data-codex-approval-surface="true"] card in the page DOM,
+ * applies Scheme A (whitelist local preview -> Allow for this chat; everything else -> Deny),
+ * and returns the action taken so host.mjs can broadcast it to the thinking panel.
+ */
+export async function inspectAndHandleApprovalCardInPage(page) {
+  if (!page || typeof page.evaluate !== 'function') return { handled: false }
+  const card = await page
+    .evaluate(() => {
+      if (typeof document === 'undefined') return null
+      const surface = document.querySelector('[data-codex-approval-surface="true"]')
+      if (!surface) return null
+      const text = (surface.innerText || surface.textContent || '').replace(/\s+/g, ' ').trim()
+      const btnEls = Array.from(surface.querySelectorAll('button'))
+      const buttons = btnEls
+        .map((b, index) => ({
+          index,
+          label: (b.innerText || b.textContent || b.getAttribute('aria-label') || '')
+            .replace(/\s+/g, ' ')
+            .trim(),
+        }))
+        .filter((b) => b.label.length > 0)
+      if (!text && buttons.length === 0) return null
+      return { text, buttons }
+    })
+    .catch(() => null)
+
+  if (!card) return { handled: false }
+  const classified = classifyApprovalCard(card)
+
+  if (classified.buttonIndex !== null) {
+    await page
+      .evaluate((btnIdx) => {
+        const surface = document.querySelector('[data-codex-approval-surface="true"]')
+        if (!surface) return
+        const btnEls = Array.from(surface.querySelectorAll('button'))
+        const target = btnEls[btnIdx]
+        if (target && typeof target.click === 'function') {
+          target.click()
+        }
+      }, classified.buttonIndex)
+      .catch(() => {})
+  } else if (classified.decision === 'deny' && page.keyboard) {
+    await page.keyboard.press('Escape').catch(() => {})
+  }
+
+  return {
+    handled: true,
+    ...classified,
+  }
+}
+
+/**
+ * Extracts all sandbox:/ file references and generated image/file attachment references
+ * from the current turn's assistant text and conversation mapping nodes.
+ */
+export function extractTurnOutputArtifactRefs({
+  text = '',
+  conv = null,
+  baselineNodeId = null,
+  finalMessageId = null,
+  maxFiles = 5,
+} = {}) {
+  const refs = []
+  const seenKeys = new Set()
+
+  const addSandboxUrl = (rawUrl, msgId) => {
+    const cleaned = String(rawUrl || '')
+      .trim()
+      .replace(/[.,;:!?。，、)\]}>]+$/u, '')
+    if (!cleaned.startsWith('sandbox:/')) return
+    const sandboxPath = cleaned.slice('sandbox:'.length)
+    if (!sandboxPath.startsWith('/') || sandboxPath.includes('..')) return
+    const key = `sandbox:${sandboxPath}`
+    if (seenKeys.has(key)) return
+    seenKeys.add(key)
+    const base = path.posix.basename(sandboxPath) || 'output.bin'
+    refs.push({
+      name: base,
+      sandboxUrl: cleaned,
+      sandboxPath,
+      messageId: msgId || finalMessageId || null,
+    })
+  }
+
+  const addFileId = (rawFileId, nameHint, mimeHint, msgId) => {
+    const cleanId = String(rawFileId || '')
+      .replace(/^(sediment|file-service):\/\//i, '')
+      .trim()
+    if (!cleanId || !/^(file[-_][a-zA-Z0-9_-]{4,128})$/.test(cleanId)) return
+    const key = `file:${cleanId}`
+    if (seenKeys.has(key)) return
+    seenKeys.add(key)
+    const ext =
+      mimeHint && mimeHint.includes('png')
+        ? '.png'
+        : mimeHint && (mimeHint.includes('jpeg') || mimeHint.includes('jpg'))
+          ? '.jpg'
+          : mimeHint && mimeHint.includes('webp')
+            ? '.webp'
+            : '.png'
+    refs.push({
+      name: nameHint || `${cleanId}${ext}`,
+      fileId: cleanId,
+      mimeType: mimeHint || undefined,
+      messageId: msgId || finalMessageId || null,
+    })
+  }
+
+  const scanSandboxLinks = (str, msgId) => {
+    const s = String(str ?? '')
+    const re = /sandbox:\/[^\s)"'`>\]]+/g
+    let m = re.exec(s)
+    while (m !== null) {
+      addSandboxUrl(m[0], msgId)
+      if (refs.length >= maxFiles) return
+      m = re.exec(s)
+    }
+  }
+
+  scanSandboxLinks(text, finalMessageId)
+
+  if (conv && conv.mapping && refs.length < maxFiles) {
+    let cur = conv.current_node
+    const visited = new Set()
+    const turnNodes = []
+    while (cur && conv.mapping[cur] && !visited.has(cur)) {
+      if (baselineNodeId && cur === baselineNodeId) break
+      visited.add(cur)
+      const node = conv.mapping[cur]
+      if (node.message?.author?.role === 'user') break
+      turnNodes.push({ id: cur, message: node.message })
+      cur = node.parent
+    }
+    turnNodes.reverse()
+    for (const { id: nodeId, message: m } of turnNodes) {
+      if (!m) continue
+      const role = m.author?.role
+      if (role !== 'assistant' && role !== 'tool') continue
+      const msgId = m.id || nodeId
+      for (const p of m.content?.parts || []) {
+        if (typeof p === 'string') {
+          scanSandboxLinks(p, msgId)
+        } else if (p && typeof p === 'object') {
+          if (typeof p.asset_pointer === 'string') {
+            addFileId(
+              p.asset_pointer,
+              p.metadata?.file_name || p.name || null,
+              p.mime_type || p.metadata?.mime_type || 'image/png',
+              msgId,
+            )
+          }
+        }
+        if (refs.length >= maxFiles) break
+      }
+      for (const att of m.metadata?.attachments || []) {
+        if (refs.length >= maxFiles) break
+        if (att && typeof att === 'object') {
+          if (typeof att.sandbox_path === 'string' && att.sandbox_path.startsWith('/')) {
+            addSandboxUrl(`sandbox:${att.sandbox_path}`, msgId)
+          } else if (typeof att.id === 'string') {
+            addFileId(att.id, att.name || null, att.mime_type || null, msgId)
+          }
+        }
+      }
+      if (refs.length >= maxFiles) break
+    }
+  }
+
+  return refs.slice(0, maxFiles)
+}
+
+/**
+ * Downloads Pro-generated sandbox files and image attachments using ONLY read-only
+ * ChatGPT backend APIs (/backend-api/conversation/<id>/interpreter/download and
+ * /backend-api/files/download/<fileId>). Never clicks any DOM link or button.
+ */
+export async function downloadTurnOutputArtifactsInPage(
+  page,
+  {
+    convId,
+    finalMessageId = null,
+    artifactRefs = [],
+    maxBytesPerFile = 25 * 1024 * 1024,
+  } = {},
+) {
+  if (
+    !page ||
+    typeof page.evaluate !== 'function' ||
+    !convId ||
+    !Array.isArray(artifactRefs) ||
+    artifactRefs.length === 0
+  ) {
+    return []
+  }
+
+  const results = []
+  for (const ref of artifactRefs) {
+    if (!ref || (!ref.sandboxPath && !ref.fileId)) continue
+    const meta = await page
+      .evaluate(
+        async ({ targetConvId, targetRef, fallbackMsgId, maxBytes }) => {
+          const toBase64 = (u8) => {
+            let binary = ''
+            const chunk = 0x8000
+            for (let i = 0; i < u8.length; i += chunk) {
+              binary += String.fromCharCode.apply(null, u8.subarray(i, i + chunk))
+            }
+            return btoa(binary)
+          }
+          let token = null
+          try {
+            const sessRes = await fetch('/api/auth/session', { credentials: 'include' })
+            if (sessRes.ok) {
+              const sess = await sessRes.json()
+              token = sess?.accessToken || null
+            }
+          } catch {}
+          const headers = token ? { Authorization: `Bearer ${token}` } : {}
+
+          const candidateUrls = []
+          if (targetRef.sandboxPath) {
+            const msgIds = [targetRef.messageId, fallbackMsgId].filter(Boolean)
+            for (const mid of msgIds) {
+              candidateUrls.push(
+                `/backend-api/conversation/${encodeURIComponent(targetConvId)}/interpreter/download?message_id=${encodeURIComponent(mid)}&sandbox_path=${encodeURIComponent(targetRef.sandboxPath)}`,
+              )
+            }
+            candidateUrls.push(
+              `/backend-api/conversation/${encodeURIComponent(targetConvId)}/interpreter/download?sandbox_path=${encodeURIComponent(targetRef.sandboxPath)}`,
+            )
+          }
+          if (targetRef.fileId) {
+            candidateUrls.push(
+              `/backend-api/files/download/${encodeURIComponent(targetRef.fileId)}?conversation_id=${encodeURIComponent(targetConvId)}&inline=false`,
+            )
+          }
+
+          let downloadUrl = null
+          let fileName = targetRef.name || 'output.bin'
+          let mimeType = targetRef.mimeType || null
+          let fileSize = null
+
+          for (const apiUrl of candidateUrls) {
+            try {
+              const r = await fetch(apiUrl, { credentials: 'include', headers })
+              if (!r.ok) continue
+              const ct = (r.headers.get('content-type') || '').toLowerCase()
+              if (ct.includes('application/json')) {
+                const j = await r.json()
+                if (j && typeof j.download_url === 'string' && j.download_url) {
+                  downloadUrl = j.download_url
+                  if (j.file_name) fileName = j.file_name
+                  if (j.mime_type) mimeType = j.mime_type
+                  if (typeof j.file_size_bytes === 'number') fileSize = j.file_size_bytes
+                  break
+                }
+              } else {
+                const ab = await r.arrayBuffer()
+                if (ab.byteLength > 0 && ab.byteLength <= maxBytes) {
+                  const u8 = new Uint8Array(ab)
+                  return {
+                    ok: true,
+                    name: fileName,
+                    mimeType: mimeType || ct || 'application/octet-stream',
+                    size: u8.byteLength,
+                    base64: toBase64(u8),
+                  }
+                }
+              }
+            } catch {}
+          }
+
+          if (!downloadUrl) return { ok: false }
+          if (typeof fileSize === 'number' && fileSize > maxBytes) {
+            return { ok: false, reason: 'too_large' }
+          }
+
+          try {
+            const dlRes = await fetch(downloadUrl)
+            if (dlRes.ok) {
+              const ab = await dlRes.arrayBuffer()
+              if (ab.byteLength > 0 && ab.byteLength <= maxBytes) {
+                const u8 = new Uint8Array(ab)
+                const dlMime = dlRes.headers.get('content-type')
+                return {
+                  ok: true,
+                  name: fileName,
+                  mimeType: mimeType || dlMime || 'application/octet-stream',
+                  size: u8.byteLength,
+                  base64: toBase64(u8),
+                }
+              }
+            }
+          } catch {}
+
+          return {
+            ok: false,
+            downloadUrl,
+            name: fileName,
+            mimeType,
+            size: fileSize,
+          }
+        },
+        {
+          targetConvId: convId,
+          targetRef: ref,
+          fallbackMsgId: finalMessageId,
+          maxBytes: maxBytesPerFile,
+        },
+      )
+      .catch(() => null)
+
+    if (!meta) continue
+
+    if (meta.ok && typeof meta.base64 === 'string' && meta.base64.length > 0) {
+      results.push({
+        name: meta.name || ref.name || 'output.bin',
+        ...(ref.sandboxUrl ? { sandboxUrl: ref.sandboxUrl } : {}),
+        ...(ref.sandboxPath ? { sandboxPath: ref.sandboxPath } : {}),
+        ...(ref.fileId ? { fileId: ref.fileId } : {}),
+        ...(meta.mimeType ? { mimeType: meta.mimeType } : {}),
+        size: meta.size || 0,
+        base64: meta.base64,
+      })
+      continue
+    }
+
+    if (typeof meta.downloadUrl === 'string' && meta.downloadUrl.startsWith('https://')) {
+      try {
+        let buf = null
+        const reqCtx =
+          typeof page.context === 'function' ? page.context()?.request : null
+        if (reqCtx && typeof reqCtx.get === 'function') {
+          const resp = await reqCtx.get(meta.downloadUrl, { timeout: 30_000 })
+          if (resp.ok()) {
+            buf = Buffer.from(await resp.body())
+          }
+        } else if (typeof fetch === 'function') {
+          const resp = await fetch(meta.downloadUrl)
+          if (resp.ok) {
+            buf = Buffer.from(await resp.arrayBuffer())
+          }
+        }
+        if (buf && buf.byteLength > 0 && buf.byteLength <= maxBytesPerFile) {
+          results.push({
+            name: meta.name || ref.name || 'output.bin',
+            ...(ref.sandboxUrl ? { sandboxUrl: ref.sandboxUrl } : {}),
+            ...(ref.sandboxPath ? { sandboxPath: ref.sandboxPath } : {}),
+            ...(ref.fileId ? { fileId: ref.fileId } : {}),
+            ...(meta.mimeType ? { mimeType: meta.mimeType } : {}),
+            size: buf.byteLength,
+            base64: buf.toString('base64'),
+          })
+        }
+      } catch {}
+    }
+  }
+
+  return results
+}
+
+/**
+ * Deterministic adaptive timeout & Stream-Rescue state machine for Pro long-thinking turns.
+ * Follows actual Pro progress up to maxTimeoutMs (default 6 hours = 21,600,000 ms).
+ */
 export function computeAdaptiveDeadline({
   startedAt,
   now,
   lastActivityAt,
   stopVisible,
+  activeThinkingVisible = false,
   stopGoneSince = null,
   hasFinalText = false,
-  baseTimeoutMs = 600_000,
-  stepExtendMs = 120_000,
-  maxTimeoutMs = 1_200_000,
-  stallWindowMs = 240_000,
+  baseTimeoutMs = DEFAULT_BASE_TIMEOUT_MS,
+  stepExtendMs = DEFAULT_STEP_EXTEND_MS,
+  maxTimeoutMs = DEFAULT_MAX_TIMEOUT_MS,
+  stallWindowMs = DEFAULT_STALL_WINDOW_MS,
   rescueAfterStopGoneMs = 90_000,
   currentDeadline = startedAt + baseTimeoutMs,
 }) {
   const hardCeiling = startedAt + maxTimeoutMs
   let deadline = Math.min(currentDeadline, hardCeiling)
   let extended = false
+  const activelyThinking = Boolean(stopVisible || activeThinkingVisible)
+  const hasRecentActivity = now - lastActivityAt < stallWindowMs
 
   if (
     now >= deadline &&
-    stopVisible &&
-    now - lastActivityAt < stallWindowMs &&
+    (activelyThinking || hasRecentActivity) &&
     deadline < hardCeiling
   ) {
-    deadline = Math.min(hardCeiling, deadline + stepExtendMs)
+    deadline = Math.min(hardCeiling, Math.max(now, deadline) + stepExtendMs)
     extended = true
   }
 
   const shouldRescue =
-    !stopVisible &&
+    !activelyThinking &&
     !hasFinalText &&
     stopGoneSince !== null &&
     now - stopGoneSince >= rescueAfterStopGoneMs
@@ -1261,6 +2129,54 @@ export function formatStreamJsonSystemInit({
   })
 }
 
+export function formatStreamJsonMessageStart({
+  messageId = `msg_${Date.now()}`,
+  model = 'box-gpt-6-astra-pro',
+} = {}) {
+  return JSON.stringify({
+    type: 'stream_event',
+    event: {
+      type: 'message_start',
+      message: {
+        id: messageId,
+        type: 'message',
+        role: 'assistant',
+        model,
+        content: [],
+        stop_reason: null,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+        },
+      },
+    },
+  })
+}
+
+export function formatStreamJsonThinkingBlockStart({ index = 0 } = {}) {
+  return JSON.stringify({
+    type: 'stream_event',
+    event: {
+      type: 'content_block_start',
+      index,
+      content_block: {
+        type: 'thinking',
+        thinking: '',
+      },
+    },
+  })
+}
+
+export function formatStreamJsonContentBlockStop({ index = 0 } = {}) {
+  return JSON.stringify({
+    type: 'stream_event',
+    event: {
+      type: 'content_block_stop',
+      index,
+    },
+  })
+}
+
 export function formatStreamJsonThinkingDelta(thinking) {
   return JSON.stringify({
     type: 'stream_event',
@@ -1275,7 +2191,7 @@ export function formatStreamJsonThinkingDelta(thinking) {
   })
 }
 
-export function formatStreamJsonTextDelta(text) {
+export function formatStreamJsonTextDelta(text, { outputAttachments = null } = {}) {
   return JSON.stringify({
     type: 'stream_event',
     event: {
@@ -1286,6 +2202,9 @@ export function formatStreamJsonTextDelta(text) {
         text: String(text ?? ''),
       },
     },
+    ...(Array.isArray(outputAttachments) && outputAttachments.length > 0
+      ? { outputAttachments }
+      : {}),
   })
 }
 
@@ -1294,6 +2213,7 @@ export function formatStreamJsonAssistantMessage({
   model = 'box-gpt-6-astra-pro',
   text = '',
   thinking = '',
+  outputAttachments = null,
 }) {
   const content = []
   if (thinking) {
@@ -1314,6 +2234,9 @@ export function formatStreamJsonAssistantMessage({
         output_tokens: Math.max(1, Math.ceil(text.length / 4)),
       },
     },
+    ...(Array.isArray(outputAttachments) && outputAttachments.length > 0
+      ? { outputAttachments }
+      : {}),
   })
 }
 
@@ -1322,6 +2245,7 @@ export function formatStreamJsonResult({
   resultText = '',
   isError = false,
   durationMs = 0,
+  outputAttachments = null,
 }) {
   return JSON.stringify({
     type: 'result',
@@ -1331,6 +2255,9 @@ export function formatStreamJsonResult({
     result: String(resultText ?? ''),
     duration_ms: Math.max(0, Math.round(durationMs)),
     total_cost_usd: 0,
+    ...(Array.isArray(outputAttachments) && outputAttachments.length > 0
+      ? { outputAttachments }
+      : {}),
   })
 }
 
