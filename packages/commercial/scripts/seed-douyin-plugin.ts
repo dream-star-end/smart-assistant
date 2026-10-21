@@ -13,7 +13,7 @@
  *       never printed; the QR file is deleted on exit.
  */
 
-import { chmod, rm, writeFile } from 'node:fs/promises'
+import { chmod, readFile, rm, writeFile } from 'node:fs/promises'
 
 import Docker from 'dockerode'
 
@@ -46,7 +46,8 @@ import { resolveDouyinLoginPins } from '../src/plugins/douyinSetup.js'
 
 const IMAGE_ID_RE = /^sha256:[0-9a-f]{64}$/
 // 与 douyinSetup 一致:二维码约 1 分钟后才出现,留 4 分钟扫码。
-const LOGIN_WINDOW_MS = 5 * 60_000
+// 与 douyinSetup 一致:二维码约 1 分钟出现,扫码后本人短信验证 3 分钟(设计 4.3.C)。
+const LOGIN_WINDOW_MS = 8 * 60_000
 
 function exactImageId(): string {
   if (process.env.OC_RUNTIME_CHANNEL !== 'v5') throw new Error('Douyin seed is V5-only')
@@ -75,14 +76,51 @@ async function advisoryStatus(): Promise<void> {
   })
 }
 
+/** 轮询 root-only 文件拿验证码:读到即删,只返回数字,不打印。 */
+async function waitForSmsCode(file: string, untilMs: number): Promise<string | null> {
+  while (Date.now() < untilMs) {
+    const raw = await readFile(file, 'utf8').catch(() => null)
+    if (raw !== null) {
+      await rm(file, { force: true })
+      const code = raw.replace(/[^0-9]/g, '')
+      if (/^[0-9]{4,8}$/.test(code)) return code
+      log({ step: 'sms-code-invalid-format' })
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 1000))
+  }
+  return null
+}
+
 async function scanLogin(
   service: DouyinDockerService,
   qrOut: string,
+  smsCodeFile: string,
 ): Promise<BrowserStorageStateV1> {
   const pins = await resolveDouyinLoginPins()
   let state = null as BrowserStorageStateV1 | null
   let failure = null as string | null
   let qrCount = 0
+  let attempts = 0
+  let smsDeadline = 0
+  // 先声明再赋值:回调可能在 startLogin 返回前触发,命令通过 handleRef 发出。
+  let handleRef: Awaited<ReturnType<DouyinDockerService['startLogin']>> | null = null
+  const submitNextCode = async () => {
+    if (!handleRef) return
+    if (attempts >= 3) {
+      await handleRef.command({ cmd: 'abort' }).catch(() => {})
+      return
+    }
+    const code = await waitForSmsCode(smsCodeFile, smsDeadline)
+    if (code === null) {
+      log({ step: 'sms-timeout' })
+      await handleRef.command({ cmd: 'abort' }).catch(() => {})
+      return
+    }
+    attempts += 1
+    log({ step: 'sms-submit', attempt: attempts })
+    await handleRef.command({ cmd: 'sms_code', code }).catch(() => {})
+  }
+  await rm(smsCodeFile, { force: true })
   const handle = await service.startLogin({
     sessionId: crypto.randomUUID(),
     pins,
@@ -105,11 +143,28 @@ async function scanLogin(
     onFailed: (code) => {
       failure = code
     },
+    onVerification: (kind) => {
+      log({ step: 'verification', kind })
+      smsDeadline = Date.now() + 3 * 60_000
+      void handleRef
+        ?.command({ cmd: kind === 'sms_available' ? 'send_sms' : 'abort' })
+        .catch(() => {})
+    },
+    onSmsSent: () => {
+      log({ step: 'sms-sent', file: smsCodeFile, hint: '把手机收到的验证码写进这个文件(只写数字)' })
+      void submitNextCode()
+    },
+    onSmsRejected: () => {
+      log({ step: 'sms-rejected', attemptsLeft: 3 - attempts })
+      void submitNextCode()
+    },
   })
+  handleRef = handle
   let doneError: unknown = null
   await handle.done.catch((error: unknown) => {
     doneError = error ?? new Error('WORKER_FAILED')
   })
+  await rm(smsCodeFile, { force: true }).catch(() => {})
   return requireCleanLogin({ state, failure, doneError })
 }
 
@@ -159,7 +214,11 @@ async function smoke(
   return { storageState, summary }
 }
 
-async function verifyAndSeed(userId: number | null, qrOut: string): Promise<void> {
+async function verifyAndSeed(
+  userId: number | null,
+  qrOut: string,
+  smsCodeFile: string,
+): Promise<void> {
   if (userId !== null) {
     const user = await query<{ status: string }>('SELECT status FROM users WHERE id = $1', [userId])
     if (user.rows[0]?.status !== 'active') throw new Error('verification user is not active')
@@ -176,7 +235,7 @@ async function verifyAndSeed(userId: number | null, qrOut: string): Promise<void
   })
   try {
     log({ step: 'login-start', windowSec: LOGIN_WINDOW_MS / 1000 })
-    const scanned = await scanLogin(service, qrOut)
+    const scanned = await scanLogin(service, qrOut, smsCodeFile)
     await rm(qrOut, { force: true })
     const { storageState, summary } = await smoke(service, scanned)
     log({ step: 'smoke-passed', ...summary })
@@ -213,8 +272,8 @@ async function main(): Promise<number> {
   }
   try {
     if (cli.mode === 'advisory-status') await advisoryStatus()
-    else if (cli.mode === 'verify-only') await verifyAndSeed(null, cli.qrOut)
-    else await verifyAndSeed(cli.userId, cli.qrOut)
+    else if (cli.mode === 'verify-only') await verifyAndSeed(null, cli.qrOut, cli.smsCodeFile)
+    else await verifyAndSeed(cli.userId, cli.qrOut, cli.smsCodeFile)
     return 0
   } catch (error) {
     console.error(`seed-douyin-plugin: ${error instanceof Error ? error.message : String(error)}`)

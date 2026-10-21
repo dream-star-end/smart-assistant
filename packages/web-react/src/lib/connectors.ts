@@ -291,10 +291,20 @@ export type KnowledgePlanetAutomationView = {
 
 export type ManagedBrowserSetupView = {
   sessionId: string
-  status: 'waiting_for_scan' | 'finalizing' | 'active' | 'cancelled' | 'expired' | 'failed'
+  status:
+    | 'waiting_for_scan'
+    | 'waiting_for_sms'
+    | 'finalizing'
+    | 'active'
+    | 'cancelled'
+    | 'expired'
+    | 'failed'
   phase?:
     | 'generating_qr'
     | 'waiting_for_scan'
+    | 'sms_required'
+    | 'sms_sent'
+    | 'sms_verifying'
     | 'scan_confirmed'
     | 'saving'
     | 'active'
@@ -309,6 +319,16 @@ export type ManagedBrowserSetupView = {
   expiresAt: string
   accountId?: string
   errorCode?: string
+  /** 当前二维码的服务端过期时间（抖音，OCV5-553）。 */
+  qrExpireAt?: string
+  /** 扫码后的本人短信验证（抖音，OCV5-553 4.3.C）。验证码本身从不出现在视图里。 */
+  sms?: {
+    deadline: string
+    resendAfter: string
+    attemptsLeft: number
+    sent: boolean
+    rejected: boolean
+  }
 }
 
 export type KnowledgePlanetSetupView = ManagedBrowserSetupView

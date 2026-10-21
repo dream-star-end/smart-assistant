@@ -32,10 +32,14 @@ import {
   validateDouyinState,
 } from './douyin.js'
 import { classifyDouyinSetupPin } from './douyinContract.js'
+import { type DouyinSmsQuotaResult, consumeDouyinSmsQuota } from './douyinSmsLimit.js'
 import { loadVerifiedRuntimePluginContract } from './review.js'
 
-// 抖音登录组件懒加载，二维码约 1 分钟后才出现（g553 侦察），比微博 / B 站多给 1 分钟扫码时间。
-const SETUP_TTL_MS = 5 * 60_000
+// 二维码约 1 分钟后才出现（g553 侦察）；扫码后抖音要求本人短信验证，验证窗口 3 分钟（设计 4.3.C）。
+const SETUP_TTL_MS = 8 * 60_000
+const SMS_WINDOW_MS = 3 * 60_000
+const SMS_MAX_ATTEMPTS = 3
+const SMS_CODE_RE = /^[0-9]{4,8}$/
 const TERMINAL_RETENTION_MS = 15 * 60_000
 const RELINK_COMMIT_TIMEOUT_MS = 30_000
 
@@ -51,6 +55,10 @@ export class DouyinSetupError extends Error {
     | 'CAPACITY_EXCEEDED'
     | 'SETUP_FAILED'
     | 'CLOSING'
+    | 'SMS_NOT_EXPECTED'
+    | 'SMS_INVALID'
+    | 'SMS_RATE_LIMITED'
+    | 'SMS_ATTEMPTS_EXCEEDED'
 
   constructor(code: DouyinSetupError['code'], message: string = code) {
     super(message)
@@ -61,6 +69,7 @@ export class DouyinSetupError extends Error {
 
 type PublicSetupStatus =
   | 'waiting_for_scan'
+  | 'waiting_for_sms'
   | 'finalizing'
   | 'active'
   | 'cancelled'
@@ -72,6 +81,9 @@ type TerminalClaim = 'authenticated' | 'cancelled' | 'expired' | 'failed'
 export type DouyinSetupPhase =
   | 'generating_qr'
   | 'waiting_for_scan'
+  | 'sms_required'
+  | 'sms_sent'
+  | 'sms_verifying'
   | 'scan_confirmed'
   | 'saving'
   | 'active'
@@ -96,6 +108,16 @@ interface SetupSession {
   relinkTarget: { accountId: string; expectedAccountInstanceId: string } | null
   errorCode: string | null
   agentReady: boolean
+  qrExpireAt: number | null
+  /** 本人短信验证进度。验证码本身从不进 session。 */
+  sms: {
+    deadline: number
+    resendAfter: number
+    attemptsLeft: number
+    sent: boolean
+    rejected: boolean
+    failCode: string | null
+  } | null
 }
 
 export interface DouyinSetupView {
@@ -108,6 +130,16 @@ export interface DouyinSetupView {
   expiresAt: string
   accountId?: string
   errorCode?: string
+  /** 当前二维码的服务端过期时间（等待扫码时）。 */
+  qrExpireAt?: string
+  /** 本人短信验证（waiting_for_sms 时）：倒计时截止、可重发时间、剩余提交次数。 */
+  sms?: {
+    deadline: string
+    resendAfter: string
+    attemptsLeft: number
+    sent: boolean
+    rejected: boolean
+  }
 }
 
 function safeUserId(value: number): number {
@@ -204,6 +236,8 @@ export class DouyinSetupManager {
         storageState: unknown
       }) => Promise<{ id: string }>
       resolvePins?: () => Promise<ManagedBrowserPinnedOrigin[]>
+      /** 测试注入；默认用 Redis 计数（douyinSmsLimit.ts）。 */
+      smsQuota?: (userId: number) => Promise<DouyinSmsQuotaResult>
     } = {},
   ) {
     this.pool = opts.pool ?? getPool()
@@ -219,6 +253,7 @@ export class DouyinSetupManager {
       if (
         session.createdAt >= threshold ||
         session.status === 'waiting_for_scan' ||
+        session.status === 'waiting_for_sms' ||
         session.status === 'finalizing'
       )
         continue
@@ -289,7 +324,112 @@ export class DouyinSetupManager {
       expiresAt: new Date(session.expiresAt).toISOString(),
       ...(session.accountId ? { accountId: session.accountId } : {}),
       ...(session.errorCode ? { errorCode: session.errorCode } : {}),
+      ...(session.status === 'waiting_for_scan' && session.qr && session.qrExpireAt
+        ? { qrExpireAt: new Date(session.qrExpireAt).toISOString() }
+        : {}),
+      ...(session.status === 'waiting_for_sms' && session.sms
+        ? {
+            sms: {
+              deadline: new Date(session.sms.deadline).toISOString(),
+              resendAfter: new Date(session.sms.resendAfter).toISOString(),
+              attemptsLeft: session.sms.attemptsLeft,
+              sent: session.sms.sent,
+              rejected: session.sms.rejected,
+            },
+          }
+        : {}),
     }
+  }
+
+  private smsQuota(userId: number): Promise<DouyinSmsQuotaResult> {
+    return this.opts.smsQuota
+      ? this.opts.smsQuota(userId)
+      : consumeDouyinSmsQuota({ redis: this.opts.redis, userId })
+  }
+
+  /** 让登录 worker 放弃本次登录（它会以 VERIFICATION_REQUIRED 结束），并记下给用户看的原因。 */
+  private abortVerification(session: SetupSession, failCode: string): void {
+    if (session.sms) session.sms.failCode = failCode
+    void session.handle
+      ?.command({ cmd: 'abort' })
+      .catch(() => session.handle?.stop().catch(() => {}))
+  }
+
+  /** 扫码后抖音要求本人验证：先过限频，再让 worker 点「接收短信验证码」。 */
+  private async beginVerification(
+    session: SetupSession,
+    kind: 'sms_available' | 'unsupported',
+  ): Promise<void> {
+    if (session.terminal !== null || session.status !== 'waiting_for_scan') return
+    wipe(session.qr)
+    session.qr = null
+    session.qrExpireAt = null
+    session.status = 'waiting_for_sms'
+    session.phase = 'sms_required'
+    session.errorCode = null
+    session.sms = {
+      deadline: this.now() + SMS_WINDOW_MS,
+      resendAfter: 0,
+      attemptsLeft: SMS_MAX_ATTEMPTS,
+      sent: false,
+      rejected: false,
+      failCode: null,
+    }
+    if (kind !== 'sms_available') return this.abortVerification(session, 'VERIFICATION_UNSUPPORTED')
+    const quota = await this.smsQuota(session.userId).catch(() => 'unavailable' as const)
+    if (session.terminal !== null) return
+    if (quota !== 'ok')
+      return this.abortVerification(
+        session,
+        quota === 'limited' ? 'SMS_RATE_LIMITED' : 'SMS_UNAVAILABLE',
+      )
+    await session.handle?.command({ cmd: 'send_sms' }).catch(() => this.failSession(session))
+  }
+
+  /** 用户在我们页面上输入的验证码：校验格式和次数后直接写给 worker，不保存、不回显、不记录。 */
+  async submitSms(userIdInput: number, sessionId: string, code: unknown): Promise<DouyinSetupView> {
+    const session = this.sessionFor(safeUserId(userIdInput), sessionId)
+    await this.expireIfNeeded(session)
+    const sms = session.sms
+    if (session.status !== 'waiting_for_sms' || !sms || !sms.sent || session.phase !== 'sms_sent')
+      throw new DouyinSetupError('SMS_NOT_EXPECTED')
+    if (typeof code !== 'string' || !SMS_CODE_RE.test(code))
+      throw new DouyinSetupError('SMS_INVALID')
+    if (sms.attemptsLeft <= 0) throw new DouyinSetupError('SMS_ATTEMPTS_EXCEEDED')
+    sms.attemptsLeft -= 1
+    sms.rejected = false
+    session.phase = 'sms_verifying'
+    session.errorCode = null
+    if (!session.handle) throw new DouyinSetupError('SMS_NOT_EXPECTED')
+    await session.handle.command({ cmd: 'sms_code', code }).catch(() => {
+      this.failSession(session)
+    })
+    return this.view(session)
+  }
+
+  /** 重发短信：过了 resendAfter 才行，并且同样先过限频。 */
+  async resendSms(userIdInput: number, sessionId: string): Promise<DouyinSetupView> {
+    const session = this.sessionFor(safeUserId(userIdInput), sessionId)
+    await this.expireIfNeeded(session)
+    const sms = session.sms
+    if (
+      session.status !== 'waiting_for_sms' ||
+      !sms ||
+      !sms.sent ||
+      session.phase !== 'sms_sent' ||
+      this.now() < sms.resendAfter
+    )
+      throw new DouyinSetupError('SMS_NOT_EXPECTED')
+    const quota = await this.smsQuota(session.userId).catch(() => 'unavailable' as const)
+    if (quota !== 'ok')
+      throw new DouyinSetupError(quota === 'limited' ? 'SMS_RATE_LIMITED' : 'UNAVAILABLE')
+    session.phase = 'sms_required'
+    session.errorCode = null
+    if (!session.handle) throw new DouyinSetupError('SMS_NOT_EXPECTED')
+    await session.handle.command({ cmd: 'resend_sms' }).catch(() => {
+      this.failSession(session)
+    })
+    return this.view(session)
   }
 
   private failSession(session: SetupSession, code = 'SETUP_FAILED'): void {
@@ -409,7 +549,10 @@ export class DouyinSetupManager {
       if (current) await this.expireIfNeeded(current)
       // Starting is idempotent for an in-flight setup. A refreshed browser can
       // recover the private session id instead of being locked out until TTL.
-      if (current && ['waiting_for_scan', 'finalizing'].includes(current.status)) {
+      if (
+        current &&
+        ['waiting_for_scan', 'waiting_for_sms', 'finalizing'].includes(current.status)
+      ) {
         if ((current.relinkTarget?.accountId ?? null) !== relinkAccountId)
           throw new DouyinSetupError('SETUP_ACTIVE')
         return this.view(current)
@@ -463,6 +606,8 @@ export class DouyinSetupManager {
       relinkTarget,
       errorCode: null,
       agentReady: entitled.agentReady,
+      qrExpireAt: null,
+      sms: null,
     }
     this.sessions.set(session.id, session)
     this.currentByUser.set(userId, session.id)
@@ -471,11 +616,35 @@ export class DouyinSetupManager {
         sessionId: session.id,
         pins,
         deadlineMs: session.expiresAt,
-        onQr: (png) => {
+        onQr: (png, expireAt) => {
           if (session.terminal !== null || session.status !== 'waiting_for_scan') return
           wipe(session.qr)
           session.qr = Buffer.from(png)
+          session.qrExpireAt = expireAt
           session.phase = 'waiting_for_scan'
+        },
+        onVerification: (kind) => {
+          void this.beginVerification(session, kind)
+        },
+        onSmsSent: (resendAfterSec) => {
+          const sms = session.sms
+          if (session.terminal !== null || session.status !== 'waiting_for_sms' || !sms) return
+          sms.sent = true
+          sms.resendAfter = this.now() + resendAfterSec * 1000
+          session.phase = 'sms_sent'
+        },
+        onSmsRejected: () => {
+          const sms = session.sms
+          if (session.terminal !== null || session.status !== 'waiting_for_sms' || !sms) return
+          sms.rejected = true
+          session.phase = 'sms_sent'
+          session.errorCode = 'SMS_REJECTED'
+          if (sms.attemptsLeft <= 0) this.abortVerification(session, 'SMS_ATTEMPTS_EXCEEDED')
+        },
+        onSmsResendFailed: () => {
+          if (session.terminal !== null || session.status !== 'waiting_for_sms') return
+          session.phase = 'sms_sent'
+          session.errorCode = 'SMS_RESEND_FAILED'
         },
         onAuthenticated: (state) => {
           if (!claim(session, 'authenticated')) return
@@ -497,7 +666,8 @@ export class DouyinSetupManager {
           session.qr = null
           session.status = terminal === 'expired' ? 'expired' : 'failed'
           session.phase = terminal === 'expired' ? 'expired' : 'failed'
-          session.errorCode = code
+          // 我们主动放弃验证时（限频 / 次数用尽 / 不支持的验证方式），给用户看真正的原因。
+          session.errorCode = session.sms?.failCode ?? code
         },
       })
       session.handle = handle
@@ -544,7 +714,11 @@ export class DouyinSetupManager {
           }
         })
         .catch(() => {
-          if (session.status === 'waiting_for_scan' || session.status === 'finalizing')
+          if (
+            session.status === 'waiting_for_scan' ||
+            session.status === 'waiting_for_sms' ||
+            session.status === 'finalizing'
+          )
             this.failSession(session)
         })
       return this.view(session)
@@ -560,7 +734,22 @@ export class DouyinSetupManager {
   }
 
   private async expireIfNeeded(session: SetupSession): Promise<void> {
-    if (session.status !== 'waiting_for_scan' || this.now() < session.expiresAt) return
+    const smsLate =
+      session.status === 'waiting_for_sms' && !!session.sms && this.now() >= session.sms.deadline
+    if (smsLate) {
+      // 不是二维码过期，而是本人验证没在 3 分钟内完成：以 failed + SMS_EXPIRED 结束，前端给专属说明。
+      if (!claim(session, 'failed')) return
+      session.status = 'failed'
+      session.phase = 'failed'
+      session.errorCode = 'SMS_EXPIRED'
+      await session.handle?.stop().catch(() => {})
+      return
+    }
+    if (
+      (session.status !== 'waiting_for_scan' && session.status !== 'waiting_for_sms') ||
+      this.now() < session.expiresAt
+    )
+      return
     if (!claim(session, 'expired')) return
     session.status = 'expired'
     session.phase = 'expired'

@@ -30,6 +30,11 @@ export type ManagedPluginProvider = {
   codeTexts?: Readonly<Record<string, string>>
   /** 生成二维码前额外展示的提示（如账号风控风险）；没有就不填。 */
   setupNotice?: string
+  /** 扫码后的本人短信验证（抖音）。没有就不填。 */
+  sms?: {
+    submit: (auth: AuthSession, sessionId: string, code: string) => Promise<KnowledgePlanetSetupView>
+    resend: (auth: AuthSession, sessionId: string) => Promise<KnowledgePlanetSetupView>
+  }
   start: (auth: AuthSession, relinkAccountId?: string) => Promise<KnowledgePlanetSetupView>
   get: (auth: AuthSession, sessionId: string) => Promise<KnowledgePlanetSetupView>
   qr: (auth: AuthSession, sessionId: string) => ReturnType<typeof api.getWeiboSetupQr>
@@ -102,12 +107,23 @@ const MANAGED_PLUGIN_PROVIDERS: Record<ManagedQrProvider, ManagedPluginProvider>
       '抖音触发了验证码或风控，本次授权已安全停止，系统不会尝试绕过。请稍后再试；若反复出现，请先在抖音 App 确认账号状态正常。',
     codeTexts: {
       VERIFICATION_REQUIRED:
-        '抖音要求账号本人完成身份验证（如短信验证），本次授权未生效。请先在手机抖音上完成验证，再重新扫码。',
+        '抖音要求的本人验证没有完成，本次授权未生效。请稍后重新扫码，并在弹出的短信验证里输入验证码。',
+      VERIFICATION_UNSUPPORTED:
+        '抖音这次要求的验证方式不是短信验证码（例如刷脸），暂不支持。请稍后重新扫码。',
       LOGIN_STATE_UNSUPPORTED:
         '抖音返回的登录凭据无法安全保存，本次登录未生效。这是平台侧限制，请不要反复扫码，并联系管理员。',
+      SMS_RATE_LIMITED:
+        '为保护你的账号，验证短信发送过于频繁（1 分钟 1 条、1 小时 3 条、1 天 5 条），本次已停止。请稍后再试。',
+      SMS_UNAVAILABLE: '暂时无法发送验证短信，本次授权已停止。请稍后再试。',
+      SMS_ATTEMPTS_EXCEEDED: '验证码已输错多次，本次授权已结束。请稍后重新扫码。',
+      SMS_EXPIRED: '短信验证超时（扫码后需在 3 分钟内完成），本次授权已结束。请重新扫码。',
     },
     setupNotice:
-      '抖音插件以浏览器自动化方式使用你的个人抖音账号，这种方式不在抖音官方开放能力之内，可能触发抖音风控，严重时限制或封禁账号，风险由你本人承担。遇到验证码或本人验证时插件会立即停止，不会尝试绕过。抖音二维码通常需要约 1 分钟才能生成。',
+      '抖音插件以浏览器自动化方式使用你的个人抖音账号，这种方式不在抖音官方开放能力之内，可能触发抖音风控，严重时限制或封禁账号，风险由你本人承担。抖音二维码通常需要约 1 分钟才能生成；扫码后抖音会要求本人短信验证，请在 3 分钟内在这里输入手机收到的验证码（我们只代为提交，不保存）。遇到图形验证码或滑块时插件会立即停止，不会尝试绕过。',
+    sms: {
+      submit: (auth, sessionId, code) => api.submitDouyinSms(auth, sessionId, code),
+      resend: (auth, sessionId) => api.resendDouyinSms(auth, sessionId),
+    },
     start: (auth, relinkAccountId) =>
       relinkAccountId ? api.startDouyinSetup(auth, relinkAccountId) : api.startDouyinSetup(auth),
     get: (auth, sessionId) => api.getDouyinSetup(auth, sessionId),

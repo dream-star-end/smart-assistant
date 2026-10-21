@@ -136,32 +136,40 @@ export function requireCleanLogin<T>(input: {
 }
 
 export const DOUYIN_SEED_CLI_USAGE =
-  'usage: seed-douyin-plugin.ts --advisory-status | (--verify-only | --verify-and-seed-user=ID) --qr-out=/root/<file>.png'
+  'usage: seed-douyin-plugin.ts --advisory-status | (--verify-only | --verify-and-seed-user=ID) --qr-out=/root/<file>.png --sms-code-file=/root/<file>'
 
 export type DouyinSeedCli =
   | { mode: 'advisory-status' }
   /** 真实扫码 + 逐动作实测,不写库、不上架(上架前检查)。 */
-  | { mode: 'verify-only'; qrOut: string }
-  | { mode: 'verify-and-seed'; userId: number; qrOut: string }
+  | { mode: 'verify-only'; qrOut: string; smsCodeFile: string }
+  | { mode: 'verify-and-seed'; userId: number; qrOut: string; smsCodeFile: string }
 
+/**
+ * --sms-code-file:扫码后抖音要求本人短信验证(设计 4.3.C),操作员把手机收到的验证码写进这个 root-only 文件;
+ * 脚本每秒轮询,读到就删,只交给登录 worker,不打印。
+ */
 export function parseDouyinSeedCliArgs(argv: readonly string[]): DouyinSeedCli {
   if (argv.length === 1 && argv[0] === '--advisory-status') return { mode: 'advisory-status' }
   let userId: number | null = null
   let verifyOnly = false
   let qrOut: string | null = null
+  let smsCodeFile: string | null = null
   for (const arg of argv) {
     const user = /^--verify-and-seed-user=(\d{1,16})$/.exec(arg)
     const qr = /^--qr-out=(\/root\/[A-Za-z0-9._-]{1,64}\.png)$/.exec(arg)
+    const sms = /^--sms-code-file=(\/root\/[A-Za-z0-9._-]{1,64})$/.exec(arg)
     if (user && userId === null && !verifyOnly) userId = Number(user[1])
     else if (arg === '--verify-only' && !verifyOnly && userId === null) verifyOnly = true
     else if (qr && qrOut === null && !qr[1]!.includes('..')) qrOut = qr[1]!
+    else if (sms && smsCodeFile === null && !sms[1]!.includes('..')) smsCodeFile = sms[1]!
     else throw new Error(DOUYIN_SEED_CLI_USAGE)
   }
-  if (qrOut === null) throw new Error(DOUYIN_SEED_CLI_USAGE)
-  if (verifyOnly) return { mode: 'verify-only', qrOut }
+  if (qrOut === null || smsCodeFile === null || smsCodeFile === qrOut)
+    throw new Error(DOUYIN_SEED_CLI_USAGE)
+  if (verifyOnly) return { mode: 'verify-only', qrOut, smsCodeFile }
   if (userId === null || !Number.isSafeInteger(userId) || userId <= 0)
     throw new Error(DOUYIN_SEED_CLI_USAGE)
-  return { mode: 'verify-and-seed', userId, qrOut }
+  return { mode: 'verify-and-seed', userId, qrOut, smsCodeFile }
 }
 
 export async function findApprovedDouyinPlugin(
