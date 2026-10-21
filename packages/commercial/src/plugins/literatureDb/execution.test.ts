@@ -920,13 +920,21 @@ test('validatePdfStructureSync and LiteratureArtifactStore accept publisher PDFs
   )
   const pdfWithObjStmJs = Buffer.concat([
     Buffer.from(
-      `%PDF-1.5\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R /OpenAction 5 0 R >>\nendobj\n4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length ${objStmPayload.length} >>\nstream\n`,
+      `%PDF-1.5\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R /OpenAction 5 0 R >>\nendobj\n4 0 obj\n<< /Type /ObjStm /Filter /FlateDecode /N 1 /First 4 /Length ${objStmPayload.length} >>\nstream\n`,
       'latin1',
     ),
     objStmPayload,
     Buffer.from('\nendstream\nendobj\ntrailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n100\n%%EOF\n', 'latin1'),
   ])
   assert.equal(validatePdfStructureSync(pdfWithObjStmJs), false)
+
+  // Uncompressed /ObjStm with % /Encrypt comment is also rejected when containing /JavaScript
+  const uncompPayload = '5 0 << /S /JavaScript /JS (noop) >>'
+  const pdfWithUncompressedObjStmJs = Buffer.from(
+    `%PDF-1.5\n% /Encrypt\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R /OpenAction 5 0 R >>\nendobj\n4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length ${uncompPayload.length} >>\nstream\n${uncompPayload}\nendstream\nendobj\ntrailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n100\n%%EOF\n`,
+    'latin1',
+  )
+  assert.equal(validatePdfStructureSync(pdfWithUncompressedObjStmJs), false)
 })
 
 test('resolveLiteratureCaptchaBundleRoot honors env override and falls back to default bundle root when present', () => {
