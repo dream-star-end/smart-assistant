@@ -1,18 +1,18 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
-import { WEIBO_WRITE_FAILURE_CODES } from './weiboWriteObservability.js'
 import {
   PLUGIN_PASSTHROUGH_ERROR_CODES,
+  type PluginRetrySafe,
+  type PluginSideEffect,
   UNKNOWN_WRITE_NEXT_ACTION,
   connectorRpcErrorEnvelope,
   connectorRpcReplayEnvelope,
   isPluginPassthroughErrorCode,
   resolvePluginErrorGuidance,
   weiboRuntimePublicMessage,
-  type PluginRetrySafe,
-  type PluginSideEffect,
 } from './pluginErrorGuidance.js'
+import { WEIBO_WRITE_FAILURE_CODES } from './weiboWriteObservability.js'
 
 type Exact = {
   retrySafe: PluginRetrySafe
@@ -22,8 +22,16 @@ type Exact = {
   message?: string
 }
 
-function assertExact(code: string, extra: { status?: string }, expected: Exact): void {
-  const g = resolvePluginErrorGuidance({ code, ...extra })
+/**
+ * 下面的精确文案表是微博插件的历史回包;provider 缺省按 'weibo' 断言,证明 OCV5-553 按 provider
+ * 生成文案后微博逐字不变。
+ */
+function assertExact(
+  code: string,
+  extra: { status?: string; provider?: string | null },
+  expected: Exact,
+): void {
+  const g = resolvePluginErrorGuidance({ provider: 'weibo', ...extra, code })
   assert.equal(g.retrySafe, expected.retrySafe, `${code} ${extra.status ?? 'read'} retrySafe`)
   assert.equal(
     g.requiresReauth,
@@ -353,7 +361,8 @@ describe('plugin error guidance table', () => {
 
   test('read and auth codes have exact guidance', () => {
     for (const [code, expected] of Object.entries(READ_AUTH_EXACT)) {
-      assertExact(code, {}, expected)
+      // CONNECTION_ERROR 的历史表项是 rpc 层的通用文案(不带 provider);微博专用文案见上面的用例。
+      assertExact(code, code === 'CONNECTION_ERROR' ? { provider: null } : {}, expected)
     }
   })
 
@@ -474,12 +483,99 @@ describe('plugin error guidance table', () => {
 
   test('unknown codes keep a conservative default and are not passthrough', () => {
     assert.equal(isPluginPassthroughErrorCode('TOTALLY_NEW_CODE'), false)
-    assertExact('TOTALLY_NEW_CODE', {}, {
-      retrySafe: 'no',
-      requiresReauth: false,
-      sideEffect: 'none',
-      nextAction: '请按错误码处理，不要无依据重试',
-      message: '操作失败',
+    assertExact(
+      'TOTALLY_NEW_CODE',
+      {},
+      {
+        retrySafe: 'no',
+        requiresReauth: false,
+        sideEffect: 'none',
+        nextAction: '请按错误码处理，不要无依据重试',
+        message: '操作失败',
+      },
+    )
+  })
+})
+
+describe('provider-aware wording (OCV5-553)', () => {
+  const PROVIDER_CODES = [
+    'LOGIN_EXPIRED',
+    'LOGIN_EXPIRED_ACCOUNT',
+    'RELINK_REQUIRED',
+    'UPSTREAM_FAILED',
+    'EXECUTION_FAILED',
+    'CAPACITY_EXCEEDED',
+    'UNAVAILABLE',
+    'IMAGE_MISMATCH',
+    'PROTOCOL',
+    'CLEANUP_FAILED',
+    'CLOSING',
+    'NOT_INSTALLED',
+    'TERMS_REQUIRED',
+    'WRITE_DISABLED',
+  ] as const
+
+  test('未传或未知 provider:通用码不再出现「微博」,retrySafe/requiresReauth 与微博一致', () => {
+    for (const code of PROVIDER_CODES) {
+      const weibo = resolvePluginErrorGuidance({ code, provider: 'weibo' })
+      for (const provider of [undefined, null, 'github', 'douyin']) {
+        const g = resolvePluginErrorGuidance({ code, provider })
+        assert.doesNotMatch(`${g.message}${g.nextAction}`, /微博/, `${code} ${provider}`)
+        assert.equal(g.retrySafe, weibo.retrySafe, code)
+        assert.equal(g.requiresReauth, weibo.requiresReauth, code)
+      }
+    }
+    assert.equal(resolvePluginErrorGuidance({ code: 'LOGIN_EXPIRED' }).message, '插件登录已过期')
+    assert.equal(
+      resolvePluginErrorGuidance({ code: 'RELINK_REQUIRED' }).nextAction,
+      '引导用户到 管理中心 → 插件 重新授权该插件账号',
+    )
+    assert.equal(
+      resolvePluginErrorGuidance({ code: 'WRITE_DISABLED' }).nextAction,
+      '请先在设置中阅读免责声明并开启该插件写入',
+    )
+  })
+
+  test('已知插件用自己的名字,且不出现「微博」', () => {
+    const cases: Array<[string, RegExp]> = [
+      ['zhihu', /知乎/],
+      ['bili-account', /B 站/],
+      ['knowledge-planet', /知识星球/],
+      ['literature-db', /文献数据库/],
+    ]
+    for (const [provider, name] of cases) {
+      for (const code of ['LOGIN_EXPIRED', 'EXECUTION_FAILED', 'NOT_INSTALLED', 'WRITE_DISABLED']) {
+        const g = resolvePluginErrorGuidance({ code, provider })
+        assert.match(`${g.message}${g.nextAction}`, name, `${provider} ${code}`)
+        assert.doesNotMatch(`${g.message}${g.nextAction}`, /微博/, `${provider} ${code}`)
+      }
+    }
+    assert.equal(
+      resolvePluginErrorGuidance({ code: 'LOGIN_EXPIRED_ACCOUNT', provider: 'zhihu' }).nextAction,
+      '引导用户重新扫码授权知乎',
+    )
+  })
+
+  test('RPC 信封按 provider 生成;不传 provider 时为中性文案', () => {
+    assert.equal(
+      connectorRpcErrorEnvelope('LOGIN_EXPIRED_ACCOUNT', 'weibo').nextAction,
+      '引导用户重新扫码授权微博',
+    )
+    assert.doesNotMatch(connectorRpcErrorEnvelope('LOGIN_EXPIRED_ACCOUNT').nextAction, /微博/)
+    const replay = connectorRpcReplayEnvelope({
+      status: 'failed',
+      errorCode: 'WRITE_DISABLED',
+      provider: 'zhihu',
     })
+    assert.equal(replay.nextAction, '请先在设置中阅读免责声明并开启知乎写入')
+  })
+
+  test('WRITE_DAILY_LIMIT:透传、未发送、不重试', () => {
+    assert.equal(isPluginPassthroughErrorCode('WRITE_DAILY_LIMIT'), true)
+    const failed = connectorRpcReplayEnvelope({ status: 'failed', errorCode: 'WRITE_DAILY_LIMIT' })
+    assert.equal(failed.retrySafe, 'no')
+    assert.equal(failed.sideEffect, 'none')
+    assert.match(failed.nextAction ?? '', /明天再试/)
+    assert.match(failed.nextAction ?? '', /不要换动作/)
   })
 })

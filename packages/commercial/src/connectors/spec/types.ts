@@ -325,6 +325,13 @@ const Oauth2ConfigProps = {
   /** client 凭据供给模式(**必填**,strict:作者必须显式表态,不给隐式默认值)。 */
   clientProvisioning: ClientProvisioning,
   clientAuth: ClientAuth,
+  /**
+   * client 公开标识的**线上参数名**(可选;缺省 = RFC 6749 的 `client_id`)。抖音开放平台等国内
+   * provider 用 `client_key`。authorize URL、code 换 token(form 型 clientAuth)、refresh 默认字段名
+   * 三处一致使用它;basic 型 clientAuth 走 Authorization 头,不受影响。refresh 若另声明了
+   * refreshFieldNames 映射 client_id,以 refreshFieldNames 为准。不得与其它协议参数名相同(编译期拒)。
+   */
+  clientIdParamName: Type.Optional(QueryName),
   scopeSeparator: Type.String({ minLength: 1, maxLength: 4 }),
   scopes: Type.Optional(Type.Array(Type.String({ maxLength: 128 }), { maxItems: 64 })),
   fixedExtraParams: Type.Optional(Type.Record(QueryName, Type.String({ maxLength: 512 }))),

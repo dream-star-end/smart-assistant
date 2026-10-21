@@ -31,6 +31,7 @@ import {
 } from '../auth/containerIdentity.js'
 import { getPool } from '../db/index.js'
 import { getGithubLinkPublic } from '../github/tokenStore.js'
+import type { PluginEnablement } from '../plugins/enablement.js'
 import {
   connectorRpcErrorEnvelope,
   connectorRpcReplayEnvelope,
@@ -52,7 +53,6 @@ import { listDeclarativeCatalog } from './engine/catalog.js'
 import type { EngineHttpDeps } from './engine/driver.js'
 import { executeDeclarativeAction, loadContractForConnection } from './engine/execute.js'
 import { executeDeclarativeWrite, proposeDeclarativeWrite } from './engine/write.js'
-import type { PluginEnablement } from '../plugins/enablement.js'
 import { ConnectorError, toConnectorError } from './errors.js'
 import { beginExecute, finalizeExecute, proposeWrite, writeFinalizeStatus } from './ledger.js'
 import type { DnsResolver } from './outboundPolicy.js'
@@ -246,7 +246,11 @@ async function checkRedisWindow(
 
 const EMPTY_SET: ReadonlySet<string> = new Set()
 
-async function assertPluginEnabled(deps: ConnectorsRpcDeps, userId: number, slug: string): Promise<void> {
+async function assertPluginEnabled(
+  deps: ConnectorsRpcDeps,
+  userId: number,
+  slug: string,
+): Promise<void> {
   if ((await deps.pluginEnablement?.disabledSet(userId))?.has(slug))
     throw new ConnectorError('PLUGIN_DISABLED', 'Plugin is disabled by the user')
 }
@@ -281,7 +285,22 @@ export interface ConnectorsRpcDeps {
     | 'call'
     | 'proposeWrite'
     | 'executeConfirmedWrite'
-  >
+  > &
+    Partial<Pick<PluginRuntimeFacade, 'targetProvider'>>
+}
+
+/**
+ * Plugin 面的错误带上 provider slug,让信封里的通用码文案按插件生成(微博保持原文,其它插件不再
+ * 被说成微博;OCV5-553)。code/message 语义与 ConnectorError 完全相同。
+ */
+class PluginRpcError extends ConnectorError {
+  constructor(
+    code: ConnectorError['code'],
+    message: string,
+    readonly provider: string | null,
+  ) {
+    super(code, message)
+  }
 }
 
 export interface ConnectorsRpcCtx {
@@ -321,7 +340,12 @@ function sendEnvelope(res: ServerResponse, body: unknown, status = 200): void {
 
 function sendReplay(
   res: ServerResponse,
-  replay: { status: string; errorCode?: string | null; resultDigest?: string | null },
+  replay: {
+    status: string
+    errorCode?: string | null
+    resultDigest?: string | null
+    provider?: string | null
+  },
 ): void {
   sendEnvelope(res, connectorRpcReplayEnvelope(replay))
 }
@@ -434,7 +458,10 @@ export function makeConnectorsRpcHandler(deps: ConnectorsRpcDeps): ConnectorsRpc
         log('warn', 'rpc_error', { path, code: ce.code })
       }
       // 业务错误统一 HTTP 200 信封(CLI 只解析 kind;非 2xx 会被当传输层失败)
-      sendEnvelope(res, connectorRpcErrorEnvelope(ce.code))
+      sendEnvelope(
+        res,
+        connectorRpcErrorEnvelope(ce.code, ce instanceof PluginRpcError ? ce.provider : null),
+      )
     }
   }
 }
@@ -521,9 +548,9 @@ async function handleList(
     sendEnvelope(res, { connections: enabledConnections })
     return
   }
-  const runtimePlugins: RuntimePluginTargetEntry[] = (pluginFacade ? await pluginFacade.list(userId) : []).filter(
-    (p) => !disabled.has(p.provider),
-  )
+  const runtimePlugins: RuntimePluginTargetEntry[] = (
+    pluginFacade ? await pluginFacade.list(userId) : []
+  ).filter((p) => !disabled.has(p.provider))
   sendEnvelope(res, {
     plugins: [
       ...enabledConnections.map((connection) => ({
@@ -594,7 +621,12 @@ function actionSummary(description: string | undefined): string {
   const line =
     description
       ?.split('\n')
-      .map((part) => part.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ').replace(/\s+/g, ' ').trim())
+      .map((part) =>
+        part
+          .replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, ' ')
+          .replace(/\s+/g, ' ')
+          .trim(),
+      )
       .find(Boolean) ?? ''
   return line.length > ACTION_SUMMARY_MAX ? `${line.slice(0, ACTION_SUMMARY_MAX - 1)}…` : line
 }
@@ -854,6 +886,10 @@ async function handleCall(
   if (rt.pluginSurface && rt.deps.pluginFacade) {
     const pluginType = await rt.deps.pluginFacade.classifyTarget(who.userId, body.connectionId)
     if (pluginType !== null) {
+      const facade = rt.deps.pluginFacade
+      // 只在出错/回放时查(正常结果不需要);查不到 = 中性文案。
+      const targetProvider = async (): Promise<string | null> =>
+        (await facade.targetProvider?.(who.userId, body.connectionId).catch(() => null)) ?? null
       try {
         if (body.confirmId) {
           const executed = await rt.deps.pluginFacade.executeConfirmedWrite({
@@ -870,6 +906,7 @@ async function handleCall(
               status: executed.status,
               errorCode: executed.errorCode,
               resultDigest: executed.resultDigest,
+              provider: executed.errorCode ? await targetProvider() : null,
             })
             return
           }
@@ -919,6 +956,7 @@ async function handleCall(
               status: executed.status,
               errorCode: executed.errorCode,
               resultDigest: executed.resultDigest,
+              provider: executed.errorCode ? await targetProvider() : null,
             })
             return
           }
@@ -938,6 +976,7 @@ async function handleCall(
         if (error instanceof ConnectorError) throw error
         const code = (error as { code?: unknown })?.code
         const original = error instanceof Error ? error.message : String(error)
+        const provider = await targetProvider()
         if (code === 'LEASE_BUSY' || code === 'RUNTIME_BUSY')
           throw new ConnectorError('RATE_LIMITED', 'Plugin account is busy')
         if (code === 'TARGET_NOT_FOUND' || code === 'ACCOUNT_NOT_FOUND')
@@ -950,23 +989,37 @@ async function handleCall(
           code === 'EXEC_REVOKED' ||
           code === 'POLICY_STALE'
         )
-          throw new ConnectorError('RELINK_REQUIRED', 'Plugin target is no longer executable')
-        if (code === 'BAD_REQUEST' || code === 'INVALID_PARAMS' || code === 'INVALID_INPUT' || code === 'ACTION_NOT_FOUND')
+          throw new PluginRpcError(
+            'RELINK_REQUIRED',
+            'Plugin target is no longer executable',
+            provider,
+          )
+        if (
+          code === 'BAD_REQUEST' ||
+          code === 'INVALID_PARAMS' ||
+          code === 'INVALID_INPUT' ||
+          code === 'ACTION_NOT_FOUND'
+        )
           throw new ConnectorError('BAD_REQUEST', 'Plugin call is invalid')
         if (code === 'WRITE_DISABLED')
-          throw new ConnectorError('WRITE_DISABLED', 'Plugin writes are disabled')
+          throw new PluginRpcError('WRITE_DISABLED', 'Plugin writes are disabled', provider)
         if (code === 'PLUGIN_DISABLED')
           throw new ConnectorError('PLUGIN_DISABLED', 'Plugin is disabled by the user')
         if (code === 'WRITE_REQUIRES_CONFIRMATION')
           throw new ConnectorError('BAD_REQUEST', 'Plugin write confirmation is required')
         if (typeof code === 'string' && isPluginPassthroughErrorCode(code)) {
           rt.log('warn', 'plugin_runtime_error', { code, err: original })
-          throw new ConnectorError(code, resolvePluginErrorGuidance({ code }).message)
+          throw new PluginRpcError(
+            code,
+            resolvePluginErrorGuidance({ code, provider }).message,
+            provider,
+          )
         }
         rt.log('warn', 'plugin_runtime_unmapped', {
           code: typeof code === 'string' ? code : 'INTERNAL',
           err: original,
         })
+        // CONNECTION_ERROR 保持历史的通用文案(不按 provider 细分),以免改变现有插件的回包。
         throw new ConnectorError(
           'CONNECTION_ERROR',
           resolvePluginErrorGuidance({ code: 'CONNECTION_ERROR' }).message,
