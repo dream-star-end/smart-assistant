@@ -895,10 +895,10 @@ test('validatePdfStructureSync and LiteratureArtifactStore accept publisher PDFs
 
   // 3. Dangerous PDF actions (/JS, /JavaScript, /Launch, including hex-escaped names) are rejected
   for (const dangerousEntry of [
-    '/OpenAction << /S /JavaScript /JS (app.alert(1)) >>',
-    '/OpenAction << /S /Java#53cript /J#53 (app.alert(1)) >>',
-    '/AA << /O << /S /Launch /F (cmd.exe) >> >>',
-    '/AA << /O << /S /Laun#63h /F (cmd.exe) >> >>',
+    '/OpenAction << /S /JavaScript /JS (noop) >>',
+    '/OpenAction << /S /Java#53cript /J#53 (noop) >>',
+    '/AA << /O << /S /Launch /F (noop) >> >>',
+    '/AA << /O << /S /Laun#63h /F (noop) >> >>',
   ]) {
     const dangerousPdf = buildPublisherPdf(dangerousEntry, 0)
     assert.equal(validatePdfStructureSync(dangerousPdf), false)
@@ -916,7 +916,7 @@ test('validatePdfStructureSync and LiteratureArtifactStore accept publisher PDFs
   // 5. Compressed /ObjStm hiding /JavaScript action is still rejected
   const zlib = await import('node:zlib')
   const objStmPayload = zlib.deflateSync(
-    Buffer.from('5 0 << /S /JavaScript /JS (app.alert(1)) >>', 'latin1'),
+    Buffer.from('5 0 << /S /JavaScript /JS (noop) >>', 'latin1'),
   )
   const pdfWithObjStmJs = Buffer.concat([
     Buffer.from(
