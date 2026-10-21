@@ -155,6 +155,7 @@ export interface SessionSubmitHost {
   _resumeMap: SessionManager['_resumeMap']
   _resumeMapCostImprecise: SessionManager['_resumeMapCostImprecise']
   _resumeMapHistory: SessionManager['_resumeMapHistory']
+  _resumeHeadPromotedFromHistory: SessionManager['_resumeHeadPromotedFromHistory']
   _resumeMapLastCost: SessionManager['_resumeMapLastCost']
   _resumeMapProvider: SessionManager['_resumeMapProvider']
   _resumeMapTimestamps: SessionManager['_resumeMapTimestamps']
@@ -1039,8 +1040,13 @@ export async function submit(
     // OCV5-556: when this agent's own last answer is in the window, the native
     // session already holds everything up to it. Keep the resume and inject only
     // the rows after it; a full replay into a fresh session is the fallback.
+    // A head the ladder promoted from history may predate that answer (the
+    // newer conversation lost its transcript), so it always gets the full rebuild.
     const providerGapDelta =
-      providerResumeId && injectionKey !== null && effectiveMasterHistoricalMessages
+      providerResumeId &&
+      injectionKey !== null &&
+      effectiveMasterHistoricalMessages &&
+      this._resumeHeadPromotedFromHistory.get(session.sessionKey) !== providerResumeId
         ? providerGapMessagesAfterOwnTurn({
             messages: effectiveMasterHistoricalMessages,
             peerId: session.peerId,
@@ -1947,6 +1953,9 @@ export async function _getOrCreateExclusive(
           // disk (the incident shape) has nothing to fall back to.
           this._pushResumeHistory(opts.sessionKey, prevId)
         }
+      }
+      if (this._resumeHeadPromotedFromHistory.get(opts.sessionKey) !== id) {
+        this._resumeHeadPromotedFromHistory.delete(opts.sessionKey)
       }
       session.ccbSessionId = id
       // Remember which provider produced this id — the next getOrCreate on
@@ -2861,6 +2870,7 @@ export function _resolveDurableResumeId(
     // history keeps only ids older than the promoted one.
     const idx = history.indexOf(picked.id)
     this._resumeMap.set(sessionKey, picked.id)
+    this._resumeHeadPromotedFromHistory.set(sessionKey, picked.id)
     this._resumeMapProvider.set(sessionKey, provider)
     this._resumeMapHistory.set(sessionKey, history.slice(idx + 1))
     // Sync the live session BEFORE saving: _saveResumeMap overlays live

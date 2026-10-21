@@ -54,6 +54,8 @@ export type ResumeEntry = {
   historyContextVersion?: number
   /** Prior same-provider ids, newest first (durable-artifact fallback ladder). */
   history?: string[]
+  /** `id` was promoted from `history`: it may predate the latest turns (OCV5-556). */
+  promotedFromHistory?: true
 }
 
 /** What a live session contributes when the map is saved. */
@@ -98,6 +100,12 @@ export class ResumeStore {
   // re-attribute the entire historical cumulative as this turn's cost).
   readonly lastCost = new Map<string, number>()
   readonly costImprecise = new Map<string, boolean>()
+  /** sessionKey → head id the durable-artifact ladder promoted from history.
+   *  Such a conversation can miss the turns that ran on the dead newer head,
+   *  so master history after the agent's own last answer is not a complete
+   *  delta for it (OCV5-556). Cleared when the engine mints a new id or the
+   *  entry is forgotten. Persisted as `promotedFromHistory`. */
+  readonly promotedFromHistory = new Map<string, string>()
   // Serialized write queue to prevent concurrent writeFile race conditions
   write: Promise<void> = Promise.resolve()
 
@@ -183,6 +191,7 @@ export class ResumeStore {
     this.lastCost.delete(key)
     this.costImprecise.delete(key)
     this.history.delete(key)
+    this.promotedFromHistory.delete(key)
   }
 
   load(): void {
@@ -240,6 +249,9 @@ export class ResumeStore {
                 .slice(0, RESUME_HISTORY_MAX)
               if (cleaned.length > 0) this.history.set(key, cleaned)
             }
+            if ((val as any).promotedFromHistory === true) {
+              this.promotedFromHistory.set(key, (val as any).id)
+            }
             // M1a:tag 归一为 engine id(历史 'codex-native' → 'codex')。
             this.provider.set(key, prov)
           }
@@ -265,6 +277,7 @@ export class ResumeStore {
     if (prov && prov !== CCB_PROVIDER_TAG) entry.provider = prov
     const hist = this.history.get(key)?.filter((h) => h !== head)
     if (hist && hist.length > 0) entry.history = hist.slice(0, RESUME_HISTORY_MAX)
+    if (this.promotedFromHistory.get(key) === head) entry.promotedFromHistory = true
     return entry
   }
 

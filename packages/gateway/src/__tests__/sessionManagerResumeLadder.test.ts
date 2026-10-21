@@ -426,6 +426,9 @@ test('real master history gap keeps native resume and injects only the missing r
   const { run, cleanup } = await liveSetup('grok')
   try {
     await run(async (m, s) => {
+      // The engine itself reports a durable head: no ladder promotion involved.
+      s.runner.setResumeSessionId?.(LIVE_B)
+      s.runner.emit('session_id', LIVE_B)
       const seam = await submitWithHistory(m, s, [
         { id: 'old-u', role: 'user', text: 'very old question' },
         { id: 'srv-unknown-ladder-t4', role: 'assistant', text: 'own answer' },
@@ -437,6 +440,52 @@ test('real master history gap keeps native resume and injects only the missing r
       assert.equal(typeof seam.payload, 'string')
       assert.match(seam.payload as string, /other agent answer/)
       assert.doesNotMatch(seam.payload as string, /very old question|own answer/)
+    })
+  } finally {
+    cleanup()
+  }
+})
+
+test('a gap on a head promoted from the history ladder still rebuilds in full', async () => {
+  const { run, cleanup } = await liveSetup('grok')
+  try {
+    await run(async (m, s) => {
+      // LIVE_A (newest) lost its transcript; the ladder promotes the older
+      // LIVE_B, which may never have seen the turns that ran on LIVE_A.
+      const seam = await submitWithHistory(m, s, [
+        { id: 'a-only-u', role: 'user', text: 'requirement only LIVE_A saw' },
+        { id: 'srv-unknown-ladder-t4', role: 'assistant', text: 'own answer' },
+        { id: 'switch-u', role: 'user', text: 'ask the other agent' },
+        { id: 'srv-unknown-other-t1', role: 'assistant', text: 'other agent answer' },
+      ])
+      assert.equal(seam.nativeId, null, 'promoted head must not be trusted for a delta')
+      assert.equal(typeof seam.payload, 'string')
+      assert.match(seam.payload as string, /requirement only LIVE_A saw/)
+      assert.match(seam.payload as string, /other agent answer/)
+    })
+  } finally {
+    cleanup()
+  }
+})
+
+test('ladder promotion mark survives resume-map.json and clears on a new engine id', async () => {
+  const { run, cleanup } = await liveSetup('grok')
+  try {
+    await run(async (m, s) => {
+      const marks = (m as unknown as { _resumeHeadPromotedFromHistory: Map<string, string> })
+        ._resumeHeadPromotedFromHistory
+      assert.equal(m._resumeIdFor(s.sessionKey, 'grok', s.workspaceCwd), LIVE_B)
+      assert.equal(marks.get(s.sessionKey), LIVE_B)
+      await m.awaitResumeMapFlush()
+      const saved = JSON.parse(readFileSync(m.resumeMapPath, 'utf8'))[s.sessionKey]
+      assert.equal(saved.promotedFromHistory, true)
+      marks.clear()
+      m._loadResumeMap()
+      assert.equal(marks.get(s.sessionKey), LIVE_B, 'reload restores the mark')
+      s.runner.emit('session_id', LIVE_B)
+      assert.equal(marks.get(s.sessionKey), LIVE_B, 'resuming the promoted id keeps the mark')
+      s.runner.emit('session_id', LIVE_C)
+      assert.equal(marks.has(s.sessionKey), false, 'a newly minted id clears the mark')
     })
   } finally {
     cleanup()

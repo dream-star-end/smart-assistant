@@ -1633,6 +1633,7 @@ export class SessionManager {
   private get _resumeMapProvider() { return this.resumeStore.provider }
   private get _resumeMapHistory() { return this.resumeStore.history }
   private get _resumeRejectedIds() { return this.resumeStore.rejected }
+  private get _resumeHeadPromotedFromHistory() { return this.resumeStore.promotedFromHistory }
   private get _resumeMapTimestamps() { return this.resumeStore.timestamps }
   private get _resumeMapLastCost() { return this.resumeStore.lastCost }
   private get _resumeMapCostImprecise() { return this.resumeStore.costImprecise }
