@@ -1,0 +1,867 @@
+{
+ "schema": 1,
+ "note": "Phase 3 plan v3.6 §3, appendix B. Every production file maps to one module; the most specific match wins (longest literal prefix). Layers: L0 contracts … L6 composition; F0–F5 front end. Same-layer edges must be listed in allow (a DAG). Changing a module's layer, scope or allow is a guardrail change (§5.3, §5.4). Same-layer allow lists encode the target domain DAG of §3.5.",
+ "modules": {
+  "protocol": {
+   "layer": "L0",
+   "match": [
+    "packages/protocol/src/**"
+   ],
+   "scope": [
+    "master",
+    "egress",
+    "container",
+    "browser"
+   ]
+  },
+  "plugin-sdk": {
+   "layer": "L0",
+   "match": [
+    "packages/plugin-sdk/src/**"
+   ],
+   "scope": [
+    "master",
+    "container"
+   ]
+  },
+  "commercial-types": {
+   "layer": "L0",
+   "match": [
+    "packages/commercial/src/types/**"
+   ],
+   "scope": [
+    "master",
+    "egress"
+   ]
+  },
+  "commercial-logging": {
+   "layer": "L1",
+   "match": [
+    "packages/commercial/src/logging/**"
+   ],
+   "scope": [
+    "master",
+    "egress"
+   ],
+   "note": "→ @openclaude/kernel log (P1)"
+  },
+  "commercial-flavor": {
+   "layer": "L1",
+   "match": [
+    "packages/commercial/src/flavor/**"
+   ],
+   "scope": [
+    "master",
+    "egress"
+   ]
+  },
+  "gateway-core": {
+   "layer": "L1",
+   "match": [
+    "packages/gateway/src/logger.ts",
+    "packages/gateway/src/metrics.ts",
+    "packages/gateway/src/eventBus.ts",
+    "packages/gateway/src/gatewayTypes.ts",
+    "packages/gateway/src/sessionTypes.ts",
+    "packages/gateway/src/runLog.ts"
+   ],
+   "scope": [
+    "master",
+    "container"
+   ],
+   "note": "→ @openclaude/kernel (P1)"
+  },
+  "platform-pg": {
+   "layer": "L2",
+   "match": [
+    "packages/commercial/src/db/**"
+   ],
+   "scope": [
+    "master",
+    "egress"
+   ],
+   "note": "pgSessionsBackend.ts splits into domain stores in P6",
+   "allow": [
+    "platform-config"
+   ]
+  },
+  "platform-config": {
+   "layer": "L2",
+   "match": [
+    "packages/commercial/src/config.ts",
+    "packages/commercial/src/platformDefaults.ts",
+    "packages/commercial/src/runtimeCapabilities.ts"
+   ],
+   "scope": [
+    "master",
+    "egress"
+   ],
+   "note": "→ config registry (P3)"
+  },
+  "platform-auth-crypto": {
+   "layer": "L2",
+   "match": [
+    "packages/commercial/src/crypto/**",
+    "packages/commercial/src/auth/jwt.ts",
+    "packages/commercial/src/auth/jwtSync.ts",
+    "packages/commercial/src/auth/passwords.ts",
+    "packages/commercial/src/bridgeSecret.ts"
+   ],
+   "scope": [
+    "master",
+    "egress"
+   ],
+   "authorities": [
+    "crypto"
+   ],
+   "allow": [
+    "platform-config"
+   ]
+  },
+  "platform-net": {
+   "layer": "L2",
+   "match": [
+    "packages/commercial/src/containerNet.ts",
+    "packages/commercial/src/projectLayerHostPorts.ts",
+    "packages/commercial/src/runtimeChannel.ts"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "platform-config"
+   ]
+  },
+  "adapters-providers": {
+   "layer": "L2",
+   "match": [
+    "packages/commercial/src/http/proxy/upstream*.ts",
+    "packages/commercial/src/minimax/**",
+    "packages/commercial/src/grok/**",
+    "packages/commercial/src/cursor/**",
+    "packages/commercial/src/codex-auth/**",
+    "packages/commercial/src/chatgptProxy/**"
+   ],
+   "scope": [
+    "master",
+    "egress"
+   ],
+   "authorities": [
+    "net",
+    "special-case"
+   ],
+   "allow": [
+    "platform-pg",
+    "platform-config",
+    "platform-auth-crypto",
+    "platform-net"
+   ]
+  },
+  "adapters-channels": {
+   "layer": "L2",
+   "match": [
+    "packages/commercial/src/wechat/**",
+    "packages/commercial/src/qqbot/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "platform-pg",
+    "platform-config",
+    "platform-auth-crypto",
+    "platform-net"
+   ]
+  },
+  "adapters-ocr": {
+   "layer": "L2",
+   "match": [
+    "packages/commercial/src/ocr/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "platform-config"
+   ]
+  },
+  "adapters-github": {
+   "layer": "L2",
+   "match": [
+    "packages/commercial/src/github/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "platform-config",
+    "platform-auth-crypto"
+   ]
+  },
+  "storage": {
+   "layer": "L2",
+   "match": [
+    "packages/storage/src/**"
+   ],
+   "scope": [
+    "master",
+    "container"
+   ],
+   "note": "session store backends (SQLite in containers, PG injected in master)"
+  },
+  "channel-wechat": {
+   "layer": "L2",
+   "match": [
+    "packages/channels/wechat/src/**"
+   ],
+   "scope": [
+    "master",
+    "container"
+   ]
+  },
+  "channel-feishu": {
+   "layer": "L2",
+   "match": [
+    "packages/channels/feishu/src/**"
+   ],
+   "scope": [
+    "master",
+    "container"
+   ]
+  },
+  "channel-telegram": {
+   "layer": "L2",
+   "match": [
+    "packages/channels/telegram/src/**"
+   ],
+   "scope": [
+    "master",
+    "container"
+   ]
+  },
+  "channel-webchat": {
+   "layer": "L2",
+   "match": [
+    "packages/channels/webchat/src/**"
+   ],
+   "scope": [
+    "master",
+    "container"
+   ]
+  },
+  "gateway-engines": {
+   "layer": "L2",
+   "match": [
+    "packages/gateway/src/engine/**",
+    "packages/gateway/src/subprocessRunner.ts",
+    "packages/gateway/src/subprocessSpawnConfig.ts",
+    "packages/gateway/src/processGroupShutdown.ts",
+    "packages/gateway/src/ccb*.ts",
+    "packages/gateway/src/codexLaunchOverrides.ts",
+    "packages/gateway/src/engineCwd.ts",
+    "packages/gateway/src/engineNotifier.ts",
+    "packages/gateway/src/terminalBackend.ts",
+    "packages/gateway/src/terminalStreamFence.ts"
+   ],
+   "scope": [
+    "container"
+   ],
+   "authorities": [
+    "special-case"
+   ]
+  },
+  "gateway-master-client": {
+   "layer": "L2",
+   "match": [
+    "packages/gateway/src/v3*.ts",
+    "packages/gateway/src/v5*Relay.ts",
+    "packages/gateway/src/modelCatalogClient.ts",
+    "packages/gateway/src/oc*Client.ts",
+    "packages/gateway/src/promptQueueClient.ts",
+    "packages/gateway/src/*Reporter.ts",
+    "packages/gateway/src/autoDreamOptimizerClient.ts",
+    "packages/gateway/src/masterTurnLease.ts",
+    "packages/gateway/src/webSearchClient.ts"
+   ],
+   "scope": [
+    "container"
+   ]
+  },
+  "gateway-mcp": {
+   "layer": "L2",
+   "match": [
+    "packages/gateway/src/mcp*.ts"
+   ],
+   "scope": [
+    "container"
+   ]
+  },
+  "identity": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/auth/**",
+    "packages/commercial/src/org/**",
+    "packages/commercial/src/user/**",
+    "packages/commercial/src/identity/**",
+    "packages/commercial/src/desktop/**"
+   ],
+   "scope": [
+    "master"
+   ]
+  },
+  "sessions": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/promptQueue/**",
+    "packages/commercial/src/intelligentUi/**",
+    "packages/commercial/src/responseRatings.ts"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "identity"
+   ]
+  },
+  "dispatch": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/dispatch/**"
+   ],
+   "scope": [
+    "master",
+    "egress"
+   ],
+   "allow": [
+    "identity",
+    "sessions"
+   ]
+  },
+  "billing": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/billing/**"
+   ],
+   "scope": [
+    "master",
+    "egress"
+   ],
+   "authorities": [
+    "billing-sql"
+   ],
+   "allow": [
+    "identity",
+    "catalog",
+    "accounts"
+   ]
+  },
+  "catalog": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/billing/modelCatalog*.ts",
+    "packages/commercial/src/billing/pricing.ts",
+    "packages/commercial/src/billing/persistedBillingPricing.ts"
+   ],
+   "scope": [
+    "master",
+    "egress"
+   ],
+   "allow": [
+    "identity"
+   ]
+  },
+  "payment": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/payment/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "authorities": [
+    "billing-sql"
+   ],
+   "note": "order fulfilment writes orders/credit_ledger in one tx today (§4.3)",
+   "allow": [
+    "identity",
+    "billing"
+   ]
+  },
+  "accounts": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/account-pool/**"
+   ],
+   "scope": [
+    "master",
+    "egress"
+   ],
+   "allow": [
+    "identity",
+    "catalog"
+   ]
+  },
+  "llm-proxy": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/http/proxy/**"
+   ],
+   "scope": [
+    "master",
+    "egress"
+   ],
+   "allow": [
+    "identity",
+    "catalog",
+    "accounts",
+    "billing",
+    "dispatch"
+   ]
+  },
+  "compute-pool": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/compute-pool/**",
+    "packages/commercial/src/remoteHosts/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "identity",
+    "billing"
+   ]
+  },
+  "marketplace": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/marketplace/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "identity",
+    "plugins"
+   ]
+  },
+  "plugins": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/plugins/**",
+    "packages/commercial/src/literatureProxy.ts",
+    "packages/commercial/src/literatureSkill.ts"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "identity"
+   ]
+  },
+  "connectors": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/connectors/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "identity",
+    "plugins"
+   ]
+  },
+  "research": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/research/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "identity"
+   ]
+  },
+  "inbox": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/inbox/**",
+    "packages/commercial/src/channelMigration/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "identity"
+   ]
+  },
+  "admin-ops": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/admin/**",
+    "packages/commercial/src/selfheal/**",
+    "packages/commercial/src/deploy/**",
+    "packages/commercial/src/analytics/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "note": "cross-domain admin queries move to app-admin (L4)",
+   "allow": [
+    "identity"
+   ]
+  },
+  "goal": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/goal/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "identity"
+   ]
+  },
+  "media": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/media-generation/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "identity"
+   ]
+  },
+  "tutorials": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/tutorials/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "identity"
+   ]
+  },
+  "feedback": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/productFriction/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "allow": [
+    "identity"
+   ]
+  },
+  "gateway-session": {
+   "layer": "L3",
+   "match": [
+    "packages/gateway/src/session*.ts",
+    "packages/gateway/src/resumeStore.ts",
+    "packages/gateway/src/runContextPersist.ts",
+    "packages/gateway/src/eventPersist.ts",
+    "packages/gateway/src/pendingPermissionSnapshot.ts",
+    "packages/gateway/src/projectWorkspace.ts",
+    "packages/gateway/src/project*.ts",
+    "packages/gateway/src/openedPath.ts"
+   ],
+   "scope": [
+    "container"
+   ]
+  },
+  "gateway-skills": {
+   "layer": "L3",
+   "match": [
+    "packages/gateway/src/skill*.ts",
+    "packages/gateway/src/userSkillWrite.ts"
+   ],
+   "scope": [
+    "container"
+   ]
+  },
+  "gateway-memory": {
+   "layer": "L3",
+   "match": [
+    "packages/gateway/src/memory*.ts"
+   ],
+   "scope": [
+    "container"
+   ]
+  },
+  "gateway-advisor": {
+   "layer": "L3",
+   "match": [
+    "packages/gateway/src/advisor*.ts"
+   ],
+   "scope": [
+    "container"
+   ]
+  },
+  "gateway-autodream": {
+   "layer": "L3",
+   "match": [
+    "packages/gateway/src/autoDream*.ts"
+   ],
+   "scope": [
+    "container"
+   ]
+  },
+  "gateway-permissions": {
+   "layer": "L3",
+   "match": [
+    "packages/gateway/src/askUser*.ts",
+    "packages/gateway/src/detachedAskUser.ts",
+    "packages/gateway/src/pathAcl.ts",
+    "packages/gateway/src/gatewayFilePolicy.ts",
+    "packages/gateway/src/bridgeApiAllowlist.ts"
+   ],
+   "scope": [
+    "container"
+   ]
+  },
+  "gateway-taskboard": {
+   "layer": "L3",
+   "match": [
+    "packages/gateway/src/taskboard/**"
+   ],
+   "scope": [
+    "container"
+   ]
+  },
+  "gateway-runtime": {
+   "layer": "L3",
+   "match": [
+    "packages/gateway/src/**"
+   ],
+   "scope": [
+    "container"
+   ],
+   "note": "the rest of gateway's flat root; split in P7"
+  },
+  "mcp-memory": {
+   "layer": "L3",
+   "match": [
+    "packages/mcp-memory/src/**"
+   ],
+   "scope": [
+    "container"
+   ],
+   "note": "independent MCP server; layered internally later"
+  },
+  "app-container": {
+   "layer": "L4",
+   "match": [
+    "packages/commercial/src/agent-sandbox/**",
+    "packages/commercial/src/platform/**"
+   ],
+   "scope": [
+    "master"
+   ]
+  },
+  "app-turn": {
+   "layer": "L4",
+   "match": [
+    "packages/commercial/src/agent/**"
+   ],
+   "scope": [
+    "master"
+   ]
+  },
+  "app-jobs": {
+   "layer": "L4",
+   "match": [
+    "packages/commercial/src/autoDream/**",
+    "packages/commercial/src/r7-backup/**"
+   ],
+   "scope": [
+    "master"
+   ]
+  },
+  "gateway-delegation": {
+   "layer": "L4",
+   "match": [
+    "packages/gateway/src/delegate*.ts",
+    "packages/gateway/src/sendToAgent*.ts",
+    "packages/gateway/src/collaboratorAgents.ts"
+   ],
+   "scope": [
+    "container"
+   ]
+  },
+  "gateway-cron": {
+   "layer": "L4",
+   "match": [
+    "packages/gateway/src/cron*.ts"
+   ],
+   "scope": [
+    "container"
+   ]
+  },
+  "gateway-turn": {
+   "layer": "L4",
+   "match": [
+    "packages/gateway/src/turn*.ts",
+    "packages/gateway/src/agentMessage.ts",
+    "packages/gateway/src/promptQueueCoordinator.ts",
+    "packages/gateway/src/promptQueueDispatch.ts",
+    "packages/gateway/src/inboundDispatch.ts",
+    "packages/gateway/src/jobTerminal.ts",
+    "packages/gateway/src/emptyCompletedTurn.ts",
+    "packages/gateway/src/boxIdle*.ts"
+   ],
+   "scope": [
+    "container"
+   ]
+  },
+  "interface-http": {
+   "layer": "L5",
+   "match": [
+    "packages/commercial/src/http/**",
+    "packages/commercial/src/middleware/**"
+   ],
+   "scope": [
+    "master"
+   ]
+  },
+  "interface-ws": {
+   "layer": "L5",
+   "match": [
+    "packages/commercial/src/ws/**"
+   ],
+   "scope": [
+    "master"
+   ]
+  },
+  "gateway-interface": {
+   "layer": "L5",
+   "match": [
+    "packages/gateway/src/routes/**",
+    "packages/gateway/src/router.ts",
+    "packages/gateway/src/gatewayHttp.ts",
+    "packages/gateway/src/wsConnection.ts",
+    "packages/gateway/src/*Handlers.ts",
+    "packages/gateway/src/http*.ts",
+    "packages/gateway/src/openaiCompat.ts",
+    "packages/gateway/src/webhooks.ts",
+    "packages/gateway/src/auth.ts",
+    "packages/gateway/src/localBridgeAuth.ts",
+    "packages/gateway/src/rateLimit.ts"
+   ],
+   "scope": [
+    "master",
+    "container"
+   ],
+   "authorities": [
+    "handler-auth"
+   ]
+  },
+  "commercial-bootstrap": {
+   "layer": "L6",
+   "match": [
+    "packages/commercial/src/index.ts"
+   ],
+   "scope": [
+    "master"
+   ]
+  },
+  "egress": {
+   "layer": "L6",
+   "match": [
+    "packages/commercial/src/egress/**"
+   ],
+   "scope": [
+    "egress"
+   ]
+  },
+  "gateway-shell": {
+   "layer": "L6",
+   "match": [
+    "packages/gateway/src/server.ts",
+    "packages/gateway/src/index.ts",
+    "packages/gateway/src/gatewayLifecycle.ts",
+    "packages/gateway/src/gatewayBind.ts"
+   ],
+   "scope": [
+    "master",
+    "container"
+   ]
+  },
+  "gateway-cli-tools": {
+   "layer": "L6",
+   "match": [
+    "packages/gateway/src/oc*Cli.ts"
+   ],
+   "scope": [
+    "container"
+   ],
+   "note": "executables run by engines inside the container"
+  },
+  "cli": {
+   "layer": "L6",
+   "match": [
+    "packages/cli/src/**"
+   ],
+   "scope": [
+    "master"
+   ]
+  },
+  "web-app": {
+   "layer": "F5",
+   "match": [
+    "packages/web-react/src/App.tsx",
+    "packages/web-react/src/main.tsx",
+    "packages/web-react/src/registerSW.ts"
+   ],
+   "scope": [
+    "browser"
+   ]
+  },
+  "web-views": {
+   "layer": "F4",
+   "match": [
+    "packages/web-react/src/components/**",
+    "packages/web-react/src/admin/**"
+   ],
+   "scope": [
+    "browser"
+   ]
+  },
+  "web-hooks": {
+   "layer": "F3",
+   "match": [
+    "packages/web-react/src/hooks/**"
+   ],
+   "scope": [
+    "browser"
+   ]
+  },
+  "web-lib": {
+   "layer": "F1",
+   "match": [
+    "packages/web-react/src/lib/**",
+    "packages/web-react/src/workers/**"
+   ],
+   "scope": [
+    "browser"
+   ],
+   "note": "socket.ts and the chat reducer split into F2 stores in P8"
+  },
+  "web-legacy": {
+   "layer": "F1",
+   "match": [
+    "packages/web/src/**"
+   ],
+   "scope": [
+    "browser"
+   ]
+  }
+ }
+}
