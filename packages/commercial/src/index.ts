@@ -639,11 +639,9 @@ import {
   makeMiniMaxMediaHandler,
   type MiniMaxMediaHandler,
 } from "./minimax/mediaProxy.js";
-import { type MuseBridgeHttpHandler, makeMuseBridgeHttpHandler } from "./muse/bridgeHttp.js";
-import { MuseBridgeHub } from "./muse/hub.js";
+import { createMuseFromConfig } from "./muse/assemble.js";
 import { makeMuseInternalHandler } from "./muse/internalHttp.js";
-import { CLI_TIMEOUT_SEC, MUSE_INTERNAL_PREFIX, parseAllowedUids } from "./muse/protocol.js";
-import { createPgMuseStore } from "./muse/store.js";
+import { MUSE_INTERNAL_PREFIX } from "./muse/protocol.js";
 import {
   MINIMAX_WEB_SEARCH_PATH,
   makeMiniMaxWebSearchHandler,
@@ -2042,32 +2040,8 @@ export async function registerCommercial(
       start: () => mediaGenerationService.start(),
     });
   }
-  // OCV5-561 Muse media bridge (selfhost; single master owns the in-memory hub). Off unless
-  // OC_MUSE_BRIDGE_ENABLED=1. A failed start leaves the feature off instead of failing boot.
-  let museHub: MuseBridgeHub | undefined;
-  let museBridgeHttp: MuseBridgeHttpHandler | undefined;
-  if (cfg.OC_MUSE_BRIDGE_ENABLED) {
-    const museStore = createPgMuseStore(getPool());
-    const hub = new MuseBridgeHub({
-      store: museStore,
-      stateRoot: cfg.OC_MUSE_STATE_ROOT ?? "/var/lib/openclaude-v5-selfhost/muse-media",
-      allowedUids: parseAllowedUids(cfg.OC_MUSE_ALLOWED_UIDS, (msg, meta) => rootLogger.warn(msg, meta)),
-      rate: {
-        imagePerHour: cfg.OC_MUSE_IMAGE_PER_HOUR ?? 30,
-        imagePerDay: cfg.OC_MUSE_IMAGE_PER_DAY ?? 200,
-        videoPerHour: cfg.OC_MUSE_VIDEO_PER_HOUR ?? 10,
-        videoPerDay: cfg.OC_MUSE_VIDEO_PER_DAY ?? 40,
-      },
-      cliTimeoutSec: CLI_TIMEOUT_SEC,
-    });
-    try {
-      await hub.start();
-      museHub = hub;
-      museBridgeHttp = makeMuseBridgeHttpHandler({ hub, store: museStore });
-    } catch (err) {
-      rootLogger.error("muse_bridge_start_failed", { err: (err as Error).message });
-    }
-  }
+  // OCV5-561 Muse media bridge (selfhost). Off unless OC_MUSE_BRIDGE_ENABLED=1; see muse/assemble.ts.
+  const { hub: museHub, bridgeHttp: museBridgeHttp } = await createMuseFromConfig(cfg, getPool());
   const goalBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge not assembled yet */ },
   };
