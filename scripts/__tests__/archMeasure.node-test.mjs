@@ -154,6 +154,12 @@ test('trains.mjs --check-last: complete vs incomplete summaries', (t) => {
       { encoding: 'utf8' },
     )
   assert.equal(run('--check-last', '2').status, 0)
+  // OCV5-563: per-gate retry logs next to the train log are not trains
+  writeFileSync(path.join(dir, 'tr-20990101T000002Z-b.ccb-mcp.attempt1.log'), '')
+  writeFileSync(path.join(dir, 'tr-20990101T000002Z-b.box-incident-proofs.attempt2.log'), '')
+  const withRetries = run('--check-last', '2')
+  assert.equal(withRetries.status, 0, withRetries.stdout)
+  assert.match(withRetries.stdout, /all 2 complete/)
   put('tr-20990101T000003Z-c', null)
   const r = run('--check-last', '2')
   assert.equal(r.status, 1)
