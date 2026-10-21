@@ -1,12 +1,24 @@
 import assert from 'node:assert/strict'
+import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { chmod, cp, mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises'
+import {
+  chmod,
+  cp,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  readlink,
+  rm,
+  symlink,
+  utimes,
+  writeFile,
+} from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { spawn, spawnSync } from 'node:child_process'
 import { afterEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
@@ -22,7 +34,10 @@ const sessionDisplayRunner = path.join(root, 'e2e/session-display/run.sh')
 const sessionDisplayFixtures = path.join(root, 'e2e/session-display/fixtures.ts')
 const sessionDisplayApi = path.join(root, 'e2e/session-display/lib/api.ts')
 const sessionDisplayUi = path.join(root, 'e2e/session-display/lib/ui.ts')
-const sessionDisplayLargeTest = path.join(root, 'e2e/session-display/tests/02-large-session-open.spec.ts')
+const sessionDisplayLargeTest = path.join(
+  root,
+  'e2e/session-display/tests/02-large-session-open.spec.ts',
+)
 const sessionDisplayStatusTest = path.join(root, 'e2e/session-display/tests/05-turn-status.spec.ts')
 const incidentManifest = path.join(root, 'e2e/session-display/incidents.json')
 const baselineEval = path.join(root, 'scripts/run-baseline-skill-evals.sh')
@@ -47,12 +62,21 @@ const knowledgePlanetSeed = path.join(
 )
 const weiboSeed = path.join(root, 'packages/commercial/scripts/seed-weibo-plugin.ts')
 const supervisor = path.join(root, 'packages/commercial/src/agent-sandbox/v3supervisor.ts')
-const runtimeDockerfile = path.join(root, 'packages/commercial/agent-sandbox/Dockerfile.openclaude-runtime')
+const runtimeDockerfile = path.join(
+  root,
+  'packages/commercial/agent-sandbox/Dockerfile.openclaude-runtime',
+)
 const v5Overrides = path.join(root, 'deploy/v5/commercial-v5.env.overrides')
 const v5UnitA = path.join(root, 'deploy/v5/openclaude-v5.service')
 const v5UnitB = path.join(root, 'deploy/v5/openclaude-v5-b.service')
-const v5BaselinePortGuardSocket = path.join(root, 'deploy/v5/openclaude-v5-baseline-port-guard.socket')
-const v5BaselinePortGuardService = path.join(root, 'deploy/v5/openclaude-v5-baseline-port-guard.service')
+const v5BaselinePortGuardSocket = path.join(
+  root,
+  'deploy/v5/openclaude-v5-baseline-port-guard.socket',
+)
+const v5BaselinePortGuardService = path.join(
+  root,
+  'deploy/v5/openclaude-v5-baseline-port-guard.service',
+)
 const dirs: string[] = []
 const require_ = createRequire(path.join(root, 'package.json'))
 const { WebSocketServer } = require_('ws')
@@ -61,7 +85,14 @@ describe('V5 branch deployment policy', () => {
   const assertBranch = (branch: string, allowAny = '0') =>
     spawnSync(
       'bash',
-      ['-c', `source "$1"; assert_v5_deploy_branch_allowed "$2" "$3"`, 'branch-policy', branchPolicy, branch, allowAny],
+      [
+        '-c',
+        `source "$1"; assert_v5_deploy_branch_allowed "$2" "$3"`,
+        'branch-policy',
+        branchPolicy,
+        branch,
+        allowAny,
+      ],
       { cwd: root, encoding: 'utf8' },
     )
 
@@ -70,13 +101,22 @@ describe('V5 branch deployment policy', () => {
     const overrides = await readFile(v5Overrides, 'utf8')
     assert.match(source, /^FROM node:22-bookworm-slim AS base$/m)
     assert.match(source, /deb http:\/\/deb\.debian\.org\/debian bookworm-backports main/)
-    assert.match(source, /apt-get install -y --no-install-recommends -t bookworm-backports \\\n+\s+libreoffice-writer \\\n+\s+libreoffice-math \\/)
+    assert.match(
+      source,
+      /apt-get install -y --no-install-recommends -t bookworm-backports \\\n+\s+libreoffice-writer \\\n+\s+libreoffice-math \\/,
+    )
     assert.match(source, /libreoffice --headless --version \| grep -Eq '\^LibreOffice 25\\\.2\\\.'/)
     assert.match(source, /dpkg-query -W -f='\$\{Status\}\\n' libreoffice-math/)
-    assert.match(source, /\\mathrm\{MSE\}=\\frac\{1\}\{n\}\\sum_\{i=1\}\^\{n\}\(y_i-\\hat\{y\}_i\)\^2/)
+    assert.match(
+      source,
+      /\\mathrm\{MSE\}=\\frac\{1\}\{n\}\\sum_\{i=1\}\^\{n\}\(y_i-\\hat\{y\}_i\)\^2/,
+    )
     assert.match(source, /grep -q 'y' \/tmp\/oc-docx-smoke\.txt/)
     assert.match(source, /! grep -q '¿' \/tmp\/oc-docx-smoke\.txt/)
-    assert.match(overrides, /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-cli-codex0153-grok105-zcode381-slim$/m)
+    assert.match(
+      overrides,
+      /^OC_RUNTIME_IMAGE=openclaude\/openclaude-runtime:v5-cli-codex0153-grok105-zcode381-slim$/m,
+    )
     assert.match(overrides, /v5-ccb-f8800e0c0480-embedded\(OC_RUNTIME_EMERGENCY_TUPLE/)
   })
 
@@ -101,7 +141,12 @@ describe('V5 branch deployment policy', () => {
 })
 
 async function runTurnCanaryFixture(
-  mode: 'foreign-then-success' | 'foreign-only' | 'own-error' | 'ccb-final-cost-tape-text' | 'ccb-final-cost-empty-session',
+  mode:
+    | 'foreign-then-success'
+    | 'foreign-only'
+    | 'own-error'
+    | 'ccb-final-cost-tape-text'
+    | 'ccb-final-cost-empty-session',
   answer = '2',
 ): Promise<{ code: number | null; stdout: string; stderr: string; elapsedMs: number }> {
   const dir = await mkdtemp(path.join(tmpdir(), 'v5-turn-canary-'))
@@ -136,80 +181,91 @@ async function runTurnCanaryFixture(
   })
   const wss = new WebSocketServer({ server, path: '/ws/user-chat-bridge' })
   let inboundAt = 0
-  wss.on('connection', (ws: {
-    once: (event: 'message', listener: (raw: { toString(): string }) => void) => void
-    send: (data: string) => void
-  }) => {
-    ws.once('message', (raw) => {
-      inboundAt = Date.now()
-      const inbound = JSON.parse(raw.toString())
-      const foreignErrors = [
-        JSON.stringify({
-          type: 'error',
-          code: 'UNAUTHORIZED_MODEL',
-          message: 'foreign recovery peer',
-          peer: { id: 'web-foreign-recovery', kind: 'dm' },
-          clientMessageId: inbound.clientMessageId,
-        }),
-        JSON.stringify({
-          type: 'error',
-          code: 'UNAUTHORIZED_MODEL',
-          message: 'foreign recovery turn',
-          peer: inbound.peer,
-          clientMessageId: 'm-recover-foreign',
-        }),
-      ]
-      const sendForeignErrors = () => foreignErrors.forEach((frame) => ws.send(frame))
-      if (mode === 'foreign-only') {
-        const timer = setInterval(sendForeignErrors, 15)
-        setTimeout(() => clearInterval(timer), 1_200)
-        return
-      }
-      sendForeignErrors()
-      if (mode === 'own-error') {
-        ws.send(JSON.stringify({
-          type: 'error',
-          code: 'UPSTREAM_FAILED',
-          message: 'own turn failed',
-          peer: inbound.peer,
-          clientMessageId: inbound.clientMessageId,
-        }))
-        return
-      }
-      if (mode === 'ccb-final-cost-tape-text' || mode === 'ccb-final-cost-empty-session') {
-        ws.send(JSON.stringify({
-          type: 'outbound.message',
-          sessionKey: `agent:main:webchat:dm:${inbound.peer.id}`,
-          channel: 'webchat',
-          peer: inbound.peer,
-          clientMessageId: inbound.clientMessageId,
-          blocks: [],
-          isFinal: true,
-        }))
+  wss.on(
+    'connection',
+    (ws: {
+      once: (event: 'message', listener: (raw: { toString(): string }) => void) => void
+      send: (data: string) => void
+    }) => {
+      ws.once('message', (raw) => {
+        inboundAt = Date.now()
+        const inbound = JSON.parse(raw.toString())
+        const foreignErrors = [
+          JSON.stringify({
+            type: 'error',
+            code: 'UNAUTHORIZED_MODEL',
+            message: 'foreign recovery peer',
+            peer: { id: 'web-foreign-recovery', kind: 'dm' },
+            clientMessageId: inbound.clientMessageId,
+          }),
+          JSON.stringify({
+            type: 'error',
+            code: 'UNAUTHORIZED_MODEL',
+            message: 'foreign recovery turn',
+            peer: inbound.peer,
+            clientMessageId: 'm-recover-foreign',
+          }),
+        ]
+        const sendForeignErrors = () => foreignErrors.forEach((frame) => ws.send(frame))
+        if (mode === 'foreign-only') {
+          const timer = setInterval(sendForeignErrors, 15)
+          setTimeout(() => clearInterval(timer), 1_200)
+          return
+        }
+        sendForeignErrors()
+        if (mode === 'own-error') {
+          ws.send(
+            JSON.stringify({
+              type: 'error',
+              code: 'UPSTREAM_FAILED',
+              message: 'own turn failed',
+              peer: inbound.peer,
+              clientMessageId: inbound.clientMessageId,
+            }),
+          )
+          return
+        }
+        if (mode === 'ccb-final-cost-tape-text' || mode === 'ccb-final-cost-empty-session') {
+          ws.send(
+            JSON.stringify({
+              type: 'outbound.message',
+              sessionKey: `agent:main:webchat:dm:${inbound.peer.id}`,
+              channel: 'webchat',
+              peer: inbound.peer,
+              clientMessageId: inbound.clientMessageId,
+              blocks: [],
+              isFinal: true,
+            }),
+          )
+          ws.send(JSON.stringify({ type: 'outbound.cost_charged' }))
+          return
+        }
+        ws.send(
+          JSON.stringify({
+            type: 'outbound.message',
+            sessionKey: `agent:main:webchat:dm:${inbound.peer.id}`,
+            channel: 'webchat',
+            peer: inbound.peer,
+            clientMessageId: inbound.clientMessageId,
+            blocks: [{ kind: 'text', text: answer }],
+            isFinal: false,
+          }),
+        )
+        ws.send(
+          JSON.stringify({
+            type: 'outbound.message',
+            sessionKey: `agent:main:webchat:dm:${inbound.peer.id}`,
+            channel: 'webchat',
+            peer: inbound.peer,
+            clientMessageId: inbound.clientMessageId,
+            blocks: [],
+            isFinal: true,
+          }),
+        )
         ws.send(JSON.stringify({ type: 'outbound.cost_charged' }))
-        return
-      }
-      ws.send(JSON.stringify({
-        type: 'outbound.message',
-        sessionKey: `agent:main:webchat:dm:${inbound.peer.id}`,
-        channel: 'webchat',
-        peer: inbound.peer,
-        clientMessageId: inbound.clientMessageId,
-        blocks: [{ kind: 'text', text: answer }],
-        isFinal: false,
-      }))
-      ws.send(JSON.stringify({
-        type: 'outbound.message',
-        sessionKey: `agent:main:webchat:dm:${inbound.peer.id}`,
-        channel: 'webchat',
-        peer: inbound.peer,
-        clientMessageId: inbound.clientMessageId,
-        blocks: [],
-        isFinal: true,
-      }))
-      ws.send(JSON.stringify({ type: 'outbound.cost_charged' }))
-    })
-  })
+      })
+    },
+  )
 
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject)
@@ -233,8 +289,12 @@ async function runTurnCanaryFixture(
   })
   let stdout = ''
   let stderr = ''
-  child.stdout.on('data', (chunk) => { stdout += chunk.toString() })
-  child.stderr.on('data', (chunk) => { stderr += chunk.toString() })
+  child.stdout.on('data', (chunk) => {
+    stdout += chunk.toString()
+  })
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk.toString()
+  })
   const code = await new Promise<number | null>((resolve, reject) => {
     const timeout = setTimeout(() => child.kill('SIGKILL'), 3_000)
     child.once('error', reject)
@@ -285,11 +345,12 @@ describe('V5 P3 preserved runtime tuple surface gate', () => {
       git('commit', '-m', message)
       return git('rev-parse', 'HEAD')
     }
-    const invoke = (from: string, target: string) => spawnSync(
-      process.execPath,
-      [deploySurfaceCheck, '--repo', repo, '--base', from, '--target', target],
-      { encoding: 'utf8' },
-    )
+    const invoke = (from: string, target: string) =>
+      spawnSync(
+        process.execPath,
+        [deploySurfaceCheck, '--repo', repo, '--base', from, '--target', target],
+        { encoding: 'utf8' },
+      )
     return { repo, base, write, git, commit, invoke }
   }
 
@@ -337,21 +398,34 @@ describe('V5 P3 preserved runtime tuple surface gate', () => {
     const rejectedResult = rejected.invoke(rejected.base, rejectedTarget)
     assert.equal(rejectedResult.status, 0, rejectedResult.stderr || rejectedResult.stdout)
     const rejectedPlan = JSON.parse(rejectedResult.stdout)
-    assert.ok(rejectedPlan.manual.some((entry: { reason: string }) => entry.reason.startsWith('manual_glob:')))
-    assert.ok(rejectedPlan.manual.some((entry: { path: string, reason: string }) =>
-      entry.path === 'e2e/session-display/incidents.json' && entry.reason === 'unmatched_path'))
+    assert.ok(
+      rejectedPlan.manual.some((entry: { reason: string }) =>
+        entry.reason.startsWith('manual_glob:'),
+      ),
+    )
+    assert.ok(
+      rejectedPlan.manual.some(
+        (entry: { path: string; reason: string }) =>
+          entry.path === 'e2e/session-display/incidents.json' && entry.reason === 'unmatched_path',
+      ),
+    )
   })
 
   test('symlink/type changes, invalid manifests, invalid commits, and non-ancestor ranges fail closed', async () => {
     const changedType = await fixture()
     await rm(path.join(changedType.repo, 'packages/gateway/src/old.ts'))
-    await symlink('/tmp/not-runtime-source', path.join(changedType.repo, 'packages/gateway/src/old.ts'))
+    await symlink(
+      '/tmp/not-runtime-source',
+      path.join(changedType.repo, 'packages/gateway/src/old.ts'),
+    )
     const typeTarget = changedType.commit()
     const typeResult = changedType.invoke(changedType.base, typeTarget)
     assert.equal(typeResult.status, 0, typeResult.stderr || typeResult.stdout)
-    assert.ok(JSON.parse(typeResult.stdout).manual.some(
-      (entry: { reason: string }) => entry.reason.startsWith('unsupported_'),
-    ))
+    assert.ok(
+      JSON.parse(typeResult.stdout).manual.some((entry: { reason: string }) =>
+        entry.reason.startsWith('unsupported_'),
+      ),
+    )
 
     const invalidManifest = await fixture()
     await invalidManifest.write('packages/web-react/src/new.ts')
@@ -390,31 +464,44 @@ describe('V5 P3 preserved runtime tuple surface gate', () => {
     ]) {
       assert.ok(guard < canary.indexOf(later), `P3 surface guard must precede ${later}`)
     }
-    const manifest = JSON.parse(await readFile(path.join(root, 'deploy/v5/selfheal-deploy-surfaces.json'), 'utf8'))
-    assert.ok(manifest.rules.some(
-      (rule: { glob: string, surface: string }) => rule.glob === 'packages/cli/**' && rule.surface === 'runtime-source',
-    ))
+    const manifest = JSON.parse(
+      await readFile(path.join(root, 'deploy/v5/selfheal-deploy-surfaces.json'), 'utf8'),
+    )
+    assert.ok(
+      manifest.rules.some(
+        (rule: { glob: string; surface: string }) =>
+          rule.glob === 'packages/cli/**' && rule.surface === 'runtime-source',
+      ),
+    )
 
-    const invokeGuard = (repo: string, base: string, target: string) => spawnSync('bash', ['-c', [
-      'set -euo pipefail',
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      `REPO_ROOT='${repo}'`,
-      'DRY=0',
-      'remote_env_get() {',
-      '  case "$1" in',
-      '    OC_RUNTIME_RELEASE) printf "%s\\n" /runtime/current ;;',
-      '    OC_PLATFORM_BUNDLE) printf "%s\\n" /bundle/current ;;',
-      '    *) return 97 ;;',
-      '  esac',
-      '}',
-      'ssh() { cat >/dev/null || true; printf "%s\\n" "$BASE"; }',
-      `assert_p3_preserved_tuple_matches_candidate '${target}'`,
-    ].join('\n')], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, ALLOW_ANY_BRANCH: '1', BASE: base },
-    })
+    const invokeGuard = (repo: string, base: string, target: string) =>
+      spawnSync(
+        'bash',
+        [
+          '-c',
+          [
+            'set -euo pipefail',
+            'export V5_DEPLOY_SOURCE_ONLY=1',
+            `source '${deploy}'`,
+            `REPO_ROOT='${repo}'`,
+            'DRY=0',
+            'remote_env_get() {',
+            '  case "$1" in',
+            '    OC_RUNTIME_RELEASE) printf "%s\\n" /runtime/current ;;',
+            '    OC_PLATFORM_BUNDLE) printf "%s\\n" /bundle/current ;;',
+            '    *) return 97 ;;',
+            '  esac',
+            '}',
+            'ssh() { cat >/dev/null || true; printf "%s\\n" "$BASE"; }',
+            `assert_p3_preserved_tuple_matches_candidate '${target}'`,
+          ].join('\n'),
+        ],
+        {
+          cwd: root,
+          encoding: 'utf8',
+          env: { ...process.env, ALLOW_ANY_BRANCH: '1', BASE: base },
+        },
+      )
 
     const runtime = await fixture()
     await runtime.write('packages/gateway/src/new.ts')
@@ -457,11 +544,12 @@ describe('V5 P3 preserved runtime tuple surface gate', () => {
       `ssh() { printf '%s|%s|%s\\n' "\${ACTUAL_ID:-${imageId}}" '${sourceCommit}' "\${EMBED_SOURCE:-1}"; }`,
       'p3_tuple_axis_source_commit "$SURFACE"',
     ].join('\n')
-    const invoke = (surface: string, env: NodeJS.ProcessEnv = {}) => spawnSync('bash', ['-c', harness], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, ALLOW_ANY_BRANCH: '1', SURFACE: surface, ...env },
-    })
+    const invoke = (surface: string, env: NodeJS.ProcessEnv = {}) =>
+      spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1', SURFACE: surface, ...env },
+      })
     const runtime = invoke('runtime-source')
     assert.equal(runtime.status, 0, runtime.stderr || runtime.stdout)
     assert.equal(runtime.stdout.trim(), sourceCommit)
@@ -999,9 +1087,15 @@ describe('V5 durable development release queue', () => {
     const lock = source.indexOf('DEPLOY_HOLDER_OWNED=1', source.indexOf('OC_V5_DEPLOY_LOCK_FD'))
     const migrationGate = source.indexOf('assert_repo_required_migrations || exit 1')
     const productionLease = source.indexOf('acquire_production_mutation_lease || exit 3')
-    assert.ok(lock >= 0 && gate > lock, 'release queue gate must run after the real local deploy lock')
+    assert.ok(
+      lock >= 0 && gate > lock,
+      'release queue gate must run after the real local deploy lock',
+    )
     assert.ok(gate < migrationGate, 'release queue gate must run before migration probes')
-    assert.ok(gate < productionLease, 'release queue gate must run before the remote mutation lease')
+    assert.ok(
+      gate < productionLease,
+      'release queue gate must run before the remote mutation lease',
+    )
   })
 
   test('pinned SHA — not the shared worktree HEAD — decides what gets released', async () => {
@@ -1013,14 +1107,18 @@ describe('V5 durable development release queue', () => {
     //   · deploy 按 pinned 显式取源(否则放宽 assert 就等于允许发出未 pin 的代码)。
     // 只留一半是净损失,所以这条测试把两半锁在一起。
     const queueSrc = await readFile(releaseQueue, 'utf8')
-    const deploySrc = await readFile(deploy, "utf8")
+    const deploySrc = await readFile(deploy, 'utf8')
 
     assert.match(
       queueSrc,
       /merge-base --is-ancestor "\$pinned" "\$current"/,
       'queue.assert 必须用祖先关系判定 pinned,而不是与共享工作树 HEAD 逐字节相等',
     )
-    assert.match(queueSrc, /^\s*pinned-sha\)/m, 'queue 必须提供只读的 pinned-sha 出口供 deploy 取值')
+    assert.match(
+      queueSrc,
+      /^\s*pinned-sha\)/m,
+      'queue 必须提供只读的 pinned-sha 出口供 deploy 取值',
+    )
 
     assert.match(
       deploySrc,
@@ -1040,7 +1138,10 @@ describe('V5 durable development release queue', () => {
       'build_platform_bundle 必须与 build_release 同源',
     )
     const buildRelease = deploySrc.indexOf('build_release() {')
-    const strayHeadRead = deploySrc.indexOf('full_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"', buildRelease)
+    const strayHeadRead = deploySrc.indexOf(
+      'full_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"',
+      buildRelease,
+    )
     assert.equal(
       strayHeadRead,
       -1,
@@ -1053,7 +1154,10 @@ describe('V5 durable development release queue', () => {
     dirs.push(dir)
     const db = path.join(dir, 'selfheal.db')
     const cgroup = path.join(dir, 'cgroup')
-    const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+    const head = spawnSync('git', ['rev-parse', 'HEAD'], {
+      cwd: root,
+      encoding: 'utf8',
+    }).stdout.trim()
     const create = spawnSync(
       'sqlite3',
       [
@@ -1093,7 +1197,11 @@ describe('V5 durable development release queue', () => {
         { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } },
       )
     assert.equal(check('').status, 1, 'missing rrid must fail')
-    assert.equal(check('rrid-ok', path.join(dir, 'missing.db')).status, 1, 'missing ledger must fail')
+    assert.equal(
+      check('rrid-ok', path.join(dir, 'missing.db')).status,
+      1,
+      'missing ledger must fail',
+    )
     await writeFile(cgroup, '0::/system.slice/wrong.scope\n')
     assert.equal(check('rrid-ok').status, 1, 'wrong cgroup scope must fail')
     await writeFile(cgroup, '0::/system.slice/scope-ok.scope\n')
@@ -1155,7 +1263,11 @@ async function manualLeaseFixture() {
   const command = path.join(dir, 'wrapped-command.sh')
   const source = await readFile(manualMutationLease, 'utf8')
   const lockNeedle = 'PRODUCTION_MUTATION_LOCK="/run/openclaude-v5/production-mutation.lock"'
-  assert.equal(source.split(lockNeedle).length - 1, 1, 'manual wrapper lock path replacement drifted')
+  assert.equal(
+    source.split(lockNeedle).length - 1,
+    1,
+    'manual wrapper lock path replacement drifted',
+  )
   const fixtureSource = source.replace(lockNeedle, `PRODUCTION_MUTATION_LOCK="${lock}"`)
   await writeFile(wrapper, fixtureSource)
   await chmod(wrapper, 0o755)
@@ -1232,17 +1344,29 @@ async function killManualLeaseFixtureProcesses(...pidFiles: string[]): Promise<v
     for (const value of raw.split(/\s+/)) {
       const pid = Number(value)
       if (!Number.isSafeInteger(pid) || pid <= 1) continue
-      try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {
+        /* already gone */
+      }
     }
   }
 }
 
 async function allRecordedProcessesExited(pidFile: string): Promise<boolean> {
   const raw = await readFile(pidFile, 'utf8').catch(() => '')
-  const pids = raw.split(/\s+/).map(Number).filter((pid) => Number.isSafeInteger(pid) && pid > 1)
+  const pids = raw
+    .split(/\s+/)
+    .map(Number)
+    .filter((pid) => Number.isSafeInteger(pid) && pid > 1)
   if (pids.length === 0) return false
   return pids.every((pid) => {
-    try { process.kill(pid, 0); return false } catch { return true }
+    try {
+      process.kill(pid, 0)
+      return false
+    } catch {
+      return true
+    }
   })
 }
 
@@ -1256,44 +1380,54 @@ function childProcessGroupLeader(parentPid: number): number | undefined {
   return undefined
 }
 
-async function writeStubbornManualCommand(fx: Awaited<ReturnType<typeof manualLeaseFixture>>): Promise<string> {
+async function writeStubbornManualCommand(
+  fx: Awaited<ReturnType<typeof manualLeaseFixture>>,
+): Promise<string> {
   const command = path.join(fx.dir, 'stubborn-command.sh')
-  await writeFile(command, [
-    '#!/bin/bash',
-    "trap '' TERM",
-    'printf "%s\\n" "$BASHPID" >>"$COMMAND_PIDS"',
-    '(',
-    "  trap '' TERM",
-    '  printf "%s\\n" "$BASHPID" >>"$COMMAND_PIDS"',
-    '  while :; do sleep 0.1; done',
-    ') &',
-    ': >"$COMMAND_STARTED"',
-    'while :; do sleep 0.1; done',
-  ].join('\n') + '\n')
+  await writeFile(
+    command,
+    [
+      '#!/bin/bash',
+      "trap '' TERM",
+      'printf "%s\\n" "$BASHPID" >>"$COMMAND_PIDS"',
+      '(',
+      "  trap '' TERM",
+      '  printf "%s\\n" "$BASHPID" >>"$COMMAND_PIDS"',
+      '  while :; do sleep 0.1; done',
+      ') &',
+      ': >"$COMMAND_STARTED"',
+      'while :; do sleep 0.1; done',
+    ].join('\n') + '\n',
+  )
   await chmod(command, 0o755)
   return command
 }
 
 async function caddyRemoteFixture() {
-  const dir = await mkdtemp(path.join(tmpdir(), 'v5-caddy-port-')); dirs.push(dir)
-  const bin = path.join(dir, 'bin'); await mkdir(bin)
+  const dir = await mkdtemp(path.join(tmpdir(), 'v5-caddy-port-'))
+  dirs.push(dir)
+  const bin = path.join(dir, 'bin')
+  await mkdir(bin)
   const sshLog = path.join(dir, 'ssh.log')
   const sshStdinLog = path.join(dir, 'ssh.stdin.log')
   const scpLog = path.join(dir, 'scp.log')
-  await writeFile(path.join(bin, 'ssh'), [
-    '#!/bin/sh',
-    'printf "%s\\n" "$*" >>"$FAKE_SSH_LOG"',
-    'if [ "${2:-}" = bash ] && [ "${3:-}" = -s ]; then',
-    '  cat >"$FAKE_SSH_STDIN_LOG"',
-    '  printf "SET:%s:svc_v5 http_v5 public_route\\n" "${9:-}"',
-    '  exit 0',
-    'fi',
-    'case "$*" in',
-    '  *psql*) cat >/dev/null; printf "%s\\n" "$FAKE_DS_ROW" ;;',
-    '  *Cookie:*) printf "%s\\n" \'{"ok":true,"slot":"B"}\' ;;',
-    '  *curl*) printf "%s\\n" \'{"ok":true,"slot":"A"}\' ;;',
-    'esac',
-  ].join('\n') + '\n')
+  await writeFile(
+    path.join(bin, 'ssh'),
+    [
+      '#!/bin/sh',
+      'printf "%s\\n" "$*" >>"$FAKE_SSH_LOG"',
+      'if [ "${2:-}" = bash ] && [ "${3:-}" = -s ]; then',
+      '  cat >"$FAKE_SSH_STDIN_LOG"',
+      '  printf "SET:%s:svc_v5 http_v5 public_route\\n" "${9:-}"',
+      '  exit 0',
+      'fi',
+      'case "$*" in',
+      '  *psql*) cat >/dev/null; printf "%s\\n" "$FAKE_DS_ROW" ;;',
+      '  *Cookie:*) printf "%s\\n" \'{"ok":true,"slot":"B"}\' ;;',
+      '  *curl*) printf "%s\\n" \'{"ok":true,"slot":"A"}\' ;;',
+      'esac',
+    ].join('\n') + '\n',
+  )
   await writeFile(path.join(bin, 'scp'), '#!/bin/sh\nprintf "%s\\n" "$*" >>"$FAKE_SCP_LOG"\n')
   await chmod(path.join(bin, 'ssh'), 0o755)
   await chmod(path.join(bin, 'scp'), 0o755)
@@ -1337,7 +1471,9 @@ describe('v5 release safety lanes', () => {
     )
     const activation = body.indexOf('activate_release "$BUILT_RELEASE"')
     const fullSmoke = body.indexOf('smoke "$ACTIVE_PORT"')
-    const turnCanary = body.indexOf('minimum_functional_core deploy "$BUILT_RELEASE" "$ACTIVE_PORT"')
+    const turnCanary = body.indexOf(
+      'minimum_functional_core deploy "$BUILT_RELEASE" "$ACTIVE_PORT"',
+    )
     const zeroTouch = body.indexOf('knowledge-planet=zero-touch')
     const seed = body.indexOf('knowledge_planet_plugin_seed "$BUILT_RELEASE"')
     const maintenanceEnd = body.indexOf('end_planned_maintenance', seed)
@@ -1351,7 +1487,9 @@ describe('v5 release safety lanes', () => {
     )
     // 最小功能核(双引擎真 turn + J1-J5 旅程)紧随 full smoke(2026-07-17 goal 事故 +
     // 2026-07-26 出口矩阵整改);零接触收尾分支必须在 seed 之前(门未关/未审批 → 不 seed 直接完成)。
-    assert.ok(turnCanary > fullSmoke && zeroTouch > turnCanary && seed > zeroTouch && maintenanceEnd > seed)
+    assert.ok(
+      turnCanary > fullSmoke && zeroTouch > turnCanary && seed > zeroTouch && maintenanceEnd > seed,
+    )
     // advisory gate 必须校验 stdout JSON 契约,不依赖 tsx 退出码(fail-open 历史教训)。
     assert.match(source, /advisory == "knowledge-planet"/)
     assert.match(source, /--advisory-status/)
@@ -1390,18 +1528,12 @@ describe('v5 release safety lanes', () => {
     assert.match(seedSource, /beforeListingOpen/)
     assert.match(seedSource, /bindManagedBrowserPluginAccount/)
     assert.match(seedSource, /--verify-user=/)
-    assert.match(
-      source,
-      /--verify-knowledge-planet-user=\*\)[\s\S]*MODE="knowledge-planet-verify"/,
-    )
+    assert.match(source, /--verify-knowledge-planet-user=\*\)[\s\S]*MODE="knowledge-planet-verify"/)
     assert.match(
       source,
       /OC_V5_KP_VERIFY_LOCK_FILE:-\/var\/lock\/oc-v5-knowledge-planet-verify\.lock/,
     )
-    assert.match(
-      source,
-      /knowledge-planet-verify\) knowledge_planet_plugin_verify_user/,
-    )
+    assert.match(source, /knowledge-planet-verify\) knowledge_planet_plugin_verify_user/)
     assert.match(seedSource, /--classify-current-for-release=/)
     assert.match(
       source,
@@ -1456,7 +1588,9 @@ describe('v5 release safety lanes', () => {
     const kpSeed = body.indexOf('knowledge_planet_plugin_seed "$BUILT_RELEASE"')
     const weiboFinishZeroTouch = body.indexOf('weibo_plugin_finish_or_seed "$BUILT_RELEASE"')
     const weiboFinishAfterKp = body.indexOf('weibo_plugin_finish_or_seed "$BUILT_RELEASE"', kpSeed)
-    assert.ok(built >= 0 && kpAdvisory > built && weiboAdvisory > kpAdvisory && maintenance > weiboAdvisory)
+    assert.ok(
+      built >= 0 && kpAdvisory > built && weiboAdvisory > kpAdvisory && maintenance > weiboAdvisory,
+    )
     assert.ok(
       weiboPre > maintenance &&
         activation > weiboPre &&
@@ -1466,7 +1600,10 @@ describe('v5 release safety lanes', () => {
         weiboFinishAfterKp > kpSeed,
     )
     assert.match(source, /advisory == "weibo"/)
-    assert.match(source, /\.decision == "noop" or \.decision == "promote" or \.decision == "unverified"/)
+    assert.match(
+      source,
+      /\.decision == "noop" or \.decision == "promote" or \.decision == "unverified"/,
+    )
     assert.match(source, /weibo_plugin_pre_activation_bracket/)
     assert.doesNotMatch(source, /weibo_candidate_commit/)
     assert.doesNotMatch(source, /weibo_plugin_smoke_gate/)
@@ -1575,17 +1712,29 @@ describe('v5 release safety lanes', () => {
     assert.equal(result.status, 0, result.stdout + result.stderr)
     assert.match(result.stdout, /^noop:$/m)
     assert.match(result.stdout, /^unverified:$/m)
-    assert.match(result.stdout, /close-fail:close:new-release lease:weibo-close-gate-recovery open-current:new-release/)
-    assert.match(result.stdout, /classify-fail:close:new-release classify:new-release:old-release:77 lease:weibo-classify-recovery/)
+    assert.match(
+      result.stdout,
+      /close-fail:close:new-release lease:weibo-close-gate-recovery open-current:new-release/,
+    )
+    assert.match(
+      result.stdout,
+      /classify-fail:close:new-release classify:new-release:old-release:77 lease:weibo-classify-recovery/,
+    )
     assert.match(result.stdout, /seed-fail:.*seed:new-release lease:weibo-seed-compensation/)
     assert.match(result.stdout, /seed-fail:.*kp-compensate:/)
-    assert.doesNotMatch(result.stdout.split('seed-fail:')[1]?.split('\n')[0] ?? '', /kp-setup-compensate/)
+    assert.doesNotMatch(
+      result.stdout.split('seed-fail:')[1]?.split('\n')[0] ?? '',
+      /kp-setup-compensate/,
+    )
     assert.match(result.stdout, /setup-first-seed-fail:.*kp-setup-compensate:/)
     assert.doesNotMatch(
       result.stdout.split('setup-first-seed-fail:')[1]?.split('\n')[0] ?? '',
       /kp-compensate:/,
     )
-    assert.match(result.stdout, /compensate:lease:weibo-deploy-compensation close:new-release transition:new-release:old-release open-release:new-release:old-release/)
+    assert.match(
+      result.stdout,
+      /compensate:lease:weibo-deploy-compensation close:new-release transition:new-release:old-release open-release:new-release:old-release/,
+    )
   })
 
   test('Knowledge Planet setup-first deploy is race-guarded, repeat-safe, and skips the v1.1 seed', async () => {
@@ -1597,9 +1746,7 @@ describe('v5 release safety lanes', () => {
     const end = source.indexOf('\n# ───────────────────────── offline recycle', start)
     const body = source.slice(start, end)
     const built = body.indexOf('build_release ||')
-    const pre = body.indexOf(
-      'knowledge_planet_plugin_assert_setup_first_safe "$BUILT_RELEASE" pre',
-    )
+    const pre = body.indexOf('knowledge_planet_plugin_assert_setup_first_safe "$BUILT_RELEASE" pre')
     const capturedVersion = body.indexOf(
       'kp_setup_plugin_version_id="$KNOWLEDGE_PLANET_SETUP_VERSION_ID"',
       pre,
@@ -1611,10 +1758,7 @@ describe('v5 release safety lanes', () => {
     )
     const smoke = body.indexOf('smoke "$ACTIVE_PORT"', post)
     const dist = body.indexOf('dist_handshake_smoke "$ACTIVE_PORT"', smoke)
-    const reopen = body.indexOf(
-      'knowledge_planet_plugin_open_setup_first_gate_to_version',
-      dist,
-    )
+    const reopen = body.indexOf('knowledge_planet_plugin_open_setup_first_gate_to_version', dist)
     const setupDone = body.indexOf('knowledge-planet=setup-first', reopen)
     const earlyReturn = body.indexOf('return 0', reopen)
     const seed = body.indexOf('knowledge_planet_plugin_seed "$BUILT_RELEASE"')
@@ -1651,11 +1795,7 @@ describe('v5 release safety lanes', () => {
     assert.equal(missingDist.status, 2, missingDist.stdout + missingDist.stderr)
     assert.match(missingDist.stderr, /仅允许与普通 deploy \+ --with-dist 同用/)
 
-    const accepted = run(deploy, [
-      '--dry-run',
-      '--with-dist',
-      '--defer-knowledge-planet-upgrade',
-    ])
+    const accepted = run(deploy, ['--dry-run', '--with-dist', '--defer-knowledge-planet-upgrade'])
     assert.equal(accepted.status, 0, accepted.stdout + accepted.stderr)
     assert.match(accepted.stdout, /setup-first 前置守卫/)
     assert.match(accepted.stdout, /setup-first drain 后守卫/)
@@ -1749,10 +1889,7 @@ describe('v5 release safety lanes', () => {
       result.stdout,
       /hotcfg-existing:rollback:1:1:new-release:1 smoke:18790 open:new-release:old-release/,
     )
-    assert.match(
-      result.stdout,
-      /hotcfg-first:rollback:1:1:new-release:0 smoke:18790(?:\n|$)/,
-    )
+    assert.match(result.stdout, /hotcfg-first:rollback:1:1:new-release:0 smoke:18790(?:\n|$)/)
     assert.doesNotMatch(result.stdout, /UNEXPECTED/)
   })
 
@@ -1763,10 +1900,7 @@ describe('v5 release safety lanes', () => {
     assert.match(verified.stdout, /one QR → 15 actions → encrypted handoff/)
 
     for (const userId of ['0', '-1', 'abc', '']) {
-      const rejected = run(deploy, [
-        '--dry-run',
-        `--verify-knowledge-planet-user=${userId}`,
-      ])
+      const rejected = run(deploy, ['--dry-run', `--verify-knowledge-planet-user=${userId}`])
       assert.equal(rejected.status, 2, rejected.stdout + rejected.stderr)
       assert.match(rejected.stderr, /需正整数用户 ID/)
     }
@@ -1777,46 +1911,64 @@ describe('v5 release safety lanes', () => {
       readFile(baselineGuard, 'utf8'),
       readFile(supervisor, 'utf8'),
     ])
-    const shellSkills = guardSource
-      .match(/EXPECTED_SKILLS=\(\n([\s\S]*?)\n\)/)?.[1]
-      .split(/\s+/)
-      .filter(Boolean) ?? []
-    const tsSkills = [...(supervisorSource
-      .match(/V3_CCB_BASELINE_SKILL_NAMES = \[([\s\S]*?)\] as const/)?.[1] ?? '')
-      .matchAll(/"([a-z0-9-]+)"/g)]
-      .map((match) => match[1])
+    const shellSkills =
+      guardSource
+        .match(/EXPECTED_SKILLS=\(\n([\s\S]*?)\n\)/)?.[1]
+        .split(/\s+/)
+        .filter(Boolean) ?? []
+    const tsSkills = [
+      ...(
+        supervisorSource.match(/V3_CCB_BASELINE_SKILL_NAMES = \[([\s\S]*?)\] as const/)?.[1] ?? ''
+      ).matchAll(/"([a-z0-9-]+)"/g),
+    ].map((match) => match[1])
     assert.deepEqual(shellSkills, tsSkills)
 
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-guard-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-guard-'))
+    dirs.push(dir)
     const release = path.join(dir, 'release')
     const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
     await mkdir(path.dirname(baseline), { recursive: true })
-    await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, { recursive: true })
+    await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, {
+      recursive: true,
+    })
     const madeWritable = spawnSync('chmod', ['-R', 'g+w', baseline], { encoding: 'utf8' })
     assert.equal(madeWritable.status, 0, madeWritable.stderr)
     await chmod(path.join(baseline, 'skills/system-info'), 0o700)
     await chmod(path.join(baseline, 'skills/system-info/SKILL.md'), 0o600)
 
-    const before = spawnSync('bash', [baselineGuard, 'check-release', release], { encoding: 'utf8' })
+    const before = spawnSync('bash', [baselineGuard, 'check-release', release], {
+      encoding: 'utf8',
+    })
     assert.notEqual(before.status, 0)
     assert.match(before.stderr, /group\/other writable/)
-    const hardened = spawnSync('bash', [baselineGuard, 'harden-release', release], { encoding: 'utf8' })
+    const hardened = spawnSync('bash', [baselineGuard, 'harden-release', release], {
+      encoding: 'utf8',
+    })
     assert.equal(hardened.status, 0, hardened.stderr)
     const after = spawnSync('bash', [baselineGuard, 'check-release', release], { encoding: 'utf8' })
     assert.equal(after.status, 0, after.stderr)
-    const dirMode = spawnSync('stat', ['-c', '%a', path.join(baseline, 'skills/system-info')], { encoding: 'utf8' })
-    const fileMode = spawnSync('stat', ['-c', '%a', path.join(baseline, 'skills/system-info/SKILL.md')], { encoding: 'utf8' })
+    const dirMode = spawnSync('stat', ['-c', '%a', path.join(baseline, 'skills/system-info')], {
+      encoding: 'utf8',
+    })
+    const fileMode = spawnSync(
+      'stat',
+      ['-c', '%a', path.join(baseline, 'skills/system-info/SKILL.md')],
+      { encoding: 'utf8' },
+    )
     assert.equal(dirMode.stdout.trim(), '755')
     assert.equal(fileMode.stdout.trim(), '644')
   })
 
   test('trusted baseline guard rejects symlinks, special nodes and manifest drift before hardening', async () => {
     const makeRelease = async (suffix: string) => {
-      const dir = await mkdtemp(path.join(tmpdir(), `v5-baseline-${suffix}-`)); dirs.push(dir)
+      const dir = await mkdtemp(path.join(tmpdir(), `v5-baseline-${suffix}-`))
+      dirs.push(dir)
       const release = path.join(dir, 'release')
       const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
       await mkdir(path.dirname(baseline), { recursive: true })
-      await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, { recursive: true })
+      await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, {
+        recursive: true,
+      })
       return { release, baseline }
     }
 
@@ -1824,7 +1976,9 @@ describe('v5 release safety lanes', () => {
     const linkedSkill = path.join(linked.baseline, 'skills/system-info/SKILL.md')
     await rm(linkedSkill)
     await symlink('/etc/passwd', linkedSkill)
-    const linkedResult = spawnSync('bash', [baselineGuard, 'harden-release', linked.release], { encoding: 'utf8' })
+    const linkedResult = spawnSync('bash', [baselineGuard, 'harden-release', linked.release], {
+      encoding: 'utf8',
+    })
     assert.notEqual(linkedResult.status, 0)
     assert.match(linkedResult.stderr, /symlink\/special node/)
 
@@ -1833,42 +1987,61 @@ describe('v5 release safety lanes', () => {
     await rm(specialSkill)
     const fifo = spawnSync('mkfifo', [specialSkill], { encoding: 'utf8' })
     assert.equal(fifo.status, 0, fifo.stderr)
-    const specialResult = spawnSync('bash', [baselineGuard, 'harden-release', special.release], { encoding: 'utf8' })
+    const specialResult = spawnSync('bash', [baselineGuard, 'harden-release', special.release], {
+      encoding: 'utf8',
+    })
     assert.notEqual(specialResult.status, 0)
     assert.match(specialResult.stderr, /symlink\/special node/)
 
     const drift = await makeRelease('drift')
     await mkdir(path.join(drift.baseline, 'skills/undeclared'))
     await writeFile(path.join(drift.baseline, 'skills/undeclared/SKILL.md'), '# unexpected\n')
-    const driftResult = spawnSync('bash', [baselineGuard, 'harden-release', drift.release], { encoding: 'utf8' })
+    const driftResult = spawnSync('bash', [baselineGuard, 'harden-release', drift.release], {
+      encoding: 'utf8',
+    })
     assert.notEqual(driftResult.status, 0)
     assert.match(driftResult.stderr, /skill manifest mismatch/)
 
     const extraFile = await makeRelease('extra-file')
     await writeFile(path.join(extraFile.baseline, 'skills/undeclared.txt'), 'unexpected\n')
-    const extraFileResult = spawnSync('bash', [baselineGuard, 'harden-release', extraFile.release], { encoding: 'utf8' })
+    const extraFileResult = spawnSync(
+      'bash',
+      [baselineGuard, 'harden-release', extraFile.release],
+      { encoding: 'utf8' },
+    )
     assert.notEqual(extraFileResult.status, 0)
     assert.match(extraFileResult.stderr, /skill manifest mismatch/)
 
     const unreadable = await makeRelease('unreadable')
     await chmod(path.join(unreadable.baseline, 'skills/system-info/SKILL.md'), 0o600)
-    const unreadableResult = spawnSync('bash', [baselineGuard, 'check-release', unreadable.release], { encoding: 'utf8' })
+    const unreadableResult = spawnSync(
+      'bash',
+      [baselineGuard, 'check-release', unreadable.release],
+      { encoding: 'utf8' },
+    )
     assert.notEqual(unreadableResult.status, 0)
     assert.match(unreadableResult.stderr, /not world-readable/)
 
     const untraversable = await makeRelease('untraversable')
     await chmod(path.join(untraversable.baseline, 'skills/system-info'), 0o700)
-    const untraversableResult = spawnSync('bash', [baselineGuard, 'check-release', untraversable.release], { encoding: 'utf8' })
+    const untraversableResult = spawnSync(
+      'bash',
+      [baselineGuard, 'check-release', untraversable.release],
+      { encoding: 'utf8' },
+    )
     assert.notEqual(untraversableResult.status, 0)
     assert.match(untraversableResult.stderr, /not world-readable\/traversable/)
   })
 
   test('legacy serving baseline compat allows only pre-admin cursor/taskboard/ssh/multi-model-review/ths gaps', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-legacy-cursor-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-legacy-cursor-'))
+    dirs.push(dir)
     const release = path.join(dir, 'release')
     const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
     await mkdir(path.dirname(baseline), { recursive: true })
-    await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, { recursive: true })
+    await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, {
+      recursive: true,
+    })
     await rm(path.join(baseline, 'skills/cursor-cli'), { recursive: true })
     await rm(path.join(baseline, 'skills/manage-taskboard'), { recursive: true })
     await rm(path.join(baseline, 'skills/ssh'), { recursive: true })
@@ -1876,18 +2049,28 @@ describe('v5 release safety lanes', () => {
     await rm(path.join(baseline, 'skills/ths'), { recursive: true })
     await rm(path.join(baseline, 'AGENTS.admin.md'))
     await rm(path.join(baseline, 'CLAUDE.admin.md'))
-    const strict = spawnSync('bash', [baselineGuard, 'check-release', release], { encoding: 'utf8' })
+    const strict = spawnSync('bash', [baselineGuard, 'check-release', release], {
+      encoding: 'utf8',
+    })
     assert.notEqual(strict.status, 0)
-    const compat = spawnSync('bash', [baselineGuard, 'harden-release-legacy-cursor', release], { encoding: 'utf8' })
+    const compat = spawnSync('bash', [baselineGuard, 'harden-release-legacy-cursor', release], {
+      encoding: 'utf8',
+    })
     assert.equal(compat.status, 0, compat.stderr)
     await mkdir(path.join(baseline, 'skills/undeclared'))
     await writeFile(path.join(baseline, 'skills/undeclared/SKILL.md'), '# unexpected\n')
-    const drift = spawnSync('bash', [baselineGuard, 'check-release-legacy-cursor', release], { encoding: 'utf8' })
+    const drift = spawnSync('bash', [baselineGuard, 'check-release-legacy-cursor', release], {
+      encoding: 'utf8',
+    })
     assert.notEqual(drift.status, 0)
     assert.match(drift.stderr, /skill manifest mismatch/)
     await rm(path.join(baseline, 'skills/undeclared'), { recursive: true })
     await rm(path.join(baseline, 'skills/system-info'), { recursive: true })
-    const forbiddenGap = spawnSync('bash', [baselineGuard, 'check-release-legacy-cursor', release], { encoding: 'utf8' })
+    const forbiddenGap = spawnSync(
+      'bash',
+      [baselineGuard, 'check-release-legacy-cursor', release],
+      { encoding: 'utf8' },
+    )
     assert.notEqual(forbiddenGap.status, 0)
     assert.match(forbiddenGap.stderr, /skill manifest mismatch/)
 
@@ -1900,36 +2083,51 @@ describe('v5 release safety lanes', () => {
   })
 
   test('post-rollback smoke uses legacy baseline for predecessor missing multi-model-review', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-rollback-smoke-legacy-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-rollback-smoke-legacy-'))
+    dirs.push(dir)
     const oldRelease = path.join(dir, 'rel-old')
     const newRelease = path.join(dir, 'rel-new')
     const copyBaseline = async (release: string) => {
       const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
       await mkdir(path.dirname(baseline), { recursive: true })
-      await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, { recursive: true })
+      await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, {
+        recursive: true,
+      })
       return baseline
     }
     const oldBaseline = await copyBaseline(oldRelease)
     await copyBaseline(newRelease)
     await rm(path.join(oldBaseline, 'skills/multi-model-review'), { recursive: true })
 
-    const strictOld = spawnSync('bash', [baselineGuard, 'check-release', oldRelease], { encoding: 'utf8' })
+    const strictOld = spawnSync('bash', [baselineGuard, 'check-release', oldRelease], {
+      encoding: 'utf8',
+    })
     assert.notEqual(strictOld.status, 0)
     assert.match(strictOld.stderr, /skill manifest mismatch/)
 
-    const strictNew = spawnSync('bash', [baselineGuard, 'check-release', newRelease], { encoding: 'utf8' })
+    const strictNew = spawnSync('bash', [baselineGuard, 'check-release', newRelease], {
+      encoding: 'utf8',
+    })
     assert.equal(strictNew.status, 0, strictNew.stderr)
 
-    const legacyOld = spawnSync('bash', [baselineGuard, 'check-release-legacy-cursor', oldRelease], { encoding: 'utf8' })
+    const legacyOld = spawnSync(
+      'bash',
+      [baselineGuard, 'check-release-legacy-cursor', oldRelease],
+      { encoding: 'utf8' },
+    )
     assert.equal(legacyOld.status, 0, legacyOld.stderr)
 
     const source = await readFile(deploy, 'utf8')
-    const helper = source.match(/serving_release_uses_legacy_baseline\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    const helper =
+      source.match(/serving_release_uses_legacy_baseline\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
     assert.match(helper, /BUILT_RELEASE/)
     assert.match(helper, /ROLLBACK_LEGACY_BASELINE_OK/)
     const smoke = source.match(/^smoke\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? ''
     assert.match(smoke, /assert_live_baseline_security_for_slot "\$baseline_slot"/)
-    assert.match(source, /assert_live_baseline_security_for_slot\(\)[\s\S]*verify_release_baseline_security "\$live_release"/)
+    assert.match(
+      source,
+      /assert_live_baseline_security_for_slot\(\)[\s\S]*verify_release_baseline_security "\$live_release"/,
+    )
     const verify = source.match(/verify_release_baseline_security\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
     assert.match(verify, /serving_release_uses_legacy_baseline "\$release"/)
     assert.match(verify, /--allow-legacy-manifest-missing/)
@@ -1959,7 +2157,8 @@ describe('v5 release safety lanes', () => {
   })
 
   test('recover smoke classifies legacy baseline by serving sourceCommit when BUILT_RELEASE is empty', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-recover-smoke-legacy-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-recover-smoke-legacy-'))
+    dirs.push(dir)
     const mismatch = path.join(dir, 'rel-old')
     const match = path.join(dir, 'rel-head')
     const missing = path.join(dir, 'rel-nosha')
@@ -1972,20 +2171,30 @@ describe('v5 release safety lanes', () => {
     assert.match(headSha, /^[0-9a-f]{40}$/)
     const otherSha = 'c40f716cc0000000000000000000000000000000'
     assert.notEqual(otherSha, headSha)
-    await writeFile(path.join(mismatch, '.complete'), JSON.stringify({
-      schemaVersion: 2,
-      sourceCommit: otherSha,
-    }) + '\n')
-    await writeFile(path.join(match, '.complete'), JSON.stringify({
-      schemaVersion: 2,
-      sourceCommit: headSha,
-    }) + '\n')
-    await writeFile(path.join(missing, '.complete'), JSON.stringify({
-      schemaVersion: 2,
-    }) + '\n')
+    await writeFile(
+      path.join(mismatch, '.complete'),
+      JSON.stringify({
+        schemaVersion: 2,
+        sourceCommit: otherSha,
+      }) + '\n',
+    )
+    await writeFile(
+      path.join(match, '.complete'),
+      JSON.stringify({
+        schemaVersion: 2,
+        sourceCommit: headSha,
+      }) + '\n',
+    )
+    await writeFile(
+      path.join(missing, '.complete'),
+      JSON.stringify({
+        schemaVersion: 2,
+      }) + '\n',
+    )
 
     const source = await readFile(deploy, 'utf8')
-    const helper = source.match(/serving_release_uses_legacy_baseline\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
+    const helper =
+      source.match(/serving_release_uses_legacy_baseline\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
     assert.match(helper, /sourceCommit/)
     assert.match(helper, /rev-parse HEAD/)
     assert.match(helper, /BUILT_RELEASE/)
@@ -2018,15 +2227,16 @@ describe('v5 release safety lanes', () => {
   })
 
   test('baseline release/config guards cover build, slots, smoke, canary and rollback activation', async () => {
-    const [source, overrides, unitA, unitB, portGuardSocket, portGuardService, indexSource] = await Promise.all([
-      readFile(deploy, 'utf8'),
-      readFile(v5Overrides, 'utf8'),
-      readFile(v5UnitA, 'utf8'),
-      readFile(v5UnitB, 'utf8'),
-      readFile(v5BaselinePortGuardSocket, 'utf8'),
-      readFile(v5BaselinePortGuardService, 'utf8'),
-      readFile(commercialIndex, 'utf8'),
-    ])
+    const [source, overrides, unitA, unitB, portGuardSocket, portGuardService, indexSource] =
+      await Promise.all([
+        readFile(deploy, 'utf8'),
+        readFile(v5Overrides, 'utf8'),
+        readFile(v5UnitA, 'utf8'),
+        readFile(v5UnitB, 'utf8'),
+        readFile(v5BaselinePortGuardSocket, 'utf8'),
+        readFile(v5BaselinePortGuardService, 'utf8'),
+        readFile(commercialIndex, 'utf8'),
+      ])
     for (const key of [
       'OC_V3_CCB_BASELINE_DIR',
       'OC_V3_CCB_BASELINE_OPTIONAL',
@@ -2036,26 +2246,47 @@ describe('v5 release safety lanes', () => {
       assert.match(source, new RegExp(`REMOVE_KEYS=\\([\\s\\S]*?${key}`))
       assert.match(source, new RegExp(`FORBIDDEN_IN_OVERRIDES=\\([\\s\\S]*?${key}`))
     }
-    assert.match(unitA, /OC_V3_CCB_BASELINE_DIR=\/opt\/openclaude\/openclaude-v5\/packages\/commercial\/agent-sandbox\/ccb-baseline/)
-    assert.match(unitB, /OC_V3_CCB_BASELINE_DIR=\/opt\/openclaude\/openclaude-v5-b\/packages\/commercial\/agent-sandbox\/ccb-baseline/)
+    assert.match(
+      unitA,
+      /OC_V3_CCB_BASELINE_DIR=\/opt\/openclaude\/openclaude-v5\/packages\/commercial\/agent-sandbox\/ccb-baseline/,
+    )
+    assert.match(
+      unitB,
+      /OC_V3_CCB_BASELINE_DIR=\/opt\/openclaude\/openclaude-v5-b\/packages\/commercial\/agent-sandbox\/ccb-baseline/,
+    )
     assert.match(unitA, /^Requires=openclaude-v5-baseline-port-guard\.socket$/m)
     assert.match(unitB, /^Requires=openclaude-v5-baseline-port-guard\.socket$/m)
     assert.doesNotMatch(unitA, /^SocketBindDeny=/m)
     assert.doesNotMatch(unitB, /^SocketBindDeny=/m)
     assert.match(portGuardSocket, /^ListenStream=127\.0\.0\.1:18893$/m)
     assert.match(portGuardSocket, /^Service=openclaude-v5-baseline-port-guard\.service$/m)
-    assert.match(portGuardService, /^ExecStart=\/usr\/lib\/systemd\/systemd-socket-proxyd .*baseline-port-disabled\.sock$/m)
+    assert.match(
+      portGuardService,
+      /^ExecStart=\/usr\/lib\/systemd\/systemd-socket-proxyd .*baseline-port-disabled\.sock$/m,
+    )
 
     const transition = source.match(/prepare_live_baseline_safety\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
-    assert.ok(transition.indexOf('install_v5_slot_units') < transition.indexOf('harden_legacy_release_baseline'))
+    assert.ok(
+      transition.indexOf('install_v5_slot_units') <
+        transition.indexOf('harden_legacy_release_baseline'),
+    )
     const bootstrap = source.match(/^bootstrap\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? ''
-    assert.ok(bootstrap.indexOf('install_v5_slot_units') < bootstrap.indexOf('harden_release_baseline "$REMOTE_SRC"'))
+    assert.ok(
+      bootstrap.indexOf('install_v5_slot_units') <
+        bootstrap.indexOf('harden_release_baseline "$REMOTE_SRC"'),
+    )
     assert.ok(bootstrap.indexOf('install_v5_slot_units') < bootstrap.indexOf('rsync -az --delete'))
     const migrate = source.match(/migrate_to_bluegreen\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
-    assert.ok(migrate.indexOf('install_v5_slot_units') < migrate.indexOf('harden_release_baseline "$REMOTE_SRC"'))
+    assert.ok(
+      migrate.indexOf('install_v5_slot_units') <
+        migrate.indexOf('harden_release_baseline "$REMOTE_SRC"'),
+    )
     assert.ok(migrate.indexOf('install_v5_slot_units') < migrate.indexOf('systemctl stop "$unit"'))
     const unitInstall = source.match(/install_v5_slot_units\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
-    assert.match(unitInstall, /if ! systemctl is-active --quiet '\$V5_BASELINE_PORT_GUARD_SOCKET'; then[\s\S]*systemctl start '\$V5_BASELINE_PORT_GUARD_SOCKET'/)
+    assert.match(
+      unitInstall,
+      /if ! systemctl is-active --quiet '\$V5_BASELINE_PORT_GUARD_SOCKET'; then[\s\S]*systemctl start '\$V5_BASELINE_PORT_GUARD_SOCKET'/,
+    )
     assert.doesNotMatch(unitInstall, /systemctl restart[^\n]*V5_BASELINE_PORT_GUARD_SOCKET/)
     assert.match(source, /assert_v5_baseline_port_guard/)
     assert.match(source, /probe\.bind\(\("0\.0\.0\.0", port\)\)/)
@@ -2077,30 +2308,46 @@ describe('v5 release safety lanes', () => {
       /build_and_sync_dist\(\)[\s\S]*VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages\/web-react/,
       'official --dist path must hide taskboard too',
     )
-    assert.ok(build.indexOf('harden_release_baseline "$staging"') < build.indexOf('publish_strong_release'))
+    assert.ok(
+      build.indexOf('harden_release_baseline "$staging"') < build.indexOf('publish_strong_release'),
+    )
     assert.match(source, /activate_release\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
-    assert.match(source, /activate_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$BUILT_RELEASE"/)
-    assert.match(source, /rollback_runtime_tuple\(\)[\s\S]*?verify_release_baseline_security "\$master"/)
+    assert.match(
+      source,
+      /activate_runtime_tuple\(\)[\s\S]*?assert_release_baseline_security "\$BUILT_RELEASE"/,
+    )
+    assert.match(
+      source,
+      /rollback_runtime_tuple\(\)[\s\S]*?verify_release_baseline_security "\$master"/,
+    )
     assert.match(source, /ROLLBACK_LEGACY_BASELINE_OK=1 smoke "\$ACTIVE_PORT"/)
     assert.match(source, /verify_release_baseline_security\(\)[\s\S]*ROLLBACK_LEGACY_BASELINE_OK/)
     assert.match(source, /write_release_baseline_manifest "\$staging" "\$full_sha"/)
     assert.ok(
       build.indexOf('write_release_baseline_manifest "$staging"') >
         build.indexOf('harden_release_baseline "$staging"') &&
-      build.indexOf('write_release_baseline_manifest "$staging"') <
-        build.indexOf('publish_strong_release'),
+        build.indexOf('write_release_baseline_manifest "$staging"') <
+          build.indexOf('publish_strong_release'),
     )
     assert.match(source, /canary\(\)[\s\S]*?assert_release_baseline_security "\$reldir"/)
-    assert.match(source, /smoke\(\)[\s\S]*?assert_live_baseline_security_for_slot "\$baseline_slot"/)
-    assert.match(source, /start_candidate_unit_and_wait\(\)[\s\S]*?assert_live_baseline_security_for_slot "\$cand"/)
+    assert.match(
+      source,
+      /smoke\(\)[\s\S]*?assert_live_baseline_security_for_slot "\$baseline_slot"/,
+    )
+    assert.match(
+      source,
+      /start_candidate_unit_and_wait\(\)[\s\S]*?assert_live_baseline_security_for_slot "\$cand"/,
+    )
 
     assert.match(indexSource, /if \(v3Deps && selfHostUuid && runtimeChannel !== "v5"\)/)
     assert.doesNotMatch(indexSource, /runtimeChannel === "v5" \? 18893/)
   })
 
   test('shared baseline env migration preserves the original on grep errors', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-env-')); dirs.push(dir)
-    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-env-'))
+    dirs.push(dir)
+    const bin = path.join(dir, 'bin')
+    await mkdir(bin)
     const envFile = path.join(dir, 'commercial-v5.env')
     const original = [
       'DATABASE_URL=postgres://fixture',
@@ -2109,14 +2356,17 @@ describe('v5 release safety lanes', () => {
       '',
     ].join('\n')
     await writeFile(envFile, original)
-    await writeFile(path.join(bin, 'grep'), [
-      '#!/bin/bash',
-      'if [[ "$1" == "-Ev" ]]; then',
-      '  printf "DATABASE_URL=truncated\\n"',
-      '  exit 2',
-      'fi',
-      'exec /usr/bin/grep "$@"',
-    ].join('\n') + '\n')
+    await writeFile(
+      path.join(bin, 'grep'),
+      [
+        '#!/bin/bash',
+        'if [[ "$1" == "-Ev" ]]; then',
+        '  printf "DATABASE_URL=truncated\\n"',
+        '  exit 2',
+        'fi',
+        'exec /usr/bin/grep "$@"',
+      ].join('\n') + '\n',
+    )
     await chmod(path.join(bin, 'grep'), 0o755)
     const harness = [
       'set -u',
@@ -2138,16 +2388,20 @@ describe('v5 release safety lanes', () => {
   })
 
   test('shared baseline env migration removes forbidden keys with leading whitespace', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-env-space-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-env-space-'))
+    dirs.push(dir)
     const envFile = path.join(dir, 'commercial-v5.env')
-    await writeFile(envFile, [
-      'DATABASE_URL=postgres://fixture',
-      '  OC_V3_CCB_BASELINE_DIR=/untrusted/shared/path',
-      '\tOC_V3_CCB_BASELINE_OPTIONAL=1',
-      ' OPENCLAUDE_MASTER_BASELINE_BASE_URL=https://untrusted.invalid',
-      'PLATFORM_HMAC_SECRET=keep-me',
-      '',
-    ].join('\n'))
+    await writeFile(
+      envFile,
+      [
+        'DATABASE_URL=postgres://fixture',
+        '  OC_V3_CCB_BASELINE_DIR=/untrusted/shared/path',
+        '\tOC_V3_CCB_BASELINE_OPTIONAL=1',
+        ' OPENCLAUDE_MASTER_BASELINE_BASE_URL=https://untrusted.invalid',
+        'PLATFORM_HMAC_SECRET=keep-me',
+        '',
+      ].join('\n'),
+    )
     const harness = [
       'set -u',
       'export V5_DEPLOY_SOURCE_ONLY=1',
@@ -2170,8 +2424,10 @@ describe('v5 release safety lanes', () => {
   })
 
   test('18893 loopback reservation fails closed on inactive, ss/probe errors, or non-loopback listeners', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-ss-')); dirs.push(dir)
-    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-ss-'))
+    dirs.push(dir)
+    const bin = path.join(dir, 'bin')
+    await mkdir(bin)
     const harness = [
       'set -u',
       'export V5_DEPLOY_SOURCE_ONLY=1',
@@ -2211,8 +2467,10 @@ describe('v5 release safety lanes', () => {
 
   test('release GC protects container baseline references and skips all deletion on inspect failure', async () => {
     const makeFixture = async (suffix: string, opts: { adminLeaf?: boolean } = {}) => {
-      const dir = await mkdtemp(path.join(tmpdir(), `v5-release-gc-${suffix}-`)); dirs.push(dir)
-      const releases = path.join(dir, 'releases'); await mkdir(releases)
+      const dir = await mkdtemp(path.join(tmpdir(), `v5-release-gc-${suffix}-`))
+      dirs.push(dir)
+      const releases = path.join(dir, 'releases')
+      await mkdir(releases)
       const releasePaths: string[] = []
       for (let index = 1; index <= 8; index += 1) {
         const release = path.join(releases, `rel-proof-${String(index).padStart(2, '0')}`)
@@ -2237,40 +2495,84 @@ describe('v5 release safety lanes', () => {
       await writeFile(prev, `${releasePaths[5]}\n`)
 
       const inspect = path.join(dir, 'inspect.json')
-      await writeFile(inspect, JSON.stringify([{
-        Config: { Labels: {
-          'com.openclaude.v3.managed': '1',
-          'com.openclaude.runtime_channel': 'v5',
-        } },
-        Mounts: [
-          { Type: 'bind', Source: path.join(releasePaths[0]!, `packages/commercial/agent-sandbox/ccb-baseline/${opts.adminLeaf ? 'AGENTS.admin.md' : 'AGENTS.md'}`), Destination: '/opt/openclaude/AGENTS.md', RW: false },
-          { Type: 'bind', Source: path.join(releasePaths[0]!, `packages/commercial/agent-sandbox/ccb-baseline/${opts.adminLeaf ? 'CLAUDE.admin.md' : 'CLAUDE.md'}`), Destination: '/run/oc/claude-config/CLAUDE.md', RW: false },
-          { Type: 'bind', Source: path.join(releasePaths[0]!, 'packages/commercial/agent-sandbox/ccb-baseline/skills'), Destination: '/run/oc/claude-config/skills', RW: false },
-        ],
-      }]))
-      const bin = path.join(dir, 'bin'); await mkdir(bin)
+      await writeFile(
+        inspect,
+        JSON.stringify([
+          {
+            Config: {
+              Labels: {
+                'com.openclaude.v3.managed': '1',
+                'com.openclaude.runtime_channel': 'v5',
+              },
+            },
+            Mounts: [
+              {
+                Type: 'bind',
+                Source: path.join(
+                  releasePaths[0]!,
+                  `packages/commercial/agent-sandbox/ccb-baseline/${opts.adminLeaf ? 'AGENTS.admin.md' : 'AGENTS.md'}`,
+                ),
+                Destination: '/opt/openclaude/AGENTS.md',
+                RW: false,
+              },
+              {
+                Type: 'bind',
+                Source: path.join(
+                  releasePaths[0]!,
+                  `packages/commercial/agent-sandbox/ccb-baseline/${opts.adminLeaf ? 'CLAUDE.admin.md' : 'CLAUDE.md'}`,
+                ),
+                Destination: '/run/oc/claude-config/CLAUDE.md',
+                RW: false,
+              },
+              {
+                Type: 'bind',
+                Source: path.join(
+                  releasePaths[0]!,
+                  'packages/commercial/agent-sandbox/ccb-baseline/skills',
+                ),
+                Destination: '/run/oc/claude-config/skills',
+                RW: false,
+              },
+            ],
+          },
+        ]),
+      )
+      const bin = path.join(dir, 'bin')
+      await mkdir(bin)
       const dockerLog = path.join(dir, 'docker.log')
-      await writeFile(path.join(bin, 'systemctl'), [
-        '#!/bin/sh',
-        'if [ "$1" = show ]; then printf "0\\n"; exit 0; fi',
-        'exit 1',
-      ].join('\n') + '\n')
-      await writeFile(path.join(bin, 'docker'), [
-        '#!/bin/sh',
-        'printf "%s\\n" "$*" >> "$FAKE_DOCKER_LOG"',
-        'if [ "$1" = ps ]; then printf "aaaaaaaaaaaa\\n"; exit 0; fi',
-        'if [ "$1" = inspect ]; then',
-        '  [ "${FAKE_INSPECT_FAIL:-0}" = 1 ] && exit 23',
-        '  cat "$FAKE_INSPECT"; exit 0',
-        'fi',
-        'exit 99',
-      ].join('\n') + '\n')
+      await writeFile(
+        path.join(bin, 'systemctl'),
+        ['#!/bin/sh', 'if [ "$1" = show ]; then printf "0\\n"; exit 0; fi', 'exit 1'].join('\n') +
+          '\n',
+      )
+      await writeFile(
+        path.join(bin, 'docker'),
+        [
+          '#!/bin/sh',
+          'printf "%s\\n" "$*" >> "$FAKE_DOCKER_LOG"',
+          'if [ "$1" = ps ]; then printf "aaaaaaaaaaaa\\n"; exit 0; fi',
+          'if [ "$1" = inspect ]; then',
+          '  [ "${FAKE_INSPECT_FAIL:-0}" = 1 ] && exit 23',
+          '  cat "$FAKE_INSPECT"; exit 0',
+          'fi',
+          'exit 99',
+        ].join('\n') + '\n',
+      )
       await chmod(path.join(bin, 'systemctl'), 0o755)
       await chmod(path.join(bin, 'docker'), 0o755)
       const args = [
-        releases, '2', srcA, srcB, egress, prev,
-        'openclaude-v5.service', 'openclaude-v5-b.service', 'openclaude-v5-egress.service',
-        '', '', '',
+        releases,
+        '2',
+        srcA,
+        srcB,
+        egress,
+        prev,
+        'openclaude-v5.service',
+        'openclaude-v5-b.service',
+        'openclaude-v5-egress.service',
+        '',
+        '',
+        '',
       ]
       const env = {
         ...process.env,
@@ -2283,10 +2585,14 @@ describe('v5 release safety lanes', () => {
 
     const protectedFixture = await makeFixture('protected')
     const protectedRun = spawnSync('bash', [releaseGc, ...protectedFixture.args], {
-      cwd: root, encoding: 'utf8', env: protectedFixture.env,
+      cwd: root,
+      encoding: 'utf8',
+      env: protectedFixture.env,
     })
     assert.equal(protectedRun.status, 0, protectedRun.stderr || protectedRun.stdout)
-    const survivors = (await readdir(protectedFixture.releases)).filter((name) => name.startsWith('rel-')).sort()
+    const survivors = (await readdir(protectedFixture.releases))
+      .filter((name) => name.startsWith('rel-'))
+      .sort()
     assert.deepEqual(survivors, ['rel-proof-01', 'rel-proof-06', 'rel-proof-07', 'rel-proof-08'])
     const dockerLog = await readFile(protectedFixture.dockerLog, 'utf8')
     assert.match(dockerLog, /label=com\.openclaude\.v3\.managed=1/)
@@ -2295,14 +2601,25 @@ describe('v5 release safety lanes', () => {
     // admin 容器绑 AGENTS.admin.md / CLAUDE.admin.md 变体:同样受保护,不得 SAFE-SKIP。
     const adminFixture = await makeFixture('admin-leaf', { adminLeaf: true })
     const adminRun = spawnSync('bash', [releaseGc, ...adminFixture.args], {
-      cwd: root, encoding: 'utf8', env: adminFixture.env,
+      cwd: root,
+      encoding: 'utf8',
+      env: adminFixture.env,
     })
     assert.equal(adminRun.status, 0, adminRun.stderr || adminRun.stdout)
-    const adminSurvivors = (await readdir(adminFixture.releases)).filter((name) => name.startsWith('rel-')).sort()
-    assert.deepEqual(adminSurvivors, ['rel-proof-01', 'rel-proof-06', 'rel-proof-07', 'rel-proof-08'])
+    const adminSurvivors = (await readdir(adminFixture.releases))
+      .filter((name) => name.startsWith('rel-'))
+      .sort()
+    assert.deepEqual(adminSurvivors, [
+      'rel-proof-01',
+      'rel-proof-06',
+      'rel-proof-07',
+      'rel-proof-08',
+    ])
 
     const failedFixture = await makeFixture('inspect-fail')
-    const before = (await readdir(failedFixture.releases)).filter((name) => name.startsWith('rel-')).sort()
+    const before = (await readdir(failedFixture.releases))
+      .filter((name) => name.startsWith('rel-'))
+      .sort()
     const failedRun = spawnSync('bash', [releaseGc, ...failedFixture.args], {
       cwd: root,
       encoding: 'utf8',
@@ -2310,7 +2627,9 @@ describe('v5 release safety lanes', () => {
     })
     assert.equal(failedRun.status, 75)
     assert.match(failedRun.stderr, /SAFE-SKIP:.*cannot inspect/)
-    const after = (await readdir(failedFixture.releases)).filter((name) => name.startsWith('rel-')).sort()
+    const after = (await readdir(failedFixture.releases))
+      .filter((name) => name.startsWith('rel-'))
+      .sort()
     assert.deepEqual(after, before)
   })
 
@@ -2334,7 +2653,10 @@ describe('v5 release safety lanes', () => {
     assert.equal(normal.status, 0, normal.stderr || normal.stdout)
     assert.equal(egress.status, 0, egress.stderr || egress.stdout)
     assert.doesNotMatch(normal.stdout, /checks=.*svc_egress/)
-    assert.match(egress.stdout, /checks=svc_v5,http_v5,public_route,turn_failures,svc_egress,http_egress/)
+    assert.match(
+      egress.stdout,
+      /checks=svc_v5,http_v5,public_route,turn_failures,svc_egress,http_egress/,
+    )
   })
 
   describe('egress surface gate (2026-09-04 cursor subagent 409 incident)', () => {
@@ -2369,7 +2691,10 @@ describe('v5 release safety lanes', () => {
       }
       // Source-only harness: real assert_egress_surface_covered + real git diff; only the
       // ssh-backed probes are stubbed.
-      const invoke = (targetSha: string, opts: { egress?: boolean; skip?: boolean; noRelease?: boolean } = {}) => {
+      const invoke = (
+        targetSha: string,
+        opts: { egress?: boolean; skip?: boolean; noRelease?: boolean } = {},
+      ) => {
         const harness = [
           'set -euo pipefail',
           'export V5_DEPLOY_SOURCE_ONLY=1',
@@ -2468,16 +2793,31 @@ describe('v5 release safety lanes', () => {
         .flatMap((match) => match[1].split(/\s+/))
         .filter((name) => name !== '' && name !== '$allowed'),
     )
-    const v5Owned = [...indexSource.matchAll(
-      /leaderBundle\.add\(\{\s*\n\s*name:\s*["']([^"']+)["'],\s*\n\s*domain:\s*["']v5-owned["']/g,
-    )].map((match) => match[1])
+    const v5Owned = [
+      ...indexSource.matchAll(
+        /leaderBundle\.add\(\{\s*\n\s*name:\s*["']([^"']+)["'],\s*\n\s*domain:\s*["']v5-owned["']/g,
+      ),
+    ].map((match) => match[1])
 
     assert.ok(v5Owned.includes('imageUsageSweep'))
     assert.ok(v5Owned.includes('githubWorkspaceSweeper'))
     assert.ok(v5Owned.includes('knowledgePlanetAutomation'))
     assert.ok(allowed.has('liveFrameMaintenance'))
     assert.ok(allowed.has('tapeJobScheduler'))
-    assert.deepEqual(v5Owned.filter((name) => !allowed.has(name)), [])
+    assert.deepEqual(
+      v5Owned.filter((name) => !allowed.has(name)),
+      [],
+    )
+    // OCV5-559: schedulers registered through trackScheduler with a domain that also runs in the v5
+    // master ("v5-owned", "local") must be allowed too, or the smoke reports a healthy master as a leak
+    const tracked = [
+      ...indexSource.matchAll(/trackScheduler\(\s*["']([^"']+)["'],\s*["'](v5-owned|local)["']/g),
+    ].map((match) => match[1])
+    assert.ok(tracked.includes('logLevelSync'))
+    assert.deepEqual(
+      tracked.filter((name) => !allowed.has(name)),
+      [],
+    )
   })
 
   test('maintenance lifecycle uses one cleanup trap and locked schema+nonce clear', async () => {
@@ -2487,16 +2827,22 @@ describe('v5 release safety lanes', () => {
     assert.match(source, /exec 9>"\$lock"; flock -x 9/)
     assert.match(source, /\.schema == 2 and \.nonce == \$nonce/)
     assert.match(source, /PLANNED_MAINTENANCE_ACTIVE=0/)
-    const recovery = source.match(/recover_cutover\(\) \{([\s\S]*?)\n\}\n\nset_cutover_maintenance/)?.[1] ?? ''
+    const recovery =
+      source.match(/recover_cutover\(\) \{([\s\S]*?)\n\}\n\nset_cutover_maintenance/)?.[1] ?? ''
     assert.match(recovery, /flock -x 8/)
     assert.match(recovery, /\.schema == 1 and \.nonce == \$nonce/)
     assert.equal((recovery.match(/rm -f "\$marker"/g) ?? []).length, 1)
-    assert.match(source, /stale\/untrusted schema1 marker preserved; deployment continues fail-open/)
+    assert.match(
+      source,
+      /stale\/untrusted schema1 marker preserved; deployment continues fail-open/,
+    )
     assert.match(source, /safely cleared expired schema1 marker/)
   })
 
   test('requiredMigrations gate covers forward writes while recovery stays target-scoped', async () => {
-    const metadata = JSON.parse(await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8')) as {
+    const metadata = JSON.parse(
+      await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8'),
+    ) as {
       minimumRequiredMigration: string
       requiredMigrations: string[]
     }
@@ -2515,13 +2861,21 @@ describe('v5 release safety lanes', () => {
     const dispatchAt = source.indexOf('case "$MODE" in', gateAt)
     assert.ok(gateAt > 0 && dispatchAt > gateAt, '统一迁移门必须在模式 dispatch 前')
     assert.match(source, /activate_release\(\)[\s\S]*assert_release_required_migrations "\$reldir"/)
-    assert.match(source, /rollback_runtime_tuple\(\)[\s\S]*assert_release_required_migrations "\$master"/)
-    assert.match(source, /abort_continue\(\)[\s\S]*assert_release_required_migrations "\$old_release"/)
+    assert.match(
+      source,
+      /rollback_runtime_tuple\(\)[\s\S]*assert_release_required_migrations "\$master"/,
+    )
+    assert.match(
+      source,
+      /abort_continue\(\)[\s\S]*assert_release_required_migrations "\$old_release"/,
+    )
 
     const dry = run(deploy, ['--dry-run'])
     assert.equal(dry.status, 0, dry.stderr || dry.stdout)
     const combined = dry.stdout + dry.stderr
-    assert.ok(combined.indexOf('校验 requiredMigrations 已全部记录') < combined.indexOf('建 release'))
+    assert.ok(
+      combined.indexOf('校验 requiredMigrations 已全部记录') < combined.indexOf('建 release'),
+    )
     for (const mode of ['--abort', '--rollback', '--recover', '--hide-luna']) {
       const recovery = run(deploy, ['--dry-run', mode])
       assert.equal(recovery.status, 0, `${mode}: ${recovery.stderr || recovery.stdout}`)
@@ -2615,7 +2969,8 @@ describe('v5 release safety lanes', () => {
   })
 
   test('requiredMigrations manifest is exact for the target release archive, including rollback fixtures', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-migration-manifest-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-migration-manifest-'))
+    dirs.push(dir)
     const release = path.join(dir, 'old-release')
     const migrations = path.join(release, 'packages/commercial/src/db/migrations')
     const metadataDir = path.join(release, 'deploy/v5')
@@ -2624,31 +2979,47 @@ describe('v5 release safety lanes', () => {
     await writeFile(path.join(migrations, '0123_first.sql'), '-- old release\n')
     await writeFile(path.join(migrations, '0124_second.sql'), '-- old release\n')
     const metadata = path.join(metadataDir, 'release-metadata.json')
-    await writeFile(metadata, JSON.stringify({
-      minimumRequiredMigration: '0123_first',
-      requiredMigrations: ['0123_first', '0124_second'],
-    }))
-    const invoke = (file: string) => spawnSync('bash', ['-c', [
-      'set -euo pipefail',
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      `required_migrations_csv '${file}' local`,
-    ].join('\n')], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
+    await writeFile(
+      metadata,
+      JSON.stringify({
+        minimumRequiredMigration: '0123_first',
+        requiredMigrations: ['0123_first', '0124_second'],
+      }),
+    )
+    const invoke = (file: string) =>
+      spawnSync(
+        'bash',
+        [
+          '-c',
+          [
+            'set -euo pipefail',
+            'export V5_DEPLOY_SOURCE_ONLY=1',
+            `source '${deploy}'`,
+            `required_migrations_csv '${file}' local`,
+          ].join('\n'),
+        ],
+        { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } },
+      )
     const valid = invoke(metadata)
     assert.equal(valid.status, 0, valid.stderr)
     assert.equal(valid.stdout, '0123_first,0124_second')
     // A migration introduced only in today's checkout is correctly irrelevant
     // to this old immutable archive; omitting a file that IS in the archive is not.
-    await writeFile(metadata, JSON.stringify({
-      minimumRequiredMigration: '0123_first', requiredMigrations: ['0123_first'],
-    }))
+    await writeFile(
+      metadata,
+      JSON.stringify({
+        minimumRequiredMigration: '0123_first',
+        requiredMigrations: ['0123_first'],
+      }),
+    )
     const omitted = invoke(metadata)
     assert.notEqual(omitted.status, 0)
     assert.match(omitted.stderr, /requiredMigrations mismatch/)
   })
 
   test('remote legacy migration manifests are scoped to the exact captured predecessor', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-legacy-migration-manifest-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-legacy-migration-manifest-'))
+    dirs.push(dir)
     const releasesRoot = path.join(dir, 'releases')
     const release = path.join(releasesRoot, 'rel-ccd3e7e0-legacy')
     const migrations = path.join(release, 'packages/commercial/src/db/migrations')
@@ -2716,15 +3087,23 @@ describe('v5 release safety lanes', () => {
       await writeFile(path.join(migrations, `${migration}.sql`), '-- legacy release\n')
     }
     const metadata = path.join(metadataDir, 'release-metadata.json')
-    const invoke = (location: 'local' | 'remote', trustPredecessor = true) => spawnSync('bash', ['-c', [
-      'set -euo pipefail',
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      `RELEASES_ROOT='${releasesRoot}'`,
-      `TRUSTED_LEGACY_PREDECESSOR=${trustPredecessor ? `'${release}'` : "''"}`,
-      "ssh() { local _host=\"$1\"; shift; \"$@\"; }",
-      `required_migrations_csv '${metadata}' ${location}`,
-    ].join('\n')], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
+    const invoke = (location: 'local' | 'remote', trustPredecessor = true) =>
+      spawnSync(
+        'bash',
+        [
+          '-c',
+          [
+            'set -euo pipefail',
+            'export V5_DEPLOY_SOURCE_ONLY=1',
+            `source '${deploy}'`,
+            `RELEASES_ROOT='${releasesRoot}'`,
+            `TRUSTED_LEGACY_PREDECESSOR=${trustPredecessor ? `'${release}'` : "''"}`,
+            'ssh() { local _host="$1"; shift; "$@"; }',
+            `required_migrations_csv '${metadata}' ${location}`,
+          ].join('\n'),
+        ],
+        { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } },
+      )
 
     await writeFile(metadata, JSON.stringify(legacyMetadata))
     const untrustedLegacy = invoke('remote', false)
@@ -2739,18 +3118,30 @@ describe('v5 release safety lanes', () => {
     assert.notEqual(legacyLocal.status, 0)
     assert.match(legacyLocal.stderr, /invalid minimumRequiredMigration/)
 
-    await writeFile(metadata, JSON.stringify({
-      ...legacyMetadata,
-      capabilities: [...legacyMetadata.capabilities, 'history-projection-revision-v1'],
-    }))
+    await writeFile(
+      metadata,
+      JSON.stringify({
+        ...legacyMetadata,
+        capabilities: [...legacyMetadata.capabilities, 'history-projection-revision-v1'],
+      }),
+    )
     const capableWithoutFloor = invoke('remote')
     assert.notEqual(capableWithoutFloor.status, 0)
-    assert.match(capableWithoutFloor.stderr, /legacy migration manifest cannot declare a post-floor history capability/)
+    assert.match(
+      capableWithoutFloor.stderr,
+      /legacy migration manifest cannot declare a post-floor history capability/,
+    )
 
-    await writeFile(metadata, JSON.stringify({
-      ...legacyMetadata,
-      requiredMigrations: [...legacyMetadata.requiredMigrations, legacyMetadata.requiredMigrations[0]],
-    }))
+    await writeFile(
+      metadata,
+      JSON.stringify({
+        ...legacyMetadata,
+        requiredMigrations: [
+          ...legacyMetadata.requiredMigrations,
+          legacyMetadata.requiredMigrations[0],
+        ],
+      }),
+    )
     const duplicate = invoke('remote')
     assert.notEqual(duplicate.status, 0)
     assert.match(duplicate.stderr, /invalid legacy requiredMigrations/)
@@ -2758,25 +3149,44 @@ describe('v5 release safety lanes', () => {
 
   test('strong release markers detect tampering and legacy trust is exact-invocation predecessor only', async () => {
     const deploySource = await readFile(deploy, 'utf8')
-    assert.match(deploySource, /write_strong_release_marker_local\(\)[\s\S]*schemaVersion:\$schemaVersion[\s\S]*sourceCommit:\$sourceCommit[\s\S]*metadataSha256:\$metadataSha256[\s\S]*artifactSha256:\$artifactSha256/)
-    assert.match(deploySource, /activate_release\(\)[\s\S]*assert_release_marker "\$reldir"[\s\S]*assert_release_required_migrations "\$reldir"/)
-    assert.match(deploySource, /rollback_runtime_tuple\(\)[\s\S]*assert_release_marker "\$master"[\s\S]*assert_release_required_migrations "\$master"/)
+    assert.match(
+      deploySource,
+      /write_strong_release_marker_local\(\)[\s\S]*schemaVersion:\$schemaVersion[\s\S]*sourceCommit:\$sourceCommit[\s\S]*metadataSha256:\$metadataSha256[\s\S]*artifactSha256:\$artifactSha256/,
+    )
+    assert.match(
+      deploySource,
+      /activate_release\(\)[\s\S]*assert_release_marker "\$reldir"[\s\S]*assert_release_required_migrations "\$reldir"/,
+    )
+    assert.match(
+      deploySource,
+      /rollback_runtime_tuple\(\)[\s\S]*assert_release_marker "\$master"[\s\S]*assert_release_required_migrations "\$master"/,
+    )
     const captureAt = deploySource.lastIndexOf('capture_trusted_release_predecessor || exit 1')
     assert.ok(captureAt > deploySource.lastIndexOf('acquire_production_mutation_lease || exit 3'))
-    assert.ok(captureAt < deploySource.lastIndexOf('run_mutation_lane_supervised run_selected_mode'))
+    assert.ok(
+      captureAt < deploySource.lastIndexOf('run_mutation_lane_supervised run_selected_mode'),
+    )
     const egressCaptureAt = deploySource.lastIndexOf('capture_trusted_egress_predecessor || exit 1')
-    assert.ok(egressCaptureAt > deploySource.lastIndexOf('acquire_production_mutation_lease || exit 3'))
-    assert.ok(egressCaptureAt < deploySource.lastIndexOf('run_mutation_lane_supervised run_selected_mode'))
+    assert.ok(
+      egressCaptureAt > deploySource.lastIndexOf('acquire_production_mutation_lease || exit 3'),
+    )
+    assert.ok(
+      egressCaptureAt < deploySource.lastIndexOf('run_mutation_lane_supervised run_selected_mode'),
+    )
 
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-release-marker-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-release-marker-'))
+    dirs.push(dir)
     const releasesRoot = path.join(dir, 'releases')
     await mkdir(releasesRoot)
-    const full = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+    const full = spawnSync('git', ['rev-parse', 'HEAD'], {
+      cwd: root,
+      encoding: 'utf8',
+    }).stdout.trim()
     const short = full.slice(0, 8)
-    const metadataRaw = spawnSync(
-      'git', ['show', `${full}:deploy/v5/release-metadata.json`],
-      { cwd: root, encoding: 'utf8' },
-    ).stdout
+    const metadataRaw = spawnSync('git', ['show', `${full}:deploy/v5/release-metadata.json`], {
+      cwd: root,
+      encoding: 'utf8',
+    }).stdout
     assert.match(full, /^[0-9a-f]{40}$/)
     assert.ok(metadataRaw.length > 0)
 
@@ -2789,18 +3199,29 @@ describe('v5 release safety lanes', () => {
       await writeFile(path.join(release, 'VERSION.json'), JSON.stringify({ commit: short }))
       await writeFile(path.join(release, 'package.json'), '{}\n')
       await writeFile(path.join(release, 'node_modules/dependency.js'), 'module.exports = 1\n')
-      await writeFile(path.join(release, 'packages/web-react/dist/index.html'), '<html>fixture</html>\n')
+      await writeFile(
+        path.join(release, 'packages/web-react/dist/index.html'),
+        '<html>fixture</html>\n',
+      )
       return release
     }
-    const invoke = (command: string) => spawnSync('bash', ['-c', [
-      'set -euo pipefail',
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      `RELEASES_ROOT='${releasesRoot}'`,
-      'KL_HOST=fake',
-      'ssh() { local _host="$1"; shift; if [[ $# == 1 ]]; then bash -c "$1"; else "$@"; fi; }',
-      command,
-    ].join('\n')], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
+    const invoke = (command: string) =>
+      spawnSync(
+        'bash',
+        [
+          '-c',
+          [
+            'set -euo pipefail',
+            'export V5_DEPLOY_SOURCE_ONLY=1',
+            `source '${deploy}'`,
+            `RELEASES_ROOT='${releasesRoot}'`,
+            'KL_HOST=fake',
+            'ssh() { local _host="$1"; shift; if [[ $# == 1 ]]; then bash -c "$1"; else "$@"; fi; }',
+            command,
+          ].join('\n'),
+        ],
+        { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } },
+      )
 
     const strong = await makeRelease('20260719-010203')
     const artifact = invoke(`release_artifact_digest '${strong}'`)
@@ -2818,12 +3239,14 @@ describe('v5 release safety lanes', () => {
 
     const hardenedStrong = await makeRelease('20260719-010206')
     await chmod(hardenedStrong, 0o775)
-    const publishHardened = invoke([
-      `write_strong_release_marker_local '${hardenedStrong}' '${full}' '${short}' '20260719-010206' 2`,
-      `[[ "$(stat -c '%u:%g:%a' -- '${hardenedStrong}')" == '0:0:755' ]]`,
-      `[[ "$(stat -c '%u:%g:%a' -- '${hardenedStrong}/.complete')" == '0:0:644' ]]`,
-      `assert_release_marker '${hardenedStrong}'`,
-    ].join('\n'))
+    const publishHardened = invoke(
+      [
+        `write_strong_release_marker_local '${hardenedStrong}' '${full}' '${short}' '20260719-010206' 2`,
+        `[[ "$(stat -c '%u:%g:%a' -- '${hardenedStrong}')" == '0:0:755' ]]`,
+        `[[ "$(stat -c '%u:%g:%a' -- '${hardenedStrong}/.complete')" == '0:0:644' ]]`,
+        `assert_release_marker '${hardenedStrong}'`,
+      ].join('\n'),
+    )
     assert.equal(publishHardened.status, 0, publishHardened.stderr)
 
     await chmod(path.join(strong, '.complete'), 0o666)
@@ -2844,10 +3267,13 @@ describe('v5 release safety lanes', () => {
     assert.match(artifactTamper.stderr, /artifact digest mismatch/)
     await writeFile(path.join(strong, 'node_modules/dependency.js'), 'module.exports = 1\n')
 
-    await writeFile(path.join(strong, '.complete'), JSON.stringify({
-      ...marker,
-      artifactSha256: 'f'.repeat(64),
-    }))
+    await writeFile(
+      path.join(strong, '.complete'),
+      JSON.stringify({
+        ...marker,
+        artifactSha256: 'f'.repeat(64),
+      }),
+    )
     const markerMismatch = invoke(`assert_release_marker '${strong}'`)
     assert.notEqual(markerMismatch.status, 0)
     assert.match(markerMismatch.stderr, /artifact digest mismatch/)
@@ -2860,52 +3286,68 @@ describe('v5 release safety lanes', () => {
     await writeFile(path.join(strong, 'deploy/v5/release-metadata.json'), metadataRaw)
 
     const legacy = await makeRelease('20260719-010204')
-    await writeFile(path.join(legacy, '.complete'), JSON.stringify({ sha: short, builtAt: '20260719-010204' }))
+    await writeFile(
+      path.join(legacy, '.complete'),
+      JSON.stringify({ sha: short, builtAt: '20260719-010204' }),
+    )
     const unknownLegacy = invoke(`assert_release_marker '${legacy}'`)
     assert.notEqual(unknownLegacy.status, 0)
     assert.match(unknownLegacy.stderr, /非本 invocation 精确捕获.*predecessor/)
-    const knownLegacy = invoke([
-      `capture_trusted_release_predecessor '${legacy}'`,
-      `assert_release_marker '${legacy}'`,
-    ].join('\n'))
+    const knownLegacy = invoke(
+      [`capture_trusted_release_predecessor '${legacy}'`, `assert_release_marker '${legacy}'`].join(
+        '\n',
+      ),
+    )
     assert.equal(knownLegacy.status, 0, knownLegacy.stderr)
 
-    const changedLegacy = invoke([
-      `capture_trusted_release_predecessor '${legacy}'`,
-      `printf '%s\\n' 'module.exports = 9' > '${legacy}/node_modules/dependency.js'`,
-      `assert_release_marker '${legacy}'`,
-    ].join('\n'))
+    const changedLegacy = invoke(
+      [
+        `capture_trusted_release_predecessor '${legacy}'`,
+        `printf '%s\\n' 'module.exports = 9' > '${legacy}/node_modules/dependency.js'`,
+        `assert_release_marker '${legacy}'`,
+      ].join('\n'),
+    )
     assert.notEqual(changedLegacy.status, 0)
     assert.match(changedLegacy.stderr, /制品未变/)
     await writeFile(path.join(legacy, 'node_modules/dependency.js'), 'module.exports = 1\n')
 
     const otherLegacy = await makeRelease('20260719-010205')
-    await writeFile(path.join(otherLegacy, '.complete'), JSON.stringify({ sha: short, builtAt: '20260719-010205' }))
-    const wrongLegacy = invoke([
-      `capture_trusted_release_predecessor '${legacy}'`,
-      `assert_release_marker '${otherLegacy}'`,
-    ].join('\n'))
+    await writeFile(
+      path.join(otherLegacy, '.complete'),
+      JSON.stringify({ sha: short, builtAt: '20260719-010205' }),
+    )
+    const wrongLegacy = invoke(
+      [
+        `capture_trusted_release_predecessor '${legacy}'`,
+        `assert_release_marker '${otherLegacy}'`,
+      ].join('\n'),
+    )
     assert.notEqual(wrongLegacy.status, 0)
     assert.match(wrongLegacy.stderr, /非本 invocation 精确捕获.*predecessor/)
 
-    const splitMasterAndEgress = invoke([
-      `capture_trusted_release_predecessor '${legacy}'`,
-      `capture_trusted_egress_predecessor '${otherLegacy}'`,
-      `assert_release_marker '${legacy}'`,
-      `assert_release_marker '${otherLegacy}' egress`,
-    ].join('\n'))
+    const splitMasterAndEgress = invoke(
+      [
+        `capture_trusted_release_predecessor '${legacy}'`,
+        `capture_trusted_egress_predecessor '${otherLegacy}'`,
+        `assert_release_marker '${legacy}'`,
+        `assert_release_marker '${otherLegacy}' egress`,
+      ].join('\n'),
+    )
     assert.equal(splitMasterAndEgress.status, 0, splitMasterAndEgress.stderr)
-    const egressPinIsNotMasterTrust = invoke([
-      `capture_trusted_release_predecessor '${legacy}'`,
-      `capture_trusted_egress_predecessor '${otherLegacy}'`,
-      `assert_release_marker '${otherLegacy}'`,
-    ].join('\n'))
+    const egressPinIsNotMasterTrust = invoke(
+      [
+        `capture_trusted_release_predecessor '${legacy}'`,
+        `capture_trusted_egress_predecessor '${otherLegacy}'`,
+        `assert_release_marker '${otherLegacy}'`,
+      ].join('\n'),
+    )
     assert.notEqual(egressPinIsNotMasterTrust.status, 0)
     assert.match(egressPinIsNotMasterTrust.stderr, /master predecessor/)
   })
 
   test('release artifact digest rejects a path added after its initial tree snapshot', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-release-digest-race-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-release-digest-race-'))
+    dirs.push(dir)
     const release = path.join(dir, 'release')
     await mkdir(release)
     const large = path.join(release, 'a-large.bin')
@@ -2939,21 +3381,32 @@ describe('v5 release safety lanes', () => {
 
   test('pinned release runs the lossless writer/reader anchor contract before publication', async () => {
     const source = await readFile(deploy, 'utf8')
-    assert.match(source, /cd '\$staging' && npx --no-install tsx scripts\/check-v5-lossless-anchor-contract\.ts/)
+    assert.match(
+      source,
+      /cd '\$staging' && npx --no-install tsx scripts\/check-v5-lossless-anchor-contract\.ts/,
+    )
     const buildStart = source.indexOf('\nbuild_release() {')
     const contractAt = source.indexOf('check-v5-lossless-anchor-contract.ts', buildStart)
-    const publishAt = source.indexOf('if ! publish_strong_release \"$staging\"', buildStart)
+    const publishAt = source.indexOf('if ! publish_strong_release "$staging"', buildStart)
     assert.ok(buildStart >= 0 && contractAt > buildStart && publishAt > contractAt)
   })
 
   test('root typecheck and every dist build use the official web workspace gate', async () => {
-    const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')) as { scripts: Record<string, string> }
+    const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')) as {
+      scripts: Record<string, string>
+    }
     assert.match(pkg.scripts.typecheck, /typecheck --workspace packages\/web-react/)
     const source = await readFile(deploy, 'utf8')
     assert.doesNotMatch(source, /cd '\$staging\/packages\/web-react' && npx vite build/)
     assert.doesNotMatch(source, /cd '\$REPO_ROOT\/packages\/web-react' && npx vite build/)
-    assert.match(source, /cd '\$staging' && VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages\/web-react/)
-    assert.match(source, /cd '\$REPO_ROOT' && VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages\/web-react/)
+    assert.match(
+      source,
+      /cd '\$staging' && VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages\/web-react/,
+    )
+    assert.match(
+      source,
+      /cd '\$REPO_ROOT' && VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages\/web-react/,
+    )
   })
 
   test('requiredMigrations remote failure stays fail-closed in production OR-list context', () => {
@@ -3003,7 +3456,10 @@ describe('v5 release safety lanes', () => {
     const gateAt = source.indexOf('assert_0151_runtime_privileges || exit 1', sourceOnlyAt)
     const dispatchAt = source.indexOf('case "$MODE" in', gateAt)
     assert.ok(gateAt > sourceOnlyAt && dispatchAt > gateAt)
-    assert.match(source, /bootstrap\(\) \{[\s\S]*assert_repo_required_migrations\n\s*assert_0151_runtime_privileges/)
+    assert.match(
+      source,
+      /bootstrap\(\) \{[\s\S]*assert_repo_required_migrations\n\s*assert_0151_runtime_privileges/,
+    )
 
     const smokeDryRun = run(deploy, ['--smoke', '--dry-run'])
     assert.equal(smokeDryRun.status, 0, smokeDryRun.stderr || smokeDryRun.stdout)
@@ -3032,8 +3488,10 @@ describe('v5 release safety lanes', () => {
   })
 
   test('0151 privilege gate rejects a false capability result and accepts only complete true', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-0151-privileges-')); dirs.push(dir)
-    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-0151-privileges-'))
+    dirs.push(dir)
+    const bin = path.join(dir, 'bin')
+    await mkdir(bin)
     const envFile = path.join(dir, 'commercial-v5.env')
     await writeFile(envFile, 'DATABASE_URL=postgres://unused/runtime\n')
     await writeFile(path.join(bin, 'psql'), '#!/bin/sh\nprintf "%s\\n" "$FAKE_PSQL_READY"\n')
@@ -3048,16 +3506,17 @@ describe('v5 release safety lanes', () => {
       'assert_0151_runtime_privileges || exit 1',
       'printf "%s\\n" SIDE_EFFECT',
     ].join('\n')
-    const runReady = (ready: 'true' | 'false') => spawnSync('bash', ['-c', harness], {
-      cwd: root,
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        ALLOW_ANY_BRANCH: '1',
-        FAKE_PSQL_READY: ready,
-        PATH: `${bin}:${process.env.PATH}`,
-      },
-    })
+    const runReady = (ready: 'true' | 'false') =>
+      spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          FAKE_PSQL_READY: ready,
+          PATH: `${bin}:${process.env.PATH}`,
+        },
+      })
     const incomplete = runReady('false')
     assert.notEqual(incomplete.status, 0)
     assert.doesNotMatch(incomplete.stdout + incomplete.stderr, /SIDE_EFFECT/)
@@ -3068,13 +3527,22 @@ describe('v5 release safety lanes', () => {
 
   test('finalize/abort verify the target before irreversible state changes', async () => {
     const source = await readFile(deploy, 'utf8')
-    const finalizeBody = source.match(/finalize_run_steps\(\) \{([\s\S]*?)\n\}\n\n# ═+ lane: --abort/)?.[1] ?? ''
+    const finalizeBody =
+      source.match(/finalize_run_steps\(\) \{([\s\S]*?)\n\}\n\n# ═+ lane: --abort/)?.[1] ?? ''
     const expectedAt = finalizeBody.indexOf('candidate release oc-build 权威')
     const smokeAt = finalizeBody.indexOf('提交 stable 前完整 smoke')
     const stopAt = finalizeBody.indexOf('systemctl stop $(slot_unit "$old")')
-    const commitAt = finalizeBody.indexOf("active_slot='$cand', previous_active_release=active_release")
-    assert.ok(expectedAt >= 0 && smokeAt > expectedAt, 'finalize 必须从 candidate release 建立 build 权威')
-    assert.ok(stopAt > smokeAt && commitAt > smokeAt, '完整 smoke/版本握手必须早于 stop old 与 stable commit')
+    const commitAt = finalizeBody.indexOf(
+      "active_slot='$cand', previous_active_release=active_release",
+    )
+    assert.ok(
+      expectedAt >= 0 && smokeAt > expectedAt,
+      'finalize 必须从 candidate release 建立 build 权威',
+    )
+    assert.ok(
+      stopAt > smokeAt && commitAt > smokeAt,
+      '完整 smoke/版本握手必须早于 stop old 与 stable commit',
+    )
     assert.doesNotMatch(finalizeBody, /dist_handshake_smoke[^\n]*\|\| true/)
     assert.doesNotMatch(
       finalizeBody,
@@ -3082,7 +3550,8 @@ describe('v5 release safety lanes', () => {
       'finalize 补偿必须先仅切 aborting，让 abort_continue 先回 Caddy 再收 desired',
     )
 
-    const abortBody = source.match(/abort_continue\(\) \{([\s\S]*?)\n\}\n\n# ═+ --recover/)?.[1] ?? ''
+    const abortBody =
+      source.match(/abort_continue\(\) \{([\s\S]*?)\n\}\n\n# ═+ --recover/)?.[1] ?? ''
     const abortSmokeAt = abortBody.indexOf('旧 slot($old)完整 smoke')
     const abortStopAt = abortBody.indexOf('systemctl stop $(slot_unit "$cand")')
     const abortCommitAt = abortBody.indexOf("phase='stable', candidate_slot=NULL")
@@ -3094,7 +3563,8 @@ describe('v5 release safety lanes', () => {
   })
 
   test('dangerous offline mode fails closed without one-shot nonce', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-deploy-safety-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-deploy-safety-'))
+    dirs.push(dir)
     await writeFile(path.join(dir, 'ssh'), '#!/bin/sh\necho active\n')
     await chmod(path.join(dir, 'ssh'), 0o755)
     const result = run(deploy, ['--offline-recycle', '--dry-run'], {
@@ -3123,7 +3593,8 @@ describe('v5 release safety lanes', () => {
   // 经 `ssh $KL_HOST <cmd>` 出口,故一个 stub 即可把"四面缺任一 → 拒绝开 flag"的矩阵实跑出来。
   // 锁走 OC_V5_DEPLOY_LOCK_FILE(hermetic,不抢真实部署锁)。
   async function maFixture(over: Record<string, string> = {}) {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-'))
+    dirs.push(dir)
     const ssh = path.join(dir, 'ssh')
     // stub 收到的是 `ssh <host> <cmd...>`;按命令特征回放各面的探测结果。
     await writeFile(
@@ -3138,9 +3609,9 @@ describe('v5 release safety lanes', () => {
         'fi',
         'case "$cmd" in',
         '  *schema_migrations*) printf "%s\\n" "${MA_DB_READY:-true}" ;;',
-        "  *\"name='DATABASE_URL'\"*) printf \"%s\\\\n\" \"openclaude_app|${MA_APP_ROLE_READY:-true}\" ;;",
-        "  *\"name='MODEL_CATALOG_ADMIN_DATABASE_URL'\"*) printf \"%s\\\\n\" \"openclaude_model_admin|${MA_ADMIN_ROLE_READY:-true}\" ;;",
-        "  *\"name='MODEL_AUTHORITY_DEPLOY_DATABASE_URL'\"*) printf \"%s\\\\n\" \"openclaude_model_deploy|${MA_DEPLOY_ROLE_READY:-true}\" ;;",
+        '  *"name=\'DATABASE_URL\'"*) printf "%s\\\\n" "openclaude_app|${MA_APP_ROLE_READY:-true}" ;;',
+        '  *"name=\'MODEL_CATALOG_ADMIN_DATABASE_URL\'"*) printf "%s\\\\n" "openclaude_model_admin|${MA_ADMIN_ROLE_READY:-true}" ;;',
+        '  *"name=\'MODEL_AUTHORITY_DEPLOY_DATABASE_URL\'"*) printf "%s\\\\n" "openclaude_model_deploy|${MA_DEPLOY_ROLE_READY:-true}" ;;',
         '  *"/healthz"*) printf "%s\\n" "{\\"ok\\":true,\\"runtime\\":{\\"capabilities\\":[${MA_MASTER_CAPS-\\"model_authority_v1\\"}]}}" ;;',
         '  *egress-health*) printf "%s\\n" "{\\"ok\\":true,\\"role\\":\\"egress\\",\\"capabilities\\":[${MA_EGRESS_CAPS-\\"model_authority_v1-egress\\"}]}" ;;',
         '  *OC_RUNTIME_RELEASE*) printf "%s\\n" "${MA_RT_RELEASE-/var/lib/openclaude-v5/runtime-releases/rel-abc}" ;;',
@@ -3172,7 +3643,10 @@ describe('v5 release safety lanes', () => {
     // ① DB:catalog + guards 任一迁移/关键对象未就绪
     const noDb = await maFixture({ MA_DB_READY: 'false' })
     assert.notEqual(noDb.status, 0)
-    assert.match(noDb.stdout + noDb.stderr, /① DB:.*0143_model_catalog.*0144_model_authority_guards/)
+    assert.match(
+      noDb.stdout + noDb.stderr,
+      /① DB:.*0143_model_catalog.*0144_model_authority_guards/,
+    )
 
     // ① DB 还必须证明 app/admin/deploy 三个独立角色的最小权限边界。
     const badAppRole = await maFixture({ MA_APP_ROLE_READY: 'false' })
@@ -3204,7 +3678,12 @@ describe('v5 release safety lanes', () => {
   test('step-5 compat floor is irreversible and guards every activation path', async () => {
     const source = await readFile(deploy, 'utf8')
     // 地板挂在**全部**激活/回滚路径:传统激活、hotcfg tuple、tuple 回滚、P3 candidate。
-    for (const fn of ['activate_release', 'activate_runtime_tuple', 'rollback_runtime_tuple', 'canary']) {
+    for (const fn of [
+      'activate_release',
+      'activate_runtime_tuple',
+      'rollback_runtime_tuple',
+      'canary',
+    ]) {
       const body = source.match(new RegExp(`(?:^|\\n)${fn}\\(\\) \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? ''
       assert.match(body, /assert_model_authority_floor/, `${fn} 未挂兼容地板`)
       assert.match(body, /assert_lossless_turn_tape_floor/, `${fn} 未挂 lossless tape 兼容地板`)
@@ -3291,7 +3770,8 @@ describe('v5 release safety lanes', () => {
       '}',
       'restore_release_activation /release/old "" smoke-failed /release/candidate',
     ].join('\n')
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-lossless-probe-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-lossless-probe-'))
+    dirs.push(dir)
     const mutationLog = path.join(dir, 'mutations.log')
     const result = spawnSync('bash', ['-c', harness], {
       cwd: root,
@@ -3300,12 +3780,16 @@ describe('v5 release safety lanes', () => {
     })
     assert.notEqual(result.status, 0)
     assert.match(result.stdout + result.stderr, /RECOVERY:lossless writer 已可能对外服务/)
-    assert.equal(spawnSync('bash', ['-c', `test ! -s '${mutationLog}'`]).status, 0,
-      `old-stack mutation unexpectedly ran:\n${result.stdout}\n${result.stderr}`)
+    assert.equal(
+      spawnSync('bash', ['-c', `test ! -s '${mutationLog}'`]).status,
+      0,
+      `old-stack mutation unexpectedly ran:\n${result.stdout}\n${result.stderr}`,
+    )
   })
 
   test('ordinary commit ACK loss checks compatibility before deploy_state compensation', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-lossless-ack-loss-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-lossless-ack-loss-'))
+    dirs.push(dir)
     const mutationLog = path.join(dir, 'mutations.log')
     const stateRevertMarker = path.join(dir, 'state-reverted')
     const activeTarget = path.join(dir, 'active-target')
@@ -3401,7 +3885,8 @@ describe('v5 release safety lanes', () => {
   })
 
   test('lossless artifact probe treats a scalar capability field as unknown', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-lossless-metadata-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-lossless-metadata-'))
+    dirs.push(dir)
     const metadataDir = path.join(dir, 'deploy/v5')
     await mkdir(metadataDir, { recursive: true })
     const metadata = path.join(metadataDir, 'release-metadata.json')
@@ -3414,11 +3899,12 @@ describe('v5 release safety lanes', () => {
       'rc=0; probe_release_lossless_master_capability "$RELEASE" || rc=$?',
       'printf "RC:%s\\n" "$rc"',
     ].join('\n')
-    const invoke = () => spawnSync('bash', ['-c', harness], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, ALLOW_ANY_BRANCH: '1', RELEASE: dir },
-    })
+    const invoke = () =>
+      spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1', RELEASE: dir },
+      })
 
     await writeFile(metadata, JSON.stringify({ capabilities: ['lossless-turn-tape-v2'] }))
     assert.match(invoke().stdout, /RC:0/)
@@ -3429,7 +3915,8 @@ describe('v5 release safety lanes', () => {
   })
 
   test('browser storage bridge keeps first rollback open, then rejects legacy after two capable generations', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-web-storage-floor-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-web-storage-floor-'))
+    dirs.push(dir)
     const legacy = path.join(dir, 'legacy')
     const capableA = path.join(dir, 'capable-a')
     const capableB = path.join(dir, 'capable-b')
@@ -3437,14 +3924,20 @@ describe('v5 release safety lanes', () => {
     for (const release of [legacy, capableA, capableB, malformed]) {
       await mkdir(path.join(release, 'deploy/v5'), { recursive: true })
     }
-    await writeFile(path.join(legacy, 'deploy/v5/release-metadata.json'),
-      JSON.stringify({ capabilities: [] }))
+    await writeFile(
+      path.join(legacy, 'deploy/v5/release-metadata.json'),
+      JSON.stringify({ capabilities: [] }),
+    )
     for (const release of [capableA, capableB]) {
-      await writeFile(path.join(release, 'deploy/v5/release-metadata.json'),
-        JSON.stringify({ capabilities: ['web-storage-rollback-safe-v1'] }))
+      await writeFile(
+        path.join(release, 'deploy/v5/release-metadata.json'),
+        JSON.stringify({ capabilities: ['web-storage-rollback-safe-v1'] }),
+      )
     }
-    await writeFile(path.join(malformed, 'deploy/v5/release-metadata.json'),
-      JSON.stringify({ capabilities: 'web-storage-rollback-safe-v1' }))
+    await writeFile(
+      path.join(malformed, 'deploy/v5/release-metadata.json'),
+      JSON.stringify({ capabilities: 'web-storage-rollback-safe-v1' }),
+    )
 
     const invoke = (current: string, previous: string, target: string) => {
       const harness = [
@@ -3458,13 +3951,22 @@ describe('v5 release safety lanes', () => {
       return spawnSync('bash', ['-c', harness], {
         cwd: root,
         encoding: 'utf8',
-        env: { ...process.env, ALLOW_ANY_BRANCH: '1', CURRENT: current, PREVIOUS: previous, TARGET: target },
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          CURRENT: current,
+          PREVIOUS: previous,
+          TARGET: target,
+        },
       })
     }
 
     assert.equal(invoke(legacy, legacy, capableA).status, 0)
-    assert.equal(invoke(capableA, legacy, legacy).status, 0,
-      'first bridge generation must retain the official legacy rollback path')
+    assert.equal(
+      invoke(capableA, legacy, legacy).status,
+      0,
+      'first bridge generation must retain the official legacy rollback path',
+    )
     const blocked = invoke(capableA, capableB, legacy)
     assert.notEqual(blocked.status, 0)
     assert.match(blocked.stderr, /拒绝 browser storage 代际降级/)
@@ -3479,8 +3981,8 @@ describe('v5 release safety lanes', () => {
       source.indexOf('\n# 传统 deploy/rollback', source.indexOf('activate_release() {')),
     )
     assert.ok(
-      activate.indexOf('assert_web_storage_rollback_transition')
-        < activate.indexOf('sync_assets_to_pool "$reldir"'),
+      activate.indexOf('assert_web_storage_rollback_transition') <
+        activate.indexOf('sync_assets_to_pool "$reldir"'),
     )
 
     const rollback = source.slice(
@@ -3488,10 +3990,16 @@ describe('v5 release safety lanes', () => {
       source.indexOf('\n# tuple 感知回滚', source.indexOf('rollback() {')),
     )
     const tuplePreflight = rollback.indexOf('"tuple rollback preflight"')
-    assert.ok(tuplePreflight >= 0 && tuplePreflight < rollback.indexOf('begin_planned_maintenance rollback 0'))
+    assert.ok(
+      tuplePreflight >= 0 &&
+        tuplePreflight < rollback.indexOf('begin_planned_maintenance rollback 0'),
+    )
     const explicitPreflight = rollback.indexOf('"explicit rollback"')
-    assert.ok(explicitPreflight >= 0 &&
-      explicitPreflight < rollback.indexOf('begin_planned_maintenance rollback 0', explicitPreflight))
+    assert.ok(
+      explicitPreflight >= 0 &&
+        explicitPreflight <
+          rollback.indexOf('begin_planned_maintenance rollback 0', explicitPreflight),
+    )
 
     const canary = source.slice(
       source.indexOf('canary() {'),
@@ -3532,32 +4040,52 @@ describe('v5 release safety lanes', () => {
       })
     }
 
-    assert.equal(invoke('false', 'incapable').status, 0, 'default-off rollout must retain old-reader rollback')
+    assert.equal(
+      invoke('false', 'incapable').status,
+      0,
+      'default-off rollout must retain old-reader rollback',
+    )
     assert.equal(invoke('true', 'capable').status, 0)
     assert.notEqual(invoke('true', 'incapable').status, 0)
     assert.notEqual(invoke('error', 'incapable').status, 0, 'unknown DB state must fail closed')
 
     const source = await readFile(deploy, 'utf8')
-    const runtimeLibSource = await readFile(path.join(root, 'scripts/v5-runtime-release-lib.sh'), 'utf8')
-    assert.match(source, /WHERE record_storage_format >= 3/,
-      'an unfinalized format-3 pin must arm the deploy rollback floor')
+    const runtimeLibSource = await readFile(
+      path.join(root, 'scripts/v5-runtime-release-lib.sh'),
+      'utf8',
+    )
+    assert.match(
+      source,
+      /WHERE record_storage_format >= 3/,
+      'an unfinalized format-3 pin must arm the deploy rollback floor',
+    )
     assert.doesNotMatch(source, /WHERE finalized_at IS NOT NULL AND record_storage_format >= 3/)
-    assert.match(runtimeLibSource, /WHERE record_storage_format >= 3/,
-      'hotcfg rollback must honor an unfinalized format-3 pin')
-    assert.doesNotMatch(runtimeLibSource, /WHERE finalized_at IS NOT NULL AND record_storage_format >= 3/)
+    assert.match(
+      runtimeLibSource,
+      /WHERE record_storage_format >= 3/,
+      'hotcfg rollback must honor an unfinalized format-3 pin',
+    )
+    assert.doesNotMatch(
+      runtimeLibSource,
+      /WHERE finalized_at IS NOT NULL AND record_storage_format >= 3/,
+    )
     const start = source.indexOf('enable_runtime_tape_batching()')
     const end = source.indexOf('\n# 自动回切', start)
     const enableBody = source.slice(start, end)
     const activeProof = enableBody.indexOf('assert_lossless_runtime_batch_capability "$active"')
     const rollbackProof = enableBody.indexOf('assert_lossless_runtime_batch_capability "$previous"')
     const flagWrite = enableBody.indexOf('remote_env_set "$LOSSLESS_RUNTIME_BATCH_ENV" 1')
-    assert.ok(activeProof >= 0 && rollbackProof > activeProof && flagWrite > rollbackProof,
-      'explicit opt-in must prove live and rollback readers before arming the writer')
+    assert.ok(
+      activeProof >= 0 && rollbackProof > activeProof && flagWrite > rollbackProof,
+      'explicit opt-in must prove live and rollback readers before arming the writer',
+    )
   })
 
   test('runtime-event batch floor treats every unprovable database state as unknown', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-runtime-batch-floor-')); dirs.push(dir)
-    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-runtime-batch-floor-'))
+    dirs.push(dir)
+    const bin = path.join(dir, 'bin')
+    await mkdir(bin)
     const envOff = path.join(dir, 'off.env')
     const envSourceFailure = path.join(dir, 'source-failure.env')
     const envMissingDatabase = path.join(dir, 'missing-database.env')
@@ -3566,16 +4094,22 @@ describe('v5 release safety lanes', () => {
     await writeFile(envOff, 'unset LOSSLESS_TURN_TAPE_RUNTIME_BATCHING\nexport DATABASE_URL=fake\n')
     await writeFile(envSourceFailure, 'return 1\n')
     await writeFile(envMissingDatabase, 'unset LOSSLESS_TURN_TAPE_RUNTIME_BATCHING DATABASE_URL\n')
-    await writeFile(envDatabase, 'unset LOSSLESS_TURN_TAPE_RUNTIME_BATCHING\nexport DATABASE_URL=fake\n')
-    await writeFile(path.join(bin, 'psql'), [
-      '#!/bin/sh',
-      'case "$FAKE_PSQL_MODE" in',
-      '  false) printf "%s\\n" false ;;',
-      '  missing-column) exit 3 ;;',
-      '  failure) exit 9 ;;',
-      '  *) exit 10 ;;',
-      'esac',
-    ].join('\n') + '\n')
+    await writeFile(
+      envDatabase,
+      'unset LOSSLESS_TURN_TAPE_RUNTIME_BATCHING\nexport DATABASE_URL=fake\n',
+    )
+    await writeFile(
+      path.join(bin, 'psql'),
+      [
+        '#!/bin/sh',
+        'case "$FAKE_PSQL_MODE" in',
+        '  false) printf "%s\\n" false ;;',
+        '  missing-column) exit 3 ;;',
+        '  failure) exit 9 ;;',
+        '  *) exit 10 ;;',
+        'esac',
+      ].join('\n') + '\n',
+    )
     await chmod(path.join(bin, 'psql'), 0o755)
 
     const invokeDeployProbe = (envFile: string, psqlMode: string) => {
@@ -3633,14 +4167,23 @@ describe('v5 release safety lanes', () => {
       assert.match(invokeDeployProbe(envFile, psqlMode).stdout, /RC:2/, `deploy probe: ${label}`)
       assert.match(invokeHotcfgProbe(envFile, psqlMode).stdout, /RC:2/, `hotcfg probe: ${label}`)
     }
-    assert.match(invokeDeployProbe(envOff, 'false').stdout, /RC:1/,
-      'only a successful false query proves the floor inactive')
-    assert.match(invokeHotcfgProbe(envOff, 'false').stdout, /RC:1/,
-      'only a successful false query proves the hotcfg floor inactive')
+    assert.match(
+      invokeDeployProbe(envOff, 'false').stdout,
+      /RC:1/,
+      'only a successful false query proves the floor inactive',
+    )
+    assert.match(
+      invokeHotcfgProbe(envOff, 'false').stdout,
+      /RC:1/,
+      'only a successful false query proves the hotcfg floor inactive',
+    )
   })
 
   test('explicit rollback uses the live capability, not a racy no-tape DB observation', () => {
-    const invoke = (live: 'capable' | 'incapable' | 'probe-error', target: 'capable' | 'incapable') => {
+    const invoke = (
+      live: 'capable' | 'incapable' | 'probe-error',
+      target: 'capable' | 'incapable',
+    ) => {
       const harness = [
         'set -u',
         'export V5_DEPLOY_SOURCE_ONLY=1',
@@ -3736,7 +4279,10 @@ describe('v5 release safety lanes', () => {
     const runtimeLib = await readFile(path.join(root, 'scripts/v5-runtime-release-lib.sh'), 'utf8')
     const canaryMatrix = source.slice(
       source.indexOf('capability_matrix_preflight()'),
-      source.indexOf('\n# 同步某 release 的 dist/assets', source.indexOf('capability_matrix_preflight()')),
+      source.indexOf(
+        '\n# 同步某 release 的 dist/assets',
+        source.indexOf('capability_matrix_preflight()'),
+      ),
     )
     assert.match(canaryMatrix, /assert_lossless_canary_pair "\$active_rel" "\$candidate_rel"/)
     const abortBody = source.slice(
@@ -3744,8 +4290,8 @@ describe('v5 release safety lanes', () => {
       source.indexOf('\n# ═════════ --recover', source.indexOf('abort_continue()')),
     )
     assert.ok(
-      abortBody.indexOf('assert_lossless_turn_tape_floor "$old_src"')
-        < abortBody.indexOf('caddy_render_reload'),
+      abortBody.indexOf('assert_lossless_turn_tape_floor "$old_src"') <
+        abortBody.indexOf('caddy_render_reload'),
       'abort must recheck the old reader before routing traffic back',
     )
     const rollbackBody = source.slice(
@@ -3753,32 +4299,45 @@ describe('v5 release safety lanes', () => {
       source.indexOf('\n# ═══════════════════════ P3', source.indexOf('rollback_runtime_tuple()')),
     )
     assert.match(rollbackBody, /assert_lossless_runtime_tuple_floor "\$image_id" "\$release"/)
-    assert.match(runtimeLib, /oc_hotcfg_assert_tuple_viable\(\)[\s\S]*oc_hotcfg_assert_tuple_lossless_floor "\$image_id" "\$release"/)
-    assert.match(runtimeLib, /oc_hotcfg_assert_master_runtime_batch_pair "\$env_file" "\$master_release" "\$prev_master_release"/)
+    assert.match(
+      runtimeLib,
+      /oc_hotcfg_assert_tuple_viable\(\)[\s\S]*oc_hotcfg_assert_tuple_lossless_floor "\$image_id" "\$release"/,
+    )
+    assert.match(
+      runtimeLib,
+      /oc_hotcfg_assert_master_runtime_batch_pair "\$env_file" "\$master_release" "\$prev_master_release"/,
+    )
 
-    const compensationGuardStart = source.indexOf('assert_release_activation_compensation_compatible()')
+    const compensationGuardStart = source.indexOf(
+      'assert_release_activation_compensation_compatible()',
+    )
     const compensationGuardBody = source.slice(
       compensationGuardStart,
       source.indexOf('\n# 仅供紧邻', compensationGuardStart),
     )
     assert.match(compensationGuardBody, /lossless_release_may_have_served "\$candidate_release"/)
     assert.match(compensationGuardBody, /assert_lossless_master_release_capability "\$old_release"/)
-    assert.match(compensationGuardBody, /assert_lossless_runtime_tuple_capability "\$image_id" "\$runtime_release"/)
+    assert.match(
+      compensationGuardBody,
+      /assert_lossless_runtime_tuple_capability "\$image_id" "\$runtime_release"/,
+    )
 
     const restoreStart = source.indexOf('restore_release_activation()')
-    const restoreBody = source.slice(
-      restoreStart,
-      source.indexOf('\n# 状态提交回执', restoreStart),
-    )
+    const restoreBody = source.slice(restoreStart, source.indexOf('\n# 状态提交回执', restoreStart))
     const ordinaryGuardAt = restoreBody.indexOf(
       'assert_release_activation_compensation_compatible "$old_release" "$candidate_release"',
     )
     const ordinaryFlipAt = restoreBody.indexOf(
       'restore_release_runtime_after_compatibility_guard "$old_release"',
     )
-    assert.ok(ordinaryGuardAt >= 0 && ordinaryGuardAt < ordinaryFlipAt,
-      'ordinary compensation must prove the old stack before flipping its symlink')
-    assert.match(source, /restore_release_activation "\$prev" "\$old_prev_file" "restart new failed" "\$reldir"/)
+    assert.ok(
+      ordinaryGuardAt >= 0 && ordinaryGuardAt < ordinaryFlipAt,
+      'ordinary compensation must prove the old stack before flipping its symlink',
+    )
+    assert.match(
+      source,
+      /restore_release_activation "\$prev" "\$old_prev_file" "restart new failed" "\$reldir"/,
+    )
 
     const activateStart = source.indexOf('activate_release() {')
     const activateBody = source.slice(
@@ -3789,8 +4348,10 @@ describe('v5 release safety lanes', () => {
       'assert_release_activation_compensation_compatible "$prev" "$reldir"',
     )
     const stateCompensationAt = activateBody.indexOf('restore_release_state_if_committed "$reldir"')
-    assert.ok(ackLossGuardAt >= 0 && ackLossGuardAt < stateCompensationAt,
-      'ordinary ACK-loss compensation must prove the old stack before reverting deploy_state')
+    assert.ok(
+      ackLossGuardAt >= 0 && ackLossGuardAt < stateCompensationAt,
+      'ordinary ACK-loss compensation must prove the old stack before reverting deploy_state',
+    )
 
     const sagaRollbackStart = runtimeLib.indexOf('_hotcfg_saga_rollback()')
     const sagaRollbackBody = runtimeLib.slice(
@@ -3799,33 +4360,65 @@ describe('v5 release safety lanes', () => {
     )
     const sagaGuardAt = sagaRollbackBody.indexOf('lossless_writer_may_have_served')
     const stateRevertAt = sagaRollbackBody.indexOf('if [ "$commit_state" = applied ]')
-    assert.ok(sagaGuardAt >= 0 && sagaGuardAt < stateRevertAt,
-      'hotcfg compensation must block an incapable old stack before state/runtime rollback')
-    assert.match(sagaRollbackBody, /oc_hotcfg_assert_master_lossless_capability "\$prev_master_release"/)
-    assert.match(sagaRollbackBody, /oc_hotcfg_assert_tuple_lossless_capability "\$old_image_id" "\$old_release"/)
-    assert.doesNotMatch(sagaRollbackBody, /assert_tuple_lossless_floor/,
-      'post-exposure rollback must be unconditional, not a racy DB floor probe')
+    assert.ok(
+      sagaGuardAt >= 0 && sagaGuardAt < stateRevertAt,
+      'hotcfg compensation must block an incapable old stack before state/runtime rollback',
+    )
+    assert.match(
+      sagaRollbackBody,
+      /oc_hotcfg_assert_master_lossless_capability "\$prev_master_release"/,
+    )
+    assert.match(
+      sagaRollbackBody,
+      /oc_hotcfg_assert_tuple_lossless_capability "\$old_image_id" "\$old_release"/,
+    )
+    assert.doesNotMatch(
+      sagaRollbackBody,
+      /assert_tuple_lossless_floor/,
+      'post-exposure rollback must be unconditional, not a racy DB floor probe',
+    )
 
     const ordinaryRollback = source.slice(
       source.indexOf('rollback()'),
       source.indexOf('\n# tuple 感知回滚', source.indexOf('rollback()')),
     )
     const ordinaryExplicitAt = ordinaryRollback.indexOf('assert_lossless_explicit_rollback_target')
-    const ordinaryMaintenanceAt = ordinaryRollback.indexOf('begin_planned_maintenance rollback 0', ordinaryExplicitAt)
-    assert.ok(ordinaryExplicitAt >= 0 && ordinaryMaintenanceAt > ordinaryExplicitAt,
-      'ordinary explicit rollback must prove the target before maintenance/symlink mutation')
-    assert.match(rollbackBody,
-      /assert_lossless_explicit_rollback_target[\s\\]*\n?[\s\\]*"\$prev_src" "\$master" "\$image_id" "\$release"/)
+    const ordinaryMaintenanceAt = ordinaryRollback.indexOf(
+      'begin_planned_maintenance rollback 0',
+      ordinaryExplicitAt,
+    )
+    assert.ok(
+      ordinaryExplicitAt >= 0 && ordinaryMaintenanceAt > ordinaryExplicitAt,
+      'ordinary explicit rollback must prove the target before maintenance/symlink mutation',
+    )
+    assert.match(
+      rollbackBody,
+      /assert_lossless_explicit_rollback_target[\s\\]*\n?[\s\\]*"\$prev_src" "\$master" "\$image_id" "\$release"/,
+    )
 
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-lossless-tuple-')); dirs.push(dir)
-    const capable = path.join(dir, 'capable'); const old = path.join(dir, 'old')
-    await mkdir(capable); await mkdir(old)
-    await writeFile(path.join(capable, 'MANIFEST.json'), JSON.stringify({ capabilities: ['lossless-turn-tape-v2'] }))
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-lossless-tuple-'))
+    dirs.push(dir)
+    const capable = path.join(dir, 'capable')
+    const old = path.join(dir, 'old')
+    await mkdir(capable)
+    await mkdir(old)
+    await writeFile(
+      path.join(capable, 'MANIFEST.json'),
+      JSON.stringify({ capabilities: ['lossless-turn-tape-v2'] }),
+    )
     await writeFile(path.join(old, 'MANIFEST.json'), JSON.stringify({ capabilities: [] }))
-    const invoke = (release: string) => spawnSync('bash', ['-c', [
-      `source '${path.join(root, 'scripts/v5-runtime-release-lib.sh')}'`,
-      `oc_hotcfg_assert_tuple_lossless_capability ignored '${release}'`,
-    ].join('\n')], { cwd: root, encoding: 'utf8' })
+    const invoke = (release: string) =>
+      spawnSync(
+        'bash',
+        [
+          '-c',
+          [
+            `source '${path.join(root, 'scripts/v5-runtime-release-lib.sh')}'`,
+            `oc_hotcfg_assert_tuple_lossless_capability ignored '${release}'`,
+          ].join('\n'),
+        ],
+        { cwd: root, encoding: 'utf8' },
+      )
     assert.equal(invoke(capable).status, 0)
     const rejected = invoke(old)
     assert.notEqual(rejected.status, 0)
@@ -3834,7 +4427,10 @@ describe('v5 release safety lanes', () => {
 
   test('model-authority operations pin the stable P3 active lane', async () => {
     const source = await readFile(deploy, 'utf8')
-    const egressUnit = await readFile(path.join(root, 'deploy/v5/openclaude-v5-egress.service'), 'utf8')
+    const egressUnit = await readFile(
+      path.join(root, 'deploy/v5/openclaude-v5-egress.service'),
+      'utf8',
+    )
     const preflight = source.match(/model_authority_preflight\(\) \{([\s\S]*?)\n\}/)?.[1] ?? ''
     assert.match(preflight, /assert_no_rollout_in_progress/)
     assert.match(preflight, /ACTIVE_PORT/)
@@ -3890,63 +4486,83 @@ describe('v5 release safety lanes', () => {
   })
 
   test('egress release readiness tolerates delayed startup and has a hard deadline', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-egress-ready-')); dirs.push(dir)
-    const bin = path.join(dir, 'bin'); await mkdir(bin)
-    const counter = path.join(dir, 'counter'); await writeFile(counter, '0')
-    await writeFile(path.join(bin, 'ssh'), [
-      '#!/bin/sh',
-      'if [ "${SLOW_PROBE:-0}" = 1 ]; then sleep 3; exit 1; fi',
-      'n=$(cat "$COUNTER"); n=$((n+1)); printf "%s" "$n" >"$COUNTER"',
-      'state=active; pid=4321; cwd="$EXPECTED_RELEASE"',
-      'health=\'{"ok":true,"role":"egress","capabilities":["model_authority_v1-egress"]}\'',
-      'case "$n" in',
-      '  1) state=activating; pid=0; cwd=""; health="" ;;',
-      '  2) cwd=/release/wrong ;;',
-      '  3) health=\'{"ok":true,"role":"egress","capabilities":[]}\' ;;',
-      'esac',
-      'printf "%s\\n%s\\n%s\\n" "$state" "$pid" "$cwd"',
-      'printf "%s" "$health" | base64 -w0',
-      'printf "\\n"',
-    ].join('\n') + '\n')
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-egress-ready-'))
+    dirs.push(dir)
+    const bin = path.join(dir, 'bin')
+    await mkdir(bin)
+    const counter = path.join(dir, 'counter')
+    await writeFile(counter, '0')
+    await writeFile(
+      path.join(bin, 'ssh'),
+      [
+        '#!/bin/sh',
+        'if [ "${SLOW_PROBE:-0}" = 1 ]; then sleep 3; exit 1; fi',
+        'n=$(cat "$COUNTER"); n=$((n+1)); printf "%s" "$n" >"$COUNTER"',
+        'state=active; pid=4321; cwd="$EXPECTED_RELEASE"',
+        'health=\'{"ok":true,"role":"egress","capabilities":["model_authority_v1-egress"]}\'',
+        'case "$n" in',
+        '  1) state=activating; pid=0; cwd=""; health="" ;;',
+        '  2) cwd=/release/wrong ;;',
+        '  3) health=\'{"ok":true,"role":"egress","capabilities":[]}\' ;;',
+        'esac',
+        'printf "%s\\n%s\\n%s\\n" "$state" "$pid" "$cwd"',
+        'printf "%s" "$health" | base64 -w0',
+        'printf "\\n"',
+      ].join('\n') + '\n',
+    )
     await chmod(path.join(bin, 'ssh'), 0o755)
 
-    const delayed = spawnSync('bash', ['-c', [
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      'sleep() { :; }',
-      'wait_for_egress_release_ready "$EXPECTED_RELEASE" 1 5',
-    ].join('\n')], {
-      cwd: root,
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        ALLOW_ANY_BRANCH: '1',
-        PATH: `${bin}:${process.env.PATH}`,
-        COUNTER: counter,
-        EXPECTED_RELEASE: '/release/new',
+    const delayed = spawnSync(
+      'bash',
+      [
+        '-c',
+        [
+          'export V5_DEPLOY_SOURCE_ONLY=1',
+          `source '${deploy}'`,
+          'sleep() { :; }',
+          'wait_for_egress_release_ready "$EXPECTED_RELEASE" 1 5',
+        ].join('\n'),
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          PATH: `${bin}:${process.env.PATH}`,
+          COUNTER: counter,
+          EXPECTED_RELEASE: '/release/new',
+        },
       },
-    })
+    )
     assert.equal(delayed.status, 0, delayed.stderr || delayed.stdout)
     assert.equal(await readFile(counter, 'utf8'), '4')
     assert.match(delayed.stdout, /egress ready\(state=active pid=4321 cwd=\/release\/new\)/)
 
     const started = Date.now()
-    const timedOut = spawnSync('bash', ['-c', [
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      'wait_for_egress_release_ready /release/new 1 1',
-    ].join('\n')], {
-      cwd: root,
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        ALLOW_ANY_BRANCH: '1',
-        PATH: `${bin}:${process.env.PATH}`,
-        COUNTER: counter,
-        EXPECTED_RELEASE: '/release/new',
-        SLOW_PROBE: '1',
+    const timedOut = spawnSync(
+      'bash',
+      [
+        '-c',
+        [
+          'export V5_DEPLOY_SOURCE_ONLY=1',
+          `source '${deploy}'`,
+          'wait_for_egress_release_ready /release/new 1 1',
+        ].join('\n'),
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          PATH: `${bin}:${process.env.PATH}`,
+          COUNTER: counter,
+          EXPECTED_RELEASE: '/release/new',
+          SLOW_PROBE: '1',
+        },
       },
-    })
+    )
     const elapsed = Date.now() - started
     assert.notEqual(timedOut.status, 0)
     assert.ok(elapsed < 2500, `one-second egress deadline took ${elapsed}ms`)
@@ -3956,7 +4572,8 @@ describe('v5 release safety lanes', () => {
 
   test('runtime release finalization propagates the full pinned capability list and rejects invalid metadata', async () => {
     async function runBuild(runtimeCapabilities: unknown) {
-      const dir = await mkdtemp(path.join(tmpdir(), 'v5-runtime-caps-')); dirs.push(dir)
+      const dir = await mkdtemp(path.join(tmpdir(), 'v5-runtime-caps-'))
+      dirs.push(dir)
       const capture = path.join(dir, 'finalize.args')
       await writeFile(capture, '')
       const harness = [
@@ -4034,7 +4651,8 @@ describe('v5 release safety lanes', () => {
       assert.equal(rejected.status, 2, rejected.stdout + rejected.stderr)
     }
 
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-runtime-image-switch-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-runtime-image-switch-'))
+    dirs.push(dir)
     await mkdir(path.join(dir, 'deploy/v5'), { recursive: true })
     await writeFile(
       path.join(dir, 'deploy/v5/commercial-v5.env.overrides'),
@@ -4079,19 +4697,20 @@ describe('v5 release safety lanes', () => {
       'hotcfg_rmt() { printf "%s\\n" "$@" >"$CAPTURE"; printf "%s\\n" "$OC_HOTCFG_RELEASES_ROOT/rel-test"; }',
       'build_runtime_release',
     ].join('\n')
-    const invoke = (env: NodeJS.ProcessEnv = {}) => spawnSync('bash', ['-c', harness], {
-      cwd: root,
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        ALLOW_ANY_BRANCH: '1',
-        CAPTURE: capture,
-        PINNED_METADATA: JSON.stringify({
-          runtimeCapabilities: ['model_authority_v1', 'future.runtime-cap'],
-        }),
-        ...env,
-      },
-    })
+    const invoke = (env: NodeJS.ProcessEnv = {}) =>
+      spawnSync('bash', ['-c', harness], {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          CAPTURE: capture,
+          PINNED_METADATA: JSON.stringify({
+            runtimeCapabilities: ['model_authority_v1', 'future.runtime-cap'],
+          }),
+          ...env,
+        },
+      })
 
     const valid = invoke()
     assert.equal(valid.status, 0, valid.stderr || valid.stdout)
@@ -4104,24 +4723,38 @@ describe('v5 release safety lanes', () => {
       [{ EMBED_SOURCE: '1' }, /只接受 slim image/],
       [{ INCLUDE_GROK: '0' }, /缺 official Grok binary/],
       [{ GROK_VERSION: 'grok 1.0.2 (old)' }, /Grok binary=/],
-      [{ SOURCE_COMMIT: 'a'.repeat(40), ANCESTOR_RC: '1' }, /不是 canonical HEAD 的可验证 ancestor/],
+      [
+        { SOURCE_COMMIT: 'a'.repeat(40), ANCESTOR_RC: '1' },
+        /不是 canonical HEAD 的可验证 ancestor/,
+      ],
     ] as const) {
       await writeFile(capture, '')
       const rejected = invoke(env)
       assert.notEqual(rejected.status, 0, rejected.stdout + rejected.stderr)
       assert.match(rejected.stderr, pattern)
-      assert.equal(await readFile(capture, 'utf8'), '', 'preflight failure must precede release finalization')
+      assert.equal(
+        await readFile(capture, 'utf8'),
+        '',
+        'preflight failure must precede release finalization',
+      )
     }
 
     const source = await readFile(deploy, 'utf8')
     const preflight = source.slice(
       source.indexOf('assert_target_runtime_image_ready()'),
-      source.indexOf('\n# ── 1. build_platform_bundle', source.indexOf('assert_target_runtime_image_ready()')),
+      source.indexOf(
+        '\n# ── 1. build_platform_bundle',
+        source.indexOf('assert_target_runtime_image_ready()'),
+      ),
     )
-    const deployBody = source.slice(source.indexOf('deploy() {'), source.indexOf('\n# ───────────────────────── offline recycle'))
+    const deployBody = source.slice(
+      source.indexOf('deploy() {'),
+      source.indexOf('\n# ───────────────────────── offline recycle'),
+    )
     assert.doesNotMatch(preflight, /sed -i|OC_RUNTIME_IMAGE=.*>>|oc_hotcfg_env_write_tuple/)
     assert.ok(
-      deployBody.indexOf('assert_target_runtime_image_ready') < deployBody.indexOf('prepare_live_baseline_safety'),
+      deployBody.indexOf('assert_target_runtime_image_ready') <
+        deployBody.indexOf('prepare_live_baseline_safety'),
       'target image provenance must be checked before live baseline/plugin mutations',
     )
     assert.match(
@@ -4135,7 +4768,9 @@ describe('v5 release safety lanes', () => {
   })
 
   test('release metadata declares authority plus lossless persistence capabilities', async () => {
-    const meta = JSON.parse(await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8'))
+    const meta = JSON.parse(
+      await readFile(path.join(root, 'deploy/v5/release-metadata.json'), 'utf8'),
+    )
     const source = await readFile(deploy, 'utf8')
     const buildRuntimeStart = source.indexOf('build_runtime_release()')
     const buildRuntimeEnd = source.indexOf('\n# ── 3. activate_runtime_tuple', buildRuntimeStart)
@@ -4176,7 +4811,8 @@ describe('v5 release safety lanes', () => {
   })
 
   test('direct turn timeline capability blocks mixed readers/writers and unsafe downgrade', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-direct-timeline-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-direct-timeline-'))
+    dirs.push(dir)
     const legacy = path.join(dir, 'legacy')
     const capable = path.join(dir, 'capable')
     for (const [release, capabilities] of [
@@ -4184,29 +4820,40 @@ describe('v5 release safety lanes', () => {
       [capable, ['dual-master-v1', 'direct-turn-timeline-v1']],
     ] as const) {
       await mkdir(path.join(release, 'deploy/v5'), { recursive: true })
-      await writeFile(path.join(release, 'deploy/v5/release-metadata.json'), JSON.stringify({ capabilities }))
+      await writeFile(
+        path.join(release, 'deploy/v5/release-metadata.json'),
+        JSON.stringify({ capabilities }),
+      )
     }
 
-    const invoke = (command: string) => spawnSync('bash', ['-c', [
-      'set -u',
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      'DRY=0; KL_HOST=fake; ACTIVE_UNIT=fake.service; ACTIVE_PORT=18890; V5_ENV=/fake/env',
-      'ssh() {',
-      '  local host="$1"; shift; local command="$*"',
-      '  case "$command" in',
-      '    *"metadata="*) bash -c "$command" ;;',
-      '    *) printf "UNEXPECTED:%s\\n" "$command" >&2; return 90 ;;',
-      '  esac',
-      '}',
-      'smoke() { printf "SMOKE\\n"; }',
-      'mark_deploy_recovery_required() { printf "RECOVERY:%s\\n" "$*"; }',
-      command,
-    ].join('\n')], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
-    })
+    const invoke = (command: string) =>
+      spawnSync(
+        'bash',
+        [
+          '-c',
+          [
+            'set -u',
+            'export V5_DEPLOY_SOURCE_ONLY=1',
+            `source '${deploy}'`,
+            'DRY=0; KL_HOST=fake; ACTIVE_UNIT=fake.service; ACTIVE_PORT=18890; V5_ENV=/fake/env',
+            'ssh() {',
+            '  local host="$1"; shift; local command="$*"',
+            '  case "$command" in',
+            '    *"metadata="*) bash -c "$command" ;;',
+            '    *) printf "UNEXPECTED:%s\\n" "$command" >&2; return 90 ;;',
+            '  esac',
+            '}',
+            'smoke() { printf "SMOKE\\n"; }',
+            'mark_deploy_recovery_required() { printf "RECOVERY:%s\\n" "$*"; }',
+            command,
+          ].join('\n'),
+        ],
+        {
+          cwd: root,
+          encoding: 'utf8',
+          env: { ...process.env, ALLOW_ANY_BRANCH: '1' },
+        },
+      )
 
     const mixed = invoke(`assert_direct_turn_timeline_pair '${legacy}' '${capable}' canary`)
     assert.notEqual(mixed.status, 0)
@@ -4216,7 +4863,9 @@ describe('v5 release safety lanes', () => {
 
     const firstAdoption = invoke(`prepare_direct_turn_timeline_activation '${capable}' '${legacy}'`)
     assert.equal(firstAdoption.status, 0, firstAdoption.stderr)
-    const zeroRevisionDowngrade = invoke(`prepare_direct_turn_timeline_activation '${legacy}' '${capable}'`)
+    const zeroRevisionDowngrade = invoke(
+      `prepare_direct_turn_timeline_activation '${legacy}' '${capable}'`,
+    )
     assert.notEqual(zeroRevisionDowngrade.status, 0)
     assert.match(zeroRevisionDowngrade.stderr, /不可逆 direct turn timeline 降级/)
     assert.doesNotMatch(zeroRevisionDowngrade.stdout + zeroRevisionDowngrade.stderr, /STOP|RESTART/)
@@ -4224,7 +4873,10 @@ describe('v5 release safety lanes', () => {
     const source = await readFile(deploy, 'utf8')
     const prepareBody = source.slice(
       source.indexOf('prepare_direct_turn_timeline_activation()'),
-      source.indexOf('\n# Tri-state artifact probe', source.indexOf('prepare_direct_turn_timeline_activation()')),
+      source.indexOf(
+        '\n# Tri-state artifact probe',
+        source.indexOf('prepare_direct_turn_timeline_activation()'),
+      ),
     )
     assert.doesNotMatch(prepareBody, /systemctl stop|turn_dispatches/)
     assert.match(prepareBody, /即使当前没有失败行也存在首写竞态/)
@@ -4233,8 +4885,8 @@ describe('v5 release safety lanes', () => {
       source.indexOf('\n# 传统 deploy/rollback', source.indexOf('activate_release() {')),
     )
     assert.ok(
-      activationBody.indexOf('prepare_direct_turn_timeline_activation "$reldir" "$prev"')
-        < activationBody.indexOf("mv -T '$tmplink' '$ACTIVE_SRC'"),
+      activationBody.indexOf('prepare_direct_turn_timeline_activation "$reldir" "$prev"') <
+        activationBody.indexOf("mv -T '$tmplink' '$ACTIVE_SRC'"),
       'ordinary downgrade must hit the irreversible floor before the source flip',
     )
     const canaryLane = source.slice(
@@ -4242,8 +4894,9 @@ describe('v5 release safety lanes', () => {
       source.indexOf('\n# 内部账号 allowlist', source.indexOf('canary() {')),
     )
     assert.ok(
-      canaryLane.indexOf('assert_direct_turn_timeline_pair "$DS_active_release" "$reldir" "canary pre-start"')
-        < canaryLane.indexOf('start_candidate_unit_and_wait "$cand"'),
+      canaryLane.indexOf(
+        'assert_direct_turn_timeline_pair "$DS_active_release" "$reldir" "canary pre-start"',
+      ) < canaryLane.indexOf('start_candidate_unit_and_wait "$cand"'),
       'mixed timeline generations must be rejected before candidate start',
     )
     const recoveryBody = source.slice(
@@ -4254,12 +4907,19 @@ describe('v5 release safety lanes', () => {
       source.indexOf('cutover_transition()'),
       source.indexOf('\nbegin_cutover_step() {', source.indexOf('cutover_transition()')),
     )
-    assert.ok(recoveryBody.indexOf('systemctl stop "$unit"') < recoveryBody.indexOf('current_direct_capability='))
-    assert.ok(recoveryBody.indexOf('rollback_partial 1') < recoveryBody.indexOf('cp -al "$remote_src/." "$restore_dir/"'))
+    assert.ok(
+      recoveryBody.indexOf('systemctl stop "$unit"') <
+        recoveryBody.indexOf('current_direct_capability='),
+    )
+    assert.ok(
+      recoveryBody.indexOf('rollback_partial 1') <
+        recoveryBody.indexOf('cp -al "$remote_src/." "$restore_dir/"'),
+    )
 
     const remoteScript = recoveryBody.match(/<<'REMOTE'\n([\s\S]*?)\nREMOTE/)?.[1]
     assert.ok(remoteScript, 'recover_cutover remote body not found')
-    const fixture = await mkdtemp(path.join(tmpdir(), 'v5-direct-recovery-')); dirs.push(fixture)
+    const fixture = await mkdtemp(path.join(tmpdir(), 'v5-direct-recovery-'))
+    dirs.push(fixture)
     const cutoverRoot = path.join(fixture, 'cutovers')
     const nonce = 'a'.repeat(32)
     const bundle = path.join(cutoverRoot, nonce)
@@ -4276,120 +4936,171 @@ describe('v5 release safety lanes', () => {
     await mkdir(path.join(remoteSrc, 'deploy/v5'), { recursive: true })
     await mkdir(bin)
     const host = spawnSync('hostname', ['-f'], { encoding: 'utf8' }).stdout.trim()
-    await writeFile(path.join(bundle, 'manifest.json'), JSON.stringify({
-      host,
-      nonce,
-      old_image: 'fixture:image',
-      old_image_id: 'sha256:fixture',
-      target_commit: targetCommit,
-      database_compatibility: 'backward-compatible',
-      expires_at: Math.floor(Date.now() / 1000) + 3600,
-      target_image: 'fixture:image',
-      target_image_id: 'sha256:fixture',
-      applied_migrations_hash: appliedHash,
-    }), { mode: 0o600 })
-    await writeFile(path.join(bundle, 'commercial-v5.env'), 'DATABASE_URL=postgres://unused\n', { mode: 0o600 })
-    await writeFile(path.join(bundle, 'state.json'), JSON.stringify({
-      state: 'activating', candidate_start_attempted: true,
-    }), { mode: 0o600 })
-    await writeFile(path.join(bundle, 'source/deploy/v5/release-metadata.json'), JSON.stringify({
-      capabilities: ['durable-turn-dispatch-v1'],
-    }))
-    await writeFile(path.join(remoteSrc, 'deploy/v5/release-metadata.json'), JSON.stringify({
-      capabilities: ['durable-turn-dispatch-v1', 'history-projection-revision-v1', 'direct-turn-timeline-v1'],
-    }))
+    await writeFile(
+      path.join(bundle, 'manifest.json'),
+      JSON.stringify({
+        host,
+        nonce,
+        old_image: 'fixture:image',
+        old_image_id: 'sha256:fixture',
+        target_commit: targetCommit,
+        database_compatibility: 'backward-compatible',
+        expires_at: Math.floor(Date.now() / 1000) + 3600,
+        target_image: 'fixture:image',
+        target_image_id: 'sha256:fixture',
+        applied_migrations_hash: appliedHash,
+      }),
+      { mode: 0o600 },
+    )
+    await writeFile(path.join(bundle, 'commercial-v5.env'), 'DATABASE_URL=postgres://unused\n', {
+      mode: 0o600,
+    })
+    await writeFile(
+      path.join(bundle, 'state.json'),
+      JSON.stringify({
+        state: 'activating',
+        candidate_start_attempted: true,
+      }),
+      { mode: 0o600 },
+    )
+    await writeFile(
+      path.join(bundle, 'source/deploy/v5/release-metadata.json'),
+      JSON.stringify({
+        capabilities: ['durable-turn-dispatch-v1'],
+      }),
+    )
+    await writeFile(
+      path.join(remoteSrc, 'deploy/v5/release-metadata.json'),
+      JSON.stringify({
+        capabilities: [
+          'durable-turn-dispatch-v1',
+          'history-projection-revision-v1',
+          'direct-turn-timeline-v1',
+        ],
+      }),
+    )
     await writeFile(envFile, 'DATABASE_URL=postgres://unused\nCURRENT=1\n', { mode: 0o600 })
     await writeFile(marker, JSON.stringify({ schema: 1, nonce }))
-    await writeFile(path.join(bin, 'docker'), [
-      '#!/bin/sh',
-      'printf "%s\\n" sha256:fixture',
-    ].join('\n') + '\n')
-    await writeFile(path.join(bin, 'systemctl'), [
-      '#!/bin/sh',
-      'printf "%s\\n" "$*" >>"$SYSTEMCTL_LOG"',
-    ].join('\n') + '\n')
-    await writeFile(path.join(bin, 'curl'), [
-      '#!/bin/sh',
-      'printf "%s\\n" \'{"ok":true,"channel":"v5"}\'',
-    ].join('\n') + '\n')
-    await writeFile(path.join(bin, 'psql'), [
-      '#!/bin/sh',
-      'printf "%s\\n" "$APPLIED_SET"',
-    ].join('\n') + '\n')
+    await writeFile(
+      path.join(bin, 'docker'),
+      ['#!/bin/sh', 'printf "%s\\n" sha256:fixture'].join('\n') + '\n',
+    )
+    await writeFile(
+      path.join(bin, 'systemctl'),
+      ['#!/bin/sh', 'printf "%s\\n" "$*" >>"$SYSTEMCTL_LOG"'].join('\n') + '\n',
+    )
+    await writeFile(
+      path.join(bin, 'curl'),
+      ['#!/bin/sh', 'printf "%s\\n" \'{"ok":true,"channel":"v5"}\''].join('\n') + '\n',
+    )
+    await writeFile(
+      path.join(bin, 'psql'),
+      ['#!/bin/sh', 'printf "%s\\n" "$APPLIED_SET"'].join('\n') + '\n',
+    )
     await chmod(path.join(bin, 'docker'), 0o755)
     await chmod(path.join(bin, 'systemctl'), 0o755)
     await chmod(path.join(bin, 'curl'), 0o755)
     await chmod(path.join(bin, 'psql'), 0o755)
     const transitionScript = transitionBody.match(/<<'REMOTE'\n([\s\S]*?)\nREMOTE/)?.[1]
     assert.ok(transitionScript, 'cutover_transition remote body not found')
-    const transitioned = spawnSync('bash', ['-c', transitionScript!, '--',
-      cutoverRoot,
-      path.join(fixture, 'cutover.lock'),
-      nonce,
-      targetCommit,
-      'activating',
-      'activated',
-      envFile,
-    ], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, APPLIED_SET: appliedSet },
-    })
+    const transitioned = spawnSync(
+      'bash',
+      [
+        '-c',
+        transitionScript!,
+        '--',
+        cutoverRoot,
+        path.join(fixture, 'cutover.lock'),
+        nonce,
+        targetCommit,
+        'activating',
+        'activated',
+        envFile,
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, APPLIED_SET: appliedSet },
+      },
+    )
     assert.equal(transitioned.status, 0, transitioned.stderr || transitioned.stdout)
     const activatedState = JSON.parse(await readFile(path.join(bundle, 'state.json'), 'utf8'))
     assert.equal(activatedState.state, 'activated')
     assert.equal(activatedState.candidate_start_attempted, true)
-    const recovered = spawnSync('bash', ['-c', remoteScript!, '--',
-      cutoverRoot,
-      path.join(fixture, 'cutover.lock'),
-      nonce,
-      remoteSrc,
-      envFile,
-      `openclaude-v5-direct-test-${process.pid}.service`,
-      '18890',
-      marker,
-      path.join(fixture, 'maintenance.lock'),
-      'direct-turn-timeline-v1',
-    ], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SYSTEMCTL_LOG: systemctlLog },
-    })
+    const recovered = spawnSync(
+      'bash',
+      [
+        '-c',
+        remoteScript!,
+        '--',
+        cutoverRoot,
+        path.join(fixture, 'cutover.lock'),
+        nonce,
+        remoteSrc,
+        envFile,
+        `openclaude-v5-direct-test-${process.pid}.service`,
+        '18890',
+        marker,
+        path.join(fixture, 'maintenance.lock'),
+        'direct-turn-timeline-v1',
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SYSTEMCTL_LOG: systemctlLog },
+      },
+    )
     assert.notEqual(recovered.status, 0)
     assert.match(recovered.stderr, /refusing irreversible direct turn timeline downgrade/)
     assert.match(await readFile(systemctlLog, 'utf8'), /stop .*\ndaemon-reload\nstart /)
     await assert.rejects(readFile(marker, 'utf8'))
-    const currentMeta = JSON.parse(await readFile(path.join(remoteSrc, 'deploy/v5/release-metadata.json'), 'utf8'))
+    const currentMeta = JSON.parse(
+      await readFile(path.join(remoteSrc, 'deploy/v5/release-metadata.json'), 'utf8'),
+    )
     assert.ok(currentMeta.capabilities.includes('direct-turn-timeline-v1'))
 
     // A stage/pre-start failure may leave capable metadata in a partial source,
     // but it never served. The durable marker is the authority: restore the
     // trusted legacy bundle instead of starting the half-staged tree.
-    await writeFile(path.join(bundle, 'state.json'), JSON.stringify({
-      state: 'staging', candidate_start_attempted: false,
-    }), { mode: 0o600 })
+    await writeFile(
+      path.join(bundle, 'state.json'),
+      JSON.stringify({
+        state: 'staging',
+        candidate_start_attempted: false,
+      }),
+      { mode: 0o600 },
+    )
     await writeFile(marker, JSON.stringify({ schema: 1, nonce }))
     await writeFile(systemctlLog, '')
-    const preStartRecovery = spawnSync('bash', ['-c', remoteScript!, '--',
-      cutoverRoot,
-      path.join(fixture, 'cutover.lock'),
-      nonce,
-      remoteSrc,
-      envFile,
-      `openclaude-v5-direct-test-${process.pid}.service`,
-      '18890',
-      marker,
-      path.join(fixture, 'maintenance.lock'),
-      'direct-turn-timeline-v1',
-    ], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SYSTEMCTL_LOG: systemctlLog },
-    })
+    const preStartRecovery = spawnSync(
+      'bash',
+      [
+        '-c',
+        remoteScript!,
+        '--',
+        cutoverRoot,
+        path.join(fixture, 'cutover.lock'),
+        nonce,
+        remoteSrc,
+        envFile,
+        `openclaude-v5-direct-test-${process.pid}.service`,
+        '18890',
+        marker,
+        path.join(fixture, 'maintenance.lock'),
+        'direct-turn-timeline-v1',
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SYSTEMCTL_LOG: systemctlLog },
+      },
+    )
     assert.equal(preStartRecovery.status, 0, preStartRecovery.stderr || preStartRecovery.stdout)
     assert.match(await readFile(systemctlLog, 'utf8'), /stop .*\ndaemon-reload\nstart /)
     await assert.rejects(readFile(marker, 'utf8'))
-    const restoredMeta = JSON.parse(await readFile(path.join(remoteSrc, 'deploy/v5/release-metadata.json'), 'utf8'))
+    const restoredMeta = JSON.parse(
+      await readFile(path.join(remoteSrc, 'deploy/v5/release-metadata.json'), 'utf8'),
+    )
     assert.ok(!restoredMeta.capabilities.includes('direct-turn-timeline-v1'))
 
     const stagedBody = source.slice(
@@ -4397,59 +5108,65 @@ describe('v5 release safety lanes', () => {
       source.indexOf('\nactivate_staged() {', source.indexOf('activate_staged_inner()')),
     )
     assert.ok(
-      stagedBody.indexOf('mark_cutover_candidate_start_attempted')
-        < stagedBody.indexOf('systemctl start $V5_UNIT'),
+      stagedBody.indexOf('mark_cutover_candidate_start_attempted') <
+        stagedBody.indexOf('systemctl start $V5_UNIT'),
       'candidate start evidence must commit before the first start attempt',
     )
   })
 
   test('model-authority readiness tolerates startup delay, rejects PID churn, and has a hard deadline', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-ready-')); dirs.push(dir)
-    const bin = path.join(dir, 'bin'); await mkdir(bin)
-    const counter = path.join(dir, 'counter'); await writeFile(counter, '0')
-    await writeFile(path.join(bin, 'ssh'), [
-      '#!/bin/sh',
-      'if [ "${SLOW_PROBE:-0}" = 1 ]; then sleep 3; exit 1; fi',
-      'n=$(cat "$COUNTER"); n=$((n+1)); printf "%s" "$n" >"$COUNTER"',
-      'master_health=$(printf %s \'{"ok":true,"runtime":{"leadership":{"state":"leader"}},"sessionsDb":"ok"}\' | base64 -w0)',
-      'egress_health=$(printf %s \'{"ok":true,"role":"egress","modelAuthority":{"enforced":true}}\' | base64 -w0)',
-      'case "$PROBE_MODE" in',
-      '  master-delayed)',
-      '    if [ "$n" -eq 1 ]; then printf "activating\\n0\\n\\n\\n\\n\\nactivating\\n0\\n"',
-      '    elif [ "$n" -eq 2 ]; then printf "active\\n4321\\n1\\n1\\n0\\n%s\\nactive\\n4322\\n" "$master_health"',
-      '    else printf "active\\n4321\\n1\\n1\\n0\\n%s\\nactive\\n4321\\n" "$master_health"; fi ;;',
-      '  master-churn) printf "active\\n4321\\n1\\n1\\n0\\n%s\\nactive\\n4322\\n" "$master_health" ;;',
-      '  master-invalid) printf "inactive\\n0\\n1\\n1\\n0\\n%s\\ninactive\\n0\\n" "$master_health" ;;',
-      '  egress-delayed)',
-      '    if [ "$n" -eq 1 ]; then printf "activating\\n0\\n\\nactivating\\n0\\n"',
-      '    elif [ "$n" -eq 2 ]; then printf "active\\n5321\\n%s\\nactive\\n5322\\n" "$egress_health"',
-      '    else printf "active\\n5321\\n%s\\nactive\\n5321\\n" "$egress_health"; fi ;;',
-      '  egress-churn) printf "active\\n5321\\n%s\\nactive\\n5322\\n" "$egress_health" ;;',
-      '  egress-invalid) printf "inactive\\n0\\n%s\\ninactive\\n0\\n" "$egress_health" ;;',
-      '  *) exit 2 ;;',
-      'esac',
-    ].join('\n') + '\n')
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-ready-'))
+    dirs.push(dir)
+    const bin = path.join(dir, 'bin')
+    await mkdir(bin)
+    const counter = path.join(dir, 'counter')
+    await writeFile(counter, '0')
+    await writeFile(
+      path.join(bin, 'ssh'),
+      [
+        '#!/bin/sh',
+        'if [ "${SLOW_PROBE:-0}" = 1 ]; then sleep 3; exit 1; fi',
+        'n=$(cat "$COUNTER"); n=$((n+1)); printf "%s" "$n" >"$COUNTER"',
+        'master_health=$(printf %s \'{"ok":true,"runtime":{"leadership":{"state":"leader"}},"sessionsDb":"ok"}\' | base64 -w0)',
+        'egress_health=$(printf %s \'{"ok":true,"role":"egress","modelAuthority":{"enforced":true}}\' | base64 -w0)',
+        'case "$PROBE_MODE" in',
+        '  master-delayed)',
+        '    if [ "$n" -eq 1 ]; then printf "activating\\n0\\n\\n\\n\\n\\nactivating\\n0\\n"',
+        '    elif [ "$n" -eq 2 ]; then printf "active\\n4321\\n1\\n1\\n0\\n%s\\nactive\\n4322\\n" "$master_health"',
+        '    else printf "active\\n4321\\n1\\n1\\n0\\n%s\\nactive\\n4321\\n" "$master_health"; fi ;;',
+        '  master-churn) printf "active\\n4321\\n1\\n1\\n0\\n%s\\nactive\\n4322\\n" "$master_health" ;;',
+        '  master-invalid) printf "inactive\\n0\\n1\\n1\\n0\\n%s\\ninactive\\n0\\n" "$master_health" ;;',
+        '  egress-delayed)',
+        '    if [ "$n" -eq 1 ]; then printf "activating\\n0\\n\\nactivating\\n0\\n"',
+        '    elif [ "$n" -eq 2 ]; then printf "active\\n5321\\n%s\\nactive\\n5322\\n" "$egress_health"',
+        '    else printf "active\\n5321\\n%s\\nactive\\n5321\\n" "$egress_health"; fi ;;',
+        '  egress-churn) printf "active\\n5321\\n%s\\nactive\\n5322\\n" "$egress_health" ;;',
+        '  egress-invalid) printf "inactive\\n0\\n%s\\ninactive\\n0\\n" "$egress_health" ;;',
+        '  *) exit 2 ;;',
+        'esac',
+      ].join('\n') + '\n',
+    )
     await chmod(path.join(bin, 'ssh'), 0o755)
 
     async function runProbe(body: string, mode: string, slow = false) {
       await writeFile(counter, '0')
-      return spawnSync('bash', ['-c', [
-        'export V5_DEPLOY_SOURCE_ONLY=1',
-        `source '${deploy}'`,
-        body,
-      ].join('\n')], {
-        cwd: root,
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          ALLOW_ANY_BRANCH: '1',
-          PATH: `${bin}:${process.env.PATH}`,
-          KL_HOST: 'fake-v5',
-          COUNTER: counter,
-          PROBE_MODE: mode,
-          SLOW_PROBE: slow ? '1' : '0',
+      return spawnSync(
+        'bash',
+        ['-c', ['export V5_DEPLOY_SOURCE_ONLY=1', `source '${deploy}'`, body].join('\n')],
+        {
+          cwd: root,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            ALLOW_ANY_BRANCH: '1',
+            PATH: `${bin}:${process.env.PATH}`,
+            KL_HOST: 'fake-v5',
+            COUNTER: counter,
+            PROBE_MODE: mode,
+            SLOW_PROBE: slow ? '1' : '0',
+          },
         },
-      })
+      )
     }
 
     const masterDelayed = await runProbe(
@@ -4506,7 +5223,8 @@ describe('v5 release safety lanes', () => {
 
   test('authority enable readiness failures take the correct verified rollback path', async () => {
     async function enableHarness(failAt: 'egress-true' | 'master-ready') {
-      const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-enable-')); dirs.push(dir)
+      const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-enable-'))
+      dirs.push(dir)
       const log = path.join(dir, 'order.log')
       const body = [
         'set -u',
@@ -4530,7 +5248,13 @@ describe('v5 release safety lanes', () => {
       const result = spawnSync('bash', ['-c', body], {
         cwd: root,
         encoding: 'utf8',
-        env: { ...process.env, ALLOW_ANY_BRANCH: '1', KL_HOST: 'fake-v5', ORDER_LOG: log, FAIL_AT: failAt },
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          KL_HOST: 'fake-v5',
+          ORDER_LOG: log,
+          FAIL_AT: failAt,
+        },
       })
       return { result, order: (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean) }
     }
@@ -4541,7 +5265,10 @@ describe('v5 release safety lanes', () => {
       egressFailure.order.join('\n'),
       /openclaude-v5-egress[\s\S]*egress-ready:true[\s\S]*env:OC_MODEL_AUTHORITY=0[\s\S]*openclaude-v5-egress[\s\S]*egress-ready:false/,
     )
-    assert.equal(egressFailure.order.some((line) => line.includes("restart 'openclaude-v5.service'")), false)
+    assert.equal(
+      egressFailure.order.some((line) => line.includes("restart 'openclaude-v5.service'")),
+      false,
+    )
 
     const masterFailure = await enableHarness('master-ready')
     assert.notEqual(masterFailure.result.status, 0)
@@ -4553,22 +5280,20 @@ describe('v5 release safety lanes', () => {
   })
 
   test('model-authority evidence persistence survives real psql command tags and stays fail-closed without a canary', (t) => {
-    const databaseUrl = process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
+    const databaseUrl =
+      process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
     const schema = `oc_ma_observation_${process.pid}_${Date.now()}`
     const bundleRev = 'abcdef123456'
     const bundlePath = `/var/lib/openclaude-v5/platform/bundles/${bundleRev}`
-    const psql = (sql: string, searchPath = false) => spawnSync(
-      'psql',
-      [databaseUrl, '-X', '-v', 'ON_ERROR_STOP=1', '-tAc', sql],
-      {
+    const psql = (sql: string, searchPath = false) =>
+      spawnSync('psql', [databaseUrl, '-X', '-v', 'ON_ERROR_STOP=1', '-tAc', sql], {
         cwd: root,
         encoding: 'utf8',
         env: {
           ...process.env,
           ...(searchPath ? { PGOPTIONS: `-c search_path=${schema}` } : {}),
         },
-      },
-    )
+      })
 
     const setup = psql(`
       CREATE SCHEMA ${schema};
@@ -4622,11 +5347,17 @@ describe('v5 release safety lanes', () => {
       '  PGOPTIONS="-c search_path=$TEST_SCHEMA" psql "$TEST_DATABASE_URL" -X -v ON_ERROR_STOP=1 -tAc "$1" 2>/dev/null | tr -d \'[:space:]\'',
       '}',
     ]
-    const runShell = (body: string[]) => spawnSync('bash', ['-c', [...shellPrelude, ...body].join('\n')], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, ALLOW_ANY_BRANCH: '1', TEST_DATABASE_URL: databaseUrl, TEST_SCHEMA: schema },
-    })
+    const runShell = (body: string[]) =>
+      spawnSync('bash', ['-c', [...shellPrelude, ...body].join('\n')], {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          TEST_DATABASE_URL: databaseUrl,
+          TEST_SCHEMA: schema,
+        },
+      })
     const runObservation = () => runShell(['start_model_authority_observation'])
 
     const success = runObservation()
@@ -4650,10 +5381,13 @@ describe('v5 release safety lanes', () => {
       bundle: bundlePath,
     })
 
-    const addCanaryUsage = psql(`
+    const addCanaryUsage = psql(
+      `
       INSERT INTO usage_records(model,execution_revision,security_epoch,authority_kind)
       VALUES ('oc-catalog-canary-glm52','revision-canary',3,'bridge_signed')
-    `, true)
+    `,
+      true,
+    )
     assert.equal(addCanaryUsage.status, 0, addCanaryUsage.stderr || addCanaryUsage.stdout)
     const status = runShell(['model_authority_observation_status'])
     assert.equal(status.status, 0, status.stderr || status.stdout)
@@ -4661,11 +5395,14 @@ describe('v5 release safety lanes', () => {
     assert.equal(statusJson.signed_requests, 1)
     assert.equal(statusJson.canary_requests, 1)
 
-    const legacyUpdate = psql(`
+    const legacyUpdate = psql(
+      `
       UPDATE model_authority_deploy_state SET value=value
       WHERE key='observation'
       RETURNING 'ok'
-    `, true)
+    `,
+      true,
+    )
     assert.equal(legacyUpdate.status, 0, legacyUpdate.stderr || legacyUpdate.stdout)
     assert.equal(legacyUpdate.stdout.replace(/\s/g, ''), 'okUPDATE1')
 
@@ -4719,12 +5456,20 @@ describe('v5 release safety lanes', () => {
       "SELECT (value->'emergency_drill')::text FROM model_authority_deploy_state WHERE key='observation'",
       true,
     )
-    assert.equal(persistedEmergency.status, 0, persistedEmergency.stderr || persistedEmergency.stdout)
-    const emergencyEvidence = JSON.parse(persistedEmergency.stdout.trim()) as Record<string, unknown>
+    assert.equal(
+      persistedEmergency.status,
+      0,
+      persistedEmergency.stderr || persistedEmergency.stdout,
+    )
+    const emergencyEvidence = JSON.parse(persistedEmergency.stdout.trim()) as Record<
+      string,
+      unknown
+    >
     assert.equal(emergencyEvidence.activated_and_restored, true)
     assert.deepEqual(emergencyEvidence.emergency_tuple, JSON.parse(emergencyTuple))
 
-    const prepareCutover = psql(`
+    const prepareCutover = psql(
+      `
       INSERT INTO usage_records(model,execution_revision,security_epoch,authority_kind)
       SELECT 'glm-5.2','revision-' || n,3,'bridge_signed' FROM generate_series(1,9) AS n;
       INSERT INTO model_catalog(entry_id,model_id,state)
@@ -4792,11 +5537,17 @@ describe('v5 release safety lanes', () => {
           jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','pre-observation','securityEpoch','3','authorityTurnId',repeat('3',32),'turnLeaseIssuedAtMs',pre_observation_issued,'turnLeaseVerifiedAtMs',pre_observation_issued+301000),
           NOW()-interval '10 minutes',NOW() FROM t
       ) AS rows(request_id,user_id,state,ctx,created_at,updated_at);
-    `, true)
+    `,
+      true,
+    )
     assert.equal(prepareCutover.status, 0, prepareCutover.stderr || prepareCutover.stdout)
 
     const beforeLongEvidence = runShell(['model_authority_observation_status'])
-    assert.equal(beforeLongEvidence.status, 0, beforeLongEvidence.stderr || beforeLongEvidence.stdout)
+    assert.equal(
+      beforeLongEvidence.status,
+      0,
+      beforeLongEvidence.stderr || beforeLongEvidence.stdout,
+    )
     assert.equal(JSON.parse(beforeLongEvidence.stdout).long_ccb_turns, 0)
 
     const cutoverBody = [
@@ -4814,7 +5565,8 @@ describe('v5 release safety lanes', () => {
     assert.notEqual(missingLong.status, 0)
     assert.match(missingLong.stderr, /no committed multi-request CCB turn/)
 
-    const addValidLongTurn = psql(`
+    const addValidLongTurn = psql(
+      `
       WITH t AS (SELECT floor(extract(epoch FROM NOW())*1000)::bigint-360000 AS issued)
       INSERT INTO request_finalize_journal(request_id,user_id,state,ctx,created_at,updated_at)
       SELECT 'valid-early',42,'committed',
@@ -4823,7 +5575,9 @@ describe('v5 release safety lanes', () => {
       UNION ALL SELECT 'valid-late',42,'committed',
         jsonb_build_object('model','oc-catalog-canary-glm52','source','ccb_proxy','authorityKind','bridge_signed','executionRevision','valid-long','securityEpoch','3','authorityTurnId',repeat('2',32),'turnLeaseIssuedAtMs',issued,'turnLeaseVerifiedAtMs',issued+301000),
         NOW()-interval '30 seconds',NOW() FROM t
-    `, true)
+    `,
+      true,
+    )
     assert.equal(addValidLongTurn.status, 0, addValidLongTurn.stderr || addValidLongTurn.stdout)
     const afterLongEvidence = runShell(['model_authority_observation_status'])
     assert.equal(afterLongEvidence.status, 0, afterLongEvidence.stderr || afterLongEvidence.stdout)
@@ -4838,12 +5592,15 @@ describe('v5 release safety lanes', () => {
     assert.equal(cutoverMarker.status, 0, cutoverMarker.stderr || cutoverMarker.stdout)
     assert.equal(cutoverMarker.stdout.trim(), 'test-release-sha')
 
-    const legacy = psql(`
+    const legacy = psql(
+      `
       INSERT INTO model_authority_deploy_state(key,value)
       VALUES ('cutover','{}')
       ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
       RETURNING 'ok'
-    `, true)
+    `,
+      true,
+    )
     assert.equal(legacy.status, 0, legacy.stderr || legacy.stdout)
     assert.equal(legacy.stdout.replace(/\s/g, ''), 'okINSERT01')
 
@@ -4856,7 +5613,8 @@ describe('v5 release safety lanes', () => {
   })
 
   async function modelAuthorityRollbackHarness(fail = '') {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-rollback-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-rollback-'))
+    dirs.push(dir)
     const log = path.join(dir, 'order.log')
     const body = [
       'set -u',
@@ -4884,7 +5642,13 @@ describe('v5 release safety lanes', () => {
     const result = spawnSync('bash', ['-c', body], {
       cwd: root,
       encoding: 'utf8',
-      env: { ...process.env, ALLOW_ANY_BRANCH: '1', KL_HOST: 'fake-v5', ORDER_LOG: log, FAIL_AT: fail },
+      env: {
+        ...process.env,
+        ALLOW_ANY_BRANCH: '1',
+        KL_HOST: 'fake-v5',
+        ORDER_LOG: log,
+        FAIL_AT: fail,
+      },
     })
     return { result, order: (await readFile(log, 'utf8')).trim().split('\n').filter(Boolean) }
   }
@@ -4913,7 +5677,10 @@ describe('v5 release safety lanes', () => {
     assert.notEqual(envFail.result.status, 0)
     const flagWrite = envFail.order.indexOf('env:OC_MODEL_AUTHORITY=0')
     assert.ok(flagWrite >= 0)
-    assert.equal(envFail.order.slice(flagWrite + 1).some((v) => v.includes('restart')), false)
+    assert.equal(
+      envFail.order.slice(flagWrite + 1).some((v) => v.includes('restart')),
+      false,
+    )
 
     const masterFail = await modelAuthorityRollbackHarness('master_first')
     assert.notEqual(masterFail.result.status, 0)
@@ -4921,7 +5688,10 @@ describe('v5 release safety lanes', () => {
 
     const masterReadinessFail = await modelAuthorityRollbackHarness('master-ready:1/0/-')
     assert.notEqual(masterReadinessFail.result.status, 0)
-    assert.doesNotMatch(masterReadinessFail.order.join('\n'), /census|OC_MODEL_AUTHORITY=0|egress-ready:false/)
+    assert.doesNotMatch(
+      masterReadinessFail.order.join('\n'),
+      /census|OC_MODEL_AUTHORITY=0|egress-ready:false/,
+    )
 
     const censusFail = await modelAuthorityRollbackHarness('census')
     assert.notEqual(censusFail.result.status, 0)
@@ -4933,7 +5703,8 @@ describe('v5 release safety lanes', () => {
   })
 
   test('authority rollback is resumable after flag0 when egress recovery previously failed', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-resume-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-resume-'))
+    dirs.push(dir)
     const log = path.join(dir, 'order.log')
     const body = [
       'set -u',
@@ -4966,13 +5737,19 @@ describe('v5 release safety lanes', () => {
     assert.equal(result.status, 0, result.stderr || result.stdout)
     const retryAt = order.indexOf('retry')
     const retried = order.slice(retryAt + 1).join('\n')
-    assert.match(retried, /master-ready:0\/0\/-[\s\S]*census[\s\S]*openclaude-v5-egress[\s\S]*egress-ready:false[\s\S]*smoke/)
+    assert.match(
+      retried,
+      /master-ready:0\/0\/-[\s\S]*census[\s\S]*openclaude-v5-egress[\s\S]*egress-ready:false[\s\S]*smoke/,
+    )
     assert.doesNotMatch(retried, /master-ready:1\/0\/-/)
   })
 
   test('seed authority failures compensate commit-unknown writes and verify live seed=0', async () => {
-    async function seedHarness(failAt: 'write-unknown' | 'seed-ready' | 'comp-ready' | 'evidence-read') {
-      const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-seed-')); dirs.push(dir)
+    async function seedHarness(
+      failAt: 'write-unknown' | 'seed-ready' | 'comp-ready' | 'evidence-read',
+    ) {
+      const dir = await mkdtemp(path.join(tmpdir(), 'v5-ma-seed-'))
+      dirs.push(dir)
       const log = path.join(dir, 'order.log')
       const body = [
         'set -u',
@@ -4997,7 +5774,13 @@ describe('v5 release safety lanes', () => {
       const result = spawnSync('bash', ['-c', body], {
         cwd: root,
         encoding: 'utf8',
-        env: { ...process.env, ALLOW_ANY_BRANCH: '1', KL_HOST: 'fake-v5', ORDER_LOG: log, FAIL_AT: failAt },
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          KL_HOST: 'fake-v5',
+          ORDER_LOG: log,
+          FAIL_AT: failAt,
+        },
       })
       return {
         result,
@@ -5035,7 +5818,10 @@ describe('v5 release safety lanes', () => {
 
     const compensationFailure = await seedHarness('comp-ready')
     assert.notEqual(compensationFailure.result.status, 0)
-    assert.match(compensationFailure.order.join('\n'), /master-ready:1\/1\/1[\s\S]*master-ready:1\/1\/0/)
+    assert.match(
+      compensationFailure.order.join('\n'),
+      /master-ready:1\/1\/1[\s\S]*master-ready:1\/1\/0/,
+    )
     assert.doesNotMatch(compensationFailure.output, /seed authority 已验证回滚/)
     assert.doesNotMatch(compensationFailure.output, /seed authority by rev 已开启并留证/)
   })
@@ -5046,7 +5832,10 @@ describe('v5 release safety lanes', () => {
     const enableStart = source.indexOf('enable_model_authority()')
     const enableEnd = source.indexOf('disable_model_authority()', enableStart)
     const enableBody = source.slice(enableStart, enableEnd)
-    assert.ok(enableBody.indexOf('install_model_authority_canary') < enableBody.indexOf('remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 1'))
+    assert.ok(
+      enableBody.indexOf('install_model_authority_canary') <
+        enableBody.indexOf('remote_env_set "$MODEL_AUTHORITY_FLAG_KEY" 1'),
+    )
     assert.ok(enableBody.indexOf('start_model_authority_observation') > enableBody.indexOf('smoke'))
 
     const cutoverStart = source.indexOf('model_authority_cutover()')
@@ -5054,7 +5843,10 @@ describe('v5 release safety lanes', () => {
     const cutoverBody = source.slice(cutoverStart, cutoverEnd)
     assert.match(cutoverBody, /MODEL_AUTHORITY_OBSERVATION_KEY[\s\S]*FOR UPDATE/)
     assert.match(cutoverBody, /model_security_epoch WHERE id FOR UPDATE/)
-    assert.match(cutoverBody, /observation window shorter than.*MODEL_AUTHORITY_MIN_OBSERVE_SECONDS/)
+    assert.match(
+      cutoverBody,
+      /observation window shorter than.*MODEL_AUTHORITY_MIN_OBSERVE_SECONDS/,
+    )
     assert.match(cutoverBody, /signed request evidence.*MODEL_AUTHORITY_MIN_REQUESTS/)
     assert.match(cutoverBody, /catalog canary has no signed usage/)
     assert.match(cutoverBody, /turnLeaseIssuedAtMs/)
@@ -5160,7 +5952,7 @@ persist_selfhost_model_authority_cutover /not-used`,
       // 2026-07-26 安全整改:/assets 处理块内嵌 route + `@sourcemap path *.map` +
       // `respond @sourcemap 404`,golden 随之更新。改 golden 时必须同时看下面那条
       // sourcemap 结构断言 —— 只更 hash 不看内容等于把门关了。
-      // (首版曾用"独立 handle 排在 /assets 之前"的写法,文本断言绿但线上照样 200 —— 
+      // (首版曾用"独立 handle 排在 /assets 之前"的写法,文本断言绿但线上照样 200 ——
       //  adapter 按路径特异性重排,详见模板与下面那条测试的注释。)
       'fd659d46d64c42d341a494275127e1420d16883be47ad2ff43bdfe7efac85929',
     )
@@ -5243,15 +6035,23 @@ persist_selfhost_model_authority_cutover /not-used`,
   })
 
   test('candidate readiness predicate is fail-closed for every required field', () => {
-    const check = (payload: string) => spawnSync('bash', ['-c', [
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      'candidate_health_ready "$PAYLOAD"',
-    ].join('\n')], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, ALLOW_ANY_BRANCH: '1', PAYLOAD: payload },
-    })
+    const check = (payload: string) =>
+      spawnSync(
+        'bash',
+        [
+          '-c',
+          [
+            'export V5_DEPLOY_SOURCE_ONLY=1',
+            `source '${deploy}'`,
+            'candidate_health_ready "$PAYLOAD"',
+          ].join('\n'),
+        ],
+        {
+          cwd: root,
+          encoding: 'utf8',
+          env: { ...process.env, ALLOW_ANY_BRANCH: '1', PAYLOAD: payload },
+        },
+      )
     const valid = '{"ok":true,"channel":"v5","leadership":{"state":"standby"},"vip":"released"}'
     assert.equal(check(valid).status, 0)
     for (const invalid of [
@@ -5271,170 +6071,249 @@ persist_selfhost_model_authority_cutover /not-used`,
   })
 
   test('candidate readiness polling supports delayed success and a hard wall-clock deadline', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-candidate-ready-')); dirs.push(dir)
-    const counter = path.join(dir, 'counter'); await writeFile(counter, '0')
-    const delayed = spawnSync('bash', ['-c', [
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      'slot_priv_healthz() {',
-      '  n=$(cat "$COUNTER"); n=$((n+1)); printf "%s" "$n" >"$COUNTER"',
-      '  if [ "$n" -lt 3 ]; then echo \'{"ok":true,"channel":"v5","leadership":{"state":"acquiring"},"vip":"released"}\';',
-      '  else echo \'{"ok":true,"channel":"v5","leadership":{"state":"standby"},"vip":"released"}\'; fi',
-      '}',
-      'sleep() { :; }',
-      'wait_for_candidate_ready B 5',
-    ].join('\n')], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, ALLOW_ANY_BRANCH: '1', COUNTER: counter },
-    })
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-candidate-ready-'))
+    dirs.push(dir)
+    const counter = path.join(dir, 'counter')
+    await writeFile(counter, '0')
+    const delayed = spawnSync(
+      'bash',
+      [
+        '-c',
+        [
+          'export V5_DEPLOY_SOURCE_ONLY=1',
+          `source '${deploy}'`,
+          'slot_priv_healthz() {',
+          '  n=$(cat "$COUNTER"); n=$((n+1)); printf "%s" "$n" >"$COUNTER"',
+          '  if [ "$n" -lt 3 ]; then echo \'{"ok":true,"channel":"v5","leadership":{"state":"acquiring"},"vip":"released"}\';',
+          '  else echo \'{"ok":true,"channel":"v5","leadership":{"state":"standby"},"vip":"released"}\'; fi',
+          '}',
+          'sleep() { :; }',
+          'wait_for_candidate_ready B 5',
+        ].join('\n'),
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1', COUNTER: counter },
+      },
+    )
     assert.equal(delayed.status, 0, delayed.stderr || delayed.stdout)
     assert.equal(await readFile(counter, 'utf8'), '3')
     assert.match(delayed.stdout, /candidate=B 已 standby\+VIP released/)
 
-    const bin = path.join(dir, 'bin'); await mkdir(bin)
+    const bin = path.join(dir, 'bin')
+    await mkdir(bin)
     await writeFile(path.join(bin, 'ssh'), '#!/bin/sh\nsleep 3\n')
     await chmod(path.join(bin, 'ssh'), 0o755)
     const started = Date.now()
-    const transportTimedOut = spawnSync('bash', ['-c', [
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      'wait_for_candidate_ready B 1',
-    ].join('\n')], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, ALLOW_ANY_BRANCH: '1', PATH: `${bin}:${process.env.PATH}` },
-    })
+    const transportTimedOut = spawnSync(
+      'bash',
+      [
+        '-c',
+        [
+          'export V5_DEPLOY_SOURCE_ONLY=1',
+          `source '${deploy}'`,
+          'wait_for_candidate_ready B 1',
+        ].join('\n'),
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1', PATH: `${bin}:${process.env.PATH}` },
+      },
+    )
     const elapsed = Date.now() - started
     assert.notEqual(transportTimedOut.status, 0)
     assert.ok(elapsed < 2500, `one-second deadline took ${elapsed}ms`)
     assert.match(transportTimedOut.stderr, /last private healthz: <empty>/)
 
-    const diagnostic = spawnSync('bash', ['-c', [
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      'slot_priv_healthz() { sleep 1; echo \'{"ok":false,"probe":"last-seen"}\'; }',
-      'wait_for_candidate_ready B 1',
-    ].join('\n')], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
+    const diagnostic = spawnSync(
+      'bash',
+      [
+        '-c',
+        [
+          'export V5_DEPLOY_SOURCE_ONLY=1',
+          `source '${deploy}'`,
+          'slot_priv_healthz() { sleep 1; echo \'{"ok":false,"probe":"last-seen"}\'; }',
+          'wait_for_candidate_ready B 1',
+        ].join('\n'),
+      ],
+      { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } },
+    )
     assert.notEqual(diagnostic.status, 0)
     assert.match(diagnostic.stderr, /last private healthz: .*last-seen/)
   })
 
   test('candidate readiness dry-run is immediate and canary failure retains pre-READY recovery', async () => {
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-candidate-dry-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-candidate-dry-'))
+    dirs.push(dir)
     const touched = path.join(dir, 'touched')
     const started = Date.now()
-    const dry = spawnSync('bash', ['-c', [
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      'DRY=1',
-      'slot_priv_healthz() { touch "$TOUCHED"; return 1; }',
-      'wait_for_candidate_ready B 90',
-      'test ! -e "$TOUCHED"',
-    ].join('\n')], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, ALLOW_ANY_BRANCH: '1', TOUCHED: touched },
-    })
+    const dry = spawnSync(
+      'bash',
+      [
+        '-c',
+        [
+          'export V5_DEPLOY_SOURCE_ONLY=1',
+          `source '${deploy}'`,
+          'DRY=1',
+          'slot_priv_healthz() { touch "$TOUCHED"; return 1; }',
+          'wait_for_candidate_ready B 90',
+          'test ! -e "$TOUCHED"',
+        ].join('\n'),
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1', TOUCHED: touched },
+      },
+    )
     assert.equal(dry.status, 0, dry.stderr || dry.stdout)
     assert.ok(Date.now() - started < 1000)
 
     const recovery = path.join(dir, 'recovered')
-    const failedStart = spawnSync('bash', ['-c', [
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      'sshk() { :; }',
-      'wait_for_candidate_ready() { return 1; }',
-      'recover_canary_prep() { printf "%s" "$1" >"$RECOVERY"; }',
-      'set +e; start_candidate_unit_and_wait B; rc=$?; set -e',
-      'test "$rc" -ne 0',
-      'test "$(cat "$RECOVERY")" = B',
-    ].join('\n')], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, ALLOW_ANY_BRANCH: '1', RECOVERY: recovery },
-    })
+    const failedStart = spawnSync(
+      'bash',
+      [
+        '-c',
+        [
+          'export V5_DEPLOY_SOURCE_ONLY=1',
+          `source '${deploy}'`,
+          'sshk() { :; }',
+          'wait_for_candidate_ready() { return 1; }',
+          'recover_canary_prep() { printf "%s" "$1" >"$RECOVERY"; }',
+          'set +e; start_candidate_unit_and_wait B; rc=$?; set -e',
+          'test "$rc" -ne 0',
+          'test "$(cat "$RECOVERY")" = B',
+        ].join('\n'),
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1', RECOVERY: recovery },
+      },
+    )
     assert.equal(failedStart.status, 0, failedStart.stderr || failedStart.stdout)
 
-    const startFailure = spawnSync('bash', ['-c', [
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      'sshk() { return 42; }',
-      'wait_for_candidate_ready() { touch "$WAITED"; return 0; }',
-      'recover_canary_prep() { touch "$RECOVERED"; }',
-      'set +e; start_candidate_unit_and_wait B; rc=$?; set -e',
-      'test "$rc" -ne 0',
-      'test ! -e "$WAITED"',
-      'test ! -e "$RECOVERED"',
-    ].join('\n')], {
-      cwd: root,
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        ALLOW_ANY_BRANCH: '1',
-        WAITED: path.join(dir, 'waited'),
-        RECOVERED: path.join(dir, 'recovered-after-start-failure'),
+    const startFailure = spawnSync(
+      'bash',
+      [
+        '-c',
+        [
+          'export V5_DEPLOY_SOURCE_ONLY=1',
+          `source '${deploy}'`,
+          'sshk() { return 42; }',
+          'wait_for_candidate_ready() { touch "$WAITED"; return 0; }',
+          'recover_canary_prep() { touch "$RECOVERED"; }',
+          'set +e; start_candidate_unit_and_wait B; rc=$?; set -e',
+          'test "$rc" -ne 0',
+          'test ! -e "$WAITED"',
+          'test ! -e "$RECOVERED"',
+        ].join('\n'),
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          WAITED: path.join(dir, 'waited'),
+          RECOVERED: path.join(dir, 'recovered-after-start-failure'),
+        },
       },
-    })
+    )
     assert.equal(startFailure.status, 0, startFailure.stderr || startFailure.stdout)
 
-    const stopFailure = spawnSync('bash', ['-c', [
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      'MUTATION_LEASE_BYPASSED=1',
-      'calls=0',
-      'sshk() { calls=$((calls+1)); [ "$calls" -ne 2 ]; }',
-      'wait_for_candidate_ready() { return 1; }',
-      'ds_cas_or_die() { touch "$CASSED"; }',
-      'set +e; start_candidate_unit_and_wait B; rc=$?; set -e',
-      'test "$rc" -ne 0',
-      'test "$calls" -eq 2',
-      'test ! -e "$CASSED"',
-    ].join('\n')], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, ALLOW_ANY_BRANCH: '1', CASSED: path.join(dir, 'cassed-after-stop-failure') },
-    })
+    const stopFailure = spawnSync(
+      'bash',
+      [
+        '-c',
+        [
+          'export V5_DEPLOY_SOURCE_ONLY=1',
+          `source '${deploy}'`,
+          'MUTATION_LEASE_BYPASSED=1',
+          'calls=0',
+          'sshk() { calls=$((calls+1)); [ "$calls" -ne 2 ]; }',
+          'wait_for_candidate_ready() { return 1; }',
+          'ds_cas_or_die() { touch "$CASSED"; }',
+          'set +e; start_candidate_unit_and_wait B; rc=$?; set -e',
+          'test "$rc" -ne 0',
+          'test "$calls" -eq 2',
+          'test ! -e "$CASSED"',
+        ].join('\n'),
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          CASSED: path.join(dir, 'cassed-after-stop-failure'),
+        },
+      },
+    )
     assert.equal(stopFailure.status, 0, stopFailure.stderr || stopFailure.stdout)
 
-    const dispatcherStopFailure = spawnSync('bash', ['-c', [
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      'MUTATION_LEASE_BYPASSED=1',
-      'ds_snapshot() { DS_phase=canary; DS_transition_step=2; DS_candidate_slot=B; DS_active_slot=A; DS_operation_id=op; DS_lock_version=7; }',
-      'recover_canary_prep() { return 42; }',
-      'ds_cas_or_die() { touch "$CASSED"; }',
-      'set +e; recover; rc=$?; set -e',
-      'test "$rc" -ne 0',
-      'test ! -e "$CASSED"',
-    ].join('\n')], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, ALLOW_ANY_BRANCH: '1', CASSED: path.join(dir, 'dispatcher-cassed-after-stop-failure') },
-    })
-    assert.equal(dispatcherStopFailure.status, 0, dispatcherStopFailure.stderr || dispatcherStopFailure.stdout)
-
-    const missingUnit = spawnSync('bash', ['-c', [
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      'MUTATION_LEASE_BYPASSED=1',
-      'sshk() { eval "$*"; }',
-      'systemctl() { touch "$SYSTEMCTL_CALLED"; return 42; }',
-      'export -f systemctl',
-      'ds_cas_or_die() { touch "$CASSED"; }',
-      'recover_canary_prep B',
-      'test ! -e "$SYSTEMCTL_CALLED"',
-      'test -e "$CASSED"',
-    ].join('\n')], {
-      cwd: root,
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        ALLOW_ANY_BRANCH: '1',
-        SYSTEMCTL_CALLED: path.join(dir, 'systemctl-called-for-missing-unit'),
-        CASSED: path.join(dir, 'cassed-for-missing-unit'),
+    const dispatcherStopFailure = spawnSync(
+      'bash',
+      [
+        '-c',
+        [
+          'export V5_DEPLOY_SOURCE_ONLY=1',
+          `source '${deploy}'`,
+          'MUTATION_LEASE_BYPASSED=1',
+          'ds_snapshot() { DS_phase=canary; DS_transition_step=2; DS_candidate_slot=B; DS_active_slot=A; DS_operation_id=op; DS_lock_version=7; }',
+          'recover_canary_prep() { return 42; }',
+          'ds_cas_or_die() { touch "$CASSED"; }',
+          'set +e; recover; rc=$?; set -e',
+          'test "$rc" -ne 0',
+          'test ! -e "$CASSED"',
+        ].join('\n'),
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          CASSED: path.join(dir, 'dispatcher-cassed-after-stop-failure'),
+        },
       },
-    })
+    )
+    assert.equal(
+      dispatcherStopFailure.status,
+      0,
+      dispatcherStopFailure.stderr || dispatcherStopFailure.stdout,
+    )
+
+    const missingUnit = spawnSync(
+      'bash',
+      [
+        '-c',
+        [
+          'export V5_DEPLOY_SOURCE_ONLY=1',
+          `source '${deploy}'`,
+          'MUTATION_LEASE_BYPASSED=1',
+          'sshk() { eval "$*"; }',
+          'systemctl() { touch "$SYSTEMCTL_CALLED"; return 42; }',
+          'export -f systemctl',
+          'ds_cas_or_die() { touch "$CASSED"; }',
+          'recover_canary_prep B',
+          'test ! -e "$SYSTEMCTL_CALLED"',
+          'test -e "$CASSED"',
+        ].join('\n'),
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ALLOW_ANY_BRANCH: '1',
+          SYSTEMCTL_CALLED: path.join(dir, 'systemctl-called-for-missing-unit'),
+          CASSED: path.join(dir, 'cassed-for-missing-unit'),
+        },
+      },
+    )
     assert.equal(missingUnit.status, 0, missingUnit.stderr || missingUnit.stdout)
 
     const source = await readFile(deploy, 'utf8')
@@ -5471,14 +6350,17 @@ describe('v5 daily report fanout accounting', () => {
     const envFile = path.join(dir, 'commercial-v5.env')
     await mkdir(bin)
     await writeFile(envFile, 'DATABASE_URL=postgres://fixture\n')
-    await writeFile(path.join(bin, 'psql'), `#!/bin/sh
+    await writeFile(
+      path.join(bin, 'psql'),
+      `#!/bin/sh
 printf '%s\\n' "$*" >>"$PSQL_CALLS"
 case "$*" in
   *"event_type=ops.daily_report"*) cat >/dev/null; echo "fanout targets=0 inserted=0 suppressed=0" ;;
   *"event_type=ops.daily_anomaly"*) cat >/dev/null; echo "fanout targets=1 inserted=1 suppressed=0" ;;
   *) cat >/dev/null ;;
 esac
-`)
+`,
+    )
     await writeFile(path.join(bin, 'sqlite3'), '#!/bin/sh\necho "0|0"\n')
     await chmod(path.join(bin, 'psql'), 0o755)
     await chmod(path.join(bin, 'sqlite3'), 0o755)
@@ -5494,10 +6376,7 @@ esac
       V5DAY_FANOUT_SQL: path.join(root, 'scripts/v5-alert-fanout.sql'),
     })
     assert.equal(result.status, 0, result.stderr || result.stdout)
-    const [logText, psqlCalls] = await Promise.all([
-      readFile(log, 'utf8'),
-      readFile(calls, 'utf8'),
-    ])
+    const [logText, psqlCalls] = await Promise.all([readFile(log, 'utf8'), readFile(calls, 'utf8')])
     assert.match(logText, /FANOUT-ZERO ops\.daily_report sev=info/)
     assert.match(logText, /FANOUT-OK ops\.daily_anomaly sev=warning targets=1 inserted=1/)
     assert.match(logText, /HEARTBEAT-NOT-PUSHED ops\.daily_report 匹配 0 个通道/)
@@ -5549,12 +6428,17 @@ async function monitorFixture(options: MonitorFixtureOptions = {}) {
     failedUnits = [],
   } = options
   const turnWindowStats = explicitTurnWindowStats ?? (allHealthy ? '0|0|0|0' : undefined)
-  const dir = await mkdtemp(path.join(tmpdir(), 'v5-monitor-safety-')); dirs.push(dir)
+  const dir = await mkdtemp(path.join(tmpdir(), 'v5-monitor-safety-'))
+  dirs.push(dir)
   // 夹具内的"健康备份"目录:一个 mtime=当下的子目录即满足 backup_fresh 的新鲜度判据。
   const backupDir = path.join(dir, 'backups')
   spawnSync('mkdir', ['-p', path.join(backupDir, 'v5-fixture-fresh')])
-  const bin = path.join(dir, 'bin'); await writeFile(path.join(dir, 'meminfo'), 'MemTotal: 1000 kB\nMemAvailable: 900 kB\n')
-  await writeFile(path.join(dir, 'env'), 'OC_RUNTIME_IMAGE=test/runtime:v5\nDATABASE_URL=postgres://unused\n')
+  const bin = path.join(dir, 'bin')
+  await writeFile(path.join(dir, 'meminfo'), 'MemTotal: 1000 kB\nMemAvailable: 900 kB\n')
+  await writeFile(
+    path.join(dir, 'env'),
+    'OC_RUNTIME_IMAGE=test/runtime:v5\nDATABASE_URL=postgres://unused\n',
+  )
   await writeFile(path.join(dir, 'state'), JSON.stringify(state))
   await writeFile(path.join(dir, 'marker'), JSON.stringify(marker))
   await chmod(path.join(dir, 'marker'), markerMode)
@@ -5564,11 +6448,14 @@ async function monitorFixture(options: MonitorFixtureOptions = {}) {
     spawnSync('mkdir', ['-p', bundle])
     await chmod(cutoverRoot, 0o700)
     await chmod(bundle, 0o700)
-    await writeFile(path.join(bundle, 'manifest.json'), JSON.stringify({
-      schema: 1,
-      host: marker.host,
-      nonce: marker.nonce,
-    }))
+    await writeFile(
+      path.join(bundle, 'manifest.json'),
+      JSON.stringify({
+        schema: 1,
+        host: marker.host,
+        nonce: marker.nonce,
+      }),
+    )
     await chmod(path.join(bundle, 'manifest.json'), 0o600)
   }
   await writeFile(path.join(dir, 'setup'), '')
@@ -5601,15 +6488,16 @@ case "$*" in
   *) echo refused >&2; exit 7;;
 esac
 `,
-    psql: deployState === 'error'
-      ? '#!/bin/sh\necho database-down >&2; exit 2\n'
-      : `#!/bin/sh
+    psql:
+      deployState === 'error'
+        ? '#!/bin/sh\necho database-down >&2; exit 2\n'
+        : `#!/bin/sh
 printf '%s\\n' "$*" >> '${psqlCalls}'
 case "$*" in
   *"FROM deploy_state"*) printf '%s\\n' '${deployState.phase}|${deployState.step}|${deployState.active}|${deployState.candidate ?? ''}' ;;
   ${turnWindowStats !== undefined ? `*request_finalize_journal*) printf '%s\\n' '${turnWindowStats}' ;;` : ''}
-  ${allHealthy ? '*product_friction_events*) printf \'0|0\\n\' ;;' : ''}
-  ${allHealthy ? '*marketplace_skill_listings*) printf \'t\\n\' ;;' : ''}
+  ${allHealthy ? "*product_friction_events*) printf '0|0\\n' ;;" : ''}
+  ${allHealthy ? "*marketplace_skill_listings*) printf 't\\n' ;;" : ''}
   *) exit 0 ;;
 esac
 `,
@@ -5617,14 +6505,17 @@ esac
     docker: `#!/bin/sh
 case "$1" in
   images) echo test/runtime:v5 ;;
-  ps) ${dockerPsFails
-    ? 'echo docker-unavailable >&2; exit 1'
-    : dockerRows.map((row) => `printf '%s\\n' '${row}'`).join('; ') || ':'} ;;
+  ps) ${
+    dockerPsFails
+      ? 'echo docker-unavailable >&2; exit 1'
+      : dockerRows.map((row) => `printf '%s\\n' '${row}'`).join('; ') || ':'
+  } ;;
 esac
 `,
   }
   for (const [name, body] of Object.entries(scripts)) {
-    await writeFile(path.join(bin, name), body); await chmod(path.join(bin, name), 0o755)
+    await writeFile(path.join(bin, name), body)
+    await chmod(path.join(bin, name), 0o755)
   }
   const statePath = path.join(dir, 'state')
   const logPath = path.join(dir, 'log')
@@ -5684,11 +6575,16 @@ describe('v5 monitor obsolete pool state migration', () => {
     assert.deepEqual(migrated.preserved, { revision: 7 })
     const calls = await readFile(result.psqlCalls, 'utf8')
     assert.doesNotMatch(calls, /INSERT INTO|write_alert_condition|v5-alert-fanout\.sql/)
-    assert.match(await readFile(result.logPath, 'utf8'), /MIGRATION obsolete pool count-threshold state bad→ok/)
+    assert.match(
+      await readFile(result.logPath, 'utf8'),
+      /MIGRATION obsolete pool count-threshold state bad→ok/,
+    )
   })
 
   test('rejects another historical bad key and leaves state byte-identical', async () => {
-    const original = JSON.stringify({ checks: { pool: { status: 'bad' }, image: { status: 'bad' } } })
+    const original = JSON.stringify({
+      checks: { pool: { status: 'bad' }, image: { status: 'bad' } },
+    })
     const result = await monitorFixture({
       args: ['--migrate-obsolete-pool-state'],
       allHealthy: true,
@@ -5701,7 +6597,9 @@ describe('v5 monitor obsolete pool state migration', () => {
   })
 
   test('rejects a current bad check and leaves state byte-identical', async () => {
-    const original = JSON.stringify({ checks: { pool: { status: 'bad', since: 1, last_alert: 2 } } })
+    const original = JSON.stringify({
+      checks: { pool: { status: 'bad', since: 1, last_alert: 2 } },
+    })
     const result = await monitorFixture({
       args: ['--migrate-obsolete-pool-state'],
       allHealthy: true,
@@ -5732,7 +6630,8 @@ interface MonitorHostInstallOptions {
 }
 
 async function monitorHostInstallFixture(options: MonitorHostInstallOptions = {}) {
-  const dir = await mkdtemp(path.join(tmpdir(), 'v5-monitor-host-install-')); dirs.push(dir)
+  const dir = await mkdtemp(path.join(tmpdir(), 'v5-monitor-host-install-'))
+  dirs.push(dir)
   const stage = path.join(dir, 'stage')
   const hostRoot = path.join(dir, 'host-monitor')
   const systemdDir = path.join(dir, 'systemd')
@@ -5770,27 +6669,39 @@ async function monitorHostInstallFixture(options: MonitorHostInstallOptions = {}
   }
   if (options.malformedDryRunSeverity) {
     await cp(path.join(stage, 'v5-monitor.sh'), path.join(stage, 'v5-monitor.real.sh'))
-    await writeFile(path.join(stage, 'v5-monitor.sh'), `#!/bin/bash
+    await writeFile(
+      path.join(stage, 'v5-monitor.sh'),
+      `#!/bin/bash
 bash "$(dirname "$0")/v5-monitor.real.sh" "$@" | sed -E 's/ \\[severity=(warning|critical)\\]$//'
-`)
+`,
+    )
     await chmod(path.join(stage, 'v5-monitor.sh'), 0o755)
   }
-  const checksum = spawnSync('bash', ['-c', [
-    'sha256sum v5-monitor.sh v5-daily-check.sh v5-alert-fail.sh v5-alert-fanout.sql v5-monitor-host-install-remote.sh',
-    'openclaude-v5-monitor.service openclaude-v5-monitor.timer',
-    'openclaude-v5-daily.service openclaude-v5-daily.timer',
-    'openclaude-v5-alert-fail@.service',
-  ].join(' ')], { cwd: stage, encoding: 'utf8' })
+  const checksum = spawnSync(
+    'bash',
+    [
+      '-c',
+      [
+        'sha256sum v5-monitor.sh v5-daily-check.sh v5-alert-fail.sh v5-alert-fanout.sql v5-monitor-host-install-remote.sh',
+        'openclaude-v5-monitor.service openclaude-v5-monitor.timer',
+        'openclaude-v5-daily.service openclaude-v5-daily.timer',
+        'openclaude-v5-alert-fail@.service',
+      ].join(' '),
+    ],
+    { cwd: stage, encoding: 'utf8' },
+  )
   assert.equal(checksum.status, 0, checksum.stderr)
   await writeFile(path.join(stage, 'SHA256SUMS'), checksum.stdout)
   const bundleSha = createHash('sha256').update(checksum.stdout).digest('hex')
   await writeFile(envFile, 'OC_RUNTIME_IMAGE=test/runtime:v5\nDATABASE_URL=postgres://unused\n')
-  const originalState = JSON.stringify(options.initialState ?? {
-    checks: {
-      pool: { status: 'bad', since: 123, last_alert: 456 },
-      mem: { status: 'ok', since: 0, last_alert: 0 },
+  const originalState = JSON.stringify(
+    options.initialState ?? {
+      checks: {
+        pool: { status: 'bad', since: 123, last_alert: 456 },
+        mem: { status: 'ok', since: 0, last_alert: 0 },
+      },
     },
-  })
+  )
   await writeFile(stateFile, originalState)
   if (options.invalidState) {
     await rm(stateFile)
@@ -5805,7 +6716,8 @@ bash "$(dirname "$0")/v5-monitor.real.sh" "$@" | sed -E 's/ \\[severity=(warning
     'openclaude-v5-daily.service',
     'openclaude-v5-daily.timer',
     'openclaude-v5-alert-fail@.service',
-  ]) await writeFile(path.join(systemdDir, unit), `old:${unit}\n`)
+  ])
+    await writeFile(path.join(systemdDir, unit), `old:${unit}\n`)
 
   const commands: Record<string, string> = {
     'systemd-analyze': '#!/bin/sh\nexit 0\n',
@@ -5874,12 +6786,15 @@ case "$1" in images) echo test/runtime:v5 ;; ps) echo 'openclaude/openclaude-run
     const failedUnit = options.failDailyUnitBackup
       ? 'openclaude-v5-daily.service'
       : 'openclaude-v5-monitor.service'
-    await writeFile(path.join(bin, 'cp'), `#!/bin/sh
+    await writeFile(
+      path.join(bin, 'cp'),
+      `#!/bin/sh
 case "$*" in
   *${systemdDir}/${failedUnit}*${backupRoot}/.monitor-backup.*) exit 1 ;;
   *) exec /bin/cp "$@" ;;
 esac
-`)
+`,
+    )
     await chmod(path.join(bin, 'cp'), 0o755)
   }
   const result = run(monitorHostInstaller, [stage, hostRoot, bundleSha, stateFile], {
@@ -5939,7 +6854,8 @@ describe('v5 host monitor independent atomic installer', () => {
       'ExecStart=/usr/bin/flock --shared --nonblock --conflict-exit-code 0 /run/openclaude-v5/production-mutation.lock /usr/bin/bash /opt/openclaude/v5-monitor/current/v5-monitor.sh',
     )
 
-    const dir = await mkdtemp(path.join(tmpdir(), 'v5-monitor-mutation-lock-')); dirs.push(dir)
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-monitor-mutation-lock-'))
+    dirs.push(dir)
     const lock = path.join(dir, 'production-mutation.lock')
     const holderReady = path.join(dir, 'holder-ready')
     const holderRelease = path.join(dir, 'holder-release')
@@ -5948,32 +6864,56 @@ describe('v5 host monitor independent atomic installer', () => {
     await writeFile(payload, `#!/bin/bash\ntouch '${payloadRan}'\n`)
 
     const holder = spawn('/usr/bin/flock', [
-      '--exclusive', lock, '/usr/bin/bash', '-c',
+      '--exclusive',
+      lock,
+      '/usr/bin/bash',
+      '-c',
       `touch '${holderReady}'; while [[ ! -e '${holderRelease}' ]]; do sleep 0.02; done`,
     ])
     try {
       assert.equal(
         await waitUntilManualLease(
-          () => readFile(holderReady).then(() => true).catch(() => false),
+          () =>
+            readFile(holderReady)
+              .then(() => true)
+              .catch(() => false),
           5_000,
         ),
         true,
         'exclusive mutation lock holder did not start',
       )
       const skipped = spawnSync('/usr/bin/flock', [
-        '--shared', '--nonblock', '--conflict-exit-code', '0', lock,
-        '/usr/bin/bash', payload,
+        '--shared',
+        '--nonblock',
+        '--conflict-exit-code',
+        '0',
+        lock,
+        '/usr/bin/bash',
+        payload,
       ])
       assert.equal(skipped.status, 0, skipped.stderr?.toString())
-      await assert.rejects(readFile(payloadRan), /ENOENT/, 'conflicting monitor payload must not run')
+      await assert.rejects(
+        readFile(payloadRan),
+        /ENOENT/,
+        'conflicting monitor payload must not run',
+      )
     } finally {
       await writeFile(holderRelease, '')
-      assert.equal(await waitForChildExit(holder, 5_000), true, 'exclusive lock holder did not exit')
+      assert.equal(
+        await waitForChildExit(holder, 5_000),
+        true,
+        'exclusive lock holder did not exit',
+      )
     }
 
     const ran = spawnSync('/usr/bin/flock', [
-      '--shared', '--nonblock', '--conflict-exit-code', '0', lock,
-      '/usr/bin/bash', payload,
+      '--shared',
+      '--nonblock',
+      '--conflict-exit-code',
+      '0',
+      lock,
+      '/usr/bin/bash',
+      payload,
     ])
     assert.equal(ran.status, 0, ran.stderr?.toString())
     assert.equal(await readFile(payloadRan, 'utf8'), '')
@@ -5997,19 +6937,37 @@ describe('v5 host monitor independent atomic installer', () => {
   test('installs a versioned bundle, migrates pool exactly, and restores the active timer', async () => {
     const fixture = await monitorHostInstallFixture()
     assert.equal(fixture.result.status, 0, fixture.result.stderr || fixture.result.stdout)
-    assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), `releases/monitor-${fixture.bundleSha}`)
+    assert.equal(
+      await readlink(path.join(fixture.hostRoot, 'current')),
+      `releases/monitor-${fixture.bundleSha}`,
+    )
     assert.equal(JSON.parse(await readFile(fixture.stateFile, 'utf8')).checks.pool.status, 'ok')
-    assert.match(await readFile(path.join(fixture.systemdDir, 'openclaude-v5-monitor.service'), 'utf8'), /\/opt\/openclaude\/v5-monitor\/current/)
+    assert.match(
+      await readFile(path.join(fixture.systemdDir, 'openclaude-v5-monitor.service'), 'utf8'),
+      /\/opt\/openclaude\/v5-monitor\/current/,
+    )
     assert.equal(
       await readFile(path.join(fixture.systemdDir, 'openclaude-v5-daily.service'), 'utf8'),
       await readFile(path.join(root, 'deploy/v5/openclaude-v5-daily.service'), 'utf8'),
     )
     await readFile(path.join(fixture.hostRoot, 'current', 'v5-daily-check.sh'), 'utf8')
     const actions = await readFile(fixture.actions, 'utf8')
-    assert.ok(actions.indexOf('stop openclaude-v5-monitor.timer') < actions.indexOf('start openclaude-v5-monitor.service'))
-    assert.ok(actions.indexOf('stop openclaude-v5-daily.timer') < actions.indexOf('start openclaude-v5-monitor.service'))
-    assert.ok(actions.indexOf('start openclaude-v5-monitor.service') < actions.lastIndexOf('start openclaude-v5-monitor.timer'))
-    assert.ok(actions.indexOf('start openclaude-v5-monitor.service') < actions.lastIndexOf('start openclaude-v5-daily.timer'))
+    assert.ok(
+      actions.indexOf('stop openclaude-v5-monitor.timer') <
+        actions.indexOf('start openclaude-v5-monitor.service'),
+    )
+    assert.ok(
+      actions.indexOf('stop openclaude-v5-daily.timer') <
+        actions.indexOf('start openclaude-v5-monitor.service'),
+    )
+    assert.ok(
+      actions.indexOf('start openclaude-v5-monitor.service') <
+        actions.lastIndexOf('start openclaude-v5-monitor.timer'),
+    )
+    assert.ok(
+      actions.indexOf('start openclaude-v5-monitor.service') <
+        actions.lastIndexOf('start openclaude-v5-daily.timer'),
+    )
     assert.doesNotMatch(actions, /(?:start|stop) openclaude-v5-daily\.service/)
     assert.match(await readFile(fixture.monitorLog, 'utf8'), /INSTALL-OK host monitor/)
   })
@@ -6020,7 +6978,10 @@ describe('v5 host monitor independent atomic installer', () => {
       initialState: { checks: {} },
     })
     assert.equal(fixture.result.status, 0, fixture.result.stderr || fixture.result.stdout)
-    assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), `releases/monitor-${fixture.bundleSha}`)
+    assert.equal(
+      await readlink(path.join(fixture.hostRoot, 'current')),
+      `releases/monitor-${fixture.bundleSha}`,
+    )
     const state = JSON.parse(await readFile(fixture.stateFile, 'utf8'))
     assert.deepEqual(state.checks.failed_units, {
       status: 'bad',
@@ -6040,7 +7001,10 @@ describe('v5 host monitor independent atomic installer', () => {
       },
     })
     assert.equal(fixture.result.status, 0, fixture.result.stderr || fixture.result.stdout)
-    assert.equal(await readlink(path.join(fixture.hostRoot, 'current')), `releases/monitor-${fixture.bundleSha}`)
+    assert.equal(
+      await readlink(path.join(fixture.hostRoot, 'current')),
+      `releases/monitor-${fixture.bundleSha}`,
+    )
     assert.deepEqual(JSON.parse(await readFile(fixture.stateFile, 'utf8')).checks.failed_units, {
       status: 'bad',
       since: 17,
@@ -6110,8 +7074,14 @@ describe('v5 host monitor independent atomic installer', () => {
     )
     assert.match(await readFile(fixture.actions, 'utf8'), /start openclaude-v5-monitor.timer/)
     assert.match(await readFile(fixture.actions, 'utf8'), /start openclaude-v5-daily.timer/)
-    assert.doesNotMatch(await readFile(fixture.actions, 'utf8'), /stop openclaude-v5-daily\.service/)
-    assert.doesNotMatch(await readFile(fixture.actions, 'utf8'), /start openclaude-v5-monitor.timer[\s\S]*stop openclaude-v5-alert-fail@/)
+    assert.doesNotMatch(
+      await readFile(fixture.actions, 'utf8'),
+      /stop openclaude-v5-daily\.service/,
+    )
+    assert.doesNotMatch(
+      await readFile(fixture.actions, 'utf8'),
+      /start openclaude-v5-monitor.timer[\s\S]*stop openclaude-v5-alert-fail@/,
+    )
     await assert.rejects(readFile(fixture.alertActive, 'utf8'), /ENOENT/)
     assert.match(await readFile(fixture.monitorLog, 'utf8'), /INSTALL-ROLLBACK host monitor/)
   })
@@ -6132,7 +7102,10 @@ describe('v5 host monitor independent atomic installer', () => {
       const actions = await readFile(fixture.actions, 'utf8')
       assert.match(actions, /start openclaude-v5-monitor.timer/)
       assert.match(actions, /start openclaude-v5-daily.timer/)
-      assert.match(actions.trim().split('\n').at(-1) ?? '', /is-active --quiet openclaude-v5-daily.timer/)
+      assert.match(
+        actions.trim().split('\n').at(-1) ?? '',
+        /is-active --quiet openclaude-v5-daily.timer/,
+      )
       assert.doesNotMatch(actions, /stop openclaude-v5-daily\.service/)
     })
   }
@@ -6175,7 +7148,8 @@ describe('v5 monitor host structural probes (2026-07-26 audit)', () => {
     const sevEnd = source.indexOf('\n}', sevStart)
     const sev = source.slice(sevStart, sevEnd)
     const criticalLine = sev.split('\n').find((l) => l.includes('echo critical')) ?? ''
-    const warningLine = sev.split('\n').find((l) => l.includes('echo warning') && l.includes('|')) ?? ''
+    const warningLine =
+      sev.split('\n').find((l) => l.includes('echo warning') && l.includes('|')) ?? ''
     // backup_fresh = critical:异地容灾退役后本地备份是唯一数据保护,停摆 = 零保护
     assert.match(criticalLine, /backup_fresh/, 'backup_fresh 必须是 critical')
     assert.match(warningLine, /failed_units/, 'failed_units 必须显式分级(否则只靠默认分支)')
@@ -6274,7 +7248,10 @@ describe('v5 monitor terminal turn classification', () => {
     })
     assert.equal(result.status, 0, result.stderr)
     assert.match(result.stdout, /turn_failures\s+bad\s+turn 错误率 20%\(2\/10,用户取消 3/)
-    assert.match(result.stdout, /friction_pipeline\s+ok\s+遥测管道:服务端失败 2 \/ friction failed turn_error 2/)
+    assert.match(
+      result.stdout,
+      /friction_pipeline\s+ok\s+遥测管道:服务端失败 2 \/ friction failed turn_error 2/,
+    )
     const calls = await readFile(result.psqlCalls, 'utf8')
     assert.equal((calls.match(/request_finalize_journal/g) ?? []).length, 1)
   })
@@ -6286,7 +7263,10 @@ describe('v5 monitor terminal turn classification', () => {
       turnWindowStats: '9|1|2|0',
     })
     assert.equal(result.status, 0, result.stderr)
-    assert.match(result.stdout, /turn_failures\s+ok\s+turn 失败率:非取消终态 9 轮\(<10,样本不足不判\),用户取消 2/)
+    assert.match(
+      result.stdout,
+      /turn_failures\s+ok\s+turn 失败率:非取消终态 9 轮\(<10,样本不足不判\),用户取消 2/,
+    )
     assert.match(result.stdout, /friction_pipeline\s+bad\s+遥测管道疑似断裂:窗内服务端失败 1 次/)
   })
 
@@ -6297,8 +7277,14 @@ describe('v5 monitor terminal turn classification', () => {
       turnWindowStats: '0|0|4|0',
     })
     assert.equal(result.status, 0, result.stderr)
-    assert.match(result.stdout, /turn_failures\s+ok\s+turn 失败率:非取消终态 0 轮\(<10,样本不足不判\),用户取消 4/)
-    assert.match(result.stdout, /friction_pipeline\s+ok\s+遥测管道:服务端失败 0 \/ friction failed turn_error 0/)
+    assert.match(
+      result.stdout,
+      /turn_failures\s+ok\s+turn 失败率:非取消终态 0 轮\(<10,样本不足不判\),用户取消 4/,
+    )
+    assert.match(
+      result.stdout,
+      /friction_pipeline\s+ok\s+遥测管道:服务端失败 0 \/ friction failed turn_error 0/,
+    )
   })
 
   test('caches a failed authority query without treating the second consumer as healthy', async () => {
@@ -6348,7 +7334,8 @@ describe('v5 monitor planned-maintenance scope', () => {
     assert.match(source, /flock -n -s 7/)
     assert.match(source, /MARKER_JSON="\$\(cat "\$MAINTENANCE_FILE"/)
     assert.match(source, /<<<"\$MARKER_JSON"/)
-    const markerSection = source.match(/MARKER_PRESENT=0([\s\S]*?)maintenance_suppresses\(\)/)?.[1] ?? ''
+    const markerSection =
+      source.match(/MARKER_PRESENT=0([\s\S]*?)maintenance_suppresses\(\)/)?.[1] ?? ''
     assert.equal((markerSection.match(/cat "\$MAINTENANCE_FILE"/g) ?? []).length, 1)
   })
 
@@ -6485,7 +7472,10 @@ describe('v5 monitor deploy_state serving lanes', () => {
       healthyHttpPorts: [18790],
     })
     assert.equal(result.status, 0, result.stderr)
-    assert.match(result.stdout, /svc_candidate_v5\s+ok\s+candidate not-serving\(phase=canary step=5/)
+    assert.match(
+      result.stdout,
+      /svc_candidate_v5\s+ok\s+candidate not-serving\(phase=canary step=5/,
+    )
     assert.doesNotMatch(result.stdout, /serving candidate=B phase=canary step=5/)
   })
 
@@ -6530,7 +7520,10 @@ describe('v5 monitor deploy_state serving lanes', () => {
     })
     assert.equal(result.status, 0, result.stderr)
     assert.match(result.stdout, /EVENT ❌ \*\*deploy_state\*\* deploy_state 不可裁决:psql 失败/)
-    assert.match(result.stdout, /svc_candidate_v5\s+ok\s+candidate not-serving\(state unavailable\)/)
+    assert.match(
+      result.stdout,
+      /svc_candidate_v5\s+ok\s+candidate not-serving\(state unavailable\)/,
+    )
     assert.doesNotMatch(result.stdout, /openclaude-v5 状态=/)
     assert.match(result.stdout, /write_alert_condition\('ops\.monitor:deploy_state','probe',true/)
     assert.doesNotMatch(result.stdout, /write_alert_condition\('ops\.monitor:(svc_v5|http_v5)'/)
@@ -6551,7 +7544,10 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     const leased = holder.indexOf('echo LEASED')
     const loop = holder.indexOf('while :; do', leased)
     assert.ok(parentCapture >= 0, 'remote holder 未快照 sshd session parent')
-    assert.ok(signalTrap > parentCapture && signalTrap < leased, '退出 trap 必须在 LEASED 握手前安装')
+    assert.ok(
+      signalTrap > parentCapture && signalTrap < leased,
+      '退出 trap 必须在 LEASED 握手前安装',
+    )
     assert.ok(
       firstKernelParent > signalTrap && firstKernelParent < leased,
       'LEASED 前缺 /proc 实时 PPid 身份校验',
@@ -6565,8 +7561,14 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     assert.doesNotMatch(holder, /exec sleep infinity/, '禁止 PID 1 收养的无限 sleep 继续持锁')
     // C1 硬 TTL + fencing 证据:meta 在 LEASED 前落盘,TTL 在 watch 循环里到点自 exit,
     // 每条退出路径都清自己的 meta。这几条一起消除"SIGKILL 部署→残活 ssh 焊死远端 lease 永不过期"。
-    assert.ok(holder.indexOf('write_meta\necho LEASED') >= 0, 'fencing meta 必须在 LEASED 握手前写(write_meta 调用)')
-    assert.ok(holder.indexOf('lease_ttl=') > parentCapture && holder.indexOf('lease_ttl=') < leased, 'remote holder 缺硬 TTL 变量 lease_ttl')
+    assert.ok(
+      holder.indexOf('write_meta\necho LEASED') >= 0,
+      'fencing meta 必须在 LEASED 握手前写(write_meta 调用)',
+    )
+    assert.ok(
+      holder.indexOf('lease_ttl=') > parentCapture && holder.indexOf('lease_ttl=') < leased,
+      'remote holder 缺硬 TTL 变量 lease_ttl',
+    )
     assert.ok(
       holder.indexOf('-ge \\"\\$lease_ttl\\"', loop) > loop,
       'parent-watch 循环缺到点自释放的硬 TTL 检查',
@@ -6586,23 +7588,50 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     const firstKernelParent = holder.indexOf('/proc/\\$\\$/status')
     const leased = holder.indexOf('echo \\"LEASED \\$nonce\\"')
     const loop = holder.indexOf('while :; do', leased)
-    assert.ok(signalTrap >= 0 && signalTrap < parentCapture, 'manual holder 须在等待 flock 前安装退出 trap')
-    assert.ok(parentCapture > signalTrap && parentCapture < flock, '必须在可能阻塞的 flock 前快照 sshd parent')
-    assert.ok(firstKernelParent > flock && firstKernelParent < leased, '取锁后、LEASED 前须读取内核实时 PPid')
-    assert.ok(holder.indexOf('[ \\"\\$current_parent\\" = \\"\\$lease_parent\\" ]', firstKernelParent) < leased,
-      'LEASED 前未校验取锁后的 PPid 仍是原 sshd parent')
-    assert.ok(holder.indexOf('kill -0 \\"\\$lease_parent\\"', firstKernelParent) < leased, 'LEASED 前未校验 parent 活性')
-    assert.ok(holder.indexOf('mv -f \\"\\$proof_tmp\\" \\"\\$proof\\"') < leased,
-      'LEASED 前须原子发布 exact nonce proof')
+    assert.ok(
+      signalTrap >= 0 && signalTrap < parentCapture,
+      'manual holder 须在等待 flock 前安装退出 trap',
+    )
+    assert.ok(
+      parentCapture > signalTrap && parentCapture < flock,
+      '必须在可能阻塞的 flock 前快照 sshd parent',
+    )
+    assert.ok(
+      firstKernelParent > flock && firstKernelParent < leased,
+      '取锁后、LEASED 前须读取内核实时 PPid',
+    )
+    assert.ok(
+      holder.indexOf('[ \\"\\$current_parent\\" = \\"\\$lease_parent\\" ]', firstKernelParent) <
+        leased,
+      'LEASED 前未校验取锁后的 PPid 仍是原 sshd parent',
+    )
+    assert.ok(
+      holder.indexOf('kill -0 \\"\\$lease_parent\\"', firstKernelParent) < leased,
+      'LEASED 前未校验 parent 活性',
+    )
+    assert.ok(
+      holder.indexOf('mv -f \\"\\$proof_tmp\\" \\"\\$proof\\"') < leased,
+      'LEASED 前须原子发布 exact nonce proof',
+    )
     assert.ok(loop > leased, 'manual holder 缺 parent-watch 循环')
     assert.ok(holder.indexOf('/proc/\\$\\$/status', loop) > loop, '循环未重读实时 PPid')
-    assert.ok(holder.indexOf('kill -0 \\"\\$lease_parent\\"', loop) > loop, '循环未复核 parent 活性')
+    assert.ok(
+      holder.indexOf('kill -0 \\"\\$lease_parent\\"', loop) > loop,
+      '循环未复核 parent 活性',
+    )
     assert.ok(
       holder.indexOf('lease_ttl=') > firstKernelParent && holder.indexOf('lease_ttl=') < leased,
       'manual holder 须在 LEASED 前固定可配置 hard TTL',
     )
-    assert.ok(holder.indexOf('now - lease_start', loop) > loop, 'manual holder 循环未执行 hard TTL 到点释放')
-    assert.doesNotMatch(holder, /exec sleep infinity/, 'manual holder 禁止 orphanable infinite sleep')
+    assert.ok(
+      holder.indexOf('now - lease_start', loop) > loop,
+      'manual holder 循环未执行 hard TTL 到点释放',
+    )
+    assert.doesNotMatch(
+      holder,
+      /exec sleep infinity/,
+      'manual holder 禁止 orphanable infinite sleep',
+    )
     assert.match(source, /ServerAliveInterval=2/, '后台 ssh 必须设置 transport keepalive')
     assert.match(source, /ServerAliveCountMax=2/, '后台 ssh 必须限制连续 keepalive 丢失次数')
     assert.match(source, /"\$KL_HOST" "\$remote_holder" <\/dev\/null/, '后台 ssh 必须隔离 stdin')
@@ -6611,7 +7640,10 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     assert.ok(localTtlSpawn >= 0 && localTtlSpawn < sshSpawn, '本地 TTL 必须早于 ssh/远端 TTL 启动')
     const waitRace = source.indexOf('if wait -n -p completed')
     assert.ok(waitRace >= 0, 'manual supervisor 缺命令/lease/watchdog 首退竞速')
-    assert.ok(source.indexOf('"$SUP_LOCAL_TTL_PID"', waitRace) > waitRace, '本地安全 TTL 未加入首退竞速')
+    assert.ok(
+      source.indexOf('"$SUP_LOCAL_TTL_PID"', waitRace) > waitRace,
+      '本地安全 TTL 未加入首退竞速',
+    )
   })
 
   test('manual mutation wrapper normal cleanup releases a reparented remote holder', async () => {
@@ -6619,20 +7651,37 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     const child = spawn('bash', [fx.wrapper, fx.command], { env: fx.env, stdio: 'ignore' })
     try {
       assert.equal(
-        await waitUntilManualLease(() => readFile(fx.commandStarted).then(() => true).catch(() => false), 5_000),
+        await waitUntilManualLease(
+          () =>
+            readFile(fx.commandStarted)
+              .then(() => true)
+              .catch(() => false),
+          5_000,
+        ),
         true,
         'wrapped command never started after LEASED',
       )
-      assert.notEqual(spawnSync('flock', ['-n', fx.lock, 'true']).status, 0, 'manual holder never held flock')
+      assert.notEqual(
+        spawnSync('flock', ['-n', fx.lock, 'true']).status,
+        0,
+        'manual holder never held flock',
+      )
       assert.match(
         await readFile(`${fx.lock}.manual-holder`, 'utf8'),
         /^[0-9a-f]{32}\n$/,
         'manual holder must publish an exact nonce proof only after acquiring flock',
       )
       await writeFile(fx.commandRelease, '')
-      assert.equal(await waitForChildExit(child, 5_000), true, 'manual wrapper did not exit after command')
       assert.equal(
-        await waitUntilManualLease(() => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0, 3_000),
+        await waitForChildExit(child, 5_000),
+        true,
+        'manual wrapper did not exit after command',
+      )
+      assert.equal(
+        await waitUntilManualLease(
+          () => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0,
+          3_000,
+        ),
         true,
         'normal cleanup left an orphaned manual holder',
       )
@@ -6647,24 +7696,45 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     const fx = await manualLeaseFixture()
     const blocker = spawn(
       'flock',
-      [fx.lock, 'bash', '-c', ': >"$BLOCKER_STARTED"; while [ ! -e "$BLOCKER_RELEASE" ]; do sleep 0.05; done'],
+      [
+        fx.lock,
+        'bash',
+        '-c',
+        ': >"$BLOCKER_STARTED"; while [ ! -e "$BLOCKER_RELEASE" ]; do sleep 0.05; done',
+      ],
       { env: fx.env, stdio: 'ignore' },
     )
     let child: ReturnType<typeof spawn> | undefined
     try {
       assert.equal(
-        await waitUntilManualLease(() => readFile(fx.blockerStarted).then(() => true).catch(() => false), 5_000),
+        await waitUntilManualLease(
+          () =>
+            readFile(fx.blockerStarted)
+              .then(() => true)
+              .catch(() => false),
+          5_000,
+        ),
         true,
         'test blocker never acquired the mutation flock',
       )
       child = spawn('bash', [fx.wrapper, fx.command], { env: fx.env, stdio: 'ignore' })
       assert.equal(
-        await waitUntilManualLease(() => readFile(fx.remotePids, 'utf8').then((raw) => raw.trim().length > 0).catch(() => false), 5_000),
+        await waitUntilManualLease(
+          () =>
+            readFile(fx.remotePids, 'utf8')
+              .then((raw) => raw.trim().length > 0)
+              .catch(() => false),
+          5_000,
+        ),
         true,
         'remote holder never started waiting for flock',
       )
       child.kill('SIGTERM')
-      assert.equal(await waitForChildExit(child, 5_000), true, 'interrupted manual wrapper did not exit')
+      assert.equal(
+        await waitForChildExit(child, 5_000),
+        true,
+        'interrupted manual wrapper did not exit',
+      )
       const remotePid = Number((await readFile(fx.remotePids, 'utf8')).trim().split(/\s+/).at(-1))
       const sshPid = Number((await readFile(fx.sshPids, 'utf8')).trim().split(/\s+/).at(-1))
       assert.equal(
@@ -6677,9 +7747,16 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
         'fake remote holder was not reparented after ssh disconnect',
       )
       await writeFile(fx.blockerRelease, '')
-      assert.equal(await waitForChildExit(blocker, 5_000), true, 'test blocker did not release flock')
       assert.equal(
-        await waitUntilManualLease(() => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0, 3_000),
+        await waitForChildExit(blocker, 5_000),
+        true,
+        'test blocker did not release flock',
+      )
+      assert.equal(
+        await waitUntilManualLease(
+          () => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0,
+          3_000,
+        ),
         true,
         'reparented pre-LEASED holder leaked flock after the blocker released it',
       )
@@ -6697,15 +7774,28 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     const child = spawn('bash', [fx.wrapper, command], { env: fx.env, stdio: 'ignore' })
     try {
       assert.equal(
-        await waitUntilManualLease(() => readFile(fx.commandStarted).then(() => true).catch(() => false), 5_000),
+        await waitUntilManualLease(
+          () =>
+            readFile(fx.commandStarted)
+              .then(() => true)
+              .catch(() => false),
+          5_000,
+        ),
         true,
         'stubborn command never started',
       )
-      assert.notEqual(spawnSync('flock', ['-n', fx.lock, 'true']).status, 0, 'manual lease was not held')
+      assert.notEqual(
+        spawnSync('flock', ['-n', fx.lock, 'true']).status,
+        0,
+        'manual lease was not held',
+      )
       assert.equal(child.kill('SIGKILL'), true, 'failed to SIGKILL outer wrapper')
       assert.equal(await waitForChildExit(child, 3_000), true, 'outer wrapper did not die')
       assert.equal(
-        await waitUntilManualLease(() => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0, 6_000),
+        await waitUntilManualLease(
+          () => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0,
+          6_000,
+        ),
         true,
         'independent supervisor did not release the mutation lease after wrapper SIGKILL',
       )
@@ -6724,13 +7814,16 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     const fx = await manualLeaseFixture()
     const heartbeat = path.join(fx.dir, 'supervisor-stop-heartbeat')
     const command = path.join(fx.dir, 'supervisor-stop-command.sh')
-    await writeFile(command, [
-      '#!/bin/bash',
-      "trap '' TERM",
-      'printf "%s\\n" "$BASHPID" >>"$COMMAND_PIDS"',
-      ': >"$COMMAND_STARTED"',
-      'while :; do printf "%s\\n" "$RANDOM" >"$HEARTBEAT"; sleep 0.05; done',
-    ].join('\n') + '\n')
+    await writeFile(
+      command,
+      [
+        '#!/bin/bash',
+        "trap '' TERM",
+        'printf "%s\\n" "$BASHPID" >>"$COMMAND_PIDS"',
+        ': >"$COMMAND_STARTED"',
+        'while :; do printf "%s\\n" "$RANDOM" >"$HEARTBEAT"; sleep 0.05; done',
+      ].join('\n') + '\n',
+    )
     await chmod(command, 0o755)
     const child = spawn('bash', [fx.wrapper, command], {
       env: { ...fx.env, HEARTBEAT: heartbeat, OC_V5_MUTATION_LEASE_TTL_SECONDS: '30' },
@@ -6739,7 +7832,13 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     let supervisorPid: number | undefined
     try {
       assert.equal(
-        await waitUntilManualLease(() => readFile(fx.commandStarted).then(() => true).catch(() => false), 5_000),
+        await waitUntilManualLease(
+          () =>
+            readFile(fx.commandStarted)
+              .then(() => true)
+              .catch(() => false),
+          5_000,
+        ),
         true,
         'heartbeat command never started',
       )
@@ -6758,21 +7857,43 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
         true,
         'independent watchdog left command mutating after supervisor-group STOP',
       )
-      assert.ok(Date.now() - stoppedAt < 3_000, 'command survived until the 30s TTL instead of immediate STOP fencing')
+      assert.ok(
+        Date.now() - stoppedAt < 3_000,
+        'command survived until the 30s TTL instead of immediate STOP fencing',
+      )
       const frozen = await readFile(heartbeat, 'utf8')
       await new Promise((resolve) => setTimeout(resolve, 250))
-      assert.equal(await readFile(heartbeat, 'utf8'), frozen, 'heartbeat advanced after supervisor-group STOP fencing')
-      assert.equal(await waitForChildExit(child, 5_000), true, 'outer wrapper required SIGCONT to finish')
+      assert.equal(
+        await readFile(heartbeat, 'utf8'),
+        frozen,
+        'heartbeat advanced after supervisor-group STOP fencing',
+      )
+      assert.equal(
+        await waitForChildExit(child, 5_000),
+        true,
+        'outer wrapper required SIGCONT to finish',
+      )
       assert.notEqual(child.exitCode, 0, 'supervisor STOP must fail closed')
       assert.equal(
-        await waitUntilManualLease(() => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0, 5_000),
+        await waitUntilManualLease(
+          () => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0,
+          5_000,
+        ),
         true,
         'supervisor STOP left the production-mutation flock held',
       )
     } finally {
       if (supervisorPid) {
-        try { process.kill(-supervisorPid, 'SIGCONT') } catch { /* already gone */ }
-        try { process.kill(-supervisorPid, 'SIGKILL') } catch { /* already gone */ }
+        try {
+          process.kill(-supervisorPid, 'SIGCONT')
+        } catch {
+          /* already gone */
+        }
+        try {
+          process.kill(-supervisorPid, 'SIGKILL')
+        } catch {
+          /* already gone */
+        }
       }
       child.kill('SIGKILL')
       await killManualLeaseFixtureProcesses(fx.commandPids, fx.sshPids, fx.remotePids)
@@ -6785,22 +7906,39 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     const child = spawn('bash', [fx.wrapper, command], { env: fx.env, stdio: 'ignore' })
     try {
       assert.equal(
-        await waitUntilManualLease(() => readFile(fx.commandStarted).then(() => true).catch(() => false), 5_000),
+        await waitUntilManualLease(
+          () =>
+            readFile(fx.commandStarted)
+              .then(() => true)
+              .catch(() => false),
+          5_000,
+        ),
         true,
         'stubborn command never started',
       )
       const sshPid = Number((await readFile(fx.sshPids, 'utf8')).trim().split(/\s+/).at(-1))
       assert.equal(Number.isSafeInteger(sshPid) && sshPid > 1, true, 'missing fake ssh pid')
       process.kill(sshPid, 'SIGKILL')
-      assert.equal(await waitForChildExit(child, 8_000), true, 'wrapper did not fail after lease ssh loss')
-      assert.equal(child.exitCode, 86, `lease loss must use the dedicated exit code; signal=${child.signalCode}`)
+      assert.equal(
+        await waitForChildExit(child, 8_000),
+        true,
+        'wrapper did not fail after lease ssh loss',
+      )
+      assert.equal(
+        child.exitCode,
+        86,
+        `lease loss must use the dedicated exit code; signal=${child.signalCode}`,
+      )
       assert.equal(
         await waitUntilManualLease(() => allRecordedProcessesExited(fx.commandPids), 6_000),
         true,
         'lease loss left the command or its TERM-ignoring grandchild alive',
       )
       assert.equal(
-        await waitUntilManualLease(() => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0, 6_000),
+        await waitUntilManualLease(
+          () => spawnSync('flock', ['-n', fx.lock, 'true']).status === 0,
+          6_000,
+        ),
         true,
         'lease ssh loss left the remote flock held',
       )
@@ -6819,12 +7957,26 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     })
     try {
       assert.equal(
-        await waitUntilManualLease(() => readFile(ttlFx.commandStarted).then(() => true).catch(() => false), 5_000),
+        await waitUntilManualLease(
+          () =>
+            readFile(ttlFx.commandStarted)
+              .then(() => true)
+              .catch(() => false),
+          5_000,
+        ),
         true,
         'TTL command never started',
       )
-      assert.equal(await waitForChildExit(ttlChild, 8_000), true, 'hard TTL did not stop the wrapper')
-      assert.equal(ttlChild.exitCode, 86, `hard TTL must surface as lease loss; signal=${ttlChild.signalCode}`)
+      assert.equal(
+        await waitForChildExit(ttlChild, 8_000),
+        true,
+        'hard TTL did not stop the wrapper',
+      )
+      assert.equal(
+        ttlChild.exitCode,
+        86,
+        `hard TTL must surface as lease loss; signal=${ttlChild.signalCode}`,
+      )
       assert.equal(
         await waitUntilManualLease(() => allRecordedProcessesExited(ttlFx.commandPids), 6_000),
         true,
@@ -6845,9 +7997,16 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
       timeout: 10_000,
     })
     try {
-      assert.equal(result.status, 23, `normal command status was not preserved; signal=${result.signal}`)
       assert.equal(
-        await waitUntilManualLease(() => spawnSync('flock', ['-n', rcFx.lock, 'true']).status === 0, 4_000),
+        result.status,
+        23,
+        `normal command status was not preserved; signal=${result.signal}`,
+      )
+      assert.equal(
+        await waitUntilManualLease(
+          () => spawnSync('flock', ['-n', rcFx.lock, 'true']).status === 0,
+          4_000,
+        ),
         true,
         'normal nonzero command exit left the lease held',
       )
@@ -6869,7 +8028,13 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
     })
     try {
       assert.equal(
-        await waitUntilManualLease(() => readFile(fx.commandStarted).then(() => true).catch(() => false), 5_000),
+        await waitUntilManualLease(
+          () =>
+            readFile(fx.commandStarted)
+              .then(() => true)
+              .catch(() => false),
+          5_000,
+        ),
         true,
         'delayed-close command never started',
       )
@@ -6886,8 +8051,16 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
         true,
         'remote hard TTL did not release the lease after local fencing',
       )
-      assert.equal(await waitForChildExit(child, 4_000), true, 'wrapper did not finish local-TTL cleanup')
-      assert.equal(child.exitCode, 86, `local TTL must surface as lease loss; signal=${child.signalCode}`)
+      assert.equal(
+        await waitForChildExit(child, 4_000),
+        true,
+        'wrapper did not finish local-TTL cleanup',
+      )
+      assert.equal(
+        child.exitCode,
+        86,
+        `local TTL must surface as lease loss; signal=${child.signalCode}`,
+      )
     } finally {
       child.kill('SIGKILL')
       await killManualLeaseFixtureProcesses(fx.commandPids, fx.sshPids, fx.remotePids)
@@ -6907,15 +8080,27 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
       stdio: 'ignore',
     })
     try {
-      assert.equal(await waitForChildExit(child, 6_000), true, 'stale-LEASED wrapper did not fail closed')
-      assert.equal(child.exitCode, 86, `stale LEASED must surface as lease loss; signal=${child.signalCode}`)
       assert.equal(
-        await readFile(fx.commandStarted).then(() => true).catch(() => false),
+        await waitForChildExit(child, 6_000),
+        true,
+        'stale-LEASED wrapper did not fail closed',
+      )
+      assert.equal(
+        child.exitCode,
+        86,
+        `stale LEASED must surface as lease loss; signal=${child.signalCode}`,
+      )
+      assert.equal(
+        await readFile(fx.commandStarted)
+          .then(() => true)
+          .catch(() => false),
         false,
         'wrapped command started from a stale LEASED receipt after remote flock release',
       )
       assert.equal(
-        await readFile(fx.commandPids, 'utf8').then((raw) => raw.trim().length > 0).catch(() => false),
+        await readFile(fx.commandPids, 'utf8')
+          .then((raw) => raw.trim().length > 0)
+          .catch(() => false),
         false,
         'stale LEASED spawned the wrapped command process group',
       )
@@ -6946,7 +8131,11 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
       /MODE" != "reclaim-mutation-lease" && "\$MODE" != "reclaim-mutation-inflight" \]\]; then\n {2}# reclaim 是"陈旧锁被同一残留焊死"/,
       'reclaim 必须跳过本地 deploy lock 获取',
     )
-    assert.match(source, /reclaim-mutation-lease\|reclaim-mutation-inflight\) ;;\n {2}# knowledge-planet-verify/, 'reclaim 必须跳过全局 mutation lease 获取')
+    assert.match(
+      source,
+      /reclaim-mutation-lease\|reclaim-mutation-inflight\) ;;\n {2}# knowledge-planet-verify/,
+      'reclaim 必须跳过全局 mutation lease 获取',
+    )
     assert.match(
       source,
       /"\$MODE" != "reclaim-mutation-lease" && "\$MODE" != "reclaim-mutation-inflight" && "\$MODE" != "hide-luna" \]\]; then\n {2}assert_no_deploy_recovery_marker/,
@@ -6958,9 +8147,18 @@ describe('v5 selfheal batch1b lock/lease hardening (F6/F7)', () => {
       /if \[\[ "\$MODE" != "recover" \]\] && ! ssh "\$KL_HOST" "test ! -e '\$DEPLOY_RECOVERY_MARKER'"/,
     )
     const recover = source.match(/^recover\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? ''
-    assert.match(recover, /stable\)[\s\S]*smoke "\$ACTIVE_PORT"[\s\S]*clear_deploy_recovery_marker_after_stable_recover/)
-    const clearRecovery = source.match(/^clear_deploy_recovery_marker_after_stable_recover\(\) \{([\s\S]*?)\n\}/m)?.[1] ?? ''
-    assert.match(clearRecovery, /require_mutation_lease_for_compensation "stable-recover-marker-clear"/)
+    assert.match(
+      recover,
+      /stable\)[\s\S]*smoke "\$ACTIVE_PORT"[\s\S]*clear_deploy_recovery_marker_after_stable_recover/,
+    )
+    const clearRecovery =
+      source.match(
+        /^clear_deploy_recovery_marker_after_stable_recover\(\) \{([\s\S]*?)\n\}/m,
+      )?.[1] ?? ''
+    assert.match(
+      clearRecovery,
+      /require_mutation_lease_for_compensation "stable-recover-marker-clear"/,
+    )
     assert.match(clearRecovery, /rm -f --/)
     assert.match(clearRecovery, /os\.fsync\(d\)/)
   })
@@ -7086,7 +8284,10 @@ wait $!
     )
     // 归属证明失败必须 fail-closed(exit 3),而非放行继承。
     const fdinfoExit = branch.indexOf('exit 3', fdinfoProof)
-    assert.ok(fdinfoExit >= 0 && fdinfoExit < relock, 'R2-5:fdinfo 归属证明失败未 fail-closed exit 3')
+    assert.ok(
+      fdinfoExit >= 0 && fdinfoExit < relock,
+      'R2-5:fdinfo 归属证明失败未 fail-closed exit 3',
+    )
   })
 
   test('F7: mutation-lease deactivation covered on compensation + emergency/staged flips', async () => {
@@ -7098,13 +8299,18 @@ wait $!
       const rqEnd = source.indexOf('# ───────────────────────── dangerous offline cutover', rqStart)
       assert.ok(rqStart >= 0 && rqEnd > rqStart, '未找到 compensation lease fence 函数体')
       const rq = source.slice(rqStart, rqEnd)
-      assert.doesNotMatch(rq, /acquire_production_mutation_lease/, '失锁补偿禁止在 generic child 内自动重取 lease')
+      assert.doesNotMatch(
+        rq,
+        /acquire_production_mutation_lease/,
+        '失锁补偿禁止在 generic child 内自动重取 lease',
+      )
       assert.match(rq, /return 86/, '失锁补偿必须返回专用 crash-stop rc=86')
       assert.match(rq, /禁止无 lease 补偿\/回滚/, '失锁补偿必须 fail-closed 并保留恢复现场')
     }
     // deploy 两条补偿路径(validation + plugin seed)各挂一次 fail-closed fence。
     assert.equal(
-      source.match(/require_mutation_lease_for_compensation "deploy-validation-compensation"/g)?.length,
+      source.match(/require_mutation_lease_for_compensation "deploy-validation-compensation"/g)
+        ?.length,
       2,
       'deploy 补偿(validation + plugin seed)未各挂一次 lease fence',
     )
@@ -7113,8 +8319,9 @@ wait $!
     const deployEnd = source.indexOf('\n# ───────────────────────── offline recycle', deployStart)
     const deployBody = source.slice(deployStart, deployEnd)
     assert.ok(
-      deployBody.indexOf('require_mutation_lease_for_compensation "deploy-validation-compensation"') <
-        deployBody.indexOf('knowledge_planet_compensate_deploy'),
+      deployBody.indexOf(
+        'require_mutation_lease_for_compensation "deploy-validation-compensation"',
+      ) < deployBody.indexOf('knowledge_planet_compensate_deploy'),
       'deploy 补偿 lease fence 未先于 compensate',
     )
     // rollback 补偿覆盖(2026-07-17 KP 门摘除后):真正做反向补偿的只剩 hotcfg smoke-failure
@@ -7151,16 +8358,24 @@ wait $!
     const ttlSpawn = source.indexOf('MUTATION_LEASE_TTL_PID=$!')
     const leaseActive = source.indexOf('MUTATION_LEASE_ACTIVE=1', ttlSpawn)
     const sshSpawn = source.indexOf('exec setsid ssh -o ServerAliveInterval=2', ttlSpawn)
-    assert.ok(ttlSpawn >= 0 && leaseActive > ttlSpawn && sshSpawn > leaseActive, 'lease acquisition ACTIVE/TTL/ssh 顺序错误')
+    assert.ok(
+      ttlSpawn >= 0 && leaseActive > ttlSpawn && sshSpawn > leaseActive,
+      'lease acquisition ACTIVE/TTL/ssh 顺序错误',
+    )
     const kpVerifyStart = source.indexOf('\nknowledge_planet_plugin_verify_user() {')
     const kpVerifyEnd = source.indexOf('\nknowledge_planet_plugin_smoke_gate() {', kpVerifyStart)
     const kpVerify = source.slice(kpVerifyStart, kpVerifyEnd)
     const kpAcquire = kpVerify.indexOf('acquire_production_mutation_lease')
-    const kpSupervisedBuild = kpVerify.indexOf('run_mutation_lane_supervised knowledge_planet_build_release_mutation')
+    const kpSupervisedBuild = kpVerify.indexOf(
+      'run_mutation_lane_supervised knowledge_planet_build_release_mutation',
+    )
     const kpRelease = kpVerify.indexOf('release_production_mutation_lease', kpSupervisedBuild)
     const kpScan = kpVerify.indexOf('seed-knowledge-planet-plugin.ts', kpRelease)
     assert.ok(
-      kpAcquire >= 0 && kpSupervisedBuild > kpAcquire && kpRelease > kpSupervisedBuild && kpScan > kpRelease,
+      kpAcquire >= 0 &&
+        kpSupervisedBuild > kpAcquire &&
+        kpRelease > kpSupervisedBuild &&
+        kpScan > kpRelease,
       'Knowledge Planet 仅 build_release 窄窗须走持续 lease supervisor，扫码窗须在 release 后',
     )
     const dispatch = source.slice(source.lastIndexOf('case "$MODE" in'))
@@ -7178,7 +8393,9 @@ wait $!
     const abortStart = source.indexOf('\nabort_continue() {')
     const abortEnd = source.indexOf('\n# ═════════ --recover', abortStart)
     const abortBody = source.slice(abortStart, abortEnd)
-    const abortReacquire = abortBody.indexOf('require_mutation_lease_for_compensation "abort-continue"')
+    const abortReacquire = abortBody.indexOf(
+      'require_mutation_lease_for_compensation "abort-continue"',
+    )
     assert.ok(
       abortReacquire >= 0 && abortReacquire < abortBody.indexOf('caddy_render_reload'),
       'abort_continue 恢复动作前未挂 lease fence',
@@ -7235,9 +8452,15 @@ wait $!
       source.indexOf('\nsmoke_turn_canary_advisory() {'),
       source.indexOf('\n# 2026-07-17 架构纠偏'),
     )
-    assert.match(advisoryFn, /\n  return 0\n\}/, 'advisory 真 turn 必须恒返回 0(非阻断)')
+    assert.match(advisoryFn, /\n {2}return 0\n\}/, 'advisory 真 turn 必须恒返回 0(非阻断)')
     assert.equal(
-      (advisoryFn.split('\n').filter((l) => !/^\s*#/.test(l)).join('\n').match(/return [1-9]/g) ?? []).length,
+      (
+        advisoryFn
+          .split('\n')
+          .filter((l) => !/^\s*#/.test(l))
+          .join('\n')
+          .match(/return [1-9]/g) ?? []
+      ).length,
       0,
       'advisory 真 turn 不得有任何非零返回路径 —— 给逃生通道加阻断门 = 把救援自我否决',
     )
@@ -7248,7 +8471,9 @@ wait $!
       source.indexOf('\nenable_runtime_tape_batching() {'),
       source.indexOf('\n# 自动回切的 lossless 能力门'),
     )
-    const compensation = batching.slice(batching.indexOf('require_mutation_lease_for_compensation "runtime-batching-compensation"'))
+    const compensation = batching.slice(
+      batching.indexOf('require_mutation_lease_for_compensation "runtime-batching-compensation"'),
+    )
     const compensationCode = compensation
       .split('\n')
       .filter((line) => !/^\s*#/.test(line))
@@ -7259,7 +8484,11 @@ wait $!
       'batching 补偿三步不得用 || true 吞掉恢复结果',
     )
     assert.match(compensation, /batch_recover_failed/, '补偿必须逐步取退出码并汇总判词')
-    assert.match(compensation, /mark_deploy_recovery_required/, '恢复未确认必须落 durable marker 阻断下次发布')
+    assert.match(
+      compensation,
+      /mark_deploy_recovery_required/,
+      '恢复未确认必须落 durable marker 阻断下次发布',
+    )
     assert.match(compensation, /✓ 已确认回到 flag=0 且服务健康/, '恢复确认必须有明确判词')
 
     // ③ begin_planned_maintenance 不得在 svc_v5/http_v5 全挂时继续叠加新 release;
@@ -7318,7 +8547,11 @@ wait $!
       source.indexOf('\nclear_gate_waiver() {'),
     )
     assert.match(record, /base64 -w0 <"\$marker"\)" == "\$encoded"/, 'marker 必须写后回读校验')
-    assert.match(record, /门禁豁免债务写入\/回读失败[\s\S]*return 1/, '写入失败必须返回非零让门保持强制')
+    assert.match(
+      record,
+      /门禁豁免债务写入\/回读失败[\s\S]*return 1/,
+      '写入失败必须返回非零让门保持强制',
+    )
     const declared = source.slice(
       source.indexOf('\nrecord_declared_gate_waivers() {'),
       source.indexOf('\n# ── 传统 deploy/dist/rollback 的严格状态快照'),
@@ -7390,7 +8623,11 @@ wait $!
       warningLine.includes('gate_waivers'),
       `monitor 未把 gate_waivers 分到 warning 档(warning 行:${warningLine.trim()})`,
     )
-    assert.match(monitor, /GATE_WAIVER_DIR=.*\.gate-waivers/, 'monitor 与 deploy 的 marker 目录必须同路径')
+    assert.match(
+      monitor,
+      /GATE_WAIVER_DIR=.*\.gate-waivers/,
+      'monitor 与 deploy 的 marker 目录必须同路径',
+    )
   })
 
   // 公网面 + 资产面(审计 8)。此前 deploy/--dist 的成功出口没有任何一层经 Caddy 公网入口验证
@@ -7404,7 +8641,11 @@ wait $!
       source.indexOf('\n# 资产可达性'),
     )
     assert.match(pub, /v5-caddy-apply\.sh" --verify/, '公网面必须走 verify_routing')
-    assert.match(pub, /CADDY_HTTP_PORT="\$CADDY_HTTP_PORT"/, '必须打 Caddy 入口端口而非 master 端口')
+    assert.match(
+      pub,
+      /CADDY_HTTP_PORT="\$CADDY_HTTP_PORT"/,
+      '必须打 Caddy 入口端口而非 master 端口',
+    )
     assert.match(pub, /return 1/, '公网面失败必须非零')
     // ② 资产面:index.html 与 admin.html 各自首个 /assets/*.js 必须 200 且是 JS
     //    (SPA fallback 会把 404 兜成 index.html,只看状态码不够)。
@@ -7413,15 +8654,27 @@ wait $!
       source.indexOf('\n# C5:rollback 收尾后的 real-turn canary'),
     )
     assert.match(asset, /for page in \/ \/admin\.html/, 'admin.html 是第二入口,必须单独校验')
-    assert.match(asset, /\/assets\/\[A-Za-z0-9\._-\]\*\\\.js/, '必须解析 index/admin 引用的哈希 chunk')
+    assert.match(
+      asset,
+      /\/assets\/\[A-Za-z0-9\._-\]\*\\\.js/,
+      '必须解析 index/admin 引用的哈希 chunk',
+    )
     assert.match(asset, /'%\{http_code\}'/, '必须断言 chunk HTTP 状态码')
-    assert.match(asset, /javascript\|ecmascript/, '必须断言 Content-Type 是 JS(防 SPA fallback 假绿)')
+    assert.match(
+      asset,
+      /javascript\|ecmascript/,
+      '必须断言 Content-Type 是 JS(防 SPA fallback 假绿)',
+    )
     // ③ 资产面并入 dist 握手 → deploy/--dist/finalize 三个握手点一次到位。
     const handshake = source.slice(
       source.indexOf('\ndist_handshake_smoke() {'),
       source.indexOf('\n# ───────────────────────── smoke:健康 + 隔离断言'),
     )
-    assert.match(handshake, /verify_asset_surface "\$sport" \|\| return 1/, 'dist 握手必须连带资产可达性')
+    assert.match(
+      handshake,
+      /verify_asset_surface "\$sport" \|\| return 1/,
+      'dist 握手必须连带资产可达性',
+    )
     // ④ deploy 与 --dist 的 validation 链都必须过公网面,且失败进补偿链(不是裸退出)。
     for (const [lane, marker] of [
       ['deploy', 'validation_failure="public/asset surface verification failed'],
@@ -7449,7 +8702,11 @@ wait $!
     assert.match(fn, /unverifiable=/, '证据取不到必须与「取到且是红的」一样进阻断分支')
     // 逃生口必须显式且记账。
     assert.match(fn, /ALLOW_UNVERIFIED_CI" != 1/, '缺显式逃生旗标判定')
-    assert.match(fn, /record_gate_waiver ci-verification[\s\S]*\|\| return 1/, '逃生必须登记 durable debt 且记账失败即拒绝')
+    assert.match(
+      fn,
+      /record_gate_waiver ci-verification[\s\S]*\|\| return 1/,
+      '逃生必须登记 durable debt 且记账失败即拒绝',
+    )
     assert.match(fn, /clear_gate_waiver ci-verification/, '全绿必须自动销账')
     assert.match(
       fn,
@@ -7461,14 +8718,17 @@ wait $!
     // B1:完整绿门(含轮询)在 mutation lease 外;build_release 只留廉价本进程断言。
     const build = source.slice(
       source.indexOf('\nbuild_release() {'),
-      source.indexOf('mkdir -p \'$staging\''),
+      source.indexOf("mkdir -p '$staging'"),
     )
     const pin = build.indexOf('BUILT_RELEASE_SOURCE_COMMIT="$full_sha"')
     const gate = build.indexOf('assert_ci_green_process_local "$full_sha" "build_release"')
     assert.ok(pin >= 0 && gate > pin, 'build_release 必须廉价断言本进程绿门已通过且 SHA 一致')
     const preLease = source.indexOf('maybe_run_ci_green_gate_for_mode || exit 1')
     const acquire = source.lastIndexOf('acquire_production_mutation_lease || exit 3')
-    assert.ok(preLease >= 0 && preLease < acquire, '完整 CI 绿门必须在 acquire_production_mutation_lease 之前')
+    assert.ok(
+      preLease >= 0 && preLease < acquire,
+      '完整 CI 绿门必须在 acquire_production_mutation_lease 之前',
+    )
     assert.match(source, /maybe_recheck_ci_green_after_lease \|\| exit 1/, '持锁后必须廉价复核绿门')
     const kp = source.slice(
       source.indexOf('\nknowledge_planet_plugin_verify_user() {'),
@@ -7476,14 +8736,20 @@ wait $!
     )
     const kpGate = kp.indexOf('run_ci_green_gate_before_lease')
     const kpLease = kp.indexOf('acquire_production_mutation_lease')
-    assert.ok(kpGate >= 0 && kpLease > kpGate, 'knowledge-planet-verify 不得绕过绿门,且须在窄窗 lease 前跑完')
+    assert.ok(
+      kpGate >= 0 && kpLease > kpGate,
+      'knowledge-planet-verify 不得绕过绿门,且须在窄窗 lease 前跑完',
+    )
     // ci-verification 有意不参与连环跳禁令(gh 故障会互锁),这条要留在代码里防被"顺手统一"。
     const envFn = source.slice(
       source.indexOf('\ngate_waiver_env_active() {'),
       source.indexOf('\nrecord_gate_waiver() {'),
     )
-    assert.match(envFn, /ci-verification\)\s+return 1 ;;/,
-      'ci-verification 不得参与连环跳禁令,否则一次 gh 故障就锁死所有发布(含热修)')
+    assert.match(
+      envFn,
+      /ci-verification\)\s+return 1 ;;/,
+      'ci-verification 不得参与连环跳禁令,否则一次 gh 故障就锁死所有发布(含热修)',
+    )
     assert.match(fn, /OC_V5_CI_GH_RETRIES/, 'GitHub 5xx 必须有界重试,禁止一次 503 就当缺 check')
     assert.match(fn, /OC_V5_CI_GREEN_POLL_SECONDS/, 'in_progress 必须有界轮询,禁止立刻当红')
     assert.match(fn, /in_progress\|queued\|waiting/, '运行中状态必须与真红拆开')
@@ -7493,13 +8759,15 @@ wait $!
       source.indexOf('\nassert_ci_green_for_source_commit() {'),
       source.indexOf('\nresolve_release_source_commit() {'),
     )
-    assert.ok(gateOnly.includes('_ci_gh_api_retry'), '绿门必须走 retry 包装,不得直接 || true 吞 API 失败')
+    assert.ok(
+      gateOnly.includes('_ci_gh_api_retry'),
+      '绿门必须走 retry 包装,不得直接 || true 吞 API 失败',
+    )
     assert.equal(
       (gateOnly.match(/2>\/dev\/null \|\| true/g) || []).length,
       0,
       'assert_ci_green 本体不得用 || true 保留失败 API 的 stdout(会把 503 JSON 当成缺失 check 名)',
     )
-
   })
 
   test('E2E journey gate is part of the shared minimum functional core and fails loud', async () => {
@@ -7516,11 +8784,19 @@ wait $!
       /record_gate_waiver e2e-journey [^\n]*\|\| return 1/,
       'V5_SMOKE_E2E=0 豁免必须登记 durable debt,且登记失败即门保持强制',
     )
-    assert.match(fn, /node_modules\/playwright-core/, '缺依赖活体探测(缺失必须 fail-loud 而非静默跳过)')
+    assert.match(
+      fn,
+      /node_modules\/playwright-core/,
+      '缺依赖活体探测(缺失必须 fail-loud 而非静默跳过)',
+    )
     assert.match(fn, /return 1/, '依赖缺失/旅程失败必须返回非零')
     assert.match(fn, /\[dry-run\]/, '缺 dry-run 分支')
     assert.match(fn, /v5-e2e-journey-canary\.mjs/, '未调用旅程脚本')
-    assert.match(fn, /V5_E2E_REMOTE_PORT="\$port"/, '旅程必须打调用方指定的端口(candidate lane 切流前跑)')
+    assert.match(
+      fn,
+      /V5_E2E_REMOTE_PORT="\$port"/,
+      '旅程必须打调用方指定的端口(candidate lane 切流前跑)',
+    )
     const preJ5Timeout = /const PRE_J5_TIMEOUT = ([\d_]+);/.exec(journeySource)
     const j5Timeout = /const TURN_WAIT_TIMEOUT = ([\d_]+);/.exec(journeySource)
     const outerTimeout = /timeout (\d+) node "\$SCRIPT_DIR\/v5-e2e-journey-canary\.mjs"/.exec(fn)
@@ -7568,7 +8844,10 @@ wait $!
       'journey 必须复用共享的真实模型选择器 helper',
     )
     assert.ok(
-      helperTrigger >= 0 && helperItem > helperTrigger && helperClick > helperItem && helperApplied > helperClick,
+      helperTrigger >= 0 &&
+        helperItem > helperTrigger &&
+        helperClick > helperItem &&
+        helperApplied > helperClick,
       'journey 必须经真实模型选择器选中固定模型并等待触发器回显',
     )
     assert.ok(modelApplied > modelPin, 'journey 必须用固定的 JOURNEY_MODEL_ID 调用选模 helper')
@@ -7624,7 +8903,9 @@ wait $!
 
     // ① deploy:进 validation_failure 对称补偿链(失败 → 回旧 source/账号版本)。
     const deployBody = slice('\ndeploy() {', '\n# ───────────────────────── offline recycle')
-    const deployCore = deployBody.indexOf('minimum_functional_core deploy "$BUILT_RELEASE" "$ACTIVE_PORT"')
+    const deployCore = deployBody.indexOf(
+      'minimum_functional_core deploy "$BUILT_RELEASE" "$ACTIVE_PORT"',
+    )
     const deployCompensate = deployBody.indexOf('knowledge_planet_compensate_deploy')
     assert.ok(deployCore >= 0, 'deploy 未挂最小功能核')
     assert.match(
@@ -7638,7 +8919,9 @@ wait $!
     const distBody = slice('\ndeploy_dist() {', '\ncompensate_dist_activation() {')
     assert.match(distBody, /minimum_functional_core dist "\$BUILT_RELEASE" "\$ACTIVE_PORT"/)
     assert.match(distBody, /dist_validation_failure="minimum functional core failed/)
-    const distPrevCapture = distBody.indexOf('dist_previous_release="$(bg_current_release "$ACTIVE_SRC")"')
+    const distPrevCapture = distBody.indexOf(
+      'dist_previous_release="$(bg_current_release "$ACTIVE_SRC")"',
+    )
     const distFlip = distBody.indexOf('activate_release "$BUILT_RELEASE"')
     assert.ok(distPrevCapture >= 0 && distFlip > distPrevCapture, '--dist 回退点必须在翻转前钉死')
     assert.match(
@@ -7647,8 +8930,14 @@ wait $!
       '--dist 校验失败必须走对称补偿',
     )
     // 补偿必须复用既有机制,不得另造一套。
-    const distCompensate = slice('\ncompensate_dist_activation() {', '\n# ───────────────────────── rollback')
-    assert.match(distCompensate, /require_mutation_lease_for_compensation "dist-activation-compensation"/)
+    const distCompensate = slice(
+      '\ncompensate_dist_activation() {',
+      '\n# ───────────────────────── rollback',
+    )
+    assert.match(
+      distCompensate,
+      /require_mutation_lease_for_compensation "dist-activation-compensation"/,
+    )
     assert.match(distCompensate, /rollback_runtime_tuple 1 1 "\$candidate" 0/)
     assert.match(distCompensate, /activate_release "\$previous"/)
 
@@ -7688,10 +8977,14 @@ wait $!
     const finalizeBody = slice('\nfinalize_run_steps() {', '\n# ═════════ lane: --abort ═════════')
     const finalizeCore = finalizeBody.indexOf('minimum_functional_core finalize-precommit')
     const finalizeStop = finalizeBody.indexOf('sshk "systemctl stop $(slot_unit "$old")"')
-    const finalizeCommit = finalizeBody.indexOf("active_slot='$cand', previous_active_release=active_release")
+    const finalizeCommit = finalizeBody.indexOf(
+      "active_slot='$cand', previous_active_release=active_release",
+    )
     assert.ok(finalizeCore >= 0, 'finalize 提交前未跑最小功能核')
-    assert.ok(finalizeCore < finalizeStop && finalizeCore < finalizeCommit,
-      'finalize 的功能门必须在 stop 旧 unit / commit stable 之前')
+    assert.ok(
+      finalizeCore < finalizeStop && finalizeCore < finalizeCommit,
+      'finalize 的功能门必须在 stop 旧 unit / commit stable 之前',
+    )
     assert.match(
       finalizeBody.slice(finalizeCore, finalizeCore + 900),
       /ds_cas_or_die "phase='aborting', transition_step=0" 0 "finalize precommit/,
@@ -7790,9 +9083,17 @@ wait $!
       const blockEnd = rendered.stdout.indexOf('\n\t}', assetsAt)
       assert.ok(blockEnd > assetsAt, `${label}: /assets 块未闭合`)
       const block = rendered.stdout.slice(assetsAt, blockEnd)
-      assert.match(block, /route \{/, `${label}: /assets 块内缺 route(不用 route 会被 adapter 重排)`)
+      assert.match(
+        block,
+        /route \{/,
+        `${label}: /assets 块内缺 route(不用 route 会被 adapter 重排)`,
+      )
       assert.match(block, /@sourcemap path \*\.map/, `${label}: /assets 块内缺 @sourcemap 匹配器`)
-      assert.match(block, /respond @sourcemap 404/, `${label}: /assets 块内缺 respond @sourcemap 404`)
+      assert.match(
+        block,
+        /respond @sourcemap 404/,
+        `${label}: /assets 块内缺 respond @sourcemap 404`,
+      )
       assert.ok(
         block.indexOf('respond @sourcemap 404') < block.indexOf('file_server'),
         `${label}: respond @sourcemap 404 必须在 route 内位于 file_server 之前`,
@@ -7802,7 +9103,10 @@ wait $!
 
   test('E2E journey completion requires a new finalized non-error assistant row', async () => {
     const source = await readFile(e2eJourney, 'utf8')
-    assert.match(source, /assistantRowsBefore = await page\.getByTestId\("assistant-row"\)\.count\(\)/)
+    assert.match(
+      source,
+      /assistantRowsBefore = await page\.getByTestId\("assistant-row"\)\.count\(\)/,
+    )
     assert.match(source, /await assistantRows\.count\(\)\) > assistantRowsBefore/)
     assert.match(source, /newestAssistant\.locator\("\.caret-blink"\)/)
     assert.match(source, /getByRole\("button", \{ name: "发送", exact: true \}\)/)
@@ -7836,7 +9140,10 @@ wait $!
       bootUses.length === 2,
       `BOOT_TIMEOUT 只应用于 J1 首屏落地(goto + 首个 click),当前传参 ${bootUses.length} 处`,
     )
-    assert.match(source, /getByPlaceholder\("邮箱"\)\.waitFor\(\{ state: "visible", timeout: STEP_TIMEOUT \}\)/)
+    assert.match(
+      source,
+      /getByPlaceholder\("邮箱"\)\.waitFor\(\{ state: "visible", timeout: STEP_TIMEOUT \}\)/,
+    )
   })
 
   test('E2E journey seeds oc_auth_hint after API login cookie and before authed root reload', async () => {
@@ -7857,20 +9164,18 @@ wait $!
   })
 
   test('release verification accepts public Luna and keeps hidden Luna grant-gated', (t) => {
-    const databaseUrl = process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
+    const databaseUrl =
+      process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
     const schema = `oc_release_verification_${process.pid}_${Date.now()}`
-    const psql = (sql: string, searchPath = false) => spawnSync(
-      'psql',
-      [databaseUrl, '-X', '-v', 'ON_ERROR_STOP=1', '-tAc', sql],
-      {
+    const psql = (sql: string, searchPath = false) =>
+      spawnSync('psql', [databaseUrl, '-X', '-v', 'ON_ERROR_STOP=1', '-tAc', sql], {
         cwd: root,
         encoding: 'utf8',
         env: {
           ...process.env,
           ...(searchPath ? { PGOPTIONS: `-c search_path=${schema},public` } : {}),
         },
-      },
-    )
+      })
 
     const setup = psql(`
       CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -7920,35 +9225,42 @@ wait $!
       assert.equal(cleanup.status, 0, cleanup.stderr || cleanup.stdout)
     })
 
-    const runGate = () => spawnSync(
-      'bash',
-      ['-c', [
-        'set -euo pipefail',
-        'export V5_DEPLOY_SOURCE_ONLY=1',
-        `source '${deploy}'`,
-        'create_release_verification_run /rel/test 42',
-      ].join('\n')],
-      {
-        cwd: root,
-        encoding: 'utf8',
-        env: {
-          ...process.env,
-          ALLOW_ANY_BRANCH: '1',
-          DS_MODE: 'local',
-          DS_DATABASE_URL: databaseUrl,
-          PGOPTIONS: `-c search_path=${schema},public`,
+    const runGate = () =>
+      spawnSync(
+        'bash',
+        [
+          '-c',
+          [
+            'set -euo pipefail',
+            'export V5_DEPLOY_SOURCE_ONLY=1',
+            `source '${deploy}'`,
+            'create_release_verification_run /rel/test 42',
+          ].join('\n'),
+        ],
+        {
+          cwd: root,
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            ALLOW_ANY_BRANCH: '1',
+            DS_MODE: 'local',
+            DS_DATABASE_URL: databaseUrl,
+            PGOPTIONS: `-c search_path=${schema},public`,
+          },
         },
-      },
-    )
+      )
 
     const publicLuna = runGate()
     assert.equal(publicLuna.status, 0, publicLuna.stderr || publicLuna.stdout)
     assert.match(publicLuna.stdout, /verification run=/)
 
-    const hideAndGrant = psql(`
+    const hideAndGrant = psql(
+      `
       UPDATE model_pricing SET visibility='hidden' WHERE model_id='gpt-5.6-luna';
       INSERT INTO model_visibility_grants(user_id,model_id) VALUES (626,'gpt-5.6-luna');
-    `, true)
+    `,
+      true,
+    )
     assert.equal(hideAndGrant.status, 0, hideAndGrant.stderr || hideAndGrant.stdout)
     const hiddenGrantedLuna = runGate()
     assert.equal(hiddenGrantedLuna.status, 0, hiddenGrantedLuna.stderr || hiddenGrantedLuna.stdout)
@@ -7964,16 +9276,17 @@ wait $!
   })
 
   test('candidate release gate is fixed-model, zero-skip, evidenced, and aborts before diagnosis', async () => {
-    const [source, runner, manifestRaw, fixtures, api, ui, largeTest, statusTest] = await Promise.all([
-      readFile(deploy, 'utf8'),
-      readFile(sessionDisplayRunner, 'utf8'),
-      readFile(incidentManifest, 'utf8'),
-      readFile(sessionDisplayFixtures, 'utf8'),
-      readFile(sessionDisplayApi, 'utf8'),
-      readFile(sessionDisplayUi, 'utf8'),
-      readFile(sessionDisplayLargeTest, 'utf8'),
-      readFile(sessionDisplayStatusTest, 'utf8'),
-    ])
+    const [source, runner, manifestRaw, fixtures, api, ui, largeTest, statusTest] =
+      await Promise.all([
+        readFile(deploy, 'utf8'),
+        readFile(sessionDisplayRunner, 'utf8'),
+        readFile(incidentManifest, 'utf8'),
+        readFile(sessionDisplayFixtures, 'utf8'),
+        readFile(sessionDisplayApi, 'utf8'),
+        readFile(sessionDisplayUi, 'utf8'),
+        readFile(sessionDisplayLargeTest, 'utf8'),
+        readFile(sessionDisplayStatusTest, 'utf8'),
+      ])
     const manifest = JSON.parse(manifestRaw)
     assert.deepEqual(manifest.fixedLiveMatrix, [
       { engine: 'codex', model: 'gpt-5.6-luna' },
@@ -7985,16 +9298,36 @@ wait $!
     assert.match(runner, /export CI=1/)
     assert.match(runner, /export NO_PROXY="127\.0\.0\.1,localhost\$\{NO_PROXY:\+,\$NO_PROXY\}"/)
     assert.match(runner, /export no_proxy="127\.0\.0\.1,localhost\$\{no_proxy:\+,\$no_proxy\}"/)
-    assert.ok(runner.includes('const u=new URL(process.env.DB_URL); console.log(`${u.hostname} ${u.port||5432}`)'))
+    assert.ok(
+      runner.includes(
+        'const u=new URL(process.env.DB_URL); console.log(`${u.hostname} ${u.port||5432}`)',
+      ),
+    )
     assert.ok(!runner.includes('process.stdout.write(`${u.hostname} ${u.port||5432}`)'))
     assert.match(runner, /if\(fail\|\|skip\|\|flaky\)/)
-    assert.match(runner, /\[ -z "\$\{OC_E2E_MODEL:-\}" \] \|\| die "OC_E2E_MODEL 已废止；模型矩阵不可覆盖"/)
+    assert.match(
+      runner,
+      /\[ -z "\$\{OC_E2E_MODEL:-\}" \] \|\| die "OC_E2E_MODEL 已废止；模型矩阵不可覆盖"/,
+    )
     assert.doesNotMatch(runner, /OC_E2E_MODEL:-[a-z0-9]/)
     assert.match(fixtures, /api: \[async \(\{\}, use\) => \{[\s\S]*scope: 'worker'/)
-    assert.match(fixtures, /sharedContext: \[async \(\{ browser \}, use\) => \{[\s\S]*scope: 'worker'/)
-    assert.match(fixtures, /page: async \(\{ sharedContext \}, use\) => \{[\s\S]*sharedContext\.newPage\(\)/)
-    assert.match(fixtures, /finally \{[\s\S]*sharedContext\.setOffline\(false\)[\s\S]*page\.close\(\)/)
-    assert.doesNotMatch(fixtures, /token: \[[\s\S]*scope: 'worker'/, 'token 必须逐测试取当前安全 TTL')
+    assert.match(
+      fixtures,
+      /sharedContext: \[async \(\{ browser \}, use\) => \{[\s\S]*scope: 'worker'/,
+    )
+    assert.match(
+      fixtures,
+      /page: async \(\{ sharedContext \}, use\) => \{[\s\S]*sharedContext\.newPage\(\)/,
+    )
+    assert.match(
+      fixtures,
+      /finally \{[\s\S]*sharedContext\.setOffline\(false\)[\s\S]*page\.close\(\)/,
+    )
+    assert.doesNotMatch(
+      fixtures,
+      /token: \[[\s\S]*scope: 'worker'/,
+      'token 必须逐测试取当前安全 TTL',
+    )
     assert.match(api, /minimumRemainingMs = cfg\.turnTimeoutMs \* 2 \+ 90_000/)
     assert.match(api, /this\.cachedLogin\.accessExp \* 1000 - Date\.now\(\) > minimumRemainingMs/)
     assert.match(ui, /name: \/\^\(\?:重试\|重新尝试\|重试发送\)\$\//)
@@ -8012,19 +9345,19 @@ wait $!
     // 幽灵选择器本身由 scripts/check-v5-e2e-selectors.ts 整类拦截。
     // 只禁真实调用,不禁注释里提名字(spec 里留了一段说明为什么换掉它)。
     assert.doesNotMatch(largeTest, /SEL\.turnProcessCard\(/)
-    assert.match(
-      largeTest,
-      /SEL\.assistantRows\(page\)[\s\S]*\.prose[\s\S]*toBeVisible\(/,
-    )
+    assert.match(largeTest, /SEL\.assistantRows\(page\)[\s\S]*\.prose[\s\S]*toBeVisible\(/)
     assert.match(largeTest, /E2E_TOOL_FINAL_MARKER/)
     const loopbackBypass = runner.indexOf('export NO_PROXY=')
     const lowercaseLoopbackBypass = runner.indexOf('export no_proxy=')
     const readinessProbe = runner.indexOf('for i in $(seq 1 40);')
     const playwrightStart = runner.indexOf('./node_modules/.bin/playwright test')
     assert.ok(
-      loopbackBypass >= 0 && lowercaseLoopbackBypass >= 0 &&
-        readinessProbe > loopbackBypass && readinessProbe > lowercaseLoopbackBypass &&
-        playwrightStart > loopbackBypass && playwrightStart > lowercaseLoopbackBypass,
+      loopbackBypass >= 0 &&
+        lowercaseLoopbackBypass >= 0 &&
+        readinessProbe > loopbackBypass &&
+        readinessProbe > lowercaseLoopbackBypass &&
+        playwrightStart > loopbackBypass &&
+        playwrightStart > lowercaseLoopbackBypass,
       'loopback proxy bypass must be active before candidate readiness and Playwright matrix traffic',
     )
 
@@ -8037,10 +9370,18 @@ wait $!
     const failure = canary.indexOf('candidate regression gate failed', fixedGate)
     const abort = canary.indexOf('\n    abort', failure)
     const closeFailed = canary.indexOf('close_release_verification_run failed', abort)
-    const recoveryVerify = canary.indexOf('verify_stable_predecessor_after_gate_failure', closeFailed)
+    const recoveryVerify = canary.indexOf(
+      'verify_stable_predecessor_after_gate_failure',
+      closeFailed,
+    )
     assert.ok(
-      routingVerify >= 0 && egressPreflight > routingVerify && fixedGate > egressPreflight && failure > fixedGate && abort > failure &&
-        closeFailed > abort && recoveryVerify > closeFailed,
+      routingVerify >= 0 &&
+        egressPreflight > routingVerify &&
+        fixedGate > egressPreflight &&
+        failure > fixedGate &&
+        abort > failure &&
+        closeFailed > abort &&
+        recoveryVerify > closeFailed,
       'candidate gate failure must issue official abort first, then close evidence and verify predecessor',
     )
     assert.match(source, /release_verification_evidence/)
@@ -8059,9 +9400,13 @@ wait $!
         finalize.indexOf('reconcile_testing_egress_transition "$DS_generation"'),
       'missing release evidence must trigger official abort before any egress recovery action',
     )
-    assert.match(finalize, /缺 exact release\/generation fixed-matrix evidence；第一动作=官方 abort/)
+    assert.match(
+      finalize,
+      /缺 exact release\/generation fixed-matrix evidence；第一动作=官方 abort/,
+    )
     assert.ok(
-      finalize.indexOf('assert_release_verification_evidence') < finalize.indexOf('knowledge_planet_plugin_assert_release_compatible'),
+      finalize.indexOf('assert_release_verification_evidence') <
+        finalize.indexOf('knowledge_planet_plugin_assert_release_compatible'),
       'finalize evidence gate must run before other candidate investigation/gates',
     )
     assert.ok(
@@ -8079,7 +9424,10 @@ wait $!
     const handoff = source.slice(handoffStart, handoffEnd)
     const refresh = handoff.indexOf('ACTIVE_STATE_LOADED=0')
     const resolve = handoff.indexOf('resolve_active_lane', refresh)
-    const migration = handoff.indexOf('assert_release_required_migrations "$DS_active_release"', resolve)
+    const migration = handoff.indexOf(
+      'assert_release_required_migrations "$DS_active_release"',
+      resolve,
+    )
     const transitionQuery = handoff.indexOf('release_egress_transitions', migration)
     assert.ok(
       refresh >= 0 && resolve > refresh && migration > resolve && transitionQuery > migration,
@@ -8103,7 +9451,10 @@ wait $!
     )
     assert.match(handoff, /transition_generation="\$DS_generation"/)
     const reconcileStart = source.indexOf('\nreconcile_testing_egress_transition()')
-    const reconcileEnd = source.indexOf('\nrollback_egress_transition_for_generation()', reconcileStart)
+    const reconcileEnd = source.indexOf(
+      '\nrollback_egress_transition_for_generation()',
+      reconcileStart,
+    )
     const reconcile = source.slice(reconcileStart, reconcileEnd)
     assert.match(reconcile, /status='testing'/)
     assert.match(reconcile, /activate_egress_release "\$predecessor" "\$release"/)
@@ -8111,13 +9462,22 @@ wait $!
     const recoverStart = source.indexOf('\nrecover() {')
     const recoverEnd = source.indexOf('\n# ═', recoverStart + 1)
     const recover = source.slice(recoverStart, recoverEnd)
-    assert.match(recover, /canary≥READY:[\s\S]*reconcile_testing_egress_transition "\$DS_generation"/)
-    assert.match(recover, /testing egress recovery failed；第一动作=官方 abort[\s\S]*\n          abort/)
+    assert.match(
+      recover,
+      /canary≥READY:[\s\S]*reconcile_testing_egress_transition "\$DS_generation"/,
+    )
+    assert.match(recover, /testing egress recovery failed；第一动作=官方 abort[\s\S]*\n {10}abort/)
 
-    const sourced = spawnSync('bash', ['-c',
-      'V5_DEPLOY_SOURCE_ONLY=1 source "$1" --dry-run; declare -F close_emergency_debt record_emergency_authorization consume_emergency_authorization set_luna_visibility run_candidate_release_verification reconcile_testing_egress_transition >/dev/null',
-      'bash', deploy,
-    ], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
+    const sourced = spawnSync(
+      'bash',
+      [
+        '-c',
+        'V5_DEPLOY_SOURCE_ONLY=1 source "$1" --dry-run; declare -F close_emergency_debt record_emergency_authorization consume_emergency_authorization set_luna_visibility run_candidate_release_verification reconcile_testing_egress_transition >/dev/null',
+        'bash',
+        deploy,
+      ],
+      { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } },
+    )
     assert.equal(sourced.status, 0, sourced.stderr || sourced.stdout)
   })
 
@@ -8158,7 +9518,10 @@ wait $!
     const emergencyBranch = canary.indexOf('dx-declared emergency containment')
     const fullGate = canary.indexOf('run_candidate_release_verification')
     assert.ok(emergencyBranch >= 0 && fullGate > emergencyBranch)
-    assert.match(canary, /if \[\[ -n "\$EMERGENCY_INCIDENT" \]\]; then[\s\S]*elif ! run_candidate_release_verification/)
+    assert.match(
+      canary,
+      /if \[\[ -n "\$EMERGENCY_INCIDENT" \]\]; then[\s\S]*elif ! run_candidate_release_verification/,
+    )
     const finalizeStart = source.indexOf('\nfinalize() {')
     const finalizeEnd = source.indexOf('\n# finalize step1', finalizeStart)
     const finalize = source.slice(finalizeStart, finalizeEnd)
@@ -8177,19 +9540,22 @@ wait $!
       source,
       /const DEFAULT_SILENCE_MS = MODEL === 'deepseek-v4-flash' \? 270_000 : 90_000/,
     )
-    assert.match(
-      source,
-      /process\.env\.V5_TURN_SILENCE_MS \?\? DEFAULT_SILENCE_MS/,
-    )
+    assert.match(source, /process\.env\.V5_TURN_SILENCE_MS \?\? DEFAULT_SILENCE_MS/)
     const attemptAt = source.indexOf('const attempt = () => new Promise')
     assert.ok(attemptAt >= 0)
     const beforeAttempt = source.slice(0, attemptAt)
     assert.doesNotMatch(beforeAttempt, /let saw(Text|Final|Cost|Error)/)
     assert.match(source.slice(attemptAt), /let answerText = ''/)
     assert.match(source.slice(attemptAt), /answerText \+= b\.text/)
-    assert.match(source.slice(attemptAt), /finalText = answerTextForExactCheck\(answerText\.trim\(\)\)/)
+    assert.match(
+      source.slice(attemptAt),
+      /finalText = answerTextForExactCheck\(answerText\.trim\(\)\)/,
+    )
     assert.match(source.slice(attemptAt), /let finalText = ''/)
-    assert.match(source.slice(attemptAt), /resolve\(\{ reason, sawText, sawFinal, sawCost, sawError, finalText, textVia \}\)/)
+    assert.match(
+      source.slice(attemptAt),
+      /resolve\(\{ reason, sawText, sawFinal, sawCost, sawError, finalText, textVia \}\)/,
+    )
     assert.match(source, /extractAssistantText/)
     assert.match(source, /textVia = 'tape'/)
     assert.match(source, /result\.finalText === '2'/)
@@ -8198,7 +9564,10 @@ wait $!
   test('real-turn canary ignores foreign recovery frames but still fails its own exact error', async () => {
     const success = await runTurnCanaryFixture('foreign-then-success')
     assert.equal(success.code, 0, success.stderr || success.stdout)
-    assert.match(success.stdout, /TURN_OK model=grok-build exact_text=2 final=true cost_charged=true via=ws/)
+    assert.match(
+      success.stdout,
+      /TURN_OK model=grok-build exact_text=2 final=true cost_charged=true via=ws/,
+    )
 
     const ownError = await runTurnCanaryFixture('own-error')
     assert.equal(ownError.code, 1, ownError.stdout)
@@ -8217,7 +9586,10 @@ wait $!
     const next = '```ui\n{"type":"next","text":"再算一下 2+2"}\n```'
     const trailing = await runTurnCanaryFixture('foreign-then-success', `2\n\n${next}`)
     assert.equal(trailing.code, 0, trailing.stderr || trailing.stdout)
-    assert.match(trailing.stdout, /TURN_OK model=grok-build exact_text=2 final=true cost_charged=true via=ws/)
+    assert.match(
+      trailing.stdout,
+      /TURN_OK model=grok-build exact_text=2 final=true cost_charged=true via=ws/,
+    )
 
     const tape = await runTurnCanaryFixture('ccb-final-cost-tape-text', `2\n${next}`)
     assert.equal(tape.code, 0, tape.stderr || tape.stdout)
@@ -8239,7 +9611,10 @@ wait $!
   test('real-turn canary accepts tape assistant text when CCB final+cost omit WS blocks', async () => {
     const tapeOk = await runTurnCanaryFixture('ccb-final-cost-tape-text')
     assert.equal(tapeOk.code, 0, tapeOk.stderr || tapeOk.stdout)
-    assert.match(tapeOk.stdout, /TURN_OK model=grok-build exact_text=2 final=true cost_charged=true via=tape/)
+    assert.match(
+      tapeOk.stdout,
+      /TURN_OK model=grok-build exact_text=2 final=true cost_charged=true via=tape/,
+    )
 
     const empty = await runTurnCanaryFixture('ccb-final-cost-empty-session')
     assert.equal(empty.code, 1, empty.stdout)
@@ -8334,7 +9709,9 @@ wait $!
     await mkdir(bin)
     await writeFile(path.join(bin, 'sleep'), '#!/usr/bin/env bash\nexit 0\n')
     await chmod(path.join(bin, 'sleep'), 0o755)
-    await writeFile(path.join(bin, 'curl'), `#!/usr/bin/env bash
+    await writeFile(
+      path.join(bin, 'curl'),
+      `#!/usr/bin/env bash
 set -u
 poll=${JSON.stringify(poll)}
 login_count=${JSON.stringify(loginCount)}
@@ -8367,7 +9744,8 @@ case "$args" in
     ;;
   *) exit 22 ;;
 esac
-`)
+`,
+    )
     await chmod(path.join(bin, 'curl'), 0o755)
 
     const ok = spawnSync('bash', [baselineEval, 'app-connectors'], {
@@ -8442,7 +9820,9 @@ esac
     await mkdir(bin)
     await writeFile(path.join(bin, 'sleep'), '#!/usr/bin/env bash\nexit 0\n')
     await chmod(path.join(bin, 'sleep'), 0o755)
-    await writeFile(path.join(bin, 'curl'), `#!/usr/bin/env bash
+    await writeFile(
+      path.join(bin, 'curl'),
+      `#!/usr/bin/env bash
 set -u
 poll=${JSON.stringify(poll)}
 login_count=${JSON.stringify(loginCount)}
@@ -8480,7 +9860,8 @@ case "$args" in
     ;;
   *) exit 22 ;;
 esac
-`)
+`,
+    )
     await chmod(path.join(bin, 'curl'), 0o755)
 
     const result = spawnSync('bash', [marketEval, 'demo'], {
@@ -8569,7 +9950,9 @@ esac
     const weekly = path.join(scriptsDir, 'v5-baseline-evals-weekly.sh')
     await cp(baselineWeekly, weekly)
     await writeFile(path.join(scriptsDir, 'v5-alert-fanout.sql'), '-- fixture\n')
-    await writeFile(path.join(scriptsDir, 'run-baseline-skill-evals.sh'), `#!/usr/bin/env bash
+    await writeFile(
+      path.join(scriptsDir, 'run-baseline-skill-evals.sh'),
+      `#!/usr/bin/env bash
 set -u
 [ "$EMAIL" = v5-evals@claudeai.chat ]
 [ "$PASSWORD" = fixture-secret ]
@@ -8583,36 +9966,46 @@ if [ "\${FAKE_MODE:-}" != missing ]; then
 fi
 [ "\${FAKE_MODE:-}" = runner-fail ] && exit 7
 exit 0
-`)
+`,
+    )
     const psqlCapture = path.join(dir, 'psql-capture')
-    await writeFile(path.join(bin, 'psql'), '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$PSQL_CAPTURE"\ncat >> "$PSQL_CAPTURE" || true\nexit 0\n')
+    await writeFile(
+      path.join(bin, 'psql'),
+      '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$PSQL_CAPTURE"\ncat >> "$PSQL_CAPTURE" || true\nexit 0\n',
+    )
     await chmod(path.join(bin, 'psql'), 0o755)
-    const realPython = spawnSync('bash', ['-lc', 'command -v python3'], { encoding: 'utf8' }).stdout.trim()
+    const realPython = spawnSync('bash', ['-lc', 'command -v python3'], {
+      encoding: 'utf8',
+    }).stdout.trim()
     assert.ok(realPython)
-    await writeFile(path.join(bin, 'python3'), `#!/usr/bin/env bash
+    await writeFile(
+      path.join(bin, 'python3'),
+      `#!/usr/bin/env bash
 if [ "\${FAKE_MODE:-}" = extract-fail ] && [ "\${1:-}" = -c ]; then exit 9; fi
 exec ${JSON.stringify(realPython)} "$@"
-`)
+`,
+    )
     await chmod(path.join(bin, 'python3'), 0o755)
     const password = path.join(dir, 'eval.password')
     const envFile = path.join(dir, 'commercial.env')
     await writeFile(password, 'fixture-secret\n')
     await writeFile(envFile, 'DATABASE_URL=postgres://fixture\n')
 
-    const runWeekly = (mode: string, history: string, extraEnv: Record<string, string> = {}) => spawnSync('bash', [weekly], {
-      cwd: dir,
-      encoding: 'utf8',
-      env: {
-        ...process.env,
-        PATH: `${bin}:${process.env.PATH}`,
-        FAKE_MODE: mode,
-        OC_EVAL_HIST_DIR: history,
-        OC_EVAL_PASSWORD_FILE: password,
-        OC_EVAL_ENV_FILE: envFile,
-        PSQL_CAPTURE: psqlCapture,
-        ...extraEnv,
-      },
-    })
+    const runWeekly = (mode: string, history: string, extraEnv: Record<string, string> = {}) =>
+      spawnSync('bash', [weekly], {
+        cwd: dir,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          FAKE_MODE: mode,
+          OC_EVAL_HIST_DIR: history,
+          OC_EVAL_PASSWORD_FILE: password,
+          OC_EVAL_ENV_FILE: envFile,
+          PSQL_CAPTURE: psqlCapture,
+          ...extraEnv,
+        },
+      })
 
     const missing = runWeekly('missing', path.join(dir, 'hist-missing'))
     assert.equal(missing.status, 0, missing.stderr || missing.stdout)
@@ -8648,16 +10041,20 @@ exec ${JSON.stringify(realPython)} "$@"
 
 describe('v5 release speedup (B1-B5, C4)', () => {
   const invokeHelpers = (command: string, extraEnv: Record<string, string> = {}) =>
-    spawnSync('bash', ['-c', [
-      'set -euo pipefail',
-      'export V5_DEPLOY_SOURCE_ONLY=1',
-      `source '${deploy}'`,
-      command,
-    ].join('\n')], {
-      cwd: root,
-      encoding: 'utf8',
-      env: { ...process.env, ALLOW_ANY_BRANCH: '1', ...extraEnv },
-    })
+    spawnSync(
+      'bash',
+      [
+        '-c',
+        ['set -euo pipefail', 'export V5_DEPLOY_SOURCE_ONLY=1', `source '${deploy}'`, command].join(
+          '\n',
+        ),
+      ],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, ALLOW_ANY_BRANCH: '1', ...extraEnv },
+      },
+    )
 
   test('B1: CI green gate runs before mutation lease and build_release only cheap-rechecks', async () => {
     const source = await readFile(deploy, 'utf8')
@@ -8667,11 +10064,14 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.match(source, /CI_GREEN_PASSED_AT/)
     const main = source.slice(source.indexOf('maybe_run_ci_green_gate_for_mode || exit 1'))
     assert.ok(
-      main.indexOf('maybe_run_ci_green_gate_for_mode || exit 1')
-        < main.indexOf('acquire_production_mutation_lease || exit 3'),
+      main.indexOf('maybe_run_ci_green_gate_for_mode || exit 1') <
+        main.indexOf('acquire_production_mutation_lease || exit 3'),
     )
     assert.match(source, /maybe_recheck_ci_green_after_lease \|\| exit 1/)
-    const build = source.slice(source.indexOf('\nbuild_release() {'), source.indexOf('\n# sessions-store-pg'))
+    const build = source.slice(
+      source.indexOf('\nbuild_release() {'),
+      source.indexOf('\n# sessions-store-pg'),
+    )
     assert.match(build, /assert_ci_green_process_local "\$full_sha" "build_release"/)
     assert.doesNotMatch(build, /assert_ci_green_for_source_commit "\$full_sha"/)
     assert.match(source, /resolve_specified_canary_source_commit\(\)/)
@@ -8685,16 +10085,20 @@ describe('v5 release speedup (B1-B5, C4)', () => {
   })
 
   test('B1: cheap recheck fails closed when this process never passed the gate or SHA drifted', () => {
-    const missing = invokeHelpers('assert_ci_green_process_local 0000000000000000000000000000000000000000 test || exit 7')
+    const missing = invokeHelpers(
+      'assert_ci_green_process_local 0000000000000000000000000000000000000000 test || exit 7',
+    )
     assert.equal(missing.status, 7)
     assert.match(missing.stderr, /CI 绿门未在本进程通过/)
 
-    const drifted = invokeHelpers([
-      'CI_GREEN_PASSED_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-      'CI_GREEN_PASSED_AT=1',
-      'DRY=0',
-      'assert_ci_green_process_local bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb test || exit 8',
-    ].join('\n'))
+    const drifted = invokeHelpers(
+      [
+        'CI_GREEN_PASSED_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        'CI_GREEN_PASSED_AT=1',
+        'DRY=0',
+        'assert_ci_green_process_local bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb test || exit 8',
+      ].join('\n'),
+    )
     assert.equal(drifted.status, 8)
     assert.match(drifted.stderr, /pinned SHA 已漂/)
   })
@@ -8708,11 +10112,20 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.match(activate, /wait_for_master_healthz_ready "\$ACTIVE_PORT"/)
     assert.doesNotMatch(activate, /if ! smoke "\$ACTIVE_PORT"/)
     assert.match(source, /wait_for_master_healthz_ready\(\) \{/)
-    const deployBody = source.slice(source.indexOf('\ndeploy() {'), source.indexOf('\n# ───────────────────────── offline recycle'))
+    const deployBody = source.slice(
+      source.indexOf('\ndeploy() {'),
+      source.indexOf('\n# ───────────────────────── offline recycle'),
+    )
     assert.match(deployBody, /! smoke "\$ACTIVE_PORT"/)
-    const distBody = source.slice(source.indexOf('\ndeploy_dist() {'), source.indexOf('\ncompensate_dist_activation() {'))
+    const distBody = source.slice(
+      source.indexOf('\ndeploy_dist() {'),
+      source.indexOf('\ncompensate_dist_activation() {'),
+    )
     assert.match(distBody, /! smoke "\$ACTIVE_PORT"/)
-    const rollback = source.slice(source.indexOf('\nrollback() {'), source.indexOf('\nrollback_runtime_tuple() {'))
+    const rollback = source.slice(
+      source.indexOf('\nrollback() {'),
+      source.indexOf('\nrollback_runtime_tuple() {'),
+    )
     assert.match(rollback, /if ! smoke "\$ACTIVE_PORT"/)
   })
 
@@ -8730,7 +10143,10 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.match(core, /e2e_rc=\$\?/)
     assert.match(core, /\[turn\]/)
     assert.match(core, /\[e2e\]/)
-    const matrix = source.slice(source.indexOf('\nsmoke_turn_matrix() {'), source.indexOf('\nsmoke_e2e_journey() {'))
+    const matrix = source.slice(
+      source.indexOf('\nsmoke_turn_matrix() {'),
+      source.indexOf('\nsmoke_e2e_journey() {'),
+    )
     assert.match(matrix, /for model in \$models/)
     assert.doesNotMatch(matrix, /smoke_turn_canary .*&/)
   })
@@ -8747,10 +10163,16 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.match(source, /packages\/web-react\/vite\.config\.ts/)
     assert.match(source, /record_dist_reuse_in_complete/)
     assert.match(source, /distReuse/)
-    const build = source.slice(source.indexOf('\nbuild_release() {'), source.indexOf('\n# sessions-store-pg'))
+    const build = source.slice(
+      source.indexOf('\nbuild_release() {'),
+      source.indexOf('\n# sessions-store-pg'),
+    )
     assert.match(build, /try_reuse_web_dist "\$staging" "\$cur" "\$full_sha"/)
     assert.match(build, /VITE_TASKBOARD_ENABLED=0 npm run build --workspace packages\/web-react/)
-    const helper = source.slice(source.indexOf('\ntry_reuse_web_dist() {'), source.indexOf('\nrecord_dist_reuse_in_complete() {'))
+    const helper = source.slice(
+      source.indexOf('\ntry_reuse_web_dist() {'),
+      source.indexOf('\nrecord_dist_reuse_in_complete() {'),
+    )
     assert.match(helper, /当前 release \.complete\/dist 不完整/)
     assert.match(helper, /web workspace 闭包\/lock\/构建配置相对/)
     assert.match(helper, /VITE_TASKBOARD_ENABLED=0 硬编码/)
@@ -8779,12 +10201,15 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     try {
       const releasesRoot = path.join(dir, 'releases')
       await mkdir(releasesRoot)
-      const full = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+      const full = spawnSync('git', ['rev-parse', 'HEAD'], {
+        cwd: root,
+        encoding: 'utf8',
+      }).stdout.trim()
       const short = full.slice(0, 8)
-      const metadataRaw = spawnSync(
-        'git', ['show', `${full}:deploy/v5/release-metadata.json`],
-        { cwd: root, encoding: 'utf8' },
-      ).stdout
+      const metadataRaw = spawnSync('git', ['show', `${full}:deploy/v5/release-metadata.json`], {
+        cwd: root,
+        encoding: 'utf8',
+      }).stdout
       const builtAt = '20260822-183616'
       const release = path.join(releasesRoot, `rel-${short}-${builtAt}`)
       await mkdir(path.join(release, 'deploy/v5'), { recursive: true })
@@ -8794,16 +10219,27 @@ describe('v5 release speedup (B1-B5, C4)', () => {
       await writeFile(path.join(release, 'VERSION.json'), JSON.stringify({ commit: short }))
       await writeFile(path.join(release, 'package.json'), '{}\n')
       await writeFile(path.join(release, 'node_modules/dependency.js'), 'module.exports = 1\n')
-      await writeFile(path.join(release, 'packages/web-react/dist/index.html'), '<html>fixture</html>\n')
-      const invoke = (command: string) => spawnSync('bash', ['-c', [
-        'set -euo pipefail',
-        'export V5_DEPLOY_SOURCE_ONLY=1',
-        `source '${deploy}'`,
-        `RELEASES_ROOT='${releasesRoot}'`,
-        'KL_HOST=fake',
-        'ssh() { local _host="$1"; shift; if [[ $# == 1 ]]; then bash -c "$1"; else "$@"; fi; }',
-        command,
-      ].join('\n')], { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } })
+      await writeFile(
+        path.join(release, 'packages/web-react/dist/index.html'),
+        '<html>fixture</html>\n',
+      )
+      const invoke = (command: string) =>
+        spawnSync(
+          'bash',
+          [
+            '-c',
+            [
+              'set -euo pipefail',
+              'export V5_DEPLOY_SOURCE_ONLY=1',
+              `source '${deploy}'`,
+              `RELEASES_ROOT='${releasesRoot}'`,
+              'KL_HOST=fake',
+              'ssh() { local _host="$1"; shift; if [[ $# == 1 ]]; then bash -c "$1"; else "$@"; fi; }',
+              command,
+            ].join('\n'),
+          ],
+          { cwd: root, encoding: 'utf8', env: { ...process.env, ALLOW_ANY_BRANCH: '1' } },
+        )
       const artifact = invoke(`release_artifact_digest '${release}'`)
       assert.equal(artifact.status, 0, artifact.stderr)
       const marker = {
@@ -8815,7 +10251,12 @@ describe('v5 release speedup (B1-B5, C4)', () => {
         distReuse: {
           fromRelease: '/opt/openclaude/openclaude-v5-releases/rel-faf094dd3-20260822-044336',
           fromSourceCommit: 'faf094dd30b6ba525cf5c19f3726e87c1208c8e8',
-          comparedPaths: ['package-lock.json', 'package.json', 'packages/protocol', 'packages/web-react'],
+          comparedPaths: [
+            'package-lock.json',
+            'package.json',
+            'packages/protocol',
+            'packages/web-react',
+          ],
           viteTaskboardEnabled: '0',
         },
       }
@@ -8831,13 +10272,18 @@ describe('v5 release speedup (B1-B5, C4)', () => {
   })
 
   test('B4: try_reuse_web_dist refuses when kill-switch is off or current release is missing', () => {
-    const off = invokeHelpers('try_reuse_web_dist /tmp/staging /tmp/cur deadbeefdeadbeefdeadbeefdeadbeefdeadbeef || exit 9', {
-      OC_V5_DIST_REUSE: '0',
-    })
+    const off = invokeHelpers(
+      'try_reuse_web_dist /tmp/staging /tmp/cur deadbeefdeadbeefdeadbeefdeadbeefdeadbeef || exit 9',
+      {
+        OC_V5_DIST_REUSE: '0',
+      },
+    )
     assert.equal(off.status, 9)
     assert.match(off.stderr, /OC_V5_DIST_REUSE=0/)
 
-    const missing = invokeHelpers('try_reuse_web_dist /tmp/staging "" deadbeefdeadbeefdeadbeefdeadbeefdeadbeef || exit 10')
+    const missing = invokeHelpers(
+      'try_reuse_web_dist /tmp/staging "" deadbeefdeadbeefdeadbeefdeadbeefdeadbeef || exit 10',
+    )
     assert.equal(missing.status, 10)
     assert.match(missing.stderr, /无当前 release/)
   })
@@ -8855,17 +10301,29 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.match(source, /inputDigest/)
     assert.match(source, /oc_hotcfg_verify_manifest_sampled/)
     assert.doesNotMatch(source, /RUNTIME_INPUT_TREE_PATHS=/)
-    const build = source.slice(source.indexOf('\nbuild_runtime_release() {'), source.indexOf('\nhotcfg_core_smoke_cmd() {'))
+    const build = source.slice(
+      source.indexOf('\nbuild_runtime_release() {'),
+      source.indexOf('\nhotcfg_core_smoke_cmd() {'),
+    )
     assert.match(build, /try_reuse_runtime_release "\$full_sha" "\$RUNTIME_IMAGE_ID"/)
     assert.match(build, /record_runtime_input_digest/)
     assert.match(build, /oc_hotcfg_finalize_release/)
   })
 
   test('B5: compute_runtime_input_digest is deterministic and fails closed on bad args', () => {
-    const sha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
-    const a = invokeHelpers(`compute_runtime_input_digest '${sha}' sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`)
-    const b = invokeHelpers(`compute_runtime_input_digest '${sha}' sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`)
-    const c = invokeHelpers(`compute_runtime_input_digest '${sha}' sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`)
+    const sha = spawnSync('git', ['rev-parse', 'HEAD'], {
+      cwd: root,
+      encoding: 'utf8',
+    }).stdout.trim()
+    const a = invokeHelpers(
+      `compute_runtime_input_digest '${sha}' sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`,
+    )
+    const b = invokeHelpers(
+      `compute_runtime_input_digest '${sha}' sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`,
+    )
+    const c = invokeHelpers(
+      `compute_runtime_input_digest '${sha}' sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`,
+    )
     assert.equal(a.status, 0, a.stderr)
     assert.equal(b.status, 0, b.stderr)
     assert.match(a.stdout.trim(), /^[0-9a-f]{64}$/)
@@ -8913,11 +10371,9 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.equal(dry.status, 0, dry.stderr)
     assert.match(dry.stdout, /\[dry-run\].*rm marker/)
 
-    const blocked = invokeHelpers([
-      'DRY=0',
-      'ds_load() { return 1; }',
-      'reclaim_mutation_lane_inflight || exit 14',
-    ].join('\n'))
+    const blocked = invokeHelpers(
+      ['DRY=0', 'ds_load() { return 1; }', 'reclaim_mutation_lane_inflight || exit 14'].join('\n'),
+    )
     assert.equal(blocked.status, 14)
     assert.match(blocked.stderr, /无法读取 deploy_state/)
   })
@@ -8933,10 +10389,7 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     ...gitIdent,
     ...extra,
   })
-  const gitOk = (
-    args: string[],
-    opts: { env?: NodeJS.ProcessEnv; input?: string } = {},
-  ) => {
+  const gitOk = (args: string[], opts: { env?: NodeJS.ProcessEnv; input?: string } = {}) => {
     const result = spawnSync('git', args, {
       cwd: root,
       encoding: 'utf8',
@@ -8950,7 +10403,9 @@ describe('v5 release speedup (B1-B5, C4)', () => {
   const danglingFileChange = (file: string, extra = '\n// audit-blocker\n') => {
     const head = gitOk(['rev-parse', 'HEAD']).stdout.trim()
     const orig = gitOk(['show', `${head}:${file}`])
-    const blob = gitOk(['hash-object', '-w', '--stdin'], { input: orig.stdout + extra }).stdout.trim()
+    const blob = gitOk(['hash-object', '-w', '--stdin'], {
+      input: orig.stdout + extra,
+    }).stdout.trim()
     assert.match(blob, /^[0-9a-f]{40}$/)
     const ls = gitOk(['ls-tree', '-r', head, '--', file])
     const mode = ls.stdout.trim().split(/\s+/)[0]
@@ -8960,7 +10415,14 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     gitOk(['update-index', '--cacheinfo', `${mode},${blob},${file}`], { env })
     const tree = gitOk(['write-tree'], { env }).stdout.trim()
     assert.match(tree, /^[0-9a-f]{40}$/)
-    const commit = gitOk(['commit-tree', tree, '-p', head, '-m', `audit overlay ${file}`]).stdout.trim()
+    const commit = gitOk([
+      'commit-tree',
+      tree,
+      '-p',
+      head,
+      '-m',
+      `audit overlay ${file}`,
+    ]).stdout.trim()
     assert.match(commit, /^[0-9a-f]{40}$/)
     spawnSync('rm', ['-f', index])
     return { head, commit }
@@ -8968,34 +10430,40 @@ describe('v5 release speedup (B1-B5, C4)', () => {
 
   test('B1: specified --canary=<release> without green evidence is refused', () => {
     const sha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-    const refused = invokeHelpers([
-      'MODE=canary',
-      'CANARY_RELEASE=/opt/openclaude/openclaude-v5-releases/rel-audit-blocker',
-      'DRY=0',
-      `release_marker_probe() { printf 'strong\\t${sha}\\tshort\\tbuilt\\tart\\n'; }`,
-      'assert_ci_green_for_source_commit() { echo "✗ CI 绿门未通过(无证据)" >&2; return 1; }',
-      'maybe_run_ci_green_gate_for_mode || exit 21',
-    ].join('\n'))
+    const refused = invokeHelpers(
+      [
+        'MODE=canary',
+        'CANARY_RELEASE=/opt/openclaude/openclaude-v5-releases/rel-audit-blocker',
+        'DRY=0',
+        `release_marker_probe() { printf 'strong\\t${sha}\\tshort\\tbuilt\\tart\\n'; }`,
+        'assert_ci_green_for_source_commit() { echo "✗ CI 绿门未通过(无证据)" >&2; return 1; }',
+        'maybe_run_ci_green_gate_for_mode || exit 21',
+      ].join('\n'),
+    )
     assert.equal(refused.status, 21)
     assert.match(refused.stderr, /CI 绿门未通过|无证据/)
 
-    const legacy = invokeHelpers([
-      'MODE=canary',
-      'CANARY_RELEASE=/opt/openclaude/openclaude-v5-releases/rel-legacy',
-      'release_marker_probe() { printf "legacy\\tabc123\\tshort\\tbuilt\\tart\\n"; }',
-      'resolve_specified_canary_source_commit || exit 22',
-    ].join('\n'))
+    const legacy = invokeHelpers(
+      [
+        'MODE=canary',
+        'CANARY_RELEASE=/opt/openclaude/openclaude-v5-releases/rel-legacy',
+        'release_marker_probe() { printf "legacy\\tabc123\\tshort\\tbuilt\\tart\\n"; }',
+        'resolve_specified_canary_source_commit || exit 22',
+      ].join('\n'),
+    )
     assert.equal(legacy.status, 22)
     assert.match(legacy.stderr, /legacy/)
 
-    const noStamp = invokeHelpers([
-      'MODE=canary',
-      'CANARY_RELEASE=/opt/openclaude/openclaude-v5-releases/rel-audit-blocker',
-      'DRY=0',
-      'CI_GREEN_PASSED_SHA=',
-      'CI_GREEN_PASSED_AT=',
-      `assert_ci_green_specified_release_local ${sha} test || exit 23`,
-    ].join('\n'))
+    const noStamp = invokeHelpers(
+      [
+        'MODE=canary',
+        'CANARY_RELEASE=/opt/openclaude/openclaude-v5-releases/rel-audit-blocker',
+        'DRY=0',
+        'CI_GREEN_PASSED_SHA=',
+        'CI_GREEN_PASSED_AT=',
+        `assert_ci_green_specified_release_local ${sha} test || exit 23`,
+      ].join('\n'),
+    )
     assert.equal(noStamp.status, 23)
     assert.match(noStamp.stderr, /CI 绿门未在本进程通过/)
   })
@@ -9008,15 +10476,17 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.match(paths.stdout, /^package-lock\.json$/m)
 
     const { head, commit } = danglingFileChange('packages/protocol/src/activeContent.ts')
-    const changed = invokeHelpers([
-      `OLD='${head}'`,
-      `NEW='${commit}'`,
-      'ssh() {',
-      '  if [[ "$*" == *jq* ]]; then printf "%s\\n" "$OLD"; return 0; fi',
-      '  return 0',
-      '}',
-      'try_reuse_web_dist /tmp/oc-v5-dist-staging /tmp/oc-v5-dist-cur "$NEW" || exit 31',
-    ].join('\n'))
+    const changed = invokeHelpers(
+      [
+        `OLD='${head}'`,
+        `NEW='${commit}'`,
+        'ssh() {',
+        '  if [[ "$*" == *jq* ]]; then printf "%s\\n" "$OLD"; return 0; fi',
+        '  return 0',
+        '}',
+        'try_reuse_web_dist /tmp/oc-v5-dist-staging /tmp/oc-v5-dist-cur "$NEW" || exit 31',
+      ].join('\n'),
+    )
     assert.equal(changed.status, 31, changed.stdout + changed.stderr)
     assert.match(changed.stderr, /web workspace 闭包|有差异/)
   })
@@ -9035,7 +10505,10 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.doesNotMatch(listed.stdout, /\t\.github\//)
     assert.doesNotMatch(listed.stdout, /\tpackages\/desktop\//)
 
-    const sha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+    const sha = spawnSync('git', ['rev-parse', 'HEAD'], {
+      cwd: root,
+      encoding: 'utf8',
+    }).stdout.trim()
     const image = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     const base = invokeHelpers(`compute_runtime_input_digest '${sha}' '${image}'`)
     assert.equal(base.status, 0, base.stderr)
@@ -9047,7 +10520,10 @@ describe('v5 release speedup (B1-B5, C4)', () => {
   })
 
   test('B5: host-only web/e2e/github changes must not invalidate runtime digest', () => {
-    const sha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+    const sha = spawnSync('git', ['rev-parse', 'HEAD'], {
+      cwd: root,
+      encoding: 'utf8',
+    }).stdout.trim()
     const image = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     const base = invokeHelpers(`compute_runtime_input_digest '${sha}' '${image}'`)
     assert.equal(base.status, 0, base.stderr)
@@ -9075,7 +10551,10 @@ describe('v5 release speedup (B1-B5, C4)', () => {
   })
 
   test('B5: host-only release-metadata migrations must not invalidate runtime digest', () => {
-    const sha = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).stdout.trim()
+    const sha = spawnSync('git', ['rev-parse', 'HEAD'], {
+      cwd: root,
+      encoding: 'utf8',
+    }).stdout.trim()
     const image = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     const base = invokeHelpers(`compute_runtime_input_digest '${sha}' '${image}'`)
     assert.equal(base.status, 0, base.stderr)
@@ -9086,7 +10565,10 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     })
     assert.equal(orig.status, 0, orig.stderr)
     const parsed = JSON.parse(orig.stdout)
-    parsed.requiredMigrations = [...parsed.requiredMigrations, '0999_host_only_runtime_digest_fixture']
+    parsed.requiredMigrations = [
+      ...parsed.requiredMigrations,
+      '0999_host_only_runtime_digest_fixture',
+    ]
     const blob = spawnSync('git', ['hash-object', '-w', '--stdin'], {
       cwd: root,
       encoding: 'utf8',
@@ -9101,17 +10583,35 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     const mode = ls.stdout.trim().split(/\s+/)[0]
     const index = path.join(tmpdir(), `oc-v5-meta-idx-${process.pid}-${Date.now()}`)
     const env = { ...process.env, GIT_INDEX_FILE: index }
-    assert.equal(spawnSync('git', ['read-tree', sha], { cwd: root, encoding: 'utf8', env }).status, 0)
     assert.equal(
-      spawnSync('git', ['update-index', '--cacheinfo', `${mode},${blob},deploy/v5/release-metadata.json`], {
-        cwd: root,
-        encoding: 'utf8',
-        env,
-      }).status,
+      spawnSync('git', ['read-tree', sha], { cwd: root, encoding: 'utf8', env }).status,
       0,
     )
-    const tree = spawnSync('git', ['write-tree'], { cwd: root, encoding: 'utf8', env }).stdout.trim()
-    const commit = gitOk(['commit-tree', tree, '-p', sha, '-m', 'audit overlay metadata migrations']).stdout.trim()
+    assert.equal(
+      spawnSync(
+        'git',
+        ['update-index', '--cacheinfo', `${mode},${blob},deploy/v5/release-metadata.json`],
+        {
+          cwd: root,
+          encoding: 'utf8',
+          env,
+        },
+      ).status,
+      0,
+    )
+    const tree = spawnSync('git', ['write-tree'], {
+      cwd: root,
+      encoding: 'utf8',
+      env,
+    }).stdout.trim()
+    const commit = gitOk([
+      'commit-tree',
+      tree,
+      '-p',
+      sha,
+      '-m',
+      'audit overlay metadata migrations',
+    ]).stdout.trim()
     spawnSync('rm', ['-f', index])
     const migrated = invokeHelpers(`compute_runtime_input_digest '${commit}' '${image}'`)
     assert.equal(migrated.status, 0, migrated.stderr)
@@ -9125,16 +10625,27 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     }).stdout.trim()
     const capIndex = path.join(tmpdir(), `oc-v5-meta-cap-idx-${process.pid}-${Date.now()}`)
     const capEnv = { ...process.env, GIT_INDEX_FILE: capIndex }
-    assert.equal(spawnSync('git', ['read-tree', sha], { cwd: root, encoding: 'utf8', env: capEnv }).status, 0)
     assert.equal(
-      spawnSync('git', ['update-index', '--cacheinfo', `${mode},${capBlob},deploy/v5/release-metadata.json`], {
-        cwd: root,
-        encoding: 'utf8',
-        env: capEnv,
-      }).status,
+      spawnSync('git', ['read-tree', sha], { cwd: root, encoding: 'utf8', env: capEnv }).status,
       0,
     )
-    const capTree = spawnSync('git', ['write-tree'], { cwd: root, encoding: 'utf8', env: capEnv }).stdout.trim()
+    assert.equal(
+      spawnSync(
+        'git',
+        ['update-index', '--cacheinfo', `${mode},${capBlob},deploy/v5/release-metadata.json`],
+        {
+          cwd: root,
+          encoding: 'utf8',
+          env: capEnv,
+        },
+      ).status,
+      0,
+    )
+    const capTree = spawnSync('git', ['write-tree'], {
+      cwd: root,
+      encoding: 'utf8',
+      env: capEnv,
+    }).stdout.trim()
     const capCommit = gitOk([
       'commit-tree',
       capTree,
@@ -9149,7 +10660,6 @@ describe('v5 release speedup (B1-B5, C4)', () => {
     assert.notEqual(base.stdout.trim(), caps.stdout.trim())
   })
 })
-
 
 describe('v5 container gateway precompile survives runtime prune', () => {
   const libPath = path.join(root, 'scripts/v5-runtime-release-lib.sh')
@@ -9259,7 +10769,10 @@ describe('v5 container gateway precompile survives runtime prune', () => {
     const excludes = await readFile(excludesPath, 'utf8')
     assert.match(excludes, /^\/scripts\/$/m)
     assert.doesNotMatch(excludes, /packages\/cli\/scripts/)
-    const wrapperSrc = await readFile(path.join(root, 'packages/cli/scripts/run-container-gateway.sh'), 'utf8')
+    const wrapperSrc = await readFile(
+      path.join(root, 'packages/cli/scripts/run-container-gateway.sh'),
+      'utf8',
+    )
     // packages/cli/scripts → repo root is three hops; two hops would resolve under packages/.
     assert.match(wrapperSrc, /BASH_SOURCE\[0\]\}"\)\/\.\.\/\.\.\/\.\./)
   })
@@ -9314,7 +10827,11 @@ describe('v5 oc-memory MCP cjs survives runtime prune and gateway precompile', (
     assert.equal(existsSync(planted), true)
     // Same wipe compilePkg uses: rmSync(out, { recursive: true, force: true })
     await rm(dist, { recursive: true, force: true })
-    assert.equal(existsSync(planted), false, 'gateway compilePkg rmSync(dist) must wipe planted cjs')
+    assert.equal(
+      existsSync(planted),
+      false,
+      'gateway compilePkg rmSync(dist) must wipe planted cjs',
+    )
   })
 
   test('finalize rebuilds MCP/CLI cjs AFTER gateway precompile and fail-closes on reuse miss', async () => {
@@ -9352,7 +10869,9 @@ describe('v5 oc-memory MCP cjs survives runtime prune and gateway precompile', (
 
 describe('v5 versioned baseline manifest', () => {
   const expectedSkills = (): string[] => {
-    const text = spawnSync('sed', ['-n', '/^EXPECTED_SKILLS=(/,/^)/p', baselineGuard], { encoding: 'utf8' })
+    const text = spawnSync('sed', ['-n', '/^EXPECTED_SKILLS=(/,/^)/p', baselineGuard], {
+      encoding: 'utf8',
+    })
     assert.equal(text.status, 0, text.stderr)
     return text.stdout
       .split('\n')
@@ -9360,14 +10879,20 @@ describe('v5 versioned baseline manifest', () => {
       .filter((line) => line && !line.startsWith('EXPECTED_SKILLS') && line !== ')')
   }
 
-  async function copyRelease(suffix: string): Promise<{ dir: string; release: string; baseline: string }> {
+  async function copyRelease(
+    suffix: string,
+  ): Promise<{ dir: string; release: string; baseline: string }> {
     const dir = await mkdtemp(path.join(tmpdir(), `v5-bman-${suffix}-`))
     dirs.push(dir)
     const release = path.join(dir, 'release')
     const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
     await mkdir(path.dirname(baseline), { recursive: true })
-    await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, { recursive: true })
-    const hardened = spawnSync('bash', [baselineGuard, 'harden-release', release], { encoding: 'utf8' })
+    await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, {
+      recursive: true,
+    })
+    const hardened = spawnSync('bash', [baselineGuard, 'harden-release', release], {
+      encoding: 'utf8',
+    })
     assert.equal(hardened.status, 0, hardened.stderr)
     return { dir, release, baseline }
   }
@@ -9411,7 +10936,9 @@ describe('v5 versioned baseline manifest', () => {
     const sourceCommit = headSha()
     const { sha } = await writeManifest(release, skills, sourceCommit)
     await writeComplete(release, sha, sourceCommit)
-    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], {
+      encoding: 'utf8',
+    })
     assert.equal(result.status, 0, result.stderr)
     assert.match(result.stdout, /ok verify-release=/)
   })
@@ -9422,7 +10949,9 @@ describe('v5 versioned baseline manifest', () => {
     const sourceCommit = headSha()
     await writeManifest(release, skills, sourceCommit)
     await writeComplete(release, 'a'.repeat(64), sourceCommit)
-    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], {
+      encoding: 'utf8',
+    })
     assert.notEqual(result.status, 0)
     assert.match(result.stderr, /baseline manifest digest mismatch/)
   })
@@ -9431,7 +10960,9 @@ describe('v5 versioned baseline manifest', () => {
     const { release } = await copyRelease('missing-strict')
     const sourceCommit = headSha()
     await writeComplete(release, null, sourceCommit)
-    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], {
+      encoding: 'utf8',
+    })
     assert.notEqual(result.status, 0)
     assert.match(result.stderr, /baseline manifest missing/)
   })
@@ -9441,7 +10972,9 @@ describe('v5 versioned baseline manifest', () => {
     await rm(path.join(baseline, 'skills/multi-model-review'), { recursive: true })
     const sourceCommit = headSha()
     await writeComplete(release, null, sourceCommit)
-    const denied = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    const denied = spawnSync('bash', [baselineGuard, 'verify-release', release], {
+      encoding: 'utf8',
+    })
     assert.notEqual(denied.status, 0)
     const allowed = spawnSync(
       'bash',
@@ -9459,10 +10992,14 @@ describe('v5 versioned baseline manifest', () => {
     const sourceCommit = headSha()
     const { sha } = await writeManifest(release, skills, sourceCommit)
     await writeComplete(release, sha, sourceCommit)
-    const strict = spawnSync('bash', [baselineGuard, 'check-release', release], { encoding: 'utf8' })
+    const strict = spawnSync('bash', [baselineGuard, 'check-release', release], {
+      encoding: 'utf8',
+    })
     assert.notEqual(strict.status, 0)
     assert.match(strict.stderr, /skill manifest mismatch/)
-    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], {
+      encoding: 'utf8',
+    })
     assert.equal(result.status, 0, result.stderr)
     assert.match(result.stdout, /ok verify-release=/)
   })
@@ -9473,9 +11010,13 @@ describe('v5 versioned baseline manifest', () => {
     const sourceCommit = headSha()
     const { sha } = await writeManifest(release, skills, sourceCommit)
     await writeComplete(release, sha, sourceCommit)
-    const chmod = spawnSync('chmod', ['g+w', path.join(baseline, 'AGENTS.md')], { encoding: 'utf8' })
+    const chmod = spawnSync('chmod', ['g+w', path.join(baseline, 'AGENTS.md')], {
+      encoding: 'utf8',
+    })
     assert.equal(chmod.status, 0, chmod.stderr)
-    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], { encoding: 'utf8' })
+    const result = spawnSync('bash', [baselineGuard, 'verify-release', release], {
+      encoding: 'utf8',
+    })
     assert.notEqual(result.status, 0)
     assert.match(result.stderr, /group\/other writable/)
   })
@@ -9485,8 +11026,13 @@ describe('v5 versioned baseline manifest', () => {
     // Filled with the #545 merge SHA: must be 40-hex and an ancestor of HEAD
     // (otherwise the ancestry classifier can never be true).
     const cutoff = /^LEGACY_MANIFEST_CUTOFF_COMMIT="([0-9a-f]{40})"$/m.exec(source)
-    assert.ok(cutoff, 'LEGACY_MANIFEST_CUTOFF_COMMIT must be a filled 40-hex merge SHA, not the empty placeholder')
-    const anc = spawnSync('git', ['-C', root, 'merge-base', '--is-ancestor', cutoff[1], 'HEAD'], { encoding: 'utf8' })
+    assert.ok(
+      cutoff,
+      'LEGACY_MANIFEST_CUTOFF_COMMIT must be a filled 40-hex merge SHA, not the empty placeholder',
+    )
+    const anc = spawnSync('git', ['-C', root, 'merge-base', '--is-ancestor', cutoff[1], 'HEAD'], {
+      encoding: 'utf8',
+    })
     assert.equal(anc.status, 0, `cutoff ${cutoff[1]} must be an ancestor of HEAD`)
     assert.match(source, /OC_V5_LEGACY_BASELINE_FALLBACK="\$\{OC_V5_LEGACY_BASELINE_FALLBACK:-1\}"/)
     assert.match(source, /--allow-legacy-manifest-missing\) ALLOW_LEGACY_MANIFEST_MISSING=1/)
@@ -9498,4 +11044,3 @@ describe('v5 versioned baseline manifest', () => {
     assert.match(verify, /OC_V5_LEGACY_BASELINE_FALLBACK/)
   })
 })
-

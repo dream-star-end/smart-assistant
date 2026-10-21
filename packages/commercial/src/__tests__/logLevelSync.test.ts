@@ -83,6 +83,23 @@ describe('log level hot setting', () => {
     }
   })
 
+  test('Codex r1: a PUT-applied level is re-synced when the DB goes back to the value the poller last read', async () => {
+    let value: LogLevelSetting = 'info'
+    const p = startLogLevelSyncPoller({ read: async () => value, intervalMs: 60_000, log: quiet })
+    try {
+      await p.tick()
+      assert.equal(commercialLogLevel.get(), 'info')
+      applyLogLevelSetting('debug') // admin PUT in this process
+      value = 'info' // another process writes the old value back
+      await p.tick()
+      assert.equal(commercialLogLevel.get(), 'info')
+      assert.equal(gatewayLogLevel.get(), 'info')
+    } finally {
+      p.stop()
+      applyLogLevelSetting('env')
+    }
+  })
+
   test('an unknown level is rejected and changes nothing', () => {
     const before = registeredLogLevels()
     assert.throws(() => applyLogLevelSetting('loud' as LogLevelSetting), TypeError)

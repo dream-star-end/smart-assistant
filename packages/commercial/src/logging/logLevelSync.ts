@@ -18,11 +18,23 @@ import { type Logger, rootLogger } from './logger.js'
 
 export type LogLevelSetting = SystemSettingValue<'log_level'>
 
+/**
+ * The setting last applied in this process, by whichever path (boot, admin PUT, poller). The
+ * poller compares the DB value with this, not with what it read last, so a value applied by a
+ * PUT and then changed back in the DB by another process is still re-applied.
+ */
+let appliedSetting: LogLevelSetting | undefined
+
 /** Apply a log_level setting to every registered level; returns the levels now in force. */
 export function applyLogLevelSetting(value: LogLevelSetting): Record<string, string> {
   if (value === 'env') resetLogLevels()
   else setLogLevels(value)
+  appliedSetting = value
   return registeredLogLevels()
+}
+
+export function appliedLogLevelSetting(): LogLevelSetting | undefined {
+  return appliedSetting
 }
 
 export interface LogLevelSyncPoller {
@@ -37,18 +49,17 @@ export function startLogLevelSyncPoller(opts: {
   log?: Logger
 }): LogLevelSyncPoller {
   const log = opts.log ?? rootLogger.child({ subsys: 'logLevelSync' })
-  let last: LogLevelSetting | undefined
   let running = false
   const tick = async () => {
     if (running) return
     running = true
     try {
       const value = await opts.read()
-      if (value !== last) {
+      if (value !== appliedSetting) {
+        const first = appliedSetting === undefined
         const levels = applyLogLevelSetting(value)
-        if (last !== undefined || value !== 'env')
+        if (!first || value !== 'env')
           log.info('log level setting applied', { setting: value, levels })
-        last = value
       }
     } catch (err) {
       log.warn('log level setting read failed; keeping current levels', { err })
