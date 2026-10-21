@@ -306,6 +306,10 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     cancel: tsFailureProbe('packages/gateway/src/ocOcrCli.ts', ['cancel'], /cancel <ticket>/),
     download: tsFailureProbe('packages/gateway/src/ocOcrCli.ts', ['download'], /download <ticket>/),
   },
+  'oc-muse': {
+    image: scriptProbe('oc-muse.py', ['image', '--help'], { code: 0, stdout: /--format/ }),
+    video: scriptProbe('oc-muse.py', ['video', '--help'], { code: 0, stdout: /--resume/ }),
+  },
   'oc-h3': {
     generate: scriptProbe('oc-h3.py', ['generate', '--help'], {
       code: 0,
@@ -921,6 +925,9 @@ function productionSurfaces(): Record<string, Set<string>> {
     ),
     'oc-docx': pythonArgparseCommands(
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-docx.py',
+    ),
+    'oc-muse': pythonArgparseCommands(
+      'packages/commercial/agent-sandbox/platform-runtime/bin/oc-muse.py',
     ),
     'oc-docxcheck': singlePurpose(
       'packages/commercial/agent-sandbox/platform-runtime/bin/oc-docxcheck.sh',
