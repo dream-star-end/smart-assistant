@@ -236,13 +236,13 @@ function decodeHtmlEntities(input: string): string {
 function isSafePaperId(paperId: string): boolean {
   if (paperId.length < 3 || paperId.length > 40) return false
   if (paperId.includes('..') || paperId.includes('/') || paperId.includes('\\')) return false
-  return /^[^\s\x00-\x1f\x7f?#]+$/.test(paperId)
+  return /^[^\s\p{Cc}?#]+$/u.test(paperId)
 }
 
 export function normalizeSpringerDoi(rawDoi: string): string | null {
   const decoded = rawDoi.trim().replace(/%2F/gi, '/')
   if (decoded.includes('..') || decoded.includes('\\')) return null
-  const match = /^(?:10\.)?(\d{4,9})\/([^\s/\\?#\x00-\x1f\x7f]+)$/.exec(decoded)
+  const match = /^(?:10\.)?(\d{4,9})\/([^\s/\\?#\p{Cc}]+)$/u.exec(decoded)
   if (!match?.[1] || !match[2]) return null
   return `10.${match[1]}/${match[2]}`
 }
@@ -250,7 +250,7 @@ export function normalizeSpringerDoi(rawDoi: string): string | null {
 export function normalizeSpringerPaperId(paperId: string): string {
   const trimmed = paperId.trim()
   if (trimmed.includes('..') || trimmed.includes('\\')) return paperId
-  const match = /^sp[._](?:10\.)?(\d{4,9})_([^\s/\\?#\x00-\x1f\x7f]+)$/.exec(trimmed)
+  const match = /^sp[._](?:10\.)?(\d{4,9})_([^\s/\\?#\p{Cc}]+)$/u.exec(trimmed)
   if (!match?.[1] || !match[2]) return paperId
   return `sp_10.${match[1]}_${match[2]}`
 }
@@ -377,8 +377,7 @@ function verifyDocumentIdHmac(
     .slice(0, 32)
   const expectedBuf = Buffer.from(expectedMacHex, 'hex')
   return (
-    providedBuf.length === expectedBuf.length &&
-    crypto.timingSafeEqual(providedBuf, expectedBuf)
+    providedBuf.length === expectedBuf.length && crypto.timingSafeEqual(providedBuf, expectedBuf)
   )
 }
 
@@ -407,9 +406,7 @@ export function verifyScopedDocumentId(
   const rawPaperId = Buffer.from(pidHex, 'hex').toString('utf8')
   const canonicalPaperId = normalizeSpringerPaperId(rawPaperId)
   const canonicalPidHex =
-    canonicalPaperId !== rawPaperId
-      ? Buffer.from(canonicalPaperId, 'utf8').toString('hex')
-      : pidHex
+    canonicalPaperId !== rawPaperId ? Buffer.from(canonicalPaperId, 'utf8').toString('hex') : pidHex
   const providedBuf = Buffer.from(macHex, 'hex')
   const matchesRaw = verifyDocumentIdHmac(
     secret,
