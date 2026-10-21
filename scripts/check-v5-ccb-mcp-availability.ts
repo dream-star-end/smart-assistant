@@ -277,7 +277,13 @@ assert.ok(
 );
 
 // OCV5-510: prove a discoverable search tool exists for Codex's scrubbed process environment.
-await proveWebSearchCli(root, join(root, "packages/gateway/src/ocWebCli.ts"));
+try {
+  await proveWebSearchCli(root, join(root, "packages/gateway/src/ocWebCli.ts"));
+} catch (error) {
+  // OCV5-557: the one line the release reads to decide whether this failure is a known flake
+  console.error(`[gate-failure] ${(error instanceof Error ? error.message : String(error)).split("\n")[0]}`);
+  throw error;
+}
 console.log("[ocv5-510-codex-web-search-cli] PASS — the real CLI restores container identity and returns a sourced result through MiniMax then Grok");
 
 console.log(
