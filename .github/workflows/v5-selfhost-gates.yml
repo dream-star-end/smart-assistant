@@ -188,6 +188,53 @@ jobs:
           path: ${{ runner.temp }}/architecture.json
           if-no-files-found: ignore
 
+  # OCV5-544(第三阶段 §5.7 第 1 条、附录 D):门禁 ↔ 源码路径耦合。PR 移动/删除了某个门禁点名的路径,
+  # 而该门禁在 HEAD 仍点名旧路径 → UNCOVERED。报告期只输出不拦;快照过期也只报告;git 失败、参数错误照样红。
+  gate-couplings:
+    name: gate-couplings
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve comparison base
+        id: base
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            ref="origin/$BASE_REF"
+          elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            ref="$BEFORE"
+          else
+            ref="origin/feat/v5-selfhost"
+          fi
+          git rev-parse --verify "$ref^{commit}" >/dev/null
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Gate couplings (report period)
+        run: npx tsx scripts/check-gate-couplings.ts --base "${{ steps.base.outputs.ref }}"
+
+      - name: Snapshot freshness (report period)
+        run: npx tsx scripts/check-gate-couplings.ts --check
+
+      - name: Checker tests
+        run: npx tsx --test scripts/__tests__/checkGateCouplings.test.ts
+
   # OCV5-447:列车 pinned staging 跑的 watch / autorecover 行为门,PR 上先跑同一份清单
   # (scripts/v5-selfhost-watch-gate.sh)。此前只有列车跑,watch 改动要等一趟列车失败才知道。
   watch-gate:
