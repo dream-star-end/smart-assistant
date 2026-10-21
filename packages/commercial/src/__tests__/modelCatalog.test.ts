@@ -875,6 +875,16 @@ describe("OCV5-551 box-gpt-6-astra-pro owner uid=3 restriction", () => {
         s.listForUser({ uid: 2, role: "admin", grantedModelIds: grantSet }).map((m) => m.modelId),
         ["glm-5.2"],
       );
+
+      // Omitted uid must fail closed for box-gpt-6-astra-pro even for admin with grant
+      assert.equal(
+        s.canUseModel({ role: "admin", grantedModelIds: grantSet }, "box-gpt-6-astra-pro"),
+        false,
+      );
+      assert.deepEqual(
+        s.listForUser({ role: "admin", grantedModelIds: grantSet }).map((m) => m.modelId),
+        ["glm-5.2"],
+      );
     } finally {
       if (prevUids === undefined) delete process.env.OC_V5_CURSOR_CREDENTIAL_UIDS;
       else process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = prevUids;

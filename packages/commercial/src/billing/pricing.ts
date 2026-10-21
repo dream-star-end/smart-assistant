@@ -426,7 +426,7 @@ export class PricingCache {
       .filter((p) => {
         if (!p.enabled) return false;
         if (isBoxGptWebModel(p.model_id)) {
-          if (args.uid !== undefined && !isBoxGptWebOwnerUid(args.uid)) return false;
+          if (!isBoxGptWebOwnerUid(args.uid)) return false;
           if (!args.grantedModelIds.has(p.model_id)) return false;
         }
         if (args.deniedModelIds?.has(p.model_id)) return false;

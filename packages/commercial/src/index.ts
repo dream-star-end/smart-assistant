@@ -5345,8 +5345,8 @@ export async function registerCommercial(
         ]);
         return pickWechatInboundModel({
           preferredModel: prefs.prefs.default_model,
-          visibleModels: pricing.listForUser(authz),
-          canUseModel: (modelId) => canUseModel({ pricing }, { ...authz, modelId }),
+          visibleModels: pricing.listForUser({ uid, ...authz }),
+          canUseModel: (modelId) => canUseModel({ pricing }, { uid, ...authz, modelId }),
           allowedModels: ALLOWED_INBOUND_MODELS,
         });
       },
@@ -5396,9 +5396,9 @@ export async function registerCommercial(
           text,
           channelName: "QQ",
           preferredModel: prefs.prefs.default_model,
-          visibleModels: pricing.listForUser(authz),
+          visibleModels: pricing.listForUser({ uid, ...authz }),
           canUseModel: (modelId) =>
-            canUseModel({ pricing }, { ...authz, modelId }),
+            canUseModel({ pricing }, { uid, ...authz, modelId }),
           allowedModels: ALLOWED_INBOUND_MODELS,
           setDefaultModel: async (modelId) => {
             await patchPreferences(uid, { default_model: modelId });
@@ -5485,9 +5485,9 @@ export async function registerCommercial(
 
         return pickWechatInboundModel({
           preferredModel: prefs.prefs.default_model,
-          visibleModels: pricing.listForUser(authz),
+          visibleModels: pricing.listForUser({ uid, ...authz }),
           canUseModel: (modelId) =>
-            canUseModel({ pricing }, { ...authz, modelId }),
+            canUseModel({ pricing }, { uid, ...authz, modelId }),
           allowedModels: ALLOWED_INBOUND_MODELS,
         });
       },
@@ -5560,9 +5560,9 @@ export async function registerCommercial(
           return await handleWechatModelCommand({
             text: evt.text,
             preferredModel: prefs.prefs.default_model,
-            visibleModels: pricing.listForUser(authz),
+            visibleModels: pricing.listForUser({ uid, ...authz }),
             canUseModel: (modelId) =>
-              canUseModel({ pricing }, { ...authz, modelId }),
+              canUseModel({ pricing }, { uid, ...authz, modelId }),
             allowedModels: ALLOWED_INBOUND_MODELS,
             setDefaultModel: async (modelId) => {
               await patchPreferences(uid, { default_model: modelId });
@@ -5958,7 +5958,7 @@ export async function registerCommercial(
       const { canUseModel } = await import("./billing/authzModels.js");
       const authz = await loadUserModelAuthz(uid);
       return (modelId: string) =>
-        canUseModel({ pricing }, { ...authz, modelId });
+        canUseModel({ pricing }, { uid, ...authz, modelId });
     },
     // P0 计费旁路封堵 —— bridge 可信模型推导的 agent 权威(seed 声明 / 常量 +
     // marketplace 预设/已装 manifest,详见 ws/agentModelAuthority.ts 头注)。

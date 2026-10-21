@@ -173,6 +173,10 @@ export function formatStreamJsonControlResponse(opts: {
   requestId: string
   subtype?: string
 }): string
+export function formatStreamJsonKeepalive(opts: {
+  sessionId: string
+  elapsedMs?: number
+}): string
 export function extractInboundDispatchAttachments(
   rawText: string,
   opts?: { allowedUploadRoots?: readonly string[]; stripWithoutVerify?: boolean },

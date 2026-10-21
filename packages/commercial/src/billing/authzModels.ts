@@ -60,7 +60,7 @@ export function canUseModel(deps: CanUseModelDeps, input: CanUseModelInput): boo
   if (!pricing) return false
   if (!pricing.enabled) return false
   if (isBoxGptWebModel(pricing.model_id)) {
-    if (input.uid !== undefined && !isBoxGptWebOwnerUid(input.uid)) return false
+    if (!isBoxGptWebOwnerUid(input.uid)) return false
     if (!input.grantedModelIds.has(pricing.model_id)) return false
   }
   if (input.deniedModelIds?.has(canonical)) return false

@@ -95,6 +95,7 @@ export function projectExternalModels(
   pricing: PricingCache,
   authz: Awaited<ReturnType<UserModelAuthzLoader>>,
   ownedBy: string,
+  uid?: string | number | bigint | null,
 ): ExternalModelEntry[] {
   const families = new Map<string, { entry: ExternalModelEntry; sortOrder: number }>();
   for (const internalId of CURSOR_ENGINE_MODEL_IDS) {
@@ -103,6 +104,7 @@ export function projectExternalModels(
     const allowed = canUseModel(
       { pricing },
       {
+        uid: uid ?? authz.uid,
         role: authz.role,
         grantedModelIds: authz.grantedModelIds,
         deniedModelIds: authz.deniedModelIds,
@@ -167,7 +169,7 @@ export function makeExternalModelsHandler(deps: ExternalModelsHandlerDeps): Exte
     }
 
     const authz = await deps.loadUserModelAuthz(identity.uid);
-    const data = projectExternalModels(deps.pricing, authz, deps.ownedBy);
+    const data = projectExternalModels(deps.pricing, authz, deps.ownedBy, identity.uid);
     const body: ExternalModelsResponse = {
       object: "list",
       data,

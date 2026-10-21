@@ -288,28 +288,48 @@ export async function withProfileFileLock(
   } = {},
 ) {
   const deadline = Date.now() + timeoutMs
-  let fd = null
-  while (fd === null) {
+  let acquiredIno = null
+  while (acquiredIno === null) {
+    const tmpPath = `${lockPath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
     try {
-      fd = fs.openSync(lockPath, 'wx')
-      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }))
+      fs.writeFileSync(tmpPath, JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }), {
+        mode: 0o600,
+      })
+      fs.linkSync(tmpPath, lockPath)
+      const st = fs.statSync(lockPath)
+      acquiredIno = st.ino
     } catch (err) {
       if (err && err.code === 'EEXIST') {
         try {
-          const stat = fs.statSync(lockPath)
-          const ageMs = Date.now() - stat.mtimeMs
+          const candidateStat = fs.statSync(lockPath)
+          const ageMs = Date.now() - candidateStat.mtimeMs
           let ownerDead = false
-          if (ageMs >= 50) {
-            try {
-              const raw = fs.readFileSync(lockPath, 'utf8')
-              const parsed = JSON.parse(raw)
-              if (parsed && Number.isInteger(parsed.pid) && !pidAliveFn(parsed.pid)) {
-                ownerDead = true
-              }
-            } catch {}
-          }
+          try {
+            const raw = fs.readFileSync(lockPath, 'utf8')
+            const parsed = JSON.parse(raw)
+            if (parsed && Number.isInteger(parsed.pid) && !pidAliveFn(parsed.pid)) {
+              ownerDead = true
+            }
+          } catch {}
           if (ownerDead || ageMs > staleMs) {
-            fs.unlinkSync(lockPath)
+            const reclaimPath = `${lockPath}.reclaim`
+            let reclaimFd = null
+            try {
+              reclaimFd = fs.openSync(reclaimPath, 'wx')
+              const verifyStat = fs.statSync(lockPath)
+              if (verifyStat.ino === candidateStat.ino) {
+                fs.unlinkSync(lockPath)
+              }
+            } catch {} finally {
+              if (reclaimFd !== null) {
+                try {
+                  fs.closeSync(reclaimFd)
+                } catch {}
+                try {
+                  fs.unlinkSync(reclaimPath)
+                } catch {}
+              }
+            }
             continue
           }
         } catch {}
@@ -323,16 +343,20 @@ export async function withProfileFileLock(
         continue
       }
       throw err
+    } finally {
+      try {
+        fs.unlinkSync(tmpPath)
+      } catch {}
     }
   }
   try {
     return await fn()
   } finally {
     try {
-      fs.closeSync(fd)
-    } catch {}
-    try {
-      fs.unlinkSync(lockPath)
+      const curStat = fs.statSync(lockPath)
+      if (curStat.ino === acquiredIno) {
+        fs.unlinkSync(lockPath)
+      }
     } catch {}
   }
 }
@@ -607,7 +631,27 @@ export async function selectProTierInPage(page, { requestedTier = 'pro' } = {}) 
         await page.mouse.click(targetX, targetY)
       }
     }
-    selectedCaption = (await slider.getAttribute('aria-valuetext')) || LEVEL_SLIDER_PCT[targetCanon]
+    const finalValRaw = await slider.getAttribute('aria-valuenow')
+    const finalValText = await slider.getAttribute('aria-valuetext')
+    const finalValNum = finalValRaw !== null ? Number(finalValRaw) : Number.NaN
+    const captionIdx = finalValText ? levelIndex(finalValText.split(/[-–—]/)[0].trim()) : -1
+    if (finalValNum !== targetIdx && captionIdx !== targetIdx) {
+      await page.keyboard.press('Escape').catch(() => {})
+      const postClickLimit = detectTierLimit(await readBanners(), targetIdx)
+      if (postClickLimit?.blocked) {
+        throw new TierLimitError(postClickLimit)
+      }
+      throw new Error(
+        `BOX_GPT_WEB_TIER_MISMATCH: requested ${targetCanon} (index ${targetIdx}) but slider remained at aria-valuenow=${String(finalValRaw)} aria-valuetext=${String(finalValText)}`,
+      )
+    }
+    if (captionIdx !== -1 && captionIdx !== targetIdx) {
+      await page.keyboard.press('Escape').catch(() => {})
+      throw new Error(
+        `BOX_GPT_WEB_TIER_MISMATCH: requested ${targetCanon} (index ${targetIdx}) but slider aria-valuetext=${String(finalValText)}`,
+      )
+    }
+    selectedCaption = finalValText || LEVEL_SLIDER_PCT[targetCanon]
   } else {
     const proItem = menu
       .locator('[role="menuitem"], [role="menuitemradio"]')
@@ -1174,6 +1218,15 @@ export function formatStreamJsonControlResponse({ requestId, subtype = 'success'
       subtype,
       request_id: String(requestId ?? ''),
     },
+  })
+}
+
+export function formatStreamJsonKeepalive({ sessionId, elapsedMs = 0 }) {
+  return JSON.stringify({
+    type: 'system',
+    subtype: 'keepalive',
+    session_id: String(sessionId ?? ''),
+    elapsed_ms: Math.max(0, Math.round(elapsedMs)),
   })
 }
 

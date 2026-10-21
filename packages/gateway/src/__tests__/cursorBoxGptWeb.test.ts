@@ -17,6 +17,7 @@ import {
   extractAssistantFromMapping,
   extractInboundDispatchAttachments,
   extractUserTurnFromStdinFrame,
+  formatStreamJsonKeepalive,
   isChatGptOriginUrl,
   levelIndex,
   loadSessionConversationMap,
@@ -433,6 +434,25 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
     await assert.rejects(
       () => selectProTierInPage(mockPage, { requestedTier: 'pro' }),
       (err: unknown) => err instanceof TierLimitError && err.code === 'TIER_LIMIT',
+    )
+
+    // When slider stays stuck at Extended (index 2) after key + click, fail closed with BOX_GPT_WEB_TIER_MISMATCH
+    banners = []
+    sliderVal = 2
+    const stuckPage = {
+      ...mockPage,
+      keyboard: {
+        press: async (key: string) => {
+          pressedKeys.push(key)
+        },
+      },
+      mouse: {
+        click: async () => {},
+      },
+    }
+    await assert.rejects(
+      () => selectProTierInPage(stuckPage, { requestedTier: 'pro' }),
+      /BOX_GPT_WEB_TIER_MISMATCH/,
     )
   })
 
@@ -1029,5 +1049,41 @@ rl.on('line', (line) => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+
+    // Concurrent contenders reclaiming a dead-PID lock must preserve mutual exclusion
+    const raceDir = mkdtempSync(join(tmpdir(), 'oc-box-gpt-web-race-'))
+    try {
+      const raceLock = join(raceDir, 'profile.lock')
+      writeFileSync(raceLock, JSON.stringify({ pid: 99999999, acquiredAt: Date.now() - 5_000 }))
+      let inCritical = 0
+      let maxInCritical = 0
+      const contender = (id: string) =>
+        withProfileFileLock(
+          raceLock,
+          async () => {
+            inCritical += 1
+            maxInCritical = Math.max(maxInCritical, inCritical)
+            await new Promise((r) => setTimeout(r, 40))
+            inCritical -= 1
+            return id
+          },
+          { timeoutMs: 0, busyMessage: BOX_GPT_WEB_BUSY_MESSAGE },
+        )
+      const settled = await Promise.allSettled([contender('A'), contender('B')])
+      assert.equal(maxInCritical, 1)
+      const fulfilled = settled.filter((r) => r.status === 'fulfilled')
+      const rejected = settled.filter((r) => r.status === 'rejected')
+      assert.equal(fulfilled.length, 1)
+      assert.equal(rejected.length, 1)
+    } finally {
+      rmSync(raceDir, { recursive: true, force: true })
+    }
+
+    const keepaliveLine = formatStreamJsonKeepalive({ sessionId: 'sess-ka', elapsedMs: 32_000 })
+    const keepaliveObj = JSON.parse(keepaliveLine.trim())
+    assert.equal(keepaliveObj.type, 'system')
+    assert.equal(keepaliveObj.subtype, 'keepalive')
+    assert.equal(keepaliveObj.session_id, 'sess-ka')
+    assert.equal(keepaliveObj.elapsed_ms, 32_000)
   })
 })

@@ -28,6 +28,7 @@ import {
   extractAssistantFromMapping,
   formatStreamJsonAssistantMessage,
   formatStreamJsonControlResponse,
+  formatStreamJsonKeepalive,
   formatStreamJsonResult,
   formatStreamJsonSystemInit,
   formatStreamJsonTextDelta,
@@ -395,9 +396,11 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
 
       const acc = new SseAccumulator({
         onThinkingDelta: (delta) => {
+          lastStdoutActivityAt = Date.now()
           writeStdoutLine(formatStreamJsonThinkingDelta(delta))
         },
         onTextDelta: (delta) => {
+          lastStdoutActivityAt = Date.now()
           writeStdoutLine(formatStreamJsonTextDelta(delta))
         },
       })
@@ -407,6 +410,8 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
       let stopGoneSince = null
       let sawStopBtn = false
       let lastMappingPollAt = 0
+      let lastObservedNodeId = baselineNodeId
+      let lastStdoutActivityAt = startedAt
       let readCursor = 0
 
       while (true) {
@@ -480,8 +485,16 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
           const mapped = await fetchConversationFromMappingInPage(page, resolvedConvId, {
             baselineNodeId,
           })
-          if (mapped?.currentNode && mapped.currentNode !== baselineNodeId) {
+          if (mapped?.currentNode && mapped.currentNode !== lastObservedNodeId) {
+            lastObservedNodeId = mapped.currentNode
             acc.lastEventAt = now
+            lastStdoutActivityAt = now
+            writeStdoutLine(
+              formatStreamJsonKeepalive({
+                sessionId: cfg.sessionId,
+                elapsedMs: now - startedAt,
+              }),
+            )
           }
           if (mapped?.text) {
             if (mapped.convId) {
@@ -506,6 +519,21 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
           currentDeadline,
         })
         currentDeadline = adaptive.deadline
+
+        if (
+          !adaptive.expired &&
+          now - acc.lastEventAt < 240_000 &&
+          (batch.stopBtn || acc.streamHandoff) &&
+          now - lastStdoutActivityAt >= 30_000
+        ) {
+          lastStdoutActivityAt = now
+          writeStdoutLine(
+            formatStreamJsonKeepalive({
+              sessionId: cfg.sessionId,
+              elapsedMs: now - startedAt,
+            }),
+          )
+        }
 
         if (adaptive.shouldRescue && hasValidMappingBaseline) {
           const rescued = await rescueFromDomOrMapping(page, resolvedConvId, { baselineNodeId })
