@@ -296,6 +296,30 @@ function clampInt(value, min, max, fallback) {
   const n = Number(value);
   return Number.isSafeInteger(n) ? Math.max(min, Math.min(max, n)) : fallback;
 }
+/**
+ * 列表分页（fail-closed）：has_more 只认 true/false/1/0；还有下一页时游标必须是非负整数且不等于
+ * 本次请求的游标，否则下一次调用会重读同一页。只有空列表允许不带 has_more。
+ */
+function pageInfo(data, cursorKey, requested, empty) {
+  const raw = data.has_more;
+  let hasMore;
+  if (raw === true || raw === 1) hasMore = true;
+  else if (raw === false || raw === 0 || (raw === undefined && empty)) hasMore = false;
+  else throw new Error('WORKER_FAILED');
+  const cursor = data[cursorKey] === undefined ? undefined : Number.isSafeInteger(data[cursorKey]) && data[cursorKey] >= 0 ? data[cursorKey] : null;
+  if (cursor === null || (hasMore && (cursor === undefined || cursor === requested))) throw new Error('WORKER_FAILED');
+  return { hasMore, cursor };
+}
+/** 逐条投影：任何一条认不出（返回 null）整个列表失败；返回 undefined 的条目（如无文字评论）跳过。 */
+function projectList(list, fn) {
+  const out = [];
+  for (const raw of list.slice(0, 20)) {
+    const item = fn(raw);
+    if (item === null) throw new Error('WORKER_FAILED');
+    if (item !== undefined) out.push(item);
+  }
+  return out;
+}
 /** work_list 里的一个作品（2026-10-22 实测字段）。 */
 function videoItem(a) {
   if (!a || typeof a !== 'object') return null;
@@ -328,8 +352,9 @@ function videoItem(a) {
 function commentItem(c) {
   if (!c || typeof c !== 'object') return null;
   const cid = digits(c.cid);
+  if (!cid || typeof c.text !== 'string') return null;
   const text = cleanText(c.text, 1000);
-  if (!cid || !text) return null;
+  if (!text) return undefined;
   return compact({
     cid, text,
     nickname: cleanText(c.user && c.user.nickname, 128) || undefined,
@@ -350,10 +375,11 @@ async function actionRead(page, input) {
     const query = new URLSearchParams({ status: '0', count: String(count), max_cursor: String(cursor) });
     const data = creatorData(await apiGet(page, SITE + '/janus/douyin/creator/pc/work_list?' + query.toString()));
     if (!Array.isArray(data.aweme_list)) throw new Error('WORKER_FAILED');
+    const paging = pageInfo(data, 'max_cursor', cursor, data.aweme_list.length === 0);
     return compact({
-      items: data.aweme_list.slice(0, 20).map(videoItem).filter(Boolean),
-      hasMore: data.has_more === true || data.has_more === 1,
-      cursor: nonNegInt(data.max_cursor),
+      items: projectList(data.aweme_list, videoItem),
+      hasMore: paging.hasMore,
+      cursor: paging.cursor,
       total: nonNegInt(data.total)
     });
   }
@@ -365,11 +391,13 @@ async function actionRead(page, input) {
     const data = creatorData(await apiGet(page, SITE + '/aweme/v1/creator/comment/list/?' + query.toString()));
     // 登录后的应答形状未实测：只认 comments 数组（没有评论时可能是 null）；认不出就失败，不猜。
     if (data.comments !== null && !Array.isArray(data.comments)) throw new Error('WORKER_FAILED');
+    const list = data.comments || [];
+    const paging = pageInfo(data, 'cursor', cursor, list.length === 0);
     return compact({
       awemeId,
-      items: (data.comments || []).slice(0, 20).map(commentItem).filter(Boolean),
-      hasMore: data.has_more === true || data.has_more === 1,
-      cursor: nonNegInt(data.cursor),
+      items: projectList(list, commentItem),
+      hasMore: paging.hasMore,
+      cursor: paging.cursor,
       total: nonNegInt(data.total)
     });
   }

@@ -439,7 +439,6 @@ describe('douyin worker behaviour (compiled from the pinned source)', () => {
                 Cover: { url_list: ['https://evil.example/x.jpeg'] },
                 statistics: {},
               },
-              { aweme_id: 'not-digits' },
             ],
           },
         },
@@ -509,8 +508,7 @@ describe('douyin worker behaviour (compiled from the pinned source)', () => {
                 reply_comment_total: 1,
                 user: { nickname: '路人' },
               },
-              { cid: 'bad', text: 'x' },
-              { cid: '7400000000000000102', text: '' },
+              { cid: '7400000000000000102', text: '  ' },
             ],
           },
         },
@@ -551,9 +549,29 @@ describe('douyin worker behaviour (compiled from the pinned source)', () => {
       ),
       { awemeId: '1', items: [], hasMore: false },
     )
-    // 认不出的形状、坏 id、未登录。
+    // 认不出的形状、认不出的条目、分页字段不对、坏 id、未登录。
     for (const [body, re] of [
       [{ status_code: 0, data: { comments: [] } }, /WORKER_FAILED/],
+      [
+        {
+          status_code: 0,
+          comments: [{ comment_id: '9', content: '真实评论' }],
+          has_more: 0,
+          total: 1,
+        },
+        /WORKER_FAILED/,
+      ],
+      [{ status_code: 0, comments: [{ cid: 'bad', text: 'x' }], has_more: 0 }, /WORKER_FAILED/],
+      [{ status_code: 0, comments: [{ cid: '9', text: 'x' }] }, /WORKER_FAILED/],
+      [{ status_code: 0, comments: [{ cid: '9', text: 'x' }], has_more: 1 }, /WORKER_FAILED/],
+      [
+        { status_code: 0, comments: [{ cid: '9', text: 'x' }], has_more: 1, cursor: 0 },
+        /WORKER_FAILED/,
+      ],
+      [
+        { status_code: 0, comments: [{ cid: '9', text: 'x' }], has_more: '1', cursor: 20 },
+        /WORKER_FAILED/,
+      ],
       [{ status_code: 8 }, /LOGIN_EXPIRED/],
       [{ status_code: 5 }, /WORKER_FAILED/],
     ] as const)
@@ -587,6 +605,41 @@ describe('douyin worker behaviour (compiled from the pinned source)', () => {
         { actionId: 'my_videos' },
       ),
       /LOGIN_EXPIRED/,
+    )
+  })
+
+  test('my_videos fails closed on unknown entries and bad pagination (PR3 Codex r1)', async () => {
+    const item = { aweme_id: '7400000000000000001' }
+    for (const body of [
+      { status_code: 0, aweme_list: [{ aweme_id: 'not-digits' }], has_more: false },
+      { status_code: 0, aweme_list: [item], has_more: '1', max_cursor: 100 },
+      { status_code: 0, aweme_list: [item], has_more: 1 },
+      { status_code: 0, aweme_list: [item], has_more: 1, max_cursor: 0 },
+      { status_code: 0, aweme_list: [item], has_more: true, max_cursor: '100' },
+      { status_code: 0, aweme_list: [item] },
+    ])
+      await assert.rejects(
+        worker.actionRead(
+          fakePage({
+            [USER_INFO]: USER_INFO_OK,
+            [`${SITE}/janus/douyin/creator/pc/work_list`]: { body },
+          }),
+          { actionId: 'my_videos' },
+        ),
+        /WORKER_FAILED/,
+        JSON.stringify(body),
+      )
+    assert.deepEqual(
+      await worker.actionRead(
+        fakePage({
+          [USER_INFO]: USER_INFO_OK,
+          [`${SITE}/janus/douyin/creator/pc/work_list`]: {
+            body: { status_code: 0, aweme_list: [] },
+          },
+        }),
+        { actionId: 'my_videos' },
+      ),
+      { items: [], hasMore: false },
     )
   })
 
