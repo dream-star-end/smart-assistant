@@ -83,6 +83,7 @@ export const ALL_GATE_IDS: GateId[] = ALL_GATES.map((g) => g.id);
 /** tsc --build 工程图(根 tsconfig.json references)。web-react 不在图内,单独跑。 */
 export const COMPOSITE_PROJECTS = [
   "packages/protocol",
+  "packages/kernel",
   "packages/storage",
   "packages/plugin-sdk",
   "packages/mcp-memory",
@@ -107,6 +108,8 @@ export const TYPECHECK_DEPENDENTS: Record<CompositeProject, CompositeProject[]> 
     "packages/commercial",
     "packages/cli",
   ],
+  // OCV5-546:kernel 刚建好、还没有生产代码 import 它;谁开始 import 就在这里登记谁。
+  "packages/kernel": [],
   "packages/storage": [
     "packages/mcp-memory",
     "packages/gateway",
@@ -176,7 +179,7 @@ export const GATE_RULES: GateRule[] = [
   {
     id: "incident-surface",
     comment:
-      "check-v5-incident-regressions.ts 只扫描 gateway/commercial/web-react/protocol/storage " +
+      "check-v5-incident-regressions.ts 只扫描 gateway/commercial/web-react/protocol/storage/kernel " +
       "上的 fix(v5) 提交;改这些包或门自身时才跑。",
     match: (f) =>
       f.startsWith("packages/gateway/") ||
@@ -184,6 +187,7 @@ export const GATE_RULES: GateRule[] = [
       f.startsWith("packages/web-react/") ||
       f.startsWith("packages/protocol/") ||
       f.startsWith("packages/storage/") ||
+      f.startsWith("packages/kernel/") ||
       f === "scripts/check-v5-incident-regressions.ts" ||
       /(^|\/)incidents\.json$/.test(f),
     gates: ["check:v5:incidents"],
@@ -352,6 +356,15 @@ export const GATE_RULES: GateRule[] = [
       f.startsWith("packages/commercial/src/db/") ||
       f.startsWith("packages/commercial/src/http/"),
     gates: ["test:commercial:integ:shard", "lint:integ-tiers"],
+  },
+  {
+    id: "kernel",
+    comment:
+      "OCV5-546:@openclaude/kernel(L1 core,第三阶段 P0c 空包)。还没有 dependents,只建自己;" +
+      "包开始被 import 时把 dependents 加进 TYPECHECK_DEPENDENTS 和这里的 typecheckProjects。",
+    match: (f) => f.startsWith("packages/kernel/"),
+    gates: ["typecheck"],
+    typecheckProjects: ["packages/kernel"],
   },
   {
     id: "plugin-sdk",

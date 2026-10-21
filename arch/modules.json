@@ -14,6 +14,18 @@
     "browser"
    ]
   },
+  "kernel": {
+   "layer": "L1",
+   "match": [
+    "packages/kernel/src/**"
+   ],
+   "scope": [
+    "master",
+    "egress",
+    "container"
+   ],
+   "note": "@openclaude/kernel core + ./node entry (plan §3.1; P0c empty, filled from P1)"
+  },
   "plugin-sdk": {
    "layer": "L0",
    "match": [

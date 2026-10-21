@@ -5,6 +5,7 @@
   "type": "module",
   "workspaces": [
     "packages/protocol",
+    "packages/kernel",
     "packages/storage",
     "packages/plugin-sdk",
     "packages/gateway",
