@@ -150,6 +150,25 @@ done
 check "user_contract_gate still ends with the S1 run (its exit code is the gate's)" \
   bash -c "sed -n '/^user_contract_gate() {/,/^}/p' '$DEPLOY' | tail -2 | head -1 | grep -q 'v5-stop-before-start-contract.mjs'"
 
+# 13. OCV5-545: the architecture step's counts land in notes; an unreadable report is noted, not fatal.
+fn="$(sed -n '/^master_note_architecture() {/,/^}/p' "$MLIB")"
+d="$T/arch"; mkdir -p "$d"
+printf '%s' '{"mode":"report","files":3,"edges":2,"seconds":36.4,"unmapped":0,"byRule":{"R3-env":5,"R2-upward":2},"identities":4,"grown":[{"key":"k"}],"stale":[],"baselineGrown":[]}' >"$T/arch.json"
+run "$d" "mlog() { :; }; $fn
+LEASE_TRAIN_ID=$TID; tsum_init || :; tsum_mark C.architecture 2>/dev/null || :; master_note_architecture '$T/arch.json'; tsum_finish 0 || :" >/dev/null 2>&1
+check "architecture counts recorded as notes" \
+  jq -e '.notes["arch.violations"] == "7" and .notes["arch.identities"] == "4" and .notes["arch.grown"] == "1" and .notes["arch.stale"] == "0" and .notes["arch.unmapped"] == "0" and .notes["arch.seconds"] == "36"' "$(S "$d")"
+d="$T/arch2"; mkdir -p "$d"
+out="$(run "$d" "mlog() { :; }; $fn
+LEASE_TRAIN_ID=$TID; tsum_init || :; master_note_architecture '$T/missing.json'; tsum_finish 0 || :; echo survived" 2>&1)"
+check "unreadable architecture report: noted, train goes on" test "$out" = survived
+check "unreadable architecture report is noted" jq -e '.notes["arch.report"] == "unreadable"' "$(S "$d")"
+body="$(sed -n '/^build_master_release() {/,/^}/p' "$MLIB")"
+check "architecture step runs at pinned staging and fails the train when the checker fails" \
+  bash -c "printf '%s\\n' \"\$1\" | grep -A3 -F 'npx --no-install tsx scripts/check-architecture.ts' | grep -qF 'die \"pinned architecture guardrails'" _ "$body"
+check "architecture counts are noted after the step" \
+  bash -c "printf '%s\\n' \"\$1\" | grep -qF 'master_note_architecture \"\$MASTER_GATE_TMPDIR/architecture.json\"'" _ "$body"
+
 echo "---"
 if (( fails )); then echo "FAIL: $fails" >&2; exit 1; fi
 echo "PASS"
