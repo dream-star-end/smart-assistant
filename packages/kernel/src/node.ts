@@ -2,8 +2,10 @@
  * @openclaude/kernel/node: the part of the kernel that needs node:* (phase 3 plan v3.6 §3.1).
  *
  * - `withTrace` / `currentTrace`: the trace context of the current async flow (AsyncLocalStorage).
- *   Nested `withTrace` merges onto the outer context. Plan §11.1: ALS cost on the master turn path
- *   is measured in P1; above 1 % CPU the callers fall back to passing the context explicitly.
+ *   Nested `withTrace` merges onto the outer context. Measured on Node 20 (OCV5-560,
+ *   scripts/arch-measure/als-overhead.mjs): 3–4.5 % CPU on turn-path-shaped work, above the 1 % budget
+ *   of plan §11.1, so the master turn path passes trace fields explicitly (child loggers) instead.
+ *   Re-measure after moving to Node >= 24 (AsyncContextFrame).
  * - `stdSink`: warn/error to stderr, the rest to stdout (the gateway's split; commercial wrote
  *   everything to stdout and keeps doing so through its own sink).
  * - `createNodeLogger`: createLogger with these two wired in.
