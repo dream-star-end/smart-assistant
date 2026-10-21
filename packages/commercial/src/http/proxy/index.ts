@@ -72,7 +72,7 @@ import {
 } from "./modelAuthorityGate.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
 import { scopedApiKeyPoolWiring } from "./apiKeyPoolWiring.js";
-import { findRouteProviderForModel, getStaticProvider, isClassifierSideQuery, resolveCursorPublicModel, staticRouteFallback, type StaticRouteFallback } from "@openclaude/protocol";
+import { findRouteProviderForModel, getStaticProvider, isClassifierSideQuery, resolveCursorPublicModel, staticProviderSupportsVision, staticRouteFallback, type StaticRouteFallback } from "@openclaude/protocol";
 import { applyFastServiceTierPricing } from "./fastServiceTier.js";
 import {
   getDegradedProviders,
@@ -933,7 +933,7 @@ export function makeAnthropicProxyHandler(
       const modelSupportsVision = gate
         ? gate.descriptor.capabilityProfile.supportsVision
         : route.kind === "static"
-          ? route.provider.supportsVision === true
+          ? staticProviderSupportsVision(route.provider, route.upstreamModel)
           : route.kind !== "box";
       // Same ready bit issuance uses (default false). OC_BOX_MODEL_API only arms
       // the transport; it does not prove the signed capability. Local catalog
@@ -1220,8 +1220,10 @@ export function makeAnthropicProxyHandler(
       // 与上游 400 同样卡会话),(b)高估 preCheck 预留 cost。strip 后估算/cap/上游 body 同口径。
       // 注:**多模态静态 provider(supportsVision=true,如 MiniMax-M3)不 strip 图** —— 它原生识图;
       // 其余纯文本静态 provider(deepseek/ark glm-5.x)仍 strip(模型看不到图,靠 understand_image 工具兜底)。
-      if (route.kind === "static" && !modelSupportsVision) {
-        const stripped = stripNonTextContentBlocks(body.messages);
+      if (route.kind === "static") {
+        // Vision only suppresses image stripping; documents still use the old
+        // text-only placeholder because the Go converters cannot represent them.
+        const stripped = stripNonTextContentBlocks(body.messages, { keepImages: modelSupportsVision });
         if (stripped.imagesStripped + stripped.documentsStripped > 0) {
           body.messages = stripped.messages as typeof body.messages;
           userLog.warn("proxy_static_text_only_nontext_stripped", {

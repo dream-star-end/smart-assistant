@@ -164,7 +164,6 @@ import {
   persistInterruptedPromptQueueTurn,
 } from './sessionManager.js'
 import type { WebhookRouter } from './webhooks.js'
-import { resolveOpenClaudeVisionEntry } from './subprocessRunner.js'
 import type {
   ToolFailureReporter,
 } from './v3ToolFailureReporter.js'
@@ -185,11 +184,6 @@ import {
   localExecutionRejectCode,
   type LocalExecutionRejectCode,
 } from './modelCatalogClient.js'
-import {
-  OPENCLAUDE_VISION_MCP_ID,
-  OPENCLAUDE_VISION_TOOLS,
-  shouldEnableOpenClaudeVision,
-} from './mcpVisionServer.js'
 import {
   AutoDreamService,
   formatAutoDreamReceipt,
@@ -295,15 +289,9 @@ export type LiveRunnerSessionView = {
 export function collectAvailableMcpToolNames(
   config: OpenClaudeConfig,
   agent?: AgentDef,
-  model?: string,
-  opts: {
-    resolveVisionEntry?: (claudeCodePath?: string) => string | null
-    modelSupportsVision?: boolean
-  } = {},
 ): string[] {
   const tools = new Set<string>()
   const effectiveProvider = agent?.provider ?? config.provider
-  const effectiveModel = model ?? agent?.model ?? config.defaults.model
 
   const toolsetDefs = config.toolsets
   const agentToolsets = agent?.toolsets ?? config.defaults.toolsets
@@ -320,21 +308,6 @@ export function collectAvailableMcpToolNames(
   const addTools = (id: string, names?: string[], bypassToolset = false) => {
     if (!bypassToolset && allowedMcpIds && !allowedMcpIds.has(id)) return
     for (const name of names ?? []) tools.add(name)
-  }
-
-  const resolveVisionEntry = opts.resolveVisionEntry ?? resolveOpenClaudeVisionEntry
-  if (
-    shouldEnableOpenClaudeVision(
-      effectiveProvider,
-      effectiveModel,
-      opts.modelSupportsVision,
-    ) &&
-    resolveVisionEntry(config.auth.claudeCodePath)
-  ) {
-    // bypassToolset=true:vision 是内置平台工具,豁免 toolset 过滤(与 subprocessRunner 注入侧一致;
-    // gating 已由 shouldEnableOpenClaudeVision 控制)。否则有 toolset 的 agent 的 prompt hint 不提
-    // understand_image,与实际注入不一致。
-    addTools(OPENCLAUDE_VISION_MCP_ID, OPENCLAUDE_VISION_TOOLS, true)
   }
 
   for (const srv of config.mcpServers ?? []) {

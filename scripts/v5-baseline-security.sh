@@ -47,7 +47,6 @@ EXPECTED_SKILLS=(
   debugging
   testing
   skill-authoring
-  oc-vision
   app-connectors
   connector-authoring
   manage-taskboard

@@ -100,8 +100,6 @@ export {
   AdvisorExecutionLockError,
   assertCcbAdvisorCatalogLock,
   buildHostSpawnProviderEnv,
-  resolveOpenClaudeVisionEntry,
-  buildOpenClaudeVisionMcpEnv,
   CCB_PLATFORM_DISALLOWED_TOOLS,
   OFFICIAL_CC_PLATFORM_DISALLOWED_TOOLS,
   isOfficialClaudeCursorSandLoopbackEnv,
@@ -1514,7 +1512,7 @@ export class SubprocessRunner extends EventEmitter {
       }
       // Built-in 平台 MCP **总是豁免 toolset 过滤**(各自有独立 gating):
       //   - openclaude-memory:总开。
-      // (vision 已从 MCP 迁到 oc-vision CLI / baseline skill,不再作为内置 MCP 注入。)
+      // (vision MCP 与 oc-vision CLI 均已在 OCV5-547 下线,不再作为内置 MCP 注入。)
       allowedMcpIds.add('openclaude-memory')
     }
     const availableMcpTools = new Set<string>()
@@ -1736,11 +1734,6 @@ export class SubprocessRunner extends EventEmitter {
       // Layer 3: Agent-specific MCPs (override same-id globals)
       // Toolset filter: if agent has toolsets configured, only include MCPs
       // whose id appears in at least one of the agent's toolset definitions.
-
-      // Built-in vision (openclaude-vision) retired from the MCP path → oc-vision
-      // CLI + baseline skill (same MiniMax-M3 backend, no long-lived stdio
-      // transport that can die and hang the turn). Text-only models discover it
-      // via the skill index + the vision prompt hint (see promptSlots/server).
 
       // Layer 1 + 2: Global MCPs
       for (const srv of this.opts.config.mcpServers ?? []) {

@@ -6,8 +6,9 @@ import {
   blocks,
   isServerTool,
   obj,
+  imageUrlFromAnthropic,
   systemTexts,
-  toolResultText,
+  toolResultParts,
   webSearchResultText,
 } from './openAiChatGoBridge.js'
 import {
@@ -59,6 +60,13 @@ export function anthropicToOpenAIResponses(body: Obj): Obj {
   const system: string[] = body.system === undefined ? [] : systemTexts(body.system)
   const input: Obj[] = []
   const issued = new Set<string>()
+  const pendingToolCalls = new Set<string>()
+  const deferredUserInputs: Obj[] = []
+  const flushDeferred = () => {
+    if (pendingToolCalls.size === 0 && deferredUserInputs.length) {
+      input.push(...deferredUserInputs.splice(0))
+    }
+  }
   // OCV5-432: only the preamble (system messages before the first assistant message) folds
   // into instructions. Later ones — CCB appends `<total_tokens>…` after every turn — stay in
   // place, so each request only appends to the previous one and the upstream prompt cache
@@ -75,22 +83,42 @@ export function anthropicToOpenAIResponses(body: Obj): Obj {
       continue
     }
     if (m.role === 'user') {
-      const texts: string[] = []
+      const parts: Obj[] = []
       for (const b of blocks(m.content)) {
         if (b.type === 'text') {
           if (typeof b.text !== 'string') throw new Error('invalid OpenCode Go text')
-          if (b.text) texts.push(b.text)
+          if (b.text) parts.push({ type: 'input_text', text: b.text })
+        } else if (b.type === 'image') {
+          parts.push({ type: 'input_image', image_url: imageUrlFromAnthropic(b) })
         } else if (b.type === 'tool_result') {
           if (typeof b.tool_use_id !== 'string' || !issued.has(b.tool_use_id))
             throw new Error('OpenCode Go tool result has no matching tool call')
+          pendingToolCalls.delete(b.tool_use_id)
+          const result = toolResultParts(b)
           input.push({
             type: 'function_call_output',
             call_id: decodeResponsesToolId(b.tool_use_id),
-            output: toolResultText(b),
+            output: result.parts.some((part) => part.type === 'image')
+              ? result.parts.map((part) =>
+                  part.type === 'text'
+                    ? { type: 'input_text', text: part.text }
+                    : { type: 'input_image', image_url: part.url },
+                )
+              : result.text,
           })
         } else throw new Error(`unsupported OpenCode Go user block: ${String(b.type)}`)
       }
-      if (texts.length) input.push({ role: 'user', content: texts.join('\n\n') })
+      flushDeferred()
+      if (parts.length) {
+        const userInput: Obj = {
+          role: 'user',
+          content: parts.length === 1 && parts[0].type === 'input_text'
+            ? parts[0].text
+            : parts,
+        }
+        if (pendingToolCalls.size) deferredUserInputs.push(userInput)
+        else input.push(userInput)
+      }
       continue
     }
     if (m.role !== 'assistant') throw new Error('unsupported OpenCode Go message role')
@@ -105,6 +133,7 @@ export function anthropicToOpenAIResponses(body: Obj): Obj {
         if (typeof b.id !== 'string' || typeof b.name !== 'string')
           throw new Error('invalid OpenCode Go tool use')
         issued.add(b.id)
+        pendingToolCalls.add(b.id)
         calls.push({
           type: 'function_call',
           call_id: decodeResponsesToolId(b.id),
@@ -125,6 +154,8 @@ export function anthropicToOpenAIResponses(body: Obj): Obj {
     if (texts.length) input.push({ role: 'assistant', content: texts.join('\n\n') })
     input.push(...calls)
   }
+  flushDeferred()
+  if (pendingToolCalls.size) throw new Error('OpenCode Go history has unanswered tool calls')
   if (!input.length) throw new Error('OpenCode Go requires nonempty content')
   const out: Obj = {
     model: body.model,

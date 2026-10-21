@@ -64,7 +64,6 @@ const promptTimingLog = createLogger({ module: 'promptTiming' })
 import { request as undiciRequest } from 'undici'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
-import { isTextOnlyDefinite, shouldEnableOpenClaudeVision } from './mcpVisionServer.js'
 import { getPlatformPrompt } from './platformPrompts.js'
 import {
   resolveTurnProjectContext,
@@ -87,8 +86,7 @@ import type { FrozenProjectContextDigests } from './runContextPersist.js'
 // packages/commercial/agent-sandbox/platform-runtime/prompts/ 下对应 .md,反之亦然
 // (__tests__/platformPrompts.test.ts 的「文件 === 常量」断言会在漂移时变红)。
 
-/** `# Platform capabilities` 静态头部;{{WECHAT_VISION_HINT}} 由 buildAgentsSlot 按
- *  needsVisionCli + 确定纯文本判定注入 CLI / Read-then-CLI / 原生三个变体之一。
+/** `# Platform capabilities` 静态头部;{{WECHAT_VISION_HINT}} 注入原生读图提示。
  *  对应 prompts/platform-capabilities.md。 */
 const PLATFORM_CAPABILITIES_FALLBACK = `# Platform capabilities
 
@@ -215,11 +213,7 @@ const MEMORY_INSTRUCTIONS_FALLBACK = `# Memory
 `
 
 const WECHAT_VISION_HINT_PLACEHOLDER = '{{WECHAT_VISION_HINT}}'
-/** 确定纯文本:模型看不到图,提示走 oc-vision CLI 识图。 */
-const WECHAT_VISION_HINT_CLI = '- 微信收到的图片、视频、语音/音频、文件会以容器内路径提供,通常在 `/home/agent/.openclaude/uploads/<安全文件名>`。当前模型看不到图,看到本地图片路径时,先用 Bash 调 `oc-vision understand <该路径> --prompt "<问题>"` 识别,再据此回答,不要说“不支持图片/没有上传图片”。'
-/** 非确定纯文本但 catalog 仍可能注入识图兜底(cursor 等):先 Read,看不到再 oc-vision。 */
-const WECHAT_VISION_HINT_READ_THEN_CLI = '- 微信收到的图片、视频、语音/音频、文件会以容器内路径提供,通常在 `/home/agent/.openclaude/uploads/<安全文件名>`。看到本地图片路径时,先用 Read 工具读图;若 Read 返回的不是图像内容/提示图片被省略/看不到图,再用 Bash 调 `oc-vision understand <该路径> --prompt "<问题>"` 识别,再据此回答,不要说“不支持图片/没有上传图片”。'
-/** needsVisionCli=false:原生多模态模型,直接读图。 */
+/** 只剩原生多模态模型:图片直接读,不再提供 CLI 兜底。 */
 const WECHAT_VISION_HINT_NATIVE = '- 微信收到的图片、视频、语音/音频、文件会以容器内路径提供,通常在 `/home/agent/.openclaude/uploads/<安全文件名>`。看到本地图片路径时,直接读图回答,不要说“不支持图片/没有上传图片”。'
 
 /** 测试内部导出(非稳定 API):暴露 fallback 常量,让 platformPrompts.test.ts 断言
@@ -228,8 +222,6 @@ export const _platformPromptFallbacks = {
   PLATFORM_CAPABILITIES_FALLBACK,
   MEMORY_INSTRUCTIONS_FALLBACK,
   WECHAT_VISION_HINT_PLACEHOLDER,
-  WECHAT_VISION_HINT_CLI,
-  WECHAT_VISION_HINT_READ_THEN_CLI,
   WECHAT_VISION_HINT_NATIVE,
 }
 
@@ -791,36 +783,14 @@ async function buildAgentsSlotParts(
   ctx: PromptSlotContext,
 ): Promise<{ header: string; dynamic: string[]; tips: string[] }> {
   const provider = ctx.provider
-  // 识图从 openclaude-vision MCP 迁到 oc-vision CLI(baseline skill)后,是否提示识图
-  // 不再看"MCP 工具是否注入"(那个值已恒 false),而看**平台是否认定该模型需要识图兜底**。
-  // 判定权威 = shouldEnableOpenClaudeVision —— 它正是迁移前决定注入 understand_image 的
-  // 同一个函数(纯文本静态模型 supportsVision!==true,或 OPENCLAUDE_VISION_MCP_PROVIDERS
-  // 显式 opt-in 的 provider),所以 `needsVisionCli` 与旧 `availableMcpTools.includes(
-  // 'understand_image')` 语义完全等价。**原生多模态模型(gpt-5.5/claude 等)默认 false**,
-  // 不会拿到误导性的"用 CLI 识图"提示(保持迁移前行为,不给它们加噪音)。
-  const needsVisionCli = shouldEnableOpenClaudeVision(
-    provider,
-    ctx.model,
-    ctx.modelSupportsVision,
-  )
-  // 微信/图片提示的「看不到图」文案只给确定纯文本;catalog supportsVision=false
-  // 仍可能让 needsVisionCli=true(cursor 家族),那种情况先 Read 再 oc-vision。
-  const textOnlyDefinite = isTextOnlyDefinite(provider, ctx.model)
   // 平台静态能力文案(`# Platform capabilities` 头部 + 多媒体/微信/富内容/子 Agent/
   // 浏览器/网页提取诸段)已上移 platform bundle(商业版真热),商业版权威 =
   // prompts/platform-capabilities.md,个人版权威 = 下方 PLATFORM_CAPABILITIES_FALLBACK。
-  // 模板里唯一的 per-model 变体(微信识图提示)用 {{WECHAT_VISION_HINT}} 占位,由
-  // needsVisionCli 在此处按运行时判定注入 —— per-model 文案不进静态文件(见 §4.2 边界)。
+  // 不再提供 OCR/识图 CLI 兜底,微信/图片提示只剩原生读图一种形态。
   const staticHeader = getPlatformPrompt(
     'platform-capabilities',
     PLATFORM_CAPABILITIES_FALLBACK,
-  ).replaceAll(WECHAT_VISION_HINT_PLACEHOLDER, () =>
-    !needsVisionCli
-      ? WECHAT_VISION_HINT_NATIVE
-      : textOnlyDefinite
-        ? WECHAT_VISION_HINT_CLI
-        : WECHAT_VISION_HINT_READ_THEN_CLI,
-  )
+  ).replaceAll(WECHAT_VISION_HINT_PLACEHOLDER, WECHAT_VISION_HINT_NATIVE)
   const lines = [selectPromptBlocks(staticHeader, promptEngineOf(provider), promptChannelOf(ctx.sessionKey))]
   const dynamic: string[] = []
 
@@ -893,38 +863,6 @@ async function buildAgentsSlotParts(
     // MiniMax-M3 原生支持图像识别(2026-06-17 放开 strip):用户上传的图片会直接进入对话,
     // **无需** understand_image 工具,直接读图回答即可。
   }
-  // 纯文本静态模型(deepseek/glm/qwen/kimi 等)的识图提示。只在「确定纯文本」
-  // 时声称看不到图;catalog supportsVision=false 的 cursor 家族不走本段。
-  if (needsVisionCli && textOnlyDefinite) {
-    lines.push('')
-    lines.push('## 图片理解提示')
-    lines.push('')
-    lines.push(
-      '当前模型按纯文本接入、看不到图。用户上传图片时,用 Bash 调 ' +
-        '`oc-vision understand <图片绝对路径> --prompt "<问题>"`(路径从上传提示里取),' +
-        '再基于命令返回的图片内容回答。细节见 `skill_view("oc-vision")`。',
-    )
-  }
-  // GPT/Codex 路径的识图提示段。CodexAdapter 构造内核时强制 provider='codex-native'
-  // (engine 路由后任意 agent 都可能落 codex 底座),model 前缀判定保留作 belt-and-braces。
-  // 这些模型经常无法用普通文件工具"看到"图像内容,oc-vision 是可靠兜底。
-  if (
-    needsVisionCli &&
-    (provider === 'codex-native' ||
-      provider === 'codex' ||
-      ctx.model?.startsWith('gpt-') ||
-      ctx.model?.startsWith('codex-'))
-  ) {
-    lines.push('')
-    lines.push('## GPT/Codex 图片理解提示')
-    lines.push('')
-    lines.push(
-      '用户消息中出现本地图片路径、而你无法直接看到图像内容时,用 Bash 调 ' +
-        '`oc-vision understand <图片绝对路径> --prompt "<问题>"`,再基于命令返回的内容回答。' +
-        '不要声称用户没有上传图片。细节见 `skill_view("oc-vision")`。',
-    )
-  }
-
   return { header: lines[0]!, dynamic, tips: lines.slice(1) }
 }
 

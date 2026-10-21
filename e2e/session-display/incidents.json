@@ -2546,17 +2546,12 @@
         {
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/imageAttachmentHint.test.ts",
-          "assertion": "cursor-fable-5.1-high + catalog supportsVision=false → Read 第 1、CLI 第 2"
+          "assertion": "only points at native image reading and never at the retired CLI"
         },
         {
           "layer": "unit",
-          "path": "packages/gateway/src/__tests__/imageAttachmentHint.test.ts",
-          "assertion": "deepseek(确定纯文本)+hasUnderstandImage → CLI 第 1、Read 第 2"
-        },
-        {
-          "layer": "unit",
-          "path": "packages/gateway/src/__tests__/promptSlotsDeepseekVision.test.ts",
-          "assertion": "cursor-fable-5.1-high + catalog supportsVision=false 不声称看不到图,先 Read 再 oc-vision"
+          "path": "packages/gateway/src/__tests__/promptSlotsVisionRemoved.test.ts",
+          "assertion": "never injects a text-only vision fallback hint"
         },
         {
           "layer": "browser",

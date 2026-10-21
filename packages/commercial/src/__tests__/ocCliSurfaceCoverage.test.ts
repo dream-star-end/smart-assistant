@@ -556,13 +556,6 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
     relation: taskProbe(['relation', 'remove', 'rel-1'], 'request'),
     run: taskProbe(['run', 'get', 'run-1'], 'request'),
   },
-  'oc-vision': {
-    understand: tsFailureProbe(
-      'packages/gateway/src/ocVisionCli.ts',
-      ['understand'],
-      /understand <image_file>/,
-    ),
-  },
   'oc-video': {
     create: scriptProbe('oc-video.sh', ['create', '--help'], { code: 0, stdout: /--storyboard/ }),
     status: scriptProbe('oc-video.sh', ['status', '--help'], { code: 0, stdout: /project_id/ }),
@@ -646,7 +639,6 @@ const THIN_WRAPPERS: Record<string, string> = {
   'oc-skill': 'packages/gateway/src/ocSkillCli.ts',
   'oc-slides': 'packages/gateway/src/ocSlidesCli.ts',
   'oc-task': 'packages/gateway/src/ocTaskCli.ts',
-  'oc-vision': 'packages/gateway/src/ocVisionCli.ts',
   'oc-web': 'packages/gateway/src/ocWebCli.ts',
 }
 
@@ -961,7 +953,6 @@ function productionSurfaces(): Record<string, Set<string>> {
     'oc-skill': tsDispatchCommands('packages/gateway/src/ocSkillCli.ts', 'cmd'),
     'oc-slides': singlePurpose('packages/gateway/src/ocSlidesCli.ts', 'render', /usage: oc-slides/),
     'oc-task': tsDispatchCommands('packages/gateway/src/ocTaskCli.ts', 'cmd'),
-    'oc-vision': tsDispatchCommands('packages/gateway/src/ocVisionCli.ts', 'cmd'),
     'oc-video': h3Commands(true),
     'oc-web-context': webContextCommands(),
     'oc-web': tsDispatchCommands('packages/gateway/src/ocWebCli.ts', 'command'),

@@ -263,9 +263,6 @@ describe("oc-* CLI 语义卡 (Bash 特判)", () => {
       }),
     ).toBe("woshipm.com");
     expect(toolSummary("Bash", { command: "which oc-web 2>/dev/null && oc-web --help" })).toBe("");
-    expect(
-      toolSummary("Bash", { command: "oc-vision understand /home/agent/img.png --prompt 'x'" }),
-    ).toBe("");
     expect(toolSummary("Bash", { command: "mmx image generate 'a cat' -o /out.png" })).toBe("");
   });
   test("oc-task Bash 卡不落成通用终端", () => {

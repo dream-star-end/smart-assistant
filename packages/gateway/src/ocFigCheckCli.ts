@@ -28,7 +28,7 @@
  * 追加 spec 派生的定向核对问句。不带 --spec 时行为与旧版完全一致(向后兼容即开关)。
  *
  * 图片路径必须落在 agent 可信产物区(uploads/generated/research;见 mcpVisionServer
- * 的 VISION_IMAGE_ROOTS),与 oc-vision 同一 SSRF 边界。
+ * 的 VISION_IMAGE_ROOTS),与视觉后端同一 SSRF 边界。
  */
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
@@ -201,7 +201,7 @@ async function main(): Promise<void> {
   }
   const followUps = spec ? specFollowUpQuestions(spec) : []
 
-  // 复用 oc-vision 的路径白名单 + 大小 + 光栅魔数校验(泛化后含 research 目录)。
+  // 复用视觉后端的路径白名单 + 大小 + 光栅魔数校验(泛化后含 research 目录)。
   const resolved = resolveVisionInput({ image_file: imageFile, prompt: auditPrompt(kind, flags.focus, followUps) })
 
   const issues: string[] = []
