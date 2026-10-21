@@ -252,6 +252,9 @@ jobs:
       - name: Train summary recorder
         run: bash scripts/v5-selfhost-train-summary.test.sh
 
+      - name: Workspace links (OCV5-549)
+        run: bash scripts/v5-selfhost-workspace-links.test.sh
+
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
