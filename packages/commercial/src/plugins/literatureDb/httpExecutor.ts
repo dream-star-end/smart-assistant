@@ -231,6 +231,19 @@ function decodeHtmlEntities(input: string): string {
     .replace(/&amp;/g, '&')
 }
 
+export function normalizeSpringerDoi(rawDoi: string): string | null {
+  const decoded = rawDoi.trim().replace(/%2F/gi, '/')
+  const match = /^(?:10\.)?(\d{4,9})\/([a-zA-Z0-9_.-]+)$/.exec(decoded)
+  if (!match?.[1] || !match[2]) return null
+  return `10.${match[1]}/${match[2]}`
+}
+
+export function normalizeSpringerPaperId(paperId: string): string {
+  const match = /^sp[._](?:10\.)?(\d{4,9})_([a-zA-Z0-9_.-]+)$/.exec(paperId.trim())
+  if (!match?.[1] || !match[2]) return paperId
+  return `sp_10.${match[1]}_${match[2]}`
+}
+
 export function parseSpringerSearchHtml(html: string, limit: number): ParsedWanfangPaper[] {
   const fullAccessPapers: ParsedWanfangPaper[] = []
   const otherPapers: ParsedWanfangPaper[] = []
@@ -240,13 +253,14 @@ export function parseSpringerSearchHtml(html: string, limit: number): ParsedWanf
   while ((m = cardRe.exec(html)) !== null) {
     const card = m[0]
     const linkMatch =
-      /<h3[^>]*data-test="title"[^>]*>[\s\S]*?<a[^>]*href="[^"]*\/article\/(10\.\d{4,9}\/[a-zA-Z0-9_.-]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(
+      /<h3[^>]*data-test="title"[^>]*>[\s\S]*?<a[^>]*href="[^"]*\/(?:articles?|chapter)\/((?:10\.)?\d{4,9}(?:\/|%2F)[a-zA-Z0-9_.-]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(
         card,
       )
     if (!linkMatch?.[1] || !linkMatch[2]) continue
-    const doi = linkMatch[1].trim()
-    const paperId = `sp_${doi.replace('/', '_')}`
-    if (paperId.length > 40 || !/^[a-zA-Z0-9_.-]{3,40}$/.test(paperId) || seenIds.has(paperId)) {
+    const doi = normalizeSpringerDoi(linkMatch[1])
+    if (!doi) continue
+    const paperId = normalizeSpringerPaperId(`sp_${doi.replace('/', '_')}`)
+    if (paperId.length > 64 || !/^[a-zA-Z0-9_.-]{3,64}$/.test(paperId) || seenIds.has(paperId)) {
       continue
     }
     const title = decodeHtmlEntities(
@@ -329,10 +343,32 @@ export function mintScopedDocumentId(
 ): string {
   const expMs = (input.nowMs ?? Date.now()) + DOCUMENT_ID_TTL_MS
   const expB36 = Math.floor(expMs).toString(36)
-  const pidHex = Buffer.from(input.paperId, 'utf8').toString('hex')
+  const canonicalPaperId = normalizeSpringerPaperId(input.paperId)
+  const pidHex = Buffer.from(canonicalPaperId, 'utf8').toString('hex')
   const macInput = `v1\0${String(input.ownerUserId ?? 1)}\0${input.accountInstanceId}\0${expB36}\0${pidHex}`
   const macHex = crypto.createHmac('sha256', secret).update(macInput).digest('hex').slice(0, 32)
   return `wfp1-${expB36}-${pidHex}-${macHex}`
+}
+
+function verifyDocumentIdHmac(
+  secret: Buffer,
+  ownerUserId: string,
+  accountInstanceId: string,
+  expB36: string,
+  candidatePidHex: string,
+  providedBuf: Buffer,
+): boolean {
+  const macInput = `v1\0${ownerUserId}\0${accountInstanceId}\0${expB36}\0${candidatePidHex}`
+  const expectedMacHex = crypto
+    .createHmac('sha256', secret)
+    .update(macInput)
+    .digest('hex')
+    .slice(0, 32)
+  const expectedBuf = Buffer.from(expectedMacHex, 'hex')
+  return (
+    providedBuf.length === expectedBuf.length &&
+    crypto.timingSafeEqual(providedBuf, expectedBuf)
+  )
 }
 
 export function verifyScopedDocumentId(
@@ -351,24 +387,38 @@ export function verifyScopedDocumentId(
   const [, expB36, pidHex, macHex] = parts as [string, string, string, string]
   if (
     !/^[0-9a-z]{1,16}$/.test(expB36) ||
-    !/^[0-9a-f]{2,80}$/.test(pidHex) ||
+    !/^[0-9a-f]{2,128}$/.test(pidHex) ||
     pidHex.length % 2 !== 0 ||
     !/^[0-9a-f]{32}$/.test(macHex)
   ) {
     throw new LiteratureError('DOCUMENT_EXPIRED')
   }
-  const macInput = `v1\0${expected.ownerUserId}\0${expected.accountInstanceId}\0${expB36}\0${pidHex}`
-  const expectedMacHex = crypto
-    .createHmac('sha256', secret)
-    .update(macInput)
-    .digest('hex')
-    .slice(0, 32)
+  const rawPaperId = Buffer.from(pidHex, 'hex').toString('utf8')
+  const canonicalPaperId = normalizeSpringerPaperId(rawPaperId)
+  const canonicalPidHex =
+    canonicalPaperId !== rawPaperId
+      ? Buffer.from(canonicalPaperId, 'utf8').toString('hex')
+      : pidHex
   const providedBuf = Buffer.from(macHex, 'hex')
-  const expectedBuf = Buffer.from(expectedMacHex, 'hex')
-  if (
-    providedBuf.length !== expectedBuf.length ||
-    !crypto.timingSafeEqual(providedBuf, expectedBuf)
-  ) {
+  const matchesRaw = verifyDocumentIdHmac(
+    secret,
+    expected.ownerUserId,
+    expected.accountInstanceId,
+    expB36,
+    pidHex,
+    providedBuf,
+  )
+  const matchesCanonical =
+    canonicalPidHex !== pidHex &&
+    verifyDocumentIdHmac(
+      secret,
+      expected.ownerUserId,
+      expected.accountInstanceId,
+      expB36,
+      canonicalPidHex,
+      providedBuf,
+    )
+  if (!matchesRaw && !matchesCanonical) {
     throw new LiteratureError('DOCUMENT_EXPIRED')
   }
   const expMs = Number.parseInt(expB36, 36)
@@ -376,11 +426,10 @@ export function verifyScopedDocumentId(
   if (!Number.isFinite(expMs) || expMs <= nowMs) {
     throw new LiteratureError('DOCUMENT_EXPIRED')
   }
-  const paperId = Buffer.from(pidHex, 'hex').toString('utf8')
-  if (!/^[a-zA-Z0-9_.-]{3,64}$/.test(paperId)) {
+  if (!/^[a-zA-Z0-9_.-]{3,64}$/.test(canonicalPaperId)) {
     throw new LiteratureError('DOCUMENT_EXPIRED')
   }
-  return { paperId }
+  return { paperId: canonicalPaperId }
 }
 
 export interface RawDownstreamResponse {
@@ -908,12 +957,16 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     paperId: string,
     title: string,
   ): Promise<LiteratureHttpReadExecutionOutput> {
-    const rawDoi = paperId.slice(3)
+    const normalizedPaperId = normalizeSpringerPaperId(paperId)
+    const rawDoi = normalizedPaperId.slice(3)
     const slashIdx = rawDoi.indexOf('_')
     if (slashIdx <= 0 || slashIdx === rawDoi.length - 1) {
       throw new LiteratureError('INVALID_INPUT')
     }
-    const doi = `${rawDoi.slice(0, slashIdx)}/${rawDoi.slice(slashIdx + 1)}`
+    const doi = normalizeSpringerDoi(`${rawDoi.slice(0, slashIdx)}/${rawDoi.slice(slashIdx + 1)}`)
+    if (!doi) {
+      throw new LiteratureError('INVALID_INPUT')
+    }
     const updatedState = await this.verifyMemberSessionOnEntry(
       initialState,
       JIEYOU_SPRINGER_WEBVPN_ENTRY_PATH,
