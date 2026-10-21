@@ -17,7 +17,7 @@ import type { ChatMessage } from "../lib/chat/model";
 import { preciseRetryEligible, interruptedContinuationTarget } from "../lib/chat/socket";
 import { CONTINUE_PROMPT } from "../lib/chat/render";
 import { reportClientFriction } from "../lib/clientFriction";
-import { normalizeMessageReplyQuote } from "@openclaude/protocol";
+import { normalizeMessageReplyQuote } from "@openclaude/protocol/browser";
 import type { Agent } from "../lib/agents";
 import type { AuthSession } from "../lib/types";
 import type { UseChatSocket } from "./useChatSocket";

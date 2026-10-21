@@ -345,7 +345,26 @@ export function normForCompare(s: string): string {
   return s.replace(/\s+/g, ' ').trim()
 }
 
-function latestAssistantMessageId(messages: unknown[]): string | null {
+/**
+ * Assistant-role notices master writes itself (no engine produced them, so no
+ * native session is missing them): the automatic-recovery give-up card
+ * (pgSessionsBackend appendRecoveryGiveUpTerminalCard), the dispatch
+ * reconciler's visible fallback, and the degraded-tape placeholder.
+ * OCV5-556: a give-up card as the latest assistant row was read as another
+ * agent's answer, which dropped the native resume and replayed 70 messages.
+ */
+const SERVER_NOTICE_ASSISTANT_ID_PREFIXES = [
+  'm-recovery-giveup-',
+  'visible-fallback:',
+  'tape-degraded:',
+] as const
+
+function isServerNoticeAssistantId(id: string): boolean {
+  return SERVER_NOTICE_ASSISTANT_ID_PREFIXES.some((prefix) => id.startsWith(prefix))
+}
+
+/** Index of the latest assistant row an engine turn produced (server notices skipped). */
+function latestEngineAssistantIndex(messages: unknown[]): number {
   for (let i = messages.length - 1; i >= 0; i--) {
     const raw = messages[i]
     if (!raw || typeof raw !== 'object') continue
@@ -353,9 +372,21 @@ function latestAssistantMessageId(messages: unknown[]): string | null {
     if (msg.system === true) continue
     if (msg.role !== 'assistant') continue
     const id = typeof msg.id === 'string' ? msg.id : ''
-    return id || null
+    if (id && isServerNoticeAssistantId(id)) continue
+    return i
   }
-  return null
+  return -1
+}
+
+function latestAssistantMessageId(messages: unknown[]): string | null {
+  const index = latestEngineAssistantIndex(messages)
+  if (index < 0) return null
+  const id = (messages[index] as { id?: unknown }).id
+  return typeof id === 'string' && id ? id : null
+}
+
+function ownAgentAssistantPrefix(peerId: string, agentId: string): string {
+  return `srv-${peerId}-${agentId}-t`
 }
 
 export function shouldTreatMasterHistoryAsProviderGap(opts: {
@@ -365,7 +396,32 @@ export function shouldTreatMasterHistoryAsProviderGap(opts: {
 }): boolean {
   const latestAssistantId = latestAssistantMessageId(opts.messages)
   if (!latestAssistantId) return false
-  return !latestAssistantId.startsWith(`srv-${opts.peerId}-${opts.agentId}-t`)
+  return !latestAssistantId.startsWith(ownAgentAssistantPrefix(opts.peerId, opts.agentId))
+}
+
+/**
+ * Master rows the native session of this agent has not seen: everything after
+ * this agent's latest own engine answer. Null when that answer is not in the
+ * window (the native session's coverage is unknown, so only a full rebuild is
+ * safe) or nothing engine-produced follows it.
+ */
+export function providerGapMessagesAfterOwnTurn(opts: {
+  messages: unknown[]
+  peerId: string
+  agentId: string
+}): unknown[] | null {
+  const prefix = ownAgentAssistantPrefix(opts.peerId, opts.agentId)
+  for (let i = opts.messages.length - 1; i >= 0; i--) {
+    const raw = opts.messages[i]
+    if (!raw || typeof raw !== 'object') continue
+    const msg = raw as ChatHistoryMessage
+    if (msg.system === true || msg.role !== 'assistant') continue
+    if (typeof msg.id !== 'string' || !msg.id.startsWith(prefix)) continue
+    // `${prefix}3-thinking` / `-tool-…` rows belong to the same turn as `${prefix}3`.
+    const tail = opts.messages.slice(i + 1)
+    return latestEngineAssistantIndex(tail) >= 0 ? tail : null
+  }
+  return null
 }
 
 export function historicalContextInjectionKey(opts: {
@@ -1577,6 +1633,7 @@ export class SessionManager {
   private get _resumeMapProvider() { return this.resumeStore.provider }
   private get _resumeMapHistory() { return this.resumeStore.history }
   private get _resumeRejectedIds() { return this.resumeStore.rejected }
+  private get _resumeHeadPromotedFromHistory() { return this.resumeStore.promotedFromHistory }
   private get _resumeMapTimestamps() { return this.resumeStore.timestamps }
   private get _resumeMapLastCost() { return this.resumeStore.lastCost }
   private get _resumeMapCostImprecise() { return this.resumeStore.costImprecise }

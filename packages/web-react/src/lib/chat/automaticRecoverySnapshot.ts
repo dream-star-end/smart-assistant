@@ -1,5 +1,5 @@
 import { AUTOMATIC_TURN_RETRY_MAX, normalizeTurnErrorCode, supportsAutomaticTurnRecovery,
-  type AutomaticTurnRecoverySnapshot } from "@openclaude/protocol";
+  type AutomaticTurnRecoverySnapshot } from "@openclaude/protocol/browser";
 import { detectServerTerminalTurns } from "../persist";
 import { isServerAuthoredRow, type ChatMessage, type ChatSession } from "./model";
 import { enterDeferredRecoverySoftState, type DeferredTerminalErrorPaint } from "./reducer";

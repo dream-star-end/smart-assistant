@@ -45,6 +45,12 @@ describe('redact', () => {
       'db_password',
       'clientSecret',
       'containerToken',
+      'passWord',
+      'toKen',
+      'PASSWORD',
+      'ApI_kEy',
+      'AuthoRization',
+      'CooKie',
     ])
       assert.equal(isCredentialKey(k), true, k)
     for (const k of [

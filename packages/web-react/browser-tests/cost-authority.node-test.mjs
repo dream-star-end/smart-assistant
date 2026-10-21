@@ -37,7 +37,7 @@ test('recorded-cost provenance remains visible in totals, legacy responses and r
   const bundle = await build({ stdin: { contents: source, resolveDir: repo, loader: 'tsx' },
     bundle: true, write: false, format: 'iife', jsx: 'automatic', loader: { '.css': 'empty' },
     nodePaths: [resolve(repo, 'node_modules')],
-    alias: { '@openclaude/protocol/containerPreview': resolve(repo, 'packages/protocol/src/containerPreview.ts'), 'node:crypto': resolve(here, 'stubs/node-crypto.js'), '@openclaude/protocol': resolve(repo, 'packages/protocol/src/index.ts') },
+    alias: { '@openclaude/protocol/containerPreview': resolve(repo, 'packages/protocol/src/containerPreview.ts'), 'node:crypto': resolve(here, 'stubs/node-crypto.js'), '@openclaude/protocol/browser': resolve(repo, 'packages/protocol/src/browser.ts'), '@openclaude/protocol': resolve(repo, 'packages/protocol/src/index.ts') },
     define: { 'process.env.NODE_ENV': '"production"', 'import.meta.env.MODE': '"production"' },
   });
   const server=createServer((_req,res)=>res.end('<!doctype html><meta charset="utf-8"><div id="root"></div>'));

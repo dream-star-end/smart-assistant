@@ -374,6 +374,124 @@ test('submit() preflight promotion reaches the execution seam with the promoted 
   }
 })
 
+// OCV5-556 (webmvhtasuy8z35hs 2026-10-21 19:03): the next user message after
+// an automatic-recovery give-up card must keep resuming the same native
+// conversation instead of replaying master history into a fresh one.
+async function submitWithHistory(
+  m: LiveInternals,
+  s: LiveSession,
+  historicalMessages: unknown[],
+): Promise<{ nativeId: string | null; mapped: string | undefined; payload: unknown }> {
+  const seams: Array<{ nativeId: string | null; mapped: string | undefined; payload: unknown }> = []
+  m.runOneTurnWithRetry = async (session: unknown, payload: unknown) => {
+    const sess = session as LiveSession
+    seams.push({
+      nativeId: sess.runner.nativeSessionId,
+      mapped: m._resumeMap.get(sess.sessionKey),
+      payload,
+    })
+  }
+  await m.submit(s, '继续', () => {}, undefined, undefined, undefined, undefined, undefined, {
+    historicalMessages,
+  })
+  assert.equal(seams.length, 1, 'submit must reach execution seam')
+  return seams[0]
+}
+
+test('next message after a recovery give-up card keeps resuming the original conversation', async () => {
+  const { run, cleanup } = await liveSetup('grok')
+  try {
+    await run(async (m, s) => {
+      const seam = await submitWithHistory(m, s, [
+        { id: 'old-u', role: 'user', text: 'long task' },
+        { id: 'srv-unknown-ladder-t4', role: 'assistant', text: 'partial answer' },
+        {
+          id: 'm-recovery-giveup-old-u',
+          role: 'assistant',
+          text: '自动恢复已停止：已达到自动恢复次数上限。请直接再发一条消息继续，或新开一个会话。',
+          status: 'completed',
+          _source: 'server',
+        },
+      ])
+      assert.equal(seam.nativeId, LIVE_B, 'native resume must survive the give-up card')
+      assert.equal(seam.mapped, LIVE_B)
+      assert.equal(seam.payload, '继续', 'no history replay on a kept native resume')
+    })
+  } finally {
+    cleanup()
+  }
+})
+
+test('real master history gap keeps native resume and injects only the missing rows', async () => {
+  const { run, cleanup } = await liveSetup('grok')
+  try {
+    await run(async (m, s) => {
+      // The engine itself reports a durable head: no ladder promotion involved.
+      s.runner.setResumeSessionId?.(LIVE_B)
+      s.runner.emit('session_id', LIVE_B)
+      const seam = await submitWithHistory(m, s, [
+        { id: 'old-u', role: 'user', text: 'very old question' },
+        { id: 'srv-unknown-ladder-t4', role: 'assistant', text: 'own answer' },
+        { id: 'switch-u', role: 'user', text: 'ask the other agent' },
+        { id: 'srv-unknown-other-t1', role: 'assistant', text: 'other agent answer' },
+      ])
+      assert.equal(seam.nativeId, LIVE_B, 'native resume must be kept for a bounded gap')
+      assert.equal(seam.mapped, LIVE_B)
+      assert.equal(typeof seam.payload, 'string')
+      assert.match(seam.payload as string, /other agent answer/)
+      assert.doesNotMatch(seam.payload as string, /very old question|own answer/)
+    })
+  } finally {
+    cleanup()
+  }
+})
+
+test('a gap on a head promoted from the history ladder still rebuilds in full', async () => {
+  const { run, cleanup } = await liveSetup('grok')
+  try {
+    await run(async (m, s) => {
+      // LIVE_A (newest) lost its transcript; the ladder promotes the older
+      // LIVE_B, which may never have seen the turns that ran on LIVE_A.
+      const seam = await submitWithHistory(m, s, [
+        { id: 'a-only-u', role: 'user', text: 'requirement only LIVE_A saw' },
+        { id: 'srv-unknown-ladder-t4', role: 'assistant', text: 'own answer' },
+        { id: 'switch-u', role: 'user', text: 'ask the other agent' },
+        { id: 'srv-unknown-other-t1', role: 'assistant', text: 'other agent answer' },
+      ])
+      assert.equal(seam.nativeId, null, 'promoted head must not be trusted for a delta')
+      assert.equal(typeof seam.payload, 'string')
+      assert.match(seam.payload as string, /requirement only LIVE_A saw/)
+      assert.match(seam.payload as string, /other agent answer/)
+    })
+  } finally {
+    cleanup()
+  }
+})
+
+test('ladder promotion mark survives resume-map.json and clears on a new engine id', async () => {
+  const { run, cleanup } = await liveSetup('grok')
+  try {
+    await run(async (m, s) => {
+      const marks = (m as unknown as { _resumeHeadPromotedFromHistory: Map<string, string> })
+        ._resumeHeadPromotedFromHistory
+      assert.equal(m._resumeIdFor(s.sessionKey, 'grok', s.workspaceCwd), LIVE_B)
+      assert.equal(marks.get(s.sessionKey), LIVE_B)
+      await m.awaitResumeMapFlush()
+      const saved = JSON.parse(readFileSync(m.resumeMapPath, 'utf8'))[s.sessionKey]
+      assert.equal(saved.promotedFromHistory, true)
+      marks.clear()
+      m._loadResumeMap()
+      assert.equal(marks.get(s.sessionKey), LIVE_B, 'reload restores the mark')
+      s.runner.emit('session_id', LIVE_B)
+      assert.equal(marks.get(s.sessionKey), LIVE_B, 'resuming the promoted id keeps the mark')
+      s.runner.emit('session_id', LIVE_C)
+      assert.equal(marks.has(s.sessionKey), false, 'a newly minted id clears the mark')
+    })
+  } finally {
+    cleanup()
+  }
+})
+
 test('paths.home is the default OPENCLAUDE_HOME for grok/zcode probes', () => {
   // Sanity: the module must not throw when env is unset and paths.home exists.
   assert.equal(typeof paths.home, 'string')

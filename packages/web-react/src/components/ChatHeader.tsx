@@ -1,4 +1,4 @@
-import type { CursorContextTier, ServiceTier } from "@openclaude/protocol";
+import type { CursorContextTier, ServiceTier } from "@openclaude/protocol/browser";
 import {
   Bell,
   ChevronDown,

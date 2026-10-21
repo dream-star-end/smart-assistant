@@ -1,4 +1,4 @@
-import { isMarketplaceCategoryId, marketplaceCategoryLabel } from "@openclaude/protocol";
+import { isMarketplaceCategoryId, marketplaceCategoryLabel } from "@openclaude/protocol/browser";
 import { Check, ChevronRight, FlaskConical, Inbox, ShieldX, Sparkles, X } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { api, apiErrorMessage } from "../../lib/api";

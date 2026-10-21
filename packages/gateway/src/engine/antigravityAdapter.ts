@@ -93,6 +93,18 @@ const AUTH_PROMPT_RE = /Authentication required|Waiting for authentication|authe
 /** Headless soft-deny: tool step reports DONE with no output, exit 0. */
 const SOFT_DENY_RE = /auto-denied/i
 const EMPTY_RUN_RE = /run ended with no output/i
+/** Go oauth2 refusing the CLI token file locally (OCV5-556). */
+const CLI_CREDENTIAL_EXPIRED_RE = /oauth2: token expired|refresh token is not set/i
+
+/**
+ * The CLI token file is platform-owned: a turn that dies on it is a platform
+ * credential fault, not an upstream outage. Tag it so errorClassify routes it
+ * to `platform_credential_expired` (no automatic recovery, precise copy).
+ */
+export function normalizeAntigravityErrorDetail(detail: string): string {
+  if (detail.startsWith('ANTIGRAVITY_CREDENTIAL_EXPIRED:')) return detail
+  return CLI_CREDENTIAL_EXPIRED_RE.test(detail) ? `ANTIGRAVITY_CREDENTIAL_EXPIRED: ${detail}` : detail
+}
 
 const EMPTY_SIGNALS: Readonly<PhantomSignals> = Object.freeze({ apiState: 'unknown', skipReason: null })
 
@@ -144,6 +156,10 @@ interface TurnContext {
   abandoned: boolean
   interrupted: boolean
   errorDetail: string | null
+  /** step_index of this launch's own user_input; earlier indices are history. */
+  firstOwnStepIndex: number | null
+  /** error_message seen before this launch's user_input; used only if the run fails. */
+  preludeErrorDetail: string | null
   resolveSummary: (summary: TurnSummary | null) => void
   resolveDrain: (() => void) | null
 }
@@ -310,6 +326,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       abandoned: false,
       interrupted: false,
       errorDetail: null,
+      firstOwnStepIndex: null,
+      preludeErrorDetail: null,
       resolveSummary,
       resolveDrain: null,
     }
@@ -390,6 +408,12 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       hostBin: probeEnvFacts().hostBin,
     })
     ctx.projection = projection
+    log.info('antigravity CLI credential projected', {
+      sessionKey: this.opts.sessionKey,
+      traceId: ctx.params.traceId,
+      admittedTokenExpiresAt: route.accessTokenExpiresAt,
+      cliTokenFileExpiry: projection.cliTokenFileExpiry,
+    })
     const prompt = await this.composePrompt(ctx.params, repoSnapshot, projection.advertisedMcpTools, cwdDecision)
     const line = `${JSON.stringify({ event: 'user', message: { content: prompt } })}\n`
     if (Buffer.byteLength(line, 'utf8') > ANTIGRAVITY_MAX_PROMPT_BYTES) {
@@ -604,6 +628,12 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   private handleStep(ctx: TurnContext, step: Record<string, unknown>): void {
     const type = asText(step.step_type)
     const state = asText(step.state)
+    const stepIndex = typeof step.step_index === 'number' && Number.isSafeInteger(step.step_index)
+      ? step.step_index
+      : null
+    if (type === 'user_input' && ctx.firstOwnStepIndex === null && stepIndex !== null) {
+      ctx.firstOwnStepIndex = stepIndex
+    }
     if (type === 'agent_response') {
       const delta = typeof step.text_delta === 'string' ? step.text_delta : ''
       if (delta) this.appendText(ctx, delta)
@@ -626,7 +656,24 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     if (type === 'error_message') {
       const info = recordOf(step.error)
       const message = info ? asText(info.message) : asText(step.error)
-      if (message) ctx.errorDetail = message
+      if (!message) return
+      // OCV5-556: a `--conversation` resume streamed an earlier launch's error
+      // step (old relay route, long-expired token) after this launch's own
+      // steps had succeeded, failing four good turns in a row. Steps before
+      // this launch's user_input belong to earlier launches.
+      if (ctx.firstOwnStepIndex === null) {
+        ctx.preludeErrorDetail = message
+        return
+      }
+      if (stepIndex !== null && stepIndex < ctx.firstOwnStepIndex) {
+        log.warn('antigravity ignored error step from an earlier launch of the conversation', {
+          sessionKey: this.opts.sessionKey,
+          stepIndex,
+          firstOwnStepIndex: ctx.firstOwnStepIndex,
+        })
+        return
+      }
+      ctx.errorDetail = message
     }
     // user_input / system_message / checkpoint / unknown (native ask_question,
     // invisible in headless mode) carry nothing the product renders.
@@ -760,7 +807,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     if (CONVERSATION_ID_RE.test(id)) ctx.conversationId = id
     if (status === 'CANCELED' || status === 'INTERRUPTED') ctx.interrupted = true
     if (status !== 'SUCCESS' && ctx.errorDetail === null) {
-      ctx.errorDetail = asText(result.error) || `Antigravity turn ended with status ${status || 'unknown'}`
+      ctx.errorDetail = asText(result.error) || ctx.preludeErrorDetail ||
+        `Antigravity turn ended with status ${status || 'unknown'}`
     }
     if (status === 'SUCCESS' && ctx.errorDetail === null) {
       // 1.3.4 reports SUCCESS for runs that produced nothing (oversized input)
@@ -805,6 +853,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     if (ctx.terminal) return
     ctx.terminal = true
     if (ctx.interrupted && ctx.errorDetail === null) ctx.errorDetail = 'Antigravity turn cancelled'
+    if (ctx.errorDetail !== null) ctx.errorDetail = normalizeAntigravityErrorDetail(ctx.errorDetail)
     const isError = ctx.errorDetail !== null
     const stopReason = ctx.interrupted ? 'interrupted' : isError ? 'error' : 'end_turn'
     ctx.params.sessionTotals.turns += 1
