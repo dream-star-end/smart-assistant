@@ -8,7 +8,7 @@
  *
  * Node built-ins only: the bridge is spawned as plain node.
  */
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, extname, join, resolve, sep } from 'node:path'
@@ -511,6 +511,35 @@ export function inlineGptWebAttachmentsInUserLine(
   }
   parsed.inlineAttachments = inlineAttachments
   return JSON.stringify(parsed)
+}
+
+/**
+ * Ensures a Route B user JSON line carries a stable `ocTurnId` across mid-turn
+ * bridge reconnects so `host.mjs` can distinguish a reconnect of the same turn
+ * from a subsequent user turn with identical text.
+ */
+export function stampGptWebTurnIdInUserLine(line: string): string {
+  if (!line || !line.trim().startsWith('{')) return line
+  const hasTrailingNewline = line.endsWith('\n')
+  let parsed: Record<string, any>
+  try {
+    parsed = JSON.parse(line.trim()) as Record<string, any>
+  } catch {
+    return line
+  }
+  if (!parsed || typeof parsed !== 'object') return line
+  if (parsed.type && parsed.type !== 'user') return line
+  if (typeof parsed.ocTurnId === 'string' && parsed.ocTurnId.trim()) {
+    return line
+  }
+  const rest = { ...parsed }
+  delete rest.type
+  const ordered = {
+    ...(parsed.type ? { type: parsed.type } : {}),
+    ...rest,
+    ocTurnId: randomUUID(),
+  }
+  return `${JSON.stringify(ordered)}${hasTrailingNewline ? '\n' : ''}`
 }
 
 export const BOX_GPT_WEB_INTERACTIVE_LAUNCH_SCRIPT = [

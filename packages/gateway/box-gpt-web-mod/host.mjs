@@ -310,6 +310,13 @@ async function rescueFromDomOrMapping(page, fallbackConvId = null, { baselineNod
   return fetchConversationFromMappingInPage(page, fallbackConvId, { baselineNodeId })
 }
 
+class DetachedTurnError extends Error {
+  constructor(stage) {
+    super(`BOX_GPT_WEB_DETACHED: host process detached (${stage})`)
+    this.name = 'DetachedTurnError'
+  }
+}
+
 async function stopActiveGenerationInPage(page) {
   if (!page) return
   try {
@@ -338,6 +345,9 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
       withProfileFileLock(
         portLockPath,
         async () => {
+          if (turnControl.detached) {
+            throw new DetachedTurnError('before launch')
+          }
           if (turnControl.abort) {
             throw new Error('BOX_GPT_WEB_INTERRUPTED: turn aborted before launch')
           }
@@ -355,6 +365,44 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
           }
           const streamer = new TurnProgressStreamer()
 
+          const activeTurnState = loadActiveTurnState(profileDir, cfg.sessionId)
+          const isSameTurn = Boolean(
+            activeTurnState &&
+              activeTurnState.promptText === turn.text &&
+              (turn.turnId
+                ? activeTurnState.turnId === turn.turnId
+                : !activeTurnState.completedAt),
+          )
+          if (isSameTurn && activeTurnState) {
+            streamer.restoreState(activeTurnState)
+            if (typeof activeTurnState.accumulatedThinking === 'string') {
+              accumulatedThinking = activeTurnState.accumulatedThinking
+            }
+          }
+
+          let currentTurnState = {
+            turnId: turn.turnId || activeTurnState?.turnId || null,
+            conversationId: activeTurnState?.conversationId || null,
+            baselineNodeId: isSameTurn ? (activeTurnState?.baselineNodeId ?? null) : null,
+            promptText: turn.text,
+            startedAt:
+              isSameTurn && Number.isFinite(activeTurnState?.startedAt)
+                ? activeTurnState.startedAt
+                : Date.now(),
+            accumulatedThinking,
+            ...streamer.exportState(),
+          }
+
+          const persistProgressState = (extra = {}) => {
+            currentTurnState = {
+              ...currentTurnState,
+              ...extra,
+              accumulatedThinking,
+              ...streamer.exportState(),
+            }
+            saveActiveTurnState(profileDir, cfg.sessionId, currentTurnState)
+          }
+
           await ensureRealChromeOnCdp(cfg, profileDir)
           const chromium = await loadPlaywrightChromium(cfg.playwrightPath)
           let browser = await getConnectedCdpBrowser(chromium, cfg.cdpPort)
@@ -362,6 +410,9 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
           turnControl.page = page
 
           const abortIfRequested = async (stage) => {
+            if (turnControl.detached) {
+              throw new DetachedTurnError(stage)
+            }
             if (turnControl.abort) {
               clearActiveTurnState(profileDir, cfg.sessionId)
               await stopActiveGenerationInPage(page)
@@ -377,7 +428,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
             latestConv,
             baselineNodeId,
           }) => {
-            clearActiveTurnState(profileDir, cfg.sessionId)
+            await abortIfRequested('before finalizeTurnOutput')
             const msgId = finalMessageId || `msg_${Date.now()}`
             let outputAttachments = []
             try {
@@ -406,9 +457,14 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
               }
             } catch {}
 
+            await abortIfRequested('after downloadTurnOutputArtifactsInPage')
             closeThinkingIfOpen()
             const tailDelta = streamer.consumeIncrementalFinalText(finalText, {
               finalFlush: true,
+            })
+            persistProgressState({
+              conversationId: convId || currentTurnState.conversationId,
+              baselineNodeId,
             })
             if (tailDelta || outputAttachments.length > 0) {
               writeStdoutLine(
@@ -422,6 +478,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
               thinking: accumulatedThinking,
               messageId: msgId,
               outputAttachments: outputAttachments.length > 0 ? outputAttachments : null,
+              turnState: currentTurnState,
             }
           }
 
@@ -466,18 +523,13 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
           let baselineNodeId = null
           let resumedInProgress = false
           let latestConv = null
-          const activeTurnState = loadActiveTurnState(profileDir, cfg.sessionId)
 
           if (syncState.conversationId) {
             const preConv = await fetchConversationPayloadInPage(page, syncState.conversationId)
             latestConv = preConv?.conv || null
             baselineNodeId = preConv?.conv?.current_node || null
 
-            if (
-              activeTurnState &&
-              activeTurnState.promptText === turn.text &&
-              preConv?.conv
-            ) {
+            if (isSameTurn && preConv?.conv) {
               const existing = inspectExistingTurnInConversation(preConv.conv, {
                 promptText: turn.text,
                 baselineNodeId: activeTurnState.baselineNodeId ?? null,
@@ -497,6 +549,15 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
                 baselineNodeId = existing.baselineNodeId
                 emitThinking('[Pro] 已重新连接正在运行的 ChatGPT Pro 回合，继续同步实时进度…\n')
               }
+            }
+          }
+
+          if (isSameTurn && !resumedInProgress) {
+            const domLive = await extractLiveProgressFromDomInPage(page)
+            if (domLive.stopBtn || domLive.activeThinking) {
+              resumedInProgress = true
+              baselineNodeId = activeTurnState?.baselineNodeId ?? baselineNodeId
+              emitThinking('[Pro] 已重新连接正在运行的 ChatGPT Pro 回合，继续同步实时进度…\n')
             }
           }
 
@@ -529,10 +590,9 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
               .first()
             await sendBtn.waitFor({ state: 'visible', timeout: 15_000 })
             await abortIfRequested('before click send')
-            saveActiveTurnState(profileDir, cfg.sessionId, {
+            persistProgressState({
               conversationId: syncState.conversationId || null,
               baselineNodeId,
-              promptText: turn.text,
               startedAt: Date.now(),
             })
             await sendBtn.click()
@@ -557,6 +617,10 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
               })
               if (safeDelta) {
                 closeThinkingIfOpen()
+                persistProgressState({
+                  conversationId: acc.conversationId || syncState.conversationId || null,
+                  baselineNodeId,
+                })
                 writeStdoutLine(formatStreamJsonTextDelta(safeDelta))
               }
             },
@@ -591,6 +655,9 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
                 }
               }, readCursor)
             } catch {
+              if (turnControl.detached || turnControl.abort) {
+                await abortIfRequested('during cdp reconnect')
+              }
               // Transient CDP / page navigation hiccup during a multi-hour turn: reconnect and continue
               await new Promise((r) => setTimeout(r, 1_000))
               await ensureRealChromeOnCdp(cfg, profileDir)
@@ -701,6 +768,12 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
                     emitThinking(td)
                   }
                 }
+                if (thinkingDeltas.length > 0 || textDeltas.length > 0) {
+                  persistProgressState({
+                    conversationId: payload.convId || resolvedConvId,
+                    baselineNodeId,
+                  })
+                }
                 for (const txd of textDeltas) {
                   lastActivityAt = now
                   closeThinkingIfOpen()
@@ -802,6 +875,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
 
 async function main() {
   const cfg = parseCliArgs(process.argv.slice(2))
+  const profileDir = profileDirFor(cfg.profile, os.homedir())
   const queue = new SerialJobQueue()
   let initEmitted = false
   const pendingTurnControls = new Set()
@@ -824,12 +898,15 @@ async function main() {
   const onSignal = () => {
     if (shuttingDown) return
     shuttingDown = true
-    void Promise.race([
-      abortAllPendingAndActiveTurns(),
-      new Promise((r) => setTimeout(r, 3_000)),
-    ]).finally(() => {
+    // When SIGTERM/SIGINT arrives (e.g. exec stream disconnect or bridge reconnect reap),
+    // detach cleanly WITHOUT clicking the page's Stop button and WITHOUT clearing activeTurnState,
+    // so the running ChatGPT Pro turn continues undisturbed and the reconnecting host can resume it.
+    for (const tc of pendingTurnControls) {
+      tc.detached = true
+    }
+    setTimeout(() => {
       process.exit(0)
-    })
+    }, 300).unref?.()
   }
 
   process.on('SIGTERM', onSignal)
@@ -852,6 +929,7 @@ async function main() {
       }
       void (async () => {
         if (frame.subtype === 'interrupt') {
+          clearActiveTurnState(profileDir, cfg.sessionId)
           await abortAllPendingAndActiveTurns()
         }
         writeStdoutLine(
@@ -895,7 +973,7 @@ async function main() {
 
     // Synchronously register turnControl before enqueueing so an interrupt frame
     // arriving in the same stdin chunk cancels this queued turn before it starts.
-    const turnControl = { abort: false, page: null, thinkingBlockOpen: false }
+    const turnControl = { abort: false, detached: false, page: null, thinkingBlockOpen: false }
     pendingTurnControls.add(turnControl)
 
     void queue.enqueue(async () => {
@@ -935,6 +1013,7 @@ async function main() {
 
       try {
         const out = await executeTurnOnBrowser(cfg, frame, turnControl)
+        if (turnControl.detached) return
         if (turnControl.thinkingBlockOpen) {
           turnControl.thinkingBlockOpen = false
           writeStdoutLine(formatStreamJsonContentBlockStop({ index: 0 }))
@@ -957,7 +1036,20 @@ async function main() {
             outputAttachments: out.outputAttachments,
           }),
         )
+        if (!turnControl.detached && !turnControl.abort) {
+          if (frame.turnId) {
+            saveActiveTurnState(profileDir, cfg.sessionId, {
+              ...out.turnState,
+              completedAt: Date.now(),
+            })
+          } else {
+            clearActiveTurnState(profileDir, cfg.sessionId)
+          }
+        }
       } catch (err) {
+        if (err instanceof DetachedTurnError || turnControl.detached) {
+          return
+        }
         const errMsg = err instanceof Error ? err.message : String(err)
         if (turnControl.thinkingBlockOpen) {
           turnControl.thinkingBlockOpen = false
@@ -982,6 +1074,9 @@ async function main() {
       } finally {
         clearInterval(keepaliveTimer)
         pendingTurnControls.delete(turnControl)
+        if (shuttingDown && pendingTurnControls.size === 0) {
+          process.exit(0)
+        }
       }
     })
   })

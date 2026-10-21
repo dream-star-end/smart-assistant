@@ -45,6 +45,7 @@ import {
   loadBoxGptWebMod,
   materializeGptWebOutputAttachmentsInStdoutLine,
   remoteInteractiveGptWebArgs,
+  stampGptWebTurnIdInUserLine,
 } from './cursorBoxGptWeb.js'
 
 type FetchFn = (url: string, init: RequestInit) => Promise<Response>
@@ -467,13 +468,17 @@ class BoxSession {
   private async writeLine(line: string): Promise<void> {
     try {
       const isGptWeb = isBoxGptWebModelArgv(this.o.args)
+      const stampedLine =
+        isGptWeb && TOP_TYPE.exec(line)?.[1] === 'user'
+          ? stampGptWebTurnIdInUserLine(line)
+          : line
       const payload = isGptWeb
-        ? inlineGptWebAttachmentsInUserLine(line, { env: this.o.env })
-        : line
+        ? inlineGptWebAttachmentsInUserLine(stampedLine, { env: this.o.env })
+        : stampedLine
       for (const body of boxCcWriteExecs(this.control, payload, ++this.lineSeq))
         await this.writeExec(body)
-      if (isGptWeb && TOP_TYPE.exec(line)?.[1] === 'user') {
-        this.activeGptWebUserLine = line
+      if (isGptWeb && TOP_TYPE.exec(stampedLine)?.[1] === 'user') {
+        this.activeGptWebUserLine = stampedLine
       }
     } catch (err) {
       if (this.abort.signal.aborted) return
@@ -834,8 +839,11 @@ export class BoxLoginSignalTap {
         this.rotate = null
       }
     }
-    // A line longer than any signal is not one; do not hold it.
-    if (this.buf.length > MAX_SIGNAL_LINE * 4) this.buf = ''
+    // A line longer than any signal is not one; do not hold its bulk in memory,
+    // but keep its leading `{"type":"..."}` prefix so when its trailing `\n`
+    // arrives in a later chunk (e.g. a >256KiB `result` frame carrying base64
+    // outputAttachments), `TOP_TYPE` still recognizes `"result"`.
+    if (this.buf.length > MAX_SIGNAL_LINE * 4) this.buf = this.buf.slice(0, 64)
     return ends
   }
 

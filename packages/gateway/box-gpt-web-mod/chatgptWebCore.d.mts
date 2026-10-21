@@ -178,7 +178,19 @@ export class TurnProgressStreamer {
   seenDomPhaseKeys: Set<string>
   emittedFinalText: string
   lastThinkingEmitAt: number
-  constructor(opts?: { nowFn?: () => number })
+  constructor(opts?: {
+    nowFn?: () => number
+    initialEmittedFinalText?: string
+    initialStepTextByKey?: Record<string, string> | null
+  })
+  restoreState(state?: {
+    emittedFinalText?: string
+    stepTextByKey?: Record<string, string> | null
+  } | null): void
+  exportState(): {
+    emittedFinalText: string
+    stepTextByKey: Record<string, string>
+  }
   ingestMappingProgress(progress: {
     thinkingSteps?: Array<{ key: string; text: string }>
     liveFinalText?: string
@@ -321,12 +333,12 @@ export function parseStdinFrame(
   opts?: { stagingDir?: string | null; allowedUploadRoots?: readonly string[] },
 ):
   | { kind: 'control_request'; requestId: string; subtype: string }
-  | { kind: 'user'; text: string; files: string[] }
+  | { kind: 'user'; text: string; files: string[]; turnId?: string }
   | null
 export function extractUserTurnFromStdinFrame(
   line: string,
   opts?: { stagingDir?: string | null; allowedUploadRoots?: readonly string[] },
-): { text: string; files: string[] } | null
+): { text: string; files: string[]; turnId?: string } | null
 
 export function resetComposerDraftInPage(page: any): Promise<void>
 export function resolveTrustedAttachmentPath(

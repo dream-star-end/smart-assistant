@@ -594,10 +594,23 @@ export async function syncPageToSessionConversation(
   { profileDir, sessionId, initScript = backendFetchTeeInitScript() },
 ) {
   const map = loadSessionConversationMap(profileDir)
-  const mappedConvId = sessionId && map[sessionId] ? map[sessionId] : null
+  let mappedConvId = sessionId && map[sessionId] ? map[sessionId] : null
   const currentUrl = page.url()
   const currentMatch = currentUrl.match(/\/c\/([a-z0-9_-]{8,128})/i)
   const currentConvId = currentMatch ? currentMatch[1] : null
+
+  if (!mappedConvId && sessionId) {
+    const activeTurn = loadActiveTurnState(profileDir, sessionId)
+    if (activeTurn && !activeTurn.completedAt) {
+      if (activeTurn.conversationId && CONV_ID_RE.test(activeTurn.conversationId)) {
+        mappedConvId = activeTurn.conversationId
+        saveSessionConversationId(profileDir, sessionId, mappedConvId)
+      } else if (currentConvId && !Object.values(map).includes(currentConvId)) {
+        mappedConvId = currentConvId
+        saveSessionConversationId(profileDir, sessionId, mappedConvId)
+      }
+    }
+  }
 
   if (mappedConvId) {
     const needNav = currentConvId !== mappedConvId
@@ -1518,12 +1531,41 @@ export function safeStreamableTextLength(text) {
  * `thinking_delta` and `text_delta` strings.
  */
 export class TurnProgressStreamer {
-  constructor({ nowFn = () => Date.now() } = {}) {
+  constructor({
+    nowFn = () => Date.now(),
+    initialEmittedFinalText = '',
+    initialStepTextByKey = null,
+  } = {}) {
     this.nowFn = nowFn
-    this.stepTextByKey = new Map()
+    this.stepTextByKey = new Map(
+      initialStepTextByKey && typeof initialStepTextByKey === 'object'
+        ? Object.entries(initialStepTextByKey)
+        : [],
+    )
     this.seenDomPhaseKeys = new Set()
-    this.emittedFinalText = ''
+    this.emittedFinalText = String(initialEmittedFinalText ?? '')
     this.lastThinkingEmitAt = nowFn()
+  }
+
+  restoreState(state) {
+    if (!state || typeof state !== 'object') return
+    if (typeof state.emittedFinalText === 'string') {
+      this.emittedFinalText = state.emittedFinalText
+    }
+    if (state.stepTextByKey && typeof state.stepTextByKey === 'object') {
+      for (const [k, v] of Object.entries(state.stepTextByKey)) {
+        if (typeof v === 'string') {
+          this.stepTextByKey.set(k, v)
+        }
+      }
+    }
+  }
+
+  exportState() {
+    return {
+      emittedFinalText: this.emittedFinalText,
+      stepTextByKey: Object.fromEntries(this.stepTextByKey),
+    }
   }
 
   ingestMappingProgress(progress) {
@@ -2456,15 +2498,24 @@ export function parseStdinFrame(line, { stagingDir = null, allowedUploadRoots = 
   }
 
   if (!cleanText && files.length === 0) return null
+  const turnId =
+    typeof parsed.ocTurnId === 'string' && parsed.ocTurnId.trim()
+      ? parsed.ocTurnId.trim()
+      : null
   return {
     kind: 'user',
     text: cleanText,
     files,
+    ...(turnId ? { turnId } : {}),
   }
 }
 
 export function extractUserTurnFromStdinFrame(line, opts = {}) {
   const frame = parseStdinFrame(line, opts)
   if (!frame || frame.kind !== 'user') return null
-  return { text: frame.text, files: frame.files }
+  return {
+    text: frame.text,
+    files: frame.files,
+    ...(frame.turnId ? { turnId: frame.turnId } : {}),
+  }
 }

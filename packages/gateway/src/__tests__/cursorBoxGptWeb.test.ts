@@ -55,7 +55,7 @@ import {
   isBoxGptWebCatalogModel,
   isBoxInteractiveCatalogModel,
 } from '../engine/cursorBoxCc.js'
-import { runBoxCcBridge } from '../engine/cursorBoxCcBridge.js'
+import { BoxLoginSignalTap, runBoxCcBridge } from '../engine/cursorBoxCcBridge.js'
 import {
   BOX_GPT_WEB_BUSY_MESSAGE,
   boxGptWebInteractiveLaunchExec,
@@ -67,6 +67,7 @@ import {
   materializeGptWebOutputAttachmentsInStdoutLine,
   releaseBoxGptWebTurnSlot,
   remoteInteractiveGptWebArgs,
+  stampGptWebTurnIdInUserLine,
   tryAcquireBoxGptWebTurnSlot,
   validateBoxGptWebLoopbackProxy,
 } from '../engine/cursorBoxGptWeb.js'
@@ -1468,6 +1469,45 @@ rl.on('line', (line) => {
       clearActiveTurnState(dir, 'sess-long-1')
       assert.equal(loadActiveTurnState(dir, 'sess-long-1'), null)
 
+      // Verify TurnProgressStreamer state export/restore prevents duplicate text_delta after reconnect
+      const preCrashStreamer = new TurnProgressStreamer()
+      assert.equal(
+        preCrashStreamer.consumeIncrementalFinalText('Hello ', { finalFlush: false }),
+        'Hello ',
+      )
+      const exportedState = preCrashStreamer.exportState()
+      const postCrashStreamer = new TurnProgressStreamer()
+      postCrashStreamer.restoreState(exportedState)
+      assert.equal(
+        postCrashStreamer.consumeIncrementalFinalText('Hello world', { finalFlush: true }),
+        'world',
+      )
+
+      // Verify BoxLoginSignalTap detects result even when >256KiB base64 outputAttachments arrive in 64KiB chunks
+      const tap = new BoxLoginSignalTap()
+      const hugeResultLine = `${JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        session_id: 'sess-huge',
+        result: 'ok',
+        outputAttachments: [{ name: 'big.bin', base64: 'A'.repeat(320_000) }],
+      })}\n`
+      const allEnds = []
+      for (let offset = 0; offset < hugeResultLine.length; offset += 65_536) {
+        allEnds.push(...tap.push(hugeResultLine.slice(offset, offset + 65_536)))
+      }
+      assert.equal(allEnds.length, 1)
+
+      // Verify stampGptWebTurnIdInUserLine stamps a stable ocTurnId across retries
+      const rawUserLine = `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'Hello' } })}\n`
+      const stamped1 = stampGptWebTurnIdInUserLine(rawUserLine)
+      const stamped2 = stampGptWebTurnIdInUserLine(stamped1)
+      assert.equal(stamped1, stamped2)
+      const parsedFrame = parseStdinFrame(stamped1)
+      assert.equal(parsedFrame?.kind, 'user')
+      assert.ok(parsedFrame?.turnId)
+
       // Simulate mid-turn stream disconnect on attempt 1 followed by seamless resume on attempt 2
       const fifo = boxCcFifoPath(`gpt-web-reconnect-${Date.now()}`)
       const control: BoxCcControl = {
@@ -1481,6 +1521,7 @@ rl.on('line', (line) => {
       }
       const realMod = loadBoxGptWebMod()
       let interactiveExecCount = 0
+      const seenTurnIds: string[] = []
       const reconnectHostMjs = `
 import readline from 'node:readline'
 import {
@@ -1496,6 +1537,7 @@ const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity 
 rl.on('line', (line) => {
   const frame = parseStdinFrame(line)
   if (!frame || frame.kind !== 'user') return
+  process.stderr.write('SEEN_TURN_ID:' + (frame.turnId || 'none') + '\\n')
   process.stdout.write(formatStreamJsonSystemInit({ sessionId: 'sess-reconnect', model: 'box-gpt-6-astra-pro' }) + '\\n')
   if (process.env.FAKE_ATTEMPT === '1') {
     process.stdout.write(formatStreamJsonThinkingDelta('Still running in Chrome...') + '\\n')
@@ -1513,6 +1555,11 @@ rl.on('line', (line) => {
       let outText = ''
       stdout.on('data', (c: Buffer) => {
         outText += c.toString('utf8')
+      })
+      stderr.on('data', (c: Buffer) => {
+        for (const m of c.toString('utf8').matchAll(/SEEN_TURN_ID:([^\s]+)/g)) {
+          seenTurnIds.push(m[1]!)
+        }
       })
 
       const bridgePromise = runBoxCcBridge({
@@ -1556,6 +1603,9 @@ rl.on('line', (line) => {
       const code = await bridgePromise
       assert.equal(code, 0)
       assert.equal(interactiveExecCount, 2)
+      assert.equal(seenTurnIds.length, 2)
+      assert.notEqual(seenTurnIds[0], 'none')
+      assert.equal(seenTurnIds[0], seenTurnIds[1])
       assert.match(outText, /Still running in Chrome\.\.\./)
       assert.match(outText, /Recovered final answer/)
     } finally {
