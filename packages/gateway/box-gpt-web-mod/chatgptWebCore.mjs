@@ -289,6 +289,67 @@ export async function withProfileFileLock(
 ) {
   const deadline = Date.now() + timeoutMs
   let acquiredIno = null
+  let immediateReclaims = 0
+
+  const isLockPayloadDeadOrStale = (targetPath, maxAgeMs) => {
+    let st
+    try {
+      st = fs.statSync(targetPath)
+    } catch {
+      return { stale: false, stat: null }
+    }
+    const ageMs = Date.now() - st.mtimeMs
+    if (ageMs > maxAgeMs) return { stale: true, stat: st }
+    try {
+      const raw = fs.readFileSync(targetPath, 'utf8')
+      const parsed = JSON.parse(raw)
+      if (!parsed || !Number.isInteger(parsed.pid)) {
+        return { stale: true, stat: st }
+      }
+      if (!pidAliveFn(parsed.pid)) {
+        return { stale: true, stat: st }
+      }
+      return { stale: false, stat: st }
+    } catch {
+      return { stale: true, stat: st }
+    }
+  }
+
+  const tryAcquireReclaimGuard = (reclaimPath) => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const tmpReclaim = `${reclaimPath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
+      try {
+        fs.writeFileSync(
+          tmpReclaim,
+          JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }),
+          { mode: 0o600 },
+        )
+        fs.linkSync(tmpReclaim, reclaimPath)
+        const st = fs.statSync(reclaimPath)
+        return st.ino
+      } catch (err) {
+        if (err && err.code === 'EEXIST' && attempt === 0) {
+          const check = isLockPayloadDeadOrStale(reclaimPath, 5_000)
+          if (check.stale && check.stat) {
+            try {
+              const cur = fs.statSync(reclaimPath)
+              if (cur.ino === check.stat.ino) {
+                fs.unlinkSync(reclaimPath)
+              }
+            } catch {}
+            continue
+          }
+        }
+        return null
+      } finally {
+        try {
+          fs.unlinkSync(tmpReclaim)
+        } catch {}
+      }
+    }
+    return null
+  }
+
   while (acquiredIno === null) {
     const tmpPath = `${lockPath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
     try {
@@ -300,39 +361,32 @@ export async function withProfileFileLock(
       acquiredIno = st.ino
     } catch (err) {
       if (err && err.code === 'EEXIST') {
-        try {
-          const candidateStat = fs.statSync(lockPath)
-          const ageMs = Date.now() - candidateStat.mtimeMs
-          let ownerDead = false
-          try {
-            const raw = fs.readFileSync(lockPath, 'utf8')
-            const parsed = JSON.parse(raw)
-            if (parsed && Number.isInteger(parsed.pid) && !pidAliveFn(parsed.pid)) {
-              ownerDead = true
-            }
-          } catch {}
-          if (ownerDead || ageMs > staleMs) {
-            const reclaimPath = `${lockPath}.reclaim`
-            let reclaimFd = null
+        let reclaimed = false
+        const lockCheck = isLockPayloadDeadOrStale(lockPath, staleMs)
+        if (lockCheck.stale && lockCheck.stat) {
+          const reclaimPath = `${lockPath}.reclaim`
+          const reclaimIno = tryAcquireReclaimGuard(reclaimPath)
+          if (reclaimIno !== null) {
             try {
-              reclaimFd = fs.openSync(reclaimPath, 'wx')
               const verifyStat = fs.statSync(lockPath)
-              if (verifyStat.ino === candidateStat.ino) {
+              if (verifyStat.ino === lockCheck.stat.ino) {
                 fs.unlinkSync(lockPath)
+                reclaimed = true
               }
             } catch {} finally {
-              if (reclaimFd !== null) {
-                try {
-                  fs.closeSync(reclaimFd)
-                } catch {}
-                try {
+              try {
+                const curReclaim = fs.statSync(reclaimPath)
+                if (curReclaim.ino === reclaimIno) {
                   fs.unlinkSync(reclaimPath)
-                } catch {}
-              }
+                }
+              } catch {}
             }
-            continue
           }
-        } catch {}
+        }
+        if (reclaimed && immediateReclaims < 2) {
+          immediateReclaims += 1
+          continue
+        }
         if (Date.now() >= deadline) {
           const msg = busyMessage
             ? `${busyMessage} (BOX_GPT_WEB_LOCK_TIMEOUT: could not acquire ${lockPath} within ${timeoutMs}ms)`

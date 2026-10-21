@@ -1075,6 +1075,29 @@ rl.on('line', (line) => {
       const rejected = settled.filter((r) => r.status === 'rejected')
       assert.equal(fulfilled.length, 1)
       assert.equal(rejected.length, 1)
+
+      // Crash recovery when a previous reclaimer was SIGKILLed leaving .reclaim behind
+      writeFileSync(raceLock, JSON.stringify({ pid: 99999999, acquiredAt: Date.now() - 5_000 }))
+      writeFileSync(`${raceLock}.reclaim`, '')
+      const recovered = await withProfileFileLock(raceLock, async () => 'recovered-ok', {
+        timeoutMs: 0,
+        busyMessage: BOX_GPT_WEB_BUSY_MESSAGE,
+      })
+      assert.equal(recovered, 'recovered-ok')
+
+      // Live .reclaim holder with timeoutMs: 0 must not busy-spin; must reject with busyMessage
+      writeFileSync(raceLock, JSON.stringify({ pid: 99999999, acquiredAt: Date.now() - 5_000 }))
+      writeFileSync(
+        `${raceLock}.reclaim`,
+        JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }),
+      )
+      await assert.rejects(
+        withProfileFileLock(raceLock, async () => 'unexpected', {
+          timeoutMs: 0,
+          busyMessage: BOX_GPT_WEB_BUSY_MESSAGE,
+        }),
+        /Pro 通道忙/,
+      )
     } finally {
       rmSync(raceDir, { recursive: true, force: true })
     }
