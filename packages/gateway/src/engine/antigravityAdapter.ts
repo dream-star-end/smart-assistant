@@ -164,6 +164,8 @@ interface TurnContext {
   preludeErrorDetail: string | null
   /** This launch's last step was an error_message (1.4.0 streams it without text). */
   trailingErrorStep: boolean
+  /** This launch streamed an error_message step of its own. */
+  ownErrorStep: boolean
   resolveSummary: (summary: TurnSummary | null) => void
   resolveDrain: (() => void) | null
 }
@@ -333,6 +335,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       firstOwnStepIndex: null,
       preludeErrorDetail: null,
       trailingErrorStep: false,
+      ownErrorStep: false,
       resolveSummary,
       resolveDrain: null,
     }
@@ -682,6 +685,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       // can still end the run SUCCESS (a relay ROUTE_EXPIRED 60 minutes into a
       // turn ended as a "success" with no reply). Remember it; settleResult
       // fails the turn unless a later tool or reply step shows the run went on.
+      ctx.ownErrorStep = true
       if (message) ctx.errorDetail = message
       else ctx.trailingErrorStep = true
     }
@@ -816,7 +820,25 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       clearTimeout(ctx.resultTimer)
       ctx.resultTimer = null
     }
-    const status = asText(result.status)
+    let status = asText(result.status)
+    // OCV5-556: once a launch of a conversation failed (e.g. relay
+    // ROUTE_EXPIRED), 1.4.0 ends every later `--conversation` launch with
+    // status ERROR and that old error, even when the launch answered normally
+    // (exit 0, empty stderr). The recovery and the next messages then "failed"
+    // until the retry circuit opened. A launch that started, answered and
+    // streamed no error step of its own did not fail.
+    if (
+      status === 'ERROR' &&
+      !ctx.ownErrorStep &&
+      ctx.firstOwnStepIndex !== null &&
+      (ctx.assistantText.trim() !== '' || asText(result.response).trim() !== '')
+    ) {
+      log.warn('antigravity CLI repeated an earlier launch error on a run that answered', {
+        sessionKey: this.opts.sessionKey,
+        error: asText(result.error).slice(0, 300),
+      })
+      status = 'SUCCESS'
+    }
     const id = asText(result.conversation_id)
     if (CONVERSATION_ID_RE.test(id)) ctx.conversationId = id
     if (status === 'CANCELED' || status === 'INTERRUPTED') ctx.interrupted = true

@@ -404,11 +404,14 @@ describe('AntigravityAdapter', () => {
       const ok = path.join(h.dir, 'prelude-ok.ndjson')
       await writeFile(ok, `${[lines[0], prelude, ...lines.slice(1)].join('\n')}\n`)
       assert.equal((await runTurn(h, ok)).summary?.isError, false)
+      // A run that really failed: ERROR and no answer. (ERROR on a run that
+      // answered is the CLI repeating an earlier launch's error; see below.)
       const failed = path.join(h.dir, 'prelude-failed.ndjson')
-      await writeFile(
-        failed,
-        `${[lines[0], prelude, ...lines.slice(1, -1), lines.at(-1)!.replace('"status":"SUCCESS"', '"status":"ERROR"')].join('\n')}\n`,
-      )
+      const failedResult = JSON.parse(lines.at(-1)!)
+      failedResult.result.status = 'ERROR'
+      failedResult.result.response = ''
+      const unanswered = lines.slice(1, -1).filter((line) => !line.includes('"agent_response"'))
+      await writeFile(failed, `${[lines[0], prelude, ...unanswered, JSON.stringify(failedResult)].join('\n')}\n`)
       const { summary } = await runTurn(h, failed)
       assert.equal(summary?.isError, true)
       assert.match(summary?.errorDetail ?? '', /^ANTIGRAVITY_CREDENTIAL_EXPIRED: /)
@@ -727,6 +730,61 @@ describe('Antigravity route expiry mid-turn (OCV5-556)', () => {
       const { summary } = await runTurn(h, fixture)
       assert.equal(summary?.isError, false, summary?.errorDetail)
       assert.match(summary?.assistantText ?? '', /done after retry/)
+    } finally {
+      await h.restore()
+    }
+  })
+})
+
+// OCV5-556 (live, uid 765): after one launch of a conversation failed on a
+// lapsed relay route, every later `--conversation` launch of the real 1.4.0
+// CLI ended status ERROR with that old 404 although it answered normally
+// (exit 0, empty stderr). The automatic recovery and the next message both
+// "failed" until the retry circuit opened. Raw CLI output, offline fake relay:
+// resume-route-expired = the failing launch, resume-after-error = the next one.
+describe('Antigravity stale result error after a failed launch (OCV5-556)', () => {
+  const CONVERSATION = '4de23c8d-7a49-4e45-8244-f9a97d41a8f7'
+
+  test('a resumed launch that answered is a success despite the repeated old error', async () => {
+    const h = await harness({ resumeSessionId: CONVERSATION })
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const { summary, sessionIds } = await runTurn(h, 'resume-after-error.ndjson')
+      assert.equal(summary?.isError, false, summary?.errorDetail)
+      assert.match(summary?.assistantText ?? '', /hi there/)
+      assert.deepEqual(sessionIds, [CONVERSATION], 'the conversation keeps resuming')
+    } finally {
+      await h.restore()
+    }
+  })
+
+  test('the launch that really failed still fails', async () => {
+    const h = await harness({ resumeSessionId: CONVERSATION })
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const stderr = await readFile(path.join(FIXTURES, 'resume-route-expired.stderr.txt'), 'utf8')
+      const { summary, sessionIds } = await runTurn(h, 'resume-route-expired.ndjson', { stderr })
+      assert.equal(summary?.isError, true)
+      assert.equal(classifyRunError(summary?.errorDetail).code, 'upstream_failed')
+      assert.deepEqual(sessionIds, [])
+    } finally {
+      await h.restore()
+    }
+  })
+
+  test('an ERROR result with no answer from this launch is not waved through', async () => {
+    const h = await harness({ resumeSessionId: CONVERSATION })
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const lines = (await readFile(path.join(FIXTURES, 'resume-after-error.ndjson'), 'utf8')).trim().split('\n')
+      const kept = lines.filter((line) => !line.includes('"agent_response"'))
+      const result = JSON.parse(kept.pop()!)
+      result.result.response = ''
+      const file = path.join(h.dir, 'resume-error-no-answer.ndjson')
+      await writeFile(file, `${[...kept, JSON.stringify(result)].join('\n')}\n`)
+      const { summary } = await runTurn(h, file)
+      assert.equal(summary?.isError, true)
+      assert.match(summary?.errorDetail ?? '', /ANTIGRAVITY_ROUTE_EXPIRED/)
     } finally {
       await h.restore()
     }
