@@ -14,7 +14,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const PROTOCOL = path.join(ROOT, 'packages/protocol')
 
 /** Protocol subpaths a browser may import. Every one of them must be node:*-free transitively. */
-export const BROWSER_ENTRIES = [
+const BROWSER_ENTRIES = [
   './browser',
   './containerPreview',
   './frames',
@@ -24,7 +24,7 @@ export const BROWSER_ENTRIES = [
 ]
 
 /** Runtime (non-type) module specifiers of a file: imports, re-exports, side-effect and dynamic imports. */
-export function runtimeImports(file: string, text: string): string[] {
+function runtimeImports(file: string, text: string): string[] {
   const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true)
   const out: string[] = []
   const visit = (n: ts.Node) => {
@@ -71,7 +71,7 @@ export function runtimeImports(file: string, text: string): string[] {
  * them. Relative imports are followed; bare package imports are reported as `pkg:<name>` so the
  * caller decides (protocol's only allowed bare dependency is @sinclair/typebox).
  */
-export function reachable(entry: string): { spec: string; chain: string[] }[] {
+function reachable(entry: string): { spec: string; chain: string[] }[] {
   const found: { spec: string; chain: string[] }[] = []
   const seen = new Set<string>()
   const walk = (file: string, chain: string[]) => {
