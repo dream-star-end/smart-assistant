@@ -276,6 +276,8 @@ export class SerialJobQueue {
  * serialize cleanly instead of colliding on the same tab. Reclaims locks immediately if the
  * recorded owner PID is no longer alive.
  */
+let localLockSeq = 0
+
 export async function withProfileFileLock(
   lockPath,
   fn,
@@ -287,194 +289,198 @@ export async function withProfileFileLock(
     busyMessage = null,
   } = {},
 ) {
+  void staleMs
   const deadline = Date.now() + timeoutMs
-  let acquiredIno = null
-  let immediateReclaims = 0
+  const holdersDir = `${lockPath}.holders`
+  fs.mkdirSync(holdersDir, { recursive: true, mode: 0o700 })
 
-  const isLockPayloadDeadOrStale = (targetPath, maxAgeMs) => {
-    let st
-    try {
-      st = fs.statSync(targetPath)
-    } catch {
-      return { stale: false, stat: null }
-    }
-    const ageMs = Date.now() - st.mtimeMs
-    if (ageMs > maxAgeMs) return { stale: true, stat: st }
-    try {
-      const raw = fs.readFileSync(targetPath, 'utf8')
-      const parsed = JSON.parse(raw)
-      if (!parsed || !Number.isInteger(parsed.pid)) {
-        return { stale: true, stat: st }
-      }
-      if (!pidAliveFn(parsed.pid)) {
-        return { stale: true, stat: st }
-      }
-      return { stale: false, stat: st }
-    } catch {
-      return { stale: true, stat: st }
-    }
-  }
+  const invocationId = `${String(process.pid).padStart(10, '0')}-${process.hrtime.bigint().toString(36)}-${(++localLockSeq).toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+  const enteringName = `entering-${invocationId}.json`
+  const enteringPath = path.join(holdersDir, enteringName)
+  let ticketName = null
+  let ticketPath = null
 
-  const isReclaimGuardDead = (reclaimPath) => {
-    let st
+  const writeJsonAtomically = (targetPath, obj) => {
+    const tmp = `${targetPath}.tmp.${process.pid}.${++localLockSeq}`
     try {
-      st = fs.statSync(reclaimPath)
-    } catch {
-      return { dead: false, stat: null }
-    }
-    try {
-      const raw = fs.readFileSync(reclaimPath, 'utf8')
-      const parsed = JSON.parse(raw)
-      if (!parsed || !Number.isInteger(parsed.pid)) {
-        return { dead: true, stat: st }
-      }
-      if (!pidAliveFn(parsed.pid)) {
-        return { dead: true, stat: st }
-      }
-      return { dead: false, stat: st }
-    } catch {
-      return { dead: true, stat: st }
-    }
-  }
-
-  const tryAcquireReclaimGuard = (reclaimPath) => {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const tmpReclaim = `${reclaimPath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
-      try {
-        fs.writeFileSync(
-          tmpReclaim,
-          JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }),
-          { mode: 0o600 },
-        )
-        fs.linkSync(tmpReclaim, reclaimPath)
-        const st = fs.statSync(reclaimPath)
-        return st.ino
-      } catch (err) {
-        if (err && err.code === 'EEXIST' && attempt === 0) {
-          const check = isReclaimGuardDead(reclaimPath)
-          if (check.dead && check.stat) {
-            const rmToken = `${reclaimPath}.rm.${check.stat.ino}`
-            const tmpRm = `${rmToken}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
-            let rmIno = null
-            try {
-              fs.writeFileSync(
-                tmpRm,
-                JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }),
-                { mode: 0o600 },
-              )
-              try {
-                fs.linkSync(tmpRm, rmToken)
-              } catch (rmErr) {
-                if (rmErr && rmErr.code === 'EEXIST') {
-                  const rmCheck = isReclaimGuardDead(rmToken)
-                  if (rmCheck.dead && rmCheck.stat) {
-                    try {
-                      if (fs.statSync(rmToken).ino === rmCheck.stat.ino) {
-                        fs.unlinkSync(rmToken)
-                        fs.linkSync(tmpRm, rmToken)
-                      }
-                    } catch {}
-                  }
-                }
-              }
-              const rmSt = fs.statSync(rmToken)
-              const rmParsed = JSON.parse(fs.readFileSync(rmToken, 'utf8'))
-              if (rmParsed && rmParsed.pid === process.pid) {
-                rmIno = rmSt.ino
-                const cur = fs.statSync(reclaimPath)
-                if (cur.ino === check.stat.ino) {
-                  fs.unlinkSync(reclaimPath)
-                }
-              }
-            } catch {} finally {
-              try {
-                fs.unlinkSync(tmpRm)
-              } catch {}
-              if (rmIno !== null) {
-                try {
-                  if (fs.statSync(rmToken).ino === rmIno) {
-                    fs.unlinkSync(rmToken)
-                  }
-                } catch {}
-              }
-            }
-            if (rmIno !== null) {
-              continue
-            }
-          }
-        }
-        return null
-      } finally {
-        try {
-          fs.unlinkSync(tmpReclaim)
-        } catch {}
-      }
-    }
-    return null
-  }
-
-  while (acquiredIno === null) {
-    const tmpPath = `${lockPath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
-    try {
-      fs.writeFileSync(tmpPath, JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }), {
-        mode: 0o600,
-      })
-      fs.linkSync(tmpPath, lockPath)
-      const st = fs.statSync(lockPath)
-      acquiredIno = st.ino
-    } catch (err) {
-      if (err && err.code === 'EEXIST') {
-        let reclaimed = false
-        const lockCheck = isLockPayloadDeadOrStale(lockPath, staleMs)
-        if (lockCheck.stale && lockCheck.stat) {
-          const reclaimPath = `${lockPath}.reclaim`
-          const reclaimIno = tryAcquireReclaimGuard(reclaimPath)
-          if (reclaimIno !== null) {
-            try {
-              const verifyStat = fs.statSync(lockPath)
-              if (verifyStat.ino === lockCheck.stat.ino) {
-                fs.unlinkSync(lockPath)
-                reclaimed = true
-              }
-            } catch {} finally {
-              try {
-                const curReclaim = fs.statSync(reclaimPath)
-                if (curReclaim.ino === reclaimIno) {
-                  fs.unlinkSync(reclaimPath)
-                }
-              } catch {}
-            }
-          }
-        }
-        if (reclaimed && immediateReclaims < 2) {
-          immediateReclaims += 1
-          continue
-        }
-        if (Date.now() >= deadline) {
-          const msg = busyMessage
-            ? `${busyMessage} (BOX_GPT_WEB_LOCK_TIMEOUT: could not acquire ${lockPath} within ${timeoutMs}ms)`
-            : `BOX_GPT_WEB_LOCK_TIMEOUT: could not acquire ${lockPath} within ${timeoutMs}ms`
-          throw new Error(msg)
-        }
-        await new Promise((r) => setTimeout(r, pollMs))
-        continue
-      }
-      throw err
+      fs.writeFileSync(tmp, JSON.stringify(obj), { mode: 0o600 })
+      fs.renameSync(tmp, targetPath)
     } finally {
       try {
-        fs.unlinkSync(tmpPath)
+        fs.unlinkSync(tmp)
       } catch {}
     }
   }
+
+  const checkPayloadStatus = (filePath) => {
+    let st
+    try {
+      st = fs.statSync(filePath)
+    } catch {
+      return 'missing'
+    }
+    if (!st.isFile()) return 'missing'
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8')
+      const parsed = JSON.parse(raw)
+      if (!parsed || !Number.isInteger(parsed.pid)) {
+        return 'dead'
+      }
+      if (!pidAliveFn(parsed.pid)) {
+        return 'dead'
+      }
+      return 'alive'
+    } catch {
+      return 'dead'
+    }
+  }
+
+  const parseTicketFile = (name) => {
+    if (!name.startsWith('ticket-') || !name.endsWith('.json')) return null
+    const body = name.slice('ticket-'.length, -'.json'.length)
+    const dash = body.indexOf('-')
+    if (dash <= 0) return null
+    const num = Number(body.slice(0, dash))
+    const id = body.slice(dash + 1)
+    if (!Number.isFinite(num) || !id) return null
+    return { num, id }
+  }
+
+  const parseEnteringFile = (name) => {
+    if (!name.startsWith('entering-') || !name.endsWith('.json')) return null
+    const id = name.slice('entering-'.length, -'.json'.length)
+    return id || null
+  }
+
   try {
+    // Step 1: Announce entering in holdersDir using an invocation-unique filename
+    writeJsonAtomically(enteringPath, {
+      pid: process.pid,
+      acquiredAt: Date.now(),
+      id: invocationId,
+    })
+
+    // Step 2: Scan existing live tickets, pick max + 1, and publish our unique ticket file
+    let maxTicketNum = 0
+    for (const name of fs.readdirSync(holdersDir)) {
+      const t = parseTicketFile(name)
+      if (t && t.num > maxTicketNum) {
+        maxTicketNum = t.num
+      }
+    }
+    const myNumber = maxTicketNum + 1
+    ticketName = `ticket-${String(myNumber).padStart(12, '0')}-${invocationId}.json`
+    ticketPath = path.join(holdersDir, ticketName)
+    writeJsonAtomically(ticketPath, {
+      pid: process.pid,
+      acquiredAt: Date.now(),
+      number: myNumber,
+      id: invocationId,
+    })
+
+    // Snapshot any entering-* files present at the moment our ticket is on disk
+    const dirAfterTicket = fs.readdirSync(holdersDir)
+    const ticketsAtSnapshot = new Set()
+    for (const name of dirAfterTicket) {
+      const t = parseTicketFile(name)
+      if (t) ticketsAtSnapshot.add(t.id)
+    }
+    const preExistingEntering = new Set()
+    for (const name of dirAfterTicket) {
+      const entId = parseEnteringFile(name)
+      if (entId && entId !== invocationId && !ticketsAtSnapshot.has(entId)) {
+        preExistingEntering.add(entId)
+      }
+    }
+
+    // Step 3: Remove our own entering marker now that our ticket is visible on disk
+    try {
+      fs.unlinkSync(enteringPath)
+    } catch {}
+
+    // Step 4: Wait until our ticket is at the head of the live queue.
+    // Note: We NEVER unlink another process's file; dead-PID files are simply ignored,
+    // which eliminates any SIGSTOP/SIGCONT unlink race across processes.
+    while (true) {
+      let blocked = false
+
+      // Respect any externally-seeded live lockPath / .reclaim file; ignore if dead/corrupt
+      for (const legacyPath of [lockPath, `${lockPath}.reclaim`]) {
+        if (checkPayloadStatus(legacyPath) === 'alive') {
+          blocked = true
+          break
+        }
+      }
+
+      // Pass 1: Wait for any pre-existing entering-* files to finish publishing their ticket
+      if (!blocked && preExistingEntering.size > 0) {
+        const curNames = fs.readdirSync(holdersDir)
+        const curTickets = new Set()
+        for (const name of curNames) {
+          const t = parseTicketFile(name)
+          if (t) curTickets.add(t.id)
+        }
+        for (const entId of [...preExistingEntering]) {
+          if (curTickets.has(entId)) {
+            preExistingEntering.delete(entId)
+            continue
+          }
+          const full = path.join(holdersDir, `entering-${entId}.json`)
+          const st = checkPayloadStatus(full)
+          if (st === 'alive') {
+            blocked = true
+            break
+          }
+          preExistingEntering.delete(entId)
+        }
+      }
+
+      // Pass 2: Fresh directory read to check if any live ticket is ordered before ours
+      if (!blocked) {
+        let sawSelf = false
+        for (const name of fs.readdirSync(holdersDir)) {
+          const t = parseTicketFile(name)
+          if (!t) continue
+          if (t.id === invocationId) {
+            sawSelf = true
+            continue
+          }
+          const full = path.join(holdersDir, name)
+          if (checkPayloadStatus(full) === 'alive') {
+            if (t.num < myNumber || (t.num === myNumber && t.id < invocationId)) {
+              blocked = true
+              break
+            }
+          }
+        }
+        if (!blocked && !sawSelf) {
+          throw new Error(`BOX_GPT_WEB_LOCK_LOST: ticket ${ticketName} disappeared`)
+        }
+      }
+
+      if (!blocked) {
+        break
+      }
+
+      if (Date.now() >= deadline) {
+        const msg = busyMessage
+          ? `${busyMessage} (BOX_GPT_WEB_LOCK_TIMEOUT: could not acquire ${lockPath} within ${timeoutMs}ms)`
+          : `BOX_GPT_WEB_LOCK_TIMEOUT: could not acquire ${lockPath} within ${timeoutMs}ms`
+        throw new Error(msg)
+      }
+      await new Promise((r) => setTimeout(r, pollMs))
+    }
+
     return await fn()
   } finally {
     try {
-      const curStat = fs.statSync(lockPath)
-      if (curStat.ino === acquiredIno) {
-        fs.unlinkSync(lockPath)
-      }
+      fs.unlinkSync(enteringPath)
     } catch {}
+    if (ticketPath) {
+      try {
+        fs.unlinkSync(ticketPath)
+      } catch {}
+    }
   }
 }
 
