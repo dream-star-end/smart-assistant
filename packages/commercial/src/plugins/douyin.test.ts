@@ -414,26 +414,46 @@ describe('douyin login proof', () => {
 
 function blockerHarness() {
   const src = DOUYIN_WORKER_SOURCE
-  const body = src.slice(src.indexOf('function blockerCode'), src.indexOf('/** 等二维码'))
-  assert.ok(body.length > 0)
+  const pick = (from: string, to: string) => {
+    const body = src.slice(src.indexOf(from), src.indexOf(to))
+    assert.ok(body.length > 0, from)
+    return body
+  }
   return new Function(
     `'use strict';
-     ${sourceConsts('CHALLENGE_TEXT', 'VERIFICATION_TEXT')}
-     ${body}
-     return { blockerCode, staticBlockers };`,
+     ${sourceConsts('SITE', 'CHALLENGE_TEXT', 'VERIFICATION_TEXT')}
+     ${pick('async function pageText', '/**\n * 页面上出现可见的风控')}
+     ${pick('const NO_BLOCKERS', '/** 等二维码')}
+     ${pick('function onLoginPage', 'async function proveSelf')}
+     return { blockerCode, staticBlockers, pageBlocker, NO_BLOCKERS };`,
   )() as {
-    blockerCode(text: string, ignore: Set<string>): string | null
-    staticBlockers(text: string): Set<string>
+    blockerCode(text: string, baseline: Map<string, number>): string | null
+    staticBlockers(text: string): Map<string, number>
+    pageBlocker(
+      context: unknown,
+      login: unknown,
+      baseline: Map<string, number>,
+    ): Promise<string | null>
+    NO_BLOCKERS: Map<string, number>
+  }
+}
+
+/** Fake Playwright page for the stop rules: a URL and the body text. */
+function textPage(url: string, text: string) {
+  return {
+    url: () => url,
+    isClosed: () => false,
+    locator: () => ({ innerText: async () => text }),
   }
 }
 
 describe('douyin login stop rules (visible captcha / identity verification)', () => {
-  const { blockerCode, staticBlockers } = blockerHarness()
+  const { blockerCode, staticBlockers, pageBlocker, NO_BLOCKERS } = blockerHarness()
   // 侦察时二维码页的文字里含「扫码登录 / 验证码登录 / 密码登录」，都不能被当成验证信号。
   const LOGIN_PAGE = '扫码登录 验证码登录 密码登录 打开抖音APP 扫一扫登录'
 
   test('the plain login page is not a blocker', () => {
-    assert.equal(blockerCode(LOGIN_PAGE, new Set()), null)
+    assert.equal(blockerCode(LOGIN_PAGE, NO_BLOCKERS), null)
     assert.equal(staticBlockers(LOGIN_PAGE).size, 0)
   })
 
@@ -443,17 +463,51 @@ describe('douyin login stop rules (visible captcha / identity verification)', ()
       '接收短信验证码',
       '验证码已发送至 138****',
     ])
-      assert.equal(blockerCode(`${LOGIN_PAGE} ${text}`, new Set()), 'VERIFICATION_REQUIRED', text)
+      assert.equal(blockerCode(`${LOGIN_PAGE} ${text}`, NO_BLOCKERS), 'VERIFICATION_REQUIRED', text)
     for (const text of ['请完成下列验证后继续', '拖动下方滑块完成拼图', '按住左边按钮拖动'])
-      assert.equal(blockerCode(`${LOGIN_PAGE} ${text}`, new Set()), 'UPSTREAM_CHALLENGE', text)
+      assert.equal(blockerCode(`${LOGIN_PAGE} ${text}`, NO_BLOCKERS), 'UPSTREAM_CHALLENGE', text)
   })
 
-  test('a phrase already on the page when the QR appeared is static text, not a signal', () => {
+  test('static text present when the QR appeared is not a signal, but a later real request of the same kind is (Codex r1 P1)', () => {
     const footer = `${LOGIN_PAGE} 身份验证中心`
-    const ignore = staticBlockers(footer)
-    assert.deepEqual([...ignore], ['VERIFICATION_REQUIRED'])
-    assert.equal(blockerCode(footer, ignore), null)
-    assert.equal(blockerCode(`${footer} 拖动下方滑块`, ignore), 'UPSTREAM_CHALLENGE')
+    const baseline = staticBlockers(footer)
+    assert.equal(blockerCode(footer, baseline), null)
+    // Codex 复现：页脚有「身份验证中心」，随后出现「请进行身份验证；验证码已发送」。
+    assert.equal(
+      blockerCode(`${footer} 请进行身份验证；验证码已发送`, baseline),
+      'VERIFICATION_REQUIRED',
+    )
+    assert.equal(blockerCode(`${footer} 请进行身份验证`, baseline), 'VERIFICATION_REQUIRED')
+    assert.equal(blockerCode(`${footer} 拖动下方滑块`, baseline), 'UPSTREAM_CHALLENGE')
+  })
+
+  test('every open page is checked; the baseline only covers the login page while it stays on the root (Codex r1 P1)', async () => {
+    const footer = `${LOGIN_PAGE} 身份验证中心`
+    const baseline = staticBlockers(footer)
+    const root = textPage('https://creator.douyin.com/', footer)
+    assert.equal(await pageBlocker({ pages: () => [root] }, root, baseline), null)
+    // Codex 复现：二维码出现后跳到验证页——同样的词在验证页上就是信号。
+    const verify = textPage('https://creator.douyin.com/verify', '身份验证中心 请完成本人验证')
+    assert.equal(
+      await pageBlocker({ pages: () => [verify] }, verify, baseline),
+      'VERIFICATION_REQUIRED',
+    )
+    // 验证在弹窗 / 新页里出现。
+    const popup = textPage('https://creator.douyin.com/x', '拖动下方滑块完成拼图')
+    assert.equal(
+      await pageBlocker({ pages: () => [root, popup] }, root, baseline),
+      'UPSTREAM_CHALLENGE',
+    )
+  })
+
+  test('the login loop checks all pages every round and again right before saving the session', () => {
+    const loop = DOUYIN_WORKER_SOURCE.slice(DOUYIN_WORKER_SOURCE.indexOf('async function runLogin'))
+    const checks = [...loop.matchAll(/await pageBlocker\(context, login, ignoredBlockers\)/g)]
+    assert.equal(checks.length, 2)
+    const authenticated = loop.indexOf("event: 'authenticated'")
+    assert.ok(checks[0]!.index! < loop.indexOf('onLoginPage(login)'))
+    assert.ok(checks[1]!.index! > loop.indexOf('await proveSelf(context)'))
+    assert.ok(checks[1]!.index! < authenticated)
   })
 })
 

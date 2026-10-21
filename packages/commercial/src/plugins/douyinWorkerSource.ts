@@ -336,19 +336,44 @@ async function pageText(page) {
   return (await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '')).replace(/\s+/g, ' ');
 }
 /**
- * 页面上出现可见的风控 / 本人验证就停：返回失败码，绝不尝试处理。ignore 是二维码出现时页面上
- * 已有的提示词（静态文案），之后不再当作信号，避免把页脚之类的固定文字误判成验证。
+ * 页面上出现可见的风控 / 本人验证就停：返回失败码，绝不尝试处理。
+ * 按「提示词 × 出现次数」比对：baseline 是二维码出现时登录页上已有的提示词次数（静态文案，如页脚的
+ * 「身份验证中心」）；之后同一个词出现得更多、或出现新的词，都算信号。只按类别屏蔽会漏掉后来出现的
+ * 同类真实验证（Codex r1 P1）。
  */
-function blockerCode(text, ignore) {
-  if (VERIFICATION_TEXT.test(text) && !ignore.has('VERIFICATION_REQUIRED')) return 'VERIFICATION_REQUIRED';
-  if (CHALLENGE_TEXT.test(text) && !ignore.has('UPSTREAM_CHALLENGE')) return 'UPSTREAM_CHALLENGE';
-  return null;
+const NO_BLOCKERS = new Map();
+function phraseCounts(text) {
+  const counts = new Map();
+  for (const [code, re] of [['VERIFICATION_REQUIRED', VERIFICATION_TEXT], ['UPSTREAM_CHALLENGE', CHALLENGE_TEXT]]) {
+    for (const match of text.matchAll(new RegExp(re.source, 'g'))) {
+      const key = code + ':' + match[0];
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+  }
+  return counts;
 }
-function staticBlockers(text) {
-  const out = new Set();
-  if (VERIFICATION_TEXT.test(text)) out.add('VERIFICATION_REQUIRED');
-  if (CHALLENGE_TEXT.test(text)) out.add('UPSTREAM_CHALLENGE');
-  return out;
+function blockerCode(text, baseline) {
+  let challenge = false;
+  for (const [key, count] of phraseCounts(text)) {
+    if (count <= (baseline.get(key) || 0)) continue;
+    if (key.startsWith('VERIFICATION_REQUIRED:')) return 'VERIFICATION_REQUIRED';
+    challenge = true;
+  }
+  return challenge ? 'UPSTREAM_CHALLENGE' : null;
+}
+function staticBlockers(text) { return phraseCounts(text); }
+/**
+ * 检查浏览器里所有打开的页面（含跳转后的验证页和弹窗）。baseline 只对仍停在登录首页的登录页生效；
+ * 离开首页后页面上的任何提示词都算信号（Codex r1 P1：只看首页会让验证页直接走到身份探测）。
+ */
+async function pageBlocker(context, login, baseline) {
+  for (const page of context.pages()) {
+    if (page.isClosed()) continue;
+    const ignore = page === login && onLoginPage(login) ? baseline : NO_BLOCKERS;
+    const code = blockerCode(await pageText(page), ignore);
+    if (code) return code;
+  }
+  return null;
 }
 /** 等二维码。等待期间不因页面文字提前失败（登录组件懒加载）；超时才看页面是否被验证挡住。 */
 async function captureQr(page, waitMs) {
@@ -359,7 +384,7 @@ async function captureQr(page, waitMs) {
     if (image) break;
     await page.waitForTimeout(1_000);
   }
-  if (!image) throw new Error(blockerCode(await pageText(page), new Set()) || 'qr');
+  if (!image) throw new Error(blockerCode(await pageText(page), NO_BLOCKERS) || 'qr');
   const png = await image.screenshot({ type: 'png', animations: 'disabled' });
   if (png.length < 100 || png.length > 512 * 1024 || !png.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) throw new Error('qr');
   return png;
@@ -413,13 +438,13 @@ async function runLogin(input, relay) {
     let nextQr = Date.now() + QR_REFRESH_MS;
     let nextProbe = 0;
     while (Date.now() < input.deadlineMs) {
+      const blocked = await pageBlocker(context, login, ignoredBlockers);
+      if (blocked) {
+        emitStep({ step: 'login.blocked', code: blocked });
+        await writeTerminalAndExit({ event: 'failed', code: blocked });
+      }
       if (onLoginPage(login)) {
         const text = await pageText(login);
-        const blocked = blockerCode(text, ignoredBlockers);
-        if (blocked) {
-          emitStep({ step: 'login.blocked', code: blocked });
-          await writeTerminalAndExit({ event: 'failed', code: blocked });
-        }
         if (QR_EXPIRED_TEXT.test(text)) {
           emitStep({ step: 'login.qr_expired' });
           await refreshExpiredQr(login);
@@ -443,6 +468,12 @@ async function runLogin(input, relay) {
         nextProbe = Date.now() + 5_000;
         const self = await proveSelf(context);
         if (self) {
+          // 身份接口通过也不代表没有本人验证：保存前再看一遍所有页面。
+          const late = await pageBlocker(context, login, ignoredBlockers);
+          if (late) {
+            emitStep({ step: 'login.blocked', code: late });
+            await writeTerminalAndExit({ event: 'failed', code: late });
+          }
           const state = filteredState(await context.storageState(), input.cookieDomains, input.stateOrigins);
           // 平台只保存带 Secure 的 cookie：登录凭据被过滤掉就明确失败，绝不存一份无法使用的登录状态。
           if (!state.cookies.some((cookie) => SESSION_COOKIES.includes(cookie.name))) {
