@@ -35,7 +35,9 @@ mlog() { echo "$*" >&2; }
 cleanup_master_staging() {
   local candidate canon root_canon parent parent_dev root_dev st_dev st_ino
   local live_canon worktree_canon
-  # 门的临时目录跟 staging 同生命周期:所有失败路径(含 EXIT trap)都经过这里。
+  # 门的临时测试库、临时目录跟 staging 同生命周期:所有失败路径(含 EXIT trap)都经过这里。
+  # 测试库要用 staging 里的 node_modules/pg 删,所以排在删 staging 之前。
+  master_gate_db_drop
   cleanup_master_gate_tmpdir
   candidate="${MASTER_STAGING:-}"
   MASTER_STAGING=""
@@ -163,6 +165,247 @@ sweep_stale_master_gate_tmpdirs() {
     mlog "  清理残留的门临时目录(pid $pid 已退出): $d"
     rm -rf -- "$d"
   done
+}
+
+# ── Box 门假失败治理(OCV5-557)──────────────────────────────────────────
+# FINDINGS-20261021:7 天 16 次 Box 相关门失败,没有一次是真缺陷。根因两类:门里的绝对时间窗口
+# 在负载 20–45 时越界;门共用的 openclaude_test 被别的会话的 integ 测试重建、加锁。这里只管调度和记录:
+#   - Box 门前先等后台 runtime 构建收尾(不并行),再等主机空闲(load1<8、没有别的会话在跑全量测试),有上限;
+#   - 每班列车一个临时测试库,门跑完即删;共享测试库只用来连到同一实例,绝不重置或删除;
+#   - 每次跑门前按负载算等待倍数 clamp(load1/8, 1, 3) 传给门,写进 summary;
+#   - 门失败时只看门自己打印的 [gate-failure] 行:全部在白名单里才重跑一次,两次日志都留,重跑写进 summary。
+# 门的断言、计数都不在这里;倍数只放大门里的等待预算,上限 3 倍。
+MASTER_BOX_GATE_LOAD_MAX=8          # 16 核的一半(用户 2026-10-21 定),不读环境变量
+MASTER_GATE_LOAD_SCALE_MAX=3        # 同上
+MASTER_GATE_IDLE_TIMEOUT_S="${MASTER_GATE_IDLE_TIMEOUT_S:-900}"
+MASTER_GATE_IDLE_POLL_S="${MASTER_GATE_IDLE_POLL_S:-15}"
+MASTER_GATE_LOADAVG="${MASTER_GATE_LOADAVG:-/proc/loadavg}"
+MASTER_GATE_TEST_LOCK_DIR="${MASTER_GATE_TEST_LOCK_DIR:-/var/lock}"
+MASTER_GATE_PROC_ROOT="${MASTER_GATE_PROC_ROOT:-/proc}"
+MASTER_GATE_ATTEMPT_DIR="${MASTER_GATE_ATTEMPT_DIR:-}"
+MASTER_GATE_LOAD_SCALE=1
+# 门打印的 [gate-failure] 行(去掉前缀后)整行匹配其一才算已知假失败。
+MASTER_GATE_FLAKY_SIGNATURES=(
+  'Query read timeout'
+  'relation "agent_containers" does not exist'
+  'BOX_SUCCESS_GATE_DEADLINE'
+  '\[box-incident-proofs\] LARGE_LINE_CLOSE_still-running'
+  '\[box-incident-proofs\] LARGE_LINE_REFUSED_HOST_LEFT_RUNNING'
+  # 一次 stop 都没收到(calls 里只有 idle-proof);收到两次 stop 是真失败,不在这里
+  '\[box-incident-proofs\] CONFIG_PARKED_TURN_NOT_STOPPED_(/internal/box/idle-proof(,/internal/box/idle-proof)*)?'
+  'SEARCH_CLI_PROCESS_FAILED exit=null'
+)
+# success recovery 的 supervisor 在 worker 失败时报这一行;它本身不是原因,原因看 worker 的那行。
+MASTER_GATE_FLAKY_WRAPPER='BOX_SUCCESS_GATE_WORKER code=1 signal=none'
+# 临时测试库(本进程建,只有 gateTestDb.mjs 认得的登记才能删)。
+MASTER_GATE_DB_URL=""
+MASTER_GATE_DB_NAME=""
+MASTER_GATE_DB_STAGING=""
+
+master_gate_base_dsn() {
+  printf '%s' "${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}"
+}
+
+master_gate_load1() {
+  local a="" rest=""
+  read -r a rest <"$MASTER_GATE_LOADAVG" 2>/dev/null || a=""
+  [[ "$a" =~ ^[0-9]+(\.[0-9]+)?$ ]] && printf '%s' "$a"
+  return 0
+}
+
+# 等待倍数 = clamp(load1/8, 1, 3),两位小数;读不到负载按 1。
+master_gate_load_scale() {
+  local l
+  l="$(master_gate_load1)"
+  if [[ -z "$l" ]]; then printf '1.00'; return 0; fi
+  awk -v l="$l" -v d="$MASTER_BOX_GATE_LOAD_MAX" -v m="$MASTER_GATE_LOAD_SCALE_MAX" \
+    'BEGIN { s = l / d; if (s < 1) s = 1; if (s > m) s = m; printf "%.2f", s }'
+}
+
+# 主机不空闲的原因(空闲时什么都不打印):负载、被持有的 test-mutex 锁、npm test 类进程。
+# 锁只用 flock -n 试探后立即放开,不新建锁文件;进程只读 /proc/<pid>/cmdline,不 pgrep/pkill。
+master_gate_busy_reason() {
+  local l f name rc pid cmd reasons=() args=()
+  l="$(master_gate_load1)"
+  if [[ -z "$l" ]]; then
+    reasons+=("load1=unreadable")
+  elif awk -v l="$l" -v m="$MASTER_BOX_GATE_LOAD_MAX" 'BEGIN { exit !(l >= m) }'; then
+    reasons+=("load1=$l>=$MASTER_BOX_GATE_LOAD_MAX")
+  fi
+  for f in "$MASTER_GATE_TEST_LOCK_DIR"/oc-test-*.lock; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    rc=0
+    flock -n -E 75 "$f" true 2>/dev/null || rc=$?
+    [[ "$rc" == 75 ]] || continue
+    name="${f##*/oc-test-}"
+    reasons+=("test-mutex:${name%.lock}")
+  done
+  for f in "$MASTER_GATE_PROC_ROOT"/[0-9]*/cmdline; do
+    pid="${f%/cmdline}"
+    pid="${pid##*/}"
+    [[ "$pid" != "$$" && "$pid" != "${BASHPID:-}" ]] || continue
+    args=()
+    mapfile -d '' -t args <"$f" 2>/dev/null || continue
+    (( ${#args[@]} > 0 )) || continue
+    cmd=" ${args[*]} "
+    if [[ "$cmd" =~ [[:space:]/]npm(-cli\.js)?[[:space:]]+(test|run[[:space:]]+(test|check:v5)[^[:space:]]*)[[:space:]] ]]; then
+      reasons+=("pid$pid:${BASH_REMATCH[0]//[[:space:]]/ }")
+    fi
+  done
+  (( ${#reasons[@]} == 0 )) || printf '%s' "${reasons[*]:0:6}"
+  return 0
+}
+
+master_gate_wait_host_idle() { # <why> → rc 1 when still busy after MASTER_GATE_IDLE_TIMEOUT_S
+  local why="$1" t0 now reason=""
+  t0="$(date +%s)"
+  while :; do
+    reason="$(master_gate_busy_reason)"
+    [[ -n "$reason" ]] || break
+    now="$(date +%s)"
+    if (( now - t0 >= MASTER_GATE_IDLE_TIMEOUT_S )); then
+      tsum_note "hostIdle.$why.timeout" "$reason" 2>/dev/null || :
+      mlog "✗ 主机持续繁忙 $((now - t0))s(上限 ${MASTER_GATE_IDLE_TIMEOUT_S}s),$why 不发车:$reason"
+      return 1
+    fi
+    mlog "  ⏳ 主机繁忙,$why 暂不发车(已等 $((now - t0))s):$reason"
+    sleep "$MASTER_GATE_IDLE_POLL_S"
+  done
+  now="$(date +%s)"
+  tsum_note "hostIdle.$why.waitSec" "$((now - t0))" 2>/dev/null || :
+  tsum_note "hostIdle.$why.load1" "$(master_gate_load1)" 2>/dev/null || :
+  mlog "  主机空闲(load1=$(master_gate_load1) < $MASTER_BOX_GATE_LOAD_MAX,没有别的会话在跑全量测试),$why 等了 $((now - t0))s"
+  return 0
+}
+
+master_gate_db_create() { # <staging>
+  local staging="$1" url
+  ( cd "$staging" && OC_V5_GATE_BASE_DSN="$(master_gate_base_dsn)" node scripts/lib/gateTestDb.mjs sweep ) \
+    || mlog "  (清扫残留的门测试库失败,不影响本次)"
+  url="$(cd "$staging" && OC_V5_GATE_BASE_DSN="$(master_gate_base_dsn)" node scripts/lib/gateTestDb.mjs create "$$")" || return 1
+  [[ "$url" =~ /(ocv5_gate_[0-9]+_[0-9a-f]{12}_test)$ ]] || return 1
+  MASTER_GATE_DB_URL="$url"
+  MASTER_GATE_DB_NAME="${BASH_REMATCH[1]}"
+  MASTER_GATE_DB_STAGING="$staging"
+  tsum_note gateDb "$MASTER_GATE_DB_NAME" 2>/dev/null || :
+  mlog "  本班列车独立测试库 $MASTER_GATE_DB_NAME(Box 门跑完即删;共享测试库不再给 Box 门用)"
+}
+
+# 失败路径也走这里(cleanup_master_staging 在删 staging 之前调用)。删不掉只告警:下一班按登记清扫。
+master_gate_db_drop() {
+  local name="$MASTER_GATE_DB_NAME" staging="$MASTER_GATE_DB_STAGING"
+  MASTER_GATE_DB_URL=""
+  MASTER_GATE_DB_NAME=""
+  MASTER_GATE_DB_STAGING=""
+  [[ -n "$name" ]] || return 0
+  if [[ -d "$staging" ]] && ( cd "$staging" && OC_V5_GATE_BASE_DSN="$(master_gate_base_dsn)" \
+      node scripts/lib/gateTestDb.mjs drop "$name" ); then
+    mlog "  已删除本班列车测试库 $name"
+  else
+    mlog "  ⚠ 删除测试库 $name 失败;下一班列车会按登记清扫"
+  fi
+  return 0
+}
+
+master_gate_attempt_log() { # <gate> <attempt>
+  local gate="$1" n="$2" dir tid=""
+  if declare -F tsum_train_id >/dev/null; then tid="$(tsum_train_id)"; fi
+  if [[ -n "$MASTER_GATE_ATTEMPT_DIR" ]]; then
+    dir="$MASTER_GATE_ATTEMPT_DIR"
+  elif [[ -n "$tid" ]]; then
+    dir="${OC_V5_TRAIN_SUMMARY_DIR:-${OC_V5_LEASE_LOG_DIR:-/opt/openclaude/tmp/lease-trains}}"
+  else
+    dir=/opt/openclaude/tmp/box-gate-attempts
+  fi
+  mkdir -p -- "$dir" || return 1
+  printf '%s/%s.%s.attempt%s.log' "$dir" "${tid:-manual-$$-$(date -u +%Y%m%dT%H%M%SZ)}" "$gate" "$n"
+}
+
+# 已知假失败:门打印了至少一条 [gate-failure],每条都在白名单里(或是 success recovery 包装行),
+# 且至少一条在白名单里。打印第一条白名单签名。别的失败(断言、清理、超总时限、被信号杀)一律不重试。
+master_gate_flaky_signature() { # <attempt-log>
+  local line re sig="" known
+  local -a lines=()
+  mapfile -t lines < <(sed -n 's/^\[gate-failure\] //p' "$1" 2>/dev/null)
+  (( ${#lines[@]} > 0 )) || return 1
+  for line in "${lines[@]}"; do
+    known=0
+    for re in "${MASTER_GATE_FLAKY_SIGNATURES[@]}"; do
+      if [[ "$line" =~ ^(${re})$ ]]; then
+        known=1
+        [[ -n "$sig" ]] || sig="$line"
+        break
+      fi
+    done
+    [[ "$known" == 1 || "$line" == "$MASTER_GATE_FLAKY_WRAPPER" ]] || return 1
+  done
+  [[ -n "$sig" ]] || return 1
+  printf '%s' "$sig"
+}
+
+# 跑一道可重跑的门:最多两次,第二次只在第一次是已知假失败时才跑。rc 0 = 某一次通过。
+master_gate_retryable() { # <gate> <command...>
+  local gate="$1" n log first="" rcf rc sig
+  shift
+  for n in 1 2; do
+    MASTER_GATE_LOAD_SCALE="$(master_gate_load_scale)"
+    if [[ "$n" == 1 ]]; then
+      tsum_note "loadScale.$gate" "$MASTER_GATE_LOAD_SCALE" 2>/dev/null || :
+    else
+      tsum_note "loadScale.$gate.retry" "$MASTER_GATE_LOAD_SCALE" 2>/dev/null || :
+    fi
+    log="$(master_gate_attempt_log "$gate" "$n")" || { mlog "✗ [$gate] 建不了尝试日志目录"; return 1; }
+    [[ "$n" == 2 && -n "$first" ]] && log="${first%.attempt1.log}.attempt2.log"
+    [[ "$n" == 1 ]] && first="$log"
+    rcf="$(mktemp "${MASTER_GATE_TMPDIR:-/tmp}/gate-rc.XXXXXX")" || return 1
+    mlog "  [$gate] 第 $n 次,等待倍数 ×$MASTER_GATE_LOAD_SCALE(load1=$(master_gate_load1)),日志 $log"
+    { rc=0; "$@" 2>&1 || rc=$?; printf '%s\n' "$rc" >"$rcf"; } | tee -- "$log" >&2
+    rc="$(cat -- "$rcf" 2>/dev/null)"
+    rm -f -- "$rcf"
+    [[ "$rc" =~ ^[0-9]+$ ]] || rc=1
+    if [[ "$rc" == 0 ]]; then
+      if [[ "$n" == 2 ]]; then
+        tsum_note "retry.$gate.result" passed 2>/dev/null || :
+        mlog "  [$gate] 重跑通过(第 1 次的已知假失败见 $first)"
+      fi
+      return 0
+    fi
+    if [[ "$n" == 2 ]]; then
+      tsum_note "retry.$gate.result" failed 2>/dev/null || :
+      mlog "✗ [$gate] 重跑仍失败,按硬失败处理"
+      return 1
+    fi
+    if ! sig="$(master_gate_flaky_signature "$log")"; then
+      mlog "  [$gate] 失败原因不在已知假失败白名单里 → 不重跑"
+      return 1
+    fi
+    tsum_note "retry.$gate" "$sig" 2>/dev/null || :
+    tsum_note "retry.$gate.attempt1Log" "$log" 2>/dev/null || :
+    mlog "  ⟳ [$gate] 已知假失败「$sig」→ 等主机空闲后重跑一次(第 1 次日志保留在 $log)"
+    master_gate_wait_host_idle "retry.$gate" || return 1
+  done
+}
+
+# 三道可重跑门的命令。两个 DB 门显式去掉 OC_V5_PROOF_TEST_DATABASE_URL:success recovery 门里它优先于
+# TEST_DATABASE_URL,留着就会连回共享库。
+master_gate_box_success_recovery() { # <staging> <full-sha>
+  local staging="$1" full_sha="$2"
+  ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
+      OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+      npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$full_sha" )
+}
+
+master_gate_box_incident_proofs() { # <staging> <full-sha>
+  local staging="$1" full_sha="$2"
+  ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
+      OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+      npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$full_sha" )
+}
+
+master_gate_ccb_mcp() { # <staging>
+  local staging="$1"
+  ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" \
+      npx --no-install tsx scripts/check-v5-ccb-mcp-availability.ts )
 }
 
 # 商业版 release_artifact_digest 的本地化抄本(无 SSH)。.complete 不计入。
@@ -725,15 +968,27 @@ build_master_release() {
   fi
   mlog "  发布门 TMPDIR=$MASTER_GATE_TMPDIR(tsx 缓存只属于本次构建,门跑完即删)"
   tsum_mark C.box-success-recovery 2>/dev/null || :
+  # OCV5-557:Box 门不与后台 runtime 构建并行,也不在主机繁忙时发车(见上方「Box 门假失败治理」)。
+  if declare -F await_runtime_release_bg >/dev/null; then
+    t0="$(date +%s)"
+    await_runtime_release_bg
+    tsum_note runtimeWaitBeforeBoxSec "$(( $(date +%s) - t0 ))" 2>/dev/null || :
+  fi
+  if ! master_gate_wait_host_idle box-gates; then
+    cleanup_master_staging
+    die "Box 门发车前主机持续繁忙超过 ${MASTER_GATE_IDLE_TIMEOUT_S}s(负载 >= ${MASTER_BOX_GATE_LOAD_MAX} 或别的会话在跑全量测试,原因见上;live 未改)"
+  fi
+  if [[ ! -f "$staging/scripts/lib/gateTestDb.mjs" ]] || ! master_gate_db_create "$staging"; then
+    cleanup_master_staging
+    die "建本班列车独立测试库失败(live 未改)"
+  fi
   mlog "  Box success recovery behavioral gate @ pinned staging(封存前;已封存 rel 的切流/回退不跑这道门)"
   if [[ ! -f "$staging/scripts/check-v5-box-success-recovery.ts" ]]; then
     cleanup_master_staging
     die "新候选缺 scripts/check-v5-box-success-recovery.ts"
   fi
-  # 本机已核 loopback fixture 只由 selfhost wrapper 显式提供。门本身不设默认 DSN。
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH \
-      TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
-      npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$full_sha" ); then
+  # 本机已核 loopback 实例只由 selfhost wrapper 显式提供;门连的是上面新建的本班列车测试库。
+  if ! master_gate_retryable box-success-recovery master_gate_box_success_recovery "$staging" "$full_sha"; then
     cleanup_master_staging
     die "pinned Box success recovery behavioral gate 失败"
   fi
@@ -754,13 +1009,12 @@ build_master_release() {
     cleanup_master_staging
     die "新候选缺 scripts/check-v5-box-incident-proofs.ts"
   fi
-  # 与 success recovery 门同一个显式 loopback *_test DSN;Box 只在 exec 端点模拟。
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH \
-      TEST_DATABASE_URL="${OC_V5_PROOF_TEST_DATABASE_URL:-postgres://test:test@127.0.0.1:55432/openclaude_test}" \
-      npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$full_sha" ); then
+  # 与 success recovery 门同一个本班列车测试库;Box 只在 exec 端点模拟。之后的门不用库,随即删掉。
+  if ! master_gate_retryable box-incident-proofs master_gate_box_incident_proofs "$staging" "$full_sha"; then
     cleanup_master_staging
     die "pinned Box incident proofs gate (OCV5-488) 失败"
   fi
+  master_gate_db_drop
   tsum_mark C.cursor-sand 2>/dev/null || :
   mlog "  Cursor Sand InferenceService contract gate @ pinned staging"
   if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-cursor-sand-inference.ts ); then
@@ -769,7 +1023,7 @@ build_master_release() {
   fi
   tsum_mark C.ccb-mcp 2>/dev/null || :
   mlog "  CCB MCP availability contract gate @ pinned staging"
-  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-v5-ccb-mcp-availability.ts ); then
+  if ! master_gate_retryable ccb-mcp master_gate_ccb_mcp "$staging"; then
     cleanup_master_staging
     die "pinned CCB MCP availability contract gate 失败"
   fi

@@ -49,6 +49,12 @@ describe("selfhost release gates use a per-build tsx cache (OCV5-357)", () => {
     const gates = block.match(/\( cd "\$staging" && [^\n]*/g) ?? [];
     assert.ok(gates.length >= 8, `found ${gates.length} gates`);
     for (const g of gates) assert.match(g, /^\( cd "\$staging" && TMPDIR="\$MASTER_GATE_TMPDIR" /, g);
+    // OCV5-557: the retryable gates run through named functions; their commands follow the same rule.
+    assert.equal((block.match(/^ {2}if ! master_gate_retryable [a-z-]+ (master_gate_[a-z_]+) /gm) ?? []).length, 3);
+    for (const name of ["master_gate_box_success_recovery", "master_gate_box_incident_proofs", "master_gate_ccb_mcp"]) {
+      const body = lib.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, "m"))?.[0] ?? "";
+      assert.match(body, /\n {2}\( cd "\$staging" && TMPDIR="\$MASTER_GATE_TMPDIR" /, name);
+    }
     assert.match(block, /\n {2}cleanup_master_gate_tmpdir\n/);
     const before = lib.slice(0, a);
     assert.ok(before.lastIndexOf("create_master_gate_tmpdir") > before.lastIndexOf("build_master_release() {"));

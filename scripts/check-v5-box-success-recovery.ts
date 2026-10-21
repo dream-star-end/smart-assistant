@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { GATE_LOAD_SCALE_KEY, scaledMs } from "./lib/gateLoadScale.js";
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const ROOT = dirname(dirname(SCRIPT));
@@ -144,9 +145,10 @@ export function parseTestDatabase(raw: string | undefined): { raw: string; confi
       user: decodeURIComponent(url.username),
       password: decodeURIComponent(url.password),
       ssl: false,
-      connectionTimeoutMillis: 3_000,
-      statement_timeout: 8_000,
-      query_timeout: 8_000,
+      // OCV5-557: waits only; the release scales them with host load (at most 3x)
+      connectionTimeoutMillis: scaledMs(3_000),
+      statement_timeout: scaledMs(8_000),
+      query_timeout: scaledMs(8_000),
       max: 1,
     },
   };
@@ -252,6 +254,8 @@ function assertWorkerEnv(home: string): void {
   if (process.env[FAULT_KEY]) allowed.add(FAULT_KEY);
   // The release passes a per-build TMPDIR so tsx's compile cache lives and dies with the build (OCV5-357).
   if (process.env.TMPDIR) allowed.add("TMPDIR");
+  // OCV5-557: the load scale for wait budgets (a number in [1, 3]; anything else reads as 1).
+  if (process.env[GATE_LOAD_SCALE_KEY]) allowed.add(GATE_LOAD_SCALE_KEY);
   const keys = Object.keys(process.env).sort();
   for (const key of keys) {
     if (!allowed.has(key)) throw new Error(`BOX_SUCCESS_GATE_ENV_LEAK ${key}`);
@@ -282,7 +286,7 @@ function holdGrandchild(marker: string): never {
   const child = spawn("/usr/bin/python3", ["-c", HOLD_PY, marker, mode], { stdio: "ignore" });
   const started = Date.now();
   while (!existsSync(marker)) {
-    if (child.exitCode !== null || Date.now() - started > 2_000) {
+    if (child.exitCode !== null || Date.now() - started > scaledMs(2_000)) {
       throw new Error("BOX_SUCCESS_GATE_HOLD_MARKER");
     }
     sleepMs(20);
@@ -342,6 +346,7 @@ export async function supervise(opts: SuperviseOptions): Promise<{ stdout: strin
       OPENCLAUDE_HOME: home,
       TEST_DATABASE_URL: db.raw,
       NODE_ENV: "test",
+      ...(process.env[GATE_LOAD_SCALE_KEY] ? { [GATE_LOAD_SCALE_KEY]: process.env[GATE_LOAD_SCALE_KEY] } : {}),
       ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}),
       ...extra,
     },
@@ -386,7 +391,7 @@ export async function supervise(opts: SuperviseOptions): Promise<{ stdout: strin
     stopReason = "deadline";
     emitErr("box success recovery gate: DEADLINE");
     releaseWait?.();
-  }, deadline);
+  }, scaledMs(deadline));
   const drain = (): Promise<void> => {
     if (!drainTask) {
       drainTask = (async () => {
@@ -523,7 +528,7 @@ async function runBusiness(root: string, ledger: string, db: DbConfig): Promise<
   };
   const spawnBounded = (req: ExecRequest): { stdout: string; stderrBytes: number; exitCode: 0 } => {
     const child = spawnSync(req.command, req.args, {
-      encoding: "utf8", cwd: req.cwd, env: req.environment, timeout: PY_TIMEOUT_MS, killSignal: "SIGKILL",
+      encoding: "utf8", cwd: req.cwd, env: req.environment, timeout: scaledMs(PY_TIMEOUT_MS), killSignal: "SIGKILL",
     });
     if ((child.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT") {
       throw new Error("BOX_SUCCESS_GATE_PYTHON_TIMEOUT");
@@ -798,7 +803,7 @@ async function runWorker(argv: string[]): Promise<void> {
     assert.ok(agy.hostPathDir, "AGY_HOST_DIR_MISSING");
     assert.deepEqual(readdirSync(agy.hostPathDir), ["host"], "AGY_HOST_DIR_EXTRA");
     const shell = spawnSync("/bin/bash", ["-lc", "command -v host; command -v sh"], {
-      encoding: "utf8", env: { HOME: agy.launchHome, PATH: "/usr/local/bin:/usr/bin:/bin" }, timeout: PY_TIMEOUT_MS,
+      encoding: "utf8", env: { HOME: agy.launchHome, PATH: "/usr/local/bin:/usr/bin:/bin" }, timeout: scaledMs(PY_TIMEOUT_MS),
     });
     assert.equal(shell.status, 0, "AGY_LOGIN_SHELL");
     const [hostPath, shPath] = shell.stdout.trim().split("\n");
@@ -890,7 +895,10 @@ async function main(): Promise<void> {
 
 if (isDirect()) {
   main().catch((error: unknown) => {
-    emitErr(error instanceof Error ? error.message : String(error));
+    const message = error instanceof Error ? error.message : String(error);
+    emitErr(message);
+    // OCV5-557: the one line the release reads to decide whether this failure is a known flake
+    emitErr(`[gate-failure] ${message.split("\n")[0]}`);
     process.exit(1);
   });
 }
