@@ -7797,7 +7797,8 @@
       "coverageCommits": [
         "b877c2bc",
         "d4a46dd6",
-        "fe480929"
+        "fe480929",
+        "00b3760a"
       ],
       "regressions": [
         {
@@ -7839,6 +7840,16 @@
           "layer": "unit",
           "path": "packages/commercial/src/__tests__/antigravityRelay.test.ts",
           "assertion": "KV renewal: refreshes the token key, never revives a route the turn end expired"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityAdapter.test.ts",
+          "assertion": "raw CLI output: the turn fails as a recoverable upstream failure"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityAdapter.test.ts",
+          "assertion": "CLI reporting SUCCESS right after its own error step is still a failure"
         },
         {
           "layer": "deploy-gate",
