@@ -20,12 +20,13 @@ import {
   type TicketTimelineNode,
   buildTicketTimeline,
   formatShanghaiAbsolute,
+  formatTimelineTime,
   isTimelineCommentLong,
+  timelineAuthorLabel,
   timelineSourcesFromItems,
 } from '../../lib/ticketTimeline'
 import { Markdown } from '../Markdown'
 import { Badge, Button, ListSkeleton } from '../ui'
-import { formatDate } from '../ui/TimeAgo'
 
 function TicketMarkdown({
   children,
@@ -66,11 +67,6 @@ function useNow(refreshMs = 60_000): number {
     return () => clearInterval(timer)
   }, [refreshMs])
   return now
-}
-
-function authorName(author: string, kind: string, pending: boolean): string {
-  if (pending && kind === 'human') return '我'
-  return assigneeLabel(author) || author || '未知'
 }
 
 function kindLabel(kind: TicketTimelineKind): string {
@@ -137,7 +133,7 @@ function TimelineTime({
       title={title}
       className="shrink-0 cursor-default text-caption text-faint tabular-nums"
     >
-      {formatDate(value, 'relative', { now })}
+      {formatTimelineTime(value, now)}
       <span className="sr-only">（{title}）</span>
     </time>
   )
@@ -159,22 +155,52 @@ function stageText(
   return null
 }
 
-function CollapsibleMarkdown({
-  body,
-  testId,
+/** max-h-40 = 10rem = 160px。超过这个渲染高度才折叠。 */
+const COLLAPSE_MAX_PX = 160
+
+function MeasuredCollapse({
+  signature,
+  fallbackLong,
+  children,
 }: {
-  body: string
-  testId?: string
+  signature: string
+  fallbackLong: boolean
+  children: ReactNode
 }) {
-  const long = isTimelineCommentLong(body)
+  const contentRef = useRef<HTMLDivElement>(null)
+  const [overflows, setOverflows] = useState(fallbackLong)
   const [open, setOpen] = useState(false)
-  const collapsed = long && !open
+
+  useEffect(() => {
+    setOpen(false)
+    const el = contentRef.current
+    if (!el) return
+    const measure = () => {
+      const height = el.scrollHeight
+      // jsdom 没有布局，scrollHeight 为 0，回落到按显示宽度估算。
+      setOverflows(height > 0 ? height > COLLAPSE_MAX_PX : fallbackLong)
+    }
+    measure()
+    if (typeof ResizeObserver !== 'function') return
+    const observer = new ResizeObserver(measure)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [signature, fallbackLong])
+
+  const collapsed = overflows && !open
   return (
     <div className="min-w-0">
-      <div className={collapsed ? 'max-h-40 overflow-hidden' : 'min-w-0'}>
-        <TicketMarkdown testId={testId}>{body}</TicketMarkdown>
+      <div className={collapsed ? 'relative max-h-40 overflow-hidden' : 'relative min-w-0'}>
+        <div ref={contentRef}>{children}</div>
+        {collapsed && (
+          <div
+            aria-hidden
+            data-testid="ticket-comment-fade"
+            className="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-elevated to-transparent md:from-sidebar"
+          />
+        )}
       </div>
-      {long && (
+      {overflows && (
         <Button
           type="button"
           variant="ghost"
@@ -186,6 +212,20 @@ function CollapsibleMarkdown({
         </Button>
       )}
     </div>
+  )
+}
+
+function CollapsibleMarkdown({
+  body,
+  testId,
+}: {
+  body: string
+  testId?: string
+}) {
+  return (
+    <MeasuredCollapse signature={body} fallbackLong={isTimelineCommentLong(body)}>
+      <TicketMarkdown testId={testId}>{body}</TicketMarkdown>
+    </MeasuredCollapse>
   )
 }
 
@@ -262,7 +302,14 @@ function SystemRun({
   )
 }
 
-function CommentBody({ comment }: { comment: TicketComment }) {
+function CommentBody({
+  comment,
+  measured = true,
+}: {
+  comment: TicketComment
+  /** 同组多条评论由外层一起量高度，这里不再各折一次。 */
+  measured?: boolean
+}) {
   const pending = isLocalComment(comment)
   return (
     <div
@@ -271,9 +318,22 @@ function CommentBody({ comment }: { comment: TicketComment }) {
       data-pending={pending ? 'true' : undefined}
       className={`min-w-0 ${pending ? 'opacity-70' : ''}`}
     >
-      <CollapsibleMarkdown testId="ticket-comment-md" body={comment.body} />
+      {measured ? (
+        <CollapsibleMarkdown testId="ticket-comment-md" body={comment.body} />
+      ) : (
+        <TicketMarkdown testId="ticket-comment-md">{comment.body}</TicketMarkdown>
+      )}
     </div>
   )
+}
+
+function activityText(node: TicketTimelineNode): string {
+  if (!node.activity) return kindLabel(node.kind)
+  const line = formatActivityLine(node.activity)
+  const who = assigneeLabel(node.activity.actorId) ?? node.activity.actor
+  if (who !== 'unidentified' || !line.startsWith('unidentified')) return line
+  const label = timelineAuthorLabel(node.author, node.authorKind)
+  return `${label}${line.slice('unidentified'.length)}`
 }
 
 function NodeBody({
@@ -300,7 +360,7 @@ function NodeBody({
   return (
     <div data-testid="ticket-timeline-item" data-kind={node.kind} className="min-w-0">
       <p className="text-body text-fg break-words">
-        {node.activity ? formatActivityLine(node.activity) : kindLabel(node.kind)}
+        {activityText(node)}
       </p>
     </div>
   )
@@ -331,7 +391,7 @@ function GroupHeader({
         <span className="text-caption font-medium text-fg">{kindLabel(first.kind)}</span>
         <span className="inline-flex min-w-0 items-center gap-1">
           <span className="max-w-40 truncate text-caption text-muted">
-            {authorName(first.author, first.authorKind, pending)}
+            {timelineAuthorLabel(first.author, first.authorKind, pending)}
           </span>
           <span
             className={`shrink-0 rounded px-1 text-caption ${authorChipClass(first.authorKind)}`}
@@ -346,6 +406,46 @@ function GroupHeader({
         )}
       </div>
       <TimelineTime value={last.createdAt} title={title} pending={pending} now={now} />
+    </div>
+  )
+}
+
+function stackedCommentSignature(group: TicketTimelineGroup): string | null {
+  if (group.nodes.length < 2) return null
+  if (!group.nodes.every((node) => node.kind === 'comment' && node.comment)) return null
+  return group.nodes.map((node) => node.comment?.body ?? '').join('\n')
+}
+
+function GroupBodies({
+  group,
+  stageById,
+  stageName,
+}: {
+  group: TicketTimelineGroup
+  stageById: Map<string, string>
+  stageName: string | null
+}) {
+  const stacked = stackedCommentSignature(group)
+  if (stacked) {
+    return (
+      <div className="mt-1 min-w-0">
+        <MeasuredCollapse signature={stacked} fallbackLong={isTimelineCommentLong(stacked)}>
+          <div className="flex min-w-0 flex-col gap-2">
+            {group.nodes.map((node) =>
+              node.comment ? (
+                <CommentBody key={node.id} comment={node.comment} measured={false} />
+              ) : null,
+            )}
+          </div>
+        </MeasuredCollapse>
+      </div>
+    )
+  }
+  return (
+    <div className="mt-1 flex min-w-0 flex-col gap-2">
+      {group.nodes.map((node) => (
+        <NodeBody key={node.id} node={node} stageById={stageById} stageName={stageName} />
+      ))}
     </div>
   )
 }
@@ -381,11 +481,7 @@ function TimelineGroupView({
       </div>
       <div className="min-w-0 flex-1 pb-4">
         <GroupHeader group={group} stageById={stageById} stageName={stageName} now={now} />
-        <div className="mt-1 flex min-w-0 flex-col gap-2">
-          {group.nodes.map((node) => (
-            <NodeBody key={node.id} node={node} stageById={stageById} stageName={stageName} />
-          ))}
-        </div>
+        <GroupBodies group={group} stageById={stageById} stageName={stageName} />
       </div>
     </li>
   )

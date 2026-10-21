@@ -4,7 +4,9 @@ import {
   COMMENT_GROUP_WINDOW_MS,
   buildTicketTimeline,
   formatShanghaiAbsolute,
+  formatTimelineTime,
   isTimelineCommentLong,
+  timelineAuthorLabel,
 } from './ticketTimeline'
 
 const T0 = 1_700_000_000_000
@@ -306,10 +308,42 @@ describe('buildTicketTimeline', () => {
     expect(isTimelineCommentLong('短评')).toBe(false)
     expect(isTimelineCommentLong(Array.from({ length: 8 }, () => '行').join('\n'))).toBe(false)
     expect(isTimelineCommentLong(Array.from({ length: 9 }, () => '行').join('\n'))).toBe(true)
+    // 400 个中文、两段：全角按 2 单位、每行 80，两段各 5 行，超过 8 行。
+    expect(isTimelineCommentLong(`${'中'.repeat(200)}\n${'中'.repeat(200)}`)).toBe(true)
+    // 160 个英文只折成 2 行，不算长。
+    expect(isTimelineCommentLong('a'.repeat(160))).toBe(false)
   })
 
   test('绝对时间用 Asia/Shanghai，而不是 UTC', () => {
     expect(formatShanghaiAbsolute(Date.UTC(2026, 0, 1, 0, 0, 0))).toBe('2026-01-01 08:00:00')
     expect(formatShanghaiAbsolute(Number.NaN)).toBe('—')
+  })
+
+  test('时间线时间：近 24 小时相对，同年写出时刻，跨年带年份', () => {
+    const at = Date.UTC(2026, 8, 8, 0, 43, 17)
+    expect(formatTimelineTime(at, at + 30_000)).toBe('刚刚')
+    expect(formatTimelineTime(at, at + 59_999)).toBe('刚刚')
+    expect(formatTimelineTime(at, at + 60_000)).toBe('1 分钟前')
+    expect(formatTimelineTime(at, at + 59 * 60_000)).toBe('59 分钟前')
+    expect(formatTimelineTime(at, at + 60 * 60_000)).toBe('1 小时前')
+    expect(formatTimelineTime(at, at + 23 * 60 * 60_000)).toBe('23 小时前')
+    expect(formatTimelineTime(at, at + 24 * 60 * 60_000)).toBe('09-08 08:43')
+    expect(formatTimelineTime(at, Date.UTC(2027, 0, 1))).toBe('2026-09-08 08:43')
+    expect(formatTimelineTime(Number.NaN, at)).toBe('—')
+  })
+
+  test('UTC 16:30 在上海是次日 00:30', () => {
+    const utc1630 = Date.UTC(2026, 0, 1, 16, 30, 0)
+    expect(formatShanghaiAbsolute(utc1630)).toBe('2026-01-02 00:30:00')
+    expect(formatTimelineTime(utc1630, Date.UTC(2026, 6, 1))).toBe('01-02 00:30')
+    expect(formatTimelineTime(utc1630, Date.UTC(2027, 0, 3))).toBe('2026-01-02 00:30')
+  })
+
+  test('unidentified 作者显示为未识别来源', () => {
+    expect(timelineAuthorLabel('unidentified', 'system')).toBe('未识别来源')
+    expect(timelineAuthorLabel('agent:unidentified', 'agent')).toBe('未识别来源')
+    expect(timelineAuthorLabel('user:alice', 'human')).toBe('alice')
+    expect(timelineAuthorLabel('user:alice', 'human', true)).toBe('我')
+    expect(timelineAuthorLabel('', 'system')).toBe('未识别来源')
   })
 })

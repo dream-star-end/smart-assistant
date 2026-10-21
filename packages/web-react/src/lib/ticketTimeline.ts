@@ -4,19 +4,20 @@
  *
  * 缺字段、null、非数组一律跳过，不抛错。时间戳必须是有限 number（含 0）。
  */
-import type {
-  AuthorKind,
-  RunStatus,
-  TicketActivity,
-  TicketComment,
-  TicketRun,
-  TimelineItem,
+import {
+  assigneeLabel,
+  type AuthorKind,
+  type RunStatus,
+  type TicketActivity,
+  type TicketComment,
+  type TicketRun,
+  type TimelineItem,
 } from './taskboard'
 
 export const COMMENT_GROUP_WINDOW_MS = 5 * 60 * 1000
 export const TIMELINE_COMMENT_MAX_LINES = 8
-/** 没有换行的长文也按大约一行 60 字折成 8 行。 */
-export const TIMELINE_COMMENT_MAX_CHARS = TIMELINE_COMMENT_MAX_LINES * 60
+/** 按抽屉里评论的大致显示宽度估算：一行约 80 个单位。 */
+export const TIMELINE_LINE_UNITS = 80
 
 export const TIMELINE_FILTERS = ['all', 'comment', 'status', 'run'] as const
 export type TicketTimelineFilter = (typeof TIMELINE_FILTERS)[number]
@@ -75,15 +76,55 @@ export interface TicketTimelineModel {
   counts: TicketTimelineCounts
 }
 
-export function isTimelineCommentLong(body: unknown): boolean {
-  if (typeof body !== 'string' || body.length === 0) return false
-  if (body.split(/\r?\n/).length > TIMELINE_COMMENT_MAX_LINES) return true
-  return body.length > TIMELINE_COMMENT_MAX_CHARS
+/** 中日韩全角（含全角标点）算 2 个显示单位，其余算 1。 */
+function charUnits(char: string): number {
+  const code = char.codePointAt(0) ?? 0
+  if (
+    (code >= 0x1100 && code <= 0x115f) ||
+    (code >= 0x2e80 && code <= 0xa4cf) ||
+    (code >= 0xac00 && code <= 0xd7a3) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xfe10 && code <= 0xfe19) ||
+    (code >= 0xfe30 && code <= 0xfe6f) ||
+    (code >= 0xff00 && code <= 0xff60) ||
+    (code >= 0xffe0 && code <= 0xffe6) ||
+    (code >= 0x20000 && code <= 0x3fffd)
+  ) {
+    return 2
+  }
+  return 1
 }
 
-/** 绝对时间固定 Asia/Shanghai，不跟容器本地时区走。 */
-export function formatShanghaiAbsolute(ms: number): string {
-  if (typeof ms !== 'number' || !Number.isFinite(ms)) return '—'
+/**
+ * 没有布局时的长评论判定。每段至少 1 行，按每行约 80 个显示单位折行，
+ * 估算行数超过 8 才算长。有布局时以渲染高度为准，这里只做回落。
+ */
+export function isTimelineCommentLong(body: unknown): boolean {
+  if (typeof body !== 'string' || body.length === 0) return false
+  let lines = 0
+  for (const paragraph of body.split(/\r?\n/)) {
+    if (paragraph.length === 0) {
+      lines += 1
+      continue
+    }
+    let units = 0
+    for (const char of paragraph) units += charUnits(char)
+    lines += Math.max(1, Math.ceil(units / TIMELINE_LINE_UNITS))
+  }
+  return lines > TIMELINE_COMMENT_MAX_LINES
+}
+
+interface ShanghaiParts {
+  year: string
+  month: string
+  day: string
+  hour: string
+  minute: string
+  second: string
+}
+
+function shanghaiParts(ms: number): ShanghaiParts | null {
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) return null
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: 'Asia/Shanghai',
     year: 'numeric',
@@ -96,8 +137,54 @@ export function formatShanghaiAbsolute(ms: number): string {
   }).formatToParts(new Date(ms))
   const pick = (type: Intl.DateTimeFormatPartTypes) =>
     parts.find((part) => part.type === type)?.value ?? ''
-  const hour = pick('hour') === '24' ? '00' : pick('hour')
-  return `${pick('year')}-${pick('month')}-${pick('day')} ${hour}:${pick('minute')}:${pick('second')}`
+  return {
+    year: pick('year'),
+    month: pick('month'),
+    day: pick('day'),
+    hour: pick('hour') === '24' ? '00' : pick('hour'),
+    minute: pick('minute'),
+    second: pick('second'),
+  }
+}
+
+/** 绝对时间固定 Asia/Shanghai，不跟容器本地时区走。悬停 title 用到秒。 */
+export function formatShanghaiAbsolute(ms: number): string {
+  const parts = shanghaiParts(ms)
+  if (!parts) return '—'
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`
+}
+
+const MINUTE_MS = 60_000
+const HOUR_MS = 60 * MINUTE_MS
+const DAY_MS = 24 * HOUR_MS
+
+/**
+ * 时间线节点上的时间。近 24 小时用相对说法，更早的写出上海时间的月日和时刻，
+ * 避免同一天的节点都挤成一个日期。
+ */
+export function formatTimelineTime(ms: number, now: number): string {
+  const when = shanghaiParts(ms)
+  if (!when) return '—'
+  const safeNow = typeof now === 'number' && Number.isFinite(now) ? now : ms
+  const delta = safeNow - ms
+  if (delta >= 0 && delta < MINUTE_MS) return '刚刚'
+  if (delta >= 0 && delta < HOUR_MS) return `${Math.floor(delta / MINUTE_MS)} 分钟前`
+  if (delta >= 0 && delta < DAY_MS) return `${Math.floor(delta / HOUR_MS)} 小时前`
+  const today = shanghaiParts(safeNow)
+  if (today && today.year === when.year) {
+    return `${when.month}-${when.day} ${when.hour}:${when.minute}`
+  }
+  return `${when.year}-${when.month}-${when.day} ${when.hour}:${when.minute}`
+}
+
+/** 时间线上的作者名。unidentified 是上游占位，不直接露给界面。 */
+export function timelineAuthorLabel(author: unknown, authorKind?: unknown, pending?: boolean): string {
+  if (pending && authorKind === 'human') return '我'
+  const raw = typeof author === 'string' ? author.trim() : ''
+  if (raw === '' || raw === 'unidentified' || raw.endsWith(':unidentified')) return '未识别来源'
+  const label = assigneeLabel(raw)
+  if (!label || label === 'unidentified') return '未识别来源'
+  return label
 }
 
 export function timelineSourcesFromItems(items: readonly TimelineItem[] | null | undefined): {
