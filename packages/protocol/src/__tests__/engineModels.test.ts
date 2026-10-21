@@ -158,8 +158,8 @@ describe('Grok Build engine model authority', () => {
 
 describe('Cursor engine model authority', () => {
   test('pins CLI families with effort/fast metadata and excludes GPT/Codex entries', () => {
-    // 72 + 8 grok-4.7 (2026-09-22) + 3 box Claude (2026-09-23) + box Claude Haiku 5.5 (2026-10-08)
-    assert.equal(CURSOR_ENGINE_MODELS.length, 84)
+    // 72 + 8 grok-4.7 (2026-09-22) + 3 box Claude (2026-09-23) + box Claude Haiku 5.5 (2026-10-08) + box GPT-6 Astra Pro (2026-10-21)
+    assert.equal(CURSOR_ENGINE_MODELS.length, 85)
     assert.equal(CURSOR_ENGINE_MODELS[0].id, 'cursor-auto')
     assert.deepEqual(
       CURSOR_ENGINE_MODELS.find((m) => m.id === 'cursor-grok-4.6-high'),

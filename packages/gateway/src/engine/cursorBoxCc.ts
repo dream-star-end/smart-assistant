@@ -18,6 +18,8 @@ import {
   BOX_CC_CWD,
   BOX_CC_REMOTE_CLAUDE,
   isBoxClaudeCatalogModel,
+  isBoxGptWebCatalogModel,
+  isBoxInteractiveCatalogModel,
   type BoxCcControl,
 } from './cursorBoxCcExec.js'
 
@@ -33,9 +35,12 @@ export {
   boxCcSpawnFifo,
   boxCcStopExec,
   boxCcWriteExecs,
+  boxGptWebModel,
   boxOfficialClaudeModel,
   encodeExecRequest,
   isBoxClaudeCatalogModel,
+  isBoxGptWebCatalogModel,
+  isBoxInteractiveCatalogModel,
   parseExecFrames,
   remoteClaudeArgs,
   type BoxCcControl,
@@ -66,7 +71,7 @@ export function cursorBoxCcSelectionEligible(selection: CursorCredentialSelectio
  * relay to be installed. Needs the container's master route; otherwise the pool path stays. */
 export function cursorBoxCcFromMaster(model: string | undefined, remote: boolean,
   env: NodeJS.ProcessEnv = process.env): boolean {
-  return !remote && cursorBoxCcEnabled(env) && isBoxClaudeCatalogModel(model) && boxLoginUrlFromEnv(env) !== null
+  return !remote && cursorBoxCcEnabled(env) && isBoxInteractiveCatalogModel(model) && boxLoginUrlFromEnv(env) !== null
 }
 
 export function boxCcFifoPath(sessionKey: string): string {

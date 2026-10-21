@@ -37,6 +37,13 @@ import {
   type BoxBridgeMod,
   type BoxCcRunner,
 } from './cursorBoxCcInteractive.js'
+import {
+  boxGptWebInteractiveLaunchExec,
+  isBoxGptWebModelArgv,
+  loadBoxGptWebMod,
+  remoteInteractiveGptWebArgs,
+  type BoxGptWebMod,
+} from './cursorBoxGptWeb.js'
 
 type FetchFn = (url: string, init: RequestInit) => Promise<Response>
 
@@ -110,6 +117,7 @@ export async function runBoxCcBridge(opts: {
   /** Must be `interactive` (the default); anything else is refused. */
   runner?: BoxCcRunner
   bridgeMod?: BoxBridgeMod
+  gptWebMod?: BoxGptWebMod
   env?: NodeJS.ProcessEnv
   /** Box login choice and reports (tests); default: the master's egress. */
   login?: BoxLoginPort
@@ -118,10 +126,16 @@ export async function runBoxCcBridge(opts: {
 }): Promise<number> {
   const fetchImpl = opts.fetchImpl ?? fetch
   const env = opts.env ?? process.env
-  const login: BoxLoginPort = opts.login ?? {
-    choose: (accountId, sticky) => requestBoxLogin({ accountId, ...sticky }, { env }),
-    report: (input) => reportBoxLoginSignals(input, { env }),
-  }
+  const isGptWeb = isBoxGptWebModelArgv(opts.args)
+  const login: BoxLoginPort = opts.login ?? (isGptWeb && !env.OC_BOX_LOGIN_URL
+    ? {
+        choose: async () => ({ profile: env.OC_BOX_GPT_WEB_PROFILE || 'default', source: 'default', alternatives: 0 }),
+        report: async () => true,
+      }
+    : {
+        choose: (accountId, sticky) => requestBoxLogin({ accountId, ...sticky }, { env }),
+        report: (input) => reportBoxLoginSignals(input, { env }),
+      })
   if ((opts.runner ?? 'interactive') !== 'interactive') {
     opts.stderr.write(`BOX_CC_RUNNER_REFUSED ${String(opts.runner)}\n`)
     return 1
@@ -171,7 +185,7 @@ export async function runBoxCcBridge(opts: {
       }
       const session = new BoxSession({
         control: { ...opts.control, fifo: boxCcSpawnFifo(opts.control.fifo, randomBytes(8).toString('hex')) },
-        args: opts.args, profile, alternatives, accountId, bridgeMod: opts.bridgeMod, held: carry, holdMax,
+        args: opts.args, profile, alternatives, accountId, bridgeMod: opts.bridgeMod, gptWebMod: opts.gptWebMod, env, held: carry, holdMax,
         fetchImpl, abort, stderr: opts.stderr, out, login, memory,
         // A line that reaches a session after it gave up (nothing ran) belongs to the next attempt.
         late: (line) => { carry.push(line) },
@@ -255,6 +269,7 @@ class StdoutLines {
 const QUOTA_OR_LOGIN = /hit your .*limit|usage limit|rate limit|limit reached|Not logged in|Please run \/login|resets? (at )?\d/i
 
 function neutralLine(line: string): string {
+  if (line.includes('[box-gpt-6-astra-pro]')) return line
   const type = TOP_TYPE.exec(line)?.[1]
   if (type !== 'assistant' && type !== 'result') return line
   if (!QUOTA_OR_LOGIN.test(line)) return line
@@ -296,7 +311,7 @@ class BoxSession {
 
   constructor(private readonly o: {
     control: BoxCcControl; args: readonly string[]; profile: string; alternatives: number
-    accountId: string | undefined; bridgeMod?: BoxBridgeMod; held: string[]; holdMax: number
+    accountId: string | undefined; bridgeMod?: BoxBridgeMod; gptWebMod?: BoxGptWebMod; env?: NodeJS.ProcessEnv; held: string[]; holdMax: number
     fetchImpl: FetchFn; abort: AbortController; stderr: NodeJS.WritableStream; out: StdoutLines
     login: BoxLoginPort; memory: BoxLoginMemory; late: (line: string) => void
   }) {
@@ -456,8 +471,11 @@ class BoxSession {
   async run(): Promise<SessionOutcome> {
     let launch: BoxCcExecRequest
     try {
-      launch = boxCcInteractiveLaunchExec(this.control, remoteInteractiveClaudeArgs(this.o.args),
-        this.o.bridgeMod ?? loadBoxBridgeMod(), this.o.profile)
+      launch = isBoxGptWebModelArgv(this.o.args)
+        ? boxGptWebInteractiveLaunchExec(this.control, remoteInteractiveGptWebArgs(this.o.args),
+            this.o.gptWebMod ?? loadBoxGptWebMod(), this.o.profile, this.o.env)
+        : boxCcInteractiveLaunchExec(this.control, remoteInteractiveClaudeArgs(this.o.args),
+            this.o.bridgeMod ?? loadBoxBridgeMod(), this.o.profile)
     } catch (err) {
       const why = err instanceof Error ? err.message : 'BOX_INTERACTIVE_LAUNCH_FAILED'
       this.o.stderr.write(`BOX_INTERACTIVE_NOT_READY ${why}\n`)
