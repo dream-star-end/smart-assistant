@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 
 import {
   BOX_ACTIVE_TURN_IDLE_MS,
+  BOX_GPT_WEB_ACTIVE_TURN_IDLE_MS,
   IDLE_TIMEOUT_DEFAULT_MS,
   IDLE_TIMEOUT_TOOL_MS,
   applyTurnIdleTimeoutTick,
@@ -27,6 +28,32 @@ import {
 } from "../sessionManager.js";
 
 describe("pickIdleTimeoutMs", () => {
+  test("box-gpt-6-astra-pro keeps both silence clocks past 6h (6h 15m)", () => {
+    const pro = "box-gpt-6-astra-pro";
+    assert.equal(BOX_GPT_WEB_ACTIVE_TURN_IDLE_MS, 6 * 60 * 60_000 + 15 * 60_000);
+    assert.equal(pickIdleTimeoutMs(null, 0, "cursor", pro), BOX_GPT_WEB_ACTIVE_TURN_IDLE_MS);
+    assert.equal(pickIdleTimeoutMs(null, 0, "ccb", pro), BOX_GPT_WEB_ACTIVE_TURN_IDLE_MS);
+    assert.equal(pickTurnSilentBackstopMs("cursor", pro), BOX_GPT_WEB_ACTIVE_TURN_IDLE_MS);
+    assert.equal(pickTurnSilentBackstopMs("ccb", pro), BOX_GPT_WEB_ACTIVE_TURN_IDLE_MS);
+    for (const elapsed of [30 * 60_000 + 1, 2 * 60 * 60_000, 6 * 60 * 60_000]) {
+      assert.equal(
+        shouldTripIdleWatchdog({
+          waitingForUserInput: false,
+          idleMs: elapsed,
+          thresholdMs: pickIdleTimeoutMs(null, 0, "cursor", pro),
+        }),
+        false,
+      );
+    }
+    assert.equal(
+      shouldTripIdleWatchdog({
+        waitingForUserInput: false,
+        idleMs: BOX_GPT_WEB_ACTIVE_TURN_IDLE_MS + 1,
+        thresholdMs: pickIdleTimeoutMs(null, 0, "cursor", pro),
+      }),
+      true,
+    );
+  });
   test("only authenticated Box CCB turn keeps both silence clocks past 4h", () => {
     const box = "box-api-claude-opus-5-5";
     assert.equal(BOX_ACTIVE_TURN_IDLE_MS, 4 * 60 * 60_000 + 5 * 60_000);

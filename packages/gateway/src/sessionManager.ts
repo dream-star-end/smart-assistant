@@ -70,6 +70,7 @@ import { notifyBoxUserStop } from './engine/boxUserStopClient.js'
 import { IdleTurnTimeoutError, runBoxIdleTurn } from './boxIdleTurn.js'
 
 import { isCcbUserCancellationDiagnostic } from './engine/ccbAdapter.js'
+import { isBoxGptWebCatalogModel } from './engine/cursorBoxCc.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
 import { decideEngineCwd } from './engineCwd.js'
@@ -634,6 +635,9 @@ export const IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
 /** One admitted Box detached tool chain may live four hours. Give its owner
  * turn five minutes to observe the keeper's terminal proof before interrupt. */
 export const BOX_ACTIVE_TURN_IDLE_MS = 4 * 60 * 60_000 + 5 * 60_000
+/** Box ChatGPT Web Pro (box-gpt-6-astra-pro) tasks can run up to 6 hours.
+ * Give the owner turn a 6h 15m silent backstop and idle watchdog threshold. */
+export const BOX_GPT_WEB_ACTIVE_TURN_IDLE_MS = 6 * 60 * 60_000 + 15 * 60_000
 
 /**
  * Idle TTL of resume-map entries whose in-memory AgentSession was evicted.
@@ -647,8 +651,15 @@ export const RESUME_MAP_INACTIVE_TTL_MS = 90 * 24 * 60 * 60 * 1000
 function isBoxActiveTurn(engineId?: string, modelId?: string): boolean {
   return engineId === 'ccb' && isBoxApiModel(modelId)
 }
+function isBoxGptWebActiveTurn(engineId?: string, modelId?: string): boolean {
+  return (
+    (engineId === 'cursor' || engineId === 'ccb' || engineId === undefined) &&
+    isBoxGptWebCatalogModel(modelId)
+  )
+}
 
 export function pickTurnSilentBackstopMs(engineId?: string, modelId?: string): number {
+  if (isBoxGptWebActiveTurn(engineId, modelId)) return BOX_GPT_WEB_ACTIVE_TURN_IDLE_MS
   return isBoxActiveTurn(engineId, modelId)
     ? BOX_ACTIVE_TURN_IDLE_MS : 30 * 60_000
 }
@@ -673,6 +684,7 @@ export function pickIdleTimeoutMs(
   engineId?: string,
   modelId?: string,
 ): number {
+  if (isBoxGptWebActiveTurn(engineId, modelId)) return BOX_GPT_WEB_ACTIVE_TURN_IDLE_MS
   if (isBoxActiveTurn(engineId, modelId)) return BOX_ACTIVE_TURN_IDLE_MS
   const inNonStreamingPhase =
     currentTurnStatus === 'compacting' ||

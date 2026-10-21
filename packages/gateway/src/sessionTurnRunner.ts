@@ -79,6 +79,7 @@ import {
   _wireTerminalCodeForTape,
   SESSION_PERSIST_QUEUED_NOTICE,
   BOX_ACTIVE_TURN_IDLE_MS,
+  BOX_GPT_WEB_ACTIVE_TURN_IDLE_MS,
   pickTurnSilentBackstopMs,
   applyTurnIdleTimeoutTick,
   scheduleSessionOutputAssetCollection,
@@ -460,7 +461,12 @@ export async function _runOneTurn(
         refresh: () => timer.refresh(),
       })
       if (!fire) return
-      const duration = IDLE_TIMEOUT_MS === BOX_ACTIVE_TURN_IDLE_MS ? '4 小时 5 分钟' : '30 分钟'
+      const duration =
+        IDLE_TIMEOUT_MS === BOX_GPT_WEB_ACTIVE_TURN_IDLE_MS
+          ? '6 小时 15 分钟'
+          : IDLE_TIMEOUT_MS === BOX_ACTIVE_TURN_IDLE_MS
+            ? '4 小时 5 分钟'
+            : '30 分钟'
       const reason = `任务 ${duration}没有新输出，已中断。本轮已自动免单，积分将原路退回；请重试。`
       const persistence =
         requestTerminalPersistence?.('interrupted', reason, 'IDLE_TIMEOUT', 'idle_timeout') ??

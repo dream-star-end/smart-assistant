@@ -7,24 +7,35 @@ import { PassThrough } from 'node:stream'
 import { describe, it } from 'node:test'
 
 import {
+  DEFAULT_MAX_TIMEOUT_MS,
   SerialJobQueue,
   SseAccumulator,
   TierLimitError,
+  TurnProgressStreamer,
   buildChromeLaunchArgs,
   cdpPortForProfile,
+  classifyApprovalCard,
+  clearActiveTurnState,
   computeAdaptiveDeadline,
   detectTierLimit,
+  downloadTurnOutputArtifactsInPage,
   extractAssistantFromMapping,
   extractInboundDispatchAttachments,
+  extractTurnOutputArtifactRefs,
+  extractTurnProgressFromMapping,
   extractUserTurnFromStdinFrame,
   formatStreamJsonKeepalive,
+  inspectAndHandleApprovalCardInPage,
+  inspectExistingTurnInConversation,
   isChatGptOriginUrl,
   levelIndex,
+  loadActiveTurnState,
   loadSessionConversationMap,
   parseStdinFrame,
   probeSessionState,
   profileDirFor,
   readProfileSingletonOwner,
+  saveActiveTurnState,
   saveSessionConversationId,
   selectProTierInPage,
   stripTierCaption,
@@ -44,7 +55,7 @@ import {
   isBoxGptWebCatalogModel,
   isBoxInteractiveCatalogModel,
 } from '../engine/cursorBoxCc.js'
-import { runBoxCcBridge } from '../engine/cursorBoxCcBridge.js'
+import { BoxLoginSignalTap, runBoxCcBridge } from '../engine/cursorBoxCcBridge.js'
 import {
   BOX_GPT_WEB_BUSY_MESSAGE,
   boxGptWebInteractiveLaunchExec,
@@ -53,8 +64,10 @@ import {
   isBoxGptWebAllowedContainerUser,
   isBoxGptWebModelArgv,
   loadBoxGptWebMod,
+  materializeGptWebOutputAttachmentsInStdoutLine,
   releaseBoxGptWebTurnSlot,
   remoteInteractiveGptWebArgs,
+  stampGptWebTurnIdInUserLine,
   tryAcquireBoxGptWebTurnSlot,
   validateBoxGptWebLoopbackProxy,
 } from '../engine/cursorBoxGptWeb.js'
@@ -787,12 +800,13 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
     assert.equal(unanswered, null)
   })
 
-  it('extends adaptive deadline up to 20m while Pro is actively thinking and triggers Stream-Rescue when stop-button disappears without final text', () => {
+  it('extends adaptive deadline up to 6 hours while Pro is actively thinking and triggers Stream-Rescue when stop-button disappears without final text', () => {
+    assert.equal(DEFAULT_MAX_TIMEOUT_MS, 21_600_000)
     const t0 = 1_000_000
     const step1 = computeAdaptiveDeadline({
       startedAt: t0,
       now: t0 + 600_000,
-      lastActivityAt: t0 + 570_000,
+      lastActivityAt: t0 + 100_000,
       stopVisible: true,
       currentDeadline: t0 + 600_000,
     })
@@ -800,12 +814,25 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
     assert.equal(step1.expired, false)
     assert.equal(step1.deadline, t0 + 720_000)
 
+    // Even when stop-button is temporarily hidden during a subagent/tool step, activeThinkingVisible keeps extending up to 6h
+    const stepSubagent = computeAdaptiveDeadline({
+      startedAt: t0,
+      now: t0 + 3_600_000,
+      lastActivityAt: t0 + 2_000_000,
+      stopVisible: false,
+      activeThinkingVisible: true,
+      currentDeadline: t0 + 3_600_000,
+    })
+    assert.equal(stepSubagent.extended, true)
+    assert.equal(stepSubagent.expired, false)
+    assert.equal(stepSubagent.deadline, t0 + 3_720_000)
+
     const stepCeiling = computeAdaptiveDeadline({
       startedAt: t0,
-      now: t0 + 1_200_000,
-      lastActivityAt: t0 + 1_190_000,
+      now: t0 + DEFAULT_MAX_TIMEOUT_MS,
+      lastActivityAt: t0 + DEFAULT_MAX_TIMEOUT_MS - 10_000,
       stopVisible: true,
-      currentDeadline: t0 + 1_200_000,
+      currentDeadline: t0 + DEFAULT_MAX_TIMEOUT_MS,
     })
     assert.equal(stepCeiling.extended, false)
     assert.equal(stepCeiling.expired, true)
@@ -1108,5 +1135,493 @@ rl.on('line', (line) => {
     assert.equal(keepaliveObj.subtype, 'keepalive')
     assert.equal(keepaliveObj.session_id, 'sess-ka')
     assert.equal(keepaliveObj.elapsed_ms, 32_000)
+  })
+
+  it('auto-handles Codex approval cards under Scheme A (loopback preview -> Allow for this chat, all others -> Deny)', async () => {
+    const loopbackPreview = classifyApprovalCard({
+      text: 'Sites\nAllow ChatGPT to preview your site?\nAllow ChatGPT to access 127.0.0.1:8765 using the cloud browser?',
+      buttons: ['Deny', 'Allow all relevant sites', 'Allow for this chat'],
+    })
+    assert.equal(loopbackPreview.decision, 'allow_this_chat')
+    assert.equal(loopbackPreview.buttonLabel, 'Allow for this chat')
+    assert.equal(loopbackPreview.buttonIndex, 2)
+    assert.match(loopbackPreview.announcement, /Allow for this chat/)
+
+    const zhLoopbackPreview = classifyApprovalCard({
+      text: '网站\n是否允许 ChatGPT 预览您的网站？\n是否允许 ChatGPT 使用云浏览器访问 localhost:3000？',
+      buttons: ['拒绝', '允许所有相关网站', '允许此聊天'],
+    })
+    assert.equal(zhLoopbackPreview.decision, 'allow_this_chat')
+    assert.equal(zhLoopbackPreview.buttonLabel, '允许此聊天')
+    assert.equal(zhLoopbackPreview.buttonIndex, 2)
+
+    // Public exposure / Auto-review card must ALWAYS be denied even if it mentions 127.0.0.1
+    const autoReviewCard = classifyApprovalCard({
+      text: 'Auto-review 阻止公开暴露工作区文件\n127.0.0.1:8765',
+      buttons: ['拒绝', '允许此聊天'],
+    })
+    assert.equal(autoReviewCard.decision, 'deny')
+    assert.equal(autoReviewCard.buttonLabel, '拒绝')
+    assert.equal(autoReviewCard.buttonIndex, 0)
+    assert.match(autoReviewCard.announcement, /自动点击「拒绝」/)
+
+    // External domain preview must ALWAYS be denied
+    const externalSiteCard = classifyApprovalCard({
+      text: 'Sites\nAllow ChatGPT to preview your site?\nAllow ChatGPT to access example.com:8080 using the cloud browser?',
+      buttons: ['Deny', 'Allow all relevant sites', 'Allow for this chat'],
+    })
+    assert.equal(externalSiteCard.decision, 'deny')
+    assert.equal(externalSiteCard.buttonLabel, 'Deny')
+    assert.equal(externalSiteCard.buttonIndex, 0)
+
+    // Verify inspectAndHandleApprovalCardInPage never clicks "Allow all relevant sites" (index 1)
+    const clickedIndices: number[] = []
+    const fakePage = {
+      evaluate: async (_fn: unknown, btnIdx?: number) => {
+        if (btnIdx === undefined) {
+          return {
+            text: 'Sites\nAllow ChatGPT to preview your site?\nAllow ChatGPT to access 127.0.0.1:8765 using the cloud browser?',
+            buttons: [
+              { index: 0, label: 'Deny' },
+              { index: 1, label: 'Allow all relevant sites' },
+              { index: 2, label: 'Allow for this chat' },
+            ],
+          }
+        }
+        clickedIndices.push(btnIdx)
+        return true
+      },
+      keyboard: {
+        press: async () => {},
+      },
+    }
+    const handled = await inspectAndHandleApprovalCardInPage(fakePage)
+    assert.equal(handled.handled, true)
+    assert.equal(handled.decision, 'allow_this_chat')
+    assert.equal(handled.buttonLabel, 'Allow for this chat')
+    assert.deepEqual(clickedIndices, [2])
+  })
+
+  it('streams intermediate commentary, subagent/tool steps, and incremental final text while holding back sandbox:/ links until finalFlush', () => {
+    const conv = {
+      current_node: 'node-5',
+      mapping: {
+        'node-1': {
+          parent: null,
+          message: {
+            id: 'u-1',
+            author: { role: 'user' },
+            content: { content_type: 'text', parts: ['Build wormhole demo'] },
+          },
+        },
+        'node-2': {
+          parent: 'node-1',
+          message: {
+            id: 'a-think',
+            author: { role: 'assistant' },
+            channel: 'thoughts',
+            content: {
+              content_type: 'thoughts',
+              thoughts: [{ summary: 'Designing WebGL shader', content: 'Setting up raymarching' }],
+            },
+          },
+        },
+        'node-3': {
+          parent: 'node-2',
+          message: {
+            id: 'a-comm',
+            author: { role: 'assistant' },
+            channel: 'commentary',
+            recipient: 'all',
+            content: {
+              content_type: 'text',
+              parts: ['我将创建一个单文件 HTML 虫洞穿越演示。'],
+            },
+          },
+        },
+        'node-4': {
+          parent: 'node-3',
+          message: {
+            id: 'a-tool',
+            author: { role: 'assistant' },
+            channel: 'commentary',
+            recipient: 'bash',
+            content: {
+              content_type: 'code',
+              text: 'python3 -m http.server 8765',
+            },
+          },
+        },
+        'node-5': {
+          parent: 'node-4',
+          message: {
+            id: 'a-final',
+            author: { role: 'assistant' },
+            channel: 'final',
+            status: 'in_progress',
+            content: {
+              content_type: 'text',
+              parts: ['演示已生成：[下载 ellis-wormhole.html](sandbox:/mnt/data/ellis-wormhole.html)'],
+            },
+          },
+        },
+      },
+    }
+
+    const progress = extractTurnProgressFromMapping(conv)
+    assert.equal(progress.currentNode, 'node-5')
+    assert.equal(progress.finishedFinal, null)
+    assert.equal(progress.thinkingSteps.length, 3)
+    assert.match(progress.thinkingSteps[0]!.text, /Designing WebGL shader/)
+    assert.match(progress.thinkingSteps[1]!.text, /我将创建一个单文件 HTML 虫洞穿越演示/)
+    assert.match(progress.thinkingSteps[2]!.text, /\[工具 bash\]/)
+
+    const streamer = new TurnProgressStreamer()
+    const mapRes = streamer.ingestMappingProgress(progress)
+    const domRes = streamer.ingestDomProgress({
+      stopBtn: true,
+      activeThinking: true,
+      statusLines: [
+        'Working for 3m 12s',
+        'Subagents: 2/2 completed',
+        'Ran command: python3 -m http.server 8765',
+      ],
+    })
+
+    const combinedThinking = [...mapRes.thinkingDeltas, ...domRes.thinkingDeltas].join('')
+    assert.ok(combinedThinking.includes('Working for 3m 12s'))
+    assert.ok(combinedThinking.includes('我将创建一个单文件 HTML 虫洞穿越演示'))
+    assert.ok(combinedThinking.includes('Subagents: 2/2 completed'))
+    // Must hold back raw sandbox:/ link before finalFlush so it can be rewritten to /api/media/...
+    assert.equal(mapRes.textDeltas.join(''), '演示已生成：')
+
+    const tailDelta = streamer.consumeIncrementalFinalText(progress.liveFinalText, {
+      finalFlush: true,
+    })
+    assert.equal(
+      mapRes.textDeltas.join('') + tailDelta,
+      '演示已生成：[下载 ellis-wormhole.html](sandbox:/mnt/data/ellis-wormhole.html)',
+    )
+  })
+
+  it('extracts sandbox artifacts via read-only download APIs and materializes downloadable links in V5 output', async () => {
+    const conv = {
+      current_node: 'node-2',
+      mapping: {
+        'node-1': {
+          parent: null,
+          message: {
+            id: 'u-1',
+            author: { role: 'user' },
+            content: { content_type: 'text', parts: ['Generate demo'] },
+          },
+        },
+        'node-2': {
+          parent: 'node-1',
+          message: {
+            id: 'msg-final-99',
+            author: { role: 'assistant' },
+            channel: 'final',
+            status: 'finished_successfully',
+            content: {
+              content_type: 'multimodal_text',
+              parts: [
+                '点击下载：[demo.html](sandbox:/mnt/data/demo.html)',
+                {
+                  content_type: 'image_asset_pointer',
+                  asset_pointer: 'sediment://file_00000000abcd1234',
+                  metadata: { file_name: 'preview.png' },
+                },
+              ],
+            },
+          },
+        },
+      },
+    }
+
+    const refs = extractTurnOutputArtifactRefs({ conv, finalMessageId: 'msg-final-99' })
+    assert.equal(refs.length, 2)
+    assert.deepEqual(refs[0], {
+      name: 'demo.html',
+      sandboxUrl: 'sandbox:/mnt/data/demo.html',
+      sandboxPath: '/mnt/data/demo.html',
+      messageId: 'msg-final-99',
+    })
+    assert.deepEqual(refs[1], {
+      name: 'preview.png',
+      fileId: 'file_00000000abcd1234',
+      mimeType: 'image/png',
+      messageId: 'msg-final-99',
+    })
+
+    const htmlBytes = Buffer.from('<!doctype html><html><body>Demo</body></html>', 'utf8')
+    const pngBytes = Buffer.from('89504e470d0a1a0a', 'hex')
+    const fakePage = {
+      evaluate: async (_fn: unknown, arg: { targetRef: { sandboxPath?: string; fileId?: string } }) => {
+        if (arg.targetRef.sandboxPath) {
+          return {
+            ok: true,
+            name: 'demo.html',
+            mimeType: 'text/html',
+            size: htmlBytes.byteLength,
+            base64: htmlBytes.toString('base64'),
+          }
+        }
+        return {
+          ok: true,
+          name: 'preview.png',
+          mimeType: 'image/png',
+          size: pngBytes.byteLength,
+          base64: pngBytes.toString('base64'),
+        }
+      },
+    }
+
+    const downloaded = await downloadTurnOutputArtifactsInPage(fakePage, {
+      convId: 'conv-demo-1',
+      finalMessageId: 'msg-final-99',
+      artifactRefs: refs,
+    })
+    assert.equal(downloaded.length, 2)
+    assert.equal(downloaded[0]!.sandboxUrl, 'sandbox:/mnt/data/demo.html')
+    assert.equal(downloaded[0]!.sandboxPath, '/mnt/data/demo.html')
+    assert.equal(downloaded[1]!.fileId, 'file_00000000abcd1234')
+
+    const outDir = mkdtempSync(join(tmpdir(), 'oc-gpt-web-output-'))
+    const uploadsDir = join(outDir, 'uploads')
+    const generatedDir = join(outDir, 'generated')
+    try {
+      const textDeltaFrame = JSON.stringify({
+        type: 'stream_event',
+        event: {
+          type: 'content_block_delta',
+          index: 1,
+          delta: {
+            type: 'text_delta',
+            text: '点击下载：[demo.html](sandbox:/mnt/data/demo.html)',
+          },
+        },
+        outputAttachments: downloaded,
+      })
+
+      const rewrittenLine = materializeGptWebOutputAttachmentsInStdoutLine(textDeltaFrame, {
+        uploadsDir,
+        generatedDir,
+      })
+      const parsed = JSON.parse(rewrittenLine)
+      assert.equal(parsed.outputAttachments, undefined)
+      const deltaText: string = parsed.event.delta.text
+      assert.doesNotMatch(deltaText, /sandbox:\/mnt\/data\/demo\.html/)
+      assert.match(deltaText, /\/api\/media\/[0-9a-f]{64}\.html/)
+      assert.match(deltaText, /!\[preview\.png\]\(\/api\/media\/[0-9a-f]{64}\.png\)/)
+      assert.match(deltaText, /demo\.html.*\/generated\/demo\.html/)
+      assert.equal(
+        readFileSync(join(generatedDir, 'demo.html'), 'utf8'),
+        '<!doctype html><html><body>Demo</body></html>',
+      )
+    } finally {
+      rmSync(outDir, { recursive: true, force: true })
+    }
+  })
+
+  it('persists active turn state and reconnects mid-turn in runBoxCcBridge when stream drops before result', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'oc-gpt-web-reconnect-'))
+    try {
+      saveActiveTurnState(dir, 'sess-long-1', {
+        conversationId: 'conv-long-1',
+        promptText: 'Build wormhole animation',
+        startedAt: 1_700_000_000_000,
+      })
+      const loaded = loadActiveTurnState(dir, 'sess-long-1')
+      assert.ok(loaded)
+      assert.equal(loaded.conversationId, 'conv-long-1')
+
+      const inspected = inspectExistingTurnInConversation(
+        {
+          current_node: 'node-2',
+          mapping: {
+            'node-1': {
+              parent: null,
+              message: {
+                id: 'u-1',
+                author: { role: 'user' },
+                content: { content_type: 'text', parts: ['Build wormhole animation'] },
+              },
+            },
+            'node-2': {
+              parent: 'node-1',
+              message: {
+                id: 'a-1',
+                author: { role: 'assistant' },
+                channel: 'commentary',
+                status: 'in_progress',
+                content: { content_type: 'text', parts: ['Working on shaders...'] },
+              },
+            },
+          },
+        },
+        { promptText: 'Build wormhole animation' },
+      )
+      assert.equal(inspected.status, 'in_progress')
+      assert.equal(inspected.userNodeId, 'node-1')
+      assert.equal(inspected.reply, null)
+
+      clearActiveTurnState(dir, 'sess-long-1')
+      assert.equal(loadActiveTurnState(dir, 'sess-long-1'), null)
+
+      // Verify TurnProgressStreamer state export/restore prevents duplicate text_delta after reconnect
+      const preCrashStreamer = new TurnProgressStreamer()
+      assert.equal(
+        preCrashStreamer.consumeIncrementalFinalText('Hello ', { finalFlush: false }),
+        'Hello ',
+      )
+      const exportedState = preCrashStreamer.exportState()
+      const postCrashStreamer = new TurnProgressStreamer()
+      postCrashStreamer.restoreState(exportedState)
+      assert.equal(
+        postCrashStreamer.consumeIncrementalFinalText('Hello world', { finalFlush: true }),
+        'world',
+      )
+
+      // Verify BoxLoginSignalTap detects result even when >256KiB base64 outputAttachments arrive in 64KiB chunks
+      const tap = new BoxLoginSignalTap()
+      const hugeResultLine = `${JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        session_id: 'sess-huge',
+        result: 'ok',
+        outputAttachments: [{ name: 'big.bin', base64: 'A'.repeat(320_000) }],
+      })}\n`
+      const allEnds = []
+      for (let offset = 0; offset < hugeResultLine.length; offset += 65_536) {
+        allEnds.push(...tap.push(hugeResultLine.slice(offset, offset + 65_536)))
+      }
+      assert.equal(allEnds.length, 1)
+
+      // Verify stampGptWebTurnIdInUserLine stamps a stable ocTurnId across retries
+      const rawUserLine = `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'Hello' } })}\n`
+      const stamped1 = stampGptWebTurnIdInUserLine(rawUserLine)
+      const stamped2 = stampGptWebTurnIdInUserLine(stamped1)
+      assert.equal(stamped1, stamped2)
+      const parsedFrame = parseStdinFrame(stamped1)
+      assert.equal(parsedFrame?.kind, 'user')
+      assert.ok(parsedFrame?.turnId)
+
+      // Simulate mid-turn stream disconnect on attempt 1 followed by seamless resume on attempt 2
+      const fifo = boxCcFifoPath(`gpt-web-reconnect-${Date.now()}`)
+      const control: BoxCcControl = {
+        execUrl: 'http://127.0.0.1:9999/exec',
+        execToken: 'tok-exec',
+        networkToken: 'tok-net',
+        remoteClaude: '/home/box/.local/bin/claude',
+        fifo,
+        cwd: dir,
+        accountId: 'selfhost-master',
+      }
+      const realMod = loadBoxGptWebMod()
+      let interactiveExecCount = 0
+      const seenTurnIds: string[] = []
+      const reconnectHostMjs = `
+import readline from 'node:readline'
+import {
+  TurnProgressStreamer,
+  formatStreamJsonAssistantMessage,
+  formatStreamJsonResult,
+  formatStreamJsonSystemInit,
+  formatStreamJsonTextDelta,
+  formatStreamJsonThinkingDelta,
+  parseStdinFrame,
+} from './chatgptWebCore.mjs'
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity })
+rl.on('line', (line) => {
+  const frame = parseStdinFrame(line)
+  if (!frame || frame.kind !== 'user') return
+  process.stderr.write('SEEN_TURN_ID:' + (frame.turnId || 'none') + '\\n')
+  const streamer = new TurnProgressStreamer({ initialEmittedFinalText: frame.deliveredText || '' })
+  process.stdout.write(formatStreamJsonSystemInit({ sessionId: 'sess-reconnect', model: 'box-gpt-6-astra-pro' }) + '\\n')
+  if (process.env.FAKE_ATTEMPT === '1') {
+    process.stdout.write(formatStreamJsonThinkingDelta('Still running in Chrome...') + '\\n')
+    const d1 = streamer.consumeIncrementalFinalText('Recovered ', { finalFlush: false })
+    process.stdout.write(formatStreamJsonTextDelta(d1) + '\\n')
+    process.exit(1)
+  }
+  const tail = streamer.consumeIncrementalFinalText('Recovered final answer', { finalFlush: true })
+  process.stdout.write(formatStreamJsonTextDelta(tail) + '\\n')
+  process.stdout.write(formatStreamJsonAssistantMessage({ messageId: 'm_rec', text: 'Recovered final answer', thinking: '' }) + '\\n')
+  process.stdout.write(formatStreamJsonResult({ sessionId: 'sess-reconnect', resultText: 'Recovered final answer', isError: false, durationMs: 120 }) + '\\n')
+  process.exit(0)
+})
+`
+      const stdin = new PassThrough()
+      const stdout = new PassThrough()
+      const stderr = new PassThrough()
+      let outText = ''
+      stdout.on('data', (c: Buffer) => {
+        outText += c.toString('utf8')
+      })
+      stderr.on('data', (c: Buffer) => {
+        for (const m of c.toString('utf8').matchAll(/SEEN_TURN_ID:([^\s]+)/g)) {
+          seenTurnIds.push(m[1]!)
+        }
+      })
+
+      const bridgePromise = runBoxCcBridge({
+        control,
+        args: ['--model', 'box-gpt-6-astra-pro', '--resume', 'sess-reconnect'],
+        stdin,
+        stdout,
+        stderr,
+        gptWebMod: {
+          ...realMod,
+          hostMjs: reconnectHostMjs,
+        },
+        env: {
+          OC_USER_ID: '3',
+          OC_BOX_LOGIN_URL: 'http://172.31.0.1:4098/internal/box/login',
+        },
+        loginStateDir: dir,
+        fetchImpl: async (_url, init) => {
+          const req = JSON.parse(
+            Buffer.from(init.body as Uint8Array)
+              .subarray(5)
+              .toString('utf8'),
+          ) as BoxCcExecRequest
+          if (req.args.some((a) => a.includes('mkfifo'))) {
+            interactiveExecCount += 1
+            req.environment = {
+              ...req.environment,
+              FAKE_ATTEMPT: String(interactiveExecCount),
+            }
+          }
+          return streamExecOnHost(req, init.signal ?? undefined)
+        },
+      })
+
+      stdin.write(
+        `${JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: 'Long running task' },
+        })}\n`,
+      )
+      const code = await bridgePromise
+      assert.equal(code, 0)
+      assert.equal(interactiveExecCount, 2)
+      assert.equal(seenTurnIds.length, 2)
+      assert.notEqual(seenTurnIds[0], 'none')
+      assert.equal(seenTurnIds[0], seenTurnIds[1])
+      assert.match(outText, /Still running in Chrome\.\.\./)
+      const combinedTextDeltas = outText
+        .trim()
+        .split('\n')
+        .map((l) => JSON.parse(l))
+        .filter((f) => f.type === 'stream_event' && f.event?.delta?.type === 'text_delta')
+        .map((f) => f.event.delta.text)
+        .join('')
+      assert.equal(combinedTextDeltas, 'Recovered final answer')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

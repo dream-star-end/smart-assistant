@@ -18,28 +18,43 @@ import {
   DEFAULT_CHATGPT_ORIGIN,
   DEFAULT_CHROME_BIN,
   DEFAULT_DISPLAY,
+  DEFAULT_MAX_TIMEOUT_MS,
   DEFAULT_PROFILE,
+  DEFAULT_STALL_WINDOW_MS,
   SerialJobQueue,
   SseAccumulator,
+  TurnProgressStreamer,
   backendFetchTeeInitScript,
   buildChromeLaunchArgs,
   cdpPortForProfile,
+  clearActiveTurnState,
   computeAdaptiveDeadline,
+  downloadTurnOutputArtifactsInPage,
   extractAssistantFromMapping,
+  extractLiveProgressFromDomInPage,
+  extractTurnOutputArtifactRefs,
+  extractTurnProgressFromMapping,
   formatStreamJsonAssistantMessage,
+  formatStreamJsonContentBlockStop,
   formatStreamJsonControlResponse,
   formatStreamJsonKeepalive,
+  formatStreamJsonMessageStart,
   formatStreamJsonResult,
   formatStreamJsonSystemInit,
   formatStreamJsonTextDelta,
+  formatStreamJsonThinkingBlockStart,
   formatStreamJsonThinkingDelta,
+  inspectAndHandleApprovalCardInPage,
+  inspectExistingTurnInConversation,
   isChatGptOriginUrl,
   isPidAlive,
+  loadActiveTurnState,
   parseStdinFrame,
   probeSessionState,
   profileDirFor,
   readProfileSingletonOwner,
   resetComposerDraftInPage,
+  saveActiveTurnState,
   saveSessionConversationId,
   selectProTierInPage,
   syncPageToSessionConversation,
@@ -51,6 +66,8 @@ import {
 
 function parseCliArgs(argv) {
   const profile = process.env.OC_BOX_GPT_WEB_PROFILE || DEFAULT_PROFILE
+  const rawMaxTimeout = Number(process.env.OC_BOX_GPT_WEB_MAX_TIMEOUT_MS)
+  const rawStallTimeout = Number(process.env.OC_BOX_GPT_WEB_STALL_TIMEOUT_MS)
   const out = {
     model: 'gpt-6-astra-pro',
     catalogModel: 'box-gpt-6-astra-pro',
@@ -63,6 +80,14 @@ function parseCliArgs(argv) {
     playwrightPath:
       process.env.OC_BOX_GPT_WEB_PLAYWRIGHT_PATH ||
       '/usr/local/lib/pnpm/5/.pnpm/playwright-core@1.59.1/node_modules/playwright-core/index.mjs',
+    maxTimeoutMs:
+      Number.isFinite(rawMaxTimeout) && rawMaxTimeout >= 60_000
+        ? rawMaxTimeout
+        : DEFAULT_MAX_TIMEOUT_MS,
+    stallWindowMs:
+      Number.isFinite(rawStallTimeout) && rawStallTimeout >= 30_000
+        ? rawStallTimeout
+        : DEFAULT_STALL_WINDOW_MS,
   }
   let explicitCdpPort = process.env.OC_BOX_GPT_WEB_CDP_PORT || null
   for (let i = 0; i < argv.length; i++) {
@@ -255,17 +280,24 @@ async function fetchConversationFromMappingInPage(
     const currentNode = fetched.conv.current_node || null
     const fromMap = extractAssistantFromMapping(fetched.conv, { baselineNodeId })
     if (fromMap?.text) {
+        return {
+          text: fromMap.text,
+          messageId: fromMap.messageId,
+          convId: fetched.convId,
+          currentNode,
+          conv: fetched.conv,
+        }
+      }
       return {
-        text: fromMap.text,
-        messageId: fromMap.messageId,
+        text: null,
+        messageId: null,
         convId: fetched.convId,
         currentNode,
+        conv: fetched.conv,
       }
     }
-    return { text: null, messageId: null, convId: fetched.convId, currentNode }
+    return null
   }
-  return null
-}
 
 async function rescueFromDomOrMapping(page, fallbackConvId = null, { baselineNodeId = null } = {}) {
   const direct = await fetchConversationFromMappingInPage(page, fallbackConvId, {
@@ -276,6 +308,13 @@ async function rescueFromDomOrMapping(page, fallbackConvId = null, { baselineNod
   await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {})
   await new Promise((r) => setTimeout(r, 1500))
   return fetchConversationFromMappingInPage(page, fallbackConvId, { baselineNodeId })
+}
+
+class DetachedTurnError extends Error {
+  constructor(stage) {
+    super(`BOX_GPT_WEB_DETACHED: host process detached (${stage})`)
+    this.name = 'DetachedTurnError'
+  }
 }
 
 async function stopActiveGenerationInPage(page) {
@@ -306,284 +345,535 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
       withProfileFileLock(
         portLockPath,
         async () => {
-      if (turnControl.abort) {
-        throw new Error('BOX_GPT_WEB_INTERRUPTED: turn aborted before launch')
-      }
-      await ensureRealChromeOnCdp(cfg, profileDir)
-      const chromium = await loadPlaywrightChromium(cfg.playwrightPath)
-      const browser = await getConnectedCdpBrowser(chromium, cfg.cdpPort)
-      const page = await acquireSingleChatGptPage(browser)
-      turnControl.page = page
-
-      const abortIfRequested = async (stage) => {
-        if (turnControl.abort) {
-          await stopActiveGenerationInPage(page)
-          await resetComposerDraftInPage(page)
-          throw new Error(`BOX_GPT_WEB_INTERRUPTED: turn aborted (${stage})`)
-        }
-      }
-
-      await abortIfRequested('after acquire page')
-
-      // Wait briefly if the page is still rendering its initial DOM
-      for (let i = 0; i < 15; i++) {
-        const probe = await probeSessionState(page, { profileDir, display: cfg.display })
-        if (probe.ok || probe.code === 'CF_CHALLENGE') break
-        await new Promise((r) => setTimeout(r, 300))
-      }
-
-      const initialProbe = await probeSessionState(page, {
-        profileDir,
-        display: cfg.display,
-      })
-      if (!initialProbe.ok) {
-        throw new Error(initialProbe.message)
-      }
-
-      const syncState = await syncPageToSessionConversation(page, {
-        profileDir,
-        sessionId: cfg.sessionId,
-      })
-      await abortIfRequested('after sync session')
-
-      if (syncState.navigated) {
-        for (let i = 0; i < 25; i++) {
-          const probe = await probeSessionState(page, { profileDir, display: cfg.display })
-          if (probe.ok || probe.code === 'CF_CHALLENGE') break
-          await new Promise((r) => setTimeout(r, 300))
-        }
-        const postNavProbe = await probeSessionState(page, {
-          profileDir,
-          display: cfg.display,
-        })
-        if (!postNavProbe.ok) {
-          throw new Error(postNavProbe.message)
-        }
-      }
-
-      let baselineNodeId = null
-      if (syncState.conversationId) {
-        const preConv = await fetchConversationPayloadInPage(page, syncState.conversationId)
-        baselineNodeId = preConv?.conv?.current_node || null
-      }
-      // On an existing conversation, we must have a valid pre-send baselineNodeId
-      // so we never mistake a previous turn's finished message for the current turn's answer.
-      const hasValidMappingBaseline = !syncState.conversationId || Boolean(baselineNodeId)
-
-      await selectProTierInPage(page, { requestedTier: 'pro' })
-      await abortIfRequested('after select pro tier')
-
-      if (turn.files && turn.files.length > 0) {
-        await uploadAttachmentsToComposer(page, turn.files)
-        await abortIfRequested('after upload attachments')
-      }
-
-      await page.evaluate(() => {
-        window.__ocSseEvents = []
-      })
-
-      await typeMultilinePreservingAttachments(page, turn.text)
-      await abortIfRequested('before send')
-
-      const sendBtn = page
-        .locator(
-          '[data-testid="send-button"], button[aria-label="Send"], button[aria-label="Send prompt"]',
-        )
-        .first()
-      await sendBtn.waitFor({ state: 'visible', timeout: 15_000 })
-      await abortIfRequested('before click send')
-      await sendBtn.click()
-
-      const acc = new SseAccumulator({
-        onThinkingDelta: (delta) => {
-          lastStdoutActivityAt = Date.now()
-          writeStdoutLine(formatStreamJsonThinkingDelta(delta))
-        },
-        onTextDelta: (delta) => {
-          lastStdoutActivityAt = Date.now()
-          writeStdoutLine(formatStreamJsonTextDelta(delta))
-        },
-      })
-
-      const startedAt = Date.now()
-      let currentDeadline = startedAt + 600_000
-      let stopGoneSince = null
-      let sawStopBtn = false
-      let lastMappingPollAt = 0
-      let lastObservedNodeId = baselineNodeId
-      let lastStdoutActivityAt = startedAt
-      let readCursor = 0
-
-      while (true) {
-        await abortIfRequested('during generation')
-
-        const batch = await page.evaluate((fromIdx) => {
-          const events = Array.isArray(window.__ocSseEvents) ? window.__ocSseEvents : []
-          const slice = events.slice(fromIdx)
-          const stopBtn = Boolean(
-            document.querySelector('[data-testid="stop-button"], button[aria-label*="Stop"]'),
-          )
-          const urlMatch = location.pathname.match(/\/c\/([a-z0-9_-]{8,128})/i)
-          return {
-            slice,
-            nextIdx: events.length,
-            stopBtn,
-            urlConvId: urlMatch ? urlMatch[1] : null,
+          if (turnControl.detached) {
+            throw new DetachedTurnError('before launch')
           }
-        }, readCursor)
-
-        readCursor = batch.nextIdx
-        for (const item of batch.slice) {
-          if (item.data) {
-            acc.feedDataLine(item.data)
-          } else if (item.error) {
-            acc.error = item.error
+          if (turnControl.abort) {
+            throw new Error('BOX_GPT_WEB_INTERRUPTED: turn aborted before launch')
           }
-        }
 
-        const resolvedConvId = acc.conversationId || batch.urlConvId
-        if (resolvedConvId) {
-          saveSessionConversationId(profileDir, cfg.sessionId, resolvedConvId)
-        }
-
-        if (acc.error) {
-          throw new Error(`BOX_GPT_WEB_SSE_ERROR: ${acc.error}`)
-        }
-        if (acc.done && acc.finalText.length > 0) {
-          if (!resolvedConvId) {
-            const m = page.url().match(/\/c\/([a-z0-9_-]{8,128})/i)
-            if (m) saveSessionConversationId(profileDir, cfg.sessionId, m[1])
+          let accumulatedThinking = ''
+          const emitThinking = (delta) => {
+            if (!delta) return
+            accumulatedThinking += delta
+            writeStdoutLine(formatStreamJsonThinkingDelta(delta))
           }
-          return {
-            text: acc.finalText,
-            thinking: acc.thinkingText,
-            messageId: acc.messageId || `msg_${Date.now()}`,
+          const closeThinkingIfOpen = () => {
+            if (!turnControl.thinkingBlockOpen) return
+            turnControl.thinkingBlockOpen = false
+            writeStdoutLine(formatStreamJsonContentBlockStop({ index: 0 }))
           }
-        }
-
-        const now = Date.now()
-        if (batch.stopBtn) {
-          sawStopBtn = true
-          stopGoneSince = null
-        } else if (stopGoneSince === null && (sawStopBtn || now - startedAt > 3_000)) {
-          stopGoneSince = now
-        }
-
-        // In ChatGPT Web Pro (Oct 2026), POST /backend-api/f/conversation emits stream_handoff
-        // and hands off generation to the backend Conduit topic. The DOM Stop button can remain
-        // visible ("ChatGPT is responding") even after /backend-api/conversation/<id> has already
-        // committed the finished_successfully final message. Poll mapping every 2s once
-        // stream_handoff (or stop-button disappearance) occurs, without waiting for !batch.stopBtn.
-        if (
-          hasValidMappingBaseline &&
-          !acc.finalText &&
-          resolvedConvId &&
-          (acc.streamHandoff || (sawStopBtn && !batch.stopBtn) || acc.done) &&
-          now - lastMappingPollAt >= 2_000
-        ) {
-          lastMappingPollAt = now
-          const mapped = await fetchConversationFromMappingInPage(page, resolvedConvId, {
-            baselineNodeId,
+          const streamer = new TurnProgressStreamer({
+            initialEmittedFinalText:
+              typeof turn.deliveredText === 'string' ? turn.deliveredText : '',
           })
-          if (mapped?.currentNode && mapped.currentNode !== lastObservedNodeId) {
-            lastObservedNodeId = mapped.currentNode
-            acc.lastEventAt = now
-            lastStdoutActivityAt = now
-            writeStdoutLine(
-              formatStreamJsonKeepalive({
-                sessionId: cfg.sessionId,
-                elapsedMs: now - startedAt,
-              }),
-            )
-          }
-          if (mapped?.text) {
-            if (mapped.convId) {
-              saveSessionConversationId(profileDir, cfg.sessionId, mapped.convId)
-            }
-            writeStdoutLine(formatStreamJsonTextDelta(mapped.text))
-            return {
-              text: mapped.text,
-              thinking: acc.thinkingText,
-              messageId: mapped.messageId || acc.messageId || `msg_${Date.now()}`,
-            }
-          }
-        }
 
-        const adaptive = computeAdaptiveDeadline({
-          startedAt,
-          now,
-          lastActivityAt: acc.lastEventAt,
-          stopVisible: batch.stopBtn,
-          stopGoneSince,
-          hasFinalText: acc.finalText.length > 0,
-          currentDeadline,
-        })
-        currentDeadline = adaptive.deadline
-
-        if (
-          !adaptive.expired &&
-          now - acc.lastEventAt < 240_000 &&
-          (batch.stopBtn || acc.streamHandoff) &&
-          now - lastStdoutActivityAt >= 30_000
-        ) {
-          lastStdoutActivityAt = now
-          writeStdoutLine(
-            formatStreamJsonKeepalive({
-              sessionId: cfg.sessionId,
-              elapsedMs: now - startedAt,
-            }),
+          const activeTurnState = loadActiveTurnState(profileDir, cfg.sessionId)
+          const isSameTurn = Boolean(
+            activeTurnState &&
+              activeTurnState.promptText === turn.text &&
+              (turn.turnId
+                ? activeTurnState.turnId === turn.turnId
+                : !activeTurnState.completedAt),
           )
-        }
-
-        if (adaptive.shouldRescue && hasValidMappingBaseline) {
-          const rescued = await rescueFromDomOrMapping(page, resolvedConvId, { baselineNodeId })
-          if (rescued?.text) {
-            if (rescued.convId) {
-              saveSessionConversationId(profileDir, cfg.sessionId, rescued.convId)
+          if (isSameTurn && activeTurnState) {
+            // Only restore stepTextByKey (thinking commentary deduplication) from disk;
+            // emittedFinalText MUST come only from gateway-acknowledged `turn.deliveredText`
+            // so an unacknowledged stdout write lost on a broken pipe is never skipped on reconnect.
+            streamer.restoreState({
+              stepTextByKey: activeTurnState.stepTextByKey,
+            })
+            if (typeof activeTurnState.accumulatedThinking === 'string') {
+              accumulatedThinking = activeTurnState.accumulatedThinking
             }
-            if (rescued.text.length > acc.finalText.length) {
-              const delta = rescued.text.slice(acc.finalText.length)
-              writeStdoutLine(formatStreamJsonTextDelta(delta))
+          }
+
+          let currentTurnState = {
+            turnId: turn.turnId || activeTurnState?.turnId || null,
+            conversationId: activeTurnState?.conversationId || null,
+            baselineNodeId: isSameTurn ? (activeTurnState?.baselineNodeId ?? null) : null,
+            promptText: turn.text,
+            startedAt:
+              isSameTurn && Number.isFinite(activeTurnState?.startedAt)
+                ? activeTurnState.startedAt
+                : Date.now(),
+            accumulatedThinking,
+            stepTextByKey: Object.fromEntries(streamer.stepTextByKey),
+          }
+
+          const persistProgressState = (extra = {}) => {
+            currentTurnState = {
+              ...currentTurnState,
+              ...extra,
+              accumulatedThinking,
+              stepTextByKey: Object.fromEntries(streamer.stepTextByKey),
+            }
+            saveActiveTurnState(profileDir, cfg.sessionId, currentTurnState)
+          }
+
+          await ensureRealChromeOnCdp(cfg, profileDir)
+          const chromium = await loadPlaywrightChromium(cfg.playwrightPath)
+          let browser = await getConnectedCdpBrowser(chromium, cfg.cdpPort)
+          let page = await acquireSingleChatGptPage(browser)
+          turnControl.page = page
+
+          const abortIfRequested = async (stage) => {
+            if (turnControl.detached) {
+              throw new DetachedTurnError(stage)
+            }
+            if (turnControl.abort) {
+              clearActiveTurnState(profileDir, cfg.sessionId)
+              await stopActiveGenerationInPage(page)
+              await resetComposerDraftInPage(page)
+              throw new Error(`BOX_GPT_WEB_INTERRUPTED: turn aborted (${stage})`)
+            }
+          }
+
+          const finalizeTurnOutput = async ({
+            finalText,
+            finalMessageId,
+            convId,
+            latestConv,
+            baselineNodeId,
+          }) => {
+            await abortIfRequested('before finalizeTurnOutput')
+            const msgId = finalMessageId || `msg_${Date.now()}`
+            let outputAttachments = []
+            try {
+              let convForArtifacts = latestConv
+              if (!convForArtifacts && convId) {
+                const fetched = await fetchConversationPayloadInPage(page, convId)
+                convForArtifacts = fetched?.conv || null
+              }
+              const artifactRefs = extractTurnOutputArtifactRefs({
+                text: finalText,
+                conv: convForArtifacts,
+                baselineNodeId,
+                finalMessageId: msgId,
+              })
+              if (artifactRefs.length > 0 && convId) {
+                if (turnControl.thinkingBlockOpen) {
+                  emitThinking(
+                    `\n[Pro 文件取回] 检测到 ${artifactRefs.length} 个生成文件/图片，正在通过只读接口取回…\n`,
+                  )
+                }
+                outputAttachments = await downloadTurnOutputArtifactsInPage(page, {
+                  convId,
+                  finalMessageId: msgId,
+                  artifactRefs,
+                })
+              }
+            } catch {}
+
+            await abortIfRequested('after downloadTurnOutputArtifactsInPage')
+            closeThinkingIfOpen()
+            const tailDelta = streamer.consumeIncrementalFinalText(finalText, {
+              finalFlush: true,
+            })
+            persistProgressState({
+              conversationId: convId || currentTurnState.conversationId,
+              baselineNodeId,
+            })
+            if (tailDelta || outputAttachments.length > 0) {
+              writeStdoutLine(
+                formatStreamJsonTextDelta(tailDelta, {
+                  outputAttachments: outputAttachments.length > 0 ? outputAttachments : null,
+                }),
+              )
             }
             return {
-              text: rescued.text,
-              thinking: acc.thinkingText,
-              messageId: rescued.messageId || acc.messageId || `msg_${Date.now()}`,
+              text: finalText,
+              thinking: accumulatedThinking,
+              messageId: msgId,
+              outputAttachments: outputAttachments.length > 0 ? outputAttachments : null,
+              turnState: currentTurnState,
             }
           }
-        }
 
-        if (!batch.stopBtn && acc.done) {
-          if (!acc.finalText && hasValidMappingBaseline) {
-            const rescued = await rescueFromDomOrMapping(page, resolvedConvId, { baselineNodeId })
-            if (rescued?.text) {
-              if (rescued.convId) {
-                saveSessionConversationId(profileDir, cfg.sessionId, rescued.convId)
+          await abortIfRequested('after acquire page')
+
+          // Wait briefly if the page is still rendering its initial DOM
+          for (let i = 0; i < 15; i++) {
+            const probe = await probeSessionState(page, { profileDir, display: cfg.display })
+            if (probe.ok || probe.code === 'CF_CHALLENGE') break
+            await new Promise((r) => setTimeout(r, 300))
+          }
+
+          const initialProbe = await probeSessionState(page, {
+            profileDir,
+            display: cfg.display,
+          })
+          if (!initialProbe.ok) {
+            throw new Error(initialProbe.message)
+          }
+
+          const syncState = await syncPageToSessionConversation(page, {
+            profileDir,
+            sessionId: cfg.sessionId,
+          })
+          await abortIfRequested('after sync session')
+
+          if (syncState.navigated) {
+            for (let i = 0; i < 25; i++) {
+              const probe = await probeSessionState(page, { profileDir, display: cfg.display })
+              if (probe.ok || probe.code === 'CF_CHALLENGE') break
+              await new Promise((r) => setTimeout(r, 300))
+            }
+            const postNavProbe = await probeSessionState(page, {
+              profileDir,
+              display: cfg.display,
+            })
+            if (!postNavProbe.ok) {
+              throw new Error(postNavProbe.message)
+            }
+          }
+
+          let baselineNodeId = null
+          let resumedInProgress = false
+          let latestConv = null
+
+          if (syncState.conversationId) {
+            const preConv = await fetchConversationPayloadInPage(page, syncState.conversationId)
+            latestConv = preConv?.conv || null
+            baselineNodeId = preConv?.conv?.current_node || null
+
+            if (isSameTurn && preConv?.conv) {
+              const existing = inspectExistingTurnInConversation(preConv.conv, {
+                promptText: turn.text,
+                baselineNodeId: activeTurnState.baselineNodeId ?? null,
+              })
+              if (existing.status === 'completed' && existing.reply?.text) {
+                emitThinking('[Pro] 检测到重连前该回合已在网页端完成，正在同步最终结果…\n')
+                return finalizeTurnOutput({
+                  finalText: existing.reply.text,
+                  finalMessageId: existing.reply.messageId,
+                  convId: syncState.conversationId,
+                  latestConv: preConv.conv,
+                  baselineNodeId: existing.baselineNodeId,
+                })
               }
-              writeStdoutLine(formatStreamJsonTextDelta(rescued.text))
-              return {
-                text: rescued.text,
-                thinking: acc.thinkingText,
-                messageId: rescued.messageId || acc.messageId || `msg_${Date.now()}`,
+              if (existing.status === 'in_progress') {
+                resumedInProgress = true
+                baselineNodeId = existing.baselineNodeId
+                emitThinking('[Pro] 已重新连接正在运行的 ChatGPT Pro 回合，继续同步实时进度…\n')
               }
             }
           }
-          return {
-            text: acc.finalText,
-            thinking: acc.thinkingText,
-            messageId: acc.messageId || `msg_${Date.now()}`,
+
+          if (isSameTurn && !resumedInProgress) {
+            const domLive = await extractLiveProgressFromDomInPage(page)
+            if (domLive.stopBtn || domLive.activeThinking) {
+              resumedInProgress = true
+              baselineNodeId = activeTurnState?.baselineNodeId ?? baselineNodeId
+              emitThinking('[Pro] 已重新连接正在运行的 ChatGPT Pro 回合，继续同步实时进度…\n')
+            }
           }
-        }
 
-        if (adaptive.expired) {
-          await stopActiveGenerationInPage(page)
-          throw new Error(
-            `BOX_GPT_WEB_PRO_TIMEOUT: turn exceeded adaptive deadline (${Math.round((now - startedAt) / 1000)}s)`,
-          )
-        }
+          // On an existing conversation, we must have a valid pre-send baselineNodeId
+          // so we never mistake a previous turn's finished message for the current turn's answer.
+          const hasValidMappingBaseline =
+            !syncState.conversationId || Boolean(baselineNodeId) || resumedInProgress
 
-        await new Promise((r) => setTimeout(r, 250))
-      }
+          if (!resumedInProgress) {
+            await selectProTierInPage(page, { requestedTier: 'pro' })
+            await abortIfRequested('after select pro tier')
+
+            if (turn.files && turn.files.length > 0) {
+              emitThinking(`[Pro] 正在上传 ${turn.files.length} 个附件…\n`)
+              await uploadAttachmentsToComposer(page, turn.files)
+              await abortIfRequested('after upload attachments')
+            }
+
+            await page.evaluate(() => {
+              window.__ocSseEvents = []
+            })
+
+            await typeMultilinePreservingAttachments(page, turn.text)
+            await abortIfRequested('before send')
+
+            const sendBtn = page
+              .locator(
+                '[data-testid="send-button"], button[aria-label="Send"], button[aria-label="Send prompt"]',
+              )
+              .first()
+            await sendBtn.waitFor({ state: 'visible', timeout: 15_000 })
+            await abortIfRequested('before click send')
+            persistProgressState({
+              conversationId: syncState.conversationId || null,
+              baselineNodeId,
+              startedAt: Date.now(),
+            })
+            await sendBtn.click()
+            emitThinking('[Pro] 已选中 Pro 档位并提交请求，等待 ChatGPT Pro 思考与执行…\n')
+          }
+
+          const startedAt =
+            resumedInProgress && Number.isFinite(activeTurnState?.startedAt)
+              ? activeTurnState.startedAt
+              : Date.now()
+          let lastActivityAt = Date.now()
+
+          const acc = new SseAccumulator({
+            onThinkingDelta: (delta) => {
+              lastActivityAt = Date.now()
+              emitThinking(delta)
+            },
+            onTextDelta: () => {
+              lastActivityAt = Date.now()
+              const safeDelta = streamer.consumeIncrementalFinalText(acc.finalText, {
+                finalFlush: false,
+              })
+              if (safeDelta) {
+                closeThinkingIfOpen()
+                persistProgressState({
+                  conversationId: acc.conversationId || syncState.conversationId || null,
+                  baselineNodeId,
+                })
+                writeStdoutLine(formatStreamJsonTextDelta(safeDelta))
+              }
+            },
+          })
+
+          let currentDeadline = Date.now() + 600_000
+          let stopGoneSince = null
+          let sawStopBtn = resumedInProgress
+          let lastDomPollAt = 0
+          let lastMappingPollAt = 0
+          let lastDomActiveThinking = false
+          let lastObservedNodeId = baselineNodeId
+          let readCursor = 0
+
+          while (true) {
+            await abortIfRequested('during generation')
+
+            let batch
+            try {
+              batch = await page.evaluate((fromIdx) => {
+                const events = Array.isArray(window.__ocSseEvents) ? window.__ocSseEvents : []
+                const slice = events.slice(fromIdx)
+                const stopBtn = Boolean(
+                  document.querySelector('[data-testid="stop-button"], button[aria-label*="Stop"]'),
+                )
+                const urlMatch = location.pathname.match(/\/c\/([a-z0-9_-]{8,128})/i)
+                return {
+                  slice,
+                  nextIdx: events.length,
+                  stopBtn,
+                  urlConvId: urlMatch ? urlMatch[1] : null,
+                }
+              }, readCursor)
+            } catch {
+              if (turnControl.detached || turnControl.abort) {
+                await abortIfRequested('during cdp reconnect')
+              }
+              // Transient CDP / page navigation hiccup during a multi-hour turn: reconnect and continue
+              await new Promise((r) => setTimeout(r, 1_000))
+              await ensureRealChromeOnCdp(cfg, profileDir)
+              browser = await getConnectedCdpBrowser(chromium, cfg.cdpPort)
+              page = await acquireSingleChatGptPage(browser)
+              turnControl.page = page
+              continue
+            }
+
+            readCursor = batch.nextIdx
+            for (const item of batch.slice) {
+              if (item.data) {
+                acc.feedDataLine(item.data)
+              } else if (item.error) {
+                acc.error = item.error
+              }
+            }
+
+            const resolvedConvId =
+              acc.conversationId || batch.urlConvId || syncState.conversationId || null
+            if (resolvedConvId) {
+              saveSessionConversationId(profileDir, cfg.sessionId, resolvedConvId)
+            }
+
+            if (acc.error) {
+              clearActiveTurnState(profileDir, cfg.sessionId)
+              throw new Error(`BOX_GPT_WEB_SSE_ERROR: ${acc.error}`)
+            }
+            if (acc.done && acc.finalText.length > 0) {
+              let finalConvId = resolvedConvId
+              if (!finalConvId) {
+                const m = page.url().match(/\/c\/([a-z0-9_-]{8,128})/i)
+                if (m) {
+                  finalConvId = m[1]
+                  saveSessionConversationId(profileDir, cfg.sessionId, finalConvId)
+                }
+              }
+              return finalizeTurnOutput({
+                finalText: acc.finalText,
+                finalMessageId: acc.messageId || `msg_${Date.now()}`,
+                convId: finalConvId,
+                latestConv,
+                baselineNodeId,
+              })
+            }
+
+            const now = Date.now()
+            if (batch.stopBtn) {
+              sawStopBtn = true
+              stopGoneSince = null
+              lastActivityAt = now
+            } else if (stopGoneSince === null && (sawStopBtn || now - startedAt > 3_000)) {
+              stopGoneSince = now
+            }
+
+            // Poll DOM every 1s for approval cards (Scheme A whitelist) and live status/subagents/commands
+            if (now - lastDomPollAt >= 1_000) {
+              lastDomPollAt = now
+              const approval = await inspectAndHandleApprovalCardInPage(page)
+              if (approval?.handled) {
+                lastActivityAt = now
+                if (approval.announcement && turnControl.thinkingBlockOpen) {
+                  emitThinking(approval.announcement)
+                }
+              }
+              const domProg = await extractLiveProgressFromDomInPage(page)
+              lastDomActiveThinking = Boolean(domProg.stopBtn || domProg.activeThinking)
+              if (lastDomActiveThinking) {
+                lastActivityAt = now
+                stopGoneSince = null
+              }
+              if (turnControl.thinkingBlockOpen) {
+                const { thinkingDeltas } = streamer.ingestDomProgress(domProg, {
+                  now,
+                  startedAt,
+                })
+                for (const td of thinkingDeltas) {
+                  emitThinking(td)
+                }
+              }
+            }
+
+            // Poll conversation mapping every 2s for intermediate commentary/thoughts/tools and final text
+            if (
+              hasValidMappingBaseline &&
+              resolvedConvId &&
+              (acc.streamHandoff ||
+                resumedInProgress ||
+                sawStopBtn ||
+                lastDomActiveThinking ||
+                acc.done ||
+                now - startedAt >= 2_000) &&
+              now - lastMappingPollAt >= 2_000
+            ) {
+              lastMappingPollAt = now
+              const payload = await fetchConversationPayloadInPage(page, resolvedConvId)
+              if (payload?.conv) {
+                latestConv = payload.conv
+                const prog = extractTurnProgressFromMapping(payload.conv, { baselineNodeId })
+                if (prog.currentNode && prog.currentNode !== lastObservedNodeId) {
+                  lastObservedNodeId = prog.currentNode
+                  lastActivityAt = now
+                }
+                const { thinkingDeltas, textDeltas } = streamer.ingestMappingProgress(prog)
+                for (const td of thinkingDeltas) {
+                  lastActivityAt = now
+                  if (turnControl.thinkingBlockOpen) {
+                    emitThinking(td)
+                  }
+                }
+                if (thinkingDeltas.length > 0 || textDeltas.length > 0) {
+                  persistProgressState({
+                    conversationId: payload.convId || resolvedConvId,
+                    baselineNodeId,
+                  })
+                }
+                for (const txd of textDeltas) {
+                  lastActivityAt = now
+                  closeThinkingIfOpen()
+                  writeStdoutLine(formatStreamJsonTextDelta(txd))
+                }
+                if (prog.finishedFinal?.text) {
+                  const finalConvId = payload.convId || resolvedConvId
+                  if (finalConvId) {
+                    saveSessionConversationId(profileDir, cfg.sessionId, finalConvId)
+                  }
+                  return finalizeTurnOutput({
+                    finalText: prog.finishedFinal.text,
+                    finalMessageId: prog.finishedFinal.messageId,
+                    convId: finalConvId,
+                    latestConv: payload.conv,
+                    baselineNodeId,
+                  })
+                }
+              }
+            }
+
+            const adaptive = computeAdaptiveDeadline({
+              startedAt,
+              now,
+              lastActivityAt: Math.max(lastActivityAt, acc.lastEventAt),
+              stopVisible: batch.stopBtn,
+              activeThinkingVisible: lastDomActiveThinking,
+              stopGoneSince,
+              hasFinalText: Boolean(acc.finalText || streamer.emittedFinalText),
+              maxTimeoutMs: cfg.maxTimeoutMs,
+              stallWindowMs: cfg.stallWindowMs,
+              currentDeadline,
+            })
+            currentDeadline = adaptive.deadline
+
+            if (adaptive.shouldRescue && hasValidMappingBaseline) {
+              const rescued = await rescueFromDomOrMapping(page, resolvedConvId, {
+                baselineNodeId,
+              })
+              if (rescued?.text) {
+                const finalConvId = rescued.convId || resolvedConvId
+                if (finalConvId) {
+                  saveSessionConversationId(profileDir, cfg.sessionId, finalConvId)
+                }
+                return finalizeTurnOutput({
+                  finalText: rescued.text,
+                  finalMessageId: rescued.messageId || acc.messageId || `msg_${Date.now()}`,
+                  convId: finalConvId,
+                  latestConv: rescued.conv || latestConv,
+                  baselineNodeId,
+                })
+              }
+            }
+
+            if (!batch.stopBtn && !lastDomActiveThinking && acc.done) {
+              if (!acc.finalText && hasValidMappingBaseline) {
+                const rescued = await rescueFromDomOrMapping(page, resolvedConvId, {
+                  baselineNodeId,
+                })
+                if (rescued?.text) {
+                  const finalConvId = rescued.convId || resolvedConvId
+                  if (finalConvId) {
+                    saveSessionConversationId(profileDir, cfg.sessionId, finalConvId)
+                  }
+                  return finalizeTurnOutput({
+                    finalText: rescued.text,
+                    finalMessageId: rescued.messageId || acc.messageId || `msg_${Date.now()}`,
+                    convId: finalConvId,
+                    latestConv: rescued.conv || latestConv,
+                    baselineNodeId,
+                  })
+                }
+              }
+              return finalizeTurnOutput({
+                finalText: acc.finalText,
+                finalMessageId: acc.messageId || `msg_${Date.now()}`,
+                convId: resolvedConvId,
+                latestConv,
+                baselineNodeId,
+              })
+            }
+
+            if (adaptive.expired) {
+              clearActiveTurnState(profileDir, cfg.sessionId)
+              await stopActiveGenerationInPage(page)
+              throw new Error(
+                `BOX_GPT_WEB_PRO_TIMEOUT: turn exceeded adaptive deadline (${Math.round((now - startedAt) / 1000)}s)`,
+              )
+            }
+
+            await new Promise((r) => setTimeout(r, 250))
+          }
         },
         lockOpts,
       ),
@@ -593,6 +883,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
 
 async function main() {
   const cfg = parseCliArgs(process.argv.slice(2))
+  const profileDir = profileDirFor(cfg.profile, os.homedir())
   const queue = new SerialJobQueue()
   let initEmitted = false
   const pendingTurnControls = new Set()
@@ -615,12 +906,15 @@ async function main() {
   const onSignal = () => {
     if (shuttingDown) return
     shuttingDown = true
-    void Promise.race([
-      abortAllPendingAndActiveTurns(),
-      new Promise((r) => setTimeout(r, 3_000)),
-    ]).finally(() => {
+    // When SIGTERM/SIGINT arrives (e.g. exec stream disconnect or bridge reconnect reap),
+    // detach cleanly WITHOUT clicking the page's Stop button and WITHOUT clearing activeTurnState,
+    // so the running ChatGPT Pro turn continues undisturbed and the reconnecting host can resume it.
+    for (const tc of pendingTurnControls) {
+      tc.detached = true
+    }
+    setTimeout(() => {
       process.exit(0)
-    })
+    }, 300).unref?.()
   }
 
   process.on('SIGTERM', onSignal)
@@ -643,6 +937,7 @@ async function main() {
       }
       void (async () => {
         if (frame.subtype === 'interrupt') {
+          clearActiveTurnState(profileDir, cfg.sessionId)
           await abortAllPendingAndActiveTurns()
         }
         writeStdoutLine(
@@ -665,6 +960,7 @@ async function main() {
           }),
         )
       }
+      writeStdoutLine(formatStreamJsonTextDelta(BOX_GPT_WEB_BUSY_MESSAGE))
       writeStdoutLine(
         formatStreamJsonAssistantMessage({
           messageId: `msg_busy_${Date.now()}`,
@@ -685,7 +981,7 @@ async function main() {
 
     // Synchronously register turnControl before enqueueing so an interrupt frame
     // arriving in the same stdin chunk cancels this queued turn before it starts.
-    const turnControl = { abort: false, page: null }
+    const turnControl = { abort: false, detached: false, page: null, thinkingBlockOpen: false }
     pendingTurnControls.add(turnControl)
 
     void queue.enqueue(async () => {
@@ -699,14 +995,44 @@ async function main() {
           }),
         )
       }
+      // Immediately exit Personal Edition's "正在启动引擎" startup phase and open the live Thinking panel
+      const provisionalMsgId = `msg_${turnStart}`
+      writeStdoutLine(
+        formatStreamJsonMessageStart({
+          messageId: provisionalMsgId,
+          model: cfg.catalogModel,
+        }),
+      )
+      writeStdoutLine(formatStreamJsonThinkingBlockStart({ index: 0 }))
+      turnControl.thinkingBlockOpen = true
+      writeStdoutLine(
+        formatStreamJsonThinkingDelta('[Pro] 正在连接浏览器会话并准备提交请求…\n'),
+      )
+
+      const keepaliveTimer = setInterval(() => {
+        writeStdoutLine(
+          formatStreamJsonKeepalive({
+            sessionId: cfg.sessionId,
+            elapsedMs: Date.now() - turnStart,
+          }),
+        )
+      }, 10_000)
+      keepaliveTimer.unref?.()
+
       try {
         const out = await executeTurnOnBrowser(cfg, frame, turnControl)
+        if (turnControl.detached) return
+        if (turnControl.thinkingBlockOpen) {
+          turnControl.thinkingBlockOpen = false
+          writeStdoutLine(formatStreamJsonContentBlockStop({ index: 0 }))
+        }
         writeStdoutLine(
           formatStreamJsonAssistantMessage({
             messageId: out.messageId,
             model: cfg.catalogModel,
             text: out.text,
             thinking: out.thinking,
+            outputAttachments: out.outputAttachments,
           }),
         )
         writeStdoutLine(
@@ -715,10 +1041,29 @@ async function main() {
             resultText: out.text,
             isError: false,
             durationMs: Date.now() - turnStart,
+            outputAttachments: out.outputAttachments,
           }),
         )
+        if (!turnControl.detached && !turnControl.abort) {
+          if (frame.turnId) {
+            saveActiveTurnState(profileDir, cfg.sessionId, {
+              ...out.turnState,
+              completedAt: Date.now(),
+            })
+          } else {
+            clearActiveTurnState(profileDir, cfg.sessionId)
+          }
+        }
       } catch (err) {
+        if (err instanceof DetachedTurnError || turnControl.detached) {
+          return
+        }
         const errMsg = err instanceof Error ? err.message : String(err)
+        if (turnControl.thinkingBlockOpen) {
+          turnControl.thinkingBlockOpen = false
+          writeStdoutLine(formatStreamJsonContentBlockStop({ index: 0 }))
+        }
+        writeStdoutLine(formatStreamJsonTextDelta(errMsg))
         writeStdoutLine(
           formatStreamJsonAssistantMessage({
             messageId: `msg_err_${Date.now()}`,
@@ -735,7 +1080,11 @@ async function main() {
           }),
         )
       } finally {
+        clearInterval(keepaliveTimer)
         pendingTurnControls.delete(turnControl)
+        if (shuttingDown && pendingTurnControls.size === 0) {
+          process.exit(0)
+        }
       }
     })
   })
