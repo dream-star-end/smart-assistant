@@ -42,6 +42,7 @@ async function bundleHarness() {
     loader: { ".css": "empty" },
     alias: {
       "node:crypto": fileURLToPath(new URL("./stubs/node-crypto.js", import.meta.url)),
+      "@openclaude/protocol/browser": fileURLToPath(new URL("../../protocol/src/browser.ts", import.meta.url)),
       "@openclaude/protocol": fileURLToPath(new URL("../../protocol/src/index.ts", import.meta.url)),
     },
     define: {

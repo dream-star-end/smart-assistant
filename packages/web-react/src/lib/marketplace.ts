@@ -5,7 +5,7 @@ import {
   type MarketplacePluginType,
   isMarketplaceCategoryId,
   marketplaceArtifactCompatibility,
-} from '@openclaude/protocol'
+} from '@openclaude/protocol/browser'
 import type { MarketplaceCard, MarketplaceInstalled } from './types'
 
 /** New additive field first; old API/cache rows fall back to the legacy kind projection. */

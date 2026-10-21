@@ -1,4 +1,4 @@
-import { classifyRecordedRunCost, RECORDED_COST_LABELS, formatRecordedCostTotal, type RecordedCostAmounts } from '@openclaude/protocol'
+import { classifyRecordedRunCost, RECORDED_COST_LABELS, formatRecordedCostTotal, type RecordedCostAmounts } from '@openclaude/protocol/browser'
 /**
  * Taskboard 前端类型 + `/api/board` 客户端。
  *
@@ -1494,9 +1494,11 @@ export const taskboardApi = {
     ),
 
   listTimeline: (a: AuthSession, idOrIdent: string) =>
-    boardGet<{ items: TimelineItem[] }>(a, ticketActionPath(idOrIdent, 'timeline')).then(
-      (b) => b.items || [],
-    ),
+    // 时间线接口默认只回最旧的 100 条，上限 500。忙的单据要看到最新评论，必须显式要满额。
+    boardGet<{ items: TimelineItem[] }>(
+      a,
+      `${ticketActionPath(idOrIdent, 'timeline')}?limit=500`,
+    ).then((b) => b.items || []),
 
   getSettings: (a: AuthSession) => boardGet<TaskboardSettingsSnapshot>(a, '/api/board/settings'),
 

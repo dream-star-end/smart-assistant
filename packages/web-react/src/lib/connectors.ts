@@ -1,4 +1,4 @@
-import type { PluginManifest } from "@openclaude/protocol";
+import type { PluginManifest } from "@openclaude/protocol/browser";
 import { HardDrive, Mail, MessagesSquare, NotebookText, Plug } from "lucide-react";
 import { type ComponentType, type ReactElement, createElement } from "react";
 

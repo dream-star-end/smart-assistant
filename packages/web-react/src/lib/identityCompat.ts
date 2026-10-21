@@ -1,4 +1,4 @@
-import { parseIdentityCompatProjection, type IdentityCompatProjection } from "@openclaude/protocol";
+import { parseIdentityCompatProjection, type IdentityCompatProjection } from "@openclaude/protocol/browser";
 import { bearerHeaders, callWithRefresh, jsonOrThrow } from "./api";
 import type { AuthSession } from "./types";
 

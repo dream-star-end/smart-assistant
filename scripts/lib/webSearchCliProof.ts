@@ -4,10 +4,14 @@ import { createServer } from "node:http";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { scaledMs } from "./gateLoadScale.js";
 
 /** Actual CLI process + authenticated loopback proxy; no provider/model or production state is used. */
 export async function proveWebSearchCli(root: string, entry = join(root, "packages/gateway/src/ocWebCli.ts")) {
   const home = await mkdtemp(join(tmpdir(), "oc-web-search-proof-"));
+  // OCV5-557: the child's own tsx cache. Without TMPDIR it compiled into the shared /tmp/tsx-<uid>
+  // (GBs, scanned linearly), and under load the cold start ran past the limit (exit=null).
+  const cache = await mkdtemp(join(tmpdir(), "oc-web-search-tsx-"));
   const identity = "fixture-proof-container";
   const query = "ocv5-510-proof-query";
   const sourceUrl = "https://example.test/ocv5-510-source";
@@ -25,11 +29,16 @@ export async function proveWebSearchCli(root: string, entry = join(root, "packag
     const address = server.address(); assert.ok(address && typeof address === "object");
     await mkdir(join(home, ".openclaude"));
     await writeFile(join(home, ".openclaude/container-auth.json"), JSON.stringify({ masterBaseUrl: `http://127.0.0.1:${address.port}`, containerToken: identity }), { mode: 0o600 });
+    // Codex removes OPENCLAUDE_*; retain only a minimal nonsecret process environment.
+    const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, LANG: "C.UTF-8", TMPDIR: cache };
+    // Compile the CLI once before the timed run; this run's outcome is not part of the proof.
+    await new Promise<void>((done) => {
+      execFile(process.execPath, ["--import", "tsx", entry, "--help"], { cwd: root, encoding: "utf8",
+        timeout: scaledMs(60_000), env }, () => done());
+    });
     const output = await new Promise<{ stdout: string; stderr: string }>((done, fail) => {
       execFile(process.execPath, ["--import", "tsx", entry, "search", query, "--json", "--timeout-ms", "3000"], {
-        cwd: root, encoding: "utf8", timeout: 15000,
-        // Codex removes OPENCLAUDE_*; retain only a minimal nonsecret process environment.
-        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, LANG: "C.UTF-8" },
+        cwd: root, encoding: "utf8", timeout: scaledMs(15000), env,
       }, (error, stdout, stderr) => {
         if (error) fail(new Error(`SEARCH_CLI_PROCESS_FAILED exit=${error.code}`));
         else done({ stdout, stderr });
@@ -48,5 +57,6 @@ export async function proveWebSearchCli(root: string, entry = join(root, "packag
     server.closeAllConnections();
     await new Promise<void>((done) => server.close(() => done()));
     await rm(home, { recursive: true, force: true });
+    await rm(cache, { recursive: true, force: true });
   }
 }

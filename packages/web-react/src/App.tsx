@@ -20,7 +20,7 @@ import {
   isCodexEngineModel,
   normalizeMessageReplyQuote,
   type MessageReplyQuote,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/browser";
 import { AgentGate } from "./components/AgentGate";
 import { LazyBoundary } from "./components/ChunkErrorBoundary";
 import { AgentPicker } from "./components/AgentPicker";

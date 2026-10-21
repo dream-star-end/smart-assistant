@@ -249,16 +249,24 @@ describe('AntigravityAdapter', () => {
       assert.equal(cap.env.XDG_CACHE_HOME, path.join(root, 'cache'))
       assert.deepEqual(JSON.parse(cap.settings), {})
       // The CLI only gets the limited token, never a refresh token.
-      assert.deepEqual(JSON.parse(cap.oauthToken), {
+      const oauth = JSON.parse(cap.oauthToken)
+      assert.deepEqual({ ...oauth, token: { ...oauth.token, expiry: '<checked below>' } }, {
         token: {
           access_token: LIMITED_TOKEN,
           token_type: 'Bearer',
           refresh_token: '',
-          expiry: '2026-10-14T06:00:00Z',
+          expiry: '<checked below>',
         },
         auth_method: 'consumer',
         id_token: 'eyJhbGciOi.id-token-payload.sig',
       })
+      // OCV5-556: without a refresh token Go oauth2 refuses locally once the
+      // file's expiry passes, so the file outlives any turn (the relay swaps
+      // Authorization; the limited token only passes the start-up userinfo check).
+      assert.ok(
+        Date.parse(oauth.token.expiry) >= Date.now() + 23 * 60 * 60 * 1000,
+        `CLI token file expiry must outlive the turn: ${oauth.token.expiry}`,
+      )
       assert.equal(cap.oauthTokenMode, 0o600)
       assert.ok(!cap.stdin.includes(LIMITED_TOKEN), 'limited token must not reach the prompt')
       assert.equal(cap.conversationsIsLink, true)
@@ -332,6 +340,77 @@ describe('AntigravityAdapter', () => {
       // resume.ndjson result.usage is 1800/64 (both turns); this turn is 900/32.
       assert.equal(summary.usage.inputTokens, 900)
       assert.equal(summary.usage.outputTokens, 32)
+    } finally {
+      await h.restore()
+    }
+  })
+
+  // OCV5-556 (webmvhtasuy8z35hs 2026-10-21 18:35-18:42): four resumed turns
+  // whose own relay calls all returned 200 were failed with an earlier launch's
+  // `oauth2: token expired` step (old route), which drove three useless
+  // automatic recoveries.
+  async function resumeFixtureWith(dir: string, extraSteps: object[], status = 'SUCCESS'): Promise<string> {
+    const lines = (await readFile(path.join(FIXTURES, 'resume.ndjson'), 'utf8')).trim().split('\n')
+    const result = lines.pop()!.replace('"status":"SUCCESS"', `"status":"${status}"`)
+    const file = path.join(dir, `resume-extra-${Math.random().toString(16).slice(2)}.ndjson`)
+    const extra = extraSteps.map((step) => JSON.stringify({ event: 'step_update', step_update: step }))
+    await writeFile(file, `${[...lines, ...extra, result].join('\n')}\n`)
+    return file
+  }
+  const STALE_ERROR = {
+    conversation_id: '4187c78c-e96d-4840-8c1c-3de86f92ddd9',
+    state: 'DONE',
+    step_type: 'error_message',
+    error: {
+      message: `agent executor error: generating and executing: request failed: Post "http://127.0.0.1:18789/internal/v5/antigravity-relay/route/${'c'.repeat(64)}/v1internal:streamGenerateContent?alt=sse": oauth2: token expired and refresh token is not set`,
+    },
+  }
+
+  test('ignores an earlier launch error step replayed by a resumed conversation', async () => {
+    const h = await harness({ resumeSessionId: '4187c78c-e96d-4840-8c1c-3de86f92ddd9' })
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const fixture = await resumeFixtureWith(h.dir, [{ ...STALE_ERROR, step_index: 2 }])
+      const { summary, sessionIds } = await runTurn(h, fixture)
+      assert.equal(summary?.isError, false, summary?.errorDetail)
+      assert.match(summary?.assistantText ?? '', /hi-from-tool/)
+      assert.deepEqual(sessionIds, ['4187c78c-e96d-4840-8c1c-3de86f92ddd9'])
+    } finally {
+      await h.restore()
+    }
+  })
+
+  test('an error step of this launch still fails the turn as a platform credential error', async () => {
+    const h = await harness({ resumeSessionId: '4187c78c-e96d-4840-8c1c-3de86f92ddd9' })
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const fixture = await resumeFixtureWith(h.dir, [{ ...STALE_ERROR, step_index: 9 }])
+      const { summary, sessionIds } = await runTurn(h, fixture)
+      assert.equal(summary?.isError, true)
+      assert.match(summary?.errorDetail ?? '', /^ANTIGRAVITY_CREDENTIAL_EXPIRED: .*oauth2: token expired/)
+      assert.deepEqual(sessionIds, [])
+    } finally {
+      await h.restore()
+    }
+  })
+
+  test('an error step before this launch user_input only counts when the run fails', async () => {
+    const h = await harness({ resumeSessionId: '4187c78c-e96d-4840-8c1c-3de86f92ddd9' })
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const lines = (await readFile(path.join(FIXTURES, 'resume.ndjson'), 'utf8')).trim().split('\n')
+      const prelude = JSON.stringify({ event: 'step_update', step_update: { ...STALE_ERROR, step_index: 3 } })
+      const ok = path.join(h.dir, 'prelude-ok.ndjson')
+      await writeFile(ok, `${[lines[0], prelude, ...lines.slice(1)].join('\n')}\n`)
+      assert.equal((await runTurn(h, ok)).summary?.isError, false)
+      const failed = path.join(h.dir, 'prelude-failed.ndjson')
+      await writeFile(
+        failed,
+        `${[lines[0], prelude, ...lines.slice(1, -1), lines.at(-1)!.replace('"status":"SUCCESS"', '"status":"ERROR"')].join('\n')}\n`,
+      )
+      const { summary } = await runTurn(h, failed)
+      assert.equal(summary?.isError, true)
+      assert.match(summary?.errorDetail ?? '', /^ANTIGRAVITY_CREDENTIAL_EXPIRED: /)
     } finally {
       await h.restore()
     }

@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   buildHistoricalContextPrompt,
   historicalContextInjectionKey,
+  providerGapMessagesAfterOwnTurn,
   shouldAttemptHistoricalContextInjection,
   shouldEmitContextRebuilt,
 } from '../sessionManager.js'
@@ -200,5 +201,70 @@ test('shouldAttemptHistoricalContextInjection dedupes by master history key even
       lastInjectedKey: 'master:srv-s-main-t1',
     }),
     false,
+  )
+})
+
+// OCV5-556 (webmvhtasuy8z35hs 2026-10-21 19:03): master's recovery give-up
+// card was the latest assistant row, so the next user message dropped the
+// native resume and replayed 70 messages into a fresh conversation.
+test('historicalContextInjectionKey ignores server-written notice cards after the own agent turn', () => {
+  for (const id of [
+    'm-recovery-giveup-dlgcb-dlgjob-mvhuw39a-66b007912df0-1',
+    'visible-fallback:5c0a3c1e-1111-4222-8333-444455556666',
+    'tape-degraded:tape-1',
+  ]) {
+    const messages = [
+      { role: 'user', id: 'u1', text: '做个长任务' },
+      { role: 'assistant', id: 'srv-s-main-t7', text: 'engine answer' },
+      { role: 'assistant', id, text: '自动恢复已停止', _source: 'server', status: 'completed' },
+      { role: 'user', id: 'u2', text: '继续', status: 'sending' },
+    ]
+    assert.equal(
+      historicalContextInjectionKey({ messages, peerId: 's', agentId: 'main', hasProviderResumeId: true }),
+      null,
+      `${id} must not invalidate the native resume`,
+    )
+    assert.equal(providerGapMessagesAfterOwnTurn({ messages, peerId: 's', agentId: 'main' }), null)
+  }
+})
+
+test('historicalContextInjectionKey still sees another agent answer behind a give-up card', () => {
+  assert.equal(
+    historicalContextInjectionKey({
+      messages: [
+        { role: 'assistant', id: 'srv-s-main-t1', text: 'main answer' },
+        { role: 'assistant', id: 'srv-s-codex-t1', text: 'codex answer' },
+        { role: 'assistant', id: 'm-recovery-giveup-x', text: '自动恢复已停止' },
+      ],
+      peerId: 's',
+      agentId: 'main',
+      hasProviderResumeId: true,
+    }),
+    'master:srv-s-codex-t1',
+  )
+})
+
+test('providerGapMessagesAfterOwnTurn returns only the rows after the own agent turn', () => {
+  const messages = [
+    { role: 'user', id: 'u0', text: 'old question' },
+    { role: 'assistant', id: 'srv-s-main-t3', text: 'main answer' },
+    { role: 'thinking', id: 'srv-s-main-t3-thinking', text: '…' },
+    { role: 'user', id: 'u1', text: '切到 codex 问一下' },
+    { role: 'assistant', id: 'srv-s-codex-t1', text: 'codex answer' },
+    { role: 'user', id: 'u2', text: '切回来继续', status: 'sending' },
+  ]
+  const delta = providerGapMessagesAfterOwnTurn({ messages, peerId: 's', agentId: 'main' })
+  assert.deepEqual(
+    delta?.map((m) => (m as { id: string }).id),
+    ['srv-s-main-t3-thinking', 'u1', 'srv-s-codex-t1', 'u2'],
+  )
+  const prompt = buildHistoricalContextPrompt(delta!, '切回来继续')
+  assert.ok(prompt)
+  assert.match(prompt!, /codex answer/)
+  assert.doesNotMatch(prompt!, /main answer|old question/)
+  // Own turn outside the window: coverage unknown, caller falls back to a full rebuild.
+  assert.equal(
+    providerGapMessagesAfterOwnTurn({ messages: messages.slice(3), peerId: 's', agentId: 'main' }),
+    null,
   )
 })

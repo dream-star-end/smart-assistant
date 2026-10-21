@@ -1503,6 +1503,7 @@ build_runtime_release() {
 RUNTIME_BG_PID=""
 RUNTIME_BG_LOG=""
 RUNTIME_BG_RESULT=""
+RUNTIME_BG_RC=""
 
 start_runtime_release_bg() { # <sha>
   local sha="$1"
@@ -1520,14 +1521,30 @@ start_runtime_release_bg() { # <sha>
   RUNTIME_BG_PID=$!
 }
 
+# OCV5-557:Box 门不和后台段并行。build_master_release 在 Box 门前调这里,只等它结束、记下退出码;
+# 日志回放、结果读取、失败处理仍由 collect_runtime_release_bg 照旧做。
+await_runtime_release_bg() {
+  [[ -n "${RUNTIME_BG_PID:-}" && -z "${RUNTIME_BG_RC:-}" ]] || return 0
+  local rc=0
+  log "  Box 门前先等后台 runtime release 构建结束(不与之并行)pid=$RUNTIME_BG_PID"
+  wait "$RUNTIME_BG_PID" || rc=$?
+  RUNTIME_BG_RC="$rc"
+  return 0
+}
+
 collect_runtime_release_bg() { # <sha>
   local sha="$1" rc=0 line
   if [[ -z "${RUNTIME_BG_PID:-}" ]]; then
     build_runtime_release "$sha"
     return 0
   fi
-  wait "$RUNTIME_BG_PID" || rc=$?
+  if [[ -n "${RUNTIME_BG_RC:-}" ]]; then
+    rc="$RUNTIME_BG_RC"
+  else
+    wait "$RUNTIME_BG_PID" || rc=$?
+  fi
   RUNTIME_BG_PID=""
+  RUNTIME_BG_RC=""
   log "── runtime release(后台段日志回放)──"
   cat "$RUNTIME_BG_LOG" 2>/dev/null || true
   if [[ "$rc" != 0 ]]; then
@@ -1553,9 +1570,12 @@ collect_runtime_release_bg() { # <sha>
 # EXIT 清理用:父 shell 提前失败时,等后台段自然结束(它自己的失败路径会清 staging),再回放日志。
 reap_runtime_release_bg() {
   [[ -n "${RUNTIME_BG_PID:-}" ]] || return 0
-  echo "  等待后台 runtime release 构建收尾(pid=$RUNTIME_BG_PID)…" >&2
-  wait "$RUNTIME_BG_PID" 2>/dev/null || true
+  if [[ -z "${RUNTIME_BG_RC:-}" ]]; then
+    echo "  等待后台 runtime release 构建收尾(pid=$RUNTIME_BG_PID)…" >&2
+    wait "$RUNTIME_BG_PID" 2>/dev/null || true
+  fi
   RUNTIME_BG_PID=""
+  RUNTIME_BG_RC=""
   [[ -n "${RUNTIME_BG_LOG:-}" ]] && cat "$RUNTIME_BG_LOG" >&2 2>/dev/null || true
   rm -f "${RUNTIME_BG_LOG:-}" "${RUNTIME_BG_RESULT:-}"
 }

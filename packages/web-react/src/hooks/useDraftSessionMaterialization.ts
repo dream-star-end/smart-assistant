@@ -1,5 +1,5 @@
 import { useCallback, type Dispatch, type RefObject, type SetStateAction } from 'react'
-import type { CursorContextTier, ServiceTier } from '@openclaude/protocol'
+import type { CursorContextTier, ServiceTier } from '@openclaude/protocol/browser'
 import type { Session } from '../lib/types'
 import type { UseChatSocket } from './useChatSocket'
 import type { PreferenceEffort } from '../lib/modelPreferences'

@@ -1,4 +1,4 @@
-import { publicCursorFamilyModelId } from "@openclaude/protocol";
+import { publicCursorFamilyModelId } from "@openclaude/protocol/browser";
 import {
   Check,
   Copy,
