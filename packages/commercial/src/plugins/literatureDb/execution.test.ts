@@ -22,13 +22,13 @@ const LITERATURE_DOWNLOAD_OUTPUT_SCHEMA = LITERATURE_PLUGIN_CONTRACT.actions.fin
 import { validateRuntimePluginJson } from '../contracts.js'
 import { LiteratureError } from './errors.js'
 import {
+  DOCUMENT_ID_TTL_MS,
   SPRINGER_WEBVPN_PREFIX,
   WANFANG_WEBVPN_DOWNLOAD_PREFIX,
   WANFANG_WEBVPN_FULLTEXT_PREFIX,
   WANFANG_WEBVPN_GRPC_PATH,
   WanfangLiteratureHttpExecutor,
   createPinnedDownstreamRequester,
-  DOCUMENT_ID_TTL_MS,
   deriveLiteratureDocumentIdSecret,
   mintScopedDocumentId,
   normalizeSpringerDoi,
@@ -361,10 +361,7 @@ test('Springer 10.1186 DOI normalization preserves 10. prefix across HTML parsin
     nowMs: now,
   })
   // Simulate LLM hex transcription dropping "31302e" ("10.") from "73705f31302e313138365f"
-  const corruptedMissing10 = minted.replace(
-    '-73705f31302e313138365f',
-    '-73705f313138365f',
-  )
+  const corruptedMissing10 = minted.replace('-73705f31302e313138365f', '-73705f313138365f')
   assert.notEqual(corruptedMissing10, minted)
   const recovered = verifyScopedDocumentId(secret, corruptedMissing10, {
     ownerUserId: '4',
@@ -887,7 +884,8 @@ test('validatePdfStructureSync and LiteratureArtifactStore accept publisher PDFs
       'xref\r6698 3\r0000000016 00000 n\r0000010307 00000 n\r0000010617 00000 n\rtrailer\r<</Size 6879/Prev 2603052/Root 6699 0 R>>\rstartxref\r0\r%%EOF\r'
     const body =
       '6699 0 obj\r<</Type/Catalog/Pages 6690 0 R>>\rendobj\r6690 0 obj\r<</Type/Pages/Count 45/Kids[6701 0 R]>>\rendobj\r6701 0 obj\r<</Type/Page/Parent 6690 0 R>>\rendobj\r'
-    const tailXref = 'xref\r0 1\r0000000000 65535 f\rtrailer\r<</Size 6698>>\rstartxref\r116\r%%EOF\r'
+    const tailXref =
+      'xref\r0 1\r0000000000 65535 f\rtrailer\r<</Size 6698>>\rstartxref\r116\r%%EOF\r'
     return Buffer.from(head + firstXref + body + tailXref, 'latin1')
   })()
   assert.equal(validatePdfStructureSync(linearizedDrifted146Pdf), true)
@@ -924,7 +922,10 @@ test('validatePdfStructureSync and LiteratureArtifactStore accept publisher PDFs
       'latin1',
     ),
     objStmPayload,
-    Buffer.from('\nendstream\nendobj\ntrailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n100\n%%EOF\n', 'latin1'),
+    Buffer.from(
+      '\nendstream\nendobj\ntrailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n100\n%%EOF\n',
+      'latin1',
+    ),
   ])
   assert.equal(validatePdfStructureSync(pdfWithObjStmJs), false)
 
