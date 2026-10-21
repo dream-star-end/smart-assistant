@@ -55,7 +55,10 @@
     "master",
     "egress"
    ],
-   "note": "→ @openclaude/kernel log (P1)"
+   "allow": [
+    "kernel"
+   ],
+   "note": "→ @openclaude/kernel log (P1). allow kernel: logger.ts is a thin wrapper over kernel log (OCV5-555)"
   },
   "commercial-flavor": {
    "layer": "L1",

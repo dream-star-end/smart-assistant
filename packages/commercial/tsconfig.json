@@ -13,6 +13,7 @@
     { "path": "../gateway" },
     { "path": "../storage" },
     { "path": "../channels/wechat" },
-    { "path": "../protocol" }
+    { "path": "../protocol" },
+    { "path": "../kernel" }
   ]
 }
