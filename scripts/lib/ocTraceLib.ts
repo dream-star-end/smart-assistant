@@ -86,6 +86,20 @@ export function toIso(ts: string | undefined): string | undefined {
 const pick = (r: Record<string, string>, keys: string[]) =>
   Object.fromEntries(keys.filter((k) => r[k]).map((k) => [k, r[k]!]))
 
+/** psql renders the selected `error_msg IS NOT NULL AS has_error` as t/f. */
+const hasError = (r: Record<string, string>) =>
+  r.has_error === 't' || r.has_error === 'true' || !!r.error_msg
+
+/** Every trace / dispatch / request id the rows of all tables mention (for the next query round). */
+export function idsFromRows(rows: Partial<Record<Source, Record<string, string>[]>>): Set<string> {
+  const out = new Set<string>()
+  for (const list of Object.values(rows))
+    for (const r of list ?? [])
+      for (const k of ['trace_id', 'dispatch_id', 'request_id', 'billing_request_id'])
+        if (r[k]) out.add(r[k]!)
+  return out
+}
+
 /** Events from one table's rows: every timestamp column that is set becomes one event. */
 export function eventsFromRows(source: Source, rows: Record<string, string>[]): TraceEvent[] {
   const out: TraceEvent[] = []
@@ -135,8 +149,8 @@ export function eventsFromRows(source: Source, rows: Record<string, string>[]): 
       case 'request_finalize_journal':
         add(r, 'created_at', 'finalize.opened')
         add(r, 'updated_at', `finalize.${r.state || 'updated'}`, {
-          code: code || (r.error_msg ? 'FINALIZE_ERROR' : undefined),
-          level: code || r.error_msg ? 'error' : 'info',
+          code: code || (hasError(r) ? 'FINALIZE_ERROR' : undefined),
+          level: code || hasError(r) ? 'error' : 'info',
         })
         break
       case 'usage_records':
@@ -145,7 +159,7 @@ export function eventsFromRows(source: Source, rows: Record<string, string>[]): 
             r.status && r.status !== 'success' && r.status !== 'ok'
               ? `USAGE_${r.status.toUpperCase()}`
               : undefined,
-          level: r.error_msg ? 'error' : 'info',
+          level: hasError(r) ? 'error' : 'info',
         })
         break
       case 'turn_upstream_performance':

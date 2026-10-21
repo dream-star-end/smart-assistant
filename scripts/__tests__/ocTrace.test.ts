@@ -7,6 +7,7 @@ import {
   eventFromLogLine,
   eventsFromRows,
   firstError,
+  idsFromRows,
   parseCsv,
   pastRetention,
   timeline,
@@ -106,7 +107,7 @@ describe('oc-trace lib', () => {
       ids: { traceId: T, dispatchId: D },
       message: 'boom',
     })
-    assert.equal(eventFromLogLine('master-log', 'plain text with ' + T), null)
+    assert.equal(eventFromLogLine('master-log', `plain text with ${T}`), null)
     assert.equal(eventFromLogLine('master-log', JSON.stringify({ msg: 'no ts', traceId: T })), null)
   })
 
@@ -189,5 +190,45 @@ describe('oc-trace lib', () => {
         ['native_relay_stage_timing', 1, undefined],
       ],
     )
+  })
+
+  test('Codex r1: a usage / journal error flag (has_error = t) makes an error event that can be the first error', () => {
+    const usage = eventsFromRows('usage_records', [
+      { request_id: 'r', status: 'error', has_error: 't', created_at: '2026-10-21 10:00:00+00' },
+    ])
+    const journal = eventsFromRows('request_finalize_journal', [
+      {
+        request_id: 'r',
+        state: 'open',
+        has_error: 't',
+        created_at: '2026-10-21 09:59:00+00',
+        updated_at: '2026-10-21 10:00:10+00',
+      },
+    ])
+    assert.equal(usage[0]!.level, 'error')
+    assert.equal(journal[1]!.code, 'FINALIZE_ERROR')
+    const restart = eventsFromRows('turn_dispatches', [
+      {
+        dispatch_id: 'd',
+        status: 'failed',
+        failure_code: 'SERVICE_RESTART',
+        terminal_at: '2026-10-21 10:01:00+00',
+      },
+    ])
+    assert.equal(firstError([...restart, ...usage])!.source, 'usage_records')
+    const ok = eventsFromRows('usage_records', [
+      { request_id: 'r', status: 'success', has_error: 'f', created_at: '2026-10-21 10:00:00+00' },
+    ])
+    assert.equal(ok[0]!.level, 'info')
+  })
+
+  test('Codex r1: ids for the next round come from every table, e.g. an upstream request id only in the journal', () => {
+    const ids = idsFromRows({
+      turn_traces: [{ trace_id: T, dispatch_id: D, request_id: 'B' }],
+      request_finalize_journal: [{ request_id: 'R-upstream', dispatch_id: D }],
+      turn_upstream_performance: [{ request_id: 'R2', dispatch_id: D }],
+      turn_dispatches: [{ dispatch_id: D, billing_request_id: 'B' }],
+    })
+    assert.deepEqual([...ids].sort(), [D, 'B', 'R-upstream', 'R2', T].sort())
   })
 })

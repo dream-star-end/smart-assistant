@@ -25,6 +25,7 @@ import {
   eventFromLogLine,
   eventsFromRows,
   firstError,
+  idsFromRows,
   parseCsv,
   pastRetention,
   timeline,
@@ -89,43 +90,45 @@ function collect(input: string): Found {
     rows[source] = r.slice(0, ROW_CAP)
     return rows[source]!
   }
-  for (let round = 0; round < 3; round++) {
+  // Every table can contribute ids (an upstream request id may appear only in the finalize journal
+  // or upstream rows, and the egress log lines carry only that id), so all six are queried each
+  // round until the id set stops growing.
+  for (let round = 0; round < 4; round++) {
+    truncated.length = 0
     const before = ids.size
-    const tr = q(
+    q(
       'turn_traces',
       `SELECT trace_id, dispatch_id, request_id, user_id, session_key, runtime_container_id, model, created_at, first_visible_at, first_visible_kind, runtime_observed_at
          FROM turn_traces WHERE trace_id = ANY(:'ids'::text[]) OR request_id = ANY(:'ids'::text[]) OR dispatch_id::text = ANY(:'ids'::text[])`,
     )
-    const di = q(
+    q(
       'turn_dispatches',
       `SELECT dispatch_id, user_id, session_id, billing_request_id, attempt_no, status, outcome, failure_code, model, agent_container_id, admitted_at, accepted_at, last_attempt_at, terminal_at
          FROM turn_dispatches WHERE dispatch_id::text = ANY(:'ids'::text[]) OR billing_request_id = ANY(:'ids'::text[])`,
     )
-    for (const r of [...tr, ...di])
-      for (const k of ['trace_id', 'dispatch_id', 'request_id', 'billing_request_id'])
-        if (r[k] && ID_RE.test(r[k])) ids.add(r[k])
+    q(
+      'request_finalize_journal',
+      `SELECT request_id, dispatch_id, attempt_no, state, failure_code, error_msg IS NOT NULL AS has_error, created_at, updated_at
+         FROM request_finalize_journal WHERE request_id = ANY(:'ids'::text[]) OR dispatch_id::text = ANY(:'ids'::text[])`,
+    )
+    q(
+      'usage_records',
+      `SELECT request_id, dispatch_id, attempt_no, status, model, cost_credits, error_msg IS NOT NULL AS has_error, created_at
+         FROM usage_records WHERE request_id = ANY(:'ids'::text[]) OR dispatch_id::text = ANY(:'ids'::text[])`,
+    )
+    q(
+      'turn_upstream_performance',
+      `SELECT request_id, dispatch_id, model, ttft_ms, stream_ms, outcome, observed_at
+         FROM turn_upstream_performance WHERE request_id = ANY(:'ids'::text[]) OR dispatch_id::text = ANY(:'ids'::text[])`,
+    )
+    q(
+      'turn_runtime_observations',
+      `SELECT trace_id, dispatch_id, session_key, duration_ms, tool_calls, observed_at
+         FROM turn_runtime_observations WHERE trace_id = ANY(:'ids'::text[]) OR dispatch_id::text = ANY(:'ids'::text[])`,
+    )
+    for (const id of idsFromRows(rows)) if (ID_RE.test(id)) ids.add(id)
     if (ids.size === before) break
   }
-  q(
-    'request_finalize_journal',
-    `SELECT request_id, dispatch_id, attempt_no, state, failure_code, error_msg IS NOT NULL AS has_error, created_at, updated_at
-       FROM request_finalize_journal WHERE request_id = ANY(:'ids'::text[]) OR dispatch_id::text = ANY(:'ids'::text[])`,
-  )
-  q(
-    'usage_records',
-    `SELECT request_id, dispatch_id, attempt_no, status, model, cost_credits, error_msg IS NOT NULL AS has_error, created_at
-       FROM usage_records WHERE request_id = ANY(:'ids'::text[]) OR dispatch_id::text = ANY(:'ids'::text[])`,
-  )
-  q(
-    'turn_upstream_performance',
-    `SELECT request_id, dispatch_id, model, ttft_ms, stream_ms, outcome, observed_at
-       FROM turn_upstream_performance WHERE request_id = ANY(:'ids'::text[]) OR dispatch_id::text = ANY(:'ids'::text[])`,
-  )
-  q(
-    'turn_runtime_observations',
-    `SELECT trace_id, dispatch_id, session_key, duration_ms, tool_calls, observed_at
-       FROM turn_runtime_observations WHERE trace_id = ANY(:'ids'::text[]) OR dispatch_id::text = ANY(:'ids'::text[])`,
-  )
   return { ids, rows, truncated }
 }
 
