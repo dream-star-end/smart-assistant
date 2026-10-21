@@ -776,9 +776,126 @@ describe('Antigravity route context', () => {
       await resolveAntigravityRelayRoute({ token: minted.token, containerId: 11, userId: 42 }),
     )
     await expireAntigravityRelayRouteForRequest(REQUEST_ID)
-    assert.equal(store.size, 0)
+    // Only the request's expired mark is left (it fences late renewals).
+    assert.deepEqual([...store.values()], ['expired'])
     assert.equal(
       await resolveAntigravityRelayRoute({ token: minted.token, containerId: 11, userId: 42 }),
+      null,
+    )
+  })
+
+  // OCV5-556: an 82-minute turn outlived the fixed 60-minute route; the CLI's
+  // next call 404'd ROUTE_EXPIRED and the turn ended with no reply.
+  test('a route in use slides past the idle window, up to the lifetime cap', async () => {
+    _resetAntigravityRelayRoutesForTests()
+    const minute = 60_000
+    const { token } = await mintAntigravityRelayRoute({
+      containerId: 11,
+      userId: 42,
+      requestId: REQUEST_ID,
+      modelId: 'antigravity-gemini-3.8-flash',
+      accountId: 7n,
+      budgetCredits: 1_000n,
+      relayPort: 18789,
+      nowMs: 0,
+    })
+    const at = (m: number) =>
+      resolveAntigravityRelayRoute({ token, containerId: 11, userId: 42, nowMs: m * minute })
+    assert.equal((await at(20))?.expiresAt, 60 * minute, 'more than half left: no renewal')
+    assert.equal((await at(40))?.expiresAt, 100 * minute)
+    assert.ok(await at(95), 'past the original 60 minutes while in use')
+    for (let m = 130; m < 360; m += 50) assert.ok(await at(m), `minute ${m}`)
+    assert.equal((await at(359))?.expiresAt, 360 * minute, 'capped at the lifetime')
+    assert.equal(await at(361), null)
+
+    _resetAntigravityRelayRoutesForTests()
+    const idle = await mintAntigravityRelayRoute({
+      containerId: 11,
+      userId: 42,
+      requestId: REQUEST_ID,
+      modelId: 'antigravity-gemini-3.8-flash',
+      accountId: 7n,
+      budgetCredits: 1_000n,
+      relayPort: 18789,
+      nowMs: 0,
+    })
+    assert.equal(
+      await resolveAntigravityRelayRoute({
+        token: idle.token,
+        containerId: 11,
+        userId: 42,
+        nowMs: 61 * minute,
+      }),
+      null,
+      'an unused route still expires after the idle window',
+    )
+  })
+
+  test('KV renewal: refreshes the token key, never revives a route the turn end expired', async () => {
+    const minute = 60_000
+    const store = new Map<string, { value: string; ttlSec: number }>()
+    let beforeTokenRead: (() => Promise<void>) | null = null
+    configureAntigravityRelayKv({
+      get: async (k) => {
+        const hit = store.get(k)?.value ?? null
+        if (beforeTokenRead && !k.includes(':req:')) {
+          const hook = beforeTokenRead
+          beforeTokenRead = null
+          await hook()
+        }
+        return hit
+      },
+      set: async (k, value, ttlSec) => {
+        store.set(k, { value, ttlSec })
+      },
+      del: async (k) => {
+        store.delete(k)
+      },
+    })
+    const { token } = await mintAntigravityRelayRoute({
+      containerId: 11,
+      userId: 42,
+      requestId: REQUEST_ID,
+      modelId: 'antigravity-gemini-3.8-flash',
+      accountId: 7n,
+      budgetCredits: 1_000n,
+      relayPort: 18789,
+      nowMs: 0,
+    })
+    const tokenEntry = () => [...store.entries()].find(([k]) => !k.includes(':req:'))?.[1]
+    const requestEntry = () => [...store.entries()].find(([k]) => k.includes(':req:'))?.[1]
+    assert.equal(tokenEntry()?.ttlSec, 3600)
+    assert.equal(requestEntry()?.ttlSec, 6 * 3600, 'request key outlives every renewal')
+
+    const renewed = await resolveAntigravityRelayRoute({
+      token,
+      containerId: 11,
+      userId: 42,
+      nowMs: 45 * minute,
+    })
+    assert.equal(renewed?.expiresAt, 105 * minute)
+    assert.equal(tokenEntry()?.ttlSec, 3600)
+    assert.equal(JSON.parse(tokenEntry()!.value).expiresAt, 105 * minute)
+
+    // The turn ends while a call that read the route is about to renew it.
+    beforeTokenRead = () => expireAntigravityRelayRouteForRequest(REQUEST_ID)
+    assert.equal(
+      await resolveAntigravityRelayRoute({
+        token,
+        containerId: 11,
+        userId: 42,
+        nowMs: 80 * minute,
+      }),
+      null,
+    )
+    assert.equal(tokenEntry(), undefined, 'the racing renewal did not leave the route behind')
+    assert.equal(
+      await resolveAntigravityRelayRoute({
+        token,
+        containerId: 11,
+        userId: 42,
+        nowMs: 81 * minute,
+      }),
       null,
     )
   })
