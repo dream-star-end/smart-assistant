@@ -306,6 +306,11 @@ export function ManagedBrowserSetupDialog({
             登录状态。登录状态加密保存在服务端，插件只访问固定域名；扫码不会开启写入，写入需在账号行另行开启，且每次执行仍需确认。
           </p>
         )}
+        {!setup && provider.setupNotice && (
+          <Alert tone="warning" density="compact">
+            {provider.setupNotice}
+          </Alert>
+        )}
         {setup && !terminalFailure && (
           <ol
             className="grid grid-cols-4 gap-1 rounded-lg border border-border bg-surface px-2 py-2"

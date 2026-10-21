@@ -9,7 +9,7 @@ tags: [connectors, plugins, email, webdav, notion, github, feishu, calendar, zsx
 访问用户在管理中心绑定的第三方账号。对用户一律把这些统称为「插件」，绑定 / 授权入口是「管理中心 → 插件」
 （不要换成别的叫法，界面上只有「插件」）。平台在服务端托管全部凭据与浏览器登录状态：
 - API 插件（邮箱、WebDAV、Notion、GitHub、飞书、B 站公开数据 bili）用 `oc-connect`；
-- 浏览器与受管插件（知识星球、微博、知乎、B 站账号 bili-account、文献数据库 literature-db）用 `oc-plugin`。
+- 浏览器与受管插件（知识星球、微博、知乎、B 站账号 bili-account、抖音 douyin、文献数据库 literature-db）用 `oc-plugin`。
 
 **不要让用户提供账号 ID 或手工挑 action**：先自行执行 `list` 发现能力；同一 provider/插件
 只有一个可用账号时直接调用。仅在多个账号必须消歧、未安装或未授权时才请用户介入。
@@ -174,6 +174,13 @@ echo '{}' | oc-plugin call knowledge-planet create_topic --confirm <确认码>
   search / video / rank / popular / comments / danmaku。评论要 aid、弹幕要 cid，先调 video 拿；参数看 `oc-connect describe bili <action>`。
 - `bili-account`：字幕、收藏夹、观看历史，要用 B 站 App 扫码登录（同微博的扫码流程）。用 `oc-plugin call bili-account <action>`。
 - 报 UPSTREAM_RATE_LIMITED（B 站风控）时如实告诉用户稍后再试，不要连续重试，也不要索要 cookie。
+
+### 抖音（douyin）
+
+只在 AI 市场，用户没装时先引导去安装；装好后在 管理中心 → 插件 → 抖音 用抖音 App 扫码登录个人账号（二维码约 1 分钟才出现）。
+- 当前版本只读：`oc-plugin call douyin me` 读取登录账号的昵称、uid、粉丝 / 关注 / 作品 / 获赞数，也用来确认登录是否有效。作品、评论、搜索、发布等能力还没有，不要假装能做。
+- 这是浏览器自动化，不在抖音官方开放能力之内，可能触发账号风控。不要连续反复调用，也不要索要 cookie、短信或验证码。
+- RELINK_REQUIRED / LOGIN_EXPIRED_ACCOUNT：请用户到 管理中心 → 插件 → 抖音 重新扫码。DOUYIN_VERIFICATION_REQUIRED：请用户先在手机抖音完成本人验证再扫码。DOUYIN_UPSTREAM_CHALLENGE：抖音触发风控，如实告知、立即停止，不要重试或换动作绕过。
 
 ## 各 provider 一览
 

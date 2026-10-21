@@ -941,6 +941,54 @@ export const integrationsApi = {
       ),
     ),
 
+  // OCV5-553: 抖音插件(个人号扫码登录)。与 B 站账号同一组接口形状。
+  startDouyinSetup: (a: AuthSession, accountId?: string): Promise<KnowledgePlanetSetupView> =>
+    jsonOrThrow<KnowledgePlanetSetupView>(
+      callWithRefresh(a, (t) =>
+        fetch("/api/plugins/douyin/setup", {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ acceptTerms: true, ...(accountId ? { accountId } : {}) }),
+        }),
+      ),
+    ),
+
+  getDouyinSetup: (a: AuthSession, sessionId: string): Promise<KnowledgePlanetSetupView> =>
+    jsonOrThrow<KnowledgePlanetSetupView>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/douyin/setup/${encodeURIComponent(sessionId)}`, {
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
+  async getDouyinSetupQr(a: AuthSession, sessionId: string): Promise<Blob> {
+    const res = await callWithRefresh(a, (t) =>
+      fetch(`/api/plugins/douyin/setup/${encodeURIComponent(sessionId)}/qr`, {
+        credentials: "include",
+        headers: { ...bearerHeaders(t), Accept: "image/png" },
+      }),
+    );
+    assertAuthResponseCurrent(res);
+    if (!res.ok) await throwApi(res);
+    const blob = await res.blob();
+    assertAuthResponseCurrent(res);
+    return blob;
+  },
+
+  cancelDouyinSetup: (a: AuthSession, sessionId: string): Promise<KnowledgePlanetSetupView> =>
+    jsonOrThrow<KnowledgePlanetSetupView>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/douyin/setup/${encodeURIComponent(sessionId)}`, {
+          method: "DELETE",
+          credentials: "include",
+          headers: bearerHeaders(t),
+        }),
+      ),
+    ),
+
   revokePluginAccount: (a: AuthSession, id: string): Promise<void> =>
     jsonOrThrow<unknown>(
       callWithRefresh(a, (t) =>

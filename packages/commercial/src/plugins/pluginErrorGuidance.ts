@@ -6,6 +6,7 @@
  * CONNECTION_ERROR fallback; messages never include pin/hash/DNS internals.
  */
 import { BILI_ACCOUNT_FAILURE_CODES } from './biliAccountObservability.js'
+import { DOUYIN_FAILURE_CODES } from './douyinObservability.js'
 import { WEIBO_WRITE_FAILURE_CODES } from './weiboWriteObservability.js'
 import { ZHIHU_WRITE_FAILURE_CODES } from './zhihuWriteObservability.js'
 
@@ -42,6 +43,7 @@ export const PLUGIN_PASSTHROUGH_ERROR_CODES = [
   ...WEIBO_WRITE_FAILURE_CODES,
   ...ZHIHU_WRITE_FAILURE_CODES,
   ...BILI_ACCOUNT_FAILURE_CODES,
+  ...DOUYIN_FAILURE_CODES,
   'LOGIN_EXPIRED',
   'LOGIN_EXPIRED_ACCOUNT',
   'PRECONDITION_CHANGED',
@@ -411,6 +413,51 @@ const ROWS: Record<string, Row> = {
     message: 'B 站账号插件未正常结束',
     nextAction: '只读操作,可稍后重试',
   },
+  // OCV5-553 · 抖音插件(本版只读:扫码登录 + me)。
+  DOUYIN_ACTION_FAILED: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: '抖音插件读取失败',
+    nextAction: '可以再试一次;仍失败时引导用户到 管理中心 → 插件 → 抖音 重新扫码登录',
+  },
+  DOUYIN_UPSTREAM_CHALLENGE: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '抖音触发了验证码或风控,已停止,无法自动继续',
+    nextAction:
+      '如实告诉用户抖音触发了风控,请稍后再试;不要自动重试、不要换动作绕过,也不要索要 cookie 或验证码',
+  },
+  DOUYIN_VERIFICATION_REQUIRED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '抖音要求账号本人完成身份验证,本次登录未生效',
+    nextAction:
+      '请用户在手机抖音上完成身份验证后,再到 管理中心 → 插件 → 抖音 重新扫码;不要自动重试,也不要索要短信验证码',
+  },
+  DOUYIN_LOGIN_UNSUPPORTED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '抖音返回的登录凭据无法安全保存,本次登录未生效',
+    nextAction: '告诉用户这是平台侧限制,不要反复扫码;请联系管理员',
+  },
+  DOUYIN_WORKER_BUSY: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: '抖音插件正忙',
+    nextAction: '请稍后重试',
+  },
+  DOUYIN_WORKER_DEADLINE: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: '抖音插件执行超时',
+    nextAction: '只读操作,可稍后重试',
+  },
+  DOUYIN_WORKER_INCOMPLETE: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: '抖音插件未正常结束',
+    nextAction: '只读操作,可稍后重试',
+  },
   PLUGIN_RUNTIME_UNAVAILABLE: {
     retrySafe: 'yes',
     requiresReauth: false,
@@ -583,6 +630,12 @@ const PROVIDER_WORDING: Record<string, ProviderWording> = {
     write: 'B 站账号插件写入',
     relink: '引导用户重新扫码授权 B 站账号',
   },
+  douyin: {
+    name: '抖音',
+    plugin: '抖音插件',
+    write: '抖音写入',
+    relink: '引导用户到 管理中心 → 插件 → 抖音 重新扫码登录,不要重复调用',
+  },
   'knowledge-planet': {
     name: '知识星球',
     plugin: '知识星球插件',
@@ -736,6 +789,10 @@ export function zhihuRuntimePublicMessage(code: string): string {
 
 export function biliAccountRuntimePublicMessage(code: string): string {
   return resolvePluginErrorGuidance({ code, provider: 'bili-account' }).message
+}
+
+export function douyinRuntimePublicMessage(code: string): string {
+  return resolvePluginErrorGuidance({ code, provider: 'douyin' }).message
 }
 
 export type PluginErrorGuidanceFields = Pick<

@@ -596,6 +596,13 @@ import {
   createBiliAccountRuntimeRegistries,
 } from './plugins/biliAccount.js'
 import { BiliAccountSetupManager } from './plugins/biliAccountSetup.js'
+import {
+  DOUYIN_BROKER_ROOT,
+  DOUYIN_WORKER_ROOT,
+  DouyinDockerService,
+  createDouyinRuntimeRegistries,
+} from './plugins/douyin.js'
+import { DouyinSetupManager } from './plugins/douyinSetup.js'
 import { seedDefaultConnectors } from './connectors/declarativeSeed.js'
 import { startConnectorSweeper } from './connectors/sweeper.js'
 import {
@@ -1712,6 +1719,8 @@ export async function registerCommercial(
   let zhihuSetup: ZhihuSetupManager | undefined
   let biliAccountService: BiliAccountDockerService | undefined
   let biliAccountSetup: BiliAccountSetupManager | undefined
+  let douyinService: DouyinDockerService | undefined
+  let douyinSetup: DouyinSetupManager | undefined
   let knowledgePlanetAutomation: KnowledgePlanetAutomationService | undefined
   const { literatureSetup, literatureArtifacts, literatureHttp, literatureRelogin } = createCommercialLiteratureRuntime({ runtimeChannel, redis })
   let pluginFacade: PluginRuntimeFacade
@@ -1752,22 +1761,34 @@ export async function registerCommercial(
       socketUid: 1000,
       socketGid: 1000,
     })
+    // OCV5-553: Douyin Plugin (market only; this version is QR login + read-only `me`).
+    douyinService = new DouyinDockerService(pluginDocker, {
+      imageId: cfg.OC_RUNTIME_IMAGE_ID,
+      workerRoot: DOUYIN_WORKER_ROOT,
+      brokerRoot: DOUYIN_BROKER_ROOT,
+      expectedOwnerUid: 0,
+      socketUid: 1000,
+      socketGid: 1000,
+    })
     const knowledgePlanetRegistries = createKnowledgePlanetRuntimeRegistries(knowledgePlanetService)
     const weiboRegistries = createWeiboRuntimeRegistries(weiboService)
     const zhihuRegistries = createZhihuRuntimeRegistries(zhihuService)
     const biliAccountRegistries = createBiliAccountRuntimeRegistries(biliAccountService)
+    const douyinRegistries = createDouyinRuntimeRegistries(douyinService)
     const browserRuntime = new ManagedBrowserRuntime({
       drivers: new Map([
         ...knowledgePlanetRegistries.drivers,
         ...weiboRegistries.drivers,
         ...zhihuRegistries.drivers,
         ...biliAccountRegistries.drivers,
+        ...douyinRegistries.drivers,
       ]),
       launchers: new Map([
         ...knowledgePlanetRegistries.launchers,
         ...weiboRegistries.launchers,
         ...zhihuRegistries.launchers,
         ...biliAccountRegistries.launchers,
+        ...douyinRegistries.launchers,
       ]),
       profileRoot: '/var/lib/openclaude-v5/plugin-browser-profiles',
       expectedOwnerUid: 0,
@@ -1792,6 +1813,10 @@ export async function registerCommercial(
       isAgentReady: (contract) => browserRuntime.supportsContract(contract),
     })
     biliAccountSetup = new BiliAccountSetupManager(biliAccountService, {
+      redis,
+      isAgentReady: (contract) => browserRuntime.supportsContract(contract),
+    })
+    douyinSetup = new DouyinSetupManager(douyinService, {
       redis,
       isAgentReady: (contract) => browserRuntime.supportsContract(contract),
     })
@@ -4437,6 +4462,7 @@ export async function registerCommercial(
     literatureArtifacts,
     zhihuSetup,
     biliAccountSetup,
+    douyinSetup,
     knowledgePlanetAutomation,
     mailer,
     redis: wrapIoredis(redis),
@@ -7221,6 +7247,7 @@ export async function registerCommercial(
           Promise.resolve().then(() => literatureArtifacts?.close()),
           zhihuSetup?.closeAndDrain(),
           biliAccountSetup?.closeAndDrain(),
+          douyinSetup?.closeAndDrain(),
         ])
       } catch {
         /* ignore */

@@ -53,6 +53,12 @@ import {
   isOfficialBiliAccountPluginIdentity,
 } from '../plugins/biliAccountContract.js'
 import {
+  COMPILED_DOUYIN_PLUGIN,
+  DOUYIN_PLUGIN_SLUG,
+  DOUYIN_PLUGIN_VERSION,
+  isOfficialDouyinPluginIdentity,
+} from '../plugins/douyinContract.js'
+import {
   LITERATURE_PLUGIN_SLUG,
   LITERATURE_PLUGIN_VERSION,
 } from '../plugins/literatureDb/builtinArtifact.js'
@@ -610,6 +616,7 @@ async function publishSkillVersionInternal(
       WEIBO_PLUGIN_SLUG,
       ZHIHU_PLUGIN_SLUG,
       BILI_ACCOUNT_PLUGIN_SLUG,
+      DOUYIN_PLUGIN_SLUG,
       LITERATURE_PLUGIN_SLUG,
       ...OFFICIAL_MARKET_CONNECTOR_SLUGS,
     ].includes(input.slug) &&
@@ -806,6 +813,26 @@ export async function publishOfficialBiliAccountVersion(
     throw new MarketplaceError(
       'ARTIFACT_MISMATCH',
       'Bilibili account platform seed identity does not match the pinned artifact',
+    )
+  return publishSkillVersionInternal(input, true)
+}
+
+/** Narrow platform-seed bypass for the exact version-controlled Douyin artifact (OCV5-553). */
+export async function publishOfficialDouyinVersion(
+  input: PublishInput,
+): Promise<{ versionId: string }> {
+  if (
+    input.slug !== DOUYIN_PLUGIN_SLUG ||
+    input.version !== DOUYIN_PLUGIN_VERSION ||
+    input.kind !== 'connector' ||
+    input.pluginType !== 'managed-browser' ||
+    input.artifactHash !== COMPILED_DOUYIN_PLUGIN.artifactHash ||
+    input.submittedBy !== input.ownerUserId ||
+    input.queueAiReview !== false
+  )
+    throw new MarketplaceError(
+      'ARTIFACT_MISMATCH',
+      'Douyin platform seed identity does not match the pinned artifact',
     )
   return publishSkillVersionInternal(input, true)
 }
@@ -1553,6 +1580,13 @@ export async function listApprovedForSearch(
           execContractHash: verifiedRuntime?.execContractHash ?? null,
           reviewSource: x.review_source,
         }) ||
+        isOfficialDouyinPluginIdentity({
+          slug: x.slug,
+          pluginType: x.plugin_type,
+          artifactHash: x.artifact_hash,
+          execContractHash: verifiedRuntime?.execContractHash ?? null,
+          reviewSource: x.review_source,
+        }) ||
         isOfficialLiteraturePluginIdentity({
           slug: x.slug,
           pluginType: x.plugin_type,
@@ -1817,6 +1851,13 @@ export async function getListingDetail(
               reviewSource: x.review_source,
             }) ||
             isOfficialBiliAccountPluginIdentity({
+              slug: x.slug,
+              pluginType: x.plugin_type,
+              artifactHash: x.artifact_hash,
+              execContractHash: verifiedRuntimeExecContractHash,
+              reviewSource: x.review_source,
+            }) ||
+            isOfficialDouyinPluginIdentity({
               slug: x.slug,
               pluginType: x.plugin_type,
               artifactHash: x.artifact_hash,
