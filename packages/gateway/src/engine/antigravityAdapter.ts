@@ -94,6 +94,8 @@ const AUTH_PROMPT_RE = /Authentication required|Waiting for authentication|authe
 const SOFT_DENY_RE = /auto-denied/i
 const EMPTY_RUN_RE = /run ended with no output/i
 /** Go oauth2 refusing the CLI token file locally (OCV5-556). */
+/** What the CLI prints to stderr when a launch fails (`error: …`, `AGY_ERROR: {…}`). */
+const CLI_STDERR_ERROR_RE = /^(?:error:|AGY_ERROR:)/m
 /** CLI ended SUCCESS right after one of this launch's own error steps. */
 export const ANTIGRAVITY_ERROR_STEP = 'ANTIGRAVITY_ERROR_STEP'
 const CLI_CREDENTIAL_EXPIRED_RE = /oauth2: token expired|refresh token is not set/i
@@ -166,6 +168,10 @@ interface TurnContext {
   trailingErrorStep: boolean
   /** This launch streamed an error_message step of its own. */
   ownErrorStep: boolean
+  /** Launched with `--conversation` (resuming an existing CLI conversation). */
+  resumedLaunch: boolean
+  /** CLI exit code once the process closed. */
+  exitCode: number | null
   resolveSummary: (summary: TurnSummary | null) => void
   resolveDrain: (() => void) | null
 }
@@ -336,6 +342,8 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       preludeErrorDetail: null,
       trailingErrorStep: false,
       ownErrorStep: false,
+      resumedLaunch: false,
+      exitCode: null,
       resolveSummary,
       resolveDrain: null,
     }
@@ -475,6 +483,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     spec: { bin: string; args: string[]; env: NodeJS.ProcessEnv; cwd: string; line: string },
   ): void {
     ctx.timing.once('spawn_requested')
+    ctx.resumedLaunch = spec.args.includes('--conversation')
     const proc = spawn(spec.bin, spec.args, {
       cwd: spec.cwd,
       env: spec.env,
@@ -526,6 +535,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       this.cleanupLaunch(ctx)
       if (ctx.abandoned) return
       ctx.procClosed = true
+      ctx.exitCode = code
       if (stdoutBuffer.trim()) this.handleLine(ctx, stdoutBuffer.trim())
       if (ctx.pendingResult) this.settleResult(ctx)
       ctx.resolveDrain?.()
@@ -825,10 +835,16 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     // ROUTE_EXPIRED), 1.4.0 ends every later `--conversation` launch with
     // status ERROR and that old error, even when the launch answered normally
     // (exit 0, empty stderr). The recovery and the next messages then "failed"
-    // until the retry circuit opened. A launch that started, answered and
-    // streamed no error step of its own did not fail.
+    // until the retry circuit opened. Such a launch resumed a conversation,
+    // started, answered, streamed no error step of its own, exited 0 and wrote
+    // no error to stderr; a launch that really failed (even after a partial
+    // reply) exits non-zero and prints the error (Codex r1 P1).
     if (
       status === 'ERROR' &&
+      ctx.resumedLaunch &&
+      ctx.procClosed &&
+      ctx.exitCode === 0 &&
+      !CLI_STDERR_ERROR_RE.test(ctx.stderr) &&
       !ctx.ownErrorStep &&
       ctx.firstOwnStepIndex !== null &&
       (ctx.assistantText.trim() !== '' || asText(result.response).trim() !== '')

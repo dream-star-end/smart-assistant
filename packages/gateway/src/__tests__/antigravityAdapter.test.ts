@@ -83,7 +83,7 @@ process.stdin.on('data', (chunk) => {
   input += chunk
   if (input.includes('\\n')) replay()
 })
-process.stdin.on('end', () => setTimeout(() => process.exit(0), Number(process.env.FAKE_AGY_EXIT_DELAY_MS || 0)))
+process.stdin.on('end', () => setTimeout(() => process.exit(Number(process.env.FAKE_AGY_EXIT_CODE || 0)), Number(process.env.FAKE_AGY_EXIT_DELAY_MS || 0)))
 `
 
 function config(): OpenClaudeConfig {
@@ -122,6 +122,7 @@ async function harness(opts: Partial<EngineCreateOpts> = {}): Promise<Harness> {
   set('FAKE_AGY_STDERR', undefined)
   set('FAKE_AGY_HANG', undefined)
   set('FAKE_AGY_EXIT_DELAY_MS', undefined)
+  set('FAKE_AGY_EXIT_CODE', undefined)
   const adapter = new AntigravityAdapter({
     sessionKey: 'agent:main:webchat:dm:agy-test',
     agentId: 'main',
@@ -767,6 +768,42 @@ describe('Antigravity stale result error after a failed launch (OCV5-556)', () =
       assert.equal(summary?.isError, true)
       assert.equal(classifyRunError(summary?.errorDetail).code, 'upstream_failed')
       assert.deepEqual(sessionIds, [])
+    } finally {
+      await h.restore()
+    }
+  })
+
+  // Codex r1 P1: a partial reply followed by a real failure is not the CLI
+  // repeating an old error, whether it shows in stderr or only in the exit code.
+  test('a partial reply then a real failure still fails', async () => {
+    const h = await harness({ resumeSessionId: CONVERSATION })
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const lines = (await readFile(path.join(FIXTURES, 'resume-after-error.ndjson'), 'utf8')).trim().split('\n')
+      const result = JSON.parse(lines.pop()!)
+      result.result.error = 'request failed (code 503): upstream unavailable'
+      const file = path.join(h.dir, 'resume-partial-then-503.ndjson')
+      await writeFile(file, `${[...lines, JSON.stringify(result)].join('\n')}\n`)
+      const stderr = 'error: request failed (code 503): upstream unavailable\nAGY_ERROR: {"short_error":"request failed (code 503)"}\n'
+      const viaStderr = await runTurn(h, file, { stderr })
+      assert.equal(viaStderr.summary?.isError, true)
+      assert.match(viaStderr.summary?.errorDetail ?? '', /503/)
+      assert.deepEqual(viaStderr.sessionIds, [])
+
+      process.env.FAKE_AGY_EXIT_CODE = '3'
+      const viaExit = await runTurn(h, file)
+      assert.equal(viaExit.summary?.isError, true, 'non-zero exit with no stderr still fails')
+    } finally {
+      await h.restore()
+    }
+  })
+
+  test('a fresh (not resumed) launch with an ERROR result and a reply still fails', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const { summary } = await runTurn(h, 'resume-after-error.ndjson')
+      assert.equal(summary?.isError, true)
     } finally {
       await h.restore()
     }
