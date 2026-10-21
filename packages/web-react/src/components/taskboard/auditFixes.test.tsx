@@ -472,7 +472,7 @@ describe('T-05 / T-06 / T-07 / T-30 单据抽屉', () => {
     expect(within(actions).getByRole('button', { name: '标记受阻' })).toBeInTheDocument()
   })
 
-  test('T-27 乐观评论显示「我 · 人」与发送中，而不是 default', async () => {
+  test('T-27 乐观评论显示「我」与发送中，而不是 default', async () => {
     const t = ticket()
     mockDrawerApis(t)
     let resolveComment: (v: { ok: true; comment: TicketComment }) => void = () => {}
@@ -504,9 +504,11 @@ describe('T-05 / T-06 / T-07 / T-30 单据抽屉', () => {
     })
     const pendingItem = screen.getByTestId('ticket-timeline-item')
     expect(pendingItem).toHaveAttribute('data-pending', 'true')
-    expect(pendingItem).toHaveTextContent('我 · 人')
-    expect(pendingItem).toHaveTextContent('发送中')
-    expect(pendingItem).not.toHaveTextContent('default')
+    // OCV5-552 时间线：作者和「发送中…」在分组头里，未发出的人类评论作者显示「我」
+    const pendingGroup = pendingItem.closest('[data-testid="ticket-timeline-group"]') as HTMLElement
+    expect(pendingGroup).toHaveTextContent('我')
+    expect(pendingGroup).toHaveTextContent('发送中')
+    expect(pendingGroup).not.toHaveTextContent('default')
     await act(async () => {
       resolveComment({
         ok: true,
@@ -522,7 +524,10 @@ describe('T-05 / T-06 / T-07 / T-30 单据抽屉', () => {
       })
     })
     await waitFor(() => {
-      expect(screen.getByTestId('ticket-timeline-item')).toHaveTextContent('alice · 人')
+      const group = screen.getByTestId('ticket-timeline-group')
+      expect(group).toHaveTextContent('alice')
+      expect(group).not.toHaveTextContent('发送中')
+      expect(screen.getByTestId('ticket-timeline-item')).not.toHaveAttribute('data-pending')
     })
   })
 })
