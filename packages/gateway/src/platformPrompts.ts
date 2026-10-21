@@ -27,6 +27,9 @@
  */
 import { readFileSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
+import { createLogger } from './logger.js'
+
+const log = createLogger({ module: 'platformPrompts' })
 
 export type PlatformPromptKey =
   | 'platform-capabilities'
@@ -112,10 +115,10 @@ function tryLoad(reason: string): void {
   try {
     snapshot = readValidatedSet(promptsDir)
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    console.error(
-      `[platform-prompts] 加载失败(${reason}),保留${snapshot ? 'last-known-good 快照' : '代码内 fallback'}:`,
-      msg,
+    log.error(
+      `platform prompts load failed (${reason}); keeping ${snapshot ? 'last-known-good snapshot' : 'built-in fallback'}`,
+      { reason, kept: snapshot ? 'last-known-good' : 'fallback' },
+      err,
     )
   }
 }

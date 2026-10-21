@@ -1413,8 +1413,7 @@ export class Gateway {
   /** 500 兜底收口:真实错误进日志(可排障),响应只回受控文案 —— 此前 39 处
    *  `sendError(res, 500, String(err))` 会把容器内部路径/栈回显给客户端。 */
   private sendInternalError(res: ServerResponse, err: unknown): void {
-    // eslint-disable-next-line no-console
-    console.error('[gateway] internal error:', err)
+    this.log.error('internal error', undefined, err)
     this.sendJson(res, 500, { error: 'internal error' })
   }
   private async readJsonBody<T = any>(req: IncomingMessage): Promise<T> {
