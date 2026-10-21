@@ -117,6 +117,7 @@ import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetu
 import type { WeiboSetupManager } from '../plugins/weiboSetup.js'
 import type { ZhihuSetupManager } from '../plugins/zhihuSetup.js'
 import type { BiliAccountSetupManager } from '../plugins/biliAccountSetup.js'
+import type { DouyinSetupManager } from '../plugins/douyinSetup.js'
 import type { KnowledgePlanetAutomationService } from '../plugins/knowledgePlanetAutomation.js'
 import type { GoalStateService } from '../goal/goalStateService.js'
 import type { MediaGenerationService } from '../media-generation/service.js'
@@ -147,6 +148,8 @@ export interface CommercialHttpDeps {
   zhihuSetup?: ZhihuSetupManager
   /** Short-lived managed login coordinator for the official Bilibili account Plugin (OCV5-402). */
   biliAccountSetup?: BiliAccountSetupManager
+  /** Short-lived managed login coordinator for the official Douyin Plugin (OCV5-553). */
+  douyinSetup?: DouyinSetupManager
   /** Separate high-risk control/rules for official Knowledge Planet unattended replies. */
   knowledgePlanetAutomation?: KnowledgePlanetAutomationService
   mailer: Mailer

@@ -68,7 +68,7 @@ interface CliSurface {
 
 /** Browser Plugins live only on the oc-plugin surface; oc-connect points there instead of to rebinding. */
 const BROWSER_PLUGIN_POINTER =
-  '浏览器插件（微博、知乎、知识星球、B 站账号 bili-account 等）不在 oc-connect 中，用 oc-plugin list 查看并用 oc-plugin call 调用。'
+  '浏览器插件（微博、知乎、知识星球、B 站账号 bili-account、抖音 douyin 等）不在 oc-connect 中，用 oc-plugin list 查看并用 oc-plugin call 调用。'
 
 const CONNECTOR_SURFACE: CliSurface = {
   program: 'oc-connect',

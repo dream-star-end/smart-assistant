@@ -10,7 +10,7 @@ vi.mock('./api', () => {
     }
   return {
     api: Object.fromEntries(
-      ['Weibo', 'Zhihu', 'KnowledgePlanet'].flatMap((p) =>
+      ['Weibo', 'Zhihu', 'KnowledgePlanet', 'Douyin'].flatMap((p) =>
         ['start', 'get', 'cancel'].map((op) => [`${op}${p}Setup`, rec(`${op}${p}Setup`)]).concat([
           [`get${p}SetupQr`, rec(`get${p}SetupQr`)],
         ]),
@@ -69,4 +69,40 @@ test('失败文案：过期 > provider 风控说明 > 通用', () => {
     '本次授权未完成，请重试。',
   )
   expect(managedSetupFailureText(kp, { status: 'failed', errorCode: 'UPSTREAM_FAILED' })).toBe('本次授权未完成，请重试。')
+})
+
+test('抖音（OCV5-553）：路由到抖音接口、可原地重新扫码、带风险提示；失败码专属说明优先', async () => {
+  const douyin = managedPluginProvider('douyin')
+  expect(douyin.slug).toBe('douyin')
+  expect(douyin.qrRelink).toBe(true)
+  expect(douyin.setupNotice).toMatch(/风控/)
+  await douyin.start(auth)
+  await douyin.start(auth, 'acc-9')
+  await douyin.get(auth, 's')
+  await douyin.qr(auth, 's')
+  await douyin.cancel(auth, 's')
+  expect(calls).toEqual([
+    ['startDouyinSetup', auth],
+    ['startDouyinSetup', auth, 'acc-9'],
+    ['getDouyinSetup', auth, 's'],
+    ['getDouyinSetupQr', auth, 's'],
+    ['cancelDouyinSetup', auth, 's'],
+  ])
+  // setup 的 errorCode 是 worker 原始码。
+  expect(managedSetupFailureText(douyin, { status: 'failed', errorCode: 'VERIFICATION_REQUIRED' })).toMatch(
+    /^抖音要求账号本人完成身份验证/,
+  )
+  expect(managedSetupFailureText(douyin, { status: 'failed', errorCode: 'LOGIN_STATE_UNSUPPORTED' })).toMatch(
+    /不要反复扫码/,
+  )
+  expect(managedSetupFailureText(douyin, { status: 'failed', errorCode: 'UPSTREAM_CHALLENGE' })).toMatch(
+    /^抖音触发了验证码或风控/,
+  )
+  expect(managedSetupFailureText(douyin, { status: 'expired', errorCode: 'VERIFICATION_REQUIRED' })).toBe(
+    '二维码已过期，请重新授权。',
+  )
+  expect(managedSetupFailureText(douyin, { status: 'failed', errorCode: 'WORKER_FAILED' })).toBe('本次授权未完成，请重试。')
+  // 其它插件没有专属说明与风险提示，行为不变。
+  expect(managedPluginProvider('weibo').codeTexts).toBeUndefined()
+  expect(managedPluginProvider('weibo').setupNotice).toBeUndefined()
 })

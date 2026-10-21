@@ -8,6 +8,8 @@ import { PluginAccountLeaseError } from '../plugins/accountLease.js'
 import { PluginAccountError } from '../plugins/accounts.js'
 import type { BiliAccountSetupManager } from '../plugins/biliAccountSetup.js'
 import { BiliAccountSetupError } from '../plugins/biliAccountSetup.js'
+import type { DouyinSetupManager } from '../plugins/douyinSetup.js'
+import { DouyinSetupError } from '../plugins/douyinSetup.js'
 import type { KnowledgePlanetAutomationService } from '../plugins/knowledgePlanetAutomation.js'
 import { KnowledgePlanetAutomationError } from '../plugins/knowledgePlanetAutomation.js'
 import type { KnowledgePlanetSetupManager } from '../plugins/knowledgePlanetSetup.js'
@@ -32,6 +34,7 @@ export interface PluginHttpDeps {
   weiboSetup?: WeiboSetupManager
   zhihuSetup?: ZhihuSetupManager
   biliAccountSetup?: BiliAccountSetupManager
+  douyinSetup?: DouyinSetupManager
   knowledgePlanetAutomation?: KnowledgePlanetAutomationService
 }
 
@@ -50,6 +53,7 @@ export const MANAGED_SETUP_PROVIDERS = [
   'weibo',
   'zhihu',
   'bili-account',
+  'douyin',
 ] as const
 type ManagedSetupProvider = (typeof MANAGED_SETUP_PROVIDERS)[number]
 const SETUP_PROVIDER_ALT = MANAGED_SETUP_PROVIDERS.join('|')
@@ -62,6 +66,7 @@ type ManagedSetupManager =
   | WeiboSetupManager
   | ZhihuSetupManager
   | BiliAccountSetupManager
+  | DouyinSetupManager
 
 function setupManager(
   deps: CommercialHttpDeps & PluginHttpDeps,
@@ -81,6 +86,10 @@ function setupManager(
 ): BiliAccountSetupManager
 function setupManager(
   deps: CommercialHttpDeps & PluginHttpDeps,
+  provider: 'douyin',
+): DouyinSetupManager
+function setupManager(
+  deps: CommercialHttpDeps & PluginHttpDeps,
   provider: ManagedSetupProvider,
 ): ManagedSetupManager
 function setupManager(
@@ -92,6 +101,7 @@ function setupManager(
     weibo: deps.weiboSetup,
     zhihu: deps.zhihuSetup,
     'bili-account': deps.biliAccountSetup,
+    douyin: deps.douyinSetup,
   }
   const manager = managers[provider]
   if (!manager)
@@ -154,7 +164,8 @@ function mapSetupError(error: unknown): never {
     !(error instanceof KnowledgePlanetSetupError) &&
     !(error instanceof WeiboSetupError) &&
     !(error instanceof ZhihuSetupError) &&
-    !(error instanceof BiliAccountSetupError)
+    !(error instanceof BiliAccountSetupError) &&
+    !(error instanceof DouyinSetupError)
   )
     throw error
   // 通用码文案按插件生成(微博保持原文;OCV5-553)。
@@ -165,7 +176,9 @@ function mapSetupError(error: unknown): never {
         ? 'zhihu'
         : error instanceof BiliAccountSetupError
           ? 'bili-account'
-          : 'knowledge-planet'
+          : error instanceof DouyinSetupError
+            ? 'douyin'
+            : 'knowledge-planet'
   switch (error.code) {
     case 'NOT_INSTALLED':
       throw pluginHttpError(403, error.code, 'Plugin is not installed', undefined, provider)
@@ -371,7 +384,13 @@ export async function dispatchPluginsRoute(
                   body.acceptTerms === true,
                   body.accountId as string | undefined,
                 )
-              : await setupManager(deps, provider).start(userId, body.acceptTerms === true)
+              : provider === 'douyin'
+                ? await setupManager(deps, provider).start(
+                    userId,
+                    body.acceptTerms === true,
+                    body.accountId as string | undefined,
+                  )
+                : await setupManager(deps, provider).start(userId, body.acceptTerms === true)
       sendJson(res, 201, setup)
       return
     } catch (error) {
