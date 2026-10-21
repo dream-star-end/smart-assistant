@@ -10,6 +10,7 @@
 | `trains.mjs` | §1.9、§8.1：读 OCV5-539 的 `<trainId>.summary.json`，按阶段字母求 p50/p90、门禁逐个、缓存命中、失败所在阶段；`--check-last 10` 是 P0a 的退出检查 | v5-dev（`/opt/openclaude/tmp/lease-trains`） |
 | `logs.mjs` | §1.7 日志形状：JSON 占比、带 traceId 的行、warn/error 带不带 id、用户键名混用 | v5-dev，root |
 | `trace-facts.sh` | §1.7 库表事实（经本机 postgres 角色的 Unix socket 连接，命令行上没有口令）：`turn_traces.dispatch_id` 填充率、`request_id = billing_request_id`、哪些表有 `trace_id` 列、最近一个 crashed 回合（附录 A.3 演练的起点） | v5-dev，root；只读会话 |
+| `als-overhead.mjs` | §11.1 / P1 退出标准：AsyncLocalStorage 在回合路径形状负载上的 CPU 开销（每种模式独立子进程、交替、取中位数；`--work N` 调每次 await 之间的 CPU 量） | 任何安静的机器（看负载） |
 | `host.sh` | §1.7 日志位置与轮转、容器日志驱动、§1.9 `lease.db` 列车状态与分钟数 | v5-dev，root |
 
 口径（与方案 §1 序言一致）：“非测试”= `.ts/.tsx`，排除 `*.test.*` 与 `__tests__/`；包的行数按整个包目录算（例如 commercial 含 `agent-sandbox/`）。值导入跳过 `import type`/`export type`，以及类型位置的 `import("x").T` / `typeof import("x")`。commercial 目录图：每个顶层目录一个节点，根目录文件合成 `_root`，去掉 `index.ts`（组装根）的出边，Tarjan 求 SCC。
@@ -65,3 +66,17 @@
 | §1.9 列车阶段耗时 | 推算值（无 `summary.json`） | `trains.mjs` 读 `summary.json` | OCV5-539 上线后用实测替代推算；§8.1 规定 2 周后重算目标 |
 
 结论：结构类数字（依赖图、SCC、反向引用、行数）逐字复现，只有两个环的大小因方案把类型位置的 `import()` 算成值导入而偏大（4→3、29→28），以脚本为准；词法计数类有偏差的，方案原文本来就是 `rg` 下限估计，以后统一以这些脚本的输出为基线。P0b 的 `check-architecture.ts` 会用 TypeScript 符号解析重新给出规则 3 的违规基线，届时这里的正则计数只作为参考。
+
+## ALS 开销（OCV5-560，P1 退出标准“ALS 在回合路径上的 CPU 开销 < 1%，超过就回退显式传参”）
+
+v5-dev（node v20.20.2，16 核），列车空闲、1 分钟负载 < 4 时跑，每种工作量 9 次交替，取 CPU 中位数。`off` 与 `als` 两种模式的日志调用读同样形状的上下文（off 读常量，als 读 ALS），只有 AsyncLocalStorage 不同：
+
+| 每次 await 之间的工作（`--work`） | off | als | 开销 |
+|---|---|---|---|
+| 1 × 2 KB 帧 parse+stringify | 4,112 ms | 4,235 ms | 2.99% |
+| 4 × | 3,084 ms | 3,224 ms | 4.53% |
+| 16 × | 2,720 ms | 2,823 ms | 3.76% |
+
+单次运行的离散度约 ±15%（宿主上其它负载），但三档都在 3–4.5%，明显高于 1% 的预算。另：第一次测量 off 模式不带上下文、als 模式每行日志都脱敏上下文，得到 18–23%，那主要是“每行日志都处理上下文”的成本，不是 ALS 本身；所以无论用不用 ALS，日志上下文都应在 child logger 上绑定一次，而不是每行重新取。
+
+**结论（按方案 §11.1）**：Node 20 上 ALS 开销超过 1%，master 回合路径的 trace 上下文用显式传参（child logger 绑定 traceId 等字段），不用 `kernel/node` 的 `withTrace`。升级到 Node ≥ 24（AsyncContextFrame）后用同一脚本复测再定。

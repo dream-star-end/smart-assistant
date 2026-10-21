@@ -7798,7 +7798,11 @@
         "b877c2bc",
         "d4a46dd6",
         "fe480929",
-        "00b3760a"
+        "00b3760a",
+        "a4512488",
+        "ac0308a8",
+        "a3d28aad",
+        "4fb1055a"
       ],
       "regressions": [
         {
@@ -7850,6 +7854,31 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/antigravityAdapter.test.ts",
           "assertion": "CLI reporting SUCCESS right after its own error step is still a failure"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityAdapter.test.ts",
+          "assertion": "a resumed launch that answered is a success despite the repeated old error"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityAdapter.test.ts",
+          "assertion": "a partial reply then a real failure still fails"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/antigravityAdapter.test.ts",
+          "assertion": "waits for the exit code when the CLI exits after the result timer"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/multiDayResumeRetention.test.ts",
+          "assertion": "an idle resume-map entry survives a multi-week break"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/multiDayResumeRetention.test.ts",
+          "assertion": "CCB keeps its transcripts longer than the resume map keeps their ids"
         },
         {
           "layer": "deploy-gate",

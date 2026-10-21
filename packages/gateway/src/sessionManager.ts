@@ -638,6 +638,16 @@ export const BOX_ACTIVE_TURN_IDLE_MS = 4 * 60 * 60_000 + 5 * 60_000
 /** Box ChatGPT Web Pro (box-gpt-6-astra-pro) tasks can run up to 6 hours.
  * Give the owner turn a 6h 15m silent backstop and idle watchdog threshold. */
 export const BOX_GPT_WEB_ACTIVE_TURN_IDLE_MS = 6 * 60 * 60_000 + 15 * 60_000
+
+/**
+ * Idle TTL of resume-map entries whose in-memory AgentSession was evicted.
+ * OCV5-556: a user coming back after more than 7 days lost the native resume
+ * and every engine fell back to a lossy history rebuild, although the native
+ * conversation files were still in the volume. 90 days matches the volume
+ * lifetime (volume GC: 90 days without a login), so the map only drops
+ * entries whose files are about to go anyway.
+ */
+export const RESUME_MAP_INACTIVE_TTL_MS = 90 * 24 * 60 * 60 * 1000
 function isBoxActiveTurn(engineId?: string, modelId?: string): boolean {
   return engineId === 'ccb' && isBoxApiModel(modelId)
 }
@@ -2512,14 +2522,9 @@ export class SessionManager {
     return startEvictionLoopImpl.call(this as unknown as SessionLifecycleHost, intervalMs)
   }
 
-  // Idle TTL for entries whose in-memory AgentSession was already evicted.
-  // 7 days covers typical gateway restarts / multi-day reconnect gaps while
-  // preventing resume-map from growing unbounded. Rationale: resume-map exists
-  // to survive *restarts*, not to be a durable conversation archive.
-  private static RESUME_MAP_INACTIVE_TTL = 7 * 24 * 60 * 60 * 1000 // 7 days
 
   private _pruneResumeMap(): void {
-    const pruned = this.resumeStore.prune((key) => this.sessions.has(key), SessionManager.RESUME_MAP_INACTIVE_TTL)
+    const pruned = this.resumeStore.prune((key) => this.sessions.has(key), RESUME_MAP_INACTIVE_TTL_MS)
     for (const { key, ageMs } of pruned) {
       log.info('pruned idle resume-map entry', { sessionKey: key, ageMs })
     }

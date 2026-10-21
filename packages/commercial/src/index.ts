@@ -639,6 +639,9 @@ import {
   makeMiniMaxMediaHandler,
   type MiniMaxMediaHandler,
 } from "./minimax/mediaProxy.js";
+import { createMuseFromConfig } from "./muse/assemble.js";
+import { makeMuseInternalHandler } from "./muse/internalHttp.js";
+import { MUSE_INTERNAL_PREFIX } from "./muse/protocol.js";
 import {
   MINIMAX_WEB_SEARCH_PATH,
   makeMiniMaxWebSearchHandler,
@@ -2037,6 +2040,8 @@ export async function registerCommercial(
       start: () => mediaGenerationService.start(),
     });
   }
+  // OCV5-561 Muse media bridge (selfhost). Off unless OC_MUSE_BRIDGE_ENABLED=1; see muse/assemble.ts.
+  const { hub: museHub, bridgeHttp: museBridgeHttp } = await createMuseFromConfig(cfg, getPool());
   const goalBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge not assembled yet */ },
   };
@@ -2433,6 +2438,8 @@ export async function registerCommercial(
       });
       const mediaGenerationInternalHandler: MediaGenerationInternalHandler =
         makeMediaGenerationInternalHandler({ identityRepo, service: mediaGenerationService });
+      // /internal/v3/muse-media — oc-muse (OCV5-561). 403 MUSE_NOT_ENABLED when off or not allowlisted.
+      const museInternalHandler = makeMuseInternalHandler({ identityRepo, hub: museHub });
       // /internal/v3/minimax-search — 容器内 CCB 内置 WebSearch(MiniMaxSearchAdapter)回源 master。
       // key(MINIMAX_TOKEN_PLAN_KEY)只在 master,不注入容器;同款 verifyContainerIdentity 双因子。
       // MiniMax coding_plan/search 中文深度强,替代脆弱的 Bing HTML 刮页(Bing Search API 已退役)。
@@ -2973,6 +2980,9 @@ export async function registerCommercial(
           path.startsWith(`${MEDIA_GENERATION_INTERNAL_PREFIX}/`)
         ) {
           return mediaGenerationInternalHandler(req, res, ctx);
+        }
+        if (path === MUSE_INTERNAL_PREFIX || path.startsWith(`${MUSE_INTERNAL_PREFIX}/`)) {
+          return museInternalHandler(req, res, ctx);
         }
         if (path === MINIMAX_WEB_SEARCH_PATH) {
           return minimaxWebSearchHandler(req, res, ctx);
@@ -4427,6 +4437,7 @@ export async function registerCommercial(
   const handler = createCommercialHandler({
     jwtSecret,
     mediaGeneration: mediaGenerationService,
+    museBridgeHttp,
     goalStateService,
     containerPreviewTickets,
     containerPreviewAvailable: () => containerPreviewBridge !== undefined,
