@@ -100,7 +100,6 @@ export function validatePdfStructureSync(data: Buffer): boolean {
   }
 
   const fullStr = data.toString('latin1')
-  const hasEncrypt = /\/Encrypt(?![A-Za-z])/.test(fullStr)
   const allObjRe = /\b\d+\s+\d+\s+obj\b([\s\S]*?)\bendobj\b/g
   let om: RegExpExecArray | null
   let hasObject = false
@@ -126,15 +125,22 @@ export function validatePdfStructureSync(data: Buffer): boolean {
         rawEnd--
       }
       if (rawEnd <= rawPos) return false
-      try {
-        const inflated = zlib.inflateSync(data.subarray(rawPos, rawEnd), {
-          maxOutputLength: 8 * 1024 * 1024,
-        })
-        if (DANGEROUS_PDF_TOKEN_RE.test(normalizePdfNames(inflated.toString('latin1')))) {
+      const rawSlice = data.subarray(rawPos, rawEnd)
+      if (!/\/Filter\b/.test(dictOnly)) {
+        if (DANGEROUS_PDF_TOKEN_RE.test(normalizePdfNames(rawSlice.toString('latin1')))) {
           return false
         }
-      } catch {
-        if (!hasEncrypt) return false
+      } else {
+        try {
+          const inflated = zlib.inflateSync(rawSlice, {
+            maxOutputLength: 8 * 1024 * 1024,
+          })
+          if (DANGEROUS_PDF_TOKEN_RE.test(normalizePdfNames(inflated.toString('latin1')))) {
+            return false
+          }
+        } catch {
+          return false
+        }
       }
     }
   }
