@@ -49,11 +49,13 @@ describe("selfhost release gates use a per-build tsx cache (OCV5-357)", () => {
     const gates = block.match(/\( cd "\$staging" && [^\n]*/g) ?? [];
     assert.ok(gates.length >= 8, `found ${gates.length} gates`);
     for (const g of gates) assert.match(g, /^\( cd "\$staging" && TMPDIR="\$MASTER_GATE_TMPDIR" /, g);
-    // OCV5-557: the retryable gates run through named functions; their commands follow the same rule.
-    assert.equal((block.match(/^ {2}if ! master_gate_retryable [a-z-]+ (master_gate_[a-z_]+) /gm) ?? []).length, 3);
-    for (const name of ["master_gate_box_success_recovery", "master_gate_box_incident_proofs", "master_gate_ccb_mcp"]) {
-      const body = lib.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, "m"))?.[0] ?? "";
-      assert.match(body, /\n {2}\( cd "\$staging" && TMPDIR="\$MASTER_GATE_TMPDIR" /, name);
+    // OCV5-557: the retryable gates run through functions defined right above their call (the
+    // commands are in `gates` above, so the same TMPDIR rule covers them).
+    const retryable = block.match(/^ {2}if ! master_gate_retryable [a-z-]+ (master_gate_[a-z_]+);/gm) ?? [];
+    assert.equal(retryable.length, 3);
+    for (const call of retryable) {
+      const name = / (master_gate_[a-z_]+);$/.exec(call)![1]!;
+      assert.match(block, new RegExp(`\\n {2}${name}\\(\\) \\{\\n {4}\\( cd "\\$staging" && TMPDIR="\\$MASTER_GATE_TMPDIR" `), name);
     }
     assert.match(block, /\n {2}cleanup_master_gate_tmpdir\n/);
     const before = lib.slice(0, a);

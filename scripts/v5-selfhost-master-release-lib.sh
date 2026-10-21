@@ -386,28 +386,6 @@ master_gate_retryable() { # <gate> <command...>
   done
 }
 
-# 三道可重跑门的命令。两个 DB 门显式去掉 OC_V5_PROOF_TEST_DATABASE_URL:success recovery 门里它优先于
-# TEST_DATABASE_URL,留着就会连回共享库。
-master_gate_box_success_recovery() { # <staging> <full-sha>
-  local staging="$1" full_sha="$2"
-  ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
-      OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
-      npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$full_sha" )
-}
-
-master_gate_box_incident_proofs() { # <staging> <full-sha>
-  local staging="$1" full_sha="$2"
-  ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
-      OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
-      npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$full_sha" )
-}
-
-master_gate_ccb_mcp() { # <staging>
-  local staging="$1"
-  ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" \
-      npx --no-install tsx scripts/check-v5-ccb-mcp-availability.ts )
-}
-
 # 商业版 release_artifact_digest 的本地化抄本(无 SSH)。.complete 不计入。
 release_artifact_digest() { # <absolute-release-root>
   local root="$1"
@@ -988,7 +966,14 @@ build_master_release() {
     die "新候选缺 scripts/check-v5-box-success-recovery.ts"
   fi
   # 本机已核 loopback 实例只由 selfhost wrapper 显式提供;门连的是上面新建的本班列车测试库。
-  if ! master_gate_retryable box-success-recovery master_gate_box_success_recovery "$staging" "$full_sha"; then
+  # 两道 DB 门的命令写在这里(check-v5-incident-regressions 只认 build_master_release 里的调用),
+  # 显式去掉 OC_V5_PROOF_TEST_DATABASE_URL:success recovery 门里它优先于 TEST_DATABASE_URL,留着就连回共享库。
+  master_gate_box_success_recovery() {
+    ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
+        OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+        npx --no-install tsx scripts/check-v5-box-success-recovery.ts --candidate-sha "$full_sha" )
+  }
+  if ! master_gate_retryable box-success-recovery master_gate_box_success_recovery; then
     cleanup_master_staging
     die "pinned Box success recovery behavioral gate 失败"
   fi
@@ -1010,7 +995,12 @@ build_master_release() {
     die "新候选缺 scripts/check-v5-box-incident-proofs.ts"
   fi
   # 与 success recovery 门同一个本班列车测试库;Box 只在 exec 端点模拟。之后的门不用库,随即删掉。
-  if ! master_gate_retryable box-incident-proofs master_gate_box_incident_proofs "$staging" "$full_sha"; then
+  master_gate_box_incident_proofs() {
+    ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" env -u NODE_OPTIONS -u NODE_PATH -u OC_V5_PROOF_TEST_DATABASE_URL \
+        OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" TEST_DATABASE_URL="$MASTER_GATE_DB_URL" \
+        npx --no-install tsx scripts/check-v5-box-incident-proofs.ts --expect-sha "$full_sha" )
+  }
+  if ! master_gate_retryable box-incident-proofs master_gate_box_incident_proofs; then
     cleanup_master_staging
     die "pinned Box incident proofs gate (OCV5-488) 失败"
   fi
@@ -1023,7 +1013,11 @@ build_master_release() {
   fi
   tsum_mark C.ccb-mcp 2>/dev/null || :
   mlog "  CCB MCP availability contract gate @ pinned staging"
-  if ! master_gate_retryable ccb-mcp master_gate_ccb_mcp "$staging"; then
+  master_gate_ccb_mcp() {
+    ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" OC_V5_GATE_LOAD_SCALE="$MASTER_GATE_LOAD_SCALE" \
+        npx --no-install tsx scripts/check-v5-ccb-mcp-availability.ts )
+  }
+  if ! master_gate_retryable ccb-mcp master_gate_ccb_mcp; then
     cleanup_master_staging
     die "pinned CCB MCP availability contract gate 失败"
   fi
