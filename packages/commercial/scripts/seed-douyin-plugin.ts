@@ -242,6 +242,15 @@ async function smoke(
     throw new Error('me returned no account')
   // 只记形状(哪些字段有值),不记昵称和 ID。
   summary.me = `fields=${Object.keys(me).sort().join('+')}`
+  const videos = await run('my_videos', { count: 5 })
+  const items = videos.items as Array<{ awemeId?: string }>
+  summary.my_videos = `n=${items.length} hasMore=${String(videos.hasMore)}`
+  // 评论接口登录后的形状未实测：必须用真实作品跑一次。账号没有作品时无法完成上架前实测。
+  const firstVideo = items.find((item) => item.awemeId)?.awemeId
+  if (firstVideo) {
+    const comments = await run('video_comments', { awemeId: firstVideo, count: 5 })
+    summary.video_comments = `n=${(comments.items as unknown[]).length}`
+  }
   // 每个动作都必须被真实执行过一次。
   const missing = douyinSmokeActionIds().filter((id) => !covered.has(id))
   if (missing.length > 0) throw new Error(`smoke did not exercise: ${missing.join(',')}`)

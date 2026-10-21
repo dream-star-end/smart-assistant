@@ -7,6 +7,7 @@
 import { isNextBlockCode } from "../../lib/nextBlock";
 import { normalizeInlineUiFences } from "../../lib/uiFence";
 import { biliToMarkdown } from "./biliMarkdown";
+import { douyinToMarkdown } from "./douyinMarkdown";
 import { computeOutputs } from "./formula";
 import { marketToMarkdown } from "./marketMarkdown";
 import { parseUiBlock } from "./parse";
@@ -340,6 +341,9 @@ export function specToMarkdown(spec: IuiSpec, values?: Record<string, number>): 
     case "bili_danmaku":
     case "bili_subtitle":
       return biliToMarkdown(spec);
+    case "douyin_videos":
+    case "douyin_comments":
+      return douyinToMarkdown(spec);
   }
 }
 

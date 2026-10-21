@@ -1,9 +1,11 @@
 /**
  * Version-controlled official Douyin Plugin artifact and trust pins (OCV5-553).
  *
- * 个人抖音号扫码登录（抖音创作者服务平台 creator.douyin.com 的官方二维码）。本版只有一个读动作
- * `me`，用来确认登录身份；作品、评论、搜索等读动作和发布 / 评论 / 点赞等写动作在后续版本加入
- * （设计见 ocv5-308/DESIGN-20261021-douyin-plugin.md 4.8）。只上 AI 市场、不预装。
+ * 个人抖音号扫码登录（抖音创作者服务平台 creator.douyin.com 的官方二维码，扫码后本人短信验证）。
+ * 读动作：`me`（登录身份）、`my_videos`（自己的作品，creator work_list，2026-10-22 实测格式）、
+ * `video_comments`（自己作品的评论，creator comment/list —— 接口由前端脚本静态分析确定、登录后应答
+ * 形状未实测，上架前的 seed 实测必须跑通）。搜索和他人内容不做（需要 www 站签名，设计 4.3.C）。
+ * 发布 / 评论 / 点赞等写动作在后续版本加入（设计 4.8）。只上 AI 市场、不预装。
  *
  * 登录页来源、二维码元素和未登录时的接口应答来自 2026-10-21 的未登录侦察（g553-recon-*.json）；
  * 登录后的应答形状、登录 cookie 是否带 Secure，要等测试号扫码后才能核实。
@@ -24,6 +26,30 @@ export const DOUYIN_LAUNCHER_ID = `douyin-container-${DOUYIN_WORKER_DIGEST.slice
 export const DOUYIN_LAUNCHER_VERSION = DOUYIN_PLUGIN_VERSION
 
 const count = { type: 'integer', minimum: 0 }
+const awemeIdSchema = { type: 'string', minLength: 1, maxLength: 32, pattern: '^[0-9]{1,32}$' }
+const videoItemSchema = {
+  type: 'object',
+  properties: {
+    awemeId: awemeIdSchema,
+    title: { type: 'string', maxLength: 200 },
+    desc: { type: 'string', maxLength: 1000 },
+    createTime: count,
+    durationSec: count,
+    // 抖音图床的签名地址很长（实测约 320 字符）；worker 只接受 https://*.douyinpic.com。
+    cover: { type: 'string', maxLength: 1024 },
+    playCount: count,
+    diggCount: count,
+    commentCount: count,
+    shareCount: count,
+    collectCount: count,
+    isPrivate: { type: 'boolean' },
+    inReview: { type: 'boolean' },
+    isImagePost: { type: 'boolean' },
+    url: { type: 'string', maxLength: 256 },
+  },
+  required: ['awemeId', 'url'],
+  additionalProperties: false,
+}
 
 export const DOUYIN_NETWORK_ORIGINS = Object.freeze(['https://creator.douyin.com'])
 
@@ -62,6 +88,79 @@ export const DOUYIN_PLUGIN_ARTIFACT = Object.freeze({
           totalFavorited: count,
         },
         required: ['nickname'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'my_videos',
+      description:
+        '列出当前账号自己发布的作品（最新在前）。参数：count（1-20，默认 10）、cursor（翻页游标，用上一页结果里的 cursor）。' +
+        '结果 items[]：awemeId、title、desc、createTime（Unix 秒）、durationSec、cover、播放 / 点赞 / 评论 / 分享 / 收藏数、isPrivate、inReview、url；hasMore 表示还有下一页。',
+      effect: 'read',
+      timeoutSeconds: 90,
+      params: {
+        type: 'object',
+        properties: {
+          count: { type: 'integer', minimum: 1, maximum: 20 },
+          cursor: { type: 'integer', minimum: 0, maximum: 9_000_000_000_000 },
+        },
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: {
+          items: { type: 'array', maxItems: 20, items: videoItemSchema },
+          hasMore: { type: 'boolean' },
+          cursor: { type: 'integer', minimum: 0 },
+          total: count,
+        },
+        required: ['items', 'hasMore'],
+        additionalProperties: false,
+      },
+    },
+    {
+      id: 'video_comments',
+      description:
+        '读取自己某个作品下的评论（只能读自己的作品）。参数：awemeId（必填，来自 my_videos）、count（1-20，默认 10）、cursor（翻页游标）。' +
+        '结果 items[]：cid、text、nickname、createTime（Unix 秒）、diggCount、replyCount；hasMore 表示还有下一页。',
+      effect: 'read',
+      timeoutSeconds: 90,
+      params: {
+        type: 'object',
+        properties: {
+          awemeId: awemeIdSchema,
+          count: { type: 'integer', minimum: 1, maximum: 20 },
+          cursor: { type: 'integer', minimum: 0, maximum: 9_000_000_000_000 },
+        },
+        required: ['awemeId'],
+        additionalProperties: false,
+      },
+      result: {
+        type: 'object',
+        properties: {
+          awemeId: awemeIdSchema,
+          items: {
+            type: 'array',
+            maxItems: 20,
+            items: {
+              type: 'object',
+              properties: {
+                cid: { type: 'string', maxLength: 32, pattern: '^[0-9]{1,32}$' },
+                text: { type: 'string', maxLength: 1000 },
+                nickname: { type: 'string', maxLength: 128 },
+                createTime: count,
+                diggCount: count,
+                replyCount: count,
+              },
+              required: ['cid', 'text'],
+              additionalProperties: false,
+            },
+          },
+          hasMore: { type: 'boolean' },
+          cursor: { type: 'integer', minimum: 0 },
+          total: count,
+        },
+        required: ['awemeId', 'items', 'hasMore'],
         additionalProperties: false,
       },
     },

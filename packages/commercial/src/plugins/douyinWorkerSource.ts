@@ -1,6 +1,7 @@
 /**
- * Reviewed Douyin worker (OCV5-553). QR login with the account owner's SMS verification + the read-only
- * `me` action.
+ * Reviewed Douyin worker (OCV5-553). QR login with the account owner's SMS verification + read-only
+ * actions `me`, `my_videos` (creator work_list) and `video_comments` (creator comment list), each list
+ * request preceded by a 1.5–4s pause.
  *
  * Same frame protocol, broker relay and storage filtering as the reviewed Bilibili account worker
  * (biliAccountWorkerSource.ts). No Playwright request client and no Node-side cookie replay: the
@@ -279,9 +280,99 @@ async function readSelf(page) {
   throw new Error('WORKER_FAILED');
 }
 
+/** 读节奏（设计 4.5）：每次列表请求前在页面里停 1.5–4 秒，同账号不连打。 */
+function humanPause(page) { return page.waitForTimeout(1_500 + Math.floor(Math.random() * 2_500)).catch(() => {}); }
+/** 创作者平台接口：status_code 8 = 未登录；其它非 0 都是失败（不猜）。 */
+function creatorData(json) {
+  if (json.status_code === 8) throw new Error('LOGIN_EXPIRED');
+  if (json.status_code !== 0) throw new Error('WORKER_FAILED');
+  return json;
+}
+function douyinPicUrl(raw) {
+  if (typeof raw !== 'string' || raw.length > 1024) return undefined;
+  try { const u = new URL(raw); return u.protocol === 'https:' && /(^|\.)douyinpic\.com$/.test(u.hostname) ? raw : undefined; } catch { return undefined; }
+}
+function clampInt(value, min, max, fallback) {
+  const n = Number(value);
+  return Number.isSafeInteger(n) ? Math.max(min, Math.min(max, n)) : fallback;
+}
+/** work_list 里的一个作品（2026-10-22 实测字段）。 */
+function videoItem(a) {
+  if (!a || typeof a !== 'object') return null;
+  const awemeId = digits(a.aweme_id);
+  if (!awemeId) return null;
+  const stats = a.statistics && typeof a.statistics === 'object' ? a.statistics : {};
+  const status = a.status && typeof a.status === 'object' ? a.status : {};
+  const cover = a.Cover && Array.isArray(a.Cover.url_list) ? a.Cover.url_list[0]
+    : a.video && a.video.cover && Array.isArray(a.video.cover.url_list) ? a.video.cover.url_list[0] : undefined;
+  const ms = nonNegInt(a.duration != null ? a.duration : a.video && a.video.duration);
+  const imagePost = a.is_pic_word === true || Array.isArray(a.images);
+  return compact({
+    awemeId,
+    title: cleanText(a.item_title, 200) || undefined,
+    desc: cleanText(a.desc || a.caption, 1000) || undefined,
+    createTime: nonNegInt(a.create_time),
+    durationSec: ms === undefined ? undefined : Math.round(ms / 1000),
+    cover: douyinPicUrl(cover),
+    playCount: nonNegInt(stats.play_count),
+    diggCount: nonNegInt(stats.digg_count),
+    commentCount: nonNegInt(stats.comment_count),
+    shareCount: nonNegInt(stats.share_count),
+    collectCount: nonNegInt(stats.collect_count),
+    isPrivate: typeof status.is_private === 'boolean' ? status.is_private : undefined,
+    inReview: typeof status.in_reviewing === 'boolean' ? status.in_reviewing : undefined,
+    isImagePost: imagePost || undefined,
+    url: 'https://www.douyin.com/' + (imagePost ? 'note/' : 'video/') + awemeId
+  });
+}
+function commentItem(c) {
+  if (!c || typeof c !== 'object') return null;
+  const cid = digits(c.cid);
+  const text = cleanText(c.text, 1000);
+  if (!cid || !text) return null;
+  return compact({
+    cid, text,
+    nickname: cleanText(c.user && c.user.nickname, 128) || undefined,
+    createTime: nonNegInt(c.create_time),
+    diggCount: nonNegInt(c.digg_count),
+    replyCount: nonNegInt(c.reply_comment_total != null ? c.reply_comment_total : c.reply_count)
+  });
+}
+
 async function actionRead(page, input) {
   const self = await readSelf(page);
   if (input.actionId === 'me') return self;
+  const params = input.params || {};
+  const count = clampInt(params.count, 1, 20, 10);
+  const cursor = clampInt(params.cursor, 0, 9_000_000_000_000, 0);
+  if (input.actionId === 'my_videos') {
+    await humanPause(page);
+    const query = new URLSearchParams({ status: '0', count: String(count), max_cursor: String(cursor) });
+    const data = creatorData(await apiGet(page, SITE + '/janus/douyin/creator/pc/work_list?' + query.toString()));
+    if (!Array.isArray(data.aweme_list)) throw new Error('WORKER_FAILED');
+    return compact({
+      items: data.aweme_list.slice(0, 20).map(videoItem).filter(Boolean),
+      hasMore: data.has_more === true || data.has_more === 1,
+      cursor: nonNegInt(data.max_cursor),
+      total: nonNegInt(data.total)
+    });
+  }
+  if (input.actionId === 'video_comments') {
+    const awemeId = digits(params.awemeId);
+    if (!awemeId) throw new Error('WORKER_FAILED');
+    await humanPause(page);
+    const query = new URLSearchParams({ item_id: awemeId, cursor: String(cursor), count: String(count) });
+    const data = creatorData(await apiGet(page, SITE + '/aweme/v1/creator/comment/list/?' + query.toString()));
+    // 登录后的应答形状未实测：只认 comments 数组（没有评论时可能是 null）；认不出就失败，不猜。
+    if (data.comments !== null && !Array.isArray(data.comments)) throw new Error('WORKER_FAILED');
+    return compact({
+      awemeId,
+      items: (data.comments || []).slice(0, 20).map(commentItem).filter(Boolean),
+      hasMore: data.has_more === true || data.has_more === 1,
+      cursor: nonNegInt(data.cursor),
+      total: nonNegInt(data.total)
+    });
+  }
   throw new Error('WORKER_FAILED');
 }
 

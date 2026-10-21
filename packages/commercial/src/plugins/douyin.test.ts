@@ -85,13 +85,21 @@ function workerHarness() {
 }
 
 /** Fake Playwright page: `evaluate(fn, { url })` answers from a URL → response table. */
-function fakePage(table: Record<string, { status?: number; body: unknown }>, seen: string[] = []) {
+/** Fake Playwright page: answers by URL (exact, or by path when the table key has no query); records pauses. */
+function fakePage(
+  table: Record<string, { status?: number; body: unknown }>,
+  seen: string[] = [],
+  pauses: number[] = [],
+) {
   return {
     async evaluate(_fn: unknown, input: { url: string; max: number }) {
       seen.push(input.url)
-      const hit = table[input.url]
+      const hit = table[input.url] ?? table[input.url.split('?')[0]!]
       if (!hit) return { status: 404, text: '', tooLarge: false }
       return { status: hit.status ?? 200, text: JSON.stringify(hit.body), tooLarge: false }
+    },
+    async waitForTimeout(ms: number) {
+      pauses.push(ms)
     },
   }
 }
@@ -144,10 +152,69 @@ describe('official Douyin Plugin', () => {
     assert.equal(isOfficialDouyinPluginIdentity({ ...identity, reviewSource: 'human' }), false)
   })
 
-  test('this version is read-only: one `me` action, network methods are GET only', () => {
+  test('this version is read-only: me / my_videos / video_comments, network methods are GET only', () => {
     assert.ok(DOUYIN_PLUGIN_CONTRACT.actions.every((action) => action.effect === 'read'))
     assert.deepEqual([...DOUYIN_PLUGIN_CONTRACT.runtime.network.methods], ['GET'])
-    assert.deepEqual(douyinSmokeActionIds(), ['me'])
+    assert.deepEqual(douyinSmokeActionIds(), ['me', 'my_videos', 'video_comments'])
+  })
+
+  test('my_videos / video_comments schemas accept documented results and reject extras / bad ids (PR3)', () => {
+    const action = (id: string) => DOUYIN_PLUGIN_CONTRACT.actions.find((a) => a.id === id)!
+    const videos = action('my_videos')
+    assert.doesNotThrow(() =>
+      validateRuntimePluginJson(videos.params, { count: 5, cursor: 1_760_000_000_000 }, 'params'),
+    )
+    assert.doesNotThrow(() => validateRuntimePluginJson(videos.params, {}, 'params'))
+    for (const bad of [{ count: 0 }, { count: 21 }, { cursor: -1 }, { extra: 1 }])
+      assert.throws(
+        () => validateRuntimePluginJson(videos.params, bad, 'params'),
+        JSON.stringify(bad),
+      )
+    const item = {
+      awemeId: '7400000000000000001',
+      url: 'https://www.douyin.com/video/7400000000000000001',
+      playCount: 3,
+      isPrivate: false,
+    }
+    assert.doesNotThrow(() =>
+      validateRuntimePluginJson(
+        videos.result,
+        { items: [item], hasMore: false, cursor: 1, total: 1 },
+        'result',
+      ),
+    )
+    for (const bad of [{ ...item, awemeId: '74a' }, { ...item, extra: 1 }, { awemeId: '1' }])
+      assert.throws(
+        () => validateRuntimePluginJson(videos.result, { items: [bad], hasMore: false }, 'result'),
+        JSON.stringify(bad),
+      )
+    const comments = action('video_comments')
+    assert.doesNotThrow(() =>
+      validateRuntimePluginJson(
+        comments.params,
+        { awemeId: '7400000000000000001', count: 10 },
+        'params',
+      ),
+    )
+    for (const bad of [{}, { awemeId: '../x' }, { awemeId: '1', extra: 1 }])
+      assert.throws(
+        () => validateRuntimePluginJson(comments.params, bad, 'params'),
+        JSON.stringify(bad),
+      )
+    assert.doesNotThrow(() =>
+      validateRuntimePluginJson(
+        comments.result,
+        { awemeId: '1', items: [{ cid: '9', text: '好', diggCount: 1 }], hasMore: true },
+        'result',
+      ),
+    )
+    assert.throws(() =>
+      validateRuntimePluginJson(
+        comments.result,
+        { awemeId: '1', items: [{ cid: 'x', text: 't' }], hasMore: false },
+        'result',
+      ),
+    )
   })
 
   test('state and network stay on douyin.com; telemetry is not allowed at login; only Secure cookies', () => {
@@ -333,6 +400,194 @@ describe('douyin worker behaviour (compiled from the pinned source)', () => {
     )
     // user-info 的两个 id 都不合格 → 退到 passport；secUid 不合格的值绝不原样返回。
     assert.deepEqual(out, { nickname: 'n', uid: '5' })
+  })
+
+  test('my_videos projects the live-test work_list fields; foreign covers dropped; one paced request', async () => {
+    const seen: string[] = []
+    const pauses: number[] = []
+    const page = fakePage(
+      {
+        [USER_INFO]: USER_INFO_OK,
+        [`${SITE}/janus/douyin/creator/pc/work_list`]: {
+          body: {
+            status_code: 0,
+            has_more: true,
+            max_cursor: 1_760_000_000_000,
+            total: 12,
+            aweme_list: [
+              {
+                aweme_id: '7400000000000000001',
+                item_title: ' 标题 ',
+                desc: '描述 #话题',
+                create_time: 1_760_000_000,
+                duration: 15_400,
+                Cover: {
+                  url_list: ['https://p3-sign.douyinpic.com/obj/x.jpeg?x-expires=1&sign=abc'],
+                },
+                statistics: {
+                  play_count: 100,
+                  digg_count: 7,
+                  comment_count: 2,
+                  share_count: 1,
+                  collect_count: 3,
+                },
+                status: { is_private: false, in_reviewing: true },
+              },
+              {
+                aweme_id: '7400000000000000002',
+                is_pic_word: true,
+                Cover: { url_list: ['https://evil.example/x.jpeg'] },
+                statistics: {},
+              },
+              { aweme_id: 'not-digits' },
+            ],
+          },
+        },
+      },
+      seen,
+      pauses,
+    )
+    const out = (await worker.actionRead(page, {
+      actionId: 'my_videos',
+      params: { count: 5, cursor: 0 },
+    })) as {
+      items: Array<Record<string, unknown>>
+    }
+    assert.deepEqual(out, {
+      items: [
+        {
+          awemeId: '7400000000000000001',
+          title: '标题',
+          desc: '描述 #话题',
+          createTime: 1_760_000_000,
+          durationSec: 15,
+          cover: 'https://p3-sign.douyinpic.com/obj/x.jpeg?x-expires=1&sign=abc',
+          playCount: 100,
+          diggCount: 7,
+          commentCount: 2,
+          shareCount: 1,
+          collectCount: 3,
+          isPrivate: false,
+          inReview: true,
+          url: 'https://www.douyin.com/video/7400000000000000001',
+        },
+        {
+          awemeId: '7400000000000000002',
+          isImagePost: true,
+          url: 'https://www.douyin.com/note/7400000000000000002',
+        },
+      ],
+      hasMore: true,
+      cursor: 1_760_000_000_000,
+      total: 12,
+    })
+    assert.equal(seen.length, 2)
+    assert.match(seen[1]!, /work_list\?status=0&count=5&max_cursor=0$/)
+    assert.equal(pauses.length, 1)
+    assert.ok(pauses[0]! >= 1_500 && pauses[0]! < 4_000)
+    const action = DOUYIN_PLUGIN_CONTRACT.actions.find((a) => a.id === 'my_videos')!
+    assert.doesNotThrow(() => validateRuntimePluginJson(action.result, out, 'result'))
+  })
+
+  test('video_comments reads the creator comment list for one own work; unknown shapes fail closed', async () => {
+    const seen: string[] = []
+    const page = fakePage(
+      {
+        [USER_INFO]: USER_INFO_OK,
+        [`${SITE}/aweme/v1/creator/comment/list/`]: {
+          body: {
+            status_code: 0,
+            has_more: 1,
+            cursor: 20,
+            total: 31,
+            comments: [
+              {
+                cid: '7400000000000000101',
+                text: ' 好看\n',
+                create_time: 1_760_000_100,
+                digg_count: 4,
+                reply_comment_total: 1,
+                user: { nickname: '路人' },
+              },
+              { cid: 'bad', text: 'x' },
+              { cid: '7400000000000000102', text: '' },
+            ],
+          },
+        },
+      },
+      seen,
+    )
+    const out = await worker.actionRead(page, {
+      actionId: 'video_comments',
+      params: { awemeId: '7400000000000000001' },
+    })
+    assert.deepEqual(out, {
+      awemeId: '7400000000000000001',
+      items: [
+        {
+          cid: '7400000000000000101',
+          text: '好看',
+          nickname: '路人',
+          createTime: 1_760_000_100,
+          diggCount: 4,
+          replyCount: 1,
+        },
+      ],
+      hasMore: true,
+      cursor: 20,
+      total: 31,
+    })
+    assert.match(seen[1]!, /comment\/list\/\?item_id=7400000000000000001&cursor=0&count=10$/)
+    const action = DOUYIN_PLUGIN_CONTRACT.actions.find((a) => a.id === 'video_comments')!
+    assert.doesNotThrow(() => validateRuntimePluginJson(action.result, out, 'result'))
+    // 没有评论时 comments 可能是 null。
+    assert.deepEqual(
+      await worker.actionRead(
+        fakePage({
+          [USER_INFO]: USER_INFO_OK,
+          [`${SITE}/aweme/v1/creator/comment/list/`]: { body: { status_code: 0, comments: null } },
+        }),
+        { actionId: 'video_comments', params: { awemeId: '1' } },
+      ),
+      { awemeId: '1', items: [], hasMore: false },
+    )
+    // 认不出的形状、坏 id、未登录。
+    for (const [body, re] of [
+      [{ status_code: 0, data: { comments: [] } }, /WORKER_FAILED/],
+      [{ status_code: 8 }, /LOGIN_EXPIRED/],
+      [{ status_code: 5 }, /WORKER_FAILED/],
+    ] as const)
+      await assert.rejects(
+        worker.actionRead(
+          fakePage({
+            [USER_INFO]: USER_INFO_OK,
+            [`${SITE}/aweme/v1/creator/comment/list/`]: { body },
+          }),
+          {
+            actionId: 'video_comments',
+            params: { awemeId: '1' },
+          },
+        ),
+        re,
+        JSON.stringify(body),
+      )
+    await assert.rejects(
+      worker.actionRead(fakePage({ [USER_INFO]: USER_INFO_OK }), {
+        actionId: 'video_comments',
+        params: { awemeId: 'x' },
+      }),
+      /WORKER_FAILED/,
+    )
+    await assert.rejects(
+      worker.actionRead(
+        fakePage({
+          [USER_INFO]: USER_INFO_OK,
+          [`${SITE}/janus/douyin/creator/pc/work_list`]: { body: { status_code: 8 } },
+        }),
+        { actionId: 'my_videos' },
+      ),
+      /LOGIN_EXPIRED/,
+    )
   })
 
   test('account/info 1011 after login (2026-10-22 live test) is "endpoint unavailable", never LOGIN_EXPIRED', async () => {
