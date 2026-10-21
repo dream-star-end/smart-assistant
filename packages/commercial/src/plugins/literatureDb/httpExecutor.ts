@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import http from 'node:http'
 import { type DnsResolver, resolvePinnedAddress } from '../../connectors/outboundPolicy.js'
+import { loadKmsKey, zeroBuffer } from '../../crypto/keys.js'
 import { type JieyouAccountState, parseJieyouAccountState } from './accountState.js'
 import {
   LITERATURE_ARTIFACT_MAX_BYTES,
@@ -69,7 +70,20 @@ export const DOWNSTREAM_HOP_TIMEOUT_MS = 30_000
 export const DOWNSTREAM_MAX_TOTAL_TIMEOUT_MS = 105_000
 const BROWSER_UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
-const DOCUMENT_ID_TTL_MS = 60 * 60 * 1000 // 1 hour
+export const DOCUMENT_ID_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours
+export const DOCUMENT_ID_HKDF_INFO = 'openclaude:literature-db:document-id:v1'
+
+export function deriveLiteratureDocumentIdSecret(env: NodeJS.ProcessEnv = process.env): Buffer {
+  let kms: Buffer | undefined
+  try {
+    kms = loadKmsKey(env)
+    return Buffer.from(crypto.hkdfSync('sha256', kms, Buffer.alloc(0), DOCUMENT_ID_HKDF_INFO, 32))
+  } catch {
+    throw new LiteratureError('SECRET_INVALID')
+  } finally {
+    if (kms) zeroBuffer(kms)
+  }
+}
 function encodeVarint(val: number): Buffer {
   const bytes: number[] = []
   let v = val >>> 0
@@ -332,7 +346,7 @@ export function verifyScopedDocumentId(
 ): { readonly paperId: string } {
   const parts = token.split('-')
   if (parts.length !== 4 || parts[0] !== 'wfp1') {
-    throw new LiteratureError('INVALID_INPUT')
+    throw new LiteratureError('DOCUMENT_EXPIRED')
   }
   const [, expB36, pidHex, macHex] = parts as [string, string, string, string]
   if (
@@ -341,7 +355,7 @@ export function verifyScopedDocumentId(
     pidHex.length % 2 !== 0 ||
     !/^[0-9a-f]{32}$/.test(macHex)
   ) {
-    throw new LiteratureError('INVALID_INPUT')
+    throw new LiteratureError('DOCUMENT_EXPIRED')
   }
   const macInput = `v1\0${expected.ownerUserId}\0${expected.accountInstanceId}\0${expB36}\0${pidHex}`
   const expectedMacHex = crypto
@@ -355,16 +369,16 @@ export function verifyScopedDocumentId(
     providedBuf.length !== expectedBuf.length ||
     !crypto.timingSafeEqual(providedBuf, expectedBuf)
   ) {
-    throw new LiteratureError('INVALID_INPUT')
+    throw new LiteratureError('DOCUMENT_EXPIRED')
   }
   const expMs = Number.parseInt(expB36, 36)
   const nowMs = expected.nowMs ?? Date.now()
   if (!Number.isFinite(expMs) || expMs <= nowMs) {
-    throw new LiteratureError('INVALID_INPUT')
+    throw new LiteratureError('DOCUMENT_EXPIRED')
   }
   const paperId = Buffer.from(pidHex, 'hex').toString('utf8')
   if (!/^[a-zA-Z0-9_.-]{3,64}$/.test(paperId)) {
-    throw new LiteratureError('INVALID_INPUT')
+    throw new LiteratureError('DOCUMENT_EXPIRED')
   }
   return { paperId }
 }
@@ -592,6 +606,7 @@ export interface WanfangLiteratureHttpExecutorOptions {
     signal: AbortSignal,
   ) => Promise<JieyouAccountState>
   readonly tokenSecret?: Buffer
+  readonly env?: NodeJS.ProcessEnv
   readonly now?: () => number
 }
 
@@ -606,7 +621,8 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
         signal: AbortSignal,
       ) => Promise<JieyouAccountState>)
     | undefined
-  private readonly tokenSecret: Buffer
+  private tokenSecret: Buffer | undefined
+  private readonly env: NodeJS.ProcessEnv | undefined
   private readonly now: () => number
   private readonly titleCache = new Map<string, string>()
   constructor(options: WanfangLiteratureHttpExecutorOptions) {
@@ -614,8 +630,19 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     this.resolver = options.resolver
     this.requester = options.requester ?? createPinnedDownstreamRequester(options.resolver)
     this.verifyMemberSessionOverride = options.verifyMemberSession
-    this.tokenSecret = options.tokenSecret ?? crypto.randomBytes(32)
+    this.env = options.env
+    this.tokenSecret =
+      options.tokenSecret ??
+      ((options.env ?? process.env).OPENCLAUDE_KMS_KEY
+        ? deriveLiteratureDocumentIdSecret(options.env ?? process.env)
+        : undefined)
     this.now = options.now ?? (() => Date.now())
+  }
+  private resolveTokenSecret(): Buffer {
+    if (!this.tokenSecret) {
+      this.tokenSecret = deriveLiteratureDocumentIdSecret(this.env ?? process.env)
+    }
+    return this.tokenSecret
   }
   private buildSearchOutput(
     parsed: ParsedWanfangPaper[],
@@ -627,7 +654,7 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     const items: LiteratureHttpSearchItem[] = parsed.slice(0, pageSize).map((item) => {
       this.rememberTitle(item.id, item.title)
       return {
-        documentId: mintScopedDocumentId(this.tokenSecret, {
+        documentId: mintScopedDocumentId(this.resolveTokenSecret(), {
           ownerUserId: String(input.ownerUserId ?? 1),
           accountInstanceId: input.accountInstanceId,
           paperId: item.id,
@@ -791,7 +818,7 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     const rawDocId =
       typeof input.params.documentId === 'string' ? input.params.documentId.trim() : ''
     if (!rawDocId) throw new LiteratureError('INVALID_INPUT')
-    const { paperId } = verifyScopedDocumentId(this.tokenSecret, rawDocId, {
+    const { paperId } = verifyScopedDocumentId(this.resolveTokenSecret(), rawDocId, {
       ownerUserId: String(input.ownerUserId ?? 1),
       accountInstanceId: input.accountInstanceId,
       nowMs: this.now(),

@@ -187,10 +187,23 @@ function isSafeDbId(value: string): boolean {
   return Number.isSafeInteger(numeric) && numeric > 0
 }
 
-function actionProjection(action: { id: string; description: string; effect: 'read' | 'write' }) {
+const LITERATURE_ACTION_DESCRIPTIONS: Readonly<Record<string, string>> = {
+  search:
+    '检索已授权文献数据库，返回有界结果与私有文献编号（documentId 有效期 24 小时；过期或报 DOCUMENT_EXPIRED 时请先重新 search 获取新编号）。',
+  download:
+    '下载本账号检索结果中的一篇文献，返回平台文件编号（documentId 有效期 24 小时，过期请先重新 search；下载多篇或遇 RATE_LIMITED 时请一篇一篇下，每篇隔 20-30 秒）。',
+}
+
+function actionProjection(
+  action: { id: string; description: string; effect: 'read' | 'write' },
+  slug?: string,
+) {
   return {
     id: action.id,
-    description: action.description,
+    description:
+      slug === 'literature-db'
+        ? (LITERATURE_ACTION_DESCRIPTIONS[action.id] ?? action.description)
+        : action.description,
     readOnly: action.effect === 'read',
   }
 }
@@ -537,7 +550,7 @@ export class PluginRuntimeFacade {
         label: row.name,
         description: row.description,
         accountMode: item.contract.account.mode,
-        actions: item.contract.actions.map(actionProjection),
+        actions: item.contract.actions.map((action) => actionProjection(action, row.slug)),
       })
     }
     return out
@@ -635,7 +648,7 @@ export class PluginRuntimeFacade {
           row.installed_description,
         accountMode:
           contract?.pluginType === 'managed-browser' ? contract.contract.account.mode : 'none',
-        actions: contract?.contract.actions.map(actionProjection) ?? [],
+        actions: contract?.contract.actions.map((action) => actionProjection(action, row.slug)) ?? [],
         installed: row.installed,
         installedVersion: row.installed_version,
         latestVersionId: available ? row.latest_id : null,
@@ -779,7 +792,7 @@ export class PluginRuntimeFacade {
         status: 'active',
         actions: item.contract.actions
           .filter((action) => action.effect === 'read' || writeControl?.enabled === true)
-          .map(actionProjection),
+          .map((action) => actionProjection(action, row.provider)),
         ...(writeControl
           ? {
               writeMode: !writeControl.enabled

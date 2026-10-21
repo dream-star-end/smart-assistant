@@ -43,6 +43,7 @@ oc-lit job-status <requestId>
   `result.records` 即逐条结果。中断/重启用**同一 requestId** 重发 `fetch-batch` 会断点续跑。
 - 下载未开启(平台 fetch flag 关)会报 `FETCH_DISABLED`:如实告诉用户需管理员开启,不要绕。
 - 批量下载前先去重(search 输出已去重),records 文件只保留需要的条目。
+- 若用户已授权绑定「文献数据库」插件(`oc-plugin call literature-db search/download`):`search` 返回的 `documentId` 有效期 24 小时,过期(报 `DOCUMENT_EXPIRED`)请先重新 `search` 获取新编号再 `download`;下载多篇或遇 `RATE_LIMITED` 时请一篇一篇下,每篇间隔 20-30 秒。
 
 - `--sources`:默认全查;可只选其一两个。`pubmed`=NCBI PubMed(生医/临床文献主源);
   `s2`=Semantic Scholar(需平台开启,未开启时该源被跳过并给 warning)。

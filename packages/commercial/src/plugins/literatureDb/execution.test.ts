@@ -28,6 +28,8 @@ import {
   WANFANG_WEBVPN_GRPC_PATH,
   WanfangLiteratureHttpExecutor,
   createPinnedDownstreamRequester,
+  DOCUMENT_ID_TTL_MS,
+  deriveLiteratureDocumentIdSecret,
   mintScopedDocumentId,
   parseSpringerSearchHtml,
   verifyScopedDocumentId,
@@ -239,7 +241,17 @@ test('mintScopedDocumentId and verifyScopedDocumentId enforce opaqueId schema, o
   })
   assert.equal(verified.paperId, 'sp_10.1007_s11128-026-05359-y')
 
-  // Wrong user rejected
+  assert.equal(DOCUMENT_ID_TTL_MS, 24 * 60 * 60 * 1000)
+  // Valid at 12 hours (within 24h TTL)
+  assert.equal(
+    verifyScopedDocumentId(secret, docId, {
+      ownerUserId: '42',
+      accountInstanceId: 'inst-42',
+      nowMs: now + 12 * 60 * 60 * 1000,
+    }).paperId,
+    'sp_10.1007_s11128-026-05359-y',
+  )
+  // Wrong user rejected with DOCUMENT_EXPIRED
   assert.throws(
     () =>
       verifyScopedDocumentId(secret, docId, {
@@ -247,9 +259,9 @@ test('mintScopedDocumentId and verifyScopedDocumentId enforce opaqueId schema, o
         accountInstanceId: 'inst-42',
         nowMs: now + 1000,
       }),
-    (err: unknown) => err instanceof LiteratureError && err.code === 'INVALID_INPUT',
+    (err: unknown) => err instanceof LiteratureError && err.code === 'DOCUMENT_EXPIRED',
   )
-  // Wrong account instance rejected
+  // Wrong account instance rejected with DOCUMENT_EXPIRED
   assert.throws(
     () =>
       verifyScopedDocumentId(secret, docId, {
@@ -257,17 +269,37 @@ test('mintScopedDocumentId and verifyScopedDocumentId enforce opaqueId schema, o
         accountInstanceId: 'inst-other',
         nowMs: now + 1000,
       }),
-    (err: unknown) => err instanceof LiteratureError && err.code === 'INVALID_INPUT',
+    (err: unknown) => err instanceof LiteratureError && err.code === 'DOCUMENT_EXPIRED',
   )
-  // Expired rejected
+  // Expired after 24h rejected with DOCUMENT_EXPIRED
   assert.throws(
     () =>
       verifyScopedDocumentId(secret, docId, {
         ownerUserId: '42',
         accountInstanceId: 'inst-42',
-        nowMs: now + 3 * 60 * 60 * 1000,
+        nowMs: now + 24 * 60 * 60 * 1000 + 1,
       }),
-    (err: unknown) => err instanceof LiteratureError && err.code === 'INVALID_INPUT',
+    (err: unknown) => err instanceof LiteratureError && err.code === 'DOCUMENT_EXPIRED',
+  )
+  // Deterministic HKDF derivation across restarts/deployments from OPENCLAUDE_KMS_KEY
+  const kmsEnv = { OPENCLAUDE_KMS_KEY: Buffer.alloc(32, 0x3c).toString('base64') }
+  const derivedA = deriveLiteratureDocumentIdSecret(kmsEnv)
+  const derivedB = deriveLiteratureDocumentIdSecret(kmsEnv)
+  assert.equal(derivedA.length, 32)
+  assert.deepEqual(derivedA, derivedB)
+  const crossRestartDocId = mintScopedDocumentId(derivedA, {
+    ownerUserId: '4',
+    accountInstanceId: 'inst-u4',
+    paperId: 'zgkx-ec202602003',
+    nowMs: now,
+  })
+  assert.equal(
+    verifyScopedDocumentId(derivedB, crossRestartDocId, {
+      ownerUserId: '4',
+      accountInstanceId: 'inst-u4',
+      nowMs: now + 6 * 60 * 60 * 1000,
+    }).paperId,
+    'zgkx-ec202602003',
   )
 })
 
