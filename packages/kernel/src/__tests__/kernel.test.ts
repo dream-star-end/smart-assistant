@@ -382,6 +382,28 @@ describe('log', () => {
   })
 })
 
+describe('level registry', () => {
+  test('registered refs follow setLogLevels; resetLogLevels restores start values; unknown is rejected', async () => {
+    const { registerLevelRef, registeredLogLevels, resetLogLevels, setLogLevels } = await import(
+      '../index.js'
+    )
+    const a = createLevelRef('warn')
+    const b = createLevelRef('info')
+    registerLevelRef('test-a', a)
+    registerLevelRef('test-b', b)
+    registerLevelRef('test-a', createLevelRef('error')) // first registration wins
+    setLogLevels('debug')
+    assert.equal(a.get(), 'debug')
+    assert.equal(b.get(), 'debug')
+    assert.throws(() => setLogLevels('loud' as never), TypeError)
+    assert.equal(a.get(), 'debug', 'an invalid level changes nothing')
+    resetLogLevels()
+    assert.equal(a.get(), 'warn')
+    assert.equal(b.get(), 'info')
+    assert.equal(registeredLogLevels()['test-a'], 'warn')
+  })
+})
+
 describe('trace (kernel/node)', () => {
   test('withTrace nests and merges; the logger adds the current context, explicit fields win', async () => {
     const lines: LogRecord[] = []

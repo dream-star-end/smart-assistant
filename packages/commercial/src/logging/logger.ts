@@ -25,6 +25,7 @@ import {
   createLevelRef,
   createLogger as createKernelLogger,
   parseLogLevel,
+  registerLevelRef,
 } from "@openclaude/kernel";
 import { measureLogWrite } from "@openclaude/protocol";
 
@@ -97,6 +98,7 @@ export function parseLevel(raw: string | undefined): LogLevel {
 
 /** 进程级共享级别:LOG_LEVEL 启动值,运行中可改(热生效接配置在 P1 后续步骤)。 */
 export const commercialLogLevel: LevelRef = createLevelRef(parseLevel(process.env.LOG_LEVEL));
+registerLevelRef("commercial", commercialLogLevel);
 
 const stdoutLine = (line: string) => {
   measureLogWrite(() => process.stdout.write(`${line}\n`), Buffer.byteLength(line) + 1);
