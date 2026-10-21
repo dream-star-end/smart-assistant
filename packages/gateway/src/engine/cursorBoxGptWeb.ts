@@ -36,6 +36,42 @@ const MAX_EXEC_STRING = 120 * 1024
 const BOX_LOGIN_NAME = /^[a-z0-9][a-z0-9_-]{0,31}$/i
 const FORBIDDEN_PROXY_PORTS = new Set([18991, 19095])
 
+export const BOX_GPT_WEB_OWNER_UID = 3
+export const BOX_GPT_WEB_OWNER_UID_STR = '3'
+export const BOX_GPT_WEB_MAX_CONCURRENCY = 1
+export const BOX_GPT_WEB_BUSY_CODE = 'BOX_GPT_WEB_BUSY'
+export const BOX_GPT_WEB_BUSY_MESSAGE =
+  'Pro 通道忙：当前已有 gpt-6-astra-pro 对话正在执行，一次只能运行一个 Pro 对话，请等待当前对话完成后再试。'
+
+let activeBoxGptWebTurnOwner: string | null = null
+
+export function isBoxGptWebAllowedContainerUser(env: NodeJS.ProcessEnv = {}): boolean {
+  const raw = env.OC_USER_ID?.trim()
+  if (!raw) {
+    return !env.OC_CONTAINER_ID
+  }
+  return raw === BOX_GPT_WEB_OWNER_UID_STR
+}
+
+export function tryAcquireBoxGptWebTurnSlot(ownerId: string): boolean {
+  if (!ownerId) return false
+  if (activeBoxGptWebTurnOwner !== null && activeBoxGptWebTurnOwner !== ownerId) {
+    return false
+  }
+  activeBoxGptWebTurnOwner = ownerId
+  return true
+}
+
+export function releaseBoxGptWebTurnSlot(ownerId?: string): void {
+  if (ownerId === undefined || activeBoxGptWebTurnOwner === ownerId) {
+    activeBoxGptWebTurnOwner = null
+  }
+}
+
+export function currentBoxGptWebTurnSlotOwner(): string | null {
+  return activeBoxGptWebTurnOwner
+}
+
 export interface BoxGptWebMod {
   chatgptWebCoreMjs: string
   hostMjs: string
@@ -131,7 +167,7 @@ export function validateBoxGptWebLoopbackProxy(proxyUrl: string | undefined | nu
  * or `$OPENCLAUDE_HOME/uploads`), matching `paths.uploadsDir` in `@openclaude/storage`
  * using Node built-ins only so `cursorBoxCcBridge` can run as plain `node`.
  */
-export function defaultTrustedUploadRoots(env: NodeJS.ProcessEnv = process.env): string[] {
+export function defaultTrustedUploadRoots(env: NodeJS.ProcessEnv = {}): string[] {
   const ocHome = env.OPENCLAUDE_HOME ?? join(homedir(), '.openclaude')
   return [join(ocHome, 'uploads')]
 }
@@ -179,7 +215,7 @@ const INBOUND_UNPARSED_DOC_BLOCK_RE =
  */
 export function inlineGptWebAttachmentsInUserLine(
   line: string,
-  opts?: { allowedUploadRoots?: readonly string[] },
+  opts?: { allowedUploadRoots?: readonly string[]; env?: NodeJS.ProcessEnv },
 ): string {
   const trimmed = line.trim()
   if (!trimmed.startsWith('{')) return line
@@ -192,7 +228,7 @@ export function inlineGptWebAttachmentsInUserLine(
   if (!parsed || typeof parsed !== 'object' || (parsed.type && parsed.type !== 'user')) {
     return line
   }
-  const allowedRoots = opts?.allowedUploadRoots ?? defaultTrustedUploadRoots()
+  const allowedRoots = opts?.allowedUploadRoots ?? defaultTrustedUploadRoots(opts?.env)
   const msg = parsed.message ?? parsed
   const content = msg?.content ?? parsed.prompt ?? ''
   const verifiedFiles: string[] = []
@@ -317,8 +353,11 @@ export function boxGptWebInteractiveLaunchExec(
   remoteArgs: readonly string[],
   mod: BoxGptWebMod = loadBoxGptWebMod(),
   profile = 'default',
-  env: NodeJS.ProcessEnv = process.env,
+  env: NodeJS.ProcessEnv = {},
 ): BoxCcExecRequest {
+  if (!isBoxGptWebAllowedContainerUser(env)) {
+    throw new Error('BOX_GPT_WEB_FORBIDDEN_USER')
+  }
   if (profile !== 'default' && !BOX_LOGIN_NAME.test(profile)) {
     throw new Error('BOX_INTERACTIVE_PROFILE_INVALID')
   }

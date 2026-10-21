@@ -45,4 +45,25 @@ export { measureLogWrite, takeLogWriteTimingSnapshot } from './logWriteTiming.js
 
 export * from './upstreamRetryHint.js'
 
-export * from './boxGptWebModels.js'
+export {
+  type BoxGptWebModel,
+  type BoxGptWebModelId,
+  type BoxGptWebThinkingMode,
+  type BoxGptWebUpstreamModelId,
+  BOX_GPT_WEB_BUSY_CODE,
+  BOX_GPT_WEB_BUSY_MESSAGE,
+  BOX_GPT_WEB_CATALOG_SQL_PLAN,
+  BOX_GPT_WEB_CDP_PORT_DEFAULT,
+  BOX_GPT_WEB_DISPLAY_DEFAULT,
+  BOX_GPT_WEB_FALLBACK_DISPLAY,
+  BOX_GPT_WEB_FORBIDDEN_PROXY_PORTS,
+  BOX_GPT_WEB_LOCAL_PROXY_DEFAULT,
+  BOX_GPT_WEB_MAX_CONCURRENCY,
+  BOX_GPT_WEB_MODEL_IDS,
+  BOX_GPT_WEB_MODELS,
+  BOX_GPT_WEB_OWNER_UID,
+  BOX_GPT_WEB_OWNER_UID_STR,
+  boxGptWebModelById,
+  isBoxGptWebModel,
+  isBoxGptWebOwnerUid,
+} from './boxGptWebModels.js'

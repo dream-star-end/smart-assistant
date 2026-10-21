@@ -19,7 +19,7 @@
  */
 
 import { Client } from "pg";
-import { COST_INDEX_BASELINE_MODEL_ID, costXVsBaseline, modelReasoningPolicy, STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
+import { COST_INDEX_BASELINE_MODEL_ID, costXVsBaseline, isBoxGptWebModel, isBoxGptWebOwnerUid, modelReasoningPolicy, STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
 import { query } from "../db/queries.js";
 import { loadConfig } from "../config.js";
 import { CATALOG_CHANNEL } from "./modelCatalog.js";
@@ -393,7 +393,7 @@ export class PricingCache {
    */
   listPublic(): PublicModel[] {
     return [...this.map.values()]
-      .filter((p) => p.enabled && p.visibility === "public")
+      .filter((p) => p.enabled && p.visibility === "public" && !isBoxGptWebModel(p.model_id))
       .sort((a, b) => a.sort_order - b.sort_order)
       .map(this.toPublicModel);
   }
@@ -415,6 +415,7 @@ export class PricingCache {
    * 之上还要查一次 DB(per-user 数据,无 NOTIFY 重载)。
    */
   listForUser(args: {
+    uid?: string | number | bigint | null;
     role: "user" | "admin";
     grantedModelIds: ReadonlySet<string>;
     deniedModelIds?: ReadonlySet<string>;
@@ -424,6 +425,10 @@ export class PricingCache {
     return [...this.map.values()]
       .filter((p) => {
         if (!p.enabled) return false;
+        if (isBoxGptWebModel(p.model_id)) {
+          if (args.uid !== undefined && !isBoxGptWebOwnerUid(args.uid)) return false;
+          if (!args.grantedModelIds.has(p.model_id)) return false;
+        }
         if (args.deniedModelIds?.has(p.model_id)) return false;
         if (!meetsMinPlan({
           minPlanCode: p.min_plan_code,

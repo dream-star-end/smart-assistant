@@ -1,13 +1,18 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+  BOX_GPT_WEB_BUSY_CODE,
+  BOX_GPT_WEB_BUSY_MESSAGE,
   BOX_GPT_WEB_CATALOG_SQL_PLAN,
   BOX_GPT_WEB_CDP_PORT_DEFAULT,
   BOX_GPT_WEB_DISPLAY_DEFAULT,
   BOX_GPT_WEB_FORBIDDEN_PROXY_PORTS,
   BOX_GPT_WEB_LOCAL_PROXY_DEFAULT,
+  BOX_GPT_WEB_MAX_CONCURRENCY,
   BOX_GPT_WEB_MODELS,
   BOX_GPT_WEB_MODEL_IDS,
+  BOX_GPT_WEB_OWNER_UID,
+  BOX_GPT_WEB_OWNER_UID_STR,
   boxClaudeRunner,
   boxGptWebModelById,
   cursorFamilyDefaultEffort,
@@ -16,6 +21,7 @@ import {
   cursorModelIdFromPublic,
   findCursorEngineModel,
   isBoxGptWebModel,
+  isBoxGptWebOwnerUid,
   isCursorEngineModel,
   publicCursorModelId,
 } from '../index.js'
@@ -36,6 +42,24 @@ describe('BOX_GPT_WEB_MODELS (OCV5-551 L0 protocol)', () => {
     assert.equal(model.maxOutputTokens, 128_000)
     assert.equal(model.supportsVision, true)
     assert.equal(model.runner, 'chatgpt-web-pro')
+  })
+
+  it('enforces exclusive owner user_id=3 and global concurrency=1 constants', () => {
+    assert.equal(BOX_GPT_WEB_OWNER_UID, 3)
+    assert.equal(BOX_GPT_WEB_OWNER_UID_STR, '3')
+    assert.equal(BOX_GPT_WEB_MAX_CONCURRENCY, 1)
+    assert.equal(BOX_GPT_WEB_BUSY_CODE, 'BOX_GPT_WEB_BUSY')
+    assert.match(BOX_GPT_WEB_BUSY_MESSAGE, /Pro 通道忙/)
+    assert.equal(isBoxGptWebOwnerUid(3), true)
+    assert.equal(isBoxGptWebOwnerUid('3'), true)
+    assert.equal(isBoxGptWebOwnerUid(' 3 '), true)
+    assert.equal(isBoxGptWebOwnerUid(3n), true)
+    assert.equal(isBoxGptWebOwnerUid(2), false)
+    assert.equal(isBoxGptWebOwnerUid(765), false)
+    assert.equal(isBoxGptWebOwnerUid('765'), false)
+    assert.equal(isBoxGptWebOwnerUid(0), false)
+    assert.equal(isBoxGptWebOwnerUid(null), false)
+    assert.equal(isBoxGptWebOwnerUid(undefined), false)
   })
 
   it('integrates with CURSOR_ENGINE_MODELS for interactive Box routing without polluting effort families', () => {

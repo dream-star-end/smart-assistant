@@ -22,6 +22,7 @@ import {
   isBoxInteractiveCatalogModel,
   type BoxCcControl,
 } from './cursorBoxCcExec.js'
+import { isBoxGptWebAllowedContainerUser } from './cursorBoxGptWeb.js'
 
 export {
   BOX_CC_CWD,
@@ -71,6 +72,7 @@ export function cursorBoxCcSelectionEligible(selection: CursorCredentialSelectio
  * relay to be installed. Needs the container's master route; otherwise the pool path stays. */
 export function cursorBoxCcFromMaster(model: string | undefined, remote: boolean,
   env: NodeJS.ProcessEnv = process.env): boolean {
+  if (isBoxGptWebCatalogModel(model) && !isBoxGptWebAllowedContainerUser(env)) return false
   return !remote && cursorBoxCcEnabled(env) && isBoxInteractiveCatalogModel(model) && boxLoginUrlFromEnv(env) !== null
 }
 

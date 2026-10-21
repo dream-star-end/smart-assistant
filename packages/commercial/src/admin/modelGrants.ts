@@ -43,6 +43,7 @@
 import type { PoolClient } from 'pg'
 import { query, tx } from '../db/queries.js'
 import { writeAdminAudit } from './audit.js'
+import { isBoxGptWebModel, isBoxGptWebOwnerUid } from '@openclaude/protocol'
 import { isCursorCredentialMember } from '../cursor/access.js'
 
 /**
@@ -181,6 +182,9 @@ export async function addGrant(
       [mid],
     )
     if (modelR.rows.length === 0) throw new GrantModelNotFoundError(mid)
+    if (isBoxGptWebModel(mid) && !isBoxGptWebOwnerUid(uid)) {
+      throw new GrantInvalidInputError('box_gpt_web_owner_only')
+    }
     if (modelR.rows[0]?.engine === 'cursor' && !isCursorCredentialMember(uid)) {
       throw new GrantInvalidInputError('cursor_credential_not_enabled')
     }

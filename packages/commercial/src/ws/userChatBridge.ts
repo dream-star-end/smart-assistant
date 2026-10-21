@@ -168,6 +168,9 @@ import {
   type MessageReplyQuote,
   type DispatchRequestContent,
   type SessionWorkspaceMode,
+  BOX_GPT_WEB_BUSY_MESSAGE,
+  isBoxGptWebModel,
+  isBoxGptWebOwnerUid,
   type DurableCodexBilling,
 } from "@openclaude/protocol";
 import { mintDispatchEnvelope } from "../dispatch/dispatchSigner.js";
@@ -6207,6 +6210,11 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account', cursorTurnIdentity);
               return;
             }
+            if (isBoxGptWebModel(modelCapture) && !isBoxGptWebOwnerUid(uid)) {
+              rejectPromptQueueDispatch('UNAUTHORIZED_MODEL');
+              sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'gpt-6-astra-pro is restricted to owner account user_id=3', cursorTurnIdentity);
+              return;
+            }
             // The local supervisor mounts the owner credential only on this
             // compute host. Missing host identity and remote rows fail closed.
             const eligible = await isCursorContainerOnSelfHost(
@@ -6220,9 +6228,46 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', 'Cursor requires the account-owned local runtime', cursorTurnIdentity);
               return;
             }
+            if (isBoxGptWebModel(modelCapture)) {
+              const busyPre = await deps.pgPool.query<{ dispatch_id: string }>(
+                `SELECT dispatch_id
+                   FROM turn_dispatches
+                  WHERE model = $1
+                    AND status IN ('admitted', 'accepted')
+                    AND (lease_until IS NULL OR lease_until > NOW())
+                    AND ($2::text IS NULL OR client_message_id <> $2)
+                  LIMIT 1`,
+                [modelCapture, cursorTurnIdentity.clientMessageId],
+              );
+              if (busyPre.rows.length > 0) {
+                rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
+                sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', BOX_GPT_WEB_BUSY_MESSAGE, cursorTurnIdentity);
+                return;
+              }
+            }
             const enriched = await attachMasterTurnState(parsedCapture, logCapture, traceCapture, !isPromptQueueDispatch && !isCronOriginDispatch, rejectPromptQueueDispatch, authorityModelCapture, recoveryJob, pretrackedEnrichment);
             if (enriched === null) return;
             dispatchRecord = lookupAdmittedDispatch(enriched);
+            if (isBoxGptWebModel(modelCapture) && dispatchRecord !== undefined) {
+              const busyPost = await deps.pgPool.query<{ dispatch_id: string }>(
+                `SELECT dispatch_id
+                   FROM turn_dispatches
+                  WHERE model = $1
+                    AND status IN ('admitted', 'accepted')
+                    AND (lease_until IS NULL OR lease_until > NOW())
+                    AND dispatch_id <> $2
+                  LIMIT 1`,
+                [modelCapture, dispatchRecord.dispatchId],
+              );
+              if (busyPost.rows.length > 0) {
+                rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
+                failDispatchPreForward(dispatchRecord, 'box_gpt_web_busy');
+                if (!cleaned && userWs.readyState === WebSocket.OPEN) {
+                  sendErrorFrame(userWs, 'CURSOR_UNAVAILABLE', BOX_GPT_WEB_BUSY_MESSAGE, cursorTurnIdentity);
+                }
+                return;
+              }
+            }
             let authorityExec: ResolvedTurnExecution | null = null;
             if (authorityOn) {
               // resolveAuthorityExecOrReject's legacy boolean means "non-CCB"
@@ -6301,11 +6346,13 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               return;
             }
-            await deps.pgPool.query(
-              `INSERT INTO cursor_external_usage_audit(request_id,user_id,container_id,session_id,model_id,status)
-               VALUES($1,$2,$3,$4,$5,'pending') ON CONFLICT (request_id) DO NOTHING`,
-              [requestId, uid, cid, peerCapture, modelCapture],
-            );
+            if (!isBoxGptWebModel(modelCapture)) {
+              await deps.pgPool.query(
+                `INSERT INTO cursor_external_usage_audit(request_id,user_id,container_id,session_id,model_id,status)
+                 VALUES($1,$2,$3,$4,$5,'pending') ON CONFLICT (request_id) DO NOTHING`,
+                [requestId, uid, cid, peerCapture, modelCapture],
+              );
+            }
             let authorityFields: Record<string, unknown> = {};
             if (authorityExec !== null) {
               const sealed = await sealAuthorityFieldsOrReject({

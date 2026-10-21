@@ -824,3 +824,60 @@ describe("platformAuxModels —— 平台次级模型", () => {
     );
   });
 });
+
+describe("OCV5-551 box-gpt-6-astra-pro owner uid=3 restriction", () => {
+  test("box-gpt-6-astra-pro is visible and routable only for uid=3, never for uid=765 or admin uid=2", () => {
+    const prevUids = process.env.OC_V5_CURSOR_CREDENTIAL_UIDS;
+    process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = "all";
+    try {
+      const astra = entry({
+        entryId: 551,
+        modelId: "box-gpt-6-astra-pro",
+        engine: "cursor",
+        providerId: "cursor",
+        upstreamModelId: "gpt-6-astra-pro",
+        contextWindow: 400_000,
+      });
+      const s = snap({
+        entries: [GLM, astra],
+        pricing: [
+          price("glm-5.2"),
+          price("box-gpt-6-astra-pro", { visibility: "hidden", displayName: "GPT-6-Astra-Pro" }),
+        ],
+      });
+
+      const grantSet = new Set(["box-gpt-6-astra-pro"]);
+      assert.equal(
+        s.canUseModel({ uid: 3, role: "admin", grantedModelIds: grantSet }, "box-gpt-6-astra-pro"),
+        true,
+      );
+      assert.deepEqual(
+        s.listForUser({ uid: 3, role: "admin", grantedModelIds: grantSet }).map((m) => m.modelId),
+        ["box-gpt-6-astra-pro", "glm-5.2"],
+      );
+
+      // uid=765 cannot see or use box-gpt-6-astra-pro even if granted
+      assert.equal(
+        s.canUseModel({ uid: 765, role: "user", grantedModelIds: grantSet }, "box-gpt-6-astra-pro"),
+        false,
+      );
+      assert.deepEqual(
+        s.listForUser({ uid: 765, role: "user", grantedModelIds: grantSet }).map((m) => m.modelId),
+        ["glm-5.2"],
+      );
+
+      // Another admin (uid=2) cannot see or use box-gpt-6-astra-pro even if granted
+      assert.equal(
+        s.canUseModel({ uid: 2, role: "admin", grantedModelIds: grantSet }, "box-gpt-6-astra-pro"),
+        false,
+      );
+      assert.deepEqual(
+        s.listForUser({ uid: 2, role: "admin", grantedModelIds: grantSet }).map((m) => m.modelId),
+        ["glm-5.2"],
+      );
+    } finally {
+      if (prevUids === undefined) delete process.env.OC_V5_CURSOR_CREDENTIAL_UIDS;
+      else process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = prevUids;
+    }
+  });
+});

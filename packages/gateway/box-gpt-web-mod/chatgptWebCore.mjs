@@ -27,6 +27,8 @@ export const DEFAULT_DISPLAY = ':1'
 export const DEFAULT_CDP_PORT = 9229
 export const DEFAULT_CHROME_BIN = '/usr/bin/google-chrome-stable'
 export const DEFAULT_CHATGPT_ORIGIN = 'https://chatgpt.com'
+export const BOX_GPT_WEB_BUSY_MESSAGE =
+  'Pro 通道忙：当前已有 gpt-6-astra-pro 对话正在执行，一次只能运行一个 Pro 对话，请等待当前对话完成后再试。'
 export const FORBIDDEN_PROXY_PORTS = new Set([18991, 19095])
 
 // 5-position Intelligence slider on ChatGPT Web (GPT-6 Astra Pro = index 4 / 100%)
@@ -277,7 +279,13 @@ export class SerialJobQueue {
 export async function withProfileFileLock(
   lockPath,
   fn,
-  { timeoutMs = 60_000, pollMs = 150, staleMs = 1_500_000, pidAliveFn = isPidAlive } = {},
+  {
+    timeoutMs = 60_000,
+    pollMs = 150,
+    staleMs = 1_500_000,
+    pidAliveFn = isPidAlive,
+    busyMessage = null,
+  } = {},
 ) {
   const deadline = Date.now() + timeoutMs
   let fd = null
@@ -306,9 +314,10 @@ export async function withProfileFileLock(
           }
         } catch {}
         if (Date.now() >= deadline) {
-          throw new Error(
-            `BOX_GPT_WEB_LOCK_TIMEOUT: could not acquire ${lockPath} within ${timeoutMs}ms`,
-          )
+          const msg = busyMessage
+            ? `${busyMessage} (BOX_GPT_WEB_LOCK_TIMEOUT: could not acquire ${lockPath} within ${timeoutMs}ms)`
+            : `BOX_GPT_WEB_LOCK_TIMEOUT: could not acquire ${lockPath} within ${timeoutMs}ms`
+          throw new Error(msg)
         }
         await new Promise((r) => setTimeout(r, pollMs))
         continue

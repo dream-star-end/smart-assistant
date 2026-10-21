@@ -36,6 +36,8 @@ export class SerialJobQueue {
   enqueue<T>(fn: () => Promise<T>, opts?: { timeoutMs?: number }): Promise<T>
 }
 
+export const BOX_GPT_WEB_BUSY_MESSAGE: string
+
 export function withProfileFileLock<T>(
   lockPath: string,
   fn: () => Promise<T>,
@@ -44,6 +46,7 @@ export function withProfileFileLock<T>(
     pollMs?: number
     staleMs?: number
     pidAliveFn?: (pid: number) => boolean
+    busyMessage?: string | null
   },
 ): Promise<T>
 

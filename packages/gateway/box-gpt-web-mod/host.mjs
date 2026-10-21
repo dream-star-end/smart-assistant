@@ -14,6 +14,7 @@ import readline from 'node:readline'
 import { pathToFileURL } from 'node:url'
 
 import {
+  BOX_GPT_WEB_BUSY_MESSAGE,
   DEFAULT_CHATGPT_ORIGIN,
   DEFAULT_CHROME_BIN,
   DEFAULT_DISPLAY,
@@ -291,8 +292,19 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
   const profileLockPath = `${profileDir}.lock`
   const portLockPath = path.join(os.tmpdir(), `.chatgpt-pro-cdp-${cfg.cdpPort}.lock`)
 
-  return withProfileFileLock(profileLockPath, () =>
-    withProfileFileLock(portLockPath, async () => {
+  const rawLockTimeout = process.env.OC_BOX_GPT_WEB_LOCK_TIMEOUT_MS
+  const lockTimeoutMs =
+    rawLockTimeout !== undefined && rawLockTimeout !== '' && Number.isFinite(Number(rawLockTimeout))
+      ? Number(rawLockTimeout)
+      : 0
+  const lockOpts = { timeoutMs: lockTimeoutMs, busyMessage: BOX_GPT_WEB_BUSY_MESSAGE }
+
+  return withProfileFileLock(
+    profileLockPath,
+    () =>
+      withProfileFileLock(
+        portLockPath,
+        async () => {
       if (turnControl.abort) {
         throw new Error('BOX_GPT_WEB_INTERRUPTED: turn aborted before launch')
       }
@@ -544,7 +556,10 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
 
         await new Promise((r) => setTimeout(r, 250))
       }
-    }),
+        },
+        lockOpts,
+      ),
+    lockOpts,
   )
 }
 
@@ -609,6 +624,34 @@ async function main() {
           }),
         )
       })()
+      return
+    }
+
+    if (queue.size > 0) {
+      if (!initEmitted) {
+        initEmitted = true
+        writeStdoutLine(
+          formatStreamJsonSystemInit({
+            sessionId: cfg.sessionId,
+            model: cfg.catalogModel,
+          }),
+        )
+      }
+      writeStdoutLine(
+        formatStreamJsonAssistantMessage({
+          messageId: `msg_busy_${Date.now()}`,
+          model: cfg.catalogModel,
+          text: BOX_GPT_WEB_BUSY_MESSAGE,
+        }),
+      )
+      writeStdoutLine(
+        formatStreamJsonResult({
+          sessionId: cfg.sessionId,
+          resultText: BOX_GPT_WEB_BUSY_MESSAGE,
+          isError: true,
+          durationMs: 0,
+        }),
+      )
       return
     }
 

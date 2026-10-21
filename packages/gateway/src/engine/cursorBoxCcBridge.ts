@@ -138,7 +138,7 @@ export async function runBoxCcBridge(opts: {
   const isGptWeb = isBoxGptWebModelArgv(opts.args)
   const login: BoxLoginPort =
     opts.login ??
-    (isGptWeb && !env.OC_BOX_LOGIN_URL
+    (isGptWeb
       ? {
           choose: async () => ({
             profile: env.OC_BOX_GPT_WEB_PROFILE || 'default',
@@ -451,7 +451,7 @@ class BoxSession {
   private async writeLine(line: string): Promise<void> {
     try {
       const payload = isBoxGptWebModelArgv(this.o.args)
-        ? inlineGptWebAttachmentsInUserLine(line)
+        ? inlineGptWebAttachmentsInUserLine(line, { env: this.o.env })
         : line
       for (const body of boxCcWriteExecs(this.control, payload, ++this.lineSeq))
         await this.writeExec(body)

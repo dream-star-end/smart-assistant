@@ -45,11 +45,16 @@ import {
 } from '../engine/cursorBoxCc.js'
 import { runBoxCcBridge } from '../engine/cursorBoxCcBridge.js'
 import {
+  BOX_GPT_WEB_BUSY_MESSAGE,
   boxGptWebInteractiveLaunchExec,
+  currentBoxGptWebTurnSlotOwner,
   inlineGptWebAttachmentsInUserLine,
+  isBoxGptWebAllowedContainerUser,
   isBoxGptWebModelArgv,
   loadBoxGptWebMod,
+  releaseBoxGptWebTurnSlot,
   remoteInteractiveGptWebArgs,
+  tryAcquireBoxGptWebTurnSlot,
   validateBoxGptWebLoopbackProxy,
 } from '../engine/cursorBoxGptWeb.js'
 import { masterBoxCredentialSelection } from '../engine/cursorCredentialSelection.js'
@@ -908,7 +913,10 @@ rl.on('line', (line) => {
           ...realMod,
           hostMjs: fakeHostMjs,
         },
-        env: {},
+        env: {
+          OC_USER_ID: '3',
+          OC_BOX_LOGIN_URL: 'http://172.31.0.1:4098/internal/box/login',
+        },
         loginStateDir: dir,
         fetchImpl: async (_url, init) => {
           const req = JSON.parse(
@@ -942,6 +950,82 @@ rl.on('line', (line) => {
       assert.equal(frames[3].type, 'assistant')
       assert.equal(frames[4].type, 'result')
       assert.equal(frames[4].is_error, false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('enforces user_id=3 container gate and global concurrency=1 turn slot', async () => {
+    assert.equal(isBoxGptWebAllowedContainerUser({ OC_USER_ID: '3' }), true)
+    assert.equal(isBoxGptWebAllowedContainerUser({ OC_USER_ID: ' 3 ' }), true)
+    assert.equal(isBoxGptWebAllowedContainerUser({ OC_USER_ID: '765' }), false)
+    assert.equal(isBoxGptWebAllowedContainerUser({ OC_USER_ID: '2' }), false)
+    assert.equal(isBoxGptWebAllowedContainerUser({ OC_CONTAINER_ID: '1150' }), false)
+
+    const baseEnv = {
+      OC_CURSOR_SAND_BOX_CC: '1',
+      OC_BOX_INTERACTIVE_MASTER: '1',
+      ANTHROPIC_BASE_URL: 'http://172.31.0.1:4098',
+      OPENCLAUDE_V3_MASTER_BASE_URL: 'http://172.31.0.1:4098',
+    }
+    assert.equal(
+      cursorBoxCcFromMaster('box-gpt-6-astra-pro', false, { ...baseEnv, OC_USER_ID: '3' }),
+      true,
+    )
+    assert.equal(
+      cursorBoxCcFromMaster('box-gpt-6-astra-pro', false, { ...baseEnv, OC_USER_ID: '765' }),
+      false,
+    )
+    assert.equal(
+      cursorBoxCcFromMaster('box-gpt-6-astra-pro', false, { ...baseEnv, OC_USER_ID: '2' }),
+      false,
+    )
+
+    const control: BoxCcControl = {
+      execUrl: 'https://127.0.0.1:8443/anyrun.v1.ExecService/Exec',
+      execToken: 'test-exec-token',
+      networkToken: 'test-net-token',
+      remoteClaude: '/usr/local/bin/claude',
+      fifo: '/tmp/oc-box-cc-test.fifo',
+      cwd: '/home/box',
+      accountId: '1001',
+    }
+    assert.throws(
+      () =>
+        boxGptWebInteractiveLaunchExec(
+          control,
+          ['--model', 'gpt-6-astra-pro'],
+          loadBoxGptWebMod(),
+          'default',
+          { OC_USER_ID: '765' },
+        ),
+      /BOX_GPT_WEB_FORBIDDEN_USER/,
+    )
+
+    releaseBoxGptWebTurnSlot()
+    assert.equal(currentBoxGptWebTurnSlotOwner(), null)
+    assert.equal(tryAcquireBoxGptWebTurnSlot('turn-1'), true)
+    assert.equal(currentBoxGptWebTurnSlotOwner(), 'turn-1')
+    assert.equal(tryAcquireBoxGptWebTurnSlot('turn-2'), false)
+    releaseBoxGptWebTurnSlot('turn-2')
+    assert.equal(currentBoxGptWebTurnSlotOwner(), 'turn-1')
+    releaseBoxGptWebTurnSlot('turn-1')
+    assert.equal(currentBoxGptWebTurnSlotOwner(), null)
+    assert.equal(tryAcquireBoxGptWebTurnSlot('turn-2'), true)
+    releaseBoxGptWebTurnSlot('turn-2')
+
+    const dir = mkdtempSync(join(tmpdir(), 'oc-box-gpt-web-busy-'))
+    try {
+      const lockPath = join(dir, 'profile.lock')
+      await assert.rejects(
+        withProfileFileLock(lockPath, async () => {
+          await withProfileFileLock(lockPath, async () => 'unexpected', {
+            timeoutMs: 0,
+            busyMessage: BOX_GPT_WEB_BUSY_MESSAGE,
+          })
+        }),
+        /Pro 通道忙/,
+      )
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
