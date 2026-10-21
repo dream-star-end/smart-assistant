@@ -623,6 +623,13 @@ export class DouyinSetupManager {
           session.qrExpireAt = expireAt
           session.phase = 'waiting_for_scan'
         },
+        onQrInvalid: () => {
+          if (session.terminal !== null || session.status !== 'waiting_for_scan') return
+          wipe(session.qr)
+          session.qr = null
+          session.qrExpireAt = null
+          session.phase = 'generating_qr'
+        },
         onVerification: (kind) => {
           void this.beginVerification(session, kind)
         },

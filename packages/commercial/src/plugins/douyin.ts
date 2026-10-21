@@ -170,6 +170,10 @@ interface SmsRejectedEvent {
 interface SmsResendFailedEvent {
   event: 'sms_resend_failed'
 }
+/** worker 作废了当前二维码（换码 / 502）：master 立即撤下缓存的码。 */
+interface QrInvalidEvent {
+  event: 'qr_invalid'
+}
 interface AuthenticatedEvent {
   event: 'authenticated'
   storageState: unknown
@@ -184,10 +188,12 @@ type WorkerEvent =
   | SmsSentEvent
   | SmsRejectedEvent
   | SmsResendFailedEvent
+  | QrInvalidEvent
 
 /** 只在登录 worker 里出现的非终止帧。 */
 const LOGIN_ONLY_EVENTS = new Set([
   'qr',
+  'qr_invalid',
   'verification',
   'sms_sent',
   'sms_rejected',
@@ -259,9 +265,13 @@ function parseWorkerEvent(value: unknown): WorkerEvent {
       throw new DouyinRuntimeError('PROTOCOL', 'worker sms frame is invalid')
     return event as unknown as SmsSentEvent
   }
-  if (event.event === 'sms_rejected' || event.event === 'sms_resend_failed') {
+  if (
+    event.event === 'sms_rejected' ||
+    event.event === 'sms_resend_failed' ||
+    event.event === 'qr_invalid'
+  ) {
     exactEventKeys(event, ['event'])
-    return event as unknown as SmsRejectedEvent | SmsResendFailedEvent
+    return event as unknown as SmsRejectedEvent | SmsResendFailedEvent | QrInvalidEvent
   }
   if (event.event === 'qr') {
     exactEventKeys(event, ['event', 'png', 'expireAt'])
@@ -882,6 +892,7 @@ export class DouyinDockerService {
     pins: readonly ManagedBrowserPinnedOrigin[]
     deadlineMs: number
     onQr: (png: Buffer, expireAt: number) => void
+    onQrInvalid?: () => void
     onAuthenticated: (storageState: unknown) => void
     onFailed: (code: string) => void
     onVerification?: (kind: 'sms_available' | 'unsupported') => void
@@ -902,6 +913,7 @@ export class DouyinDockerService {
       },
       onEvent: (event) => {
         if (event.event === 'qr') args.onQr(event.png, event.expireAt)
+        else if (event.event === 'qr_invalid') args.onQrInvalid?.()
         else if (event.event === 'authenticated') args.onAuthenticated(event.storageState)
         else if (event.event === 'failed') args.onFailed(event.code)
         else if (event.event === 'verification') args.onVerification?.(event.kind)

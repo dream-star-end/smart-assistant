@@ -453,14 +453,14 @@ function loginHarness() {
     `'use strict';
      ${sourceConsts('CHALLENGE_TEXT', 'QR_MIN_PUBLISH_MS', 'QR_STALL_MS')}
      ${pick('async function pageText', 'const commands = [];')}
-     return { challengeCode, pageChallenge, isMfaResponse, newQrTracker, qrOnResponse, qrNeedsKick, validCommand };`,
+     return { challengeCode, pageChallenge, isMfaResponse, newQrTracker, qrOnResponse, qrNeedsKick, validCommand, requestQrToken, smsResponse };`,
   )() as {
     challengeCode(text: string): string | null
     pageChallenge(context: unknown): Promise<string | null>
     isMfaResponse(data: unknown): boolean
     newQrTracker(): {
-      pending: { png: string; expireAt: number } | null
-      published: { png: string; expireAt: number } | null
+      pending: { png: string; expireAt: number; token: string } | null
+      published: { png: string; expireAt: number; token: string } | null
       lastPollAt: number
       lastGetQrAt: number
       status: string | null
@@ -471,14 +471,17 @@ function loginHarness() {
       http: number,
       json: unknown,
       now: number,
+      requestToken?: string | null,
     ): {
-      publish: { png: string; expireAt: number } | null
+      publish: { png: string; expireAt: number; token: string } | null
       invalidate: boolean
       mfa: boolean
       status: string | null
     }
     qrNeedsKick(tracker: unknown, now: number, overlay: boolean): boolean
     validCommand(value: unknown): { cmd: string; code?: string }
+    requestQrToken(url: string, postData: string | null): string | null
+    smsResponse(http: number, json: unknown): { ok: boolean; challenge: boolean }
   }
 }
 
@@ -533,71 +536,131 @@ describe('douyin login: visible captcha still stops; verification is the owner S
       assert.equal(L.isMfaResponse(data), false, JSON.stringify(data))
   })
 
-  test('a code is published only after the page polled it and got `new` with ≥45s left (4.3.C)', () => {
+  test('a code is published only after the page polled THAT code (by token) and got `new` with ≥45s left (4.3.C, Codex r1 P1)', () => {
     const t = L.newQrTracker()
     const now = 1_000_000
-    const issued = L.qrOnResponse(
-      t,
-      GET_QR,
-      200,
-      { data: { qrcode: PNG_B64, expire_time: (now + 60_000) / 1000 } },
-      now,
-    )
+    const qr = (token: string, expireAt: number) => ({
+      data: { qrcode: PNG_B64, expire_time: expireAt / 1000, token },
+    })
+    const issued = L.qrOnResponse(t, GET_QR, 200, qr('tokA', now + 60_000), now)
     assert.equal(issued.publish, null)
     assert.equal(issued.invalidate, true)
-    const polled = L.qrOnResponse(t, POLL, 200, { data: { status: 'new' } }, now + 1_500)
-    assert.deepEqual(polled.publish, { png: PNG_B64, expireAt: now + 60_000 })
-    // 下一次轮询不再重复发布同一个码。
+    // 带着别的 token（或拿不到 token）的 new 不发布。
     assert.equal(
-      L.qrOnResponse(t, POLL, 200, { data: { status: 'new' } }, now + 3_000).publish,
+      L.qrOnResponse(t, POLL, 200, { data: { status: 'new' } }, now + 1_000, 'other').publish,
       null,
     )
-    // 页面没在轮询的码（剩余 <45 秒才被确认）不发布。
-    const late = L.newQrTracker()
-    L.qrOnResponse(
-      late,
-      GET_QR,
-      200,
-      { data: { qrcode: PNG_B64, expire_time: (now + 60_000) / 1000 } },
-      now,
-    )
     assert.equal(
-      L.qrOnResponse(late, POLL, 200, { data: { status: 'new' } }, now + 20_000).publish,
+      L.qrOnResponse(t, POLL, 200, { data: { status: 'new' } }, now + 1_200, null).publish,
       null,
     )
-    // 过期应答自带新码：旧码立即作废，新码同样要等页面轮询。
+    const polled = L.qrOnResponse(t, POLL, 200, { data: { status: 'new' } }, now + 1_500, 'tokA')
+    assert.deepEqual(polled.publish, { png: PNG_B64, expireAt: now + 60_000, token: 'tokA' })
+    assert.equal(
+      L.qrOnResponse(t, POLL, 200, { data: { status: 'new' } }, now + 3_000, 'tokA').publish,
+      null,
+    )
+    // 新码 B 来了：A 立即作废；A 的迟到 new 不会让 B 被发布。
     const rotated = L.qrOnResponse(
       t,
       POLL,
       200,
-      { data: { status: 'expired', qrcode: PNG_B64, expire_time: (now + 120_000) / 1000 } },
+      { data: { status: 'expired', ...qr('tokB', now + 120_000).data } },
       now + 60_500,
+      'tokA',
     )
     assert.equal(rotated.invalidate, true)
     assert.equal(t.published, null)
-    // 502：作废已发布的码。
-    L.qrOnResponse(t, POLL, 200, { data: { status: 'new' } }, now + 61_000)
-    assert.ok(t.published)
-    assert.equal(L.qrOnResponse(t, POLL, 502, null, now + 62_000).invalidate, true)
+    assert.equal(
+      L.qrOnResponse(t, POLL, 200, { data: { status: 'new' } }, now + 60_700, 'tokA').publish,
+      null,
+    )
+    assert.ok(
+      L.qrOnResponse(t, POLL, 200, { data: { status: 'new' } }, now + 61_000, 'tokB').publish,
+    )
+    // 502：作废已发布的码；没有码时不必通知。
+    assert.equal(L.qrOnResponse(t, POLL, 502, null, now + 62_000, 'tokB').invalidate, true)
     assert.equal(t.published, null)
-    // 非 PNG base64 不接受。
-    const bad = L.newQrTracker()
-    L.qrOnResponse(
-      bad,
-      GET_QR,
-      200,
-      { data: { qrcode: '<svg onload=1>'.repeat(20), expire_time: (now + 60_000) / 1000 } },
-      now,
+    assert.equal(L.qrOnResponse(t, POLL, 502, null, now + 63_000, 'tokB').invalidate, false)
+    // 剩余 <45 秒才被确认：不发布。
+    const late = L.newQrTracker()
+    L.qrOnResponse(late, GET_QR, 200, qr('tokC', now + 60_000), now)
+    assert.equal(
+      L.qrOnResponse(late, POLL, 200, { data: { status: 'new' } }, now + 20_000, 'tokC').publish,
+      null,
+    )
+    // 没有 token 或不是 PNG base64 的码不发布。
+    for (const data of [
+      { qrcode: PNG_B64, expire_time: (now + 60_000) / 1000 },
+      { qrcode: '<svg onload=1>'.repeat(20), expire_time: (now + 60_000) / 1000, token: 'tokD' },
+    ]) {
+      const bad = L.newQrTracker()
+      L.qrOnResponse(bad, GET_QR, 200, { data }, now)
+      assert.equal(
+        L.qrOnResponse(bad, POLL, 200, { data: { status: 'new' } }, now + 1_000, 'tokD').publish,
+        null,
+      )
+    }
+  })
+
+  test('the poll token is read from the query string or the form / JSON body', () => {
+    assert.equal(
+      L.requestQrToken(
+        'https://creator.douyin.com/passport/web/check_qrconnect/?token=abc_1-2&x=1',
+        null,
+      ),
+      'abc_1-2',
     )
     assert.equal(
-      L.qrOnResponse(bad, POLL, 200, { data: { status: 'new' } }, now + 1_000).publish,
+      L.requestQrToken(
+        'https://creator.douyin.com/passport/web/check_qrconnect/',
+        'token=tok9&aid=1',
+      ),
+      'tok9',
+    )
+    assert.equal(
+      L.requestQrToken(
+        'https://creator.douyin.com/passport/web/check_qrconnect/',
+        '{"token":"tokJ"}',
+      ),
+      'tokJ',
+    )
+    assert.equal(
+      L.requestQrToken(
+        'https://creator.douyin.com/passport/web/check_qrconnect/?token=a%20b',
+        null,
+      ),
+      null,
+    )
+    assert.equal(
+      L.requestQrToken('https://creator.douyin.com/passport/web/check_qrconnect/', null),
       null,
     )
   })
 
+  test('send_code / validate_code: 403, 429 or a captcha is risk control; only `success` is ok', () => {
+    assert.deepEqual(L.smsResponse(200, { message: 'success', data: {} }), {
+      ok: true,
+      challenge: false,
+    })
+    assert.deepEqual(L.smsResponse(200, { message: 'error', data: { error_code: 7 } }), {
+      ok: false,
+      challenge: false,
+    })
+    for (const http of [403, 429])
+      assert.deepEqual(L.smsResponse(http, null), { ok: false, challenge: true })
+    assert.deepEqual(L.smsResponse(200, { message: 'error', data: { captcha: 'x' } }), {
+      ok: false,
+      challenge: true,
+    })
+  })
+
   test('MFA answers and scan states pass through the tracker', () => {
     const t = L.newQrTracker()
-    assert.equal(L.qrOnResponse(t, POLL, 200, { data: { status: 'scanned' } }, 1).status, 'scanned')
+    assert.equal(
+      L.qrOnResponse(t, POLL, 200, { data: { status: 'scanned' } }, 1, 'x').status,
+      'scanned',
+    )
     assert.equal(
       L.qrOnResponse(t, POLL, 200, { data: { biz_params: { std_verify_flow_id: 'x' } } }, 2).mfa,
       true,
@@ -618,7 +681,7 @@ describe('douyin login: visible captcha still stops; verification is the owner S
     const t = L.newQrTracker()
     assert.equal(L.qrNeedsKick(t, 0, false), false)
     assert.equal(L.qrNeedsKick(t, 0, true), true)
-    t.published = { png: PNG_B64, expireAt: 100_000 }
+    t.published = { png: PNG_B64, expireAt: 100_000, token: 'tokA' }
     t.lastPollAt = 105_000
     assert.equal(L.qrNeedsKick(t, 109_000, false), false)
     assert.equal(L.qrNeedsKick(t, 110_001, false), true)
@@ -658,17 +721,24 @@ describe('douyin login: visible captcha still stops; verification is the owner S
         loop.indexOf("event: 'authenticated'"),
     )
     assert.match(loop, /await runVerification\(login, flags, input\.deadlineMs\)/)
-    // 码只在页面轮询过之后才发给 master（qr 帧带 expireAt）。
+    // 码只在页面轮询过之后才发给 master（qr 帧带 expireAt）；作废立即通知 master。
     assert.match(
       loop,
       /if \(out\.publish\) \{ writeFrame\(\{ event: 'qr', png: out\.publish\.png, expireAt: out\.publish\.expireAt \}\)/,
     )
+    assert.match(loop, /if \(out\.invalidate\) writeFrame\(\{ event: 'qr_invalid' \}\)/)
+    assert.match(loop, /requestQrToken\(request\.url\(\), request\.postData\(\)\)/)
     const verify = DOUYIN_WORKER_SOURCE.slice(
       DOUYIN_WORKER_SOURCE.indexOf('async function runVerification'),
       DOUYIN_WORKER_SOURCE.indexOf('async function runLogin'),
     )
     // 发短信以 send_code 成功为准；提交以 validate_code 为准；只在 master 命令后才动作。
-    assert.match(verify, /flags\.sendCodeOkAt !== before/)
+    assert.match(verify, /flags\.sendCode\.at !== before/)
+    // 一次命令只点一次（一份额度一次发送）；风控立即停。
+    assert.equal((verify.match(/await target\.click\(/g) ?? []).length, 1)
+    assert.doesNotMatch(verify, /for \(let attempt/)
+    assert.match(verify, /flags\.sendCode\.challenge\) await failLogin\('UPSTREAM_CHALLENGE'/)
+    assert.match(verify, /flags\.validateChallenge\) await failLogin\('UPSTREAM_CHALLENGE'/)
     assert.match(verify, /flags\.validateAt !== before && flags\.validateOk/)
     assert.match(verify, /const command = await nextCommand\(/)
     assert.doesNotMatch(verify, /emitStep\([^)]*code: command/)
@@ -730,9 +800,18 @@ describe('douyin protocol, codes, logs, seed CLI', () => {
           framed({ event: 'sms_sent', resendAfterSec: 60 }),
           framed({ event: 'sms_rejected' }),
           framed({ event: 'sms_resend_failed' }),
+          framed({ event: 'qr_invalid' }),
         ]),
       ),
-      ['ready', 'qr', 'verification', 'sms_sent', 'sms_rejected', 'sms_resend_failed'],
+      [
+        'ready',
+        'qr',
+        'verification',
+        'sms_sent',
+        'sms_rejected',
+        'sms_resend_failed',
+        'qr_invalid',
+      ],
     )
     for (const bad of [
       { event: 'qr', png },
@@ -820,7 +899,7 @@ describe('douyin protocol, codes, logs, seed CLI', () => {
 
   test('seed CLI: advisory needs nothing; verify needs user + root-only QR path + root-only SMS code file', () => {
     assert.deepEqual(parseDouyinSeedCliArgs(['--advisory-status']), { mode: 'advisory-status' })
-    const sms = '--sms-code-file=/root/.g553-douyin-sms'
+    const sms = '--sms-code-fifo=/root/.g553-douyin-sms'
     assert.deepEqual(
       parseDouyinSeedCliArgs([
         '--verify-and-seed-user=247',
@@ -831,7 +910,7 @@ describe('douyin protocol, codes, logs, seed CLI', () => {
         mode: 'verify-and-seed',
         userId: 247,
         qrOut: '/root/g553-douyin-qr.png',
-        smsCodeFile: '/root/.g553-douyin-sms',
+        smsCodeFifo: '/root/.g553-douyin-sms',
       },
     )
     assert.deepEqual(
@@ -839,7 +918,7 @@ describe('douyin protocol, codes, logs, seed CLI', () => {
       {
         mode: 'verify-only',
         qrOut: '/root/g553-douyin-qr.png',
-        smsCodeFile: '/root/.g553-douyin-sms',
+        smsCodeFifo: '/root/.g553-douyin-sms',
       },
     )
     for (const bad of [
@@ -848,9 +927,10 @@ describe('douyin protocol, codes, logs, seed CLI', () => {
       ['--verify-and-seed-user=3', '--qr-out=/root/x.png'],
       ['--verify-and-seed-user=3', '--qr-out=/tmp/x.png', sms],
       ['--verify-and-seed-user=3', '--qr-out=/root/../x.png', sms],
-      ['--verify-and-seed-user=3', '--qr-out=/root/x.png', '--sms-code-file=/tmp/code'],
-      ['--verify-and-seed-user=3', '--qr-out=/root/x.png', '--sms-code-file=/root/x.png'],
+      ['--verify-and-seed-user=3', '--qr-out=/root/x.png', '--sms-code-fifo=/tmp/code'],
+      ['--verify-and-seed-user=3', '--qr-out=/root/x.png', '--sms-code-fifo=/root/x.png'],
       ['--verify-and-seed-user=3', '--qr-out=/root/x.png', sms, '--subtitle-bvid=BV1xx411c7mD'],
+      ['--verify-and-seed-user=3', '--qr-out=/root/x.png', '--sms-code-file=/root/.code'],
       ['--seed-only'],
     ])
       assert.throws(() => parseDouyinSeedCliArgs(bad), JSON.stringify(bad))

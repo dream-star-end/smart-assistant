@@ -361,31 +361,51 @@ function isMfaResponse(data) {
   return /std_verify|passport_mfa/.test(keys);
 }
 /**
- * 二维码追踪（纯逻辑）。新码先挂起；页面下一次轮询对它返回 new、且剩余 ≥45 秒，才发布给用户。
- * 返回 { publish, invalidate, mfa, status }。
+ * 二维码追踪（纯逻辑）。新码先挂起（记下它的 token）；页面随后**带着这个 token** 轮询并得到 new、且剩余
+ * ≥45 秒，才发布给用户。旧码的迟到应答不会让新码被发布（Codex r1 P1）。
+ * 返回 { publish, invalidate, mfa, status }；invalidate 时调用方要通知 master 撤下已发布的码。
  */
+const QR_TOKEN_RE = /^[A-Za-z0-9_-]{1,128}$/;
 function newQrTracker() { return { pending: null, published: null, lastPollAt: 0, lastGetQrAt: 0, status: null }; }
-function qrOnResponse(tracker, path, http, json, now) {
+function qrOnResponse(tracker, path, http, json, now, requestToken) {
   const out = { publish: null, invalidate: false, mfa: false, status: null };
   const isPoll = /check_qrconnect/.test(path);
   if (!isPoll && !/get_qrcode/.test(path)) return out;
-  if (isPoll && http !== 200) { tracker.published = null; tracker.pending = null; out.invalidate = true; return out; }
+  if (isPoll && http !== 200) { out.invalidate = !!(tracker.published || tracker.pending); tracker.published = null; tracker.pending = null; return out; }
   if (isPoll) tracker.lastPollAt = now;
   const data = json && typeof json === 'object' && json.data && typeof json.data === 'object' ? json.data : {};
   if (isPoll && isMfaResponse(data)) { out.mfa = true; return out; }
   if (typeof data.status === 'string') { tracker.status = data.status; out.status = data.status; }
   if (typeof data.qrcode === 'string' && data.qrcode.length > 100 && Number.isFinite(Number(data.expire_time))) {
     const b64 = data.qrcode.replace(/^data:image\/[a-z]+;base64,/, '');
-    tracker.pending = /^[A-Za-z0-9+/=]+$/.test(b64) && b64.length <= 700000 ? { png: b64, expireAt: Number(data.expire_time) * 1000 } : null;
+    const token = typeof data.token === 'string' && QR_TOKEN_RE.test(data.token) ? data.token : null;
+    tracker.pending = token && /^[A-Za-z0-9+/=]+$/.test(b64) && b64.length <= 700000 ? { png: b64, expireAt: Number(data.expire_time) * 1000, token } : null;
     tracker.published = null;
     out.invalidate = true;
     return out;
   }
-  if (isPoll && data.status === 'new' && tracker.pending) {
+  if (isPoll && data.status === 'new' && tracker.pending && requestToken === tracker.pending.token) {
     if (tracker.pending.expireAt - now >= QR_MIN_PUBLISH_MS) { tracker.published = tracker.pending; out.publish = tracker.pending; }
     tracker.pending = null;
   }
   return out;
+}
+/** 轮询请求带的二维码 token（查询串或表单 / JSON 请求体）。拿不到就是 null，对应的码不会被发布。 */
+function requestQrToken(url, postData) {
+  try { const q = new URL(url).searchParams.get('token'); if (q && QR_TOKEN_RE.test(q)) return q; } catch {}
+  if (typeof postData === 'string' && postData) {
+    try { const f = new URLSearchParams(postData).get('token'); if (f && QR_TOKEN_RE.test(f)) return f; } catch {}
+    try { const j = JSON.parse(postData); if (j && typeof j.token === 'string' && QR_TOKEN_RE.test(j.token)) return j.token; } catch {}
+  }
+  return null;
+}
+/** send_code / validate_code 的应答：403/429 或带验证码 = 风控，立即停（不重试）。 */
+function smsResponse(http, json) {
+  const data = json && typeof json === 'object' && json.data && typeof json.data === 'object' ? json.data : {};
+  return {
+    ok: !!(http === 200 && json && json.message === 'success'),
+    challenge: http === 403 || http === 429 || (typeof data.captcha === 'string' && data.captcha.length > 0)
+  };
 }
 /** 换码卡住：显示失效覆盖层 / 已发布的码过期超过 10 秒 / 超过 10 秒没有轮询。 */
 function qrNeedsKick(tracker, now, overlayVisible) {
@@ -483,13 +503,13 @@ async function runVerification(login, flags, deadlineMs) {
     if (command.cmd === 'invalid') await failLogin('WORKER_FAILED', 'login.command_invalid');
     if (command.cmd === 'abort' || !available) await failLogin('VERIFICATION_REQUIRED', 'login.verification_aborted');
     if (command.cmd === 'send_sms' || command.cmd === 'resend_sms') {
-      const before = flags.sendCodeOkAt;
-      for (let attempt = 1; attempt <= 3 && flags.sendCodeOkAt === before; attempt += 1) {
-        const target = command.cmd === 'send_sms' ? smsOption : login.getByText('重新发送', { exact: true }).last();
-        await target.click({ timeout: 1_500 }).catch(() => {});
-        await waitFor(login, () => flags.sendCodeOkAt !== before, 1_500);
-      }
-      if (flags.sendCodeOkAt !== before) { writeFrame({ event: 'sms_sent', resendAfterSec: SMS_RESEND_AFTER_SEC }); emitStep({ step: 'login.sms_sent' }); }
+      // 一次命令只点一次（一份限频额度对应一次发送，Codex r1 P1）；以 send_code 应答为准。
+      const before = flags.sendCode.at;
+      const target = command.cmd === 'send_sms' ? smsOption : login.getByText('重新发送', { exact: true }).last();
+      await target.click({ timeout: 3_000 }).catch(() => {});
+      await waitFor(login, () => flags.sendCode.at !== before, 6_000);
+      if (flags.sendCode.at !== before && flags.sendCode.challenge) await failLogin('UPSTREAM_CHALLENGE', 'login.sms_challenge');
+      if (flags.sendCode.at !== before && flags.sendCode.ok) { writeFrame({ event: 'sms_sent', resendAfterSec: SMS_RESEND_AFTER_SEC }); emitStep({ step: 'login.sms_sent' }); }
       else if (command.cmd === 'send_sms') await failLogin('VERIFICATION_REQUIRED', 'login.sms_send_failed');
       else writeFrame({ event: 'sms_resend_failed' });
       continue;
@@ -502,6 +522,7 @@ async function runVerification(login, flags, deadlineMs) {
       command.code = '';
       await login.getByText('验证', { exact: true }).last().click({ timeout: 5_000 }).catch(() => {});
       await waitFor(login, () => flags.validateAt !== before, VALIDATE_WAIT_MS);
+      if (flags.validateAt !== before && flags.validateChallenge) await failLogin('UPSTREAM_CHALLENGE', 'login.sms_challenge');
       if (flags.validateAt !== before && flags.validateOk) { flags.validated = true; emitStep({ step: 'login.sms_validated' }); return; }
       await input.fill('', { timeout: 2_000 }).catch(() => {});
       writeFrame({ event: 'sms_rejected' });
@@ -516,7 +537,7 @@ async function runLogin(input, relay) {
   try {
     const context = await secureContext(browser, { cookies: [], origins: [] }, allowed, ['GET', 'POST', 'HEAD']);
     const tracker = newQrTracker();
-    const flags = { mfa: false, validated: false, sendCodeOkAt: 0, validateAt: 0, validateOk: false };
+    const flags = { mfa: false, validated: false, sendCode: { at: 0, ok: false, challenge: false }, validateAt: 0, validateOk: false, validateChallenge: false };
     context.on('request', (request) => { try { if (/\/passport\/web\/get_qrcode\//.test(new URL(request.url()).pathname)) tracker.lastGetQrAt = Date.now(); } catch {} });
     context.on('response', async (response) => {
       let path;
@@ -524,10 +545,13 @@ async function runLogin(input, relay) {
       if (!/\/passport\/web\/(get_qrcode|check_qrconnect|send_code|validate_code)\//.test(path)) return;
       let json = null;
       try { json = JSON.parse(await response.text()); } catch {}
-      if (/send_code/.test(path)) { if (json && json.message === 'success') flags.sendCodeOkAt = Date.now(); return; }
-      if (/validate_code/.test(path)) { flags.validateOk = !!(json && json.message === 'success'); flags.validateAt = Date.now(); return; }
-      const out = qrOnResponse(tracker, path, response.status(), json, Date.now());
+      if (/send_code/.test(path)) { const r = smsResponse(response.status(), json); flags.sendCode = { at: Date.now(), ok: r.ok, challenge: r.challenge }; return; }
+      if (/validate_code/.test(path)) { const r = smsResponse(response.status(), json); flags.validateOk = r.ok; flags.validateChallenge = r.challenge; flags.validateAt = Date.now(); return; }
+      const request = response.request();
+      const out = qrOnResponse(tracker, path, response.status(), json, Date.now(), requestQrToken(request.url(), request.postData()));
       if (out.mfa) flags.mfa = true;
+      // 码作废（换码 / 502）：立即让 master 撤下已发布的码，免得用户继续扫一个已失效的码（Codex r1 P1）。
+      if (out.invalidate) writeFrame({ event: 'qr_invalid' });
       if (out.publish) { writeFrame({ event: 'qr', png: out.publish.png, expireAt: out.publish.expireAt }); emitStep({ step: 'login.qr' }); }
     });
     const login = await context.newPage();

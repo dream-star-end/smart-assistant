@@ -346,6 +346,7 @@ function smsHarness(opts: { quota?: Array<'ok' | 'limited' | 'unavailable'> } = 
   let cb:
     | {
         onQr: (png: Buffer, expireAt: number) => void
+        onQrInvalid: () => void
         onAuthenticated: (state: unknown) => void
         onFailed: (code: string) => void
         onVerification: (kind: 'sms_available' | 'unsupported') => void
@@ -408,6 +409,16 @@ describe('Douyin owner SMS verification (4.3.C)', () => {
     h.cb().onQr(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), 1_060_000)
     const waiting = await h.manager.status(7, setup.sessionId)
     assert.equal(waiting.qrExpireAt, new Date(1_060_000).toISOString())
+    // worker 作废了这个码：立即撤下，不再提供（Codex r1 P1）。
+    h.cb().onQrInvalid()
+    const invalid = await h.manager.status(7, setup.sessionId)
+    assert.equal(invalid.qrReady, false)
+    assert.equal(invalid.qrExpireAt, undefined)
+    await assert.rejects(
+      h.manager.qr(7, setup.sessionId),
+      (e: unknown) => e instanceof DouyinSetupError && e.code === 'QR_NOT_READY',
+    )
+    h.cb().onQr(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), 1_060_000)
     h.cb().onVerification('sms_available')
     await settle()
     assert.deepEqual(h.quotaCalls, [7])
