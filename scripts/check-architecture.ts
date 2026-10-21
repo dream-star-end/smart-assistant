@@ -22,7 +22,7 @@
  * Usage: npx tsx scripts/check-architecture.ts [--root <repo>] [--enforce] [--base <git-ref>]
  *          [--json <out.json>] [--write-baseline]
  */
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -262,54 +262,60 @@ export function resolveSpec(
   pkgs: Pkg[],
   from: string,
   spec: string,
-): { file: string | null; pkg: Pkg | null } {
+): { files: string[]; pkg: Pkg | null } {
   if (spec.startsWith('.')) {
     const f = resolveFile(
       root,
       path.posix.normalize(path.posix.join(path.posix.dirname(from), spec)),
     )
-    return { file: f, pkg: f ? pkgOf(pkgs, f) : null }
+    // an unresolved relative import is internal by definition: report it, never treat it as external
+    return { files: f ? [f] : [], pkg: f ? pkgOf(pkgs, f) : pkgOf(pkgs, from) }
   }
   const p = pkgs.find((x) => spec === x.name || spec.startsWith(`${x.name}/`))
-  if (!p) return { file: null, pkg: null }
+  if (!p) return { files: [], pkg: null }
   const sub = spec.slice(p.name.length + 1)
   // package.json `exports` first (the runtime resolves through it), then the src/ convention.
-  const target = exportTarget(p.exports, sub ? `./${sub}` : '.')
-  const viaExports = target ? resolveFile(root, path.posix.normalize(`${p.dir}/${target}`)) : null
-  const f =
-    viaExports ??
-    (sub
-      ? (resolveFile(root, `${p.dir}/src/${sub}`) ?? resolveFile(root, `${p.dir}/${sub}`))
-      : resolveFile(root, `${p.dir}/src/index`))
-  return { file: f, pkg: p }
+  const viaExports = exportTargets(p.exports, sub ? `./${sub}` : '.')
+    .map((t) => resolveFile(root, path.posix.normalize(`${p.dir}/${t}`)))
+    .filter((f): f is string => !!f)
+  if (viaExports.length) return { files: [...new Set(viaExports)], pkg: p }
+  const f = sub
+    ? (resolveFile(root, `${p.dir}/src/${sub}`) ?? resolveFile(root, `${p.dir}/${sub}`))
+    : resolveFile(root, `${p.dir}/src/index`)
+  return { files: f ? [f] : [], pkg: p }
 }
-/** The file an `exports` entry points at for this subpath (types, then default; wildcards one level). */
-function exportTarget(exp: unknown, sub: string): string | null {
-  if (!exp) return null
-  if (typeof exp === 'string') return sub === '.' ? exp : null
-  if (typeof exp !== 'object') return null
+/**
+ * Every runtime file an `exports` entry can load for this subpath (wildcards one level). `types` is
+ * not a runtime target, so it is never an edge; when conditions disagree, each one is an edge.
+ */
+export function exportTargets(exp: unknown, sub: string): string[] {
+  if (!exp) return []
+  if (typeof exp === 'string') return sub === '.' ? [exp] : []
+  if (typeof exp !== 'object') return []
   const map = exp as Record<string, unknown>
-  const pick = (v: unknown): string | null => {
-    if (typeof v === 'string') return v
-    if (v && typeof v === 'object') {
-      const o = v as Record<string, unknown>
-      return pick(o.types ?? o.default ?? o.import ?? o.require ?? null)
-    }
-    return null
+  const pick = (v: unknown): string[] => {
+    if (typeof v === 'string') return [v]
+    if (Array.isArray(v)) return v.flatMap(pick)
+    if (v && typeof v === 'object')
+      return Object.entries(v as Record<string, unknown>)
+        .filter(([k]) => k !== 'types')
+        .flatMap(([, x]) => pick(x))
+    return []
   }
-  if (!Object.keys(map).some((k) => k.startsWith('.'))) return sub === '.' ? pick(map) : null
-  if (sub in map) return pick(map[sub])
+  const uniq = (xs: string[]) => [...new Set(xs)]
+  if (!Object.keys(map).some((k) => k.startsWith('.'))) return sub === '.' ? uniq(pick(map)) : []
+  if (sub in map) return uniq(pick(map[sub]))
   for (const [k, v] of Object.entries(map)) {
     const star = k.indexOf('*')
     if (star < 0) continue
     const pre = k.slice(0, star)
     const post = k.slice(star + 1)
-    if (sub.startsWith(pre) && sub.endsWith(post)) {
-      const t = pick(v)
-      if (t) return t.replace('*', sub.slice(pre.length, sub.length - post.length))
-    }
+    if (sub.startsWith(pre) && sub.endsWith(post))
+      return uniq(
+        pick(v).map((t) => t.replace('*', sub.slice(pre.length, sub.length - post.length))),
+      )
   }
-  return null
+  return []
 }
 
 function pkgOf(pkgs: Pkg[], file: string): Pkg | null {
@@ -389,26 +395,35 @@ export function factsOf(fileName: string, text: string): FileFacts {
     specialCase: 0,
   }
   const line = (n: ts.Node) => sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1
-  // local name → imported name, so `import { createHmac as h }` and `const { requireAuth: ra } = x`
-  // are still recognised at the call site.
-  const alias = new Map<string, string>()
+  // local name → every name it was bound from, so `import { createHmac as h }` and
+  // `const { requireAuth: ra } = x` are still recognised at the call site. Bindings are only ever
+  // added, never replaced: a same-named local in another scope must not erase an import's identity
+  // (that can over-count a shadowed name, never under-count a real call).
+  const alias = new Map<string, Set<string>>()
+  const bind = (local: string, from: string) => {
+    const s = alias.get(local) ?? new Set<string>()
+    s.add(from)
+    for (const x of alias.get(from) ?? []) s.add(x)
+    alias.set(local, s)
+  }
   const collect = (n: ts.Node): void => {
-    if (ts.isImportSpecifier(n)) alias.set(n.name.text, (n.propertyName ?? n.name).text)
+    if (ts.isImportSpecifier(n)) bind(n.name.text, (n.propertyName ?? n.name).text)
     else if (
       ts.isBindingElement(n) &&
       ts.isIdentifier(n.name) &&
       n.propertyName &&
       ts.isIdentifier(n.propertyName)
     )
-      alias.set(n.name.text, n.propertyName.text)
+      bind(n.name.text, n.propertyName.text)
     else if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer) {
       const init = n.initializer
-      if (ts.isIdentifier(init)) alias.set(n.name.text, alias.get(init.text) ?? init.text)
-      else if (ts.isPropertyAccessExpression(init)) alias.set(n.name.text, init.name.text)
+      if (ts.isIdentifier(init)) bind(n.name.text, init.text)
+      else if (ts.isPropertyAccessExpression(init)) bind(n.name.text, init.name.text)
     }
     ts.forEachChild(n, collect)
   }
   collect(sf)
+  const namesOf = (id: string) => new Set([id, ...(alias.get(id) ?? [])])
   const visit = (n: ts.Node): void => {
     if (ts.isImportDeclaration(n) && ts.isStringLiteral(n.moduleSpecifier)) {
       const c = n.importClause
@@ -446,21 +461,19 @@ export function factsOf(fileName: string, text: string): FileFacts {
           if (NET_MODULES.has(a.text)) f.net++
         } else f.dynamicNonLiteral++
       }
-      const name = ts.isIdentifier(callee)
-        ? (alias.get(callee.text) ?? callee.text)
-        : ts.isPropertyAccessExpression(callee)
-          ? callee.name.text
-          : ''
+      const names = ts.isIdentifier(callee)
+        ? namesOf(callee.text)
+        : new Set(ts.isPropertyAccessExpression(callee) ? [callee.name.text] : [])
       if (
-        name === 'fetch' &&
+        names.has('fetch') &&
         (ts.isIdentifier(callee) ||
           (ts.isPropertyAccessExpression(callee) &&
             ts.isIdentifier(callee.expression) &&
             ['globalThis', 'window', 'self'].includes(callee.expression.text)))
       )
         f.net++
-      if (CRYPTO_FNS.has(name)) f.crypto++
-      if (AUTH_FNS.has(name)) f.handlerAuth++
+      if ([...names].some((x) => CRYPTO_FNS.has(x))) f.crypto++
+      if ([...names].some((x) => AUTH_FNS.has(x))) f.handlerAuth++
     } else if (ts.isPropertyAccessExpression(n) || ts.isElementAccessExpression(n)) {
       const nameText = ts.isPropertyAccessExpression(n)
         ? n.name.text
@@ -518,6 +531,13 @@ export function check(
   const v = (rule: string, file: string, target = '-') => out.push({ rule, file, target })
   for (const file of files) {
     const mod = map.moduleOf(file)
+    // parse every production file first: an unmapped file that does not parse is still exit 2
+    let facts: FileFacts
+    try {
+      facts = factsOf(file, readFileSync(path.join(root, file), 'utf8'))
+    } catch (e) {
+      fail(`cannot parse ${(e as Error).message}`)
+    }
     if (!mod) {
       v('R1-unmapped', file)
       continue
@@ -525,12 +545,6 @@ export function check(
     const amb = map.ambiguous(file)
     if (amb.length) fail(`modules.json maps ${file} to ${amb.join(' and ')} with equal specificity`)
     const me = map.get(mod)
-    let facts: FileFacts
-    try {
-      facts = factsOf(file, readFileSync(path.join(root, file), 'utf8'))
-    } catch (e) {
-      fail(`cannot parse ${(e as Error).message}`)
-    }
     const myPkg = pkgOf(pkgs, file)
     for (const imp of facts.imports) {
       if (imp.spec.startsWith('node:') && me.layer === 'L0' && !imp.type)
@@ -538,31 +552,36 @@ export function check(
       if (imp.type) continue
       const r = resolveSpec(root, pkgs, file, imp.spec)
       if (!r.pkg) continue // external package
-      if (!r.file) {
+      if (!r.files.length) {
         v('R2-unresolved-internal', file, imp.spec) // an internal import the checker cannot follow is not "no violation"
         continue
       }
-      if (imp.spec.startsWith('.') && r.pkg !== myPkg) v('R2-cross-package-internal', file, r.file)
-      if (
-        /\.(ts|tsx|mts)$/.test(r.file) &&
-        !/\.d\.ts$/.test(r.file) &&
-        !isProductionSource(r.file)
-      ) {
-        v('R2-imports-test-code', file, r.file) // production code must not import test helpers (§3.1)
-        continue
+      for (const target of r.files) {
+        if (imp.spec.startsWith('.') && r.pkg !== myPkg)
+          v('R2-cross-package-internal', file, target)
+        if (
+          /\.(ts|tsx|mts)$/.test(target) &&
+          !/\.d\.ts$/.test(target) &&
+          !isProductionSource(target)
+        ) {
+          v('R2-imports-test-code', file, target) // production code must not import test helpers (§3.1)
+          continue
+        }
+        const tm = map.moduleOf(target)
+        if (!tm || tm === mod) continue
+        edges++
+        const t = map.get(tm)
+        const front = me.layer.startsWith('F')
+        if (front !== t.layer.startsWith('F') && !(front && t.layer === 'L0'))
+          v('R2-front-back', file, tm)
+        else if (LAYER_RANK[t.layer]! > LAYER_RANK[me.layer]!) v('R2-upward', file, tm)
+        else if (t.layer === me.layer && !(me.allow ?? []).includes(tm))
+          v('R2-same-layer', file, tm)
+        const ms = me.scope ?? []
+        const tsc = t.scope ?? []
+        if (ms.length > 1 && tsc.length && !ms.every((s) => tsc.includes(s)))
+          v('R2-scope', file, tm)
       }
-      const tm = map.moduleOf(r.file)
-      if (!tm || tm === mod) continue
-      edges++
-      const t = map.get(tm)
-      const front = me.layer.startsWith('F')
-      if (front !== t.layer.startsWith('F') && !(front && t.layer === 'L0'))
-        v('R2-front-back', file, tm)
-      else if (LAYER_RANK[t.layer]! > LAYER_RANK[me.layer]!) v('R2-upward', file, tm)
-      else if (t.layer === me.layer && !(me.allow ?? []).includes(tm)) v('R2-same-layer', file, tm)
-      const ms = me.scope ?? []
-      const tsc = t.scope ?? []
-      if (ms.length > 1 && tsc.length && !ms.every((s) => tsc.includes(s))) v('R2-scope', file, tm)
     }
     if (facts.dynamicNonLiteral)
       for (let i = 0; i < facts.dynamicNonLiteral; i++) v('R2-dynamic-import', file)
@@ -592,11 +611,20 @@ export function tally(vs: Violation[]): Record<string, number> {
 /** Git renames base...HEAD (one-to-one pairs only), used to carry baseline entries across a move. */
 export function renamesSince(root: string, base: string): Map<string, string> {
   const out = new Map<string, string>()
-  const txt = execFileSync(
-    'git',
-    ['diff', '-M', '--name-status', '--diff-filter=R', `${base}...HEAD`],
-    { cwd: root, encoding: 'utf8' },
-  )
+  let txt: string
+  try {
+    txt = execFileSync(
+      'git',
+      ['diff', '-M', '--name-status', '--diff-filter=R', `${base}...HEAD`],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    )
+  } catch (e) {
+    fail(`git diff ${base}...HEAD: ${(e as Error).message.split('\n')[0]}`)
+  }
   for (const l of txt.split('\n')) {
     const [st, from, to] = l.split('\t')
     if (st?.startsWith('R') && from && to) out.set(from, to)
@@ -604,17 +632,44 @@ export function renamesSince(root: string, base: string): Map<string, string> {
   return out
 }
 
+/** The baseline entries as committed at `rev`, or null when that commit has no baseline file. */
+export function baselineAt(root: string, rev: string): Record<string, number> | null {
+  const r = spawnSync('git', ['show', `${rev}:arch/violations-baseline.json`], {
+    cwd: root,
+    encoding: 'utf8',
+    maxBuffer: 1 << 28,
+  })
+  if (r.status !== 0) {
+    // only "path not in that commit" means no baseline; a bad ref or any other git error fails closed
+    if (/does not exist in|exists on disk, but not in/.test(r.stderr)) return null
+    fail(`git show ${rev}:arch/violations-baseline.json: ${r.stderr.trim().split('\n')[0]}`)
+  }
+  try {
+    const j = JSON.parse(r.stdout)
+    if (j.schema !== 1 || !j.entries || typeof j.entries !== 'object') throw new Error('bad shape')
+    return j.entries
+  } catch (e) {
+    fail(`invalid baseline at ${rev}: ${(e as Error).message}`)
+  }
+}
+
+/** Baseline keys rewritten through git renames (file and target), counts summed. */
+export function carry(entries: Record<string, number>, renames = new Map<string, string>()) {
+  const moved: Record<string, number> = {}
+  for (const [k, n] of Object.entries(entries)) {
+    const [rule, file, target] = k.split('|')
+    const nk = `${rule}|${renames.get(file!) ?? file}|${renames.get(target!) ?? target}`
+    moved[nk] = (moved[nk] ?? 0) + n
+  }
+  return moved
+}
+
 export function compare(
   baseline: Record<string, number>,
   current: Record<string, number>,
   renames = new Map<string, string>(),
 ) {
-  const moved: Record<string, number> = {}
-  for (const [k, n] of Object.entries(baseline)) {
-    const [rule, file, target] = k.split('|')
-    const nk = `${rule}|${renames.get(file!) ?? file}|${renames.get(target!) ?? target}`
-    moved[nk] = (moved[nk] ?? 0) + n
-  }
+  const moved = carry(baseline, renames)
   const grown: { key: string; baseline: number; now: number }[] = []
   const stale: { key: string; baseline: number; now: number }[] = []
   for (const [k, n] of Object.entries(current))
@@ -670,11 +725,19 @@ function main() {
       fail(`invalid violations-baseline.json entry ${JSON.stringify(k)}: ${JSON.stringify(n)}`)
   }
   const base = opt('--base')
-  const { grown, stale } = compare(
-    baseline.entries,
-    current,
-    base ? renamesSince(root, base) : undefined,
-  )
+  const renames = base ? renamesSince(root, base) : undefined
+  const { grown, stale } = compare(baseline.entries, current, renames)
+  // Rule 4 also holds for the baseline file itself: against the base commit's baseline it may only
+  // shrink, otherwise a PR could add a violation and raise its count in the same diff.
+  let baselineGrown: { key: string; baseline: number; now: number }[] = []
+  let baseHasBaseline = false
+  if (base) {
+    const prev = baselineAt(root, base)
+    if (prev) {
+      baseHasBaseline = true
+      baselineGrown = compare(prev, carry(baseline.entries, renames), renames).grown
+    }
+  }
   const byRule: Record<string, number> = {}
   for (const x of res.violations) byRule[x.rule] = (byRule[x.rule] ?? 0) + 1
   const unmapped = res.violations.filter((x) => x.rule === 'R1-unmapped').length
@@ -689,6 +752,7 @@ function main() {
     identities: Object.keys(current).length,
     grown,
     stale,
+    baselineGrown,
   }
   const jout = opt('--json')
   if (jout) writeFileSync(jout, `${JSON.stringify(report, null, 1)}\n`)
@@ -707,8 +771,14 @@ function main() {
   for (const s of stale.slice(0, 50))
     console.log(`  STALE     ${s.key} ${s.baseline} → ${s.now} (remove from the baseline)`)
   if (stale.length > 50) console.log(`  … ${stale.length - 50} more stale`)
-  console.log(`[architecture] new/grown=${grown.length} stale=${stale.length} unmapped=${unmapped}`)
-  if (enforce && (grown.length || stale.length)) process.exit(1)
+  for (const g of baselineGrown)
+    console.log(`  BASELINE-GROWN ${g.key} ${g.baseline} → ${g.now} (the baseline may only shrink)`)
+  if (base && !baseHasBaseline)
+    console.log(`[architecture] ${base} has no baseline: introduced here`)
+  console.log(
+    `[architecture] new/grown=${grown.length} stale=${stale.length} baseline-grown=${baselineGrown.length} unmapped=${unmapped}`,
+  )
+  if (enforce && (grown.length || stale.length || baselineGrown.length)) process.exit(1)
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main()

@@ -185,6 +185,45 @@ describe('Codex r1 repros (OCV5-543)', () => {
   })
 })
 
+describe('Codex r2 repros (OCV5-543)', () => {
+  test('exports: `types` is not a runtime target; every runtime condition is an edge', (t) => {
+    const root = repo(t, {
+      'packages/other/package.json': JSON.stringify({
+        name: '@x/other',
+        exports: {
+          './api': {
+            types: './src/low/api.d.ts',
+            'openclaude-precompiled': './src/pre/api.ts',
+            default: './src/high/api.ts',
+          },
+        },
+      }),
+      'packages/other/src/low/api.d.ts': 'export declare const A: number;\n',
+      'packages/other/src/pre/api.ts': 'export const A = 1;\n',
+      'packages/other/src/high/api.ts': 'export const A = 1;\n',
+      'packages/app/src/dom1/useApi.ts': "import { A } from '@x/other/api';\nexport const a = A;\n",
+    })
+    // dom1 -> other: same layer, not in dom1's allow list; one identity, one hit per runtime target
+    assert.deepEqual(rules(root), [
+      'R2-same-layer|useApi.ts|other',
+      'R2-same-layer|useApi.ts|other',
+    ])
+  })
+  test('an unresolved relative import is reported, not treated as an external package', (t) => {
+    const root = repo(t, {
+      'packages/app/src/dom2/r.ts': "import { Q } from './gone.js';\nexport const q = Q;\n",
+    })
+    assert.deepEqual(rules(root), ['R2-unresolved-internal|r.ts|./gone.js'])
+  })
+  test('a same-named local in another scope does not erase an imported identity', () => {
+    const f = factsOf(
+      'x.ts',
+      "import { createHmac } from 'node:crypto';\nexport const x = createHmac('sha256', 'k');\nfunction unrelated() { const noop = () => {}; const createHmac = noop; return createHmac }\n",
+    )
+    assert.equal(f.crypto, 1)
+  })
+})
+
 describe('baseline (rule 4)', () => {
   test('counts may not grow, new identities fail, removed ones are stale; renames carry entries', () => {
     const base = { 'R3-env|a.ts|-': 2, 'R2-upward|b.ts|api': 1, 'R3-net|old.ts|-': 1 }
@@ -283,6 +322,38 @@ describe('CLI', () => {
       JSON.stringify({ schema: 1, entries: { 'R3-env|packages/app/src/dom2/e.ts|-': 'bogus' } }),
     )
     assert.equal(run(root, '--enforce').status, 2)
+  })
+  test('an unmapped production file that does not parse fails closed', (t) => {
+    const root = repo(t, { 'packages/app/src/stray.ts': 'export const = ;\n' })
+    assert.equal(run(root, '--write-baseline').status, 2)
+    assert.equal(run(root).status, 2)
+  })
+  test('with --base the baseline itself may only shrink against the base commit', (t) => {
+    const root = repo(t, {})
+    assert.equal(run(root, '--write-baseline').status, 0)
+    const git = (...a: string[]) => execFileSync('git', a, { cwd: root, encoding: 'utf8' })
+    git('init', '-q', '-b', 'main')
+    git('config', 'user.email', 't@t')
+    git('config', 'user.name', 't')
+    git('add', '-A')
+    git('commit', '-qm', 'base')
+    writeFileSync(
+      path.join(root, 'packages/app/src/dom2/e.ts'),
+      'export const e = process.env.A;\n',
+    )
+    assert.equal(
+      run(root, '--write-baseline').status,
+      0,
+      'violation added and baseline raised together',
+    )
+    git('add', '-A')
+    git('commit', '-qm', 'mask')
+    assert.equal(run(root, '--enforce').status, 0, 'without --base the raised baseline hides it')
+    const r = run(root, '--enforce', '--base', 'main~1')
+    assert.equal(r.status, 1)
+    assert.match(r.stdout, /BASELINE-GROWN R3-env\|packages\/app\/src\/dom2\/e\.ts\|- 0 → 1/)
+    assert.equal(run(root, '--base', 'main~1').status, 0, 'report period: printed, not blocking')
+    assert.equal(run(root, '--base', 'no-such-ref').status, 2, 'a bad base ref fails closed')
   })
   test('fails closed without a baseline or with an invalid modules.json', (t) => {
     const root = repo(t, {})
