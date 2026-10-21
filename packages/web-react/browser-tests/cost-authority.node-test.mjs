@@ -55,7 +55,6 @@ test('recorded-cost provenance remains visible in totals, legacy responses and r
     assert.match(await money.textContent(), /估算 \$1.0000/);
     assert.match(await money.textContent(), /未标估算 \$2.0000/);
     assert.match(await money.textContent(), /来源未证实 \$3.0000/);
-    await page.getByTestId('ticket-system-toggle').click();
     await page.getByTestId('ticket-run-detail').first().waitFor().catch(async e=>{console.error(await page.locator('body').innerText());throw e});
     const details=await page.getByTestId('ticket-run-detail').allTextContents();
     assert.equal(details.length,3);
