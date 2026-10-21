@@ -111,6 +111,7 @@ export class SseAccumulator {
   finalText: string
   thinkingText: string
   done: boolean
+  streamHandoff: boolean
   error: string | null
   lastEventAt: number
   constructor(opts?: {

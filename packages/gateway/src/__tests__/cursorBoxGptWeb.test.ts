@@ -661,6 +661,21 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
 
     assert.equal(acc.conversationId, 'conv-pro-123')
     assert.equal(acc.done, true)
+
+    // Verify Oct 2026 Pro stream_handoff envelope does not prematurely set done=true before final text
+    const handoffAcc = new SseAccumulator()
+    handoffAcc.feedDataLine('"v1"')
+    handoffAcc.feedDataLine(
+      JSON.stringify({
+        type: 'stream_handoff',
+        conversation_id: '6ad887d6-d9e0-83ec-81b0-ea7e9a178f2d',
+        turn_exchange_id: '15373702-e393-454a-85c6-d8e3d8f651ba',
+      }),
+    )
+    handoffAcc.feedDataLine('[DONE]')
+    assert.equal(handoffAcc.streamHandoff, true)
+    assert.equal(handoffAcc.conversationId, '6ad887d6-d9e0-83ec-81b0-ea7e9a178f2d')
+    assert.equal(handoffAcc.done, false)
     assert.equal(acc.finalText, 'Hello from GPT-6 Astra Pro!')
     assert.deepEqual(textChunks, ['Hello ', 'from GPT-6 ', 'Astra Pro!'])
     assert.equal(

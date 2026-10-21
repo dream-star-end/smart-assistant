@@ -155,13 +155,18 @@ async function ensureRealChromeOnCdp(cfg, profileDir) {
 }
 
 async function loadPlaywrightChromium(playwrightPath) {
-  try {
-    const mod = await import(pathToFileURL(playwrightPath).href)
-    return mod.chromium || mod.default?.chromium
-  } catch {
-    const mod = await import('playwright-core')
-    return mod.chromium || mod.default?.chromium
+  const candidates = [
+    playwrightPath,
+    '/usr/local/lib/pnpm/5/node_modules/playwright-core/index.mjs',
+  ].filter(Boolean)
+  for (const p of candidates) {
+    try {
+      const mod = await import(pathToFileURL(p).href)
+      if (mod.chromium || mod.default?.chromium) return mod.chromium || mod.default?.chromium
+    } catch {}
   }
+  const mod = await import('playwright-core')
+  return mod.chromium || mod.default?.chromium
 }
 
 async function acquireSingleChatGptPage(browser) {
@@ -189,27 +194,55 @@ async function acquireSingleChatGptPage(browser) {
   return target
 }
 
-async function rescueFromDomOrMapping(page) {
-  await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {})
-  await new Promise((r) => setTimeout(r, 1500))
-  const rescued = await page.evaluate(async () => {
-    const m = location.pathname.match(/\/c\/([a-z0-9_-]{8,128})/i)
-    if (m) {
+async function fetchConversationFromMappingInPage(page, fallbackConvId = null) {
+  const fetched = await page
+    .evaluate(async (knownId) => {
+      const m = location.pathname.match(/\/c\/([a-z0-9_-]{8,128})/i)
+      const convId = (m && m[1]) || knownId || null
+      if (!convId) return { conv: null, convId: null }
       try {
-        const r = await fetch(`/backend-api/conversation/${m[1]}`, { credentials: 'include' })
+        let token = null
+        try {
+          const sessRes = await fetch('/api/auth/session', { credentials: 'include' })
+          if (sessRes.ok) {
+            const sess = await sessRes.json()
+            token = sess?.accessToken || null
+          }
+        } catch {}
+        const headers = token ? { Authorization: `Bearer ${token}` } : {}
+        const r = await fetch(`/backend-api/conversation/${convId}`, {
+          credentials: 'include',
+          headers,
+        })
         if (r.ok) {
           const conv = await r.json()
-          return { conv, domText: null, convId: m[1] }
+          return { conv, convId }
         }
       } catch {}
+      return { conv: null, convId }
+    }, fallbackConvId)
+    .catch(() => ({ conv: null, convId: fallbackConvId }))
+
+  if (fetched?.conv) {
+    const fromMap = extractAssistantFromMapping(fetched.conv)
+    if (fromMap?.text) {
+      return {
+        text: fromMap.text,
+        messageId: fromMap.messageId,
+        convId: fetched.convId,
+      }
     }
-    return { conv: null, domText: null, convId: m ? m[1] : null }
-  })
-  if (rescued.conv) {
-    const fromMap = extractAssistantFromMapping(rescued.conv)
-    if (fromMap?.text) return { text: fromMap.text, convId: rescued.convId }
   }
   return null
+}
+
+async function rescueFromDomOrMapping(page, fallbackConvId = null) {
+  const direct = await fetchConversationFromMappingInPage(page, fallbackConvId)
+  if (direct?.text) return direct
+
+  await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {})
+  await new Promise((r) => setTimeout(r, 1500))
+  return fetchConversationFromMappingInPage(page, fallbackConvId)
 }
 
 async function stopActiveGenerationInPage(page) {
@@ -248,8 +281,14 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
 
       await abortIfRequested('after acquire page')
 
-      // Wait briefly if the page is still rendering its initial DOM
-      for (let i = 0; i < 10; i++) {
+      await syncPageToSessionConversation(page, {
+        profileDir,
+        sessionId: cfg.sessionId,
+      })
+      await abortIfRequested('after sync session')
+
+      // Wait briefly while the page renders its composer DOM after navigation
+      for (let i = 0; i < 30; i++) {
         const probe = await probeSessionState(page, { profileDir, display: cfg.display })
         if (probe.ok || probe.code === 'CF_CHALLENGE') break
         await new Promise((r) => setTimeout(r, 300))
@@ -262,12 +301,6 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
       if (!sessionProbe.ok) {
         throw new Error(sessionProbe.message)
       }
-
-      await syncPageToSessionConversation(page, {
-        profileDir,
-        sessionId: cfg.sessionId,
-      })
-      await abortIfRequested('after sync session')
 
       await selectProTierInPage(page, { requestedTier: 'pro' })
       await abortIfRequested('after select pro tier')
@@ -284,7 +317,11 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
       await typeMultilinePreservingAttachments(page, turn.text)
       await abortIfRequested('before send')
 
-      const sendBtn = page.locator('[data-testid="send-button"]').first()
+      const sendBtn = page
+        .locator(
+          '[data-testid="send-button"], button[aria-label="Send"], button[aria-label="Send prompt"]',
+        )
+        .first()
       await sendBtn.waitFor({ state: 'visible', timeout: 15_000 })
       await abortIfRequested('before click send')
       await sendBtn.click()
@@ -301,6 +338,8 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
       const startedAt = Date.now()
       let currentDeadline = startedAt + 600_000
       let stopGoneSince = null
+      let sawStopBtn = false
+      let lastMappingPollAt = 0
       let readCursor = 0
 
       while (true) {
@@ -352,9 +391,36 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
 
         const now = Date.now()
         if (batch.stopBtn) {
+          sawStopBtn = true
           stopGoneSince = null
-        } else if (stopGoneSince === null && now - startedAt > 3_000) {
+        } else if (stopGoneSince === null && (sawStopBtn || now - startedAt > 3_000)) {
           stopGoneSince = now
+        }
+
+        // In ChatGPT Web Pro (Oct 2026), POST /backend-api/f/conversation emits stream_handoff
+        // and hands off token delivery to WebSocket. Once stop-button disappears (or every 2s
+        // after stream_handoff when stop-button is gone), query /backend-api/conversation/<id>
+        // with Bearer auth to collect the finished_successfully final assistant reply immediately.
+        if (
+          !batch.stopBtn &&
+          !acc.finalText &&
+          resolvedConvId &&
+          (sawStopBtn || acc.streamHandoff || acc.done) &&
+          now - lastMappingPollAt >= 1_500
+        ) {
+          lastMappingPollAt = now
+          const mapped = await fetchConversationFromMappingInPage(page, resolvedConvId)
+          if (mapped?.text) {
+            if (mapped.convId) {
+              saveSessionConversationId(profileDir, cfg.sessionId, mapped.convId)
+            }
+            writeStdoutLine(formatStreamJsonTextDelta(mapped.text))
+            return {
+              text: mapped.text,
+              thinking: acc.thinkingText,
+              messageId: mapped.messageId || acc.messageId || `msg_${Date.now()}`,
+            }
+          }
         }
 
         const adaptive = computeAdaptiveDeadline({
@@ -369,7 +435,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
         currentDeadline = adaptive.deadline
 
         if (adaptive.shouldRescue) {
-          const rescued = await rescueFromDomOrMapping(page)
+          const rescued = await rescueFromDomOrMapping(page, resolvedConvId)
           if (rescued?.text) {
             if (rescued.convId) {
               saveSessionConversationId(profileDir, cfg.sessionId, rescued.convId)
@@ -381,14 +447,14 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
             return {
               text: rescued.text,
               thinking: acc.thinkingText,
-              messageId: acc.messageId || `msg_${Date.now()}`,
+              messageId: rescued.messageId || acc.messageId || `msg_${Date.now()}`,
             }
           }
         }
 
         if (!batch.stopBtn && acc.done) {
           if (!acc.finalText) {
-            const rescued = await rescueFromDomOrMapping(page)
+            const rescued = await rescueFromDomOrMapping(page, resolvedConvId)
             if (rescued?.text) {
               if (rescued.convId) {
                 saveSessionConversationId(profileDir, cfg.sessionId, rescued.convId)
@@ -397,7 +463,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
               return {
                 text: rescued.text,
                 thinking: acc.thinkingText,
-                messageId: acc.messageId || `msg_${Date.now()}`,
+                messageId: rescued.messageId || acc.messageId || `msg_${Date.now()}`,
               }
             }
           }

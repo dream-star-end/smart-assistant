@@ -371,7 +371,9 @@ export async function resetComposerDraftInPage(page) {
       for (const btn of removeBtns) {
         if (typeof btn.click === 'function') btn.click()
       }
-      const el = document.querySelector('#prompt-textarea')
+      const el = document.querySelector(
+        '#prompt-textarea, div.ProseMirror[contenteditable="true"], [role="textbox"][contenteditable="true"]',
+      )
       if (el) {
         if ('value' in el) el.value = ''
         el.textContent = ''
@@ -492,8 +494,12 @@ export async function probeSessionState(
         document.querySelector('a[href*="/auth/login"]'),
     )
     const hasComposer = Boolean(
-      document.querySelector('#prompt-textarea') ||
-        document.querySelector('[data-testid="model-switcher-dropdown-button"]'),
+      document.querySelector(
+        '#prompt-textarea, div.ProseMirror[contenteditable="true"], [role="textbox"][contenteditable="true"]',
+      ) ||
+        document.querySelector(
+          '[data-testid="model-switcher-dropdown-button"], button[aria-label="Select ChatGPT model"]',
+        ),
     )
     const isCfChallenge =
       title.includes('Just a moment') ||
@@ -552,7 +558,14 @@ export async function selectProTierInPage(page, { requestedTier = 'pro' } = {}) 
     throw new TierLimitError(preLimit)
   }
 
-  const switcher = page.locator('[data-testid="model-switcher-dropdown-button"]').first()
+  const switcher = page
+    .locator(
+      '[data-testid="model-switcher-dropdown-button"], button[aria-label="Select ChatGPT model"]',
+    )
+    .first()
+  if (typeof switcher.waitFor === 'function') {
+    await switcher.waitFor({ state: 'visible', timeout: 15_000 }).catch(() => {})
+  }
   if ((await switcher.count()) === 0) {
     throw new Error(
       'BOX_GPT_WEB_SWITCHER_MISSING: [data-testid="model-switcher-dropdown-button"] not found',
@@ -682,7 +695,11 @@ export async function uploadAttachmentsToComposer(
  * so Enter does not prematurely submit the turn.
  */
 export async function typeMultilinePreservingAttachments(page, text) {
-  const composer = page.locator('#prompt-textarea').first()
+  const composer = page
+    .locator(
+      '#prompt-textarea, div.ProseMirror[contenteditable="true"], [role="textbox"][contenteditable="true"]',
+    )
+    .first()
   await composer.click()
   const lines = String(text ?? '').split(/\r?\n/)
   for (let i = 0; i < lines.length; i++) {
@@ -740,7 +757,10 @@ export function backendFetchTeeInitScript() {
                 }
               }
             } catch (err) {
-              window.__ocSseEvents.push({ seq, ts: Date.now(), error: String(err && err.message || err) });
+              const msg = String((err && err.message) || err || '');
+              if (err?.name !== 'AbortError' && !/aborted/i.test(msg)) {
+                window.__ocSseEvents.push({ seq, ts: Date.now(), error: msg });
+              }
             } finally {
               window.__ocSseEvents.push({ seq, ts: Date.now(), eof: true });
             }
@@ -770,6 +790,7 @@ export class SseAccumulator {
     this.finalText = ''
     this.thinkingText = ''
     this.done = false
+    this.streamHandoff = false
     this.error = null
     this.lastEventAt = nowFn()
   }
@@ -779,7 +800,9 @@ export class SseAccumulator {
     if (!trimmed) return
     this.lastEventAt = this.nowFn()
     if (trimmed === '[DONE]') {
-      this.done = true
+      if (!this.streamHandoff || this.finalText.length > 0) {
+        this.done = true
+      }
       return
     }
     let obj
@@ -795,6 +818,12 @@ export class SseAccumulator {
     }
     if (obj.v && typeof obj.v === 'object' && typeof obj.v.conversation_id === 'string') {
       this.conversationId = obj.v.conversation_id
+    }
+    if (obj.type === 'stream_handoff' || obj.type === 'resume_conversation_token') {
+      if (obj.type === 'stream_handoff') {
+        this.streamHandoff = true
+      }
+      return
     }
     if (obj.type === 'message_stream_complete') {
       this.done = true
