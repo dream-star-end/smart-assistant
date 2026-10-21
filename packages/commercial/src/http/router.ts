@@ -16,10 +16,9 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-// V3 S12e CG9 — contract D (deploy smoke) trace-id child binding on HTTP
-// request logger. master HTTP segment is the ONLY commercial path that reads
-// X-Trace-Id here (WS bridge has its own X-Connection-Trace-Id flow).
-import { newTraceId, parseTraceIdCandidate } from '@openclaude/protocol'
+// Trace-id child binding on the HTTP request logger (V3 S12e CG9; OCV5-564: x-openclaude-trace-id,
+// x-trace-id alias). The WS bridge has its own connection trace flow.
+import { resolveRequestTrace } from './requestTrace.js'
 import { getClientSessionCollabParent } from '@openclaude/storage'
 import { incrGatewayRequest } from '../admin/metrics.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
@@ -2202,19 +2201,16 @@ export function createCommercialHandler(
     // 任何下游 handler / preCheck / proxy / finalize 都通过 ctx.log 派生子 logger,
     // requestId 自然贯穿,且基底 binding(route/method/clientIp)一次性写明
     //
-    // V3 S12e CG9 — extract X-Trace-Id header (turn-level trace, contract D
-    // smoke canary). master-canonical fallback: if the client sent garbage,
-    // newTraceId() so reqLog ALWAYS has a traceId binding — that's what
-    // verify_trace_propagation in smoke-v3.sh greps for. Plan §510 spec.
-    const rawTrace = req.headers['x-trace-id']
-    const traceCand = parseTraceIdCandidate(Array.isArray(rawTrace) ? rawTrace[0] : rawTrace)
-    const traceId = traceCand.ok ? traceCand.traceId : newTraceId()
+    // OCV5-564(plan §7.1):trace 头以 x-openclaude-trace-id 为准,x-trace-id 别名一个周期;
+    // 没有合法头时生成的值标 traceIdOrigin=generated(一个周期后不再绑定),见 requestTrace.ts。
+    const { traceId, traceIdOrigin } = resolveRequestTrace(req.headers)
     const reqLog: Logger = httpLogger.child({
       requestId,
       route: labelRoute,
       method,
       clientIp: clientIpOf(req),
       traceId,
+      traceIdOrigin,
     })
 
     const ctx: RequestContext = {
