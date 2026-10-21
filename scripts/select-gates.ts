@@ -110,8 +110,8 @@ export const TYPECHECK_DEPENDENTS: Record<CompositeProject, CompositeProject[]> 
     "packages/commercial",
     "packages/cli",
   ],
-  // OCV5-546:kernel 刚建好、还没有生产代码 import 它;谁开始 import 就在这里登记谁。
-  "packages/kernel": [],
+  // OCV5-546/550:gateway 起 import kernel(logger 薄包装);commercial/cli 经 gateway 依赖它。
+  "packages/kernel": ["packages/gateway", "packages/commercial", "packages/cli"],
   "packages/storage": [
     "packages/mcp-memory",
     "packages/gateway",
@@ -362,11 +362,11 @@ export const GATE_RULES: GateRule[] = [
   {
     id: "kernel",
     comment:
-      "OCV5-546:@openclaude/kernel(L1 core,第三阶段 P0c 空包)。还没有 dependents,只建自己;" +
-      "包开始被 import 时把 dependents 加进 TYPECHECK_DEPENDENTS 和这里的 typecheckProjects。",
+      "OCV5-546/550:@openclaude/kernel(L1 core)。gateway 的 logger 是它的薄包装,所以改 kernel " +
+      "要跑 gateway 单测,并建 kernel 及其 dependents(gateway/commercial/cli)。",
     match: (f) => f.startsWith("packages/kernel/"),
-    gates: ["test:kernel", "typecheck"],
-    typecheckProjects: ["packages/kernel"],
+    gates: ["test:kernel", "test:gateway", "typecheck"],
+    typecheckProjects: ["packages/kernel", "packages/gateway", "packages/commercial", "packages/cli"],
   },
   {
     id: "plugin-sdk",

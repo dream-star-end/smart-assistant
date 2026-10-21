@@ -66,7 +66,7 @@ async function boundedCleanup(work: () => Promise<void>): Promise<void> {
 async function supervise(): Promise<void> {
   const db = testDatabase()
   const sha = await sourceSha()
-  for (const name of ['storage', 'protocol', 'gateway', 'commercial']) {
+  for (const name of ['storage', 'protocol', 'kernel', 'gateway', 'commercial']) {
     assert.equal(await realpath(join(root, 'node_modules/@openclaude', name)),
       await realpath(join(root, 'packages', name)), 'workspace dependency escaped pinned tree: ' + name)
   }

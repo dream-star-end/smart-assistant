@@ -81,7 +81,10 @@
     "master",
     "container"
    ],
-   "note": "→ @openclaude/kernel (P1)"
+   "allow": [
+    "kernel"
+   ],
+   "note": "→ @openclaude/kernel (P1). allow kernel: logger.ts is a thin wrapper over kernel log while it moves there (OCV5-550)"
   },
   "platform-pg": {
    "layer": "L2",
