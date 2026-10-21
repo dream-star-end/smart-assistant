@@ -1,3 +1,4 @@
+import { canUseModel } from "../billing/authzModels.js";
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import type { QueryResult, QueryResultRow } from "pg";
@@ -876,17 +877,40 @@ describe("OCV5-551 box-gpt-6-astra-pro owner uid=3 restriction", () => {
         ["glm-5.2"],
       );
 
-      // Omitted uid must fail closed for box-gpt-6-astra-pro even for admin with grant
+      // Omitted/empty uid must fail closed for box-gpt-6-astra-pro even for admin with grant
+      const fakePricingCache = {
+        get: (id: string) =>
+          id === "box-gpt-6-astra-pro"
+            ? {
+                model_id: "box-gpt-6-astra-pro",
+                enabled: true,
+                visibility: "hidden" as const,
+                min_plan_code: "free",
+                min_plan_tier: 0,
+              }
+            : undefined,
+      };
       assert.equal(
-        s.canUseModel({ role: "admin", grantedModelIds: grantSet }, "box-gpt-6-astra-pro"),
+        canUseModel(
+          { pricing: fakePricingCache as never },
+          {
+            modelId: "box-gpt-6-astra-pro",
+            role: "admin",
+            grantedModelIds: grantSet,
+          },
+        ),
+        false,
+      );
+      assert.equal(
+        s.canUseModel({ uid: "", role: "admin", grantedModelIds: grantSet }, "box-gpt-6-astra-pro"),
         false,
       );
       assert.deepEqual(
-        s.listForUser({ role: "admin", grantedModelIds: grantSet }).map((m) => m.modelId),
+        s.listForUser({ uid: "", role: "admin", grantedModelIds: grantSet }).map((m) => m.modelId),
         ["glm-5.2"],
       );
     } finally {
-      if (prevUids === undefined) delete process.env.OC_V5_CURSOR_CREDENTIAL_UIDS;
+      if (prevUids === undefined) Reflect.deleteProperty(process.env, "OC_V5_CURSOR_CREDENTIAL_UIDS");
       else process.env.OC_V5_CURSOR_CREDENTIAL_UIDS = prevUids;
     }
   });

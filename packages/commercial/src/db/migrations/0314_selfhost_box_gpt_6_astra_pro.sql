@@ -12,6 +12,7 @@
 -- DELETE FROM model_catalog WHERE model_id = 'box-gpt-6-astra-pro' AND state = 'staged';
 -- END MANUAL ROLLBACK 0314
 
+-- compat: additive selfhost-only staged catalog seed for box-gpt-6-astra-pro (born disabled; DELETE only affects non-owner grants on this new model_id)
 DO $$
 BEGIN
   IF NOT EXISTS (
