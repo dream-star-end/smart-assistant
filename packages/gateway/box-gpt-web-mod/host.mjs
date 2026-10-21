@@ -250,15 +250,17 @@ async function fetchConversationFromMappingInPage(
 ) {
   const fetched = await fetchConversationPayloadInPage(page, fallbackConvId)
   if (fetched?.conv) {
+    const currentNode = fetched.conv.current_node || null
     const fromMap = extractAssistantFromMapping(fetched.conv, { baselineNodeId })
     if (fromMap?.text) {
       return {
         text: fromMap.text,
         messageId: fromMap.messageId,
         convId: fetched.convId,
-        currentNode: fetched.conv.current_node || null,
+        currentNode,
       }
     }
+    return { text: null, messageId: null, convId: fetched.convId, currentNode }
   }
   return null
 }
@@ -448,20 +450,23 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
         }
 
         // In ChatGPT Web Pro (Oct 2026), POST /backend-api/f/conversation emits stream_handoff
-        // and hands off token delivery to WebSocket. Once stop-button disappears (or every 2s
-        // after stream_handoff when stop-button is gone), query /backend-api/conversation/<id>
-        // with Bearer auth to collect the finished_successfully final assistant reply immediately.
+        // and hands off generation to the backend Conduit topic. The DOM Stop button can remain
+        // visible ("ChatGPT is responding") even after /backend-api/conversation/<id> has already
+        // committed the finished_successfully final message. Poll mapping every 2s once
+        // stream_handoff (or stop-button disappearance) occurs, without waiting for !batch.stopBtn.
         if (
-          !batch.stopBtn &&
           !acc.finalText &&
           resolvedConvId &&
-          (sawStopBtn || acc.streamHandoff || acc.done) &&
-          now - lastMappingPollAt >= 1_500
+          (acc.streamHandoff || acc.done || !batch.stopBtn) &&
+          now - lastMappingPollAt >= 2_000
         ) {
           lastMappingPollAt = now
           const mapped = await fetchConversationFromMappingInPage(page, resolvedConvId, {
             baselineNodeId,
           })
+          if (mapped?.currentNode && mapped.currentNode !== baselineNodeId) {
+            acc.lastEventAt = now
+          }
           if (mapped?.text) {
             if (mapped.convId) {
               saveSessionConversationId(profileDir, cfg.sessionId, mapped.convId)
