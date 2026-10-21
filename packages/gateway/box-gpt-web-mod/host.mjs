@@ -154,6 +154,23 @@ async function ensureRealChromeOnCdp(cfg, profileDir) {
   )
 }
 
+let cachedCdpBrowser = null
+let cachedCdpPort = null
+
+async function getConnectedCdpBrowser(chromium, cdpPort) {
+  if (
+    cachedCdpBrowser &&
+    cachedCdpPort === cdpPort &&
+    typeof cachedCdpBrowser.isConnected === 'function' &&
+    cachedCdpBrowser.isConnected()
+  ) {
+    return cachedCdpBrowser
+  }
+  cachedCdpBrowser = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`)
+  cachedCdpPort = cdpPort
+  return cachedCdpBrowser
+}
+
 async function loadPlaywrightChromium(playwrightPath) {
   const candidates = [
     playwrightPath,
@@ -194,7 +211,7 @@ async function acquireSingleChatGptPage(browser) {
   return target
 }
 
-async function fetchConversationFromMappingInPage(page, fallbackConvId = null) {
+async function fetchConversationPayloadInPage(page, fallbackConvId = null) {
   const fetched = await page
     .evaluate(async (knownId) => {
       const m = location.pathname.match(/\/c\/([a-z0-9_-]{8,128})/i)
@@ -223,26 +240,38 @@ async function fetchConversationFromMappingInPage(page, fallbackConvId = null) {
     }, fallbackConvId)
     .catch(() => ({ conv: null, convId: fallbackConvId }))
 
+  return fetched
+}
+
+async function fetchConversationFromMappingInPage(
+  page,
+  fallbackConvId = null,
+  { baselineNodeId = null } = {},
+) {
+  const fetched = await fetchConversationPayloadInPage(page, fallbackConvId)
   if (fetched?.conv) {
-    const fromMap = extractAssistantFromMapping(fetched.conv)
+    const fromMap = extractAssistantFromMapping(fetched.conv, { baselineNodeId })
     if (fromMap?.text) {
       return {
         text: fromMap.text,
         messageId: fromMap.messageId,
         convId: fetched.convId,
+        currentNode: fetched.conv.current_node || null,
       }
     }
   }
   return null
 }
 
-async function rescueFromDomOrMapping(page, fallbackConvId = null) {
-  const direct = await fetchConversationFromMappingInPage(page, fallbackConvId)
+async function rescueFromDomOrMapping(page, fallbackConvId = null, { baselineNodeId = null } = {}) {
+  const direct = await fetchConversationFromMappingInPage(page, fallbackConvId, {
+    baselineNodeId,
+  })
   if (direct?.text) return direct
 
   await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {})
   await new Promise((r) => setTimeout(r, 1500))
-  return fetchConversationFromMappingInPage(page, fallbackConvId)
+  return fetchConversationFromMappingInPage(page, fallbackConvId, { baselineNodeId })
 }
 
 async function stopActiveGenerationInPage(page) {
@@ -267,7 +296,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
       }
       await ensureRealChromeOnCdp(cfg, profileDir)
       const chromium = await loadPlaywrightChromium(cfg.playwrightPath)
-      const browser = await chromium.connectOverCDP(`http://127.0.0.1:${cfg.cdpPort}`)
+      const browser = await getConnectedCdpBrowser(chromium, cfg.cdpPort)
       const page = await acquireSingleChatGptPage(browser)
       turnControl.page = page
 
@@ -281,25 +310,46 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
 
       await abortIfRequested('after acquire page')
 
-      await syncPageToSessionConversation(page, {
-        profileDir,
-        sessionId: cfg.sessionId,
-      })
-      await abortIfRequested('after sync session')
-
-      // Wait briefly while the page renders its composer DOM after navigation
-      for (let i = 0; i < 30; i++) {
+      // Wait briefly if the page is still rendering its initial DOM
+      for (let i = 0; i < 15; i++) {
         const probe = await probeSessionState(page, { profileDir, display: cfg.display })
         if (probe.ok || probe.code === 'CF_CHALLENGE') break
         await new Promise((r) => setTimeout(r, 300))
       }
 
-      const sessionProbe = await probeSessionState(page, {
+      const initialProbe = await probeSessionState(page, {
         profileDir,
         display: cfg.display,
       })
-      if (!sessionProbe.ok) {
-        throw new Error(sessionProbe.message)
+      if (!initialProbe.ok) {
+        throw new Error(initialProbe.message)
+      }
+
+      const syncState = await syncPageToSessionConversation(page, {
+        profileDir,
+        sessionId: cfg.sessionId,
+      })
+      await abortIfRequested('after sync session')
+
+      if (syncState.navigated) {
+        for (let i = 0; i < 25; i++) {
+          const probe = await probeSessionState(page, { profileDir, display: cfg.display })
+          if (probe.ok || probe.code === 'CF_CHALLENGE') break
+          await new Promise((r) => setTimeout(r, 300))
+        }
+        const postNavProbe = await probeSessionState(page, {
+          profileDir,
+          display: cfg.display,
+        })
+        if (!postNavProbe.ok) {
+          throw new Error(postNavProbe.message)
+        }
+      }
+
+      let baselineNodeId = null
+      if (syncState.conversationId) {
+        const preConv = await fetchConversationPayloadInPage(page, syncState.conversationId)
+        baselineNodeId = preConv?.conv?.current_node || null
       }
 
       await selectProTierInPage(page, { requestedTier: 'pro' })
@@ -409,7 +459,9 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
           now - lastMappingPollAt >= 1_500
         ) {
           lastMappingPollAt = now
-          const mapped = await fetchConversationFromMappingInPage(page, resolvedConvId)
+          const mapped = await fetchConversationFromMappingInPage(page, resolvedConvId, {
+            baselineNodeId,
+          })
           if (mapped?.text) {
             if (mapped.convId) {
               saveSessionConversationId(profileDir, cfg.sessionId, mapped.convId)
@@ -435,7 +487,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
         currentDeadline = adaptive.deadline
 
         if (adaptive.shouldRescue) {
-          const rescued = await rescueFromDomOrMapping(page, resolvedConvId)
+          const rescued = await rescueFromDomOrMapping(page, resolvedConvId, { baselineNodeId })
           if (rescued?.text) {
             if (rescued.convId) {
               saveSessionConversationId(profileDir, cfg.sessionId, rescued.convId)
@@ -454,7 +506,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
 
         if (!batch.stopBtn && acc.done) {
           if (!acc.finalText) {
-            const rescued = await rescueFromDomOrMapping(page, resolvedConvId)
+            const rescued = await rescueFromDomOrMapping(page, resolvedConvId, { baselineNodeId })
             if (rescued?.text) {
               if (rescued.convId) {
                 saveSessionConversationId(profileDir, cfg.sessionId, rescued.convId)

@@ -978,11 +978,14 @@ export class SseAccumulator {
  * Stops immediately if it encounters a user message before any final assistant message
  * (so it never returns an earlier turn's answer), and strictly requires channel === 'final' (or null).
  */
-export function extractAssistantFromMapping(conv) {
+export function extractAssistantFromMapping(conv, { baselineNodeId = null } = {}) {
   if (!conv || !conv.mapping) return null
   let cur = conv.current_node
   const visited = new Set()
   while (cur && conv.mapping[cur] && !visited.has(cur)) {
+    if (baselineNodeId && cur === baselineNodeId) {
+      return null
+    }
     visited.add(cur)
     const node = conv.mapping[cur]
     const m = node.message

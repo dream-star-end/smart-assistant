@@ -122,7 +122,10 @@ export class SseAccumulator {
   feedDataLine(raw: string): void
 }
 
-export function extractAssistantFromMapping(conv: any): { text: string; messageId: string } | null
+export function extractAssistantFromMapping(
+  conv: any,
+  opts?: { baselineNodeId?: string | null },
+): { text: string; messageId: string } | null
 
 export function computeAdaptiveDeadline(opts: {
   startedAt: number
