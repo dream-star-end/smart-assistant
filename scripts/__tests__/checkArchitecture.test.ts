@@ -157,6 +157,34 @@ describe('check-architecture rules', () => {
   })
 })
 
+describe('Codex r1 repros (OCV5-543)', () => {
+  test('imports resolved through package.json exports are edges', (t) => {
+    const root = repo(t, {
+      'packages/other/package.json': JSON.stringify({
+        name: '@x/other',
+        exports: { './api': './src/high/api.ts' },
+      }),
+      'packages/other/src/high/api.ts': 'export const A = 1;\n',
+      'packages/app/src/base/useApi.ts': "import { A } from '@x/other/api';\nexport const a = A;\n",
+    })
+    // base (L2, scope a+b) -> other (L3, scope a): the edge exists, so both layer and scope fire.
+    assert.deepEqual(rules(root), ['R2-scope|useApi.ts|other', 'R2-upward|useApi.ts|other'])
+  })
+  test('an internal import the checker cannot resolve is reported, not skipped', (t) => {
+    const root = repo(t, {
+      'packages/app/src/dom2/u.ts': "import { Z } from '@x/other/nowhere';\nexport const z = Z;\n",
+    })
+    assert.deepEqual(rules(root), ['R2-unresolved-internal|u.ts|@x/other/nowhere'])
+  })
+  test('renamed imports and destructured aliases still count for R3', (t) => {
+    const root = repo(t, {
+      'packages/app/src/dom2/al.ts':
+        "import { createHmac as h } from 'node:crypto';\ndeclare const deps: { requireAuth: (r: unknown) => void };\nconst { requireAuth: ra } = deps;\nexport const x = () => h('sha256', 'k') && ra(1);\n",
+    })
+    assert.deepEqual(rules(root), ['R3-crypto|al.ts|-', 'R3-handler-auth|al.ts|-'])
+  })
+})
+
 describe('baseline (rule 4)', () => {
   test('counts may not grow, new identities fail, removed ones are stale; renames carry entries', () => {
     const base = { 'R3-env|a.ts|-': 2, 'R2-upward|b.ts|api': 1, 'R3-net|old.ts|-': 1 }
@@ -248,6 +276,14 @@ describe('CLI', () => {
     spawnSync(process.execPath, ['--import', 'tsx', SCRIPT, '--root', root, ...a], {
       encoding: 'utf8',
     })
+  test('a baseline count that is not a positive integer fails closed', (t) => {
+    const root = repo(t, { 'packages/app/src/dom2/e.ts': 'export const e = process.env.A;\n' })
+    writeFileSync(
+      path.join(root, 'arch/violations-baseline.json'),
+      JSON.stringify({ schema: 1, entries: { 'R3-env|packages/app/src/dom2/e.ts|-': 'bogus' } }),
+    )
+    assert.equal(run(root, '--enforce').status, 2)
+  })
   test('fails closed without a baseline or with an invalid modules.json', (t) => {
     const root = repo(t, {})
     assert.equal(run(root).status, 2)

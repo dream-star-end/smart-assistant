@@ -226,12 +226,16 @@ function findCycle(g: Record<string, string[]>): string[] | null {
 interface Pkg {
   name: string
   dir: string
+  exports?: unknown
 }
 function packages(root: string): Pkg[] {
   const out: Pkg[] = []
   const add = (dir: string) => {
     const f = path.join(root, dir, 'package.json')
-    if (existsSync(f)) out.push({ name: JSON.parse(readFileSync(f, 'utf8')).name, dir })
+    if (existsSync(f)) {
+      const j = JSON.parse(readFileSync(f, 'utf8'))
+      out.push({ name: j.name, dir, exports: j.exports })
+    }
   }
   for (const p of readdirSync(path.join(root, 'packages'))) {
     if (p === 'channels')
@@ -269,11 +273,45 @@ export function resolveSpec(
   const p = pkgs.find((x) => spec === x.name || spec.startsWith(`${x.name}/`))
   if (!p) return { file: null, pkg: null }
   const sub = spec.slice(p.name.length + 1)
-  const f = sub
-    ? (resolveFile(root, `${p.dir}/src/${sub}`) ?? resolveFile(root, `${p.dir}/${sub}`))
-    : resolveFile(root, `${p.dir}/src/index`)
+  // package.json `exports` first (the runtime resolves through it), then the src/ convention.
+  const target = exportTarget(p.exports, sub ? `./${sub}` : '.')
+  const viaExports = target ? resolveFile(root, path.posix.normalize(`${p.dir}/${target}`)) : null
+  const f =
+    viaExports ??
+    (sub
+      ? (resolveFile(root, `${p.dir}/src/${sub}`) ?? resolveFile(root, `${p.dir}/${sub}`))
+      : resolveFile(root, `${p.dir}/src/index`))
   return { file: f, pkg: p }
 }
+/** The file an `exports` entry points at for this subpath (types, then default; wildcards one level). */
+function exportTarget(exp: unknown, sub: string): string | null {
+  if (!exp) return null
+  if (typeof exp === 'string') return sub === '.' ? exp : null
+  if (typeof exp !== 'object') return null
+  const map = exp as Record<string, unknown>
+  const pick = (v: unknown): string | null => {
+    if (typeof v === 'string') return v
+    if (v && typeof v === 'object') {
+      const o = v as Record<string, unknown>
+      return pick(o.types ?? o.default ?? o.import ?? o.require ?? null)
+    }
+    return null
+  }
+  if (!Object.keys(map).some((k) => k.startsWith('.'))) return sub === '.' ? pick(map) : null
+  if (sub in map) return pick(map[sub])
+  for (const [k, v] of Object.entries(map)) {
+    const star = k.indexOf('*')
+    if (star < 0) continue
+    const pre = k.slice(0, star)
+    const post = k.slice(star + 1)
+    if (sub.startsWith(pre) && sub.endsWith(post)) {
+      const t = pick(v)
+      if (t) return t.replace('*', sub.slice(pre.length, sub.length - post.length))
+    }
+  }
+  return null
+}
+
 function pkgOf(pkgs: Pkg[], file: string): Pkg | null {
   let best: Pkg | null = null
   for (const p of pkgs)
@@ -351,6 +389,26 @@ export function factsOf(fileName: string, text: string): FileFacts {
     specialCase: 0,
   }
   const line = (n: ts.Node) => sf.getLineAndCharacterOfPosition(n.getStart(sf)).line + 1
+  // local name → imported name, so `import { createHmac as h }` and `const { requireAuth: ra } = x`
+  // are still recognised at the call site.
+  const alias = new Map<string, string>()
+  const collect = (n: ts.Node): void => {
+    if (ts.isImportSpecifier(n)) alias.set(n.name.text, (n.propertyName ?? n.name).text)
+    else if (
+      ts.isBindingElement(n) &&
+      ts.isIdentifier(n.name) &&
+      n.propertyName &&
+      ts.isIdentifier(n.propertyName)
+    )
+      alias.set(n.name.text, n.propertyName.text)
+    else if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.initializer) {
+      const init = n.initializer
+      if (ts.isIdentifier(init)) alias.set(n.name.text, alias.get(init.text) ?? init.text)
+      else if (ts.isPropertyAccessExpression(init)) alias.set(n.name.text, init.name.text)
+    }
+    ts.forEachChild(n, collect)
+  }
+  collect(sf)
   const visit = (n: ts.Node): void => {
     if (ts.isImportDeclaration(n) && ts.isStringLiteral(n.moduleSpecifier)) {
       const c = n.importClause
@@ -389,7 +447,7 @@ export function factsOf(fileName: string, text: string): FileFacts {
         } else f.dynamicNonLiteral++
       }
       const name = ts.isIdentifier(callee)
-        ? callee.text
+        ? (alias.get(callee.text) ?? callee.text)
         : ts.isPropertyAccessExpression(callee)
           ? callee.name.text
           : ''
@@ -479,7 +537,11 @@ export function check(
         v('R2-contract-node', file, imp.spec)
       if (imp.type) continue
       const r = resolveSpec(root, pkgs, file, imp.spec)
-      if (!r.file || !r.pkg) continue // external package or unresolved non-internal path
+      if (!r.pkg) continue // external package
+      if (!r.file) {
+        v('R2-unresolved-internal', file, imp.spec) // an internal import the checker cannot follow is not "no violation"
+        continue
+      }
       if (imp.spec.startsWith('.') && r.pkg !== myPkg) v('R2-cross-package-internal', file, r.file)
       if (
         /\.(ts|tsx|mts)$/.test(r.file) &&
@@ -596,8 +658,17 @@ function main() {
   }
   if (!existsSync(bf)) fail(`missing ${bf}`)
   const baseline = JSON.parse(readFileSync(bf, 'utf8'))
-  if (baseline.schema !== 1 || typeof baseline.entries !== 'object')
+  if (
+    baseline.schema !== 1 ||
+    !baseline.entries ||
+    typeof baseline.entries !== 'object' ||
+    Array.isArray(baseline.entries)
+  )
     fail('invalid violations-baseline.json')
+  for (const [k, n] of Object.entries(baseline.entries)) {
+    if (!/^R\d-[a-z-]+\|[^|]+\|[^|]+$/.test(k) || !Number.isInteger(n) || (n as number) < 1)
+      fail(`invalid violations-baseline.json entry ${JSON.stringify(k)}: ${JSON.stringify(n)}`)
+  }
   const base = opt('--base')
   const { grown, stale } = compare(
     baseline.entries,
