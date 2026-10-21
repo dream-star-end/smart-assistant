@@ -188,6 +188,7 @@ source "$SCRIPT_DIR/lib/v5-selfhost-env.sh"
 source "$SCRIPT_DIR/lib/v5-selfhost-rollback.sh"
 # shellcheck source=lib/v5-selfhost-train-summary.sh
 source "$SCRIPT_DIR/lib/v5-selfhost-train-summary.sh"   # OCV5-539: <trainId>.summary.json, record only
+source "$SCRIPT_DIR/lib/v5-selfhost-workspace-links.sh"  # OCV5-549: ws_links_ensure
 # P0-Web 前端热切换(OCV5-489):overlay 指针根 + 纯函数库 + --p0-web* 编排。
 WEB_OVERLAY_ROOT="${OC_V5_WEB_OVERLAY_ROOT:-/var/lib/openclaude-v5-selfhost/web-overlay}"
 # shellcheck source=scripts/v5-web-overlay-lib.sh
@@ -1020,6 +1021,8 @@ cutover_sessions_to_pg() {
 ensure_node_modules() {
   log "── worktree node_modules ──"
   if [[ -d "$REPO_ROOT/node_modules" ]]; then
+    # OCV5-549:之后新增的工作区包(如 @openclaude/kernel)在已有 node_modules 里没有链接
+    ws_links_ensure "$REPO_ROOT" || die "worktree node_modules 缺工作区链接且无法安全补上。补救: 在 $REPO_ROOT 跑 npm ci。"
     log "  ✓ node_modules 已存在,跳过 npm ci"
     return 0
   fi
