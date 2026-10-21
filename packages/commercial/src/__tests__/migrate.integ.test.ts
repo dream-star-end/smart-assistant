@@ -228,6 +228,8 @@ describe("migrate.runMigrations", () => {
       { model_id: "box-claude-haiku-5-5", upstream_model_id: "claude-haiku-5-5", state: "staged", enabled: false, visibility: "public" },
       { model_id: "box-claude-opus-5-5", upstream_model_id: "claude-opus-5-5", state: "active", enabled: true, visibility: "public" },
       { model_id: "box-claude-sonnet-5", upstream_model_id: "claude-sonnet-5", state: "active", enabled: true, visibility: "public" },
+      // 0314: born staged / disabled / hidden (exclusive to user_id=3); activated after release
+      { model_id: "box-gpt-6-astra-pro", upstream_model_id: "gpt-6-astra-pro", state: "staged", enabled: false, visibility: "hidden" },
       { model_id: "cursor-auto", upstream_model_id: null, state: "active", enabled: true, visibility: "hidden" },
       { model_id: "cursor-composer-2.5", upstream_model_id: "composer-2.5", state: "disabled", enabled: false, visibility: "hidden" },
       { model_id: "cursor-composer-2.5-fast", upstream_model_id: "composer-2.5-fast", state: "disabled", enabled: false, visibility: "hidden" },

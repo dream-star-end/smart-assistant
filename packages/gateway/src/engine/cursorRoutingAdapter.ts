@@ -30,7 +30,7 @@ import {
 } from './cursorAdapter.js'
 import { CursorSandAdapter } from './cursorSandAdapter.js'
 import { CursorBoxCcAdapter } from './cursorBoxCcAdapter.js'
-import { cursorBoxCcEnabled, cursorBoxCcFromMaster, cursorBoxCcSelectionEligible, isBoxClaudeCatalogModel } from './cursorBoxCc.js'
+import { cursorBoxCcEnabled, cursorBoxCcFromMaster, cursorBoxCcSelectionEligible, isBoxInteractiveCatalogModel } from './cursorBoxCc.js'
 import {
   cursorSandEnabledForSelection,
   masterBoxCredentialSelection,
@@ -86,7 +86,7 @@ export function cursorVariantFor(
     executionTarget?.kind !== 'remote'
     && cursorBoxCcEnabled(env)
     && cursorBoxCcSelectionEligible(selection)
-    && isBoxClaudeCatalogModel(model)
+    && isBoxInteractiveCatalogModel(model)
   ) return 'sand-box-cc'
   if (!cursorSandEnabledForSelection(model, selection)) return 'native'
   if (

@@ -12,6 +12,7 @@
 import type { UserModelScope } from "../billing/modelCatalog.js";
 
 export type UserModelAuthz = {
+  uid?: string | number | bigint | null;
   role: "user" | "admin";
   grantedModelIds: ReadonlySet<string>;
   /** Account-scoped hard denials override visibility and explicit grants. */
@@ -159,7 +160,7 @@ export function makeLoadUserModelAuthz(): UserModelAuthzLoader {
       }
     }
     const plan = await loadPlanEntitlement(uid);
-    return { ...loaded!.value, ...plan };
+    return { uid: userKey, ...loaded!.value, ...plan };
   };
 }
 

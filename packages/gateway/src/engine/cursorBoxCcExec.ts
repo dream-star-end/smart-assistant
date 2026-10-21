@@ -27,8 +27,29 @@ export function boxOfficialClaudeModel(model: string | undefined): string | unde
   return undefined
 }
 
+const BOX_GPT_WEB_MODELS_MAP: Record<string, string> = {
+  'box-gpt-6-astra-pro': 'gpt-6-astra-pro',
+}
+
+export function boxGptWebModel(model: string | undefined): string | undefined {
+  if (!model) return undefined
+  if (Object.prototype.hasOwnProperty.call(BOX_GPT_WEB_MODELS_MAP, model)) {
+    return BOX_GPT_WEB_MODELS_MAP[model]
+  }
+  if (model === 'gpt-6-astra-pro') return 'gpt-6-astra-pro'
+  return undefined
+}
+
+export function isBoxGptWebCatalogModel(model: string | undefined): boolean {
+  return !!model && Object.prototype.hasOwnProperty.call(BOX_GPT_WEB_MODELS_MAP, model)
+}
+
 export function isBoxClaudeCatalogModel(model: string | undefined): boolean {
   return !!model && Object.prototype.hasOwnProperty.call(BOX_OFFICIAL_MODELS, model)
+}
+
+export function isBoxInteractiveCatalogModel(model: string | undefined): boolean {
+  return isBoxClaudeCatalogModel(model) || isBoxGptWebCatalogModel(model)
 }
 
 /** Official stream-json argv that is safe to run inside the box.
