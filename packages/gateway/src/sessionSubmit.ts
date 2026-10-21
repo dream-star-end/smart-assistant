@@ -112,6 +112,7 @@ import {
   assertPromptQueueExecutionAdmission,
   normForCompare,
   historicalContextInjectionKey,
+  providerGapMessagesAfterOwnTurn,
   buildHistoricalContextPrompt,
   buildNativeModelHandoffPayload,
   shouldAttemptHistoricalContextInjection,
@@ -154,6 +155,7 @@ export interface SessionSubmitHost {
   _resumeMap: SessionManager['_resumeMap']
   _resumeMapCostImprecise: SessionManager['_resumeMapCostImprecise']
   _resumeMapHistory: SessionManager['_resumeMapHistory']
+  _resumeHeadPromotedFromHistory: SessionManager['_resumeHeadPromotedFromHistory']
   _resumeMapLastCost: SessionManager['_resumeMapLastCost']
   _resumeMapProvider: SessionManager['_resumeMapProvider']
   _resumeMapTimestamps: SessionManager['_resumeMapTimestamps']
@@ -1035,7 +1037,30 @@ export async function submit(
       agentId: session.agentId,
       hasProviderResumeId: !!providerResumeId,
     })
-    if (providerResumeId && injectionKey !== null) {
+    // OCV5-556: when this agent's own last answer is in the window, the native
+    // session already holds everything up to it. Keep the resume and inject only
+    // the rows after it; a full replay into a fresh session is the fallback.
+    // A head the ladder promoted from history may predate that answer (the
+    // newer conversation lost its transcript), so it always gets the full rebuild.
+    const providerGapDelta =
+      providerResumeId &&
+      injectionKey !== null &&
+      effectiveMasterHistoricalMessages &&
+      this._resumeHeadPromotedFromHistory.get(session.sessionKey) !== providerResumeId
+        ? providerGapMessagesAfterOwnTurn({
+            messages: effectiveMasterHistoricalMessages,
+            peerId: session.peerId,
+            agentId: session.agentId,
+          })
+        : null
+    if (providerGapDelta) {
+      log.info('master history gap kept native resume; injecting missing rows only', {
+        sessionKey: session.sessionKey,
+        provider: session.providerTag,
+        injectionKey,
+        missingCount: providerGapDelta.length,
+      })
+    } else if (providerResumeId && injectionKey !== null) {
       log.warn('master history gap invalidated native resume before context rebuild', {
         sessionKey: session.sessionKey,
         provider: session.providerTag,
@@ -1114,6 +1139,7 @@ export async function submit(
     ) {
       try {
         const historyMessages =
+          providerGapDelta ??
           effectiveMasterHistoricalMessages ??
           mergePendingExternalHistory(
             (await getEngineContextMessages(session.peerId, session.userId ?? 'default', {
@@ -1149,13 +1175,15 @@ export async function submit(
             sessionKey: session.sessionKey,
             provider: session.providerTag,
             source: masterHistoricalMessages ? 'master-frame' : 'local-storage',
+            mode: providerGapDelta ? 'gap-delta-on-native-resume' : 'full-rebuild',
             injectionKey: session._historicalContextInjectedKey,
             messageCount: injectedCount,
           })
           // §2.3 boss 硬指标 3:兜底注入成功 = 引擎无法原生续接、上下文被重建 → 主动
           // 提醒用户(仅当上层传了回调,即 webchat leader turn;内部子 turn 不提醒)。
           // 回调抛错不能打断 turn —— 提示是尽力而为的 UX,吞掉即可。
-          const shouldNotifyContextRebuilt = shouldEmitContextRebuilt({
+          // A delta on top of a kept native resume rebuilds nothing.
+          const shouldNotifyContextRebuilt = !providerGapDelta && shouldEmitContextRebuilt({
             historyMode: session.runner.capabilities.historyMode,
             reason: session._contextRebuildNotice,
           })
@@ -1925,6 +1953,9 @@ export async function _getOrCreateExclusive(
           // disk (the incident shape) has nothing to fall back to.
           this._pushResumeHistory(opts.sessionKey, prevId)
         }
+      }
+      if (this._resumeHeadPromotedFromHistory.get(opts.sessionKey) !== id) {
+        this._resumeHeadPromotedFromHistory.delete(opts.sessionKey)
       }
       session.ccbSessionId = id
       // Remember which provider produced this id — the next getOrCreate on
@@ -2839,6 +2870,7 @@ export function _resolveDurableResumeId(
     // history keeps only ids older than the promoted one.
     const idx = history.indexOf(picked.id)
     this._resumeMap.set(sessionKey, picked.id)
+    this._resumeHeadPromotedFromHistory.set(sessionKey, picked.id)
     this._resumeMapProvider.set(sessionKey, provider)
     this._resumeMapHistory.set(sessionKey, history.slice(idx + 1))
     // Sync the live session BEFORE saving: _saveResumeMap overlays live

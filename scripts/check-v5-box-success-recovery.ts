@@ -51,6 +51,7 @@ const BEHAVIOR = [
   "[ocv5-527-step-chat] PASS — stable Step pricing identity selects the current chat upstream for static and catalog routes",
   "[ocv5-530-agy-host-path] PASS — Antigravity launch login shell resolves only the selfhost host wrapper; neighbouring user shims stay off PATH",
   "[go-websearch-server-tool] PASS — official WebSearch side requests on Go chat/responses bridges are answered from platform search with zero usage and no upstream call; mixed requests keep only function tools",
+  "[ocv5-556-resume-agycred] PASS — a recovery give-up card keeps the native resume, a real gap injects only the missing rows, the Antigravity CLI token file outlives the turn hard limit, and its expiry error is a platform credential error with no automatic recovery",
 ];
 const HOLD_PY = [
   "import os, signal, sys, time",
@@ -873,6 +874,12 @@ async function runWorker(argv: string[]): Promise<void> {
     assert.ok(!JSON.stringify(converted.tools).includes("web_search"), `WS_MIXED_SERVER_TOOL_${label}`);
   }
   emit(BEHAVIOR[6]!);
+  // INC-20261021-AGY-CRED-RESUME-GAP (OCV5-556): run the shared proof under this
+  // worker's private OPENCLAUDE_HOME (synthetic token, no network, no database).
+  const { proveResumeAgyCred } = await import("../packages/gateway/src/__tests__/resumeAgyCredProof.js");
+  const agyCredReceipt = proveResumeAgyCred();
+  assert.equal(agyCredReceipt, BEHAVIOR[7]);
+  emit(agyCredReceipt);
 }
 
 function parseFormal(argv: string[]): string {
