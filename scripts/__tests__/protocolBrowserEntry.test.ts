@@ -140,6 +140,24 @@ describe('protocol browser entries', () => {
   })
 })
 
+describe('browser test bundles', () => {
+  test('a browser test that aliases the protocol root also aliases /browser', () => {
+    // esbuild appends a subpath to a package alias: aliasing only `@openclaude/protocol` turns
+    // `@openclaude/protocol/browser` into `.../index.ts/browser` and the bundle fails to resolve
+    const dir = path.join(ROOT, 'packages/web-react/browser-tests')
+    const bad: string[] = []
+    for (const f of ts.sys.readDirectory(dir, ['.mjs', '.js', '.ts'])) {
+      const s = readFileSync(f, 'utf8')
+      if (
+        /['"]@openclaude\/protocol['"]\s*:/.test(s) &&
+        !/['"]@openclaude\/protocol\/browser['"]\s*:/.test(s)
+      )
+        bad.push(path.relative(ROOT, f))
+    }
+    assert.deepEqual(bad, [])
+  })
+})
+
 describe('the walker itself (counter-examples)', () => {
   const tree = (t: { after(fn: () => void): void }, files: Record<string, string>) => {
     const dir = mkdtempSync(path.join(tmpdir(), 'proto-browser-'))
