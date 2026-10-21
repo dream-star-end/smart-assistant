@@ -95,6 +95,10 @@ export const TURN_ERROR_TAXONOMY = {
   engine_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
   internal_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
   auth_error: { retryable: false, cta: 'relogin' },
+  /** gateway errorClassify: a platform-issued engine credential expired mid-turn
+   * (OCV5-556). The next message gets a fresh one, so a manual retry works;
+   * automatic recovery would replay the same failure. */
+  platform_credential_expired: { retryable: true, cta: 'retry' },
   service_restart: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true },
   session_persist_unavailable: { retryable: true, cta: 'retry' },
   /** Soft-deleted conversation. Same-peer retry cannot revive it; restore from

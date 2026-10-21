@@ -112,6 +112,7 @@ import {
   assertPromptQueueExecutionAdmission,
   normForCompare,
   historicalContextInjectionKey,
+  providerGapMessagesAfterOwnTurn,
   buildHistoricalContextPrompt,
   buildNativeModelHandoffPayload,
   shouldAttemptHistoricalContextInjection,
@@ -1035,7 +1036,25 @@ export async function submit(
       agentId: session.agentId,
       hasProviderResumeId: !!providerResumeId,
     })
-    if (providerResumeId && injectionKey !== null) {
+    // OCV5-556: when this agent's own last answer is in the window, the native
+    // session already holds everything up to it. Keep the resume and inject only
+    // the rows after it; a full replay into a fresh session is the fallback.
+    const providerGapDelta =
+      providerResumeId && injectionKey !== null && effectiveMasterHistoricalMessages
+        ? providerGapMessagesAfterOwnTurn({
+            messages: effectiveMasterHistoricalMessages,
+            peerId: session.peerId,
+            agentId: session.agentId,
+          })
+        : null
+    if (providerGapDelta) {
+      log.info('master history gap kept native resume; injecting missing rows only', {
+        sessionKey: session.sessionKey,
+        provider: session.providerTag,
+        injectionKey,
+        missingCount: providerGapDelta.length,
+      })
+    } else if (providerResumeId && injectionKey !== null) {
       log.warn('master history gap invalidated native resume before context rebuild', {
         sessionKey: session.sessionKey,
         provider: session.providerTag,
@@ -1114,6 +1133,7 @@ export async function submit(
     ) {
       try {
         const historyMessages =
+          providerGapDelta ??
           effectiveMasterHistoricalMessages ??
           mergePendingExternalHistory(
             (await getEngineContextMessages(session.peerId, session.userId ?? 'default', {
@@ -1149,13 +1169,15 @@ export async function submit(
             sessionKey: session.sessionKey,
             provider: session.providerTag,
             source: masterHistoricalMessages ? 'master-frame' : 'local-storage',
+            mode: providerGapDelta ? 'gap-delta-on-native-resume' : 'full-rebuild',
             injectionKey: session._historicalContextInjectedKey,
             messageCount: injectedCount,
           })
           // §2.3 boss 硬指标 3:兜底注入成功 = 引擎无法原生续接、上下文被重建 → 主动
           // 提醒用户(仅当上层传了回调,即 webchat leader turn;内部子 turn 不提醒)。
           // 回调抛错不能打断 turn —— 提示是尽力而为的 UX,吞掉即可。
-          const shouldNotifyContextRebuilt = shouldEmitContextRebuilt({
+          // A delta on top of a kept native resume rebuilds nothing.
+          const shouldNotifyContextRebuilt = !providerGapDelta && shouldEmitContextRebuilt({
             historyMode: session.runner.capabilities.historyMode,
             reason: session._contextRebuildNotice,
           })

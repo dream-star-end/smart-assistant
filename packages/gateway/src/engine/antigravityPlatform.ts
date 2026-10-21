@@ -108,6 +108,8 @@ export interface AntigravityPlatformProjection {
   cacheDir: string
   advertisedMcpTools: string[]
   delegateContextFile: string | null
+  /** `expiry` written to the CLI token file (ISO); logged per turn, never the token. */
+  cliTokenFileExpiry: string
 }
 
 /** Limited (openid/userinfo) Google token minted by master for one turn. */
@@ -144,6 +146,24 @@ function writePrivate(path: string, value: string): void {
 function privateDir(path: string): string {
   mkdirSync(path, { recursive: true, mode: 0o700 })
   return path
+}
+
+/**
+ * Lifetime the CLI's token file claims (OCV5-556). The CLI checks the limited
+ * token against userinfo once at start; every later Cloud Code call goes to the
+ * loopback relay, which replaces Authorization with the container token, so the
+ * file's token never authenticates anything mid-turn. With the real expiry
+ * (20-60 min) and no refresh_token, Go oauth2 refused locally once it passed:
+ * `oauth2: token expired and refresh token is not set` on an 82-minute turn.
+ * Outlives the 12 h turn hard limit.
+ */
+export const ANTIGRAVITY_CLI_TOKEN_FILE_TTL_MS = 24 * 60 * 60 * 1000
+
+/** max(real expiry, now + TTL); an unparseable real expiry counts as now. */
+export function antigravityCliTokenFileExpiry(realExpiresAt: string, nowMs: number = Date.now()): string {
+  const real = Date.parse(realExpiresAt)
+  const floor = nowMs + ANTIGRAVITY_CLI_TOKEN_FILE_TTL_MS
+  return new Date(Number.isFinite(real) && real > floor ? real : floor).toISOString()
 }
 
 /** Single-quoted in .profile and joined into PATH: no quotes, colons or spaces. */
@@ -201,7 +221,9 @@ export function projectAntigravityPlatform(
   // Google-account mode: no modelProvider override. The CLI reads this token
   // file when no keyring is reachable; it only runs the userinfo eligibility
   // check with it. Every Cloud Code call goes to CLOUD_CODE_URL (the relay),
-  // which swaps in the account's real token. refresh_token stays empty.
+  // which swaps in the account's real token. refresh_token stays empty, so the
+  // file claims a lifetime longer than any turn (see ANTIGRAVITY_CLI_TOKEN_FILE_TTL_MS).
+  const cliTokenFileExpiry = antigravityCliTokenFileExpiry(input.credential.accessTokenExpiresAt)
   writePrivate(join(cliDir, 'settings.json'), `${JSON.stringify({}, null, 2)}\n`)
   writePrivate(
     join(cliDir, 'antigravity-oauth-token'),
@@ -210,7 +232,7 @@ export function projectAntigravityPlatform(
         access_token: input.credential.accessToken,
         token_type: 'Bearer',
         refresh_token: '',
-        expiry: input.credential.accessTokenExpiresAt,
+        expiry: cliTokenFileExpiry,
       },
       auth_method: 'consumer',
       ...(input.credential.idToken ? { id_token: input.credential.idToken } : {}),
@@ -271,7 +293,15 @@ export function projectAntigravityPlatform(
     join(configDir, 'mcp_config.json'),
     `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`,
   )
-  return { root, launchHome, hostPathDir, cacheDir, advertisedMcpTools, delegateContextFile }
+  return {
+    root,
+    launchHome,
+    hostPathDir,
+    cacheDir,
+    advertisedMcpTools,
+    delegateContextFile,
+    cliTokenFileExpiry,
+  }
 }
 
 /** Remove one launch HOME. Never follows the shared symlinks. */

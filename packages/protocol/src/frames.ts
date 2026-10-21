@@ -1071,6 +1071,7 @@ export const OutboundError = Type.Object({
     Type.Literal('service_restart'),
     Type.Literal('engine_error'),
     Type.Literal('auth_error'),
+    Type.Literal('platform_credential_expired'),
     Type.Literal('session_persist_unavailable'),
     Type.Literal('project_context_unavailable'),
   ]),
