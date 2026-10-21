@@ -1,12 +1,13 @@
-import { LiteratureError } from '../plugins/literatureDb/errors.js'
 import assert from 'node:assert/strict'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 import { describe, test } from 'node:test'
+import { LiteratureError } from '../plugins/literatureDb/errors.js'
 
 import { signAccess } from '../auth/jwt.js'
 import { PluginAccountError } from '../plugins/accounts.js'
 import { KnowledgePlanetSetupError } from '../plugins/knowledgePlanetSetup.js'
+import { resolvePluginErrorGuidance } from '../plugins/pluginErrorGuidance.js'
 import { PluginRuntimeFacadeError } from '../plugins/runtime.js'
 import { WeiboSetupError } from '../plugins/weiboSetup.js'
 import { dispatchPluginsRoute } from './plugins.js'
@@ -441,6 +442,42 @@ describe('Plugin management HTTP dispatcher', () => {
     )
   })
 
+  test('account route guidance names the account provider; lookup failure falls back to neutral wording', async () => {
+    const body = { enabled: true, accepted: true, disclaimerVersion: 1 }
+    const call = async (targetProvider: () => Promise<string | null>) => {
+      const req = await request('PATCH', '/api/plugins/accounts/901/write-preapproval', body)
+      try {
+        await dispatchPluginsRoute(
+          req,
+          response(),
+          ctx,
+          deps({
+            pluginRuntime: {
+              setManagedAccountWritePreapproval: async () => {
+                throw new PluginRuntimeFacadeError('WRITE_DISABLED')
+              },
+              targetProvider,
+            },
+          }),
+        )
+      } catch (error) {
+        assert.ok(error instanceof HttpError && error.status === 409)
+        return String(error.nextAction)
+      }
+      assert.fail('expected WRITE_DISABLED')
+    }
+    // 微博逐字不变:与 provider='weibo' 的精确表一致。
+    assert.equal(
+      await call(async () => 'weibo'),
+      resolvePluginErrorGuidance({ code: 'WRITE_DISABLED', provider: 'weibo' }).nextAction,
+    )
+    assert.match(await call(async () => 'zhihu'), /知乎/)
+    const neutral = await call(async () => {
+      throw new Error('db down')
+    })
+    assert.doesNotMatch(neutral, /微博|知乎/)
+  })
+
   test('unattended automation uses separate consent and exact account/rule bindings', async () => {
     const calls: Array<{ kind: string; input: unknown }> = []
     const custom = deps({
@@ -721,7 +758,10 @@ describe('Plugin management HTTP dispatcher', () => {
     )
     await assert.rejects(
       dispatchPluginsRoute(
-        await request('GET', '/api/plugins/literature-db/artifacts/litpdf-ffffffffffffffffffffffffffffffff'),
+        await request(
+          'GET',
+          '/api/plugins/literature-db/artifacts/litpdf-ffffffffffffffffffffffffffffffff',
+        ),
         response(),
         {} as any,
         deps({ literatureArtifacts: store }),

@@ -192,24 +192,49 @@ function mapSetupError(error: unknown): never {
   }
 }
 
-function mapRuntimeError(error: unknown): never {
+/** Provider of the account an error is about, so guidance names the right plugin; looked up only on error. */
+async function accountProvider(
+  deps: CommercialHttpDeps & PluginHttpDeps,
+  userId: number,
+  targetId: string,
+): Promise<string | undefined> {
+  try {
+    return (await deps.pluginRuntime?.targetProvider?.(userId, targetId)) ?? undefined
+  } catch {
+    return undefined
+  }
+}
+
+function mapRuntimeError(error: unknown, provider?: string): never {
   if (error instanceof PluginRuntimeFacadeError) {
     switch (error.code) {
       case 'BAD_REQUEST':
-        throw pluginHttpError(400, error.code, 'invalid Plugin request')
+        throw pluginHttpError(400, error.code, 'invalid Plugin request', undefined, provider)
       case 'TARGET_NOT_FOUND':
-        throw pluginHttpError(404, error.code, 'Plugin account not found')
+        throw pluginHttpError(404, error.code, 'Plugin account not found', undefined, provider)
       case 'TARGET_STALE':
-        throw pluginHttpError(409, error.code, 'Plugin account changed; retry')
+        throw pluginHttpError(409, error.code, 'Plugin account changed; retry', undefined, provider)
       case 'WRITE_DISABLED':
       case 'WRITE_REQUIRES_CONFIRMATION':
-        throw pluginHttpError(409, error.code, 'Plugin writes are not enabled')
+        throw pluginHttpError(409, error.code, 'Plugin writes are not enabled', undefined, provider)
       case 'RUNTIME_BUSY':
-        throw pluginHttpError(429, error.code, 'Plugin runtime is busy')
+        throw pluginHttpError(429, error.code, 'Plugin runtime is busy', undefined, provider)
       case 'RELINK_REQUIRED':
-        throw pluginHttpError(401, error.code, 'Plugin account must be authorized again')
+        throw pluginHttpError(
+          401,
+          error.code,
+          'Plugin account must be authorized again',
+          undefined,
+          provider,
+        )
       default:
-        throw pluginHttpError(503, error.code, 'Plugin runtime unavailable', error.message)
+        throw pluginHttpError(
+          503,
+          error.code,
+          'Plugin runtime unavailable',
+          error.message,
+          provider,
+        )
     }
   }
   if (error instanceof PluginAccountLeaseError) {
@@ -222,7 +247,13 @@ function mapRuntimeError(error: unknown): never {
       throw new HttpError(404, 'TARGET_NOT_FOUND', 'Plugin account not found')
     if (error.code === 'ACCOUNT_STALE')
       throw new HttpError(409, 'TARGET_STALE', 'Plugin account changed; retry')
-    throw pluginHttpError(503, 'PLUGIN_RUNTIME_UNAVAILABLE', 'Plugin runtime unavailable')
+    throw pluginHttpError(
+      503,
+      'PLUGIN_RUNTIME_UNAVAILABLE',
+      'Plugin runtime unavailable',
+      undefined,
+      provider,
+    )
   }
   throw error
 }
@@ -357,7 +388,7 @@ export async function dispatchPluginsRoute(
       })
       return
     } catch (error) {
-      mapRuntimeError(error)
+      mapRuntimeError(error, await accountProvider(deps, userId, account[1]!))
     }
   }
 
@@ -392,7 +423,7 @@ export async function dispatchPluginsRoute(
       sendJson(res, 200, { writeControl })
       return
     } catch (error) {
-      mapRuntimeError(error)
+      mapRuntimeError(error, await accountProvider(deps, userId, writeAccess[1]!))
     }
   }
 
@@ -427,7 +458,7 @@ export async function dispatchPluginsRoute(
       sendJson(res, 200, { writeControl })
       return
     } catch (error) {
-      mapRuntimeError(error)
+      mapRuntimeError(error, await accountProvider(deps, userId, writePreapproval[1]!))
     }
   }
 
