@@ -13,7 +13,7 @@ import {
   cursorModelById,
   formatCostX,
   isMorePickerModelId,
-} from '@openclaude/protocol'
+} from '@openclaude/protocol/browser'
 import type { LockedPublicModel, PublicModel } from './types'
 
 export type CursorPickerRow = {

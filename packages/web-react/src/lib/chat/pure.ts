@@ -14,7 +14,7 @@ import {
   REPORT_EXEMPT_TURN_ERROR_CODES,
   type TurnErrorCode,
   turnErrorSemantics,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/browser";
 import { formatLiveActivityAction } from "./liveActivityLabel";
 import type {
   OutboundContentBlock,

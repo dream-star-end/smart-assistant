@@ -6,7 +6,7 @@
  */
 import { useCallback, useState, useRef, useEffect, useMemo } from "react";
 import type { MediaRef, InboundMessage } from "../lib/chat/frames";
-import { type MessageReplyQuote, cursorModelSupportsContextTier, supportsFastServiceTier, isCodexEngineModel } from "@openclaude/protocol";
+import { type MessageReplyQuote, cursorModelSupportsContextTier, supportsFastServiceTier, isCodexEngineModel } from "@openclaude/protocol/browser";
 import { sessionTitleFromText } from "../lib/sessionTitle";
 import type { Message, Session } from "../lib/types";
 import { demoReply } from "../lib/demo";

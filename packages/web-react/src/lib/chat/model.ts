@@ -9,7 +9,7 @@
  * 重要：reducer 对 `session.messages` **就地 mutation**（push / 改字段），不每帧
  * 重建数组（streaming delta 频率极高）。订阅侧靠 `version` 单调递增触发重渲。
  */
-import type { CursorContextTier, MessageReplyQuote, ServiceTier } from "@openclaude/protocol";
+import type { CursorContextTier, MessageReplyQuote, ServiceTier } from "@openclaude/protocol/browser";
 import type {
   CallTokenUsageSnapshot,
   TurnTokenUsageSnapshot,

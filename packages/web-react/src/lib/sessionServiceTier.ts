@@ -8,7 +8,7 @@
  * 后端:serviceTier 是 inbound.message 顶层 turn 级字段;只对 protocol serviceTiers 列出的
  * 模型生效(Codex serviceTierForTurn / OpenCode Go service_tier=priority),其它模型忽略。
  */
-import type { ServiceTier } from '@openclaude/protocol'
+import type { ServiceTier } from '@openclaude/protocol/browser'
 
 const SERVICE_TIER_SESSION_PREFIX = 'oc_v5_service_tier:'
 

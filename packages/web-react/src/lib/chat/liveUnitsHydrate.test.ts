@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import type { LiveUnit } from "@openclaude/protocol";
+import type { LiveUnit } from "@openclaude/protocol/browser";
 import { liveUnitToMessage } from "./liveUnitsHydrate";
 
 function toolUnit(overrides: Partial<LiveUnit> & { inputPreview?: string }): LiveUnit {
