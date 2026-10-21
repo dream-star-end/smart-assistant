@@ -358,6 +358,30 @@ export function saveSessionConversationId(profileDir, sessionId, conversationId)
  * - If `sessionId` is a new session and the tab is currently on another conversation `/c/...`,
  *   navigates back to `https://chatgpt.com/` so prompts never leak across sessions.
  */
+/**
+ * Clears any unsent draft text and removes any leftover attachment chips in the composer
+ * so a cancelled or failed turn never leaks draft content into a subsequent turn or session.
+ */
+export async function resetComposerDraftInPage(page) {
+  if (!page || typeof page.evaluate !== 'function') return
+  await page
+    .evaluate(() => {
+      if (typeof document === 'undefined') return
+      const removeBtns = document.querySelectorAll('button[aria-label^="Remove "]')
+      for (const btn of removeBtns) {
+        if (typeof btn.click === 'function') btn.click()
+      }
+      const el = document.querySelector('#prompt-textarea')
+      if (el) {
+        if ('value' in el) el.value = ''
+        el.textContent = ''
+        el.innerHTML = ''
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+      }
+    })
+    .catch(() => {})
+}
+
 export async function syncPageToSessionConversation(
   page,
   { profileDir, sessionId, initScript = backendFetchTeeInitScript() },
@@ -369,26 +393,27 @@ export async function syncPageToSessionConversation(
   const currentConvId = currentMatch ? currentMatch[1] : null
 
   if (mappedConvId) {
-    if (currentConvId !== mappedConvId) {
+    const needNav = currentConvId !== mappedConvId
+    if (needNav) {
       await page.goto(`${DEFAULT_CHATGPT_ORIGIN}/c/${mappedConvId}`, {
         waitUntil: 'domcontentloaded',
         timeout: 45_000,
       })
       if (initScript) await page.evaluate(initScript)
     }
-    return { conversationId: mappedConvId, navigated: currentConvId !== mappedConvId }
+    await resetComposerDraftInPage(page)
+    return { conversationId: mappedConvId, navigated: needNav }
   }
 
-  if (currentConvId !== null || !isChatGptOriginUrl(currentUrl)) {
-    await page.goto(`${DEFAULT_CHATGPT_ORIGIN}/`, {
-      waitUntil: 'domcontentloaded',
-      timeout: 45_000,
-    })
-    if (initScript) await page.evaluate(initScript)
-    return { conversationId: null, navigated: true }
-  }
-
-  return { conversationId: null, navigated: false }
+  // Brand-new session (no recorded conversationId): always navigate cleanly to https://chatgpt.com/
+  // and reset the composer draft so an aborted prior session on "/" cannot leak its unsent draft.
+  await page.goto(`${DEFAULT_CHATGPT_ORIGIN}/`, {
+    waitUntil: 'domcontentloaded',
+    timeout: 45_000,
+  })
+  if (initScript) await page.evaluate(initScript)
+  await resetComposerDraftInPage(page)
+  return { conversationId: null, navigated: true }
 }
 
 export function levelIndex(raw) {
@@ -1106,29 +1131,94 @@ export function formatStreamJsonControlResponse({ requestId, subtype = 'success'
 }
 
 /**
- * Extracts attachment paths injected by Gateway's `inboundDispatch` (`buildImageAttachmentHint`
- * and unparsed document hints) and strips the Claude Code `Read`-tool instruction footer.
+ * Resolves `filePath` to a canonical regular file strictly inside `allowedUploadRoots`.
+ * Prevents arbitrary local file disclosure when user prompt text contains path-like strings.
  */
-export function extractInboundDispatchAttachments(rawText) {
+export function resolveTrustedAttachmentPath(filePath, allowedUploadRoots = []) {
+  if (!filePath || !Array.isArray(allowedUploadRoots) || allowedUploadRoots.length === 0) {
+    return null
+  }
+  let real
+  try {
+    real = fs.realpathSync(filePath)
+  } catch {
+    return null
+  }
+  for (const rootDir of allowedUploadRoots) {
+    if (!rootDir) continue
+    let rootReal
+    try {
+      rootReal = fs.realpathSync(rootDir)
+    } catch {
+      continue
+    }
+    const prefix = rootReal.endsWith(path.sep) ? rootReal : `${rootReal}${path.sep}`
+    if (real.startsWith(prefix)) {
+      try {
+        if (fs.statSync(real).isFile()) return real
+      } catch {}
+    }
+  }
+  return null
+}
+
+const INBOUND_IMAGE_HINT_BLOCK_RE =
+  /\n*---\n用户附带了以下图片\(已保存到服务器本地\):\n((?:- `\/[^`\n]+` \([^)\n]*原名: [^)\n]+\)\n?)+)\n如果需要看图片内容:\n1\. 用 Read 工具读图片路径\(原生多模态 provider 会直接看到图像\)。\n2\. 如果当前 provider 不支持图片识别,告诉用户。/g
+
+const INBOUND_UNPARSED_DOC_BLOCK_RE =
+  /\n*---\n用户还附带了以下文档\(已保存到服务器本地,gateway 没能预解析 ——\n可能因为格式不支持、解析失败或解析超时\):\n((?:- `\/[^`\n]+` \([^)\n]*原名: [^)\n]+\)\n?)+)\n可以用 Read 工具读取文档内容\(对纯文本、CSV、源码、PDF 等都有效\n—— 大 PDF 即便预解析超时,Read 也可能能拿到部分文本\)。\n若是 \.doc 老格式 Word 二进制,Read 会看到乱码 —— 礼貌地请用户转存为 \.docx 重传。/g
+
+/**
+ * Extracts attachment paths injected by Gateway's `inboundDispatch` (`buildImageAttachmentHint`
+ * and unparsed document hints) ONLY when those paths resolve inside `allowedUploadRoots`,
+ * and strips only the matched attachment block(s) without touching subsequent sections
+ * (such as pre-parsed PDF markdown).
+ */
+export function extractInboundDispatchAttachments(
+  rawText,
+  { allowedUploadRoots = [], stripWithoutVerify = false } = {},
+) {
   const text = String(rawText ?? '')
   const extractedPaths = []
   const bulletRe = /^-\s+`(\/[^`\n]+)`\s+\([^)\n]*原名:\s*([^)\n]+)\)/gm
-  let match = bulletRe.exec(text)
-  while (match !== null) {
-    extractedPaths.push(match[1])
-    match = bulletRe.exec(text)
+
+  const processBlock = (fullMatch, bulletSection) => {
+    const blockPaths = []
+    bulletRe.lastIndex = 0
+    let m = bulletRe.exec(bulletSection)
+    while (m !== null) {
+      blockPaths.push(m[1])
+      m = bulletRe.exec(bulletSection)
+    }
+    if (blockPaths.length === 0) return fullMatch
+    if (stripWithoutVerify) {
+      return ''
+    }
+    const verified = []
+    for (const p of blockPaths) {
+      const resolved = resolveTrustedAttachmentPath(p, allowedUploadRoots)
+      if (!resolved) {
+        return fullMatch
+      }
+      verified.push(resolved)
+    }
+    for (const vp of verified) {
+      if (!extractedPaths.includes(vp)) {
+        extractedPaths.push(vp)
+      }
+    }
+    return ''
   }
-  if (extractedPaths.length === 0) {
+
+  let cleaned = text.replace(INBOUND_IMAGE_HINT_BLOCK_RE, processBlock)
+  cleaned = cleaned.replace(INBOUND_UNPARSED_DOC_BLOCK_RE, processBlock)
+
+  if (extractedPaths.length === 0 && !stripWithoutVerify) {
     return { cleanText: text, extractedPaths: [] }
   }
-  const stripped = text
-    .replace(
-      /\n*---\n用户(?:还)?附带了以下(?:图片|音频文件|视频文件|文档)\(已保存到服务器本地[\s\S]*$/m,
-      '',
-    )
-    .trim()
+  const trimmed = cleaned.trim()
   return {
-    cleanText: stripped || '请分析上传的附件。',
+    cleanText: trimmed || '请分析上传的附件。',
     extractedPaths,
   }
 }
@@ -1137,14 +1227,16 @@ export function extractInboundDispatchAttachments(rawText) {
  * Parses a Route B stdin JSON line into either a `control_request` (e.g. `interrupt`)
  * or a `user` turn (with extracted prompt text and attachment file paths).
  */
-export function parseStdinFrame(line, { stagingDir = null } = {}) {
+export function parseStdinFrame(line, { stagingDir = null, allowedUploadRoots = [] } = {}) {
   const trimmed = String(line ?? '').trim()
   if (!trimmed) return null
   let parsed
   try {
     parsed = JSON.parse(trimmed)
   } catch {
-    const { cleanText, extractedPaths } = extractInboundDispatchAttachments(trimmed)
+    const { cleanText, extractedPaths } = extractInboundDispatchAttachments(trimmed, {
+      allowedUploadRoots,
+    })
     return { kind: 'user', text: cleanText, files: extractedPaths }
   }
   if (!parsed || typeof parsed !== 'object') return null
@@ -1161,8 +1253,9 @@ export function parseStdinFrame(line, { stagingDir = null } = {}) {
   const msg = parsed.message || parsed
   const content = msg.content ?? parsed.prompt ?? ''
   const files = Array.isArray(parsed.files) ? [...parsed.files] : []
+  const hasInlined = Array.isArray(parsed.inlineAttachments) && parsed.inlineAttachments.length > 0
 
-  if (Array.isArray(parsed.inlineAttachments) && parsed.inlineAttachments.length > 0) {
+  if (hasInlined) {
     const targetDir = stagingDir || fs.mkdtempSync(path.join(os.tmpdir(), 'oc-gpt-web-att-'))
     fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 })
     for (let i = 0; i < parsed.inlineAttachments.length; i++) {
@@ -1200,15 +1293,24 @@ export function parseStdinFrame(line, { stagingDir = null } = {}) {
     rawText = String(content || '')
   }
 
-  const { cleanText, extractedPaths } = extractInboundDispatchAttachments(rawText)
-  if (!Array.isArray(parsed.inlineAttachments) || parsed.inlineAttachments.length === 0) {
+  const { cleanText, extractedPaths } = extractInboundDispatchAttachments(rawText, {
+    allowedUploadRoots,
+    stripWithoutVerify: hasInlined,
+  })
+  if (!hasInlined) {
     for (const p of extractedPaths) {
       if (!files.includes(p)) {
         files.push(p)
       }
     }
   }
-  return { kind: 'user', text: cleanText, files }
+
+  if (!cleanText && files.length === 0) return null
+  return {
+    kind: 'user',
+    text: cleanText,
+    files,
+  }
 }
 
 export function extractUserTurnFromStdinFrame(line, opts = {}) {

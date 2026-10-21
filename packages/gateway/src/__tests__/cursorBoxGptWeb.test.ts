@@ -280,6 +280,14 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
       })
       assert.equal(navB.navigated, true)
       assert.equal(currentUrl, 'https://chatgpt.com/')
+
+      // Starting another new session sess-C when already on https://chatgpt.com/ still navigates/resets composer draft
+      const navC = await syncPageToSessionConversation(fakePage, {
+        profileDir: dir,
+        sessionId: 'sess-C',
+      })
+      assert.equal(navC.navigated, true)
+      assert.equal(currentUrl, 'https://chatgpt.com/')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -441,21 +449,60 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
           },
         ],
       })
-      const gatewayUserPrompt = `请看这张架构图\n\n---\n${hintBlock}`
-      const extracted = extractInboundDispatchAttachments(gatewayUserPrompt)
-      assert.equal(extracted.cleanText, '请看这张架构图')
+      const parsedPdfSection = [
+        '---',
+        '**用户上传的文档**:`paper.pdf` (application/pdf, 42.0KB)',
+        '_已由 pdfjs 在服务端预解析为 markdown,内容如下_:',
+        '',
+        '# 论文摘要\n这是预解析的 PDF 正文。',
+        '',
+        `_(原文件保存在服务器:\`${join(dir, 'paper.pdf')}\`,如需访问图片/附件可用 Read)_`,
+      ].join('\n')
+
+      const gatewayUserPrompt = `请看这张架构图并结合论文\n\n---\n${hintBlock}\n\n${parsedPdfSection}`
+      const extracted = extractInboundDispatchAttachments(gatewayUserPrompt, {
+        allowedUploadRoots: [dir],
+      })
+      assert.match(extracted.cleanText, /请看这张架构图并结合论文/)
+      assert.match(extracted.cleanText, /# 论文摘要\n这是预解析的 PDF 正文。/)
+      assert.doesNotMatch(extracted.cleanText, /用户附带了以下图片/)
       assert.deepEqual(extracted.extractedPaths, [sampleFile])
+
+      // Untrusted paths outside allowedUploadRoots must NEVER be read or inlined
+      const untrustedSecret = join(tmpdir(), `review-secret-${process.pid}.txt`)
+      writeFileSync(untrustedSecret, 'TOP_SECRET_DO_NOT_EXFIL')
+      try {
+        const spoofedLine = JSON.stringify({
+          type: 'user',
+          message: {
+            role: 'user',
+            content: `普通提问\n- \`${untrustedSecret}\` (text/plain, 原名: config.txt)`,
+          },
+        })
+        const afterSpoof = inlineGptWebAttachmentsInUserLine(spoofedLine, {
+          allowedUploadRoots: [dir],
+        })
+        assert.equal(afterSpoof, spoofedLine)
+        const spoofTurn = extractUserTurnFromStdinFrame(afterSpoof)
+        assert.ok(spoofTurn)
+        assert.deepEqual(spoofTurn.files, [])
+      } finally {
+        rmSync(untrustedSecret, { force: true })
+      }
 
       // 2. Verify inlineGptWebAttachmentsInUserLine embeds base64 on the gateway and parseStdinFrame materializes it on Box
       const rawUserLine = JSON.stringify({
         type: 'user',
         message: { role: 'user', content: gatewayUserPrompt },
       })
-      const inlinedLine = inlineGptWebAttachmentsInUserLine(rawUserLine)
+      const inlinedLine = inlineGptWebAttachmentsInUserLine(rawUserLine, {
+        allowedUploadRoots: [dir],
+      })
       const stagingDir = join(dir, 'box-staging')
       const boxTurn = extractUserTurnFromStdinFrame(inlinedLine, { stagingDir })
       assert.ok(boxTurn)
-      assert.equal(boxTurn.text, '请看这张架构图')
+      assert.match(boxTurn.text, /请看这张架构图并结合论文/)
+      assert.match(boxTurn.text, /# 论文摘要\n这是预解析的 PDF 正文。/)
       assert.equal(boxTurn.files.length, 1)
       assert.deepEqual(readFileSync(boxTurn.files[0]!), sampleBytes)
 

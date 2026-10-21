@@ -9,8 +9,9 @@
  * Node built-ins only: the bridge is spawned as plain node.
  */
 import { createHash } from 'node:crypto'
-import { existsSync, readFileSync, statSync } from 'node:fs'
-import { basename, join, resolve } from 'node:path'
+import { readFileSync, realpathSync, statSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { basename, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   BOX_CC_HOME,
@@ -126,11 +127,60 @@ export function validateBoxGptWebLoopbackProxy(proxyUrl: string | undefined | nu
 }
 
 /**
+ * Returns the default trusted upload roots on the gateway (`~/.openclaude/uploads`
+ * or `$OPENCLAUDE_HOME/uploads`), matching `paths.uploadsDir` in `@openclaude/storage`
+ * using Node built-ins only so `cursorBoxCcBridge` can run as plain `node`.
+ */
+export function defaultTrustedUploadRoots(env: NodeJS.ProcessEnv = process.env): string[] {
+  const ocHome = env.OPENCLAUDE_HOME ?? join(homedir(), '.openclaude')
+  return [join(ocHome, 'uploads')]
+}
+
+function resolveTrustedUploadFile(
+  filePath: string,
+  allowedUploadRoots: readonly string[],
+): string | null {
+  if (!filePath || allowedUploadRoots.length === 0) return null
+  let real: string
+  try {
+    real = realpathSync(filePath)
+  } catch {
+    return null
+  }
+  for (const rootDir of allowedUploadRoots) {
+    if (!rootDir) continue
+    let rootReal: string
+    try {
+      rootReal = realpathSync(rootDir)
+    } catch {
+      continue
+    }
+    const prefix = rootReal.endsWith(sep) ? rootReal : `${rootReal}${sep}`
+    if (real.startsWith(prefix)) {
+      try {
+        if (statSync(real).isFile()) return real
+      } catch {}
+    }
+  }
+  return null
+}
+
+const INBOUND_IMAGE_HINT_BLOCK_RE =
+  /\n*---\n用户附带了以下图片\(已保存到服务器本地\):\n((?:- `\/[^`\n]+` \([^)\n]*原名: [^)\n]+\)\n?)+)\n如果需要看图片内容:\n1\. 用 Read 工具读图片路径\(原生多模态 provider 会直接看到图像\)。\n2\. 如果当前 provider 不支持图片识别,告诉用户。/g
+
+const INBOUND_UNPARSED_DOC_BLOCK_RE =
+  /\n*---\n用户还附带了以下文档\(已保存到服务器本地,gateway 没能预解析 ——\n可能因为格式不支持、解析失败或解析超时\):\n((?:- `\/[^`\n]+` \([^)\n]*原名: [^)\n]+\)\n?)+)\n可以用 Read 工具读取文档内容\(对纯文本、CSV、源码、PDF 等都有效\n—— 大 PDF 即便预解析超时,Read 也可能能拿到部分文本\)。\n若是 \.doc 老格式 Word 二进制,Read 会看到乱码 —— 礼貌地请用户转存为 \.docx 重传。/g
+
+/**
  * Scans a Route B user JSON line for local gateway attachment paths (from `inboundDispatch`
- * `buildImageAttachmentHint` / unparsed file hints or `files` array) and embeds their bytes
+ * `buildImageAttachmentHint` / unparsed file hints or `files` array), verifies that every path
+ * resolves inside `allowedUploadRoots` (`paths.uploadsDir`), and embeds their bytes
  * as `inlineAttachments` so `host.mjs` on the Box can materialize and upload them to ChatGPT Web.
  */
-export function inlineGptWebAttachmentsInUserLine(line: string): string {
+export function inlineGptWebAttachmentsInUserLine(
+  line: string,
+  opts?: { allowedUploadRoots?: readonly string[] },
+): string {
   const trimmed = line.trim()
   if (!trimmed.startsWith('{')) return line
   let parsed: Record<string, any>
@@ -142,9 +192,25 @@ export function inlineGptWebAttachmentsInUserLine(line: string): string {
   if (!parsed || typeof parsed !== 'object' || (parsed.type && parsed.type !== 'user')) {
     return line
   }
+  const allowedRoots = opts?.allowedUploadRoots ?? defaultTrustedUploadRoots()
   const msg = parsed.message ?? parsed
   const content = msg?.content ?? parsed.prompt ?? ''
-  const candidatePaths: string[] = Array.isArray(parsed.files) ? [...parsed.files] : []
+  const verifiedFiles: string[] = []
+
+  const addIfTrusted = (fp: string): boolean => {
+    const resolved = resolveTrustedUploadFile(fp, allowedRoots)
+    if (!resolved) return false
+    if (!verifiedFiles.includes(resolved)) {
+      verifiedFiles.push(resolved)
+    }
+    return true
+  }
+
+  if (Array.isArray(parsed.files)) {
+    for (const fp of parsed.files) {
+      if (typeof fp === 'string') addIfTrusted(fp)
+    }
+  }
 
   let textContent = ''
   if (typeof content === 'string') {
@@ -158,38 +224,58 @@ export function inlineGptWebAttachmentsInUserLine(line: string): string {
           (block.type === 'image' || block.type === 'file') &&
           typeof block.path === 'string'
         ) {
-          candidatePaths.push(block.path)
+          addIfTrusted(block.path)
         }
       }
     }
   }
 
   const bulletRe = /^-\s+`(\/[^`\n]+)`\s+\([^)\n]*原名:\s*([^)\n]+)\)/gm
-  let match = bulletRe.exec(textContent)
-  while (match !== null) {
-    const p = match[1]
-    if (p && !candidatePaths.includes(p)) {
-      candidatePaths.push(p)
+  const processBlock = (fullMatch: string, bulletSection: string) => {
+    const blockPaths: string[] = []
+    bulletRe.lastIndex = 0
+    let m = bulletRe.exec(bulletSection)
+    while (m !== null) {
+      if (m[1]) blockPaths.push(m[1])
+      m = bulletRe.exec(bulletSection)
     }
-    match = bulletRe.exec(textContent)
+    if (blockPaths.length === 0) return fullMatch
+    const resolvedBlock: string[] = []
+    for (const p of blockPaths) {
+      const resolved = resolveTrustedUploadFile(p, allowedRoots)
+      if (!resolved) return fullMatch
+      resolvedBlock.push(resolved)
+    }
+    for (const rp of resolvedBlock) {
+      if (!verifiedFiles.includes(rp)) {
+        verifiedFiles.push(rp)
+      }
+    }
+    return ''
   }
 
-  if (candidatePaths.length === 0) return line
+  let cleanedText = textContent.replace(INBOUND_IMAGE_HINT_BLOCK_RE, processBlock)
+  cleanedText = cleanedText.replace(INBOUND_UNPARSED_DOC_BLOCK_RE, processBlock)
+
+  if (verifiedFiles.length === 0) return line
 
   const inlineAttachments: Array<{ name: string; base64: string }> = []
-  for (const fp of candidatePaths) {
+  for (const fp of verifiedFiles) {
     try {
-      if (existsSync(fp) && statSync(fp).isFile()) {
-        const buf = readFileSync(fp)
-        inlineAttachments.push({
-          name: basename(fp),
-          base64: buf.toString('base64'),
-        })
-      }
+      const buf = readFileSync(fp)
+      inlineAttachments.push({
+        name: basename(fp),
+        base64: buf.toString('base64'),
+      })
     } catch {}
   }
 
   if (inlineAttachments.length === 0) return line
+  if (typeof msg?.content === 'string') {
+    msg.content = cleanedText.trim() || '请分析上传的附件。'
+  } else if (typeof parsed.prompt === 'string') {
+    parsed.prompt = cleanedText.trim() || '请分析上传的附件。'
+  }
   parsed.inlineAttachments = inlineAttachments
   return JSON.stringify(parsed)
 }

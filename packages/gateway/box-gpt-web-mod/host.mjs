@@ -37,6 +37,7 @@ import {
   probeSessionState,
   profileDirFor,
   readProfileSingletonOwner,
+  resetComposerDraftInPage,
   saveSessionConversationId,
   selectProTierInPage,
   syncPageToSessionConversation,
@@ -237,6 +238,16 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
       const page = await acquireSingleChatGptPage(browser)
       turnControl.page = page
 
+      const abortIfRequested = async (stage) => {
+        if (turnControl.abort) {
+          await stopActiveGenerationInPage(page)
+          await resetComposerDraftInPage(page)
+          throw new Error(`BOX_GPT_WEB_INTERRUPTED: turn aborted (${stage})`)
+        }
+      }
+
+      await abortIfRequested('after acquire page')
+
       // Wait briefly if the page is still rendering its initial DOM
       for (let i = 0; i < 10; i++) {
         const probe = await probeSessionState(page, { profileDir, display: cfg.display })
@@ -256,11 +267,14 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
         profileDir,
         sessionId: cfg.sessionId,
       })
+      await abortIfRequested('after sync session')
 
       await selectProTierInPage(page, { requestedTier: 'pro' })
+      await abortIfRequested('after select pro tier')
 
       if (turn.files && turn.files.length > 0) {
         await uploadAttachmentsToComposer(page, turn.files)
+        await abortIfRequested('after upload attachments')
       }
 
       await page.evaluate(() => {
@@ -268,15 +282,11 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
       })
 
       await typeMultilinePreservingAttachments(page, turn.text)
+      await abortIfRequested('before send')
 
-      if (turnControl.abort) {
-        throw new Error('BOX_GPT_WEB_INTERRUPTED: turn aborted before send')
-      }
       const sendBtn = page.locator('[data-testid="send-button"]').first()
       await sendBtn.waitFor({ state: 'visible', timeout: 15_000 })
-      if (turnControl.abort) {
-        throw new Error('BOX_GPT_WEB_INTERRUPTED: turn aborted before send')
-      }
+      await abortIfRequested('before click send')
       await sendBtn.click()
 
       const acc = new SseAccumulator({
@@ -294,10 +304,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
       let readCursor = 0
 
       while (true) {
-        if (turnControl.abort) {
-          await stopActiveGenerationInPage(page)
-          throw new Error('BOX_GPT_WEB_INTERRUPTED: turn interrupted by user')
-        }
+        await abortIfRequested('during generation')
 
         const batch = await page.evaluate((fromIdx) => {
           const events = Array.isArray(window.__ocSseEvents) ? window.__ocSseEvents : []
@@ -418,19 +425,36 @@ async function main() {
   const cfg = parseCliArgs(process.argv.slice(2))
   const queue = new SerialJobQueue()
   let initEmitted = false
-  let activeTurnControl = null
+  const pendingTurnControls = new Set()
 
-  const abortActiveTurn = () => {
-    if (activeTurnControl) {
-      activeTurnControl.abort = true
-      void stopActiveGenerationInPage(activeTurnControl.page)
+  const abortAllPendingAndActiveTurns = async () => {
+    const tasks = []
+    for (const tc of pendingTurnControls) {
+      tc.abort = true
+      if (tc.page) {
+        tasks.push(stopActiveGenerationInPage(tc.page))
+        tasks.push(resetComposerDraftInPage(tc.page))
+      }
+    }
+    if (tasks.length > 0) {
+      await Promise.allSettled(tasks)
     }
   }
 
-  process.on('SIGTERM', () => {
-    abortActiveTurn()
-    process.exit(0)
-  })
+  let shuttingDown = false
+  const onSignal = () => {
+    if (shuttingDown) return
+    shuttingDown = true
+    void Promise.race([
+      abortAllPendingAndActiveTurns(),
+      new Promise((r) => setTimeout(r, 3_000)),
+    ]).finally(() => {
+      process.exit(0)
+    })
+  }
+
+  process.on('SIGTERM', onSignal)
+  process.on('SIGINT', onSignal)
 
   const rl = readline.createInterface({
     input: process.stdin,
@@ -443,21 +467,31 @@ async function main() {
 
     if (frame.kind === 'control_request') {
       if (frame.subtype === 'interrupt') {
-        abortActiveTurn()
+        for (const tc of pendingTurnControls) {
+          tc.abort = true
+        }
       }
-      writeStdoutLine(
-        formatStreamJsonControlResponse({
-          requestId: frame.requestId,
-          subtype: 'success',
-        }),
-      )
+      void (async () => {
+        if (frame.subtype === 'interrupt') {
+          await abortAllPendingAndActiveTurns()
+        }
+        writeStdoutLine(
+          formatStreamJsonControlResponse({
+            requestId: frame.requestId,
+            subtype: 'success',
+          }),
+        )
+      })()
       return
     }
 
+    // Synchronously register turnControl before enqueueing so an interrupt frame
+    // arriving in the same stdin chunk cancels this queued turn before it starts.
+    const turnControl = { abort: false, page: null }
+    pendingTurnControls.add(turnControl)
+
     void queue.enqueue(async () => {
       const turnStart = Date.now()
-      const turnControl = { abort: false, page: null }
-      activeTurnControl = turnControl
       if (!initEmitted) {
         initEmitted = true
         writeStdoutLine(
@@ -503,26 +537,13 @@ async function main() {
           }),
         )
       } finally {
-        if (activeTurnControl === turnControl) {
-          activeTurnControl = null
-        }
+        pendingTurnControls.delete(turnControl)
       }
     })
   })
-
-  await new Promise((resolve) => {
-    rl.on('close', () => {
-      // Wait for any queued work to drain before exiting
-      void queue.enqueue(async () => {}).then(resolve, resolve)
-    })
-  })
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  main().catch((err) => {
-    process.stderr.write(
-      `[box-gpt-web-host] fatal: ${err instanceof Error ? err.stack || err.message : String(err)}\n`,
-    )
-    process.exit(1)
-  })
-}
+main().catch((err) => {
+  process.stderr.write(`[box-gpt-web-host] fatal: ${err?.stack || err}\n`)
+  process.exit(1)
+})

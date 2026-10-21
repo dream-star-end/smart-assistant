@@ -166,18 +166,27 @@ export function formatStreamJsonControlResponse(opts: {
   requestId: string
   subtype?: string
 }): string
-export function extractInboundDispatchAttachments(rawText: string): {
+export function extractInboundDispatchAttachments(
+  rawText: string,
+  opts?: { allowedUploadRoots?: readonly string[]; stripWithoutVerify?: boolean },
+): {
   cleanText: string
   extractedPaths: string[]
 }
 export function parseStdinFrame(
   line: string,
-  opts?: { stagingDir?: string | null },
+  opts?: { stagingDir?: string | null; allowedUploadRoots?: readonly string[] },
 ):
   | { kind: 'control_request'; requestId: string; subtype: string }
   | { kind: 'user'; text: string; files: string[] }
   | null
 export function extractUserTurnFromStdinFrame(
   line: string,
-  opts?: { stagingDir?: string | null },
+  opts?: { stagingDir?: string | null; allowedUploadRoots?: readonly string[] },
 ): { text: string; files: string[] } | null
+
+export function resetComposerDraftInPage(page: any): Promise<void>
+export function resolveTrustedAttachmentPath(
+  filePath: string,
+  allowedUploadRoots?: readonly string[],
+): string | null
