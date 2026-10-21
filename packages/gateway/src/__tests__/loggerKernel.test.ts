@@ -13,12 +13,14 @@ describe('gateway logger (kernel wrapper)', () => {
   beforeEach(() => {
     out.length = 0
     err.length = 0
-    process.stdout.write = ((s: string) => (
-      out.push(String(s)), true
-    )) as typeof process.stdout.write
-    process.stderr.write = ((s: string) => (
-      err.push(String(s)), true
-    )) as typeof process.stderr.write
+    process.stdout.write = ((s: string) => {
+      out.push(String(s))
+      return true
+    }) as typeof process.stdout.write
+    process.stderr.write = ((s: string) => {
+      err.push(String(s))
+      return true
+    }) as typeof process.stderr.write
     gatewayLogLevel.set('debug')
   })
   afterEach(() => {
