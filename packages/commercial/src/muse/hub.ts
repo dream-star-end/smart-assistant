@@ -157,6 +157,9 @@ export class MuseBridgeHub {
   private readonly queue: HubJob[] = []
   private readonly jobs = new Map<string, HubJob>()
   private timer: NodeJS.Timeout | null = null
+  /** Submissions between their checks and their enqueue (they await the DB). */
+  private reservedTotal = 0
+  private readonly reserved = new Map<string, number>()
 
   constructor(opts: MuseBridgeHubOptions) {
     this.store = opts.store
@@ -339,6 +342,8 @@ export class MuseBridgeHub {
       return
     }
     if (job.uploadBusy) throw new MuseError(429, 'UPLOAD_BUSY', 'a chunk is still being written')
+    // Hold the upload lock across verification so no chunk can change what was checked.
+    job.uploadBusy = true
     let files: MuseFileView[]
     try {
       files = await this.verifyUploads(job, body.files)
@@ -346,6 +351,8 @@ export class MuseBridgeHub {
       const message = err instanceof MuseError ? err.message : 'result verification failed'
       this.finish(job, fail('MUSE_BAD_OUTPUT', message))
       throw new MuseError(400, 'BAD_RESULT', message)
+    } finally {
+      job.uploadBusy = false
     }
     if (job.state !== 'running') throw new MuseError(410, 'JOB_GONE', 'job is no longer running')
     const meta = isObj(body.meta) ? body.meta : {}
@@ -423,19 +430,39 @@ export class MuseBridgeHub {
     if (!this.bridgeOnline()) {
       throw new MuseError(503, 'MUSE_BRIDGE_OFFLINE', 'the Muse bridge is not connected')
     }
-    if (this.queue.length >= QUEUE_MAX) {
+    // Reserve the queue slot and the rate count synchronously, before any await, so
+    // concurrent submissions cannot all pass the checks and overfill the queue / limits.
+    if (this.queue.length + this.reservedTotal >= QUEUE_MAX) {
       throw new MuseError(503, 'MUSE_BUSY', 'the Muse channel is busy; try again shortly', true)
     }
+    const key = `${userId}:${spec.kind}`
+    const pending = this.reserved.get(key) ?? 0
+    this.reservedTotal += 1
+    this.reserved.set(key, pending + 1)
+    try {
+      return await this.admit(userId, containerId, spec, pending)
+    } finally {
+      this.reservedTotal -= 1
+      const left = (this.reserved.get(key) ?? 1) - 1
+      if (left > 0) this.reserved.set(key, left)
+      else this.reserved.delete(key)
+    }
+  }
+
+  private async admit(
+    userId: string,
+    containerId: string | null,
+    spec: MuseJobSpec,
+    pending: number,
+  ): Promise<string> {
     const counts = await this.store.countRecent(userId, spec.kind)
     const [perHour, perDay] =
       spec.kind === 'video'
         ? [this.rate.videoPerHour, this.rate.videoPerDay]
         : [this.rate.imagePerHour, this.rate.imagePerDay]
-    if (counts.hour >= perHour || counts.day >= perDay) {
+    // `pending` = this user's earlier submissions of this kind still in flight (not yet counted).
+    if (counts.hour + pending >= perHour || counts.day + pending >= perDay) {
       throw new MuseError(429, 'MUSE_RATE_LIMITED', `${spec.kind} rate limit reached`)
-    }
-    if (this.queue.length >= QUEUE_MAX) {
-      throw new MuseError(503, 'MUSE_BUSY', 'the Muse channel is busy; try again shortly', true)
     }
     const id = `mj_${randomUUID()}`
     await this.store.insertJob({

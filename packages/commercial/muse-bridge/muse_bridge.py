@@ -50,7 +50,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BRIDGE_VERSION = "0.3.0"
+BRIDGE_VERSION = "0.3.1"
 API_PREFIX = "/api/muse-bridge/v1"
 DEFAULT_CLI = "/opt/hatch/bin/media-generation"
 DEFAULT_STATE_DIR = os.path.join(os.path.expanduser("~"), ".muse-bridge")
@@ -688,20 +688,25 @@ class Bridge:
         cancel = threading.Event()
         job_ref = {"id": jid, "nonce": str(raw_job.get("nonce") or "") if isinstance(raw_job, dict) else ""}
         hb_stop = threading.Event()
+        # One runner per job: a heartbeat still in flight when this job ends can only ever kill
+        # this job's process, never the next job's.
+        runner = CliRunner(self.cli)
+        self.runner = runner
+
+        def stop_job():
+            if hb_stop.is_set():
+                return
+            cancel.set()
+            runner.kill()
 
         def beat():
             while not hb_stop.wait(heartbeat_sec):
                 try:
                     r = client.heartbeat(job_ref)
                     if isinstance(r, dict) and r.get("cancel"):
-                        cancel.set()
-                        self.runner.kill()
-                except JobGone:
-                    cancel.set()
-                    self.runner.kill()
-                except FatalAuth:
-                    cancel.set()
-                    self.runner.kill()
+                        stop_job()
+                except (JobGone, FatalAuth):
+                    stop_job()
                 except Exception as e:
                     log.warning("heartbeat 失败：%s", redact(str(e), 120))
 
@@ -723,7 +728,7 @@ class Bridge:
             try:
                 job = validate_job(raw_job, limits)
                 log.info("任务 %s 开始：%s", job["id"], job["kind"])
-                contract = self.runner.run(job, out_dir, cancel)
+                contract = runner.run(job, out_dir, cancel)
                 files = collect_outputs(contract, os.path.join(out_dir, "media"), job["kind"], limits)
                 self.upload(client, job, files, limits, cancel)
                 body = {

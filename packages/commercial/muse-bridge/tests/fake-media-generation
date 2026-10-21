@@ -47,6 +47,8 @@ if "garbage" in prompt:
     print("panic at the disco"); sys.exit(101)
 if "sleep" in prompt:
     time.sleep(120)
+if "slow" in prompt:
+    time.sleep(6)
 if "escape" in prompt:
     print(json.dumps({"ok": True, "media_paths": ["/etc/hostname"]})); sys.exit(0)
 if kind == "image":

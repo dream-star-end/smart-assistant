@@ -63,12 +63,17 @@ class MemStore implements MuseStore {
   async touchCredential() {}
 }
 
-function makeHub(store: MemStore, clock: { t: number }, root: string) {
+function makeHub(
+  store: MemStore,
+  clock: { t: number },
+  root: string,
+  rate = { imagePerHour: 30, imagePerDay: 200, videoPerHour: 10, videoPerDay: 40 },
+) {
   return new MuseBridgeHub({
     store,
     stateRoot: root,
     allowedUids: new Set(['3']),
-    rate: { imagePerHour: 30, imagePerDay: 200, videoPerHour: 10, videoPerDay: 40 },
+    rate,
     cliTimeoutSec: { image: 120, video: 300 },
     now: () => clock.t,
   })
@@ -342,6 +347,52 @@ describe('muse hub', () => {
       () => hub.heartbeat(job.id, job.nonce),
       (e: MuseError) => e.status === 410,
     )
+  })
+
+  it('concurrent submissions cannot overrun the rate limit or the queue (Codex r1 P1)', async () => {
+    store.countRecent = async () => {
+      await new Promise((r) => setTimeout(r, 20))
+      return { hour: 0, day: 0 }
+    }
+    const limited = makeHub(store, clock, root, {
+      imagePerHour: 1,
+      imagePerDay: 1,
+      videoPerHour: 1,
+      videoPerDay: 1,
+    })
+    limited.hello('1', null)
+    const r1 = await Promise.allSettled(
+      Array.from({ length: 20 }, () => limited.submit('3', null, { kind: 'image', prompt: 'x' })),
+    )
+    assert.equal(r1.filter((r) => r.status === 'fulfilled').length, 1)
+    limited.stop()
+    await online()
+    const r2 = await Promise.allSettled(
+      Array.from({ length: 20 }, () => hub.submit('3', null, { kind: 'image', prompt: 'x' })),
+    )
+    assert.equal(r2.filter((r) => r.status === 'fulfilled').length, 3)
+    assert.ok(
+      r2.every((r) => r.status === 'fulfilled' || (r.reason as MuseError).code === 'MUSE_BUSY'),
+    )
+  })
+
+  it('no chunk can land while a result is being verified (Codex r1 P1)', async () => {
+    const job = await runningJob()
+    await upload(job, PNG)
+    const verifying = hub.result(job.id, job.nonce, {
+      ok: true,
+      files: [{ idx: 0, mime: 'image/png', bytes: PNG.length, sha256: sha(PNG), chunks: 1 }],
+    })
+    const extra = Buffer.alloc(1024, 9)
+    await assert.rejects(
+      hub.putChunk(job.id, job.nonce, 0, 1, extra, sha(extra)),
+      (e: MuseError) => e.status === 429 || e.status === 410,
+    )
+    await verifying
+    const v = await hub.view('3', job.id, 0)
+    assert.equal(v?.status, 'succeeded')
+    assert.equal(v?.files?.[0]?.bytes, PNG.length)
+    assert.deepEqual(readFileSync(hub.fileFor('3', job.id, 0)!.path), PNG)
   })
 
   it('view waits for the terminal state and falls back to the audit row', async () => {

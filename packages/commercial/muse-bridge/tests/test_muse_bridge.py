@@ -215,6 +215,14 @@ class E2E(unittest.TestCase):
         mm.S.ack_flaky["af1"] = 1
         r = self.res(self.job("af1", prompt="ok"))
         self.assertTrue(r["ok"], r)
+    def test_09d_stale_heartbeat_cannot_kill_next_job(self):
+        # Codex r1 P1: job A's heartbeat is still in flight when A ends and B starts; its late
+        # 410 must not kill B's CLI.
+        mm.S.hb_delay["slowA"] = 4
+        self.job("slowA", prompt="slow A"); self.job("slowB", prompt="slow B")
+        self.assertTrue(self.res("slowA", 30)["ok"])
+        r = self.res("slowB", 40)
+        self.assertTrue(r["ok"], r)
     def test_10_tempdirs_cleaned(self):
         import glob
         # the result is posted before the job dir is removed, so give cleanup a moment

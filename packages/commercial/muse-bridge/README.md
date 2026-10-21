@@ -1,4 +1,4 @@
-# Muse bridge（Muse VM 内运行的中转程序）v0.3.0
+# Muse bridge（Muse VM 内运行的中转程序）v0.3.1
 
 只有一个文件：`muse_bridge.py`。只用 Python 3 标准库，不需要 pip 安装任何东西。
 文件里**没有任何密钥**：token 在首次启动时提示输入（不回显），保存在 `~/.muse-bridge/token`（权限 0600）。

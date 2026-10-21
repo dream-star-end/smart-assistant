@@ -7,7 +7,7 @@ class State:
     def __init__(self):
         self.jobs = queue.Queue(); self.results = {}; self.chunks = {}; self.heartbeats = {}
         self.cancel = set(); self.session = None; self.hellos = 0; self.gone = set()
-        self.ack_gone = set(); self.ack_flaky = {}
+        self.ack_gone = set(); self.ack_flaky = {}; self.hb_delay = {}; self.acked = set()
         self.limits = {"chunk_bytes": 4 * 1024 * 1024}
         self.done = threading.Condition()
 S = State()
@@ -43,6 +43,9 @@ class H(BaseHTTPRequestHandler):
             if jid in S.ack_gone: return self.send(410)
             if S.ack_flaky.get(jid, 0) > 0:
                 S.ack_flaky[jid] -= 1; return self.send(503, {"error": "flaky"})
+            if jid in S.hb_delay and jid in S.acked:
+                import time; time.sleep(S.hb_delay[jid]); return self.send(410)
+            S.acked.add(jid)
             S.heartbeats[jid] = S.heartbeats.get(jid, 0) + 1
             return self.send(200, {"cancel": jid in S.cancel})
         if path.endswith("/result"):
