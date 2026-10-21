@@ -29,7 +29,8 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
  *      instruction; without this the codex agent would silently fork its
  *      memory state into codex's private store.
  */
-import { _internals, resolveMcpMemoryEntry } from '../codexLaunchOverrides.js'
+import { _internals } from '../codexLaunchOverrides.js'
+import { resolveMcpMemoryEntry } from '../mcpMemoryEntry.js'
 
 const { tomlValue, CODEX_PREAMBLE, codexMcpToolTimeoutSec } = _internals
 
@@ -534,9 +535,6 @@ describe('buildCodexLaunchOverrides', () => {
           !out.argvOverrides.some((s) => s.startsWith('mcp_servers.openclaude-vision')),
           'openclaude-vision MCP override 应已移除',
         )
-        // 迁移后 vision token 不再随 codex 注入,字段恒空(死字段,待清理批次连同 MCP 包装删)。
-        assert.ok(out.visionTokenFile == null)
-        assert.ok(out.visionTokenContent == null)
         // 容器 token 绝不泄漏进 argv(memory 注入仍走 tokenFile,不含 literal)。
         for (const arg of out.argvOverrides) {
           assert.ok(!arg.includes(TOKEN), `argv leaked token in: ${arg}`)

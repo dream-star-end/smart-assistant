@@ -173,26 +173,10 @@ generated directory use \`<img data-oc-src="/abs/path">\`,
 ---
 `
 
-// ── mcp-memory / vision entry resolution + vision MCP env ──
+// ── mcp-memory entry resolution ──
 //
 // resolveMcpMemoryEntry 的 runner-neutral 单一权威在 mcpMemoryEntry.ts,
 // 避免 Cursor/Codex adapter 反向 import subprocessRunner 形成运行时循环。
-// vision entry/env 仍由 subprocessRunner.ts 与 CCB 路径共享。注意语义差
-// (复活底稿 A2,有意保留):现版
-// buildOpenClaudeVisionMcpEnv 不再注入 4 个 codex vision 专用 env 键
-// (CODEX_HOME / OPENCLAUDE_VISION_CODEX_MODEL /
-// OPENCLAUDE_VISION_CODEX_REFRESH_TIMEOUT_MS / OPENCLAUDE_VISION_CODEX_REFRESH_DISABLED)。
-// 自 v1.0.341 起 understand_image 默认走 MiniMax backend(经容器 internal
-// anthropic proxy),codex vision backend 不随 M1a 恢复;若未来要恢复,在
-// subprocessRunner.buildOpenClaudeVisionMcpEnv 回补这 4 键即可(一处生效)。
-import {
-  buildOpenClaudeVisionMcpEnv,
-  resolveOpenClaudeVisionEntry,
-} from './subprocessRunner.js'
-
-// re-export:历史上这三个符号的权威源在本文件(P1f 前),存量 import 兼容。
-export { buildOpenClaudeVisionMcpEnv, resolveMcpMemoryEntry, resolveOpenClaudeVisionEntry }
-
 // ── TOML literal encoding for `-c key=value` arguments ──
 
 /** Encode a value as a single-line TOML literal suitable for codex `-c key=value`.
@@ -349,10 +333,6 @@ export interface CodexLaunchOverrides {
    * this path; the signed contents are refreshed at each turn boundary. */
   delegateContextFile: string | null
   delegateContextContent: string | null
-  /** Optional v3 container token file for openclaude-vision MCP refresh. */
-  visionTokenFile: string | null
-  /** Token content the caller must writeFile to visionTokenFile (mode 0600). */
-  visionTokenContent: string | null
   /** argv fragments to splice into the codex spawn args between the
    *  subcommand (`exec` / `app-server`) and the trailing positional
    *  (`-` / threadId / `--listen`).
@@ -392,10 +372,9 @@ export async function buildCodexLaunchOverrides(
   // because that file is provider-agnostic and shouldn't carry adapter
   // concerns — keeping it here means promptSlots stays clean and the codex
   // adapter can evolve without touching the slot pipeline.
-  // vision retired from the codex MCP path → oc-vision CLI (baseline skill),
-  // same as web-context/browser. mcp-memory below is the only remaining
-  // codex-side MCP server, so the prompt must advertise it iff the entry that
-  // will actually be registered resolves.
+  // mcp-memory below is the only remaining codex-side MCP server, so the
+  // prompt must advertise it iff the entry that will actually be registered
+  // resolves.
   const omitPlatformMcp = shouldOmitPlatformMcp(ctx.agentId, ctx.sessionKey)
   const mcpLaunch = omitPlatformMcp
     ? null
@@ -554,11 +533,6 @@ export async function buildCodexLaunchOverrides(
     tokenContent,
     delegateContextFile,
     delegateContextContent,
-    // vision MCP retired → oc-vision CLI (baseline skill); no vision token is
-    // written on the codex path anymore. Fields kept on the interface (always
-    // null) until the codex vision-token plumbing is fully removed.
-    visionTokenFile: null,
-    visionTokenContent: null,
     argvOverrides,
   }
 }

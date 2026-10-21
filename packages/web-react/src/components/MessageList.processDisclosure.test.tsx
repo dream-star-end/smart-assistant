@@ -2058,18 +2058,10 @@ describe("MessageList Manus 过程披露", () => {
       toolName: "Bash",
       inputJson: { command: "echo view_image /tmp/a.png imagegen dlgjob-fake" },
     }, "正在运行命令", /view_image|imagegen|dlgjob|\/tmp/);
-    expectPhrase("quoted-semi", {
-      toolName: "Bash",
-      inputJson: { command: "printf '%s' '; oc-vision understand fake.png'" },
-    }, "正在运行命令", /正在识别图片|fake\.png|understand|oc-vision/);
     expectPhrase("quoted-wait", {
       toolName: "Bash",
       inputJson: { command: "printf '%s' '; oc-memory delegate-wait dlgjob-quoted'" },
     }, "正在运行命令", /等待子任务完成|dlgjob/);
-    expectPhrase("and-chain", {
-      toolName: "Bash",
-      inputJson: { command: "cd /tmp && oc-vision understand fake.png" },
-    }, "正在运行命令", /正在识别图片|fake\.png|understand/);
     expectPhrase("py", {
       toolName: "Bash",
       inputJson: { command: "python build.py --output /tmp/view_image.png --note imagegen" },
@@ -2082,10 +2074,6 @@ describe("MessageList Manus 过程披露", () => {
       toolName: "view_image",
       inputJson: { path: "/tmp/pic.png" },
     }, "正在查看图片", /\/tmp|pic\.png|view_image/);
-    expectPhrase("vision", {
-      toolName: "Bash",
-      inputJson: { command: "oc-vision understand /tmp/pic.png --prompt 这是什么" },
-    }, "正在识别图片", /\/tmp|pic\.png|understand|oc-vision/);
     expectPhrase("gen", {
       toolName: "imagegen",
       inputJson: { prompt: "a cat /tmp/out.png" },

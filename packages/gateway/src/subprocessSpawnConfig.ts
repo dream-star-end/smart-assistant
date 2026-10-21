@@ -730,66 +730,6 @@ export function buildHostSpawnProviderEnv(input: HostSpawnProviderEnvInput): Hos
   return { env: providerEnv, routing: 'settings-default' }
 }
 
-/** Resolve the built-in OpenClaude vision MCP entry used by CCB text-only
- * providers (DeepSeek/custom). Mirrors resolveMcpMemoryEntry's three layouts:
- * source checkout, process.cwd() checkout, and v3 runtime image layout. */
-export function resolveOpenClaudeVisionEntry(claudeCodePath?: string): string | null {
-  const moduleDir = new URL('.', import.meta.url).pathname.replace(/^\/([A-Za-z]):/, '$1:')
-  const candidates: string[] = [
-    resolve(moduleDir, 'mcpVisionServer.ts'),
-    resolve(process.cwd(), 'packages/gateway/src/mcpVisionServer.ts'),
-  ]
-  if (claudeCodePath) {
-    candidates.push(
-      resolve(claudeCodePath, '..', 'openclaude/packages/gateway/src/mcpVisionServer.ts'),
-    )
-  }
-  for (const c of candidates) {
-    if (existsSync(c)) return c
-  }
-  return null
-}
-
-/** Build the env table for the built-in openclaude-vision MCP server child.
- *  Used by CCB text-only providers (DeepSeek/custom) that need understand_image
- *  via the MiniMax-backed vision MCP. */
-export function buildOpenClaudeVisionMcpEnv(
-  agentId: string,
-  opts: { containerTokenFile?: string } = {},
-): Record<string, string> {
-  return {
-    OPENCLAUDE_AGENT_ID: agentId,
-    ...(process.env.OPENCLAUDE_HOME ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME } : {}),
-    ...(process.env.OPENCLAUDE_VISION_TIMEOUT_MS
-      ? { OPENCLAUDE_VISION_TIMEOUT_MS: process.env.OPENCLAUDE_VISION_TIMEOUT_MS }
-      : {}),
-    ...(process.env.OPENCLAUDE_VISION_MAX_IMAGE_BYTES
-      ? {
-          OPENCLAUDE_VISION_MAX_IMAGE_BYTES: process.env.OPENCLAUDE_VISION_MAX_IMAGE_BYTES,
-        }
-      : {}),
-    ...(process.env.OPENCLAUDE_VISION_MAX_CONCURRENT
-      ? { OPENCLAUDE_VISION_MAX_CONCURRENT: process.env.OPENCLAUDE_VISION_MAX_CONCURRENT }
-      : {}),
-    ...(process.env.OPENCLAUDE_V3_MASTER_BASE_URL
-      ? { OPENCLAUDE_V3_MASTER_BASE_URL: process.env.OPENCLAUDE_V3_MASTER_BASE_URL }
-      : {}),
-    // minimax vision backend 经容器 internal anthropic proxy 调 MiniMax-M3。base url 非 secret,
-    // 可直接放 env;bearer 走 containerTokenFile(下方,token file,不进 argv)。
-    ...(process.env.ANTHROPIC_BASE_URL
-      ? { ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL }
-      : {}),
-    ...(process.env.OPENCLAUDE_VISION_BACKEND
-      ? { OPENCLAUDE_VISION_BACKEND: process.env.OPENCLAUDE_VISION_BACKEND }
-      : {}),
-    ...(opts.containerTokenFile
-      ? { OPENCLAUDE_V3_CONTAINER_TOKEN_FILE: opts.containerTokenFile }
-      : process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
-        ? { OPENCLAUDE_V3_CONTAINER_TOKEN: process.env.OPENCLAUDE_V3_CONTAINER_TOKEN }
-        : {}),
-  }
-}
-
 // ───────────────────────────────────────────────
 // SubprocessRunner
 //

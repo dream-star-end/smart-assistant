@@ -712,7 +712,6 @@ function runningToolPhrase(message: ChatMessage): string {
     if (head.op === "delegate-wait") return "等待子任务完成";
     if (head.op === "core-search" || head.op === "session-search" || head.op === "archival-search") return "正在搜索资料";
   }
-  if (head?.bin === "oc-vision" && head.op === "understand") return "正在识别图片";
   if (head?.bin === "oc-browser" && head.op === "screenshot") return "工具执行中";
   if (/browser_take_screenshot/i.test(name)) return "工具执行中";
 

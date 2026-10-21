@@ -1043,7 +1043,7 @@ function OcWebExtractCard({ tool }: { tool: ToolLike }): ReactNode | null {
   );
 }
 
-// ── oc-* 通用工具原语 + 4 个新专属卡(oc-vision / oc-memory / oc-minimax / oc-browser)──
+// ── oc-* 通用工具原语 + 3 个新专属卡(oc-memory / oc-minimax / oc-browser)──
 // 复用 CardShell + tone + lucide + 媒体签名组件,不发明新视觉语言;一律**不渲染原始
 // `$ command` / stdout dump / 参数 dump**,只呈现语义结果(boss 硬需求)。
 
@@ -1259,34 +1259,6 @@ function MediaPreview({ path, kind }: { path: string; kind: "image" | "audio" | 
     <div className="mt-2">
       <SignedAudio src={safe} />
     </div>
-  );
-}
-
-// ── oc-vision(图片理解)──────────────────────────────────────────────────────
-
-/** oc-vision understand <image> [--prompt "问题"] → 缩略图 + 问题 + 识图结论(纯文本 stdout)。 */
-function VisionCliCard({ command, tool }: { command: string; tool: ToolLike }): ReactNode | null {
-  const prompt = parseCommandFlag(command, "prompt");
-  const result = outputText(tool);
-  // understand 之后的首个位置参数 = 被识别的图片路径。
-  const imgMatch = /understand\s+(?:"([^"]+)"|'([^']+)'|([^\s"'-][^\s]*))/.exec(command);
-  const imagePath = imgMatch ? (imgMatch[1] ?? imgMatch[2] ?? imgMatch[3] ?? "") : "";
-  const safeImg = imagePath ? safeArtifactSrc(imagePath) : null;
-  if (!prompt && !result && !safeImg) return null;
-  return (
-    <CardShell icon={<Eye className="size-4" />} title="图片理解">
-      {safeImg && (
-        <div className="mb-2">
-          <SignedImg src={safeImg} alt="识别的图片" className="max-h-40 rounded-md border border-border" />
-        </div>
-      )}
-      {prompt && <PromptChip text={prompt} />}
-      {result && (
-        <div className="mt-2">
-          <ResultText text={result} />
-        </div>
-      )}
-    </CardShell>
   );
 }
 
@@ -1518,7 +1490,6 @@ const OC_BODY_CARDS: Partial<Record<OcCli, (command: string, tool: ToolLike) => 
   // 技能市场。
   "oc-market": (c, t) => MarketToolCard({ command: c, tool: t }),
   // 本批新增的 4 个专属卡。
-  "oc-vision": (c, t) => VisionCliCard({ command: c, tool: t }),
   "oc-memory": (c, t) => MemoryCliCard({ command: c, tool: t }),
   "oc-minimax": (c, t) => MinimaxCliCard({ command: c, tool: t }),
   mmx: (c, t) => MinimaxCliCard({ command: c, tool: t }),

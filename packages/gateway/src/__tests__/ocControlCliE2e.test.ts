@@ -170,9 +170,9 @@ function publicationPng(width = 1200, height = 800): Buffer {
   ])
 }
 
-describe('oc-vision and oc-figcheck real CLI pipeline with isolated Codex backend', () => {
+describe('oc-figcheck real CLI pipeline with isolated Codex backend', () => {
   test('safe PNG flows through runVision and figcheck emits a deterministic PASS', async () => {
-    const work = mkdtempSync(join(tmpdir(), 'oc-vision-cli-e2e-'))
+    const work = mkdtempSync(join(tmpdir(), 'oc-figcheck-cli-e2e-'))
     const home = join(work, 'home')
     const uploads = join(home, 'uploads')
     const codexHome = join(work, 'source-codex-home')
@@ -220,15 +220,7 @@ fs.writeFileSync(record.output, 'PASS: publication quality')
       OPENAI_API_KEY: undefined,
     }
     try {
-      let result = await runTs(
-        'packages/gateway/src/ocVisionCli.ts',
-        ['understand', image, '--prompt', 'Read the visible labels'],
-        env,
-      )
-      assert.equal(result.code, 0, result.stderr)
-      assert.equal(result.stdout, 'PASS: publication quality\n')
-
-      result = await runTs(
+      const result = await runTs(
         'packages/gateway/src/ocFigCheckCli.ts',
         [image, '--kind', 'figure', '--focus', 'axis labels'],
         env,
@@ -252,9 +244,8 @@ fs.writeFileSync(record.output, 'PASS: publication quality')
         .trim()
         .split('\n')
         .map((line) => JSON.parse(line))
-      assert.equal(records.length, 2)
-      assert.match(records[0].prompt, /Read the visible labels/)
-      assert.match(records[1].prompt, /axis labels/)
+      assert.equal(records.length, 1)
+      assert.match(records[0].prompt, /axis labels/)
       for (const record of records) {
         assert.equal(record.args[0], 'exec')
         assert.ok(record.args.includes('--ephemeral'))

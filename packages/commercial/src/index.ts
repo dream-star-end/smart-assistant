@@ -2439,7 +2439,7 @@ export async function registerCommercial(
       const grokWebSearchHandler: GrokWebSearchHandler = makeGrokWebSearchHandler({
         identityRepo,
       });
-      // /internal/v3/grok-vision — 识图后端(understand_image / oc-vision / oc-figcheck)。
+      // /internal/v3/grok-vision — 识图后端(oc-figcheck)。
       // 容器只交图片和问题;master 借一个 Grok 账号调 Grok 4.7,并按 grok-build 目录价
       // 走 预扣 → journal → 结算(用量取上游响应)。订阅 token 和计费请求号都不出 master。
       const grokVisionHandler: GrokVisionHandler = makeGrokVisionHandler({

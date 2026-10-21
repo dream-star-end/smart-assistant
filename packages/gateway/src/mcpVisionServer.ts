@@ -1,17 +1,10 @@
-#!/usr/bin/env node
 /**
- * openclaude-vision MCP
+ * OpenClaude vision backend.
  *
- * CCB-compatible image understanding bridge for text-only models (DeepSeek,
- * custom Anthropic-compatible providers). v1 intentionally supports only
- * local files that the gateway saved under paths.uploadsDir; URL input is
- * rejected to avoid SSRF. The default backend is Grok 4.7 through the master
- * (see runGrokVision); it is hidden behind this MCP abstraction so deployments
- * can swap the implementation without changing the agent-facing tool name.
+ * Used by oc-figcheck for image review. The text-only fallback CLI
+ * (`oc-vision`) and the legacy `openclaude-vision` MCP server were retired
+ * in OCV5-547; this module no longer exposes an MCP tool.
  */
-
-// 必须第一个 import:stdout 只留给 JSON-RPC + 未捕获异常不退出(见 mcpStdioGuard 注释)。
-import './mcpStdioGuard.js'
 import { type ChildProcessByStdio, spawn } from 'node:child_process'
 import {
   chmodSync,
@@ -28,20 +21,15 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 import type { Readable } from 'node:stream'
 import { fileURLToPath } from 'node:url'
-import { Server } from '@modelcontextprotocol/sdk/server/index.js'
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import {
   CODEX_TOKEN_REFRESH_PATH,
   DEFAULT_CODEX_ENGINE_MODEL,
   GROK_VISION_PATH,
-  findRouteProviderForModel,
 } from '@openclaude/protocol'
 import { paths } from '@openclaude/storage'
 import { LOCAL_CATALOG_HEADER, getLocalCatalogToken } from './modelCatalogClient.js'
 import { resolveConnectorEndpoint } from './ocConnectorsClient.js'
 
-const TOOL_NAME = 'understand_image'
 const DEFAULT_MODEL = DEFAULT_CODEX_ENGINE_MODEL
 const DEFAULT_TIMEOUT_MS = 120_000
 const DEFAULT_MAX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -92,9 +80,6 @@ export function visionBackendLabel(): string {
   return backend === 'grok' ? GROK_VISION_MODEL : STATIC_VISION_MODEL
 }
 
-export const OPENCLAUDE_VISION_MCP_ID = 'openclaude-vision'
-export const OPENCLAUDE_VISION_TOOLS = [TOOL_NAME]
-
 /**
  * 该 model 是否为**纯文本静态模型**(命中 protocol 静态 provider 注册表,且该 spec
  * `supportsVision !== true` —— 即 false/undefined 都算纯文本)。
@@ -109,56 +94,6 @@ export const OPENCLAUDE_VISION_TOOLS = [TOOL_NAME]
  * "这个 model 是否真的路由到该静态上游"的权威。不命中(codex/claude/gpt 等非静态
  * provider,或未注册模型)→ 返回 false,由调用方决定默认。
  */
-export function isTextOnlyStaticVisionModel(model?: string): boolean {
-  const m = model?.trim()
-  if (!m) return false
-  const spec = findRouteProviderForModel(m)
-  return !!spec && spec.supportsVision !== true
-}
-
-/** `OPENCLAUDE_VISION_MCP_PROVIDERS` 显式 opt-in 的自定义纯文本上游。 */
-export function isOpenClaudeVisionProviderOptIn(provider?: string): boolean {
-  const p = provider?.trim().toLowerCase()
-  if (!p) return false
-  const optInProviders = (process.env.OPENCLAUDE_VISION_MCP_PROVIDERS ?? '')
-    .split(',')
-    .map((v) => v.trim().toLowerCase())
-    .filter(Boolean)
-  return optInProviders.includes(p)
-}
-
-/**
- * 是否为「确定纯文本」:静态路由表 supportsVision!==true,或 provider 显式 opt-in。
- * **不含** catalog `supportsVision=false` —— cursor 等引擎可能仍能经 Read 原生看图,
- * 不能把描述符 false 当成「模型看不到图」。
- */
-export function isTextOnlyDefinite(provider?: string, model?: string): boolean {
-  return isTextOnlyStaticVisionModel(model) || isOpenClaudeVisionProviderOptIn(provider)
-}
-
-/**
- * 是否给该 provider/model 注入 understand_image 工具。
- * **纯文本静态模型**(看不到图)启用;**原生多模态模型不启用**。
- *   - 判定权威 = protocol staticKeyProviders(见 isTextOnlyStaticVisionModel):
- *     deepseek-* / glm-5.1 / glm-5.2 / qwen3.7-max/plus / kimi-k2.7-code(纯文本)→ true;
- *     MiniMax-M3(supportsVision=true,原生识图,也作为本工具 backend)→ false。
- *   - 非静态 provider(codex/claude/gpt 原生多模态,或自定义 Anthropic 兼容层):
- *     默认 false;仅 `OPENCLAUDE_VISION_MCP_PROVIDERS` 显式 opt-in 的 provider 走工具兜底。
- */
-export function shouldEnableOpenClaudeVision(
-  provider?: string,
-  model?: string,
-  supportsVisionOverride?: boolean,
-): boolean {
-  if (process.env.OPENCLAUDE_VISION_MCP_DISABLED === '1') return false
-  // 已验签/已 fence 的 catalog capability 优先于 baked 路由表和 provider opt-in。
-  if (supportsVisionOverride !== undefined) return !supportsVisionOverride
-  // 已注册静态模型:protocol supportsVision 是唯一权威(纯文本 → 注入)。
-  if (isTextOnlyStaticVisionModel(model)) return true
-  // 非静态 provider 的显式 opt-in(自定义 Anthropic 兼容纯文本上游)。
-  return isOpenClaudeVisionProviderOptIn(provider)
-}
-
 export type VisionToolArgs = {
   image_file?: unknown
   image_source?: unknown
@@ -1033,69 +968,3 @@ async function runCodexVision(input: ResolvedVisionInput): Promise<string> {
 }
 
 export const runCodexVisionForTest = runCodexVision
-
-const TOOLS = [
-  {
-    name: TOOL_NAME,
-    description: [
-      'Understand an uploaded local image using the OpenClaude vision bridge.',
-      'Pass image_file (preferred) or image_source as an absolute path from the upload hint.',
-      'URL input is intentionally disabled in v1 to avoid SSRF; upload remote images first.',
-    ].join('\n'),
-    inputSchema: {
-      type: 'object',
-      properties: {
-        image_file: {
-          type: 'string',
-          description: 'Absolute path to an uploaded PNG/JPEG/GIF/WebP image',
-        },
-        image_source: { type: 'string', description: 'Alias for image_file' },
-        image_url: {
-          type: 'string',
-          description: 'Disabled in v1; upload the image and use image_file',
-        },
-        question: { type: 'string', description: 'Question to answer about the image' },
-        prompt: { type: 'string', description: 'Alias for question' },
-      },
-    },
-  },
-]
-
-export async function startVisionMcpServer(): Promise<void> {
-  const server = new Server(
-    { name: OPENCLAUDE_VISION_MCP_ID, version: '0.1.0' },
-    { capabilities: { tools: {} } },
-  )
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
-    const { name, arguments: args } = req.params
-    if (name !== TOOL_NAME) {
-      return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true }
-    }
-    try {
-      const input = resolveVisionInput((args ?? {}) as VisionToolArgs)
-      const text = await runVision(input)
-      return { content: [{ type: 'text', text }] }
-    } catch (err: any) {
-      return {
-        content: [{ type: 'text', text: `error: ${err?.message ?? String(err)}` }],
-        isError: true,
-      }
-    }
-  })
-  await server.connect(new StdioServerTransport())
-}
-
-function isDirectExecution(): boolean {
-  const argv1 = process.argv[1]
-  if (!argv1) return false
-  return resolve(argv1) === fileURLToPath(import.meta.url)
-}
-
-if (isDirectExecution()) {
-  startVisionMcpServer().catch((err) => {
-    const name = basename(fileURLToPath(import.meta.url))
-    process.stderr.write(`[${name}] fatal: ${err?.message ?? String(err)}\n`)
-    process.exit(1)
-  })
-}

@@ -26,7 +26,6 @@ const TSX_WRAPPERS = [
   'oc-skill.sh',
   'oc-slides.sh',
   'oc-task.sh',
-  'oc-vision.sh',
   'oc-web.sh',
 ] as const
 

@@ -12,74 +12,6 @@ const baseConfig: any = {
 }
 
 describe('collectAvailableMcpToolNames', () => {
-  it('catalog vision override 驱动动态模型的 upload/tool hint', () => {
-    const tools = collectAvailableMcpToolNames(
-      baseConfig,
-      { id: 'main', provider: 'unknown' } as any,
-      'dynamic-model',
-      { modelSupportsVision: false, resolveVisionEntry: () => '/vision' },
-    )
-    assert.ok(tools.includes('understand_image'))
-  })
-  it('includes built-in openclaude-vision understand_image by default', () => {
-    const tools = collectAvailableMcpToolNames(baseConfig, { id: 'main' } as any)
-    assert.ok(tools.includes('understand_image'))
-  })
-
-  it('does not advertise built-in vision if the MCP entry is missing', () => {
-    const tools = collectAvailableMcpToolNames(baseConfig, { id: 'main' } as any, undefined, {
-      resolveVisionEntry: () => null,
-    })
-    assert.equal(tools.includes('understand_image'), false)
-  })
-
-  it('does not advertise built-in vision for native multimodal providers', () => {
-    const config = {
-      ...baseConfig,
-      provider: 'anthropic',
-      defaults: { ...baseConfig.defaults, model: 'claude-opus-4-7' },
-    }
-    const tools = collectAvailableMcpToolNames(config, { id: 'main' } as any)
-    assert.equal(tools.includes('understand_image'), false)
-  })
-
-  it('advertises understand_image for glm-5.x text-only models(火山 ark)', () => {
-    const config = {
-      ...baseConfig,
-      provider: 'ark',
-      defaults: { ...baseConfig.defaults, model: 'glm-5.2' },
-    }
-    const tools = collectAvailableMcpToolNames(config, { id: 'main' } as any)
-    assert.ok(tools.includes('understand_image'))
-  })
-
-  it('does not advertise understand_image for MiniMax-M3(原生多模态)', () => {
-    const config = {
-      ...baseConfig,
-      provider: 'minimax',
-      defaults: { ...baseConfig.defaults, model: 'MiniMax-M3' },
-    }
-    const tools = collectAvailableMcpToolNames(config, { id: 'main' } as any)
-    assert.equal(tools.includes('understand_image'), false)
-  })
-
-  it('lets explicit provider opt-ins use built-in vision for custom text-only providers', () => {
-    const old = process.env.OPENCLAUDE_VISION_MCP_PROVIDERS
-    process.env.OPENCLAUDE_VISION_MCP_PROVIDERS = 'openrouter'
-    try {
-      const config = {
-        ...baseConfig,
-        provider: 'openrouter',
-        defaults: { ...baseConfig.defaults, model: 'some-text-model' },
-      }
-      const tools = collectAvailableMcpToolNames(config, { id: 'main' } as any)
-      assert.ok(tools.includes('understand_image'))
-    } finally {
-      if (old === undefined) Reflect.deleteProperty(process.env, 'OPENCLAUDE_VISION_MCP_PROVIDERS')
-      else process.env.OPENCLAUDE_VISION_MCP_PROVIDERS = old
-    }
-  })
-
   it('filters provider-scoped global MCPs by effective provider', () => {
     const config = {
       ...baseConfig,
@@ -102,28 +34,6 @@ describe('collectAvailableMcpToolNames', () => {
     }
     const tools = collectAvailableMcpToolNames(config, agent)
     assert.ok(tools.includes('agent_tool'))
-  })
-
-  it('built-in vision 豁免 toolset 过滤(像 memory;由 shouldEnable 控制)', () => {
-    // deepseek(shouldEnable=true)+ toolset coding(不含 vision)→ 仍有 understand_image。
-    const config = {
-      ...baseConfig,
-      defaults: { ...baseConfig.defaults, toolsets: ['coding'] },
-      toolsets: { coding: ['browser'] },
-    }
-    const tools = collectAvailableMcpToolNames(config, { id: 'main' } as any)
-    assert.equal(tools.includes('understand_image'), true)
-  })
-
-  it('glm-5.2 + core toolset(不含 vision)仍拿到 understand_image(回归:main/全能助手场景)', () => {
-    const config = {
-      ...baseConfig,
-      provider: 'ark',
-      defaults: { ...baseConfig.defaults, model: 'glm-5.2', toolsets: ['core'] },
-      toolsets: { core: [] },
-    }
-    const tools = collectAvailableMcpToolNames(config, { id: 'main' } as any)
-    assert.equal(tools.includes('understand_image'), true)
   })
 
   it('多模态模型 + toolset 仍不拿 understand_image(shouldEnable gate,不受豁免影响)', () => {
