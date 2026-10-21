@@ -3,6 +3,8 @@
 # 由 deploy-v5-selfhost.sh 在 master release lib 之后 source;翻转本身复用 cmd_cutover 的 joint 状态机。
 # 依赖调用方提供:mlog/log/die、canonicalize_prev_release、read_required_migration_gap、write_prev_release_file、
 # sql_file_has_breaking_ddl、oc_hotcfg_*(runtime lib)、preflight_common、lease_train_begin/finish、cmd_cutover。
+# OCV5-542:本阶段只做加法的兼容候选检测器(逐条语句;候选须带 -- compat: 声明),与本文件同目录。
+ROLLBACK_COMPAT_DETECTOR="${ROLLBACK_COMPAT_DETECTOR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/v5-migration-compat.py}"
 
 # ── --rollback(OCV5-534,FINDINGS DEP-6)────────────────────────────────────
 # 一次只退一步:master 目标只取 .prev-release(canonicalize + digest),运行四元组只取 history 里
@@ -95,6 +97,20 @@ rollback_schema_gate() { # <prev-rel> <live-rel>
     fi
     if [[ "$rc" != 1 || -n "$hit" ]]; then
       mlog "回退 schema 门: 破坏性 DDL 检测器对 $v 异常(rc=$rc),无法证明兼容,拒绝回退(fail-closed)"
+      return 1
+    fi
+    # OCV5-542:还要过兼容候选检测器。候选(改类型/非空/约束/唯一索引/单独 DROP/改名/触发器/函数/
+    # UPDATE/DELETE/动态 SQL/无法分类)没有 -- compat: 声明 → 无法证明旧代码能读写,拒绝。rc 0=无未声明候选,
+    # 1=有,其余(含检测器缺失)fail-closed。
+    out="$( { r=0; python3 "$ROLLBACK_COMPAT_DETECTOR" "$sql" 2>&1 || r=$?; printf '\nrc=%s' "$r"; } )"
+    rc="${out##*rc=}"
+    if [[ "$rc" == 1 ]]; then
+      hit="$(grep -F '"declared": false' <<<"${out%$'\n'rc=*}" | jq -r '"line \(.line) [\(.kinds | join(","))]"' 2>/dev/null | tr '\n' ' ')"
+      mlog "回退 schema 门: 上一版之后 applied 的 $v 有未声明兼容性的候选语句(${hit% }),无法证明旧代码能读写,拒绝回退。改走前滚修复。"
+      return 1
+    fi
+    if [[ "$rc" != 0 ]]; then
+      mlog "回退 schema 门: 兼容候选检测器对 $v 异常(rc=$rc),无法证明兼容,拒绝回退(fail-closed)"
       return 1
     fi
     mlog "  回退 schema 门: 上一版之后 applied 的 $v 为非破坏性 DDL,旧代码可共存"
