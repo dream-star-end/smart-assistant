@@ -4,20 +4,20 @@
  * 设计出处:V5_RUNTIME_HOTCFG_PLAN.md §1.2 / §4.2。断言覆盖:
  *   - env 未设 → 恒回落 fallback,且不建立任何快照(不起轮询);
  *   - 四文件齐全+合法 → 整套生效,getPlatformPrompt 返回文件内容;
- *   - 缺一个/超大/非空校验失败 → 保留 last-known-good + console.error 告警(半套不生效);
+ *   - 缺一个/超大/非空校验失败 → 保留 last-known-good + error 级日志告警(半套不生效);
  *   - 翻转 current symlink 后按 rev 变化 TTL 重读;TTL 未到不重读;
  *   - workspace 缺省 cwd(sessionManager.resolveDefaultWorkspaceCwd);
  *   - fallback 常量与 platform-runtime/prompts/*.md 逐字一致(漂移即红)。
  */
 import * as assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, readFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
-import { getPlatformPrompt, _internals, type PlatformPromptKey } from '../platformPrompts.js'
-import { _platformPromptFallbacks } from '../promptSlots.js'
 import { _internals as codexInternals } from '../codexLaunchOverrides.js'
 import { _internals as cursorInternals } from '../engine/cursorAdapter.js'
+import { type PlatformPromptKey, _internals, getPlatformPrompt } from '../platformPrompts.js'
+import { _platformPromptFallbacks } from '../promptSlots.js'
 
 const KEYS: PlatformPromptKey[] = [
   'platform-capabilities',
@@ -67,20 +67,26 @@ const cap = (tag: string) => sample(tag)['platform-capabilities']
 const roots: string[] = []
 let origEnv: string | undefined
 let errorLogs: string[] = []
-let origError: typeof console.error
+let origStderrWrite: typeof process.stderr.write
 
 beforeEach(() => {
   origEnv = process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR
   delete process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR
   _internals.resetForTests()
   errorLogs = []
-  origError = console.error
-  console.error = (...args: unknown[]) => {
-    errorLogs.push(args.map((a) => String(a)).join(' '))
-  }
+  // OCV5-562: the alert is an error-level line of the gateway logger (stderr), not console.error
+  origStderrWrite = process.stderr.write
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    for (const line of String(chunk).split('\n').filter(Boolean)) {
+      try {
+        if (JSON.parse(line).level === 'error') errorLogs.push(line)
+      } catch {}
+    }
+    return true
+  }) as typeof process.stderr.write
 })
 afterEach(() => {
-  console.error = origError
+  process.stderr.write = origStderrWrite
   if (origEnv === undefined) delete process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR
   else process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR = origEnv
   _internals.resetForTests()
@@ -131,7 +137,7 @@ describe('platformPrompts LKG 加载器', () => {
     assert.equal(getPlatformPrompt('codex-preamble', 'FB-CODEX'), 'FB-CODEX')
     assert.equal(_internals.hasSnapshot(), false)
     assert.ok(
-      errorLogs.some((l) => l.includes('platform-prompts')),
+      errorLogs.some((l) => l.includes('"module":"platformPrompts"')),
       '缺文件必须 console.error 告警',
     )
   })
@@ -146,7 +152,7 @@ describe('platformPrompts LKG 加载器', () => {
     process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR = promptsDirVia(root)
     assert.equal(getPlatformPrompt('memory-instructions', 'FB-MEM'), 'FB-MEM')
     assert.equal(_internals.hasSnapshot(), false)
-    assert.ok(errorLogs.some((l) => l.includes('platform-prompts')))
+    assert.ok(errorLogs.some((l) => l.includes('"module":"platformPrompts"')))
   })
 
   it('空文件 → 整套拒 + 告警', () => {
@@ -158,7 +164,7 @@ describe('platformPrompts LKG 加载器', () => {
     pointCurrent(root, 'r1')
     process.env.OPENCLAUDE_PLATFORM_PROMPTS_DIR = promptsDirVia(root)
     assert.equal(getPlatformPrompt('platform-capabilities', 'FB'), 'FB')
-    assert.ok(errorLogs.some((l) => l.includes('platform-prompts')))
+    assert.ok(errorLogs.some((l) => l.includes('"module":"platformPrompts"')))
   })
 
   it('先成功后缺文件 → 保留 last-known-good(不回落 fallback)+ 告警', () => {
@@ -179,7 +185,7 @@ describe('platformPrompts LKG 加载器', () => {
     // LKG:仍返回 r1 的值,而非 fallback、也不是半套 r2
     assert.equal(getPlatformPrompt('codex-preamble', 'FB'), 'CODEX-r1')
     assert.equal(getPlatformPrompt('platform-capabilities', 'FB'), cap('r1'))
-    assert.ok(errorLogs.some((l) => l.includes('platform-prompts')))
+    assert.ok(errorLogs.some((l) => l.includes('"module":"platformPrompts"')))
   })
 
   it('翻转 current symlink → rev 变化触发整套重读', () => {
@@ -318,7 +324,10 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
     assert.ok(!prompt.includes('## 效率契约'), '常驻 prompt 与基线重复,主 agent 会读两遍')
     for (const file of ['CLAUDE.md', 'CLAUDE.admin.md']) {
-      const baseline = readFileSync(join('packages/commercial/agent-sandbox/ccb-baseline', file), 'utf8')
+      const baseline = readFileSync(
+        join('packages/commercial/agent-sandbox/ccb-baseline', file),
+        'utf8',
+      )
       assert.equal(baseline.split('## 效率契约').length, 2, `${file} 必须恰好含一段效率契约`)
       for (const fragment of [
         '对所有 agent(含委派子 agent)生效',
@@ -393,12 +402,28 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
     const sources = {
       prompt: _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK,
       agents: readFileSync('packages/commercial/agent-sandbox/ccb-baseline/AGENTS.md', 'utf8'),
-      agentsAdmin: readFileSync('packages/commercial/agent-sandbox/ccb-baseline/AGENTS.admin.md', 'utf8'),
-      skill: readFileSync('packages/commercial/agent-sandbox/ccb-baseline/skills/platform-capabilities/SKILL.md', 'utf8'),
-      codex: readFileSync('packages/commercial/agent-sandbox/platform-runtime/prompts/codex-preamble.md', 'utf8'),
+      agentsAdmin: readFileSync(
+        'packages/commercial/agent-sandbox/ccb-baseline/AGENTS.admin.md',
+        'utf8',
+      ),
+      skill: readFileSync(
+        'packages/commercial/agent-sandbox/ccb-baseline/skills/platform-capabilities/SKILL.md',
+        'utf8',
+      ),
+      codex: readFileSync(
+        'packages/commercial/agent-sandbox/platform-runtime/prompts/codex-preamble.md',
+        'utf8',
+      ),
     }
     for (const [name, source] of Object.entries(sources)) {
-      for (const needle of ['var(--oc-fg)', '.oc-pills', 'cdn.jsdelivr.net', 'data-oc-src', 'ocFile(', 'data-oc-download']) {
+      for (const needle of [
+        'var(--oc-fg)',
+        '.oc-pills',
+        'cdn.jsdelivr.net',
+        'data-oc-src',
+        'ocFile(',
+        'data-oc-download',
+      ]) {
         assert.ok(source.includes(needle), `${name} 缺无缝嵌入写法: ${needle}`)
       }
     }

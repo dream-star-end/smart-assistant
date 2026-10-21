@@ -61,6 +61,7 @@ import { AGENT_MODEL_AUTO } from '@openclaude/protocol'
 import { promptContentMetrics } from './promptContentMetrics.js'
 import { createLogger } from './logger.js'
 const promptTimingLog = createLogger({ module: 'promptTiming' })
+const slotsLog = createLogger({ module: 'promptSlots' })
 import { request as undiciRequest } from 'undici'
 import type { RepoSnapshot } from './sessionRepoWorkspace.js'
 import { listCollaboratorAgents } from './collaboratorAgents.js'
@@ -1337,8 +1338,7 @@ export function buildModelHintSlot(ctx: PromptSlotContext): ModelHintSlot | null
     raw = _modelHintProvider(ctx.model)
   } catch (err) {
     // 不让 hint provider 异常拖死整个 prompt 构建
-    // eslint-disable-next-line no-console
-    console.warn('[promptSlots] modelHintProvider threw, treating as null:', err)
+    slotsLog.warn('modelHintProvider threw, treating as null', undefined, err)
     return null
   }
   // 防御外部脏数据:必须是 { id: string, text: string } 形状,id 非空,text trim 后非空。
@@ -1398,8 +1398,7 @@ export async function buildLiteratureSkillSlot(): Promise<PromptSlot | null> {
     raw = (await _literatureSkillProvider()) ?? null
   } catch (err) {
     // 不让 provider 异常拖死整个 prompt 构建
-    // eslint-disable-next-line no-console
-    console.warn('[promptSlots] literatureSkillProvider threw, treating as null:', err)
+    slotsLog.warn('literatureSkillProvider threw, treating as null', undefined, err)
     return null
   }
   if (raw === null) return null
@@ -1553,11 +1552,7 @@ export async function fetchPlatformSlotsFromMasterDetailed(
   } catch (err) {
     // 网络 / DNS / abort —— 容器 spawn 期间 master 出问题,fail-soft 返 [],
     // 主流程照常推进。warn 不 error:slot 缺席不影响功能正确性。
-    // eslint-disable-next-line no-console
-    console.warn(
-      '[promptSlots] platform slot fetch failed, returning empty',
-      err instanceof Error ? err.message : String(err),
-    )
+    slotsLog.warn('platform slot fetch failed, returning empty', undefined, err)
     return { ok: false, slots: [] }
   } finally {
     clearTimeout(timer)
@@ -1566,8 +1561,7 @@ export async function fetchPlatformSlotsFromMasterDetailed(
   if (status !== 200) {
     // 401/403 = 容器 token 不对或 bound_ip 不匹配(env 注错 / 容器迁移),
     // 5xx = master 本身出问题。两种都不在 spawn 路径上做花式重试。
-    // eslint-disable-next-line no-console
-    console.warn('[promptSlots] platform slot fetch non-200', { status })
+    slotsLog.warn('platform slot fetch non-200', { status })
     return { ok: false, slots: [] }
   }
 
@@ -1575,8 +1569,7 @@ export async function fetchPlatformSlotsFromMasterDetailed(
   try {
     parsed = JSON.parse(bodyText)
   } catch {
-    // eslint-disable-next-line no-console
-    console.warn('[promptSlots] platform slot response JSON parse failed')
+    slotsLog.warn('platform slot response JSON parse failed')
     return { ok: false, slots: [] }
   }
 
