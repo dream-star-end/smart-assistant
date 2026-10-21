@@ -445,7 +445,7 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
             path: sampleFile,
             mimeType: 'image/png',
             sizeHint: '1.0KB',
-            name: 'diagram.png',
+            name: 'diagram (1).png',
           },
         ],
       })

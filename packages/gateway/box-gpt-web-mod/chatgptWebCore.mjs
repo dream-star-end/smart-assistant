@@ -1163,10 +1163,10 @@ export function resolveTrustedAttachmentPath(filePath, allowedUploadRoots = []) 
 }
 
 const INBOUND_IMAGE_HINT_BLOCK_RE =
-  /\n*---\n用户附带了以下图片\(已保存到服务器本地\):\n((?:- `\/[^`\n]+` \([^)\n]*原名: [^)\n]+\)\n?)+)\n如果需要看图片内容:\n1\. 用 Read 工具读图片路径\(原生多模态 provider 会直接看到图像\)。\n2\. 如果当前 provider 不支持图片识别,告诉用户。/g
+  /\n*---\n用户附带了以下图片\(已保存到服务器本地\):\n((?:- `\/[^`\r\n]+` \([^\r\n]*?原名: [^\r\n]+\)\r?\n?)+)\n如果需要看图片内容:\n1\. 用 Read 工具读图片路径\(原生多模态 provider 会直接看到图像\)。\n2\. 如果当前 provider 不支持图片识别,告诉用户。/g
 
 const INBOUND_UNPARSED_DOC_BLOCK_RE =
-  /\n*---\n用户还附带了以下文档\(已保存到服务器本地,gateway 没能预解析 ——\n可能因为格式不支持、解析失败或解析超时\):\n((?:- `\/[^`\n]+` \([^)\n]*原名: [^)\n]+\)\n?)+)\n可以用 Read 工具读取文档内容\(对纯文本、CSV、源码、PDF 等都有效\n—— 大 PDF 即便预解析超时,Read 也可能能拿到部分文本\)。\n若是 \.doc 老格式 Word 二进制,Read 会看到乱码 —— 礼貌地请用户转存为 \.docx 重传。/g
+  /\n*---\n用户还附带了以下文档\(已保存到服务器本地,gateway 没能预解析 ——\n可能因为格式不支持、解析失败或解析超时\):\n((?:- `\/[^`\r\n]+` \([^\r\n]*?原名: [^\r\n]+\)\r?\n?)+)\n可以用 Read 工具读取文档内容\(对纯文本、CSV、源码、PDF 等都有效\n—— 大 PDF 即便预解析超时,Read 也可能能拿到部分文本\)。\n若是 \.doc 老格式 Word 二进制,Read 会看到乱码 —— 礼貌地请用户转存为 \.docx 重传。/g
 
 /**
  * Extracts attachment paths injected by Gateway's `inboundDispatch` (`buildImageAttachmentHint`
@@ -1180,7 +1180,7 @@ export function extractInboundDispatchAttachments(
 ) {
   const text = String(rawText ?? '')
   const extractedPaths = []
-  const bulletRe = /^-\s+`(\/[^`\n]+)`\s+\([^)\n]*原名:\s*([^)\n]+)\)/gm
+  const bulletRe = /^-\s+`(\/[^`\r\n]+)`\s+\([^\r\n]*?原名:\s*([^\r\n]+)\)\s*$/gm
 
   const processBlock = (fullMatch, bulletSection) => {
     const blockPaths = []
