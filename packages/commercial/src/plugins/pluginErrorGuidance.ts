@@ -63,6 +63,7 @@ export const PLUGIN_PASSTHROUGH_ERROR_CODES = [
   'DOCUMENT_EXPIRED',
   'TIMEOUT',
   'RESPONSE_INVALID',
+  'WRITE_DAILY_LIMIT',
 ] as const
 
 export type PluginPassthroughErrorCode = (typeof PLUGIN_PASSTHROUGH_ERROR_CODES)[number]
@@ -98,7 +99,8 @@ function writeSideEffect(code: string, input: PluginErrorGuidanceInput): PluginS
   if (isFailedWrite(input.status)) return 'none'
   if (input.attempted === false && !SEND_OR_RESULT.has(code)) return 'none'
   if (isUnknownWrite(input.status)) {
-    if (SEND_OR_RESULT.has(code) || input.attempted === true || (input.pids ?? 0) > 0) return 'likely'
+    if (SEND_OR_RESULT.has(code) || input.attempted === true || (input.pids ?? 0) > 0)
+      return 'likely'
     return 'possible'
   }
   return 'none'
@@ -149,10 +151,9 @@ function applyUnknownWriteOverride(
 ): PluginErrorGuidance {
   if (code === 'PRECONDITION_CHANGED') return guidance
   const prefix = unknownWritePrefix(code)
-  const next =
-    code.startsWith('ZHIHU_')
-      ? '先 get_self 或 list_my_answers 核对是否已发出，确认未发出才可新开确认卡重发'
-      : UNKNOWN_WRITE_NEXT_ACTION
+  const next = code.startsWith('ZHIHU_')
+    ? '先 get_self 或 list_my_answers 核对是否已发出，确认未发出才可新开确认卡重发'
+    : UNKNOWN_WRITE_NEXT_ACTION
   return {
     ...guidance,
     retrySafe: 'check_first',
@@ -161,36 +162,12 @@ function applyUnknownWriteOverride(
 }
 
 const ROWS: Record<string, Row> = {
-  LOGIN_EXPIRED: {
-    retrySafe: 'after_reauth',
-    requiresReauth: true,
-    message: '微博登录已过期',
-    nextAction: '引导用户重新扫码授权微博',
-  },
-  LOGIN_EXPIRED_ACCOUNT: {
-    retrySafe: 'after_reauth',
-    requiresReauth: true,
-    message: '微博登录已过期',
-    nextAction: '引导用户重新扫码授权微博',
-  },
-  RELINK_REQUIRED: {
-    retrySafe: 'after_reauth',
-    requiresReauth: true,
-    message: '插件授权已失效，需要重新绑定',
-    nextAction: '引导用户重新扫码授权微博',
-  },
   WEIBO_ACTION_FAILED: {
     retrySafe: 'after_reauth',
     requiresReauth: false,
     message: '微博动作失败，页面未能完成操作',
     nextAction:
       '可再试一次读操作确认；若仍失败，引导用户重新扫码授权微博（设置里可能仍显示已授权）',
-  },
-  UPSTREAM_FAILED: {
-    retrySafe: 'no',
-    requiresReauth: false,
-    message: '微博触发了验证码或风控，无法自动继续',
-    nextAction: '请用户本人在浏览器完成验证后再试，不要自动重试',
   },
   PRECONDITION_CHANGED: {
     retrySafe: 'no',
@@ -299,48 +276,6 @@ const ROWS: Record<string, Row> = {
     requiresReauth: false,
     message: '微博工作器未正常结束',
     nextAction: '工作器未完成且未发送，可稍后重试',
-  },
-  EXECUTION_FAILED: {
-    retrySafe: 'no',
-    requiresReauth: false,
-    message: '微博动作执行失败',
-    nextAction: '执行失败且未发送。请检查参数后重开，不要无依据重试同一确认卡',
-  },
-  CAPACITY_EXCEEDED: {
-    retrySafe: 'yes',
-    requiresReauth: false,
-    message: '微博工作容量已满',
-    nextAction: '请稍后重试，本次未发送',
-  },
-  UNAVAILABLE: {
-    retrySafe: 'yes',
-    requiresReauth: false,
-    message: '微博运行时暂不可用',
-    nextAction: '请稍后重试；若持续失败请联系管理员',
-  },
-  IMAGE_MISMATCH: {
-    retrySafe: 'yes',
-    requiresReauth: false,
-    message: '微博工作镜像与期望不一致',
-    nextAction: '平台故障，请稍后重试或联系管理员',
-  },
-  PROTOCOL: {
-    retrySafe: 'yes',
-    requiresReauth: false,
-    message: '微博工作协议异常',
-    nextAction: '协议异常且未发送，请稍后重试',
-  },
-  CLEANUP_FAILED: {
-    retrySafe: 'yes',
-    requiresReauth: false,
-    message: '微博工作器清理失败',
-    nextAction: '平台清理异常。请稍后重试',
-  },
-  CLOSING: {
-    retrySafe: 'yes',
-    requiresReauth: false,
-    message: '微博运行时正在关闭',
-    nextAction: '请稍后重试',
   },
   ZHIHU_ACTION_FAILED: {
     retrySafe: 'after_reauth',
@@ -488,12 +423,6 @@ const ROWS: Record<string, Row> = {
     message: '插件授权未完成',
     nextAction: '请重新扫码授权',
   },
-  NOT_INSTALLED: {
-    retrySafe: 'no',
-    requiresReauth: false,
-    message: '尚未安装该插件',
-    nextAction: '请先从 AI 市场安装或更新微博插件',
-  },
   SETUP_ACTIVE: {
     retrySafe: 'no',
     requiresReauth: false,
@@ -517,12 +446,6 @@ const ROWS: Record<string, Row> = {
     requiresReauth: false,
     message: '二维码尚未就绪',
     nextAction: '请稍后重试获取二维码',
-  },
-  TERMS_REQUIRED: {
-    retrySafe: 'no',
-    requiresReauth: false,
-    message: '需要先接受使用条款',
-    nextAction: '请先阅读并接受微博插件使用条款',
   },
   CONNECTION_ERROR: {
     retrySafe: 'yes',
@@ -606,12 +529,6 @@ const ROWS: Record<string, Row> = {
     message: '插件已停用',
     nextAction: '请告诉用户在 管理中心 → 插件 里打开这个插件后再试，不要绕过',
   },
-  WRITE_DISABLED: {
-    retrySafe: 'no',
-    requiresReauth: false,
-    message: '插件写入未开启',
-    nextAction: '请先在设置中阅读免责声明并开启微博写入',
-  },
   ACTION_UNKNOWN: {
     retrySafe: 'no',
     requiresReauth: false,
@@ -624,6 +541,164 @@ const ROWS: Record<string, Row> = {
     message: '服务暂时不可用',
     nextAction: '请稍后重试；若持续失败请联系管理员',
   },
+  WRITE_DAILY_LIMIT: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '该账号今日此类写操作已达上限，本次未执行',
+    nextAction: '本次未发送。请告诉用户明天再试，不要换动作或换确认卡绕过上限',
+  },
+}
+
+/**
+ * 插件在用户可见文案里的称呼(按 provider slug)。通用码(登录过期、运行时故障、未安装、条款、写入开关)
+ * 的文案按它生成:微博逐字保持历史原文;已知插件用自己的名字;未知或未传 provider 用中性措辞,
+ * 不再一律说「微博」(OCV5-553)。
+ */
+type ProviderWording = {
+  /** 拼进 message 的主语,如「微博登录已过期」;中性 = 「插件」。 */
+  name: string
+  /** 拼进「安装或更新 X」「接受 X 使用条款」「开启 X 写入」的宾语;中性 = 「该插件」。 */
+  plugin: string
+  write: string
+  /** 授权失效时引导用户的动作。 */
+  relink: string
+}
+
+const PROVIDER_WORDING: Record<string, ProviderWording> = {
+  weibo: {
+    name: '微博',
+    plugin: '微博插件',
+    write: '微博写入',
+    relink: '引导用户重新扫码授权微博',
+  },
+  zhihu: {
+    name: '知乎',
+    plugin: '知乎插件',
+    write: '知乎写入',
+    relink: '引导用户重新扫码授权知乎',
+  },
+  'bili-account': {
+    name: 'B 站账号插件',
+    plugin: 'B 站账号插件',
+    write: 'B 站账号插件写入',
+    relink: '引导用户重新扫码授权 B 站账号',
+  },
+  'knowledge-planet': {
+    name: '知识星球',
+    plugin: '知识星球插件',
+    write: '知识星球写入',
+    relink: '引导用户到 管理中心 → 插件 重新授权知识星球账号',
+  },
+  'literature-db': {
+    name: '文献数据库',
+    plugin: '文献数据库插件',
+    write: '文献数据库写入',
+    relink: '引导用户到 管理中心 → 插件 重新连接文献数据库账号',
+  },
+}
+
+const NEUTRAL_WORDING: ProviderWording = {
+  name: '插件',
+  plugin: '该插件',
+  write: '该插件写入',
+  relink: '引导用户到 管理中心 → 插件 重新授权该插件账号',
+}
+
+function providerWording(provider: string | null | undefined): ProviderWording {
+  return (provider ? PROVIDER_WORDING[provider] : undefined) ?? NEUTRAL_WORDING
+}
+
+const PROVIDER_ROWS: Record<string, (w: ProviderWording) => Row> = {
+  LOGIN_EXPIRED: (w) => ({
+    retrySafe: 'after_reauth',
+    requiresReauth: true,
+    message: `${w.name}登录已过期`,
+    nextAction: w.relink,
+  }),
+  LOGIN_EXPIRED_ACCOUNT: (w) => ({
+    retrySafe: 'after_reauth',
+    requiresReauth: true,
+    message: `${w.name}登录已过期`,
+    nextAction: w.relink,
+  }),
+  RELINK_REQUIRED: (w) => ({
+    retrySafe: 'after_reauth',
+    requiresReauth: true,
+    message: '插件授权已失效，需要重新绑定',
+    nextAction: w.relink,
+  }),
+  UPSTREAM_FAILED: (w) => ({
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: `${w.name}触发了验证码或风控，无法自动继续`,
+    nextAction: '请用户本人在浏览器完成验证后再试，不要自动重试',
+  }),
+  EXECUTION_FAILED: (w) => ({
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: `${w.name}动作执行失败`,
+    nextAction: '执行失败且未发送。请检查参数后重开，不要无依据重试同一确认卡',
+  }),
+  CAPACITY_EXCEEDED: (w) => ({
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: `${w.name}工作容量已满`,
+    nextAction: '请稍后重试，本次未发送',
+  }),
+  UNAVAILABLE: (w) => ({
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: `${w.name}运行时暂不可用`,
+    nextAction: '请稍后重试；若持续失败请联系管理员',
+  }),
+  IMAGE_MISMATCH: (w) => ({
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: `${w.name}工作镜像与期望不一致`,
+    nextAction: '平台故障，请稍后重试或联系管理员',
+  }),
+  PROTOCOL: (w) => ({
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: `${w.name}工作协议异常`,
+    nextAction: '协议异常且未发送，请稍后重试',
+  }),
+  CLEANUP_FAILED: (w) => ({
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: `${w.name}工作器清理失败`,
+    nextAction: '平台清理异常。请稍后重试',
+  }),
+  CLOSING: (w) => ({
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: `${w.name}运行时正在关闭`,
+    nextAction: '请稍后重试',
+  }),
+  NOT_INSTALLED: (w) => ({
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '尚未安装该插件',
+    nextAction: `请先从 AI 市场安装或更新${w.plugin}`,
+  }),
+  TERMS_REQUIRED: (w) => ({
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '需要先接受使用条款',
+    nextAction: `请先阅读并接受${w.plugin}使用条款`,
+  }),
+  WRITE_DISABLED: (w) => ({
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '插件写入未开启',
+    nextAction: `请先在设置中阅读免责声明并开启${w.write}`,
+  }),
+}
+
+function rowFor(code: string, provider: string | null | undefined): Row {
+  const byProvider = PROVIDER_ROWS[code]
+  if (byProvider) return byProvider(providerWording(provider))
+  return ROWS[code] ?? DEFAULT_ROW
 }
 
 const DEFAULT_ROW: Row = {
@@ -635,7 +710,7 @@ const DEFAULT_ROW: Row = {
 
 export function resolvePluginErrorGuidance(input: PluginErrorGuidanceInput): PluginErrorGuidance {
   const code = input.code
-  const row = ROWS[code] ?? DEFAULT_ROW
+  const row = rowFor(code, input.provider)
   const nextAction =
     code === 'CONNECTION_ERROR' && input.provider === 'weibo'
       ? '请稍后重试。若微博已授权仍反复失败，不要当成单纯网络故障，引导用户重新扫码授权'
@@ -652,15 +727,15 @@ export function resolvePluginErrorGuidance(input: PluginErrorGuidanceInput): Plu
 }
 
 export function weiboRuntimePublicMessage(code: string): string {
-  return resolvePluginErrorGuidance({ code }).message
+  return resolvePluginErrorGuidance({ code, provider: 'weibo' }).message
 }
 
 export function zhihuRuntimePublicMessage(code: string): string {
-  return resolvePluginErrorGuidance({ code }).message
+  return resolvePluginErrorGuidance({ code, provider: 'zhihu' }).message
 }
 
 export function biliAccountRuntimePublicMessage(code: string): string {
-  return resolvePluginErrorGuidance({ code }).message
+  return resolvePluginErrorGuidance({ code, provider: 'bili-account' }).message
 }
 
 export type PluginErrorGuidanceFields = Pick<
@@ -668,7 +743,9 @@ export type PluginErrorGuidanceFields = Pick<
   'retrySafe' | 'requiresReauth' | 'sideEffect' | 'nextAction'
 > & { message: string }
 
-export function pluginErrorGuidanceFields(input: PluginErrorGuidanceInput): PluginErrorGuidanceFields {
+export function pluginErrorGuidanceFields(
+  input: PluginErrorGuidanceInput,
+): PluginErrorGuidanceFields {
   const g = resolvePluginErrorGuidance(input)
   return {
     message: g.message,
@@ -679,7 +756,10 @@ export function pluginErrorGuidanceFields(input: PluginErrorGuidanceInput): Plug
   }
 }
 
-export function connectorRpcErrorEnvelope(code: string): {
+export function connectorRpcErrorEnvelope(
+  code: string,
+  provider?: string | null,
+): {
   kind: 'error'
   code: string
   message: string
@@ -688,7 +768,7 @@ export function connectorRpcErrorEnvelope(code: string): {
   sideEffect: PluginSideEffect
   nextAction: string
 } {
-  const g = resolvePluginErrorGuidance({ code })
+  const g = resolvePluginErrorGuidance({ code, provider })
   return {
     kind: 'error',
     code,
@@ -704,6 +784,7 @@ export function connectorRpcReplayEnvelope(input: {
   status: string
   errorCode?: string | null
   resultDigest?: string | null
+  provider?: string | null
 }): {
   kind: 'replay'
   status: string
@@ -725,6 +806,7 @@ export function connectorRpcReplayEnvelope(input: {
     const g = resolvePluginErrorGuidance({
       code: input.errorCode,
       status: input.status,
+      provider: input.provider,
     })
     body.message = g.message
     body.retrySafe = g.retrySafe

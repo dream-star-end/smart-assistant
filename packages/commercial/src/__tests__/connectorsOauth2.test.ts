@@ -28,7 +28,11 @@ import {
   validateSecretBag,
 } from '../connectors/engine/credentialBag.js'
 import type { EngineHttpDeps } from '../connectors/engine/driver.js'
-import { buildAuthorizeUrl, exchangeAuthCode, refreshOauth2Token } from '../connectors/engine/oauth2.js'
+import {
+  buildAuthorizeUrl,
+  exchangeAuthCode,
+  refreshOauth2Token,
+} from '../connectors/engine/oauth2.js'
 import type { ResolvedCredentials } from '../connectors/engine/placement.js'
 import { resolveApiCredentials } from '../connectors/engine/tokenEngine.js'
 import { ConnectorError } from '../connectors/errors.js'
@@ -1027,5 +1031,152 @@ describe('pkce', () => {
     const challenge = await pkceChallengeS256(v1)
     assert.equal(challenge, createHash('sha256').update(v1, 'ascii').digest('base64url'))
     assert.notEqual(challenge, v1) // 单向派生:URL 里那半 ≠ 交换时那半
+  })
+})
+
+// ─── clientIdParamName(OCV5-553:抖音开放平台用 client_key) ────────────────────
+
+describe('oauth2 clientIdParamName', () => {
+  const AUTH_OPTS = {
+    clientId: 'cid-public-abc',
+    redirectUri: 'https://app.example.com/oauth/callback',
+    state: 'state-token-123',
+    pkceChallenge: 'CHALLENGE-s256-xyz',
+  }
+  const withClientKey = (s: Record<string, unknown>) => {
+    ;(s.auth as Record<string, unknown>).clientIdParamName = 'client_key'
+  }
+
+  test('缺省时契约不带该字段,execContractHash 与改动前同一输入一致(现有连接器零漂移)', () => {
+    const a = compileSpec(githubSpec(), githubDecision())
+    assert.equal('clientIdParamName' in (a.execContract.oauth2 as Record<string, unknown>), false)
+    const spec = githubSpec()
+    withClientKey(spec)
+    const b = compileSpec(spec, githubDecision())
+    assert.equal((b.execContract.oauth2 as Record<string, unknown>).clientIdParamName, 'client_key')
+    assert.notEqual(a.execContractHash, b.execContractHash)
+  })
+
+  test('与其它协议参数同名 → AUTH_SCHEMA_INVALID;非法字符 → SPEC_SCHEMA_INVALID', () => {
+    for (const bad of ['client_secret', 'code', 'redirect_uri', 'grant_type', 'refresh_token']) {
+      assert.throws(
+        () =>
+          compileGithub((s) => {
+            ;(s.auth as Record<string, unknown>).clientIdParamName = bad
+          }),
+        isSpecCode('AUTH_SCHEMA_INVALID'),
+        bad,
+      )
+    }
+    assert.throws(
+      () =>
+        compileGithub((s) => {
+          ;(s.auth as Record<string, unknown>).clientIdParamName = 'client key&x=1'
+        }),
+      // QueryName 模式在整份 spec 的 schema 校验里先拦下。
+      isSpecCode('SPEC_SCHEMA_INVALID'),
+    )
+    // client_id 本身允许(等同缺省)。
+    const c = compileGithub((s) => {
+      ;(s.auth as Record<string, unknown>).clientIdParamName = 'client_id'
+    })
+    assert.equal(
+      new URL(buildAuthorizeUrl(c, AUTH_OPTS)).searchParams.get('client_id'),
+      'cid-public-abc',
+    )
+  })
+
+  test('buildAuthorizeUrl:用 client_key,不出现 client_id;fixedExtraParams 不能覆盖 client_key', () => {
+    const c = compileGithub((s) => {
+      withClientKey(s)
+      ;(s.auth as Record<string, unknown>).fixedExtraParams = {
+        client_key: 'HIJACK',
+        allow_signup: 'false',
+      }
+    })
+    const u = new URL(buildAuthorizeUrl(c, AUTH_OPTS))
+    assert.equal(u.searchParams.get('client_key'), 'cid-public-abc')
+    assert.equal(u.searchParams.get('client_id'), null)
+    assert.equal(u.searchParams.get('allow_signup'), 'false')
+  })
+
+  test('exchangeAuthCode form 型:body 用 client_key,不带 client_id', async () => {
+    const c = compileGithub(withClientKey)
+    const captured: Captured[] = []
+    await exchangeAuthCode({
+      contract: c,
+      code: CODE,
+      clientId: 'cid-public-abc',
+      clientSecret: SECRET,
+      redirectUri: 'https://app.example.com/oauth/callback',
+      pkceVerifier: VERIFIER,
+      deps: {
+        resolver: okResolver(),
+        fetchImpl: mockFetch(captured, () => ({
+          status: 200,
+          body: JSON.stringify({ access_token: 'at-live-xyz' }),
+        })),
+      },
+    })
+    const b = new URLSearchParams(captured[0]?.body ?? '')
+    assert.equal(b.get('client_key'), 'cid-public-abc')
+    assert.equal(b.get('client_id'), null)
+    assert.equal(b.get('client_secret'), SECRET)
+    assert.equal(b.get('code'), CODE)
+  })
+
+  test('exchangeAuthCode basic 型:不受影响,client 标识仍在 Authorization 头', async () => {
+    const c = compileGithub((s) => {
+      withClientKey(s)
+      ;(s.auth as Record<string, unknown>).clientAuth = 'basic'
+    })
+    const captured: Captured[] = []
+    await exchangeAuthCode({
+      contract: c,
+      code: CODE,
+      clientId: 'cid-public-abc',
+      clientSecret: SECRET,
+      redirectUri: 'https://app.example.com/oauth/callback',
+      pkceVerifier: VERIFIER,
+      deps: {
+        resolver: okResolver(),
+        fetchImpl: mockFetch(captured, () => ({
+          status: 200,
+          body: JSON.stringify({ access_token: 'at-live-xyz' }),
+        })),
+      },
+    })
+    const b = new URLSearchParams(captured[0]?.body ?? '')
+    assert.equal(b.get('client_key'), null)
+    assert.equal(b.get('client_id'), null)
+    assert.equal(
+      captured[0]?.headers.authorization,
+      `Basic ${Buffer.from(`cid-public-abc:${SECRET}`).toString('base64')}`,
+    )
+  })
+
+  test('refreshOauth2Token:默认 client 字段名取 client_key;refreshFieldNames 映射 client_id 时以其为准', async () => {
+    const captured: Captured[] = []
+    const deps = {
+      resolver: okResolver(),
+      fetchImpl: mockFetch(captured, () => ({
+        status: 200,
+        body: JSON.stringify({ access_token: NEW_ACCESS }),
+      })),
+    }
+    await refreshOauth2Token({ contract: compileGithub(withClientKey), ...REFRESH_ARGS, deps })
+    const b1 = new URLSearchParams(captured[0]?.body ?? '')
+    assert.equal(b1.get('client_key'), 'cid-public-abc')
+    assert.equal(b1.get('client_id'), null)
+    assert.equal(b1.get('refresh_token'), REFRESH_TOKEN)
+
+    const c2 = compileGithub((s) => {
+      withClientKey(s)
+      ;(s.auth as Record<string, unknown>).refreshFieldNames = { app_key: 'client_id' }
+    })
+    await refreshOauth2Token({ contract: c2, ...REFRESH_ARGS, deps })
+    const b2 = new URLSearchParams(captured[1]?.body ?? '')
+    assert.equal(b2.get('app_key'), 'cid-public-abc')
+    assert.equal(b2.get('client_key'), null)
   })
 })

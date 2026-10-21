@@ -47,6 +47,11 @@ const RESERVED_AUTHORIZE_PARAMS: ReadonlySet<string> = new Set([
   'code_challenge_method',
 ])
 
+/** client 公开标识的线上参数名:契约 clientIdParamName,缺省 RFC 6749 的 client_id。 */
+function clientIdWireName(cfg: Oauth2ConfigT): string {
+  return cfg.clientIdParamName ?? 'client_id'
+}
+
 /** 取 contract.oauth2(缺失=编程错误:非 oauth2 契约误入本模块)。 */
 function requireOauth2(contract: ExecContractT): Oauth2ConfigT {
   const cfg = contract.oauth2
@@ -115,7 +120,8 @@ export function buildAuthorizeUrl(contract: ExecContractT, opts: BuildAuthorizeU
   // URLSearchParams 保序 + 自动百分号编码(拒 CRLF 已前置到 assertClean)。
   const params = new URLSearchParams()
   params.set('response_type', 'code')
-  params.set('client_id', assertClean(opts.clientId, 'clientId'))
+  const clientIdName = clientIdWireName(cfg)
+  params.set(clientIdName, assertClean(opts.clientId, 'clientId'))
   params.set('redirect_uri', opts.redirectUri)
   params.set('state', assertClean(opts.state, 'state'))
   if (cfg.scopes !== undefined && cfg.scopes.length > 0) {
@@ -135,7 +141,7 @@ export function buildAuthorizeUrl(contract: ExecContractT, opts: BuildAuthorizeU
   // fixedExtraParams:核心协议参数不可被覆盖(RESERVED_AUTHORIZE_PARAMS 跳过)。
   if (cfg.fixedExtraParams !== undefined) {
     for (const [k, v] of Object.entries(cfg.fixedExtraParams)) {
-      if (RESERVED_AUTHORIZE_PARAMS.has(k)) continue
+      if (RESERVED_AUTHORIZE_PARAMS.has(k) || k === clientIdName) continue
       params.set(k, assertClean(v, `extra ${k}`))
     }
   }
@@ -198,8 +204,8 @@ export async function exchangeAuthCode(opts: ExchangeAuthCodeOpts): Promise<Exch
       // basic-auth 型:client_id:client_secret 进 Authorization Basic,其余进 body。
       headers.authorization = `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`
     } else {
-      // body 型(form/json → oauth2 交换仍 form 编码):client_id + client_secret 进 body。
-      fields.client_id = clientId
+      // body 型(form/json → oauth2 交换仍 form 编码):client 标识(名按 clientIdParamName)+ client_secret 进 body。
+      fields[clientIdWireName(cfg)] = clientId
       fields.client_secret = clientSecret
     }
     const body = new URLSearchParams(fields).toString()
@@ -294,14 +300,15 @@ const REFRESH_GRANT_VALUE = 'refresh_token'
  * `Record<线上字段名, 规范 source 名>`(key 受 QueryName pattern 约束因为它要进 body/query;
  * value 是引擎内部的规范 source 名)。本函数把它**反转**成 `source → 线上字段名` 供组包用。
  *
- * 未声明 → 默认恒等映射(线上字段名 == 规范名,即 RFC 6749 标准形状)。声明了 → 逐 source 覆盖
+ * 未声明 → 默认恒等映射(线上字段名 == 规范名,即 RFC 6749 标准形状;client_id 的默认线上名取
+ * clientIdParamName)。声明了 → 逐 source 覆盖
  * 默认(只覆盖出现的那些)。同一 source 被映射到两个线上字段名 = 歧义 → BAD_REQUEST。
  */
 function refreshWireNames(cfg: Oauth2ConfigT): Record<string, string> {
   const wire: Record<string, string> = {
     grant_type: 'grant_type',
     refresh_token: 'refresh_token',
-    client_id: 'client_id',
+    client_id: clientIdWireName(cfg),
     client_secret: 'client_secret',
   }
   if (cfg.refreshFieldNames === undefined) return wire

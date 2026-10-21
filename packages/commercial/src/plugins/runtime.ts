@@ -15,7 +15,11 @@ import { buildWriteSummary } from '../connectors/service.js'
 import { ConnectorSpecError } from '../connectors/spec/types.js'
 import { getPool } from '../db/index.js'
 import { tx } from '../db/queries.js'
-import { PluginAccountLeaseError, type PluginLeaseRedis, acquirePluginAccountLease } from './accountLease.js'
+import {
+  PluginAccountLeaseError,
+  type PluginLeaseRedis,
+  acquirePluginAccountLease,
+} from './accountLease.js'
 import {
   LITERATURE_SESSION_MAX_MS,
   PluginAccountError,
@@ -38,6 +42,14 @@ import {
   coerceIntegerStringParams,
   validateRuntimePluginJson,
 } from './contracts.js'
+import type { PluginEnablement } from './enablement.js'
+import { KNOWLEDGE_PLANET_PLUGIN_SLUG } from './knowledgePlanetContract.js'
+import {
+  type KnowledgePlanetMediaDeps,
+  type KnowledgePlanetSealedMedia,
+  sealKnowledgePlanetMedia,
+  stageKnowledgePlanetMedia,
+} from './knowledgePlanetMedia.js'
 import { type JieyouAccountState, parseJieyouAccountState } from './literatureDb/accountState.js'
 import { isLiteratureHttpIdentity } from './literatureDb/builtinContract.js'
 import type { LiteratureCredentials } from './literatureDb/credentials.js'
@@ -46,13 +58,6 @@ import type {
   LiteratureHttpExecuteOutput,
   LiteratureHttpReadExecutor,
 } from './literatureDb/httpExecutor.js'
-import { KNOWLEDGE_PLANET_PLUGIN_SLUG } from './knowledgePlanetContract.js'
-import {
-  type KnowledgePlanetMediaDeps,
-  type KnowledgePlanetSealedMedia,
-  sealKnowledgePlanetMedia,
-  stageKnowledgePlanetMedia,
-} from './knowledgePlanetMedia.js'
 import type { VerifiedLocalPluginRuntime } from './localRuntime.js'
 import {
   type VerifiedRuntimePluginContract,
@@ -60,9 +65,16 @@ import {
   loadVerifiedRuntimePluginContract,
 } from './review.js'
 import { WEIBO_PLUGIN_SLUG } from './weiboContract.js'
+import {
+  type ManagedPluginWriteDailyCapPolicy,
+  consumeManagedPluginWriteDailyCap,
+} from './writeDailyCap.js'
+import {
+  managedPluginWriteDailyCap,
+  managedPluginWritePolicy,
+  managedPluginWritePreapprovalPolicy,
+} from './writePolicy.js'
 import { ZHIHU_PLUGIN_SLUG } from './zhihuContract.js'
-import type { PluginEnablement } from './enablement.js'
-import { managedPluginWritePolicy, managedPluginWritePreapprovalPolicy } from './writePolicy.js'
 
 export class PluginRuntimeFacadeError extends Error {
   readonly code:
@@ -348,6 +360,9 @@ export class PluginRuntimeFacade {
        */
       pluginEnablement?: PluginEnablement
       literatureHttp?: LiteratureHttpReadExecutor
+      /** 每日写上限策略(OCV5-553)。省略 = writePolicy.managedPluginWriteDailyCap;测试注入。 */
+      writeDailyCapPolicy?: (slug: string) => ManagedPluginWriteDailyCapPolicy | null
+      now?: () => number
       literatureRelogin?: (input: {
         userId: number
         accountId: string
@@ -394,7 +409,10 @@ export class PluginRuntimeFacade {
     if (verified.pluginType !== 'managed-browser' || verified.slug !== row.provider)
       throw new PluginRuntimeFacadeError('TARGET_NOT_FOUND', 'Plugin account subtype mismatch')
     if ((await this.opts.pluginEnablement?.disabledSet(userId))?.has(verified.slug))
-      throw new PluginRuntimeFacadeError('PLUGIN_DISABLED', `Plugin ${verified.slug} is disabled by the user`)
+      throw new PluginRuntimeFacadeError(
+        'PLUGIN_DISABLED',
+        `Plugin ${verified.slug} is disabled by the user`,
+      )
     if (!this.supportsManagedRuntime(verified))
       throw new PluginRuntimeFacadeError(
         'RUNTIME_UNAVAILABLE',
@@ -404,6 +422,19 @@ export class PluginRuntimeFacade {
       requireCurrent: true,
     })
     return { row, verified }
+  }
+
+  /**
+   * 托管账号目标 → provider slug。只给错误/回放信封挑文案用(OCV5-553);本地插件目标或查不到 = null,
+   * 调用方回落到中性文案。
+   */
+  async targetProvider(userId: number, targetId: string): Promise<string | null> {
+    if (!isSafeDbId(targetId)) return null
+    const r = await this.pool.query<{ provider: string }>(
+      'SELECT provider FROM connections WHERE id = $1::bigint AND user_id = $2',
+      [targetId, userId],
+    )
+    return r.rows[0]?.provider ?? null
   }
 
   async classifyTarget(
@@ -541,8 +572,7 @@ export class PluginRuntimeFacade {
     for (const row of rows) {
       const item = verified.get(Number(row.id))
       if (!item || item.pluginType !== row.plugin_type) continue
-      if (item.pluginType === 'managed-browser' && !this.supportsManagedRuntime(item))
-        continue
+      if (item.pluginType === 'managed-browser' && !this.supportsManagedRuntime(item)) continue
       out.push({
         versionId: row.id,
         slug: row.slug,
@@ -618,8 +648,7 @@ export class PluginRuntimeFacade {
     const runtimeSupportedVersionIds = new Set(
       [...verified.values()]
         .filter(
-          (item) =>
-            item.pluginType !== 'managed-browser' || this.supportsManagedRuntime(item),
+          (item) => item.pluginType !== 'managed-browser' || this.supportsManagedRuntime(item),
         )
         .map((item) => String(item.versionId)),
     )
@@ -648,7 +677,8 @@ export class PluginRuntimeFacade {
           row.installed_description,
         accountMode:
           contract?.pluginType === 'managed-browser' ? contract.contract.account.mode : 'none',
-        actions: contract?.contract.actions.map((action) => actionProjection(action, row.slug)) ?? [],
+        actions:
+          contract?.contract.actions.map((action) => actionProjection(action, row.slug)) ?? [],
         installed: row.installed,
         installedVersion: row.installed_version,
         latestVersionId: available ? row.latest_id : null,
@@ -1671,6 +1701,15 @@ export class PluginRuntimeFacade {
           verified,
           runner: this.pool,
         })
+        // 每日上限在派发围栏之前扣减:超限即 WRITE_DAILY_LIMIT,账本走下方 failed 分支(确定未派发)。
+        await consumeManagedPluginWriteDailyCap({
+          redis: this.opts.redis,
+          policy: (this.opts.writeDailyCapPolicy ?? managedPluginWriteDailyCap)(verified.slug),
+          slug: verified.slug,
+          connectionId: input.targetId,
+          actionId: begun.row.action,
+          now: (this.opts.now ?? Date.now)(),
+        })
         const envelope = decryptPluginAccountEnvelope(fencedRow, verified.contract, this.opts.env)
         const manifest = Array.isArray(begun.params.mediaManifest)
           ? (begun.params.mediaManifest as KnowledgePlanetSealedMedia[])
@@ -1993,7 +2032,10 @@ export class PluginRuntimeFacade {
       this.pool,
       { env: this.opts.env },
     )
-    if (initialVerified.pluginType !== 'managed-browser' || initialVerified.slug !== initialRow.provider)
+    if (
+      initialVerified.pluginType !== 'managed-browser' ||
+      initialVerified.slug !== initialRow.provider
+    )
       throw new PluginRuntimeFacadeError('TARGET_NOT_FOUND', 'Plugin account subtype mismatch')
     if (isLiteratureHttpIdentity(initialVerified)) {
       return this.callLiteratureHttpRead(input, initialRow, initialVerified)
@@ -2316,10 +2358,7 @@ export class PluginRuntimeFacade {
             )
           }
         } else if (error instanceof LiteratureError && error.code === 'CAPACITY') {
-          throw new PluginRuntimeFacadeError(
-            'RUNTIME_BUSY',
-            'Literature artifact capacity is full',
-          )
+          throw new PluginRuntimeFacadeError('RUNTIME_BUSY', 'Literature artifact capacity is full')
         } else {
           throw error
         }
@@ -2338,7 +2377,10 @@ export class PluginRuntimeFacade {
           !isLiteratureHttpIdentity(current) ||
           !this.supportsManagedRuntime(current)
         )
-          throw new PluginRuntimeFacadeError('TARGET_STALE', 'Plugin contract changed during invoke')
+          throw new PluginRuntimeFacadeError(
+            'TARGET_STALE',
+            'Plugin contract changed during invoke',
+          )
         if ((await this.opts.pluginEnablement?.disabledSet(input.userId))?.has(current.slug))
           throw new PluginRuntimeFacadeError(
             'PLUGIN_DISABLED',

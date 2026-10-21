@@ -1647,6 +1647,88 @@ describe('marketplace Plugin kernel migration', () => {
         uncertain,
       )
       assert.equal(dispatches, 1, 'unknown replay must never dispatch or retry again')
+
+      // OCV5-553:每日写上限在派发围栏之前扣减;超限 → failed + WRITE_DAILY_LIMIT,绝不派发。
+      const capCounts = new Map<string, number>()
+      const capRedis = {
+        async eval(script: string, numKeys: number, ...args: Array<string | number>) {
+          if (script.includes("redis.call('INCR'")) {
+            const key = String(args[0])
+            const v = capCounts.get(key) ?? 0
+            if (v >= Number(args[1])) return -1
+            capCounts.set(key, v + 1)
+            return v + 1
+          }
+          return transitionRedis.eval(script, numKeys, ...args)
+        },
+      }
+      let cappedDispatches = 0
+      const cappedFacade = new PluginRuntimeFacade({
+        pool: getPool(),
+        redis: capRedis,
+        env: process.env,
+        writeDailyCapPolicy: (slug) =>
+          slug === KNOWLEDGE_PLANET_PLUGIN_SLUG
+            ? {
+                buckets: { create_comment: 'comment' },
+                defaultBucket: 'other',
+                caps: { comment: 1, other: 5 },
+              }
+            : null,
+        now: () => Date.UTC(2026, 9, 21, 4, 0, 0),
+        browserRuntime: {
+          supportsContract: () => true,
+          async runAction(input: { storageState: unknown; beforeDispatch: () => Promise<void> }) {
+            await input.beforeDispatch()
+            cappedDispatches += 1
+            return { result: { commented: true }, storageState: input.storageState }
+          },
+        } as never,
+      })
+      const firstCapped = await cappedFacade.proposeWrite({
+        userId: activeUserId,
+        targetId: activeAccount.id,
+        actionId: 'create_comment',
+        params: { topicId: '987654', text: 'daily cap probe 1' },
+      })
+      await approveConfirmation(firstCapped.confirmId, activeUserId, getPool())
+      assert.deepEqual(
+        await cappedFacade.executeConfirmedWrite({
+          userId: activeUserId,
+          targetId: activeAccount.id,
+          confirmId: firstCapped.confirmId,
+        }),
+        { kind: 'result', result: { commented: true } },
+      )
+      const overCap = await cappedFacade.proposeWrite({
+        userId: activeUserId,
+        targetId: activeAccount.id,
+        actionId: 'create_comment',
+        params: { topicId: '987654', text: 'daily cap probe 2' },
+      })
+      await approveConfirmation(overCap.confirmId, activeUserId, getPool())
+      assert.deepEqual(
+        await cappedFacade.executeConfirmedWrite({
+          userId: activeUserId,
+          targetId: activeAccount.id,
+          confirmId: overCap.confirmId,
+        }),
+        { kind: 'replay', status: 'failed', errorCode: 'WRITE_DAILY_LIMIT', resultDigest: null },
+      )
+      assert.equal(cappedDispatches, 1, 'over-cap write must never dispatch')
+      const overCapLedger = await getLedgerRow(overCap.confirmId, activeUserId, getPool())
+      assert.equal(overCapLedger?.status, 'failed')
+      assert.equal(overCapLedger?.dispatch_armed_at, null)
+      assert.deepEqual(
+        [...capCounts.entries()],
+        [
+          [
+            `plugins:write-daily:${KNOWLEDGE_PLANET_PLUGIN_SLUG}:${activeAccount.id}:comment:20261021`,
+            1,
+          ],
+        ],
+      )
+
       await facade.setManagedAccountWriteAccess({
         userId: activeUserId,
         targetId: activeAccount.id,

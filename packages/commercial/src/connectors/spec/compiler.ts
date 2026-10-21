@@ -416,6 +416,34 @@ function validateOauth2Endpoint(
   validatePath(u.pathname, { properties: {} })
 }
 
+/**
+ * clientIdParamName 不得与 authorize / code 交换 / refresh 里的其它协议参数同名:否则 client
+ * 公开标识会顶掉 code / redirect_uri / client_secret 等,发出语义错乱的请求。`client_id` 本身允许
+ * (等同缺省)。
+ */
+const OAUTH2_NON_CLIENT_ID_PARAMS: ReadonlySet<string> = new Set([
+  'response_type',
+  'redirect_uri',
+  'state',
+  'scope',
+  'code_challenge',
+  'code_challenge_method',
+  'grant_type',
+  'code',
+  'code_verifier',
+  'client_secret',
+  'refresh_token',
+])
+
+function validateOauth2ClientIdParamName(name: string | undefined): void {
+  if (name === undefined) return
+  if (OAUTH2_NON_CLIENT_ID_PARAMS.has(name))
+    throw new ConnectorSpecError(
+      'AUTH_SCHEMA_INVALID',
+      `oauth2 clientIdParamName '${name}' collides with a protocol parameter`,
+    )
+}
+
 // ─── placement 判别联合的跨字段校验(§3.3) ─────────────────────────────────
 
 function validatePlacement(p: ApiCredentialPlacementT): void {
@@ -640,6 +668,7 @@ export function compileSpec(rawSpec: unknown, securityDecision: unknown): Compil
       tokenEndpoint: string
       refreshEndpoint?: string
       revokeEndpoint?: string
+      clientIdParamName?: string
     }
     if (audience.authorizationOrigins.length === 0)
       throw new ConnectorSpecError(
@@ -658,6 +687,7 @@ export function compileSpec(rawSpec: unknown, securityDecision: unknown): Compil
       validateOauth2Endpoint(auth.refreshEndpoint, audience.tokenOrigins, 'refreshEndpoint')
     if (auth.revokeEndpoint !== undefined)
       validateOauth2Endpoint(auth.revokeEndpoint, audience.tokenOrigins, 'revokeEndpoint')
+    validateOauth2ClientIdParamName(auth.clientIdParamName)
     // Oauth2Config 提取:按 Oauth2Config strict schema 剔除 tokenOutputs/apiCredentialPlacements
     // (二者另有权威通道)。Value.Clean = 单一权威、防漂移(config 增字段自动携带)。
     oauth2 = Value.Clean(Oauth2Config, structuredClone(spec.auth)) as Oauth2ConfigT
