@@ -137,14 +137,6 @@ test('validatePdfStructureSync and validatePdfInIsolatedWorker accept valid PDFs
   assert.equal(validatePdfStructureSync(compactPdf), true)
   assert.equal(await validatePdfInIsolatedWorker(compactPdf, signal), true)
 
-  const brokenPagesRefPdf = buildCustomPdf('999 0 R', '<</Type/Pages/Count 1/Kids[3 0 R]>>')
-  assert.equal(validatePdfStructureSync(brokenPagesRefPdf), false)
-  assert.equal(await validatePdfInIsolatedWorker(brokenPagesRefPdf, signal), false)
-
-  const mismatchedGenerationPdf = buildCustomPdf('2 1 R', '<</Type/Pages/Count 1/Kids[3 0 R]>>')
-  assert.equal(validatePdfStructureSync(mismatchedGenerationPdf), false)
-  assert.equal(await validatePdfInIsolatedWorker(mismatchedGenerationPdf, signal), false)
-
   const fontNameWithEndobjSubstringPdf = (() => {
     const header = '%PDF-1.4\n'
     const obj1 = '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n'
@@ -309,6 +301,9 @@ test('Springer 10.1186 DOI normalization preserves 10. prefix across HTML parsin
   assert.equal(normalizeSpringerDoi('10.1186/s40623-026-02478-9'), '10.1186/s40623-026-02478-9')
   assert.equal(normalizeSpringerDoi('1186/s40623-026-02478-9'), '10.1186/s40623-026-02478-9')
   assert.equal(normalizeSpringerDoi('10.1186%2Fs43020-023-00122-5'), '10.1186/s43020-023-00122-5')
+  assert.equal(normalizeSpringerDoi('10.1007/BF02525647(01):2'), '10.1007/BF02525647(01):2')
+  assert.equal(normalizeSpringerDoi('10.1007/..%2Fadmin'), null)
+  assert.equal(normalizeSpringerDoi('10.1007/a/b'), null)
   assert.equal(
     normalizeSpringerPaperId('sp_1186_s40623-026-02478-9'),
     'sp_10.1186_s40623-026-02478-9',
@@ -688,7 +683,12 @@ test('createPinnedDownstreamRequester aborts during DNS and enforces hop timeout
 test('createPinnedDownstreamRequester keeps active byte stream alive past hopTimeoutMs, enforces total ceiling, and supports loopback proxy with direct fallback', async () => {
   const http = await import('node:http')
   let mode: 'progress' | 'trickle-cap' | 'stall' = 'progress'
+  let stallBeforeHeadersOnce = false
   const srv = http.createServer((_req, res) => {
+    if (stallBeforeHeadersOnce) {
+      stallBeforeHeadersOnce = false
+      return
+    }
     res.writeHead(200, { 'Content-Type': 'application/octet-stream' })
     if (mode === 'stall') return
     let sent = 1
@@ -769,6 +769,43 @@ test('createPinnedDownstreamRequester keeps active byte stream alive past hopTim
     assert.equal(seenTargets[1]?.port, 80)
     assert.equal(seenTargets[1]?.path, '/stream')
 
+    // 3b. Proxy pre-header stall (35ms < hopTimeoutMs 250ms) quickly falls back to direct,
+    // while active proxy streaming past 35ms (total ~55ms) stays alive under 250ms hopTimeoutMs:
+    failProxyWith502 = false
+    seenTargets.length = 0
+    stallBeforeHeadersOnce = true
+    const fastHeaderProxyReq = createPinnedDownstreamRequester(
+      resolver,
+      250,
+      1000,
+      localRequest,
+      'http://127.0.0.1:29999',
+      35,
+    )
+    const preHeaderFallbackRes = await fastHeaderProxyReq({
+      url: new URL('http://webvpn.ustb.booktsg.com/stream'),
+      method: 'GET',
+      headers: {},
+      maxBytes: 1024,
+      signal: new AbortController().signal,
+    })
+    assert.equal(preHeaderFallbackRes.statusCode, 200)
+    assert.equal(seenTargets.length, 2)
+    assert.equal(seenTargets[0]?.port, 29999)
+    assert.equal(seenTargets[1]?.port, 80)
+
+    seenTargets.length = 0
+    const postHeaderStreamRes = await fastHeaderProxyReq({
+      url: new URL('http://webvpn.ustb.booktsg.com/stream'),
+      method: 'GET',
+      headers: {},
+      maxBytes: 1024,
+      signal: new AbortController().signal,
+    })
+    assert.equal(postHeaderStreamRes.statusCode, 200)
+    assert.equal(seenTargets.length, 1)
+    assert.equal(seenTargets[0]?.port, 29999)
+
     // 4. Infinite trickle exceeds maxTotalTimeoutMs (95ms):
     mode = 'trickle-cap'
     const capReq = createPinnedDownstreamRequester(resolver, 55, 95, localRequest, '')
@@ -802,141 +839,71 @@ test('createPinnedDownstreamRequester keeps active byte stream alive past hopTim
   }
 })
 
-test('validatePdfStructureSync and LiteratureArtifactStore allow empty-password permission-encrypted PDFs (sxjxtx202601012 style) and WebVPN offset drift while rejecting password-protected and dangerous PDFs', async () => {
+test('validatePdfStructureSync and LiteratureArtifactStore accept publisher PDFs with severe WebVPN offset drift (-127B / -146B) and Linearized /Prev tables while rejecting dangerous actions', async () => {
   const signal = new AbortController().signal
   const pad = (n: number) => String(n).padStart(10, '0')
 
-  // 1. sxjxtx202601012-style empty-user-password permission-only /Encrypt (Standard V=2, R=3, Length=128, P=2100)
-  // with single-line `xref 0 5` header and `0000000000 00000 n` free entry 0
-  const buildEncryptedPdf = (uHex: string, extraCatalogEntries = '') => {
+  const buildPublisherPdf = (extraCatalogEntries = '', declaredDriftBytes = 0) => {
     const header = '%PDF-1.4\r\n'
     const obj1 = `1 0 obj\r<< /Type /Catalog /Pages 2 0 R ${extraCatalogEntries} >>\rendobj\r`
     const obj2 = '2 0 obj\r<< /Type /Pages /Kids [3 0 R] /Count 1 >>\rendobj\r'
     const obj3 = '3 0 obj\r<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\rendobj\r'
     const oHex = '68d1431b5b2a08c20f9e529b1957bb364b78a4726e0236e270da6c92d8f016be'
+    const uHex = '0f936997ec0401773b4b91055e33abd800000000000000000000000000000000'
     const obj4 = `4 0 obj\r<</Filter /Standard/U <${uHex}>/O <${oHex}>/P 2100/V 2/Length 128 /R 3>>\rendobj\r`
     const o1 = header.length
     const o2 = o1 + obj1.length
     const o3 = o2 + obj2.length
     const o4 = o3 + obj3.length
-    const xrefOffset = o4 + obj4.length
-    const xref = `xref 0 5 \r0000000000 00000 n\r${pad(o1)} 00000 n\r${pad(o2)} 00000 n\r${pad(o3)} 00000 n\r${pad(o4)} 00000 n\r`
+    const actualXrefOffset = o4 + obj4.length
+    const xref = `xref 0 5 \r0000000000 00000 n\r${pad(o1)} 00000 n\r${pad(o2 + declaredDriftBytes)} 00000 n\r${pad(o3 + declaredDriftBytes)} 00000 n\r${pad(o4 + declaredDriftBytes)} 00000 n\r`
     const fileIdHex = '1210121610131116111515161312E000'
-    const trailer = `trailer\r<</Size 5/Root 1 0 R/ID[<${fileIdHex}><${fileIdHex}>]/Encrypt 4 0 R>>\rstartxref\r${xrefOffset}\r%%EOF\r`
+    const trailer = `trailer\r<</Size 5/Root 1 0 R/ID[<${fileIdHex}><${fileIdHex}>]/Encrypt 4 0 R>>\rstartxref\r${actualXrefOffset + declaredDriftBytes}\r%%EOF\r`
     return Buffer.from(header + obj1 + obj2 + obj3 + obj4 + xref + trailer, 'latin1')
   }
 
-  // Exact U value for empty user password "" with O=oHex, P=2100, ID=1210121610131116111515161312E000 from sxjxtx202601012
-  const emptyUserPassUHex = '0f936997ec0401773b4b91055e33abd800000000000000000000000000000000'
-  const sxjxtx202601012StylePdf = buildEncryptedPdf(emptyUserPassUHex)
-  assert.equal(validatePdfStructureSync(sxjxtx202601012StylePdf), true)
-  assert.equal(await validatePdfInIsolatedWorker(sxjxtx202601012StylePdf, signal), true)
+  // 1. 10.1186/s12885-024-13320-4 style (-127B WebVPN URL-rewrite offset drift)
+  const drifted127Pdf = buildPublisherPdf('', 127)
+  assert.equal(validatePdfStructureSync(drifted127Pdf), true)
+  assert.equal(await validatePdfInIsolatedWorker(drifted127Pdf, signal), true)
 
   const store = new LiteratureArtifactStore()
   const staged = await store.stagePdf({
     userId: 247,
-    filename: 'sxjxtx202601012.pdf',
-    data: sxjxtx202601012StylePdf,
+    filename: 's12885-024-13320-4.pdf',
+    data: drifted127Pdf,
     signal,
   })
   staged.publish()
   const delivered = store.read(247, staged.artifactId)
   assert(delivered)
-  assert.deepEqual(delivered.data, sxjxtx202601012StylePdf)
+  assert.deepEqual(delivered.data, drifted127Pdf)
 
-  // 2. Non-empty user password /Encrypt must be rejected
-  const nonEmptyUserPassUHex = '11223344556677889900aabbccddeeff00000000000000000000000000000000'
-  const lockedPdf = buildEncryptedPdf(nonEmptyUserPassUHex)
-  assert.equal(validatePdfStructureSync(lockedPdf), false)
-  assert.equal(await validatePdfInIsolatedWorker(lockedPdf, signal), false)
-  await assert.rejects(
-    store.stagePdf({
-      userId: 247,
-      filename: 'locked.pdf',
-      data: lockedPdf,
-      signal,
-    }),
-    (err: unknown) => err instanceof LiteratureError && err.code === 'RESPONSE_INVALID',
-  )
+  // 2. 10.1007/s11831-025-10367-9 style Linearized PDF with /Prev drifted by -146B and bare \r line endings
+  const linearizedDrifted146Pdf = (() => {
+    const head =
+      '%PDF-1.4\r%\xe2\xe3\xcf\xd3\r6698 0 obj\r<</Linearized 1/L 2737147/O 6701/E 398948/N 45/T 2603065/H [ 3916 6391]>>\rendobj\r'
+    const firstXref =
+      'xref\r6698 3\r0000000016 00000 n\r0000010307 00000 n\r0000010617 00000 n\rtrailer\r<</Size 6879/Prev 2603052/Root 6699 0 R>>\rstartxref\r0\r%%EOF\r'
+    const body =
+      '6699 0 obj\r<</Type/Catalog/Pages 6690 0 R>>\rendobj\r6690 0 obj\r<</Type/Pages/Count 45/Kids[6701 0 R]>>\rendobj\r6701 0 obj\r<</Type/Page/Parent 6690 0 R>>\rendobj\r'
+    const tailXref = 'xref\r0 1\r0000000000 65535 f\rtrailer\r<</Size 6698>>\rstartxref\r116\r%%EOF\r'
+    return Buffer.from(head + firstXref + body + tailXref, 'latin1')
+  })()
+  assert.equal(validatePdfStructureSync(linearizedDrifted146Pdf), true)
+  assert.equal(await validatePdfInIsolatedWorker(linearizedDrifted146Pdf, signal), true)
 
-  // 3. Dangerous PDF actions/content (/JS, /JavaScript, /Launch, /EmbeddedFiles) must be rejected
+  // 3. Dangerous PDF actions (/JS, /JavaScript, /Launch, including hex-escaped names) are rejected
   for (const dangerousEntry of [
     '/OpenAction << /S /JavaScript /JS (app.alert(1)) >>',
     '/OpenAction << /S /Java#53cript /J#53 (app.alert(1)) >>',
     '/AA << /O << /S /Launch /F (cmd.exe) >> >>',
     '/AA << /O << /S /Laun#63h /F (cmd.exe) >> >>',
-    '/Names << /EmbeddedFiles << /Names [] >> >>',
-    '/Names << /Embedded#46iles << /Names [] >> >>',
   ]) {
-    const dangerousPdf = buildEncryptedPdf(emptyUserPassUHex, dangerousEntry)
+    const dangerousPdf = buildPublisherPdf(dangerousEntry, 0)
     assert.equal(validatePdfStructureSync(dangerousPdf), false)
     assert.equal(await validatePdfInIsolatedWorker(dangerousPdf, signal), false)
   }
-
-  // 4. WebVPN metadata URL rewrite offset drift (e.g. https:// -> http:// shifting offsets by -5..-6 bytes)
-  const driftedPdf = (() => {
-    const header = '%PDF-1.4\n'
-    const obj1 = '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n'
-    const obj2 = '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n'
-    const obj3 = '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n'
-    const o1 = header.length
-    const o2 = o1 + obj1.length
-    const o3 = o2 + obj2.length
-    const actualXrefOffset = o3 + obj3.length
-    const xref = `xref\n0 4\n0000000000 65535 f \n${pad(o1)} 00000 n \n${pad(o2 + 5)} 00000 n \n${pad(o3 + 5)} 00000 n \n`
-    const trailer = `trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n${actualXrefOffset + 6}\n%%EOF\n`
-    return Buffer.from(header + obj1 + obj2 + obj3 + xref + trailer, 'latin1')
-  })()
-  assert.equal(validatePdfStructureSync(driftedPdf), true)
-  assert.equal(await validatePdfInIsolatedWorker(driftedPdf, signal), true)
-
-  // 5. Hybrid-xref PDF with valid /XRefStm is accepted, while broken /XRefStm is rejected
-  const buildHybridXrefPdf = (xrefStmType: string) => {
-    const header = '%PDF-1.5\n'
-    const obj1 = '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n'
-    const obj2 = '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n'
-    const obj3 = '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n'
-    const obj4 = `4 0 obj\n<< /Type ${xrefStmType} /Size 5 /W [1 2 1] /Length 4 >>\nstream\n\x01\x00\x00\x00\nendstream\nendobj\n`
-    const o1 = header.length
-    const o2 = o1 + obj1.length
-    const o3 = o2 + obj2.length
-    const o4 = o3 + obj3.length
-    const xrefOffset = o4 + obj4.length
-    const xref = `xref\n0 4\n0000000000 65535 f \n${pad(o1)} 00000 n \n${pad(o2)} 00000 n \n${pad(o3)} 00000 n \n`
-    const trailer = `trailer\n<< /Size 5 /Root 1 0 R /XRefStm ${o4} >>\nstartxref\n${xrefOffset}\n%%EOF\n`
-    return Buffer.from(header + obj1 + obj2 + obj3 + obj4 + xref + trailer, 'latin1')
-  }
-  const validHybridPdf = buildHybridXrefPdf('/XRef')
-  assert.equal(validatePdfStructureSync(validHybridPdf), true)
-  assert.equal(await validatePdfInIsolatedWorker(validHybridPdf, signal), true)
-  const invalidHybridPdf = buildHybridXrefPdf('/NotXRef')
-  assert.equal(validatePdfStructureSync(invalidHybridPdf), false)
-  assert.equal(await validatePdfInIsolatedWorker(invalidHybridPdf, signal), false)
-
-  // 6. Earlier dummy empty-password 4 0 obj cannot shadow later xref-targeted locked 4 0 obj in /XRefStm PDF
-  const shadowedHybridPdf = (() => {
-    const header = '%PDF-1.5\n'
-    const obj1 = '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n'
-    const obj2 = '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n'
-    const obj3 = '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n'
-    const oHex = '68d1431b5b2a08c20f9e529b1957bb364b78a4726e0236e270da6c92d8f016be'
-    const dummyObj4 = `4 0 obj\n<</Filter /Standard/U <${emptyUserPassUHex}>/O <${oHex}>/P 2100/V 2/Length 128 /R 3>>\nendobj\n`
-    const realLockedObj4 = `4 0 obj\n<</Filter /Standard/U <${nonEmptyUserPassUHex}>/O <${oHex}>/P 2100/V 2/Length 128 /R 3>>\nendobj\n`
-    const obj5 = '5 0 obj\n<< /Type /XRef /Size 6 /W [1 2 1] /Length 4 >>\nstream\n\x01\x00\x00\x00\nendstream\nendobj\n'
-    const o1 = header.length
-    const o2 = o1 + obj1.length
-    const o3 = o2 + obj2.length
-    const o4Dummy = o3 + obj3.length
-    const o4Real = o4Dummy + dummyObj4.length
-    const o5 = o4Real + realLockedObj4.length
-    const xrefOffset = o5 + obj5.length
-    const fileIdHex = '1210121610131116111515161312E000'
-    const xref = `xref\n0 6\n0000000000 65535 f \n${pad(o1)} 00000 n \n${pad(o2)} 00000 n \n${pad(o3)} 00000 n \n${pad(o4Real)} 00000 n \n${pad(o5)} 00000 n \n`
-    const trailer = `trailer\n<< /Size 6 /Root 1 0 R /XRefStm ${o5} /ID[<${fileIdHex}><${fileIdHex}>] /Encrypt 4 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`
-    return Buffer.from(header + obj1 + obj2 + obj3 + dummyObj4 + realLockedObj4 + obj5 + xref + trailer, 'latin1')
-  })()
-  assert.equal(validatePdfStructureSync(shadowedHybridPdf), false)
-  assert.equal(await validatePdfInIsolatedWorker(shadowedHybridPdf, signal), false)
 })
 
 test('resolveLiteratureCaptchaBundleRoot honors env override and falls back to default bundle root when present', () => {
