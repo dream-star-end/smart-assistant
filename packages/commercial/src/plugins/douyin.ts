@@ -1,6 +1,9 @@
 /**
  * Douyin managed-browser runtime (OCV5-553). Ported from the reviewed Bilibili account runtime
  * (biliAccount.ts); this version is read-only (QR login + `me`). Writes arrive in a later version.
+ * Login workers additionally take command frames on stdin for the account owner's SMS
+ * verification (design 4.3.C): the master writes `send_sms` / `sms_code` / `resend_sms` / `abort`;
+ * the code frame buffer is zeroed right after the write.
  *
  * Structure follows the reviewed Weibo runtime (weibo.ts): one pinned-image worker container per
  * call, NetworkMode none + TLS CONNECT broker limited to the contract's IP pins, read-only rootfs,
@@ -149,12 +152,60 @@ interface CompletedEvent {
 interface QrEvent {
   event: 'qr'
   png: Buffer
+  /** 服务端给这个码的过期时间（epoch ms）。 */
+  expireAt: number
+}
+/** 扫码后抖音要求本人验证（OCV5-553 4.3.C）。只有短信这条路由我们代为提交。 */
+interface VerificationEvent {
+  event: 'verification'
+  kind: 'sms_available' | 'unsupported'
+}
+interface SmsSentEvent {
+  event: 'sms_sent'
+  resendAfterSec: number
+}
+interface SmsRejectedEvent {
+  event: 'sms_rejected'
+}
+interface SmsResendFailedEvent {
+  event: 'sms_resend_failed'
+}
+/** worker 作废了当前二维码（换码 / 502）：master 立即撤下缓存的码。 */
+interface QrInvalidEvent {
+  event: 'qr_invalid'
 }
 interface AuthenticatedEvent {
   event: 'authenticated'
   storageState: unknown
 }
-type WorkerEvent = ReadyEvent | FailedEvent | CompletedEvent | QrEvent | AuthenticatedEvent
+type WorkerEvent =
+  | ReadyEvent
+  | FailedEvent
+  | CompletedEvent
+  | QrEvent
+  | AuthenticatedEvent
+  | VerificationEvent
+  | SmsSentEvent
+  | SmsRejectedEvent
+  | SmsResendFailedEvent
+  | QrInvalidEvent
+
+/** 只在登录 worker 里出现的非终止帧。 */
+const LOGIN_ONLY_EVENTS = new Set([
+  'qr',
+  'qr_invalid',
+  'verification',
+  'sms_sent',
+  'sms_rejected',
+  'sms_resend_failed',
+])
+
+/** master → 登录 worker 的命令帧（stdin）。验证码只在内存里，写出后立即清零。 */
+export type DouyinLoginCommand =
+  | { cmd: 'send_sms' }
+  | { cmd: 'resend_sms' }
+  | { cmd: 'abort' }
+  | { cmd: 'sms_code'; code: string }
 
 const TERMINAL_EVENTS = new Set(['failed', 'completed', 'authenticated'])
 
@@ -198,8 +249,34 @@ function parseWorkerEvent(value: unknown): WorkerEvent {
     exactEventKeys(event, ['event', 'storageState'])
     return event as unknown as AuthenticatedEvent
   }
+  if (event.event === 'verification') {
+    exactEventKeys(event, ['event', 'kind'])
+    if (event.kind !== 'sms_available' && event.kind !== 'unsupported')
+      throw new DouyinRuntimeError('PROTOCOL', 'worker verification frame is invalid')
+    return event as unknown as VerificationEvent
+  }
+  if (event.event === 'sms_sent') {
+    exactEventKeys(event, ['event', 'resendAfterSec'])
+    if (
+      !Number.isSafeInteger(event.resendAfterSec) ||
+      (event.resendAfterSec as number) < 0 ||
+      (event.resendAfterSec as number) > 600
+    )
+      throw new DouyinRuntimeError('PROTOCOL', 'worker sms frame is invalid')
+    return event as unknown as SmsSentEvent
+  }
+  if (
+    event.event === 'sms_rejected' ||
+    event.event === 'sms_resend_failed' ||
+    event.event === 'qr_invalid'
+  ) {
+    exactEventKeys(event, ['event'])
+    return event as unknown as SmsRejectedEvent | SmsResendFailedEvent | QrInvalidEvent
+  }
   if (event.event === 'qr') {
-    exactEventKeys(event, ['event', 'png'])
+    exactEventKeys(event, ['event', 'png', 'expireAt'])
+    if (!Number.isSafeInteger(event.expireAt) || (event.expireAt as number) <= 0)
+      throw new DouyinRuntimeError('PROTOCOL', 'worker QR frame is invalid')
     if (typeof event.png !== 'string' || event.png.length > 700_000)
       throw new DouyinRuntimeError('PROTOCOL', 'worker QR frame is invalid')
     const png = Buffer.from(event.png, 'base64')
@@ -209,7 +286,7 @@ function parseWorkerEvent(value: unknown): WorkerEvent {
       !png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
     )
       throw new DouyinRuntimeError('PROTOCOL', 'worker QR image is invalid')
-    return { event: 'qr', png }
+    return { event: 'qr', png, expireAt: event.expireAt as number }
   }
   throw new DouyinRuntimeError('PROTOCOL', 'worker event is unsupported')
 }
@@ -341,12 +418,16 @@ interface ActiveWorker {
   broker: ManagedBrowserBrokerHandle
   done: Promise<WorkerEvent[]>
   kind: 'action' | 'login'
+  /** 向 worker stdin 写一帧（只用于登录 worker 的命令）。 */
+  send(value: DouyinLoginCommand): Promise<void>
 }
 
 export interface DouyinLoginWorkerHandle {
   sessionId: string
   done: Promise<void>
   stop(): Promise<void>
+  /** 发命令给登录 worker（发短信 / 提交验证码 / 重发 / 放弃）。 */
+  command(value: DouyinLoginCommand): Promise<void>
 }
 
 export class DouyinDockerService {
@@ -630,7 +711,8 @@ export class DouyinDockerService {
         // 登录 worker 只能以 authenticated / failed 结束,动作 worker 只能以 completed / failed 结束。
         if (
           (args.kind === 'login' && event.event === 'completed') ||
-          (args.kind === 'action' && (event.event === 'authenticated' || event.event === 'qr'))
+          (args.kind === 'action' &&
+            (event.event === 'authenticated' || LOGIN_ONLY_EVENTS.has(event.event)))
         )
           throw new DouyinRuntimeError('PROTOCOL', 'worker event does not match its mode')
         events.push(event)
@@ -737,7 +819,23 @@ export class DouyinDockerService {
         if (!completed) throw failure
         return completed
       })()
-      const active = { container: current, broker, done, kind: args.kind }
+      const liveStream = stream!
+      const send = (value: DouyinLoginCommand): Promise<void> => {
+        if (args.kind !== 'login')
+          return Promise.reject(
+            new DouyinRuntimeError('PROTOCOL', 'only login workers take commands'),
+          )
+        const bytes = frame(value)
+        return new Promise<void>((resolveWrite, rejectWrite) => {
+          liveStream.write(bytes, (error) => {
+            bytes.fill(0)
+            if (error)
+              rejectWrite(new DouyinRuntimeError('PROTOCOL', 'worker command write failed'))
+            else resolveWrite()
+          })
+        })
+      }
+      const active = { container: current, broker, done, kind: args.kind, send }
       if (args.signal?.aborted) throw args.signal.reason
       this.active.set(args.key, active)
       return active
@@ -793,9 +891,14 @@ export class DouyinDockerService {
     sessionId: string
     pins: readonly ManagedBrowserPinnedOrigin[]
     deadlineMs: number
-    onQr: (png: Buffer) => void
+    onQr: (png: Buffer, expireAt: number) => void
+    onQrInvalid?: () => void
     onAuthenticated: (storageState: unknown) => void
     onFailed: (code: string) => void
+    onVerification?: (kind: 'sms_available' | 'unsupported') => void
+    onSmsSent?: (resendAfterSec: number) => void
+    onSmsRejected?: () => void
+    onSmsResendFailed?: () => void
   }): Promise<DouyinLoginWorkerHandle> {
     const worker = await this.startWorker({
       key: `login:${args.sessionId}`,
@@ -809,15 +912,21 @@ export class DouyinDockerService {
         stateOrigins: DOUYIN_PLUGIN_CONTRACT.runtime.accountState.origins,
       },
       onEvent: (event) => {
-        if (event.event === 'qr') args.onQr(event.png)
+        if (event.event === 'qr') args.onQr(event.png, event.expireAt)
+        else if (event.event === 'qr_invalid') args.onQrInvalid?.()
         else if (event.event === 'authenticated') args.onAuthenticated(event.storageState)
         else if (event.event === 'failed') args.onFailed(event.code)
+        else if (event.event === 'verification') args.onVerification?.(event.kind)
+        else if (event.event === 'sms_sent') args.onSmsSent?.(event.resendAfterSec)
+        else if (event.event === 'sms_rejected') args.onSmsRejected?.()
+        else if (event.event === 'sms_resend_failed') args.onSmsResendFailed?.()
       },
     })
     return {
       sessionId: args.sessionId,
       done: worker.done.then(() => undefined),
       stop: () => this.terminate(`login:${args.sessionId}`),
+      command: (value) => worker.send(value),
     }
   }
 

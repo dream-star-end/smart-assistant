@@ -9,7 +9,7 @@ import type {
 } from '../../../lib/connectors'
 import { managedPluginProvider, managedSetupFailureText } from '../../../lib/managedPluginProviders'
 import type { AuthSession } from '../../../lib/types'
-import { Alert, Button, Modal, Skeleton, Spinner } from '../../ui'
+import { Alert, Button, Input, Modal, Skeleton, Spinner } from '../../ui'
 import { errText } from './shared'
 
 export function ManagedBrowserSetupDialog({
@@ -34,6 +34,10 @@ export function ManagedBrowserSetupDialog({
   const [error, setError] = useState<string | null>(null)
   const [reportedActive, setReportedActive] = useState(false)
   const [cancelling, setCancelling] = useState(false)
+  // 本人短信验证（抖音，OCV5-553 4.3.C）：验证码只在输入框里，提交后立即清空。
+  const [smsCode, setSmsCode] = useState('')
+  const [smsBusy, setSmsBusy] = useState(false)
+  const [nowMs, setNowMs] = useState(() => Date.now())
   const setupSessionId = setup?.sessionId ?? null
   const setupStatus = setup?.status ?? null
   const setupQrReady = setup?.qrReady === true
@@ -88,7 +92,7 @@ export function ManagedBrowserSetupDialog({
     if (
       !setupSessionId ||
       !setupStatus ||
-      !['waiting_for_scan', 'finalizing'].includes(setupStatus)
+      !['waiting_for_scan', 'waiting_for_sms', 'finalizing'].includes(setupStatus)
     )
       return
     let cancelled = false
@@ -185,6 +189,16 @@ export function ManagedBrowserSetupDialog({
     setupSessionId,
   ])
 
+  // 倒计时（二维码剩余秒数、短信验证截止、可重发时间）每秒刷新一次。
+  const ticking = Boolean(setup?.qrExpireAt || setup?.sms)
+  useEffect(() => {
+    if (!ticking) return
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [ticking])
+  const secondsUntil = (iso: string | undefined) =>
+    iso ? Math.max(0, Math.ceil((Date.parse(iso) - nowMs) / 1000)) : 0
+
   useEffect(() => {
     if (setupStatus !== 'active' || reportedActive) return
     if (relinkAccountId && setup?.accountId !== relinkAccountId) {
@@ -229,7 +243,7 @@ export function ManagedBrowserSetupDialog({
   const close = async () => {
     if (cancelling) return
     if (setup?.status === 'finalizing') return
-    if (setup?.status === 'waiting_for_scan') {
+    if (setup?.status === 'waiting_for_scan' || setup?.status === 'waiting_for_sms') {
       setCancelling(true)
       setError(null)
       try {
@@ -244,8 +258,39 @@ export function ManagedBrowserSetupDialog({
     onClose()
   }
 
+  const submitSms = async () => {
+    const sms = provider.sms
+    const code = smsCode.trim()
+    if (!sms || !setup || smsBusy || !/^[0-9]{4,8}$/.test(code)) return
+    setSmsBusy(true)
+    setSmsCode('')
+    setError(null)
+    try {
+      setSetup(await sms.submit(auth, setup.sessionId, code))
+    } catch (e) {
+      setError(errText(e, '提交验证码失败，请重试'))
+    } finally {
+      setSmsBusy(false)
+    }
+  }
+
+  const resendSms = async () => {
+    const sms = provider.sms
+    if (!sms || !setup || smsBusy) return
+    setSmsBusy(true)
+    setError(null)
+    try {
+      setSetup(await sms.resend(auth, setup.sessionId))
+    } catch (e) {
+      setError(errText(e, '重发验证码失败，请稍后再试'))
+    } finally {
+      setSmsBusy(false)
+    }
+  }
+
   const retry = () => {
     if (qrUrl) URL.revokeObjectURL(qrUrl)
+    setSmsCode('')
     setQrUrl(null)
     setSetup(null)
     setError(null)
@@ -320,7 +365,10 @@ export function ManagedBrowserSetupDialog({
               const current =
                 setupPhase === 'generating_qr'
                   ? 0
-                  : setupPhase === 'waiting_for_scan'
+                  : setupPhase === 'waiting_for_scan' ||
+                      setupPhase === 'sms_required' ||
+                      setupPhase === 'sms_sent' ||
+                      setupPhase === 'sms_verifying'
                     ? 1
                     : setupPhase === 'scan_confirmed' || setupPhase === 'saving'
                       ? 2
@@ -374,6 +422,13 @@ export function ManagedBrowserSetupDialog({
                   ? `二维码已生成 · 请使用${scanner}扫码，并在手机上确认登录`
                   : '正在加载二维码…'}
             </output>
+            {qrUrl && setup.qrExpireAt && (
+              <output className="text-center text-caption text-faint" aria-live="off">
+                {secondsUntil(setup.qrExpireAt) > 0
+                  ? `这个二维码还剩 ${secondsUntil(setup.qrExpireAt)} 秒，过期后会自动换新`
+                  : '二维码正在换新…'}
+              </output>
+            )}
             {qrUrl && (
               <a
                 href={qrUrl}
@@ -384,6 +439,78 @@ export function ManagedBrowserSetupDialog({
               >
                 <ExternalLink size={12} /> 单独打开二维码
               </a>
+            )}
+          </div>
+        )}
+        {setup?.status === 'waiting_for_sms' && provider.sms && (
+          <div className="flex flex-col gap-3" aria-label={`${label}本人短信验证`}>
+            {setupPhase === 'sms_required' || !setup.sms?.sent ? (
+              <output
+                className="flex items-center justify-center gap-2 py-6 text-body text-muted"
+                aria-live="polite"
+              >
+                <Spinner /> {label}要求本人验证 · 正在向这个账号绑定的手机发送验证码…
+              </output>
+            ) : (
+              <>
+                <p className="text-meta leading-relaxed text-muted">
+                  {label}要求本人验证：验证码已发送到这个账号绑定的手机。请在{' '}
+                  <strong className="text-fg">{secondsUntil(setup.sms?.deadline)} 秒</strong>
+                  内输入（我们只代为提交，不保存验证码）。
+                </p>
+                {setup.sms?.rejected && (
+                  <Alert tone="warning" density="compact">
+                    验证码不正确，还可以再试 {setup.sms.attemptsLeft} 次。
+                  </Alert>
+                )}
+                {setup.errorCode === 'SMS_RESEND_FAILED' && (
+                  <Alert tone="warning" density="compact">
+                    重发没有成功，请稍后再试或直接输入已收到的验证码。
+                  </Alert>
+                )}
+                <form
+                  className="flex items-end gap-2"
+                  onSubmit={(e) => {
+                    e.preventDefault()
+                    void submitSms()
+                  }}
+                >
+                  <label className="flex min-w-0 flex-1 flex-col gap-1.5 text-sm font-medium text-fg">
+                    短信验证码
+                    <Input
+                      aria-label="短信验证码"
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                      maxLength={8}
+                      value={smsCode}
+                      disabled={smsBusy || setupPhase === 'sms_verifying'}
+                      onChange={(e) => setSmsCode(e.target.value.replace(/[^0-9]/g, ''))}
+                    />
+                  </label>
+                  <Button
+                    type="submit"
+                    variant="primary"
+                    size="sm"
+                    loading={smsBusy || setupPhase === 'sms_verifying'}
+                    disabled={!/^[0-9]{4,8}$/.test(smsCode)}
+                  >
+                    提交
+                  </Button>
+                </form>
+                <div className="flex items-center justify-between text-caption text-faint">
+                  <span>剩余可提交 {setup.sms?.attemptsLeft ?? 0} 次</span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={smsBusy || secondsUntil(setup.sms?.resendAfter) > 0}
+                    onClick={() => void resendSms()}
+                  >
+                    {secondsUntil(setup.sms?.resendAfter) > 0
+                      ? `${secondsUntil(setup.sms?.resendAfter)} 秒后可重发`
+                      : '重发验证码'}
+                  </Button>
+                </div>
+              </>
             )}
           </div>
         )}

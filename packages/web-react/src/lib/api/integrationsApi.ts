@@ -989,6 +989,31 @@ export const integrationsApi = {
       ),
     ),
 
+  // OCV5-553 4.3.C: 扫码后的本人短信验证。验证码只在这次请求里经过,不在前端保存。
+  submitDouyinSms: (a: AuthSession, sessionId: string, code: string): Promise<KnowledgePlanetSetupView> =>
+    jsonOrThrow<KnowledgePlanetSetupView>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/douyin/setup/${encodeURIComponent(sessionId)}/sms`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: JSON.stringify({ code }),
+        }),
+      ),
+    ),
+
+  resendDouyinSms: (a: AuthSession, sessionId: string): Promise<KnowledgePlanetSetupView> =>
+    jsonOrThrow<KnowledgePlanetSetupView>(
+      callWithRefresh(a, (t) =>
+        fetch(`/api/plugins/douyin/setup/${encodeURIComponent(sessionId)}/sms/resend`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(t, true),
+          body: "{}",
+        }),
+      ),
+    ),
+
   revokePluginAccount: (a: AuthSession, id: string): Promise<void> =>
     jsonOrThrow<unknown>(
       callWithRefresh(a, (t) =>
