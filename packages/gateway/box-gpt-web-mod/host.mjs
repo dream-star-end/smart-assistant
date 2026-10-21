@@ -3,17 +3,17 @@
  * Box ChatGPT Web Pro Interactive Runner Host (OCV5-551).
  *
  * Speaks V5 Route B stream-json over stdin/stdout (identical framing to cursorBoxCcBridge)
- * while driving a persistent real Google Chrome session on Box DISPLAY=:1 via CDP (127.0.0.1:9229).
+ * while driving a persistent real Google Chrome session on Box DISPLAY=:1 via CDP.
  */
 
 import { spawn } from 'node:child_process'
 import http from 'node:http'
 import os from 'node:os'
+import path from 'node:path'
 import readline from 'node:readline'
 import { pathToFileURL } from 'node:url'
 
 import {
-  DEFAULT_CDP_PORT,
   DEFAULT_CHATGPT_ORIGIN,
   DEFAULT_CHROME_BIN,
   DEFAULT_DISPLAY,
@@ -22,17 +22,24 @@ import {
   SseAccumulator,
   backendFetchTeeInitScript,
   buildChromeLaunchArgs,
+  cdpPortForProfile,
   computeAdaptiveDeadline,
   extractAssistantFromMapping,
-  extractUserTurnFromStdinFrame,
   formatStreamJsonAssistantMessage,
+  formatStreamJsonControlResponse,
   formatStreamJsonResult,
   formatStreamJsonSystemInit,
   formatStreamJsonTextDelta,
   formatStreamJsonThinkingDelta,
+  isChatGptOriginUrl,
+  isPidAlive,
+  parseStdinFrame,
   probeSessionState,
   profileDirFor,
+  readProfileSingletonOwner,
+  saveSessionConversationId,
   selectProTierInPage,
+  syncPageToSessionConversation,
   typeMultilinePreservingAttachments,
   uploadAttachmentsToComposer,
   validateLocalOnlyProxy,
@@ -40,19 +47,21 @@ import {
 } from './chatgptWebCore.mjs'
 
 function parseCliArgs(argv) {
+  const profile = process.env.OC_BOX_GPT_WEB_PROFILE || DEFAULT_PROFILE
   const out = {
     model: 'gpt-6-astra-pro',
     catalogModel: 'box-gpt-6-astra-pro',
     sessionId: `gpt-web-pro-${Date.now()}`,
-    profile: process.env.OC_BOX_GPT_WEB_PROFILE || DEFAULT_PROFILE,
+    profile,
     display: process.env.OC_BOX_GPT_WEB_DISPLAY || DEFAULT_DISPLAY,
-    cdpPort: Number(process.env.OC_BOX_GPT_WEB_CDP_PORT || DEFAULT_CDP_PORT),
+    cdpPort: cdpPortForProfile(profile, process.env.OC_BOX_GPT_WEB_CDP_PORT),
     proxyUrl: process.env.OC_BOX_GPT_WEB_PROXY || null,
     chromeBin: process.env.OC_BOX_GPT_WEB_CHROME_BIN || DEFAULT_CHROME_BIN,
     playwrightPath:
       process.env.OC_BOX_GPT_WEB_PLAYWRIGHT_PATH ||
       '/usr/local/lib/pnpm/5/.pnpm/playwright-core@1.59.1/node_modules/playwright-core/index.mjs',
   }
+  let explicitCdpPort = process.env.OC_BOX_GPT_WEB_CDP_PORT || null
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--model' && argv[i + 1]) {
@@ -62,11 +71,12 @@ function parseCliArgs(argv) {
     } else if (a === '--profile' && argv[i + 1]) {
       out.profile = argv[++i]
     } else if (a === '--cdp-port' && argv[i + 1]) {
-      out.cdpPort = Number(argv[++i])
+      explicitCdpPort = argv[++i]
     } else if (a === '--proxy' && argv[i + 1]) {
       out.proxyUrl = argv[++i]
     }
   }
+  out.cdpPort = cdpPortForProfile(out.profile, explicitCdpPort)
   return out
 }
 
@@ -93,9 +103,30 @@ function checkCdpAlive(port, timeoutMs = 1200) {
 
 async function ensureRealChromeOnCdp(cfg, profileDir) {
   const validatedProxy = validateLocalOnlyProxy(cfg.proxyUrl)
+  const owner = readProfileSingletonOwner(profileDir)
+
   if (await checkCdpAlive(cfg.cdpPort)) {
+    if (!owner.locked || !owner.ownsProfile || owner.cdpPort !== cfg.cdpPort) {
+      throw new Error(
+        `BOX_GPT_WEB_CDP_PROFILE_MISMATCH: port 127.0.0.1:${cfg.cdpPort} is not owned by profile ${profileDir}`,
+      )
+    }
     return
   }
+
+  // If the profile is currently held by a manually-launched Chrome without --remote-debugging-port,
+  // gracefully send SIGTERM to that exact main PID so it flushes cookies/storage cleanly before we relaunch with CDP.
+  if (owner.locked && owner.ownsProfile && owner.pid && owner.cdpPort !== cfg.cdpPort) {
+    try {
+      process.kill(owner.pid, 'SIGTERM')
+    } catch {}
+    const handoffDeadline = Date.now() + 8_000
+    while (Date.now() < handoffDeadline) {
+      if (!isPidAlive(owner.pid)) break
+      await new Promise((r) => setTimeout(r, 150))
+    }
+  }
+
   const args = buildChromeLaunchArgs({
     profileDir,
     cdpPort: cfg.cdpPort,
@@ -138,16 +169,16 @@ async function acquireSingleChatGptPage(browser) {
   await context.addInitScript(backendFetchTeeInitScript())
 
   const pages = context.pages()
-  let target = pages.find((p) => p.url().startsWith(DEFAULT_CHATGPT_ORIGIN)) || pages[0]
+  let target = pages.find((p) => isChatGptOriginUrl(p.url())) || pages[0]
   if (!target) {
     target = await context.newPage()
   }
   for (const p of pages) {
-    if (p !== target && p.url().startsWith(DEFAULT_CHATGPT_ORIGIN)) {
+    if (p !== target) {
       await p.close().catch(() => {})
     }
   }
-  if (!target.url().startsWith(DEFAULT_CHATGPT_ORIGIN)) {
+  if (!isChatGptOriginUrl(target.url())) {
     await target.goto(`${DEFAULT_CHATGPT_ORIGIN}/`, {
       waitUntil: 'domcontentloaded',
       timeout: 45_000,
@@ -161,184 +192,272 @@ async function rescueFromDomOrMapping(page) {
   await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {})
   await new Promise((r) => setTimeout(r, 1500))
   const rescued = await page.evaluate(async () => {
-    const m = location.pathname.match(/\/c\/([0-9a-f-]{20,})/i)
+    const m = location.pathname.match(/\/c\/([a-z0-9_-]{8,128})/i)
     if (m) {
       try {
         const r = await fetch(`/backend-api/conversation/${m[1]}`, { credentials: 'include' })
         if (r.ok) {
           const conv = await r.json()
-          return { conv, domText: null }
+          return { conv, domText: null, convId: m[1] }
         }
       } catch {}
     }
-    const turns = document.querySelectorAll('[data-message-author-role="assistant"]')
-    const last = turns.length > 0 ? turns[turns.length - 1] : null
-    return { conv: null, domText: last ? (last.innerText || '').trim() : null }
+    return { conv: null, domText: null, convId: m ? m[1] : null }
   })
   if (rescued.conv) {
     const fromMap = extractAssistantFromMapping(rescued.conv)
-    if (fromMap?.text) return fromMap.text
+    if (fromMap?.text) return { text: fromMap.text, convId: rescued.convId }
   }
-  return rescued.domText || null
+  return null
 }
 
-async function executeTurnOnBrowser(cfg, turn) {
+async function stopActiveGenerationInPage(page) {
+  if (!page) return
+  try {
+    const stopBtn = page.locator('[data-testid="stop-button"], button[aria-label*="Stop"]').first()
+    if ((await stopBtn.count()) > 0) {
+      await stopBtn.click({ timeout: 2_000 }).catch(() => {})
+    }
+  } catch {}
+}
+
+async function executeTurnOnBrowser(cfg, turn, turnControl) {
   const profileDir = profileDirFor(cfg.profile, os.homedir())
-  const lockPath = `${profileDir}.lock`
+  const profileLockPath = `${profileDir}.lock`
+  const portLockPath = path.join(os.tmpdir(), `.chatgpt-pro-cdp-${cfg.cdpPort}.lock`)
 
-  return withProfileFileLock(lockPath, async () => {
-    await ensureRealChromeOnCdp(cfg, profileDir)
-    const chromium = await loadPlaywrightChromium(cfg.playwrightPath)
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${cfg.cdpPort}`)
-    const page = await acquireSingleChatGptPage(browser)
+  return withProfileFileLock(profileLockPath, () =>
+    withProfileFileLock(portLockPath, async () => {
+      if (turnControl.abort) {
+        throw new Error('BOX_GPT_WEB_INTERRUPTED: turn aborted before launch')
+      }
+      await ensureRealChromeOnCdp(cfg, profileDir)
+      const chromium = await loadPlaywrightChromium(cfg.playwrightPath)
+      const browser = await chromium.connectOverCDP(`http://127.0.0.1:${cfg.cdpPort}`)
+      const page = await acquireSingleChatGptPage(browser)
+      turnControl.page = page
 
-    const sessionProbe = await probeSessionState(page, {
-      profileDir,
-      display: cfg.display,
-    })
-    if (!sessionProbe.ok) {
-      throw new Error(sessionProbe.message)
-    }
-
-    await selectProTierInPage(page, { requestedTier: 'pro' })
-
-    if (turn.files && turn.files.length > 0) {
-      await uploadAttachmentsToComposer(page, turn.files)
-    }
-
-    await page.evaluate(() => {
-      window.__ocSseEvents = []
-    })
-
-    await typeMultilinePreservingAttachments(page, turn.text)
-
-    const sendBtn = page.locator('[data-testid="send-button"]').first()
-    await sendBtn.waitFor({ state: 'visible', timeout: 15_000 })
-    await sendBtn.click()
-
-    const acc = new SseAccumulator({
-      onThinkingDelta: (delta) => {
-        writeStdoutLine(formatStreamJsonThinkingDelta(delta))
-      },
-      onTextDelta: (delta) => {
-        writeStdoutLine(formatStreamJsonTextDelta(delta))
-      },
-    })
-
-    const startedAt = Date.now()
-    let currentDeadline = startedAt + 600_000
-    let stopGoneSince = null
-    let readCursor = 0
-
-    while (true) {
-      const batch = await page.evaluate((fromIdx) => {
-        const events = Array.isArray(window.__ocSseEvents) ? window.__ocSseEvents : []
-        const slice = events.slice(fromIdx)
-        const stopBtn = Boolean(
-          document.querySelector('[data-testid="stop-button"], button[aria-label*="Stop"]'),
-        )
-        return { slice, nextIdx: events.length, stopBtn }
-      }, readCursor)
-
-      readCursor = batch.nextIdx
-      for (const item of batch.slice) {
-        if (item.data) {
-          acc.feedDataLine(item.data)
-        } else if (item.error) {
-          acc.error = item.error
-        }
+      // Wait briefly if the page is still rendering its initial DOM
+      for (let i = 0; i < 10; i++) {
+        const probe = await probeSessionState(page, { profileDir, display: cfg.display })
+        if (probe.ok || probe.code === 'CF_CHALLENGE') break
+        await new Promise((r) => setTimeout(r, 300))
       }
 
-      if (acc.error) {
-        throw new Error(`BOX_GPT_WEB_SSE_ERROR: ${acc.error}`)
-      }
-      if (acc.done && acc.finalText.length > 0) {
-        return {
-          text: acc.finalText,
-          thinking: acc.thinkingText,
-          messageId: acc.messageId || `msg_${Date.now()}`,
-        }
-      }
-
-      const now = Date.now()
-      if (batch.stopBtn) {
-        stopGoneSince = null
-      } else if (stopGoneSince === null && now - startedAt > 3_000) {
-        stopGoneSince = now
-      }
-
-      const adaptive = computeAdaptiveDeadline({
-        startedAt,
-        now,
-        lastActivityAt: acc.lastEventAt,
-        stopVisible: batch.stopBtn,
-        stopGoneSince,
-        hasFinalText: acc.finalText.length > 0,
-        currentDeadline,
+      const sessionProbe = await probeSessionState(page, {
+        profileDir,
+        display: cfg.display,
       })
-      currentDeadline = adaptive.deadline
+      if (!sessionProbe.ok) {
+        throw new Error(sessionProbe.message)
+      }
 
-      if (adaptive.shouldRescue) {
-        const rescuedText = await rescueFromDomOrMapping(page)
-        if (rescuedText) {
-          if (rescuedText.length > acc.finalText.length) {
-            const delta = rescuedText.slice(acc.finalText.length)
-            writeStdoutLine(formatStreamJsonTextDelta(delta))
+      await syncPageToSessionConversation(page, {
+        profileDir,
+        sessionId: cfg.sessionId,
+      })
+
+      await selectProTierInPage(page, { requestedTier: 'pro' })
+
+      if (turn.files && turn.files.length > 0) {
+        await uploadAttachmentsToComposer(page, turn.files)
+      }
+
+      await page.evaluate(() => {
+        window.__ocSseEvents = []
+      })
+
+      await typeMultilinePreservingAttachments(page, turn.text)
+
+      if (turnControl.abort) {
+        throw new Error('BOX_GPT_WEB_INTERRUPTED: turn aborted before send')
+      }
+      const sendBtn = page.locator('[data-testid="send-button"]').first()
+      await sendBtn.waitFor({ state: 'visible', timeout: 15_000 })
+      if (turnControl.abort) {
+        throw new Error('BOX_GPT_WEB_INTERRUPTED: turn aborted before send')
+      }
+      await sendBtn.click()
+
+      const acc = new SseAccumulator({
+        onThinkingDelta: (delta) => {
+          writeStdoutLine(formatStreamJsonThinkingDelta(delta))
+        },
+        onTextDelta: (delta) => {
+          writeStdoutLine(formatStreamJsonTextDelta(delta))
+        },
+      })
+
+      const startedAt = Date.now()
+      let currentDeadline = startedAt + 600_000
+      let stopGoneSince = null
+      let readCursor = 0
+
+      while (true) {
+        if (turnControl.abort) {
+          await stopActiveGenerationInPage(page)
+          throw new Error('BOX_GPT_WEB_INTERRUPTED: turn interrupted by user')
+        }
+
+        const batch = await page.evaluate((fromIdx) => {
+          const events = Array.isArray(window.__ocSseEvents) ? window.__ocSseEvents : []
+          const slice = events.slice(fromIdx)
+          const stopBtn = Boolean(
+            document.querySelector('[data-testid="stop-button"], button[aria-label*="Stop"]'),
+          )
+          const urlMatch = location.pathname.match(/\/c\/([a-z0-9_-]{8,128})/i)
+          return {
+            slice,
+            nextIdx: events.length,
+            stopBtn,
+            urlConvId: urlMatch ? urlMatch[1] : null,
+          }
+        }, readCursor)
+
+        readCursor = batch.nextIdx
+        for (const item of batch.slice) {
+          if (item.data) {
+            acc.feedDataLine(item.data)
+          } else if (item.error) {
+            acc.error = item.error
+          }
+        }
+
+        const resolvedConvId = acc.conversationId || batch.urlConvId
+        if (resolvedConvId) {
+          saveSessionConversationId(profileDir, cfg.sessionId, resolvedConvId)
+        }
+
+        if (acc.error) {
+          throw new Error(`BOX_GPT_WEB_SSE_ERROR: ${acc.error}`)
+        }
+        if (acc.done && acc.finalText.length > 0) {
+          if (!resolvedConvId) {
+            const m = page.url().match(/\/c\/([a-z0-9_-]{8,128})/i)
+            if (m) saveSessionConversationId(profileDir, cfg.sessionId, m[1])
           }
           return {
-            text: rescuedText,
+            text: acc.finalText,
             thinking: acc.thinkingText,
             messageId: acc.messageId || `msg_${Date.now()}`,
           }
         }
-      }
 
-      if (!batch.stopBtn && acc.done) {
-        if (!acc.finalText) {
-          const rescuedText = await rescueFromDomOrMapping(page)
-          if (rescuedText) {
-            writeStdoutLine(formatStreamJsonTextDelta(rescuedText))
+        const now = Date.now()
+        if (batch.stopBtn) {
+          stopGoneSince = null
+        } else if (stopGoneSince === null && now - startedAt > 3_000) {
+          stopGoneSince = now
+        }
+
+        const adaptive = computeAdaptiveDeadline({
+          startedAt,
+          now,
+          lastActivityAt: acc.lastEventAt,
+          stopVisible: batch.stopBtn,
+          stopGoneSince,
+          hasFinalText: acc.finalText.length > 0,
+          currentDeadline,
+        })
+        currentDeadline = adaptive.deadline
+
+        if (adaptive.shouldRescue) {
+          const rescued = await rescueFromDomOrMapping(page)
+          if (rescued?.text) {
+            if (rescued.convId) {
+              saveSessionConversationId(profileDir, cfg.sessionId, rescued.convId)
+            }
+            if (rescued.text.length > acc.finalText.length) {
+              const delta = rescued.text.slice(acc.finalText.length)
+              writeStdoutLine(formatStreamJsonTextDelta(delta))
+            }
             return {
-              text: rescuedText,
+              text: rescued.text,
               thinking: acc.thinkingText,
               messageId: acc.messageId || `msg_${Date.now()}`,
             }
           }
         }
-        return {
-          text: acc.finalText,
-          thinking: acc.thinkingText,
-          messageId: acc.messageId || `msg_${Date.now()}`,
+
+        if (!batch.stopBtn && acc.done) {
+          if (!acc.finalText) {
+            const rescued = await rescueFromDomOrMapping(page)
+            if (rescued?.text) {
+              if (rescued.convId) {
+                saveSessionConversationId(profileDir, cfg.sessionId, rescued.convId)
+              }
+              writeStdoutLine(formatStreamJsonTextDelta(rescued.text))
+              return {
+                text: rescued.text,
+                thinking: acc.thinkingText,
+                messageId: acc.messageId || `msg_${Date.now()}`,
+              }
+            }
+          }
+          return {
+            text: acc.finalText,
+            thinking: acc.thinkingText,
+            messageId: acc.messageId || `msg_${Date.now()}`,
+          }
         }
-      }
 
-      if (adaptive.expired) {
-        throw new Error(
-          `BOX_GPT_WEB_PRO_TIMEOUT: turn exceeded adaptive deadline (${Math.round((now - startedAt) / 1000)}s)`,
-        )
-      }
+        if (adaptive.expired) {
+          await stopActiveGenerationInPage(page)
+          throw new Error(
+            `BOX_GPT_WEB_PRO_TIMEOUT: turn exceeded adaptive deadline (${Math.round((now - startedAt) / 1000)}s)`,
+          )
+        }
 
-      await new Promise((r) => setTimeout(r, 250))
-    }
-  })
+        await new Promise((r) => setTimeout(r, 250))
+      }
+    }),
+  )
 }
 
 async function main() {
   const cfg = parseCliArgs(process.argv.slice(2))
   const queue = new SerialJobQueue()
   let initEmitted = false
+  let activeTurnControl = null
+
+  const abortActiveTurn = () => {
+    if (activeTurnControl) {
+      activeTurnControl.abort = true
+      void stopActiveGenerationInPage(activeTurnControl.page)
+    }
+  }
+
+  process.on('SIGTERM', () => {
+    abortActiveTurn()
+    process.exit(0)
+  })
 
   const rl = readline.createInterface({
     input: process.stdin,
     crlfDelay: Number.POSITIVE_INFINITY,
   })
 
-  for await (const line of rl) {
-    const turn = extractUserTurnFromStdinFrame(line)
-    if (!turn) continue
+  rl.on('line', (line) => {
+    const frame = parseStdinFrame(line)
+    if (!frame) return
 
-    await queue.enqueue(async () => {
+    if (frame.kind === 'control_request') {
+      if (frame.subtype === 'interrupt') {
+        abortActiveTurn()
+      }
+      writeStdoutLine(
+        formatStreamJsonControlResponse({
+          requestId: frame.requestId,
+          subtype: 'success',
+        }),
+      )
+      return
+    }
+
+    void queue.enqueue(async () => {
       const turnStart = Date.now()
+      const turnControl = { abort: false, page: null }
+      activeTurnControl = turnControl
       if (!initEmitted) {
         initEmitted = true
         writeStdoutLine(
@@ -349,7 +468,7 @@ async function main() {
         )
       }
       try {
-        const out = await executeTurnOnBrowser(cfg, turn)
+        const out = await executeTurnOnBrowser(cfg, frame, turnControl)
         writeStdoutLine(
           formatStreamJsonAssistantMessage({
             messageId: out.messageId,
@@ -383,9 +502,20 @@ async function main() {
             durationMs: Date.now() - turnStart,
           }),
         )
+      } finally {
+        if (activeTurnControl === turnControl) {
+          activeTurnControl = null
+        }
       }
     })
-  }
+  })
+
+  await new Promise((resolve) => {
+    rl.on('close', () => {
+      // Wait for any queued work to drain before exiting
+      void queue.enqueue(async () => {}).then(resolve, resolve)
+    })
+  })
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {

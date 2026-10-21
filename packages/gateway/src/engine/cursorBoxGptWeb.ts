@@ -9,8 +9,8 @@
  * Node built-ins only: the bridge is spawned as plain node.
  */
 import { createHash } from 'node:crypto'
-import { readFileSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { existsSync, readFileSync, statSync } from 'node:fs'
+import { basename, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   BOX_CC_HOME,
@@ -112,7 +112,7 @@ export function validateBoxGptWebLoopbackProxy(proxyUrl: string | undefined | nu
     throw new Error(`BOX_GPT_WEB_PROXY_UNSUPPORTED_PROTOCOL: ${parsed.protocol}`)
   }
   const host = parsed.hostname.toLowerCase()
-  if (host !== '127.0.0.1' && host !== 'localhost' && host !== '[::1]' && host !== '::1') {
+  if (host !== '127.0.0.1' && host !== 'localhost') {
     throw new Error(`BOX_GPT_WEB_PROXY_NOT_LOOPBACK: ${parsed.hostname}`)
   }
   const port = Number(parsed.port)
@@ -123,6 +123,75 @@ export function validateBoxGptWebLoopbackProxy(proxyUrl: string | undefined | nu
     throw new Error(`BOX_GPT_WEB_PROXY_FORBIDDEN_PORT: ${port}`)
   }
   return `${parsed.protocol}//${parsed.hostname}:${port}`
+}
+
+/**
+ * Scans a Route B user JSON line for local gateway attachment paths (from `inboundDispatch`
+ * `buildImageAttachmentHint` / unparsed file hints or `files` array) and embeds their bytes
+ * as `inlineAttachments` so `host.mjs` on the Box can materialize and upload them to ChatGPT Web.
+ */
+export function inlineGptWebAttachmentsInUserLine(line: string): string {
+  const trimmed = line.trim()
+  if (!trimmed.startsWith('{')) return line
+  let parsed: Record<string, any>
+  try {
+    parsed = JSON.parse(trimmed) as Record<string, any>
+  } catch {
+    return line
+  }
+  if (!parsed || typeof parsed !== 'object' || (parsed.type && parsed.type !== 'user')) {
+    return line
+  }
+  const msg = parsed.message ?? parsed
+  const content = msg?.content ?? parsed.prompt ?? ''
+  const candidatePaths: string[] = Array.isArray(parsed.files) ? [...parsed.files] : []
+
+  let textContent = ''
+  if (typeof content === 'string') {
+    textContent = content
+  } else if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block && typeof block === 'object') {
+        if (block.type === 'text' && typeof block.text === 'string') {
+          textContent += `${block.text}\n`
+        } else if (
+          (block.type === 'image' || block.type === 'file') &&
+          typeof block.path === 'string'
+        ) {
+          candidatePaths.push(block.path)
+        }
+      }
+    }
+  }
+
+  const bulletRe = /^-\s+`(\/[^`\n]+)`\s+\([^)\n]*原名:\s*([^)\n]+)\)/gm
+  let match = bulletRe.exec(textContent)
+  while (match !== null) {
+    const p = match[1]
+    if (p && !candidatePaths.includes(p)) {
+      candidatePaths.push(p)
+    }
+    match = bulletRe.exec(textContent)
+  }
+
+  if (candidatePaths.length === 0) return line
+
+  const inlineAttachments: Array<{ name: string; base64: string }> = []
+  for (const fp of candidatePaths) {
+    try {
+      if (existsSync(fp) && statSync(fp).isFile()) {
+        const buf = readFileSync(fp)
+        inlineAttachments.push({
+          name: basename(fp),
+          base64: buf.toString('base64'),
+        })
+      }
+    } catch {}
+  }
+
+  if (inlineAttachments.length === 0) return line
+  parsed.inlineAttachments = inlineAttachments
+  return JSON.stringify(parsed)
 }
 
 export const BOX_GPT_WEB_INTERACTIVE_LAUNCH_SCRIPT = [
@@ -174,7 +243,9 @@ export function boxGptWebInteractiveLaunchExec(
     LANG: 'C.UTF-8',
     DISPLAY: env.OC_BOX_GPT_WEB_DISPLAY || ':1',
     OC_BOX_GPT_WEB_PROFILE: profile,
-    OC_BOX_GPT_WEB_CDP_PORT: env.OC_BOX_GPT_WEB_CDP_PORT || '9229',
+    ...(env.OC_BOX_GPT_WEB_CDP_PORT
+      ? { OC_BOX_GPT_WEB_CDP_PORT: env.OC_BOX_GPT_WEB_CDP_PORT }
+      : {}),
     OC_BOX_GPT_WEB_CORE_MJS: mod.chatgptWebCoreMjs,
     OC_BOX_GPT_WEB_HOST_MJS: mod.hostMjs,
     OC_BOX_GPT_WEB_MOD_SHA256: mod.sha256,

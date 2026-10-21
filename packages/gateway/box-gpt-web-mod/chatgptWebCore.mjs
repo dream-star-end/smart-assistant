@@ -68,6 +68,39 @@ export function profileDirFor(profile = DEFAULT_PROFILE, home = os.homedir()) {
 }
 
 /**
+ * Deterministic CDP port per profile so two profiles never collide on port 9229.
+ */
+export function cdpPortForProfile(profile = DEFAULT_PROFILE, explicitPort = null) {
+  if (explicitPort !== null && explicitPort !== undefined && String(explicitPort).trim() !== '') {
+    const p = Number(explicitPort)
+    if (Number.isInteger(p) && p >= 1024 && p <= 65535 && !FORBIDDEN_PROXY_PORTS.has(p)) {
+      return p
+    }
+  }
+  const normalized = String(profile || DEFAULT_PROFILE).trim() || DEFAULT_PROFILE
+  if (normalized === DEFAULT_PROFILE) return DEFAULT_CDP_PORT
+  let hash = 0
+  for (let i = 0; i < normalized.length; i++) {
+    hash = (hash * 31 + normalized.charCodeAt(i)) >>> 0
+  }
+  const candidate = 9230 + (hash % 500)
+  return FORBIDDEN_PROXY_PORTS.has(candidate) ? candidate + 1 : candidate
+}
+
+/**
+ * Strict URL origin check against https://chatgpt.com (prevents prefix spoofing
+ * such as https://chatgpt.com.attacker.example/).
+ */
+export function isChatGptOriginUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || ''))
+    return parsed.origin === DEFAULT_CHATGPT_ORIGIN
+  } catch {
+    return false
+  }
+}
+
+/**
  * Validates that an optional proxy URL is strictly loopback (127.0.0.1 / localhost)
  * and never touches kl-mirror's 18991 / 19095 ports.
  */
@@ -85,7 +118,7 @@ export function validateLocalOnlyProxy(proxyUrl) {
     throw new Error(`BOX_GPT_WEB_PROXY_UNSUPPORTED_PROTOCOL: ${parsed.protocol}`)
   }
   const host = parsed.hostname.toLowerCase()
-  if (host !== '127.0.0.1' && host !== 'localhost' && host !== '[::1]' && host !== '::1') {
+  if (host !== '127.0.0.1' && host !== 'localhost') {
     throw new Error(
       `BOX_GPT_WEB_PROXY_NOT_LOOPBACK: proxy must bind to 127.0.0.1/localhost only (got ${parsed.hostname})`,
     )
@@ -137,6 +170,61 @@ export function buildChromeLaunchArgs({
   return args
 }
 
+export function isPidAlive(pid) {
+  const n = Number(pid)
+  if (!Number.isInteger(n) || n <= 0) return false
+  try {
+    process.kill(n, 0)
+    return true
+  } catch (err) {
+    return Boolean(err && err.code === 'EPERM')
+  }
+}
+
+/**
+ * Inspects `<profileDir>/SingletonLock` and `/proc/<pid>/cmdline` to determine which
+ * Chrome main process currently holds `profileDir` and whether it has `--remote-debugging-port`.
+ */
+export function readProfileSingletonOwner(profileDir, procRoot = '/proc') {
+  const lockPath = path.join(profileDir, 'SingletonLock')
+  let target
+  try {
+    target = fs.readlinkSync(lockPath)
+  } catch {
+    return { locked: false, pid: null, cdpPort: null, ownsProfile: false }
+  }
+  const dashIdx = target.lastIndexOf('-')
+  const pid = dashIdx >= 0 ? Number(target.slice(dashIdx + 1)) : Number.NaN
+  if (!Number.isInteger(pid) || pid <= 0 || !isPidAlive(pid)) {
+    return {
+      locked: false,
+      pid: Number.isInteger(pid) ? pid : null,
+      cdpPort: null,
+      ownsProfile: false,
+      staleSingleton: true,
+    }
+  }
+  let cmdline = ''
+  try {
+    cmdline = fs
+      .readFileSync(path.join(procRoot, String(pid), 'cmdline'))
+      .toString('utf8')
+      .replace(/\0/g, ' ')
+  } catch {
+    return { locked: true, pid, cdpPort: null, ownsProfile: false }
+  }
+  const ownsProfile = cmdline.includes(`--user-data-dir=${profileDir}`)
+  const portMatch = cmdline.match(/--remote-debugging-port=(\d+)/)
+  const cdpPort = portMatch ? Number(portMatch[1]) : null
+  return {
+    locked: true,
+    pid,
+    cdpPort,
+    ownsProfile,
+    cmdline,
+  }
+}
+
 /**
  * Single-tab in-process serial job queue (concurrency = 1).
  * Ensures concurrent turn submissions never race on the single ChatGPT Web tab.
@@ -183,12 +271,13 @@ export class SerialJobQueue {
 
 /**
  * Cross-process file lock for the persistent Chrome profile so two overlapping SSH runners
- * serialize cleanly instead of colliding on the same tab.
+ * serialize cleanly instead of colliding on the same tab. Reclaims locks immediately if the
+ * recorded owner PID is no longer alive.
  */
 export async function withProfileFileLock(
   lockPath,
   fn,
-  { timeoutMs = 60_000, pollMs = 150, staleMs = 1_500_000 } = {},
+  { timeoutMs = 60_000, pollMs = 150, staleMs = 1_500_000, pidAliveFn = isPidAlive } = {},
 ) {
   const deadline = Date.now() + timeoutMs
   let fd = null
@@ -200,7 +289,18 @@ export async function withProfileFileLock(
       if (err && err.code === 'EEXIST') {
         try {
           const stat = fs.statSync(lockPath)
-          if (Date.now() - stat.mtimeMs > staleMs) {
+          const ageMs = Date.now() - stat.mtimeMs
+          let ownerDead = false
+          if (ageMs >= 50) {
+            try {
+              const raw = fs.readFileSync(lockPath, 'utf8')
+              const parsed = JSON.parse(raw)
+              if (parsed && Number.isInteger(parsed.pid) && !pidAliveFn(parsed.pid)) {
+                ownerDead = true
+              }
+            } catch {}
+          }
+          if (ownerDead || ageMs > staleMs) {
             fs.unlinkSync(lockPath)
             continue
           }
@@ -226,6 +326,69 @@ export async function withProfileFileLock(
       fs.unlinkSync(lockPath)
     } catch {}
   }
+}
+
+const SESSION_MAP_FILENAME = 'oc-session-conversations.json'
+const CONV_ID_RE = /^[a-z0-9_-]{8,128}$/i
+
+export function loadSessionConversationMap(profileDir) {
+  try {
+    const raw = fs.readFileSync(path.join(profileDir, SESSION_MAP_FILENAME), 'utf8')
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+export function saveSessionConversationId(profileDir, sessionId, conversationId) {
+  if (!sessionId || !conversationId || !CONV_ID_RE.test(conversationId)) return
+  try {
+    fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 })
+    const map = loadSessionConversationMap(profileDir)
+    map[sessionId] = conversationId
+    const file = path.join(profileDir, SESSION_MAP_FILENAME)
+    fs.writeFileSync(file, JSON.stringify(map, null, 2), { mode: 0o600 })
+  } catch {}
+}
+
+/**
+ * Ensures the browser tab is bound to the ChatGPT conversation belonging to `sessionId`.
+ * - If `sessionId` has a recorded conversationId, navigates to `https://chatgpt.com/c/<convId>`.
+ * - If `sessionId` is a new session and the tab is currently on another conversation `/c/...`,
+ *   navigates back to `https://chatgpt.com/` so prompts never leak across sessions.
+ */
+export async function syncPageToSessionConversation(
+  page,
+  { profileDir, sessionId, initScript = backendFetchTeeInitScript() },
+) {
+  const map = loadSessionConversationMap(profileDir)
+  const mappedConvId = sessionId && map[sessionId] ? map[sessionId] : null
+  const currentUrl = page.url()
+  const currentMatch = currentUrl.match(/\/c\/([a-z0-9_-]{8,128})/i)
+  const currentConvId = currentMatch ? currentMatch[1] : null
+
+  if (mappedConvId) {
+    if (currentConvId !== mappedConvId) {
+      await page.goto(`${DEFAULT_CHATGPT_ORIGIN}/c/${mappedConvId}`, {
+        waitUntil: 'domcontentloaded',
+        timeout: 45_000,
+      })
+      if (initScript) await page.evaluate(initScript)
+    }
+    return { conversationId: mappedConvId, navigated: currentConvId !== mappedConvId }
+  }
+
+  if (currentConvId !== null || !isChatGptOriginUrl(currentUrl)) {
+    await page.goto(`${DEFAULT_CHATGPT_ORIGIN}/`, {
+      waitUntil: 'domcontentloaded',
+      timeout: 45_000,
+    })
+    if (initScript) await page.evaluate(initScript)
+    return { conversationId: null, navigated: true }
+  }
+
+  return { conversationId: null, navigated: false }
 }
 
 export function levelIndex(raw) {
@@ -287,7 +450,7 @@ export function detectTierLimit(bannerTexts, targetIdx = 4) {
 }
 
 /**
- * Fail-closed session state probe.
+ * Fail-closed session state probe. Requires positive composer readiness evidence (`hasComposer`).
  * NEVER auto-fills credentials, NEVER clicks login buttons, NEVER reads external cookies.
  */
 export async function probeSessionState(
@@ -325,11 +488,7 @@ export async function probeSessionState(
     }
   }
 
-  if (
-    info.hasLoginBtn ||
-    info.href.includes('/auth/login') ||
-    (!info.hasComposer && /log in|sign up/i.test(info.bodyText))
-  ) {
+  if (info.hasLoginBtn || info.href.includes('/auth/login') || !info.hasComposer) {
     return {
       ok: false,
       code: 'NOT_LOGGED_IN',
@@ -652,7 +811,8 @@ export class SseAccumulator {
       this.contentType === 'thoughts' ||
       this.contentType === 'reasoning_recap' ||
       this.channel === 'commentary' ||
-      this.channel === 'thoughts'
+      this.channel === 'thoughts' ||
+      this.channel === 'analysis'
     )
   }
 
@@ -755,6 +915,8 @@ export class SseAccumulator {
 /**
  * Extracts the latest final assistant text from a /backend-api/conversation/<id>
  * mapping tree object (used during Stream-Rescue fallback).
+ * Stops immediately if it encounters a user message before any final assistant message
+ * (so it never returns an earlier turn's answer), and strictly requires channel === 'final' (or null).
  */
 export function extractAssistantFromMapping(conv) {
   if (!conv || !conv.mapping) return null
@@ -764,24 +926,33 @@ export function extractAssistantFromMapping(conv) {
     visited.add(cur)
     const node = conv.mapping[cur]
     const m = node.message
-    if (m && m.author?.role === 'assistant') {
-      const ct = m.content?.content_type
-      const ch = m.channel
-      if (
-        ct === 'thoughts' ||
-        ct === 'reasoning_recap' ||
-        ch === 'commentary' ||
-        ch === 'thoughts'
-      ) {
-        cur = node.parent
-        continue
+    if (m) {
+      const role = m.author?.role
+      if (role === 'user') {
+        // Reached the current turn's user message without seeing a final assistant reply.
+        return null
       }
-      if (ct === 'text' || ct === 'multimodal_text') {
-        const parts = (m.content.parts || [])
-          .map((p) => (typeof p === 'string' ? p : p && typeof p.text === 'string' ? p.text : ''))
-          .filter(Boolean)
-        if (parts.length > 0) {
-          return { text: parts.join(''), messageId: m.id || cur }
+      if (role === 'assistant') {
+        const ct = m.content?.content_type
+        const ch = m.channel
+        if (
+          ct === 'thoughts' ||
+          ct === 'reasoning_recap' ||
+          (ch !== undefined && ch !== null && ch !== 'final')
+        ) {
+          cur = node.parent
+          continue
+        }
+        if (m.status && m.status !== 'finished_successfully') {
+          return null
+        }
+        if (ct === 'text' || ct === 'multimodal_text') {
+          const parts = (m.content.parts || [])
+            .map((p) => (typeof p === 'string' ? p : p && typeof p.text === 'string' ? p.text : ''))
+            .filter(Boolean)
+          if (parts.length > 0) {
+            return { text: parts.join(''), messageId: m.id || cur }
+          }
         }
       }
     }
@@ -924,26 +1095,91 @@ export function formatStreamJsonResult({
   })
 }
 
-export function extractUserTurnFromStdinFrame(line) {
+export function formatStreamJsonControlResponse({ requestId, subtype = 'success' }) {
+  return JSON.stringify({
+    type: 'control_response',
+    response: {
+      subtype,
+      request_id: String(requestId ?? ''),
+    },
+  })
+}
+
+/**
+ * Extracts attachment paths injected by Gateway's `inboundDispatch` (`buildImageAttachmentHint`
+ * and unparsed document hints) and strips the Claude Code `Read`-tool instruction footer.
+ */
+export function extractInboundDispatchAttachments(rawText) {
+  const text = String(rawText ?? '')
+  const extractedPaths = []
+  const bulletRe = /^-\s+`(\/[^`\n]+)`\s+\([^)\n]*原名:\s*([^)\n]+)\)/gm
+  let match = bulletRe.exec(text)
+  while (match !== null) {
+    extractedPaths.push(match[1])
+    match = bulletRe.exec(text)
+  }
+  if (extractedPaths.length === 0) {
+    return { cleanText: text, extractedPaths: [] }
+  }
+  const stripped = text
+    .replace(
+      /\n*---\n用户(?:还)?附带了以下(?:图片|音频文件|视频文件|文档)\(已保存到服务器本地[\s\S]*$/m,
+      '',
+    )
+    .trim()
+  return {
+    cleanText: stripped || '请分析上传的附件。',
+    extractedPaths,
+  }
+}
+
+/**
+ * Parses a Route B stdin JSON line into either a `control_request` (e.g. `interrupt`)
+ * or a `user` turn (with extracted prompt text and attachment file paths).
+ */
+export function parseStdinFrame(line, { stagingDir = null } = {}) {
   const trimmed = String(line ?? '').trim()
   if (!trimmed) return null
   let parsed
   try {
     parsed = JSON.parse(trimmed)
   } catch {
-    return { text: trimmed, files: [] }
+    const { cleanText, extractedPaths } = extractInboundDispatchAttachments(trimmed)
+    return { kind: 'user', text: cleanText, files: extractedPaths }
   }
   if (!parsed || typeof parsed !== 'object') return null
+
+  if (parsed.type === 'control_request') {
+    return {
+      kind: 'control_request',
+      requestId: String(parsed.request_id || ''),
+      subtype: String(parsed.request?.subtype || ''),
+    }
+  }
   if (parsed.type && parsed.type !== 'user') return null
 
   const msg = parsed.message || parsed
   const content = msg.content ?? parsed.prompt ?? ''
   const files = Array.isArray(parsed.files) ? [...parsed.files] : []
 
-  if (typeof content === 'string') {
-    return { text: content, files }
+  if (Array.isArray(parsed.inlineAttachments) && parsed.inlineAttachments.length > 0) {
+    const targetDir = stagingDir || fs.mkdtempSync(path.join(os.tmpdir(), 'oc-gpt-web-att-'))
+    fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 })
+    for (let i = 0; i < parsed.inlineAttachments.length; i++) {
+      const att = parsed.inlineAttachments[i]
+      if (att && typeof att.base64 === 'string' && att.base64.length > 0) {
+        const safeName = String(att.name || `upload-${i}.bin`).replace(/[^a-zA-Z0-9._-]/g, '_')
+        const outPath = path.join(targetDir, `${i}-${safeName}`)
+        fs.writeFileSync(outPath, Buffer.from(att.base64, 'base64'), { mode: 0o600 })
+        files.push(outPath)
+      }
+    }
   }
-  if (Array.isArray(content)) {
+
+  let rawText = ''
+  if (typeof content === 'string') {
+    rawText = content
+  } else if (Array.isArray(content)) {
     const texts = []
     for (const block of content) {
       if (typeof block === 'string') {
@@ -959,7 +1195,24 @@ export function extractUserTurnFromStdinFrame(line) {
         }
       }
     }
-    return { text: texts.join('\n'), files }
+    rawText = texts.join('\n')
+  } else {
+    rawText = String(content || '')
   }
-  return { text: String(content || ''), files }
+
+  const { cleanText, extractedPaths } = extractInboundDispatchAttachments(rawText)
+  if (!Array.isArray(parsed.inlineAttachments) || parsed.inlineAttachments.length === 0) {
+    for (const p of extractedPaths) {
+      if (!files.includes(p)) {
+        files.push(p)
+      }
+    }
+  }
+  return { kind: 'user', text: cleanText, files }
+}
+
+export function extractUserTurnFromStdinFrame(line, opts = {}) {
+  const frame = parseStdinFrame(line, opts)
+  if (!frame || frame.kind !== 'user') return null
+  return { text: frame.text, files: frame.files }
 }

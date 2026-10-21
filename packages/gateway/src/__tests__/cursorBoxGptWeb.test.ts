@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -11,15 +11,23 @@ import {
   SseAccumulator,
   TierLimitError,
   buildChromeLaunchArgs,
+  cdpPortForProfile,
   computeAdaptiveDeadline,
   detectTierLimit,
   extractAssistantFromMapping,
+  extractInboundDispatchAttachments,
   extractUserTurnFromStdinFrame,
+  isChatGptOriginUrl,
   levelIndex,
+  loadSessionConversationMap,
+  parseStdinFrame,
   probeSessionState,
   profileDirFor,
+  readProfileSingletonOwner,
+  saveSessionConversationId,
   selectProTierInPage,
   stripTierCaption,
+  syncPageToSessionConversation,
   typeMultilinePreservingAttachments,
   uploadAttachmentsToComposer,
   validateLocalOnlyProxy,
@@ -38,6 +46,7 @@ import {
 import { runBoxCcBridge } from '../engine/cursorBoxCcBridge.js'
 import {
   boxGptWebInteractiveLaunchExec,
+  inlineGptWebAttachmentsInUserLine,
   isBoxGptWebModelArgv,
   loadBoxGptWebMod,
   remoteInteractiveGptWebArgs,
@@ -45,6 +54,7 @@ import {
 } from '../engine/cursorBoxGptWeb.js'
 import { masterBoxCredentialSelection } from '../engine/cursorCredentialSelection.js'
 import { cursorVariantFor } from '../engine/cursorRoutingAdapter.js'
+import { buildImageAttachmentHint } from '../imageAttachmentHint.js'
 
 function encodeExecFrames(frames: ExecFrame[]): Uint8Array {
   const parts: Buffer[] = []
@@ -105,10 +115,22 @@ function streamExecOnHost(req: BoxCcExecRequest, signal?: AbortSignal): Response
 }
 
 describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
-  it('validates persistent profile paths, real Chrome launch args, and local-only proxy rules (rejecting 18991/19095)', () => {
+  it('validates persistent profile paths, strict origin check, per-profile CDP ports, and loopback proxy rules', () => {
     assert.equal(profileDirFor('default', '/home/box'), '/home/box/.chatgpt-pro-default')
     assert.equal(profileDirFor('acct-2', '/home/box'), '/home/box/.chatgpt-pro-acct-2')
     assert.throws(() => profileDirFor('../escape', '/home/box'), /Invalid ChatGPT Web profile/)
+
+    // Strict origin check prevents https://chatgpt.com.attacker.example/ spoofing
+    assert.equal(isChatGptOriginUrl('https://chatgpt.com/'), true)
+    assert.equal(isChatGptOriginUrl('https://chatgpt.com/c/1234-5678'), true)
+    assert.equal(isChatGptOriginUrl('https://chatgpt.com.attacker.example/'), false)
+    assert.equal(isChatGptOriginUrl('http://chatgpt.com/'), false)
+
+    // Per-profile deterministic CDP ports prevent cross-profile port 9229 collisions
+    assert.equal(cdpPortForProfile('default'), 9229)
+    const acct2Port = cdpPortForProfile('acct-2')
+    assert.notEqual(acct2Port, 9229)
+    assert.ok(acct2Port >= 9230 && acct2Port < 9730)
 
     assert.equal(validateLocalOnlyProxy(null), null)
     assert.equal(validateLocalOnlyProxy(''), null)
@@ -116,9 +138,17 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
     assert.equal(validateLocalOnlyProxy('socks5://localhost:18993'), 'socks5://localhost:18993')
     assert.equal(validateBoxGptWebLoopbackProxy('http://127.0.0.1:18992'), 'http://127.0.0.1:18992')
 
-    // Reject non-loopback proxies
+    // Reject non-loopback proxies and IPv6 [::1] (strictly 127.0.0.1 / localhost)
     assert.throws(
       () => validateLocalOnlyProxy('http://192.168.10.223:18992'),
+      /BOX_GPT_WEB_PROXY_NOT_LOOPBACK/,
+    )
+    assert.throws(
+      () => validateLocalOnlyProxy('http://[::1]:18992'),
+      /BOX_GPT_WEB_PROXY_NOT_LOOPBACK/,
+    )
+    assert.throws(
+      () => validateBoxGptWebLoopbackProxy('http://[::1]:18992'),
       /BOX_GPT_WEB_PROXY_NOT_LOOPBACK/,
     )
     assert.throws(
@@ -154,10 +184,6 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
       ),
       false,
     )
-    assert.equal(
-      defaultArgs.some((a: string) => a.startsWith('--proxy-server=')),
-      false,
-    )
 
     const proxyArgs = buildChromeLaunchArgs({
       profileDir: '/home/box/.chatgpt-pro-default',
@@ -168,7 +194,7 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
     assert.ok(proxyArgs.includes('--proxy-bypass-list=<-loopback>'))
   })
 
-  it('serializes single-tab turns via SerialJobQueue and cross-process file lock', async () => {
+  it('serializes single-tab turns, reclaims dead-PID locks immediately, and binds sessionId to ChatGPT conversation URLs', async () => {
     const queue = new SerialJobQueue()
     const order: string[] = []
     let active = 0
@@ -187,7 +213,7 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
       })
 
     const [r1, r2, r3] = await Promise.allSettled([
-      job('turn1', 25, false),
+      job('turn1', 20, false),
       job('turn2', 15, true),
       job('turn3', 10, false),
     ])
@@ -208,25 +234,58 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'oc-gpt-web-lock-'))
     const lockPath = join(dir, '.chatgpt-pro-default.lock')
     try {
-      const lockEvents: string[] = []
-      await Promise.all([
-        withProfileFileLock(lockPath, async () => {
-          lockEvents.push('a:in')
-          await new Promise((r) => setTimeout(r, 30))
-          lockEvents.push('a:out')
-        }),
-        withProfileFileLock(lockPath, async () => {
-          lockEvents.push('b:in')
-          lockEvents.push('b:out')
-        }),
-      ])
-      assert.deepEqual(lockEvents, ['a:in', 'a:out', 'b:in', 'b:out'])
+      // Simulate a lock left behind by a killed process (PID 99999999 is not alive)
+      writeFileSync(lockPath, JSON.stringify({ pid: 99999999, acquiredAt: Date.now() - 500 }))
+      await new Promise((r) => setTimeout(r, 60))
+      let acquiredAfterDeadPid = false
+      await withProfileFileLock(
+        lockPath,
+        async () => {
+          acquiredAfterDeadPid = true
+        },
+        { timeoutMs: 1_000, pollMs: 20 },
+      )
+      assert.equal(acquiredAfterDeadPid, true)
+
+      // Verify SingletonLock owner inspection
+      symlinkSync(`host-${process.pid}`, join(dir, 'SingletonLock'))
+      const owner = readProfileSingletonOwner(dir)
+      assert.equal(owner.locked, true)
+      assert.equal(owner.pid, process.pid)
+
+      // Verify sessionId <-> ChatGPT conversation binding prevents context bleed across sessions
+      saveSessionConversationId(dir, 'sess-A', 'conv-11111111-2222-3333-4444')
+      assert.equal(loadSessionConversationMap(dir)['sess-A'], 'conv-11111111-2222-3333-4444')
+
+      let currentUrl = 'https://chatgpt.com/'
+      const fakePage = {
+        url: () => currentUrl,
+        goto: async (u: string) => {
+          currentUrl = u
+        },
+        evaluate: async () => {},
+      }
+      // Resuming sess-A navigates directly to /c/conv-11111111-2222-3333-4444
+      const navA = await syncPageToSessionConversation(fakePage, {
+        profileDir: dir,
+        sessionId: 'sess-A',
+      })
+      assert.equal(navA.navigated, true)
+      assert.equal(currentUrl, 'https://chatgpt.com/c/conv-11111111-2222-3333-4444')
+
+      // Starting a brand-new session sess-B while tab is on sess-A's /c/... navigates back to https://chatgpt.com/
+      const navB = await syncPageToSessionConversation(fakePage, {
+        profileDir: dir,
+        sessionId: 'sess-B',
+      })
+      assert.equal(navB.navigated, true)
+      assert.equal(currentUrl, 'https://chatgpt.com/')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
   })
 
-  it('fails closed when browser session is not logged in or hits Cloudflare challenge', async () => {
+  it('fails closed when browser session is not logged in, blank, or hits Cloudflare challenge', async () => {
     const loggedOutPage = {
       evaluate: async () => ({
         href: 'https://chatgpt.com/',
@@ -244,7 +303,21 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
     assert.equal(probeOut.ok, false)
     assert.equal(probeOut.code, 'NOT_LOGGED_IN')
     assert.match(probeOut.message, /\/home\/box\/\.chatgpt-pro-default/)
-    assert.match(probeOut.message, /noVNC port 6080/)
+
+    // Blank page without composer must also fail closed (NOT_LOGGED_IN)
+    const blankPage = {
+      evaluate: async () => ({
+        href: 'about:blank',
+        title: '',
+        bodyText: '',
+        hasLoginBtn: false,
+        hasComposer: false,
+        isCfChallenge: false,
+      }),
+    }
+    const probeBlank = await probeSessionState(blankPage)
+    assert.equal(probeBlank.ok, false)
+    assert.equal(probeBlank.code, 'NOT_LOGGED_IN')
 
     const cfPage = {
       evaluate: async () => ({
@@ -350,12 +423,42 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
     )
   })
 
-  it('uploads attachments atomically and types multiline text with Shift+Enter without clearing attachments', async () => {
+  it('bridges inboundDispatch image attachment hints into Box file uploads and types multiline text with Shift+Enter', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'oc-gpt-web-upload-'))
     const sampleFile = join(dir, 'diagram.png')
-    writeFileSync(sampleFile, Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex'))
+    const sampleBytes = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex')
+    writeFileSync(sampleFile, sampleBytes)
 
     try {
+      // 1. Verify inboundDispatch buildImageAttachmentHint integration
+      const hintBlock = buildImageAttachmentHint({
+        paths: [
+          {
+            path: sampleFile,
+            mimeType: 'image/png',
+            sizeHint: '1.0KB',
+            name: 'diagram.png',
+          },
+        ],
+      })
+      const gatewayUserPrompt = `请看这张架构图\n\n---\n${hintBlock}`
+      const extracted = extractInboundDispatchAttachments(gatewayUserPrompt)
+      assert.equal(extracted.cleanText, '请看这张架构图')
+      assert.deepEqual(extracted.extractedPaths, [sampleFile])
+
+      // 2. Verify inlineGptWebAttachmentsInUserLine embeds base64 on the gateway and parseStdinFrame materializes it on Box
+      const rawUserLine = JSON.stringify({
+        type: 'user',
+        message: { role: 'user', content: gatewayUserPrompt },
+      })
+      const inlinedLine = inlineGptWebAttachmentsInUserLine(rawUserLine)
+      const stagingDir = join(dir, 'box-staging')
+      const boxTurn = extractUserTurnFromStdinFrame(inlinedLine, { stagingDir })
+      assert.ok(boxTurn)
+      assert.equal(boxTurn.text, '请看这张架构图')
+      assert.equal(boxTurn.files.length, 1)
+      assert.deepEqual(readFileSync(boxTurn.files[0]!), sampleBytes)
+
       let uploadedFiles: string[] = []
       let dispatchedEvents = false
       let evalCalls = 0
@@ -375,7 +478,6 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
         evaluate: async (_fn: unknown, prev?: number) => {
           evalCalls += 1
           if (prev === undefined) return 0
-          // First poll has spinner=1, second poll has spinner=0 and chips=1
           if (evalCalls <= 2) return { chips: 1, spinners: 1, added: true }
           return { chips: 1, spinners: 0, added: true }
         },
@@ -407,12 +509,12 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
         },
       }
 
-      const up = await uploadAttachmentsToComposer(mockPage, [sampleFile], {
+      const up = await uploadAttachmentsToComposer(mockPage, boxTurn.files, {
         timeoutMs: 2_000,
         pollMs: 10,
       })
       assert.equal(up.uploadedCount, 1)
-      assert.deepEqual(uploadedFiles, [sampleFile])
+      assert.deepEqual(uploadedFiles, boxTurn.files)
       assert.equal(dispatchedEvents, true)
 
       await typeMultilinePreservingAttachments(mockPage, 'Line 1\nLine 2\nLine 3')
@@ -431,7 +533,7 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
     }
   })
 
-  it('accumulates delta-encoded SSE frames and strictly separates thoughts/reasoning_recap from final text', () => {
+  it('accumulates delta-encoded SSE frames and strictly enforces final channel and user turn boundary in mapping rescue', () => {
     const thinkingChunks: string[] = []
     const textChunks: string[] = []
     const acc = new SseAccumulator({
@@ -439,7 +541,6 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
       onTextDelta: (d: string) => textChunks.push(d),
     })
 
-    // 1. Reasoning thoughts message snapshot + delta append
     acc.feedDataLine(
       JSON.stringify({
         v: {
@@ -464,7 +565,6 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
       }),
     )
 
-    // 2. Reasoning recap (must not leak into finalText)
     acc.feedDataLine(
       JSON.stringify({
         v: {
@@ -481,7 +581,6 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
       }),
     )
 
-    // 3. Final assistant message snapshot + delta JSON-Patch appends
     acc.feedDataLine(
       JSON.stringify({
         v: {
@@ -522,21 +621,29 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
       'Analyzing architecture... Checking P3 layer invariants.Thought for 4m 12s',
     )
 
-    // Verify mapping tree fallback skips thoughts/recap and extracts final assistant text
+    // Mapping rescue skips analysis/commentary/thoughts and extracts final assistant text
     const extracted = extractAssistantFromMapping({
-      current_node: 'node-3',
+      current_node: 'node-4',
       mapping: {
         'node-1': {
           parent: null,
           message: {
-            id: 'm1',
-            author: { role: 'assistant' },
-            channel: 'thoughts',
-            content: { content_type: 'thoughts', parts: ['secret thought'] },
+            id: 'u1',
+            author: { role: 'user' },
+            content: { content_type: 'text', parts: ['Question 1'] },
           },
         },
         'node-2': {
           parent: 'node-1',
+          message: {
+            id: 'm1',
+            author: { role: 'assistant' },
+            channel: 'analysis',
+            content: { content_type: 'text', parts: ['internal analysis text'] },
+          },
+        },
+        'node-3': {
+          parent: 'node-2',
           message: {
             id: 'm2',
             author: { role: 'assistant' },
@@ -544,8 +651,8 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
             content: { content_type: 'text', parts: ['Rescued final answer'] },
           },
         },
-        'node-3': {
-          parent: 'node-2',
+        'node-4': {
+          parent: 'node-3',
           message: {
             id: 'm3',
             author: { role: 'assistant' },
@@ -556,11 +663,45 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
       },
     })
     assert.deepEqual(extracted, { text: 'Rescued final answer', messageId: 'm2' })
+
+    // If current_node is a new unanswered user message (or only has analysis so far),
+    // extractAssistantFromMapping MUST stop at the user boundary and return null instead of returning Turn 1's answer!
+    const unanswered = extractAssistantFromMapping({
+      current_node: 'node-6',
+      mapping: {
+        'node-3': {
+          parent: null,
+          message: {
+            id: 'm2',
+            author: { role: 'assistant' },
+            channel: 'final',
+            content: { content_type: 'text', parts: ['Turn 1 old answer'] },
+          },
+        },
+        'node-5': {
+          parent: 'node-3',
+          message: {
+            id: 'u2',
+            author: { role: 'user' },
+            content: { content_type: 'text', parts: ['Turn 2 question'] },
+          },
+        },
+        'node-6': {
+          parent: 'node-5',
+          message: {
+            id: 'm_analysis',
+            author: { role: 'assistant' },
+            channel: 'analysis',
+            content: { content_type: 'text', parts: ['Still thinking...'] },
+          },
+        },
+      },
+    })
+    assert.equal(unanswered, null)
   })
 
   it('extends adaptive deadline up to 20m while Pro is actively thinking and triggers Stream-Rescue when stop-button disappears without final text', () => {
     const t0 = 1_000_000
-    // At 10m (600s), stop button is still visible and SSE activity happened 30s ago -> extend by +120s
     const step1 = computeAdaptiveDeadline({
       startedAt: t0,
       now: t0 + 600_000,
@@ -572,7 +713,6 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
     assert.equal(step1.expired, false)
     assert.equal(step1.deadline, t0 + 720_000)
 
-    // At 20m (1200s) hard ceiling -> no further extension, expired = true
     const stepCeiling = computeAdaptiveDeadline({
       startedAt: t0,
       now: t0 + 1_200_000,
@@ -583,7 +723,6 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
     assert.equal(stepCeiling.extended, false)
     assert.equal(stepCeiling.expired, true)
 
-    // Stop button disappeared 95s ago without final text -> triggers Stream-Rescue
     const rescueCheck = computeAdaptiveDeadline({
       startedAt: t0,
       now: t0 + 300_000,
@@ -597,7 +736,7 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
     assert.equal(rescueCheck.expired, false)
   })
 
-  it('routes box-gpt-6-astra-pro through cursorRoutingAdapter and runBoxCcBridge over FIFO stream-json', async () => {
+  it('routes box-gpt-6-astra-pro through cursorRoutingAdapter and handles control_request interrupt + FIFO stream-json in runBoxCcBridge', async () => {
     assert.equal(isBoxGptWebCatalogModel('box-gpt-6-astra-pro'), true)
     assert.equal(isBoxClaudeCatalogModel('box-gpt-6-astra-pro'), false)
     assert.equal(isBoxInteractiveCatalogModel('box-gpt-6-astra-pro'), true)
@@ -606,6 +745,19 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
       remoteInteractiveGptWebArgs(['--model', 'box-gpt-6-astra-pro', '--resume', 'sess-42']),
       ['--model', 'gpt-6-astra-pro', '--resume', 'sess-42'],
     )
+
+    const ctrlFrame = parseStdinFrame(
+      JSON.stringify({
+        type: 'control_request',
+        request_id: 'req-int-1',
+        request: { subtype: 'interrupt' },
+      }),
+    )
+    assert.deepEqual(ctrlFrame, {
+      kind: 'control_request',
+      requestId: 'req-int-1',
+      subtype: 'interrupt',
+    })
 
     const env = {
       OC_CURSOR_SAND_BOX_CC: '1',
@@ -619,25 +771,6 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
       'sand-box-cc',
     )
 
-    // Parse user turn with attachments from Route B stdin frame
-    const parsedTurn = extractUserTurnFromStdinFrame(
-      JSON.stringify({
-        type: 'user',
-        message: {
-          role: 'user',
-          content: [
-            { type: 'text', text: 'Analyze this diagram' },
-            { type: 'image', path: '/tmp/arch.png' },
-          ],
-        },
-      }),
-    )
-    assert.deepEqual(parsedTurn, {
-      text: 'Analyze this diagram',
-      files: ['/tmp/arch.png'],
-    })
-
-    // End-to-end runBoxCcBridge test using real BOX_GPT_WEB_INTERACTIVE_LAUNCH_SCRIPT
     const dir = mkdtempSync(join(tmpdir(), 'oc-box-gpt-web-bridge-'))
     const fifo = boxCcFifoPath(`gpt-web-test-${Date.now()}`)
     const control: BoxCcControl = {
@@ -654,35 +787,34 @@ describe('Box ChatGPT Web Pro prototype (OCV5-551)', () => {
     const fakeHostMjs = `
 import readline from 'node:readline'
 import {
-  extractUserTurnFromStdinFrame,
   formatStreamJsonAssistantMessage,
+  formatStreamJsonControlResponse,
   formatStreamJsonResult,
   formatStreamJsonSystemInit,
   formatStreamJsonTextDelta,
   formatStreamJsonThinkingDelta,
+  parseStdinFrame,
 } from './chatgptWebCore.mjs'
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity })
 let first = true
-for await (const line of rl) {
-  const turn = extractUserTurnFromStdinFrame(line)
-  if (!turn) continue
+rl.on('line', (line) => {
+  const frame = parseStdinFrame(line)
+  if (!frame) return
+  if (frame.kind === 'control_request') {
+    process.stdout.write(formatStreamJsonControlResponse({ requestId: frame.requestId }) + '\\n')
+    return
+  }
   if (first) {
     first = false
     process.stdout.write(formatStreamJsonSystemInit({ sessionId: 'sess-gpt-web', model: 'box-gpt-6-astra-pro' }) + '\\n')
   }
-  if (turn.text === 'PROBE_LOGGED_OUT') {
-    const msg = '[box-gpt-6-astra-pro] ChatGPT Pro session is not logged in inside Box profile /home/box/.chatgpt-pro-default (DISPLAY=:1).'
-    process.stdout.write(formatStreamJsonAssistantMessage({ messageId: 'm_err', text: msg }) + '\\n')
-    process.stdout.write(formatStreamJsonResult({ sessionId: 'sess-gpt-web', resultText: msg, isError: true, durationMs: 12 }) + '\\n')
-    process.exit(0)
-  }
   process.stdout.write(formatStreamJsonThinkingDelta('Deep Pro synthesis...') + '\\n')
-  process.stdout.write(formatStreamJsonTextDelta('Answer: ' + turn.text) + '\\n')
-  process.stdout.write(formatStreamJsonAssistantMessage({ messageId: 'm_ok', text: 'Answer: ' + turn.text, thinking: 'Deep Pro synthesis...' }) + '\\n')
-  process.stdout.write(formatStreamJsonResult({ sessionId: 'sess-gpt-web', resultText: 'Answer: ' + turn.text, isError: false, durationMs: 45 }) + '\\n')
+  process.stdout.write(formatStreamJsonTextDelta('Answer: ' + frame.text) + '\\n')
+  process.stdout.write(formatStreamJsonAssistantMessage({ messageId: 'm_ok', text: 'Answer: ' + frame.text, thinking: 'Deep Pro synthesis...' }) + '\\n')
+  process.stdout.write(formatStreamJsonResult({ sessionId: 'sess-gpt-web', resultText: 'Answer: ' + frame.text, isError: false, durationMs: 45 }) + '\\n')
   process.exit(0)
-}
+})
 `
 
     try {

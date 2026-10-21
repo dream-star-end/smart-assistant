@@ -14,35 +14,36 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
+  BoxLoginUnavailableError,
+  reportBoxLoginSignals,
+  requestBoxLogin,
+} from './boxLoginClient.js'
+import {
+  type BoxCcControl,
+  type BoxCcExecRequest,
   boxCcSpawnFifo,
   boxCcStopExec,
   boxCcWriteExecs,
   encodeExecRequest,
   execExitCode,
   parseExecFrames,
-  type BoxCcControl,
-  type BoxCcExecRequest,
 } from './cursorBoxCcExec.js'
 import {
-  BoxLoginUnavailableError,
-  reportBoxLoginSignals,
-  requestBoxLogin,
-} from './boxLoginClient.js'
-import {
+  type BoxBridgeMod,
+  type BoxCcRunner,
   boxCcInteractiveAbandonExec,
   boxCcInteractiveLaunchExec,
   boxCcRunnerFromEnv,
   loadBoxBridgeMod,
   remoteInteractiveClaudeArgs,
-  type BoxBridgeMod,
-  type BoxCcRunner,
 } from './cursorBoxCcInteractive.js'
 import {
+  type BoxGptWebMod,
   boxGptWebInteractiveLaunchExec,
+  inlineGptWebAttachmentsInUserLine,
   isBoxGptWebModelArgv,
   loadBoxGptWebMod,
   remoteInteractiveGptWebArgs,
-  type BoxGptWebMod,
 } from './cursorBoxGptWeb.js'
 
 type FetchFn = (url: string, init: RequestInit) => Promise<Response>
@@ -53,16 +54,24 @@ const STOP_STREAM_GRACE_MS = 300
 
 function readControl(path: string): BoxCcControl {
   const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<BoxCcControl>
-  if (!parsed || typeof parsed.execUrl !== 'string' || typeof parsed.execToken !== 'string'
-    || typeof parsed.networkToken !== 'string' || typeof parsed.remoteClaude !== 'string'
-    || typeof parsed.fifo !== 'string' || typeof parsed.cwd !== 'string') {
+  if (
+    !parsed ||
+    typeof parsed.execUrl !== 'string' ||
+    typeof parsed.execToken !== 'string' ||
+    typeof parsed.networkToken !== 'string' ||
+    typeof parsed.remoteClaude !== 'string' ||
+    typeof parsed.fifo !== 'string' ||
+    typeof parsed.cwd !== 'string'
+  ) {
     throw new Error('BOX_CC_CONTROL_INVALID')
   }
   if (!parsed.execUrl.startsWith('https://') || !parsed.fifo.startsWith('/tmp/oc-box-cc-')) {
     throw new Error('BOX_CC_CONTROL_INVALID')
   }
-  if (parsed.accountId !== undefined
-    && (typeof parsed.accountId !== 'string' || !/^[1-9][0-9]{0,18}$/.test(parsed.accountId))) {
+  if (
+    parsed.accountId !== undefined &&
+    (typeof parsed.accountId !== 'string' || !/^[1-9][0-9]{0,18}$/.test(parsed.accountId))
+  ) {
     throw new Error('BOX_CC_CONTROL_INVALID')
   }
   return parsed as BoxCcControl
@@ -127,15 +136,21 @@ export async function runBoxCcBridge(opts: {
   const fetchImpl = opts.fetchImpl ?? fetch
   const env = opts.env ?? process.env
   const isGptWeb = isBoxGptWebModelArgv(opts.args)
-  const login: BoxLoginPort = opts.login ?? (isGptWeb && !env.OC_BOX_LOGIN_URL
-    ? {
-        choose: async () => ({ profile: env.OC_BOX_GPT_WEB_PROFILE || 'default', source: 'default', alternatives: 0 }),
-        report: async () => true,
-      }
-    : {
-        choose: (accountId, sticky) => requestBoxLogin({ accountId, ...sticky }, { env }),
-        report: (input) => reportBoxLoginSignals(input, { env }),
-      })
+  const login: BoxLoginPort =
+    opts.login ??
+    (isGptWeb && !env.OC_BOX_LOGIN_URL
+      ? {
+          choose: async () => ({
+            profile: env.OC_BOX_GPT_WEB_PROFILE || 'default',
+            source: 'fallback' as const,
+            alternatives: 0,
+          }),
+          report: async () => true,
+        }
+      : {
+          choose: (accountId, sticky) => requestBoxLogin({ accountId, ...sticky }, { env }),
+          report: (input) => reportBoxLoginSignals(input, { env }),
+        })
   if ((opts.runner ?? 'interactive') !== 'interactive') {
     opts.stderr.write(`BOX_CC_RUNNER_REFUSED ${String(opts.runner)}\n`)
     return 1
@@ -143,7 +158,10 @@ export async function runBoxCcBridge(opts: {
   const accountId = opts.control.accountId
   // A chat keeps its login across bridge restarts when it can: --resume then lands on the login
   // that holds its prompt cache. The master has the last word (benched or deselected logins move).
-  const memory = new BoxLoginMemory(opts.loginStateDir ?? join(tmpdir(), 'oc-box-cc'), opts.control.fifo)
+  const memory = new BoxLoginMemory(
+    opts.loginStateDir ?? join(tmpdir(), 'oc-box-cc'),
+    opts.control.fifo,
+  )
   const abort = new AbortController()
   const onAbort = (): void => abort.abort()
   opts.signal?.addEventListener('abort', onAbort)
@@ -170,32 +188,62 @@ export async function runBoxCcBridge(opts: {
       let alternatives = 0
       try {
         const prefer = memory.read()
-        const chosen = await login.choose(accountId,
-          { ...(memory.session ? { session: memory.session } : {}), ...(prefer ? { prefer } : {}) })
+        const chosen = await login.choose(accountId, {
+          ...(memory.session ? { session: memory.session } : {}),
+          ...(prefer ? { prefer } : {}),
+        })
         profile = chosen.profile
         alternatives = chosen.alternatives ?? 0
         memory.write(profile)
-        opts.stderr.write(`BOX_INTERACTIVE_LOGIN ${profile} ${chosen.source}${prefer && prefer !== profile ? ` moved_from=${prefer}` : ''}\n`)
+        opts.stderr.write(
+          `BOX_INTERACTIVE_LOGIN ${profile} ${chosen.source}${prefer && prefer !== profile ? ` moved_from=${prefer}` : ''}\n`,
+        )
       } catch (err) {
-        opts.stderr.write(`${err instanceof BoxLoginUnavailableError ? err.message : 'BOX_LOGIN_UNAVAILABLE'}\n`)
+        opts.stderr.write(
+          `${err instanceof BoxLoginUnavailableError ? err.message : 'BOX_LOGIN_UNAVAILABLE'}\n`,
+        )
         // Not even the default login is usable; the waiting turn ends plainly.
         out.unavailable(sessionIdOf(opts.args))
         code = 0
         break
       }
       const session = new BoxSession({
-        control: { ...opts.control, fifo: boxCcSpawnFifo(opts.control.fifo, randomBytes(8).toString('hex')) },
-        args: opts.args, profile, alternatives, accountId, bridgeMod: opts.bridgeMod, gptWebMod: opts.gptWebMod, env, held: carry, holdMax,
-        fetchImpl, abort, stderr: opts.stderr, out, login, memory,
+        control: {
+          ...opts.control,
+          fifo: boxCcSpawnFifo(opts.control.fifo, randomBytes(8).toString('hex')),
+        },
+        args: opts.args,
+        profile,
+        alternatives,
+        accountId,
+        bridgeMod: opts.bridgeMod,
+        gptWebMod: opts.gptWebMod,
+        env,
+        held: carry,
+        holdMax,
+        fetchImpl,
+        abort,
+        stderr: opts.stderr,
+        out,
+        login,
+        memory,
         // A line that reaches a session after it gave up (nothing ran) belongs to the next attempt.
-        late: (line) => { carry.push(line) },
+        late: (line) => {
+          carry.push(line)
+        },
       })
-      if (stdinEnded) { code = 0; break }   // the gateway retired this process meanwhile
+      if (stdinEnded) {
+        code = 0
+        break
+      } // the gateway retired this process meanwhile
       carry = []
       current = session
       const outcome = await session.run()
       current = null
-      if (outcome.kind === 'ended') { code = outcome.code; break }
+      if (outcome.kind === 'ended') {
+        code = outcome.code
+        break
+      }
       // Nothing ran on this attempt: its lines are still ours.
       carry = [...outcome.held, ...carry]
       if (outcome.unsafe) {
@@ -257,16 +305,33 @@ class StdoutLines {
   /** A failed result for the waiting turn, in the CLI's own result shape (the parser finalizes it). */
   unavailable(sessionId: string): void {
     this.flush()
-    this.stdout.write(`${JSON.stringify({
-      type: 'result', subtype: 'error_during_execution', is_error: true, duration_ms: 0, duration_api_ms: 0,
-      num_turns: 0, result: BOX_TURN_UNAVAILABLE_TEXT, stop_reason: null, session_id: sessionId, total_cost_usd: 0,
-      usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
-      permission_denials: [], errors: ['BOX_INTERACTIVE_UNAVAILABLE'],
-    })}\n`)
+    this.stdout.write(
+      `${JSON.stringify({
+        type: 'result',
+        subtype: 'error_during_execution',
+        is_error: true,
+        duration_ms: 0,
+        duration_api_ms: 0,
+        num_turns: 0,
+        result: BOX_TURN_UNAVAILABLE_TEXT,
+        stop_reason: null,
+        session_id: sessionId,
+        total_cost_usd: 0,
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+        },
+        permission_denials: [],
+        errors: ['BOX_INTERACTIVE_UNAVAILABLE'],
+      })}\n`,
+    )
   }
 }
 
-const QUOTA_OR_LOGIN = /hit your .*limit|usage limit|rate limit|limit reached|Not logged in|Please run \/login|resets? (at )?\d/i
+const QUOTA_OR_LOGIN =
+  /hit your .*limit|usage limit|rate limit|limit reached|Not logged in|Please run \/login|resets? (at )?\d/i
 
 function neutralLine(line: string): string {
   if (line.includes('[box-gpt-6-astra-pro]')) return line
@@ -274,13 +339,29 @@ function neutralLine(line: string): string {
   if (type !== 'assistant' && type !== 'result') return line
   if (!QUOTA_OR_LOGIN.test(line)) return line
   let record: Record<string, any>
-  try { record = JSON.parse(line) as Record<string, any> } catch { return line }
-  if (type === 'assistant' && record.message?.model === '<synthetic>' && Array.isArray(record.message.content)) {
+  try {
+    record = JSON.parse(line) as Record<string, any>
+  } catch {
+    return line
+  }
+  if (
+    type === 'assistant' &&
+    record.message?.model === '<synthetic>' &&
+    Array.isArray(record.message.content)
+  ) {
     record.message.content = record.message.content.map((block: Record<string, unknown>) =>
-      typeof block?.text === 'string' && QUOTA_OR_LOGIN.test(block.text) ? { ...block, text: BOX_TURN_UNAVAILABLE_TEXT } : block)
+      typeof block?.text === 'string' && QUOTA_OR_LOGIN.test(block.text)
+        ? { ...block, text: BOX_TURN_UNAVAILABLE_TEXT }
+        : block,
+    )
     return JSON.stringify(record)
   }
-  if (type === 'result' && record.is_error === true && typeof record.result === 'string' && QUOTA_OR_LOGIN.test(record.result)) {
+  if (
+    type === 'result' &&
+    record.is_error === true &&
+    typeof record.result === 'string' &&
+    QUOTA_OR_LOGIN.test(record.result)
+  ) {
     record.result = BOX_TURN_UNAVAILABLE_TEXT
     return JSON.stringify(record)
   }
@@ -309,12 +390,27 @@ class BoxSession {
   /** Set once the session gave up before READY: later lines go back to the bridge. */
   private gaveUp = false
 
-  constructor(private readonly o: {
-    control: BoxCcControl; args: readonly string[]; profile: string; alternatives: number
-    accountId: string | undefined; bridgeMod?: BoxBridgeMod; gptWebMod?: BoxGptWebMod; env?: NodeJS.ProcessEnv; held: string[]; holdMax: number
-    fetchImpl: FetchFn; abort: AbortController; stderr: NodeJS.WritableStream; out: StdoutLines
-    login: BoxLoginPort; memory: BoxLoginMemory; late: (line: string) => void
-  }) {
+  constructor(
+    private readonly o: {
+      control: BoxCcControl
+      args: readonly string[]
+      profile: string
+      alternatives: number
+      accountId: string | undefined
+      bridgeMod?: BoxBridgeMod
+      gptWebMod?: BoxGptWebMod
+      env?: NodeJS.ProcessEnv
+      held: string[]
+      holdMax: number
+      fetchImpl: FetchFn
+      abort: AbortController
+      stderr: NodeJS.WritableStream
+      out: StdoutLines
+      login: BoxLoginPort
+      memory: BoxLoginMemory
+      late: (line: string) => void
+    },
+  ) {
     this.held = [...o.held]
     for (const line of this.held) this.heldBytes += Buffer.byteLength(line)
     const parent = (): void => this.abort.abort()
@@ -322,7 +418,9 @@ class BoxSession {
     else o.abort.signal.addEventListener('abort', parent, { once: true })
   }
 
-  private get control(): BoxCcControl { return this.o.control }
+  private get control(): BoxCcControl {
+    return this.o.control
+  }
 
   // The write runs as its own exec in the box. A request whose response the
   // transport lost is sent once more: the box script never writes a numbered
@@ -352,7 +450,11 @@ class BoxSession {
 
   private async writeLine(line: string): Promise<void> {
     try {
-      for (const body of boxCcWriteExecs(this.control, line, ++this.lineSeq)) await this.writeExec(body)
+      const payload = isBoxGptWebModelArgv(this.o.args)
+        ? inlineGptWebAttachmentsInUserLine(line)
+        : line
+      for (const body of boxCcWriteExecs(this.control, payload, ++this.lineSeq))
+        await this.writeExec(body)
     } catch (err) {
       if (this.abort.signal.aborted) return
       const message = err instanceof Error ? err.message : 'BOX_CC_WRITE_FAILED'
@@ -362,8 +464,15 @@ class BoxSession {
       const stopper = new AbortController()
       const timer = setTimeout(() => stopper.abort(), STOP_EXEC_TIMEOUT_MS)
       timer.unref?.()
-      this.failedWriteCleanup = postExec(this.control, boxCcStopExec(this.control), this.o.fetchImpl, stopper.signal)
-        .then(async (response) => { await response.arrayBuffer() })
+      this.failedWriteCleanup = postExec(
+        this.control,
+        boxCcStopExec(this.control),
+        this.o.fetchImpl,
+        stopper.signal,
+      )
+        .then(async (response) => {
+          await response.arrayBuffer()
+        })
         .catch(() => undefined)
         .finally(() => clearTimeout(timer))
       this.abort.abort()
@@ -377,11 +486,20 @@ class BoxSession {
     this.abandoned = why
     this.o.stderr.write(`BOX_INTERACTIVE_ABANDON ${why}\n`)
     void (async () => {
-      for (let attempt = 0; attempt < 30 && !this.hostStreamEnded && !this.abort.signal.aborted; attempt++) {
+      for (
+        let attempt = 0;
+        attempt < 30 && !this.hostStreamEnded && !this.abort.signal.aborted;
+        attempt++
+      ) {
         const stopper = new AbortController()
         const timer = setTimeout(() => stopper.abort(), STOP_EXEC_TIMEOUT_MS)
         try {
-          const response = await postExec(this.control, boxCcInteractiveAbandonExec(this.control), this.o.fetchImpl, stopper.signal)
+          const response = await postExec(
+            this.control,
+            boxCcInteractiveAbandonExec(this.control),
+            this.o.fetchImpl,
+            stopper.signal,
+          )
           await response.arrayBuffer()
         } catch {
           // Tried again below while the host's stream is open.
@@ -395,7 +513,10 @@ class BoxSession {
 
   async deliver(line: string): Promise<void> {
     await this.gate
-    if (this.gaveUp) { this.o.late(line); return }
+    if (this.gaveUp) {
+      this.o.late(line)
+      return
+    }
     if (this.abort.signal.aborted) return
     if (this.held) {
       this.held.push(line)
@@ -409,7 +530,9 @@ class BoxSession {
   /** Sends `lines` first; later lines wait behind them. */
   private flushFirst(lines: string[]): Promise<void> {
     let release!: () => void
-    this.gate = new Promise((resolveGate) => { release = resolveGate })
+    this.gate = new Promise((resolveGate) => {
+      release = resolveGate
+    })
     return (async () => {
       try {
         for (const line of lines) {
@@ -433,7 +556,12 @@ class BoxSession {
     const stopper = new AbortController()
     const timer = setTimeout(() => stopper.abort(), STOP_EXEC_TIMEOUT_MS)
     try {
-      const response = await postExec(this.control, boxCcStopExec(this.control), this.o.fetchImpl, stopper.signal)
+      const response = await postExec(
+        this.control,
+        boxCcStopExec(this.control),
+        this.o.fetchImpl,
+        stopper.signal,
+      )
       await response.arrayBuffer()
     } catch {
       // The next launch for this session ends whatever is left.
@@ -447,14 +575,22 @@ class BoxSession {
 
   private async onTurnEnd(rotate: string | null): Promise<void> {
     const lines = this.signals.take()
-    const retire = rotate === 'quota' || rotate === 'login' || (rotate === 'near_limit' && this.o.alternatives > 0)
+    const retire =
+      rotate === 'quota' ||
+      rotate === 'login' ||
+      (rotate === 'near_limit' && this.o.alternatives > 0)
     if (!retire || this.stopRequested) {
-      if (lines.length > 0) void this.o.login.report({ accountId: this.o.accountId, profile: this.o.profile, lines }).catch(() => false)
+      if (lines.length > 0)
+        void this.o.login
+          .report({ accountId: this.o.accountId, profile: this.o.profile, lines })
+          .catch(() => false)
       return
     }
     // The master must know before this chat's next launch asks, or it could hand out the same
     // login again; and this container stops preferring it. The next message relaunches (--resume).
-    await this.o.login.report({ accountId: this.o.accountId, profile: this.o.profile, lines }).catch(() => false)
+    await this.o.login
+      .report({ accountId: this.o.accountId, profile: this.o.profile, lines })
+      .catch(() => false)
     this.o.memory.forget()
     this.o.stderr.write(`BOX_LOGIN_ROTATE ${this.o.profile} ${rotate}\n`)
     void this.stop()
@@ -472,10 +608,19 @@ class BoxSession {
     let launch: BoxCcExecRequest
     try {
       launch = isBoxGptWebModelArgv(this.o.args)
-        ? boxGptWebInteractiveLaunchExec(this.control, remoteInteractiveGptWebArgs(this.o.args),
-            this.o.gptWebMod ?? loadBoxGptWebMod(), this.o.profile, this.o.env)
-        : boxCcInteractiveLaunchExec(this.control, remoteInteractiveClaudeArgs(this.o.args),
-            this.o.bridgeMod ?? loadBoxBridgeMod(), this.o.profile)
+        ? boxGptWebInteractiveLaunchExec(
+            this.control,
+            remoteInteractiveGptWebArgs(this.o.args),
+            this.o.gptWebMod ?? loadBoxGptWebMod(),
+            this.o.profile,
+            this.o.env,
+          )
+        : boxCcInteractiveLaunchExec(
+            this.control,
+            remoteInteractiveClaudeArgs(this.o.args),
+            this.o.bridgeMod ?? loadBoxBridgeMod(),
+            this.o.profile,
+          )
     } catch (err) {
       const why = err instanceof Error ? err.message : 'BOX_INTERACTIVE_LAUNCH_FAILED'
       this.o.stderr.write(`BOX_INTERACTIVE_NOT_READY ${why}\n`)
@@ -530,11 +675,17 @@ class BoxSession {
     if (!this.readySeen && !this.sawStdout && !this.stopRequested && !this.o.abort.signal.aborted) {
       // The host never got a line, so nothing ran.
       const unsafe = /BOX_INTERACTIVE_NOT_READY profile_unsafe/.test(this.hostErr)
-      return this.giveUp({ why: this.abandoned ?? (unsafe ? 'profile_unsafe' : 'not_ready'), unsafe,
-        retryable: this.abandoned !== 'held_overflow' })
+      return this.giveUp({
+        why: this.abandoned ?? (unsafe ? 'profile_unsafe' : 'not_ready'),
+        unsafe,
+        retryable: this.abandoned !== 'held_overflow',
+      })
     }
     const rest = this.signals.take()
-    if (rest.length > 0) void this.o.login.report({ accountId: this.o.accountId, profile: this.o.profile, lines: rest }).catch(() => false)
+    if (rest.length > 0)
+      void this.o.login
+        .report({ accountId: this.o.accountId, profile: this.o.profile, lines: rest })
+        .catch(() => false)
     if (this.stopRequested) return { kind: 'ended', code: 0 }
     return { kind: 'ended', code: this.sawExit ? this.exitCode : 1 }
   }
@@ -550,7 +701,11 @@ class BoxLoginMemory {
     this.session = /^\/tmp\/oc-box-cc-([a-f0-9]{16})\.fifo$/.exec(fifo)?.[1] ?? null
     this.path = this.session ? join(dir, `login-${this.session}`) : null
     if (this.path) {
-      try { mkdirSync(dir, { recursive: true, mode: 0o700 }) } catch { /* reading fails below; only a cost */ }
+      try {
+        mkdirSync(dir, { recursive: true, mode: 0o700 })
+      } catch {
+        /* reading fails below; only a cost */
+      }
     }
   }
   read(): string | null {
@@ -558,23 +713,39 @@ class BoxLoginMemory {
     try {
       const value = readFileSync(this.path, 'utf8').trim()
       return /^(default|[a-z0-9][a-z0-9-]{0,31})$/.test(value) ? value : null
-    } catch { return null }
+    } catch {
+      return null
+    }
   }
   write(profile: string): void {
     if (!this.path) return
-    try { writeFileSync(this.path, profile, { mode: 0o600 }) } catch { /* only a cost */ }
+    try {
+      writeFileSync(this.path, profile, { mode: 0o600 })
+    } catch {
+      /* only a cost */
+    }
   }
   forget(): void {
     if (!this.path) return
-    try { rmSync(this.path, { force: true }) } catch { /* only a cost */ }
+    try {
+      rmSync(this.path, { force: true })
+    } catch {
+      /* only a cost */
+    }
   }
 }
 
 export interface BoxLoginPort {
-  choose(accountId: string | undefined, sticky?: { session?: string; prefer?: string }):
-    Promise<{ profile: string; source: 'master' | 'fallback'; alternatives?: number }>
-  report(input: { accountId: string | undefined; profile: string; lines: readonly string[]; unsafe?: boolean }):
-    Promise<unknown>
+  choose(
+    accountId: string | undefined,
+    sticky?: { session?: string; prefer?: string },
+  ): Promise<{ profile: string; source: 'master' | 'fallback'; alternatives?: number }>
+  report(input: {
+    accountId: string | undefined
+    profile: string
+    lines: readonly string[]
+    unsafe?: boolean
+  }): Promise<unknown>
 }
 
 const MAX_TURN_SIGNALS = 16
@@ -599,7 +770,8 @@ export class BoxLoginSignalTap {
       this.buf = this.buf.slice(nl + 1)
       const type = TOP_TYPE.exec(line)?.[1]
       if (type === 'rate_limit_event' || (type === 'assistant' && line.includes('"<synthetic>"'))) {
-        if (line.length <= MAX_SIGNAL_LINE && this.turn.length < MAX_TURN_SIGNALS) this.turn.push(line)
+        if (line.length <= MAX_SIGNAL_LINE && this.turn.length < MAX_TURN_SIGNALS)
+          this.turn.push(line)
         const reason = rotateReason(line)
         // A refusal or a logged-out login outranks "near the limit" within the same turn.
         if (reason && (this.rotate === null || this.rotate === 'near_limit')) this.rotate = reason
@@ -622,19 +794,40 @@ export class BoxLoginSignalTap {
 
 function rotateReason(line: string): string | null {
   let record: unknown
-  try { record = JSON.parse(line) } catch { return null }
-  const top = record as { type?: unknown; rate_limit_info?: Record<string, unknown>; message?: { model?: unknown; content?: unknown } }
+  try {
+    record = JSON.parse(line)
+  } catch {
+    return null
+  }
+  const top = record as {
+    type?: unknown
+    rate_limit_info?: Record<string, unknown>
+    message?: { model?: unknown; content?: unknown }
+  }
   if (top?.type === 'rate_limit_event') {
-    const info = (top.rate_limit_info ?? {}) as { status?: unknown; utilization?: unknown; unifiedWindows?: unknown }
+    const info = (top.rate_limit_info ?? {}) as {
+      status?: unknown
+      utilization?: unknown
+      unifiedWindows?: unknown
+    }
     if (info.status === 'rejected') return 'quota'
-    const used = [info.utilization, ...Object.values((info.unifiedWindows ?? {}) as Record<string, { utilization?: unknown }>)
-      .map((w) => w?.utilization)].filter((u): u is number => typeof u === 'number' && Number.isFinite(u))
+    const used = [
+      info.utilization,
+      ...Object.values(
+        (info.unifiedWindows ?? {}) as Record<string, { utilization?: unknown }>,
+      ).map((w) => w?.utilization),
+    ].filter((u): u is number => typeof u === 'number' && Number.isFinite(u))
     return used.some((u) => u >= NEAR_LIMIT) ? 'near_limit' : null
   }
-  if (top?.type === 'assistant' && top.message?.model === '<synthetic>' && Array.isArray(top.message.content)) {
+  if (
+    top?.type === 'assistant' &&
+    top.message?.model === '<synthetic>' &&
+    Array.isArray(top.message.content)
+  ) {
     for (const block of top.message.content as Array<{ text?: unknown }>) {
       if (typeof block?.text === 'string' && /^Not logged in\b/.test(block.text)) return 'login'
-      if (typeof block?.text === 'string' && /hit your .*limit|usage limit/i.test(block.text)) return 'quota'
+      if (typeof block?.text === 'string' && /hit your .*limit|usage limit/i.test(block.text))
+        return 'quota'
     }
   }
   return null
@@ -651,7 +844,8 @@ function bufferLines(
   let buf = ''
   let chain = Promise.resolve()
   return new Promise((resolvePromise, reject) => {
-    const fail = (error: unknown): void => reject(error instanceof Error ? error : new Error(String(error)))
+    const fail = (error: unknown): void =>
+      reject(error instanceof Error ? error : new Error(String(error)))
     input.on('data', (chunk: Buffer | string) => {
       buf += typeof chunk === 'string' ? chunk : chunk.toString('utf8')
       let nl = buf.indexOf('\n')
@@ -674,8 +868,8 @@ function bufferLines(
   })
 }
 
-const invokedDirectly = process.argv[1]
-  && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+const invokedDirectly =
+  process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)
 
 if (invokedDirectly) {
   const controlPath = process.env.OC_BOX_CC_CONTROL
@@ -690,11 +884,13 @@ if (invokedDirectly) {
     stdin: process.stdin,
     stdout: process.stdout,
     stderr: process.stderr,
-  }).then((code) => {
-    process.exit(code)
-  }).catch((error: unknown) => {
-    const message = error instanceof Error ? error.message : 'BOX_CC_BRIDGE_FAILED'
-    process.stderr.write(`${message}\n`)
-    process.exit(1)
   })
+    .then((code) => {
+      process.exit(code)
+    })
+    .catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : 'BOX_CC_BRIDGE_FAILED'
+      process.stderr.write(`${message}\n`)
+      process.exit(1)
+    })
 }
