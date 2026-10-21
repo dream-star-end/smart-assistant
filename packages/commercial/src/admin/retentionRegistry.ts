@@ -147,6 +147,7 @@ export const DURABLE_TABLES: readonly string[] = [
   "model_runtime_requirements",
   "model_security_epoch",
   "model_visibility_grants",
+  "muse_bridge_credentials",
   "oauth_identities",
   "orders",
   "org_installs",

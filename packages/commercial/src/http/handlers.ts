@@ -118,11 +118,14 @@ import type { BiliAccountSetupManager } from '../plugins/biliAccountSetup.js'
 import type { KnowledgePlanetAutomationService } from '../plugins/knowledgePlanetAutomation.js'
 import type { GoalStateService } from '../goal/goalStateService.js'
 import type { MediaGenerationService } from '../media-generation/service.js'
+import type { MuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
 
 export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
   /** Durable local H3 jobs and long-form storyboard projects. */
   mediaGeneration?: MediaGenerationService;
+  /** OCV5-561 Muse bridge endpoints; undefined (→ 404) unless OC_MUSE_BRIDGE_ENABLED=1. */
+  museBridgeHttp?: MuseBridgeHttpHandler;
   /** Platform-authoritative session GoalState service. */
   goalStateService?: GoalStateService;
   /** Short-lived one-time browser tickets for V5 container-local preview. */
