@@ -904,6 +904,29 @@ test('validatePdfStructureSync and LiteratureArtifactStore accept publisher PDFs
     assert.equal(validatePdfStructureSync(dangerousPdf), false)
     assert.equal(await validatePdfInIsolatedWorker(dangerousPdf, signal), false)
   }
+
+  // 4. Content stream containing literal text "/JS" in last 64KiB is NOT falsely rejected
+  const textWithSlashJsStream = 'BT /F1 12 Tf 72 720 Td (Documentation: /JS is a PDF key.) Tj ET'
+  const pdfWithSlashJsInContentStream = Buffer.from(
+    `%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>\nendobj\n4 0 obj\n<< /Length ${textWithSlashJsStream.length} >>\nstream\n${textWithSlashJsStream}\nendstream\nendobj\nxref\n0 5\n0000000000 65535 f \ntrailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n100\n%%EOF\n`,
+    'latin1',
+  )
+  assert.equal(validatePdfStructureSync(pdfWithSlashJsInContentStream), true)
+
+  // 5. Compressed /ObjStm hiding /JavaScript action is still rejected
+  const zlib = await import('node:zlib')
+  const objStmPayload = zlib.deflateSync(
+    Buffer.from('5 0 << /S /JavaScript /JS (app.alert(1)) >>', 'latin1'),
+  )
+  const pdfWithObjStmJs = Buffer.concat([
+    Buffer.from(
+      `%PDF-1.5\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R /OpenAction 5 0 R >>\nendobj\n4 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length ${objStmPayload.length} >>\nstream\n`,
+      'latin1',
+    ),
+    objStmPayload,
+    Buffer.from('\nendstream\nendobj\ntrailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n100\n%%EOF\n', 'latin1'),
+  ])
+  assert.equal(validatePdfStructureSync(pdfWithObjStmJs), false)
 })
 
 test('resolveLiteratureCaptchaBundleRoot honors env override and falls back to default bundle root when present', () => {
