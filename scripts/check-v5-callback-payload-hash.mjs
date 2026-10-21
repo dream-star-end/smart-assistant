@@ -114,7 +114,7 @@ async function verifyEvents() {
 
 async function supervise() {
   // Absolute workspace links in a reused donor must not execute old product code.
-  for (const name of ['commercial', 'gateway', 'protocol', 'storage']) {
+  for (const name of ['commercial', 'gateway', 'protocol', 'kernel', 'storage']) {
     assert.equal(await realpath(join(root, 'node_modules/@openclaude', name)),
       await realpath(join(root, 'packages', name)), 'workspace escaped candidate: ' + name);
   }

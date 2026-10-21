@@ -214,7 +214,7 @@ async function killGroup(pid: number): Promise<void> {
 
 function assertPinnedModules(root: string): void {
   const base = realpathSync(root);
-  for (const name of ["commercial", "gateway", "protocol", "storage", "pg", "tsx"]) {
+  for (const name of ["commercial", "gateway", "protocol", "kernel", "storage", "pg", "tsx"]) {
     const linked = realpathSync(join(root, "node_modules", name === "pg" || name === "tsx"
       ? name : join("@openclaude", name)));
     const owned = name === "pg" || name === "tsx" ? linked : realpathSync(join(root, "packages", name));

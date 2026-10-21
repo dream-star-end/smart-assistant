@@ -328,8 +328,14 @@ describe('log', () => {
     assert.equal(w.cause.message, 'inner')
     assert.equal(typeof w.stack, 'string')
     assert.deepEqual(i, { a: 1, ts: 'T', level: 'info', msg: 'plain' })
+    log.error('obj', undefined, { reason: 'busy', token: 't' })
+    assert.deepEqual(
+      json()[2].error,
+      { reason: 'busy', token: '<redacted>' },
+      'a plain object is kept, redacted',
+    )
     log.error('str', undefined, 'just a string')
-    assert.equal(json()[2].error, 'just a string')
+    assert.equal(json()[3].error, 'just a string')
   })
   test('levels: filtered below the shared ref, changeable at runtime, parse is lenient', () => {
     const level = createLevelRef('warn')

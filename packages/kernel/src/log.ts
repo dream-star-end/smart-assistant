@@ -106,7 +106,9 @@ export function createLogger(opts: LoggerOptions): Logger {
         put(fields ? (r(fields) as Fields) : undefined)
         if (error !== undefined) {
           const e = r(error)
-          if (e && typeof e === 'object' && !Array.isArray(e)) {
+          // only an Error is flattened into error/errorCode/stack/cause; anything else (a string, a
+          // plain object, a rejected value) is kept as `error`, redacted
+          if (error instanceof Error && e && typeof e === 'object' && !Array.isArray(e)) {
             const ef = e as Fields
             entry.error = ef.message ?? ef.name
             if (ef.code !== undefined) entry.errorCode = ef.code
