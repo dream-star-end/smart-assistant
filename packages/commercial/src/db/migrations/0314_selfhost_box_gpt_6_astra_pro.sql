@@ -16,9 +16,8 @@
 DO $$
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM model_catalog
-     WHERE model_id = 'box-claude-opus-5-5' AND engine = 'cursor' AND provider_id = 'cursor'
-       AND state IN ('active', 'disabled', 'staged')
+    SELECT 1 FROM model_catalog c JOIN model_pricing p USING (model_id)
+     WHERE c.model_id = 'box-claude-opus-5-5'
   ) THEN
     RAISE EXCEPTION '0314 requires the box-claude-opus-5-5 catalog row as the donor';
   END IF;
@@ -40,11 +39,11 @@ BEGIN
       model_id, engine, provider_id, upstream_model_id, context_window,
       capability_profile, capability_schema_version, state
     )
-    SELECT 'box-gpt-6-astra-pro', engine, provider_id, 'gpt-6-astra-pro', 400000,
+    SELECT 'box-gpt-6-astra-pro', 'cursor', 'cursor', 'gpt-6-astra-pro', 400000,
            capability_profile, capability_schema_version, 'staged'
       FROM model_catalog
-     WHERE model_id = 'box-claude-opus-5-5' AND state IN ('active', 'disabled', 'staged')
-     ORDER BY (state = 'active') DESC, entry_id DESC
+     WHERE model_id = 'box-claude-opus-5-5'
+     ORDER BY (engine = 'cursor' AND provider_id = 'cursor') DESC, (state = 'active') DESC, entry_id DESC
      LIMIT 1;
 
     INSERT INTO model_pricing (
