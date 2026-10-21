@@ -35,6 +35,19 @@ describe('commercial logger (kernel wrapper)', () => {
     assert.equal(obj.requestBody, '<redacted>')
     assert.equal(obj['api-key'], '<redacted>')
   })
+  test('Codex r1: mixed-case keys stay case-insensitive (passWord, toKen, ApI_kEy, BODY)', () => {
+    const c = capture()
+    c.logger.info('probe', {
+      passWord: 's3cr3t-value',
+      toKen: 'opaque-credential',
+      ApI_kEy: 'k1',
+      BODY: 'b1',
+      SyStEm: 's1',
+    })
+    const raw = c.lines.join('\n')
+    for (const leaked of ['s3cr3t-value', 'opaque-credential', 'k1', 'b1', 's1'])
+      assert.ok(!raw.includes(leaked), leaked)
+  })
   test('free text is scanned: e-mail, bearer tokens, URL credentials in msg and fields', () => {
     const c = capture()
     c.logger.warn('login failed for bob@example.com', {

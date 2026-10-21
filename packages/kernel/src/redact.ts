@@ -111,9 +111,19 @@ export function normalizeKey(key: string): string {
     .toLowerCase()
 }
 
+/**
+ * The forms a key is compared in: camelCase split (`accessToken` → `access_token`) and plain
+ * lowercase (`passWord` → `password`, `TOKEN` → `token`), both with `-`/space/`.` → `_`. A key
+ * matches when either form does, so case-insensitive matching is never lost to the camel split.
+ */
+function keyForms(key: string): [string, string] {
+  return [normalizeKey(key), key.replace(/[-\s.]+/g, '_').toLowerCase()]
+}
+
 export function isCredentialKey(key: string): boolean {
-  const k = normalizeKey(key)
-  return CREDENTIAL_KEYS.has(k) || CREDENTIAL_SUFFIXES.some((s) => k.endsWith(s))
+  return keyForms(key).some(
+    (k) => CREDENTIAL_KEYS.has(k) || CREDENTIAL_SUFFIXES.some((s) => k.endsWith(s)),
+  )
 }
 
 // Credential keys recognised in free-text `key=value` / `"key": value` pairs: like isCredentialKey,
@@ -259,8 +269,7 @@ export function createRedactor(
   const extra = new Set([...(policy.extraKeys ?? [])].map(normalizeKey))
   const redactsKey = (key: string) => {
     if (isCredentialKey(key)) return true
-    const k = normalizeKey(key)
-    return extra.has(k) || (!!policy.payload && PAYLOAD_KEYS.has(k))
+    return keyForms(key).some((k) => extra.has(k) || (!!policy.payload && PAYLOAD_KEYS.has(k)))
   }
   let nodes = 0
   let textBudget = 0
