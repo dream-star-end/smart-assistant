@@ -614,6 +614,27 @@ write_web_dist_reuse_record() { # <staging> <key-or-empty> <mode> <full-sha> [do
     > "$staging/$WEB_DIST_REUSE_RECORD"
 }
 
+# OCV5-545:把 check-architecture.ts --json 的计数记进列车 summary.json(只记录,读不到就记 unreadable)。
+master_note_architecture() { # <report.json>
+  local counts v
+  counts="$(node -e '
+    const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+    const total = Object.values(r.byRule || {}).reduce((n, x) => n + x, 0);
+    console.log([total, r.identities, (r.grown || []).length, (r.stale || []).length, r.unmapped,
+      Math.round(r.seconds)].join(" "));
+  ' "$1" 2>/dev/null)" || counts=""
+  if [[ -z "$counts" ]]; then
+    tsum_note arch.report unreadable 2>/dev/null || :
+    return 0
+  fi
+  local names=(violations identities grown stale unmapped seconds) i=0
+  for v in $counts; do
+    tsum_note "arch.${names[i]}" "$v" 2>/dev/null || :
+    i=$((i + 1))
+  done
+  mlog "  architecture: violations/identities/grown/stale/unmapped/seconds = $counts"
+}
+
 build_master_release() {
   local full_sha short_sha ts staging reldir donor t0 t1 build_id web_key web_donor
   BUILT_MASTER_RELEASE=""
@@ -776,6 +797,21 @@ build_master_release() {
     cleanup_master_staging
     die "pinned session unavailable / data-safety rootfix contract gate 失败"
   fi
+  # OCV5-545(第三阶段 P0b 列车步骤):架构护栏在 pinned staging 跑报告期,计数写进 summary.json。
+  # 报告期不拦新增违规(和 PR CI 的 architecture job 一致);检查器 fail-closed(解析失败、modules.json
+  # 或基线不合法,退出 2)照样让列车失败。转强制期时这里改 --enforce。
+  tsum_mark C.architecture 2>/dev/null || :
+  mlog "  architecture guardrails (report period) @ pinned staging"
+  if [[ ! -f "$staging/scripts/check-architecture.ts" ]]; then
+    cleanup_master_staging
+    die "新候选缺 scripts/check-architecture.ts"
+  fi
+  if ! ( cd "$staging" && TMPDIR="$MASTER_GATE_TMPDIR" npx --no-install tsx scripts/check-architecture.ts \
+      --json "$MASTER_GATE_TMPDIR/architecture.json" ); then
+    cleanup_master_staging
+    die "pinned architecture guardrails 失败(检查器 fail-closed)"
+  fi
+  master_note_architecture "$MASTER_GATE_TMPDIR/architecture.json"
   # OCV5-404:committed 后会把本 release 的 watch.sh 装到宿主,所以它的判定逻辑与停用/重新武装
   # 行为必须先在 pinned staging 上过一遍。测试只写 mktemp 目录,不碰宿主标记与安装副本。
   # OCV5-418:门禁失败 stay 路径(survivor kept-failed / 维护窗口 / 列车 failed / 告警)同样先在 staging 跑。
