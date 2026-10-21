@@ -63,8 +63,9 @@ CREATE INDEX IF NOT EXISTS muse_media_jobs_user_kind_queued_idx ON muse_media_jo
 ### 3.2 `MuseBridgeHub`（进程内单例，`hub.ts`）
 
 - 状态：当前 session（`{id, credentialId, lastSeen, version}`），等待中的 poll（最多 1 个），FIFO 队列（≤ 3），当前运行的 job（≤ 1）。
-- job 状态机：`queued → dispatched → running → succeeded|failed|cancelled`。
-  - **dispatched → running 需要 bridge 的 ack**：bridge 收到 job 后立即发一次 heartbeat（bridge v0.3.0 改动）。master 在 20 s 内没收到 ack，就把 job 放回队首并换一个新 nonce。这样能覆盖“长轮询响应在 Cloudflare 上丢失、bridge 根本没收到任务”的情况，因为 bridge 从没开始，重派是安全的。一旦已 ack，就不再重派（生成可能已经在后端进行）。
+- job 状态机（内存）：`queued → dispatched → running → succeeded|failed|cancelled`。
+  - **`dispatched` 只存在于内存**。数据库的 `status` 在 dispatched 期间仍是 `queued`，收到 ack 后才写成 `running`。所以 CHECK 约束不需要改，启动收口（`queued`/`running` → `failed/MUSE_MASTER_RESTARTED`）也覆盖了 dispatched 期间重启的情况。（plan r1 P1-3）
+  - **ack 是执行屏障**（plan r1 P1-2）：bridge 收到 job 后先发一次 heartbeat 作为 ack，**只有拿到 master 对这个 session/job/nonce 的 200 成功响应后才启动 CLI**。ack 失败时最多重试 3 次（每次间隔 2 s，总时长小于 master 的 20 s ack 超时）；仍然失败，或者收到 410，就放弃这个 job：不跑 CLI，也不回传结果，直接回到 poll。master 侧：dispatched 状态 20 s 内没有收到 ack，就把 job 放回队首并换一个新 nonce（最多派发 3 次，超过就记为 `MUSE_BRIDGE_LOST`）。旧 nonce 的 ack 一律返回 410。这样任何时刻最多只有一份生成在执行：bridge 拿到成功 ack 时，master 必然已把 job 标为 running，之后不会再重派；master 重派之前，bridge 必然没拿到成功 ack，所以也没有开始执行。
   - running 后 60 s 没有 heartbeat → `MUSE_BRIDGE_LOST`。
   - deadline（图片 180 s；视频 390 s；带源图再加 120 s）到了 → `MUSE_TIMEOUT`，下次 heartbeat 回 `cancel:true`。
 - 只有一个 master 进程持有 hub（个人版 master 单实例）。重启时 hub 为空，启动时把 DB 里 `queued/running` 的行收口为 `failed / MUSE_MASTER_RESTARTED`。
@@ -75,7 +76,7 @@ CREATE INDEX IF NOT EXISTS muse_media_jobs_user_kind_queued_idx ON muse_media_jo
 
 - `router.ts`：新增 `{ method: ANY_METHOD, pathPrefix: '/api/muse-bridge/', handler }`；`COMMERCIAL_ROUTE_PREFIXES` 加 `'/api/muse-bridge/'`（`routeOwnership.test.ts` 的两处同步契约）。不进维护期白名单（维护期 bridge 收到 503 后退避重试，与设计一致）。
 - 鉴权：`Authorization: Bearer mbr_…` → sha256 → 查 `muse_bridge_credentials`（`revoked_at IS NULL`），用 `timingSafeEqual` 比较。失败：同一 `clientIp` 每分钟超过 10 次 → 429。日志只记 credential id 和 IP。
-- 端点与设计 §3 一致：`hello`、`poll`（挂起 25 s；`req` 的 close 事件会撤掉等待，**不会把任务派给已断开的 poll**）、`jobs/:id/heartbeat`、`jobs/:id/files/:idx/chunks/:n`（PUT，≤ 4 MiB，校验 `X-Chunk-Sha256` 和 `X-Job-Nonce`，n 必须连续）、`jobs/:id/result`。`bridge.py` 下载接口不做。
+- 端点与设计 §3 一致：`hello`、`poll`（挂起 25 s。用 **`res` 的 `close` 事件，并判断 `!res.writableEnded`** 来识别客户端提前断开（`req` 的 close 在正常读完请求体后也会触发，不能用；plan r1 P1-1），断开就撤掉等待者。派发时如果 `res.destroyed` 或 `res.writableEnded`，就立即把 job 放回队首。万一写出成功但对端没收到，由上面的 ack 屏障兜底）、`jobs/:id/heartbeat`、`jobs/:id/files/:idx/chunks/:n`（PUT，≤ 4 MiB，校验 `X-Chunk-Sha256` 和 `X-Job-Nonce`，n 必须连续）、`jobs/:id/result`。`bridge.py` 下载接口不做。
 - 请求体上限：JSON 64 KiB；分片按 `chunk_bytes + 1 KiB`。
 
 ### 3.4 容器内部接口（`internalHttp.ts`，`/internal/v3/muse-media/*`）
@@ -118,8 +119,8 @@ CREATE INDEX IF NOT EXISTS muse_media_jobs_user_kind_queued_idx ON muse_media_jo
 
 ## 5. bridge v0.3.0（随本 PR 收进仓库）
 
-- 收到 job 后**立即**发一次 heartbeat 作为 ack（之后每 15 s 一次）。
-- 其它行为不变；测试一并进仓库。新增用例：立即 ack；poll 断开时不丢 job（mock 里模拟“派发后不 ack → 重派”）。
+- 收到 job 后**先 ack，拿到成功响应才开始**：ack 失败最多重试 3 次（每次间隔 2 s）；收到 410 或重试耗尽就放弃这个 job，不执行、不回传。ack 成功后每 15 s 发一次 heartbeat。
+- 其它行为不变；测试一并进仓库。新增用例：ack 成功才执行；ack 收到 410 时不执行；ack 网络失败重试后放弃且不执行；master 侧“派发后 20 s 没有 ack → 换 nonce 重派，旧 nonce 返回 410”。
 
 ## 6. 测试
 
