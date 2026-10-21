@@ -132,6 +132,19 @@ export type {
   OfficialClaudeCliArgsInput,
 } from './subprocessSpawnConfig.js'
 
+/**
+ * OCV5-556: CCB deletes transcripts older than `cleanupPeriodDays` (default
+ * 30) from the persisted projects volume, so a conversation resumed after a
+ * month failed with STALE_RESUME_ID. Keep them longer than the resume-map TTL
+ * (RESUME_MAP_INACTIVE_TTL_MS, 90 days).
+ */
+export const CCB_TRANSCRIPT_RETENTION_DAYS = 120
+
+/** Per-session `--settings` for CCB: transcript retention plus the efficiency hooks, if any. */
+export function buildCcbSessionSettings(efficiency: Record<string, unknown> | null): Record<string, unknown> {
+  return { ...(efficiency ?? {}), cleanupPeriodDays: CCB_TRANSCRIPT_RETENTION_DAYS }
+}
+
 export { renderCcbGoalPrompt }
 
 const runnerLog = createLogger({ module: 'subprocessRunner' })
@@ -1776,15 +1789,12 @@ export class SubprocessRunner extends EventEmitter {
     }
 
     try {
-      const efficiencySettings = buildCcbEfficiencySettings()
-      if (efficiencySettings) {
-        const settingsPath = resolve(sessionDir, 'settings.json')
-        atomicWriteJsonFile(settingsPath, efficiencySettings, 0o600)
-        out.settingsFile = settingsPath
-      }
+      const settingsPath = resolve(sessionDir, 'settings.json')
+      atomicWriteJsonFile(settingsPath, buildCcbSessionSettings(buildCcbEfficiencySettings()), 0o600)
+      out.settingsFile = settingsPath
     } catch (err) {
       runnerLog.warn(
-        'failed to write efficiency hook settings',
+        'failed to write CCB session settings',
         { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId },
         err,
       )
