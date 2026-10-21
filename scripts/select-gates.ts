@@ -32,6 +32,7 @@ export type GateId =
   | "typecheck"
   | "test:v5:ops"
   | "test:protocol"
+  | "test:kernel"
   | "test:channels"
   | "test:gateway"
   | "test:mcp-memory"
@@ -50,7 +51,7 @@ export interface GateMeta {
   lock: GateLock;
 }
 
-/** check:v5 的 18 道门,顺序与 package.json 全量链一致,便于打印「跳过了哪些」。 */
+/** check:v5 的 19 道门,顺序与 package.json 全量链一致,便于打印「跳过了哪些」。 */
 export const ALL_GATES: GateMeta[] = [
   { id: "check:ci-parity", npmScript: "check:ci-parity", cost: "cheap", lock: null },
   { id: "check:v5:incidents", npmScript: "check:v5:incidents", cost: "cheap", lock: null },
@@ -62,6 +63,7 @@ export const ALL_GATES: GateMeta[] = [
   { id: "typecheck", npmScript: "typecheck", cost: "medium", lock: null },
   { id: "test:v5:ops", npmScript: "test:v5:ops", cost: "medium", lock: null },
   { id: "test:protocol", npmScript: "test:protocol", cost: "medium", lock: null },
+  { id: "test:kernel", npmScript: "test:kernel", cost: "cheap", lock: null },
   { id: "test:channels", npmScript: "test:channels", cost: "medium", lock: null },
   { id: "test:gateway", npmScript: "test:gateway", cost: "medium", lock: null },
   { id: "test:mcp-memory", npmScript: "test:mcp-memory", cost: "medium", lock: null },
@@ -363,7 +365,7 @@ export const GATE_RULES: GateRule[] = [
       "OCV5-546:@openclaude/kernel(L1 core,第三阶段 P0c 空包)。还没有 dependents,只建自己;" +
       "包开始被 import 时把 dependents 加进 TYPECHECK_DEPENDENTS 和这里的 typecheckProjects。",
     match: (f) => f.startsWith("packages/kernel/"),
-    gates: ["typecheck"],
+    gates: ["test:kernel", "typecheck"],
     typecheckProjects: ["packages/kernel"],
   },
   {
