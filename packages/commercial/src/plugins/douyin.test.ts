@@ -739,6 +739,14 @@ describe('douyin login: visible captcha still stops; verification is the owner S
     assert.doesNotMatch(verify, /for \(let attempt/)
     assert.match(verify, /flags\.sendCode\.challenge\) await failLogin\('UPSTREAM_CHALLENGE'/)
     assert.match(verify, /flags\.validateChallenge\) await failLogin\('UPSTREAM_CHALLENGE'/)
+    // 风控信号粘性：迟到的 403/429 也会让验证循环和主循环下一轮立即停止（Codex r2 P1）。
+    assert.match(verify, /if \(flags\.challengeSeen\) await failLogin\('UPSTREAM_CHALLENGE'/)
+    assert.match(loop, /if \(flags\.challengeSeen\) await failLogin\('UPSTREAM_CHALLENGE'/)
+    assert.equal(
+      (DOUYIN_WORKER_SOURCE.match(/if \(r\.challenge\) flags\.challengeSeen = true;/g) ?? [])
+        .length,
+      2,
+    )
     assert.match(verify, /flags\.validateAt !== before && flags\.validateOk/)
     assert.match(verify, /const command = await nextCommand\(/)
     assert.doesNotMatch(verify, /emitStep\([^)]*code: command/)

@@ -14,8 +14,8 @@
  */
 
 import { execFileSync } from 'node:child_process'
-import { lstatSync, rmSync } from 'node:fs'
-import { chmod, readFile, rm, writeFile } from 'node:fs/promises'
+import { closeSync, constants as fsConstants, lstatSync, openSync, readSync, rmSync } from 'node:fs'
+import { chmod, rm, writeFile } from 'node:fs/promises'
 
 import Docker from 'dockerode'
 
@@ -79,32 +79,47 @@ async function advisoryStatus(): Promise<void> {
 }
 
 /** 建 root-only 命名管道:验证码只经过内存,不落盘。 */
-function createSmsFifo(path: string): void {
+/**
+ * 建 root-only 命名管道并以非阻塞方式打开读端:验证码只经过内存、不落盘;读取靠轮询,没有被阻塞的线程,
+ * 管道被删或登录结束都不会让 CLI 卡住(Codex r2 P1)。
+ */
+function openSmsFifo(path: string): number {
   rmSync(path, { force: true })
   execFileSync('mkfifo', ['-m', '600', path])
+  if (!lstatSync(path).isFIFO()) throw new Error('sms code path is not a FIFO')
+  return openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK)
 }
 
-/** 从命名管道读一次验证码(阻塞到有人写入);超时就自己写一个空值解开阻塞并返回 null。只返回数字,不打印。 */
-async function waitForSmsCode(fifo: string, untilMs: number): Promise<string | null> {
-  if (!lstatSync(fifo).isFIFO()) throw new Error('sms code path is not a FIFO')
-  let timer: NodeJS.Timeout | undefined
-  const timeout = new Promise<null>((resolveTimeout) => {
-    timer = setTimeout(
-      () => {
-        // 写端打开会让阻塞中的读取拿到 EOF;值为空,下面按无效处理。
-        void writeFile(fifo, '').catch(() => {})
-        resolveTimeout(null)
-      },
-      Math.max(0, untilMs - Date.now()),
-    )
-  })
-  const raw = await Promise.race([readFile(fifo, 'utf8'), timeout])
-  if (timer) clearTimeout(timer)
-  if (raw === null) return null
-  const code = raw.replace(/[^0-9]/g, '')
-  if (/^[0-9]{4,8}$/.test(code)) return code
-  log({ step: 'sms-code-invalid-format' })
-  return Date.now() < untilMs ? waitForSmsCode(fifo, untilMs) : null
+/** 轮询读一次验证码:写端写完关闭后才算一条;超时或登录已结束返回 null。只返回数字,不打印。 */
+async function waitForSmsCode(
+  fd: number,
+  untilMs: number,
+  stopped: () => boolean,
+): Promise<string | null> {
+  const chunk = Buffer.alloc(64)
+  let pending = ''
+  while (Date.now() < untilMs && !stopped()) {
+    let n = 0
+    try {
+      n = readSync(fd, chunk, 0, chunk.length, null)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EAGAIN') throw error
+    }
+    if (n > 0) {
+      pending += chunk.toString('utf8', 0, n)
+      chunk.fill(0)
+      if (pending.length > 64) pending = ''
+      continue
+    }
+    if (pending) {
+      const code = pending.replace(/[^0-9]/g, '')
+      pending = ''
+      if (/^[0-9]{4,8}$/.test(code)) return code
+      log({ step: 'sms-code-invalid-format' })
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 200))
+  }
+  return null
 }
 
 async function scanLogin(
@@ -126,7 +141,7 @@ async function scanLogin(
       await handleRef.command({ cmd: 'abort' }).catch(() => {})
       return
     }
-    const code = await waitForSmsCode(smsCodeFifo, smsDeadline)
+    const code = await waitForSmsCode(fifoFd, smsDeadline, () => loginEnded)
     if (code === null) {
       log({ step: 'sms-timeout' })
       await handleRef.command({ cmd: 'abort' }).catch(() => {})
@@ -136,7 +151,8 @@ async function scanLogin(
     log({ step: 'sms-submit', attempt: attempts })
     await handleRef.command({ cmd: 'sms_code', code }).catch(() => {})
   }
-  createSmsFifo(smsCodeFifo)
+  const fifoFd = openSmsFifo(smsCodeFifo)
+  let loginEnded = false
   const handle = await service.startLogin({
     sessionId: crypto.randomUUID(),
     pins,
@@ -180,6 +196,8 @@ async function scanLogin(
   await handle.done.catch((error: unknown) => {
     doneError = error ?? new Error('WORKER_FAILED')
   })
+  loginEnded = true
+  closeSync(fifoFd)
   await rm(smsCodeFifo, { force: true }).catch(() => {})
   return requireCleanLogin({ state, failure, doneError })
 }

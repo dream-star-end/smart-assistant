@@ -495,6 +495,8 @@ async function runVerification(login, flags, deadlineMs) {
   emitStep({ step: 'login.verification', kind: available ? 'sms_available' : 'unsupported' });
   const until = Math.min(deadlineMs, Date.now() + VERIFY_WINDOW_MS);
   while (Date.now() < until) {
+    // 风控信号是粘性的：任何一次 send_code / validate_code 风控应答（哪怕晚于等待窗口到达）都会让下一轮立即停止（Codex r2 P1）。
+    if (flags.challengeSeen) await failLogin('UPSTREAM_CHALLENGE', 'login.sms_challenge');
     const challenge = await pageChallenge(login.context());
     if (challenge) await failLogin(challenge, 'login.blocked');
     if (flags.validated) return;
@@ -537,7 +539,7 @@ async function runLogin(input, relay) {
   try {
     const context = await secureContext(browser, { cookies: [], origins: [] }, allowed, ['GET', 'POST', 'HEAD']);
     const tracker = newQrTracker();
-    const flags = { mfa: false, validated: false, sendCode: { at: 0, ok: false, challenge: false }, validateAt: 0, validateOk: false, validateChallenge: false };
+    const flags = { mfa: false, validated: false, sendCode: { at: 0, ok: false, challenge: false }, validateAt: 0, validateOk: false, validateChallenge: false, challengeSeen: false };
     context.on('request', (request) => { try { if (/\/passport\/web\/get_qrcode\//.test(new URL(request.url()).pathname)) tracker.lastGetQrAt = Date.now(); } catch {} });
     context.on('response', async (response) => {
       let path;
@@ -545,8 +547,8 @@ async function runLogin(input, relay) {
       if (!/\/passport\/web\/(get_qrcode|check_qrconnect|send_code|validate_code)\//.test(path)) return;
       let json = null;
       try { json = JSON.parse(await response.text()); } catch {}
-      if (/send_code/.test(path)) { const r = smsResponse(response.status(), json); flags.sendCode = { at: Date.now(), ok: r.ok, challenge: r.challenge }; return; }
-      if (/validate_code/.test(path)) { const r = smsResponse(response.status(), json); flags.validateOk = r.ok; flags.validateChallenge = r.challenge; flags.validateAt = Date.now(); return; }
+      if (/send_code/.test(path)) { const r = smsResponse(response.status(), json); flags.sendCode = { at: Date.now(), ok: r.ok, challenge: r.challenge }; if (r.challenge) flags.challengeSeen = true; return; }
+      if (/validate_code/.test(path)) { const r = smsResponse(response.status(), json); flags.validateOk = r.ok; flags.validateChallenge = r.challenge; flags.validateAt = Date.now(); if (r.challenge) flags.challengeSeen = true; return; }
       const request = response.request();
       const out = qrOnResponse(tracker, path, response.status(), json, Date.now(), requestQrToken(request.url(), request.postData()));
       if (out.mfa) flags.mfa = true;
@@ -561,6 +563,7 @@ async function runLogin(input, relay) {
     const initialCookies = await authCookieDigest(context);
     let nextProbe = 0, nextKick = 0;
     while (Date.now() < input.deadlineMs) {
+      if (flags.challengeSeen) await failLogin('UPSTREAM_CHALLENGE', 'login.sms_challenge');
       const challenge = await pageChallenge(context);
       if (challenge) await failLogin(challenge, 'login.blocked');
       const onRoot = onLoginPage(login);
