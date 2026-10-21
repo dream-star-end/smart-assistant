@@ -59,7 +59,26 @@ describe('kernel release closure', () => {
     )
     assert.deepEqual([...refs].sort(), [...COMPOSITE_PROJECTS].sort())
     assert.ok(refs.includes(KERNEL))
-    assert.deepEqual(TYPECHECK_DEPENDENTS[KERNEL], [], 'no dependents yet; add them when imported')
+    // every workspace package that depends on kernel references it in its tsconfig and is rebuilt
+    // when kernel changes (TYPECHECK_DEPENDENTS), together with its own dependents
+    const ws: string[] = json('package.json').workspaces
+    for (const dir of ws) {
+      if (!existsSync(path.join(ROOT, dir, 'package.json'))) continue
+      const deps = json(`${dir}/package.json`).dependencies ?? {}
+      if (!('@openclaude/kernel' in deps)) continue
+      const tsc = json(`${dir}/tsconfig.json`)
+      assert.ok(
+        tsc.references?.some((r: { path: string }) => r.path === '../kernel'),
+        `${dir} tsconfig references kernel`,
+      )
+      const dependents: string[] = TYPECHECK_DEPENDENTS[KERNEL]
+      assert.ok(dependents.includes(dir), `${dir} is a typecheck dependent of kernel`)
+      for (const d of (TYPECHECK_DEPENDENTS as Record<string, string[]>)[dir] ?? [])
+        assert.ok(
+          dependents.includes(d),
+          `${d} (dependent of ${dir}) is a typecheck dependent of kernel`,
+        )
+    }
     assert.equal(json(`${KERNEL}/tsconfig.json`).extends, '../../tsconfig.base.json')
   })
 
@@ -70,7 +89,10 @@ describe('kernel release closure', () => {
       sel.triggers.typecheck?.some((t) => t.ruleId === 'kernel'),
       JSON.stringify(sel.triggers),
     )
-    assert.deepEqual(sel.typecheck.projects, [KERNEL])
+    assert.deepEqual(
+      [...sel.typecheck.projects].sort(),
+      [KERNEL, ...TYPECHECK_DEPENDENTS[KERNEL]].sort(),
+    )
   })
 
   test('deploy surfaces: kernel drives the master process and the runtime source release', () => {

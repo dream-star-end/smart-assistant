@@ -670,7 +670,7 @@ describe('TicketDrawer 详情', () => {
     )
   })
 
-  test('讨论区显示评论，系统活动默认折叠', async () => {
+  test('评论、审批和执行记录在同一条时间线上，可按类型筛选', async () => {
     const ticket = sampleTicket()
     mockDrawerApis(ticket)
     vi.spyOn(taskboardApi, 'listTimeline').mockResolvedValue(
@@ -683,15 +683,20 @@ describe('TicketDrawer 详情', () => {
       }),
     )
     renderDrawer(ticket)
-    expect(await screen.findByTestId('ticket-discussion')).toBeInTheDocument()
+    expect(await screen.findByTestId('ticket-timeline')).toBeInTheDocument()
     // Markdown 评论块在 listTimeline 落定后才挂上，同步 getBy 会在 CI 负载下偶发 miss。
     expect((await screen.findByTestId('ticket-comment-md')).textContent).toMatch(/改了/)
-    expect(screen.queryByTestId('ticket-run-detail')).not.toBeInTheDocument()
-    await act(async () => {
-      fireEvent.click(screen.getByTestId('ticket-system-toggle'))
-    })
-    expect(await screen.findByTestId('ticket-run-detail')).toBeInTheDocument()
+    expect(screen.getByTestId('ticket-run-detail')).toBeInTheDocument()
     expect(screen.getByText(/批准了开工/)).toBeInTheDocument()
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('ticket-timeline-filter-comment'))
+    })
+    expect(screen.queryByTestId('ticket-run-detail')).not.toBeInTheDocument()
+    expect(screen.getByTestId('ticket-comment-md')).toBeInTheDocument()
+    await act(async () => {
+      fireEvent.click(screen.getByTestId('ticket-timeline-jump'))
+    })
+    expect(screen.getByTestId('ticket-drawer-comment')).toBeInTheDocument()
   })
 
   test('正文与评论按 Markdown 渲染', async () => {
@@ -757,9 +762,6 @@ describe('TicketDrawer 详情', () => {
     const run = sampleRun({ skipReason: 'concurrency_full', durationMs: null, costUsd: null })
     mockDrawerApis(ticket, [run])
     renderDrawer(ticket)
-    await act(async () => {
-      fireEvent.click(await screen.findByTestId('ticket-system-toggle'))
-    })
     expect(await screen.findByText('跳过：巡检并发已满')).toBeInTheDocument()
     expect(screen.getByText(/耗时未记录/)).toBeInTheDocument()
     expect(screen.getByText(/用量未记录/)).toBeInTheDocument()
@@ -778,9 +780,6 @@ describe('TicketDrawer 详情', () => {
     })
     mockDrawerApis(ticket, [run])
     renderDrawer(ticket)
-    await act(async () => {
-      fireEvent.click(await screen.findByTestId('ticket-system-toggle'))
-    })
     expect(await screen.findByText(/有用量但无金额/)).toBeInTheDocument()
     expect(screen.queryByText(/\$0\.0000/)).not.toBeInTheDocument()
   })
