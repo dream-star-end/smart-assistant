@@ -18,9 +18,9 @@ API 插件写操作必须逐次确认；受管浏览器插件以 `oc-plugin list
 
 ## 结果展示：插件专属组件（按需读取）
 
-微博、知乎、飞书各有专属的展示组件，定义不在系统提示里。在网页对话里要展示其中某个插件的结果时，
+微博、知乎、飞书、B 站、抖音各有专属的展示组件，定义不在系统提示里。在网页对话里要展示其中某个插件的结果时，
 先用 Read 读本技能目录下对应的定义文件，每个对话读一次即可，然后按定义写 ```ui 块：
-微博 `references/ui-weibo.md`，知乎 `references/ui-zhihu.md`，飞书 `references/ui-feishu.md`，B 站 `references/ui-bili.md`。
+微博 `references/ui-weibo.md`，知乎 `references/ui-zhihu.md`，飞书 `references/ui-feishu.md`，B 站 `references/ui-bili.md`，抖音 `references/ui-douyin.md`。
 本技能目录就是加载时给出的 Base directory，通常是 `/run/oc/claude-config/skills/app-connectors`。
 没有 Intelligent UI 协议时（例如微信、定时任务）不要读这些文件，也不要写这些块。
 
@@ -177,8 +177,9 @@ echo '{}' | oc-plugin call knowledge-planet create_topic --confirm <确认码>
 
 ### 抖音（douyin）
 
-只在 AI 市场，用户没装时先引导去安装；装好后在 管理中心 → 插件 → 抖音 用抖音 App 扫码登录个人账号（二维码约 1 分钟才出现）。
-- 当前版本只读：`oc-plugin call douyin me` 读取登录账号的昵称、uid、粉丝 / 关注 / 作品 / 获赞数，也用来确认登录是否有效。作品、评论、搜索、发布等能力还没有，不要假装能做。
+只在 AI 市场，用户没装时先引导去安装；装好后在 管理中心 → 插件 → 抖音 用抖音 App 扫码登录个人账号（二维码约 1 分钟才出现；扫码后抖音会要求本人短信验证，用户在同一个弹层里 3 分钟内输入手机收到的验证码即可。验证码只在那个弹层里输入，不要在对话里向用户要）。
+- 当前版本只读、只看自己的账号：`oc-plugin call douyin me`（昵称、uid、粉丝 / 关注 / 作品 / 获赞数，也用来确认登录是否有效）；`my_videos`（自己发布的作品和播放 / 点赞 / 评论等数据，参数 count、cursor）；`video_comments`（自己某个作品下的评论，参数 awemeId 来自 my_videos）。搜索、看别人的作品、发布、评论、点赞都还没有，不要假装能做。
+- 在网页对话里展示作品列表或评论时，先读 `references/ui-douyin.md` 再写组件块。
 - 这是浏览器自动化，不在抖音官方开放能力之内，可能触发账号风控。不要连续反复调用，也不要索要 cookie、短信或验证码。
 - RELINK_REQUIRED / LOGIN_EXPIRED_ACCOUNT：请用户到 管理中心 → 插件 → 抖音 重新扫码。DOUYIN_VERIFICATION_REQUIRED：请用户先在手机抖音完成本人验证再扫码。DOUYIN_UPSTREAM_CHALLENGE：抖音触发风控，如实告知、立即停止，不要重试或换动作绕过。
 

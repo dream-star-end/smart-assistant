@@ -15,6 +15,7 @@ import { FormBlock, QuizBlock, RecipeBlock } from "./InteractiveBlocks";
 import { IntradayBlock, KlineBlock, QuoteBlock, StockListBlock } from "./MarketBlocks";
 import { CardsBlock, GalleryBlock, SwatchesBlock, TilesBlock } from "./MediaBlocks";
 import { BiliCommentsBlock, BiliDanmakuBlock, BiliRankBlock, BiliSubtitleBlock, BiliVideoBlock, BiliVideosBlock } from "./BiliBlocks";
+import { DouyinCommentsBlock, DouyinVideosBlock } from "./DouyinBlocks";
 import { FeishuDocBlock, FeishuEventsBlock, WeiboHotBlock, WeiboPostsBlock, ZhihuAnswersBlock, ZhihuHotBlock } from "./PluginBlocks";
 import { TableBlock } from "./TableBlock";
 import { DraftBlock, OutlineBlock, SourcesBlock } from "./TextBlocks";
@@ -143,6 +144,10 @@ export function renderSpec(spec: IuiSpec, notes: string[], streaming: boolean, r
       return <BiliDanmakuBlock spec={spec} {...p} />;
     case "bili_subtitle":
       return <BiliSubtitleBlock spec={spec} {...p} />;
+    case "douyin_videos":
+      return <DouyinVideosBlock spec={spec} {...p} />;
+    case "douyin_comments":
+      return <DouyinCommentsBlock spec={spec} {...p} />;
   }
 }
 
@@ -217,6 +222,9 @@ function hasContent(spec: IuiSpec): boolean {
       return spec.items.length > 0 || spec.density.length > 0;
     case "bili_subtitle":
       return spec.lines.length > 0;
+    case "douyin_videos":
+    case "douyin_comments":
+      return spec.items.length > 0;
   }
 }
 

@@ -70,6 +70,15 @@ export const PLUGIN_UI_COMPONENTS: readonly PluginUiComponentSet[] = Object.free
     doc: 'references/ui-feishu.md',
     types: ['feishu_events', 'feishu_doc'],
   },
+  {
+    // OCV5-553：抖音受管插件（my_videos / video_comments 的结果）。
+    plugin: 'douyin',
+    displayName: '抖音',
+    author: 'model',
+    skill: 'app-connectors',
+    doc: 'references/ui-douyin.md',
+    types: ['douyin_videos', 'douyin_comments'],
+  },
 ])
 
 /** 组件类型 → 所属插件；通用组件返回 null。 */

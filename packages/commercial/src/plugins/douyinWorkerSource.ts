@@ -1,17 +1,27 @@
 /**
- * Reviewed Douyin worker (OCV5-553). This version: QR login + the read-only `me` action.
+ * Reviewed Douyin worker (OCV5-553). QR login with the account owner's SMS verification + read-only
+ * actions `me`, `my_videos` (creator work_list) and `video_comments` (creator comment list), each list
+ * request preceded by a 1.5–4s pause.
  *
  * Same frame protocol, broker relay and storage filtering as the reviewed Bilibili account worker
  * (biliAccountWorkerSource.ts). No Playwright request client and no Node-side cookie replay: the
  * action opens https://creator.douyin.com/robots.txt (light, same origin) and reads the creator
  * platform's own user-info endpoint with `fetch(..., { credentials: 'include' })` inside that page.
- * Login screenshots the official QR code on creator.douyin.com (`img[aria-label="二维码"]`) and
- * proves the session with the user-info endpoint before returning state.
  *
- * Stops immediately, never retries and never tries to get around:
- * - a visible captcha / slider or HTTP 403 / 429 → UPSTREAM_CHALLENGE;
- * - Douyin asking the account owner to verify identity (SMS etc.) after the scan →
- *   VERIFICATION_REQUIRED (the user finishes it on the phone and scans again).
+ * Login (design 4.3.C, from the 2026-10-22 live test):
+ * - QR codes come from the page's own get_qrcode / check_qrconnect responses (PNG + expire_time) and
+ *   are published only after the page has polled that code and got `new` with ≥45s left — a code the
+ *   page no longer polls can be scanned on the phone but never logs the web session in.
+ * - The login widget stops rotating after a few codes (or after a 502): the worker clicks the QR
+ *   centre and reopens the page if no new get_qrcode follows.
+ * - Douyin asks the account owner to verify identity after the scan. The worker reports it
+ *   (`verification` frame) and only acts on the master's command frames on stdin: `send_sms`
+ *   (click 「接收短信验证码」; send_code must succeed), `sms_code` (fill + 「验证」; validate_code
+ *   decides), `resend_sms`, `abort`. The code is typed into the page and never logged or echoed.
+ * - A visible captcha / slider or HTTP 403 / 429 still stops immediately (UPSTREAM_CHALLENGE); no
+ *   bypass. Verification methods other than SMS (face, upstream SMS) end the login
+ *   (VERIFICATION_REQUIRED).
+ * Headless only: the headful-only native 「Open xdg-open?」 dialog never appears; JS dialogs are dismissed.
  */
 export const DOUYIN_WORKER_SOURCE = String.raw`
 import { createHash } from 'node:crypto';
@@ -26,7 +36,6 @@ const MAX_INPUT = 512 * 1024;
 const MAX_OUTPUT = 1024 * 1024;
 const MAX_STATE_JSON = 256 * 1024;
 const MAX_API_TEXT = 256 * 1024;
-const QR_REFRESH_MS = 8_000;
 // 2026-10-21 侦察：登录组件懒加载，二维码在打开页面后约 55 秒才出现（宿主负载高时）。
 const QR_WAIT_MS = 150_000;
 const SITE = 'https://creator.douyin.com';
@@ -38,7 +47,12 @@ const SESSION_COOKIES = ['sessionid', 'sessionid_ss'];
 const AUTH_COOKIES = ['sessionid', 'sessionid_ss', 'sid_guard', 'sid_tt', 'uid_tt'];
 const CHALLENGE_TEXT = /请完成(下列|安全)验证|拖动(下方)?滑块|按住左边按钮|向右滑动/;
 const VERIFICATION_TEXT = /身份验证|短信验证|接收短信|验证码已发送/;
-const QR_EXPIRED_TEXT = /二维码已失效|二维码失效|二维码已过期/;
+const QR_EXPIRED_TEXT = /二维码已?失效|二维码已过期|点击刷新/;
+const QR_MIN_PUBLISH_MS = 45_000;
+const QR_STALL_MS = 10_000;
+const VERIFY_WINDOW_MS = 180_000;
+const VALIDATE_WAIT_MS = 40_000;
+const SMS_RESEND_AFTER_SEC = 60;
 const FAILURE_CODES = new Set(['WORKER_FAILED', 'LOGIN_EXPIRED', 'UPSTREAM_CHALLENGE', 'LOGIN_STATE_UNSUPPORTED', 'VERIFICATION_REQUIRED']);
 let terminal = false;
 
@@ -244,7 +258,8 @@ function identityFromAccountInfo(data) {
 }
 /**
  * 当前登录身份。未登录时（侦察实测）：user/info 返回 status_code 8「用户未登录」，
- * passport account/info 返回 message "error" + data.error_code 1「会话过期」。
+ * passport account/info 返回 message "error" + data.error_code 1「会话过期」。只有这两种明确应答算未登录；
+ * 其它应答（含 account/info 登录后的 1011）都是 WORKER_FAILED。
  */
 async function readSelf(page) {
   const info = await apiGet(page, USER_INFO_URL);
@@ -257,6 +272,7 @@ async function readSelf(page) {
   const data = account.data && typeof account.data === 'object' ? account.data : null;
   if (data && typeof data.captcha === 'string' && data.captcha) throw new Error('UPSTREAM_CHALLENGE');
   if (account.message === 'error' && data && data.error_code === 1) throw new Error('LOGIN_EXPIRED');
+  // 登录后这个备用接口返回 1011「用户不存在」（2026-10-22 实测）：表示接口不可用，不是登录失效。
   if (account.message === 'success') {
     const self = identityFromAccountInfo(data);
     if (self) return self;
@@ -264,9 +280,127 @@ async function readSelf(page) {
   throw new Error('WORKER_FAILED');
 }
 
+/** 读节奏（设计 4.5）：每次列表请求前在页面里停 1.5–4 秒，同账号不连打。 */
+function humanPause(page) { return page.waitForTimeout(1_500 + Math.floor(Math.random() * 2_500)).catch(() => {}); }
+/** 创作者平台接口：status_code 8 = 未登录；其它非 0 都是失败（不猜）。 */
+function creatorData(json) {
+  if (json.status_code === 8) throw new Error('LOGIN_EXPIRED');
+  if (json.status_code !== 0) throw new Error('WORKER_FAILED');
+  return json;
+}
+function douyinPicUrl(raw) {
+  if (typeof raw !== 'string' || raw.length > 1024) return undefined;
+  try { const u = new URL(raw); return u.protocol === 'https:' && /(^|\.)douyinpic\.com$/.test(u.hostname) ? raw : undefined; } catch { return undefined; }
+}
+function clampInt(value, min, max, fallback) {
+  const n = Number(value);
+  return Number.isSafeInteger(n) ? Math.max(min, Math.min(max, n)) : fallback;
+}
+/**
+ * 列表分页（fail-closed）：has_more 只认 true/false/1/0；还有下一页时游标必须是非负整数且不等于
+ * 本次请求的游标，否则下一次调用会重读同一页。只有空列表允许不带 has_more。
+ */
+function pageInfo(data, cursorKey, requested, empty) {
+  const raw = data.has_more;
+  let hasMore;
+  if (raw === true || raw === 1) hasMore = true;
+  else if (raw === false || raw === 0 || (raw === undefined && empty)) hasMore = false;
+  else throw new Error('WORKER_FAILED');
+  const cursor = data[cursorKey] === undefined ? undefined : Number.isSafeInteger(data[cursorKey]) && data[cursorKey] >= 0 ? data[cursorKey] : null;
+  if (cursor === null || (hasMore && (cursor === undefined || cursor === requested))) throw new Error('WORKER_FAILED');
+  return { hasMore, cursor };
+}
+/** 逐条投影：任何一条认不出（返回 null）整个列表失败；返回 undefined 的条目（如无文字评论）跳过。 */
+function projectList(list, fn) {
+  const out = [];
+  for (const raw of list.slice(0, 20)) {
+    const item = fn(raw);
+    if (item === null) throw new Error('WORKER_FAILED');
+    if (item !== undefined) out.push(item);
+  }
+  return out;
+}
+/** work_list 里的一个作品（2026-10-22 实测字段）。 */
+function videoItem(a) {
+  if (!a || typeof a !== 'object') return null;
+  const awemeId = digits(a.aweme_id);
+  if (!awemeId) return null;
+  const stats = a.statistics && typeof a.statistics === 'object' ? a.statistics : {};
+  const status = a.status && typeof a.status === 'object' ? a.status : {};
+  const cover = a.Cover && Array.isArray(a.Cover.url_list) ? a.Cover.url_list[0]
+    : a.video && a.video.cover && Array.isArray(a.video.cover.url_list) ? a.video.cover.url_list[0] : undefined;
+  const ms = nonNegInt(a.duration != null ? a.duration : a.video && a.video.duration);
+  const imagePost = a.is_pic_word === true || Array.isArray(a.images);
+  return compact({
+    awemeId,
+    title: cleanText(a.item_title, 200) || undefined,
+    desc: cleanText(a.desc || a.caption, 1000) || undefined,
+    createTime: nonNegInt(a.create_time),
+    durationSec: ms === undefined ? undefined : Math.round(ms / 1000),
+    cover: douyinPicUrl(cover),
+    playCount: nonNegInt(stats.play_count),
+    diggCount: nonNegInt(stats.digg_count),
+    commentCount: nonNegInt(stats.comment_count),
+    shareCount: nonNegInt(stats.share_count),
+    collectCount: nonNegInt(stats.collect_count),
+    isPrivate: typeof status.is_private === 'boolean' ? status.is_private : undefined,
+    inReview: typeof status.in_reviewing === 'boolean' ? status.in_reviewing : undefined,
+    isImagePost: imagePost || undefined,
+    url: 'https://www.douyin.com/' + (imagePost ? 'note/' : 'video/') + awemeId
+  });
+}
+function commentItem(c) {
+  if (!c || typeof c !== 'object') return null;
+  const cid = digits(c.cid);
+  if (!cid || typeof c.text !== 'string') return null;
+  const text = cleanText(c.text, 1000);
+  if (!text) return undefined;
+  return compact({
+    cid, text,
+    nickname: cleanText(c.user && c.user.nickname, 128) || undefined,
+    createTime: nonNegInt(c.create_time),
+    diggCount: nonNegInt(c.digg_count),
+    replyCount: nonNegInt(c.reply_comment_total != null ? c.reply_comment_total : c.reply_count)
+  });
+}
+
 async function actionRead(page, input) {
   const self = await readSelf(page);
   if (input.actionId === 'me') return self;
+  const params = input.params || {};
+  const count = clampInt(params.count, 1, 20, 10);
+  const cursor = clampInt(params.cursor, 0, 9_000_000_000_000, 0);
+  if (input.actionId === 'my_videos') {
+    await humanPause(page);
+    const query = new URLSearchParams({ status: '0', count: String(count), max_cursor: String(cursor) });
+    const data = creatorData(await apiGet(page, SITE + '/janus/douyin/creator/pc/work_list?' + query.toString()));
+    if (!Array.isArray(data.aweme_list)) throw new Error('WORKER_FAILED');
+    const paging = pageInfo(data, 'max_cursor', cursor, data.aweme_list.length === 0);
+    return compact({
+      items: projectList(data.aweme_list, videoItem),
+      hasMore: paging.hasMore,
+      cursor: paging.cursor,
+      total: nonNegInt(data.total)
+    });
+  }
+  if (input.actionId === 'video_comments') {
+    const awemeId = digits(params.awemeId);
+    if (!awemeId) throw new Error('WORKER_FAILED');
+    await humanPause(page);
+    const query = new URLSearchParams({ item_id: awemeId, cursor: String(cursor), count: String(count) });
+    const data = creatorData(await apiGet(page, SITE + '/aweme/v1/creator/comment/list/?' + query.toString()));
+    // 登录后的应答形状未实测：只认 comments 数组（没有评论时可能是 null）；认不出就失败，不猜。
+    if (data.comments !== null && !Array.isArray(data.comments)) throw new Error('WORKER_FAILED');
+    const list = data.comments || [];
+    const paging = pageInfo(data, 'cursor', cursor, list.length === 0);
+    return compact({
+      awemeId,
+      items: projectList(list, commentItem),
+      hasMore: paging.hasMore,
+      cursor: paging.cursor,
+      total: nonNegInt(data.total)
+    });
+  }
   throw new Error('WORKER_FAILED');
 }
 
@@ -291,16 +425,20 @@ async function secureContext(browser, storageState, allowed, methods) {
     locale: 'zh-CN', timezoneId: 'Asia/Shanghai', viewport: { width: 1280, height: 900 },
     serviceWorkers: 'block', storageState
   });
+  const loggedBlocked = new Set();
   await context.route('**/*', async (route) => {
     const request = route.request();
     let origin;
     try { origin = new URL(request.url()).origin; } catch { await route.abort(); return; }
     if (!allowed.has(origin) || !methods.includes(request.method()) || ['websocket', 'eventsource'].includes(request.resourceType())) {
+      // 只记被拦下的来源域名（每个域名一次），用于下一次实测决定白名单；不记路径和参数。
+      try { const host = new URL(origin).hostname; if (!loggedBlocked.has(host) && loggedBlocked.size < 64) { loggedBlocked.add(host); emitStep({ step: 'net.blocked', host }); } } catch {}
       await route.abort();
       return;
     }
     await route.continue();
   });
+  context.on('page', (page) => page.on('dialog', (dialog) => { dialog.dismiss().catch(() => {}); }));
   return context;
 }
 async function runAction(input, relay) {
@@ -321,60 +459,124 @@ async function runAction(input, relay) {
   } finally { await browser.close(); }
 }
 
-const QR_SELECTOR = 'img[aria-label="二维码"][src^="data:image/png"]';
-async function qrElement(page) {
-  const images = page.locator(QR_SELECTOR);
-  const total = Math.min(await images.count(), 10);
-  for (let index = 0; index < total; index += 1) {
-    const image = images.nth(index);
-    const box = await image.boundingBox().catch(() => null);
-    if (box && box.width >= 100 && box.width <= 400 && Math.abs(box.width - box.height) < 8) return image;
-  }
-  return null;
-}
+const QR_SELECTOR = 'img[aria-label="二维码"]';
 async function pageText(page) {
   return (await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '')).replace(/\s+/g, ' ');
 }
-/**
- * 页面上出现可见的风控 / 本人验证就停：返回失败码，绝不尝试处理。没有「静态文案」豁免：任何页面上只要
- * 出现这些提示词就停（宁可误停也不放过真实验证；Codex r1/r2 P1）。侦察时登录页文字不含这些词。
- */
-function blockerCode(text) {
-  if (VERIFICATION_TEXT.test(text)) return 'VERIFICATION_REQUIRED';
-  if (CHALLENGE_TEXT.test(text)) return 'UPSTREAM_CHALLENGE';
-  return null;
-}
-/** 检查浏览器里所有打开的页面（含跳转后的验证页和弹窗）。 */
-async function pageBlocker(context) {
+/** 可见的验证码 / 滑块（风控）：任何页面出现就停，绝不尝试处理。 */
+function challengeCode(text) { return CHALLENGE_TEXT.test(text) ? 'UPSTREAM_CHALLENGE' : null; }
+async function pageChallenge(context) {
   for (const page of context.pages()) {
     if (page.isClosed()) continue;
-    const code = blockerCode(await pageText(page));
+    const code = challengeCode(await pageText(page));
     if (code) return code;
   }
   return null;
 }
-/** 等二维码。等待期间不因页面文字提前失败（登录组件懒加载）；超时才看页面是否被验证挡住。 */
-async function captureQr(page, waitMs) {
-  const until = Date.now() + waitMs;
-  let image = null;
-  while (!image && Date.now() < until) {
-    image = await qrElement(page);
-    if (image) break;
-    await page.waitForTimeout(1_000);
-  }
-  if (!image) throw new Error(blockerCode(await pageText(page)) || 'qr');
-  const png = await image.screenshot({ type: 'png', animations: 'disabled' });
-  if (png.length < 100 || png.length > 512 * 1024 || !png.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) throw new Error('qr');
-  return png;
+/** check_qrconnect 返回多因素验证参数（无 status，带 std_verify_* / passport_mfa_*）= 要求本人验证。 */
+function isMfaResponse(data) {
+  if (!data || typeof data !== 'object' || data.status) return false;
+  const keys = JSON.stringify([Object.keys(data.biz_params || {}), Object.keys(data.common_params || {})]);
+  return /std_verify|passport_mfa/.test(keys);
 }
-async function refreshExpiredQr(page) {
-  // 失效后登录组件在二维码上盖一层「刷新」；点不到就整页重载（重载要等登录组件重新加载）。
-  const refresh = page.getByText('刷新', { exact: false }).first();
-  if (await refresh.isVisible().catch(() => false)) {
-    await refresh.click({ timeout: 5_000 }).catch(() => {});
-    return;
+/**
+ * 二维码追踪（纯逻辑）。新码先挂起（记下它的 token）；页面随后**带着这个 token** 轮询并得到 new、且剩余
+ * ≥45 秒，才发布给用户。旧码的迟到应答不会让新码被发布（Codex r1 P1）。
+ * 返回 { publish, invalidate, mfa, status }；invalidate 时调用方要通知 master 撤下已发布的码。
+ */
+const QR_TOKEN_RE = /^[A-Za-z0-9_-]{1,128}$/;
+function newQrTracker() { return { pending: null, published: null, lastPollAt: 0, lastGetQrAt: 0, status: null }; }
+function qrOnResponse(tracker, path, http, json, now, requestToken) {
+  const out = { publish: null, invalidate: false, mfa: false, status: null };
+  const isPoll = /check_qrconnect/.test(path);
+  if (!isPoll && !/get_qrcode/.test(path)) return out;
+  if (isPoll && http !== 200) { out.invalidate = !!(tracker.published || tracker.pending); tracker.published = null; tracker.pending = null; return out; }
+  if (isPoll) tracker.lastPollAt = now;
+  const data = json && typeof json === 'object' && json.data && typeof json.data === 'object' ? json.data : {};
+  if (isPoll && isMfaResponse(data)) { out.mfa = true; return out; }
+  if (typeof data.status === 'string') { tracker.status = data.status; out.status = data.status; }
+  if (typeof data.qrcode === 'string' && data.qrcode.length > 100 && Number.isFinite(Number(data.expire_time))) {
+    const b64 = data.qrcode.replace(/^data:image\/[a-z]+;base64,/, '');
+    const token = typeof data.token === 'string' && QR_TOKEN_RE.test(data.token) ? data.token : null;
+    tracker.pending = token && /^[A-Za-z0-9+/=]+$/.test(b64) && b64.length <= 700000 ? { png: b64, expireAt: Number(data.expire_time) * 1000, token } : null;
+    tracker.published = null;
+    out.invalidate = true;
+    return out;
   }
-  await page.reload({ waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
+  if (isPoll && data.status === 'new' && tracker.pending && requestToken === tracker.pending.token) {
+    if (tracker.pending.expireAt - now >= QR_MIN_PUBLISH_MS) { tracker.published = tracker.pending; out.publish = tracker.pending; }
+    tracker.pending = null;
+  }
+  return out;
+}
+/** 轮询请求带的二维码 token（查询串或表单 / JSON 请求体）。拿不到就是 null，对应的码不会被发布。 */
+function requestQrToken(url, postData) {
+  try { const q = new URL(url).searchParams.get('token'); if (q && QR_TOKEN_RE.test(q)) return q; } catch {}
+  if (typeof postData === 'string' && postData) {
+    try { const f = new URLSearchParams(postData).get('token'); if (f && QR_TOKEN_RE.test(f)) return f; } catch {}
+    try { const j = JSON.parse(postData); if (j && typeof j.token === 'string' && QR_TOKEN_RE.test(j.token)) return j.token; } catch {}
+  }
+  return null;
+}
+/** send_code / validate_code 的应答：403/429 或带验证码 = 风控，立即停（不重试）。 */
+function smsResponse(http, json) {
+  const data = json && typeof json === 'object' && json.data && typeof json.data === 'object' ? json.data : {};
+  return {
+    ok: !!(http === 200 && json && json.message === 'success'),
+    challenge: http === 403 || http === 429 || (typeof data.captcha === 'string' && data.captcha.length > 0)
+  };
+}
+/** 换码卡住：显示失效覆盖层 / 已发布的码过期超过 10 秒 / 超过 10 秒没有轮询。 */
+function qrNeedsKick(tracker, now, overlayVisible) {
+  return !!(overlayVisible || (tracker.published && now > tracker.published.expireAt + QR_STALL_MS) || (tracker.lastPollAt && now - tracker.lastPollAt > QR_STALL_MS));
+}
+/** master → worker 命令帧。验证码只接受 4–8 位数字。 */
+function validCommand(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { cmd: 'invalid' };
+  const keys = Object.keys(value).sort().join(',');
+  if (['send_sms', 'resend_sms', 'abort'].includes(value.cmd) && keys === 'cmd') return { cmd: value.cmd };
+  if (value.cmd === 'sms_code' && keys === 'cmd,code' && typeof value.code === 'string' && /^[0-9]{4,8}$/.test(value.code)) return { cmd: 'sms_code', code: value.code };
+  return { cmd: 'invalid' };
+}
+const commands = [];
+function startCommandReader() {
+  let buffer = Buffer.alloc(0);
+  process.stdin.on('data', (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    if (buffer.length > 64 * 1024) { buffer = Buffer.alloc(0); commands.push({ cmd: 'invalid' }); return; }
+    while (buffer.length >= 4) {
+      const size = buffer.readUInt32BE(0);
+      if (size < 2 || size > 4096) { buffer = Buffer.alloc(0); commands.push({ cmd: 'invalid' }); return; }
+      if (buffer.length < size + 4) return;
+      const body = buffer.subarray(4, size + 4);
+      buffer = buffer.subarray(size + 4);
+      try { commands.push(validCommand(JSON.parse(body.toString('utf8')))); } catch { commands.push({ cmd: 'invalid' }); }
+      body.fill(0);
+    }
+  });
+  process.stdin.resume();
+}
+async function nextCommand(page, untilMs) {
+  while (Date.now() < untilMs) {
+    if (commands.length) return commands.shift();
+    await page.waitForTimeout(200).catch(() => {});
+  }
+  return null;
+}
+async function waitFor(page, predicate, ms) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) { if (predicate()) return true; await page.waitForTimeout(150).catch(() => {}); }
+  return predicate();
+}
+async function kickQr(page, tracker) {
+  const before = tracker.lastGetQrAt;
+  const box = await page.locator(QR_SELECTOR).first().boundingBox().catch(() => null);
+  if (box) await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2).catch(() => {});
+  if (await waitFor(page, () => tracker.lastGetQrAt !== before, 6_000)) { emitStep({ step: 'login.qr_kicked', ok: true }); return 'clicked'; }
+  emitStep({ step: 'login.qr_reopen' });
+  tracker.lastPollAt = 0; tracker.published = null; tracker.pending = null;
+  await page.goto(SITE + '/', { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {});
+  return 'reopened';
 }
 async function authCookieDigest(context) {
   const rows = (await context.cookies())
@@ -400,70 +602,115 @@ async function proveSelf(context) {
   }
   finally { await page.close().catch(() => {}); }
 }
+async function failLogin(code, step) {
+  emitStep({ step: step || 'login.failed', code });
+  await writeTerminalAndExit({ event: 'failed', code });
+}
+/** 本人短信验证：等 master 的命令；验证码只填进输入框，不记录、不回显。 */
+async function runVerification(login, flags, deadlineMs) {
+  const smsOption = login.getByText('接收短信验证码', { exact: true }).first();
+  const available = await waitFor(login, () => false, 1_500).then(() => smsOption.isVisible().catch(() => false));
+  writeFrame({ event: 'verification', kind: available ? 'sms_available' : 'unsupported' });
+  emitStep({ step: 'login.verification', kind: available ? 'sms_available' : 'unsupported' });
+  const until = Math.min(deadlineMs, Date.now() + VERIFY_WINDOW_MS);
+  while (Date.now() < until) {
+    // 风控信号是粘性的：任何一次 send_code / validate_code 风控应答（哪怕晚于等待窗口到达）都会让下一轮立即停止（Codex r2 P1）。
+    if (flags.challengeSeen) await failLogin('UPSTREAM_CHALLENGE', 'login.sms_challenge');
+    const challenge = await pageChallenge(login.context());
+    if (challenge) await failLogin(challenge, 'login.blocked');
+    if (flags.validated) return;
+    const command = await nextCommand(login, Math.min(until, Date.now() + 1_000));
+    if (!command) continue;
+    if (command.cmd === 'invalid') await failLogin('WORKER_FAILED', 'login.command_invalid');
+    if (command.cmd === 'abort' || !available) await failLogin('VERIFICATION_REQUIRED', 'login.verification_aborted');
+    if (command.cmd === 'send_sms' || command.cmd === 'resend_sms') {
+      // 一次命令只点一次（一份限频额度对应一次发送，Codex r1 P1）；以 send_code 应答为准。
+      const before = flags.sendCode.at;
+      const target = command.cmd === 'send_sms' ? smsOption : login.getByText('重新发送', { exact: true }).last();
+      await target.click({ timeout: 3_000 }).catch(() => {});
+      await waitFor(login, () => flags.sendCode.at !== before, 6_000);
+      if (flags.sendCode.at !== before && flags.sendCode.challenge) await failLogin('UPSTREAM_CHALLENGE', 'login.sms_challenge');
+      if (flags.sendCode.at !== before && flags.sendCode.ok) { writeFrame({ event: 'sms_sent', resendAfterSec: SMS_RESEND_AFTER_SEC }); emitStep({ step: 'login.sms_sent' }); }
+      else if (command.cmd === 'send_sms') await failLogin('VERIFICATION_REQUIRED', 'login.sms_send_failed');
+      else writeFrame({ event: 'sms_resend_failed' });
+      continue;
+    }
+    if (command.cmd === 'sms_code') {
+      const before = flags.validateAt;
+      const input = login.getByPlaceholder('请输入验证码').last();
+      await input.click({ timeout: 5_000 }).catch(() => {});
+      await input.fill(command.code, { timeout: 5_000 }).catch(() => {});
+      command.code = '';
+      await login.getByText('验证', { exact: true }).last().click({ timeout: 5_000 }).catch(() => {});
+      await waitFor(login, () => flags.validateAt !== before, VALIDATE_WAIT_MS);
+      if (flags.validateAt !== before && flags.validateChallenge) await failLogin('UPSTREAM_CHALLENGE', 'login.sms_challenge');
+      if (flags.validateAt !== before && flags.validateOk) { flags.validated = true; emitStep({ step: 'login.sms_validated' }); return; }
+      await input.fill('', { timeout: 2_000 }).catch(() => {});
+      writeFrame({ event: 'sms_rejected' });
+      emitStep({ step: 'login.sms_rejected' });
+    }
+  }
+  await failLogin('LOGIN_EXPIRED', 'login.verification_timeout');
+}
 async function runLogin(input, relay) {
   const allowed = new Set(input.allowedOrigins.map((origin) => new URL(origin).origin));
   const browser = await chromium.launch({ headless: true, proxy: { server: relay.proxy }, args: browserArgs() });
   try {
     const context = await secureContext(browser, { cookies: [], origins: [] }, allowed, ['GET', 'POST', 'HEAD']);
+    const tracker = newQrTracker();
+    const flags = { mfa: false, validated: false, sendCode: { at: 0, ok: false, challenge: false }, validateAt: 0, validateOk: false, validateChallenge: false, challengeSeen: false };
+    context.on('request', (request) => { try { if (/\/passport\/web\/get_qrcode\//.test(new URL(request.url()).pathname)) tracker.lastGetQrAt = Date.now(); } catch {} });
+    context.on('response', async (response) => {
+      let path;
+      try { path = new URL(response.url()).pathname; } catch { return; }
+      if (!/\/passport\/web\/(get_qrcode|check_qrconnect|send_code|validate_code)\//.test(path)) return;
+      let json = null;
+      try { json = JSON.parse(await response.text()); } catch {}
+      if (/send_code/.test(path)) { const r = smsResponse(response.status(), json); flags.sendCode = { at: Date.now(), ok: r.ok, challenge: r.challenge }; if (r.challenge) flags.challengeSeen = true; return; }
+      if (/validate_code/.test(path)) { const r = smsResponse(response.status(), json); flags.validateOk = r.ok; flags.validateChallenge = r.challenge; flags.validateAt = Date.now(); if (r.challenge) flags.challengeSeen = true; return; }
+      const request = response.request();
+      const out = qrOnResponse(tracker, path, response.status(), json, Date.now(), requestQrToken(request.url(), request.postData()));
+      if (out.mfa) flags.mfa = true;
+      // 码作废（换码 / 502）：立即让 master 撤下已发布的码，免得用户继续扫一个已失效的码（Codex r1 P1）。
+      if (out.invalidate) writeFrame({ event: 'qr_invalid' });
+      if (out.publish) { writeFrame({ event: 'qr', png: out.publish.png, expireAt: out.publish.expireAt }); emitStep({ step: 'login.qr' }); }
+    });
     const login = await context.newPage();
     await login.goto(SITE + '/', { waitUntil: 'domcontentloaded', timeout: 60_000 });
-    let png = await captureQr(login, Math.min(QR_WAIT_MS, Math.max(1_000, input.deadlineMs - Date.now() - 5_000)));
-    let qrHash = digest(png.toString('base64'));
-    writeFrame({ event: 'qr', png: png.toString('base64') });
-    emitStep({ step: 'login.qr' });
+    if (!(await waitFor(login, () => !!tracker.published, Math.min(QR_WAIT_MS, Math.max(1_000, input.deadlineMs - Date.now() - 5_000)))))
+      await failLogin((await pageChallenge(context)) || 'WORKER_FAILED', 'login.no_qr');
     const initialCookies = await authCookieDigest(context);
-    let nextQr = Date.now() + QR_REFRESH_MS;
-    let nextProbe = 0;
+    let nextProbe = 0, nextKick = 0;
     while (Date.now() < input.deadlineMs) {
-      const blocked = await pageBlocker(context);
-      if (blocked) {
-        emitStep({ step: 'login.blocked', code: blocked });
-        await writeTerminalAndExit({ event: 'failed', code: blocked });
+      if (flags.challengeSeen) await failLogin('UPSTREAM_CHALLENGE', 'login.sms_challenge');
+      const challenge = await pageChallenge(context);
+      if (challenge) await failLogin(challenge, 'login.blocked');
+      const onRoot = onLoginPage(login);
+      if (!flags.validated && (flags.mfa || (onRoot && VERIFICATION_TEXT.test(await pageText(login))))) {
+        await runVerification(login, flags, input.deadlineMs);
+        continue;
       }
-      if (onLoginPage(login)) {
-        const text = await pageText(login);
-        if (QR_EXPIRED_TEXT.test(text)) {
-          emitStep({ step: 'login.qr_expired' });
-          await refreshExpiredQr(login);
-          nextQr = 0;
-        }
-        if (Date.now() >= nextQr) {
-          nextQr = Date.now() + QR_REFRESH_MS;
-          const fresh = await captureQr(login, 2_000).catch(() => null);
-          if (fresh) {
-            const freshHash = digest(fresh.toString('base64'));
-            if (freshHash !== qrHash) {
-              qrHash = freshHash;
-              png = fresh;
-              writeFrame({ event: 'qr', png: png.toString('base64') });
-            }
-          }
-        }
+      if (onRoot && !flags.validated && tracker.status !== 'scanned' && tracker.status !== 'confirmed' && Date.now() >= nextKick &&
+          qrNeedsKick(tracker, Date.now(), QR_EXPIRED_TEXT.test(await pageText(login)))) {
+        nextKick = Date.now() + ((await kickQr(login, tracker)) === 'reopened' ? 90_000 : 15_000);
       }
-      const signal = (await authCookieDigest(context)) !== initialCookies || !onLoginPage(login);
+      const signal = (await authCookieDigest(context)) !== initialCookies || !onLoginPage(login) || tracker.status === 'confirmed';
       if (signal && Date.now() >= nextProbe) {
         nextProbe = Date.now() + 5_000;
         const self = await proveSelf(context);
         if (self) {
-          // 身份接口通过也不代表没有本人验证：保存前再看一遍所有页面。
-          const late = await pageBlocker(context);
-          if (late) {
-            emitStep({ step: 'login.blocked', code: late });
-            await writeTerminalAndExit({ event: 'failed', code: late });
-          }
+          const late = await pageChallenge(context);
+          if (late) await failLogin(late, 'login.blocked');
           const state = filteredState(await context.storageState(), input.cookieDomains, input.stateOrigins);
           // 平台只保存带 Secure 的 cookie：登录凭据被过滤掉就明确失败，绝不存一份无法使用的登录状态。
-          if (!state.cookies.some((cookie) => SESSION_COOKIES.includes(cookie.name))) {
-            emitStep({ step: 'login.state_unsupported' });
-            await writeTerminalAndExit({ event: 'failed', code: 'LOGIN_STATE_UNSUPPORTED' });
-          }
+          if (!state.cookies.some((cookie) => SESSION_COOKIES.includes(cookie.name))) await failLogin('LOGIN_STATE_UNSUPPORTED', 'login.state_unsupported');
           emitStep({ step: 'login.authenticated' });
           await writeTerminalAndExit({ event: 'authenticated', storageState: state });
         }
       }
       await login.waitForTimeout(800).catch(() => {});
     }
-    await writeTerminalAndExit({ event: 'failed', code: 'LOGIN_EXPIRED' });
+    await failLogin('LOGIN_EXPIRED', 'login.deadline');
   } finally { await browser.close(); }
 }
 try {
@@ -483,7 +730,7 @@ try {
   const timer = setTimeout(() => process.exit(124), remaining + 2_000);
   try {
     if (input.mode === 'action') await runAction(input, relay);
-    else await runLogin(input, relay);
+    else { startCommandReader(); await runLogin(input, relay); }
   } finally {
     clearTimeout(timer);
     await relay.close();

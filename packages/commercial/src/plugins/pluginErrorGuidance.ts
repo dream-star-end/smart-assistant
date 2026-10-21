@@ -452,6 +452,31 @@ const ROWS: Record<string, Row> = {
     message: '抖音插件执行超时',
     nextAction: '只读操作,可稍后重试',
   },
+  // OCV5-553 4.3.C · 抖音扫码后的本人短信验证（只出现在管理中心的扫码弹层里）。
+  SMS_INVALID: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '验证码格式不对',
+    nextAction: '请输入短信里的数字验证码',
+  },
+  SMS_NOT_EXPECTED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '当前不在等待短信验证码的步骤',
+    nextAction: '请按扫码弹层的提示操作；若已过期请重新扫码',
+  },
+  SMS_ATTEMPTS_EXCEEDED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '验证码已输错多次，本次扫码已结束',
+    nextAction: '请稍后重新扫码',
+  },
+  SMS_RATE_LIMITED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '短信发送过于频繁，已暂停发送以保护账号',
+    nextAction: '请稍后再试（同一账号 1 分钟 1 条、1 小时 3 条、1 天 5 条）',
+  },
   DOUYIN_WORKER_INCOMPLETE: {
     retrySafe: 'yes',
     requiresReauth: false,

@@ -64,7 +64,17 @@ const LOG_MAX_DIR_BYTES = 4 * 1024 * 1024
 
 const LOG_BOOL_KEYS = new Set(['ok'])
 const LOG_NUMBER_KEYS = new Set(['t', 'ms'])
-const LOG_STRING_KEYS = new Set(['src', 'step', 'code', 'actionId', 'kind', 'sessionId', 'event'])
+// host：被拦下的来源域名（net.blocked），只有域名，没有路径和参数。
+const LOG_STRING_KEYS = new Set([
+  'src',
+  'step',
+  'code',
+  'actionId',
+  'kind',
+  'sessionId',
+  'event',
+  'host',
+])
 
 export function douyinWorkerDockerLogConfig(): {
   Type: 'none'
