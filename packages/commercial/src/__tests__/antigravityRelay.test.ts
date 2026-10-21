@@ -877,6 +877,8 @@ describe('Antigravity route context', () => {
     assert.equal(tokenEntry()?.ttlSec, 3600)
     assert.equal(JSON.parse(tokenEntry()!.value).expiresAt, 105 * minute)
 
+    const [staleKey, staleEntry] = [...store.entries()].find(([k]) => !k.includes(':req:'))!
+    const staleRow = staleEntry.value
     // The turn ends while a call that read the route is about to renew it.
     beforeTokenRead = () => expireAntigravityRelayRouteForRequest(REQUEST_ID)
     assert.equal(
@@ -889,6 +891,22 @@ describe('Antigravity route context', () => {
       null,
     )
     assert.equal(tokenEntry(), undefined, 'the racing renewal did not leave the route behind')
+
+    // Codex r1 P1: a second call that lands while a racing renewal has the
+    // token key written back must still be refused.
+    const raw = JSON.stringify({ ...JSON.parse(staleRow), expiresAt: 200 * minute })
+    store.set(staleKey, { value: raw, ttlSec: 3600 })
+    assert.equal(
+      await resolveAntigravityRelayRoute({
+        token,
+        containerId: 11,
+        userId: 42,
+        nowMs: 82 * minute,
+      }),
+      null,
+      'a call during the renewal window is not served after the turn ended',
+    )
+    assert.equal(store.has(staleKey), false)
     assert.equal(
       await resolveAntigravityRelayRoute({
         token,

@@ -185,6 +185,12 @@ export async function resolveAntigravityRelayRoute(args: {
   }
   if (row.containerId !== args.containerId) return null
   if (row.userId !== BigInt(args.userId)) return null
+  // A renewal racing the turn end can briefly write the token key back; the
+  // request's mark is authoritative, so no call is served after the turn ended.
+  if (kv && (await kv.get(requestKey(row.requestId))) === EXPIRED_MARK) {
+    await kv.del(tokenKey(row.token))
+    return null
+  }
   return renewIfDue(row, now)
 }
 
@@ -206,7 +212,7 @@ async function renewIfDue(
   }
   await kv.set(tokenKey(row.token), serialize(renewed), ttlSeconds(next - now))
   // expireAntigravityRelayRouteForRequest marks the request before deleting the
-  // token key: if the mark is here now, this write may have revived the route.
+  // token key: if the mark is here now, this write may have put the key back.
   if ((await kv.get(requestKey(row.requestId))) === EXPIRED_MARK) {
     await kv.del(tokenKey(row.token))
     return null
