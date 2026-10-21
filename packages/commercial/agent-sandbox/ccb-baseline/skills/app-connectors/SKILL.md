@@ -9,7 +9,7 @@ tags: [connectors, plugins, email, webdav, notion, github, feishu, calendar, zsx
 访问用户在管理中心绑定的第三方账号。对用户一律把这些统称为「插件」，绑定 / 授权入口是「管理中心 → 插件」
 （不要换成别的叫法，界面上只有「插件」）。平台在服务端托管全部凭据与浏览器登录状态：
 - API 插件（邮箱、WebDAV、Notion、GitHub、飞书、B 站公开数据 bili）用 `oc-connect`；
-- 浏览器插件（知识星球、微博、知乎、B 站账号 bili-account）用 `oc-plugin`。
+- 浏览器与受管插件（知识星球、微博、知乎、B 站账号 bili-account、文献数据库 literature-db）用 `oc-plugin`。
 
 **不要让用户提供账号 ID 或手工挑 action**：先自行执行 `list` 发现能力；同一 provider/插件
 只有一个可用账号时直接调用。仅在多个账号必须消歧、未安装或未授权时才请用户介入。
@@ -160,6 +160,12 @@ echo '{}' | oc-plugin call knowledge-planet create_topic --confirm <确认码>
 5. 确认窗口 10 分钟;过期/被拒绝就如实告知用户,需要时重新发起。
 6. 返回 `in_progress`=已在执行别催;`replay`=该确认码已执行过,**不要**再原样重发一单。
    尤其 `replay.status=unknown` 表示可能已经写入：先让用户到知识星球核实，绝不自动重试。
+
+### 文献数据库（literature-db）
+
+用户安装并绑定「文献数据库」插件后，可用 `oc-plugin call literature-db search` 与 `oc-plugin call literature-db download` 检索和下载中英文文献全文：
+- **编号有效期 24 小时**：`search` 返回的 `documentId` 绑定当前用户与账号实例，有效期 24 小时。若下载报 `DOCUMENT_EXPIRED`（编号过期或校验失败），**必须先重新调用 `search` 获取新 `documentId` 再下载**，不要重放旧编号。
+- **串行限速下载**：下载多篇文献或遇到 `RATE_LIMITED` / `TIMEOUT` 时，**必须一篇一篇串行下载，每篇间隔 20-30 秒**，不要并发或紧挨着连续连打。
 
 ### B 站（哔哩哔哩）
 

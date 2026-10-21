@@ -247,7 +247,10 @@ export function createCommercialLiteratureRuntime(input: {
     input.runtimeChannel === 'v5' ? new LiteratureArtifactStore() : undefined
   const literatureHttp =
     literatureArtifacts !== undefined
-      ? new WanfangLiteratureHttpExecutor({ artifactStore: literatureArtifacts })
+      ? new WanfangLiteratureHttpExecutor({
+          artifactStore: literatureArtifacts,
+          ...(input.env ? { env: input.env } : {}),
+        })
       : undefined
   const literatureRelogin =
     input.runtimeChannel === 'v5'

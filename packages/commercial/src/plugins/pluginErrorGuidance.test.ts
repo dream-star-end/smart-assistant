@@ -168,7 +168,7 @@ const READ_AUTH_EXACT: Record<string, Exact> = {
     requiresReauth: false,
     sideEffect: 'none',
     nextAction:
-      '请稍后重试。若微博已授权仍反复失败，不要当成单纯网络故障，引导用户重新扫码授权',
+      '请稍后重试；若该插件已授权仍反复失败，不要当成单纯网络故障，引导用户到 管理中心 → 插件 重新绑定或刷新授权',
     message: '插件运行时不可用',
   },
   PLUGIN_RUNTIME_UNAVAILABLE: {
@@ -245,7 +245,28 @@ const READ_AUTH_EXACT: Record<string, Exact> = {
     retrySafe: 'yes',
     requiresReauth: false,
     sideEffect: 'none',
-    nextAction: '请稍后重试，不要立即连打',
+    nextAction: '请稍后重试，不要立即连打；下载文献时请一篇一篇下，每篇间隔 20-30 秒',
+  },
+  DOCUMENT_EXPIRED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    sideEffect: 'none',
+    nextAction: '请重新 search 获取新编号后再下载，不要重放旧 documentId',
+    message: '文献编号已过期或校验失败',
+  },
+  TIMEOUT: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    sideEffect: 'none',
+    nextAction: '请稍后重试；下载多篇文献时请一篇一篇下，每篇间隔 20-30 秒',
+    message: '文献源响应或下载超时',
+  },
+  RESPONSE_INVALID: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    sideEffect: 'none',
+    nextAction: '可稍后重试一次；若仍失败，说明上游暂无该篇有效 PDF，请换一篇文献',
+    message: '文献源返回格式异常或该文献暂无可用 PDF 全文',
   },
   BAD_REQUEST: {
     retrySafe: 'no',
@@ -309,6 +330,14 @@ describe('plugin error guidance table', () => {
     }
     assert.equal(isPluginPassthroughErrorCode('LOGIN_EXPIRED_ACCOUNT'), true)
     assert.equal(isPluginPassthroughErrorCode('PRECONDITION_CHANGED'), true)
+    assert.equal(isPluginPassthroughErrorCode('DOCUMENT_EXPIRED'), true)
+    assert.equal(isPluginPassthroughErrorCode('TIMEOUT'), true)
+    assert.equal(isPluginPassthroughErrorCode('RESPONSE_INVALID'), true)
+    assert.doesNotMatch(resolvePluginErrorGuidance({ code: 'CONNECTION_ERROR' }).nextAction, /微博/)
+    assert.match(
+      resolvePluginErrorGuidance({ code: 'CONNECTION_ERROR', provider: 'weibo' }).nextAction,
+      /微博/,
+    )
     assert.equal(isPluginPassthroughErrorCode('WEATHER_FORECAST'), false)
     assert.equal(PLUGIN_PASSTHROUGH_ERROR_CODES.includes('WEIBO_ACTION_FAILED'), true)
   })

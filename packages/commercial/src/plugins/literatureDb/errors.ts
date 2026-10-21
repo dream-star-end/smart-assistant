@@ -21,6 +21,7 @@ export type LiteratureErrorCode =
   | 'PERSISTENCE_UNCERTAIN'
   | 'CLEANUP_FAILED'
   | 'SESSION_EXPIRED'
+  | 'DOCUMENT_EXPIRED'
 export class LiteratureError extends Error {
   constructor(readonly code: LiteratureErrorCode) {
     super(code)
