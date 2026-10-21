@@ -7795,7 +7795,8 @@
       "symptom": "个人版 Antigravity 会话 webmvhtasuy8z35hs：82 分钟回合因 CLI token 文件写了准入 token 的真实到期且无 refresh_token，Go oauth2 本地报 token expired 而失败；随后续接同一 CLI 会话时旧 error 步被重吐，四个上游调用全 200 的好回合被判失败并自动恢复 3 次（每次白烧 25–31 万上游输入）；放弃卡又被当成别的 agent 的回答，下一条消息丢 resume、整段重放 70 条。修法：token 文件 expiry 远期化并记日志；忽略本次 user_input 之前的 error 步；该错误归 platform_credential_expired 不自动恢复；缺口判断跳过 master 自写卡，真缺口保留 resume 只补缺的行。",
       "rootFixCommit": "a4c4e35b",
       "coverageCommits": [
-        "b877c2bc"
+        "b877c2bc",
+        "1b374989"
       ],
       "regressions": [
         {
@@ -7827,6 +7828,16 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/antigravityPlatform.test.ts",
           "assertion": "CLI token file expiry outlives any turn and never shortens a later real expiry"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/antigravityRelay.test.ts",
+          "assertion": "a route in use slides past the idle window, up to the lifetime cap"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/antigravityRelay.test.ts",
+          "assertion": "KV renewal: refreshes the token key, never revives a route the turn end expired"
         },
         {
           "layer": "deploy-gate",
