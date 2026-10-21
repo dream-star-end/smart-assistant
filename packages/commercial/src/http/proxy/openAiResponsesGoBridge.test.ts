@@ -250,10 +250,88 @@ describe('request conversion', () => {
       type: 'function_call_output',
       call_id: 't1',
       output: [
-        { type: 'input_text', text: 'read' },
         { type: 'input_image', image_url: 'data:image/png;base64,aGk=' },
+        { type: 'input_text', text: 'read' },
       ],
     })
+  })
+
+  test('keeps tool content order and does not interleave user input between parallel tool outputs', () => {
+    const image = (data: string) => ({
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data },
+    })
+    const out = anthropicToOpenAIResponses({
+      model: 'muse-spark-1.3-go',
+      messages: [
+        { role: 'user', content: 'go' },
+        { role: 'assistant', content: [
+          { type: 'tool_use', id: 'a', name: 'Read', input: {} },
+          { type: 'tool_use', id: 'b', name: 'Read', input: {} },
+        ] },
+        { role: 'user', content: [{
+          type: 'tool_result',
+          tool_use_id: 'a',
+          content: [
+            { type: 'text', text: 'before' },
+            image('YQ=='),
+            { type: 'text', text: 'after' },
+          ],
+        }] },
+        { role: 'user', content: 'between' },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'b', content: 'done' }] },
+      ],
+    }) as Obj
+    const input = out.input as Obj[]
+    const outputs = input.filter((i) => i.type === 'function_call_output')
+    assert.equal(outputs.length, 2)
+    assert.deepEqual(outputs[0].output, [
+      { type: 'input_text', text: 'before' },
+      { type: 'input_image', image_url: 'data:image/png;base64,YQ==' },
+      { type: 'input_text', text: 'after' },
+    ])
+    assert.ok(
+      input.findIndex((i) => i.role === 'user' && i.content !== 'go') >
+        input.indexOf(outputs[1]!),
+      'deferred user content must come after every tool output',
+    )
+  })
+
+  test('parallel image tool results keep their A→B order and error text', () => {
+    const image = (data: string) => ({
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data },
+    })
+    const out = anthropicToOpenAIResponses({
+      model: 'muse-spark-1.3-go',
+      messages: [
+        { role: 'assistant', content: [
+          { type: 'tool_use', id: 'a', name: 'Read', input: {} },
+          { type: 'tool_use', id: 'b', name: 'Read', input: {} },
+        ] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: [image('YQ==')] }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'b', content: [image('Yg==')] }] },
+      ],
+    }) as Obj
+    const outputs = (out.input as Obj[]).filter((i) => i.type === 'function_call_output')
+    assert.deepEqual(outputs[0].output, [{ type: 'input_image', image_url: 'data:image/png;base64,YQ==' }])
+    assert.deepEqual(outputs[1].output, [{ type: 'input_image', image_url: 'data:image/png;base64,Yg==' }])
+    const errored = anthropicToOpenAIResponses({
+      model: 'muse-spark-1.3-go',
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'e', name: 'Read', input: {} }] },
+        { role: 'user', content: [{
+          type: 'tool_result',
+          tool_use_id: 'e',
+          is_error: true,
+          content: [image('YQ=='), { type: 'text', text: 'partial capture' }],
+        }] },
+      ],
+    }) as Obj
+    assert.deepEqual((errored.input as Obj[])[1].output, [
+      { type: 'input_image', image_url: 'data:image/png;base64,YQ==' },
+      { type: 'input_text', text: 'Error: partial capture' },
+    ])
   })
 
   test('fails closed on images, server tools and orphan tool results', () => {

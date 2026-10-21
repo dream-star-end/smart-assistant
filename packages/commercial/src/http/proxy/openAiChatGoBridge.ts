@@ -82,22 +82,43 @@ export function imageUrlFromAnthropic(block: Obj): string {
   throw new Error('invalid OpenCode Go image source')
 }
 
-export function toolResultContent(b: Obj): { text: string; images: string[] } {
-  if (b.content === undefined) return { text: '', images: [] }
-  const texts: string[] = []
-  const images: string[] = []
+export type GoContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image'; url: string }
+
+export function toolResultParts(b: Obj): { text: string; parts: GoContentPart[] } {
+  if (b.content === undefined) return { text: '', parts: [] }
+  const parts: GoContentPart[] = []
   for (const c of blocks(b.content)) {
     if (c.type === 'text') {
       if (typeof c.text !== 'string') throw new Error('invalid OpenCode Go text')
-      texts.push(c.text)
+      parts.push({ type: 'text', text: c.text })
     } else if (c.type === 'image') {
-      images.push(imageUrlFromAnthropic(c))
+      parts.push({ type: 'image', url: imageUrlFromAnthropic(c) })
     } else {
       throw new Error('OpenCode Go supports text and image tool results only')
     }
   }
-  const text = texts.join('\n')
-  return { text: b.is_error === true ? `Error: ${text}` : text, images }
+  const text = parts.filter((p) => p.type === 'text').map((p) => p.text).join('\n')
+  if (b.is_error !== true) return { text, parts }
+  let prefixed = false
+  const errorParts = parts.map((p) => {
+    if (!prefixed && p.type === 'text') {
+      prefixed = true
+      return { ...p, text: `Error: ${p.text}` }
+    }
+    return p
+  })
+  if (!prefixed) errorParts.unshift({ type: 'text', text: 'Error' })
+  return { text: text ? `Error: ${text}` : 'Error', parts: errorParts }
+}
+
+export function toolResultContent(b: Obj): { text: string; images: string[] } {
+  const result = toolResultParts(b)
+  return {
+    text: result.text,
+    images: result.parts.filter((p) => p.type === 'image').map((p) => p.url),
+  }
 }
 
 export function toolResultText(b: Obj): string {
@@ -122,6 +143,13 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
   const system: string[] = body.system === undefined ? [] : systemTexts(body.system)
   const messages: Obj[] = []
   const issued = new Set<string>()
+  const pendingToolCalls = new Set<string>()
+  const deferredUserMessages: Obj[] = []
+  const flushDeferred = () => {
+    if (pendingToolCalls.size === 0 && deferredUserMessages.length) {
+      messages.push(...deferredUserMessages.splice(0))
+    }
+  }
   // OCV5-432: CCB sends platform context as role:"system" messages. Only the preamble (before
   // the first assistant message) folds into the leading system message; later ones (the
   // per-turn `<total_tokens>…`) stay in place so the prompt-cache prefix never changes.
@@ -137,18 +165,18 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
       continue
     }
     if (m.role === 'user') {
-      const texts: string[] = []
-      const images: Obj[] = []
+      const parts: Obj[] = []
       const toolImages: string[] = []
       for (const b of blocks(m.content)) {
         if (b.type === 'text') {
           if (typeof b.text !== 'string') throw new Error('invalid OpenCode Go text')
-          if (b.text) texts.push(b.text)
+          if (b.text) parts.push({ type: 'text', text: b.text })
         } else if (b.type === 'image') {
-          images.push({ type: 'image_url', image_url: { url: imageUrlFromAnthropic(b) } })
+          parts.push({ type: 'image_url', image_url: { url: imageUrlFromAnthropic(b) } })
         } else if (b.type === 'tool_result') {
           if (typeof b.tool_use_id !== 'string' || !issued.has(b.tool_use_id))
             throw new Error('OpenCode Go tool result has no matching tool call')
+          pendingToolCalls.delete(b.tool_use_id)
           const result = toolResultContent(b)
           messages.push({
             role: 'tool',
@@ -158,20 +186,24 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
           toolImages.push(...result.images)
         } else throw new Error(`unsupported OpenCode Go user block: ${String(b.type)}`)
       }
-      if (texts.length || images.length) {
-        messages.push({
-          role: 'user',
-          content: images.length
-            ? [...(texts.length ? [{ type: 'text', text: texts.join('\n\n') }] : []), ...images]
-            : texts.join('\n\n'),
-        })
-      }
+      const userMessage: Obj | null = parts.length
+        ? {
+            role: 'user',
+            content: parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts,
+          }
+        : null
       // Chat tool messages cannot carry images; append a user message the model can see.
-      if (toolImages.length) {
-        messages.push({
-          role: 'user',
-          content: toolImages.map((url) => ({ type: 'image_url', image_url: { url } })),
-        })
+      const imageMessage: Obj | null = toolImages.length
+        ? {
+            role: 'user',
+            content: toolImages.map((url) => ({ type: 'image_url', image_url: { url } })),
+          }
+        : null
+      flushDeferred()
+      for (const msg of [userMessage, imageMessage]) {
+        if (!msg) continue
+        if (pendingToolCalls.size) deferredUserMessages.push(msg)
+        else messages.push(msg)
       }
       continue
     }
@@ -187,6 +219,7 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
         if (typeof b.id !== 'string' || typeof b.name !== 'string')
           throw new Error('invalid OpenCode Go tool use')
         issued.add(b.id)
+        pendingToolCalls.add(b.id)
         calls.push({
           id: decodeChatToolId(b.id),
           type: 'function',
@@ -213,6 +246,8 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
       ...(calls.length && { tool_calls: calls }),
     })
   }
+  flushDeferred()
+  if (pendingToolCalls.size) throw new Error('OpenCode Go history has unanswered tool calls')
   if (!messages.length) throw new Error('OpenCode Go requires nonempty content')
   if (system.length) messages.unshift({ role: 'system', content: system.join('\n\n') })
   const out: Obj = {

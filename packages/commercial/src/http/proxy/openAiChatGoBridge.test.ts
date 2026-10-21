@@ -277,6 +277,92 @@ describe('request conversion', () => {
     })
   })
 
+  test('keeps interleaved text/image order and defers images until parallel tools finish', () => {
+    const image = (data: string) => ({
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data },
+    })
+    const ordered = anthropicToOpenAIChat({
+      model: 'm',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'before' },
+          image('YQ=='),
+          { type: 'text', text: 'after' },
+          image('Yg=='),
+        ],
+      }],
+    }) as Obj
+    assert.deepEqual((ordered.messages as Obj[])[0].content, [
+      { type: 'text', text: 'before' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,YQ==' } },
+      { type: 'text', text: 'after' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,Yg==' } },
+    ])
+
+    const parallel = anthropicToOpenAIChat({
+      model: 'm',
+      messages: [
+        { role: 'user', content: 'go' },
+        { role: 'assistant', content: [
+          { type: 'tool_use', id: 'a', name: 'Read', input: {} },
+          { type: 'tool_use', id: 'b', name: 'Read', input: {} },
+        ] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: [image('YQ==')] }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'b', content: 'done' }] },
+      ],
+    }) as Obj
+    const roles = (parallel.messages as Obj[]).map((m) => m.role)
+    assert.deepEqual(roles, ['user', 'assistant', 'tool', 'tool', 'user'])
+    assert.deepEqual((parallel.messages as Obj[]).at(-1), {
+      role: 'user',
+      content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,YQ==' } }],
+    })
+  })
+
+  test('parallel image tool results keep their original A→B order and error text', () => {
+    const image = (data: string) => ({
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data },
+    })
+    const out = anthropicToOpenAIChat({
+      model: 'm',
+      messages: [
+        { role: 'assistant', content: [
+          { type: 'tool_use', id: 'a', name: 'Read', input: {} },
+          { type: 'tool_use', id: 'b', name: 'Read', input: {} },
+        ] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: [image('YQ==')] }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'b', content: [image('Yg==')] }] },
+      ],
+    }) as Obj
+    const messages = out.messages as Obj[]
+    assert.deepEqual(messages.slice(-2), [
+      {
+        role: 'user',
+        content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,YQ==' } }],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,Yg==' } }],
+      },
+    ])
+    const errored = anthropicToOpenAIChat({
+      model: 'm',
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'e', name: 'Read', input: {} }] },
+        { role: 'user', content: [{
+          type: 'tool_result',
+          tool_use_id: 'e',
+          is_error: true,
+          content: [image('YQ=='), { type: 'text', text: 'partial capture' }],
+        }] },
+      ],
+    }) as Obj
+    assert.equal((errored.messages as Obj[]).find((m) => m.role === 'tool')?.content, 'Error: partial capture')
+  })
+
   test('fails closed on what it cannot represent', () => {
     const m = (content: unknown, role = 'user') => ({ model: 'm', messages: [{ role, content }] })
     assert.throws(

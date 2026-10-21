@@ -1619,7 +1619,10 @@ export function stripProviderBoundAssistantBlocks(messages: unknown[]): {
  * 性能/不变量:copy-on-write —— 无任何非文本块时直返原引用,且不 mutate 入参(调用方在
  * sanitize 后还会读 body / estimateInputTokens 等),与 stripMalformedThinkingBlocks 同构。
  */
-export function stripNonTextContentBlocks(messages: unknown[]): {
+export function stripNonTextContentBlocks(
+  messages: unknown[],
+  opts: { keepImages?: boolean } = {},
+): {
   messages: unknown[];
   imagesStripped: number;
   documentsStripped: number;
@@ -1638,6 +1641,7 @@ export function stripNonTextContentBlocks(messages: unknown[]): {
     block: Record<string, unknown>,
   ): Record<string, unknown> | null => {
     if (block.type === "image") {
+      if (opts.keepImages) return null;
       imagesStripped++;
       return { type: "text", text: "[image omitted: this model accepts text input only]" };
     }
