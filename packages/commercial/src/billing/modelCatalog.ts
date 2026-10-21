@@ -59,7 +59,7 @@ export const CAPABILITY_SCHEMA_VERSION = 1;
 
 /** capability_profile(JSONB)的 v1 形状 —— 与 0143 fn_model_catalog_capability 同源。 */
 export interface ModelCapabilityProfile {
-  /** 上游是否原生支持图像识别。false → master proxy strip 图 + understand_image 工具兜底。 */
+  /** 代理是否剥图:true = 保留图片发给上游;false = master proxy strip 图。不是模型能力的推断。 */
   supportsVision: boolean;
   reasoning: {
     /** 该模型可接受/展示的思考档位;空数组 = 不支持思考深度。 */

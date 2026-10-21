@@ -69,6 +69,7 @@ import {
   isOpenCodeGoFastUpstream,
   OPENAI_FAST_SERVICE_TIER,
   staticProviderOutputConfigEfforts,
+  staticProviderSupportsVision,
   type StaticKeyProviderSpec,
   type StaticProviderId,
   type StaticProviderKeys,
@@ -219,7 +220,7 @@ export function providerCapabilityCeiling(route: UpstreamRoute): ProviderCapabil
   const spec = route.provider;
   // Model-scoped list (OCV5-425) > provider allowlist > [] when output_config is stripped.
   const efforts = staticProviderOutputConfigEfforts(spec, route.upstreamModel);
-  return { supportsVision: spec.supportsVision === true, efforts };
+  return { supportsVision: staticProviderSupportsVision(spec, route.upstreamModel), efforts };
 }
 
 /**

@@ -242,11 +242,46 @@ describe('request conversion', () => {
     assert.equal(anthropicToOpenAIChat({ ...base, max_tokens: 100 }).max_tokens, 100)
   })
 
+  test('represents user images and appends tool-result images as a user message', () => {
+    const image = {
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data: 'aGk=' },
+    }
+    const out = anthropicToOpenAIChat({
+      model: 'm',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'look' }, image] },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: {} }] },
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 't1', content: [image, { type: 'text', text: 'read' }] }],
+        },
+      ],
+    }) as Obj
+    const messages = out.messages as Obj[]
+    assert.deepEqual(messages[0], {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'look' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,aGk=' } },
+      ],
+    })
+    assert.deepEqual(messages.find((m) => m.role === 'tool'), {
+      role: 'tool',
+      tool_call_id: 't1',
+      content: 'read',
+    })
+    assert.deepEqual(messages.at(-1), {
+      role: 'user',
+      content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,aGk=' } }],
+    })
+  })
+
   test('fails closed on what it cannot represent', () => {
     const m = (content: unknown, role = 'user') => ({ model: 'm', messages: [{ role, content }] })
     assert.throws(
       () => anthropicToOpenAIChat(m([{ type: 'image', source: {} }])),
-      /unsupported OpenCode Go user block/,
+      /invalid OpenCode Go image source/,
     )
     assert.throws(
       () =>

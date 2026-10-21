@@ -222,11 +222,45 @@ describe('request conversion', () => {
     assert.equal(forced.reasoning, undefined)
   })
 
+  test('represents user images and tool-result images', () => {
+    const image = {
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data: 'aGk=' },
+    }
+    const out = anthropicToOpenAIResponses({
+      model: 'muse-spark-1.3-go',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'look' }, image] },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: {} }] },
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 't1', content: [image, { type: 'text', text: 'read' }] }],
+        },
+      ],
+    }) as Obj
+    const input = out.input as Obj[]
+    assert.deepEqual(input.find((i) => i.role === 'user'), {
+      role: 'user',
+      content: [
+        { type: 'input_text', text: 'look' },
+        { type: 'input_image', image_url: 'data:image/png;base64,aGk=' },
+      ],
+    })
+    assert.deepEqual(input.find((i) => i.type === 'function_call_output'), {
+      type: 'function_call_output',
+      call_id: 't1',
+      output: [
+        { type: 'input_text', text: 'read' },
+        { type: 'input_image', image_url: 'data:image/png;base64,aGk=' },
+      ],
+    })
+  })
+
   test('fails closed on images, server tools and orphan tool results', () => {
     const m = (content: unknown) => ({ model: 'm', messages: [{ role: 'user', content }] })
     assert.throws(
       () => anthropicToOpenAIResponses(m([{ type: 'image', source: {} }])),
-      /unsupported/,
+      /invalid OpenCode Go image source/,
     )
     assert.throws(
       () =>

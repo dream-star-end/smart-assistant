@@ -72,7 +72,7 @@ import {
 } from "./modelAuthorityGate.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
 import { scopedApiKeyPoolWiring } from "./apiKeyPoolWiring.js";
-import { findRouteProviderForModel, getStaticProvider, isClassifierSideQuery, resolveCursorPublicModel, staticRouteFallback, type StaticRouteFallback } from "@openclaude/protocol";
+import { findRouteProviderForModel, getStaticProvider, isClassifierSideQuery, resolveCursorPublicModel, staticProviderSupportsVision, staticRouteFallback, type StaticRouteFallback } from "@openclaude/protocol";
 import { applyFastServiceTierPricing } from "./fastServiceTier.js";
 import {
   getDegradedProviders,
@@ -933,7 +933,7 @@ export function makeAnthropicProxyHandler(
       const modelSupportsVision = gate
         ? gate.descriptor.capabilityProfile.supportsVision
         : route.kind === "static"
-          ? route.provider.supportsVision === true
+          ? staticProviderSupportsVision(route.provider, route.upstreamModel)
           : route.kind !== "box";
       // Same ready bit issuance uses (default false). OC_BOX_MODEL_API only arms
       // the transport; it does not prove the signed capability. Local catalog

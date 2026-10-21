@@ -68,18 +68,40 @@ export function webSearchResultText(content: unknown): string {
     : 'Web search returned no results.'
 }
 
+export function imageUrlFromAnthropic(block: Obj): string {
+  if (block.type !== 'image') throw new Error('expected an image block')
+  const source = obj(block.source)
+  if (
+    source.type === 'base64' &&
+    typeof source.media_type === 'string' &&
+    typeof source.data === 'string'
+  ) {
+    return `data:${source.media_type};base64,${source.data}`
+  }
+  if (source.type === 'url' && typeof source.url === 'string' && source.url) return source.url
+  throw new Error('invalid OpenCode Go image source')
+}
+
+export function toolResultContent(b: Obj): { text: string; images: string[] } {
+  if (b.content === undefined) return { text: '', images: [] }
+  const texts: string[] = []
+  const images: string[] = []
+  for (const c of blocks(b.content)) {
+    if (c.type === 'text') {
+      if (typeof c.text !== 'string') throw new Error('invalid OpenCode Go text')
+      texts.push(c.text)
+    } else if (c.type === 'image') {
+      images.push(imageUrlFromAnthropic(c))
+    } else {
+      throw new Error('OpenCode Go supports text and image tool results only')
+    }
+  }
+  const text = texts.join('\n')
+  return { text: b.is_error === true ? `Error: ${text}` : text, images }
+}
+
 export function toolResultText(b: Obj): string {
-  const text =
-    b.content === undefined
-      ? ''
-      : blocks(b.content)
-          .map((c) => {
-            if (c.type !== 'text' || typeof c.text !== 'string')
-              throw new Error('OpenCode Go supports text tool results only')
-            return c.text
-          })
-          .join('\n')
-  return b.is_error === true ? `Error: ${text}` : text
+  return toolResultContent(b).text
 }
 
 export function isServerTool(t: Obj): boolean {
@@ -116,21 +138,41 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
     }
     if (m.role === 'user') {
       const texts: string[] = []
+      const images: Obj[] = []
+      const toolImages: string[] = []
       for (const b of blocks(m.content)) {
         if (b.type === 'text') {
           if (typeof b.text !== 'string') throw new Error('invalid OpenCode Go text')
           if (b.text) texts.push(b.text)
+        } else if (b.type === 'image') {
+          images.push({ type: 'image_url', image_url: { url: imageUrlFromAnthropic(b) } })
         } else if (b.type === 'tool_result') {
           if (typeof b.tool_use_id !== 'string' || !issued.has(b.tool_use_id))
             throw new Error('OpenCode Go tool result has no matching tool call')
+          const result = toolResultContent(b)
           messages.push({
             role: 'tool',
             tool_call_id: decodeChatToolId(b.tool_use_id),
-            content: toolResultText(b),
+            content: result.text || (result.images.length ? 'Tool returned an image.' : ''),
           })
+          toolImages.push(...result.images)
         } else throw new Error(`unsupported OpenCode Go user block: ${String(b.type)}`)
       }
-      if (texts.length) messages.push({ role: 'user', content: texts.join('\n\n') })
+      if (texts.length || images.length) {
+        messages.push({
+          role: 'user',
+          content: images.length
+            ? [...(texts.length ? [{ type: 'text', text: texts.join('\n\n') }] : []), ...images]
+            : texts.join('\n\n'),
+        })
+      }
+      // Chat tool messages cannot carry images; append a user message the model can see.
+      if (toolImages.length) {
+        messages.push({
+          role: 'user',
+          content: toolImages.map((url) => ({ type: 'image_url', image_url: { url } })),
+        })
+      }
       continue
     }
     if (m.role !== 'assistant') throw new Error('unsupported OpenCode Go message role')

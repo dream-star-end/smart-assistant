@@ -6,8 +6,9 @@ import {
   blocks,
   isServerTool,
   obj,
+  imageUrlFromAnthropic,
   systemTexts,
-  toolResultText,
+  toolResultContent,
   webSearchResultText,
 } from './openAiChatGoBridge.js'
 import {
@@ -76,21 +77,43 @@ export function anthropicToOpenAIResponses(body: Obj): Obj {
     }
     if (m.role === 'user') {
       const texts: string[] = []
+      const images: Obj[] = []
       for (const b of blocks(m.content)) {
         if (b.type === 'text') {
           if (typeof b.text !== 'string') throw new Error('invalid OpenCode Go text')
           if (b.text) texts.push(b.text)
+        } else if (b.type === 'image') {
+          images.push({ type: 'input_image', image_url: imageUrlFromAnthropic(b) })
         } else if (b.type === 'tool_result') {
           if (typeof b.tool_use_id !== 'string' || !issued.has(b.tool_use_id))
             throw new Error('OpenCode Go tool result has no matching tool call')
+          const result = toolResultContent(b)
           input.push({
             type: 'function_call_output',
             call_id: decodeResponsesToolId(b.tool_use_id),
-            output: toolResultText(b),
+            output: result.images.length
+              ? [
+                  {
+                    type: 'input_text',
+                    text: result.text || 'Tool returned an image.',
+                  },
+                  ...result.images.map((url) => ({ type: 'input_image', image_url: url })),
+                ]
+              : result.text,
           })
         } else throw new Error(`unsupported OpenCode Go user block: ${String(b.type)}`)
       }
-      if (texts.length) input.push({ role: 'user', content: texts.join('\n\n') })
+      if (texts.length || images.length) {
+        input.push({
+          role: 'user',
+          content: images.length
+            ? [
+                ...(texts.length ? [{ type: 'input_text', text: texts.join('\n\n') }] : []),
+                ...images,
+              ]
+            : texts.join('\n\n'),
+        })
+      }
       continue
     }
     if (m.role !== 'assistant') throw new Error('unsupported OpenCode Go message role')

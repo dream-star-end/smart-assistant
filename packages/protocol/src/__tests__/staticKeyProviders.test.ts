@@ -20,6 +20,7 @@ import {
   STATIC_KEY_INBOUND_MODEL_IDS,
   findRouteProviderForModel,
   getStaticProvider,
+  staticProviderSupportsVision,
   type StaticProviderId,
 } from '../staticKeyProviders.js'
 
@@ -508,6 +509,30 @@ describe('staticKeyProviders — supportsVision(原生多模态标记)', () => {
     assert.equal(getStaticProvider('opencodego').supportsVision ?? false, false)
     // kimi 2026-07-06 实测 image block → 400 InvalidParameter(同 lane 的 M3 反而是多模态)。
     assert.equal(getStaticProvider('kimi').supportsVision ?? false, false)
+  })
+})
+
+describe('staticKeyProviders — modelSupportsVision(OpenCode Go 按模型白名单)', () => {
+  it('only the audited Go upstream models are native-vision; beam and the rest stay text-only', () => {
+    const go = getStaticProvider('opencodego')
+    for (const upstream of [
+      'deepseek-v4-flash',
+      'minimax-m3',
+      'qwen3.7-plus',
+      'glm-5.3-flash',
+      'minimax-m3.1-flash-free',
+      'mimo-v2.5',
+      'mimo-v2.6-flash',
+      'step-5-preview',
+      'longcat-2.5-preview-free',
+      'muse-spark-1.3-contributor',
+    ]) {
+      assert.equal(staticProviderSupportsVision(go, upstream), true, upstream)
+    }
+    assert.equal(staticProviderSupportsVision(go, 'beam-free'), false)
+    assert.equal(staticProviderSupportsVision(go, 'kimi-k3'), false)
+    assert.equal(staticProviderSupportsVision(go, 'qwen3.8-max'), false)
+    assert.equal(staticProviderSupportsVision(go), false)
   })
 })
 

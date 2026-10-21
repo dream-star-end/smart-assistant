@@ -54,6 +54,50 @@ async function rewrite(upstreamModel: string, extra: Record<string, unknown>) {
   return body as unknown as Record<string, unknown>
 }
 
+describe('OpenCode Go vision ceiling', () => {
+  test('per upstream model: the audited ten are vision-capable; beam-free is not', () => {
+    for (const model of [
+      'deepseek-v4-flash',
+      'minimax-m3',
+      'qwen3.7-plus',
+      'glm-5.3-flash',
+      'minimax-m3.1-flash-free',
+      'mimo-v2.5',
+      'mimo-v2.6-flash',
+      'step-5-preview',
+      'longcat-2.5-preview-free',
+      'muse-spark-1.3-contributor',
+    ]) {
+      assert.equal(providerCapabilityCeiling(route(model)).supportsVision, true, model)
+    }
+    assert.equal(providerCapabilityCeiling(route('beam-free')).supportsVision, false)
+    assert.equal(providerCapabilityCeiling(route('kimi-k3')).supportsVision, false)
+    assert.equal(providerCapabilityCeiling(route()).supportsVision, false)
+  })
+
+  test('snapshot check accepts vision only on allowlisted Go upstream ids', () => {
+    const entry = (modelId: string, upstreamModelId: string, supportsVision: boolean) => ({
+      modelId,
+      engine: 'ccb',
+      providerId: 'opencodego',
+      upstreamModelId,
+      state: 'active',
+      capabilityProfile: { supportsVision, reasoning: { supported: [] } },
+    })
+    assert.deepEqual(
+      checkSnapshotCapabilities({
+        entries: [
+          entry('minimax-m3-go', 'minimax-m3', true),
+          entry('muse-spark-1.3-go', 'muse-spark-1.3-contributor', true),
+        ],
+      }),
+      [],
+    )
+    assert.equal(checkSnapshotCapabilities({ entries: [entry('beam-free-go', 'beam-free', true)] }).length, 1)
+    assert.equal(checkSnapshotCapabilities({ entries: [entry('kimi-k3-go', 'kimi-k3', true)] }).length, 1)
+  })
+})
+
 describe('OpenCode Go effort ceiling', () => {
   test('per upstream model; unlisted models and the bare provider stay at no tiers', () => {
     assert.deepEqual(providerCapabilityCeiling(route('claude-haiku-5-5')).efforts, [
