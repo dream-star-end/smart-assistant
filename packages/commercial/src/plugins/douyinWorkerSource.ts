@@ -336,41 +336,19 @@ async function pageText(page) {
   return (await page.locator('body').innerText({ timeout: 5_000 }).catch(() => '')).replace(/\s+/g, ' ');
 }
 /**
- * 页面上出现可见的风控 / 本人验证就停：返回失败码，绝不尝试处理。
- * 按「提示词 × 出现次数」比对：baseline 是二维码出现时登录页上已有的提示词次数（静态文案，如页脚的
- * 「身份验证中心」）；之后同一个词出现得更多、或出现新的词，都算信号。只按类别屏蔽会漏掉后来出现的
- * 同类真实验证（Codex r1 P1）。
+ * 页面上出现可见的风控 / 本人验证就停：返回失败码，绝不尝试处理。没有「静态文案」豁免：任何页面上只要
+ * 出现这些提示词就停（宁可误停也不放过真实验证；Codex r1/r2 P1）。侦察时登录页文字不含这些词。
  */
-const NO_BLOCKERS = new Map();
-function phraseCounts(text) {
-  const counts = new Map();
-  for (const [code, re] of [['VERIFICATION_REQUIRED', VERIFICATION_TEXT], ['UPSTREAM_CHALLENGE', CHALLENGE_TEXT]]) {
-    for (const match of text.matchAll(new RegExp(re.source, 'g'))) {
-      const key = code + ':' + match[0];
-      counts.set(key, (counts.get(key) || 0) + 1);
-    }
-  }
-  return counts;
+function blockerCode(text) {
+  if (VERIFICATION_TEXT.test(text)) return 'VERIFICATION_REQUIRED';
+  if (CHALLENGE_TEXT.test(text)) return 'UPSTREAM_CHALLENGE';
+  return null;
 }
-function blockerCode(text, baseline) {
-  let challenge = false;
-  for (const [key, count] of phraseCounts(text)) {
-    if (count <= (baseline.get(key) || 0)) continue;
-    if (key.startsWith('VERIFICATION_REQUIRED:')) return 'VERIFICATION_REQUIRED';
-    challenge = true;
-  }
-  return challenge ? 'UPSTREAM_CHALLENGE' : null;
-}
-function staticBlockers(text) { return phraseCounts(text); }
-/**
- * 检查浏览器里所有打开的页面（含跳转后的验证页和弹窗）。baseline 只对仍停在登录首页的登录页生效；
- * 离开首页后页面上的任何提示词都算信号（Codex r1 P1：只看首页会让验证页直接走到身份探测）。
- */
-async function pageBlocker(context, login, baseline) {
+/** 检查浏览器里所有打开的页面（含跳转后的验证页和弹窗）。 */
+async function pageBlocker(context) {
   for (const page of context.pages()) {
     if (page.isClosed()) continue;
-    const ignore = page === login && onLoginPage(login) ? baseline : NO_BLOCKERS;
-    const code = blockerCode(await pageText(page), ignore);
+    const code = blockerCode(await pageText(page));
     if (code) return code;
   }
   return null;
@@ -384,7 +362,7 @@ async function captureQr(page, waitMs) {
     if (image) break;
     await page.waitForTimeout(1_000);
   }
-  if (!image) throw new Error(blockerCode(await pageText(page), NO_BLOCKERS) || 'qr');
+  if (!image) throw new Error(blockerCode(await pageText(page)) || 'qr');
   const png = await image.screenshot({ type: 'png', animations: 'disabled' });
   if (png.length < 100 || png.length > 512 * 1024 || !png.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]))) throw new Error('qr');
   return png;
@@ -433,12 +411,11 @@ async function runLogin(input, relay) {
     let qrHash = digest(png.toString('base64'));
     writeFrame({ event: 'qr', png: png.toString('base64') });
     emitStep({ step: 'login.qr' });
-    const ignoredBlockers = staticBlockers(await pageText(login));
     const initialCookies = await authCookieDigest(context);
     let nextQr = Date.now() + QR_REFRESH_MS;
     let nextProbe = 0;
     while (Date.now() < input.deadlineMs) {
-      const blocked = await pageBlocker(context, login, ignoredBlockers);
+      const blocked = await pageBlocker(context);
       if (blocked) {
         emitStep({ step: 'login.blocked', code: blocked });
         await writeTerminalAndExit({ event: 'failed', code: blocked });
@@ -469,7 +446,7 @@ async function runLogin(input, relay) {
         const self = await proveSelf(context);
         if (self) {
           // 身份接口通过也不代表没有本人验证：保存前再看一遍所有页面。
-          const late = await pageBlocker(context, login, ignoredBlockers);
+          const late = await pageBlocker(context);
           if (late) {
             emitStep({ step: 'login.blocked', code: late });
             await writeTerminalAndExit({ event: 'failed', code: late });
