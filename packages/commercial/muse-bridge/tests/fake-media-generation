@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+# Stub of /opt/hatch/bin/media-generation per MUSE-MEDIA-CLI-v2; behaviour chosen by prompt keyword.
+import json, os, sys, time
+a = sys.argv[1:]
+if a == ["--help"]:
+    print("Usage: media-generation --media-subagent-output-type <image|video> ..."); sys.exit(0)
+if a == ["--version"]:
+    print("media-generation 0.1.0-fake"); sys.exit(0)
+with open(os.environ.get("FAKE_ARGV_LOG", "/dev/null"), "a") as f:
+    f.write(json.dumps(a, ensure_ascii=False) + "\n")
+def arg(n):
+    return a[a.index(n) + 1] if n in a else None
+LEGACY = ("--image-file", "--image-id", "--reference-image-file", "--reference-image-id")
+SUBAGENT = ("--media-subagent-output-type", "--conversation-json", "--resume-from-snapshot-id")
+if any(x in a for x in LEGACY) and any(x in a for x in SUBAGENT):
+    print("error: media_subagent cannot be combined with legacy media-generation arguments", file=sys.stderr); sys.exit(1)
+if "--upload-only" in a:
+    files = [a[i + 1] for i, x in enumerate(a) if x == "--image-file"]
+    if not files or any(not os.path.isfile(p) for p in files):
+        print("error: --upload-only needs --image-file", file=sys.stderr); sys.exit(2)
+    if os.environ.get("FAKE_UPLOAD_FAIL"):
+        print(json.dumps({"ok": False, "error_code": "upload_failed", "error_message": "upload rejected", "retryable": True})); sys.exit(1)
+    ids = ["15188757200826%02d" % i for i in range(len(files))]
+    with open(os.path.join(arg("--output-dir"), "media-generation-last-upload-handles.json"), "w") as f:
+        json.dump(ids, f)
+    print(json.dumps({"image_ids": ids, "upload_count": len(ids)})); sys.exit(0)
+kind, conv, out = arg("--media-subagent-output-type"), arg("--conversation-json"), arg("--output-dir")
+if not conv or not kind or not out:
+    print("Usage: ...", file=sys.stderr); sys.exit(2)
+items = json.loads(conv)
+if any(len(it) != 1 or not ({"text", "image"} & set(it)) for it in items):
+    print("error: each conversation item needs exactly one of text/image", file=sys.stderr); sys.exit(2)
+images = [it["image"] for it in items if "image" in it]
+if any(not str(i).startswith("15188757200826") for i in images):
+    print(json.dumps({"ok": False, "error_code": "invalid_image_id", "error_message": "unknown image id"})); sys.exit(1)
+prompt = [it["text"] for it in items if "text" in it][-1]
+if "badargs" in prompt:
+    print("error: unexpected argument", file=sys.stderr); sys.exit(2)
+if "region" in prompt:
+    print(json.dumps({"ok": False, "status": 200, "downstream_status": 403, "media_type": "video",
+        "error_code": "video_not_available", "error_message": "Video generation isn't available in your country or region."})); sys.exit(1)
+if "retry" in prompt:
+    print(json.dumps({"ok": False, "error_code": "upstream_overloaded", "error_message": "busy, see https://x.fbcdn.net/abc", "retryable": True})); sys.exit(1)
+if "policy" in prompt:
+    print(json.dumps({"ok": False, "error_code": "content_policy", "error_message": "blocked"})); sys.exit(1)
+if "garbage" in prompt:
+    print("panic at the disco"); sys.exit(101)
+if "sleep" in prompt:
+    time.sleep(120)
+if "escape" in prompt:
+    print(json.dumps({"ok": True, "media_paths": ["/etc/hostname"]})); sys.exit(0)
+if kind == "image":
+    size = 30 * 1024 * 1024 if "big" in prompt else 9 * 1024 * 1024 + 123 if "multi" in prompt else 4000
+    head, ext = b"RIFF\x00\x00\x00\x00WEBPVP8 ", "webp"
+else:
+    # measured 2026-10-22: text-to-video ~10.7 MB, image-to-video ~6.7 MB
+    size = 70 * 1024 * 1024 if "big" in prompt else (6_700_000 if images else 10_700_000)
+    head, ext = b"\x00\x00\x00\x18ftypmp42", "mp4"
+p = os.path.join(out, "media-generation-x." + ext)
+with open(p, "wb") as f:
+    f.write(head + os.urandom(size - len(head)))
+resume = arg("--resume-from-snapshot-id")
+snap = (resume.split(":")[0] if resume else "5421fa39-fc25-431a-97d8-8114a892997b") + ":" + os.urandom(3).hex()
+print(json.dumps({"ok": True, "status": 200, "media_type": kind, "media_paths": [p],
+    "media_urls": ["https://scontent.xx.fbcdn.net/secret"], "artifact_ids": ["media-artifact:abc"], "snapshot_id": snap}))
