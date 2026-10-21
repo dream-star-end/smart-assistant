@@ -31,7 +31,7 @@ import {
   Wand2,
   X,
 } from "lucide-react";
-import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol";
+import { normalizeTurnErrorCode, turnErrorSemantics } from "@openclaude/protocol/browser";
 import { createContext, memo, useContext, useEffect, useId, useRef, useState } from "react";
 import type { BlankProbeReport as TimelineBlankReport } from "../../lib/chat/timelineBlankProbe";
 import type { ChatMessage } from "../../lib/chat/model";

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { EPOCH_BAND, packEpoch, timelineIdentity } from "@openclaude/protocol";
+import { EPOCH_BAND, packEpoch, timelineIdentity } from "@openclaude/protocol/browser";
 import type { ChatMessage } from "../chat/model";
 import {
   identityOf,

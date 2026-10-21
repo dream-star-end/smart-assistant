@@ -3,7 +3,7 @@
  * 视觉组件见 SessionStatusDot；本 tab 发送中由 isSending 注入 running，
  * 服务端 runState/lastOutcome 只做刷新与跨设备兜底。
  */
-import { normalizeTurnErrorCode } from "@openclaude/protocol";
+import { normalizeTurnErrorCode } from "@openclaude/protocol/browser";
 import type { SessionLastOutcome } from "./types";
 
 export type SessionStatusKind =

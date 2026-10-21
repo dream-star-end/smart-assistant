@@ -9,7 +9,7 @@ import "@testing-library/jest-dom/vitest";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PLUGIN_UI_COMPONENTS, pluginUiTypes } from "@openclaude/protocol";
+import { PLUGIN_UI_COMPONENTS, pluginUiTypes } from "@openclaude/protocol/browser";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, test } from "vitest";
 import { normalizeMathDelimiters } from "../mathDelimiters";

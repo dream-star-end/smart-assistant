@@ -1,4 +1,4 @@
-import { classifyRecordedRunCost, RECORDED_COST_LABELS, formatRecordedCostTotal, type RecordedCostAmounts } from '@openclaude/protocol'
+import { classifyRecordedRunCost, RECORDED_COST_LABELS, formatRecordedCostTotal, type RecordedCostAmounts } from '@openclaude/protocol/browser'
 /**
  * Taskboard 前端类型 + `/api/board` 客户端。
  *
