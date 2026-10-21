@@ -31,6 +31,8 @@ import {
   DOCUMENT_ID_TTL_MS,
   deriveLiteratureDocumentIdSecret,
   mintScopedDocumentId,
+  normalizeSpringerDoi,
+  normalizeSpringerPaperId,
   parseSpringerSearchHtml,
   verifyScopedDocumentId,
 } from './httpExecutor.js'
@@ -301,6 +303,125 @@ test('mintScopedDocumentId and verifyScopedDocumentId enforce opaqueId schema, o
     }).paperId,
     'zgkx-ec202602003',
   )
+})
+
+test('Springer 10.1186 DOI normalization preserves 10. prefix across HTML parsing, documentId mint/verify, and download', async () => {
+  assert.equal(normalizeSpringerDoi('10.1186/s40623-026-02478-9'), '10.1186/s40623-026-02478-9')
+  assert.equal(normalizeSpringerDoi('1186/s40623-026-02478-9'), '10.1186/s40623-026-02478-9')
+  assert.equal(normalizeSpringerDoi('10.1186%2Fs43020-023-00122-5'), '10.1186/s43020-023-00122-5')
+  assert.equal(
+    normalizeSpringerPaperId('sp_1186_s40623-026-02478-9'),
+    'sp_10.1186_s40623-026-02478-9',
+  )
+  assert.equal(
+    normalizeSpringerPaperId('sp.1186_s43020-023-00122-5'),
+    'sp_10.1186_s43020-023-00122-5',
+  )
+
+  const html = `<ol>
+    <li class="app-card-open" data-test="search-result-item">
+      <div class="app-card-open__main">
+        <div data-test="entitlements" class="app-entitlement__text">Open access</div>
+        <h3 class="app-card-open__heading" data-test="title">
+          <a href="${SPRINGER_WEBVPN_PREFIX}/article/10.1186/s40623-026-02478-9">
+            Probing atmospheric turbulence with VLBI residuals: when theory meets observations
+          </a>
+        </h3>
+        <div class="app-card-open__authors">
+          <span data-test="authors">Benedikt Soja, Rohithori</span>
+        </div>
+        <div class="app-card-open__meta">
+          <a data-test="parent" href="/journal/40623">Earth, Planets and Space</a>
+          <span data-test="published">19 February 2026</span>
+        </div>
+      </div>
+    </li>
+    <li class="app-card-open" data-test="search-result-item">
+      <div class="app-card-open__main">
+        <div data-test="entitlements" class="app-entitlement__text">Open access</div>
+        <h3 class="app-card-open__heading" data-test="title">
+          <a href="${SPRINGER_WEBVPN_PREFIX}/articles/1186%2Fs43020-023-00122-5">
+            Modeling and mitigating non-isotropic tropospheric delay in GNSS
+          </a>
+        </h3>
+        <div class="app-card-open__meta">
+          <a data-test="parent" href="/journal/43020">Satellite Navigation</a>
+          <span data-test="published">2023</span>
+        </div>
+      </div>
+    </li>
+  </ol>`
+
+  const parsed = parseSpringerSearchHtml(html, 10)
+  assert.equal(parsed.length, 2)
+  assert.equal(parsed[0]!.id, 'sp_10.1186_s40623-026-02478-9')
+  assert.equal(parsed[1]!.id, 'sp_10.1186_s43020-023-00122-5')
+
+  const secret = Buffer.alloc(32, 0x24)
+  const now = 1_792_547_293_000
+  const minted = mintScopedDocumentId(secret, {
+    ownerUserId: '4',
+    accountInstanceId: 'inst-u4',
+    paperId: 'sp_10.1186_s40623-026-02478-9',
+    nowMs: now,
+  })
+  // Simulate LLM hex transcription dropping "31302e" ("10.") from "73705f31302e313138365f"
+  const corruptedMissing10 = minted.replace(
+    '-73705f31302e313138365f',
+    '-73705f313138365f',
+  )
+  assert.notEqual(corruptedMissing10, minted)
+  const recovered = verifyScopedDocumentId(secret, corruptedMissing10, {
+    ownerUserId: '4',
+    accountInstanceId: 'inst-u4',
+    nowMs: now + 60_000,
+  })
+  assert.equal(recovered.paperId, 'sp_10.1186_s40623-026-02478-9')
+
+  // Forged MAC on corrupted token is still rejected
+  const forged = `${corruptedMissing10.slice(0, -4)}ffff`
+  assert.throws(
+    () =>
+      verifyScopedDocumentId(secret, forged, {
+        ownerUserId: '4',
+        accountInstanceId: 'inst-u4',
+        nowMs: now + 60_000,
+      }),
+    (err: unknown) => err instanceof LiteratureError && err.code === 'DOCUMENT_EXPIRED',
+  )
+
+  // Verify end-to-end download requests /content/pdf/10.1186/s40623-026-02478-9.pdf
+  const store = new LiteratureArtifactStore()
+  const requestedPaths: string[] = []
+  const executor = new WanfangLiteratureHttpExecutor({
+    artifactStore: store,
+    tokenSecret: secret,
+    verifyMemberSession: async (s) => s,
+    requester: async ({ url }) => {
+      requestedPaths.push(url.pathname)
+      if (url.pathname === `${SPRINGER_WEBVPN_PREFIX}/content/pdf/10.1186/s40623-026-02478-9.pdf`) {
+        return {
+          statusCode: 200,
+          headers: { 'content-type': 'application/pdf' },
+          body: VALID_PDF,
+        }
+      }
+      throw new Error(`Unexpected path: ${url.pathname}`)
+    },
+  })
+  const dl = await executor.executeRead({
+    userId: 4,
+    ownerUserId: '4',
+    accountInstanceId: 'inst-u4',
+    storageState: buildAuthenticatedState(),
+    actionId: 'download',
+    params: { documentId: corruptedMissing10 },
+    signal: new AbortController().signal,
+  })
+  dl.stagedArtifact?.publish()
+  assert.deepEqual(requestedPaths, [
+    `${SPRINGER_WEBVPN_PREFIX}/content/pdf/10.1186/s40623-026-02478-9.pdf`,
+  ])
 })
 
 test('jieyouLoginSession classifies responses and reloginJieyouAutomatically retries until authenticated', async () => {
