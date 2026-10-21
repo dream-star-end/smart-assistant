@@ -798,6 +798,28 @@ describe('Antigravity stale result error after a failed launch (OCV5-556)', () =
     }
   })
 
+  // Codex r2 P1: the result timer must not fail the turn before the exit code
+  // arrives; a CLI still running past the bounded wait fails.
+  test('waits for the exit code when the CLI exits after the result timer', async () => {
+    const h = await harness({ resumeSessionId: CONVERSATION })
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      _internals.setTimingTestHooks({ resultSettleMs: 50, staleErrorExitWaitMs: 2_000 })
+      process.env.FAKE_AGY_EXIT_DELAY_MS = '400'
+      const late = await runTurn(h, 'resume-after-error.ndjson')
+      assert.equal(late.summary?.isError, false, late.summary?.errorDetail)
+      assert.deepEqual(late.sessionIds, [CONVERSATION])
+
+      _internals.setTimingTestHooks({ resultSettleMs: 50, staleErrorExitWaitMs: 200 })
+      process.env.FAKE_AGY_EXIT_DELAY_MS = '1500'
+      const stuck = await runTurn(h, 'resume-after-error.ndjson')
+      assert.equal(stuck.summary?.isError, true, 'no exit code within the bound: not waved through')
+    } finally {
+      _internals.setTimingTestHooks(null)
+      await h.restore()
+    }
+  })
+
   test('a fresh (not resumed) launch with an ERROR result and a reply still fails', async () => {
     const h = await harness()
     try {

@@ -72,6 +72,8 @@ const KEEPALIVE_INTERVAL_MS = 30_000
 /** After `result`, wait this long for the process to exit so trailing
  * stderr (soft-deny / empty-run notices) is read before the turn settles. */
 const RESULT_SETTLE_MS = 5_000
+/** How long a possibly repeated old ERROR waits for the exit code before it fails. */
+const STALE_ERROR_EXIT_WAIT_MS = 30_000
 
 /** Sandboxed resolution set; user-writable PATH entries stay out. */
 const ANTIGRAVITY_SPAWN_PATH = '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin'
@@ -85,7 +87,7 @@ function antigravitySpawnPath(hostPathDir: string | null): string {
   return hostPathDir ? `${hostPathDir}:${ANTIGRAVITY_SPAWN_PATH}` : ANTIGRAVITY_SPAWN_PATH
 }
 
-let timingTestHooks: { keepaliveMs?: number; resultSettleMs?: number } | null = null
+let timingTestHooks: { keepaliveMs?: number; resultSettleMs?: number; staleErrorExitWaitMs?: number } | null = null
 const STDERR_MAX_CHARS = 64 * 1024
 const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 /** 1.3.4 without usable credentials prints an OAuth URL and blocks for 60 s. */
@@ -172,6 +174,8 @@ interface TurnContext {
   resumedLaunch: boolean
   /** CLI exit code once the process closed. */
   exitCode: number | null
+  /** A possibly repeated old ERROR is waiting for the exit code (Codex r2 P1). */
+  awaitingExitSince: number | null
   resolveSummary: (summary: TurnSummary | null) => void
   resolveDrain: (() => void) | null
 }
@@ -344,6 +348,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       ownErrorStep: false,
       resumedLaunch: false,
       exitCode: null,
+      awaitingExitSince: null,
       resolveSummary,
       resolveDrain: null,
     }
@@ -825,11 +830,24 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   private settleResult(ctx: TurnContext): void {
     const result = ctx.pendingResult
     if (!result || ctx.terminal || ctx.abandoned) return
-    ctx.pendingResult = null
     if (ctx.resultTimer) {
       clearTimeout(ctx.resultTimer)
       ctx.resultTimer = null
     }
+    // The exit code decides whether an ERROR is the CLI repeating an old one;
+    // hold such a result until the process closes, within a bound.
+    if (!ctx.procClosed && this.mayBeRepeatedOldError(ctx, result)) {
+      const now = Date.now()
+      ctx.awaitingExitSince ??= now
+      const wait = timingTestHooks?.staleErrorExitWaitMs ?? STALE_ERROR_EXIT_WAIT_MS
+      const left = ctx.awaitingExitSince + wait - now
+      if (left > 0) {
+        ctx.resultTimer = setTimeout(() => { this.settleResult(ctx) }, left)
+        ctx.resultTimer.unref()
+        return
+      }
+    }
+    ctx.pendingResult = null
     let status = asText(result.status)
     // OCV5-556: once a launch of a conversation failed (e.g. relay
     // ROUTE_EXPIRED), 1.4.0 ends every later `--conversation` launch with
@@ -839,16 +857,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     // started, answered, streamed no error step of its own, exited 0 and wrote
     // no error to stderr; a launch that really failed (even after a partial
     // reply) exits non-zero and prints the error (Codex r1 P1).
-    if (
-      status === 'ERROR' &&
-      ctx.resumedLaunch &&
-      ctx.procClosed &&
-      ctx.exitCode === 0 &&
-      !CLI_STDERR_ERROR_RE.test(ctx.stderr) &&
-      !ctx.ownErrorStep &&
-      ctx.firstOwnStepIndex !== null &&
-      (ctx.assistantText.trim() !== '' || asText(result.response).trim() !== '')
-    ) {
+    if (ctx.procClosed && ctx.exitCode === 0 && this.mayBeRepeatedOldError(ctx, result)) {
       log.warn('antigravity CLI repeated an earlier launch error on a run that answered', {
         sessionKey: this.opts.sessionKey,
         error: asText(result.error).slice(0, 300),
@@ -886,6 +895,16 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       this.emit('session_id', ctx.conversationId)
     }
     this.finish(ctx, typeof result.num_turns === 'number' ? count(result.num_turns) : 1)
+  }
+
+  /** Everything but the exit code that marks an ERROR as the repeated old one. */
+  private mayBeRepeatedOldError(ctx: TurnContext, result: Record<string, unknown>): boolean {
+    return asText(result.status) === 'ERROR' &&
+      ctx.resumedLaunch &&
+      !CLI_STDERR_ERROR_RE.test(ctx.stderr) &&
+      !ctx.ownErrorStep &&
+      ctx.firstOwnStepIndex !== null &&
+      (ctx.assistantText.trim() !== '' || asText(result.response).trim() !== '')
   }
 
   private usageSnapshot(ctx: TurnContext) {
@@ -1100,7 +1119,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 export const _internals = {
   promptText,
   assemblePrompt,
-  setTimingTestHooks(hooks: { keepaliveMs?: number; resultSettleMs?: number } | null): void {
+  setTimingTestHooks(hooks: { keepaliveMs?: number; resultSettleMs?: number; staleErrorExitWaitMs?: number } | null): void {
     timingTestHooks = hooks
   },
 }
