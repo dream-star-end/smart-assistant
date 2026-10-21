@@ -516,9 +516,14 @@ export function inlineGptWebAttachmentsInUserLine(
 /**
  * Ensures a Route B user JSON line carries a stable `ocTurnId` across mid-turn
  * bridge reconnects so `host.mjs` can distinguish a reconnect of the same turn
- * from a subsequent user turn with identical text.
+ * from a subsequent user turn with identical text, and optionally records
+ * `ocDeliveredText` (the exact prefix of `text_delta` characters actually
+ * delivered to the gateway stdout before the stream broke).
  */
-export function stampGptWebTurnIdInUserLine(line: string): string {
+export function stampGptWebTurnIdInUserLine(
+  line: string,
+  opts?: { deliveredText?: string },
+): string {
   if (!line || !line.trim().startsWith('{')) return line
   const hasTrailingNewline = line.endsWith('\n')
   let parsed: Record<string, any>
@@ -529,15 +534,24 @@ export function stampGptWebTurnIdInUserLine(line: string): string {
   }
   if (!parsed || typeof parsed !== 'object') return line
   if (parsed.type && parsed.type !== 'user') return line
-  if (typeof parsed.ocTurnId === 'string' && parsed.ocTurnId.trim()) {
+  const hasTurnId = typeof parsed.ocTurnId === 'string' && Boolean(parsed.ocTurnId.trim())
+  const nextDelivered = opts?.deliveredText
+  if (hasTurnId && (nextDelivered === undefined || parsed.ocDeliveredText === nextDelivered)) {
     return line
   }
   const rest = { ...parsed }
   delete rest.type
-  const ordered = {
+  const ordered: Record<string, any> = {
     ...(parsed.type ? { type: parsed.type } : {}),
     ...rest,
-    ocTurnId: randomUUID(),
+    ocTurnId: hasTurnId ? parsed.ocTurnId.trim() : randomUUID(),
+  }
+  if (typeof nextDelivered === 'string') {
+    if (nextDelivered.length > 0) {
+      ordered.ocDeliveredText = nextDelivered
+    } else {
+      delete ordered.ocDeliveredText
+    }
   }
   return `${JSON.stringify(ordered)}${hasTrailingNewline ? '\n' : ''}`
 }

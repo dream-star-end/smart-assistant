@@ -1525,6 +1525,7 @@ rl.on('line', (line) => {
       const reconnectHostMjs = `
 import readline from 'node:readline'
 import {
+  TurnProgressStreamer,
   formatStreamJsonAssistantMessage,
   formatStreamJsonResult,
   formatStreamJsonSystemInit,
@@ -1538,12 +1539,16 @@ rl.on('line', (line) => {
   const frame = parseStdinFrame(line)
   if (!frame || frame.kind !== 'user') return
   process.stderr.write('SEEN_TURN_ID:' + (frame.turnId || 'none') + '\\n')
+  const streamer = new TurnProgressStreamer({ initialEmittedFinalText: frame.deliveredText || '' })
   process.stdout.write(formatStreamJsonSystemInit({ sessionId: 'sess-reconnect', model: 'box-gpt-6-astra-pro' }) + '\\n')
   if (process.env.FAKE_ATTEMPT === '1') {
     process.stdout.write(formatStreamJsonThinkingDelta('Still running in Chrome...') + '\\n')
+    const d1 = streamer.consumeIncrementalFinalText('Recovered ', { finalFlush: false })
+    process.stdout.write(formatStreamJsonTextDelta(d1) + '\\n')
     process.exit(1)
   }
-  process.stdout.write(formatStreamJsonTextDelta('Recovered final answer') + '\\n')
+  const tail = streamer.consumeIncrementalFinalText('Recovered final answer', { finalFlush: true })
+  process.stdout.write(formatStreamJsonTextDelta(tail) + '\\n')
   process.stdout.write(formatStreamJsonAssistantMessage({ messageId: 'm_rec', text: 'Recovered final answer', thinking: '' }) + '\\n')
   process.stdout.write(formatStreamJsonResult({ sessionId: 'sess-reconnect', resultText: 'Recovered final answer', isError: false, durationMs: 120 }) + '\\n')
   process.exit(0)
@@ -1607,7 +1612,14 @@ rl.on('line', (line) => {
       assert.notEqual(seenTurnIds[0], 'none')
       assert.equal(seenTurnIds[0], seenTurnIds[1])
       assert.match(outText, /Still running in Chrome\.\.\./)
-      assert.match(outText, /Recovered final answer/)
+      const combinedTextDeltas = outText
+        .trim()
+        .split('\n')
+        .map((l) => JSON.parse(l))
+        .filter((f) => f.type === 'stream_event' && f.event?.delta?.type === 'text_delta')
+        .map((f) => f.event.delta.text)
+        .join('')
+      assert.equal(combinedTextDeltas, 'Recovered final answer')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

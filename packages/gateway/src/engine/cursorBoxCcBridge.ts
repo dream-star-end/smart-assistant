@@ -168,7 +168,7 @@ export async function runBoxCcBridge(opts: {
   const onAbort = (): void => abort.abort()
   opts.signal?.addEventListener('abort', onAbort)
   const holdMax = positiveInt(env.OC_BOX_INTERACTIVE_HOLD_MAX_BYTES) ?? 64 * 1024 * 1024
-  const out = new StdoutLines(opts.stdout, env)
+  const out = new StdoutLines(opts.stdout, env, isGptWeb)
   const maxAttempts = isGptWeb ? 4 : LAUNCH_ATTEMPTS
 
   // stdin -> the current session; lines that arrive between sessions wait in `carry`.
@@ -292,13 +292,78 @@ function sessionIdOf(args: readonly string[]): string {
  * (shown to the user as assistant text, or as a failed result's text) is reworded neutrally. */
 class StdoutLines {
   private buf = ''
+  private rawDeliveredTurnText = ''
+  private deliveredTurnText = ''
   constructor(
     private readonly stdout: NodeJS.WritableStream,
     private readonly env?: NodeJS.ProcessEnv,
+    private readonly isGptWeb = false,
   ) {}
+  getRawDeliveredTurnText(): string {
+    return this.rawDeliveredTurnText
+  }
+  discardIncompleteLine(): void {
+    this.buf = ''
+  }
   private transformLine(line: string): string {
     if (!line) return line
-    return materializeGptWebOutputAttachmentsInStdoutLine(neutralLine(line), { env: this.env })
+    if (this.isGptWeb && line.startsWith('{')) {
+      try {
+        const rawObj = JSON.parse(line) as Record<string, any>
+        if (
+          rawObj?.type === 'stream_event' &&
+          rawObj.event?.type === 'content_block_delta' &&
+          rawObj.event.delta?.type === 'text_delta' &&
+          typeof rawObj.event.delta.text === 'string'
+        ) {
+          this.rawDeliveredTurnText += rawObj.event.delta.text
+        }
+      } catch {}
+    }
+    const transformed = materializeGptWebOutputAttachmentsInStdoutLine(neutralLine(line), {
+      env: this.env,
+    })
+    if (this.isGptWeb && transformed.startsWith('{')) {
+      try {
+        const obj = JSON.parse(transformed) as Record<string, any>
+        if (
+          obj?.type === 'stream_event' &&
+          obj.event?.type === 'content_block_delta' &&
+          obj.event.delta?.type === 'text_delta' &&
+          typeof obj.event.delta.text === 'string'
+        ) {
+          this.deliveredTurnText += obj.event.delta.text
+        } else if (obj?.type === 'assistant' && Array.isArray(obj.message?.content)) {
+          const textBlock = obj.message.content.find(
+            (b: Record<string, unknown>) => b?.type === 'text' && typeof b.text === 'string',
+          )
+          const fullText = typeof textBlock?.text === 'string' ? textBlock.text : ''
+          if (
+            fullText.length > this.deliveredTurnText.length &&
+            fullText.startsWith(this.deliveredTurnText)
+          ) {
+            const missingSuffix = fullText.slice(this.deliveredTurnText.length)
+            this.deliveredTurnText = fullText
+            const backfillDelta = JSON.stringify({
+              type: 'stream_event',
+              event: {
+                type: 'content_block_delta',
+                index: 0,
+                delta: {
+                  type: 'text_delta',
+                  text: missingSuffix,
+                },
+              },
+            })
+            return `${backfillDelta}\n${transformed}`
+          }
+        } else if (obj?.type === 'result') {
+          this.rawDeliveredTurnText = ''
+          this.deliveredTurnText = ''
+        }
+      } catch {}
+    }
+    return transformed
   }
   write(data: string): void {
     this.buf += data
@@ -693,7 +758,10 @@ class BoxSession {
       this.hostStreamEnded = true
       if (!this.stopRequested && !this.o.abort.signal.aborted) {
         if (isBoxGptWebModelArgv(this.o.args) && this.activeGptWebUserLine !== null) {
-          const resumeLine = this.activeGptWebUserLine
+          this.o.out.discardIncompleteLine()
+          const resumeLine = stampGptWebTurnIdInUserLine(this.activeGptWebUserLine, {
+            deliveredText: this.o.out.getRawDeliveredTurnText(),
+          })
           this.activeGptWebUserLine = null
           this.gaveUp = true
           return {
@@ -729,7 +797,10 @@ class BoxSession {
       !this.o.abort.signal.aborted &&
       (!this.sawExit || this.exitCode !== 0)
     ) {
-      const resumeLine = this.activeGptWebUserLine
+      this.o.out.discardIncompleteLine()
+      const resumeLine = stampGptWebTurnIdInUserLine(this.activeGptWebUserLine, {
+        deliveredText: this.o.out.getRawDeliveredTurnText(),
+      })
       this.activeGptWebUserLine = null
       this.gaveUp = true
       return {

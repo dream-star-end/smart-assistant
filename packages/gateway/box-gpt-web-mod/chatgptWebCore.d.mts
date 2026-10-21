@@ -333,12 +333,12 @@ export function parseStdinFrame(
   opts?: { stagingDir?: string | null; allowedUploadRoots?: readonly string[] },
 ):
   | { kind: 'control_request'; requestId: string; subtype: string }
-  | { kind: 'user'; text: string; files: string[]; turnId?: string }
+  | { kind: 'user'; text: string; files: string[]; turnId?: string; deliveredText?: string }
   | null
 export function extractUserTurnFromStdinFrame(
   line: string,
   opts?: { stagingDir?: string | null; allowedUploadRoots?: readonly string[] },
-): { text: string; files: string[]; turnId?: string } | null
+): { text: string; files: string[]; turnId?: string; deliveredText?: string } | null
 
 export function resetComposerDraftInPage(page: any): Promise<void>
 export function resolveTrustedAttachmentPath(

@@ -2502,11 +2502,14 @@ export function parseStdinFrame(line, { stagingDir = null, allowedUploadRoots = 
     typeof parsed.ocTurnId === 'string' && parsed.ocTurnId.trim()
       ? parsed.ocTurnId.trim()
       : null
+  const deliveredText =
+    typeof parsed.ocDeliveredText === 'string' ? parsed.ocDeliveredText : ''
   return {
     kind: 'user',
     text: cleanText,
     files,
     ...(turnId ? { turnId } : {}),
+    ...(deliveredText ? { deliveredText } : {}),
   }
 }
 
@@ -2517,5 +2520,6 @@ export function extractUserTurnFromStdinFrame(line, opts = {}) {
     text: frame.text,
     files: frame.files,
     ...(frame.turnId ? { turnId: frame.turnId } : {}),
+    ...(frame.deliveredText ? { deliveredText: frame.deliveredText } : {}),
   }
 }

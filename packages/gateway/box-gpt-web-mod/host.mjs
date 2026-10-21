@@ -363,7 +363,10 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
             turnControl.thinkingBlockOpen = false
             writeStdoutLine(formatStreamJsonContentBlockStop({ index: 0 }))
           }
-          const streamer = new TurnProgressStreamer()
+          const streamer = new TurnProgressStreamer({
+            initialEmittedFinalText:
+              typeof turn.deliveredText === 'string' ? turn.deliveredText : '',
+          })
 
           const activeTurnState = loadActiveTurnState(profileDir, cfg.sessionId)
           const isSameTurn = Boolean(
@@ -374,7 +377,12 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
                 : !activeTurnState.completedAt),
           )
           if (isSameTurn && activeTurnState) {
-            streamer.restoreState(activeTurnState)
+            // Only restore stepTextByKey (thinking commentary deduplication) from disk;
+            // emittedFinalText MUST come only from gateway-acknowledged `turn.deliveredText`
+            // so an unacknowledged stdout write lost on a broken pipe is never skipped on reconnect.
+            streamer.restoreState({
+              stepTextByKey: activeTurnState.stepTextByKey,
+            })
             if (typeof activeTurnState.accumulatedThinking === 'string') {
               accumulatedThinking = activeTurnState.accumulatedThinking
             }
@@ -390,7 +398,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
                 ? activeTurnState.startedAt
                 : Date.now(),
             accumulatedThinking,
-            ...streamer.exportState(),
+            stepTextByKey: Object.fromEntries(streamer.stepTextByKey),
           }
 
           const persistProgressState = (extra = {}) => {
@@ -398,7 +406,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
               ...currentTurnState,
               ...extra,
               accumulatedThinking,
-              ...streamer.exportState(),
+              stepTextByKey: Object.fromEntries(streamer.stepTextByKey),
             }
             saveActiveTurnState(profileDir, cfg.sessionId, currentTurnState)
           }
