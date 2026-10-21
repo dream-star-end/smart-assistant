@@ -416,7 +416,7 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
   // Provider-wide default remains text-only; these Go upstream models accept images
   // natively and must not be stripped (OCV5-547, audited on the Go gateway).
   modelSupportsVision: {
-    'deepseek-v4-flash': true,
+    'deepseek-v4.1-flash': true,
     'minimax-m3': true,
     'qwen3.7-plus': true,
     'glm-5.3-flash': true,

@@ -57,7 +57,7 @@ async function rewrite(upstreamModel: string, extra: Record<string, unknown>) {
 describe('OpenCode Go vision ceiling', () => {
   test('per upstream model: the audited ten are vision-capable; beam-free is not', () => {
     for (const model of [
-      'deepseek-v4-flash',
+      'deepseek-v4.1-flash',
       'minimax-m3',
       'qwen3.7-plus',
       'glm-5.3-flash',

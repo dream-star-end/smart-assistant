@@ -516,7 +516,7 @@ describe('staticKeyProviders — modelSupportsVision(OpenCode Go 按模型白名
   it('only the audited Go upstream models are native-vision; beam and the rest stay text-only', () => {
     const go = getStaticProvider('opencodego')
     for (const upstream of [
-      'deepseek-v4-flash',
+      'deepseek-v4.1-flash',
       'minimax-m3',
       'qwen3.7-plus',
       'glm-5.3-flash',
@@ -529,6 +529,9 @@ describe('staticKeyProviders — modelSupportsVision(OpenCode Go 按模型白名
     ]) {
       assert.equal(staticProviderSupportsVision(go, upstream), true, upstream)
     }
+    // Real upstream name is v4.1; the v4 catalog alias must not be the key.
+    assert.equal(staticProviderSupportsVision(go, 'deepseek-v4.1-flash'), true)
+    assert.equal(staticProviderSupportsVision(go, 'deepseek-v4-flash'), false)
     assert.equal(staticProviderSupportsVision(go, 'beam-free'), false)
     assert.equal(staticProviderSupportsVision(go, 'kimi-k3'), false)
     assert.equal(staticProviderSupportsVision(go, 'qwen3.8-max'), false)
