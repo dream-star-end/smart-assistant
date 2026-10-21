@@ -286,7 +286,7 @@ export function materializeGptWebOutputAttachmentsInStdoutLine(
   }
   if (!parsed || typeof parsed !== 'object') return line
   const rawList = parsed.outputAttachments
-  delete parsed.outputAttachments
+  parsed.outputAttachments = undefined
   if (!Array.isArray(rawList) || rawList.length === 0) {
     return JSON.stringify(parsed)
   }
@@ -539,19 +539,18 @@ export function stampGptWebTurnIdInUserLine(
   if (hasTurnId && (nextDelivered === undefined || parsed.ocDeliveredText === nextDelivered)) {
     return line
   }
-  const rest = { ...parsed }
-  delete rest.type
+  const { type: rawType, ocDeliveredText: prevDelivered, ...rest } = parsed
+  const resolvedDelivered =
+    typeof nextDelivered === 'string'
+      ? nextDelivered
+      : typeof prevDelivered === 'string'
+        ? prevDelivered
+        : ''
   const ordered: Record<string, any> = {
-    ...(parsed.type ? { type: parsed.type } : {}),
+    ...(rawType ? { type: rawType } : {}),
     ...rest,
     ocTurnId: hasTurnId ? parsed.ocTurnId.trim() : randomUUID(),
-  }
-  if (typeof nextDelivered === 'string') {
-    if (nextDelivered.length > 0) {
-      ordered.ocDeliveredText = nextDelivered
-    } else {
-      delete ordered.ocDeliveredText
-    }
+    ...(resolvedDelivered.length > 0 ? { ocDeliveredText: resolvedDelivered } : {}),
   }
   return `${JSON.stringify(ordered)}${hasTrailingNewline ? '\n' : ''}`
 }

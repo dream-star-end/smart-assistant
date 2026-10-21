@@ -1839,11 +1839,11 @@ export function extractTurnOutputArtifactRefs({
     if (seenKeys.has(key)) return
     seenKeys.add(key)
     const ext =
-      mimeHint && mimeHint.includes('png')
+      mimeHint?.includes('png')
         ? '.png'
         : mimeHint && (mimeHint.includes('jpeg') || mimeHint.includes('jpg'))
           ? '.jpg'
-          : mimeHint && mimeHint.includes('webp')
+          : mimeHint?.includes('webp')
             ? '.webp'
             : '.png'
     refs.push({
@@ -1867,7 +1867,7 @@ export function extractTurnOutputArtifactRefs({
 
   scanSandboxLinks(text, finalMessageId)
 
-  if (conv && conv.mapping && refs.length < maxFiles) {
+  if (conv?.mapping && refs.length < maxFiles) {
     let cur = conv.current_node
     const visited = new Set()
     const turnNodes = []
