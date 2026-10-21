@@ -1,0 +1,308 @@
+/**
+ * Gate ↔ source-path couplings (OCV5-544, phase 3 plan v3.6 §5.7 rule 1, appendix D).
+ *
+ * Many gates pin source paths in their text (file lists, dynamic import paths, digest manifests,
+ * tsconfig `paths`). When a PR moves or deletes a path a gate names and leaves the gate alone, the
+ * gate goes blind or turns red later in a train. Rule: the gate changes in the same PR (or the old
+ * path keeps a thin re-export, §5.7 rule 2, in which case nothing moved as far as this check is
+ * concerned).
+ *
+ * A coupling is a gate file plus a tracked path its text names. Gate files are the tracked files
+ * matching GATE_GLOBS (scripts, workflows, deploy manifests, tsconfigs, package.json, docs/V5_CI.md).
+ * A path is a repo-relative mention (`packages/…`, `scripts/…`, …) or a quoted `./` `../` string
+ * resolved against the gate's directory (tsconfig `paths`, imports). Paths are cut at the first glob
+ * or interpolation, so `packages/x/src/${y}` couples to the directory packages/x/src.
+ *
+ *   --base R   couplings come from the merge base of R and HEAD (the gates as they were). A coupling
+ *              is UNCOVERED when its path (file, or directory with no tracked file left) is gone at
+ *              HEAD while the gate, at its HEAD path, still names it. Touching the gate elsewhere
+ *              does not cover it; a thin re-export left at the old path (§5.7 rule 2) does.
+ *              Report period: exit 0; --enforce: exit 1.
+ *   --write    regenerate arch/gate-couplings.json (the reviewed snapshot) from the working tree
+ *   --check    report whether arch/gate-couplings.json is stale; with --enforce stale is exit 1
+ *
+ * Fail-closed in every mode (exit 2): git errors, an unknown argument, a missing snapshot.
+ *
+ * Usage: npx tsx scripts/check-gate-couplings.ts [--root <repo>] (--write | --check | --base <ref>)
+ *          [--enforce]
+ */
+import { execFileSync } from 'node:child_process'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const OUT = 'arch/gate-couplings.json'
+
+/** Files whose text can pin source paths. The snapshot and generated reports are not gates. */
+const GATE_GLOBS = [
+  /^scripts\/.+\.(?:ts|mts|mjs|cjs|js|sh|py|json)$/,
+  /^\.github\/workflows\/[^/]+\.ya?ml$/,
+  /^\.github\/[^/]+\.json$/,
+  /^deploy\/.+\.(?:json|sh|ya?ml)$/,
+  /^tsconfig(?:\.[^/]+)?\.json$/,
+  /^packages\/[^/]+\/tsconfig(?:\.[^/]+)?\.json$/,
+  /^package\.json$/,
+  /^docs\/V5_CI\.md$/,
+]
+// arch/ is generated output; the checker's own test names only synthetic fixture paths
+const NOT_GATES = [
+  /^arch\//,
+  /^scripts\/__tests__\/fixtures\//,
+  /^scripts\/__tests__\/checkGateCouplings\.test\.ts$/,
+]
+
+const PATH_RE = /(?:packages|scripts|deploy|\.github|docs|arch)\/[A-Za-z0-9_@.\/-]+/g
+
+export type Tree = { files: Set<string>; dirs: Set<string> }
+export type Couplings = Record<string, string[]>
+
+export function isGate(p: string): boolean {
+  return GATE_GLOBS.some((g) => g.test(p)) && !NOT_GATES.some((g) => g.test(p))
+}
+
+export function treeOf(files: Iterable<string>): Tree {
+  const t: Tree = { files: new Set(files), dirs: new Set() }
+  for (const f of t.files) {
+    const parts = f.split('/')
+    for (let i = 1; i < parts.length; i++) t.dirs.add(parts.slice(0, i).join('/'))
+  }
+  return t
+}
+
+const REL_RE = /['"`](\.\.?\/[^'"`\s]+)['"`]/g
+
+const cut = (p: string) =>
+  p
+    .split(/[*{$]/)[0]!
+    .replace(/[.,:;)]+$/, '')
+    .replace(/\/+$/, '')
+
+/**
+ * Every path a gate's text names, tracked or not: repo-relative mentions (`packages/…`, `scripts/…`)
+ * and quoted `./` `../` strings resolved against the gate's directory (tsconfig `paths`, imports).
+ */
+export function rawNames(gate: string, text: string): Set<string> {
+  const out = new Set<string>()
+  for (const m of text.matchAll(PATH_RE)) out.add(cut(m[0]))
+  for (const m of text.matchAll(REL_RE)) {
+    const r = path.posix.normalize(path.posix.join(path.posix.dirname(gate), cut(m[1]!)))
+    if (!r.startsWith('..')) out.add(r.replace(/\/+$/, ''))
+  }
+  out.delete(gate)
+  out.delete('')
+  out.delete('.')
+  return out
+}
+
+/** Tracked paths (files or directories) a gate's text names, sorted, the gate itself excluded. */
+export function pathsNamedBy(gate: string, text: string, tree: Tree): string[] {
+  return [...rawNames(gate, text)].filter((p) => tree.files.has(p) || tree.dirs.has(p)).sort()
+}
+
+export function couplingsOf(tree: Tree, read: (gate: string) => string): Couplings {
+  const out: Couplings = {}
+  for (const g of [...tree.files].filter(isGate).sort()) {
+    const named = pathsNamedBy(g, read(g), tree)
+    if (named.length) out[g] = named
+  }
+  return out
+}
+
+export function render(c: Couplings): string {
+  const pathCount = Object.values(c).reduce((n, v) => n + v.length, 0)
+  return `${JSON.stringify(
+    {
+      schema: 1,
+      note: 'generated by scripts/check-gate-couplings.ts --write: gate file → tracked paths its text names (plan §5.7, appendix D). The --base check recomputes this from the base tree; this file is the reviewed snapshot.',
+      gates: Object.keys(c).length,
+      couplings: pathCount,
+      byGate: c,
+    },
+    null,
+    1,
+  )}\n`
+}
+
+export type Change = { status: 'renamed' | 'deleted'; from: string; to?: string }
+export type Hit = { gate: string; coupled: string; change: Change }
+export type Head = {
+  tree: Tree
+  /** where the gate lives at HEAD (follows a git rename), or null when it was deleted */
+  gatePath: (gate: string) => string | null
+  text: (headPath: string) => string
+}
+
+/**
+ * Couplings the diff broke: a coupled file or directory that is gone at HEAD while the gate (at its
+ * HEAD path) still names it. Editing the gate somewhere else does not count; it has to stop naming
+ * the vanished path, or the gate itself is gone. A thin re-export at the old path (§5.7 rule 2)
+ * keeps the path alive, so nothing is broken.
+ */
+export function uncovered(c: Couplings, changes: Change[], head: Head): Hit[] {
+  const hits: Hit[] = []
+  for (const [gate, coupled] of Object.entries(c)) {
+    const gp = head.gatePath(gate)
+    if (gp === null) continue
+    const names = rawNames(gp, head.text(gp))
+    for (const p of coupled) {
+      if (head.tree.files.has(p) || head.tree.dirs.has(p)) continue
+      if (!names.has(p)) continue
+      const change = changes.find((ch) => ch.from === p || ch.from.startsWith(`${p}/`)) ?? {
+        status: 'deleted' as const,
+        from: p,
+      }
+      hits.push({ gate: gp, coupled: p, change })
+    }
+  }
+  return hits
+}
+
+function git(root: string, args: string[], input?: string): string {
+  return execFileSync('git', args, {
+    cwd: root,
+    encoding: 'utf8',
+    input,
+    maxBuffer: 1 << 30,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+}
+
+function lsTree(root: string, rev: string): string[] {
+  return git(root, ['ls-tree', '-r', '-z', '--name-only', rev]).split('\0').filter(Boolean)
+}
+
+/** Read many blobs of one revision with a single `git cat-file --batch`. */
+function readAt(root: string, rev: string, paths: string[]): Map<string, string> {
+  const buf = execFileSync('git', ['cat-file', '--batch'], {
+    cwd: root,
+    input: paths.map((p) => `${rev}:${p}\n`).join(''),
+    maxBuffer: 1 << 30,
+  })
+  const out = new Map<string, string>()
+  let off = 0
+  for (const p of paths) {
+    const nl = buf.indexOf(10, off)
+    const header = buf.subarray(off, nl).toString('utf8')
+    const m = /^[0-9a-f]+ blob (\d+)$/.exec(header)
+    if (!m) throw new Error(`cannot read ${rev}:${p} (${header})`)
+    const size = Number(m[1])
+    out.set(p, buf.subarray(nl + 1, nl + 1 + size).toString('utf8'))
+    off = nl + 1 + size + 1
+  }
+  return out
+}
+
+export function diffChanges(
+  root: string,
+  from: string,
+): { changes: Change[]; renames: Map<string, string> } {
+  const raw = git(root, ['diff', '-M', '-z', '--name-status', from, 'HEAD']).split('\0')
+  const changes: Change[] = []
+  const renames = new Map<string, string>()
+  for (let i = 0; i < raw.length && raw[i]; ) {
+    const st = raw[i++]!
+    const a = raw[i++]!
+    if (st.startsWith('R') || st.startsWith('C')) {
+      const to = raw[i++]!
+      if (st.startsWith('R')) {
+        changes.push({ status: 'renamed', from: a, to })
+        renames.set(a, to)
+      }
+    } else if (st === 'D') {
+      changes.push({ status: 'deleted', from: a })
+    }
+  }
+  return { changes, renames }
+}
+
+function fail(msg: string): never {
+  console.error(`[gate-couplings] FAIL-CLOSED: ${msg}`)
+  process.exit(2)
+}
+
+function main() {
+  const argv = process.argv.slice(2)
+  const known = new Set(['--root', '--write', '--check', '--base', '--enforce'])
+  for (let i = 0; i < argv.length; i++) {
+    if (!known.has(argv[i]!)) fail(`unknown argument ${argv[i]}`)
+    if (argv[i] === '--root' || argv[i] === '--base') i++
+  }
+  const val = (flag: string) => {
+    const i = argv.indexOf(flag)
+    if (i < 0) return undefined
+    const v = argv[i + 1]
+    if (!v || v.startsWith('--')) fail(`${flag} needs a value`)
+    return v
+  }
+  const root = path.resolve(
+    val('--root') ?? path.join(path.dirname(fileURLToPath(import.meta.url)), '..'),
+  )
+  const enforce = argv.includes('--enforce')
+  const base = val('--base')
+  const modes = [argv.includes('--write'), argv.includes('--check'), base !== undefined]
+  if (modes.filter(Boolean).length !== 1) fail('pass exactly one of --write, --check, --base <ref>')
+
+  try {
+    if (base === undefined) {
+      // the working tree as it will be committed: tracked and new (not ignored) files that exist
+      const tree = treeOf(
+        git(root, ['ls-files', '-z', '--cached', '--others', '--exclude-standard'])
+          .split('\0')
+          .filter((f) => f && existsSync(path.join(root, f))),
+      )
+      const fresh = render(couplingsOf(tree, (g) => readFileSync(path.join(root, g), 'utf8')))
+      const file = path.join(root, OUT)
+      if (argv.includes('--write')) {
+        mkdirSync(path.dirname(file), { recursive: true })
+        writeFileSync(file, fresh)
+        console.log(`[gate-couplings] wrote ${OUT}`)
+        return
+      }
+      if (!existsSync(file)) fail(`missing ${OUT}`)
+      if (readFileSync(file, 'utf8') === fresh) {
+        console.log(`[gate-couplings] ${OUT} up to date`)
+        return
+      }
+      console.log(
+        `[gate-couplings] STALE ${OUT}: run npx tsx scripts/check-gate-couplings.ts --write${enforce ? '' : ' (report period)'}`,
+      )
+      if (enforce) process.exit(1)
+      return
+    }
+    const baseRev = git(root, ['rev-parse', '--verify', `${base}^{commit}`]).trim()
+    // the diff is base...HEAD, so the gates "as they were" are the ones at the merge base
+    const mb = git(root, ['merge-base', baseRev, 'HEAD']).trim()
+    const mbTree = treeOf(lsTree(root, mb))
+    const gates = [...mbTree.files].filter(isGate)
+    const texts = readAt(root, mb, gates)
+    const c = couplingsOf(mbTree, (g) => texts.get(g) ?? '')
+    const headTree = treeOf(lsTree(root, 'HEAD'))
+    const { changes, renames } = diffChanges(root, mb)
+    const gatePath = (g: string) => {
+      const p = renames.get(g) ?? g
+      return headTree.files.has(p) ? p : null
+    }
+    const live = Object.keys(c)
+      .map(gatePath)
+      .filter((p): p is string => p !== null)
+    const headTexts = readAt(root, 'HEAD', live)
+    const hits = uncovered(c, changes, {
+      tree: headTree,
+      gatePath,
+      text: (p) => headTexts.get(p) ?? '',
+    })
+    for (const h of hits) {
+      const what = h.change.status === 'renamed' ? `renamed → ${h.change.to}` : 'deleted'
+      const via = h.change.from === h.coupled ? '' : `; directory gone, e.g. ${h.change.from}`
+      console.log(`  UNCOVERED ${h.coupled} (${what}${via}): ${h.gate} still names it`)
+    }
+    console.log(
+      `[gate-couplings] gates=${Object.keys(c).length} couplings=${Object.values(c).reduce((n, v) => n + v.length, 0)} moved/deleted=${changes.length} uncovered=${hits.length}${enforce ? '' : ' (report period)'}`,
+    )
+    if (enforce && hits.length) process.exit(1)
+  } catch (e) {
+    fail((e as Error).message.split('\n')[0]!)
+  }
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main()
