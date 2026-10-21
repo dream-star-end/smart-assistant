@@ -396,6 +396,7 @@ test('Springer 10.1186 DOI normalization preserves 10. prefix across HTML parsin
   const executor = new WanfangLiteratureHttpExecutor({
     artifactStore: store,
     tokenSecret: secret,
+    now: () => now + 60_000,
     verifyMemberSession: async (s) => s,
     requester: async ({ url }) => {
       requestedPaths.push(url.pathname)

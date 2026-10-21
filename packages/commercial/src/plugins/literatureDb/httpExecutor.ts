@@ -260,7 +260,7 @@ export function parseSpringerSearchHtml(html: string, limit: number): ParsedWanf
     const doi = normalizeSpringerDoi(linkMatch[1])
     if (!doi) continue
     const paperId = normalizeSpringerPaperId(`sp_${doi.replace('/', '_')}`)
-    if (paperId.length > 64 || !/^[a-zA-Z0-9_.-]{3,64}$/.test(paperId) || seenIds.has(paperId)) {
+    if (paperId.length > 40 || !/^[a-zA-Z0-9_.-]{3,40}$/.test(paperId) || seenIds.has(paperId)) {
       continue
     }
     const title = decodeHtmlEntities(
@@ -387,7 +387,7 @@ export function verifyScopedDocumentId(
   const [, expB36, pidHex, macHex] = parts as [string, string, string, string]
   if (
     !/^[0-9a-z]{1,16}$/.test(expB36) ||
-    !/^[0-9a-f]{2,128}$/.test(pidHex) ||
+    !/^[0-9a-f]{2,80}$/.test(pidHex) ||
     pidHex.length % 2 !== 0 ||
     !/^[0-9a-f]{32}$/.test(macHex)
   ) {
@@ -426,7 +426,7 @@ export function verifyScopedDocumentId(
   if (!Number.isFinite(expMs) || expMs <= nowMs) {
     throw new LiteratureError('DOCUMENT_EXPIRED')
   }
-  if (!/^[a-zA-Z0-9_.-]{3,64}$/.test(canonicalPaperId)) {
+  if (!/^[a-zA-Z0-9_.-]{3,40}$/.test(canonicalPaperId)) {
     throw new LiteratureError('DOCUMENT_EXPIRED')
   }
   return { paperId: canonicalPaperId }
