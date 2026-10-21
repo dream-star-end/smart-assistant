@@ -315,6 +315,28 @@ export async function withProfileFileLock(
     }
   }
 
+  const isReclaimGuardDead = (reclaimPath) => {
+    let st
+    try {
+      st = fs.statSync(reclaimPath)
+    } catch {
+      return { dead: false, stat: null }
+    }
+    try {
+      const raw = fs.readFileSync(reclaimPath, 'utf8')
+      const parsed = JSON.parse(raw)
+      if (!parsed || !Number.isInteger(parsed.pid)) {
+        return { dead: true, stat: st }
+      }
+      if (!pidAliveFn(parsed.pid)) {
+        return { dead: true, stat: st }
+      }
+      return { dead: false, stat: st }
+    } catch {
+      return { dead: true, stat: st }
+    }
+  }
+
   const tryAcquireReclaimGuard = (reclaimPath) => {
     for (let attempt = 0; attempt < 2; attempt++) {
       const tmpReclaim = `${reclaimPath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
@@ -329,15 +351,56 @@ export async function withProfileFileLock(
         return st.ino
       } catch (err) {
         if (err && err.code === 'EEXIST' && attempt === 0) {
-          const check = isLockPayloadDeadOrStale(reclaimPath, 5_000)
-          if (check.stale && check.stat) {
+          const check = isReclaimGuardDead(reclaimPath)
+          if (check.dead && check.stat) {
+            const rmToken = `${reclaimPath}.rm.${check.stat.ino}`
+            const tmpRm = `${rmToken}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
+            let rmIno = null
             try {
-              const cur = fs.statSync(reclaimPath)
-              if (cur.ino === check.stat.ino) {
-                fs.unlinkSync(reclaimPath)
+              fs.writeFileSync(
+                tmpRm,
+                JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }),
+                { mode: 0o600 },
+              )
+              try {
+                fs.linkSync(tmpRm, rmToken)
+              } catch (rmErr) {
+                if (rmErr && rmErr.code === 'EEXIST') {
+                  const rmCheck = isReclaimGuardDead(rmToken)
+                  if (rmCheck.dead && rmCheck.stat) {
+                    try {
+                      if (fs.statSync(rmToken).ino === rmCheck.stat.ino) {
+                        fs.unlinkSync(rmToken)
+                        fs.linkSync(tmpRm, rmToken)
+                      }
+                    } catch {}
+                  }
+                }
               }
-            } catch {}
-            continue
+              const rmSt = fs.statSync(rmToken)
+              const rmParsed = JSON.parse(fs.readFileSync(rmToken, 'utf8'))
+              if (rmParsed && rmParsed.pid === process.pid) {
+                rmIno = rmSt.ino
+                const cur = fs.statSync(reclaimPath)
+                if (cur.ino === check.stat.ino) {
+                  fs.unlinkSync(reclaimPath)
+                }
+              }
+            } catch {} finally {
+              try {
+                fs.unlinkSync(tmpRm)
+              } catch {}
+              if (rmIno !== null) {
+                try {
+                  if (fs.statSync(rmToken).ino === rmIno) {
+                    fs.unlinkSync(rmToken)
+                  }
+                } catch {}
+              }
+            }
+            if (rmIno !== null) {
+              continue
+            }
           }
         }
         return null
