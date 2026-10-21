@@ -94,6 +94,8 @@ const AUTH_PROMPT_RE = /Authentication required|Waiting for authentication|authe
 const SOFT_DENY_RE = /auto-denied/i
 const EMPTY_RUN_RE = /run ended with no output/i
 /** Go oauth2 refusing the CLI token file locally (OCV5-556). */
+/** CLI ended SUCCESS right after one of this launch's own error steps. */
+export const ANTIGRAVITY_ERROR_STEP = 'ANTIGRAVITY_ERROR_STEP'
 const CLI_CREDENTIAL_EXPIRED_RE = /oauth2: token expired|refresh token is not set/i
 
 /**
@@ -160,6 +162,8 @@ interface TurnContext {
   firstOwnStepIndex: number | null
   /** error_message seen before this launch's user_input; used only if the run fails. */
   preludeErrorDetail: string | null
+  /** This launch's last step was an error_message (1.4.0 streams it without text). */
+  trailingErrorStep: boolean
   resolveSummary: (summary: TurnSummary | null) => void
   resolveDrain: (() => void) | null
 }
@@ -328,6 +332,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       errorDetail: null,
       firstOwnStepIndex: null,
       preludeErrorDetail: null,
+      trailingErrorStep: false,
       resolveSummary,
       resolveDrain: null,
     }
@@ -656,16 +661,16 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     if (type === 'error_message') {
       const info = recordOf(step.error)
       const message = info ? asText(info.message) : asText(step.error)
-      if (!message) return
       // OCV5-556: a `--conversation` resume streamed an earlier launch's error
       // step (old relay route, long-expired token) after this launch's own
       // steps had succeeded, failing four good turns in a row. Steps before
       // this launch's user_input belong to earlier launches.
       if (ctx.firstOwnStepIndex === null) {
-        ctx.preludeErrorDetail = message
+        if (message) ctx.preludeErrorDetail = message
         return
       }
       if (stepIndex !== null && stepIndex < ctx.firstOwnStepIndex) {
+        if (!message) return
         log.warn('antigravity ignored error step from an earlier launch of the conversation', {
           sessionKey: this.opts.sessionKey,
           stepIndex,
@@ -673,14 +678,22 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
         })
         return
       }
-      ctx.errorDetail = message
+      // OCV5-556: 1.4.0 streams this launch's own error steps with no text and
+      // can still end the run SUCCESS (a relay ROUTE_EXPIRED 60 minutes into a
+      // turn ended as a "success" with no reply). Remember it; settleResult
+      // fails the turn unless a later tool or reply step shows the run went on.
+      if (message) ctx.errorDetail = message
+      else ctx.trailingErrorStep = true
     }
     // user_input / system_message / checkpoint / unknown (native ask_question,
     // invisible in headless mode) carry nothing the product renders.
   }
 
   private appendText(ctx: TurnContext, text: string): void {
-    if (text.trim()) ctx.timing.once('first_text')
+    if (text.trim()) {
+      ctx.timing.once('first_text')
+      ctx.trailingErrorStep = false
+    }
     ctx.sawOutput = true
     if (!ctx.lastWasText) {
       ctx.assistantSegments.push({
@@ -708,6 +721,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 
   private handleToolStep(ctx: TurnContext, step: Record<string, unknown>, state: string): void {
     ctx.sawOutput = true
+    ctx.trailingErrorStep = false
     const id = this.toolId(ctx, step)
     const info = recordOf(step.tool_info) ?? {}
     const nativeName = asText(info.name) || asText(step.tool_name)
@@ -814,7 +828,10 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       // 1.3.4 reports SUCCESS for runs that produced nothing (oversized input)
       // and for headless soft-denied tools. Both are failures for the user.
       const denied = Array.isArray(result.denied_actions) ? result.denied_actions : []
-      if (denied.length > 0 || SOFT_DENY_RE.test(ctx.stderr)) {
+      if (ctx.trailingErrorStep) {
+        const why = asText(result.error) || ctx.stderr.trim().slice(-500) || 'CLI reported success after an error step'
+        ctx.errorDetail = `${ANTIGRAVITY_ERROR_STEP}: ${why}`
+      } else if (denied.length > 0 || SOFT_DENY_RE.test(ctx.stderr)) {
         const actions = denied.map((d) => asText(recordOf(d)?.action) || asText(d)).filter(Boolean)
         ctx.errorDetail = `ANTIGRAVITY_TOOL_DENIED: ${actions.length > 0 ? actions.join(',') : ctx.stderr.trim().slice(0, 500)}`
       } else if (!ctx.sawOutput && !asText(result.response)) {

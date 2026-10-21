@@ -24,6 +24,7 @@ import {
 } from '../engine/antigravityAdapter.js'
 import { antigravityProductToolInput, antigravityProductToolName } from '../engine/antigravityToolNormalize.js'
 import { resetEnvFactsCache } from '../envProbe.js'
+import { classifyRunError } from '../errorClassify.js'
 import type { EngineEvent } from '../engine/engineEvents.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
 import type { TurnSummary } from '../engine/engineEvents.js'
@@ -656,5 +657,78 @@ describe('antigravity external billing sideband', () => {
     })
     assert.equal(seen[0]?.status, 'unavailable')
     assert.equal(seen[0]?.terminalCode, 'AUTH_UNAVAILABLE')
+  })
+})
+
+// OCV5-556: a relay route that lapsed mid-turn (404 ANTIGRAVITY_ROUTE_EXPIRED,
+// 60 minutes into a live turn) was recorded as a successful turn with no reply
+// ("本轮未能产出可见回复"). route-expired.ndjson/.stderr.txt are the raw output of
+// the real 1.4.0 CLI against a relay answering ROUTE_EXPIRED after one tool:
+// its error_message step carries no text at all.
+describe('Antigravity route expiry mid-turn (OCV5-556)', () => {
+  const ROUTE_EXPIRED_STDERR = path.join(FIXTURES, 'route-expired.stderr.txt')
+
+  async function fixtureWithStatus(dir: string, status: string, extra: object[] = []): Promise<string> {
+    const lines = (await readFile(path.join(FIXTURES, 'route-expired.ndjson'), 'utf8')).trim().split('\n')
+    const result = JSON.parse(lines.pop()!)
+    result.result.status = status
+    if (status === 'SUCCESS') result.result.error = ''
+    const steps = extra.map((step) => JSON.stringify({ event: 'step_update', step_update: step }))
+    const file = path.join(dir, `route-expired-${status}-${extra.length}.ndjson`)
+    await writeFile(file, `${[...lines, ...steps, JSON.stringify(result)].join('\n')}\n`)
+    return file
+  }
+
+  test('raw CLI output: the turn fails as a recoverable upstream failure', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const stderr = await readFile(ROUTE_EXPIRED_STDERR, 'utf8')
+      const { summary, sessionIds } = await runTurn(h, 'route-expired.ndjson', { stderr })
+      assert.equal(summary?.isError, true)
+      assert.match(summary?.errorDetail ?? '', /ANTIGRAVITY_ROUTE_EXPIRED/)
+      assert.equal(classifyRunError(summary?.errorDetail).code, 'upstream_failed')
+      assert.deepEqual(sessionIds, [])
+    } finally {
+      await h.restore()
+    }
+  })
+
+  test('CLI reporting SUCCESS right after its own error step is still a failure', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const stderr = await readFile(ROUTE_EXPIRED_STDERR, 'utf8')
+      const fixture = await fixtureWithStatus(h.dir, 'SUCCESS')
+      const { summary, events, sessionIds } = await runTurn(h, fixture, { stderr })
+      assert.equal(summary?.isError, true, 'not a successful turn with no reply')
+      assert.match(summary?.errorDetail ?? '', /^ANTIGRAVITY_ERROR_STEP: [\s\S]*ANTIGRAVITY_ROUTE_EXPIRED/)
+      assert.equal(classifyRunError(summary?.errorDetail).code, 'upstream_failed')
+      assert.ok(events.some((e) => e.kind === 'error'))
+      assert.deepEqual(sessionIds, [], 'the failed launch does not move the resume id')
+
+      const bare = await fixtureWithStatus(h.dir, 'SUCCESS')
+      const quiet = await runTurn(h, bare)
+      assert.equal(quiet.summary?.isError, true, 'also without any stderr')
+      assert.equal(classifyRunError(quiet.summary?.errorDetail).code, 'upstream_failed')
+    } finally {
+      await h.restore()
+    }
+  })
+
+  test('an error step the CLI recovered from (tool and reply after it) is not a failure', async () => {
+    const h = await harness()
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      const conversation_id = '90a2f047-c919-49fa-850d-1d1e4c88fe7b'
+      const fixture = await fixtureWithStatus(h.dir, 'SUCCESS', [
+        { conversation_id, step_index: 4, state: 'DONE', step_type: 'agent_response', text_delta: 'done after retry' },
+      ])
+      const { summary } = await runTurn(h, fixture)
+      assert.equal(summary?.isError, false, summary?.errorDetail)
+      assert.match(summary?.assistantText ?? '', /done after retry/)
+    } finally {
+      await h.restore()
+    }
   })
 })
