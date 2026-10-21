@@ -353,6 +353,9 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
         const preConv = await fetchConversationPayloadInPage(page, syncState.conversationId)
         baselineNodeId = preConv?.conv?.current_node || null
       }
+      // On an existing conversation, we must have a valid pre-send baselineNodeId
+      // so we never mistake a previous turn's finished message for the current turn's answer.
+      const hasValidMappingBaseline = !syncState.conversationId || Boolean(baselineNodeId)
 
       await selectProTierInPage(page, { requestedTier: 'pro' })
       await abortIfRequested('after select pro tier')
@@ -455,9 +458,10 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
         // committed the finished_successfully final message. Poll mapping every 2s once
         // stream_handoff (or stop-button disappearance) occurs, without waiting for !batch.stopBtn.
         if (
+          hasValidMappingBaseline &&
           !acc.finalText &&
           resolvedConvId &&
-          (acc.streamHandoff || acc.done || !batch.stopBtn) &&
+          (acc.streamHandoff || (sawStopBtn && !batch.stopBtn) || acc.done) &&
           now - lastMappingPollAt >= 2_000
         ) {
           lastMappingPollAt = now
@@ -491,7 +495,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
         })
         currentDeadline = adaptive.deadline
 
-        if (adaptive.shouldRescue) {
+        if (adaptive.shouldRescue && hasValidMappingBaseline) {
           const rescued = await rescueFromDomOrMapping(page, resolvedConvId, { baselineNodeId })
           if (rescued?.text) {
             if (rescued.convId) {
@@ -510,7 +514,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
         }
 
         if (!batch.stopBtn && acc.done) {
-          if (!acc.finalText) {
+          if (!acc.finalText && hasValidMappingBaseline) {
             const rescued = await rescueFromDomOrMapping(page, resolvedConvId, { baselineNodeId })
             if (rescued?.text) {
               if (rescued.convId) {
