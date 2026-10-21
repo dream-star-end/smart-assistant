@@ -502,6 +502,16 @@
     "identity"
    ]
   },
+  "muse": {
+   "layer": "L3",
+   "match": [
+    "packages/commercial/src/muse/**"
+   ],
+   "scope": [
+    "master"
+   ],
+   "note": "Muse bridge domain: hub, store, wire protocol (OCV5-561); its HTTP handlers and wiring are interface-http"
+  },
   "inbox": {
    "layer": "L3",
    "match": [
@@ -743,7 +753,10 @@
    "layer": "L5",
    "match": [
     "packages/commercial/src/http/**",
-    "packages/commercial/src/middleware/**"
+    "packages/commercial/src/middleware/**",
+    "packages/commercial/src/muse/bridgeHttp.ts",
+    "packages/commercial/src/muse/internalHttp.ts",
+    "packages/commercial/src/muse/assemble.ts"
    ],
    "scope": [
     "master"
