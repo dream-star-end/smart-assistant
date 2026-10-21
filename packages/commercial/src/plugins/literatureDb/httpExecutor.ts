@@ -67,6 +67,8 @@ const ALLOWED_DOWNSTREAM_HOSTS = new Set(['webvpn.ustb.booktsg.com'])
 
 export const DOWNSTREAM_HOP_TIMEOUT_MS = 30_000
 
+export const DOWNSTREAM_PROXY_HEADER_TIMEOUT_MS = 15_000
+
 export const DOWNSTREAM_MAX_TOTAL_TIMEOUT_MS = 105_000
 const BROWSER_UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
@@ -231,15 +233,24 @@ function decodeHtmlEntities(input: string): string {
     .replace(/&amp;/g, '&')
 }
 
+function isSafePaperId(paperId: string): boolean {
+  if (paperId.length < 3 || paperId.length > 40) return false
+  if (paperId.includes('..') || paperId.includes('/') || paperId.includes('\\')) return false
+  return /^[^\s\x00-\x1f\x7f?#]+$/.test(paperId)
+}
+
 export function normalizeSpringerDoi(rawDoi: string): string | null {
   const decoded = rawDoi.trim().replace(/%2F/gi, '/')
-  const match = /^(?:10\.)?(\d{4,9})\/([a-zA-Z0-9_.-]+)$/.exec(decoded)
+  if (decoded.includes('..') || decoded.includes('\\')) return null
+  const match = /^(?:10\.)?(\d{4,9})\/([^\s/\\?#\x00-\x1f\x7f]+)$/.exec(decoded)
   if (!match?.[1] || !match[2]) return null
   return `10.${match[1]}/${match[2]}`
 }
 
 export function normalizeSpringerPaperId(paperId: string): string {
-  const match = /^sp[._](?:10\.)?(\d{4,9})_([a-zA-Z0-9_.-]+)$/.exec(paperId.trim())
+  const trimmed = paperId.trim()
+  if (trimmed.includes('..') || trimmed.includes('\\')) return paperId
+  const match = /^sp[._](?:10\.)?(\d{4,9})_([^\s/\\?#\x00-\x1f\x7f]+)$/.exec(trimmed)
   if (!match?.[1] || !match[2]) return paperId
   return `sp_10.${match[1]}_${match[2]}`
 }
@@ -253,14 +264,14 @@ export function parseSpringerSearchHtml(html: string, limit: number): ParsedWanf
   while ((m = cardRe.exec(html)) !== null) {
     const card = m[0]
     const linkMatch =
-      /<h3[^>]*data-test="title"[^>]*>[\s\S]*?<a[^>]*href="[^"]*\/(?:articles?|chapter)\/((?:10\.)?\d{4,9}(?:\/|%2F)[a-zA-Z0-9_.-]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(
+      /<h3[^>]*data-test="title"[^>]*>[\s\S]*?<a[^>]*href="[^"]*\/(?:articles?|chapter)\/((?:10\.)?\d{4,9}(?:\/|%2F)[^"'\s?#<>]+)"[^>]*>([\s\S]*?)<\/a>/i.exec(
         card,
       )
     if (!linkMatch?.[1] || !linkMatch[2]) continue
     const doi = normalizeSpringerDoi(linkMatch[1])
     if (!doi) continue
-    const paperId = normalizeSpringerPaperId(`sp_${doi.replace('/', '_')}`)
-    if (paperId.length > 40 || !/^[a-zA-Z0-9_.-]{3,40}$/.test(paperId) || seenIds.has(paperId)) {
+    const paperId = normalizeSpringerPaperId(`sp_${doi.replace(/\//g, '_')}`)
+    if (!isSafePaperId(paperId) || seenIds.has(paperId)) {
       continue
     }
     const title = decodeHtmlEntities(
@@ -426,7 +437,7 @@ export function verifyScopedDocumentId(
   if (!Number.isFinite(expMs) || expMs <= nowMs) {
     throw new LiteratureError('DOCUMENT_EXPIRED')
   }
-  if (!/^[a-zA-Z0-9_.-]{3,40}$/.test(canonicalPaperId)) {
+  if (!isSafePaperId(canonicalPaperId)) {
     throw new LiteratureError('DOCUMENT_EXPIRED')
   }
   return { paperId: canonicalPaperId }
@@ -493,6 +504,7 @@ export function createPinnedDownstreamRequester(
   maxTotalTimeoutMs = DOWNSTREAM_MAX_TOTAL_TIMEOUT_MS,
   requestImpl: typeof http.request = http.request,
   proxyUrl = process.env.LITERATURE_DOWNSTREAM_PROXY_URL,
+  proxyHeaderTimeoutMs = Math.min(hopTimeoutMs, DOWNSTREAM_PROXY_HEADER_TIMEOUT_MS),
 ): DownstreamHttpRequester {
   const proxy = parseLoopbackProxyUrl(proxyUrl)
   return async ({ url, method, headers, body, maxBytes, signal }) => {
@@ -555,15 +567,15 @@ export function createPinnedDownstreamRequester(
           req.destroy()
           finish(new LiteratureError('TIMEOUT'))
         }
-        const armIdleTimer = () => {
+        const armIdleTimer = (ms = hopTimeoutMs) => {
           clearTimeout(idleTimer)
-          idleTimer = setTimeout(onTimeout, hopTimeoutMs)
+          idleTimer = setTimeout(onTimeout, ms)
         }
         const onAbort = () => {
           req.destroy()
           finish(new LiteratureError('CANCELLED'))
         }
-        armIdleTimer()
+        armIdleTimer(viaProxy ? Math.min(hopTimeoutMs, proxyHeaderTimeoutMs) : hopTimeoutMs)
         const totalTimer = setTimeout(onTimeout, Math.max(hopTimeoutMs, maxTotalTimeoutMs))
         const req = requestImpl(
           {
