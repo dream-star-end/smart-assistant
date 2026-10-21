@@ -14,6 +14,7 @@ import {
   createLogger as createKernelLogger,
   createLevelRef,
   parseLogLevel,
+  registerLevelRef,
 } from '@openclaude/kernel'
 import { measureLogWrite } from '@openclaude/protocol'
 
@@ -29,6 +30,7 @@ export interface LogContext {
 
 /** Minimum level: OPENCLAUDE_LOG_LEVEL at start (default info); changeable while running. */
 export const gatewayLogLevel = createLevelRef(parseLogLevel(process.env.OPENCLAUDE_LOG_LEVEL))
+registerLevelRef('gateway', gatewayLogLevel)
 
 const root: KernelLogger = createKernelLogger({
   level: gatewayLogLevel,

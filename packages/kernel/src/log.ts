@@ -44,6 +44,32 @@ export function createLevelRef(initial: LogLevel = 'info'): LevelRef {
   }
 }
 
+/**
+ * Named shared levels of this process (gateway, commercial, …), so one runtime setting can drive
+ * them all without the packages importing each other. `initial` is the level a ref had when it
+ * was registered (its env-derived start value); resetLogLevels() goes back to it.
+ */
+const registry = new Map<string, { ref: LevelRef; initial: LogLevel }>()
+
+export function registerLevelRef(name: string, ref: LevelRef): void {
+  if (!registry.has(name)) registry.set(name, { ref, initial: ref.get() })
+}
+
+/** Set every registered level (a hot setting). Throws on an unknown level, changing nothing. */
+export function setLogLevels(level: LogLevel): void {
+  if (!(level in RANK)) throw new TypeError(`unknown log level ${JSON.stringify(level)}`)
+  for (const { ref } of registry.values()) ref.set(level)
+}
+
+/** Every registered level back to its start value. */
+export function resetLogLevels(): void {
+  for (const { ref, initial } of registry.values()) ref.set(initial)
+}
+
+export function registeredLogLevels(): Record<string, LogLevel> {
+  return Object.fromEntries([...registry].map(([n, { ref }]) => [n, ref.get()]))
+}
+
 export interface LogRecord {
   level: LogLevel
   line: string

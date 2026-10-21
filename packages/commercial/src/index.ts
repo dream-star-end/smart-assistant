@@ -181,6 +181,7 @@ import { createGeminiPoolAdapter } from "./account-pool/geminiPoolAdapter.js";
 import { registerPoolAdapter, startPoolRecoveryActor } from "./account-pool/policy/registry.js";
 import { configureAffinitySettings } from "./account-pool/policy/affinity.js";
 import { getSystemSetting } from "./admin/systemSettings.js";
+import { startLogLevelSyncPoller } from "./logging/logLevelSync.js";
 import { startCursorAuthSyncActor } from "./account-pool/cursorMaterializer.js";
 import { startCursorSandPreparationActor } from "./account-pool/cursorSandActor.js";
 import { startCursorUsageSweeper } from "./account-pool/cursorUsageSweeper.js";
@@ -1404,6 +1405,10 @@ export async function registerCommercial(
       `[commercial] auto-migrate disabled (controlPlaneEnabled=${controlPlaneEnabled} channel=${runtimeChannel})`,
     );
   }
+
+  // 第三阶段 P1(OCV5-559):日志级别热改。system_settings.log_level 驱动 gateway / 商用版的共享级别
+  // (kernel registerLevelRef);启动立即应用、admin PUT 立即应用、每 5 秒轮询收敛。纯进程内(只读一行)→ local。
+  const logLevelSync = trackScheduler("logLevelSync", "local", startLogLevelSyncPoller({ read: async () => (await getSystemSetting("log_level")).value }));
 
   // ── P2:master 会话权威 backend 选择(RFC-v5-sessions-pg D1 启动矩阵)────────────
   // 放在 config 加载 + auto-migrate(0134 表须先在)之后、一切 schedulers/backend 消费之前。
@@ -7258,6 +7263,7 @@ export async function registerCommercial(
       if (accountSlotReaper) {
         try { accountSlotReaper.stop(); } catch { /* ignore */ }
       }
+      try { logLevelSync.stop(); } catch { /* ignore */ }
       if (codexDriftReconciler) {
         try { codexDriftReconciler.stop(); } catch { /* ignore */ }
       }
