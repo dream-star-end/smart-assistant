@@ -9,6 +9,7 @@
  * - Shared producer/consumer permit (no unbounded queue)
  */
 import { randomUUID } from 'node:crypto'
+import zlib from 'node:zlib'
 import { LiteratureError } from './errors.js'
 
 export const LITERATURE_ARTIFACT_MAX_BYTES = 26_214_400
@@ -94,9 +95,12 @@ export function validatePdfStructureSync(data: Buffer): boolean {
   const tailLen = Math.min(data.length, 65536)
   const tail = data.subarray(data.length - tailLen).toString('latin1')
   if (!tail.includes('%%EOF')) return false
-  if (DANGEROUS_PDF_TOKEN_RE.test(normalizePdfNames(tail))) return false
+  for (const tm of tail.matchAll(/\btrailer(?:\s|<<)([\s\S]*?)(?:\bstartxref\b|%%EOF|$)/g)) {
+    if (tm[1] && DANGEROUS_PDF_TOKEN_RE.test(normalizePdfNames(tm[1]))) return false
+  }
 
   const fullStr = data.toString('latin1')
+  const hasEncrypt = /\/Encrypt(?![A-Za-z])/.test(fullStr)
   const allObjRe = /\b\d+\s+\d+\s+obj\b([\s\S]*?)\bendobj\b/g
   let om: RegExpExecArray | null
   let hasObject = false
@@ -110,6 +114,29 @@ export function validatePdfStructureSync(data: Buffer): boolean {
         : fullBody,
     )
     if (DANGEROUS_PDF_TOKEN_RE.test(dictOnly)) return false
+    if (/\/Type\s*\/ObjStm(?![A-Za-z])/.test(dictOnly)) {
+      const streamIdx = fullBody.indexOf('stream')
+      const endstreamIdx = fullBody.lastIndexOf('endstream')
+      if (streamIdx < 0 || endstreamIdx <= streamIdx) return false
+      let rawPos = om.index + om[0].indexOf('stream') + 6
+      if (data[rawPos] === 13 && data[rawPos + 1] === 10) rawPos += 2
+      else if (data[rawPos] === 10 || data[rawPos] === 13) rawPos += 1
+      let rawEnd = om.index + om[0].lastIndexOf('endstream')
+      while (rawEnd > rawPos && (data[rawEnd - 1] === 10 || data[rawEnd - 1] === 13)) {
+        rawEnd--
+      }
+      if (rawEnd <= rawPos) return false
+      try {
+        const inflated = zlib.inflateSync(data.subarray(rawPos, rawEnd), {
+          maxOutputLength: 8 * 1024 * 1024,
+        })
+        if (DANGEROUS_PDF_TOKEN_RE.test(normalizePdfNames(inflated.toString('latin1')))) {
+          return false
+        }
+      } catch {
+        if (!hasEncrypt) return false
+      }
+    }
   }
   return hasObject
 }
