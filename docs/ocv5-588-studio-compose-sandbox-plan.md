@@ -43,8 +43,12 @@ class ComposeRunner {
 - **命令永远是参数数组**（`Entrypoint: []`、`Cmd: ['ffmpeg', ...]` 或 `['ffprobe', ...]`），不经过 shell，所有参数由下面的类型化规格生成。
 - 超时：每种操作都有上限（probe 30 s，抽帧和缩略图 60 s，波形 60 s，成片合成 600 s）。超时就 kill，状态码不是 0 时取 stderr 前 2 KB，作为 `COMPOSE_FAILED`。
 - 输出校验：只收 `out/` 里预期的文件名；单个文件 ≤ 512 MiB；用文件头魔数检查 mp4 / png / wav / json。
+- **运行期磁盘硬上限**（Codex plan r1 P1-2）：
+  1. 每个 ffmpeg 输出都带 `-fs <字节>`（成片 512 MiB，帧和胶片条 20 MiB，`pcm.raw` 16 MiB）。ffmpeg 写到上限就停，所以单个输出不会超过上限（只有一个包大小的余量）。产物大小达到上限的 99% 时，视为被截断，报 `COMPOSE_OUTPUT`。
+  2. 每个输入都带时长上限：`waveform_pcm` 和 `probe` 以外的解码都加 `-t`（取剪辑长度，最多 600 s）；`waveform_pcm` 固定 `-t 600`（8 kHz 单声道 s16le 最多约 9.6 MB）。
+  3. 开工前用 `statfs` 检查 `<root>` 所在文件系统：剩余空间少于“本操作上限 × 2 + 1 GiB”时，直接拒绝，报 `COMPOSE_DISK`，不启动容器。
 - 不管成功还是失败都 `container.remove({force:true})`；工作目录交给调用方清理，并提供 `cleanup(jobId)`。
-- 启动时把残留的、带 `com.openclaude.studio.compose=1` label 的容器全部删掉，这类容器都是一次性的。
+- 残留清理（Codex plan r1 P1-1：不能误删另一个 master 实例正在跑的任务）：每个容器带 label `com.openclaude.studio.owner=<实例 id>` 和 `com.openclaude.studio.started=<epoch 秒>`。`sweepStale()` 只删同时满足下面两个条件的容器：(a) 创建时间早于“当前时间 − (最长超时 600 s + 300 s 余量)”；(b) owner 不是本实例。超过最长超时的容器，原来的 runner 必然已经 kill 并放弃它，所以删掉是安全的；在途任务一律不碰。
 
 ## 4. 类型化操作（纯函数生成 argv，重点单测）
 
