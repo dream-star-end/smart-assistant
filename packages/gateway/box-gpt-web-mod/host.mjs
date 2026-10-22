@@ -420,6 +420,8 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
             if (isSameTurn && typeof activeTurnState.accumulatedThinking === 'string') {
               accumulatedThinking = activeTurnState.accumulatedThinking
             }
+            // OCV5-584: how each already-streamed citation marker was rendered, so a reconnect keeps it.
+            if (isSameTurn) streamer.citations.restoreState(activeTurnState.citationState)
           }
 
           let currentTurnState = {
@@ -442,6 +444,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
               ...extra,
               accumulatedThinking,
               stepTextByKey: Object.fromEntries(streamer.stepTextByKey),
+              citationState: streamer.citations.exportState(),
             }
             saveActiveTurnState(profileDir, cfg.sessionId, currentTurnState)
           }
@@ -480,6 +483,13 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
                 const fetched = await fetchConversationPayloadInPage(page, convId)
                 convForArtifacts = fetched?.conv || null
               }
+              if (convForArtifacts) {
+                // Current turn only: ChatGPT's turnNsearchM refs are numbered per reply.
+                streamer.citations.addSources(
+                  extractTurnProgressFromMapping(convForArtifacts, { baselineNodeId })
+                    .citationSources,
+                )
+              }
               const artifactRefs = extractTurnOutputArtifactRefs({
                 text: finalText,
                 conv: convForArtifacts,
@@ -517,7 +527,8 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
               )
             }
             return {
-              text: finalText,
+              // Display text (citation markers rendered), identical to what was streamed.
+              text: streamer.emittedFinalText,
               thinking: accumulatedThinking,
               messageId: msgId,
               outputAttachments: outputAttachments.length > 0 ? outputAttachments : null,
@@ -694,6 +705,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
             },
             onTextDelta: () => {
               lastActivityAt = Date.now()
+              streamer.citations.addSources(acc.citationSources)
               const safeDelta = streamer.consumeIncrementalFinalText(acc.finalText, {
                 finalFlush: false,
               })
@@ -773,6 +785,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
               throw new Error(`BOX_GPT_WEB_SSE_ERROR: ${acc.error}`)
             }
             if (acc.done && acc.finalText.length > 0) {
+              streamer.citations.addSources(acc.citationSources)
               let finalConvId = resolvedConvId
               if (!finalConvId) {
                 const m = page.url().match(/\/c\/([a-z0-9_-]{8,128})/i)
