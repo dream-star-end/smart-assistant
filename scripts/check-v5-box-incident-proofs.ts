@@ -3642,7 +3642,7 @@ async function main(): Promise<void> {
   process.env.OPENCLAUDE_HOME = home;
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
-    provePendingUser(api), proveImageCaption(api), proveParallelImageCaption(api), proveForeignToolHistory(api),
+    provePendingUser(api), proveImageCaption(api), proveParallelImageCaption(api), proveForeignToolHistory(api), await (await import("./lib/boxGptWebCitationProof.js")).proveGptWebCitationMarkers(CANDIDATE), // OCV5-584 (file-size ratchet): [ocv5-584-gpt-web-citation-markers] PASS — ChatGPT Web citation markers cut across SSE frames never reach a text delta and a known source becomes a link
     await proveCliRepaired(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveMixedCallTurnCut(api),
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),

@@ -122,6 +122,28 @@ export function uploadAttachmentsToComposer(
 export function typeMultilinePreservingAttachments(page: any, text: string): Promise<void>
 export function backendFetchTeeInitScript(): string
 
+/** Map<refId (e.g. turn0search3) | `matched:${markerText}`, sources> (OCV5-584). */
+export type ChatgptCitationSources = Map<string, Array<{ url: string; title: string }>>
+export const CHATGPT_MARKER_MAX_LEN: number
+export function collectChatgptCitationSources(
+  value: unknown,
+  into?: ChatgptCitationSources,
+): ChatgptCitationSources
+export type ChatgptCitationState = {
+  rendered: Array<[string, string]>
+  numbers: Array<[string, number]>
+  nextNumber: number
+  pendingRefs: Array<{ markerText: string; refs: string[] }>
+}
+export class ChatgptCitationRenderer {
+  constructor(opts?: { sources?: ChatgptCitationSources | null })
+  addSources(sources: ChatgptCitationSources | null | undefined): void
+  /** Serializable rendering state (persisted with the active turn so a reconnect renders delivered markers alike). */
+  exportState(): ChatgptCitationState
+  restoreState(state: ChatgptCitationState | null | undefined): void
+  render(rawText: string, opts?: { final?: boolean; delivered?: string }): string
+}
+
 export class SseAccumulator {
   conversationId: string | null
   messageId: string | null
@@ -130,6 +152,7 @@ export class SseAccumulator {
   contentType: string | null
   finalText: string
   thinkingText: string
+  citationSources: ChatgptCitationSources
   done: boolean
   streamHandoff: boolean
   error: string | null
@@ -175,6 +198,7 @@ export function extractTurnProgressFromMapping(
   thinkingSteps: Array<{ key: string; text: string }>
   liveFinalText: string
   finishedFinal: { text: string; messageId: string } | null
+  citationSources: ChatgptCitationSources
   currentNode: string | null
 }
 
@@ -191,6 +215,7 @@ export class TurnProgressStreamer {
   seenDomPhaseKeys: Set<string>
   emittedFinalText: string
   lastThinkingEmitAt: number
+  citations: ChatgptCitationRenderer
   constructor(opts?: {
     nowFn?: () => number
     initialEmittedFinalText?: string
@@ -200,16 +225,19 @@ export class TurnProgressStreamer {
     state?: {
       emittedFinalText?: string
       stepTextByKey?: Record<string, string> | null
+      citations?: ChatgptCitationState | null
     } | null,
   ): void
   exportState(): {
     emittedFinalText: string
     stepTextByKey: Record<string, string>
+    citations: ChatgptCitationState
   }
   ingestMappingProgress(progress: {
     thinkingSteps?: Array<{ key: string; text: string }>
     liveFinalText?: string
     finishedFinal?: { text: string; messageId: string } | null
+    citationSources?: ChatgptCitationSources | null
   }): { thinkingDeltas: string[]; textDeltas: string[] }
   ingestDomProgress(
     domProgress: { stopBtn?: boolean; activeThinking?: boolean; statusLines?: string[] },
