@@ -13,6 +13,7 @@
 import { readFileSync, statSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { type Server as HttpsServer, createServer as createHttpsServer } from 'node:https'
+import type { Socket } from 'node:net'
 
 import type { CommercialConfig } from '../config.js'
 import { sendJson, setSecurityHeaders } from '../http/util.js'
@@ -129,6 +130,13 @@ export function startMusePublicListener(deps: MusePublicListenerDeps): MusePubli
     })
   })
   server.on('clientError', (_err, socket) => socket.destroy())
+  // Every raw TCP socket, including ones still before or inside the TLS handshake, which
+  // closeAllConnections() does not see: close() must not wait on them past systemd's stop timeout.
+  const sockets = new Set<Socket>()
+  server.on('connection', (socket: Socket) => {
+    sockets.add(socket)
+    socket.once('close', () => sockets.delete(socket))
+  })
   // An unhandled 'error' on a server would take the whole master down.
   server.on('error', (err: NodeJS.ErrnoException) => {
     if (server.listening)
@@ -195,8 +203,10 @@ export function startMusePublicListener(deps: MusePublicListenerDeps): MusePubli
       if (!server.listening) return Promise.resolve()
       return new Promise((resolve) => {
         server.close(() => resolve())
-        // Held long-polls would otherwise keep close() waiting for up to POLL_HOLD_SEC.
+        // Held long-polls and half-open TLS handshakes would otherwise keep close() waiting.
         server.closeAllConnections()
+        for (const socket of sockets) socket.destroy()
+        sockets.clear()
       })
     },
   }

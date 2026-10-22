@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, rmSync, utimesSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { request as httpsRequest } from 'node:https'
-import { type Server, createServer as createNetServer } from 'node:net'
+import { type Server, createServer as createNetServer, connect as netConnect } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
@@ -298,6 +298,27 @@ describe('Muse public listener', () => {
     await l.close()
     assert.ok(Date.now() - t0 < 2_000, 'close returned promptly')
     assert.ok((await pending) instanceof Error, 'the held poll was cut, not answered')
+  })
+
+  it('close() does not wait for a client that never starts the TLS handshake', async () => {
+    const l = startMusePublicListener({
+      port: 0,
+      bind: '127.0.0.1',
+      certPath: tls.cert,
+      keyPath: tls.key,
+      handler,
+      logger: silent,
+    })
+    const port = (await l.ready)!
+    const raw = netConnect(port, '127.0.0.1')
+    raw.on('error', () => {})
+    await new Promise<void>((r) => raw.once('connect', () => r()))
+    await new Promise((r) => setTimeout(r, 50))
+    const t0 = Date.now()
+    await l.close()
+    const took = Date.now() - t0
+    raw.destroy()
+    assert.ok(took < 2_000, `close returned promptly (${took} ms)`)
   })
 
   it('throws at start when the certificate cannot be read (caller turns it off)', () => {
