@@ -128,12 +128,14 @@
 
 ## PR-B / PR-C 概要（各自开工前再细化并送审）
 
-- **PR-B**：
-  - JEV 客户端从 gateway 抽到共享位置，gateway 原有行为和测试不变。
-  - `tutorialModeration.ts` worker 用租约认领，可重试，结果写入 `community_tutorial_moderations`（迁移编号到时再申领）。
+- **PR-B**（2026-10-22 实施时调整，见下）：
+  - `tutorialModeration.ts` worker 用租约认领（每篇一个作业），可重试，判定写入 `community_tutorial_moderations`（迁移 0321，`order-dependency: 0320`）。
   - 判定保守：全部为否且置信度 ≥0.9 才自动通过；任一为是且置信度 ≥0.9 才驳回，理由用模板；其余情况转人工。出错时绝不自动通过。
-  - 稿件只作为数据传给模型，命中注入特征直接转人工。
-  - 站内信通知；`OC_TUTORIAL_AI_MODERATION=off|shadow|on`；附 20 篇样本的评估结果。
+  - 稿件只作为数据传给模型，命中注入特征直接转人工；站内信通知（AI 与人工审核共用）；`OC_TUTORIAL_AI_MODERATION=off|shadow|on`。
+  - **正文模型改为平台 deepseek-v4-flash**（`fetchPlatformFlash`，与市场 AI 审批同一通道），不用 JEV：实测平台 Vercel AI Gateway 账号是免费档，`typesafe-ai/jev` 对任何请求都回 403 "Free tier users do not have access to this model"。因此不再抽 JEV 共享模块，gateway 不动。
+  - 顺带修：`openCodeGoAuthHeaders` 缺 `x-opencode-session`，OpenCode Go 自 2026-09-07 起回 400 MissingSessionID 且不触发回落，平台直连调用恒失败；补上与真实流量同源的会话头。
+  - 图片用平台 Grok 订阅账号的视觉模型（`grok-build`），`OC_TUTORIAL_MODERATION_VISION=off` 时带图稿件转人工。
+  - 20 篇中文样本实测（真实模型）：18/20 与预期一致；2 篇偏差都不是放过违规（一篇低质 0.85 转人工，一篇提到付费工具的经验文 ad=no 0.90 自动通过）。
 - **PR-C**：按 `design/after/` 的 12 张图实现：
   - 教程中心「经验分享」页签和侧栏入口；
   - 列表、详情、分栏编辑器（拖拽、粘贴、点击上传，前端压缩为 webp）；

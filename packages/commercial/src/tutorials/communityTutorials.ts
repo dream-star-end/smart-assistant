@@ -14,6 +14,8 @@ import {
   parseTutorialImageRefs,
   tutorialReadMinutes,
 } from './tutorialImages.js'
+import { enqueueTutorialModeration, tutorialModerationMode } from './tutorialModerationQueue.js'
+import { notifyCommunityTutorialDecision } from './tutorialNotices.js'
 import {
   TUTORIAL_ACTIVE_AUTHOR_CAP,
   TutorialTimelineError,
@@ -133,10 +135,25 @@ export interface PendingTutorialRow extends OwnTutorialRow {
   authorName: string
 }
 
+export interface TutorialModerationSummaryRow {
+  verdict: 'pass' | 'reject' | 'uncertain' | 'error'
+  mode: 'shadow' | 'on'
+  applied: boolean
+  /** {violation: {choice, confidence, yes}, ad: …}；yes = 判为「是」的概率，管理端画置信度条用。 */
+  categories: Record<string, { choice: string | null; confidence: number | null; yes: number | null }>
+  images: Array<{ sha256: string; violation: string | null; ad: string | null; confidence: number | null }>
+  reason: string | null
+  adminNote: string | null
+  injection: boolean
+  createdAt: string
+}
+
 export interface AdminTutorialRow extends OwnTutorialRow {
   authorName: string
   imageCount: number
   bodyChars: number
+  /** 最近一次 AI 审核记录；没有审核过为 null。 */
+  moderation: TutorialModerationSummaryRow | null
 }
 
 /** 封面 = 正文里第一个图片地址；只用于卡片展示，代码块里的极少数例外不值得在 SQL 里解析。 */
@@ -200,6 +217,8 @@ function assertNoMarkdownLeaks(bodyMarkdown: string): void {
 export type SubmitCommunityTutorialOptions = {
   /** 默认读 OC_COMMUNITY_BLOG_ENABLED；关闭时带图片的投稿被拒（旧的纯文字投稿照常）。 */
   blogEnabled?: boolean
+  /** 默认读 OC_TUTORIAL_AI_MODERATION。 */
+  moderationMode?: 'off' | 'shadow' | 'on'
   limits?: { daily: number; maxPending: number }
 }
 
@@ -234,19 +253,21 @@ export async function submitCommunityTutorial(
       )
     if (Number(counts.rows[0]?.recent ?? 0) >= limits.daily)
       throw new CommunityTutorialError('RATE_LIMITED', `24 小时内最多投稿 ${limits.daily} 篇`)
-    // AI 审核（PR-B）接手前，新投稿都在等人工。
+    // on：先等 AI，拿不准再转人工；shadow：AI 只记录，稿件直接进人工队列；off：只有人工。
+    const mode = options.moderationMode ?? tutorialModerationMode()
     const result = await client.query<{ id: string; created_at: Date | string }>(
       `INSERT INTO community_tutorials
          (author_user_id, title, summary, category, body_markdown, kind, needs_human)
-       VALUES ($1::bigint, $2, $3, $4, $5, 'markdown', true)
+       VALUES ($1::bigint, $2, $3, $4, $5, 'markdown', $6)
        RETURNING id::text AS id, created_at`,
-      [authorUserId, draft.title, draft.summary, draft.category, draft.bodyMarkdown],
+      [authorUserId, draft.title, draft.summary, draft.category, draft.bodyMarkdown, mode !== 'on'],
     )
     const row = result.rows[0]!
     await bindTutorialImages(
       { publicationId: row.id, authorUserId, shas: imageShas },
       client,
     )
+    await enqueueTutorialModeration(row.id, mode, client)
     return {
       id: row.id,
       status: 'pending' as const,
@@ -635,13 +656,25 @@ export async function listAdminCommunityTutorials(
   // 非 pending 的排序键：处理时间，缺失（作者撤回、0320 前的行）时退到 updated_at。
   const orderKey = pending ? 't.created_at' : 'COALESCE(t.reviewed_at, t.updated_at)'
   const result = await query<
-    OwnRowDb & { cursor_at: string; author_name: string; image_count: string; body_chars: number }
+    OwnRowDb & {
+      cursor_at: string
+      author_name: string
+      image_count: string
+      body_chars: number
+      moderation: ModerationDb | null
+    }
   >(
     `SELECT ${OWN_COLUMNS}, ${orderKey}::text AS cursor_at,
             COALESCE(NULLIF(btrim(u.display_name), ''), '社区用户') AS author_name,
             (SELECT count(*) FROM tutorial_blob_refs r
               WHERE r.publication_id = t.id AND r.role LIKE 'image:%')::text AS image_count,
-            char_length(t.body_markdown) AS body_chars
+            char_length(t.body_markdown) AS body_chars,
+            (SELECT to_jsonb(m) FROM (
+               SELECT verdict, mode, applied, categories, images, reason, admin_note, injection, created_at
+                 FROM community_tutorial_moderations
+                WHERE publication_id = t.id
+                ORDER BY id DESC LIMIT 1
+             ) m) AS moderation
        FROM community_tutorials t
        JOIN users u ON u.id = t.author_user_id
       WHERE t.status = $1
@@ -667,6 +700,126 @@ export async function listAdminCommunityTutorials(
       authorName: row.author_name,
       imageCount: Number(row.image_count),
       bodyChars: row.body_chars,
+      moderation: row.moderation ? mapModeration(row.moderation) : null,
+    })),
+    nextCursor: page.nextCursor,
+  }
+}
+
+type ModerationDb = {
+  verdict: TutorialModerationSummaryRow['verdict']
+  mode: TutorialModerationSummaryRow['mode']
+  applied: boolean
+  categories: TutorialModerationSummaryRow['categories']
+  images: TutorialModerationSummaryRow['images']
+  reason: string | null
+  admin_note: string | null
+  injection: boolean
+  created_at: string
+}
+
+function mapModeration(row: ModerationDb): TutorialModerationSummaryRow {
+  return {
+    verdict: row.verdict,
+    mode: row.mode,
+    applied: row.applied,
+    categories: row.categories ?? {},
+    images: row.images ?? [],
+    reason: row.reason,
+    adminNote: row.admin_note,
+    injection: row.injection,
+    createdAt: iso(row.created_at)!,
+  }
+}
+
+/** 管理端页头：当前模式与今天（服务器时区自然日）的自动通过 / 自动驳回 / 转人工计数。 */
+export async function getTutorialModerationStats(runner?: QueryRunner): Promise<{
+  today: { autoApproved: number; autoRejected: number; toHuman: number }
+}> {
+  const result = await query<{ approved: string; rejected: string; human: string }>(
+    `SELECT count(*) FILTER (WHERE applied AND verdict = 'pass')::text AS approved,
+            count(*) FILTER (WHERE applied AND verdict = 'reject')::text AS rejected,
+            count(*) FILTER (WHERE mode = 'on' AND verdict IN ('uncertain', 'error'))::text AS human
+       FROM community_tutorial_moderations
+      WHERE created_at >= date_trunc('day', NOW())`,
+    [],
+    runner,
+  )
+  const row = result.rows[0]
+  return {
+    today: {
+      autoApproved: Number(row?.approved ?? 0),
+      autoRejected: Number(row?.rejected ?? 0),
+      toHuman: Number(row?.human ?? 0),
+    },
+  }
+}
+
+export interface TutorialModerationRecordRow extends TutorialModerationSummaryRow {
+  id: string
+  publicationId: string
+  title: string
+  authorName: string
+  postStatus: CommunityTutorialStatus
+  textModel: string | null
+  visionModel: string | null
+  inputTokens: number | null
+  outputTokens: number | null
+  latencyMs: number | null
+  errorCode: string | null
+}
+
+/** 「AI 审核记录」：最新在前，游标 = (created_at, id)。 */
+export async function listTutorialModerations(
+  args: { cursor: TutorialCursor | null; limit: number },
+  runner?: QueryRunner,
+): Promise<{ items: TutorialModerationRecordRow[]; nextCursor: string | null }> {
+  const result = await query<
+    ModerationDb & {
+      id: string
+      publication_id: string
+      title: string
+      author_name: string
+      post_status: CommunityTutorialStatus
+      text_model: string | null
+      vision_model: string | null
+      input_tokens: number | null
+      output_tokens: number | null
+      latency_ms: number | null
+      error_code: string | null
+      cursor_at: string
+    }
+  >(
+    `SELECT m.id::text AS id, m.publication_id::text AS publication_id, m.verdict, m.mode, m.applied,
+            m.categories, m.images, m.reason, m.admin_note, m.injection, m.created_at,
+            m.created_at::text AS cursor_at, m.text_model, m.vision_model, m.input_tokens,
+            m.output_tokens, m.latency_ms, m.error_code,
+            t.title, t.status AS post_status,
+            COALESCE(NULLIF(btrim(u.display_name), ''), '社区用户') AS author_name
+       FROM community_tutorial_moderations m
+       JOIN community_tutorials t ON t.id = m.publication_id
+       JOIN users u ON u.id = t.author_user_id
+      WHERE ($1::timestamptz IS NULL OR (m.created_at, m.id) < ($1::timestamptz, $2::bigint))
+      ORDER BY m.created_at DESC, m.id DESC
+      LIMIT $3`,
+    [args.cursor?.at ?? null, args.cursor?.id ?? null, args.limit + 1],
+    runner,
+  )
+  const page = splitPage(result.rows, args.limit, (row) => row.cursor_at)
+  return {
+    items: page.rows.map((row) => ({
+      ...mapModeration(row),
+      id: row.id,
+      publicationId: row.publication_id,
+      title: row.title,
+      authorName: row.author_name,
+      postStatus: row.post_status,
+      textModel: row.text_model,
+      visionModel: row.vision_model,
+      inputTokens: row.input_tokens,
+      outputTokens: row.output_tokens,
+      latencyMs: row.latency_ms,
+      errorCode: row.error_code,
     })),
     nextCursor: page.nextCursor,
   }
@@ -725,6 +878,11 @@ export async function takedownCommunityTutorial(args: {
   throw new CommunityTutorialError('NOT_PENDING', '只能下架已公开的教程')
 }
 
+/** 公开前的泄密复扫（人工通过与 AI 自动通过共用）。扫出问题抛 LEAKS_FOUND。 */
+export async function assertTutorialPublishable(id: string, runner: QueryRunner): Promise<void> {
+  await rescanBeforeReview(id, runner)
+}
+
 async function rescanBeforeReview(id: string, runner: QueryRunner): Promise<void> {
   const result = await query<{
     kind: CommunityTutorialKind
@@ -764,12 +922,15 @@ export async function reviewCommunityTutorial(args: {
   decision: 'approve' | 'reject'
   note: string | null
 }): Promise<{ status: 'approved' | 'rejected'; publishedAt: string | null }> {
-  return tx(async (client) => {
+  const reviewed = await tx(async (client) => {
     if (args.decision === 'approve') await rescanBeforeReview(args.id, client)
     const status = args.decision === 'approve' ? 'approved' : 'rejected'
     const result = await client.query<{
       status: 'approved' | 'rejected'
       published_at: Date | string | null
+      author_user_id: string
+      title: string
+      kind: CommunityTutorialKind
     }>(
       `UPDATE community_tutorials
           SET status = $2,
@@ -781,7 +942,7 @@ export async function reviewCommunityTutorial(args: {
               published_at = CASE WHEN $2 = 'approved' THEN NOW() ELSE NULL END,
               updated_at = NOW()
         WHERE id = $1::bigint AND status = 'pending'
-        RETURNING status, published_at`,
+        RETURNING status, published_at, author_user_id::text AS author_user_id, title, kind`,
       [args.id, status, args.note, args.reviewerUserId],
     )
     const row = result.rows[0]
@@ -793,6 +954,17 @@ export async function reviewCommunityTutorial(args: {
       if (!existing.rows[0]) throw new CommunityTutorialError('NOT_FOUND', '教程投稿不存在')
       throw new CommunityTutorialError('NOT_PENDING', '该教程已经处理或撤回')
     }
-    return { status: row.status, publishedAt: iso(row.published_at) }
+    return row
   })
+  // 经验分享的审核结果发站内信（AI 与人工同一条路径）；通知失败不影响审核。
+  if (reviewed.kind === 'markdown') {
+    await notifyCommunityTutorialDecision({
+      publicationId: args.id,
+      authorUserId: reviewed.author_user_id,
+      title: reviewed.title,
+      decision: reviewed.status,
+      reason: args.note,
+    }).catch(() => {})
+  }
+  return { status: reviewed.status, publishedAt: iso(reviewed.published_at) }
 }

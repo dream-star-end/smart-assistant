@@ -252,6 +252,7 @@ import {
   startMarketplaceAiReviewScheduler,
   type MarketplaceAiReviewSchedulerHandle,
 } from "./marketplace/aiReview.js";
+import { startTutorialModerationScheduler } from "./tutorials/tutorialModeration.js";
 import {
   startProviderHealthScheduler,
   type ProviderHealthSchedulerHandle,
@@ -6887,6 +6888,7 @@ export async function registerCommercial(
     });
   }
 
+  if (runtimeChannel === "v5") trackScheduler("tutorialModeration", "v5-owned", startTutorialModerationScheduler({ apiKey: cfg.OPENCODE_GO_API_KEY, logger: rootLogger })); // OCV5-577 经验分享 AI 审核;off 缺省只把残留作业转人工;停机中断的作业由 lease 过期重领
   // 市场发布 AI 自动审批 worker(deepseek-v4-flash via OpenCode Go)。仅 v5 启动:marketplace 表 v3/v5 共享
   // 无 channel 列,但 v3 跑旧代码不写 ai_review_state → 恒 NULL → 永不被 claim,故 v3 保持
   // 纯人审、零行为变更。domain 'v5-owned'(v5 合法后台职责;写共享 marketplace 表但由
