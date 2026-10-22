@@ -53,8 +53,11 @@ export interface Problem { kind: string; message: string }
 
 /** What may precede a run at command position: sudo, env (-u NAME, NAME=value, emptied quotes) and
  * NAME=value assignments. Text after `echo`, inside quotes or in a comment is never a run. */
-const QUOTED = String.raw`(?:''|"[^"\n]*")`;
-const PREFIX = String.raw`(?:^|[;&|(])\s*(?:sudo\s+)?(?:(?:env(?:\s+(?:-u\s+\S+|${QUOTED}|[A-Za-z_][A-Za-z0-9_]*=\S*))*|[A-Za-z_][A-Za-z0-9_]*=\S*|${QUOTED})\s+)*`;
+/** A quoted `NAME=…` word (the scanner keeps the NAME= of a quoted string). Any other quoted word at
+ * command position IS the command (`"echo" node …` prints; Codex fresh r1), so it never counts as a
+ * prefix. */
+const QUOTED_ASSIGN = String.raw`(?:'[A-Za-z_][A-Za-z0-9_]*='|"[A-Za-z_][A-Za-z0-9_]*=[^"\n]*")`;
+const PREFIX = String.raw`(?:^|[;&|(])\s*(?:sudo\s+)?(?:(?:env(?:\s+(?:-u\s+\S+|${QUOTED_ASSIGN}|[A-Za-z_][A-Za-z0-9_]*=\S*))*|[A-Za-z_][A-Za-z0-9_]*=\S*|${QUOTED_ASSIGN})\s+)*`;
 const SCRIPT_RUN = new RegExp(
   `${PREFIX}(?:npx(?:\\s+--no-install)?\\s+tsx|tsx|node|bash)\\s+((?:packages\\/[\\w.-]+\\/)?scripts\\/[\\w./-]+)`, "g");
 const NPM_RUN = new RegExp(`${PREFIX}npm run (\\S+)((?:\\s+--workspace\\s+\\S+)?)`, "g");
@@ -95,7 +98,8 @@ function scanCode(text: string, from: number, inSub: boolean): [string, number] 
     if (c === "\\") { out += text[i + 1] === "\n" ? "\\\n" : "_"; i += 2; continue; }
     if (c === "'") {
       const j = text.indexOf("'", i + 1);
-      out += "''"; i = j < 0 ? text.length : j + 1; continue;
+      const assign = /^[A-Za-z_][A-Za-z0-9_]*=/.exec(text.slice(i + 1, j < 0 ? text.length : j));
+      out += `'${assign ? assign[0] : ""}'`; i = j < 0 ? text.length : j + 1; continue;
     }
     if (c === '"') {
       const [kept, j] = scanDouble(text, i + 1);
@@ -128,8 +132,10 @@ function backtickEnd(text: string, from: number): number {
 }
 
 function scanDouble(text: string, from: number): [string, number] {
-  let out = "";
-  let i = from;
+  // keep a leading NAME= so an `env "NAME=$X"` argument stays an assignment, not a command word
+  const assign = /^[A-Za-z_][A-Za-z0-9_]*=/.exec(text.slice(from));
+  let out = assign ? assign[0] : "";
+  let i = from + out.length;
   while (i < text.length && text[i] !== '"') {
     const c = text[i]!;
     if (c === "\\") { i += 2; continue; }

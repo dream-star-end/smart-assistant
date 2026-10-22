@@ -81,6 +81,14 @@ test("red: the Codex final r3 backtick case in a CI step", () => {
   assert.deepEqual(kinds(check(input)), ["ci-missing"]);
 });
 
+test("red: the Codex fresh r1 quoted command word in a CI step", () => {
+  const wf = "v5-selfhost-release-gates.yml";
+  const input = real();
+  input.workflows[wf] = input.workflows[wf]!.replace("run: node scripts/check-v5-callback-payload-hash.mjs",
+    "run: |\n          \"echo\" node scripts/check-v5-callback-payload-hash.mjs");
+  assert.deepEqual(kinds(check(input)), ["ci-missing"]);
+});
+
 test("red: a quote or heredoc spanning lines that only prints the gate does not run it (Codex r2)", () => {
   const wf = "v5-selfhost-release-gates.yml";
   const step = "run: node scripts/check-v5-callback-payload-hash.mjs";
@@ -113,6 +121,11 @@ test("the scanner keeps only what bash executes inside quotes", () => {
   assert.deepEqual(runs("out=`node scripts/a.mjs`"), ["scripts/a.mjs"]);
   assert.deepEqual(runs(`echo "$(echo 'node scripts/a.mjs')"`), []);
   assert.deepEqual(runs(`v="$(( 1 + 2 ))"; node scripts/b.mjs`), ["scripts/b.mjs"]);
+  // Codex fresh r1: a quoted word at command position is the command, not a prefix
+  assert.deepEqual(runs(`"echo" node scripts/a.mjs`), []);
+  assert.deepEqual(runs(`'echo' node scripts/a.mjs`), []);
+  assert.deepEqual(runs(`env "echo" node scripts/a.mjs`), []);
+  assert.deepEqual(runs(`env 'X=1' "Y=$Z" node scripts/a.mjs`), ["scripts/a.mjs"]);
   // Codex final r3: an escaped backtick does not close the substitution
   assert.deepEqual(runs("out=`printf '%s' '\\` ; node scripts/a.mjs'` # '"), []);
   assert.deepEqual(runs("out=`echo \\` x`; node scripts/b.mjs"), ["scripts/b.mjs"]);
