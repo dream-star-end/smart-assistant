@@ -579,3 +579,47 @@ describe('provider-aware wording (OCV5-553)', () => {
     assert.match(failed.nextAction ?? '', /不要换动作/)
   })
 })
+
+describe('literature-db codes (OCV5-585)', () => {
+  const LITERATURE_CODES = [
+    'LITERATURE_ARTIFACT_CAPACITY',
+    'LITERATURE_NO_ACCESS',
+    'LITERATURE_UPSTREAM_RATE_LIMITED',
+    'LITERATURE_UPSTREAM_CHALLENGE',
+    'LITERATURE_UPSTREAM_CHANGED',
+  ] as const
+
+  test('every literature code passes through instead of collapsing into CONNECTION_ERROR', () => {
+    for (const code of LITERATURE_CODES) {
+      assert.equal(isPluginPassthroughErrorCode(code), true, code)
+      const env = connectorRpcErrorEnvelope(code, 'literature-db')
+      assert.equal(env.code, code)
+      assert.notEqual(env.message, '操作失败', code)
+      assert.equal(env.sideEffect, 'none', code)
+      assert.equal(env.requiresReauth, false, `${code} never asks to relink a healthy account`)
+    }
+  })
+
+  test('capacity guidance is actionable and does not pretend to be rate limiting', () => {
+    const g = resolvePluginErrorGuidance({
+      code: 'LITERATURE_ARTIFACT_CAPACITY',
+      provider: 'literature-db',
+    })
+    assert.equal(g.retrySafe, 'yes')
+    assert.match(g.message, /暂存/)
+    assert.match(g.nextAction, /保存 PDF/)
+    assert.doesNotMatch(`${g.message}${g.nextAction}`, /频繁|限流|20-30 秒/)
+  })
+
+  test('no-access and challenge guidance say the account needs no relink and must not be retried blindly', () => {
+    const noAccess = resolvePluginErrorGuidance({ code: 'LITERATURE_NO_ACCESS' })
+    assert.equal(noAccess.retrySafe, 'no')
+    assert.match(noAccess.nextAction, /无需重新绑定/)
+    const challenge = resolvePluginErrorGuidance({ code: 'LITERATURE_UPSTREAM_CHALLENGE' })
+    assert.equal(challenge.retrySafe, 'no')
+    const limited = resolvePluginErrorGuidance({ code: 'LITERATURE_UPSTREAM_RATE_LIMITED' })
+    assert.equal(limited.retrySafe, 'yes')
+    const changed = resolvePluginErrorGuidance({ code: 'LITERATURE_UPSTREAM_CHANGED' })
+    assert.match(changed.message, /不是零结果|并非零结果/)
+  })
+})

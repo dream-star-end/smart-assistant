@@ -58,6 +58,7 @@ import type {
   LiteratureHttpExecuteOutput,
   LiteratureHttpReadExecutor,
 } from './literatureDb/httpExecutor.js'
+import { type LiteratureCallEvent, LiteratureCallTrace } from './literatureDb/observability.js'
 import type { VerifiedLocalPluginRuntime } from './localRuntime.js'
 import {
   type VerifiedRuntimePluginContract,
@@ -203,7 +204,7 @@ const LITERATURE_ACTION_DESCRIPTIONS: Readonly<Record<string, string>> = {
   search:
     '检索已授权文献数据库，返回有界结果与私有文献编号（documentId 有效期 24 小时；过期或报 DOCUMENT_EXPIRED 时请先重新 search 获取新编号）。',
   download:
-    '下载本账号检索结果中的一篇文献，返回平台文件编号（documentId 有效期 24 小时，过期请先重新 search；下载多篇或遇 RATE_LIMITED 时请一篇一篇下，每篇隔 20-30 秒）。',
+    '下载本账号检索结果中的一篇文献，返回平台文件编号（documentId 有效期 24 小时，过期请先重新 search；下载多篇或遇 RATE_LIMITED 时请一篇一篇下，每篇隔 20-30 秒）。PDF 暂存约 30 分钟，请提醒用户及时保存；报 LITERATURE_ARTIFACT_CAPACITY 时先让用户保存已就绪的 PDF，报 LITERATURE_NO_ACCESS 时换一篇（账号无需重绑）。',
 }
 
 function actionProjection(
@@ -369,6 +370,8 @@ export class PluginRuntimeFacade {
         credentials: LiteratureCredentials
         signal: AbortSignal
       }) => Promise<{ storageState: JieyouAccountState; verifiedAt: number }>
+      /** One allow-listed event per literature call, success or error (OCV5-585). Must not throw. */
+      literatureObserver?: (event: LiteratureCallEvent) => void
     } = {},
   ) {
     this.pool = opts.pool ?? getPool()
@@ -2143,6 +2146,39 @@ export class PluginRuntimeFacade {
     initialRow: PluginAccountRow,
     initialVerified: Extract<VerifiedRuntimePluginContract, { pluginType: 'managed-browser' }>,
   ): Promise<unknown> {
+    const trace = new LiteratureCallTrace(
+      /^[a-z][a-z_]{0,31}$/.test(input.actionId) ? input.actionId : 'unknown',
+    )
+    let failure: { error: unknown } | undefined
+    try {
+      return await this.runLiteratureHttpRead(input, initialRow, initialVerified, trace)
+    } catch (error) {
+      failure = { error }
+      throw error
+    } finally {
+      try {
+        this.opts.literatureObserver?.(
+          trace.finish(
+            failure ? { uid: input.userId, error: failure.error } : { uid: input.userId },
+          ),
+        )
+      } catch {
+        // Observability must never change the call result.
+      }
+    }
+  }
+
+  private async runLiteratureHttpRead(
+    input: {
+      userId: number
+      targetId: string
+      actionId: string
+      params: Record<string, unknown>
+    },
+    initialRow: PluginAccountRow,
+    initialVerified: Extract<VerifiedRuntimePluginContract, { pluginType: 'managed-browser' }>,
+    trace: LiteratureCallTrace,
+  ): Promise<unknown> {
     if ((await this.opts.pluginEnablement?.disabledSet(input.userId))?.has(initialVerified.slug))
       throw new PluginRuntimeFacadeError(
         'PLUGIN_DISABLED',
@@ -2169,6 +2205,7 @@ export class PluginRuntimeFacade {
     const lease = await acquirePluginAccountLease(this.opts.redis, input.targetId, {
       hardTimeoutMs: action.timeoutSeconds * 1000,
     })
+    trace.phase('lease')
     try {
       const verified = await loadVerifiedRuntimePluginContract(
         Number(initialRow.connector_version_id),
@@ -2220,7 +2257,10 @@ export class PluginRuntimeFacade {
             credentials,
             signal: lease.signal,
           })
+          trace.relogin = 'ok'
         } catch (err) {
+          trace.relogin = 'failed'
+          trace.phase('relogin')
           if (lease.signal.aborted) throw err
           await lease.assertHeld()
           await markPluginAccountRelinkRequiredFenced({
@@ -2254,6 +2294,7 @@ export class PluginRuntimeFacade {
           verified,
           runner: this.pool,
         })
+        trace.phase('relogin')
         return decryptLiteratureHttpAccountEnvelope(fencedRow, verified.contract, this.opts.env)
       }
 
@@ -2300,6 +2341,7 @@ export class PluginRuntimeFacade {
             accountInstanceId: env.accountInstanceId,
             storageState: env.storageState,
             signal: combined.signal,
+            trace,
           })
           if (ttlLatched) {
             out.stagedArtifact?.discard()
@@ -2338,11 +2380,6 @@ export class PluginRuntimeFacade {
                   'Plugin account login has expired',
                 )
               }
-              if (retryErr instanceof LiteratureError && retryErr.code === 'CAPACITY')
-                throw new PluginRuntimeFacadeError(
-                  'RUNTIME_BUSY',
-                  'Literature artifact capacity is full',
-                )
               throw retryErr
             }
           } else {
@@ -2357,9 +2394,9 @@ export class PluginRuntimeFacade {
               'Plugin account login has expired',
             )
           }
-        } else if (error instanceof LiteratureError && error.code === 'CAPACITY') {
-          throw new PluginRuntimeFacadeError('RUNTIME_BUSY', 'Literature artifact capacity is full')
         } else {
+          // LITERATURE_ARTIFACT_CAPACITY and the upstream codes pass through to the RPC layer
+          // verbatim; capacity is no longer reported as an account-busy RATE_LIMITED.
           throw error
         }
       }
@@ -2411,6 +2448,7 @@ export class PluginRuntimeFacade {
         throw postError
       }
 
+      trace.phase('commit')
       executed.stagedArtifact?.publish()
       return executed.data
     } finally {

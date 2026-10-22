@@ -1,6 +1,11 @@
-# 文献数据库登录底座（OCV5-524）
+# 文献数据库插件（literature-db，OCV5-524 / OCV5-585）
 
-当前仍是未上架的内部底座，不是已经可安装使用的插件。私密setup服务、HTTP路由和设置表单已接入，但启动代码只创建`LiteratureSetupService({redis})`，未注入真实`createSession`、readers与`isAgentReady`，授权返回`UNAVAILABLE`。HTTP runtime执行、真实身份验证、检索/下载、自动重登完整链、私有文件交付和市场seed仍未接通；不能把fixture通过当真实站点验收。按用户01:53决定，本非紧急商业PR保持CI绿并挂起，等统一安排，不自行合并、发布或两版同步。
+**现状（2026-10-23）**：商业版已上架并接线（市场 seed、私密 setup、HTTP runtime 检索/下载、自动重登、私有 PDF 交付）。下文从 `policy.ts` 起是 OCV5-524 开发期的设计记录，其中“未接线/未上架”等表述描述的是当时状态，以本段为准。
+
+运行要点（OCV5-585）：
+- **错误码**：上游登录页（解忧会员页登录提示、`/e/member/login` 跳转、401）才是 `SESSION_EXPIRED`，只有它会自动重登、重登后仍失效才标 `relink_required`。无订阅/权限页与 403 → `LITERATURE_NO_ACCESS`；429/限流页 → `LITERATURE_UPSTREAM_RATE_LIMITED`；验证码/风控页 → `LITERATURE_UPSTREAM_CHALLENGE`；无法识别的检索页 → `LITERATURE_UPSTREAM_CHANGED`（不当零结果）。万方 gRPC 以 `grpc-status`（头或 trailer 帧）判错。页面标记来自 `ocv5-308/g585-upstream-samples.md` 的只读样本，见 `upstreamClassify.ts`。
+- **PDF 暂存**（`artifactStore.ts`）：进程内、按真实字节计（每进程 160MiB / 每用户 80MiB、16 份），发布后 30 分钟到期；需要腾空间时先逐出已保存（owner GET 成功）的文件，再逐出该用户自己最旧的未保存文件，绝不逐出他人未保存文件，否则报 `LITERATURE_ARTIFACT_CAPACITY`（独立码，不再显示为 RATE_LIMITED）。同 owner + 账号实例 + 同篇重复下载复用已校验文件。重启或请求落到另一实例时文件不可见，保存卡经 `GET /api/plugins/literature-db/artifacts/<id>/meta` 显示期限并提示重新下载。documentId 24 小时 ≠ 文件 30 分钟。
+- **观测**（`observability.ts`）：每次调用一行 `literature_plugin_call`、暂存事件一行 `literature_artifact`（白名单字段，无检索词/编号/文件名/URL/cookie）。7/14 天聚合：`npx tsx packages/commercial/scripts/literature-plugin-metrics.ts /var/log/openclaude-v5.log* /var/log/openclaude-v5-b.log*`（默认排除测试账号 uid 247，client 类错误单列）。
 
 - `policy.ts` 仅允许精确的 `www.jieyoutsg.com` HTTP80 / HTTPS443，使用共享公网DNS校验。通用HTTPS规则未改。
 - `transport.ts` 用已验IP执行一个原生HTTP(S)请求，Host/SNI保留原域，使用一次性Agent，总超时包括DNS，响应限字节。它不跟跳、不重放POST；私有session必须逐跳选择Cookie（尤其不能把Secure cookie降级到HTTP）、重新pin并判断登录结果。Set-Cookie数组不合并拆逗号。

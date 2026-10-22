@@ -168,6 +168,8 @@ export function useChatCardActions({
             onOpenTasks: () => openManage("cron"),
             downloadLiteratureArtifact: (artifactId: string) =>
               api.downloadLiteratureArtifact(authRef.current, artifactId),
+            literatureArtifactMeta: (artifactId: string) =>
+              api.literatureArtifactMeta(authRef.current, artifactId),
             connectorConfirm: {
               getDetail: (id: string) => api.getConnectorConfirmation(authRef.current, id),
               decide: (id: string, decision: "approve" | "deny") =>
