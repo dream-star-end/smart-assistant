@@ -62,57 +62,72 @@ const SCRIPT_RUN = new RegExp(
   `${PREFIX}(?:npx(?:\\s+--no-install)?\\s+tsx|tsx|node|bash)\\s+((?:packages\\/[\\w.-]+\\/)?scripts\\/[\\w./-]+)`, "g");
 const NPM_RUN = new RegExp(`${PREFIX}npm run (\\S+)((?:\\s+--workspace\\s+\\S+)?)`, "g");
 
-/** Drop heredoc bodies (the opening line stays): what a heredoc feeds is data, not a command. Every
- * heredoc a line opens is queued; their bodies follow in order (Codex fresh r3: `cat <<A <<B`). */
-function dropHeredocBodies(lines: string[]): string[] {
-  const out: string[] = [];
-  const pending: { tag: string; dash: boolean }[] = [];
-  const op = /(?<!<)<<(?!<)(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([^\s;&|<>()'"]+))/g;
-  for (const raw of lines) {
-    if (pending.length > 0) {
-      if ((pending[0]!.dash ? raw.replace(/^\t+/, "") : raw) === pending[0]!.tag) pending.shift();
-      continue;
-    }
-    // any bash word is a delimiter (END-OF-TEXT, 42, 'a b'); `<<<` is a here-string, not a heredoc
-    for (const m of raw.matchAll(op)) pending.push({ tag: (m[2] ?? m[3] ?? m[4])!, dash: m[1] === "-" });
-    out.push(raw);
-  }
-  return out;
-}
-
-/** Shell text → executable text. Single-quoted strings are literals and become ''. A
- * double-quoted string keeps only what bash executes or expands inside it — `$( … )` / backtick
- * substitutions (scanned recursively) and `$NAME` / `${NAME}` — so `"run; node scripts/x"` is no
- * command while `"$("$GATE" …)"` still is (Codex final r2: a single-quoted `$( … )` was counted).
- * Escaped characters are literals; a continuation survives; `#` starts a comment only at a word
- * start. Unbalanced input fails closed: the rest reads as one literal, so nothing after it runs. */
+/** Shell text → executable text, one state machine for quotes, comments, escapes and heredocs
+ * (Codex fresh r1–r3 bypasses all came from handling them separately). Line breaks are preserved
+ * one-for-one, so line k of the result is line k of the input.
+ *  - single-quoted strings are literals → '' (a leading NAME= is kept: `env 'X=1'`);
+ *  - inside double quotes only `$( … )` / backtick substitutions and `$NAME` / `${NAME}` survive,
+ *    so `"run; node scripts/x"` is no command while `"$("$GATE" …)"` still is;
+ *  - escaped characters are literals; a continuation survives;
+ *  - `#` starts a comment only at a word start outside quotes;
+ *  - every heredoc a line opens (in code, not in a comment or quote) is queued, and their bodies,
+ *    which are data, become blank lines.
+ * Unbalanced input fails closed: the rest reads as one literal, so nothing after it runs. */
 export function stripShell(text: string): string {
-  return scanCode(text, 0, false)[0];
+  return scanCode(text, 0, false, { heredocs: [] })[0];
 }
 
-function scanCode(text: string, from: number, inSub: boolean): [string, number] {
+interface ScanState { heredocs: { tag: string; dash: boolean }[] }
+const newlines = (s: string) => s.replace(/[^\n]/g, "");
+const HEREDOC = /^<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|((?:\\.|[^\s;&|<>()'"])+))/;
+
+function scanCode(text: string, from: number, inSub: boolean, st: ScanState): [string, number] {
   let out = "";
   let depth = 0;
   let i = from;
   while (i < text.length) {
     const c = text[i]!;
+    if (c === "\n") {
+      out += "\n"; i++;
+      while (st.heredocs.length > 0 && i < text.length) {
+        const h = st.heredocs.shift()!;
+        while (i < text.length) {
+          const j = text.indexOf("\n", i);
+          const line = text.slice(i, j < 0 ? text.length : j);
+          i = j < 0 ? text.length : j + 1;
+          if (j >= 0) out += "\n";
+          if ((h.dash ? line.replace(/^\t+/, "") : line) === h.tag) break;
+        }
+      }
+      continue;
+    }
     if (c === "\\") { out += text[i + 1] === "\n" ? "\\\n" : "_"; i += 2; continue; }
     if (c === "'") {
       const j = text.indexOf("'", i + 1);
-      const assign = /^[A-Za-z_][A-Za-z0-9_]*=/.exec(text.slice(i + 1, j < 0 ? text.length : j));
-      out += `'${assign ? assign[0] : ""}'`; i = j < 0 ? text.length : j + 1; continue;
+      const raw = text.slice(i + 1, j < 0 ? text.length : j);
+      const assign = /^[A-Za-z_][A-Za-z0-9_]*=/.exec(raw);
+      out += `'${assign ? assign[0] : ""}'${newlines(raw)}`; i = j < 0 ? text.length : j + 1; continue;
     }
     if (c === '"') {
-      const [kept, j] = scanDouble(text, i + 1);
-      out += `"${kept}"`; i = j; continue;
+      const [kept, j] = scanDouble(text, i + 1, st);
+      out += `"${kept.replace(/\n/g, "; ")}"${newlines(text.slice(i, j))}`; i = j; continue;
     }
     if (c === "`") {
       const j = backtickEnd(text, i + 1);
-      out += `$(${stripShell(text.slice(i + 1, j))})`; i = j + 1; continue;
+      const raw = text.slice(i + 1, j);
+      out += `$(${stripShell(raw).replace(/\n/g, "; ")})${newlines(raw)}`; i = j + 1; continue;
     }
     if (c === "#" && (i === from || /[\s;&|(]/.test(text[i - 1]!))) {
       const j = text.indexOf("\n", i);
       i = j < 0 ? text.length : j; continue;
+    }
+    if (c === "<" && text[i + 1] === "<" && text[i + 2] !== "<" && text[i - 1] !== "<") {
+      // any bash word is a delimiter (END-OF-TEXT, 42, 'a b'); `<<<` is a here-string
+      const m = HEREDOC.exec(text.slice(i));
+      if (m) {
+        st.heredocs.push({ tag: m[2] ?? m[3] ?? m[4]!.replace(/\\(.)/g, "$1"), dash: m[1] === "-" });
+        out += "<<''"; i += m[0].length; continue;
+      }
     }
     if (inSub && c === "(") depth++;
     if (inSub && c === ")") {
@@ -132,7 +147,7 @@ function backtickEnd(text: string, from: number): number {
   return Math.min(j, text.length);
 }
 
-function scanDouble(text: string, from: number): [string, number] {
+function scanDouble(text: string, from: number, st: ScanState): [string, number] {
   // keep a leading NAME= so an `env "NAME=$X"` argument stays an assignment, not a command word
   const assign = /^[A-Za-z_][A-Za-z0-9_]*=/.exec(text.slice(from));
   let out = assign ? assign[0] : "";
@@ -141,7 +156,7 @@ function scanDouble(text: string, from: number): [string, number] {
     const c = text[i]!;
     if (c === "\\") { i += 2; continue; }
     if (c === "$" && text[i + 1] === "(") {
-      const [inner, j] = scanCode(text, i + 2, true);
+      const [inner, j] = scanCode(text, i + 2, true, st);
       out += `$(${inner})`; i = j; continue;
     }
     if (c === "`") {
@@ -155,10 +170,9 @@ function scanDouble(text: string, from: number): [string, number] {
   return [out, i + 1];
 }
 
-/** Shell text → command lines: heredoc bodies dropped, quoted text and comments dropped (quote
- * state carried across lines), then continuations joined. */
+/** Shell text → command lines (stripShell, then continuations joined). */
 export function shellCommands(text: string): string[] {
-  return stripShell(dropHeredocBodies(text.split("\n")).join("\n")).replace(/\\\n/g, " ").split("\n");
+  return stripShell(text).replace(/\\\n/g, " ").split("\n");
 }
 
 /** Command lines of a shell function body, by the same rules as shellCommands, so a message or
@@ -229,12 +243,13 @@ export function deployRuns(deployScript: string, gate: Gate): boolean {
   const v = word(d.variable);
   const runs = new RegExp(`(?:^|[;&|(]|\\$\\()\\s*"?\\$(?:\\{${v}\\}|${v})"?(?:\\s|\\)|$)`);
   if (!body.some((line) => runs.test(line))) return false;
-  // every assignment of the variable (heredoc bodies and comments excluded) must be the script path,
-  // so a decoy in a heredoc or a later reassignment fails (Codex fresh r3)
+  // every assignment of the variable that bash executes (not in a heredoc body, quote or comment)
+  // must be exactly the script path, so a decoy or a later reassignment fails (Codex fresh r3)
   const want = `${v}="$SCRIPT_DIR/${gate.script.replace(/^scripts\//, "")}"`;
-  const assigns = dropHeredocBodies(deployScript.split("\n"))
-    .map((line) => line.replace(/(^|\s)#.*$/, "$1").trim())
-    .filter((line) => new RegExp(`(?:^|[;&|(]\\s*|\\b(?:export|local|declare|readonly)\\s+)${v}=`).test(line));
+  const raw = deployScript.split("\n");
+  const code = stripShell(deployScript).split("\n");
+  const assignAt = new RegExp(`(?:^|[;&|(]\\s*|\\b(?:export|local|declare|readonly)\\s+)${v}=`);
+  const assigns = code.flatMap((line, k) => (assignAt.test(line) ? [raw[k]!.replace(/(^|\s)#.*$/, "$1").trim()] : []));
   return assigns.length > 0 && assigns.every((line) => line === want);
 }
 

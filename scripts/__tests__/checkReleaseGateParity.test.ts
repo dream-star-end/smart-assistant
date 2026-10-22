@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { type Manifest, check, functionCommands, runsIn, shellCommands, workflowRuns } from "../check-release-gate-parity.ts";
+import { type Manifest, check, functionCommands, runsIn, shellCommands, stripShell, workflowRuns } from "../check-release-gate-parity.ts";
 
 const ROOT = join(import.meta.dirname, "..", "..");
 const read = (p: string) => readFileSync(join(ROOT, p), "utf8");
@@ -100,6 +100,8 @@ test("red: a quote or heredoc spanning lines that only prints the gate does not 
     "run: |\n          cat <<'END-OF-TEXT'\n          node scripts/check-v5-callback-payload-hash.mjs\n          END-OF-TEXT",
     "run: |\n          cat <<42\n          node scripts/check-v5-callback-payload-hash.mjs\n          42",
     "run: |\n          cat <<\"two words\"\n          node scripts/check-v5-callback-payload-hash.mjs\n          two words",
+    // Codex fresh r3 r2: a `<<` inside a comment opens no heredoc
+    "run: |\n          cat <<'A' # <<'B'\n          A\n          echo '\n          B\n          node scripts/check-v5-callback-payload-hash.mjs\n          ' # '",
     // Codex fresh r3: two heredocs on one line, the gate in the second body
     "run: |\n          cat <<'A' <<'B'\n          A\n          node scripts/check-v5-callback-payload-hash.mjs\n          B",
   ]) {
@@ -135,6 +137,15 @@ test("the scanner keeps only what bash executes inside quotes", () => {
   // Codex final r3: an escaped backtick does not close the substitution
   assert.deepEqual(runs("out=`printf '%s' '\\` ; node scripts/a.mjs'` # '"), []);
   assert.deepEqual(runs("out=`echo \\` x`; node scripts/b.mjs"), ["scripts/b.mjs"]);
+});
+
+test("the scanner keeps line k of the input at line k of the output", () => {
+  const text = "a 'x\ny'\nb \"p\nq\"\ncat <<E\nbody1\nbody2\nE\nnode scripts/z.mjs # c <<F\nlast";
+  const out = stripShell(text).split("\n");
+  assert.equal(out.length, text.split("\n").length);
+  assert.equal(out[8], "node scripts/z.mjs ");
+  assert.deepEqual([out[5], out[6], out[7]], ["", "", ""]);
+  assert.equal(out[9], "last", "a << inside a comment opens no heredoc");
 });
 
 test("a comment with an apostrophe does not swallow the next command", () => {
