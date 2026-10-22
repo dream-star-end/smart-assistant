@@ -6,6 +6,7 @@ import { LiteratureError } from '../plugins/literatureDb/errors.js'
 
 import { signAccess } from '../auth/jwt.js'
 import { PluginAccountError } from '../plugins/accounts.js'
+import { DouyinSetupError } from '../plugins/douyinSetup.js'
 import { KnowledgePlanetSetupError } from '../plugins/knowledgePlanetSetup.js'
 import { resolvePluginErrorGuidance } from '../plugins/pluginErrorGuidance.js'
 import { PluginRuntimeFacadeError } from '../plugins/runtime.js'
@@ -918,3 +919,91 @@ describe('private literature setup routes', () => {
     )
   })
 })
+
+describe('Douyin owner SMS verification routes (OCV5-553 4.3.C)', () => {
+  const SMS_PATH = `/api/plugins/douyin/setup/${SESSION}/sms`
+
+  function douyinDeps(impl: Record<string, (...args: any[]) => Promise<unknown>>) {
+    const calls: unknown[][] = []
+    const wrap = (name: string) => async (...args: unknown[]) => {
+      calls.push([name, ...args])
+      return impl[name]!(...args)
+    }
+    return {
+      calls,
+      deps: deps({ douyinSetup: { submitSms: wrap('submitSms'), resendSms: wrap('resendSms') } }),
+    }
+  }
+
+  test('submit passes the code straight to the setup manager; resend takes an empty body', async () => {
+    const { calls, deps: d } = douyinDeps({
+      submitSms: async () => ({ sessionId: SESSION, status: 'waiting_for_sms', phase: 'sms_verifying' }),
+      resendSms: async () => ({ sessionId: SESSION, status: 'waiting_for_sms', phase: 'sms_required' }),
+    })
+    const res = response()
+    await dispatchPluginsRoute(await request('POST', SMS_PATH, { code: '123456' }), res, ctx, d)
+    assert.equal(res.statusCode, 200)
+    assert.deepEqual(calls, [['submitSms', 42, SESSION, '123456']])
+    assert.doesNotMatch(JSON.stringify(res.body), /123456/)
+    const res2 = response()
+    await dispatchPluginsRoute(await request('POST', `${SMS_PATH}/resend`), res2, ctx, d)
+    assert.equal(res2.statusCode, 200)
+    assert.deepEqual(calls.at(-1), ['resendSms', 42, SESSION])
+  })
+
+  test('malformed bodies are rejected before the manager is touched', async () => {
+    const { calls, deps: d } = douyinDeps({ submitSms: async () => ({}), resendSms: async () => ({}) })
+    for (const body of [{ code: 123456 }, { code: '123456', extra: 1 }, ['123456'], {}]) {
+      await assert.rejects(
+        dispatchPluginsRoute(await request('POST', SMS_PATH, body), response(), ctx, d),
+        (e: unknown) => e instanceof HttpError && e.status === 400,
+        JSON.stringify(body),
+      )
+    }
+    await assert.rejects(
+      dispatchPluginsRoute(await request('POST', `${SMS_PATH}/resend`, { code: '1' }), response(), ctx, d),
+      (e: unknown) => e instanceof HttpError && e.status === 400,
+    )
+    assert.deepEqual(calls, [])
+  })
+
+  test('setup errors map to stable statuses and never echo the code', async () => {
+    for (const [code, status] of [
+      ['SMS_INVALID', 400],
+      ['SMS_NOT_EXPECTED', 409],
+      ['SMS_ATTEMPTS_EXCEEDED', 409],
+      ['SMS_RATE_LIMITED', 429],
+      ['SETUP_NOT_FOUND', 404],
+    ] as const) {
+      const { deps: d } = douyinDeps({
+        submitSms: async () => {
+          throw new DouyinSetupError(code)
+        },
+      })
+      await assert.rejects(
+        dispatchPluginsRoute(await request('POST', SMS_PATH, { code: '987654' }), response(), ctx, d),
+        (e: unknown) =>
+          e instanceof HttpError &&
+          e.status === status &&
+          e.code === code &&
+          !`${e.message} ${e.logMessage ?? ''} ${e.nextAction ?? ''}`.includes('987654'),
+        code,
+      )
+    }
+  })
+
+  test('only POST on the exact douyin paths; other providers have no SMS step', async () => {
+    const { deps: d } = douyinDeps({ submitSms: async () => ({}), resendSms: async () => ({}) })
+    for (const [method, path] of [
+      ['GET', SMS_PATH],
+      ['POST', `/api/plugins/weibo/setup/${SESSION}/sms`],
+      ['POST', `${SMS_PATH}/other`],
+    ] as const)
+      await assert.rejects(
+        dispatchPluginsRoute(await request(method, path, { code: '123456' }), response(), ctx, d),
+        (e: unknown) => e instanceof HttpError && e.status === 404,
+        `${method} ${path}`,
+      )
+  })
+})
+

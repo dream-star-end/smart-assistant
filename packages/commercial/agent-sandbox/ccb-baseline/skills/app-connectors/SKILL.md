@@ -18,9 +18,9 @@ API 插件写操作必须逐次确认；受管浏览器插件以 `oc-plugin list
 
 ## 结果展示：插件专属组件（按需读取）
 
-微博、知乎、飞书各有专属的展示组件，定义不在系统提示里。在网页对话里要展示其中某个插件的结果时，
+微博、知乎、飞书、B 站、抖音各有专属的展示组件，定义不在系统提示里。在网页对话里要展示其中某个插件的结果时，
 先用 Read 读本技能目录下对应的定义文件，每个对话读一次即可，然后按定义写 ```ui 块：
-微博 `references/ui-weibo.md`，知乎 `references/ui-zhihu.md`，飞书 `references/ui-feishu.md`，B 站 `references/ui-bili.md`。
+微博 `references/ui-weibo.md`，知乎 `references/ui-zhihu.md`，飞书 `references/ui-feishu.md`，B 站 `references/ui-bili.md`，抖音 `references/ui-douyin.md`。
 本技能目录就是加载时给出的 Base directory，通常是 `/run/oc/claude-config/skills/app-connectors`。
 没有 Intelligent UI 协议时（例如微信、定时任务）不要读这些文件，也不要写这些块。
 
@@ -177,9 +177,13 @@ echo '{}' | oc-plugin call knowledge-planet create_topic --confirm <确认码>
 
 ### 抖音（douyin）
 
-只在 AI 市场，用户没装时先引导去安装；装好后在 管理中心 → 插件 → 抖音 用抖音 App 扫码登录个人账号（二维码约 1 分钟才出现）。
-- 当前版本只读：`oc-plugin call douyin me` 读取登录账号的昵称、uid、粉丝 / 关注 / 作品 / 获赞数，也用来确认登录是否有效。作品、评论、搜索、发布等能力还没有，不要假装能做。
-- 这是浏览器自动化，不在抖音官方开放能力之内，可能触发账号风控。不要连续反复调用，也不要索要 cookie、短信或验证码。
+只在 AI 市场，用户没装时先引导去安装；装好后在 管理中心 → 插件 → 抖音 用抖音 App 扫码登录个人账号（二维码约 1 分钟才出现；扫码后抖音会要求本人短信验证，用户在同一个弹层里 3 分钟内输入手机收到的验证码即可。验证码只在那个弹层里输入，不要在对话里向用户要）。
+- 读（只看自己的账号）：`oc-plugin call douyin me`（昵称、uid、粉丝 / 关注 / 作品 / 获赞数，也用来确认登录是否有效）；`my_videos`（自己发布的作品和播放 / 点赞 / 评论等数据，参数 count、cursor）；`video_comments`（自己某个作品下的评论，参数 awemeId 来自 my_videos）。搜索、看别人的作品都没有，不要假装能做。
+- 写（都只针对自己的作品）：`publish_video`（video 为 uploads/ 或 generated/ 下 ≤50MB 的 mp4，caption 文案里直接写 # 话题和 @，可选 title、visibility）、`publish_images`（images 1-20 张 jpg/png/webp）、`create_comment`（awemeId、text）、`reply_comment`（awemeId、cid、text）、`set_comment_digg`（awemeId、cid、digg）。用户先要在 管理中心 → 插件 → 抖音 阅读写入声明并打开写入开关。**抖音没有免逐次确认**：每次都先不带 `--confirm` 调用，等用户在确认卡上批准后再带 `--confirm <确认码>` 调一次。评论、回复、点赞的目标必须在最近 60 个作品 / 60 条评论里（先用 my_videos、video_comments 拿 id）。
+- 写有每日上限（发布视频 3、发布图文 3、评论与回复合计 20、点赞合计 30）和同账号最短间隔（发布约 10 分钟、评论或回复约 1 分钟、点赞约 20 秒）。WRITE_DAILY_LIMIT：告诉用户明天再试。DOUYIN_PACING_WAIT：告诉用户大概还要等多久，请用户稍后再发起；**不要 sleep 后循环重试**。DOUYIN_WRITE_COOLDOWN：账号触发过风控，写操作暂停 24 小时，如实告知。DOUYIN_WRITE_UNVERIFIED：当前版本的发布、评论、点赞还没完成实测接入，本次没有发出，告诉用户暂不可用，不要换动作绕过。PRECONDITION_CHANGED：目标在发出前变了（作品或评论已删除），没有发出，重新读取后再开新的确认卡。结果不明（replay 的 status 为 unknown）时**不要重发**，先用 my_videos 或 video_comments 核对。
+- 禁止：批量刷评论或点赞；一次对话里连续发布；替用户编造内容后不经用户确认就发起写操作。
+- 在网页对话里展示作品列表或评论时，先读 `references/ui-douyin.md` 再写组件块。
+- 这是浏览器自动化，不在抖音官方开放能力之内，违反或可能违反抖音用户协议，可能触发账号风控，严重时限制或封禁账号，风险由用户本人承担；第一次帮用户写之前把这一点告诉用户。不要连续反复调用，也不要索要 cookie、短信或验证码。
 - RELINK_REQUIRED / LOGIN_EXPIRED_ACCOUNT：请用户到 管理中心 → 插件 → 抖音 重新扫码。DOUYIN_VERIFICATION_REQUIRED：请用户先在手机抖音完成本人验证再扫码。DOUYIN_UPSTREAM_CHALLENGE：抖音触发风控，如实告知、立即停止，不要重试或换动作绕过。
 
 ## 各 provider 一览

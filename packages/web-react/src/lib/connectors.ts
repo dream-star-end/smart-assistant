@@ -222,6 +222,16 @@ export type RuntimePluginAccount = {
       disclaimerText: string | null
     }
   } | null
+  /** 「今日已用 / 上限」（OCV5-553）：只有声明了每日写上限的插件（当前只有抖音）才有。 */
+  writeUsage?: {
+    /** 北京时间 YYYY-MM-DD。 */
+    day: string
+    /** false = 服务端读不到计数，前端只说「暂不可用」，不显示 0。 */
+    available: boolean
+    buckets: Array<{ bucket: string; label: string; used: number; cap: number }>
+    /** 风控冷却到期时间（ISO）；没有冷却时 null。 */
+    cooldownUntil: string | null
+  } | null
 }
 
 export type PluginManagementResponse = {
@@ -291,10 +301,20 @@ export type KnowledgePlanetAutomationView = {
 
 export type ManagedBrowserSetupView = {
   sessionId: string
-  status: 'waiting_for_scan' | 'finalizing' | 'active' | 'cancelled' | 'expired' | 'failed'
+  status:
+    | 'waiting_for_scan'
+    | 'waiting_for_sms'
+    | 'finalizing'
+    | 'active'
+    | 'cancelled'
+    | 'expired'
+    | 'failed'
   phase?:
     | 'generating_qr'
     | 'waiting_for_scan'
+    | 'sms_required'
+    | 'sms_sent'
+    | 'sms_verifying'
     | 'scan_confirmed'
     | 'saving'
     | 'active'
@@ -309,6 +329,16 @@ export type ManagedBrowserSetupView = {
   expiresAt: string
   accountId?: string
   errorCode?: string
+  /** 当前二维码的服务端过期时间（抖音，OCV5-553）。 */
+  qrExpireAt?: string
+  /** 扫码后的本人短信验证（抖音，OCV5-553 4.3.C）。验证码本身从不出现在视图里。 */
+  sms?: {
+    deadline: string
+    resendAfter: string
+    attemptsLeft: number
+    sent: boolean
+    rejected: boolean
+  }
 }
 
 export type KnowledgePlanetSetupView = ManagedBrowserSetupView

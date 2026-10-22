@@ -1761,7 +1761,7 @@ export async function registerCommercial(
       socketUid: 1000,
       socketGid: 1000,
     })
-    // OCV5-553: Douyin Plugin (market only; this version is QR login + read-only `me`).
+    // OCV5-553: Douyin Plugin (market only): QR login, own-work reads, fenced writes (1.1.0).
     douyinService = new DouyinDockerService(pluginDocker, {
       imageId: cfg.OC_RUNTIME_IMAGE_ID,
       workerRoot: DOUYIN_WORKER_ROOT,

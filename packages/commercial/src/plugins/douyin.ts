@@ -1,13 +1,18 @@
 /**
  * Douyin managed-browser runtime (OCV5-553). Ported from the reviewed Bilibili account runtime
- * (biliAccount.ts); this version is read-only (QR login + `me`). Writes arrive in a later version.
+ * (biliAccount.ts): QR login, reads of the account's own works / comments, and (1.1.0) write actions
+ * behind the reviewed dispatch fence of the Zhihu runtime (zhihu.ts): the worker emits `prepared`,
+ * the master durably arms the ledger in `beforeDispatch` and only then writes `dispatch`; a worker
+ * that finds the target changed ends with `not_dispatched` (proven not sent). Write media is mounted
+ * read-only at `/inputs` from the sha256-verified staging directory.
+ * Login workers additionally take command frames on stdin for the account owner's SMS
+ * verification (design 4.3.C): the master writes `send_sms` / `sms_code` / `resend_sms` / `abort`;
+ * the code frame buffer is zeroed right after the write.
  *
  * Structure follows the reviewed Weibo runtime (weibo.ts): one pinned-image worker container per
  * call, NetworkMode none + TLS CONNECT broker limited to the contract's IP pins, read-only rootfs,
  * all capabilities dropped, Docker log driver `none` (stdout carries storage state), 4-byte framed
- * JSON on stdin/stdout. What is intentionally absent: the write dispatch fence (`prepared` /
- * `dispatch` / `not_dispatched`), media input mounts and compatibility pins — there are no write
- * actions and no earlier versions.
+ * JSON on stdin/stdout. No compatibility pins: no earlier version was ever published.
  */
 import { createHash, randomUUID } from 'node:crypto'
 import { chmod, lstat, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
@@ -92,8 +97,9 @@ export const DOUYIN_WORKER_ROOT = '/var/lib/openclaude-v5/plugin-workers-douyin'
 export const DOUYIN_SEED_BROKER_ROOT = '/run/openclaude-v5/douyin-seed-brokers'
 export const DOUYIN_SEED_WORKER_ROOT = '/var/lib/openclaude-v5/plugin-workers-douyin-seed'
 
-/** 只读动作都是几次页面内请求,给 3 分钟上限,远低于 Weibo 写操作用的 570 秒。 */
+/** 只读动作都是几次页面内请求,给 3 分钟上限;写动作(含视频上传)与微博 / 知乎写操作相同,570 秒。 */
 const ACTION_SESSION_MS = 180_000
+const WRITE_SESSION_MS = 570_000
 
 export function resolveDouyinWorkerResources(kind: 'action' | 'login'): {
   memoryBytes: number
@@ -120,7 +126,11 @@ export class DouyinRuntimeError extends Error {
     | 'LOGIN_EXPIRED_ACCOUNT'
     | 'CLOSING'
     | 'CLEANUP_FAILED'
+    | 'PRECONDITION_CHANGED'
     | DouyinFailureCode
+
+  /** worker 证明了没有发出（目标在发出前变了）：账本记 failed 而不是 unknown。 */
+  readonly dispatchProvenNotStarted: boolean
 
   constructor(
     code: DouyinRuntimeError['code'],
@@ -129,6 +139,7 @@ export class DouyinRuntimeError extends Error {
     super(message)
     this.name = 'DouyinRuntimeError'
     this.code = code
+    this.dispatchProvenNotStarted = code === 'PRECONDITION_CHANGED'
   }
 }
 
@@ -146,17 +157,78 @@ interface CompletedEvent {
   result: unknown
   storageState: unknown
 }
+/** 写动作：worker 已核对目标、准备好发出，等 master 落定派发围栏后的 `dispatch`。 */
+interface PreparedEvent {
+  event: 'prepared'
+}
+/** 写动作：发出前目标已变化，确定没有发出。 */
+interface NotDispatchedEvent {
+  event: 'not_dispatched'
+  code: 'PRECONDITION_CHANGED'
+}
 interface QrEvent {
   event: 'qr'
   png: Buffer
+  /** 服务端给这个码的过期时间（epoch ms）。 */
+  expireAt: number
+}
+/** 扫码后抖音要求本人验证（OCV5-553 4.3.C）。只有短信这条路由我们代为提交。 */
+interface VerificationEvent {
+  event: 'verification'
+  kind: 'sms_available' | 'unsupported'
+}
+interface SmsSentEvent {
+  event: 'sms_sent'
+  resendAfterSec: number
+}
+interface SmsRejectedEvent {
+  event: 'sms_rejected'
+}
+interface SmsResendFailedEvent {
+  event: 'sms_resend_failed'
+}
+/** worker 作废了当前二维码（换码 / 502）：master 立即撤下缓存的码。 */
+interface QrInvalidEvent {
+  event: 'qr_invalid'
 }
 interface AuthenticatedEvent {
   event: 'authenticated'
   storageState: unknown
 }
-type WorkerEvent = ReadyEvent | FailedEvent | CompletedEvent | QrEvent | AuthenticatedEvent
+type WorkerEvent =
+  | ReadyEvent
+  | FailedEvent
+  | CompletedEvent
+  | PreparedEvent
+  | NotDispatchedEvent
+  | QrEvent
+  | AuthenticatedEvent
+  | VerificationEvent
+  | SmsSentEvent
+  | SmsRejectedEvent
+  | SmsResendFailedEvent
+  | QrInvalidEvent
 
-const TERMINAL_EVENTS = new Set(['failed', 'completed', 'authenticated'])
+/** 只在登录 worker 里出现的非终止帧。 */
+const LOGIN_ONLY_EVENTS = new Set([
+  'qr',
+  'qr_invalid',
+  'verification',
+  'sms_sent',
+  'sms_rejected',
+  'sms_resend_failed',
+])
+
+/** master → 登录 worker 的命令帧（stdin）。验证码只在内存里，写出后立即清零。 */
+export type DouyinLoginCommand =
+  | { cmd: 'send_sms' }
+  | { cmd: 'resend_sms' }
+  | { cmd: 'abort' }
+  | { cmd: 'sms_code'; code: string }
+
+const TERMINAL_EVENTS = new Set(['failed', 'completed', 'authenticated', 'not_dispatched'])
+/** 只在动作 worker 的写流程里出现的帧。 */
+const WRITE_ONLY_EVENTS = new Set(['prepared', 'not_dispatched'])
 
 function plainEvent(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value))
@@ -172,7 +244,7 @@ function exactEventKeys(value: Record<string, unknown>, keys: readonly string[])
     throw new DouyinRuntimeError('PROTOCOL', 'worker frame fields are invalid')
 }
 
-/** 只认这五种帧;写流程用的 prepared / not_dispatched 在只读 worker 里一律是协议错误。 */
+/** prepared / not_dispatched 只属于动作 worker 的写流程;登录 worker 发出即协议错误(见 startReservedWorker)。 */
 function parseWorkerEvent(value: unknown): WorkerEvent {
   const event = plainEvent(value)
   if (event.event === 'ready') {
@@ -194,12 +266,48 @@ function parseWorkerEvent(value: unknown): WorkerEvent {
     exactEventKeys(event, ['event', 'result', 'storageState'])
     return event as unknown as CompletedEvent
   }
+  if (event.event === 'prepared') {
+    exactEventKeys(event, ['event'])
+    return event as unknown as PreparedEvent
+  }
+  if (event.event === 'not_dispatched') {
+    exactEventKeys(event, ['event', 'code'])
+    if (event.code !== 'PRECONDITION_CHANGED')
+      throw new DouyinRuntimeError('PROTOCOL', 'worker precondition code is invalid')
+    return event as unknown as NotDispatchedEvent
+  }
   if (event.event === 'authenticated') {
     exactEventKeys(event, ['event', 'storageState'])
     return event as unknown as AuthenticatedEvent
   }
+  if (event.event === 'verification') {
+    exactEventKeys(event, ['event', 'kind'])
+    if (event.kind !== 'sms_available' && event.kind !== 'unsupported')
+      throw new DouyinRuntimeError('PROTOCOL', 'worker verification frame is invalid')
+    return event as unknown as VerificationEvent
+  }
+  if (event.event === 'sms_sent') {
+    exactEventKeys(event, ['event', 'resendAfterSec'])
+    if (
+      !Number.isSafeInteger(event.resendAfterSec) ||
+      (event.resendAfterSec as number) < 0 ||
+      (event.resendAfterSec as number) > 600
+    )
+      throw new DouyinRuntimeError('PROTOCOL', 'worker sms frame is invalid')
+    return event as unknown as SmsSentEvent
+  }
+  if (
+    event.event === 'sms_rejected' ||
+    event.event === 'sms_resend_failed' ||
+    event.event === 'qr_invalid'
+  ) {
+    exactEventKeys(event, ['event'])
+    return event as unknown as SmsRejectedEvent | SmsResendFailedEvent | QrInvalidEvent
+  }
   if (event.event === 'qr') {
-    exactEventKeys(event, ['event', 'png'])
+    exactEventKeys(event, ['event', 'png', 'expireAt'])
+    if (!Number.isSafeInteger(event.expireAt) || (event.expireAt as number) <= 0)
+      throw new DouyinRuntimeError('PROTOCOL', 'worker QR frame is invalid')
     if (typeof event.png !== 'string' || event.png.length > 700_000)
       throw new DouyinRuntimeError('PROTOCOL', 'worker QR frame is invalid')
     const png = Buffer.from(event.png, 'base64')
@@ -209,7 +317,7 @@ function parseWorkerEvent(value: unknown): WorkerEvent {
       !png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
     )
       throw new DouyinRuntimeError('PROTOCOL', 'worker QR image is invalid')
-    return { event: 'qr', png }
+    return { event: 'qr', png, expireAt: event.expireAt as number }
   }
   throw new DouyinRuntimeError('PROTOCOL', 'worker event is unsupported')
 }
@@ -251,6 +359,37 @@ class FrameDecoder {
 }
 
 /** Regression seam: frame parsing without Docker. */
+/**
+ * 帧顺序与模式(纯函数,单测直接调用):第一帧必须是 ready;终止帧之后不能再有帧;登录 worker 只能以
+ * authenticated / failed 结束、不能发写流程帧;动作 worker 不能发登录帧;prepared / not_dispatched 只属于
+ * 带 beforeDispatch 的写调用,prepared 只能一次;写调用要以 completed 结束必须先经过 prepared(派发围栏)。
+ */
+export function assertDouyinWorkerEventOrder(input: {
+  kind: 'action' | 'login'
+  prior: readonly string[]
+  event: string
+  writeCall: boolean
+}): void {
+  const { kind, prior, event } = input
+  if (prior.length === 0 && event !== 'ready')
+    throw new DouyinRuntimeError('PROTOCOL', 'worker omitted compatibility handshake')
+  if (prior.length > 0 && event === 'ready')
+    throw new DouyinRuntimeError('PROTOCOL', 'worker repeated compatibility handshake')
+  if (prior.some((item) => TERMINAL_EVENTS.has(item)))
+    throw new DouyinRuntimeError('PROTOCOL', 'worker emitted data after terminal event')
+  if (
+    (kind === 'login' && (event === 'completed' || WRITE_ONLY_EVENTS.has(event))) ||
+    (kind === 'action' && (event === 'authenticated' || LOGIN_ONLY_EVENTS.has(event)))
+  )
+    throw new DouyinRuntimeError('PROTOCOL', 'worker event does not match its mode')
+  if (event === 'prepared' && (!input.writeCall || prior.includes('prepared')))
+    throw new DouyinRuntimeError('PROTOCOL', 'worker dispatch fence is invalid')
+  if (event === 'not_dispatched' && !input.writeCall)
+    throw new DouyinRuntimeError('PROTOCOL', 'worker dispatch fence is invalid')
+  if (event === 'completed' && input.writeCall && !prior.includes('prepared'))
+    throw new DouyinRuntimeError('PROTOCOL', 'write worker completed without the dispatch fence')
+}
+
 export function decodeDouyinWorkerFramesForTest(chunk: Buffer): WorkerEvent['event'][] {
   const events: WorkerEvent['event'][] = []
   const decoder = new FrameDecoder((event) => {
@@ -341,12 +480,16 @@ interface ActiveWorker {
   broker: ManagedBrowserBrokerHandle
   done: Promise<WorkerEvent[]>
   kind: 'action' | 'login'
+  /** 向 worker stdin 写一帧（只用于登录 worker 的命令）。 */
+  send(value: DouyinLoginCommand): Promise<void>
 }
 
 export interface DouyinLoginWorkerHandle {
   sessionId: string
   done: Promise<void>
   stop(): Promise<void>
+  /** 发命令给登录 worker（发短信 / 提交验证码 / 重发 / 放弃）。 */
+  command(value: DouyinLoginCommand): Promise<void>
 }
 
 export class DouyinDockerService {
@@ -485,6 +628,8 @@ export class DouyinDockerService {
     input: Record<string, unknown>
     onEvent?: (event: WorkerEvent) => void
     signal?: AbortSignal
+    beforeDispatch?: () => Promise<void>
+    inputDirectory?: string
   }): Promise<ActiveWorker> {
     if (args.signal?.aborted) throw args.signal.reason
     this.reserveWorker(args.key, args.kind)
@@ -505,6 +650,8 @@ export class DouyinDockerService {
     input: Record<string, unknown>
     onEvent?: (event: WorkerEvent) => void
     signal?: AbortSignal
+    beforeDispatch?: () => Promise<void>
+    inputDirectory?: string
   }): Promise<ActiveWorker> {
     const materialized = await this.initialize()
     if (args.signal?.aborted) throw args.signal.reason
@@ -538,6 +685,20 @@ export class DouyinDockerService {
     let stream: Duplex | null = null
     let cleanupFailure: unknown = null
     try {
+      if (args.inputDirectory) {
+        // 只挂载宿主已按 sha256 核对过的暂存目录(stageKnowledgePlanetMedia),且只给写动作。
+        const stat = await lstat(args.inputDirectory)
+        if (
+          args.kind !== 'action' ||
+          !isAbsolute(args.inputDirectory) ||
+          !stat.isDirectory() ||
+          stat.isSymbolicLink() ||
+          stat.uid !== (this.opts.expectedOwnerUid ?? 0) ||
+          (stat.mode & 0o777) !== 0o555 ||
+          (await realpath(args.inputDirectory)) !== args.inputDirectory
+        )
+          throw new DouyinRuntimeError('UNAVAILABLE', 'worker input directory is unsafe')
+      }
       const resources = resolveDouyinWorkerResources(args.kind)
       container = await this.createContainerInHostSlot({
         Image: this.opts.imageId,
@@ -602,6 +763,17 @@ export class DouyinDockerService {
               ReadOnly: true,
               BindOptions: { Propagation: 'rprivate' },
             },
+            ...(args.inputDirectory
+              ? [
+                  {
+                    Type: 'bind' as const,
+                    Source: args.inputDirectory,
+                    Target: '/inputs',
+                    ReadOnly: true,
+                    BindOptions: { Propagation: 'rprivate' as const },
+                  },
+                ]
+              : []),
           ],
           RestartPolicy: { Name: 'no', MaximumRetryCount: 0 },
           LogConfig: douyinWorkerDockerLogConfig(),
@@ -620,19 +792,18 @@ export class DouyinDockerService {
       if (args.signal?.aborted) throw args.signal.reason
       const events: WorkerEvent[] = []
       let protocolFailure: unknown = null
+      let dispatchFailure: unknown = null
+      let dispatchPromise: Promise<void> | null = null
+      let prepared = false
       let stderrBytes = 0
       let stderrRemainder = ''
       const decoder = new FrameDecoder((event) => {
-        if (events.length === 0 && event.event !== 'ready')
-          throw new DouyinRuntimeError('PROTOCOL', 'worker omitted compatibility handshake')
-        if (events.some((item) => TERMINAL_EVENTS.has(item.event)))
-          throw new DouyinRuntimeError('PROTOCOL', 'worker emitted data after terminal event')
-        // 登录 worker 只能以 authenticated / failed 结束,动作 worker 只能以 completed / failed 结束。
-        if (
-          (args.kind === 'login' && event.event === 'completed') ||
-          (args.kind === 'action' && (event.event === 'authenticated' || event.event === 'qr'))
-        )
-          throw new DouyinRuntimeError('PROTOCOL', 'worker event does not match its mode')
+        assertDouyinWorkerEventOrder({
+          kind: args.kind,
+          prior: events.map((item) => item.event),
+          event: event.event,
+          writeCall: args.beforeDispatch !== undefined,
+        })
         events.push(event)
         args.onEvent?.(event)
         if (event.event === 'ready') this.writeWorkerLog(sessionId, { step: 'host.ready' })
@@ -641,6 +812,36 @@ export class DouyinDockerService {
         if (event.event === 'completed') this.writeWorkerLog(sessionId, { step: 'host.completed' })
         if (event.event === 'authenticated')
           this.writeWorkerLog(sessionId, { step: 'host.authenticated' })
+        if (event.event === 'not_dispatched')
+          this.writeWorkerLog(sessionId, { step: 'host.not_dispatched', code: event.code })
+        if (event.event === 'prepared') {
+          // 顺序已由 assertDouyinWorkerEventOrder 检查;master 先落定派发围栏再放行。
+          if (prepared || !args.beforeDispatch || !stream)
+            throw new DouyinRuntimeError('PROTOCOL', 'worker dispatch fence is invalid')
+          prepared = true
+          this.writeWorkerLog(sessionId, { step: 'host.prepared' })
+          dispatchPromise = args
+            .beforeDispatch()
+            .then(() => {
+              this.writeWorkerLog(sessionId, { step: 'host.dispatch' })
+              return new Promise<void>((resolveWrite, reject) => {
+                stream!.write(frame({ event: 'dispatch' }), (error) =>
+                  error ? reject(error) : resolveWrite(),
+                )
+              })
+            })
+            .catch((error) => {
+              dispatchFailure = error
+              this.writeWorkerLog(sessionId, {
+                step: 'host.dispatch_failed',
+                code:
+                  typeof (error as { code?: unknown })?.code === 'string'
+                    ? String((error as { code: string }).code)
+                    : 'INTERNAL',
+              })
+              void current.kill().catch(() => {})
+            })
+        }
       })
       const stdout = new Writable({
         write(chunk: Buffer, _encoding, callback) {
@@ -697,6 +898,7 @@ export class DouyinDockerService {
           ]).finally(() => {
             if (timer) clearTimeout(timer)
           })
+          if (dispatchPromise) await dispatchPromise
           await Promise.race([
             streamEnded,
             new Promise<never>((_resolve, reject) => {
@@ -716,6 +918,7 @@ export class DouyinDockerService {
           const terminal = events.at(-1)
           if (status !== 0 || !terminal || !TERMINAL_EVENTS.has(terminal.event))
             throw new DouyinRuntimeError('DOUYIN_WORKER_INCOMPLETE', 'worker did not finish')
+          if (dispatchFailure) throw dispatchFailure
           completed = events
         } catch (error) {
           failure = error
@@ -737,7 +940,23 @@ export class DouyinDockerService {
         if (!completed) throw failure
         return completed
       })()
-      const active = { container: current, broker, done, kind: args.kind }
+      const liveStream = stream!
+      const send = (value: DouyinLoginCommand): Promise<void> => {
+        if (args.kind !== 'login')
+          return Promise.reject(
+            new DouyinRuntimeError('PROTOCOL', 'only login workers take commands'),
+          )
+        const bytes = frame(value)
+        return new Promise<void>((resolveWrite, rejectWrite) => {
+          liveStream.write(bytes, (error) => {
+            bytes.fill(0)
+            if (error)
+              rejectWrite(new DouyinRuntimeError('PROTOCOL', 'worker command write failed'))
+            else resolveWrite()
+          })
+        })
+      }
+      const active = { container: current, broker, done, kind: args.kind, send }
       if (args.signal?.aborted) throw args.signal.reason
       this.active.set(args.key, active)
       return active
@@ -765,6 +984,8 @@ export class DouyinDockerService {
     params: Record<string, unknown>
     deadlineMs: number
     signal?: AbortSignal
+    beforeDispatch?: () => Promise<void>
+    inputDirectory?: string
   }): Promise<{ result: unknown; storageState: unknown }> {
     const worker = await this.startWorker({
       key: args.profileDir,
@@ -772,6 +993,8 @@ export class DouyinDockerService {
       pins: args.pins,
       deadlineMs: args.deadlineMs,
       ...(args.signal ? { signal: args.signal } : {}),
+      ...(args.beforeDispatch ? { beforeDispatch: args.beforeDispatch } : {}),
+      ...(args.inputDirectory ? { inputDirectory: args.inputDirectory } : {}),
       input: {
         mode: 'action',
         actionId: args.actionId,
@@ -784,6 +1007,8 @@ export class DouyinDockerService {
     const terminal = (await worker.done).at(-1)!
     if (terminal.event === 'failed')
       throw new DouyinRuntimeError(mapDouyinWorkerProtocolFailure(terminal.code))
+    if (terminal.event === 'not_dispatched')
+      throw new DouyinRuntimeError('PRECONDITION_CHANGED', 'Douyin target changed before dispatch')
     if (terminal.event !== 'completed')
       throw new DouyinRuntimeError('PROTOCOL', 'action worker terminal event is invalid')
     return { result: terminal.result, storageState: terminal.storageState }
@@ -793,9 +1018,14 @@ export class DouyinDockerService {
     sessionId: string
     pins: readonly ManagedBrowserPinnedOrigin[]
     deadlineMs: number
-    onQr: (png: Buffer) => void
+    onQr: (png: Buffer, expireAt: number) => void
+    onQrInvalid?: () => void
     onAuthenticated: (storageState: unknown) => void
     onFailed: (code: string) => void
+    onVerification?: (kind: 'sms_available' | 'unsupported') => void
+    onSmsSent?: (resendAfterSec: number) => void
+    onSmsRejected?: () => void
+    onSmsResendFailed?: () => void
   }): Promise<DouyinLoginWorkerHandle> {
     const worker = await this.startWorker({
       key: `login:${args.sessionId}`,
@@ -809,15 +1039,21 @@ export class DouyinDockerService {
         stateOrigins: DOUYIN_PLUGIN_CONTRACT.runtime.accountState.origins,
       },
       onEvent: (event) => {
-        if (event.event === 'qr') args.onQr(event.png)
+        if (event.event === 'qr') args.onQr(event.png, event.expireAt)
+        else if (event.event === 'qr_invalid') args.onQrInvalid?.()
         else if (event.event === 'authenticated') args.onAuthenticated(event.storageState)
         else if (event.event === 'failed') args.onFailed(event.code)
+        else if (event.event === 'verification') args.onVerification?.(event.kind)
+        else if (event.event === 'sms_sent') args.onSmsSent?.(event.resendAfterSec)
+        else if (event.event === 'sms_rejected') args.onSmsRejected?.()
+        else if (event.event === 'sms_resend_failed') args.onSmsResendFailed?.()
       },
     })
     return {
       sessionId: args.sessionId,
       done: worker.done.then(() => undefined),
       stop: () => this.terminate(`login:${args.sessionId}`),
+      command: (value) => worker.send(value),
     }
   }
 
@@ -865,6 +1101,7 @@ class DouyinManagedSession implements ManagedBrowserSession {
     actionId: string,
     params: Record<string, unknown>,
     signal: AbortSignal,
+    beforeDispatch?: () => Promise<void>,
   ): Promise<unknown> {
     if (this.executing || this.completed)
       throw new ManagedBrowserRuntimeError('EXECUTION_FAILED', 'browser session is single use')
@@ -880,8 +1117,10 @@ class DouyinManagedSession implements ManagedBrowserSession {
         storageState: this.args.storageState,
         actionId,
         params,
-        deadlineMs: Date.now() + ACTION_SESSION_MS,
+        deadlineMs: Date.now() + (beforeDispatch ? WRITE_SESSION_MS : ACTION_SESSION_MS),
         signal,
+        ...(beforeDispatch ? { beforeDispatch } : {}),
+        ...(this.args.inputDirectory ? { inputDirectory: this.args.inputDirectory } : {}),
       })
       return this.completed.result
     } finally {
@@ -923,10 +1162,7 @@ export function createDouyinRuntimeRegistries(service: DouyinDockerService): {
     async execute(args) {
       if (!(args.session instanceof DouyinManagedSession))
         throw new ManagedBrowserRuntimeError('EXECUTION_FAILED', 'driver session is invalid')
-      // 只读插件没有派发围栏:任何 beforeDispatch(写流程)到这里都是编程错误。
-      if (args.beforeDispatch)
-        throw new ManagedBrowserRuntimeError('EXECUTION_FAILED', 'read-only driver has no dispatch')
-      return args.session.execute(args.actionId, args.params, args.signal)
+      return args.session.execute(args.actionId, args.params, args.signal, args.beforeDispatch)
     },
   }
   return {

@@ -147,15 +147,23 @@ function unknownWritePrefix(code: string): string {
   }
 }
 
+/** 抖音写结果不明时的核对方式（只有自己的作品和评论可读）。 */
+export const DOUYIN_UNKNOWN_WRITE_NEXT_ACTION =
+  '先 my_videos 或 video_comments 核对是否已发出，确认未发出才可新开确认卡重发'
+
 function applyUnknownWriteOverride(
   code: string,
   guidance: PluginErrorGuidance,
+  provider?: string | null,
 ): PluginErrorGuidance {
   if (code === 'PRECONDITION_CHANGED') return guidance
   const prefix = unknownWritePrefix(code)
-  const next = code.startsWith('ZHIHU_')
-    ? '先 get_self 或 list_my_answers 核对是否已发出，确认未发出才可新开确认卡重发'
-    : UNKNOWN_WRITE_NEXT_ACTION
+  const next =
+    code.startsWith('DOUYIN_') || provider === 'douyin'
+      ? DOUYIN_UNKNOWN_WRITE_NEXT_ACTION
+      : code.startsWith('ZHIHU_')
+        ? '先 get_self 或 list_my_answers 核对是否已发出，确认未发出才可新开确认卡重发'
+        : UNKNOWN_WRITE_NEXT_ACTION
   return {
     ...guidance,
     retrySafe: 'check_first',
@@ -413,11 +421,11 @@ const ROWS: Record<string, Row> = {
     message: 'B 站账号插件未正常结束',
     nextAction: '只读操作,可稍后重试',
   },
-  // OCV5-553 · 抖音插件(本版只读:扫码登录 + me)。
+  // OCV5-553 · 抖音插件(扫码登录、读自己的作品和评论;1.1.0 起有写动作)。
   DOUYIN_ACTION_FAILED: {
     retrySafe: 'yes',
     requiresReauth: false,
-    message: '抖音插件读取失败',
+    message: '抖音插件执行失败',
     nextAction: '可以再试一次;仍失败时引导用户到 管理中心 → 插件 → 抖音 重新扫码登录',
   },
   DOUYIN_UPSTREAM_CHALLENGE: {
@@ -446,17 +454,69 @@ const ROWS: Record<string, Row> = {
     message: '抖音插件正忙',
     nextAction: '请稍后重试',
   },
+  // OCV5-553 设计 4.4 · 抖音写操作的节奏、冷却与未接入的上游写接口。都在派发之前拒绝,确定未发出。
+  DOUYIN_PACING_WAIT: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: '为降低风控,同一抖音账号的写操作需要间隔,本次未执行',
+    nextAction:
+      '本次未发送。发布间隔约 10 分钟、评论或回复约 1 分钟、点赞约 20 秒;请告诉用户稍后再发起新的确认卡,不要 sleep 后循环重试',
+  },
+  DOUYIN_WRITE_COOLDOWN: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '该抖音账号最近触发了风控,写操作已暂停 24 小时,本次未执行',
+    nextAction: '本次未发送。如实告诉用户账号处于风控冷却期,24 小时后再试;不要换动作或换账号绕过',
+  },
+  DOUYIN_WRITE_UNVERIFIED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '抖音写操作尚未完成实测接入,本次未执行',
+    nextAction: '本次未发送。请告诉用户抖音的发布、评论和点赞暂不可用,不要重试或换动作绕过',
+  },
+  DOUYIN_MEDIA_INVALID: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '媒体文件不符合抖音发布要求,本次未执行',
+    nextAction:
+      '本次未发送。视频需为 uploads/ 或 generated/ 下 ≤50MB 的 mp4,图文需为 1-20 张 jpg/png/webp;调整后重新发起',
+  },
   DOUYIN_WORKER_DEADLINE: {
     retrySafe: 'yes',
     requiresReauth: false,
     message: '抖音插件执行超时',
-    nextAction: '只读操作,可稍后重试',
+    nextAction: '可稍后重试;写操作若提示结果不明,先按提示核对是否已发出',
+  },
+  // OCV5-553 4.3.C · 抖音扫码后的本人短信验证（只出现在管理中心的扫码弹层里）。
+  SMS_INVALID: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '验证码格式不对',
+    nextAction: '请输入短信里的数字验证码',
+  },
+  SMS_NOT_EXPECTED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '当前不在等待短信验证码的步骤',
+    nextAction: '请按扫码弹层的提示操作；若已过期请重新扫码',
+  },
+  SMS_ATTEMPTS_EXCEEDED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '验证码已输错多次，本次扫码已结束',
+    nextAction: '请稍后重新扫码',
+  },
+  SMS_RATE_LIMITED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '短信发送过于频繁，已暂停发送以保护账号',
+    nextAction: '请稍后再试（同一账号 1 分钟 1 条、1 小时 3 条、1 天 5 条）',
   },
   DOUYIN_WORKER_INCOMPLETE: {
     retrySafe: 'yes',
     requiresReauth: false,
     message: '抖音插件未正常结束',
-    nextAction: '只读操作,可稍后重试',
+    nextAction: '可稍后重试;写操作若提示结果不明,先按提示核对是否已发出',
   },
   PLUGIN_RUNTIME_UNAVAILABLE: {
     retrySafe: 'yes',
@@ -775,7 +835,7 @@ export function resolvePluginErrorGuidance(input: PluginErrorGuidanceInput): Plu
     nextAction,
     message: row.message,
   }
-  if (isUnknownWrite(input.status)) return applyUnknownWriteOverride(code, base)
+  if (isUnknownWrite(input.status)) return applyUnknownWriteOverride(code, base, input.provider)
   return base
 }
 

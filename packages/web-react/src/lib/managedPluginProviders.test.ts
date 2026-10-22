@@ -10,11 +10,16 @@ vi.mock('./api', () => {
     }
   return {
     api: Object.fromEntries(
-      ['Weibo', 'Zhihu', 'KnowledgePlanet', 'Douyin'].flatMap((p) =>
-        ['start', 'get', 'cancel'].map((op) => [`${op}${p}Setup`, rec(`${op}${p}Setup`)]).concat([
-          [`get${p}SetupQr`, rec(`get${p}SetupQr`)],
+      ['Weibo', 'Zhihu', 'KnowledgePlanet', 'Douyin']
+        .flatMap((p) =>
+          ['start', 'get', 'cancel'].map((op) => [`${op}${p}Setup`, rec(`${op}${p}Setup`)]).concat([
+            [`get${p}SetupQr`, rec(`get${p}SetupQr`)],
+          ]),
+        )
+        .concat([
+          ['submitDouyinSms', rec('submitDouyinSms')],
+          ['resendDouyinSms', rec('resendDouyinSms')],
         ]),
-      ),
     ),
   }
 })
@@ -90,7 +95,7 @@ test('抖音（OCV5-553）：路由到抖音接口、可原地重新扫码、带
   ])
   // setup 的 errorCode 是 worker 原始码。
   expect(managedSetupFailureText(douyin, { status: 'failed', errorCode: 'VERIFICATION_REQUIRED' })).toMatch(
-    /^抖音要求账号本人完成身份验证/,
+    /^抖音要求的本人验证没有完成/,
   )
   expect(managedSetupFailureText(douyin, { status: 'failed', errorCode: 'LOGIN_STATE_UNSUPPORTED' })).toMatch(
     /不要反复扫码/,
@@ -105,4 +110,21 @@ test('抖音（OCV5-553）：路由到抖音接口、可原地重新扫码、带
   // 其它插件没有专属说明与风险提示，行为不变。
   expect(managedPluginProvider('weibo').codeTexts).toBeUndefined()
   expect(managedPluginProvider('weibo').setupNotice).toBeUndefined()
+})
+
+test('抖音本人短信验证（OCV5-553 4.3.C）：提交 / 重发路由到抖音接口；新失败码有专属说明；其它插件没有短信环节', async () => {
+  const douyin = managedPluginProvider('douyin')
+  expect(douyin.sms).toBeDefined()
+  await douyin.sms!.submit(auth, 's', '123456')
+  await douyin.sms!.resend(auth, 's')
+  expect(calls).toEqual([
+    ['submitDouyinSms', auth, 's', '123456'],
+    ['resendDouyinSms', auth, 's'],
+  ])
+  for (const code of ['SMS_RATE_LIMITED', 'SMS_ATTEMPTS_EXCEEDED', 'SMS_EXPIRED', 'SMS_UNAVAILABLE', 'VERIFICATION_UNSUPPORTED'])
+    expect(managedSetupFailureText(douyin, { status: 'failed', errorCode: code })).not.toBe('本次授权未完成，请重试。')
+  expect(managedSetupFailureText(douyin, { status: 'failed', errorCode: 'SMS_EXPIRED' })).toMatch(/3 分钟/)
+  expect(douyin.setupNotice).toMatch(/短信验证/)
+  expect(managedPluginProvider('weibo').sms).toBeUndefined()
+  expect(managedPluginProvider('bili-account').sms).toBeUndefined()
 })

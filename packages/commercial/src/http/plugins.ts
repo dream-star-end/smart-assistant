@@ -60,6 +60,8 @@ const SETUP_PROVIDER_ALT = MANAGED_SETUP_PROVIDERS.join('|')
 const SETUP_SESSION_RE = new RegExp(
   `^\\/api\\/plugins\\/(${SETUP_PROVIDER_ALT})\\/setup\\/([0-9a-f-]{36})(\\/qr)?$`,
 )
+/** 抖音扫码后的本人短信验证（OCV5-553 4.3.C）：提交验证码 / 重发。 */
+const DOUYIN_SMS_RE = /^\/api\/plugins\/douyin\/setup\/([0-9a-f-]{36})\/sms(\/resend)?$/
 const SETUP_ROOT_RE = new RegExp(`^\\/api\\/plugins\\/(${SETUP_PROVIDER_ALT})\\/setup$`)
 type ManagedSetupManager =
   | KnowledgePlanetSetupManager
@@ -200,6 +202,13 @@ function mapSetupError(error: unknown): never {
         'Plugin runtime unavailable',
         error.message,
       )
+    case 'SMS_INVALID':
+      throw pluginHttpError(400, error.code, 'verification code format is invalid', undefined, provider)
+    case 'SMS_NOT_EXPECTED':
+    case 'SMS_ATTEMPTS_EXCEEDED':
+      throw pluginHttpError(409, error.code, 'Plugin setup is not waiting for this step', undefined, provider)
+    case 'SMS_RATE_LIMITED':
+      throw pluginHttpError(429, error.code, 'verification SMS rate limited', undefined, provider)
     default:
       throw pluginHttpError(500, 'PLUGIN_SETUP_FAILED', 'Plugin setup failed', error.message)
   }
@@ -697,6 +706,34 @@ export async function dispatchPluginsRoute(
       return
     } catch (error) {
       mapAutomationError(error)
+    }
+  }
+
+  // 验证码只在这个请求里经过：直接交给登录 worker，不保存、不回显、不进日志（错误信息里也不带）。
+  const sms = DOUYIN_SMS_RE.exec(path)
+  if (sms && method === 'POST') {
+    const resend = sms[2] === '/resend'
+    const raw = (await readJsonBody(req, 256)) ?? {}
+    if (
+      raw === null ||
+      typeof raw !== 'object' ||
+      Array.isArray(raw) ||
+      !exactBodyKeys(raw as Record<string, unknown>, resend ? [] : ['code']) ||
+      (!resend && typeof (raw as Record<string, unknown>).code !== 'string')
+    )
+      throw new HttpError(400, 'BAD_REQUEST', 'Plugin setup body is invalid')
+    try {
+      const manager = setupManager(deps, 'douyin')
+      sendJson(
+        res,
+        200,
+        resend
+          ? await manager.resendSms(userId, sms[1]!)
+          : await manager.submitSms(userId, sms[1]!, (raw as Record<string, unknown>).code),
+      )
+      return
+    } catch (error) {
+      mapSetupError(error)
     }
   }
 

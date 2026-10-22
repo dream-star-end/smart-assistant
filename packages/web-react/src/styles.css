@@ -2312,6 +2312,24 @@ figure.oc-iui, .oc-iui { margin: 12px 0 20px; font-size: 14.5px; line-height: 1.
   .oc-bili-cover { width: 112px; }
   .oc-bili-row { padding: 10px 12px; gap: 8px; }
 }
+/* OCV5-553 · 抖音插件组件（DouyinBlocks.tsx）。封面是竖图；强调色只用在链接与标签上。 */
+.oc-plg.is-douyin { --plg-accent: #e0245e; }
+.dark .oc-plg.is-douyin { --plg-accent: #ff7a9c; }
+.oc-dy-list { list-style: none; margin: 0; padding: 4px 0 6px; }
+.oc-dy-row { display: flex; align-items: flex-start; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--iui-line); }
+.oc-dy-row:last-child { border-bottom: 0; }
+.oc-dy-cover { position: relative; flex-shrink: 0; width: 72px; aspect-ratio: 3 / 4; border-radius: 8px; overflow: hidden; background: var(--iui-sunken); }
+.oc-dy-cover .oc-iui-media { display: block; width: 100%; height: 100%; }
+.oc-dy-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.oc-dy-duration { position: absolute; right: 4px; bottom: 4px; padding: 0 4px; border-radius: 4px; font-size: 11px; line-height: 17px; color: #fff; background: rgb(0 0 0 / 0.62); }
+.oc-dy-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.oc-dy-title { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; font-size: 14px; line-height: 1.5; font-weight: 600; color: var(--fg); overflow-wrap: anywhere; }
+.oc-dy-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+.oc-dy-when { display: inline; }
+@media (max-width: 480px) {
+  .oc-dy-cover { width: 64px; }
+  .oc-dy-row { padding: 10px 12px; gap: 8px; }
+}
 
 .oc-mkt-chart { padding: 2px 12px 12px; }
 .oc-mkt-readout { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; min-height: 22px; margin-bottom: 4px; font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
