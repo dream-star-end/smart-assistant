@@ -310,6 +310,14 @@ describe('fallback 常量 === bundle 文件(逐字同步门)', () => {
       ),
     )
   })
+  it('视频优先 oc-muse,不可用时如实告知,且不在任何引擎专属块里(OCV5-572)', () => {
+    const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
+    const media = prompt.slice(prompt.indexOf('## 多媒体与文件'), prompt.indexOf('<!-- oc-channel:wechat:start -->'))
+    assert.ok(media.includes('优先用 Bash `oc-muse video'))
+    assert.ok(media.includes('MUSE_NOT_ENABLED'))
+    assert.ok(media.includes('如实告诉用户 Muse 视频当前不可用'))
+    assert.ok(media.includes('不要声称已生成'))
+  })
   it('普通模式子 Agent 文案使用平台真实委派通道', () => {
     const prompt = _platformPromptFallbacks.PLATFORM_CAPABILITIES_FALLBACK
     for (const tool of ['delegate_task', 'delegate_tasks', 'send_to_agent']) {

@@ -133,6 +133,7 @@ describe('ccb-baseline skills ↔ manifest', () => {
   it('routes ordinary video requests to durable H3 instead of the MiniMax Token Plan', () => {
     const body = readFileSync(join(skillsDir, 'minimax-media', 'SKILL.md'), 'utf8')
     assert.match(body, /For ordinary video requests, use `oc-h3`/)
+    assert.ok(body.indexOf('try `oc-muse video`') < body.indexOf('use `oc-h3`'), 'Muse comes before H3 (OCV5-572)')
     assert.match(body, /oc-h3 generate/)
     assert.match(body, /one 5, 10, or 15 second shot/)
     assert.match(body, /oc-video create/)

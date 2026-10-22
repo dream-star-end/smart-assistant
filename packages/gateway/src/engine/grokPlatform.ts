@@ -61,6 +61,9 @@ auto_update = false
 [features]
 telemetry = false
 feedback = false
+# image_to_video / reference_to_video POST /videos/generations, which the
+# master Grok relay does not allow (405). Video goes through oc-muse instead.
+video_gen = false
 
 [shell_environment_policy]
 inherit = "all"
