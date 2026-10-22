@@ -331,6 +331,33 @@ describe("HtmlPreview 文件桥", () => {
     expect(resolve).not.toHaveBeenCalled();
   });
 
+  // OCV5-573:宿主只回 ready 之后的文件请求;引导脚本曾先 wire() 后报 ready,静态 data-oc-src 的请求被丢,图片永远空白。
+  it("引导脚本先报 ready 再发文件请求", () => {
+    const src = "/home/agent/.openclaude/generated/a.gif";
+    const out = wrapEmbedHtml(`<img data-oc-src="${src}">`, { token: "t", dark: false, vars: {} });
+    const script = /<script>([\s\S]*?)<\/script>/.exec(out)?.[1];
+    if (!script) throw new Error("no bootstrap");
+    const img = document.createElement("img");
+    img.setAttribute("data-oc-src", src);
+    document.body.appendChild(img);
+    const sent: string[] = [];
+    const fakeParent = { postMessage: (m: { type: string }) => sent.push(m.type) };
+    try {
+      // 观察器和窗口监听换成空的,不让引导脚本留在测试页面上。
+      new Function("parent", "MutationObserver", "ResizeObserver", "addEventListener", script)(
+        fakeParent,
+        undefined,
+        undefined,
+        () => {},
+      );
+    } finally {
+      img.remove();
+    }
+    expect(sent).toContain("file");
+    expect(sent.indexOf("ready")).toBeGreaterThanOrEqual(0);
+    expect(sent.indexOf("ready")).toBeLessThan(sent.indexOf("file"));
+  });
+
   it("代码里没用到文件桥的嵌入,文件请求一概不理", async () => {
     const { container } = render(<HtmlPreview code={PAGE} />);
     const f = frame(container);
