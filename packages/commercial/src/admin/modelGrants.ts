@@ -43,8 +43,8 @@
 import type { PoolClient } from 'pg'
 import { query, tx } from '../db/queries.js'
 import { writeAdminAudit } from './audit.js'
-import { isBoxGptWebModel, isBoxGptWebOwnerUid } from '@openclaude/protocol'
-import { isCursorCredentialMember } from '../cursor/access.js'
+import { isBoxGptWebModel } from '@openclaude/protocol'
+import { isBoxGptWebAllowedUser, isCursorCredentialMember } from '../cursor/access.js'
 
 /**
  * grant 写提交后收敛本进程 catalog 快照(epoch 已被 0144 的 trigger bump)。
@@ -182,7 +182,7 @@ export async function addGrant(
       [mid],
     )
     if (modelR.rows.length === 0) throw new GrantModelNotFoundError(mid)
-    if (isBoxGptWebModel(mid) && !isBoxGptWebOwnerUid(uid)) {
+    if (isBoxGptWebModel(mid) && !isBoxGptWebAllowedUser(uid)) {
       throw new GrantInvalidInputError('box_gpt_web_owner_only')
     }
     if (modelR.rows[0]?.engine === 'cursor' && !isCursorCredentialMember(uid)) {

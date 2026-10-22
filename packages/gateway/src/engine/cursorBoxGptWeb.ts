@@ -45,7 +45,15 @@ export const BOX_GPT_WEB_BUSY_MESSAGE =
 
 let activeBoxGptWebTurnOwner: string | null = null
 
+/**
+ * The master writes OC_BOX_GPT_WEB_ALLOWED=1|0 into every container from its allowlist
+ * (OC_BOX_GPT_WEB_ALLOWED_UIDS, OCV5-575); that flag is authoritative. A container created by an older
+ * master has no flag and keeps the original owner rule (uid 3); the master and the egress still check
+ * the uid themselves before any turn or Box exec endpoint is handed out.
+ */
 export function isBoxGptWebAllowedContainerUser(env: NodeJS.ProcessEnv = {}): boolean {
+  const flag = env.OC_BOX_GPT_WEB_ALLOWED
+  if (flag !== undefined) return flag === '1'
   const raw = env.OC_USER_ID?.trim()
   if (!raw) {
     return !env.OC_CONTAINER_ID

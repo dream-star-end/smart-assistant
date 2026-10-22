@@ -34,12 +34,13 @@ async function call(handler: ReturnType<typeof makeBoxLoginHandler>, path: strin
 }
 
 /** The egress assembly: the real handler behind the gate, an exec lookup that uses the real entitlement. */
-function egressRoute(env: NodeJS.ProcessEnv) {
+function egressRoute(env: NodeJS.ProcessEnv, uid = 3n) {
   let builds = 0;
   const lookups: bigint[] = [];
+  const identity = uid === 3n ? container : ({ resolve: async () => ({ uid, containerId: 7n }) } as never);
   const route = boxInteractiveMasterRoute(env, () => {
     builds++;
-    return makeBoxLoginHandler({ identity: container,
+    return makeBoxLoginHandler({ identity,
       logins: { choose: async () => ({ kind: "login", profile: "default", reason: "affinity", alternatives: 0 }),
         observe: () => true } as never,
       execTargets: async (uid) => {
@@ -107,4 +108,43 @@ test("OCV5-380 boxExecTargetEntitlement: wildcard refused, explicit list and own
   assert.equal(boxExecTargetEntitlement(9, { OC_V5_CURSOR_CREDENTIAL_UIDS: " ", OC_V5_CURSOR_OWNER_UID: "9" }), "entitled");
   assert.equal(boxExecTargetEntitlement(3, {}), "not_entitled");
   assert.equal(boxExecTargetEntitlement(3, { OC_V5_CURSOR_CREDENTIAL_UIDS: "3,evil" }), "not_entitled");
+});
+
+// OCV5-575 (user decision 2026-10-22, option B): commercial hands the Box exec endpoint to the containers
+// of uid 1 and uid 4 only, while it keeps mounting Cursor for everyone (OC_V5_CURSOR_CREDENTIAL_UIDS=all).
+const COMMERCIAL_GPT_PRO = { OC_BOX_INTERACTIVE_MASTER: "1", OC_V5_CURSOR_CREDENTIAL_UIDS: "all",
+  OC_V5_CURSOR_OWNER_UID: "4", OC_BOX_EXEC_TARGET_UIDS: "1,4" };
+
+test("OCV5-575 the Box exec endpoint goes only to the uids in OC_BOX_EXEC_TARGET_UIDS", async () => {
+  for (const uid of [1n, 4n]) {
+    const egress = egressRoute(COMMERCIAL_GPT_PRO, uid);
+    const ok = await call(egress.route, BOX_EXEC_TARGET_PATH, {});
+    assert.equal(ok.status, 200, `uid ${uid}`);
+    assert.equal(JSON.parse(ok.text).exec_token, "T0K");
+    assert.deepEqual(egress.lookups, [uid]);
+  }
+  for (const uid of [2n, 3n, 35n, 247n, 267n, 765n]) {
+    const egress = egressRoute(COMMERCIAL_GPT_PRO, uid);
+    const out = await call(egress.route, BOX_EXEC_TARGET_PATH, {});
+    assert.deepEqual([out.status, JSON.parse(out.text)], [403, { error: "BOX_EXEC_NOT_ENTITLED" }], `uid ${uid}`);
+    assert.ok(!out.text.includes("T0K") && !out.text.includes("N3T") && !out.text.includes("cursorvm"),
+      `nothing of the Box leaks to uid ${uid}`);
+    assert.deepEqual(egress.lookups, [], `the Box is never resolved for uid ${uid}`);
+  }
+});
+
+test("OCV5-575 OC_BOX_EXEC_TARGET_UIDS: wildcard refused, empty or malformed allows nobody, unset keeps the mount rule", () => {
+  const base = { OC_V5_CURSOR_CREDENTIAL_UIDS: "all" };
+  assert.equal(boxExecTargetEntitlement(1, { ...base, OC_BOX_EXEC_TARGET_UIDS: "1,4" }), "entitled");
+  assert.equal(boxExecTargetEntitlement(4, { ...base, OC_BOX_EXEC_TARGET_UIDS: "1,4" }), "entitled");
+  assert.equal(boxExecTargetEntitlement(3, { ...base, OC_BOX_EXEC_TARGET_UIDS: "1,4" }), "not_entitled");
+  for (const raw of ["all", "*", " all "]) {
+    assert.equal(boxExecTargetEntitlement(1, { ...base, OC_BOX_EXEC_TARGET_UIDS: raw }), "wildcard_refused", raw);
+  }
+  for (const raw of ["", " ", "1,evil", "1;4", "01", "1, 4", "-1"]) {
+    assert.equal(boxExecTargetEntitlement(1, { ...base, OC_BOX_EXEC_TARGET_UIDS: raw }), "not_entitled", JSON.stringify(raw));
+  }
+  // Unset: selfhost keeps the credential-mount rule (and commercial's `all` stays refused).
+  assert.equal(boxExecTargetEntitlement(3, { OC_V5_CURSOR_CREDENTIAL_UIDS: "3" }), "entitled");
+  assert.equal(boxExecTargetEntitlement(1, base), "wildcard_refused");
 });
