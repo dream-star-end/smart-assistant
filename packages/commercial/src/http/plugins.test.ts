@@ -784,6 +784,50 @@ describe('Plugin management HTTP dispatcher', () => {
       (e: unknown) => e instanceof HttpError && e.status === 429,
     )
   })
+
+  test('literature PDF artifact meta tells the owner when the saved file expires (OCV5-585)', async () => {
+    const validId = 'litpdf-1234567890abcdef1234567890abcdef'
+    const expiresAt = Date.parse('2026-10-23T01:30:00Z')
+    const reads: string[] = []
+    const store = {
+      read: (_uid: number, id: string) => {
+        reads.push(id)
+        return null
+      },
+      describe: (uid: number, id: string) =>
+        uid === 42 && id === validId
+          ? { filename: '深度学习研究_2026.pdf', bytes: 2048, expiresAt, saved: false }
+          : null,
+    }
+    const res = response()
+    await dispatchPluginsRoute(
+      await request('GET', `/api/plugins/literature-db/artifacts/${validId}/meta`),
+      res,
+      {} as any,
+      deps({ literatureArtifacts: store }),
+    )
+    assert.equal(res.statusCode, 200)
+    assert.match(res.headers.get('cache-control') ?? '', /no-store/)
+    assert.deepEqual(JSON.parse(res.bytes.toString('utf8')), {
+      expiresAt: '2026-10-23T01:30:00.000Z',
+      bytes: 2048,
+      saved: false,
+    })
+    assert.deepEqual(reads, [], 'meta never reads (and never marks the file saved)')
+    await assert.rejects(
+      dispatchPluginsRoute(
+        await request(
+          'GET',
+          '/api/plugins/literature-db/artifacts/litpdf-ffffffffffffffffffffffffffffffff/meta',
+        ),
+        response(),
+        {} as any,
+        deps({ literatureArtifacts: store }),
+      ),
+      (e: unknown) =>
+        e instanceof HttpError && e.status === 404 && e.code === 'LITERATURE_ARTIFACT_EXPIRED',
+    )
+  })
 })
 
 describe('private literature setup routes', () => {

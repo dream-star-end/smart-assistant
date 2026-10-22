@@ -22,6 +22,12 @@ export type LiteratureErrorCode =
   | 'CLEANUP_FAILED'
   | 'SESSION_EXPIRED'
   | 'DOCUMENT_EXPIRED'
+  // Agent-facing codes (OCV5-585): the RPC layer passes these through verbatim.
+  | 'LITERATURE_ARTIFACT_CAPACITY'
+  | 'LITERATURE_NO_ACCESS'
+  | 'LITERATURE_UPSTREAM_RATE_LIMITED'
+  | 'LITERATURE_UPSTREAM_CHALLENGE'
+  | 'LITERATURE_UPSTREAM_CHANGED'
 export class LiteratureError extends Error {
   constructor(readonly code: LiteratureErrorCode) {
     super(code)
