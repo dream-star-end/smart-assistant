@@ -252,10 +252,7 @@ import {
   startMarketplaceAiReviewScheduler,
   type MarketplaceAiReviewSchedulerHandle,
 } from "./marketplace/aiReview.js";
-import {
-  startTutorialModerationScheduler,
-  type TutorialModerationScheduler,
-} from "./tutorials/tutorialModeration.js";
+import { startTutorialModerationScheduler } from "./tutorials/tutorialModeration.js";
 import {
   startProviderHealthScheduler,
   type ProviderHealthSchedulerHandle,
@@ -6891,20 +6888,7 @@ export async function registerCommercial(
     });
   }
 
-  // 经验分享 AI 审核 worker(OCV5-577 PR-B)。仅 v5 启动;OC_TUTORIAL_AI_MODERATION=off(缺省)
-  // 时 tick 只把残留的排队作业转人工,不调用任何模型。正文走平台 flash(与市场 AI 审批同一 key),
-  // 图片走平台 Grok 订阅账号;都不经用户计费。domain 'v5-owned'。
-  let tutorialModerationScheduler: TutorialModerationScheduler | undefined;
-  if (runtimeChannel === "v5") {
-    tutorialModerationScheduler = trackScheduler("tutorialModeration", "v5-owned", startTutorialModerationScheduler({
-      apiKey: cfg.OPENCODE_GO_API_KEY,
-      logger: {
-        info: (m) => rootLogger.info(m, { subsys: "commercial", module: "tutorialModeration" }),
-        warn: (m) => rootLogger.warn(m, { subsys: "commercial", module: "tutorialModeration" }),
-      },
-    }));
-  }
-
+  if (runtimeChannel === "v5") trackScheduler("tutorialModeration", "v5-owned", startTutorialModerationScheduler({ apiKey: cfg.OPENCODE_GO_API_KEY, logger: rootLogger })); // OCV5-577 经验分享 AI 审核;off 缺省只把残留作业转人工;停机中断的作业由 lease 过期重领
   // 市场发布 AI 自动审批 worker(deepseek-v4-flash via OpenCode Go)。仅 v5 启动:marketplace 表 v3/v5 共享
   // 无 channel 列,但 v3 跑旧代码不写 ai_review_state → 恒 NULL → 永不被 claim,故 v3 保持
   // 纯人审、零行为变更。domain 'v5-owned'(v5 合法后台职责;写共享 marketplace 表但由
@@ -7302,9 +7286,6 @@ export async function registerCommercial(
       }
       if (marketplaceAiReviewScheduler) {
         try { marketplaceAiReviewScheduler.stop(); } catch { /* ignore */ }
-      }
-      if (tutorialModerationScheduler) {
-        try { tutorialModerationScheduler.stop(); } catch { /* ignore */ }
       }
       if (providerHealthScheduler) {
         try { providerHealthScheduler.stop(); } catch { /* ignore */ }
