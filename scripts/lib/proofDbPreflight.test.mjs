@@ -1,0 +1,70 @@
+// OCV5-581: proofDbPreflight decisions on frozen catalog facts. Each failing fact set is one
+// observed or minimal fault; the healthy set is what v5-dev's proof server reports today.
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { test } from "node:test";
+import { evaluate, vetDsn } from "./proofDbPreflight.mjs";
+
+const healthy = {
+  user: "test", database: "openclaude_test", serverVersion: "16.15",
+  superuser: true, createdb: false, dbCreate: true, publicUsage: true,
+  pgcryptoAvailable: true, pgcryptoTrusted: true, pgcryptoSchema: "public",
+  digestExists: true, digestExecute: true,
+};
+const statuses = (r) => r.map(([s]) => s);
+const failsWith = (r, re) => r.some(([s, m]) => s === "fail" && re.test(m));
+
+test("healthy shared and gate databases pass", () => {
+  assert.deepEqual(statuses(evaluate("shared-db", healthy)), ["ok"]);
+  assert.deepEqual(statuses(evaluate("gate-db", { ...healthy, pgcryptoSchema: null })), ["ok"]);
+});
+
+test("seq365 attempt 2: public.digest(bytea, unknown) missing is refused before the build", () => {
+  // pgcrypto absent from the shared database and the role cannot install it
+  assert.ok(failsWith(evaluate("shared-db", { ...healthy, superuser: false, pgcryptoSchema: null,
+    digestExists: false, digestExecute: false, pgcryptoTrusted: false }), /cannot install/));
+  // pgcrypto installed outside public: IF NOT EXISTS … WITH SCHEMA public is a no-op
+  assert.ok(failsWith(evaluate("shared-db", { ...healthy, pgcryptoSchema: "extensions",
+    digestExists: false, digestExecute: false }), /schema extensions, not public/));
+  assert.ok(failsWith(evaluate("shared-db", { ...healthy, digestExists: false, digestExecute: false }),
+    /public\.digest\(bytea, text\) is missing/));
+  assert.ok(failsWith(evaluate("shared-db", { ...healthy, digestExecute: false }), /lacks EXECUTE/));
+  assert.ok(failsWith(evaluate("shared-db", { ...healthy, publicUsage: false }), /lacks USAGE/));
+  assert.ok(failsWith(evaluate("shared-db", { ...healthy, dbCreate: false }), /lacks CREATE on database/));
+});
+
+test("absent but installable pgcrypto passes the shared database", () => {
+  const r = evaluate("shared-db", { ...healthy, superuser: false, pgcryptoSchema: null,
+    digestExists: false, digestExecute: false });
+  assert.deepEqual(statuses(r), ["ok"]);
+});
+
+test("gate database: CREATE DATABASE, contrib and trusted install are required", () => {
+  assert.ok(failsWith(evaluate("gate-db", { ...healthy, superuser: false, createdb: false }), /cannot CREATE DATABASE/));
+  assert.ok(failsWith(evaluate("gate-db", { ...healthy, pgcryptoAvailable: false }), /not available/));
+  assert.ok(failsWith(evaluate("gate-db", { ...healthy, superuser: false, createdb: true, pgcryptoTrusted: false }),
+    /not a trusted extension/));
+  assert.deepEqual(statuses(evaluate("gate-db", { ...healthy, superuser: false, createdb: true })), ["ok"]);
+});
+
+test("DSN vetting matches the gate database tool and never echoes the DSN", () => {
+  assert.match(vetDsn("").error, /missing/);
+  assert.match(vetDsn("postgres://u:secret@10.0.0.1/x_test").error, /not loopback/);
+  assert.match(vetDsn("postgres://u:secret@127.0.0.1/openclaude").error, /not a \*_test/);
+  const ok = vetDsn("postgres://u:secret@127.0.0.1:5433/openclaude_test");
+  assert.equal(ok.port, 5433);
+  assert.equal(ok.database, "openclaude_test");
+  for (const raw of ["postgres://u:secret@10.0.0.1/x_test", "postgres://u:secret@127.0.0.1/y"]) {
+    assert.ok(!JSON.stringify(vetDsn(raw)).includes("secret"));
+  }
+});
+
+test("the probe only reads: one read-only transaction around a single SELECT", () => {
+  const src = readFileSync(new URL("./proofDbPreflight.mjs", import.meta.url), "utf8");
+  const queries = [...src.matchAll(/client\.query\(([^)]*)\)/g)].map((m) => m[1].trim());
+  assert.deepEqual(queries, ['"BEGIN READ ONLY"', "FACTS_SQL", '"ROLLBACK"']);
+  const sql = /const FACTS_SQL = `([\s\S]*?)`;/.exec(src)[1];
+  assert.match(sql.trim(), /^SELECT /);
+  // privilege names such as 'CREATE' are string literals passed to has_*_privilege, not statements
+  assert.doesNotMatch(sql.replace(/'[^']*'/g, "''"), /\b(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|GRANT|REVOKE|TRUNCATE|COMMENT)\b/);
+});
