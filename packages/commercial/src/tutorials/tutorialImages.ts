@@ -114,6 +114,15 @@ export async function prepareTutorialImage(
   if (output.length > TUTORIAL_IMAGE_MAX_BYTES)
     throw new TutorialImageError('TOO_LARGE', '图片处理后仍超过 10MB')
   const { width, height } = await decodedSize(output)
+  // metadata() 只读头部；缩到 64px 会把整条像素流解一遍，压缩流损坏的图在这里拦下。
+  try {
+    await sharp(output, { failOn: 'error', limitInputPixels: TUTORIAL_IMAGE_MAX_PIXELS })
+      .resize(64, 64, { fit: 'inside' })
+      .raw()
+      .toBuffer()
+  } catch {
+    throw new TutorialImageError('BAD_IMAGE', '图片数据损坏')
+  }
   return {
     sha256: createHash('sha256').update(output).digest('hex'),
     mime: outputMime,
@@ -162,30 +171,103 @@ export async function storeTutorialImageUpload(
 }
 
 const IMAGE_REF_RE = /tutorial-blob:([a-f0-9]{64})\b/g
-const INLINE_IMAGE_RE = /!\[[^\]\n]*\]\(\s*<?([^)\s>]*)>?(?:\s+(?:"[^"\n]*"|'[^'\n]*'))?\s*\)/g
-const REFERENCE_IMAGE_RE = /!\[[^\]\n]*\]\s?\[[^\]\n]*\]/
-const FENCE_RE = /^ {0,3}(`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:^ {0,3}\1[^\n]*$|(?![\s\S]))/gm
-const INLINE_CODE_RE = /(`+)[^`\n][\s\S]*?\1/g
+// 只认一种图片写法：`![说明](tutorial-blob:<sha256> "可选标题")`。所有量词都有上界，配合
+// 下面按 `![` 逐个定位的循环，整篇解析是线性的（Codex R1 P1：无界正则在 2 万个反引号上
+// 回溯 6 秒，会卡住事件循环）。
+const IMAGE_AT_RE =
+  /!\[[^\]\n]{0,500}\]\([ \t]{0,20}<?tutorial-blob:([a-f0-9]{64})>?(?:[ \t]{1,20}(?:"[^"\n]{0,300}"|'[^'\n]{0,300}'))?[ \t]{0,20}\)/y
+const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})/
 
+/** 去掉围栏代码块（逐行）和行内代码（逐个反引号串配对），都是线性扫描。 */
 function withoutCode(markdown: string): string {
-  return markdown.replace(FENCE_RE, '').replace(INLINE_CODE_RE, '')
+  const kept: string[] = []
+  let fence: string | null = null
+  for (const line of markdown.split('\n')) {
+    const open = FENCE_OPEN_RE.exec(line)
+    if (fence) {
+      if (open && open[1]![0] === fence[0] && open[1]!.length >= fence.length && line.trim() === open[1])
+        fence = null
+      continue
+    }
+    if (open) {
+      fence = open[1]!
+      continue
+    }
+    kept.push(line)
+  }
+  return stripInlineCode(kept.join('\n'))
 }
 
 /**
- * 解析正文里的图片。代码块里的示例不算图片；内联图片的地址只能是
- * `tutorial-blob:<sha256>`，引用式图片（`![a][ref]`）一律不收，以免绕过地址检查。
- * 返回按首次出现排序、去重后的 sha 列表。
+ * 行内代码：长度为 n 的反引号串与下一个长度同为 n 的串配对，中间整段去掉；配不上的串按
+ * 普通文字保留。某个长度配对失败，说明它后面再没有同长度的串，所以每种长度最多整段扫一次。
+ */
+function stripInlineCode(text: string): string {
+  let out = ''
+  let i = 0
+  while (i < text.length) {
+    const tick = text.indexOf('`', i)
+    if (tick < 0) {
+      out += text.slice(i)
+      break
+    }
+    out += text.slice(i, tick)
+    let runEnd = tick
+    while (runEnd < text.length && text[runEnd] === '`') runEnd += 1
+    const run = runEnd - tick
+    let close = -1
+    let k = runEnd
+    while (k < text.length) {
+      const next = text.indexOf('`', k)
+      if (next < 0) break
+      let end = next
+      while (end < text.length && text[end] === '`') end += 1
+      if (end - next === run) {
+        close = next
+        break
+      }
+      k = end
+    }
+    if (close < 0) {
+      out += text.slice(tick, runEnd)
+      i = runEnd
+    } else {
+      i = close + run
+    }
+  }
+  return out
+}
+
+/** 依次取正文里每个 `![`：合法的本站图片返回 sha，其它写法返回 null。 */
+function* imageMarks(markdown: string): Generator<string | null> {
+  const text = withoutCode(markdown)
+  let from = 0
+  while (true) {
+    const at = text.indexOf('![', from)
+    if (at < 0) return
+    IMAGE_AT_RE.lastIndex = at
+    const match = IMAGE_AT_RE.exec(text)
+    if (match) {
+      yield match[1]!
+      from = IMAGE_AT_RE.lastIndex
+    } else {
+      yield null
+      from = at + 2
+    }
+  }
+}
+
+/**
+ * 解析正文里的图片。代码块里的示例不算图片；正文里每个 `![` 都必须是
+ * `![说明](tutorial-blob:<sha256>)`，外链、data URL、引用式和快捷引用式图片一律拒收，
+ * 以免绕过地址检查。返回按首次出现排序、去重后的 sha 列表。
  */
 export function parseTutorialImageRefs(markdown: string): string[] {
-  const text = withoutCode(markdown)
-  if (REFERENCE_IMAGE_RE.test(text))
-    throw new TutorialImageError('EXTERNAL_IMAGE', '请用 ![说明](图片) 的形式插入本站上传的图片')
   const shas: string[] = []
-  for (const match of text.matchAll(INLINE_IMAGE_RE)) {
-    const target = match[1] ?? ''
-    const ref = /^tutorial-blob:([a-f0-9]{64})$/.exec(target)
-    if (!ref) throw new TutorialImageError('EXTERNAL_IMAGE', '正文只能插入本站上传的图片，不支持外链图片')
-    if (!shas.includes(ref[1]!)) shas.push(ref[1]!)
+  for (const sha of imageMarks(markdown)) {
+    if (sha === null)
+      throw new TutorialImageError('EXTERNAL_IMAGE', '正文只能用 ![说明](图片) 插入本站上传的图片，不支持外链图片')
+    if (!shas.includes(sha)) shas.push(sha)
   }
   if (shas.length > TUTORIAL_IMAGE_MAX_PER_POST)
     throw new TutorialImageError('TOO_MANY_IMAGES', `每篇最多 ${TUTORIAL_IMAGE_MAX_PER_POST} 张图片`)
@@ -194,10 +276,7 @@ export function parseTutorialImageRefs(markdown: string): string[] {
 
 /** 第一张图（用作封面），代码块里的不算。 */
 export function firstTutorialImageSha(markdown: string): string | null {
-  for (const match of withoutCode(markdown).matchAll(INLINE_IMAGE_RE)) {
-    const ref = /^tutorial-blob:([a-f0-9]{64})$/.exec(match[1] ?? '')
-    if (ref) return ref[1]!
-  }
+  for (const sha of imageMarks(markdown)) if (sha) return sha
   return null
 }
 

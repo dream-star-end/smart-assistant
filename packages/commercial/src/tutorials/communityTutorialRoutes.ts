@@ -147,12 +147,16 @@ export async function handleListCommunityTutorials(
   const { cursor, limit } = pageArgs(req)
   const q = url.searchParams.get('q')?.trim() ?? ''
   if (q.length > 100) throw new HttpError(400, 'BAD_REQUEST', 'q too long')
+  const kind = url.searchParams.get('kind') || null
+  if (kind !== null && kind !== 'markdown' && kind !== 'snapshot')
+    throw new HttpError(400, 'BAD_REQUEST', 'kind must be markdown|snapshot')
   try {
     const page = await listPublishedCommunityTutorials({
       cursor,
       limit,
       category: optionalCategory(url.searchParams.get('category')),
       query: q || null,
+      kind,
     })
     res.setHeader('Cache-Control', 'public, max-age=30')
     res.setHeader('X-Robots-Tag', 'noindex')
@@ -389,11 +393,15 @@ export async function handleAdminListCommunityTutorials(
   if (!(ADMIN_TUTORIAL_STATUSES as readonly string[]).includes(status))
     throw new HttpError(400, 'BAD_REQUEST', `status must be ${ADMIN_TUTORIAL_STATUSES.join('|')}`)
   const needsHuman = url.searchParams.get('needsHuman') === '1'
+  const kind = url.searchParams.get('kind') || null
+  if (kind !== null && kind !== 'markdown' && kind !== 'snapshot')
+    throw new HttpError(400, 'BAD_REQUEST', 'kind must be markdown|snapshot')
   const args = pageArgs(req)
   try {
     const page = await listAdminCommunityTutorials({
       status: status as AdminTutorialStatus,
       needsHuman,
+      kind,
       ...args,
     })
     res.setHeader('Cache-Control', 'private, no-store')

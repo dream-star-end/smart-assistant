@@ -101,13 +101,13 @@ function request(
 ) {
   const headers: Record<string, string> = {}
   if (options.token) headers.Authorization = `Bearer ${options.token}`
-  let body: string | Buffer | undefined
+  let body: BodyInit | undefined
   if (options.json !== undefined) {
     headers['Content-Type'] = 'application/json'
     body = JSON.stringify(options.json)
   } else if (options.raw) {
     headers['Content-Type'] = options.type ?? 'image/png'
-    body = options.raw
+    body = new Uint8Array(options.raw) as BodyInit
   }
   return fetch(`${baseUrl}${path}`, { method: options.method ?? 'GET', headers, body })
 }
@@ -345,6 +345,16 @@ describe('经验分享 · 投稿', () => {
     }
     assert.deepEqual(list.tutorials.map((row) => row.id), [id])
     assert.equal(list.total, 1)
+    const markdownOnly = (await (await request('/api/tutorials?kind=markdown')).json()) as {
+      tutorials: Array<{ id: string }>
+    }
+    assert.deepEqual(markdownOnly.tutorials.map((row) => row.id), [id])
+    const snapshotOnly = (await (await request('/api/tutorials?kind=snapshot')).json()) as {
+      tutorials: unknown[]
+      total: number
+    }
+    assert.deepEqual([snapshotOnly.tutorials, snapshotOnly.total], [[], 0])
+    assert.equal((await request('/api/tutorials?kind=video')).status, 400)
   })
 
   test('作者撤回后 needs_human 清掉，人工队列里不再出现', async (t) => {

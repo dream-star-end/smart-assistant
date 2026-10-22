@@ -56,9 +56,26 @@ describe('tutorialImages · 正文图片引用', () => {
       '![x](data:image/png;base64,AAAA)',
       `![x](tutorial-blob:${SHA_A.slice(0, 12)})`,
       '![x][ref]\n\n[ref]: https://example.com/a.png',
+      '![x]\n\n[x]: https://example.com/a.png',
     ]) {
       await expectImageError(() => parseTutorialImageRefs(body), 'EXTERNAL_IMAGE')
     }
+  })
+
+  test('病态输入线性解析：大量反引号、空格、未闭合图片不会卡住事件循环', async () => {
+    const started = Date.now()
+    parseTutorialImageRefs('`'.repeat(50_000))
+    parseTutorialImageRefs('`a``b'.repeat(10_000))
+    await expectImageError(() => parseTutorialImageRefs(`![a](${' '.repeat(50_000)}`), 'EXTERNAL_IMAGE')
+    await expectImageError(() => parseTutorialImageRefs('![['.repeat(16_000)), 'EXTERNAL_IMAGE')
+    assert.equal(firstTutorialImageSha('![x'.repeat(16_000)), null)
+    assert.ok(Date.now() - started < 1_000, `took ${Date.now() - started}ms`)
+  })
+
+  test('围栏没闭合时其后都算代码；行内代码按同长度反引号配对', () => {
+    assert.deepEqual(parseTutorialImageRefs('```\n![x](https://a/b.png)\n'), [])
+    assert.deepEqual(parseTutorialImageRefs('`` a ` ![x](https://a/b.png) ``'), [])
+    assert.deepEqual(parseTutorialImageRefs(`\`x\` ![](tutorial-blob:${SHA_A})`), [SHA_A])
   })
 
   test(`每篇最多 ${TUTORIAL_IMAGE_MAX_PER_POST} 张`, async () => {
@@ -142,6 +159,11 @@ describe('tutorialImages · 上传字节校验', () => {
       'BAD_IMAGE',
     )
     await expectImageError(() => prepareTutorialImage(Buffer.alloc(0), 'image/png'), 'BAD_IMAGE')
+    // 头部完好、像素流损坏：metadata() 能读，完整解码失败。
+    const broken = Buffer.from(await solid('png', 64, 64))
+    const idat = broken.indexOf(Buffer.from('IDAT'))
+    broken.fill(0, idat + 4, idat + 24)
+    await expectImageError(() => prepareTutorialImage(broken, 'image/png'), 'BAD_IMAGE')
     // 两帧必须不同，否则 libwebp 会把重复帧合并成静态图。
     const frame = (background: string) =>
       sharp({ create: { width: 8, height: 8, channels: 3, background } }).webp().toBuffer()

@@ -373,14 +373,17 @@ export async function listPublishedCommunityTutorials(
     limit: number
     category?: CommunityTutorialCategory | null
     query?: string | null
+    /** 经验分享只看 markdown 投稿；不传 = 全部（教程工作室）。 */
+    kind?: CommunityTutorialKind | null
   },
   runner?: QueryRunner,
 ): Promise<{ items: PublishedTutorialRow[]; nextCursor: string | null; total: number | null }> {
-  const filterParams = [args.category ?? null, args.query ?? null]
+  const filterParams = [args.category ?? null, args.query ?? null, args.kind ?? null]
   const FILTER_SQL = `t.status = 'approved'
         AND ($1::text IS NULL OR t.category = $1)
         AND ($2::text IS NULL OR t.title ILIKE '%' || $2 || '%' OR t.summary ILIKE '%' || $2 || '%'
-             OR u.display_name ILIKE '%' || $2 || '%')`
+             OR u.display_name ILIKE '%' || $2 || '%')
+        AND ($3::text IS NULL OR t.kind = $3)`
   const result = await query<{
     id: string
     title: string
@@ -401,9 +404,9 @@ export async function listPublishedCommunityTutorials(
        FROM community_tutorials t
        JOIN users u ON u.id = t.author_user_id
       WHERE ${FILTER_SQL}
-        AND ($3::timestamptz IS NULL OR (t.published_at, t.id) < ($3::timestamptz, $4::bigint))
+        AND ($4::timestamptz IS NULL OR (t.published_at, t.id) < ($4::timestamptz, $5::bigint))
       ORDER BY t.published_at DESC, t.id DESC
-      LIMIT $5`,
+      LIMIT $6`,
     [...filterParams, args.cursor?.at ?? null, args.cursor?.id ?? null, args.limit + 1],
     runner,
   )
@@ -621,6 +624,8 @@ export async function listAdminCommunityTutorials(
   args: {
     status: AdminTutorialStatus
     needsHuman: boolean
+    /** 管理端「经验分享」只看 markdown；不传 = 全部。 */
+    kind?: CommunityTutorialKind | null
     cursor: TutorialCursor | null
     limit: number
   },
@@ -641,6 +646,7 @@ export async function listAdminCommunityTutorials(
        JOIN users u ON u.id = t.author_user_id
       WHERE t.status = $1
         AND (NOT $2::boolean OR t.needs_human)
+        AND ($6::text IS NULL OR t.kind = $6)
         AND ($3::timestamptz IS NULL OR (${orderKey}, t.id) ${pending ? '>' : '<'} ($3::timestamptz, $4::bigint))
       ORDER BY ${orderKey} ${pending ? 'ASC' : 'DESC'}, t.id ${pending ? 'ASC' : 'DESC'}
       LIMIT $5`,
@@ -650,6 +656,7 @@ export async function listAdminCommunityTutorials(
       args.cursor?.at ?? null,
       args.cursor?.id ?? null,
       args.limit + 1,
+      args.kind ?? null,
     ],
     runner,
   )
