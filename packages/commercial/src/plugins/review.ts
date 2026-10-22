@@ -1,3 +1,4 @@
+import { LITERATURE_PLUGIN_ARTIFACT_HASH } from './literatureDb/builtinArtifact.js'
 /**
  * Non-declarative Plugin review and load boundary.
  *
@@ -408,6 +409,7 @@ interface StoredRuntimePluginRow {
   signature: Buffer | null
   key_id: string | null
   signature_scheme: string | null
+  review_source: string | null
 }
 
 interface VerifiedRuntimePluginContractBase {
@@ -440,7 +442,7 @@ async function readStoredRuntimeRows(
             v.artifact_hash, v.raw_artifact, v.security_review_state,
             v.functional_verify_state, v.exec_revoked_at, v.exec_contract,
             v.exec_contract_hash, v.compiler_version, v.security_policy_version,
-            v.signature, v.key_id, v.signature_scheme
+            v.signature, v.key_id, v.signature_scheme, v.review_source
       FROM marketplace_skill_versions v
       JOIN marketplace_skill_listings l ON l.slug = v.slug
       WHERE v.id = ANY($1::bigint[])
@@ -498,6 +500,8 @@ function verifyStoredRuntimeRow(
   )
   if (compiled.pluginType !== pluginType)
     throw new ConnectorSpecError('WRONG_ARTIFACT_KIND', 'runtime Plugin subtype drift')
+  if (compiled.artifactHash === LITERATURE_PLUGIN_ARTIFACT_HASH && row.review_source !== 'platform')
+    throw new ConnectorSpecError('NOT_SECURITY_APPROVED', 'HTTP builtin requires platform review')
   const storedHash = Buffer.from(row.exec_contract_hash).toString('hex')
   if (
     storedHash !== compiled.execContractHash ||

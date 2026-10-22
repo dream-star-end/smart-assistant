@@ -127,6 +127,9 @@ export const DURABLE_TABLES: readonly string[] = [
   // incident 家族里唯一的**配置**表(非账本)→ durable,不进 PERMANENT_OPS_LEDGER_TABLES。
   "incident_policies",
   "leader_lease",
+  // Persistent dispatch/idempotency evidence, like usage_records. User deletion
+  // anonymizes the owner without refunding platform quota; no age-based sweep.
+  "literature_captcha_requests",
   "literature_deepxiv_config",
   "marketplace_agent_capability_bindings",
   "marketplace_capability_requirements",

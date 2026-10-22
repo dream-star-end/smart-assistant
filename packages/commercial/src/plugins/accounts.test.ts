@@ -204,6 +204,27 @@ describe('managed-browser Plugin accounts', () => {
         execContract: contract,
       },
     }
+    const httpOnlyEnvelope = { ...envelope, credentialSeal: { schemaVersion: 1 } }
+    await assert.rejects(
+      commitPluginAccountState({ row, verified, envelope: httpOnlyEnvelope, runner, env }),
+      (error: unknown) => error instanceof PluginAccountError && error.code === 'INVALID_STATE',
+    )
+    for (const lifetime of [
+      { sessionVerifiedAt: Date.now() - 1 },
+      { sessionExpiresAt: Date.now() + 1000 },
+    ]) {
+      await assert.rejects(
+        commitPluginAccountState({
+          row,
+          verified,
+          envelope: { ...envelope, ...lifetime },
+          runner,
+          env,
+        }),
+        (error: unknown) => error instanceof PluginAccountError && error.code === 'INVALID_STATE',
+      )
+    }
+    assert.equal(params.length, 0)
     assert.equal(await commitPluginAccountState({ row, verified, envelope, runner, env }), '3')
     assert.match(statement, /EXISTS/)
     assert.match(statement, /current_approved_version_id = v\.id/)

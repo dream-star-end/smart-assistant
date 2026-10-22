@@ -1,5 +1,5 @@
 /* 管理中心「插件」分区的组成部分 —— 从 ConnectorsTab.tsx 原样拆出（OCV5-379），行为不变。 */
-import { ArrowUpCircle, ChevronRight, QrCode, RotateCw, Trash2, X } from 'lucide-react'
+import { ArrowUpCircle, ChevronRight, KeyRound, QrCode, RotateCw, Trash2, X } from 'lucide-react'
 import { type ReactNode, useState } from 'react'
 import { api } from '../../../lib/api'
 import type { RuntimePluginAccount, RuntimePluginCatalogEntry } from '../../../lib/connectors'
@@ -63,10 +63,12 @@ export function RuntimePluginCard({
   onWritePreapprovalChanged: (enabled: boolean) => void
   onWritePreapprovalError: (error: unknown) => void
 }) {
+  const literature = plugin.slug === 'literature-db'
   const qrProvider = managedPluginProvider(plugin.slug)
   const canSelfAuthorize =
-    ['knowledge-planet', 'weibo', 'zhihu', 'bili-account'].includes(plugin.slug) && plugin.installedCurrent
-  const authorizeLabel = qrProvider.authorizeLabel
+    ['knowledge-planet', 'weibo', 'zhihu', 'bili-account', 'literature-db'].includes(plugin.slug) &&
+    plugin.installedCurrent
+  const authorizeLabel = literature ? '连接文献数据库' : qrProvider.authorizeLabel
   const writeCount = plugin.actions.filter((action) => !action.readOnly).length
   const [consentAccount, setConsentAccount] = useState<RuntimePluginAccount | null>(null)
   const [consentChecked, setConsentChecked] = useState(false)
@@ -174,7 +176,11 @@ export function RuntimePluginCard({
       setWriteBusyId(null)
     }
   }
-  const reloginLabel = qrProvider.qrRelink ? '重新扫码登录' : '重新扫码授权'
+  const reloginLabel = literature
+    ? '重新登录'
+    : qrProvider.qrRelink
+      ? '重新扫码登录'
+      : '重新扫码授权'
   const meta: ReactNode[] = [writeCount > 0 ? '可读写' : '只读']
   if (plugin.installed && plugin.installedVersion) meta.push(`v${plugin.installedVersion}`)
   if (plugin.pluginType === 'managed-browser') meta.push('隔离运行')
@@ -205,7 +211,12 @@ export function RuntimePluginCard({
           needsAuthorize &&
           canSelfAuthorize && (
             <Button variant="secondary" size="sm" onClick={onAuthorize}>
-              <QrCode size={14} strokeWidth={1.75} aria-hidden="true" /> {authorizeLabel}
+              {literature ? (
+                <KeyRound size={14} strokeWidth={1.75} aria-hidden="true" />
+              ) : (
+                <QrCode size={14} strokeWidth={1.75} aria-hidden="true" />
+              )}{' '}
+              {authorizeLabel}
             </Button>
           )
         }
@@ -273,7 +284,7 @@ export function RuntimePluginCard({
             // 修复动作只在需要时出现在行面上；健康账号的「重新登录」收进「⋯」。
             const fixInline = canSelfAuthorize && accountState.needsReauth
             const reloginInMenu =
-              canSelfAuthorize && !accountState.needsReauth && qrProvider.qrRelink
+              canSelfAuthorize && !accountState.needsReauth && (literature || qrProvider.qrRelink)
             const accountBusy =
               busyAction === `reauth:${account.id}` || busyAction === `revoke:${account.id}`
             return (
@@ -307,7 +318,11 @@ export function RuntimePluginCard({
                         loading={busyAction === `reauth:${account.id}`}
                         disabled={busyAction !== null}
                       >
-                        <QrCode size={14} strokeWidth={1.75} aria-hidden="true" />
+                        {literature ? (
+                          <KeyRound size={14} strokeWidth={1.75} aria-hidden="true" />
+                        ) : (
+                          <QrCode size={14} strokeWidth={1.75} aria-hidden="true" />
+                        )}
                         {reloginLabel}
                       </Button>
                     )}

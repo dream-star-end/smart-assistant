@@ -22,6 +22,7 @@ export type PluginErrorGuidance = {
 
 export type PluginErrorGuidanceInput = {
   code: string
+  provider?: string | null
   status?: string | null
   /**
    * Reserved narrowing signals from the worker protocol. The current
@@ -59,6 +60,15 @@ export const PLUGIN_PASSTHROUGH_ERROR_CODES = [
   'QR_NOT_READY',
   'TERMS_REQUIRED',
   'ACCOUNT_ALREADY_EXISTS',
+  'DOCUMENT_EXPIRED',
+  'TIMEOUT',
+  'RESPONSE_INVALID',
+  // 文献数据库（OCV5-585）：暂存容量与上游异常分类各有独立码，不再折成 RATE_LIMITED / CONNECTION_ERROR。
+  'LITERATURE_ARTIFACT_CAPACITY',
+  'LITERATURE_NO_ACCESS',
+  'LITERATURE_UPSTREAM_RATE_LIMITED',
+  'LITERATURE_UPSTREAM_CHALLENGE',
+  'LITERATURE_UPSTREAM_CHANGED',
 ] as const
 
 export type PluginPassthroughErrorCode = (typeof PLUGIN_PASSTHROUGH_ERROR_CODES)[number]
@@ -525,7 +535,7 @@ const ROWS: Record<string, Row> = {
     requiresReauth: false,
     message: '插件运行时不可用',
     nextAction:
-      '请稍后重试。若微博已授权仍反复失败，不要当成单纯网络故障，引导用户重新扫码授权',
+      '请稍后重试；若该插件已授权仍反复失败，不要当成单纯网络故障，引导用户到 管理中心 → 插件 重新绑定或刷新授权',
   },
   CONNECTION_NOT_FOUND: {
     retrySafe: 'no',
@@ -543,7 +553,58 @@ const ROWS: Record<string, Row> = {
     retrySafe: 'yes',
     requiresReauth: false,
     message: '操作过于频繁或账号正忙',
-    nextAction: '请稍后重试，不要立即连打',
+    nextAction: '请稍后重试，不要立即连打；下载文献时请一篇一篇下，每篇间隔 20-30 秒',
+  },
+  DOCUMENT_EXPIRED: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '文献编号已过期或校验失败',
+    nextAction: '请重新 search 获取新编号后再下载，不要重放旧 documentId',
+  },
+  LITERATURE_ARTIFACT_CAPACITY: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: '平台为你暂存的文献 PDF 已满，本篇未下载',
+    nextAction:
+      '请先让用户在已就绪的文献卡片上点「保存 PDF」存到本地（已保存的文件会优先腾出空间），或等较早的文件约 30 分钟到期后再下载这一篇；不要连续重试',
+  },
+  LITERATURE_NO_ACCESS: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '文献源拒绝访问：该文献不在已授权的订阅范围内，或机构通道暂时拒绝访问',
+    nextAction: '请换一篇文献或稍后再试；账号登录正常，无需重新绑定，不要反复重试同一篇',
+  },
+  LITERATURE_UPSTREAM_RATE_LIMITED: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: '文献源限流（访问过于频繁）',
+    nextAction: '请等几分钟后再试，不要立即连打；多篇文献请一篇一篇检索或下载',
+  },
+  LITERATURE_UPSTREAM_CHALLENGE: {
+    retrySafe: 'no',
+    requiresReauth: false,
+    message: '文献源要求人机验证或触发了风控，无法自动继续',
+    nextAction:
+      '请稍后再试；若持续出现，请告诉用户联系管理员检查文献通道。账号无需重新绑定，不要自动重试',
+  },
+  LITERATURE_UPSTREAM_CHANGED: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: '文献源返回了无法识别的页面，并非零结果',
+    nextAction:
+      '可稍后重试一次；仍失败请告诉用户文献源页面可能已变化、需联系管理员，不要当成没有检索结果',
+  },
+  TIMEOUT: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: '文献源响应或下载超时',
+    nextAction: '请稍后重试；下载多篇文献时请一篇一篇下，每篇间隔 20-30 秒',
+  },
+  RESPONSE_INVALID: {
+    retrySafe: 'yes',
+    requiresReauth: false,
+    message: '文献源返回格式异常或该文献暂无可用 PDF 全文',
+    nextAction: '可稍后重试一次；若仍失败，说明上游暂无该篇有效 PDF，请换一篇文献',
   },
   BAD_REQUEST: {
     retrySafe: 'no',
@@ -614,11 +675,15 @@ const DEFAULT_ROW: Row = {
 export function resolvePluginErrorGuidance(input: PluginErrorGuidanceInput): PluginErrorGuidance {
   const code = input.code
   const row = ROWS[code] ?? DEFAULT_ROW
+  const nextAction =
+    code === 'CONNECTION_ERROR' && input.provider === 'weibo'
+      ? '请稍后重试。若微博已授权仍反复失败，不要当成单纯网络故障，引导用户重新扫码授权'
+      : row.nextAction
   const base: PluginErrorGuidance = {
     retrySafe: row.retrySafe,
     requiresReauth: row.requiresReauth,
     sideEffect: writeSideEffect(code, input),
-    nextAction: row.nextAction,
+    nextAction,
     message: row.message,
   }
   if (isUnknownWrite(input.status)) return applyUnknownWriteOverride(code, base)

@@ -8,6 +8,7 @@ import { managedPluginProvider } from '../../lib/managedPluginProviders'
 import { buildPluginDirectory, pluginAccountState, type UnifiedProvider, unifyProviders } from '../../lib/pluginDirectory'
 import { BindDialog, DeclarativeBindDialog } from './plugins/BindDialogs'
 import { ManagedBrowserSetupDialog } from './plugins/ManagedBrowserSetupDialog'
+import { LiteratureSetupDialog } from './plugins/LiteratureSetupDialog'
 import { ConnectionRow, ProviderCard } from './plugins/ProviderCard'
 import { DisabledNote, LocalPluginDetail, PluginDetailBar, PluginRow, type PluginRowModel } from './plugins/PluginList'
 import { RuntimePluginCard } from './plugins/RuntimePluginCard'
@@ -260,7 +261,7 @@ export function ConnectorsTab({
       setCardNotice({
         slug: autoAuthorizePluginSlug,
         tone: 'success',
-        text: `${plugin?.label ?? '插件'}账号已授权，无需重复扫码。`,
+        text: plugin?.slug === 'literature-db' ? '文献数据库账号已连接。' : `${plugin?.label ?? '插件'}账号已授权，无需重复扫码。`,
       })
       return
     }
@@ -269,7 +270,7 @@ export function ConnectorsTab({
       setCardNotice({
         slug: autoAuthorizePluginSlug,
         tone: 'warning',
-        text: `${plugin?.label ?? '插件'}账号的登录已失效，点击账号行上的「重新扫码授权」即可恢复。`,
+        text: plugin?.slug === 'literature-db' ? (pluginAccountState(staleAccount, plugin).needsReauth ? '文献数据库登录已失效，请点击账号行上的「重新登录」。' : '文献数据库登录已保存，检索暂未启用。') : `${plugin?.label ?? '插件'}账号的登录已失效，点击账号行上的「重新扫码授权」即可恢复。`,
       })
       return
     }
@@ -425,6 +426,13 @@ export function ConnectorsTab({
    */
   const reauthorizeRuntimeAccount = useCallback(
     async (account: RuntimePluginAccount, plugin: RuntimePluginCatalogEntry) => {
+      if (plugin.slug === 'literature-db') {
+        setCardNotice(null)
+        setErr(null)
+        setSetupRuntimeAccountId(account.id)
+        setSetupRuntimeFor(plugin)
+        return
+      }
       const relinkInPlace =
         managedPluginProvider(plugin.slug).qrRelink &&
         plugin.installedCurrent &&
@@ -728,7 +736,17 @@ export function ConnectorsTab({
           reload();
         }}
       />
-      <ManagedBrowserSetupDialog
+      {setupRuntimeFor?.slug === 'literature-db' ? <LiteratureSetupDialog
+        key={`${setupRuntimeFor.versionId}:${setupRuntimeAccountId ?? 'new'}`}
+        auth={auth}
+        plugin={setupRuntimeFor}
+        relinkAccountId={setupRuntimeAccountId}
+        onClose={() => { setSetupRuntimeFor(null); setSetupRuntimeAccountId(null); reload() }}
+        onBound={(agentReady) => {
+          setCardNotice({ slug: 'literature-db', tone: 'success', text: agentReady ? '文献数据库登录已保存，可以检索文献。' : '登录信息已加密保存，检索尚未启用。' })
+          reload()
+        }}
+      /> : <ManagedBrowserSetupDialog
         key={`${setupRuntimeFor?.versionId ?? 'closed'}:${setupRuntimeAccountId ?? 'new'}`}
         auth={auth}
         plugin={setupRuntimeFor}
@@ -753,7 +771,7 @@ export function ConnectorsTab({
             })
           reload()
         }}
-      />
+      />}
       {confirmEl}
     </>
   )

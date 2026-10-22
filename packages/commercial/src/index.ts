@@ -85,12 +85,11 @@ import { canUseModel } from "./billing/authzModels.js";
 import { ALLOWED_INBOUND_MODELS, setModelHintProvider, setLiteratureSkillProvider, setHostStaticProviderKeys } from "@openclaude/gateway";
 import { setPlatformFlashFallbackKey } from "./http/proxy/shared.js";
 import { getPreferences, patchPreferences } from "./user/preferences.js";
-import { getLiteratureSkillConfig } from "./admin/literatureConfig.js";
 import {
   getPhase6AccountUuidEnforce,
   getSessionPinMode,
 } from "./admin/runtimeFlags.js";
-import { LITERATURE_SKILL_POINTER } from "./literatureSkill.js";
+import { literatureSkillSlotProvider } from "./literatureSkill.js";
 import {
   estimateMaxCost,
   InsufficientCreditsError,
@@ -588,6 +587,7 @@ import { KnowledgePlanetAutomationService } from './plugins/knowledgePlanetAutom
 import { startKnowledgePlanetAutomationScheduler } from './plugins/knowledgePlanetAutomationScheduler.js'
 import { WeiboDockerService, createWeiboRuntimeRegistries } from './plugins/weibo.js'
 import { WeiboSetupManager } from './plugins/weiboSetup.js'
+import { createCommercialLiteratureRuntime } from './plugins/literatureDb/jieyouLoginSession.js'
 import { ZhihuDockerService, createZhihuRuntimeRegistries } from './plugins/zhihu.js'
 import { ZhihuSetupManager } from './plugins/zhihuSetup.js'
 import {
@@ -1646,27 +1646,8 @@ export async function registerCommercial(
   // OCV5-482:平台直连 flash(市场审核/语音润色/知识星球)Go 不可用时回落 DeepSeek 官方。
   setPlatformFlashFallbackKey(cfg.DEEPSEEK_API_KEY);
 
-  // 0069 — SKILLS_LITERATURE slot 反向钩子:容器 spawn 重建 system prompt 时读窄配置,
-  // admin 改完下次 spawn 自然生效(无 cache / 无 LISTEN/NOTIFY,见 0069 migration 注释)。
-  // 关键最小权限分流:这里**只**调 getLiteratureSkillConfig()(不解密 token),bearer
-  // plaintext 只在 proxy 路径(getLiteratureConfig(false))才会出现。
-  // fail-soft:DB 抖动 → 返 null + warn,prompt 构建照样推进。
-  setLiteratureSkillProvider(async () => {
-    try {
-      const cfg = await getLiteratureSkillConfig();
-      if (!cfg.enabled || !cfg.token_set) return null;
-      return {
-        name: "SKILLS_LITERATURE",
-        content: LITERATURE_SKILL_POINTER,
-      };
-    } catch (err) {
-      // 单行 DB 读失败就跳过 slot,不要让 master DB 闪断拖垮容器系统 prompt 构建。
-      // 选 warn 不 error:这条 slot 是增强非必需,日志噪声压低。
-      // eslint-disable-next-line no-console
-      console.warn("[commercial] literatureSkillProvider read failed, skipping slot:", err);
-      return null;
-    }
-  });
+  // 0069 — SKILLS_LITERATURE slot 反向钩子(provider 见 literatureSkill.ts,fail-soft、不解密 token)。
+  setLiteratureSkillProvider(literatureSkillSlotProvider);
 
   // T-24 虎皮椒:三件套齐全 → 生产 client;否则 undefined(handler 会 503)
   let hupijiao: HupijiaoClient | undefined;
@@ -1718,6 +1699,8 @@ export async function registerCommercial(
   let biliAccountService: BiliAccountDockerService | undefined
   let biliAccountSetup: BiliAccountSetupManager | undefined
   let knowledgePlanetAutomation: KnowledgePlanetAutomationService | undefined
+  // 文献插件(OCV5-524/585):观测日志 literature_plugin_call / literature_artifact 由 runtime 工厂接到 rootLogger。
+  const { literatureSetup, literatureArtifacts, literatureHttp, literatureRelogin, literatureObserver } = createCommercialLiteratureRuntime({ runtimeChannel, redis, logger: rootLogger })
   let pluginFacade: PluginRuntimeFacade
   if (runtimeChannel === 'v5' && cfg.OC_RUNTIME_IMAGE_ID) {
     const pluginDocker = cfg.AGENT_DOCKER_SOCKET
@@ -1780,6 +1763,7 @@ export async function registerCommercial(
       redis,
       browserRuntime,
       knowledgePlanetMedia: knowledgePlanetMediaDeps,
+      literatureHttp, literatureRelogin, literatureObserver,
       pluginEnablement: PREFS_PLUGIN_ENABLEMENT,
     })
     knowledgePlanetSetup = new KnowledgePlanetSetupManager(knowledgePlanetService, {
@@ -1799,7 +1783,7 @@ export async function registerCommercial(
     })
     knowledgePlanetAutomation = new KnowledgePlanetAutomationService(pluginFacade)
   } else {
-    pluginFacade = new PluginRuntimeFacade({ redis, pluginEnablement: PREFS_PLUGIN_ENABLEMENT })
+    pluginFacade = new PluginRuntimeFacade({ redis, literatureHttp, literatureRelogin, literatureObserver, pluginEnablement: PREFS_PLUGIN_ENABLEMENT })
   }
 
   // T-53: 装配 agent 运行时(image + seccomp + rpc dir + lifecycle scheduler)。
@@ -4447,6 +4431,8 @@ export async function registerCommercial(
     pluginRuntime: pluginFacade,
     knowledgePlanetSetup,
     weiboSetup,
+    literatureSetup,
+    literatureArtifacts,
     zhihuSetup,
     biliAccountSetup,
     knowledgePlanetAutomation,
@@ -7226,9 +7212,11 @@ export async function registerCommercial(
       try { await cursorExternalRoute?.close(); } catch { /* ignore */ }
       // Managed setup/action workers must drain while PG/Redis and Docker control are alive.
       try {
-        await Promise.all([
+        await Promise.allSettled([
           knowledgePlanetSetup?.closeAndDrain(),
           weiboSetup?.closeAndDrain(),
+          literatureSetup.close(),
+          Promise.resolve().then(() => literatureArtifacts?.close()),
           zhihuSetup?.closeAndDrain(),
           biliAccountSetup?.closeAndDrain(),
         ])
