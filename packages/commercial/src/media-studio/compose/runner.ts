@@ -75,6 +75,21 @@ export function pgHostLock(pool: Pool, key = 'oc-studio-compose-disk'): HostLock
   }
 }
 
+/** Resolves to the promise's value, or to undefined after `ms`. */
+async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: NodeJS.Timeout | undefined
+  try {
+    return await Promise.race([
+      p,
+      new Promise<undefined>((res) => {
+        timer = setTimeout(() => res(undefined), ms)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /** Single-process lock for tests and tooling (not cross-process). */
 export function inProcessHostLock(): HostLock {
   let chain: Promise<unknown> = Promise.resolve()
@@ -470,7 +485,12 @@ export class ComposeRunner {
       ])
       clearTimeout(timer)
       if (outcome === 'timeout') {
-        await container.kill().catch(() => {})
+        // kill() itself may hang: bound it by the grace period too (code r2 P1-1).
+        const grace = this.opts.killGraceMs ?? KILL_GRACE_MS
+        await withTimeout(
+          container.kill().catch(() => {}),
+          grace,
+        )
         await Promise.race([
           waited,
           new Promise((res) => setTimeout(res, this.opts.killGraceMs ?? KILL_GRACE_MS)),
@@ -499,10 +519,13 @@ export class ComposeRunner {
       return { outputs }
     } finally {
       stream?.destroy()
-      this.release()
-      // Release the disk reservation only once the container is confirmed gone (code r1 P1-7).
+      // The concurrency slot and the disk reservation are released only once the container is
+      // confirmed removed, so stuck containers can never exceed the concurrency cap (code r2 P1-2).
       if (container) void this.retireContainer(container, releaseDisk)
-      else await releaseDisk()
+      else {
+        this.release()
+        await releaseDisk()
+      }
     }
   }
 
@@ -511,22 +534,33 @@ export class ComposeRunner {
     container: Docker.Container,
     releaseDisk: () => Promise<void>,
   ): Promise<void> {
+    const done = async () => {
+      this.release()
+      await releaseDisk()
+    }
     for (let attempt = 0; attempt <= REMOVE_RETRIES; attempt++) {
       try {
-        await container.remove({ force: true })
-        await releaseDisk()
-        return
+        // remove() may hang on a wedged daemon: bound each attempt.
+        const removed = await withTimeout(
+          container.remove({ force: true }).then(() => true),
+          this.opts.killGraceMs ?? KILL_GRACE_MS,
+        )
+        if (removed === true) {
+          await done()
+          return
+        }
       } catch (err) {
         const status = (err as { statusCode?: number }).statusCode
         if (status === 404) {
-          await releaseDisk()
+          await done()
           return
         }
       }
       if (attempt < REMOVE_RETRIES)
         await new Promise((res) => setTimeout(res, this.opts.removeRetryMs ?? REMOVE_RETRY_MS))
     }
-    // Still not removable: keep the reservation counted; sweep or a later restart will retire it.
+    // Still not removable: keep the slot and the reservation held (fail safe); a later restart
+    // (new owner) lets sweepStale retire the container and frees both.
   }
 
   private async assertInputs(inDir: string): Promise<void> {
