@@ -727,7 +727,12 @@ export async function submit(
     // stdin JSON-RPC 扩展。Lock 保证 setTraceId 与并发 submit() 串行,不会
     // 跨 turn 互踩。
     log.info('turn_pipeline_timing', { traceId, stage: 'memory_barrier_acquired', elapsedMs: performance.now() - submitStartedAt })
+    // OCV5-570: the runner also puts this trace on the turn's egress requests, so a trace-less turn
+    // clears it rather than inheriting the previous turn's value. A defined trace keeps the hard call
+    // (a runner missing the mandatory mutator must fail loudly); the clear is optional-called so test
+    // doubles that never carried a trace keep working.
     if (traceId !== undefined) session.runner.setTraceId(traceId)
+    else session.runner.setTraceId?.(undefined)
     // 市场使用信号(skillUsageReporter)读点:本 turn 的 canonical traceId 落到 session,
     // 供 tool.called(hub skill_view)上报方在 turn 执行期同步取到评分归因键。**无条件**
     // 赋值(含 undefined):清除上一 turn 残留,避免把旧 traceId 误配到本 turn 的使用事件。

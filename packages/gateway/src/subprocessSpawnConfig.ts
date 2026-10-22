@@ -4,7 +4,13 @@
  * Moved verbatim out of subprocessRunner.ts — FINDINGS §8 (cc2), OCV5-478. subprocessRunner.ts
  * imports these back and re-exports its former exports, so its import surface is unchanged.
  */
-import { BOX_API_MODELS, OPENAI_FAST_SERVICE_TIER, isBoxApiModel } from '@openclaude/protocol'
+import {
+  BOX_API_MODELS,
+  OPENAI_FAST_SERVICE_TIER,
+  TRACE_ID_HEADER,
+  isBoxApiModel,
+  parseTraceIdCandidate,
+} from '@openclaude/protocol'
 import type { IdentityCompatRuntimeContext } from '@openclaude/storage'
 import { existsSync } from 'node:fs'
 import { isAbsolute, resolve } from 'node:path'
@@ -497,8 +503,16 @@ function assertHeaderValueSafe(header: string, value: string): void {
  * `TurnUpstreamHeaders` → `ANTHROPIC_CUSTOM_HEADERS` 的多行 `Name: Value` 串。
  *
  * 无凭据(undefined / 全空)→ **空串**(清位,见上方铁律)。
+ *
+ * `traceId`(OCV5-570,方案 §7.3):本 turn 的 canonical traceId,作 `x-openclaude-trace-id` 随 CCB 每个
+ * 发往 egress 的请求带上(egress 第 0 步绑定,§7.4)。调用方只在 CCB 上游就是 egress 时传
+ * (见 _ccbUpstreamIsEgress)—— 直连外部 provider 的 lane 不带,内部关联信息不出站。不合法的值丢弃
+ * (不拒 turn:trace 是观测,不是凭据)。
  */
-export function _buildAnthropicCustomHeadersEnv(headers: TurnUpstreamHeaders | undefined): {
+export function _buildAnthropicCustomHeadersEnv(
+  headers: TurnUpstreamHeaders | undefined,
+  traceId?: string,
+): {
   ANTHROPIC_CUSTOM_HEADERS: string
 } {
   const lines: string[] = []
@@ -510,7 +524,23 @@ export function _buildAnthropicCustomHeadersEnv(headers: TurnUpstreamHeaders | u
   push(AUTHORITY_HEADER, headers?.authority)
   push(TURN_LEASE_HEADER, headers?.lease)
   push(LOCAL_CATALOG_HEADER, headers?.localCatalog)
+  const trace = parseTraceIdCandidate(traceId)
+  if (traceId !== undefined && trace.ok) push(TRACE_ID_HEADER, trace.traceId)
   return { ANTHROPIC_CUSTOM_HEADERS: lines.join('\n') }
+}
+
+/**
+ * Whether a spawned CCB talks to egress: its `ANTHROPIC_BASE_URL` is the gateway's own egress base
+ * (the same value the gateway's Box clients use). Direct provider lanes (host-static, oauth-direct)
+ * and anything else get no internal trace header.
+ */
+export function _ccbUpstreamIsEgress(
+  spawnEnv: NodeJS.ProcessEnv | Record<string, string | undefined>,
+  gatewayEnv: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const norm = (v: string | undefined) => (v ?? '').trim().replace(/\/+$/, '')
+  const egress = norm(gatewayEnv.ANTHROPIC_BASE_URL)
+  return egress !== '' && norm(spawnEnv.ANTHROPIC_BASE_URL) === egress
 }
 
 /** CCB stdin 控制消息(schema:`{ type, variables: Record<string,string> }`)。 */
