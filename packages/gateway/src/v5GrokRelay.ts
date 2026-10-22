@@ -2,7 +2,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 import { GROK_RELAY_PREFIX, TRACE_ID_HEADER } from '@openclaude/protocol'
-import { grokRelayTrace } from './relayTrace.js'
+import { routeRelayTrace } from './relayTrace.js'
 import { isLoopbackRemoteAddress } from './v3CodexRelay.js'
 
 export const V5_GROK_RELAY_PREFIX = GROK_RELAY_PREFIX
@@ -39,7 +39,7 @@ function headersFor(req: IncomingMessage, token: string, pathname: string): Head
     else headers.set(rawKey, rawValue)
   }
   headers.set('authorization', `Bearer ${token}`)
-  const traceId = grokRelayTrace(pathname)
+  const traceId = routeRelayTrace(pathname)
   if (traceId) headers.set(TRACE_ID_HEADER, traceId)
   return headers
 }

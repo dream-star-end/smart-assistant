@@ -22,13 +22,16 @@ import {
   _resetRelayTraceForTests,
   adoptCodexTurnTrace,
   bindCodexThreadTrace,
-  bindGrokRouteTrace,
+  bindRouteTrace,
   codexRelayTrace,
-  grokRelayTrace,
+  routeRelayTrace,
   withCodexTurnTrace,
 } from '../relayTrace.js'
 import { V3_CODEX_RELAY_PREFIX, handleV3CodexRelayLocal } from '../v3CodexRelay.js'
 import { V5_GROK_RELAY_PREFIX, handleV5GrokRelayLocal } from '../v5GrokRelay.js'
+import { V5_ZCODE_RELAY_PREFIX, handleV5ZcodeRelayLocal } from '../v5ZcodeRelay.js'
+import { V5_ANTIGRAVITY_RELAY_PREFIX, handleV5AntigravityRelayLocal } from '../v5AntigravityRelay.js'
+import { ZcodeAdapter } from '../engine/zcodeAdapter.js'
 
 const T1 = '0a1b2c3d4e5f60718293a4b5c6d7e8f9'
 const T2 = 'ffeeddccbbaa99887766554433221100'
@@ -40,18 +43,18 @@ afterEach(() => _resetRelayTraceForTests())
 describe('relay trace registry', () => {
   it('Grok: the route token names the running turn; a stale release keeps the newer binding', () => {
     const path = `${V5_GROK_RELAY_PREFIX}/route/${TOKEN}/v1/chat/completions`
-    assert.equal(grokRelayTrace(path), undefined)
-    const release1 = bindGrokRouteTrace(TOKEN, T1)
-    assert.equal(grokRelayTrace(path), T1)
-    assert.equal(grokRelayTrace(`${V5_GROK_RELAY_PREFIX}/route/${'b'.repeat(64)}/v1`), undefined)
-    const release2 = bindGrokRouteTrace(TOKEN, T2)
+    assert.equal(routeRelayTrace(path), undefined)
+    const release1 = bindRouteTrace(TOKEN, T1)
+    assert.equal(routeRelayTrace(path), T1)
+    assert.equal(routeRelayTrace(`${V5_GROK_RELAY_PREFIX}/route/${'b'.repeat(64)}/v1`), undefined)
+    const release2 = bindRouteTrace(TOKEN, T2)
     release1()
-    assert.equal(grokRelayTrace(path), T2)
+    assert.equal(routeRelayTrace(path), T2)
     release2()
-    assert.equal(grokRelayTrace(path), undefined)
-    bindGrokRouteTrace(TOKEN, T1)
-    bindGrokRouteTrace(TOKEN, 'not-a-trace')
-    assert.equal(grokRelayTrace(path), undefined, 'a trace-less turn clears the token')
+    assert.equal(routeRelayTrace(path), undefined)
+    bindRouteTrace(TOKEN, T1)
+    bindRouteTrace(TOKEN, 'not-a-trace')
+    assert.equal(routeRelayTrace(path), undefined, 'a trace-less turn clears the token')
   })
 
   it('Codex: pending thread, then its own turn id; late requests keep their turn; others get nothing', () => {
@@ -97,7 +100,7 @@ describe('relay trace registry', () => {
 })
 
 async function relayOnce(
-  handler: 'grok' | 'codex',
+  handler: 'grok' | 'codex' | 'zcode' | 'antigravity',
   path: string,
   headers: Record<string, string>,
 ): Promise<Headers> {
@@ -108,9 +111,13 @@ async function relayOnce(
     return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
   }
   const server = createServer((req, res) => {
-    void (handler === 'grok'
-      ? handleV5GrokRelayLocal(req, res, cfg, { fetchImpl })
-      : handleV3CodexRelayLocal(req, res, cfg, { fetchImpl }))
+    const handle = {
+      grok: handleV5GrokRelayLocal,
+      codex: handleV3CodexRelayLocal,
+      zcode: handleV5ZcodeRelayLocal,
+      antigravity: handleV5AntigravityRelayLocal,
+    }[handler]
+    void handle(req, res, cfg, { fetchImpl })
   })
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
   try {
@@ -130,9 +137,24 @@ describe('container relays', () => {
     const path = `${V5_GROK_RELAY_PREFIX}/route/${TOKEN}/v1/chat/completions`
     const forged = { [TRACE_ID_HEADER]: T2, 'content-type': 'application/json' }
     assert.equal((await relayOnce('grok', path, forged)).get(TRACE_ID_HEADER), null)
-    bindGrokRouteTrace(TOKEN, T1)
+    bindRouteTrace(TOKEN, T1)
     assert.equal((await relayOnce('grok', path, forged)).get(TRACE_ID_HEADER), T1)
   })
+
+  for (const [name, prefix, tail] of [
+    ['zcode', V5_ZCODE_RELAY_PREFIX, '/v1/messages'],
+    ['antigravity', V5_ANTIGRAVITY_RELAY_PREFIX, '/v1internal:streamGenerateContent'],
+  ] as const) {
+    it(`${name} relay: drops a caller trace header and sends the route token turn trace`, async () => {
+      const path = `${prefix}/route/${TOKEN}${tail}`
+      const forged = { [TRACE_ID_HEADER]: T2, 'content-type': 'application/json' }
+      assert.equal((await relayOnce(name, path, forged)).get(TRACE_ID_HEADER), null)
+      const release = bindRouteTrace(TOKEN, T1)
+      assert.equal((await relayOnce(name, path, forged)).get(TRACE_ID_HEADER), T1)
+      release()
+      assert.equal((await relayOnce(name, path, forged)).get(TRACE_ID_HEADER), null)
+    })
+  }
 
   it('Codex relay: drops a caller trace header and sends the turn trace from x-codex-turn-metadata', async () => {
     const path = `${V3_CODEX_RELAY_PREFIX}/backend-api/codex/responses`
@@ -233,15 +255,72 @@ setTimeout(() => console.log(JSON.stringify({ type: 'end', stopReason: 'end_turn
         assert.ok(Date.now() < deadline, 'fake grok never started')
         await new Promise((r) => setTimeout(r, 10))
       }
-      assert.equal(grokRelayTrace(path), T1, 'while the turn process runs')
+      assert.equal(routeRelayTrace(path), T1, 'while the turn process runs')
       assert.ok(await run.summary)
       await adapter.waitForOutputDrain()
-      assert.equal(grokRelayTrace(path), undefined, 'after the turn')
+      assert.equal(routeRelayTrace(path), undefined, 'after the turn')
     } finally {
       if (prevBin === undefined) Reflect.deleteProperty(process.env, 'OC_GROK_CLI_BIN')
       else process.env.OC_GROK_CLI_BIN = prevBin
       if (prevStarted === undefined) Reflect.deleteProperty(process.env, 'FAKE_GROK_STARTED')
       else process.env.FAKE_GROK_STARTED = prevStarted
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('ZcodeAdapter registers its turn', () => {
+  it('the route token names the turn while its process runs, and nothing after', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'oc-zcode-relaytrace-'))
+    const fake = join(dir, 'fake-zcode.cjs')
+    const started = join(dir, 'started')
+    const result = { sessionId: 'sess_relaytrace', response: 'ok', usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } }
+    await writeFile(fake, `#!/usr/bin/env node
+require('node:fs').writeFileSync(${JSON.stringify(started)}, '1')
+setTimeout(() => process.stdout.write(${JSON.stringify(`${JSON.stringify(result)}\n`)}), 400)
+`)
+    await chmod(fake, 0o755)
+    const prevBin = process.env.OC_ZCODE_CLI_BIN
+    process.env.OC_ZCODE_CLI_BIN = fake
+    const path = `${V5_ZCODE_RELAY_PREFIX}/route/${TOKEN}/v1/messages`
+    try {
+      const adapter = new ZcodeAdapter({
+        sessionKey: 'agent:main:webchat:dm:zcode-relaytrace',
+        agentId: 'main',
+        agentBaseDir: dir,
+        config: {
+          version: 1,
+          gateway: { bind: '127.0.0.1', port: 0, accessToken: '' },
+          auth: { mode: 'subscription', claudeCodePath: '' },
+          sessions: { dbPath: '' },
+          defaults: { model: 'zcode-experimental' },
+        },
+        model: 'zcode-experimental',
+      } as unknown as EngineCreateOpts)
+      adapter.setZcodeRoute({ baseUrl: `http://127.0.0.1:18789${V5_ZCODE_RELAY_PREFIX}/route/${TOKEN}`, routeToken: TOKEN })
+      adapter.on('error', () => {})
+      adapter.setTraceId(T1)
+      const run = adapter.submitTurn({
+        input: 'hi',
+        requestId: 'b'.repeat(32),
+        turnKey: 'c'.repeat(64),
+        onEvent: () => {},
+        sessionTotals: { totalCostUSD: 0, turns: 0 },
+        toolUseIdToName: new Map(),
+      })
+      await run.submitted
+      const deadline = Date.now() + 5000
+      while (!(await stat(started).then(() => true, () => false))) {
+        assert.ok(Date.now() < deadline, 'fake zcode never started')
+        await new Promise((r) => setTimeout(r, 10))
+      }
+      assert.equal(routeRelayTrace(path), T1, 'while the turn process runs')
+      await run.summary
+      await adapter.waitForOutputDrain()
+      assert.equal(routeRelayTrace(path), undefined, 'after the turn')
+    } finally {
+      if (prevBin === undefined) Reflect.deleteProperty(process.env, 'OC_ZCODE_CLI_BIN')
+      else process.env.OC_ZCODE_CLI_BIN = prevBin
       await rm(dir, { recursive: true, force: true })
     }
   })

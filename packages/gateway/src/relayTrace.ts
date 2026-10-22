@@ -1,12 +1,12 @@
 /**
- * OCV5-580 (plan v3.6 §7.3 rows 2-3): which turn's canonical traceId a request through a container
- * loopback relay belongs to, so the relay can send it to egress as `x-openclaude-trace-id`.
+ * OCV5-580 / OCV5-595 (plan v3.6 §7.3 rows 2-3): which turn's canonical traceId a request through
+ * a container loopback relay belongs to, so the relay can send it to egress as `x-openclaude-trace-id`.
  *
- * Neither CLI sends our trace itself. The relays run in the same gateway process as the adapters,
+ * None of these CLIs sends our trace itself. The relays run in the same gateway process as the adapters,
  * so the adapters register their running turn here and the relay looks it up by something the
  * request itself carries:
- *   - Grok: the route token in the request path. Grok spawns per turn and a token serves one session,
- *     so while the turn's process lives, the token names exactly that turn.
+ *   - Grok, ZCode, Antigravity: the route token in the request path. Each spawns per turn and a token
+ *     serves one session, so while the turn's process lives, the token names exactly that turn.
  *   - Codex: `x-codex-turn-metadata.turn_id`, Codex's own JSON-RPC turn id (verified on codex-cli
  *     0.163: equals `turn/start` → `turn.id`, differs per turn). `root_turn_id` covers subagent turns.
  *     Before `turn/start` answers, a request on the thread can only belong to the turn being started,
@@ -19,7 +19,7 @@ import { parseTraceIdCandidate } from '@openclaude/protocol'
 const MAX_CODEX_TURNS = 512
 const MAX_TURN_METADATA_CHARS = 8192
 
-const grokRoutes = new Map<string, { traceId: string }>()
+const routeTokens = new Map<string, { traceId: string }>()
 const codexThreads = new Map<string, { traceId: string; turnId?: string }>()
 const codexTurns = new Map<string, string>()
 
@@ -29,24 +29,24 @@ function validTraceId(traceId: string | undefined): string | undefined {
   return trace.ok ? trace.traceId : undefined
 }
 
-/** Grok turn start: requests on this route token belong to `traceId` until the returned release. */
-export function bindGrokRouteTrace(routeToken: string, traceId: string | undefined): () => void {
+/** Per-turn CLI start: requests on this route token belong to `traceId` until the returned release. */
+export function bindRouteTrace(routeToken: string, traceId: string | undefined): () => void {
   const trace = validTraceId(traceId)
   if (trace === undefined) {
-    grokRoutes.delete(routeToken)
+    routeTokens.delete(routeToken)
     return () => {}
   }
   const entry = { traceId: trace }
-  grokRoutes.set(routeToken, entry)
+  routeTokens.set(routeToken, entry)
   return () => {
-    if (grokRoutes.get(routeToken) === entry) grokRoutes.delete(routeToken)
+    if (routeTokens.get(routeToken) === entry) routeTokens.delete(routeToken)
   }
 }
 
-/** The trace for a Grok relay request path (`…/route/<token>/…`), if its turn is running. */
-export function grokRelayTrace(pathname: string): string | undefined {
+/** The trace for a token-bound relay request path (`…/route/<token>/…`), if its turn is running. */
+export function routeRelayTrace(pathname: string): string | undefined {
   const m = /\/route\/([0-9a-f]{64})(?:\/|$)/.exec(pathname)
-  return m ? grokRoutes.get(m[1]!)?.traceId : undefined
+  return m ? routeTokens.get(m[1]!)?.traceId : undefined
 }
 
 /** Codex, before `turn/start`: the thread's next turn belongs to `traceId` until the returned release. */
@@ -121,7 +121,7 @@ export function codexRelayTrace(turnMetadata: string | string[] | undefined): st
 }
 
 export function _resetRelayTraceForTests(): void {
-  grokRoutes.clear()
+  routeTokens.clear()
   codexThreads.clear()
   codexTurns.clear()
 }
