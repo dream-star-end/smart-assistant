@@ -54,32 +54,64 @@ const SCRIPT_RUN = new RegExp(
   `${PREFIX}(?:npx(?:\\s+--no-install)?\\s+tsx|tsx|node|bash)\\s+((?:packages\\/[\\w.-]+\\/)?scripts\\/[\\w./-]+)`, "g");
 const NPM_RUN = new RegExp(`${PREFIX}npm run (\\S+)((?:\\s+--workspace\\s+\\S+)?)`, "g");
 
-/** Shell text → command lines: continuations joined, quoted text and comments dropped. */
-export function shellCommands(text: string): string[] {
-  return text.replace(/\\\n/g, " ").split("\n")
-    .map((raw) => raw.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''").replace(/(^|\s)#.*$/, "$1"));
-}
-
-/** Command lines of a shell function body: continuations joined, heredocs skipped, quoted text
- * and comments dropped, so a message or a file-presence test naming a gate is not a run. */
-export function functionCommands(src: string, name: string): string[] {
-  const lines = src.replace(/\\\n/g, " ").split("\n");
-  const start = lines.findIndex((line) => new RegExp(`^${name}\\(\\) \\{\\s*$`).test(line));
-  if (start < 0) return [];
+/** Drop heredoc bodies (the opening line stays): what a heredoc feeds is data, not a command. */
+function dropHeredocBodies(lines: string[]): string[] {
   const out: string[] = [];
   let heredoc: { tag: string; dash: boolean } | null = null;
-  for (const raw of lines.slice(start + 1)) {
+  for (const raw of lines) {
     if (heredoc) {
       if ((heredoc.dash ? raw.replace(/^\t+/, "") : raw) === heredoc.tag) heredoc = null;
       continue;
     }
-    if (/^\}/.test(raw)) break;
     const doc = /<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/.exec(raw);
     if (doc) heredoc = { tag: doc[3]!, dash: doc[1] === "-" };
-    // keep single-quoted env values like NODE_OPTIONS='…' harmless, drop all other quoted text
-    out.push(raw.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''").replace(/(^|\s)#.*$/, "$1"));
+    out.push(raw);
   }
   return out;
+}
+
+/** Replace every quoted string with '' and drop comments, tracking quote state across lines
+ * (Codex r2: a quote opened on one line and closed on a later one is still one string). A `#`
+ * starts a comment only at a word start outside quotes. Unbalanced input fails closed: the rest
+ * of the text reads as one string, so nothing after it counts as a run. */
+export function stripShell(text: string): string {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i]!;
+    if (c === "\\") { out += text.slice(i, i + 2); i += 2; continue; }
+    if (c === "'") {
+      const j = text.indexOf("'", i + 1);
+      out += "''"; i = j < 0 ? text.length : j + 1; continue;
+    }
+    if (c === '"') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+      out += "''"; i = j + 1; continue;
+    }
+    if (c === "#" && (i === 0 || /\s|[;&|(]/.test(text[i - 1]!))) {
+      const j = text.indexOf("\n", i);
+      i = j < 0 ? text.length : j; continue;
+    }
+    out += c; i++;
+  }
+  return out;
+}
+
+/** Shell text → command lines: heredoc bodies dropped, quoted text and comments dropped (quote
+ * state carried across lines), then continuations joined. */
+export function shellCommands(text: string): string[] {
+  return stripShell(dropHeredocBodies(text.split("\n")).join("\n")).replace(/\\\n/g, " ").split("\n");
+}
+
+/** Command lines of a shell function body, by the same rules as shellCommands, so a message or
+ * a file-presence test naming a gate is not a run. */
+export function functionCommands(src: string, name: string): string[] {
+  const lines = src.split("\n");
+  const start = lines.findIndex((line) => new RegExp(`^${name}\\(\\) \\{\\s*$`).test(line));
+  if (start < 0) return [];
+  const end = lines.findIndex((line, i) => i > start && /^\}/.test(line));
+  return shellCommands(lines.slice(start + 1, end < 0 ? undefined : end).join("\n"));
 }
 
 /** Scripts and npm-run commands the given command lines execute. */

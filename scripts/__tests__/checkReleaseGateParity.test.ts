@@ -73,6 +73,26 @@ test("red: a CI step that only prints, quotes or comments the gate does not run 
   assert.deepEqual(kinds(check(web)), ["ci-missing"]);
 });
 
+test("red: a quote or heredoc spanning lines that only prints the gate does not run it (Codex r2)", () => {
+  const wf = "v5-selfhost-release-gates.yml";
+  const step = "run: node scripts/check-v5-callback-payload-hash.mjs";
+  for (const fake of [
+    "run: |\n          echo '\n          node scripts/check-v5-callback-payload-hash.mjs\n          '",
+    "run: |\n          echo \"\n          node scripts/check-v5-callback-payload-hash.mjs\n          \"",
+    "run: |\n          cat <<'EOF'\n          node scripts/check-v5-callback-payload-hash.mjs\n          EOF",
+  ]) {
+    const input = real();
+    input.workflows[wf] = input.workflows[wf]!.replace(step, fake);
+    assert.ok(input.workflows[wf]!.includes("cat <<'EOF'") || input.workflows[wf]!.includes("echo"), fake);
+    assert.deepEqual(kinds(check(input)), ["ci-missing"], fake);
+  }
+});
+
+test("a comment with an apostrophe does not swallow the next command", () => {
+  const runs = runsIn(shellCommands("# don't run twice\nnode scripts/a.mjs\necho \"it's # not a comment\"\nbash scripts/b.sh # done"));
+  assert.deepEqual([...runs.scripts], ["scripts/a.mjs", "scripts/b.sh"]);
+});
+
 test("sudo/env prefixes at command position still count as a run", () => {
   const runs = runsIn(shellCommands([
     'sudo env "PATH=$PATH" "HOME=$HOME" npx --no-install tsx scripts/a.ts',
