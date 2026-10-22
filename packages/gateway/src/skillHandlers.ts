@@ -663,6 +663,11 @@ export async function _runSkillEvalGen(
   await this.skillEvalGenJobs.finishDone(run, Date.now(), { cases: finalized.cases, note })
 }
 
+export type SkillEvalTurnOpts = {
+    skillEvalExclude?: string
+    skillEvalDraft?: { name: string; dir: string }
+  }
+
 /** 跑一个被测/评分 turn:一次性会话,收最终文本+用量,完了销毁会话释放资源。 */
 export async function _skillEvalTurn(
   this: SkillHandlersHost,
@@ -670,10 +675,7 @@ export async function _skillEvalTurn(
   userId: string,
   prompt: string,
   model: string,
-  opts: {
-    skillEvalExclude?: string
-    skillEvalDraft?: { name: string; dir: string }
-  },
+  opts: SkillEvalTurnOpts,
 ): Promise<{
   text: string
   usage?: {

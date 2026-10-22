@@ -38,7 +38,10 @@ import { dirname, join } from 'node:path'
 
 import { MODEL_CATALOG_PATH, MODEL_CATALOG_EPOCH_PATH, MODEL_CATALOG_PROJECTION_FORMAT, BOX_NATIVE_CONTEXT_OWNER, isBoxApiModel } from '@openclaude/protocol'
 import { request as undiciRequest } from 'undici'
+import { createLogger } from './logger.js'
 import { resolveConnectorEndpoint } from './ocConnectorsClient.js'
+
+const catalogLog = createLogger({ module: 'modelCatalog' })
 
 export { MODEL_CATALOG_PATH, MODEL_CATALOG_EPOCH_PATH }
 
@@ -251,12 +254,7 @@ export class ModelCatalogClient {
     this.lkgPath = deps.lkgPath ?? defaultLkgPath(this.env)
     this.ttlMs = deps.ttlMs ?? CATALOG_TTL_MS
     this.timeoutMs = deps.timeoutMs ?? FETCH_TIMEOUT_MS
-    this.log =
-      deps.log ??
-      ((event, fields) => {
-        // eslint-disable-next-line no-console
-        console.warn(`[modelCatalog] ${event}`, JSON.stringify(fields))
-      })
+    this.log = deps.log ?? ((event, fields) => catalogLog.warn(event, fields))
   }
 
   /** 装配就绪?(env 不齐 = 个人版 / 非托管容器 → 调用方走本地既有判定,不经本客户端。) */
@@ -672,7 +670,12 @@ export function parseCatalogResponse(raw: unknown): LocalCatalogView {
     if (
       !r ||
       typeof r.model_id !== 'string' ||
-      (r.engine !== 'ccb' && r.engine !== 'codex' && r.engine !== 'grok' && r.engine !== 'cursor' && r.engine !== 'zcode' && r.engine !== 'antigravity') ||
+      (r.engine !== 'ccb' &&
+        r.engine !== 'codex' &&
+        r.engine !== 'grok' &&
+        r.engine !== 'cursor' &&
+        r.engine !== 'zcode' &&
+        r.engine !== 'antigravity') ||
       typeof r.supports_vision !== 'boolean' ||
       typeof r.capability_zero !== 'boolean' ||
       typeof r.supports_thinking !== 'boolean' ||
@@ -761,9 +764,7 @@ export function lookupCatalogAgentMultiplier(
   return view.agentCostOverrides.get(id) ?? '1.000'
 }
 
-function parseOptionalAgentCostOverrides(
-  raw: unknown,
-): ReadonlyMap<string, string> | null {
+function parseOptionalAgentCostOverrides(raw: unknown): ReadonlyMap<string, string> | null {
   if (raw === undefined) return null
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new ModelCatalogUnavailableError('catalog response agent_cost_overrides is not an object')

@@ -1,4 +1,4 @@
-import type { IdentityCompatProjection } from "@openclaude/protocol";
+import type { IdentityCompatProjection } from "@openclaude/protocol/browser";
 import { useEffect, useId, useRef, useState } from "react";
 import { AuthEpochStaleError, apiErrorMessage } from "../../lib/api";
 import { identityCompatApi, type PersonaDocument } from "../../lib/identityCompat";

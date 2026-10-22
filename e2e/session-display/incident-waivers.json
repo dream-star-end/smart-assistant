@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "scope": "Incident trailer 闭环门的豁免簿。凡 subject 匹配 ^fix(v5) 且触碰 packages/{gateway,commercial,web-react,protocol,storage} 的 commit,都必须在 trailer 写 `Incident: INC-YYYYMMDD-SLUG`;确实与任何事故无关的,写 `Incident: none (<理由>)` 并在此登记一条 waiver。waiver 必须带审批引用与到期日,过期即门红 —— 它是有时限的例外,不是永久出口。",
+  "scope": "Incident trailer 闭环门的豁免簿。凡 subject 匹配 ^fix(v5) 且触碰 packages/{gateway,commercial,web-react,protocol,storage,kernel} 的 commit,都必须在 trailer 写 `Incident: INC-YYYYMMDD-SLUG`;确实与任何事故无关的,写 `Incident: none (<理由>)` 并在此登记一条 waiver。waiver 必须带审批引用与到期日,过期即门红 —— 它是有时限的例外,不是永久出口。",
   "waivers": [
     {
       "commit": "c2d0923c3f0d875ee187a412b1ceb50f3253fb1b",
@@ -337,6 +337,18 @@
       "reason": "OCV5-453: backport of commercial 51790b628. getFreshAntigravityAccessToken loads the KMS key before checking out a pool client, so a key failure can no longer strand the client and hang pool.end(). Latent: selfhost has its KMS key, no user report; found through a commercial CI integ timeout. Unit test red without the fix.",
       "approvedBy": "user 2026-10-16 「开始回挂 cc3-sync 的连接泄漏修复 51790b628……到个人版」，按规范写 Incident: none 豁免（cc3 antigravity 会话）",
       "expiresAt": "2026-11-15"
+    },
+    {
+      "commit": "cceebbc1e62545947fd2311e6c78bc0979128fe4",
+      "reason": "OCV5-529: when a turn waiver zeroes a charge inside settleUsageAndLedger, the finalizers now write the settled 0 into request_finalize_journal and the committed log instead of the pre-settle amount. Bookkeeping only: users were already waived (usage 0, no ledger); no charge, wallet or message changes. Found during the cc3 catalog canary on 2026-10-20 (4 rows all-time, all turn_auto_waive).",
+      "approvedBy": "butler 2026-10-20 16:42 「扣费漏洞……单独开一个工单……修复 PR 走正常审查和 CI，两个版本都要查」（cc3-catalog 会话），按规范写 Incident: none 豁免",
+      "expiresAt": "2026-11-19"
+    },
+    {
+      "commit": "4e461a864637cd6700a499a123b6ad1ee3750c9f",
+      "reason": "OCV5-538: Box CC reap() matched fifo readers with a readlink fork per host process (seconds under load), so bridge closes waited out the 2 s stop-exec timeout; root cause of the flaky OCV5-488 LARGE_LINE_CLOSE / LARGE_LINE_REFUSED_HOST_LEFT_RUNNING gate failures. Latent, no user report; the close window and the proof are unchanged. Unit test red without the fix.",
+      "approvedBy": "user 2026-10-21 via 管家 「留意 OCV5-488 … 请查清为什么关闭慢，绝不能放宽这个检查」; cc3 full design authority 2026-10-20 20:26; Incident: none waiver per the rules (cc3-arch2 session)",
+      "expiresAt": "2026-11-20"
     }
   ]
 }

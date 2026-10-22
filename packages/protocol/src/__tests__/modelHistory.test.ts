@@ -180,7 +180,6 @@ test('user history with only an image still emits a reconstructable path', () =>
     _media: [{ kind: 'image', url: `/api/media/${digest}` }],
   })
   assert.match(semantic, new RegExp(`/home/agent/\\.openclaude/uploads/${digest}`))
-  assert.doesNotMatch(semantic, /oc-vision/)
 })
 
 test('plain text user history does not grow a media path section', () => {

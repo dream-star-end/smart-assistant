@@ -1,4 +1,4 @@
-import { MARKETPLACE_CATEGORIES, isMarketplaceCategoryId } from "@openclaude/protocol";
+import { MARKETPLACE_CATEGORIES, isMarketplaceCategoryId } from "@openclaude/protocol/browser";
 import { CheckCircle2, ChevronRight, Plus, Sparkles, Upload, X } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, api, apiErrorMessage } from "../../lib/api";

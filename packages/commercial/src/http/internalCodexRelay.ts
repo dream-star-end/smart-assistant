@@ -69,6 +69,7 @@ import { CODEX_RELAY_PREFIX } from '@openclaude/protocol'
 import { buildUpstreamHeaders, CODEX_UPSTREAM_AUTH_HEADER, HOP_BY_HOP_HEADERS } from './codexUpstreamHeaders.js'
 
 export { buildUpstreamHeaders, CODEX_UPSTREAM_AUTH_HEADER } from './codexUpstreamHeaders.js'
+import { egressTraceFields } from './egressTrace.js'
 
 export { CODEX_RELAY_PREFIX }
 
@@ -752,7 +753,9 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     res.setHeader(REQUEST_ID_HEADER, requestId)
 
     const method = req.method ?? 'GET'
-    const reqLog = log.child({ requestId, hostUuid: ctx.hostUuid, boundIp: ctx.boundIp, method })
+    const reqLog = log.child({
+      requestId, ...egressTraceFields(req), hostUuid: ctx.hostUuid, boundIp: ctx.boundIp, method,
+    })
 
     const routeReq = parseRouteRelayUrl(req.url ?? '/', method)
     if ('error' in routeReq) {

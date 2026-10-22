@@ -2,6 +2,7 @@ import type Docker from "dockerode";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { ensureAgentNetwork } from "./network.js";
+import { removeContainerSavingLogs } from "../compute-pool/containerLogArchive.js";
 import { ensureUserVolumes, volumeNamesFor } from "./volumes.js";
 import {
   type ContainerStatus,
@@ -443,7 +444,7 @@ export async function createContainer(
     } catch (startErr) {
       // start 失败要回滚 create,否则下次 create 会撞 NameConflict
       try {
-        await container.remove({ force: true });
+        await removeContainerSavingLogs(container, "start_failed");
       } catch {
         // 清理失败就吞,留给 lifecycle GC
       }
@@ -491,7 +492,7 @@ export async function stopContainer(docker: Docker, uid: number, timeoutSec = 5)
 export async function removeContainer(docker: Docker, uid: number): Promise<void> {
   const name = containerNameFor(uid);
   try {
-    await docker.getContainer(name).remove({ force: true });
+    await removeContainerSavingLogs(docker.getContainer(name), "remove");
   } catch (err) {
     if (isNotFound(err)) return;
     throw wrapDockerError(err);

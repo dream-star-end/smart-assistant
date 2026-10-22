@@ -39,7 +39,7 @@
  *      OC_PROVIDER_HEALTH_RECOVERY_PROBE_INTERVAL_MS 调周期(缺省 60s,夹 [15s, 1h])。
  */
 
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { STATIC_KEY_PROVIDERS, type StaticKeyProviderSpec } from '@openclaude/protocol'
 import { request } from 'undici'
 import { directEgressDispatcher } from '../account-pool/egressDispatcher.js'
@@ -75,6 +75,20 @@ interface RecoveryProberDeps {
   probeRequest?: RecoveryProbeRequest
   /** 只记成功样本;失败由日志承载(缺成功样本=不恢复,判定等价)。 */
   recordSuccess?: (providerId: string, model: string) => void
+  now?: () => number
+}
+
+/**
+ * ROB-4:401/402/403(凭据失效、欠费、被禁)靠重试不会好,要人工处理。这类失败按 provider 指数退避
+ * (基础间隔 ×2^n,上限 1h),不再每分钟探一次(曾经每天 ~1,450 条 402)。key 换了(人工修好)立即重探;
+ * 探活成功、provider 离开 auto+degraded 或遇到可恢复错误时清零。
+ */
+export const PERMANENT_PROBE_STATUSES: ReadonlySet<number> = new Set([401, 402, 403])
+export const PERMANENT_PROBE_BACKOFF_MAX_MS = 3_600_000
+
+/** 只用于比较“key 是否换了”;不落日志、不出进程。 */
+function keyFingerprint(key: string): string {
+  return createHash('sha256').update(key).digest('hex').slice(0, 16)
 }
 
 function probeCandidates(spec: StaticKeyProviderSpec): string[] {
@@ -226,7 +240,9 @@ export function startRecoveryProber(opts: {
   const q = opts._deps?.query ?? _query
   const probeRequest = opts._deps?.probeRequest ?? requestRecoveryProbe
   const recordSuccess = opts._deps?.recordSuccess ?? _recordSuccess
+  const now = opts._deps?.now ?? Date.now
   const log = opts.log
+  const backoff = new Map<string, { failures: number; nextAt: number; keyFp: string }>()
 
   const byId = new Map<string, StaticKeyProviderSpec>(STATIC_KEY_PROVIDERS.map((p) => [p.id, p]))
 
@@ -240,7 +256,10 @@ export function startRecoveryProber(opts: {
     for (const row of r.rows) {
       if (stopped) return
       // 过滤在代码而非 SQL:单测可注入任意 ops 行;全表 ≤9 行,无谓再压查询。
-      if (row.health_mode !== 'auto' || row.health_status !== 'degraded') continue
+      if (row.health_mode !== 'auto' || row.health_status !== 'degraded') {
+        backoff.delete(row.provider_id)
+        continue
+      }
       const spec = byId.get(row.provider_id)
       if (!spec) continue // 非静态 provider(account-pool 体系)不在本系统治理面
       let key: string | null
@@ -252,15 +271,38 @@ export function startRecoveryProber(opts: {
       }
       if (stopped) return
       if (!key) continue
+      const keyFp = keyFingerprint(key)
+      const held = backoff.get(spec.id)
+      if (held) {
+        if (held.keyFp === keyFp && now() < held.nextAt) continue
+        if (held.keyFp !== keyFp) {
+          log.info('recovery_probe_backoff_reset', { provider: spec.id, reason: 'key_changed' })
+          backoff.delete(spec.id)
+        }
+      }
       const res = await probeRequest(spec, key)
       if (res.ok) {
+        backoff.delete(spec.id)
         recordSuccess(spec.id, res.model)
         log.info('recovery_probe_ok', {
           provider: spec.id,
           status: res.statusCode,
           model: res.model,
         })
+      } else if (res.statusCode !== null && PERMANENT_PROBE_STATUSES.has(res.statusCode)) {
+        const failures = (backoff.get(spec.id)?.failures ?? 0) + 1
+        const delayMs = Math.min(intervalMs * 2 ** failures, PERMANENT_PROBE_BACKOFF_MAX_MS)
+        backoff.set(spec.id, { failures, nextAt: now() + delayMs, keyFp })
+        log.warn('recovery_probe_failed', {
+          provider: spec.id,
+          status: res.statusCode,
+          error: res.error,
+          model: res.model,
+          needsOperator: true,
+          nextProbeInMs: delayMs,
+        })
       } else {
+        backoff.delete(spec.id)
         log.warn('recovery_probe_failed', {
           provider: spec.id,
           status: res.statusCode,

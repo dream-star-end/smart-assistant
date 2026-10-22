@@ -71,7 +71,7 @@ test("QQ image first message ensures the container before resolving and saving i
     assert.equal(result.media[0]?.kind, "image");
     assert.match(result.media[0]?.filename ?? "", /^qq-image-[a-f0-9]{32}\.png$/);
     assert.match(result.promptText, /图里是什么？/);
-    assert.match(result.promptText, /oc-vision understand/);
+    assert.match(result.promptText, /直接读取内容/);
     assert.equal(
       await readFile(join(uploads, result.media[0]!.filename), "utf8"),
       "png-bytes",

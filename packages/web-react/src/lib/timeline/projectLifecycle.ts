@@ -12,7 +12,7 @@ import {
   packEpoch,
   timelineIdentity,
   type TimelineLifecycle,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/browser";
 import type { ChatMessage } from "../chat/model";
 
 export type LifecycleSlots = { content?: ChatMessage; locator?: ChatMessage };

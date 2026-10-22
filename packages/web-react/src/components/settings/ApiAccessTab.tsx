@@ -1,4 +1,4 @@
-import { publicCursorModelId } from "@openclaude/protocol";
+import { publicCursorModelId } from "@openclaude/protocol/browser";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ApiError,

@@ -11,7 +11,7 @@
  *  - MessageRenderer:仅该段(且本轮进行中)抑制 TodoWrite / structured plan 的 inline
  *    卡,历史段渲染只读卡 → 翻历史会话仍能看到当时的计划与完成状态。
  */
-import { normalizeTurnErrorCode } from "@openclaude/protocol";
+import { normalizeTurnErrorCode } from "@openclaude/protocol/browser";
 import { hasVisibleAssistantContent } from "../../lib/assistantVisibleContent";
 import type { ChatMessage } from "../../lib/chat/model";
 import { errorPresentation, isCollapsedAnchorTerminalEvidence } from "../../lib/chat/render";

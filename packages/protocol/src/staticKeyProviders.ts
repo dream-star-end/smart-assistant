@@ -124,6 +124,13 @@ export interface StaticKeyProviderSpec {
    */
   readonly modelOutputConfigEfforts?: Readonly<Record<string, readonly string[]>>
   /**
+   * Model-scoped native-vision allowlist, keyed by lowercase **upstream** model.
+   * A hit wins over `supportsVision`. OpenCode Go uses this because some Go models
+   * accept images natively while others are text-only (OCV5-547); the provider-wide
+   * flag alone cannot express that split.
+   */
+  readonly modelSupportsVision?: Readonly<Record<string, boolean>>
+  /**
    * 上游要求的「稳定会话 id」请求头名。声明后 master/egress 转发前必须带上
    * `<header>: <引擎原生 session id>`(取 `metadata.session_id` / `metadata.user_id` JSON 的
    * session_id;缺失时退化为每请求随机 UUID —— 只影响上游路由/缓存亲和,不影响正确性)。
@@ -171,7 +178,7 @@ export const OPENCODE_GO_CHAT_MODELS: Readonly<Record<string, string>> = {
   'hy3-go': 'hy3',
   'longcat-2.0-go': 'longcat-2.0',
   'longcat-2.5-preview-free-go': 'longcat-2.5-preview-free',
-  'step-5-preview-free-go': 'step-5-preview-free',
+  'step-5-preview-free-go': 'step-5-preview',
   'step-5-preview-go': 'step-5-preview',
   'minimax-m3.1-flash-free-go': 'minimax-m3.1-flash-free',
   'beam-free-go': 'beam-free',
@@ -431,7 +438,20 @@ const OPENCODE_GO: StaticKeyProviderSpec = {
     'muse-spark-1.2-contributor': ['low', 'high'],
   },
   maxInputTokens: 1_000_000,
-  // 红/蓝图像探针只消耗 reasoning、无可验证文本结果，按纯文本接入并启用 vision 工具兜底。
+  // Provider-wide default remains text-only; these Go upstream models accept images
+  // natively and must not be stripped (OCV5-547, audited on the Go gateway).
+  modelSupportsVision: {
+    'deepseek-v4.1-flash': true,
+    'minimax-m3': true,
+    'qwen3.7-plus': true,
+    'glm-5.3-flash': true,
+    'minimax-m3.1-flash-free': true,
+    'mimo-v2.5': true,
+    'mimo-v2.6-flash': true,
+    'step-5-preview': true,
+    'longcat-2.5-preview-free': true,
+    'muse-spark-1.3-contributor': true,
+  },
   supportsVision: false,
 }
 
@@ -622,6 +642,18 @@ export function getStaticProvider(id: StaticProviderId): StaticKeyProviderSpec {
  * the provider puts no limit on it. Single source for the proxy ceiling, the proxy rewrite and
  * `modelReasoningPolicy`.
  */
+export function staticProviderSupportsVision(
+  spec: StaticKeyProviderSpec,
+  upstreamModel?: string,
+): boolean {
+  const scoped =
+    upstreamModel === undefined
+      ? undefined
+      : spec.modelSupportsVision?.[upstreamModel.toLowerCase()]
+  if (scoped !== undefined) return scoped
+  return spec.supportsVision === true
+}
+
 export function staticProviderOutputConfigEfforts(
   spec: StaticKeyProviderSpec,
   upstreamModel?: string,

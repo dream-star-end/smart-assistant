@@ -2,6 +2,7 @@
   "files": [],
   "references": [
     { "path": "./packages/protocol" },
+    { "path": "./packages/kernel" },
     { "path": "./packages/storage" },
     { "path": "./packages/plugin-sdk" },
     { "path": "./packages/mcp-memory" },

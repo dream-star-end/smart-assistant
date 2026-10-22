@@ -75,6 +75,13 @@ describe('OpenCode Go /messages models', () => {
       assert.ok(!(id in OPENCODE_GO_MESSAGES_MODELS))
   })
 
+  it('OCV5-527 stable Step id uses the renamed chat-only upstream', () => {
+    assert.equal(GO.upstreamModelForRequest?.('step-5-preview-free-go'), 'step-5-preview')
+    assert.equal(GO.canonicalizeForPricing('step-5-preview-free-go'), 'step-5-preview-free-go')
+    assert.equal(isOpenCodeGoChatUpstream('step-5-preview'), true)
+    assert.equal(isOpenCodeGoResponsesUpstream('step-5-preview'), false)
+  })
+
   it('existing OpenCode Go routes are unchanged', () => {
     assert.equal(GO.upstreamModelForRequest?.('deepseek-v4-flash'), 'deepseek-v4-flash')
     assert.equal(

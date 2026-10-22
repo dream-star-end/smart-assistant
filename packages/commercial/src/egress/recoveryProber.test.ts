@@ -445,3 +445,98 @@ describe('requestRecoveryProbe — complete inference evidence', () => {
     )
   })
 })
+
+describe('ROB-4 — 401/402/403 按 provider 指数退避(需人工),key 换了立即重探', () => {
+  const degraded = [{ provider_id: 'opencodego', health_status: 'degraded', health_mode: 'auto' }]
+  function runAt(rows: OpsRow[], probe: RecoveryProbeRequest, clock: { t: number }) {
+    return startRecoveryProber({
+      resolveKey: async (provider) => keys[provider] ?? null,
+      log: fakeLog,
+      _deps: {
+        query: (async () => ({ rows })) as unknown as QueryFn,
+        probeRequest: probe,
+        recordSuccess: (providerId, model) => recorded.push({ providerId, model }),
+        now: () => clock.t,
+      },
+    })
+  }
+
+  test('402 后跳过,到期再探,间隔翻倍并封顶 1h', async () => {
+    const clock = { t: 1_000_000 }
+    let probes = 0
+    const h = runAt(degraded, async () => {
+      probes += 1
+      return failResult('m', 402)
+    }, clock)
+    assert.ok(h)
+    await h.runNow() // 第 1 次:402 → 退避 60s×2=120s
+    assert.equal(probes, 1)
+    clock.t += 60_000
+    await h.runNow()
+    assert.equal(probes, 1, '退避期内不探')
+    clock.t += 60_000
+    await h.runNow() // 到期:第 2 次 → 退避 240s
+    assert.equal(probes, 2)
+    clock.t += 239_000
+    await h.runNow()
+    assert.equal(probes, 2)
+    clock.t += 1_000
+    await h.runNow()
+    assert.equal(probes, 3)
+    for (let i = 0; i < 10; i++) {
+      clock.t += 3_600_000
+      await h.runNow()
+    }
+    assert.equal(probes, 13, '封顶 1h:每小时最多一次')
+    h.stop()
+  })
+
+  test('退避中换了 key → 立即重探并记 backoff_reset', async () => {
+    const clock = { t: 0 }
+    let probes = 0
+    const h = runAt(degraded, async () => {
+      probes += 1
+      return failResult('m', 401)
+    }, clock)
+    assert.ok(h)
+    await h.runNow()
+    const old = keys.opencodego
+    keys.opencodego = 'sk-opencodego-rotated'
+    try {
+      await h.runNow()
+      assert.equal(probes, 2)
+      assert.ok(logState.infos.includes('recovery_probe_backoff_reset'))
+    } finally {
+      keys.opencodego = old
+      h.stop()
+    }
+  })
+
+  test('离开 auto+degraded 清零;429/5xx/传输错误不退避', async () => {
+    const clock = { t: 0 }
+    const rows: OpsRow[] = [{ provider_id: 'opencodego', health_status: 'degraded', health_mode: 'auto' }]
+    let status: number | null = 403
+    let probes = 0
+    const h = runAt(rows, async () => {
+      probes += 1
+      return failResult('m', status)
+    }, clock)
+    assert.ok(h)
+    await h.runNow()
+    rows[0].health_status = 'healthy'
+    await h.runNow()
+    rows[0].health_status = 'degraded'
+    await h.runNow()
+    assert.equal(probes, 2, '离开降级后退避清零,回到降级立即探')
+    status = 429
+    clock.t += 3_600_000
+    await h.runNow() // 退避到期:429 是可恢复错误 → 清零
+    await h.runNow() // 不退避,照常探
+    status = 503
+    await h.runNow()
+    status = null
+    await h.runNow()
+    assert.equal(probes, 6, '429/503/传输错误每轮都探')
+    h.stop()
+  })
+})

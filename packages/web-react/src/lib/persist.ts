@@ -14,7 +14,7 @@
  *    无需真实 IndexedDB 即可单测核心逻辑。
  */
 import { TEAM_CARD_CLIENT_DISPLAY_FIELDS } from "@openclaude/protocol/teamCards";
-import { normalizeTurnErrorCode } from "@openclaude/protocol";
+import { normalizeTurnErrorCode } from "@openclaude/protocol/browser";
 import type {
   BashTail,
   ChatMessage,

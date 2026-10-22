@@ -73,10 +73,7 @@ export interface AskUserPermissionsHost {
   sessions: Gateway['sessions']
 }
 
-/** Handle permission approval/denial from the web frontend */
-export async function handlePermissionResponse(
-  this: AskUserPermissionsHost,
-  frame: {
+export type HandlePermissionResponseFrame = {
     type: 'inbound.permission_response'
     channel: string
     peer: { id: string; kind: 'dm' | 'group' }
@@ -89,7 +86,12 @@ export async function handlePermissionResponse(
      *  Sanitized via `sanitizeAskUserQuestionUpdatedInput` before being
      *  forwarded to CCB; untrusted client fields are dropped. */
     updatedInput?: Record<string, unknown>
-  },
+  }
+
+/** Handle permission approval/denial from the web frontend */
+export async function handlePermissionResponse(
+  this: AskUserPermissionsHost,
+  frame: HandlePermissionResponseFrame,
 ): Promise<void> {
   // Consume pending first so we can use its authoritative channel/peer/sessionKey
   // instead of trusting the client-supplied frame fields. For the not-found /
@@ -364,6 +366,16 @@ export async function handlePermissionResponse(
   })
 }
 
+export type BroadcastPermissionSettledPayload = {
+    sessionKey: string
+    channel: string
+    peer: { id: string; kind: 'dm' | 'group' }
+    requestId: string
+    behavior: 'allow' | 'deny'
+    reason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed' | 'user_stop'
+    answers?: Record<string, string>
+  }
+
 /** Broadcast a settlement event to all WS clients at a peerKey.
  *  `answers` is only set for AskUserQuestion allow settlements — lets
  *  other tabs render the collected answers in the permission card, and
@@ -372,15 +384,7 @@ export async function handlePermissionResponse(
 export function _broadcastPermissionSettled(
   this: AskUserPermissionsHost,
   peerKey: string,
-  payload: {
-    sessionKey: string
-    channel: string
-    peer: { id: string; kind: 'dm' | 'group' }
-    requestId: string
-    behavior: 'allow' | 'deny'
-    reason: 'remote' | 'already_settled' | 'disconnect' | 'timeout' | 'crashed' | 'user_stop'
-    answers?: Record<string, string>
-  },
+  payload: BroadcastPermissionSettledPayload,
 ): void {
   // Route through the stamped session-frame helper so the settlement is
   // recorded in the outbound ring buffer keyed by sessionKey. A reconnecting
@@ -559,14 +563,7 @@ export async function handleEngineAskUser(
   }
 }
 
-/**
- * Deliver an in-window ask_user answer over HTTP, or compensate with the
- * same dispatchInbound path used after timeout. `tryClaimDelivery` is the
- * synchronous one-shot so HTTP success and compensation cannot both fire.
- */
-export async function _finishInWindowAskUserWait(
-  this: AskUserPermissionsHost,
-  args: {
+export type FinishInWindowAskUserWaitArgs = {
     req: IncomingMessage
     res: ServerResponse
     waiter: AskUserWaiter
@@ -579,7 +576,16 @@ export async function _finishInWindowAskUserWait(
       peer: { id: string; kind: 'dm' | 'group' }
     }
     clientGone: boolean
-  },
+  }
+
+/**
+ * Deliver an in-window ask_user answer over HTTP, or compensate with the
+ * same dispatchInbound path used after timeout. `tryClaimDelivery` is the
+ * synchronous one-shot so HTTP success and compensation cannot both fire.
+ */
+export async function _finishInWindowAskUserWait(
+  this: AskUserPermissionsHost,
+  args: FinishInWindowAskUserWaitArgs,
 ): Promise<void> {
   const { req, res, waiter, result, requestId, pending, clientGone } = args
   const answer = result.answer
@@ -627,18 +633,20 @@ export async function _finishInWindowAskUserWait(
   waiter.tryClaimDelivery()
 }
 
+export type CompensateInWindowAskUserAnswerPending = {
+    sessionKey: string
+    userId: string
+    channel: string
+    peer: { id: string; kind: 'dm' | 'group' }
+  }
+
 /**
  * In-window answer could not be written back to the MCP HTTP caller.
  * Reuse the timeout-then-answer path: tape user-answer row + dispatchInbound.
  */
 export async function _compensateInWindowAskUserAnswer(
   this: AskUserPermissionsHost,
-  pending: {
-    sessionKey: string
-    userId: string
-    channel: string
-    peer: { id: string; kind: 'dm' | 'group' }
-  },
+  pending: CompensateInWindowAskUserAnswerPending,
   requestId: string,
   answer: AskUserWaiterAnswer,
 ): Promise<void> {
@@ -659,9 +667,7 @@ export async function _compensateInWindowAskUserAnswer(
   await this._submitDetachedAskUserAnswer(pending, answer.answerText, requestId, answerId)
 }
 
-export async function _persistDetachedAskUserCard(
-  this: AskUserPermissionsHost,
-  args: {
+export type PersistDetachedAskUserCardArgs = {
     requestId: string
     questions: Array<Record<string, unknown>>
     sessionKey: string
@@ -670,7 +676,11 @@ export async function _persistDetachedAskUserCard(
     peer: { id: string; kind: 'dm' | 'group' }
     expiresAt: number
     agentId: string
-  },
+  }
+
+export async function _persistDetachedAskUserCard(
+  this: AskUserPermissionsHost,
+  args: PersistDetachedAskUserCardArgs,
 ): Promise<void> {
   const msg = buildDetachedAskUserPersistMessage(args)
   const sink = getV3MasterSinkOrNull()
@@ -728,14 +738,16 @@ export async function _persistDetachedAskUserCard(
   }
 }
 
-export async function _patchDetachedAskUserResolved(
-  this: AskUserPermissionsHost,
-  pending: {
+export type PatchDetachedAskUserResolvedPending = {
     peer: { id: string; kind?: 'dm' | 'group' }
     userId: string
     sessionKey: string
     channel?: string
-  },
+  }
+
+export async function _patchDetachedAskUserResolved(
+  this: AskUserPermissionsHost,
+  pending: PatchDetachedAskUserResolvedPending,
   requestId: string,
   patch: Record<string, unknown>,
   userAnswer?: { id: string; text: string; ts?: number },
@@ -847,9 +859,7 @@ export async function _loadDetachedAskUserCard(
   return null
 }
 
-export async function _hydrateDetachedAskUserPending(
-  this: AskUserPermissionsHost,
-  frame: {
+export type HydrateDetachedAskUserPendingFrame = {
     requestId: string
     channel: string
     peer: { id: string; kind: 'dm' | 'group' }
@@ -857,7 +867,11 @@ export async function _hydrateDetachedAskUserPending(
      *  from the client frame — this is the only user identity we can trust
      *  once the in-memory pending entry is gone (restart / TTL rebuild). */
     _userId?: unknown
-  },
+  }
+
+export async function _hydrateDetachedAskUserPending(
+  this: AskUserPermissionsHost,
+  frame: HydrateDetachedAskUserPendingFrame,
 ): Promise<ReturnType<typeof pendingFromDetachedAskUserMessage>> {
   if (!isDetachedAskUserRequestId(frame.requestId)) return null
   const userId = typeof frame._userId === 'string' && frame._userId ? frame._userId : 'default'
@@ -876,14 +890,16 @@ export async function _hydrateDetachedAskUserPending(
   }
 }
 
-export async function _submitDetachedAskUserAnswer(
-  this: AskUserPermissionsHost,
-  pending: {
+export type SubmitDetachedAskUserAnswerPending = {
     sessionKey: string
     userId: string
     channel: string
     peer: { id: string; kind: 'dm' | 'group' }
-  },
+  }
+
+export async function _submitDetachedAskUserAnswer(
+  this: AskUserPermissionsHost,
+  pending: SubmitDetachedAskUserAnswerPending,
   text: string,
   requestId: string,
   clientMessageId: string = buildDetachedAskUserAnswerMessageId(requestId),

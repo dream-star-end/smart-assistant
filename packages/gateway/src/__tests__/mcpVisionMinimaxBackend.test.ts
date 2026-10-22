@@ -3,7 +3,6 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
-import { STATIC_KEY_PROVIDERS } from '@openclaude/protocol'
 import {
   LOCAL_CATALOG_HEADER,
   type ModelCatalogClient,
@@ -39,86 +38,6 @@ async function withEnv<T>(patch: Record<string, string | undefined>, fn: () => T
     }
   }
 }
-
-describe('shouldEnableOpenClaudeVision gating', () => {
-  it('catalog supportsVision override 是最高权威(动态 model id 不查 baked 表)', () => {
-    assert.equal(vision.shouldEnableOpenClaudeVision('unknown', 'dynamic-model', false), true)
-    assert.equal(vision.shouldEnableOpenClaudeVision('deepseek', 'deepseek-v4-pro', true), false)
-  })
-  it('纯文本静态模型(deepseek/glm-5.1/glm-5.2)→ true', () => {
-    assert.equal(vision.shouldEnableOpenClaudeVision('deepseek', 'deepseek-v4-pro'), true)
-    assert.equal(vision.shouldEnableOpenClaudeVision('ark', 'glm-5.1'), true)
-    assert.equal(vision.shouldEnableOpenClaudeVision('ark', 'glm-5.2'), true)
-    assert.equal(vision.shouldEnableOpenClaudeVision(undefined, 'GLM-5.2'), true)
-    assert.equal(vision.shouldEnableOpenClaudeVision('ark', 'glm-5.3'), true)
-  })
-  it('MiniMax-M3(原生多模态)→ false(它直接识图,不注入工具)', () => {
-    assert.equal(vision.shouldEnableOpenClaudeVision('minimax', 'MiniMax-M3'), false)
-    assert.equal(vision.shouldEnableOpenClaudeVision('minimax', 'minimax-m3'), false)
-  })
-  it('多模态/未知模型 → false', () => {
-    assert.equal(
-      vision.shouldEnableOpenClaudeVision('claude-subscription', 'claude-opus-4-7'),
-      false,
-    )
-    assert.equal(vision.shouldEnableOpenClaudeVision('codex-native', 'gpt-5.6-sol'), false)
-  })
-  it('OPENCLAUDE_VISION_MCP_DISABLED=1 → 全 false', async () => {
-    await withEnv({ OPENCLAUDE_VISION_MCP_DISABLED: '1' }, () => {
-      assert.equal(vision.shouldEnableOpenClaudeVision('ark', 'glm-5.2'), false)
-    })
-  })
-  it('纯文本静态成员(OpenCode Go / kimi-k2.7-code,supportsVision=false)→ true', () => {
-    // 派生自 protocol supportsVision,不再依赖 gateway 侧字面量 allowlist。
-    assert.equal(vision.shouldEnableOpenClaudeVision('opencodego', 'deepseek-v4-flash'), true)
-    assert.equal(vision.shouldEnableOpenClaudeVision('opencodego', 'deepseek-v4-flash-opencode-go'), true)
-    assert.equal(vision.shouldEnableOpenClaudeVision('opencodego', 'qwen3.7-max'), true)
-    assert.equal(vision.shouldEnableOpenClaudeVision('opencodego', 'qwen3.7-plus'), true)
-    assert.equal(vision.shouldEnableOpenClaudeVision('kimi', 'kimi-k2.7-code'), true)
-  })
-  it('OPENCLAUDE_VISION_MCP_PROVIDERS opt-in → 非静态 provider 也注入', async () => {
-    await withEnv({ OPENCLAUDE_VISION_MCP_PROVIDERS: 'customtext' }, () => {
-      assert.equal(vision.shouldEnableOpenClaudeVision('customtext', 'some-text-model'), true)
-      assert.equal(vision.shouldEnableOpenClaudeVision('otherprov', 'some-text-model'), false)
-    })
-  })
-})
-
-// 反漂移守护:gateway 的识图工具 gating 必须逐 spec 等于 protocol 的 supportsVision
-// 权威(纯文本 supportsVision!==true → 注入)。新增静态模型只要在 protocol 登记,
-// 本断言自动覆盖 —— 忘同步 gateway 字面量导致"发图无识图工具"的漂移不可能再发生。
-describe('vision gating 派生自 protocol supportsVision(反漂移)', () => {
-  it('每个静态 provider 的每个 inbound model:shouldEnable === (supportsVision !== true)', () => {
-    for (const p of STATIC_KEY_PROVIDERS) {
-      const expected = p.supportsVision !== true
-      for (const modelId of p.inboundModelIds) {
-        assert.equal(
-          vision.shouldEnableOpenClaudeVision(p.id, modelId),
-          expected,
-          `${p.id}/${modelId}: shouldEnable 应 === supportsVision!==true (${expected})`,
-        )
-        // isTextOnlyStaticVisionModel 是 gating 的派生核心,单独锁一遍。
-        assert.equal(vision.isTextOnlyStaticVisionModel(modelId), expected, `${modelId} textOnly`)
-      }
-    }
-  })
-  it('非静态模型(claude/codex/未注册)→ isTextOnlyStaticVisionModel false', () => {
-    assert.equal(vision.isTextOnlyStaticVisionModel('claude-opus-4-8'), false)
-    assert.equal(vision.isTextOnlyStaticVisionModel('gpt-5.6-sol'), false)
-    assert.equal(vision.isTextOnlyStaticVisionModel('totally-unknown-model'), false)
-    assert.equal(vision.isTextOnlyStaticVisionModel(undefined), false)
-  })
-  it('isTextOnlyDefinite:静态纯文本 true;cursor/claude/gpt false;opt-in provider true', async () => {
-    assert.equal(vision.isTextOnlyDefinite('deepseek', 'deepseek-v4-pro'), true)
-    assert.equal(vision.isTextOnlyDefinite('cursor', 'cursor-fable-5.1-high'), false)
-    assert.equal(vision.isTextOnlyDefinite('claude-subscription', 'claude-opus-4-7'), false)
-    assert.equal(vision.isTextOnlyDefinite('codex-native', 'gpt-5.5'), false)
-    await withEnv({ OPENCLAUDE_VISION_MCP_PROVIDERS: 'customtext' }, () => {
-      assert.equal(vision.isTextOnlyDefinite('customtext', 'some-text-model'), true)
-      assert.equal(vision.isTextOnlyDefinite('otherprov', 'some-text-model'), false)
-    })
-  })
-})
 
 describe('vision backend cap/timeout(商业版与 selfhost 默认 Grok 4.7)', () => {
   it('默认(无 env)→ grok backend,cap 5MB / 120s', async () => {

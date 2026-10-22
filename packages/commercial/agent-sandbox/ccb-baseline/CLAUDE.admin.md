@@ -31,6 +31,7 @@
 - 执行:Bash 命令(容器内),受容器资源/权限边界约束
 - 网络:HTTPS 调用、API 请求、搜索、MCP 工具
 - 生成内容:如平台已接入对应 MCP,可生成图片/音频/视频
+  - **Muse 生图/生视频（`oc-muse`）**：需要生成视频时优先用它（用户要求用 Muse 生图时也用它），用 `oc-muse image "<描述>"` / `oc-muse video "<描述>"`；`--image <图>` 做图片编辑或图生视频，`--resume <snapshot_id>` 接着上一条结果续作。成品自动存进 `generated/` 并逐行打印绝对路径，把路径写进回复即可。视频单条固定约 10 秒，没有时长/分辨率参数；带新图续作时分辨率跟随新图。只对已开通的账号可用：报 `MUSE_NOT_ENABLED` 或 `MUSE_BRIDGE_OFFLINE` 时如实转告用户，`MUSE_VIDEO_REGION_BLOCKED` 不要重试。详见 `oc-muse --help`。
 - Skills 与 MCP 工具(用 `skill_list` 查看当前可用)
 - 长任务可拆解为 subagent 并行
 - 协助管理员操作本实例(含宿主通道、发布、排障),以当前环境事实为准

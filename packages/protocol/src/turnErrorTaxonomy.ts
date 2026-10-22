@@ -95,6 +95,10 @@ export const TURN_ERROR_TAXONOMY = {
   engine_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
   internal_error: { retryable: true, automaticRecovery: true, cta: 'retry' },
   auth_error: { retryable: false, cta: 'relogin' },
+  /** gateway errorClassify: a platform-issued engine credential expired mid-turn
+   * (OCV5-556). The next message gets a fresh one, so a manual retry works;
+   * automatic recovery would replay the same failure. */
+  platform_credential_expired: { retryable: true, cta: 'retry' },
   service_restart: { retryable: true, automaticRecovery: true, cta: 'retry', expected: true },
   session_persist_unavailable: { retryable: true, cta: 'retry' },
   /** Soft-deleted conversation. Same-peer retry cannot revive it; restore from
@@ -241,6 +245,26 @@ export function isSilentAutomaticRecoveryError(code: string): boolean {
  * intentionally ignored. Any model text, tool boundary or non-zero token
  * observation keeps the ordinary recovery budget available. */
 export function hasMeaningfulAutomaticRecoveryProgress(records: readonly unknown[]): boolean {
+  return recordsShowProgress(records,
+    /(?:input|output|cacheRead|cacheWrite|cacheCreation|reasoning|total)[_]?tokens/i, () => false)
+}
+
+/** Usage counters of one call or one turn, matched whole: `maxOutputTokens`
+ * and `contextWindow` are model limits, not usage. */
+const TURN_USAGE_TOKEN_KEY =
+  /^(?:input|output|total|reasoning|reasoning_?output|cache_?read(?:_?input)?|cache_?write|cache_?creation(?:_?input)?)_?tokens$/i
+
+/** OCV5-571 (#75f47e31): the same evidence restricted to this turn. Claude
+ * Code's closing `result` event carries `modelUsage`, summed over the whole
+ * CLI session (it repeated the first turn's 52k cache tokens on every empty
+ * recovery) and listing `maxOutputTokens`; this turn's own count is its
+ * `usage`, which stays here. */
+function hasCurrentTurnRecoveryProgress(records: readonly unknown[]): boolean {
+  return recordsShowProgress(records, TURN_USAGE_TOKEN_KEY, (key) => key === 'modelUsage')
+}
+
+function recordsShowProgress(records: readonly unknown[], tokenKey: RegExp,
+  skipKey: (key: string) => boolean): boolean {
   let progressed = false
   const seen = new Set<unknown>()
   const visit = (value: unknown): void => {
@@ -270,8 +294,9 @@ export function hasMeaningfulAutomaticRecoveryProgress(records: readonly unknown
       return
     }
     for (const [key, nested] of Object.entries(row)) {
+      if (skipKey(key)) continue
       if (
-        /(?:input|output|cacheRead|cacheWrite|cacheCreation|reasoning|total)[_]?tokens/i.test(key) &&
+        tokenKey.test(key) &&
         typeof nested === 'number' && Number.isFinite(nested) && nested > 0
       ) {
         progressed = true
@@ -444,7 +469,8 @@ export function emptyRecoveryRepeatsModelPlaneFailure(input: {
   if (input.currentAttempt < 1) return false
   if (!MODEL_PLANE_CHECKPOINT_CODES.has(normalizeTurnErrorCode(input.errorCode))) return false
   // Its text is not output; any usage it carries still counts as progress.
-  return !hasMeaningfulAutomaticRecoveryProgress(
+  // Only this turn's usage counts (OCV5-571); the other gates keep the wider rule.
+  return !hasCurrentTurnRecoveryProgress(
     input.records.map((record) => isCliApiErrorRow(record)
       ? { ...(record as Record<string, unknown>), text: '' } : record),
   )

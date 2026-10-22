@@ -1,9 +1,9 @@
-import type { LiveChildBlock, LiveUnit, LiveUnitsPage } from "@openclaude/protocol";
+import type { LiveChildBlock, LiveUnit, LiveUnitsPage } from "@openclaude/protocol/browser";
 import {
   EPOCH_BAND,
   packEpoch,
   timelineIdentity,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/browser";
 import type { ChatMessage, ChildBlock } from "./model";
 
 export function isLiveUnitsPage(value: unknown): value is LiveUnitsPage {

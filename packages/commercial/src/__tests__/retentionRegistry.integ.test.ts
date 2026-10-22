@@ -122,7 +122,7 @@ describe("retention 注册表内部自洽(不连库)", () => {
 
   test("每个 deferred 条目都带 owner + 到期日 + 说明", () => {
     const deferred = Object.entries(RETENTION_REGISTRY).filter(([, d]) => d.kind === "deferred");
-    assert.ok(deferred.length > 0, "deferred 档不应为空(至少 marketplace/response/wechat_audit)");
+    // OCV5-537 起三条历史 deferred 已裁定,档可以为空;到期即红由 retentionDecisions.unit.test.ts 负责。
     for (const [table, d] of deferred) {
       assert.equal(d.kind, "deferred");
       const meta = d as Extract<RetentionDisposition, { kind: "deferred" }>;

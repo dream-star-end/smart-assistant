@@ -10,7 +10,7 @@ import {
   isDelegateTerminalState,
   type DelegateJobState,
   type InflightDelegateSurface,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/browser";
 import { bearerHeaders, callWithRefresh } from "../api";
 import type { AuthSession } from "../types";
 import { agentGroupRunId, type ChatMessage } from "./model";

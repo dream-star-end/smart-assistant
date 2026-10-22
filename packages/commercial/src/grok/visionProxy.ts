@@ -1,6 +1,6 @@
 // Master-side image understanding on Grok 4.7 (grok-build).
 //
-// This is the backend of the container's understand_image / oc-vision /
+// This is the backend of the container's oc-figcheck vision review /
 // oc-figcheck tools. The Grok engine itself only takes a text prompt, so the
 // image never reaches Grok through an engine turn; here the container hands the
 // image and the question to the master, and the master calls the official CLI

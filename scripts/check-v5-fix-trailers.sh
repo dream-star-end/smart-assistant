@@ -42,7 +42,7 @@ MARKER="e2e/session-display/incident-trailer-enforced-from"
 CHECKER="scripts/check-v5-incident-regressions.ts"
 INCIDENTS="e2e/session-display/incidents.json"
 WAIVERS="e2e/session-display/incident-waivers.json"
-SURFACES=(packages/gateway/ packages/commercial/ packages/web-react/ packages/protocol/ packages/storage/)
+SURFACES=(packages/gateway/ packages/commercial/ packages/web-react/ packages/protocol/ packages/storage/ packages/kernel/)
 INC_RE='^INC-[0-9]{8}-[A-Z0-9-]{3,40}$'
 # 与 TS 门完全相同的唯一 exact emergency 例外(不可变 P0 containment)。
 EMERGENCY_SHA="aa583b702d5e454801e90ff3c6b25df38e808a98"

@@ -1133,17 +1133,6 @@ const OC_ROWS: Row[] = [
     },
   },
   {
-    key: 'vision',
-    message: {
-      toolName: 'Bash',
-      inputJson: {
-        command: 'oc-vision understand /home/agent/uploads/receipt.jpg --prompt "发票金额与日期"',
-      },
-      output: '金额:¥1,280.00;开票日期:2026-09-12;销售方:某某科技有限公司。',
-      _completed: true,
-    },
-  },
-  {
     key: 'task',
     message: {
       toolName: 'Bash',

@@ -10,12 +10,12 @@ import type {
   MarketplaceCapabilityRef,
   MarketplacePluginType,
   MarketplaceReviewSource,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/browser";
 
 export type {
   MarketplaceCapabilityReadiness,
   MarketplaceCapabilityRef,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/browser";
 
 /**
  * 当前用户。`displayName` / `roles` 是 UI 既有展示字段（Sidebar / SettingsCenter 等读它），

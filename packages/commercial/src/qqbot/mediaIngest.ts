@@ -431,7 +431,7 @@ function buildQqMediaPrompt(text: string | undefined, media: SavedQqMedia[]): st
   if (media.some((item) => item.kind === "image")) {
     lines.push(
       "",
-      '图片如果你看不到内容，先用 Bash 调 `oc-vision understand <图片本地路径> --prompt "<问题>"` 命令识图，再基于返回内容回答。不要说用户没有上传图片。',
+      '图片请直接读取内容并据此回答。不要说用户没有上传图片;不要调用已下线的 oc-vision。',
     );
   }
   if (media.some((item) => item.kind !== "image")) {

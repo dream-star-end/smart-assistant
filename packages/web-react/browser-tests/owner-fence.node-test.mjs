@@ -29,6 +29,7 @@ test("Composer owner fence (real Chromium, no backend)", { timeout: 120_000 }, a
     loader: { ".css": "empty" },
     alias: {
       "node:crypto": fileURLToPath(new URL("./stubs/node-crypto.js", import.meta.url)),
+      "@openclaude/protocol/browser": fileURLToPath(new URL("../../protocol/src/browser.ts", import.meta.url)),
       "@openclaude/protocol": fileURLToPath(new URL("../../protocol/src/index.ts", import.meta.url)),
     },
     define: { "process.env.NODE_ENV": '"production"', "import.meta.env.MODE": '"production"' },

@@ -8,7 +8,7 @@ import { BOX_PROMPT_LAYOUT_STATIC_FIRST } from "./boxNativePointer.js";
 import { createHash, randomUUID } from "node:crypto";
 import type { ProxyBody } from "./shared.js";
 import { BoxCacheAnnotationError, normalizeBoxSemanticBody,
-  strictBoxImageBlock } from "./boxCacheAnnotations.js";
+  strictBoxDocumentBlock, strictBoxImageBlock } from "./boxCacheAnnotations.js";
 
 export class BoxMessagesShapeError extends Error {
   constructor(readonly code: string) {
@@ -154,7 +154,8 @@ function validateContent(content: unknown, role: "user" | "assistant"): void {
           && block.content.every((part) => part !== null && typeof part === "object"
             && !Array.isArray(part)
             && ((part.type === "text" && typeof part.text === "string")
-              || strictBoxImageBlock(part) !== null))))) continue;
+              || strictBoxImageBlock(part) !== null
+              || strictBoxDocumentBlock(part) !== null))))) continue;
     // Preserve signed completed thinking history exactly. It is not rendered
     // as plaintext or treated as a new model request; malformed signatures
     // and unsupported extra fields still fail closed.
@@ -168,6 +169,10 @@ function validateContent(content: unknown, role: "user" | "assistant"): void {
     // OCV5-377: Claude Code's own images after tool results (staged inside
     // the last result for the Box CLI, see compileBoxCliSyntheticTurn).
     if (role === "user" && block.type === "image" && strictBoxImageBlock(block) !== null
+      && blocks(content).some((item) => item.type === "tool_result")) continue;
+    // OCV5-571: the PDF a Read returned, in the current exchange or any later
+    // history (Claude Code keeps it there until compaction).
+    if (role === "user" && strictBoxDocumentBlock(block) !== null
       && blocks(content).some((item) => item.type === "tool_result")) continue;
     // No silent multimodal or unknown thinking downgrade.
     throw new BoxMessagesShapeError("BOX_BLOCK_UNSUPPORTED");
@@ -200,7 +205,8 @@ function resultText(content: unknown): string {
   if (!Array.isArray(content)) return "";
   return content.map((part) => {
     const item = part as { type?: unknown; text?: unknown };
-    return item?.type === "text" && typeof item.text === "string" ? item.text : "[image]";
+    return item?.type === "text" && typeof item.text === "string" ? item.text
+      : item?.type === "document" ? "[document]" : "[image]";
   }).join("\n");
 }
 
@@ -328,7 +334,8 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
     // OCV5-377: images may follow too (e.g. Claude Code's own resized-image
     // blocks). The Box CLI takes images only inside tool results, so they
     // join the last result, beside the images that Read already returned.
-    const all = Array.isArray(current.content) ? current.content : [];
+    // OCV5-571: so does the document of a PDF Read, into its own result.
+    const all =Array.isArray(current.content) ? current.content : [];
     const cut = all.findIndex((block) => blocks([block])[0]?.type !== "tool_result");
     const tail = cut < 0 ? [] : all.slice(cut);
     const isText = (block: unknown): boolean => {
@@ -336,20 +343,34 @@ export function compileBoxCliSyntheticTurn(body: ProxyBody, args: {
       return item?.type === "text" && typeof item.text === "string" && item.text.trim().length > 0;
     };
     const isImage = (block: unknown): boolean => blocks([block])[0]?.type === "image";
-    const answeredTail = tail.length > 0 && tail.every((block) => isText(block) || isImage(block));
+    // OCV5-571: a Read PDF (validated by validateContent above).
+    const isDocument = (block: unknown): boolean => blocks([block])[0]?.type === "document";
+    const answeredTail = tail.length > 0
+      && tail.every((block) => isText(block) || isImage(block) || isDocument(block));
     if (!args.resumeToolResults || cut === 0 || (tail.length > 0 && !answeredTail)) {
       throw new BoxMessagesShapeError("BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION");
     }
     if (answeredTail) {
       const results = all.slice(0, cut) as Block[];
-      const images = tail.filter(isImage) as Block[];
-      if (images.length > 0) {
-        const last = results[results.length - 1]!;
-        const prior = typeof last.content === "string"
-          ? (last.content.length > 0 ? [{ type: "text", text: last.content }] : [])
-          : Array.isArray(last.content) ? last.content : [];
-        results[results.length - 1] = { ...last, content: [...prior, ...images] };
+      const join = (index: number, extra: Block[]): void => {
+        const result = results[index]!;
+        const prior = typeof result.content === "string"
+          ? (result.content.length > 0 ? [{ type: "text", text: result.content }] : [])
+          : Array.isArray(result.content) ? result.content : [];
+        results[index] = { ...result, content: [...prior, ...extra] };
+      };
+      // Each document joins the Read that announced it ("PDF file read: …",
+      // in order); when the count does not match, all join the last result.
+      const documents = tail.filter(isDocument) as Block[];
+      const pdfReads = results.flatMap((result, index) => typeof result.content === "string"
+        && result.content.startsWith("PDF file read: ") ? [index] : []);
+      if (documents.length > 0 && pdfReads.length === documents.length) {
+        documents.forEach((document, n) => join(pdfReads[n]!, [document]));
+      } else if (documents.length > 0) {
+        join(results.length - 1, documents);
       }
+      const images = tail.filter(isImage) as Block[];
+      if (images.length > 0) join(results.length - 1, images);
       const texts = tail.filter(isText) as Block[];
       if (texts.length > 0) prompt = texts;
       current = { ...current, content: results };

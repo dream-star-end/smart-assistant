@@ -17,7 +17,7 @@ import {
   type CursorContextTier,
   DEFAULT_CURSOR_CONTEXT_TIER,
   isCursorContextTier,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/browser";
 
 export const CONTEXT_TIER_GLOBAL_KEY = "oc_v5_context_tier";
 

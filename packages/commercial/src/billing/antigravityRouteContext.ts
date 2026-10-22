@@ -11,12 +11,20 @@ import { createHash, randomBytes } from 'node:crypto'
 import { ANTIGRAVITY_RELAY_PREFIX, isAntigravityEngineModel } from '@openclaude/protocol'
 
 export { ANTIGRAVITY_RELAY_PREFIX }
-/** Long turns keep calling the relay; the bridge expires the route at the end. */
+/**
+ * Idle window: each call that finds less than half of it left renews it, so a
+ * long turn keeps its route (OCV5-556: an 82-minute turn outlived a fixed
+ * 60-minute route). The bridge expires the route when the turn ends.
+ */
 export const ANTIGRAVITY_RELAY_TTL_MS = 60 * 60 * 1000
+/** Renewals stop here, counted from mint, for turns that never end. */
+export const ANTIGRAVITY_RELAY_MAX_LIFETIME_MS = 6 * 60 * 60 * 1000
 
 const TOKEN_RE = /^[0-9a-f]{64}$/
 const REQUEST_ID_RE = /^[0-9a-f]{32}$/
 const KV_PREFIX = 'oc:v5:antigravity-relay:'
+/** requestKey value once the turn ended; a racing renewal sees it and backs out. */
+const EXPIRED_MARK = 'expired'
 
 export type AntigravityRelayRoute = {
   token: string
@@ -28,6 +36,8 @@ export type AntigravityRelayRoute = {
   /** Spendable credits at admission; the relay stops new generate calls past it. */
   budgetCredits: bigint
   expiresAt: number
+  /** Renewal ceiling; rows minted before renewal existed carry expiresAt here. */
+  maxExpiresAt: number
 }
 
 export type AntigravityRelayKv = {
@@ -61,6 +71,7 @@ function serialize(row: AntigravityRelayRoute): string {
     accountId: row.accountId.toString(),
     budgetCredits: row.budgetCredits.toString(),
     expiresAt: row.expiresAt,
+    maxExpiresAt: row.maxExpiresAt,
   })
 }
 
@@ -80,6 +91,10 @@ function deserialize(token: string, raw: string): AntigravityRelayRoute | null {
   if (typeof body.requestId !== 'string' || !REQUEST_ID_RE.test(body.requestId)) return null
   if (typeof body.modelId !== 'string' || !isAntigravityEngineModel(body.modelId)) return null
   if (typeof body.expiresAt !== 'number' || !Number.isFinite(body.expiresAt)) return null
+  const maxExpiresAt =
+    typeof body.maxExpiresAt === 'number' && Number.isFinite(body.maxExpiresAt)
+      ? body.maxExpiresAt
+      : body.expiresAt
   return {
     token,
     containerId: body.containerId as number,
@@ -89,6 +104,7 @@ function deserialize(token: string, raw: string): AntigravityRelayRoute | null {
     accountId: BigInt(body.accountId),
     budgetCredits: BigInt(body.budgetCredits),
     expiresAt: body.expiresAt,
+    maxExpiresAt,
   }
 }
 
@@ -102,6 +118,7 @@ export async function mintAntigravityRelayRoute(args: {
   relayPort: number
   nowMs?: number
   ttlMs?: number
+  maxLifetimeMs?: number
 }): Promise<{ token: string; baseUrl: string }> {
   if (!Number.isInteger(args.containerId) || args.containerId <= 0) {
     throw new Error('antigravity relay containerId is invalid')
@@ -121,6 +138,7 @@ export async function mintAntigravityRelayRoute(args: {
   const token = randomBytes(32).toString('hex')
   const now = args.nowMs ?? Date.now()
   const ttl = args.ttlMs ?? ANTIGRAVITY_RELAY_TTL_MS
+  const maxExpiresAt = now + Math.max(ttl, args.maxLifetimeMs ?? ANTIGRAVITY_RELAY_MAX_LIFETIME_MS)
   const row: AntigravityRelayRoute = {
     token,
     containerId: args.containerId,
@@ -130,11 +148,12 @@ export async function mintAntigravityRelayRoute(args: {
     accountId: args.accountId,
     budgetCredits: args.budgetCredits,
     expiresAt: now + ttl,
+    maxExpiresAt,
   }
   if (kv) {
-    const ttlSec = Math.max(1, Math.ceil(ttl / 1000))
-    await kv.set(tokenKey(token), serialize(row), ttlSec)
-    await kv.set(requestKey(args.requestId), tokenKey(token), ttlSec)
+    await kv.set(tokenKey(token), serialize(row), ttlSeconds(ttl))
+    // Outlives every renewal of the token key, so the turn end can always find it.
+    await kv.set(requestKey(args.requestId), tokenKey(token), ttlSeconds(maxExpiresAt - now))
   } else {
     routes.set(token, row)
   }
@@ -166,7 +185,39 @@ export async function resolveAntigravityRelayRoute(args: {
   }
   if (row.containerId !== args.containerId) return null
   if (row.userId !== BigInt(args.userId)) return null
-  return row
+  // A renewal racing the turn end can briefly write the token key back; the
+  // request's mark is authoritative, so no call is served after the turn ended.
+  if (kv && (await kv.get(requestKey(row.requestId))) === EXPIRED_MARK) {
+    await kv.del(tokenKey(row.token))
+    return null
+  }
+  return renewIfDue(row, now)
+}
+
+function ttlSeconds(ms: number): number {
+  return Math.max(1, Math.ceil(ms / 1000))
+}
+
+async function renewIfDue(
+  row: AntigravityRelayRoute,
+  now: number,
+): Promise<AntigravityRelayRoute | null> {
+  const next = Math.min(now + ANTIGRAVITY_RELAY_TTL_MS, row.maxExpiresAt)
+  if (row.expiresAt - now >= ANTIGRAVITY_RELAY_TTL_MS / 2 || next <= row.expiresAt) return row
+  const renewed = { ...row, expiresAt: next }
+  if (!kv) {
+    // An expired route is gone from the map; renewing a detached row revives nothing.
+    if (routes.get(row.token) === row) routes.set(row.token, renewed)
+    return renewed
+  }
+  await kv.set(tokenKey(row.token), serialize(renewed), ttlSeconds(next - now))
+  // expireAntigravityRelayRouteForRequest marks the request before deleting the
+  // token key: if the mark is here now, this write may have put the key back.
+  if ((await kv.get(requestKey(row.requestId))) === EXPIRED_MARK) {
+    await kv.del(tokenKey(row.token))
+    return null
+  }
+  return renewed
 }
 
 export async function expireAntigravityRelayRoute(token: string): Promise<void> {
@@ -187,8 +238,9 @@ export async function expireAntigravityRelayRouteForRequest(requestId: string): 
   if (!REQUEST_ID_RE.test(requestId)) return
   if (kv) {
     const key = await kv.get(requestKey(requestId))
+    if (key === EXPIRED_MARK) return
+    await kv.set(requestKey(requestId), EXPIRED_MARK, ttlSeconds(ANTIGRAVITY_RELAY_MAX_LIFETIME_MS))
     if (key?.startsWith(KV_PREFIX) && !key.startsWith(`${KV_PREFIX}req:`)) await kv.del(key)
-    await kv.del(requestKey(requestId))
     return
   }
   for (const [token, row] of routes) if (row.requestId === requestId) routes.delete(token)

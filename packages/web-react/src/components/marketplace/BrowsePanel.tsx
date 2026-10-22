@@ -1,4 +1,4 @@
-import { isMarketplaceCategoryId, marketplaceCategoryLabel } from "@openclaude/protocol";
+import { isMarketplaceCategoryId, marketplaceCategoryLabel } from "@openclaude/protocol/browser";
 import {
   ArrowUpCircle,
   ArrowUpRight,

@@ -49,6 +49,8 @@
     { "glob": "packages/cli/**", "surface": "runtime-source", "note": "容器通过根 package gateway script 执行 packages/cli/src/index.ts；cli 与 gateway 同属 runtime source release" },
     { "glob": "packages/protocol/**", "surface": "master", "note": "playbook §4.1 protocol 驱动 master 进程(源行 ~200)" },
     { "glob": "packages/protocol/**", "surface": "runtime-source", "note": "playbook §4.1 protocol 亦在容器 runtime source(源行 ~204):protocol 双面" },
+    { "glob": "packages/kernel/**", "surface": "master", "note": "第三阶段 P0c(OCV5-546):kernel 被 master 进程加载(tsx 源码)" },
+    { "glob": "packages/kernel/**", "surface": "runtime-source", "note": "第三阶段 P0c(OCV5-546):kernel 亦在容器 runtime source(预编译 dist):kernel 双面" },
     { "glob": "packages/gateway/**", "surface": "runtime-source", "note": "playbook §4.1 容器 gateway 源码(源行 ~204)→ runtime source release" },
     { "glob": "packages/mcp-memory/**", "surface": "runtime-source", "note": "playbook §4.1 容器 mcp-memory 源码(源行 ~204)→ runtime source release" },
     { "glob": "**/agent-sandbox/platform-runtime/**", "surface": "platform-runtime", "note": "playbook §4.1 平台配置(源行 ~205)→ platform bundle 轴" },

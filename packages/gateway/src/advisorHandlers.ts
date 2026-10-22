@@ -144,12 +144,14 @@ export function _projectAdvisorConsultSettled(
   this._advisorConsults.projectOneReceipt(requestId)
 }
 
-export function _adviceFromConsult(
-  this: AdvisorHandlersHost,
-  record: {
+export type AdviceFromConsultRecord = {
     advice?: string | null
     jobId?: string | null
-  },
+  }
+
+export function _adviceFromConsult(
+  this: AdvisorHandlersHost,
+  record: AdviceFromConsultRecord,
 ): string {
   if (typeof record.advice === 'string' && record.advice) return record.advice
   if (!record.jobId) return ''
@@ -225,13 +227,15 @@ export function _presentConsultBody(
   }
 }
 
-export async function _presentExistingConsult(
-  this: AdvisorHandlersHost,
-  input: {
+export type PresentExistingConsultInput = {
     record: import('./advisorConsultStore.js').AdvisorConsultRecord
     question: string
     concern: string
-  },
+  }
+
+export async function _presentExistingConsult(
+  this: AdvisorHandlersHost,
+  input: PresentExistingConsultInput,
 ): Promise<{ status: number; body: Record<string, unknown> }> {
   const { record } = input
   if (!matchConsultIdentity(record, { question: input.question, concern: input.concern })) {
@@ -353,13 +357,15 @@ export async function _freezeAdvisorTurn(
   }
 }
 
+export type InvocationFromLiveConsultToolParent = | {
+        runner?: { getPartialSnapshot?: () => { completedTools?: unknown[] } }
+      }
+    | undefined
+
 export async function _invocationFromLiveConsultTool(
   this: AdvisorHandlersHost,
   parent:
-    | {
-        runner?: { getPartialSnapshot?: () => { completedTools?: unknown[] } }
-      }
-    | undefined,
+    InvocationFromLiveConsultToolParent,
 ): Promise<{ ok: true; invocationId: string } | { ok: false; reason: 'none' | 'ambiguous' }> {
   const read = () => {
     const tools = parent?.runner?.getPartialSnapshot?.()?.completedTools
@@ -807,11 +813,13 @@ export async function _loadConsultHistoryTape(
   return listTurnTapeRecords(peerId, userId, turnKey, 0, 80)
 }
 
+export type ResolveAdvisorConsultExecutionResult = { ok: true; value: AdvisorConsultExecution } | { ok: false; error: string; status: number }
+
 export async function _resolveAdvisorConsultExecution(
   this: AdvisorHandlersHost,
   advisorModel: string,
 ): Promise<
-  { ok: true; value: AdvisorConsultExecution } | { ok: false; error: string; status: number }
+  ResolveAdvisorConsultExecutionResult
 > {
   const store = this.advisorConfigStore().read()
   if (!isModelAuthorityRequired()) {
@@ -876,9 +884,14 @@ export async function _resolveAdvisorConsultExecution(
   }
 }
 
-export async function _spawnCcbAdvisorConsult(
-  this: AdvisorHandlersHost,
-  input: {
+export type SpawnCcbAdvisorConsultResult = {
+  state: string
+  advice: string
+  jobId?: string
+  error?: string
+}
+
+export type SpawnCcbAdvisorConsultInput = {
     consultId: string
     parent: AgentSession
     originTurnKey: string
@@ -886,13 +899,12 @@ export async function _spawnCcbAdvisorConsult(
     execution: AdvisorConsultExecution
     abort?: AbortController
     unregister?: (() => void) | null
-  },
-): Promise<{
-  state: string
-  advice: string
-  jobId?: string
-  error?: string
-}> {
+  }
+
+export async function _spawnCcbAdvisorConsult(
+  this: AdvisorHandlersHost,
+  input: SpawnCcbAdvisorConsultInput,
+): Promise<SpawnCcbAdvisorConsultResult> {
   const consultStore = this.advisorConsultStore()
   const advisorSessionKey = `advisor:${input.originTurnKey}:${input.consultId}`
   const slotOpts = { parentBucketKey: input.parent.sessionKey, isReview: false }
@@ -1175,9 +1187,15 @@ export function _advisorConsultRouteOverride(
   })
 }
 
-export async function _spawnAdvisorConsult(
-  this: AdvisorHandlersHost,
-  input: {
+export type SpawnAdvisorConsultResult = {
+  state: string
+  advice: string
+  jobId?: string
+  error?: string
+  usage?: DurableCodexBilling['usage']
+}
+
+export type SpawnAdvisorConsultInput = {
     consultId: string
     parent: AgentSession
     originTurnKey: string
@@ -1187,14 +1205,12 @@ export async function _spawnAdvisorConsult(
     abort?: AbortController
     unregister?: (() => void) | null
     codexRoute: import('./engine/codexShared.js').CodexProviderConfigOverride
-  },
-): Promise<{
-  state: string
-  advice: string
-  jobId?: string
-  error?: string
-  usage?: DurableCodexBilling['usage']
-}> {
+  }
+
+export async function _spawnAdvisorConsult(
+  this: AdvisorHandlersHost,
+  input: SpawnAdvisorConsultInput,
+): Promise<SpawnAdvisorConsultResult> {
   const consultStore = this.advisorConsultStore()
   const advisorSessionKey = `advisor:${input.originTurnKey}:${input.consultId}`
   const slotOpts = { parentBucketKey: input.parent.sessionKey, isReview: false }

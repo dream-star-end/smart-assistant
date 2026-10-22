@@ -8,26 +8,36 @@ import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
 
 import type { Pool } from 'pg'
+import { PERMANENT_CODEX_WAIVER_PREFIX } from '../billing/codexFinalizer.js'
+import { permanentCodexWaiverReason } from '../billing/codexFinalizer.js'
+import { isProducerFenced, resetProducerFenceForTests } from '../db/liveTurnFrames.js'
+import type { ContainerCallResult } from '../dispatch/containerDispatchClient.js'
 import {
-  isProducerFenced,
-  resetProducerFenceForTests,
-} from '../db/liveTurnFrames.js'
-import {
+  DEFAULT_ACCEPTED_STUCK_FLOOR_MS,
+  MAX_ACCEPTED_STUCK_MS,
+  _resetVisibleOrphanScanOffset,
   assessDispatchBilling,
   buildTurnDispatchReconcileFrame,
-  DEFAULT_ACCEPTED_STUCK_FLOOR_MS,
   expireAdmittedLeasesOnShutdown,
-  MAX_ACCEPTED_STUCK_MS,
+  loadGatewayExitDispatchIds,
   resolveDispatchStuckThresholdMs,
   runReconcileTick,
   runShutdownDispatchHandoff,
-  loadGatewayExitDispatchIds,
-  _resetVisibleOrphanScanOffset,
 } from '../dispatch/turnDispatchReconciler.js'
 import { markOpenDispatchShutdownEvidence } from '../dispatch/turnDispatchStore.js'
-import { PERMANENT_CODEX_WAIVER_PREFIX } from '../billing/codexFinalizer.js'
-import type { ContainerCallResult } from '../dispatch/containerDispatchClient.js'
-import { permanentCodexWaiverReason } from '../billing/codexFinalizer.js'
+import { createLogger } from '../logging/logger.js'
+
+/** OCV5-567: capture the reconciler's transition log lines. */
+function captureLog() {
+  const lines: Record<string, unknown>[] = []
+  const log = createLogger({
+    level: 'debug',
+    out: (l) => {
+      lines.push(JSON.parse(l))
+    },
+  })
+  return { log, lines }
+}
 
 type Raw = Record<string, unknown>
 
@@ -122,8 +132,9 @@ function makeFakePool(canned: Canned) {
     }
     if (s.includes('-- closeVisibleOrphans lock')) {
       const id = params?.[0]
-      const orphan = (canned.visibleOrphans ?? []).find((row) => row.dispatch_id === id)
-        ?? canned.visibleOrphans?.[0]
+      const orphan =
+        (canned.visibleOrphans ?? []).find((row) => row.dispatch_id === id) ??
+        canned.visibleOrphans?.[0]
       if (!orphan) return { rows: [], rowCount: 0 }
       return { rows: [{ status: orphan.status }], rowCount: 1 }
     }
@@ -154,22 +165,40 @@ function makeFakePool(canned: Canned) {
       recordWrite(s)
       writeParams.push(params ?? [])
       if (s.includes("state='aborted'") && s.includes('request_finalize_journal')) {
-        return { rows: canned.abortedJournalRefs ?? [], rowCount: canned.abortedJournalRefs?.length ?? 0 }
+        return {
+          rows: canned.abortedJournalRefs ?? [],
+          rowCount: canned.abortedJournalRefs?.length ?? 0,
+        }
       }
       if (s.includes('client_notified = TRUE')) return { rows: [], rowCount: 1 }
-      if (s.includes("status = 'manual_reconcile'")) return { rows: [rawRow({ status: 'manual_reconcile', conflict_reason: 'x' })], rowCount: 1 }
+      if (s.includes("status = 'manual_reconcile'"))
+        return { rows: [rawRow({ status: 'manual_reconcile', conflict_reason: 'x' })], rowCount: 1 }
       if (s.includes("status = 'terminal'")) {
         if (canned.casToTerminalMiss) return { rows: [], rowCount: 0 }
-        return { rows: [rawRow({ status: 'terminal', outcome: 'not_accepted', terminal_at: new Date() })], rowCount: 1 }
+        return {
+          rows: [rawRow({ status: 'terminal', outcome: 'not_accepted', terminal_at: new Date() })],
+          rowCount: 1,
+        }
       }
-      if (s.includes("status = 'accepted'")) return { rows: [rawRow({ status: 'accepted' })], rowCount: 1 }
-      if (s.includes("status = 'rejecting'")) return { rows: [rawRow({ status: 'rejecting' })], rowCount: 1 }
+      if (s.includes("status = 'accepted'"))
+        return { rows: [rawRow({ status: 'accepted' })], rowCount: 1 }
+      if (s.includes("status = 'rejecting'"))
+        return { rows: [rawRow({ status: 'rejecting' })], rowCount: 1 }
       return { rows: [], rowCount: 1 }
     }
     // reads (scans)
-    if (s.includes("status = 'admitted'") && s.includes('lease_until')) return { rows: canned.admittedLeaseExpired ?? [], rowCount: (canned.admittedLeaseExpired ?? []).length }
-    if (s.includes("status = 'rejecting'") && s.includes('ORDER BY admitted_at')) return { rows: canned.rejecting ?? [], rowCount: (canned.rejecting ?? []).length }
-    if (s.includes("status = 'terminal'") && s.includes('client_notified = FALSE')) return { rows: canned.terminalUnnotified ?? [], rowCount: (canned.terminalUnnotified ?? []).length }
+    if (s.includes("status = 'admitted'") && s.includes('lease_until'))
+      return {
+        rows: canned.admittedLeaseExpired ?? [],
+        rowCount: (canned.admittedLeaseExpired ?? []).length,
+      }
+    if (s.includes("status = 'rejecting'") && s.includes('ORDER BY admitted_at'))
+      return { rows: canned.rejecting ?? [], rowCount: (canned.rejecting ?? []).length }
+    if (s.includes("status = 'terminal'") && s.includes('client_notified = FALSE'))
+      return {
+        rows: canned.terminalUnnotified ?? [],
+        rowCount: (canned.terminalUnnotified ?? []).length,
+      }
     if (s.includes("status = 'accepted'") && s.includes('COALESCE(accepted_at')) {
       if (params?.[0] instanceof Date) acceptedScanCutoffs.push(params[0] as Date)
       return { rows: canned.acceptedStuck ?? [], rowCount: (canned.acceptedStuck ?? []).length }
@@ -183,9 +212,10 @@ function makeFakePool(canned: Canned) {
         .map((row) => ({
           dispatch_id: row.dispatch_id,
           user_id: row.user_id,
-          session_key: typeof row.session_id === 'string'
-            ? `agent:main:webchat:dm:${row.session_id}`
-            : String(row.session_id ?? ''),
+          session_key:
+            typeof row.session_id === 'string'
+              ? `agent:main:webchat:dm:${row.session_id}`
+              : String(row.session_id ?? ''),
           first_visible_at: row.first_visible_at,
         }))
       return { rows: traces, rowCount: traces.length }
@@ -196,8 +226,10 @@ function makeFakePool(canned: Canned) {
       return { rows: canned.visibleOrphans ?? [], rowCount: (canned.visibleOrphans ?? []).length }
     }
     // ⓪ scanOpenSessionGone(LEFT JOIN)必须先于 openAged 路由:两者都含 status IN (open 三态)。
-    if (s.includes('LEFT JOIN client_sessions s')) return { rows: canned.openSessionGone ?? [], rowCount: (canned.openSessionGone ?? []).length }
-    if (s.includes("status IN ('admitted', 'accepted', 'rejecting')")) return { rows: canned.openAged ?? [], rowCount: (canned.openAged ?? []).length }
+    if (s.includes('LEFT JOIN client_sessions s'))
+      return { rows: canned.openSessionGone ?? [], rowCount: (canned.openSessionGone ?? []).length }
+    if (s.includes("status IN ('admitted', 'accepted', 'rejecting')"))
+      return { rows: canned.openAged ?? [], rowCount: (canned.openAged ?? []).length }
     return { rows: [], rowCount: 0 }
   }
   const pool = {
@@ -222,8 +254,14 @@ function makeFakePool(canned: Canned) {
 }
 
 const noContainer = {
-  rejectIfAbsent: async (): Promise<ContainerCallResult> => ({ kind: 'unreachable', detail: 'test' }),
-  getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'unreachable', detail: 'test' }),
+  rejectIfAbsent: async (): Promise<ContainerCallResult> => ({
+    kind: 'unreachable',
+    detail: 'test',
+  }),
+  getDispatchState: async (): Promise<ContainerCallResult> => ({
+    kind: 'unreachable',
+    detail: 'test',
+  }),
 }
 
 describe('authoritative reconcile frame', () => {
@@ -254,14 +292,20 @@ describe('authoritative reconcile frame', () => {
 
 describe('resolveDispatchStuckThresholdMs', () => {
   test('floor = max(codexMax*2, 90min); env only raises', () => {
-    assert.equal(resolveDispatchStuckThresholdMs(undefined, 600_000), DEFAULT_ACCEPTED_STUCK_FLOOR_MS)
+    assert.equal(
+      resolveDispatchStuckThresholdMs(undefined, 600_000),
+      DEFAULT_ACCEPTED_STUCK_FLOOR_MS,
+    )
     // codexMax*2 = 4h > 90min → floor 4h
     assert.equal(resolveDispatchStuckThresholdMs(undefined, 7_200_000), 14_400_000)
     // env below floor ignored
     assert.equal(resolveDispatchStuckThresholdMs(1000, 600_000), DEFAULT_ACCEPTED_STUCK_FLOOR_MS)
     // env above floor honored, capped at 24h
     assert.equal(resolveDispatchStuckThresholdMs(String(3 * 3_600_000), 600_000), 3 * 3_600_000)
-    assert.equal(resolveDispatchStuckThresholdMs(String(999 * 3_600_000), 600_000), MAX_ACCEPTED_STUCK_MS)
+    assert.equal(
+      resolveDispatchStuckThresholdMs(String(999 * 3_600_000), 600_000),
+      MAX_ACCEPTED_STUCK_MS,
+    )
   })
 })
 
@@ -289,7 +333,11 @@ describe('⓪ session-gone auto close(2026-07-18 e2e 残留 accepted 恒卡实�
     assert.equal(counts.sessionGoneClosed, 1)
     assert.equal(alerts.length, 0)
     assert.equal(containerCalls, 0)
-    assert.ok(pool.writes.some((w) => w.includes("status = 'manual_reconcile'") && w.includes('conflict_reason')))
+    assert.ok(
+      pool.writes.some(
+        (w) => w.includes("status = 'manual_reconcile'") && w.includes('conflict_reason'),
+      ),
+    )
     assert.ok(pool.writes.some((w) => w.includes('SET resolution =')))
   })
 })
@@ -308,9 +356,13 @@ describe('terminal-unnotified branch (financial safety)', () => {
     assert.equal(counts.notified, 1)
     assert.equal(counts.manualReconcile, 0)
     assert.ok(pool.writes.some((w) => w.includes('client_notified = TRUE')))
-    assert.ok(pool.writes.some((w) =>
-      w.includes('history_revision = history_revision + 1') &&
-      w.includes('timeline_generation = timeline_generation + 1')))
+    assert.ok(
+      pool.writes.some(
+        (w) =>
+          w.includes('history_revision = history_revision + 1') &&
+          w.includes('timeline_generation = timeline_generation + 1'),
+      ),
+    )
     assert.ok(!pool.writes.some((w) => w.includes('turn_dispatch_error_projections')))
     assert.ok(!pool.writes.some((w) => w.includes("status = 'manual_reconcile'")))
     assert.equal(alerts.length, 0)
@@ -339,7 +391,9 @@ describe('terminal-unnotified branch (financial safety)', () => {
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
       container: noContainer,
-      assessBilling: async () => { throw new Error('db blip') },
+      assessBilling: async () => {
+        throw new Error('db blip')
+      },
     })
     assert.equal(counts.visibleFailures, 0)
     assert.equal(counts.notified, 0)
@@ -362,10 +416,17 @@ describe('B-R1-1: not_accepted → abort pre-forward journal → durable visible
       const s = sql.replace(/\s+/g, ' ')
       if (s === 'BEGIN' || s === 'COMMIT' || s === 'ROLLBACK') return { rows: [], rowCount: 0 }
       if (s.includes('FROM turn_dispatches') && s.includes('FOR UPDATE')) {
-        return { rows: [rawRow({ outcome: 'not_accepted', failure_code: 'DISPATCH_NOT_ACCEPTED' })], rowCount: 1 }
+        return {
+          rows: [rawRow({ outcome: 'not_accepted', failure_code: 'DISPATCH_NOT_ACCEPTED' })],
+          rowCount: 1,
+        }
       }
       // B-R1-1 abort:按 dispatch_id 把 inflight journal 置永久 waiver aborted(no-usage 守卫内嵌)。
-      if (s.startsWith('UPDATE request_finalize_journal') && s.includes("state='aborted'") && s.includes('dispatch_id')) {
+      if (
+        s.startsWith('UPDATE request_finalize_journal') &&
+        s.includes("state='aborted'") &&
+        s.includes('dispatch_id')
+      ) {
         writes.push(s)
         // no-usage 守卫命中(hasUsage=false)才 abort;有 usage 则 WHERE 不命中 → 0 行。
         if (opts.hasUsage) return { rows: [], rowCount: 0 }
@@ -379,13 +440,19 @@ describe('B-R1-1: not_accepted → abort pre-forward journal → durable visible
       // assess:journal 现态 —— abort 后返回永久 waiver aborted,否则 inflight(never-executed)。
       if (s.includes('FROM request_finalize_journal')) {
         const state = journalAborted ? 'aborted' : 'inflight'
-        const error_msg = journalAborted ? `${PERMANENT_CODEX_WAIVER_PREFIX}dispatch_never_executed` : null
+        const error_msg = journalAborted
+          ? `${PERMANENT_CODEX_WAIVER_PREFIX}dispatch_never_executed`
+          : null
         return { rows: [{ state, error_msg }], rowCount: 1 }
       }
       if (s.startsWith('UPDATE') || s.startsWith('INSERT')) {
         writes.push(s)
         if (s.includes('client_notified = TRUE')) return { rows: [], rowCount: 1 }
-        if (s.includes("status = 'manual_reconcile'")) return { rows: [rawRow({ status: 'manual_reconcile', conflict_reason: 'x' })], rowCount: 1 }
+        if (s.includes("status = 'manual_reconcile'"))
+          return {
+            rows: [rawRow({ status: 'manual_reconcile', conflict_reason: 'x' })],
+            rowCount: 1,
+          }
         return { rows: [], rowCount: 1 }
       }
       if (s.includes("status = 'terminal'") && s.includes('client_notified = FALSE')) {
@@ -395,13 +462,28 @@ describe('B-R1-1: not_accepted → abort pre-forward journal → durable visible
     }
     return {
       pool: {
-        async query(sql: string) { return route(sql) },
-        async connect() { return { async query(sql: string) { return route(sql) }, release() {} } },
+        async query(sql: string) {
+          return route(sql)
+        },
+        async connect() {
+          return {
+            async query(sql: string) {
+              return route(sql)
+            },
+            release() {},
+          }
+        },
       },
       writes,
-      get journalAborted() { return journalAborted },
-      get releasedReservation() { return releasedReservation },
-      setReleased(r: { userId: string; requestId: string }) { releasedReservation = r },
+      get journalAborted() {
+        return journalAborted
+      },
+      get releasedReservation() {
+        return releasedReservation
+      },
+      setReleased(r: { userId: string; requestId: string }) {
+        releasedReservation = r
+      },
     }
   }
 
@@ -412,11 +494,15 @@ describe('B-R1-1: not_accepted → abort pre-forward journal → durable visible
       pool: fake.pool as unknown as Pool,
       container: noContainer,
       enqueueAlert: (e) => alerts.push(e),
-      releaseReservation: async (ref) => { fake.setReleased(ref) },
+      releaseReservation: async (ref) => {
+        fake.setReleased(ref)
+      },
     })
     // journal 被 CAS 为永久 no-execution waiver aborted。
     assert.ok(fake.journalAborted, 'pre-forward inflight journal 应被 abort 为永久 waiver')
-    const abortWrite = fake.writes.find((w) => w.startsWith('UPDATE request_finalize_journal') && w.includes("state='aborted'"))
+    const abortWrite = fake.writes.find(
+      (w) => w.startsWith('UPDATE request_finalize_journal') && w.includes("state='aborted'"),
+    )
     assert.ok(abortWrite, 'abort UPDATE 应按 dispatch_id 发出')
     // 财务判定 not_billed → durable status(免单 tone),非 manual。
     assert.equal(counts.visibleFailures, 1)
@@ -456,7 +542,9 @@ describe('rejecting resolution', () => {
     }
     const counts = await runReconcileTick({ pool: pool as unknown as Pool, container })
     assert.equal(counts.rejectedTerminal, 1)
-    assert.ok(pool.writes.some((w) => w.includes("status = 'terminal'") && w.includes("outcome = $2")))
+    assert.ok(
+      pool.writes.some((w) => w.includes("status = 'terminal'") && w.includes('outcome = $2')),
+    )
   })
 
   test('container has running row → accepted (not terminal)', async () => {
@@ -471,7 +559,9 @@ describe('rejecting resolution', () => {
   })
 
   test('container unreachable → no terminal, no accepted (retry, never infer)', async () => {
-    const pool = makeFakePool({ rejecting: [rawRow({ status: 'rejecting', lease_until: null, admitted_at: new Date() })] })
+    const pool = makeFakePool({
+      rejecting: [rawRow({ status: 'rejecting', lease_until: null, admitted_at: new Date() })],
+    })
     const counts = await runReconcileTick({ pool: pool as unknown as Pool, container: noContainer })
     assert.equal(counts.rejectedTerminal, 0)
     assert.equal(counts.accepted, 0)
@@ -481,16 +571,23 @@ describe('rejecting resolution', () => {
 describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
   test('accepted dispatch whose container inbox is rejected → terminal(not_accepted)', async () => {
     const pool = makeFakePool({
-      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 3 * 3_600_000) })],
+      acceptedStuck: [
+        rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 3 * 3_600_000) }),
+      ],
     })
     const container = {
       ...noContainer,
-      getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'rejected' }),
+      getDispatchState: async (): Promise<ContainerCallResult> => ({
+        kind: 'ok',
+        state: 'rejected',
+      }),
     }
     const counts = await runReconcileTick({ pool: pool as unknown as Pool, container })
     assert.equal(counts.rejectedTerminal, 1)
     // CAS terminal(not_accepted) from ['accepted'] 的 UPDATE 落地。
-    assert.ok(pool.writes.some((w) => w.includes("status = 'terminal'") && w.includes("outcome = $2")))
+    assert.ok(
+      pool.writes.some((w) => w.includes("status = 'terminal'") && w.includes('outcome = $2')),
+    )
   })
 
   test('accepted 容器求证持续失败 >15min → accepted_unreachable 告警(不再静默 continue)', async () => {
@@ -498,15 +595,20 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
     // 无告警(唯一兜底 7d open_aged)。契约:持续不可达必须走 alertWarn 出口,但不动状态。
     const alerts: Array<{ payload?: { kind?: string }; dedupe_all_statuses?: boolean }> = []
     const pool = makeFakePool({
-      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 3 * 3_600_000) })],
+      acceptedStuck: [
+        rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 3 * 3_600_000) }),
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
       container: noContainer, // getDispatchState 恒 unreachable
-      enqueueAlert: (event) => alerts.push(event as {
-        payload?: { kind?: string }
-        dedupe_all_statuses?: boolean
-      }),
+      enqueueAlert: (event) =>
+        alerts.push(
+          event as {
+            payload?: { kind?: string }
+            dedupe_all_statuses?: boolean
+          },
+        ),
     })
     assert.ok(counts.alerts >= 1, '持续不可达必须计入告警')
     assert.ok(
@@ -525,16 +627,15 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
     // visible on the next tick instead of waiting 15/90 minutes.
     assert.equal(pool.acceptedScanCutoffs.length >= 1, true, 'accepted 扫描必须带时间参数')
     const cutoffAge = Date.now() - pool.acceptedScanCutoffs[0]!.getTime()
-    assert.ok(
-      cutoffAge >= 0 && cutoffAge < 5_000,
-      `扫描下限必须≈当前时刻(实际 ${cutoffAge}ms)`,
-    )
+    assert.ok(cutoffAge >= 0 && cutoffAge < 5_000, `扫描下限必须≈当前时刻(实际 ${cutoffAge}ms)`)
   })
 
   test('accepted 求证失败但龄 <15min → 不告警(等下轮,避免抖动噪音)', async () => {
     const alerts: Array<{ payload?: { kind?: string } }> = []
     const pool = makeFakePool({
-      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 5 * 60_000) })],
+      acceptedStuck: [
+        rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 5 * 60_000) }),
+      ],
     })
     await runReconcileTick({
       pool: pool as unknown as Pool,
@@ -557,21 +658,32 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
       pool: pool as unknown as Pool,
       container: {
         ...noContainer,
-        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'rejected' }),
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'rejected',
+        }),
       },
     })
     assert.equal(counts.rejectedTerminal, 1, '明确 negative proof 要立即收敛')
     assert.equal(counts.manualReconcile, 0)
-    assert.ok(pool.writes.some((w) => w.includes("status = 'terminal'")), '写 not_accepted 终态')
+    assert.ok(
+      pool.writes.some((w) => w.includes("status = 'terminal'")),
+      '写 not_accepted 终态',
+    )
   })
 
   test('accepted dispatch still running → no terminal (keep waiting)', async () => {
     const pool = makeFakePool({
-      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 3 * 3_600_000) })],
+      acceptedStuck: [
+        rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 3 * 3_600_000) }),
+      ],
     })
     const container = {
       ...noContainer,
-      getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'running' }),
+      getDispatchState: async (): Promise<ContainerCallResult> => ({
+        kind: 'ok',
+        state: 'running',
+      }),
     }
     const counts = await runReconcileTick({ pool: pool as unknown as Pool, container })
     assert.equal(counts.rejectedTerminal, 0)
@@ -588,21 +700,30 @@ describe('accepted-stuck branch (B2: container rejected tombstone)', () => {
       container: {
         ...noContainer,
         getDispatchState: async (): Promise<ContainerCallResult> => ({
-          kind: 'ok', state: 'terminal', outcome: 'crashed',
+          kind: 'ok',
+          state: 'terminal',
+          outcome: 'crashed',
         }),
       },
-      nudgeClient: () => { nudged++ },
+      nudgeClient: () => {
+        nudged++
+      },
     })
     assert.equal(counts.visibleFailures, 1)
     assert.equal(counts.notified, 1)
     assert.equal(nudged, 1)
-    assert.ok(pool.writes.some((w) =>
-      w.includes("status = 'terminal'") && w.includes('failure_code = $3')))
+    assert.ok(
+      pool.writes.some((w) => w.includes("status = 'terminal'") && w.includes('failure_code = $3')),
+    )
     assert.ok(pool.writeParams.some((p) => p[2] === 'RESULT_RECOVERY_PENDING'))
     assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
-    assert.ok(pool.writes.some((w) =>
-      w.includes('history_revision = history_revision + 1') &&
-      w.includes('timeline_generation = timeline_generation + 1')))
+    assert.ok(
+      pool.writes.some(
+        (w) =>
+          w.includes('history_revision = history_revision + 1') &&
+          w.includes('timeline_generation = timeline_generation + 1'),
+      ),
+    )
   })
 })
 
@@ -612,8 +733,10 @@ describe('assessDispatchBilling (B8: 零计费证明收紧)', () => {
     return {
       async query(sql: string) {
         const s = sql.replace(/\s+/g, ' ')
-        if (s.includes('FROM usage_records')) return { rows: [{ n: String(usageCount) }], rowCount: 1 }
-        if (s.includes('FROM request_finalize_journal')) return { rows: journal, rowCount: journal.length }
+        if (s.includes('FROM usage_records'))
+          return { rows: [{ n: String(usageCount) }], rowCount: 1 }
+        if (s.includes('FROM request_finalize_journal'))
+          return { rows: journal, rowCount: journal.length }
         return { rows: [], rowCount: 0 }
       },
     }
@@ -629,7 +752,10 @@ describe('assessDispatchBilling (B8: 零计费证明收紧)', () => {
 
   test('non-aborted journal (inflight) → billed', async () => {
     assert.equal(
-      await assessDispatchBilling(q(0, [{ state: 'inflight', error_msg: null }]) as unknown as Pool, 'd'),
+      await assessDispatchBilling(
+        q(0, [{ state: 'inflight', error_msg: null }]) as unknown as Pool,
+        'd',
+      ),
       'billed',
     )
   })
@@ -638,7 +764,9 @@ describe('assessDispatchBilling (B8: 零计费证明收紧)', () => {
     // 非永久 abort = 结算瞬态失败(可重开),不是零计费证明。
     assert.equal(
       await assessDispatchBilling(
-        q(0, [{ state: 'aborted', error_msg: 'codex_settlement_failed_before_commit' }]) as unknown as Pool,
+        q(0, [
+          { state: 'aborted', error_msg: 'codex_settlement_failed_before_commit' },
+        ]) as unknown as Pool,
         'd',
       ),
       'billed',
@@ -648,7 +776,9 @@ describe('assessDispatchBilling (B8: 零计费证明收紧)', () => {
   test('aborted WITH permanent waiver → not_billed (proven no-usage)', async () => {
     assert.equal(
       await assessDispatchBilling(
-        q(0, [{ state: 'aborted', error_msg: permanentCodexWaiverReason('bridge_disconnect') }]) as unknown as Pool,
+        q(0, [
+          { state: 'aborted', error_msg: permanentCodexWaiverReason('bridge_disconnect') },
+        ]) as unknown as Pool,
         'd',
       ),
       'not_billed',
@@ -659,13 +789,18 @@ describe('assessDispatchBilling (B8: 零计费证明收紧)', () => {
 describe('carrier-death fast path (accepted)', () => {
   test('有进程退出证据时,探测窗内 container rejected → 立即 terminal', async () => {
     const pool = makeFakePool({
-      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 20 * 60_000) })],
+      acceptedStuck: [
+        rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 20 * 60_000) }),
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
       container: {
         ...noContainer,
-        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'rejected' }),
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'rejected',
+        }),
       },
       listCarrierDeadDispatchIds: async () => ['d-1'],
     })
@@ -674,13 +809,18 @@ describe('carrier-death fast path (accepted)', () => {
 
   test('有进程退出证据但容器仍 running → 不终态(不误杀活引擎)', async () => {
     const pool = makeFakePool({
-      acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 20 * 60_000) })],
+      acceptedStuck: [
+        rawRow({ status: 'accepted', accepted_at: new Date(Date.now() - 20 * 60_000) }),
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
       container: {
         ...noContainer,
-        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'running' }),
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'running',
+        }),
       },
       listCarrierDeadDispatchIds: async () => ['d-1'],
     })
@@ -691,11 +831,13 @@ describe('carrier-death fast path (accepted)', () => {
 
   test('accepted + 停机证据 + 容器不可达 → 保留证据、等下轮、不写 SERVICE_RESTART', async () => {
     const pool = makeFakePool({
-      acceptedStuck: [rawRow({
-        status: 'accepted',
-        accepted_at: new Date(),
-        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
-      })],
+      acceptedStuck: [
+        rawRow({
+          status: 'accepted',
+          accepted_at: new Date(),
+          shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+        }),
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
@@ -711,17 +853,22 @@ describe('carrier-death fast path (accepted)', () => {
 
   test('accepted + 停机证据 + 容器 error 探测 → 同样不收口、保留证据', async () => {
     const pool = makeFakePool({
-      acceptedStuck: [rawRow({
-        status: 'accepted',
-        accepted_at: new Date(),
-        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
-      })],
+      acceptedStuck: [
+        rawRow({
+          status: 'accepted',
+          accepted_at: new Date(),
+          shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+        }),
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
       container: {
         ...noContainer,
-        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'error', detail: '502' }),
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'error',
+          detail: '502',
+        }),
       },
     })
     assert.equal(counts.visibleFailures, 0)
@@ -731,31 +878,51 @@ describe('carrier-death fast path (accepted)', () => {
 
   test('accepted + 停机证据 + 容器 absent → 收口成 SERVICE_RESTART', async () => {
     const pool = makeFakePool({
-      acceptedStuck: [rawRow({
-        status: 'accepted',
-        accepted_at: new Date(),
-        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
-      })],
+      acceptedStuck: [
+        rawRow({
+          status: 'accepted',
+          accepted_at: new Date(),
+          shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+        }),
+      ],
     })
+    const cap = captureLog()
     const counts = await runReconcileTick({
+      log: cap.log,
       pool: pool as unknown as Pool,
       container: {
         ...noContainer,
-        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'absent' }),
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'absent',
+        }),
       },
     })
     assert.equal(counts.visibleFailures, 1)
     assert.equal(counts.rejectedTerminal, 0)
     assert.ok(pool.writeParams.some((p) => p[1] === 'executed_error' && p[2] === 'SERVICE_RESTART'))
-    assert.ok(!pool.writeParams.some((p) => p[1] === 'not_accepted' || p[2] === 'DISPATCH_NOT_ACCEPTED'))
+    assert.ok(
+      !pool.writeParams.some((p) => p[1] === 'not_accepted' || p[2] === 'DISPATCH_NOT_ACCEPTED'),
+    )
     assert.ok(!pool.writeParams.some((p) => p[2] === 'RESULT_RECOVERY_PENDING'))
+    // OCV5-567: the close leaves a line with the dispatch id and the evidence it was based on
+    const line = cap.lines.find((l) => l.msg === 'dispatch transition by reconciler')
+    assert.ok(line, 'transition line written')
+    assert.equal(line.level, 'warn')
+    assert.equal(line.dispatchId, 'd-1')
+    assert.equal(line.failureCode, 'SERVICE_RESTART')
+    assert.equal(line.outcome, 'executed_error')
+    assert.equal(line.containerState, 'absent')
+    assert.equal(line.deadEvidence, true)
   })
 
   test('terminal+crashed 且无停机证据 → 不写 SERVICE_RESTART', async () => {
     const pool = makeFakePool({
       acceptedStuck: [rawRow({ status: 'accepted', accepted_at: new Date() })],
     })
+    const cap = captureLog()
     const counts = await runReconcileTick({
+      log: cap.log,
       pool: pool as unknown as Pool,
       container: {
         ...noContainer,
@@ -767,17 +934,28 @@ describe('carrier-death fast path (accepted)', () => {
       },
     })
     assert.equal(counts.visibleFailures, 1)
-    assert.ok(pool.writeParams.some((p) => p[1] === 'executed_error' && p[2] === 'RESULT_RECOVERY_PENDING'))
+    assert.ok(
+      pool.writeParams.some((p) => p[1] === 'executed_error' && p[2] === 'RESULT_RECOVERY_PENDING'),
+    )
     assert.ok(!pool.writeParams.some((p) => p[2] === 'SERVICE_RESTART'))
+    // OCV5-567: the line says why it is not SERVICE_RESTART (no stop evidence, container said crashed)
+    const line = cap.lines.find((l) => l.msg === 'dispatch transition by reconciler')
+    assert.ok(line)
+    assert.equal(line.failureCode, 'RESULT_RECOVERY_PENDING')
+    assert.equal(line.containerState, 'terminal')
+    assert.equal(line.containerOutcome, 'crashed')
+    assert.equal(line.deadEvidence, false)
   })
 
   test('terminal+crashed 且有 shutdown_ctx → 收口成 SERVICE_RESTART', async () => {
     const pool = makeFakePool({
-      acceptedStuck: [rawRow({
-        status: 'accepted',
-        accepted_at: new Date(),
-        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
-      })],
+      acceptedStuck: [
+        rawRow({
+          status: 'accepted',
+          accepted_at: new Date(),
+          shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+        }),
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
@@ -819,11 +997,13 @@ describe('carrier-death fast path (accepted)', () => {
 
   test('recovery_pending 且有 shutdown_ctx → 收口成 SERVICE_RESTART', async () => {
     const pool = makeFakePool({
-      acceptedStuck: [rawRow({
-        status: 'accepted',
-        accepted_at: new Date(),
-        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
-      })],
+      acceptedStuck: [
+        rawRow({
+          status: 'accepted',
+          accepted_at: new Date(),
+          shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+        }),
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
@@ -849,7 +1029,10 @@ describe('carrier-death fast path (accepted)', () => {
       pool: pool as unknown as Pool,
       container: {
         ...noContainer,
-        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'running' }),
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'running',
+        }),
       },
       listCarrierDeadDispatchIds: async () => ['d-1'],
     })
@@ -862,19 +1045,24 @@ describe('carrier-death fast path (accepted)', () => {
 
   test('幼龄 admitted + 租约过期 + 进程退出证据 → 进入 reject-if-absent', async () => {
     const pool = makeFakePool({
-      admittedLeaseExpired: [rawRow({
-        status: 'admitted',
-        outcome: null,
-        failure_code: null,
-        admitted_at: new Date(Date.now() - 30_000),
-        lease_until: new Date(Date.now() - 1_000),
-      })],
+      admittedLeaseExpired: [
+        rawRow({
+          status: 'admitted',
+          outcome: null,
+          failure_code: null,
+          admitted_at: new Date(Date.now() - 30_000),
+          lease_until: new Date(Date.now() - 1_000),
+        }),
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
       container: {
         ...noContainer,
-        rejectIfAbsent: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'rejected' }),
+        rejectIfAbsent: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'rejected',
+        }),
       },
       listCarrierDeadDispatchIds: async () => ['d-1'],
     })
@@ -883,23 +1071,32 @@ describe('carrier-death fast path (accepted)', () => {
 
   test('幼龄 admitted + 租约过期但无进程退出证据 → 仍走 5min 门,不接管', async () => {
     const pool = makeFakePool({
-      admittedLeaseExpired: [rawRow({
-        status: 'admitted',
-        outcome: null,
-        failure_code: null,
-        admitted_at: new Date(Date.now() - 30_000),
-        lease_until: new Date(Date.now() - 1_000),
-      })],
+      admittedLeaseExpired: [
+        rawRow({
+          status: 'admitted',
+          outcome: null,
+          failure_code: null,
+          admitted_at: new Date(Date.now() - 30_000),
+          lease_until: new Date(Date.now() - 1_000),
+        }),
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
       container: {
         ...noContainer,
-        rejectIfAbsent: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'rejected' }),
+        rejectIfAbsent: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'rejected',
+        }),
       },
     })
     assert.equal(counts.rejectedTerminal, 0)
-    assert.ok(!pool.writes.some((w) => w.includes("status = 'rejecting'") || w.includes("status = 'terminal'")))
+    assert.ok(
+      !pool.writes.some(
+        (w) => w.includes("status = 'rejecting'") || w.includes("status = 'terminal'"),
+      ),
+    )
   })
 })
 
@@ -914,7 +1111,10 @@ describe('runShutdownDispatchHandoff', () => {
       pool: pool as unknown as Pool,
       container: {
         ...noContainer,
-        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'running' }),
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'running',
+        }),
       },
       markJournals: async () => {
         marked = 3
@@ -938,11 +1138,13 @@ describe('runShutdownDispatchHandoff', () => {
 
   test('停机探测超时/不可达但容器仍 running → 不终态化', async () => {
     const pool = makeFakePool({
-      acceptedStuck: [rawRow({
-        status: 'accepted',
-        accepted_at: new Date(),
-        shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
-      })],
+      acceptedStuck: [
+        rawRow({
+          status: 'accepted',
+          accepted_at: new Date(),
+          shutdown_ctx: { gatewayExitedAt: '2026-08-20T00:00:00.000Z' },
+        }),
+      ],
     })
     const out = await runShutdownDispatchHandoff({
       pool: pool as unknown as Pool,
@@ -969,7 +1171,10 @@ describe('runShutdownDispatchHandoff', () => {
       pool: pool as unknown as Pool,
       container: {
         ...noContainer,
-        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'running' }),
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'running',
+        }),
       },
       listCarrierDeadDispatchIds: async () => ['d-1'],
     })
@@ -987,8 +1192,14 @@ describe('runShutdownDispatchHandoff', () => {
     const out = await runShutdownDispatchHandoff({
       pool: pool as unknown as Pool,
       container: {
-        rejectIfAbsent: () => new Promise(() => { /* hang */ }),
-        getDispatchState: () => new Promise(() => { /* hang */ }),
+        rejectIfAbsent: () =>
+          new Promise(() => {
+            /* hang */
+          }),
+        getDispatchState: () =>
+          new Promise(() => {
+            /* hang */
+          }),
       },
       markJournals: async () => 1,
       expireLeases: async () => 1,
@@ -1062,9 +1273,7 @@ describe('loadGatewayExitDispatchIds — 按 dispatch_id 反查', () => {
         return { rows: [{ dispatch_id: 'd-1' }], rowCount: 1 }
       },
     }
-    const ids = await loadGatewayExitDispatchIds(pool as unknown as Pool, [
-      { dispatchId: 'd-1' },
-    ])
+    const ids = await loadGatewayExitDispatchIds(pool as unknown as Pool, [{ dispatchId: 'd-1' }])
     assert.deepEqual(ids, ['d-1'])
     assert.match(sqls[0]!, /dispatch_id = ANY\(\$1::uuid\[\]\)/)
     assert.ok(!/request_id = ANY/.test(sqls[0]!), '按 billing/request_id 查会漏掉调用级标记')
@@ -1075,11 +1284,13 @@ describe('loadGatewayExitDispatchIds — 按 dispatch_id 反查', () => {
 describe('carrier-dead 语义:多 journal 且标记不在 billing_request_id 那一行', () => {
   test('20min accepted + 容器 rejected + 标记在 call-level journal → 立即 terminal', async () => {
     const pool = makeFakePool({
-      acceptedStuck: [rawRow({
-        status: 'accepted',
-        accepted_at: new Date(Date.now() - 20 * 60_000),
-        billing_request_id: 'br-not-the-marked-row',
-      })],
+      acceptedStuck: [
+        rawRow({
+          status: 'accepted',
+          accepted_at: new Date(Date.now() - 20 * 60_000),
+          billing_request_id: 'br-not-the-marked-row',
+        }),
+      ],
     })
     const origQuery = pool.query.bind(pool)
     pool.query = async (sql: string, params?: unknown[]) => {
@@ -1096,13 +1307,19 @@ describe('carrier-dead 语义:多 journal 且标记不在 billing_request_id 那
       pool: pool as unknown as Pool,
       container: {
         ...noContainer,
-        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'rejected' }),
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'rejected',
+        }),
       },
     })
-    assert.equal(counts.rejectedTerminal, 1, '标记在 request_id≠billing_request_id 的行上必须仍能走快路径')
+    assert.equal(
+      counts.rejectedTerminal,
+      1,
+      '标记在 request_id≠billing_request_id 的行上必须仍能走快路径',
+    )
   })
 })
-
 
 describe('closeVisibleOrphans (rev2 B4)', () => {
   const PARTS_COMPLETE_QUIET_MS = 2 * 60_000
@@ -1136,12 +1353,14 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     const nudges: string[] = []
     const commits: string[] = []
     const pool = makeFakePool({
-      visibleOrphans: [orphanRow({
-        tape_id: 'tape-complete',
-        tape_part_count: 12,
-        tape_parts_rows: '12',
-        last_frame_at: new Date(nowMs - PARTS_COMPLETE_QUIET_MS),
-      })],
+      visibleOrphans: [
+        orphanRow({
+          tape_id: 'tape-complete',
+          tape_part_count: 12,
+          tape_parts_rows: '12',
+          last_frame_at: new Date(nowMs - PARTS_COMPLETE_QUIET_MS),
+        }),
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
@@ -1157,7 +1376,9 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     })
     assert.equal(counts.visibleOrphans, 1)
     assert.deepEqual(commits, ['tape-complete'])
-    assert.ok(!pool.writes.some((sql) => sql.includes('visible-fallback') || sql.includes('visible_head')))
+    assert.ok(
+      !pool.writes.some((sql) => sql.includes('visible-fallback') || sql.includes('visible_head')),
+    )
     assert.ok(!pool.writes.some((sql) => sql.includes("status = 'terminal'")))
     assert.deepEqual(nudges, ['turn_completed'])
   })
@@ -1166,12 +1387,14 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     _resetVisibleOrphanScanOffset()
     let attempts = 0
     const pool = makeFakePool({
-      visibleOrphans: [orphanRow({
-        tape_id: 'tape-fail-a',
-        tape_part_count: 3,
-        tape_parts_rows: '3',
-        last_frame_at: new Date(nowMs - PARTS_COMPLETE_QUIET_MS),
-      })],
+      visibleOrphans: [
+        orphanRow({
+          tape_id: 'tape-fail-a',
+          tape_part_count: 3,
+          tape_parts_rows: '3',
+          last_frame_at: new Date(nowMs - PARTS_COMPLETE_QUIET_MS),
+        }),
+      ],
     })
     const deps = {
       pool: pool as unknown as Pool,
@@ -1186,7 +1409,9 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     const first = await runReconcileTick(deps)
     assert.equal(first.visibleOrphans, 0)
     assert.equal(attempts, 1)
-    assert.ok(!pool.writes.some((sql) => sql.includes('visible-fallback') || sql.includes('visible_head')))
+    assert.ok(
+      !pool.writes.some((sql) => sql.includes('visible-fallback') || sql.includes('visible_head')),
+    )
     assert.ok(!pool.writes.some((sql) => sql.includes("status = 'terminal'")))
     assert.ok(!pool.writes.includes('COMMIT'))
     const second = await runReconcileTick(deps)
@@ -1198,22 +1423,26 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     _resetVisibleOrphanScanOffset()
     const friction: unknown[] = []
     const pool = makeFakePool({
-      visibleOrphans: [orphanRow({
-        tape_id: null,
-        tape_part_count: null,
-        tape_parts_rows: '0',
-        last_frame_at: null,
-        admitted_at: new Date(nowMs - 16 * 60_000),
-        accepted_at: new Date(nowMs - 16 * 60_000),
-        container_running: false,
-      })],
+      visibleOrphans: [
+        orphanRow({
+          tape_id: null,
+          tape_part_count: null,
+          tape_parts_rows: '0',
+          last_frame_at: null,
+          admitted_at: new Date(nowMs - 16 * 60_000),
+          accepted_at: new Date(nowMs - 16 * 60_000),
+          container_running: false,
+        }),
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
       container: noContainer,
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
-      recordFriction: (event) => { friction.push(event) },
+      recordFriction: (event) => {
+        friction.push(event)
+      },
     })
     assert.equal(counts.visibleOrphans, 1)
     assert.ok(pool.writes.includes('COMMIT'))
@@ -1235,13 +1464,15 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     _resetVisibleOrphanScanOffset()
     const friction: unknown[] = []
     const pool = makeFakePool({
-      visibleOrphans: [orphanRow({
-        tape_id: null,
-        tape_part_count: null,
-        tape_parts_rows: '0',
-        last_frame_at: new Date(nowMs - 20 * 60_000),
-        container_running: false,
-      })],
+      visibleOrphans: [
+        orphanRow({
+          tape_id: null,
+          tape_part_count: null,
+          tape_parts_rows: '0',
+          last_frame_at: new Date(nowMs - 20 * 60_000),
+          container_running: false,
+        }),
+      ],
       casToTerminalMiss: true,
     })
     await runReconcileTick({
@@ -1249,7 +1480,9 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
       container: noContainer,
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
-      recordFriction: (event) => { friction.push(event) },
+      recordFriction: (event) => {
+        friction.push(event)
+      },
     })
     assert.equal(friction.length, 0)
   })
@@ -1257,13 +1490,15 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
   test('CAS miss rolls back so fallback projection does not commit', async () => {
     _resetVisibleOrphanScanOffset()
     const pool = makeFakePool({
-      visibleOrphans: [orphanRow({
-        tape_id: null,
-        tape_part_count: null,
-        tape_parts_rows: '0',
-        last_frame_at: new Date(nowMs - 20 * 60_000),
-        container_running: false,
-      })],
+      visibleOrphans: [
+        orphanRow({
+          tape_id: null,
+          tape_part_count: null,
+          tape_parts_rows: '0',
+          last_frame_at: new Date(nowMs - 20 * 60_000),
+          container_running: false,
+        }),
+      ],
       casToTerminalMiss: true,
     })
     const counts = await runReconcileTick({
@@ -1275,18 +1510,22 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     assert.equal(counts.visibleOrphans, 0)
     assert.ok(pool.writes.includes('ROLLBACK'))
     assert.ok(!pool.writes.includes('COMMIT'))
-    assert.ok(!pool.writes.some((sql) => sql.includes('visible-fallback') || sql.includes('visible_head')))
+    assert.ok(
+      !pool.writes.some((sql) => sql.includes('visible-fallback') || sql.includes('visible_head')),
+    )
   })
 
-  test("SQL prefetches turn_traces first_visible_at without LIKE or per-row subquery", async () => {
+  test('SQL prefetches turn_traces first_visible_at without LIKE or per-row subquery', async () => {
     _resetVisibleOrphanScanOffset()
     const pool = makeFakePool({
-      visibleOrphans: [orphanRow({
-        last_frame_at: new Date(nowMs),
-        admitted_at: new Date(nowMs),
-        accepted_at: new Date(nowMs),
-        container_running: true,
-      })],
+      visibleOrphans: [
+        orphanRow({
+          last_frame_at: new Date(nowMs),
+          admitted_at: new Date(nowMs),
+          accepted_at: new Date(nowMs),
+          container_running: true,
+        }),
+      ],
     })
     await runReconcileTick({
       pool: pool as unknown as Pool,
@@ -1294,39 +1533,46 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
     })
-    const scan = pool.queries.find((query) => query.includes("-- closeVisibleOrphans") && !query.includes("lock"))
-    const prefetch = pool.queries.find((query) => query.includes("-- firstVisiblePrefetch"))
-    assert.ok(scan, "closeVisibleOrphans scan SQL must run")
-    assert.ok(prefetch, "firstVisiblePrefetch SQL must run")
-    assert.equal(scan.includes("turn_traces"), false, "scan must not correlate turn_traces")
+    const scan = pool.queries.find(
+      (query) => query.includes('-- closeVisibleOrphans') && !query.includes('lock'),
+    )
+    const prefetch = pool.queries.find((query) => query.includes('-- firstVisiblePrefetch'))
+    assert.ok(scan, 'closeVisibleOrphans scan SQL must run')
+    assert.ok(prefetch, 'firstVisiblePrefetch SQL must run')
+    assert.equal(scan.includes('turn_traces'), false, 'scan must not correlate turn_traces')
     assert.equal(/LIKE/i.test(scan), false)
-    assert.ok(prefetch.includes("turn_traces"), "prefetch must read turn_traces")
-    assert.ok(prefetch.includes("first_visible_at"), "scan must select first_visible_at")
-    assert.ok(prefetch.includes("dispatch_id IS NULL"), "prefetch includes NULL-dispatch fallback")
-    assert.ok(prefetch.includes("session_key"), "prefetch matches session_key")
-    assert.ok(prefetch.includes("UNION ALL"), "prefetch is one-shot UNION, not per-row subquery")
-    assert.equal(/LIKE/i.test(prefetch), false, "prefetch must not use LIKE wildcards")
-    assert.ok(prefetch.includes("unnest("), "NULL-dispatch arm binds this page's candidate pairs")
-    assert.ok(prefetch.includes("right("), "NULL-dispatch arm uses exact suffix via right(), not LIKE")
+    assert.ok(prefetch.includes('turn_traces'), 'prefetch must read turn_traces')
+    assert.ok(prefetch.includes('first_visible_at'), 'scan must select first_visible_at')
+    assert.ok(prefetch.includes('dispatch_id IS NULL'), 'prefetch includes NULL-dispatch fallback')
+    assert.ok(prefetch.includes('session_key'), 'prefetch matches session_key')
+    assert.ok(prefetch.includes('UNION ALL'), 'prefetch is one-shot UNION, not per-row subquery')
+    assert.equal(/LIKE/i.test(prefetch), false, 'prefetch must not use LIKE wildcards')
+    assert.ok(prefetch.includes('unnest('), "NULL-dispatch arm binds this page's candidate pairs")
     assert.ok(
-      prefetch.includes("char_length(cand.session_id) + 1"),
+      prefetch.includes('right('),
+      'NULL-dispatch arm uses exact suffix via right(), not LIKE',
+    )
+    assert.ok(
+      prefetch.includes('char_length(cand.session_id) + 1'),
       "suffix length is ':' + session_id, matching visibleOrphan endsWith",
     )
   })
 
-  test("OCV5-43 hydrate-dead engine attempts interrupt fence even if CAS misses", async () => {
+  test('OCV5-43 hydrate-dead engine attempts interrupt fence even if CAS misses', async () => {
     _resetVisibleOrphanScanOffset()
     const pool = makeFakePool({
-      visibleOrphans: [orphanRow({
-        tape_id: null,
-        tape_part_count: null,
-        tape_parts_rows: "0",
-        last_frame_at: null,
-        first_visible_at: null,
-        admitted_at: new Date(nowMs - 15 * 60_000),
-        accepted_at: new Date(nowMs - 15 * 60_000),
-        container_running: false,
-      })],
+      visibleOrphans: [
+        orphanRow({
+          tape_id: null,
+          tape_part_count: null,
+          tape_parts_rows: '0',
+          last_frame_at: null,
+          first_visible_at: null,
+          admitted_at: new Date(nowMs - 15 * 60_000),
+          accepted_at: new Date(nowMs - 15 * 60_000),
+          container_running: false,
+        }),
+      ],
       casToTerminalMiss: true,
     })
     const counts = await runReconcileTick({
@@ -1336,27 +1582,29 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
       listCarrierDeadDispatchIds: async () => [],
     })
     assert.equal(counts.visibleOrphans, 0)
-    assert.ok(pool.writes.includes("ROLLBACK"))
-    assert.ok(!pool.writes.includes("COMMIT"))
+    assert.ok(pool.writes.includes('ROLLBACK'))
+    assert.ok(!pool.writes.includes('COMMIT'))
     assert.ok(
-      pool.attemptedWrites.some((sql) => sql.includes("producer_fenced_at")),
-      "interrupt_tapeless must attempt producer fence",
+      pool.attemptedWrites.some((sql) => sql.includes('producer_fenced_at')),
+      'interrupt_tapeless must attempt producer fence',
     )
   })
 
-  test("OCV5-57 first_visible plus zero dispatch frames skips and does not fence", async () => {
+  test('OCV5-57 first_visible plus zero dispatch frames skips and does not fence', async () => {
     _resetVisibleOrphanScanOffset()
     const pool = makeFakePool({
-      visibleOrphans: [orphanRow({
-        tape_id: null,
-        tape_part_count: null,
-        tape_parts_rows: "0",
-        last_frame_at: null,
-        first_visible_at: new Date(nowMs - 14 * 60_000),
-        admitted_at: new Date(nowMs - 15 * 60_000),
-        accepted_at: new Date(nowMs - 15 * 60_000),
-        container_running: true,
-      })],
+      visibleOrphans: [
+        orphanRow({
+          tape_id: null,
+          tape_part_count: null,
+          tape_parts_rows: '0',
+          last_frame_at: null,
+          first_visible_at: new Date(nowMs - 14 * 60_000),
+          admitted_at: new Date(nowMs - 15 * 60_000),
+          accepted_at: new Date(nowMs - 15 * 60_000),
+          container_running: true,
+        }),
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
@@ -1365,25 +1613,27 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
       listCarrierDeadDispatchIds: async () => [],
     })
     assert.equal(counts.visibleOrphans, 0)
-    assert.ok(!pool.writes.includes("COMMIT"))
-    assert.ok(!pool.writes.some((sql) => sql.includes("producer_fenced_at")))
-    assert.ok(!pool.writes.some((sql) => sql.includes("visible-fallback")))
+    assert.ok(!pool.writes.includes('COMMIT'))
+    assert.ok(!pool.writes.some((sql) => sql.includes('producer_fenced_at')))
+    assert.ok(!pool.writes.some((sql) => sql.includes('visible-fallback')))
   })
 
-  test("interrupt fence COMMIT writes producer_fenced_at and terminal together", async () => {
+  test('interrupt fence COMMIT writes producer_fenced_at and terminal together', async () => {
     resetProducerFenceForTests()
     _resetVisibleOrphanScanOffset()
     const pool = makeFakePool({
-      visibleOrphans: [orphanRow({
-        tape_id: "tape-present",
-        tape_part_count: 3,
-        tape_parts_rows: "1",
-        last_frame_at: null,
-        first_visible_at: null,
-        admitted_at: new Date(nowMs - 15 * 60_000),
-        accepted_at: new Date(nowMs - 15 * 60_000),
-        container_running: false,
-      })],
+      visibleOrphans: [
+        orphanRow({
+          tape_id: 'tape-present',
+          tape_part_count: 3,
+          tape_parts_rows: '1',
+          last_frame_at: null,
+          first_visible_at: null,
+          admitted_at: new Date(nowMs - 15 * 60_000),
+          accepted_at: new Date(nowMs - 15 * 60_000),
+          container_running: false,
+        }),
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
@@ -1392,31 +1642,33 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
       listCarrierDeadDispatchIds: async () => [],
     })
     assert.equal(counts.visibleOrphans, 1)
-    assert.ok(pool.writes.includes("COMMIT"))
-    assert.ok(pool.writes.some((sql) => sql.includes("producer_fenced_at")))
+    assert.ok(pool.writes.includes('COMMIT'))
+    assert.ok(pool.writes.some((sql) => sql.includes('producer_fenced_at')))
     assert.ok(pool.writes.some((sql) => sql.includes("status = 'terminal'")))
     assert.equal(
-      pool.writes.indexOf("COMMIT") >
+      pool.writes.indexOf('COMMIT') >
         Math.max(
-          pool.writes.findIndex((sql) => sql.includes("producer_fenced_at")),
+          pool.writes.findIndex((sql) => sql.includes('producer_fenced_at')),
           pool.writes.findIndex((sql) => sql.includes("status = 'terminal'")),
         ),
       true,
     )
-    assert.equal(isProducerFenced({
-      dispatchId: "d-vis-1",
-      sessionId: "sess-vis",
-      clientMessageId: "cm-vis",
-    }), true)
+    assert.equal(
+      isProducerFenced({
+        dispatchId: 'd-vis-1',
+        sessionId: 'sess-vis',
+        clientMessageId: 'cm-vis',
+      }),
+      true,
+    )
   })
 
-
-  test("overlapping admits: late first_visible skips both A and B", async () => {
+  test('overlapping admits: late first_visible skips both A and B', async () => {
     _resetVisibleOrphanScanOffset()
     const pool = makeFakePool({
       visibleOrphans: [
         orphanRow({
-          dispatch_id: "disp-a",
+          dispatch_id: 'disp-a',
           last_frame_at: null,
           first_visible_at: new Date(nowMs - 12 * 60_000),
           admitted_at: new Date(nowMs - 15 * 60_000),
@@ -1424,7 +1676,7 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
           container_running: true,
         }),
         orphanRow({
-          dispatch_id: "disp-b",
+          dispatch_id: 'disp-b',
           last_frame_at: null,
           first_visible_at: new Date(nowMs - 12 * 60_000),
           admitted_at: new Date(nowMs - 13 * 60_000),
@@ -1440,27 +1692,31 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
       listCarrierDeadDispatchIds: async () => [],
     })
     assert.equal(counts.visibleOrphans, 0)
-    assert.ok(!pool.writes.includes("COMMIT"))
+    assert.ok(!pool.writes.includes('COMMIT'))
   })
 
-  test("session_id underscore does not steal a sibling NULL-dispatch first_visible", async () => {
+  test('session_id underscore does not steal a sibling NULL-dispatch first_visible', async () => {
     _resetVisibleOrphanScanOffset()
     const pool = makeFakePool({
-      visibleOrphans: [orphanRow({
-        dispatch_id: "disp-under",
-        session_id: "sess_001",
-        last_frame_at: null,
-        first_visible_at: null,
-        admitted_at: new Date(nowMs - 15 * 60_000),
-        accepted_at: new Date(nowMs - 15 * 60_000),
-        container_running: false,
-      })],
-      firstVisibleTraces: [{
-        dispatch_id: null,
-        user_id: "42",
-        session_key: "agent:main:webchat:dm:sessX001",
-        first_visible_at: new Date(nowMs - 12 * 60_000),
-      }],
+      visibleOrphans: [
+        orphanRow({
+          dispatch_id: 'disp-under',
+          session_id: 'sess_001',
+          last_frame_at: null,
+          first_visible_at: null,
+          admitted_at: new Date(nowMs - 15 * 60_000),
+          accepted_at: new Date(nowMs - 15 * 60_000),
+          container_running: false,
+        }),
+      ],
+      firstVisibleTraces: [
+        {
+          dispatch_id: null,
+          user_id: '42',
+          session_key: 'agent:main:webchat:dm:sessX001',
+          first_visible_at: new Date(nowMs - 12 * 60_000),
+        },
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
@@ -1468,77 +1724,96 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
     })
-    assert.ok(pool.queries.some(sql => sql.includes('-- orphanFinalizeFirstVisibleReverify')),
-      'sibling trace was not credited: absent first_visible is rechecked inside the lock')
+    assert.ok(
+      pool.queries.some((sql) => sql.includes('-- orphanFinalizeFirstVisibleReverify')),
+      'sibling trace was not credited: absent first_visible is rechecked inside the lock',
+    )
     assert.equal(counts.visibleOrphans, 1, "LIKE '_' must not credit sibling sessX001")
-    assert.ok(pool.writes.some((sql) => sql.includes("producer_fenced_at")))
+    assert.ok(pool.writes.some((sql) => sql.includes('producer_fenced_at')))
   })
 
-  test("exact session_key suffix with underscore is still credited", async () => {
+  test('exact session_key suffix with underscore is still credited', async () => {
     _resetVisibleOrphanScanOffset()
     let probes = 0
     const pool = makeFakePool({
-      visibleOrphans: [orphanRow({
-        dispatch_id: "disp-under-hit",
-        session_id: "sess_001",
-        last_frame_at: null,
-        first_visible_at: null,
-        admitted_at: new Date(nowMs - 15 * 60_000),
-        accepted_at: new Date(nowMs - 15 * 60_000),
-        container_running: true,
-      })],
-      firstVisibleTraces: [{
-        dispatch_id: null,
-        user_id: "42",
-        session_key: "agent:main:webchat:dm:sess_001",
-        first_visible_at: new Date(nowMs - 12 * 60_000),
-      }],
+      visibleOrphans: [
+        orphanRow({
+          dispatch_id: 'disp-under-hit',
+          session_id: 'sess_001',
+          last_frame_at: null,
+          first_visible_at: null,
+          admitted_at: new Date(nowMs - 15 * 60_000),
+          accepted_at: new Date(nowMs - 15 * 60_000),
+          container_running: true,
+        }),
+      ],
+      firstVisibleTraces: [
+        {
+          dispatch_id: null,
+          user_id: '42',
+          session_key: 'agent:main:webchat:dm:sess_001',
+          first_visible_at: new Date(nowMs - 12 * 60_000),
+        },
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
-      container: { ...noContainer, getDispatchState: async () => { probes++; return { kind: 'unreachable', detail: 'unexpected probe after credited first_visible' } } },
+      container: {
+        ...noContainer,
+        getDispatchState: async () => {
+          probes++
+          return { kind: 'unreachable', detail: 'unexpected probe after credited first_visible' }
+        },
+      },
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
     })
     assert.equal(probes, 0, 'credited first_visible skips before any typed-state probe')
     assert.equal(counts.visibleOrphans, 0)
-    assert.ok(!pool.writes.includes("COMMIT"))
+    assert.ok(!pool.writes.includes('COMMIT'))
   })
 
   // ── INC-20260831-VISIBLE-ORPHAN-FALSE-KILL 后续:两处缺口的回归锁 ──────────
   // gap1: typed state(running/queued/sink_staged)的存活结论必须传进 orphan 收口;
   // gap2: 扫描→提交之间帧/first_visible 推进必须使 finalize 回滚。
 
-  test("INC-20260831 gap1: typed-state proven-live running dispatch is never interrupted (16min, zero frames)", async () => {
+  test('INC-20260831 gap1: typed-state proven-live running dispatch is never interrupted (16min, zero frames)', async () => {
     _resetVisibleOrphanScanOffset()
     // 主循环 accepted-stuck 探测返回 running;同一 dispatch 出现在 orphan 扫描里,
     // 零帧 + 无 first_visible + 静默 16min + 容器在跑 —— 旧实现对这种行判 interrupt_tapeless。
     const pool = makeFakePool({
-      acceptedStuck: [rawRow({
-        dispatch_id: 'd-live-1',
-        status: 'accepted',
-        outcome: null,
-        failure_code: null,
-        admitted_at: new Date(nowMs - 16 * 60_000),
-        accepted_at: new Date(nowMs - 16 * 60_000),
-      })],
-      visibleOrphans: [orphanRow({
-        dispatch_id: 'd-live-1',
-        tape_id: null,
-        tape_part_count: null,
-        tape_parts_rows: '0',
-        last_frame_at: null,
-        first_visible_at: null,
-        admitted_at: new Date(nowMs - 16 * 60_000),
-        accepted_at: new Date(nowMs - 16 * 60_000),
-        container_running: true,
-      })],
+      acceptedStuck: [
+        rawRow({
+          dispatch_id: 'd-live-1',
+          status: 'accepted',
+          outcome: null,
+          failure_code: null,
+          admitted_at: new Date(nowMs - 16 * 60_000),
+          accepted_at: new Date(nowMs - 16 * 60_000),
+        }),
+      ],
+      visibleOrphans: [
+        orphanRow({
+          dispatch_id: 'd-live-1',
+          tape_id: null,
+          tape_part_count: null,
+          tape_parts_rows: '0',
+          last_frame_at: null,
+          first_visible_at: null,
+          admitted_at: new Date(nowMs - 16 * 60_000),
+          accepted_at: new Date(nowMs - 16 * 60_000),
+          container_running: true,
+        }),
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
       container: {
         ...noContainer,
-        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'ok', state: 'running' }),
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'ok',
+          state: 'running',
+        }),
       },
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
@@ -1551,22 +1826,24 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     assert.ok(!pool.writes.some((sql) => sql.includes('visible-fallback')), '不得投影 fallback')
   })
 
-  test("INC-20260831 gap1: interrupt_tapeless outside the stuck page re-probes typed state; queued skips", async () => {
+  test('INC-20260831 gap1: interrupt_tapeless outside the stuck page re-probes typed state; queued skips', async () => {
     _resetVisibleOrphanScanOffset()
     // orphan 扫描有自己的 OFFSET 分页且含 admitted 行:这行不在主循环 stuck 页里,
     // 分类为 interrupt_tapeless 后必须在提交前再查一次 typed state。
     let probes = 0
     const pool = makeFakePool({
-      visibleOrphans: [orphanRow({
-        tape_id: null,
-        tape_part_count: null,
-        tape_parts_rows: '0',
-        last_frame_at: null,
-        first_visible_at: null,
-        admitted_at: new Date(nowMs - 16 * 60_000),
-        accepted_at: new Date(nowMs - 16 * 60_000),
-        container_running: true,
-      })],
+      visibleOrphans: [
+        orphanRow({
+          tape_id: null,
+          tape_part_count: null,
+          tape_parts_rows: '0',
+          last_frame_at: null,
+          first_visible_at: null,
+          admitted_at: new Date(nowMs - 16 * 60_000),
+          accepted_at: new Date(nowMs - 16 * 60_000),
+          container_running: true,
+        }),
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
@@ -1588,20 +1865,22 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     assert.ok(!pool.writes.some((sql) => sql.includes("status = 'terminal'")))
   })
 
-  test("INC-20260831 gap2: frame landed between scan and lock → ROLLBACK, zero UPDATE, counted stale", async () => {
+  test('INC-20260831 gap2: frame landed between scan and lock → ROLLBACK, zero UPDATE, counted stale', async () => {
     _resetVisibleOrphanScanOffset()
     // 扫描时零帧;锁内重验返回 5 分钟前的新帧(producer 在扫描后落帧)。
     const pool = makeFakePool({
-      visibleOrphans: [orphanRow({
-        tape_id: null,
-        tape_part_count: null,
-        tape_parts_rows: '0',
-        last_frame_at: null,
-        first_visible_at: null,
-        admitted_at: new Date(nowMs - 16 * 60_000),
-        accepted_at: new Date(nowMs - 16 * 60_000),
-        container_running: false,
-      })],
+      visibleOrphans: [
+        orphanRow({
+          tape_id: null,
+          tape_part_count: null,
+          tape_parts_rows: '0',
+          last_frame_at: null,
+          first_visible_at: null,
+          admitted_at: new Date(nowMs - 16 * 60_000),
+          accepted_at: new Date(nowMs - 16 * 60_000),
+          container_running: false,
+        }),
+      ],
       orphanFrameReverify: new Date(nowMs - 5 * 60_000),
     })
     const counts = await runReconcileTick({
@@ -1610,42 +1889,54 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
     })
-    const lock = pool.queries.findIndex(sql => sql.includes('-- closeVisibleOrphans lock'))
-    const frame = pool.queries.findIndex(sql => sql.includes('-- orphanFinalizeFrameReverify'))
+    const lock = pool.queries.findIndex((sql) => sql.includes('-- closeVisibleOrphans lock'))
+    const frame = pool.queries.findIndex((sql) => sql.includes('-- orphanFinalizeFrameReverify'))
     const rollback = pool.queries.indexOf('ROLLBACK')
-    assert.ok(lock >= 0 && frame > lock && rollback > frame, 'lock and frame recheck execute before rollback')
+    assert.ok(
+      lock >= 0 && frame > lock && rollback > frame,
+      'lock and frame recheck execute before rollback',
+    )
     assert.equal(pool.attemptedWrites.length, 0, 'no UPDATE/INSERT before stale-evidence rollback')
-    assert.equal(pool.queries.some(sql => sql.includes('-- orphanFinalizeFirstVisibleReverify')), false,
-      'new frame returns before later rechecks or writes')
+    assert.equal(
+      pool.queries.some((sql) => sql.includes('-- orphanFinalizeFirstVisibleReverify')),
+      false,
+      'new frame returns before later rechecks or writes',
+    )
     assert.equal(counts.visibleOrphans, 0)
     assert.equal(counts.visibleOrphansEvidenceStale, 1, '证据推进必须计数')
     assert.ok(pool.writes.includes('ROLLBACK'))
     assert.ok(!pool.writes.includes('COMMIT'))
     assert.ok(
-      !pool.attemptedWrites.some((sql) => sql.includes('producer_fenced_at') || sql.includes("status = 'terminal'")),
+      !pool.attemptedWrites.some(
+        (sql) => sql.includes('producer_fenced_at') || sql.includes("status = 'terminal'"),
+      ),
       '锁内重验失败必须在任何 UPDATE 之前回滚',
     )
   })
 
-  test("INC-20260831 gap2: first_visible appearing between scan and lock → ROLLBACK", async () => {
+  test('INC-20260831 gap2: first_visible appearing between scan and lock → ROLLBACK', async () => {
     _resetVisibleOrphanScanOffset()
     const pool = makeFakePool({
-      visibleOrphans: [orphanRow({
-        tape_id: null,
-        tape_part_count: null,
-        tape_parts_rows: '0',
-        last_frame_at: null,
-        first_visible_at: null,
-        admitted_at: new Date(nowMs - 16 * 60_000),
-        accepted_at: new Date(nowMs - 16 * 60_000),
-        container_running: false,
-      })],
-      orphanFirstVisibleReverify: [{
-        dispatch_id: 'd-vis-1',
-        user_id: '42',
-        session_key: 'agent:main:webchat:dm:sess-vis',
-        first_visible_at: new Date(nowMs - 60_000),
-      }],
+      visibleOrphans: [
+        orphanRow({
+          tape_id: null,
+          tape_part_count: null,
+          tape_parts_rows: '0',
+          last_frame_at: null,
+          first_visible_at: null,
+          admitted_at: new Date(nowMs - 16 * 60_000),
+          accepted_at: new Date(nowMs - 16 * 60_000),
+          container_running: false,
+        }),
+      ],
+      orphanFirstVisibleReverify: [
+        {
+          dispatch_id: 'd-vis-1',
+          user_id: '42',
+          session_key: 'agent:main:webchat:dm:sess-vis',
+          first_visible_at: new Date(nowMs - 60_000),
+        },
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
@@ -1653,12 +1944,17 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
     })
-    const lock = pool.queries.findIndex(sql => sql.includes('-- closeVisibleOrphans lock'))
-    const frame = pool.queries.findIndex(sql => sql.includes('-- orphanFinalizeFrameReverify'))
+    const lock = pool.queries.findIndex((sql) => sql.includes('-- closeVisibleOrphans lock'))
+    const frame = pool.queries.findIndex((sql) => sql.includes('-- orphanFinalizeFrameReverify'))
     const rollback = pool.queries.indexOf('ROLLBACK')
-    assert.ok(lock >= 0 && frame > lock && rollback > frame, 'lock and frame recheck execute before rollback')
+    assert.ok(
+      lock >= 0 && frame > lock && rollback > frame,
+      'lock and frame recheck execute before rollback',
+    )
     assert.equal(pool.attemptedWrites.length, 0, 'no UPDATE/INSERT before stale-evidence rollback')
-    const trace = pool.queries.findIndex(sql => sql.includes('-- orphanFinalizeFirstVisibleReverify'))
+    const trace = pool.queries.findIndex((sql) =>
+      sql.includes('-- orphanFinalizeFirstVisibleReverify'),
+    )
     assert.ok(trace > frame && rollback > trace, 'first_visible recheck executes inside the lock')
     assert.equal(counts.visibleOrphans, 0)
     assert.equal(counts.visibleOrphansEvidenceStale, 1)
@@ -1667,27 +1963,32 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     assert.ok(!pool.attemptedWrites.some((sql) => sql.includes('producer_fenced_at')))
   })
 
-  test("INC-20260831: inactive carrier remains independent dead evidence despite typed-state error", async () => {
+  test('INC-20260831: inactive carrier remains independent dead evidence despite typed-state error', async () => {
     _resetVisibleOrphanScanOffset()
     // typed error is not death evidence; the inactive carrier is independent proof.
     // Keep interrupt/fence assertions; active-error cases separately prove fail-closed.
     const pool = makeFakePool({
-      visibleOrphans: [orphanRow({
-        tape_id: null,
-        tape_part_count: null,
-        tape_parts_rows: '0',
-        last_frame_at: null,
-        first_visible_at: null,
-        admitted_at: new Date(nowMs - 16 * 60_000),
-        accepted_at: new Date(nowMs - 16 * 60_000),
-        container_running: false,
-      })],
+      visibleOrphans: [
+        orphanRow({
+          tape_id: null,
+          tape_part_count: null,
+          tape_parts_rows: '0',
+          last_frame_at: null,
+          first_visible_at: null,
+          admitted_at: new Date(nowMs - 16 * 60_000),
+          accepted_at: new Date(nowMs - 16 * 60_000),
+          container_running: false,
+        }),
+      ],
     })
     const counts = await runReconcileTick({
       pool: pool as unknown as Pool,
       container: {
         ...noContainer,
-        getDispatchState: async (): Promise<ContainerCallResult> => ({ kind: 'error', detail: '502' }),
+        getDispatchState: async (): Promise<ContainerCallResult> => ({
+          kind: 'error',
+          detail: '502',
+        }),
       },
       now: () => nowMs,
       listCarrierDeadDispatchIds: async () => [],
@@ -1699,7 +2000,6 @@ describe('closeVisibleOrphans (rev2 B4)', () => {
     assert.ok(pool.writes.some((sql) => sql.includes('producer_fenced_at')))
     assert.ok(pool.writes.some((sql) => sql.includes("status = 'terminal'")))
   })
-
 })
 
 describe('OCV5-121 queued consumer full tick', () => {
@@ -1708,18 +2008,34 @@ describe('OCV5-121 queued consumer full tick', () => {
       test('queued age=' + age + ' acceptedPage=' + acceptedPage, async () => {
         _resetVisibleOrphanScanOffset()
         const now = Date.now()
-        const row = rawRow({ status: 'accepted', outcome: null,
-          admitted_at: new Date(now - age), accepted_at: new Date(now - age),
-          tape_visible_at: null, tape_id: null, tape_part_count: null, tape_parts_rows: '0',
-          last_frame_at: null, container_running: true })
-        const pool = makeFakePool({ acceptedStuck: acceptedPage ? [row] : [], visibleOrphans: [row] })
+        const row = rawRow({
+          status: 'accepted',
+          outcome: null,
+          admitted_at: new Date(now - age),
+          accepted_at: new Date(now - age),
+          tape_visible_at: null,
+          tape_id: null,
+          tape_part_count: null,
+          tape_parts_rows: '0',
+          last_frame_at: null,
+          container_running: true,
+        })
+        const pool = makeFakePool({
+          acceptedStuck: acceptedPage ? [row] : [],
+          visibleOrphans: [row],
+        })
         let probes = 0
         let cancels = 0
         const counts = await runReconcileTick({
-          pool: pool as unknown as Pool, now: () => now,
+          pool: pool as unknown as Pool,
+          now: () => now,
           listCarrierDeadDispatchIds: async () => [],
-          container: { ...noContainer,
-            getDispatchState: async () => { probes++; return { kind: 'ok', state: 'queued' } },
+          container: {
+            ...noContainer,
+            getDispatchState: async () => {
+              probes++
+              return { kind: 'ok', state: 'queued' }
+            },
             cancelIfQueued: async (id) => {
               assert.equal(id.attemptNo, 1)
               cancels++
@@ -1730,7 +2046,12 @@ describe('OCV5-121 queued consumer full tick', () => {
         assert.equal(counts.visibleOrphans, 0)
         assert.equal(probes, 1, 'accepted cache or exact per-row probe')
         assert.equal(cancels, age >= 6 * 3_600_000 ? 1 : 0)
-        assert.equal(pool.writes.some(s => s.includes('producer_fenced_at') || s.includes("status = 'terminal'")), false)
+        assert.equal(
+          pool.writes.some(
+            (s) => s.includes('producer_fenced_at') || s.includes("status = 'terminal'"),
+          ),
+          false,
+        )
       })
     }
   }
@@ -1739,31 +2060,59 @@ describe('OCV5-121 queued consumer full tick', () => {
 test('OCV5-121 cancel outcomes always defer this tick; durable rejected settles without fallback', async () => {
   for (const cancelResult of [
     { kind: 'ok', state: 'rejected', outcome: 'not_accepted' },
-    { kind: 'ok', state: 'running' }, { kind: 'ok', state: 'absent' },
+    { kind: 'ok', state: 'running' },
+    { kind: 'ok', state: 'absent' },
     { kind: 'unreachable', detail: 'old runtime 404' },
     { kind: 'error', detail: 'lost response after CAS' },
   ] as ContainerCallResult[]) {
     _resetVisibleOrphanScanOffset()
     const now = Date.now()
-    const row = rawRow({ status: 'accepted', outcome: null, admitted_at: new Date(now - 6 * 3_600_000),
-      accepted_at: new Date(now - 6 * 3_600_000), tape_visible_at: null, tape_id: null,
-      tape_part_count: null, tape_parts_rows: '0', last_frame_at: null, container_running: true })
-    const canned: Canned = { acceptedStuck: [row], visibleOrphans: [row],
-      abortedJournalRefs: [{ user_id: '42', request_id: 'br-1' }] }
+    const row = rawRow({
+      status: 'accepted',
+      outcome: null,
+      admitted_at: new Date(now - 6 * 3_600_000),
+      accepted_at: new Date(now - 6 * 3_600_000),
+      tape_visible_at: null,
+      tape_id: null,
+      tape_part_count: null,
+      tape_parts_rows: '0',
+      last_frame_at: null,
+      container_running: true,
+    })
+    const canned: Canned = {
+      acceptedStuck: [row],
+      visibleOrphans: [row],
+      abortedJournalRefs: [{ user_id: '42', request_id: 'br-1' }],
+    }
     const pool = makeFakePool(canned)
     let state: ContainerCallResult = { kind: 'ok', state: 'queued' }
     let cancels = 0
     const released: unknown[] = []
-    const deps = { pool: pool as unknown as Pool, now: () => now, listCarrierDeadDispatchIds: async () => [],
+    const deps = {
+      pool: pool as unknown as Pool,
+      now: () => now,
+      listCarrierDeadDispatchIds: async () => [],
       assessBilling: async () => 'not_billed' as const,
-      releaseReservation: async (ref: unknown) => { released.push(ref) },
-      container: { ...noContainer, getDispatchState: async () => state,
-        cancelIfQueued: async () => { cancels++; return cancelResult } } }
+      releaseReservation: async (ref: unknown) => {
+        released.push(ref)
+      },
+      container: {
+        ...noContainer,
+        getDispatchState: async () => state,
+        cancelIfQueued: async () => {
+          cancels++
+          return cancelResult
+        },
+      },
+    }
     const first = await runReconcileTick(deps)
     assert.equal(cancels, 1)
     assert.equal(first.visibleOrphans, 0)
     assert.equal(pool.writes.length, 0)
-    if (cancelResult.kind === 'unreachable' || (cancelResult.kind === 'ok' && cancelResult.state === 'absent')) {
+    if (
+      cancelResult.kind === 'unreachable' ||
+      (cancelResult.kind === 'ok' && cancelResult.state === 'absent')
+    ) {
       const next = await runReconcileTick(deps)
       assert.equal(next.rejectedTerminal, 0)
       assert.equal(next.visibleOrphans, 0)
@@ -1791,53 +2140,111 @@ test('OCV5-121 cancel outcomes always defer this tick; durable rejected settles 
     const settled = await runReconcileTick(deps)
     assert.equal(settled.notified, 1)
     assert.deepEqual(released, [{ userId: '42', requestId: 'br-1' }])
-    assert.ok(pool.writes.some(s => s.includes("state='aborted'") && s.includes('request_finalize_journal')))
-    assert.equal(pool.writes.some(s => /producer_fenced_at\s*=/.test(s) || s.includes('visible-fallback')), false)
+    assert.ok(
+      pool.writes.some(
+        (s) => s.includes("state='aborted'") && s.includes('request_finalize_journal'),
+      ),
+    )
+    assert.equal(
+      pool.writes.some((s) => /producer_fenced_at\s*=/.test(s) || s.includes('visible-fallback')),
+      false,
+    )
   }
 })
 
 test('OCV5-121 active destructive candidates require exact running proof', async () => {
   for (const state of [
-    { kind: 'unreachable', detail: 'timeout' }, { kind: 'error', detail: 'bad body' },
-    ...['rejected', 'terminal', 'absent', 'sink_staged', 'sink_stage_failed', 'recovery_pending'].map(state => ({ kind: 'ok', state })),
+    { kind: 'unreachable', detail: 'timeout' },
+    { kind: 'error', detail: 'bad body' },
+    ...[
+      'rejected',
+      'terminal',
+      'absent',
+      'sink_staged',
+      'sink_stage_failed',
+      'recovery_pending',
+    ].map((state) => ({ kind: 'ok', state })),
   ] as ContainerCallResult[]) {
     const now = Date.now()
-    const pool = makeFakePool({ visibleOrphans: [rawRow({ status: 'accepted',
-      admitted_at: new Date(now - 7 * 3_600_000), accepted_at: new Date(now - 7 * 3_600_000),
-      tape_visible_at: null, tape_id: null, tape_part_count: null, tape_parts_rows: '0',
-      last_frame_at: null, container_running: true })] })
-    const counts = await runReconcileTick({ pool: pool as unknown as Pool, now: () => now,
-      listCarrierDeadDispatchIds: async () => [], container: { ...noContainer, getDispatchState: async () => state } })
+    const pool = makeFakePool({
+      visibleOrphans: [
+        rawRow({
+          status: 'accepted',
+          admitted_at: new Date(now - 7 * 3_600_000),
+          accepted_at: new Date(now - 7 * 3_600_000),
+          tape_visible_at: null,
+          tape_id: null,
+          tape_part_count: null,
+          tape_parts_rows: '0',
+          last_frame_at: null,
+          container_running: true,
+        }),
+      ],
+    })
+    const counts = await runReconcileTick({
+      pool: pool as unknown as Pool,
+      now: () => now,
+      listCarrierDeadDispatchIds: async () => [],
+      container: { ...noContainer, getDispatchState: async () => state },
+    })
     assert.equal(counts.visibleOrphans, 0)
     assert.equal(pool.writes.length, 0)
   }
 })
 
 describe('OCV5-121 R4 exact-attempt liveness integration', () => {
-  const rowAt = (now: number, age: number, attempt = 1) => rawRow({
-    status: 'accepted', outcome: null, attempt_no: attempt,
-    admitted_at: new Date(now - age), accepted_at: new Date(now - age),
-    tape_visible_at: null, tape_id: null, tape_part_count: null, tape_parts_rows: '0',
-    first_visible_at: null, last_frame_at: null, container_running: true,
-  })
+  const rowAt = (now: number, age: number, attempt = 1) =>
+    rawRow({
+      status: 'accepted',
+      outcome: null,
+      attempt_no: attempt,
+      admitted_at: new Date(now - age),
+      accepted_at: new Date(now - age),
+      tape_visible_at: null,
+      tape_id: null,
+      tape_part_count: null,
+      tape_parts_rows: '0',
+      first_visible_at: null,
+      last_frame_at: null,
+      container_running: true,
+    })
   const assertNoDestructive = (pool: ReturnType<typeof makeFakePool>) => {
     assert.equal(pool.attemptedWrites.length, 0)
     assert.equal(pool.writes.includes('COMMIT'), false)
-    assert.equal(pool.queries.some(sql => sql.includes('SELECT f.payload') && sql.includes('FROM client_session_live_streams')), false)
+    assert.equal(
+      pool.queries.some(
+        (sql) =>
+          sql.includes('SELECT f.payload') && sql.includes('FROM client_session_live_streams'),
+      ),
+      false,
+    )
   }
 
   for (const age of [16 * 60_000, 6 * 3_600_000]) {
     for (const acceptedPage of [true, false]) {
       test('running age=' + age + ' acceptedPage=' + acceptedPage, async () => {
         _resetVisibleOrphanScanOffset()
-        const now = Date.now(), row = rowAt(now, age)
-        const pool = makeFakePool({ acceptedStuck: acceptedPage ? [row] : [], visibleOrphans: [row] })
+        const now = Date.now(),
+          row = rowAt(now, age)
+        const pool = makeFakePool({
+          acceptedStuck: acceptedPage ? [row] : [],
+          visibleOrphans: [row],
+        })
         let probes = 0
         const counts = await runReconcileTick({
-          pool: pool as unknown as Pool, now: () => now, listCarrierDeadDispatchIds: async () => [],
-          container: { ...noContainer, getDispatchState: async () => {
-            probes++; return { kind: 'ok', state: 'running' }
-          }, cancelIfQueued: async () => { assert.fail('running is never a queued cancellation') } },
+          pool: pool as unknown as Pool,
+          now: () => now,
+          listCarrierDeadDispatchIds: async () => [],
+          container: {
+            ...noContainer,
+            getDispatchState: async () => {
+              probes++
+              return { kind: 'ok', state: 'running' }
+            },
+            cancelIfQueued: async () => {
+              assert.fail('running is never a queued cancellation')
+            },
+          },
         })
         assert.equal(probes, 1)
         if (age < 6 * 3_600_000) {
@@ -1848,8 +2255,8 @@ describe('OCV5-121 R4 exact-attempt liveness integration', () => {
           assert.equal(counts.visibleOrphans, 1)
           assert.equal(counts.visibleOrphansSkippedLive, 0)
           assert.ok(pool.writes.includes('COMMIT'))
-          assert.ok(pool.writes.some(sql => sql.includes('producer_fenced_at')))
-          assert.ok(pool.writes.some(sql => sql.includes("status = 'terminal'")))
+          assert.ok(pool.writes.some((sql) => sql.includes('producer_fenced_at')))
+          assert.ok(pool.writes.some((sql) => sql.includes("status = 'terminal'")))
         }
       })
     }
@@ -1858,18 +2265,28 @@ describe('OCV5-121 R4 exact-attempt liveness integration', () => {
   for (const currentState of ['queued', 'running'] as const) {
     test('raw-id live/probed hits cannot reuse a different attempt: ' + currentState, async () => {
       _resetVisibleOrphanScanOffset()
-      const now = Date.now(), age = 6 * 3_600_000
-      const old = rowAt(now, age, 1), current = rowAt(now, age, 2)
+      const now = Date.now(),
+        age = 6 * 3_600_000
+      const old = rowAt(now, age, 1),
+        current = rowAt(now, age, 2)
       const pool = makeFakePool({ acceptedStuck: [old], visibleOrphans: [current] })
-      const attempts: number[] = [], canceled: number[] = []
+      const attempts: number[] = [],
+        canceled: number[] = []
       const counts = await runReconcileTick({
-        pool: pool as unknown as Pool, now: () => now, listCarrierDeadDispatchIds: async () => [],
-        container: { ...noContainer, getDispatchState: async id => {
-          attempts.push(id.attemptNo)
-          return { kind: 'ok', state: id.attemptNo === 1 ? 'sink_staged' : currentState }
-        }, cancelIfQueued: async id => {
-          canceled.push(id.attemptNo); return { kind: 'ok', state: 'rejected', outcome: 'not_accepted' }
-        } },
+        pool: pool as unknown as Pool,
+        now: () => now,
+        listCarrierDeadDispatchIds: async () => [],
+        container: {
+          ...noContainer,
+          getDispatchState: async (id) => {
+            attempts.push(id.attemptNo)
+            return { kind: 'ok', state: id.attemptNo === 1 ? 'sink_staged' : currentState }
+          },
+          cancelIfQueued: async (id) => {
+            canceled.push(id.attemptNo)
+            return { kind: 'ok', state: 'rejected', outcome: 'not_accepted' }
+          },
+        },
       })
       assert.deepEqual(attempts, [1, 2])
       assert.deepEqual(canceled, currentState === 'queued' ? [2] : [])
@@ -1881,14 +2298,31 @@ describe('OCV5-121 R4 exact-attempt liveness integration', () => {
   for (const kind of ['error', 'unreachable'] as const) {
     for (const age of [16 * 60_000, 6 * 3_600_000]) {
       for (const acceptedPage of [true, false]) {
-        test('active unknown ' + kind + ' age=' + age + ' acceptedPage=' + acceptedPage, async () => {
+        test('active unknown ' +
+          kind +
+          ' age=' +
+          age +
+          ' acceptedPage=' +
+          acceptedPage, async () => {
           _resetVisibleOrphanScanOffset()
-          const now = Date.now(), row = rowAt(now, age)
-          const pool = makeFakePool({ acceptedStuck: acceptedPage ? [row] : [], visibleOrphans: [row] })
+          const now = Date.now(),
+            row = rowAt(now, age)
+          const pool = makeFakePool({
+            acceptedStuck: acceptedPage ? [row] : [],
+            visibleOrphans: [row],
+          })
           let probes = 0
           const counts = await runReconcileTick({
-            pool: pool as unknown as Pool, now: () => now, listCarrierDeadDispatchIds: async () => [],
-            container: { ...noContainer, getDispatchState: async () => { probes++; return { kind, detail: 'unknown' } } },
+            pool: pool as unknown as Pool,
+            now: () => now,
+            listCarrierDeadDispatchIds: async () => [],
+            container: {
+              ...noContainer,
+              getDispatchState: async () => {
+                probes++
+                return { kind, detail: 'unknown' }
+              },
+            },
           })
           assert.equal(probes, 1)
           assert.equal(counts.visibleOrphans, 0)
@@ -1901,12 +2335,21 @@ describe('OCV5-121 R4 exact-attempt liveness integration', () => {
   for (const acceptedPage of [true, false]) {
     test('sink_staged at 6h remains live acceptedPage=' + acceptedPage, async () => {
       _resetVisibleOrphanScanOffset()
-      const now = Date.now(), row = rowAt(now, 6 * 3_600_000)
+      const now = Date.now(),
+        row = rowAt(now, 6 * 3_600_000)
       const pool = makeFakePool({ acceptedStuck: acceptedPage ? [row] : [], visibleOrphans: [row] })
       let probes = 0
       const counts = await runReconcileTick({
-        pool: pool as unknown as Pool, now: () => now, listCarrierDeadDispatchIds: async () => [],
-        container: { ...noContainer, getDispatchState: async () => { probes++; return { kind: 'ok', state: 'sink_staged' } } },
+        pool: pool as unknown as Pool,
+        now: () => now,
+        listCarrierDeadDispatchIds: async () => [],
+        container: {
+          ...noContainer,
+          getDispatchState: async () => {
+            probes++
+            return { kind: 'ok', state: 'sink_staged' }
+          },
+        },
       })
       assert.equal(probes, 1)
       assert.equal(counts.visibleOrphans, 0)
@@ -1914,19 +2357,32 @@ describe('OCV5-121 R4 exact-attempt liveness integration', () => {
       assertNoDestructive(pool)
     })
 
-    test('queued hard-cap waits for durable next-tick GET; first acceptedPage=' + acceptedPage, async () => {
+    test('queued hard-cap waits for durable next-tick GET; first acceptedPage=' +
+      acceptedPage, async () => {
       _resetVisibleOrphanScanOffset()
-      const now = Date.now(), row = rowAt(now, 6 * 3_600_000)
+      const now = Date.now(),
+        row = rowAt(now, 6 * 3_600_000)
       const canned: Canned = { acceptedStuck: acceptedPage ? [row] : [], visibleOrphans: [row] }
       const pool = makeFakePool(canned)
       let state: ContainerCallResult = { kind: 'ok', state: 'queued' }
-      let probes = 0, cancels = 0
+      let probes = 0,
+        cancels = 0
       const deps = {
-        pool: pool as unknown as Pool, now: () => now, listCarrierDeadDispatchIds: async () => [],
-        container: { ...noContainer, getDispatchState: async () => { probes++; return state },
+        pool: pool as unknown as Pool,
+        now: () => now,
+        listCarrierDeadDispatchIds: async () => [],
+        container: {
+          ...noContainer,
+          getDispatchState: async () => {
+            probes++
+            return state
+          },
           cancelIfQueued: async () => {
-            cancels++; state = { kind: 'ok', state: 'rejected', outcome: 'not_accepted' }; return state
-          } },
+            cancels++
+            state = { kind: 'ok', state: 'rejected', outcome: 'not_accepted' }
+            return state
+          },
+        },
       }
       const first = await runReconcileTick(deps)
       assert.equal(probes, 1)
@@ -1941,8 +2397,13 @@ describe('OCV5-121 R4 exact-attempt liveness integration', () => {
       assert.equal(cancels, 1)
       assert.equal(next.rejectedTerminal, 1)
       assert.equal(next.visibleOrphans, 0)
-      assert.ok(pool.writes.some(sql => sql.includes("status = 'terminal'")))
-      assert.equal(pool.writes.some(sql => /producer_fenced_at\s*=/.test(sql) || sql.includes('visible-fallback')), false)
+      assert.ok(pool.writes.some((sql) => sql.includes("status = 'terminal'")))
+      assert.equal(
+        pool.writes.some(
+          (sql) => /producer_fenced_at\s*=/.test(sql) || sql.includes('visible-fallback'),
+        ),
+        false,
+      )
     })
   }
 })

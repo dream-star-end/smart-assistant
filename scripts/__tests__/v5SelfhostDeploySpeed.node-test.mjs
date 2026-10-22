@@ -98,8 +98,8 @@ test('build_master_release reuses a matching dist instead of running the web bui
  const forced=bash(f,webLib,'OC_V5_FORCE_WEB_BUILD=1\n'+body);assert.equal(forced.status,73,forced.stderr);assert.match(forced.stderr,/NPM_BUILD_RAN/);
 });
 
-const bgSrc=()=>[fn(d,'start_runtime_release_bg'),fn(d,'collect_runtime_release_bg'),fn(d,'reap_runtime_release_bg')].join('\n');
-const bgPrelude='DRY=0; RUNTIME_BG_PID=""; RUNTIME_BG_LOG=""; RUNTIME_BG_RESULT=""; OC_HOTCFG_RELEASES_ROOT="$TEST_ROOT/rt"; mkdir -p "$OC_HOTCFG_RELEASES_ROOT"';
+const bgSrc=()=>[fn(d,'start_runtime_release_bg'),fn(d,'await_runtime_release_bg'),fn(d,'collect_runtime_release_bg'),fn(d,'reap_runtime_release_bg')].join('\n');
+const bgPrelude='DRY=0; RUNTIME_BG_PID=""; RUNTIME_BG_LOG=""; RUNTIME_BG_RESULT=""; RUNTIME_BG_RC=""; OC_HOTCFG_RELEASES_ROOT="$TEST_ROOT/rt"; mkdir -p "$OC_HOTCFG_RELEASES_ROOT"';
 
 test('runtime release builds in the background while master builds, and its result reaches the parent shell',t=>{
  const f=fixture(t);
@@ -117,6 +117,29 @@ test('a failed background runtime build fails the deploy (die) with its log repl
  const f=fixture(t);
  const o=bash(f,bgSrc(),[bgPrelude,'build_runtime_release() { log "rt-boom-log"; die "release finalize 失败"; }','start_runtime_release_bg x; collect_runtime_release_bg x; echo SHOULD_NOT_REACH'].join('\n'));
  assert.equal(o.status,73,o.stdout+o.stderr);assert.match(o.stdout,/rt-boom-log/);assert.match(o.stderr,/后台构建失败/);assert.doesNotMatch(o.stdout,/SHOULD_NOT_REACH/);
+});
+
+// OCV5-557: build_master_release waits for the bg build before the Box gates; collect still replays and fails.
+test('await before the Box gates: the bg build has finished, collect then reads its result as before',t=>{
+ const f=fixture(t);
+ const s=ok(bash(f,bgSrc(),[bgPrelude,
+  'build_runtime_release() { sleep 1; touch "$TEST_ROOT/bg-finished"; mkdir -p "$OC_HOTCFG_RELEASES_ROOT/rel-abc"; BUILT_RUNTIME_RELEASE="$OC_HOTCFG_RELEASES_ROOT/rel-abc"; RUNTIME_IMAGE_ID=sha256:feed; log "rt-done"; }',
+  'start_runtime_release_bg x; await_runtime_release_bg; [[ -e "$TEST_ROOT/bg-finished" ]] && echo AWAITED; await_runtime_release_bg; collect_runtime_release_bg x',
+  'echo "R=$BUILT_RUNTIME_RELEASE I=$RUNTIME_IMAGE_ID RC=[$RUNTIME_BG_RC]"'].join('\n')));
+ assert.match(s,/AWAITED/);assert.match(s,/rt-done/);assert.match(s,/R=.*\/rt\/rel-abc I=sha256:feed RC=\[\]/);
+});
+
+test('await before the Box gates: a failed bg build still fails the deploy at collect, log replayed',t=>{
+ const f=fixture(t);
+ const o=bash(f,bgSrc(),[bgPrelude,'build_runtime_release() { log "rt-boom-log"; die "release finalize 失败"; }','start_runtime_release_bg x; await_runtime_release_bg; echo AWAITED; collect_runtime_release_bg x; echo SHOULD_NOT_REACH'].join('\n'));
+ assert.equal(o.status,73,o.stdout+o.stderr);assert.match(o.stdout,/AWAITED/);assert.match(o.stdout,/rt-boom-log/);assert.match(o.stderr,/后台构建失败 rc=73/);assert.doesNotMatch(o.stdout,/SHOULD_NOT_REACH/);
+});
+
+test('await before the Box gates, then the parent dies: EXIT reap does not wait twice and replays the log',t=>{
+ const f=fixture(t);
+ const o=bash(f,bgSrc(),[bgPrelude,'build_runtime_release() { log "rt-bg-log"; BUILT_RUNTIME_RELEASE=x; RUNTIME_IMAGE_ID=y; }',
+  'trap reap_runtime_release_bg EXIT','start_runtime_release_bg x; await_runtime_release_bg; die "box gate failed"'].join('\n'));
+ assert.equal(o.status,73);assert.match(o.stderr,/rt-bg-log/);assert.doesNotMatch(o.stderr,/not a child/);
 });
 
 test('if the parent dies first, EXIT cleanup waits for the background build before releasing anything',t=>{

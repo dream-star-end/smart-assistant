@@ -24,6 +24,7 @@
  *   - role=admin + visibility='hidden' + 没 grant → false。admin 不自动 bypass hidden,
  *     与 listForUser 同源:hidden 是"必须显式授权才能用"的最严格语义,plan v3 §E1 定义。
  */
+import { isBoxGptWebModel, isBoxGptWebOwnerUid } from '@openclaude/protocol'
 import type { PricingCache } from './pricing.js'
 import { canonicalizeModelId } from './pricing.js'
 import { meetsMinPlan } from './planEntitlement.js'
@@ -34,6 +35,7 @@ export interface CanUseModelDeps {
 }
 
 export interface CanUseModelInput {
+  uid?: string | number | bigint | null
   /** JWT 解析得到。anonymous(未登录)调用本函数无意义,caller 自己先决定要不要查。 */
   role: 'user' | 'admin'
   /** caller 必须在调用前一次性查表得到本 uid 的 grants 集合。空集合可。 */
@@ -57,6 +59,10 @@ export function canUseModel(deps: CanUseModelDeps, input: CanUseModelInput): boo
   const pricing = deps.pricing.get(canonical)
   if (!pricing) return false
   if (!pricing.enabled) return false
+  if (isBoxGptWebModel(pricing.model_id)) {
+    if (!isBoxGptWebOwnerUid(input.uid)) return false
+    if (!input.grantedModelIds.has(pricing.model_id)) return false
+  }
   if (input.deniedModelIds?.has(canonical)) return false
   if (!meetsMinPlan({
     minPlanCode: pricing.min_plan_code,

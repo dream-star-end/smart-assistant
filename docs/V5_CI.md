@@ -24,7 +24,7 @@ containers 配置照抄 v3,端口/凭证/健康检查完全一致。
 | ci-queue-sentinel | `(none; scheduling gate)` | 秒级调度闸:先让第一梯队(含 required 6 job)抢 runner,再放行 integ/browser | 2 min |
 | typecheck | `npm run typecheck && npm run check:ci-parity` | 全仓类型闭合;CI 门集合 ≡ `check:v5` 门集合(见下「CI parity 门」) | 20 min |
 | lint | `npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run check:test-retries` | 导出的调度器/轮询器真的被 start(HealthPoller 事故);读 `agent_containers` 显式带 state,vanished 行不渗进用户视图/计费聚合;禁止静默 test retry | 10 min |
-| protocol | `npm run test:protocol` | gateway↔web-react↔容器的帧与错误码单一权威(frames / turnErrorTaxonomy / promptQueueFrames / modelAuthority)未漂 | 10 min |
+| protocol | `npm run test:protocol && npm run test:kernel` | gateway↔web-react↔容器的帧与错误码单一权威(frames / turnErrorTaxonomy / promptQueueFrames / modelAuthority)未漂;kernel 脱敏/日志/trace 契约 | 10 min |
 | channels | `npm run test:channels` | 企微 iLink 收发/媒体/配对链路契约 | 10 min |
 | gateway | `npm run test:gateway` | 网关侧会话/工具/路由行为 | 25 min |
 | storage | `npm run test:storage && npm run test:mcp-memory` | 持久化层与记忆子系统 | 15 min |

@@ -45,6 +45,15 @@ const gatewaySource = [
   'gatewayLifecycle.ts',
   'gatewayHttp.ts',
   'sessionRepoBinding.ts',
+  'turnDispatch.ts',
+  'promptQueueDispatch.ts',
+  'delegateGuard.ts',
+  'skillTrainRuns.ts',
+  'agentMessage.ts',
+  'delegatePolicy.ts',
+  'wechatInboundCompensate.ts',
+  'autoDreamSchedule.ts',
+  'httpUploadStatic.ts',
 ]
   .map((f) => readFileSync(join(root, 'packages/gateway/src', f), 'utf8'))
   .join('\n')
@@ -1050,7 +1059,7 @@ const A_EXTERNAL_LEAVES = [
 ] as const;
 const { createHash: hashAProof } = await import('node:crypto');
 const { realpathSync: realAProof } = await import('node:fs');
-for (const pkg of ['commercial', 'gateway', 'protocol', 'storage']) {
+for (const pkg of ['commercial', 'gateway', 'protocol', 'kernel', 'storage']) {
   assert.equal(realAProof(join(candidateRoot, 'node_modules/@openclaude', pkg)),
     realAProof(join(candidateRoot, 'packages', pkg)), `A proof workspace escaped candidate: ${pkg}`);
 }

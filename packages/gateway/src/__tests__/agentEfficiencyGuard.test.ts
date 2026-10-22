@@ -7,6 +7,7 @@ import { mkdtempSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, it } from 'node:test'
+import { readGatewaySource } from './helpers/gatewaySource.js'
 
 const TEST_HOME = mkdtempSync(join(tmpdir(), 'oc-eff-guard-'))
 process.env.OPENCLAUDE_HOME = TEST_HOME
@@ -393,7 +394,9 @@ describe('sessionManager mount contract', () => {
     const capSrc = readFileSync(new URL('../delegateCapacity.ts', import.meta.url), 'utf8')
     assert.match(capSrc, /export const DELEGATE_MAX_CONCURRENT_DELEGATIONS = 5/)
     assert.match(capSrc, /export const DELEGATE_REVIEW_RESERVED_SLOTS = 1/)
-    const src = readFileSync(new URL('../server.ts', import.meta.url), 'utf8')
+    // Gateway source set (server.ts + split-out modules, FINDINGS §7/§10): the per-turn member default
+    // and the cap call moved to delegatePolicy.ts / delegateGuard.ts (OCV5-533).
+    const src = readGatewaySource()
     assert.match(src, /MEMBER_DELEGATIONS_PER_TURN_DEFAULT = 8/)
     assert.match(src, /delegateConcurrencyCap\(/)
     assert.doesNotMatch(src, /MAX_CONCURRENT_DELEGATIONS\s*=\s*\d+/)

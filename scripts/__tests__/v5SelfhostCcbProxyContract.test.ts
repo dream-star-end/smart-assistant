@@ -51,7 +51,8 @@ describe('v5 selfhost CCB HTTPS proxy deployment contract', () => {
   })
 
   it('upserts transport env and refreshes listener/firewall before cutover', () => {
-    const deploy = read('scripts/deploy-v5-selfhost.sh')
+    // OCV5-535: the env writers live in scripts/lib/v5-selfhost-env.sh, sourced by the deploy script.
+    const deploy = read('scripts/deploy-v5-selfhost.sh') + read('scripts/lib/v5-selfhost-env.sh')
     assert.match(deploy, /OC_CLAUDE_CODE_HTTPS_PROXY "http:\/\/172\.31\.0\.1:18991"/)
     assert.match(deploy, /OC_CLAUDE_CODE_TZ "Asia\/Tokyo"/)
     assert.match(deploy, /install_unit "\$UNIT_DIR\/\$V5_CCB_PROXY_UNIT"/)

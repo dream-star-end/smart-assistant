@@ -4,7 +4,7 @@
  * effect 顺序不变。语义见 lib/sessionEffort、lib/sessionContextTier。
  */
 import { useCallback, useEffect, useState } from "react";
-import type { CursorContextTier, ServiceTier } from "@openclaude/protocol";
+import type { CursorContextTier, ServiceTier } from "@openclaude/protocol/browser";
 import { readContextTierForSession, writeContextTier } from "../lib/sessionContextTier";
 import { readSessionEffort, writeSessionEffort } from "../lib/sessionEffort";
 import { readSessionServiceTier, writeSessionServiceTier } from "../lib/sessionServiceTier";

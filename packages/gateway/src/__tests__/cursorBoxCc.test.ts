@@ -755,6 +755,7 @@ function largeLineBridge(writeExit: number, loseFirstResponse = false): {
     fetchImpl: async (_url, init) => {
       const body = JSON.parse(Buffer.from(init.body as Uint8Array).subarray(5).toString('utf8')) as {
         command: string
+        args: string[]
         environment: Record<string, string>
       }
       if (body.command === 'python3') {
@@ -763,6 +764,9 @@ function largeLineBridge(writeExit: number, loseFirstResponse = false): {
         if (writeExit === 0 && body.environment.OC_BOX_CC_LAST === '1'
           && body.environment.OC_BOX_CC_SEQ === '2') endLaunch?.()
         return new Response(Uint8Array.from(exit(writeExit)))
+      }
+      if (body.command === 'sh' && body.args[1] === BOX_CC_STOP_SCRIPT) {
+        return new Response(Uint8Array.from(exit(0)))
       }
       // The launch stream stays open until Claude exits or the bridge gives up; the interactive
       // host first reports ready (Box Claude has no -p launch).

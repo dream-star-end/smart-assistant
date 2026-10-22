@@ -65,9 +65,10 @@ For each page, `render` keeps the 160-DPI `page-N.png` and creates a matching, s
 
 ```bash
 find "$QA" -maxdepth 1 -type f -name 'vision-page-*.jpg' -print | sort -V
-oc-vision understand "$QA/vision-page-1.jpg" --prompt \
-  "Check this page for clipping, broken tables, odd page breaks, missing glyphs, header/footer errors, blank pages, or overcrowding. Return PASS or list concrete issues."
-# Repeat for every path returned by find.
+# Inspect every vision-page-N.jpg with the current model's native image input
+# (for example, Read each path). Check for clipping, broken tables, odd page
+# breaks, missing glyphs, header/footer errors, blank pages, or overcrowding.
+# Do not call the retired oc-vision command.
 ```
 
 If any page fails, edit the source, regenerate, re-render, re-run inspect, and visually review every page again. Automated warnings do not replace visual review.
@@ -105,4 +106,4 @@ oc-artifact-qa deliver --input "$FINAL.docx"
 
 Print **only** the FINAL absolute path, on its own line. Do not wrap it in a fenced code block. Never invent URLs, ports, tokens, or curl fallbacks. Do not print `.deliver.json` sidecars. Two or more deliverables → `oc-artifact-qa pack --out /home/agent/.openclaude/generated/<stem>.zip -- file1 file2` and print the zip path only.
 
-Return the absolute path of the cleaned final DOCX and any requested source file. Do not deliver internal QA images unless requested. Use only the documented `oc-docx`/`oc-docxcheck`/`oc-artifact-qa`/`oc-vision` commands.
+Return the absolute path of the cleaned final DOCX and any requested source file. Do not deliver internal QA images unless requested. Use only the documented `oc-docx`/`oc-docxcheck`/`oc-artifact-qa` commands.
