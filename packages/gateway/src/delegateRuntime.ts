@@ -109,25 +109,10 @@ import {
   type ReviewEvidenceItem,
   type TeamReviewMode,
 } from './teamMode.js'
-import {
-  DELEGATE_DEFAULT_PREFERRED_MODELS,
-  DELEGATE_GROK_FALLBACK_MODEL,
-  assertKnownExplicitDelegateModel,
-  resolveLocalExecutionIfEnforced,
-  localExecutionOverride,
-  DELEGATE_QUEUE_MAX_WAITERS,
-  MAX_HIDDEN_DELEGATIONS_PER_TURN,
-  MEMBER_DELEGATIONS_PER_TURN_DEFAULT,
-  PerTurnDelegationGuard,
-  resolveDelegateParentClientSessionId,
-  _buildTurnStatusFrame,
-} from './server.js'
-import type {
-  Gateway,
-  LocalExecutionDecision,
-  DelegateGateBlock,
-  RunDelegateInput,
-} from './server.js'
+import { resolveLocalExecutionIfEnforced, localExecutionOverride, _buildTurnStatusFrame } from './server.js'
+import { DELEGATE_DEFAULT_PREFERRED_MODELS, DELEGATE_GROK_FALLBACK_MODEL, assertKnownExplicitDelegateModel, DELEGATE_QUEUE_MAX_WAITERS, MAX_HIDDEN_DELEGATIONS_PER_TURN, MEMBER_DELEGATIONS_PER_TURN_DEFAULT, PerTurnDelegationGuard, resolveDelegateParentClientSessionId } from './delegatePolicy.js'
+import type { Gateway, LocalExecutionDecision } from './server.js'
+import type { DelegateGateBlock, RunDelegateInput } from './delegatePolicy.js'
 
 export interface DelegateRuntimeHost {
   _acquireDelegateGrokRoute: Gateway['_acquireDelegateGrokRoute']
@@ -412,6 +397,11 @@ export function _resolveDelegateParentEngine(
   }
 }
 
+export type ResolveDelegateProgressTargetArgs = {
+    parentSessionKey?: unknown
+    sourceAgent?: unknown
+  }
+
 /**
  * 解析委派进度路由:沿父链向上追溯到最近的 webchat 祖先会话(取代旧的「父非 webchat
  * 即 null」——那会让二级+嵌套委派的进度整段丢弃,一级卡长时间无进展)。
@@ -426,10 +416,7 @@ export function _resolveDelegateParentEngine(
  */
 export function _resolveDelegateProgressTarget(
   this: DelegateRuntimeHost,
-  args: {
-    parentSessionKey?: unknown
-    sourceAgent?: unknown
-  },
+  args: ResolveDelegateProgressTargetArgs,
 ): DelegateProgressRouting | null {
   const parent =
     typeof args.parentSessionKey === 'string'
@@ -470,19 +457,23 @@ export function _resolveDelegateProgressTarget(
   })
 }
 
-export function _resolveDelegateParent(
-  this: DelegateRuntimeHost,
-  args: {
-    parentSessionKey?: unknown
-    sourceAgent?: unknown
-  },
-): {
+export type ResolveDelegateParentResult = {
   sessionKey: string
   repoSessionId?: string
   workspaceMode: 'legacy' | 'isolated_v1'
   billingParentTurnKey?: string
   platformGoal?: GoalStateSnapshot | null
-} | null {
+} | null
+
+export type ResolveDelegateParentArgs = {
+    parentSessionKey?: unknown
+    sourceAgent?: unknown
+  }
+
+export function _resolveDelegateParent(
+  this: DelegateRuntimeHost,
+  args: ResolveDelegateParentArgs,
+): ResolveDelegateParentResult {
   if (typeof args.parentSessionKey !== 'string' || !args.parentSessionKey) return null
   const parent = this.sessions.getByKey(args.parentSessionKey)
   if (!parent) return null
@@ -2473,14 +2464,16 @@ export function _readDelegateMemoryPressure(
   return readDelegateMemoryPressure()
 }
 
+export type TryReserveDelegateSlotOpts = {
+    parentBucketKey?: string
+    isReview?: boolean
+  }
+
 /** 预占一个并发名额(判定+自增在同一同步段,单线程下原子,等待者间无超发);
  *  被闸拦截则返回原因、不占名额。P2 债C:非 review + 有父桶 → 同步 bump per-parent 运行计数。 */
 export function _tryReserveDelegateSlot(
   this: DelegateRuntimeHost,
-  opts?: {
-    parentBucketKey?: string
-    isReview?: boolean
-  },
+  opts?: TryReserveDelegateSlotOpts,
 ): DelegateGateBlock | null {
   const blocked = this._checkDelegateResourceGate(opts)
   if (blocked) return blocked
@@ -2492,14 +2485,16 @@ export function _tryReserveDelegateSlot(
   return null
 }
 
+export type ReleaseDelegateSlotOpts = {
+    parentBucketKey?: string
+    isReview?: boolean
+  }
+
 /** 释放一个已预占的并发名额(全局 + per-parent)。所有过闸后的路径必须经此释放,
  *  与 _tryReserveDelegateSlot 的增量口径严格对称(否则 per-parent 计数漂移锁死后续委派)。 */
 export function _releaseDelegateSlot(
   this: DelegateRuntimeHost,
-  opts?: {
-    parentBucketKey?: string
-    isReview?: boolean
-  },
+  opts?: ReleaseDelegateSlotOpts,
 ): void {
   this._activeDelegations--
   if (opts && !opts.isReview && opts.parentBucketKey) {
@@ -2509,6 +2504,20 @@ export function _releaseDelegateSlot(
     else m.set(opts.parentBucketKey, cur - 1)
   }
 }
+
+export type WaitForDelegateCapacityResult = | { status: 'ok' }
+  | { status: 'queue_full'; blocked: DelegateGateBlock }
+  | { status: 'timeout'; blocked: DelegateGateBlock; waitedMs: number }
+  | { status: 'aborted'; waitedMs: number }
+
+export type WaitForDelegateCapacityArgs = {
+    sessionKey: string
+    /** P2 债C/3.5 — per-parent 分桶键(队长会话 sessionKey);缺省 → 只走全局闸。 */
+    parentBucketKey?: string
+    /** P2 债C — review 委派:走保留槽、豁免 per-parent 桶。 */
+    isReview?: boolean
+    onQueued?: (blocked: DelegateGateBlock) => void
+  }
 
 /**
  * delegate 资源闸有界排队:命中「并发 ≥ 上限」或「内存 ≥ 阈值」→ 轮询复查等待
@@ -2528,19 +2537,9 @@ export function _releaseDelegateSlot(
  */
 export async function _waitForDelegateCapacity(
   this: DelegateRuntimeHost,
-  args: {
-    sessionKey: string
-    /** P2 债C/3.5 — per-parent 分桶键(队长会话 sessionKey);缺省 → 只走全局闸。 */
-    parentBucketKey?: string
-    /** P2 债C — review 委派:走保留槽、豁免 per-parent 桶。 */
-    isReview?: boolean
-    onQueued?: (blocked: DelegateGateBlock) => void
-  },
+  args: WaitForDelegateCapacityArgs,
 ): Promise<
-  | { status: 'ok' }
-  | { status: 'queue_full'; blocked: DelegateGateBlock }
-  | { status: 'timeout'; blocked: DelegateGateBlock; waitedMs: number }
-  | { status: 'aborted'; waitedMs: number }
+  WaitForDelegateCapacityResult
 > {
   const reserveOpts = { parentBucketKey: args.parentBucketKey, isReview: args.isReview }
   const first = this._tryReserveDelegateSlot(reserveOpts)
@@ -2639,6 +2638,13 @@ export function _admitDelegateCreate(
   return 'wait'
 }
 
+export type ApplyDelegateCapacityRejectArgs = {
+    httpStatus: number
+    message: string
+    failureClass?: DelegateFailureClass
+    drop: boolean
+  }
+
 /**
  * Capacity reject must not leave an executable job, and must not fail a job
  * that already lost the race to claimQueued. Single-threaded Map ops make
@@ -2648,12 +2654,7 @@ export function _admitDelegateCreate(
 export function _applyDelegateCapacityReject(
   this: DelegateRuntimeHost,
   input: RunDelegateInput,
-  args: {
-    httpStatus: number
-    message: string
-    failureClass?: DelegateFailureClass
-    drop: boolean
-  },
+  args: ApplyDelegateCapacityRejectArgs,
 ): DelegateTaskResult {
   const jobId = input.backgroundJobId
   const store = this._delegateJobs

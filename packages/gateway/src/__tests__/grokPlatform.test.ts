@@ -119,4 +119,28 @@ describe('grok platform projection', () => {
       restore('OPENCLAUDE_HOME', oldHome)
     }
   })
+
+  test('turns off native video tools but keeps image tools (OCV5-572)', () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'oc-grok-platform-video-'))
+    const oldHome = process.env.OPENCLAUDE_HOME
+    process.env.OPENCLAUDE_HOME = home
+    try {
+      for (const gatewayToken of ['token', '']) {
+        const projected = projectGrokPlatform({
+          agentId: 'main',
+          sessionKey: 'agent:main:webchat:dm:grok-platform-video',
+          gatewayPort: 18790,
+          gatewayToken,
+          delegationDepth: 0,
+        })
+        const raw = readFileSync(path.join(projected.launchHome, 'config.toml'), 'utf8')
+        const features = raw.slice(raw.indexOf('[features]'), raw.indexOf('[shell_environment_policy]'))
+        assert.match(features, /^video_gen = false$/m)
+        assert.doesNotMatch(raw, /image_gen|image_edit|imagine_tools_disabled/)
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+      restore('OPENCLAUDE_HOME', oldHome)
+    }
+  })
 })

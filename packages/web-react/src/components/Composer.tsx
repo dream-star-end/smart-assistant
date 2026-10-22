@@ -1,6 +1,6 @@
 import * as Dialog from "@radix-ui/react-dialog";
-import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol";
-import type { MessageReplyQuote } from "@openclaude/protocol";
+import { MAX_ATTACHMENTS_PER_MESSAGE } from "@openclaude/protocol/browser";
+import type { MessageReplyQuote } from "@openclaude/protocol/browser";
 import type { GoalStateSnapshot } from "@openclaude/protocol/goalState";
 import {
   ArrowUp,

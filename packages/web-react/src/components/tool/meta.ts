@@ -136,9 +136,8 @@ export const OC_TOOLS = {
   "oc-docx": { icon: FileText, label: "Word 生成", tone: "success" },
   "oc-slides": { icon: AppWindow, label: "幻灯片生成", tone: "success" },
   "oc-poster": { icon: ImageIcon, label: "海报生成", tone: "success" },
-  // 识图/记忆从 MCP 工具迁到 CLI(2026-07-07)后经 Bash 调用,专属卡沿用旧语义
-  //(understand_image → "图片理解"眼睛;memory/archival/session_search → "记忆")。
-  "oc-vision": { icon: Eye, label: "图片理解", tone: "info" },
+  // memory/archival/session_search 从 MCP 工具迁到 CLI(2026-07-07)后经 Bash 调用,
+  // 专属卡沿用旧语义("记忆")。oc-vision 已下线(OCV5-547)。
   "oc-memory": { icon: Brain, label: "记忆", tone: "accent" },
   "oc-minimax": { icon: Sparkles, label: "媒体生成", tone: "accent" },
   // mmx = oc-minimax 的软链(Dockerfile `ln -sf oc-minimax mmx`);同图标/标签/卡。

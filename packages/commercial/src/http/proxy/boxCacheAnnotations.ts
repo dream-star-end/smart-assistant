@@ -246,6 +246,25 @@ export function strictBoxImageBlock(block: unknown): { data: string; mimeType: s
   if (raw.length > MAX_IMAGE_BYTES || raw.toString("base64") !== source.data) return null;
   return { data: source.data, mimeType: source.media_type };
 }
+/** The Messages API document limit: a 32 MB request bounds any one PDF. */
+const MAX_DOCUMENT_BYTES = 32 * 1024 * 1024;
+/** OCV5-571 (#75f47e31): Claude Code's Read returns a PDF as a one-line
+ * tool_result plus this isMeta document block after the results (FileReadTool
+ * `newMessages`). Strict like images: exactly that base64 PDF, no other keys,
+ * canonical base64. Any other document (a text source included) is not one
+ * Read produces and stays rejected. */
+export function strictBoxDocumentBlock(block: unknown): { mediaType: string } | null {
+  if (!object(block) || block.type !== "document") return null;
+  if (Object.keys(block).sort().join(",") !== "source,type" || !object(block.source)) return null;
+  const source = block.source;
+  if (Object.keys(source).sort().join(",") !== "data,media_type,type"
+    || typeof source.data !== "string" || source.data.length === 0) return null;
+  if (source.type !== "base64" || source.media_type !== "application/pdf") return null;
+  const raw = Buffer.from(source.data, "base64");
+  if (raw.length > MAX_DOCUMENT_BYTES || raw.toString("base64") !== source.data
+    || raw.subarray(0, 5).toString("latin1") !== "%PDF-") return null;
+  return { mediaType: "application/pdf" };
+}
 function inspectResultContent(content: unknown): { ok: boolean; images: number; captions: number } {
   if (typeof content === "string") {
     return { ok: true, images: 0, captions: captionShaped(content) ? 1 : 0 };
@@ -424,6 +443,9 @@ function foldBoxCcbHookContext(body: ProxyBody): ProxyBody {
         results.push(part);
         continue;
       }
+      // OCV5-571: a document or image is no hook text: leave the message
+      // unfolded; content() below still checks its cache marker.
+      if (!object(part) || part.type !== "text") return current;
       const text = block(part, ["text"]);
       if (!object(text) || Object.keys(text).sort().join(",") !== "text,type"
         || text.type !== "text" || typeof text.text !== "string") return current;
@@ -874,8 +896,9 @@ export function normalizeBoxSemanticBody(body: ProxyBody,
   const collapse = options.collapseSingleText !== false;
   const messages = semanticBody.messages.map((raw) => {
     if (!object(raw)) return raw;
+    // OCV5-571: CCB puts its cache marker on the last block, often a Read PDF.
     const allowed = raw.role === "assistant" ? ["text", "tool_use"]
-      : ["text", "tool_result", "image"];
+      : ["text", "tool_result", "image", "document"];
     return { ...raw, content: content(raw.content, allowed, collapse) };
   });
   const system = content(semanticBody.system, ["text"], collapse);

@@ -54,6 +54,7 @@
  *   - 串行 tick + stop awaits inflight + runOnce 钩子(完全镜像 v3idleSweep / volumeGc)
  */
 
+import { removeContainerSavingLogs } from "../compute-pool/containerLogArchive.js";
 import type Docker from "dockerode";
 import type { Pool } from "pg";
 import { dockerContainerOwnedByChannel, getRuntimeChannel } from "../runtimeChannel.js";
@@ -313,7 +314,7 @@ async function reconcileDockerOrphans(
         if (!isNotFound(err) && (err as { statusCode?: number }).statusCode !== 304) throw err;
       }
       try {
-        await handle.remove({ force: true });
+        await removeContainerSavingLogs(handle, "orphan_reconcile");
       } catch (err) {
         if (!isNotFound(err)) throw err;
       }

@@ -53,6 +53,7 @@ import type { PreparedUpstreamSession } from "./upstream.js";
 import { createGeminiGoFetch } from "./geminiGoBridge.js";
 import { createOpenAIChatGoFetch } from "./openAiChatGoBridge.js";
 import { createOpenAIResponsesGoFetch } from "./openAiResponsesGoBridge.js";
+import type { BoundWebSearch } from "./webSearchServerTool.js";
 import {
   assertClaudeOAuthIdentity,
   ClaudeIdentityGuardError,
@@ -137,6 +138,13 @@ export interface RoundTripCtx {
   requestId: string;
   uid: bigint;
   body: ProxyBody;
+  /**
+   * Platform search executor bound to this request's container identity. Used by
+   * the OpenCode Go chat/responses bridges to fulfill the official Claude Code
+   * WebSearch side request (`web_search_*` server tool). Absent → the tool is
+   * stripped and the model call proceeds (no 400, no server-side results).
+   */
+  webSearch?: BoundWebSearch;
   session: PreparedUpstreamSession;
   /**
    * OCV5-482: prepares a session on the static route's declared fallback upstream. Set only when the
@@ -306,13 +314,25 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
       }
     };
     const fetchStartMs = Date.now();
+    const webSearch = ctx.webSearch
+      ? (input: Parameters<BoundWebSearch>[0]) => ctx.webSearch!(input, ac.signal)
+      : undefined;
+    // A locally fulfilled WebSearch side request returns a synthetic 200. It
+    // must not be reported as model/provider/key health or latency.
+    let localFulfillment = false;
+    const bridgeOptions = {
+      webSearch,
+      onLocalFulfillment: () => {
+        localFulfillment = true;
+      },
+    };
     const roundTripFetch =
       session.transport === "gemini-go"
         ? createGeminiGoFetch(fetchFn)
         : session.transport === "openai-chat-go"
-          ? createOpenAIChatGoFetch(fetchFn)
+          ? createOpenAIChatGoFetch(fetchFn, bridgeOptions)
           : session.transport === "openai-responses-go"
-            ? createOpenAIResponsesGoFetch(fetchFn)
+            ? createOpenAIResponsesGoFetch(fetchFn, bridgeOptions)
             : fetchFn;
     let upstream = await observedFetch("primary", roundTripFetch, session.endpoint, fetchInit);
     let upstreamErrorPreview: string | null = null;
@@ -525,7 +545,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     }
     // A half-open quota probe is complete as soon as healthy 2xx headers and
     // a body arrive. Clear its durable block before exposing streaming bytes.
-    if (quotaProbeProviderId) {
+    if (!localFulfillment && quotaProbeProviderId) {
       try {
         await clearProviderQuotaBlock(quotaProbeProviderId);
         invalidateDegradedProvidersCache();
@@ -536,11 +556,12 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
         });
       }
     }
-    if (ctx.recordServedUpstream && session.providerId) {
+    if (!localFulfillment && ctx.recordServedUpstream && session.providerId) {
       finalize.setUpstream?.({ provider: session.providerId, model: session.upstreamModel });
     }
     // OCV5-424:API-key 池成员拿到健康 2xx 头 → 成功上报(health 回升、退避级别归零)。
-    if (session.poolMember) {
+    // 本地搜索合成 200 没有碰过模型 key,不能拿来证明 provider 健康。
+    if (!localFulfillment && session.poolMember) {
       void reportApiKeyOutcome(session.poolMember.memberId, { kind: "success" });
     }
     // M9 配额可见性 — 从上游响应头抽 5h/7d utilization + reset,fire-and-forget
@@ -548,7 +569,7 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     // 详见 quota.ts 文件头。maybeUpdateAccountQuota 内部已吞所有错,这里 .catch
     // 仅做最后兜底(理论不会触发),保留以防未来重构破坏内部 swallow 语义。
     // session.shouldUpdateQuotaFromResponse=false(DeepSeek)→ 整段跳过。
-    if (session.shouldUpdateQuotaFromResponse && session.accountId !== null) {
+    if (!localFulfillment && session.shouldUpdateQuotaFromResponse && session.accountId !== null) {
       maybeUpdateAccountQuota(pgPool, session.accountId, upstream.headers).catch((err) => {
         userLog.warn("proxy_quota_update_failed", { err: errSummary(err) });
       });
@@ -572,22 +593,26 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     const streamEndMs = Date.now();
     // 2I-2 metrics:TTFT 是 fetch 起到第一字节;stream duration 是 fetch 起到最后一字节。
     // 任意一项 < 0 / NaN 由 metrics observe 自动丢弃,无需在这里防御。
-    if (result.firstByteAtMs !== null) {
-      observeAnthropicProxyTtft(body.model, (result.firstByteAtMs - fetchStartMs) / 1000);
+    // Synthetic local search responses carry no model TTFT/latency: keep them
+    // out of the provider performance series.
+    if (!localFulfillment) {
+      if (result.firstByteAtMs !== null) {
+        observeAnthropicProxyTtft(body.model, (result.firstByteAtMs - fetchStartMs) / 1000);
+      }
+      observeAnthropicProxyStreamDuration(body.model, (streamEndMs - fetchStartMs) / 1000);
+      recordUpstreamPerformance(
+        pgPool,
+        (message, fields) => userLog.warn(message, fields),
+        {
+          requestId,
+          userId: uid,
+          model: body.model,
+          ttftMs: result.firstByteAtMs === null ? null : result.firstByteAtMs - fetchStartMs,
+          streamMs: streamEndMs - fetchStartMs,
+          outcome: result.error === null ? "success" : "error",
+        },
+      );
     }
-    observeAnthropicProxyStreamDuration(body.model, (streamEndMs - fetchStartMs) / 1000);
-    recordUpstreamPerformance(
-      pgPool,
-      (message, fields) => userLog.warn(message, fields),
-      {
-        requestId,
-        userId: uid,
-        model: body.model,
-        ttftMs: result.firstByteAtMs === null ? null : result.firstByteAtMs - fetchStartMs,
-        streamMs: streamEndMs - fetchStartMs,
-        outcome: result.error === null ? "success" : "error",
-      },
-    );
     // OCV5-328: an upstream that broke off mid-message must not read as a
     // finished response. Not after a client abort (nobody is listening) and
     // not once the terminal frames went out (the message is complete).
@@ -612,14 +637,18 @@ export async function runUpstreamRoundTrip(ctx: RoundTripCtx): Promise<void> {
     if (result.error !== null) {
       if (isClientAbort(result.error)) {
         outcome = await finalize.failClient(observed, result.error, "CLIENT_ABORT");
-        recordProviderHealthSample(body.model, "aborted", session.providerId); // 客户端断:judgement 排除,不算 provider 失败
+        if (!localFulfillment)
+          recordProviderHealthSample(body.model, "aborted", session.providerId); // 客户端断:judgement 排除,不算 provider 失败
       } else {
         outcome = await finalize.fail(observed, result.error, "STREAM_FAILED");
-        recordProviderHealthSample(body.model, "partial", session.providerId); // 中途断流 = provider 侧失败
+        if (!localFulfillment)
+          recordProviderHealthSample(body.model, "partial", session.providerId); // 中途断流 = provider 侧失败
       }
     } else {
       outcome = await finalize.commit(observed);
-      recordProviderHealthSample(body.model, "final", session.providerId); // 完整完成:抽样 1/10
+      // 本地搜索合成 200 不代表模型上游健康。
+      if (!localFulfillment)
+        recordProviderHealthSample(body.model, "final", session.providerId); // 完整完成:抽样 1/10
     }
     // 把真实扣费的积分 + 扣费后余额推给该 uid 的前端 WS,前端会替换响应 meta
     // 行里 $0.xxxx(容器侧估算,口径不一致)为真实扣费积分。

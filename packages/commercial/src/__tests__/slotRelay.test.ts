@@ -141,3 +141,34 @@ describe("slot relay", () => {
     );
   });
 });
+
+describe("ROB-7 peer 不可达只在状态变化时记一次", () => {
+  test("同一口连续失败只 warn 一次;恢复时记 recovered 并带静默条数", async () => {
+    const warns: Array<{ msg: string; meta: unknown }> = [];
+    const infos: Array<{ msg: string; meta: unknown }> = [];
+    const logger = {
+      warn: (msg: string, meta?: unknown) => warns.push({ msg, meta }),
+      info: (msg: string, meta?: unknown) => infos.push({ msg, meta }),
+    };
+    const sent: Array<{ uids: string[]; payload: unknown }> = [];
+    const portA = await listen(relayServer("secret", new Set(["1"]), sent));
+    // 拿一个确实空闲的口:先 listen 再关,之后 connect 必然 ECONNREFUSED。
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const deadPort = (probe.address() as { port: number }).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    const client = createSlotRelayClient({ secret: "secret", ports: [portA, deadPort], logger });
+    for (let i = 0; i < 5; i++) assert.deepEqual(await client.onlineUserSubset(["1", "2"]), ["1"]);
+    const unavailable = warns.filter((w) => w.msg === "slot relay peer unavailable");
+    assert.equal(unavailable.length, 1, "5 次失败只记 1 次");
+    assert.equal((unavailable[0].meta as { port: number }).port, deadPort);
+
+    const revived = createServer(relayServer("secret", new Set(["2"]), []));
+    servers.push(revived);
+    await new Promise<void>((resolve) => revived.listen(deadPort, "127.0.0.1", resolve));
+    assert.deepEqual((await client.onlineUserSubset(["1", "2"])).sort(), ["1", "2"]);
+    assert.deepEqual(infos.map((i) => i.msg), ["slot relay peer recovered"]);
+    assert.deepEqual(infos[0].meta, { port: deadPort, suppressedFailures: 4 });
+    assert.equal(warns.filter((w) => w.msg === "slot relay peer unavailable").length, 1);
+  });
+});

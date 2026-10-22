@@ -71,6 +71,7 @@ import { notifyBoxUserStop } from './engine/boxUserStopClient.js'
 import { IdleTurnTimeoutError, runBoxIdleTurn } from './boxIdleTurn.js'
 
 import { isCcbUserCancellationDiagnostic } from './engine/ccbAdapter.js'
+import { isBoxGptWebCatalogModel } from './engine/cursorBoxCc.js'
 import './engine/codexAdapter.js'
 import './engine/grokAdapter.js'
 import { decideEngineCwd } from './engineCwd.js'
@@ -346,7 +347,26 @@ export function normForCompare(s: string): string {
   return s.replace(/\s+/g, ' ').trim()
 }
 
-function latestAssistantMessageId(messages: unknown[]): string | null {
+/**
+ * Assistant-role notices master writes itself (no engine produced them, so no
+ * native session is missing them): the automatic-recovery give-up card
+ * (pgSessionsBackend appendRecoveryGiveUpTerminalCard), the dispatch
+ * reconciler's visible fallback, and the degraded-tape placeholder.
+ * OCV5-556: a give-up card as the latest assistant row was read as another
+ * agent's answer, which dropped the native resume and replayed 70 messages.
+ */
+const SERVER_NOTICE_ASSISTANT_ID_PREFIXES = [
+  'm-recovery-giveup-',
+  'visible-fallback:',
+  'tape-degraded:',
+] as const
+
+function isServerNoticeAssistantId(id: string): boolean {
+  return SERVER_NOTICE_ASSISTANT_ID_PREFIXES.some((prefix) => id.startsWith(prefix))
+}
+
+/** Index of the latest assistant row an engine turn produced (server notices skipped). */
+function latestEngineAssistantIndex(messages: unknown[]): number {
   for (let i = messages.length - 1; i >= 0; i--) {
     const raw = messages[i]
     if (!raw || typeof raw !== 'object') continue
@@ -354,9 +374,21 @@ function latestAssistantMessageId(messages: unknown[]): string | null {
     if (msg.system === true) continue
     if (msg.role !== 'assistant') continue
     const id = typeof msg.id === 'string' ? msg.id : ''
-    return id || null
+    if (id && isServerNoticeAssistantId(id)) continue
+    return i
   }
-  return null
+  return -1
+}
+
+function latestAssistantMessageId(messages: unknown[]): string | null {
+  const index = latestEngineAssistantIndex(messages)
+  if (index < 0) return null
+  const id = (messages[index] as { id?: unknown }).id
+  return typeof id === 'string' && id ? id : null
+}
+
+function ownAgentAssistantPrefix(peerId: string, agentId: string): string {
+  return `srv-${peerId}-${agentId}-t`
 }
 
 export function shouldTreatMasterHistoryAsProviderGap(opts: {
@@ -366,7 +398,32 @@ export function shouldTreatMasterHistoryAsProviderGap(opts: {
 }): boolean {
   const latestAssistantId = latestAssistantMessageId(opts.messages)
   if (!latestAssistantId) return false
-  return !latestAssistantId.startsWith(`srv-${opts.peerId}-${opts.agentId}-t`)
+  return !latestAssistantId.startsWith(ownAgentAssistantPrefix(opts.peerId, opts.agentId))
+}
+
+/**
+ * Master rows the native session of this agent has not seen: everything after
+ * this agent's latest own engine answer. Null when that answer is not in the
+ * window (the native session's coverage is unknown, so only a full rebuild is
+ * safe) or nothing engine-produced follows it.
+ */
+export function providerGapMessagesAfterOwnTurn(opts: {
+  messages: unknown[]
+  peerId: string
+  agentId: string
+}): unknown[] | null {
+  const prefix = ownAgentAssistantPrefix(opts.peerId, opts.agentId)
+  for (let i = opts.messages.length - 1; i >= 0; i--) {
+    const raw = opts.messages[i]
+    if (!raw || typeof raw !== 'object') continue
+    const msg = raw as ChatHistoryMessage
+    if (msg.system === true || msg.role !== 'assistant') continue
+    if (typeof msg.id !== 'string' || !msg.id.startsWith(prefix)) continue
+    // `${prefix}3-thinking` / `-tool-…` rows belong to the same turn as `${prefix}3`.
+    const tail = opts.messages.slice(i + 1)
+    return latestEngineAssistantIndex(tail) >= 0 ? tail : null
+  }
+  return null
 }
 
 export function historicalContextInjectionKey(opts: {
@@ -579,11 +636,31 @@ export const IDLE_TIMEOUT_DEFAULT_MS = 5 * 60_000
 /** One admitted Box detached tool chain may live four hours. Give its owner
  * turn five minutes to observe the keeper's terminal proof before interrupt. */
 export const BOX_ACTIVE_TURN_IDLE_MS = 4 * 60 * 60_000 + 5 * 60_000
+/** Box ChatGPT Web Pro (box-gpt-6-astra-pro) tasks can run up to 6 hours.
+ * Give the owner turn a 6h 15m silent backstop and idle watchdog threshold. */
+export const BOX_GPT_WEB_ACTIVE_TURN_IDLE_MS = 6 * 60 * 60_000 + 15 * 60_000
+
+/**
+ * Idle TTL of resume-map entries whose in-memory AgentSession was evicted.
+ * OCV5-556: a user coming back after more than 7 days lost the native resume
+ * and every engine fell back to a lossy history rebuild, although the native
+ * conversation files were still in the volume. 90 days matches the volume
+ * lifetime (volume GC: 90 days without a login), so the map only drops
+ * entries whose files are about to go anyway.
+ */
+export const RESUME_MAP_INACTIVE_TTL_MS = 90 * 24 * 60 * 60 * 1000
 function isBoxActiveTurn(engineId?: string, modelId?: string): boolean {
   return engineId === 'ccb' && isBoxApiModel(modelId)
 }
+function isBoxGptWebActiveTurn(engineId?: string, modelId?: string): boolean {
+  return (
+    (engineId === 'cursor' || engineId === 'ccb' || engineId === undefined) &&
+    isBoxGptWebCatalogModel(modelId)
+  )
+}
 
 export function pickTurnSilentBackstopMs(engineId?: string, modelId?: string): number {
+  if (isBoxGptWebActiveTurn(engineId, modelId)) return BOX_GPT_WEB_ACTIVE_TURN_IDLE_MS
   return isBoxActiveTurn(engineId, modelId)
     ? BOX_ACTIVE_TURN_IDLE_MS : 30 * 60_000
 }
@@ -608,6 +685,7 @@ export function pickIdleTimeoutMs(
   engineId?: string,
   modelId?: string,
 ): number {
+  if (isBoxGptWebActiveTurn(engineId, modelId)) return BOX_GPT_WEB_ACTIVE_TURN_IDLE_MS
   if (isBoxActiveTurn(engineId, modelId)) return BOX_ACTIVE_TURN_IDLE_MS
   const inNonStreamingPhase =
     currentTurnStatus === 'compacting' ||
@@ -1578,6 +1656,7 @@ export class SessionManager {
   private get _resumeMapProvider() { return this.resumeStore.provider }
   private get _resumeMapHistory() { return this.resumeStore.history }
   private get _resumeRejectedIds() { return this.resumeStore.rejected }
+  private get _resumeHeadPromotedFromHistory() { return this.resumeStore.promotedFromHistory }
   private get _resumeMapTimestamps() { return this.resumeStore.timestamps }
   private get _resumeMapLastCost() { return this.resumeStore.lastCost }
   private get _resumeMapCostImprecise() { return this.resumeStore.costImprecise }
@@ -2445,14 +2524,9 @@ export class SessionManager {
     return startEvictionLoopImpl.call(this as unknown as SessionLifecycleHost, intervalMs)
   }
 
-  // Idle TTL for entries whose in-memory AgentSession was already evicted.
-  // 7 days covers typical gateway restarts / multi-day reconnect gaps while
-  // preventing resume-map from growing unbounded. Rationale: resume-map exists
-  // to survive *restarts*, not to be a durable conversation archive.
-  private static RESUME_MAP_INACTIVE_TTL = 7 * 24 * 60 * 60 * 1000 // 7 days
 
   private _pruneResumeMap(): void {
-    const pruned = this.resumeStore.prune((key) => this.sessions.has(key), SessionManager.RESUME_MAP_INACTIVE_TTL)
+    const pruned = this.resumeStore.prune((key) => this.sessions.has(key), RESUME_MAP_INACTIVE_TTL_MS)
     for (const { key, ageMs } of pruned) {
       log.info('pruned idle resume-map entry', { sessionKey: key, ageMs })
     }

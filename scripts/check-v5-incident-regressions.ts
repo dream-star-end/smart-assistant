@@ -119,6 +119,7 @@ const TRAILER_GATE_SURFACES = [
   "packages/web-react/",
   "packages/protocol/",
   "packages/storage/",
+  "packages/kernel/",
 ];
 
 type Regression = { layer: string; path: string; assertion?: string };

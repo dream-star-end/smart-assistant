@@ -27,8 +27,29 @@ export function boxOfficialClaudeModel(model: string | undefined): string | unde
   return undefined
 }
 
+const BOX_GPT_WEB_MODELS_MAP: Record<string, string> = {
+  'box-gpt-6-astra-pro': 'gpt-6-astra-pro',
+}
+
+export function boxGptWebModel(model: string | undefined): string | undefined {
+  if (!model) return undefined
+  if (Object.prototype.hasOwnProperty.call(BOX_GPT_WEB_MODELS_MAP, model)) {
+    return BOX_GPT_WEB_MODELS_MAP[model]
+  }
+  if (model === 'gpt-6-astra-pro') return 'gpt-6-astra-pro'
+  return undefined
+}
+
+export function isBoxGptWebCatalogModel(model: string | undefined): boolean {
+  return !!model && Object.prototype.hasOwnProperty.call(BOX_GPT_WEB_MODELS_MAP, model)
+}
+
 export function isBoxClaudeCatalogModel(model: string | undefined): boolean {
   return !!model && Object.prototype.hasOwnProperty.call(BOX_OFFICIAL_MODELS, model)
+}
+
+export function isBoxInteractiveCatalogModel(model: string | undefined): boolean {
+  return isBoxClaudeCatalogModel(model) || isBoxGptWebCatalogModel(model)
 }
 
 /** Official stream-json argv that is safe to run inside the box.
@@ -59,6 +80,10 @@ export function remoteClaudeArgs(argv: readonly string[]): string[] {
 }
 
 /** End the Claude that reads one fifo: the process whose stdin is that path.
+ * The match is the shell's own `[ A -ef B ]` (same device and inode), never a
+ * readlink per process: that forked once for every process on the Box and took
+ * seconds under load, which made every bridge close wait out the stop-exec
+ * timeout (OCV5-538 / OCV5-488).
  * The launch script keeps the fifo open, so closing a writer never ends it.
  * dash applies a foreground redirect to itself while the command runs, so the
  * launch shell is a reader too and goes with its Claude; callers remove the
@@ -67,7 +92,7 @@ export const BOX_CC_REAP_FUNCTION = [
   'reap() {',
   '  pids=""',
   '  for d in /proc/[0-9]*; do',
-  '    if [ "$(readlink "$d/fd/0" 2>/dev/null || true)" = "$1" ]; then pids="$pids ${d#/proc/}"; fi',
+  '    if [ "$d/fd/0" -ef "$1" ]; then pids="$pids ${d#/proc/}"; fi',
   '  done',
   '  if [ -z "$pids" ]; then return 0; fi',
   '  kill -TERM $pids 2>/dev/null || true',
@@ -75,7 +100,7 @@ export const BOX_CC_REAP_FUNCTION = [
   '  while [ "$n" -lt 20 ]; do',
   '    alive=""',
   '    for p in $pids; do',
-  '      if [ "$(readlink "/proc/$p/fd/0" 2>/dev/null || true)" = "$1" ]; then alive="$alive $p"; fi',
+  '      if [ "/proc/$p/fd/0" -ef "$1" ]; then alive="$alive $p"; fi',
   '    done',
   '    if [ -z "$alive" ]; then return 0; fi',
   '    sleep 0.1',

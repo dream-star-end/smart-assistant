@@ -2374,6 +2374,27 @@ describe("pickUpstream — H6.D refresh rebind 保留 pick.account_uuid", () => 
   }
  });
 
+test("OCV5-527 Step catalog and static routes use the renamed chat upstream", async () => {
+  const model = "step-5-preview-free-go";
+  const routes = [
+    selectUpstreamRoute(model),
+    selectUpstreamRoute(model, { providerId: "opencodego", upstreamModelId: "step-5-preview" }),
+  ];
+  for (const route of routes) {
+    const sched = makeScheduler({});
+    const result = await pickUpstream(
+      { scheduler: sched.scheduler, staticProviderKeys: { opencodego: "test-key" } },
+      bodyFor(model), route, log,
+    );
+    assert.ok(result.ok);
+    if (!result.ok) throw new Error("Step route was not prepared");
+    assert.equal(result.session.providerId, "opencodego");
+    assert.equal(result.session.upstreamModel, "step-5-preview");
+    assert.equal(result.session.transport, "openai-chat-go");
+    assert.equal(sched.pickCalls, 0);
+  }
+});
+
 // ─── OCV5-424:静态 provider 的 API-key 服务池 ─────────────────────────────
 
 describe("pickUpstream — API-key 服务池(OCV5-424)", () => {

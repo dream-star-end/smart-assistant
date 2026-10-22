@@ -4,7 +4,8 @@
  */
 import { createHash } from "node:crypto";
 import type { ProxyBody } from "./shared.js";
-import { BoxCacheAnnotationError, normalizeBoxSemanticBody } from "./boxCacheAnnotations.js";
+import { BoxCacheAnnotationError, normalizeBoxSemanticBody,
+  strictBoxDocumentBlock } from "./boxCacheAnnotations.js";
 import { deriveBoxCallFingerprint, deriveBoxContextHash, deriveBoxFallbackAlias,
   fingerprintOfPrepared, type BoxCallFingerprint } from "./boxCallFingerprint.js";
 import { compileBoxToolCatalog, type BoxToolCatalog } from "./boxToolCatalog.js";
@@ -219,7 +220,9 @@ export function boxRequestTailShape(body: ProxyBody, count = 3): string {
 /** OCV5-322 / OCV5-377: tool results followed only by content the Box CLI
  * cannot take through a tool result: non-empty text blocks and images, in any
  * mix, whoever wrote them (a prompt typed during the tool run, a Claude Code
- * reminder, caption or Skill body no fold recognized). `tail` may be empty. */
+ * reminder, caption or Skill body no fold recognized). `tail` may be empty.
+ * OCV5-571: and the document a PDF Read appends (strict, see
+ * strictBoxDocumentBlock); it reaches the Box CLI only as staged history. */
 export function answeredExchangeSplit(content: readonly unknown[]):
   { results: Record<string, unknown>[]; tail: Record<string, unknown>[] } | null {
   let cut = 0;
@@ -229,7 +232,7 @@ export function answeredExchangeSplit(content: readonly unknown[]):
   const tail = content.slice(cut);
   if (results.length < 1 || !tail.every((block) => record(block)
     && ((block.type === "text" && typeof block.text === "string" && block.text.trim().length > 0)
-      || block.type === "image"))) {
+      || block.type === "image" || strictBoxDocumentBlock(block) !== null))) {
     return null;
   }
   return { results, tail: tail as Record<string, unknown>[] };

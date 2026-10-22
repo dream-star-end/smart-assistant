@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
@@ -11,7 +11,7 @@ const lib = readFileSync(path.join(root, 'scripts/v5-selfhost-master-release-lib
 const fn = lib.match(/^cutover_wait_for_user_idle\(\) \{[\s\S]*?\n\}/m)?.[0]
 assert.ok(fn)
 
-function run(stub: string, dry = 0) {
+function run(stub: string, dry = 0, allow = 0, bound = 1, db = 'openclaude_v5_selfhost') {
   const dir = mkdtempSync(path.join(tmpdir(), 'ocv5-idle-'))
   try {
     return spawnSync(
@@ -19,8 +19,11 @@ function run(stub: string, dry = 0) {
       [
         '-c',
         `set -Eeuo pipefail
-DRY=${dry}; PG_DB=personal_fixture; SECONDS=0; state=${JSON.stringify(path.join(dir, 'state'))}
+DRY=${dry}; ALLOW_INFLIGHT=${allow}; PG_DB=${db}; SECONDS=0; state=${JSON.stringify(path.join(dir, 'state'))}
 cutover_clog() { echo "$*"; }
+LEASE_TRAIN_ID=fixture; LEASE_TARGET_SHA=fixture
+lease_train_load_lib() { return 0; }
+lease_inflight_train_allowed() { return $((1 - ${bound})); }
 sleep() { SECONDS=$((SECONDS + 300)); echo SLEPT; }
 psql_as_postgres() { ${stub}; }
 ${fn}
@@ -97,4 +100,103 @@ test('cutover refuses before survivor/mutation and does not compensate idle fail
   assert.ok(check < body.indexOf('install_unit "$unit_snap/$V5_EGRESS_UNIT"'))
   assert.ok(check < body.indexOf('atomic_flip_live_symlink "$rel"'))
   assert.doesNotMatch(fn, /cutover_compensate|systemctl|survivor|atomic_flip/)
+})
+
+
+test('explicit selfhost permission skips only the idle query and sleep', () => {
+  const r = run('echo DATABASE_CALLED; echo "1|1"; return 2', 0, 1)
+  assert.equal(r.status, 0, r.stderr + r.stdout)
+  assert.match(r.stdout, /--allow-inflight.*600s/)
+  assert.match(r.stdout, /MUTATION_ALLOWED/)
+  assert.doesNotMatch(r.stdout, /DATABASE_CALLED|SLEPT/)
+})
+
+test('inflight permission needs the official source-bound train and selfhost database', () => {
+  for (const r of [run('echo "1|1"', 0, 1, 0), run('echo "1|1"', 0, 1, 1, 'commercial_fixture')]) {
+    assert.notEqual(r.status, 0)
+    assert.doesNotMatch(r.stdout, /MUTATION_ALLOWED/)
+  }
+})
+
+test('real registration, SQL binding and both worker spawn paths keep permission source-bound', () => {
+  const r = spawnSync('python3', [path.join(root, 'scripts/__tests__/v5SelfhostInflight.test.py')], {
+    encoding: 'utf8', timeout: 120_000, env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
+  })
+  assert.equal(r.status, 0, r.stderr + r.stdout)
+  assert.match(r.stdout, /PASS selfhost inflight registration, frozen binding, old-worker adoption and worker argv/)
+})
+
+test('selfhost CLI accepts the explicit argument and never inherits permission from env', () => {
+  const deploy = readFileSync(path.join(root, 'scripts/deploy-v5-selfhost.sh'), 'utf8')
+  const parser = deploy.match(/^for arg in "\$@"; do\n[\s\S]*?^done$/m)?.[0]
+  const init = deploy.match(/^ALLOW_DIRTY=0[^\n]*$/m)?.[0]
+  assert.ok(parser && init)
+  for (const allow of [false, true]) {
+    const r = spawnSync('bash', ['-c', `set -euo pipefail
+MODE=''; DRY=0
+${init}
+usage() { return 2; }
+${parser}
+printf 'MODE=%s ALLOW=%s\n' "$MODE" "$ALLOW_INFLIGHT"
+`, 'fixture', '--deploy', ...(allow ? ['--allow-inflight'] : [])], {
+      encoding: 'utf8', env: { ...process.env, ALLOW_INFLIGHT: '1' },
+    })
+    assert.equal(r.status, 0, r.stderr + r.stdout)
+    assert.match(r.stdout, new RegExp(`MODE=deploy ALLOW=${allow ? 1 : 0}`))
+  }
+})
+
+test('commercial deployment rejects the parameter without invoking external operations', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'ocv5-commercial-no-inflight-'))
+  try {
+    const bin = path.join(dir, 'bin')
+    const spy = path.join(dir, 'external.calls')
+    mkdirSync(bin)
+    for (const name of ['ssh', 'sudo', 'systemctl', 'docker']) {
+      const file = path.join(bin, name)
+      writeFileSync(file, '#!/bin/sh\nprintf "%s\\n" "$0" >> "$SPY_LOG"\nexit 99\n')
+      chmodSync(file, 0o755)
+    }
+    const r = spawnSync('bash', [path.join(root, 'scripts/deploy-v5.sh'), '--allow-inflight'], {
+      cwd: root, encoding: 'utf8', timeout: 10_000,
+      env: { ...process.env, ALLOW_ANY_BRANCH: '1', ALLOW_INFLIGHT: '1',
+        PATH: `${bin}:${process.env.PATH}`, SPY_LOG: spy },
+    })
+    assert.equal(r.status, 2, r.stderr + r.stdout)
+    assert.match(r.stderr + r.stdout, /未知参数.*--allow-inflight/)
+    assert.equal(existsSync(spy), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('an early claimed train keeps its exact source when shared HEAD advances during auxiliary setup', () => {
+  const deploy = readFileSync(path.join(root, 'scripts/deploy-v5-selfhost.sh'), 'utf8')
+  const start = deploy.indexOf('  ensure_model_authority\n', deploy.indexOf('cmd_deploy()'))
+  const end = deploy.indexOf('  build_master_release "$sha"', start)
+  assert.ok(start > 0 && end > start)
+  const actual = `${deploy.slice(start, end)}  build_master_release "$sha"\n`
+  const a = 'a'.repeat(40)
+  const b = 'b'.repeat(40)
+  for (const active of [0, 1]) {
+    const r = spawnSync('bash', ['-c', `set -Eeuo pipefail
+sha=${a}; LEASE_TRAIN_ACTIVE=${active}; BUILT_MASTER_RELEASE=fixture
+source_commit() { echo ${b}; }
+ensure_model_authority() { :; }
+assert_env_key_drift() { :; }
+lease_train_begin() { echo "CLAIM:$1"; }
+assert_fix_trailers() { :; }
+assert_p0_web_overlay_contained() { :; }
+log() { :; }
+start_runtime_release_bg() { echo "RUNTIME:$1"; }
+build_master_release() { echo "MASTER:$1"; }
+${actual}`], { encoding: 'utf8' })
+    assert.equal(r.status, 0, r.stderr)
+    const expected = active ? a : b
+    assert.match(r.stdout, new RegExp(`RUNTIME:${expected}`))
+    assert.match(r.stdout, new RegExp(`MASTER:${expected}`))
+    if (active) assert.doesNotMatch(r.stdout, /CLAIM:/)
+    else assert.match(r.stdout, new RegExp(`CLAIM:${b}`))
+  }
 })

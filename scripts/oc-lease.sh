@@ -6,7 +6,7 @@
 # **不提供 wait 子命令**:阻塞等待是守护进程的事,不是会话的事。
 #
 # 用法:
-#   oc-lease register --resource deploy:selfhost --mode ride --sha <40hex> [--ticket OCV5-xx] [--callback auto|none [--release-policy user-impact-only]] [--owner TAG]
+#   oc-lease register --resource deploy:selfhost --mode ride --sha <40hex> [--ticket OCV5-xx] [--callback auto|none [--release-policy user-impact-only]] [--allow-inflight] [--owner TAG]
 #   oc-lease status   [--resource R] [--id ID] [--json]
 #   oc-lease cancel   --id ID [--owner TAG]
 #   oc-lease train    list | resolve --id TR --as committed|failed --reason "..."
@@ -30,9 +30,10 @@ detect_session_key() {
 
 cmd_register() {
   local resource="" mode="ride" sha="" ticket="" callback="auto" owner="" uid="${OC_USER_ID:-}"
-  local release_policy="" requested_mode=legacy result_meta=""
+  local release_policy="" requested_mode=legacy result_meta="" allow_inflight=0 requested_cutover=wait
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --allow-inflight) allow_inflight=1; requested_cutover=allow; shift ;;
       --release-policy)
         [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || lease_die '--release-policy 缺值'
         [[ -z "$release_policy" ]] || lease_die '--release-policy 不能重复'
@@ -71,6 +72,12 @@ cmd_register() {
   if [[ -n "$release_policy" ]]; then
     [[ "$sha" == "$tip" ]] || lease_die 'release-policy 必须绑定当前完整 publisher tip SHA'
     result_meta="$(jq -cn --arg sha "$sha" '{request:{releasePolicy:{schema:1,mode:"user-impact-only",sourceSha:$sha}}}')" || lease_die 'policy request 创建失败'
+  fi
+
+  if [[ "$allow_inflight" == 1 ]]; then
+    [[ "$sha" == "$tip" ]] || lease_die '--allow-inflight 必须绑定当前完整 publisher tip SHA'
+    local base_meta="$result_meta"; [[ -n "$base_meta" ]] || base_meta='{}'
+    result_meta="$(jq -cn --arg sha "$sha" --argjson base "$base_meta" '$base | .request.cutover={schema:1,sourceSha:$sha,allowInflight:true}')" || lease_die 'cutover request 创建失败'
   fi
 
   # 2) live 已含 → 不建 lease,直接告知。
@@ -117,6 +124,9 @@ receipt="$(lease_tx <<SQL
 .bail on
 BEGIN IMMEDIATE;
 $lp_views
+$(lease_inflight_views_sql)
+INSERT INTO _lp_guard SELECT CASE WHEN NOT EXISTS(
+ SELECT 1 FROM _li_open WHERE inflight_mode<>'$requested_cutover') THEN 1 ELSE 0 END;
 -- Reject malformed/same-SHA mixed mode before either insertion or idempotent return.
 INSERT INTO _lp_guard SELECT CASE WHEN NOT EXISTS (
  SELECT 1 FROM _lp_open WHERE want_sha='$sha' AND policy_mode<>'$requested_mode'
@@ -129,7 +139,7 @@ INSERT INTO _lp_guard SELECT CASE WHEN
  ) THEN 1 ELSE 0 END;
 -- New explicit request cannot retrofit a running train. Identical existing request
 -- remains a pure idempotent return and does not change callbacks or binding.
-INSERT INTO _lp_guard SELECT CASE WHEN '$requested_mode'='legacy'
+INSERT INTO _lp_guard SELECT CASE WHEN ('$requested_mode'='legacy' AND '$requested_cutover'='wait')
  OR EXISTS(SELECT 1 FROM _lp_existing)
  OR NOT EXISTS(SELECT 1 FROM train WHERE resource='$(lease_q "$resource")'
                AND status NOT IN ('committed','failed')) THEN 1 ELSE 0 END;
@@ -147,7 +157,7 @@ SELECT '$id','$(lease_q "$resource")','$mode','registered','$(lease_q "$owner")'
  '$now','$now' WHERE (SELECT inserted FROM _lp_registration)=1;
 INSERT INTO event(subject_id,event,actor,detail,created_at)
  SELECT '$id','registered','$(lease_q "$owner")',
- 'resource=$(lease_q "$resource") sha=$sha policy=$requested_mode ticket=$(lease_q "$ticket")',
+ 'resource=$(lease_q "$resource") sha=$sha policy=$requested_mode allow_inflight=$allow_inflight ticket=$(lease_q "$ticket")',
  '$now' WHERE (SELECT inserted FROM _lp_registration)=1;
 COMMIT;
 SELECT json_object('id',id,'inserted',inserted) FROM _lp_registration;
@@ -161,7 +171,7 @@ if [[ "$inserted" == 0 ]]; then
  return 0
 fi
 id="$selected_id"
-  echo "✓ lease $id 已登记:$resource/$mode want=${sha:0:12} owner=$owner"
+  echo "✓ lease $id 已登记:$resource/$mode want=${sha:0:12} owner=$owner allow_inflight=$allow_inflight"
   echo "  $cb_note"
   echo "  当前: origin tip ${tip:0:12};live ${live_sha:-未知/未committed}"
   echo "▶ 请立即收口本回合。worker 每 30s 调度:锁空即发一班列车带上所有已登记 sha;结果将按上方实际回调落点送达；面板评论不等于原会话已唤醒。"

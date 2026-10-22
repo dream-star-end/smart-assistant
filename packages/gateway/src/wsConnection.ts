@@ -58,21 +58,8 @@ import {
   runDurableDispatchAdmission,
 } from './turnDispatchInbox.js'
 import { _pendingPermissionCatchupFrames } from './pendingPermissionSnapshot.js'
-import {
-  ALLOWED_INBOUND_MODELS,
-  resolveLocalExecutionIfEnforced,
-  localExecutionOverride,
-  makePeerKey,
-  _parseConnectionTraceIdFromUpgrade,
-  _stripPrivateRoutingFields,
-  _turnStatusWireFields,
-  preparedModelSwitchCatchupFrame,
-  _matchActiveTurnReplayCandidate,
-  _unservedActiveTurnReplay,
-  _noteActiveTurnReplayServed,
-  _shouldPushTurnInterruptedFinal,
-  _shouldInterruptUnknownInFlight,
-} from './server.js'
+import { resolveLocalExecutionIfEnforced, localExecutionOverride, makePeerKey, _parseConnectionTraceIdFromUpgrade, _stripPrivateRoutingFields, _turnStatusWireFields, preparedModelSwitchCatchupFrame, _matchActiveTurnReplayCandidate, _unservedActiveTurnReplay, _noteActiveTurnReplayServed, _shouldPushTurnInterruptedFinal, _shouldInterruptUnknownInFlight } from './server.js'
+import { ALLOWED_INBOUND_MODELS } from './delegatePolicy.js'
 import type { Gateway } from './server.js'
 
 export interface WsConnectionHost {
@@ -795,16 +782,18 @@ export function handleWsConnection(
   })
 }
 
-export async function autoResumeFromHello(
-  this: WsConnectionHost,
-  peers: Array<{
+export type AutoResumeFromHelloPeers = Array<{
     peerId: string
     agentId: string
     inFlight?: boolean
     lastFrameSeq?: number
     resumeActiveTurnCandidateMessageIds?: unknown
     inFlightClientMessageId?: string
-  }>,
+  }>
+
+export async function autoResumeFromHello(
+  this: WsConnectionHost,
+  peers: AutoResumeFromHelloPeers,
   ws: WebSocket,
 ): Promise<void> {
   // Register the reconnected WS client for each peer that has an active/resumable session.
@@ -1280,16 +1269,18 @@ export async function autoResumeFromHello(
   }
 }
 
-export async function handleStop(
-  this: WsConnectionHost,
-  frame: {
+export type HandleStopFrame = {
     type: 'inbound.control.stop'
     channel: string
     peer: { id: string; kind: 'dm' | 'group' }
     agentId?: string
     sessionKey?: string
     clientMessageId?: string
-  },
+  }
+
+export async function handleStop(
+  this: WsConnectionHost,
+  frame: HandleStopFrame,
 ): Promise<boolean> {
   let sessionKey = frame.sessionKey
   const explicitStopAgentId = sessionKey?.split(':')[1] ?? frame.agentId
@@ -1401,6 +1392,15 @@ export async function handleStop(
   return ok
 }
 
+export type DeliverOut = | OutboundMessage
+    | OutboundError
+    | OutboundCodexBilling
+    | OutboundExternalEngineBilling
+    | OutboundTurnStatus
+    | OutboundTurnUsage
+    | OutboundCallUsage
+    | SysContextRebuilt
+
 /**
  * Outbound frame egress — WS broadcast + outboundRing + optional adapter fan-out.
  *
@@ -1417,14 +1417,7 @@ export async function handleStop(
 export function deliver(
   this: WsConnectionHost,
   out:
-    | OutboundMessage
-    | OutboundError
-    | OutboundCodexBilling
-    | OutboundExternalEngineBilling
-    | OutboundTurnStatus
-    | OutboundTurnUsage
-    | OutboundCallUsage
-    | SysContextRebuilt,
+    DeliverOut,
   adapter?: ChannelAdapter,
 ): void {
   // V3 S12e CG6 — strip ALL private routing fields up-front (`_userId`,

@@ -158,6 +158,11 @@ export const KEY_SCHEMAS = {
   chatgpt_proxy_allowlist: z
     .array(z.string().trim().regex(/^[1-9][0-9]{0,18}$/))
     .max(10_000),
+  /**
+   * 第三阶段 P1(OCV5-559):master 进程日志级别热改。"env" = 用启动时的 env 值
+   * (LOG_LEVEL / OPENCLAUDE_LOG_LEVEL);其它值覆盖 gateway 与商用版的共享级别,≤5 秒生效。
+   */
+  log_level: z.enum(["env", "trace", "debug", "info", "warn", "error"]),
 } as const;
 
 export type SystemSettingKey = keyof typeof KEY_SCHEMAS;
@@ -241,6 +246,7 @@ export const DEFAULTS: { [K in SystemSettingKey]: SystemSettingValue<K> } = {
   desktop_allowlist: [] as string[],
   chatgpt_proxy_enabled: false,
   chatgpt_proxy_allowlist: [] as string[],
+  log_level: "env",
 };
 
 /**
@@ -357,6 +363,11 @@ export const KEY_META: Record<
     kind: "string_array",
     max: 10_000,
     description: "允许使用 ChatGPT 直连代理的用户 uid 列表(admin 默认有权;一行一个)",
+  },
+  log_level: {
+    kind: "enum",
+    enumValues: ["env", "trace", "debug", "info", "warn", "error"],
+    description: "master 日志级别热改(env = 启动时的 LOG_LEVEL / OPENCLAUDE_LOG_LEVEL);改后 ≤5 秒生效,不重启",
   },
 };
 

@@ -343,9 +343,10 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
           // Unknown COMMIT must retain finalizing: a debit may already exist.
           throw err;
         }
+        // OCV5-529: record the settled amount (a turn waiver can zero it in settle).
         await finalizeInflightJournal(ctx.pgPool, {
           requestId: ctx.requestId,
-          finalCredits: effectiveCredits,
+          finalCredits: settled.settledCostCredits ?? effectiveCredits,
           ledgerId: settled.ledgerId,
           usageId: settled.usageId,
           settlementClaimId,
@@ -362,7 +363,7 @@ export function makeCodexFinalizer(ctx: CodexFinalizeContext): CodexFinalizeHand
         attributionCredits: settled.attributionCredits,
         // 双钱包总可用(settleUsageAndLedger → spendTwoBucket.totalAfter),非单桶。
         balanceAfter: settled.balanceAfter,
-        costCredits: effectiveCredits,
+        costCredits: settled.settledCostCredits ?? effectiveCredits,
         clamped: settled.clamped,
       };
     })();

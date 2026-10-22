@@ -29,7 +29,7 @@ export const CRON_EXECUTION_HEARTBEAT_LEAVES = [
   'non-waiting silence trips idle; waiting skips idle at 2h; 12h hard limit still fires',
 ] as const
 
-const WORKSPACE_PACKAGES = ['gateway', 'storage', 'protocol'] as const
+const WORKSPACE_PACKAGES = ['gateway', 'storage', 'protocol', 'kernel'] as const
 const DEFAULT_TIMEOUT_MS = 120_000
 const DRAIN_MS = 2_000
 const SUMMARY_KEYS = ['tests', 'pass', 'fail', 'cancelled', 'skipped', 'todo'] as const

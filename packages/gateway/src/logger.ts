@@ -1,18 +1,24 @@
 /**
- * Structured JSON logger for the OpenClaude gateway.
+ * Structured JSON logger for the OpenClaude gateway: a thin wrapper over @openclaude/kernel's
+ * logger (phase 3 plan v3.6 P1, §7.8; OCV5-550). The signature is unchanged, `(msg, ctx?, err?)`,
+ * and so are the stdout/stderr split and the log-write timing.
  *
- * Zero dependencies — writes JSON lines to stdout/stderr.
- * Each log entry carries optional traceId, agentId, sessionKey for correlation.
+ * What the kernel adds: credential keys (token, password, cookie, authorization, apiKey, …) are
+ * redacted at any depth, and free text (messages, string fields, error message and stack) is scanned
+ * for credentials, e-mail addresses and phone numbers. Payload keys (body, content, text, …) are
+ * not redacted here: the gateway's normal diagnostics stay. Errors also carry errorCode / cause.
  */
 
+import {
+  type Logger as KernelLogger,
+  createLogger as createKernelLogger,
+  createLevelRef,
+  parseLogLevel,
+  registerLevelRef,
+} from '@openclaude/kernel'
 import { measureLogWrite } from '@openclaude/protocol'
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
-
-const LEVEL_NUM: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 40 }
-
-/** Minimum log level (configurable via OPENCLAUDE_LOG_LEVEL env) */
-const minLevel: number = LEVEL_NUM[(process.env.OPENCLAUDE_LOG_LEVEL as LogLevel) ?? 'info'] ?? LEVEL_NUM.info
 
 export interface LogContext {
   module?: string
@@ -22,50 +28,26 @@ export interface LogContext {
   [key: string]: unknown
 }
 
-function write(level: LogLevel, msg: string, ctx?: LogContext, error?: unknown): void {
-  if (LEVEL_NUM[level] < minLevel) return
+/** Minimum level: OPENCLAUDE_LOG_LEVEL at start (default info); changeable while running. */
+export const gatewayLogLevel = createLevelRef(parseLogLevel(process.env.OPENCLAUDE_LOG_LEVEL))
+registerLevelRef('gateway', gatewayLogLevel)
 
-  const entry: Record<string, unknown> = {
-    ts: new Date().toISOString(),
-    level,
-    msg,
-  }
-
-  if (ctx) {
-    if (ctx.module) entry.module = ctx.module
-    if (ctx.traceId) entry.traceId = ctx.traceId
-    if (ctx.agentId) entry.agentId = ctx.agentId
-    if (ctx.sessionKey) entry.sessionKey = ctx.sessionKey
-    // Copy extra fields (skip standard ones already handled)
-    for (const [k, v] of Object.entries(ctx)) {
-      if (k !== 'module' && k !== 'traceId' && k !== 'agentId' && k !== 'sessionKey' && v !== undefined) {
-        entry[k] = v
-      }
-    }
-  }
-
-  if (error instanceof Error) {
-    entry.error = error.message
-    entry.stack = error.stack
-  } else if (error !== undefined) {
-    entry.error = String(error)
-  }
-
-  const line = JSON.stringify(entry)
-  if (level === 'error' || level === 'warn') {
-    measureLogWrite(() => process.stderr.write(line + '\n'), Buffer.byteLength(line) + 1)
-  } else {
-    measureLogWrite(() => process.stdout.write(line + '\n'), Buffer.byteLength(line) + 1)
-  }
-}
+const root: KernelLogger = createKernelLogger({
+  level: gatewayLogLevel,
+  sink: ({ level, line }) => {
+    const stream = level === 'error' || level === 'warn' ? process.stderr : process.stdout
+    measureLogWrite(() => stream.write(`${line}\n`), Buffer.byteLength(line) + 1)
+  },
+})
 
 /** Create a child logger with preset context fields. */
 export function createLogger(baseCtx: LogContext) {
+  const l = root.child(baseCtx)
   return {
-    debug: (msg: string, ctx?: LogContext) => write('debug', msg, { ...baseCtx, ...ctx }),
-    info: (msg: string, ctx?: LogContext) => write('info', msg, { ...baseCtx, ...ctx }),
-    warn: (msg: string, ctx?: LogContext, error?: unknown) => write('warn', msg, { ...baseCtx, ...ctx }, error),
-    error: (msg: string, ctx?: LogContext, error?: unknown) => write('error', msg, { ...baseCtx, ...ctx }, error),
+    debug: (msg: string, ctx?: LogContext) => l.debug(msg, ctx),
+    info: (msg: string, ctx?: LogContext) => l.info(msg, ctx),
+    warn: (msg: string, ctx?: LogContext, error?: unknown) => l.warn(msg, ctx, error),
+    error: (msg: string, ctx?: LogContext, error?: unknown) => l.error(msg, ctx, error),
   }
 }
 

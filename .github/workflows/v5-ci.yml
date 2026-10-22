@@ -119,7 +119,7 @@ jobs:
           - name: protocol
             # protocol = gateway↔web-react↔容器的帧与错误码单一权威
             # (frames / turnErrorTaxonomy / promptQueueFrames / modelAuthority)。
-            run: npm run test:protocol
+            run: npm run test:protocol && npm run test:kernel
             timeout: 10
           - name: channels
             run: npm run test:channels

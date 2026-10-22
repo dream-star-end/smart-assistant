@@ -16,6 +16,7 @@ import {
   responsesToAnthropicEvents,
   responsesUsage,
 } from './openAiResponsesGoBridge.js'
+import { type BoundWebSearch, WebSearchError } from './webSearchServerTool.js'
 
 type Obj = Record<string, unknown>
 
@@ -47,11 +48,48 @@ async function events(input: Obj[]): Promise<Obj[]> {
   return out
 }
 
+function parseAnthropicSse(text: string): Obj[] {
+  return text
+    .split(/\n\n/)
+    .map((chunk) => chunk.split(/\n/).find((line) => line.startsWith('data: ')))
+    .filter((line): line is string => Boolean(line))
+    .map((line) => JSON.parse(line.slice(6)) as Obj)
+}
+
 const usage = {
   input_tokens: 6817,
   output_tokens: 40,
   input_tokens_details: { cached_tokens: 100, cache_write_tokens: 6700 },
   output_tokens_details: { reasoning_tokens: 30 },
+}
+
+function webSearchBody(extra: Obj = {}): Obj {
+  return {
+    model: 'muse-spark-1.3-go',
+    max_tokens: 1024,
+    system: 'You are an assistant for performing a web search tool use',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: 'Perform a web search for the query: Claude Fable 5.5 release date',
+          },
+        ],
+      },
+    ],
+    tools: [
+      {
+        type: 'web_search_20250305',
+        name: 'web_search',
+        max_uses: 8,
+        allowed_domains: ['example.com'],
+        blocked_domains: ['spam.example.com'],
+      },
+    ],
+    ...extra,
+  }
 }
 const completed = (extra: Obj = {}) => ({
   type: 'response.completed',
@@ -101,9 +139,15 @@ function ccbSession(id: string): Obj[] {
 describe('request conversion', () => {
   test('OCV5-434: Fast forwards service_tier "priority"; standard sends no tier', () => {
     const base = { model: 'gpt-6-luna', messages: [{ role: 'user', content: 'hi' }] }
-    assert.equal(anthropicToOpenAIResponses({ ...base, service_tier: 'priority' }).service_tier, 'priority')
+    assert.equal(
+      anthropicToOpenAIResponses({ ...base, service_tier: 'priority' }).service_tier,
+      'priority',
+    )
     assert.equal('service_tier' in anthropicToOpenAIResponses(base), false)
-    assert.equal('service_tier' in anthropicToOpenAIResponses({ ...base, service_tier: 'auto' }), false)
+    assert.equal(
+      'service_tier' in anthropicToOpenAIResponses({ ...base, service_tier: 'auto' }),
+      false,
+    )
   })
   test('later system messages stay in place, so every request extends the previous one (OCV5-432)', () => {
     const outs = ccbSession(encodeResponsesToolId('call_1')).map((b) =>
@@ -178,11 +222,123 @@ describe('request conversion', () => {
     assert.equal(forced.reasoning, undefined)
   })
 
+  test('represents user images and tool-result images', () => {
+    const image = {
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data: 'aGk=' },
+    }
+    const out = anthropicToOpenAIResponses({
+      model: 'muse-spark-1.3-go',
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'look' }, image] },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: {} }] },
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 't1', content: [image, { type: 'text', text: 'read' }] }],
+        },
+      ],
+    }) as Obj
+    const input = out.input as Obj[]
+    assert.deepEqual(input.find((i) => i.role === 'user'), {
+      role: 'user',
+      content: [
+        { type: 'input_text', text: 'look' },
+        { type: 'input_image', image_url: 'data:image/png;base64,aGk=' },
+      ],
+    })
+    assert.deepEqual(input.find((i) => i.type === 'function_call_output'), {
+      type: 'function_call_output',
+      call_id: 't1',
+      output: [
+        { type: 'input_image', image_url: 'data:image/png;base64,aGk=' },
+        { type: 'input_text', text: 'read' },
+      ],
+    })
+  })
+
+  test('keeps tool content order and does not interleave user input between parallel tool outputs', () => {
+    const image = (data: string) => ({
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data },
+    })
+    const out = anthropicToOpenAIResponses({
+      model: 'muse-spark-1.3-go',
+      messages: [
+        { role: 'user', content: 'go' },
+        { role: 'assistant', content: [
+          { type: 'tool_use', id: 'a', name: 'Read', input: {} },
+          { type: 'tool_use', id: 'b', name: 'Read', input: {} },
+        ] },
+        { role: 'user', content: [{
+          type: 'tool_result',
+          tool_use_id: 'a',
+          content: [
+            { type: 'text', text: 'before' },
+            image('YQ=='),
+            { type: 'text', text: 'after' },
+          ],
+        }] },
+        { role: 'user', content: 'between' },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'b', content: 'done' }] },
+      ],
+    }) as Obj
+    const input = out.input as Obj[]
+    const outputs = input.filter((i) => i.type === 'function_call_output')
+    assert.equal(outputs.length, 2)
+    assert.deepEqual(outputs[0].output, [
+      { type: 'input_text', text: 'before' },
+      { type: 'input_image', image_url: 'data:image/png;base64,YQ==' },
+      { type: 'input_text', text: 'after' },
+    ])
+    assert.ok(
+      input.findIndex((i) => i.role === 'user' && i.content !== 'go') >
+        input.indexOf(outputs[1]!),
+      'deferred user content must come after every tool output',
+    )
+  })
+
+  test('parallel image tool results keep their A→B order and error text', () => {
+    const image = (data: string) => ({
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data },
+    })
+    const out = anthropicToOpenAIResponses({
+      model: 'muse-spark-1.3-go',
+      messages: [
+        { role: 'assistant', content: [
+          { type: 'tool_use', id: 'a', name: 'Read', input: {} },
+          { type: 'tool_use', id: 'b', name: 'Read', input: {} },
+        ] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: [image('YQ==')] }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'b', content: [image('Yg==')] }] },
+      ],
+    }) as Obj
+    const outputs = (out.input as Obj[]).filter((i) => i.type === 'function_call_output')
+    assert.deepEqual(outputs[0].output, [{ type: 'input_image', image_url: 'data:image/png;base64,YQ==' }])
+    assert.deepEqual(outputs[1].output, [{ type: 'input_image', image_url: 'data:image/png;base64,Yg==' }])
+    const errored = anthropicToOpenAIResponses({
+      model: 'muse-spark-1.3-go',
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'e', name: 'Read', input: {} }] },
+        { role: 'user', content: [{
+          type: 'tool_result',
+          tool_use_id: 'e',
+          is_error: true,
+          content: [image('YQ=='), { type: 'text', text: 'partial capture' }],
+        }] },
+      ],
+    }) as Obj
+    assert.deepEqual((errored.input as Obj[])[1].output, [
+      { type: 'input_image', image_url: 'data:image/png;base64,YQ==' },
+      { type: 'input_text', text: 'Error: partial capture' },
+    ])
+  })
+
   test('fails closed on images, server tools and orphan tool results', () => {
     const m = (content: unknown) => ({ model: 'm', messages: [{ role: 'user', content }] })
     assert.throws(
       () => anthropicToOpenAIResponses(m([{ type: 'image', source: {} }])),
-      /unsupported/,
+      /invalid OpenCode Go image source/,
     )
     assert.throws(
       () =>
@@ -191,14 +347,39 @@ describe('request conversion', () => {
         ),
       /no matching/,
     )
+    // The official Claude Code WebSearch server tool is stripped instead of
+    // rejecting the whole request; other server tools still fail closed.
+    const stripped = anthropicToOpenAIResponses({
+      ...m('x'),
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      tool_choice: { type: 'tool', name: 'web_search' },
+    })
+    assert.equal('tools' in stripped, false)
+    assert.equal('tool_choice' in stripped, false)
     assert.throws(
       () =>
         anthropicToOpenAIResponses({
           ...m('x'),
-          tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+          tools: [{ type: 'web_fetch_20250910', name: 'web_fetch' }],
         }),
       /server tools/,
     )
+  })
+
+  test('mixed web_search + function tools keep only function tools and relax a forced search', () => {
+    const mixed = anthropicToOpenAIResponses({
+      model: 'grok-4.7',
+      messages: [{ role: 'user', content: 'search then read' }],
+      tools: [
+        { type: 'web_search_20250305', name: 'web_search' },
+        { name: 'Read', input_schema: { type: 'object', properties: {} } },
+      ],
+      tool_choice: { type: 'tool', name: 'web_search' },
+    })
+    assert.deepEqual(mixed.tools, [
+      { type: 'function', name: 'Read', parameters: { type: 'object', properties: {} } },
+    ])
+    assert.equal(mixed.tool_choice, 'auto')
   })
 
   test('tool ids round-trip in the Anthropic alphabet', () => {
@@ -431,5 +612,148 @@ describe('fetch wrapper', () => {
     })
     assert.equal(bad.status, 400)
     assert.equal(called, false)
+  })
+
+  test('fulfills the WebSearch side request with platform results instead of a 400', async () => {
+    let upstreamCalled = false
+    let seen: Parameters<BoundWebSearch>[0] | undefined
+    const webSearch: BoundWebSearch = async (spec) => {
+      seen = spec
+      return [
+        { title: 'Fable docs', url: 'https://docs.example.com/fable', pageAge: '2026-10-01' },
+        { title: 'Blocked', url: 'https://spam.example.com/x' },
+        { title: 'Other site', url: 'https://other.test/fable' },
+      ]
+    }
+    const bridge = createOpenAIResponsesGoFetch(
+      (async () => {
+        upstreamCalled = true
+        return new Response('')
+      }) as unknown as typeof fetch,
+      { webSearch },
+    )
+    const r = await bridge('x', {
+      method: 'POST',
+      headers: { 'x-api-key': 'GO-KEY' },
+      body: JSON.stringify(webSearchBody()),
+    })
+    assert.equal(r.status, 200)
+    const events = parseAnthropicSse(await r.text())
+    assert.equal(upstreamCalled, false, 'the search side request never hits the Go model')
+    assert.equal(seen!.name, 'web_search')
+    assert.equal(seen!.query, 'Claude Fable 5.5 release date')
+    assert.deepEqual(seen!.allowedDomains, ['example.com'])
+    assert.deepEqual(seen!.blockedDomains, ['spam.example.com'])
+    assert.deepEqual(
+      events.map((e) => e.type),
+      [
+        'message_start',
+        'content_block_start',
+        'content_block_delta',
+        'content_block_stop',
+        'content_block_start',
+        'content_block_stop',
+        'message_delta',
+        'message_stop',
+      ],
+    )
+    const toolUse = events[1]!.content_block as Obj
+    assert.equal(toolUse.type, 'server_tool_use')
+    assert.equal(toolUse.name, 'web_search')
+    assert.match(toolUse.id as string, /^srvtoolu_ws_/)
+    assert.deepEqual(JSON.parse((events[2]!.delta as Obj).partial_json as string), {
+      query: 'Claude Fable 5.5 release date',
+    })
+    const result = events[4]!.content_block as Obj
+    assert.equal(result.tool_use_id, toolUse.id)
+    assert.deepEqual(result.content, [
+      {
+        type: 'web_search_result',
+        title: 'Fable docs',
+        url: 'https://docs.example.com/fable',
+        encrypted_content: '',
+        page_age: '2026-10-01',
+      },
+    ])
+    assert.equal((events[6]!.delta as Obj).stop_reason, 'end_turn')
+  })
+
+  test('a failed search returns the protocol error block, not an empty result or a 400', async () => {
+    const webSearch: BoundWebSearch = async () => {
+      throw new WebSearchError('unavailable', 'search backend down')
+    }
+    const r = await createOpenAIResponsesGoFetch(
+      (async () => new Response('')) as unknown as typeof fetch,
+      { webSearch },
+    )('x', {
+      method: 'POST',
+      headers: { 'x-api-key': 'GO-KEY' },
+      body: JSON.stringify(webSearchBody()),
+    })
+    assert.equal(r.status, 200)
+    const result = parseAnthropicSse(await r.text()).find(
+      (e) =>
+        e.type === 'content_block_start' &&
+        (e.content_block as Obj).type === 'web_search_tool_result',
+    )!.content_block as Obj
+    assert.deepEqual(result.content, {
+      type: 'web_search_tool_result_error',
+      error_code: 'unavailable',
+      error_message: 'search backend down',
+    })
+  })
+
+  test('without an executor the side request reports search unavailable, without a model call', async () => {
+    let upstreamCalled = false
+    const fetchImpl = (async () => {
+      upstreamCalled = true
+      return new Response('')
+    }) as unknown as typeof fetch
+    const r = await createOpenAIResponsesGoFetch(fetchImpl)('x', {
+      method: 'POST',
+      headers: { 'x-api-key': 'GO-KEY' },
+      body: JSON.stringify(webSearchBody()),
+    })
+    assert.equal(r.status, 200)
+    const result = parseAnthropicSse(await r.text()).find(
+      (e) =>
+        e.type === 'content_block_start' &&
+        (e.content_block as Obj).type === 'web_search_tool_result',
+    )!.content_block as Obj
+    assert.deepEqual(result.content, {
+      type: 'web_search_tool_result_error',
+      error_code: 'unavailable',
+      error_message: 'web search is not configured for this route',
+    })
+    assert.equal(upstreamCalled, false)
+  })
+
+  test('mixed requests without an executor still strip the tool and reach the model', async () => {
+    let seen: Obj | undefined
+    const fetchImpl = (async (_url: string, init: RequestInit) => {
+      seen = JSON.parse(String(init.body))
+      return new Response(
+        sse([{ type: 'response.output_text.delta', delta: 'no search here' }, completed()]),
+        { status: 200 },
+      )
+    }) as unknown as typeof fetch
+    const r = await createOpenAIResponsesGoFetch(fetchImpl)('x', {
+      method: 'POST',
+      headers: { 'x-api-key': 'GO-KEY' },
+      body: JSON.stringify(
+        webSearchBody({
+          tools: [
+            { type: 'web_search_20250305', name: 'web_search' },
+            { name: 'Read', input_schema: { type: 'object' } },
+          ],
+          messages: [{ role: 'user', content: 'read this file' }],
+        }),
+      ),
+    })
+    assert.equal(r.status, 200)
+    assert.deepEqual(seen!.tools, [
+      { type: 'function', name: 'Read', parameters: { type: 'object' } },
+    ])
+    assert.match(await r.text(), /no search here/)
   })
 })

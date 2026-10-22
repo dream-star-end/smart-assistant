@@ -1,4 +1,5 @@
 import type { Logger } from '../logging/logger.js'
+import { egressTraceFields } from './egressTrace.js'
 import { createPassiveRelayTiming } from './passiveRelayTiming.js'
 /** Master-side relay for official Grok CLI subscription traffic. */
 import type { IncomingMessage, ServerResponse } from 'node:http'
@@ -227,7 +228,7 @@ export function makeGrokRelayHandler(deps: {
       if (!billed) { error(res, 403, 'GROK_DELEGATE_NOT_BILLED', requestId); return }
     }
     const stage = createPassiveRelayTiming(deps.logger, {
-      engine: 'grok', requestId, uid: String(identity.userId),
+      engine: 'grok', requestId, ...egressTraceFields(req), uid: String(identity.userId),
       model: context.modelId, slotId: context.slotId,
     }, receivedAt)
     stage('proxy_received')

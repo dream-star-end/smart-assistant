@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
+import { readFile, readdir } from 'node:fs/promises'
 import { beforeEach, test } from 'node:test'
 import type { Pool } from 'pg'
 import sharp from 'sharp'
@@ -289,6 +289,14 @@ test('migration rollback refuses retained usage and an empty-table rollback can 
   )
   const client = await getPool().connect()
   try {
+    // Later migrations must go first (each commits its own rollback); runMigrations below reapplies them.
+    const rollbacks = new URL('../../db/rollbacks/', import.meta.url)
+    for (const later of (await readdir(rollbacks))
+      .filter((f) => f > '0316_commercial_literature_captcha_requests.sql')
+      .sort()
+      .reverse()) {
+      await client.query(await readFile(new URL(later, rollbacks), 'utf8'))
+    }
     await assert.rejects(client.query(sql), /retained platform usage/)
     await client.query('ROLLBACK')
     assert.equal(

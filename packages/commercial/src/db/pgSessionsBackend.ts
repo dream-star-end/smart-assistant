@@ -552,6 +552,8 @@ export interface SettledUsageAttribution {
   usageId: bigint;
   ledgerId: bigint | null;
   attributionCredits: bigint | null;
+  /** usage_records.cost_credits as committed (0 for waived / sponsored rows). */
+  costCredits: bigint;
 }
 
 /**
@@ -574,9 +576,11 @@ export async function loadSettledUsageAttribution(
     id: string;
     ledger_id: string | null;
     attribution_credits: string | null;
+    cost_credits: string;
   }>(
     `SELECT usage_records.id::text AS id,
             usage_records.ledger_id::text AS ledger_id,
+            usage_records.cost_credits::text AS cost_credits,
             COALESCE(
               (SELECT p.cost_credits FROM pending_usage_patches p
                 WHERE p.user_id=$3 AND p.request_id=usage_records.request_id),
@@ -592,6 +596,7 @@ export async function loadSettledUsageAttribution(
     ledgerId: row.ledger_id === null ? null : BigInt(row.ledger_id),
     attributionCredits:
       row.attribution_credits == null ? null : BigInt(row.attribution_credits),
+    costCredits: BigInt(row.cost_credits),
   };
 }
 

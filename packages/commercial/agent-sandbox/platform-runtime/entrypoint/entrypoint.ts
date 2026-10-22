@@ -522,6 +522,7 @@ const PLATFORM_LINKED_CLIS = [
   "oc-task",
   "oc-memory",
   "oc-browser",
+  "oc-muse",
   // 基线本机插件的命令（OCV5-383）：plugin.json components.bin[].name，经 plugin-exec 启动。
   "ths",
 ] as const;

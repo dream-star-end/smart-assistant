@@ -2,7 +2,7 @@ import {
   SERVER_FEATURES_OFF,
   parseServerFeatures,
   type ServerFeatures,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/browser";
 import { useEffect, useState } from "react";
 import { bearerHeaders, callWithRefresh, jsonOrThrow } from "../lib/api";
 import type { AuthSession } from "../lib/types";

@@ -442,6 +442,7 @@ export type CursorEngineFamilyId =
   | 'box-claude-sonnet'
   | 'box-claude-haiku'
   | 'box-claude-haiku-5-5'
+  | 'box-gpt-6-astra-pro'
 
 export const CURSOR_ENGINE_MODELS = [
   {
@@ -1230,6 +1231,16 @@ export const CURSOR_ENGINE_MODELS = [
     fast: false,
     runner: 'interactive',
   },
+  {
+    id: 'box-gpt-6-astra-pro',
+    displayName: 'GPT-6 Astra Pro (Box Web)',
+    upstreamModel: 'gpt-6-astra-pro',
+    family: 'box-gpt-6-astra-pro',
+    familyLabel: 'GPT-6 Astra Pro (Box Web)',
+    effort: null,
+    fast: false,
+    runner: 'interactive',
+  },
 ] as const
 
 export const CURSOR_ENGINE_MODEL_IDS = CURSOR_ENGINE_MODELS.map((m) => m.id)
@@ -1510,7 +1521,8 @@ export function cursorFamilyDefaultEffort(
     family === 'box-claude-opus' ||
     family === 'box-claude-sonnet' ||
     family === 'box-claude-haiku' ||
-    family === 'box-claude-haiku-5-5'
+    family === 'box-claude-haiku-5-5' ||
+    family === 'box-gpt-6-astra-pro'
   ) {
     return null
   }

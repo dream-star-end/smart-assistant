@@ -72,7 +72,7 @@ import {
 } from "./modelAuthorityGate.js";
 import { STATIC_PROVIDER_META } from "./staticProviderMeta.js";
 import { scopedApiKeyPoolWiring } from "./apiKeyPoolWiring.js";
-import { findRouteProviderForModel, getStaticProvider, isClassifierSideQuery, resolveCursorPublicModel, staticRouteFallback, type StaticRouteFallback } from "@openclaude/protocol";
+import { findRouteProviderForModel, getStaticProvider, isClassifierSideQuery, resolveCursorPublicModel, staticProviderSupportsVision, staticRouteFallback, type StaticRouteFallback } from "@openclaude/protocol";
 import { applyFastServiceTierPricing } from "./fastServiceTier.js";
 import {
   getDegradedProviders,
@@ -134,6 +134,7 @@ import { BOX_INTERNAL_ENDPOINT, isBoxRouteModelName } from "./upstream.js";
 import { prepareBoxSwitch, relabelBoxSwitchSession, type BoxSwitchOutcome } from "./boxSwitchCompaction.js";
 import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js";
 import { recordUserImpactBestEffort } from "../../selfheal/userImpact.js";
+import { egressTraceFields } from "../egressTrace.js";
 
 // ─── 私有 helper ──────────────────────────────────────────────────────────
 
@@ -366,6 +367,7 @@ export function makeAnthropicProxyHandler(
     res.setHeader(REQUEST_ID_HEADER, requestId);
     const reqLog = log.child({
       requestId,
+      ...egressTraceFields(req),
       hostUuid: ctx.hostUuid,
       boundIp: ctx.boundIp,
       method: req.method ?? "GET",
@@ -933,7 +935,7 @@ export function makeAnthropicProxyHandler(
       const modelSupportsVision = gate
         ? gate.descriptor.capabilityProfile.supportsVision
         : route.kind === "static"
-          ? route.provider.supportsVision === true
+          ? staticProviderSupportsVision(route.provider, route.upstreamModel)
           : route.kind !== "box";
       // Same ready bit issuance uses (default false). OC_BOX_MODEL_API only arms
       // the transport; it does not prove the signed capability. Local catalog
@@ -1220,8 +1222,10 @@ export function makeAnthropicProxyHandler(
       // 与上游 400 同样卡会话),(b)高估 preCheck 预留 cost。strip 后估算/cap/上游 body 同口径。
       // 注:**多模态静态 provider(supportsVision=true,如 MiniMax-M3)不 strip 图** —— 它原生识图;
       // 其余纯文本静态 provider(deepseek/ark glm-5.x)仍 strip(模型看不到图,靠 understand_image 工具兜底)。
-      if (route.kind === "static" && !modelSupportsVision) {
-        const stripped = stripNonTextContentBlocks(body.messages);
+      if (route.kind === "static") {
+        // Vision only suppresses image stripping; documents still use the old
+        // text-only placeholder because the Go converters cannot represent them.
+        const stripped = stripNonTextContentBlocks(body.messages, { keepImages: modelSupportsVision });
         if (stripped.imagesStripped + stripped.documentsStripped > 0) {
           body.messages = stripped.messages as typeof body.messages;
           userLog.warn("proxy_static_text_only_nontext_stripped", {
@@ -1871,6 +1875,18 @@ export function makeAnthropicProxyHandler(
         uid,
         body,
         session,
+        // Official Claude Code WebSearch sends a side request with the Anthropic
+        // server tool web_search_*. The egress process fulfills it through the
+        // master search proxies using this request's container identity.
+        webSearch: deps.webSearch
+          ? (input, signal) =>
+              deps.webSearch!(input, {
+                authorization: req.headers.authorization,
+                hostUuid: ctx.hostUuid,
+                boundIp: ctx.boundIp,
+                signal,
+              })
+          : undefined,
         // OCV5-482:主上游 session 且声明了回落上游 → core 在主上游拒绝时同请求重试回落上游;
         // 这类路由(含已在回落上游上的)把实际服务的上游记进扣费快照。
         ...(() => {

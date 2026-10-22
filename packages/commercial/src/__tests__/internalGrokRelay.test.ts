@@ -121,6 +121,7 @@ describe('internal Grok relay', () => {
           'x-grok-agent-id': 'agent-abcdef',
           'x-grok-turn-idx': '2',
           traceparent: '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01',
+          'x-openclaude-trace-id': '0a1b2c3d4e5f60718293a4b5c6d7e8f9',
         },
         body: '{"model":"grok-build"}',
       })
@@ -141,6 +142,8 @@ describe('internal Grok relay', () => {
       assert.equal(captured.headers?.get('x-grok-agent-id'), 'agent-abcdef')
       assert.equal(captured.headers?.get('x-grok-turn-idx'), '2')
       assert.equal(captured.headers?.get('traceparent'), '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01')
+      // OCV5-569 (§7.4): the internal trace header never goes to the provider
+      assert.equal(captured.headers?.get('x-openclaude-trace-id'), null)
       assert.strictEqual(captured.dispatcher, DISPATCHER)
       assert.equal(captured.body, '{"model":"grok-build"}')
       assert.deepEqual(statusCalls, [[53n, 201]])

@@ -136,6 +136,13 @@ const SCENARIOS: readonly Scenario[] = [
     attempts: 1,
     why: 'E7 — 凭据坏了重试只会再 401,不进 TRANSIENT_RETRY_ERROR_CODES,立即给 relogin 引导',
   },
+  {
+    code: 'platform_credential_expired',
+    sample:
+      'ANTIGRAVITY_CREDENTIAL_EXPIRED: agent executor error: generating and executing: request failed: Post \"http://127.0.0.1:18789/internal/v5/antigravity-relay/route/<route>/v1internal:streamGenerateContent?alt=sse\": oauth2: token expired and refresh token is not set',
+    attempts: 1,
+    why: 'OCV5-556 — 平台写给 Antigravity CLI 的凭证本地判过期,同一启动重放只会再失败(三次恢复各白烧 25-31 万上游输入);下一条消息会拿到新凭证',
+  },
 ]
 
 /**

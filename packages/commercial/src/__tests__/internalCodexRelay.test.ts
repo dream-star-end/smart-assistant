@@ -262,6 +262,7 @@ describe('internalCodexRelay handler', () => {
           [CODEX_UPSTREAM_AUTH_HEADER]: 'Bearer upstream-token',
           'content-type': 'application/json',
           'x-openclaude-evil': 'strip-me',
+          'x-openclaude-trace-id': '0a1b2c3d4e5f60718293a4b5c6d7e8f9',
         },
         body: '{"input":"hi"}',
       })
@@ -273,6 +274,8 @@ describe('internalCodexRelay handler', () => {
       assert.equal(captured.headers?.get('content-type'), 'application/json')
       assert.equal(captured.headers?.get('accept-encoding'), 'identity')
       assert.equal(captured.headers?.get('x-openclaude-evil'), null)
+      // OCV5-569 (§7.4): the internal trace header never goes to the provider
+      assert.equal(captured.headers?.get('x-openclaude-trace-id'), null)
       assert.equal(captured.headers?.get(CODEX_UPSTREAM_AUTH_HEADER), null)
       assert.equal(captured.body, '{"input":"hi"}')
       assert.equal(captured.duplex, 'half')

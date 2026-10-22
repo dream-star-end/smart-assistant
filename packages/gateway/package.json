@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
+    "@openclaude/kernel": "*",
     "@openclaude/plugin-sdk": "*",
     "@openclaude/protocol": "*",
     "@openclaude/storage": "*",
