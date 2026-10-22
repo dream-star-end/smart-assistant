@@ -1,5 +1,8 @@
 import type {
+  AdminBlogPost,
   AuthSession,
+  BlogModerationRecord,
+  BlogModerationStats,
   CommunityTutorialPage,
   CommunityTutorialPending,
   MarketplaceAiReview,
@@ -52,6 +55,58 @@ export const adminApi = {
           headers: bearerHeaders(token, true),
           body: JSON.stringify({ decision, note }),
         }),
+      ),
+    ),
+
+  // ── 经验分享（OCV5-577；markdown 投稿的按状态列表 / AI 审核 / 下架） ──────────
+
+  adminListBlogPosts: (
+    a: AuthSession,
+    opts: { status: "pending" | "approved" | "rejected" | "takedown" | "withdrawn"; needsHuman?: boolean; cursor?: string | null },
+  ) => {
+    const qs = new URLSearchParams({ status: opts.status, kind: "markdown" });
+    if (opts.needsHuman) qs.set("needsHuman", "1");
+    if (opts.cursor) qs.set("cursor", opts.cursor);
+    return jsonOrThrow<CommunityTutorialPage<AdminBlogPost>>(
+      callWithRefresh(a, (token) =>
+        fetch(`/api/admin/tutorials?${qs.toString()}`, {
+          credentials: "include",
+          headers: bearerHeaders(token),
+        }),
+      ),
+    );
+  },
+
+  adminTakedownCommunityTutorial: (a: AuthSession, id: string, note: string) =>
+    jsonOrThrow<{ ok: boolean }>(
+      callWithRefresh(a, (token) =>
+        fetch(`/api/admin/tutorials/${encodeURIComponent(id)}/takedown`, {
+          method: "POST",
+          credentials: "include",
+          headers: bearerHeaders(token, true),
+          body: JSON.stringify({ note }),
+        }),
+      ),
+    ),
+
+  /** PR-B 才有；旧后端 404 时调用方隐藏 AI 部分。 */
+  adminBlogModerationStats: (a: AuthSession) =>
+    jsonOrThrow<BlogModerationStats>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/admin/tutorials/moderation-stats", {
+          credentials: "include",
+          headers: bearerHeaders(token),
+        }),
+      ),
+    ),
+
+  adminBlogModerations: (a: AuthSession, cursor?: string | null) =>
+    jsonOrThrow<{ moderations: BlogModerationRecord[]; nextCursor: string | null }>(
+      callWithRefresh(a, (token) =>
+        fetch(
+          `/api/admin/tutorials/moderations${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+          { credentials: "include", headers: bearerHeaders(token) },
+        ),
       ),
     ),
 
