@@ -30,6 +30,7 @@ export type ClassifiedErrorCode =
   | 'context_too_long'
   | 'bad_request'
   | 'auth_error'
+  | 'platform_credential_expired'
   | 'unknown'
 
 export interface ClassifiedError {
@@ -65,6 +66,26 @@ const PATTERNS: Array<{
     re: /(?:insufficient[_ ]credits|INSUFFICIENT_CREDITS|\b402\b.*credit)/i,
     code: 'insufficient_credits',
     message: '积分已耗尽，请充值',
+  },
+  // OCV5-556: the official Antigravity CLI's Go oauth2 refusing the
+  // platform-written token file. A platform fault, not the user's login and
+  // not an upstream outage: automatic recovery would only replay the same
+  // launch (three recoveries burned 250-310k upstream input tokens each).
+  // Must beat auth_error and the generic upstream rule.
+  {
+    re: /\bANTIGRAVITY_CREDENTIAL_EXPIRED\b|oauth2: token expired|refresh token is not set/i,
+    code: 'platform_credential_expired',
+    message: '平台为本轮签发的模型临时凭证已过期，本轮已停止，不会自动重试，也不是你的账号或登录问题。请直接再发一条消息继续。',
+  },
+  // OCV5-556: the Antigravity relay route of a turn lapsed (404
+  // ANTIGRAVITY_ROUTE_EXPIRED), or the CLI ended "successfully" right after an
+  // error step of its own. Platform plumbing, not the user's account: the next
+  // turn mints a fresh route and resumes the same CLI conversation, so it is
+  // transient and auto-recoverable. Must beat auth_error and bad_request (404).
+  {
+    re: /\bANTIGRAVITY_ROUTE_EXPIRED\b|\bANTIGRAVITY_ERROR_STEP\b/,
+    code: 'upstream_failed',
+    message: '模型服务上游暂时异常，请稍后重试',
   },
   // 认证/凭据失效 —— 401 / unauthorized / invalid api key / AUTH_ERROR 词族。
   // 不可自动重试(不进 TRANSIENT_RETRY_ERROR_CODES):凭据坏了重试只会再 401。

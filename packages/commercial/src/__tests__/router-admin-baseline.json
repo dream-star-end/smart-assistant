@@ -8,6 +8,24 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/tutorials",
+    "handler": "handleAdminListCommunityTutorials"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/tutorials/moderation-stats",
+    "handler": "handleAdminTutorialModerationStats"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
+    "pathValue": "/api/admin/tutorials/moderations",
+    "handler": "handleAdminListTutorialModerations"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/tutorials/case-specs",
     "handler": "handleAdminTutorialControlGet"
   },

@@ -1,6 +1,6 @@
 import { Check, KeyRound, Loader2, ShieldCheck, Store, Users } from 'lucide-react'
 import { useEffect, useId, useState } from 'react'
-import { DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME } from '@openclaude/protocol'
+import { DEFAULT_CODEX_ENGINE_MODEL_DISPLAY_NAME } from '@openclaude/protocol/browser'
 import { type Agent, MAIN_AGENT, agentFromApiRow } from '../lib/agents'
 import { api } from '../lib/api'
 import {

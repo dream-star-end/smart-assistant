@@ -678,6 +678,43 @@ export const commercialConfigSchema = z
         ),
       )
       .refine((values) => values.every((value) => /^\d+$/.test(value)), "user ids must be decimal"),
+    /** OCV5-561 Muse media bridge (selfhost). Off unless "1": /api/muse-bridge/* answers 404. */
+    OC_MUSE_BRIDGE_ENABLED: z
+      .enum(["0", "1"])
+      .optional()
+      .transform((value) => value === "1"),
+    /** Decimal uids allowed to use oc-muse. Unset → "3"; empty → nobody. uid 4 is always ignored. */
+    OC_MUSE_ALLOWED_UIDS: z
+      .string()
+      .max(8192)
+      .optional()
+      .transform((value) =>
+        value === undefined
+          ? undefined
+          : Object.freeze(
+              value
+                .split(",")
+                .map((item) => item.trim())
+                .filter(Boolean),
+            ),
+      )
+      .refine(
+        (values) => values === undefined || values.every((value) => /^\d+$/.test(value)),
+        "user ids must be decimal",
+      ),
+    /** Muse result staging; default /var/lib/openclaude-v5-selfhost/muse-media. */
+    OC_MUSE_STATE_ROOT: absolutePath("OC_MUSE_STATE_ROOT"),
+    OC_MUSE_IMAGE_PER_HOUR: positiveInt(10_000),
+    OC_MUSE_IMAGE_PER_DAY: positiveInt(100_000),
+    OC_MUSE_VIDEO_PER_HOUR: positiveInt(10_000),
+    OC_MUSE_VIDEO_PER_DAY: positiveInt(100_000),
+    /**
+     * Optional direct HTTPS port for the Muse bridge (muse/publicListener.ts): serves only
+     * /api/muse-bridge/* with the cert/key below, bypassing the Cloudflare tunnel. Unset = off.
+     */
+    OC_MUSE_PUBLIC_PORT: positiveInt(65_535),
+    OC_MUSE_PUBLIC_TLS_CERT: absolutePath("OC_MUSE_PUBLIC_TLS_CERT"),
+    OC_MUSE_PUBLIC_TLS_KEY: absolutePath("OC_MUSE_PUBLIC_TLS_KEY"),
     /**
      * 火山方舟 Ark Coding Plan key(2026-06-15 接入)。glm-5.1 当前是 **coder 默认模型**
      * (2026-06-16 起平台默认改为 MiniMax-M3,见 platformDefaults.ts / entrypoint COMMERCIAL_DEFAULT_MODEL;

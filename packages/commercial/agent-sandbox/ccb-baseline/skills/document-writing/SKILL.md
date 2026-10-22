@@ -93,14 +93,14 @@ oc-docx inspect /home/agent/.openclaude/generated/report-draft.docx \
 `render` 为每一页同时生成：
 
 - `page-N.png`：160 DPI 原始页面，保留作高精度复核；
-- `vision-page-N.jpg`：最长边/质量按 4.5MB 预算自动规范化，供 `oc-vision` 使用。
+- `vision-page-N.jpg`：最长边/质量按 4.5MB 预算自动规范化，供当前模型的原生视觉读图使用。
 
 必须按自然页序枚举**全部**视觉副本，不得设页数上限、抽样或因单页过大跳过：
 
 ```bash
 find "$QA" -maxdepth 1 -type f -name 'vision-page-*.jpg' -print | sort -V
-oc-vision understand "$QA/vision-page-1.jpg" --prompt "检查本页是否有裁切、表格断裂、异常分页、缺字乱码、页眉页脚错误、空白页或过度拥挤；明确给出 PASS 或问题。"
-# 对 find 列出的每一页逐一执行同样检查
+# 用当前模型的原生视觉能力逐页查看 vision-page-N.jpg（例如 Read 这些路径），检查裁切、表格断裂、异常分页、缺字乱码、页眉页脚错误、空白页或过度拥挤；明确给出 PASS 或问题。
+# 不要调用已下线的 oc-vision。
 ```
 
 任何一页有问题：修改源 `.qmd/.md/.yaml/.json`，重新生成、render、inspect，并从第一页重新逐页检查。`inspect` 的自动警告不能替代视觉检查。
@@ -143,4 +143,4 @@ oc-artifact-qa deliver --input "$FINAL.docx"
 
 ## 工具调用纪律
 
-只调用本 skill 给出的 `oc-docx` / `oc-docxcheck` / `oc-artifact-qa` / `oc-vision` / 本地校验命令；绝不自行拼 `curl`、URL、端口或 token。命令失败时读清错误并修正输入/路径，不能用 HTML 改扩展名兜底。
+只调用本 skill 给出的 `oc-docx` / `oc-docxcheck` / `oc-artifact-qa` / 本地校验命令；绝不自行拼 `curl`、URL、端口或 token。命令失败时读清错误并修正输入/路径，不能用 HTML 改扩展名兜底。

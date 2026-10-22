@@ -51,6 +51,8 @@ import {
   type TurnModelAuthority,
   type TurnUpstreamHeaders,
   _buildAnthropicCustomHeadersEnv,
+  _ccbUpstreamIsEgress,
+  _withTraceIdHeader,
   _buildUpdateEnvStdinLine,
   renewTurnHeaderBundle,
   resolveTurnRuntime,
@@ -100,8 +102,6 @@ export {
   AdvisorExecutionLockError,
   assertCcbAdvisorCatalogLock,
   buildHostSpawnProviderEnv,
-  resolveOpenClaudeVisionEntry,
-  buildOpenClaudeVisionMcpEnv,
   CCB_PLATFORM_DISALLOWED_TOOLS,
   OFFICIAL_CC_PLATFORM_DISALLOWED_TOOLS,
   isOfficialClaudeCursorSandLoopbackEnv,
@@ -133,6 +133,19 @@ export type {
   CcbCliArgsInput,
   OfficialClaudeCliArgsInput,
 } from './subprocessSpawnConfig.js'
+
+/**
+ * OCV5-556: CCB deletes transcripts older than `cleanupPeriodDays` (default
+ * 30) from the persisted projects volume, so a conversation resumed after a
+ * month failed with STALE_RESUME_ID. Keep them longer than the resume-map TTL
+ * (RESUME_MAP_INACTIVE_TTL_MS, 90 days).
+ */
+export const CCB_TRANSCRIPT_RETENTION_DAYS = 120
+
+/** Per-session `--settings` for CCB: transcript retention plus the efficiency hooks, if any. */
+export function buildCcbSessionSettings(efficiency: Record<string, unknown> | null): Record<string, unknown> {
+  return { ...(efficiency ?? {}), cleanupPeriodDays: CCB_TRANSCRIPT_RETENTION_DAYS }
+}
 
 export { renderCcbGoalPrompt }
 
@@ -235,6 +248,8 @@ export class SubprocessRunner extends EventEmitter {
   private currentExecutionDescriptor: CcbExecutionDescriptor | undefined
   /** Header bundle last written for the current turn. Cleared on shutdown. */
   private currentTurnHeaders: TurnUpstreamHeaders | undefined
+  /** OCV5-570: the running CCB's ANTHROPIC_BASE_URL is the gateway's egress (set at spawn). */
+  private spawnedUpstreamIsEgress = false
   private spawnedExecutionDescriptor: CcbExecutionDescriptor | undefined
   private spawnGeneration = 0
   private processTiming: PassiveStageTiming | undefined
@@ -835,6 +850,16 @@ export class SubprocessRunner extends EventEmitter {
           this.boxCcControlPath,
         )
       }
+      // OCV5-570: only a CCB whose upstream is egress gets the turn's internal trace header.
+      this.spawnedUpstreamIsEgress = _ccbUpstreamIsEgress(spawnOpts.env as NodeJS.ProcessEnv)
+      // official-cc has no stdin env update, so its trace header goes in at spawn.
+      const officialSpawnTrace = harness === 'official-cc' && !this.opts.boxResidentCc && this.pendingOfficialSpawnEnv
+        ? this.egressTraceId()
+        : undefined
+      if (officialSpawnTrace !== undefined) {
+        const env = spawnOpts.env as Record<string, string>
+        env.ANTHROPIC_CUSTOM_HEADERS = _withTraceIdHeader(env.ANTHROPIC_CUSTOM_HEADERS ?? '', officialSpawnTrace)
+      }
       const backend: TerminalBackend = createBackend(this.opts.config.terminal)
       timing.once('spawn_requested')
       proc = ccbSpawnForTests ? ccbSpawnForTests(spawnOpts) : backend.spawn(spawnOpts)
@@ -869,6 +894,7 @@ export class SubprocessRunner extends EventEmitter {
     if (resolveCcbHarness(this.opts.harness) === 'official-cc' && this.pendingOfficialSpawnEnv) {
       this.spawnedOfficialHeaderFingerprint = officialCcProxySpawnFingerprint(
         this.pendingOfficialSpawnEnv,
+        this.opts.traceId,
       )
     }
     // Emit BEFORE any stdout listener is attached, so subscribers (e.g. session
@@ -1242,15 +1268,17 @@ export class SubprocessRunner extends EventEmitter {
         turnKey,
         executionDescriptorEnv: this.currentExecutionDescriptorEnv,
       })
-      const fingerprint = officialCcProxySpawnFingerprint(spawnEnv)
+      const fingerprint = officialCcProxySpawnFingerprint(spawnEnv, this.opts.traceId)
       if (this.proc && this.spawnedOfficialHeaderFingerprint !== fingerprint) {
         await this.shutdown()
       }
       this.pendingOfficialSpawnEnv = spawnEnv
     }
     this.currentTurnHeaders = runtime.headers
-    const envUpdateLine = harness === 'ccb'
-      ? _buildUpdateEnvStdinLine(
+    // Built here so a bad authority header still fails the turn before any spawn; the custom-header
+    // value is rebuilt with the turn trace once the process (and so its upstream) is known (OCV5-570).
+    const envUpdateVars = harness === 'ccb'
+      ? (
           {
             ..._buildAnthropicCustomHeadersEnv(runtime.headers),
             ..._buildCcbUsageAttributionEnv(this.opts.usageAttribution, turnKey),
@@ -1262,7 +1290,7 @@ export class SubprocessRunner extends EventEmitter {
             ...(isCcbAdvisorHermeticProfile(this.opts)
               ? { CLAUDE_CODE_UNATTENDED_RETRY: '0', [CCB_ADVISOR_HERMETIC_ENV]: '1' }
               : {}),
-          },
+          }
         )
       : null
 
@@ -1271,6 +1299,12 @@ export class SubprocessRunner extends EventEmitter {
     turnTiming.once('process_available')
     if (!this.proc) throw new Error('failed to start agent subprocess')
     this.refreshDelegateContext()
+    const envUpdateLine = envUpdateVars
+      ? _buildUpdateEnvStdinLine({
+          ...envUpdateVars,
+          ..._buildAnthropicCustomHeadersEnv(runtime.headers, this.egressTraceId()),
+        })
+      : null
     const content = ccbStdinUserContent(userTextOrBlocks)
     const userMsg = {
       type: 'user',
@@ -1335,10 +1369,15 @@ export class SubprocessRunner extends EventEmitter {
     const renewed = renewTurnHeaderBundle(this.currentTurnHeaders, leaseEnvelope)
     this.currentTurnHeaders = renewed
     const envUpdateLine = _buildUpdateEnvStdinLine(
-      _buildAnthropicCustomHeadersEnv(renewed),
+      _buildAnthropicCustomHeadersEnv(renewed, this.egressTraceId()),
     )
     if (!this.proc) throw new Error('cannot renew turn lease without a running CCB subprocess')
     await this.writeTurnLineOrDestroy(envUpdateLine, 'authority_env')
+  }
+
+  /** The turn trace for CCB's egress requests (OCV5-570), or undefined when CCB's upstream is not egress. */
+  private egressTraceId(): string | undefined {
+    return this.spawnedUpstreamIsEgress ? this.opts.traceId : undefined
   }
 
   private async writeTurnLineOrDestroy(
@@ -1514,7 +1553,7 @@ export class SubprocessRunner extends EventEmitter {
       }
       // Built-in 平台 MCP **总是豁免 toolset 过滤**(各自有独立 gating):
       //   - openclaude-memory:总开。
-      // (vision 已从 MCP 迁到 oc-vision CLI / baseline skill,不再作为内置 MCP 注入。)
+      // (vision MCP 与 oc-vision CLI 均已在 OCV5-547 下线,不再作为内置 MCP 注入。)
       allowedMcpIds.add('openclaude-memory')
     }
     const availableMcpTools = new Set<string>()
@@ -1737,11 +1776,6 @@ export class SubprocessRunner extends EventEmitter {
       // Toolset filter: if agent has toolsets configured, only include MCPs
       // whose id appears in at least one of the agent's toolset definitions.
 
-      // Built-in vision (openclaude-vision) retired from the MCP path → oc-vision
-      // CLI + baseline skill (same MiniMax-M3 backend, no long-lived stdio
-      // transport that can die and hang the turn). Text-only models discover it
-      // via the skill index + the vision prompt hint (see promptSlots/server).
-
       // Layer 1 + 2: Global MCPs
       for (const srv of this.opts.config.mcpServers ?? []) {
         if (srv.enabled === false) continue
@@ -1783,15 +1817,12 @@ export class SubprocessRunner extends EventEmitter {
     }
 
     try {
-      const efficiencySettings = buildCcbEfficiencySettings()
-      if (efficiencySettings) {
-        const settingsPath = resolve(sessionDir, 'settings.json')
-        atomicWriteJsonFile(settingsPath, efficiencySettings, 0o600)
-        out.settingsFile = settingsPath
-      }
+      const settingsPath = resolve(sessionDir, 'settings.json')
+      atomicWriteJsonFile(settingsPath, buildCcbSessionSettings(buildCcbEfficiencySettings()), 0o600)
+      out.settingsFile = settingsPath
     } catch (err) {
       runnerLog.warn(
-        'failed to write efficiency hook settings',
+        'failed to write CCB session settings',
         { sessionKey: this.opts.sessionKey, agentId: this.opts.agentId },
         err,
       )

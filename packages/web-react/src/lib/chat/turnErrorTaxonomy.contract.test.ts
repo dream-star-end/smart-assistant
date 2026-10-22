@@ -14,7 +14,7 @@ import {
   REPORT_EXEMPT_TURN_ERROR_CODES,
   TURN_ERROR_TAXONOMY,
   WAIVED_TURN_ERROR_CODES,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/browser";
 import { describe, expect, test } from "vitest";
 import {
   BRIDGE_ERROR_FALLBACK,

@@ -20,6 +20,7 @@ import {
   type SystemSettingRow,
 } from "../../admin/systemSettings.js";
 import { invalidateRuntimeFlagsCache } from "../../admin/runtimeFlags.js";
+import { applyLogLevelSetting, type LogLevelSetting } from "../../logging/logLevelSync.js";
 import type { CommercialHttpDeps, RequestContext } from "../handlers.js";
 import { listAutoDreamModelOptions } from "../../billing/autoDreamModels.js";
 
@@ -160,6 +161,8 @@ export async function handleAdminPutSetting(
     // runtime flag cache 只有 2 个 entry(system_settings 表本身 19 个 key,但
     // 只有这 2 个走 cache),无脑 clear 开销可忽略,不需要按 key 分支。
     invalidateRuntimeFlagsCache();
+    // OCV5-559:日志级别本机立即生效(轮询器 ≤5 秒兜底收敛)
+    if (key === "log_level") applyLogLevelSetting(row.value as LogLevelSetting);
     sendJson(res, 200, { setting: serializeSetting(row, await safeAutoDreamOptions()) });
   } catch (err) {
     if (err instanceof SystemSettingNotFoundError) {

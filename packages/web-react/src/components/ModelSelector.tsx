@@ -12,7 +12,7 @@ import {
   cursorFamilySupportsContextTier,
   fastServiceTierRoute,
   cursorFamilySupportsFast,
-} from '@openclaude/protocol'
+} from '@openclaude/protocol/browser'
 import { AlertTriangle, Check, ChevronDown, ChevronRight, Cpu, Loader2, Lock, Users } from 'lucide-react'
 import { type ReactNode, useEffect, useState } from 'react'
 import { useNarrowViewport } from '../hooks/useMdViewport'

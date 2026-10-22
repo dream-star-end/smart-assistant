@@ -84,39 +84,15 @@ import {
   pickDeliberationPanel,
   type DeliberationPanelMember,
 } from './teamMode.js'
-import { isTextOnlyDefinite } from './mcpVisionServer.js'
 import { buildImageAttachmentHint } from './imageAttachmentHint.js'
 import { isAutoDreamSuccessfulTurn } from './autoDream.js'
 import {
   _isBlockingUserInputTool,
   _permissionRequestExpiresAt,
 } from './pendingPermissionSnapshot.js'
-import {
-  V3_WECHAT_OUTBOUND_ADAPTER_ID,
-  V3_QQBOT_OUTBOUND_ADAPTER_ID,
-  ALLOWED_INBOUND_MODELS,
-  liveSessionReuseSkipReason,
-  readLiveRunnerModel,
-  resolveLocalExecutionIfEnforced,
-  localExecutionOverride,
-  collectAvailableMcpToolNames,
-  _buildSafeCodexRouteOverride,
-  _buildSafeGrokRouteOverride,
-  _buildSafeZcodeRouteOverride,
-  _buildSafeAntigravityRouteOverride,
-  makePeerKey,
-  _buildTurnTraceContext,
-  _inheritOutboundRouting,
-  _buildEngineErrorFrame,
-  _buildTurnStatusFrame,
-  _earlyRejectErrorFrames,
-  _buildContextRebuiltFrame,
-  MAX_UPLOAD_SINGLE,
-  MAX_UPLOAD_TOTAL,
-  isUploadMimeAllowed,
-  uploadExtForMime,
-  mimeFor,
-} from './server.js'
+import { V3_WECHAT_OUTBOUND_ADAPTER_ID, V3_QQBOT_OUTBOUND_ADAPTER_ID, liveSessionReuseSkipReason, readLiveRunnerModel, resolveLocalExecutionIfEnforced, localExecutionOverride, collectAvailableMcpToolNames, _buildSafeCodexRouteOverride, _buildSafeGrokRouteOverride, _buildSafeZcodeRouteOverride, _buildSafeAntigravityRouteOverride, makePeerKey, _buildTurnTraceContext, _inheritOutboundRouting, _buildEngineErrorFrame, _buildTurnStatusFrame, _earlyRejectErrorFrames, _buildContextRebuiltFrame, isUploadMimeAllowed, uploadExtForMime } from './server.js'
+import { ALLOWED_INBOUND_MODELS } from './delegatePolicy.js'
+import { MAX_UPLOAD_SINGLE, MAX_UPLOAD_TOTAL, mimeFor } from './httpUploadStatic.js'
 import type { Gateway, LocalExecutionDecision } from './server.js'
 
 export interface InboundDispatchHost {
@@ -1471,14 +1447,6 @@ export async function dispatchInbound(
 
       let finalText = text
       if (savedMedia.length > 0) {
-        const activeMcpTools = collectAvailableMcpToolNames(
-          this.deps.config,
-          effectiveAgent,
-          safeModel,
-          { modelSupportsVision: turnAuthority?.supportsVision ?? localExec?.supportsVision },
-        )
-        const hasUnderstandImage = activeMcpTools.includes('understand_image')
-
         const images = savedMedia.filter((m) => m.kind === 'image')
         const audios = savedMedia.filter((m) => m.kind === 'audio')
         const videos = savedMedia.filter((m) => m.kind === 'video')
@@ -1497,11 +1465,6 @@ export async function dispatchInbound(
                 sizeHint: ip.sizeHint,
                 name: ip.name,
               })),
-              textOnlyDefinite: isTextOnlyDefinite(
-                effectiveAgent?.provider ?? this.deps.config.provider,
-                safeModel,
-              ),
-              hasUnderstandImage,
             }),
           )
         }

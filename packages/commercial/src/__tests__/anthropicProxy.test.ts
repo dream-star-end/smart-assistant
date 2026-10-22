@@ -1481,6 +1481,18 @@ describe("stripNonTextContentBlocks", () => {
     assert.match(content[0].text, /document omitted/);
   });
 
+  test("keepImages preserves images but still strips documents", () => {
+    const messages = [
+      { role: "user", content: [IMG(), { type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBER" } }] },
+    ];
+    const r = stripNonTextContentBlocks(messages, { keepImages: true });
+    assert.equal(r.imagesStripped, 0);
+    assert.equal(r.documentsStripped, 1);
+    const content = (r.messages[0] as { content: any[] }).content;
+    assert.equal(content[0].type, "image");
+    assert.match(content[1].text, /document omitted/);
+  });
+
   test("string content / 非数组 content 跳过,不抛错", () => {
     const messages = [
       { role: "user", content: "plain string" },
@@ -1510,36 +1522,33 @@ describe("stripNonTextContentBlocks", () => {
     const src = readFileSync(indexPath, "utf-8");
 
     // 锚定真实调用(`estimateInputTokens(body)` 也出现在注释里,故用赋值整句锚定)。
-    const stripIdx = src.indexOf("stripNonTextContentBlocks(body.messages)");
-    assert.ok(stripIdx >= 0, "必须存在 stripNonTextContentBlocks(body.messages) 调用");
+    const stripIdx = src.indexOf("stripNonTextContentBlocks(body.messages, { keepImages: modelSupportsVision })");
+    assert.ok(stripIdx >= 0, "必须存在 keepImages=modelSupportsVision 的 strip 调用");
 
     const estimateIdx = src.indexOf("const inputTokens = estimateInputTokens(body)");
     assert.ok(estimateIdx >= 0, "必须存在 const inputTokens = estimateInputTokens(body) 调用");
     assert.ok(stripIdx < estimateIdx, "strip 必须在 estimateInputTokens(body) 之前");
-    // strip 必须 gated 在 `if (route.kind === "static" && !modelSupportsVision)` 内:
-    // 只对静态**纯文本**模型 strip;MiniMax-M3 等原生识图的模型不 strip。
+    // strip 必须 gated 在 `if (route.kind === "static")` 内:
+    // 纯文本模型 strip 图+文档;原生识图模型只 strip 文档。
     //
     // 2026-07-12 模型权威批次:gate 从 **provider 级** `route.provider.supportsVision` 收窄成
     // **per-model** `modelSupportsVision` —— catalog 生效时取该行的 capability_profile
     // (方案 §4 "proxy 清洗消费 catalog 行 per-model"),legacy 期回落 provider 级 spec。
     // 语义没变(纯文本模型才 strip),但表达力升级:同一 provider 下未来会同时有多模态与
     // 纯文本型号,provider 级 flag 表达不了。
-    const gateIdx = src.lastIndexOf(
-      'if (route.kind === "static" && !modelSupportsVision)',
-      stripIdx,
-    );
+    const gateIdx = src.lastIndexOf('if (route.kind === "static")', stripIdx);
     assert.ok(
       gateIdx >= 0 && gateIdx < stripIdx,
-      'strip 必须 gated 在 if (route.kind === "static" && !modelSupportsVision) 内',
+      'strip 必须 gated 在 if (route.kind === "static") 内',
     );
 
-    // input cap guard 也必须 gated 在 !modelSupportsVision —— vision 请求含大 base64 图,
-    // estimateInputTokens(JSON.length/4)把图当文本 token 高估(2MB 图≈725k),误撞文本 context cap → 413。
-    // 期望源码里有**两处** !modelSupportsVision:strip gate + input cap gate。
+    // Vision 只跳过图片占位,documents 仍走 strip;input cap guard 仍只对 !modelSupportsVision
+    // 生效 —— vision 请求含大 base64 图,estimateInputTokens(JSON.length/4)把图当文本 token
+    // 高估(2MB 图≈725k),误撞文本 context cap → 413。
     const supportsVisionGates = (src.match(/!modelSupportsVision/g) ?? []).length;
     assert.ok(
-      supportsVisionGates >= 2,
-      'strip 与 static input cap guard 两处都必须 gated 在 !modelSupportsVision',
+      supportsVisionGates >= 1,
+      'static input cap guard 必须 gated 在 !modelSupportsVision',
     );
 
     // modelSupportsVision 的**权威来源**:catalog descriptor(gate 生效)→ 否则 provider spec。

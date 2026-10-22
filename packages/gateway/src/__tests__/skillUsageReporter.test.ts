@@ -129,7 +129,7 @@ describe('skillUsageReporter', () => {
     assert.equal(parseSkillSlug('{"name":"browser"}'), 'browser')
     assert.equal(parseSkillSlug('{"name":"web-context","path":"references/x.md"}'), 'web-context')
     // 截断的 JSON(path 值被切断)→ 正则仍能抓到 name。
-    assert.equal(parseSkillSlug('{"name":"oc-vision","path":"references/verylongpath-that-is-'), 'oc-vision')
+    assert.equal(parseSkillSlug('{"name":"oc-memory","path":"references/verylongpath-that-is-'), 'oc-memory')
     assert.equal(parseSkillSlug('{"path":"x"}'), null) // 无 name
     assert.equal(parseSkillSlug(''), null)
     assert.equal(parseSkillSlug(undefined), null)

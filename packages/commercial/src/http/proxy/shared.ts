@@ -29,6 +29,7 @@ import { parseRetryAfterMs } from "../../account-pool/policy/outcome.js";
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import type { Pool } from "pg";
@@ -102,11 +103,17 @@ export function openCodeGoAuthHeaders(
   apiKey: string,
   accept = "application/json",
 ): Record<string, string> {
-  return {
+  const headers: Record<string, string> = {
     "x-api-key": apiKey,
     "Content-Type": "application/json",
     Accept: accept,
   };
+  // OpenCode Go 自 2026-09-07 起缺稳定会话 id 头即 400 MissingSessionID,且 400 不触发 DeepSeek
+  // 回落 —— 平台直连调用(市场 AI 审批、经验分享审核)因此恒失败。头名取 protocol spec
+  // (与 upstream.ts 真实流量同源);平台调用每次独立,随机 UUID 即可。
+  const sessionHeader = getStaticProvider("opencodego").sessionIdHeader;
+  if (sessionHeader) headers[sessionHeader] = randomUUID();
+  return headers;
 }
 
 let platformFlashFallbackKey: string | undefined;
@@ -1619,7 +1626,10 @@ export function stripProviderBoundAssistantBlocks(messages: unknown[]): {
  * 性能/不变量:copy-on-write —— 无任何非文本块时直返原引用,且不 mutate 入参(调用方在
  * sanitize 后还会读 body / estimateInputTokens 等),与 stripMalformedThinkingBlocks 同构。
  */
-export function stripNonTextContentBlocks(messages: unknown[]): {
+export function stripNonTextContentBlocks(
+  messages: unknown[],
+  opts: { keepImages?: boolean } = {},
+): {
   messages: unknown[];
   imagesStripped: number;
   documentsStripped: number;
@@ -1638,6 +1648,7 @@ export function stripNonTextContentBlocks(messages: unknown[]): {
     block: Record<string, unknown>,
   ): Record<string, unknown> | null => {
     if (block.type === "image") {
+      if (opts.keepImages) return null;
       imagesStripped++;
       return { type: "text", text: "[image omitted: this model accepts text input only]" };
     }
@@ -1757,6 +1768,13 @@ export interface AnthropicProxyDeps {
   rateLimitRedis: RateLimitRedis;
   /** 注入 fetch(测试用)。 */
   fetchImpl?: typeof fetch;
+  /**
+   * Platform executor for Anthropic server-side `web_search_*` tools (official
+   * Claude Code WebSearch side requests) on the OpenCode Go chat/responses
+   * bridges. Omitted (master without egress) → the tool is stripped and the
+   * request still reaches the model instead of failing with 400.
+   */
+  webSearch?: import("./webSearchServerTool.js").WebSearchExecutor;
   /** Optional, off-by-default Box CLI model transport. The proxy retains
    * identity/authority/precheck/finalizer; this component owns only the Box
    * invocation and its independent cross-HTTP account-capacity lease. */

@@ -39,17 +39,8 @@ import { CollaborationConfigError, resolveSessionCollab } from './advisorConfigS
 import { serveFileFdWithRange } from './httpRange.js'
 import { isEngineLocalTurnExempt } from './modelAuthority.js'
 import { getLocalCatalogView } from './modelCatalogClient.js'
-import {
-  CLAUDE_OAUTH_USER_AGENT,
-  _uploadFsOps,
-  isFileAllowed,
-  makeUserScopedMediaPredicate,
-  isFileBlocked,
-  MAX_UPLOAD_SINGLE,
-  isUploadMimeAllowed,
-  uploadExtForMime,
-  mimeFor,
-} from './server.js'
+import { CLAUDE_OAUTH_USER_AGENT, _uploadFsOps, isFileAllowed, makeUserScopedMediaPredicate, isFileBlocked, isUploadMimeAllowed, uploadExtForMime } from './server.js'
+import { MAX_UPLOAD_SINGLE, mimeFor } from './httpUploadStatic.js'
 import type { Gateway } from './server.js'
 
 export interface HttpMiscHandlersHost {
@@ -73,6 +64,23 @@ export interface HttpMiscHandlersHost {
   sendJson: Gateway['sendJson']
   sessions: Gateway['sessions']
 }
+
+export type ResolveMediaDirsResult = | { kind: 'legacy'; uploads: string; generated: string }
+  | { kind: 'ok'; uid: number; uploads: string; generated: string }
+  | {
+      kind: 'fail'
+      reason: 'remote-host'
+      uid: number
+      hostUuid: string
+      uploads: string
+      generated: string
+      logCtx: Record<string, unknown>
+    }
+  | {
+      kind: 'fail'
+      reason: 'invalid-uid' | 'not-ready' | 'volume-missing' | 'ambiguous' | 'daemon-error'
+      logCtx: Record<string, unknown>
+    }
 
 /**
  * Resolve the media directories (uploads + generated) for an authenticated
@@ -99,22 +107,7 @@ export async function _resolveMediaDirs(
   this: HttpMiscHandlersHost,
   userId: string,
 ): Promise<
-  | { kind: 'legacy'; uploads: string; generated: string }
-  | { kind: 'ok'; uid: number; uploads: string; generated: string }
-  | {
-      kind: 'fail'
-      reason: 'remote-host'
-      uid: number
-      hostUuid: string
-      uploads: string
-      generated: string
-      logCtx: Record<string, unknown>
-    }
-  | {
-      kind: 'fail'
-      reason: 'invalid-uid' | 'not-ready' | 'volume-missing' | 'ambiguous' | 'daemon-error'
-      logCtx: Record<string, unknown>
-    }
+  ResolveMediaDirsResult
 > {
   // No commercial hook OR resolver not injected (agentRuntime not ready) →
   // legacy single-tenant write/read path. `default` always falls here

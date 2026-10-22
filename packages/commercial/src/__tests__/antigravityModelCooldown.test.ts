@@ -21,6 +21,7 @@ import {
   createIoredisAntigravityModelCooldownStore,
   reportAntigravityModelOutcome,
 } from '../account-pool/antigravityModelCooldown.js'
+import { AntigravityOAuthError } from '../account-pool/antigravityOAuth.js'
 import { pickAntigravityAccount, reportAntigravityOutcome } from '../account-pool/antigravityPool.js'
 
 const GPT = 'antigravity-gpt-oss-120b'
@@ -228,6 +229,76 @@ describe('admission skips accounts whose model is cooling', () => {
       },
     })
     assert.equal(granted.token, 't-1')
+  })
+})
+
+describe('a dead grant moves admission to another account (OCV5-556)', () => {
+  const args = {
+    containerId: 11,
+    userId: 42n,
+    requestId: 'e'.repeat(32),
+    modelId: FLASH,
+    budgetCredits: 100n,
+    relayPort: 18789,
+  }
+  const accounts = (n: number) =>
+    fakePool(Array.from({ length: n }, (_, i) => ({ id: String(i + 1), email: `${i}@x` })))
+  function deps(pool: never, fail: (id: bigint) => Error | null) {
+    const minted: bigint[] = []
+    return {
+      minted,
+      deps: {
+        clientSecret: 'GOCSPX-test-secret-not-real-000',
+        pick: (d: Parameters<typeof pickAntigravityAccount>[0]) => pickAntigravityAccount({ ...d, pool }),
+        modelCoolingUntil: async () => null,
+        mintLimited: (async (id: bigint) => {
+          minted.push(id)
+          const err = fail(id)
+          if (err) throw err
+          return { accessToken: 'limited', expiresAt: new Date(now + 3_600_000), idToken: null }
+        }) as never,
+        mintRoute: (async (a: { accountId: bigint }) => ({
+          token: `t-${a.accountId}`,
+          baseUrl: 'http://relay',
+        })) as never,
+      },
+    }
+  }
+  const authUnavailable = (err: unknown) =>
+    err instanceof AntigravityAdmissionError && err.code === 'ANTIGRAVITY_AUTH_UNAVAILABLE'
+
+  test('invalid_grant on the first account admits the turn on the next one', async () => {
+    const { pool } = accounts(2)
+    const d = deps(pool, (id) => (id === 1n ? new AntigravityOAuthError(400, 'invalid_grant') : null))
+    assert.equal((await admitAntigravityTurn(args, d.deps)).token, 't-2')
+    assert.deepEqual(d.minted, [1n, 2n])
+  })
+
+  test('a 401 from the token endpoint also moves on', async () => {
+    const { pool } = accounts(2)
+    const d = deps(pool, (id) => (id === 1n ? new AntigravityOAuthError(401, null) : null))
+    assert.equal((await admitAntigravityTurn(args, d.deps)).token, 't-2')
+  })
+
+  test('invalid_client (the shared client) and network errors do not try another account', async () => {
+    for (const err of [new AntigravityOAuthError(400, 'invalid_client'), new AntigravityOAuthError(503, null), new Error('ECONNRESET')]) {
+      const { pool } = accounts(2)
+      const d = deps(pool, () => err)
+      await assert.rejects(admitAntigravityTurn(args, d.deps), authUnavailable)
+      assert.deepEqual(d.minted, [1n])
+    }
+  })
+
+  test('every grant dead: AUTH_UNAVAILABLE, at most three accounts tried', async () => {
+    const two = accounts(2)
+    const d2 = deps(two.pool, () => new AntigravityOAuthError(400, 'invalid_grant'))
+    await assert.rejects(admitAntigravityTurn(args, d2.deps), authUnavailable)
+    assert.deepEqual(d2.minted, [1n, 2n])
+    const five = accounts(5)
+    const d5 = deps(five.pool, () => new AntigravityOAuthError(400, 'invalid_grant'))
+    await assert.rejects(admitAntigravityTurn(args, d5.deps), authUnavailable)
+    assert.equal(d5.minted.length, 3)
+    assert.equal(new Set(d5.minted).size, 3)
   })
 })
 

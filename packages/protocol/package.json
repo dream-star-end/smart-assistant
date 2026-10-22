@@ -11,6 +11,11 @@
       "openclaude-precompiled": "./dist/index.js",
       "default": "./src/index.ts"
     },
+    "./browser": {
+      "types": "./src/browser.ts",
+      "openclaude-precompiled": "./dist/browser.js",
+      "default": "./src/browser.ts"
+    },
     "./frames": {
       "types": "./src/frames.ts",
       "openclaude-precompiled": "./dist/frames.js",

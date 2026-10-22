@@ -893,7 +893,10 @@ export class CcbAdapter extends EventEmitter implements EngineAdapter {
   }
 
   setTraceId(traceId: string | undefined): void {
-    this.runner.setTraceId(traceId)
+    // OCV5-570: same rule as SessionManager.submit — a defined trace is a hard call; the per-turn clear
+    // is optional-called so wrapped runner doubles that never carried a trace keep working.
+    if (traceId !== undefined) this.runner.setTraceId(traceId)
+    else this.runner.setTraceId?.(undefined)
   }
 
   async setGoalState(goal: GoalStateSnapshot | null): Promise<void> {

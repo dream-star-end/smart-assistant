@@ -520,21 +520,7 @@ describe("兜底反转:oc-* 绝不泄漏原始命令", () => {
   });
 });
 
-describe("4 个新专属卡", () => {
-  test("oc-vision → 图片理解卡(问题 + 识图结论,无 $ command)", () => {
-    const { container } = render(
-      <div>
-        {researchToolCard(
-          "oc-vision understand /home/agent/uploads/x.png --prompt '这是什么'",
-          tool({ output: "图中是一只橘猫,背景是沙发。" }),
-        )}
-      </div>,
-    );
-    expect(screen.getByText("图片理解")).toBeInTheDocument();
-    expect(screen.getByText("这是什么")).toBeInTheDocument();
-    expect(screen.getByText(/橘猫/)).toBeInTheDocument();
-    expect(container.textContent).not.toContain("oc-vision understand");
-  });
+describe("3 个新专属卡", () => {
 
   test("oc-memory memory 子命令已退役 → 干净的兜底正文,不裸露命令", () => {
     // 核心记忆改 memdir 文件写入,memory 子命令后端提示 + exit2;前端 MemoryCliCard 返回 null

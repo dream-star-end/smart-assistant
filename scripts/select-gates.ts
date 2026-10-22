@@ -32,6 +32,7 @@ export type GateId =
   | "typecheck"
   | "test:v5:ops"
   | "test:protocol"
+  | "test:kernel"
   | "test:channels"
   | "test:gateway"
   | "test:mcp-memory"
@@ -50,7 +51,7 @@ export interface GateMeta {
   lock: GateLock;
 }
 
-/** check:v5 的 18 道门,顺序与 package.json 全量链一致,便于打印「跳过了哪些」。 */
+/** check:v5 的 19 道门,顺序与 package.json 全量链一致,便于打印「跳过了哪些」。 */
 export const ALL_GATES: GateMeta[] = [
   { id: "check:ci-parity", npmScript: "check:ci-parity", cost: "cheap", lock: null },
   { id: "check:v5:incidents", npmScript: "check:v5:incidents", cost: "cheap", lock: null },
@@ -62,6 +63,7 @@ export const ALL_GATES: GateMeta[] = [
   { id: "typecheck", npmScript: "typecheck", cost: "medium", lock: null },
   { id: "test:v5:ops", npmScript: "test:v5:ops", cost: "medium", lock: null },
   { id: "test:protocol", npmScript: "test:protocol", cost: "medium", lock: null },
+  { id: "test:kernel", npmScript: "test:kernel", cost: "cheap", lock: null },
   { id: "test:channels", npmScript: "test:channels", cost: "medium", lock: null },
   { id: "test:gateway", npmScript: "test:gateway", cost: "medium", lock: null },
   { id: "test:mcp-memory", npmScript: "test:mcp-memory", cost: "medium", lock: null },
@@ -83,6 +85,7 @@ export const ALL_GATE_IDS: GateId[] = ALL_GATES.map((g) => g.id);
 /** tsc --build 工程图(根 tsconfig.json references)。web-react 不在图内,单独跑。 */
 export const COMPOSITE_PROJECTS = [
   "packages/protocol",
+  "packages/kernel",
   "packages/storage",
   "packages/plugin-sdk",
   "packages/mcp-memory",
@@ -107,6 +110,8 @@ export const TYPECHECK_DEPENDENTS: Record<CompositeProject, CompositeProject[]> 
     "packages/commercial",
     "packages/cli",
   ],
+  // OCV5-546/550:gateway 起 import kernel(logger 薄包装);commercial/cli 经 gateway 依赖它。
+  "packages/kernel": ["packages/gateway", "packages/commercial", "packages/cli"],
   "packages/storage": [
     "packages/mcp-memory",
     "packages/gateway",
@@ -176,7 +181,7 @@ export const GATE_RULES: GateRule[] = [
   {
     id: "incident-surface",
     comment:
-      "check-v5-incident-regressions.ts 只扫描 gateway/commercial/web-react/protocol/storage " +
+      "check-v5-incident-regressions.ts 只扫描 gateway/commercial/web-react/protocol/storage/kernel " +
       "上的 fix(v5) 提交;改这些包或门自身时才跑。",
     match: (f) =>
       f.startsWith("packages/gateway/") ||
@@ -184,6 +189,7 @@ export const GATE_RULES: GateRule[] = [
       f.startsWith("packages/web-react/") ||
       f.startsWith("packages/protocol/") ||
       f.startsWith("packages/storage/") ||
+      f.startsWith("packages/kernel/") ||
       f === "scripts/check-v5-incident-regressions.ts" ||
       /(^|\/)incidents\.json$/.test(f),
     gates: ["check:v5:incidents"],
@@ -352,6 +358,15 @@ export const GATE_RULES: GateRule[] = [
       f.startsWith("packages/commercial/src/db/") ||
       f.startsWith("packages/commercial/src/http/"),
     gates: ["test:commercial:integ:shard", "lint:integ-tiers"],
+  },
+  {
+    id: "kernel",
+    comment:
+      "OCV5-546/550:@openclaude/kernel(L1 core)。gateway 的 logger 是它的薄包装,所以改 kernel " +
+      "要跑 gateway 单测,并建 kernel 及其 dependents(gateway/commercial/cli)。",
+    match: (f) => f.startsWith("packages/kernel/"),
+    gates: ["test:kernel", "test:gateway", "typecheck"],
+    typecheckProjects: ["packages/kernel", "packages/gateway", "packages/commercial", "packages/cli"],
   },
   {
     id: "plugin-sdk",

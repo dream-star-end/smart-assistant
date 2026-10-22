@@ -27,6 +27,7 @@ describe('automatic turn recovery policy', () => {
       'codex_turn_busy', // another turn owns the session; FIFO lifecycle owns it
       'codex_billing', // billing admission result is not a model continuation proof
       'project_context_unavailable', // held before dispatch until the master answers; user retries
+      'platform_credential_expired', // OCV5-556: replay reuses the dead launch credential; the next message gets a fresh one
     ])
     const actual = Object.entries(TURN_ERROR_TAXONOMY)
       .filter(([, semantics]) =>
@@ -52,6 +53,7 @@ describe('automatic turn recovery policy', () => {
     }
     for (const code of [
       'auth_error',
+      'platform_credential_expired',
       'insufficient_credits',
       'context_too_long',
       'bad_request',

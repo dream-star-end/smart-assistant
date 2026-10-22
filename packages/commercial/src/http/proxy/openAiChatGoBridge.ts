@@ -1,11 +1,23 @@
 import { randomUUID } from 'node:crypto'
 
+import {
+  type GoBridgeOptions,
+  WebSearchError,
+  isWebSearchServerTool,
+  webSearchResponse,
+  webSearchToolSpec,
+} from './webSearchServerTool.js'
+
 /**
  * OCV5-425 phase 2: Anthropic Messages ↔ OpenAI chat completions for the OpenCode Go models that
  * only answer on /chat/completions (GLM, Kimi K2.x, MiMo, LongCat, Hy, Step). Same shape as
  * geminiGoBridge: convert the request, stream the answer back as Anthropic SSE, and map usage so
  * the proxy meters it. Reasoning is billed (completion_tokens include it) but not surfaced as
- * Anthropic thinking: there is no signature to give it. Server web search is not offered.
+ * Anthropic thinking: there is no signature to give it.
+ *
+ * Server-side web search is not offered by the upstream. The official Claude Code WebSearch side
+ * request is fulfilled by the platform search proxies (see webSearchServerTool.ts); a mixed
+ * request keeps only its function tools so it reaches the model instead of failing with 400.
  */
 
 export type Obj = Record<string, unknown>
@@ -56,18 +68,61 @@ export function webSearchResultText(content: unknown): string {
     : 'Web search returned no results.'
 }
 
+export function imageUrlFromAnthropic(block: Obj): string {
+  if (block.type !== 'image') throw new Error('expected an image block')
+  const source = obj(block.source)
+  if (
+    source.type === 'base64' &&
+    typeof source.media_type === 'string' &&
+    typeof source.data === 'string'
+  ) {
+    return `data:${source.media_type};base64,${source.data}`
+  }
+  if (source.type === 'url' && typeof source.url === 'string' && source.url) return source.url
+  throw new Error('invalid OpenCode Go image source')
+}
+
+export type GoContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image'; url: string }
+
+export function toolResultParts(b: Obj): { text: string; parts: GoContentPart[] } {
+  if (b.content === undefined) return { text: '', parts: [] }
+  const parts: GoContentPart[] = []
+  for (const c of blocks(b.content)) {
+    if (c.type === 'text') {
+      if (typeof c.text !== 'string') throw new Error('invalid OpenCode Go text')
+      parts.push({ type: 'text', text: c.text })
+    } else if (c.type === 'image') {
+      parts.push({ type: 'image', url: imageUrlFromAnthropic(c) })
+    } else {
+      throw new Error('OpenCode Go supports text and image tool results only')
+    }
+  }
+  const text = parts.filter((p) => p.type === 'text').map((p) => p.text).join('\n')
+  if (b.is_error !== true) return { text, parts }
+  let prefixed = false
+  const errorParts = parts.map((p) => {
+    if (!prefixed && p.type === 'text') {
+      prefixed = true
+      return { ...p, text: `Error: ${p.text}` }
+    }
+    return p
+  })
+  if (!prefixed) errorParts.unshift({ type: 'text', text: 'Error' })
+  return { text: text ? `Error: ${text}` : 'Error', parts: errorParts }
+}
+
+export function toolResultContent(b: Obj): { text: string; images: string[] } {
+  const result = toolResultParts(b)
+  return {
+    text: result.text,
+    images: result.parts.filter((p) => p.type === 'image').map((p) => p.url),
+  }
+}
+
 export function toolResultText(b: Obj): string {
-  const text =
-    b.content === undefined
-      ? ''
-      : blocks(b.content)
-          .map((c) => {
-            if (c.type !== 'text' || typeof c.text !== 'string')
-              throw new Error('OpenCode Go supports text tool results only')
-            return c.text
-          })
-          .join('\n')
-  return b.is_error === true ? `Error: ${text}` : text
+  return toolResultContent(b).text
 }
 
 export function isServerTool(t: Obj): boolean {
@@ -88,6 +143,13 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
   const system: string[] = body.system === undefined ? [] : systemTexts(body.system)
   const messages: Obj[] = []
   const issued = new Set<string>()
+  const pendingToolCalls = new Set<string>()
+  const deferredUserMessages: Obj[] = []
+  const flushDeferred = () => {
+    if (pendingToolCalls.size === 0 && deferredUserMessages.length) {
+      messages.push(...deferredUserMessages.splice(0))
+    }
+  }
   // OCV5-432: CCB sends platform context as role:"system" messages. Only the preamble (before
   // the first assistant message) folds into the leading system message; later ones (the
   // per-turn `<total_tokens>…`) stay in place so the prompt-cache prefix never changes.
@@ -103,22 +165,46 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
       continue
     }
     if (m.role === 'user') {
-      const texts: string[] = []
+      const parts: Obj[] = []
+      const toolImages: string[] = []
       for (const b of blocks(m.content)) {
         if (b.type === 'text') {
           if (typeof b.text !== 'string') throw new Error('invalid OpenCode Go text')
-          if (b.text) texts.push(b.text)
+          if (b.text) parts.push({ type: 'text', text: b.text })
+        } else if (b.type === 'image') {
+          parts.push({ type: 'image_url', image_url: { url: imageUrlFromAnthropic(b) } })
         } else if (b.type === 'tool_result') {
           if (typeof b.tool_use_id !== 'string' || !issued.has(b.tool_use_id))
             throw new Error('OpenCode Go tool result has no matching tool call')
+          pendingToolCalls.delete(b.tool_use_id)
+          const result = toolResultContent(b)
           messages.push({
             role: 'tool',
             tool_call_id: decodeChatToolId(b.tool_use_id),
-            content: toolResultText(b),
+            content: result.text || (result.images.length ? 'Tool returned an image.' : ''),
           })
+          toolImages.push(...result.images)
         } else throw new Error(`unsupported OpenCode Go user block: ${String(b.type)}`)
       }
-      if (texts.length) messages.push({ role: 'user', content: texts.join('\n\n') })
+      const userMessage: Obj | null = parts.length
+        ? {
+            role: 'user',
+            content: parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts,
+          }
+        : null
+      // Chat tool messages cannot carry images; append a user message the model can see.
+      const imageMessage: Obj | null = toolImages.length
+        ? {
+            role: 'user',
+            content: toolImages.map((url) => ({ type: 'image_url', image_url: { url } })),
+          }
+        : null
+      flushDeferred()
+      for (const msg of [userMessage, imageMessage]) {
+        if (!msg) continue
+        if (pendingToolCalls.size) deferredUserMessages.push(msg)
+        else messages.push(msg)
+      }
       continue
     }
     if (m.role !== 'assistant') throw new Error('unsupported OpenCode Go message role')
@@ -133,6 +219,7 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
         if (typeof b.id !== 'string' || typeof b.name !== 'string')
           throw new Error('invalid OpenCode Go tool use')
         issued.add(b.id)
+        pendingToolCalls.add(b.id)
         calls.push({
           id: decodeChatToolId(b.id),
           type: 'function',
@@ -159,6 +246,8 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
       ...(calls.length && { tool_calls: calls }),
     })
   }
+  flushDeferred()
+  if (pendingToolCalls.size) throw new Error('OpenCode Go history has unanswered tool calls')
   if (!messages.length) throw new Error('OpenCode Go requires nonempty content')
   if (system.length) messages.unshift({ role: 'system', content: system.join('\n\n') })
   const out: Obj = {
@@ -180,10 +269,14 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
   const effort = chatReasoningEffort(body.output_config)
   if (effort) out.reasoning_effort = effort
   const tools = Array.isArray(body.tools) ? body.tools.map(obj) : []
-  if (tools.some(isServerTool))
+  const searchNames = new Set(
+    tools.filter(isWebSearchServerTool).map((t) => (typeof t.name === 'string' ? t.name : '')),
+  )
+  const functionTools = tools.filter((t) => !isWebSearchServerTool(t))
+  if (functionTools.some(isServerTool))
     throw new Error('OpenCode Go chat models do not offer server tools (web search)')
-  if (tools.length) {
-    out.tools = tools.map((t) => {
+  if (functionTools.length) {
+    out.tools = functionTools.map((t) => {
       if (typeof t.name !== 'string' || t.input_schema === undefined)
         throw new Error('unsupported OpenCode Go tool declaration')
       return {
@@ -196,8 +289,13 @@ export function anthropicToOpenAIChat(body: Obj): Obj {
       }
     })
     const choice = body.tool_choice === undefined ? { type: 'auto' } : obj(body.tool_choice)
-    out.tool_choice =
-      choice.type === 'auto'
+    // A force-search choice points at the stripped server tool; the remaining
+    // function tools decide for themselves.
+    const forcedSearch =
+      choice.type === 'tool' && typeof choice.name === 'string' && searchNames.has(choice.name)
+    out.tool_choice = forcedSearch
+      ? 'auto'
+      : choice.type === 'auto'
         ? 'auto'
         : choice.type === 'none'
           ? 'none'
@@ -406,13 +504,34 @@ export async function* chatToAnthropicEvents(
   }
 }
 
-export function createOpenAIChatGoFetch(fetchImpl: typeof fetch): typeof fetch {
+export function createOpenAIChatGoFetch(
+  fetchImpl: typeof fetch,
+  options?: GoBridgeOptions,
+): typeof fetch {
   return async (_input, init) => {
     let body: Obj
     let model: string
     try {
       if (typeof init?.body !== 'string') throw new Error('OpenCode Go bridge requires a JSON body')
       const anthropic = obj(JSON.parse(init.body))
+      if (typeof anthropic.model !== 'string' || !anthropic.model)
+        throw new Error('OpenCode Go requires a model')
+      const search = webSearchToolSpec(anthropic)
+      if (search) {
+        options?.onLocalFulfillment?.()
+        return webSearchResponse({
+          model: anthropic.model,
+          spec: search,
+          // No executor = this route has no platform search. Say so explicitly
+          // instead of spending a model call whose answer the WebSearch adapter
+          // would discard.
+          search:
+            options?.webSearch ??
+            (async () => {
+              throw new WebSearchError('unavailable', 'web search is not configured for this route')
+            }),
+        })
+      }
       body = anthropicToOpenAIChat(anthropic)
       model = body.model as string
     } catch (error) {

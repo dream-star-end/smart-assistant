@@ -86,10 +86,158 @@ jobs:
         run: npx tsx scripts/check-incident-ledger-superset.ts
 
       - name: Gate script tests
-        run: npx tsx --test scripts/__tests__/incidentLineage.test.ts scripts/__tests__/biomeChangedGate.test.ts scripts/__tests__/twoTreeDivergence.test.ts scripts/__tests__/incidentLedgerSuperset.test.ts scripts/__tests__/incidentTrailerExactCompat.test.ts scripts/__tests__/v5FixTrailerGate.test.ts scripts/__tests__/v5SelfhostCutoverIdle.test.ts
+        run: npx tsx --test scripts/__tests__/incidentLineage.test.ts scripts/__tests__/biomeChangedGate.test.ts scripts/__tests__/twoTreeDivergence.test.ts scripts/__tests__/incidentLedgerSuperset.test.ts scripts/__tests__/incidentTrailerExactCompat.test.ts scripts/__tests__/v5FixTrailerGate.test.ts scripts/__tests__/v5SelfhostCutoverIdle.test.ts scripts/__tests__/archMeasure.node-test.mjs scripts/__tests__/kernelReleaseClosure.test.ts scripts/__tests__/protocolBrowserEntry.test.ts scripts/__tests__/ocTrace.test.ts
+
+      # OCV5-548:kernel(脱敏/日志/trace 唯一实现)的单测;selfhost CI 不跑逐包 test:*,这里单独跑。
+      - name: Kernel unit tests
+        run: npm run test:kernel
 
       - name: Two-tree divergence (report only until the unified sync)
         run: npx tsx scripts/check-v5-two-tree-divergence.ts --against origin/feat/v5-aurora-rewrite
+
+  # OCV5-542(第三阶段 §9.3 第 3 条):本阶段迁移只做加法。新增/改动的迁移里每条兼容候选语句
+  # 都要有 -- compat: 声明,PR 描述要有 "## Migration compatibility" 一节逐个点名;任何一项缺失即红。
+  # 独立的必过 job,不是上面 precheck 的 warning。
+  migration-compat:
+    name: selfhost-migration-compat
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve comparison base
+        id: base
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            ref="origin/$BASE_REF"
+          elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            ref="$BEFORE"
+          else
+            ref="origin/feat/v5-selfhost"
+          fi
+          git rev-parse --verify "$ref^{commit}" >/dev/null
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Additive-only migrations (blocking)
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            printf '%s\n' "$PR_BODY" > "$RUNNER_TEMP/pr-body.md"
+            bash scripts/v5-selfhost-migration-compat-check.sh --base "${{ steps.base.outputs.ref }}" --pr-body-file "$RUNNER_TEMP/pr-body.md"
+          else
+            bash scripts/v5-selfhost-migration-compat-check.sh --base "${{ steps.base.outputs.ref }}"
+          fi
+
+      - name: Detector and check tests
+        run: bash scripts/v5-migration-compat.test.sh
+
+  # OCV5-543(第三阶段 §5):架构护栏规则 1–4。报告期(1–2 周)只输出新增/增长/过期的违规身份,不拦;
+  # 脚本缺失、解析失败、modules.json 不合法、基线缺失照样红(fail-closed)。强制期改为 --enforce。
+  architecture:
+    name: architecture
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve comparison base
+        id: base
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            ref="origin/$BASE_REF"
+          elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            ref="$BEFORE"
+          else
+            ref="origin/feat/v5-selfhost"
+          fi
+          git rev-parse --verify "$ref^{commit}" >/dev/null
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Architecture guardrails (report period)
+        run: npx tsx scripts/check-architecture.ts --base "${{ steps.base.outputs.ref }}" --json "$RUNNER_TEMP/architecture.json"
+
+      - name: Checker tests
+        run: npx tsx --test scripts/__tests__/checkArchitecture.test.ts
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: architecture-report
+          path: ${{ runner.temp }}/architecture.json
+          if-no-files-found: ignore
+
+  # OCV5-544(第三阶段 §5.7 第 1 条、附录 D):门禁 ↔ 源码路径耦合。PR 移动/删除了某个门禁点名的路径,
+  # 而该门禁在 HEAD 仍点名旧路径 → UNCOVERED。报告期只输出不拦;快照过期也只报告;git 失败、参数错误照样红。
+  gate-couplings:
+    name: gate-couplings
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve comparison base
+        id: base
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            ref="origin/$BASE_REF"
+          elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            ref="$BEFORE"
+          else
+            ref="origin/feat/v5-selfhost"
+          fi
+          git rev-parse --verify "$ref^{commit}" >/dev/null
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Gate couplings (report period)
+        run: npx tsx scripts/check-gate-couplings.ts --base "${{ steps.base.outputs.ref }}"
+
+      - name: Snapshot freshness (report period)
+        run: npx tsx scripts/check-gate-couplings.ts --check
+
+      - name: Checker tests
+        run: npx tsx --test scripts/__tests__/checkGateCouplings.test.ts
 
   # OCV5-447:列车 pinned staging 跑的 watch / autorecover 行为门,PR 上先跑同一份清单
   # (scripts/v5-selfhost-watch-gate.sh)。此前只有列车跑,watch 改动要等一趟列车失败才知道。
@@ -103,6 +251,19 @@ jobs:
 
       - name: Watch behaviour gate (same list as the train)
         run: bash scripts/v5-selfhost-watch-gate.sh --log-dir "$RUNNER_TEMP/watch-gate"
+
+      # OCV5-539:列车 summary.json 记录器(只记录,不参与列车判定,所以不进 watch 门清单)。
+      - name: Train summary recorder
+        run: bash scripts/v5-selfhost-train-summary.test.sh
+
+      - name: Workspace links (OCV5-549)
+        run: bash scripts/v5-selfhost-workspace-links.test.sh
+
+      # OCV5-581:L0 只读发车预检。每项检查用最小故障红一次、修好绿一次;另验只读与接线顺序。
+      - name: L0 departure preflight (OCV5-581)
+        run: |
+          bash scripts/v5-release-preflight.test.sh
+          node --test scripts/lib/proofDbPreflight.test.mjs
 
       - name: Upload logs on failure
         if: failure()

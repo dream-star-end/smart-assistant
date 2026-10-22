@@ -12,7 +12,9 @@ import path from 'node:path'
 import { test } from 'node:test'
 
 import {
+  ANTIGRAVITY_CLI_TOKEN_FILE_TTL_MS,
   type AntigravityPlatformInput,
+  antigravityCliTokenFileExpiry,
   cleanupAntigravityLaunch,
   projectAntigravityPlatform,
 } from '../engine/antigravityPlatform.js'
@@ -90,6 +92,29 @@ test('launch HOME stays unchanged without a host wrapper (commercial)', async ()
       assert.equal(projection.hostPathDir, null)
       assert.equal(existsSync(path.join(projection.launchHome, '.profile')), false)
       assert.equal(existsSync(path.join(projection.launchHome, '.oc-host-bin')), false)
+    } finally {
+      cleanupAntigravityLaunch(projection)
+    }
+  })
+})
+
+// OCV5-556: Go oauth2 in the CLI refuses locally once the file expiry passes
+// (no refresh_token), so the file must outlive the 12 h turn hard limit.
+test('CLI token file expiry outlives any turn and never shortens a later real expiry', () => {
+  const now = Date.parse('2026-10-21T08:02:45Z')
+  const floor = new Date(now + ANTIGRAVITY_CLI_TOKEN_FILE_TTL_MS).toISOString()
+  assert.ok(ANTIGRAVITY_CLI_TOKEN_FILE_TTL_MS > 12 * 60 * 60 * 1000)
+  assert.equal(antigravityCliTokenFileExpiry('2026-10-21T08:25:00Z', now), floor)
+  assert.equal(antigravityCliTokenFileExpiry('not-a-date', now), floor)
+  assert.equal(antigravityCliTokenFileExpiry('2026-10-30T00:00:00.000Z', now), '2026-10-30T00:00:00.000Z')
+})
+
+test('projection reports the expiry it wrote and never the token', async () => {
+  await withHome(async () => {
+    const projection = projectAntigravityPlatform(input(null))
+    try {
+      assert.ok(Date.parse(projection.cliTokenFileExpiry) >= Date.now() + 23 * 60 * 60 * 1000)
+      assert.ok(!JSON.stringify(projection).includes('limited-token'))
     } finally {
       cleanupAntigravityLaunch(projection)
     }

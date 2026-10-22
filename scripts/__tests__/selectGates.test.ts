@@ -151,10 +151,12 @@ describe("check:v5:fast 不得削弱 CI", () => {
     assert.ok(pkg.scripts["check:v5"], "missing check:v5");
     assert.equal(pkg.scripts["check:v5"].includes("check:v5:fast"), false);
     assert.match(pkg.scripts["check:v5:fast"], /run-v5-fast/);
-    // 全量链直接 npm run 数；新增门必须同时进 CI 与 check:v5（OCV5-119 加了 check:test-retries）。
+    // 全量链直接 npm run 数；新增门必须同时进 CI 与 check:v5（OCV5-119 加了 check:test-retries，
+    // OCV5-548 加了 test:kernel）。
     const runs = pkg.scripts["check:v5"].match(/\bnpm run \S+/g) ?? [];
-    assert.equal(runs.length, 20, `check:v5 应为 20 个直接步骤,实际 ${runs.length}: ${runs.join(" , ")}`);
+    assert.equal(runs.length, 21, `check:v5 应为 21 个直接步骤,实际 ${runs.length}: ${runs.join(" , ")}`);
     assert.ok(pkg.scripts["check:v5"].includes("check:test-retries"), "check:v5 必须含 check:test-retries");
+    assert.ok(pkg.scripts["check:v5"].includes("npm run test:kernel"), "check:v5 必须含 test:kernel");
   });
 
   test("v5-ci.yml 不引用 check:v5:fast", () => {

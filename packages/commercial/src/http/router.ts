@@ -16,10 +16,9 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
-// V3 S12e CG9 — contract D (deploy smoke) trace-id child binding on HTTP
-// request logger. master HTTP segment is the ONLY commercial path that reads
-// X-Trace-Id here (WS bridge has its own X-Connection-Trace-Id flow).
-import { newTraceId, parseTraceIdCandidate } from '@openclaude/protocol'
+// Trace-id child binding on the HTTP request logger (V3 S12e CG9; OCV5-564: x-openclaude-trace-id,
+// x-trace-id alias). The WS bridge has its own connection trace flow.
+import { resolveRequestTrace } from './requestTrace.js'
 import { getClientSessionCollabParent } from '@openclaude/storage'
 import { incrGatewayRequest } from '../admin/metrics.js'
 import { requireAdminVerifyDb } from '../admin/requireAdmin.js'
@@ -29,6 +28,8 @@ import { dialTunnelSocket as defaultTunnelDial } from '../compute-pool/nodeAgent
 import { getHostById as computePoolGetHostById } from '../compute-pool/queries.js'
 import { dispatchConnectorsRoute } from '../connectors/handlers.js'
 import { dispatchMediaGenerationRoute } from '../media-generation/http.js'
+import { dispatchMuseBridgeRoute } from '../muse/bridgeHttp.js'
+import { MUSE_BRIDGE_PREFIX } from '../muse/protocol.js'
 import { type Logger, rootLogger } from '../logging/logger.js'
 import {
   handleAdminMarketplaceAiReviews,
@@ -55,13 +56,17 @@ import {
 import { handleMarketplaceSearch } from '../marketplace/marketplaceSearch.js'
 import { isActiveAdmin, isInMaintenance } from '../middleware/maintenanceMode.js'
 import {
+  handleAdminListCommunityTutorials,
+  handleAdminListTutorialModerations,
   handleAdminPendingCommunityTutorials,
+  handleAdminTutorialModerationStats,
   handleAdminTutorialWrite,
   handleListCommunityTutorials,
   handleListOwnCommunityTutorials,
   handleSubmitCommunityTutorial,
   handleSubmitTutorialSnapshot,
   handleTutorialUserGet,
+  handleUploadTutorialImage,
   handleWithdrawCommunityTutorial,
 } from '../tutorials/communityTutorialRoutes.js'
 import { handleGetTutorialBlob, handleGetTutorialEmbed } from '../tutorials/tutorialBlobRoutes.js'
@@ -743,6 +748,8 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
     { method: 'GET', path: '/api/me', handler: handleMe },
     { method: ANY_METHOD, path: '/api/media-generation', handler: dispatchMediaGenerationRoute },
     { method: ANY_METHOD, pathPrefix: '/api/media-generation/', handler: dispatchMediaGenerationRoute },
+    // OCV5-561 Muse bridge (Muse VM dials out; bridge-token auth in the handler).
+    { method: ANY_METHOD, pathPrefix: MUSE_BRIDGE_PREFIX, handler: dispatchMuseBridgeRoute },
     // Session GoalState. Method/action semantics are centralized in the
     // dispatcher; ownership is rechecked against client_sessions in PG.
     {
@@ -865,6 +872,12 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
       path: '/api/tutorials/mine',
       handler: (req, res) => handleListOwnCommunityTutorials(req, res, deps),
     },
+    // 经验分享图片上传（原始字节）。exact 路由优先于下面的 POST `/api/tutorials/` 前缀（撤回）。
+    {
+      method: 'POST',
+      path: '/api/tutorials/images',
+      handler: (req, res) => handleUploadTutorialImage(req, res, deps),
+    },
     {
       method: 'POST',
       pathPrefix: '/api/tutorials/',
@@ -889,6 +902,21 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
       method: 'GET',
       path: '/api/admin/tutorials/pending',
       handler: (req, res) => handleAdminPendingCommunityTutorials(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/tutorials',
+      handler: (req, res) => handleAdminListCommunityTutorials(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/tutorials/moderation-stats',
+      handler: (req, res) => handleAdminTutorialModerationStats(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/tutorials/moderations',
+      handler: (req, res) => handleAdminListTutorialModerations(req, res, deps),
     },
     {
       method: 'GET',
@@ -1589,6 +1617,8 @@ export const COMMERCIAL_ROUTE_PREFIXES: readonly string[] = [
     '/api/connectors',
     '/api/plugins',
     '/api/media-generation',
+    // OCV5-561 Muse bridge; 404 unless OC_MUSE_BRIDGE_ENABLED=1.
+    MUSE_BRIDGE_PREFIX,
     // 会话目标(GoalState)REST 面。2026-07-17 事故:PR#76 只登了 routes 数组漏了
     // 本清单 → goal 全部 REST 404(GET 被前端当"无目标"吞,PUT 炸出 not found)。
     // 两处同步铁律由 routeOwnership.test.ts 契约测试锁死。
@@ -2196,19 +2226,16 @@ export function createCommercialHandler(
     // 任何下游 handler / preCheck / proxy / finalize 都通过 ctx.log 派生子 logger,
     // requestId 自然贯穿,且基底 binding(route/method/clientIp)一次性写明
     //
-    // V3 S12e CG9 — extract X-Trace-Id header (turn-level trace, contract D
-    // smoke canary). master-canonical fallback: if the client sent garbage,
-    // newTraceId() so reqLog ALWAYS has a traceId binding — that's what
-    // verify_trace_propagation in smoke-v3.sh greps for. Plan §510 spec.
-    const rawTrace = req.headers['x-trace-id']
-    const traceCand = parseTraceIdCandidate(Array.isArray(rawTrace) ? rawTrace[0] : rawTrace)
-    const traceId = traceCand.ok ? traceCand.traceId : newTraceId()
+    // OCV5-564(plan §7.1):trace 头以 x-openclaude-trace-id 为准,x-trace-id 别名一个周期;
+    // 没有合法头时生成的值标 traceIdOrigin=generated(一个周期后不再绑定),见 requestTrace.ts。
+    const { traceId, traceIdOrigin } = resolveRequestTrace(req.headers)
     const reqLog: Logger = httpLogger.child({
       requestId,
       route: labelRoute,
       method,
       clientIp: clientIpOf(req),
       traceId,
+      traceIdOrigin,
     })
 
     const ctx: RequestContext = {

@@ -133,6 +133,11 @@ DEPLOY_BUILT_RELEASE=""
 DEPLOY_BUILT_SOURCE_COMMIT=""
 CUTOVER_JOINT=0
 CUTOVER_TUPLE_BUNDLE=""
+# OCV5-534 --rollback 的已验证身份只由 cmd_rollback 设置;绝不从环境继承(否则 --cutover 可伪造回退身份绕过 HEAD 校验与迁移门)。
+CUTOVER_ROLLBACK=0
+ROLLBACK_SHA=""
+ROLLBACK_FROM=""
+ROLLBACK_ORIG_PREV=""
 # Lease Center(OCV5-131):worker 发车时传 --lease-train=<tr-*> --target-sha=<sha>;
 # 人工直跑 --deploy 时脚本自己登记一条 manual train,让 worker 能对账、不会在同一窗口再发一班。
 LEASE_TRAIN_ID=""
@@ -177,6 +182,13 @@ die() {
 # shellcheck source=scripts/v5-selfhost-master-release-lib.sh
 # shellcheck disable=SC1091
 source "$MASTER_RELEASE_LIB"
+# shellcheck source=lib/v5-selfhost-env.sh
+source "$SCRIPT_DIR/lib/v5-selfhost-env.sh"
+# shellcheck source=lib/v5-selfhost-rollback.sh
+source "$SCRIPT_DIR/lib/v5-selfhost-rollback.sh"
+# shellcheck source=lib/v5-selfhost-train-summary.sh
+source "$SCRIPT_DIR/lib/v5-selfhost-train-summary.sh"   # OCV5-539: <trainId>.summary.json, record only
+source "$SCRIPT_DIR/lib/v5-selfhost-workspace-links.sh"  # OCV5-549: ws_links_ensure
 # P0-Web 前端热切换(OCV5-489):overlay 指针根 + 纯函数库 + --p0-web* 编排。
 WEB_OVERLAY_ROOT="${OC_V5_WEB_OVERLAY_ROOT:-/var/lib/openclaude-v5-selfhost/web-overlay}"
 # shellcheck source=scripts/v5-web-overlay-lib.sh
@@ -205,6 +217,7 @@ own_instance_present() {
 
 cleanup_selfhost_deploy() {
   local exit_rc=$?
+  tsum_finish "$exit_rc" 2>/dev/null || :
   # Owner loss forbids successor state/holder writes from this invocation.
   [[ "$exit_rc" == 86 ]] && return 86
   if release_policy_enabled && ! release_policy_require_owner; then
@@ -212,6 +225,9 @@ cleanup_selfhost_deploy() {
     exit 86
   fi
   if [[ "$exit_rc" != 0 ]]; then release_policy_abort_unexposed || true; fi
+  if [[ "$exit_rc" != 0 ]] && declare -F rollback_restore_prev_if_unchanged >/dev/null 2>&1; then
+    rollback_restore_prev_if_unchanged || true
+  fi
   # 后台 runtime release 段必须先收尾,再释放锁/train(否则下一次 deploy 可能与它并发写 runtime-releases)。
   if declare -F reap_runtime_release_bg >/dev/null 2>&1; then reap_runtime_release_bg || true; fi
   # 函数定义在后面;参数校验阶段的 die 也会进这里,此时函数尚不存在。
@@ -448,7 +464,7 @@ acquire_selfhost_deploy_lock() {
 # --build-master-only / --cutover 持锁,避免与别人的 --deploy 撞车。
 maybe_acquire_selfhost_deploy_lock() {
   case "$MODE" in
-    deploy|bootstrap|build-master-only|cutover)
+    deploy|bootstrap|build-master-only|cutover|rollback)
       [[ "$DRY" == 1 ]] && return 0
       acquire_selfhost_deploy_lock
       ;;
@@ -456,7 +472,7 @@ maybe_acquire_selfhost_deploy_lock() {
 }
 usage() {
   cat <<'EOF'
-用法: scripts/deploy-v5-selfhost.sh --preflight|--bootstrap|--deploy|--build-master-only|--cutover|--smoke|--status [--dry-run] [--force-env] [--allow-dirty] [--platform-from-head] [--force-npm-ci] [--release=PATH]
+用法: scripts/deploy-v5-selfhost.sh --preflight|--bootstrap|--deploy|--build-master-only|--cutover|--rollback|--smoke|--status [--dry-run] [--force-env] [--allow-dirty] [--platform-from-head] [--force-npm-ci] [--release=PATH]
 
 日常发布(另一位 agent 请看这里):
   scripts/deploy-v5-selfhost.sh --deploy
@@ -467,6 +483,9 @@ usage() {
   --deploy              常规发布:构建不可变 master release(staging 内 vite)+容器制品,再走 --cutover 同一套翻转状态机
   --build-master-only   只建一份不可变 master rel-*(不迁库/不装 unit/不切 symlink/不重启)
   --cutover             手动逃生:已有 rel-* 时只做翻转(静态门+迁移门+备份+survivor+装 unit+symlink+重启+smoke)
+  --rollback            退回 .prev-release 及它当时的运行四元组(一次一步;不跑迁移、不回滚 schema;
+                        上一版之后有破坏性迁移、history 血缘断开、制品已回收时拒绝)。走同一套 joint
+                        状态机与门禁,登记 manual train;先 --rollback --dry-run 看计划
   --smoke               只读健康检查(含个人版回归;live 存在时比对 release dist oc-build)
   --status              打印当前状态(含 live / .prev-release / 四元组)
   --dry-run             与上述组合:打印将执行的命令,不改任何东西
@@ -505,6 +524,7 @@ usage() {
   scripts/deploy-v5-selfhost.sh --deploy --allow-dirty --platform-from-head
   scripts/deploy-v5-selfhost.sh --build-master-only
   scripts/deploy-v5-selfhost.sh --cutover --dry-run
+  scripts/deploy-v5-selfhost.sh --rollback --dry-run
   scripts/deploy-v5-selfhost.sh --cutover --release=/opt/openclaude/openclaude-v5-selfhost-releases/rel-...
   scripts/deploy-v5-selfhost.sh --smoke
 EOF
@@ -521,7 +541,7 @@ for arg in "$@"; do
     --resume-release-policy) RELEASE_POLICY_RESUME=1 ;;
     --lease-train=*) LEASE_TRAIN_ID="${arg#--lease-train=}" ;;
     --target-sha=*) LEASE_TARGET_SHA="${arg#--target-sha=}" ;;
-    --preflight|--bootstrap|--deploy|--smoke|--status|--build-master-only|--cutover|--p0-web|--p0-web-revert|--p0-web-status)
+    --preflight|--bootstrap|--deploy|--smoke|--status|--build-master-only|--cutover|--rollback|--p0-web|--p0-web-revert|--p0-web-status)
       [[ -z "$MODE" ]] || die "只能指定一个主模式(已有 --$MODE,又收到 $arg)"
       MODE="${arg#--}"
       ;;
@@ -575,7 +595,7 @@ fi
 
 if [[ "$DRY" != 1 ]]; then
   case "$MODE" in
-    deploy|bootstrap|build-master-only|cutover|p0-web|p0-web-revert)
+    deploy|bootstrap|build-master-only|cutover|rollback|p0-web|p0-web-revert)
       if [[ "$RELEASE_POLICY_RESUME" != 1 ]]; then
         release_policy_context_present && { log "unresolved release-policy context blocks mutation"; exit 79; }
       fi ;;
@@ -846,134 +866,6 @@ ensure_model_authority() {
 
 # ── env / HOME ───────────────────────────────────────────────────────────
 
-# 从 secrets.env 追加 provider 相关键。永不把值打印到 stdout。
-# 跳过任何 DATABASE/REDIS/SESSION/JWT/KMS/HUPIJIAO,避免把个人版库 URL 写进来。
-append_provider_keys() {
-  local dest="$1" line key
-  [[ -f "$SECRETS_ENV" ]] || return 0
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
-    key="${line%%=*}"
-    case "$key" in
-      *DATABASE*|*REDIS*|HUPIJIAO*|COMMERCIAL_JWT*|JWT_SECRET|OPENCLAUDE_KMS*|PLATFORM_HMAC*|OC_EGRESS_SECRET*)
-        continue
-        ;;
-    esac
-    case "$key" in
-      ARK_*|DEEPSEEK_*|DEEPGRAM_*|EMBEDDING_*|OPENAI_*|ANTHROPIC_*|GLM_*|DASHSCOPE_*|MOONSHOT_*|MINIMAX_*|GROK_*|GEMINI_*|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|ALL_PROXY|*_API_KEY|*_API_TOKEN)
-        printf '%s\n' "$line" >>"$dest"
-        ;;
-    esac
-  done <"$SECRETS_ENV"
-}
-
-write_env_file() {
-  local pass="$1" jwt kms hmac egress tmp
-  log "── 生成 $V5_ENV ──"
-  if [[ -f "$V5_ENV" && "$FORCE_ENV" != 1 ]]; then
-    log "  ⚠ $V5_ENV 已存在 → 保留不覆盖(权威=现网文件)。要重建请加 --force-env"
-    return 0
-  fi
-  if [[ -f "$V5_ENV" && "$FORCE_ENV" == 1 ]]; then
-    log "  ⚠ --force-env:将覆盖已存在的 env(旧文件备份为 ${V5_ENV}.bak-force)"
-    run "cp -a '$V5_ENV' '${V5_ENV}.bak-force-$(date -u +%Y%m%d%H%M%S)'"
-  fi
-  jwt="$(openssl rand -hex 32)"
-  # crypto/keys.ts 要求 OPENCLAUDE_KMS_KEY 是 base64(32 bytes),不是 hex。
-  kms="$(openssl rand -base64 32 | tr -d '\n')"
-  hmac="$(openssl rand -hex 32)"
-  egress="$(openssl rand -hex 32)"
-  if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] 写 $V5_ENV (mode 600;密钥不打印)"
-    return 0
-  fi
-  tmp="$(mktemp)"
-  local old_umask
-  old_umask="$(umask)"
-  umask 077
-  cat >"$tmp" <<EOF
-# commercial-v5-selfhost.env — 本机自用 V5,由 scripts/deploy-v5-selfhost.sh 生成。
-# 人工不要手改 OC_RUNTIME_* 四元组;由 hotcfg saga 原子写入。
-COMMERCIAL_ENABLED=1
-OC_RUNTIME_CHANNEL=v5
-OC_CONTROL_PLANE_LEADER=1
-OC_SELFHEAL_DISABLED=1
-OC_INSTANCE_ID=${INSTANCE_ID}
-OC_SLOT=A
-DATABASE_URL=postgres://${PG_ROLE}:${pass}@127.0.0.1:5432/${PG_DB}
-REDIS_URL=${REDIS_URL}
-COMMERCIAL_JWT_SECRET=${jwt}
-OPENCLAUDE_KMS_KEY=${kms}
-PLATFORM_HMAC_SECRET=${hmac}
-OC_EGRESS_SECRET=${egress}
-OC_V3_MEMORY_MB=4096
-OC_V3_CPUS=2
-OC_V3_PIDS_LIMIT=4096
-OC_IDLE_SWEEP_DISABLED=1
-OC_VOLUME_GC_DISABLED=1
-COMMERCIAL_AUTO_MIGRATE=0
-# 制品根覆盖:OC_HOTCFG_* 只决定构建产物落在哪,master 侧校验 release/bundle 走这两个键。
-# 不配则回落 DEFAULT_*_ROOT(/var/lib/openclaude-v5/...) → 本实例 release 一律判 invalid、拒 provision。
-# 下面两行在生成时展开为真实路径(EnvironmentFile 不会二次展开)。
-OC_PLATFORM_ROOT=${OC_HOTCFG_PLATFORM_ROOT}
-OC_RUNTIME_RELEASES_ROOT=${OC_HOTCFG_RELEASES_ROOT}
-# 与 sessions_store_migration_state=pg_authoritative + 本地 manifest 三件套必须同时到位,
-# 否则启动矩阵 fail-closed 拒起(env≠pg 不得退回 SQLite)。
-OC_SESSIONS_STORE=pg
-TURNSTILE_ENFORCE=0
-WECHAT_BROKER_ENABLED=0
-OC_EGRESS_SPLIT=1
-INTERNAL_PROXY_BIND=${V5_EGRESS_BIND}
-INTERNAL_PROXY_PORT=${V5_EGRESS_PORT}
-INTERNAL_CONTROL_BIND=${V5_CONTROL_BIND}
-INTERNAL_CONTROL_PORT=${V5_CONTROL_PORT}
-AGENT_RPC_SOCKET_DIR=/var/run/openclaude-agent-rpc-v5-selfhost
-AGENT_DOCKER_SOCKET=/var/run/docker.sock
-OC_RUNTIME_IMAGE=${RUNTIME_IMAGE}
-OC_PREHEAT_DISABLED=1
-OC_IMAGE_DISTRIBUTE_DISABLED=1
-OC_MIGRATION_RECONCILER_DISABLED=1
-OC_HEALTH_POLLER_DISABLED=1
-# Privacy-safe continuous-iteration telemetry. No raw prompt/tool output leaves the container.
-OC_TOOL_FAILURE_AUDIT=1
-OC_SKILL_SHADOW_SAMPLE_RATE=0.1
-OC_DURABLE_METRIC_ROLLUPS=1
-OC_LOCAL_OBSERVABILITY_RETENTION=1
-OC_LOCAL_EVENT_RETENTION_DAYS=30
-OC_LOCAL_USAGE_RETENTION_DAYS=365
-OC_REDACT_TOOL_EVENT_PREVIEWS=1
-# Bound project context (PROJECT.md / skill overlay / run snapshots). Commercial
-# production does not set this; gateway keeps the old path when unset.
-OC_PROJECT_CONTEXT=1
-# Project smart assist (OCV5-354), one flag each; the master forwards them into
-# user containers. OC_P5_UNFILED_SUGGEST stays unset: its precision on the
-# operator's real unfiled chats was below the bar (evidence in OCV5-354).
-OC_P5_PROJECT_SEARCH=1
-OC_P5_CHIPS=1
-OC_P5_RECIPE_SCHEDULE=1
-# Claude Code external HTTPS transport:keep internal http://172.31.0.1:18892
-# on NO_PROXY while login/telemetry endpoints share the stable Japan egress.
-OC_CLAUDE_CODE_HTTPS_PROXY=http://172.31.0.1:18991
-OC_CLAUDE_CODE_TZ=Asia/Tokyo
-# 用户面时区(OCV5-166)—— 与上面的 OC_CLAUDE_CODE_TZ **正交**,不要混改。
-#   OC_CLAUDE_CODE_TZ : 引擎子进程 TZ,跟随日本出口 IP,是风控一致性控制;
-#   OC_USER_TZ        : 用户真实所在地。两处消费:① 外接 ApiKey 路径的 system-reminder
-#                       追加「用户本地日期+UTC 偏移」;② 注入容器 env(docker Create.Env),
-#                       容器 gateway envProbe 渲染成 ENV slot 的 user_tz= 行给网页/cron 会话。
-#                       不改子进程 TZ、不参与选路;非缺省值改后需重建容器才进 PID1。
-OC_USER_TZ=Asia/Shanghai
-# 不要在本文件写入 OPENCLAUDE_V3_MASTER_BASE_URL / OPENCLAUDE_V3_CONTAINER_TOKEN。
-# 这两项由 v3supervisor 按用户容器注入;写进 host env 会让 cron 站内信全部落到同一个 uid。
-# token 明文不得进 git。上线无需改本文件,下一次容器重建即带上 supervisor 注入的 env。
-EOF
-  append_provider_keys "$tmp"
-  mkdir -p "$(dirname "$V5_ENV")"
-  mv -f "$tmp" "$V5_ENV"
-  chmod 600 "$V5_ENV"
-  umask "$old_umask"
-  log "  ✓ 已写入 $V5_ENV (mode 600;密钥未打印)"
-}
-
 ensure_home_config() {
   local json="$V5_HOME/openclaude.json" token
   log "── HOME $V5_HOME / openclaude.json ──"
@@ -1016,51 +908,6 @@ EOF
   chmod 600 "$json"
   umask "$old_umask"
   log "  ✓ 已写 $json (accessToken 不打印;默认模型 glm-5.2;未启用 telegram/wechat)"
-}
-
-# 幂等 upsert env 键。值不含换行/|;不打印 val(可能跟在含密钥的文件里)。
-ensure_env_kv() {
-  local file="$1" key="$2" val="$3" cur
-  cur="$(oc_hotcfg_env_get "$file" "$key")"
-  if [[ "$cur" == "$val" ]]; then
-    return 0
-  fi
-  if grep -Eq "^[[:space:]]*${key}=" "$file"; then
-    sed -i "s|^[[:space:]]*${key}=.*|${key}=${val}|" "$file"
-  else
-    printf '%s=%s\n' "$key" "$val" >>"$file"
-  fi
-  chmod 600 "$file"
-}
-
-ensure_selfhost_env_keys() {
-  log "── 确认制品根 + OC_SESSIONS_STORE=pg 写在 $V5_ENV ──"
-  if [[ "$DRY" == 1 ]]; then
-    echo "  [dry-run] upsert OC_PLATFORM_ROOT OC_RUNTIME_RELEASES_ROOT OC_SESSIONS_STORE=pg"
-    return 0
-  fi
-  [[ -f "$V5_ENV" ]] || die "缺 $V5_ENV。补救: write_env_file 应先跑。"
-  ensure_env_kv "$V5_ENV" OC_PLATFORM_ROOT "$OC_HOTCFG_PLATFORM_ROOT"
-  ensure_env_kv "$V5_ENV" OC_RUNTIME_RELEASES_ROOT "$OC_HOTCFG_RELEASES_ROOT"
-  ensure_env_kv "$V5_ENV" OC_SESSIONS_STORE pg
-  ensure_env_kv "$V5_ENV" OC_TOOL_FAILURE_AUDIT 1
-  ensure_env_kv "$V5_ENV" OC_SKILL_SHADOW_SAMPLE_RATE 0.1
-  ensure_env_kv "$V5_ENV" OC_DURABLE_METRIC_ROLLUPS 1
-  ensure_env_kv "$V5_ENV" OC_LOCAL_OBSERVABILITY_RETENTION 1
-  ensure_env_kv "$V5_ENV" OC_LOCAL_EVENT_RETENTION_DAYS 30
-  ensure_env_kv "$V5_ENV" OC_LOCAL_USAGE_RETENTION_DAYS 365
-  ensure_env_kv "$V5_ENV" OC_REDACT_TOOL_EVENT_PREVIEWS 1
-  ensure_env_kv "$V5_ENV" OC_PROJECT_CONTEXT 1
-  ensure_env_kv "$V5_ENV" OC_P5_PROJECT_SEARCH 1
-  ensure_env_kv "$V5_ENV" OC_P5_CHIPS 1
-  ensure_env_kv "$V5_ENV" OC_P5_RECIPE_SCHEDULE 1
-  ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_HTTPS_PROXY "http://172.31.0.1:18991"
-  ensure_env_kv "$V5_ENV" OC_CLAUDE_CODE_TZ "Asia/Tokyo"
-  ensure_env_kv "$V5_ENV" OC_USER_TZ "Asia/Shanghai"
-  ensure_env_kv "$V5_ENV" OC_SELFHOST_ENGINE_LOCAL_TURNS 1
-  ensure_env_kv "$V5_ENV" SELFHOST_CURSOR_EGRESS 1
-  ensure_env_kv "$V5_ENV" OC_V5_WEB_OVERLAY_ROOT "$WEB_OVERLAY_ROOT"
-  log "  ✓ 制品根 / PG sessions / privacy-safe telemetry / CCB Japan transport keys"
 }
 
 ensure_worktree_complete() {
@@ -1174,6 +1021,8 @@ cutover_sessions_to_pg() {
 ensure_node_modules() {
   log "── worktree node_modules ──"
   if [[ -d "$REPO_ROOT/node_modules" ]]; then
+    # OCV5-549:之后新增的工作区包(如 @openclaude/kernel)在已有 node_modules 里没有链接
+    ws_links_ensure "$REPO_ROOT" || die "worktree node_modules 缺工作区链接且无法安全补上。补救: 在 $REPO_ROOT 跑 npm ci。"
     log "  ✓ node_modules 已存在,跳过 npm ci"
     return 0
   fi
@@ -1654,6 +1503,7 @@ build_runtime_release() {
 RUNTIME_BG_PID=""
 RUNTIME_BG_LOG=""
 RUNTIME_BG_RESULT=""
+RUNTIME_BG_RC=""
 
 start_runtime_release_bg() { # <sha>
   local sha="$1"
@@ -1671,14 +1521,30 @@ start_runtime_release_bg() { # <sha>
   RUNTIME_BG_PID=$!
 }
 
+# OCV5-557:Box 门不和后台段并行。build_master_release 在 Box 门前调这里,只等它结束、记下退出码;
+# 日志回放、结果读取、失败处理仍由 collect_runtime_release_bg 照旧做。
+await_runtime_release_bg() {
+  [[ -n "${RUNTIME_BG_PID:-}" && -z "${RUNTIME_BG_RC:-}" ]] || return 0
+  local rc=0
+  log "  Box 门前先等后台 runtime release 构建结束(不与之并行)pid=$RUNTIME_BG_PID"
+  wait "$RUNTIME_BG_PID" || rc=$?
+  RUNTIME_BG_RC="$rc"
+  return 0
+}
+
 collect_runtime_release_bg() { # <sha>
   local sha="$1" rc=0 line
   if [[ -z "${RUNTIME_BG_PID:-}" ]]; then
     build_runtime_release "$sha"
     return 0
   fi
-  wait "$RUNTIME_BG_PID" || rc=$?
+  if [[ -n "${RUNTIME_BG_RC:-}" ]]; then
+    rc="$RUNTIME_BG_RC"
+  else
+    wait "$RUNTIME_BG_PID" || rc=$?
+  fi
   RUNTIME_BG_PID=""
+  RUNTIME_BG_RC=""
   log "── runtime release(后台段日志回放)──"
   cat "$RUNTIME_BG_LOG" 2>/dev/null || true
   if [[ "$rc" != 0 ]]; then
@@ -1704,9 +1570,12 @@ collect_runtime_release_bg() { # <sha>
 # EXIT 清理用:父 shell 提前失败时,等后台段自然结束(它自己的失败路径会清 staging),再回放日志。
 reap_runtime_release_bg() {
   [[ -n "${RUNTIME_BG_PID:-}" ]] || return 0
-  echo "  等待后台 runtime release 构建收尾(pid=$RUNTIME_BG_PID)…" >&2
-  wait "$RUNTIME_BG_PID" 2>/dev/null || true
+  if [[ -z "${RUNTIME_BG_RC:-}" ]]; then
+    echo "  等待后台 runtime release 构建收尾(pid=$RUNTIME_BG_PID)…" >&2
+    wait "$RUNTIME_BG_PID" 2>/dev/null || true
+  fi
   RUNTIME_BG_PID=""
+  RUNTIME_BG_RC=""
   [[ -n "${RUNTIME_BG_LOG:-}" ]] && cat "$RUNTIME_BG_LOG" >&2 2>/dev/null || true
   rm -f "${RUNTIME_BG_LOG:-}" "${RUNTIME_BG_RESULT:-}"
 }
@@ -2017,6 +1886,7 @@ user_contract_gate() { # <candidate release>
   local password_file=/etc/openclaude/selfhost-canary.password
   [[ -f "$password_file" && -r "$password_file" && -s "$password_file" ]] \
     || { echo "FATAL: user contract canary password missing/unreadable/empty: $password_file" >&2; return 1; }
+  tsum_mark F.prewarm 2>/dev/null || :
   # OCV5-429: the cutover may recycle the canary container onto the new runtime tuple (or it was
   # idle-swept); its cold start outlasts C2's 20s window. Warm it first (same UI login, no message,
   # wait for relay_ready). Not part of the verdict: a prewarm that never gets ready only warns.
@@ -2025,10 +1895,12 @@ user_contract_gate() { # <candidate release>
     V5_CANARY_PASSWORD_FILE="$password_file" \
     node "$SCRIPT_DIR/v5-user-contract-prewarm.mjs" \
     || echo "  ⚠ canary 预热未就绪,门禁照跑(由 C1–C3 判定)" >&2
+  tsum_mark F.C1-C3 2>/dev/null || :
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
     V5_CANARY_EMAIL="${V5_CANARY_EMAIL:-v5-selfhost-canary@claudeai.chat}" \
     V5_CANARY_PASSWORD_FILE="$password_file" V5_CONTRACT_COST=live \
     node "$SCRIPT_DIR/v5-user-contract-smoke.mjs" || return 1
+  tsum_mark F.G1 2>/dev/null || :
   # OCV5-432: a real multi-turn OpenCode Go chat must read the upstream prompt cache
   # (INC-20261015-GO-CACHE-PREFIX wrote the whole prompt every request and read 0).
   if [[ -n "$rel" ]] && go_cache_user_waiver_matches "$rel"; then
@@ -2039,6 +1911,7 @@ user_contract_gate() { # <candidate release>
       V5_CANARY_PASSWORD_FILE="$password_file" \
       node "$SCRIPT_DIR/v5-go-cache-contract.mjs" || return 1
   fi
+  tsum_mark F.S1 2>/dev/null || :
   # OCV5-435: a Stop sent while the turn's engine is still starting must stop that turn
   # (INC-20261015-PRESTART-STOP-LOST answered it TURN_NOT_ACTIVE and the turn ran unseen).
   V5_E2E_BASE="http://127.0.0.1:${V5_PORT}" \
@@ -2166,6 +2039,8 @@ cmd_status() {
   log "  gate-fail:   policy=$(gate_fail_policy 2>/dev/null) survivor-phase=$(sed -n 's/^phase=//p' "${SURVIVOR_STATE:-/run/openclaude-v5-selfhost/cutover-survivor.state}" 2>/dev/null | head -n1 || true) maint=$(sed -n 's/^until=//p' "$V5_WATCH_MAINT" 2>/dev/null | head -n1 || true)"
   if [[ -f "$V5_ENV" ]]; then
     log "  OC_SESSIONS_STORE=$(oc_hotcfg_env_get "$V5_ENV" OC_SESSIONS_STORE)"
+    log "  env keys:    $(bash "$SCRIPT_DIR/v5-selfhost-env-drift.sh" --env "$V5_ENV" --quiet \
+      --template "$REPO_ROOT/deploy/v5-selfhost/commercial-v5-selfhost.env.template" 2>&1 | tail -n1 || true)"
   fi
   log "  personal:     $(status_unit_state "$PERSONAL_UNIT" n/a)"
   if docker network inspect openclaude-v5-net >/dev/null 2>&1; then
@@ -2258,6 +2133,7 @@ cmd_deploy() {
     log "✓ same-operation policy recovery verified; no serving pointer changed"
     return 0
   fi
+  tsum_init 2>/dev/null || :
   log "══ v5 selfhost --deploy(不可变 master + 容器制品 + joint 翻转) ══"
   log "流程: 构建 master release(staging vite) → runtime-release → platform bundle"
   log "      → 复用 --cutover 同一套状态机翻转(survivor / 两级回滚 / 候选 snapshot unit)"
@@ -2281,7 +2157,7 @@ $dirty
     fi
     log "$dirty"
   fi
-  sha="$(source_commit)"
+  sha="$(source_commit)"; selfhost_release_preflight "${LEASE_TARGET_SHA:-$sha}"  # OCV5-581 L0,只读
   local policy_bind_rc=0
   release_policy_bind_official_train_request "$sha" || policy_bind_rc=$?
   [[ "$policy_bind_rc" == 0 ]] || exit "$policy_bind_rc"
@@ -2298,6 +2174,7 @@ $dirty
   install_aux_units
   refresh_ccb_proxy_path
   ensure_model_authority
+  assert_env_key_drift
   if [[ "${LEASE_TRAIN_ACTIVE:-0}" != 1 ]]; then
     sha="$(source_commit)"
     lease_train_begin "$sha"
@@ -2312,7 +2189,9 @@ $dirty
     [[ -f "$BUILT_MASTER_RELEASE/.complete" ]] || die "缺 .complete: $BUILT_MASTER_RELEASE"
     log "  ✓ master release=$BUILT_MASTER_RELEASE donor 优先 live,不吃工作树/.poisoned"
   fi
+  tsum_mark P.runtime-wait 2>/dev/null || :
   collect_runtime_release_bg "$sha"
+  tsum_mark P.platform-bundle 2>/dev/null || :
   build_platform_bundle "$sha"
   CUTOVER_TUPLE_BUNDLE="$OC_HOTCFG_PLATFORM_ROOT/bundles/$BUILT_BUNDLE_REV"
   DEPLOY_BUILT_RELEASE="$BUILT_MASTER_RELEASE"
@@ -2531,6 +2410,7 @@ cutover_rollback_inplace() { # <failed-rel> <backup-dir>
 
 cutover_compensate() { # <reason>
   local reason="$1" policy_rc=0
+  tsum_mark X.compensate 2>/dev/null || :
   if release_policy_enabled; then
     release_policy_failure "$reason" || policy_rc=$?
     case "$policy_rc" in
@@ -2906,6 +2786,11 @@ SQL
 # Only an internally built, from-head invocation owns a pinned expected source.
 # Legacy worktree-platform deploy and standalone cutover keep their current-HEAD gate.
 cutover_expected_source_commit() {
+  if [[ "${CUTOVER_ROLLBACK:-0}" == 1 ]]; then
+    [[ "${ROLLBACK_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || die "回退缺已验证的目标 sourceCommit,拒绝切流"
+    printf "%s\n" "$ROLLBACK_SHA"
+    return 0
+  fi
   if [[ -n "${DEPLOY_BUILT_RELEASE:-}" && "${PLATFORM_FROM_HEAD:-0}" == 1 ]]; then
     [[ "${DEPLOY_BUILT_SOURCE_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]] \
       || die "本次构建缺已验证 sourceCommit,拒绝切流"
@@ -2950,6 +2835,7 @@ cmd_cutover() {
   fi
   CUTOVER_REL="$rel"
   cutover_clog "STEP $step 候选 release=$rel"
+  tsum_mark E1 2>/dev/null || :
   cutover_clog "  跑静态门 + digest 复算 + tsx 自检(只读,dry-run 也跑)"
   assert_master_release_static_gate "$rel" "$head"
   assert_master_release_tsx_selfcheck "$rel"
@@ -2973,8 +2859,16 @@ cmd_cutover() {
   fi
 
   step=3
+  tsum_mark E2 2>/dev/null || :
+  if [[ "${CUTOVER_ROLLBACK:-0}" == 1 ]]; then
+    cutover_clog "STEP $step 回退 schema 门(只读;回退不跑迁移、不回滚 schema)"
+    rollback_schema_gate "$rel" "$(readlink -f -- "$MASTER_LIVE_LINK")" \
+      || die "回退 schema 门不通过。尚未改任何东西。"
+    CUTOVER_HAS_MIGRATION=0
+  else
   cutover_clog "STEP $step 迁移门(DB 缺口权威;git diff fail-closed;不用工作树 .complete)"
   gate_cutover_migrations "$rel"
+  fi
   if [[ "$CUTOVER_HAS_MIGRATION" == 1 ]]; then
     cutover_clog "  HAS_MIGRATION=1 → apply 与翻转必须同一把锁、同一窗口"
     if [[ "$DRY" == 1 ]]; then
@@ -2994,6 +2888,7 @@ cmd_cutover() {
     prev_val="none"
   fi
 
+  tsum_mark E3.prep 2>/dev/null || :
   if release_policy_enabled && [[ "$DRY" != 1 ]]; then
     [[ "${CUTOVER_JOINT:-0}" == 1 && "$prev_val" != none ]] || return 2
     release_policy_install_guards "$rel" "$prev_val" || return $?
@@ -3021,6 +2916,7 @@ cmd_cutover() {
       || die "写 .prev-release 失败。尚未覆盖 unit。"
     cutover_clog "  .prev-release=$prev_val"
   fi
+  tsum_mark E3.wait-idle 2>/dev/null || :
   cutover_wait_for_user_idle || return 1
   # 第一次覆盖 installed unit 之前:明确 phase/mutated,并武装 survivor。
   if [[ "$DRY" != 1 ]]; then
@@ -3035,6 +2931,7 @@ cmd_cutover() {
   fi
 
   step=5
+  tsum_mark E3.units 2>/dev/null || :
   cutover_clog "STEP $step 从候选 snapshot 装 live unit + daemon-reload"
   if [[ "$DRY" == 1 ]]; then
     cutover_clog "  [dry-run] install $unit_snap/$V5_UNIT → /etc/systemd/system/$V5_UNIT"
@@ -3094,6 +2991,7 @@ cmd_cutover() {
       cutover_clog "  [dry-run] 对着 $rel 跑 migration runner(失败则不翻转,不回滚 schema)"
     else
       release_policy_guard_owner || return 86
+      tsum_mark E2.apply 2>/dev/null || :
       if ! run_migrations_from_release "$rel"; then
         cutover_compensate "migration-apply"
         return $?
@@ -3103,6 +3001,7 @@ cmd_cutover() {
   fi
 
   step=7
+  tsum_mark E4 2>/dev/null || :
   cutover_clog "STEP $step 原子挂 live symlink $MASTER_LIVE_LINK → $rel"
   if [[ "$DRY" == 1 ]]; then
     cutover_clog "  [dry-run] ln -s $rel ${MASTER_LIVE_LINK}.newlink.\$\$ && mv -T ${MASTER_LIVE_LINK}.newlink.\$\$ $MASTER_LIVE_LINK"
@@ -3178,6 +3077,7 @@ cmd_cutover() {
   fi
 
   step=10
+  tsum_mark G 2>/dev/null || :
   cutover_clog "STEP $step 失败则走统一补偿(本步仅在失败路径执行)"
   if [[ "$DRY" == 1 ]]; then
     cutover_clog "  [dry-run] 覆盖 unit 前: 武装独立 systemd-run survivor + 先落盘 phase=mutated"
@@ -3238,6 +3138,7 @@ case "$MODE" in
   deploy) cmd_deploy ;;
   build-master-only) cmd_build_master_only ;;
   cutover) cmd_cutover ;;
+  rollback) cmd_rollback ;;
   smoke) cmd_smoke ;;
   status) cmd_status ;;
   p0-web) cmd_p0_web ;;

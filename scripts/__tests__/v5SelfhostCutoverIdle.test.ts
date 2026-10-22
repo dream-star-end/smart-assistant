@@ -184,6 +184,7 @@ test('an early claimed train keeps its exact source when shared HEAD advances du
 sha=${a}; LEASE_TRAIN_ACTIVE=${active}; BUILT_MASTER_RELEASE=fixture
 source_commit() { echo ${b}; }
 ensure_model_authority() { :; }
+assert_env_key_drift() { :; }
 lease_train_begin() { echo "CLAIM:$1"; }
 assert_fix_trailers() { :; }
 assert_p0_web_overlay_contained() { :; }

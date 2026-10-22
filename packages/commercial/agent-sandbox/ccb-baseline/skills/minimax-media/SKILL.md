@@ -6,6 +6,10 @@ priority: 4
 
 # MiniMax media in OpenClaude commercial
 
+Video goes to Muse first: try `oc-muse video` (see `oc-muse --help`). If it reports
+`MUSE_NOT_ENABLED` or `MUSE_BRIDGE_OFFLINE`, tell the user Muse is unavailable, then
+fall back to the commands below.
+
 For ordinary video requests, use `oc-h3` or `oc-video`. For images, speech, music,
 lyrics, or an explicitly requested Hailuo/MMX cloud video, use the built-in `mmx`
 command. These platform commands keep credentials outside the Agent container.

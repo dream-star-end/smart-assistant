@@ -30,8 +30,10 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { provePendingUser } from "./lib/boxPendingUserProof.js";
+import { proveEmptyRecoveryCliResult, proveReadPdfDocument } from "./lib/boxReadPdfProof.js"; // OCV5-571 (file-size ratchet): [ocv5-571-read-pdf-document] PASS — a PDF Read result with its document block runs fresh with the PDF inside its result, never 409 · [ocv5-571-empty-recovery-cli-result] PASS — an empty recovery whose CLI result event repeats the session usage keeps the short budget of three
 import { proveRefusedRecoveryClosed as refusedRecoveryProof } from "./lib/boxRefusedRecoveryProof.js";
 import { misrecordedRun, proveCliRepairedToolInput, proveForeignToolHistory, rereadError } from "./lib/boxCliRepairProof.js";
+import { scaledMs } from "./lib/gateLoadScale.js";
 const LIMIT_MS = 120_000;
 const CANDIDATE = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
 const PROXY = join(CANDIDATE, "packages/commercial/src/http/proxy");
@@ -685,6 +687,13 @@ const isRunner = (args: string[]) => args[0] === "-I" && args[1] === "-c"
   && args[2]?.includes("sys.argv=[p,*argv]") === true
   && args[3]?.startsWith("/tmp/ocv5-289-v2-detached-runner-") === true;
 const tick = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+/** `work`, or "still-running" after `ms`; the timer is cleared either way (OCV5-557: these bounds are 20 s+). */
+async function within<T>(work: Promise<T>, ms: number): Promise<T | "still-running"> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([work, new Promise<"still-running">((resolve) => { timer = setTimeout(() => resolve("still-running"), ms); })]);
+  } finally { clearTimeout(timer); }
+}
 /** The awaited product call must succeed; its failure is named after the proof step. */
 const must = <T>(label: string, pending: Promise<T>): Promise<T> => pending.catch((error: unknown) =>
   fail(`${label}_${String((error as { code?: unknown }).code ?? (error as Error).message ?? "THREW")}`));
@@ -1897,8 +1906,17 @@ async function egressInternalRoutes(api: Api, journal: Journal, who: { uid: bigi
   process.env.OPENCLAUDE_V3_CONTAINER_TOKEN = "oc-v3.proof-token";
   process.env.OC_BOX_IDLE_PROOF_WAIT_MS = "0";
   return { calls,
-    /** Every request received so far has been answered. */
-    settled: async () => { await tick(50); await idle; },
+    /** Every request received so far has been answered. With `until`, first wait (bounded) for that path to
+     * arrive: the adapter sends it asynchronously, and at load 40 it was not there after 50 ms (OCV5-557).
+     * Then wait 500 ms more, ten times the old window, so a second one is still counted. */
+    settled: async (until?: string) => {
+      if (until) {
+        const end = Date.now() + scaledMs(10_000);
+        while (!calls.includes(until) && Date.now() < end) await tick(25);
+        await tick(scaledMs(500));
+      } else await tick(50);
+      await idle;
+    },
     close: async () => {
       keys.forEach((key, i) => { if (before[i] === undefined) delete process.env[key]; else process.env[key] = before[i]; });
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -1982,7 +2000,7 @@ async function proveRejectBlocksNextMessage(api: Api, db: Db): Promise<string> {
     await ccbTurn.submitted;
     runner.emit("message", { type: "result", subtype: "success", is_error: true, result: `API Error: 409 ${wire}` });
     if ((await ccbTurn.summary)?.isError !== true) fail("REJECT_TURN_NOT_ENDED");
-    await routes.settled();
+    await routes.settled("/internal/box/stop");
     if (routes.calls.filter((path) => path === "/internal/box/stop").length !== 1) {
       fail(`REJECT_PARKED_TURN_NOT_STOPPED_${routes.calls.join(",")}`);
     }
@@ -2003,7 +2021,7 @@ async function proveRejectBlocksNextMessage(api: Api, db: Db): Promise<string> {
     runner.emit("message", { type: "result", subtype: "success", is_error: true, result:
       'API Error: 409 {"error":{"code":"BOX_REPLAY_PENDING","message":"previous Box call still resolving"},"request_id":"x"}' });
     await otherTurn.summary;
-    await routes.settled();
+    await routes.settled("/internal/box/stop");
     if (routes.calls.filter((path) => path === "/internal/box/stop").length !== 1) fail("REJECT_TRANSIENT_STOPPED");
   } finally {
     await routes.close();
@@ -2054,7 +2072,7 @@ async function proveConfigChangedBlocksNextMessage(api: Api, db: Db): Promise<st
     await ccbTurn.submitted;
     runner.emit("message", { type: "result", subtype: "success", is_error: true, result: `API Error: 409 ${wire}` });
     if ((await ccbTurn.summary)?.isError !== true) fail("CONFIG_TURN_NOT_ENDED");
-    await routes.settled();
+    await routes.settled("/internal/box/stop");
     if (routes.calls.filter((path) => path === "/internal/box/stop").length !== 1) {
       fail(`CONFIG_PARKED_TURN_NOT_STOPPED_${routes.calls.join(",")}`);
     }
@@ -2360,17 +2378,16 @@ async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<
     // INC-20261003-BOX-ANSWERED-EXCHANGE-PROMPT, second half: each automatic 「从断点继续」 failed within a second
     // with the same Box 409 and recorded nothing but Claude Code's own API Error row; the master took every one
     // for a new chance and sent ten in twenty seconds. Such an empty repeat has the short budget of three.
-    const empty = (attempt: number) => finalized(`empty-recovery-${attempt}`, { tools: [], errorCode: "ENGINE_ERROR",
+    const empty = (attempt: number, name = "empty-recovery", payload: unknown = { type: "result", is_error: true, num_turns: 1 }) => finalized(`${name}-${attempt}`, { tools: [], errorCode: "ENGINE_ERROR",
       recoveryAttempt: attempt, outputTokens: 0, text: 'API Error: 409 {"error":{"code":"BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION"}}',
-      runtimeEvents: [{ ordinal: 1, observedAt: 1_783_950_170_100, source: "ccb",
-        payload: { type: "result", is_error: true, num_turns: 1 } }] });
+      runtimeEvents: [{ ordinal: 1, observedAt: 1_783_950_170_100, source: "ccb", payload }] }); // OCV5-571: the CLI result event varies
     // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
     const retried = await empty(2), stopped = await empty(3);
     if (!isDeepStrictEqual(retried.jobs.map((job) => job.split("#")[1]), ["3"]) || stopped.jobs.length !== 0) {
       fail(`ANSWERED_EMPTY_RECOVERY_BUDGET_${retried.jobs.join(",")}_${stopped.jobs.join(",")}`);
     }
     return ["[ocv5-317-settled-tools-auto-resume] PASS — a model failure after settled tools schedules the automatic checkpoint continuation",
-      "[ocv5-321-leftover-tool-frames] PASS — settled tools whose live frames are still present pair by id and the checkpoint continuation is scheduled"];
+      "[ocv5-321-leftover-tool-frames] PASS — settled tools whose live frames are still present pair by id and the checkpoint continuation is scheduled", await proveEmptyRecoveryCliResult(empty)];
   });
 }
 
@@ -2502,9 +2519,11 @@ function boxCliBridge(api: Api, box: Awaited<ReturnType<typeof boxCliBox>>, tag:
 const textOf = (line: string): string => (JSON.parse(line) as { message: { content: string } }).message.content;
 const lineHash = (line: string) => createHash("sha256").update(textOf(line)).digest("hex");
 
-/** The stop script has killed the box Claude; on a loaded host its /proc entry can outlive the kill by a moment. */
+/** The stop script has killed the box Claude; on a loaded host its /proc entry can outlive the kill by a moment
+ * (OCV5-557: more than the old 2 s at load 40). Polled until a deadline, not for a fixed count. */
 async function gone(readers: () => number[]): Promise<boolean> {
-  for (let i = 0; i < 80 && readers().length !== 0; i++) await tick(25);
+  const end = Date.now() + scaledMs(15_000);
+  while (readers().length !== 0 && Date.now() < end) await tick(25);
   return readers().length === 0;
 }
 
@@ -2558,7 +2577,7 @@ async function proveBoxCliFollowUpTurn(api: Api): Promise<string> {
   }
   // the gateway retires the process: shutdown, model switch, idle recycle
   stdin.end();
-  const code = await Promise.race([bridge, tick(5_000).then(() => "still-running" as const)]);
+  const code = await within(bridge, scaledMs(20_000));
   if (code !== 0) fail(`FOLLOWUP_STDIN_CLOSE_${code}`);
   if (!await gone(readers)) fail("FOLLOWUP_BOX_CLAUDE_LEFT_RUNNING");
   return "[ocv5-315-box-cli-follow-up-turn] PASS — a follow-up turn reaches the same box Claude and closing stdin ends it";
@@ -2590,7 +2609,7 @@ async function proveBoxCliLargeLine(api: Api): Promise<string> {
     fail(`LARGE_LINE_NOT_WHOLE_${got.map((item) => item.bytes).join("+")}_OF_${sent.map((item) => Buffer.byteLength(textOf(item))).join("+")}`);
   }
   stdin.end();
-  const code = await Promise.race([bridge, tick(5_000).then(() => "still-running" as const)]);
+  const code = await within(bridge, scaledMs(20_000));
   if (code !== 0 || !await gone(box.readers)) fail(`LARGE_LINE_CLOSE_${code}`);
 
   // the Box does not complete a write: the bridge reports it and ends, instead of waiting for an answer
@@ -3441,7 +3460,7 @@ async function proveContainerRebuiltStopsParkedTurn(api: Api, db: Db): Promise<s
  * success recovery then delivers its answer, which a stop would throw away. */
 async function proveAnyRefusalStopsParkedTurn(api: Api, db: Db): Promise<string[]> {
   const journal = api.journal(db);
-  const endTurn = async (uid: bigint, label: string, status: number, code: string, message: string) => {
+  const endTurn = async (uid: bigint, label: string, status: number, code: string, message: string, stopExpected: boolean) => {
     const who = { uid, containerId: uid - 900_000_000n, sessionId: `session-${label}` };
     const turnKey = createHash("sha256").update(label).digest("hex");
     await db.query("INSERT INTO users(id,email,password_hash,credits) VALUES ($1,$2,'unused',10000)",
@@ -3461,7 +3480,7 @@ async function proveAnyRefusalStopsParkedTurn(api: Api, db: Db): Promise<string[
       await ccbTurn.submitted;
       runner.emit("message", { type: "result", subtype: "success", is_error: true, result: `API Error: ${status} ${wire}` });
       if ((await ccbTurn.summary)?.isError !== true) fail(`REFUSAL_${label}_TURN_NOT_ENDED`);
-      await routes.settled();
+      await routes.settled(stopExpected ? "/internal/box/stop" : undefined);
       return { calls: routes.calls.filter((path) => path === "/internal/box/stop").length,
         stops: turn.host.count.stop, state: String((await journalRow(db, `box-${label}-1`))?.ctx.boxState) };
     } finally {
@@ -3469,12 +3488,12 @@ async function proveAnyRefusalStopsParkedTurn(api: Api, db: Db): Promise<string[
     }
   };
   // not one of the codes the exact list knew
-  const refused = await endTurn(900_000_494n, "refused-400", 400, "BOX_REQUEST_UNSUPPORTED", "request shape not supported");
+  const refused = await endTurn(900_000_494n, "refused-400", 400, "BOX_REQUEST_UNSUPPORTED", "request shape not supported", true);
   if (refused.calls !== 1 || refused.stops !== 1 || refused.state !== "failed_stopped") {
     fail(`REFUSAL_NOT_STOPPED_${refused.calls}_${refused.stops}_${refused.state}`);
   }
   const transient = await endTurn(900_000_495n, "transient-503", 503, "BOX_REPLAY_UNAVAILABLE",
-    "previous Box response unavailable");
+    "previous Box response unavailable", false);
   if (transient.calls !== 0 || transient.stops !== 0 || transient.state !== "handoff") {
     fail(`REFUSAL_5XX_STOPPED_${transient.calls}_${transient.stops}_${transient.state}`);
   }
@@ -3487,7 +3506,7 @@ async function proveAnyRefusalStopsParkedTurn(api: Api, db: Db): Promise<string[
     fail("REPLAY_REJECTION_NOT_CLASSIFIED");
   }
   const replayRejected = await endTurn(900_000_509n, "replay-rejected-409", 409, "BOX_REPLAY_REJECTED",
-    "previous Box response was rejected");
+    "previous Box response was rejected", true);
   if (replayRejected.calls !== 1 || replayRejected.stops !== 1 || replayRejected.state !== "failed_stopped") {
     fail(`REPLAY_REJECTED_NOT_STOPPED_${replayRejected.calls}_${replayRejected.stops}_${replayRejected.state}`);
   }
@@ -3612,9 +3631,10 @@ async function main(): Promise<void> {
   const expectSha = parseArgs(process.argv);
   const deadline = setTimeout(() => {
     console.error("[box-incident-proofs] deadline exceeded");
+    console.error("[gate-failure] [box-incident-proofs] deadline exceeded");
     // still drop what this run created, bounded, before failing
     void Promise.race([cleanUp().catch(() => {}), tick(8_000)]).then(() => process.exit(1));
-  }, LIMIT_MS);
+  }, scaledMs(LIMIT_MS));
   const database = await testDatabase();
   // the gateway keeps its durable session state under OPENCLAUDE_HOME, read when its modules load
   const home = mkdtempSync(join(tmpdir(), "ocv5-308-home-"));
@@ -3632,7 +3652,7 @@ async function main(): Promise<void> {
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
       await proveRejectBlocksNextMessage(api, db), await proveConfigChangedBlocksNextMessage(api, db),
       await proveIdleNoSummary(api, db),
-      await proveAnsweredExchangePrompt(api, db), await proveWaitingHandoffSuperseded(api, db), await proveResumeUnsentParked(api, db),
+      await proveAnsweredExchangePrompt(api, db), await proveReadPdfDocument({ api, db, boxTurn, prechecked, journalRow, must, spoolOf, cliInit, FINAL_ANSWER }), await proveWaitingHandoffSuperseded(api, db), await proveResumeUnsentParked(api, db),
       await proveUnknownNeverClosed(api, db), await proveNativeResumedStop(api, db),
       await proveProcessAbsentReleased(api, db), await proveIdleProofStopsParkedTurn(api, db),
       await proveContainerRebuiltStopsParkedTurn(api, db), ...await proveAnyRefusalStopsParkedTurn(api, db)]),
@@ -3642,7 +3662,13 @@ async function main(): Promise<void> {
   process.stdout.write(`${JSON.stringify({ ok: true, expectSha, candidate: CANDIDATE, proofs })}\n`);
 }
 main().catch(async (error: unknown) => {
-  console.error(error instanceof Error ? error.message : String(error));
-  await Promise.race([cleanUp().catch((failure: unknown) => console.error(String(failure))), tick(8_000)]);
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(message);
+  // OCV5-557: the release retries a known flake only when every [gate-failure] line is one
+  console.error(`[gate-failure] ${message.split("\n")[0]}`);
+  await Promise.race([cleanUp().catch((failure: unknown) => {
+    console.error(String(failure));
+    console.error(`[gate-failure] cleanup ${String(failure).split("\n")[0]}`);
+  }), tick(8_000)]);
   process.exit(1);
 });

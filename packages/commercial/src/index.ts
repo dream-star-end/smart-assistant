@@ -181,6 +181,7 @@ import { createGeminiPoolAdapter } from "./account-pool/geminiPoolAdapter.js";
 import { registerPoolAdapter, startPoolRecoveryActor } from "./account-pool/policy/registry.js";
 import { configureAffinitySettings } from "./account-pool/policy/affinity.js";
 import { getSystemSetting } from "./admin/systemSettings.js";
+import { startLogLevelSyncPoller } from "./logging/logLevelSync.js";
 import { startCursorAuthSyncActor } from "./account-pool/cursorMaterializer.js";
 import { startCursorSandPreparationActor } from "./account-pool/cursorSandActor.js";
 import { startCursorUsageSweeper } from "./account-pool/cursorUsageSweeper.js";
@@ -251,6 +252,7 @@ import {
   startMarketplaceAiReviewScheduler,
   type MarketplaceAiReviewSchedulerHandle,
 } from "./marketplace/aiReview.js";
+import { startTutorialModerationScheduler } from "./tutorials/tutorialModeration.js";
 import {
   startProviderHealthScheduler,
   type ProviderHealthSchedulerHandle,
@@ -639,6 +641,9 @@ import {
   makeMiniMaxMediaHandler,
   type MiniMaxMediaHandler,
 } from "./minimax/mediaProxy.js";
+import { createMuseFromConfig } from "./muse/assemble.js";
+import { makeMuseInternalHandler } from "./muse/internalHttp.js";
+import { MUSE_INTERNAL_PREFIX } from "./muse/protocol.js";
 import {
   MINIMAX_WEB_SEARCH_PATH,
   makeMiniMaxWebSearchHandler,
@@ -1406,6 +1411,10 @@ export async function registerCommercial(
     );
   }
 
+  // 第三阶段 P1(OCV5-559):日志级别热改。system_settings.log_level 驱动 gateway / 商用版的共享级别
+  // (kernel registerLevelRef);启动立即应用、admin PUT 立即应用、每 5 秒轮询收敛。纯进程内(只读一行)→ local。
+  const logLevelSync = trackScheduler("logLevelSync", "local", startLogLevelSyncPoller({ read: async () => (await getSystemSetting("log_level")).value }));
+
   // ── P2:master 会话权威 backend 选择(RFC-v5-sessions-pg D1 启动矩阵)────────────
   // 放在 config 加载 + auto-migrate(0134 表须先在)之后、一切 schedulers/backend 消费之前。
   // channel=v5 = master 形态(容器内 gateway / 个人版不加载 commercial → 天然 SQLite,零变化)。
@@ -2036,6 +2045,8 @@ export async function registerCommercial(
       start: () => mediaGenerationService.start(),
     });
   }
+  // OCV5-561 Muse media bridge (selfhost). Off unless OC_MUSE_BRIDGE_ENABLED=1; see muse/assemble.ts.
+  const { hub: museHub, bridgeHttp: museBridgeHttp, closePublic: closeMusePublic } = await createMuseFromConfig(cfg, getPool());
   const goalBroadcastRef: { current: (uid: bigint, payload: unknown) => void } = {
     current: () => { /* bridge not assembled yet */ },
   };
@@ -2432,6 +2443,8 @@ export async function registerCommercial(
       });
       const mediaGenerationInternalHandler: MediaGenerationInternalHandler =
         makeMediaGenerationInternalHandler({ identityRepo, service: mediaGenerationService });
+      // /internal/v3/muse-media — oc-muse (OCV5-561). 403 MUSE_NOT_ENABLED when off or not allowlisted.
+      const museInternalHandler = makeMuseInternalHandler({ identityRepo, hub: museHub });
       // /internal/v3/minimax-search — 容器内 CCB 内置 WebSearch(MiniMaxSearchAdapter)回源 master。
       // key(MINIMAX_TOKEN_PLAN_KEY)只在 master,不注入容器;同款 verifyContainerIdentity 双因子。
       // MiniMax coding_plan/search 中文深度强,替代脆弱的 Bing HTML 刮页(Bing Search API 已退役)。
@@ -2443,7 +2456,7 @@ export async function registerCommercial(
       const grokWebSearchHandler: GrokWebSearchHandler = makeGrokWebSearchHandler({
         identityRepo,
       });
-      // /internal/v3/grok-vision — 识图后端(understand_image / oc-vision / oc-figcheck)。
+      // /internal/v3/grok-vision — 识图后端(oc-figcheck)。
       // 容器只交图片和问题;master 借一个 Grok 账号调 Grok 4.7,并按 grok-build 目录价
       // 走 预扣 → journal → 结算(用量取上游响应)。订阅 token 和计费请求号都不出 master。
       const grokVisionHandler: GrokVisionHandler = makeGrokVisionHandler({
@@ -2972,6 +2985,9 @@ export async function registerCommercial(
           path.startsWith(`${MEDIA_GENERATION_INTERNAL_PREFIX}/`)
         ) {
           return mediaGenerationInternalHandler(req, res, ctx);
+        }
+        if (path === MUSE_INTERNAL_PREFIX || path.startsWith(`${MUSE_INTERNAL_PREFIX}/`)) {
+          return museInternalHandler(req, res, ctx);
         }
         if (path === MINIMAX_WEB_SEARCH_PATH) {
           return minimaxWebSearchHandler(req, res, ctx);
@@ -4426,6 +4442,7 @@ export async function registerCommercial(
   const handler = createCommercialHandler({
     jwtSecret,
     mediaGeneration: mediaGenerationService,
+    museBridgeHttp,
     goalStateService,
     containerPreviewTickets,
     containerPreviewAvailable: () => containerPreviewBridge !== undefined,
@@ -5351,8 +5368,8 @@ export async function registerCommercial(
         ]);
         return pickWechatInboundModel({
           preferredModel: prefs.prefs.default_model,
-          visibleModels: pricing.listForUser(authz),
-          canUseModel: (modelId) => canUseModel({ pricing }, { ...authz, modelId }),
+          visibleModels: pricing.listForUser({ uid, ...authz }),
+          canUseModel: (modelId) => canUseModel({ pricing }, { uid, ...authz, modelId }),
           allowedModels: ALLOWED_INBOUND_MODELS,
         });
       },
@@ -5402,9 +5419,9 @@ export async function registerCommercial(
           text,
           channelName: "QQ",
           preferredModel: prefs.prefs.default_model,
-          visibleModels: pricing.listForUser(authz),
+          visibleModels: pricing.listForUser({ uid, ...authz }),
           canUseModel: (modelId) =>
-            canUseModel({ pricing }, { ...authz, modelId }),
+            canUseModel({ pricing }, { uid, ...authz, modelId }),
           allowedModels: ALLOWED_INBOUND_MODELS,
           setDefaultModel: async (modelId) => {
             await patchPreferences(uid, { default_model: modelId });
@@ -5491,9 +5508,9 @@ export async function registerCommercial(
 
         return pickWechatInboundModel({
           preferredModel: prefs.prefs.default_model,
-          visibleModels: pricing.listForUser(authz),
+          visibleModels: pricing.listForUser({ uid, ...authz }),
           canUseModel: (modelId) =>
-            canUseModel({ pricing }, { ...authz, modelId }),
+            canUseModel({ pricing }, { uid, ...authz, modelId }),
           allowedModels: ALLOWED_INBOUND_MODELS,
         });
       },
@@ -5566,9 +5583,9 @@ export async function registerCommercial(
           return await handleWechatModelCommand({
             text: evt.text,
             preferredModel: prefs.prefs.default_model,
-            visibleModels: pricing.listForUser(authz),
+            visibleModels: pricing.listForUser({ uid, ...authz }),
             canUseModel: (modelId) =>
-              canUseModel({ pricing }, { ...authz, modelId }),
+              canUseModel({ pricing }, { uid, ...authz, modelId }),
             allowedModels: ALLOWED_INBOUND_MODELS,
             setDefaultModel: async (modelId) => {
               await patchPreferences(uid, { default_model: modelId });
@@ -5964,7 +5981,7 @@ export async function registerCommercial(
       const { canUseModel } = await import("./billing/authzModels.js");
       const authz = await loadUserModelAuthz(uid);
       return (modelId: string) =>
-        canUseModel({ pricing }, { ...authz, modelId });
+        canUseModel({ pricing }, { uid, ...authz, modelId });
     },
     // P0 计费旁路封堵 —— bridge 可信模型推导的 agent 权威(seed 声明 / 常量 +
     // marketplace 预设/已装 manifest,详见 ws/agentModelAuthority.ts 头注)。
@@ -6877,6 +6894,7 @@ export async function registerCommercial(
     });
   }
 
+  if (runtimeChannel === "v5") trackScheduler("tutorialModeration", "v5-owned", startTutorialModerationScheduler({ apiKey: cfg.OPENCODE_GO_API_KEY, logger: rootLogger })); // OCV5-577 经验分享 AI 审核;off 缺省只把残留作业转人工;停机中断的作业由 lease 过期重领
   // 市场发布 AI 自动审批 worker(deepseek-v4-flash via OpenCode Go)。仅 v5 启动:marketplace 表 v3/v5 共享
   // 无 channel 列,但 v3 跑旧代码不写 ai_review_state → 恒 NULL → 永不被 claim,故 v3 保持
   // 纯人审、零行为变更。domain 'v5-owned'(v5 合法后台职责;写共享 marketplace 表但由
@@ -7206,6 +7224,7 @@ export async function registerCommercial(
       const cgpServer = chatgptProxyServer;
       chatgptProxyServer = undefined;
       try { await cgpServer?.close(); } catch { /* ignore */ }
+      try { await closeMusePublic?.(); } catch { /* ignore */ }
       try { await directPreview?.shutdown(); } catch { /* ignore */ }
       try { await previewBridge?.shutdown(); } catch { /* ignore */ }
       try { await voiceTranscribeHandler.shutdown(); } catch { /* ignore */ }
@@ -7266,6 +7285,7 @@ export async function registerCommercial(
       if (accountSlotReaper) {
         try { accountSlotReaper.stop(); } catch { /* ignore */ }
       }
+      try { logLevelSync.stop(); } catch { /* ignore */ }
       if (codexDriftReconciler) {
         try { codexDriftReconciler.stop(); } catch { /* ignore */ }
       }

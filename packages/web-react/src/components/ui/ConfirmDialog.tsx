@@ -19,7 +19,7 @@ import { Modal } from "./Modal";
 
 export type ConfirmChoice = boolean | "alt";
 
-type ConfirmOpts = {
+export type ConfirmOpts = {
   title: string;
   body?: ReactNode;
   confirmText?: string;

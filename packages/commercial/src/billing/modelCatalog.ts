@@ -31,6 +31,8 @@ import { createHash } from "node:crypto";
 import { Client } from "pg";
 import { DEFAULT_CCB_SUBAGENT_MODEL, DEFAULT_SECONDARY_UTILITY_MODEL } from "@openclaude/gateway";
 import {
+  isBoxGptWebModel,
+  isBoxGptWebOwnerUid,
   PLATFORM_REASONING_EFFORTS,
   type PlatformReasoningEffort,
 } from "@openclaude/protocol";
@@ -59,7 +61,7 @@ export const CAPABILITY_SCHEMA_VERSION = 1;
 
 /** capability_profile(JSONB)的 v1 形状 —— 与 0143 fn_model_catalog_capability 同源。 */
 export interface ModelCapabilityProfile {
-  /** 上游是否原生支持图像识别。false → master proxy strip 图 + understand_image 工具兜底。 */
+  /** 代理是否剥图:true = 保留图片发给上游;false = master proxy strip 图。不是模型能力的推断。 */
   supportsVision: boolean;
   reasoning: {
     /** 该模型可接受/展示的思考档位;空数组 = 不支持思考深度。 */
@@ -598,7 +600,9 @@ export class ModelCatalogSnapshot {
     const schemaOk =
       entry !== undefined && entry.capabilitySchemaVersion <= CAPABILITY_SCHEMA_VERSION;
     const routable = entry !== undefined && schemaOk && pricing !== undefined;
-    const cursorOk = entry?.engine !== "cursor" || isCursorCredentialMember(scope.uid);
+    const boxGptWebOwnerOk = !isBoxGptWebModel(canonical) || isBoxGptWebOwnerUid(scope.uid);
+    const cursorOk =
+      (entry?.engine !== "cursor" || isCursorCredentialMember(scope.uid)) && boxGptWebOwnerOk;
     // `isCursorCredentialMember(0, "all")` is false (uid 0 is not a valid
     // credential uid). Anonymous is a placeholder identity: after subscribe
     // they get a real uid, and policy `all` accepts every real uid. Advertise
@@ -606,10 +610,11 @@ export class ModelCatalogSnapshot {
     // allow-list that does not contain the uid stays excluded. Execution
     // (`canUseModel` / `listForUser`) stays on strict `cursorOk`.
     const lockedCursorOk =
-      cursorOk ||
-      (entry?.engine === "cursor" &&
-        scope.uid === 0 &&
-        parseCursorCredentialUids(process.env.OC_V5_CURSOR_CREDENTIAL_UIDS) === "all");
+      boxGptWebOwnerOk &&
+      (cursorOk ||
+        (entry?.engine === "cursor" &&
+          scope.uid === 0 &&
+          parseCursorCredentialUids(process.env.OC_V5_CURSOR_CREDENTIAL_UIDS) === "all"));
     const denied = scope.deniedModelIds?.has(canonical) === true;
     const meetsPlan = pricing
       ? meetsMinPlan({
@@ -619,12 +624,13 @@ export class ModelCatalogSnapshot {
           orgPlanCode: scope.orgPlanCode,
         })
       : false;
-    const visible = pricing
-      ? pricing.visibility === "public" ||
-        (pricing.visibility === "admin" &&
-          (scope.role === "admin" || scope.grantedModelIds.has(canonical))) ||
-        (pricing.visibility === "hidden" && scope.grantedModelIds.has(canonical))
-      : false;
+    const visible =
+      pricing && boxGptWebOwnerOk
+        ? pricing.visibility === "public" ||
+          (pricing.visibility === "admin" &&
+            (scope.role === "admin" || scope.grantedModelIds.has(canonical))) ||
+          (pricing.visibility === "hidden" && scope.grantedModelIds.has(canonical))
+        : false;
     return { canonical, pricing, routable, cursorOk, lockedCursorOk, denied, meetsPlan, visible };
   }
 

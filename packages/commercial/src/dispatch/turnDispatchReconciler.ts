@@ -18,33 +18,28 @@ import type { Pool } from 'pg'
 
 import { EVENTS } from '../admin/alertEvents.js'
 import { safeEnqueueAlert } from '../admin/alertOutbox.js'
-import { recordProductFrictionEvent, type ProductFrictionEvent } from '../productFriction/events.js'
 import { isPermanentCodexWaiver, permanentCodexWaiverReason } from '../billing/codexFinalizer.js'
 import {
   GATEWAY_EXITED_AT_CTX_KEY,
   clearGatewayShutdownEvidenceByDispatchIds,
   markGatewayShutdownEvidence,
 } from '../billing/finalizeJournalReconciler.js'
+import { registerProducerFence } from '../db/liveTurnFrames.js'
 import { advanceClientTimelineIdentityInTransaction } from '../db/pgSessionsBackend.js'
 import { closeRefusedRecoveryChains } from '../db/refusedRecoveryCards.js'
+import { type Logger, rootLogger } from '../logging/logger.js'
+import { type ProductFrictionEvent, recordProductFrictionEvent } from '../productFriction/events.js'
 import type { ContainerCallResult, DispatchIdentity } from './containerDispatchClient.js'
 import {
-  classifyVisibleOrphan,
-  HARD_CAP_AGE_MS,
-  firstVisibleAtMsForDispatch,
-  shouldFenceProducer,
-  type TraceFirstVisibleRow,
-} from './visibleOrphan.js'
-import { registerProducerFence } from '../db/liveTurnFrames.js'
-import { pauseRecoveryJobsForRefusedDispatches } from './turnRecoveryStore.js'
-import {
+  DISPATCH_OPEN_ALERT_AGE_MS,
+  DISPATCH_REJECT_MIN_AGE_MS,
+  type Queryable,
+  type TurnDispatchRow,
   casAdmittedToRejecting,
   casRejectingToAccepted,
   casToManualReconcile,
   casToTerminal,
   clearDispatchShutdownEvidence,
-  DISPATCH_OPEN_ALERT_AGE_MS,
-  DISPATCH_REJECT_MIN_AGE_MS,
   dispatchHasShutdownEvidence,
   getDispatchForUpdate,
   markClientNotified,
@@ -56,12 +51,39 @@ import {
   scanOpenSessionGone,
   scanRejecting,
   scanTerminalUnnotified,
-  type Queryable,
-  type TurnDispatchRow,
 } from './turnDispatchStore.js'
+import { pauseRecoveryJobsForRefusedDispatches } from './turnRecoveryStore.js'
+import {
+  HARD_CAP_AGE_MS,
+  type TraceFirstVisibleRow,
+  classifyVisibleOrphan,
+  firstVisibleAtMsForDispatch,
+  shouldFenceProducer,
+} from './visibleOrphan.js'
 
 export const DEFAULT_RECONCILE_INTERVAL_MS = 30_000
 export const MIN_INTERVAL_MS = 5_000
+
+const reconcilerLog: Logger = rootLogger.child({ subsys: 'turnDispatchReconciler' })
+
+/**
+ * OCV5-567(plan §1.7 / §7.6):每次 reconciler 把 dispatch 收成终态或转人工,都在状态持久后留一条带
+ * dispatchId 的日志(含看到的容器状态与停机证据),oc-trace 才能回答「为什么」而不只是「是什么码」。
+ */
+function logTransition(
+  deps: Pick<TurnDispatchReconcilerDeps, 'log'>,
+  row: { dispatchId: string; userId: bigint | string; sessionId: string; clientMessageId: string },
+  fields: Record<string, unknown>,
+  level: 'info' | 'warn' = 'warn',
+): void {
+  ;(deps.log ?? reconcilerLog)[level]('dispatch transition by reconciler', {
+    dispatchId: row.dispatchId,
+    userId: String(row.userId),
+    sessionId: row.sessionId,
+    clientMessageId: row.clientMessageId,
+    ...fields,
+  })
+}
 
 export function buildTurnDispatchReconcileFrame(input: {
   sessionId: string
@@ -146,7 +168,10 @@ export type BillingAssessment = 'not_billed' | 'billed'
  *   - 无 journal / usage,或 journal 全为永久 waiver aborted → not_billed
  * 在事务内调用时传入锁行的 client(与 SELECT ... FOR UPDATE 同一 snapshot)。
  */
-export async function assessDispatchBilling(q: Queryable, dispatchId: string): Promise<BillingAssessment> {
+export async function assessDispatchBilling(
+  q: Queryable,
+  dispatchId: string,
+): Promise<BillingAssessment> {
   const usage = await q.query<{ n: string }>(
     `SELECT count(*)::text AS n FROM usage_records WHERE dispatch_id = $1`,
     [dispatchId],
@@ -205,6 +230,8 @@ export async function abortNeverExecutedJournalForDispatch(
 
 export interface TurnDispatchReconcilerDeps {
   pool: Pool
+  /** 测试注入;默认 rootLogger.child({ subsys: 'turnDispatchReconciler' })(OCV5-567) */
+  log?: Logger
   container: {
     cancelIfQueued?: (id: DispatchIdentity) => Promise<ContainerCallResult>
     rejectIfAbsent: (id: DispatchIdentity) => Promise<ContainerCallResult>
@@ -291,7 +318,9 @@ export interface ReconcileTickCounts {
  * 跑一轮收敛。顺序:⓪ 会话亡自动结案 → ① rejecting 求证(可能产出新 terminal)→ ③ terminal
  * 未通知(消化① 的产物)→ ② accepted stuck → open>7d 告警。全 best-effort:单行失败不拖累其余。
  */
-export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promise<ReconcileTickCounts> {
+export async function runReconcileTick(
+  deps: TurnDispatchReconcilerDeps,
+): Promise<ReconcileTickCounts> {
   const now = deps.now ?? Date.now
   const limit = deps.limit ?? DEFAULT_LIMIT
   const rejectMinAge = deps.rejectMinAgeMs ?? DISPATCH_REJECT_MIN_AGE_MS
@@ -333,6 +362,16 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
       resolution: 'auto_closed:session_deleted',
       now: now(),
     })
+    logTransition(
+      deps,
+      row,
+      {
+        to: 'manual_reconcile',
+        conflictReason: 'session_deleted',
+        resolution: 'auto_closed:session_deleted',
+      },
+      'info',
+    )
     await clearExitMark(deps, row)
     counts.sessionGoneClosed++
   }
@@ -398,16 +437,27 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
     const age = now() - (row.acceptedAt ?? row.admittedAt).getTime()
     const hasDeadEvidence = acceptedDeadIds.has(row.dispatchId) || dispatchHasShutdownEvidence(row)
     probedDispatchIds.add(row.dispatchId)
-    const res = await deps.container.getDispatchState(idOf(row)).catch((): ContainerCallResult => ({
-      kind: 'unreachable', detail: 'dispatch state query failed',
-    }))
+    const res = await deps.container.getDispatchState(idOf(row)).catch(
+      (): ContainerCallResult => ({
+        kind: 'unreachable',
+        detail: 'dispatch state query failed',
+      }),
+    )
     dispatchStates.set(JSON.stringify([row.dispatchId, row.attemptNo]), res)
-    if (res.kind === 'ok' && (res.state === 'running' || res.state === 'queued' || res.state === 'sink_staged')) {
+    if (
+      res.kind === 'ok' &&
+      (res.state === 'running' || res.state === 'queued' || res.state === 'sink_staged')
+    ) {
       // 真在飞:禁止因停机证据收口。清掉证据,避免下一轮不可达时误杀。
       provenLiveDispatchIds.add(row.dispatchId)
       if (hasDeadEvidence) await clearExitMark(deps, row)
       if (res.state === 'sink_staged' && age > SINK_WAIT_ALERT_MS) {
-        alertWarn(enqueue, row, `accepted dispatch awaiting sink for ${Math.round(age / 3_600_000)}h`, 'sink_wait')
+        alertWarn(
+          enqueue,
+          row,
+          `accepted dispatch awaiting sink for ${Math.round(age / 3_600_000)}h`,
+          'sink_wait',
+        )
         counts.alerts++
       }
       continue
@@ -436,6 +486,7 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
         row,
         now(),
         hasDeadEvidence ? 'SERVICE_RESTART' : 'RESULT_RECOVERY_PENDING',
+        { containerState: res.state, containerOutcome: res.outcome, deadEvidence: hasDeadEvidence },
       )
       if (closed) {
         counts.visibleFailures++
@@ -443,7 +494,9 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
         await clearExitMark(deps, row)
         try {
           deps.nudgeClient?.(row.userId, row.sessionId, row.clientMessageId)
-        } catch { /* status is durable; live nudge is best-effort */ }
+        } catch {
+          /* status is durable; live nudge is best-effort */
+        }
       }
       continue
     }
@@ -452,14 +505,18 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
       // 真崩溃(RUNNER_CRASHED / ENGINE_FAULT)；写成 SERVICE_RESTART 会让侧栏
       // 画出「可恢复的琥珀点」。无证据时保持既有等待 / 90min stuck 门。
       if (hasDeadEvidence) {
-        const closed = await closeAcceptedAsServiceRestart(deps, row, now())
+        const closed = await closeAcceptedAsServiceRestart(deps, row, now(), {
+          containerState: res.state,
+        })
         if (closed) {
           counts.visibleFailures++
           counts.notified++
           await clearExitMark(deps, row)
           try {
             deps.nudgeClient?.(row.userId, row.sessionId, row.clientMessageId)
-          } catch { /* status is durable; live nudge is best-effort */ }
+          } catch {
+            /* status is durable; live nudge is best-effort */
+          }
         }
       }
       continue
@@ -479,6 +536,12 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
       })
       if (terminal) {
         counts.rejectedTerminal++
+        logTransition(deps, row, {
+          to: 'terminal',
+          outcome: 'not_accepted',
+          failureCode: 'DISPATCH_NOT_ACCEPTED',
+          containerState: res.state,
+        })
         await clearExitMark(deps, row)
       }
       continue
@@ -487,14 +550,18 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
     if (age < stuckMs && !hasDeadEvidence) continue
     if (res.state === 'absent' && hasDeadEvidence) {
       // 重启后行消失:已执行过,写 SERVICE_RESTART,绝不 not_accepted。
-      const closed = await closeAcceptedAsServiceRestart(deps, row, now())
+      const closed = await closeAcceptedAsServiceRestart(deps, row, now(), {
+        containerState: res.state,
+      })
       if (closed) {
         counts.visibleFailures++
         counts.notified++
         await clearExitMark(deps, row)
         try {
           deps.nudgeClient?.(row.userId, row.sessionId, row.clientMessageId)
-        } catch { /* status is durable; live nudge is best-effort */ }
+        } catch {
+          /* status is durable; live nudge is best-effort */
+        }
       }
     } else if (res.state === 'sink_stage_failed' || res.state === 'absent') {
       const held = await casToManualReconcile(deps.pool, {
@@ -503,6 +570,12 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
         now: now(),
       })
       if (held) {
+        logTransition(deps, row, {
+          to: 'manual_reconcile',
+          conflictReason: `container_${res.state}`,
+          containerState: res.state,
+          deadEvidence: hasDeadEvidence,
+        })
         counts.manualReconcile++
         alertManual(enqueue, row, `container inbox state=${res.state} for an accepted dispatch`)
         counts.alerts++
@@ -511,7 +584,12 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
     } else if (res.state === 'sink_staged' || res.state === 'terminal') {
       // 等 sink ACK(无 TTL 必达);过久告警但不动状态。
       if (age > SINK_WAIT_ALERT_MS) {
-        alertWarn(enqueue, row, `accepted dispatch awaiting sink for ${Math.round(age / 3_600_000)}h`, 'sink_wait')
+        alertWarn(
+          enqueue,
+          row,
+          `accepted dispatch awaiting sink for ${Math.round(age / 3_600_000)}h`,
+          'sink_wait',
+        )
         counts.alerts++
       }
     }
@@ -529,7 +607,11 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
   counts.visibleOrphansEvidenceStale = orphanOutcome.staleEvidence
 
   // ── open>7d 只读告警(永不 GC)─────────────────────────────────────────────
-  const openAged = await scanOpenAged(deps.pool, { ageMs: DISPATCH_OPEN_ALERT_AGE_MS, limit, now: now() })
+  const openAged = await scanOpenAged(deps.pool, {
+    ageMs: DISPATCH_OPEN_ALERT_AGE_MS,
+    limit,
+    now: now(),
+  })
   for (const row of openAged) {
     alertWarn(enqueue, row, `dispatch stuck open (${row.status}) for >7d`, 'open_aged')
     counts.alerts++
@@ -538,8 +620,10 @@ export async function runReconcileTick(deps: TurnDispatchReconcilerDeps): Promis
   return counts
 }
 
-
-async function aggregateDispatchLiveText(pool: import('pg').Pool, dispatchId: string): Promise<string> {
+async function aggregateDispatchLiveText(
+  pool: import('pg').Pool,
+  dispatchId: string,
+): Promise<string> {
   const frames = await pool.query<{ payload: Buffer }>(
     `SELECT f.payload
        FROM client_session_live_streams s
@@ -772,7 +856,11 @@ async function finalizeOrphanDispatch(input: {
     }
     return { committed: true, evidenceStale: false }
   } catch (err) {
-    try { await client.query('ROLLBACK') } catch { /* ignore */ }
+    try {
+      await client.query('ROLLBACK')
+    } catch {
+      /* ignore */
+    }
     throw err
   } finally {
     client.release()
@@ -919,8 +1007,9 @@ async function closeVisibleOrphans(
 ): Promise<CloseVisibleOrphansOutcome> {
   const { dispatchStates } = opts
   const scanLimit = Math.min(200, Math.max(limit * 4, limit))
-  const queryVisible = async (offset: number) => deps.pool.query<VisibleOrphanScanRow>(
-    `SELECT -- closeVisibleOrphans
+  const queryVisible = async (offset: number) =>
+    deps.pool.query<VisibleOrphanScanRow>(
+      `SELECT -- closeVisibleOrphans
             d.dispatch_id, d.user_id::text AS user_id, d.session_id, d.client_message_id,
             d.status, d.admitted_at, d.accepted_at, d.attempt_no, d.agent_container_id, d.runtime_kind,
             t.visible_at::text AS tape_visible_at,
@@ -956,8 +1045,8 @@ async function closeVisibleOrphans(
       WHERE d.status IN ('admitted','accepted')
       ORDER BY d.admitted_at, d.dispatch_id
       OFFSET $2 LIMIT $1`,
-    [scanLimit, offset],
-  )
+      [scanLimit, offset],
+    )
   let rows = await queryVisible(visibleOrphanScanOffset)
   if (rows.rows.length === 0 && visibleOrphanScanOffset > 0) {
     visibleOrphanScanOffset = 0
@@ -974,9 +1063,12 @@ async function closeVisibleOrphans(
     const key = JSON.stringify([id.dispatchId, id.attemptNo])
     const cached = dispatchStates.get(key)
     if (cached) return cached
-    const result = await deps.container.getDispatchState(id).catch((): ContainerCallResult => ({
-      kind: 'unreachable', detail: 'dispatch state query failed',
-    }))
+    const result = await deps.container.getDispatchState(id).catch(
+      (): ContainerCallResult => ({
+        kind: 'unreachable',
+        detail: 'dispatch state query failed',
+      }),
+    )
     dispatchStates.set(key, result)
     return result
   }
@@ -991,8 +1083,11 @@ async function closeVisibleOrphans(
     if (opts.provenLiveDispatchIds.has(row.dispatch_id)) {
       if (!Number.isSafeInteger(row.attempt_no) || row.attempt_no < 1) continue
       const cached = dispatchStates.get(JSON.stringify([row.dispatch_id, row.attempt_no]))
-      if (cached?.kind === 'ok' && (cached.state === 'sink_staged'
-        || ((cached.state === 'queued' || cached.state === 'running') && age < HARD_CAP_AGE_MS))) {
+      if (
+        cached?.kind === 'ok' &&
+        (cached.state === 'sink_staged' ||
+          ((cached.state === 'queued' || cached.state === 'running') && age < HARD_CAP_AGE_MS))
+      ) {
         skippedLive++
         continue
       }
@@ -1051,9 +1146,10 @@ async function closeVisibleOrphans(
       }
     }
     const hasTape = typeof row.tape_id === 'string' && row.tape_id.length > 0
-    const outcome = action === 'complete_from_frames' || action === 'converge_only'
-      ? 'completed' as const
-      : 'interrupted' as const
+    const outcome =
+      action === 'complete_from_frames' || action === 'converge_only'
+        ? ('completed' as const)
+        : ('interrupted' as const)
     if (hasTape && action === 'complete_from_frames') {
       const tapeId = row.tape_id
       if (!tapeId || !deps.commitVisibleTape) continue
@@ -1080,13 +1176,21 @@ async function closeVisibleOrphans(
       continue
     }
     const projectFallback = !hasTape
-    if (hasTape && !projectFallback && action !== 'converge_only'
-      && action !== 'interrupt_tapeless' && action !== 'fence_hard_cap') {
+    if (
+      hasTape &&
+      !projectFallback &&
+      action !== 'converge_only' &&
+      action !== 'interrupt_tapeless' &&
+      action !== 'fence_hard_cap'
+    ) {
       continue
     }
-    const aggregated = projectFallback ? await aggregateDispatchLiveText(deps.pool, row.dispatch_id) : ''
-    const text = aggregated
-      || (outcome === 'completed'
+    const aggregated = projectFallback
+      ? await aggregateDispatchLiveText(deps.pool, row.dispatch_id)
+      : ''
+    const text =
+      aggregated ||
+      (outcome === 'completed'
         ? 'turn completed (visible fallback)'
         : 'turn interrupted (visible fallback)')
     const ok = await finalizeOrphanDispatch({
@@ -1105,20 +1209,33 @@ async function closeVisibleOrphans(
       continue
     }
     closed++
+    logTransition(
+      deps,
+      {
+        dispatchId: row.dispatch_id,
+        userId: row.user_id,
+        sessionId: row.session_id,
+        clientMessageId: row.client_message_id,
+      },
+      { to: 'terminal', outcome, via: 'visible_orphan', action },
+      'info',
+    )
     if (projectFallback === true) {
       const reason = /^[a-z0-9_]{1,48}$/.test(action) ? action : undefined
       const write = deps.recordFriction ?? recordProductFrictionEvent
-      void Promise.resolve(write({
-        correlation: row.dispatch_id,
-        userId: BigInt(row.user_id),
-        surface: 'chat',
-        stage: 'visible_fallback',
-        code: outcome,
-        outcome: 'failed',
-        path: 'reconciler',
-        reason,
-        sessionId: row.session_id,
-      })).catch(() => undefined)
+      void Promise.resolve(
+        write({
+          correlation: row.dispatch_id,
+          userId: BigInt(row.user_id),
+          surface: 'chat',
+          stage: 'visible_fallback',
+          code: outcome,
+          outcome: 'failed',
+          path: 'reconciler',
+          reason,
+          sessionId: row.session_id,
+        }),
+      ).catch(() => undefined)
     }
     try {
       deps.nudgeClient?.(
@@ -1185,7 +1302,18 @@ async function settleTerminalUnnotified(
         now: nowMs,
       })
       await client.query('COMMIT')
-      if (held) post = { kind: 'manual', reason: 'missing anchor_seq — cannot place verified failure status', reservations: [] }
+      if (held)
+        logTransition(deps, row, {
+          to: 'manual_reconcile',
+          conflictReason: 'missing_anchor_seq',
+          outcome: row.outcome,
+        })
+      if (held)
+        post = {
+          kind: 'manual',
+          reason: 'missing anchor_seq — cannot place verified failure status',
+          reservations: [],
+        }
       finalizeSettlePost(post, scanned, counts, enqueue, deps)
       return
     }
@@ -1210,6 +1338,12 @@ async function settleTerminalUnnotified(
         now: nowMs,
       })
       await client.query('COMMIT')
+      if (held)
+        logTransition(deps, row, {
+          to: 'manual_reconcile',
+          conflictReason: 'billed_but_failed',
+          outcome: row.outcome,
+        })
       if (held) {
         post = {
           kind: 'manual',
@@ -1315,7 +1449,12 @@ async function resolveRejecting(
     // 不可达/错误 → 保持 rejecting 重试。超 30min 且不可达 → 告警(不碰用户面)。
     const age = nowMs - row.admittedAt.getTime()
     if (age > REJECTING_UNREACHABLE_ALERT_MS) {
-      alertWarn(enqueue, row, `rejecting dispatch: container unreachable for ${Math.round(age / 60000)}min (${res.detail})`, 'rejecting_unreachable')
+      alertWarn(
+        enqueue,
+        row,
+        `rejecting dispatch: container unreachable for ${Math.round(age / 60000)}min (${res.detail})`,
+        'rejecting_unreachable',
+      )
       counts.alerts++
     }
     return
@@ -1332,13 +1471,22 @@ async function resolveRejecting(
     })
     if (terminal) {
       counts.rejectedTerminal++
+      logTransition(deps, row, {
+        to: 'terminal',
+        outcome: 'not_accepted',
+        failureCode: 'DISPATCH_NOT_ACCEPTED',
+        containerState: res.state,
+      })
       await clearExitMark(deps, row)
     }
   } else if (res.state === 'absent') {
     // reject-if-absent 契约下不该回 absent(无行必插 tombstone);保守当错误重试。
   } else {
     // 容器有行(queued/running/…) → 转 accepted 分支。
-    const accepted = await casRejectingToAccepted(deps.pool, { dispatchId: row.dispatchId, now: nowMs })
+    const accepted = await casRejectingToAccepted(deps.pool, {
+      dispatchId: row.dispatchId,
+      now: nowMs,
+    })
     if (accepted) counts.accepted++
   }
 }
@@ -1391,12 +1539,12 @@ function alertWarn(
   })
 }
 
-
 async function closeAcceptedAsExecutedError(
   deps: TurnDispatchReconcilerDeps,
   row: TurnDispatchRow,
   nowMs: number,
   failureCode: 'SERVICE_RESTART' | 'RESULT_RECOVERY_PENDING',
+  evidence: Record<string, unknown> = {},
 ): Promise<TurnDispatchRow | null> {
   const client = await deps.pool.connect()
   let terminal: TurnDispatchRow | null = null
@@ -1413,11 +1561,22 @@ async function closeAcceptedAsExecutedError(
     if (terminal) await advanceVisibleTimelineIdentity(client, row)
     await client.query('COMMIT')
   } catch (error) {
-    try { await client.query('ROLLBACK') } catch { /* connection already broken */ }
+    try {
+      await client.query('ROLLBACK')
+    } catch {
+      /* connection already broken */
+    }
     throw error
   } finally {
     client.release()
   }
+  if (terminal)
+    logTransition(deps, row, {
+      to: 'terminal',
+      outcome: 'executed_error',
+      failureCode,
+      ...evidence,
+    })
   return terminal
 }
 
@@ -1425,8 +1584,12 @@ async function closeAcceptedAsServiceRestart(
   deps: TurnDispatchReconcilerDeps,
   row: TurnDispatchRow,
   nowMs: number,
+  evidence: Record<string, unknown> = {},
 ): Promise<TurnDispatchRow | null> {
-  return closeAcceptedAsExecutedError(deps, row, nowMs, 'SERVICE_RESTART')
+  return closeAcceptedAsExecutedError(deps, row, nowMs, 'SERVICE_RESTART', {
+    deadEvidence: true,
+    ...evidence,
+  })
 }
 
 async function resolveCarrierDeadDispatchIds(
@@ -1480,22 +1643,16 @@ async function clearExitMark(
     /* 终态已落,清标记失败下轮可重试 */
   }
   try {
-    await clearGatewayShutdownEvidenceByDispatchIds(
-      [row.dispatchId],
-      async (sql, params) => {
-        const res = await deps.pool.query(sql, params ?? [])
-        return { rows: res.rows as Array<{ request_id: string }>, rowCount: res.rowCount }
-      },
-    )
+    await clearGatewayShutdownEvidenceByDispatchIds([row.dispatchId], async (sql, params) => {
+      const res = await deps.pool.query(sql, params ?? [])
+      return { rows: res.rows as Array<{ request_id: string }>, rowCount: res.rowCount }
+    })
   } catch {
     /* 终态已落,清标记失败下轮可重试 */
   }
 }
 
-export async function expireAdmittedLeasesOnShutdown(
-  pool: Pool,
-  nowMs?: number,
-): Promise<number> {
+export async function expireAdmittedLeasesOnShutdown(pool: Pool, nowMs?: number): Promise<number> {
   const at = new Date(nowMs ?? Date.now())
   const res = await pool.query(
     `UPDATE turn_dispatches
@@ -1529,9 +1686,11 @@ function withProbeBudget(
     }
   }
   return {
-    ...(container.cancelIfQueued ? {
-      cancelIfQueued: (id: DispatchIdentity) => wrap(container.cancelIfQueued!(id)),
-    } : {}),
+    ...(container.cancelIfQueued
+      ? {
+          cancelIfQueued: (id: DispatchIdentity) => wrap(container.cancelIfQueued!(id)),
+        }
+      : {}),
     rejectIfAbsent: (id) => wrap(container.rejectIfAbsent(id)),
     getDispatchState: (id) => wrap(container.getDispatchState(id)),
   }
@@ -1564,16 +1723,27 @@ export async function runShutdownDispatchHandoff(
   const now = deps.now ?? Date.now
   const started = now()
   const budgetMs = deps.budgetMs ?? DEFAULT_SHUTDOWN_HANDOFF_BUDGET_MS
-  const markedJournals = await (deps.markJournals
-    ?? (() => markGatewayShutdownEvidence({ reason: 'process_shutdown' })))()
-  const markedDispatches = await (deps.markOpenDispatches
-    ?? (() => markOpenDispatchShutdownEvidence(deps.pool, { now: now(), reason: 'process_shutdown' })))()
-  const expiredLeases = await (deps.expireLeases
-    ?? (() => expireAdmittedLeasesOnShutdown(deps.pool, now())))()
+  const markedJournals = await (
+    deps.markJournals ?? (() => markGatewayShutdownEvidence({ reason: 'process_shutdown' }))
+  )()
+  const markedDispatches = await (
+    deps.markOpenDispatches ??
+    (() => markOpenDispatchShutdownEvidence(deps.pool, { now: now(), reason: 'process_shutdown' }))
+  )()
+  const expiredLeases = await (
+    deps.expireLeases ?? (() => expireAdmittedLeasesOnShutdown(deps.pool, now()))
+  )()
 
   const remain = budgetMs - (now() - started)
   if (remain <= 150) {
-    return { markedJournals, markedDispatches, expiredLeases, probed: false, timedOut: true, tick: null }
+    return {
+      markedJournals,
+      markedDispatches,
+      expiredLeases,
+      probed: false,
+      timedOut: true,
+      tick: null,
+    }
   }
 
   const probeTimeout = Math.min(SHUTDOWN_PROBE_TIMEOUT_MS, Math.max(80, remain - 80))
@@ -1652,12 +1822,14 @@ export function startTurnDispatchReconciler(
       // OCV5-377: a forwarded recovery job whose dispatch ended not_accepted
       // gets no tape and would read "retrying" forever; pause it (best-effort,
       // the next tick retries).
-      await (opts.pauseRefusedRecoveryJobs ?? pauseRecoveryJobsForRefusedDispatches)(opts.pool)
-        .catch(onError)
+      await (opts.pauseRefusedRecoveryJobs ?? pauseRecoveryJobsForRefusedDispatches)(
+        opts.pool,
+      ).catch(onError)
       // OCV5-509: a paused recovery that never ran still ends the session in
       // its unanswered recovery row; close the chain with a visible card.
-      await (opts.closeRefusedRecoveryChains ?? closeRefusedRecoveryChains)(opts.pool)
-        .catch(onError)
+      await (opts.closeRefusedRecoveryChains ?? closeRefusedRecoveryChains)(opts.pool).catch(
+        onError,
+      )
       // jitter:错开双 master 抢先(leaderBundle 只 leader 跑,jitter 再防定时对齐踩踏)。
       return await runReconcileTick(opts)
     } catch (err) {

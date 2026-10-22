@@ -852,13 +852,13 @@ export const taskboardScenes: Scene[] = [
   },
   {
     id: 'taskboard-ticket-drawer',
-    label: '任务面板 · 单据抽屉(正文 / 操作 / 讨论 / 系统活动展开)',
+    label: '任务面板 · 单据抽屉(正文 / 操作 / 时间线)',
     group: GROUP,
     viewports: VP,
     api: {},
     render: () => {
       installStubs()
-      return <Board view="board" ticketId="V5-101" clicks={['[data-testid="ticket-system-toggle"]']} />
+      return <Board view="board" ticketId="V5-101" />
     },
   },
   {

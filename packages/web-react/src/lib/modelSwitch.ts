@@ -1,4 +1,4 @@
-import { cursorModelById } from '@openclaude/protocol'
+import { cursorModelById } from '@openclaude/protocol/browser'
 import type { PublicModel } from './types'
 
 export type ModelSwitchCompactionReason = {

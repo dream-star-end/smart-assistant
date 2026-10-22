@@ -14,7 +14,7 @@ import {
   trustedContainerHome,
 } from './pathAcl.js'
 import { paths } from '@openclaude/storage'
-import { SAFE_UPLOAD_EXTENSION_RE } from './server.js'
+import { SAFE_UPLOAD_EXTENSION_RE } from './httpUploadStatic.js'
 
 /**
  * Sensitive-file blocklist. Authoritative inventory for both:

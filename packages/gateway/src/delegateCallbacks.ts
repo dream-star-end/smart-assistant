@@ -52,7 +52,8 @@ import { dispatchJobTerminalNotify, retryPendingNotifies } from './delegateNotif
 import { parseParentEngine } from './jobTerminal.js'
 import { delegateCallbackMessageId, persistDelegateJobSnapshots } from './delegateCompleter.js'
 import { getTurnDispatchState, normalizeDispatchUserId } from './turnDispatchInbox.js'
-import type { Gateway, RunDelegateInput } from './server.js'
+import type { Gateway } from './server.js'
+import type { RunDelegateInput } from './delegatePolicy.js'
 
 export interface DelegateCallbacksHost {
   _acquireSyntheticTurnBarrier: Gateway['_acquireSyntheticTurnBarrier']
@@ -336,6 +337,15 @@ export function queueCcbLocalAgentInject(
   })
 }
 
+export type InjectCcbLocalAgentCallbackArgs = {
+    sessionKey: string
+    userId?: string
+    taskId: string
+    status?: string
+    outputFile?: string
+    summary?: string
+  }
+
 /**
  * Origin-inject a CCB local-agent completion after the parent turn is
  * idle and no mid-turn delivered ack arrived. Retries with the same
@@ -344,14 +354,7 @@ export function queueCcbLocalAgentInject(
  */
 export async function injectCcbLocalAgentCallback(
   this: DelegateCallbacksHost,
-  args: {
-    sessionKey: string
-    userId?: string
-    taskId: string
-    status?: string
-    outputFile?: string
-    summary?: string
-  },
+  args: InjectCcbLocalAgentCallbackArgs,
 ): Promise<CronOriginFireResult> {
   const origin = parseOriginWebchatSessionKey(args.sessionKey)
   if (!origin) {
@@ -590,13 +593,7 @@ export function _queueSendToAgentCallback(
     })
 }
 
-/**
- * send_to_agent 完成后注入父 webchat：等父 turn 不在飞，再写 user 行并
- * dispatchInbound 新开父 turn。不走 lastActiveChannel 的 📨 WS 旁路。
- */
-export async function injectSendToAgentCallback(
-  this: DelegateCallbacksHost,
-  args: {
+export type InjectSendToAgentCallbackArgs = {
     parentSessionKey?: string
     jobId: string
     agentId: string
@@ -607,7 +604,15 @@ export async function injectSendToAgentCallback(
     clientMessageId?: string
     /** Stage 2 notifier: one try, BUSY returns to pending instead of 12-then-fallback. */
     once?: boolean
-  },
+  }
+
+/**
+ * send_to_agent 完成后注入父 webchat：等父 turn 不在飞，再写 user 行并
+ * dispatchInbound 新开父 turn。不走 lastActiveChannel 的 📨 WS 旁路。
+ */
+export async function injectSendToAgentCallback(
+  this: DelegateCallbacksHost,
+  args: InjectSendToAgentCallbackArgs,
 ): Promise<CronOriginFireResult> {
   const origin = parseOriginWebchatSessionKey(args.parentSessionKey || '')
   if (!origin) {
@@ -787,15 +792,17 @@ export async function trySendToAgentCallbackDispatch(
   return { kind: 'injected' }
 }
 
-export async function _sendToAgentCallbackTurnAlreadyQueued(
-  this: DelegateCallbacksHost,
-  args: {
+export type SendToAgentCallbackTurnAlreadyQueuedArgs = {
     jobId: string
     userId: string
     sessionKey: string
     sessionId: string
     clientMessageId: string
-  },
+  }
+
+export async function _sendToAgentCallbackTurnAlreadyQueued(
+  this: DelegateCallbacksHost,
+  args: SendToAgentCallbackTurnAlreadyQueuedArgs,
 ): Promise<boolean> {
   if (this._isIdempotencyDuplicate(sendToAgentCallbackIdempotencyKey(args.jobId))) return true
   const live = this.sessions.getByKey(args.sessionKey) as

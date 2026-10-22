@@ -1,6 +1,6 @@
 // Master-side image understanding on Grok 4.7 (grok-build).
 //
-// This is the backend of the container's understand_image / oc-vision /
+// This is the backend of the container's oc-figcheck vision review /
 // oc-figcheck tools. The Grok engine itself only takes a text prompt, so the
 // image never reaches Grok through an engine turn; here the container hands the
 // image and the question to the master, and the master calls the official CLI
@@ -221,6 +221,21 @@ export function grokVisionBody(input: {
     max_output_tokens: MAX_OUTPUT_TOKENS,
     store: false,
   });
+}
+
+/** Headers of the official CLI chat proxy call (shared with tutorial image moderation). */
+export function grokVisionHeaders(accessToken: Buffer, canonicalModel: string): Record<string, string> {
+  return {
+    authorization: `Bearer ${accessToken.toString("utf8")}`,
+    "content-type": "application/json",
+    accept: "application/json",
+    "x-xai-token-auth": "xai-grok-cli",
+    "x-authenticateresponse": "authenticate-response",
+    "x-grok-model-override": canonicalModel,
+    "x-grok-client-mode": "headless",
+    "x-grok-client-version": "1.0.62",
+    "x-grok-client-identifier": "openclaude-vision",
+  };
 }
 
 /** Text of the assistant message items of a Responses API result. */
@@ -495,17 +510,7 @@ export function makeGrokVisionHandler(deps: GrokVisionHandlerDeps): GrokVisionHa
         dispatcher: directEgressDispatcher(),
         headersTimeout: UPSTREAM_TIMEOUT_MS,
         bodyTimeout: UPSTREAM_TIMEOUT_MS,
-        headers: {
-          authorization: `Bearer ${accessToken.toString("utf8")}`,
-          "content-type": "application/json",
-          accept: "application/json",
-          "x-xai-token-auth": "xai-grok-cli",
-          "x-authenticateresponse": "authenticate-response",
-          "x-grok-model-override": canonical,
-          "x-grok-client-mode": "headless",
-          "x-grok-client-version": "1.0.62",
-          "x-grok-client-identifier": "openclaude-vision",
-        },
+        headers: grokVisionHeaders(accessToken, canonical),
         body: grokVisionBody({ upstreamModel, mediaType: image.mediaType, data: image.data, prompt }),
       });
       const text = await upstream.body.text();

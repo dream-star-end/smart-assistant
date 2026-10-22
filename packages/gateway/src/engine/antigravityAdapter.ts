@@ -72,6 +72,8 @@ const KEEPALIVE_INTERVAL_MS = 30_000
 /** After `result`, wait this long for the process to exit so trailing
  * stderr (soft-deny / empty-run notices) is read before the turn settles. */
 const RESULT_SETTLE_MS = 5_000
+/** How long a possibly repeated old ERROR waits for the exit code before it fails. */
+const STALE_ERROR_EXIT_WAIT_MS = 30_000
 
 /** Sandboxed resolution set; user-writable PATH entries stay out. */
 const ANTIGRAVITY_SPAWN_PATH = '/run/oc/platform/current/bin:/usr/local/bin:/usr/bin:/bin'
@@ -85,7 +87,7 @@ function antigravitySpawnPath(hostPathDir: string | null): string {
   return hostPathDir ? `${hostPathDir}:${ANTIGRAVITY_SPAWN_PATH}` : ANTIGRAVITY_SPAWN_PATH
 }
 
-let timingTestHooks: { keepaliveMs?: number; resultSettleMs?: number } | null = null
+let timingTestHooks: { keepaliveMs?: number; resultSettleMs?: number; staleErrorExitWaitMs?: number } | null = null
 const STDERR_MAX_CHARS = 64 * 1024
 const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 /** 1.3.4 without usable credentials prints an OAuth URL and blocks for 60 s. */
@@ -93,6 +95,22 @@ const AUTH_PROMPT_RE = /Authentication required|Waiting for authentication|authe
 /** Headless soft-deny: tool step reports DONE with no output, exit 0. */
 const SOFT_DENY_RE = /auto-denied/i
 const EMPTY_RUN_RE = /run ended with no output/i
+/** Go oauth2 refusing the CLI token file locally (OCV5-556). */
+/** What the CLI prints to stderr when a launch fails (`error: …`, `AGY_ERROR: {…}`). */
+const CLI_STDERR_ERROR_RE = /^(?:error:|AGY_ERROR:)/m
+/** CLI ended SUCCESS right after one of this launch's own error steps. */
+export const ANTIGRAVITY_ERROR_STEP = 'ANTIGRAVITY_ERROR_STEP'
+const CLI_CREDENTIAL_EXPIRED_RE = /oauth2: token expired|refresh token is not set/i
+
+/**
+ * The CLI token file is platform-owned: a turn that dies on it is a platform
+ * credential fault, not an upstream outage. Tag it so errorClassify routes it
+ * to `platform_credential_expired` (no automatic recovery, precise copy).
+ */
+export function normalizeAntigravityErrorDetail(detail: string): string {
+  if (detail.startsWith('ANTIGRAVITY_CREDENTIAL_EXPIRED:')) return detail
+  return CLI_CREDENTIAL_EXPIRED_RE.test(detail) ? `ANTIGRAVITY_CREDENTIAL_EXPIRED: ${detail}` : detail
+}
 
 const EMPTY_SIGNALS: Readonly<PhantomSignals> = Object.freeze({ apiState: 'unknown', skipReason: null })
 
@@ -144,6 +162,20 @@ interface TurnContext {
   abandoned: boolean
   interrupted: boolean
   errorDetail: string | null
+  /** step_index of this launch's own user_input; earlier indices are history. */
+  firstOwnStepIndex: number | null
+  /** error_message seen before this launch's user_input; used only if the run fails. */
+  preludeErrorDetail: string | null
+  /** This launch's last step was an error_message (1.4.0 streams it without text). */
+  trailingErrorStep: boolean
+  /** This launch streamed an error_message step of its own. */
+  ownErrorStep: boolean
+  /** Launched with `--conversation` (resuming an existing CLI conversation). */
+  resumedLaunch: boolean
+  /** CLI exit code once the process closed. */
+  exitCode: number | null
+  /** A possibly repeated old ERROR is waiting for the exit code (Codex r2 P1). */
+  awaitingExitSince: number | null
   resolveSummary: (summary: TurnSummary | null) => void
   resolveDrain: (() => void) | null
 }
@@ -310,6 +342,13 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       abandoned: false,
       interrupted: false,
       errorDetail: null,
+      firstOwnStepIndex: null,
+      preludeErrorDetail: null,
+      trailingErrorStep: false,
+      ownErrorStep: false,
+      resumedLaunch: false,
+      exitCode: null,
+      awaitingExitSince: null,
       resolveSummary,
       resolveDrain: null,
     }
@@ -390,6 +429,12 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       hostBin: probeEnvFacts().hostBin,
     })
     ctx.projection = projection
+    log.info('antigravity CLI credential projected', {
+      sessionKey: this.opts.sessionKey,
+      traceId: ctx.params.traceId,
+      admittedTokenExpiresAt: route.accessTokenExpiresAt,
+      cliTokenFileExpiry: projection.cliTokenFileExpiry,
+    })
     const prompt = await this.composePrompt(ctx.params, repoSnapshot, projection.advertisedMcpTools, cwdDecision)
     const line = `${JSON.stringify({ event: 'user', message: { content: prompt } })}\n`
     if (Buffer.byteLength(line, 'utf8') > ANTIGRAVITY_MAX_PROMPT_BYTES) {
@@ -443,6 +488,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     spec: { bin: string; args: string[]; env: NodeJS.ProcessEnv; cwd: string; line: string },
   ): void {
     ctx.timing.once('spawn_requested')
+    ctx.resumedLaunch = spec.args.includes('--conversation')
     const proc = spawn(spec.bin, spec.args, {
       cwd: spec.cwd,
       env: spec.env,
@@ -494,6 +540,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       this.cleanupLaunch(ctx)
       if (ctx.abandoned) return
       ctx.procClosed = true
+      ctx.exitCode = code
       if (stdoutBuffer.trim()) this.handleLine(ctx, stdoutBuffer.trim())
       if (ctx.pendingResult) this.settleResult(ctx)
       ctx.resolveDrain?.()
@@ -604,6 +651,12 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   private handleStep(ctx: TurnContext, step: Record<string, unknown>): void {
     const type = asText(step.step_type)
     const state = asText(step.state)
+    const stepIndex = typeof step.step_index === 'number' && Number.isSafeInteger(step.step_index)
+      ? step.step_index
+      : null
+    if (type === 'user_input' && ctx.firstOwnStepIndex === null && stepIndex !== null) {
+      ctx.firstOwnStepIndex = stepIndex
+    }
     if (type === 'agent_response') {
       const delta = typeof step.text_delta === 'string' ? step.text_delta : ''
       if (delta) this.appendText(ctx, delta)
@@ -626,14 +679,40 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     if (type === 'error_message') {
       const info = recordOf(step.error)
       const message = info ? asText(info.message) : asText(step.error)
+      // OCV5-556: a `--conversation` resume streamed an earlier launch's error
+      // step (old relay route, long-expired token) after this launch's own
+      // steps had succeeded, failing four good turns in a row. Steps before
+      // this launch's user_input belong to earlier launches.
+      if (ctx.firstOwnStepIndex === null) {
+        if (message) ctx.preludeErrorDetail = message
+        return
+      }
+      if (stepIndex !== null && stepIndex < ctx.firstOwnStepIndex) {
+        if (!message) return
+        log.warn('antigravity ignored error step from an earlier launch of the conversation', {
+          sessionKey: this.opts.sessionKey,
+          stepIndex,
+          firstOwnStepIndex: ctx.firstOwnStepIndex,
+        })
+        return
+      }
+      // OCV5-556: 1.4.0 streams this launch's own error steps with no text and
+      // can still end the run SUCCESS (a relay ROUTE_EXPIRED 60 minutes into a
+      // turn ended as a "success" with no reply). Remember it; settleResult
+      // fails the turn unless a later tool or reply step shows the run went on.
+      ctx.ownErrorStep = true
       if (message) ctx.errorDetail = message
+      else ctx.trailingErrorStep = true
     }
     // user_input / system_message / checkpoint / unknown (native ask_question,
     // invisible in headless mode) carry nothing the product renders.
   }
 
   private appendText(ctx: TurnContext, text: string): void {
-    if (text.trim()) ctx.timing.once('first_text')
+    if (text.trim()) {
+      ctx.timing.once('first_text')
+      ctx.trailingErrorStep = false
+    }
     ctx.sawOutput = true
     if (!ctx.lastWasText) {
       ctx.assistantSegments.push({
@@ -661,6 +740,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 
   private handleToolStep(ctx: TurnContext, step: Record<string, unknown>, state: string): void {
     ctx.sawOutput = true
+    ctx.trailingErrorStep = false
     const id = this.toolId(ctx, step)
     const info = recordOf(step.tool_info) ?? {}
     const nativeName = asText(info.name) || asText(step.tool_name)
@@ -750,23 +830,55 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
   private settleResult(ctx: TurnContext): void {
     const result = ctx.pendingResult
     if (!result || ctx.terminal || ctx.abandoned) return
-    ctx.pendingResult = null
     if (ctx.resultTimer) {
       clearTimeout(ctx.resultTimer)
       ctx.resultTimer = null
     }
-    const status = asText(result.status)
+    // The exit code decides whether an ERROR is the CLI repeating an old one;
+    // hold such a result until the process closes, within a bound.
+    if (!ctx.procClosed && this.mayBeRepeatedOldError(ctx, result)) {
+      const now = Date.now()
+      ctx.awaitingExitSince ??= now
+      const wait = timingTestHooks?.staleErrorExitWaitMs ?? STALE_ERROR_EXIT_WAIT_MS
+      const left = ctx.awaitingExitSince + wait - now
+      if (left > 0) {
+        ctx.resultTimer = setTimeout(() => { this.settleResult(ctx) }, left)
+        ctx.resultTimer.unref()
+        return
+      }
+    }
+    ctx.pendingResult = null
+    let status = asText(result.status)
+    // OCV5-556: once a launch of a conversation failed (e.g. relay
+    // ROUTE_EXPIRED), 1.4.0 ends every later `--conversation` launch with
+    // status ERROR and that old error, even when the launch answered normally
+    // (exit 0, empty stderr). The recovery and the next messages then "failed"
+    // until the retry circuit opened. Such a launch resumed a conversation,
+    // started, answered, streamed no error step of its own, exited 0 and wrote
+    // no error to stderr; a launch that really failed (even after a partial
+    // reply) exits non-zero and prints the error (Codex r1 P1).
+    if (ctx.procClosed && ctx.exitCode === 0 && this.mayBeRepeatedOldError(ctx, result)) {
+      log.warn('antigravity CLI repeated an earlier launch error on a run that answered', {
+        sessionKey: this.opts.sessionKey,
+        error: asText(result.error).slice(0, 300),
+      })
+      status = 'SUCCESS'
+    }
     const id = asText(result.conversation_id)
     if (CONVERSATION_ID_RE.test(id)) ctx.conversationId = id
     if (status === 'CANCELED' || status === 'INTERRUPTED') ctx.interrupted = true
     if (status !== 'SUCCESS' && ctx.errorDetail === null) {
-      ctx.errorDetail = asText(result.error) || `Antigravity turn ended with status ${status || 'unknown'}`
+      ctx.errorDetail = asText(result.error) || ctx.preludeErrorDetail ||
+        `Antigravity turn ended with status ${status || 'unknown'}`
     }
     if (status === 'SUCCESS' && ctx.errorDetail === null) {
       // 1.3.4 reports SUCCESS for runs that produced nothing (oversized input)
       // and for headless soft-denied tools. Both are failures for the user.
       const denied = Array.isArray(result.denied_actions) ? result.denied_actions : []
-      if (denied.length > 0 || SOFT_DENY_RE.test(ctx.stderr)) {
+      if (ctx.trailingErrorStep) {
+        const why = asText(result.error) || ctx.stderr.trim().slice(-500) || 'CLI reported success after an error step'
+        ctx.errorDetail = `${ANTIGRAVITY_ERROR_STEP}: ${why}`
+      } else if (denied.length > 0 || SOFT_DENY_RE.test(ctx.stderr)) {
         const actions = denied.map((d) => asText(recordOf(d)?.action) || asText(d)).filter(Boolean)
         ctx.errorDetail = `ANTIGRAVITY_TOOL_DENIED: ${actions.length > 0 ? actions.join(',') : ctx.stderr.trim().slice(0, 500)}`
       } else if (!ctx.sawOutput && !asText(result.response)) {
@@ -783,6 +895,16 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
       this.emit('session_id', ctx.conversationId)
     }
     this.finish(ctx, typeof result.num_turns === 'number' ? count(result.num_turns) : 1)
+  }
+
+  /** Everything but the exit code that marks an ERROR as the repeated old one. */
+  private mayBeRepeatedOldError(ctx: TurnContext, result: Record<string, unknown>): boolean {
+    return asText(result.status) === 'ERROR' &&
+      ctx.resumedLaunch &&
+      !CLI_STDERR_ERROR_RE.test(ctx.stderr) &&
+      !ctx.ownErrorStep &&
+      ctx.firstOwnStepIndex !== null &&
+      (ctx.assistantText.trim() !== '' || asText(result.response).trim() !== '')
   }
 
   private usageSnapshot(ctx: TurnContext) {
@@ -805,6 +927,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
     if (ctx.terminal) return
     ctx.terminal = true
     if (ctx.interrupted && ctx.errorDetail === null) ctx.errorDetail = 'Antigravity turn cancelled'
+    if (ctx.errorDetail !== null) ctx.errorDetail = normalizeAntigravityErrorDetail(ctx.errorDetail)
     const isError = ctx.errorDetail !== null
     const stopReason = ctx.interrupted ? 'interrupted' : isError ? 'error' : 'end_turn'
     ctx.params.sessionTotals.turns += 1
@@ -996,7 +1119,7 @@ export class AntigravityAdapter extends EventEmitter implements EngineAdapter {
 export const _internals = {
   promptText,
   assemblePrompt,
-  setTimingTestHooks(hooks: { keepaliveMs?: number; resultSettleMs?: number } | null): void {
+  setTimingTestHooks(hooks: { keepaliveMs?: number; resultSettleMs?: number; staleErrorExitWaitMs?: number } | null): void {
     timingTestHooks = hooks
   },
 }

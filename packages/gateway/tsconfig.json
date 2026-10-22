@@ -11,6 +11,7 @@
   "include": ["src", "box-bridge-mod/oc-bridge/hooks/frames.ts"],
   "references": [
     { "path": "../protocol" },
+    { "path": "../kernel" },
     { "path": "../plugin-sdk" },
     { "path": "../storage" }
   ]

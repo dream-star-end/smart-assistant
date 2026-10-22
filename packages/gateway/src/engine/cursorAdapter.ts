@@ -1456,6 +1456,7 @@ export const CURSOR_SAND_RESUME_PREFIX = 'sand-ccb:'
 export const CURSOR_SAND_OFFICIAL_CC_RESUME_PREFIX = 'sand-official-cc:'
 export const CURSOR_SAND_BOX_CC_RESUME_PREFIX = 'sand-box-cc:'
 const CURSOR_RESUME_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const CURSOR_BOX_GPT_WEB_RESUME_ID_RE = /^gpt-web-pro-[a-z0-9_-]{1,64}$/i
 
 export function isCursorSandResumeId(sessionId: string | null | undefined): sessionId is string {
   return typeof sessionId === 'string' && sessionId.startsWith(CURSOR_SAND_RESUME_PREFIX)
@@ -1500,7 +1501,9 @@ export function cursorSandBoxCcResumeInnerId(
 ): string | undefined {
   if (!isCursorSandBoxCcResumeId(sessionId)) return undefined
   const inner = sessionId.slice(CURSOR_SAND_BOX_CC_RESUME_PREFIX.length)
-  return CURSOR_RESUME_ID_RE.test(inner) ? inner : undefined
+  return CURSOR_RESUME_ID_RE.test(inner) || CURSOR_BOX_GPT_WEB_RESUME_ID_RE.test(inner)
+    ? inner
+    : undefined
 }
 
 export function isAnyCursorSandResumeId(sessionId: string | null | undefined): sessionId is string {

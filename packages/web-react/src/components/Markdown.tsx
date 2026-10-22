@@ -42,6 +42,11 @@ export type MarkdownProps = {
    * `.prose`,DOM 与整段一次渲染完全一致(react-markdown 本身不加包裹元素)。
    */
   bare?: boolean;
+  /**
+   * 经验分享正文(OCV5-577):只渲染 `![](tutorial-blob:<sha256>)` 图片,交给调用方决定取图方式
+   * (公开 embed / 作者预览的鉴权读取);其它任何图片来源一律不加载。调用方需保持函数引用稳定。
+   */
+  tutorialImage?: (sha256: string, image: { alt: string; title?: string }) => ReactNode;
 };
 
 let markdownImplLoader: Promise<typeof import("./MarkdownImpl")> | null = null;
@@ -168,6 +173,7 @@ export const Markdown = memo(function Markdown({
   blockImages,
   autoDetectCode,
   bare,
+  tutorialImage,
 }: MarkdownProps) {
   // 组件类型按实例在挂载时定一次：chunk 到达前挂载的实例（如正在流式的消息）保持 lazy，
   // 不会在 chunk 到达后因类型变化再被整块重挂（HTML 预览 iframe 会因此重载）。
@@ -184,6 +190,7 @@ export const Markdown = memo(function Markdown({
           blockImages={blockImages}
           autoDetectCode={autoDetectCode}
           bare={bare}
+          tutorialImage={tutorialImage}
         >
           {children}
         </MarkdownImpl>

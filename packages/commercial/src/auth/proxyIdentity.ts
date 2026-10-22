@@ -194,6 +194,7 @@ export async function authorizeProxyIdentity(
   const ok = canUseModel(
     { pricing: deps.pricing },
     {
+      uid: identity.uid,
       role: authz.role,
       grantedModelIds: authz.grantedModelIds,
       deniedModelIds: authz.deniedModelIds,

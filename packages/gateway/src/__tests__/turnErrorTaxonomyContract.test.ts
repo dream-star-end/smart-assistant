@@ -47,6 +47,10 @@ const CLASSIFY_SAMPLES: Array<{ input: string; code: string }> = [
     input: 'API Error: 401 {"error":{"type":"authentication_error","message":"invalid x-api-key"}}',
     code: 'auth_error',
   },
+  {
+    input: 'agent executor error: generating and executing: request failed: Post \"http://127.0.0.1:18789/internal/v5/antigravity-relay/route/<route>/v1internal:streamGenerateContent?alt=sse\": oauth2: token expired and refresh token is not set',
+    code: 'platform_credential_expired',
+  },
 ]
 
 /** Delegate-specific input shapes that still share the ClassifiedErrorCode
@@ -162,6 +166,7 @@ describe('turnErrorTaxonomy 契约 — wire OutboundError.code 枚举', () => {
       'service_restart',
       'engine_error',
       'auth_error',
+      'platform_credential_expired',
       'session_persist_unavailable',
     ]) {
       assert.ok(wireCodes.includes(code), `wire 枚举缺 ${code}`)

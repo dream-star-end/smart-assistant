@@ -25,6 +25,8 @@ const CLIENT = join(CCB, "src/services/api/client.ts");
 const MODULE_INSTALL = join(CCB, "node_modules");
 const TOOL_MARK = "OCV5296_CCB_TOOL_OK";
 const MAX_HTTP = 6;
+// OCV5-570: the turn trace rides the same control line (only when CCB's upstream is egress).
+const TRACE = "0a1b2c3d4e5f60718293a4b5c6d7e8f9";
 const BOX = {
   canonicalModel: "box-api-claude-opus-5-5",
   contextWindow: 200_000,
@@ -57,6 +59,8 @@ async function runnerLines(): Promise<{ first: string[]; renew: string; cleared:
     kill() {},
   };
   ;(runner as unknown as { spawnedExecutionDescriptor: unknown }).spawnedExecutionDescriptor = BOX;
+  ;(runner as unknown as { spawnedUpstreamIsEgress: boolean }).spawnedUpstreamIsEgress = true;
+  runner.setTraceId(TRACE);
   const authority: TurnModelAuthority = {
     authorityEnvelope: "BOXAUTH",
     leaseEnvelope: "BOXLEASE1",
@@ -67,6 +71,7 @@ async function runnerLines(): Promise<{ first: string[]; renew: string; cleared:
   await runner.updateTurnLease("BOXLEASE2");
   const renew = writes[first.length]!;
   ;(runner as unknown as { spawnedExecutionDescriptor: unknown }).spawnedExecutionDescriptor = undefined;
+  runner.setTraceId(undefined);
   await runner.submit("next");
   return { first, renew, cleared: writes.slice(first.length + 1) };
 }
@@ -126,7 +131,7 @@ test("claude-code-best consumes runner Box control lines on loopback", { timeout
   const cliPath = join(runtimeTree, "src/entrypoints/cli.tsx");
   assert.equal(existsSync(MODULE_INSTALL), true, "claude-code-best/node_modules missing; bun install --ignore-scripts in that directory first");
 
-  const hits: Array<{ authority?: string; lease?: string; hasToolMark: boolean; bytes: number }> = [];
+  const hits: Array<{ authority?: string; lease?: string; trace?: string; hasToolMark: boolean; bytes: number }> = [];
   const decisions: Array<(kind: "tool" | "text") => void> = [];
   let http = 0;
   let stdout = "";
@@ -144,6 +149,7 @@ test("claude-code-best consumes runner Box control lines on loopback", { timeout
     hits.push({
       authority: req.headers["x-oc-model-authority"] as string | undefined,
       lease: req.headers["x-oc-turn-lease"] as string | undefined,
+      trace: req.headers["x-openclaude-trace-id"] as string | undefined,
       hasToolMark: raw.includes(TOOL_MARK),
       bytes: raw.length,
     });
@@ -220,11 +226,13 @@ test("claude-code-best consumes runner Box control lines on loopback", { timeout
     const first = await waitHit(1);
     assert.equal(first.authority, "BOXAUTH");
     assert.equal(first.lease, "BOXLEASE1");
+    assert.equal(first.trace, TRACE);
     decisions[0]!("tool");
     const tool = await waitHit(2);
     assert.equal(tool.authority, "BOXAUTH");
     assert.equal(tool.lease, "BOXLEASE1");
     assert.equal(tool.hasToolMark, true);
+    assert.equal(tool.trace, TRACE, "the tool round-trip of the same turn keeps the trace");
     child.stdin.write(lines.renew);
     await new Promise((resolve) => setTimeout(resolve, 300));
     child.stdin.write(lines.first[1]!);
@@ -232,11 +240,13 @@ test("claude-code-best consumes runner Box control lines on loopback", { timeout
     const renewed = await waitHit(3);
     assert.equal(renewed.authority, "BOXAUTH");
     assert.equal(renewed.lease, "BOXLEASE2");
+    assert.equal(renewed.trace, TRACE, "a lease renewal keeps the turn trace");
     decisions[2]!("text");
     for (const line of lines.cleared) child.stdin.write(line);
     const cleared = await waitHit(4);
     assert.equal(cleared.authority, undefined);
     assert.equal(cleared.lease, undefined);
+    assert.equal(cleared.trace, undefined, "a trace-less turn clears the previous trace");
     decisions[3]!("text");
     outcome = "pass";
   } finally {

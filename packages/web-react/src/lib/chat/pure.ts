@@ -14,7 +14,7 @@ import {
   REPORT_EXEMPT_TURN_ERROR_CODES,
   type TurnErrorCode,
   turnErrorSemantics,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/browser";
 import { formatLiveActivityAction } from "./liveActivityLabel";
 import type {
   OutboundContentBlock,
@@ -776,6 +776,7 @@ export const BRIDGE_ERROR_MESSAGES: Record<TurnErrorCode, string> = {
   engine_error: "任务执行时遇到内部错误，你的消息已保留，可以直接重试。",
   internal_error: "服务遇到内部错误，你的消息已保留，请重试。",
   auth_error: "认证状态异常，本轮未正常完成，请重新尝试。",
+  platform_credential_expired: "平台为本轮签发的模型临时凭证已过期，本轮已停止，不会自动重试，也不是你的账号或登录问题。请直接再发一条消息继续。",
   service_restart: "服务正在更新，本轮已中断，请重试。",
   session_persist_unavailable: "消息已保留在本机，但暂时未能安全送达。请点下方“重试”原样发送。",
   session_deleted: "这个会话已被删除。请新建会话继续；在这里重试不会把它找回来。从回收站恢复后即可正常发送。",

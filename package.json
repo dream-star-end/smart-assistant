@@ -5,6 +5,7 @@
   "type": "module",
   "workspaces": [
     "packages/protocol",
+    "packages/kernel",
     "packages/storage",
     "packages/plugin-sdk",
     "packages/gateway",
@@ -28,6 +29,7 @@
     "test:gateway": "npx tsx --test --test-concurrency=1 $(find packages/gateway/src -type f -name \"*.test.ts\")",
     "test:mcp-memory": "npx tsx --test $(find packages/mcp-memory/src -type f -name \"*.test.ts\")",
     "test:protocol": "npx tsx --test $(find packages/protocol/src -type f -name \"*.test.ts\")",
+    "test:kernel": "npx tsx --test $(find packages/kernel/src -type f -name \"*.test.ts\")",
     "test:channels": "npx tsx --test $(find packages/channels -type f -name \"*.test.ts\" -not -path \"*/node_modules/*\")",
     "test:web": "npx tsx --test packages/web/__tests__/*.test.ts",
     "lint:agent-containers-sql": "tsx packages/commercial/scripts/lint-agent-containers-sql.ts",
@@ -47,7 +49,7 @@
     "lint:migration-order": "tsx scripts/check-migration-order.ts",
     "test:commercial:prompt-queue": "bash scripts/test-mutex.sh commercial 'npx tsx --test --test-concurrency=1 packages/commercial/src/__tests__/internalPromptQueue.test.ts packages/commercial/src/__tests__/promptQueueDispatch.test.ts packages/commercial/src/__tests__/promptQueueStore.integ.test.ts packages/commercial/src/__tests__/userChatBridgeCodexBilling.test.ts'",
     "test:commercial": "npm run test:commercial:unit && npm run test:commercial:integ",
-    "test:v5:ops": "npx tsx --test scripts/__tests__/v5ReleasePolicy.test.ts scripts/__tests__/v5ReleaseWorker.test.ts scripts/__tests__/v5HotConfig.test.ts scripts/__tests__/v5ReleaseQueueHeartbeat.test.ts scripts/__tests__/v5WorktreeNew.test.ts scripts/__tests__/v5ChangeRoute.test.ts scripts/__tests__/huggingfaceTransformersStub.test.ts scripts/__tests__/selectGates.test.ts scripts/__tests__/coreMemoryModelRelease.test.ts scripts/__tests__/v5ReleaseSafety.test.ts scripts/__tests__/smokeTurnText.test.ts scripts/__tests__/v5RemountCcbBaseline.test.ts scripts/__tests__/knownFailuresGate.test.ts scripts/__tests__/v5MutationLease.test.ts scripts/__tests__/v5ModelAuthorityRollback.test.ts scripts/__tests__/v5OcrWorkerTunnel.test.ts scripts/__tests__/v5SelfhealDrillSafety.test.ts scripts/__tests__/v5SyntheticEvalOverlay.test.ts scripts/__tests__/v5SyntheticEvalRunArm.test.ts scripts/__tests__/v5SyntheticEvalHelpers.test.ts scripts/__tests__/v5SyntheticEvalPair.test.ts scripts/__tests__/v5DocumentArtifactPair.test.ts scripts/__tests__/v5DeployDetached.test.ts scripts/__tests__/v5TutorialVerifiedEvidence.test.ts scripts/__tests__/v5TutorialGateInteractive.test.ts scripts/__tests__/migrationOrderGate.test.ts scripts/__tests__/regressionContractGate.test.ts scripts/__tests__/assertFlavorContract.test.ts scripts/__tests__/incidentLedgerSuperset.test.ts scripts/__tests__/v5SelfhostCutoverSurvivor.test.ts scripts/__tests__/v5SelfhostBootOrder.test.ts scripts/__tests__/v5SelfhostGateTsxCache.test.ts scripts/__tests__/testForceExitOutput.test.ts scripts/__tests__/v5UserContract.test.ts scripts/__tests__/v5HostMaint.test.ts scripts/__tests__/v5CiFlakeLedger.test.ts scripts/__tests__/v5TestRetries.test.ts scripts/__tests__/requeueFailedTapeJobs.test.ts scripts/__tests__/incidentTrailerExactCompat.test.ts scripts/__tests__/v5FixTrailerGate.test.ts scripts/__tests__/v5SelfevolveWeeklyReport.test.ts && node --test .github/scripts/ci-classify.test.mjs .github/scripts/check-known-failures-policy.test.mjs && npx tsx --test .github/scripts/integ-shard-budget.test.ts scripts/__tests__/v5SelfhostPgBackup.test.ts scripts/__tests__/v5SelfhostWatchHostChecks.test.ts scripts/__tests__/v5SelfhostDeployStatus.test.ts scripts/__tests__/v5SelfhostWatchGate.test.ts scripts/__tests__/v5SelfhostMigrationPrecheck.test.ts scripts/__tests__/v5WebOverlay.test.ts scripts/__tests__/fileSizeRatchet.test.ts",
+    "test:v5:ops": "npx tsx --test scripts/__tests__/v5ReleasePolicy.test.ts scripts/__tests__/v5ReleaseWorker.test.ts scripts/__tests__/v5HotConfig.test.ts scripts/__tests__/v5ReleaseQueueHeartbeat.test.ts scripts/__tests__/v5WorktreeNew.test.ts scripts/__tests__/v5ChangeRoute.test.ts scripts/__tests__/huggingfaceTransformersStub.test.ts scripts/__tests__/selectGates.test.ts scripts/__tests__/coreMemoryModelRelease.test.ts scripts/__tests__/v5ReleaseSafety.test.ts scripts/__tests__/smokeTurnText.test.ts scripts/__tests__/v5RemountCcbBaseline.test.ts scripts/__tests__/knownFailuresGate.test.ts scripts/__tests__/v5MutationLease.test.ts scripts/__tests__/v5ModelAuthorityRollback.test.ts scripts/__tests__/v5OcrWorkerTunnel.test.ts scripts/__tests__/v5SelfhealDrillSafety.test.ts scripts/__tests__/v5SyntheticEvalOverlay.test.ts scripts/__tests__/v5SyntheticEvalRunArm.test.ts scripts/__tests__/v5SyntheticEvalHelpers.test.ts scripts/__tests__/v5SyntheticEvalPair.test.ts scripts/__tests__/v5DocumentArtifactPair.test.ts scripts/__tests__/v5DeployDetached.test.ts scripts/__tests__/v5TutorialVerifiedEvidence.test.ts scripts/__tests__/v5TutorialGateInteractive.test.ts scripts/__tests__/migrationOrderGate.test.ts scripts/__tests__/regressionContractGate.test.ts scripts/__tests__/assertFlavorContract.test.ts scripts/__tests__/incidentLedgerSuperset.test.ts scripts/__tests__/v5SelfhostCutoverSurvivor.test.ts scripts/__tests__/v5SelfhostBoxGateFlaky.test.ts scripts/__tests__/v5SelfhostBootOrder.test.ts scripts/__tests__/v5SelfhostGateTsxCache.test.ts scripts/__tests__/testForceExitOutput.test.ts scripts/__tests__/v5UserContract.test.ts scripts/__tests__/v5HostMaint.test.ts scripts/__tests__/v5CiFlakeLedger.test.ts scripts/__tests__/v5TestRetries.test.ts scripts/__tests__/requeueFailedTapeJobs.test.ts scripts/__tests__/incidentTrailerExactCompat.test.ts scripts/__tests__/v5FixTrailerGate.test.ts scripts/__tests__/v5SelfevolveWeeklyReport.test.ts && node --test .github/scripts/ci-classify.test.mjs .github/scripts/check-known-failures-policy.test.mjs && npx tsx --test .github/scripts/integ-shard-budget.test.ts scripts/__tests__/v5SelfhostPgBackup.test.ts scripts/__tests__/v5SelfhostWatchHostChecks.test.ts scripts/__tests__/v5SelfhostDeployStatus.test.ts scripts/__tests__/v5SelfhostWatchGate.test.ts scripts/__tests__/v5SelfhostMigrationPrecheck.test.ts scripts/__tests__/v5WebOverlay.test.ts scripts/__tests__/fileSizeRatchet.test.ts",
     "check:tutorials": "tsx scripts/check-v5-tutorials.ts",
     "check:ci-parity": "tsx scripts/check-ci-parity.ts",
     "check:v5:incidents": "tsx scripts/check-v5-incident-regressions.ts && tsx scripts/check-incident-ledger-superset.ts && tsx scripts/check-v5-cursor-sand-inference.ts && tsx scripts/check-v5-ccb-mcp-availability.ts && tsx scripts/check-v5-cron-submit-boundary.ts && npx tsx --test scripts/__tests__/cronSubmitBoundaryGate.test.ts && tsx scripts/check-v5-session-unavailable-rootfix.ts && tsx scripts/check-v5-taskboard-commercial-gate.ts && tsx scripts/check-v5-delegate-billing-requestid.ts && tsx scripts/check-v5-codex-chatgpt-ws.ts",
@@ -56,10 +58,10 @@
     "tutorials:accept": "tsx scripts/check-v5-tutorials.ts accept",
     "tutorials:media": "tsx scripts/generate-v5-tutorial-media.ts",
     "test:evals": "npx tsx --import ./scripts/lib/test-blocking-stdio.mjs --test --test-force-exit evals/run.test.ts",
-    "test": "npm run test:protocol && npm run test:channels && npm run test:gateway && npm run test:storage && npm run test:commercial",
+    "test": "npm run test:protocol && npm run test:kernel && npm run test:channels && npm run test:gateway && npm run test:storage && npm run test:commercial",
     "migrate:commercial": "tsx packages/commercial/src/db/migrate.ts",
     "typecheck": "tsc --build && npm run typecheck --workspace packages/web-react",
-    "check:v5": "npm run check:ci-parity && npm run check:v5:incidents && npm run check:v5:e2e-selectors && npm run check:tutorials && npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run check:test-retries && npm run lint:integ-tiers && npm run build:node-agent && npm run typecheck && npm run test:v5:ops && npm run test:protocol && npm run test:channels && npm run test:gateway && npm run test:mcp-memory && npm run test:storage && npm run test:web-react && npm run test:browser && npm run test:commercial:unit:gate && npm run test:commercial:integ:shard -- pr",
+    "check:v5": "npm run check:ci-parity && npm run check:v5:incidents && npm run check:v5:e2e-selectors && npm run check:tutorials && npm run lint:scheduler-wiring && npm run lint:agent-containers-sql && npm run check:test-retries && npm run lint:integ-tiers && npm run build:node-agent && npm run typecheck && npm run test:v5:ops && npm run test:protocol && npm run test:kernel && npm run test:channels && npm run test:gateway && npm run test:mcp-memory && npm run test:storage && npm run test:web-react && npm run test:browser && npm run test:commercial:unit:gate && npm run test:commercial:integ:shard -- pr",
     "check:v5:fast": "tsx scripts/run-v5-fast.ts",
     "typecheck:clean": "tsc --build --clean",
     "typecheck:watch": "tsc --build --watch",
@@ -73,5 +75,8 @@
     "playwright-core": "1.60.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
+  },
+  "overrides": {
+    "sharp": "0.35.5"
   }
 }

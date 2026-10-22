@@ -66,7 +66,7 @@ import { errorLabel } from "./render";
 import {
   AUTOMATIC_TURN_RETRY_MAX,
   supportsAutomaticTurnRecovery,
-} from "@openclaude/protocol";
+} from "@openclaude/protocol/browser";
 
 /** teardown 后非 final 帧的压制时间窗(客户端同域):覆盖 stop 后 server 收尾期,不无界压制多端新 turn。*/
 const TEARDOWN_DROP_WINDOW_MS = 3 * 60_000;

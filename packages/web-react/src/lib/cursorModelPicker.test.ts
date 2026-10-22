@@ -1,4 +1,4 @@
-import { CONTEXT_TIER_FAMILIES, cursorModelById } from '@openclaude/protocol'
+import { CONTEXT_TIER_FAMILIES, cursorModelById } from '@openclaude/protocol/browser'
 import { describe, expect, it } from 'vitest'
 import {
   lockedModelUnlockNotice,

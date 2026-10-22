@@ -23,15 +23,11 @@ import {
   rejectTurnDispatchIfAbsent,
   cancelQueuedTurnDispatchExact,
 } from './turnDispatchInbox.js'
-import {
-  V3_WECHAT_OUTBOUND_ADAPTER_ID,
-  V3_QQBOT_OUTBOUND_ADAPTER_ID,
-  ALLOWED_INBOUND_MODELS,
-  validateEnginePreheatBody,
-  runSessionPreheat,
-  validateWechatInboundCompensateBody,
-} from './server.js'
-import type { Gateway, WechatStartOutcome, SessionPreheatHost } from './server.js'
+import { V3_WECHAT_OUTBOUND_ADAPTER_ID, V3_QQBOT_OUTBOUND_ADAPTER_ID, validateEnginePreheatBody, runSessionPreheat } from './server.js'
+import { ALLOWED_INBOUND_MODELS } from './delegatePolicy.js'
+import { validateWechatInboundCompensateBody } from './wechatInboundCompensate.js'
+import type { Gateway, SessionPreheatHost } from './server.js'
+import type { WechatStartOutcome } from './wechatInboundCompensate.js'
 
 export interface ChannelHandlersHost {
   _getIdempotencyEntry: Gateway['_getIdempotencyEntry']
@@ -58,17 +54,19 @@ function wechatPeerIdFromSessionKey(sessionKey: string | undefined): string | un
   return /^agent:[^:]+:webchat:dm:(wsess-[0-9a-f]{16})$/.exec(sessionKey)?.[1]
 }
 
-export function _updateWechatIdempotency(
-  this: ChannelHandlersHost,
-  key: string,
-  patch: Partial<{
+export type UpdateWechatIdempotencyPatch = Partial<{
     started: boolean
     completed: boolean
     traceId: string
     sessionKey: string
     peerId: string
     agentId: string
-  }>,
+  }>
+
+export function _updateWechatIdempotency(
+  this: ChannelHandlersHost,
+  key: string,
+  patch: UpdateWechatIdempotencyPatch,
 ): void {
   const entry = this._getIdempotencyEntry(key)
   if (!entry?.wechat) return

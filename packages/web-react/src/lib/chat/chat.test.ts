@@ -79,7 +79,7 @@ import type {
   OutboundPermissionSettledWire,
 } from "./frames";
 import { childSignature, messageSignature } from "./render";
-import { reduceLiveFrames, type LiveFrameInput } from "@openclaude/protocol";
+import { reduceLiveFrames, type LiveFrameInput } from "@openclaude/protocol/browser";
 
 // ─── helpers ──────────────────────────────────────────────────────────
 function sess(id = "s1", agentId = "main") {

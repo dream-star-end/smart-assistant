@@ -10,6 +10,8 @@ import type { LiteratureSetupService } from '../plugins/literatureDb/setupServic
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
 import { resolve as resolvePath } from "node:path";
+import { communityBlogEnabled } from "../tutorials/tutorialImages.js";
+import { tutorialModerationMode } from "../tutorials/tutorialModerationQueue.js";
 import {
   HttpError,
   readJsonBody,
@@ -120,6 +122,7 @@ import type { BiliAccountSetupManager } from '../plugins/biliAccountSetup.js'
 import type { KnowledgePlanetAutomationService } from '../plugins/knowledgePlanetAutomation.js'
 import type { GoalStateService } from '../goal/goalStateService.js'
 import type { MediaGenerationService } from '../media-generation/service.js'
+import type { MuseBridgeHttpHandler } from '../muse/bridgeHttp.js'
 
 export interface CommercialHttpDeps {
   literatureSetup?: LiteratureSetupService
@@ -127,6 +130,8 @@ export interface CommercialHttpDeps {
   jwtSecret: string | Uint8Array;
   /** Durable local H3 jobs and long-form storyboard projects. */
   mediaGeneration?: MediaGenerationService;
+  /** OCV5-561 Muse bridge endpoints; undefined (→ 404) unless OC_MUSE_BRIDGE_ENABLED=1. */
+  museBridgeHttp?: MuseBridgeHttpHandler;
   /** Platform-authoritative session GoalState service. */
   goalStateService?: GoalStateService;
   /** Short-lived one-time browser tickets for V5 container-local preview. */
@@ -1351,6 +1356,10 @@ export async function handleGetPublicConfig(
     // FEATURE_REMOTE_SSH 灰度状态 —— 前端据此决定是否渲染执行环境切换器。
     feature_remote_ssh: deps.remoteSshEnabled === true,
     feature_image2: process.env.OC_IMAGE2_ENABLED === "true",
+    // 经验分享（OCV5-577）：个人版开，商业版默认关。
+    feature_community_blog: communityBlogEnabled(),
+    // 编辑器底部文案：on = 「提交后由 AI 自动审核」；否则「提交后由管理员审核」。
+    feature_community_blog_ai_review: tutorialModerationMode() === "on",
     // system_settings.allow_registration 透传给前端。关停时前端要:
     //   1) 在 register tab 展示 banner + disable 表单 + 不挂 Turnstile
     //   2) 在 login tab 隐藏"立即注册"导航链接(LDC SSO 按钮保留 — 老用户登录用)
