@@ -168,6 +168,8 @@ function fakeDocker(behaviour: {
   killRejects?: boolean
   waitNever?: boolean
   removeRejects?: boolean
+  killHangs?: boolean
+  removeHangs?: boolean
   stdoutDelayMs?: number
 }) {
   const created: Created[] = []
@@ -206,10 +208,12 @@ function fakeDocker(behaviour: {
         },
         async kill() {
           rec.killed = true
+          if (behaviour.killHangs) await new Promise(() => {})
           if (behaviour.killRejects) throw new Error('docker kill failed')
           if (!behaviour.waitNever) release({ StatusCode: 137 })
         },
         async remove() {
+          if (behaviour.removeHangs) await new Promise(() => {})
           if (behaviour.removeRejects)
             throw Object.assign(new Error('docker unavailable'), { statusCode: 500 })
           rec.removed = true
@@ -660,6 +664,47 @@ describe('ComposeRunner (OCV5-588)', () => {
       left.filter((n) => n.startsWith('job-00000011')).length,
       1,
       'reservation kept while the container may still exist',
+    )
+  })
+
+  test('code r2: a hanging kill() cannot block run(); a stuck container keeps holding its slot', async () => {
+    const root = await setup()
+    const r0 = new ComposeRunner({
+      hostLock: TEST_LOCK,
+      docker: fakeDocker({}),
+      imageId: IMAGE,
+      root,
+      chownOutput: false,
+    })
+    const { inDir } = await r0.prepare('job-00000013')
+    await writeFile(join(inDir, 'a.mp4'), 'x')
+    const wedged = fakeDocker({ waitNever: true, killHangs: true, removeHangs: true })
+    const r = new ComposeRunner({
+      hostLock: TEST_LOCK,
+      docker: wedged,
+      imageId: IMAGE,
+      root,
+      chownOutput: false,
+      timeoutMsOverride: 20,
+      killGraceMs: 20,
+      maxConcurrent: 1,
+      queueWaitMs: 50,
+      removeRetryMs: 5,
+    })
+    const started = Date.now()
+    await assert.rejects(
+      r.run('job-00000013', { op: 'probe', file: 'a.mp4' }),
+      (e: unknown) => e instanceof ComposeRunnerError && e.code === 'COMPOSE_TIMEOUT',
+    )
+    assert.ok(Date.now() - started < 2000, 'run() returns even though kill() never settles')
+    await assert.rejects(
+      r.run('job-00000013', { op: 'probe', file: 'a.mp4' }),
+      (e: unknown) => e instanceof ComposeRunnerError && e.code === 'COMPOSE_BUSY',
+    )
+    assert.equal(
+      wedged.created.length,
+      1,
+      'no second container starts while the first is not confirmed removed',
     )
   })
 
