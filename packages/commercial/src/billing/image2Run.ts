@@ -14,9 +14,14 @@
  * are indistinguishable from container traffic except container_id IS NULL. The
  * relay itself is untouched — no egress-surface behaviour change.
  *
- * Idempotency: callers pass a stable requestId (studio uses `studio:<exec id>`).
- * A retry after a successful settle replays the cached body and never re-charges.
+ * Idempotency: callers pass a stable requestKey (studio uses `studio:<task id>`). The
+ * journey's request_id is `<requestKey>#<sha256(upstream body)[0:32]>`, so it names one
+ * exact input: a retry of the same input replays the cache / paid recovery and never
+ * re-charges, while a changed input can never reuse an earlier charge or cached
+ * result (Codex code r1 P1). buildImage2Request() is exported so a reconciler can
+ * recompute the id from the task payload.
  */
+import { createHash } from 'node:crypto'
 import type { Pool } from 'pg'
 import type { Dispatcher } from 'undici'
 import { resolveCodexAccountEgressDispatcher } from '../account-pool/codexEgress.js'
@@ -54,10 +59,9 @@ import {
   releasePreCheck,
 } from './preCheck.js'
 
-export interface Image2RunInput {
-  userId: bigint
-  /** Stable per logical call (≤128 chars); retries must reuse it. */
-  requestId: string
+export interface Image2RequestSpec {
+  /** Stable per logical call (≤95 chars); retries must reuse it. */
+  requestKey: string
   prompt: string
   /** Must be in the policy allowlist; defaults to policy.editDefault. */
   model?: string
@@ -67,6 +71,10 @@ export interface Image2RunInput {
   size?: string
   /** Reference images (PNG/JPEG/WebP bytes). Present → /images/edits. */
   referenceImages?: Buffer[]
+}
+
+export interface Image2RunInput extends Image2RequestSpec {
+  userId: bigint
   signal?: AbortSignal
 }
 
@@ -74,6 +82,8 @@ export interface Image2RunResult {
   images: Buffer[]
   model: string
   costCredits: bigint
+  /** The journey request_id (image_generation_usage_records) this result is recorded under. */
+  requestId: string
   /** false when the result was replayed from the completed-request cache. */
   charged: boolean
 }
@@ -179,6 +189,61 @@ async function decodeExpected(bytes: Buffer, n: number): Promise<Buffer[] | null
   return decoded as Buffer[]
 }
 
+const MAX_REQUEST_KEY_CHARS = 95
+
+/** Validates a request and builds its deterministic upstream body and journey request id. */
+export function buildImage2Request(
+  spec: Image2RequestSpec,
+  policy: ImageModelPolicy,
+): {
+  requestId: string
+  body: string
+  path: '/images/edits' | '/images/generations'
+  model: string
+  n: number
+} {
+  const model = spec.model ?? policy.editDefault
+  const prompt = spec.prompt.trim()
+  const refs = spec.referenceImages ?? []
+  const n = Math.min(4, Math.max(1, Math.trunc(spec.n ?? 1)))
+  if (!policy.allowed.has(model)) {
+    throw new Image2RunError(
+      'INVALID_IMAGE_REQUEST',
+      `only model=${[...policy.allowed].join('|')} is supported`,
+    )
+  }
+  if (spec.requestKey.length < 1 || spec.requestKey.length > MAX_REQUEST_KEY_CHARS)
+    throw new Image2RunError('INVALID_IMAGE_REQUEST', 'invalid request key')
+  if (prompt.length < 1 || prompt.length > MAX_PROMPT_CHARS)
+    throw new Image2RunError('INVALID_IMAGE_REQUEST', 'invalid prompt')
+  if (spec.size !== undefined && !SIZE_RE.test(spec.size))
+    throw new Image2RunError('INVALID_IMAGE_REQUEST', 'invalid size')
+  if (refs.length > MAX_REFERENCE_IMAGES)
+    throw new Image2RunError('INVALID_IMAGE_REQUEST', 'too many reference images')
+  const images: Array<{ image_url: string }> = []
+  for (const ref of refs) {
+    const mime = sniffImageMime(ref)
+    if (!mime)
+      throw new Image2RunError('INVALID_IMAGE_REQUEST', 'reference is not a png/jpeg/webp image')
+    images.push({ image_url: `data:${mime};base64,${ref.toString('base64')}` })
+  }
+  const body = JSON.stringify({
+    model,
+    prompt,
+    n,
+    ...(spec.size ? { size: spec.size } : {}),
+    ...(images.length > 0 ? { images } : {}),
+  })
+  const digest = createHash('sha256').update(body, 'utf8').digest('hex').slice(0, 32)
+  return {
+    requestId: `${spec.requestKey}#${digest}`,
+    body,
+    path: images.length > 0 ? '/images/edits' : '/images/generations',
+    model,
+    n,
+  }
+}
+
 export function makeImage2Runner(
   deps: Image2RunDeps,
 ): (input: Image2RunInput) => Promise<Image2RunResult> {
@@ -213,44 +278,12 @@ export function makeImage2Runner(
   } = { ...defaultBilling, ...deps.billing }
 
   return async function runImage2ForUser(input) {
-    const { userId, requestId } = input
-    const runLog = log.child({ uid: String(userId), requestId })
+    const { userId } = input
     if (!enabled) throw new Image2RunError('IMAGE2_DISABLED', 'Image 2 is temporarily unavailable')
-
-    // ── validate & build the upstream body (deterministic for a given input) ──
-    const model = input.model ?? deps.policy.editDefault
-    const prompt = input.prompt.trim()
-    const refs = input.referenceImages ?? []
-    const n = Math.min(4, Math.max(1, Math.trunc(input.n ?? 1)))
-    if (!deps.policy.allowed.has(model)) {
-      throw new Image2RunError(
-        'INVALID_IMAGE_REQUEST',
-        `only model=${[...deps.policy.allowed].join('|')} is supported`,
-      )
-    }
-    if (requestId.length < 1 || requestId.length > 128)
-      throw new Image2RunError('INVALID_IMAGE_REQUEST', 'invalid request id')
-    if (prompt.length < 1 || prompt.length > MAX_PROMPT_CHARS)
-      throw new Image2RunError('INVALID_IMAGE_REQUEST', 'invalid prompt')
-    if (input.size !== undefined && !SIZE_RE.test(input.size))
-      throw new Image2RunError('INVALID_IMAGE_REQUEST', 'invalid size')
-    if (refs.length > MAX_REFERENCE_IMAGES)
-      throw new Image2RunError('INVALID_IMAGE_REQUEST', 'too many reference images')
-    const images: Array<{ image_url: string }> = []
-    for (const ref of refs) {
-      const mime = sniffImageMime(ref)
-      if (!mime)
-        throw new Image2RunError('INVALID_IMAGE_REQUEST', 'reference is not a png/jpeg/webp image')
-      images.push({ image_url: `data:${mime};base64,${ref.toString('base64')}` })
-    }
-    const body = JSON.stringify({
-      model,
-      prompt,
-      n,
-      ...(input.size ? { size: input.size } : {}),
-      ...(images.length > 0 ? { images } : {}),
-    })
-    const url = `${baseUrl}${images.length > 0 ? '/images/edits' : '/images/generations'}`
+    // Validate & build the upstream body; the request id is bound to it.
+    const { requestId, body, path, model, n } = buildImage2Request(input, deps.policy)
+    const runLog = log.child({ uid: String(userId), requestId })
+    const url = `${baseUrl}${path}`
     const costCredits = IMAGE2_UNIT_COST * BigInt(n)
 
     const replay = async (): Promise<Image2RunResult | null> => {
@@ -260,7 +293,7 @@ export function makeImage2Runner(
       if (!cached) return null
       const decoded = await decodeExpected(cached.responseBody, n)
       if (!decoded) return null
-      return { images: decoded, model, costCredits, charged: false }
+      return { images: decoded, model, costCredits, requestId, charged: false }
     }
     const cached = await replay()
     if (cached) {
@@ -473,7 +506,7 @@ export function makeImage2Runner(
           runLog.warn('image2_run_charge_callback_failed')
         }
       }
-      return { images: decoded, model, costCredits, charged: !settled.duplicate }
+      return { images: decoded, model, costCredits, requestId, charged: !settled.duplicate }
     } catch (err) {
       const aborted = controller.signal.aborted
       const code: Image2RunErrorCode = aborted
