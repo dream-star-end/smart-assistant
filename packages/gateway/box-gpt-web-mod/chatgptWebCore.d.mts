@@ -8,6 +8,7 @@ export const LEVEL_ORDER: string[]
 export const LEVEL_ALIASES: Record<string, string>
 export const LEVEL_SLIDER_PCT: Record<string, string>
 
+export function defaultGptWebSessionId(): string
 export function profileDirFor(profile?: string, home?: string): string
 export function cdpPortForProfile(profile?: string, explicitPort?: number | string | null): number
 export function isChatGptOriginUrl(rawUrl: string): boolean
@@ -96,6 +97,12 @@ export function probeSessionState(
   opts?: { profileDir?: string; display?: string },
 ): Promise<{ ok: boolean; code: string; message: string }>
 
+export function resolveVisibleLocator(
+  page: any,
+  selector: string,
+  opts?: { timeoutMs?: number; pollMs?: number },
+): Promise<any>
+
 export function selectProTierInPage(
   page: any,
   opts?: { requestedTier?: string },
@@ -183,10 +190,12 @@ export class TurnProgressStreamer {
     initialEmittedFinalText?: string
     initialStepTextByKey?: Record<string, string> | null
   })
-  restoreState(state?: {
-    emittedFinalText?: string
-    stepTextByKey?: Record<string, string> | null
-  } | null): void
+  restoreState(
+    state?: {
+      emittedFinalText?: string
+      stepTextByKey?: Record<string, string> | null
+    } | null,
+  ): void
   exportState(): {
     emittedFinalText: string
     stepTextByKey: Record<string, string>

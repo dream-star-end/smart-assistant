@@ -17,6 +17,7 @@ import {
   classifyApprovalCard,
   clearActiveTurnState,
   computeAdaptiveDeadline,
+  defaultGptWebSessionId,
   detectTierLimit,
   downloadTurnOutputArtifactsInPage,
   extractAssistantFromMapping,
@@ -35,6 +36,8 @@ import {
   probeSessionState,
   profileDirFor,
   readProfileSingletonOwner,
+  resetComposerDraftInPage,
+  resolveVisibleLocator,
   saveActiveTurnState,
   saveSessionConversationId,
   selectProTierInPage,
@@ -45,6 +48,10 @@ import {
   validateLocalOnlyProxy,
   withProfileFileLock,
 } from '../../box-gpt-web-mod/chatgptWebCore.mjs'
+import {
+  CURSOR_SAND_BOX_CC_RESUME_PREFIX,
+  cursorSandBoxCcResumeInnerId,
+} from '../engine/cursorAdapter.js'
 import {
   type BoxCcControl,
   type BoxCcExecRequest,
@@ -1646,5 +1653,147 @@ rl.on('line', (line) => {
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
+  })
+  it('mints UUID session ids accepted by cursorSandBoxCcResumeInnerId and preserves legacy gpt-web-pro ids', () => {
+    const freshId = defaultGptWebSessionId()
+    assert.match(freshId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+    assert.equal(
+      cursorSandBoxCcResumeInnerId(`${CURSOR_SAND_BOX_CC_RESUME_PREFIX}${freshId}`),
+      freshId,
+    )
+    assert.equal(
+      cursorSandBoxCcResumeInnerId(`${CURSOR_SAND_BOX_CC_RESUME_PREFIX}gpt-web-pro-1792632309911`),
+      'gpt-web-pro-1792632309911',
+    )
+    assert.equal(
+      cursorSandBoxCcResumeInnerId(`${CURSOR_SAND_BOX_CC_RESUME_PREFIX}../evil`),
+      undefined,
+    )
+  })
+
+  it('skips hidden 0x0 duplicate Select ChatGPT model button on /c/<convId> and clicks visible composer switcher', async () => {
+    let hiddenClicked = false
+    let visibleClicked = false
+
+    const hiddenSwitcher = {
+      count: async () => 1,
+      isVisible: async () => false,
+      click: async () => {
+        hiddenClicked = true
+        throw new Error('Wait for hidden element timed out')
+      },
+      innerText: async () => 'Thinking effortPro',
+    }
+    const visibleSwitcher = {
+      count: async () => 1,
+      isVisible: async () => true,
+      click: async () => {
+        visibleClicked = true
+      },
+      innerText: async () => 'Pro',
+    }
+    const slider = {
+      count: async () => 1,
+      focus: async () => {},
+      getAttribute: async (attr: string) =>
+        attr === 'aria-valuenow' ? '4' : 'Pro - Research-grade intelligence',
+      boundingBox: async () => ({ x: 100, y: 100, width: 200, height: 20 }),
+    }
+    const menu = {
+      count: async () => 1,
+      isVisible: async () => true,
+      waitFor: async () => {},
+      locator: (sel: string) => {
+        if (sel === '[role="slider"]') return { first: () => slider }
+        return { filter: () => ({ first: () => ({ count: async () => 0 }) }) }
+      },
+    }
+    const fakePage = {
+      evaluate: async () => [] as string[],
+      locator: (sel: string) => {
+        if (sel === '[data-testid="model-switcher-dropdown-button"]') {
+          const empty = { count: async () => 0, isVisible: async () => false }
+          return {
+            count: async () => 0,
+            first: () => empty,
+            nth: () => empty,
+          }
+        }
+        if (sel === 'button[aria-label="Select ChatGPT model"]') {
+          const items = [hiddenSwitcher, visibleSwitcher]
+          return {
+            count: async () => items.length,
+            first: () => items[0],
+            nth: (idx: number) => items[idx],
+          }
+        }
+        if (sel === '[role="menu"]') {
+          return {
+            count: async () => 1,
+            first: () => menu,
+            nth: () => menu,
+          }
+        }
+        throw new Error(`Unexpected selector: ${sel}`)
+      },
+      keyboard: {
+        press: async () => {},
+      },
+      mouse: {
+        click: async () => {},
+      },
+    }
+
+    const resolved = await resolveVisibleLocator(
+      fakePage,
+      'button[aria-label="Select ChatGPT model"]',
+    )
+    assert.equal(resolved, visibleSwitcher)
+
+    const out = await selectProTierInPage(fakePage, { requestedTier: 'pro' })
+    assert.equal(hiddenClicked, false)
+    assert.equal(visibleClicked, true)
+    assert.equal(out.tier, 'pro')
+    assert.equal(out.sliderIndex, 4)
+
+    // Verify resetComposerDraftInPage clears <textarea> drafts where innerText/textContent are ""
+    const textareaEl = {
+      value: 'old draft',
+      innerText: '',
+      textContent: '',
+      dispatched: false,
+      dispatchEvent() {
+        this.dispatched = true
+      },
+    }
+    const emptyProseMirrorEl = {
+      innerText: '\n',
+      textContent: '',
+      innerHTML: '<p><br class="ProseMirror-trailingBreak"></p>',
+      dispatched: false,
+      dispatchEvent() {
+        this.dispatched = true
+      },
+    }
+    await resetComposerDraftInPage({
+      evaluate: async (fn: () => void) => {
+        const prevDoc = (globalThis as any).document
+        ;(globalThis as any).document = {
+          querySelectorAll: (sel: string) => {
+            if (sel.startsWith('button')) return []
+            return [textareaEl, emptyProseMirrorEl]
+          },
+        }
+        try {
+          fn()
+        } finally {
+          ;(globalThis as any).document = prevDoc
+        }
+      },
+    })
+    assert.equal(textareaEl.value, '')
+    assert.equal(textareaEl.dispatched, true)
+    assert.equal(emptyProseMirrorEl.innerHTML, '<p><br class="ProseMirror-trailingBreak"></p>')
+    assert.equal(emptyProseMirrorEl.dispatched, false)
   })
 })

@@ -29,6 +29,7 @@ import {
   cdpPortForProfile,
   clearActiveTurnState,
   computeAdaptiveDeadline,
+  defaultGptWebSessionId,
   downloadTurnOutputArtifactsInPage,
   extractAssistantFromMapping,
   extractLiveProgressFromDomInPage,
@@ -54,6 +55,7 @@ import {
   profileDirFor,
   readProfileSingletonOwner,
   resetComposerDraftInPage,
+  resolveVisibleLocator,
   saveActiveTurnState,
   saveSessionConversationId,
   selectProTierInPage,
@@ -71,7 +73,7 @@ function parseCliArgs(argv) {
   const out = {
     model: 'gpt-6-astra-pro',
     catalogModel: 'box-gpt-6-astra-pro',
-    sessionId: `gpt-web-pro-${Date.now()}`,
+    sessionId: defaultGptWebSessionId(),
     profile,
     display: process.env.OC_BOX_GPT_WEB_DISPLAY || DEFAULT_DISPLAY,
     cdpPort: cdpPortForProfile(profile, process.env.OC_BOX_GPT_WEB_CDP_PORT),
@@ -280,24 +282,24 @@ async function fetchConversationFromMappingInPage(
     const currentNode = fetched.conv.current_node || null
     const fromMap = extractAssistantFromMapping(fetched.conv, { baselineNodeId })
     if (fromMap?.text) {
-        return {
-          text: fromMap.text,
-          messageId: fromMap.messageId,
-          convId: fetched.convId,
-          currentNode,
-          conv: fetched.conv,
-        }
-      }
       return {
-        text: null,
-        messageId: null,
+        text: fromMap.text,
+        messageId: fromMap.messageId,
         convId: fetched.convId,
         currentNode,
         conv: fetched.conv,
       }
     }
-    return null
+    return {
+      text: null,
+      messageId: null,
+      convId: fetched.convId,
+      currentNode,
+      conv: fetched.conv,
+    }
   }
+  return null
+}
 
 async function rescueFromDomOrMapping(page, fallbackConvId = null, { baselineNodeId = null } = {}) {
   const direct = await fetchConversationFromMappingInPage(page, fallbackConvId, {
@@ -320,7 +322,10 @@ class DetachedTurnError extends Error {
 async function stopActiveGenerationInPage(page) {
   if (!page) return
   try {
-    const stopBtn = page.locator('[data-testid="stop-button"], button[aria-label*="Stop"]').first()
+    const stopBtn = await resolveVisibleLocator(
+      page,
+      '[data-testid="stop-button"], button[aria-label*="Stop"]',
+    )
     if ((await stopBtn.count()) > 0) {
       await stopBtn.click({ timeout: 2_000 }).catch(() => {})
     }
@@ -372,9 +377,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
           const isSameTurn = Boolean(
             activeTurnState &&
               activeTurnState.promptText === turn.text &&
-              (turn.turnId
-                ? activeTurnState.turnId === turn.turnId
-                : !activeTurnState.completedAt),
+              (turn.turnId ? activeTurnState.turnId === turn.turnId : !activeTurnState.completedAt),
           )
           if (isSameTurn && activeTurnState) {
             // Only restore stepTextByKey (thinking commentary deduplication) from disk;
@@ -533,7 +536,11 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
           let latestConv = null
 
           if (syncState.conversationId) {
-            const preConv = await fetchConversationPayloadInPage(page, syncState.conversationId)
+            let preConv = await fetchConversationPayloadInPage(page, syncState.conversationId)
+            if (!preConv?.conv?.current_node) {
+              await new Promise((r) => setTimeout(r, 800))
+              preConv = await fetchConversationPayloadInPage(page, syncState.conversationId)
+            }
             latestConv = preConv?.conv || null
             baselineNodeId = preConv?.conv?.current_node || null
 
@@ -591,12 +598,14 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
             await typeMultilinePreservingAttachments(page, turn.text)
             await abortIfRequested('before send')
 
-            const sendBtn = page
-              .locator(
-                '[data-testid="send-button"], button[aria-label="Send"], button[aria-label="Send prompt"]',
-              )
-              .first()
-            await sendBtn.waitFor({ state: 'visible', timeout: 15_000 })
+            const sendBtn = await resolveVisibleLocator(
+              page,
+              '[data-testid="send-button"], button[aria-label="Send"], button[aria-label="Send prompt"]',
+              { timeoutMs: 15_000 },
+            )
+            if (typeof sendBtn.waitFor === 'function') {
+              await sendBtn.waitFor({ state: 'visible', timeout: 15_000 })
+            }
             await abortIfRequested('before click send')
             persistProgressState({
               conversationId: syncState.conversationId || null,
@@ -1005,9 +1014,7 @@ async function main() {
       )
       writeStdoutLine(formatStreamJsonThinkingBlockStart({ index: 0 }))
       turnControl.thinkingBlockOpen = true
-      writeStdoutLine(
-        formatStreamJsonThinkingDelta('[Pro] 正在连接浏览器会话并准备提交请求…\n'),
-      )
+      writeStdoutLine(formatStreamJsonThinkingDelta('[Pro] 正在连接浏览器会话并准备提交请求…\n'))
 
       const keepaliveTimer = setInterval(() => {
         writeStdoutLine(
