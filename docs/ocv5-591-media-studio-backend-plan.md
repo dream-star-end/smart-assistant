@@ -71,7 +71,7 @@ studio_charges(id bigserial pk, user_id, project_id, request_id text, kind check
 - 失败重试：provider 返回“可重试”时按指数退避（30 s 起，最多 3 次）；不可重试的失败交给编排器决定是换备选 provider，还是标为 `needs_user`。
 - **执行幂等（plan r1 P1-1）**：每个任务有固定的 `exec_request_id = studio:<task id>`，重领时不变。lease + epoch 只能保护任务状态，挡不住上游被重复调用、重复扣费，所以每个 provider 都按下面的顺序走：
   - GPT 图片：requestId 用 `exec_request_id`。`image_generation_usage_records` 对 `(user, request_id)` 有缓存回放（成功响应保留 1–24 小时）。重领时命中缓存直接回放，不调上游，也不重复扣费。
-  - Muse：submit 后**立即**把 `mj_…` 写进 `provider_job_ref`，然后才开始等待。重领时只用 `hub.view(jobId)` 继续等，不会再提交一次。扣费由 hub 按 job 一次完成。
+  - Muse（plan r2 P1-1：提交本身必须幂等）：A0 给 `MuseBridgeHub.submit` 增加一个可选参数 `jobId`。工作台传入**由 `exec_request_id` 确定性导出**的 id：`mj_<uuidv5(namespace, exec_request_id)>`，格式仍满足 `^mj_[0-9a-f-]{36}$`。hub 写入时用 `INSERT … ON CONFLICT (id) DO NOTHING`：如果这个 id 已存在且属于同一用户，直接返回已有的 job（不重复入队，也不重复扣费，因为扣费按 job 只发生一次）；属于别人则拒绝。这样即使“submit 成功、写 `provider_job_ref` 失败”，重领时算出的还是同一个 id，`submit` 返回原 job，接着 `view` 等待即可。`provider_job_ref` 只作为缓存，不再是正确性的前提。
   - MiniMax：结算对 `(user, request_id)` 唯一。崩溃发生在结算之后、结果落库之前时，重领会再调一次上游，但结算走 replay，**不会向用户重复扣费**（平台多付一次上游成本，可以接受，并会记日志）。
   - Grok（QA、Plan 等步骤）：`runGrokResponsesForUser` 接受外部传入的稳定 requestId。执行顺序是：上游 → **先把结果写进 `studio_step_results`** → 再结算（`usage_records` 对 `(user, request_id)` 唯一，结算本身幂等）→ 任务完成。重领时，如果 `studio_step_results` 里已经有结果，就只补做幂等结算，不再调上游；如果没有结果，说明还没结算过，可以重调。所以两种情况都不会重复扣费。
   - ElevenLabs、合成：顺序是 生成 → 写 blob → 往 `studio_charges` 写 `(user, request_id)` 唯一的记录并扣费 → 完成。重领时先查 blob 和扣费记录。
@@ -91,7 +91,7 @@ running:
 composing：合成沙箱 → final.mp4 → QA_final（抽帧 + 响度 + 时长）→ done
 ```
 
-- **预算守卫（plan r1 P1-2，原子预留）**：派发任务时，在同一个事务里执行 `UPDATE studio_projects SET reserved_credits = reserved_credits + $est WHERE id=$p AND spent_credits + reserved_credits + $est <= budget_credits RETURNING`，同时把 `$est` 记到任务的 `reserved_credits` 上。`$est` 取这次调用可能的**最高**价（例如视频按 Muse 的 50 加上可能的备选价）。更新不到行就不派发，项目转为 `paused` 并发出 `needs_user`（类型 budget）。任务结束时，同一事务里把预留转成 `spent_credits += 实际扣费`、`reserved_credits -= $est`；失败或取消时只释放预留。这样同时在途的多个任务不可能一起把预算冲破。
+- **预算守卫（plan r1 P1-2，原子预留）**：派发任务时，在同一个事务里执行 `UPDATE studio_projects SET reserved_credits = reserved_credits + $est WHERE id=$p AND spent_credits + reserved_credits + $est <= budget_credits RETURNING`，同时把 `$est` 记到任务的 `reserved_credits` 上。`$est` 取这次调用可能的**最高**价（例如视频按 Muse 的 50 加上可能的备选价）。更新不到行就不派发，项目转为 `paused` 并发出 `needs_user`（类型 budget）。任务结束时（**无论成功、失败还是取消**，plan r2 P1-2），先按任务的 `exec_request_id` 和 `provider_ref`，到各 provider 账本里查这次执行**实际已经扣掉的积分**（provider 已结算、但工作台后续的存储或校验失败，这种情况也算），然后在同一事务里执行 `spent_credits += 实际扣费`、`reserved_credits -= $est`。失败或取消时只释放没有被用掉的那部分预留，已经发生的扣费一定计入 spent。这样同时在途的多个任务不可能一起把预算冲破。
 - **低置信度才找人**：QA 置信度低于 0.6，或重试两次没有提升，或 provider 不可用且没有备选时，才转人工。
 - **批注即指令**：`studio_annotations` 写入后由 Interpret 步骤生成结构化指令（`op` 白名单）。autonomy=max 且置信度 ≥ 0.8 时直接执行，否则界面显示“agent 理解为”，等用户确认。
 - 用户取消或暂停时：已经派出去的上游调用让它跑完（已在途的扣费照常），不再派新任务。
@@ -105,7 +105,7 @@ composing：合成沙箱 → final.mp4 → QA_final（抽帧 + 响度 + 时长�
 - 根目录 `OC_STUDIO_ROOT`，默认 `/var/lib/openclaude-v5/studio`：
   - `blobs/<aa>/<bb>/<sha256>`：内容寻址，0640，写入时先写临时文件再 rename，保证原子。物理文件不属于任何人，归属由 `studio_blob_refs`（user + 引用对象）表达，所有读取都必须先找到本人的引用（plan r1 P1-4）。物理文件的 `used_bytes` 只算一次，记在 site 行；用户行按“该用户引用到的不同 sha 的大小之和”记；
   - `work/<jobId>`：合成沙箱的工作目录。
-- 配额（plan r1 P1-5，跨进程原子预留）：`studio_quota` 里有 `u:<id>`（5 GB）和 `site`（15 GB）两行。写入前在一个事务里对这两行都执行 `UPDATE … SET reserved_bytes = reserved_bytes + $n WHERE used_bytes + reserved_bytes + $n <= limit_bytes`，任何一行失败就回滚，返回 `STUDIO_QUOTA`。`$n` 是这次写入的上限：provider 返回的文件按已知大小，合成按 -fs 上限。写入时边写边计字节，超过 `$n` 就中止并删除临时文件。完成后把预留转为 `used`；如果内容已经存在（去重），就只释放预留，只加一条引用。另有 `statfs` 硬下限：剩余空间减去全站已预留字节后少于 2 GB 时，拒绝所有写入。GC 删掉物理文件时，同步扣减 `used`。
+- 配额（plan r1 P1-5，跨进程原子预留）：`studio_quota` 里有 `u:<id>`（5 GB）和 `site`（15 GB）两行。写入前在一个事务里对这两行都执行 `UPDATE … SET reserved_bytes = reserved_bytes + $n WHERE used_bytes + reserved_bytes + $n <= limit_bytes`，任何一行失败就回滚，返回 `STUDIO_QUOTA`。`$n` 是这次写入的上限：provider 返回的文件按已知大小，合成按 -fs 上限。写入时边写边计字节，超过 `$n` 就中止并删除临时文件。完成后按两个维度分别结算（plan r2 P1-3）：**全站行**：物理文件是新的 → 预留转为 `used`；物理文件已存在 → 释放全站预留。**用户行**：这个用户此前没有引用过该 sha（看 `studio_blob_refs` 里本人是否已有这个 sha）→ 预留转为 `used`（即使别的用户早就有这个文件，也照样计入本人用量）；本人已经引用过 → 释放用户预留。插入引用和结算用户行放在同一个事务里，用 `SELECT … FOR UPDATE` 锁住用户的配额行，防止并发首次引用被重复计数或漏计。另有 `statfs` 硬下限：剩余空间减去全站已预留字节后少于 2 GB 时，拒绝所有写入。GC 删掉物理文件时，同步扣减 `used`。
 - 回收：没被采用的 take 的 blob 在 take 结束 30 天后回收；锁定的资产和成片跟着项目走；项目软删除 7 天后硬删除。由每天一次的 GC 任务完成，走队列。
 - 下发：`POST /api/studio/blobs/:sha/ticket` 签发 HMAC ticket（15 分钟，绑定用户和 sha）→ `GET /api/studio/blobs/:sha?ticket=`，支持 Range（206/416），实现照搬 `media-generation/http.ts:150-200` 并抽成共享的 `sendFileWithRange`。缩略图在生成时由 ffmpeg 直接产出 webp 存成 blob，不在请求时现做。
 
