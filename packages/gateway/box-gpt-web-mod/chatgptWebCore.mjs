@@ -18,6 +18,7 @@
  *   copies or substantial portions of the Software.
  */
 
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -60,6 +61,14 @@ export const LEVEL_SLIDER_PCT = {
 }
 
 const VALID_PROFILE = /^[a-zA-Z0-9_-]{1,40}$/
+
+/**
+ * Generates a standard UUID v4 session identifier for Box ChatGPT Web sessions
+ * so gateway resume-map validation (`sand-box-cc:<uuid>`) preserves native multi-turn continuation.
+ */
+export function defaultGptWebSessionId() {
+  return randomUUID()
+}
 
 export function profileDirFor(profile = DEFAULT_PROFILE, home = os.homedir()) {
   const normalized = String(profile || DEFAULT_PROFILE).trim() || DEFAULT_PROFILE
@@ -576,13 +585,27 @@ export async function resetComposerDraftInPage(page) {
       for (const btn of removeBtns) {
         if (typeof btn.click === 'function') btn.click()
       }
-      const el = document.querySelector(
-        '#prompt-textarea, div.ProseMirror[contenteditable="true"], [role="textbox"][contenteditable="true"]',
+      const candidates = Array.from(
+        document.querySelectorAll(
+          '#prompt-textarea, div.ProseMirror[contenteditable="true"], [role="textbox"][contenteditable="true"]',
+        ),
       )
-      if (el) {
-        if ('value' in el) el.value = ''
-        el.textContent = ''
-        el.innerHTML = ''
+      for (const el of candidates) {
+        const currentText = (el.innerText ?? el.textContent ?? el.value ?? '').trim()
+        if (!currentText) continue
+        if ('value' in el && typeof el.value === 'string') {
+          el.value = ''
+        }
+        if (typeof el.focus === 'function' && typeof document.execCommand === 'function') {
+          try {
+            el.focus()
+            document.execCommand('selectAll', false, null)
+            document.execCommand('delete', false, null)
+          } catch {}
+        }
+        if ((el.innerText ?? el.textContent ?? '').trim()) {
+          el.textContent = ''
+        }
         el.dispatchEvent(new Event('input', { bubbles: true }))
       }
     })
@@ -619,8 +642,8 @@ export async function syncPageToSessionConversation(
         waitUntil: 'domcontentloaded',
         timeout: 45_000,
       })
-      if (initScript) await page.evaluate(initScript)
     }
+    if (initScript) await page.evaluate(initScript)
     await resetComposerDraftInPage(page)
     return { conversationId: mappedConvId, navigated: needNav }
   }
@@ -752,6 +775,46 @@ export async function probeSessionState(
  * Selects the Pro tier (index 4 / 100% Max intelligence) on ChatGPT Web's
  * 5-position Intelligence slider and verifies no quota banner blocks Pro.
  */
+/**
+ * Resolves a Playwright locator matching `selector` that is currently visible (`isVisible() === true`).
+ * ChatGPT Web conversation DOM (`/c/<convId>`) and SPA route transitions often keep a hidden `0x0`
+ * duplicate of `button[aria-label="Select ChatGPT model"]` or `#prompt-textarea` at index 0 while
+ * the active composer control is at index 1+. Iterates from the last matching node to the first so
+ * the bottom composer control wins when multiple nodes exist, and stays backward-compatible with
+ * lightweight unit-test mocks that only implement `.first()` / `.count()`.
+ */
+export async function resolveVisibleLocator(page, selector, { timeoutMs = 0, pollMs = 150 } = {}) {
+  if (!page || typeof page.locator !== 'function') {
+    throw new Error(`BOX_GPT_WEB_LOCATOR_UNAVAILABLE: invalid page for selector ${selector}`)
+  }
+  const base = page.locator(selector)
+  const fallback = () => (base && typeof base.first === 'function' ? base.first() : base)
+  if (!base || typeof base.count !== 'function') {
+    return fallback()
+  }
+
+  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0)
+  while (true) {
+    const total = await base.count().catch(() => 0)
+    if (total > 0) {
+      if (typeof base.nth !== 'function') {
+        return fallback()
+      }
+      for (let i = total - 1; i >= 0; i--) {
+        const cand = base.nth(i)
+        if (!cand || typeof cand.isVisible !== 'function') {
+          return fallback()
+        }
+        const vis = await cand.isVisible().catch(() => false)
+        if (vis) return cand
+      }
+    }
+    if (Date.now() >= deadline) break
+    await new Promise((r) => setTimeout(r, pollMs))
+  }
+  return fallback()
+}
+
 export async function selectProTierInPage(page, { requestedTier = 'pro' } = {}) {
   const targetCanon = LEVEL_ALIASES[String(requestedTier).toLowerCase()] || 'pro'
   const targetIdx = LEVEL_ORDER.indexOf(targetCanon)
@@ -776,14 +839,19 @@ export async function selectProTierInPage(page, { requestedTier = 'pro' } = {}) 
     throw new TierLimitError(preLimit)
   }
 
-  let switcher = page.locator('[data-testid="model-switcher-dropdown-button"]').first()
-  if ((await switcher.count()) === 0) {
-    const altLoc = page.locator('button[aria-label="Select ChatGPT model"]')
-    if (altLoc && typeof altLoc.first === 'function') {
-      switcher = altLoc.first()
-      if (typeof switcher.waitFor === 'function') {
-        await switcher.waitFor({ state: 'visible', timeout: 15_000 }).catch(() => {})
-      }
+  let switcher = await resolveVisibleLocator(page, '[data-testid="model-switcher-dropdown-button"]')
+  const primaryCount = typeof switcher.count === 'function' ? await switcher.count() : 0
+  const primaryVisible =
+    primaryCount > 0 &&
+    (typeof switcher.isVisible !== 'function' || (await switcher.isVisible().catch(() => false)))
+  if (!primaryVisible) {
+    const altSwitcher = await resolveVisibleLocator(
+      page,
+      'button[aria-label="Select ChatGPT model"]',
+      { timeoutMs: 15_000 },
+    )
+    if (typeof altSwitcher.count === 'function' && (await altSwitcher.count()) > 0) {
+      switcher = altSwitcher
     }
   }
   if ((await switcher.count()) === 0) {
@@ -791,10 +859,20 @@ export async function selectProTierInPage(page, { requestedTier = 'pro' } = {}) 
       'BOX_GPT_WEB_SWITCHER_MISSING: [data-testid="model-switcher-dropdown-button"] not found',
     )
   }
+  if (
+    typeof switcher.isVisible === 'function' &&
+    !(await switcher.isVisible().catch(() => false))
+  ) {
+    throw new Error(
+      'BOX_GPT_WEB_SWITCHER_NOT_VISIBLE: model switcher button is present in DOM but hidden',
+    )
+  }
   await switcher.click()
 
-  const menu = page.locator('[role="menu"]').first()
-  await menu.waitFor({ state: 'visible', timeout: 5_000 })
+  const menu = await resolveVisibleLocator(page, '[role="menu"]', { timeoutMs: 5_000 })
+  if (typeof menu.waitFor === 'function') {
+    await menu.waitFor({ state: 'visible', timeout: 5_000 })
+  }
 
   const slider = menu.locator('[role="slider"]').first()
   let selectedCaption = null
@@ -935,14 +1013,23 @@ export async function uploadAttachmentsToComposer(
  * so Enter does not prematurely submit the turn.
  */
 export async function typeMultilinePreservingAttachments(page, text) {
-  let composer = page.locator('#prompt-textarea').first()
-  if (typeof composer.count === 'function' && (await composer.count()) === 0) {
-    const altComposer = page.locator(
+  let composer = await resolveVisibleLocator(page, '#prompt-textarea', { timeoutMs: 2_000 })
+  const primaryCount = typeof composer.count === 'function' ? await composer.count() : 1
+  const primaryVisible =
+    primaryCount > 0 &&
+    (typeof composer.isVisible !== 'function' || (await composer.isVisible().catch(() => false)))
+  if (!primaryVisible) {
+    const altComposer = await resolveVisibleLocator(
+      page,
       'div.ProseMirror[contenteditable="true"], [role="textbox"][contenteditable="true"]',
+      { timeoutMs: 10_000 },
     )
-    if (altComposer && typeof altComposer.first === 'function') {
-      composer = altComposer.first()
+    if (typeof altComposer.count !== 'function' || (await altComposer.count()) > 0) {
+      composer = altComposer
     }
+  }
+  if (typeof composer.waitFor === 'function') {
+    await composer.waitFor({ state: 'visible', timeout: 15_000 })
   }
   await composer.click()
   const lines = String(text ?? '').split(/\r?\n/)
@@ -1382,9 +1469,7 @@ export function extractTurnProgressFromMapping(conv, { baselineNodeId = null } =
         continue
       }
       if (ct === 'reasoning_recap') {
-        const recap = String(
-          m.content?.content || (m.content?.parts || []).join('') || '',
-        ).trim()
+        const recap = String(m.content?.content || (m.content?.parts || []).join('') || '').trim()
         if (recap) {
           thinkingSteps.push({ key: `${nodeId}:recap`, text: `[${recap}]` })
         }
@@ -1405,8 +1490,7 @@ export function extractTurnProgressFromMapping(conv, { baselineNodeId = null } =
               '',
           ).trim()
           const firstLine = rawCode.split(/\r?\n/)[0]?.slice(0, 160) || ''
-          const label =
-            recipient && recipient !== 'all' ? `[工具 ${recipient}]` : '[执行命令]'
+          const label = recipient && recipient !== 'all' ? `[工具 ${recipient}]` : '[执行命令]'
           thinkingSteps.push({
             key: `${nodeId}:code`,
             text: firstLine ? `${label} ${firstLine}` : label,
@@ -1468,7 +1552,8 @@ export async function extractLiveProgressFromDomInPage(page) {
       const articles = document.querySelectorAll(
         'article[data-turn="assistant"], [data-message-author-role="assistant"]',
       )
-      const scope = articles.length > 0 ? articles[articles.length - 1] : document.querySelector('main')
+      const scope =
+        articles.length > 0 ? articles[articles.length - 1] : document.querySelector('main')
       const statusLines = []
       if (scope) {
         const candidates = scope.querySelectorAll(
@@ -1488,8 +1573,7 @@ export async function extractLiveProgressFromDomInPage(page) {
         }
       }
       const activeThinking = Boolean(
-        stopBtn ||
-          (statusLines.length > 0 && !statusLines.every((s) => /^Thought for\b/i.test(s))),
+        stopBtn || (statusLines.length > 0 && !statusLines.every((s) => /^Thought for\b/i.test(s))),
       )
       return { stopBtn, activeThinking, statusLines }
     })
@@ -1665,7 +1749,9 @@ const NON_HOST_FILE_EXT_RE =
   /\.(?:html?|m?js|cjs|tsx?|jsx?|py|sh|json|csv|txt|md|png|jpe?g|gif|webp|svg|pdf|zip|tar|gz|css|wasm|yml|yaml|xml|sql|log)$/i
 
 export function classifyApprovalCard({ text = '', buttons = [] } = {}) {
-  const raw = String(text ?? '').replace(/\s+/g, ' ').trim()
+  const raw = String(text ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
   const summary = raw.slice(0, 140) || '未知授权卡片'
 
   const loopbackMatches = [
@@ -1690,7 +1776,7 @@ export function classifyApprovalCard({ text = '', buttons = [] } = {}) {
   const normButtons = Array.isArray(buttons)
     ? buttons.map((b, i) => ({
         index: typeof b?.index === 'number' ? b.index : i,
-        label: String(typeof b === 'string' ? b : b?.label ?? '')
+        label: String(typeof b === 'string' ? b : (b?.label ?? ''))
           .replace(/\s+/g, ' ')
           .trim(),
       }))
@@ -1836,14 +1922,13 @@ export function extractTurnOutputArtifactRefs({
     const key = `file:${cleanId}`
     if (seenKeys.has(key)) return
     seenKeys.add(key)
-    const ext =
-      mimeHint?.includes('png')
-        ? '.png'
-        : mimeHint && (mimeHint.includes('jpeg') || mimeHint.includes('jpg'))
-          ? '.jpg'
-          : mimeHint?.includes('webp')
-            ? '.webp'
-            : '.png'
+    const ext = mimeHint?.includes('png')
+      ? '.png'
+      : mimeHint && (mimeHint.includes('jpeg') || mimeHint.includes('jpg'))
+        ? '.jpg'
+        : mimeHint?.includes('webp')
+          ? '.webp'
+          : '.png'
     refs.push({
       name: nameHint || `${cleanId}${ext}`,
       fileId: cleanId,
@@ -1922,12 +2007,7 @@ export function extractTurnOutputArtifactRefs({
  */
 export async function downloadTurnOutputArtifactsInPage(
   page,
-  {
-    convId,
-    finalMessageId = null,
-    artifactRefs = [],
-    maxBytesPerFile = 25 * 1024 * 1024,
-  } = {},
+  { convId, finalMessageId = null, artifactRefs = [], maxBytesPerFile = 25 * 1024 * 1024 } = {},
 ) {
   if (
     !page ||
@@ -2074,8 +2154,7 @@ export async function downloadTurnOutputArtifactsInPage(
     if (typeof meta.downloadUrl === 'string' && meta.downloadUrl.startsWith('https://')) {
       try {
         let buf = null
-        const reqCtx =
-          typeof page.context === 'function' ? page.context()?.request : null
+        const reqCtx = typeof page.context === 'function' ? page.context()?.request : null
         if (reqCtx && typeof reqCtx.get === 'function') {
           const resp = await reqCtx.get(meta.downloadUrl, { timeout: 30_000 })
           if (resp.ok()) {
@@ -2130,11 +2209,7 @@ export function computeAdaptiveDeadline({
   const activelyThinking = Boolean(stopVisible || activeThinkingVisible)
   const hasRecentActivity = now - lastActivityAt < stallWindowMs
 
-  if (
-    now >= deadline &&
-    (activelyThinking || hasRecentActivity) &&
-    deadline < hardCeiling
-  ) {
+  if (now >= deadline && (activelyThinking || hasRecentActivity) && deadline < hardCeiling) {
     deadline = Math.min(hardCeiling, Math.max(now, deadline) + stepExtendMs)
     extended = true
   }
@@ -2497,11 +2572,8 @@ export function parseStdinFrame(line, { stagingDir = null, allowedUploadRoots = 
 
   if (!cleanText && files.length === 0) return null
   const turnId =
-    typeof parsed.ocTurnId === 'string' && parsed.ocTurnId.trim()
-      ? parsed.ocTurnId.trim()
-      : null
-  const deliveredText =
-    typeof parsed.ocDeliveredText === 'string' ? parsed.ocDeliveredText : ''
+    typeof parsed.ocTurnId === 'string' && parsed.ocTurnId.trim() ? parsed.ocTurnId.trim() : null
+  const deliveredText = typeof parsed.ocDeliveredText === 'string' ? parsed.ocDeliveredText : ''
   return {
     kind: 'user',
     text: cleanText,
