@@ -350,10 +350,13 @@ TAG_RE = re.compile(r"<(script|style)\b.*?</\1>|<[^>]+>", re.S | re.I)
 SECRET_RES = (
     (re.compile(r"https?:(?:\\?/){2}\S*", re.I), "<url>"),
     # Header-style and JSON-style fields alike: `Cookie: a=b`, `"password":"x"`, `token='x'`.
+    # A value that opens with a quote ends at the matching unescaped quote; any other
+    # auth/cookie value runs to the end of its line, so quotes inside it cannot end it early.
     (re.compile(r"""["']?\b((?:proxy-)?authorization|(?:set-)?cookie)\b["']?\s*[:=]\s*"""
-                r"""(?:"[^"]*"|'[^']*'|[^\n"'<>]*)""", re.I), r"\1: <redacted>"),
+                r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\n]*)""", re.I), r"\1: <redacted>"),
     (re.compile(r"""["']?\b(password|passwd|pwd|secret|token|access[_-]?token|api[_-]?key|session[_-]?id)\b"""
-                r"""["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s"',;}&<>]+)""", re.I), r"\1=<redacted>"),
+                r"""["']?\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}&<>]+)""", re.I),
+     r"\1=<redacted>"),
     (re.compile(r"\b(?:basic|bearer|digest|negotiate)\s+\S+", re.I), "<redacted>"),
     (re.compile(r"\S+:\S*@"), "<redacted>@"),
     (re.compile(r"mbr_[A-Za-z0-9_-]*"), "mbr_<redacted>"),
