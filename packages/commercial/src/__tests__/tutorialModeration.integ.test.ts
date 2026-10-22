@@ -121,7 +121,7 @@ async function post(id: string) {
 
 async function inbox(userId: string) {
   const result = await query<{ title: string; source_phase: string; body_md: string }>(
-    `SELECT title, source_phase, body_md FROM inbox_messages WHERE user_id = $1::bigint ORDER BY id`,
+    'SELECT title, source_phase, body_md FROM inbox_messages WHERE user_id = $1::bigint ORDER BY id',
     [userId],
   )
   return result.rows
@@ -228,12 +228,12 @@ describe('经验分享 AI 审核 worker', () => {
     const { id } = await submitCommunityTutorial(author, draft())
     const failing = transport({ textFails: true })
     for (let i = 0; i < TUTORIAL_MODERATION_MAX_ATTEMPTS; i += 1) {
-      await query(`UPDATE community_tutorial_moderation_jobs SET next_attempt_at = NOW()`)
+      await query('UPDATE community_tutorial_moderation_jobs SET next_attempt_at = NOW()')
       await runOnce(failing)
     }
     assert.equal(failing.calls.text, TUTORIAL_MODERATION_MAX_ATTEMPTS)
     assert.deepEqual([(await post(id)).status, (await post(id)).needs_human], ['pending', true])
-    const job = await query<{ status: string }>(`SELECT status FROM community_tutorial_moderation_jobs`)
+    const job = await query<{ status: string }>('SELECT status FROM community_tutorial_moderation_jobs')
     assert.equal(job.rows[0]?.status, 'failed')
     const records = await listTutorialModerations({ cursor: null, limit: 10 })
     assert.deepEqual(
@@ -270,7 +270,7 @@ describe('经验分享 AI 审核 worker', () => {
     assert.equal((await post(id)).needs_human, true)
     const offPost = await submitCommunityTutorial(author, draft(`${BODY} 另一篇`))
     assert.equal((await post(offPost.id)).needs_human, true)
-    const jobs = await query(`SELECT 1 FROM community_tutorial_moderation_jobs WHERE publication_id = $1::bigint`, [offPost.id])
+    const jobs = await query('SELECT 1 FROM community_tutorial_moderation_jobs WHERE publication_id = $1::bigint', [offPost.id])
     assert.equal(jobs.rowCount, 0)
   })
 
