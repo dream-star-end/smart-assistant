@@ -103,6 +103,8 @@ out="$(rpf_report 2>&1)"; [[ "$out" != *"u:p@"* ]] && ok "proof-db report never 
 
 rpf_reset; rpf_check_proof_db "$W" gate-db "postgres://u:p@127.0.0.1/x_test"
 expect "proof-db warn: tree without pg yet (npm ci after L0 stays supported)" proof-db warn "pg not installed"
+rpf_reset; rpf_check_proof_db "$W" shared-db "postgres://u:p@10.9.9.9/x_test"
+expect "proof-db red: non-loopback DSN refused even in a tree without pg" proof-db fail "not loopback"
 
 # ── errexit: the deploy script runs under set -Eeuo pipefail ──────────
 # Healthy and failing paths of every check must return to the caller (the result is the verdict,
