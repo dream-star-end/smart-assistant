@@ -102,8 +102,8 @@ function scanCode(text: string, from: number, inSub: boolean): [string, number] 
       out += `"${kept}"`; i = j; continue;
     }
     if (c === "`") {
-      const j = text.indexOf("`", i + 1);
-      out += `$(${stripShell(text.slice(i + 1, j < 0 ? text.length : j))})`; i = j < 0 ? text.length : j + 1; continue;
+      const j = backtickEnd(text, i + 1);
+      out += `$(${stripShell(text.slice(i + 1, j))})`; i = j + 1; continue;
     }
     if (c === "#" && (i === from || /[\s;&|(]/.test(text[i - 1]!))) {
       const j = text.indexOf("\n", i);
@@ -119,6 +119,14 @@ function scanCode(text: string, from: number, inSub: boolean): [string, number] 
   return [out, i];
 }
 
+/** Index of the backtick closing a substitution opened before `from`; `\`` inside is escaped
+ * (Codex final r3). Unclosed → end of text (fails closed: the rest is one substitution). */
+function backtickEnd(text: string, from: number): number {
+  let j = from;
+  while (j < text.length && text[j] !== "`") j += text[j] === "\\" ? 2 : 1;
+  return Math.min(j, text.length);
+}
+
 function scanDouble(text: string, from: number): [string, number] {
   let out = "";
   let i = from;
@@ -130,8 +138,8 @@ function scanDouble(text: string, from: number): [string, number] {
       out += `$(${inner})`; i = j; continue;
     }
     if (c === "`") {
-      const j = text.indexOf("`", i + 1);
-      out += `$(${stripShell(text.slice(i + 1, j < 0 ? text.length : j))})`; i = j < 0 ? text.length : j + 1; continue;
+      const j = backtickEnd(text, i + 1);
+      out += `$(${stripShell(text.slice(i + 1, j))})`; i = j + 1; continue;
     }
     const v = c === "$" ? /^\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)/.exec(text.slice(i)) : null;
     if (v) { out += v[0]; i += v[0].length; continue; }
