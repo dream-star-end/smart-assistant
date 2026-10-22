@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import sharp from 'sharp'
+import sharp, { type Metadata } from 'sharp'
 import { query } from '../db/queries.js'
 
 export const MAX_INBOX_ASSETS = 8
@@ -91,7 +91,7 @@ async function normalizeImage(
   index: number,
   source: Buffer,
 ): Promise<PreparedInboxAsset> {
-  let metadata: sharp.Metadata
+  let metadata: Metadata
   try {
     metadata = await sharp(source, {
       animated: true,
