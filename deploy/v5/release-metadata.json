@@ -189,7 +189,7 @@
     "0315_selfhost_muse_media",
     "0320_community_blog",
     "0321_community_tutorial_moderation",
-    "0316_commercial_literature_captcha_requests"
+    "0322_selfhost_literature_captcha_requests"
   ],
   "capabilities": [
     "sessions-store-pg-v1",

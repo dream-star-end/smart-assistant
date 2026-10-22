@@ -1,4 +1,4 @@
--- order-dependency: none  (0314/0315 are commercial-only migrations on feat/v5-aurora-rewrite)
+-- order-dependency: none  (selfhost copy of commercial 0316_commercial_literature_captcha_requests; additive, independent of 0320/0321)
 -- OCV5-524: free plugin inference uses platform request quotas, never user wallet debits.
 -- Reservations are counted even if the provider result/usage is unknown. No automatic refunds.
 -- Additive: old binaries ignore this table. No service is activated by this migration.

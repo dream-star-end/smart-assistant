@@ -284,7 +284,7 @@ test('migration rollback refuses retained usage and an empty-table rollback can 
   if (db.skipIfUnavailable(t)) return
   await meter().beginPlatformUsage(begin())
   const sql = await readFile(
-    new URL('../../db/rollbacks/0316_commercial_literature_captcha_requests.sql', import.meta.url),
+    new URL('../../db/rollbacks/0322_selfhost_literature_captcha_requests.sql', import.meta.url),
     'utf8',
   )
   const client = await getPool().connect()
