@@ -2355,6 +2355,7 @@ export function resolveTurnCompletionDecision({
   stopVisible = false,
   activeThinkingVisible = false,
   stopGoneSince = null,
+  lastFinalTextGrowthAt = null,
   now = Date.now(),
   emptyDoneGraceMs = 45_000,
 } = {}) {
@@ -2393,8 +2394,13 @@ export function resolveTurnCompletionDecision({
     }
   }
 
-  // No finished reply yet: if stopGoneSince is within the grace window, keep polling instead of exiting empty.
-  if (stopGoneSince === null || now - stopGoneSince < emptyDoneGraceMs) {
+  // No finished reply yet: if stopGoneSince or recent liveFinalText growth is within the grace window,
+  // keep polling instead of exiting empty or truncating a still-growing in_progress message.
+  if (
+    stopGoneSince === null ||
+    now - stopGoneSince < emptyDoneGraceMs ||
+    (lastFinalTextGrowthAt !== null && now - lastFinalTextGrowthAt < emptyDoneGraceMs)
+  ) {
     return { action: 'wait_grace' }
   }
 

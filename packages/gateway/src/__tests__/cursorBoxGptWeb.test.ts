@@ -1836,7 +1836,27 @@ rl.on('line', (line) => {
     assert.equal(rescuedDecision.source, 'rescue')
     assert.equal(rescuedDecision.messageId, '71e55f98-6bd2-58aa-8870-8a170e11423d')
 
-    // 3. After the grace window expires, fall back to liveFinalText if available, or error_empty if truly empty
+    // 3. If liveFinalText is still growing (lastFinalTextGrowthAt within emptyDoneGraceMs),
+    // must return wait_grace even after stopGoneSince exceeds emptyDoneGraceMs
+    const growingDecision = resolveTurnCompletionDecision({
+      accDone: true,
+      accFinalText: '',
+      rescued: null,
+      latestProg: {
+        liveFinalText: 'Still streaming in_progress text...',
+        finishedFinal: null,
+      },
+      emittedFinalText: '',
+      stopVisible: false,
+      activeThinkingVisible: false,
+      stopGoneSince: 1_000,
+      lastFinalTextGrowthAt: 40_000,
+      now: 50_000,
+      emptyDoneGraceMs: 45_000,
+    })
+    assert.equal(growingDecision.action, 'wait_grace')
+
+    // After BOTH stopGoneSince and lastFinalTextGrowthAt exceed the grace window, fall back to liveFinalText
     const partialDecision = resolveTurnCompletionDecision({
       accDone: true,
       accFinalText: '',
@@ -1849,6 +1869,7 @@ rl.on('line', (line) => {
       stopVisible: false,
       activeThinkingVisible: false,
       stopGoneSince: 1_000,
+      lastFinalTextGrowthAt: 2_000,
       now: 50_000,
       emptyDoneGraceMs: 45_000,
     })

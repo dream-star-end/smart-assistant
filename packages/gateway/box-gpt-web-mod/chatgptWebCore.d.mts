@@ -315,6 +315,7 @@ export function resolveTurnCompletionDecision(opts?: {
   stopVisible?: boolean
   activeThinkingVisible?: boolean
   stopGoneSince?: number | null
+  lastFinalTextGrowthAt?: number | null
   now?: number
   emptyDoneGraceMs?: number
 }): {

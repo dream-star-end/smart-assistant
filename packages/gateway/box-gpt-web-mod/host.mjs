@@ -7,6 +7,8 @@
  */
 
 import { spawn } from 'node:child_process'
+import crypto from 'node:crypto'
+import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
@@ -373,16 +375,41 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
               typeof turn.deliveredText === 'string' ? turn.deliveredText : '',
           })
 
+          const turnAttachmentSignature = Array.isArray(turn.files)
+            ? turn.files
+                .map((filePath) => {
+                  const raw = String(filePath ?? '')
+                  try {
+                    const buf = fs.readFileSync(raw)
+                    const digest = crypto
+                      .createHash('sha256')
+                      .update(buf)
+                      .digest('hex')
+                      .slice(0, 16)
+                    return `${path.basename(raw)}:${buf.byteLength}:${digest}`
+                  } catch {
+                    return path.basename(raw)
+                  }
+                })
+                .join('|')
+            : ''
+
           const activeTurnState = loadActiveTurnState(profileDir, cfg.sessionId)
+          const sameAttachments =
+            Boolean(activeTurnState) &&
+            (activeTurnState.attachmentSignature ?? '') === turnAttachmentSignature
           const isSameTurn = Boolean(
             activeTurnState &&
+              sameAttachments &&
               activeTurnState.promptText === turn.text &&
               (turn.turnId ? activeTurnState.turnId === turn.turnId : !activeTurnState.completedAt),
           )
           // Also allow recovering an already-completed ChatGPT reply when the user retries
-          // the exact same prompt in the same session after a prior empty/interrupted turn.
+          // the exact same prompt (with identical attachment signature) in the same session
+          // after a prior empty/interrupted turn.
           const canRecoverSamePromptRetry = Boolean(
             activeTurnState &&
+              sameAttachments &&
               activeTurnState.promptText === turn.text &&
               !activeTurnState.completedWithText,
           )
@@ -403,6 +430,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
             conversationId: activeTurnState?.conversationId || null,
             baselineNodeId: isSameTurn ? (activeTurnState?.baselineNodeId ?? null) : null,
             promptText: turn.text,
+            attachmentSignature: turnAttachmentSignature,
             startedAt:
               isSameTurn && Number.isFinite(activeTurnState?.startedAt)
                 ? activeTurnState.startedAt
@@ -691,6 +719,8 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
           let lastRescueAttemptAt = 0
           let lastDomActiveThinking = false
           let lastObservedNodeId = baselineNodeId
+          let lastObservedLiveFinalText = ''
+          let lastFinalTextGrowthAt = null
           let latestProg = null
           let readCursor = 0
 
@@ -821,6 +851,11 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
                   lastObservedNodeId = prog.currentNode
                   lastActivityAt = now
                 }
+                if (prog.liveFinalText && prog.liveFinalText !== lastObservedLiveFinalText) {
+                  lastObservedLiveFinalText = prog.liveFinalText
+                  lastFinalTextGrowthAt = now
+                  lastActivityAt = now
+                }
                 const { thinkingDeltas, textDeltas } = streamer.ingestMappingProgress(prog)
                 for (const td of thinkingDeltas) {
                   lastActivityAt = now
@@ -870,13 +905,25 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
             currentDeadline = adaptive.deadline
 
             if (adaptive.shouldRescue && hasValidMappingBaseline) {
+              const canUseInProgressFallback =
+                lastFinalTextGrowthAt === null || now - lastFinalTextGrowthAt >= 45_000
               const rescued = await rescueFromDomOrMapping(page, resolvedConvId, {
                 baselineNodeId,
                 allowReload: true,
-                allowInProgress: true,
+                allowInProgress: canUseInProgressFallback,
               })
               if (rescued?.conv) {
                 latestConv = rescued.conv
+                const rescuedProg = extractTurnProgressFromMapping(rescued.conv, { baselineNodeId })
+                latestProg = rescuedProg
+                if (
+                  rescuedProg.liveFinalText &&
+                  rescuedProg.liveFinalText !== lastObservedLiveFinalText
+                ) {
+                  lastObservedLiveFinalText = rescuedProg.liveFinalText
+                  lastFinalTextGrowthAt = now
+                  lastActivityAt = now
+                }
               }
               if (rescued?.text) {
                 const finalConvId = rescued.convId || resolvedConvId
@@ -901,11 +948,22 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
                 rescued = await rescueFromDomOrMapping(page, resolvedConvId, {
                   baselineNodeId,
                   allowReload: stopGoneElapsed >= 15_000,
-                  allowInProgress: stopGoneElapsed >= 30_000,
+                  allowInProgress: false,
                 })
                 if (rescued?.conv) {
                   latestConv = rescued.conv
-                  latestProg = extractTurnProgressFromMapping(rescued.conv, { baselineNodeId })
+                  const rescuedProg = extractTurnProgressFromMapping(rescued.conv, {
+                    baselineNodeId,
+                  })
+                  latestProg = rescuedProg
+                  if (
+                    rescuedProg.liveFinalText &&
+                    rescuedProg.liveFinalText !== lastObservedLiveFinalText
+                  ) {
+                    lastObservedLiveFinalText = rescuedProg.liveFinalText
+                    lastFinalTextGrowthAt = now
+                    lastActivityAt = now
+                  }
                 }
               }
               const decision = resolveTurnCompletionDecision({
@@ -917,6 +975,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
                 stopVisible: batch.stopBtn,
                 activeThinkingVisible: lastDomActiveThinking,
                 stopGoneSince,
+                lastFinalTextGrowthAt,
                 now,
               })
               if (decision.action === 'finalize' && decision.text) {
