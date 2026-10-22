@@ -62,6 +62,11 @@ MIN_REQUIRED_TOPLEVEL=(AGENTS.md CLAUDE.md skills)
 MIN_FORBIDDEN_SKILLS=()
 MIN_FORBIDDEN_RELATIVE_PATHS=()
 
+# Serving predecessor compatibility only: skills a later release retired that an older serving
+# release still carries (oc-vision, retired by OCV5-547). Legacy mode accepts them when present;
+# new releases remain exact-manifest strict.
+LEGACY_RETIRED_SKILLS=(oc-vision)
+
 # Serving predecessor compatibility only: pre-admin/taskboard releases may lack
 # the two admin prompt variants and the cursor/taskboard skills; releases built
 # before the SSH skill landed may lack that skill too; serving releases before
@@ -165,6 +170,11 @@ assert_structure() { # <baseline-dir>
         skills_expected="$(grep -vx "$skill" <<<"$skills_expected")"
       fi
     done
+    for skill in "${LEGACY_RETIRED_SKILLS[@]}"; do
+      if [[ -e "$root/skills/$skill" ]]; then
+        skills_expected="$(printf '%s\n%s\n' "$skills_expected" "$skill")"
+      fi
+    done
   fi
   skills_expected="$(sorted_lines <<<"$skills_expected")"
   # Runtime resolveCcbBaselineMounts() enumerates every skills/ entry before it
@@ -183,6 +193,11 @@ assert_structure() { # <baseline-dir>
     fi
     assert_skill_inner "$root" "$skill"
   done
+  if [[ "$ALLOW_LEGACY_BASELINE_GAPS" == 1 ]]; then
+    for skill in "${LEGACY_RETIRED_SKILLS[@]}"; do
+      if [[ -e "$root/skills/$skill" ]]; then assert_skill_inner "$root" "$skill"; fi
+    done
+  fi
 }
 
 # Question (a): the release matches its own baked expectedSkills / top-level
