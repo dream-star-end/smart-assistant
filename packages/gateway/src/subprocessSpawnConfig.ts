@@ -524,9 +524,26 @@ export function _buildAnthropicCustomHeadersEnv(
   push(AUTHORITY_HEADER, headers?.authority)
   push(TURN_LEASE_HEADER, headers?.lease)
   push(LOCAL_CATALOG_HEADER, headers?.localCatalog)
+  return { ANTHROPIC_CUSTOM_HEADERS: _withTraceIdHeader(lines.join('\n'), traceId) }
+}
+
+/** The turn trace if it is a valid canonical id, else undefined (dropped, never rejected). */
+function validTraceId(traceId: string | undefined): string | undefined {
+  if (traceId === undefined) return undefined
   const trace = parseTraceIdCandidate(traceId)
-  if (traceId !== undefined && trace.ok) push(TRACE_ID_HEADER, trace.traceId)
-  return { ANTHROPIC_CUSTOM_HEADERS: lines.join('\n') }
+  return trace.ok ? trace.traceId : undefined
+}
+
+/**
+ * `ANTHROPIC_CUSTOM_HEADERS` plus the `x-openclaude-trace-id` line for a valid trace (OCV5-570).
+ * official-cc reads its headers only at spawn, so the runner adds the trace to that spawn env once
+ * it knows the process's upstream is egress.
+ */
+export function _withTraceIdHeader(customHeaders: string, traceId: string | undefined): string {
+  const trace = validTraceId(traceId)
+  if (trace === undefined) return customHeaders
+  const line = `${TRACE_ID_HEADER}: ${trace}`
+  return customHeaders === '' ? line : `${customHeaders}\n${line}`
 }
 
 /**
@@ -1102,8 +1119,13 @@ export function buildOfficialCcProxySpawnEnv(input: {
   }
 }
 
-export function officialCcProxySpawnFingerprint(vars: Record<string, string>): string {
-  return JSON.stringify(vars)
+/** The turn trace is part of the fingerprint: it reaches the stock CLI only through the spawn env. */
+export function officialCcProxySpawnFingerprint(
+  vars: Record<string, string>,
+  traceId?: string,
+): string {
+  const trace = validTraceId(traceId)
+  return trace === undefined ? JSON.stringify(vars) : JSON.stringify([vars, trace])
 }
 
 /**
