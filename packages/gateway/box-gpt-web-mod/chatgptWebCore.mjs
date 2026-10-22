@@ -1105,6 +1105,195 @@ export function backendFetchTeeInitScript() {
   })();`
 }
 
+// ChatGPT Web inline markers (OCV5-584): U+E200 <kind> U+E202 <payload…> U+E201, e.g. cite + turn0search3 refs,
+// genui + {"citation":{"ref":"turn27view0"}} or {"citation":{"refs":[…]}}, entity + ["company","Topcon",…].
+// chatgpt.com renders them as source chips; passed through raw they leak as private-use glyphs plus JSON.
+const CITE_OPEN = ''
+const CITE_CLOSE = ''
+const CITE_SEP = ''
+const CITE_STRAY_RE = /[-]/g
+const CITE_REF_RE = /^turn\d+[a-z_]+\d+$/i
+const CITE_HEAD_RE = /^[a-z_]{1,32}/i
+const CITE_HEAD_PREFIX_RE = /^[a-z_]{0,32}$/i
+/** A marker head longer than this is not a marker: only its private-use chars are dropped. */
+export const CHATGPT_MARKER_MAX_LEN = 65_536
+
+function citationRefId(ref) {
+  if (typeof ref === 'string') return CITE_REF_RE.test(ref) ? ref : null
+  const { turn_index: turn, ref_type: type, ref_index: index } = ref && typeof ref === 'object' ? ref : {}
+  if (!Number.isInteger(turn) || !Number.isInteger(index) || typeof type !== 'string') return null
+  const id = `turn${turn}${type}${index}`
+  return CITE_REF_RE.test(id) ? id : null
+}
+
+function citationSource(obj) {
+  const url = obj && typeof obj === 'object' && typeof obj.url === 'string' ? obj.url.trim() : ''
+  if (!/^https?:\/\/[^\s/]/i.test(url) || [...url].some((ch) => ch < ' ' || ch === '\x7f')) return null
+  return { url, title: typeof obj.title === 'string' ? obj.title.trim() : '' }
+}
+
+function addCitationSource(into, key, src) {
+  const list = into.get(key) || []
+  if (!list.some((s) => s.url === src.url)) list.push(src)
+  into.set(key, list)
+}
+
+/** Collects http(s) citation sources from any ChatGPT message metadata fragment into `into`
+ * (Map<refId | `matched:${markerText}`, {url,title}[]>). A bounded generic walk, because the shape varies:
+ * content_references[] {matched_text, refs[], items[]}, search_result_groups[].entries[] {url, title, ref_id}. */
+export function collectChatgptCitationSources(value, into = new Map()) {
+  let budget = 20_000
+  const walk = (v, depth) => {
+    if (!v || typeof v !== 'object' || depth > 10 || budget-- <= 0) return
+    if (Array.isArray(v)) return v.forEach((item) => walk(item, depth + 1))
+    const own = citationSource(v)
+    const refId = citationRefId(v.ref_id)
+    if (own && refId) addCitationSource(into, refId, own)
+    const items = (Array.isArray(v.items) ? v.items : []).map(citationSource).filter(Boolean)
+    const sources = items.length > 0 ? items : own ? [own] : []
+    if (typeof v.matched_text === 'string' && v.matched_text.includes(CITE_OPEN)) {
+      for (const s of sources) addCitationSource(into, `matched:${v.matched_text}`, s)
+    }
+    const refs = (Array.isArray(v.refs) ? v.refs : []).map(citationRefId).filter(Boolean)
+    refs.forEach((id, i) => {
+      for (const s of refs.length === sources.length ? [sources[i]] : sources) addCitationSource(into, id, s)
+    })
+    for (const key of Object.keys(v)) walk(v[key], depth + 1)
+  }
+  walk(value, 0)
+  return into
+}
+
+function markerJson(payload) {
+  try {
+    return JSON.parse(payload.join(CITE_SEP))
+  } catch {
+    return null
+  }
+}
+
+function citationRefsOf(kind, payload) {
+  if (kind !== 'genui') return payload.map((p) => p.trim()).filter((p) => CITE_REF_RE.test(p))
+  const c = markerJson(payload)?.citation
+  if (!c || typeof c !== 'object') return []
+  return (Array.isArray(c.refs) ? c.refs : [c.ref]).map(citationRefId).filter(Boolean)
+}
+
+const markdownSafeUrl = (url) =>
+  url.replace(/[\s()<>]/g, (ch) => encodeURIComponent(ch).replace(/[()]/g, (c) => (c === '(' ? '%28' : '%29')))
+
+/** Raw ChatGPT final text → display text (OCV5-584). A citation marker with a known source becomes [n](url),
+ * otherwise it goes; entity markers keep their name; stray marker chars never reach the output. An unterminated
+ * marker is held while streaming (split SSE frames never leak) and dropped at the end. Prefix-stable: a marker
+ * renders once (on reconnect, as the previous host delivered it); sources known only later go to a final 来源 list. */
+export class ChatgptCitationRenderer {
+  constructor({ sources = null } = {}) {
+    this.sources = new Map()
+    this.renderedByMarker = new Map()
+    this.numberByUrl = new Map()
+    this.nextNumber = 1
+    this.pendingRefs = []
+    this.addSources(sources)
+  }
+
+  addSources(sources) {
+    for (const [key, list] of sources || []) for (const s of list) addCitationSource(this.sources, key, s)
+  }
+
+  exportState() {
+    const { renderedByMarker: r, numberByUrl: n, nextNumber, pendingRefs } = this
+    return { rendered: [...r], numbers: [...n], nextNumber, pendingRefs }
+  }
+
+  restoreState(state) {
+    if (!Array.isArray(state?.rendered) || !Array.isArray(state.numbers)) return
+    Object.assign(this, { renderedByMarker: new Map(state.rendered), numberByUrl: new Map(state.numbers),
+      nextNumber: Number(state.nextNumber) || state.numbers.length + 1, pendingRefs: state.pendingRefs || [] })
+  }
+
+  #resolve(markerText, refs) {
+    const found = new Map()
+    for (const key of [`matched:${markerText}`, ...refs]) {
+      for (const s of this.sources.get(key) || []) if (!found.has(s.url)) found.set(s.url, s)
+    }
+    return [...found.values()]
+  }
+
+  #numberFor(url) {
+    const key = markdownSafeUrl(url)
+    if (!this.numberByUrl.has(key)) this.numberByUrl.set(key, this.nextNumber++)
+    return this.numberByUrl.get(key)
+  }
+
+  /** `delivered`: what a previous host already sent at this position (reconnect) — adopted, never contradicted. */
+  #renderMarker(markerText, delivered) {
+    const [kind, ...payload] = markerText.slice(1, -1).split(CITE_SEP)
+    if (kind === 'entity') {
+      const arr = markerJson(payload)
+      return Array.isArray(arr) && typeof arr[1] === 'string' ? arr[1].replace(CITE_STRAY_RE, '') : ''
+    }
+    const refs = citationRefsOf(kind, payload)
+    const found = refs.length > 0 ? this.#resolve(markerText, refs) : []
+    if (delivered != null) {
+      // Fallback when the renderer state was lost: claim only this marker's links (its own sources, or
+      // at most one per ref when they are unknown) so an adjacent marker keeps its own.
+      const safe = new Set(found.map((s) => markdownSafeUrl(s.url)))
+      const mine = []
+      for (const l of delivered.match(/^(?:\[\d+\]\([^)\s]+\))+/)?.[0].matchAll(/\[(\d+)\]\(([^)\s]+)\)/g) ?? []) {
+        if (safe.size > 0 ? !safe.has(l[2]) : mine.length >= refs.length) break
+        this.numberByUrl.set(l[2], Number(l[1]))
+        this.nextNumber = Math.max(this.nextNumber, Number(l[1]) + 1)
+        mine.push(l[0])
+      }
+      if (mine.length > 0) return mine.join('')
+    }
+    if (refs.length > 0 && (found.length === 0 || delivered != null)) this.pendingRefs.push({ markerText, refs })
+    if (delivered != null) return ''
+    return found.map((s) => `[${this.#numberFor(s.url)}](${markdownSafeUrl(s.url)})`).join('')
+  }
+
+  render(rawText, { final = false, delivered = '' } = {}) {
+    const raw = String(rawText ?? '')
+    let out = ''
+    let i = 0
+    while (i < raw.length) {
+      const open = raw.indexOf(CITE_OPEN, i)
+      out += raw.slice(i, open < 0 ? raw.length : open).replace(CITE_STRAY_RE, '')
+      if (open < 0) break
+      const close = raw.indexOf(CITE_CLOSE, open + 1)
+      const reopen = raw.indexOf(CITE_OPEN, open + 1)
+      const cut = reopen >= 0 && (close < 0 || reopen < close)
+      const end = cut ? reopen : close < 0 ? raw.length : close + 1
+      const seg = raw.slice(open, end)
+      const head = seg.length <= CHATGPT_MARKER_MAX_LEN && CITE_HEAD_RE.test(seg)
+      if (!cut && close >= 0 && head) {
+        const key = `${open}:${seg}`
+        const prior = delivered.length > out.length ? delivered.slice(out.length) : null
+        if (!this.renderedByMarker.has(key)) this.renderedByMarker.set(key, this.#renderMarker(seg, prior))
+        out += this.renderedByMarker.get(key)
+        i = end
+      } else if (!cut && close < 0 && (head || (seg.length <= 33 && CITE_HEAD_PREFIX_RE.test(seg)))) {
+        // unterminated marker (maybe split across SSE frames): held while streaming, dropped at the end
+        if (!final) return out
+        break
+      } else if (cut && head) {
+        i = reopen // an abandoned marker head before the next marker
+      } else {
+        i = open + 1 // not a marker: only the private-use char goes
+      }
+    }
+    return final ? out + this.#lateSourcesSection() : out
+  }
+
+  #lateSourcesSection() {
+    const late = new Map()
+    for (const { markerText, refs } of this.pendingRefs) for (const s of this.#resolve(markerText, refs)) late.set(s.url, s)
+    const lines = [...late.values()].map((s) =>
+      `${this.#numberFor(s.url)}. [${(s.title || s.url).replace(/[[\]\n\r]/g, ' ').trim()}](${markdownSafeUrl(s.url)})`)
+    return lines.length > 0 ? `\n\n来源：\n${lines.join('\n')}` : ''
+  }
+}
+
 /**
  * Stateful accumulator for ChatGPT Web's delta-encoded SSE frames (event: delta_encoding / v1).
  * Strictly separates internal reasoning (thoughts / reasoning_recap / commentary) from final
@@ -1122,6 +1311,7 @@ export class SseAccumulator {
     this.contentType = null
     this.finalText = ''
     this.thinkingText = ''
+    this.citationSources = new Map()
     this.done = false
     this.streamHandoff = false
     this.error = null
@@ -1224,6 +1414,9 @@ export class SseAccumulator {
     this.channel = msg.channel ?? null
     this.contentType = msg.content?.content_type || null
     if (msg.id) this.messageId = msg.id
+    if (msg.metadata && typeof msg.metadata === 'object') {
+      collectChatgptCitationSources(msg.metadata, this.citationSources)
+    }
 
     if (this.role !== 'assistant') return
 
@@ -1263,6 +1456,10 @@ export class SseAccumulator {
 
     if (p === '/message/channel' && typeof v === 'string') {
       this.channel = v
+      return
+    }
+    if (p.startsWith('/message/metadata')) {
+      if (v && typeof v === 'object') collectChatgptCitationSources(v, this.citationSources)
       return
     }
     if (p === '/message/content/content_type' && typeof v === 'string') {
@@ -1516,6 +1713,7 @@ export function extractTurnProgressFromMapping(conv, { baselineNodeId = null } =
       thinkingSteps: [],
       liveFinalText: '',
       finishedFinal: null,
+      citationSources: new Map(),
       currentNode: null,
     }
   }
@@ -1536,10 +1734,14 @@ export function extractTurnProgressFromMapping(conv, { baselineNodeId = null } =
   const thinkingSteps = []
   let liveFinalText = ''
   let finishedFinal = null
+  const citationSources = new Map()
 
   for (const { id: nodeId, node } of chain) {
     const m = node.message
     if (!m) continue
+    if (m.metadata && typeof m.metadata === 'object') {
+      collectChatgptCitationSources(m.metadata, citationSources)
+    }
     const role = m.author?.role
     const ct = m.content?.content_type
     const ch = m.channel
@@ -1620,6 +1822,7 @@ export function extractTurnProgressFromMapping(conv, { baselineNodeId = null } =
     thinkingSteps,
     liveFinalText,
     finishedFinal,
+    citationSources,
     currentNode: conv.current_node || null,
   }
 }
@@ -1719,6 +1922,7 @@ export class TurnProgressStreamer {
     this.seenDomPhaseKeys = new Set()
     this.emittedFinalText = String(initialEmittedFinalText ?? '')
     this.lastThinkingEmitAt = nowFn()
+    this.citations = new ChatgptCitationRenderer()
   }
 
   restoreState(state) {
@@ -1733,12 +1937,14 @@ export class TurnProgressStreamer {
         }
       }
     }
+    this.citations.restoreState(state.citations)
   }
 
   exportState() {
     return {
       emittedFinalText: this.emittedFinalText,
       stepTextByKey: Object.fromEntries(this.stepTextByKey),
+      citations: this.citations.exportState(),
     }
   }
 
@@ -1762,6 +1968,7 @@ export class TurnProgressStreamer {
         this.lastThinkingEmitAt = this.nowFn()
       }
     }
+    this.citations.addSources(progress.citationSources)
     if (progress.liveFinalText) {
       const delta = this.consumeIncrementalFinalText(progress.liveFinalText, {
         finalFlush: Boolean(progress.finishedFinal),
@@ -1807,8 +2014,9 @@ export class TurnProgressStreamer {
     return { thinkingDeltas }
   }
 
+  /** `fullText` is ChatGPT's raw text; deltas and `emittedFinalText` are display text (OCV5-584). */
   consumeIncrementalFinalText(fullText, { finalFlush = false } = {}) {
-    const text = String(fullText ?? '')
+    const text = this.citations.render(fullText, { final: finalFlush, delivered: this.emittedFinalText })
     if (!text) return ''
     if (!finalFlush) {
       const safeLen = safeStreamableTextLength(text)

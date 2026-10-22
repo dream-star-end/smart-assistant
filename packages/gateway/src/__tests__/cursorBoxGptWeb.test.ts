@@ -7,6 +7,8 @@ import { PassThrough } from 'node:stream'
 import { describe, it } from 'node:test'
 
 import {
+  CHATGPT_MARKER_MAX_LEN,
+  ChatgptCitationRenderer,
   DEFAULT_MAX_TIMEOUT_MS,
   SerialJobQueue,
   SseAccumulator,
@@ -16,6 +18,7 @@ import {
   cdpPortForProfile,
   classifyApprovalCard,
   clearActiveTurnState,
+  collectChatgptCitationSources,
   computeAdaptiveDeadline,
   defaultGptWebSessionId,
   detectTierLimit,
@@ -1985,5 +1988,239 @@ rl.on('line', (line) => {
     assert.equal(secondFetch.conv?.current_node, 'node-final')
     assert.equal(authCalls, 2)
     assert.equal(convCalls, 3)
+  })
+})
+
+// OCV5-584: ChatGPT Web inline citation markers leaked into GPT-6 Astra Pro replies as private-use glyphs + JSON.
+describe('Box ChatGPT Web citation markers (OCV5-584)', () => {
+  const O = ''
+  const C = ''
+  const S = ''
+  const PUA = /[-]/
+  const genui = (citation: object) => `${O}genui${S}${JSON.stringify({ citation })}${C}`
+  const ref = (turn: number, type: string, index: number) => ({ turn_index: turn, ref_type: type, ref_index: index })
+  const contentReferences = [
+    {
+      matched_text: genui({ ref: 'turn27view0' }),
+      refs: [ref(27, 'view', 0)],
+      items: [{ url: 'https://www.topcon.example/ms05axii', title: 'Topcon MS05AXII' }],
+    },
+  ]
+  const searchGroups = [
+    { entries: [{ url: 'https://sokkia.example/net05', title: 'Sokkia NET05AXII', ref_id: ref(30, 'search', 23) }] },
+  ]
+  const answer =
+    `拓普康 0.5 mm+1 ppm。${genui({ ref: 'turn27view0' })}\n` +
+    `| 索佳 | 0.5 mm+1 ppm ${genui({ refs: ['turn30search23', 'turn30search0'] })} |\n` +
+    `出自 ${O}entity${S}["company","Topcon","Japanese maker"]${C}。${O}cite${S}turn9search1${C}完`
+
+  /** Feeds SSE frames the way host.mjs does and returns every text_delta plus the final display text. */
+  function streamThroughHost(frames: object[]) {
+    const streamer = new TurnProgressStreamer()
+    const deltas: string[] = []
+    const acc = new SseAccumulator({
+      onTextDelta: () => {
+        streamer.citations.addSources(acc.citationSources)
+        const delta = streamer.consumeIncrementalFinalText(acc.finalText, { finalFlush: false })
+        if (delta) deltas.push(delta)
+      },
+    })
+    for (const frame of frames) acc.feedDataLine(JSON.stringify(frame))
+    streamer.citations.addSources(acc.citationSources)
+    const tail = streamer.consumeIncrementalFinalText(acc.finalText, { finalFlush: true })
+    if (tail) deltas.push(tail)
+    return { deltas, final: streamer.emittedFinalText }
+  }
+  const snapshot = {
+    v: { message: { id: 'm1', author: { role: 'assistant' }, channel: 'final', content: { content_type: 'text', parts: [''] } } },
+  }
+  /** Splits the answer into small appends, cutting markers in the middle (also inside the JSON). */
+  const appends = (text: string, size: number) =>
+    Array.from({ length: Math.ceil(text.length / size) }, (_, n) => ({
+      p: '/message/content/parts/0',
+      o: 'append',
+      v: text.slice(n * size, n * size + size),
+    }))
+
+  it('OCV5-584 a citation marker with a known source renders as a numbered link', () => {
+    const sources = collectChatgptCitationSources({ content_references: contentReferences, search_result_groups: searchGroups })
+    const out = new ChatgptCitationRenderer({ sources }).render(answer, { final: true })
+    assert.equal(
+      out,
+      '拓普康 0.5 mm+1 ppm。[1](https://www.topcon.example/ms05axii)\n' +
+        '| 索佳 | 0.5 mm+1 ppm [2](https://sokkia.example/net05) |\n' +
+        '出自 Topcon。完',
+    )
+    // a URL that would break the markdown link is percent-encoded; non-http sources are ignored
+    const odd = collectChatgptCitationSources({
+      content_references: [
+        { refs: ['turn1search0'], items: [{ url: 'https://x.example/a (b)' }, { url: 'javascript:alert(1)' }] },
+      ],
+    })
+    assert.equal(
+      new ChatgptCitationRenderer({ sources: odd }).render(`a${O}cite${S}turn1search0${C}`, { final: true }),
+      'a[1](https://x.example/a%20%28b%29)',
+    )
+  })
+
+  it('OCV5-584 an unresolved citation marker and stray marker characters are removed', () => {
+    const out = new ChatgptCitationRenderer().render(
+      `${answer}${O}image_group${S}{"query":["x"]}${C} 尾${S}${C}`,
+      { final: true },
+    )
+    assert.equal(out, '拓普康 0.5 mm+1 ppm。\n| 索佳 | 0.5 mm+1 ppm  |\n出自 Topcon。完 尾')
+    assert.ok(!PUA.test(out))
+    assert.ok(!out.includes('citation'))
+    // ordinary text passes through unchanged
+    assert.equal(new ChatgptCitationRenderer().render('plain [link](https://a.example) 文本'), 'plain [link](https://a.example) 文本')
+  })
+
+  it('OCV5-584 a marker split across SSE frames never reaches a text delta', () => {
+    for (const size of [1, 2, 3, 7, 16]) {
+      const { deltas, final } = streamThroughHost([
+        snapshot,
+        { p: '/message/metadata', o: 'add', v: { content_references: contentReferences, search_result_groups: searchGroups } },
+        ...appends(answer, size),
+        { type: 'message_stream_complete' },
+      ])
+      for (const d of deltas) {
+        assert.ok(!PUA.test(d), `size ${size}: delta leaked ${JSON.stringify(d)}`)
+        assert.ok(!d.includes('"citation"'), `size ${size}: delta leaked ${JSON.stringify(d)}`)
+      }
+      assert.equal(deltas.join(''), final)
+      assert.ok(final.includes('[1](https://www.topcon.example/ms05axii)'), final)
+      assert.ok(final.includes('[2](https://sokkia.example/net05)'), final)
+      assert.ok(!final.includes('来源'), final)
+    }
+  })
+
+  it('OCV5-584 sources that arrive after the text are listed once at the end', () => {
+    const { deltas, final } = streamThroughHost([
+      snapshot,
+      ...appends(answer, 5),
+      { p: '/message/metadata/content_references', o: 'append', v: contentReferences },
+      { p: '/message/metadata', o: 'patch', v: [{ p: '/message/metadata/search_result_groups', o: 'append', v: searchGroups }] },
+      { type: 'message_stream_complete' },
+    ])
+    assert.equal(deltas.join(''), final, 'what was streamed is never rewritten')
+    assert.ok(!PUA.test(final))
+    assert.ok(
+      final.endsWith(
+        '\n\n来源：\n1. [Topcon MS05AXII](https://www.topcon.example/ms05axii)\n2. [Sokkia NET05AXII](https://sokkia.example/net05)',
+      ),
+      final,
+    )
+  })
+
+  it('OCV5-584 an unterminated marker is held while streaming and dropped at the end', () => {
+    const streamer = new TurnProgressStreamer()
+    const head = `结论${O}genui${S}{"citation":{"ref":"turn3`
+    assert.equal(streamer.consumeIncrementalFinalText(head), '结论')
+    assert.equal(streamer.consumeIncrementalFinalText(`${head}view0"}}`), '')
+    assert.equal(streamer.consumeIncrementalFinalText(`${head}view0"}}`, { finalFlush: true }), '')
+    assert.equal(streamer.emittedFinalText, '结论')
+    // something that only starts like a marker is released as text once it is too long to be one
+    const long = `a${O}${'x'.repeat(CHATGPT_MARKER_MAX_LEN + 1)}`
+    const released = new TurnProgressStreamer().consumeIncrementalFinalText(long)
+    assert.equal(released, `a${'x'.repeat(CHATGPT_MARKER_MAX_LEN + 1)}`)
+  })
+
+  it('OCV5-584 mapping progress takes sources only from the current reply', () => {
+    const msg = (id: string, role: string, text: string, metadata: object = {}) => ({
+      id,
+      message: { id, author: { role }, channel: 'final', status: 'finished_successfully', content: { content_type: 'text', parts: [text] }, metadata },
+    })
+    const old = { content_references: [{ refs: [ref(0, 'search', 0)], items: [{ url: 'https://old.example/' }] }] }
+    const now = { content_references: [{ refs: [ref(0, 'search', 1)], items: [{ url: 'https://new.example/' }] }] }
+    const conv = {
+      current_node: 'a2',
+      mapping: {
+        u1: { ...msg('u1', 'user', 'q1'), parent: null },
+        a1: { ...msg('a1', 'assistant', 'old', old), parent: 'u1' },
+        u2: { ...msg('u2', 'user', 'q2'), parent: 'a1' },
+        a2: { ...msg('a2', 'assistant', `新${O}cite${S}turn0search0${S}turn0search1${C}`, now), parent: 'u2' },
+      },
+    }
+    const prog = extractTurnProgressFromMapping(conv, { baselineNodeId: 'a1' })
+    assert.deepEqual([...prog.citationSources.keys()], ['turn0search1'])
+    const streamer = new TurnProgressStreamer()
+    const { textDeltas } = streamer.ingestMappingProgress(prog)
+    assert.deepEqual(textDeltas, ['新[1](https://new.example/)'])
+  })
+
+  it('OCV5-584 a reconnect keeps what the previous host already delivered', () => {
+    const sources = collectChatgptCitationSources({
+      content_references: [
+        { refs: ['turn0search0'], items: [{ url: 'https://s0.example/' }] },
+        { refs: ['turn0search1'], items: [{ url: 'https://s1.example/' }] },
+        { refs: ['turn0search9'], items: [{ url: 'https://z.example/' }] },
+      ],
+    })
+    // delivered while the source was unknown: the stripped marker is not turned into a link afterwards
+    const before = new TurnProgressStreamer()
+    const raw = `结论${O}cite${S}turn0search0${C}。`
+    assert.equal(before.consumeIncrementalFinalText(raw), '结论。')
+    const after = new TurnProgressStreamer({ initialEmittedFinalText: before.emittedFinalText })
+    after.citations.addSources(sources)
+    const more = `${raw}后文${O}cite${S}turn0search1${C}`
+    assert.equal(after.consumeIncrementalFinalText(more), '后文[1](https://s1.example/)')
+    assert.equal(
+      after.consumeIncrementalFinalText(more, { finalFlush: true }),
+      '\n\n来源：\n2. [https://s0.example/](https://s0.example/)',
+    )
+    // delivered as links: kept with their numbers, the next citation continues the numbering
+    const first = new TurnProgressStreamer()
+    first.citations.addSources(sources)
+    const linked = `x${O}cite${S}turn0search9${C}y${O}cite${S}turn0search0${C}`
+    assert.equal(first.consumeIncrementalFinalText(linked), 'x[1](https://z.example/)y[2](https://s0.example/)')
+    const resumed = new TurnProgressStreamer({ initialEmittedFinalText: first.emittedFinalText })
+    assert.equal(
+      resumed.consumeIncrementalFinalText(`${linked}z${O}cite${S}turn0search1${C}`, { finalFlush: true }),
+      'z',
+    )
+  })
+
+  it('OCV5-584 a citation marker longer than 4096 chars is still parsed, never leaked', () => {
+    const refs = Array.from({ length: 300 }, (_, n) => `turn0search${n}`)
+    const long = `前${genui({ refs })}后`
+    assert.ok(long.length > 5000)
+    const streamer = new TurnProgressStreamer()
+    streamer.citations.addSources(
+      collectChatgptCitationSources({ content_references: [{ refs: ['turn0search7'], items: [{ url: 'https://s7.example/' }] }] }),
+    )
+    const deltas: string[] = []
+    for (let at = 11; at < long.length + 11; at += 11) deltas.push(streamer.consumeIncrementalFinalText(long.slice(0, at)))
+    deltas.push(streamer.consumeIncrementalFinalText(long, { finalFlush: true }))
+    for (const d of deltas) assert.ok(!PUA.test(d) && !d.includes('citation'), JSON.stringify(d))
+    assert.equal(deltas.join(''), '前[1](https://s7.example/)后')
+    // text that cannot be a marker head is released at once, without the private-use char
+    assert.equal(new TurnProgressStreamer().consumeIncrementalFinalText(`a${O}not a marker`), 'anot a marker')
+  })
+
+  it('OCV5-584 adjacent citations delivered before a reconnect keep their own links', () => {
+    const ab = collectChatgptCitationSources({
+      content_references: [
+        { refs: ['turn0search0'], items: [{ url: 'https://a.example/' }] },
+        { refs: ['turn0search1'], items: [{ url: 'https://b.example/' }] },
+      ],
+    })
+    const raw = `结论${O}cite${S}turn0search0${C}${O}cite${S}turn0search1${C}。`
+    const first = new TurnProgressStreamer()
+    first.citations.addSources(ab)
+    assert.equal(first.consumeIncrementalFinalText(raw), '结论[1](https://a.example/)[2](https://b.example/)。')
+    const more = `${raw}后文`
+    // renderer state lost: each marker claims only its own links (sources known, or one per ref when not)
+    for (const sources of [ab, null]) {
+      const resumed = new TurnProgressStreamer({ initialEmittedFinalText: first.emittedFinalText })
+      resumed.citations.addSources(sources)
+      assert.equal(resumed.consumeIncrementalFinalText(more), '后文')
+      assert.equal(resumed.consumeIncrementalFinalText(more, { finalFlush: true }), '')
+    }
+    // the persisted state (JSON, as host.mjs saves it with the active turn) restores the exact rendering
+    const saved = JSON.parse(JSON.stringify(first.exportState().citations))
+    const restored = new TurnProgressStreamer({ initialEmittedFinalText: first.emittedFinalText })
+    restored.citations.restoreState(saved)
+    restored.citations.addSources(ab)
+    assert.equal(restored.consumeIncrementalFinalText(`${more}${O}cite${S}turn0search1${C}`, { finalFlush: true }), '后文[2](https://b.example/)')
   })
 })
