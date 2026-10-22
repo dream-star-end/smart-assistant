@@ -109,6 +109,13 @@ describe('oc-trace lib', () => {
     })
     assert.equal(eventFromLogLine('master-log', `plain text with ${T}`), null)
     assert.equal(eventFromLogLine('master-log', JSON.stringify({ msg: 'no ts', traceId: T })), null)
+    // a saved container log line: docker's timestamp, then the gateway's JSON line (OCV5-568)
+    const c = eventFromLogLine(
+      'container-log',
+      `2026-10-21T10:00:41.123456789Z ${JSON.stringify({ module: 'gateway', traceId: T, ts: '2026-10-21T10:00:41.120Z', level: 'error', msg: 'runner crashed' })}`,
+    )
+    assert.equal(c?.event, 'runner crashed')
+    assert.equal(c?.ids.traceId, T)
   })
 
   test('timeline is time-ordered across sources; first error prefers a coded error over a bare error line', () => {

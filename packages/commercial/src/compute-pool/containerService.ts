@@ -24,6 +24,7 @@
  *   - 超时、重试、日志由 backend 内部决定;facade 不加额外包装。
  */
 
+import { removeContainerSavingLogs } from "./containerLogArchive.js";
 import type Docker from "dockerode";
 import { rootLogger } from "../logging/logger.js";
 import { getRuntimeChannel } from "../runtimeChannel.js";
@@ -285,7 +286,7 @@ export class LocalDockerBackend {
       await container.start();
     } catch (startErr) {
       try {
-        await container.remove({ force: true });
+        await removeContainerSavingLogs(container, "start_failed");
       } catch {
         /* swallow */
       }
@@ -307,7 +308,7 @@ export class LocalDockerBackend {
   async remove(cid: string, opts?: { force?: boolean }): Promise<void> {
     const handle = this.docker.getContainer(cid);
     try {
-      await handle.remove({ force: opts?.force ?? true });
+      await removeContainerSavingLogs(handle, "remove", { force: opts?.force ?? true });
     } catch (err) {
       if (isDockerNotFound(err)) return;
       throw err;

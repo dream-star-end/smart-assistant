@@ -38,7 +38,7 @@ export const RETENTION_DAYS: Record<Source, number | null> = {
   usage_records: null,
   'master-log': 14, // logrotate daily, rotate 14, maxsize 200M (may be shorter under load)
   'egress-log': 14,
-  'container-log': 0, // lost when the container is removed, until §7.5 (P2-g)
+  'container-log': 14, // saved before removal to /var/log/openclaude-v5-containers (§7.5, OCV5-568), pruned at 14 days / 1 GiB
 }
 
 /** RFC 4180-ish CSV (psql --csv): quoted fields, doubled quotes, embedded newlines. */
@@ -184,8 +184,10 @@ export function eventsFromRows(source: Source, rows: Record<string, string>[]): 
 /** A JSON log line that mentions one of the ids → an event (non-JSON lines are skipped). */
 export function eventFromLogLine(source: Source, line: string): TraceEvent | null {
   let o: Record<string, unknown>
+  // saved container logs carry docker's own timestamp in front of each line
+  const json = line.startsWith('{') ? line : line.replace(/^\d{4}-\d\d-\d\dT\S+Z /, '')
   try {
-    o = JSON.parse(line)
+    o = JSON.parse(json)
   } catch {
     return null
   }
