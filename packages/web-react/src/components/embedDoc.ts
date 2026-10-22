@@ -109,9 +109,8 @@ function wire(root){var s=(root||document).querySelectorAll?(root||document).que
 document.addEventListener("click",function(e){var a=e.target&&e.target.closest?e.target.closest("[data-oc-download]"):null;if(!a)return;e.preventDefault();post({type:"download",path:a.getAttribute("data-oc-download"),name:a.getAttribute("download")||""})});`
     : "function wire(){}"
 }
-function boot(){q();pw();wire();try{new ResizeObserver(q).observe(document.documentElement);if(document.body)new ResizeObserver(q).observe(document.body)}catch(e){}
-try{new MutationObserver(function(r){for(var i=0;i<r.length;i++){for(var j=0;j<r[i].addedNodes.length;j++){var n=r[i].addedNodes[j];if(n.nodeType===1){pw(n.parentNode||n);wire(n.parentNode||n)}}}q()}).observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:["type"]})}catch(e){}
-post({type:"ready"})}
+function boot(){q();pw();post({type:"ready"});wire();try{new ResizeObserver(q).observe(document.documentElement);if(document.body)new ResizeObserver(q).observe(document.body)}catch(e){}
+try{new MutationObserver(function(r){for(var i=0;i<r.length;i++){for(var j=0;j<r[i].addedNodes.length;j++){var n=r[i].addedNodes[j];if(n.nodeType===1){pw(n.parentNode||n);wire(n.parentNode||n)}}}q()}).observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:["type"]})}catch(e){}}
 if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",boot);else boot();
 addEventListener("load",q);
 })();`;
