@@ -36,19 +36,16 @@
    - `view_count BIGINT NOT NULL DEFAULT 0`。
    - 回填：已有的 `status='pending'` 行设为 `needs_human=true`，因为它们都在等人工审核。
 4. **重建 `community_tutorials_review_state_chk`**
-   - approved 和 rejected 的条件，由「`reviewed_by IS NOT NULL`」改为「`reviewed_by IS NOT NULL OR review_source = 'ai'`」，其余条件不变。
-   - 旧行的 `reviewed_by` 都非空，所以全部满足新约束（迁移里先 `NOT VALID` 加上，再 `VALIDATE`）。
-5. **新约束 `community_tutorials_needs_human_chk`**：`needs_human = false OR status = 'pending'`。所有离开 pending 的写入（审核、撤回、下架，以及 PR-B 的 AI 结论）都必须同时清掉 `needs_human`。
+   - approved 和 rejected 的条件，由「`reviewed_by IS NOT NULL`」改为「`reviewed_by IS NOT NULL OR review_source IS NOT DISTINCT FROM 'ai'`」，其余条件不变。
+   - 必须用 `IS NOT DISTINCT FROM`：`review_source` 为 NULL 时，用 `=` 得到的是 NULL，PG 的 CHECK 会放行 NULL，那样就会出现「既没有审核人、也不是 AI」的 approved 行（Codex 方案审 R1 P1）。
+   - 只放宽，旧行和旧代码的写入全部满足。
+5. **`needs_human` 不用 CHECK 和 status 绑定**（Codex 方案审 R1 P1）。0320 之前的代码改 status 时不知道这一列，回滚后旧代码的撤回和审核不能因此失败。读取方一律按 `status='pending' AND needs_human` 过滤；新代码在离开 pending 时顺手清掉 `needs_human`，只为数据整洁，不依赖它。
 6. **索引** `idx_community_tutorials_needs_human`，建在 `(created_at, id)` 上，条件是 `WHERE status='pending' AND needs_human`。
-7. **登记**：写入 `deploy/v5/release-metadata.json` 的 `requiredMigrations`；对应的 integ 测试登记到 `.github/integ-tiers`。
+7. **登记**：写入 `deploy/v5/release-metadata.json` 的 `requiredMigrations`；integ 测试登记到 `.github/integ-tiers`。每条可能有兼容风险的语句都写 `-- compat:` 说明（`scripts/v5-selfhost-migration-compat-check.sh`）。
 
-**对线上旧代码是否安全（部署窗口三问）**：新列都有默认值。旧代码的 review、withdraw、takedown 不会写 `needs_human`：
-- review 和 takedown 都要求行处于 approved/pending，并把状态改成非 pending。
-- 如果那一行是回填过 `needs_human=true` 的 pending 行，新约束会拒绝这次更新。
-
-所以迁移和新代码**必须同一次发布生效**：先 apply 迁移，再立刻切新代码。部署窗口里旧代码对回填行做人工审核会 409/500。窗口只有几分钟，管理员审核是低频手动操作，可以接受；发布时我会确认当时没有人在审核。
-
-为什么不改成「回填 false、只对新投稿置 true」：那样存量待审稿会掉出「待人工复核」队列。现网目前没有 pending 行（3 篇都是 approved），实际不会触发这个问题。
+**对线上旧代码是否安全（部署窗口三问）**：迁移只做加法。新列都有默认值；放宽后的约束对旧写入恒真；没有任何绑定新旧列的约束。所以：
+- 迁移先于代码 apply，部署窗口内旧代码照常运行；
+- 回滚到 0320 之前的代码也能正常读写，AI 审核过的行旧代码照样能读，只是看不到 review_source。
 
 ### 2. 图片上传 `POST /api/tutorials/images`
 
@@ -62,7 +59,7 @@
   - `failOn:'error'`；
   - `limitInputPixels` 50M；
   - 单边不超过 16384；
-  - `pages === 1`，拒绝动图。
+  - 页数按 `metadata.pages ?? 1` 判断：静态图的 pages 是 undefined，按 1 处理；大于 1 的是动图，拒绝（Codex 方案审 R1 P1）。
 - **频控**：在事务里先取 `pg_advisory_xact_lock('tutorial-image-upload:<uid>')`。同一用户 24 小时内的上传行数达到 200 时，返回 429 `RATE_LIMITED`。同一张图（sha 相同）重复上传是幂等的：不新增行，也不占额度。
 - **写入**：`tutorial_blobs`（kind=`image`，`ON CONFLICT DO NOTHING`），再写 `tutorial_blob_uploads`。
 - **返回**：`{ sha256, mime, bytes, width, height }`。
