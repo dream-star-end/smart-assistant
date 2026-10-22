@@ -1,4 +1,5 @@
 // Muse media bridge — PG persistence (audit rows, rate counts, bridge credentials). OCV5-561.
+// Credits for a succeeded job are recorded by billing.ts in the same row (OCV5-574).
 //
 // The hub keeps live job state in memory; this table is the audit trail and the source of
 // truth after a master restart. The in-memory `dispatched` state is never written: the row
@@ -41,8 +42,11 @@ export interface MuseStore {
   markRunning(id: string, credentialId: string): Promise<void>
   finishJob(id: string, fin: MuseJobFinish): Promise<void>
   countRecent(userId: string, kind: MuseKind): Promise<{ hour: number; day: number }>
-  /** Startup: rows left queued/running by a previous process can never complete. */
-  failOrphans(): Promise<number>
+  /** Jobs of this kind queued across the site since the start of the day (UTC). */
+  countSiteToday(kind: MuseKind): Promise<number>
+  /** Rows left queued/running by a process that can no longer finish them: older than `graceMs`
+   * (0 = all) and not among `ownIds`, this process's open jobs. */
+  failOrphans(graceMs: number, ownIds: readonly string[]): Promise<number>
   findJob(userId: string, id: string): Promise<MuseJobRecord | null>
   findCredential(tokenSha256: Buffer): Promise<{ id: string } | null>
   touchCredential(id: string, bridgeVersion: string | null): Promise<void>
@@ -101,11 +105,22 @@ export function createPgMuseStore(pool: Pool): MuseStore {
       )
       return { hour: Number(r.rows[0]?.hour ?? 0), day: Number(r.rows[0]?.day ?? 0) }
     },
-    async failOrphans() {
+    async countSiteToday(kind) {
+      const r = await pool.query<{ n: string }>(
+        `SELECT COUNT(*)::text AS n FROM muse_media_jobs
+          WHERE kind = $1 AND queued_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'`,
+        [kind],
+      )
+      return Number(r.rows[0]?.n ?? 0)
+    },
+    async failOrphans(graceMs, ownIds) {
       const r = await pool.query(
         `UPDATE muse_media_jobs
             SET status = 'failed', error_code = 'MUSE_MASTER_RESTARTED', finished_at = NOW()
-          WHERE status IN ('queued', 'running')`,
+          WHERE status IN ('queued', 'running')
+            AND queued_at <= NOW() - make_interval(secs => $1::double precision / 1000)
+            AND NOT (id = ANY($2::text[]))`,
+        [graceMs, [...ownIds]],
       )
       return r.rowCount ?? 0
     },

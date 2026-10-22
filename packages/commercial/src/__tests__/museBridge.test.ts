@@ -47,6 +47,9 @@ class MemStore implements MuseStore {
   async countRecent() {
     return this.recent
   }
+  async countSiteToday() {
+    return 0
+  }
   async failOrphans() {
     return 0
   }

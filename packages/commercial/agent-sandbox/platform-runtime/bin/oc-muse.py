@@ -13,6 +13,9 @@ Videos are a fixed ~10 s clip; there are no duration or resolution options. Text
 1280x720; image-to-video and resume-with-a-new-image follow the source image's size.
 Failures print one JSON line on stderr ({"ok":false,"code":"MUSE_…",...}) and exit 1.
 Only enabled accounts can use it (others get MUSE_NOT_ENABLED).
+While the job waits for a free slot, stderr shows `# Muse queue: position N of M`; tell the user.
+Where Muse is billed, stderr ends a success with `# charged: N credits` (nothing is charged on failure).
+--timeout counts from when the job starts running; the server bounds the time spent in the queue.
 """
 
 from __future__ import annotations
@@ -44,6 +47,8 @@ DEFAULT_OUT_DIR = Path("/home/agent/.openclaude/generated")
 TERMINAL = {"succeeded", "failed", "cancelled"}
 MAX_SOURCE_BYTES = 10 * 1024 * 1024
 MAX_SOURCES = 4
+# Safety net only: the server ends a queued job itself (MUSE_BUSY) well before this.
+QUEUE_WAIT_MAX_SEC = 3700
 EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "video/mp4": "mp4", "video/webm": "webm"}
 
 
@@ -173,18 +178,33 @@ def run(kind: str, ns: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGINT, cancel)
     signal.signal(signal.SIGTERM, cancel)
-    deadline = time.monotonic() + ns.timeout
+    # --timeout runs from when the job leaves the queue; the queue itself is bounded by the server.
+    queue_until = time.monotonic() + QUEUE_WAIT_MAX_SEC
+    deadline: float | None = None
+    last_position = None
     view: dict = {}
-    while time.monotonic() < deadline:
-        view = call("GET", f"/jobs/{job_id}?wait=25", timeout=60)
-        if view.get("status") in TERMINAL:
+    while True:
+        now = time.monotonic()
+        if now >= (deadline if deadline is not None else queue_until):
+            try:
+                call("DELETE", f"/jobs/{job_id}", timeout=10)
+            except MuseFailure:
+                pass
+            raise MuseFailure("MUSE_TIMEOUT", f"no result within {ns.timeout} s", True, job_id=job_id)
+        # First look right away (a queued job reports its place at once), then long-poll.
+        wait = 25 if view else 0
+        view = call("GET", f"/jobs/{job_id}?wait={wait}", timeout=60)
+        status = view.get("status")
+        if status in TERMINAL:
             break
-    else:
-        try:
-            call("DELETE", f"/jobs/{job_id}", timeout=10)
-        except MuseFailure:
-            pass
-        raise MuseFailure("MUSE_TIMEOUT", f"no result within {ns.timeout} s", True, job_id=job_id)
+        if status == "queued":
+            position = view.get("queue_position")
+            if position and position != last_position:
+                total = view.get("queue_length") or position
+                print(f"# Muse queue: position {position} of {total}", file=sys.stderr, flush=True)
+                last_position = position
+        elif deadline is None:
+            deadline = now + ns.timeout
 
     if view.get("status") != "succeeded":
         err = view.get("error") or {}
@@ -197,6 +217,8 @@ def run(kind: str, ns: argparse.Namespace) -> int:
         )
     out_dir = Path(os.environ.get(OUT_DIR_ENV) or DEFAULT_OUT_DIR)
     paths = download(job_id, view.get("files") or [], out_dir)
+    if view.get("charged_credits") is not None:
+        print(f"# charged: {view['charged_credits']} credits", file=sys.stderr, flush=True)
     if ns.json:
         print(json.dumps({
             "ok": True,
