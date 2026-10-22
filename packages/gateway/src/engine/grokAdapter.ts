@@ -45,7 +45,7 @@ import { persistRunContextSnapshot } from '../runContextPersist.js'
 import { buildPromptContext } from '../promptSlots.js'
 import { GROK_PREAMBLE, prepareGrokHome, projectGrokPlatform } from './grokPlatform.js'
 import { renderCcbGoalPrompt } from '../goalPrompt.js'
-import { bindGrokRouteTrace } from '../relayTrace.js'
+import { bindRouteTrace } from '../relayTrace.js'
 import {
   CREDIT_EXHAUSTED_DETAIL,
   runningCostFenForUsage,
@@ -680,7 +680,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       seedFastCatalog(platform.grokHome, env.GROK_HOME, env.GROK_MODELS_LIST_URL)
       ensureFastCatalog(bin, env, env.GROK_HOME)
     }
-    ctx.releaseRelayTrace = bindGrokRouteTrace(route.routeToken, this.traceId)
+    ctx.releaseRelayTrace = bindRouteTrace(route.routeToken, this.traceId)
     this.spawnGrokChild(ctx, { resume: Boolean(this.nativeId) })
   }
 
