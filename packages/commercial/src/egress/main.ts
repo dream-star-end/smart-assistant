@@ -102,6 +102,7 @@ import { EGRESS_HEALTH_PATH, EGRESS_STATS_PATH } from "@openclaude/protocol";
 import { rootLogger } from "../logging/logger.js";
 import { CODEX_TOKEN_REFRESH_PATH } from "../http/internalCodexTokenRefresh.js";
 import { CODEX_RELAY_PREFIX } from "../http/internalCodexRelay.js";
+import { bindEgressTrace, egressTraceBindingCounts, egressTurnRoute } from "../http/egressTrace.js";
 import { GROK_RELAY_PREFIX, makeGrokRelayHandler } from "../http/internalGrokRelay.js";
 import { ZCODE_RELAY_PREFIX, makeZcodeRelayHandler } from "../http/internalZcodeRelay.js";
 import { configureZcodeRelayKv, createIoredisZcodeRelayKv } from "../billing/zcodeRouteContext.js";
@@ -673,6 +674,11 @@ export async function startEgress(): Promise<void> {
   const server = createHttpServer((req, res) => {
     const path = (req.url ?? "/").split("?")[0];
     const peerIp = req.socket.remoteAddress ?? "";
+    // OCV5-569 (plan §7.4): step 0, before any branch — bind the turn trace (or why there is none).
+    const turnRoute = egressTurnRoute(path, {
+      codex: CODEX_RELAY_PREFIX, grok: GROK_RELAY_PREFIX, zcode: ZCODE_RELAY_PREFIX, antigravity: ANTIGRAVITY_RELAY_PREFIX,
+    });
+    if (turnRoute) bindEgressTrace(req, turnRoute);
     if (path === "/internal/box/idle-proof") {
       Promise.resolve(boxIdleProofHandler(req, res, {
         hostUuid: selfHostUuid, boundIp: peerIp,
@@ -826,6 +832,7 @@ export async function startEgress(): Promise<void> {
           ...costSink.healthCounters(),
           capabilities: [...EGRESS_CAPABILITIES],
           modelAuthority: { enforced: isModelAuthorityEnforced() },
+          traceBinding: egressTraceBindingCounts(),
         }),
       );
       return;

@@ -66,6 +66,7 @@ import { InsufficientCreditsError as LedgerInsufficientCreditsError } from '../b
 
 import { codexRequestTiming, codexResponseTiming, codexBodyTiming } from './codexRelayTiming.js'
 import { CODEX_RELAY_PREFIX } from '@openclaude/protocol'
+import { egressTraceFields } from './egressTrace.js'
 
 export { CODEX_RELAY_PREFIX }
 export const CODEX_UPSTREAM_AUTH_HEADER = 'x-openclaude-upstream-authorization'
@@ -813,7 +814,9 @@ export function makeCodexRelayHandler(deps: CodexRelayDeps): CodexRelayHandler {
     res.setHeader(REQUEST_ID_HEADER, requestId)
 
     const method = req.method ?? 'GET'
-    const reqLog = log.child({ requestId, hostUuid: ctx.hostUuid, boundIp: ctx.boundIp, method })
+    const reqLog = log.child({
+      requestId, ...egressTraceFields(req), hostUuid: ctx.hostUuid, boundIp: ctx.boundIp, method,
+    })
 
     const routeReq = parseRouteRelayUrl(req.url ?? '/', method)
     if ('error' in routeReq) {

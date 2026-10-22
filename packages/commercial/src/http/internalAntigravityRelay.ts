@@ -1,4 +1,5 @@
 import type { Logger } from '../logging/logger.js'
+import { egressTraceFields } from './egressTrace.js'
 import { createPassiveRelayTiming } from './passiveRelayTiming.js'
 /**
  * Master/egress relay for the official Antigravity CLI (OCV5-415 P2).
@@ -473,7 +474,7 @@ export function makeAntigravityRelayHandler(deps: AntigravityRelayDeps): Antigra
       return
     }
     const stage = createPassiveRelayTiming(deps.logger, {
-      engine: 'antigravity', requestId, turnRequestId: route.requestId,
+      engine: 'antigravity', requestId, ...egressTraceFields(req), turnRequestId: route.requestId,
       uid: String(identity.userId), model: route.modelId, rpc,
     }, receivedAt)
     stage('proxy_received')

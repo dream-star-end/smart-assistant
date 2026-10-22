@@ -3,7 +3,7 @@ import type { Logger } from '../logging/logger.js'
 /** Passive stages: immutable request bindings, no payload, authority or stream changes. */
 export function createPassiveRelayTiming(
   logger: Pick<Logger, 'info'> | undefined,
-  identity: Readonly<Record<string, string>>,
+  identity: Readonly<Record<string, string | null>>,
   startedAt = performance.now(),
 ) {
   const captured = Object.freeze({ ...identity })

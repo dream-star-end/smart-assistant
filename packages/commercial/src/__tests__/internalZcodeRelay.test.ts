@@ -76,7 +76,7 @@ describe("internal ZCode relay dispatcher", () => {
 
   test("passes directEgressDispatcher even when the global dispatcher would ECONNRESET", async () => {
     const token = await mintRoute();
-    const captured: { dispatcher?: unknown; url?: string; auth?: string } = {};
+    const captured: { dispatcher?: unknown; url?: string; auth?: string; trace?: string | null } = {};
     const handler = makeZcodeRelayHandler({
       identityRepo: repo(),
       codingPlanKey: "not-a-real-key",
@@ -84,6 +84,7 @@ describe("internal ZCode relay dispatcher", () => {
         captured.dispatcher = init.dispatcher;
         captured.url = String(_url);
         captured.auth = new Headers(init.headers).get("authorization") ?? "";
+        captured.trace = new Headers(init.headers).get("x-openclaude-trace-id");
         if (!init.dispatcher || init.dispatcher === getGlobalDispatcher()) {
           const err = new Error("simulated proxy ECONNRESET");
           (err as Error & { code?: string }).code = "ECONNRESET";
@@ -108,6 +109,7 @@ describe("internal ZCode relay dispatcher", () => {
           headers: {
             authorization: `Bearer ${CONTAINER_TOKEN}`,
             "content-type": "application/json",
+            "x-openclaude-trace-id": "0a1b2c3d4e5f60718293a4b5c6d7e8f9",
           },
           body: JSON.stringify({ model: "attacker-model", messages: [] }),
         },
@@ -118,6 +120,8 @@ describe("internal ZCode relay dispatcher", () => {
       assert.strictEqual(captured.dispatcher, directEgressDispatcher());
       assert.notEqual(captured.dispatcher, getGlobalDispatcher());
       assert.equal(captured.auth, "Bearer not-a-real-key");
+      // OCV5-569 (§7.4): the internal trace header never goes to the provider
+      assert.equal(captured.trace, null);
     } finally {
       await close(server);
     }
