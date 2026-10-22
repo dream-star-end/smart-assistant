@@ -37,6 +37,8 @@ export interface MuseBilling {
   ensureBalance(userId: string, required: bigint): Promise<void>
   /** Marks the running row succeeded and charges it, atomically. Throws when the row is no longer running. */
   settle(input: MuseSettleInput): Promise<MuseSettleResult>
+  /** After settle threw: whether that transaction committed anyway (a lost COMMIT reply). */
+  outcome(jobId: string): Promise<{ charged: boolean; debitedCredits: bigint | null }>
 }
 
 export const MUSE_PRICE_SOURCE =
@@ -121,6 +123,20 @@ export function createMuseBilling(
         throw err
       } finally {
         client.release()
+      }
+    },
+
+    async outcome(jobId) {
+      const r = await pool.query<{ status: string; cost: string | null; debited: string | null }>(
+        `SELECT status, cost_credits::text AS cost, debited_credits::text AS debited
+           FROM muse_media_jobs WHERE id = $1`,
+        [jobId],
+      )
+      const row = r.rows[0]
+      const charged = row?.status === 'succeeded' && row.cost !== null
+      return {
+        charged,
+        debitedCredits: charged && row!.debited !== null ? BigInt(row!.debited) : null,
       }
     },
   }

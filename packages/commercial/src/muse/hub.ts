@@ -16,7 +16,7 @@
 //     charges nothing.
 
 import { type Hash, createHash, randomUUID } from 'node:crypto'
-import { appendFile, mkdir, open, readdir, rename, rm, stat } from 'node:fs/promises'
+import { access, appendFile, mkdir, open, readdir, rename, rm, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { type Logger, rootLogger } from '../logging/logger.js'
@@ -45,7 +45,7 @@ import {
   perFileLimit,
   sniffMime,
 } from './protocol.js'
-import type { MuseJobStatus, MuseStore } from './store.js'
+import type { MuseJobRecord, MuseJobStatus, MuseStore } from './store.js'
 
 export interface MuseFileView {
   idx: number
@@ -475,20 +475,36 @@ export class MuseBridgeHub {
           })
           chargedCredits = settled.debitedCredits ?? 0n
         } catch (err) {
+          // The transaction may have committed before the error (a lost COMMIT reply): ask the
+          // database what happened instead of assuming nothing was charged.
           this.log.error('muse_billing_settle_failed', {
             jobId: job.id,
             err: (err as Error).message,
           })
-          this.finish(
-            job,
-            fail(
-              'MUSE_BILLING_FAILED',
-              'the result could not be recorded; nothing was charged',
+          let outcome: { charged: boolean; debitedCredits: bigint | null } | null = null
+          try {
+            outcome = await this.billing.outcome(job.id)
+          } catch (lookupErr) {
+            this.log.error('muse_billing_outcome_unknown', {
+              jobId: job.id,
+              err: (lookupErr as Error).message,
+            })
+          }
+          if (outcome && !outcome.charged) {
+            this.finish(
+              job,
+              fail(
+                'MUSE_BILLING_FAILED',
+                'the result could not be recorded; nothing was charged',
+                true,
+              ),
               true,
-            ),
-            true,
-          )
-          return
+            )
+            return
+          }
+          // Charged, or unknown: deliver. A charge must never go undelivered; an unknown outcome
+          // at worst delivers one job uncharged (the row stays open and is never billed later).
+          chargedCredits = outcome ? (outcome.debitedCredits ?? job.price) : null
         }
       }
       this.finish(job, { ok: true, files, snapshotId: snapshot, artifactIds, chargedCredits }, true)
@@ -531,7 +547,7 @@ export class MuseBridgeHub {
       out.push({
         idx: i,
         // Never trust the bridge-supplied name; derive it.
-        filename: `muse-${job.spec.kind}-${job.id.slice(3, 11)}-${i + 1}.${MIME_EXT[mime]}`,
+        filename: museFileName(job.spec.kind, job.id, i, mime),
         mime,
         bytes: up.bytes,
         sha256: digest,
@@ -581,7 +597,8 @@ export class MuseBridgeHub {
     const own = this.reservedByUser.get(userId) ?? { count: 0, credits: 0n }
     this.reservedByUser.set(userId, { count: own.count + 1, credits: own.credits + price })
     try {
-      return await this.admit(userId, containerId, spec, pending, price, mine.credits)
+      // Other admissions of this account in this process, not yet in the database.
+      return await this.admit(userId, containerId, spec, pending, price, own.credits)
     } finally {
       this.reservedTotal -= 1
       const left = (this.reserved.get(key) ?? 1) - 1
@@ -594,24 +611,12 @@ export class MuseBridgeHub {
     }
   }
 
-  /** This account's open jobs (queued, dispatched, running, or being admitted) and their credits. */
-  private userLoad(userId: string): { count: number; credits: bigint } {
+  /** This account's open jobs in this process (queued, dispatched, running, or being admitted). */
+  private userLoad(userId: string): { count: number } {
     let count = 0
-    let credits = 0n
-    for (const job of this.queue) {
-      if (job.userId === userId) {
-        count += 1
-        credits += job.price
-      }
-    }
-    for (const job of this.active.values()) {
-      if (job.userId === userId) {
-        count += 1
-        credits += job.price
-      }
-    }
-    const reserved = this.reservedByUser.get(userId)
-    return { count: count + (reserved?.count ?? 0), credits: credits + (reserved?.credits ?? 0n) }
+    for (const job of this.queue) if (job.userId === userId) count += 1
+    for (const job of this.active.values()) if (job.userId === userId) count += 1
+    return { count: count + (this.reservedByUser.get(userId)?.count ?? 0) }
   }
 
   private async admit(
@@ -620,7 +625,7 @@ export class MuseBridgeHub {
     spec: MuseJobSpec,
     pending: number,
     price: bigint,
-    otherCredits: bigint,
+    admittingCredits: bigint,
   ): Promise<string> {
     const counts = await this.store.countRecent(userId, spec.kind)
     const [perHour, perDay] =
@@ -647,8 +652,10 @@ export class MuseBridgeHub {
       }
     }
     if (this.billing && price > 0n) {
-      // Room for this job plus every other open job of this account (none is charged yet).
-      await this.billing.ensureBalance(userId, price + otherCredits)
+      // Room for this job plus every other open job of this account (none is charged yet). The
+      // database holds the quote of every open job, including the other A/B slot's.
+      const open = await this.store.openCredits(userId)
+      await this.billing.ensureBalance(userId, price + open + admittingCredits)
     }
     const id = `mj_${randomUUID()}`
     await this.store.insertJob({
@@ -658,6 +665,7 @@ export class MuseBridgeHub {
       kind: spec.kind,
       promptSha256: createHash('sha256').update(spec.prompt).digest(),
       promptPreview: spec.prompt.slice(0, 500),
+      priceCredits: price,
       params: {
         orientation: spec.orientation ?? null,
         aspect_ratio: spec.aspect_ratio ?? null,
@@ -702,10 +710,15 @@ export class MuseBridgeHub {
     if (!job || job.userId !== userId) {
       const rec = await this.store.findJob(userId, jobId)
       if (!rec) return null
+      // Finished in another process (a restart, the other A/B slot): its files are in the shared
+      // state directory for as long as they exist.
+      const files = rec.status === 'succeeded' ? await this.storedFiles(rec) : null
       return {
         job_id: rec.id,
         kind: rec.kind,
         status: rec.status,
+        ...(files ? { files, snapshot_id: rec.snapshotId } : {}),
+        ...(files && rec.debitedCredits !== null ? { charged_credits: rec.debitedCredits } : {}),
         ...(rec.errorCode
           ? {
               error: {
@@ -750,12 +763,37 @@ export class MuseBridgeHub {
   }
 
   /** Path of a finished file, for the owner only. */
-  fileFor(userId: string, jobId: string, idx: number): { path: string; file: MuseFileView } | null {
+  async fileFor(
+    userId: string,
+    jobId: string,
+    idx: number,
+  ): Promise<{ path: string; file: MuseFileView } | null> {
     const job = this.jobs.get(jobId)
-    if (!job || job.userId !== userId || !job.outcome?.ok) return null
-    const file = job.outcome.files.find((f) => f.idx === idx)
-    if (!file) return null
-    return { path: join(this.root, job.id, `${idx}.bin`), file }
+    let files: MuseFileView[] | null = null
+    if (job && job.userId === userId) {
+      files = job.outcome?.ok ? job.outcome.files : null
+    } else {
+      const rec = await this.store.findJob(userId, jobId)
+      files = rec?.status === 'succeeded' ? await this.storedFiles(rec) : null
+    }
+    const file = files?.find((f) => f.idx === idx)
+    return file ? { path: join(this.root, jobId, `${idx}.bin`), file } : null
+  }
+
+  /** A succeeded row's files, when every one is still in the state directory. */
+  private async storedFiles(rec: MuseJobRecord): Promise<MuseFileView[] | null> {
+    if (!rec.files?.length) return null
+    const out: MuseFileView[] = []
+    for (const [idx, f] of rec.files.entries()) {
+      if (!MIME_EXT[f.mime]) return null
+      try {
+        await access(join(this.root, rec.id, `${idx}.bin`))
+      } catch {
+        return null
+      }
+      out.push({ idx, filename: museFileName(rec.kind, rec.id, idx, f.mime), ...f })
+    }
+    return out
   }
 
   // ── internals ────────────────────────────────────────────────────────────
@@ -994,6 +1032,10 @@ export class MuseBridgeHub {
       deadline_at: new Date(job.deadlineAt).toISOString(),
     }
   }
+}
+
+function museFileName(kind: MuseKind, jobId: string, idx: number, mime: string): string {
+  return `muse-${kind}-${jobId.slice(3, 11)}-${idx + 1}.${MIME_EXT[mime]}`
 }
 
 function fail(code: string, message: string, retryable = false): Outcome {

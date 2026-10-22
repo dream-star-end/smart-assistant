@@ -16,16 +16,38 @@ import type { MuseJobFinish, MuseStore } from '../muse/store.js'
 const WEBP = Buffer.concat([Buffer.from('RIFF\0\0\0\0WEBPVP8 ', 'latin1'), Buffer.alloc(200, 7)])
 const sha = (b: Buffer) => createHash('sha256').update(b).digest('hex')
 
+type Row = {
+  status: string
+  error: string | null
+  userId: string
+  kind: 'image' | 'video'
+  price: bigint
+  files: Array<{ mime: string; bytes: number; sha256: string }> | null
+  debited: string | null
+}
+
 class MemStore implements MuseStore {
-  rows = new Map<
-    string,
-    { status: string; error: string | null; userId: string; kind: 'image' | 'video' }
-  >()
+  rows = new Map<string, Row>()
+  /** Quotes of open jobs another process (the other A/B slot) holds. */
+  otherSlotOpen = 0n
   finished: Array<[string, MuseJobFinish]> = []
   orphanCalls: Array<[number, string[]]> = []
   site = 0
-  async insertJob(r: { id: string; userId: string; kind: 'image' | 'video' }) {
-    this.rows.set(r.id, { status: 'queued', error: null, userId: r.userId, kind: r.kind })
+  async insertJob(r: {
+    id: string
+    userId: string
+    kind: 'image' | 'video'
+    priceCredits?: bigint
+  }) {
+    this.rows.set(r.id, {
+      status: 'queued',
+      error: null,
+      userId: r.userId,
+      kind: r.kind,
+      price: r.priceCredits ?? 0n,
+      files: null,
+      debited: null,
+    })
   }
   async markRunning(id: string) {
     const r = this.rows.get(id)
@@ -35,7 +57,7 @@ class MemStore implements MuseStore {
     this.finished.push([id, fin])
     const r = this.rows.get(id)
     if (r && (r.status === 'queued' || r.status === 'running')) {
-      Object.assign(r, { status: fin.status, error: fin.errorCode })
+      Object.assign(r, { status: fin.status, error: fin.errorCode, files: fin.files })
     }
   }
   async countRecent() {
@@ -48,8 +70,25 @@ class MemStore implements MuseStore {
     this.orphanCalls.push([graceMs, [...ownIds]])
     return 0
   }
-  async findJob() {
-    return null
+  async findJob(userId: string, id: string) {
+    const r = this.rows.get(id)
+    if (!r || r.userId !== userId) return null
+    return {
+      id,
+      kind: r.kind,
+      status: r.status as 'succeeded',
+      errorCode: r.error,
+      files: r.files,
+      snapshotId: null,
+      debitedCredits: r.debited,
+    }
+  }
+  async openCredits(userId: string) {
+    let sum = this.otherSlotOpen
+    for (const r of this.rows.values()) {
+      if (r.userId === userId && (r.status === 'queued' || r.status === 'running')) sum += r.price
+    }
+    return sum
   }
   async findCredential() {
     return { id: '1' }
@@ -58,7 +97,11 @@ class MemStore implements MuseStore {
 }
 
 class FakeBilling implements MuseBilling {
+  constructor(private readonly store: MemStore) {}
   balance = new Map<string, bigint>()
+  /** The transaction committed, then the call failed (a lost COMMIT reply). */
+  commitThenFail = false
+  outcomeError: Error | null = null
   settled: MuseSettleInput[] = []
   checks: Array<[string, bigint]> = []
   settleGate: Promise<void> | null = null
@@ -83,7 +126,21 @@ class FakeBilling implements MuseBilling {
     if (this.settleGate) await this.settleGate
     if (this.settleError) throw this.settleError
     this.settled.push(input)
+    const row = this.store.rows.get(input.jobId)
+    if (row)
+      Object.assign(row, {
+        status: 'succeeded',
+        files: input.files,
+        debited: input.price.toString(),
+      })
+    if (this.commitThenFail) throw new Error('Connection terminated unexpectedly')
     return { ledgerId: 77n, debitedCredits: input.price, clamped: false }
+  }
+  async outcome(jobId: string) {
+    if (this.outcomeError) throw this.outcomeError
+    const row = this.store.rows.get(jobId)
+    const charged = row?.status === 'succeeded' && row.debited !== null
+    return { charged, debitedCredits: charged ? BigInt(row!.debited!) : null }
   }
 }
 
@@ -136,7 +193,7 @@ describe('commercial muse hub (OCV5-574)', () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'muse-commercial-'))
     store = new MemStore()
-    billing = new FakeBilling()
+    billing = new FakeBilling(store)
     clock = { t: 1_000_000 }
     hubs = []
     keepAlive = setInterval(() => {}, 1000)
@@ -312,7 +369,7 @@ describe('commercial muse hub (OCV5-574)', () => {
     const view = await hub.view('90', id, 0)
     assert.equal(view?.status, 'failed')
     assert.equal(view?.error?.code, 'MUSE_BILLING_FAILED')
-    assert.equal(hub.fileFor('90', id, 0), null)
+    assert.equal(await hub.fileFor('90', id, 0), null)
   })
 
   it('enforces the site daily cap per kind', async () => {
@@ -362,5 +419,79 @@ describe('commercial muse hub (OCV5-574)', () => {
     assert.equal(store.rows.get(id)?.status, 'failed')
     assert.equal(store.rows.get(id)?.error, 'MUSE_MASTER_RESTARTED')
     assert.ok(hub.maxJobLifetimeMs() < 1_800_000, 'a live job is always younger than the grace')
+  })
+
+  it('a settle that failed after its COMMIT is delivered as charged (the database is asked)', async () => {
+    const hub = makeHub()
+    const sid = hub.hello('1', null)
+    const id = await hub.submit('130', null, { kind: 'video', prompt: 'p' })
+    billing.commitThenFail = true
+    const job = (await hub.poll(sid, 50))!
+    hub.heartbeat(job.id, job.nonce)
+    const MP4 = Buffer.concat([
+      Buffer.from([0, 0, 0, 0x18]),
+      Buffer.from('ftypmp42'),
+      Buffer.alloc(100),
+    ])
+    await hub.putChunk(job.id, job.nonce, 0, 0, MP4, sha(MP4))
+    await hub.result(job.id, job.nonce, {
+      ok: true,
+      files: [
+        {
+          idx: 0,
+          filename: 'x.mp4',
+          mime: 'video/mp4',
+          bytes: MP4.length,
+          sha256: sha(MP4),
+          chunks: 1,
+        },
+      ],
+    })
+    const view = await hub.view('130', id, 0)
+    assert.equal(view?.status, 'succeeded')
+    assert.equal(view?.charged_credits, '50')
+    assert.ok(await hub.fileFor('130', id, 0), 'the charged file is still there')
+  })
+
+  it('when the settle outcome cannot be read, the job is delivered (never charged and dropped)', async () => {
+    const hub = makeHub()
+    const sid = hub.hello('1', null)
+    const id = await hub.submit('140', null, { kind: 'image', prompt: 'p' })
+    billing.settleError = new Error('connection reset')
+    billing.outcomeError = new Error('database unreachable')
+    await runToSuccess(hub, (await hub.poll(sid, 50))!)
+    const view = await hub.view('140', id, 0)
+    assert.equal(view?.status, 'succeeded')
+    assert.equal(view?.charged_credits, undefined)
+    assert.ok(await hub.fileFor('140', id, 0))
+  })
+
+  it('another process (restart, the other A/B slot) can show and serve a succeeded job', async () => {
+    const first = makeHub({ orphanGraceMs: 1_800_000 })
+    const sid = first.hello('1', null)
+    const id = await first.submit('150', null, { kind: 'image', prompt: 'p' })
+    await runToSuccess(first, (await first.poll(sid, 50))!)
+    const second = makeHub({ orphanGraceMs: 1_800_000 })
+    await second.start()
+    const view = await second.view('150', id, 0)
+    assert.equal(view?.status, 'succeeded')
+    assert.equal(view?.files?.length, 1)
+    assert.equal(view?.files?.[0]?.sha256, sha(WEBP))
+    assert.equal(view?.charged_credits, '10')
+    const file = await second.fileFor('150', id, 0)
+    assert.ok(file && existsSync(file.path))
+    assert.equal(await second.fileFor('151', id, 0), null, 'never for another account')
+  })
+
+  it('the balance check counts open jobs the other A/B slot recorded', async () => {
+    const hub = makeHub()
+    hub.hello('1', null)
+    store.otherSlotOpen = 50n
+    billing.balance.set('160', 50n)
+    await assert.rejects(
+      hub.submit('160', null, { kind: 'video', prompt: 'v' }),
+      (e: unknown) => e instanceof MuseError && e.code === 'MUSE_INSUFFICIENT_CREDITS',
+    )
+    assert.deepEqual(billing.checks.at(-1), ['160', 100n], "this 50 + the other slot's open 50")
   })
 })

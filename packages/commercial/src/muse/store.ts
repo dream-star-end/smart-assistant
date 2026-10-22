@@ -19,6 +19,8 @@ export interface MuseJobInsert {
   promptSha256: Buffer
   promptPreview: string
   params: Record<string, unknown>
+  /** Quoted credits for a billed job (0319, commercial); 0n/absent = not billed, not written. */
+  priceCredits?: bigint
 }
 
 export interface MuseJobFinish {
@@ -35,6 +37,11 @@ export interface MuseJobRecord {
   kind: MuseKind
   status: MuseJobStatus
   errorCode: string | null
+  /** Succeeded rows: the delivered files, in index order. */
+  files: Array<{ mime: string; bytes: number; sha256: string }> | null
+  snapshotId: string | null
+  /** Credits actually debited (0319); null when not billed or on a database without 0319. */
+  debitedCredits: string | null
 }
 
 export interface MuseStore {
@@ -48,6 +55,8 @@ export interface MuseStore {
    * (0 = all) and not among `ownIds`, this process's open jobs. */
   failOrphans(graceMs: number, ownIds: readonly string[]): Promise<number>
   findJob(userId: string, id: string): Promise<MuseJobRecord | null>
+  /** Sum of the quoted credits of this account's open (queued/running) jobs, across processes. */
+  openCredits(userId: string): Promise<bigint>
   findCredential(tokenSha256: Buffer): Promise<{ id: string } | null>
   touchCredential(id: string, bridgeVersion: string | null): Promise<void>
 }
@@ -55,19 +64,31 @@ export interface MuseStore {
 export function createPgMuseStore(pool: Pool): MuseStore {
   return {
     async insertJob(row) {
+      const values = [
+        row.id,
+        row.userId,
+        row.containerId,
+        row.kind,
+        row.promptSha256,
+        row.promptPreview,
+        JSON.stringify(row.params),
+      ]
+      // price_credits exists only where 0319 ran (commercial); unbilled jobs never name it.
+      if (row.priceCredits !== undefined && row.priceCredits > 0n) {
+        await pool.query(
+          `INSERT INTO muse_media_jobs
+             (id, user_id, container_id, kind, prompt_sha256, prompt_preview, params, status,
+              price_credits)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8)`,
+          [...values, row.priceCredits.toString()],
+        )
+        return
+      }
       await pool.query(
         `INSERT INTO muse_media_jobs
            (id, user_id, container_id, kind, prompt_sha256, prompt_preview, params, status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued')`,
-        [
-          row.id,
-          row.userId,
-          row.containerId,
-          row.kind,
-          row.promptSha256,
-          row.promptPreview,
-          JSON.stringify(row.params),
-        ],
+        values,
       )
     },
     async markRunning(id, credentialId) {
@@ -125,19 +146,36 @@ export function createPgMuseStore(pool: Pool): MuseStore {
       return r.rowCount ?? 0
     },
     async findJob(userId, id) {
-      const r = await pool.query<{
-        id: string
-        kind: MuseKind
-        status: MuseJobStatus
-        error_code: string | null
-      }>(
-        'SELECT id, kind, status, error_code FROM muse_media_jobs WHERE id = $1 AND user_id = $2',
+      // The whole row as JSON: columns a database does not have (debited_credits before 0319)
+      // read as absent instead of failing the query.
+      const r = await pool.query<{ r: Record<string, unknown> }>(
+        'SELECT to_jsonb(m) AS r FROM muse_media_jobs m WHERE id = $1 AND user_id = $2',
         [id, userId],
       )
-      const row = r.rows[0]
-      return row
-        ? { id: row.id, kind: row.kind, status: row.status, errorCode: row.error_code }
+      const row = r.rows[0]?.r
+      if (!row) return null
+      const files = Array.isArray(row.files)
+        ? (row.files as Array<{ mime: string; bytes: number; sha256: string }>)
         : null
+      const debited = row.debited_credits
+      return {
+        id: String(row.id),
+        kind: row.kind as MuseKind,
+        status: row.status as MuseJobStatus,
+        errorCode: typeof row.error_code === 'string' ? row.error_code : null,
+        files,
+        snapshotId: typeof row.muse_snapshot_id === 'string' ? row.muse_snapshot_id : null,
+        debitedCredits:
+          typeof debited === 'number' || typeof debited === 'string' ? String(debited) : null,
+      }
+    },
+    async openCredits(userId) {
+      const r = await pool.query<{ n: string }>(
+        `SELECT COALESCE(SUM(price_credits), 0)::text AS n FROM muse_media_jobs
+          WHERE user_id = $1 AND status IN ('queued', 'running')`,
+        [userId],
+      )
+      return BigInt(r.rows[0]?.n ?? '0')
     },
     async findCredential(tokenSha256) {
       const r = await pool.query<{ id: string }>(

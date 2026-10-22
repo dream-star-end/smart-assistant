@@ -3,11 +3,14 @@
 -- Muse image/video jobs open to every commercial account and charged per successful job (user
 -- decision 2026-10-22: video 50, image 10 credits). The charge is written by muse/billing.ts in the
 -- same transaction that marks the job succeeded: cost_credits / price_snapshot / debited_credits /
--- ledger_id are set together or not at all. credit_ledger gains the reason 'muse_media'.
+-- ledger_id are set together or not at all. price_credits is the quote written at admission.
+-- credit_ledger gains the reason 'muse_media'.
 -- Rollback: db/rollbacks/0319_commercial_muse_billing.sql.
 
 -- compat: additive nullable columns, one index and a widened CHECK; old binaries never read or write them
 ALTER TABLE muse_media_jobs
+  -- The quote at admission: open jobs' quotes are summed for the balance check across both A/B slots.
+  ADD COLUMN IF NOT EXISTS price_credits BIGINT CHECK (price_credits IS NULL OR price_credits >= 0),
   ADD COLUMN IF NOT EXISTS cost_credits BIGINT CHECK (cost_credits IS NULL OR cost_credits >= 0),
   ADD COLUMN IF NOT EXISTS debited_credits BIGINT CHECK (debited_credits IS NULL OR debited_credits >= 0),
   ADD COLUMN IF NOT EXISTS price_snapshot JSONB,

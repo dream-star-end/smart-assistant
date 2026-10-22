@@ -61,8 +61,19 @@ function memStore(): MuseStore {
     async findJob(userId, id) {
       const r = rows.get(id)
       return r && r.userId === userId
-        ? { id, kind: r.kind, status: r.status as 'failed', errorCode: r.error }
+        ? {
+            id,
+            kind: r.kind,
+            status: r.status as 'failed',
+            errorCode: r.error,
+            files: null,
+            snapshotId: null,
+            debitedCredits: null,
+          }
         : null
+    },
+    async openCredits() {
+      return 0n
     },
     async findCredential(sha) {
       return sha.toString('hex') === cred ? { id: '1' } : null
@@ -252,6 +263,7 @@ describe('muse end to end, commercial (2 slots, queue, credits)', { timeout: 240
   const charged: string[] = []
   let running = 0
   let peak = 0
+  let settleDelayMs = 0
 
   before(async () => {
     work = mkdtempSync(join(tmpdir(), 'muse-e2e-c-'))
@@ -278,7 +290,9 @@ describe('muse end to end, commercial (2 slots, queue, credits)', { timeout: 240
       billing: {
         price: (kind) => (kind === 'video' ? 50n : 10n),
         ensureBalance: async () => {},
+        outcome: async () => ({ charged: false, debitedCredits: null }),
         settle: async (input) => {
+          if (settleDelayMs > 0) await new Promise((r) => setTimeout(r, settleDelayMs))
           charged.push(input.jobId)
           running = Math.max(0, running - 1)
           return { ledgerId: 1n, debitedCredits: input.price, clamped: false }
@@ -362,5 +376,28 @@ describe('muse end to end, commercial (2 slots, queue, credits)', { timeout: 240
     assert.equal(new Set(charged).size, 3)
     // 6 s fake generations: 2 slots finish three in about 12 s, one slot would need 18 s.
     assert.ok(Date.now() - started < 17_000, `took ${Date.now() - started} ms`)
+  })
+
+  it('a timeout while the result is being charged waits for it instead of abandoning a charged job', async () => {
+    settleDelayMs = 6_000
+    try {
+      const before = charged.length
+      const r = await run('python3', ['-I', OC_MUSE, 'image', 'ok', '--timeout', '3'], {
+        PATH: process.env.PATH,
+        HOME: work,
+        OPENCLAUDE_V3_MASTER_BASE_URL: base,
+        OPENCLAUDE_V3_CONTAINER_TOKEN: `oc-v3.42.${SECRET}`,
+        OC_MUSE_OUT_DIR: join(work, 'generated'),
+      })
+      assert.equal(r.code, 0, r.stderr)
+      assert.match(r.stderr, /# charged: 10 credits/)
+      assert.equal(charged.length, before + 1)
+      assert.ok(
+        statSync(r.stdout.trim().split('\n')[0]!).size > 0,
+        'the charged file was downloaded',
+      )
+    } finally {
+      settleDelayMs = 0
+    }
   })
 })

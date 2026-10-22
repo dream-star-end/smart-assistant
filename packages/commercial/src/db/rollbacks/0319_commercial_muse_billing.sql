@@ -27,6 +27,7 @@ ALTER TABLE muse_media_jobs
   DROP COLUMN IF EXISTS ledger_id,
   DROP COLUMN IF EXISTS price_snapshot,
   DROP COLUMN IF EXISTS debited_credits,
-  DROP COLUMN IF EXISTS cost_credits;
+  DROP COLUMN IF EXISTS cost_credits,
+  DROP COLUMN IF EXISTS price_credits;
 DELETE FROM schema_migrations WHERE version = '0319_commercial_muse_billing';
 COMMIT;

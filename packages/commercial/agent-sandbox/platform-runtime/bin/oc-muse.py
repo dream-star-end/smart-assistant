@@ -49,6 +49,9 @@ MAX_SOURCE_BYTES = 10 * 1024 * 1024
 MAX_SOURCES = 4
 # Safety net only: the server ends a queued job itself (MUSE_BUSY) well before this.
 QUEUE_WAIT_MAX_SEC = 3700
+# A timeout's cancel can be refused while the result is being recorded and charged; wait this
+# much longer for it instead of leaving a charged result behind.
+SETTLE_GRACE_SEC = 180
 EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "video/mp4": "mp4", "video/webm": "webm"}
 
 
@@ -181,15 +184,24 @@ def run(kind: str, ns: argparse.Namespace) -> int:
     # --timeout runs from when the job leaves the queue; the queue itself is bounded by the server.
     queue_until = time.monotonic() + QUEUE_WAIT_MAX_SEC
     deadline: float | None = None
+    graced = False
     last_position = None
     view: dict = {}
     while True:
         now = time.monotonic()
         if now >= (deadline if deadline is not None else queue_until):
             try:
-                call("DELETE", f"/jobs/{job_id}", timeout=10)
+                left = call("DELETE", f"/jobs/{job_id}", timeout=10)
             except MuseFailure:
-                pass
+                left = {}
+            if left.get("status") == "succeeded":
+                view = left
+                break
+            if left.get("status") == "running" and not graced:
+                # Not cancelled: the job is finishing (its result is being recorded). Wait for it.
+                graced = True
+                deadline = now + SETTLE_GRACE_SEC
+                continue
             raise MuseFailure("MUSE_TIMEOUT", f"no result within {ns.timeout} s", True, job_id=job_id)
         # First look right away (a queued job reports its place at once), then long-poll.
         wait = 25 if view else 0

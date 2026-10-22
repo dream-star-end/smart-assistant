@@ -7,6 +7,8 @@
  *   3. a job that is not running (failed / cancelled / orphan-closed) is never charged.
  *   4. ensureBalance refuses a requirement above the spendable balance (402).
  *   5. the CHECK keeps cost_credits on succeeded rows only.
+ *   6. outcome() tells a committed charge from none (a lost COMMIT reply); openCredits() sums the
+ *      quotes of open jobs only, whichever process wrote them; findJob() returns delivered files.
  */
 
 import assert from 'node:assert/strict'
@@ -18,6 +20,7 @@ import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
 import { createMuseBilling } from '../muse/billing.js'
 import { MuseError } from '../muse/protocol.js'
+import { createPgMuseStore } from '../muse/store.js'
 import { resetTestSchemaForTest } from './helpers/db.js'
 
 const TEST_DB_URL =
@@ -183,5 +186,52 @@ describe('Muse billing (OCV5-574)', () => {
       query('UPDATE muse_media_jobs SET cost_credits = 10 WHERE id = $1', [id]),
       /muse_media_jobs_charge_only_succeeded/,
     )
+  })
+
+  test('outcome reports a committed charge and nothing for an uncharged job', async (t) => {
+    if (!pgAvailable) return t.skip('no test database')
+    const billing = createMuseBilling(getPool(), PRICES)
+    const uid = await user(1000n)
+    const paid = await job(uid, 'running', 'video')
+    await billing.settle(settleInput(paid, uid, 'video', 50n))
+    assert.deepEqual(await billing.outcome(paid), { charged: true, debitedCredits: 50n })
+    const failed = await job(uid, 'failed')
+    assert.deepEqual(await billing.outcome(failed), { charged: false, debitedCredits: null })
+    const running = await job(uid, 'running')
+    assert.deepEqual(await billing.outcome(running), { charged: false, debitedCredits: null })
+  })
+
+  test('openCredits sums open quotes only; findJob returns the delivered files', async (t) => {
+    if (!pgAvailable) return t.skip('no test database')
+    const store = createPgMuseStore(getPool())
+    const billing = createMuseBilling(getPool(), PRICES)
+    const uid = await user(1000n)
+    const insert = (kind: 'image' | 'video', price: bigint) => {
+      const id = `mj_${randomUUID()}`
+      return store
+        .insertJob({
+          id,
+          userId: uid,
+          containerId: null,
+          kind,
+          promptSha256: Buffer.alloc(32),
+          promptPreview: 'p',
+          params: {},
+          priceCredits: price,
+        })
+        .then(() => id)
+    }
+    const video = await insert('video', 50n)
+    await insert('image', 10n)
+    assert.equal(await store.openCredits(uid), 60n)
+    await query("UPDATE muse_media_jobs SET status = 'running' WHERE id = $1", [video])
+    await billing.settle(settleInput(video, uid, 'video', 50n))
+    assert.equal(await store.openCredits(uid), 10n, 'a succeeded job is no longer open')
+    const rec = await store.findJob(uid, video)
+    assert.equal(rec?.status, 'succeeded')
+    assert.equal(rec?.debitedCredits, '50')
+    assert.deepEqual(rec?.files, [{ mime: 'image/webp', bytes: 4000, sha256: 'a'.repeat(64) }])
+    assert.equal(rec?.snapshotId, 'snap:1')
+    assert.equal(await store.findJob(String(Number(uid) + 999), video), null)
   })
 })

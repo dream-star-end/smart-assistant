@@ -131,6 +131,9 @@ class Concurrent(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.proc.send_signal(signal.SIGTERM); cls.proc.wait(30)
+        # The mock's job queue is shared by every test class: let this bridge's in-flight polls
+        # (hold 2 s) expire so none of them takes the next class's first job.
+        time.sleep(3)
         mm.S.max_concurrency = None; mm.S.session = None
     def job(self, jid, prompt):
         mm.S.jobs.put({"id": jid, "nonce": "n-" + jid, "kind": "image", "prompt": prompt}); return jid
