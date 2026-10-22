@@ -79,7 +79,14 @@ export function stripShell(text: string): string {
 
 interface ScanState { heredocs: { tag: string; dash: boolean }[] }
 const newlines = (s: string) => s.replace(/[^\n]/g, "");
-const HEREDOC = /^<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|((?:\\.|[^\s;&|<>()'"])+))/;
+/** `<<` / `<<-` and its delimiter: one bash word, quoted parts and unquoted parts mixed (`E"OF"` is
+ * EOF; Codex final4 r1). */
+const HEREDOC = /^<<(-?)[ \t]*((?:'[^'\n]*'|"(?:\\.|[^"\\\n])*"|\\.|[^\s;&|<>()'"])+)/;
+/** Quote removal on a heredoc delimiter word. */
+function unquoteWord(w: string): string {
+  return w.replace(/'([^']*)'|"((?:\\.|[^"\\])*)"|\\(.)/g, (_m, sq: string | undefined, dq: string | undefined, esc: string | undefined) =>
+    sq ?? (dq !== undefined ? dq.replace(/\\([$`"\\])/g, "$1") : esc!));
+}
 
 function scanCode(text: string, from: number, inSub: boolean, st: ScanState): [string, number] {
   let out = "";
@@ -125,7 +132,7 @@ function scanCode(text: string, from: number, inSub: boolean, st: ScanState): [s
       // any bash word is a delimiter (END-OF-TEXT, 42, 'a b'); `<<<` is a here-string
       const m = HEREDOC.exec(text.slice(i));
       if (m) {
-        st.heredocs.push({ tag: m[2] ?? m[3] ?? m[4]!.replace(/\\(.)/g, "$1"), dash: m[1] === "-" });
+        st.heredocs.push({ tag: unquoteWord(m[2]!), dash: m[1] === "-" });
         out += "<<''"; i += m[0].length; continue;
       }
     }
@@ -248,7 +255,8 @@ export function deployRuns(deployScript: string, gate: Gate): boolean {
   const want = `${v}="$SCRIPT_DIR/${gate.script.replace(/^scripts\//, "")}"`;
   const raw = deployScript.split("\n");
   const code = stripShell(deployScript).split("\n");
-  const assignAt = new RegExp(`(?:^|[;&|(]\\s*|\\b(?:export|local|declare|readonly)\\s+)${v}=`);
+  // leading indentation is still command position (Codex final4 r1: `  VAR=/bin/true`)
+  const assignAt = new RegExp(`(?:^\\s*|[;&|(]\\s*|\\b(?:export|local|declare|readonly)\\s+)${v}=`);
   const assigns = code.flatMap((line, k) => (assignAt.test(line) ? [raw[k]!.replace(/(^|\s)#.*$/, "$1").trim()] : []));
   return assigns.length > 0 && assigns.every((line) => line === want);
 }

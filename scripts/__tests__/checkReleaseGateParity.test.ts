@@ -104,6 +104,10 @@ test("red: a quote or heredoc spanning lines that only prints the gate does not 
     "run: |\n          cat <<'A' # <<'B'\n          A\n          echo '\n          B\n          node scripts/check-v5-callback-payload-hash.mjs\n          ' # '",
     // Codex fresh r3: two heredocs on one line, the gate in the second body
     "run: |\n          cat <<'A' <<'B'\n          A\n          node scripts/check-v5-callback-payload-hash.mjs\n          B",
+    // Codex final4 r1: a delimiter word mixing quoted and unquoted parts (bash: EOF, not E)
+    "run: |\n          cat <<E\"OF\"\n          E\n          node scripts/check-v5-callback-payload-hash.mjs\n          EOF",
+    "run: |\n          cat <<'E'OF\n          E\n          node scripts/check-v5-callback-payload-hash.mjs\n          EOF",
+    "run: |\n          cat <<E\\OF\n          E\n          node scripts/check-v5-callback-payload-hash.mjs\n          EOF",
   ]) {
     const input = real();
     input.workflows[wf] = input.workflows[wf]!.replace(step, fake);
@@ -198,6 +202,9 @@ test("red: the deploy-stage trailer gate is no longer really called (Codex final
     ["real assignment replaced, decoy in a heredoc", (d) => d.replace(/^FIX_TRAILER_GATE=.*$/m,
       "FIX_TRAILER_GATE=/bin/true\n: <<'DOC'\nFIX_TRAILER_GATE=\"$SCRIPT_DIR/check-v5-fix-trailers.sh\"\nDOC")],
     ["reassigned later", (d) => d.replace(/^FIX_TRAILER_GATE=.*$/m, (m) => `${m}\nFIX_TRAILER_GATE=/bin/true`)],
+    // Codex final4 r1: an indented reassignment is still executed
+    ["reassigned later, indented", (d) => d.replace(/^FIX_TRAILER_GATE=.*$/m, (m) => `${m}\n  FIX_TRAILER_GATE=/bin/true`)],
+    ["reassigned later, tab-indented", (d) => d.replace(/^FIX_TRAILER_GATE=.*$/m, (m) => `${m}\n\tFIX_TRAILER_GATE=/bin/true`)],
     // Codex final r2: a single-quoted $( … ) is a literal, not a run
     ["runner single-quoted", (d) => d.replace(/out="\$\("\$FIX_TRAILER_GATE" (.*?)\)"/, "out='$(\"$FIX_TRAILER_GATE\" $1)'")],
     ["runner only named in a double-quoted message", (d) => d.replace(/out="\$\("\$FIX_TRAILER_GATE" (.*?)\)"/, 'out="later; $FIX_TRAILER_GATE $1"')],
