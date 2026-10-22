@@ -1473,9 +1473,40 @@ function LiteraturePluginDownloadCard({
   filename: string;
   bytes: number;
 }) {
-  const { downloadLiteratureArtifact } = useToolCardActions();
+  const { downloadLiteratureArtifact, literatureArtifactMeta } = useToolCardActions();
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // 平台只暂存约 30 分钟（OCV5-585）：从服务端取到期时间，过期后不再给保存按钮。
+  const [expiry, setExpiry] = useState<{ kind: "unknown" } | { kind: "until"; at: number } | { kind: "expired" }>({
+    kind: "unknown",
+  });
+
+  useEffect(() => {
+    if (!literatureArtifactMeta) return;
+    let alive = true;
+    literatureArtifactMeta(artifactId).then(
+      (meta) => {
+        if (!alive) return;
+        const at = meta ? Date.parse(meta.expiresAt) : Number.NaN;
+        setExpiry(!meta ? { kind: "expired" } : Number.isFinite(at) ? { kind: "until", at } : { kind: "unknown" });
+      },
+      () => {},
+    );
+    return () => {
+      alive = false;
+    };
+  }, [artifactId, literatureArtifactMeta]);
+
+  useEffect(() => {
+    if (expiry.kind !== "until") return;
+    const left = expiry.at - Date.now();
+    if (left <= 0) {
+      setExpiry({ kind: "expired" });
+      return;
+    }
+    const timer = setTimeout(() => setExpiry({ kind: "expired" }), Math.min(left, 2_000_000_000));
+    return () => clearTimeout(timer);
+  }, [expiry]);
 
   const onSave = async () => {
     if (!downloadLiteratureArtifact || busy) return;
@@ -1496,23 +1527,30 @@ function LiteraturePluginDownloadCard({
         setTimeout(() => URL.revokeObjectURL(url), 1000);
       }
     } catch (e) {
+      if ((e as { status?: unknown })?.status === 404) setExpiry({ kind: "expired" });
       setErr(e instanceof Error && e.message ? e.message : "PDF 下载失败或文件已过期");
     } finally {
       setBusy(false);
     }
   };
 
+  const expired = expiry.kind === "expired";
+  const deadline =
+    expiry.kind === "until"
+      ? ` · 请在 ${new Date(expiry.at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })} 前保存`
+      : "";
+
   return (
     <CardShell
       icon={<FileText className="size-4" />}
-      title="文献全文已就绪"
-      subtitle={formatLiteraturePdfBytes(bytes)}
+      title={expired ? "文献 PDF 已过期" : "文献全文已就绪"}
+      subtitle={`${formatLiteraturePdfBytes(bytes)}${deadline}`}
     >
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="min-w-0 flex-1 truncate text-[13px] font-medium text-fg" title={filename}>
           {filename}
         </div>
-        {downloadLiteratureArtifact && (
+        {downloadLiteratureArtifact && !expired && (
           <button
             type="button"
             disabled={busy}
@@ -1523,7 +1561,12 @@ function LiteraturePluginDownloadCard({
           </button>
         )}
       </div>
-      {err && <div className="mt-1.5 text-xs text-danger">{err}</div>}
+      {expired && (
+        <div className="mt-1.5 text-xs text-muted">
+          平台暂存的文件已过期或已被清理，请让助手用同一编号重新下载（编号 24 小时内有效）。
+        </div>
+      )}
+      {err && !expired && <div className="mt-1.5 text-xs text-danger">{err}</div>}
     </CardShell>
   );
 }

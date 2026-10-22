@@ -589,6 +589,11 @@ import { startKnowledgePlanetAutomationScheduler } from './plugins/knowledgePlan
 import { WeiboDockerService, createWeiboRuntimeRegistries } from './plugins/weibo.js'
 import { WeiboSetupManager } from './plugins/weiboSetup.js'
 import { createCommercialLiteratureRuntime } from './plugins/literatureDb/jieyouLoginSession.js'
+import {
+  LITERATURE_ARTIFACT_LOG_MSG,
+  LITERATURE_CALL_LOG_MSG,
+  type LiteratureCallEvent,
+} from './plugins/literatureDb/observability.js'
 import { ZhihuDockerService, createZhihuRuntimeRegistries } from './plugins/zhihu.js'
 import { ZhihuSetupManager } from './plugins/zhihuSetup.js'
 import {
@@ -1719,7 +1724,14 @@ export async function registerCommercial(
   let biliAccountService: BiliAccountDockerService | undefined
   let biliAccountSetup: BiliAccountSetupManager | undefined
   let knowledgePlanetAutomation: KnowledgePlanetAutomationService | undefined
-  const { literatureSetup, literatureArtifacts, literatureHttp, literatureRelogin } = createCommercialLiteratureRuntime({ runtimeChannel, redis })
+  // 文献插件观测(OCV5-585):每次调用 / PDF 暂存事件一行白名单字段,聚合见 scripts/literature-plugin-metrics.ts。
+  const literatureLog = rootLogger.child({ subsys: "plugins", module: "literature-db" })
+  const literatureObserver = (event: LiteratureCallEvent) => literatureLog.info(LITERATURE_CALL_LOG_MSG, { ...event })
+  const { literatureSetup, literatureArtifacts, literatureHttp, literatureRelogin } = createCommercialLiteratureRuntime({
+    runtimeChannel,
+    redis,
+    onArtifactEvent: (event) => literatureLog.info(LITERATURE_ARTIFACT_LOG_MSG, { ...event }),
+  })
   let pluginFacade: PluginRuntimeFacade
   if (runtimeChannel === 'v5' && cfg.OC_RUNTIME_IMAGE_ID) {
     const pluginDocker = cfg.AGENT_DOCKER_SOCKET
@@ -1784,6 +1796,7 @@ export async function registerCommercial(
       knowledgePlanetMedia: knowledgePlanetMediaDeps,
       literatureHttp,
       literatureRelogin,
+      literatureObserver,
       pluginEnablement: PREFS_PLUGIN_ENABLEMENT,
     })
     knowledgePlanetSetup = new KnowledgePlanetSetupManager(knowledgePlanetService, {
@@ -1803,7 +1816,7 @@ export async function registerCommercial(
     })
     knowledgePlanetAutomation = new KnowledgePlanetAutomationService(pluginFacade)
   } else {
-    pluginFacade = new PluginRuntimeFacade({ redis, literatureHttp, literatureRelogin, pluginEnablement: PREFS_PLUGIN_ENABLEMENT })
+    pluginFacade = new PluginRuntimeFacade({ redis, literatureHttp, literatureRelogin, literatureObserver, pluginEnablement: PREFS_PLUGIN_ENABLEMENT })
   }
 
   // T-53: 装配 agent 运行时(image + seccomp + rpc dir + lifecycle scheduler)。
