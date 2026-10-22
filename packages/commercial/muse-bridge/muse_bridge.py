@@ -349,10 +349,12 @@ TAG_RE = re.compile(r"<(script|style)\b.*?</\1>|<[^>]+>", re.S | re.I)
 # link, including JSON-escaped ones.
 SECRET_RES = (
     (re.compile(r"https?:(?:\\?/){2}\S*", re.I), "<url>"),
-    (re.compile(r"\b(?:proxy-)?authorization\s*[:=]\s*(?:\w+\s+)?\S+", re.I), "<redacted>"),
-    (re.compile(r"\b(?:set-)?cookie\s*[:=][^\n]*", re.I), "<redacted>"),
+    # Header-style and JSON-style fields alike: `Cookie: a=b`, `"password":"x"`, `token='x'`.
+    (re.compile(r"""["']?\b((?:proxy-)?authorization|(?:set-)?cookie)\b["']?\s*[:=]\s*"""
+                r"""(?:"[^"]*"|'[^']*'|[^\n"'<>]*)""", re.I), r"\1: <redacted>"),
+    (re.compile(r"""["']?\b(password|passwd|pwd|secret|token|access[_-]?token|api[_-]?key|session[_-]?id)\b"""
+                r"""["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s"',;}&<>]+)""", re.I), r"\1=<redacted>"),
     (re.compile(r"\b(?:basic|bearer|digest|negotiate)\s+\S+", re.I), "<redacted>"),
-    (re.compile(r"\b(?:password|passwd|pwd|secret|token|api[_-]?key)\b\s*[:=]\s*\S+", re.I), "<redacted>"),
     (re.compile(r"\S+:\S*@"), "<redacted>@"),
     (re.compile(r"mbr_[A-Za-z0-9_-]*"), "mbr_<redacted>"),
     (re.compile(r"[A-Za-z0-9+/_=-]{24,}"), "<redacted>"),
@@ -387,10 +389,11 @@ def describe_foreign(status, headers, payload, url):
     """One line saying who most likely answered status instead of the master."""
     server = (headers.get("Server") if headers else None) or "-"
     ray = (headers.get("cf-ray") if headers else None) or "-"
-    text = " ".join(TAG_RE.sub(" ", payload[:4096].decode("utf-8", "replace")).split())
+    # Scrub before collapsing whitespace: a header-style value ends at its line break.
+    text = " ".join(scrub(TAG_RE.sub("\n", payload[:4096].decode("utf-8", "replace"))).split())
     return ("HTTP %d 不是个人版服务端返回的（Server: %s，cf-ray: %s，本机代理: %s）。"
             "多半是 Muse VM 的出口代理或 Cloudflare 拦截了请求，换 token 没有用。响应摘要：%s"
-            % (status, scrub(server)[:80], scrub(ray)[:40], proxy_for(url), scrub(text)[:160] or "（空）"))
+            % (status, scrub(server)[:80], scrub(ray)[:40], proxy_for(url), text[:160] or "（空）"))
 
 
 def parse_contract(stdout):

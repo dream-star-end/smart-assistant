@@ -336,15 +336,31 @@ class MasterErrors(unittest.TestCase):
         for body in (b"", b"<html>403</html>", b'{"error":"bad"}', b"[1]", b"\xff"):
             self.assertIsNone(mb.master_error_code(body))
     def test_foreign_diagnosis_scrubs_secrets(self):
-        body = (b"<pre>Proxy-Authorization: Basic dXNlcjpzZWNyZXQ=</pre> Authorization: Bearer abc.def "
-                b"Cookie: sid=s3cr3t; x=1\n token=tok123 http://u:p@proxy:8080/x "
-                b'{"u":"https:\\/\\/scontent.xx.fbcdn.net\\/v\\/t1.png?oh=abc"} https://meta.example/p?sig=1 '
-                b"opaque ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 ok")
-        out = mb.describe_foreign(403, {"Server": "squid mbr_servertoken", "cf-ray": "Basic Zm9vOmJhcg=="}, body,
-                                  "https://h.example/api/muse-bridge/v1/hello")
-        for leak in ("dXNlcjpzZWNyZXQ", "user:secret", "abc.def", "s3cr3t", "tok123", "u:p@", "fbcdn", "scontent",
-                     "meta.example", "sig=1", "mbr_servertoken", "Zm9vOmJhcg", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"):
-            self.assertNotIn(leak, out)
+        # One input per rule, each followed by a marker that must survive, so no rule hides another.
+        cases = [
+            (b"<pre>Proxy-Authorization: Basic dXNlcjpzZWNyZXQ=</pre> KEEP", ("dXNlcjpzZWNyZXQ", "user:secret")),
+            (b"Authorization: Bearer abc.def\nKEEP", ("abc.def",)),
+            (b"Cookie: sid=s3cr3t; x=1\nKEEP", ("s3cr3t",)),
+            (b'{"Cookie":"sid=s3cr3t","KEEP":1}', ("s3cr3t",)),
+            (b'{"password":"p4ssword","KEEP":1}', ("p4ssword",)),
+            (b"{'api_key': 'k3y'} KEEP", ("k3y",)),
+            (b"token=tok123&KEEP", ("tok123",)),
+            (b'{"access_token":"at999"} KEEP', ("at999",)),
+            (b"see http://u:p@proxy:8080/x KEEP", ("u:p@", "proxy:8080")),
+            (b"proxy u:p@10.0.0.1 KEEP", ("u:p@",)),
+            (b'{"u":"https:\\/\\/scontent.xx.fbcdn.net\\/v\\/t1.png?oh=abc"} KEEP', ("fbcdn", "scontent")),
+            (b"https://meta.example/p?sig=1 KEEP", ("meta.example", "sig=1")),
+            (b"mbr_bodytoken KEEP", ("mbr_bodytoken",)),
+            (b"opaque ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 KEEP", ("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123",)),
+        ]
+        for body, leaks in cases:
+            out = mb.describe_foreign(403, {}, body, "https://h.example/api/muse-bridge/v1/hello")
+            for leak in leaks:
+                self.assertNotIn(leak, out, body)
+            self.assertIn("KEEP", out, body)
+        out = mb.describe_foreign(403, {"Server": "squid mbr_servertoken", "cf-ray": "Basic Zm9vOmJhcg=="}, b"",
+                                  "https://h.example/x")
+        self.assertNotIn("mbr_servertoken", out); self.assertNotIn("Zm9vOmJhcg", out)
         self.assertIn("HTTP 403", out); self.assertIn("squid", out)
     def test_proxy_for_drops_credentials(self):
         old = dict(os.environ)
