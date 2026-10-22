@@ -47,6 +47,11 @@
 - 迁移先于代码 apply，部署窗口内旧代码照常运行；
 - 回滚到 0320 之前的代码也能正常读写，AI 审核过的行旧代码照样能读，只是看不到 review_source。
 
+> **2026-10-22 改写（合入后，发布前）**：个人版列车的破坏性 DDL 门（`scripts/lib/v5-migration-ddl.sh`）拒绝任何 `ALTER ... DROP`，0320 原稿里放宽约束用的 `DROP CONSTRAINT` 会让下一趟列车卡住。改写后的 0320 不含任何 DROP，也不放宽既有约束：
+> - 图片按既有的 `kind='media'` 入库，靠 mime 与 `image:` role 区分；入库上限沿用既有的 8 MiB（上传原图仍可到 10MB，前端先压成 webp）；
+> - 审核状态约束不变：AI 结论的 `reviewed_by` 记最早的在职管理员作系统操作者（与系统站内信发件人同一做法），来源靠 `review_source='ai'` 区分；没有在职管理员时转人工。
+> 上面第 1 节里放宽 kind/bytes/审核状态约束的条目因此作废。
+
 ### 2. 图片上传 `POST /api/tutorials/images`
 
 - **前置条件**：需要登录，并且 `OC_COMMUNITY_BLOG_ENABLED` 为 `1` 或 `true`；开关关闭时返回 404 `FEATURE_DISABLED`。

@@ -128,9 +128,9 @@ async function inbox(userId: string) {
 }
 
 describe('经验分享 AI 审核 worker', () => {
-  test('on：全部确定为否 → 自动发布（review_source=ai、无审核人）、记一条判定、发站内信', async (t) => {
+  test('on：全部确定为否 → 自动发布（review_source=ai、审核人记系统管理员）、记一条判定、发站内信', async (t) => {
     if (db.skipIfUnavailable(t)) return
-    await createUser('admin@example.com', 'admin')
+    const admin = await createUser('admin@example.com', 'admin')
     const author = await createUser('a@example.com')
     const { id } = await submitCommunityTutorial(author, draft())
     assert.equal((await post(id)).needs_human, false)
@@ -139,7 +139,7 @@ describe('经验分享 AI 审核 worker', () => {
       status: 'approved',
       needs_human: false,
       review_source: 'ai',
-      reviewed_by: null,
+      reviewed_by: admin,
       review_note: null,
     })
     const records = await listTutorialModerations({ cursor: null, limit: 10 })
@@ -200,6 +200,7 @@ describe('经验分享 AI 审核 worker', () => {
 
   test('图片：视觉判广告 → 驳回；视觉关闭 → 带图稿件转人工', async (t) => {
     if (db.skipIfUnavailable(t)) return
+    await createUser('admin@example.com', 'admin')
     const author = await createUser('a@example.com')
     const png = await sharp({ create: { width: 30, height: 20, channels: 3, background: '#335577' } })
       .png()
@@ -287,6 +288,7 @@ describe('经验分享 AI 审核 worker', () => {
 
   test('租约反复过期、次数用满：不再认领，收尾为 failed 并转人工，不堵队首', async (t) => {
     if (db.skipIfUnavailable(t)) return
+    await createUser('admin@example.com', 'admin')
     const author = await createUser('a@example.com')
     const stuck = await submitCommunityTutorial(author, draft())
     const next = await submitCommunityTutorial(author, draft(`${BODY} 第二篇`))
@@ -307,6 +309,16 @@ describe('经验分享 AI 审核 worker', () => {
       [stuck.id],
     )
     assert.equal(job.rows[0]?.status, 'failed')
+  })
+
+  test('没有在职管理员可作系统审核人：确定的结论也转人工，不写无审核人的终态', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const author = await createUser('a@example.com')
+    const { id } = await submitCommunityTutorial(author, draft())
+    await runOnce(transport({}))
+    assert.deepEqual([(await post(id)).status, (await post(id)).needs_human], ['pending', true])
+    const records = await listTutorialModerations({ cursor: null, limit: 10 })
+    assert.match(records.items[0]?.adminNote ?? '', /没有在职管理员/)
   })
 
   test('作者在审核前撤回：作业跳过，不记判定', async (t) => {

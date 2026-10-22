@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { randomBytes } from 'node:crypto'
 import { type Server, createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { after, before, beforeEach, describe, test } from 'node:test'
@@ -175,7 +176,7 @@ describe('经验分享 · 图片上传与归属', () => {
     // 直接造满额度（逐张上传太慢），只让最后一张走真实接口。
     await query(
       `INSERT INTO tutorial_blobs (sha256, kind, mime, bytes, body)
-       SELECT lpad(to_hex(g), 64, '0'), 'image', 'image/png', 1, '\\x00'::bytea
+       SELECT lpad(to_hex(g), 64, '0'), 'media', 'image/png', 1, '\\x00'::bytea
          FROM generate_series(1, $1::int) g`,
       [TUTORIAL_IMAGE_DAILY_UPLOADS - 1],
     )
@@ -379,30 +380,46 @@ describe('经验分享 · 投稿', () => {
 })
 
 describe('迁移 0320 约束', () => {
-  test('AI 审核可以没有 reviewed_by；既无审核人又非 AI 的 approved 行被拒', async (t) => {
+  test('审核状态约束不变：approved 仍须有审核人（AI 结论也一样）；review_source 只认 human/ai', async (t) => {
     if (db.skipIfUnavailable(t)) return
     const author = await createUser('a@example.com')
+    const admin = await createUser('admin@example.com', 'admin', '管理员')
     const { id } = await submit(author.token, LONG_TEXT)
-    await query(
-      `UPDATE community_tutorials
-          SET status = 'approved', review_source = 'ai', reviewed_at = NOW(), published_at = NOW(),
-              needs_human = false
-        WHERE id = $1::bigint`,
-      [id],
-    )
-    const second = await submit(author.token, `${LONG_TEXT} 另一篇`)
     await assert.rejects(
       query(
         `UPDATE community_tutorials
-            SET status = 'approved', reviewed_at = NOW(), published_at = NOW()
+            SET status = 'approved', review_source = 'ai', reviewed_at = NOW(), published_at = NOW(),
+                needs_human = false
           WHERE id = $1::bigint`,
-        [second.id],
+        [id],
       ),
       /community_tutorials_review_state_chk/,
+    )
+    await query(
+      `UPDATE community_tutorials
+          SET status = 'approved', review_source = 'ai', reviewed_by = $2::bigint, reviewed_at = NOW(),
+              published_at = NOW(), needs_human = false
+        WHERE id = $1::bigint`,
+      [id, admin.id],
     )
     await assert.rejects(
       query(`UPDATE community_tutorials SET review_source = 'robot' WHERE id = $1::bigint`, [id]),
       /community_tutorials_review_source_chk/,
     )
+  })
+
+  test('图片按既有 media kind 入库；处理后超过 8 MiB 的拒收（既有 bytes 上限不放宽）', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const user = await createUser('u@example.com')
+    const { sha } = await upload(user.token, await png(21))
+    const row = await query<{ kind: string }>('SELECT kind FROM tutorial_blobs WHERE sha256 = $1', [sha])
+    assert.equal(row.rows[0]?.kind, 'media')
+    // 随机像素的 PNG 几乎不可压缩：1750×1750×3 ≈ 9.2MB，在 10MB 上传上限内，但超过 8 MiB 入库上限。
+    const big = await sharp(randomBytes(1750 * 1750 * 3), { raw: { width: 1750, height: 1750, channels: 3 } })
+      .png({ compressionLevel: 0 })
+      .toBuffer()
+    assert.ok(big.length > 8 * 1024 * 1024 && big.length < 10 * 1024 * 1024, String(big.length))
+    const res = await upload(user.token, big)
+    assert.deepEqual([res.status, res.code], [413, 'TOO_LARGE'])
   })
 })
