@@ -51,7 +51,7 @@
 
 ### 2.4 音色归属（堵越权）
 
-- 新迁移 `0322_minimax_voices.sql`（`scripts/v5-migration-claim.sh` 申领结果；文件头声明 `-- order-dependency: 0321_community_tutorial_moderation`，因为个人版的 0320/0321 社区博客迁移在途，要先同步进商业并 apply；只增不删）：
+- 新迁移 `0322_minimax_voices.sql`（`scripts/v5-migration-claim.sh` 申领结果。0320/0321 是只存在于个人版的社区博客迁移，商业树里没有；如果声明依赖它们，`migrate.ts` 会因为依赖既未 apply 又不在目录里而 fail-closed，所有 integ 都会挂。所以声明 `-- order-dependency: none (...)`，并在 PR 写明：博客以后同步进商业时，那两支要重编号到 0322 之后，做法同 OCV5-576 对个人版 0313–0315 的处理。只增不删）：
 
 ```sql
 CREATE TABLE minimax_voices (
@@ -78,7 +78,7 @@ CREATE INDEX idx_minimax_voices_user ON minimax_voices(user_id, created_at DESC)
 - **创建幂等**（Codex plan r1 P1-2）：调上游**之前**，先以 `(user_id, request_id)` 插入一行 `pending`，同时写入生成好的 `voice_id` 和 `params_sha256`。同一 `request_id` 再次进来时：
   - `active`：直接返回原来的 `voice_id`，结算按 replay 处理，不重复扣费，也不再调上游；
   - `pending` 且 15 分钟内有更新：返回 409 `VOICE_CREATE_IN_PROGRESS`；
-  - `pending` 超过 15 分钟（进程崩溃）或 `failed`：换一个新的 `voice_id`，把行重置为 `pending` 后重试。旧 `voice_id` 在上游即使已经建成，也没人用，7 天后会被 MiniMax 自动删除，而且从未向用户收费；
+  - `pending` 超过 15 分钟（进程崩溃）或 `failed`：**先对账**（Codex plan r2 P1）。如果 `minimax_media_usage_records` 里已经有这个 `(user_id, request_id)` 的成功结算，说明是“结算已提交、但还没来得及置 active 就崩溃”，此时直接把原来的 `voice_id` 置为 `active`、补上 `usage_id`，按 replay 返回，不换号也不再调上游。只有确认从未结算过时，才换一个新的 `voice_id`，把行重置为 `pending` 后重试。旧 `voice_id` 在上游即使已经建成，也没人用，7 天后会被 MiniMax 自动删除，而且从未向用户收费；
   - `params_sha256` 不一致：返回 409 `REQUEST_ID_REUSED`，不调上游。
   上游成功并结算后 → `active`，写 `usage_id`；上游失败或审核拒绝 → `failed`。归属校验只认 `active` 状态的行。
 
