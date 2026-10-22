@@ -1705,6 +1705,7 @@ export function App() {
               caseId={tutorialCase}
               communityId={tutorialCommunity}
               browseView={tutorialTab ?? "showcase"}
+              blogEnabled={publicCfg?.featureCommunityBlog === true}
               onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
               signatureWorkId={tutorialWork}
               onSignatureWorkChange={setTutorialWork}
@@ -1882,7 +1883,9 @@ export function App() {
     onOpenManage: demo ? undefined : () => openManage(DEFAULT_MANAGE_TAB),
     onOpenMarketplace: demo ? undefined : () => openMarketplace("browse"),
     onOpenTutorial: demo ? undefined : () => openTutorial(),
-    onOpenBlog: demo
+    // 经验分享入口跟随 feature_community_blog（商业版默认关；配置未到时也不显示）。
+    onOpenBlog:
+      demo || publicCfg?.featureCommunityBlog !== true
       ? undefined
       : () => {
           openTutorial();
@@ -2723,6 +2726,7 @@ export function App() {
             caseId={tutorialCase}
             communityId={tutorialCommunity}
             browseView={tutorialTab ?? "showcase"}
+            blogEnabled={publicCfg?.featureCommunityBlog === true}
             onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
             signatureWorkId={tutorialWork}
             onSignatureWorkChange={setTutorialWork}

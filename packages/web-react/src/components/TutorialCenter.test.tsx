@@ -446,3 +446,27 @@ describe("TutorialCenter", () => {
     ).toBeInTheDocument();
   });
 });
+
+describe("经验分享页签跟随 feature_community_blog（OCV5-577）", () => {
+  const base = {
+    open: true,
+    topicId: null,
+    onTopicChange: () => {},
+    onClose: () => {},
+    actionState: () => ({ enabled: true, label: "回到功能位置" }),
+    onRunAction: () => {},
+  } as const;
+
+  it("开关关闭：没有「经验分享」页签，tab=blog 深链回落到案例展厅", () => {
+    render(<TutorialCenter {...base} browseView="blog" blogEnabled={false} />);
+    expect(screen.queryByRole("button", { name: /经验分享/ })).toBeNull();
+    expect(screen.getByRole("heading", { name: "案例展厅" })).toBeInTheDocument();
+  });
+
+  it("开关打开：页签出现，tab=blog 打开经验分享", () => {
+    vi.spyOn(api, "listCommunityTutorials").mockResolvedValue({ tutorials: [], nextCursor: null });
+    render(<TutorialCenter {...base} browseView="blog" blogEnabled />);
+    expect(screen.getByRole("button", { name: /经验分享/ })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "经验分享" })).toBeInTheDocument();
+  });
+});
