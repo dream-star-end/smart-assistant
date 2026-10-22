@@ -122,7 +122,7 @@ export function makeMuseInternalHandler(deps: MuseInternalDeps): MuseInternalHan
         return
       }
       if (method === 'GET' && m[2] !== undefined) {
-        const found = hub.fileFor(userId, jobId, Number(m[2]))
+        const found = await hub.fileFor(userId, jobId, Number(m[2]))
         if (!found) throw new MuseError(404, 'NOT_FOUND', 'file not found')
         res.statusCode = 200
         res.setHeader('Content-Type', found.file.mime)

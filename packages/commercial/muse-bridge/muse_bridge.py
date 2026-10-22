@@ -50,7 +50,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BRIDGE_VERSION = "0.3.2"
+BRIDGE_VERSION = "0.4.0"
 API_PREFIX = "/api/muse-bridge/v1"
 DEFAULT_CLI = "/opt/hatch/bin/media-generation"
 DEFAULT_STATE_DIR = os.path.join(os.path.expanduser("~"), ".muse-bridge")
@@ -90,6 +90,9 @@ HEARTBEAT_DEFAULT = 15
 ACK_ATTEMPTS = 3
 ACK_RETRY_SEC = 2
 BACKOFF_MAX = 60
+# Jobs this bridge runs at once: the smaller of --max-concurrency and the master's hello
+# `max_concurrency` (a master that does not send it gets one, as before 0.4.0).
+MAX_CONCURRENCY_HARD = 16
 LOG_MAX_BYTES = 5 * MIB
 
 URL_RE = re.compile(r"https?://\S+")
@@ -109,6 +112,10 @@ class Blocked(FatalAuth):
 
 class JobGone(Exception):
     """Master no longer knows this job (410): drop it."""
+
+
+class SessionLost(Exception):
+    """The master no longer knows this session (it restarted): say hello again."""
 
 
 class StopRequested(Exception):
@@ -206,6 +213,12 @@ def _clamp_limit(server_limits, key):
 
 def effective_limits(server_limits=None):
     return {k: _clamp_limit(server_limits, k) for k in DEFAULT_LIMITS}
+
+
+def effective_slots(server_value, local_max):
+    """Jobs to run at once: the master's offer (1 when absent or invalid), never above local_max."""
+    offered = server_value if isinstance(server_value, int) and not isinstance(server_value, bool) else 1
+    return max(1, min(offered, local_max, MAX_CONCURRENCY_HARD))
 
 
 def sniff_mime(head):
@@ -636,6 +649,8 @@ class Client:
                 raise Blocked(describe_foreign(status, resp_headers, payload, url))
         if status == 410:
             raise JobGone()
+        if status == 400 and master_error_code(payload) == "SESSION_UNKNOWN":
+            raise SessionLost("master 不再认识本会话（可能已重启），重新连接")
         if status == 204:
             return None
         if status >= 400:
@@ -694,19 +709,29 @@ def with_retries(fn, attempts=3):
 
 
 class Bridge:
-    def __init__(self, paths, cli):
+    def __init__(self, paths, cli, max_concurrency=1):
         self.paths = paths
         self.cli = cli
-        self.runner = CliRunner(cli)
+        self.max_concurrency = max(1, min(int(max_concurrency), MAX_CONCURRENCY_HARD))
         self.stop = threading.Event()
-        self.in_job = False
         self.cli_version = cli_version(cli)
+        # Held while a worker polls or runs a job. Workers of an ended session keep their job
+        # (and slot) until it finishes, so a reconnect never pushes the total above the local cap.
+        self.slots = threading.BoundedSemaphore(self.max_concurrency)
+        self._runners = set()
+        self._runners_lock = threading.Lock()
+
+    def _track(self, runner, add):
+        with self._runners_lock:
+            (self._runners.add if add else self._runners.discard)(runner)
 
     def request_stop(self, *_):
         self.stop.set()
-        if self.in_job:
-            self.runner.kill()
-        else:
+        with self._runners_lock:
+            runners = list(self._runners)
+        for runner in runners:
+            runner.kill()
+        if not runners:
             raise StopRequested()
 
     def serve(self):
@@ -744,15 +769,67 @@ class Bridge:
         hold = int(hello.get("poll_hold_sec") or POLL_HOLD_DEFAULT)
         heartbeat = max(5, min(30, int(hello.get("heartbeat_sec") or HEARTBEAT_DEFAULT)))
         limits = effective_limits(hello.get("limits"))
-        while not self.stop.is_set():
-            resp = client.poll(hold)
-            if not resp or not resp.get("job"):
-                continue
-            self.in_job = True
-            try:
-                self.handle_job(client, resp["job"], limits, heartbeat)
-            finally:
-                self.in_job = False
+        workers = effective_slots(hello.get("max_concurrency"), self.max_concurrency)
+        if workers > 1:
+            log.info("并发 %d 路", workers)
+        ended = threading.Event()
+        reasons = []
+
+        def end(reason):
+            if not reasons:
+                reasons.append(reason)
+            ended.set()
+
+        def worker():
+            backoff = 1
+            while not self.stop.is_set() and not ended.is_set():
+                if not self.slots.acquire(timeout=1):
+                    continue
+                delay = 0
+                try:
+                    if self.stop.is_set() or ended.is_set():
+                        return
+                    resp = client.poll(hold)
+                    backoff = 1
+                    if resp and resp.get("job"):
+                        self.handle_job(client, resp["job"], limits, heartbeat)
+                except (FatalAuth, SessionLost) as e:
+                    # Session-wide: a reconnect (or exit) is the only way forward.
+                    end(e)
+                    return
+                except Exception as e:
+                    # One slot's network trouble must not drop the session: a new hello would make
+                    # the master fail every job the other slots are running.
+                    delay = min(BACKOFF_MAX, backoff) * random.uniform(0.8, 1.2)
+                    log.warning("轮询失败：%s；%.0f 秒后重试", redact(str(e), 200), delay)
+                    backoff = min(BACKOFF_MAX, backoff * 2)
+                finally:
+                    self.slots.release()
+                if delay and self.stop.wait(delay):
+                    return
+
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
+        for t in threads:
+            t.start()
+        try:
+            while not ended.wait(1):
+                if self.stop.is_set():
+                    break
+        except StopRequested:
+            self.stop.set()
+        ended.set()
+        if self.stop.is_set():
+            # Let slots that were running a job report it (MUSE_BRIDGE_LOST) before the process
+            # exits; idle long-polls are simply abandoned.
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and any(t.is_alive() for t in threads):
+                with self._runners_lock:
+                    busy = bool(self._runners)
+                if not busy:
+                    break
+                time.sleep(0.2)
+            raise StopRequested()
+        raise reasons[0] if reasons else IOError("会话结束")
 
     def handle_job(self, client, raw_job, limits, heartbeat_sec):
         started = time.monotonic()
@@ -763,7 +840,6 @@ class Bridge:
         # One runner per job: a heartbeat still in flight when this job ends can only ever kill
         # this job's process, never the next job's.
         runner = CliRunner(self.cli)
-        self.runner = runner
 
         def stop_job():
             if hb_stop.is_set():
@@ -785,6 +861,9 @@ class Bridge:
         # Ack barrier: start nothing until the master confirmed this exact job/nonce. Without
         # the confirmation the master may requeue the job with a new nonce, so running it
         # here could produce a second, duplicate generation.
+        # Stopping: leave the job un-acked; the master requeues it.
+        if self.stop.is_set():
+            return
         if not jid or not self.ack(client, job_ref):
             log.info("任务 %s 未获确认，放弃（不执行）", jid)
             return
@@ -793,6 +872,7 @@ class Bridge:
         os.chmod(out_dir, 0o700)
         hb = None
         kind = raw_job.get("kind") if isinstance(raw_job, dict) else None
+        self._track(runner, True)
         try:
             if jid:
                 hb = threading.Thread(target=beat, daemon=True)
@@ -821,11 +901,13 @@ class Bridge:
                 body = e.result()
                 log.info("任务 %s 失败：%s（%s）%.0f 秒", jid, e.code, kind, time.monotonic() - started)
             if jid:
+                # The runner stays tracked until the result is posted, so a stop waits for it.
                 try:
                     with_retries(lambda: client.result(job_ref, body))
                 except JobGone:
                     log.info("任务 %s 在 master 侧已失效，结果丢弃", jid)
         finally:
+            self._track(runner, False)
             hb_stop.set()
             shutil.rmtree(out_dir, ignore_errors=True)
 
@@ -929,7 +1011,7 @@ def daemonize():
     return True
 
 
-def run_bridge(paths, cli, foreground):
+def run_bridge(paths, cli, foreground, max_concurrency=1):
     lock_fd = acquire_lock(paths)
     if lock_fd is None:
         if foreground:
@@ -938,10 +1020,11 @@ def run_bridge(paths, cli, foreground):
     os.umask(0o077)
     write_private(paths["pid"], str(os.getpid()))
     setup_logging(paths, foreground)
-    bridge = Bridge(paths, cli)
+    bridge = Bridge(paths, cli, max_concurrency)
     signal.signal(signal.SIGTERM, bridge.request_stop)
     signal.signal(signal.SIGINT, bridge.request_stop)
-    log.info("bridge %s 启动，pid %d，server %s", BRIDGE_VERSION, os.getpid(), server_host(read_server(paths)))
+    log.info("bridge %s 启动，pid %d，server %s，本地并发上限 %d", BRIDGE_VERSION, os.getpid(),
+             server_host(read_server(paths)), bridge.max_concurrency)
     try:
         return bridge.serve()
     except StopRequested:
@@ -1042,6 +1125,8 @@ def self_check(paths, cli, verbose=True):
 
 
 def cmd_start(args, paths, foreground):
+    if not 1 <= args.max_concurrency <= MAX_CONCURRENCY_HARD:
+        raise SystemExit("--max-concurrency 必须在 1 到 %d 之间" % MAX_CONCURRENCY_HARD)
     ensure_state_dir(paths)
     if args.server:
         write_private(paths["server"], normalize_server(args.server) + "\n")
@@ -1059,7 +1144,7 @@ def cmd_start(args, paths, foreground):
             print("自检未通过，没有启动。确认无误可加 --force 强制启动。")
             return 1
     if foreground:
-        return run_bridge(paths, args.cli, True)
+        return run_bridge(paths, args.cli, True, args.max_concurrency)
     sys.stdout.flush()
     sys.stderr.flush()
     if not daemonize():
@@ -1071,7 +1156,7 @@ def cmd_start(args, paths, foreground):
                 return 0
         print("bridge 没能启动，请看日志 %s" % paths["log"])
         return 1
-    code = run_bridge(paths, args.cli, False)
+    code = run_bridge(paths, args.cli, False, args.max_concurrency)
     os._exit(code)
 
 
@@ -1159,6 +1244,8 @@ def main(argv=None):
         sp = sub.add_parser(name)
         sp.add_argument("--server")
         sp.add_argument("--force", action="store_true")
+        sp.add_argument("--max-concurrency", dest="max_concurrency", type=int, default=1,
+                        help="最多同时跑几个任务（1-%d）；实际还受服务端下发的上限约束" % MAX_CONCURRENCY_HARD)
     sub.add_parser("stop")
     sub.add_parser("status")
     sp = sub.add_parser("check")

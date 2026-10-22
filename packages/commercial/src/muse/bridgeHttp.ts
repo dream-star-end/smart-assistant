@@ -184,6 +184,8 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
           poll_hold_sec: POLL_HOLD_SEC,
           heartbeat_sec: HEARTBEAT_SEC,
           limits: MUSE_LIMITS,
+          // Bridges >= 0.4.0 run this many jobs at once (capped by their --max-concurrency).
+          max_concurrency: deps.hub.bridgeConcurrency(),
         })
         return
       }
@@ -194,12 +196,18 @@ export function makeMuseBridgeHttpHandler(deps: MuseBridgeHttpDeps): MuseBridgeH
       if (method === 'POST' && sub === '/poll') {
         await readJson(req, JSON_MAX_BYTES)
         // Detect the client going away on the *response* side; req 'close' also fires after
-        // a normally consumed body and must not be used here.
+        // a normally consumed body and must not be used here. One bridge keeps a poll per free
+        // slot, so the abort names this poll, not the session.
+        const gone = new AbortController()
         const onClose = () => {
-          if (!res.writableEnded) deps.hub.cancelPoll(sessionId)
+          if (!res.writableEnded) gone.abort()
         }
         res.on('close', onClose)
-        const job = await deps.hub.poll(sessionId, deps.pollHoldMs ?? POLL_HOLD_SEC * 1000)
+        const job = await deps.hub.poll(
+          sessionId,
+          deps.pollHoldMs ?? POLL_HOLD_SEC * 1000,
+          gone.signal,
+        )
         res.off('close', onClose)
         if (!job) {
           if (!res.destroyed && !res.writableEnded) {

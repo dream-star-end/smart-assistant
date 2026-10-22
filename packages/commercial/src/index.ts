@@ -7250,6 +7250,8 @@ export async function registerCommercial(
       chatgptProxyServer = undefined;
       try { await cgpServer?.close(); } catch { /* ignore */ }
       try { await closeMusePublic?.(); } catch { /* ignore */ }
+      // OCV5-574: close this process's open Muse jobs (MUSE_MASTER_RESTARTED, never charged).
+      try { await museHub?.stop(); } catch { /* ignore */ }
       try { await directPreview?.shutdown(); } catch { /* ignore */ }
       try { await previewBridge?.shutdown(); } catch { /* ignore */ }
       try { await voiceTranscribeHandler.shutdown(); } catch { /* ignore */ }

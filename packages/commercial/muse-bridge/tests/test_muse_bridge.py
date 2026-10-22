@@ -86,6 +86,13 @@ class Pure(unittest.TestCase):
         self.assertEqual(code(0, "not json"), ("MUSE_BAD_OUTPUT", False))
         self.assertEqual(code(0, json.dumps({"ok": True, "media_paths": []})), ("MUSE_BAD_OUTPUT", False))
         self.assertEqual(code(0, "log line\n" + json.dumps({"ok": True, "media_paths": ["/a"]})), "OK")
+    def test_effective_slots(self):
+        self.assertEqual(mb.effective_slots(None, 10), 1, "a master that offers nothing gets one")
+        self.assertEqual(mb.effective_slots(10, 3), 3)
+        self.assertEqual(mb.effective_slots(2, 10), 2)
+        self.assertEqual(mb.effective_slots(64, 64), mb.MAX_CONCURRENCY_HARD)
+        for bad in (0, -1, True, "5", 2.5):
+            self.assertEqual(mb.effective_slots(bad, 10), 1, repr(bad))
     def test_server_limits_clamped(self):
         l = mb.effective_limits({"video_max_bytes": 10 ** 12, "chunk_bytes": "x", "max_files": 2})
         self.assertEqual(l["video_max_bytes"], mb.HARD_LIMITS["video_max_bytes"]); self.assertEqual(l["chunk_bytes"], 4 * mb.MIB)
@@ -106,6 +113,52 @@ class Pure(unittest.TestCase):
             mb.CliRunner("/nonexistent/cli").run({"id": "t", "kind": "image", "prompt": "x", "timeout_secs": 30}, tempfile.mkdtemp(), threading.Event())
         self.assertEqual(c.exception.code, "MUSE_CLI_MISSING")
 
+class Concurrent(unittest.TestCase):
+    """0.4.0: several jobs at once when both the master (hello max_concurrency) and --max-concurrency allow."""
+    @classmethod
+    def setUpClass(cls):
+        mm.S.max_concurrency = 3
+        cls.srv = mm.start(); cls.url = "http://127.0.0.1:%d" % cls.srv.server_port
+        cls.home = tempfile.mkdtemp(); os.chmod(cls.home, 0o700)
+        with open(os.path.join(cls.home, "token"), "w") as f: f.write(mm.TOKEN)
+        mm.S.session = None
+        cls.proc = subprocess.Popen([sys.executable, "-I", BRIDGE, "--state-dir", cls.home, "--cli", FAKE, "run",
+                                     "--server", cls.url, "--max-concurrency", "3"],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        for _ in range(50):
+            if mm.S.session: break
+            time.sleep(0.2)
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.send_signal(signal.SIGTERM); cls.proc.wait(30)
+        # The mock's job queue is shared by every test class: let this bridge's in-flight polls
+        # (hold 2 s) expire so none of them takes the next class's first job.
+        time.sleep(3)
+        mm.S.max_concurrency = None; mm.S.session = None
+    def job(self, jid, prompt):
+        mm.S.jobs.put({"id": jid, "nonce": "n-" + jid, "kind": "image", "prompt": prompt}); return jid
+    def test_1_three_slots_run_in_parallel(self):
+        t0 = time.monotonic()
+        jids = [self.job("par%d" % i, "slow") for i in range(3)]
+        for jid in jids:
+            r = mm.wait_result(jid, 40); self.assertIsNotNone(r, jid); self.assertTrue(r["ok"], r)
+        # Each fake generation sleeps 6 s: one at a time would need 18 s.
+        self.assertLess(time.monotonic() - t0, 14)
+    def test_2_one_slot_poll_error_keeps_the_session(self):
+        hellos = mm.S.hellos; mm.S.poll_errors = 2
+        r = mm.wait_result(self.job("perr1", "ok"), 40); self.assertIsNotNone(r); self.assertTrue(r["ok"], r)
+        self.assertEqual(mm.S.hellos, hellos, "a 502 on one poll must not trigger a new hello")
+    def test_3_unknown_session_says_hello_again(self):
+        hellos = mm.S.hellos; mm.S.session_unknown = True
+        for _ in range(50):
+            if mm.S.hellos > hellos: break
+            time.sleep(0.2)
+        self.assertGreater(mm.S.hellos, hellos)
+        # The real master answers the old session's pending polls with nothing at hello; this mock
+        # does not, so let them expire (hold 2 s) before queueing the next job.
+        time.sleep(3)
+        r = mm.wait_result(self.job("after-hello", "ok"), 40); self.assertIsNotNone(r); self.assertTrue(r["ok"], r)
+
 class E2E(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -113,7 +166,9 @@ class E2E(unittest.TestCase):
         cls.home = tempfile.mkdtemp(); os.chmod(cls.home, 0o700)
         with open(os.path.join(cls.home, "token"), "w") as f: f.write(mm.TOKEN)
         cls.argvlog = os.path.join(cls.home, "argv.log")
-        env = dict(os.environ, FAKE_ARGV_LOG=cls.argvlog)
+        # Own temp dir: other classes' bridges share /tmp, and test_10 must see only this one's jobs.
+        cls.tmp = os.path.join(cls.home, "tmp"); os.mkdir(cls.tmp, 0o700)
+        env = dict(os.environ, FAKE_ARGV_LOG=cls.argvlog, TMPDIR=cls.tmp)
         open(cls.argvlog, "w").close()
         cls.proc = subprocess.Popen([sys.executable, "-I", BRIDGE, "--state-dir", cls.home, "--cli", FAKE, "run", "--server", cls.url],
                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
@@ -227,8 +282,8 @@ class E2E(unittest.TestCase):
     def test_10_tempdirs_cleaned(self):
         import glob
         # the result is posted before the job dir is removed, so give cleanup a moment
-        for _ in range(30):
-            left = glob.glob(os.path.join(tempfile.gettempdir(), "muse-job-*"))
+        for _ in range(100):
+            left = glob.glob(os.path.join(self.tmp, "muse-job-*"))
             if not left: break
             time.sleep(0.1)
         self.assertEqual(left, [])

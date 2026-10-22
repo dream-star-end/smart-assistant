@@ -38,8 +38,11 @@ export const ACK_TIMEOUT_MS = 20_000
 export const MAX_DISPATCH_ATTEMPTS = 3
 export const HEARTBEAT_LOST_MS = 60_000
 export const BRIDGE_ONLINE_MS = 60_000
+/** Defaults for the personal edition (one bridge slot); commercial overrides them through config. */
 export const QUEUE_MAX = 3
 export const QUEUE_WAIT_MS = 240_000
+/** Hard ceiling for OC_MUSE_CONCURRENCY; the bridge clamps to its own --max-concurrency too. */
+export const MAX_CONCURRENCY = 32
 /** Finished jobs (and their files) stay fetchable this long. */
 export const DONE_RETAIN_MS = 60 * 60_000
 
@@ -220,11 +223,16 @@ export function normalizeBridgeFailure(body: Record<string, unknown>): {
   return { code, message, retryable: body.retryable === true, upstreamCode: upstream }
 }
 
-/** Parse comma-separated decimal uids; uid 4 is never enabled (task rule). */
+/** Who may submit jobs: a set of uids, or every signed-in account (commercial, OCV5-574). */
+export type MuseAllowlist = ReadonlySet<string> | 'all'
+
+/** Parse comma-separated decimal uids; uid 4 is never enabled in a list (selfhost task rule).
+ * The single token `all` opens Muse to every account. */
 export function parseAllowedUids(
   raw: readonly string[] | undefined,
   warn: (msg: string, meta: Record<string, unknown>) => void = () => {},
-): ReadonlySet<string> {
+): MuseAllowlist {
+  if (raw?.length === 1 && raw[0] === 'all') return 'all'
   const out = new Set<string>()
   for (const uid of raw ?? ['3']) {
     if (uid === '4') {

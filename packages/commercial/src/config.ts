@@ -692,7 +692,8 @@ export const commercialConfigSchema = z
       .enum(["0", "1"])
       .optional()
       .transform((value) => value === "1"),
-    /** Decimal uids allowed to use oc-muse. Unset → "3"; empty → nobody. uid 4 is always ignored. */
+    /** Decimal uids allowed to use oc-muse. Unset → "3"; empty → nobody. uid 4 is always ignored in a
+     * list. The single token `all` opens Muse to every account (commercial, OCV5-574). */
     OC_MUSE_ALLOWED_UIDS: z
       .string()
       .max(8192)
@@ -708,8 +709,11 @@ export const commercialConfigSchema = z
             ),
       )
       .refine(
-        (values) => values === undefined || values.every((value) => /^\d+$/.test(value)),
-        "user ids must be decimal",
+        (values) =>
+          values === undefined ||
+          (values.length === 1 && values[0] === "all") ||
+          values.every((value) => /^\d+$/.test(value)),
+        "user ids must be decimal, or the single token all",
       ),
     /** Muse result staging; default /var/lib/openclaude-v5-selfhost/muse-media. */
     OC_MUSE_STATE_ROOT: absolutePath("OC_MUSE_STATE_ROOT"),
@@ -717,6 +721,26 @@ export const commercialConfigSchema = z
     OC_MUSE_IMAGE_PER_DAY: positiveInt(100_000),
     OC_MUSE_VIDEO_PER_HOUR: positiveInt(10_000),
     OC_MUSE_VIDEO_PER_DAY: positiveInt(100_000),
+    /** OCV5-574 commercial Muse. All optional; unset keeps the personal edition's single-slot hub. */
+    /** Jobs running at once across the site (bridge slots). Unset → 1. */
+    OC_MUSE_CONCURRENCY: positiveInt(32),
+    /** Jobs waiting across the site. Unset → 3. */
+    OC_MUSE_QUEUE_MAX: positiveInt(1_000),
+    /** Longest wait in the queue, per kind. Unset → 240 s. */
+    OC_MUSE_QUEUE_WAIT_IMAGE_SEC: positiveInt(3_600),
+    OC_MUSE_QUEUE_WAIT_VIDEO_SEC: positiveInt(3_600),
+    /** Per account: queued + running jobs, and running jobs. Unset → no per-account cap. */
+    OC_MUSE_USER_INFLIGHT_MAX: positiveInt(100),
+    OC_MUSE_USER_RUNNING_MAX: positiveInt(32),
+    /** Whole-site jobs per day, per kind. Unset → no site cap. */
+    OC_MUSE_GLOBAL_IMAGE_PER_DAY: positiveInt(10_000_000),
+    OC_MUSE_GLOBAL_VIDEO_PER_DAY: positiveInt(10_000_000),
+    /** Credits (the 积分 shown in the UI = cost_credits) per successful job. Unset → not billed. */
+    OC_MUSE_PRICE_IMAGE_CREDITS: positiveInt(1_000_000),
+    OC_MUSE_PRICE_VIDEO_CREDITS: positiveInt(1_000_000),
+    /** Open rows another master process left behind are closed only once this old (A/B slots share
+     * the database). Unset → closed at start (one master, the personal edition). */
+    OC_MUSE_ORPHAN_GRACE_SEC: positiveInt(86_400),
     /**
      * Optional direct HTTPS port for the Muse bridge (muse/publicListener.ts): serves only
      * /api/muse-bridge/* with the cert/key below, bypassing the Cloudflare tunnel. Unset = off.

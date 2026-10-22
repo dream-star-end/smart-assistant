@@ -9,6 +9,7 @@ class State:
         self.cancel = set(); self.session = None; self.hellos = 0; self.gone = set(); self.auth_fails = 0
         self.ack_gone = set(); self.ack_flaky = {}; self.hb_delay = {}; self.acked = set()
         self.limits = {"chunk_bytes": 4 * 1024 * 1024}
+        self.max_concurrency = None; self.session_unknown = False; self.poll_errors = 0; self.polls = 0
         self.done = threading.Condition()
 S = State()
 class H(BaseHTTPRequestHandler):
@@ -33,10 +34,18 @@ class H(BaseHTTPRequestHandler):
         data = self.body(); path = self.path
         if path == P + "/hello":
             S.hellos += 1; S.session = uuid.uuid4().hex; S.last_hello = json.loads(data)
-            return self.send(200, {"session_id": S.session, "poll_hold_sec": 2, "heartbeat_sec": 5, "limits": S.limits})
+            hello = {"session_id": S.session, "poll_hold_sec": 2, "heartbeat_sec": 5, "limits": S.limits}
+            if S.max_concurrency is not None: hello["max_concurrency"] = S.max_concurrency
+            return self.send(200, hello)
         if self.headers.get("X-Muse-Bridge-Session") != S.session:
             return self.send(409, {"error": {"code": "SUPERSEDED", "message": "a newer bridge session took over"}})
         if path == P + "/poll":
+            S.polls += 1
+            if S.session_unknown:
+                S.session_unknown = False
+                return self.send(400, {"error": {"code": "SESSION_UNKNOWN", "message": "unknown session; send hello again"}})
+            if S.poll_errors > 0:
+                S.poll_errors -= 1; return self.send(502, {"error": "bad gateway"})
             try: job = S.jobs.get(timeout=2)
             except queue.Empty: return self.send(204)
             return self.send(200, {"job": job})

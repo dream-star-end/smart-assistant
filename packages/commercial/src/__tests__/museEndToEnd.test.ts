@@ -52,14 +52,28 @@ function memStore(): MuseStore {
     async countRecent() {
       return { hour: 0, day: 0 }
     },
+    async countSiteToday() {
+      return 0
+    },
     async failOrphans() {
       return 0
     },
     async findJob(userId, id) {
       const r = rows.get(id)
       return r && r.userId === userId
-        ? { id, kind: r.kind, status: r.status as 'failed', errorCode: r.error }
+        ? {
+            id,
+            kind: r.kind,
+            status: r.status as 'failed',
+            errorCode: r.error,
+            files: null,
+            snapshotId: null,
+            debitedCredits: null,
+          }
         : null
+    },
+    async openCredits() {
+      return 0n
     },
     async findCredential(sha) {
       return sha.toString('hex') === cred ? { id: '1' } : null
@@ -236,5 +250,173 @@ describe('muse end to end (bridge.py + master + oc-muse)', { timeout: 240_000 },
     })
     assert.equal(res.status, 403)
     assert.equal((await res.json()).error.code, 'MUSE_NOT_ENABLED')
+  })
+})
+
+// OCV5-574 commercial shape: two bridge slots, a queue, credits per successful job.
+describe('muse end to end, commercial (2 slots, queue, credits)', { timeout: 240_000 }, () => {
+  let work: string
+  let server: Server
+  let hub: MuseBridgeHub
+  let bridge: ChildProcess
+  let base: string
+  const charged: string[] = []
+  let running = 0
+  let peak = 0
+  let settleDelayMs = 0
+
+  before(async () => {
+    work = mkdtempSync(join(tmpdir(), 'muse-e2e-c-'))
+    const store = memStore()
+    const markRunning = store.markRunning.bind(store)
+    const finishJob = store.finishJob.bind(store)
+    store.markRunning = async (id, cred) => {
+      running += 1
+      peak = Math.max(peak, running)
+      return markRunning(id, cred)
+    }
+    store.finishJob = async (id, fin) => {
+      running = Math.max(0, running - 1)
+      return finishJob(id, fin)
+    }
+    hub = new MuseBridgeHub({
+      store,
+      stateRoot: join(work, 'state'),
+      allowedUids: 'all',
+      rate: { imagePerHour: 900, imagePerDay: 6000, videoPerHour: 300, videoPerDay: 1200 },
+      cliTimeoutSec: { image: 60, video: 60 },
+      concurrency: 2,
+      queueMax: 10,
+      billing: {
+        price: (kind) => (kind === 'video' ? 50n : 10n),
+        ensureBalance: async () => {},
+        outcome: async () => ({ charged: false, debitedCredits: null }),
+        settle: async (input) => {
+          if (settleDelayMs > 0) await new Promise((r) => setTimeout(r, settleDelayMs))
+          charged.push(input.jobId)
+          running = Math.max(0, running - 1)
+          return { ledgerId: 1n, debitedCredits: input.price, clamped: false }
+        },
+      },
+    })
+    await hub.start()
+    const bridgeHttp = makeMuseBridgeHttpHandler({ hub, store, pollHoldMs: 2000 })
+    const internal = makeMuseInternalHandler({ identityRepo, hub })
+    server = createServer((req, res) => {
+      const path = (req.url ?? '').split('?')[0]!
+      if (path.startsWith('/api/muse-bridge/'))
+        return void bridgeHttp(req, res, { clientIp: '127.0.0.1' })
+      if (path.startsWith(MUSE_INTERNAL_PREFIX))
+        return void internal(req, res, { hostUuid: HOST, boundIp: '10.0.0.42' })
+      res.statusCode = 404
+      res.end()
+    })
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+    base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+    const bridgeHome = join(work, 'bridge')
+    await run('mkdir', ['-p', '-m', '700', bridgeHome], process.env)
+    writeFileSync(join(bridgeHome, 'token'), BRIDGE_TOKEN, { mode: 0o600 })
+    bridge = spawn(
+      'python3',
+      [
+        '-I',
+        BRIDGE,
+        '--state-dir',
+        bridgeHome,
+        '--cli',
+        FAKE_CLI,
+        'run',
+        '--server',
+        base,
+        '--max-concurrency',
+        '4',
+      ],
+      {
+        stdio: ['ignore', 'ignore', 'ignore'],
+        env: { ...process.env, FAKE_ARGV_LOG: join(work, 'argv.log') },
+      },
+    )
+    for (let i = 0; i < 100 && !hub.bridgeOnline(); i++)
+      await new Promise((r) => setTimeout(r, 100))
+    assert.ok(hub.bridgeOnline(), 'bridge did not connect')
+  })
+
+  after(async () => {
+    bridge?.kill('SIGTERM')
+    await hub?.stop()
+    server?.closeAllConnections()
+    await new Promise((r) => server?.close(r))
+    rmSync(work, { recursive: true, force: true })
+  })
+
+  it('three slow jobs: two run at once, the third queues, every success is charged once', async () => {
+    const env = {
+      PATH: process.env.PATH,
+      HOME: work,
+      OPENCLAUDE_V3_MASTER_BASE_URL: base,
+      OPENCLAUDE_V3_CONTAINER_TOKEN: `oc-v3.42.${SECRET}`,
+      OC_MUSE_OUT_DIR: join(work, 'generated'),
+    }
+    const started = Date.now()
+    const results = await Promise.all(
+      ['slow one', 'slow two', 'slow three'].map((p) =>
+        run('python3', ['-I', OC_MUSE, 'image', p], env),
+      ),
+    )
+    for (const r of results) {
+      assert.equal(r.code, 0, r.stderr)
+      assert.match(r.stderr, /# charged: 10 credits/)
+    }
+    assert.ok(
+      results.some((r) => /# Muse queue: position 1 of 1/.test(r.stderr)),
+      'the third job reports its place',
+    )
+    assert.equal(peak, 2, 'the master offers 2 slots; the bridge allows 4')
+    assert.equal(charged.length, 3)
+    assert.equal(new Set(charged).size, 3)
+    // 6 s fake generations: 2 slots finish three in about 12 s, one slot would need 18 s.
+    assert.ok(Date.now() - started < 17_000, `took ${Date.now() - started} ms`)
+  })
+
+  it('a timeout while the result is being charged waits for it instead of abandoning a charged job', async () => {
+    settleDelayMs = 6_000
+    try {
+      const before = charged.length
+      const r = await run('python3', ['-I', OC_MUSE, 'image', 'ok', '--timeout', '3'], {
+        PATH: process.env.PATH,
+        HOME: work,
+        OPENCLAUDE_V3_MASTER_BASE_URL: base,
+        OPENCLAUDE_V3_CONTAINER_TOKEN: `oc-v3.42.${SECRET}`,
+        OC_MUSE_OUT_DIR: join(work, 'generated'),
+      })
+      assert.equal(r.code, 0, r.stderr)
+      assert.match(r.stderr, /# charged: 10 credits/)
+      assert.equal(charged.length, before + 1)
+      assert.ok(
+        statSync(r.stdout.trim().split('\n')[0]!).size > 0,
+        'the charged file was downloaded',
+      )
+    } finally {
+      settleDelayMs = 0
+    }
+  })
+
+  it('oc-muse fetch downloads an earlier job again by its id', async () => {
+    const env = {
+      PATH: process.env.PATH,
+      HOME: work,
+      OPENCLAUDE_V3_MASTER_BASE_URL: base,
+      OPENCLAUDE_V3_CONTAINER_TOKEN: `oc-v3.42.${SECRET}`,
+      OC_MUSE_OUT_DIR: join(work, 'refetch'),
+    }
+    const first = await run('python3', ['-I', OC_MUSE, 'image', 'ok', '--json'], env)
+    assert.equal(first.code, 0, first.stderr)
+    const { job_id: jobId } = JSON.parse(first.stdout)
+    const again = await run('python3', ['-I', OC_MUSE, 'fetch', jobId], env)
+    assert.equal(again.code, 0, again.stderr)
+    assert.ok(statSync(again.stdout.trim().split('\n')[0]!).size > 0)
+    const bad = await run('python3', ['-I', OC_MUSE, 'fetch', '../../etc'], env)
+    assert.equal(bad.code, 1)
+    assert.equal(JSON.parse(bad.stderr.trim()).code, 'MUSE_INVALID_INPUT')
   })
 })

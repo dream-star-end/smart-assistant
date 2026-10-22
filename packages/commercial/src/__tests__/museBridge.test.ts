@@ -47,14 +47,28 @@ class MemStore implements MuseStore {
   async countRecent() {
     return this.recent
   }
+  async countSiteToday() {
+    return 0
+  }
   async failOrphans() {
     return 0
   }
   async findJob(userId: string, id: string) {
     const r = this.rows.get(id)
     return r && r.userId === userId
-      ? { id, kind: r.kind, status: r.status as 'queued', errorCode: r.error }
+      ? {
+          id,
+          kind: r.kind,
+          status: r.status as 'queued',
+          errorCode: r.error,
+          files: null,
+          snapshotId: null,
+          debitedCredits: null,
+        }
       : null
+  }
+  async openCredits() {
+    return 0n
   }
   async findCredential(s: Buffer) {
     const id = this.creds.get(s.toString('hex'))
@@ -276,9 +290,9 @@ describe('muse hub', () => {
     assert.equal(v?.status, 'succeeded')
     assert.equal(v?.snapshot_id, 'c51d:981z14')
     assert.match(v!.files![0]!.filename, /^muse-image-[0-9a-f-]{8}-1\.webp$/)
-    const f = hub.fileFor('3', job.id, 0)!
+    const f = (await hub.fileFor('3', job.id, 0))!
     assert.deepEqual(readFileSync(f.path), WEBP)
-    assert.equal(hub.fileFor('765', job.id, 0), null)
+    assert.equal(await hub.fileFor('765', job.id, 0), null)
     assert.equal(await hub.view('765', job.id, 0), null)
 
     const big = await runningJob('image')
@@ -392,7 +406,7 @@ describe('muse hub', () => {
     const v = await hub.view('3', job.id, 0)
     assert.equal(v?.status, 'succeeded')
     assert.equal(v?.files?.[0]?.bytes, PNG.length)
-    assert.deepEqual(readFileSync(hub.fileFor('3', job.id, 0)!.path), PNG)
+    assert.deepEqual(readFileSync((await hub.fileFor('3', job.id, 0))!.path), PNG)
   })
 
   it('view waits for the terminal state and falls back to the audit row', async () => {
