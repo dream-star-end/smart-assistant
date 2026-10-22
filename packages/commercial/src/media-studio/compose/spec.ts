@@ -81,8 +81,10 @@ export interface BuiltCommand {
   /** argv[0] is the binary inside the sandbox image. */
   argv: string[]
   timeoutMs: number
-  /** Runtime per-output byte cap passed to ffmpeg as -fs (Codex plan r1 P1-2); also the disk-space reservation. */
+  /** Total disk reservation for this step: per-file cap × outputs. */
   maxOutputBytes: number
+  /** Per-output byte cap (-fs for streams; bounded by scaling for single images). */
+  perFileCapBytes: number
   /** Files the runner must find in /work/out afterwards (basenames). */
   outputs: string[]
   /** ffprobe writes JSON to stdout instead of a file. */
@@ -127,6 +129,7 @@ export function buildCommand(op: ComposeOp): BuiltCommand {
         ],
         timeoutMs: 30_000,
         maxOutputBytes: 0,
+        perFileCapBytes: 0,
         outputs: [],
         stdoutJson: true,
       }
@@ -146,6 +149,12 @@ export function buildCommand(op: ComposeOp): BuiltCommand {
         argv.push(
           '-map',
           `${i}:v:0`,
+          // PNG (image2) cannot be capped by -fs: bound the pixels instead. 1920x1920 rgb24 is at
+          // most ~11 MB uncompressed, well under OUTPUT_CAP.image (code r1 P1-5).
+          '-vf',
+          'scale=w=1920:h=1920:force_original_aspect_ratio=decrease',
+          '-pix_fmt',
+          'rgb24',
           '-frames:v',
           '1',
           '-fs',
@@ -158,6 +167,7 @@ export function buildCommand(op: ComposeOp): BuiltCommand {
         timeoutMs: 60_000,
         outputs,
         maxOutputBytes: OUTPUT_CAP.image * op.times.length,
+        perFileCapBytes: OUTPUT_CAP.image,
       }
     }
     case 'filmstrip': {
@@ -177,7 +187,10 @@ export function buildCommand(op: ComposeOp): BuiltCommand {
           '-i',
           inPath(op.file),
           '-vf',
-          `fps=${num(count / dur, 4)},scale=-2:${height},tile=${count}x1`,
+          // Each tile ≤ 640x360 → ≤ 24 × 640 × 360 rgb24 ≈ 16.6 MB, under OUTPUT_CAP.image.
+          `fps=${num(count / dur, 4)},scale=w=640:h=${height}:force_original_aspect_ratio=decrease,tile=${count}x1`,
+          '-pix_fmt',
+          'rgb24',
           '-frames:v',
           '1',
           '-fs',
@@ -186,6 +199,7 @@ export function buildCommand(op: ComposeOp): BuiltCommand {
         ],
         timeoutMs: 60_000,
         maxOutputBytes: OUTPUT_CAP.image,
+        perFileCapBytes: OUTPUT_CAP.image,
         outputs: ['filmstrip.png'],
       }
     }
@@ -216,6 +230,7 @@ export function buildCommand(op: ComposeOp): BuiltCommand {
         ],
         timeoutMs: 60_000,
         maxOutputBytes: OUTPUT_CAP.pcm,
+        perFileCapBytes: OUTPUT_CAP.pcm,
         outputs: ['pcm.raw'],
       }
     case 'compose':
@@ -406,7 +421,13 @@ function buildCompose(spec: ComposeSpec): BuiltCommand {
     outPath('final.mp4'),
   )
   // Soft subtitles (burn=false) are delivered as an .srt written by node (ass.ts toSrt), not muxed.
-  return { argv, timeoutMs: 600_000, outputs: ['final.mp4'], maxOutputBytes: OUTPUT_CAP.final }
+  return {
+    argv,
+    timeoutMs: 600_000,
+    outputs: ['final.mp4'],
+    maxOutputBytes: OUTPUT_CAP.final,
+    perFileCapBytes: OUTPUT_CAP.final,
+  }
 }
 
 /** Peaks from 8 kHz s16le mono PCM: max |sample| per bucket, normalised to 0..1. */
