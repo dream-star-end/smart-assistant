@@ -343,9 +343,10 @@ export function LiteratureSetupDialog({
         )}
         {!view && capability?.available && (
           <>
-            <label className="flex flex-col gap-1.5 text-sm font-medium text-fg">
+            <label htmlFor="literature-setup-username" className="flex flex-col gap-1.5 text-sm font-medium text-fg">
               网站账号
               <Input
+                id="literature-setup-username"
                 aria-label="网站账号"
                 autoComplete="off"
                 autoCapitalize="off"
@@ -356,9 +357,10 @@ export function LiteratureSetupDialog({
                 onChange={(e) => setUsername(e.target.value)}
               />
             </label>
-            <label className="flex flex-col gap-1.5 text-sm font-medium text-fg">
+            <label htmlFor="literature-setup-password" className="flex flex-col gap-1.5 text-sm font-medium text-fg">
               网站密码
               <Input
+                id="literature-setup-password"
                 aria-label="网站密码"
                 type="password"
                 autoComplete="off"
@@ -394,9 +396,10 @@ export function LiteratureSetupDialog({
                 className="h-20 w-[188px] rounded border border-border-control bg-surface object-contain"
               />
             )}
-            <label className="flex flex-col gap-1.5 text-sm font-medium text-fg">
+            <label htmlFor="literature-setup-captcha" className="flex flex-col gap-1.5 text-sm font-medium text-fg">
               验证码
               <Input
+                id="literature-setup-captcha"
                 aria-label="验证码"
                 placeholder="请输入上方验证码"
                 autoComplete="off"

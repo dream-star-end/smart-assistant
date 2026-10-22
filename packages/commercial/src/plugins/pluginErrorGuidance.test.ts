@@ -496,7 +496,7 @@ describe('literature-db codes (OCV5-585)', () => {
   test('every literature code passes through instead of collapsing into CONNECTION_ERROR', () => {
     for (const code of LITERATURE_CODES) {
       assert.equal(isPluginPassthroughErrorCode(code), true, code)
-      const env = connectorRpcErrorEnvelope(code, 'literature-db')
+      const env = connectorRpcErrorEnvelope(code)
       assert.equal(env.code, code)
       assert.notEqual(env.message, '操作失败', code)
       assert.equal(env.sideEffect, 'none', code)
