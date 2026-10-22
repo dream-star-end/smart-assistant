@@ -207,7 +207,7 @@ export function classifyApprovalCard(opts?: {
   text?: string
   buttons?: Array<string | { index?: number; label?: string }>
 }): {
-  decision: 'allow_this_chat' | 'deny'
+  decision: 'allow_this_chat' | 'skip'
   buttonIndex: number | null
   buttonLabel: string
   targetHost: string | null
@@ -217,7 +217,7 @@ export function classifyApprovalCard(opts?: {
 
 export function inspectAndHandleApprovalCardInPage(page: any): Promise<{
   handled: boolean
-  decision?: 'allow_this_chat' | 'deny'
+  decision?: 'allow_this_chat' | 'skip'
   buttonIndex?: number | null
   buttonLabel?: string
   targetHost?: string | null

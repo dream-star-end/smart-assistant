@@ -721,7 +721,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
               stopGoneSince = now
             }
 
-            // Poll DOM every 1s for approval cards (Scheme A whitelist) and live status/subagents/commands
+            // Poll DOM every 1s for approval cards (auto-allow for this chat) and live status/subagents/commands
             if (now - lastDomPollAt >= 1_000) {
               lastDomPollAt = now
               const approval = await inspectAndHandleApprovalCardInPage(page)

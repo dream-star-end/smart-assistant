@@ -1656,37 +1656,36 @@ export class TurnProgressStreamer {
 }
 
 /**
- * Classifies a ChatGPT Web approval card ([data-codex-approval-surface="true"]) under Scheme A:
- * - Local loopback site preview (127.0.0.1 / localhost / [::1]) -> click "Allow for this chat" / "允许此聊天"
- *   (NEVER "Allow all relevant sites" / "允许所有相关网站").
- * - Everything else (including Auto-review workspace exposure or external domains) -> click "Deny" / "拒绝".
+ * Classifies a ChatGPT Web approval card ([data-codex-approval-surface="true"]):
+ * - All approval cards automatically click "Allow for this chat" / "允许此聊天"
+ *   (NEVER "Allow all relevant sites" / "允许所有相关网站", and never auto-deny).
+ * - Extracts the requested site/host so host.mjs can announce which site was allowed in the thinking panel.
  */
+const NON_HOST_FILE_EXT_RE =
+  /\.(?:html?|m?js|cjs|tsx?|jsx?|py|sh|json|csv|txt|md|png|jpe?g|gif|webp|svg|pdf|zip|tar|gz|css|wasm|yml|yaml|xml|sql|log)$/i
+
 export function classifyApprovalCard({ text = '', buttons = [] } = {}) {
   const raw = String(text ?? '').replace(/\s+/g, ' ').trim()
   const summary = raw.slice(0, 140) || '未知授权卡片'
-  const isBlockedSurface = /auto-review|公开暴露|publicly\s+expos|expose\s+workspace/i.test(raw)
 
   const loopbackMatches = [
     ...raw.matchAll(/(?:https?:\/\/)?((?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?)/gi),
   ].map((m) => m[1])
 
-  const urlHostMatches = [
-    ...raw.matchAll(/https?:\/\/([^/\s:?#)"'`]+)/gi),
-    ...raw.matchAll(/\b((?:[a-z0-9-]+\.)+[a-z]{2,}|(?:\d{1,3}\.){3}\d{1,3})(?::\d{1,5})?\b/gi),
-  ].map((m) => m[1].toLowerCase())
+  const schemeHostMatches = [...raw.matchAll(/https?:\/\/([^/\s:?#)"'`]+)/gi)].map((m) =>
+    m[1].toLowerCase(),
+  )
 
-  const isLoopbackHost = (h) => {
-    const clean = String(h || '')
-      .toLowerCase()
-      .replace(/:\d+$/, '')
-    return clean === '127.0.0.1' || clean === 'localhost' || clean === '[::1]'
-  }
+  const bareHostMatches = [
+    ...raw.matchAll(/\b(((?:[a-z0-9-]+\.)+[a-z]{2,}|(?:\d{1,3}\.){3}\d{1,3})(?::\d{1,5})?)\b/gi),
+  ]
+    .map((m) => m[1].toLowerCase())
+    .filter((candidate) => {
+      if (/:\d{1,5}$/.test(candidate)) return true
+      return !NON_HOST_FILE_EXT_RE.test(candidate)
+    })
 
-  const nonLoopbackHosts = urlHostMatches.filter((h) => !isLoopbackHost(h))
-  const isPreviewContext =
-    /(preview your site|cloud browser to access|使用云浏览器访问|预览您的网站|\bSites\b|访问\s*(?:127\.0\.0\.1|localhost|\[::1\]))/i.test(
-      raw,
-    )
+  const targetHost = loopbackMatches[0] || schemeHostMatches[0] || bareHostMatches[0] || null
 
   const normButtons = Array.isArray(buttons)
     ? buttons.map((b, i) => ({
@@ -1697,58 +1696,52 @@ export function classifyApprovalCard({ text = '', buttons = [] } = {}) {
       }))
     : []
 
-  if (
-    !isBlockedSurface &&
-    isPreviewContext &&
-    loopbackMatches.length > 0 &&
-    nonLoopbackHosts.length === 0
-  ) {
-    const allowChatBtn = normButtons.find(
-      (b) =>
-        /(Allow for this chat|允许此聊天)/i.test(b.label) &&
-        !/(all relevant|所有相关|all sites|所有网站|always|始终)/i.test(b.label),
-    )
-    if (allowChatBtn) {
-      const targetHost = loopbackMatches[0]
-      return {
-        decision: 'allow_this_chat',
-        buttonIndex: allowChatBtn.index,
-        buttonLabel: allowChatBtn.label,
-        targetHost,
-        summary,
-        announcement: `\n[Pro 授权卡片] 检测到本地预览授权请求（${targetHost}），已按白名单自动点击「${allowChatBtn.label}」。\n`,
-      }
-    }
-  }
+  const isForbiddenMultiSiteAllow = (label) =>
+    /(all relevant|所有相关|all sites|所有网站|always|始终)/i.test(label)
+  const isDenyOrCancel = (label) =>
+    /(Deny|Reject|Refuse|Block|Cancel|Dismiss|Close|拒绝|阻止|取消|关闭)/i.test(label)
 
-  const denyBtn =
+  const allowChatBtn =
     normButtons.find(
       (b) =>
-        /^(Deny|Reject|Refuse|Block|Cancel|Dismiss|Close|拒绝|阻止|取消|关闭)$/i.test(b.label) &&
-        !/(Allow|允许)/i.test(b.label),
+        /(Allow for this chat|允许此聊天|Allow once|仅允许本次)/i.test(b.label) &&
+        !isForbiddenMultiSiteAllow(b.label) &&
+        !isDenyOrCancel(b.label),
     ) ||
     normButtons.find(
       (b) =>
-        /(Deny|Reject|Refuse|Block|Cancel|Dismiss|拒绝|阻止|取消)/i.test(b.label) &&
-        !/(Allow|允许)/i.test(b.label),
+        /(Allow|允许|Approve|批准)/i.test(b.label) &&
+        !isForbiddenMultiSiteAllow(b.label) &&
+        !isDenyOrCancel(b.label),
     ) ||
     null
 
-  const label = denyBtn ? denyBtn.label : '拒绝'
+  if (allowChatBtn) {
+    const siteLabel = targetHost || summary
+    return {
+      decision: 'allow_this_chat',
+      buttonIndex: allowChatBtn.index,
+      buttonLabel: allowChatBtn.label,
+      targetHost,
+      summary,
+      announcement: `\n[Pro 授权卡片] 检测到授权请求（站点：${siteLabel}），已自动点击「${allowChatBtn.label}」。\n`,
+    }
+  }
+
   return {
-    decision: 'deny',
-    buttonIndex: denyBtn ? denyBtn.index : null,
-    buttonLabel: label,
-    targetHost: nonLoopbackHosts[0] || loopbackMatches[0] || null,
+    decision: 'skip',
+    buttonIndex: null,
+    buttonLabel: '',
+    targetHost,
     summary,
-    announcement: `\n[Pro 授权卡片] 检测到非白名单授权卡片（${summary}），已按策略自动点击「${label}」。\n`,
+    announcement: '',
   }
 }
 
 /**
  * Detects any visible [data-codex-approval-surface="true"] card in the page DOM,
- * applies Scheme A (whitelist local preview -> Allow for this chat; everything else -> Deny),
- * and returns the action taken so host.mjs can broadcast it to the thinking panel.
+ * clicks "Allow for this chat" / "允许此聊天" (never "Allow all relevant sites" and never "Deny"),
+ * and returns the action taken so host.mjs can broadcast the allowed site to the thinking panel.
  */
 export async function inspectAndHandleApprovalCardInPage(page) {
   if (!page || typeof page.evaluate !== 'function') return { handled: false }
@@ -1757,6 +1750,8 @@ export async function inspectAndHandleApprovalCardInPage(page) {
       if (typeof document === 'undefined') return null
       const surface = document.querySelector('[data-codex-approval-surface="true"]')
       if (!surface) return null
+      const lastClickedAt = Number(surface.getAttribute('data-oc-approval-clicked') || 0)
+      if (lastClickedAt > 0 && Date.now() - lastClickedAt < 3_000) return null
       const text = (surface.innerText || surface.textContent || '').replace(/\s+/g, ' ').trim()
       const btnEls = Array.from(surface.querySelectorAll('button'))
       const buttons = btnEls
@@ -1774,22 +1769,25 @@ export async function inspectAndHandleApprovalCardInPage(page) {
 
   if (!card) return { handled: false }
   const classified = classifyApprovalCard(card)
-
-  if (classified.buttonIndex !== null) {
-    await page
-      .evaluate((btnIdx) => {
-        const surface = document.querySelector('[data-codex-approval-surface="true"]')
-        if (!surface) return
-        const btnEls = Array.from(surface.querySelectorAll('button'))
-        const target = btnEls[btnIdx]
-        if (target && typeof target.click === 'function') {
-          target.click()
-        }
-      }, classified.buttonIndex)
-      .catch(() => {})
-  } else if (classified.decision === 'deny' && page.keyboard) {
-    await page.keyboard.press('Escape').catch(() => {})
+  if (classified.decision !== 'allow_this_chat' || classified.buttonIndex === null) {
+    return {
+      handled: false,
+      ...classified,
+    }
   }
+
+  await page
+    .evaluate((btnIdx) => {
+      const surface = document.querySelector('[data-codex-approval-surface="true"]')
+      if (!surface) return
+      const btnEls = Array.from(surface.querySelectorAll('button'))
+      const target = btnEls[btnIdx]
+      if (target && typeof target.click === 'function') {
+        surface.setAttribute('data-oc-approval-clicked', String(Date.now()))
+        target.click()
+      }
+    }, classified.buttonIndex)
+    .catch(() => {})
 
   return {
     handled: true,
