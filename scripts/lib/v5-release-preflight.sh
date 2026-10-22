@@ -151,8 +151,9 @@ rpf_check_proof_db() { # <repo> <gate-db|shared-db> <dsn>
   if [[ -z "$dsn" ]]; then
     rpf_add fail proof-db "no proof database DSN configured"; return 0
   fi
-  # cwd = the repo so `pg` resolves from its node_modules; the probe itself ships with this lib
-  out="$(cd "$repo" && OC_V5_PREFLIGHT_PROOF_DSN="$dsn" timeout 30 node "$RPF_LIB_DIR/proofDbPreflight.mjs" "$mode" 2>&1)" || rc=$?
+  # cwd = the repo so `pg` resolves from its node_modules; the probe itself ships with this lib.
+  # OC_V5_PREFLIGHT_PROOF_PROBE replaces the probe only in tests that have no Postgres.
+  out="$(cd "$repo" && OC_V5_PREFLIGHT_PROOF_DSN="$dsn" timeout 30 node "${OC_V5_PREFLIGHT_PROOF_PROBE:-$RPF_LIB_DIR/proofDbPreflight.mjs}" "$mode" 2>&1)" || rc=$?
   while IFS=$'\t' read -r s detail; do
     case "$s" in
       ok|warn|fail) rpf_add "$s" proof-db "$detail"; any=1 ;;
