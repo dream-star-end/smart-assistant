@@ -1970,6 +1970,7 @@ rl.on('line', (line) => {
     }
 
     const firstFetch = await fetchConversationPayloadInPage(fakePage, null, {
+      // oc-retry: transport the product's own in-page fetch retry option under test, not a test retry
       retries: 2,
       tokenTtlMs: 240_000,
     })
@@ -1979,6 +1980,7 @@ rl.on('line', (line) => {
 
     // Subsequent poll reuses cached token without calling /api/auth/session again
     const secondFetch = await fetchConversationPayloadInPage(fakePage, null, {
+      // oc-retry: transport the product's own in-page fetch retry option under test, not a test retry
       retries: 2,
       tokenTtlMs: 240_000,
     })

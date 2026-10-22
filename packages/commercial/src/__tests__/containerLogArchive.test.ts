@@ -286,6 +286,7 @@ describe('container log archive', () => {
       },
       'channelMigration/cutover.ts': { count: 1, why: 'migration cutover, keeps volumes' },
       'plugins/biliAccount.ts': { count: 4, why: 'plugin browser sandbox, not a turn runtime' },
+      'plugins/douyin.ts': { count: 4, why: 'plugin browser sandbox, not a turn runtime' },
       'plugins/knowledgePlanet.ts': { count: 4, why: 'plugin browser sandbox, not a turn runtime' },
       'plugins/weibo.ts': { count: 4, why: 'plugin browser sandbox, not a turn runtime' },
       'plugins/zhihu.ts': { count: 4, why: 'plugin browser sandbox, not a turn runtime' },
