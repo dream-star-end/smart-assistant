@@ -62,18 +62,19 @@ const SCRIPT_RUN = new RegExp(
   `${PREFIX}(?:npx(?:\\s+--no-install)?\\s+tsx|tsx|node|bash)\\s+((?:packages\\/[\\w.-]+\\/)?scripts\\/[\\w./-]+)`, "g");
 const NPM_RUN = new RegExp(`${PREFIX}npm run (\\S+)((?:\\s+--workspace\\s+\\S+)?)`, "g");
 
-/** Drop heredoc bodies (the opening line stays): what a heredoc feeds is data, not a command. */
+/** Drop heredoc bodies (the opening line stays): what a heredoc feeds is data, not a command. Every
+ * heredoc a line opens is queued; their bodies follow in order (Codex fresh r3: `cat <<A <<B`). */
 function dropHeredocBodies(lines: string[]): string[] {
   const out: string[] = [];
-  let heredoc: { tag: string; dash: boolean } | null = null;
+  const pending: { tag: string; dash: boolean }[] = [];
+  const op = /(?<!<)<<(?!<)(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([^\s;&|<>()'"]+))/g;
   for (const raw of lines) {
-    if (heredoc) {
-      if ((heredoc.dash ? raw.replace(/^\t+/, "") : raw) === heredoc.tag) heredoc = null;
+    if (pending.length > 0) {
+      if ((pending[0]!.dash ? raw.replace(/^\t+/, "") : raw) === pending[0]!.tag) pending.shift();
       continue;
     }
     // any bash word is a delimiter (END-OF-TEXT, 42, 'a b'); `<<<` is a here-string, not a heredoc
-    const doc = /(?<!<)<<(?!<)(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([^\s;&|<>()'"]+))/.exec(raw);
-    if (doc) heredoc = { tag: (doc[2] ?? doc[3] ?? doc[4])!, dash: doc[1] === "-" };
+    for (const m of raw.matchAll(op)) pending.push({ tag: (m[2] ?? m[3] ?? m[4])!, dash: m[1] === "-" });
     out.push(raw);
   }
   return out;
@@ -228,8 +229,13 @@ export function deployRuns(deployScript: string, gate: Gate): boolean {
   const v = word(d.variable);
   const runs = new RegExp(`(?:^|[;&|(]|\\$\\()\\s*"?\\$(?:\\{${v}\\}|${v})"?(?:\\s|\\)|$)`);
   if (!body.some((line) => runs.test(line))) return false;
-  const assign = new RegExp(`^${v}="\\$SCRIPT_DIR/${gate.script.replace(/^scripts\//, "").replace(/[.]/g, "\\.")}"\\s*$`, "m");
-  return assign.test(deployScript);
+  // every assignment of the variable (heredoc bodies and comments excluded) must be the script path,
+  // so a decoy in a heredoc or a later reassignment fails (Codex fresh r3)
+  const want = `${v}="$SCRIPT_DIR/${gate.script.replace(/^scripts\//, "")}"`;
+  const assigns = dropHeredocBodies(deployScript.split("\n"))
+    .map((line) => line.replace(/(^|\s)#.*$/, "$1").trim())
+    .filter((line) => new RegExp(`(?:^|[;&|(]\\s*|\\b(?:export|local|declare|readonly)\\s+)${v}=`).test(line));
+  return assigns.length > 0 && assigns.every((line) => line === want);
 }
 
 export function check(input: {

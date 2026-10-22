@@ -100,6 +100,8 @@ test("red: a quote or heredoc spanning lines that only prints the gate does not 
     "run: |\n          cat <<'END-OF-TEXT'\n          node scripts/check-v5-callback-payload-hash.mjs\n          END-OF-TEXT",
     "run: |\n          cat <<42\n          node scripts/check-v5-callback-payload-hash.mjs\n          42",
     "run: |\n          cat <<\"two words\"\n          node scripts/check-v5-callback-payload-hash.mjs\n          two words",
+    // Codex fresh r3: two heredocs on one line, the gate in the second body
+    "run: |\n          cat <<'A' <<'B'\n          A\n          node scripts/check-v5-callback-payload-hash.mjs\n          B",
   ]) {
     const input = real();
     input.workflows[wf] = input.workflows[wf]!.replace(step, fake);
@@ -181,6 +183,10 @@ test("red: the deploy-stage trailer gate is no longer really called (Codex final
     ["call only echoed", (d) => inCmdDeploy(d, (b) => b.replace('assert_fix_trailers "$sha"', 'echo assert_fix_trailers "$sha"'))],
     ["function no longer runs the gate", (d) => d.replace(/"\$FIX_TRAILER_GATE" --repo/, "true --repo")],
     ["variable points elsewhere", (d) => d.replace(/^FIX_TRAILER_GATE=.*$/m, 'FIX_TRAILER_GATE="$SCRIPT_DIR/other.sh"')],
+    // Codex fresh r3: a decoy assignment in a heredoc, and a later reassignment
+    ["real assignment replaced, decoy in a heredoc", (d) => d.replace(/^FIX_TRAILER_GATE=.*$/m,
+      "FIX_TRAILER_GATE=/bin/true\n: <<'DOC'\nFIX_TRAILER_GATE=\"$SCRIPT_DIR/check-v5-fix-trailers.sh\"\nDOC")],
+    ["reassigned later", (d) => d.replace(/^FIX_TRAILER_GATE=.*$/m, (m) => `${m}\nFIX_TRAILER_GATE=/bin/true`)],
     // Codex final r2: a single-quoted $( … ) is a literal, not a run
     ["runner single-quoted", (d) => d.replace(/out="\$\("\$FIX_TRAILER_GATE" (.*?)\)"/, "out='$(\"$FIX_TRAILER_GATE\" $1)'")],
     ["runner only named in a double-quoted message", (d) => d.replace(/out="\$\("\$FIX_TRAILER_GATE" (.*?)\)"/, 'out="later; $FIX_TRAILER_GATE $1"')],
