@@ -52,6 +52,7 @@ import {
   type TurnUpstreamHeaders,
   _buildAnthropicCustomHeadersEnv,
   _ccbUpstreamIsEgress,
+  _withTraceIdHeader,
   _buildUpdateEnvStdinLine,
   renewTurnHeaderBundle,
   resolveTurnRuntime,
@@ -851,6 +852,14 @@ export class SubprocessRunner extends EventEmitter {
       }
       // OCV5-570: only a CCB whose upstream is egress gets the turn's internal trace header.
       this.spawnedUpstreamIsEgress = _ccbUpstreamIsEgress(spawnOpts.env as NodeJS.ProcessEnv)
+      // official-cc has no stdin env update, so its trace header goes in at spawn.
+      const officialSpawnTrace = harness === 'official-cc' && !this.opts.boxResidentCc && this.pendingOfficialSpawnEnv
+        ? this.egressTraceId()
+        : undefined
+      if (officialSpawnTrace !== undefined) {
+        const env = spawnOpts.env as Record<string, string>
+        env.ANTHROPIC_CUSTOM_HEADERS = _withTraceIdHeader(env.ANTHROPIC_CUSTOM_HEADERS ?? '', officialSpawnTrace)
+      }
       const backend: TerminalBackend = createBackend(this.opts.config.terminal)
       timing.once('spawn_requested')
       proc = ccbSpawnForTests ? ccbSpawnForTests(spawnOpts) : backend.spawn(spawnOpts)
@@ -885,6 +894,7 @@ export class SubprocessRunner extends EventEmitter {
     if (resolveCcbHarness(this.opts.harness) === 'official-cc' && this.pendingOfficialSpawnEnv) {
       this.spawnedOfficialHeaderFingerprint = officialCcProxySpawnFingerprint(
         this.pendingOfficialSpawnEnv,
+        this.opts.traceId,
       )
     }
     // Emit BEFORE any stdout listener is attached, so subscribers (e.g. session
@@ -1258,7 +1268,7 @@ export class SubprocessRunner extends EventEmitter {
         turnKey,
         executionDescriptorEnv: this.currentExecutionDescriptorEnv,
       })
-      const fingerprint = officialCcProxySpawnFingerprint(spawnEnv)
+      const fingerprint = officialCcProxySpawnFingerprint(spawnEnv, this.opts.traceId)
       if (this.proc && this.spawnedOfficialHeaderFingerprint !== fingerprint) {
         await this.shutdown()
       }
