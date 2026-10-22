@@ -101,6 +101,34 @@ rpf_reset; rpf_check_proof_db "$ROOT" shared-db "postgres://u:p@10.9.9.9/x_test"
 expect "proof-db red: non-loopback DSN refused before connecting" proof-db fail "not loopback"
 out="$(rpf_report 2>&1)"; [[ "$out" != *"u:p@"* ]] && ok "proof-db report never echoes the DSN" || bad "DSN echoed"
 
+rpf_reset; rpf_check_proof_db "$W" gate-db "postgres://u:p@127.0.0.1/x_test"
+expect "proof-db warn: tree without pg yet (npm ci after L0 stays supported)" proof-db warn "pg not installed"
+
+# ── errexit: the deploy script runs under set -Eeuo pipefail ──────────
+# Healthy and failing paths of every check must return to the caller (the result is the verdict,
+# never an abort). Codex r1 P1: a no-match grep in the healthy workspace path aborted the train.
+CLASSIFY="$(sed -n '/^classify_pending_migration_file() {/,/^}/p' "$MASTER")"
+strict() { # <label> <snippet>
+  local out
+  out="$(bash -Eeuo pipefail -c "source '$LIB'; source '$ROOT/scripts/lib/v5-selfhost-workspace-links.sh'
+    source '$ROOT/scripts/lib/v5-migration-ddl.sh'; $CLASSIFY
+    rpf_reset; $2; rpf_report >/dev/null || true; echo REACHED" 2>&1)"
+  if [[ "$out" == *REACHED* ]]; then ok "set -Eeuo pipefail survives: $1"; else bad "set -Eeuo pipefail aborted: $1 :: $(tail -n 2 <<<"$out")"; fi
+}
+strict "source-pin green" "rpf_check_source_pin '$R' '$C2'"
+strict "source-pin red" "rpf_check_source_pin '$R' '$C1'"
+strict "workspace-links green (no ✗ lines)" "rpf_check_workspace_links '$W' 0"
+W2="$T/ws2"; cp -a "$W" "$W2"; rm "$W2/node_modules/@openclaude/kernel"
+strict "workspace-links missing (strict)" "rpf_check_workspace_links '$W2' 0"
+strict "workspace-links missing (repairable)" "rpf_check_workspace_links '$W2' 1"
+strict "migrations no change" "rpf_check_migrations '$M' '$LIVE' '$LIVE'"
+strict "migrations listed" "rpf_check_migrations '$M' '$LIVE' '$LISTED'"
+strict "migrations breaking" "OC_V5_ALLOW_BREAKING_MIGRATION=0 rpf_check_migrations '$M' '$LIVE' '$BREAKING'"
+strict "disk green" "rpf_check_disk 1 '$T/ref' '$T'"
+strict "disk red" "rpf_check_disk $((1 << 50)) '' '$T'"
+strict "proof-db without pg" "rpf_check_proof_db '$W' gate-db 'postgres://u:p@127.0.0.1/x_test'"
+strict "proof-db non-loopback" "rpf_check_proof_db '$ROOT' shared-db 'postgres://u:p@10.9.9.9/x_test'"
+
 # ── report / summary ──────────────────────────────────────────────────
 rpf_reset; rpf_add ok a x; rpf_add warn b y
 rpf_report >/dev/null && ok "report rc 0 with ok+warn" || bad "report rc with ok+warn"

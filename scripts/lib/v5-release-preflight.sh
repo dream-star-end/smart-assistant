@@ -18,6 +18,8 @@
 # probe never prints it.
 #
 # Usage (sourced): rpf_reset; rpf_check_* ...; rpf_report  → rc 1 when any check failed.
+# Callers run under set -Eeuo pipefail: every pipeline here that may legitimately find nothing
+# ends in `|| true`, so a healthy result never aborts the caller.
 # Each result is one line: "  ✓|⚠|✗ preflight <check>: <detail>".
 
 # shellcheck disable=SC2034  # read by callers (assert_master_releases_disk, selfhost_release_preflight)
@@ -86,11 +88,11 @@ rpf_check_workspace_links() { # <repo> <repairable 0|1>
   fi
   out="$(DRY=1 ws_links_ensure "$repo" 2>&1)" || rc=$?
   planned="$(grep -c '\[dry-run\] ln -s' <<<"$out" || true)"
-  bad="$(grep '✗' <<<"$out" | sed 's/^ *✗ *//' | head -3 | paste -sd ';' -)"
+  bad="$(grep '✗' <<<"$out" | sed 's/^ *✗ *//' | head -3 | paste -sd ';' - || true)"
   if [[ "$rc" != 0 || -n "$bad" ]]; then
     rpf_add fail workspace-links "${bad:-ws_links_ensure rc=$rc}"
   elif [[ "$planned" != 0 && "$repairable" != 1 ]]; then
-    rpf_add fail workspace-links "$planned workspace link(s) missing: $(grep -o 'node_modules/[^ ]*' <<<"$out" | head -3 | paste -sd ' ' -)"
+    rpf_add fail workspace-links "$planned workspace link(s) missing: $(grep -o 'node_modules/[^ ]*' <<<"$out" | head -3 | paste -sd ' ' - || true)"
   elif [[ "$planned" != 0 ]]; then
     rpf_add warn workspace-links "$planned missing link(s) will be created by ensure_node_modules"
   else
@@ -128,7 +130,7 @@ rpf_check_migrations() { # <repo> <from-sha|""> <target-sha>
     n=$((n + 1))
     if git -C "$repo" cat-file -e "$to:$f" 2>/dev/null; then
       mkdir -p "$tmp/$(dirname "$f")"
-      git -C "$repo" show "$to:$f" >"$tmp/$f"
+      git -C "$repo" show "$to:$f" >"$tmp/$f" || true
     fi
     # the gate's die/mlog, captured: a refusal becomes one reason instead of an exit
     out="$( (die() { printf '%s\n' "$*"; exit 1; }; mlog() { :; }
@@ -149,6 +151,12 @@ rpf_check_proof_db() { # <repo> <gate-db|shared-db> <dsn>
   if [[ -z "$dsn" ]]; then
     rpf_add fail proof-db "no proof database DSN configured"; return 0
   fi
+  # A tree without node_modules is a supported path (the caller installs dependencies after L0);
+  # the proof server is then probed by the gates themselves, not refused here.
+  if ! (cd "$repo" && node -e 'require.resolve("pg")') >/dev/null 2>&1; then
+    rpf_add warn proof-db "pg not installed in $repo yet (dependencies are installed after L0); proof server not probed"
+    return 0
+  fi
   # cwd = the repo so `pg` resolves from its node_modules; the probe itself ships with this lib
   out="$(cd "$repo" && OC_V5_PREFLIGHT_PROOF_DSN="$dsn" timeout 30 node "$RPF_LIB_DIR/proofDbPreflight.mjs" "$mode" 2>&1)" || rc=$?
   while IFS=$'\t' read -r s detail; do
@@ -168,7 +176,7 @@ rpf_check_disk() { # <min-free-kb> <inode-reference-dir|""> <path>...
   local min_kb="$1" ref="$2" p seen=" " dev avail_kb free_i need_i=0 ref_i
   shift 2
   if [[ -n "$ref" && -d "$ref" ]]; then
-    ref_i="$(du --inodes -sx -- "$ref" 2>/dev/null | awk '{print $1}')"
+    ref_i="$(du --inodes -sx -- "$ref" 2>/dev/null | awk '{print $1}' || true)"
     [[ "$ref_i" =~ ^[0-9]+$ ]] && need_i=$((ref_i * RPF_INODE_FACTOR))
   fi
   for p in "$@"; do
@@ -176,8 +184,8 @@ rpf_check_disk() { # <min-free-kb> <inode-reference-dir|""> <path>...
     dev="$(stat -c %d -- "$p" 2>/dev/null)" || { rpf_add fail disk "cannot stat $p"; continue; }
     [[ "$seen" == *" $dev "* ]] && continue
     seen+="$dev "
-    avail_kb="$(df -Pk -- "$p" | awk 'NR==2 {print $4}')"
-    free_i="$(df -Pi -- "$p" | awk 'NR==2 {print $4}')"
+    avail_kb="$(df -Pk -- "$p" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+    free_i="$(df -Pi -- "$p" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
     if [[ ! "$avail_kb" =~ ^[0-9]+$ ]]; then
       rpf_add fail disk "cannot read free space of $p"; continue
     fi
