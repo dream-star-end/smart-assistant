@@ -1882,6 +1882,12 @@ export function App() {
     onOpenManage: demo ? undefined : () => openManage(DEFAULT_MANAGE_TAB),
     onOpenMarketplace: demo ? undefined : () => openMarketplace("browse"),
     onOpenTutorial: demo ? undefined : () => openTutorial(),
+    onOpenBlog: demo
+      ? undefined
+      : () => {
+          openTutorial();
+          setTutorialTab("blog");
+        },
     onOpenMediaTasks:
       demo || mediaTasksAvailable === false ? undefined : () => setMediaTasksOpen(true),
     onOpenChatGptProxy: !demo && chatGptProxyEnabled ? () => setChatGptProxyOpen(true) : undefined,
@@ -2043,6 +2049,7 @@ export function App() {
           onOpenManage={closeMobileThen(sidebarProps.onOpenManage)}
           onOpenMarketplace={closeMobileThen(sidebarProps.onOpenMarketplace)}
           onOpenTutorial={closeMobileThen(sidebarProps.onOpenTutorial)}
+          onOpenBlog={closeMobileThen(sidebarProps.onOpenBlog)}
           onOpenOrg={closeMobileThen(sidebarProps.onOpenOrg)}
           onOpenPalette={closeMobileThen(sidebarProps.onOpenPalette)}
           onOpenMediaTasks={closeMobileThen(sidebarProps.onOpenMediaTasks)}

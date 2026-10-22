@@ -2338,3 +2338,26 @@ figure.oc-iui, .oc-iui { margin: 12px 0 20px; font-size: 14.5px; line-height: 1.
 .oc-mkt-legend i.is-price { background: var(--iui-c1); }
 .oc-mkt-legend i.is-avg { background: #e0a45e; }
 .oc-mkt-legend i.is-base { background: var(--muted); }
+
+/* ── 经验分享（OCV5-577）：阅读版式与卡片。颜色全部走 token，亮暗自动跟随。 ───────────── */
+.blog-chip { display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600; background: var(--hover); color: var(--muted); white-space: nowrap; }
+.blog-chip-accent { background: var(--accent-soft); color: var(--accent); }
+.blog-chip-ok { background: var(--success-soft); color: var(--success); }
+.blog-chip-warn { background: var(--warning-soft); color: var(--warning); }
+.blog-chip-bad { background: var(--danger-soft); color: var(--danger); }
+.blog-chip-info { background: var(--info-soft); color: var(--info); }
+.blog-cover { position: relative; aspect-ratio: 16 / 9; background: #07111f center / cover no-repeat; display: grid; place-items: center; color: rgba(255, 255, 255, 0.8); overflow: hidden; }
+.blog-cover > .blog-chip { position: absolute; left: 12px; top: 12px; background: rgba(255, 255, 255, 0.9); color: #15151b; }
+.blog-prose .prose { font-size: 16.5px; line-height: 1.8; }
+.blog-prose.blog-prose-compact .prose { font-size: 15px; }
+.blog-prose .prose p { margin: 0 0 16px; }
+.blog-prose .prose h2 { font-size: 21px; margin: 34px 0 10px; }
+.blog-prose .prose pre { background: var(--code); border: 1px solid var(--border); border-radius: 14px; }
+.blog-prose .prose blockquote { margin: 18px 0; padding: 12px 16px; border-left: 3px solid var(--accent); background: var(--accent-soft); border-radius: 0 12px 12px 0; color: var(--fg); font-size: 15px; }
+.blog-figure { margin: 22px 0; display: block; }
+.blog-figure > span, .blog-figure > span > button { display: block; width: 100%; }
+.blog-figure-img { display: block; width: 100%; border-radius: 14px; border: 1px solid var(--border); }
+.blog-figcaption { display: block;  font-size: 12.5px; color: var(--faint); text-align: center; margin-top: 8px; }
+.blog-figure-ph { display: grid; aspect-ratio: 16 / 9; border-radius: 14px; background: var(--skeleton); place-items: center; color: var(--faint); font-size: 13px; }
+.blog-meter { height: 6px; border-radius: 9px; background: var(--hover); overflow: hidden; }
+.blog-meter > i { display: block; height: 100%; border-radius: 9px; }

@@ -12,6 +12,7 @@ import {
   Mail,
   MessageSquare,
   Network,
+  PenLine,
   ScrollText,
   Server,
   Settings,
@@ -105,6 +106,7 @@ export const adminPages: AdminPage[] = [
   { key: "inbox", title: "站内信", group: "用户触达", desc: "发送、历史和触达记录", icon: Mail, Component: lz(() => import("./pages/inbox")) },
   // ── 内容运营 ──
   { key: "marketplace", title: "AI 市场", group: "内容运营", desc: "审核投稿、上架和下架", icon: Store, Component: lz(() => import("./pages/marketplace")) },
+  { key: "blog", title: "经验分享", group: "内容运营", desc: "AI 审核结果复核、发布与下架用户经验文章", icon: PenLine, Component: lz(() => import("./pages/blog")) },
   { key: "tutorials", title: "教程工作室", group: "内容运营", desc: "审核用户教程投稿，并登记外部案例评测 / 改进罗盘", icon: BookOpen, Component: lz(() => import("./pages/tutorials")) },
   // ── 系统配置 ──
   { key: "literature", title: "文献检索", group: "系统配置", desc: "检索服务连接、配额和运行数据", icon: BookOpen, Component: lz(() => import("./pages/literature")) },
