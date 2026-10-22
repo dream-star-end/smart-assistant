@@ -30,6 +30,7 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { provePendingUser } from "./lib/boxPendingUserProof.js";
+import { proveEmptyRecoveryCliResult, proveReadPdfDocument } from "./lib/boxReadPdfProof.js"; // OCV5-571 (file-size ratchet): [ocv5-571-read-pdf-document] PASS — a PDF Read result with its document block runs fresh with the PDF inside its result, never 409 · [ocv5-571-empty-recovery-cli-result] PASS — an empty recovery whose CLI result event repeats the session usage keeps the short budget of three
 import { proveRefusedRecoveryClosed as refusedRecoveryProof } from "./lib/boxRefusedRecoveryProof.js";
 import { misrecordedRun, proveCliRepairedToolInput, proveForeignToolHistory, rereadError } from "./lib/boxCliRepairProof.js";
 import { scaledMs } from "./lib/gateLoadScale.js";
@@ -2377,17 +2378,16 @@ async function proveFinalizedTurnRecovery(api: Api, database: unknown): Promise<
     // INC-20261003-BOX-ANSWERED-EXCHANGE-PROMPT, second half: each automatic 「从断点继续」 failed within a second
     // with the same Box 409 and recorded nothing but Claude Code's own API Error row; the master took every one
     // for a new chance and sent ten in twenty seconds. Such an empty repeat has the short budget of three.
-    const empty = (attempt: number) => finalized(`empty-recovery-${attempt}`, { tools: [], errorCode: "ENGINE_ERROR",
+    const empty = (attempt: number, name = "empty-recovery", payload: unknown = { type: "result", is_error: true, num_turns: 1 }) => finalized(`${name}-${attempt}`, { tools: [], errorCode: "ENGINE_ERROR",
       recoveryAttempt: attempt, outputTokens: 0, text: 'API Error: 409 {"error":{"code":"BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION"}}',
-      runtimeEvents: [{ ordinal: 1, observedAt: 1_783_950_170_100, source: "ccb",
-        payload: { type: "result", is_error: true, num_turns: 1 } }] });
+      runtimeEvents: [{ ordinal: 1, observedAt: 1_783_950_170_100, source: "ccb", payload }] }); // OCV5-571: the CLI result event varies
     // biome-ignore lint/style/useSingleVarDeclarator: moved verbatim from the commercial copy of this file (OCV5-488)
     const retried = await empty(2), stopped = await empty(3);
     if (!isDeepStrictEqual(retried.jobs.map((job) => job.split("#")[1]), ["3"]) || stopped.jobs.length !== 0) {
       fail(`ANSWERED_EMPTY_RECOVERY_BUDGET_${retried.jobs.join(",")}_${stopped.jobs.join(",")}`);
     }
     return ["[ocv5-317-settled-tools-auto-resume] PASS — a model failure after settled tools schedules the automatic checkpoint continuation",
-      "[ocv5-321-leftover-tool-frames] PASS — settled tools whose live frames are still present pair by id and the checkpoint continuation is scheduled"];
+      "[ocv5-321-leftover-tool-frames] PASS — settled tools whose live frames are still present pair by id and the checkpoint continuation is scheduled", await proveEmptyRecoveryCliResult(empty)];
   });
 }
 
@@ -3652,7 +3652,7 @@ async function main(): Promise<void> {
       await proveReplayPendingAfterCut(api, db), await proveRecoveredToolExchange(api, db),
       await proveRejectBlocksNextMessage(api, db), await proveConfigChangedBlocksNextMessage(api, db),
       await proveIdleNoSummary(api, db),
-      await proveAnsweredExchangePrompt(api, db), await proveWaitingHandoffSuperseded(api, db), await proveResumeUnsentParked(api, db),
+      await proveAnsweredExchangePrompt(api, db), await proveReadPdfDocument({ api, db, boxTurn, prechecked, journalRow, must, spoolOf, cliInit, FINAL_ANSWER }), await proveWaitingHandoffSuperseded(api, db), await proveResumeUnsentParked(api, db),
       await proveUnknownNeverClosed(api, db), await proveNativeResumedStop(api, db),
       await proveProcessAbsentReleased(api, db), await proveIdleProofStopsParkedTurn(api, db),
       await proveContainerRebuiltStopsParkedTurn(api, db), ...await proveAnyRefusalStopsParkedTurn(api, db)]),
