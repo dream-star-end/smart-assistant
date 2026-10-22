@@ -200,11 +200,13 @@ function withoutCode(markdown: string): string {
 
 /**
  * 行内代码：长度为 n 的反引号串与下一个长度同为 n 的串配对，中间整段去掉；配不上的串按
- * 普通文字保留。某个长度配对失败，说明它后面再没有同长度的串，所以每种长度最多整段扫一次。
+ * 普通文字保留。某个长度配对失败，说明它后面再没有同长度的串，记下来以后直接跳过，
+ * 所以每种长度最多整段扫一次（Codex R2 P2）。
  */
 function stripInlineCode(text: string): string {
   let out = ''
   let i = 0
+  const unmatched = new Set<number>()
   while (i < text.length) {
     const tick = text.indexOf('`', i)
     if (tick < 0) {
@@ -216,7 +218,7 @@ function stripInlineCode(text: string): string {
     while (runEnd < text.length && text[runEnd] === '`') runEnd += 1
     const run = runEnd - tick
     let close = -1
-    let k = runEnd
+    let k = unmatched.has(run) ? text.length : runEnd
     while (k < text.length) {
       const next = text.indexOf('`', k)
       if (next < 0) break
@@ -229,6 +231,7 @@ function stripInlineCode(text: string): string {
       k = end
     }
     if (close < 0) {
+      unmatched.add(run)
       out += text.slice(tick, runEnd)
       i = runEnd
     } else {
@@ -317,7 +320,7 @@ export async function bindTutorialImages(
     const role = tutorialImageRole(sha, roles)
     roles.add(role)
     await query(
-      `INSERT INTO tutorial_blob_refs (publication_id, sha256, role) VALUES ($1::bigint, $2, $3)`,
+      'INSERT INTO tutorial_blob_refs (publication_id, sha256, role) VALUES ($1::bigint, $2, $3)',
       [args.publicationId, sha, role],
       runner,
     )

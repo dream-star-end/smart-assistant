@@ -64,7 +64,7 @@ before(async () => {
 })
 
 after(async () => {
-  if (previousFlag === undefined) delete process.env.OC_COMMUNITY_BLOG_ENABLED
+  if (previousFlag === undefined) Reflect.deleteProperty(process.env, 'OC_COMMUNITY_BLOG_ENABLED')
   else process.env.OC_COMMUNITY_BLOG_ENABLED = previousFlag
   if (!server) return
   server.closeAllConnections()

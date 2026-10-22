@@ -17,7 +17,7 @@ import {
 import { scanMarkdownBody } from '../tutorials/snapshotSanitizer.js'
 
 const SHA_A = 'a'.repeat(64)
-const SHA_B = 'b'.repeat(63) + 'c'
+const SHA_B = `${'b'.repeat(63)}c`
 
 function solid(format: 'png' | 'jpeg' | 'webp', width = 32, height = 24) {
   return sharp({
@@ -69,6 +69,8 @@ describe('tutorialImages · 正文图片引用', () => {
     await expectImageError(() => parseTutorialImageRefs(`![a](${' '.repeat(50_000)}`), 'EXTERNAL_IMAGE')
     await expectImageError(() => parseTutorialImageRefs('![['.repeat(16_000)), 'EXTERNAL_IMAGE')
     assert.equal(firstTutorialImageSha('![x'.repeat(16_000)), null)
+    // 长度 1..314 的反引号串各出现一次、互不配对（Codex R2 的构造）。
+    parseTutorialImageRefs(`x${Array.from({ length: 314 }, (_, n) => '`'.repeat(n + 1)).join('x')}`)
     assert.ok(Date.now() - started < 1_000, `took ${Date.now() - started}ms`)
   })
 
