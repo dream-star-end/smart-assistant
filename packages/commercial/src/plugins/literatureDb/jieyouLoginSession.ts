@@ -1,12 +1,22 @@
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { LiteratureArtifactStore, type LiteratureArtifactStoreOptions } from './artifactStore.js'
+import {
+  LITERATURE_ARTIFACT_LOG_MSG,
+  LITERATURE_CALL_LOG_MSG,
+  type LiteratureCallEvent,
+} from './observability.js'
 import { WanfangLiteratureHttpExecutor } from './httpExecutor.js'
 import { createLocalCaptchaReader } from './localCaptchaReader.js'
 import { LiteratureSetupService, type LiteratureSetupOptions } from './setupService.js'
 /** Positive login session adapter over JieyouHttpClient for LiteratureSetupService. */
 import type { JieyouAccountState } from './accountState.js'
-import { type CaptchaBudget, type CaptchaImage, type CaptchaReader, LiteratureCaptchaSolver } from './captcha.js'
+import {
+  type CaptchaBudget,
+  type CaptchaImage,
+  type CaptchaReader,
+  LiteratureCaptchaSolver,
+} from './captcha.js'
 import { type LiteratureCredentials, parseLiteratureCredentials } from './credentials.js'
 import { LiteratureError } from './errors.js'
 import { JieyouHttpClient, type JieyouLoginForm } from './jieyouHttpClient.js'
@@ -66,7 +76,9 @@ export function classifyJieyouLoginPost(
 }
 
 function selectLifetime(form: JieyouLoginForm): string {
-  const preferred = form.lifetimes.find((item) => item.value === '86400') ?? form.lifetimes.find((item) => item.value === '3600')
+  const preferred =
+    form.lifetimes.find((item) => item.value === '86400') ??
+    form.lifetimes.find((item) => item.value === '3600')
   if (preferred) return preferred.value
   const checked = form.lifetimes.find((item) => item.checked)
   if (checked) return checked.value
@@ -216,9 +228,7 @@ export async function reloginJieyouAutomatically(input: {
   }
 }
 
-
-export const DEFAULT_LITERATURE_CAPTCHA_BUNDLE_ROOT =
-  '/opt/openclaude/literature-captcha-bundle'
+export const DEFAULT_LITERATURE_CAPTCHA_BUNDLE_ROOT = '/opt/openclaude/literature-captcha-bundle'
 
 export function resolveLiteratureCaptchaBundleRoot(
   env: NodeJS.ProcessEnv = process.env,
@@ -231,9 +241,7 @@ export function resolveLiteratureCaptchaBundleRoot(
   }
   const python = path.join(DEFAULT_LITERATURE_CAPTCHA_BUNDLE_ROOT, 'venv/bin/python')
   const runner = path.join(DEFAULT_LITERATURE_CAPTCHA_BUNDLE_ROOT, 'runner.py')
-  return hasFile(python) && hasFile(runner)
-    ? DEFAULT_LITERATURE_CAPTCHA_BUNDLE_ROOT
-    : undefined
+  return hasFile(python) && hasFile(runner) ? DEFAULT_LITERATURE_CAPTCHA_BUNDLE_ROOT : undefined
 }
 
 export function createCommercialLiteratureRuntime(input: {
@@ -241,12 +249,28 @@ export function createCommercialLiteratureRuntime(input: {
   redis: LiteratureSetupOptions['redis']
   env?: NodeJS.ProcessEnv
   onArtifactEvent?: LiteratureArtifactStoreOptions['onEvent']
+  /** Structured logger (rootLogger); wires literature_plugin_call / literature_artifact lines. */
+  logger?: {
+    child(bindings: Record<string, unknown>): {
+      info(msg: string, fields?: Record<string, unknown>): void
+    }
+  }
 }) {
+  const log = input.logger?.child({ subsys: 'plugins', module: 'literature-db' })
+  const onArtifactEvent =
+    input.onArtifactEvent ??
+    (log
+      ? (event: Parameters<NonNullable<LiteratureArtifactStoreOptions['onEvent']>>[0]) =>
+          log.info(LITERATURE_ARTIFACT_LOG_MSG, { ...event })
+      : undefined)
+  const literatureObserver = log
+    ? (event: LiteratureCallEvent) => log.info(LITERATURE_CALL_LOG_MSG, { ...event })
+    : undefined
   const bundleRoot = resolveLiteratureCaptchaBundleRoot(input.env)
   const readers = bundleRoot ? () => [createLocalCaptchaReader({ bundleRoot })] : () => []
   const literatureArtifacts =
     input.runtimeChannel === 'v5'
-      ? new LiteratureArtifactStore(input.onArtifactEvent ? { onEvent: input.onArtifactEvent } : {})
+      ? new LiteratureArtifactStore(onArtifactEvent ? { onEvent: onArtifactEvent } : {})
       : undefined
   const literatureHttp =
     literatureArtifacts !== undefined
@@ -278,5 +302,11 @@ export function createCommercialLiteratureRuntime(input: {
         }
       : { redis: input.redis },
   )
-  return { literatureSetup, literatureArtifacts, literatureHttp, literatureRelogin }
+  return {
+    literatureSetup,
+    literatureArtifacts,
+    literatureHttp,
+    literatureRelogin,
+    literatureObserver,
+  }
 }
