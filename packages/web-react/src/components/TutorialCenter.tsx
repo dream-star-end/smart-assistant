@@ -296,7 +296,7 @@ export function TutorialCenter({
   const mode =
     browseView === "blog" && !topicId && !caseId && !communityOpen
       ? "blog"
-      : communityId || communityOpen
+      : (communityId && requestedView !== "blog") || communityOpen
       ? "community"
       : topicId
         ? "features"
@@ -381,11 +381,12 @@ export function TutorialCenter({
       setSignatureWorkIdState(null);
       return;
     }
-    if (communityId && browseView !== "blog") setCommunityOpen(true);
+    // 请求的是 blog 页签时 communityId 是文章 id：开关关闭也不能把它当教程工作室打开。
+    if (communityId && requestedView !== "blog") setCommunityOpen(true);
     if (!topicId) return;
     const timer = window.setTimeout(() => setProgress(markTutorialRead(topicId)), 900);
     return () => window.clearTimeout(timer);
-  }, [open, topicId, communityId, browseView]);
+  }, [open, topicId, communityId, requestedView]);
 
   useEffect(
     () => () => {

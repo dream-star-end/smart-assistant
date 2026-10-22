@@ -463,6 +463,20 @@ describe("经验分享页签跟随 feature_community_blog（OCV5-577）", () => 
     expect(screen.getByRole("heading", { name: "案例展厅" })).toBeInTheDocument();
   });
 
+  it("开关关闭时 tab=blog&community=<id> 不进教程工作室；配置晚到为开时切到经验分享详情", async () => {
+    const list = vi.spyOn(api, "listCommunityTutorials").mockResolvedValue({ tutorials: [], nextCursor: null });
+    const detail = vi.spyOn(api, "getCommunityTutorial").mockRejectedValue(new Error("not loaded"));
+    const { rerender } = render(
+      <TutorialCenter {...base} browseView="blog" communityId="42" blogEnabled={false} />,
+    );
+    expect(screen.getByRole("heading", { name: "案例展厅" })).toBeInTheDocument();
+    expect(screen.queryByText("教程工作室")).toBeNull();
+    rerender(<TutorialCenter {...base} browseView="blog" communityId="42" blogEnabled />);
+    expect(screen.getByRole("heading", { name: "经验分享" })).toBeInTheDocument();
+    await waitFor(() => expect(detail).toHaveBeenCalledWith("42"));
+    expect(list).toBeDefined();
+  });
+
   it("开关打开：页签出现，tab=blog 打开经验分享", () => {
     vi.spyOn(api, "listCommunityTutorials").mockResolvedValue({ tutorials: [], nextCursor: null });
     render(<TutorialCenter {...base} browseView="blog" blogEnabled />);

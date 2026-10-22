@@ -351,6 +351,21 @@ export function App() {
 
   // 公开配置（Turnstile bypass / site key）：登录页驱动 AuthGate 是否渲染真 widget。
   const [publicCfg, setPublicCfg] = useState<PublicConfig | null>(null);
+  // 经验分享入口（OCV5-577）跟随 feature_community_blog。publicCfg 只在未登录时加载，已登录用户也要
+  // 知道这个开关，所以单独取一次，不改 publicCfg 的加载时机（image2 等判断依赖它为 null 的语义）。
+  const [communityBlogEnabled, setCommunityBlogEnabled] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getPublicConfig()
+      .then((cfg) => {
+        if (!cancelled) setCommunityBlogEnabled(cfg.featureCommunityBlog === true);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const [publicCfgRetryNonce, setPublicCfgRetryNonce] = useState(0);
 
   // demo 展示消息（本地 fixture 流式回放用；非 demo 的消息权威在 WS service）。
@@ -1705,7 +1720,7 @@ export function App() {
               caseId={tutorialCase}
               communityId={tutorialCommunity}
               browseView={tutorialTab ?? "showcase"}
-              blogEnabled={publicCfg?.featureCommunityBlog === true}
+              blogEnabled={communityBlogEnabled}
               onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
               signatureWorkId={tutorialWork}
               onSignatureWorkChange={setTutorialWork}
@@ -1885,7 +1900,7 @@ export function App() {
     onOpenTutorial: demo ? undefined : () => openTutorial(),
     // 经验分享入口跟随 feature_community_blog（商业版默认关；配置未到时也不显示）。
     onOpenBlog:
-      demo || publicCfg?.featureCommunityBlog !== true
+      demo || !communityBlogEnabled
       ? undefined
       : () => {
           openTutorial();
@@ -2726,7 +2741,7 @@ export function App() {
             caseId={tutorialCase}
             communityId={tutorialCommunity}
             browseView={tutorialTab ?? "showcase"}
-            blogEnabled={publicCfg?.featureCommunityBlog === true}
+            blogEnabled={communityBlogEnabled}
             onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
             signatureWorkId={tutorialWork}
             onSignatureWorkChange={setTutorialWork}
