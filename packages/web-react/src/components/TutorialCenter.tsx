@@ -237,6 +237,7 @@ export function TutorialCenter({
   signatureWorkId: signatureWorkIdProp,
   onSignatureWorkChange,
   stepIndex = null,
+  blogEnabled = true,
 }: {
   open: boolean;
   topicId: ProductFeatureId | null;
@@ -268,12 +269,18 @@ export function TutorialCenter({
   sending?: boolean;
   sessionTitle?: string;
   sessionProjectId?: string | null;
+  /**
+   * 「经验分享」页签是否出现（OCV5-577）。App 按 /api/public/config 的 feature_community_blog 传入：
+   * 商业版默认关；关闭时页签隐藏，`tab=blog` 深链回落到案例展厅。缺省 true 只为 ui-preview 与旧测试。
+   */
+  blogEnabled?: boolean;
 }) {
   // 经验分享的文章详情也走 communityId，但它属于 blog 页签，不打开教程工作室。
   const [communityOpen, setCommunityOpen] = useState(!!communityId && browseViewProp !== "blog");
   // 页签与精选作品选中态:传了受控 prop 就以 prop 为准(App 镜像到 URL,TU-17),否则用内部 state。
   const [browseViewState, setBrowseViewState] = useState<TutorialBrowseView>("showcase");
-  const browseView = browseViewProp ?? browseViewState;
+  const requestedView = browseViewProp ?? browseViewState;
+  const browseView: TutorialBrowseView = !blogEnabled && requestedView === "blog" ? "showcase" : requestedView;
   const setBrowseView = (view: TutorialBrowseView) => {
     if (browseViewProp === undefined) setBrowseViewState(view);
     onBrowseViewChange?.(view);
@@ -289,7 +296,7 @@ export function TutorialCenter({
   const mode =
     browseView === "blog" && !topicId && !caseId && !communityOpen
       ? "blog"
-      : communityId || communityOpen
+      : (communityId && requestedView !== "blog") || communityOpen
       ? "community"
       : topicId
         ? "features"
@@ -374,11 +381,12 @@ export function TutorialCenter({
       setSignatureWorkIdState(null);
       return;
     }
-    if (communityId && browseView !== "blog") setCommunityOpen(true);
+    // 请求的是 blog 页签时 communityId 是文章 id：开关关闭也不能把它当教程工作室打开。
+    if (communityId && requestedView !== "blog") setCommunityOpen(true);
     if (!topicId) return;
     const timer = window.setTimeout(() => setProgress(markTutorialRead(topicId)), 900);
     return () => window.clearTimeout(timer);
-  }, [open, topicId, communityId, browseView]);
+  }, [open, topicId, communityId, requestedView]);
 
   useEffect(
     () => () => {
@@ -492,10 +500,12 @@ export function TutorialCenter({
                 <ViewTab active={mode === "features"} onClick={showFeatures} icon={BookOpen}>
                   功能参考
                 </ViewTab>
-                <ViewTab active={mode === "blog"} onClick={showBlog} icon={PenLine}>
-                  经验分享
-                  <span className="rounded-full bg-accent px-1.5 text-[10px] font-bold leading-4 text-accent-fg">新</span>
-                </ViewTab>
+                {blogEnabled && (
+                  <ViewTab active={mode === "blog"} onClick={showBlog} icon={PenLine}>
+                    经验分享
+                    <span className="rounded-full bg-accent px-1.5 text-[10px] font-bold leading-4 text-accent-fg">新</span>
+                  </ViewTab>
+                )}
               </div>
               {/* 「帮助与创作」走 DropdownMenu 原语(审计 TU-03):原生 <details> 没有外点 / Esc 关闭,
                   也没有 menu 语义与方向键;Radix 版本这些都自带,与全站其它下拉一致。 */}

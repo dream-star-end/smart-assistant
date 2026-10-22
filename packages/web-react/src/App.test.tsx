@@ -2102,3 +2102,72 @@ describe('Aurora v5 — 项目主页(P1 review)', () => {
     expect(window.location.pathname).toBe('/p/p1/chats')
   }, 30000)
 })
+
+describe('经验分享入口跟随 feature_community_blog（OCV5-577）', () => {
+  function bootLoggedIn(featureCommunityBlog: boolean) {
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_OK
+      if (u.includes('/api/public/config')) {
+        return okJson({
+          turnstile_site_key: '',
+          turnstile_bypass: true,
+          require_email_verified: false,
+          feature_remote_ssh: false,
+          feature_image2: false,
+          allow_registration: true,
+          feature_community_blog: featureCommunityBlog,
+        })
+      }
+      if (u.includes('/api/public/models')) return okJson(MODELS)
+      if (u.includes('/api/me/preferences')) return okJson({ prefs: {} })
+      if (u.includes('/api/agent/status')) return okJson(AGENT_READY)
+      if (u.includes('/api/me')) {
+        return okJson({ user: { id: 'u1', email: 'a@b.com', role: 'user', display_name: 'Alice', credits: '300' } })
+      }
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    setAuthHint()
+    render(<App />)
+  }
+
+  test('已登录（静默续期）且开关打开：侧栏出现「经验分享」入口', async () => {
+    bootLoggedIn(true)
+    expect(await screen.findByTestId('blog-nav')).toBeInTheDocument()
+  })
+
+  test('未登录访客打开 tab=blog 深链：开关打开时进入经验分享', async () => {
+    window.history.replaceState({}, '', '/?panel=help&tab=blog')
+    fetchMock = vi.fn(async (url: string) => {
+      const u = String(url)
+      if (u.includes('/api/auth/refresh')) return REFRESH_401
+      if (u.includes('/api/public/config')) {
+        return okJson({
+          turnstile_site_key: '',
+          turnstile_bypass: true,
+          require_email_verified: false,
+          feature_remote_ssh: false,
+          feature_image2: false,
+          allow_registration: true,
+          feature_community_blog: true,
+        })
+      }
+      if (u.includes('/api/tutorials')) return okJson({ tutorials: [], nextCursor: null, total: 0 })
+      return okJson({})
+    }) as unknown as FetchMock
+    vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch)
+    render(<App />)
+    expect(await screen.findByRole('heading', { name: '经验分享' })).toBeInTheDocument()
+    window.history.replaceState({}, '', '/')
+  })
+
+  test('已登录但开关关闭：没有「经验分享」入口', async () => {
+    bootLoggedIn(false)
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /新建会话/ }).length).toBeGreaterThan(0))
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/api/public/config'))).toBe(true),
+    )
+    expect(screen.queryByTestId('blog-nav')).toBeNull()
+  })
+})

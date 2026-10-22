@@ -351,6 +351,9 @@ export function App() {
 
   // 公开配置（Turnstile bypass / site key）：登录页驱动 AuthGate 是否渲染真 widget。
   const [publicCfg, setPublicCfg] = useState<PublicConfig | null>(null);
+  // 经验分享入口（OCV5-577）跟随 feature_community_blog。publicCfg 只在登录页加载，已登录与首页深链时
+  // 单独取一次（见下方 effect），不改 publicCfg 的加载时机（image2 等判断依赖它已登录时为 null）。
+  const [signedInCommunityBlog, setSignedInCommunityBlog] = useState<boolean | null>(null);
   const [publicCfgRetryNonce, setPublicCfgRetryNonce] = useState(0);
 
   // demo 展示消息（本地 fixture 流式回放用；非 demo 的消息权威在 WS service）。
@@ -620,6 +623,24 @@ export function App() {
     document.addEventListener("click", onClick, true);
     return () => document.removeEventListener("click", onClick, true);
   }, [authed, demo]);
+
+  // 已登录（侧栏入口）或教程中心已打开（含匿名访客的 tab=blog 深链）时取一次；登录页与 demo 不多发请求。
+  const needCommunityBlogFlag = !demo && (authed || tutorialOpen);
+  useEffect(() => {
+    if (!needCommunityBlogFlag || signedInCommunityBlog !== null) return;
+    let cancelled = false;
+    api
+      .getPublicConfig()
+      .then((cfg) => {
+        if (!cancelled) setSignedInCommunityBlog(cfg.featureCommunityBlog === true);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [needCommunityBlogFlag, signedInCommunityBlog]);
+  const communityBlogEnabled =
+    !demo && (signedInCommunityBlog ?? publicCfg?.featureCommunityBlog === true);
 
   const interrupt = useCallback(() => {
     stopRef.current = true;
@@ -1705,6 +1726,7 @@ export function App() {
               caseId={tutorialCase}
               communityId={tutorialCommunity}
               browseView={tutorialTab ?? "showcase"}
+              blogEnabled={communityBlogEnabled}
               onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
               signatureWorkId={tutorialWork}
               onSignatureWorkChange={setTutorialWork}
@@ -1882,7 +1904,9 @@ export function App() {
     onOpenManage: demo ? undefined : () => openManage(DEFAULT_MANAGE_TAB),
     onOpenMarketplace: demo ? undefined : () => openMarketplace("browse"),
     onOpenTutorial: demo ? undefined : () => openTutorial(),
-    onOpenBlog: demo
+    // 经验分享入口跟随 feature_community_blog（商业版默认关；配置未到时也不显示）。
+    onOpenBlog:
+      demo || !communityBlogEnabled
       ? undefined
       : () => {
           openTutorial();
@@ -2723,6 +2747,7 @@ export function App() {
             caseId={tutorialCase}
             communityId={tutorialCommunity}
             browseView={tutorialTab ?? "showcase"}
+            blogEnabled={communityBlogEnabled}
             onBrowseViewChange={(next) => setTutorialTab(next === "showcase" ? null : next)}
             signatureWorkId={tutorialWork}
             onSignatureWorkChange={setTutorialWork}
