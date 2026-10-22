@@ -1,3 +1,5 @@
+// OCV5-568 (plan §7.5): logs are saved before a turn-runtime container is removed; saving never
+// blocks removal; memory and the archive are bounded; and no new removal path can bypass the helper.
 import assert from 'node:assert/strict'
 import {
   mkdtempSync,
@@ -10,14 +12,14 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-// OCV5-568 (plan §7.5): logs are saved before a turn-runtime container is removed; saving never
-// blocks removal; the archive is bounded; and no new removal path can bypass the helper.
+import { PassThrough, Readable } from 'node:stream'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import {
+  type LogStreamOpener,
   type RemovableContainer,
+  TailDemuxer,
   containerLogArchiveStats,
-  demuxDockerLogs,
   pruneContainerLogArchive,
   removeContainerSavingLogs,
 } from '../compute-pool/containerLogArchive.js'
@@ -33,18 +35,10 @@ function frame(stream: 1 | 2, text: string): Buffer {
   return Buffer.concat([h, body])
 }
 
-function fakeContainer(
-  over: Partial<RemovableContainer> & { logsImpl?: () => Promise<Buffer> } = {},
-) {
+function fakeContainer(over: { remove?: RemovableContainer['remove'] } = {}) {
   const calls: string[] = []
   const c: RemovableContainer = {
     id: 'abcdef0123456789',
-    logs: async () => {
-      calls.push('logs')
-      return over.logsImpl
-        ? over.logsImpl()
-        : Buffer.concat([frame(1, 'out line\n'), frame(2, 'err line\n')])
-    },
     remove: async (opts) => {
       calls.push(`remove:${opts.force}`)
       if (over.remove) return over.remove(opts)
@@ -52,6 +46,14 @@ function fakeContainer(
     },
   }
   return { c, calls }
+}
+
+/** An opener that records the call and returns the given chunks as a stream. */
+function opener(calls: string[], chunks: Buffer[]): LogStreamOpener {
+  return async () => {
+    calls.push('logs')
+    return Readable.from(chunks)
+  }
 }
 
 function tmp(t: { after(fn: () => void): void }) {
@@ -73,18 +75,56 @@ function captureLog() {
   }
 }
 
+const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
 describe('container log archive', () => {
-  test('demux: framed stdout/stderr are joined without headers; TTY or malformed input is returned as is', () => {
-    assert.equal(
-      demuxDockerLogs(Buffer.concat([frame(1, 'a\n'), frame(2, 'b\n')])).toString(),
-      'a\nb\n',
-    )
-    assert.equal(
-      demuxDockerLogs(Buffer.from('plain tty output\n')).toString(),
-      'plain tty output\n',
-    )
-    const truncated = frame(1, 'abcdef').subarray(0, 10)
-    assert.deepEqual(demuxDockerLogs(truncated), truncated)
+  test('demux: frames are stripped even when a header is split across reads; TTY input is kept as is', () => {
+    const d = new TailDemuxer(1024)
+    const all = Buffer.concat([frame(1, 'a\n'), frame(2, 'b\n')])
+    // splits inside the first header, inside the first body, and inside the second header
+    for (const [a, b] of [[0, 3], [3, 9], [9, 12], [12, all.length]]) d.push(all.subarray(a, b))
+    assert.equal(d.result().toString(), 'a\nb\n')
+    const tty = new TailDemuxer(1024)
+    tty.push(Buffer.from('plain tty output\n'))
+    assert.equal(tty.result().toString(), 'plain tty output\n')
+  })
+
+  test('Codex r1: memory is bounded while reading — only about the last maxBytes are held', () => {
+    const max = 64 * 1024
+    const d = new TailDemuxer(max)
+    const line = frame(1, `${'y'.repeat(16 * 1024 - 1)}\n`)
+    for (let i = 0; i < 4096; i++) d.push(line) // 64 MiB of log through a 64 KiB tail
+    d.push(frame(2, 'CRASH\n'))
+    const held = (d as unknown as { total: number }).total
+    assert.ok(held <= max + line.length, `held ${held} bytes`)
+    const r = d.result()
+    assert.equal(r.length, max)
+    assert.ok(r.toString().endsWith('CRASH\n'))
+  })
+
+  test('the docker opener asks for a non-follow stream with the abort signal (never the buffering logs())', async () => {
+    let seen: Record<string, unknown> | undefined
+    const c: RemovableContainer = {
+      id: 'abcdef0123456789',
+      remove: async () => undefined,
+      modem: {
+        dial: (opts, cb) => {
+          seen = opts as Record<string, unknown>
+          cb(null, Readable.from([frame(1, 'x\n')]))
+        },
+      },
+    }
+    const dir = mkdtempSync(path.join(tmpdir(), 'ctr-logs-'))
+    try {
+      await removeContainerSavingLogs(c, 'r', { dir })
+      assert.equal(seen?.path, '/containers/abcdef0123456789/logs?')
+      assert.equal(seen?.isStream, true)
+      assert.ok(seen?.abortSignal instanceof AbortSignal)
+      assert.deepEqual(seen?.options, { stdout: true, stderr: true, timestamps: true, tail: 20_000 })
+      assert.equal(readFileSync(path.join(dir, readdirSync(dir)[0]!), 'utf8'), 'x\n')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   test('logs are saved (demuxed, 0600) before removal, which runs with force', async (t) => {
@@ -93,6 +133,7 @@ describe('container log archive', () => {
     await removeContainerSavingLogs(c, 'stop_and_remove', {
       dir,
       now: () => new Date('2026-10-22T01:02:03.456Z'),
+      openLogs: opener(calls, [frame(1, 'out line\n'), frame(2, 'err line\n')]),
     })
     assert.deepEqual(calls, ['logs', 'remove:true'])
     const files = readdirSync(dir)
@@ -103,52 +144,111 @@ describe('container log archive', () => {
 
   test('a log larger than the cap keeps its end (where the crash is)', async (t) => {
     const dir = tmp(t)
-    const { c } = fakeContainer({ logsImpl: async () => frame(1, `${'x'.repeat(100)}CRASH`) })
-    await removeContainerSavingLogs(c, 'r', { dir, maxBytes: 10 })
+    const { c, calls } = fakeContainer()
+    const openLogs = opener(calls, [frame(1, `${'x'.repeat(100)}CRASH`)])
+    await removeContainerSavingLogs(c, 'r', { dir, maxBytes: 10, openLogs })
     assert.equal(readFileSync(path.join(dir, readdirSync(dir)[0]!), 'utf8'), 'xxxxxCRASH')
   })
 
-  test('a failed or slow save never blocks removal; it is warned and counted (404 is silent)', async (t) => {
+  test('a failed save never blocks removal; it is warned and counted (404 is silent)', async (t) => {
     const dir = tmp(t)
     const before = containerLogArchiveStats().failed
     const cap = captureLog()
-    const broken = fakeContainer({
-      logsImpl: async () => {
+    const broken = fakeContainer()
+    await removeContainerSavingLogs(broken.c, 'r', {
+      dir,
+      log: cap.log,
+      openLogs: async () => {
         throw Object.assign(new Error('daemon busy'), { statusCode: 500 })
       },
     })
-    await removeContainerSavingLogs(broken.c, 'r', { dir, log: cap.log })
-    assert.deepEqual(broken.calls, ['logs', 'remove:true'])
-    assert.equal(
-      cap.lines.filter((l) => l.msg === 'container logs not saved before removal').length,
-      1,
-    )
-    const slow = fakeContainer({ logsImpl: () => new Promise(() => {}) })
-    const t0 = Date.now()
-    await removeContainerSavingLogs(slow.c, 'r', { dir, log: cap.log, timeoutMs: 50 })
-    assert.ok(Date.now() - t0 < 2000)
-    assert.deepEqual(slow.calls, ['logs', 'remove:true'])
-    const gone = fakeContainer({
-      logsImpl: async () => {
+    assert.deepEqual(broken.calls, ['remove:true'])
+    const gone = fakeContainer()
+    await removeContainerSavingLogs(gone.c, 'r', {
+      dir,
+      log: cap.log,
+      openLogs: async () => {
         throw Object.assign(new Error('no such container'), { statusCode: 404 })
       },
     })
-    await removeContainerSavingLogs(gone.c, 'r', { dir, log: cap.log })
-    assert.equal(cap.lines.length, 2, '404 adds no warning')
+    const noModem = fakeContainer()
+    await removeContainerSavingLogs(noModem.c, 'r', { dir, log: cap.log })
+    assert.deepEqual(noModem.calls, ['remove:true'])
+    assert.equal(
+      cap.lines.filter((l) => l.msg === 'container logs not saved before removal').length,
+      2,
+      '404 adds no warning',
+    )
     assert.equal(containerLogArchiveStats().failed, before + 2)
+  })
+
+  test('Codex r1: a response that comes after the deadline is dropped — nothing is written after removal', async (t) => {
+    const dir = tmp(t)
+    let late: PassThrough | undefined
+    const { c, calls } = fakeContainer()
+    const t0 = Date.now()
+    await removeContainerSavingLogs(c, 'r', {
+      dir,
+      timeoutMs: 10,
+      log: captureLog().log,
+      openLogs: async () => {
+        await delay(40)
+        late = new PassThrough()
+        late.end(frame(1, 'x'.repeat(100)))
+        return late
+      },
+    })
+    assert.ok(Date.now() - t0 < 1000)
+    assert.deepEqual(calls, ['remove:true'])
+    await delay(80)
+    assert.deepEqual(readdirSync(dir), [])
+    assert.equal(late?.destroyed, true)
+  })
+
+  test('Codex r1: a read still running at the deadline is cut, saved with a note, and pruned in the same call', async (t) => {
+    const dir = tmp(t)
+    const cap = captureLog()
+    writeFileSync(path.join(dir, 'older.log'), 'o'.repeat(100))
+    utimesSync(path.join(dir, 'older.log'), new Date(Date.now() - 60_000), new Date(Date.now() - 60_000))
+    const s = new PassThrough()
+    const { c, calls } = fakeContainer()
+    const t0 = Date.now()
+    const done = removeContainerSavingLogs(c, 'r', {
+      dir,
+      timeoutMs: 50,
+      maxTotalBytes: 150,
+      log: cap.log,
+      openLogs: async () => s,
+    })
+    s.write(frame(1, 'first lines\n')) // the stream never ends
+    await done
+    assert.ok(Date.now() - t0 < 1000)
+    assert.deepEqual(calls, ['remove:true'])
+    assert.equal(s.destroyed, true)
+    const files = readdirSync(dir)
+    assert.equal(files.length, 1, 'the older file was pruned to fit the total')
+    assert.match(readFileSync(path.join(dir, files[0]!), 'utf8'), /^first lines\n\n\[oc: log save cut/)
+    assert.equal(cap.lines.filter((l) => l.msg === 'container logs cut at save deadline').length, 1)
   })
 
   test('removal errors propagate unchanged, and force can be turned off', async (t) => {
     const dir = tmp(t)
     const notFound = Object.assign(new Error('gone'), { statusCode: 404 })
-    const { c } = fakeContainer({
+    const { c, calls } = fakeContainer({
       remove: async () => {
         throw notFound
       },
     })
-    await assert.rejects(removeContainerSavingLogs(c, 'r', { dir }), (e) => e === notFound)
+    await assert.rejects(
+      removeContainerSavingLogs(c, 'r', { dir, openLogs: opener(calls, []) }),
+      (e) => e === notFound,
+    )
     const soft = fakeContainer()
-    await removeContainerSavingLogs(soft.c, 'r', { dir, force: false })
+    await removeContainerSavingLogs(soft.c, 'r', {
+      dir,
+      force: false,
+      openLogs: opener(soft.calls, []),
+    })
     assert.deepEqual(soft.calls, ['logs', 'remove:false'])
   })
 
