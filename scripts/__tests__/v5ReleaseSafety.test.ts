@@ -2220,6 +2220,48 @@ describe('v5 release safety lanes', () => {
     assert.doesNotMatch(prepare, /assert_release_baseline_security "\$live_release"/)
   })
 
+  test('legacy serving baseline compat accepts a still-present retired oc-vision skill, strict mode does not', async () => {
+    // OCV5-576: commercial deploy of ba6b77f84 failed before activation (live unchanged) because the
+    // serving rel-153c6bf14 still carries oc-vision, which OCV5-547 retired from EXPECTED_SKILLS.
+    const dir = await mkdtemp(path.join(tmpdir(), 'v5-baseline-legacy-retired-'))
+    dirs.push(dir)
+    const release = path.join(dir, 'release')
+    const baseline = path.join(release, 'packages/commercial/agent-sandbox/ccb-baseline')
+    await mkdir(path.dirname(baseline), { recursive: true })
+    await cp(path.join(root, 'packages/commercial/agent-sandbox/ccb-baseline'), baseline, {
+      recursive: true,
+    })
+    await mkdir(path.join(baseline, 'skills/oc-vision'))
+    await writeFile(path.join(baseline, 'skills/oc-vision/SKILL.md'), '# oc-vision\n')
+    const strict = spawnSync('bash', [baselineGuard, 'check-release', release], {
+      encoding: 'utf8',
+    })
+    assert.notEqual(strict.status, 0)
+    assert.match(strict.stderr, /skill manifest mismatch/)
+    const compat = spawnSync('bash', [baselineGuard, 'harden-release-legacy-cursor', release], {
+      encoding: 'utf8',
+    })
+    assert.equal(compat.status, 0, compat.stderr)
+    const check = spawnSync('bash', [baselineGuard, 'check-release-legacy-cursor', release], {
+      encoding: 'utf8',
+    })
+    assert.equal(check.status, 0, check.stderr)
+    // The retired skill is still held to the skill layout rules, and nothing else extra passes.
+    await writeFile(path.join(baseline, 'skills/oc-vision/stray.bin'), 'x')
+    const badInner = spawnSync('bash', [baselineGuard, 'check-release-legacy-cursor', release], {
+      encoding: 'utf8',
+    })
+    assert.notEqual(badInner.status, 0)
+    await rm(path.join(baseline, 'skills/oc-vision/stray.bin'))
+    await mkdir(path.join(baseline, 'skills/undeclared'))
+    await writeFile(path.join(baseline, 'skills/undeclared/SKILL.md'), '# unexpected\n')
+    const drift = spawnSync('bash', [baselineGuard, 'check-release-legacy-cursor', release], {
+      encoding: 'utf8',
+    })
+    assert.notEqual(drift.status, 0)
+    assert.match(drift.stderr, /skill manifest mismatch/)
+  })
+
   test('post-rollback smoke uses legacy baseline for predecessor missing multi-model-review', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'v5-rollback-smoke-legacy-'))
     dirs.push(dir)
