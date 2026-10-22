@@ -149,8 +149,14 @@ export const DEFAULT_STALL_WINDOW_MS: number
 
 export function extractAssistantFromMapping(
   conv: any,
-  opts?: { baselineNodeId?: string | null },
+  opts?: { baselineNodeId?: string | null; allowInProgress?: boolean },
 ): { text: string; messageId: string } | null
+
+export function fetchConversationPayloadInPage(
+  page: any,
+  fallbackConvId?: string | null,
+  opts?: { retries?: number; tokenTtlMs?: number },
+): Promise<{ conv: any | null; convId: string | null; status?: number }>
 
 export function inspectExistingTurnInConversation(
   conv: any,
@@ -290,6 +296,34 @@ export function computeAdaptiveDeadline(opts: {
   extended: boolean
   shouldRescue: boolean
   expired: boolean
+}
+
+export function resolveTurnCompletionDecision(opts?: {
+  accDone?: boolean
+  accFinalText?: string
+  rescued?: {
+    text?: string | null
+    messageId?: string | null
+    convId?: string | null
+    conv?: any
+  } | null
+  latestProg?: {
+    liveFinalText?: string
+    finishedFinal?: { text: string; messageId: string } | null
+  } | null
+  emittedFinalText?: string
+  stopVisible?: boolean
+  activeThinkingVisible?: boolean
+  stopGoneSince?: number | null
+  now?: number
+  emptyDoneGraceMs?: number
+}): {
+  action: 'continue' | 'wait_grace' | 'finalize' | 'error_empty'
+  text?: string
+  messageId?: string | null
+  convId?: string | null
+  conv?: any | null
+  source?: 'sse' | 'rescue' | 'mapping_finished' | 'partial_fallback'
 }
 
 export function formatStreamJsonSystemInit(opts: {

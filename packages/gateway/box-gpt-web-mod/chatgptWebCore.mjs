@@ -1305,7 +1305,10 @@ export class SseAccumulator {
  * Stops immediately if it encounters a user message before any final assistant message
  * (so it never returns an earlier turn's answer), and strictly requires channel === 'final' (or null).
  */
-export function extractAssistantFromMapping(conv, { baselineNodeId = null } = {}) {
+export function extractAssistantFromMapping(
+  conv,
+  { baselineNodeId = null, allowInProgress = false } = {},
+) {
   if (!conv || !conv.mapping) return null
   let cur = conv.current_node
   const visited = new Set()
@@ -1333,7 +1336,7 @@ export function extractAssistantFromMapping(conv, { baselineNodeId = null } = {}
           cur = node.parent
           continue
         }
-        if (m.status && m.status !== 'finished_successfully') {
+        if (!allowInProgress && m.status && m.status !== 'finished_successfully') {
           return null
         }
         if (ct === 'text' || ct === 'multimodal_text') {
@@ -1341,7 +1344,10 @@ export function extractAssistantFromMapping(conv, { baselineNodeId = null } = {}
             .map((p) => (typeof p === 'string' ? p : p && typeof p.text === 'string' ? p.text : ''))
             .filter(Boolean)
           if (parts.length > 0) {
-            return { text: parts.join(''), messageId: m.id || cur }
+            return {
+              text: parts.join(''),
+              messageId: m.id || cur,
+            }
           }
         }
       }
@@ -1349,6 +1355,88 @@ export function extractAssistantFromMapping(conv, { baselineNodeId = null } = {}
     cur = node.parent
   }
   return null
+}
+
+/**
+ * Fetches `/backend-api/conversation/<convId>` inside the page with page-level `/api/auth/session`
+ * bearer token caching (default TTL 4 minutes) and automatic token refresh + retry on 401/403/404/429/5xx.
+ * Prevents `/api/auth/session` rate-limiting during 30+ minute Pro turns (which otherwise causes unauthenticated
+ * `/backend-api/conversation/<id>` calls to fail with HTTP 404 `conversation_inaccessible`).
+ */
+export async function fetchConversationPayloadInPage(
+  page,
+  fallbackConvId = null,
+  { retries = 2, tokenTtlMs = 240_000 } = {},
+) {
+  if (!page || typeof page.evaluate !== 'function') {
+    return { conv: null, convId: fallbackConvId }
+  }
+  return page
+    .evaluate(
+      async ({ knownId, maxRetries, ttlMs }) => {
+        const m = location.pathname.match(/\/c\/([a-z0-9_-]{8,128})/i)
+        const convId = m?.[1] || knownId || null
+        if (!convId) return { conv: null, convId: null }
+
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+        const getToken = async (forceRefresh = false) => {
+          const now = Date.now()
+          const cached = window.__ocAuthTokenCache
+          if (
+            !forceRefresh &&
+            cached &&
+            typeof cached.token === 'string' &&
+            cached.token.length > 0 &&
+            now < cached.expiresAt
+          ) {
+            return cached.token
+          }
+          for (let sAttempt = 0; sAttempt < 2; sAttempt++) {
+            try {
+              const sessRes = await fetch('/api/auth/session', { credentials: 'include' })
+              if (sessRes.ok) {
+                const sess = await sessRes.json()
+                const tok = sess?.accessToken || null
+                if (tok) {
+                  window.__ocAuthTokenCache = {
+                    token: tok,
+                    expiresAt: Date.now() + ttlMs,
+                  }
+                  return tok
+                }
+              }
+            } catch {}
+            if (sAttempt === 0) await sleep(250)
+          }
+          return cached?.token || null
+        }
+
+        const attempts = Math.max(0, Number(maxRetries) || 0) + 1
+        for (let attempt = 0; attempt < attempts; attempt++) {
+          try {
+            const token = await getToken(attempt > 0)
+            const headers = token ? { Authorization: `Bearer ${token}` } : {}
+            const r = await fetch(`/backend-api/conversation/${convId}`, {
+              credentials: 'include',
+              headers,
+            })
+            if (r.ok) {
+              const conv = await r.json()
+              return { conv, convId, status: r.status }
+            }
+            window.__ocAuthTokenCache = null
+          } catch {
+            window.__ocAuthTokenCache = null
+          }
+          if (attempt + 1 < attempts) {
+            await sleep(400 * (attempt + 1))
+          }
+        }
+        return { conv: null, convId }
+      },
+      { knownId: fallbackConvId, maxRetries: retries, ttlMs: tokenTtlMs },
+    )
+    .catch(() => ({ conv: null, convId: fallbackConvId }))
 }
 
 /**
@@ -2037,10 +2125,26 @@ export async function downloadTurnOutputArtifactsInPage(
           }
           let token = null
           try {
-            const sessRes = await fetch('/api/auth/session', { credentials: 'include' })
-            if (sessRes.ok) {
-              const sess = await sessRes.json()
-              token = sess?.accessToken || null
+            const cached = window.__ocAuthTokenCache
+            if (
+              cached &&
+              typeof cached.token === 'string' &&
+              cached.token.length > 0 &&
+              Date.now() < cached.expiresAt
+            ) {
+              token = cached.token
+            } else {
+              const sessRes = await fetch('/api/auth/session', { credentials: 'include' })
+              if (sessRes.ok) {
+                const sess = await sessRes.json()
+                token = sess?.accessToken || null
+                if (token) {
+                  window.__ocAuthTokenCache = {
+                    token,
+                    expiresAt: Date.now() + 240_000,
+                  }
+                }
+              }
             }
           } catch {}
           const headers = token ? { Authorization: `Bearer ${token}` } : {}
@@ -2104,7 +2208,12 @@ export async function downloadTurnOutputArtifactsInPage(
           }
 
           try {
-            const dlRes = await fetch(downloadUrl)
+            const isSameOrigin =
+              downloadUrl.startsWith('/') || downloadUrl.startsWith('https://chatgpt.com/')
+            const dlRes = await fetch(
+              downloadUrl,
+              isSameOrigin ? { credentials: 'include', headers } : undefined,
+            )
             if (dlRes.ok) {
               const ab = await dlRes.arrayBuffer()
               if (ab.byteLength > 0 && ab.byteLength <= maxBytes) {
@@ -2229,6 +2338,79 @@ export function computeAdaptiveDeadline({
     shouldRescue,
     expired,
   }
+}
+
+/**
+ * Decides what to do when `acc.done` is true and neither Stop button nor active thinking is visible.
+ * Prevents `stream_handoff` turns (where `acc.done` becomes true early with `acc.finalText === ""`)
+ * from prematurely returning an empty string (`result: ""`) when `rescueFromDomOrMapping` hasn't yet
+ * seen a `finished_successfully` final reply or during a brief Stop-button flicker between tool steps.
+ */
+export function resolveTurnCompletionDecision({
+  accDone = false,
+  accFinalText = '',
+  rescued = null,
+  latestProg = null,
+  emittedFinalText = '',
+  stopVisible = false,
+  activeThinkingVisible = false,
+  stopGoneSince = null,
+  now = Date.now(),
+  emptyDoneGraceMs = 45_000,
+} = {}) {
+  if (stopVisible || activeThinkingVisible || !accDone) {
+    return { action: 'continue' }
+  }
+  const sseText = String(accFinalText ?? '')
+  if (sseText.length > 0) {
+    return {
+      action: 'finalize',
+      text: sseText,
+      messageId: null,
+      convId: null,
+      conv: null,
+      source: 'sse',
+    }
+  }
+  if (rescued?.text && String(rescued.text).length > 0) {
+    return {
+      action: 'finalize',
+      text: String(rescued.text),
+      messageId: rescued.messageId || null,
+      convId: rescued.convId || null,
+      conv: rescued.conv || null,
+      source: 'rescue',
+    }
+  }
+  if (latestProg?.finishedFinal?.text && String(latestProg.finishedFinal.text).length > 0) {
+    return {
+      action: 'finalize',
+      text: String(latestProg.finishedFinal.text),
+      messageId: latestProg.finishedFinal.messageId || null,
+      convId: null,
+      conv: null,
+      source: 'mapping_finished',
+    }
+  }
+
+  // No finished reply yet: if stopGoneSince is within the grace window, keep polling instead of exiting empty.
+  if (stopGoneSince === null || now - stopGoneSince < emptyDoneGraceMs) {
+    return { action: 'wait_grace' }
+  }
+
+  const partial = String(latestProg?.liveFinalText || emittedFinalText || '')
+  if (partial.trim().length > 0) {
+    return {
+      action: 'finalize',
+      text: partial,
+      messageId: null,
+      convId: null,
+      conv: null,
+      source: 'partial_fallback',
+    }
+  }
+
+  return { action: 'error_empty' }
 }
 
 export function formatStreamJsonSystemInit({
