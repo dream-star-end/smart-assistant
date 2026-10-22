@@ -61,6 +61,7 @@ import {
 } from './codexHermeticPolicy.js'
 import { createLogger } from '../logger.js'
 import { type ClassifiedErrorCode, classifyRunError } from '../errorClassify.js'
+import { withCodexTurnTrace } from '../relayTrace.js'
 import type {
   AutomaticRetryState,
   CollabAgentPolicy,
@@ -2602,7 +2603,8 @@ export class CodexAppServerRunner extends EventEmitter {
         try {
           log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
             stage: 'turn_start_sent', elapsedMs: performance.now() - timingStartedAt })
-          tres = (await this.sendRequest('turn/start', this.buildTurnStartParams(prompt))) as
+          tres = (await withCodexTurnTrace(this.threadId, this.opts.traceId, () =>
+            this.sendRequest('turn/start', this.buildTurnStartParams(prompt)))) as
             | { turn?: { id?: string } }
             | undefined
         } catch (startErr) {
