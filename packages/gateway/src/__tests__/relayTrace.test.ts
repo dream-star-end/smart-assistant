@@ -25,6 +25,7 @@ import {
   bindGrokRouteTrace,
   codexRelayTrace,
   grokRelayTrace,
+  withCodexTurnTrace,
 } from '../relayTrace.js'
 import { V3_CODEX_RELAY_PREFIX, handleV3CodexRelayLocal } from '../v3CodexRelay.js'
 import { V5_GROK_RELAY_PREFIX, handleV5GrokRelayLocal } from '../v5GrokRelay.js'
@@ -69,6 +70,20 @@ describe('relay trace registry', () => {
       assert.equal(codexRelayTrace(bad), undefined, String(bad).slice(0, 20))
     }
     assert.equal(codexRelayTrace(['a', 'b']), undefined)
+  })
+
+  it('Codex: withCodexTurnTrace covers turn/start, adopts its id, and ends the pending binding even when it throws', async () => {
+    const m = meta({ thread_id: 'th-w', turn_id: 'u-w' })
+    const res = await withCodexTurnTrace('th-w', T1, async () => {
+      assert.equal(codexRelayTrace(m), T1, 'pending')
+      return { turn: { id: 'u-w' } }
+    })
+    assert.deepEqual(res, { turn: { id: 'u-w' } })
+    assert.equal(codexRelayTrace(m), T1, 'by turn id')
+    assert.equal(codexRelayTrace(meta({ thread_id: 'th-w', turn_id: 'u-later' })), undefined, 'pending ended')
+    await assert.rejects(withCodexTurnTrace('th-f', T2, async () => { throw new Error('rejected') }), /rejected/)
+    assert.equal(codexRelayTrace(meta({ thread_id: 'th-f', turn_id: 'u-f' })), undefined)
+    assert.deepEqual(await withCodexTurnTrace(null, T1, async () => 'x'), 'x')
   })
 
   it('Codex: the recent-turn map is bounded', () => {

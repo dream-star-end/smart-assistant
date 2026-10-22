@@ -77,6 +77,26 @@ export function adoptCodexTurnTrace(threadId: string, turnId: string): void {
   }
 }
 
+/**
+ * Wraps Codex's `turn/start` call: the thread's pending trace covers requests sent before it
+ * answers, its returned `turn.id` is then recorded, and the pending binding ends either way.
+ */
+export async function withCodexTurnTrace<T>(
+  threadId: string | null,
+  traceId: string | undefined,
+  turnStart: () => Promise<T>,
+): Promise<T> {
+  const release = threadId ? bindCodexThreadTrace(threadId, traceId) : () => {}
+  try {
+    const res = await turnStart()
+    const turnId = (res as { turn?: { id?: unknown } } | undefined)?.turn?.id
+    if (threadId && typeof turnId === 'string' && turnId) adoptCodexTurnTrace(threadId, turnId)
+    return res
+  } finally {
+    release()
+  }
+}
+
 /** The trace for a Codex relay request, from its own `x-codex-turn-metadata` header value. */
 export function codexRelayTrace(turnMetadata: string | string[] | undefined): string | undefined {
   if (typeof turnMetadata !== 'string' || turnMetadata.length > MAX_TURN_METADATA_CHARS) return undefined
