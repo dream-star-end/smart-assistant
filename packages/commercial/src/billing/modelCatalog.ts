@@ -32,7 +32,6 @@ import { Client } from "pg";
 import { DEFAULT_CCB_SUBAGENT_MODEL, DEFAULT_SECONDARY_UTILITY_MODEL } from "@openclaude/gateway";
 import {
   isBoxGptWebModel,
-  isBoxGptWebOwnerUid,
   PLATFORM_REASONING_EFFORTS,
   type PlatformReasoningEffort,
 } from "@openclaude/protocol";
@@ -41,7 +40,7 @@ import { query, type QueryRunner } from "../db/queries.js";
 import { getPool } from "../db/index.js";
 import { projectContextWindowForRole } from "./modelRolePolicy.js";
 import type { ModelPricing, ModelVisibility } from "./pricing.js";
-import { isCursorCredentialMember, parseCursorCredentialUids } from "../cursor/access.js";
+import { isBoxGptWebAllowedUser, isCursorCredentialMember, parseCursorCredentialUids } from "../cursor/access.js";
 import { meetsMinPlan } from "./planEntitlement.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -600,7 +599,7 @@ export class ModelCatalogSnapshot {
     const schemaOk =
       entry !== undefined && entry.capabilitySchemaVersion <= CAPABILITY_SCHEMA_VERSION;
     const routable = entry !== undefined && schemaOk && pricing !== undefined;
-    const boxGptWebOwnerOk = !isBoxGptWebModel(canonical) || isBoxGptWebOwnerUid(scope.uid);
+    const boxGptWebOwnerOk = !isBoxGptWebModel(canonical) || isBoxGptWebAllowedUser(scope.uid);
     const cursorOk =
       (entry?.engine !== "cursor" || isCursorCredentialMember(scope.uid)) && boxGptWebOwnerOk;
     // `isCursorCredentialMember(0, "all")` is false (uid 0 is not a valid

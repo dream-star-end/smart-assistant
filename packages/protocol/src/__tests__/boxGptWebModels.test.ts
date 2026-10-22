@@ -13,6 +13,8 @@ import {
   BOX_GPT_WEB_MODEL_IDS,
   BOX_GPT_WEB_OWNER_UID,
   BOX_GPT_WEB_OWNER_UID_STR,
+  isBoxGptWebAllowedUid,
+  parseBoxGptWebAllowedUids,
   boxClaudeRunner,
   boxGptWebModelById,
   cursorFamilyDefaultEffort,
@@ -85,5 +87,33 @@ describe('BOX_GPT_WEB_MODELS (OCV5-551 L0 protocol)', () => {
     assert.match(BOX_GPT_WEB_CATALOG_SQL_PLAN, /INSERT INTO model_catalog/)
     assert.match(BOX_GPT_WEB_CATALOG_SQL_PLAN, /'box-gpt-6-astra-pro'/)
     assert.match(BOX_GPT_WEB_CATALOG_SQL_PLAN, /'staged'/)
+  })
+})
+
+describe('box-gpt-6-astra-pro allowlist (OCV5-575)', () => {
+  it('defaults to the personal owner 3 when the env is unset', () => {
+    assert.deepEqual([...parseBoxGptWebAllowedUids(undefined)], ['3'])
+    assert.equal(isBoxGptWebAllowedUid(3, undefined), true)
+    assert.equal(isBoxGptWebAllowedUid('3', undefined), true)
+    assert.equal(isBoxGptWebAllowedUid(3n, undefined), true)
+    assert.equal(isBoxGptWebAllowedUid(4, undefined), false)
+  })
+
+  it('commercial lists uid 1 and uid 4 only', () => {
+    for (const uid of [1, '1', 1n, 4, ' 4 ', 4n]) {
+      assert.equal(isBoxGptWebAllowedUid(uid, '1,4'), true, String(uid))
+    }
+    for (const uid of [2, 3, 35, 247, 267, 765, 0, -1, '', '1a', null, undefined]) {
+      assert.equal(isBoxGptWebAllowedUid(uid, '1,4'), false, String(uid))
+    }
+  })
+
+  it('a set but empty, wildcard or malformed list allows nobody', () => {
+    for (const raw of ['', ' ', '*', 'all', '1,evil', '1;4', '01', '1,-4', '1,4.0']) {
+      assert.equal(parseBoxGptWebAllowedUids(raw).size, 0, JSON.stringify(raw))
+      assert.equal(isBoxGptWebAllowedUid(1, raw), false, JSON.stringify(raw))
+      assert.equal(isBoxGptWebAllowedUid(3, raw), false, JSON.stringify(raw))
+    }
+    assert.deepEqual([...parseBoxGptWebAllowedUids(' 1 , 4 ,')], ['1', '4'])
   })
 })

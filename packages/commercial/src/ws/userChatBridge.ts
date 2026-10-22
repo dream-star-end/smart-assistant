@@ -45,7 +45,7 @@ import { snapshotAdmissionRequest } from "../dispatch/admissionRestartRecovery.j
 import { randomUUID, randomBytes } from "node:crypto";
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { Pool } from "pg";
-import { isCursorCredentialMember } from "../cursor/access.js";
+import { isBoxGptWebAllowedUser, isCursorCredentialMember } from "../cursor/access.js";
 
 import { verifyAccess, JwtError, type AccessClaims } from "../auth/jwt.js";
 import { ConnectionRegistry, type Conn } from "./connections.js";
@@ -172,7 +172,6 @@ import {
   type SessionWorkspaceMode,
   BOX_GPT_WEB_BUSY_MESSAGE,
   isBoxGptWebModel,
-  isBoxGptWebOwnerUid,
   type DurableCodexBilling,
 } from "@openclaude/protocol";
 import { mintDispatchEnvelope } from "../dispatch/dispatchSigner.js";
@@ -6230,9 +6229,9 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'Cursor is not enabled for this account', cursorTurnIdentity);
               return;
             }
-            if (isBoxGptWebModel(modelCapture) && !isBoxGptWebOwnerUid(uid)) {
+            if (isBoxGptWebModel(modelCapture) && !isBoxGptWebAllowedUser(uid)) {
               rejectPromptQueueDispatch('UNAUTHORIZED_MODEL');
-              sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'gpt-6-astra-pro is restricted to owner account user_id=3', cursorTurnIdentity);
+              sendErrorFrame(userWs, 'UNAUTHORIZED_MODEL', 'gpt-6-astra-pro is not enabled for this account', cursorTurnIdentity);
               return;
             }
             // The local supervisor mounts the owner credential only on this
@@ -6340,9 +6339,12 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
             }
             const requestId = dispatchRecord ? dispatchRecord.billingRequestId : ensureRequestIdServerSide();
-            let cursorSpendable: bigint;
+            // box-gpt-6-astra-pro is never billed (no audit row, so no settle; OCV5-575): an allowed
+            // account with a zero balance may still use it.
+            const cursorBilled = !isBoxGptWebModel(modelCapture);
+            let cursorSpendable: bigint | null = null;
             try {
-              cursorSpendable = await readTotalSpendableBalance(uid);
+              if (cursorBilled) cursorSpendable = await readTotalSpendableBalance(uid);
             } catch (err) {
               logCapture?.error('user-chat-bridge: cursor spendable lookup failed', { err });
               rejectPromptQueueDispatch('CURSOR_UNAVAILABLE');
@@ -6352,7 +6354,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               }
               return;
             }
-            if (cursorSpendable <= 0n) {
+            if (cursorSpendable !== null && cursorSpendable <= 0n) {
               rejectPromptQueueDispatch('ERR_INSUFFICIENT_CREDITS');
               failDispatchPreForward(dispatchRecord, 'insufficient_credits');
               if (!cleaned && userWs.readyState === WebSocket.OPEN) {
@@ -6386,7 +6388,7 @@ export function createUserChatBridge(deps: UserChatBridgeDeps): UserChatBridgeHa
               if (sealed === null) { failDispatchPreForward(dispatchRecord, 'cursor_authority_seal_rejected'); return; }
               authorityFields = sealed;
             }
-            const forwarded = { ...enriched, requestId, traceId: traceCapture, _creditBudget: cursorSpendable.toString(), ...authorityFields, ...dispatchAuthorityField(dispatchRecord) };
+            const forwarded = { ...enriched, requestId, traceId: traceCapture, _creditBudget: cursorSpendable === null ? undefined : cursorSpendable.toString(), ...authorityFields, ...dispatchAuthorityField(dispatchRecord) };
             const encoded = JSON.stringify(forwarded); const len = Buffer.byteLength(encoded);
             if (len > maxFrameBytes) { failDispatchPreForward(dispatchRecord, 'ERR_FRAME_TOO_BIG'); rejectPromptQueueDispatch('ERR_FRAME_TOO_BIG'); return; }
             await forwardPreparedFrame(Buffer.from(encoded, 'utf8'), false, len, dispatchRecord);

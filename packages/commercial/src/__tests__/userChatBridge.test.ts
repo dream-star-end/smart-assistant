@@ -3485,7 +3485,7 @@ describe("Cursor external authority regression tripwire", () => {
     assert.match(cursorBranch, /INSERT INTO cursor_external_usage_audit/);
     assert.match(cursorBranch, /readTotalSpendableBalance\(uid\)/);
     assert.match(cursorBranch, /ERR_INSUFFICIENT_CREDITS/);
-    assert.match(cursorBranch, /_creditBudget: cursorSpendable\.toString\(\)/);
+    assert.match(cursorBranch, /_creditBudget: cursorSpendable === null \? undefined : cursorSpendable\.toString\(\)/);
     assert.match(cursorBranch, /peerCapture, modelCapture/);
     assert.match(cursorBranch, /cursorTurnIdentity/);
     assert.match(
@@ -3616,7 +3616,7 @@ describe("Cursor external authority regression tripwire", () => {
     assert.match(source, /if \(hasClientCreditBudget\) \{\s*delete sanitizedParsed\._creditBudget;/);
 
     // Cursor / Grok / Codex paths keep their existing injection.
-    assert.match(source, /_creditBudget: cursorSpendable\.toString\(\)/);
+    assert.match(source, /_creditBudget: cursorSpendable === null \? undefined : cursorSpendable\.toString\(\)/);
     assert.ok((source.match(/_creditBudget:/g) ?? []).length >= 4, "cursor, grok/codex, zcode and ccb must all inject _creditBudget");
   });
 

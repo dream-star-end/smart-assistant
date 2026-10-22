@@ -19,7 +19,8 @@
  */
 
 import { Client } from "pg";
-import { COST_INDEX_BASELINE_MODEL_ID, costXVsBaseline, isBoxGptWebModel, isBoxGptWebOwnerUid, modelReasoningPolicy, STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
+import { COST_INDEX_BASELINE_MODEL_ID, costXVsBaseline, isBoxGptWebModel, modelReasoningPolicy, STATIC_KEY_PROVIDERS } from "@openclaude/protocol";
+import { isBoxGptWebAllowedUser } from "../cursor/access.js";
 import { query } from "../db/queries.js";
 import { loadConfig } from "../config.js";
 import { CATALOG_CHANNEL } from "./modelCatalog.js";
@@ -426,7 +427,7 @@ export class PricingCache {
       .filter((p) => {
         if (!p.enabled) return false;
         if (isBoxGptWebModel(p.model_id)) {
-          if (!isBoxGptWebOwnerUid(args.uid)) return false;
+          if (!isBoxGptWebAllowedUser(args.uid)) return false;
           if (!args.grantedModelIds.has(p.model_id)) return false;
         }
         if (args.deniedModelIds?.has(p.model_id)) return false;

@@ -80,7 +80,7 @@ import { appendCoreMemoryEmbeddingEnv } from "./coreMemoryEmbeddingEnv.js";
 import { isPromptQueueV1Enabled } from "../http/internalPromptQueue.js";
 import { skillShadowContainerEnv } from "../http/internalSkillShadow.js";
 import { zeroBuffer } from "../crypto/keys.js";
-import { isCursorCredentialMember } from "../cursor/access.js";
+import { boxGptWebContainerEnv, isCursorCredentialMember } from "../cursor/access.js";
 import {
   removeCodexContainerAuthDir,
   writeCodexContainerAuthFile,
@@ -2849,6 +2849,9 @@ export async function provisionV3Container(
     // envProbe 把它渲染进 ENV prompt slot(user_tz=…),让模型不再把子进程 `date` 当用户
     // 时间。只透传合法 IANA 名;缺省/非法不注入,容器侧自行回落 Asia/Shanghai。
     env.push(...resolveUserTimeZoneEnv(process.env.OC_USER_TZ));
+    // OCV5-575: the container gateway launches the Box ChatGPT Web runner only when the master marks
+    // this container's uid as allowed (OC_BOX_GPT_WEB_ALLOWED_UIDS). Always written, 1 or 0.
+    env.push(boxGptWebContainerEnv(uid));
     const promptQueueEnabled = getRuntimeChannel() === "v5" && isPromptQueueV1Enabled();
     if (promptQueueEnabled) {
       // Both halves of the container-side strict gate are server-authored.
