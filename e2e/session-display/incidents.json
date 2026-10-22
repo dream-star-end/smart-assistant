@@ -7802,7 +7802,8 @@
         "a4512488",
         "ac0308a8",
         "a3d28aad",
-        "4fb1055a"
+        "4fb1055a",
+        "1ffeee31"
       ],
       "regressions": [
         {
@@ -7879,6 +7880,16 @@
           "layer": "unit",
           "path": "packages/gateway/src/__tests__/multiDayResumeRetention.test.ts",
           "assertion": "CCB keeps its transcripts longer than the resume map keeps their ids"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/antigravityModelCooldown.test.ts",
+          "assertion": "invalid_grant on the first account admits the turn on the next one"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/__tests__/antigravityModelCooldown.test.ts",
+          "assertion": "every grant dead: AUTH_UNAVAILABLE, at most three accounts tried"
         },
         {
           "layer": "deploy-gate",
