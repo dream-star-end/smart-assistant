@@ -166,7 +166,9 @@ class E2E(unittest.TestCase):
         cls.home = tempfile.mkdtemp(); os.chmod(cls.home, 0o700)
         with open(os.path.join(cls.home, "token"), "w") as f: f.write(mm.TOKEN)
         cls.argvlog = os.path.join(cls.home, "argv.log")
-        env = dict(os.environ, FAKE_ARGV_LOG=cls.argvlog)
+        # Own temp dir: other classes' bridges share /tmp, and test_10 must see only this one's jobs.
+        cls.tmp = os.path.join(cls.home, "tmp"); os.mkdir(cls.tmp, 0o700)
+        env = dict(os.environ, FAKE_ARGV_LOG=cls.argvlog, TMPDIR=cls.tmp)
         open(cls.argvlog, "w").close()
         cls.proc = subprocess.Popen([sys.executable, "-I", BRIDGE, "--state-dir", cls.home, "--cli", FAKE, "run", "--server", cls.url],
                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
@@ -280,8 +282,8 @@ class E2E(unittest.TestCase):
     def test_10_tempdirs_cleaned(self):
         import glob
         # the result is posted before the job dir is removed, so give cleanup a moment
-        for _ in range(30):
-            left = glob.glob(os.path.join(tempfile.gettempdir(), "muse-job-*"))
+        for _ in range(100):
+            left = glob.glob(os.path.join(self.tmp, "muse-job-*"))
             if not left: break
             time.sleep(0.1)
         self.assertEqual(left, [])

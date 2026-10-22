@@ -37,7 +37,8 @@ export interface MuseBilling {
   ensureBalance(userId: string, required: bigint): Promise<void>
   /** Marks the running row succeeded and charges it, atomically. Throws when the row is no longer running. */
   settle(input: MuseSettleInput): Promise<MuseSettleResult>
-  /** After settle threw: whether that transaction committed anyway (a lost COMMIT reply). */
+  /** After settle threw: whether that transaction committed anyway (a lost COMMIT reply). Waits
+   * (row lock, at most 30 s) for a settle still in flight; throws when it cannot tell. */
   outcome(jobId: string): Promise<{ charged: boolean; debitedCredits: bigint | null }>
 }
 
@@ -71,6 +72,8 @@ export function createMuseBilling(
       const client = await pool.connect()
       try {
         await client.query('BEGIN')
+        // Bounded, so a job can only be "being charged" for so long (the hub and oc-muse wait for it).
+        await client.query("SET LOCAL statement_timeout = '60s'")
         const snapshot = {
           provider: 'muse',
           kind: input.kind,
@@ -127,16 +130,34 @@ export function createMuseBilling(
     },
 
     async outcome(jobId) {
-      const r = await pool.query<{ status: string; cost: string | null; debited: string | null }>(
-        `SELECT status, cost_credits::text AS cost, debited_credits::text AS debited
-           FROM muse_media_jobs WHERE id = $1`,
-        [jobId],
-      )
-      const row = r.rows[0]
-      const charged = row?.status === 'succeeded' && row.cost !== null
-      return {
-        charged,
-        debitedCredits: charged && row!.debited !== null ? BigInt(row!.debited) : null,
+      // Lock the row: a settle transaction that is still finishing (its COMMIT reply lost) holds
+      // it until it commits or rolls back, so what this reads afterwards is final. A plain read
+      // could see `running` and the commit land a moment later.
+      const client = await pool.connect()
+      try {
+        await client.query('BEGIN')
+        await client.query("SET LOCAL lock_timeout = '30s'")
+        const r = await client.query<{
+          status: string
+          cost: string | null
+          debited: string | null
+        }>(
+          `SELECT status, cost_credits::text AS cost, debited_credits::text AS debited
+             FROM muse_media_jobs WHERE id = $1 FOR UPDATE`,
+          [jobId],
+        )
+        await client.query('COMMIT')
+        const row = r.rows[0]
+        const charged = row?.status === 'succeeded' && row.cost !== null
+        return {
+          charged,
+          debitedCredits: charged && row!.debited !== null ? BigInt(row!.debited) : null,
+        }
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {})
+        throw err
+      } finally {
+        client.release()
       }
     },
   }

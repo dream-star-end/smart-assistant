@@ -400,4 +400,23 @@ describe('muse end to end, commercial (2 slots, queue, credits)', { timeout: 240
       settleDelayMs = 0
     }
   })
+
+  it('oc-muse fetch downloads an earlier job again by its id', async () => {
+    const env = {
+      PATH: process.env.PATH,
+      HOME: work,
+      OPENCLAUDE_V3_MASTER_BASE_URL: base,
+      OPENCLAUDE_V3_CONTAINER_TOKEN: `oc-v3.42.${SECRET}`,
+      OC_MUSE_OUT_DIR: join(work, 'refetch'),
+    }
+    const first = await run('python3', ['-I', OC_MUSE, 'image', 'ok', '--json'], env)
+    assert.equal(first.code, 0, first.stderr)
+    const { job_id: jobId } = JSON.parse(first.stdout)
+    const again = await run('python3', ['-I', OC_MUSE, 'fetch', jobId], env)
+    assert.equal(again.code, 0, again.stderr)
+    assert.ok(statSync(again.stdout.trim().split('\n')[0]!).size > 0)
+    const bad = await run('python3', ['-I', OC_MUSE, 'fetch', '../../etc'], env)
+    assert.equal(bad.code, 1)
+    assert.equal(JSON.parse(bad.stderr.trim()).code, 'MUSE_INVALID_INPUT')
+  })
 })

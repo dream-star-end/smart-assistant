@@ -309,6 +309,7 @@ const OC_SURFACES: Record<string, Record<string, Probe>> = {
   'oc-muse': {
     image: scriptProbe('oc-muse.py', ['image', '--help'], { code: 0, stdout: /--format/ }),
     video: scriptProbe('oc-muse.py', ['video', '--help'], { code: 0, stdout: /--resume/ }),
+    fetch: scriptProbe('oc-muse.py', ['fetch', '--help'], { code: 0, stdout: /job_id/ }),
   },
   'oc-h3': {
     generate: scriptProbe('oc-h3.py', ['generate', '--help'], {

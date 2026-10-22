@@ -234,4 +234,30 @@ describe('Muse billing (OCV5-574)', () => {
     assert.equal(rec?.snapshotId, 'snap:1')
     assert.equal(await store.findJob(String(Number(uid) + 999), video), null)
   })
+
+  test('outcome waits for a settle still in flight and reads its final result', async (t) => {
+    if (!pgAvailable) return t.skip('no test database')
+    const billing = createMuseBilling(getPool(), PRICES)
+    const uid = await user(1000n)
+    const id = await job(uid, 'running', 'image')
+    // Stand-in for a settle whose COMMIT reply was lost: the row is locked and not yet committed.
+    const inFlight = await getPool().connect()
+    try {
+      await inFlight.query('BEGIN')
+      await inFlight.query(
+        "UPDATE muse_media_jobs SET status = 'succeeded', cost_credits = 10, debited_credits = 10 WHERE id = $1",
+        [id],
+      )
+      const pending = billing.outcome(id)
+      const early = await Promise.race([
+        pending,
+        new Promise((r) => setTimeout(() => r('waiting'), 300)),
+      ])
+      assert.equal(early, 'waiting', 'a plain read would have said running')
+      await inFlight.query('COMMIT')
+      assert.deepEqual(await pending, { charged: true, debitedCredits: 10n })
+    } finally {
+      inFlight.release()
+    }
+  })
 })

@@ -16,6 +16,7 @@ Only enabled accounts can use it (others get MUSE_NOT_ENABLED).
 While the job waits for a free slot, stderr shows `# Muse queue: position N of M`; tell the user.
 Where Muse is billed, stderr ends a success with `# charged: N credits` (nothing is charged on failure).
 --timeout counts from when the job starts running; the server bounds the time spent in the queue.
+`oc-muse fetch <job_id>` downloads an earlier job's files (for example after a MUSE_TIMEOUT).
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import signal
 import sys
 import time
@@ -49,9 +51,10 @@ MAX_SOURCE_BYTES = 10 * 1024 * 1024
 MAX_SOURCES = 4
 # Safety net only: the server ends a queued job itself (MUSE_BUSY) well before this.
 QUEUE_WAIT_MAX_SEC = 3700
-# A timeout's cancel can be refused while the result is being recorded and charged; wait this
-# much longer for it instead of leaving a charged result behind.
-SETTLE_GRACE_SEC = 180
+# A timeout's cancel is refused while the result is being recorded and charged: keep waiting for
+# it (checking again every this many seconds) instead of leaving a charged result behind.
+SETTLE_RECHECK_SEC = 60
+JOB_ID_RE = re.compile(r"^mj_[0-9a-f-]{36}$")
 EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "video/mp4": "mp4", "video/webm": "webm"}
 
 
@@ -183,8 +186,9 @@ def run(kind: str, ns: argparse.Namespace) -> int:
     signal.signal(signal.SIGTERM, cancel)
     # --timeout runs from when the job leaves the queue; the queue itself is bounded by the server.
     queue_until = time.monotonic() + QUEUE_WAIT_MAX_SEC
+    # Safety net only: past this even a job whose cancel keeps being refused is left to `fetch`.
+    give_up = queue_until + ns.timeout
     deadline: float | None = None
-    graced = False
     last_position = None
     view: dict = {}
     while True:
@@ -197,11 +201,17 @@ def run(kind: str, ns: argparse.Namespace) -> int:
             if left.get("status") == "succeeded":
                 view = left
                 break
-            if left.get("status") == "running" and not graced:
+            if left.get("status") == "running" and now < give_up:
                 # Not cancelled: the job is finishing (its result is being recorded). Wait for it.
-                graced = True
-                deadline = now + SETTLE_GRACE_SEC
+                deadline = now + SETTLE_RECHECK_SEC
                 continue
+            if left.get("status") == "running":
+                raise MuseFailure(
+                    "MUSE_TIMEOUT",
+                    f"no result yet; it may still finish — run `oc-muse fetch {job_id}` later",
+                    True,
+                    job_id=job_id,
+                )
             raise MuseFailure("MUSE_TIMEOUT", f"no result within {ns.timeout} s", True, job_id=job_id)
         # First look right away (a queued job reports its place at once), then long-poll.
         wait = 25 if view else 0
@@ -218,6 +228,11 @@ def run(kind: str, ns: argparse.Namespace) -> int:
         elif deadline is None:
             deadline = now + ns.timeout
 
+    return deliver(job_id, view, ns.json)
+
+
+def deliver(job_id: str, view: dict, as_json: bool) -> int:
+    """Download a finished job's files and print them (or raise its failure)."""
     if view.get("status") != "succeeded":
         err = view.get("error") or {}
         raise MuseFailure(
@@ -231,7 +246,7 @@ def run(kind: str, ns: argparse.Namespace) -> int:
     paths = download(job_id, view.get("files") or [], out_dir)
     if view.get("charged_credits") is not None:
         print(f"# charged: {view['charged_credits']} credits", file=sys.stderr, flush=True)
-    if ns.json:
+    if as_json:
         print(json.dumps({
             "ok": True,
             "job_id": job_id,
@@ -274,7 +289,23 @@ def main(argv: list[str] | None = None) -> int:
     common(video)
     video.add_argument("--aspect-ratio", dest="aspect_ratio", choices=("4:5", "7:12", "9:16"))
 
+    fetch = subparsers.add_parser("fetch", help="get the files of an earlier job by its job_id")
+    fetch.add_argument("job_id")
+    fetch.add_argument("--json", action="store_true", help="print one JSON line instead of paths")
+
     ns = parser.parse_args(argv)
+    if ns.command == "fetch":
+        try:
+            if not JOB_ID_RE.match(ns.job_id):
+                raise MuseFailure("MUSE_INVALID_INPUT", "job_id looks like mj_<uuid>")
+            view = call("GET", f"/jobs/{ns.job_id}?wait=25", timeout=60)
+            if view.get("status") in ("queued", "running"):
+                raise MuseFailure("MUSE_PENDING", "the job has not finished yet; try again shortly", True,
+                                  job_id=ns.job_id)
+            return deliver(ns.job_id, view, ns.json)
+        except MuseFailure as exc:
+            print(json.dumps(exc.payload, ensure_ascii=False), file=sys.stderr)
+            return 1
     if ns.timeout is None:
         ns.timeout = 600 if ns.command == "video" else 360
     try:
