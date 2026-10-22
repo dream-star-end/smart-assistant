@@ -7886,6 +7886,55 @@
           "assertion": "[ocv5-556-resume-agycred] PASS — a recovery give-up card keeps the native resume, a real gap injects only the missing rows, the Antigravity CLI token file outlives the turn hard limit, and its expiry error is a platform credential error with no automatic recovery"
         }
       ]
+    },
+    {
+      "id": "INC-20261022-BOX-READ-PDF-DOCUMENT",
+      "occurredAt": "2026-10-22",
+      "severity": "P1",
+      "symptom": "个人版 uid 3 会话 webmvj0mdpfyt9q5g（box-claude-opus-5-5，2026-10-22 12:03 CST，#75f47e31）：模型用 Read 读用户上传的 PDF。Claude Code 对 PDF 回一行 tool_result 并在结果后追加 isMeta document 块，下一次请求结尾为 user:tool_result+document；egress 先拒绝该 document 上的缓存标记（503 BOX_REPLAY_UNAVAILABLE），再以 409 BOX_TOOL_RESULT_REQUIRES_LIVE_INVOCATION 拒绝。每次自动恢复多拼一条「继续」并在一秒内同样失败；CLI result 事件的会话累计 modelUsage（含 maxOutputTokens）被当作进展，OCV5-322 的三次短预算从未生效，50 秒内恢复 9 次后显示「已达到自动恢复次数上限」，任务未完成。",
+      "rootFixCommit": "71b0514d",
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-571-read-pdf-document] PASS — a PDF Read result with its document block runs fresh with the PDF inside its result, never 409"
+        },
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-571-empty-recovery-cli-result] PASS — an empty recovery whose CLI result event repeats the session usage keeps the short budget of three"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxReadResultShapes.test.ts",
+          "assertion": "OCV5-571 a PDF Read result with its document block runs fresh, never 409"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxReadResultShapes.test.ts",
+          "assertion": "OCV5-571 the document joins its own Read result in the staged history"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxReadResultShapes.test.ts",
+          "assertion": "OCV5-571 every other Read result shape continues"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/commercial/src/http/proxy/boxReadResultShapes.test.ts",
+          "assertion": "OCV5-571 a malformed document still fails closed"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/emptyRecoveryBudget.test.ts",
+          "assertion": "OCV5-571 the CLI result event with session-wide modelUsage is not progress of this recovery"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/protocol/src/__tests__/emptyRecoveryBudget.test.ts",
+          "assertion": "OCV5-571 tokens this recovery really spent still keep the full budget"
+        }
+      ]
     }
   ]
 }
