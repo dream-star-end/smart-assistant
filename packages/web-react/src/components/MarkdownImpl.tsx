@@ -431,6 +431,17 @@ export default function MarkdownImpl({
             const label = /language-(\S+)/.exec(className || "")?.[1];
             const lang = label?.toLowerCase();
             const isBlock = className?.includes("language-") || String(children).includes("\n");
+            // 经验分享(tutorialImage)是用户投稿:富块(ui 画廊/媒体、options、html 预览、mermaid、chart)
+            // 都可能加载外部资源,一律按普通代码块显示,只有 tutorial-blob 图片会被加载。
+            if (isBlock && tutorialImage) {
+              return (
+                <CodeBlock language={label} live={liveRef.current} lineCount={countLines(children)}>
+                  <span className={className} {...props}>
+                    {children}
+                  </span>
+                </CodeBlock>
+              );
+            }
             if (isBlock) {
               // 富块:mermaid 流程图 / html 沙盒预览(取原文,绕开 highlight 的 span 包裹)。
               if (lang === "mermaid") return <MermaidBlock code={nodeText(children).replace(/\n$/, "")} />;
@@ -556,7 +567,12 @@ export default function MarkdownImpl({
       >
         {typeof children === "string"
           ? normalizeMathDelimiters(
-              iuiEnabled ? normalizeInlineUiFences(source) : uiFencesToMarkdown(source, !!live),
+              // 经验分享原样渲染:不把 ui 围栏改写成组件或 Markdown(下面的 code 渲染器按代码块显示)。
+              tutorialImage
+                ? source
+                : iuiEnabled
+                  ? normalizeInlineUiFences(source)
+                  : uiFencesToMarkdown(source, !!live),
             )
           : children}
       </ReactMarkdown>

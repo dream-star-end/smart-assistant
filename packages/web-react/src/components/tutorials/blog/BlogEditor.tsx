@@ -111,17 +111,26 @@ export function BlogEditor({
     };
   }, [draftKey]);
 
-  useEffect(
-    () => () => {
+  // 卸载后迟到的上传结果不再建 object URL(清理已经跑过,建了就泄漏)。
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
       for (const url of localUrls.values()) URL.revokeObjectURL(url);
-    },
-    [localUrls],
-  );
+      localUrls.clear();
+    };
+  }, [localUrls]);
 
+  // 改动先同步写进 draftRef 再 setState:一次拖进多张图时,下一张的占位插入 / 替换读到的是
+  // 上一张替换后的正文,而不是 React 还没渲染的旧值(Codex R1)。
   const update = (patch: Partial<BlogDraft>) => {
     dirtyRef.current = true;
-    setDraft((current) => ({ ...current, ...patch }));
+    const next = { ...draftRef.current, ...patch };
+    draftRef.current = next;
+    setDraft(next);
   };
+  const updateBody = (change: (body: string) => string) => update({ bodyMarkdown: change(draftRef.current.bodyMarkdown) });
 
   const currentEdit = (): TextEdit => {
     const el = textareaRef.current;
@@ -152,22 +161,33 @@ export function BlogEditor({
       return;
     }
     if (images.length > room) toast(`每篇最多 ${BLOG_IMAGE_MAX_PER_POST} 张图片，只插入前 ${room} 张`, "info");
-    for (const file of images.slice(0, room)) {
+    // 占位一次性插在光标处,之后只按 token 替换:逐张插入时光标位置来自还没渲染的旧 DOM 文本,
+    // 第二张会插进第一张的引用中间(Codex R1)。
+    const batch = images.slice(0, room).map((file) => {
       const id = `u${Math.random().toString(36).slice(2, 10)}`;
-      const token = uploadingToken(id, file.name || "图片");
-      applyEdit(insertBlock(currentEdit(), token));
-      setUploads((current) => [...current, { id, name: file.name || "图片", fromBytes: file.size, toBytes: null, percent: 10 }]);
+      return { file, id, token: uploadingToken(id, file.name || "图片") };
+    });
+    applyEdit(insertBlock(currentEdit(), batch.map((item) => item.token).join("\n\n")));
+    setUploads((current) => [
+      ...current,
+      ...batch.map(({ file, id }) => ({ id, name: file.name || "图片", fromBytes: file.size, toBytes: null, percent: 10 })),
+    ]);
+    for (const { file, id, token } of batch) {
       try {
         const compressed = await compressBlogImage(file);
         setUploads((current) =>
           current.map((u) => (u.id === id ? { ...u, toBytes: compressed.size, percent: 55 } : u)),
         );
         const uploaded = await api.uploadTutorialImage(auth, compressed);
+        if (!mountedRef.current) return;
+        const previous = localUrls.get(uploaded.sha256);
+        if (previous) URL.revokeObjectURL(previous);
         localUrls.set(uploaded.sha256, URL.createObjectURL(compressed));
         const ref = `![${imageAltFromName(file.name || "图片")}](tutorial-blob:${uploaded.sha256})`;
-        update({ bodyMarkdown: draftRef.current.bodyMarkdown.replace(token, ref) });
+        updateBody((body) => body.replace(token, ref));
       } catch (cause) {
-        update({ bodyMarkdown: draftRef.current.bodyMarkdown.replace(`${token}`, "").replace(/\n{3,}/g, "\n\n") });
+        if (!mountedRef.current) return;
+        updateBody((body) => body.replace(token, "").replace(/\n{3,}/g, "\n\n"));
         toast(cause instanceof BlogImageError ? cause.message : apiErrorMessage(cause, "图片上传失败"), "error");
       } finally {
         setUploads((current) => current.filter((u) => u.id !== id));
