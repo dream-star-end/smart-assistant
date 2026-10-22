@@ -25,6 +25,7 @@ import {
   extractTurnOutputArtifactRefs,
   extractTurnProgressFromMapping,
   extractUserTurnFromStdinFrame,
+  fetchConversationPayloadInPage,
   formatStreamJsonKeepalive,
   inspectAndHandleApprovalCardInPage,
   inspectExistingTurnInConversation,
@@ -37,6 +38,7 @@ import {
   profileDirFor,
   readProfileSingletonOwner,
   resetComposerDraftInPage,
+  resolveTurnCompletionDecision,
   resolveVisibleLocator,
   saveActiveTurnState,
   saveSessionConversationId,
@@ -1795,5 +1797,193 @@ rl.on('line', (line) => {
     assert.equal(textareaEl.dispatched, true)
     assert.equal(emptyProseMirrorEl.innerHTML, '<p><br class="ProseMirror-trailingBreak"></p>')
     assert.equal(emptyProseMirrorEl.dispatched, false)
+  })
+
+  it('prevents premature empty finalization after stream_handoff and caches /api/auth/session tokens across mapping polls', async () => {
+    // 1. When stream_handoff sets accDone=true with accFinalText="" and Stop button disappears,
+    // resolveTurnCompletionDecision must wait during the grace window instead of finalizing ""
+    const waitDecision = resolveTurnCompletionDecision({
+      accDone: true,
+      accFinalText: '',
+      rescued: null,
+      latestProg: { liveFinalText: '', finishedFinal: null },
+      emittedFinalText: '',
+      stopVisible: false,
+      activeThinkingVisible: false,
+      stopGoneSince: 1_000,
+      now: 10_000,
+      emptyDoneGraceMs: 45_000,
+    })
+    assert.equal(waitDecision.action, 'wait_grace')
+
+    // 2. When rescueFromDomOrMapping finds the finished reply (e.g. 8161-char TeX report), finalize immediately
+    const rescuedDecision = resolveTurnCompletionDecision({
+      accDone: true,
+      accFinalText: '',
+      rescued: {
+        text: '已完成完整技术方案 [atmospheric_phase_alignment.tex](sandbox:/workspace/scratch/out.tex)',
+        messageId: '71e55f98-6bd2-58aa-8870-8a170e11423d',
+        convId: '6ad97fc0-692c-83ec-8fea-7008ad6060c3',
+      },
+      latestProg: null,
+      emittedFinalText: '',
+      stopVisible: false,
+      activeThinkingVisible: false,
+      stopGoneSince: 1_000,
+      now: 2_000,
+    })
+    assert.equal(rescuedDecision.action, 'finalize')
+    assert.equal(rescuedDecision.source, 'rescue')
+    assert.equal(rescuedDecision.messageId, '71e55f98-6bd2-58aa-8870-8a170e11423d')
+
+    // 3. If liveFinalText is still growing (lastFinalTextGrowthAt within emptyDoneGraceMs or null),
+    // must return wait_grace even after stopGoneSince exceeds emptyDoneGraceMs (including adaptive shouldRescue)
+    const growingDecision = resolveTurnCompletionDecision({
+      accDone: false,
+      shouldRescue: true,
+      accFinalText: '',
+      rescued: null,
+      latestProg: {
+        liveFinalText: 'Still streaming in_progress text...',
+        finishedFinal: null,
+      },
+      emittedFinalText: '',
+      stopVisible: false,
+      activeThinkingVisible: false,
+      stopGoneSince: 1_000,
+      lastFinalTextGrowthAt: 100_000,
+      now: 110_000,
+      emptyDoneGraceMs: 45_000,
+    })
+    assert.equal(growingDecision.action, 'wait_grace')
+
+    // After BOTH stopGoneSince and lastFinalTextGrowthAt exceed the grace window, fall back to liveFinalText
+    const partialDecision = resolveTurnCompletionDecision({
+      accDone: true,
+      accFinalText: '',
+      rescued: null,
+      latestProg: {
+        liveFinalText: 'Partial buffered text with sandbox:/workspace/a.tex',
+        finishedFinal: null,
+      },
+      emittedFinalText: '',
+      stopVisible: false,
+      activeThinkingVisible: false,
+      stopGoneSince: 1_000,
+      lastFinalTextGrowthAt: 2_000,
+      now: 50_000,
+      emptyDoneGraceMs: 45_000,
+    })
+    assert.equal(partialDecision.action, 'finalize')
+    assert.equal(partialDecision.source, 'partial_fallback')
+    assert.match(partialDecision.text || '', /Partial buffered text/)
+
+    const errorEmptyDecision = resolveTurnCompletionDecision({
+      accDone: true,
+      accFinalText: '',
+      rescued: null,
+      latestProg: { liveFinalText: '', finishedFinal: null },
+      emittedFinalText: '',
+      stopVisible: false,
+      activeThinkingVisible: false,
+      stopGoneSince: 1_000,
+      now: 50_000,
+      emptyDoneGraceMs: 45_000,
+    })
+    assert.equal(errorEmptyDecision.action, 'error_empty')
+
+    // 4. extractAssistantFromMapping supports allowInProgress fallback for settled in_progress final node
+    const inProgressConv = {
+      current_node: 'node-final',
+      mapping: {
+        'node-user': {
+          id: 'node-user',
+          parent: null,
+          message: { author: { role: 'user' }, content: { content_type: 'text', parts: ['Q'] } },
+        },
+        'node-final': {
+          id: 'node-final',
+          parent: 'node-user',
+          message: {
+            id: 'msg-final',
+            author: { role: 'assistant' },
+            status: 'in_progress',
+            channel: 'final',
+            content: { content_type: 'text', parts: ['Final TeX plan'] },
+          },
+        },
+      },
+    }
+    assert.equal(extractAssistantFromMapping(inProgressConv), null)
+    const rescuedInProgress = extractAssistantFromMapping(inProgressConv, { allowInProgress: true })
+    assert.equal(rescuedInProgress?.text, 'Final TeX plan')
+    assert.equal(rescuedInProgress?.messageId, 'msg-final')
+
+    // 5. fetchConversationPayloadInPage caches /api/auth/session token and retries when /backend-api/conversation returns 404 conversation_inaccessible
+    let authCalls = 0
+    let convCalls = 0
+    const mockWin: Record<string, any> = {}
+    const fakePage = {
+      evaluate: async (fn: (arg: any) => Promise<any>, arg: any) => {
+        const prevWin = (globalThis as any).window
+        const prevLoc = (globalThis as any).location
+        const prevFetch = (globalThis as any).fetch
+        ;(globalThis as any).window = mockWin
+        ;(globalThis as any).location = { pathname: '/c/6ad97fc0-692c-83ec-8fea-7008ad6060c3' }
+        ;(globalThis as any).fetch = async (url: string, init?: any) => {
+          if (url === '/api/auth/session') {
+            authCalls += 1
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ accessToken: `tok-${authCalls}` }),
+            }
+          }
+          if (url.startsWith('/backend-api/conversation/')) {
+            convCalls += 1
+            const authHeader = init?.headers?.Authorization || ''
+            // Simulate first conversation call failing with 404 conversation_inaccessible when token is stale
+            if (convCalls === 1) {
+              return {
+                ok: false,
+                status: 404,
+                json: async () => ({ detail: { code: 'conversation_inaccessible' } }),
+              }
+            }
+            assert.equal(authHeader, `Bearer tok-${authCalls}`)
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ current_node: 'node-final', mapping: {} }),
+            }
+          }
+          throw new Error(`Unexpected fetch URL: ${url}`)
+        }
+        try {
+          return await fn(arg)
+        } finally {
+          ;(globalThis as any).window = prevWin
+          ;(globalThis as any).location = prevLoc
+          ;(globalThis as any).fetch = prevFetch
+        }
+      },
+    }
+
+    const firstFetch = await fetchConversationPayloadInPage(fakePage, null, {
+      retries: 2,
+      tokenTtlMs: 240_000,
+    })
+    assert.equal(firstFetch.conv?.current_node, 'node-final')
+    assert.equal(authCalls, 2) // 1st fetch + 1 refresh after 404
+    assert.equal(convCalls, 2)
+
+    // Subsequent poll reuses cached token without calling /api/auth/session again
+    const secondFetch = await fetchConversationPayloadInPage(fakePage, null, {
+      retries: 2,
+      tokenTtlMs: 240_000,
+    })
+    assert.equal(secondFetch.conv?.current_node, 'node-final')
+    assert.equal(authCalls, 2)
+    assert.equal(convCalls, 3)
   })
 })

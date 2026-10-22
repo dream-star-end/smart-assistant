@@ -7,6 +7,8 @@
  */
 
 import { spawn } from 'node:child_process'
+import crypto from 'node:crypto'
+import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
@@ -35,6 +37,7 @@ import {
   extractLiveProgressFromDomInPage,
   extractTurnOutputArtifactRefs,
   extractTurnProgressFromMapping,
+  fetchConversationPayloadInPage,
   formatStreamJsonAssistantMessage,
   formatStreamJsonContentBlockStop,
   formatStreamJsonControlResponse,
@@ -55,6 +58,7 @@ import {
   profileDirFor,
   readProfileSingletonOwner,
   resetComposerDraftInPage,
+  resolveTurnCompletionDecision,
   resolveVisibleLocator,
   saveActiveTurnState,
   saveSessionConversationId,
@@ -240,38 +244,6 @@ async function acquireSingleChatGptPage(browser) {
   return target
 }
 
-async function fetchConversationPayloadInPage(page, fallbackConvId = null) {
-  const fetched = await page
-    .evaluate(async (knownId) => {
-      const m = location.pathname.match(/\/c\/([a-z0-9_-]{8,128})/i)
-      const convId = m?.[1] || knownId || null
-      if (!convId) return { conv: null, convId: null }
-      try {
-        let token = null
-        try {
-          const sessRes = await fetch('/api/auth/session', { credentials: 'include' })
-          if (sessRes.ok) {
-            const sess = await sessRes.json()
-            token = sess?.accessToken || null
-          }
-        } catch {}
-        const headers = token ? { Authorization: `Bearer ${token}` } : {}
-        const r = await fetch(`/backend-api/conversation/${convId}`, {
-          credentials: 'include',
-          headers,
-        })
-        if (r.ok) {
-          const conv = await r.json()
-          return { conv, convId }
-        }
-      } catch {}
-      return { conv: null, convId }
-    }, fallbackConvId)
-    .catch(() => ({ conv: null, convId: fallbackConvId }))
-
-  return fetched
-}
-
 async function fetchConversationFromMappingInPage(
   page,
   fallbackConvId = null,
@@ -280,7 +252,9 @@ async function fetchConversationFromMappingInPage(
   const fetched = await fetchConversationPayloadInPage(page, fallbackConvId)
   if (fetched?.conv) {
     const currentNode = fetched.conv.current_node || null
-    const fromMap = extractAssistantFromMapping(fetched.conv, { baselineNodeId })
+    const fromMap = extractAssistantFromMapping(fetched.conv, {
+      baselineNodeId,
+    })
     if (fromMap?.text) {
       return {
         text: fromMap.text,
@@ -301,15 +275,40 @@ async function fetchConversationFromMappingInPage(
   return null
 }
 
-async function rescueFromDomOrMapping(page, fallbackConvId = null, { baselineNodeId = null } = {}) {
-  const direct = await fetchConversationFromMappingInPage(page, fallbackConvId, {
-    baselineNodeId,
-  })
-  if (direct?.text) return direct
+async function rescueFromDomOrMapping(
+  page,
+  fallbackConvId = null,
+  { baselineNodeId = null, allowReload = false } = {},
+) {
+  let latest = null
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const direct = await fetchConversationFromMappingInPage(page, fallbackConvId, {
+      baselineNodeId,
+    })
+    if (direct?.text) return direct
+    if (direct) latest = direct
+    if (attempt < 2) {
+      await new Promise((r) => setTimeout(r, 800))
+    }
+  }
+
+  if (!allowReload) {
+    return latest
+  }
 
   await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {})
-  await new Promise((r) => setTimeout(r, 1500))
-  return fetchConversationFromMappingInPage(page, fallbackConvId, { baselineNodeId })
+  await new Promise((r) => setTimeout(r, 2_000))
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const postReload = await fetchConversationFromMappingInPage(page, fallbackConvId, {
+      baselineNodeId,
+    })
+    if (postReload?.text) return postReload
+    if (postReload) latest = postReload
+    if (attempt === 0) {
+      await new Promise((r) => setTimeout(r, 1_000))
+    }
+  }
+  return latest
 }
 
 class DetachedTurnError extends Error {
@@ -373,20 +372,52 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
               typeof turn.deliveredText === 'string' ? turn.deliveredText : '',
           })
 
+          const turnAttachmentSignature = Array.isArray(turn.files)
+            ? turn.files
+                .map((filePath) => {
+                  const raw = String(filePath ?? '')
+                  try {
+                    const buf = fs.readFileSync(raw)
+                    const digest = crypto
+                      .createHash('sha256')
+                      .update(buf)
+                      .digest('hex')
+                      .slice(0, 16)
+                    return `${path.basename(raw)}:${buf.byteLength}:${digest}`
+                  } catch {
+                    return path.basename(raw)
+                  }
+                })
+                .join('|')
+            : ''
+
           const activeTurnState = loadActiveTurnState(profileDir, cfg.sessionId)
+          const sameAttachments =
+            Boolean(activeTurnState) &&
+            (activeTurnState.attachmentSignature ?? '') === turnAttachmentSignature
           const isSameTurn = Boolean(
             activeTurnState &&
+              sameAttachments &&
               activeTurnState.promptText === turn.text &&
               (turn.turnId ? activeTurnState.turnId === turn.turnId : !activeTurnState.completedAt),
           )
-          if (isSameTurn && activeTurnState) {
+          // Also allow recovering an already-completed ChatGPT reply when the user retries
+          // the exact same prompt (with identical attachment signature) in the same session
+          // after a prior empty/interrupted turn.
+          const canRecoverSamePromptRetry = Boolean(
+            activeTurnState &&
+              sameAttachments &&
+              activeTurnState.promptText === turn.text &&
+              !activeTurnState.completedWithText,
+          )
+          if ((isSameTurn || canRecoverSamePromptRetry) && activeTurnState) {
             // Only restore stepTextByKey (thinking commentary deduplication) from disk;
             // emittedFinalText MUST come only from gateway-acknowledged `turn.deliveredText`
             // so an unacknowledged stdout write lost on a broken pipe is never skipped on reconnect.
             streamer.restoreState({
               stepTextByKey: activeTurnState.stepTextByKey,
             })
-            if (typeof activeTurnState.accumulatedThinking === 'string') {
+            if (isSameTurn && typeof activeTurnState.accumulatedThinking === 'string') {
               accumulatedThinking = activeTurnState.accumulatedThinking
             }
           }
@@ -396,6 +427,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
             conversationId: activeTurnState?.conversationId || null,
             baselineNodeId: isSameTurn ? (activeTurnState?.baselineNodeId ?? null) : null,
             promptText: turn.text,
+            attachmentSignature: turnAttachmentSignature,
             startedAt:
               isSameTurn && Number.isFinite(activeTurnState?.startedAt)
                 ? activeTurnState.startedAt
@@ -502,10 +534,30 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
             await new Promise((r) => setTimeout(r, 300))
           }
 
-          const initialProbe = await probeSessionState(page, {
+          let initialProbe = await probeSessionState(page, {
             profileDir,
             display: cfg.display,
           })
+          // If a previous turn left the tab on a `/c/<id>` error banner ("Could not load this ChatGPT conversation"),
+          // recover by navigating back to the ChatGPT home page before failing closed.
+          if (!initialProbe.ok && initialProbe.code === 'DOM_DRIFT') {
+            await page
+              .goto(`${DEFAULT_CHATGPT_ORIGIN}/`, {
+                waitUntil: 'domcontentloaded',
+                timeout: 45_000,
+              })
+              .catch(() => {})
+            await page.evaluate(backendFetchTeeInitScript()).catch(() => {})
+            for (let i = 0; i < 20; i++) {
+              const probe = await probeSessionState(page, { profileDir, display: cfg.display })
+              if (probe.ok || probe.code === 'CF_CHALLENGE') break
+              await new Promise((r) => setTimeout(r, 300))
+            }
+            initialProbe = await probeSessionState(page, {
+              profileDir,
+              display: cfg.display,
+            })
+          }
           if (!initialProbe.ok) {
             throw new Error(initialProbe.message)
           }
@@ -515,21 +567,6 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
             sessionId: cfg.sessionId,
           })
           await abortIfRequested('after sync session')
-
-          if (syncState.navigated) {
-            for (let i = 0; i < 25; i++) {
-              const probe = await probeSessionState(page, { profileDir, display: cfg.display })
-              if (probe.ok || probe.code === 'CF_CHALLENGE') break
-              await new Promise((r) => setTimeout(r, 300))
-            }
-            const postNavProbe = await probeSessionState(page, {
-              profileDir,
-              display: cfg.display,
-            })
-            if (!postNavProbe.ok) {
-              throw new Error(postNavProbe.message)
-            }
-          }
 
           let baselineNodeId = null
           let resumedInProgress = false
@@ -544,7 +581,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
             latestConv = preConv?.conv || null
             baselineNodeId = preConv?.conv?.current_node || null
 
-            if (isSameTurn && preConv?.conv) {
+            if ((isSameTurn || canRecoverSamePromptRetry) && preConv?.conv) {
               const existing = inspectExistingTurnInConversation(preConv.conv, {
                 promptText: turn.text,
                 baselineNodeId: activeTurnState.baselineNodeId ?? null,
@@ -559,11 +596,39 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
                   baselineNodeId: existing.baselineNodeId,
                 })
               }
-              if (existing.status === 'in_progress') {
+              if (isSameTurn && existing.status === 'in_progress') {
                 resumedInProgress = true
                 baselineNodeId = existing.baselineNodeId
                 emitThinking('[Pro] 已重新连接正在运行的 ChatGPT Pro 回合，继续同步实时进度…\n')
               }
+            }
+          }
+
+          if (syncState.navigated && !resumedInProgress) {
+            for (let i = 0; i < 25; i++) {
+              const probe = await probeSessionState(page, { profileDir, display: cfg.display })
+              if (probe.ok || probe.code === 'CF_CHALLENGE') break
+              await new Promise((r) => setTimeout(r, 300))
+            }
+            let postNavProbe = await probeSessionState(page, {
+              profileDir,
+              display: cfg.display,
+            })
+            if (!postNavProbe.ok && postNavProbe.code === 'DOM_DRIFT') {
+              await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => {})
+              await page.evaluate(backendFetchTeeInitScript()).catch(() => {})
+              for (let i = 0; i < 20; i++) {
+                const probe = await probeSessionState(page, { profileDir, display: cfg.display })
+                if (probe.ok || probe.code === 'CF_CHALLENGE') break
+                await new Promise((r) => setTimeout(r, 300))
+              }
+              postNavProbe = await probeSessionState(page, {
+                profileDir,
+                display: cfg.display,
+              })
+            }
+            if (!postNavProbe.ok) {
+              throw new Error(postNavProbe.message)
             }
           }
 
@@ -648,8 +713,12 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
           let sawStopBtn = resumedInProgress
           let lastDomPollAt = 0
           let lastMappingPollAt = 0
+          let lastRescueAttemptAt = 0
           let lastDomActiveThinking = false
           let lastObservedNodeId = baselineNodeId
+          let lastObservedLiveFinalText = ''
+          let lastFinalTextGrowthAt = null
+          let latestProg = null
           let readCursor = 0
 
           while (true) {
@@ -774,8 +843,14 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
               if (payload?.conv) {
                 latestConv = payload.conv
                 const prog = extractTurnProgressFromMapping(payload.conv, { baselineNodeId })
+                latestProg = prog
                 if (prog.currentNode && prog.currentNode !== lastObservedNodeId) {
                   lastObservedNodeId = prog.currentNode
+                  lastActivityAt = now
+                }
+                if (prog.liveFinalText && prog.liveFinalText !== lastObservedLiveFinalText) {
+                  lastObservedLiveFinalText = prog.liveFinalText
+                  lastFinalTextGrowthAt = now
                   lastActivityAt = now
                 }
                 const { thinkingDeltas, textDeltas } = streamer.ingestMappingProgress(prog)
@@ -826,51 +901,62 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
             })
             currentDeadline = adaptive.deadline
 
-            if (adaptive.shouldRescue && hasValidMappingBaseline) {
-              const rescued = await rescueFromDomOrMapping(page, resolvedConvId, {
-                baselineNodeId,
+            if (!batch.stopBtn && !lastDomActiveThinking && (acc.done || adaptive.shouldRescue)) {
+              let rescued = null
+              if (!acc.finalText && hasValidMappingBaseline && now - lastRescueAttemptAt >= 2_500) {
+                lastRescueAttemptAt = now
+                const stopGoneElapsed = stopGoneSince !== null ? now - stopGoneSince : 0
+                rescued = await rescueFromDomOrMapping(page, resolvedConvId, {
+                  baselineNodeId,
+                  allowReload: stopGoneElapsed >= 15_000,
+                })
+                if (rescued?.conv) {
+                  latestConv = rescued.conv
+                  const rescuedProg = extractTurnProgressFromMapping(rescued.conv, {
+                    baselineNodeId,
+                  })
+                  latestProg = rescuedProg
+                  if (
+                    rescuedProg.liveFinalText &&
+                    rescuedProg.liveFinalText !== lastObservedLiveFinalText
+                  ) {
+                    lastObservedLiveFinalText = rescuedProg.liveFinalText
+                    lastFinalTextGrowthAt = now
+                    lastActivityAt = now
+                  }
+                }
+              }
+              const decision = resolveTurnCompletionDecision({
+                accDone: acc.done,
+                shouldRescue: adaptive.shouldRescue,
+                accFinalText: acc.finalText,
+                rescued,
+                latestProg,
+                emittedFinalText: streamer.emittedFinalText,
+                stopVisible: batch.stopBtn,
+                activeThinkingVisible: lastDomActiveThinking,
+                stopGoneSince,
+                lastFinalTextGrowthAt,
+                now,
               })
-              if (rescued?.text) {
-                const finalConvId = rescued.convId || resolvedConvId
+              if (decision.action === 'finalize' && decision.text) {
+                const finalConvId = decision.convId || resolvedConvId
                 if (finalConvId) {
                   saveSessionConversationId(profileDir, cfg.sessionId, finalConvId)
                 }
                 return finalizeTurnOutput({
-                  finalText: rescued.text,
-                  finalMessageId: rescued.messageId || acc.messageId || `msg_${Date.now()}`,
+                  finalText: decision.text,
+                  finalMessageId: decision.messageId || acc.messageId || `msg_${Date.now()}`,
                   convId: finalConvId,
-                  latestConv: rescued.conv || latestConv,
+                  latestConv: decision.conv || latestConv,
                   baselineNodeId,
                 })
               }
-            }
-
-            if (!batch.stopBtn && !lastDomActiveThinking && acc.done) {
-              if (!acc.finalText && hasValidMappingBaseline) {
-                const rescued = await rescueFromDomOrMapping(page, resolvedConvId, {
-                  baselineNodeId,
-                })
-                if (rescued?.text) {
-                  const finalConvId = rescued.convId || resolvedConvId
-                  if (finalConvId) {
-                    saveSessionConversationId(profileDir, cfg.sessionId, finalConvId)
-                  }
-                  return finalizeTurnOutput({
-                    finalText: rescued.text,
-                    finalMessageId: rescued.messageId || acc.messageId || `msg_${Date.now()}`,
-                    convId: finalConvId,
-                    latestConv: rescued.conv || latestConv,
-                    baselineNodeId,
-                  })
-                }
+              if (decision.action === 'error_empty') {
+                throw new Error(
+                  'BOX_GPT_WEB_EMPTY_RESPONSE: ChatGPT Pro turn finished without producing assistant text',
+                )
               }
-              return finalizeTurnOutput({
-                finalText: acc.finalText,
-                finalMessageId: acc.messageId || `msg_${Date.now()}`,
-                convId: resolvedConvId,
-                latestConv,
-                baselineNodeId,
-              })
             }
 
             if (adaptive.expired) {
@@ -1056,6 +1142,7 @@ async function main() {
             saveActiveTurnState(profileDir, cfg.sessionId, {
               ...out.turnState,
               completedAt: Date.now(),
+              completedWithText: Boolean(out.text && out.text.trim().length > 0),
             })
           } else {
             clearActiveTurnState(profileDir, cfg.sessionId)
