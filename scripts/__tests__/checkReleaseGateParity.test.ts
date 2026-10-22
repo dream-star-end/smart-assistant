@@ -74,7 +74,7 @@ test("red: the production web build left the train or CI", () => {
 test("exempt needs a written reason; a real reason is accepted", () => {
   const input = real();
   const gate = input.manifest.gates.find((g) => g.id === "callback-payload-hash")!;
-  delete gate.ci;
+  gate.ci = undefined;
   gate.ciExempt = "n/a";
   assert.deepEqual(kinds(check(input)), ["ci-missing"]);
   gate.ciExempt = "needs the host's commercial test mutex and a live loopback WS listener";
