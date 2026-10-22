@@ -22,10 +22,12 @@ import {
   decodeTutorialCursor,
   getOwnCommunityTutorial,
   getPublishedCommunityTutorial,
+  getTutorialModerationStats,
   listAdminCommunityTutorials,
   listOwnCommunityTutorials,
   listPendingCommunityTutorials,
   listPublishedCommunityTutorials,
+  listTutorialModerations,
   recordCommunityTutorialView,
   reviewCommunityTutorial,
   submitCommunityTutorial,
@@ -42,6 +44,7 @@ import {
   prepareTutorialImage,
   storeTutorialImageUpload,
 } from './tutorialImages.js'
+import { tutorialModerationMode } from './tutorialModerationQueue.js'
 import { parseTutorialSessionId, TutorialTimelineError } from './tutorialTimeline.js'
 
 export { TUTORIAL_SNAPSHOT_MAX_BODY_BYTES }
@@ -406,6 +409,39 @@ export async function handleAdminListCommunityTutorials(
     })
     res.setHeader('Cache-Control', 'private, no-store')
     sendJson(res, 200, { tutorials: page.items, nextCursor: page.nextCursor })
+  } catch (error) {
+    throw mapTutorialError(error)
+  }
+}
+
+/** 管理端页头：审核模式与今天的自动处理计数。 */
+export async function handleAdminTutorialModerationStats(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  await requireAdminVerifyDb(req, deps.jwtSecret)
+  const stats = await getTutorialModerationStats()
+  res.setHeader('Cache-Control', 'private, no-store')
+  sendJson(res, 200, {
+    mode: tutorialModerationMode(),
+    vision: process.env.OC_TUTORIAL_MODERATION_VISION?.trim().toLowerCase() !== 'off',
+    ...stats,
+  })
+}
+
+/** 「AI 审核记录」列表。 */
+export async function handleAdminListTutorialModerations(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: TutorialRouteDeps,
+): Promise<void> {
+  await requireAdminVerifyDb(req, deps.jwtSecret)
+  const args = pageArgs(req)
+  try {
+    const page = await listTutorialModerations(args)
+    res.setHeader('Cache-Control', 'private, no-store')
+    sendJson(res, 200, { moderations: page.items, nextCursor: page.nextCursor })
   } catch (error) {
     throw mapTutorialError(error)
   }

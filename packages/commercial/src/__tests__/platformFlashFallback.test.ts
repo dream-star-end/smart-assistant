@@ -58,6 +58,8 @@ describe("fetchPlatformFlash", () => {
     assert.equal(r.calls.length, 1);
     assert.equal(r.calls[0]!.url, GO);
     assert.equal(r.calls[0]!.headers["x-api-key"], "GO-KEY");
+    // OpenCode Go 缺 x-opencode-session 即 400 MissingSessionID(且不回落)。
+    assert.match(r.calls[0]!.headers["x-opencode-session"] ?? "", /^[0-9a-f-]{36}$/);
     assert.equal(r.calls[0]!.body.model, "deepseek-v4-flash");
   });
 

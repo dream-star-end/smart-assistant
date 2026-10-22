@@ -29,6 +29,7 @@ import { parseRetryAfterMs } from "../../account-pool/policy/outcome.js";
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { z } from "zod";
 import type { Pool } from "pg";
@@ -102,11 +103,17 @@ export function openCodeGoAuthHeaders(
   apiKey: string,
   accept = "application/json",
 ): Record<string, string> {
-  return {
+  const headers: Record<string, string> = {
     "x-api-key": apiKey,
     "Content-Type": "application/json",
     Accept: accept,
   };
+  // OpenCode Go 自 2026-09-07 起缺稳定会话 id 头即 400 MissingSessionID,且 400 不触发 DeepSeek
+  // 回落 —— 平台直连调用(市场 AI 审批、经验分享审核)因此恒失败。头名取 protocol spec
+  // (与 upstream.ts 真实流量同源);平台调用每次独立,随机 UUID 即可。
+  const sessionHeader = getStaticProvider("opencodego").sessionIdHeader;
+  if (sessionHeader) headers[sessionHeader] = randomUUID();
+  return headers;
 }
 
 let platformFlashFallbackKey: string | undefined;

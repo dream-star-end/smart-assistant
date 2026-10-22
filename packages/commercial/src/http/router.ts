@@ -57,7 +57,9 @@ import { handleMarketplaceSearch } from '../marketplace/marketplaceSearch.js'
 import { isActiveAdmin, isInMaintenance } from '../middleware/maintenanceMode.js'
 import {
   handleAdminListCommunityTutorials,
+  handleAdminListTutorialModerations,
   handleAdminPendingCommunityTutorials,
+  handleAdminTutorialModerationStats,
   handleAdminTutorialWrite,
   handleListCommunityTutorials,
   handleListOwnCommunityTutorials,
@@ -905,6 +907,16 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
       method: 'GET',
       path: '/api/admin/tutorials',
       handler: (req, res) => handleAdminListCommunityTutorials(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/tutorials/moderation-stats',
+      handler: (req, res) => handleAdminTutorialModerationStats(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/tutorials/moderations',
+      handler: (req, res) => handleAdminListTutorialModerations(req, res, deps),
     },
     {
       method: 'GET',

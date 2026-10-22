@@ -223,6 +223,10 @@ export const DURABLE_TABLES: readonly string[] = [
   "chat_projects",
   "client_session_live_streams",
   "community_tutorials",
+  // 0321 经验分享 AI 审核:作业(每篇一行)与判定记录,FK community_tutorials ON DELETE CASCADE,
+  // 随稿件离场;稿件本身无基于时间的清理。
+  "community_tutorial_moderation_jobs",
+  "community_tutorial_moderations",
   "cursor_external_usage_audit",
   "inbox_message_audience_snapshots",
   "ocr_jobs",
