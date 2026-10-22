@@ -6,7 +6,7 @@ P = "/api/muse-bridge/v1"
 class State:
     def __init__(self):
         self.jobs = queue.Queue(); self.results = {}; self.chunks = {}; self.heartbeats = {}
-        self.cancel = set(); self.session = None; self.hellos = 0; self.gone = set()
+        self.cancel = set(); self.session = None; self.hellos = 0; self.gone = set(); self.auth_fails = 0
         self.ack_gone = set(); self.ack_flaky = {}; self.hb_delay = {}; self.acked = set()
         self.limits = {"chunk_bytes": 4 * 1024 * 1024}
         self.done = threading.Condition()
@@ -21,11 +21,14 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0); return self.rfile.read(n)
     def auth(self):
         if self.headers.get("Authorization") != "Bearer " + TOKEN:
+            S.auth_fails += 1
             self.body(); self.send(401, {"error": {"code": "UNAUTHORIZED", "message": "bridge token rejected"}}); return False
         return True
     def do_GET(self):
         self.send(404 if self.path != "/healthz" else 200, {"ok": True})
     def do_POST(self):
+        if not self.path.startswith(P + "/"):  # like the master: 404 before authentication
+            self.body(); return self.send(404, {"error": {"code": "NOT_FOUND", "message": "not found"}})
         if not self.auth(): return
         data = self.body(); path = self.path
         if path == P + "/hello":

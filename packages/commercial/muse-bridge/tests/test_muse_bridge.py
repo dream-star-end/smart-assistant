@@ -323,17 +323,29 @@ class Blocking(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0, out)
         self.assertIn("✓ 能连到 server", out); self.assertIn("✗ bridge 接口可用", out); self.assertIn("HTTP 403 不是个人版服务端", out)
     def test_check_passes_against_master_without_real_token(self):
-        srv = mm.start(); hellos = mm.S.hellos; session = mm.S.session
+        srv = mm.start(); before = (mm.S.hellos, mm.S.session, mm.S.auth_fails)
         r = self.run_bridge("check", "--server", "http://127.0.0.1:%d" % srv.server_port)
         out = r.stdout.decode()
         self.assertIn("✓ bridge 接口可用", out, out)
-        self.assertEqual((mm.S.hellos, mm.S.session), (hellos, session))  # probe never logged in
+        # never logged in, never took over a session, never counted as a failed login
+        self.assertEqual((mm.S.hellos, mm.S.session, mm.S.auth_fails), before)
 
 class MasterErrors(unittest.TestCase):
     def test_master_401_vs_others(self):
         self.assertEqual(mb.master_error_code(b'{"error":{"code":"UNAUTHORIZED"}}'), "UNAUTHORIZED")
         for body in (b"", b"<html>403</html>", b'{"error":"bad"}', b"[1]", b"\xff"):
             self.assertIsNone(mb.master_error_code(body))
+    def test_foreign_diagnosis_scrubs_secrets(self):
+        body = (b"<pre>Proxy-Authorization: Basic dXNlcjpzZWNyZXQ=</pre> Authorization: Bearer abc.def "
+                b"Cookie: sid=s3cr3t; x=1\n token=tok123 http://u:p@proxy:8080/x "
+                b'{"u":"https:\\/\\/scontent.xx.fbcdn.net\\/v\\/t1.png?oh=abc"} https://meta.example/p?sig=1 '
+                b"opaque ABCDEFGHIJKLMNOPQRSTUVWXYZ0123 ok")
+        out = mb.describe_foreign(403, {"Server": "squid mbr_servertoken", "cf-ray": "Basic Zm9vOmJhcg=="}, body,
+                                  "https://h.example/api/muse-bridge/v1/hello")
+        for leak in ("dXNlcjpzZWNyZXQ", "user:secret", "abc.def", "s3cr3t", "tok123", "u:p@", "fbcdn", "scontent",
+                     "meta.example", "sig=1", "mbr_servertoken", "Zm9vOmJhcg", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"):
+            self.assertNotIn(leak, out)
+        self.assertIn("HTTP 403", out); self.assertIn("squid", out)
     def test_proxy_for_drops_credentials(self):
         old = dict(os.environ)
         try:

@@ -343,8 +343,26 @@ def redact(text, limit=500):
     return text[-limit:]
 
 
-TOKEN_RE = re.compile(r"mbr_[A-Za-z0-9_-]+")
 TAG_RE = re.compile(r"<(script|style)\b.*?</\1>|<[^>]+>", re.S | re.I)
+# Text from a proxy or CDN error page is untrusted: before it is printed or logged, drop anything
+# that could be a credential (tokens, auth headers, cookies, user:pass@, long opaque strings) or a
+# link, including JSON-escaped ones.
+SECRET_RES = (
+    (re.compile(r"https?:(?:\\?/){2}\S*", re.I), "<url>"),
+    (re.compile(r"\b(?:proxy-)?authorization\s*[:=]\s*(?:\w+\s+)?\S+", re.I), "<redacted>"),
+    (re.compile(r"\b(?:set-)?cookie\s*[:=][^\n]*", re.I), "<redacted>"),
+    (re.compile(r"\b(?:basic|bearer|digest|negotiate)\s+\S+", re.I), "<redacted>"),
+    (re.compile(r"\b(?:password|passwd|pwd|secret|token|api[_-]?key)\b\s*[:=]\s*\S+", re.I), "<redacted>"),
+    (re.compile(r"\S+:\S*@"), "<redacted>@"),
+    (re.compile(r"mbr_[A-Za-z0-9_-]*"), "mbr_<redacted>"),
+    (re.compile(r"[A-Za-z0-9+/_=-]{24,}"), "<redacted>"),
+)
+
+
+def scrub(text):
+    for pattern, repl in SECRET_RES:
+        text = pattern.sub(repl, text)
+    return text
 
 
 def master_error_code(payload):
@@ -368,12 +386,11 @@ def proxy_for(url):
 def describe_foreign(status, headers, payload, url):
     """One line saying who most likely answered status instead of the master."""
     server = (headers.get("Server") if headers else None) or "-"
-    text = TAG_RE.sub(" ", payload[:4096].decode("utf-8", "replace"))
-    text = TOKEN_RE.sub("mbr_<redacted>", " ".join(text.split()))
+    ray = (headers.get("cf-ray") if headers else None) or "-"
+    text = " ".join(TAG_RE.sub(" ", payload[:4096].decode("utf-8", "replace")).split())
     return ("HTTP %d 不是个人版服务端返回的（Server: %s，cf-ray: %s，本机代理: %s）。"
             "多半是 Muse VM 的出口代理或 Cloudflare 拦截了请求，换 token 没有用。响应摘要：%s"
-            % (status, server, (headers.get("cf-ray") if headers else None) or "-", proxy_for(url),
-               redact(text, 160) or "（空）"))
+            % (status, scrub(server)[:80], scrub(ray)[:40], proxy_for(url), scrub(text)[:160] or "（空）"))
 
 
 def parse_contract(stdout):
@@ -944,18 +961,30 @@ def probe_server(server):
         return False, redact(str(e), 200)
 
 
+PROBE_PATH = "/api/muse-bridge/probe"
+
+
 def probe_bridge_api(server):
-    """POST hello with a deliberately invalid token: only the master's own JSON 401 proves that an
-    authenticated POST reaches it. Never sends the real token, so a running bridge is not taken over."""
+    """POST shaped like a real bridge call (JSON body, Bearer header) to a path outside /v1/: the
+    master answers its own JSON 404 NOT_FOUND before looking at the token, so this proves the POST
+    reaches it without counting as a failed login (the master locks an IP out after repeated ones)
+    and without sending the real token or taking over a running bridge."""
+    url = server + PROBE_PATH
+    req = urllib.request.Request(url, data=b"{}", method="POST", headers={
+        "Authorization": "Bearer probe", "Content-Type": "application/json",
+        "User-Agent": "muse-bridge/" + BRIDGE_VERSION})
     try:
-        Client(server, "mbr_probe_invalid").hello("-", "-")
-    except Blocked as e:
-        return False, str(e)
-    except FatalAuth:
-        return True, "POST 到达个人版服务端（用无效 token 探测，得到服务端自己的 401）"
+        with urllib.request.build_opener(urllib.request.ProxyHandler()).open(req, timeout=15) as r:
+            status, headers, payload = r.status, r.headers, r.read(4096)
+    except urllib.error.HTTPError as e:
+        status, headers, payload = e.code, e.headers, (e.read(4096) if e.fp else b"")
     except Exception as e:
         return False, redact(str(e), 200)
-    return False, "无效 token 竟被接受，server 地址可能不对"
+    if status == 404 and master_error_code(payload) == "NOT_FOUND":
+        return True, "POST 能到达个人版服务端"
+    if status in (401, 403):
+        return False, describe_foreign(status, headers, payload, url)
+    return False, "HTTP %d，不是个人版服务端的应答，server 地址可能不对" % status
 
 
 def self_check(paths, cli, verbose=True):

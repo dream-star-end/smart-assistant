@@ -13,6 +13,8 @@
 // hello again, so never answer 401/409 for anything but those meanings. The bridge only trusts
 // these as JSON `{error:{code}}` bodies: a 401/403 without them came from a proxy or the CDN in
 // front of the master and is reported as such (bridge >= 0.3.2). This handler never sends 403.
+// The bridge self-check POSTs /api/muse-bridge/probe and expects the JSON 404 NOT_FOUND that the
+// prefix check below sends *before* authenticate(), so it never counts as a failed login.
 
 import { createHash } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
