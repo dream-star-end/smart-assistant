@@ -323,6 +323,13 @@ export interface GrokRunInput {
    * task execution id so a retried step settles idempotently on usage_records (user, request_id).
    */
   requestId: string;
+  /**
+   * Execution attempt for a stable requestId (studio: the task's claim count). A failed attempt
+   * leaves its journal row aborted and that id can never be admitted again, so attempt N ≥ 1
+   * bills under `<requestId>~<N>` (Codex code r1 P1). A caller that persisted a result through
+   * onResult settles it with resettleGrokRun under the id onResult reported, never by re-running.
+   */
+  attempt?: number;
   prompt: string;
   image?: { mediaType: VisionMediaType; data: string };
   /**
@@ -332,7 +339,7 @@ export interface GrokRunInput {
    */
   billTo?: "user" | "platform";
   /** Called after a successful upstream answer and before settlement (studio persists it first). */
-  onResult?: (result: { text: string; usage: GrokVisionUsage; model: string }) => Promise<void>;
+  onResult?: (result: { text: string; usage: GrokVisionUsage; model: string; requestId: string }) => Promise<void>;
   /** Rate-limit key; defaults to the container id, or `studio:<userId>` without a container. */
   rateKey?: string;
   /** The HTTP route counts the rate limit before reading the body; it sets this to avoid counting twice. */
@@ -379,6 +386,14 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
       reqLog.warn("rate_limited", { rateKey });
       throw new GrokRunError(429, "RATE_LIMITED", "grok vision rate limit exceeded");
     }
+    const attempt = input.attempt ?? 0;
+    if (!Number.isSafeInteger(attempt) || attempt < 0 || attempt > 9999) {
+      throw new GrokRunError(400, "BAD_BODY", "attempt must be an integer in 0..9999");
+    }
+    const billingRequestId = attempt === 0 ? input.requestId : `${input.requestId}~${attempt}`;
+    if (billingRequestId.length < 1 || billingRequestId.length > 128) {
+      throw new GrokRunError(400, "BAD_BODY", "request id must be 1..128 chars");
+    }
     if (input.prompt.length < 1 || input.prompt.length > MAX_PROMPT_CHARS) {
       throw new GrokRunError(400, "BAD_BODY", "prompt must be 1..8000 chars");
     }
@@ -410,7 +425,6 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
       throw new GrokRunError(503, "GROK_VISION_MODEL_UNAVAILABLE", "vision model is not available");
     }
 
-    const billingRequestId = input.requestId;
     const reservation = { userId: userId.toString(), requestId: billingRequestId };
     const engineSessionId = deriveEngineSessionId(
       containerId !== null ? `vision:${userId}:${containerId}` : `studio:${userId}`,
@@ -552,7 +566,7 @@ export function makeGrokRunner(deps: Omit<GrokVisionHandlerDeps, "identityRepo" 
 
     if (input.onResult) {
       try {
-        await input.onResult({ text: answer, usage, model: canonical });
+        await input.onResult({ text: answer, usage, model: canonical, requestId: billingRequestId });
       } catch (err) {
         // The answer could not be persisted: do not settle a result the caller cannot use.
         await abandon("grok_run_result_persist_failed");
