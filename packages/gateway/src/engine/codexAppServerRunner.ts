@@ -61,6 +61,7 @@ import {
 } from './codexHermeticPolicy.js'
 import { createLogger } from '../logger.js'
 import { type ClassifiedErrorCode, classifyRunError } from '../errorClassify.js'
+import { adoptCodexTurnTrace, bindCodexThreadTrace } from '../relayTrace.js'
 import type {
   AutomaticRetryState,
   CollabAgentPolicy,
@@ -426,6 +427,8 @@ export class CodexAppServerRunner extends EventEmitter {
    * arrives it is interrupted at once. Cleared when runTurn returns.
    */
   private pendingStartInterrupt = false
+  /** Ends this turn's thread trace binding for the container Codex relay (OCV5-580). */
+  private releaseRelayTrace: (() => void) | null = null
   /** True iff the *current* app-server proc has done thread/start or
    *  thread/resume for this.threadId. Cleared when the proc dies. Distinct
    *  from `initialized` (which tracks the JSON-RPC handshake) — re-spawning
@@ -2599,6 +2602,11 @@ export class CodexAppServerRunner extends EventEmitter {
         }
 
         let tres: { turn?: { id?: string } } | undefined
+        // A relay request on this thread before turn/start answers can only be this turn's.
+        this.releaseRelayTrace?.()
+        this.releaseRelayTrace = this.threadId
+          ? bindCodexThreadTrace(this.threadId, this.opts.traceId)
+          : null
         try {
           log.info('codex_turn_timing', { traceId: this.opts.traceId, threadId: this.threadId,
             stage: 'turn_start_sent', elapsedMs: performance.now() - timingStartedAt })
@@ -2687,6 +2695,7 @@ export class CodexAppServerRunner extends EventEmitter {
           throw new Error('turn/start did not return turn.id')
         }
         this.activeTurnId = turnId
+        if (this.threadId) adoptCodexTurnTrace(this.threadId, turnId)
         if (this.pendingStartInterrupt) {
           // OCV5-435: stopped while turn/start was in flight — interrupt now.
           this.pendingStartInterrupt = false
@@ -2872,6 +2881,8 @@ export class CodexAppServerRunner extends EventEmitter {
       // Do NOT re-throw — drain() catches and rejects the queue entry, but
       // upstream sessionManager handles errors via the result message above.
     } finally {
+      this.releaseRelayTrace?.()
+      this.releaseRelayTrace = null
       this.off('message', observeFirstDelta)
       this.currentCollabAgentPolicy = undefined
       this.activeRequestId = undefined
