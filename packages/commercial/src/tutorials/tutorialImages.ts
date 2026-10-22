@@ -8,7 +8,15 @@ import { sanitizeTutorialImageBytes } from './snapshotSanitizer.js'
 // `![alt](tutorial-blob:<sha256>)` 绑定成 tutorial_blob_refs。公开读取仍只走
 // /api/tutorial-embeds（引用它的稿件必须 approved），这里只管上传、归属和作者预览。
 
+/** 上传的原图上限（前端会先压成 webp，正常远小于此）。 */
 export const TUTORIAL_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+/**
+ * 去元数据后实际入库的上限：tutorial_blobs.bytes 的既有 CHECK（8 MiB）。0320 不放宽它，
+ * 因为个人版列车的破坏性 DDL 门拒绝 ALTER ... DROP。
+ */
+export const TUTORIAL_IMAGE_STORED_MAX_BYTES = 8 * 1024 * 1024
+/** 图片按既有的 'media' kind 入库（同理不扩 kind 的 CHECK），靠 mime 与 image: role 区分。 */
+export const TUTORIAL_IMAGE_BLOB_KIND = 'media'
 export const TUTORIAL_IMAGE_MAX_PER_POST = 20
 export const TUTORIAL_IMAGE_DAILY_UPLOADS = 200
 export const TUTORIAL_IMAGE_MAX_SIDE = 16_384
@@ -111,8 +119,8 @@ export async function prepareTutorialImage(
     output = sanitized
     outputMime = mime
   }
-  if (output.length > TUTORIAL_IMAGE_MAX_BYTES)
-    throw new TutorialImageError('TOO_LARGE', '图片处理后仍超过 10MB')
+  if (output.length > TUTORIAL_IMAGE_STORED_MAX_BYTES)
+    throw new TutorialImageError('TOO_LARGE', '图片处理后仍超过 8MB，请压缩后再上传')
   const { width, height } = await decodedSize(output)
   // metadata() 只读头部；缩到 64px 会把整条像素流解一遍，压缩流损坏的图在这里拦下。
   try {
@@ -158,9 +166,9 @@ export async function storeTutorialImageUpload(
       throw new TutorialImageError('RATE_LIMITED', `24 小时内最多上传 ${TUTORIAL_IMAGE_DAILY_UPLOADS} 张图片`)
     await client.query(
       `INSERT INTO tutorial_blobs (sha256, kind, mime, bytes, body)
-       VALUES ($1, 'image', $2, $3, $4)
+       VALUES ($1, $5, $2, $3, $4)
        ON CONFLICT (sha256) DO NOTHING`,
-      [image.sha256, image.mime, image.body.length, image.body],
+      [image.sha256, image.mime, image.body.length, image.body, TUTORIAL_IMAGE_BLOB_KIND],
     )
     await client.query(
       `INSERT INTO tutorial_blob_uploads (sha256, user_id) VALUES ($1, $2::bigint)

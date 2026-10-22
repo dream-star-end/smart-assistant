@@ -694,23 +694,38 @@ async function settle(
         adminNote = '自动通过前的泄密复扫命中，转人工'
       }
     }
+    // 审核状态约束要求 approved/rejected 有 reviewed_by（0320 不放宽它）：AI 结论记在最早的在职
+    // 管理员名下作系统操作者（与系统站内信发件人同一做法），来源靠 review_source='ai' 区分。
+    let actor: string | null = null
+    if (mode === 'on' && (verdict === 'pass' || verdict === 'reject')) {
+      actor =
+        (
+          await client.query<{ id: string }>(
+            `SELECT id::text AS id FROM users WHERE role = 'admin' AND status = 'active' ORDER BY id ASC LIMIT 1`,
+          )
+        ).rows[0]?.id ?? null
+      if (!actor) {
+        verdict = 'uncertain'
+        adminNote = '没有在职管理员可作系统审核人，转人工'
+      }
+    }
     if (mode === 'on' && verdict === 'pass') {
       const result = await client.query(
         `UPDATE community_tutorials
-            SET status = 'approved', review_source = 'ai', reviewed_by = NULL, review_note = NULL,
+            SET status = 'approved', review_source = 'ai', reviewed_by = $2::bigint, review_note = NULL,
                 reviewed_at = NOW(), published_at = NOW(), needs_human = false, updated_at = NOW()
           WHERE id = $1::bigint AND status = 'pending'`,
-        [job.publicationId],
+        [job.publicationId, actor],
       )
       applied = result.rowCount === 1
       if (applied) notice = 'approved'
     } else if (mode === 'on' && verdict === 'reject') {
       const result = await client.query(
         `UPDATE community_tutorials
-            SET status = 'rejected', review_source = 'ai', reviewed_by = NULL, review_note = $2,
+            SET status = 'rejected', review_source = 'ai', reviewed_by = $3::bigint, review_note = $2,
                 reviewed_at = NOW(), published_at = NULL, needs_human = false, updated_at = NOW()
           WHERE id = $1::bigint AND status = 'pending'`,
-        [job.publicationId, reason],
+        [job.publicationId, reason, actor],
       )
       applied = result.rowCount === 1
       if (applied) notice = 'rejected'
