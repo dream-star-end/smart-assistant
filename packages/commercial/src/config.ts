@@ -668,6 +668,12 @@ export const commercialConfigSchema = z
     MINIMAX_MEDIA_KEY_FILE: z.string().trim().regex(/^\/[^\0]*$/, "must be an absolute path").max(512).optional(),
     /** OCV5-589: global soft cap on successful MiniMax media calls per rolling 5 hours. Unset → no cap. */
     OC_MINIMAX_MEDIA_WINDOW_MAX_CALLS: positiveInt(1_000_000),
+    /** OCV5-588 media studio: root for compose work dirs and studio blobs. */
+    OC_STUDIO_ROOT: z.string().trim().regex(/^\/[^\0]*$/, "must be an absolute path").max(512).optional(),
+    /** OCV5-588: exact image ID of openclaude/studio-ffmpeg (build-image.sh). Unset → compose unavailable. */
+    OC_STUDIO_FFMPEG_IMAGE_ID: z.string().trim().regex(/^sha256:[0-9a-f]{64}$/, "must be sha256:<64 hex>").optional(),
+    /** OCV5-588: site-wide concurrent compose containers. Unset → 2. */
+    OC_STUDIO_COMPOSE_CONCURRENCY: positiveInt(8),
     /** Loopback endpoint, or explicitly opted-in HTTPS endpoint, of the SCNet H3 worker. */
     MEDIA_GENERATION_WORKER_URL: urlStringWithProtocols(
       ["http:", "https:"],
