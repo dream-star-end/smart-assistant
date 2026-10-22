@@ -186,6 +186,7 @@ source_commit() { echo ${b}; }
 ensure_model_authority() { :; }
 assert_env_key_drift() { :; }
 lease_train_begin() { echo "CLAIM:$1"; }
+selfhost_release_preflight() { echo "L0:$1"; }
 assert_fix_trailers() { :; }
 assert_p0_web_overlay_contained() { :; }
 log() { :; }
@@ -196,6 +197,9 @@ ${actual}`], { encoding: 'utf8' })
     const expected = active ? a : b
     assert.match(r.stdout, new RegExp(`RUNTIME:${expected}`))
     assert.match(r.stdout, new RegExp(`MASTER:${expected}`))
+    // OCV5-581: L0 checks the same exact source the build uses, after the claim and before the build
+    assert.match(r.stdout, new RegExp(`L0:${expected}[\\s\\S]*MASTER:${expected}`))
+    if (!active) assert.match(r.stdout, new RegExp(`CLAIM:${b}[\\s\\S]*L0:${b}`))
     if (active) assert.doesNotMatch(r.stdout, /CLAIM:/)
     else assert.match(r.stdout, new RegExp(`CLAIM:${b}`))
   }

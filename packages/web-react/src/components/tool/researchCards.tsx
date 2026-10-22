@@ -46,7 +46,7 @@ import { SignedAudio, SignedFileCard, SignedImg, SignedVideo, useSignedSrc } fro
 import { ClaimList, CoverageBadge, GatesRow, LiteratureLibraryPanel } from "../chat/researchEvidence";
 import { Badge } from "../ui";
 import { connectorToolCard } from "./connectorCards";
-import { useToolHeaderLabel } from "./context";
+import { useToolCardActions, useToolHeaderLabel } from "./context";
 import { ExpandControls, useExpandableSlice } from "./expandable";
 import { safeArtifactSrc } from "./artifactSrc";
 import { asArr, asStr, detectShellFileWrites, isSafeHttpUrl, type ToolLike } from "./format";
@@ -1457,6 +1457,142 @@ function obj(
  * 未登记的 CLI 注册卡片,从类型层面消除"header 加了 body 忘了"的双注册表漂移。未登记 body
  * 的 oc-*(如 oc-web-context)或本卡返回 null → researchToolCard 兜底 GenericOcCard,绝不泄漏命令。
  */
+
+function formatLiteraturePdfBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+function LiteraturePluginDownloadCard({
+  artifactId,
+  filename,
+  bytes,
+}: {
+  artifactId: string;
+  filename: string;
+  bytes: number;
+}) {
+  const { downloadLiteratureArtifact, literatureArtifactMeta } = useToolCardActions();
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  // 平台只暂存约 30 分钟（OCV5-585）：从服务端取到期时间，过期后不再给保存按钮。
+  const [expiry, setExpiry] = useState<{ kind: "unknown" } | { kind: "until"; at: number } | { kind: "expired" }>({
+    kind: "unknown",
+  });
+
+  useEffect(() => {
+    if (!literatureArtifactMeta) return;
+    let alive = true;
+    literatureArtifactMeta(artifactId).then(
+      (meta) => {
+        if (!alive) return;
+        const at = meta ? Date.parse(meta.expiresAt) : Number.NaN;
+        setExpiry(!meta ? { kind: "expired" } : Number.isFinite(at) ? { kind: "until", at } : { kind: "unknown" });
+      },
+      () => {},
+    );
+    return () => {
+      alive = false;
+    };
+  }, [artifactId, literatureArtifactMeta]);
+
+  useEffect(() => {
+    if (expiry.kind !== "until") return;
+    const left = expiry.at - Date.now();
+    if (left <= 0) {
+      setExpiry({ kind: "expired" });
+      return;
+    }
+    const timer = setTimeout(() => setExpiry({ kind: "expired" }), Math.min(left, 2_000_000_000));
+    return () => clearTimeout(timer);
+  }, [expiry]);
+
+  const onSave = async () => {
+    if (!downloadLiteratureArtifact || busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const blob = await downloadLiteratureArtifact(artifactId);
+      const url = URL.createObjectURL(blob);
+      try {
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        a.rel = "noopener";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      } finally {
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+    } catch (e) {
+      if ((e as { status?: unknown })?.status === 404) setExpiry({ kind: "expired" });
+      setErr(e instanceof Error && e.message ? e.message : "PDF 下载失败或文件已过期");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const expired = expiry.kind === "expired";
+  const deadline =
+    expiry.kind === "until"
+      ? ` · 请在 ${new Date(expiry.at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false })} 前保存`
+      : "";
+
+  return (
+    <CardShell
+      icon={<FileText className="size-4" />}
+      title={expired ? "文献 PDF 已过期" : "文献全文已就绪"}
+      subtitle={`${formatLiteraturePdfBytes(bytes)}${deadline}`}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="min-w-0 flex-1 truncate text-[13px] font-medium text-fg" title={filename}>
+          {filename}
+        </div>
+        {downloadLiteratureArtifact && !expired && (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void onSave()}
+            className="shrink-0 rounded-md bg-accent px-2.5 py-1 text-xs font-medium text-white transition hover:opacity-90 disabled:opacity-50"
+          >
+            {busy ? "下载中…" : "保存 PDF"}
+          </button>
+        )}
+      </div>
+      {expired && (
+        <div className="mt-1.5 text-xs text-muted">
+          平台暂存的文件已过期或已被清理，请让助手用同一编号重新下载（编号 24 小时内有效）。
+        </div>
+      )}
+      {err && !expired && <div className="mt-1.5 text-xs text-danger">{err}</div>}
+    </CardShell>
+  );
+}
+
+function literaturePluginDownloadCard(tool: ToolLike): ReactNode | null {
+  if (tool.error) return null;
+  const raw = outputText(tool);
+  if (!raw) return null;
+  const clean = stripExternalEnvelope(stripCommandEcho(raw)).trim();
+  const data = looseJson(clean);
+  if (!data) return null;
+  const artifactId = asStr(data.artifactId);
+  const filename = asStr(data.filename);
+  const mimeType = asStr(data.mimeType);
+  const bytes = typeof data.bytes === "number" && Number.isFinite(data.bytes) ? data.bytes : 0;
+  if (
+    !/^[A-Za-z0-9-]{16,128}$/.test(artifactId) ||
+    !filename ||
+    mimeType !== "application/pdf" ||
+    bytes < 1
+  ) {
+    return null;
+  }
+  return <LiteraturePluginDownloadCard artifactId={artifactId} filename={filename} bytes={bytes} />;
+}
+
 const OC_BODY_CARDS: Partial<Record<OcCli, (command: string, tool: ToolLike) => ReactNode | null>> = {
   // 研究工具(对象型 JSON 输出)。
   "oc-lit": (_c, t) => obj(t, LiteratureCard),
@@ -1497,8 +1633,8 @@ const OC_BODY_CARDS: Partial<Record<OcCli, (command: string, tool: ToolLike) => 
   // 应用连接器:输出含 confirmation_required 触发对象 → 写操作确认卡(human-in-the-loop);
   // 其余输出(list/读操作)→ null 兜底 GenericOcCard。实现在 connectorCards.tsx。
   "oc-connect": (_c, t) => connectorToolCard(t, { embedded: true }),
-  // 市场 Plugin 使用与应用连接器相同的确认账本输出契约。
-  "oc-plugin": (_c, t) => connectorToolCard(t, { embedded: true }),
+  // 市场 Plugin 使用与应用连接器相同的确认账本输出契约；文献插件 download 额外渲染受鉴权 PDF 保存卡。
+  "oc-plugin": (_c, t) => connectorToolCard(t, { embedded: true }) ?? literaturePluginDownloadCard(t),
   // 同花顺插件：--ui 输出直接渲染成行情组件；JSON 输出 → null → 通用卡。
   ths: (_c, t) => (thsUiBlocks(outputText(t)).length > 0 ? <ThsToolCard tool={t} /> : null),
 };

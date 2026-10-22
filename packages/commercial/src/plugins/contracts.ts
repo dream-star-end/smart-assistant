@@ -2,6 +2,12 @@ import { extname } from 'node:path'
 import { normalizeHttpsOrigin } from '../connectors/outboundPolicy.js'
 import { canonicalSha256Hex } from '../connectors/spec/canonical.js'
 import {
+  LITERATURE_HTTP_ORIGINS,
+  LITERATURE_HTTP_STATE_FORMAT,
+  LITERATURE_HTTP_TRANSPORT,
+  LITERATURE_PLUGIN_ARTIFACT_HASH,
+} from './literatureDb/builtinArtifact.js'
+import {
   type CompiledLocalPluginBrokerPolicy,
   compileLocalPluginBrokerPolicy,
 } from './localBroker.js'
@@ -99,11 +105,13 @@ export interface ManagedBrowserNetworkContractV1 {
 }
 
 export interface ManagedBrowserAccountStateContractV1 {
+  format?: typeof LITERATURE_HTTP_STATE_FORMAT
   cookieDomains: readonly string[]
   origins: readonly string[]
 }
 
 export interface ManagedBrowserRuntimeContractV1 {
+  transport?: typeof LITERATURE_HTTP_TRANSPORT
   driverId: string
   driverVersion: string
   network: ManagedBrowserNetworkContractV1
@@ -760,12 +768,50 @@ function compileManaged(
   }
 }
 
+/** Only the complete platform artifact hash may reach this fixed HTTP exception. */
+function compilePinnedLiterature(
+  root: Record<string, unknown>,
+  artifactHash: string,
+): CompiledRuntimePluginArtifact {
+  const https = ['https://www.jieyoutsg.com:443']
+  const compiled = compileManaged(
+    {
+      ...root,
+      accountState: { cookieDomains: ['jieyoutsg.com', 'www.jieyoutsg.com'], origins: https },
+      network: { origins: https, methods: ['GET', 'POST'] },
+    },
+    artifactHash,
+  )
+  if (compiled.pluginType !== 'managed-browser') invalid('literature subtype mismatch')
+  const execContract: ManagedBrowserPluginContractV1 = {
+    ...compiled.execContract,
+    runtime: {
+      ...compiled.execContract.runtime,
+      transport: LITERATURE_HTTP_TRANSPORT,
+      network: { ...compiled.execContract.runtime.network, origins: [...LITERATURE_HTTP_ORIGINS] },
+      accountState: {
+        ...compiled.execContract.runtime.accountState,
+        format: LITERATURE_HTTP_STATE_FORMAT,
+        origins: [...LITERATURE_HTTP_ORIGINS],
+      },
+    },
+  }
+  return {
+    pluginType: 'managed-browser',
+    artifactHash,
+    execContract,
+    execContractHash: canonicalSha256Hex(execContract),
+  }
+}
+
 export function compileRuntimePluginArtifact(input: unknown): CompiledRuntimePluginArtifact {
   assertArtifactBudget(input)
   const root = plainObject(input, 'artifact')
   if (root.schemaVersion !== 1) invalid('artifact.schemaVersion must be 1')
   const artifactHash = canonicalSha256Hex(input)
   if (root.pluginType === 'sandboxed-local') return compileLocal(root, artifactHash)
+  if (root.pluginType === 'managed-browser' && artifactHash === LITERATURE_PLUGIN_ARTIFACT_HASH)
+    return compilePinnedLiterature(root, artifactHash)
   if (root.pluginType === 'managed-browser') return compileManaged(root, artifactHash)
   invalid('artifact.pluginType must be sandboxed-local or managed-browser')
 }

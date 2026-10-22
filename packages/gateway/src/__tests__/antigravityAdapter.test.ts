@@ -24,6 +24,7 @@ import {
 } from '../engine/antigravityAdapter.js'
 import { antigravityProductToolInput, antigravityProductToolName } from '../engine/antigravityToolNormalize.js'
 import { resetEnvFactsCache } from '../envProbe.js'
+import { routeRelayTrace } from '../relayTrace.js'
 import { classifyRunError } from '../errorClassify.js'
 import type { EngineEvent } from '../engine/engineEvents.js'
 import type { EngineCreateOpts } from '../engine/registry.js'
@@ -219,6 +220,33 @@ describe('AntigravityAdapter', () => {
       const { summary } = await runTurn(h, 'tool-success.ndjson')
       assert.match(summary?.errorDetail ?? '', /ANTIGRAVITY_MODEL_UNSUPPORTED/)
       assert.equal(existsSync(h.capture), false)
+    } finally {
+      await h.restore()
+    }
+  })
+
+  test('OCV5-595: the route token names the turn for the relay while its process runs, and nothing after', async () => {
+    const h = await harness()
+    process.env.FAKE_AGY_EXIT_DELAY_MS = '300'
+    try {
+      h.adapter.setAntigravityRoute(ROUTE)
+      h.adapter.setTraceId('0a1b2c3d4e5f60718293a4b5c6d7e8f9')
+      const path = `/internal/v5/antigravity-relay/route/${TOKEN}/v1internal:streamGenerateContent`
+      const seen = new Set<string | undefined>()
+      let polling = true
+      const poll = (async () => {
+        while (polling) {
+          if (existsSync(h.capture)) seen.add(routeRelayTrace(path))
+          await new Promise((r) => setTimeout(r, 2))
+        }
+      })()
+      const { summary } = await runTurn(h, 'tool-success.ndjson')
+      await h.adapter.waitForOutputDrain()
+      polling = false
+      await poll
+      assert.ok(summary)
+      assert.ok(seen.has('0a1b2c3d4e5f60718293a4b5c6d7e8f9'), 'bound while the CLI ran')
+      assert.equal(routeRelayTrace(path), undefined, 'released after the turn')
     } finally {
       await h.restore()
     }

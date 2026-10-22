@@ -8,7 +8,8 @@
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
-import { ANTIGRAVITY_RELAY_PREFIX } from '@openclaude/protocol'
+import { ANTIGRAVITY_RELAY_PREFIX, TRACE_ID_HEADER } from '@openclaude/protocol'
+import { routeRelayTrace } from './relayTrace.js'
 import { isLoopbackRemoteAddress } from './v3CodexRelay.js'
 
 export const V5_ANTIGRAVITY_RELAY_PREFIX = ANTIGRAVITY_RELAY_PREFIX
@@ -37,6 +38,8 @@ const DROP = new Set([
   'x-goog-api-key',
   'cookie',
   'accept-encoding',
+  // The turn trace comes only from the route token's running turn (OCV5-595), never from the caller.
+  TRACE_ID_HEADER,
 ])
 
 export function readV5AntigravityRelayConfig(
@@ -53,7 +56,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body))
 }
 
-function headersFor(req: IncomingMessage, token: string): Headers {
+function headersFor(req: IncomingMessage, token: string, pathname: string): Headers {
   const headers = new Headers()
   for (const [rawKey, rawValue] of Object.entries(req.headers)) {
     const key = rawKey.toLowerCase()
@@ -63,6 +66,8 @@ function headersFor(req: IncomingMessage, token: string): Headers {
     else headers.set(rawKey, rawValue)
   }
   headers.set('authorization', `Bearer ${token}`)
+  const traceId = routeRelayTrace(pathname)
+  if (traceId) headers.set(TRACE_ID_HEADER, traceId)
   return headers
 }
 
@@ -92,7 +97,7 @@ export async function handleV5AntigravityRelayLocal(
       `${cfg.masterBaseUrl}${parsed.pathname}${parsed.search}`,
       {
         method: req.method ?? 'GET',
-        headers: headersFor(req, cfg.containerToken),
+        headers: headersFor(req, cfg.containerToken, parsed.pathname),
         body:
           req.method === 'GET' || req.method === 'HEAD' ? undefined : (req as unknown as BodyInit),
         duplex: 'half',

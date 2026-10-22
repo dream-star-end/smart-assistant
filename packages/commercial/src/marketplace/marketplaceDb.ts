@@ -53,6 +53,14 @@ import {
   isOfficialBiliAccountPluginIdentity,
 } from '../plugins/biliAccountContract.js'
 import {
+  LITERATURE_PLUGIN_SLUG,
+  LITERATURE_PLUGIN_VERSION,
+} from '../plugins/literatureDb/builtinArtifact.js'
+import {
+  COMPILED_LITERATURE_PLUGIN,
+  isOfficialLiteraturePluginIdentity,
+} from '../plugins/literatureDb/builtinContract.js'
+import {
   lockMarketplaceListing,
   lockMarketplaceMutationSet,
   lockMarketplaceVersion,
@@ -602,6 +610,7 @@ async function publishSkillVersionInternal(
       WEIBO_PLUGIN_SLUG,
       ZHIHU_PLUGIN_SLUG,
       BILI_ACCOUNT_PLUGIN_SLUG,
+      LITERATURE_PLUGIN_SLUG,
       ...OFFICIAL_MARKET_CONNECTOR_SLUGS,
     ].includes(input.slug) &&
       !allowOfficialKnowledgePlanetSeed)
@@ -797,6 +806,26 @@ export async function publishOfficialBiliAccountVersion(
     throw new MarketplaceError(
       'ARTIFACT_MISMATCH',
       'Bilibili account platform seed identity does not match the pinned artifact',
+    )
+  return publishSkillVersionInternal(input, true)
+}
+
+/** Narrow platform-seed bypass for the exact version-controlled Literature DB artifact (OCV5-524). */
+export async function publishOfficialLiteratureVersion(
+  input: PublishInput,
+): Promise<{ versionId: string }> {
+  if (
+    input.slug !== LITERATURE_PLUGIN_SLUG ||
+    input.version !== LITERATURE_PLUGIN_VERSION ||
+    input.kind !== 'connector' ||
+    input.pluginType !== 'managed-browser' ||
+    input.artifactHash !== COMPILED_LITERATURE_PLUGIN.artifactHash ||
+    input.submittedBy !== input.ownerUserId ||
+    input.queueAiReview !== false
+  )
+    throw new MarketplaceError(
+      'ARTIFACT_MISMATCH',
+      'Literature DB platform seed identity does not match the pinned artifact',
     )
   return publishSkillVersionInternal(input, true)
 }
@@ -1523,6 +1552,13 @@ export async function listApprovedForSearch(
           artifactHash: x.artifact_hash,
           execContractHash: verifiedRuntime?.execContractHash ?? null,
           reviewSource: x.review_source,
+        }) ||
+        isOfficialLiteraturePluginIdentity({
+          slug: x.slug,
+          pluginType: x.plugin_type,
+          artifactHash: x.artifact_hash,
+          execContractHash: verifiedRuntime?.execContractHash ?? null,
+          reviewSource: x.review_source,
         }))
     out.push({
       versionId: x.id,
@@ -1781,6 +1817,13 @@ export async function getListingDetail(
               reviewSource: x.review_source,
             }) ||
             isOfficialBiliAccountPluginIdentity({
+              slug: x.slug,
+              pluginType: x.plugin_type,
+              artifactHash: x.artifact_hash,
+              execContractHash: verifiedRuntimeExecContractHash,
+              reviewSource: x.review_source,
+            }) ||
+            isOfficialLiteraturePluginIdentity({
               slug: x.slug,
               pluginType: x.plugin_type,
               artifactHash: x.artifact_hash,

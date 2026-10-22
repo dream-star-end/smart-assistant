@@ -951,7 +951,7 @@ async function handleCall(
           code === 'POLICY_STALE'
         )
           throw new ConnectorError('RELINK_REQUIRED', 'Plugin target is no longer executable')
-        if (code === 'BAD_REQUEST' || code === 'INVALID_PARAMS' || code === 'ACTION_NOT_FOUND')
+        if (code === 'BAD_REQUEST' || code === 'INVALID_PARAMS' || code === 'INVALID_INPUT' || code === 'ACTION_NOT_FOUND')
           throw new ConnectorError('BAD_REQUEST', 'Plugin call is invalid')
         if (code === 'WRITE_DISABLED')
           throw new ConnectorError('WRITE_DISABLED', 'Plugin writes are disabled')

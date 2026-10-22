@@ -12,6 +12,8 @@ import type {
   CommunityTutorialMine,
   CommunityTutorialPage,
   CommunityTutorialSummary,
+  TutorialImageUpload,
+  TutorialKind,
   TutorialSnapshotDraft,
   TutorialSnapshotSubmitResult,
   CronCreateInput,
@@ -692,11 +694,14 @@ export const memorySkillsApi = {
     query?: string;
     category?: CommunityTutorialCategory | null;
     limit?: number;
+    /** 经验分享只列 markdown 投稿。 */
+    kind?: TutorialKind | null;
   }) => {
     const qs = new URLSearchParams();
     if (opts?.cursor) qs.set("cursor", opts.cursor);
     if (opts?.query) qs.set("q", opts.query);
     if (opts?.category) qs.set("category", opts.category);
+    if (opts?.kind) qs.set("kind", opts.kind);
     if (opts?.limit) qs.set("limit", String(opts.limit));
     const suffix = qs.size > 0 ? `?${qs.toString()}` : "";
     return jsonOrThrow<CommunityTutorialPage<CommunityTutorialSummary>>(
@@ -745,6 +750,31 @@ export const memorySkillsApi = {
         }),
       ),
     ),
+
+  /** 经验分享图片上传：原始字节（前端已压成 webp），服务端按魔数复核并去元数据。 */
+  uploadTutorialImage: (a: AuthSession, file: Blob) =>
+    jsonOrThrow<{ image: TutorialImageUpload }>(
+      callWithRefresh(a, (token) =>
+        fetch("/api/tutorials/images", {
+          method: "POST",
+          credentials: "include",
+          headers: { ...bearerHeaders(token), "Content-Type": file.type || "image/webp" },
+          body: file,
+        }),
+      ),
+    ).then((result) => result.image),
+
+  /** 作者/管理员读取未公开稿件里的图（编辑器预览、审核预览）；返回 Blob，调用方转 object URL。 */
+  fetchTutorialImage: async (a: AuthSession, sha256: string): Promise<Blob> => {
+    const res = await callWithRefresh(a, (token) =>
+      fetch(`/api/tutorials/images/${encodeURIComponent(sha256)}`, {
+        credentials: "include",
+        headers: bearerHeaders(token),
+      }),
+    );
+    if (!res.ok) throw new Error(`读取图片失败（${res.status}）`);
+    return res.blob();
+  },
 
   withdrawCommunityTutorial: (a: AuthSession, id: string) =>
     jsonOrThrow<{ ok: boolean }>(

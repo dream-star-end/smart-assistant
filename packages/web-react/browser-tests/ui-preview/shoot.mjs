@@ -253,6 +253,14 @@ async function preparePage(page) {
         if (IMAGE_HOSTS.has(new URL(url).hostname)) return route.continue()
       } catch {}
     }
+    // 经验分享场景的封面 / 正文图:/api/tutorial-embeds/<sha> → fixtures/blog-<sha 前 8 位>.jpg(没有就照旧 204)。
+    const embed = /\/api\/tutorial-embeds\/([a-f0-9]{8})[a-f0-9]{56}$/.exec(url)
+    if (embed) {
+      const fixture = join(HERE, 'fixtures', `blog-${embed[1]}.jpg`)
+      try {
+        return route.fulfill({ status: 200, contentType: 'image/jpeg', body: readFileSync(fixture) })
+      } catch {}
+    }
     let asset
     try {
       asset = assetByName.get(basename(new URL(url).pathname))

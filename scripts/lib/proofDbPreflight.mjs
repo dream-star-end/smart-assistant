@@ -37,6 +37,13 @@ export function vetDsn(raw) {
   };
 }
 
+/** Which database to read. gate-db reaches the server the way scripts/lib/gateTestDb.mjs does
+ * (through `postgres`): the per-train database is new and the base *_test database need not exist
+ * (Codex r1 on the commercial port). shared-db reads the database the proofs will use. */
+export function connectionFor(mode, conn) {
+  return mode === "gate-db" ? { ...conn, database: "postgres" } : conn;
+}
+
 /** Pure decision over catalog facts → [[status, reason], ...]. */
 export function evaluate(mode, f) {
   const out = [];
@@ -116,7 +123,7 @@ async function main() {
     process.exit(0);
   }
   const client = new (pg.default ?? pg).Client({
-    ...conn, ssl: false, connectionTimeoutMillis: 10_000, statement_timeout: 10_000,
+    ...connectionFor(mode, conn), ssl: false, connectionTimeoutMillis: 10_000, statement_timeout: 10_000,
     application_name: "ocv5-581-preflight",
   });
   try {

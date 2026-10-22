@@ -34,6 +34,8 @@ import type {
   DeclarativeManagementResponse,
   DeclarativeOauthStartResult,
   KnowledgePlanetSetupView,
+  LiteratureSetupCapability,
+  LiteratureSetupView,
   LocalPlugin,
   PluginManagementResponse,
   KnowledgePlanetAutomationControl,
@@ -51,6 +53,60 @@ import {
 } from "./http";
 
 export const integrationsApi = {
+  getLiteratureSetupCapability: (a: AuthSession): Promise<LiteratureSetupCapability> =>
+    jsonOrThrow<LiteratureSetupCapability>(callWithRefresh(a, (t) => fetch('/api/plugins/literature-db/setup', {
+      credentials: 'include', headers: bearerHeaders(t),
+    }))),
+  startLiteratureSetup: (a: AuthSession, input: { username: string; password: string; acceptTerms: boolean; accountId?: string }): Promise<LiteratureSetupView> =>
+    jsonOrThrow<LiteratureSetupView>(callWithRefresh(a, (t) => fetch('/api/plugins/literature-db/setup', {
+      method: 'POST', credentials: 'include', headers: bearerHeaders(t, true), body: JSON.stringify(input),
+    }))),
+  getLiteratureSetup: (a: AuthSession, operationId: string): Promise<LiteratureSetupView> =>
+    jsonOrThrow<LiteratureSetupView>(callWithRefresh(a, (t) => fetch(`/api/plugins/literature-db/setup/${encodeURIComponent(operationId)}`, {
+      credentials: 'include', headers: bearerHeaders(t),
+    }))),
+  async getLiteratureSetupImage(a: AuthSession, operationId: string, challengeId: string): Promise<Blob> {
+    const res = await callWithRefresh(a, (t) => fetch(`/api/plugins/literature-db/setup/${encodeURIComponent(operationId)}/challenges/${encodeURIComponent(challengeId)}/image`, {
+      credentials: 'include', headers: { ...bearerHeaders(t), Accept: 'image/png' },
+    }));
+    assertAuthResponseCurrent(res);
+    if (!res.ok) await throwApi(res);
+    const image = await res.blob();
+    assertAuthResponseCurrent(res);
+    return image;
+  },
+  answerLiteratureSetup: (a: AuthSession, operationId: string, challengeId: string, answer: string): Promise<LiteratureSetupView> =>
+    jsonOrThrow<LiteratureSetupView>(callWithRefresh(a, (t) => fetch(`/api/plugins/literature-db/setup/${encodeURIComponent(operationId)}/answer`, {
+      method: 'POST', credentials: 'include', headers: bearerHeaders(t, true), body: JSON.stringify({ challengeId, answer }),
+    }))),
+  cancelLiteratureSetup: (a: AuthSession, operationId: string): Promise<LiteratureSetupView> =>
+    jsonOrThrow<LiteratureSetupView>(callWithRefresh(a, (t) => fetch(`/api/plugins/literature-db/setup/${encodeURIComponent(operationId)}`, {
+      method: 'DELETE', credentials: 'include', headers: bearerHeaders(t),
+    }))),
+  async downloadLiteratureArtifact(a: AuthSession, artifactId: string): Promise<Blob> {
+    const res = await callWithRefresh(a, (t) => fetch(`/api/plugins/literature-db/artifacts/${encodeURIComponent(artifactId)}`, {
+      credentials: 'include', headers: { ...bearerHeaders(t), Accept: 'application/pdf' },
+    }));
+    assertAuthResponseCurrent(res);
+    if (!res.ok) await throwApi(res);
+    const pdf = await res.blob();
+    assertAuthResponseCurrent(res);
+    return pdf;
+  },
+  /** 文献 PDF 保存卡元数据（OCV5-585）：到期时间；已过期或已被清理（404）返回 null。 */
+  async literatureArtifactMeta(
+    a: AuthSession,
+    artifactId: string,
+  ): Promise<{ expiresAt: string; bytes: number; saved: boolean } | null> {
+    const res = await callWithRefresh(a, (t) => fetch(`/api/plugins/literature-db/artifacts/${encodeURIComponent(artifactId)}/meta`, {
+      credentials: 'include', headers: bearerHeaders(t),
+    }));
+    assertAuthResponseCurrent(res);
+    if (res.status === 404) return null;
+    if (!res.ok) await throwApi(res);
+    return (await res.json()) as { expiresAt: string; bytes: number; saved: boolean };
+  },
+
   // 社区教程 admin 审核 + 教程评测(/api/admin/tutorials/*)已整体迁往 lib/api/admin.ts
   // (adminApi),管理后台页直接 import;用户端无调用点,故此处不再保留代理。
 

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import sharp from 'sharp'
+import sharp, { type Metadata } from 'sharp'
 
 import { query, tx, type QueryRunner } from '../db/queries.js'
 import { sanitizeTutorialImageBytes } from './snapshotSanitizer.js'
@@ -63,7 +63,7 @@ export type PreparedTutorialImage = {
 }
 
 async function decodedSize(body: Buffer): Promise<{ width: number; height: number }> {
-  let metadata: sharp.Metadata
+  let metadata: Metadata
   try {
     metadata = await sharp(body, {
       animated: true,

@@ -106,6 +106,18 @@ expect "proof-db warn: tree without pg yet (npm ci after L0 stays supported)" pr
 rpf_reset; rpf_check_proof_db "$W" shared-db "postgres://u:p@10.9.9.9/x_test"
 expect "proof-db red: non-loopback DSN refused even in a tree without pg" proof-db fail "not loopback"
 
+# Codex #992: the test-only probe override is never silent and a probe without a verdict refuses
+rpf_reset; OC_V5_PREFLIGHT_PROOF_PROBE=/dev/null rpf_check_proof_db "$W" gate-db "postgres://u:p@10.9.9.9/x_test"
+expect "proof-db red: replaced probe that prints nothing" proof-db fail "no usable verdict"
+rpf_report >/dev/null && bad "report passed with a silent probe" || ok "report refuses a silent probe"
+printf '%s\n' 'process.stdout.write("ok\tfake\n"); process.exit(3)' >"$T/rc3.mjs"
+rpf_reset; OC_V5_PREFLIGHT_PROOF_PROBE="$T/rc3.mjs" rpf_check_proof_db "$W" gate-db "postgres://u:p@127.0.0.1/x_test"
+expect "proof-db red: probe exits non-zero without a fail line" proof-db fail "rc=3"
+printf '%s\n' 'process.stdout.write("ok\tfake\n")' >"$T/ok.mjs"
+rpf_reset; OC_V5_PREFLIGHT_PROOF_PROBE="$T/ok.mjs" rpf_check_proof_db "$W" gate-db "postgres://u:p@127.0.0.1/x_test"
+[[ "$(rpf_report)" == *"⚠ preflight proof-db: probe replaced by OC_V5_PREFLIGHT_PROOF_PROBE"* ]] \
+  && ok "an overridden probe is always reported" || bad "override not reported"
+
 # ── errexit: the deploy script runs under set -Eeuo pipefail ──────────
 # Healthy and failing paths of every check must return to the caller (the result is the verdict,
 # never an abort). Codex r1 P1: a no-match grep in the healthy workspace path aborted the train.
@@ -141,12 +153,14 @@ rpf_add fail c z; rpf_report >/dev/null && bad "report rc 0 despite a failure" |
 # ── selfhost wiring ───────────────────────────────────────────────────
 body="$(sed -n '/^cmd_deploy() {/,/^}/p' "$DEPLOY")"
 line_of() { grep -n -- "$1" <<<"$body" | head -1 | cut -d: -f1; }
-pf="$(line_of 'selfhost_release_preflight')"; bind="$(line_of 'release_policy_bind_official_train_request')"
-nm="$(line_of '^  ensure_node_modules')"; build="$(line_of 'build_master_release "\$sha"')"
-if [[ -n "$pf" && -n "$bind" && -n "$nm" && -n "$build" ]] && (( pf < bind && pf < nm && pf < build )); then
-  ok "cmd_deploy runs L0 before policy bind, node_modules and the build"
+pf="$(line_of 'selfhost_release_preflight')"; begin="$(line_of '^    lease_train_begin "\$sha"')"
+trailer="$(line_of 'assert_fix_trailers "\$sha"')"; build="$(line_of 'build_master_release "\$sha"')"
+# 2026-10-22 18:4x: L0 ran before lease_train_begin, so its refusal was not a deploy-reported train
+# failure and the worker re-dispatched the same target every ~30 s (117 trains in an hour).
+if [[ -n "$pf" && -n "$begin" && -n "$trailer" && -n "$build" ]] && (( begin < pf && pf <= trailer && pf < build )); then
+  ok "cmd_deploy runs L0 after lease_train_begin (refusal is deploy-reported) and before the build"
 else
-  bad "cmd_deploy wiring order pf=$pf bind=$bind nm=$nm build=$build"
+  bad "cmd_deploy wiring order begin=$begin pf=$pf trailer=$trailer build=$build"
 fi
 grep -q 'selfhost_release_preflight "${LEASE_TARGET_SHA:-$sha}"' <<<"$body" && ok "L0 gets the train's pinned target" || bad "L0 target"
 grep -qE 'avail_kb < RPF_MIN_FREE_KB' "$MASTER" && ok "build disk gate and L0 share one threshold" || bad "disk threshold not shared"

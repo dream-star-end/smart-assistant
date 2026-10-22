@@ -147,20 +147,27 @@ rpf_check_migrations() { # <repo> <from-sha|""> <target-sha>
 # Proof database: the probe reads the catalog in one read-only transaction (pgcrypto availability
 # and schema, public.digest EXECUTE, CREATE DATABASE / CREATE rights). DSN only via the environment.
 rpf_check_proof_db() { # <repo> <gate-db|shared-db> <dsn>
-  local repo="$1" mode="$2" dsn="$3" out rc=0 line s detail any=0
+  local repo="$1" mode="$2" dsn="$3" out rc=0 line s detail any=0 failed=0
+  local probe="$RPF_LIB_DIR/proofDbPreflight.mjs"
   if [[ -z "$dsn" ]]; then
     rpf_add fail proof-db "no proof database DSN configured"; return 0
   fi
-  # cwd = the repo so `pg` resolves from its node_modules; the probe itself ships with this lib
-  out="$(cd "$repo" && OC_V5_PREFLIGHT_PROOF_DSN="$dsn" timeout 30 node "$RPF_LIB_DIR/proofDbPreflight.mjs" "$mode" 2>&1)" || rc=$?
+  # OC_V5_PREFLIGHT_PROOF_PROBE replaces the probe only in tests that have no Postgres. It is never
+  # silent: the replacement is reported, and a probe that gives no verdict is a refusal (Codex #992).
+  if [[ -n "${OC_V5_PREFLIGHT_PROOF_PROBE:-}" ]]; then
+    probe="$OC_V5_PREFLIGHT_PROOF_PROBE"
+    rpf_add warn proof-db "probe replaced by OC_V5_PREFLIGHT_PROOF_PROBE=$probe (test-only; a real departure must not set it)"
+  fi
+  # cwd = the repo so `pg` resolves from its node_modules; the probe itself ships with this lib.
+  out="$(cd "$repo" && OC_V5_PREFLIGHT_PROOF_DSN="$dsn" timeout 30 node "$probe" "$mode" 2>&1)" || rc=$?
   while IFS=$'\t' read -r s detail; do
     case "$s" in
-      ok|warn|fail) rpf_add "$s" proof-db "$detail"; any=1 ;;
+      ok|warn|fail) rpf_add "$s" proof-db "$detail"; any=1; [[ "$s" != fail ]] || failed=1 ;;
     esac
   done <<<"$out"
-  if [[ "$rc" != 0 && "$any" == 0 ]]; then
+  if [[ "$any" == 0 || ( "$rc" != 0 && "$failed" == 0 ) ]]; then
     line="$(tail -n 1 <<<"$out" | sed -E 's#(postgres(ql)?://)[^ "]+#\1<redacted>#g')"
-    rpf_add fail proof-db "probe rc=$rc: ${line:-no output}"
+    rpf_add fail proof-db "probe gave no usable verdict (rc=$rc): ${line:-no output}"
   fi
 }
 

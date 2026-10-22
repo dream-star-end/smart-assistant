@@ -1093,7 +1093,7 @@ describe('RPC 信封契约', () => {
         }
       },
     }
-    for (const code of ['WEIBO_ACTION_FAILED', 'LOGIN_EXPIRED_ACCOUNT'] as const) {
+    for (const code of ['WEIBO_ACTION_FAILED', 'LOGIN_EXPIRED_ACCOUNT', 'DOCUMENT_EXPIRED', 'TIMEOUT', 'RESPONSE_INVALID'] as const) {
       const handler = makeConnectorsRpcHandler({
         identityRepo: okRepo,
         pool: {} as never,

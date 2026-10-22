@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { evaluate, vetDsn } from "./proofDbPreflight.mjs";
+import { connectionFor, evaluate, vetDsn } from "./proofDbPreflight.mjs";
 
 const healthy = {
   user: "test", database: "openclaude_test", serverVersion: "16.15",
@@ -67,4 +67,12 @@ test("the probe only reads: one read-only transaction around a single SELECT", (
   assert.match(sql.trim(), /^SELECT /);
   // privilege names such as 'CREATE' are string literals passed to has_*_privilege, not statements
   assert.doesNotMatch(sql.replace(/'[^']*'/g, "''"), /\b(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|GRANT|REVOKE|TRUNCATE|COMMENT)\b/);
+});
+
+test("gate-db reads the server through postgres like gateTestDb.mjs; shared-db reads the proof database", () => {
+  const conn = vetDsn("postgres://u:p@127.0.0.1/missing_test");
+  assert.equal(connectionFor("gate-db", conn).database, "postgres");
+  assert.equal(connectionFor("shared-db", conn).database, "missing_test");
+  const tool = readFileSync(new URL("./gateTestDb.mjs", import.meta.url), "utf8");
+  assert.match(tool, /database: "postgres"/, "gateTestDb.mjs still connects through postgres");
 });

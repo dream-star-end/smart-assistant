@@ -1,3 +1,4 @@
+import { LiteratureError } from '../plugins/literatureDb/errors.js'
 import assert from 'node:assert/strict'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
@@ -658,6 +659,266 @@ describe('Plugin management HTTP dispatcher', () => {
       ),
       (error: unknown) =>
         error instanceof HttpError && error.status === 429 && error.code === 'CAPACITY_EXCEEDED',
+    )
+  })
+  test('literature PDF artifact download enforces user ownership, no-store headers, and status codes', async () => {
+    const validId = 'litpdf-1234567890abcdef1234567890abcdef'
+    const pdfBytes = Buffer.from('%PDF-1.4\n1 0 obj<<>>endobj\n%%EOF\n')
+    const store = {
+      read: (uid: number, id: string) => {
+        if (uid === 42 && id === validId) {
+          return {
+            artifactId: validId,
+            filename: '深度学习研究_2026.pdf',
+            mimeType: 'application/pdf' as const,
+            bytes: pdfBytes.length,
+            data: pdfBytes,
+          }
+        }
+        return null
+      },
+    }
+    const res = response()
+    await dispatchPluginsRoute(
+      await request('GET', `/api/plugins/literature-db/artifacts/${validId}`),
+      res,
+      {} as any,
+      deps({ literatureArtifacts: store }),
+    )
+    assert.equal(res.statusCode, 200)
+    assert.equal(res.headers.get('content-type'), 'application/pdf')
+    assert.equal(res.headers.get('cache-control'), 'no-store, private')
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff')
+    assert.match(res.headers.get('content-disposition') ?? '', /attachment; filename=/)
+    assert.deepEqual(res.bytes, pdfBytes)
+
+    await assert.rejects(
+      dispatchPluginsRoute(
+        await request('POST', `/api/plugins/literature-db/artifacts/${validId}`),
+        response(),
+        {} as any,
+        deps({ literatureArtifacts: store }),
+      ),
+      (e: unknown) => e instanceof HttpError && e.status === 405,
+    )
+    await assert.rejects(
+      dispatchPluginsRoute(
+        await request('GET', '/api/plugins/literature-db/artifacts/bad_id!'),
+        response(),
+        {} as any,
+        deps({ literatureArtifacts: store }),
+      ),
+      (e: unknown) => e instanceof HttpError && e.status === 400,
+    )
+    await assert.rejects(
+      dispatchPluginsRoute(
+        await request('GET', `/api/plugins/literature-db/artifacts/${validId}`),
+        response(),
+        {} as any,
+        deps(),
+      ),
+      (e: unknown) => e instanceof HttpError && e.status === 503,
+    )
+    await assert.rejects(
+      dispatchPluginsRoute(
+        await request('GET', '/api/plugins/literature-db/artifacts/litpdf-ffffffffffffffffffffffffffffffff'),
+        response(),
+        {} as any,
+        deps({ literatureArtifacts: store }),
+      ),
+      (e: unknown) => e instanceof HttpError && e.status === 404,
+    )
+    await assert.rejects(
+      dispatchPluginsRoute(
+        await request('GET', `/api/plugins/literature-db/artifacts/${validId}`),
+        response(),
+        {} as any,
+        deps({
+          literatureArtifacts: {
+            read: () => {
+              throw new LiteratureError('CAPACITY')
+            },
+          },
+        }),
+      ),
+      (e: unknown) => e instanceof HttpError && e.status === 429,
+    )
+  })
+
+  test('literature PDF artifact meta tells the owner when the saved file expires (OCV5-585)', async () => {
+    const validId = 'litpdf-1234567890abcdef1234567890abcdef'
+    const expiresAt = Date.parse('2026-10-23T01:30:00Z')
+    const reads: string[] = []
+    const store = {
+      read: (_uid: number, id: string) => {
+        reads.push(id)
+        return null
+      },
+      describe: (uid: number, id: string) =>
+        uid === 42 && id === validId
+          ? { filename: '深度学习研究_2026.pdf', bytes: 2048, expiresAt, saved: false }
+          : null,
+    }
+    const res = response()
+    await dispatchPluginsRoute(
+      await request('GET', `/api/plugins/literature-db/artifacts/${validId}/meta`),
+      res,
+      {} as any,
+      deps({ literatureArtifacts: store }),
+    )
+    assert.equal(res.statusCode, 200)
+    assert.match(res.headers.get('cache-control') ?? '', /no-store/)
+    assert.deepEqual(JSON.parse(res.bytes.toString('utf8')), {
+      expiresAt: '2026-10-23T01:30:00.000Z',
+      bytes: 2048,
+      saved: false,
+    })
+    assert.deepEqual(reads, [], 'meta never reads (and never marks the file saved)')
+    await assert.rejects(
+      dispatchPluginsRoute(
+        await request(
+          'GET',
+          '/api/plugins/literature-db/artifacts/litpdf-ffffffffffffffffffffffffffffffff/meta',
+        ),
+        response(),
+        {} as any,
+        deps({ literatureArtifacts: store }),
+      ),
+      (e: unknown) =>
+        e instanceof HttpError && e.status === 404 && e.code === 'LITERATURE_ARTIFACT_EXPIRED',
+    )
+  })
+})
+
+describe('private literature setup routes', () => {
+  test('Bearer authentication and availability are checked before reading credentials', async () => {
+    const req = await request('POST', '/api/plugins/literature-db/setup', {
+      username: 'synthetic',
+      password: 'synthetic-private',
+    })
+    Reflect.deleteProperty(req.headers, 'authorization')
+    await assert.rejects(
+      dispatchPluginsRoute(req, response(), {} as any, deps()),
+      (e: unknown) => e instanceof HttpError && e.status === 401,
+    )
+    assert.equal(req.readableDidRead, false)
+    const unavailable = await request('POST', '/api/plugins/literature-db/setup', {
+      password: 'synthetic-private',
+    })
+    await assert.rejects(
+      dispatchPluginsRoute(unavailable, response(), {} as any, deps()),
+      (e: unknown) => e instanceof HttpError && e.status === 503,
+    )
+    assert.equal(unavailable.readableDidRead, false)
+  })
+  test('fixed JSON schema rejects unsupported type, oversized body and authority fields', async () => {
+    let starts = 0
+    const dependency = deps({
+      literatureSetup: {
+        assertAvailable: async () => {},
+        start: async () => {
+          starts++
+        },
+      },
+    })
+    for (const [input, contentType, status] of [
+      [{ username: 'fixture', password: 'fixture', acceptTerms: true }, 'text/plain', 415],
+      [
+        { username: 'fixture', password: 'x'.repeat(9000), acceptTerms: true },
+        'application/json',
+        413,
+      ],
+      [
+        { username: 'fixture', password: 'fixture', acceptTerms: true, userId: 99 },
+        'application/json',
+        400,
+      ],
+      [
+        {
+          username: 'fixture',
+          password: 'fixture',
+          acceptTerms: true,
+          sessionExpiresAt: Date.now() + 1,
+        },
+        'application/json',
+        400,
+      ],
+    ] as const) {
+      const req = await request('POST', '/api/plugins/literature-db/setup', input)
+      req.headers['content-type'] = contentType
+      await assert.rejects(
+        dispatchPluginsRoute(req, response(), {} as any, dependency),
+        (e: unknown) => e instanceof HttpError && e.status === status,
+      )
+    }
+    assert.equal(starts, 0)
+  })
+  test('private form uses server identity, and image responses stay authenticated and uncached', async () => {
+    const req = await request('POST', '/api/plugins/literature-db/setup', {
+      username: 'fixture',
+      password: 'fixture',
+      acceptTerms: true,
+      accountId: '7',
+    })
+    req.headers['content-type'] = 'application/json; charset=utf-8'
+    let captured: unknown
+    const res = response()
+    const dependency = deps({
+      literatureSetup: {
+        assertAvailable: async () => {},
+        start: async (userId: number, input: unknown) => {
+          captured = { userId, input }
+          return { operationId: SESSION, status: 'running', agentReady: false }
+        },
+        image: async (userId: number, operationId: string, challengeId: string) => {
+          assert.deepEqual([userId, operationId, challengeId], [42, SESSION, SESSION])
+          return { mediaType: 'image/png', data: Buffer.from('synthetic-png') }
+        },
+      },
+    })
+    await dispatchPluginsRoute(req, res, {} as any, dependency)
+    assert.deepEqual(captured, {
+      userId: 42,
+      input: { username: 'fixture', password: 'fixture', acceptTerms: true, accountId: '7' },
+    })
+    assert.equal(res.statusCode, 202)
+    const png = response()
+    await dispatchPluginsRoute(
+      await request(
+        'GET',
+        `/api/plugins/literature-db/setup/${SESSION}/challenges/${SESSION}/image`,
+      ),
+      png,
+      {} as any,
+      dependency,
+    )
+    assert.equal(png.headers.get('cache-control'), 'no-store, private')
+    assert.equal(png.headers.get('x-content-type-options'), 'nosniff')
+    assert.equal(png.headers.get('content-length'), String(png.bytes.length))
+  })
+  test('unexpected upstream errors are replaced before HTTP logging or response construction', async () => {
+    const privateValue = 'synthetic-private-upstream-content'
+    const req = await request('GET', '/api/plugins/literature-db/setup')
+    await assert.rejects(
+      dispatchPluginsRoute(
+        req,
+        response(),
+        {} as any,
+        deps({
+          literatureSetup: {
+            capability: async () => {
+              throw new Error(privateValue)
+            },
+          },
+        }),
+      ),
+      (e: unknown) => {
+        assert(e instanceof HttpError)
+        assert.equal(e.status, 500)
+        assert(!e.message.includes(privateValue))
+        assert(!JSON.stringify(e).includes(privateValue))
+        return true
+      },
     )
   })
 })
