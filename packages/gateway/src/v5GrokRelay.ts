@@ -1,7 +1,8 @@
 /** Loopback-only container hop for Grok CLI subscription traffic. */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
-import { GROK_RELAY_PREFIX } from '@openclaude/protocol'
+import { GROK_RELAY_PREFIX, TRACE_ID_HEADER } from '@openclaude/protocol'
+import { grokRelayTrace } from './relayTrace.js'
 import { isLoopbackRemoteAddress } from './v3CodexRelay.js'
 
 export const V5_GROK_RELAY_PREFIX = GROK_RELAY_PREFIX
@@ -26,16 +27,20 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body))
 }
 
-function headersFor(req: IncomingMessage, token: string): Headers {
+function headersFor(req: IncomingMessage, token: string, pathname: string): Headers {
   const headers = new Headers()
   for (const [rawKey, rawValue] of Object.entries(req.headers)) {
     const key = rawKey.toLowerCase()
     if (HOP.has(key) || key === 'host' || key === 'content-length' || key === 'authorization') continue
+    // The turn trace comes only from the route token's running turn (OCV5-580), never from the caller.
+    if (key === TRACE_ID_HEADER) continue
     if (rawValue === undefined) continue
     if (Array.isArray(rawValue)) rawValue.forEach((value) => headers.append(rawKey, value))
     else headers.set(rawKey, rawValue)
   }
   headers.set('authorization', `Bearer ${token}`)
+  const traceId = grokRelayTrace(pathname)
+  if (traceId) headers.set(TRACE_ID_HEADER, traceId)
   return headers
 }
 
@@ -63,7 +68,7 @@ export async function handleV5GrokRelayLocal(
       `${cfg.masterBaseUrl}${parsed.pathname}${parsed.search}`,
       {
         method: req.method ?? 'GET',
-        headers: headersFor(req, cfg.containerToken),
+        headers: headersFor(req, cfg.containerToken, parsed.pathname),
         body: req.method === 'GET' || req.method === 'HEAD' ? undefined : req as unknown as BodyInit,
         duplex: 'half',
         signal: controller.signal,
