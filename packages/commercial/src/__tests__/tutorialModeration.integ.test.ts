@@ -87,7 +87,7 @@ function transport(opts: {
     async vision() {
       calls.vision += 1
       return {
-        text: opts.vision ?? '{"violation":"no","ad":"no","confidence":0.95}',
+        text: opts.vision ?? '{"violation":"no","ad":"no","leak":"no","confidence":0.95}',
         inputTokens: 1500,
         outputTokens: 40,
       }
@@ -208,7 +208,7 @@ describe('经验分享 AI 审核 worker', () => {
     await storeTutorialImageUpload(author, image)
     const body = `${BODY}\n\n![截图](tutorial-blob:${image.sha256})`
     const first = await submitCommunityTutorial(author, draft(body), { blogEnabled: true })
-    const fake = transport({ vision: '{"violation":"no","ad":"yes","confidence":0.94}' })
+    const fake = transport({ vision: '{"violation":"no","ad":"yes","leak":"no","confidence":0.94}' })
     await runOnce(fake)
     assert.equal(fake.calls.vision, 1)
     assert.equal((await post(first.id)).status, 'rejected')
@@ -272,6 +272,41 @@ describe('经验分享 AI 审核 worker', () => {
     assert.equal((await post(offPost.id)).needs_human, true)
     const jobs = await query(`SELECT 1 FROM community_tutorial_moderation_jobs WHERE publication_id = $1::bigint`, [offPost.id])
     assert.equal(jobs.rowCount, 0)
+  })
+
+  test('on 模式投的稿，处理前切到 shadow：只记录、转人工，不自动发布', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const author = await createUser('a@example.com')
+    const { id } = await submitCommunityTutorial(author, draft())
+    process.env.OC_TUTORIAL_AI_MODERATION = 'shadow'
+    await runOnce(transport({}))
+    assert.deepEqual([(await post(id)).status, (await post(id)).needs_human], ['pending', true])
+    const records = await listTutorialModerations({ cursor: null, limit: 10 })
+    assert.deepEqual([records.items[0]?.mode, records.items[0]?.applied], ['shadow', false])
+  })
+
+  test('租约反复过期、次数用满：不再认领，收尾为 failed 并转人工，不堵队首', async (t) => {
+    if (db.skipIfUnavailable(t)) return
+    const author = await createUser('a@example.com')
+    const stuck = await submitCommunityTutorial(author, draft())
+    const next = await submitCommunityTutorial(author, draft(`${BODY} 第二篇`))
+    await query(
+      `UPDATE community_tutorial_moderation_jobs
+          SET status = 'running', attempt = $2, lease_owner = 'dead', lease_expires_at = NOW() - INTERVAL '1 minute',
+              next_attempt_at = NOW() - INTERVAL '1 hour'
+        WHERE publication_id = $1::bigint`,
+      [stuck.id, TUTORIAL_MODERATION_MAX_ATTEMPTS],
+    )
+    const fake = transport({})
+    await runOnce(fake)
+    assert.equal(fake.calls.text, 1)
+    assert.deepEqual([(await post(stuck.id)).status, (await post(stuck.id)).needs_human], ['pending', true])
+    assert.equal((await post(next.id)).status, 'approved')
+    const job = await query<{ status: string }>(
+      'SELECT status FROM community_tutorial_moderation_jobs WHERE publication_id = $1::bigint',
+      [stuck.id],
+    )
+    assert.equal(job.rows[0]?.status, 'failed')
   })
 
   test('作者在审核前撤回：作业跳过，不记判定', async (t) => {

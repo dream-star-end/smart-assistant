@@ -27,7 +27,7 @@ describe('tutorialModeration · 判定规则', () => {
   test('四问都确定为否、图片都通过、无注入 → 自动通过', () => {
     const decision = decideModeration({
       text: allNo(),
-      images: [{ sha256: SHA, violation: 'no', ad: 'no', confidence: 0.95 }],
+      images: [{ sha256: SHA, violation: 'no', ad: 'no', leak: 'no', confidence: 0.95 }],
       injection: false,
       imagesUnreviewed: false,
     })
@@ -50,7 +50,7 @@ describe('tutorialModeration · 判定规则', () => {
     assert.equal(
       decideModeration({
         text: allNo(),
-        images: [{ sha256: SHA, violation: 'no', ad: 'yes', confidence: 0.93 }],
+        images: [{ sha256: SHA, violation: 'no', ad: 'yes', leak: 'no', confidence: 0.93 }],
         injection: false,
         imagesUnreviewed: false,
       }).verdict,
@@ -58,12 +58,32 @@ describe('tutorialModeration · 判定规则', () => {
     )
     const unsure = decideModeration({
       text: allNo(),
-      images: [{ sha256: SHA, violation: 'no', ad: 'no', confidence: 0.6 }],
+      images: [{ sha256: SHA, violation: 'no', ad: 'no', leak: 'no', confidence: 0.6 }],
       injection: false,
       imagesUnreviewed: false,
     })
     assert.equal(unsure.verdict, 'uncertain')
     assert.match(unsure.adminNote ?? '', /图片 cccccccc/)
+  })
+
+  test('截图里能看到密码/隐私 → 驳回；图片没给泄密维度 → 转人工', () => {
+    const leak = decideModeration({
+      text: allNo(),
+      images: [{ sha256: SHA, violation: 'no', ad: 'no', leak: 'yes', confidence: 0.99 }],
+      injection: false,
+      imagesUnreviewed: false,
+    })
+    assert.equal(leak.verdict, 'reject')
+    assert.match(leak.reason ?? '', /密码、密钥或他人隐私/)
+    assert.equal(
+      decideModeration({
+        text: allNo(),
+        images: [{ sha256: SHA, violation: 'no', ad: 'no', leak: null, confidence: 0.99 }],
+        injection: false,
+        imagesUnreviewed: false,
+      }).verdict,
+      'uncertain',
+    )
   })
 
   test('置信度不够、拿不到判定、注入特征、图片没审 → 一律转人工，不自动通过', () => {
@@ -145,10 +165,11 @@ describe('tutorialModeration · 提示词注入样本不会被自动通过', () 
 
 describe('tutorialModeration · 视觉结论解析', () => {
   test('严格 JSON；容忍代码围栏；字段缺失或越界 → 全部 null', () => {
-    assert.deepEqual(parseVisionVerdict('{"violation":"no","ad":"yes","confidence":0.92}', SHA), {
+    assert.deepEqual(parseVisionVerdict('{"violation":"no","ad":"yes","leak":"no","confidence":0.92}', SHA), {
       sha256: SHA,
       violation: 'no',
       ad: 'yes',
+      leak: 'no',
       confidence: 0.92,
     })
     assert.equal(
