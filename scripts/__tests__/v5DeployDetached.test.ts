@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
@@ -259,27 +259,47 @@ function git(args: string[]): string {
   return r.stdout.trim()
 }
 
-// 假 ssh:只回答 deploy-v5.sh egress surface gate 的两次只读查询(egress 进程 cwd、release sourceCommit)。
+// 假 ssh:只回答 deploy-v5.sh egress surface gate 的两次只读查询(egress 进程 cwd、release sourceCommit),
+// 以及 OCV5-581 L0 的三类只读查询:deploy_state 快照(psql)、serving release(readlink)、
+// baseline 结构复验(把本 checkout 的 guard 脚本在本机对 fixture release 真跑一遍)。
 // OCV5-391:egress 进程 cwd 经 scripts/v5-egress-slots.sh active 读取(legacy 或双槽之一)。
+const BASELINE_REL = 'packages/commercial/agent-sandbox/ccb-baseline'
 function preflightFixture(egressSha: string): {
   env: NodeJS.ProcessEnv
   queue: (args: string[]) => ReturnType<typeof spawnSync>
+  serving: string
+  previous: string
+  bin: string
   cleanup: () => void
 } {
   const dir = mkdtempSync(path.join(tmpdir(), 'v5-deploy-preflight-'))
   const bin = path.join(dir, 'bin')
   spawnSync('mkdir', ['-p', bin])
+  // serving / 回退目标 release:本 checkout 的 baseline 原样复制,结构必兼容。
+  const serving = path.join(dir, 'releases', 'rel-serving')
+  const previous = path.join(dir, 'releases', 'rel-previous')
+  for (const rel of [serving, previous]) {
+    mkdirSync(path.join(rel, path.dirname(BASELINE_REL)), { recursive: true })
+    cpSync(path.join(root, BASELINE_REL), path.join(rel, BASELINE_REL), { recursive: true })
+  }
   writeFileSync(
     path.join(bin, 'ssh'),
     `#!/usr/bin/env bash
 case "$*" in
   *"bash -s -- active"*) printf '%s\\n' 'openclaude-v5-egress@A.service 4242 /opt/openclaude/openclaude-v5-releases/rel-egress-fixture' ;;
   *sourceCommit*) printf '%s\\n' "$FAKE_EGRESS_SHA" ;;
+  *psql*) cat >/dev/null; [[ "\${FAKE_DS_FAIL:-0}" == 1 ]] && exit 2
+          printf '%s\\n' "7|stable|A||$FAKE_SERVING||A|A|0||0||5|$FAKE_PREVIOUS" ;;
+  *"readlink -f"*) printf '%s\\n' "$FAKE_SERVING" ;;
+  *"bash -s -- check-structure-release"*) shift; eval "$*" ;;
   *) exit 97 ;;
 esac
 `,
   )
   chmodSync(path.join(bin, 'ssh'), 0o755)
+  // 本机没有 Postgres 的用例:探针换成只回结论的假探针(真探针的判定在 proofDbPreflight.test.mjs)。
+  writeFileSync(path.join(bin, 'fake-proof-probe.mjs'),
+    `process.stdout.write(process.env.FAKE_PROBE_LINE ?? "ok\\tfake probe\\n"); process.exit(process.env.FAKE_PROBE_LINE?.startsWith("fail") ? 1 : 0)\n`)
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     PATH: `${bin}:${process.env.PATH}`,
@@ -288,6 +308,9 @@ esac
     // 默认关掉 nightly 提示,别让用例去打真 GitHub;专门的用例用假 gh 打开。
     OC_V5_PREFLIGHT_NIGHTLY: '0',
     FAKE_EGRESS_SHA: egressSha,
+    FAKE_SERVING: serving,
+    FAKE_PREVIOUS: previous,
+    OC_V5_PREFLIGHT_PROOF_PROBE: path.join(bin, 'fake-proof-probe.mjs'),
     OC_V5_RELEASE_QUEUE_DB: path.join(dir, 'queue.db'),
     OC_V5_RELEASE_QUEUE_LOCK: path.join(dir, 'queue.lock'),
     OC_V5_RELEASE_QUEUE_REPO_ROOT: root,
@@ -298,7 +321,7 @@ esac
   delete env.OC_V5_DETACHED_SKIP_PREFLIGHT
   const queue = (args: string[]) =>
     spawnSync(path.join(root, 'scripts/v5-release-queue.sh'), args, { cwd: root, encoding: 'utf8', env })
-  return { env, queue, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
+  return { env, queue, serving, previous, bin, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
 }
 
 function activePinnedQueue(fx: ReturnType<typeof preflightFixture>, sha: string): string {
@@ -399,6 +422,128 @@ test('preflight skips dry-run and does not demand a proof DSN for recovery lanes
     assert.equal(reuse.status, 0, reuse.stderr)
   } finally {
     fx.cleanup()
+  }
+})
+
+// ── OCV5-581 L0:2026-10-22 seq365 的三个面在建 unit 之前拒绝 ──
+function readyRun(fx: ReturnType<typeof preflightFixture>, sha: string, extra: NodeJS.ProcessEnv = {}, args = ['--with-dist']) {
+  const id = activePinnedQueue(fx, sha)
+  return runPreflight({ ...fx.env, OC_V5_RELEASE_QUEUE_ID: id,
+    OC_V5_PROOF_TEST_DATABASE_URL: 'postgres://t@127.0.0.1:55432/x_test', ...extra }, args)
+}
+
+test('L0 green: pin, links, proof probe and both baselines are reported and pass', () => {
+  const head = git(['rev-parse', 'HEAD'])
+  const fx = preflightFixture(head)
+  try {
+    const r = readyRun(fx, head)
+    assert.equal(r.status, 0, r.stderr)
+    for (const check of ['source-pin', 'workspace-links', 'proof-db', 'baseline', 'baseline-rollback']) {
+      assert.match(r.stderr, new RegExp(`✓ preflight ${check}:`), check)
+    }
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('L0 refuses a serving release whose baseline structure this checkout rejects (seq365 attempt 3)', () => {
+  const head = git(['rev-parse', 'HEAD'])
+  const fx = preflightFixture(head)
+  try {
+    mkdirSync(path.join(fx.serving, BASELINE_REL, 'skills', 'zz-retired-elsewhere'))
+    writeFileSync(path.join(fx.serving, BASELINE_REL, 'skills', 'zz-retired-elsewhere', 'SKILL.md'), '# x\n')
+    const r = readyRun(fx, head)
+    assert.equal(r.status, 2, r.stderr)
+    assert.match(r.stderr, /✗ preflight baseline: serving rel-serving: skill manifest mismatch \[\+zz-retired-elsewhere -\]/)
+    assert.match(r.stderr, /未创建 detached unit/)
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('L0 only warns about an incompatible rollback target', () => {
+  const head = git(['rev-parse', 'HEAD'])
+  const fx = preflightFixture(head)
+  try {
+    rmSync(path.join(fx.previous, BASELINE_REL, 'AGENTS.md'))
+    const r = readyRun(fx, head)
+    assert.equal(r.status, 0, r.stderr)
+    assert.match(r.stderr, /⚠ preflight baseline-rollback: 回退目标 rel-previous/)
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('L0 refuses when the deploy_state snapshot cannot be read, as deploy would', () => {
+  const head = git(['rev-parse', 'HEAD'])
+  const fx = preflightFixture(head)
+  try {
+    const r = readyRun(fx, head, { FAKE_DS_FAIL: '1' })
+    assert.equal(r.status, 2, r.stderr)
+    assert.match(r.stderr, /✗ preflight baseline: deploy_state 只读快照读不到/)
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('L0 refuses a proof database the probe rejects (seq365 attempt 2) and the DSN never reaches output', () => {
+  const head = git(['rev-parse', 'HEAD'])
+  const fx = preflightFixture(head)
+  try {
+    const r = readyRun(fx, head, { FAKE_PROBE_LINE: 'fail\tpgcrypto is installed in schema extensions, not public\n' })
+    assert.equal(r.status, 2, r.stderr)
+    assert.match(r.stderr, /✗ preflight proof-db: pgcrypto is installed in schema extensions/)
+    assert.doesNotMatch(r.stderr + r.stdout, /postgres:\/\//)
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('L0 refuses a checkout HEAD that moved past the pinned SHA (build_release :4010)', () => {
+  const head = git(['rev-parse', 'HEAD'])
+  const parent = git(['rev-parse', 'HEAD~1'])
+  const fx = preflightFixture(head)
+  try {
+    // pin 只能落在当时的 HEAD;模拟「pin 之后共享 canonical 又前进了一个提交」:队列里的 pin 改成父提交。
+    const id = activePinnedQueue(fx, head)
+    const db = String(fx.env.OC_V5_RELEASE_QUEUE_DB)
+    const upd = spawnSync('sqlite3', [db, `UPDATE release_queue_jobs SET canonical_sha='${parent}' WHERE id='${id}';`], { encoding: 'utf8' })
+    assert.equal(upd.status, 0, upd.stderr)
+    const r = runPreflight({ ...fx.env, OC_V5_RELEASE_QUEUE_ID: id,
+      OC_V5_PROOF_TEST_DATABASE_URL: 'postgres://t@127.0.0.1:55432/x_test' }, ['--with-dist'])
+    assert.match(r.stderr, /✓ V5 release queue active=.* canonical_sha=/, 'the queue itself still accepts an ancestor pin')
+    assert.equal(r.status, 2, r.stderr)
+    assert.match(r.stderr, /✗ preflight source-pin: .* HEAD [0-9a-f]{12} ≠ target [0-9a-f]{12}/)
+  } finally {
+    fx.cleanup()
+  }
+})
+
+test('baseline guard structure modes are read-only and ignore modes the harden step fixes', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'v5-baseline-structure-'))
+  try {
+    const rel = path.join(dir, 'rel-x')
+    mkdirSync(path.join(rel, path.dirname(BASELINE_REL)), { recursive: true })
+    cpSync(path.join(root, BASELINE_REL), path.join(rel, BASELINE_REL), { recursive: true })
+    const agents = path.join(rel, BASELINE_REL, 'AGENTS.md')
+    chmodSync(agents, 0o666) // group/other writable: check-release refuses, harden would fix it
+    const guard = path.join(root, 'scripts/v5-baseline-security.sh')
+    const run = (mode: string) => spawnSync('bash', [guard, mode, rel], { encoding: 'utf8' })
+    for (const mode of ['check-structure-release', 'check-structure-release-legacy-cursor']) {
+      const r = run(mode)
+      assert.equal(r.status, 0, `${mode}: ${r.stderr}`)
+      assert.match(r.stdout, /^ok structure=/)
+    }
+    assert.notEqual(run('check-release').status, 0, 'owner/mode check still refuses the same tree')
+    assert.equal(statSync(agents).mode & 0o777, 0o666, 'structure modes changed nothing')
+    mkdirSync(path.join(rel, BASELINE_REL, 'skills', 'zz-extra'))
+    writeFileSync(path.join(rel, BASELINE_REL, 'skills', 'zz-extra', 'SKILL.md'), '# x\n')
+    const extra = run('check-structure-release-legacy-cursor')
+    assert.notEqual(extra.status, 0)
+    assert.match(extra.stderr, /skill manifest/)
+    assert.ok(existsSync(path.join(rel, BASELINE_REL, 'skills', 'zz-extra')))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
 })
 
