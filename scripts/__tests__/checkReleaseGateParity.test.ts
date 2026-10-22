@@ -80,12 +80,21 @@ test("red: a quote or heredoc spanning lines that only prints the gate does not 
     "run: |\n          echo '\n          node scripts/check-v5-callback-payload-hash.mjs\n          '",
     "run: |\n          echo \"\n          node scripts/check-v5-callback-payload-hash.mjs\n          \"",
     "run: |\n          cat <<'EOF'\n          node scripts/check-v5-callback-payload-hash.mjs\n          EOF",
+    // Codex r3: any bash word is a delimiter
+    "run: |\n          cat <<'END-OF-TEXT'\n          node scripts/check-v5-callback-payload-hash.mjs\n          END-OF-TEXT",
+    "run: |\n          cat <<42\n          node scripts/check-v5-callback-payload-hash.mjs\n          42",
+    "run: |\n          cat <<\"two words\"\n          node scripts/check-v5-callback-payload-hash.mjs\n          two words",
   ]) {
     const input = real();
     input.workflows[wf] = input.workflows[wf]!.replace(step, fake);
-    assert.ok(input.workflows[wf]!.includes("cat <<'EOF'") || input.workflows[wf]!.includes("echo"), fake);
+    assert.ok(!input.workflows[wf]!.includes(step), fake);
     assert.deepEqual(kinds(check(input)), ["ci-missing"], fake);
   }
+});
+
+test("a here-string is not a heredoc: the next line still runs", () => {
+  const runs = runsIn(shellCommands("grep -q x <<< \"$v\"\nnode scripts/a.mjs"));
+  assert.deepEqual([...runs.scripts], ["scripts/a.mjs"]);
 });
 
 test("a comment with an apostrophe does not swallow the next command", () => {

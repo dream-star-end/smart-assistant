@@ -63,8 +63,9 @@ function dropHeredocBodies(lines: string[]): string[] {
       if ((heredoc.dash ? raw.replace(/^\t+/, "") : raw) === heredoc.tag) heredoc = null;
       continue;
     }
-    const doc = /<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/.exec(raw);
-    if (doc) heredoc = { tag: doc[3]!, dash: doc[1] === "-" };
+    // any bash word is a delimiter (END-OF-TEXT, 42, 'a b'); `<<<` is a here-string, not a heredoc
+    const doc = /(?<!<)<<(?!<)(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([^\s;&|<>()'"]+))/.exec(raw);
+    if (doc) heredoc = { tag: (doc[2] ?? doc[3] ?? doc[4])!, dash: doc[1] === "-" };
     out.push(raw);
   }
   return out;
