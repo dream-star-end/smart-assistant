@@ -1,4 +1,4 @@
-# Muse bridge（Muse VM 内运行的中转程序）v0.3.1
+# Muse bridge（Muse VM 内运行的中转程序）v0.3.2
 
 只有一个文件：`muse_bridge.py`。只用 Python 3 标准库，不需要 pip 安装任何东西。
 文件里**没有任何密钥**：token 在首次启动时提示输入（不回显），保存在 `~/.muse-bridge/token`（权限 0600）。
@@ -10,7 +10,7 @@
 python3 muse_bridge.py start --server https://<个人版域名>
 ```
 
-- 第一次运行会提示粘贴 bridge token，随后自检（`media-generation` 能否运行、能否连到 server），通过后在后台运行。
+- 第一次运行会提示粘贴 bridge token，随后自检（`media-generation` 能否运行、能否连到 server、bridge 接口的 POST 请求能否真正到达个人版服务端），通过后在后台运行。
 - 再次启动只需要 `python3 muse_bridge.py start`，server 地址和 token 都已保存在 `~/.muse-bridge/`。
 - 个人版域名变了：用新的 `--server` 再执行一次 `start`。已在运行的 bridge 会在下次重连时读取新地址；或者先 `stop` 再 `start`。
 
@@ -54,5 +54,20 @@ python3 muse_bridge.py start --server https://<个人版域名>
 - 只上传本任务输出目录内的成品文件，并核对文件类型和大小：图片 ≤ 25 MiB；视频 ≤ 64 MiB，实测 10.7 MB，余量充足。源图每张 ≤ 10 MiB，只接受 png、jpg、webp。
 - 日志 `~/.muse-bridge/bridge.log` 只记任务 id、类型、耗时、错误码和字节数，不记提示词、token、snapshot 或 Meta 的图片链接；超过 5 MB 轮转，保留 2 份。
 - token 被拒绝，或者另一个 bridge 接管了连接时，会直接退出，不会无限重试。
+- 只有个人版服务端自己写出的 JSON 错误（401 `UNAUTHORIZED`）才报「token 被个人版服务端拒绝」，退出码 2。个人版服务端的 bridge 接口从不返回 403。
+
+## 出现 HTTP 401/403 时怎么判断
+
+中间的代理或 Cloudflare 也可能返回 401/403，这时换 token 没有用。v0.3.2 起，这类 401/403 会单独报出来：
+
+```
+HTTP 403 不是个人版服务端返回的（Server: …，cf-ray: …，本机代理: host:port）。多半是 Muse VM 的出口代理或 Cloudflare 拦截了请求，换 token 没有用。响应摘要：…
+```
+
+bridge 随后以退出码 3 退出。要判断是哪一层拦的：
+
+- 先运行 `python3 muse_bridge.py check`。其中「bridge 接口可用」一项会按真实请求的格式（POST、JSON 正文、Bearer 头）向 `/api/muse-bridge/probe` 发一次请求，只有收到服务端自己的 JSON 404 才算通过。服务端在检查 token 之前就会应答这个地址，所以这一项不发送真实 token、不会顶掉正在运行的 bridge，也不计入服务端按 IP 统计的登录失败次数。
+- 「本机代理」显示的是 `HTTPS_PROXY`（或 `https_proxy`）里的主机和端口，账号和密码会去掉。响应摘要里疑似凭据的内容（token、认证头、Cookie、`user:pass@`、长串随机字符）和链接都会替换成 `<redacted>` 或 `<url>`。如果这里有代理，并且 `Server` 不是 `cloudflare`，基本可以确定是 Muse VM 的出口代理拦截了。
+- `Server: cloudflare` 并且带 cf-ray 时，说明是 Cloudflare 边缘拦截。可以把 cf-ray 发给运维查。
 
 协议与错误码详见设计文档 `DESIGN-20261022-muse-media.md` 的 §3、§9。

@@ -50,7 +50,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BRIDGE_VERSION = "0.3.1"
+BRIDGE_VERSION = "0.3.2"
 API_PREFIX = "/api/muse-bridge/v1"
 DEFAULT_CLI = "/opt/hatch/bin/media-generation"
 DEFAULT_STATE_DIR = os.path.join(os.path.expanduser("~"), ".muse-bridge")
@@ -101,6 +101,10 @@ log = logging.getLogger("muse-bridge")
 
 class FatalAuth(Exception):
     """Token rejected or session superseded: stop instead of retrying."""
+
+
+class Blocked(FatalAuth):
+    """A 401/403 that the selfhost master did not write (VM egress proxy, Cloudflare, ...)."""
 
 
 class JobGone(Exception):
@@ -339,6 +343,62 @@ def redact(text, limit=500):
     return text[-limit:]
 
 
+TAG_RE = re.compile(r"<(script|style)\b.*?</\1>|<[^>]+>", re.S | re.I)
+# Text from a proxy or CDN error page is untrusted: before it is printed or logged, drop anything
+# that could be a credential (tokens, auth headers, cookies, user:pass@, long opaque strings) or a
+# link, including JSON-escaped ones.
+SECRET_RES = (
+    (re.compile(r"https?:(?:\\?/){2}\S*", re.I), "<url>"),
+    # Header-style and JSON-style fields alike: `Cookie: a=b`, `"password":"x"`, `token='x'`.
+    # A value that opens with a quote ends at the matching unescaped quote; any other
+    # auth/cookie value runs to the end of its line, so quotes inside it cannot end it early.
+    (re.compile(r"""["']?\b((?:proxy-)?authorization|(?:set-)?cookie)\b["']?\s*[:=]\s*"""
+                r"""(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\n]*)""", re.I), r"\1: <redacted>"),
+    (re.compile(r"""["']?\b(password|passwd|pwd|secret|token|access[_-]?token|api[_-]?key|session[_-]?id)\b"""
+                r"""["']?\s*[:=]\s*(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}&<>]+)""", re.I),
+     r"\1=<redacted>"),
+    (re.compile(r"\b(?:basic|bearer|digest|negotiate)\s+\S+", re.I), "<redacted>"),
+    (re.compile(r"\S+:\S*@"), "<redacted>@"),
+    (re.compile(r"mbr_[A-Za-z0-9_-]*"), "mbr_<redacted>"),
+    (re.compile(r"[A-Za-z0-9+/_=-]{24,}"), "<redacted>"),
+)
+
+
+def scrub(text):
+    for pattern, repl in SECRET_RES:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def master_error_code(payload):
+    """error.code of a JSON error body the selfhost master wrote, else None."""
+    try:
+        err = json.loads(payload.decode("utf-8")).get("error")
+    except (ValueError, AttributeError, UnicodeDecodeError):
+        return None
+    code = err.get("code") if isinstance(err, dict) else None
+    return code if isinstance(code, str) else None
+
+
+def proxy_for(url):
+    """host:port of the proxy urllib will use for url (credentials dropped), or 无."""
+    proxy = urllib.request.getproxies().get(urllib.parse.urlsplit(url).scheme)
+    if not proxy or urllib.request.proxy_bypass(urllib.parse.urlsplit(url).hostname or ""):
+        return "无"
+    return urllib.parse.urlsplit(proxy if "://" in proxy else "http://" + proxy).netloc.rpartition("@")[2]
+
+
+def describe_foreign(status, headers, payload, url):
+    """One line saying who most likely answered status instead of the master."""
+    server = (headers.get("Server") if headers else None) or "-"
+    ray = (headers.get("cf-ray") if headers else None) or "-"
+    # Scrub before collapsing whitespace: a header-style value ends at its line break.
+    text = " ".join(scrub(TAG_RE.sub("\n", payload[:4096].decode("utf-8", "replace"))).split())
+    return ("HTTP %d 不是个人版服务端返回的（Server: %s，cf-ray: %s，本机代理: %s）。"
+            "多半是 Muse VM 的出口代理或 Cloudflare 拦截了请求，换 token 没有用。响应摘要：%s"
+            % (status, scrub(server)[:80], scrub(ray)[:40], proxy_for(url), text[:160] or "（空）"))
+
+
 def parse_contract(stdout):
     """The CLI prints one JSON line; take the last line that parses as an object."""
     for line in reversed((stdout or "").splitlines()):
@@ -561,10 +621,19 @@ class Client:
         except urllib.error.HTTPError as e:
             status = e.code
             payload = e.read() if e.fp else b""
-        if status in (401, 403):
-            raise FatalAuth("token 被拒绝（HTTP %d），请检查或重新签发 token" % status)
-        if status == 409:
-            raise FatalAuth("已有新的 bridge 接管连接（HTTP 409），本实例退出")
+            resp_headers = e.headers
+        else:
+            resp_headers = resp.headers
+        # Only the master's own JSON errors mean "token rejected" / "superseded"; the same status
+        # from a proxy or the CDN in front of it must not send the user off to rotate the token.
+        if status in (401, 403, 409):
+            code = master_error_code(payload)
+            if status == 401 and code == "UNAUTHORIZED":
+                raise FatalAuth("token 被个人版服务端拒绝（HTTP 401），请检查或重新签发 token")
+            if status == 409 and code == "SUPERSEDED":
+                raise FatalAuth("已有新的 bridge 接管连接（HTTP 409），本实例退出")
+            if status != 409:
+                raise Blocked(describe_foreign(status, resp_headers, payload, url))
         if status == 410:
             raise JobGone()
         if status == 204:
@@ -654,6 +723,9 @@ class Bridge:
                 log.info("已连接 %s（session %s…）", server_host(server), client.session_id[:8])
                 backoff = 1
                 self.loop(client, hello)
+            except Blocked as e:
+                log.error("%s", e)
+                return 3
             except FatalAuth as e:
                 log.error("%s", e)
                 return 2
@@ -895,6 +967,32 @@ def probe_server(server):
         return False, redact(str(e), 200)
 
 
+PROBE_PATH = "/api/muse-bridge/probe"
+
+
+def probe_bridge_api(server):
+    """POST shaped like a real bridge call (JSON body, Bearer header) to a path outside /v1/: the
+    master answers its own JSON 404 NOT_FOUND before looking at the token, so this proves the POST
+    reaches it without counting as a failed login (the master locks an IP out after repeated ones)
+    and without sending the real token or taking over a running bridge."""
+    url = server + PROBE_PATH
+    req = urllib.request.Request(url, data=b"{}", method="POST", headers={
+        "Authorization": "Bearer probe", "Content-Type": "application/json",
+        "User-Agent": "muse-bridge/" + BRIDGE_VERSION})
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler()).open(req, timeout=15) as r:
+            status, headers, payload = r.status, r.headers, r.read(4096)
+    except urllib.error.HTTPError as e:
+        status, headers, payload = e.code, e.headers, (e.read(4096) if e.fp else b"")
+    except Exception as e:
+        return False, redact(str(e), 200)
+    if status == 404 and master_error_code(payload) == "NOT_FOUND":
+        return True, "POST 能到达个人版服务端"
+    if status in (401, 403):
+        return False, describe_foreign(status, headers, payload, url)
+    return False, "HTTP %d，不是个人版服务端的应答，server 地址可能不对" % status
+
+
 def self_check(paths, cli, verbose=True):
     ok = True
 
@@ -925,8 +1023,12 @@ def self_check(paths, cli, verbose=True):
     server = read_server(paths)
     if server:
         good, detail = probe_server(server)
-        say(good, "能连到 server %s" % server_host(server), detail)
+        say(good, "能连到 server %s" % server_host(server), detail + "，本机代理: " + proxy_for(server))
         ok &= good
+        if good:
+            good, detail = probe_bridge_api(server)
+            say(good, "bridge 接口可用", detail)
+            ok &= good
     else:
         say(False, "server 地址", "未设置（用 --server 指定）")
         ok = False
