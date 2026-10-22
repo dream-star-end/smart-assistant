@@ -222,6 +222,16 @@ export type RuntimePluginAccount = {
       disclaimerText: string | null
     }
   } | null
+  /** 「今日已用 / 上限」（OCV5-553）：只有声明了每日写上限的插件（当前只有抖音）才有。 */
+  writeUsage?: {
+    /** 北京时间 YYYY-MM-DD。 */
+    day: string
+    /** false = 服务端读不到计数，前端只说「暂不可用」，不显示 0。 */
+    available: boolean
+    buckets: Array<{ bucket: string; label: string; used: number; cap: number }>
+    /** 风控冷却到期时间（ISO）；没有冷却时 null。 */
+    cooldownUntil: string | null
+  } | null
 }
 
 export type PluginManagementResponse = {

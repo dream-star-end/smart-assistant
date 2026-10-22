@@ -97,6 +97,15 @@ export async function readDouyinWriteGate(input: {
   }
 }
 
+/** 风控冷却到期时间（插件卡片显示）；没有冷却时 null。Redis 读失败时抛 RUNTIME_UNAVAILABLE。 */
+export async function readDouyinWriteCooldown(input: {
+  redis: PluginLeaseRedis | null | undefined
+  connectionId: string
+  now: number
+}): Promise<number | null> {
+  return (await readDouyinWriteGate({ ...input, actionId: 'publish_video' })).cooldownUntil
+}
+
 /** 执行前的闸：冷却中 → DOUYIN_WRITE_COOLDOWN；间隔没到 → DOUYIN_PACING_WAIT。 */
 export async function assertDouyinWriteAllowed(input: {
   redis: PluginLeaseRedis | null | undefined

@@ -21,6 +21,7 @@ import {
   Switch,
 } from '../../ui'
 import { KnowledgePlanetAutomationPanel } from '../KnowledgePlanetAutomationPanel'
+import { WriteUsageRow } from './WriteUsageRow'
 import {
   AccountRows,
   CONNECTOR_SECTION,
@@ -409,6 +410,9 @@ export function RuntimePluginCard({
                       }}
                     />
                   </ListRow>
+                )}
+                {account.writeControl && account.writeUsage && (
+                  <WriteUsageRow usage={account.writeUsage} accountName={accountName} />
                 )}
                 {/* 自动回复外提：账号下只留一行入口，规则子系统去 Sheet 里展开。 */}
                 {plugin.slug === 'knowledge-planet' && account.status === 'active' && (

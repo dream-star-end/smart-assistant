@@ -71,6 +71,12 @@ const DOUYIN_WRITE_DAILY_CAP: ManagedPluginWriteDailyCapPolicy = Object.freeze({
   }),
   defaultBucket: 'other',
   caps: Object.freeze({ publish_video: 3, publish_images: 3, comment: 20, digg: 30, other: 1 }),
+  labels: Object.freeze({
+    publish_video: '发布视频',
+    publish_images: '发布图文',
+    comment: '评论与回复',
+    digg: '点赞',
+  }),
 })
 
 /** A managed-browser Plugin may expose writes only when the platform owns a current policy. */

@@ -49,6 +49,7 @@ import {
   DouyinWriteGuardError,
   assertDouyinWriteAllowed,
   beijingClock,
+  readDouyinWriteCooldown,
   readDouyinWriteGate,
   recordDouyinWriteDispatch,
   tripDouyinWriteCooldown,
@@ -78,7 +79,9 @@ import {
 import { WEIBO_PLUGIN_SLUG } from './weiboContract.js'
 import {
   type ManagedPluginWriteDailyCapPolicy,
+  type ManagedPluginWriteDailyUsage,
   consumeManagedPluginWriteDailyCap,
+  readManagedPluginWriteDailyUsage,
 } from './writeDailyCap.js'
 import {
   managedPluginWriteDailyCap,
@@ -133,6 +136,14 @@ export interface RuntimePluginWriteControl {
   }
 }
 
+/**
+ * 插件卡片上的「今日已用 / 上限」(OCV5-553):只有声明了每日写上限的插件(当前只有抖音)才有。
+ * `cooldownUntil` 是抖音风控冷却的到期时间(ISO),没有冷却或读不到时为 null。
+ */
+export type RuntimePluginWriteUsage = ManagedPluginWriteDailyUsage & {
+  cooldownUntil: string | null
+}
+
 export interface RuntimePluginManagementEntry extends RuntimePluginCatalogEntry {
   installed: boolean
   installedVersion: string
@@ -148,6 +159,8 @@ export interface RuntimePluginManagementAccount extends Omit<RuntimePluginTarget
   versionId: string
   executable: boolean
   writeControl: RuntimePluginWriteControl | null
+  /** 只在有写开关且声明了每日上限的插件上出现(当前只有抖音)。 */
+  writeUsage?: RuntimePluginWriteUsage | null
 }
 
 export interface RuntimePluginTargetEntry {
@@ -755,35 +768,64 @@ export class PluginRuntimeFacade {
         ORDER BY c.created_at DESC`,
       [userId],
     )
-    const accounts: RuntimePluginManagementAccount[] = accountRows.rows.map((row) => {
-      const plugin = bySlug.get(row.provider)
-      const writeControl = plugin
-        ? writeControlFor(
-            row.provider,
-            plugin.actions.map((action) => ({
-              effect: action.readOnly ? ('read' as const) : ('write' as const),
-            })),
-            row,
-          )
-        : null
-      return {
-        id: row.id,
-        provider: row.provider,
-        pluginType: 'managed-browser',
-        displayName: row.display_name || row.provider,
-        accountHint: typeof row.meta?.account_hint === 'string' ? row.meta.account_hint : '',
-        status: row.status,
-        actions: plugin?.actions ?? [],
-        versionId: row.connector_version_id,
-        executable:
-          row.status === 'active' &&
-          plugin?.installedCurrent === true &&
-          plugin.versionId === row.connector_version_id &&
-          runtimeSupportedVersionIds.has(row.connector_version_id),
-        writeControl,
-      }
-    })
+    const accounts: RuntimePluginManagementAccount[] = await Promise.all(
+      accountRows.rows.map(async (row) => {
+        const plugin = bySlug.get(row.provider)
+        const writeControl = plugin
+          ? writeControlFor(
+              row.provider,
+              plugin.actions.map((action) => ({
+                effect: action.readOnly ? ('read' as const) : ('write' as const),
+              })),
+              row,
+            )
+          : null
+        return {
+          id: row.id,
+          provider: row.provider,
+          pluginType: 'managed-browser',
+          displayName: row.display_name || row.provider,
+          accountHint: typeof row.meta?.account_hint === 'string' ? row.meta.account_hint : '',
+          status: row.status,
+          actions: plugin?.actions ?? [],
+          versionId: row.connector_version_id,
+          executable:
+            row.status === 'active' &&
+            plugin?.installedCurrent === true &&
+            plugin.versionId === row.connector_version_id &&
+            runtimeSupportedVersionIds.has(row.connector_version_id),
+          writeControl,
+          ...(writeControl ? { writeUsage: await this.writeUsageFor(row.provider, row.id) } : {}),
+        }
+      }),
+    )
     return { catalog, accounts }
+  }
+
+  /** 只读:不扣额度。Redis 故障只让卡片显示「暂不可用」,不影响管理页其它内容。 */
+  private async writeUsageFor(
+    slug: string,
+    connectionId: string,
+  ): Promise<RuntimePluginWriteUsage | null> {
+    const now = (this.opts.now ?? Date.now)()
+    const usage = await readManagedPluginWriteDailyUsage({
+      redis: this.opts.redis,
+      policy: (this.opts.writeDailyCapPolicy ?? managedPluginWriteDailyCap)(slug),
+      slug,
+      connectionId,
+      now,
+    })
+    if (!usage) return null
+    let cooldownUntil: string | null = null
+    if (slug === DOUYIN_PLUGIN_SLUG) {
+      try {
+        const until = await readDouyinWriteCooldown({ redis: this.opts.redis, connectionId, now })
+        cooldownUntil = until === null ? null : new Date(until).toISOString()
+      } catch {
+        return { ...usage, available: false, cooldownUntil: null }
+      }
+    }
+    return { ...usage, cooldownUntil }
   }
 
   async list(userId: number): Promise<RuntimePluginTargetEntry[]> {

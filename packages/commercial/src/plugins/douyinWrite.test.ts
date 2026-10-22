@@ -24,6 +24,7 @@ import {
   assertDouyinWriteAllowed,
   beijingClock,
   douyinPacingKind,
+  readDouyinWriteCooldown,
   readDouyinWriteGate,
   recordDouyinWriteDispatch,
   tripDouyinWriteCooldown,
@@ -34,7 +35,11 @@ import {
   resolvePluginErrorGuidance,
 } from './pluginErrorGuidance.js'
 import { PluginRuntimeFacade, douyinTargetDigest } from './runtime.js'
-import { writeDailyCapBucket } from './writeDailyCap.js'
+import {
+  consumeManagedPluginWriteDailyCap,
+  readManagedPluginWriteDailyUsage,
+  writeDailyCapBucket,
+} from './writeDailyCap.js'
 import {
   managedPluginWriteDailyCap,
   managedPluginWritePolicy,
@@ -785,5 +790,122 @@ describe('douyin server-side write snapshots (PluginRuntimeFacade.prepareDouyinW
       /media is unavailable/,
     )
     assert.equal(calls.length, 0)
+  })
+})
+
+describe('douyin plugin card: today used / cap (read-only usage)', () => {
+  /** Fake Redis for the cap counter (INCR script) and the usage read (GET list). */
+  function capRedis(opts: { fail?: boolean; reply?: unknown } = {}) {
+    const store = new Map<string, number>()
+    const reads: string[][] = []
+    return {
+      store,
+      reads,
+      async eval(script: string, numKeys: number, ...args: Array<string | number>) {
+        if (opts.fail) throw new Error('down')
+        const keys = args.slice(0, numKeys).map(String)
+        if (script.includes("redis.call('INCR'")) {
+          const v = store.get(keys[0]!) ?? 0
+          if (v >= Number(args[numKeys])) return -1
+          store.set(keys[0]!, v + 1)
+          return v + 1
+        }
+        reads.push(keys)
+        if (opts.reply !== undefined) return opts.reply
+        return keys.map((key) => String(store.get(key) ?? '0'))
+      },
+    }
+  }
+  const policy = managedPluginWriteDailyCap('douyin')!
+  const now = Date.UTC(2026, 9, 21, 17, 0) // 北京时间 10-22 01:00
+
+  test('reads the same counters the cap consumes, per labelled bucket, without consuming', async () => {
+    const redis = capRedis()
+    for (const actionId of ['reply_comment', 'create_comment', 'publish_video'])
+      await consumeManagedPluginWriteDailyCap({
+        redis,
+        policy,
+        slug: 'douyin',
+        connectionId: 'c',
+        actionId,
+        now,
+      })
+    const usage = await readManagedPluginWriteDailyUsage({
+      redis,
+      policy,
+      slug: 'douyin',
+      connectionId: 'c',
+      now,
+    })
+    assert.deepEqual(usage, {
+      day: '2026-10-22',
+      available: true,
+      buckets: [
+        { bucket: 'publish_video', label: '发布视频', used: 1, cap: 3 },
+        { bucket: 'publish_images', label: '发布图文', used: 0, cap: 3 },
+        { bucket: 'comment', label: '评论与回复', used: 2, cap: 20 },
+        { bucket: 'digg', label: '点赞', used: 0, cap: 30 },
+      ],
+    })
+    // 只读：再读一次计数不变；其它账号互不影响。
+    const again = await readManagedPluginWriteDailyUsage({
+      redis,
+      policy,
+      slug: 'douyin',
+      connectionId: 'c',
+      now,
+    })
+    assert.deepEqual(again, usage)
+    const other = await readManagedPluginWriteDailyUsage({
+      redis,
+      policy,
+      slug: 'douyin',
+      connectionId: 'd',
+      now,
+    })
+    assert.ok(other!.buckets.every((bucket) => bucket.used === 0))
+    assert.ok(redis.reads.every((keys) => keys.every((key) => key.endsWith(':20261022'))))
+  })
+
+  test('no policy → null without touching Redis; Redis down or garbage → available=false with zeros', async () => {
+    const redis = capRedis()
+    assert.equal(
+      await readManagedPluginWriteDailyUsage({
+        redis,
+        policy: null,
+        slug: 'weibo',
+        connectionId: 'c',
+        now,
+      }),
+      null,
+    )
+    assert.equal(redis.reads.length, 0)
+    for (const broken of [
+      null,
+      capRedis({ fail: true }),
+      capRedis({ reply: 'x' }),
+      capRedis({ reply: ['1', 'a', '0', '0'] }),
+    ]) {
+      const usage = await readManagedPluginWriteDailyUsage({
+        redis: broken,
+        policy,
+        slug: 'douyin',
+        connectionId: 'c',
+        now,
+      })
+      assert.equal(usage!.available, false)
+      assert.ok(usage!.buckets.every((bucket) => bucket.used === 0))
+    }
+  })
+
+  test('cooldown end for the card', async () => {
+    const redis = fakeRedis()
+    assert.equal(await readDouyinWriteCooldown({ redis, connectionId: 'c', now }), null)
+    const until = await tripDouyinWriteCooldown({ redis, connectionId: 'c', now })
+    assert.equal(await readDouyinWriteCooldown({ redis, connectionId: 'c', now: now + 1 }), until)
+    await assert.rejects(
+      readDouyinWriteCooldown({ redis: null, connectionId: 'c', now }),
+      /RUNTIME_UNAVAILABLE/,
+    )
   })
 })
