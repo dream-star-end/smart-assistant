@@ -247,14 +247,13 @@ async function acquireSingleChatGptPage(browser) {
 async function fetchConversationFromMappingInPage(
   page,
   fallbackConvId = null,
-  { baselineNodeId = null, allowInProgress = false } = {},
+  { baselineNodeId = null } = {},
 ) {
   const fetched = await fetchConversationPayloadInPage(page, fallbackConvId)
   if (fetched?.conv) {
     const currentNode = fetched.conv.current_node || null
     const fromMap = extractAssistantFromMapping(fetched.conv, {
       baselineNodeId,
-      allowInProgress,
     })
     if (fromMap?.text) {
       return {
@@ -279,13 +278,12 @@ async function fetchConversationFromMappingInPage(
 async function rescueFromDomOrMapping(
   page,
   fallbackConvId = null,
-  { baselineNodeId = null, allowReload = false, allowInProgress = false } = {},
+  { baselineNodeId = null, allowReload = false } = {},
 ) {
   let latest = null
   for (let attempt = 0; attempt < 3; attempt++) {
     const direct = await fetchConversationFromMappingInPage(page, fallbackConvId, {
       baselineNodeId,
-      allowInProgress: attempt === 2 && allowInProgress,
     })
     if (direct?.text) return direct
     if (direct) latest = direct
@@ -303,7 +301,6 @@ async function rescueFromDomOrMapping(
   for (let attempt = 0; attempt < 2; attempt++) {
     const postReload = await fetchConversationFromMappingInPage(page, fallbackConvId, {
       baselineNodeId,
-      allowInProgress: attempt === 1 && allowInProgress,
     })
     if (postReload?.text) return postReload
     if (postReload) latest = postReload
@@ -904,43 +901,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
             })
             currentDeadline = adaptive.deadline
 
-            if (adaptive.shouldRescue && hasValidMappingBaseline) {
-              const canUseInProgressFallback =
-                lastFinalTextGrowthAt === null || now - lastFinalTextGrowthAt >= 45_000
-              const rescued = await rescueFromDomOrMapping(page, resolvedConvId, {
-                baselineNodeId,
-                allowReload: true,
-                allowInProgress: canUseInProgressFallback,
-              })
-              if (rescued?.conv) {
-                latestConv = rescued.conv
-                const rescuedProg = extractTurnProgressFromMapping(rescued.conv, { baselineNodeId })
-                latestProg = rescuedProg
-                if (
-                  rescuedProg.liveFinalText &&
-                  rescuedProg.liveFinalText !== lastObservedLiveFinalText
-                ) {
-                  lastObservedLiveFinalText = rescuedProg.liveFinalText
-                  lastFinalTextGrowthAt = now
-                  lastActivityAt = now
-                }
-              }
-              if (rescued?.text) {
-                const finalConvId = rescued.convId || resolvedConvId
-                if (finalConvId) {
-                  saveSessionConversationId(profileDir, cfg.sessionId, finalConvId)
-                }
-                return finalizeTurnOutput({
-                  finalText: rescued.text,
-                  finalMessageId: rescued.messageId || acc.messageId || `msg_${Date.now()}`,
-                  convId: finalConvId,
-                  latestConv: rescued.conv || latestConv,
-                  baselineNodeId,
-                })
-              }
-            }
-
-            if (!batch.stopBtn && !lastDomActiveThinking && acc.done) {
+            if (!batch.stopBtn && !lastDomActiveThinking && (acc.done || adaptive.shouldRescue)) {
               let rescued = null
               if (!acc.finalText && hasValidMappingBaseline && now - lastRescueAttemptAt >= 2_500) {
                 lastRescueAttemptAt = now
@@ -948,7 +909,6 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
                 rescued = await rescueFromDomOrMapping(page, resolvedConvId, {
                   baselineNodeId,
                   allowReload: stopGoneElapsed >= 15_000,
-                  allowInProgress: false,
                 })
                 if (rescued?.conv) {
                   latestConv = rescued.conv
@@ -968,6 +928,7 @@ async function executeTurnOnBrowser(cfg, turn, turnControl) {
               }
               const decision = resolveTurnCompletionDecision({
                 accDone: acc.done,
+                shouldRescue: adaptive.shouldRescue,
                 accFinalText: acc.finalText,
                 rescued,
                 latestProg,

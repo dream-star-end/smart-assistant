@@ -2348,6 +2348,7 @@ export function computeAdaptiveDeadline({
  */
 export function resolveTurnCompletionDecision({
   accDone = false,
+  shouldRescue = false,
   accFinalText = '',
   rescued = null,
   latestProg = null,
@@ -2359,7 +2360,7 @@ export function resolveTurnCompletionDecision({
   now = Date.now(),
   emptyDoneGraceMs = 45_000,
 } = {}) {
-  if (stopVisible || activeThinkingVisible || !accDone) {
+  if (stopVisible || activeThinkingVisible || (!accDone && !shouldRescue)) {
     return { action: 'continue' }
   }
   const sseText = String(accFinalText ?? '')
@@ -2394,12 +2395,17 @@ export function resolveTurnCompletionDecision({
     }
   }
 
+  const hasInProgressLiveText = Boolean(
+    latestProg?.liveFinalText && String(latestProg.liveFinalText).trim().length > 0,
+  )
+
   // No finished reply yet: if stopGoneSince or recent liveFinalText growth is within the grace window,
   // keep polling instead of exiting empty or truncating a still-growing in_progress message.
   if (
     stopGoneSince === null ||
     now - stopGoneSince < emptyDoneGraceMs ||
-    (lastFinalTextGrowthAt !== null && now - lastFinalTextGrowthAt < emptyDoneGraceMs)
+    (hasInProgressLiveText &&
+      (lastFinalTextGrowthAt === null || now - lastFinalTextGrowthAt < emptyDoneGraceMs))
   ) {
     return { action: 'wait_grace' }
   }
@@ -2416,7 +2422,7 @@ export function resolveTurnCompletionDecision({
     }
   }
 
-  return { action: 'error_empty' }
+  return { action: accDone ? 'error_empty' : 'wait_grace' }
 }
 
 export function formatStreamJsonSystemInit({

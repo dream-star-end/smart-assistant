@@ -300,6 +300,7 @@ export function computeAdaptiveDeadline(opts: {
 
 export function resolveTurnCompletionDecision(opts?: {
   accDone?: boolean
+  shouldRescue?: boolean
   accFinalText?: string
   rescued?: {
     text?: string | null

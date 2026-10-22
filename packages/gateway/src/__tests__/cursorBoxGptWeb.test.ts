@@ -1836,10 +1836,11 @@ rl.on('line', (line) => {
     assert.equal(rescuedDecision.source, 'rescue')
     assert.equal(rescuedDecision.messageId, '71e55f98-6bd2-58aa-8870-8a170e11423d')
 
-    // 3. If liveFinalText is still growing (lastFinalTextGrowthAt within emptyDoneGraceMs),
-    // must return wait_grace even after stopGoneSince exceeds emptyDoneGraceMs
+    // 3. If liveFinalText is still growing (lastFinalTextGrowthAt within emptyDoneGraceMs or null),
+    // must return wait_grace even after stopGoneSince exceeds emptyDoneGraceMs (including adaptive shouldRescue)
     const growingDecision = resolveTurnCompletionDecision({
-      accDone: true,
+      accDone: false,
+      shouldRescue: true,
       accFinalText: '',
       rescued: null,
       latestProg: {
@@ -1850,8 +1851,8 @@ rl.on('line', (line) => {
       stopVisible: false,
       activeThinkingVisible: false,
       stopGoneSince: 1_000,
-      lastFinalTextGrowthAt: 40_000,
-      now: 50_000,
+      lastFinalTextGrowthAt: 100_000,
+      now: 110_000,
       emptyDoneGraceMs: 45_000,
     })
     assert.equal(growingDecision.action, 'wait_grace')
