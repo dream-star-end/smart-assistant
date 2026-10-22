@@ -691,14 +691,42 @@ find_master_release_donor() { # <staging-lock>
   return 1
 }
 
+# OCV5-581: L0 发车预检(只读)。构建前一次报出全部确定性前置缺口,不再等列车跑到对应的门才逐个暴露。
+# 不替代任何门:迁移门、Box 门、磁盘门照常在原位置再跑一遍。
+# shellcheck source=scripts/lib/v5-release-preflight.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/v5-release-preflight.sh"
+
+selfhost_release_preflight() { # <target-sha>
+  local target="$1" live from=""
+  live="$(readlink -f -- "$MASTER_LIVE_LINK" 2>/dev/null || true)"
+  if [[ -n "$live" && -f "$live/.complete" ]]; then
+    from="$(jq -r '.sourceCommit // empty' "$live/.complete" 2>/dev/null || true)"
+  fi
+  mlog "── L0 发车预检(只读:不建库、不加锁、不写标记;OCV5-581)target=${target:0:12} ──"
+  rpf_reset
+  rpf_check_source_pin "$REPO_ROOT" "$target"
+  rpf_check_workspace_links "$REPO_ROOT" 1
+  rpf_check_migrations "$REPO_ROOT" "$from" "$target"
+  rpf_check_proof_db "$REPO_ROOT" gate-db "$(master_gate_base_dsn)"
+  rpf_check_disk "$RPF_MIN_FREE_KB" "$live" "$MASTER_RELEASES_ROOT" "${OC_HOTCFG_RELEASES_ROOT:-$MASTER_RELEASES_ROOT}" "${TMPDIR:-/tmp}"
+  tsum_note preflight "$(rpf_summary)" 2>/dev/null || :
+  if rpf_report >&2; then
+    mlog "  ✓ L0 发车预检通过"
+  elif [[ "${DRY:-0}" == 1 ]]; then
+    mlog "  [dry-run] L0 发车预检未通过;正式发车会在这里拒绝"
+  else
+    die "L0 发车预检未通过:上面每条 ✗ 都要先处理(只读检查,未构建、live 未改)。"
+  fi
+}
+
 assert_master_releases_disk() {
   local parent avail_kb
   parent="$(dirname -- "$MASTER_RELEASES_ROOT")"
   mkdir -p -- "$parent"
   avail_kb="$(df -Pk -- "$parent" | awk 'NR==2 {print $4}')"
   [[ "$avail_kb" =~ ^[0-9]+$ ]] || die "无法读取磁盘剩余空间"
-  # 一份冷装表观 ~1.8G + staging 峰值,留 8G 余量。
-  if (( avail_kb < 8 * 1024 * 1024 )); then
+  # 一份冷装表观 ~1.8G + staging 峰值,留 8G 余量(RPF_MIN_FREE_KB,与 L0 预检同一阈值)。
+  if (( avail_kb < RPF_MIN_FREE_KB )); then
     die "根盘可用 ${avail_kb}KiB < 8GiB,拒绝构建 master release。补救:先腾空间。"
   fi
 }
