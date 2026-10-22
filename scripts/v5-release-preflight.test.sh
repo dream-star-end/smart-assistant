@@ -110,10 +110,10 @@ expect "proof-db red: non-loopback DSN refused even in a tree without pg" proof-
 rpf_reset; OC_V5_PREFLIGHT_PROOF_PROBE=/dev/null rpf_check_proof_db "$W" gate-db "postgres://u:p@10.9.9.9/x_test"
 expect "proof-db red: replaced probe that prints nothing" proof-db fail "no usable verdict"
 rpf_report >/dev/null && bad "report passed with a silent probe" || ok "report refuses a silent probe"
-printf '%s\n' 'process.stdout.write("ok\\tfake\\n"); process.exit(3)' >"$T/rc3.mjs"
+printf '%s\n' 'process.stdout.write("ok\tfake\n"); process.exit(3)' >"$T/rc3.mjs"
 rpf_reset; OC_V5_PREFLIGHT_PROOF_PROBE="$T/rc3.mjs" rpf_check_proof_db "$W" gate-db "postgres://u:p@127.0.0.1/x_test"
 expect "proof-db red: probe exits non-zero without a fail line" proof-db fail "rc=3"
-printf '%s\n' 'process.stdout.write("ok\\tfake\\n")' >"$T/ok.mjs"
+printf '%s\n' 'process.stdout.write("ok\tfake\n")' >"$T/ok.mjs"
 rpf_reset; OC_V5_PREFLIGHT_PROOF_PROBE="$T/ok.mjs" rpf_check_proof_db "$W" gate-db "postgres://u:p@127.0.0.1/x_test"
 [[ "$(rpf_report)" == *"⚠ preflight proof-db: probe replaced by OC_V5_PREFLIGHT_PROOF_PROBE"* ]] \
   && ok "an overridden probe is always reported" || bad "override not reported"
