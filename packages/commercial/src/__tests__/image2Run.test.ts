@@ -2,7 +2,12 @@ import assert from 'node:assert/strict'
 import { before, describe, it } from 'node:test'
 import type { Pool } from 'pg'
 import sharp from 'sharp'
-import { type Image2Billing, Image2RunError, makeImage2Runner } from '../billing/image2Run.js'
+import {
+  type Image2Billing,
+  Image2RunError,
+  buildImage2Request,
+  makeImage2Runner,
+} from '../billing/image2Run.js'
 import { ImageDailyLimitError } from '../billing/imageBilling.js'
 import { InMemoryPreCheckRedis, InsufficientCreditsError } from '../billing/preCheck.js'
 
@@ -114,7 +119,7 @@ describe('runImage2ForUser (OCV5-591 A0)', () => {
     const h = harness({ responses: [() => new Response(okBody(2), { status: 200 })] })
     const out = await h.run({
       userId: 247n,
-      requestId: 'studio:t1',
+      requestKey: 'studio:t1',
       prompt: '  a lighthouse  ',
       n: 2,
       size: '1024x1536',
@@ -153,11 +158,33 @@ describe('runImage2ForUser (OCV5-591 A0)', () => {
     assert.deepEqual(h.charges, [{ costCredits: '100', balanceAfter: '950' }])
   })
 
+  it('binds the journey request id to the exact input (Codex code r1 P1)', async () => {
+    const base = { requestKey: 'studio:task-1', prompt: 'a lighthouse' }
+    const a = buildImage2Request(base, POLICY)
+    assert.match(a.requestId, /^studio:task-1#[0-9a-f]{32}$/)
+    assert.equal(buildImage2Request({ ...base }, POLICY).requestId, a.requestId)
+    for (const changed of [
+      { prompt: 'a castle' },
+      { n: 4 },
+      { model: 'gpt-image-2.5-flare' },
+      { size: '1024x1024' },
+    ]) {
+      assert.notEqual(buildImage2Request({ ...base, ...changed }, POLICY).requestId, a.requestId)
+    }
+    const h = harness()
+    const out = await h.run({ userId: 247n, ...base })
+    assert.equal(out.requestId, a.requestId)
+    assert.equal((h.calls[0]!.args as { requestId: string }).requestId, a.requestId)
+    assert.throws(() => buildImage2Request({ ...base, requestKey: 'k'.repeat(96) }, POLICY), {
+      code: 'INVALID_IMAGE_REQUEST',
+    })
+  })
+
   it('routes reference images to /images/edits as data URLs', async () => {
     const h = harness()
     await h.run({
       userId: 247n,
-      requestId: 'studio:t2',
+      requestKey: 'studio:t2',
       prompt: 'restyle',
       referenceImages: [PNG],
       model: 'gpt-image-2.5-flare',
@@ -170,7 +197,7 @@ describe('runImage2ForUser (OCV5-591 A0)', () => {
 
   it('replays a completed request without reserving or calling upstream', async () => {
     const h = harness({ cached: Buffer.from(okBody(1)) })
-    const out = await h.run({ userId: 247n, requestId: 'studio:t3', prompt: 'x' })
+    const out = await h.run({ userId: 247n, requestKey: 'studio:t3', prompt: 'x' })
     assert.equal(out.charged, false)
     assert.equal(h.fetches.length, 0)
     assert.deepEqual(names(h.calls), ['release'])
@@ -185,7 +212,7 @@ describe('runImage2ForUser (OCV5-591 A0)', () => {
       { referenceImages: [Buffer.from('not an image')] },
     ]) {
       await assert.rejects(
-        h.run({ userId: 247n, requestId: 'studio:t4', prompt: 'x', ...input }),
+        h.run({ userId: 247n, requestKey: 'studio:t4', prompt: 'x', ...input }),
         (e: unknown) => e instanceof Image2RunError && e.code === 'INVALID_IMAGE_REQUEST',
       )
     }
@@ -194,13 +221,13 @@ describe('runImage2ForUser (OCV5-591 A0)', () => {
 
   it('maps preflight failures and marks the journey failed', async () => {
     const daily = harness({ reserveError: new ImageDailyLimitError() })
-    await assert.rejects(daily.run({ userId: 247n, requestId: 'studio:t5', prompt: 'x' }), {
+    await assert.rejects(daily.run({ userId: 247n, requestKey: 'studio:t5', prompt: 'x' }), {
       code: 'IMAGE_DAILY_LIMIT',
     })
     assert.ok(!names(daily.calls).includes('mark'), 'nothing was reserved, so nothing to mark')
 
     const poor = harness({ precheckError: new InsufficientCreditsError(10n, 50n) })
-    await assert.rejects(poor.run({ userId: 247n, requestId: 'studio:t6', prompt: 'x' }), {
+    await assert.rejects(poor.run({ userId: 247n, requestKey: 'studio:t6', prompt: 'x' }), {
       code: 'ERR_INSUFFICIENT_CREDITS',
     })
     assert.equal(
@@ -210,14 +237,14 @@ describe('runImage2ForUser (OCV5-591 A0)', () => {
 
     const busy = Object.assign(new Error('dup'), { code: '23505' })
     const raced = harness({ reserveError: busy })
-    await assert.rejects(raced.run({ userId: 247n, requestId: 'studio:t7', prompt: 'x' }), {
+    await assert.rejects(raced.run({ userId: 247n, requestKey: 'studio:t7', prompt: 'x' }), {
       code: 'IMAGE_REQUEST_IN_PROGRESS',
     })
   })
 
   it('skips the redis hold on paid recovery', async () => {
     const h = harness({ alreadyCharged: true, settleDuplicate: true })
-    const out = await h.run({ userId: 247n, requestId: 'studio:t8', prompt: 'x' })
+    const out = await h.run({ userId: 247n, requestKey: 'studio:t8', prompt: 'x' })
     assert.equal(out.charged, false)
     assert.ok(!names(h.calls).includes('precheck'))
     assert.equal(h.charges.length, 0)
@@ -225,7 +252,7 @@ describe('runImage2ForUser (OCV5-591 A0)', () => {
 
   it('fails closed without an account or token and releases the hold', async () => {
     const noAccount = harness({ account: null })
-    await assert.rejects(noAccount.run({ userId: 247n, requestId: 'studio:t9', prompt: 'x' }), {
+    await assert.rejects(noAccount.run({ userId: 247n, requestKey: 'studio:t9', prompt: 'x' }), {
       code: 'NO_CODEX_ACCOUNT',
     })
     assert.deepEqual(names(noAccount.calls), ['reserve', 'precheck', 'mark', 'release'])
@@ -235,7 +262,7 @@ describe('runImage2ForUser (OCV5-591 A0)', () => {
     )
 
     const noToken = harness({ token: null })
-    await assert.rejects(noToken.run({ userId: 247n, requestId: 'studio:t10', prompt: 'x' }), {
+    await assert.rejects(noToken.run({ userId: 247n, requestKey: 'studio:t10', prompt: 'x' }), {
       code: 'CODEX_ACCOUNT_TOKEN_UNAVAILABLE',
     })
     assert.equal(noToken.fetches.length, 0)
@@ -248,7 +275,7 @@ describe('runImage2ForUser (OCV5-591 A0)', () => {
         () => new Response(okBody(1), { status: 200 }),
       ],
     })
-    await h.run({ userId: 247n, requestId: 'studio:t11', prompt: 'x' })
+    await h.run({ userId: 247n, requestKey: 'studio:t11', prompt: 'x' })
     const finishes = h.calls
       .filter((c) => c.name === 'finish')
       .map((c) => (c.args as { outcome: string }).outcome)
@@ -263,7 +290,7 @@ describe('runImage2ForUser (OCV5-591 A0)', () => {
       ],
     })
     await assert.rejects(
-      h.run({ userId: 247n, requestId: 'studio:t12', prompt: 'x' }),
+      h.run({ userId: 247n, requestKey: 'studio:t12', prompt: 'x' }),
       (e: unknown) =>
         e instanceof Image2RunError &&
         e.code === 'IMAGE_UPSTREAM_REJECTED_MODERATION' &&
@@ -274,7 +301,7 @@ describe('runImage2ForUser (OCV5-591 A0)', () => {
     assert.deepEqual(names(h.calls).slice(-2), ['mark', 'release'])
 
     const down = harness({ responses: [() => new Response('oops', { status: 502 })] })
-    await assert.rejects(down.run({ userId: 247n, requestId: 'studio:t13', prompt: 'x' }), {
+    await assert.rejects(down.run({ userId: 247n, requestKey: 'studio:t13', prompt: 'x' }), {
       code: 'IMAGE_UPSTREAM_FAILED',
       retryable: true,
     })
@@ -282,7 +309,7 @@ describe('runImage2ForUser (OCV5-591 A0)', () => {
 
   it('never settles a response with the wrong image count', async () => {
     const h = harness({ responses: [() => new Response(okBody(1), { status: 200 })] })
-    await assert.rejects(h.run({ userId: 247n, requestId: 'studio:t14', prompt: 'x', n: 2 }), {
+    await assert.rejects(h.run({ userId: 247n, requestKey: 'studio:t14', prompt: 'x', n: 2 }), {
       code: 'IMAGE_INVALID_RESPONSE',
     })
     assert.ok(!names(h.calls).includes('settle'))
@@ -299,7 +326,7 @@ describe('runImage2ForUser (OCV5-591 A0)', () => {
       ],
     })
     await assert.rejects(
-      h.run({ userId: 247n, requestId: 'studio:t15', prompt: 'x', signal: ac.signal }),
+      h.run({ userId: 247n, requestKey: 'studio:t15', prompt: 'x', signal: ac.signal }),
       { code: 'IMAGE_CLIENT_ABORT' },
     )
     assert.equal(
@@ -316,7 +343,7 @@ describe('runImage2ForUser (OCV5-591 A0)', () => {
       policy: POLICY,
       enabled: false,
     })
-    await assert.rejects(run({ userId: 247n, requestId: 'studio:t16', prompt: 'x' }), {
+    await assert.rejects(run({ userId: 247n, requestKey: 'studio:t16', prompt: 'x' }), {
       code: 'IMAGE2_DISABLED',
     })
   })
