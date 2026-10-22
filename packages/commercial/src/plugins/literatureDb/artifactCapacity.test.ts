@@ -165,3 +165,37 @@ test('store events report saves, evictions and unsaved expiry without ids', asyn
     assert.equal(e.uid, 3)
   }
 })
+
+test('a reused file waiting for the account commit is neither evicted nor swept before publish', async () => {
+  let now = 1_700_000_000_000
+  const store = new LiteratureArtifactStore({
+    now: () => now,
+    ttlMs: 60_000,
+    maxTotalFiles: 2,
+  })
+  const a = await stageAndPublish(store, 1, pdfOfSize(64 * 1024, 'a'), 'paper-a')
+  assert(store.read(1, a.artifactId), 'saved, so normally the first eviction candidate')
+  const handle = store.reuse(1, 'paper-a')
+  assert(handle)
+  // While user 1 commits, user 2 fills the process budget: the pinned file must survive.
+  await stageAndPublish(store, 2, pdfOfSize(64 * 1024, 'b'))
+  await assert.rejects(stageAndPublish(store, 3, pdfOfSize(64 * 1024, 'c')), capacityError)
+  // The original TTL passes during the commit: still not swept.
+  now += 61_000
+  store.describe(2, 'ffffffffffffffff-unknown')
+  handle.publish()
+  assert(store.read(1, handle.artifactId), 'the reported artifactId is readable after publish')
+  // After publish the pin is gone, so the (saved again) file is evictable as usual.
+  await stageAndPublish(store, 2, pdfOfSize(64 * 1024, 'd'))
+  await stageAndPublish(store, 3, pdfOfSize(64 * 1024, 'c'))
+  assert.equal(store.describe(1, handle.artifactId), null)
+})
+
+test('a discarded reuse handle releases its pin', async () => {
+  const store = new LiteratureArtifactStore({ maxTotalFiles: 1 })
+  const a = await stageAndPublish(store, 1, pdfOfSize(64 * 1024, 'a'), 'paper-a')
+  assert(store.read(1, a.artifactId))
+  store.reuse(1, 'paper-a')?.discard()
+  await stageAndPublish(store, 2, pdfOfSize(64 * 1024, 'b'))
+  assert.equal(store.describe(1, a.artifactId), null)
+})

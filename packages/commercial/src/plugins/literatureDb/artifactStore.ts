@@ -83,7 +83,13 @@ interface StoredReservation {
   expiresAt: number
   savedAt: number | null
   activeReaders: number
+  /** Reuse handles waiting for the account commit; pinned files are never evicted or swept. */
+  pins: number
+  pinnedUntil: number
 }
+
+/** Upper bound on a reuse pin (the download action times out at 120 s) so a lost handle cannot hold memory forever. */
+const REUSE_PIN_MAX_MS = 5 * 60 * 1000
 
 export function sanitizeLiteraturePdfFilename(raw: string): string {
   const cleaned = raw
@@ -235,9 +241,13 @@ export class LiteratureArtifactStore {
     this.reservations.delete(entry.id)
   }
 
+  private pinned(entry: StoredReservation, now = this.now()): boolean {
+    return entry.pins > 0 && now < entry.pinnedUntil
+  }
+
   private sweep(now = this.now()): void {
     for (const entry of this.reservations.values()) {
-      if (entry.activeReaders !== 0) continue
+      if (entry.activeReaders !== 0 || this.pinned(entry, now)) continue
       if (entry.discarded) {
         this.drop(entry)
       } else if (entry.published && entry.expiresAt <= now) {
@@ -256,6 +266,7 @@ export class LiteratureArtifactStore {
    * without touching another user's unsaved file or an unpublished stage.
    */
   private planEviction(userId: number, bytes: number): StoredReservation[] | null {
+    const now = this.now()
     const live = [...this.reservations.values()].filter((e) => !e.discarded)
     let userBytes = 0
     let userFiles = 0
@@ -271,7 +282,7 @@ export class LiteratureArtifactStore {
     }
     const bySaved = (a: StoredReservation, b: StoredReservation) => a.savedAt! - b.savedAt!
     const byCreated = (a: StoredReservation, b: StoredReservation) => a.createdAt - b.createdAt
-    const published = live.filter((e) => e.published)
+    const published = live.filter((e) => e.published && !this.pinned(e, now))
     const anySaved = published.filter((e) => e.savedAt !== null).sort(bySaved)
     const ownSaved = anySaved.filter((e) => e.userId === userId)
     const ownUnsaved = published
@@ -360,6 +371,8 @@ export class LiteratureArtifactStore {
         expiresAt: 0,
         savedAt: null,
         activeReaders: 0,
+        pins: 0,
+        pinnedUntil: 0,
       }
       this.reservations.set(artifactId, reservation)
 
@@ -415,6 +428,16 @@ export class LiteratureArtifactStore {
     const entry = found
     const planned = now + this.ttlMs
     let published = false
+    let settled = false
+    // Pin until publish()/discard(): another user's stage or a sweep must not drop the file while
+    // the runtime is still committing the account state, or a success would point at nothing.
+    entry.pins++
+    entry.pinnedUntil = Math.max(entry.pinnedUntil, now + REUSE_PIN_MAX_MS)
+    const unpin = () => {
+      if (settled) return
+      settled = true
+      entry.pins = Math.max(0, entry.pins - 1)
+    }
     return {
       artifactId: entry.id,
       result: Object.freeze({
@@ -428,13 +451,16 @@ export class LiteratureArtifactStore {
         return published ? entry.expiresAt : planned
       },
       publish: () => {
-        if (published || entry.discarded || !entry.buffer) return
+        if (settled) return
+        unpin()
+        if (entry.discarded || !entry.buffer) return
         published = true
-        entry.expiresAt = Math.max(entry.expiresAt, planned)
+        entry.expiresAt = Math.max(entry.expiresAt, this.now() + this.ttlMs)
         entry.savedAt = null
         this.emit({ event: 'reuse', uid: entry.userId, ageMs: this.now() - entry.createdAt })
       },
-      discard: () => {},
+      // Leaves the earlier published file in place; only releases the pin.
+      discard: unpin,
     }
   }
 
