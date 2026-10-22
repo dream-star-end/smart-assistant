@@ -351,21 +351,9 @@ export function App() {
 
   // 公开配置（Turnstile bypass / site key）：登录页驱动 AuthGate 是否渲染真 widget。
   const [publicCfg, setPublicCfg] = useState<PublicConfig | null>(null);
-  // 经验分享入口（OCV5-577）跟随 feature_community_blog。publicCfg 只在未登录时加载，已登录用户也要
-  // 知道这个开关，所以单独取一次，不改 publicCfg 的加载时机（image2 等判断依赖它为 null 的语义）。
-  const [communityBlogEnabled, setCommunityBlogEnabled] = useState(false);
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .getPublicConfig()
-      .then((cfg) => {
-        if (!cancelled) setCommunityBlogEnabled(cfg.featureCommunityBlog === true);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  // 经验分享入口（OCV5-577）跟随 feature_community_blog：未登录时读 publicCfg；已登录时 publicCfg 不加载，
+  // 单独取一次（见下方 effect），不改 publicCfg 的加载时机（image2 等判断依赖它已登录时为 null）。
+  const [signedInCommunityBlog, setSignedInCommunityBlog] = useState(false);
   const [publicCfgRetryNonce, setPublicCfgRetryNonce] = useState(0);
 
   // demo 展示消息（本地 fixture 流式回放用；非 demo 的消息权威在 WS service）。
@@ -635,6 +623,22 @@ export function App() {
     document.addEventListener("click", onClick, true);
     return () => document.removeEventListener("click", onClick, true);
   }, [authed, demo]);
+
+  useEffect(() => {
+    if (demo || !authed) return;
+    let cancelled = false;
+    api
+      .getPublicConfig()
+      .then((cfg) => {
+        if (!cancelled) setSignedInCommunityBlog(cfg.featureCommunityBlog === true);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [authed, demo]);
+  const communityBlogEnabled =
+    !demo && (authed ? signedInCommunityBlog : publicCfg?.featureCommunityBlog === true);
 
   const interrupt = useCallback(() => {
     stopRef.current = true;
