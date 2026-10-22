@@ -153,12 +153,14 @@ rpf_add fail c z; rpf_report >/dev/null && bad "report rc 0 despite a failure" |
 # ── selfhost wiring ───────────────────────────────────────────────────
 body="$(sed -n '/^cmd_deploy() {/,/^}/p' "$DEPLOY")"
 line_of() { grep -n -- "$1" <<<"$body" | head -1 | cut -d: -f1; }
-pf="$(line_of 'selfhost_release_preflight')"; bind="$(line_of 'release_policy_bind_official_train_request')"
-nm="$(line_of '^  ensure_node_modules')"; build="$(line_of 'build_master_release "\$sha"')"
-if [[ -n "$pf" && -n "$bind" && -n "$nm" && -n "$build" ]] && (( pf < bind && pf < nm && pf < build )); then
-  ok "cmd_deploy runs L0 before policy bind, node_modules and the build"
+pf="$(line_of 'selfhost_release_preflight')"; begin="$(line_of '^    lease_train_begin "\$sha"')"
+trailer="$(line_of 'assert_fix_trailers "\$sha"')"; build="$(line_of 'build_master_release "\$sha"')"
+# 2026-10-22 18:4x: L0 ran before lease_train_begin, so its refusal was not a deploy-reported train
+# failure and the worker re-dispatched the same target every ~30 s (117 trains in an hour).
+if [[ -n "$pf" && -n "$begin" && -n "$trailer" && -n "$build" ]] && (( begin < pf && pf <= trailer && pf < build )); then
+  ok "cmd_deploy runs L0 after lease_train_begin (refusal is deploy-reported) and before the build"
 else
-  bad "cmd_deploy wiring order pf=$pf bind=$bind nm=$nm build=$build"
+  bad "cmd_deploy wiring order begin=$begin pf=$pf trailer=$trailer build=$build"
 fi
 grep -q 'selfhost_release_preflight "${LEASE_TARGET_SHA:-$sha}"' <<<"$body" && ok "L0 gets the train's pinned target" || bad "L0 target"
 grep -qE 'avail_kb < RPF_MIN_FREE_KB' "$MASTER" && ok "build disk gate and L0 share one threshold" || bad "disk threshold not shared"
