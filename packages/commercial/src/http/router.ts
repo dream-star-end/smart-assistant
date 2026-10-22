@@ -56,6 +56,7 @@ import {
 import { handleMarketplaceSearch } from '../marketplace/marketplaceSearch.js'
 import { isActiveAdmin, isInMaintenance } from '../middleware/maintenanceMode.js'
 import {
+  handleAdminListCommunityTutorials,
   handleAdminPendingCommunityTutorials,
   handleAdminTutorialWrite,
   handleListCommunityTutorials,
@@ -63,6 +64,7 @@ import {
   handleSubmitCommunityTutorial,
   handleSubmitTutorialSnapshot,
   handleTutorialUserGet,
+  handleUploadTutorialImage,
   handleWithdrawCommunityTutorial,
 } from '../tutorials/communityTutorialRoutes.js'
 import { handleGetTutorialBlob, handleGetTutorialEmbed } from '../tutorials/tutorialBlobRoutes.js'
@@ -868,6 +870,12 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
       path: '/api/tutorials/mine',
       handler: (req, res) => handleListOwnCommunityTutorials(req, res, deps),
     },
+    // 经验分享图片上传（原始字节）。exact 路由优先于下面的 POST `/api/tutorials/` 前缀（撤回）。
+    {
+      method: 'POST',
+      path: '/api/tutorials/images',
+      handler: (req, res) => handleUploadTutorialImage(req, res, deps),
+    },
     {
       method: 'POST',
       pathPrefix: '/api/tutorials/',
@@ -892,6 +900,11 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
       method: 'GET',
       path: '/api/admin/tutorials/pending',
       handler: (req, res) => handleAdminPendingCommunityTutorials(req, res, deps),
+    },
+    {
+      method: 'GET',
+      path: '/api/admin/tutorials',
+      handler: (req, res) => handleAdminListCommunityTutorials(req, res, deps),
     },
     {
       method: 'GET',

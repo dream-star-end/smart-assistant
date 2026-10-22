@@ -240,6 +240,8 @@ export const DURABLE_TABLES: readonly string[] = [
   "turn_tape_materialization_jobs",
   "turn_tape_settlement_jobs",
   "tutorial_blob_refs",
+  // 0320 经验分享图片上传者(FK tutorial_blobs/users ON DELETE CASCADE),随 blob 离场。
+  "tutorial_blob_uploads",
   "tutorial_blobs",
   "tutorial_case_specs",
   "tutorial_compass_notes",
