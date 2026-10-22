@@ -13,7 +13,7 @@
  *   4. the GC tick purges projects soft-deleted more than 7 days ago with their refs.
  */
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { access, mkdtemp, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -467,6 +467,57 @@ describe('media studio blobs', () => {
     await lapsed.dropRefs(u, { kind: 'asset', id: assetId })
     assert.equal(await quota(`u:${u}`), 0)
     assert.equal(await lapsed.addRef(u, put.sha, { kind: 'asset', id: randomUUID() }), false)
+  })
+
+  test('a hold that lapses while settle waits on its locks is re-admitted', async (t) => {
+    if (skip(t)) return
+    const root = await mkdtemp(path.join(tmpdir(), 'oc-studio-lapse-'))
+    const u = BigInt(await user())
+    await query(`UPDATE studio_quota SET limit_bytes=1000000000 WHERE scope='site'`)
+    const a = Buffer.from('a'.repeat(16))
+    const shaA = createHash('sha256').update(a).digest('hex')
+    // Codex code r2 P1: A's settle transaction begins before its hold expires, then waits on the
+    // sha lock until it has; B is admitted in the meantime, so A must be re-checked and refused.
+    const locker = await getPool().connect()
+    try {
+      await locker.query('BEGIN')
+      await locker.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`studio-blob:${shaA}`])
+      const short = blobStore(root, { holdTtlSeconds: 1, userLimitBytes: 16n })
+      const pending = short.put({
+        userId: u,
+        mime: 'image/png',
+        maxBytes: 16,
+        source: a,
+        ref: { kind: 'take', id: randomUUID() },
+      })
+      pending.catch(() => {})
+      for (let i = 0; i < 100; i++) {
+        const w = await query<{ n: string }>(
+          `SELECT COUNT(*)::text AS n FROM pg_locks WHERE locktype='advisory' AND NOT granted`,
+        )
+        if (w.rows[0]!.n !== '0') break
+        await new Promise((r) => setTimeout(r, 20))
+      }
+      await new Promise((r) => setTimeout(r, 1300))
+      const b = await blobStore(root, { userLimitBytes: 16n }).put({
+        userId: u,
+        mime: 'image/png',
+        maxBytes: 16,
+        source: Buffer.from('b'.repeat(16)),
+        ref: { kind: 'take', id: randomUUID() },
+      })
+      assert.equal(await quota(`u:${u}`), b.bytes)
+      await locker.query('COMMIT')
+      await assert.rejects(
+        pending,
+        (e: unknown) => e instanceof StudioQuotaError && e.scope === 'user',
+      )
+    } finally {
+      await locker.query('ROLLBACK').catch(() => {})
+      locker.release()
+    }
+    assert.equal(await quota(`u:${u}`), 16)
+    assert.equal(await liveHolds(), 0)
   })
 
   test('gc deletes unreferenced content and the GC tick purges old deleted projects', async (t) => {

@@ -169,7 +169,7 @@ export class StudioBlobStore {
       const held = await client.query<{ site: string; mine: string }>(
         `SELECT COALESCE(SUM(bytes),0)::text AS site,
                 COALESCE(SUM(bytes) FILTER (WHERE user_id=$1),0)::text AS mine
-         FROM studio_quota_holds WHERE expires_at > NOW()`,
+         FROM studio_quota_holds WHERE expires_at > clock_timestamp()`,
         [userId.toString()],
       )
       const siteHeld = BigInt(held.rows[0]!.site)
@@ -181,7 +181,7 @@ export class StudioBlobStore {
       if (free - siteHeld - need < this.diskFloor) throw new StudioQuotaError('disk')
       await client.query(
         `INSERT INTO studio_quota_holds(id, user_id, bytes, expires_at)
-         VALUES ($1, $2, $3, NOW() + make_interval(secs => $4))`,
+         VALUES ($1, $2, $3, clock_timestamp() + make_interval(secs => $4))`,
         [id, userId.toString(), need.toString(), this.holdTtl],
       )
     })
@@ -234,8 +234,10 @@ export class StudioBlobStore {
               [args.userId.toString(), sha],
             )
           ).rowCount === 0
+        // clock_timestamp(), not NOW(): NOW() is frozen at BEGIN, so a hold that lapsed while this
+        // transaction waited on the locks above would still look live (Codex code r2 P1).
         const live = await client.query(
-          'DELETE FROM studio_quota_holds WHERE id=$1 AND expires_at > NOW() RETURNING id',
+          'DELETE FROM studio_quota_holds WHERE id=$1 AND expires_at > clock_timestamp() RETURNING id',
           [holdId],
         )
         if (live.rowCount !== 1) {
@@ -244,7 +246,7 @@ export class StudioBlobStore {
           const held = await client.query<{ site: string; mine: string }>(
             `SELECT COALESCE(SUM(bytes),0)::text AS site,
                     COALESCE(SUM(bytes) FILTER (WHERE user_id=$1),0)::text AS mine
-             FROM studio_quota_holds WHERE expires_at > NOW() AND id <> $2`,
+             FROM studio_quota_holds WHERE expires_at > clock_timestamp() AND id <> $2`,
             [args.userId.toString(), holdId],
           )
           const row = (scope: string) => quotaRows.rows.find((r) => r.scope === scope)!
