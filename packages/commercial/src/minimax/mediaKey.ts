@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync } from 'node:fs'
 
 /**
  * MiniMax media key resolution (OCV5-589, user decision D12 2026-10-23).
@@ -15,31 +15,34 @@ import { readFileSync } from "node:fs";
  * Error strings never include the file contents.
  */
 export interface MiniMaxMediaKey {
-  key?: string;
-  source: "file" | "token_plan" | "none";
-  error?: string;
+  key?: string
+  source: 'file' | 'token_plan' | 'none'
+  error?: string
 }
 
-const KEY_RE = /^[\x21-\x7e]{1,512}$/;
+const KEY_RE = /^[\x21-\x7e]{1,512}$/
 
 export function resolveMiniMaxMediaKey(
   env: NodeJS.ProcessEnv = process.env,
-  read: (path: string) => string = (p) => readFileSync(p, "utf8"),
+  read: (path: string) => string = (p) => readFileSync(p, 'utf8'),
 ): MiniMaxMediaKey {
-  const file = env.MINIMAX_MEDIA_KEY_FILE?.trim();
+  const file = env.MINIMAX_MEDIA_KEY_FILE?.trim()
   if (file) {
-    let raw: string;
+    let raw: string
     try {
-      raw = read(file);
+      raw = read(file)
     } catch {
-      return { source: "none", error: "MINIMAX_MEDIA_KEY_FILE is not readable" };
+      return { source: 'none', error: 'MINIMAX_MEDIA_KEY_FILE is not readable' }
     }
-    const key = raw.trim();
+    const key = raw.trim()
     if (!KEY_RE.test(key)) {
-      return { source: "none", error: "MINIMAX_MEDIA_KEY_FILE does not contain a single printable token" };
+      return {
+        source: 'none',
+        error: 'MINIMAX_MEDIA_KEY_FILE does not contain a single printable token',
+      }
     }
-    return { key, source: "file" };
+    return { key, source: 'file' }
   }
-  const tokenPlan = env.MINIMAX_TOKEN_PLAN_KEY?.trim();
-  return tokenPlan ? { key: tokenPlan, source: "token_plan" } : { source: "none" };
+  const tokenPlan = env.MINIMAX_TOKEN_PLAN_KEY?.trim()
+  return tokenPlan ? { key: tokenPlan, source: 'token_plan' } : { source: 'none' }
 }
