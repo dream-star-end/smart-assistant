@@ -657,6 +657,8 @@ export const commercialConfigSchema = z
      * web search). Unset → MINIMAX_TOKEN_PLAN_KEY as before.
      */
     MINIMAX_MEDIA_KEY_FILE: z.string().trim().regex(/^\/[^\0]*$/, "must be an absolute path").max(512).optional(),
+    /** OCV5-589: global soft cap on successful MiniMax media calls per rolling 5 hours. Unset → no cap. */
+    OC_MINIMAX_MEDIA_WINDOW_MAX_CALLS: positiveInt(1_000_000),
     /** Loopback endpoint, or explicitly opted-in HTTPS endpoint, of the SCNet H3 worker. */
     MEDIA_GENERATION_WORKER_URL: urlStringWithProtocols(
       ["http:", "https:"],

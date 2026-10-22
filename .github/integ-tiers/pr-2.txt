@@ -10,6 +10,7 @@ packages/commercial/src/__tests__/payment.integ.test.ts
 packages/commercial/src/__tests__/funnelEvents.integ.test.ts
 packages/commercial/src/__tests__/orders.integ.test.ts
 packages/commercial/src/__tests__/ledger.integ.test.ts
+packages/commercial/src/__tests__/minimaxVoices.integ.test.ts
 packages/commercial/src/__tests__/preCheckCap.integ.test.ts
 packages/commercial/src/__tests__/settleUsage.integ.test.ts
 packages/commercial/src/__tests__/antigravitySettle.integ.test.ts
