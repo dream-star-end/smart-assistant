@@ -189,7 +189,8 @@ describe('Antigravity relay handler', () => {
       `${ANTIGRAVITY_RELAY_PREFIX}/route/${token}/v1internal:streamGenerateContent?alt=sse`,
       {
         body: generateBody('gemini-3.8-flash-high'),
-        headers: { 'x-goog-api-key': 'nope', cookie: 'a=b' },
+        // the trace header (OCV5-569) must not be among the forwarded keys below
+        headers: { 'x-goog-api-key': 'nope', cookie: 'a=b', 'x-openclaude-trace-id': '0a1b2c3d4e5f60718293a4b5c6d7e8f9' },
       },
       { status: 200, body: SSE },
     )

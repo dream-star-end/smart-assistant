@@ -134,6 +134,7 @@ import { BOX_INTERNAL_ENDPOINT, isBoxRouteModelName } from "./upstream.js";
 import { prepareBoxSwitch, relabelBoxSwitchSession, type BoxSwitchOutcome } from "./boxSwitchCompaction.js";
 import { buildPlatformEnvelope } from "../../platform/platformEnvelopeBuilder.js";
 import { recordUserImpactBestEffort } from "../../selfheal/userImpact.js";
+import { egressTraceFields } from "../egressTrace.js";
 
 // ─── 私有 helper ──────────────────────────────────────────────────────────
 
@@ -366,6 +367,7 @@ export function makeAnthropicProxyHandler(
     res.setHeader(REQUEST_ID_HEADER, requestId);
     const reqLog = log.child({
       requestId,
+      ...egressTraceFields(req),
       hostUuid: ctx.hostUuid,
       boundIp: ctx.boundIp,
       method: req.method ?? "GET",
