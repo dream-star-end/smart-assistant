@@ -36,6 +36,7 @@ import {
   probeSessionState,
   profileDirFor,
   readProfileSingletonOwner,
+  resetComposerDraftInPage,
   resolveVisibleLocator,
   saveActiveTurnState,
   saveSessionConversationId,
@@ -1754,5 +1755,45 @@ rl.on('line', (line) => {
     assert.equal(visibleClicked, true)
     assert.equal(out.tier, 'pro')
     assert.equal(out.sliderIndex, 4)
+
+    // Verify resetComposerDraftInPage clears <textarea> drafts where innerText/textContent are ""
+    const textareaEl = {
+      value: 'old draft',
+      innerText: '',
+      textContent: '',
+      dispatched: false,
+      dispatchEvent() {
+        this.dispatched = true
+      },
+    }
+    const emptyProseMirrorEl = {
+      innerText: '\n',
+      textContent: '',
+      innerHTML: '<p><br class="ProseMirror-trailingBreak"></p>',
+      dispatched: false,
+      dispatchEvent() {
+        this.dispatched = true
+      },
+    }
+    await resetComposerDraftInPage({
+      evaluate: async (fn: () => void) => {
+        const prevDoc = (globalThis as any).document
+        ;(globalThis as any).document = {
+          querySelectorAll: (sel: string) => {
+            if (sel.startsWith('button')) return []
+            return [textareaEl, emptyProseMirrorEl]
+          },
+        }
+        try {
+          fn()
+        } finally {
+          ;(globalThis as any).document = prevDoc
+        }
+      },
+    })
+    assert.equal(textareaEl.value, '')
+    assert.equal(textareaEl.dispatched, true)
+    assert.equal(emptyProseMirrorEl.innerHTML, '<p><br class="ProseMirror-trailingBreak"></p>')
+    assert.equal(emptyProseMirrorEl.dispatched, false)
   })
 })

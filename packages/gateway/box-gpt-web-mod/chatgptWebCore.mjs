@@ -591,7 +591,9 @@ export async function resetComposerDraftInPage(page) {
         ),
       )
       for (const el of candidates) {
-        const currentText = (el.innerText ?? el.textContent ?? el.value ?? '').trim()
+        const rawVal = typeof el.value === 'string' ? el.value : ''
+        const rawText = el.innerText || el.textContent || ''
+        const currentText = (rawVal || rawText).trim()
         if (!currentText) continue
         if ('value' in el && typeof el.value === 'string') {
           el.value = ''
