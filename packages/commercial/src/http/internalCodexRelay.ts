@@ -368,14 +368,14 @@ class ImageUpstreamError extends Error {
 /** 把上游图片端点的失败归类成一个稳定、不泄漏原文的机器码,交给 gateway 本地化成
  * 人话文案(见 server.ts 图片编辑错误分支)。原始 body 从不透传给用户 —— 只依据其中
  * 的粗粒度关键词判类。5xx / 429 归为瞬时可重试;4xx 归为"请求被拒"的确定性失败。 */
-type ImageUpstreamFailureCode =
+export type ImageUpstreamFailureCode =
   | 'IMAGE_UPSTREAM_FAILED'
   | 'IMAGE_UPSTREAM_RATE_LIMITED'
   | 'IMAGE_UPSTREAM_REJECTED_FORMAT'
   | 'IMAGE_UPSTREAM_REJECTED_IMAGE'
   | 'IMAGE_UPSTREAM_REJECTED_MODERATION'
   | 'IMAGE_UPSTREAM_REJECTED'
-function classifyImageUpstreamFailure(status: number, bytes: Buffer): ImageUpstreamFailureCode {
+export function classifyImageUpstreamFailure(status: number, bytes: Buffer): ImageUpstreamFailureCode {
   if (status === 429) return 'IMAGE_UPSTREAM_RATE_LIMITED'
   if (status >= 500) return 'IMAGE_UPSTREAM_FAILED'
   let body = ''
@@ -402,7 +402,7 @@ export function image429RetryDelayMs(headers: Headers): number | null {
   return Number.isFinite(ms) && ms >= 0 && ms <= 2_000 ? Math.max(100, ms) : null
 }
 
-async function waitForImageRetry(ms: number, signal: AbortSignal): Promise<void> {
+export async function waitForImageRetry(ms: number, signal: AbortSignal): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     if (signal.aborted) return reject(new DOMException('image request aborted', 'AbortError'))
     const onAbort = () => {
@@ -519,7 +519,7 @@ async function spoolBailianCodexResponseBody(req: IncomingMessage): Promise<{
   }
 }
 
-async function readBoundedResponseBody(response: Response, maxBytes = 64 * 1024 * 1024): Promise<Buffer> {
+export async function readBoundedResponseBody(response: Response, maxBytes = 64 * 1024 * 1024): Promise<Buffer> {
   const length = Number(response.headers.get('content-length') ?? '0')
   if (Number.isFinite(length) && length > maxBytes) throw new Error('image response body too large')
   if (!response.body) return Buffer.alloc(0)
