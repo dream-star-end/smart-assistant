@@ -15,7 +15,7 @@
     { "id": "watch-gate", "script": "scripts/v5-selfhost-watch-gate.sh", "ci": "v5-selfhost-gates.yml" },
     { "id": "oc-memory-mcp-build", "script": "packages/mcp-memory/scripts/build-oc-memory-mcp.sh", "ci": "v5-selfhost-release-gates.yml" },
     { "id": "web-react-production-build", "command": "npm run build --workspace packages/web-react", "ci": "v5-selfhost-release-gates.yml" },
-    { "id": "fix-trailers", "script": "scripts/check-v5-fix-trailers.sh", "stage": "deploy", "ci": "v5-selfhost-release-gates.yml" }
+    { "id": "fix-trailers", "script": "scripts/check-v5-fix-trailers.sh", "stage": "deploy", "deploy": { "caller": "cmd_deploy", "function": "assert_fix_trailers", "variable": "FIX_TRAILER_GATE" }, "ci": "v5-selfhost-release-gates.yml" }
   ],
   "helpers": []
 }

@@ -34,6 +34,10 @@ export interface Gate {
   command?: string;
   /** build (default) = build_master_release; deploy = deploy-v5-selfhost.sh itself */
   stage?: "build" | "deploy";
+  /** deploy stage only: the call chain that really runs the script (Codex final r1: a file-name
+   * mention is not a run). `caller` must call `function` at command position, `function` must run
+   * "$<variable>" at command position, and `variable` must be assigned the script's path. */
+  deploy?: { caller: string; function: string; variable: string };
   /** workflow file (under .github/workflows) that runs the same script/command */
   ci?: string;
   /** why CI cannot run it; required when `ci` is absent */
@@ -80,7 +84,8 @@ export function stripShell(text: string): string {
   let i = 0;
   while (i < text.length) {
     const c = text[i]!;
-    if (c === "\\") { out += text.slice(i, i + 2); i += 2; continue; }
+    // an escaped character is a literal (`echo \; node …` prints); only a continuation survives
+    if (c === "\\") { out += text[i + 1] === "\n" ? "\\\n" : "_"; i += 2; continue; }
     if (c === "'") {
       const j = text.indexOf("'", i + 1);
       out += "''"; i = j < 0 ? text.length : j + 1; continue;
@@ -160,6 +165,28 @@ export function ciRuns(workflows: Record<string, string>, pkgScripts: Record<str
   return out;
 }
 
+/** A deploy-stage gate really runs: caller → function at command position → "$variable" at
+ * command position inside the function → variable assigned the script path at top level. */
+export function deployRuns(deployScript: string, gate: Gate): boolean {
+  const d = gate.deploy;
+  if (!d || !gate.script) return false;
+  const word = (name: string) => name.replace(/[^A-Za-z0-9_]/g, "");
+  const at = (name: string) => new RegExp(`${PREFIX}(?:if\\s+)?(?:!\\s*)?${word(name)}(?:\\s|$)`);
+  if (!functionCommands(deployScript, d.caller).some((line) => at(d.function).test(line))) return false;
+  // inside the function the runner is quoted ("$VAR" …), so look at the raw body with comments
+  // and heredocs removed, but quotes kept: "$VAR" must open a command (alone or as $( … ))
+  const lines = deployScript.split("\n");
+  const start = lines.findIndex((line) => new RegExp(`^${word(d.function)}\\(\\) \\{\\s*$`).test(line));
+  if (start < 0) return false;
+  const end = lines.findIndex((line, i) => i > start && /^\}/.test(line));
+  const body = lines.slice(start + 1, end < 0 ? undefined : end).map((l) => l.replace(/(^|\s)#.*$/, "$1"));
+  const v = word(d.variable);
+  const runs = new RegExp(`(?:^|[;&|(]|\\$\\()\\s*"?\\$(?:\\{${v}\\}|${v})"?(?:\\s|\\)|$)`);
+  if (!body.some((line) => runs.test(line))) return false;
+  const assign = new RegExp(`^${v}="\\$SCRIPT_DIR/${gate.script.replace(/^scripts\//, "").replace(/[.]/g, "\\.")}"\\s*$`, "m");
+  return assign.test(deployScript);
+}
+
 export function check(input: {
   manifest: Manifest;
   masterLib: string;
@@ -195,7 +222,7 @@ export function check(input: {
     const stage = gate.stage ?? "build";
     const inTrain = stage === "build"
       ? (gate.script ? train.scripts.has(key) : train.npm.has(key))
-      : deployScript.includes(key.split("/").pop()!);
+      : deployRuns(deployScript, gate);
     if (!inTrain) {
       problems.push({ kind: "manifest-not-in-train", message: `${gate.id}: the ${stage} stage no longer runs ${key}` });
     }

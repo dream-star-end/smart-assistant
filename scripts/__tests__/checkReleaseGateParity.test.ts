@@ -129,6 +129,33 @@ test("red: the production web build left the train or CI", () => {
   assert.deepEqual(kinds(check(ci)), ["ci-missing"]);
 });
 
+test("red: the deploy-stage trailer gate is no longer really called (Codex final r1)", () => {
+  const cases: [string, (d: string) => string][] = [
+    ["call removed, mentions kept", (d) => d.replace(/^ {2}assert_fix_trailers "\$sha"\n/m, "")],
+    ["call only in a comment", (d) => d.replace(/^ {2}assert_fix_trailers "\$sha"$/m, '  # assert_fix_trailers "$sha"')],
+    ["call only echoed", (d) => d.replace(/^ {2}assert_fix_trailers "\$sha"$/m, '  echo assert_fix_trailers "$sha"')],
+    ["function no longer runs the gate", (d) => d.replace(/"\$FIX_TRAILER_GATE" --repo/, "true --repo")],
+    ["variable points elsewhere", (d) => d.replace(/^FIX_TRAILER_GATE=.*$/m, 'FIX_TRAILER_GATE="$SCRIPT_DIR/other.sh"')],
+  ];
+  for (const [name, mutate] of cases) {
+    const input = real();
+    const before = input.deployScript;
+    input.deployScript = mutate(before);
+    assert.notEqual(input.deployScript, before, `${name}: mutation applied`);
+    assert.deepEqual(kinds(check(input)), ["manifest-not-in-train"], name);
+  }
+});
+
+test("red: an escaped separator does not start a command (Codex final r1)", () => {
+  const wf = "v5-selfhost-release-gates.yml";
+  const input = real();
+  input.workflows[wf] = input.workflows[wf]!.replace("run: node scripts/check-v5-callback-payload-hash.mjs",
+    "run: echo \\; node scripts/check-v5-callback-payload-hash.mjs");
+  assert.deepEqual(kinds(check(input)), ["ci-missing"]);
+  assert.deepEqual([...runsIn(shellCommands("a \\\nnode scripts/x.mjs")).scripts], [], "continuation joins into a's arguments");
+  assert.deepEqual([...runsIn(shellCommands("a;\\\nnode scripts/x.mjs")).scripts], ["scripts/x.mjs"]);
+});
+
 test("exempt needs a written reason; a real reason is accepted", () => {
   const input = real();
   const gate = input.manifest.gates.find((g) => g.id === "callback-payload-hash")!;
