@@ -2157,7 +2157,7 @@ $dirty
     fi
     log "$dirty"
   fi
-  sha="$(source_commit)"; selfhost_release_preflight "${LEASE_TARGET_SHA:-$sha}"  # OCV5-581 L0,只读
+  sha="$(source_commit)"
   local policy_bind_rc=0
   release_policy_bind_official_train_request "$sha" || policy_bind_rc=$?
   [[ "$policy_bind_rc" == 0 ]] || exit "$policy_bind_rc"
@@ -2179,7 +2179,7 @@ $dirty
     sha="$(source_commit)"
     lease_train_begin "$sha"
   fi
-  assert_fix_trailers "$sha"
+  selfhost_release_preflight "${LEASE_TARGET_SHA:-$sha}"; assert_fix_trailers "$sha"  # L0 在 begin 之后:拒绝即 deploy 上报的失败,worker 不重发(OCV5-581)
   assert_p0_web_overlay_contained "$sha"
   log "── source=$sha 构建三面制品(失败则 live 不动) ──"
   start_runtime_release_bg "$sha"
