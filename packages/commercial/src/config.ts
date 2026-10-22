@@ -709,6 +709,13 @@ export const commercialConfigSchema = z
     OC_MUSE_VIDEO_PER_HOUR: positiveInt(10_000),
     OC_MUSE_VIDEO_PER_DAY: positiveInt(100_000),
     /**
+     * Optional direct HTTPS port for the Muse bridge (muse/publicListener.ts): serves only
+     * /api/muse-bridge/* with the cert/key below, bypassing the Cloudflare tunnel. Unset = off.
+     */
+    OC_MUSE_PUBLIC_PORT: positiveInt(65_535),
+    OC_MUSE_PUBLIC_TLS_CERT: absolutePath("OC_MUSE_PUBLIC_TLS_CERT"),
+    OC_MUSE_PUBLIC_TLS_KEY: absolutePath("OC_MUSE_PUBLIC_TLS_KEY"),
+    /**
      * 火山方舟 Ark Coding Plan key(2026-06-15 接入)。glm-5.1 当前是 **coder 默认模型**
      * (2026-06-16 起平台默认改为 MiniMax-M3,见 platformDefaults.ts / entrypoint COMMERCIAL_DEFAULT_MODEL;
      * ark 北京端点跨境抖动,故平台默认/队长改走新加坡 MiniMax-M3,coder 保留 glm-5.1)。

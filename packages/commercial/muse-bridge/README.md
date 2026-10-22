@@ -69,5 +69,6 @@ bridge 随后以退出码 3 退出。要判断是哪一层拦的：
 - 先运行 `python3 muse_bridge.py check`。其中「bridge 接口可用」一项会按真实请求的格式（POST、JSON 正文、Bearer 头）向 `/api/muse-bridge/probe` 发一次请求，只有收到服务端自己的 JSON 404 才算通过。服务端在检查 token 之前就会应答这个地址，所以这一项不发送真实 token、不会顶掉正在运行的 bridge，也不计入服务端按 IP 统计的登录失败次数。
 - 「本机代理」显示的是 `HTTPS_PROXY`（或 `https_proxy`）里的主机和端口，账号和密码会去掉。响应摘要里疑似凭据的内容（token、认证头、Cookie、`user:pass@`、长串随机字符）和链接都会替换成 `<redacted>` 或 `<url>`。如果这里有代理，并且 `Server` 不是 `cloudflare`，基本可以确定是 Muse VM 的出口代理拦截了。
 - `Server: cloudflare` 并且带 cf-ray 时，说明是 Cloudflare 边缘拦截。可以把 cf-ray 发给运维查。
+- 遇到 Cloudflare 拦截时，改用个人版的直连入口：`--server https://<主机>:<OC_MUSE_PUBLIC_PORT>`。这个入口不经过 Cloudflare，只提供 `/api/muse-bridge/*`，token 不用换。服务端怎么开启，见设计文档「直连入口」一节。
 
 协议与错误码详见设计文档 `DESIGN-20261022-muse-media.md` 的 §3、§9。
