@@ -48,6 +48,7 @@
  *   Phase B,见 docs/v3/02-DEVELOPMENT-PLAN.md 后续 task。
  */
 
+import { removeContainerSavingLogs } from "../compute-pool/containerLogArchive.js";
 import type Docker from "dockerode";
 import { randomBytes, createHash, createHmac } from "node:crypto";
 import { lstatSync, readFileSync, readdirSync, realpathSync } from "node:fs";
@@ -2285,7 +2286,7 @@ async function createV3ContainerLocalWithSelfHeal(
 
   // 三重校验通过 + 非 running → rm(force);404 吞掉(幂等共存 orphanReconcile / 并发 provision)。
   try {
-    await docker.getContainer(conflictId).remove({ force: true });
+    await removeContainerSavingLogs(docker.getContainer(conflictId), "name_conflict_heal");
   } catch (rmErr) {
     if (!isNotFound(rmErr)) {
       // rm 真失败(非 404)→ 放弃自愈,保留原 409 失败(上层短重试,下一轮再判)。
@@ -2369,7 +2370,7 @@ async function compensateProvisionFailure(
       if (useRemote) {
         await deps.containerService!.remove(hostId!, createdDockerId, { force: true });
       } else {
-        await deps.docker.getContainer(createdDockerId).remove({ force: true });
+        await removeContainerSavingLogs(deps.docker.getContainer(createdDockerId), "provision_compensate");
       }
     } catch {
       /* swallow — orphanReconcile / NameConflict 自愈兜底 */
@@ -3603,7 +3604,7 @@ export async function provisionV3Container(
         // start 失败,就近回收本 container(force);再抛给中段 catch → compensateProvisionFailure
         // 翻 vanished(rm 幂等:此处已删 → 补偿再 rm 撞 404 吞掉)。
         try {
-          await container.remove({ force: true });
+          await removeContainerSavingLogs(container, "start_failed");
         } catch {
           /* swallow */
         }
@@ -3833,7 +3834,7 @@ export async function cleanupV3ContainerDocker(
     if (useRemote) {
       await deps.containerService!.remove(effectiveHostUuid!, cid, { force: true });
     } else {
-      await deps.docker.getContainer(cid).remove({ force: true });
+      await removeContainerSavingLogs(deps.docker.getContainer(cid), "stop_and_remove");
     }
     containerCleared = true;
   } catch (err) {

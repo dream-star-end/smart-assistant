@@ -36,9 +36,13 @@ const LOG_LINE_CAP = 5000 // raw matching lines read; the timeline is collapsed 
 const EVENT_CAP = 400
 const DB = process.env.OC_TRACE_DB ?? 'openclaude_v5_selfhost'
 const LOG_DIR = process.env.OC_TRACE_LOG_DIR ?? '/var/log'
-const LOGS: [Source, RegExp][] = [
-  ['master-log', /^openclaude-v5-selfhost\.log(\.\d+(\.gz)?)?$/],
-  ['egress-log', /^openclaude-v5-selfhost-egress\.log(\.\d+(\.gz)?)?$/],
+const CONTAINER_LOG_DIR =
+  process.env.OC_TRACE_CONTAINER_LOG_DIR ?? '/var/log/openclaude-v5-containers'
+const LOGS: [Source, string, RegExp][] = [
+  ['master-log', LOG_DIR, /^openclaude-v5-selfhost\.log(\.\d+(\.gz)?)?$/],
+  ['egress-log', LOG_DIR, /^openclaude-v5-selfhost-egress\.log(\.\d+(\.gz)?)?$/],
+  // saved before each turn-runtime container removal (OCV5-568, plan §7.5)
+  ['container-log', CONTAINER_LOG_DIR, /\.log$/],
 ]
 const ID_RE = /^[0-9A-Za-z_-]{8,128}$/
 
@@ -136,10 +140,11 @@ function logEvents(ids: Set<string>): { events: TraceEvent[]; truncated: boolean
   const events: TraceEvent[] = []
   let truncated = false
   const patterns = [...ids].filter((i) => i.length >= 16).join('\n')
-  if (!patterns || !existsSync(LOG_DIR)) return { events, truncated }
-  for (const [source, re] of LOGS) {
-    for (const f of readdirSync(LOG_DIR).filter((n) => re.test(n))) {
-      const file = path.join(LOG_DIR, f)
+  if (!patterns) return { events, truncated }
+  for (const [source, dir, re] of LOGS) {
+    if (!existsSync(dir)) continue
+    for (const f of readdirSync(dir).filter((n) => re.test(n))) {
+      const file = path.join(dir, f)
       const r = spawnSync(f.endsWith('.gz') ? 'zgrep' : 'grep', ['-h', '-F', '-f', '-', file], {
         input: patterns,
         encoding: 'utf8',
@@ -182,8 +187,7 @@ export function trace(input: string) {
       ...(logs.truncated ? (['logs'] as const) : []),
       ...(all.length > EVENT_CAP ? (['timeline'] as const) : []),
     ],
-    containerLogs:
-      'not retained (container stdout is lost when the container is removed until plan §7.5, P2-g)',
+    containerLogs: `${CONTAINER_LOG_DIR} (saved before each removal since OCV5-568; containers removed earlier left nothing)`,
     seconds: (Date.now() - t0) / 1000,
   }
 }
