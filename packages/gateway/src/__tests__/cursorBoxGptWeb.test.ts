@@ -1137,7 +1137,7 @@ rl.on('line', (line) => {
     assert.equal(keepaliveObj.elapsed_ms, 32_000)
   })
 
-  it('auto-handles Codex approval cards under Scheme A (loopback preview -> Allow for this chat, all others -> Deny)', async () => {
+  it('auto-handles Codex approval cards by always clicking Allow for this chat (never Allow all relevant sites or Deny) and announcing the allowed site', async () => {
     const loopbackPreview = classifyApprovalCard({
       text: 'Sites\nAllow ChatGPT to preview your site?\nAllow ChatGPT to access 127.0.0.1:8765 using the cloud browser?',
       buttons: ['Deny', 'Allow all relevant sites', 'Allow for this chat'],
@@ -1145,6 +1145,8 @@ rl.on('line', (line) => {
     assert.equal(loopbackPreview.decision, 'allow_this_chat')
     assert.equal(loopbackPreview.buttonLabel, 'Allow for this chat')
     assert.equal(loopbackPreview.buttonIndex, 2)
+    assert.equal(loopbackPreview.targetHost, '127.0.0.1:8765')
+    assert.match(loopbackPreview.announcement, /127\.0\.0\.1:8765/)
     assert.match(loopbackPreview.announcement, /Allow for this chat/)
 
     const zhLoopbackPreview = classifyApprovalCard({
@@ -1154,33 +1156,48 @@ rl.on('line', (line) => {
     assert.equal(zhLoopbackPreview.decision, 'allow_this_chat')
     assert.equal(zhLoopbackPreview.buttonLabel, '允许此聊天')
     assert.equal(zhLoopbackPreview.buttonIndex, 2)
+    assert.equal(zhLoopbackPreview.targetHost, 'localhost:3000')
+    assert.match(zhLoopbackPreview.announcement, /localhost:3000/)
+    assert.match(zhLoopbackPreview.announcement, /允许此聊天/)
 
-    // Public exposure / Auto-review card must ALWAYS be denied even if it mentions 127.0.0.1
+    // All approval cards (including Auto-review and external domains) auto-click "Allow for this chat" / "允许此聊天"
     const autoReviewCard = classifyApprovalCard({
       text: 'Auto-review 阻止公开暴露工作区文件\n127.0.0.1:8765',
       buttons: ['拒绝', '允许此聊天'],
     })
-    assert.equal(autoReviewCard.decision, 'deny')
-    assert.equal(autoReviewCard.buttonLabel, '拒绝')
-    assert.equal(autoReviewCard.buttonIndex, 0)
-    assert.match(autoReviewCard.announcement, /自动点击「拒绝」/)
+    assert.equal(autoReviewCard.decision, 'allow_this_chat')
+    assert.equal(autoReviewCard.buttonLabel, '允许此聊天')
+    assert.equal(autoReviewCard.buttonIndex, 1)
+    assert.equal(autoReviewCard.targetHost, '127.0.0.1:8765')
+    assert.match(autoReviewCard.announcement, /127\.0\.0\.1:8765/)
+    assert.match(autoReviewCard.announcement, /已自动点击「允许此聊天」/)
 
-    // External domain preview must ALWAYS be denied
     const externalSiteCard = classifyApprovalCard({
       text: 'Sites\nAllow ChatGPT to preview your site?\nAllow ChatGPT to access example.com:8080 using the cloud browser?',
       buttons: ['Deny', 'Allow all relevant sites', 'Allow for this chat'],
     })
-    assert.equal(externalSiteCard.decision, 'deny')
-    assert.equal(externalSiteCard.buttonLabel, 'Deny')
-    assert.equal(externalSiteCard.buttonIndex, 0)
+    assert.equal(externalSiteCard.decision, 'allow_this_chat')
+    assert.equal(externalSiteCard.buttonLabel, 'Allow for this chat')
+    assert.equal(externalSiteCard.buttonIndex, 2)
+    assert.equal(externalSiteCard.targetHost, 'example.com:8080')
+    assert.match(externalSiteCard.announcement, /example\.com:8080/)
+    assert.match(externalSiteCard.announcement, /Allow for this chat/)
 
-    // Verify inspectAndHandleApprovalCardInPage never clicks "Allow all relevant sites" (index 1)
+    // Never clicks "Allow all relevant sites" or "Deny" when single-chat allow is absent
+    const multiSiteOnlyCard = classifyApprovalCard({
+      text: 'Sites\nAllow ChatGPT to access example.com:8080?',
+      buttons: ['Deny', 'Allow all relevant sites'],
+    })
+    assert.equal(multiSiteOnlyCard.decision, 'skip')
+    assert.equal(multiSiteOnlyCard.buttonIndex, null)
+
+    // Verify inspectAndHandleApprovalCardInPage never clicks "Allow all relevant sites" (index 1) or "Deny" (index 0)
     const clickedIndices: number[] = []
     const fakePage = {
       evaluate: async (_fn: unknown, btnIdx?: number) => {
         if (btnIdx === undefined) {
           return {
-            text: 'Sites\nAllow ChatGPT to preview your site?\nAllow ChatGPT to access 127.0.0.1:8765 using the cloud browser?',
+            text: 'Sites\nAllow ChatGPT to preview your site?\nAllow ChatGPT to access example.com:8080 using the cloud browser?',
             buttons: [
               { index: 0, label: 'Deny' },
               { index: 1, label: 'Allow all relevant sites' },
@@ -1199,6 +1216,7 @@ rl.on('line', (line) => {
     assert.equal(handled.handled, true)
     assert.equal(handled.decision, 'allow_this_chat')
     assert.equal(handled.buttonLabel, 'Allow for this chat')
+    assert.equal(handled.targetHost, 'example.com:8080')
     assert.deepEqual(clickedIndices, [2])
   })
 
@@ -1261,7 +1279,9 @@ rl.on('line', (line) => {
             status: 'in_progress',
             content: {
               content_type: 'text',
-              parts: ['演示已生成：[下载 ellis-wormhole.html](sandbox:/mnt/data/ellis-wormhole.html)'],
+              parts: [
+                '演示已生成：[下载 ellis-wormhole.html](sandbox:/mnt/data/ellis-wormhole.html)',
+              ],
             },
           },
         },
@@ -1357,7 +1377,10 @@ rl.on('line', (line) => {
     const htmlBytes = Buffer.from('<!doctype html><html><body>Demo</body></html>', 'utf8')
     const pngBytes = Buffer.from('89504e470d0a1a0a', 'hex')
     const fakePage = {
-      evaluate: async (_fn: unknown, arg: { targetRef: { sandboxPath?: string; fileId?: string } }) => {
+      evaluate: async (
+        _fn: unknown,
+        arg: { targetRef: { sandboxPath?: string; fileId?: string } },
+      ) => {
         if (arg.targetRef.sandboxPath) {
           return {
             ok: true,
