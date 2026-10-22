@@ -335,6 +335,14 @@ function sanitizeBinaryArtifact(mime: string, body: Buffer): Buffer | null {
   return null
 }
 
+/** 经验分享图片上传复用同一套 chunk 白名单剥离（去掉 EXIF/XMP/文本块，不重编码）。 */
+export function sanitizeTutorialImageBytes(
+  mime: 'image/png' | 'image/webp',
+  body: Buffer,
+): Buffer | null {
+  return sanitizeBinaryArtifact(mime, body)
+}
+
 function sanitizedArtifactBody(
   mime: string,
   body: Buffer,

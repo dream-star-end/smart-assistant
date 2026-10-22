@@ -8,6 +8,12 @@
   {
     "method": "GET",
     "pathKind": "path",
+    "pathValue": "/api/admin/tutorials",
+    "handler": "handleAdminListCommunityTutorials"
+  },
+  {
+    "method": "GET",
+    "pathKind": "path",
     "pathValue": "/api/admin/tutorials/case-specs",
     "handler": "handleAdminTutorialControlGet"
   },
