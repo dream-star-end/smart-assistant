@@ -49,6 +49,53 @@ export function resolveElevenLabsKey(
   return { key }
 }
 
+const MAX_ERROR_BYTES = 64 * 1024
+
+function upstreamFailure(err: unknown): string {
+  const name = err instanceof Error ? err.name : ''
+  return name === 'TimeoutError' || name === 'AbortError'
+    ? 'music provider timed out'
+    : 'music provider is unreachable'
+}
+
+/** Remove the configured key and any key-shaped token (sk_…, xi-… style) from upstream text. */
+export function redactSecrets(text: string, key: string): string {
+  let out = key ? text.split(key).join('[redacted]') : text
+  out = out.replace(/\b(sk|xi)[_-][A-Za-z0-9_-]{8,}\b/g, '[redacted]')
+  return out
+}
+
+async function readBoundedBytes(res: Response, max: number): Promise<Buffer> {
+  if (!res.body) return Buffer.alloc(0)
+  const chunks: Buffer[] = []
+  let total = 0
+  const reader = res.body.getReader()
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value) continue
+      total += value.byteLength
+      if (total > max) {
+        await reader.cancel().catch(() => {})
+        throw new MusicProviderError(
+          'MUSIC_UPSTREAM',
+          502,
+          'music provider response exceeds size limit',
+        )
+      }
+      chunks.push(Buffer.from(value))
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  return Buffer.concat(chunks)
+}
+
+async function readBounded(res: Response, max: number): Promise<string> {
+  return (await readBoundedBytes(res, max)).toString('utf8')
+}
+
 export function musicCostCredits(durationMs: number, perMinute = 150): bigint {
   const minutes = Math.max(1, Math.ceil(Math.max(0, durationMs) / 60_000))
   return BigInt(minutes) * BigInt(Math.max(1, Math.trunc(perMinute)))
@@ -91,21 +138,28 @@ export async function composeMusic(
   }
   const url = new URL(ELEVENLABS_MUSIC_URL)
   url.searchParams.set('output_format', 'mp3_44100_128')
-  const res = await (deps.fetchImpl ?? fetch)(url, {
-    method: 'POST',
-    headers: { 'xi-api-key': deps.key, 'content-type': 'application/json', accept: 'audio/mpeg' },
-    body: JSON.stringify({
-      prompt,
-      music_length_ms: args.durationMs,
-      model_id: args.modelId ?? 'music_v1',
-      force_instrumental: args.instrumental,
-    }),
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  })
+  let res: Response
+  try {
+    res = await (deps.fetchImpl ?? fetch)(url, {
+      method: 'POST',
+      headers: { 'xi-api-key': deps.key, 'content-type': 'application/json', accept: 'audio/mpeg' },
+      body: JSON.stringify({
+        prompt,
+        music_length_ms: args.durationMs,
+        model_id: args.modelId ?? 'music_v1',
+        force_instrumental: args.instrumental,
+      }),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    })
+  } catch (err) {
+    // Network failures and timeouts map to the documented code (code r1 P1-3).
+    throw new MusicProviderError('MUSIC_UPSTREAM', 502, upstreamFailure(err))
+  }
   if (!res.ok) {
     let detail = ''
     try {
-      const j = (await res.json()) as {
+      // Bounded read of the error body (code r1 P1-2): never buffer more than 64 KiB.
+      const j = JSON.parse(await readBounded(res, MAX_ERROR_BYTES)) as {
         detail?: Array<{ msg?: string }> | { message?: string } | string
       }
       detail = Array.isArray(j.detail)
@@ -119,7 +173,8 @@ export async function composeMusic(
     } catch {
       /* non-JSON error body */
     }
-    detail = detail.slice(0, 200)
+    // Upstream text may echo the request's key: redact it and anything key-shaped (code r1 P1-1).
+    detail = redactSecrets(detail, deps.key).slice(0, 200)
     if (res.status === 401 || res.status === 403)
       throw new MusicProviderError(
         'MUSIC_PROVIDER_AUTH',
@@ -146,25 +201,13 @@ export async function composeMusic(
   }
   if (!res.body)
     throw new MusicProviderError('MUSIC_UPSTREAM', 502, 'music provider returned no body')
-  const chunks: Buffer[] = []
-  let total = 0
-  const reader = res.body.getReader()
+  let audio: Buffer
   try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (!value) continue
-      total += value.byteLength
-      if (total > MAX_AUDIO_BYTES) {
-        await reader.cancel().catch(() => {})
-        throw new MusicProviderError('MUSIC_UPSTREAM', 502, 'music file exceeds size limit')
-      }
-      chunks.push(Buffer.from(value))
-    }
-  } finally {
-    reader.releaseLock()
+    audio = await readBoundedBytes(res, MAX_AUDIO_BYTES)
+  } catch (err) {
+    if (err instanceof MusicProviderError) throw err
+    throw new MusicProviderError('MUSIC_UPSTREAM', 502, upstreamFailure(err))
   }
-  const audio = Buffer.concat(chunks)
   if (!looksLikeMp3(audio.subarray(0, 4)))
     throw new MusicProviderError('MUSIC_UPSTREAM', 502, 'music provider returned invalid mp3 data')
   return {

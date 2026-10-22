@@ -96,6 +96,68 @@ describe('ElevenLabs music provider (OCV5-590)', () => {
     }
   })
 
+  test('code r1: key never leaks via upstream detail; error bodies are bounded; network errors map to MUSIC_UPSTREAM', async () => {
+    const key = 'sk_review_fake_0123456789'
+    const leak = upstream(
+      422,
+      JSON.stringify({ detail: [{ msg: `invalid xi-api-key: ${key}` }] }),
+      { 'content-type': 'application/json' },
+    )
+    await assert.rejects(
+      composeMusic(
+        { key, fetchImpl: leak.fetchImpl },
+        { prompt: 'x', durationMs: 5000, instrumental: true },
+      ),
+      (e: unknown) =>
+        e instanceof MusicProviderError &&
+        e.code === 'MUSIC_INVALID' &&
+        !e.message.includes(key) &&
+        e.message.includes('[redacted]'),
+    )
+    const huge = upstream(500, `${' '.repeat(200 * 1024)}{}`, {
+      'content-type': 'application/json',
+    })
+    await assert.rejects(
+      composeMusic(
+        { key, fetchImpl: huge.fetchImpl },
+        { prompt: 'x', durationMs: 5000, instrumental: true },
+      ),
+      (e: unknown) => e instanceof MusicProviderError && e.code === 'MUSIC_UPSTREAM',
+    )
+    for (const thrown of [
+      new TypeError('fetch failed'),
+      Object.assign(new Error('t'), { name: 'TimeoutError' }),
+    ]) {
+      const failing = (async () => {
+        throw thrown
+      }) as unknown as typeof fetch
+      await assert.rejects(
+        composeMusic(
+          { key, fetchImpl: failing },
+          { prompt: 'x', durationMs: 5000, instrumental: true },
+        ),
+        (e: unknown) =>
+          e instanceof MusicProviderError && e.code === 'MUSIC_UPSTREAM' && e.status === 502,
+      )
+    }
+    const broken = (async () =>
+      new Response(
+        new ReadableStream({
+          pull(c) {
+            c.error(new TypeError('terminated'))
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'audio/mpeg' } },
+      )) as unknown as typeof fetch
+    await assert.rejects(
+      composeMusic(
+        { key, fetchImpl: broken },
+        { prompt: 'x', durationMs: 5000, instrumental: true },
+      ),
+      (e: unknown) => e instanceof MusicProviderError && e.code === 'MUSIC_UPSTREAM',
+    )
+  })
+
   test('non-audio or corrupt responses are refused', async () => {
     const html = upstream(200, '<html>', { 'content-type': 'text/html' })
     await assert.rejects(
