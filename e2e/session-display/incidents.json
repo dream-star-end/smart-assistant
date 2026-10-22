@@ -8558,6 +8558,65 @@
           "assertion": "OCV5-571 tokens this recovery really spent still keep the full budget"
         }
       ]
+    },
+    {
+      "id": "INC-20261023-BOX-GPT-WEB-CITATION-LEAK",
+      "occurredAt": "2026-10-23",
+      "severity": "P2",
+      "symptom": "商业 uid 1 会话 webmvjqjcdxtgwq7a（box-gpt-6-astra-pro，GPT-6 Astra Pro Box Web）：回复正文表格和段落里漏出 ChatGPT 网页的内部引用标记——私有区字符 + genui + {\"citation\":{\"ref\":\"turn27view0\"}} / {\"citation\":{\"refs\":[…]}}，本应显示为来源角标。box-gpt-web-mod 把 /message/content/parts 的原文直接流式输出，并作为最终 assistant 消息和 result 发出。",
+      "rootFixCommit": "d1e741a4",
+      "regressions": [
+        {
+          "layer": "deploy-gate",
+          "path": "scripts/check-v5-box-incident-proofs.ts",
+          "assertion": "[ocv5-584-gpt-web-citation-markers] PASS — ChatGPT Web citation markers cut across SSE frames never reach a text delta and a known source becomes a link"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxGptWeb.test.ts",
+          "assertion": "OCV5-584 a citation marker with a known source renders as a numbered link"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxGptWeb.test.ts",
+          "assertion": "OCV5-584 an unresolved citation marker and stray marker characters are removed"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxGptWeb.test.ts",
+          "assertion": "OCV5-584 a marker split across SSE frames never reaches a text delta"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxGptWeb.test.ts",
+          "assertion": "OCV5-584 sources that arrive after the text are listed once at the end"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxGptWeb.test.ts",
+          "assertion": "OCV5-584 an unterminated marker is held while streaming and dropped at the end"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxGptWeb.test.ts",
+          "assertion": "OCV5-584 mapping progress takes sources only from the current reply"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxGptWeb.test.ts",
+          "assertion": "OCV5-584 a reconnect keeps what the previous host already delivered"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxGptWeb.test.ts",
+          "assertion": "OCV5-584 a citation marker longer than 4096 chars is still parsed, never leaked"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxGptWeb.test.ts",
+          "assertion": "OCV5-584 adjacent citations delivered before a reconnect keep their own links"
+        }
+      ]
     }
   ]
 }
