@@ -444,6 +444,31 @@ describe('media studio blobs', () => {
     assert.equal(await liveHolds(), 1)
   })
 
+  test('an expired hold is re-admitted at settle; addRef keeps usage while any ref survives', async (t) => {
+    if (skip(t)) return
+    const root = await mkdtemp(path.join(tmpdir(), 'oc-studio-readmit-'))
+    const u = BigInt(await user())
+    // holdTtlSeconds 0: the hold is already expired when the write settles (Codex code r1 P1).
+    const lapsed = blobStore(root, { holdTtlSeconds: 0 })
+    const takeId = randomUUID()
+    const put = await lapsed.put({
+      userId: u,
+      mime: 'image/png',
+      maxBytes: 16,
+      source: Buffer.from('lapsed hold'),
+      ref: { kind: 'take', id: takeId },
+    })
+    assert.equal(await quota(`u:${u}`), put.bytes)
+    assert.equal(await liveHolds(), 0)
+    const assetId = randomUUID()
+    assert.equal(await lapsed.addRef(u, put.sha, { kind: 'asset', id: assetId }), true)
+    await lapsed.dropRefs(u, { kind: 'take', id: takeId })
+    assert.equal(await quota(`u:${u}`), put.bytes, 'the asset ref still holds the content')
+    await lapsed.dropRefs(u, { kind: 'asset', id: assetId })
+    assert.equal(await quota(`u:${u}`), 0)
+    assert.equal(await lapsed.addRef(u, put.sha, { kind: 'asset', id: randomUUID() }), false)
+  })
+
   test('gc deletes unreferenced content and the GC tick purges old deleted projects', async (t) => {
     if (skip(t)) return
     const root = await mkdtemp(path.join(tmpdir(), 'oc-studio-gc-'))

@@ -14,7 +14,9 @@
  *                its 2 GB floor after every live hold lands. The hold row expires (default 30 min),
  *                so a writer that dies never leaks reservation.
  *   2. write   — streamed to tmp/ while hashing and counting; more than `maxBytes` aborts.
- *   3. settle  — under a per-sha advisory lock: the file is renamed into place if absent, the blob
+ *   3. settle  — under a per-sha advisory lock and the quota row locks: a hold that expired during
+ *                the write is re-admitted against current usage (or refused); then the file is renamed
+ *                into place if absent, the blob
  *                row inserted if new ('site' used += bytes only then), the ref inserted and, when
  *                this is the user's first ref to the sha, 'u:<id>' used += bytes (even if other
  *                users already hold the same content). The hold is deleted in the same transaction.
@@ -216,42 +218,70 @@ export class StudioBlobStore {
       const sha = hash.digest('hex')
       const finalPath = this.blobPath(sha)
       const newForUser = await inTx(this.opts.pool, async (client) => {
+        // Lock order everywhere: sha advisory lock, then 'site', then 'u:<id>'.
         await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`studio-blob:${sha}`])
+        const quotaRows = await client.query<{ scope: string; used: string; lim: string }>(
+          `SELECT scope, used_bytes::text AS used, limit_bytes::text AS lim FROM studio_quota
+           WHERE scope IN ('site', $1) ORDER BY scope='site' DESC FOR UPDATE`,
+          [userScope(args.userId)],
+        )
+        const physicalNew =
+          (await client.query('SELECT 1 FROM studio_blobs WHERE sha256=$1', [sha])).rowCount === 0
+        const first =
+          (
+            await client.query(
+              'SELECT 1 FROM studio_blob_refs WHERE user_id=$1 AND sha256=$2 LIMIT 1',
+              [args.userId.toString(), sha],
+            )
+          ).rowCount === 0
+        const live = await client.query(
+          'DELETE FROM studio_quota_holds WHERE id=$1 AND expires_at > NOW() RETURNING id',
+          [holdId],
+        )
+        if (live.rowCount !== 1) {
+          // The hold expired while we wrote (Codex code r1 P1): it no longer protects these bytes,
+          // so admit them again against current usage and every other live hold.
+          const held = await client.query<{ site: string; mine: string }>(
+            `SELECT COALESCE(SUM(bytes),0)::text AS site,
+                    COALESCE(SUM(bytes) FILTER (WHERE user_id=$1),0)::text AS mine
+             FROM studio_quota_holds WHERE expires_at > NOW() AND id <> $2`,
+            [args.userId.toString(), holdId],
+          )
+          const row = (scope: string) => quotaRows.rows.find((r) => r.scope === scope)!
+          const fits = (scope: string, heldBytes: string, add: boolean) =>
+            !add ||
+            BigInt(row(scope).used) + BigInt(heldBytes) + BigInt(bytes) <= BigInt(row(scope).lim)
+          if (!fits(userScope(args.userId), held.rows[0]!.mine, first))
+            throw new StudioQuotaError('user')
+          if (!fits('site', held.rows[0]!.site, physicalNew)) throw new StudioQuotaError('site')
+          await client.query('DELETE FROM studio_quota_holds WHERE id=$1', [holdId])
+        }
         if (!(await exists(finalPath))) {
           await mkdir(join(finalPath, '..'), { recursive: true, mode: 0o750 })
           await rename(tmp, finalPath)
         }
-        const inserted = await client.query(
-          `INSERT INTO studio_blobs(sha256, bytes, mime) VALUES ($1, $2, $3)
-           ON CONFLICT (sha256) DO NOTHING`,
-          [sha, bytes, args.mime],
-        )
-        if (inserted.rowCount === 1) {
+        if (physicalNew) {
+          await client.query('INSERT INTO studio_blobs(sha256, bytes, mime) VALUES ($1, $2, $3)', [
+            sha,
+            bytes,
+            args.mime,
+          ])
           await client.query(
             `UPDATE studio_quota SET used_bytes = used_bytes + $1, updated_at = NOW() WHERE scope='site'`,
             [bytes],
           )
         }
-        await client.query('SELECT 1 FROM studio_quota WHERE scope=$1 FOR UPDATE', [
-          userScope(args.userId),
-        ])
-        const had = await client.query(
-          'SELECT 1 FROM studio_blob_refs WHERE user_id=$1 AND sha256=$2 LIMIT 1',
-          [args.userId.toString(), sha],
-        )
         await client.query(
           `INSERT INTO studio_blob_refs(user_id, sha256, ref_kind, ref_id) VALUES ($1, $2, $3, $4)
            ON CONFLICT DO NOTHING`,
           [args.userId.toString(), sha, args.ref.kind, args.ref.id],
         )
-        const first = had.rowCount === 0
         if (first) {
           await client.query(
             'UPDATE studio_quota SET used_bytes = used_bytes + $1, updated_at = NOW() WHERE scope=$2',
             [bytes, userScope(args.userId)],
           )
         }
-        await client.query('DELETE FROM studio_quota_holds WHERE id=$1', [holdId])
         return first
       })
       const mime = await this.opts.pool.query<{ mime: string }>(
@@ -275,14 +305,21 @@ export class StudioBlobStore {
     ref: { kind: BlobRefKind; id: string },
   ): Promise<boolean> {
     if (!SHA_RE.test(sha) || !UUID_RE.test(ref.id)) throw new Error('invalid blob ref')
-    const r = await this.opts.pool.query(
-      `INSERT INTO studio_blob_refs(user_id, sha256, ref_kind, ref_id)
-       SELECT $1, $2, $3, $4
-       WHERE EXISTS (SELECT 1 FROM studio_blob_refs WHERE user_id=$1 AND sha256=$2)
-       ON CONFLICT DO NOTHING`,
-      [userId.toString(), sha, ref.kind, ref.id],
-    )
-    return r.rowCount === 1
+    return inTx(this.opts.pool, async (client) => {
+      // Same user-row lock as dropRefs: the existing ref cannot be released between the check and
+      // the insert, so the user's usage never drops to 0 while a ref survives (Codex code r1 P1).
+      await client.query('SELECT 1 FROM studio_quota WHERE scope=$1 FOR UPDATE', [
+        userScope(userId),
+      ])
+      const r = await client.query(
+        `INSERT INTO studio_blob_refs(user_id, sha256, ref_kind, ref_id)
+         SELECT $1, $2, $3, $4
+         WHERE EXISTS (SELECT 1 FROM studio_blob_refs WHERE user_id=$1 AND sha256=$2)
+         ON CONFLICT DO NOTHING`,
+        [userId.toString(), sha, ref.kind, ref.id],
+      )
+      return r.rowCount === 1
+    })
   }
 
   /** Removes the user's refs held by one object; gives back bytes of shas the user no longer references. */
