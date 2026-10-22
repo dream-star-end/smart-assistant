@@ -46,10 +46,10 @@ class ComposeRunner {
 - **运行期磁盘硬上限**（Codex plan r1 P1-2）：
   1. 每个 ffmpeg 输出都带 `-fs <字节>`（成片 512 MiB，帧和胶片条 20 MiB，`pcm.raw` 16 MiB）。ffmpeg 写到上限就停，所以单个输出不会超过上限（只有一个包大小的余量）。产物大小达到上限的 99% 时，视为被截断，报 `COMPOSE_OUTPUT`。
   2. 每个输入都带时长上限：`waveform_pcm` 和 `probe` 以外的解码都加 `-t`（取剪辑长度，最多 600 s）；`waveform_pcm` 固定 `-t 600`（8 kHz 单声道 s16le 最多约 9.6 MB）。
-  3. 磁盘预留（r2 P1-2，覆盖并发和两个进程）：开工前先拿 `<root>/reservations/.lock`（用 O_EXCL 创建的锁文件，里面写 owner；如果 owner 已死就接管这个锁）。持锁期间汇总 `reservations/*.json` 里 owner 仍然活着的预留字节数，满足“`statfs` 可用空间 − 已预留 ≥ 本操作的 `maxOutputBytes`（成片 512 MiB、帧 20 MiB×n、pcm 16 MiB）+ 1 GiB”时，才写入自己的预留文件。写完后释放锁。不满足就返回 `COMPOSE_DISK`，不启动容器。任务结束（无论成功失败）就删除预留文件；owner 已死的预留在汇总时不计入。因为每个输出都有 `-fs` 硬上限，在途任务的实际写入量不会超过它的预留。
+  3. 磁盘预留（r2 P1-2，覆盖并发和两个进程）：开工前先拿 `<root>/reservations/.lock`（用 O_EXCL 创建的锁文件，里面写 owner；如果 owner 已死就接管这个锁）。持锁期间汇总 `reservations/*.json` 里 owner 仍然活着的预留字节数，满足“`statfs` 可用空间 − 已预留 ≥ 本操作的 `maxOutputBytes`（成片 512 MiB、帧 20 MiB×n、pcm 16 MiB）+ 1 GiB”时，才写入自己的预留文件。写完后释放锁。不满足就返回 `COMPOSE_DISK`，不启动容器。任务结束（无论成功失败）就删除预留文件。owner 已死的预留**不能直接忽略**（plan r3 P1-2）：持锁汇总时如果发现死 owner 的预留，先对该 owner 执行 sweep，把它名下所有带 label 的容器 force remove（容器被删除后就不会再写盘），确认 `docker ps` 里已经没有该 owner 的容器之后，才删除它的预留文件；否则继续计入。因为每个输出都有 `-fs` 硬上限，在途任务的实际写入量不会超过它的预留。
 - 不管成功还是失败都 `container.remove({force:true})`；工作目录交给调用方清理，并提供 `cleanup(jobId)`。
 - 残留清理（plan r1 P1-1、r2 P1-1：必须**证明** owner 已经失效，不能凭年龄或时钟判断）：A/B 两个 master 都在同一台主机上，共用同一个 Docker daemon。每个容器带 label `com.openclaude.studio.owner=<hostname>:<pid>:<进程 starttime>`，其中 starttime 取 `/proc/<pid>/stat` 的第 22 列，用来防止 pid 被复用。`sweepStale()` 的规则：
-  - 容器已经不在运行（exited、created、dead）→ 删除。这类容器没有在途工作可言；
+  - 容器状态是 `exited` 或 `dead` → 删除，因为已经停止的容器不会再写盘。`created`、`restarting`、`paused` 这几种状态可能下一刻就会运行（例如 A 刚 create 完、还没 start），所以和 running 一样处理，也要先证明 owner 已死（plan r3 P1-1）；
   - 容器在运行，并且 owner 的 hostname 是本机，而 `/proc/<pid>` 不存在或 starttime 对不上 → owner 进程已死 → 删除；
   - 其它情况（owner 还活着、label 无法解析、hostname 不是本机）→ **不碰**。
   完全不依赖墙钟。
