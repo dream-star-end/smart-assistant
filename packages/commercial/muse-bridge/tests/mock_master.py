@@ -21,7 +21,7 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0); return self.rfile.read(n)
     def auth(self):
         if self.headers.get("Authorization") != "Bearer " + TOKEN:
-            self.body(); self.send(401, {"error": "bad token"}); return False
+            self.body(); self.send(401, {"error": {"code": "UNAUTHORIZED", "message": "bridge token rejected"}}); return False
         return True
     def do_GET(self):
         self.send(404 if self.path != "/healthz" else 200, {"ok": True})
@@ -32,7 +32,7 @@ class H(BaseHTTPRequestHandler):
             S.hellos += 1; S.session = uuid.uuid4().hex; S.last_hello = json.loads(data)
             return self.send(200, {"session_id": S.session, "poll_hold_sec": 2, "heartbeat_sec": 5, "limits": S.limits})
         if self.headers.get("X-Muse-Bridge-Session") != S.session:
-            return self.send(409, {"error": "superseded"})
+            return self.send(409, {"error": {"code": "SUPERSEDED", "message": "a newer bridge session took over"}})
         if path == P + "/poll":
             try: job = S.jobs.get(timeout=2)
             except queue.Empty: return self.send(204)

@@ -50,7 +50,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-BRIDGE_VERSION = "0.3.1"
+BRIDGE_VERSION = "0.3.2"
 API_PREFIX = "/api/muse-bridge/v1"
 DEFAULT_CLI = "/opt/hatch/bin/media-generation"
 DEFAULT_STATE_DIR = os.path.join(os.path.expanduser("~"), ".muse-bridge")
@@ -101,6 +101,10 @@ log = logging.getLogger("muse-bridge")
 
 class FatalAuth(Exception):
     """Token rejected or session superseded: stop instead of retrying."""
+
+
+class Blocked(FatalAuth):
+    """A 401/403 that the selfhost master did not write (VM egress proxy, Cloudflare, ...)."""
 
 
 class JobGone(Exception):
@@ -339,6 +343,39 @@ def redact(text, limit=500):
     return text[-limit:]
 
 
+TOKEN_RE = re.compile(r"mbr_[A-Za-z0-9_-]+")
+TAG_RE = re.compile(r"<(script|style)\b.*?</\1>|<[^>]+>", re.S | re.I)
+
+
+def master_error_code(payload):
+    """error.code of a JSON error body the selfhost master wrote, else None."""
+    try:
+        err = json.loads(payload.decode("utf-8")).get("error")
+    except (ValueError, AttributeError, UnicodeDecodeError):
+        return None
+    code = err.get("code") if isinstance(err, dict) else None
+    return code if isinstance(code, str) else None
+
+
+def proxy_for(url):
+    """host:port of the proxy urllib will use for url (credentials dropped), or 无."""
+    proxy = urllib.request.getproxies().get(urllib.parse.urlsplit(url).scheme)
+    if not proxy or urllib.request.proxy_bypass(urllib.parse.urlsplit(url).hostname or ""):
+        return "无"
+    return urllib.parse.urlsplit(proxy if "://" in proxy else "http://" + proxy).netloc.rpartition("@")[2]
+
+
+def describe_foreign(status, headers, payload, url):
+    """One line saying who most likely answered status instead of the master."""
+    server = (headers.get("Server") if headers else None) or "-"
+    text = TAG_RE.sub(" ", payload[:4096].decode("utf-8", "replace"))
+    text = TOKEN_RE.sub("mbr_<redacted>", " ".join(text.split()))
+    return ("HTTP %d 不是个人版服务端返回的（Server: %s，cf-ray: %s，本机代理: %s）。"
+            "多半是 Muse VM 的出口代理或 Cloudflare 拦截了请求，换 token 没有用。响应摘要：%s"
+            % (status, server, (headers.get("cf-ray") if headers else None) or "-", proxy_for(url),
+               redact(text, 160) or "（空）"))
+
+
 def parse_contract(stdout):
     """The CLI prints one JSON line; take the last line that parses as an object."""
     for line in reversed((stdout or "").splitlines()):
@@ -561,10 +598,19 @@ class Client:
         except urllib.error.HTTPError as e:
             status = e.code
             payload = e.read() if e.fp else b""
-        if status in (401, 403):
-            raise FatalAuth("token 被拒绝（HTTP %d），请检查或重新签发 token" % status)
-        if status == 409:
-            raise FatalAuth("已有新的 bridge 接管连接（HTTP 409），本实例退出")
+            resp_headers = e.headers
+        else:
+            resp_headers = resp.headers
+        # Only the master's own JSON errors mean "token rejected" / "superseded"; the same status
+        # from a proxy or the CDN in front of it must not send the user off to rotate the token.
+        if status in (401, 403, 409):
+            code = master_error_code(payload)
+            if status == 401 and code == "UNAUTHORIZED":
+                raise FatalAuth("token 被个人版服务端拒绝（HTTP 401），请检查或重新签发 token")
+            if status == 409 and code == "SUPERSEDED":
+                raise FatalAuth("已有新的 bridge 接管连接（HTTP 409），本实例退出")
+            if status != 409:
+                raise Blocked(describe_foreign(status, resp_headers, payload, url))
         if status == 410:
             raise JobGone()
         if status == 204:
@@ -654,6 +700,9 @@ class Bridge:
                 log.info("已连接 %s（session %s…）", server_host(server), client.session_id[:8])
                 backoff = 1
                 self.loop(client, hello)
+            except Blocked as e:
+                log.error("%s", e)
+                return 3
             except FatalAuth as e:
                 log.error("%s", e)
                 return 2
@@ -895,6 +944,20 @@ def probe_server(server):
         return False, redact(str(e), 200)
 
 
+def probe_bridge_api(server):
+    """POST hello with a deliberately invalid token: only the master's own JSON 401 proves that an
+    authenticated POST reaches it. Never sends the real token, so a running bridge is not taken over."""
+    try:
+        Client(server, "mbr_probe_invalid").hello("-", "-")
+    except Blocked as e:
+        return False, str(e)
+    except FatalAuth:
+        return True, "POST 到达个人版服务端（用无效 token 探测，得到服务端自己的 401）"
+    except Exception as e:
+        return False, redact(str(e), 200)
+    return False, "无效 token 竟被接受，server 地址可能不对"
+
+
 def self_check(paths, cli, verbose=True):
     ok = True
 
@@ -925,8 +988,12 @@ def self_check(paths, cli, verbose=True):
     server = read_server(paths)
     if server:
         good, detail = probe_server(server)
-        say(good, "能连到 server %s" % server_host(server), detail)
+        say(good, "能连到 server %s" % server_host(server), detail + "，本机代理: " + proxy_for(server))
         ok &= good
+        if good:
+            good, detail = probe_bridge_api(server)
+            say(good, "bridge 接口可用", detail)
+            ok &= good
     else:
         say(False, "server 地址", "未设置（用 --server 指定）")
         ok = False

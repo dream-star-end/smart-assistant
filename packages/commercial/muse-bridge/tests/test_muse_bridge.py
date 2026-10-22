@@ -4,6 +4,7 @@ BRIDGE = os.environ.get("MUSE_BRIDGE_PATH") or os.path.join(HERE, "..", "muse_br
 FAKE = os.path.join(HERE, "fake-media-generation")
 spec = importlib.util.spec_from_file_location("mb", BRIDGE); mb = importlib.util.module_from_spec(spec); spec.loader.exec_module(mb)
 sys.path.insert(0, HERE); import mock_master as mm
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 LEGACY = ("--image-file", "--image-id", "--reference-image-file", "--reference-image-id")
 SUBAGENT = ("--media-subagent-output-type", "--conversation-json", "--resume-from-snapshot-id")
 PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 100
@@ -278,6 +279,71 @@ class Auth(unittest.TestCase):
         time.sleep(1); mm.S.session = "someone-else"; time.sleep(5)
         s = subprocess.run([sys.executable, "-I", BRIDGE, "--state-dir", home, "status"], stdout=subprocess.PIPE, timeout=10)
         self.assertIn("未运行".encode(), s.stdout); self.assertIn("接管".encode(), s.stdout)
+
+class Foreign403(BaseHTTPRequestHandler):
+    """Stands in for a VM egress proxy / CDN: 403 with an HTML page, never the master's JSON."""
+    def log_message(self, *a): pass
+    def version_string(self): return "egress-proxy"
+    def _deny(self):
+        n = int(self.headers.get("Content-Length") or 0); self.rfile.read(n)
+        body = b"<html><head><style>p{}</style></head><body><h1>403 Forbidden</h1><p>Request denied by egress policy mbr_leak</p></body></html>"
+        self.send_response(403); self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+    def do_GET(self):
+        if self.path == "/healthz":
+            self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"ok")
+        else: self._deny()
+    do_POST = do_PUT = _deny
+
+class Blocking(unittest.TestCase):
+    """A 403 written by something in front of the master must not be reported as a bad token."""
+    def setUp(self):
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), Foreign403)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = "http://127.0.0.1:%d" % self.srv.server_port
+    def tearDown(self): self.srv.shutdown()
+    def run_bridge(self, *cmd):
+        home = tempfile.mkdtemp()
+        with open(os.path.join(home, "token"), "w") as f: f.write(mm.TOKEN)
+        return subprocess.run([sys.executable, "-I", BRIDGE, "--state-dir", home, "--cli", FAKE] + list(cmd),
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+    def test_foreign_403_is_not_a_token_error(self):
+        r = self.run_bridge("run", "--force", "--server", self.url)
+        self.assertEqual(r.returncode, 3, r.stdout)
+        out = r.stdout.decode()
+        self.assertIn("不是个人版服务端返回的", out); self.assertIn("egress-proxy", out); self.assertIn("Request denied", out)
+        self.assertNotIn("重新签发", out); self.assertNotIn(mm.TOKEN, out); self.assertNotIn("mbr_leak", out)
+        self.assertNotIn("<h1>", out)
+    def test_start_refuses_when_post_is_blocked(self):
+        r = self.run_bridge("start", "--server", self.url)
+        self.assertEqual(r.returncode, 1, r.stdout); self.assertIn("自检未通过".encode(), r.stdout)
+    def test_check_flags_blocked_post(self):
+        r = self.run_bridge("check", "--server", self.url)
+        out = r.stdout.decode()
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("✓ 能连到 server", out); self.assertIn("✗ bridge 接口可用", out); self.assertIn("HTTP 403 不是个人版服务端", out)
+    def test_check_passes_against_master_without_real_token(self):
+        srv = mm.start(); hellos = mm.S.hellos; session = mm.S.session
+        r = self.run_bridge("check", "--server", "http://127.0.0.1:%d" % srv.server_port)
+        out = r.stdout.decode()
+        self.assertIn("✓ bridge 接口可用", out, out)
+        self.assertEqual((mm.S.hellos, mm.S.session), (hellos, session))  # probe never logged in
+
+class MasterErrors(unittest.TestCase):
+    def test_master_401_vs_others(self):
+        self.assertEqual(mb.master_error_code(b'{"error":{"code":"UNAUTHORIZED"}}'), "UNAUTHORIZED")
+        for body in (b"", b"<html>403</html>", b'{"error":"bad"}', b"[1]", b"\xff"):
+            self.assertIsNone(mb.master_error_code(body))
+    def test_proxy_for_drops_credentials(self):
+        old = dict(os.environ)
+        try:
+            for k in list(os.environ):
+                if k.lower().endswith("_proxy"): del os.environ[k]
+            self.assertEqual(mb.proxy_for("https://x.example"), "无")
+            os.environ["https_proxy"] = "http://user:secret@proxy.internal:3128"
+            self.assertEqual(mb.proxy_for("https://x.example"), "proxy.internal:3128")
+        finally:
+            os.environ.clear(); os.environ.update(old)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -7,10 +7,12 @@
 //   POST /api/muse-bridge/v1/jobs/:id/result
 //
 // Auth: `Authorization: Bearer mbr_…`; only sha256(token) is stored (muse_bridge_credentials).
-// Status codes the bridge relies on: 401/403 = stop (token rejected), 409 = superseded by a
-// newer bridge (stop), 410 = job gone (drop it), 204 = no job. Everything else (400 for an
-// unknown session after a master restart, 429, 5xx) makes the bridge back off and say hello
-// again, so never answer 401/403/409 for anything but those meanings.
+// Status codes the bridge relies on: 401 UNAUTHORIZED = stop (token rejected), 409 SUPERSEDED =
+// superseded by a newer bridge (stop), 410 = job gone (drop it), 204 = no job. Everything else
+// (400 for an unknown session after a master restart, 429, 5xx) makes the bridge back off and say
+// hello again, so never answer 401/409 for anything but those meanings. The bridge only trusts
+// these as JSON `{error:{code}}` bodies: a 401/403 without them came from a proxy or the CDN in
+// front of the master and is reported as such (bridge >= 0.3.2). This handler never sends 403.
 
 import { createHash } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
