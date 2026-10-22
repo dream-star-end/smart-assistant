@@ -151,12 +151,6 @@ rpf_check_proof_db() { # <repo> <gate-db|shared-db> <dsn>
   if [[ -z "$dsn" ]]; then
     rpf_add fail proof-db "no proof database DSN configured"; return 0
   fi
-  # A tree without node_modules is a supported path (the caller installs dependencies after L0);
-  # the proof server is then probed by the gates themselves, not refused here.
-  if ! (cd "$repo" && node -e 'require.resolve("pg")') >/dev/null 2>&1; then
-    rpf_add warn proof-db "pg not installed in $repo yet (dependencies are installed after L0); proof server not probed"
-    return 0
-  fi
   # cwd = the repo so `pg` resolves from its node_modules; the probe itself ships with this lib
   out="$(cd "$repo" && OC_V5_PREFLIGHT_PROOF_DSN="$dsn" timeout 30 node "$RPF_LIB_DIR/proofDbPreflight.mjs" "$mode" 2>&1)" || rc=$?
   while IFS=$'\t' read -r s detail; do

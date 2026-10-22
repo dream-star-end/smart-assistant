@@ -103,8 +103,18 @@ async function main() {
     process.stdout.write(`fail\t${conn.error}\n`);
     process.exit(1);
   }
+  // The DSN is vetted first (a non-loopback or non-_test DSN is wrong whatever is installed).
+  // A tree without node_modules is a supported path: the caller installs dependencies after L0 and
+  // the gates probe the server themselves, so a missing pg is a warning, not a refusal.
   const require = createRequire(`${process.cwd()}/package.json`);
-  const pg = require("pg");
+  let pg;
+  try {
+    pg = require("pg");
+  } catch (error) {
+    if (error?.code !== "MODULE_NOT_FOUND") throw error;
+    process.stdout.write("warn\tpg not installed in this tree yet (dependencies are installed after L0); proof server not probed\n");
+    process.exit(0);
+  }
   const client = new (pg.default ?? pg).Client({
     ...conn, ssl: false, connectionTimeoutMillis: 10_000, statement_timeout: 10_000,
     application_name: "ocv5-581-preflight",
