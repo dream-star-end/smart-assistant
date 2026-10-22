@@ -12,6 +12,7 @@ import {
   ComposeRunner,
   ComposeRunnerError,
   type DockerLike,
+  inProcessHostLock,
   isOwnerDead,
   processOwnerToken,
 } from '../media-studio/compose/runner.js'
@@ -21,6 +22,8 @@ import {
   buildCommand,
   peaksFromPcm,
 } from '../media-studio/compose/spec.js'
+
+const TEST_LOCK = inProcessHostLock()
 
 const base = (over: Partial<ComposeSpec> = {}): ComposeSpec => ({
   width: 1280,
@@ -162,6 +165,10 @@ function fakeDocker(behaviour: {
   hang?: boolean
   write?: (outDir: string) => Promise<void>
   outDir?: string
+  killRejects?: boolean
+  waitNever?: boolean
+  removeRejects?: boolean
+  stdoutDelayMs?: number
 }) {
   const created: Created[] = []
   const docker = {
@@ -185,18 +192,26 @@ function fakeDocker(behaviour: {
         },
         async start() {
           if (behaviour.write && behaviour.outDir) await behaviour.write(behaviour.outDir)
-          if (behaviour.stdout) stream.write(behaviour.stdout)
-          stream.end()
-          if (!behaviour.hang) release({ StatusCode: behaviour.status ?? 0 })
+          if (!behaviour.hang && !behaviour.waitNever)
+            release({ StatusCode: behaviour.status ?? 0 })
+          const emit = () => {
+            if (behaviour.stdout) stream.write(behaviour.stdout)
+            stream.end()
+          }
+          if (behaviour.stdoutDelayMs) setTimeout(emit, behaviour.stdoutDelayMs)
+          else emit()
         },
         async wait() {
           return waited
         },
         async kill() {
           rec.killed = true
-          release({ StatusCode: 137 })
+          if (behaviour.killRejects) throw new Error('docker kill failed')
+          if (!behaviour.waitNever) release({ StatusCode: 137 })
         },
         async remove() {
+          if (behaviour.removeRejects)
+            throw Object.assign(new Error('docker unavailable'), { statusCode: 500 })
           rec.removed = true
         },
       }
@@ -262,6 +277,7 @@ describe('ComposeRunner (OCV5-588)', () => {
   test('unconfigured image refuses to run', async () => {
     const root = await setup()
     const r = new ComposeRunner({
+      hostLock: TEST_LOCK,
       docker: fakeDocker({}),
       imageId: undefined,
       root,
@@ -276,6 +292,7 @@ describe('ComposeRunner (OCV5-588)', () => {
   test('container is isolated (no network, ro rootfs, caps dropped, limits, ro input) and always removed', async () => {
     const root = await setup()
     const r = new ComposeRunner({
+      hostLock: TEST_LOCK,
       docker: fakeDocker({}),
       imageId: IMAGE,
       root,
@@ -288,7 +305,13 @@ describe('ComposeRunner (OCV5-588)', () => {
       outDir,
       write: async (o) => writeFile(join(o, 'frame-0.png'), PNG),
     })
-    const r2 = new ComposeRunner({ docker: d2, imageId: IMAGE, root, chownOutput: false })
+    const r2 = new ComposeRunner({
+      hostLock: TEST_LOCK,
+      docker: d2,
+      imageId: IMAGE,
+      root,
+      chownOutput: false,
+    })
     const res = await r2.run('job-00000002', { op: 'frames', file: 'a.mp4', times: [1] })
     assert.equal(res.outputs[0]!.name, 'frame-0.png')
     const c = d2.created[0]!
@@ -318,6 +341,7 @@ describe('ComposeRunner (OCV5-588)', () => {
   test('non-zero exit and missing outputs fail; the container is still removed', async () => {
     const root = await setup()
     const r0 = new ComposeRunner({
+      hostLock: TEST_LOCK,
       docker: fakeDocker({}),
       imageId: IMAGE,
       root,
@@ -327,19 +351,25 @@ describe('ComposeRunner (OCV5-588)', () => {
     await writeFile(join(inDir, 'a.mp4'), 'x')
     const failing = fakeDocker({ status: 1 })
     await assert.rejects(
-      new ComposeRunner({ docker: failing, imageId: IMAGE, root, chownOutput: false }).run(
-        'job-00000003',
-        { op: 'frames', file: 'a.mp4', times: [1] },
-      ),
+      new ComposeRunner({
+        hostLock: TEST_LOCK,
+        docker: failing,
+        imageId: IMAGE,
+        root,
+        chownOutput: false,
+      }).run('job-00000003', { op: 'frames', file: 'a.mp4', times: [1] }),
       (e: unknown) => e instanceof ComposeRunnerError && e.code === 'COMPOSE_FAILED',
     )
     assert.equal(failing.created[0]!.removed, true)
     const silent = fakeDocker({ status: 0 })
     await assert.rejects(
-      new ComposeRunner({ docker: silent, imageId: IMAGE, root, chownOutput: false }).run(
-        'job-00000003',
-        { op: 'frames', file: 'a.mp4', times: [1] },
-      ),
+      new ComposeRunner({
+        hostLock: TEST_LOCK,
+        docker: silent,
+        imageId: IMAGE,
+        root,
+        chownOutput: false,
+      }).run('job-00000003', { op: 'frames', file: 'a.mp4', times: [1] }),
       (e: unknown) => e instanceof ComposeRunnerError && e.code === 'COMPOSE_OUTPUT',
     )
   })
@@ -347,6 +377,7 @@ describe('ComposeRunner (OCV5-588)', () => {
   test('an output that fails the magic check is rejected', async () => {
     const root = await setup()
     const r0 = new ComposeRunner({
+      hostLock: TEST_LOCK,
       docker: fakeDocker({}),
       imageId: IMAGE,
       root,
@@ -360,10 +391,13 @@ describe('ComposeRunner (OCV5-588)', () => {
       write: async (o) => writeFile(join(o, 'frame-0.png'), 'not a png at all'),
     })
     await assert.rejects(
-      new ComposeRunner({ docker: d, imageId: IMAGE, root, chownOutput: false }).run(
-        'job-00000004',
-        { op: 'frames', file: 'a.mp4', times: [1] },
-      ),
+      new ComposeRunner({
+        hostLock: TEST_LOCK,
+        docker: d,
+        imageId: IMAGE,
+        root,
+        chownOutput: false,
+      }).run('job-00000004', { op: 'frames', file: 'a.mp4', times: [1] }),
       (e: unknown) => e instanceof ComposeRunnerError && e.code === 'COMPOSE_OUTPUT',
     )
   })
@@ -371,6 +405,7 @@ describe('ComposeRunner (OCV5-588)', () => {
   test('symlinked or oddly named inputs are refused before any container starts', async () => {
     const root = await setup()
     const r0 = new ComposeRunner({
+      hostLock: TEST_LOCK,
       docker: fakeDocker({}),
       imageId: IMAGE,
       root,
@@ -380,10 +415,13 @@ describe('ComposeRunner (OCV5-588)', () => {
     await symlink('/etc/passwd', join(inDir, 'a.mp4'))
     const d = fakeDocker({ status: 0 })
     await assert.rejects(
-      new ComposeRunner({ docker: d, imageId: IMAGE, root, chownOutput: false }).run(
-        'job-00000005',
-        { op: 'probe', file: 'a.mp4' },
-      ),
+      new ComposeRunner({
+        hostLock: TEST_LOCK,
+        docker: d,
+        imageId: IMAGE,
+        root,
+        chownOutput: false,
+      }).run('job-00000005', { op: 'probe', file: 'a.mp4' }),
       (e: unknown) => e instanceof ComposeRunnerError && e.code === 'COMPOSE_INVALID',
     )
     assert.equal(d.created.length, 0)
@@ -395,6 +433,7 @@ describe('ComposeRunner (OCV5-588)', () => {
   test('probe returns parsed JSON; a hung step times out, is killed and removed; stale containers are swept', async () => {
     const root = await setup()
     const r0 = new ComposeRunner({
+      hostLock: TEST_LOCK,
       docker: fakeDocker({}),
       imageId: IMAGE,
       root,
@@ -404,6 +443,7 @@ describe('ComposeRunner (OCV5-588)', () => {
     await writeFile(join(inDir, 'a.mp4'), 'x')
     const probe = fakeDocker({ status: 0, stdout: '{"format":{"duration":"10.0"}}' })
     const res = await new ComposeRunner({
+      hostLock: TEST_LOCK,
       docker: probe,
       imageId: IMAGE,
       root,
@@ -413,6 +453,7 @@ describe('ComposeRunner (OCV5-588)', () => {
     const hung = fakeDocker({ hang: true })
     await assert.rejects(
       new ComposeRunner({
+        hostLock: TEST_LOCK,
         docker: hung,
         imageId: IMAGE,
         root,
@@ -425,6 +466,7 @@ describe('ComposeRunner (OCV5-588)', () => {
     assert.equal(hung.created[0]!.removed, true)
     const sweeper = fakeDocker({})
     const swept = await new ComposeRunner({
+      hostLock: TEST_LOCK,
       docker: sweeper,
       imageId: IMAGE,
       root,
@@ -443,6 +485,7 @@ describe('ComposeRunner (OCV5-588)', () => {
   test('not enough free disk refuses before any container starts; frames carry a runtime -fs cap', async () => {
     const root = await setup()
     const r0 = new ComposeRunner({
+      hostLock: TEST_LOCK,
       docker: fakeDocker({}),
       imageId: IMAGE,
       root,
@@ -453,6 +496,7 @@ describe('ComposeRunner (OCV5-588)', () => {
     const d = fakeDocker({ status: 0 })
     await assert.rejects(
       new ComposeRunner({
+        hostLock: TEST_LOCK,
         docker: d,
         imageId: IMAGE,
         root,
@@ -473,6 +517,7 @@ describe('ComposeRunner (OCV5-588)', () => {
   test("disk reservations of live in-flight jobs count against free space; dead owners' reservations do not", async () => {
     const root = await setup()
     const r0 = new ComposeRunner({
+      hostLock: TEST_LOCK,
       docker: fakeDocker({}),
       imageId: IMAGE,
       root,
@@ -492,6 +537,7 @@ describe('ComposeRunner (OCV5-588)', () => {
     )
     const mk = (free: number, docker = fakeDocker({ status: 0 })) =>
       new ComposeRunner({
+        hostLock: TEST_LOCK,
         docker,
         imageId: IMAGE,
         root,
@@ -516,6 +562,7 @@ describe('ComposeRunner (OCV5-588)', () => {
       1,
       'admitted (fails later only because the fake writes no output)',
     )
+    await new Promise((r) => setTimeout(r, 50))
     const left = (await readdir(join(root, 'reservations'))).sort()
     assert.deepEqual(
       left,
@@ -550,9 +597,133 @@ describe('ComposeRunner (OCV5-588)', () => {
     assert.equal(isOwnerDead(processOwnerToken()), false, 'this process is alive')
   })
 
+  test('code r1 fixes: input perms, timeout ends a stuck wait, late stdout, reservation kept when removal fails', async () => {
+    const root = await setup()
+    const r0 = new ComposeRunner({
+      hostLock: TEST_LOCK,
+      docker: fakeDocker({}),
+      imageId: IMAGE,
+      root,
+      chownOutput: false,
+    })
+    const { inDir } = await r0.prepare('job-00000011')
+    const { stat, chmod: chmodP } = await import('node:fs/promises')
+    assert.equal((await stat(inDir)).mode & 0o777, 0o755, 'in/ is traversable by the sandbox user')
+    await writeFile(join(inDir, 'a.mp4'), 'x')
+    await chmodP(join(inDir, 'a.mp4'), 0o600)
+    // late stdout after wait() resolved is still parsed (P1-8)
+    const late = fakeDocker({ status: 0, stdout: '{"format":{}}', stdoutDelayMs: 30 })
+    const res = await new ComposeRunner({
+      hostLock: TEST_LOCK,
+      docker: late,
+      imageId: IMAGE,
+      root,
+      chownOutput: false,
+    }).run('job-00000011', { op: 'probe', file: 'a.mp4' })
+    assert.deepEqual(res.stdoutJson, { format: {} })
+    assert.equal(
+      (await stat(join(inDir, 'a.mp4'))).mode & 0o044,
+      0o044,
+      'inputs are made readable for uid 1000 (P1-1)',
+    )
+    // wait() never settles and kill() rejects: the timeout still ends run() (P1-6)
+    const stuck = fakeDocker({ waitNever: true, killRejects: true })
+    await assert.rejects(
+      new ComposeRunner({
+        hostLock: TEST_LOCK,
+        docker: stuck,
+        imageId: IMAGE,
+        root,
+        chownOutput: false,
+        timeoutMsOverride: 20,
+        killGraceMs: 20,
+      }).run('job-00000011', { op: 'probe', file: 'a.mp4' }),
+      (e: unknown) => e instanceof ComposeRunnerError && e.code === 'COMPOSE_TIMEOUT',
+    )
+    // removal keeps failing: the disk reservation stays counted (P1-7)
+    const sticky = fakeDocker({ status: 0, removeRejects: true })
+    await assert.rejects(
+      new ComposeRunner({
+        hostLock: TEST_LOCK,
+        docker: sticky,
+        imageId: IMAGE,
+        root,
+        chownOutput: false,
+        owner: 'me',
+        removeRetryMs: 1,
+      }).run('job-00000011', { op: 'frames', file: 'a.mp4', times: [1] }),
+      ComposeRunnerError,
+    )
+    await new Promise((r) => setTimeout(r, 100))
+    const left = await readdir(join(root, 'reservations'))
+    assert.equal(
+      left.filter((n) => n.startsWith('job-00000011')).length,
+      1,
+      'reservation kept while the container may still exist',
+    )
+  })
+
+  test('a dead owner whose containers cannot be listed keeps its reservation counted (P1-4)', async () => {
+    const root = await setup()
+    const r0 = new ComposeRunner({
+      hostLock: TEST_LOCK,
+      docker: fakeDocker({}),
+      imageId: IMAGE,
+      root,
+      chownOutput: false,
+    })
+    const { inDir } = await r0.prepare('job-00000012')
+    await writeFile(join(inDir, 'a.mp4'), 'x')
+    await mkdir(join(root, 'reservations'), { recursive: true })
+    const GiB = 1024 * 1024 * 1024
+    await writeFile(
+      join(root, 'reservations', 'dead.json'),
+      JSON.stringify({ bytes: 0.5 * GiB, owner: 'dead' }),
+    )
+    const broken = fakeDocker({ status: 0 })
+    ;(broken as unknown as { listContainers: () => Promise<never> }).listContainers = async () => {
+      throw new Error('docker down')
+    }
+    await assert.rejects(
+      new ComposeRunner({
+        hostLock: TEST_LOCK,
+        docker: broken,
+        imageId: IMAGE,
+        root,
+        chownOutput: false,
+        owner: 'me',
+        ownerDead: (o) => o === 'dead',
+        freeBytes: async () => 1.5 * GiB,
+      }).run('job-00000012', { op: 'frames', file: 'a.mp4', times: [1] }),
+      (e: unknown) => e instanceof ComposeRunnerError && e.code === 'COMPOSE_DISK',
+    )
+    assert.ok((await readdir(join(root, 'reservations'))).includes('dead.json'))
+  })
+
+  test('frames and filmstrip bound pixels so PNG outputs stay under the per-file cap (P1-5)', () => {
+    const f = buildCommand({ op: 'frames', file: 'a.mp4', times: [0, 1] })
+    assert.equal(
+      f.argv.filter((a) => a === 'scale=w=1920:h=1920:force_original_aspect_ratio=decrease').length,
+      2,
+    )
+    assert.equal(f.perFileCapBytes, 20 * 1024 * 1024)
+    const strip = buildCommand({
+      op: 'filmstrip',
+      file: 'a.mp4',
+      durationSec: 10,
+      count: 24,
+      height: 360,
+    })
+    assert.match(
+      strip.argv[strip.argv.indexOf('-vf') + 1]!,
+      /scale=w=640:h=360:force_original_aspect_ratio=decrease,tile=24x1/,
+    )
+  })
+
   test('concurrency is capped and excess jobs fail with COMPOSE_BUSY after the queue wait', async () => {
     const root = await setup()
     const r0 = new ComposeRunner({
+      hostLock: TEST_LOCK,
       docker: fakeDocker({}),
       imageId: IMAGE,
       root,
@@ -564,6 +735,7 @@ describe('ComposeRunner (OCV5-588)', () => {
     }
     const hang = fakeDocker({ hang: true })
     const r = new ComposeRunner({
+      hostLock: TEST_LOCK,
       docker: hang,
       imageId: IMAGE,
       root,

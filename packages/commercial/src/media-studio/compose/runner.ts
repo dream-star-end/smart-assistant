@@ -28,6 +28,7 @@ import { join } from 'node:path'
 import { type Duplex, Writable } from 'node:stream'
 
 import type Docker from 'dockerode'
+import type { Pool } from 'pg'
 
 import { BASENAME_RE, type ComposeOp, SANDBOX_IN, SANDBOX_OUT, buildCommand } from './spec.js'
 
@@ -36,6 +37,53 @@ export const OWNER_LABEL = 'com.openclaude.studio.owner'
 export const STARTED_LABEL = 'com.openclaude.studio.started'
 const DISK_HEADROOM_BYTES = 1024 * 1024 * 1024
 const LOCK_WAIT_MS = 5_000
+const KILL_GRACE_MS = 10_000
+const STREAM_DRAIN_MS = 5_000
+const REMOVE_RETRY_MS = 30_000
+const REMOVE_RETRIES = 10
+
+/**
+ * Host-wide mutual exclusion for disk reservations across both A/B masters. Production uses a
+ * Postgres advisory lock (released by the server if the holding process dies), which replaces a
+ * lock file whose takeover and crash windows could not be made safe (Codex code r1 P1-2/3).
+ */
+export type HostLock = <T>(fn: () => Promise<T>) => Promise<T>
+
+export function pgHostLock(pool: Pool, key = 'oc-studio-compose-disk'): HostLock {
+  return async <T>(fn: () => Promise<T>): Promise<T> => {
+    const client = await pool.connect()
+    try {
+      const deadline = Date.now() + LOCK_WAIT_MS
+      for (;;) {
+        const r = await client.query<{ ok: boolean }>(
+          'SELECT pg_try_advisory_lock(hashtext($1)) AS ok',
+          [key],
+        )
+        if (r.rows[0]?.ok) break
+        if (Date.now() > deadline)
+          throw new ComposeRunnerError('COMPOSE_BUSY', 'compose disk reservation lock is busy')
+        await new Promise((res) => setTimeout(res, 50))
+      }
+      try {
+        return await fn()
+      } finally {
+        await client.query('SELECT pg_advisory_unlock(hashtext($1))', [key]).catch(() => {})
+      }
+    } finally {
+      client.release()
+    }
+  }
+}
+
+/** Single-process lock for tests and tooling (not cross-process). */
+export function inProcessHostLock(): HostLock {
+  let chain: Promise<unknown> = Promise.resolve()
+  return <T>(fn: () => Promise<T>): Promise<T> => {
+    const next = chain.then(fn, fn)
+    chain = next.catch(() => {})
+    return next
+  }
+}
 
 /** `<hostname>:<pid>:<starttime>` — starttime (field 22 of /proc/<pid>/stat) guards against pid reuse. */
 export function processOwnerToken(pid = process.pid): string {
@@ -107,12 +155,16 @@ export interface ComposeRunnerOptions {
   chownOutput?: boolean
   /** Test seam: overrides every step timeout. */
   timeoutMsOverride?: number
+  /** Host-wide lock for disk reservations (production: pgHostLock). */
+  hostLock: HostLock
   /** Owner token stamped on containers and reservations (default: this process). */
   owner?: string
   /** Test seams. */
   now?: () => number
   freeBytes?: (path: string) => Promise<number>
   ownerDead?: (owner: string | undefined) => boolean
+  removeRetryMs?: number
+  killGraceMs?: number
 }
 
 export interface ComposeResult {
@@ -183,7 +235,9 @@ export class ComposeRunner {
   /** Create the job's in/ and out/ directories. Callers then place inputs into in/. */
   async prepare(jobId: string): Promise<{ inDir: string; outDir: string }> {
     const { inDir, outDir } = this.jobDir(jobId)
-    await mkdir(inDir, { recursive: true, mode: 0o750 })
+    // The container runs as uid 1000: in/ must be traversable and its files readable (code r1 P1-1).
+    await mkdir(inDir, { recursive: true, mode: 0o755 })
+    await chmod(inDir, 0o755)
     await rm(outDir, { recursive: true, force: true })
     await mkdir(outDir, { recursive: false, mode: 0o700 })
     if (this.opts.chownOutput ?? process.getuid?.() === 0)
@@ -238,39 +292,6 @@ export class ComposeRunner {
     return join(this.opts.root, 'reservations')
   }
 
-  private async withReservationLock<T>(fn: () => Promise<T>): Promise<T> {
-    const dir = this.reservationsDir()
-    await mkdir(dir, { recursive: true, mode: 0o700 })
-    const lock = join(dir, '.lock')
-    const deadline = Date.now() + LOCK_WAIT_MS
-    for (;;) {
-      try {
-        const fh = await open(lock, 'wx', 0o600)
-        try {
-          await fh.writeFile(this.owner)
-        } finally {
-          await fh.close()
-        }
-        break
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err
-        const holder = await readFile(lock, 'utf8').catch(() => '')
-        if (holder && this.ownerDead(holder)) {
-          await unlink(lock).catch(() => {})
-          continue
-        }
-        if (Date.now() > deadline)
-          throw new ComposeRunnerError('COMPOSE_BUSY', 'compose disk reservation lock is busy')
-        await new Promise((r) => setTimeout(r, 50))
-      }
-    }
-    try {
-      return await fn()
-    } finally {
-      await unlink(lock).catch(() => {})
-    }
-  }
-
   /**
    * Cross-process disk reservation (Codex plan r2 P1-2): under one host-wide lock, free space minus
    * the bytes reserved by every live in-flight job must cover this step's -fs cap plus headroom.
@@ -279,23 +300,35 @@ export class ComposeRunner {
   private async reserveDisk(jobId: string, bytes: number): Promise<() => Promise<void>> {
     if (bytes <= 0) return async () => {}
     const file = join(this.reservationsDir(), `${jobId}-${randomUUID().slice(0, 8)}.json`)
-    await this.withReservationLock(async () => {
+    await mkdir(this.reservationsDir(), { recursive: true, mode: 0o700 })
+    await this.opts.hostLock(async () => {
       let reserved = 0
       for (const name of await readdir(this.reservationsDir())) {
         if (!name.endsWith('.json')) continue
         const path = join(this.reservationsDir(), name)
+        let r: { bytes?: number; owner?: string }
         try {
-          const r = JSON.parse(await readFile(path, 'utf8')) as { bytes?: number; owner?: string }
-          // A dead owner's containers may still be writing: remove them first, and only drop the
-          // reservation once none of its containers remain (plan r3 P1-2).
-          if (this.ownerDead(r.owner) && (await this.removeOwnerContainers(r.owner!))) {
+          r = JSON.parse(await readFile(path, 'utf8')) as { bytes?: number; owner?: string }
+        } catch {
+          // Unreadable: count it conservatively as the largest possible step.
+          reserved += MAX_OUTPUT_BYTES
+          continue
+        }
+        // A dead owner's containers may still be writing: remove them first, and drop the
+        // reservation only once none remain. Any Docker error keeps it counted (code r1 P1-4).
+        if (this.ownerDead(r.owner)) {
+          let gone = false
+          try {
+            gone = await this.removeOwnerContainers(r.owner!)
+          } catch {
+            gone = false
+          }
+          if (gone) {
             await unlink(path).catch(() => {})
             continue
           }
-          reserved += Number(r.bytes) || 0
-        } catch {
-          /* unreadable reservation: ignore */
         }
+        reserved += Number(r.bytes) || MAX_OUTPUT_BYTES
       }
       const free = this.opts.freeBytes
         ? await this.opts.freeBytes(this.opts.root)
@@ -416,21 +449,37 @@ export class ComposeRunner {
       const stdout = new Bounded(MAX_STDOUT_BYTES)
       const stderr = new Bounded(MAX_STDERR_BYTES)
       this.opts.docker.modem.demuxStream(stream, sink(stdout), sink(stderr))
+      const streamEnded = new Promise<void>((resolveEnd) => {
+        stream?.once('end', () => resolveEnd())
+        stream?.once('close', () => resolveEnd())
+        stream?.once('error', () => resolveEnd())
+      })
       await container.start()
-      let timedOut = false
       const timeoutMs = this.opts.timeoutMsOverride ?? cmd.timeoutMs
-      const timer = setTimeout(() => {
-        timedOut = true
-        void container?.kill().catch(() => {})
-      }, timeoutMs)
-      let status: number
-      try {
-        status = ((await container.wait()) as { StatusCode?: number }).StatusCode ?? -1
-      } finally {
-        clearTimeout(timer)
-      }
-      if (timedOut)
+      const waited = container.wait().then(
+        (r) => ({ status: (r as { StatusCode?: number }).StatusCode ?? -1 }),
+        () => ({ status: -1 }),
+      )
+      // The timeout must end the wait even if kill() fails or wait() never settles (code r1 P1-6).
+      let timer: NodeJS.Timeout | undefined
+      const outcome = await Promise.race([
+        waited,
+        new Promise<'timeout'>((res) => {
+          timer = setTimeout(() => res('timeout'), timeoutMs)
+        }),
+      ])
+      clearTimeout(timer)
+      if (outcome === 'timeout') {
+        await container.kill().catch(() => {})
+        await Promise.race([
+          waited,
+          new Promise((res) => setTimeout(res, this.opts.killGraceMs ?? KILL_GRACE_MS)),
+        ])
         throw new ComposeRunnerError('COMPOSE_TIMEOUT', `compose step exceeded ${timeoutMs} ms`)
+      }
+      const status = outcome.status
+      // stdout may arrive after wait() resolves on its own connection (code r1 P1-8).
+      await Promise.race([streamEnded, new Promise((res) => setTimeout(res, STREAM_DRAIN_MS))])
       if (status !== 0) {
         throw new ComposeRunnerError(
           'COMPOSE_FAILED',
@@ -439,7 +488,7 @@ export class ComposeRunner {
       }
       if (stdout.overflow)
         throw new ComposeRunnerError('COMPOSE_OUTPUT', 'compose stdout exceeded limit')
-      const outputs = await this.collectOutputs(outDir, cmd.outputs, cmd.maxOutputBytes)
+      const outputs = await this.collectOutputs(outDir, cmd.outputs, cmd.perFileCapBytes)
       if (cmd.stdoutJson) {
         try {
           return { outputs, stdoutJson: JSON.parse(stdout.text()) }
@@ -450,10 +499,34 @@ export class ComposeRunner {
       return { outputs }
     } finally {
       stream?.destroy()
-      if (container) await container.remove({ force: true }).catch(() => {})
       this.release()
-      await releaseDisk()
+      // Release the disk reservation only once the container is confirmed gone (code r1 P1-7).
+      if (container) void this.retireContainer(container, releaseDisk)
+      else await releaseDisk()
     }
+  }
+
+  /** Remove the container (retrying) and only then release its disk reservation. */
+  private async retireContainer(
+    container: Docker.Container,
+    releaseDisk: () => Promise<void>,
+  ): Promise<void> {
+    for (let attempt = 0; attempt <= REMOVE_RETRIES; attempt++) {
+      try {
+        await container.remove({ force: true })
+        await releaseDisk()
+        return
+      } catch (err) {
+        const status = (err as { statusCode?: number }).statusCode
+        if (status === 404) {
+          await releaseDisk()
+          return
+        }
+      }
+      if (attempt < REMOVE_RETRIES)
+        await new Promise((res) => setTimeout(res, this.opts.removeRetryMs ?? REMOVE_RETRY_MS))
+    }
+    // Still not removable: keep the reservation counted; sweep or a later restart will retire it.
   }
 
   private async assertInputs(inDir: string): Promise<void> {
@@ -475,6 +548,7 @@ export class ComposeRunner {
           'COMPOSE_INVALID',
           'compose inputs must be regular files (no links or directories)',
         )
+      if ((st.mode & 0o044) !== 0o044) await chmod(join(inDir, name), 0o644)
     }
   }
 
@@ -496,7 +570,7 @@ export class ComposeRunner {
         throw new ComposeRunnerError('COMPOSE_OUTPUT', `output ${name} has invalid size`)
       // ffmpeg -fs stops at the cap; an output that reached it was truncated.
       const cap = perFileCap > 0 ? Math.min(perFileCap, MAX_OUTPUT_BYTES) : MAX_OUTPUT_BYTES
-      if (expected.length === 1 && st.size >= cap * 0.99) {
+      if (perFileCap > 0 && st.size >= cap * 0.99) {
         throw new ComposeRunnerError(
           'COMPOSE_OUTPUT',
           `output ${name} hit the size cap and was truncated`,
