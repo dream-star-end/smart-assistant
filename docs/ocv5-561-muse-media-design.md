@@ -339,3 +339,24 @@ CREATE INDEX ON muse_media_jobs (user_id, queued_at DESC);
 - 新增测试：`FreshStateDir`（目录不存在时运行 status/stop，不报错、目录权限 0700）、E2E `test_07c2`（续接加新源图：先上传，生成时同时带 image 项和 `--resume-from-snapshot-id`）。共 33 项全部通过，连续 3 次。
 - 行为说明写进 README 和本文 §3：image ID 不缓存；续接加新源图时输出分辨率跟随新源图。
 - 范围：只改中转程序，个人版 PR1 没有开始。
+
+## 直连入口（2026-10-22 补充）
+
+**为什么需要：** 第一次真机启动时，Muse VM 出口 IP 发出的请求被 Cloudflare 边缘拦截，返回 HTTP 403 `Your request was blocked.`，`Server: cloudflare`。请求根本没有到达 master。trycloudflare 快速隧道不能配置 WAF 放行，所以 bridge 需要一个不经过 Cloudflare 的入口。
+
+**做法：** 由 `muse/publicListener.ts` 实现。
+
+- master 另开一个 HTTPS 端口，用 `OC_MUSE_PUBLIC_PORT` 指定，监听 `0.0.0.0`。证书和私钥由 `OC_MUSE_PUBLIC_TLS_CERT` / `OC_MUSE_PUBLIC_TLS_KEY` 指定，个人版只读复用 GPT 订阅代理的 Let's Encrypt 证书文件。
+- 这个端口只把 `/api/muse-bridge/*` 交给同一个 bridge handler，其它路径一律返回 JSON 404。所以 token 鉴权、按 IP 的失败锁定、会话接管规则都和主入口完全一致。
+- 客户端 IP 只取 TCP 对端地址，不信任 `X-Forwarded-For`。
+- 证书每小时按 mtime 检查一次，变了就热加载（certbot 续期后生效）。读取失败时继续用已加载的证书。
+- 端口被上一个 master 占用时，最多重试 10 分钟。
+- 关停时会主动断开挂起的长轮询。
+- 未设置端口时这个入口不开；配置错误或监听失败只记 error，不影响 master 启动。
+- 不改 GPT 订阅代理（8443）的代码和进程，也不动 Cloudflare 隧道。
+
+**个人版取值：**
+
+- `OC_MUSE_PUBLIC_PORT=8444`；
+- 证书和私钥用 `OC_CHATGPT_PROXY_TLS_CERT/KEY` 的同一组文件；
+- bridge 启动参数改为 `--server https://38-55-252-217.sslip.io:8444`。
