@@ -53,11 +53,11 @@ export interface Problem { kind: string; message: string }
 
 /** What may precede a run at command position: sudo, env (-u NAME, NAME=value, emptied quotes) and
  * NAME=value assignments. Text after `echo`, inside quotes or in a comment is never a run. */
-/** A quoted `NAME=…` word (the scanner keeps the NAME= of a quoted string). Any other quoted word at
- * command position IS the command (`"echo" node …` prints; Codex fresh r1), so it never counts as a
- * prefix. */
+/** A quoted `NAME=…` word (the scanner keeps the NAME= of a quoted string): an assignment only as an
+ * `env` argument. At command position any quoted word, `"X=1"` included, IS the command (`"echo"
+ * node …` prints; Codex fresh r1/r2); a bare assignment is an unquoted NAME= (value may be quoted). */
 const QUOTED_ASSIGN = String.raw`(?:'[A-Za-z_][A-Za-z0-9_]*='|"[A-Za-z_][A-Za-z0-9_]*=[^"\n]*")`;
-const PREFIX = String.raw`(?:^|[;&|(])\s*(?:sudo\s+)?(?:(?:env(?:\s+(?:-u\s+\S+|${QUOTED_ASSIGN}|[A-Za-z_][A-Za-z0-9_]*=\S*))*|[A-Za-z_][A-Za-z0-9_]*=\S*|${QUOTED_ASSIGN})\s+)*`;
+const PREFIX = String.raw`(?:^|[;&|(])\s*(?:sudo\s+)?(?:(?:env(?:\s+(?:-u\s+\S+|${QUOTED_ASSIGN}|[A-Za-z_][A-Za-z0-9_]*=\S*))*|[A-Za-z_][A-Za-z0-9_]*=\S*)\s+)*`;
 const SCRIPT_RUN = new RegExp(
   `${PREFIX}(?:npx(?:\\s+--no-install)?\\s+tsx|tsx|node|bash)\\s+((?:packages\\/[\\w.-]+\\/)?scripts\\/[\\w./-]+)`, "g");
 const NPM_RUN = new RegExp(`${PREFIX}npm run (\\S+)((?:\\s+--workspace\\s+\\S+)?)`, "g");

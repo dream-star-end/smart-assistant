@@ -126,6 +126,10 @@ test("the scanner keeps only what bash executes inside quotes", () => {
   assert.deepEqual(runs(`'echo' node scripts/a.mjs`), []);
   assert.deepEqual(runs(`env "echo" node scripts/a.mjs`), []);
   assert.deepEqual(runs(`env 'X=1' "Y=$Z" node scripts/a.mjs`), ["scripts/a.mjs"]);
+  // Codex fresh r2: a standalone quoted assignment is a command name; NAME="v" is an assignment
+  assert.deepEqual(runs(`"X=1" node scripts/a.mjs || true`), []);
+  assert.deepEqual(runs(`'X=1' node scripts/a.mjs`), []);
+  assert.deepEqual(runs(`X="1" Y='2' node scripts/a.mjs`), ["scripts/a.mjs"]);
   // Codex final r3: an escaped backtick does not close the substitution
   assert.deepEqual(runs("out=`printf '%s' '\\` ; node scripts/a.mjs'` # '"), []);
   assert.deepEqual(runs("out=`echo \\` x`; node scripts/b.mjs"), ["scripts/b.mjs"]);
@@ -163,11 +167,18 @@ test("red: the production web build left the train or CI", () => {
   assert.deepEqual(kinds(check(ci)), ["ci-missing"]);
 });
 
+/** Apply a change to cmd_deploy's body only (the call's line layout is not pinned). */
+function inCmdDeploy(deploy: string, change: (body: string) => string): string {
+  const start = deploy.indexOf("\ncmd_deploy() {\n");
+  const end = deploy.indexOf("\n}\n", start);
+  return deploy.slice(0, start) + change(deploy.slice(start, end)) + deploy.slice(end);
+}
+
 test("red: the deploy-stage trailer gate is no longer really called (Codex final r1)", () => {
   const cases: [string, (d: string) => string][] = [
-    ["call removed, mentions kept", (d) => d.replace(/^ {2}assert_fix_trailers "\$sha"\n/m, "")],
-    ["call only in a comment", (d) => d.replace(/^ {2}assert_fix_trailers "\$sha"$/m, '  # assert_fix_trailers "$sha"')],
-    ["call only echoed", (d) => d.replace(/^ {2}assert_fix_trailers "\$sha"$/m, '  echo assert_fix_trailers "$sha"')],
+    ["call removed, mentions kept", (d) => inCmdDeploy(d, (b) => b.replace('assert_fix_trailers "$sha"', "true"))],
+    ["call only in a comment", (d) => inCmdDeploy(d, (b) => b.replace('assert_fix_trailers "$sha"', 'true # assert_fix_trailers "$sha"'))],
+    ["call only echoed", (d) => inCmdDeploy(d, (b) => b.replace('assert_fix_trailers "$sha"', 'echo assert_fix_trailers "$sha"'))],
     ["function no longer runs the gate", (d) => d.replace(/"\$FIX_TRAILER_GATE" --repo/, "true --repo")],
     ["variable points elsewhere", (d) => d.replace(/^FIX_TRAILER_GATE=.*$/m, 'FIX_TRAILER_GATE="$SCRIPT_DIR/other.sh"')],
     // Codex final r2: a single-quoted $( … ) is a literal, not a run
