@@ -272,10 +272,7 @@ export function buildWriteSummary(
       const text = String(params.text ?? '')
       const media = Array.isArray(params.mediaManifest) ? params.mediaManifest : []
       const images = media.length > 0 ? `（${media.length} 张图片）` : ''
-      return ellipsize(
-        `用知乎${hint}发布想法${images}：「${ellipsize(text, 300)}」`,
-        2000,
-      )
+      return ellipsize(`用知乎${hint}发布想法${images}：「${ellipsize(text, 300)}」`, 2000)
     }
     case 'zhihu/create_answer': {
       const media = Array.isArray(params.mediaManifest) ? params.mediaManifest : []
@@ -333,9 +330,44 @@ export function buildWriteSummary(
         2000,
       )
     }
+    case 'douyin/publish_video':
+    case 'douyin/publish_images': {
+      const media = Array.isArray(params.mediaManifest) ? params.mediaManifest : []
+      const what = action === 'publish_video' ? '发布视频' : `发布图文（${media.length} 张图片）`
+      const title = String(params.title ?? '')
+      return ellipsize(
+        `用抖音${hint}${what}，${douyinVisibility(params.visibility)}${title ? `，标题「${ellipsize(title, 30)}」` : ''}：「${ellipsize(String(params.caption ?? ''), 300)}」${DOUYIN_RISK_LINE}`,
+        2000,
+      )
+    }
+    case 'douyin/create_comment':
+      return ellipsize(
+        `用抖音${hint}在自己的作品 ${String(params.awemeId ?? '')} 下评论：「${ellipsize(String(params.text ?? ''), 300)}」${DOUYIN_RISK_LINE}`,
+        2000,
+      )
+    case 'douyin/reply_comment':
+      return ellipsize(
+        `用抖音${hint}回复作品 ${String(params.awemeId ?? '')} 下的评论 ${String(params.cid ?? '')}：「${ellipsize(String(params.text ?? ''), 300)}」${DOUYIN_RISK_LINE}`,
+        2000,
+      )
+    case 'douyin/set_comment_digg':
+      return ellipsize(
+        `用抖音${hint}把作品 ${String(params.awemeId ?? '')} 下的评论 ${String(params.cid ?? '')} 设置为${params.digg === true ? '已点赞' : '未点赞'}${DOUYIN_RISK_LINE}`,
+        2000,
+      )
     default:
       return ellipsize(`${provider} 写操作 ${action}`, 2000)
   }
+}
+
+/** 抖音确认卡固定的风险提示(设计 4.4)。 */
+const DOUYIN_RISK_LINE =
+  '\n将以你的抖音账号真实发布 / 互动；自动化操作可能触发抖音风控，严重时限制或封禁账号。'
+
+function douyinVisibility(value: unknown): string {
+  if (value === 'friends') return '好友可见'
+  if (value === 'private') return '仅自己可见'
+  return '公开'
 }
 
 /**
@@ -595,6 +627,47 @@ export function buildWriteDetail(
         title: String(params.title ?? ''),
         text: String(params.text ?? ''),
         media: Array.isArray(params.mediaManifest) ? params.mediaManifest : [],
+      }
+    case 'douyin/publish_video':
+    case 'douyin/publish_images':
+      return {
+        kind: action === 'publish_video' ? 'douyin_video' : 'douyin_images',
+        title: String(params.title ?? ''),
+        caption: String(params.caption ?? ''),
+        visibility: douyinVisibility(params.visibility),
+        // 文件名、大小和 sha256 前 8 位(设计 4.4);不带工作区路径以外的东西。
+        media: (Array.isArray(params.mediaManifest) ? params.mediaManifest : []).map((item) => {
+          const m = item as Record<string, unknown>
+          return {
+            filename: String(m.filename ?? ''),
+            sizeBytes: typeof m.sizeBytes === 'number' ? m.sizeBytes : 0,
+            sha256Prefix: String(m.sha256 ?? '').slice(0, 8),
+          }
+        }),
+        warning: DOUYIN_RISK_LINE.trim(),
+      }
+    case 'douyin/create_comment':
+      return {
+        kind: 'douyin_comment',
+        awemeId: String(params.awemeId ?? ''),
+        text: String(params.text ?? ''),
+        warning: DOUYIN_RISK_LINE.trim(),
+      }
+    case 'douyin/reply_comment':
+      return {
+        kind: 'douyin_comment_reply',
+        awemeId: String(params.awemeId ?? ''),
+        cid: String(params.cid ?? ''),
+        text: String(params.text ?? ''),
+        warning: DOUYIN_RISK_LINE.trim(),
+      }
+    case 'douyin/set_comment_digg':
+      return {
+        kind: 'douyin_comment_digg',
+        awemeId: String(params.awemeId ?? ''),
+        cid: String(params.cid ?? ''),
+        digg: params.digg === true,
+        warning: DOUYIN_RISK_LINE.trim(),
       }
     default:
       // 兜底:原样返回(params 本身已过严格 schema,无凭据)

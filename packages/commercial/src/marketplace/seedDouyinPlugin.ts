@@ -111,11 +111,16 @@ async function initialOwner(): Promise<number> {
   return ownerUserId
 }
 
-/** Read-only by construction: the contract has no write action, and the smoke refuses any. */
+/**
+ * 上架实测只跑读动作（me / my_videos / video_comments），且必须正好是这三个：写动作（1.1.0 起）绝不进实测，
+ * 读动作有增减时要先改这里和实测流程。
+ */
 export function douyinSmokeActionIds(): string[] {
-  const ids = DOUYIN_PLUGIN_CONTRACT.actions.map((action) => action.id)
-  if (DOUYIN_PLUGIN_CONTRACT.actions.some((action) => action.effect !== 'read'))
-    throw new Error('Douyin contract must stay read-only')
+  const ids = DOUYIN_PLUGIN_CONTRACT.actions
+    .filter((action) => action.effect === 'read')
+    .map((action) => action.id)
+  if (ids.join(',') !== 'me,my_videos,video_comments')
+    throw new Error('Douyin smoke actions changed; update the verify flow first')
   return ids
 }
 

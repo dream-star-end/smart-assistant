@@ -1,5 +1,5 @@
 /**
- * OCV5-553 · official Douyin Plugin (managed-browser), QR login + read-only `me`. No Docker, no
+ * OCV5-553 · official Douyin Plugin (managed-browser), QR login + reads (writes: douyinWrite.test.ts). No Docker, no
  * network: contract pins / schemas, account-state limits, worker source branches (compiled from the
  * pinned source with a fake page), login stop rules, frame protocol, failure-code mapping, log
  * sanitising, seed CLI parsing.
@@ -132,7 +132,7 @@ const USER_INFO_OK = {
 describe('official Douyin Plugin', () => {
   test('pins the current artifact; only the exact pin is setup-compatible', () => {
     assert.equal(DOUYIN_PLUGIN_SLUG, 'douyin')
-    assert.equal(DOUYIN_PLUGIN_VERSION, '1.0.0')
+    assert.equal(DOUYIN_PLUGIN_VERSION, '1.1.0')
     assert.equal(COMPILED_DOUYIN_PLUGIN.pluginType, 'managed-browser')
     assert.match(COMPILED_DOUYIN_PLUGIN.artifactHash, /^[0-9a-f]{64}$/)
     const exact = {
@@ -152,8 +152,11 @@ describe('official Douyin Plugin', () => {
     assert.equal(isOfficialDouyinPluginIdentity({ ...identity, reviewSource: 'human' }), false)
   })
 
-  test('this version is read-only: me / my_videos / video_comments, network methods are GET only', () => {
-    assert.ok(DOUYIN_PLUGIN_CONTRACT.actions.every((action) => action.effect === 'read'))
+  test('reads are me / my_videos / video_comments (also the seed smoke); network methods are GET only', () => {
+    assert.deepEqual(
+      DOUYIN_PLUGIN_CONTRACT.actions.filter((action) => action.effect === 'read').map((a) => a.id),
+      ['me', 'my_videos', 'video_comments'],
+    )
     assert.deepEqual([...DOUYIN_PLUGIN_CONTRACT.runtime.network.methods], ['GET'])
     assert.deepEqual(douyinSmokeActionIds(), ['me', 'my_videos', 'video_comments'])
   })
@@ -278,8 +281,17 @@ describe('official Douyin Plugin', () => {
   })
 
   test('worker source: a branch per action, same-origin in-page GETs only, no Node request client', () => {
-    for (const action of DOUYIN_PLUGIN_CONTRACT.actions)
+    for (const action of DOUYIN_PLUGIN_CONTRACT.actions.filter((a) => a.effect === 'read'))
       assert.ok(DOUYIN_WORKER_SOURCE.includes(`input.actionId === '${action.id}'`), action.id)
+    // 写动作走 actionWrite（列表与契约一致）。
+    assert.ok(
+      DOUYIN_WORKER_SOURCE.includes(
+        `const WRITE_ACTIONS = new Set([${DOUYIN_PLUGIN_CONTRACT.actions
+          .filter((a) => a.effect === 'write')
+          .map((a) => `'${a.id}'`)
+          .join(', ')}]);`,
+      ),
+    )
     assert.match(DOUYIN_WORKER_SOURCE, /credentials: 'include'/)
     assert.doesNotMatch(DOUYIN_WORKER_SOURCE, /'omit'/)
     assert.match(DOUYIN_WORKER_SOURCE, /robots\.txt/)
@@ -298,7 +310,12 @@ describe('official Douyin Plugin', () => {
     assert.match(DOUYIN_WORKER_SOURCE, /const QR_SELECTOR = 'img\[aria-label="二维码"\]';/)
     // 唯一的填写是把用户本人提交的短信验证码填进「请输入验证码」；唯一的鼠标操作是点二维码中心。
     // 没有键盘模拟、拖动（滑块）或逐字输入：系统不碰任何图形验证码。
-    assert.equal((DOUYIN_WORKER_SOURCE.match(/\.fill\(/g) ?? []).length, 3)
+    // `.fill(0)` 只用于清零缓冲区（命令帧、读过的媒体），不算页面填写。
+    assert.deepEqual(DOUYIN_WORKER_SOURCE.match(/[a-z]+\.fill\(0\)/g), [
+      'bytes.fill(0)',
+      'body.fill(0)',
+    ])
+    assert.equal((DOUYIN_WORKER_SOURCE.match(/\.fill\((?!0\))/g) ?? []).length, 2)
     assert.match(
       DOUYIN_WORKER_SOURCE,
       /const input = login\.getByPlaceholder\('请输入验证码'\)\.last\(\);/,
@@ -1079,16 +1096,27 @@ describe('douyin protocol, codes, logs, seed CLI', () => {
     )
   })
 
-  test('frames: ready + terminal decode; write-fence frames and unknown codes are protocol errors', () => {
+  test('frames: ready + terminal decode; malformed write-fence frames and unknown codes are protocol errors', () => {
     assert.deepEqual(
       decodeDouyinWorkerFramesForTest(
         Buffer.concat([framed(READY), framed({ event: 'failed', code: 'VERIFICATION_REQUIRED' })]),
       ),
       ['ready', 'failed'],
     )
+    // 写围栏帧本身能解码（顺序由 assertDouyinWorkerEventOrder 管，见 douyinWrite.test.ts）。
+    assert.deepEqual(
+      decodeDouyinWorkerFramesForTest(
+        Buffer.concat([
+          framed(READY),
+          framed({ event: 'prepared' }),
+          framed({ event: 'not_dispatched', code: 'PRECONDITION_CHANGED' }),
+        ]),
+      ),
+      ['ready', 'prepared', 'not_dispatched'],
+    )
     for (const forbidden of [
-      { event: 'prepared' },
-      { event: 'not_dispatched', code: 'PRECONDITION_CHANGED' },
+      { event: 'prepared', extra: 1 },
+      { event: 'not_dispatched', code: 'WEIBO_WRITE_SEND' },
       { event: 'failed', code: 'WEIBO_WRITE_SEND' },
     ])
       assert.throws(() =>
@@ -1150,6 +1178,8 @@ describe('douyin protocol, codes, logs, seed CLI', () => {
       'DOUYIN_UPSTREAM_CHALLENGE',
       'DOUYIN_LOGIN_UNSUPPORTED',
       'DOUYIN_VERIFICATION_REQUIRED',
+      'DOUYIN_WRITE_UNVERIFIED',
+      'DOUYIN_MEDIA_INVALID',
     ])
     for (const code of DOUYIN_FAILURE_CODES) {
       assert.ok(isPluginPassthroughErrorCode(code), code)

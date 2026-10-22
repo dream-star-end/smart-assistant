@@ -1,3 +1,4 @@
+import { DOUYIN_PLUGIN_SLUG } from './douyinContract.js'
 import { KNOWLEDGE_PLANET_PLUGIN_SLUG } from './knowledgePlanetContract.js'
 import { WEIBO_PLUGIN_SLUG } from './weiboContract.js'
 import type { ManagedPluginWriteDailyCapPolicy } from './writeDailyCap.js'
@@ -50,21 +51,44 @@ const ZHIHU_WRITE_PREAPPROVAL_POLICY: ManagedPluginWritePreapprovalPolicy = Obje
     '开启“免逐次确认”后，当前账号下可使用知乎插件的所有 Agent 都能直接发布想法、回答问题、编辑或永久删除自己的回答、发表或回复评论、删除自己的评论、发布文章，上传你指定的本地图片，以及设置赞同/反对和关注状态，不再逐次向你展示确认卡。该独立授权是对写入声明中“默认逐次确认”规则的明确例外；想法、回答、评论、文章和互动会立即作用于真实账号，编辑会改变已发布内容，删除不可撤销。AI 可能误解你的意图、选错问题、回答或用户，生成错误或不当内容，也可能在短时间内连续执行多次操作。你应确保 Agent 指令、文字、图片和目标合法合规，拥有必要权利并遵守知乎社区规范及适用法律。平台仍会执行参数校验、账号锁、图片完整性校验、编辑或删除前精确目标快照复核、加密审计、派发围栏，以及结果不明确时不自动重试；这些保护不能替代你的逐次审阅。验证码、风控或身份异常会立即停止，系统不会尝试绕过。关闭本开关会阻止尚未开始的新免确认写入；已经进入发送阶段的操作仍可能完成。启用即表示你理解并接受免逐次确认带来的全部风险和最终责任。',
 })
 
+/**
+ * 抖音写入声明 v1（OCV5-553 设计 4.4）。抖音没有「免逐次确认」：每一次写都必须在确认卡上单独批准。
+ */
+const DOUYIN_WRITE_POLICY: ManagedPluginWritePolicy = Object.freeze({
+  version: 1,
+  disclaimerText:
+    '开启后，插件可使用你当前登录的真实抖音账号发布视频或图文、在你自己的作品下发表评论、回复你作品下的评论，以及给你作品下的评论点赞或取消点赞。这些操作会立即以你的身份对抖音用户可见。插件通过网页自动化代你操作，这违反或可能违反抖音用户协议，可能导致限流、功能受限或封号，相关风险由你本人承担。每一次写操作都必须由你在对话确认卡中单独批准，本插件不提供免逐次确认；同一账号每天的发布、评论与回复、点赞次数都有上限，两次写操作之间有最短间隔。你应确保内容真实、合法并拥有所需权利，遵守抖音社区自律公约及适用法律，避免泄露隐私或机密信息。AI 可能理解错误、选错目标或生成不当内容。遇到验证码、风控或身份异常会立即停止，系统不会尝试绕过，并暂停该账号的写操作 24 小时。上游网页没有条件更新版本号，最终复核与发送之间仍可能存在极短竞态窗口。关闭后不会启动新的写入；已经确认并进入发送阶段的操作仍可能完成。发送结果不明确时不会自动重试，请先到抖音核实，避免重复发布或互动。本版本不提供删除。',
+})
+
+/** 抖音每日写上限（设计 4.4 表；常量，可调）。评论与回复共用一个桶。 */
+const DOUYIN_WRITE_DAILY_CAP: ManagedPluginWriteDailyCapPolicy = Object.freeze({
+  buckets: Object.freeze({
+    publish_video: 'publish_video',
+    publish_images: 'publish_images',
+    create_comment: 'comment',
+    reply_comment: 'comment',
+    set_comment_digg: 'digg',
+  }),
+  defaultBucket: 'other',
+  caps: Object.freeze({ publish_video: 3, publish_images: 3, comment: 20, digg: 30, other: 1 }),
+})
+
 /** A managed-browser Plugin may expose writes only when the platform owns a current policy. */
 export function managedPluginWritePolicy(slug: string): ManagedPluginWritePolicy | null {
   if (slug === KNOWLEDGE_PLANET_PLUGIN_SLUG) return KNOWLEDGE_PLANET_WRITE_POLICY
   if (slug === WEIBO_PLUGIN_SLUG) return WEIBO_WRITE_POLICY
   if (slug === ZHIHU_PLUGIN_SLUG) return ZHIHU_WRITE_POLICY
+  if (slug === DOUYIN_PLUGIN_SLUG) return DOUYIN_WRITE_POLICY
   return null
 }
 
 /**
  * Per-account daily write caps (OCV5-553). `null` = no cap; every existing Plugin stays uncapped
  * so its behavior is unchanged. A Plugin that declares a cap is enforced by
- * `consumeManagedPluginWriteDailyCap` before the write is dispatched.
+ * `consumeManagedPluginWriteDailyCap` before the write is dispatched. Only Douyin declares one.
  */
-export function managedPluginWriteDailyCap(_slug: string): ManagedPluginWriteDailyCapPolicy | null {
-  return null
+export function managedPluginWriteDailyCap(slug: string): ManagedPluginWriteDailyCapPolicy | null {
+  return slug === DOUYIN_PLUGIN_SLUG ? DOUYIN_WRITE_DAILY_CAP : null
 }
 
 /** Independent policy for account-level removal of the per-operation confirmation card. */

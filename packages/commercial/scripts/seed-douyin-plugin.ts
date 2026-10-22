@@ -3,7 +3,7 @@
  * Official Douyin Plugin (OCV5-553): live verification and seed. This version is read-only.
  *
  *   --advisory-status
- *       No login, no worker. Prints whether the 1.0.0 listing exists and matches the code pins.
+ *       No login, no worker. Prints whether the current listing exists and matches the code pins.
  *   --verify-and-seed-user=ID --qr-out=/root/<file>.png   (or --verify-only: no DB writes)
  *       Needs ONE real QR scan by the operator. Starts the exact-image login worker, writes the
  *       official Douyin QR PNG to --qr-out (root-only, refreshed while it changes), waits for the

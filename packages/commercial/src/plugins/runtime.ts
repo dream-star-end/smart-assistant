@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 import type { Pool } from 'pg'
 import { canonicalDigestHex } from '../connectors/canonicalJson.js'
 import {
@@ -42,6 +44,15 @@ import {
   coerceIntegerStringParams,
   validateRuntimePluginJson,
 } from './contracts.js'
+import { DOUYIN_IMAGE_MIME_TYPES, DOUYIN_PLUGIN_SLUG } from './douyinContract.js'
+import {
+  DouyinWriteGuardError,
+  assertDouyinWriteAllowed,
+  beijingClock,
+  readDouyinWriteGate,
+  recordDouyinWriteDispatch,
+  tripDouyinWriteCooldown,
+} from './douyinWriteGuard.js'
 import type { PluginEnablement } from './enablement.js'
 import { KNOWLEDGE_PLANET_PLUGIN_SLUG } from './knowledgePlanetContract.js'
 import {
@@ -272,6 +283,31 @@ function ledgerReplay(row: LedgerRow): RuntimePluginWriteExecution {
     resultDigest: row.result_digest,
   }
 }
+
+/**
+ * 抖音写目标的快照摘要。worker（douyinWorkerSource.ts 的 douyinTargetDigest）用同样的键顺序计算，
+ * 发出前逐字核对：作品看 awemeId + 发布时间，评论看 awemeId + cid + 原文 + 发表时间。
+ */
+export function douyinTargetDigest(
+  target:
+    | { kind: 'video'; awemeId: string; createTime: number | null }
+    | { kind: 'comment'; awemeId: string; cid: string; text: string; createTime: number | null },
+): string {
+  const value =
+    target.kind === 'video'
+      ? { kind: 'video', awemeId: target.awemeId, createTime: target.createTime }
+      : {
+          kind: 'comment',
+          awemeId: target.awemeId,
+          cid: target.cid,
+          text: target.text,
+          createTime: target.createTime,
+        }
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex')
+}
+
+/** 写前快照最多翻 3 页（每页 20）：只能对最近 60 个作品 / 最近 60 条评论写。 */
+const DOUYIN_SNAPSHOT_MAX_PAGES = 3
 
 function stablePluginErrorCode(error: unknown): string {
   const code = (error as { code?: unknown } | null)?.code
@@ -1511,6 +1547,136 @@ export class PluginRuntimeFacade {
     return prepared
   }
 
+  /** 在自己最近的作品里找目标作品（服务端读，Agent 不能自传快照）。 */
+  private async findOwnDouyinVideo(input: {
+    userId: number
+    targetId: string
+    awemeId: string
+  }): Promise<Record<string, unknown> | null> {
+    let cursor: number | undefined
+    for (let page = 0; page < DOUYIN_SNAPSHOT_MAX_PAGES; page++) {
+      const read = (await this.call({
+        userId: input.userId,
+        targetId: input.targetId,
+        actionId: 'my_videos',
+        params: { count: 20, ...(cursor !== undefined ? { cursor } : {}) },
+      })) as { items?: Record<string, unknown>[]; hasMore?: boolean; cursor?: number }
+      const found = read.items?.find((item) => item.awemeId === input.awemeId)
+      if (found) return found
+      if (read.hasMore !== true || typeof read.cursor !== 'number') return null
+      cursor = read.cursor
+    }
+    return null
+  }
+
+  /** 在自己某个作品下找目标评论（video_comments 只能读自己的作品）。 */
+  private async findOwnDouyinComment(input: {
+    userId: number
+    targetId: string
+    awemeId: string
+    cid: string
+  }): Promise<Record<string, unknown> | null> {
+    let cursor: number | undefined
+    for (let page = 0; page < DOUYIN_SNAPSHOT_MAX_PAGES; page++) {
+      const read = (await this.call({
+        userId: input.userId,
+        targetId: input.targetId,
+        actionId: 'video_comments',
+        params: {
+          awemeId: input.awemeId,
+          count: 20,
+          ...(cursor !== undefined ? { cursor } : {}),
+        },
+      })) as {
+        awemeId?: string
+        items?: Record<string, unknown>[]
+        hasMore?: boolean
+        cursor?: number
+      }
+      if (read.awemeId !== input.awemeId) return null
+      const found = read.items?.find((item) => item.cid === input.cid)
+      if (found) return found
+      if (read.hasMore !== true || typeof read.cursor !== 'number') return null
+      cursor = read.cursor
+    }
+    return null
+  }
+
+  private async prepareDouyinWriteParams(input: {
+    userId: number
+    targetId: string
+    actionId: string
+    params: Record<string, unknown>
+  }): Promise<Record<string, unknown>> {
+    if (Object.hasOwn(input.params, 'snapshot') || Object.hasOwn(input.params, 'mediaManifest'))
+      throw new PluginRuntimeFacadeError('BAD_REQUEST', 'server-owned Plugin fields are forbidden')
+    const prepared: Record<string, unknown> = { ...input.params }
+
+    if (input.actionId === 'publish_video' || input.actionId === 'publish_images') {
+      if (!this.opts.knowledgePlanetMedia)
+        throw new PluginRuntimeFacadeError('RUNTIME_UNAVAILABLE', 'Plugin media is unavailable')
+      const items =
+        input.actionId === 'publish_video'
+          ? [{ path: String(input.params.video ?? ''), kind: 'file' as const }]
+          : (Array.isArray(input.params.images) ? (input.params.images as unknown[]) : []).map(
+              (path) => ({ path: String(path), kind: 'image' as const }),
+            )
+      const manifest = await sealKnowledgePlanetMedia({
+        userId: input.userId,
+        items,
+        deps: this.opts.knowledgePlanetMedia,
+      })
+      // 视频只认 mp4（扩展名判定；worker 发出前再看文件头 ftyp），图文只认 jpg / png / webp。
+      const allowed =
+        input.actionId === 'publish_video' ? ['video/mp4'] : (DOUYIN_IMAGE_MIME_TYPES as string[])
+      if (manifest.length === 0 || manifest.some((item) => !allowed.includes(item.mimeType)))
+        throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Douyin media type is unsupported')
+      prepared.mediaManifest = manifest
+      return prepared
+    }
+
+    const awemeId = String(input.params.awemeId ?? '')
+    if (input.actionId === 'create_comment') {
+      const video = await this.findOwnDouyinVideo({ ...input, awemeId })
+      if (!video)
+        throw new PluginRuntimeFacadeError(
+          'BAD_REQUEST',
+          'Douyin own-video snapshot is unavailable',
+        )
+      prepared.snapshot = {
+        awemeId,
+        digest: douyinTargetDigest({
+          kind: 'video',
+          awemeId,
+          createTime: typeof video.createTime === 'number' ? video.createTime : null,
+        }),
+      }
+      return prepared
+    }
+    if (input.actionId === 'reply_comment' || input.actionId === 'set_comment_digg') {
+      const cid = String(input.params.cid ?? '')
+      const comment = await this.findOwnDouyinComment({ ...input, awemeId, cid })
+      if (!comment || typeof comment.text !== 'string')
+        throw new PluginRuntimeFacadeError(
+          'BAD_REQUEST',
+          'Douyin own-video comment snapshot is unavailable',
+        )
+      prepared.snapshot = {
+        awemeId,
+        cid,
+        digest: douyinTargetDigest({
+          kind: 'comment',
+          awemeId,
+          cid,
+          text: comment.text,
+          createTime: typeof comment.createTime === 'number' ? comment.createTime : null,
+        }),
+      }
+      return prepared
+    }
+    throw new PluginRuntimeFacadeError('BAD_REQUEST', 'Plugin write action not found')
+  }
+
   async proposeWrite(input: {
     userId: number
     targetId: string
@@ -1540,6 +1706,21 @@ export class PluginRuntimeFacade {
       throw error
     }
 
+    // 抖音：风控冷却期内连确认卡都不开（也不去读目标）；间隔没到照常开卡，但写明最早执行时间。
+    let douyinNote = ''
+    if (initial.verified.slug === DOUYIN_PLUGIN_SLUG) {
+      const gate = await readDouyinWriteGate({
+        redis: this.opts.redis,
+        connectionId: input.targetId,
+        actionId: input.actionId,
+        now: (this.opts.now ?? Date.now)(),
+      })
+      if (gate.cooldownUntil !== null)
+        throw new DouyinWriteGuardError('DOUYIN_WRITE_COOLDOWN', gate.cooldownUntil)
+      if (gate.notBefore !== null)
+        douyinNote = `\n为降低风控，同账号写操作需要间隔：最早可在北京时间 ${beijingClock(gate.notBefore)} 之后执行，之前确认会被拒绝且不会发出。`
+    }
+
     const sealedParams =
       initial.verified.slug === KNOWLEDGE_PLANET_PLUGIN_SLUG
         ? await this.prepareKnowledgePlanetWriteParams(input)
@@ -1547,7 +1728,9 @@ export class PluginRuntimeFacade {
           ? await this.prepareWeiboWriteParams(input)
           : initial.verified.slug === ZHIHU_PLUGIN_SLUG
             ? await this.prepareZhihuWriteParams(input)
-            : input.params
+            : initial.verified.slug === DOUYIN_PLUGIN_SLUG
+              ? await this.prepareDouyinWriteParams(input)
+              : input.params
 
     const lease = await acquirePluginAccountLease(this.opts.redis, input.targetId, {
       hardTimeoutMs: 15_000,
@@ -1584,12 +1767,15 @@ export class PluginRuntimeFacade {
           provider: current.verified.slug,
           action: action.id,
           params: sealedParams,
-          summary: buildWriteSummary(
-            current.verified.slug,
-            action.id,
-            sealedParams,
-            typeof current.row.meta?.account_hint === 'string' ? current.row.meta.account_hint : '',
-          ),
+          summary:
+            buildWriteSummary(
+              current.verified.slug,
+              action.id,
+              sealedParams,
+              typeof current.row.meta?.account_hint === 'string'
+                ? current.row.meta.account_hint
+                : '',
+            ) + douyinNote,
           contractPins: {
             connectorVersionId: current.verified.versionId,
             specHashHex: current.verified.artifactHash,
@@ -1701,6 +1887,14 @@ export class PluginRuntimeFacade {
           verified,
           runner: this.pool,
         })
+        // 抖音:风控冷却与同账号写间隔在扣每日额度之前检查;没到就 failed(确定未派发),不排队。
+        if (verified.slug === DOUYIN_PLUGIN_SLUG)
+          await assertDouyinWriteAllowed({
+            redis: this.opts.redis,
+            connectionId: input.targetId,
+            actionId: begun.row.action,
+            now: (this.opts.now ?? Date.now)(),
+          })
         // 每日上限在派发围栏之前扣减:超限即 WRITE_DAILY_LIMIT,账本走下方 failed 分支(确定未派发)。
         await consumeManagedPluginWriteDailyCap({
           redis: this.opts.redis,
@@ -1716,9 +1910,12 @@ export class PluginRuntimeFacade {
           : []
         let staged: Awaited<ReturnType<typeof stageKnowledgePlanetMedia>> | null = null
         if (
-          [KNOWLEDGE_PLANET_PLUGIN_SLUG, WEIBO_PLUGIN_SLUG, ZHIHU_PLUGIN_SLUG].includes(
-            verified.slug,
-          ) &&
+          [
+            KNOWLEDGE_PLANET_PLUGIN_SLUG,
+            WEIBO_PLUGIN_SLUG,
+            ZHIHU_PLUGIN_SLUG,
+            DOUYIN_PLUGIN_SLUG,
+          ].includes(verified.slug) &&
           manifest.length > 0
         ) {
           const mediaDeps = this.opts.knowledgePlanetMedia
@@ -1741,6 +1938,15 @@ export class PluginRuntimeFacade {
             ...(staged ? { inputDirectory: staged.directory } : {}),
             beforeDispatch: async () => {
               await lease.assertHeld()
+              // 抖音:先记节奏(下一次同类写的最早时间)再落派发围栏。记录失败 = 本次停在发出之前;
+              // 围栏失败时节奏已记,只会更保守。
+              if (verified!.slug === DOUYIN_PLUGIN_SLUG)
+                await recordDouyinWriteDispatch({
+                  redis: this.opts.redis,
+                  connectionId: input.targetId,
+                  actionId: begun!.row.action,
+                  now: (this.opts.now ?? Date.now)(),
+                })
               armAttempted = true
               await armPluginWriteDispatch(
                 {
@@ -1798,6 +2004,13 @@ export class PluginRuntimeFacade {
         return { kind: 'result', result: executed.result }
       } catch (error) {
         const code = stablePluginErrorCode(error)
+        // 抖音风控熔断:写流程里出现验证码 / 风控,该账号所有写操作暂停 24 小时(尽力而为,不影响账本收口)。
+        if (code === 'DOUYIN_UPSTREAM_CHALLENGE' && verified?.slug === DOUYIN_PLUGIN_SLUG)
+          await tripDouyinWriteCooldown({
+            redis: this.opts.redis,
+            connectionId: input.targetId,
+            now: (this.opts.now ?? Date.now)(),
+          }).catch(() => {})
         const dispatchProvenNotStarted =
           (error as { dispatchProvenNotStarted?: unknown } | null)?.dispatchProvenNotStarted ===
           true
@@ -2100,6 +2313,13 @@ export class PluginRuntimeFacade {
         }
         if (code === 'CAPACITY_EXCEEDED')
           throw new PluginRuntimeFacadeError('RUNTIME_BUSY', 'Plugin worker capacity is full')
+        // 抖音:读操作(含写前快照)碰到验证码 / 风控同样让该账号写操作冷却 24 小时(设计 4.4)。
+        if (code === 'DOUYIN_UPSTREAM_CHALLENGE' && verified.slug === DOUYIN_PLUGIN_SLUG)
+          await tripDouyinWriteCooldown({
+            redis: this.opts.redis,
+            connectionId: input.targetId,
+            now: (this.opts.now ?? Date.now)(),
+          }).catch(() => {})
         throw error
       }
 

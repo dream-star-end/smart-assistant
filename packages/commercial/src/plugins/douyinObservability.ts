@@ -16,6 +16,9 @@ export const DOUYIN_WORKER_PROTOCOL_FAILURE_CODES = [
   'UPSTREAM_CHALLENGE',
   'LOGIN_STATE_UNSUPPORTED',
   'VERIFICATION_REQUIRED',
+  // 写动作（1.1.0）：上游写接口未接入 / 媒体不合格。两者都在派发围栏之前，确定未发出。
+  'WRITE_UNVERIFIED',
+  'MEDIA_INVALID',
 ] as const
 export type DouyinWorkerProtocolFailureCode = (typeof DOUYIN_WORKER_PROTOCOL_FAILURE_CODES)[number]
 
@@ -28,6 +31,10 @@ export const DOUYIN_FAILURE_CODES = [
   'DOUYIN_WORKER_BUSY',
   'DOUYIN_WORKER_DEADLINE',
   'DOUYIN_WORKER_INCOMPLETE',
+  'DOUYIN_PACING_WAIT',
+  'DOUYIN_WRITE_COOLDOWN',
+  'DOUYIN_WRITE_UNVERIFIED',
+  'DOUYIN_MEDIA_INVALID',
 ] as const
 export type DouyinFailureCode = (typeof DOUYIN_FAILURE_CODES)[number]
 
@@ -51,6 +58,10 @@ export function mapDouyinWorkerProtocolFailure(
       return 'DOUYIN_LOGIN_UNSUPPORTED'
     case 'VERIFICATION_REQUIRED':
       return 'DOUYIN_VERIFICATION_REQUIRED'
+    case 'WRITE_UNVERIFIED':
+      return 'DOUYIN_WRITE_UNVERIFIED'
+    case 'MEDIA_INVALID':
+      return 'DOUYIN_MEDIA_INVALID'
     default:
       return 'DOUYIN_ACTION_FAILED'
   }

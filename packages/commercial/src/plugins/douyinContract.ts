@@ -4,8 +4,13 @@
  * 个人抖音号扫码登录（抖音创作者服务平台 creator.douyin.com 的官方二维码，扫码后本人短信验证）。
  * 读动作：`me`（登录身份）、`my_videos`（自己的作品，creator work_list，2026-10-22 实测格式）、
  * `video_comments`（自己作品的评论，creator comment/list —— 接口由前端脚本静态分析确定、登录后应答
- * 形状未实测，上架前的 seed 实测必须跑通）。搜索和他人内容不做（需要 www 站签名，设计 4.3.C）。
- * 发布 / 评论 / 点赞等写动作在后续版本加入（设计 4.8）。只上 AI 市场、不预装。
+ * 形状未实测，上架前的 seed 实测必须跑通）。搜索和他人内容不做（需要 www 站签名，设计 4.3.C）。只上 AI 市场、不预装。
+ *
+ * 写动作（1.1.0，设计 4.4 / 4.8 PR4）：发布视频、发布图文、在自己作品下评论、回复自己作品下的评论、
+ * 给自己作品下的评论点赞 / 取消点赞。全部走确认账本逐次确认（没有「免逐次确认」），并受每日上限、
+ * 同账号写间隔和风控冷却约束。评论 / 回复 / 点赞只针对自己的作品：服务端用 my_videos / video_comments
+ * 读出目标做快照，worker 发出前再核对一次。这一版 worker 在派发围栏之前停下（DOUYIN_WRITE_UNVERIFIED，
+ * 确定未发出）：上游写接口要等测试号实测确定后再接入（不登录就无法实测）。
  *
  * 登录页来源、二维码元素和未登录时的接口应答来自 2026-10-21 的未登录侦察（g553-recon-*.json）；
  * 登录后的应答形状、登录 cookie 是否带 Secure，要等测试号扫码后才能核实。
@@ -18,7 +23,7 @@ import { compileRuntimePluginArtifact } from './contracts.js'
 import { DOUYIN_WORKER_SOURCE } from './douyinWorkerSource.js'
 
 export const DOUYIN_PLUGIN_SLUG = 'douyin'
-export const DOUYIN_PLUGIN_VERSION = '1.0.0'
+export const DOUYIN_PLUGIN_VERSION = '1.1.0'
 export const DOUYIN_WORKER_DIGEST = createHash('sha256').update(DOUYIN_WORKER_SOURCE).digest('hex')
 export const DOUYIN_DRIVER_ID = `douyin-${DOUYIN_WORKER_DIGEST.slice(0, 51)}`
 export const DOUYIN_DRIVER_VERSION = DOUYIN_PLUGIN_VERSION
@@ -53,6 +58,72 @@ const videoItemSchema = {
 
 export const DOUYIN_NETWORK_ORIGINS = Object.freeze(['https://creator.douyin.com'])
 
+/** 媒体路径与微博、知乎相同：由 sealKnowledgePlanetMedia 按工作区规则解析，只认 uploads / generated。 */
+const mediaPathSchema = { type: 'string', minLength: 1, maxLength: 512 }
+/** 文案：话题（#）和 @ 直接写在正文里，抖音按原文发布。 */
+const captionSchema = { type: 'string', maxLength: 1000 }
+const titleSchema = { type: 'string', maxLength: 30 }
+const visibilitySchema = { type: 'string', enum: ['public', 'friends', 'private'] }
+const cidSchema = { type: 'string', minLength: 1, maxLength: 32, pattern: '^[0-9]{1,32}$' }
+const digestSchema = { type: 'string', minLength: 64, maxLength: 64, pattern: '^[0-9a-f]{64,64}$' }
+const commentTextSchema = { type: 'string', minLength: 1, maxLength: 500 }
+/** 服务端封装的媒体清单（Agent 不能自传：proposeWrite 拒绝带这个字段的参数）。视频 ≤50MB（媒体通用上限）。 */
+const sealedMediaSchema = (kind: 'image' | 'file', mimeTypes: readonly string[]) => ({
+  type: 'object',
+  properties: {
+    path: mediaPathSchema,
+    inputId: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9-]{1,64}$' },
+    filename: { type: 'string', minLength: 1, maxLength: 512 },
+    sizeBytes: { type: 'integer', minimum: 1, maximum: 50 * 1024 * 1024 },
+    sha256: digestSchema,
+    mimeType: { type: 'string', enum: mimeTypes },
+    kind: { type: 'string', enum: [kind] },
+  },
+  required: ['path', 'inputId', 'filename', 'sizeBytes', 'sha256', 'mimeType', 'kind'],
+  additionalProperties: false,
+})
+export const DOUYIN_IMAGE_MIME_TYPES = Object.freeze(['image/jpeg', 'image/png', 'image/webp'])
+const videoManifestSchema = {
+  type: 'array',
+  minItems: 1,
+  maxItems: 1,
+  items: sealedMediaSchema('file', ['video/mp4']),
+}
+const imageManifestSchema = {
+  type: 'array',
+  minItems: 1,
+  maxItems: 20,
+  items: sealedMediaSchema('image', DOUYIN_IMAGE_MIME_TYPES),
+}
+/** 服务端读出的目标快照（自己作品 / 自己作品下的评论）；worker 发出前逐字段核对。 */
+const videoSnapshotSchema = {
+  type: 'object',
+  properties: { awemeId: awemeIdSchema, digest: digestSchema },
+  required: ['awemeId', 'digest'],
+  additionalProperties: false,
+}
+const commentSnapshotSchema = {
+  type: 'object',
+  properties: { awemeId: awemeIdSchema, cid: cidSchema, digest: digestSchema },
+  required: ['awemeId', 'cid', 'digest'],
+  additionalProperties: false,
+}
+const writeResultSchema = {
+  type: 'object',
+  properties: {
+    status: {
+      type: 'string',
+      enum: ['published', 'in_review', 'commented', 'replied', 'digg_set'],
+    },
+    awemeId: awemeIdSchema,
+    cid: cidSchema,
+    digg: { type: 'boolean' },
+    url: { type: 'string', maxLength: 256 },
+  },
+  required: ['status'],
+  additionalProperties: false,
+}
+
 export const DOUYIN_PLUGIN_ARTIFACT = Object.freeze({
   schemaVersion: 1,
   pluginType: 'managed-browser',
@@ -65,6 +136,7 @@ export const DOUYIN_PLUGIN_ARTIFACT = Object.freeze({
     cookieDomains: ['douyin.com', 'creator.douyin.com'],
     origins: ['https://creator.douyin.com'],
   },
+  // 这一版的写动作在派发围栏之前停下，不发任何写请求，所以方法仍只有 GET。
   network: { origins: DOUYIN_NETWORK_ORIGINS, methods: ['GET'] },
   actions: [
     {
@@ -163,6 +235,108 @@ export const DOUYIN_PLUGIN_ARTIFACT = Object.freeze({
         required: ['awemeId', 'items', 'hasMore'],
         additionalProperties: false,
       },
+    },
+    {
+      id: 'publish_video',
+      description:
+        '用当前账号发布一条视频（写操作：每次都要用户在确认卡上批准，每天最多 3 条，两次发布至少间隔约 10 分钟）。' +
+        '参数：video（必填，uploads/ 或 generated/ 下的 mp4 文件，≤50MB）、caption（文案，话题 # 和 @ 写在正文里，≤1000 字）、' +
+        'title（可选，≤30 字）、visibility（public 公开 / friends 好友可见 / private 仅自己，默认 public）。',
+      effect: 'write',
+      timeoutSeconds: 600,
+      params: {
+        type: 'object',
+        properties: {
+          video: mediaPathSchema,
+          caption: captionSchema,
+          title: titleSchema,
+          visibility: visibilitySchema,
+          mediaManifest: videoManifestSchema,
+        },
+        required: ['video'],
+        additionalProperties: false,
+      },
+      result: writeResultSchema,
+    },
+    {
+      id: 'publish_images',
+      description:
+        '用当前账号发布一条图文（写操作：每次都要用户批准，每天最多 3 条，两次发布至少间隔约 10 分钟）。' +
+        '参数：images（必填，1-20 张 uploads/ 或 generated/ 下的 jpg / png / webp）、caption、title、visibility（同 publish_video）。',
+      effect: 'write',
+      timeoutSeconds: 600,
+      params: {
+        type: 'object',
+        properties: {
+          images: { type: 'array', minItems: 1, maxItems: 20, items: mediaPathSchema },
+          caption: captionSchema,
+          title: titleSchema,
+          visibility: visibilitySchema,
+          mediaManifest: imageManifestSchema,
+        },
+        required: ['images'],
+        additionalProperties: false,
+      },
+      result: writeResultSchema,
+    },
+    {
+      id: 'create_comment',
+      description:
+        '在自己的某个作品下发表一条评论（写操作：每次都要用户批准；评论与回复合计每天最多 20 条，同账号两次至少间隔约 1 分钟）。' +
+        '参数：awemeId（必填，来自 my_videos）、text（1-500 字）。',
+      effect: 'write',
+      timeoutSeconds: 300,
+      params: {
+        type: 'object',
+        properties: {
+          awemeId: awemeIdSchema,
+          text: commentTextSchema,
+          snapshot: videoSnapshotSchema,
+        },
+        required: ['awemeId', 'text'],
+        additionalProperties: false,
+      },
+      result: writeResultSchema,
+    },
+    {
+      id: 'reply_comment',
+      description:
+        '回复自己作品下的一条评论（写操作：每次都要用户批准；与评论合计每天最多 20 条，间隔约 1 分钟）。' +
+        '参数：awemeId、cid（来自 video_comments）、text（1-500 字）。',
+      effect: 'write',
+      timeoutSeconds: 300,
+      params: {
+        type: 'object',
+        properties: {
+          awemeId: awemeIdSchema,
+          cid: cidSchema,
+          text: commentTextSchema,
+          snapshot: commentSnapshotSchema,
+        },
+        required: ['awemeId', 'cid', 'text'],
+        additionalProperties: false,
+      },
+      result: writeResultSchema,
+    },
+    {
+      id: 'set_comment_digg',
+      description:
+        '给自己作品下的一条评论点赞（digg=true）或取消点赞（digg=false）（写操作：每次都要用户批准；每天合计最多 30 次，间隔约 20 秒）。' +
+        '参数：awemeId、cid、digg。',
+      effect: 'write',
+      timeoutSeconds: 300,
+      params: {
+        type: 'object',
+        properties: {
+          awemeId: awemeIdSchema,
+          cid: cidSchema,
+          digg: { type: 'boolean' },
+          snapshot: commentSnapshotSchema,
+        },
+        required: ['awemeId', 'cid', 'digg'],
+        additionalProperties: false,
+      },
+      result: writeResultSchema,
     },
   ],
 } as const)

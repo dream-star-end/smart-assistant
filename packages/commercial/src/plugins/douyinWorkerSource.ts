@@ -22,9 +22,19 @@
  *   bypass. Verification methods other than SMS (face, upstream SMS) end the login
  *   (VERIFICATION_REQUIRED).
  * Headless only: the headful-only native 「Open xdg-open?」 dialog never appears; JS dialogs are dismissed.
+ *
+ * Writes (1.1.0, design 4.4): `publish_video` / `publish_images` / `create_comment` / `reply_comment` /
+ * `set_comment_digg`, all on the account's own works. Before the dispatch fence the worker proves the
+ * session (user info), re-reads the target the master snapshotted (own work via work_list, own work's
+ * comment via comment/list; digest must match, else `not_dispatched` PRECONDITION_CHANGED) and checks
+ * the staged media in /inputs (size, sha256, mp4 `ftyp` / image magic; else MEDIA_INVALID). Only then
+ * would it emit `prepared` and wait for the master's `dispatch`. No upstream write endpoint is wired
+ * in this version (they need a live test with a test account): every write stops before `prepared`
+ * with WRITE_UNVERIFIED, so nothing is sent.
  */
 export const DOUYIN_WORKER_SOURCE = String.raw`
 import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { createServer, createConnection } from 'node:net';
 
@@ -53,7 +63,10 @@ const QR_STALL_MS = 10_000;
 const VERIFY_WINDOW_MS = 180_000;
 const VALIDATE_WAIT_MS = 40_000;
 const SMS_RESEND_AFTER_SEC = 60;
-const FAILURE_CODES = new Set(['WORKER_FAILED', 'LOGIN_EXPIRED', 'UPSTREAM_CHALLENGE', 'LOGIN_STATE_UNSUPPORTED', 'VERIFICATION_REQUIRED']);
+const FAILURE_CODES = new Set(['WORKER_FAILED', 'LOGIN_EXPIRED', 'UPSTREAM_CHALLENGE', 'LOGIN_STATE_UNSUPPORTED', 'VERIFICATION_REQUIRED', 'WRITE_UNVERIFIED', 'MEDIA_INVALID']);
+const WRITE_ACTIONS = new Set(['publish_video', 'publish_images', 'create_comment', 'reply_comment', 'set_comment_digg']);
+const SNAPSHOT_MAX_PAGES = 3;
+const MEDIA_MAX_BYTES = 50 * 1024 * 1024;
 let terminal = false;
 
 function encodeFrame(value) {
@@ -364,44 +377,131 @@ function commentItem(c) {
   });
 }
 
+async function listMyVideos(page, count, cursor) {
+  await humanPause(page);
+  const query = new URLSearchParams({ status: '0', count: String(count), max_cursor: String(cursor) });
+  const data = creatorData(await apiGet(page, SITE + '/janus/douyin/creator/pc/work_list?' + query.toString()));
+  if (!Array.isArray(data.aweme_list)) throw new Error('WORKER_FAILED');
+  const paging = pageInfo(data, 'max_cursor', cursor, data.aweme_list.length === 0);
+  return compact({
+    items: projectList(data.aweme_list, videoItem),
+    hasMore: paging.hasMore,
+    cursor: paging.cursor,
+    total: nonNegInt(data.total)
+  });
+}
+async function listComments(page, awemeId, count, cursor) {
+  await humanPause(page);
+  const query = new URLSearchParams({ item_id: awemeId, cursor: String(cursor), count: String(count) });
+  const data = creatorData(await apiGet(page, SITE + '/aweme/v1/creator/comment/list/?' + query.toString()));
+  // 登录后的应答形状未实测：只认 comments 数组（没有评论时可能是 null）；认不出就失败，不猜。
+  if (data.comments !== null && !Array.isArray(data.comments)) throw new Error('WORKER_FAILED');
+  const list = data.comments || [];
+  const paging = pageInfo(data, 'cursor', cursor, list.length === 0);
+  return compact({
+    awemeId,
+    items: projectList(list, commentItem),
+    hasMore: paging.hasMore,
+    cursor: paging.cursor,
+    total: nonNegInt(data.total)
+  });
+}
 async function actionRead(page, input) {
   const self = await readSelf(page);
   if (input.actionId === 'me') return self;
   const params = input.params || {};
   const count = clampInt(params.count, 1, 20, 10);
   const cursor = clampInt(params.cursor, 0, 9_000_000_000_000, 0);
-  if (input.actionId === 'my_videos') {
-    await humanPause(page);
-    const query = new URLSearchParams({ status: '0', count: String(count), max_cursor: String(cursor) });
-    const data = creatorData(await apiGet(page, SITE + '/janus/douyin/creator/pc/work_list?' + query.toString()));
-    if (!Array.isArray(data.aweme_list)) throw new Error('WORKER_FAILED');
-    const paging = pageInfo(data, 'max_cursor', cursor, data.aweme_list.length === 0);
-    return compact({
-      items: projectList(data.aweme_list, videoItem),
-      hasMore: paging.hasMore,
-      cursor: paging.cursor,
-      total: nonNegInt(data.total)
-    });
-  }
+  if (input.actionId === 'my_videos') return listMyVideos(page, count, cursor);
   if (input.actionId === 'video_comments') {
     const awemeId = digits(params.awemeId);
     if (!awemeId) throw new Error('WORKER_FAILED');
-    await humanPause(page);
-    const query = new URLSearchParams({ item_id: awemeId, cursor: String(cursor), count: String(count) });
-    const data = creatorData(await apiGet(page, SITE + '/aweme/v1/creator/comment/list/?' + query.toString()));
-    // 登录后的应答形状未实测：只认 comments 数组（没有评论时可能是 null）；认不出就失败，不猜。
-    if (data.comments !== null && !Array.isArray(data.comments)) throw new Error('WORKER_FAILED');
-    const list = data.comments || [];
-    const paging = pageInfo(data, 'cursor', cursor, list.length === 0);
-    return compact({
-      awemeId,
-      items: projectList(list, commentItem),
-      hasMore: paging.hasMore,
-      cursor: paging.cursor,
-      total: nonNegInt(data.total)
-    });
+    return listComments(page, awemeId, count, cursor);
   }
   throw new Error('WORKER_FAILED');
+}
+
+/** 与 master 的 douyinTargetDigest（runtime.ts）同一键顺序。 */
+function douyinTargetDigest(target) {
+  const value = target.kind === 'video'
+    ? { kind: 'video', awemeId: target.awemeId, createTime: target.createTime }
+    : { kind: 'comment', awemeId: target.awemeId, cid: target.cid, text: target.text, createTime: target.createTime };
+  return digest(value);
+}
+/** 发出前重读目标（与 master 快照同样最多翻 3 页）。找不到也算「目标已变化」。 */
+async function currentTargetDigest(page, actionId, params) {
+  const awemeId = digits(params.awemeId);
+  if (!awemeId) throw new Error('WORKER_FAILED');
+  let cursor = 0;
+  for (let index = 0; index < SNAPSHOT_MAX_PAGES; index += 1) {
+    if (actionId === 'create_comment') {
+      const listed = await listMyVideos(page, 20, cursor);
+      const video = listed.items.find((item) => item.awemeId === awemeId);
+      if (video) return douyinTargetDigest({ kind: 'video', awemeId, createTime: video.createTime === undefined ? null : video.createTime });
+      if (!listed.hasMore) return null;
+      cursor = listed.cursor;
+    } else {
+      const cid = digits(params.cid);
+      if (!cid) throw new Error('WORKER_FAILED');
+      const listed = await listComments(page, awemeId, 20, cursor);
+      const comment = listed.items.find((item) => item.cid === cid);
+      if (comment) return douyinTargetDigest({ kind: 'comment', awemeId, cid, text: comment.text, createTime: comment.createTime === undefined ? null : comment.createTime });
+      if (!listed.hasMore) return null;
+      cursor = listed.cursor;
+    }
+  }
+  return null;
+}
+function mediaMagicOk(kind, mimeType, bytes) {
+  if (kind === 'file') return mimeType === 'video/mp4' && bytes.length >= 12 && bytes.subarray(4, 8).toString('latin1') === 'ftyp';
+  if (mimeType === 'image/jpeg') return bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  if (mimeType === 'image/png') return bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  if (mimeType === 'image/webp') return bytes.length >= 12 && bytes.subarray(0, 4).toString('latin1') === 'RIFF' && bytes.subarray(8, 12).toString('latin1') === 'WEBP';
+  return false;
+}
+/** 暂存目录里的媒体逐个核对：大小、sha256、文件头。任何一项不符 = MEDIA_INVALID（未发出）。 */
+async function verifyStagedMedia(actionId, manifest) {
+  const expectedKind = actionId === 'publish_video' ? 'file' : 'image';
+  const max = actionId === 'publish_video' ? 1 : 20;
+  if (!Array.isArray(manifest) || manifest.length < 1 || manifest.length > max) throw new Error('MEDIA_INVALID');
+  for (const item of manifest) {
+    const inputId = String(item && item.inputId || '');
+    if (!/^[A-Za-z0-9-]{1,64}$/.test(inputId) || item.kind !== expectedKind || !Number.isSafeInteger(item.sizeBytes) || item.sizeBytes < 1 || item.sizeBytes > MEDIA_MAX_BYTES) throw new Error('MEDIA_INVALID');
+    let bytes;
+    try { bytes = await readFile('/inputs/' + inputId); } catch { throw new Error('MEDIA_INVALID'); }
+    const ok = bytes.length === item.sizeBytes && createHash('sha256').update(bytes).digest('hex') === item.sha256 && mediaMagicOk(item.kind, item.mimeType, bytes);
+    bytes.fill(0);
+    if (!ok) throw new Error('MEDIA_INVALID');
+  }
+}
+async function awaitDispatch() {
+  writeFrame({ event: 'prepared' });
+  const command = await readFrame();
+  if (Object.keys(command).sort().join('\0') !== 'event' || command.event !== 'dispatch') throw new Error('dispatch');
+}
+/**
+ * 每个写动作真正发往抖音的那一步（awaitDispatch 之后调用）。这一版一个都没有接：上游写接口
+ * 要等测试号实测确定（设计 4.8）。没有条目的动作在 prepared 之前以 WRITE_UNVERIFIED 结束。
+ */
+const WRITE_DISPATCHERS = Object.freeze({});
+async function actionWrite(page, input) {
+  const params = input.params || {};
+  await readSelf(page);
+  if (input.actionId === 'publish_video' || input.actionId === 'publish_images') {
+    await verifyStagedMedia(input.actionId, params.mediaManifest);
+  } else {
+    const snapshot = params.snapshot;
+    if (!snapshot || typeof snapshot !== 'object' || snapshot.awemeId !== params.awemeId || (input.actionId !== 'create_comment' && snapshot.cid !== params.cid)) throw new Error('WORKER_FAILED');
+    const current = await currentTargetDigest(page, input.actionId, params);
+    if (current === null || current !== snapshot.digest) {
+      emitStep({ step: 'write.not_dispatched', actionId: input.actionId });
+      await writeTerminalAndExit({ event: 'not_dispatched', code: 'PRECONDITION_CHANGED' });
+    }
+  }
+  const dispatcher = WRITE_DISPATCHERS[input.actionId];
+  if (typeof dispatcher !== 'function') throw new Error('WRITE_UNVERIFIED');
+  await awaitDispatch();
+  return dispatcher(page, params);
 }
 
 async function finishAction(context, input, result) {
@@ -449,7 +549,7 @@ async function runAction(input, relay) {
     const context = await secureContext(browser, input.storageState, ACTION_ORIGINS, ['GET']);
     const page = await openSitePage(context);
     try {
-      const result = await actionRead(page, input);
+      const result = WRITE_ACTIONS.has(input.actionId) ? await actionWrite(page, input) : await actionRead(page, input);
       emitStep({ step: 'action.done', actionId: input.actionId, ok: true, ms: Date.now() - started });
       await finishAction(context, input, result);
     } catch (error) {
