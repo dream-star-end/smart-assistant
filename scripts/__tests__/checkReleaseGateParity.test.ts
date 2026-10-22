@@ -97,6 +97,16 @@ test("a here-string is not a heredoc: the next line still runs", () => {
   assert.deepEqual([...runs.scripts], ["scripts/a.mjs"]);
 });
 
+test("the scanner keeps only what bash executes inside quotes", () => {
+  const runs = (t: string) => [...runsIn(shellCommands(t)).scripts];
+  assert.deepEqual(runs(`log "run; node scripts/a.mjs"`), []);
+  assert.deepEqual(runs(`x='$(node scripts/a.mjs)'`), []);
+  assert.deepEqual(runs(`out="$(node scripts/a.mjs --x "$Y")"`), ["scripts/a.mjs"]);
+  assert.deepEqual(runs("out=`node scripts/a.mjs`"), ["scripts/a.mjs"]);
+  assert.deepEqual(runs(`echo "$(echo 'node scripts/a.mjs')"`), []);
+  assert.deepEqual(runs(`v="$(( 1 + 2 ))"; node scripts/b.mjs`), ["scripts/b.mjs"]);
+});
+
 test("a comment with an apostrophe does not swallow the next command", () => {
   const runs = runsIn(shellCommands("# don't run twice\nnode scripts/a.mjs\necho \"it's # not a comment\"\nbash scripts/b.sh # done"));
   assert.deepEqual([...runs.scripts], ["scripts/a.mjs", "scripts/b.sh"]);
@@ -136,6 +146,9 @@ test("red: the deploy-stage trailer gate is no longer really called (Codex final
     ["call only echoed", (d) => d.replace(/^ {2}assert_fix_trailers "\$sha"$/m, '  echo assert_fix_trailers "$sha"')],
     ["function no longer runs the gate", (d) => d.replace(/"\$FIX_TRAILER_GATE" --repo/, "true --repo")],
     ["variable points elsewhere", (d) => d.replace(/^FIX_TRAILER_GATE=.*$/m, 'FIX_TRAILER_GATE="$SCRIPT_DIR/other.sh"')],
+    // Codex final r2: a single-quoted $( … ) is a literal, not a run
+    ["runner single-quoted", (d) => d.replace(/out="\$\("\$FIX_TRAILER_GATE" (.*?)\)"/, "out='$(\"$FIX_TRAILER_GATE\" $1)'")],
+    ["runner only named in a double-quoted message", (d) => d.replace(/out="\$\("\$FIX_TRAILER_GATE" (.*?)\)"/, 'out="later; $FIX_TRAILER_GATE $1"')],
   ];
   for (const [name, mutate] of cases) {
     const input = real();

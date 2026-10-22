@@ -53,7 +53,8 @@ export interface Problem { kind: string; message: string }
 
 /** What may precede a run at command position: sudo, env (-u NAME, NAME=value, emptied quotes) and
  * NAME=value assignments. Text after `echo`, inside quotes or in a comment is never a run. */
-const PREFIX = String.raw`(?:^|[;&|(])\s*(?:sudo\s+)?(?:(?:env(?:\s+(?:-u\s+\S+|''|[A-Za-z_][A-Za-z0-9_]*=\S*))*|[A-Za-z_][A-Za-z0-9_]*=\S*|'')\s+)*`;
+const QUOTED = String.raw`(?:''|"[^"\n]*")`;
+const PREFIX = String.raw`(?:^|[;&|(])\s*(?:sudo\s+)?(?:(?:env(?:\s+(?:-u\s+\S+|${QUOTED}|[A-Za-z_][A-Za-z0-9_]*=\S*))*|[A-Za-z_][A-Za-z0-9_]*=\S*|${QUOTED})\s+)*`;
 const SCRIPT_RUN = new RegExp(
   `${PREFIX}(?:npx(?:\\s+--no-install)?\\s+tsx|tsx|node|bash)\\s+((?:packages\\/[\\w.-]+\\/)?scripts\\/[\\w./-]+)`, "g");
 const NPM_RUN = new RegExp(`${PREFIX}npm run (\\S+)((?:\\s+--workspace\\s+\\S+)?)`, "g");
@@ -75,33 +76,68 @@ function dropHeredocBodies(lines: string[]): string[] {
   return out;
 }
 
-/** Replace every quoted string with '' and drop comments, tracking quote state across lines
- * (Codex r2: a quote opened on one line and closed on a later one is still one string). A `#`
- * starts a comment only at a word start outside quotes. Unbalanced input fails closed: the rest
- * of the text reads as one string, so nothing after it counts as a run. */
+/** Shell text → executable text. Single-quoted strings are literals and become ''. A
+ * double-quoted string keeps only what bash executes or expands inside it — `$( … )` / backtick
+ * substitutions (scanned recursively) and `$NAME` / `${NAME}` — so `"run; node scripts/x"` is no
+ * command while `"$("$GATE" …)"` still is (Codex final r2: a single-quoted `$( … )` was counted).
+ * Escaped characters are literals; a continuation survives; `#` starts a comment only at a word
+ * start. Unbalanced input fails closed: the rest reads as one literal, so nothing after it runs. */
 export function stripShell(text: string): string {
+  return scanCode(text, 0, false)[0];
+}
+
+function scanCode(text: string, from: number, inSub: boolean): [string, number] {
   let out = "";
-  let i = 0;
+  let depth = 0;
+  let i = from;
   while (i < text.length) {
     const c = text[i]!;
-    // an escaped character is a literal (`echo \; node …` prints); only a continuation survives
     if (c === "\\") { out += text[i + 1] === "\n" ? "\\\n" : "_"; i += 2; continue; }
     if (c === "'") {
       const j = text.indexOf("'", i + 1);
       out += "''"; i = j < 0 ? text.length : j + 1; continue;
     }
     if (c === '"') {
-      let j = i + 1;
-      while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
-      out += "''"; i = j + 1; continue;
+      const [kept, j] = scanDouble(text, i + 1);
+      out += `"${kept}"`; i = j; continue;
     }
-    if (c === "#" && (i === 0 || /\s|[;&|(]/.test(text[i - 1]!))) {
+    if (c === "`") {
+      const j = text.indexOf("`", i + 1);
+      out += `$(${stripShell(text.slice(i + 1, j < 0 ? text.length : j))})`; i = j < 0 ? text.length : j + 1; continue;
+    }
+    if (c === "#" && (i === from || /[\s;&|(]/.test(text[i - 1]!))) {
       const j = text.indexOf("\n", i);
       i = j < 0 ? text.length : j; continue;
     }
+    if (inSub && c === "(") depth++;
+    if (inSub && c === ")") {
+      if (depth === 0) return [out, i + 1];
+      depth--;
+    }
     out += c; i++;
   }
-  return out;
+  return [out, i];
+}
+
+function scanDouble(text: string, from: number): [string, number] {
+  let out = "";
+  let i = from;
+  while (i < text.length && text[i] !== '"') {
+    const c = text[i]!;
+    if (c === "\\") { i += 2; continue; }
+    if (c === "$" && text[i + 1] === "(") {
+      const [inner, j] = scanCode(text, i + 2, true);
+      out += `$(${inner})`; i = j; continue;
+    }
+    if (c === "`") {
+      const j = text.indexOf("`", i + 1);
+      out += `$(${stripShell(text.slice(i + 1, j < 0 ? text.length : j))})`; i = j < 0 ? text.length : j + 1; continue;
+    }
+    const v = c === "$" ? /^\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)/.exec(text.slice(i)) : null;
+    if (v) { out += v[0]; i += v[0].length; continue; }
+    i++;
+  }
+  return [out, i + 1];
 }
 
 /** Shell text → command lines: heredoc bodies dropped, quoted text and comments dropped (quote
@@ -173,13 +209,8 @@ export function deployRuns(deployScript: string, gate: Gate): boolean {
   const word = (name: string) => name.replace(/[^A-Za-z0-9_]/g, "");
   const at = (name: string) => new RegExp(`${PREFIX}(?:if\\s+)?(?:!\\s*)?${word(name)}(?:\\s|$)`);
   if (!functionCommands(deployScript, d.caller).some((line) => at(d.function).test(line))) return false;
-  // inside the function the runner is quoted ("$VAR" …), so look at the raw body with comments
-  // and heredocs removed, but quotes kept: "$VAR" must open a command (alone or as $( … ))
-  const lines = deployScript.split("\n");
-  const start = lines.findIndex((line) => new RegExp(`^${word(d.function)}\\(\\) \\{\\s*$`).test(line));
-  if (start < 0) return false;
-  const end = lines.findIndex((line, i) => i > start && /^\}/.test(line));
-  const body = lines.slice(start + 1, end < 0 ? undefined : end).map((l) => l.replace(/(^|\s)#.*$/, "$1"));
+  // the runner is a quoted expansion ("$VAR" …): the scanner keeps it only where bash executes it
+  const body = functionCommands(deployScript, d.function);
   const v = word(d.variable);
   const runs = new RegExp(`(?:^|[;&|(]|\\$\\()\\s*"?\\$(?:\\{${v}\\}|${v})"?(?:\\s|\\)|$)`);
   if (!body.some((line) => runs.test(line))) return false;
