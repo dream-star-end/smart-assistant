@@ -9,7 +9,7 @@
  * bytes through unchanged; native Claude Code's own Read applies the same
  * limits, so the model sees what it would see locally. */
 import { createHash } from "node:crypto";
-import sharp from "sharp";
+import sharp, { type Metadata } from "sharp";
 import type { BoxMatchedToolResult } from "./boxToolResultMatcher.js";
 
 export const BOX_CLI_IMAGE_MAX_DIM = 2000;
@@ -21,7 +21,7 @@ type McpContent = BoxMatchedToolResult["content"][number];
 
 export async function normalizeBoxCliImage(block: McpImage): Promise<McpImage> {
   const raw = Buffer.from(block.data, "base64");
-  let meta: sharp.Metadata;
+  let meta: Metadata;
   try { meta = await sharp(raw).metadata(); } catch { return block; }
   const format = meta.format === ("jpg" as string) ? "jpeg" : String(meta.format ?? "");
   const media = MEDIA[format];
