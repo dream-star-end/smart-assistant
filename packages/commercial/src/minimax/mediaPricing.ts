@@ -135,21 +135,24 @@ export function calculateMiniMaxSpeechCost(input: {
       : (() => { throw new TypeError(`unsupported MiniMax speech model: ${model}`); })();
   const chars = input.usageCharacters ?? countMiniMaxSpeechCharacters(input.text ?? "");
   const charCount = positiveInt("usageCharacters", chars, 1_000_000);
-  const qty = ceilDiv(BigInt(charCount), 10_000n);
-  const cost = qty * unitPrice;
+  // OCV5-589 / D6a (2026-10-23): pro-rata by character, rounded up to the cent,
+  // minimum 1 cent. Previously every call was rounded up to a whole 10k-char
+  // block, so a one-line voiceover cost the full 200/350 cents.
+  const cost = ceilDiv(BigInt(charCount) * unitPrice, 10_000n);
   return {
     operation: "speech",
     model,
-    units: { characters: charCount, billing_blocks_10k_chars: qty.toString() },
+    units: { characters: charCount, unit_price_cents_per_10k_chars: unitPrice.toString() },
     costCredits: cost,
     snapshot: snapshot({
       operation: "speech",
       model,
-      unit: "10k_chars",
+      unit: "char",
       unitPriceCents: unitPrice,
-      quantity: qty,
+      quantity: BigInt(charCount),
       costCredits: cost,
       capturedAt: input.capturedAt,
+      notes: "unit_price_cents is per 10k characters; cost = ceil(chars x price / 10000), pro-rata.",
     }),
   };
 }
@@ -158,8 +161,8 @@ export function calculateMiniMaxVoiceDesignCost(input: {
   operation: "voice_design" | "voice_clone";
   capturedAt?: Date;
 }): MiniMaxMediaCostResult {
-  // 价格页：音色设计/快速复刻 ¥9.9/音色；费用在首次使用音色合成时收取。
-  // 当前 proxy 不直接开放 voice design/clone 执行,但保留 calculator 供后续接入。
+  // 价格页：音色设计/快速复刻 ¥9.9/音色；MiniMax 在首次使用音色合成时收取。
+  // OCV5-589：媒体工作台在 master 侧创建成功后即按 990 结算（D6d），不对容器开放。
   const unitPrice = 990n;
   return {
     operation: input.operation,

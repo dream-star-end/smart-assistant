@@ -24,16 +24,25 @@ import {
   calculateMiniMaxImageCost,
   calculateMiniMaxLyricsCost,
   calculateMiniMaxMusicCost,
-  calculateMiniMaxSpeechCost,
   calculateMiniMaxVideoCost,
   type MiniMaxMediaCostResult,
 } from "./mediaPricing.js";
 import { settleMiniMaxMediaSuccess } from "./mediaBilling.js";
+import {
+  checkMediaWindowCap,
+  ensureSufficientBalance as ensureBalance,
+  fetchSystemVoices,
+  getJson,
+  hexToBuffer,
+  isObj,
+  postJson,
+  synthesizeSpeech,
+  traceId,
+} from "./mediaClient.js";
+import { SystemVoiceCache } from "./voices.js";
 
 export const MINIMAX_MEDIA_PATH = "/internal/v3/minimax";
 
-const API_BASE = "https://api.minimaxi.com";
-const UPSTREAM_TIMEOUT_MS = 300_000;
 const DOWNLOAD_TIMEOUT_MS = 600_000;
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 
@@ -120,9 +129,14 @@ type HandlerCtx = { hostUuid: string; boundIp: string };
 export interface MiniMaxMediaHandlerDeps {
   identityRepo: ContainerIdentityRepo;
   pgPool: Pool;
+  /** Media key (OCV5-589: MINIMAX_MEDIA_KEY_FILE, else MINIMAX_TOKEN_PLAN_KEY). */
   tokenPlanKey?: string;
   logger?: Logger;
   fetchImpl?: typeof fetch;
+  /** System-voice cache shared with the studio client; built from tokenPlanKey when omitted. */
+  voices?: SystemVoiceCache;
+  /** OC_MINIMAX_MEDIA_WINDOW_MAX_CALLS (5-hour global soft cap); unset = no cap. */
+  windowCap?: number;
 }
 
 export type MiniMaxMediaHandler = (
@@ -130,83 +144,6 @@ export type MiniMaxMediaHandler = (
   res: ServerResponse,
   ctx: HandlerCtx,
 ) => Promise<void>;
-
-function isObj(v: unknown): v is Record<string, unknown> {
-  return Boolean(v && typeof v === "object" && !Array.isArray(v));
-}
-
-function baseRespOk(json: unknown): boolean {
-  if (!isObj(json)) return true;
-  const br = json.base_resp;
-  if (!isObj(br)) return true;
-  const code = br.status_code;
-  return code === undefined || code === 0;
-}
-
-function baseRespMessage(json: unknown): string {
-  if (!isObj(json)) return "upstream error";
-  const br = json.base_resp;
-  if (isObj(br) && typeof br.status_msg === "string") return br.status_msg.slice(0, 200);
-  return "upstream error";
-}
-
-function traceId(json: unknown): string | null {
-  return isObj(json) && typeof json.trace_id === "string" ? json.trace_id : null;
-}
-
-async function readUpstreamJson(res: Response): Promise<unknown> {
-  const text = await res.text();
-  if (!text) return {};
-  try {
-    return JSON.parse(text);
-  } catch {
-    throw new HttpError(502, "MINIMAX_BAD_RESPONSE", "minimax returned invalid JSON");
-  }
-}
-
-async function postJson(fetchFn: typeof fetch, token: string, path: string, body: unknown): Promise<unknown> {
-  const res = await fetchFn(`${API_BASE}${path}`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-type": "application/json",
-      accept: "application/json",
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-    // minimax 新加坡端点显式直连,绕开 gateway 全局 EnvHttpProxyAgent(给 Anthropic 出海的日本节点)。
-    dispatcher: directEgressDispatcher(),
-  } as RequestInit & { dispatcher: Dispatcher });
-  const json = await readUpstreamJson(res);
-  if (!res.ok || !baseRespOk(json)) {
-    throw new HttpError(502, "MINIMAX_UPSTREAM_ERROR", baseRespMessage(json));
-  }
-  return json;
-}
-
-async function getJson(fetchFn: typeof fetch, token: string, path: string, params: Record<string, string>): Promise<unknown> {
-  const url = new URL(`${API_BASE}${path}`);
-  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-  const res = await fetchFn(url, {
-    method: "GET",
-    headers: { authorization: `Bearer ${token}`, accept: "application/json" },
-    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-    // minimax 端点显式直连,绕开全局日本代理(理由同 postJson)。
-    dispatcher: directEgressDispatcher(),
-  } as RequestInit & { dispatcher: Dispatcher });
-  const json = await readUpstreamJson(res);
-  if (!res.ok || !baseRespOk(json)) {
-    throw new HttpError(502, "MINIMAX_UPSTREAM_ERROR", baseRespMessage(json));
-  }
-  return json;
-}
-
-function hexToBase64(hex: string): string {
-  if (!/^[0-9a-fA-F]*$/.test(hex) || hex.length % 2 !== 0) {
-    throw new HttpError(502, "MINIMAX_BAD_RESPONSE", "minimax returned invalid hex audio");
-  }
-  return Buffer.from(hex, "hex").toString("base64");
-}
 
 class MiniMaxDownloadUrlError extends HttpError {
   readonly downloadHost?: string;
@@ -308,39 +245,26 @@ function costPayload(settled: Awaited<ReturnType<typeof settleMiniMaxMediaSucces
   };
 }
 
+function hexToBase64(hex: string): string {
+  return hexToBuffer(hex).toString("base64");
+}
+
 async function ensureSufficientBalance(
   deps: MiniMaxMediaHandlerDeps,
   identity: { userId: bigint },
   cost: MiniMaxMediaCostResult,
 ): Promise<void> {
-  if (cost.costCredits <= 0n) return;
-  // 双钱包（0096）：前置门按"总可用"= users.credits 持久钱包 + active 未过期订阅 period_credits
-  // 期内桶，否则钱包 0、套餐桶有余额的订阅用户会被误拒 402。
-  const out = await deps.pgPool.query<{ credits: string }>(
-    `SELECT (u.credits + COALESCE(us.period_credits, 0))::text AS credits
-       FROM users u
-       LEFT JOIN user_subscriptions us
-         ON us.user_id = u.id AND us.status = 'active' AND us.period_end > NOW()
-      WHERE u.id = $1`,
-    [identity.userId.toString()],
-  );
-  const balance = out.rowCount === 0 ? 0n : BigInt(out.rows[0]!.credits);
-  // Media calls have a known planned cost before the upstream request, unlike
-  // streaming LLM calls whose final cost is only known after SSE completes. Hard
-  // reject insufficient balance here so a 1-credit account cannot submit a
-  // high-priced video/music job and rely on settle() clamping after delivery.
-  if (balance < cost.costCredits) {
-    throw new HttpError(
-      402,
-      "INSUFFICIENT_CREDITS",
-      `insufficient credits: balance=${balance} required=${cost.costCredits}`,
-    );
-  }
+  await ensureBalance(deps.pgPool, identity.userId, cost);
+  await checkMediaWindowCap(deps.pgPool, deps.windowCap);
 }
 
 export function makeMiniMaxMediaHandler(deps: MiniMaxMediaHandlerDeps): MiniMaxMediaHandler {
   const log = (deps.logger ?? rootLogger).child({ subsys: "minimaxMediaProxy" });
   const fetchFn = deps.fetchImpl ?? fetch;
+  const voices = deps.voices ?? new SystemVoiceCache(async () => {
+    if (!deps.tokenPlanKey) throw new Error("minimax not configured");
+    return await fetchSystemVoices(fetchFn, deps.tokenPlanKey);
+  });
 
   return async function handle(req, res, ctx) {
     setSecurityHeaders(res);
@@ -435,36 +359,23 @@ export function makeMiniMaxMediaHandler(deps: MiniMaxMediaHandlerDeps): MiniMaxM
         }
         case "speech": {
           const p = parsed.payload;
-          const plannedCost = calculateMiniMaxSpeechCost({ model: p.model, text: p.text });
-          await ensureSufficientBalance(deps, identity, plannedCost);
-          const upstreamPayload = {
-            model: p.model,
-            text: p.text,
-            stream: false,
-            voice_setting: { voice_id: p.voice_id, speed: 1, vol: 1, pitch: 0 },
-            audio_setting: { sample_rate: 32000, bitrate: 128000, format: p.format, channel: 1 },
-            subtitle_enable: false,
-            ...(p.extra ?? {}),
-          };
-          const json = await postJson(fetchFn, deps.tokenPlanKey, "/v1/t2a_v2", upstreamPayload);
-          const audioHex = isObj(json) && isObj(json.data) && typeof json.data.audio === "string" ? json.data.audio : null;
-          if (!audioHex) throw new HttpError(502, "MINIMAX_BAD_RESPONSE", "minimax returned no audio");
-          const usageCharacters = isObj(json) && isObj(json.extra_info) && typeof json.extra_info.usage_characters === "number"
-            ? json.extra_info.usage_characters
-            : undefined;
-          const cost = calculateMiniMaxSpeechCost({ model: p.model, text: p.text, usageCharacters });
-          const base64 = hexToBase64(audioHex);
-          const settled = await settle(deps, {
-            identity,
-            requestId,
-            cost,
-            upstream: { traceId: traceId(json) },
-            outputMeta: { format: p.format, usage_characters: usageCharacters ?? null },
-          });
+          const out = await synthesizeSpeech(
+            { pool: deps.pgPool, key: deps.tokenPlanKey, fetchImpl: fetchFn, voices, windowCap: deps.windowCap },
+            {
+              userId: identity.userId,
+              containerId: identity.containerId,
+              requestId,
+              model: p.model,
+              text: p.text,
+              voiceId: p.voice_id,
+              format: p.format,
+              extra: p.extra,
+            },
+          );
           sendJson(res, 200, {
             kind: "speech",
-            files: [{ filename: `minimax-speech.${p.format}`, mime: `audio/${p.format}`, base64 }],
-            billing: costPayload(settled),
+            files: [{ filename: `minimax-speech.${p.format}`, mime: `audio/${p.format}`, base64: out.audio.toString("base64") }],
+            billing: costPayload(out.settled),
           });
           return;
         }
