@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
-import { type Manifest, check, functionCommands, runsIn, workflowRuns } from "../check-release-gate-parity.ts";
+import { type Manifest, check, functionCommands, runsIn, shellCommands, workflowRuns } from "../check-release-gate-parity.ts";
 
 const ROOT = join(import.meta.dirname, "..", "..");
 const read = (p: string) => readFileSync(join(ROOT, p), "utf8");
@@ -53,6 +53,35 @@ test("red: a gate named only in a workflow comment or step name is not run", () 
     .replace("run: node scripts/check-v5-callback-payload-hash.mjs", "run: echo skipped # node scripts/check-v5-callback-payload-hash.mjs");
   assert.ok(workflowRuns(input.workflows[wf]!).includes("echo skipped"));
   assert.deepEqual(kinds(check(input)), ["ci-missing"]);
+});
+
+test("red: a CI step that only prints, quotes or comments the gate does not run it (Codex r1)", () => {
+  const wf = "v5-selfhost-release-gates.yml";
+  for (const fake of [
+    "run: echo node scripts/check-v5-callback-payload-hash.mjs",
+    "run: echo \"node scripts/check-v5-callback-payload-hash.mjs\"",
+    "run: true # node scripts/check-v5-callback-payload-hash.mjs",
+    "run: printf '%s' 'npx --no-install tsx scripts/check-v5-callback-payload-hash.mjs'",
+  ]) {
+    const input = real();
+    input.workflows[wf] = input.workflows[wf]!.replace("run: node scripts/check-v5-callback-payload-hash.mjs", fake);
+    const p = check(input);
+    assert.deepEqual(kinds(p), ["ci-missing"], fake);
+  }
+  const web = real();
+  web.workflows[wf] = web.workflows[wf]!.replace("run: npm run build --workspace packages/web-react", "run: echo npm run build --workspace packages/web-react");
+  assert.deepEqual(kinds(check(web)), ["ci-missing"]);
+});
+
+test("sudo/env prefixes at command position still count as a run", () => {
+  const runs = runsIn(shellCommands([
+    'sudo env "PATH=$PATH" "HOME=$HOME" npx --no-install tsx scripts/a.ts',
+    "env -u DATABASE_URL -u TEST_DATABASE_URL npx --no-install tsx scripts/b.ts --expect-sha x",
+    "cd x && NODE_OPTIONS='--max' npm run build --workspace packages/web-react",
+    "tsx scripts/c.ts && tsx scripts/d.ts",
+  ].join("\n")));
+  assert.deepEqual([...runs.scripts], ["scripts/a.ts", "scripts/b.ts", "scripts/c.ts", "scripts/d.ts"]);
+  assert.deepEqual([...runs.npm], ["npm run build --workspace packages/web-react"]);
 });
 
 test("red: the train stopped running a manifest gate", () => {

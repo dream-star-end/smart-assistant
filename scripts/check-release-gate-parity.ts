@@ -12,8 +12,9 @@
  *             production web build (lexical, same rules as check-v5-incident-regressions.ts),
  *             plus manifest gates the deploy script itself runs (`stage: "deploy"`);
  *   manifest = deploy/v5/selfhost-release-gates.json;
- *   CI      = the `run:` steps of .github/workflows/v5-selfhost-*.yml (comments and step names do
- *             not count), with `npm run <script>` expanded through package.json.
+ *   CI      = what the `run:` steps of .github/workflows/v5-selfhost-*.yml execute: same lexical
+ *             command-position rule (an echo, a quoted string or a comment naming a gate is not a
+ *             run), with `npm run <script>` followed through package.json.
  *
  * Problems (exit 1): a train gate missing from the manifest, a manifest gate the train no longer
  * runs, a manifest gate whose `ci` workflow does not run it, a gate with neither `ci` nor a
@@ -46,9 +47,18 @@ export interface Manifest {
 }
 export interface Problem { kind: string; message: string }
 
-const SCRIPT_RUN =
-  /(?:^|[;&|(])\s*(?:(?:env(?:\s+-u\s+\S+)*|[A-Za-z_][A-Za-z0-9_]*=\S*)\s+)*(?:npx(?:\s+--no-install)?\s+tsx|node|bash)\s+((?:packages\/[\w.-]+\/)?scripts\/[\w./-]+)/g;
-const NPM_RUN = /\bnpm run (\S+)((?:\s+--workspace\s+\S+)?)/g;
+/** What may precede a run at command position: sudo, env (-u NAME, NAME=value, emptied quotes) and
+ * NAME=value assignments. Text after `echo`, inside quotes or in a comment is never a run. */
+const PREFIX = String.raw`(?:^|[;&|(])\s*(?:sudo\s+)?(?:(?:env(?:\s+(?:-u\s+\S+|''|[A-Za-z_][A-Za-z0-9_]*=\S*))*|[A-Za-z_][A-Za-z0-9_]*=\S*|'')\s+)*`;
+const SCRIPT_RUN = new RegExp(
+  `${PREFIX}(?:npx(?:\\s+--no-install)?\\s+tsx|tsx|node|bash)\\s+((?:packages\\/[\\w.-]+\\/)?scripts\\/[\\w./-]+)`, "g");
+const NPM_RUN = new RegExp(`${PREFIX}npm run (\\S+)((?:\\s+--workspace\\s+\\S+)?)`, "g");
+
+/** Shell text → command lines: continuations joined, quoted text and comments dropped. */
+export function shellCommands(text: string): string[] {
+  return text.replace(/\\\n/g, " ").split("\n")
+    .map((raw) => raw.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, "''").replace(/(^|\s)#.*$/, "$1"));
+}
 
 /** Command lines of a shell function body: continuations joined, heredocs skipped, quoted text
  * and comments dropped, so a message or a file-presence test naming a gate is not a run. */
@@ -93,16 +103,27 @@ export function workflowRuns(yml: string): string {
   return runs.join("\n");
 }
 
-/** `run:` text of the workflows, `npm run x` expanded through package.json (cycle-safe). */
-export function ciText(workflows: Record<string, string>, pkgScripts: Record<string, string>): Record<string, string> {
-  const expand = (text: string, seen: Set<string>): string =>
-    text.replace(/\bnpm run (\S+)/g, (whole, name: string) => {
-      const body = pkgScripts[name];
-      if (body === undefined || seen.has(name)) return whole;
-      return `${whole} ${expand(body, new Set([...seen, name]))}`;
-    });
-  const out: Record<string, string> = {};
-  for (const [file, yml] of Object.entries(workflows)) out[file] = expand(workflowRuns(yml), new Set());
+/** What each workflow's `run:` steps execute, `npm run x` followed through package.json
+ * (cycle-safe) with the same command-position rule. */
+export function ciRuns(workflows: Record<string, string>, pkgScripts: Record<string, string>):
+  Record<string, { scripts: Set<string>; npm: Set<string> }> {
+  const out: Record<string, { scripts: Set<string>; npm: Set<string> }> = {};
+  for (const [file, yml] of Object.entries(workflows)) {
+    const scripts = new Set<string>();
+    const npm = new Set<string>();
+    const visit = (text: string, seen: Set<string>): void => {
+      const r = runsIn(shellCommands(text));
+      for (const x of r.scripts) scripts.add(x);
+      for (const x of r.npm) {
+        npm.add(x);
+        const name = x.split(" ")[2]!;
+        const body = pkgScripts[name];
+        if (body !== undefined && !x.includes("--workspace") && !seen.has(name)) visit(body, new Set([...seen, name]));
+      }
+    };
+    visit(workflowRuns(yml), new Set());
+    out[file] = { scripts, npm };
+  }
   return out;
 }
 
@@ -134,7 +155,7 @@ export function check(input: {
     if (!byKey.has(c)) problems.push({ kind: "train-not-in-manifest", message: `build_master_release runs \`${c}\`, which is not in the gate manifest` });
   }
   // manifest → train, manifest → CI
-  const ci = ciText(workflows, pkgScripts);
+  const ci = ciRuns(workflows, pkgScripts);
   for (const gate of manifest.gates) {
     const key = gate.script ?? gate.command;
     if (!key) continue;
@@ -146,10 +167,10 @@ export function check(input: {
       problems.push({ kind: "manifest-not-in-train", message: `${gate.id}: the ${stage} stage no longer runs ${key}` });
     }
     if (gate.ci) {
-      const text = ci[gate.ci];
-      if (text === undefined) {
+      const runs = ci[gate.ci];
+      if (runs === undefined) {
         problems.push({ kind: "ci-missing", message: `${gate.id}: workflow ${gate.ci} does not exist` });
-      } else if (!text.includes(key)) {
+      } else if (!(gate.script ? runs.scripts.has(key) : runs.npm.has(key))) {
         problems.push({ kind: "ci-missing", message: `${gate.id}: ${gate.ci} does not run ${key}` });
       }
     } else if (!gate.ciExempt || gate.ciExempt.trim().length < 20) {
