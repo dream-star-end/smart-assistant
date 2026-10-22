@@ -44,7 +44,7 @@
   1. 样本先在本地校验：mp3 / m4a / wav（看魔数），≤ 20 MB；时长 10 s–5 min 交给上游校验。
   2. `POST /v1/files/upload`（multipart，`purpose=voice_clone`）拿到 `file_id`。
   3. `POST /v1/voice_clone`，带 `{ file_id, voice_id, need_noise_reduction: true, need_volume_normalization: true }`。可选带 `text` 和 `model=speech-2.8-turbo` 生成试听，试听按 TTS 价另计。
-  4. 上游返回 `input_sensitive.type != 0` 时视为失败：不登记音色，也不扣费。
+  4. 上游返回 `input_sensitive === true`，或顶层 `input_sensitive_type` 不为 0 时，视为被审核拒绝：音色行记为 `failed`，不扣费（Codex plan r1 P1-1：官方响应是布尔值 `input_sensitive` 加顶层 `input_sensitive_type`）。
 - **授权（D7）**：`consent` 必须是 `{ statement: 'self_or_authorized', acceptedAt: ISO }`，否则直接 400，不调上游。授权内容随音色一起落库。
 - 计费：设计和克隆都按 `calculateMiniMaxVoiceDesignCost`（990，D6d），**在上游成功之后**经 `settleMiniMaxMediaSuccess` 扣费，operation 分别是 `voice_design` 和 `voice_clone`，`requestId` 保证幂等。设计时的试听按 TTS 价并入同一次结算，记在 units 里。MiniMax 那边要等音色首次用于合成才收费；我们在创建成功时就收，这是我们的定价口径，不影响和上游对账，因为我们的成本是固定订阅费。
 - 7 天规则：克隆或设计出的音色如果 7 天内没有正式用于合成，会被 MiniMax 删除。所以创建成功后，编排器会紧接着用它合成第一句台词。表里记 `last_used_at`；超过 7 天没用的音色标为 `maybe_expired`，下次使用时如果上游报错，就提示“音色已过期，请重新创建”。
@@ -57,6 +57,9 @@
 CREATE TABLE minimax_voices (
   id BIGSERIAL PRIMARY KEY,
   user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  request_id TEXT NOT NULL,          -- 调用方幂等键（编排器的 take id）
+  params_sha256 TEXT NOT NULL,       -- kind + prompt/preview/样本摘要；同一 request_id 换参数 → 409
+  status TEXT NOT NULL CHECK (status IN ('pending','active','failed')),
   voice_id TEXT NOT NULL UNIQUE,
   kind TEXT NOT NULL CHECK (kind IN ('design','clone')),
   label TEXT NOT NULL DEFAULT '',
@@ -65,12 +68,21 @@ CREATE TABLE minimax_voices (
   usage_id BIGINT REFERENCES minimax_media_usage_records(id),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   last_used_at TIMESTAMPTZ,
-  deleted_at TIMESTAMPTZ
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  deleted_at TIMESTAMPTZ,
+  UNIQUE (user_id, request_id)
 );
 CREATE INDEX idx_minimax_voices_user ON minimax_voices(user_id, created_at DESC);
 ```
 
-  在 `retentionRegistry` 登记：`deleted_at` 超过 30 天的行清理。用户注销时级联删除。
+- **创建幂等**（Codex plan r1 P1-2）：调上游**之前**，先以 `(user_id, request_id)` 插入一行 `pending`，同时写入生成好的 `voice_id` 和 `params_sha256`。同一 `request_id` 再次进来时：
+  - `active`：直接返回原来的 `voice_id`，结算按 replay 处理，不重复扣费，也不再调上游；
+  - `pending` 且 15 分钟内有更新：返回 409 `VOICE_CREATE_IN_PROGRESS`；
+  - `pending` 超过 15 分钟（进程崩溃）或 `failed`：换一个新的 `voice_id`，把行重置为 `pending` 后重试。旧 `voice_id` 在上游即使已经建成，也没人用，7 天后会被 MiniMax 自动删除，而且从未向用户收费；
+  - `params_sha256` 不一致：返回 409 `REQUEST_ID_REUSED`，不调上游。
+  上游成功并结算后 → `active`，写 `usage_id`；上游失败或审核拒绝 → `failed`。归属校验只认 `active` 状态的行。
+
+  在 `retentionRegistry` 的 durable 清单登记：这是用户自有的配置，随用户删除级联清除，不做按时间的清理。
 - speech 的音色校验（容器代理和 master 客户端共用）：`voice_id` 必须满足以下之一：
   - 在系统音色缓存里；
   - 是 `minimax_voices` 里属于本人、且 `deleted_at IS NULL` 的音色。
