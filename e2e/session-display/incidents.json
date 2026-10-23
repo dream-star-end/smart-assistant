@@ -8124,39 +8124,48 @@
         },
         {
           "layer": "unit",
-          "path": "claude-code-best/src/utils/__tests__/sessionFileIo.test.ts"
+          "path": "claude-code-best/src/utils/__tests__/sessionFileIo.test.ts",
+          "assertion": "inherited FD keeps the actual transcript inode locked after the acquire child exits"
         },
         {
           "layer": "unit",
-          "path": "claude-code-best/src/utils/__tests__/nativeTranscriptRecovery.test.ts"
+          "path": "claude-code-best/src/utils/__tests__/nativeTranscriptRecovery.test.ts",
+          "assertion": "proves every interleaved byte, preserves all values/signatures/metadata, and changes only ordering"
         },
         {
           "layer": "unit",
-          "path": "claude-code-best/src/utils/__tests__/sessionTranscriptReader.test.ts"
+          "path": "claude-code-best/src/utils/__tests__/sessionTranscriptReader.test.ts",
+          "assertion": "Snip can remove its own source and a large parent bridge without losing the retained chain"
         },
         {
           "layer": "unit",
-          "path": "claude-code-best/src/utils/__tests__/sessionTranscriptQueue.test.ts"
+          "path": "claude-code-best/src/utils/__tests__/sessionTranscriptQueue.test.ts",
+          "assertion": "producer admission, queue backpressure, metadata and tombstones all commit before terminal flush"
         },
         {
           "layer": "integration",
-          "path": "packages/commercial/src/__tests__/ccbNativeRestoreArchive.integ.test.ts"
+          "path": "packages/commercial/src/__tests__/ccbNativeRestoreArchive.integ.test.ts",
+          "assertion": "raw restore validates tenant authority, batched bytes, deferred input and administrative recovery without touching shared tables"
         },
         {
           "layer": "unit",
-          "path": "packages/commercial/src/__tests__/internalCcbTranscriptRestore.test.ts"
+          "path": "packages/commercial/src/__tests__/internalCcbTranscriptRestore.test.ts",
+          "assertion": "restore uses real host/IP and bearer identity and never a caller-supplied UID"
         },
         {
           "layer": "unit",
-          "path": "packages/gateway/src/__tests__/subprocessRunnerTranscriptRestore.test.ts"
+          "path": "packages/gateway/src/__tests__/subprocessRunnerTranscriptRestore.test.ts",
+          "assertion": "an old start delayed before learning context cannot close the new generation socket"
         },
         {
           "layer": "unit",
-          "path": "packages/gateway/src/__tests__/ccbTranscriptRestore.test.ts"
+          "path": "packages/gateway/src/__tests__/ccbTranscriptRestore.test.ts",
+          "assertion": "a private restore socket forwards only its fixed authority and preserves byte framing"
         },
         {
           "layer": "unit",
-          "path": "packages/commercial/src/http/proxy/boxImageIdentity.test.ts"
+          "path": "packages/commercial/src/http/proxy/boxImageIdentity.test.ts",
+          "assertion": "private image evidence binds all 91 byte owners, preserves multiplicity and never contains raw metadata"
         }
       ],
       "coverageCommits": [
