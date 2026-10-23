@@ -47,12 +47,9 @@ composing → done / failed（A2-1c）
 | kind | payload | 幂等键 | 执行 |
 |---|---|---|---|
 | `plan` | `{}` | `plan:<project>:<rev>` | Plan 步骤（§5），结果先写 `studio_step_results(request_id = exec_request_id)`，再在一个事务里落库 shots / lines / assets |
-| `gen.bible` | `{assetId}` | `gen.bible:<asset>:<n>` | registry `image.generate` |
-| `gen.frame` | `{shotId}` | `gen.frame:<shot>:<n>` | registry `image.generate`，参考 bible 图 |
-| `gen.video` | `{shotId, frameTakeId}` | `gen.video:<shot>:<n>` | registry `video.from_image`（`affinity()='muse'` 时入队带亲和）|
-| `gen.line` | `{lineId}` | `gen.line:<line>:<n>` | registry `voice.tts` |
+| `gen`（所有生成共用一个 kind，plan r3 P1）| `{takeId, providerId, ownerKind: bible\|shot_frame\|shot_video\|line, ownerId, request, booked}` | `gen:<ownerKind>:<ownerId>:v<take version>` | 按 `ownerKind` 调用注册表：bible / shot_frame → `image.generate`（首帧带 bible 参考图），shot_video → `video.from_image`（`affinity()='muse'` 时入队带亲和），line → `voice.tts` |
 | `qa.*` / `interpret` / `compose` | — | — | A2-1b / A2-1c |
-- `<n>` 是该对象的第 n 次尝试（重拍时递增），所以重拍是新任务、新 `exec_request_id`，而同一次尝试的重领是同一个任务。
+- 幂等键里的 `v<take version>` 是派发时为该对象新建的 take 版本（重拍时递增），所以重拍是新任务、新 `exec_request_id`，而同一次尝试的重领是同一个任务。增量对账器按 `kind = 'gen'` 扫描，覆盖全部生成任务。
 - **take 在派发时创建并绑定（plan r1 P1-2）**：`advanceProject` 在同一个事务里先插入 `studio_takes(status='queued', version = 该对象当前最大 version + 1)`（锁住对象行后再算 max，避免并发派发撞号），再 `enqueueStudioTask(payload: {..., takeId})`。执行器只按 `payload.takeId` 更新这一行（`queued → running → succeeded|failed`），重领读同一个 takeId，绝不再新建 take；所以一个任务恰好对应一个 take。完成后写 blob（`StudioBlobStore.put`，ref = take）、`status='succeeded'`、`cost_credits`、`provider_ref`。
 - `MediaProviderError.retryable = true` → `retryStudioTask`，指数退避 30 秒起、最多 3 次；不可重试或次数用尽 → take `failed` + `error_code`，然后按 `registry.candidates(kind, op, user, {exclude: 已失败的实例, includeOffline: true})` 换下一个候选重新入队（新的 `<n>`）；没有候选 → 对象 `needs_user`（镜头）或 `failed`（台词），项目转 `awaiting_user`。
 - `IMAGE_DAILY_LIMIT`（Image 2 每用户每日 10 张）：不可重试 → 自动换 Muse 图片；都不可用 → needs_user，并在事件里说明原因。
