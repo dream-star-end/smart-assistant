@@ -1,4 +1,4 @@
-# Selfhost egress and watch logs only. Not installed by the release train.
+# Selfhost egress and watch logs only. Installed by the release train.
 # maxsize is checked when logrotate runs, not a realtime cap.
 # copytruncate keeps the live inode; bytes written between copy and
 # truncate can be dropped. This is not a lossless audit log.

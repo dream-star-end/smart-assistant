@@ -110,6 +110,10 @@ describe("resolveIntelligentUiSlot", () => {
   });
 });
 
+const guideRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../agent-sandbox/platform-runtime/prompts/system-assistant/references");
+const CORE_UI_PROTOCOL = readFileSync(resolve(guideRoot, "ui.md"), "utf8");
+const PREDICTION_PROTOCOL = readFileSync(resolve(guideRoot, "input-prediction.md"), "utf8");
+
 describe("协议文案", () => {
   test("覆盖前端支持的全部组件类型,且只写前端认识的类型", () => {
     const here = dirname(fileURLToPath(import.meta.url));
@@ -128,15 +132,15 @@ describe("协议文案", () => {
     const frontendOnly = new Set(["sources"]);
     for (const t of types) {
       if (frontendOnly.has(t)) continue;
-      assert.match(INTELLIGENT_UI_PROMPT, new RegExp(`"type":"${t}"`), t);
+      assert.match(CORE_UI_PROTOCOL, new RegExp(`"type":"${t}"`), t);
     }
-    for (const t of [...cliOnly, ...frontendOnly]) assert.doesNotMatch(INTELLIGENT_UI_PROMPT, new RegExp(`"type":"${t}"`), t);
-    const advertised = [...INTELLIGENT_UI_PROMPT.matchAll(/"type":"([a-z_]+)"/g)].map((m) => m[1]!);
+    for (const t of [...cliOnly, ...frontendOnly]) assert.doesNotMatch(CORE_UI_PROTOCOL, new RegExp(`"type":"${t}"`), t);
+    const advertised = [...CORE_UI_PROTOCOL.matchAll(/"type":"([a-z_]+)"/g)].map((m) => m[1]!);
     for (const t of advertised) assert.ok(types.includes(t), `prompt advertises unknown type ${t}`);
   });
 
   test("示例块本身是合法 JSON:分段里放计算器(带曲线与占比)", () => {
-    const m = /```ui\n(.+)\n```/.exec(INTELLIGENT_UI_PROMPT);
+    const m = /```ui\n(.+)\n```/.exec(CORE_UI_PROTOCOL);
     assert.ok(m);
     const v = JSON.parse(m![1]!) as { type: string; tabs: { block: { type: string; chart?: unknown; breakdown?: unknown } }[] };
     assert.equal(v.type, "tabs");
@@ -150,38 +154,43 @@ describe("协议文案", () => {
     const icons = /const ICON_SOURCES = \{([\s\S]*?)\} as const/.exec(source)?.[1] ?? "";
     const known = new Set([...icons.matchAll(/^\s*"?([a-z-]+)"?:/gm)].map((x) => x[1]!));
     assert.ok(known.size >= 40, `parsed icons: ${known.size}`);
-    const line = /icon 可选:([^\n。]+)/.exec(INTELLIGENT_UI_PROMPT)?.[1] ?? "";
+    const line = /icon 可选:([^\n。]+)/.exec(CORE_UI_PROTOCOL)?.[1] ?? "";
     const advertised = line.trim().split(/\s+/);
     assert.ok(advertised.length >= 40);
     for (const name of advertised) assert.ok(known.has(name), `prompt advertises unknown icon ${name}`);
   });
 
   test("测验类走 quiz 组件:组件能做的事不改用 htmlpreview(平台 htmlpreview 段落同样这样写,OCV5-382)", () => {
-    assert.match(INTELLIGENT_UI_PROMPT, /测验、知识问答[^\n]*一律用 ui 组件[^\n]*不要为它们另做 htmlpreview/);
-    assert.doesNotMatch(INTELLIGENT_UI_PROMPT, /以本段为准/);
-    assert.match(INTELLIGENT_UI_PROMPT, /- quiz:[^\n]*出题考考大家/);
-    assert.doesNotMatch(INTELLIGENT_UI_PROMPT, /小工具或小游戏用/);
+    assert.match(CORE_UI_PROTOCOL, /测验、知识问答[^\n]*一律用 ui 组件[^\n]*不要为它们另做 htmlpreview/);
+    assert.doesNotMatch(CORE_UI_PROTOCOL, /以本段为准/);
+    assert.match(CORE_UI_PROTOCOL, /- quiz:[^\n]*出题考考大家/);
+    assert.doesNotMatch(CORE_UI_PROTOCOL, /小工具或小游戏用/);
   });
   test("第三轮:来源只用真实链接、成稿与大纲的用法写明、表格说明筛选与下载", () => {
-    assert.match(INTELLIGENT_UI_PROMPT, /普通 Markdown 写参考来源[^\n]*不要用 ui 组件[^\n]*本轮工具真实返回或用户给出[^\n]*绝不编造链接/);
-    assert.match(INTELLIGENT_UI_PROMPT, /- draft:[^\n]*original[^\n]*修改对比/);
-    assert.match(INTELLIGENT_UI_PROMPT, /层级结构\(大纲、思维导图、组织架构\)用 outline/);
-    assert.match(INTELLIGENT_UI_PROMPT, /- table:[^\n]*可下载 CSV,行多时可筛选/);
+    assert.match(CORE_UI_PROTOCOL, /普通 Markdown 写参考来源[^\n]*不要用 ui 组件[^\n]*本轮工具真实返回或用户给出[^\n]*绝不编造链接/);
+    assert.match(CORE_UI_PROTOCOL, /- draft:[^\n]*original[^\n]*修改对比/);
+    assert.match(CORE_UI_PROTOCOL, /层级结构\(大纲、思维导图、组织架构\)用 outline/);
+    assert.match(CORE_UI_PROTOCOL, /- table:[^\n]*可下载 CSV,行多时可筛选/);
   });
   test("文字里的引号写成「」或“”(canary 里 deepseek 把英文双引号直接写进 JSON 字符串)", () => {
-    assert.match(INTELLIGENT_UI_PROMPT, /合法 JSON 对象\([^)\n]*引号用「」或“”,不要用英文双引号\)/);
+    assert.match(CORE_UI_PROTOCOL, /合法 JSON 对象\([^)\n]*引号用「」或“”,不要用英文双引号\)/);
   });
 
-  test("体积受控(系统提示每轮都带;第二轮组件补齐后上限 9KB)", () => {
-    assert.ok(Buffer.byteLength(INTELLIGENT_UI_PROMPT, "utf8") < 9_000, String(Buffer.byteLength(INTELLIGENT_UI_PROMPT, "utf8")));
+  test("常驻只有加载入口，完整协议按需提供且索引不内联schema", () => {
+    assert.match(INTELLIGENT_UI_PROMPT, /oc-system skill ui/);
+    assert.match(INPUT_PREDICTION_PROMPT, /oc-system skill input-prediction/);
+    for (const index of [INTELLIGENT_UI_PROMPT, INPUT_PREDICTION_PROMPT]) {
+      assert.doesNotMatch(index, /"type"\s*:|```ui|\"columns\"|\"formula\"/);
+    }
+    assert.ok(Buffer.byteLength(INTELLIGENT_UI_PROMPT) < Buffer.byteLength(CORE_UI_PROTOCOL));
   });
 
-  test("输入预测:示例块是合法 JSON、类型 next、要求放在最后;体积小(每轮都带)", () => {
-    const m = /```ui\n(\{[^\n]*\})\n```/.exec(INPUT_PREDICTION_PROMPT);
+  test("输入预测:示例块是合法 JSON、类型 next、要求放在最后;完整正文按需加载", () => {
+    const m = /```ui\n(\{[^\n]*\})\n```/.exec(PREDICTION_PROTOCOL);
     assert.ok(m);
     assert.equal((JSON.parse(m[1]!) as { type: string }).type, "next");
-    assert.match(INPUT_PREDICTION_PROMPT, /最后一个块/);
-    assert.match(INPUT_PREDICTION_PROMPT, /不是你的建议/);
-    assert.ok(Buffer.byteLength(INPUT_PREDICTION_PROMPT, "utf8") < 1_500, String(Buffer.byteLength(INPUT_PREDICTION_PROMPT, "utf8")));
+    assert.match(PREDICTION_PROTOCOL, /最后一个块/);
+    assert.match(PREDICTION_PROTOCOL, /不是你的建议/);
+    assert.ok(PREDICTION_PROTOCOL.trim().length > 0);
   });
 });

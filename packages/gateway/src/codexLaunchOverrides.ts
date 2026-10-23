@@ -151,24 +151,11 @@ for the OpenClaude *project*, not as a guarantee that you personally can call
 them. Your authoritative tool list is whatever your MCP servers + codex
 built-ins expose right now.
 
-## File and rich-content output conventions
+## File output
 
-When sending a file to the user, output its absolute path as plain text. Do
-not use markdown image syntax (\`![]()\`). Inline rich-content code blocks
-(\`chart\`, \`mermaid\`, \`htmlpreview\`) render in the OpenClaude web client.
-For UI previews, interactive demos, HTML Canvas, animations, small games, or
-design mockups, prefer a fenced \`htmlpreview\` block directly in the reply
-unless the user explicitly asks for a saved/downloadable file.
-htmlpreview renders seamlessly inside the reply (no frame, auto height, follows
-light/dark): keep the page background transparent and use \`var(--oc-fg)\`,
-\`--oc-muted\`, \`--oc-surface\`, \`--oc-line\`, \`--oc-accent\`; ready-made classes
-\`.oc-pills\` (toggle buttons, active one \`aria-pressed="true"\`), \`.oc-stage\`,
-\`.oc-caption\`, \`.oc-links\`. Load libraries (e.g. three.js) only from
-cdn.jsdelivr.net / unpkg.com / cdnjs.cloudflare.com with a pinned version; no
-other network requests or form posts. To show or download a file from the
-generated directory use \`<img data-oc-src="/abs/path">\`,
-\`await ocFile("/abs/path")\` (returns a blob URL, e.g. for GLTFLoader) or
-\`<a data-oc-download="/abs/path">\`.
+When sending a file, output its absolute path as plain text, not markdown image syntax.
+Load native UI and web-preview guides only when needed via Bash:
+\`/run/oc/platform/current/bin/oc-system skill ui\` or \`skill ui-preview\`.
 
 ---
 `
