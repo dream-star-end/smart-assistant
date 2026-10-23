@@ -79,7 +79,6 @@ function transport(opts: {
       calls.text += 1
       if (opts.textFails) throw new ModerationCallError('TEXT_HTTP', 'text status 503')
       return {
-        text: '',
         structured: { violation: NO, ad: NO, leak: NO, low_quality: NO, addresses_moderator: NO, ...opts.text },
         inputTokens: 800,
         outputTokens: 60,
@@ -212,7 +211,7 @@ describe('经验分享 AI 审核 worker', () => {
     await runOnce(transport({}))
     assert.deepEqual([(await post(id)).status, (await post(id)).needs_human], ['pending', true])
     const row = await query<{ verdict: string; injection: boolean }>(
-      `SELECT verdict, injection FROM community_tutorial_moderations WHERE publication_id = $1::bigint`,
+      'SELECT verdict, injection FROM community_tutorial_moderations WHERE publication_id = $1::bigint',
       [id],
     )
     assert.deepEqual(row.rows, [{ verdict: 'uncertain', injection: true }])

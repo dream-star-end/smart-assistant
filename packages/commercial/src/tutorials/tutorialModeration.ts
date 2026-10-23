@@ -298,9 +298,8 @@ export function yesScore(answer: DimensionAnswer): number | null {
 
 export type ModerationTransport = {
   text: (args: { system: string; user: string }) => Promise<{
-    text: string
-    /** 强制工具调用拿到的结构化结果（有就优先用它，没有再从 text 里解析）。 */
-    structured?: unknown
+    /** 强制工具调用 record_moderation 的 input；没有工具调用时为 undefined（整篇转人工）。 */
+    structured: unknown
     inputTokens: number
     outputTokens: number
   }>
@@ -357,19 +356,13 @@ export function platformModerationTransport(goKey?: string): ModerationTransport
         throw new ModerationCallError('TEXT_HTTP', `text status ${res.status}`)
       }
       const json = (await res.json().catch(() => null)) as {
-        content?: Array<{ type?: string; text?: string; name?: string; input?: unknown }>
+        content?: Array<{ type?: string; name?: string; input?: unknown }>
         usage?: { input_tokens?: number; output_tokens?: number }
       } | null
-      const text = (json?.content ?? [])
-        .filter((part) => part?.type === 'text' && typeof part.text === 'string')
-        .map((part) => part.text)
-        .join('\n')
-        .trim()
       const structured = (json?.content ?? []).find(
         (part) => part?.type === 'tool_use' && part.name === TEXT_TOOL_NAME,
       )?.input
       return {
-        text,
         structured,
         inputTokens: Number(json?.usage?.input_tokens ?? 0) || 0,
         outputTokens: Number(json?.usage?.output_tokens ?? 0) || 0,
@@ -431,24 +424,16 @@ function fenceUntrusted(value: string): string {
   return value.replaceAll('<<<', '‹‹‹').replaceAll('>>>', '›››')
 }
 
-function firstJsonObject(text: string): unknown {
-  const start = text.indexOf('{')
-  const end = text.lastIndexOf('}')
-  if (start < 0 || end <= start) return null
-  try {
-    return JSON.parse(text.slice(start, end + 1))
-  } catch {
-    return null
-  }
-}
-
 /**
  * 严格解析各问：缺字段、answer 不是 yes/no、confidence 越界 → 该问为空（转人工）。
- * 优先用工具调用的结构化结果；拿不到再从文本里找 JSON（上游不支持强制工具时）。
+ * 只认强制工具调用的结构化结果。回复正文里的 JSON 一律不算：它可能是模型在复述稿件里的
+ * 「示例结论」，拿不到工具结果就全部为空（Codex R1 P1）。
  */
-export function parseTextVerdict(text: string, structured?: unknown): TextVerdict {
-  const root = structured && typeof structured === 'object' ? structured : firstJsonObject(text)
-  const record = root && typeof root === 'object' && !Array.isArray(root) ? (root as Record<string, unknown>) : {}
+export function parseTextVerdict(structured: unknown): TextVerdict {
+  const record =
+    structured && typeof structured === 'object' && !Array.isArray(structured)
+      ? (structured as Record<string, unknown>)
+      : {}
   return Object.fromEntries(
     TEXT_QUESTIONS.map((dim) => {
       const raw = record[dim]
@@ -488,7 +473,7 @@ export async function evaluateTutorialText(
     })
     inputTokens += res.inputTokens
     outputTokens += res.outputTokens
-    const verdict = parseTextVerdict(res.text, res.structured)
+    const verdict = parseTextVerdict(res.structured)
     for (const dim of TEXT_QUESTIONS) {
       const answer = verdict[dim]
       const current = merged[dim]
@@ -536,15 +521,15 @@ const VISION_FORMAT = {
   },
 }
 
-/** 严格解析视觉结论：字段缺失或越界一律 null（转人工）。 */
+/**
+ * 严格解析视觉结论：strict json_schema 下整段输出就是一个 JSON 对象；不是（夹了文字、代码围栏）
+ * 或字段缺失、越界一律 null（转人工）。不从文字里截取 JSON，理由同 parseTextVerdict。
+ */
 export function parseVisionVerdict(text: string, sha256: string): ImageVerdict {
   const empty: ImageVerdict = { sha256, violation: null, ad: null, leak: null, addressesModerator: null, confidence: null }
-  const start = text.indexOf('{')
-  const end = text.lastIndexOf('}')
-  if (start < 0 || end <= start) return empty
   let parsed: unknown
   try {
-    parsed = JSON.parse(text.slice(start, end + 1))
+    parsed = JSON.parse(text.trim())
   } catch {
     return empty
   }
