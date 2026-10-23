@@ -1,0 +1,493 @@
+/**
+ * OCV5-591 A2-1b-2 integ: annotations end to end on the real schema — API → interpret task (fake
+ * Grok, fake sandbox for the marked frame) → one-time execution → settle.
+ *   - a sure instruction on an autonomous, finished project runs at once and reopens it
+ *   - otherwise it waits; two applies dispatch once; reject is refused while it runs
+ *   - a voice swap dispatches every line under its own key (plan r2 P1)
+ *   - an instruction outside the whitelist never runs; the annotation can be sent again
+ *   - a running execution is applied when its target is ready on a new version
+ *   - a budget that cannot cover it leaves nothing behind and records the failure
+ *   - another user's annotation is 404
+ */
+import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
+import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import path from 'node:path'
+import { after, before, beforeEach, describe, test } from 'node:test'
+
+import sharp from 'sharp'
+
+import { closePool, createPool, getPool, resetPool, setPoolOverride } from '../db/index.js'
+import { runMigrations } from '../db/migrate.js'
+import { query } from '../db/queries.js'
+import type { GrokRunInput, GrokRunner } from '../grok/visionProxy.js'
+import { StudioBlobStore } from '../media-studio/blobs.js'
+import type { ComposeResult } from '../media-studio/compose/runner.js'
+import type { ComposeOp } from '../media-studio/compose/spec.js'
+import { type AdvanceDeps, advanceProject } from '../media-studio/orchestrator/advance.js'
+import type { ComposeRunnerLike } from '../media-studio/orchestrator/compose.js'
+import { type ExecuteDeps, executeTask } from '../media-studio/orchestrator/execute.js'
+import { makeOrchestratorApi } from '../media-studio/orchestrator/service.js'
+import type { ProviderRegistry } from '../media-studio/providers/registry.js'
+import type { MediaKind, MediaOp, MediaProvider } from '../media-studio/providers/types.js'
+import { claimStudioTasks } from '../media-studio/queue.js'
+import { StudioStore } from '../media-studio/store.js'
+import { resetTestSchemaForTest } from './helpers/db.js'
+
+const TEST_DB_URL =
+  process.env.TEST_DATABASE_URL ?? 'postgres://test:test@127.0.0.1:55432/openclaude_test'
+const REQUIRE_TEST_DB = process.env.CI === 'true' || process.env.REQUIRE_TEST_DB === '1'
+let pgAvailable = false
+
+async function probe(): Promise<boolean> {
+  const p = createPool({ connectionString: TEST_DB_URL, max: 2, connectionTimeoutMillis: 1500 })
+  try {
+    await p.query('SELECT 1')
+    await p.end()
+    return true
+  } catch {
+    try {
+      await p.end()
+    } catch {
+      /* ignore */
+    }
+    return false
+  }
+}
+
+before(async () => {
+  pgAvailable = await probe()
+  if (!pgAvailable) {
+    if (REQUIRE_TEST_DB) throw new Error(`test Postgres unavailable at ${TEST_DB_URL}`)
+    return
+  }
+  await resetPool()
+  setPoolOverride(createPool({ connectionString: TEST_DB_URL, max: 8 }))
+  await resetTestSchemaForTest()
+  await runMigrations()
+})
+
+after(async () => {
+  if (pgAvailable) {
+    try {
+      await resetTestSchemaForTest()
+    } catch {
+      /* ignore */
+    }
+    await closePool()
+  }
+})
+
+beforeEach(async () => {
+  if (!pgAvailable) return
+  await query(
+    'TRUNCATE TABLE studio_projects, studio_blob_refs, studio_blobs, studio_quota, studio_quota_holds, studio_step_results, users RESTART IDENTITY CASCADE',
+  )
+})
+
+const skip = (t: { skip: (m: string) => void }) => {
+  if (!pgAvailable) {
+    t.skip('no Postgres test fixture')
+    return true
+  }
+  return false
+}
+
+/** Dispatch-only providers (the tests never run a generation; they look at what was queued). */
+function provider(id: string, kind: MediaKind, ops: MediaOp[]): MediaProvider {
+  return {
+    id,
+    kind,
+    adapter: 'fake',
+    label: id,
+    priority: 0,
+    models: () => [{ id: `${id}-m`, label: 'm', ops, isDefault: true }],
+    status: () => ({ state: 'ready' as const }),
+    estimateMaxCost: () => 10n,
+    affinity: () => null,
+    chargedFor: async () => 0n,
+    run: async () => {
+      throw new Error('not run in these tests')
+    },
+  } as unknown as MediaProvider
+}
+const PROVIDERS = [
+  provider('img', 'image', ['image.generate', 'image.edit']),
+  provider('vid', 'video', ['video.from_image']),
+  provider('tts', 'voice', ['voice.tts']),
+]
+const registry: ProviderRegistry = {
+  list: () => PROVIDERS,
+  get: (id) => PROVIDERS.find((p) => p.id === id),
+  candidates: (kind, op) =>
+    PROVIDERS.filter(
+      (p) => p.kind === kind && p.models().some((m) => (m.ops as string[]).includes(op)),
+    ),
+  describe: () => ({ kinds: [] }),
+}
+
+class FakeGrok {
+  calls: GrokRunInput[] = []
+  answers: string[] = []
+  run: GrokRunner = async (input) => {
+    this.calls.push(input)
+    const text = this.answers.shift() ?? '{"op":null,"confidence":0.2,"explanation":"?"}'
+    await input.onResult?.({
+      text,
+      usage: {} as never,
+      model: 'grok-build',
+      requestId: input.requestId,
+    })
+    return { text, model: 'grok-build', usage: {} as never, requestId: input.requestId }
+  }
+}
+
+const png = (r: number) =>
+  sharp({ create: { width: 320, height: 180, channels: 3, background: { r, g: 90, b: 140 } } })
+    .png()
+    .toBuffer()
+
+class FakeRunner implements ComposeRunnerLike {
+  constructor(private readonly root: string) {}
+  configured() {
+    return true
+  }
+  async prepare(jobId: string) {
+    const inDir = path.join(this.root, jobId, 'in')
+    await mkdir(inDir, { recursive: true })
+    await mkdir(path.join(this.root, jobId, 'out'), { recursive: true })
+    return { inDir, outDir: path.join(this.root, jobId, 'out') }
+  }
+  async run(jobId: string, op: ComposeOp): Promise<ComposeResult> {
+    if (op.op !== 'frames') throw new Error(`unexpected ${op.op}`)
+    const p = path.join(this.root, jobId, 'out', 'frame-0.png')
+    const b = await png(120)
+    await writeFile(p, b)
+    return { outputs: [{ name: 'frame-0.png', path: p, bytes: b.length }] }
+  }
+  async cleanup() {}
+}
+
+async function setup(
+  opts: { autonomy?: 'max' | 'confirm'; status?: string; budget?: number } = {},
+) {
+  const root = await mkdtemp(path.join(tmpdir(), 'oc-annot-'))
+  const blobs = new StudioBlobStore({
+    pool: getPool(),
+    root: path.join(root, 'blobs'),
+    freeBytes: async () => 100n * 1024n ** 3n,
+  })
+  const grok = new FakeGrok()
+  const runner = new FakeRunner(path.join(root, 'work'))
+  const voices = [{ voiceId: 'female-shaonv', name: '少女', description: [] as string[] }]
+  const exec: ExecuteDeps = {
+    pool: getPool(),
+    blobs,
+    providers: registry,
+    grok: grok.run,
+    systemVoices: async () => voices,
+    compose: runner,
+  }
+  const advanceDeps: AdvanceDeps = { pool: getPool(), providers: registry, compose: runner }
+  const kicked: string[] = []
+  const api = makeOrchestratorApi(getPool(), (id) => void kicked.push(id), advanceDeps).annotations
+  const uid = (
+    await query<{ id: string }>(
+      `INSERT INTO users(email, password_hash, email_verified, credits) VALUES ($1, 'x', TRUE, 1000) RETURNING id::text AS id`,
+      [`a${randomUUID().slice(0, 8)}@t.local`],
+    )
+  ).rows[0]!.id
+  const p = await new StudioStore(getPool()).createProject(uid, {
+    budgetCredits: opts.budget ?? 500,
+  })
+  await query(
+    `UPDATE studio_projects SET status = $2, autonomy = $3,
+            settings = settings || '{"musicSkippedNoted":true,"narration":{"voiceId":"male-qn-jingying"}}'::jsonb
+      WHERE id = $1`,
+    [p.id, opts.status ?? 'done', opts.autonomy ?? 'max'],
+  )
+  const take = async (
+    ownerKind: string,
+    ownerId: string,
+    version: number,
+    mime: string,
+    qa?: unknown,
+  ) => {
+    const id = randomUUID()
+    const bytes = mime.startsWith('image')
+      ? await png(version * 30)
+      : Buffer.from(`${ownerKind}-${id}`)
+    const sha = (
+      await blobs.put({
+        userId: BigInt(uid),
+        mime,
+        maxBytes: bytes.length,
+        source: bytes,
+        ref: { kind: 'take', id },
+      })
+    ).sha
+    await query(
+      `INSERT INTO studio_takes(id, project_id, owner_kind, owner_id, version, provider, model, op, status, blob_sha,
+                                cost_credits, meta, qa, inputs, finished_at)
+       VALUES ($1, $2, $3, $4, $5, 'fake', 'm', 'x', 'succeeded', $6, 0, '{"durationMs":5000}'::jsonb, $7::jsonb, $8::jsonb, NOW())`,
+      [
+        id,
+        p.id,
+        ownerKind,
+        ownerId,
+        version,
+        sha,
+        qa === undefined ? null : JSON.stringify(qa),
+        JSON.stringify({ inputs: [] }),
+      ],
+    )
+    return { id, sha }
+  }
+  const shot = randomUUID()
+  await query(
+    `INSERT INTO studio_shots(id, project_id, ordinal, spec, status) VALUES ($1, $2, 0, $3::jsonb, 'ready')`,
+    [shot, p.id, JSON.stringify({ durationSec: 5, framing: '中景', action: '狐狸奔跑' })],
+  )
+  const frame = await take('shot_frame', shot, 1, 'image/png')
+  const video = await take('shot_video', shot, 1, 'video/mp4')
+  await query('UPDATE studio_shots SET active_take_id = $2 WHERE id = $1', [shot, video.id])
+  const lines: string[] = []
+  for (const [i, text] of ['雪落下来了', '狐狸回头'].entries()) {
+    const id = randomUUID()
+    await query(
+      `INSERT INTO studio_lines(id, project_id, shot_id, ordinal, text, status) VALUES ($1, $2, $3, $4, $5, 'ready')`,
+      [id, p.id, shot, i, text],
+    )
+    const lt = await take('line', id, 1, 'audio/mpeg')
+    await query('UPDATE studio_lines SET active_take_id = $2 WHERE id = $1', [id, lt.id])
+    lines.push(id)
+  }
+  return { uid, p, grok, exec, advanceDeps, api, kicked, shot, frame, video, lines, take }
+}
+
+async function runOne(exec: ExecuteDeps) {
+  const [task] = await claimStudioTasks(getPool(), { owner: 'A', limit: 1, museOnline: false })
+  assert.ok(task, 'a due task')
+  await executeTask(exec, task, new AbortController().signal)
+  return task
+}
+const annotation = async (id: string) =>
+  (
+    await query<{
+      status: string
+      interpretation: Record<string, any> | null
+      frame: string | null
+      applied: string | null
+    }>(
+      'SELECT status, interpretation, frame_blob_sha AS frame, applied_take_id::text AS applied FROM studio_annotations WHERE id = $1',
+      [id],
+    )
+  ).rows[0]!
+const genTasks = async (projectId: string) =>
+  (
+    await query<{ key: string }>(
+      `SELECT idempotency_key AS key FROM studio_tasks WHERE project_id = $1 AND kind = 'gen' ORDER BY idempotency_key`,
+      [projectId],
+    )
+  ).rows.map((r) => r.key)
+const projectRow = async (id: string) =>
+  (
+    await query<{ status: string; reserved: string }>(
+      'SELECT status, reserved_credits::text AS reserved FROM studio_projects WHERE id = $1',
+      [id],
+    )
+  ).rows[0]!
+const sure = (op: string, args: unknown, confidence = 0.92) =>
+  JSON.stringify({ op, args, confidence, explanation: '按批注重画这个镜头' })
+
+describe('studio annotations (OCV5-591 A2-1b-2)', () => {
+  test('a sure instruction on an autonomous finished film runs at once and reopens it', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    const { id } = await s.api.create(s.uid, s.p.id, {
+      takeId: s.video.id,
+      kind: 'box',
+      tStartMs: 1200,
+      geom: { x: 0.1, y: 0.2, w: 0.3, h: 0.3 },
+      text: '尾巴应该是白色的',
+    })
+    await s.api.send(s.uid, id)
+    s.grok.answers.push(sure('regenerate_shot', { shotId: s.shot, promptDelta: '尾巴白色' }))
+    const task = await runOne(s.exec)
+    assert.equal(task.kind, 'interpret', 'interpret runs on a finished project')
+    assert.equal(s.grok.calls[0]!.billTo, 'platform')
+    assert.equal(s.grok.calls[0]!.image?.mediaType, 'image/jpeg', 'the marked frame is sent')
+    const a = await annotation(id)
+    assert.equal(a.interpretation?.op, 'regenerate_shot')
+    assert.equal(a.interpretation?.execution?.state, 'running')
+    assert.ok(a.frame, 'the marked frame is kept with the annotation')
+    assert.equal((await projectRow(s.p.id)).status, 'running')
+    assert.deepEqual(await genTasks(s.p.id), [`annot:${id}:1:shot_frame:${s.shot}:frame`])
+    const shot = (
+      await query<{ status: string; active: string | null; redo: unknown }>(
+        `SELECT status, active_take_id::text AS active, spec->'redo' AS redo FROM studio_shots WHERE id = $1`,
+        [s.shot],
+      )
+    ).rows[0]!
+    assert.deepEqual(shot, { status: 'generating', active: null, redo: { frame: 2, video: 2 } })
+  })
+
+  test('otherwise it waits; two applies dispatch once; reject is refused while it runs', async (t) => {
+    if (skip(t)) return
+    const s = await setup({ autonomy: 'confirm', status: 'awaiting_user' })
+    const { id } = await s.api.create(s.uid, s.p.id, {
+      takeId: s.frame.id,
+      kind: 'text',
+      text: '镜头再长一点',
+    })
+    await s.api.send(s.uid, id)
+    s.grok.answers.push(sure('retime_shot', { shotId: s.shot, durationSec: 7 }))
+    await runOne(s.exec)
+    assert.equal((await annotation(id)).interpretation?.execution, undefined, 'waits for the user')
+    const results = await Promise.allSettled([s.api.apply(s.uid, id), s.api.apply(s.uid, id)])
+    assert.equal(results.filter((r) => r.status === 'fulfilled').length, 1)
+    const refused = results.find((r) => r.status === 'rejected') as PromiseRejectedResult
+    assert.equal((refused.reason as { code?: string }).code, 'ANNOTATION_BUSY')
+    const spec = (
+      await query<{ d: number }>(
+        `SELECT (spec->>'durationSec')::float8 AS d FROM studio_shots WHERE id = $1`,
+        [s.shot],
+      )
+    ).rows[0]!
+    assert.equal(spec.d, 7)
+    await assert.rejects(s.api.reject(s.uid, id), { code: 'ANNOTATION_BUSY' })
+  })
+
+  test('a voice swap dispatches every line under its own key (plan r2 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    const lineTake = (
+      await query<{ id: string }>(
+        'SELECT active_take_id::text AS id FROM studio_lines WHERE id = $1',
+        [s.lines[0]],
+      )
+    ).rows[0]!.id
+    const { id } = await s.api.create(s.uid, s.p.id, {
+      takeId: lineTake,
+      kind: 'text',
+      text: '换成少女的声音',
+    })
+    await s.api.send(s.uid, id)
+    s.grok.answers.push(sure('swap_voice', { voiceId: 'female-shaonv' }))
+    await runOne(s.exec)
+    assert.deepEqual(
+      await genTasks(s.p.id),
+      s.lines.map((l) => `annot:${id}:1:line:${l}:tts`).sort(),
+    )
+    const v = await query<{ v: string }>(
+      `SELECT settings->'narration'->>'voiceId' AS v FROM studio_projects WHERE id = $1`,
+      [s.p.id],
+    )
+    assert.equal(v.rows[0]!.v, 'female-shaonv')
+  })
+
+  test('outside the whitelist nothing runs; the annotation can be sent again', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    const { id } = await s.api.create(s.uid, s.p.id, {
+      takeId: s.frame.id,
+      kind: 'text',
+      text: '把项目删了',
+    })
+    await s.api.send(s.uid, id)
+    s.grok.answers.push(sure('delete_project', {}))
+    await runOne(s.exec)
+    const a = await annotation(id)
+    assert.deepEqual([a.status, a.interpretation?.op], ['sent', null])
+    assert.deepEqual(await genTasks(s.p.id), [])
+    assert.equal((await projectRow(s.p.id)).status, 'done', 'not reopened')
+    await s.api.send(s.uid, id)
+    const keys = await query<{ key: string }>(
+      `SELECT idempotency_key AS key FROM studio_tasks WHERE kind = 'interpret' ORDER BY created_at`,
+      [],
+    )
+    assert.deepEqual(
+      keys.rows.map((r) => r.key),
+      [`interpret:${id}:0`, `interpret:${id}:1`],
+    )
+  })
+
+  test('a running execution is applied once its target is ready on a new version', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    const { id } = await s.api.create(s.uid, s.p.id, {
+      takeId: s.frame.id,
+      kind: 'text',
+      text: '第一句改成：雪停了',
+    })
+    await s.api.send(s.uid, id)
+    s.grok.answers.push(sure('change_line', { lineId: s.lines[0], text: '雪停了' }))
+    await runOne(s.exec)
+    assert.equal((await annotation(id)).interpretation?.execution?.state, 'running')
+    await advanceProject(s.advanceDeps, s.p.id)
+    assert.equal((await annotation(id)).status, 'sent', 'still running')
+    // A new voice take finishes and is adopted (v2 is the queued one the execution dispatched).
+    const v2 = await s.take('line', s.lines[0]!, 3, 'audio/mpeg')
+    await query(`UPDATE studio_lines SET active_take_id = $2, status = 'ready' WHERE id = $1`, [
+      s.lines[0],
+      v2.id,
+    ])
+    await advanceProject(s.advanceDeps, s.p.id)
+    const a = await annotation(id)
+    assert.deepEqual(
+      [a.status, a.applied, a.interpretation?.execution?.state],
+      ['applied', v2.id, 'done'],
+    )
+  })
+
+  test('a budget that cannot cover it leaves nothing behind and records the failure', async (t) => {
+    if (skip(t)) return
+    const s = await setup({ budget: 5 })
+    const { id } = await s.api.create(s.uid, s.p.id, {
+      takeId: s.frame.id,
+      kind: 'text',
+      text: '重画',
+    })
+    await s.api.send(s.uid, id)
+    s.grok.answers.push(sure('regenerate_shot', { shotId: s.shot, promptDelta: '更亮' }))
+    await runOne(s.exec)
+    const a = await annotation(id)
+    assert.deepEqual(
+      [a.status, a.interpretation?.execution?.state, a.interpretation?.execution?.error],
+      ['sent', 'failed', 'budget'],
+    )
+    assert.deepEqual(await genTasks(s.p.id), [])
+    const p = await projectRow(s.p.id)
+    assert.deepEqual([p.status, p.reserved], ['done', '0'], 'the reopen was rolled back too')
+    const shot = (
+      await query<{ status: string }>('SELECT status FROM studio_shots WHERE id = $1', [s.shot])
+    ).rows[0]!
+    assert.equal(shot.status, 'ready')
+  })
+
+  test("another user's annotation is not found", async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    const other = await setup()
+    const { id } = await s.api.create(s.uid, s.p.id, {
+      takeId: s.frame.id,
+      kind: 'text',
+      text: '改',
+    })
+    for (const call of [
+      () => other.api.send(other.uid, id),
+      () => other.api.apply(other.uid, id),
+      () => other.api.reject(other.uid, id),
+      () => other.api.remove(other.uid, id),
+    ])
+      await assert.rejects(call(), { status: 404 })
+    // A take of another project cannot be annotated either.
+    await assert.rejects(
+      s.api.create(s.uid, s.p.id, { takeId: other.frame.id, kind: 'text', text: 'x' }),
+      {
+        status: 400,
+      },
+    )
+  })
+})

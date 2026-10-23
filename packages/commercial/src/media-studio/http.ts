@@ -13,6 +13,9 @@
  *   POST   /api/studio/projects/:id/music            {providerId, trackId} → a free music take
  *   PUT    /api/studio/projects/:id/music/edit       trim / place / loop / fades / ducking
  *   POST   /api/studio/projects/:id/export           {resolution, subtitles} → free re-compose (A2-1c)
+ *   POST   /api/studio/projects/:id/annotations      {takeId, kind, tStartMs?, tEndMs?, geom?, text} → draft (A2-1b-2)
+ *   PATCH  /api/studio/annotations/:id               a draft's fields;  DELETE a draft
+ *   POST   /api/studio/annotations/:id/send|apply|reject
  *   POST   /api/studio/blobs/:sha/ticket             → {url, expiresInSeconds}
  *   GET    /api/studio/blobs/:sha?ticket=            Range-capable
  *
@@ -68,12 +71,13 @@ const UPLOAD_TYPES: Record<string, (b: Buffer) => boolean> = {
 const notFound = () => new HttpError(404, 'NOT_FOUND', 'not found')
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 const PROJECT_RE = new RegExp(
-  `^/projects/(${UUID})(?:/(pause|resume|cancel|uploads|start|approve|voices|export))?$`,
+  `^/projects/(${UUID})(?:/(pause|resume|cancel|uploads|start|approve|voices|export|annotations))?$`,
 )
 const TAKE_SELECT_RE = new RegExp(`^/takes/(${UUID})/select$`)
 const VOICE_NARRATION_RE = new RegExp(`^/assets/(${UUID})/narration$`)
 const BLOB_RE = /^\/blobs\/([0-9a-f]{64})(\/ticket)?$/
 const PROJECT_MUSIC_RE = new RegExp(`^/projects/(${UUID})/music(/edit)?$`)
+const ANNOTATION_RE = new RegExp(`^/annotations/(${UUID})(?:/(send|apply|reject))?$`)
 const MUSIC_AUDIO_TYPES = new Set(['audio/mpeg', 'audio/wav'])
 
 /** Music search query from the URL (OCV5-591 M1); bad numbers are refused, not ignored. */
@@ -328,6 +332,30 @@ export async function dispatchStudioRoute(
     sendJson(res, 200, await studio.orchestrator.useVoiceForNarration(uid, narration[1]!))
     return
   }
+  // OCV5-591 A2-1b-2: annotations.
+  const annotation = ANNOTATION_RE.exec(path)
+  if (annotation) {
+    if (!studio.orchestrator)
+      throw new HttpError(503, 'STUDIO_ORCHESTRATOR_OFF', 'the director agent is not running')
+    const api = studio.orchestrator.annotations
+    const id = annotation[1]!
+    const act = annotation[2]
+    if (!act && method === 'PATCH') {
+      await api.update(uid, id, bodyRecord(await readJsonBody(req)))
+    } else if (!act && method === 'DELETE') {
+      await api.remove(uid, id)
+    } else if (act === 'send' && method === 'POST') {
+      await api.send(uid, id)
+    } else if (act === 'apply' && method === 'POST') {
+      await api.apply(uid, id)
+    } else if (act === 'reject' && method === 'POST') {
+      await api.reject(uid, id)
+    } else {
+      throw notFound()
+    }
+    sendJson(res, 200, { ok: true })
+    return
+  }
   const takeSelect = TAKE_SELECT_RE.exec(path)
   if (takeSelect && method === 'POST') {
     if (!studio.orchestrator)
@@ -372,6 +400,20 @@ export async function dispatchStudioRoute(
       res,
       201,
       await studio.orchestrator.createVoice(uid, projectId, bodyRecord(await readJsonBody(req))),
+    )
+    return
+  }
+  if (action === 'annotations' && method === 'POST') {
+    if (!studio.orchestrator)
+      throw new HttpError(503, 'STUDIO_ORCHESTRATOR_OFF', 'the director agent is not running')
+    sendJson(
+      res,
+      201,
+      await studio.orchestrator.annotations.create(
+        uid,
+        projectId,
+        bodyRecord(await readJsonBody(req)),
+      ),
     )
     return
   }

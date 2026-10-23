@@ -11,6 +11,7 @@ import type { MediaRequest } from '../providers/types.js'
 import { enqueueStudioTask } from '../queue.js'
 import { STUDIO_MAX_TARGET_SEC, appendStudioEvent } from '../store.js'
 import { type AdvanceDeps, dispatchRequest } from './advance.js'
+import { type AnnotationApi, makeAnnotationApi } from './annotations.js'
 import { loadComposeInputs } from './compose.js'
 import { parseVariant, variantKey } from './composeJob.js'
 
@@ -45,6 +46,8 @@ export interface OrchestratorApi {
   ): Promise<{ queued: true } | { reused: true; takeId: string }>
   /** Advance soon, off the request path. */
   kick(projectId: string): void
+  /** OCV5-591 A2-1b-2: drafts, send → interpret, apply / reject. */
+  annotations: AnnotationApi
 }
 
 const notFound = () => new HttpError(404, 'NOT_FOUND', 'not found')
@@ -74,6 +77,7 @@ export function makeOrchestratorApi(
 ): OrchestratorApi {
   return {
     kick,
+    annotations: makeAnnotationApi(pool, deps, kick),
     async start(userId, projectId) {
       await inTx(pool, async (c) => {
         // One running project per user (backend plan §3): serialize the decision per user.

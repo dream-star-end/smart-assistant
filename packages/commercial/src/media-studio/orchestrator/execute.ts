@@ -24,6 +24,7 @@ import {
   parsePlan,
 } from './plan.js'
 import { type StudioQaDeps, qaGates } from './qa.js'
+import { failInterpret, runInterpret } from './runInterpret.js'
 import { failQa, runQa } from './runQa.js'
 
 export { LeaseLostError }
@@ -646,8 +647,11 @@ async function gate(deps: ExecuteDeps, task: StudioTask): Promise<boolean> {
   )
   const p = r.rows[0]
   // An export-format switch re-composes a finished project (plan §1); everything else stops at done.
+  // A2-1b-2: interpreting an annotation only reads; executing it reopens the project itself.
   const exportOfDone =
-    p?.status === 'done' && task.kind === 'compose' && composePayload(task).reason === 'export'
+    p?.status === 'done' &&
+    ((task.kind === 'compose' && composePayload(task).reason === 'export') ||
+      task.kind === 'interpret')
   if (
     !p ||
     p.deleted ||
@@ -733,6 +737,10 @@ async function recover(deps: ExecuteDeps, task: StudioTask, err: unknown): Promi
     await failQa(deps, task, e)
     return
   }
+  if (task.kind === 'interpret') {
+    await failInterpret(deps, task, e)
+    return
+  }
   if (task.kind === 'gen') {
     let g: GenPayload | null = null
     try {
@@ -781,6 +789,7 @@ export async function executeTask(
     if (task.kind === 'gen') return await runGen(deps, task, signal)
     if (task.kind === 'compose') return await runCompose(deps, task)
     if (task.kind === 'qa') return await runQa(deps, task)
+    if (task.kind === 'interpret') return await runInterpret(deps, task)
     throw new MediaProviderError('INVALID_TASK', false, `unknown task kind ${task.kind}`)
   } catch (err) {
     // A lost lease (or a timeout abort) belongs to the next holder; it must not write anything.

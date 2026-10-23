@@ -9,6 +9,7 @@ import type { ProviderRegistry } from '../providers/registry.js'
 import { type MediaOp, type MediaRequest, defaultModelFor, kindOf } from '../providers/types.js'
 import { enqueueStudioTask } from '../queue.js'
 import { appendStudioEvent } from '../store.js'
+import { settleAnnotations } from './annotate.js'
 import { reserveBudget } from './budget.js'
 import { DEFAULT_VARIANT } from './composeJob.js'
 import { type Action, type DQa, type DState, type Dispatch, decide } from './decide.js'
@@ -22,6 +23,16 @@ export interface AdvanceDeps {
   compose?: { configured(): boolean }
   /** OCV5-591 A2-1b-1: visual QA (absent or disabled → takes are used as they come). */
   qa?: StudioQaDeps
+}
+
+/** A2-1b-2: a shot redone from an annotation ignores versions older than these. */
+function redoOf(spec: Record<string, unknown> | null | undefined): {
+  redo?: { frame: number; video: number }
+} {
+  const r = spec?.redo as { frame?: unknown; video?: unknown } | undefined
+  if (!r || typeof r !== 'object') return {}
+  const n = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : 0)
+  return { redo: { frame: n(r.frame), video: n(r.video) } }
 }
 
 function dqa(raw: unknown): DQa | null {
@@ -143,6 +154,7 @@ export async function loadState(
       status: s.status as DState['shots'][number]['status'],
       activeTakeId: s.active_take_id,
       frameTakeId: typeof s.spec?.frameTakeId === 'string' ? s.spec.frameTakeId : null,
+      ...redoOf(s.spec),
     })),
     lines: lines.rows.map((l) => ({
       id: l.id,
@@ -272,6 +284,8 @@ export async function dispatchRequest(
   d: Pick<Dispatch, 'ownerKind' | 'ownerId' | 'op' | 'exclude'> & {
     /** Only this provider (the source the user picked); no fallback to another one. */
     only?: string
+    /** A2-1b-2: the task's key (an annotation execution's per-target key); default per version. */
+    idempotencyKey?: string
   },
   req: MediaRequest,
 ): Promise<'queued' | 'budget' | 'no_provider'> {
@@ -316,7 +330,7 @@ export async function dispatchRequest(
   await enqueueStudioTask(client, {
     projectId: ctx.project.id,
     kind: 'gen',
-    idempotencyKey: `gen:${d.ownerKind}:${d.ownerId}:v${version}`,
+    idempotencyKey: d.idempotencyKey ?? `gen:${d.ownerKind}:${d.ownerId}:v${version}`,
     payload: {
       takeId,
       providerId: provider.id,
@@ -530,6 +544,8 @@ export async function advanceProject(deps: AdvanceDeps, projectId: string): Prom
       await client.query('ROLLBACK')
       return false
     }
+    // A2-1b-2: an annotation's execution is applied / failed once its targets settle.
+    await settleAnnotations(client, projectId)
     const ctx = await loadState(client, deps, projectId)
     if (ctx) await apply(client, deps, ctx, decide(ctx.state))
     await client.query('COMMIT')

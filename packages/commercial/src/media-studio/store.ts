@@ -238,7 +238,7 @@ export class StudioStore {
   async projectView(userId: string, id: string): Promise<Record<string, unknown> | null> {
     const project = await this.getProject(userId, id)
     if (!project) return null
-    const [shots, lines, assets, takes, events] = await Promise.all([
+    const [shots, lines, assets, takes, events, annotations] = await Promise.all([
       this.pool.query(
         `SELECT id::text AS id, ordinal, spec, status, active_take_id::text AS "activeTakeId"
          FROM studio_shots WHERE project_id=$1 ORDER BY ordinal`,
@@ -282,6 +282,19 @@ export class StudioStore {
          WHERE project_id=$1 ORDER BY id DESC LIMIT 50`,
         [id],
       ),
+      // OCV5-591 A2-1b-2: what the agent understood and how running it went (no model internals).
+      this.pool.query(
+        `SELECT id::text AS id, target_kind AS "targetKind", target_id::text AS "targetId", take_id::text AS "takeId",
+                kind, t_start_ms AS "tStartMs", t_end_ms AS "tEndMs", geom, text, status,
+                CASE WHEN interpretation IS NULL THEN NULL ELSE jsonb_build_object(
+                  'op', interpretation->'op', 'explanation', interpretation->'explanation',
+                  'confidence', interpretation->'confidence',
+                  'state', interpretation->'execution'->'state', 'error', interpretation->'execution'->'error')
+                END AS interpretation,
+                applied_take_id::text AS "appliedTakeId", created_at AS "createdAt"
+           FROM studio_annotations WHERE project_id=$1 ORDER BY created_at DESC LIMIT 200`,
+        [id],
+      ),
     ])
     return {
       project,
@@ -290,6 +303,7 @@ export class StudioStore {
       assets: assets.rows,
       takes: takes.rows,
       events: events.rows,
+      annotations: annotations.rows,
     }
   }
 

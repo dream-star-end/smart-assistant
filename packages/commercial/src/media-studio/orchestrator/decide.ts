@@ -47,6 +47,8 @@ export interface DShot {
   activeTakeId: string | null
   /** The frame the user picked as the video's start (spec.frameTakeId). */
   frameTakeId: string | null
+  /** A2-1b-2: redone from an annotation — frames / videos older than these versions do not count. */
+  redo?: { frame: number; video: number }
 }
 
 export interface DLine {
@@ -244,8 +246,13 @@ export function decide(s: DState): Action[] {
       blocked = true
       continue
     }
-    const frames = ownerTakes(s, 'shot_frame', shot.id)
-    const videos = ownerTakes(s, 'shot_video', shot.id)
+    // A2-1b-2: after an annotation's redo only the versions made for it count.
+    const frames = ownerTakes(s, 'shot_frame', shot.id).filter(
+      (t) => t.version >= (shot.redo?.frame ?? 0) || t.id === shot.frameTakeId,
+    )
+    const videos = ownerTakes(s, 'shot_video', shot.id).filter(
+      (t) => t.version >= (shot.redo?.video ?? 0),
+    )
     if (frames.some(live) || videos.some(live)) continue
     // A2-1b-1: a finished frame / video is judged before anything is built on it.
     // The user's picked frame is theirs: never judged (code r1 P1).

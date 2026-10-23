@@ -263,6 +263,8 @@ describe('dispatchStudioRoute', () => {
       `/projects/${PROJECT}/voices`,
       `/takes/${TAKE}/select`,
       `/assets/${ASSET}/narration`,
+      `/projects/${PROJECT}/annotations`,
+      `/annotations/${TAKE}/send`,
     ]
     orchestrator = undefined
     for (const r of routes) {
@@ -272,7 +274,19 @@ describe('dispatchStudioRoute', () => {
     }
 
     const seen: string[] = []
+    const notes: string[] = []
     orchestrator = {
+      annotations: {
+        create: async (uid, id, body) => {
+          notes.push(`create:${uid}:${id}:${body.kind}:${body.text}`)
+          return { id: 'n1' }
+        },
+        update: async (uid, id, body) => void notes.push(`update:${uid}:${id}:${body.text}`),
+        remove: async (uid, id) => void notes.push(`remove:${uid}:${id}`),
+        send: async (uid, id) => void notes.push(`send:${uid}:${id}`),
+        apply: async (uid, id) => void notes.push(`apply:${uid}:${id}`),
+        reject: async (uid, id) => void notes.push(`reject:${uid}:${id}`),
+      },
       start: async (uid, id) => void seen.push(`start:${uid}:${id}`),
       approve: async (uid, id) => void seen.push(`approve:${uid}:${id}`),
       selectTake: async (uid, id) => {
@@ -322,6 +336,33 @@ describe('dispatchStudioRoute', () => {
         202,
       )
       seen.splice(seen.indexOf(`export:247:${PROJECT}:1080p:burn`), 2)
+      // A2-1b-2 annotations: a draft on the project, then its own routes.
+      const made = await post(`/projects/${PROJECT}/annotations`, { kind: 'text', text: '慢一点' })
+      assert.equal(made.status, 201)
+      assert.deepEqual(await made.json(), { id: 'n1' })
+      const auth247 = await bearer('247')
+      const call = (method: string, path: string, body?: unknown) =>
+        fetch(`${base}${path}`, {
+          method,
+          headers: { authorization: auth247, 'content-type': 'application/json' },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        })
+      assert.equal(
+        (await call('PATCH', `/annotations/${TAKE}`, { kind: 'text', text: '再慢' })).status,
+        200,
+      )
+      for (const act of ['send', 'apply', 'reject'])
+        assert.equal((await call('POST', `/annotations/${TAKE}/${act}`)).status, 200, act)
+      assert.equal((await call('DELETE', `/annotations/${TAKE}`)).status, 200)
+      assert.equal((await call('GET', `/annotations/${TAKE}/send`)).status, 404)
+      assert.deepEqual(notes, [
+        `create:247:${PROJECT}:text:慢一点`,
+        `update:247:${TAKE}:再慢`,
+        `send:247:${TAKE}`,
+        `apply:247:${TAKE}`,
+        `reject:247:${TAKE}`,
+        `remove:247:${TAKE}`,
+      ])
       assert.deepEqual(seen, [
         `start:247:${PROJECT}`,
         `approve:247:${PROJECT}`,
