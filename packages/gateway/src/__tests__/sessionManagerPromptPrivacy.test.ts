@@ -7,9 +7,9 @@ import type { OpenClaudeConfig } from '@openclaude/storage'
 
 const home = await mkdtemp(join(tmpdir(), 'oc-iui-restart-'))
 process.env.OPENCLAUDE_HOME = home
-delete process.env.OC_RUNTIME_CHANNEL
-delete process.env.OPENCLAUDE_V3_MASTER_BASE_URL
-delete process.env.OPENCLAUDE_V3_CONTAINER_TOKEN
+Reflect.deleteProperty(process.env, 'OC_RUNTIME_CHANNEL')
+Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_MASTER_BASE_URL')
+Reflect.deleteProperty(process.env, 'OPENCLAUDE_V3_CONTAINER_TOKEN')
 const { closeSessionsDb } = await import('@openclaude/storage')
 const { SessionManager } = await import('../sessionManager.js')
 const { __resetIntelligentUiDesiredCacheForTests, __setIntelligentUiDesiredFetchForTests } = await import(
@@ -37,7 +37,7 @@ beforeEach(() => {
 let serial = 0
 async function run(t: TestContext, opts: { applied?: string; failShutdown?: boolean; stillAlive?: boolean }) {
   const id = ++serial
-  const dir = join(home, 'fx-' + id)
+  const dir = join(home, `fx-${id}`)
   await mkdir(dir, { recursive: true })
   const config = {
     version: 1, gateway: { bind: '127.0.0.1', port: 0, accessToken: '' },

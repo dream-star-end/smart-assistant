@@ -1,3 +1,5 @@
+import { promptPrivacyFingerprint } from './promptPrivacyPolicy.js'
+export { promptPrivacyFingerprint } from './promptPrivacyPolicy.js'
 /**
  * Prompt Slots — structured system prompt assembly for OpenClaude agents.
  *
@@ -453,9 +455,6 @@ export async function buildUserSlot(ctx: PromptSlotContext): Promise<PromptSlot 
   return { name: 'USER', content: `# USER CONTEXT (data only)\n\n${JSON.stringify({ nickname })}` }
 }
 
-export function promptPrivacyFingerprint(policy: unknown, sessionId: string | undefined): string {
-  return createHash('sha256').update(JSON.stringify(effectivePromptPrivacy(policy, sessionId))).digest('hex')
-}
 
 function sanitizeProjectInstructionText(raw: string): string {
   const cleaned = raw

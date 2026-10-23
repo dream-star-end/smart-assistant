@@ -4377,3 +4377,52 @@ it('reads the exact native Codex compacted payload from rollout JSONL', async ()
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+it('privacy withdrawal resumes the same native thread with current instructions before compaction', async (t) => {
+  const { promptPrivacyFingerprint } = await import('../promptPrivacyPolicy.js')
+  const h = await makeHarness({ withFakeProc: true, resumeSessionId: 'privacy-source-thread' })
+  const r = h.runner as any
+  const calls: string[] = []
+  r.attached = true
+  r._promptPolicyFingerprint = promptPrivacyFingerprint({ schemaVersion: 1, profile: { nickname: 'old-fixture-name', sessionId: 'scope-a' } }, 'scope-a')
+  t.mock.method(r, 'shutdown', async () => { calls.push('stop'); r.proc = null; r.attached = false })
+  t.mock.method(r, 'ensureSpawned', async () => {
+    calls.push('spawn')
+    assert.equal(r.proc, null)
+    assert.deepEqual(r.promptPolicy, { schemaVersion: 1, profile: null })
+    r.proc = {}; r.cachedOverrides = { instructionsContent: 'NEW_SAFE_INSTRUCTIONS' }
+  })
+  t.mock.method(r, 'sendRequest', async (method: string, params: Record<string, unknown>) => {
+    calls.push(method)
+    assert.equal(method, 'thread/resume')
+    assert.equal(params.threadId, 'privacy-source-thread')
+    assert.equal(params.baseInstructions, 'NEW_SAFE_INSTRUCTIONS')
+    return {}
+  })
+  t.mock.method(r, 'compactCurrentThreadForHandoff', async () => {
+    calls.push('compact')
+    assert.equal(r.attached, true)
+    return { summaryText: 'isolated-fixture-summary' }
+  })
+  try {
+    await h.runner.compactForHandoff()
+    assert.deepEqual(calls, ['stop', 'spawn', 'thread/resume', 'compact'])
+    assert.equal(r.promptPolicy, undefined)
+    assert.equal(r.threadId, 'privacy-source-thread')
+  } finally { await h.cleanup() }
+})
+
+it('native compaction cannot reach the model when the old privacy process has not closed', async (t) => {
+  const h = await makeHarness({ withFakeProc: true, resumeSessionId: 'privacy-source-thread' })
+  const r = h.runner as any
+  r.attached = true
+  r._promptPolicyFingerprint = 'old-policy'
+  let effects = 0
+  t.mock.method(r, 'shutdown', async () => {})
+  t.mock.method(r, 'compactCurrentThreadForHandoff', async () => { effects++; return {} })
+  try {
+    await assert.rejects(h.runner.compactForHandoff(), /尚未生效/)
+    assert.equal(effects, 0)
+    assert.equal(r.promptPolicy, undefined)
+  } finally { await h.cleanup() }
+})

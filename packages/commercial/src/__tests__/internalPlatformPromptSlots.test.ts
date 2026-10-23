@@ -814,11 +814,11 @@ describe('minimal prompt privacy metadata', () => {
       readPreferences: async uid => { calls.push(String(uid)); return { prefs: { system_assistant_profile: { enabled: true, nickname: '小林', sessionId: 'scope-a' } }, updated_at: '2000-01-01T00:00:00Z' } },
     })
     const res = makeRes()
-    await handler(makeReq({ authorization: auth, url: PLATFORM_PROMPT_SLOTS_PATH + '?sessionId=scope-a&userId=765' }), res, { hostUuid: HOST, boundIp: IP })
+    await handler(makeReq({ authorization: auth, url: `${PLATFORM_PROMPT_SLOTS_PATH}?sessionId=scope-a&userId=765` }), res, { hostUuid: HOST, boundIp: IP })
     assert.deepEqual(calls, [String(id.userId)])
     assert.deepEqual(parseBody(res.body), { slots: [], promptPolicy: { schemaVersion: 1, profile: { nickname: '小林', sessionId: 'scope-a' } } })
     const other = makeRes()
-    await handler(makeReq({ authorization: auth, url: PLATFORM_PROMPT_SLOTS_PATH + '?sessionId=scope-b' }), other, { hostUuid: HOST, boundIp: IP })
+    await handler(makeReq({ authorization: auth, url: `${PLATFORM_PROMPT_SLOTS_PATH}?sessionId=scope-b` }), other, { hostUuid: HOST, boundIp: IP })
     assert.deepEqual(parseBody(other.body).promptPolicy, { schemaVersion: 1, profile: null })
   })
   test('preference failure returns a closed projection and no raw failure details', async () => {

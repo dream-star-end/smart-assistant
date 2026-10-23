@@ -1,3 +1,4 @@
+import { withFreshPromptPrivacy } from './promptPrivacyRuntime.js'
 import { type PreheatPreparation, reserveUnusedPreheat, armUnusedPreheat, consumeUnusedPreheat, clearUnusedPreheats } from './speculativePreheat.js'
 /**
  * Session runner lifecycle: preheat, repo-change recycle, eviction loop, shutdown/destroy, idle drain, execution target and model switch
@@ -142,7 +143,7 @@ export async function preheatRunner(
       }
       const deadlineMs = resolveEnginePreheatDeadlineMs()
       try {
-        await withPreheatDeadline(session.runner.preheat!(), deadlineMs)
+        await withFreshPromptPrivacy(session.runner, session.peerId, () => withPreheatDeadline(session.runner.preheat!(), deadlineMs))
       } catch (err) {
         if (!isPreheatDeadline(err)) throw err
         log.warn('engine_preheat', {

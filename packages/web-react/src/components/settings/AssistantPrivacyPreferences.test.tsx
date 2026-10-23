@@ -8,7 +8,7 @@ import { AssistantPrivacyPreferences } from './AssistantPrivacyPreferences'
 afterEach(cleanup)
 test('default off; editing, opening and cancelling never write; explicit consent saves scoped data', async () => {
   const auth = createMemoryAuthSession(() => {})
-  const writes = vi.fn(async () => {})
+  const writes = vi.fn(async (_patch: Record<string, unknown>) => {})
   function Harness() {
     const [profile, setProfile] = useState<PrefsView['system_assistant_profile']>()
     return <AssistantPrivacyPreferences auth={auth} sessionId="scope-a" profile={profile} onPatch={async p => { await writes(p); setProfile(p.system_assistant_profile as PrefsView['system_assistant_profile']) }} />
@@ -43,7 +43,7 @@ test('failed withdrawal retains the controlled preference and reports failure', 
 })
 test('a new identity cannot confirm a sheet prepared by the previous identity', async () => {
   const auth = createMemoryAuthSession(() => {})
-  const writes = vi.fn(async () => {})
+  const writes = vi.fn(async (_patch: Record<string, unknown>) => {})
   render(<AssistantPrivacyPreferences auth={auth} sessionId="scope-a" profile={{ enabled: true, nickname: '小林', sessionId: 'scope-a' }} onPatch={writes} />)
   fireEvent.click(screen.getByRole('switch', { name: '本会话使用称呼' }))
   const dialog = await screen.findByRole('dialog')

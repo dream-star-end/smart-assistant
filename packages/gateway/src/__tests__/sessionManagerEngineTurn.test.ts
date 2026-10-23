@@ -1,3 +1,4 @@
+import { MinimalPrivacyRunner } from './fixtures/minimalPrivacyRunner.js'
 import { encodeUpstreamRetryHint } from '@openclaude/protocol';
 import { waitForRetryDelay } from '../sessionTurnRunner.js';
 /**
@@ -16,7 +17,6 @@ import { waitForRetryDelay } from '../sessionTurnRunner.js';
 
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
 
 import {
   SessionManager,
@@ -68,7 +68,7 @@ function makeConfigStub(): OpenClaudeConfig {
 
 type FakeExitInfo = { code: number | null; signal: string | null; crashed: boolean };
 
-class FakeCcbRunner extends EventEmitter {
+class FakeCcbRunner extends MinimalPrivacyRunner {
   lastActivityAt = Date.now();
   /** Warm process by default so legacy sequence assertions see no synthetic
    * engine_starting frame; cold-start tests flip this to false. */
@@ -96,19 +96,25 @@ class FakeCcbRunner extends EventEmitter {
       await new Promise((resolve) => setTimeout(resolve, this.startDelayMs));
     }
     this.isRunning = true;
+
+    this.recordBuiltPromptPrivacy(); this.isRunning = true
   }
 
   interrupt(): boolean {
     return false;
   }
 
-  async shutdown(): Promise<void> {}
+  async shutdown(): Promise<void> {
+    this.isRunning = false
+  }
 
   clearSessionId(): void {}
 
   async waitForOutputDrain(): Promise<void> {}
 
   async submit(input?: unknown): Promise<void> {
+    this.recordBuiltPromptPrivacy(); this.isRunning = true
+
     this.submittedInputs.push(input);
     this.onSubmit(this);
   }

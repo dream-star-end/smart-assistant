@@ -308,6 +308,7 @@ export class SubprocessRunner extends EventEmitter {
     if (this.proc) throw new Error("助手隐私刷新仍在等待旧进程终结，请稍后重试。")
   }
   setPromptPrivacy(policy: PromptPrivacyPolicy): void { this.promptPolicy = structuredClone(policy) }
+  clearPromptPrivacy(): void { this.promptPolicy = undefined }
   /** Exact stock-CLI abort result observed for the current process. Official
    * Claude Code exits 1 after emitting it; that is an expected recycle, not a
    * process crash. Reset on every spawn. */

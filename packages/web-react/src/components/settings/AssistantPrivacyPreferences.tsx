@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
+import { hasPromptPrivacyControlCharacters } from '@openclaude/protocol/browser'
+import { useEffect, useId, useRef, useState } from 'react'
 import type { AuthSession } from '../../lib/types'
 import type { PrefsView } from '../../lib/modelPreferences'
 import { apiErrorMessage } from '../../lib/api'
@@ -8,14 +9,16 @@ type Profile = NonNullable<PrefsView['system_assistant_profile']>
 export function AssistantPrivacyPreferences({ auth, sessionId, profile, onPatch }: {
   auth: AuthSession; sessionId?: string; profile?: Profile; onPatch: (patch: Record<string, unknown>) => Promise<void>
 }) {
+  const nicknameInputId = useId()
   const enabled = Boolean(sessionId && profile?.enabled && profile.sessionId === sessionId)
-  const [nickname, setNickname] = useState(enabled ? profile!.nickname : '')
+  const currentNickname = enabled ? profile?.nickname ?? '' : ''
+  const [nickname, setNickname] = useState(currentNickname)
   const [pending, setPending] = useState<{ value: Profile | null; scope: string | undefined; epoch: number } | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const scope = useRef(sessionId); scope.current = sessionId
-  useEffect(() => { setNickname(enabled ? profile!.nickname : '') }, [enabled, profile?.nickname])
-  const valid = nickname.trim().length > 0 && nickname.trim().length <= 80 && !/[\u0000-\u001f\u007f]/.test(nickname)
+  useEffect(() => { setNickname(currentNickname) }, [currentNickname])
+  const valid = nickname.trim().length > 0 && nickname.trim().length <= 80 && !hasPromptPrivacyControlCharacters(nickname)
   function request(value: Profile | null) { setError(''); setPending({ value, scope: sessionId, epoch: auth.snapshot().epoch }) }
   async function save() {
     const proposal = pending
@@ -37,7 +40,7 @@ export function AssistantPrivacyPreferences({ auth, sessionId, profile, onPatch 
       </div>
       <Switch aria-label="本会话使用称呼" checked={enabled} disabled={busy || (!enabled && !next)} onCheckedChange={checked => request(checked ? next : null)} />
     </div>
-    <label className="mt-3 block text-meta text-muted">称呼<Input aria-label="助手称呼" className="mt-1" value={nickname} maxLength={80} disabled={busy} onChange={e => setNickname(e.target.value)} placeholder="填写你希望的称呼" /></label>
+    <label htmlFor={nicknameInputId} className="mt-3 block text-meta text-muted">称呼<Input id={nicknameInputId} aria-label="助手称呼" className="mt-1" value={nickname} maxLength={80} disabled={busy} onChange={e => setNickname(e.target.value)} placeholder="填写你希望的称呼" /></label>
     {!sessionId && <p className="mt-2 text-meta text-muted">打开一个会话后，可单独授权该会话。</p>}
     {enabled && profile?.nickname !== nickname.trim() && <Button className="mt-3" size="sm" disabled={!next || busy} onClick={() => request(next)}>查看称呼更改</Button>}
     {profile?.enabled && !enabled && <div className="mt-3 flex flex-wrap items-center gap-3"><p className="text-meta text-muted">此前授权属于另一会话，当前会话未使用。</p><Button size="sm" disabled={busy} onClick={() => request(null)}>撤回此前授权</Button></div>}

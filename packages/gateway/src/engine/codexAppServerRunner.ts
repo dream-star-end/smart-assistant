@@ -1,3 +1,4 @@
+import { withFreshPromptPrivacy } from '../promptPrivacyRuntime.js'
 import type { PromptPrivacyPolicy } from '@openclaude/protocol'
 import { identityCompatEnvironment, type IdentityCompatRuntimeContext } from '@openclaude/storage'
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process'
@@ -618,6 +619,7 @@ export class CodexAppServerRunner extends EventEmitter {
     if (this.proc) throw new Error("助手隐私刷新仍在等待旧进程终结，请稍后重试。")
   }
   setPromptPrivacy(policy: PromptPrivacyPolicy): void { this.promptPolicy = structuredClone(policy) }
+  clearPromptPrivacy(): void { this.promptPolicy = undefined }
   get promptIntelligentUi(): IntelligentUiApplied | undefined {
     return this._promptIntelligentUi
   }
@@ -923,7 +925,31 @@ export class CodexAppServerRunner extends EventEmitter {
     this.emitTurnStatus(this.pendingUserInputs.size > 0 ? 'waiting_for_user' : null)
   }
 
+  private compactPrivacyPreparing = false
   async compactForHandoff(): Promise<NativeModelHandoffArtifact> {
+    if (!this.proc || !this.attached || !this.threadId) throw new Error('CODEX_NATIVE_COMPACTION_SESSION_NOT_READY')
+    if (this.processing || this.currentTurnCompleter || this.pendingNativeCompaction || this.compactPrivacyPreparing) throw new Error('CODEX_NATIVE_COMPACTION_BUSY')
+    const sourceThread = this.threadId
+    this.compactPrivacyPreparing = true
+    try {
+      return await withFreshPromptPrivacy(this, this.opts.sessionId, async () => {
+        if (this.threadId !== sourceThread) throw new Error('CODEX_NATIVE_COMPACTION_SESSION_CHANGED')
+        if (!this.proc || !this.attached) {
+          const repo = this._currentRepoSnapshot()
+          const cwd = this._applyRepoBindingFromSnapshot(repo)
+          await this.ensureSpawned(repo, cwd)
+          await this.sendRequest('thread/resume', {
+              ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
+            threadId: sourceThread, approvalPolicy: 'never', sandbox: 'danger-full-access', cwd,
+            ...(this.codexTransportModel() ? { model: this.codexTransportModel() } : {}),
+          })
+          this.attached = true
+        }
+        return this.compactCurrentThreadForHandoff()
+      })
+    } finally { this.compactPrivacyPreparing = false }
+  }
+  private async compactCurrentThreadForHandoff(): Promise<NativeModelHandoffArtifact> {
     if (!this.proc || !this.attached || !this.threadId) {
       throw new Error('CODEX_NATIVE_COMPACTION_SESSION_NOT_READY')
     }
@@ -2486,6 +2512,7 @@ export class CodexAppServerRunner extends EventEmitter {
         } else {
           try {
             await this.sendRequest('thread/resume', {
+              ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
               threadId: this.threadId,
               approvalPolicy: 'never',
               sandbox: 'danger-full-access',
@@ -2531,6 +2558,7 @@ export class CodexAppServerRunner extends EventEmitter {
               this.syncedPlatformGoal = null
               try {
                 await this.sendRequest('thread/resume', {
+              ...(this.cachedOverrides?.instructionsContent !== undefined ? { baseInstructions: this.cachedOverrides.instructionsContent } : {}),
                   threadId: fallback,
                   approvalPolicy: 'never',
                   sandbox: 'danger-full-access',

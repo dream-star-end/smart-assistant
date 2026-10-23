@@ -33,7 +33,7 @@
  */
 
 import { scanMemoryContent } from "@openclaude/storage";
-import { PLATFORM_REASONING_EFFORTS } from "@openclaude/protocol";
+import { PLATFORM_REASONING_EFFORTS, hasPromptPrivacyControlCharacters } from "@openclaude/protocol";
 import { z } from "zod";
 import { query } from "../db/queries.js";
 
@@ -56,8 +56,8 @@ const disabledPluginsSchema = z
 /** Explicit nickname consent is scoped to one conversation; absent means disabled. */
 const assistantProfileSchema = z.object({
   enabled: z.boolean(),
-  nickname: z.string().trim().min(1).max(80).regex(/^[^\u0000-\u001f\u007f]+$/).refine(value => scanMemoryContent(value).ok, "称呼应为简短名称，不能包含系统指令"),
-  sessionId: z.string().min(1).max(256).regex(/^[^\u0000-\u001f\u007f]+$/),
+  nickname: z.string().trim().min(1).max(80).refine(value => !hasPromptPrivacyControlCharacters(value), "不接受控制字符").refine(value => scanMemoryContent(value).ok, "称呼应为简短名称，不能包含系统指令"),
+  sessionId: z.string().min(1).max(256).refine(value => !hasPromptPrivacyControlCharacters(value), "不接受控制字符"),
 }).strict();
 
 /**

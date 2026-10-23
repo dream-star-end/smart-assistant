@@ -4,6 +4,9 @@ export interface PromptPrivacyPolicy {
   profile: { nickname: string; sessionId: string } | null
 }
 export const DEFAULT_PROMPT_PRIVACY: Readonly<PromptPrivacyPolicy> = Object.freeze({ schemaVersion: 1, profile: null })
+export function hasPromptPrivacyControlCharacters(value: string): boolean {
+  return [...value].some(ch => ch.charCodeAt(0) < 32 || ch.charCodeAt(0) === 127)
+}
 export function parsePromptPrivacyPolicy(raw: unknown): PromptPrivacyPolicy | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   const p = raw as Record<string, unknown>
@@ -12,7 +15,7 @@ export function parsePromptPrivacyPolicy(raw: unknown): PromptPrivacyPolicy | nu
   if (!p.profile || typeof p.profile !== 'object' || Array.isArray(p.profile)) return null
   const v = p.profile as Record<string, unknown>
   if (Object.keys(v).sort().join(',') !== 'nickname,sessionId' || typeof v.nickname !== 'string' || typeof v.sessionId !== 'string') return null
-  if (!v.nickname.trim() || v.nickname.length > 80 || !v.sessionId || v.sessionId.length > 256 || /[\u0000-\u001f\u007f]/.test(v.nickname + v.sessionId)) return null
+  if (!v.nickname.trim() || v.nickname.length > 80 || !v.sessionId || v.sessionId.length > 256 || hasPromptPrivacyControlCharacters(v.nickname + v.sessionId)) return null
   return { schemaVersion: 1, profile: { nickname: v.nickname.trim(), sessionId: v.sessionId } }
 }
 export function effectivePromptPrivacy(raw: unknown, sessionId: string | undefined): PromptPrivacyPolicy {
