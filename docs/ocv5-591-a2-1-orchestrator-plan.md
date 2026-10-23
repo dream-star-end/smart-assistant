@@ -61,9 +61,14 @@ composing → done / failed（A2-1c）
 - 派发时（在 `advanceProject` 的同一事务里）：`est = provider.estimateMaxCost(req)`；
   `UPDATE studio_projects SET reserved_credits = reserved_credits + $est WHERE id=$p AND spent_credits + reserved_credits + $est <= budget_credits RETURNING id`。更新不到行 → 不派发，项目 `paused`，事件 `budget.exhausted`（前端显示预算提醒）。成功则 `enqueueStudioTask(reservedCredits = est)`。
 - 执行时 `ctx.maxCostCredits = task.reservedCredits`（A2-0 注册表拒绝 `estimate > 预留`，TTS 已封顶）。
-- **成功**：一个事务里 `spent_credits += result.costCredits`（适配器返回的是这次执行 id 的实际扣费，含重放的原扣费）、`reserved_credits -= task.reserved_credits`，并把 task 的 `reserved_credits` 置 0（`WHERE reserved_credits > 0` 作为 CAS，防止重复释放）。因为同一执行 id 最多扣一次费，失租的旧执行者即使之后也成功，也不会产生第二笔扣费。`overReservation = true` 时照实记 spent 并把项目 `paused`。
-- **失败 / 取消（plan r1 P1-1）：不立即释放**。任务转 `failed|canceled` 时预留保持不动；**延迟对账器**（每分钟，两个 slot 都跑，`FOR UPDATE SKIP LOCKED`）只处理 `status IN ('failed','canceled') AND reserved_credits > 0 AND updated_at < NOW() - 结算窗口` 的任务：调用该任务所用 provider 的 `chargedFor(execRequestId)` 查实际扣费（GPT 图片：`image_generation_usage_records` 中 `request_id` 以 `<exec>#` 开头的已结算行；Muse：`muse_media_jobs` 中确定性 job id 的扣费；MiniMax：`voice:tts:<exec>` 的 usage 行 + `miniMaxDebitedCredits`），把它计入 spent 并以同一 CAS 释放预留。
-- **结算窗口**由适配器声明 `maxInFlightMs()`（A2-0 接口小扩展）：GPT 图片 = 上游超时 × 2（含一次 429 重试）；MiniMax = 上游超时 × 2；Muse = `hub.maxJobLifetimeMs()`（job 截止时间之后 hub 不再结算）；窗口再加 lease 时长 90 秒。窗口之后旧执行者不可能再产生扣费，所以对账结果是终值。项目在有未对账任务时照常推进；预算以 `spent + reserved` 判断，保守不超支。
+- **入账以 provider 账本为准，可以随时补记（plan r1 P1-1 / r2 P1）**：同一执行 id 在各 provider 都最多扣一次费，但旧执行者的扣费可能在任何时候迟到（进程被挂起后恢复），时间窗口无法证明“结算已终止”。所以不靠窗口关闭，而是让项目 spent **始终追平账本**：
+  - 每个生成任务在 `payload.booked` 记录“这次执行已计入项目 spent 的积分”（初始 0）。
+  - **成功**：一个事务里 `delta = result.costCredits - booked`，`spent_credits += delta`、`payload.booked = result.costCredits`，并以 task 的 `reserved_credits > 0` 作为 CAS 释放预留（`reserved_credits -= task.reserved_credits`、task 预留置 0）。
+  - **失败 / 取消**：立即 `charged = provider.chargedFor(userId, exec_request_id)`，同样按 delta 入账并释放预留——不再等待窗口。
+  - **增量对账器**（每 5 分钟，两个 slot 都跑，`FOR UPDATE SKIP LOCKED` 分批）：扫描 `kind='gen'`、已结束（`done|failed|canceled`）、`updated_at` 在 30 天内、项目未删除的任务，重新查 `chargedFor`；`charged != booked` 时以 `payload.booked` 的旧值为 CAS 把差额计入 spent（可正可负，spent 不低于 0），同时更新对应 take 的 `cost_credits`。迟到的扣费因此一定会被补记，不会因为预留已释放而漏掉。
+  - 补记后若 `spent + reserved > budget`，项目转 `paused` 并写事件 `budget.exceeded_late`（超出量最多是一次被放弃执行的价格）。
+  - **边界说明**：用户钱包的扣费永远由 provider 账本决定，不会出错；项目 spent 是预算防护和展示用的计数。对账范围取 30 天（与未采用 take 的 blob 回收周期一致）；超过 30 天才落地的扣费在实际中不会出现（结算发生在发起请求的进程内），即使出现，也只影响项目计数，不影响用户账单。
+  - 因此 A2-0 接口只增加 `chargedFor(userId, execRequestId)`，不需要 `maxInFlightMs`。
 - 平台承担的 LLM 步骤（Plan、Prompt、Interpret）不占预算；用户承担的视觉 QA（A2-1b）按 Grok 目录价预留上限。
 
 ## 5. LLM 步骤（`orchestrator/steps/*`）
@@ -101,7 +106,7 @@ composing → done / failed（A2-1c）
 - 内容审核（D7，A2-1b）：需求先过一次审核步骤（平台承担），拒绝时项目 `failed` 并说明原因。
 
 ## 8. 测试
-- **单测**（假 provider、假 Grok、假时钟）：take 派发绑定（重领复用同一 take）；失败任务在结算窗口内不释放、窗口后按 `chargedFor` 记账（含迟到扣费）；选首帧派发视频而不置 ready；目标 300 秒的方案可被接受、>300 秒 start 被拒；状态机全路径（max / confirm、预算不足暂停、needs_user、pause / resume / cancel、失败换候选、IMAGE_DAILY_LIMIT 降级、音乐未配置跳过、台词超长延长镜头）；Plan 输出校验（越界时长、未知 voiceId、注入文本只在数据区）；预算 CAS（重复释放无效）。
+- **单测**（假 provider、假 Grok、假时钟）：take 派发绑定（重领复用同一 take）；失败立即按 `chargedFor` 入账并释放预留、迟到扣费由增量对账补记（booked CAS，不重复、不遗漏）；选首帧派发视频而不置 ready；目标 300 秒的方案可被接受、>300 秒 start 被拒；状态机全路径（max / confirm、预算不足暂停、needs_user、pause / resume / cancel、失败换候选、IMAGE_DAILY_LIMIT 降级、音乐未配置跳过、台词超长延长镜头）；Plan 输出校验（越界时长、未知 voiceId、注入文本只在数据区）；预算 CAS（重复释放无效）。
 - **integ**（CI，pr-2）：两个 worker 并发认领同一项目只推进一次；lease 丢失后另一 worker 重做不重复扣费（假 provider 记录调用次数 + 账本断言）；`spent + reserved ≤ budget` 在并发派发下恒成立。
 - **上线前验证（需批准，A2-1c 之后）**：uid 247 跑一个 15 秒 3 镜头项目做全量对账（按总方案 §9）。
 
