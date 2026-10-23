@@ -26,9 +26,19 @@ import { PRE_AUTH_ROUTES } from '../routes/preAuth.js'
 import { dispatchRoutes, type HttpRoute, matchingRouteIds } from '../routes/routeTable.js'
 import { SYSTEM_ROUTES } from '../routes/system.js'
 import { WORKSPACE_API_ROUTES } from '../routes/workspaceApi.js'
-import { LEGACY_HTTP_DISPATCH } from './fixtures/legacyHttpDispatch.js'
+import { LEGACY_HTTP_DISPATCH, type LegacyGroup } from './fixtures/legacyHttpDispatch.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
+// Preserve the frozen extraction baseline; specify later route additions independently.
+const CURRENT_HTTP_DISPATCH: Record<string, LegacyGroup> = {
+  ...LEGACY_HTTP_DISPATCH,
+  PRE_AUTH_ROUTES: {
+    ...LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES,
+    routes: [{ id: 'SYSTEM_HELP_LOCAL', line: 0, calls: ['handleSystemHelp'],
+      match: (_req, url) => url.pathname === '/api/internal/system-help' }, ...LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES.routes],
+    samples: ['/api/internal/system-help', ...LEGACY_HTTP_DISPATCH.PRE_AUTH_ROUTES.samples],
+  },
+}
 const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']
 
 // Original chain order (the client-session block between SYSTEM and APP_CONFIG was already a module).
@@ -55,7 +65,7 @@ function corpus(): string[] {
     '/healthz/',
     '/metricsx',
   ])
-  for (const group of Object.values(LEGACY_HTTP_DISPATCH)) {
+  for (const group of Object.values(CURRENT_HTTP_DISPATCH)) {
     for (const s of group.samples) {
       out.add(s)
       out.add(`${s}/`)
@@ -73,7 +83,7 @@ function corpus(): string[] {
 describe('route tables ≡ original if-chain', () => {
   it('fixture covers exactly these tables, in chain order', () => {
     assert.deepEqual(
-      Object.keys(LEGACY_HTTP_DISPATCH),
+      Object.keys(CURRENT_HTTP_DISPATCH),
       TABLES.map(([name]) => name),
     )
   })
@@ -82,7 +92,7 @@ describe('route tables ≡ original if-chain', () => {
     it(`${name}: same routes, same order`, () => {
       assert.deepEqual(
         table.map((r) => r.id),
-        LEGACY_HTTP_DISPATCH[name].routes.map((r) => r.id),
+        CURRENT_HTTP_DISPATCH[name].routes.map((r) => r.id),
       )
     })
   }
@@ -94,7 +104,7 @@ describe('route tables ≡ original if-chain', () => {
       for (const method of METHODS) {
         const req = reqOf(method)
         const legacy = TABLES.flatMap(([name]) =>
-          LEGACY_HTTP_DISPATCH[name].routes
+          CURRENT_HTTP_DISPATCH[name].routes
             .filter((r) => r.match(req, url))
             .map((r) => `${name}:${r.id}`),
         )
@@ -112,7 +122,7 @@ describe('route tables ≡ original if-chain', () => {
     const unreached: string[] = []
     for (const [name, table] of TABLES) {
       const hit = new Set<string>()
-      for (const path of LEGACY_HTTP_DISPATCH[name].samples) {
+      for (const path of CURRENT_HTTP_DISPATCH[name].samples) {
         const url = new URL(path, 'http://gateway.test')
         for (const method of METHODS)
           for (const id of matchingRouteIds(table, reqOf(method), url)) hit.add(id)
@@ -142,7 +152,7 @@ function recordingIo() {
 
 describe('thin-dispatch routes call the original handler', () => {
   for (const [name, table] of TABLES) {
-    const legacy = LEGACY_HTTP_DISPATCH[name]
+    const legacy = CURRENT_HTTP_DISPATCH[name]
     // routes whose original branch only did `this.handler(...).catch((err) => this.sendInternalError(res, err))`
     const thin = legacy.routes.filter(
       (r) =>

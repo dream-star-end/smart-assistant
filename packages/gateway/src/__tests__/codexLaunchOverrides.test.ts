@@ -386,7 +386,8 @@ describe('buildCodexLaunchOverrides', () => {
       systemHelpContextFile: '/synthetic/system-help-context.json',
     })
     const envKey = out.argvOverrides.find((s) => s.startsWith('mcp_servers.openclaude_memory.env='))
-    assert.ok(envKey?.includes('OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE'))
+    assert.ok(envKey)
+    assert.ok(envKey.includes('OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE'))
     assert.ok(envKey.includes('/synthetic/system-help-context.json'))
     if (envKey) {
       // env table must carry the FILE path, not the token itself.
