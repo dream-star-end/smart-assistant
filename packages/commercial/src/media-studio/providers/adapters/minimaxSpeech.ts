@@ -3,8 +3,14 @@
 // no real calls for them yet (user decision 2026-10-23 09:44).
 
 import { HttpError } from '../../../http/util.js'
-import { type SpeechModel, synthesizeSpeech } from '../../../minimax/mediaClient.js'
+import { miniMaxDebitedCredits } from '../../../minimax/mediaBilling.js'
+import {
+  type SpeechModel,
+  fetchSystemVoices,
+  synthesizeSpeech,
+} from '../../../minimax/mediaClient.js'
 import { calculateMiniMaxSpeechCost } from '../../../minimax/mediaPricing.js'
+import { SystemVoiceCache } from '../../../minimax/voices.js'
 import type { AdapterFactory } from '../registry.js'
 import { MediaProviderError, type ModelInfo } from '../types.js'
 import type { BuiltinAdapterDeps } from './deps.js'
@@ -33,7 +39,17 @@ export const minimaxSpeechAdapter: AdapterFactory<BuiltinAdapterDeps> = {
     return { missing: k?.error ? 'KEY_UNREADABLE' : 'MISSING_KEY' }
   },
   create({ deps, key }) {
-    const client = deps.minimax?.client
+    const mm = deps.minimax
+    const client = mm?.client
+    const speech = mm?.speech ?? synthesizeSpeech
+    const fetchVoices = mm?.fetchVoices ?? ((k: string) => fetchSystemVoices(fetch, k))
+    const debitedFor =
+      mm?.debitedFor ?? ((usageId: bigint) => miniMaxDebitedCredits(client!.pool, usageId))
+    // System voices are listed with this provider's own key (keyFile / keyEnv / default), code r1 P1.
+    const voices = new SystemVoiceCache(async () => {
+      if (!key) throw new Error('minimax media key missing')
+      return await fetchVoices(key)
+    })
     return {
       status: () => (client ? null : { state: 'disabled', reason: 'FEATURE_OFF' }),
       estimateMaxCost: (req, model) =>
@@ -51,8 +67,8 @@ export const minimaxSpeechAdapter: AdapterFactory<BuiltinAdapterDeps> = {
           throw new MediaProviderError('INVALID_REQUEST', false, 'voice.tts needs text and voiceId')
         }
         try {
-          const out = await synthesizeSpeech(
-            { ...client, key },
+          const out = await speech(
+            { ...client, key, voices },
             {
               userId: ctx.userId,
               containerId: null,
@@ -66,8 +82,9 @@ export const minimaxSpeechAdapter: AdapterFactory<BuiltinAdapterDeps> = {
             },
           )
           const s = out.settled
-          // A clamped debit (balance ran out mid-settle) charged less than the price.
-          const cost = s.debitedCredits ?? s.costCredits
+          // What was actually debited (code r1 P1): a clamped settle debits less than the price,
+          // and a replay carries no debit of its own, so the original is read from the ledger.
+          const cost = s.replayed ? await debitedFor(s.usageId) : (s.debitedCredits ?? 0n)
           return {
             outputs: [{ bytes: out.audio, mime: 'audio/mpeg' }],
             model: model.id,

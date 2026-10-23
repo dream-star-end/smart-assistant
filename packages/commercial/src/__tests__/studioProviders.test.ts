@@ -89,7 +89,7 @@ function fakeDeps(over: Partial<BuiltinAdapterDeps> = {}): BuiltinAdapterDeps & 
       prices: { image: 10n, video: 50n },
       readFile: async () => Buffer.from('mp4'),
     },
-    minimax: { mediaKey: { source: 'none' }, client: { pool: {} as never, voices: {} as never } },
+    minimax: { mediaKey: { source: 'none' }, client: { pool: {} as never } },
     ...over,
   }
 }
@@ -168,7 +168,7 @@ describe('default providers (no OC_STUDIO_PROVIDERS)', () => {
     const deps = fakeDeps({
       minimax: {
         mediaKey: { key: SENTINEL_KEY, source: 'file' },
-        client: { pool: {} as never, voices: {} as never },
+        client: { pool: {} as never },
       },
     })
     assert.equal(kindView(build(undefined, deps).registry, 'voice').state, 'ready')
@@ -455,7 +455,7 @@ describe('adapters', () => {
     const deps = fakeDeps({
       minimax: {
         mediaKey: { key: SENTINEL_KEY, source: 'file' },
-        client: { pool: {} as never, voices: {} as never },
+        client: { pool: {} as never },
       },
     })
     const p = build(undefined, deps).registry.get('minimax-speech')!
@@ -467,6 +467,88 @@ describe('adapters', () => {
       code: 'UNSUPPORTED_OP',
     })
     await assert.rejects(p.run(ctx(), { op: 'voice.tts', text: 'x' }), { code: 'INVALID_REQUEST' })
+  })
+
+  it('minimax-speech lists system voices with its own keyFile key (code r1 P1)', async () => {
+    const seen: string[] = []
+    let gotKey: string | undefined
+    const deps = fakeDeps({
+      minimax: {
+        mediaKey: { source: 'none' },
+        client: { pool: {} as never },
+        fetchVoices: async (key) => {
+          seen.push(key)
+          return [{ voiceId: 'v1', voiceName: 'v1', description: [] }]
+        },
+        speech: (async (d: { key?: string; voices: { get(): Promise<unknown> } }) => {
+          gotKey = d.key
+          await d.voices.get()
+          return {
+            audio: Buffer.from('ID3'),
+            format: 'mp3',
+            usageCharacters: 2,
+            settled: {
+              usageId: 1n,
+              ledgerId: 1n,
+              costCredits: 1n,
+              debitedCredits: 1n,
+              balanceAfter: 9n,
+              clamped: false,
+              replayed: false,
+            },
+          }
+        }) as never,
+      },
+    })
+    const { registry } = build(
+      JSON.stringify([{ id: 'minimax-speech', adapter: 'minimax-speech', keyFile: SENTINEL_PATH }]),
+      deps,
+    )
+    const p = registry.get('minimax-speech')!
+    assert.equal(p.status(USER).state, 'ready')
+    const out = await p.run(ctx(), { op: 'voice.tts', text: 'hi', voiceId: 'v1' })
+    assert.equal(gotKey, SENTINEL_KEY)
+    assert.deepEqual(seen, [SENTINEL_KEY])
+    assert.equal(out.costCredits, 1n)
+    assert.equal(out.charged, true)
+  })
+
+  it('minimax-speech reports the real debit: clamped settle, and a replay reads the ledger (code r1 P1)', async () => {
+    const settled = {
+      usageId: 7n,
+      ledgerId: 1n,
+      costCredits: 3n,
+      debitedCredits: 1n as bigint | null,
+      balanceAfter: 0n,
+      clamped: true,
+      replayed: false,
+    }
+    const asked: bigint[] = []
+    const deps = fakeDeps({
+      minimax: {
+        mediaKey: { key: SENTINEL_KEY, source: 'file' },
+        client: { pool: {} as never },
+        speech: (async () => ({
+          audio: Buffer.from('ID3'),
+          format: 'mp3',
+          usageCharacters: 9,
+          settled,
+        })) as never,
+        debitedFor: async (id) => {
+          asked.push(id)
+          return 1n
+        },
+      },
+    })
+    const p = build(undefined, deps).registry.get('minimax-speech')!
+    const first = await p.run(ctx(), { op: 'voice.tts', text: 'x', voiceId: 'v' })
+    assert.equal(first.costCredits, 1n)
+    assert.equal(first.charged, true)
+    Object.assign(settled, { debitedCredits: null, clamped: false, replayed: true })
+    const replay = await p.run(ctx(), { op: 'voice.tts', text: 'x', voiceId: 'v' })
+    assert.deepEqual(asked, [7n])
+    assert.equal(replay.costCredits, 1n, 'the original debit, not the 3-credit list price')
+    assert.equal(replay.charged, false)
   })
 
   it('refuses to run when the reservation is below the bound; flags an overrun', async () => {

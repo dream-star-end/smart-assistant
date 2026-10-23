@@ -10,9 +10,7 @@ import { parseImageModelPolicy } from '../billing/imageModels.js'
 import type { PreCheckRedis } from '../billing/preCheck.js'
 import type { CommercialConfig } from '../config.js'
 import { rootLogger } from '../logging/logger.js'
-import { fetchSystemVoices } from '../minimax/mediaClient.js'
 import { resolveMiniMaxMediaKey } from '../minimax/mediaKey.js'
-import { SystemVoiceCache } from '../minimax/voices.js'
 import type { MuseBridgeHub } from '../muse/hub.js'
 import { studioAccess } from './access.js'
 import { StudioBlobStore } from './blobs.js'
@@ -60,17 +58,9 @@ function providerDeps(
     MINIMAX_MEDIA_KEY_FILE: cfg.MINIMAX_MEDIA_KEY_FILE,
     MINIMAX_TOKEN_PLAN_KEY: cfg.MINIMAX_TOKEN_PLAN_KEY,
   })
-  const key = mediaKey.key
   deps.minimax = {
     mediaKey,
-    client: {
-      pool,
-      voices: new SystemVoiceCache(async () => {
-        if (!key) throw new Error('minimax media key missing')
-        return await fetchSystemVoices(fetch, key)
-      }),
-      windowCap: cfg.OC_MINIMAX_MEDIA_WINDOW_MAX_CALLS,
-    },
+    client: { pool, windowCap: cfg.OC_MINIMAX_MEDIA_WINDOW_MAX_CALLS },
   }
   return deps
 }
