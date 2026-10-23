@@ -10,6 +10,7 @@ import { assertModelCatalogAdminPoolConfigured, closeModelCatalogAdminPool,
   getModelCatalogAdminPool } from '../../packages/commercial/src/db/modelCatalogAdmin.js'
 import { loadConfig } from '../../packages/commercial/src/config.js'
 import { getRuntimeChannel } from '../../packages/commercial/src/runtimeChannel.js'
+import { peekModelCatalogCache } from '../../packages/commercial/src/billing/modelCatalogRuntime.js'
 import { createStaged, normalizeVersionInput, validateVersionSemantics }
   from '../../packages/commercial/src/admin/modelCatalogOps.js'
 import { KIMI31_MODEL_ID, KIMI31_VERSION, KIMI31_CATALOG_COLUMNS,
@@ -104,11 +105,13 @@ async function main(): Promise<void> {
     catalog: state.catalog ?? null, price: state.price ?? null, activationPerformed: false }))
 }
 void main().then(async () => {
+  await peekModelCatalogCache()?.stopListener()
   await Promise.allSettled([closePool(), closeModelCatalogAdminPool()])
 }, async (error: unknown) => {
   const code = error instanceof Error && /^[A-Z][A-Z0-9_]{1,79}$/.test(error.message)
     ? error.message : 'KIMI31_CATALOG_FAILED'
   console.error(code)
+  await peekModelCatalogCache()?.stopListener()
   await Promise.allSettled([closePool(), closeModelCatalogAdminPool()])
   process.exitCode = 1
 })
