@@ -6254,13 +6254,19 @@
         "74984cbf",
         "92acb899",
         "dc1ea28c",
-        "43b509a0"
+        "43b509a0",
+        "571fa589"
       ],
       "regressions": [
         {
           "layer": "deploy-gate",
           "path": "scripts/check-v5-box-incident-proofs.ts",
           "assertion": "[ocv5-317-box-cli-large-line] PASS — a 900 KB stdin line reaches the box Claude whole and a failed write ends the turn at once"
+        },
+        {
+          "layer": "unit",
+          "path": "packages/gateway/src/__tests__/cursorBoxCcWriteCleanup.test.ts",
+          "assertion": "a clean host exit cannot hide a refused write"
         },
         {
           "layer": "unit",

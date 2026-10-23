@@ -35,6 +35,7 @@ import { proveEmptyRecoveryCliResult, proveReadPdfDocument } from "./lib/boxRead
 import { proveRefusedRecoveryClosed as refusedRecoveryProof } from "./lib/boxRefusedRecoveryProof.js";
 import { proveGptWebCitationMarkers } from "./lib/boxGptWebCitationProof.js"; // OCV5-584 (file-size ratchet): [ocv5-584-gpt-web-citation-markers] PASS — ChatGPT Web citation markers cut across SSE frames never reach a text delta and a known source becomes a link
 import { misrecordedRun, proveCliRepairedToolInput, proveForeignToolHistory, rereadError } from "./lib/boxCliRepairProof.js";
+import { boxBridgeFailed, boxBridgeOutcome } from "./lib/boxBridgeFailureProof.js";
 import { scaledMs } from "./lib/gateLoadScale.js";
 
 const LIMIT_MS = 120_000;
@@ -2686,10 +2687,9 @@ async function proveBoxCliLargeLine(api: Api): Promise<string> {
   failing.refuse.writes = true;
   const refused = boxCliBridge(api, failing, "ocv5-317-refused");
   refused.stdin.write(line("never delivered"));
-  const outcome = await Promise.race([refused.bridge.then((exit) => `exit-${exit}`, () => "failed"),
-    tick(30_000).then(() => "still-waiting")]);
-  if (outcome !== "failed" || !refused.err().includes("BOX_CC_WRITE_FAILED") || refused.results().length !== 0) {
-    fail(`LARGE_LINE_WRITE_FAILURE_${outcome} ${refused.err().trim().split("\n").slice(-4).join(" | ").slice(-500)}`);
+  const outcome = await boxBridgeOutcome(refused.bridge, tick(30_000));
+  if (!boxBridgeFailed(outcome) || !refused.err().includes("BOX_CC_WRITE_FAILED") || refused.results().length !== 0) {
+    fail(`LARGE_LINE_WRITE_FAILURE_${JSON.stringify(outcome)} ${refused.err().trim().split("\n").slice(-4).join(" | ").slice(-500)}`);
   }
   refused.stdin.end();
   if (!await gone(failing.readers)) fail("LARGE_LINE_REFUSED_HOST_LEFT_RUNNING");
