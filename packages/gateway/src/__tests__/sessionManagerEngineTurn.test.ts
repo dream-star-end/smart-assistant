@@ -4969,6 +4969,7 @@ describe("preheatRunner", () => {
     runner.isRunning = false;
     runner.startDelayMs = 20;
     const session = makeSession(runner);
+    (sm as unknown as { sessions: Map<string, ReturnType<typeof makeSession>> }).sessions.set(session.sessionKey, session);
     const [a, b] = await Promise.all([sm.preheatRunner(session), sm.preheatRunner(session)]);
     assert.equal(a, "started");
     // 第二个并发调用要么共享同一 in-flight(started),要么在 isRunning 后到达。
@@ -4981,6 +4982,7 @@ describe("preheatRunner", () => {
     const sm = new SessionManager(makeConfigStub());
     const runner = new FakeCcbRunner(() => {});
     const session = makeSession(runner);
+    (sm as unknown as { sessions: Map<string, ReturnType<typeof makeSession>> }).sessions.set(session.sessionKey, session);
     assert.equal(await sm.preheatRunner(session), "already_running");
     assert.equal(runner.startCalls, 0);
   });
@@ -5019,6 +5021,7 @@ describe("preheatRunner", () => {
       throw new Error("spawn boom");
     };
     const session = makeSession(runner);
+    (sm as unknown as { sessions: Map<string, ReturnType<typeof makeSession>> }).sessions.set(session.sessionKey, session);
     assert.equal(await sm.preheatRunner(session), "failed");
     // lock 已释放:后续等待者不悬挂。
     await session.lock;
@@ -5032,6 +5035,7 @@ describe("preheatRunner", () => {
       const inner = new FakeCcbRunner(() => {});
       inner.isRunning = false;
       const session = makeSession(inner);
+      (sm as unknown as { sessions: Map<string, ReturnType<typeof makeSession>> }).sessions.set(session.sessionKey, session);
       const hung = new Promise<void>(() => {});
       let generation = 0;
       let startCalls = 0;
@@ -5075,6 +5079,7 @@ describe("preheatRunner", () => {
       runner.isRunning = false;
       runner.startDelayMs = 20;
       const session = makeSession(runner);
+      (sm as unknown as { sessions: Map<string, ReturnType<typeof makeSession>> }).sessions.set(session.sessionKey, session);
       assert.equal(await sm.preheatRunner(session), "started");
       assert.equal(runner.startCalls, 1);
       assert.ok(session.lastUsedAt > 0);

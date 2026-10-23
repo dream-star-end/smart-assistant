@@ -53,5 +53,5 @@ test('a stale or unknown runtime cannot accept a new profile grant through a dir
   req.method = 'PATCH'; req.headers.authorization = `Bearer ${access.token}`; req.headers['content-type'] = 'application/json'
   req.push(JSON.stringify({ system_assistant_profile: { enabled: true, nickname: 'fixture', sessionId: 'scope-a' } })); req.push(null)
   const res = new ServerResponse(req)
-  await assert.rejects(handlePatchMyPreferences(req, res, {} as never, { jwtSecret: secret, resolvePromptPrivacySupport: async () => ({ version: 1, state: 'upgrade_required' }) } as CommercialHttpDeps), e => e instanceof Error && e.message.includes('更新运行环境'))
+  await assert.rejects(handlePatchMyPreferences(req, res, {} as never, { jwtSecret: secret, resolvePromptPrivacySupport: async () => ({ version: 1, state: 'upgrade_required' }) } as unknown as CommercialHttpDeps), e => e instanceof Error && e.message.includes('更新运行环境'))
 })
