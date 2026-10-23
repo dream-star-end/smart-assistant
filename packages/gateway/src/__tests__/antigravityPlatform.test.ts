@@ -5,7 +5,7 @@
  */
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, readdirSync, realpathSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -118,5 +118,19 @@ test('projection reports the expiry it wrote and never the token', async () => {
     } finally {
       cleanupAntigravityLaunch(projection)
     }
+  })
+})
+
+test('the Antigravity MCP shell inherits only the stable help context path and existing local gateway port', async () => {
+  await withHome(async () => {
+    const projection = projectAntigravityPlatform({ ...input(null), gatewayToken: 'synthetic-gateway-token', systemHelpContextFile: '/synthetic/system-help-context.json' })
+    const raw = readFileSync(path.join(projection.launchHome, '.gemini', 'config', 'mcp_config.json'), 'utf8')
+    const config = JSON.parse(raw) as { mcpServers: Record<string, { env: Record<string, string> }> }
+    const server = Object.values(config.mcpServers)[0]
+    assert.ok(server)
+    assert.equal(server.env.OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE, '/synthetic/system-help-context.json')
+    assert.equal(server.env.OPENCLAUDE_GATEWAY_PORT, '18789')
+    assert.equal(raw.includes('synthetic-gateway-token'), false)
+    cleanupAntigravityLaunch(projection)
   })
 })

@@ -5899,6 +5899,7 @@ export async function registerCommercial(
 
   const userChatBridge: UserChatBridgeHandler = createUserChatBridge({
     jwtSecret,
+    issueSystemHelpBootstrap: systemActions ? scope => systemActions!.runtime.issueBootstrap(scope) : undefined,
     promptQueueEnabled: isPromptQueueV1Enabled(),
     // Chat / turn dispatch may prefer a live desktop tunnel (P1-IMPL-01).
     resolveContainerEndpoint,

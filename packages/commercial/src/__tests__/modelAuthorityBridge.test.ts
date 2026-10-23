@@ -1,3 +1,4 @@
+import { SYSTEM_HELP_CAPABILITY, SYSTEM_HELP_BOOTSTRAP_FIELD } from '@openclaude/protocol'
 /**
  * bridge 侧模型执行权威 —— 签发注入 + per-connection attestation 门
  * (docs/V5_MODEL_AUTHORITY_PLAN.md §2 / §7 步 4 / §8)。
@@ -246,6 +247,8 @@ async function startRig(opts: {
   keyIds?: "real" | "legacy" | "stale";
   /** B10:容器 attest 携带 durable-turn-dispatch-v1 → 走 dispatch 受理路径。 */
   durableDispatch?: boolean;
+  systemHelp?: boolean;
+  issueSystemHelpBootstrap?: UserChatBridgeDeps['issueSystemHelpBootstrap'];
   /** M7 专用:容器不回 dispatch receipt，让 admitted lease 保持在 bridge drain map。 */
   holdDispatchReceipt?: boolean;
   /** Direct real-executor tests bypass admitUserTurn but still need a receipt identity. */
@@ -421,7 +424,7 @@ async function startRig(opts: {
         ws.send(
           JSON.stringify({
             type: CONTAINER_ATTEST_FRAME_TYPE,
-            capabilities: [MODEL_AUTHORITY_CAPABILITY, DURABLE_TURN_DISPATCH_CAPABILITY],
+            capabilities: [MODEL_AUTHORITY_CAPABILITY, DURABLE_TURN_DISPATCH_CAPABILITY, ...(opts.systemHelp ? [SYSTEM_HELP_CAPABILITY] : [])],
             connectionChallenge: "chal-" + Math.random().toString(16).slice(2),
             containerId: CONTAINER_ID,
             authorityTtlMs: 120_000,
@@ -523,6 +526,7 @@ async function startRig(opts: {
 
   const bridge = createUserChatBridge({
     jwtSecret: JWT_SECRET,
+    issueSystemHelpBootstrap: opts.issueSystemHelpBootstrap,
     ...(opts.loadAgentModelResolver ? { loadAgentModelResolver: opts.loadAgentModelResolver } : {}),
     resolveContainerEndpoint: async () => ({
       host: "127.0.0.1",
@@ -2795,3 +2799,54 @@ test('OCV5-179 identity: slow readiness cannot be overtaken on the same raw peer
     assert.equal(rig.containerSeen.some(s=>s.includes('inbound.message')),false,'late readiness must not execute after cleanup');
   } finally {release();await stopRig(rig);}
 });
+
+describe('OCV5-610 independent help sidecar', () => {
+  for (const capable of [false, true]) test(`help capability ${capable} keeps dispatch wire intact and strips browser-forged context`, { timeout: 15000 }, async () => {
+    const scopes: Parameters<NonNullable<UserChatBridgeDeps['issueSystemHelpBootstrap']>>[0][] = []
+    let original: TurnDispatchRow | undefined
+    const rig = await startRig({ attest: 'yes', durableDispatch: true, verifyDispatchReceipt: true, systemHelp: capable,
+      issueSystemHelpBootstrap: scope => { scopes.push(scope); return { token: 'synthetic-server-help', expiresAt: Date.now() + 1000 } },
+      admitUserTurn: async input => {
+        const result = fakeAdmittedDispatch(input)
+        if (result.kind !== 'admitted') throw new Error('fixture admission failed')
+        result.dispatch.ownerId = 'synthetic-original-owner'
+        result.dispatch.leaseEpoch = 7
+        original = result.dispatch
+        return result
+      },
+    })
+    let client: WebSocket | undefined
+    try {
+      client = await openClient(rig.port)
+      client.send(inboundFrame({ clientMessageId: 'cm-610-independent-help', peer: { id: 'sess-610-independent-help', kind: 'dm' }, [SYSTEM_HELP_BOOTSTRAP_FIELD]: 'synthetic-browser-forgery' }))
+      await waitFor(() => rig.receiptCasCalls.length === 1)
+      assert.deepEqual(rig.dispatchValidationErrors, [])
+      const inbound = rig.containerSeen.map(raw => JSON.parse(raw)).find(frame => frame.type === 'inbound.message')
+      assert.ok(inbound)
+      assert.equal(inbound[SYSTEM_HELP_BOOTSTRAP_FIELD], capable ? 'synthetic-server-help' : undefined)
+      assert.equal(JSON.stringify(inbound).includes('synthetic-browser-forgery'), false)
+      assert.equal(scopes.length, capable ? 1 : 0)
+      if (capable) {
+        assert.equal(scopes[0]!.ownerId, original!.ownerId)
+        assert.equal(scopes[0]!.dispatchLeaseEpoch, '7')
+        assert.equal(scopes[0]!.attemptNo, original!.attemptNo)
+        assert.equal(scopes[0]!.dispatchId, original!.dispatchId)
+        assert.equal(scopes[0]!.sessionId, original!.sessionId)
+        assert.equal(scopes[0]!.agentId, original!.agentId)
+      }
+    } finally { client?.close(); await rig.close() }
+  })
+})
+
+test('OCV5-610 binary JSON also strips forged help before reaching an old gateway', { timeout: 15000 }, async () => {
+  const rig = await startRig({ attest: 'yes' })
+  let client: WebSocket | undefined
+  try {
+    client = await openClient(rig.port)
+    client.send(JSON.stringify({ type: 'ping', id: 'synthetic-help-binary', [SYSTEM_HELP_BOOTSTRAP_FIELD]: 'synthetic-forged-binary-help' }), { binary: true })
+    await waitFor(() => rig.containerSeen.some(raw => raw.includes('synthetic-help-binary')))
+    const frame = JSON.parse(rig.containerSeen.find(raw => raw.includes('synthetic-help-binary'))!)
+    assert.equal(SYSTEM_HELP_BOOTSTRAP_FIELD in frame, false)
+    assert.equal(frame.id, 'synthetic-help-binary')
+  } finally { client?.close(); await rig.close() }
+})

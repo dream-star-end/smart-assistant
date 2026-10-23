@@ -1,3 +1,6 @@
+import { SYSTEM_HELP_CAPABILITY, takeSystemHelpBootstrap } from '@openclaude/protocol'
+import { captureSystemHelpFrame } from './systemHelpFrames.js'
+import { getSystemHelpRelay } from './systemHelpRelay.js'
 /**
  * Gateway WebSocket connection: connection lifecycle, hello auto-resume, stop, delivery and stamped/status frames
  *
@@ -201,6 +204,7 @@ export function handleWsConnection(
           this._durableTurnDispatchReady,
         ),
       ]
+      if (this._dispatchAuthority.enabled && this._durableTurnDispatchReady && getSystemHelpRelay(this.sessions)) attestFrame.capabilities.push(SYSTEM_HELP_CAPABILITY)
       ws.send(JSON.stringify(attestFrame))
     } catch (err) {
       this.log.warn('model_authority.attest_send_failed', {
@@ -227,6 +231,7 @@ export function handleWsConnection(
         ws.send(JSON.stringify({ type: 'error', error: 'invalid json' }))
         return
       }
+      const systemHelpBootstrap = takeSystemHelpBootstrap(frame)
       // Client-side application-level ping. Echo a pong (preserving the
       // optional id) so the client's watchdog can distinguish a live socket
       // from one that's still readyState=1 but frozen by an iOS Safari
@@ -410,6 +415,7 @@ export function handleWsConnection(
         // 无票据(非 durable / 非 webchat-DM / 未 enabled)→ return true 放行 legacy;
         // dispatch 票据与 prompt-queue grant 互斥,故此门失败无 queue grant 需取消。
         if (!this._consumeDispatchAuthority(ws, frame as any, isFromBridge)) return
+        captureSystemHelpFrame(frame as object, systemHelpBootstrap, isFromBridge)
         if (isFromBridge) (this.trustedGoalFrames ??= new WeakSet()).add(frame as object)
         // biome-ignore lint/performance/noDelete: moved verbatim from server.ts (OCV5-483); pre-existing there
         else delete (frame as any)._goalState

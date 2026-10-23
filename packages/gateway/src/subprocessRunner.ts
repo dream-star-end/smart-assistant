@@ -766,6 +766,8 @@ export class SubprocessRunner extends EventEmitter {
           OC_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
           OPENCLAUDE_AGENT_ID: this.opts.agentId,
+          OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE: this.opts.systemHelpContextFile ?? '',
+          OPENCLAUDE_GATEWAY_PORT: String(this.opts.config.gateway.port),
           OC_AGENT_ID: this.opts.agentId,
           ...identityCompatEnvironment(this.opts.identityCompat),
           ...(this.delegateContextFile
@@ -1752,6 +1754,7 @@ export class SubprocessRunner extends EventEmitter {
               ? { OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME }
               : {}),
             OPENCLAUDE_SESSION_KEY: this.opts.sessionKey,
+            ...(this.opts.systemHelpContextFile ? { OPENCLAUDE_SYSTEM_HELP_CONTEXT_FILE: this.opts.systemHelpContextFile } : {}),
             OPENCLAUDE_GATEWAY_PORT: String(this.opts.config.gateway.port),
             OPENCLAUDE_GATEWAY_TOKEN: this.opts.config.gateway.accessToken,
             OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,

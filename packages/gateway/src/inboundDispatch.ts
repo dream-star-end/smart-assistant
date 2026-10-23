@@ -1,3 +1,5 @@
+import { takeSystemHelpBootstrap } from '@openclaude/protocol'
+import { getSystemHelpBootstrap } from './systemHelpFrames.js'
 /**
  * Gateway inbound dispatch: the per-frame chat dispatch path (dispatchInbound)
  *
@@ -165,6 +167,7 @@ export async function dispatchInbound(
 ): Promise<void> {
   // A few compatibility tests invoke this method with a minimal Gateway-shaped
   // object. Keep the flag-off/non-queue path independent of coordinator state.
+  takeSystemHelpBootstrap(frame)
   const gatewayReceivedAt = performance.now()
   const promptQueueLifecycle = this._promptQueueLifecycleByFrame?.get(frame as object)
   const promptQueueExecutionFence = this._promptQueueExecutionFenceByFrame?.get(frame as object)
@@ -2236,6 +2239,7 @@ export async function dispatchInbound(
               }
             : undefined
       const leaderSubmitOpts = {
+        systemHelpBootstrap: getSystemHelpBootstrap(frame as object),
         historicalMessages: masterHistoricalMessages,
         codexRoute: safeCodexRoute,
         grokRoute: safeGrokRoute,

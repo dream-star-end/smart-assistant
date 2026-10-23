@@ -1,3 +1,4 @@
+import { systemHelpEnvironment } from '../systemHelpEnvironment.js'
 /**
  * Project OpenClaude platform context + openclaude-memory MCP into the
  * official Google Antigravity CLI (OCV5-415). The CLI inherits nothing from
@@ -120,6 +121,7 @@ export interface AntigravityLaunchCredential {
 }
 
 export interface AntigravityPlatformInput {
+  systemHelpContextFile?: string
   credential: AntigravityLaunchCredential
   identityCompat?: IdentityCompatRuntimeContext
   agentId: string
@@ -268,7 +270,8 @@ export function projectAntigravityPlatform(
         ...(input.projectId ? { OPENCLAUDE_PROJECT_ID: input.projectId } : {}),
         OPENCLAUDE_HOME: process.env.OPENCLAUDE_HOME?.trim() || paths.home,
         OPENCLAUDE_SESSION_KEY: input.sessionKey,
-        OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
+        ...systemHelpEnvironment(input.systemHelpContextFile, input.gatewayPort),
+      OPENCLAUDE_GATEWAY_PORT: String(input.gatewayPort),
         OPENCLAUDE_GATEWAY_TOKEN_FILE: tokenFile,
         OPENCLAUDE_DELEGATE_CONTEXT_FILE: delegateContextFile,
         OPENCLAUDE_DELEGATION_DEPTH: String(input.delegationDepth),

@@ -1,3 +1,5 @@
+import { getSystemHelpRelay, installSystemHelpRelay } from './systemHelpRelay.js'
+import { handleSystemHelpLocal } from './systemHelpHttp.js'
 export { runSessionPreheat, validateEnginePreheatBody } from './sessionPreheat.js'
 export type { EnginePreheatBody, EnginePreheatValidation, SessionPreheatHost } from './sessionPreheat.js'
 import type { GatewayHttpIo } from './routes/httpIo.js'
@@ -727,6 +729,7 @@ export class Gateway {
   constructor(private deps: GatewayDeps) {
     this.router = new Router(deps.agentsConfig)
     this.sessions = new SessionManager(deps.config)
+    installSystemHelpRelay(this.sessions)
     this.sessions.onCcbTaskNotification = (session, payload) => {
       void this.handleCcbLocalAgentNotification(session, payload)
     }
@@ -873,6 +876,7 @@ export class Gateway {
   }
   /** Narrow view of the Gateway for routes/preAuth.ts (FINDINGS §7.5 2b, OCV5-468). */
   private readonly preAuthRoutesIo: PreAuthRoutesIo = ((gw: Gateway): PreAuthRoutesIo => ({
+    handleSystemHelp: (req, res) => handleSystemHelpLocal(req, res, getSystemHelpRelay(gw.sessions)),
     _handleSkillEvalGenStart: (...args) => gw._handleSkillEvalGenStart(...args),
     _handleSkillEvalGenStatus: (...args) => gw._handleSkillEvalGenStatus(...args),
     _handleSkillTrainRun: (...args) => gw._handleSkillTrainRun(...args),

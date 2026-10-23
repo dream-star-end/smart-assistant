@@ -796,6 +796,8 @@ export function buildHostSpawnProviderEnv(input: HostSpawnProviderEnvInput): Hos
 // ───────────────────────────────────────────────
 
 export interface SubprocessRunnerOpts {
+  /** Stable, attempt-refreshed opaque help context. Never contains the master signing key. */
+  systemHelpContextFile?: string
   sessionKey: string
   agentId: string
   /** Phase 5 重命名(原 `cwd`):agent 的项目基础目录 = 没绑定 GitHub repo 时
