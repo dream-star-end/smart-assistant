@@ -228,3 +228,44 @@ describe('costBreakdown', () => {
     ])
   })
 })
+
+describe('FE-3 code r1 fixes', () => {
+  test('final QA judges every item; failing ones are not ticked', () => {
+    const v = view({
+      takes: [
+        take({
+          id: 'f1',
+          ownerKind: 'final',
+          ownerId: 'p',
+          version: 1,
+          qa: { passed: false, character: 0.9, glitches: 3, moderation: 'fail' },
+        }),
+      ],
+    })
+    render(<FinalPage auth={auth} view={v} onOpenBoard={() => {}} />)
+    expect(screen.queryByText('QA 全部通过')).not.toBeInTheDocument()
+    expect(screen.getAllByRole('img', { name: '通过' })).toHaveLength(1)
+    expect(screen.getAllByRole('img', { name: '未达标' })).toHaveLength(2)
+    expect(screen.getByText('3 处')).toBeInTheDocument()
+    expect(screen.getByText('未通过')).toBeInTheDocument()
+  })
+
+  test('starting one music candidate pauses the others', async () => {
+    const v = view({
+      takes: [
+        take({ id: 'm1', ownerKind: 'music', ownerId: 'p', version: 1 }),
+        take({ id: 'm2', ownerKind: 'music', ownerId: 'p', version: 2, blobSha: 'b'.repeat(64) }),
+      ],
+    })
+    const { container } = render(
+      <MusicPage auth={auth} view={v} providers={prov('ready', 'ready')} onOpenShot={() => {}} />,
+    )
+    await waitFor(() => expect(container.querySelectorAll('audio')).toHaveLength(2))
+    const [a, b] = [...container.querySelectorAll('audio')]
+    const pauseA = vi.spyOn(a!, 'pause').mockImplementation(() => {})
+    const pauseB = vi.spyOn(b!, 'pause').mockImplementation(() => {})
+    b!.dispatchEvent(new Event('play'))
+    expect(pauseA).toHaveBeenCalledTimes(1)
+    expect(pauseB).not.toHaveBeenCalled()
+  })
+})

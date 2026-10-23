@@ -2361,3 +2361,4 @@ fieldset.st-versions {
     padding: 16px;
   }
 }
+.st-qa-fail b { color: var(--warning); }

@@ -125,7 +125,15 @@ export function MusicPage(props: {
               </div>
             </div>
           ) : (
-            <div className="st-music-cands">
+            <div
+              className="st-music-cands"
+              // One candidate plays at a time (code r1 P1): starting one pauses the others.
+              onPlay={(e) => {
+                const playing = e.target
+                for (const a of e.currentTarget.querySelectorAll('audio'))
+                  if (a !== playing) a.pause()
+              }}
+            >
               {candidates.slice(0, 4).map((t, i) => (
                 <Candidate
                   key={t.id}

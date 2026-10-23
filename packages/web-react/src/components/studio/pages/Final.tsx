@@ -1,7 +1,7 @@
 // OCV5-593 FE-3 成片 (d08 / m05): the composed film on a cinema stage, its shots / voice / music
 // strip, the final QA, export (download of the composed file) and the project cost breakdown.
 
-import { Check, Clapperboard, Download, MapPin } from 'lucide-react'
+import { Check, CircleAlert, Clapperboard, Download, MapPin } from 'lucide-react'
 import { useMemo, useState } from 'react'
 
 import { useBlobUrl } from '../../../hooks/useBlobUrl'
@@ -48,12 +48,33 @@ export function costBreakdown(
     .map(({ label, count, credits }) => ({ label, count, credits }))
 }
 
-const QA_LABEL: Array<[string, string, (v: unknown) => string]> = [
-  ['character', '角色一致', (v) => Number(v).toFixed(2)],
-  ['subtitleSyncMs', '字幕与配音对齐', (v) => `±${Number(v)} ms`],
-  ['loudnessLufs', '响度', (v) => `${Number(v).toFixed(1)} LUFS`],
-  ['glitches', '黑帧 / 卡顿 / 爆音', (v) => (Number(v) === 0 ? '无' : `${Number(v)} 处`)],
-  ['moderation', '内容审核', (v) => (v === 'pass' || v === true ? '通过' : String(v))],
+/** [field, label, format, passes] — each item is judged on its own (code r1 P1: never a blanket tick). */
+export const QA_ITEMS: Array<[string, string, (v: unknown) => string, (v: unknown) => boolean]> = [
+  ['character', '角色一致', (v) => Number(v).toFixed(2), (v) => Number(v) >= 0.75],
+  [
+    'subtitleSyncMs',
+    '字幕与配音对齐',
+    (v) => `±${Number(v)} ms`,
+    (v) => Math.abs(Number(v)) <= 120,
+  ],
+  [
+    'loudnessLufs',
+    '响度',
+    (v) => `${Number(v).toFixed(1)} LUFS`,
+    (v) => Number(v) >= -18 && Number(v) <= -14,
+  ],
+  [
+    'glitches',
+    '黑帧 / 卡顿 / 爆音',
+    (v) => (Number(v) === 0 ? '无' : `${Number(v)} 处`),
+    (v) => Number(v) === 0,
+  ],
+  [
+    'moderation',
+    '内容审核',
+    (v) => (v === 'pass' || v === true ? '通过' : v === 'review' ? '待人工复核' : '未通过'),
+    (v) => v === 'pass' || v === true,
+  ],
 ]
 
 export function FinalPage(props: {
@@ -158,10 +179,14 @@ export function FinalPage(props: {
             </div>
             {qa ? (
               <ul className="st-final-qa">
-                {QA_LABEL.filter(([k]) => qa[k] !== undefined).map(([k, label, fmt]) => (
-                  <li key={k} className="st-row">
-                    <span className="st-chip st-chip-ok st-qa-tick">
-                      <Check />
+                {QA_ITEMS.filter(([k]) => qa[k] !== undefined).map(([k, label, fmt, passes]) => (
+                  <li key={k} className={`st-row${passes(qa[k]) ? '' : ' st-qa-fail'}`}>
+                    <span
+                      className={`st-chip ${passes(qa[k]) ? 'st-chip-ok' : 'st-chip-warn'} st-qa-tick`}
+                      role="img"
+                      aria-label={passes(qa[k]) ? '通过' : '未达标'}
+                    >
+                      {passes(qa[k]) ? <Check /> : <CircleAlert />}
                     </span>
                     <span style={{ flex: 1 }}>{label}</span>
                     <b className="tnum">{fmt(qa[k])}</b>
