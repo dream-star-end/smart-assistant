@@ -230,6 +230,9 @@ export const DURABLE_TABLES: readonly string[] = [
   // 随稿件离场;稿件本身无基于时间的清理。
   "community_tutorial_moderation_jobs",
   "community_tutorial_moderations",
+  // 0326 经验分享修改记录与修改稿图片：FK community_tutorials / 修改稿 ON DELETE CASCADE，随稿件离场。
+  "community_tutorial_revisions",
+  "community_tutorial_revision_images",
   "cursor_external_usage_audit",
   "inbox_message_audience_snapshots",
   "ocr_jobs",

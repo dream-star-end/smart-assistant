@@ -1,4 +1,4 @@
-import { Check, Eye, EyeOff, Image as ImageIcon, X } from 'lucide-react'
+import { Check, Eye, EyeOff, Image as ImageIcon, SquarePen, X } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { BlogProse, type BlogImageSource } from '../../../components/tutorials/blog/BlogArticle'
 import { blogCategoryLabel } from '../../../components/tutorials/blog/blogLib'
@@ -114,6 +114,11 @@ function ReviewCard({
     >
       <div className="min-w-0">
         <div className="mb-2 flex flex-wrap items-center gap-1.5">
+          {item.editId && (
+            <span className="blog-chip blog-chip-warn" title="已发布帖的修改稿：审核通过后替换线上版本，驳回则线上不变">
+              <SquarePen size={12} aria-hidden /> 修改稿 · 线上为旧版
+            </span>
+          )}
           <span className="blog-chip blog-chip-accent">{blogCategoryLabel(item.category)}</span>
           {(item.imageCount ?? 0) > 0 && (
             <span className="blog-chip">
@@ -151,6 +156,7 @@ function ReviewCard({
             tab={tab}
             busy={busy}
             actionLabel={actionLabel}
+            approveLabel={item.editId ? '通过并替换线上' : '通过发布'}
             noteOpen={noteOpen}
             note={note}
             setNote={setNote}
@@ -168,6 +174,7 @@ function ReviewCard({
             tab={tab}
             busy={busy}
             actionLabel={actionLabel}
+            approveLabel={item.editId ? '通过并替换线上' : '通过发布'}
             noteOpen={noteOpen}
             note={note}
             setNote={setNote}
@@ -186,6 +193,7 @@ function Actions(props: {
   tab: Tab
   busy: boolean
   actionLabel: string
+  approveLabel: string
   noteOpen: boolean
   note: string
   setNote: (v: string) => void
@@ -212,7 +220,7 @@ function Actions(props: {
       <div className="flex flex-wrap gap-2">
         {tab === 'human' && !noteOpen && (
           <Button variant="accent" size="sm" shape="pill" loading={busy} disabled={busy} onClick={props.onApprove}>
-            <Check size={14} /> 通过发布
+            <Check size={14} /> {props.approveLabel}
           </Button>
         )}
         {noteOpen ? (
@@ -255,6 +263,7 @@ function RecordRow({ record }: { record: BlogModerationRecord }) {
             {VERDICT_LABEL[record.verdict]}
           </span>
           <span className="blog-chip">{record.mode === 'shadow' ? '影子模式' : record.applied ? '已生效' : '未生效'}</span>
+          {record.revisionId && <span className="blog-chip">修改稿</span>}
           <span className="blog-chip">
             #{record.publicationId} · {record.authorName} · {stamp(record.createdAt)}
           </span>
@@ -332,7 +341,10 @@ export default function BlogAdminPage() {
       setItems((current) => current.filter((entry) => entry.id !== item.id))
       if (tab === 'human') setHumanCount((n) => (n == null ? n : Math.max(0, n - 1)))
     } catch (cause) {
-      setError(apiErrorMessage(cause, failure))
+      // 作者中途改过（409）或已被处理：先刷新列表（load 会清掉旧错误），再显示原因。
+      const message = apiErrorMessage(cause, failure)
+      await load(null)
+      setError(message)
     } finally {
       setBusyId(null)
     }
@@ -391,10 +403,18 @@ export default function BlogAdminPage() {
               tab={tab}
               busy={busyId === item.id}
               onApprove={() =>
-                void act(item, () => adminApi.adminReviewCommunityTutorial(adminSession, item.id, 'approve'), '通过失败')
+                void act(
+                  item,
+                  () => adminApi.adminReviewCommunityTutorial(adminSession, item.id, 'approve', undefined, item.reviewToken),
+                  '通过失败',
+                )
               }
               onReject={(note) =>
-                void act(item, () => adminApi.adminReviewCommunityTutorial(adminSession, item.id, 'reject', note), '驳回失败')
+                void act(
+                  item,
+                  () => adminApi.adminReviewCommunityTutorial(adminSession, item.id, 'reject', note, item.reviewToken),
+                  '驳回失败',
+                )
               }
               onTakedown={(note) =>
                 void act(item, () => adminApi.adminTakedownCommunityTutorial(adminSession, item.id, note), '下架失败')

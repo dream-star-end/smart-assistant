@@ -46,6 +46,8 @@ export const adminApi = {
     id: string,
     decision: "approve" | "reject",
     note?: string,
+    /** 列表给的 reviewToken；作者中途改过服务端返回 409，避免审到旧内容。 */
+    reviewToken?: string,
   ) =>
     jsonOrThrow<{ ok: boolean }>(
       callWithRefresh(a, (token) =>
@@ -53,7 +55,7 @@ export const adminApi = {
           method: "POST",
           credentials: "include",
           headers: bearerHeaders(token, true),
-          body: JSON.stringify({ decision, note }),
+          body: JSON.stringify({ decision, note, reviewToken }),
         }),
       ),
     ),

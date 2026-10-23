@@ -21,6 +21,8 @@ const post: AdminBlogPost = {
   needsHuman: true,
   imageCount: 4,
   bodyChars: 3420,
+  editId: null,
+  reviewToken: 'p:1',
   moderation: {
     verdict: 'uncertain',
     mode: 'on',
@@ -62,7 +64,7 @@ describe('BlogAdminPage', () => {
     expect(screen.getByText(/4 张图/)).toBeInTheDocument()
     expect(adminApi.adminListBlogPosts).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ status: 'pending', needsHuman: true }))
     fireEvent.click(screen.getByRole('button', { name: /通过发布/ }))
-    await waitFor(() => expect(adminApi.adminReviewCommunityTutorial).toHaveBeenCalledWith(expect.anything(), '12', 'approve'))
+    await waitFor(() => expect(adminApi.adminReviewCommunityTutorial).toHaveBeenCalledWith(expect.anything(), '12', 'approve', undefined, 'p:1'))
     await waitFor(() => expect(screen.queryByText(post.title)).not.toBeInTheDocument())
   })
 
@@ -75,8 +77,34 @@ describe('BlogAdminPage', () => {
     fireEvent.change(screen.getByLabelText('驳回理由'), { target: { value: '请删掉付费工具推广' } })
     fireEvent.click(confirm)
     await waitFor(() =>
-      expect(adminApi.adminReviewCommunityTutorial).toHaveBeenCalledWith(expect.anything(), '12', 'reject', '请删掉付费工具推广'),
+      expect(adminApi.adminReviewCommunityTutorial).toHaveBeenCalledWith(expect.anything(), '12', 'reject', '请删掉付费工具推广', 'p:1'),
     )
+  })
+
+  it('已发布帖的修改稿：标「修改稿 · 线上为旧版」，通过按钮是「通过并替换线上」，带回修改稿的 reviewToken', async () => {
+    vi.mocked(adminApi.adminListBlogPosts).mockResolvedValue({
+      tutorials: [{ ...post, editId: '31', reviewToken: 'r:31', status: 'pending' }],
+      nextCursor: null,
+    })
+    render(<BlogAdminPage />)
+    await screen.findByText(post.title)
+    expect(screen.getByText(/修改稿 · 线上为旧版/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /通过并替换线上/ }))
+    await waitFor(() =>
+      expect(adminApi.adminReviewCommunityTutorial).toHaveBeenCalledWith(expect.anything(), '12', 'approve', undefined, 'r:31'),
+    )
+  })
+
+  it('审核失败（作者中途改过，409）：显示原因并重新加载列表', async () => {
+    vi.mocked(adminApi.adminReviewCommunityTutorial).mockRejectedValue(
+      new ApiError({ status: 409, message: '作者刚修改过这篇，请刷新后按新内容再审' }),
+    )
+    render(<BlogAdminPage />)
+    await screen.findByText(post.title)
+    const loads = vi.mocked(adminApi.adminListBlogPosts).mock.calls.length
+    fireEvent.click(screen.getByRole('button', { name: /通过发布/ }))
+    expect(await screen.findByText(/作者刚修改过这篇/)).toBeInTheDocument()
+    await waitFor(() => expect(vi.mocked(adminApi.adminListBlogPosts).mock.calls.length).toBeGreaterThan(loads))
   })
 
   it('没有 AI 审核接口（旧后端 404）时隐藏 AI 状态行与审核记录页签', async () => {

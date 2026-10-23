@@ -1,5 +1,5 @@
 import '@testing-library/jest-dom/vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { api } from '../../../lib/api'
 import type { AuthSession, CommunityTutorialMine, CommunityTutorialSummary } from '../../../lib/types'
@@ -110,13 +110,14 @@ describe('经验分享', () => {
     expect(document.querySelector('meta[name="robots"]')).toBeNull()
   })
 
-  it('我的投稿：AI 审核中显示分步进度，未通过显示理由与复制为新稿，人工复核中有说明', async () => {
+  it('我的投稿：AI 审核中显示分步进度，未通过显示理由与修改，人工复核中有说明，已撤回可复制为新稿', async () => {
     vi.mocked(api.listMyCommunityTutorials).mockResolvedValue({
       tutorials: [
         mine({ id: '1', needsHuman: false }),
         mine({ id: '2', title: '加我微信领模板', status: 'rejected', reviewNote: '内容包含站外联系方式。', reviewedAt: '2026-10-18T10:00:00.000Z' }),
         mine({ id: '3', title: '论文精读', needsHuman: true }),
         mine({ id: '4', title: '日报', status: 'approved', publishedAt: '2026-10-19T10:00:00.000Z', viewCount: 128 }),
+        mine({ id: '5', title: '撤回过的一篇', status: 'withdrawn' }),
       ],
       nextCursor: null,
     })
@@ -128,9 +129,88 @@ describe('经验分享', () => {
     expect(screen.getByText('内容包含站外联系方式。')).toBeInTheDocument()
     expect(screen.getByText(/已转给管理员复核/)).toBeInTheDocument()
     expect(screen.getByText(/已被阅读 128 次/)).toBeInTheDocument()
+    // 待审 2 篇 + 未通过 + 已发布都能改；撤回按钮在待审 2 篇和已发布上（OCV5-577：已发布也能撤回）。
+    expect(screen.getAllByRole('button', { name: '修改' })).toHaveLength(4)
+    expect(screen.getAllByRole('button', { name: '撤回' })).toHaveLength(3)
     fireEvent.click(screen.getByRole('button', { name: '复制为新稿' }))
-    expect(await screen.findByLabelText('标题')).toHaveValue('加我微信领模板')
+    expect(await screen.findByLabelText('标题')).toHaveValue('撤回过的一篇')
     expect(screen.getByText(/提交后由 AI 自动审核/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /提交发布/ })).toBeInTheDocument()
+  })
+
+  it('修改未通过的稿件：编辑器带入原文，提交走 revise，回到我的投稿', async () => {
+    window.localStorage.removeItem('oc:blog-edit:2')
+    const body = '## 做法\n\n先准备数据源，再写清楚口径，最后让定时任务每天自动跑一次，跑完核对三天的数据都对得上。'
+    vi.mocked(api.listMyCommunityTutorials).mockResolvedValue({
+      tutorials: [mine({ id: '2', title: '定时任务做日报', status: 'rejected', reviewNote: '缺少具体步骤。', bodyMarkdown: body, summary: '记录配置步骤和踩过的坑。' })],
+      nextCursor: null,
+    })
+    const revise = vi.spyOn(api, 'reviseCommunityTutorial').mockResolvedValue({ id: '2', mode: 'inplace', revisionId: '7', contentVersion: 2 })
+    const submit = vi.spyOn(api, 'submitCommunityTutorial')
+    render(<CommunityBlog auth={auth} />)
+    await screen.findByText('经验 1')
+    fireEvent.click(screen.getByRole('button', { name: /我的投稿/ }))
+    fireEvent.click(await screen.findByRole('button', { name: '修改' }))
+    expect(await screen.findByLabelText('标题')).toHaveValue('定时任务做日报')
+    expect(screen.getByText('修改投稿')).toBeInTheDocument()
+    expect(screen.getByRole('note')).toHaveTextContent('提交修改后会重新审核')
+    fireEvent.change(screen.getByLabelText('标题'), { target: { value: '定时任务做日报（补了步骤）' } })
+    fireEvent.click(screen.getByRole('button', { name: /提交修改/ }))
+    await waitFor(() =>
+      expect(revise).toHaveBeenCalledWith(auth, '2', expect.objectContaining({ title: '定时任务做日报（补了步骤）', bodyMarkdown: body })),
+    )
+    expect(submit).not.toHaveBeenCalled()
+    expect(await screen.findByRole('heading', { name: '我的投稿' })).toBeInTheDocument()
+  })
+
+  it('已发布帖：修改在审显示「线上仍是原版」；修改未通过显示理由，「再改」从修改稿接着改', async () => {
+    window.localStorage.removeItem('oc:blog-edit:4')
+    const edit = (status: 'pending' | 'rejected') => ({
+      id: '9',
+      status,
+      needsHuman: false,
+      reviewNote: status === 'rejected' ? '补充部分包含推广链接。' : null,
+      title: '日报（第二版）',
+      summary: '记录配置步骤和踩过的坑。',
+      category: 'general' as const,
+      bodyMarkdown: '## 第二版\n\n先准备数据源，再写清楚口径，最后让定时任务每天自动跑一次，跑完核对三天的数据都对得上。',
+      createdAt: '2026-10-23T10:00:00.000Z',
+      reviewedAt: null,
+    })
+    const published = { title: '日报', status: 'approved' as const, publishedAt: '2026-10-19T10:00:00.000Z' }
+    vi.mocked(api.listMyCommunityTutorials).mockResolvedValue({
+      tutorials: [mine({ id: '4', ...published, edit: edit('pending') }), mine({ id: '6', ...published, edit: edit('rejected') })],
+      nextCursor: null,
+    })
+    const revise = vi.spyOn(api, 'reviseCommunityTutorial').mockResolvedValue({ id: '6', mode: 'pending', revisionId: '10', contentVersion: 1 })
+    render(<CommunityBlog auth={auth} />)
+    await screen.findByText('经验 1')
+    fireEvent.click(screen.getByRole('button', { name: /我的投稿/ }))
+    expect(await screen.findByText('修改审核中')).toBeInTheDocument()
+    expect(screen.getByText(/线上仍是原版，新版本审核通过后自动替换/)).toBeInTheDocument()
+    expect(screen.getByText(/修改未通过，线上仍是原版/)).toBeInTheDocument()
+    expect(screen.getByText('补充部分包含推广链接。')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '再改' }))
+    expect(await screen.findByLabelText('标题')).toHaveValue('日报（第二版）')
+    expect(screen.getByRole('note')).toHaveTextContent('审核通过前读者看到的仍是原来的版本')
+    fireEvent.click(screen.getByRole('button', { name: /提交修改/ }))
+    await waitFor(() => expect(revise).toHaveBeenCalledWith(auth, '6', expect.objectContaining({ title: '日报（第二版）' })))
+  })
+
+  it('已发布帖可以撤回：先确认，确认后调用撤回接口', async () => {
+    vi.mocked(api.listMyCommunityTutorials).mockResolvedValue({
+      tutorials: [mine({ id: '4', title: '日报', status: 'approved', publishedAt: '2026-10-19T10:00:00.000Z' })],
+      nextCursor: null,
+    })
+    const withdraw = vi.spyOn(api, 'withdrawCommunityTutorial').mockResolvedValue({ ok: true })
+    render(<CommunityBlog auth={auth} />)
+    await screen.findByText('经验 1')
+    fireEvent.click(screen.getByRole('button', { name: /我的投稿/ }))
+    fireEvent.click(await screen.findByRole('button', { name: '撤回' }))
+    expect(await screen.findByText(/这篇会从经验分享下线/)).toBeInTheDocument()
+    const dialog = screen.getByRole('dialog')
+    fireEvent.click(within(dialog).getByRole('button', { name: '撤回' }))
+    await waitFor(() => expect(withdraw).toHaveBeenCalledWith(auth, '4'))
   })
 
   it('编辑器：没填够不提交，填好后提交并进入我的投稿', async () => {

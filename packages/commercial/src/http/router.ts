@@ -68,7 +68,7 @@ import {
   handleSubmitTutorialSnapshot,
   handleTutorialUserGet,
   handleUploadTutorialImage,
-  handleWithdrawCommunityTutorial,
+  handleTutorialUserPost,
 } from '../tutorials/communityTutorialRoutes.js'
 import { handleGetTutorialBlob, handleGetTutorialEmbed } from '../tutorials/tutorialBlobRoutes.js'
 import {
@@ -885,10 +885,11 @@ export function buildCommercialRoutes(deps: CommercialHttpDeps): Route[] {
       path: '/api/tutorials/images',
       handler: (req, res) => handleUploadTutorialImage(req, res, deps),
     },
+    // 撤回 `/:id/withdraw` 与修改 `/:id/revise`。
     {
       method: 'POST',
       pathPrefix: '/api/tutorials/',
-      handler: (req, res) => handleWithdrawCommunityTutorial(req, res, deps),
+      handler: (req, res) => handleTutorialUserPost(req, res, deps),
     },
     {
       method: 'GET',
