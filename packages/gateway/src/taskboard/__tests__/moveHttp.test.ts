@@ -451,7 +451,7 @@ describe('POST /move 拒绝分支', () => {
     db.close()
   })
 
-  it('cancelRunningRun=true 时先释放 lease 再退回积压', async () => {
+  it('cancelRunningRun=true 没有真实控制器时拒绝，保持租约与历史不变', async () => {
     const db = freshDb()
     await withServer(humanCtx(db), async (base) => {
       const { ticket, stages } = await setup(base, db)
@@ -459,7 +459,7 @@ describe('POST /move 拒绝分支', () => {
         status: 'running',
         stageId: stages[0]!.id,
       })
-      acquireLease(db, ticket.id, stages[0]!.id, 'agent:coding-assistant', 50 * 60 * 1000, {
+      const lease = acquireLease(db, ticket.id, stages[0]!.id, 'agent:coding-assistant', 50 * 60 * 1000, {
         agentId: 'coding-assistant',
         trigger: 'manual',
       })
@@ -468,9 +468,11 @@ describe('POST /move 拒绝分支', () => {
         expectedVersion: running.version,
         cancelRunningRun: true,
       })
-      assert.equal(res.status, 200, JSON.stringify(res.body))
-      assert.equal((res.body.ticket as TicketJson).status, 'backlog')
-      assert.equal(getActiveLease(db, ticket.id), null)
+      assert.equal(res.status, 409, JSON.stringify(res.body))
+      assert.equal(res.body.code, 'run_control_unavailable')
+      assert.equal(getTicket(db, ticket.id)?.status, 'running')
+      assert.equal(getTicket(db, ticket.id)?.version, running.version)
+      assert.deepEqual(getActiveLease(db, ticket.id), lease)
     })
     db.close()
   })

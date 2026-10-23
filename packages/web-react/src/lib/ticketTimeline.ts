@@ -470,6 +470,7 @@ function normalizeRun(raw: unknown, index: number): TicketRun | null {
     outputMd: typeof row.outputMd === 'string' ? row.outputMd : null,
     error: typeof row.error === 'string' ? row.error : null,
     createdAt: createdAt ?? anchor,
+    stopRequested: row.stopRequested === true,
     actualModels: Array.isArray(row.actualModels)
       ? [...new Set(row.actualModels.filter((model): model is string => typeof model === 'string' && model !== '' && model !== 'auto'))]
       : undefined,

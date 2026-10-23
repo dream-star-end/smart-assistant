@@ -2,6 +2,7 @@ import { loadSessionUsageModels } from '@openclaude/storage'
 import { readLiveRunnerModel } from '../localExecution.js'
 import type { AgentSession } from '../sessionManager.js'
 import type { TicketRun } from './domain.js'
+import { taskboardRunControls } from './runControl.js'
 
 /** Keep only whole UTF-8 characters, without allocating an unbounded output. */
 function tailText(text: string, bytes: number): string {
@@ -45,12 +46,12 @@ export async function projectTaskboardRunSnapshots(
   runs: readonly TicketRun[],
   getSession: (key: string) => AgentSession | undefined,
   loadModels: typeof loadSessionUsageModels = loadSessionUsageModels,
-): Promise<Record<string, Pick<TicketRun, 'actualModels' | 'preview'>>> {
+): Promise<Record<string, Pick<TicketRun, 'actualModels' | 'preview' | 'stopRequested'>>> {
   if (runs.length > 200) throw new RangeError('taskboard snapshot exceeds run page')
   const keys = [...new Set(runs.flatMap((run) => run.sessionKey ? [run.sessionKey] : []))]
   let recorded: Record<string, string[]> = Object.create(null)
   try { recorded = await loadModels(keys) } catch { /* Live feedback survives a temporary usage database failure. */ }
-  const result: Record<string, Pick<TicketRun, 'actualModels' | 'preview'>> = Object.create(null)
+  const result: Record<string, Pick<TicketRun, 'actualModels' | 'preview' | 'stopRequested'>> = Object.create(null)
   for (const run of runs) {
     const actualModels = [...(run.sessionKey ? recorded[run.sessionKey] ?? [] : [])]
     let preview: TicketRun['preview']
@@ -60,7 +61,8 @@ export async function projectTaskboardRunSnapshots(
       if (live && live !== 'auto' && !actualModels.includes(live)) actualModels.push(live)
       preview = taskboardPreview(session)
     }
-    result[run.id] = { actualModels, ...(preview ? { preview } : {}) }
+    const control = run.leaseOwner ? taskboardRunControls.get(run.id, run.ticketId, run.leaseOwner) : undefined
+    result[run.id] = { actualModels, stopRequested: control?.signal.aborted === true, ...(preview ? { preview } : {}) }
   }
   return result
 }

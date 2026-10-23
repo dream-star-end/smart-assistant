@@ -289,6 +289,7 @@ export interface PipelineStage {
 export interface TicketRun {
   /** Read-only response projection from actual usage/live runner; never persisted. */
   actualModels?: string[]
+  stopRequested?: boolean
   preview?: { text: string; toolNames: string[]; lastActivityAt: number | null }
   id: string
   ticketId: string
@@ -513,6 +514,7 @@ export type TimelineItem =
 
 export interface TicketDetail {
   ticket: Ticket
+  execution?: TicketRun | null
   pipeline?: Pipeline | null
   stage?: PipelineStage | null
 }
@@ -1378,8 +1380,11 @@ export const taskboardApi = {
   getTicketDetail: (a: AuthSession, idOrIdent: string) =>
     boardGet<TicketDetail>(
       a,
-      `/api/board/tickets/${encodeURIComponent(idOrIdent)}${qs({ expand: 'pipeline,stage' })}`,
+      `/api/board/tickets/${encodeURIComponent(idOrIdent)}${qs({ expand: 'pipeline,stage,execution' })}`,
     ),
+
+  stopRun: (a: AuthSession, idOrIdent: string, expectedVersion: number, runId: string) =>
+    boardSend<{ ok: true; state: 'stopping' | 'terminal'; ticket: Ticket; run: TicketRun }>(a, `/api/board/tickets/${encodeURIComponent(idOrIdent)}/stop`, 'POST', { expectedVersion, runId }),
 
   createTicket: (a: AuthSession, body: TicketCreateInput) =>
     boardSend<{ ok: boolean; ticket: Ticket }>(a, '/api/board/tickets', 'POST', body),

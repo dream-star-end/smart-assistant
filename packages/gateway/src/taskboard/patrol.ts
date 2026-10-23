@@ -106,6 +106,7 @@ import { shouldPatrol } from './patrolWindow.js'
 import { renderPrompt } from './promptRender.js'
 import { summarizeRunOutput } from './runOutput.js'
 import { assertTransition } from './stateMachine.js'
+import { taskboardRunControls } from './runControl.js'
 
 const PRIORITY_RANK: Record<TicketPriority, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }
 const TERMINAL = new Set(['done', 'canceled'])
@@ -196,6 +197,8 @@ export async function freezeStageProjectContext(opts: {
 }
 
 export interface PatrolDelegateInput {
+  /** Internal lifecycle owner; never read from HTTP request bodies. */
+  control?: import('./runControl.js').TaskboardRunControl
   agentId: string
   goal: string
   context?: string
@@ -212,6 +215,10 @@ export interface PatrolDelegateInput {
 }
 
 export interface PatrolDelegateResult {
+  /** Root-only text for summary extraction; output keeps every child result. */
+  summaryOutput?: string
+  usageIncludesDescendants?: boolean
+  cancelled?: boolean
   ok: boolean
   output: string
   error?: string
@@ -685,7 +692,25 @@ export class PatrolEngine {
     const sessionKey = run.sessionKey ?? buildPatrolSessionKey(agentId, ticket.id, stage.id, run.id)
     if (!run.sessionKey) updateRun(db, run.id, { sessionKey })
     const owner = run.leaseOwner
-
+    if (!owner || run.status !== 'running' || (run.leaseExpiresAt ?? 0) <= this.nowFn()) return
+    const control = taskboardRunControls.begin(run.id, ticket.id, owner, sessionKey)
+    let leaseLost = false
+    const leaseTtlMs = alignedLeaseTtlMs(stage.timeoutSec, this.leaseTtlMs, this.leaseRenewIntervalMs)
+    const renewTimer = setInterval(() => {
+      try {
+        if (!renewLease(db, run.id, owner, leaseTtlMs, this.nowFn())) {
+          leaseLost = true
+          control.requestStop()
+          this.log('taskboard lease renewal lost', { runId: run.id, owner })
+        }
+      } catch (err) {
+        leaseLost = true
+        control.requestStop()
+        this.log('taskboard lease renewal failed', { runId: run.id, owner, err: String(err) })
+      }
+    }, this.leaseRenewIntervalMs)
+    renewTimer.unref?.()
+    try {
     const comments = listComments(db, ticket.id, { limit: 200, offset: 0 })
     const lastRun = latestSettledRun(db, ticket.id, run.id)
     const boardProject = getProject(db, ticket.projectId)
@@ -742,6 +767,10 @@ export class PatrolEngine {
     // 准备上下文是异步的:这段时间里单据可能被人或 agent 关单 / 受阻。不再是 running 就
     // 以 skipped(ticket_closed)结算本 run,不启动 agent(OCV5-414)。
     const live = getTicket(db, ticket.id)
+    if (control.signal.aborted) {
+      if (!leaseLost) await this.finishRun(db, ticket, stage, run, settings, { ok: false, output: '', error: 'USER_CANCELLED: stopped before execution', cancelled: true })
+      return
+    }
     if (!live || live.status !== 'running') {
       const at = this.nowFn()
       if (owner) {
@@ -772,27 +801,10 @@ export class PatrolEngine {
       return
     }
 
-    let leaseLost = !owner
-    const leaseTtlMs = alignedLeaseTtlMs(stage.timeoutSec, this.leaseTtlMs, this.leaseRenewIntervalMs)
-    const renewTimer = owner
-      ? setInterval(() => {
-          try {
-            if (!renewLease(db, run.id, owner, leaseTtlMs, this.nowFn())) {
-              leaseLost = true
-              this.log('taskboard lease renewal lost', { runId: run.id, owner })
-            }
-          } catch (err) {
-            leaseLost = true
-            this.log('taskboard lease renewal failed', { runId: run.id, owner, err: String(err) })
-          }
-        }, this.leaseRenewIntervalMs)
-      : null
-    renewTimer?.unref?.()
-
-    try {
       let result: PatrolDelegateResult
       try {
         result = await this.delegate({
+          control,
           agentId,
           goal: prompt,
           toolsets: stage.toolsets,
@@ -824,9 +836,12 @@ export class PatrolEngine {
         }
       }
       if (leaseLost) return
+      await control.waitForDescendants(sessionKey)
       await this.finishRun(db, ticket, stage, run, settings, result)
     } finally {
-      if (renewTimer) clearInterval(renewTimer)
+      clearInterval(renewTimer)
+      await control.waitForDescendants(sessionKey)
+      taskboardRunControls.finish(control)
     }
   }
 
@@ -838,16 +853,19 @@ export class PatrolEngine {
     settings: TaskboardSettings,
     result: PatrolDelegateResult,
   ): Promise<void> {
-    const timedOut = result.timedOut === true
+    const cancelled = result.cancelled === true
+    const timedOut = !cancelled && result.timedOut === true
     const ok = result.ok && !timedOut && !result.error
     const output = result.output ?? ''
     const status = timedOut ? 'timeout' : ok ? 'succeeded' : 'failed'
-    const error = timedOut
+    const error = cancelled
+      ? (result.error?.startsWith('USER_CANCELLED:') ? result.error : `USER_CANCELLED: ${result.error ?? 'stopped by user'}`)
+      : timedOut
       ? (result.error ?? 'delegate timed out')
       : ok
         ? null
-        : (result.error ?? 'delegate failed')
-    const digested = summarizeRunOutput(output, { failed: !ok, error })
+        : (result.error?.startsWith('USER_CANCELLED:') ? `DELEGATE_FAILED: ${result.error}` : result.error ?? 'delegate failed')
+    const digested = summarizeRunOutput(result.summaryOutput ?? output, { failed: !ok, error })
 
     const sessionKey =
       run.sessionKey ??
@@ -904,6 +922,10 @@ export class PatrolEngine {
 
       const current = getTicket(db, ticket.id)
       if (!current || current.status !== 'running') return true
+      if (cancelled) {
+        this.transition(db, current, 'blocked', 'system', stage, { blockedReason: '用户停止本次执行' }, run)
+        return true
+      }
       if (ok) this.applySuccess(db, current, stage, settings, run)
       else this.applyFailure(db, current, stage, settings, error ?? 'failed', run)
       return true
@@ -933,7 +955,7 @@ export class PatrolEngine {
         /* fail-soft */
       }
     }
-    if (!isRunUsageComplete(usage)) this.queueUsageBackfill(db, run.id, sessionKey)
+    if (!isRunUsageComplete(usage) && !result.usageIncludesDescendants) this.queueUsageBackfill(db, run.id, sessionKey)
   }
 
   private applySuccess(
@@ -1263,7 +1285,7 @@ export class PatrolEngine {
     result: PatrolDelegateResult,
   ): Promise<RunUsageSnapshot> {
     let usage = usageFromDelegateResult(result)
-    if (isRunUsageComplete(usage)) return usage
+    if (isRunUsageComplete(usage) || result.usageIncludesDescendants) return usage
     try {
       const looked = await this.lookupUsage(sessionKey)
       usage = mergeRunUsage(usage, looked)

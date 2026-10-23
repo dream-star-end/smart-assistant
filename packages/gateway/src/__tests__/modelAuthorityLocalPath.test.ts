@@ -963,6 +963,18 @@ describe('⑦ delegate 默认模型:grok-build 优先,mint 失败同请求回落
     })
   }
 
+  test('nine independent taskboard runs retain independent ordinary delegate guard owners', async () => {
+    installCatalog({ extraModels: GROK_ROWS })
+    await withFlags({ authority: true, exempt: true }, async () => {
+      const gw = makeDelegateGateway()
+      for (let i = 0; i < 9; i += 1) {
+        const result = await gw._runTaskboardDelegate({ agentId: 'coding-assistant', model: 'deepseek-v4-flash', goal: `independent task ${i}`, sessionKey: `agent:coding-assistant:taskboard:fixture:stage:run-${i}`, timeoutSec: 60 })
+        assert.equal(result.ok, true, JSON.stringify(result))
+      }
+      assert.equal(gw.sessions.getOrCreateCalls, 9)
+    })
+  })
+
   test('decideLocalExecution:preferredModels 排在 agent.model 之前,但不可路由时静默跳过', () => {
     const v = view([row('glm-5.2', 'ccb'), row('grok-build', 'grok')])
     const exempt = { OC_SELFHOST_ENGINE_LOCAL_TURNS: '1' } as NodeJS.ProcessEnv

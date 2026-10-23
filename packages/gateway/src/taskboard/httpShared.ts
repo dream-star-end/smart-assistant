@@ -34,7 +34,7 @@ export interface TaskboardHttpContext {
   isCommercialJwt?: (token: string) => boolean
   listAgents?: () => Promise<BoardAgent[]>
   /** Only database-resolved runs are accepted; no client supplied session keys. */
-  getRunSnapshots?: (runs: readonly TicketRun[]) => Promise<Record<string, Pick<TicketRun, 'actualModels' | 'preview'>>>
+  getRunSnapshots?: (runs: readonly TicketRun[]) => Promise<Record<string, Pick<TicketRun, 'actualModels' | 'preview' | 'stopRequested'>>>
   /**
    * 阶段 model 覆盖是否在当前 catalog 投影里且 available。
    * 测试注入;生产省略则走 getLocalCatalogView().isRoutable。

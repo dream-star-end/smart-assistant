@@ -201,6 +201,15 @@ function expireLeasesOnTicket(db: TaskboardDb, ticketId: string, now: number): v
   ).run({ ticketId, now })
 }
 
+/** Latest real execution metadata; never loads a long result for polling. */
+export function getLatestRunMetadata(db: TaskboardDb, ticketId: string): TicketRun | null {
+  const columns = RUN_COLS.replace(/\boutput_md\b/, 'NULL AS output_md')
+    .replace(/\bsummary\b/, 'NULL AS summary').replace(/\berror\b/, 'substr(error, 1, 160) AS error')
+  const row = db.prepare(`SELECT ${columns} FROM tb_ticket_run
+    WHERE ticket_id = ? AND status <> 'skipped' ORDER BY created_at DESC, id DESC LIMIT 1`).get(ticketId) as RunRow | undefined
+  return row ? mapRun(row) : null
+}
+
 export function insertRun(db: TaskboardDb, input: CreateRunInput): TicketRun {
   const now = nowMs()
   const id = newId()

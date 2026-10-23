@@ -246,6 +246,7 @@ function SystemRun({
   stageName: string | null | undefined
   compact: boolean
 }) {
+  const cancelled = run.error?.startsWith('USER_CANCELLED:') === true
   const duration = formatDurationMs(run.durationMs)
   const costText = formatRunReferenceCost(run)
   const skip = skipReasonLabel(run.skipReason)
@@ -259,15 +260,14 @@ function SystemRun({
         <p className="text-caption text-muted">
           {RUN_TRIGGER_LABEL[run.trigger] ?? run.trigger} · 开始执行
         </p>
-        <p className="text-caption text-faint break-all">执行模型：{run.actualModels?.length ? run.actualModels.join('、') : '未记录'}</p>
       </div>
     )
   }
   return (
     <div className="flex min-w-0 flex-col gap-1.5" data-testid="ticket-run-detail">
       <div className="flex flex-wrap items-center gap-1.5">
-        <Badge tone={runStatusTone(run.status)} size="sm">
-          {RUN_STATUS_LABEL[run.status] ?? run.status}
+        <Badge tone={cancelled ? 'neutral' : runStatusTone(run.status)} size="sm">
+          {run.stopRequested && (run.status === 'running' || run.status === 'queued') ? '停止处理中' : cancelled ? '已停止' : RUN_STATUS_LABEL[run.status] ?? run.status}
         </Badge>
         <span className="text-body text-fg">{stageName || '未知阶段'}</span>
         <span className="text-caption text-faint">
@@ -305,7 +305,7 @@ function SystemRun({
         />
       )}
       {run.error && (
-        <p className="break-words whitespace-pre-wrap text-body text-danger">{run.error}</p>
+        <p className="break-words whitespace-pre-wrap text-body text-danger">{cancelled ? '本次执行已停止，已保留生成内容和已发生用量。' : run.error}</p>
       )}
     </div>
   )

@@ -56,10 +56,10 @@ import { addRelation, listRelations, removeRelation } from './db/relations.js'
 import {
   acquireLease,
   getActiveLease,
+  getLatestRunMetadata,
   getRun,
   insertRun,
   listRuns,
-  releaseLease,
   updateRun,
 } from './db/runs.js'
 import { seedDefaultPipelines } from './db/seed.js'
@@ -116,6 +116,7 @@ import {
   publicStageRef,
 } from './moveIntent.js'
 import { hasOpenBlockers, listOpenBlockers } from './patrol.js'
+import { taskboardRunControls } from './runControl.js'
 import { dispatchProjectMemory } from './projectMemoryHttp.js'
 import { TaskboardTransitionDenied, assertTransition } from './stateMachine.js'
 import {
@@ -180,6 +181,7 @@ const TICKET_ACTIONS = [
   'cancel',
   'comment',
   'patrol',
+  'stop',
   'move',
 ] as const
 type TicketAction = (typeof TICKET_ACTIONS)[number]
@@ -792,7 +794,7 @@ async function dispatch(
   const ticketItem = path.match(/^\/api\/board\/tickets\/([^/]+)$/)
   if (ticketItem) {
     const idOrIdent = decodeURIComponent(ticketItem[1])
-    if (method === 'GET') return handleGetTicket(res, url, db, idOrIdent)
+    if (method === 'GET') return handleGetTicket(res, url, db, idOrIdent, ctx)
     if (method === 'PATCH') {
       return handlePatchTicket(res, await readJsonBody(req), db, actor, idOrIdent)
     }
@@ -1395,7 +1397,7 @@ function handleCreateTicket(
   sendJson(res, 201, { ok: true, ticket })
 }
 
-function handleGetTicket(res: ServerResponse, url: URL, db: TaskboardDb, idOrIdent: string): void {
+async function handleGetTicket(res: ServerResponse, url: URL, db: TaskboardDb, idOrIdent: string, ctx: TaskboardHttpContext): Promise<void> {
   const ticket = requireTicket(db, idOrIdent)
   const expand = (url.searchParams.get('expand') ?? '')
     .split(',')
@@ -1408,6 +1410,12 @@ function handleGetTicket(res: ServerResponse, url: URL, db: TaskboardDb, idOrIde
   }
   if (expand.includes('stage')) {
     extra.stage = ticket.stageId ? getStage(db, ticket.stageId) : null
+  }
+  if (expand.includes('execution')) {
+    const run = getActiveLease(db, ticket.id) ?? getLatestRunMetadata(db, ticket.id)
+    const execution = run ? { ...(await enrichTaskboardRuns(ctx, [run]))[0], outputMd: null, summary: null } : null
+    sendJson(res, 200, { ticket, ...extra, execution })
+    return
   }
   sendJson(res, 200, { ticket, ...extra })
 }
@@ -1564,8 +1572,15 @@ function handleTicketAction(
   action: TicketAction,
 ): void {
   const ticket = requireTicket(db, idOrIdent)
+  const activeExecution = getActiveLease(db, ticket.id)
+  const control = activeExecution?.leaseOwner ? taskboardRunControls.get(activeExecution.id, ticket.id, activeExecution.leaseOwner) : undefined
+  if (actor !== 'human' && action !== 'comment' && control?.signal.aborted) return sendError(res, 409, '本次执行已停止', { code: 'USER_CANCELLED' })
+  if (actor === 'human' && !['comment', 'patrol', 'stop', 'move'].includes(action) && activeExecution) {
+    return sendError(res, 409, '请先停止本次执行，收尾完成后再操作', { code: 'active_execution' })
+  }
   if (action === 'comment') handleComment(res, body, db, actor, ticket)
   else if (action === 'patrol') handlePatrol(res, body, db, actor, ticket)
+  else if (action === 'stop') handleStop(res, body, db, actor, ticket)
   else if (action === 'claim') handleClaim(res, body, db, actor, ticket)
   else if (action === 'ready') handleReady(res, body, db, actor, ticket)
   else if (action === 'advance') handleAdvance(res, body, db, actor, ticket)
@@ -1659,7 +1674,7 @@ function handleMove(
   }
 
   const activeRun = getActiveLease(db, ticket.id)
-  if (ticket.status === 'running' && !cancelRunningRun) {
+  if (activeRun && !cancelRunningRun) {
     throw new TaskboardMoveDenied(
       409,
       'running_run_active',
@@ -1713,13 +1728,16 @@ function handleMove(
     )
   }
 
+  if (activeRun && cancelRunningRun) {
+    const stopped = requestHumanRunStop(db, ticket.id, expectedVersion, activeRun.id)
+    if (stopped.kind === 'conflict') throw new TaskboardMoveDenied(409, stopped.code, stopped.message)
+    if (stopped.kind === 'requested') stopped.control.requestStop()
+    if (stopped.kind !== 'terminal') throw new TaskboardMoveDenied(409, 'stop_pending', '已请求停止本次执行，收尾完成后请再次移动任务。', { ticket: stopped.ticket, runId: activeRun.id })
+  }
   const actorId = actorIdOf(actor)
   const fromStage = currentStage(db, ticket)
   const toStage = intent.toStageId ? getStage(db, intent.toStageId) : null
   const result = db.transaction(() => {
-    if (ticket.status === 'running' && cancelRunningRun) {
-      cancelActiveRunForMove(db, ticket)
-    }
 
     let updated: Ticket
     if (intent.action === 'ack_advance') {
@@ -1903,19 +1921,6 @@ function applyHumanAckAdvance(
     'ready',
   )
   return updated
-}
-
-function cancelActiveRunForMove(db: TaskboardDb, ticket: Ticket): void {
-  const run = getActiveLease(db, ticket.id)
-  if (!run) return
-  releaseLease(db, run.id)
-  const now = Date.now()
-  updateRun(db, run.id, {
-    status: 'failed',
-    error: 'canceled_by_human_move',
-    finishedAt: now,
-    durationMs: run.startedAt != null ? now - run.startedAt : null,
-  })
 }
 
 function handleComment(
@@ -2312,6 +2317,45 @@ function handleCancel(
     'canceled',
   )
   sendJson(res, 200, { ok: true, ticket: updated })
+}
+
+function requestHumanRunStop(db: TaskboardDb, ticketId: string, expectedVersion: number, runId: string) {
+  return db.transaction(() => {
+    const current = requireTicket(db, ticketId)
+    const run = getRun(db, runId)
+    if (!run || run.ticketId !== current.id) throw new TaskboardNotFound('run', runId)
+    if (run.status !== 'running' && run.status !== 'queued') return { kind: 'terminal' as const, ticket: current, run }
+    const now = Date.now()
+    const active = getActiveLease(db, current.id, now)
+    if (!active || active.id !== run.id || !run.leaseOwner) return { kind: 'conflict' as const, code: 'run_changed', message: '当前执行已变化，请刷新后操作' }
+    const control = taskboardRunControls.get(run.id, current.id, run.leaseOwner)
+    if (!control) return { kind: 'conflict' as const, code: 'run_control_unavailable', message: '当前执行控制不可用，请等待执行收尾后重试' }
+    if (control.signal.aborted) return { kind: 'pending' as const, ticket: current, run }
+    if (current.version !== expectedVersion) throw new TaskboardVersionConflict(current.id, expectedVersion, current.version)
+    if (current.status !== 'blocked') assertTransition({ from: current.status, to: 'blocked', actor: 'human' })
+    const updated = updateTicket(db, current.id, expectedVersion, { status: 'blocked', blockedReason: '用户停止本次执行' })
+    recordActivity(db, current.id, 'human', HUMAN_ACTOR_ID, 'status_changed', 'status', current.status, 'blocked')
+    createComment(db, { ticketId: current.id, authorKind: 'human', author: HUMAN_ACTOR_ID, runId: run.id, body: '已请求停止本次执行，正在保留输出并收尾。结束后可重试。' })
+    return { kind: 'requested' as const, ticket: updated, run, control }
+  }).immediate()
+}
+
+/** Human stop is an exact-run request, never a lease release or terminal claim. */
+function handleStop(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  db: TaskboardDb,
+  actor: Actor,
+  ticket: Ticket,
+): void {
+  if (actor !== 'human') return sendError(res, 403, 'forbidden', { code: 'forbidden' })
+  const expectedVersion = requireExpectedVersion(body)
+  const runId = asString(body.runId)
+  if (!runId) throw new TaskboardValidationError('runId is required')
+  const outcome = requestHumanRunStop(db, ticket.id, expectedVersion, runId)
+  if (outcome.kind === 'conflict') return sendError(res, 409, outcome.message, { code: outcome.code })
+  if (outcome.kind === 'requested') outcome.control.requestStop()
+  sendJson(res, outcome.kind === 'terminal' ? 200 : 202, { ok: true, state: outcome.kind === 'terminal' ? 'terminal' : 'stopping', ticket: outcome.ticket, run: outcome.run })
 }
 
 function handlePatrol(

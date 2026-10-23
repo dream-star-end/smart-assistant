@@ -199,7 +199,7 @@ export const WORKSPACE_API_ROUTES: readonly HttpRoute<WorkspaceApiRoutesIo>[] = 
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(ready|claim|advance)$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(block|approve|reject)$/) ||
-      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(done|cancel|comment|patrol|move)$/) ||
+      url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/(done|cancel|comment|patrol|stop|move)$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/runs$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/relations$/) ||
       url.pathname.match(/^\/api\/board\/tickets\/([^/]+)\/comments$/) ||

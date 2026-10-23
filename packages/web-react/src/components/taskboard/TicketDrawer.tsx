@@ -10,6 +10,7 @@ import {
   type Ticket,
   type TicketComment,
   type TicketPriority,
+  type TicketRun,
   type TimelineItem,
   assigneeLabel,
   isVersionConflict,
@@ -32,6 +33,24 @@ function joinRead<T>(pending: Map<string, Promise<T>>, key: string, load: () => 
   const next = load().finally(() => pending.delete(key))
   pending.set(key, next)
   return next
+}
+
+function mergeExecution(items: TimelineItem[], execution: TicketRun | null): TimelineItem[] {
+  if (!execution) return items
+  const active = execution.status === 'running' || execution.status === 'queued'
+  let found = false
+  const merged = items.map((item) => {
+    if (item.kind !== 'run' || item.run.id !== execution.id) return item
+    found = true
+    const terminal = item.run.status !== 'running' && item.run.status !== 'queued'
+    const actualModels = [...new Set([...(item.run.actualModels ?? []), ...(execution.actualModels ?? [])])]
+    if (terminal) return { ...item, run: { ...item.run, actualModels } }
+    if (!active) return item // Full terminal output comes only from the timeline.
+    const preview = (execution.preview?.lastActivityAt ?? 0) < (item.run.preview?.lastActivityAt ?? 0) ? item.run.preview : execution.preview
+    return { ...item, run: { ...item.run, ...execution, actualModels, preview } }
+  })
+  if (!found && active) merged.push({ kind: 'run', createdAt: execution.createdAt, run: execution })
+  return sortTimelineAsc(merged)
 }
 
 function TicketMarkdown({
@@ -137,6 +156,8 @@ export function TicketDrawer({
   const [comment, setComment] = useState('')
   const [commenting, setCommenting] = useState(false)
   const [patrolling, setPatrolling] = useState(false)
+  const [execution, setExecution] = useState<TicketRun | null>(null)
+  const [stopState, setStopState] = useState<'requesting' | 'stopping' | null>(null)
 
   const ownerLookup = ticketRef || ticket?.identifier || ticket?.id || null
   const ownerGen = useRef(0)
@@ -160,6 +181,8 @@ export function TicketDrawer({
     if (saving) setSaving(false)
     if (commenting) setCommenting(false)
     if (patrolling) setPatrolling(false)
+    if (execution) setExecution(null)
+    if (stopState) setStopState(null)
     paintedOwnerRef.current = open ? ownerLookup : null
   }
   const current = belongsToOwner(detail) && (!belongsToOwner(ticket) || detail!.version >= ticket!.version)
@@ -171,10 +194,25 @@ export function TicketDrawer({
   currentRef.current = current
   const timelineRef = useRef(timeline)
   timelineRef.current = timeline
+  const executionRef = useRef(execution)
+  executionRef.current = execution
+  const activeExecution = execution && (execution.status === 'running' || execution.status === 'queued') ? execution : null
+  const applyExecution = useCallback((next: TicketRun | null | undefined) => {
+    if (next === undefined) return false
+    const previous = executionRef.current
+    const knownTerminal = next && timelineRef.current.some((item) => item.kind === 'run' && item.run.id === next.id && item.run.status !== 'running' && item.run.status !== 'queued')
+    if (next && knownTerminal && (next.status === 'running' || next.status === 'queued')) return false
+    executionRef.current = next
+    setExecution(next)
+    if (next?.stopRequested) setStopState('stopping')
+    else if (!next || (next.status !== 'running' && next.status !== 'queued')) setStopState(null)
+    setTimeline((items) => mergeExecution(items, next))
+    return previous?.id !== next?.id || previous?.status !== next?.status
+  }, [])
   const currentStage = detailStage?.id === current?.stageId
     ? detailStage
     : stages.find((stage) => stage.id === current?.stageId) ?? null
-  const canStart = !!current && (current.status === 'ready' || current.status === 'waiting_human') && currentStage?.kind === 'ai'
+  const canStart = !activeExecution && !!current && (current.status === 'ready' || current.status === 'waiting_human') && currentStage?.kind === 'ai'
   const reads = useMemo(() => {
     const details = new Map<string, ReturnType<typeof taskboardApi.getTicketDetail>>()
     const timelines = new Map<string, ReturnType<typeof taskboardApi.listTimeline>>()
@@ -242,6 +280,7 @@ export function TicketDrawer({
         setStageName(fresh.stage?.name ?? null)
         setDetailStage(fresh.stage ?? null)
         onDetailLoadedRef.current?.(fresh.ticket)
+        applyExecution(fresh.execution !== undefined ? fresh.execution : runs.items[0] ?? null)
         let items: TimelineItem[]
         try {
           items = await reads.timeline(requested)
@@ -259,7 +298,7 @@ export function TicketDrawer({
         }
         if (cancelled || ownerGen.current !== gen || ownerLookupRef.current !== requested) return
         if (currentRef.current?.version !== fresh.ticket.version || commentingRef.current) return
-        setTimeline(sortTimelineAsc(items))
+        setTimeline(mergeExecution(items, executionRef.current))
       } catch (e) {
         if (e instanceof AuthEpochStaleError || cancelled || ownerGen.current !== gen) return
         toast(taskboardErrorMessage(e, '加载单据详情失败'), 'error')
@@ -271,7 +310,7 @@ export function TicketDrawer({
     return () => {
       cancelled = true
     }
-  }, [auth, lookup, open, reads, ticket?.version, toast])
+  }, [applyExecution, auth, lookup, open, reads, ticket?.version, toast])
 
   // Refresh only the open owner. Do not reload project metadata or blank the
   // timeline on a background tick. Visibility resume also catches comments.
@@ -293,6 +332,7 @@ export function TicketDrawer({
         const fresh = await reads.detail(requested)
         if (!owned() || (currentRef.current && fresh.ticket.version < currentRef.current.version)) return
         failures = 0
+        const executionChanged = applyExecution(fresh.execution)
         setStageName(fresh.stage?.name ?? null)
         setDetailStage(fresh.stage ?? null)
         const changed = fresh.ticket.version !== currentRef.current?.version
@@ -301,14 +341,14 @@ export function TicketDrawer({
           setDetail(fresh.ticket)
           onDetailLoadedRef.current?.(fresh.ticket)
         }
-        if (changed || forceTimeline || Date.now() - lastTimelineAt >= 15_000) {
+        if (changed || executionChanged || forceTimeline || Date.now() - lastTimelineAt >= 15_000) {
           const version = fresh.ticket.version
           const items = await reads.timeline(requested)
           if (!owned() || currentRef.current?.version !== version || commentingRef.current) return
-          setTimeline((cur) => sortTimelineAsc([
+          setTimeline((cur) => mergeExecution([
             ...items,
             ...cur.filter((item) => item.kind === 'comment' && item.comment.id.startsWith(LOCAL_COMMENT_ID_PREFIX)),
-          ]))
+          ], executionRef.current))
           lastTimelineAt = Date.now()
         }
       } catch (e) {
@@ -316,7 +356,7 @@ export function TicketDrawer({
       } finally {
         inFlight = false
         if (owned() && visible()) {
-          const interval = currentRef.current?.status === 'running' ? 3_000 : 15_000
+          const interval = executionRef.current?.status === 'running' || executionRef.current?.status === 'queued' ? 2_000 : currentRef.current?.status === 'running' ? 3_000 : 15_000
           timer = setTimeout(() => void tick(), Math.min(60_000, interval * 2 ** failures))
         }
       }
@@ -332,7 +372,7 @@ export function TicketDrawer({
       clearTimeout(timer)
       document.removeEventListener('visibilitychange', resume)
     }
-  }, [lookup, open, reads])
+  }, [applyExecution, lookup, open, reads])
 
   const refreshAfterWrite = async (idOrIdent: string, gen: number) => {
     try {
@@ -360,7 +400,8 @@ export function TicketDrawer({
       setDetail(fresh.ticket)
       setStageName(fresh.stage?.name ?? null)
       setDetailStage(fresh.stage ?? null)
-      if (!commentingRef.current) setTimeline(sortTimelineAsc(items))
+      applyExecution(fresh.execution)
+      if (!commentingRef.current) setTimeline(mergeExecution(items, executionRef.current))
       onTicketUpdated(fresh.ticket)
     } catch (e) {
       if (e instanceof AuthEpochStaleError) return
@@ -480,6 +521,30 @@ export function TicketDrawer({
       toast(taskboardErrorMessage(e, '启动巡检失败'), 'error')
     } finally {
       if (ownerGen.current === gen) setPatrolling(false)
+    }
+  }
+
+  const stopRun = async () => {
+    if (!current || !activeExecution || stopState) return
+    const gen = ownerGen.current
+    setStopState('requesting')
+    try {
+      const out = await taskboardApi.stopRun(auth, current.id, current.version, activeExecution.id)
+      if (ownerGen.current !== gen) return
+      if (!currentRef.current || out.ticket.version >= currentRef.current.version) {
+        currentRef.current = out.ticket
+        setDetail(out.ticket)
+        onTicketUpdated(out.ticket)
+      }
+      setStopState(out.state === 'stopping' ? 'stopping' : null)
+      toast(out.state === 'stopping' ? '已请求停止，正在保留输出并收尾' : '本次执行已结束', 'success')
+      void refreshAfterWrite(current.identifier, gen)
+    } catch (error) {
+      if (ownerGen.current !== gen) return
+      setStopState(null)
+      if (error instanceof AuthEpochStaleError) return
+      toast(taskboardErrorMessage(error, '停止执行失败，请稍后重试'), 'error')
+      void refreshAfterWrite(current.identifier, gen)
     }
   }
 
@@ -619,6 +684,11 @@ export function TicketDrawer({
                 onClick={() => beginEdit(current)}
               >
                 改需求
+              </Button>
+            )}
+            {activeExecution && (
+              <Button type="button" size="sm" variant="danger" data-testid="ticket-drawer-stop" loading={stopState === 'requesting'} disabled={stopState !== null} onClick={() => void stopRun()}>
+                {stopState === 'requesting' ? '请求停止…' : stopState === 'stopping' ? '停止处理中' : '停止本次执行'}
               </Button>
             )}
             {canStart && (
