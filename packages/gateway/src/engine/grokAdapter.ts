@@ -600,6 +600,7 @@ export class GrokAdapter extends EventEmitter implements EngineAdapter {
       agentId: this.opts.agentId,
       projectId: this.opts.projectId,
       sessionKey: this.opts.sessionKey,
+      traceId: ctx.params.traceId,
       gatewayPort: this.opts.config.gateway.port,
       gatewayToken: this.opts.config.gateway.accessToken ?? '',
       delegationDepth: this.opts.delegationDepth ?? 0,

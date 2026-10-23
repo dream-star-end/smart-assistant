@@ -82,6 +82,7 @@ export interface GrokPlatformInput {
   identityCompat?: IdentityCompatRuntimeContext
   agentId: string
   projectId?: string
+  traceId?: string
   sessionKey: string
   gatewayPort: number
   gatewayToken: string
@@ -130,6 +131,7 @@ export function projectGrokPlatform(input: GrokPlatformInput): GrokPlatformProje
       `${issueParentCallerToken({
         agentId: input.agentId,
         sessionKey: input.sessionKey,
+        traceId: input.traceId,
         depth: input.delegationDepth,
         consultTurn: input.consultTurn,
       })}\n`,

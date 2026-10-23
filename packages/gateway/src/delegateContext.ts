@@ -28,6 +28,8 @@ export type DelegateContextClaimsV1 = {
   agentId: string
   sessionKey: string
   depth: number
+  /** Canonical parent turn, signed with the caller identity; absent for legacy/bootstrap. */
+  traceId?: string
   iat: number
   exp: number
   nonce: string
@@ -42,6 +44,11 @@ export type DelegateContextClaimsV2 = Omit<DelegateContextClaimsV1, 'v'> & {
 }
 
 export type DelegateContextClaims = DelegateContextClaimsV1 | DelegateContextClaimsV2
+
+function checkedTraceId(traceId: string): string {
+  if (!/^[0-9a-f]{32}$/.test(traceId)) throw new Error('invalid canonical delegate trace')
+  return traceId
+}
 
 export const CONSULT_INVOCATION_HEADER = 'x-openclaude-consult-invocation'
 
@@ -70,6 +77,8 @@ export function issueDelegateContextToken(input: {
   agentId: string
   sessionKey: string
   depth: number
+  /** Canonical parent turn, signed with the caller identity; absent for legacy/bootstrap. */
+  traceId?: string
   now?: number
   ttlMs?: number
 }): string {
@@ -79,6 +88,7 @@ export function issueDelegateContextToken(input: {
     v: 1,
     agentId: input.agentId.trim(),
     sessionKey: input.sessionKey.trim(),
+    ...(input.traceId ? { traceId: checkedTraceId(input.traceId) } : {}),
     depth: Number.isFinite(input.depth) ? Math.max(0, Math.floor(input.depth)) : 0,
     iat: now,
     exp: now + ttlMs,
@@ -96,6 +106,8 @@ export function issueConsultTurnToken(input: {
   agentId: string
   sessionKey: string
   depth: number
+  /** Canonical parent turn, signed with the caller identity; absent for legacy/bootstrap. */
+  traceId?: string
   turnKey: string
   turnIndex: number
   collabMode: 'solo' | 'advisor' | 'team'
@@ -109,6 +121,7 @@ export function issueConsultTurnToken(input: {
     v: 2,
     agentId: input.agentId.trim(),
     sessionKey: input.sessionKey.trim(),
+    ...(input.traceId ? { traceId: checkedTraceId(input.traceId) } : {}),
     depth: Number.isFinite(input.depth) ? Math.max(0, Math.floor(input.depth)) : 0,
     iat: now,
     exp: now + ttlMs,
@@ -130,6 +143,8 @@ export function issueParentCallerToken(input: {
   agentId: string
   sessionKey: string
   depth: number
+  /** Canonical parent turn, signed with the caller identity; absent for legacy/bootstrap. */
+  traceId?: string
   consultTurn?: { turnKey: string; turnIndex: number; configVersion: string } | null
 }): string {
   const consult = input.consultTurn
@@ -138,6 +153,7 @@ export function issueParentCallerToken(input: {
       agentId: input.agentId,
       sessionKey: input.sessionKey,
       depth: input.depth,
+      traceId: input.traceId,
       turnKey: consult.turnKey,
       turnIndex: consult.turnIndex,
       collabMode: 'advisor',
@@ -148,6 +164,7 @@ export function issueParentCallerToken(input: {
     agentId: input.agentId,
     sessionKey: input.sessionKey,
     depth: input.depth,
+    traceId: input.traceId,
   })
 }
 
@@ -168,6 +185,7 @@ function parseConsultTurnPayload(raw: string): DelegateContextClaimsV2 | null {
   try {
     const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as DelegateContextClaims
     if (parsed?.v !== 2) return null
+    if (parsed.traceId !== undefined && (typeof parsed.traceId !== 'string' || !/^[0-9a-f]{32}$/.test(parsed.traceId))) return null
     if (typeof parsed.agentId !== 'string' || !parsed.agentId.trim()) return null
     if (typeof parsed.sessionKey !== 'string' || !parsed.sessionKey.trim()) return null
     if (typeof parsed.depth !== 'number' || !Number.isFinite(parsed.depth) || parsed.depth < 0) return null
@@ -230,6 +248,7 @@ export function verifyDelegateContextToken(
   try {
     const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as DelegateContextClaims
     if (parsed?.v !== 1 && parsed?.v !== 2) return null
+    if (parsed.traceId !== undefined && (typeof parsed.traceId !== 'string' || !/^[0-9a-f]{32}$/.test(parsed.traceId))) return null
     if (typeof parsed.agentId !== 'string' || !parsed.agentId.trim()) return null
     if (typeof parsed.sessionKey !== 'string' || !parsed.sessionKey.trim()) return null
     if (typeof parsed.depth !== 'number' || !Number.isFinite(parsed.depth) || parsed.depth < 0) {
