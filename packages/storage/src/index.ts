@@ -41,3 +41,5 @@ export * from './multimodalSummary.js'
 export * from './indexPipeline.js'
 
 export * from './identityCompatRuntime.js'
+
+export * from './systemActions.js'
