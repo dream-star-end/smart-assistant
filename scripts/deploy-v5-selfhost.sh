@@ -2157,7 +2157,7 @@ $dirty
     fi
     log "$dirty"
   fi
-  sha="$(source_commit)"
+  sha="$(source_commit)"; selfhost_release_preflight "${LEASE_TARGET_SHA:-$sha}"  # OCV5-581 L0,只读
   local policy_bind_rc=0
   release_policy_bind_official_train_request "$sha" || policy_bind_rc=$?
   [[ "$policy_bind_rc" == 0 ]] || exit "$policy_bind_rc"
