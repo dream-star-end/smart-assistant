@@ -28,7 +28,7 @@ import { runMigrations } from '../db/migrate.js'
 import { query } from '../db/queries.js'
 import { StudioBlobStore } from '../media-studio/blobs.js'
 import { runStudioGc } from '../media-studio/gc.js'
-import { advanceProject } from '../media-studio/orchestrator/advance.js'
+import { advanceProject, dispatchRequest } from '../media-studio/orchestrator/advance.js'
 import {
   type ExecuteDeps,
   LeaseLostError,
@@ -42,6 +42,7 @@ import {
   MediaProviderError,
   type MediaRequest,
   type MediaResult,
+  type ModelInfo,
 } from '../media-studio/providers/types.js'
 import {
   cancelQueuedStudioTasks,
@@ -129,6 +130,7 @@ class FakeProvider implements MediaProvider {
   calls = 0
   fail: MediaProviderError | null = null
   ledgerDown = false
+  extraModels: ModelInfo[] = []
   constructor(
     readonly id: string,
     readonly kind: MediaKind,
@@ -142,7 +144,7 @@ class FakeProvider implements MediaProvider {
         : this.kind === 'video'
           ? (['video.from_image'] as const)
           : (['voice.tts'] as const)
-    return [{ id: `${this.id}-m`, label: 'm', ops: [...ops], isDefault: true }]
+    return [{ id: `${this.id}-m`, label: 'm', ops: [...ops], isDefault: true }, ...this.extraModels]
   }
   status() {
     return { state: 'ready' as const }
@@ -421,6 +423,41 @@ describe('studio orchestrator engine (OCV5-591 A2-1a)', () => {
     assert.equal(r.rows[0]!.model, 'img-m')
   })
 
+  test('a voice design is frozen to the model that runs it, not the TTS default (code r2 P1)', async (t) => {
+    if (skip(t)) return
+    const voice = new FakeProvider('mm', 'voice')
+    voice.extraModels = [{ id: 'mm-design', label: 'design', ops: ['voice.design'] }]
+    const d = await deps(voice)
+    const p = await runningProject(0)
+    const asset = await query<{ id: string }>(
+      `INSERT INTO studio_assets(id, project_id, user_id, kind, name, descriptor)
+       VALUES (gen_random_uuid(), $1, $2, 'voice', '旁白', '沉稳') RETURNING id::text AS id`,
+      [p.id, p.userId],
+    )
+    const client = await getPool().connect()
+    try {
+      await client.query('BEGIN')
+      const out = await dispatchRequest(
+        client,
+        d,
+        { id: p.id, userId: p.userId },
+        { ownerKind: 'bible', ownerId: asset.rows[0]!.id, op: 'voice.design', exclude: [] },
+        { op: 'voice.design', prompt: '沉稳男声', text: '清晨' },
+      )
+      assert.equal(out, 'queued')
+      await client.query('COMMIT')
+    } finally {
+      client.release()
+    }
+    const r = await query<{ model: string; take: string }>(
+      `SELECT t.payload->'request'->>'model' AS model, k.model AS take
+         FROM studio_tasks t JOIN studio_takes k ON k.id::text = t.payload->>'takeId'
+        WHERE t.project_id = $1`,
+      [p.id],
+    )
+    assert.deepEqual(r.rows[0], { model: 'mm-design', take: 'mm-design' })
+  })
+
   test("a late video never overrides the user's pick or a shot sent to the user (code r1 P1)", async (t) => {
     if (skip(t)) return
     const d = await deps(new FakeProvider('img', 'image'), new FakeProvider('vid', 'video'))
@@ -478,6 +515,28 @@ describe('studio orchestrator engine (OCV5-591 A2-1a)', () => {
     const [take] = await takes(p.id)
     assert.deepEqual([take!.status, take!.cost], ['failed', '6'])
     assert.deepEqual(await money(p.id), { spent: 6n, reserved: 0n, status: 'running' })
+  })
+
+  test('waiting out a pause does not use up attempts (code r2 P1)', async (t) => {
+    if (skip(t)) return
+    const img = new FakeProvider('img', 'image')
+    const d = await deps(img)
+    const p = await runningProject(1)
+    await advanceProject(d, p.id)
+    await query(`UPDATE studio_projects SET status = 'paused' WHERE id = $1`, [p.id])
+    for (let i = 0; i < 8; i++) {
+      await runOne(d)
+      await query('UPDATE studio_tasks SET run_after = NOW() WHERE project_id = $1', [p.id])
+    }
+    const task = await query<{ status: string; attempts: number }>(
+      'SELECT status, attempts FROM studio_tasks WHERE project_id = $1',
+      [p.id],
+    )
+    assert.deepEqual(task.rows[0], { status: 'queued', attempts: 0 })
+    assert.equal(img.calls, 0)
+    await query(`UPDATE studio_projects SET status = 'running' WHERE id = $1`, [p.id])
+    await runOne(d)
+    assert.equal((await takes(p.id))[0]!.status, 'succeeded')
   })
 
   test('a task claimed too many times is closed instead of re-running forever (code r1 P1)', async (t) => {

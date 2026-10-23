@@ -567,9 +567,13 @@ async function gate(deps: ExecuteDeps, task: StudioTask): Promise<boolean> {
     return false
   }
   if (p.status === 'paused') {
-    await withLease(deps.pool, task, (c) =>
-      retryStudioTask(c, task, { delaySeconds: 60, error: 'project paused' }),
-    )
+    // Waiting out a pause is not an attempt: give the claim back so MAX_TASK_CLAIMS counts runs only.
+    await withLease(deps.pool, task, async (c) => {
+      await retryStudioTask(c, task, { delaySeconds: 60, error: 'project paused' })
+      await c.query('UPDATE studio_tasks SET attempts = GREATEST(0, attempts - 1) WHERE id = $1', [
+        task.id,
+      ])
+    })
     return false
   }
   return true

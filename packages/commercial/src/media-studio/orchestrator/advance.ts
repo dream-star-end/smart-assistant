@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto'
 import type { Pool, PoolClient } from 'pg'
 
 import type { ProviderRegistry } from '../providers/registry.js'
-import { type MediaOp, type MediaRequest, kindOf } from '../providers/types.js'
+import { type MediaOp, type MediaRequest, defaultModelFor, kindOf } from '../providers/types.js'
 import { enqueueStudioTask } from '../queue.js'
 import { appendStudioEvent } from '../store.js'
 import { reserveBudget } from './budget.js'
@@ -249,8 +249,9 @@ export async function dispatchRequest(
   )
   const version = v.rows[0]!.next
   const takeId = randomUUID()
-  const model =
-    req.model ?? provider.models().find((m) => m.isDefault)?.id ?? provider.models()[0]?.id ?? ''
+  // The default model for this op (a provider's overall default may not run it, e.g. MiniMax TTS
+  // vs voice design); frozen into the task so a re-claim runs the same model.
+  const model = req.model ?? defaultModelFor(provider, d.op)?.id ?? ''
   await client.query(
     `INSERT INTO studio_takes(id, project_id, owner_kind, owner_id, version, provider, model, op, inputs, prompt, status)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, 'queued')`,
