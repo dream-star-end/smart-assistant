@@ -385,6 +385,8 @@ usage:
   v5-baseline-security.sh harden-release <absolute-release-root>
   v5-baseline-security.sh check-release-legacy-cursor <absolute-release-root>
   v5-baseline-security.sh harden-release-legacy-cursor <absolute-release-root>
+  v5-baseline-security.sh check-structure-release <absolute-release-root>
+  v5-baseline-security.sh check-structure-release-legacy-cursor <absolute-release-root>
   v5-baseline-security.sh check-dir <absolute-baseline-dir>
   v5-baseline-security.sh harden-dir <absolute-baseline-dir>
   v5-baseline-security.sh write-manifest <absolute-release-root> <40-hex-sourceCommit>
@@ -419,6 +421,21 @@ case "$mode" in
   check-dir)
     [[ $# == 0 ]] || usage
     check_baseline "${path%/}"
+    ;;
+  # OCV5-581 L0 departure preflight: the structure half of check-release / its legacy variant
+  # (top level, exact skill manifest, per-skill whitelist, no special nodes). Read-only: find/stat
+  # only. Ownership and modes are left out on purpose, because harden-release-legacy-cursor fixes
+  # those before it checks; a structure mismatch is what harden cannot fix (seq365, 2026-10-22).
+  check-structure-release)
+    [[ $# == 0 ]] || usage
+    assert_structure "${path%/}/$BASELINE_REL"
+    printf 'ok structure=%s skills=%s\n' "${path%/}/$BASELINE_REL" "${#EXPECTED_SKILLS[@]}"
+    ;;
+  check-structure-release-legacy-cursor)
+    [[ $# == 0 ]] || usage
+    ALLOW_LEGACY_BASELINE_GAPS=1
+    assert_structure "${path%/}/$BASELINE_REL"
+    printf 'ok structure=%s skills=%s legacy\n' "${path%/}/$BASELINE_REL" "${#EXPECTED_SKILLS[@]}"
     ;;
   harden-dir)
     [[ $# == 0 ]] || usage
