@@ -33,6 +33,7 @@ import { provePendingUser } from "./lib/boxPendingUserProof.js";
 import { proveLocalCatalogOwner } from "./lib/boxLocalCatalogOwnerProof.js";
 import { proveEmptyRecoveryCliResult, proveReadPdfDocument } from "./lib/boxReadPdfProof.js"; // OCV5-571 (file-size ratchet): [ocv5-571-read-pdf-document] PASS — a PDF Read result with its document block runs fresh with the PDF inside its result, never 409 · [ocv5-571-empty-recovery-cli-result] PASS — an empty recovery whose CLI result event repeats the session usage keeps the short budget of three
 import { proveRefusedRecoveryClosed as refusedRecoveryProof } from "./lib/boxRefusedRecoveryProof.js";
+import { proveGptWebCitationMarkers } from "./lib/boxGptWebCitationProof.js"; // OCV5-584 (file-size ratchet): [ocv5-584-gpt-web-citation-markers] PASS — ChatGPT Web citation markers cut across SSE frames never reach a text delta and a known source becomes a link
 import { misrecordedRun, proveCliRepairedToolInput, proveForeignToolHistory, rereadError } from "./lib/boxCliRepairProof.js";
 import { scaledMs } from "./lib/gateLoadScale.js";
 
@@ -3672,7 +3673,6 @@ function proveParallelImageCaption(api: Api): string {
   return "[ocv5-334-parallel-image-caption] PASS — one caption among parallel image results joins the image it describes";
 }
 
-
 async function cleanUp(): Promise<void> {
   const pending = [...cleanups];
   cleanups.clear();
@@ -3699,7 +3699,7 @@ async function main(): Promise<void> {
   const api = await load();
   const proofs = [proveSkillContinuation(api), proveParallelSkillBodies(api), proveSkillBudgetTail(api),
     provePendingUser(api), await proveLocalCatalogOwner(api), proveImageCaption(api), proveParallelImageCaption(api),
-    proveForeignToolHistory(api), await proveCliRepaired(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
+    proveForeignToolHistory(api), await proveGptWebCitationMarkers(CANDIDATE), await proveCliRepaired(api), await proveResultRewriteEcho(api), await proveCliRejectedCall(api),
     await proveMixedCallTurnCut(api),
     await proveSpoolReadTransient(api), await proveBoxCliFollowUpTurn(api), await proveBoxCliLargeLine(api),
     await proveCliVersionRead(api), proveFreshProjectsDir(api), await proveSandInstallNotResent(api),

@@ -11,7 +11,18 @@ import {
 import { LiteratureError, abortable } from './errors.js'
 import { JieyouHttpClient } from './jieyouHttpClient.js'
 import { hasJieyouMemberAuthCookies } from './jieyouLoginSession.js'
+import type { LiteratureCallTrace, LiteratureEgressHop } from './observability.js'
 import { LiteratureHttpTransport } from './transport.js'
+import {
+  classifyMemberEntryResponse,
+  classifyResponsePage,
+  decodeUpstreamHtml,
+  grpcStatusError,
+  grpcWebStatus,
+  isHtmlResponse,
+  upstreamPageError,
+  upstreamStatusError,
+} from './upstreamClassify.js'
 
 export interface LiteratureHttpReadExecutionInput {
   readonly actionId: 'search' | 'download'
@@ -21,6 +32,8 @@ export interface LiteratureHttpReadExecutionInput {
   readonly accountInstanceId: string
   readonly storageState: JieyouAccountState
   readonly signal: AbortSignal
+  /** Per-call observability recorder (OCV5-585); never receives query or ids. */
+  readonly trace?: LiteratureCallTrace
 }
 
 export interface LiteratureHttpSearchItem {
@@ -334,6 +347,10 @@ export function parseSpringerSearchHtml(html: string, limit: number): ParsedWanf
   return [...fullAccessPapers, ...otherPapers].slice(0, limit)
 }
 
+/** Springer search page markers (2026-10-22 samples, ocv5-308/g585-upstream-samples.md). */
+const SPRINGER_NO_RESULTS_RE = /data-test=["']no-results["']/
+const SPRINGER_RESULTS_SHELL_RE = /data-test=["']results-data["']|class="[^"]*app-card-open/
+
 export function isChineseLiteratureQuery(query: string): boolean {
   return /\p{Script=Han}/u.test(query)
 }
@@ -453,6 +470,8 @@ export type DownstreamHttpRequester = (input: {
   readonly body?: Buffer
   readonly maxBytes: number
   readonly signal: AbortSignal
+  /** Reports each egress attempt: proxy (with the fallback reason when abandoned) or direct. */
+  readonly onRoute?: (hop: LiteratureEgressHop) => void
 }) => Promise<RawDownstreamResponse>
 function withDeadline<T>(work: Promise<T>, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -504,7 +523,7 @@ export function createPinnedDownstreamRequester(
   proxyHeaderTimeoutMs = Math.min(hopTimeoutMs, DOWNSTREAM_PROXY_HEADER_TIMEOUT_MS),
 ): DownstreamHttpRequester {
   const proxy = parseLoopbackProxyUrl(proxyUrl)
-  return async ({ url, method, headers, body, maxBytes, signal }) => {
+  return async ({ url, method, headers, body, maxBytes, signal, onRoute }) => {
     if (signal.aborted) throw new LiteratureError('CANCELLED')
     const hostname = url.hostname.toLowerCase()
     if (
@@ -637,19 +656,28 @@ export function createPinnedDownstreamRequester(
         req.end()
       })
     if (proxy) {
+      let fallback: LiteratureEgressHop['fallback']
       try {
         const proxyRes = await runAttempt(proxy)
-        if (![502, 503, 504].includes(proxyRes.statusCode)) return proxyRes
+        if (![502, 503, 504].includes(proxyRes.statusCode)) {
+          onRoute?.({ via: 'proxy' })
+          return proxyRes
+        }
+        fallback = 'status_5xx'
       } catch (err) {
         if (
           signal.aborted ||
           (err instanceof LiteratureError &&
             (err.code === 'CANCELLED' || err.code === 'RESPONSE_TOO_LARGE'))
         ) {
+          onRoute?.({ via: 'proxy' })
           throw err
         }
+        fallback = err instanceof LiteratureError && err.code === 'TIMEOUT' ? 'timeout' : 'error'
       }
+      onRoute?.({ via: 'proxy', fallback })
     }
+    onRoute?.({ via: 'direct' })
     return await runAttempt(null)
   }
 }
@@ -728,10 +756,33 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
         ...(item.snippet ? { snippet: item.snippet.slice(0, 2048) } : {}),
       }
     })
+    if (input.trace) {
+      input.trace.items = items.length
+      input.trace.zeroResult = items.length === 0
+    }
     return {
       storageState,
       data: { items, nextPage: items.length >= pageSize && page < 10000 ? page + 1 : 0 },
     }
+  }
+  private routeRecorder(input: LiteratureHttpReadExecutionInput) {
+    const trace = input.trace
+    return trace ? (hop: LiteratureEgressHop) => trace.recordHop(hop) : undefined
+  }
+  private reuseKey(input: LiteratureHttpReadExecutionInput, paperId: string): string {
+    return crypto
+      .createHash('sha256')
+      .update(`${String(input.ownerUserId ?? 1)}\0${input.accountInstanceId}\0${paperId}`)
+      .digest('hex')
+  }
+  private numericUserId(input: LiteratureHttpReadExecutionInput): number {
+    return typeof input.userId === 'number' &&
+      Number.isSafeInteger(input.userId) &&
+      input.userId > 0
+      ? input.userId
+      : Number(input.ownerUserId) > 0
+        ? Number(input.ownerUserId)
+        : 1
   }
   private rememberTitle(paperId: string, title: string): void {
     if (this.titleCache.size >= 500) {
@@ -770,14 +821,13 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     )
     try {
       const { url, response } = await client.getMemberPage(entryPath, signal)
-      const html = response.body.toString('utf8')
-      if (
-        response.status !== 200 ||
-        /\/e\/member\/login/i.test(url) ||
-        /请先登录|您还未登录|name=["']username["']/i.test(html)
-      ) {
-        throw new LiteratureError('SESSION_EXPIRED')
-      }
+      const failure = classifyMemberEntryResponse({
+        status: response.status,
+        url,
+        contentType: String(response.headers['content-type'] ?? ''),
+        body: response.body,
+      })
+      if (failure) throw failure
       return client.exportPrivateCookies()
     } finally {
       await client.close()
@@ -801,11 +851,13 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     if (!isChineseLiteratureQuery(query)) {
       return await this.executeEnglishSearch(input, initialState, query, pageSize, page)
     }
+    if (input.trace) input.trace.route = 'zh'
     const updatedState = await this.verifyMemberSessionOnEntry(
       initialState,
       JIEYOU_WANFANG_ENTRY_PATH,
       input.signal,
     )
+    input.trace?.phase('session')
     const grpcUrl = new URL(WANFANG_WEBVPN_GRPC_PATH, WANFANG_WEBVPN_ORIGIN)
     const grpcFrame = buildWanfangRelatedPaperGrpcFrame(query, pageSize, page)
     const res = await this.requester({
@@ -823,16 +875,20 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
       body: grpcFrame,
       maxBytes: 2 * 1024 * 1024,
       signal: input.signal,
+      onRoute: this.routeRecorder(input),
     })
-    if (res.statusCode === 401 || res.statusCode === 403) {
-      throw new LiteratureError('SESSION_EXPIRED')
-    }
-    if (res.statusCode === 429) {
-      throw new LiteratureError('RATE_LIMITED')
-    }
+    input.trace?.phase('upstream')
+    const statusError = upstreamStatusError(res)
+    if (statusError) throw statusError
     if (res.statusCode !== 200) {
       throw new LiteratureError('RESPONSE_INVALID')
     }
+    // A login/permission/challenge page is not an empty gRPC answer.
+    if (isHtmlResponse(res))
+      throw upstreamPageError(classifyResponsePage(res), 'LITERATURE_UPSTREAM_CHANGED')
+    // Errors arrive as HTTP 200 with a non-zero grpc-status (observed: trailers-only, empty body).
+    const grpcError = grpcStatusError(grpcWebStatus(res))
+    if (grpcError) throw grpcError
     const parsed = parseWanfangRelatedPaperGrpcResponse(res.body)
     return this.buildSearchOutput(parsed, pageSize, page, input, updatedState)
   }
@@ -843,11 +899,13 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     pageSize: number,
     page: number,
   ): Promise<LiteratureHttpReadExecutionOutput> {
+    if (input.trace) input.trace.route = 'en'
     const updatedState = await this.verifyMemberSessionOnEntry(
       initialState,
       JIEYOU_SPRINGER_WEBVPN_ENTRY_PATH,
       input.signal,
     )
+    input.trace?.phase('session')
     const searchUrl = new URL(`${SPRINGER_WEBVPN_PREFIX}/search`, WANFANG_WEBVPN_ORIGIN)
     searchUrl.searchParams.set('new-search', 'true')
     searchUrl.searchParams.set('query', query)
@@ -855,18 +913,29 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     if (page > 1) {
       searchUrl.searchParams.set('page', String(page))
     }
-    const res = await this.followUstbWebvpnRedirects(searchUrl, input.signal, 2 * 1024 * 1024)
-    if (res.statusCode === 401 || res.statusCode === 403) {
-      throw new LiteratureError('SESSION_EXPIRED')
-    }
-    if (res.statusCode === 429) {
-      throw new LiteratureError('RATE_LIMITED')
-    }
+    const res = await this.followUstbWebvpnRedirects(
+      searchUrl,
+      input.signal,
+      2 * 1024 * 1024,
+      this.routeRecorder(input),
+    )
+    input.trace?.phase('upstream')
+    const statusError = upstreamStatusError(res)
+    if (statusError) throw statusError
     if (res.statusCode !== 200) {
       throw new LiteratureError('RESPONSE_INVALID')
     }
-    const html = res.body.toString('utf8')
+    const html = decodeUpstreamHtml(res.body, String(res.headers['content-type'] ?? ''))
     const parsed = parseSpringerSearchHtml(html, pageSize)
+    if (parsed.length === 0) {
+      // Only Springer's explicit "no results" block is a real zero; a results shell whose cards no
+      // longer parse, or any other page, is reported instead of being shown as zero results.
+      if (!SPRINGER_NO_RESULTS_RE.test(html)) {
+        if (SPRINGER_RESULTS_SHELL_RE.test(html))
+          throw new LiteratureError('LITERATURE_UPSTREAM_CHANGED')
+        throw upstreamPageError(classifyResponsePage(res), 'LITERATURE_UPSTREAM_CHANGED')
+      }
+    }
     return this.buildSearchOutput(parsed, pageSize, page, input, updatedState)
   }
   private async executeDownload(
@@ -882,6 +951,26 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
       nowMs: this.now(),
     })
     const title = this.titleCache.get(paperId) ?? paperId
+    if (input.trace) input.trace.route = paperId.startsWith('sp_') ? 'en' : 'zh'
+    // Same owner, same account instance, same paper: hand out the verified file again instead of
+    // downloading it upstream and taking more of the artifact budget.
+    const reused = this.artifactStore.reuse(
+      this.numericUserId(input),
+      this.reuseKey(input, paperId),
+    )
+    if (reused) {
+      if (input.trace) input.trace.download = { bytes: reused.result.bytes, reused: true }
+      return {
+        storageState: initialState,
+        stagedArtifact: reused,
+        data: {
+          artifactId: reused.result.artifactId,
+          filename: reused.result.filename,
+          mimeType: reused.result.mimeType,
+          bytes: reused.result.bytes,
+        },
+      }
+    }
     if (paperId.startsWith('sp_')) {
       return await this.executeEnglishSpringerDownload(input, initialState, paperId, title)
     }
@@ -890,6 +979,7 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
       JIEYOU_WANFANG_ENTRY_PATH,
       input.signal,
     )
+    input.trace?.phase('session')
     const hop1Url = new URL(
       `${WANFANG_WEBVPN_DOWNLOAD_PREFIX}${encodeURIComponent(paperId)}.aspx`,
       WANFANG_WEBVPN_ORIGIN,
@@ -901,10 +991,24 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
         headers: { 'User-Agent': BROWSER_UA, Referer: ref, Cookie: 'authdomain=123123' },
         maxBytes,
         signal: input.signal,
+        onRoute: this.routeRecorder(input),
       })
+    // Every hop without a Location is classified the same way (401/403/429 and recognised pages);
+    // an unrecognised page keeps the historical "no usable PDF" meaning below.
+    const nextHop = (res: RawDownstreamResponse): string => {
+      const location = typeof res.headers.location === 'string' ? res.headers.location : ''
+      if (location) return location
+      const statusError = upstreamStatusError(res)
+      if (statusError) throw statusError
+      if (isHtmlResponse(res)) {
+        const kind = classifyResponsePage(res)
+        if (kind !== 'unknown') throw upstreamPageError(kind, 'RESPONSE_INVALID')
+      }
+      return ''
+    }
     const hop1Res = await getVpn(hop1Url, 256 * 1024, 'http://www.jieyoutsg.com/')
     let transactionId = ''
-    let nextLocation = typeof hop1Res.headers.location === 'string' ? hop1Res.headers.location : ''
+    let nextLocation = nextHop(hop1Res)
     for (let hop = 0; hop < 4 && nextLocation; hop++) {
       const nextUrl = new URL(nextLocation, WANFANG_WEBVPN_ORIGIN)
       if (nextUrl.origin !== WANFANG_WEBVPN_ORIGIN) {
@@ -916,7 +1020,7 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
         break
       }
       const hopRes = await getVpn(nextUrl, 256 * 1024)
-      nextLocation = typeof hopRes.headers.location === 'string' ? hopRes.headers.location : ''
+      nextLocation = nextHop(hopRes)
     }
     if (!transactionId) {
       throw new LiteratureError('RESPONSE_INVALID')
@@ -926,12 +1030,14 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     fulltextUrl.searchParams.set('resourceId', paperId)
     fulltextUrl.searchParams.set('transaction', transactionId)
     const pdfRes = await getVpn(fulltextUrl, LITERATURE_ARTIFACT_MAX_BYTES)
+    input.trace?.phase('upstream')
     return await this.stagePdfResponse(input, updatedState, pdfRes, title, paperId)
   }
   private async followUstbWebvpnRedirects(
     initialUrl: URL,
     signal: AbortSignal,
     maxBytes: number,
+    onRoute?: (hop: LiteratureEgressHop) => void,
   ): Promise<RawDownstreamResponse> {
     let currentUrl = initialUrl
     for (let hop = 0; hop < 6; hop++) {
@@ -945,6 +1051,7 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
         },
         maxBytes,
         signal,
+        ...(onRoute ? { onRoute } : {}),
       })
       if (res.statusCode >= 300 && res.statusCode < 400) {
         const loc = typeof res.headers.location === 'string' ? res.headers.location : ''
@@ -981,6 +1088,8 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
       JIEYOU_SPRINGER_WEBVPN_ENTRY_PATH,
       input.signal,
     )
+    input.trace?.phase('session')
+    const onRoute = this.routeRecorder(input)
     const pdfUrl = new URL(
       `${SPRINGER_WEBVPN_PREFIX}/content/pdf/${doi}.pdf`,
       WANFANG_WEBVPN_ORIGIN,
@@ -995,19 +1104,22 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
       },
       maxBytes: LITERATURE_ARTIFACT_MAX_BYTES,
       signal: input.signal,
+      ...(onRoute ? { onRoute } : {}),
     })
     if (pdfRes.statusCode >= 300 && pdfRes.statusCode < 400) {
       const warmSearchUrl = new URL(`${SPRINGER_WEBVPN_PREFIX}/search`, WANFANG_WEBVPN_ORIGIN)
       warmSearchUrl.searchParams.set('new-search', 'true')
       warmSearchUrl.searchParams.set('query', doi)
       warmSearchUrl.searchParams.set('content-type', 'Article')
-      await this.followUstbWebvpnRedirects(warmSearchUrl, input.signal, 2 * 1024 * 1024)
+      await this.followUstbWebvpnRedirects(warmSearchUrl, input.signal, 2 * 1024 * 1024, onRoute)
       pdfRes = await this.followUstbWebvpnRedirects(
         pdfUrl,
         input.signal,
         LITERATURE_ARTIFACT_MAX_BYTES,
+        onRoute,
       )
     }
+    input.trace?.phase('upstream')
     return await this.stagePdfResponse(input, updatedState, pdfRes, title, paperId)
   }
   private async stagePdfResponse(
@@ -1017,37 +1129,39 @@ export class WanfangLiteratureHttpExecutor implements LiteratureHttpReadExecutor
     title: string,
     fallbackId: string,
   ): Promise<LiteratureHttpReadExecutionOutput> {
-    if (pdfRes.statusCode === 401 || pdfRes.statusCode === 403) {
-      throw new LiteratureError('SESSION_EXPIRED')
-    }
-    if (pdfRes.statusCode === 429) {
-      throw new LiteratureError('RATE_LIMITED')
-    }
+    const statusError = upstreamStatusError(pdfRes)
+    if (statusError) throw statusError
     if (pdfRes.statusCode !== 200) {
       throw new LiteratureError('RESPONSE_INVALID')
     }
-    const contentType = String(pdfRes.headers['content-type'] ?? '').toLowerCase()
-    if (contentType.includes('text/html')) {
-      throw new LiteratureError('SESSION_EXPIRED')
-    }
+    // An HTML answer is only a login problem when it is a login page; an unsubscribed article's
+    // landing page is LITERATURE_NO_ACCESS and must not re-login or mark the account for relink.
+    if (isHtmlResponse(pdfRes))
+      throw upstreamPageError(classifyResponsePage(pdfRes), 'RESPONSE_INVALID')
     const safeTitle =
       title
         .replace(/[\\/:*?"<>|\r\n]+/g, '_')
         .trim()
         .slice(0, 200) || fallbackId
     const filename = safeTitle.toLowerCase().endsWith('.pdf') ? safeTitle : `${safeTitle}.pdf`
-    const numericUserId =
-      typeof input.userId === 'number' && Number.isSafeInteger(input.userId) && input.userId > 0
-        ? input.userId
-        : Number(input.ownerUserId) > 0
-          ? Number(input.ownerUserId)
-          : 1
-    const staged = await this.artifactStore.stagePdf({
-      userId: numericUserId,
-      filename,
-      data: pdfRes.body,
-      signal: input.signal,
-    })
+    let staged: StagedLiteratureArtifact
+    try {
+      staged = await this.artifactStore.stagePdf({
+        userId: this.numericUserId(input),
+        filename,
+        data: pdfRes.body,
+        signal: input.signal,
+        reuseKey: this.reuseKey(input, fallbackId),
+      })
+    } catch (error) {
+      if (input.trace && error instanceof LiteratureError && error.code === 'RESPONSE_INVALID')
+        input.trace.download = { bytes: pdfRes.body.length, pdfValid: false, reused: false }
+      throw error
+    } finally {
+      input.trace?.phase('stage')
+    }
+    if (input.trace)
+      input.trace.download = { bytes: staged.result.bytes, pdfValid: true, reused: false }
     return {
       storageState: updatedState,
       stagedArtifact: staged,

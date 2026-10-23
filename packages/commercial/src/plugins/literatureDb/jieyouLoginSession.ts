@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs'
 import path from 'node:path'
-import { LiteratureArtifactStore } from './artifactStore.js'
+import { LiteratureArtifactStore, type LiteratureArtifactStoreOptions } from './artifactStore.js'
 import { WanfangLiteratureHttpExecutor } from './httpExecutor.js'
 import { createLocalCaptchaReader } from './localCaptchaReader.js'
 import { LiteratureSetupService, type LiteratureSetupOptions } from './setupService.js'
@@ -240,11 +240,14 @@ export function createCommercialLiteratureRuntime(input: {
   runtimeChannel: string
   redis: LiteratureSetupOptions['redis']
   env?: NodeJS.ProcessEnv
+  onArtifactEvent?: LiteratureArtifactStoreOptions['onEvent']
 }) {
   const bundleRoot = resolveLiteratureCaptchaBundleRoot(input.env)
   const readers = bundleRoot ? () => [createLocalCaptchaReader({ bundleRoot })] : () => []
   const literatureArtifacts =
-    input.runtimeChannel === 'v5' ? new LiteratureArtifactStore() : undefined
+    input.runtimeChannel === 'v5'
+      ? new LiteratureArtifactStore(input.onArtifactEvent ? { onEvent: input.onArtifactEvent } : {})
+      : undefined
   const literatureHttp =
     literatureArtifacts !== undefined
       ? new WanfangLiteratureHttpExecutor({
