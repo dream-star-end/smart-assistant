@@ -86,6 +86,37 @@ test('task polish user flows (real Chromium, isolated)', { timeout: 240_000 }, a
           assert.deepEqual(errors, [])
         } finally { await context.close() }
       })
+      await t.test(`${width}: latest history, gaps and full read-only paid output stay accessible`, async () => {
+        const { context, page, errors } = await pageFor('scenario=history')
+        try {
+          await page.getByTestId('ticket-run-models').waitFor()
+          await page.getByTestId('ticket-comment-expand').waitFor()
+          assert.equal(await page.getByText('PAID_RESULT_END', { exact: true }).count(), 0)
+          assert.equal(await page.locator('.oc-iui').count(), 0)
+          assert.equal((await page.evaluate(() => window.historyStats())).fullReads, 1)
+          await page.getByTestId('ticket-comment-expand').click()
+          await page.getByText('PAID_RESULT_END', { exact: true }).waitFor()
+          const readonlyAction = page.getByRole('button', { name: '历史只读操作', exact: true })
+          await readonlyAction.waitFor()
+          assert.equal(await readonlyAction.isDisabled(), true)
+          const earlier = page.getByTestId('timeline-load-earlier')
+          await earlier.click()
+          await page.waitForFunction(() => window.historyStats().earlier.length === 1)
+          assert.deepEqual((await page.evaluate(() => window.historyStats())).earlier, ['421'])
+          await page.evaluate(() => window.burstHistory())
+          await page.getByRole('button', { name: '加载缺失记录', exact: true }).waitFor()
+          await earlier.click()
+          await page.waitForFunction(() => window.historyStats().earlier.length === 2)
+          await page.getByRole('button', { name: '加载更早记录', exact: true }).waitFor()
+          await earlier.click()
+          await page.waitForFunction(() => window.historyStats().earlier.length === 3)
+          assert.deepEqual((await page.evaluate(() => window.historyStats())).earlier, ['421', '571', '321'])
+          assert.equal(await page.getByTestId('ticket-comment-expand').getAttribute('aria-expanded'), 'true')
+          await page.getByText('PAID_RESULT_END', { exact: true }).waitFor()
+          assert.equal((await page.evaluate(() => window.historyStats())).fullReads, 1)
+          assert.deepEqual(errors, [])
+        } finally { await context.close() }
+      })
       await t.test(`${width}: stop, paid result and retry fence a delayed old stop receipt`, async () => {
         const { context, page, errors } = await pageFor('scenario=execution')
         try {
