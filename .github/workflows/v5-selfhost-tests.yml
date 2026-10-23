@@ -110,7 +110,8 @@ jobs:
 
   v5-ops:
     name: selfhost-v5-ops
-    runs-on: ubuntu-latest
+    # Release deadline proofs use the GNU process-group semantics of v5-dev.
+    runs-on: ubuntu-24.04
     # v5-dev 实测 8 分钟
     timeout-minutes: 15
     services:
@@ -144,6 +145,12 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Verify release timeout toolchain
+        run: |
+          timeout_version="$(timeout --version)"
+          printf '%s\n' "${timeout_version%%$'\n'*}"
+          [[ "$timeout_version" == *"GNU coreutils"* ]]
 
       - name: Run v5-ops
         # baseline hardening must prove production root:root ownership.
