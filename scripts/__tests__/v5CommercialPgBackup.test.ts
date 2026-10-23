@@ -409,6 +409,38 @@ describe('commercial backup controller and official lease qualification', () => 
     assert.equal(r.status, 3, r.stderr)
   })
 
+  test('the remote worker and its children run at nice 15 and idle I/O priority', () => {
+    // An SSH server starts with its own scheduling settings. The local unit's
+    // Nice/IOSchedulingClass cannot be inherited across the network boundary.
+    stub('ssh-exec', [
+      'renice -n 0 -p "$$" >/dev/null || exit 2',
+      'ps -o ni= -p "$$" > "$STUB_DIR/server-nice"',
+      'exec ionice -c 2 -n 4 bash -c "${@: -1}"',
+    ].join('\n'))
+    stub('priority-worker', [
+      'ps -o ni= -p "$$" > "$STUB_DIR/worker-nice"',
+      'ionice -p "$$" > "$STUB_DIR/worker-io"',
+      `bash -c 'ps -o ni= -p "$BASHPID" > "$STUB_DIR/child-nice"; ionice -p "$BASHPID" > "$STUB_DIR/child-io"'`,
+    ].join('\n'))
+    const controller = path.join(root, 'scripts/v5-commercial-pg-backup-controller.sh')
+    const r = spawnSync('bash', [controller, '__leased'], {
+      env: {
+        ...process.env, PATH: `${path.join(dir, 'bin')}:${process.env.PATH}`,
+        LC_ALL: 'C', STUB_DIR: dir,
+        OC_V5_MANUAL_LEASE_NONCE: '0123456789abcdef0123456789abcdef',
+        V5CB_CONTROLLER_SSH: path.join(dir, 'bin/ssh-exec'),
+        V5CB_CONTROLLER_REMOTE: path.join(dir, 'bin/priority-worker'),
+      },
+      encoding: 'utf8', timeout: 10_000,
+    })
+    assert.equal(r.status, 0, `${r.stdout}${r.stderr}`)
+    assert.equal(Number(readFileSync(path.join(dir, 'server-nice'), 'utf8').trim()), 0)
+    for (const who of ['worker', 'child']) {
+      assert.equal(Number(readFileSync(path.join(dir, `${who}-nice`), 'utf8').trim()), 15)
+      assert.equal(readFileSync(path.join(dir, `${who}-io`), 'utf8').trim(), 'idle')
+    }
+  })
+
   test('actual flock, invocation, expiry and dump cluster are qualified through the existing verifier', async () => {
     const lock = path.join(dir, 'lease.lock')
     const holder = spawn('bash', ['-c', 'exec 9>"$1"; flock -x 9; echo ready; exec sleep 30', 'fixture', lock], { stdio: ['ignore', 'pipe', 'pipe'] })
