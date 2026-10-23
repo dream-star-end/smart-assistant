@@ -22,17 +22,19 @@ const bundle = await build({
   } }] : [],
 })
 test('task polish user flows (real Chromium, isolated)', { timeout: 240_000 }, async (t) => {
-  const server = createServer((_req, res) => { res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end('<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{margin:0;font:14px sans-serif}.virtual-fixture{height:200px;width:240px;overflow-y:auto}[role=dialog]{position:fixed;inset:0;background:white;display:flex;flex-direction:column;overflow:auto}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden}button{min-height:36px}details:not([open])>:not(summary){display:none}</style><div id="root"></div>') })
+  const server = createServer((_req, res) => { if (_req.url === '/task-polish.js') { res.setHeader('Content-Type', 'text/javascript; charset=utf-8'); res.end(bundle.outputFiles[0].text); return } res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end('<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{margin:0;font:14px sans-serif}.virtual-fixture{height:200px;width:240px;overflow-y:auto}[role=dialog]{position:fixed;inset:0;background:white;display:flex;flex-direction:column;overflow:auto}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden}button{min-height:36px}details:not([open])>:not(summary){display:none}</style><div id="root"></div>') })
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
   const browser = await chromium.launch({ executablePath: resolveBrowserExecutable(), headless: true, args: ['--no-sandbox'] })
   try {
     for (const width of [1440, 390]) {
       async function pageFor(query) {
+        const started = performance.now()
         const context = await browser.newContext({ viewport: { width, height: 844 }, isMobile: width < 768, hasTouch: width < 768 })
         const page = await context.newPage(); page.setDefaultTimeout(8000)
         const errors = []; page.on('pageerror', (e) => errors.push(e.message))
         await page.goto(`http://127.0.0.1:${server.address().port}/?${query}`)
-        await page.addScriptTag({ content: bundle.outputFiles[0].text })
+        await page.addScriptTag({ url: `http://127.0.0.1:${server.address().port}/task-polish.js` })
+        t.diagnostic(`${width} ${query}: isolated page/bootstrap ${Math.round(performance.now() - started)}ms, bundle ${bundle.outputFiles[0].contents.length} bytes`)
         return { context, page, errors }
       }
       await t.test(`${width}: all 1000 loaded tickets remain accessible with bounded pages`, async () => {
