@@ -99,6 +99,18 @@ describe('VoiceLibrary (OCV5-593 FE-4)', () => {
     })
   })
 
+  test('dialogs take focus, close on Escape and give focus back to the opener', () => {
+    render(<VoiceLibrary auth={auth} view={base()} voiceReady onReload={vi.fn()} />)
+    const opener = screen.getByRole('button', { name: /一句话设计/ })
+    opener.focus()
+    fireEvent.click(opener)
+    const dialog = screen.getByRole('dialog', { name: '一句话设计音色' })
+    expect(screen.getByLabelText('名称')).toHaveFocus()
+    fireEvent.keyDown(dialog, { key: 'Escape' })
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(opener).toHaveFocus()
+  })
+
   test('clone needs the consent box; the sample is uploaded as audio first', async () => {
     uploadAsset.mockResolvedValue({ id: 'up1' })
     createVoice.mockResolvedValue({ assetId: 'v2' })

@@ -2148,8 +2148,21 @@ fieldset.st-versions {
 .st-line audio {
   display: none;
 }
+.st-voice-spacer {
+  flex: 1;
+}
 @media (max-width: 1100px) {
+  .st-board-voice {
+    flex-direction: column;
+  }
   .st-voice-lib {
+    width: auto;
+    max-height: 42dvh;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .st-voice-spacer,
+  .st-voice-sub {
     display: none;
   }
 }
@@ -2426,8 +2439,8 @@ fieldset.st-versions {
 .st-field .st-input {
   flex: none;
 }
-.st-voice-dialog {
-  box-shadow: 0 0 0 100vmax rgba(10, 10, 14, 0.38), 0 24px 60px -12px rgba(0, 0, 0, 0.45);
+.st-voice-dialog::backdrop {
+  background: rgba(10, 10, 14, 0.38);
 }
 output.st-chip {
   height: auto;

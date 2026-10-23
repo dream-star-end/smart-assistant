@@ -158,7 +158,7 @@ export function VoicePage(props: {
   }
 
   return (
-    <div className="st-board">
+    <div className="st-board st-board-voice">
       <aside className="st-voice-lib" aria-label="音色">
         <VoiceLibrary
           auth={auth}
@@ -166,7 +166,7 @@ export function VoicePage(props: {
           voiceReady={voice.state === 'ready'}
           onReload={props.onReload}
         />
-        <div style={{ flex: 1 }} />
+        <div className="st-voice-spacer" />
         <div className="st-card st-voice-sub">
           <div className="st-row" style={{ gap: 6 }}>
             <Captions size={14} />
