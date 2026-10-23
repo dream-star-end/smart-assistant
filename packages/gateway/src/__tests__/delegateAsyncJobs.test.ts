@@ -654,7 +654,7 @@ describe('605 delegate trace boundaries', () => {
 
   it('parent Stop during mint cannot create a child and does not consume queue budget', async () => {
     const gw = makeGateway()
-    gw.sessions.getByKey = (key: string) => key === PARENT_KEY ? { sessionKey: PARENT_KEY, _teamModeTurn: true } : undefined
+    gw.sessions.getByKey = (key: string) => key === PARENT_KEY ? { sessionKey: PARENT_KEY, channel: 'webchat', agentId: 'main', _teamModeTurn: true } : undefined
     gw.sessions.interrupt = () => false
     const mint = await mintBarrier()
     try {
