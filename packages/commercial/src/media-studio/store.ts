@@ -259,7 +259,11 @@ export class StudioStore {
       this.pool.query(
         `SELECT id::text AS id, owner_kind AS "ownerKind", owner_id::text AS "ownerId", version, provider,
                 model, op, status, error_code AS "errorCode", cost_credits::text AS "costCredits", qa,
-                blob_sha AS "blobSha", created_at AS "createdAt", finished_at AS "finishedAt"
+                blob_sha AS "blobSha", created_at AS "createdAt", finished_at AS "finishedAt",
+                -- OCV5-591 M1: a music take carries its licence snapshot and track card for the UI;
+                -- other takes' meta (provider internals) stays server-side.
+                CASE WHEN owner_kind = 'music'
+                     THEN jsonb_build_object('license', meta->'license', 'track', meta->'track') END AS music
          FROM studio_takes WHERE project_id=$1 ORDER BY created_at DESC LIMIT 500`,
         [id],
       ),

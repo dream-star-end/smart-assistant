@@ -273,6 +273,16 @@ describe('studio music sources (OCV5-591 M1)', () => {
       [p.id],
     )
     assert.deepEqual(s.rows[0], { take: row.id, spent: '0' })
+    // The project view carries the licence and track card for the music page (other takes do not).
+    const view = (await new StudioStore(getPool()).projectView(uid, p.id))!
+    const music = (view.takes as Array<{ id: string }>).find((x) => x.id === row.id) as unknown as {
+      music: { license: { attributionText: string }; track: { metadata: unknown } }
+    }
+    assert.equal(
+      music.music.license.attributionText,
+      '"Easy Lemon" Kevin MacLeod (incompetech.com)',
+    )
+    assert.deepEqual(music.music.track.metadata, { bpm: 'source', moods: 'source' })
   })
 
   test('an older choice finishing last never replaces a newer one (code r1 P1)', async (t) => {
