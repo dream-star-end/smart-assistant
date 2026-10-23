@@ -189,7 +189,7 @@ for (const cyclic of [false, true]) {
     const f = fixture()
     const first = ordinary(80, cyclic ? uuid(81) : null, 'user', 'extra local branch', -2)
     const second = ordinary(81, uuid(80), 'assistant', 'extra local result', -1)
-    let raw = Buffer.concat([f.raw, Buffer.from(`${JSON.stringify(first)}\n${JSON.stringify(second)}\n`)])
+    let raw: Buffer = Buffer.concat([f.raw, Buffer.from(`${JSON.stringify(first)}\n${JSON.stringify(second)}\n`)])
     if (cyclic) {
       const input = clone(f.expected[0]); input.parentUuid = uuid(80)
       raw = replaceRow(raw, f.expected[0], [input])

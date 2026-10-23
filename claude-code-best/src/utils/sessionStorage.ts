@@ -3787,11 +3787,11 @@ function walkChainBeforeParse(buf: Buffer, prune: boolean): TranscriptWalkResult
     if (isTranscriptMessage(entry)) {
       const parentUuid = entry.parentUuid && progressBridge.has(entry.parentUuid)
         ? (progressBridge.get(entry.parentUuid) ?? null) : entry.parentUuid
-      const content = entry.type === 'user' ? entry.message.content : undefined
+      const content = entry.type === 'user' ? entry.message!.content : undefined
       const node: TranscriptLightNode = {
         uuid: entry.uuid, parentUuid, timestamp: entry.timestamp, type: entry.type,
         isSidechain: entry.isSidechain,
-        assistantId: entry.type === 'assistant' ? entry.message.id : undefined,
+        assistantId: entry.type === 'assistant' ? entry.message!.id : undefined,
         hasToolResult: Array.isArray(content) && content.some(block => block.type === 'tool_result'),
         snipMetadata: (entry as { snipMetadata?: { removedUuids?: UUID[] } }).snipMetadata,
       }
