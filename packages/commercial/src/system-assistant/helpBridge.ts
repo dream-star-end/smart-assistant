@@ -27,7 +27,7 @@ export function systemHelpDispatchFields(input: {
     try {
       fields[SYSTEM_HELP_BOOTSTRAP_FIELD] = input.issueBootstrap({ uid: uid.toString(), containerId: containerId.toString(), sessionId: record.sessionId,
         agentId: record.agentId, dispatchId: record.dispatchId, attemptNo: record.attemptNo, ownerId: record.leaseOwnerId, dispatchLeaseEpoch: String(record.leaseEpoch) }).token
-    } catch { input.onUnavailable() }
+    } catch { try { input.onUnavailable() } catch { /* advisory only */ } }
   }
   return fields
 }
