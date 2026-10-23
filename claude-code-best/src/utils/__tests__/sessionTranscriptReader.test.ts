@@ -2,13 +2,13 @@ import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createHash } from 'node:crypto'
+import { createHash, type UUID } from 'node:crypto'
 import { loadFullLog, loadTranscriptFile, clearSessionMessagesCache, resetProjectForTesting } from '../sessionStorage.js'
 import { flushSessionFileIo } from '../sessionFileIo.js'
 import type { LogOption } from '../../types/logs.js'
 
 const sid = '60700000-0000-4000-8000-000000001000'
-const id = (n: number): string => `60700000-0000-4000-8000-${String(n).padStart(12, '0')}`
+const id = (n: number): UUID => `60700000-0000-4000-8000-${String(n).padStart(12, '0')}`
 const stamp = (n: number): string => new Date(Date.UTC(2026, 9, 24, 0, 0, n)).toISOString()
 const hash = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const image = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII='
