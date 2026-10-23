@@ -337,6 +337,13 @@ export function makeOrchestratorApi(
             WHERE id = $1 AND status = 'done'`,
           [projectId],
         )
+        // Paused after a compose finished (resume would land on done): resume to the director
+        // instead (code r2 P1), so the new music is composed.
+        await c.query(
+          `UPDATE studio_projects SET settings = settings || '{"resumeTo":"running"}'::jsonb
+            WHERE id = $1 AND status = 'paused' AND settings->>'resumeTo' = 'done'`,
+          [projectId],
+        )
         await appendStudioEvent(c, projectId, 'music.requested', {
           providerId,
           trackId,
@@ -355,7 +362,10 @@ export function makeOrchestratorApi(
         throw err
       }
       const r = await pool.query(
-        `UPDATE studio_projects SET settings = settings || jsonb_build_object('musicEdit', $3::jsonb),
+        `UPDATE studio_projects SET settings = settings || jsonb_build_object('musicEdit', $3::jsonb)
+                -- paused after a compose finished: resume to the director with the new edit (code r2 P1)
+                || CASE WHEN status = 'paused' AND settings->>'resumeTo' = 'done'
+                        THEN '{"resumeTo":"running"}'::jsonb ELSE '{}'::jsonb END,
                 -- A finished film goes back to the director with the new edit (free re-compose).
                 status = CASE WHEN status = 'done' THEN 'running' ELSE status END,
                 rev = rev + 1, updated_at = NOW()

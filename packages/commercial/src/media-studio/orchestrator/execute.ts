@@ -555,8 +555,18 @@ async function gate(deps: ExecuteDeps, task: StudioTask): Promise<boolean> {
     (p.status === 'done' && !exportOfDone)
   ) {
     const composeTake = task.kind === 'compose' ? composePayload(task).takeId : undefined
+    const owner = composeTake
+      ? (
+          await deps.pool.query<{ user_id: string }>(
+            'SELECT user_id::text AS user_id FROM studio_projects WHERE id = $1',
+            [task.projectId],
+          )
+        ).rows[0]
+      : undefined
     await withLease(deps.pool, task, async (c) => {
       if (composeTake) {
+        if (owner)
+          await deps.blobs.dropRefs(BigInt(owner.user_id), { kind: 'final', id: composeTake }, c)
         await c.query(
           `UPDATE studio_takes SET status = 'canceled', finished_at = NOW() WHERE id = $1 AND status IN ('queued','running')`,
           [composeTake],
@@ -574,14 +584,6 @@ async function gate(deps: ExecuteDeps, task: StudioTask): Promise<boolean> {
       }
       await finishStudioTask(c, task, { status: 'canceled', error: 'project is no longer active' })
     })
-    if (composeTake) {
-      const u = await deps.pool.query<{ user_id: string }>(
-        'SELECT user_id::text AS user_id FROM studio_projects WHERE id = $1',
-        [task.projectId],
-      )
-      if (u.rows[0])
-        await deps.blobs.dropRefs(BigInt(u.rows[0].user_id), { kind: 'final', id: composeTake })
-    }
     return false
   }
   if (p.status === 'paused') {

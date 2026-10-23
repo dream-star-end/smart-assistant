@@ -565,4 +565,54 @@ describe('studio compose (OCV5-591 A2-1c)', () => {
       'back to the director, who composes after that work',
     )
   })
+
+  test('a music edit saved while paused after the film finished is composed on resume (code r2 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    await advanceProject(s.advanceDeps, s.p.id)
+    s.runner.onCompose = async () => {
+      await new StudioStore(getPool()).transition(s.uid, s.p.id, 'pause')
+    }
+    await runOne(s.exec)
+    await s.api.setMusicEdit(s.uid, s.p.id, { inSec: 6 })
+    await new StudioStore(getPool()).transition(s.uid, s.p.id, 'resume')
+    assert.equal(
+      (await project(s.p.id)).status,
+      'running',
+      'back to the director, not straight to done',
+    )
+    await advanceProject(s.advanceDeps, s.p.id)
+    assert.equal((await project(s.p.id)).status, 'composing')
+  })
+
+  test('an export interrupted by pending work keeps its format and comes back (code r2 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    await advanceProject(s.advanceDeps, s.p.id)
+    await runOne(s.exec)
+    assert.deepEqual(
+      await s.api.requestExport(s.uid, s.p.id, { resolution: 'vertical', subtitles: 'srt' }),
+      { queued: true },
+    )
+    s.runner.onCompose = async () => {
+      await enqueueStudioTask(getPool(), {
+        projectId: s.p.id,
+        kind: 'gen',
+        idempotencyKey: `gen:music:${randomUUID()}`,
+        payload: {},
+      })
+    }
+    await runOne(s.exec)
+    const again = await query<{
+      variant: { resolution: string; subtitles: string }
+      reason: string
+    }>(
+      `SELECT payload->'variant' AS variant, payload->>'reason' AS reason FROM studio_tasks
+        WHERE project_id = $1 AND kind = 'compose' AND status = 'queued'`,
+      [s.p.id],
+    )
+    assert.deepEqual(again.rows, [
+      { variant: { resolution: 'vertical', subtitles: 'srt' }, reason: 'export' },
+    ])
+  })
 })

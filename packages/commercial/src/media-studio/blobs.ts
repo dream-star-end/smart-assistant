@@ -398,13 +398,23 @@ export class StudioBlobStore {
     })
   }
 
+  /** The caller's transaction when given, else one of our own. */
+  private inOwnOr<T>(
+    db: PoolClient | undefined,
+    fn: (client: PoolClient) => Promise<T>,
+  ): Promise<T> {
+    return db ? fn(db) : inTx(this.opts.pool, fn)
+  }
+
   /** Like dropRefs, but keeps the refs to `keep` (a re-used take keeps only what it publishes). */
   async dropRefsExcept(
     userId: bigint,
     ref: { kind: BlobRefKind; id: string },
     keep: string[],
+    /** Run inside this transaction (atomic with the caller's own writes, A2-1c code r2 P1). */
+    db?: PoolClient,
   ): Promise<number> {
-    return inTx(this.opts.pool, async (client) => {
+    return this.inOwnOr(db, async (client) => {
       await client.query('SELECT 1 FROM studio_quota WHERE scope=$1 FOR UPDATE', [
         userScope(userId),
       ])
@@ -431,8 +441,12 @@ export class StudioBlobStore {
   }
 
   /** Removes the user's refs held by one object; gives back bytes of shas the user no longer references. */
-  async dropRefs(userId: bigint, ref: { kind: BlobRefKind; id: string }): Promise<number> {
-    return inTx(this.opts.pool, async (client) => {
+  async dropRefs(
+    userId: bigint,
+    ref: { kind: BlobRefKind; id: string },
+    db?: PoolClient,
+  ): Promise<number> {
+    return this.inOwnOr(db, async (client) => {
       await client.query('SELECT 1 FROM studio_quota WHERE scope=$1 FOR UPDATE', [
         userScope(userId),
       ])

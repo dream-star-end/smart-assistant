@@ -254,14 +254,14 @@ export async function runCompose(deps: ExecuteDeps, task: StudioTask): Promise<v
           [pl.takeId],
         )
       }
+      // An earlier attempt may have written its blob already (code r1 P1): give it back, atomically.
+      if (pl.takeId)
+        await deps.blobs.dropRefs(BigInt(inputs.userId), { kind: 'final', id: pl.takeId }, c)
       await finishStudioTask(c, task, {
         status: 'failed',
         error: `COMPOSE_NARRATION: ${err.message}`.slice(0, 500),
       })
     })
-    // An earlier attempt may have written its blob already (code r1 P1): give it back.
-    if (pl.takeId)
-      await deps.blobs.dropRefs(BigInt(inputs.userId), { kind: 'final', id: pl.takeId })
     return
   }
 
@@ -353,7 +353,7 @@ export async function runCompose(deps: ExecuteDeps, task: StudioTask): Promise<v
   }
 
   // Publish only if the cut still matches the project (plan §3.7a).
-  const outcome = await withLease(deps.pool, task, async (c) => {
+  await withLease(deps.pool, task, async (c) => {
     await c.query('SELECT 1 FROM studio_projects WHERE id = $1 FOR UPDATE', [task.projectId])
     const now = await loadComposeInputs(c, task.projectId, pl.variant)
     // What this run actually composed (a re-claim composes the inputs as they are now).
@@ -377,6 +377,17 @@ export async function runCompose(deps: ExecuteDeps, task: StudioTask): Promise<v
       await appendStudioEvent(c, task.projectId, 'compose.superseded', {
         message: '合成期间有新的改动（如换配乐）还在进行，等它完成后重新合成。',
       })
+      // An export keeps the format it was asked for (code r2 P1): it comes back after that work.
+      if (pl.reason === 'export') {
+        await enqueueStudioTask(c, {
+          projectId: task.projectId,
+          kind: 'compose',
+          idempotencyKey: `compose:${task.projectId}:export-after:${task.id}`,
+          payload: { reason: 'export', variant: pl.variant },
+          runAfterSeconds: 30,
+        })
+      }
+      await deps.blobs.dropRefs(userId, { kind: 'final', id: takeId }, c)
       await finishStudioTask(c, task, { status: 'done', error: 'superseded by pending work' })
       return 'superseded' as const
     }
@@ -396,6 +407,7 @@ export async function runCompose(deps: ExecuteDeps, task: StudioTask): Promise<v
           message: '合成期间配乐或镜头有改动，按最新的内容重新合成。',
         })
       }
+      await deps.blobs.dropRefs(userId, { kind: 'final', id: takeId }, c)
       await finishStudioTask(c, task, { status: 'done', error: 'superseded by newer inputs' })
       return 'superseded' as const
     }
@@ -440,16 +452,17 @@ export async function runCompose(deps: ExecuteDeps, task: StudioTask): Promise<v
           : '新规格的成片合成好了，可以下载。'
         : `成片合成好了，但质检没通过（时长 ${qa.durationSec ?? '未知'} 秒，应为 ${job.expectedSec} 秒），请看一下。`,
     })
+    // A re-claimed run reuses the take; what an earlier attempt stored on it is given back in this
+    // same transaction (code r1 / r2 P1): never a window where the task is done but refs leak.
+    await deps.blobs.dropRefsExcept(
+      userId,
+      { kind: 'final', id: takeId },
+      [finalSha, ...(srtSha ? [srtSha] : [])],
+      c,
+    )
     await finishStudioTask(c, task, { status: 'done' })
     return 'published' as const
   })
-  if (outcome === 'superseded') await deps.blobs.dropRefs(userId, { kind: 'final', id: takeId })
-  // A re-claimed run reuses the take; what an earlier attempt stored on it is given back (code r1 P1).
-  else
-    await deps.blobs.dropRefsExcept(userId, { kind: 'final', id: takeId }, [
-      finalSha,
-      ...(srtSha ? [srtSha] : []),
-    ])
 }
 
 /** A compose that will not be retried: its take fails and gives its blob refs back (plan §4). */
@@ -485,11 +498,11 @@ export async function failCompose(
           ? '成片没有合成成功，没有扣费。可以稍后让导演 agent 再试。'
           : '这个规格没有合成成功，没有扣费，可以稍后再试。',
     })
+    if (pl.takeId && p.rows[0])
+      await deps.blobs.dropRefs(BigInt(p.rows[0].user_id), { kind: 'final', id: pl.takeId }, c)
     await finishStudioTask(c, task, {
       status: 'failed',
       error: `${code}: ${message}`.slice(0, 500),
     })
   })
-  if (pl.takeId && p.rows[0])
-    await deps.blobs.dropRefs(BigInt(p.rows[0].user_id), { kind: 'final', id: pl.takeId })
 }
