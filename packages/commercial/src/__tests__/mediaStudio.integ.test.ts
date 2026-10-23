@@ -685,6 +685,20 @@ describe('media studio music catalog (0325, OCV5-591 M1)', () => {
     assert.ok(ok.id)
   })
 
+  test('re-importing an orphaned site blob restarts its grace period (code r1 P1)', async (t) => {
+    if (skip(t)) return
+    const blobs = blobStore(await mkdtemp(path.join(tmpdir(), 'oc-studio-orphan-')))
+    const content = Buffer.from('ID3 orphan from an earlier import')
+    const sha = await blobs.putSite(content, 'audio/mpeg')
+    await query(
+      "UPDATE studio_blobs SET created_at = NOW() - INTERVAL '2 hours' WHERE sha256 = $1",
+      [sha],
+    )
+    assert.equal(await blobs.putSite(content, 'audio/mpeg'), sha)
+    assert.equal(await blobs.gc(), 0, 'fresh again: the import has its full hour to list it')
+    await access(blobs.blobPath(sha))
+  })
+
   test('a user track needs the rights statement', async (t) => {
     if (skip(t)) return
     const uid = await user()

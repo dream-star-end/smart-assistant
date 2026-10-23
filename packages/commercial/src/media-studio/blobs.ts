@@ -332,6 +332,12 @@ export class StudioBlobStore {
       )
       const physicalNew =
         (await client.query('SELECT 1 FROM studio_blobs WHERE sha256=$1', [sha])).rowCount === 0
+      if (!physicalNew) {
+        // Re-imported content may be an orphan from an earlier run: restart its grace period under
+        // the sha lock, so the GC (which re-checks the age under the same lock) cannot take it
+        // before the caller's catalog row holds it.
+        await client.query('UPDATE studio_blobs SET created_at = NOW() WHERE sha256=$1', [sha])
+      }
       if (physicalNew) {
         const held = await client.query<{ n: string }>(
           'SELECT COALESCE(SUM(bytes),0)::text AS n FROM studio_quota_holds WHERE expires_at > clock_timestamp()',
@@ -453,10 +459,11 @@ export class StudioBlobStore {
         await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`studio-blob:${sha}`])
         const del = await client.query<{ bytes: string }>(
           `DELETE FROM studio_blobs b WHERE b.sha256=$1
+             AND b.created_at < NOW() - make_interval(secs => $2)
              AND NOT EXISTS (SELECT 1 FROM studio_blob_refs r WHERE r.sha256=b.sha256)
              AND NOT EXISTS (${CATALOG_HOLDS})
            RETURNING bytes::text AS bytes`,
-          [sha],
+          [sha, UNREFERENCED_GRACE_SECONDS],
         )
         if (del.rowCount !== 1) return false
         await client.query(

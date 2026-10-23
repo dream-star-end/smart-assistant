@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS studio_user_tracks (
   duration_ms INT CHECK (duration_ms IS NULL OR duration_ms BETWEEN 1 AND 1800000),
   bpm NUMERIC(5,1) CHECK (bpm IS NULL OR bpm BETWEEN 20 AND 300),
   -- {statement: 'own_or_licensed', acceptedAt, note?}: the uploader's statement, required.
-  rights_statement JSONB NOT NULL CHECK (rights_statement->>'statement' = 'own_or_licensed'),
+  rights_statement JSONB NOT NULL
+    CHECK (COALESCE(rights_statement->>'statement', '') = 'own_or_licensed'),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   deleted_at TIMESTAMPTZ
 );
