@@ -109,9 +109,10 @@ function view(over: Partial<StudioProjectView> = {}): StudioProjectView {
 }
 
 describe('VoicePage (OCV5-593 FE-3)', () => {
-  test('lines with voiced count, locked narrator, design / clone not wired', () => {
+  test('lines with voiced count, locked narrator, design / clone open (FE-4)', () => {
     render(
       <VoicePage
+        onReload={() => {}}
         auth={auth}
         view={view()}
         providers={prov('ready', 'unconfigured')}
@@ -121,8 +122,8 @@ describe('VoicePage (OCV5-593 FE-3)', () => {
     expect(screen.getAllByTestId('studio-line')).toHaveLength(2)
     expect(screen.getByText('1 / 2 已配')).toBeInTheDocument()
     expect(screen.getAllByText('旁白 · 沉稳男声').length).toBeGreaterThan(0)
-    expect(screen.getByRole('button', { name: /一句话设计/ })).toBeDisabled()
-    expect(screen.getByRole('button', { name: /上传克隆/ })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /一句话设计/ })).toBeEnabled()
+    expect(screen.getByRole('button', { name: /上传克隆/ })).toBeEnabled()
     expect(screen.getByRole('button', { name: '试听：它听见了什么？' })).toBeDisabled()
     expect(screen.queryByTestId('unconfigured-voice')).not.toBeInTheDocument()
   })
@@ -130,6 +131,7 @@ describe('VoicePage (OCV5-593 FE-3)', () => {
   test('voice without a ready provider shows "未配置", never an error', () => {
     render(
       <VoicePage
+        onReload={() => {}}
         auth={auth}
         view={view()}
         providers={prov('unconfigured', 'unconfigured')}

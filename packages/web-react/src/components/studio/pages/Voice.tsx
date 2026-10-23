@@ -1,8 +1,8 @@
-// OCV5-593 FE-3 配音 (d06 / m04): the locked voices, every line with its real waveform, duration
-// against its shot, preview playback, the timeline and the director panel. Voice design / clone are
-// shown but not wired: no real calls for them yet (user decision 2026-10-23 09:44).
+// OCV5-593 FE-3 配音 (d06 / m04): the voice library (FE-4: MiniMax design / clone, user decision
+// 2026-10-23 13:03), every line with its real waveform, duration against its shot, preview playback,
+// the timeline and the director panel.
 
-import { Captions, Check, Lock, Mic, Pause, Play, RefreshCw, Upload, Wand2 } from 'lucide-react'
+import { Captions, Check, Pause, Play, RefreshCw } from 'lucide-react'
 import { useMemo, useRef, useState } from 'react'
 
 import { useBlobUrl } from '../../../hooks/useBlobUrl'
@@ -19,6 +19,7 @@ import { AgentPanel } from '../AgentPanel'
 import { MediaThumb } from '../MediaThumb'
 import { Timeline } from '../Timeline'
 import { UnconfiguredCard } from '../UnconfiguredCard'
+import { VoiceLibrary } from '../VoiceLibrary'
 import { Waveform } from '../Waveform'
 
 export function lineTake(view: StudioProjectView, line: StudioLine): StudioTake | null {
@@ -120,6 +121,7 @@ export function VoicePage(props: {
   view: StudioProjectView
   providers: ProvidersView
   onOpenShot: (shotId: string) => void
+  onReload: () => Promise<void> | void
 }) {
   const { auth, view } = props
   const voice = kindView(props.providers, 'voice')
@@ -131,8 +133,6 @@ export function VoicePage(props: {
   const lines = useMemo(() => [...view.lines].sort((a, b) => a.ordinal - b.ordinal), [view.lines])
   const voices = view.assets.filter((a) => a.kind === 'voice')
   const narrator = voices.find((a) => a.locked) ?? voices[0] ?? null
-  const narratorTake = narrator?.blobSha ? ({ blobSha: narrator.blobSha } as StudioTake) : null
-  const narratorUrl = useBlobUrl(auth, narratorTake?.blobSha)
   const tl = useMemo(() => timeline(view), [view])
   const shown = useMemo(() => new Map(cards.map((c) => [c.shot.id, c.shown])), [cards])
   const voiced = lines.filter((l) => lineTake(view, l)).length
@@ -160,79 +160,12 @@ export function VoicePage(props: {
   return (
     <div className="st-board">
       <aside className="st-voice-lib" aria-label="音色">
-        <div className="st-label">音色 · 锁定后每句都用它</div>
-        {narrator ? (
-          <div className="st-stage st-voice-card">
-            <div className="st-row" style={{ gap: 12, alignItems: 'flex-start' }}>
-              <span className="st-voice-ic" aria-hidden="true">
-                <Mic size={18} />
-              </span>
-              <div style={{ minWidth: 0 }}>
-                <div style={{ fontWeight: 650, color: '#f5f4ed' }}>{narrator.name}</div>
-                <div className="st-cap" style={{ color: 'var(--st-stage-muted)' }}>
-                  {narrator.descriptor ?? (narrator.voiceId ? `音色 ${narrator.voiceId}` : '')}
-                </div>
-              </div>
-            </div>
-            {narratorUrl ? (
-              <div style={{ color: 'var(--st-trk-voice)', marginTop: 12 }}>
-                <Waveform
-                  sha={narrator.blobSha}
-                  url={narratorUrl}
-                  bars={48}
-                  height={26}
-                  label={`${narrator.name} 试听`}
-                />
-              </div>
-            ) : null}
-            {narrator.locked ? (
-              <span className="st-chip st-chip-dark st-chip-ok" style={{ marginTop: 10 }}>
-                <Lock />
-                已锁定
-              </span>
-            ) : null}
-          </div>
-        ) : (
-          <div className="st-card st-image-empty">
-            <div className="st-h3" style={{ fontSize: 13.5 }}>
-              还没有选定音色
-            </div>
-            <div className="st-cap">开拍后导演 agent 会从系统音色里挑一个并锁定。</div>
-          </div>
-        )}
-        {voices
-          .filter((v) => v.id !== narrator?.id)
-          .map((v) => (
-            <div key={v.id} className="st-card st-voice-alt">
-              <b>{v.name}</b>
-              {v.descriptor ? <div className="st-cap">{v.descriptor}</div> : null}
-            </div>
-          ))}
-        <div className="st-row" style={{ gap: 8 }}>
-          <button
-            type="button"
-            className="st-btn st-btn-sm"
-            style={{ flex: 1 }}
-            disabled
-            title="暂未开放"
-          >
-            <Wand2 />
-            一句话设计
-          </button>
-          <button
-            type="button"
-            className="st-btn st-btn-sm"
-            style={{ flex: 1 }}
-            disabled
-            title="暂未开放"
-          >
-            <Upload />
-            上传克隆
-          </button>
-        </div>
-        <div className="st-cap">
-          设计音色和克隆音色暂未开放。开放后，克隆需要确认“本人声音或已获授权”，样本只在你自己的项目里可用。
-        </div>
+        <VoiceLibrary
+          auth={auth}
+          view={view}
+          voiceReady={voice.state === 'ready'}
+          onReload={props.onReload}
+        />
         <div style={{ flex: 1 }} />
         <div className="st-card st-voice-sub">
           <div className="st-row" style={{ gap: 6 }}>

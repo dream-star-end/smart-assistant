@@ -47,7 +47,7 @@ describe('studioApi.uploadAsset (OCV5-593 FE-2c)', () => {
 
   test('error text by code', () => {
     expect(studioErrorText(new StudioApiError(415, 'STUDIO_UNSUPPORTED_MEDIA', 'x'))).toBe(
-      '只支持 PNG、JPEG、WebP 图片',
+      '文件格式不支持（图片用 PNG、JPEG、WebP；声音样本用 MP3、WAV）',
     )
     expect(studioErrorText(new StudioApiError(409, 'STUDIO_NOT_DRAFT', 'x'))).toBe(
       '项目已开拍，需求和画幅不能再改',

@@ -14,6 +14,8 @@ import type {
 
 export const STUDIO_API = '/api/studio'
 export const UPLOAD_IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp']
+/** Voice clone samples (the server sniffs the bytes; mp3 or wav, 10 s – 5 min). */
+export const UPLOAD_AUDIO_TYPES = ['audio/mpeg', 'audio/wav']
 export const UPLOAD_MAX_BYTES = 25 * 1024 * 1024
 
 export class StudioApiError extends Error {
@@ -91,9 +93,14 @@ export const studioApi = {
         { method: 'POST' },
       )
     ).project,
-  /** Reference upload (png / jpeg / webp, ≤ 25 MB); the server checks the bytes match the type. */
-  uploadAsset: async (auth: AuthSession, projectId: string, file: File) => {
-    if (!UPLOAD_IMAGE_TYPES.includes(file.type)) {
+  /** Upload (images by default, or audio for a clone sample; ≤ 25 MB); the server checks the bytes. */
+  uploadAsset: async (
+    auth: AuthSession,
+    projectId: string,
+    file: File,
+    allowed: readonly string[] = UPLOAD_IMAGE_TYPES,
+  ) => {
+    if (!allowed.includes(file.type)) {
       throw new StudioApiError(415, 'STUDIO_UNSUPPORTED_MEDIA', 'unsupported upload type')
     }
     if (file.size > UPLOAD_MAX_BYTES) {
@@ -114,6 +121,22 @@ export const studioApi = {
       )
     ).asset
   },
+  /** Design or clone a voice with MiniMax; it runs as a studio task (watch the voice asset). */
+  createVoice: (
+    auth: AuthSession,
+    projectId: string,
+    body:
+      | { mode: 'design'; name: string; prompt: string; previewText: string }
+      | { mode: 'clone'; name: string; sampleAssetId: string; consent: true; previewText?: string },
+  ) =>
+    call<{ assetId: string }>(auth, `/projects/${encodeURIComponent(projectId)}/voices`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  useVoiceForNarration: (auth: AuthSession, assetId: string) =>
+    call<{ projectId: string }>(auth, `/assets/${encodeURIComponent(assetId)}/narration`, {
+      method: 'POST',
+    }),
   blobTicket: (auth: AuthSession, sha: string) =>
     call<{ url: string; expiresInSeconds: number }>(auth, `/blobs/${sha}/ticket`, {
       method: 'POST',
@@ -135,9 +158,19 @@ export function studioErrorText(err: unknown): string {
       case 'STUDIO_PROJECT_LIMIT':
         return '项目数量已达上限，先删除不需要的项目'
       case 'STUDIO_UNSUPPORTED_MEDIA':
-        return '只支持 PNG、JPEG、WebP 图片'
+        return '文件格式不支持（图片用 PNG、JPEG、WebP；声音样本用 MP3、WAV）'
       case 'STUDIO_UPLOAD_TOO_LARGE':
-        return '图片不能超过 25 MB'
+        return '文件不能超过 25 MB'
+      case 'STUDIO_BUDGET_TOO_LOW':
+        return '项目预算不够了：新建一个音色需要 990 积分，先调高预算'
+      case 'STUDIO_VOICE_UNAVAILABLE':
+        return '配音服务未配置'
+      case 'STUDIO_VOICE_NOT_READY':
+        return '这个音色还没准备好'
+      case 'CLONE_CONSENT_REQUIRED':
+        return '请先确认声音样本是你本人的，或你已获得授权'
+      case 'STUDIO_ORCHESTRATOR_OFF':
+        return '导演 agent 暂时没有运行'
       case 'STUDIO_QUOTA':
         return '工作台存储空间已满'
       case 'ERR_INSUFFICIENT_CREDITS':
@@ -149,4 +182,22 @@ export function studioErrorText(err: unknown): string {
     }
   }
   return '网络异常，请稍后再试'
+}
+
+/** Why a voice task failed, from its take error code (the MiniMax plan / account limits included). */
+export function voiceFailureText(code: string | null): string {
+  switch (code) {
+    case 'MINIMAX_PLAN_NO_VOICE_DESIGN':
+      return '当前 MiniMax 套餐不包含声音设计，需要升级套餐后再试'
+    case 'MINIMAX_CLONE_NOT_ENABLED':
+      return 'MiniMax 账号还没有开通声音克隆（通常需要先完成认证）'
+    case 'MINIMAX_CLONE_REJECTED':
+      return '声音样本没有通过审核，换一段清晰的本人录音再试'
+    case 'ERR_INSUFFICIENT_CREDITS':
+      return '积分不足'
+    case 'BAD_BODY':
+      return '样本格式或时长不符合要求（MP3 / WAV，10 秒到 5 分钟）'
+    default:
+      return code ? `没有成功（${code}）` : '没有成功'
+  }
 }

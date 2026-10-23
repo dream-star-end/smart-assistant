@@ -156,6 +156,7 @@ export function ProjectShell(props: {
         <ReviewPage auth={auth} view={state.view} shotId={props.shot} onBack={() => go('board')} />
       ) : page === 'voice' ? (
         <VoicePage
+          onReload={reload}
           auth={auth}
           view={state.view}
           providers={props.providers}

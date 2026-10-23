@@ -47,7 +47,11 @@ export function useStudioProject(auth: AuthSession, id: string) {
     void reload()
   }, [reload])
 
-  const active = state.state === 'ready' && ACTIVE_STATUSES.has(state.view.project.status)
+  // Also while any take is in flight (e.g. a voice being designed in a draft project, FE-4).
+  const active =
+    state.state === 'ready' &&
+    (ACTIVE_STATUSES.has(state.view.project.status) ||
+      state.view.takes.some((t) => t.status === 'queued' || t.status === 'running'))
   useEffect(() => {
     if (!active) return
     const tick = window.setInterval(poll, STUDIO_POLL_MS)
