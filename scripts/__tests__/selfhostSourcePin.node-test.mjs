@@ -53,15 +53,19 @@ test('production static gate rejects legacy mixed source and wrong pinned candid
 test('actual cmd_deploy passes captured A through lease master runtime payload expected after HEAD B',t=>{
  const f=fixture(t);f.git('checkout','-q',f.A);writeFileSync(join(f.dir,'env'),'');symlinkSync(f.repo,join(f.dir,'live'));
  const source=[fn(d,'cmd_deploy'),fn(d,'start_runtime_release_bg'),fn(d,'collect_runtime_release_bg'),expected(),fn(m,'build_master_release'),fn(d,'build_platform_bundle').replace('build_platform_bundle()','production_platform_bundle()')].join('\n');
- const body=[platformStubs,'DRY=1; ALLOW_DIRTY=0; PLATFORM_FROM_HEAD=1','V5_ENV="$TEST_ROOT/env"; MASTER_LIVE_LINK="$TEST_ROOT/live"; MASTER_RELEASES_ROOT="$TEST_ROOT/releases"',
+ const body=[platformStubs,'DRY=1; ALLOW_DIRTY=0; PLATFORM_FROM_HEAD=1; RELEASE_POLICY_RESUME=0','V5_ENV="$TEST_ROOT/env"; MASTER_LIVE_LINK="$TEST_ROOT/live"; MASTER_RELEASES_ROOT="$TEST_ROOT/releases"',
  'preflight_common() { :; }; explain_dirty_semantics() { :; }; ensure_selfhost_env_keys() { :; }; assert_env_key_drift() { :; }',
+ // These policy boundaries are spies; the policy suite exercises their implementations.
+ 'release_policy_bind_official_train_request() { echo "$1" > "$TEST_ROOT/bind"; [[ "$1" == "$A" ]]; }',
+ 'cutover_adopt_inflight_request() { echo "$1" > "$TEST_ROOT/adopt"; [[ "$1" == "$A" ]]; }',
+ 'selfhost_release_preflight() { echo "$1" > "$TEST_ROOT/preflight"; [[ "$1" == "$A" ]]; }',
  'docker() { :; }; ensure_node_modules() { :; }; install_aux_units() { :; }; refresh_ccb_proxy_path() { :; }; ensure_model_authority() { :; }',
  'lease_train_begin() { echo "$1" > "$TEST_ROOT/lease"; git -C "$REPO_ROOT" checkout -q "$B"; }',
  'assert_fix_trailers() { [[ "$1" == "$A" ]]; }; assert_p0_web_overlay_contained() { [[ "$1" == "$A" ]]; }; lease_train_finish() { :; }; build_runtime_release() { echo "$1" > "$TEST_ROOT/runtime"; }',
  'build_platform_bundle() { DRY=0; production_platform_bundle "$1"; DRY=1; }',
  'cmd_cutover() { cutover_expected_source_commit > "$TEST_ROOT/expected"; }','cmd_deploy; echo "$DEPLOY_BUILT_RELEASE"'].join('\n');
  assert.ok(ok(bash(f,source,body)).includes('rel-'+f.A.slice(0,9)+'-'));
- for(const n of['lease','runtime','expected'])assert.equal(readFileSync(join(f.dir,n),'utf8').trim(),f.A,n);
+ for(const n of['bind','adopt','preflight','lease','runtime','expected'])assert.equal(readFileSync(join(f.dir,n),'utf8').trim(),f.A,n);
  assert.equal(readFileSync(join(f.dir,'payload'),'utf8').trim(),'platform-A');assert.equal(f.git('rev-parse','HEAD'),f.B);
 });
 test('internal pin is reset instead of inherited from caller environment',()=>assert.match(d,/^DEPLOY_BUILT_SOURCE_COMMIT=""/m));

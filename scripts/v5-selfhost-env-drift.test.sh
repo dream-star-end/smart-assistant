@@ -103,7 +103,9 @@ out="$(bash "$DRIFT" --env "$E.9" --template "$TEMPLATE")" && [[ "$out" == "ENV_
   && ok "D9 CRLF 续行与跨行单引号值不产生键" || bad "D9: $out"
 
 # W* 接线
-grep -qE 'v5-selfhost-env-drift\.sh' "$DEPLOY" \
+grep -qF 'source "$SCRIPT_DIR/lib/v5-selfhost-env.sh"' "$DEPLOY" \
+  && awk '/^assert_env_key_drift\(\) \{/{f=1} f {print} f && /^}/{exit}' "$ENVLIB" \
+    | grep -qF 'bash "$SCRIPT_DIR/v5-selfhost-env-drift.sh" --env "$V5_ENV"' \
   && awk '/^cmd_deploy\(\) \{/{f=1} f && /^  ensure_selfhost_env_keys$/{e=NR} f && /^  ensure_model_authority$/{m=NR} f && /^  assert_env_key_drift$/{d=NR} f && /^}/{exit} END{exit !(e && m && d && d>e && d>m)}' "$DEPLOY" \
   && ok "W1 --deploy 在 ensure_selfhost_env_keys 与 ensure_model_authority 补齐之后才跑漂移检查" || bad "W1 --deploy 漂移检查位置不对"
 
