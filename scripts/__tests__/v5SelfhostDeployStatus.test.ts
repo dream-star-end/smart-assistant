@@ -96,11 +96,11 @@ sysctl() { echo 0; }
 port_in_use() { return 0; }
 host_log_policy_check_release() { printf 'policy-target=%s\\n' "$1"; return ${policyResult}; }
 `
-    const r = spawnSync('bash', ['-c', prelude + fnBody('cmd_status') + '\ncmd_status', '_', dir], {
+    const r = spawnSync('bash', ['-c', `${prelude}${fnBody('cmd_status')}\ncmd_status`, '_', dir], {
       env: { PATH: process.env.PATH },
       encoding: 'utf8',
     })
-    assert.ok(r.stdout.includes('policy-target=' + live))
+    assert.ok(r.stdout.includes(`policy-target=${live}`))
     assert.match(r.stdout, /port 18789: listen/)
     return r
   } finally {
