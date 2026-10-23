@@ -63,9 +63,10 @@ jobs:
 
       # 界面是中文。托管 runner 没有 CJK 字体时汉字按回退字形排版,行数和高度都和用户看到的不一样。
       - name: Install CJK fonts
+        timeout-minutes: 8
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends fonts-noto-cjk
+          node --test .github/scripts/install-cjk-fonts.test.mjs
+          bash .github/scripts/install-cjk-fonts.sh
 
       # 浏览器门把截图和预览地址写到 /home/agent/.openclaude/generated;托管 runner 默认无权创建。
       - name: Prepare browser artifact directory
