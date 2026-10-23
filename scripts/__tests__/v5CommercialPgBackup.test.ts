@@ -1,9 +1,9 @@
 // OCV5-600: scripts/v5-commercial-pg-backup.sh (commercial PG backup, local + encrypted copy on R2)
 // against stub tools. No database, bucket, key or unit is touched: pg_dump / pg_restore / psql /
-// fuser / systemctl / df / rclone / gpg are PATH stubs in a private temp dir; the real shared R2
+// lease verifier / systemctl / df / rclone / gpg are PATH stubs in a private temp dir; the real shared R2
 // helper (scripts/v5-selfhost-pg-backup-r2.sh) runs against the stub rclone.
 import assert from 'node:assert/strict'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import {
   chmodSync,
   existsSync,
@@ -11,6 +11,8 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  statSync,
+  symlinkSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
@@ -18,6 +20,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { qualifyBackupLease } from '../v5-commercial-pg-backup-lease'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const script = path.join(root, 'scripts/v5-commercial-pg-backup.sh')
@@ -29,6 +32,13 @@ function stub(name: string, body: string) {
   const p = path.join(dir, 'bin', name)
   writeFileSync(p, `#!/usr/bin/env bash\n${body}\n`)
   chmodSync(p, 0o755)
+}
+
+function alive(pid: number): boolean {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+    return !['Z', 'X', 'x'].includes(stat.slice(stat.lastIndexOf(') ') + 2).split(' ')[0])
+  } catch { return false }
 }
 
 function objects(sub: string): string[] {
@@ -51,10 +61,12 @@ function run(args: string[] = ['run'], extra: Record<string, string> = {}) {
     HOME: dir,
     STUB_DIR: dir,
     V5CB_PG_AS: '',
+    V5CB_BUN: 'bash',
+    V5CB_LEASE_VERIFY: path.join(dir, 'bin/lease-verify'),
+    V5CB_COMMERCIAL_ENV: path.join(dir, 'commercial.env'),
     V5CB_DIR: path.join(dir, 'backups'),
     V5CB_LOCK: path.join(dir, 'run/backup.lock'),
     V5CB_MARKER: path.join(dir, 'run/openclaude/pg-r2-backup.running'),
-    V5CB_MUTATION_LOCK: path.join(dir, 'run/v5/production-mutation.lock'),
     V5CB_RUN_DIR: path.join(dir, 'run/v5'),
     V5CB_FILES_SRC: path.join(dir, 'files'),
     V5CB_STATUS: path.join(dir, 'state/status.json'),
@@ -80,9 +92,11 @@ beforeEach(() => {
     mkdirSync(path.join(dir, d), { recursive: true })
   }
   writeFileSync(path.join(dir, 'files/v5-20261022-200001Z/sessions.db'), 'sqlite')
+  writeFileSync(path.join(dir, 'commercial.env'), '', { mode: 0o600 })
+  stub('lease-verify', '[[ ! -f "$STUB_DIR/lease_invalid" ]] || exit 1; if [[ -f "$STUB_DIR/verify_hang" && -f "$STUB_DIR/dump.pid" ]]; then sleep 30; fi')
   writeFileSync(path.join(dir, 'rclone.conf'), '[r2]\ntype = local\n')
   writeFileSync(path.join(dir, 'avail'), String(50 * GIB))
-  writeFileSync(path.join(dir, 'deploy_state'), 'stable|')
+  writeFileSync(path.join(dir, 'deploy_state'), 'stable||')
   stub(
     'df',
     'printf "Filesystem 1-blocks Used Available Use%% Mounted\\n/dev/x 1 1 %s 1%% /\\n" "$(cat "$STUB_DIR/avail")"',
@@ -93,8 +107,13 @@ beforeEach(() => {
     [
       'printf "%s\\n" "$@" > "$STUB_DIR/pg_dump.args"',
       'mode=$(cat "$STUB_DIR/dump_mode" 2>/dev/null || echo ok)',
+      '(( $(cat "$STUB_DIR/sc_calls" 2>/dev/null || echo 0) > $(cat "$STUB_DIR/active_polls" 2>/dev/null || echo 0) )) || { echo "dump started during file backup" >&2; exit 1; }',
       'case "$mode" in',
       '  fail) echo partial; exit 1 ;;',
+      '  lose) echo $$ > "$STUB_DIR/dump.pid"; touch "$STUB_DIR/lease_invalid"; exec sleep 40 ;;',
+      '  parentdie) echo $$ > "$STUB_DIR/dump.pid"; kill -KILL "$V5CB_SUPERVISOR_PID"; exec sleep 40 ;;',
+      '  guarddie) echo $$ > "$STUB_DIR/dump.pid"; kill -KILL "$V5CB_GUARDIAN_PID"; exec sleep 40 ;;',
+      '  hold) echo $$ > "$STUB_DIR/dump.pid"; exec sleep 40 ;;',
       '  big) head -c 300000 /dev/zero ;;',
       '  *) cat "$STUB_DIR/run/openclaude/pg-r2-backup.running" > "$STUB_DIR/marker_during_dump" 2>/dev/null; echo "PGDMP-commercial" ;;',
       'esac',
@@ -109,24 +128,14 @@ beforeEach(() => {
     'psql',
     'if [[ "$*" == *deploy_state* ]]; then cat "$STUB_DIR/deploy_state"; else echo 20000; fi',
   )
-  // fuser: "busy" when $STUB_DIR/fuser_busy exists; fuser_busy_after=N turns busy from call N on.
-  stub(
-    'fuser',
-    [
-      'n=$(( $(cat "$STUB_DIR/fuser_calls" 2>/dev/null || echo 0) + 1 )); echo $n > "$STUB_DIR/fuser_calls"',
-      '[[ -f "$STUB_DIR/fuser_busy" ]] && exit 0',
-      'after=$(cat "$STUB_DIR/fuser_busy_after" 2>/dev/null || echo 0)',
-      '(( after > 0 && n >= after )) && exit 0',
-      'exit 1',
-    ].join('\n'),
-  )
-  // systemctl is-active: active for the first $STUB_DIR/active_polls calls.
+  // A running oneshot is activating; systemctl is-active returns 3 for it.
   stub(
     'systemctl',
     [
       'n=$(( $(cat "$STUB_DIR/sc_calls" 2>/dev/null || echo 0) + 1 )); echo $n > "$STUB_DIR/sc_calls"',
-      '(( n <= $(cat "$STUB_DIR/active_polls" 2>/dev/null || echo 0) )) && exit 0',
-      'exit 3',
+      'state=inactive; (( n <= $(cat "$STUB_DIR/active_polls" 2>/dev/null || echo 0) )) && state=activating',
+      'if [[ "$1" == is-active ]]; then [[ "$state" == active ]] && exit 0; exit 3; fi',
+      'echo "$state"; exit 0',
     ].join('\n'),
   )
   // rclone / gpg: same contract as the selfhost helper tests (objects are files under bucket/).
@@ -197,14 +206,12 @@ describe('v5-commercial-pg-backup.sh', () => {
     assert.equal(status().result, 'ok')
   })
 
-  test('an open production mutation lock skips the run before the marker or a dump', () => {
-    writeFileSync(path.join(dir, 'fuser_busy'), '')
+  test('an unqualified official lease stops the run before a marker or dump', () => {
+    writeFileSync(path.join(dir, 'lease_invalid'), '')
     const r = run()
-    assert.equal(r.status, 3, r.out)
-    assert.match(r.out, /SKIP release busy: production mutation lock is open/)
+    assert.notEqual(r.status, 0, r.out)
     assert.equal(existsSync(path.join(dir, 'pg_dump.args')), false)
     assert.equal(existsSync(path.join(dir, 'run/openclaude/pg-r2-backup.running')), false)
-    assert.equal(status().result, 'skipped_release_busy')
   })
 
   test('recovery and inflight markers and a non-stable deploy_state skip the run', () => {
@@ -213,7 +220,7 @@ describe('v5-commercial-pg-backup.sh', () => {
       assert.equal(run().status, 3, m)
       rmSync(path.join(dir, 'run/v5', m))
     }
-    for (const st of ['deploying|', 'stable|rel-x']) {
+    for (const st of ['deploying||', 'stable|A|rel-x', 'stable|A|']) {
       writeFileSync(path.join(dir, 'deploy_state'), st)
       const r = run()
       assert.equal(r.status, 3, r.out)
@@ -222,14 +229,41 @@ describe('v5-commercial-pg-backup.sh', () => {
     assert.equal(existsSync(path.join(dir, 'pg_dump.args')), false)
   })
 
-  test('a release that starts just as the marker is written still makes the run skip', () => {
-    writeFileSync(path.join(dir, 'fuser_busy_after'), '2') // free on the first check, busy on the second
+  test('lease loss during pg_dump kills the owned body and prevents all uploads', () => {
+    writeFileSync(path.join(dir, 'dump_mode'), 'lose')
     const r = run()
-    assert.equal(r.status, 3, r.out)
-    assert.match(r.out, /SKIP release busy after marker/)
-    assert.equal(existsSync(path.join(dir, 'pg_dump.args')), false)
+    assert.notEqual(r.status, 0, r.out)
+    const pid = Number(readFileSync(path.join(dir, 'dump.pid'), 'utf8'))
+    assert.equal(alive(pid), false, `dump ${pid} survived lease loss`)
+    assert.deepEqual(objects('pg/full'), [])
     assert.equal(existsSync(path.join(dir, 'run/openclaude/pg-r2-backup.running')), false)
   })
+
+  test('a hanging qualification is bounded and cannot leave the dump running', () => {
+    writeFileSync(path.join(dir, 'dump_mode'), 'hold')
+    writeFileSync(path.join(dir, 'verify_hang'), '')
+    const started = Date.now()
+    const r = run()
+    assert.notEqual(r.status, 0, r.out)
+    assert.ok(Date.now() - started < 15_000, r.out)
+    const pid = Number(readFileSync(path.join(dir, 'dump.pid'), 'utf8'))
+    assert.equal(alive(pid), false, `dump ${pid} survived qualification timeout`)
+    assert.deepEqual(objects('pg/full'), [])
+  })
+
+  for (const mode of ['parentdie', 'guarddie']) {
+    test(`${mode}: the other execution supervisor kills the dump and prevents upload`, () => {
+      writeFileSync(path.join(dir, 'dump_mode'), mode)
+      const started = Date.now()
+      const r = run()
+      assert.notEqual(r.status, 0, r.out)
+      assert.ok(Date.now() - started < 15_000, `orphan ran until its natural timeout: ${r.out}`)
+      const pid = Number(readFileSync(path.join(dir, 'dump.pid'), 'utf8'))
+      assert.equal(alive(pid), false, `dump ${pid} survived ${mode}`)
+      assert.deepEqual(objects('pg/full'), [])
+      assert.equal(existsSync(path.join(dir, 'run/openclaude/pg-r2-backup.running')), false)
+    })
+  }
 
   test('waits for the file-level backup unit, and skips when it stays active', () => {
     writeFileSync(path.join(dir, 'active_polls'), '2')
@@ -299,21 +333,87 @@ describe('v5-commercial-pg-backup.sh', () => {
 
   test('units: daily 04:30 Asia/Taipei, alert on failure, script from the installed copy', () => {
     const svc = readFileSync(
-      path.join(root, 'deploy/v5/openclaude-v5-pg-r2-backup.service'),
+      path.join(root, 'deploy/v5-dev/openclaude-v5-pg-r2-backup.service'),
       'utf8',
     )
     assert.match(
       svc,
-      /^ExecStart=\/opt\/openclaude\/pg-r2-backup\/current\/v5-commercial-pg-backup\.sh run$/m,
+      /^ExecStart=\/opt\/openclaude\/pg-r2-backup\/current\/scripts\/v5-commercial-pg-backup-controller\.sh run$/m,
     )
-    assert.match(svc, /^OnFailure=openclaude-v5-alert-fail@%n\.service$/m)
-    assert.match(svc, /^EnvironmentFile=-\/etc\/openclaude\/pg-r2-backup\.env$/m)
+    assert.match(svc, /^OnFailure=openclaude-v5-selfhost-watch-alert@%n\.service$/m)
+    assert.match(svc, /^EnvironmentFile=-\/etc\/openclaude\/commercial-pg-backup-controller\.env$/m)
     const timer = readFileSync(
-      path.join(root, 'deploy/v5/openclaude-v5-pg-r2-backup.timer'),
+      path.join(root, 'deploy/v5-dev/openclaude-v5-pg-r2-backup.timer'),
       'utf8',
     )
     assert.match(timer, /^OnCalendar=\*-\*-\* 04:30:00 Asia\/Taipei$/m)
     assert.match(timer, /^Persistent=true$/m)
     assert.match(timer, /^Unit=openclaude-v5-pg-r2-backup\.service$/m)
+  })
+})
+
+
+describe('commercial backup controller and official lease qualification', () => {
+  test('a symlinked installed entrypoint refuses an invocation without a lease proof', () => {
+    const link = path.join(dir, 'lease-entry.ts')
+    symlinkSync(path.join(root, 'scripts/v5-commercial-pg-backup-lease.ts'), link)
+    const r = spawnSync('npx', ['--no-install', 'tsx', link], {
+      env: { PATH: process.env.PATH, OC_V5_MANUAL_LEASE_NONCE: '' },
+      encoding: 'utf8', timeout: 20_000,
+    })
+    assert.equal(r.status, 1, `${r.stdout}${r.stderr}`)
+    assert.match(r.stderr, /official lease qualification failed/)
+    assert.equal(r.stdout, '')
+  })
+
+  test('the official wrapper encloses the foreground dump and upload, including SSH failure', () => {
+    stub('lease-wrapper', 'echo begin >> "$STUB_DIR/events"; export OC_V5_MANUAL_LEASE_NONCE=0123456789abcdef0123456789abcdef; "$@"; rc=$?; echo end >> "$STUB_DIR/events"; exit "$rc"')
+    stub('ssh', '[[ "$1" == -tt ]] || exit 2; echo dump >> "$STUB_DIR/events"; echo upload >> "$STUB_DIR/events"; exit "${SSH_RC:-0}"')
+    stub('queue', `echo '[{"status":"completed","task":"old active task"}]'`)
+    writeFileSync(path.join(dir, 'loadavg'), '0.0 0.0 0.0 1/1 1\n')
+    const controller = path.join(root, 'scripts/v5-commercial-pg-backup-controller.sh')
+    const env = { ...process.env, PATH: `${path.join(dir, 'bin')}:${process.env.PATH}`, STUB_DIR: dir, V5CB_CONTROLLER_QUEUE: path.join(dir, 'bin/queue'), V5CB_CONTROLLER_LOADAVG: path.join(dir, 'loadavg'), V5CB_CONTROLLER_LEASE: path.join(dir, 'bin/lease-wrapper'), V5CB_CONTROLLER_SSH: path.join(dir, 'bin/ssh') }
+    let r = spawnSync('bash', [controller, 'run'], { env, encoding: 'utf8' })
+    assert.equal(r.status, 0, r.stderr)
+    assert.equal(readFileSync(path.join(dir, 'events'), 'utf8'), 'begin\ndump\nupload\nend\n')
+    r = spawnSync('bash', [controller, 'run'], { env: { ...env, SSH_RC: '7' }, encoding: 'utf8' })
+    assert.equal(r.status, 7, r.stderr)
+    const directEnv = { ...env, OC_V5_MANUAL_LEASE_NONCE: '' }
+    r = spawnSync('bash', [controller, '__leased'], { env: directEnv, encoding: 'utf8' })
+    assert.equal(r.status, 3, r.stderr)
+    stub('queue', `echo '[{"status":"active"}]'`)
+    r = spawnSync('bash', [controller, 'run'], { env, encoding: 'utf8' })
+    assert.equal(r.status, 3, r.stderr)
+  })
+
+  test('actual flock, invocation, expiry and dump cluster are qualified through the existing verifier', async () => {
+    const lock = path.join(dir, 'lease.lock')
+    const holder = spawn('bash', ['-c', 'exec 9>"$1"; flock -x 9; echo ready; exec sleep 30', 'fixture', lock], { stdio: ['ignore', 'pipe', 'pipe'] })
+    try {
+      await new Promise<void>((resolve, reject) => {
+        holder.stdout.once('data', () => resolve())
+        holder.once('error', reject)
+      })
+      const pid = holder.pid!
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+      const start = stat.slice(stat.lastIndexOf(') ') + 2).trim().split(/\s+/)[19]
+      const ino = statSync(lock, { bigint: true })
+      const nonce = '0123456789abcdef0123456789abcdef'
+      const paths = { lock, commonNonce: path.join(dir, 'common'), manualNonce: path.join(dir, 'manual') }
+      const identity = { clusterId: 'fixture', database: 'fixture', databaseOid: '1', serverAddress: '127.0.0.1', serverPort: 5432, postmasterEpoch: '1', inRecovery: false }
+      const proof = { ...identity, schema: 1, nonce, holderPid: pid, holderStart: start, lockDevIno: `${ino.dev}:${ino.ino}`, expiresAt: Math.floor(Date.now() / 1000) + 30 }
+      writeFileSync(paths.commonNonce, nonce, { mode: 0o600 })
+      writeFileSync(paths.manualNonce, nonce, { mode: 0o600 })
+      writeFileSync(`${paths.commonNonce}.db`, JSON.stringify(proof), { mode: 0o600 })
+      const query = () => identity
+      assert.equal((await qualifyBackupLease(nonce, {}, paths, query)).holderPid, pid)
+      await assert.rejects(qualifyBackupLease('f'.repeat(32), {}, paths, query), /STALE_INVOCATION_NONCE/)
+      await assert.rejects(qualifyBackupLease(nonce, {}, paths, (_sql, _env, local) => local ? { ...identity, clusterId: 'other' } : identity), /DUMP_PRIMARY_IDENTITY_MISMATCH/)
+      writeFileSync(`${paths.commonNonce}.db`, JSON.stringify({ ...proof, expiresAt: 0 }))
+      await assert.rejects(qualifyBackupLease(nonce, {}, paths, query), /LEASE_EXPIRED/)
+    } finally {
+      holder.kill('SIGKILL')
+      await new Promise<void>((resolve) => holder.once('exit', () => resolve()))
+    }
   })
 })

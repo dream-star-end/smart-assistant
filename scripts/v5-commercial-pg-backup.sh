@@ -1,32 +1,29 @@
 #!/usr/bin/env bash
 # v5 commercial PostgreSQL backup with an encrypted off-host copy on Cloudflare R2 (OCV5-600).
 #
-# Until now the commercial database (openclaude_commercial, ~16 GB) had no PostgreSQL backup
-# at all: openclaude-v5-backup.service only copies sessions.db, config and env. Daily (timer
-# 04:30 Asia/Taipei) this script:
-#   1. waits for the file-level backup (openclaude-v5-backup.service) to finish;
-#   2. skips (exit 3) when a release or a manual production change may be running: the
-#      production mutation lock is open by any process, a recovery/inflight marker exists, or
-#      deploy_state is not stable with an empty candidate. It never takes that lock: deploy's
-#      reclaim protocol refuses holders without fencing meta;
-#   3. writes /run/openclaude/pg-r2-backup.running (pid, start) for the run and checks again.
-#      Releases check that file before they start (ocv5-release-verify), because a dump holds
-#      AccessShareLock on every table and migrations set no lock_timeout;
-#   4. dumps the whole database (pg_dump -Fc -Z zstd:3) to V5CB_DIR, verifies it, keeps 2;
-#   5. uploads it to R2 through scripts/v5-selfhost-pg-backup-r2.sh (the shared helper: gpg to a
-#      public key, delete the old full copy first, 9.5 GB cap with precheck and streaming
-#      abort, warning above 9 GB) and the newest file-level backup as a tarball through the
-#      helper's keep-N slot (prefix files/, kept 2). Its core-<UTC>.dump name is only the slot
-#      format: the content is the file-level tarball.
-#
+# Scheduled on v5-dev through the existing official production mutation lease.
+# This foreground remote worker dumps locally (2 kept), uploads one encrypted full
+# and two encrypted file backups to R2. A separate execution guardian checks the
+# official lease proof while it runs, and kills this invocation's body on loss.
+# It never acquires or renews a production lease. See the controller and install guide.
 # Usage: v5-commercial-pg-backup.sh run | status
-# Exit codes: 0 ok, 1 failure, 2 usage, 3 skipped (release busy, low disk, R2 cap),
-#             4 another run holds the lock, 5 done but the R2 bucket is above its warning line.
+# Exit: 0 success, 1 failure, 2 usage, 3 skipped, 4 another backup, 5 R2 warning.
 set -Eeuo pipefail
 umask 077
 export LC_ALL=C
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "${V5CB_BACKUP_ENV:-/etc/openclaude/pg-r2-backup.env}" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "${V5CB_BACKUP_ENV:-/etc/openclaude/pg-r2-backup.env}"
+  set +a
+fi
+# shellcheck source=scripts/lib/v5-commercial-backup-supervisor.sh
+source "$SELF_DIR/lib/v5-commercial-backup-supervisor.sh"
+BUN="${V5CB_BUN:-/root/.bun/bin/bun}"
+LEASE_VERIFY="${V5CB_LEASE_VERIFY:-$SELF_DIR/v5-commercial-pg-backup-lease.ts}"
+COMMERCIAL_ENV="${V5CB_COMMERCIAL_ENV:-/etc/openclaude/commercial-v5.env}"
 DB="${V5CB_DB:-openclaude_commercial}"
 BACKUP_DIR="${V5CB_DIR:-/var/backups/openclaude-v5-pg}"
 KEEP="${V5CB_KEEP:-2}"
@@ -34,8 +31,7 @@ MIN_FREE_GIB="${V5CB_MIN_FREE_GIB:-10}"
 COMPRESS="${V5CB_COMPRESS:-zstd:3}"
 LOCK_FILE="${V5CB_LOCK:-/run/openclaude-v5-pg-r2-backup.lock}"
 MARKER="${V5CB_MARKER:-/run/openclaude/pg-r2-backup.running}"
-MUTATION_LOCK="${V5CB_MUTATION_LOCK:-/run/openclaude-v5/production-mutation.lock}"
-RUN_DIR="${V5CB_RUN_DIR:-/run/openclaude-v5}"
+RUN_DIR="${V5CB_RUN_DIR:-/opt/openclaude/openclaude-v5-releases}"
 FILES_SRC="${V5CB_FILES_SRC:-/var/backups/openclaude-v5}"
 FILE_UNIT="${V5CB_FILE_BACKUP_UNIT:-openclaude-v5-backup.service}"
 FILE_WAIT_SEC="${V5CB_FILE_BACKUP_WAIT_SEC:-1800}"
@@ -45,7 +41,6 @@ PG_DUMP="${V5CB_PG_DUMP:-pg_dump}"
 PG_RESTORE="${V5CB_PG_RESTORE:-pg_restore}"
 PSQL="${V5CB_PSQL:-psql}"
 PG_AS="${V5CB_PG_AS-postgres}"
-FUSER="${V5CB_FUSER:-fuser}"
 SYSTEMCTL="${V5CB_SYSTEMCTL:-systemctl}"
 POLL="${V5CB_POLL_SEC:-15}"
 
@@ -85,17 +80,28 @@ print(json.dumps(out, ensure_ascii=False, sort_keys=True))
   return 1
 }
 
-# Non-empty reason when a release or a manual production change may be running.
+# Every qualification is bounded: a stuck database probe cannot stall the execution guardian.
+qualify_lease() (
+  [[ -f "$COMMERCIAL_ENV" && ! -L "$COMMERCIAL_ENV" ]] || return 1
+  [[ "$(stat -c '%u:%a' "$COMMERCIAL_ENV")" == 0:600 ]] || return 1
+  set -a
+  # shellcheck source=/dev/null
+  source "$COMMERCIAL_ENV"
+  set +a
+  timeout --signal=KILL --kill-after=1 5s "$BUN" "$LEASE_VERIFY" >/dev/null 2>&1
+)
+
+# The official lease is ours; a missing/stale proof or recovery state stops the run.
 busy_reason() {
   local st
-  if "$FUSER" "$MUTATION_LOCK" >/dev/null 2>&1; then echo "production mutation lock is open"; return; fi
+  qualify_lease || { echo "official production mutation lease is not qualified"; return; }
   for st in .manual-recovery-required .mutation-lane-inflight; do
     if [[ -e "$RUN_DIR/$st" ]]; then echo "$RUN_DIR/$st exists"; return; fi
   done
   st=$(as_pg "$PSQL" -d "$DB" -XAtqc \
-    "select phase || '|' || coalesce(candidate_release, '') from deploy_state where singleton" 2>/dev/null) \
+    "select phase || '|' || coalesce(candidate_slot, '') || '|' || coalesce(candidate_release, '') from deploy_state where singleton" 2>/dev/null) \
     || { echo "cannot read deploy_state"; return; }
-  [[ "$st" == "stable|" ]] || echo "deploy_state is '$st' (want stable, no candidate)"
+  [[ "$st" == "stable||" ]] || echo "deploy_state is '$st' (want stable, no candidate)"
 }
 
 MARKER_OWNED=0
@@ -115,10 +121,16 @@ drop_marker() {
 }
 
 wait_file_backup() {
-  local waited=0
-  while "$SYSTEMCTL" is-active --quiet "$FILE_UNIT" 2>/dev/null; do
+  local waited=0 state
+  while :; do
+    state=$("$SYSTEMCTL" show "$FILE_UNIT" -p ActiveState --value 2>/dev/null) || return 1
+    case "$state" in
+      inactive|failed) return 0 ;;
+      active|activating|deactivating|reloading) ;;
+      *) return 1 ;;
+    esac
     (( waited < FILE_WAIT_SEC )) || return 1
-    (( waited == 0 )) && log "waiting for $FILE_UNIT to finish (up to ${FILE_WAIT_SEC}s)"
+    if (( waited == 0 )); then log "waiting for $FILE_UNIT ($state, up to ${FILE_WAIT_SEC}s)"; fi
     sleep "$POLL"
     waited=$((waited + POLL))
   done
@@ -162,7 +174,7 @@ run() {
   reason=$(busy_reason)
   if [[ -n "$reason" ]]; then log "SKIP release busy: $reason"; write_status result=skipped_release_busy "at=$(now_iso)" "reason=$reason"; return 3; fi
   write_marker || { fail "cannot write $MARKER"; return 1; }
-  # A release that checked before the marker existed may have started meanwhile.
+  # Requalify after publishing the informational marker; the controller holds the real lease.
   reason=$(busy_reason)
   if [[ -n "$reason" ]]; then log "SKIP release busy after marker: $reason"; write_status result=skipped_release_busy "at=$(now_iso)" "reason=$reason"; return 3; fi
 
@@ -245,6 +257,14 @@ run() {
 cmd="${1:-}"
 case "$cmd" in
   status) if [[ -f "$STATUS_FILE" ]]; then cat -- "$STATUS_FILE"; else echo '{"schemaVersion":1}'; fi; exit 0 ;;
+  __watch) backup_watch "$2" "$3" "$4"; exit $? ;;
+  __body)
+    [[ "$PPID" == "$3" ]] && backup_live "$3" "$4" || exit 1
+    [[ -e /proc/$$/fd/9 && /proc/$$/fd/9 -ef "$LOCK_FILE" ]] || exit 1
+    while [[ ! -e "$2/go" ]]; do backup_live "$3" "$4" || exit 1; sleep 0.02; done
+    trap drop_marker EXIT
+    rc=0; run || rc=$?; exit "$rc"
+    ;;
   run) ;;
   -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
   *) die_usage "usage: $0 run | status" ;;
@@ -261,7 +281,6 @@ done
 install -d -m 755 -- "$(dirname -- "$LOCK_FILE")"
 exec 9>"$LOCK_FILE"
 flock -n 9 || { log "another run holds $LOCK_FILE"; exit 4; }
-trap drop_marker EXIT
 rc=0
-run || rc=$?
+backup_supervise || rc=$?
 exit "$rc"
