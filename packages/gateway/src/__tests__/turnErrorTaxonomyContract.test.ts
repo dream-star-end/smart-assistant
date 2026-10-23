@@ -24,6 +24,8 @@ import { readClassifiedErrorCodes } from './helpers/classifiedErrorCodes.js'
 /** 用代表性错误串驱动 classifyRunError,收集所有非 unknown 产出码(行为断言,
  *  不读源码正则)。每类各喂一条已知命中该码的串。 */
 const CLASSIFY_SAMPLES: Array<{ input: string; code: string }> = [
+  { input: 'Request too large (max 20MB). Try with a smaller file.', code: 'request_too_large' },
+  { input: '本轮资料未能完整处理，文件和对话均已保留。', code: 'request_too_large' },
   {
     input:
       'API Error: 409 {"error":{"code":"MODEL_CONFIG_CHANGED_RETRY_TURN","message":"model configuration changed, please retry in a new turn"}}',

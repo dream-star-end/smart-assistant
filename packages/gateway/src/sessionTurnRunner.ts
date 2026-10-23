@@ -1626,6 +1626,8 @@ export async function _runOneTurn(
 
       // Update session accumulators from turn result
       if (result) {
+        const persistedResultStatus = terminalOverride?.status
+          ?? (result.isError || result.errorDetail !== undefined ? 'crashed' : 'completed')
         terminalPersistenceClaim = 'complete'
         flushTerminalBilling()
         const completedAssistantRaw = normalizeAssistantOutputUiFences(
@@ -1637,7 +1639,7 @@ export async function _runOneTurn(
           ),
         )
         const completedAssistantText = emptyCompletedTurnAssistantText({
-          status: terminalOverride?.status ?? 'completed',
+          status: persistedResultStatus,
           errorCode: terminalOverride?.errorCode,
           assistantText: completedAssistantRaw.text,
         })
@@ -1841,7 +1843,7 @@ export async function _runOneTurn(
             ...(session._currentDispatch ? { dispatch: session._currentDispatch } : {}),
             text: assistantText,
             ...(completedHasThinking ? { thinkingText } : {}),
-            status: terminalOverride?.status ?? 'completed',
+            status: persistedResultStatus,
             ...(terminalOverride?.waiveReason ? { waiveReason: terminalOverride.waiveReason } : {}),
             // Plan §4.4 改动 7 — wire telemetry into the sink so master
             // can persist `usage` + render refresh-stable truncated pill.

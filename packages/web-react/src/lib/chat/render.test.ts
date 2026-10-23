@@ -474,3 +474,29 @@ describe("errorPresentation R6/R7:失败轮部分正文 + detail 守卫", () => 
     expect(JSON.stringify(p)).not.toContain("任务执行失败");
   });
 });
+
+
+describe("大请求完整资料错误", () => {
+  const old = "Request too large (max 20MB). Try with a smaller file.";
+  test("旧ENGINE_ERROR与新分类都不把固定英文当作回答", () => {
+    for (const code of ["ENGINE_ERROR", "request_too_large"]) {
+      const shown = errorPresentation(code, old, old);
+      expect(shown.title).toBe("资料暂未处理完成");
+      expect(shown.message).toContain("文件和对话均已保留");
+      expect(shown.bodyText).toBeUndefined();
+      expect(JSON.stringify(shown)).not.toContain("Request too large");
+      expect(JSON.stringify(shown)).not.toContain("内部错误");
+      expect(shown.waived).toBe(false);
+    }
+  });
+  test("保留此前真实回答，只去掉末尾固定诊断", () => {
+    const shown = errorPresentation("request_too_large", "已完成的分析。\n" + old, undefined);
+    expect(shown.bodyText).toBe("已完成的分析。");
+    expect(shown.message).toContain("文件和对话均已保留");
+  });
+  test("已产生的合法回答不会因错误详情含413而丢失", () => {
+    const shown = errorPresentation("request_too_large", "这是已完成的分析。", old);
+    expect(shown.bodyText).toBe("这是已完成的分析。");
+    expect(shown.detail).toBeUndefined();
+  });
+});
