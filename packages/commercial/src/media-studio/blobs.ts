@@ -148,7 +148,6 @@ export class StudioBlobStore {
   async hold(userId: bigint, bytes: number): Promise<string> {
     if (!Number.isSafeInteger(bytes) || bytes <= 0) throw new Error('hold size must be positive')
     const need = BigInt(bytes)
-    const free = await this.freeBytes(this.opts.root)
     const id = randomUUID()
     await inTx(this.opts.pool, async (client) => {
       await client.query(
@@ -172,6 +171,9 @@ export class StudioBlobStore {
          FROM studio_quota_holds WHERE expires_at > clock_timestamp()`,
         [userId.toString()],
       )
+      // Sampled under the site lock (Codex Sol r1 P1): a sample taken earlier misses bytes another
+      // writer settled (and whose hold it dropped) while we waited, so it could admit past the floor.
+      const free = await this.freeBytes(this.opts.root)
       const siteHeld = BigInt(held.rows[0]!.site)
       const userHeld = BigInt(held.rows[0]!.mine)
       if (BigInt(user.rows[0]!.used) + userHeld + need > BigInt(user.rows[0]!.lim))

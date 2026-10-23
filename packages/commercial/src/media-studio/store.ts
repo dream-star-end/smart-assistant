@@ -52,6 +52,9 @@ const PROJECT_COLUMNS = `id::text AS id, title, brief, status, autonomy, aspect,
   spent_credits::text AS "spentCredits", reserved_credits::text AS "reservedCredits", settings, rev,
   created_at AS "createdAt", updated_at AS "updatedAt"`
 
+const CURSOR_RE =
+  /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z)_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/
+
 const notFound = () => new HttpError(404, 'NOT_FOUND', 'studio project not found')
 
 export interface ProjectPatch {
@@ -170,18 +173,23 @@ export class StudioStore {
     opts: { before?: string; limit?: number } = {},
   ): Promise<{ projects: ProjectRow[]; next: string | null }> {
     const limit = Math.max(1, Math.min(50, Math.trunc(opts.limit ?? 20)))
-    const before = opts.before ? new Date(opts.before) : null
-    if (before && Number.isNaN(before.getTime()))
-      throw new HttpError(400, 'BAD_REQUEST', 'invalid cursor')
-    const rows = await this.pool.query<ProjectRow>(
-      `SELECT ${PROJECT_COLUMNS} FROM studio_projects
-       WHERE user_id=$1 AND deleted_at IS NULL AND ($2::timestamptz IS NULL OR updated_at < $2)
-       ORDER BY updated_at DESC LIMIT $3`,
-      [userId, before?.toISOString() ?? null, limit + 1],
+    // Keyset cursor "<updated_at to the microsecond>_<id>" (Codex Sol r1 P2): a JS Date keeps only
+    // milliseconds, and updated_at alone is not unique, so either would skip rows across pages.
+    const m = opts.before ? CURSOR_RE.exec(opts.before) : null
+    if (opts.before && !m) throw new HttpError(400, 'BAD_REQUEST', 'invalid cursor')
+    const rows = await this.pool.query<ProjectRow & { cursor: string }>(
+      `SELECT ${PROJECT_COLUMNS},
+              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') || '_' || id::text
+                AS cursor
+       FROM studio_projects
+       WHERE user_id=$1 AND deleted_at IS NULL
+         AND ($2::timestamptz IS NULL OR (updated_at, id) < ($2::timestamptz, $3::uuid))
+       ORDER BY updated_at DESC, id DESC LIMIT $4`,
+      [userId, m?.[1] ?? null, m?.[2] ?? null, limit + 1],
     )
-    const projects = rows.rows.slice(0, limit)
-    const next =
-      rows.rows.length > limit ? new Date(projects.at(-1)!.updatedAt).toISOString() : null
+    const page = rows.rows.slice(0, limit)
+    const next = rows.rows.length > limit ? page.at(-1)!.cursor : null
+    const projects = page.map(({ cursor: _cursor, ...p }) => p as ProjectRow)
     return { projects, next }
   }
 
