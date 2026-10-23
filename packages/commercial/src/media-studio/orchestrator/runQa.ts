@@ -7,7 +7,7 @@ import { copyFile, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { PoolClient } from 'pg'
 
-import { GrokRunError } from '../../grok/visionProxy.js'
+import { GrokRunError, type GrokVisionUsage } from '../../grok/visionProxy.js'
 import { grokCharged } from '../providers/charges.js'
 import { MediaProviderError } from '../providers/types.js'
 import { type StudioTask, finishStudioTask, retryStudioTask } from '../queue.js'
@@ -44,6 +44,7 @@ interface QaTake {
   duration_ms: number | null
   inputs: { inputs?: Array<{ role?: string; blobSha?: string }> } | null
   user_id: string
+  created_at: Date
 }
 
 interface QaContext {
@@ -62,7 +63,8 @@ async function loadTake(deps: ExecuteDeps, task: StudioTask): Promise<QaTake | n
     throw new MediaProviderError('INVALID_TASK', false, 'qa task has no take')
   const r = await deps.pool.query<QaTake>(
     `SELECT t.id::text AS id, t.owner_kind, t.owner_id::text AS owner_id, t.version, t.status, t.blob_sha,
-            t.qa, (t.meta->>'durationMs')::float8 AS duration_ms, t.inputs, p.user_id::text AS user_id
+            t.qa, (t.meta->>'durationMs')::float8 AS duration_ms, t.inputs, p.user_id::text AS user_id,
+            t.created_at
        FROM studio_takes t JOIN studio_projects p ON p.id = t.project_id
       WHERE t.id = $1 AND t.project_id = $2`,
     [takeId, task.projectId],
@@ -171,27 +173,38 @@ async function candidates(
   }
 }
 
-/** Earlier QA'd attempts of this owner since its last hand-off, counted in rounds of candidates. */
+/**
+ * Earlier QA'd attempts of this owner, counted in rounds of candidates. A hand-off starts a new
+ * count only for takes made after it (the user acted); a candidate of the same round that was
+ * already on its way still counts with its siblings (code r1 P1: no reset of the redo cap).
+ */
 async function history(
   deps: ExecuteDeps,
   t: QaTake,
   perRound: number,
 ): Promise<{ h: QaHistory; scored: Array<{ id: string; score: number }> }> {
-  const r = await deps.pool.query<{ id: string; qa: Record<string, unknown> }>(
-    `SELECT id::text AS id, qa FROM studio_takes
+  const r = await deps.pool.query<{ id: string; qa: Record<string, unknown>; created_at: Date }>(
+    `SELECT id::text AS id, qa, created_at FROM studio_takes
       WHERE owner_kind = $1 AND owner_id = $2 AND version < $3 AND qa IS NOT NULL
       ORDER BY version`,
     [t.owner_kind, t.owner_id, t.version],
   )
   let since: Array<{ id: string; score: number }> = []
+  let handoffAt: number | null = null
+  const fresh = (created: Date) => handoffAt !== null && created.getTime() > handoffAt
   for (const row of r.rows) {
-    if (row.qa.skipped === true) continue
-    if (row.qa.next === 'handoff') {
+    if (fresh(row.created_at)) {
       since = []
-      continue
+      handoffAt = null
     }
+    if (row.qa.skipped === true) continue
     since.push({ id: row.id, score: typeof row.qa.score === 'number' ? row.qa.score : 0 })
+    if (row.qa.next === 'handoff') {
+      const at = typeof row.qa.at === 'string' ? Date.parse(row.qa.at) : Number.NaN
+      handoffAt = Number.isFinite(at) ? at : row.created_at.getTime()
+    }
   }
+  if (fresh(t.created_at)) since = []
   const rounds = Math.floor(since.length / Math.max(1, perRound))
   const prior = since.slice(0, rounds * perRound)
   return {
@@ -201,6 +214,54 @@ async function history(
     },
     scored: since,
   }
+}
+
+interface StoredAnswer {
+  text?: string
+  model?: string
+  usage?: GrokVisionUsage
+  /** The billing request id the answer was charged under (`<exec>` or `<exec>~<n>`). */
+  requestId?: string
+}
+
+const attemptOf = (task: StudioTask) => {
+  const n = Number((task.payload as { qaAttempt?: unknown }).qaAttempt ?? 0)
+  return Number.isSafeInteger(n) && n >= 0 ? n : 0
+}
+
+async function setAttempt(c: PoolClient, task: StudioTask, n: number): Promise<void> {
+  await c.query(
+    `UPDATE studio_tasks SET payload = jsonb_set(payload, '{qaAttempt}', to_jsonb($2::int)) WHERE id = $1`,
+    [task.id, n],
+  )
+  task.payload = { ...task.payload, qaAttempt: n }
+}
+
+/**
+ * The billing attempt for the next call (code r1 P1): it does not follow the claim count, so two
+ * holders can never pay twice. The finalize journal is the fence — one admitted call per billing
+ * id. An id still in flight belongs to another (or a crashed) holder: wait. An id that ended
+ * without a stored answer (aborted, or settled but lost) is spent: move to the next one.
+ */
+async function billingAttempt(deps: ExecuteDeps, task: StudioTask): Promise<number> {
+  const n = attemptOf(task)
+  const id = n === 0 ? task.execRequestId : `${task.execRequestId}~${n}`
+  const j = await deps.pool.query<{ state: string }>(
+    'SELECT state FROM request_finalize_journal WHERE request_id = $1',
+    [id],
+  )
+  const state = j.rows[0]?.state
+  if (state === 'inflight' || state === 'finalizing')
+    throw new MediaProviderError(
+      'QA_IN_FLIGHT',
+      true,
+      'an earlier call of this QA is still running',
+    )
+  if (state === 'aborted' || state === 'committed') {
+    await withLease(deps.pool, task, (c) => setAttempt(c, task, n + 1))
+    return n + 1
+  }
+  return n
 }
 
 /** Grok failures: busy / transient ones retry with the executor's backoff; the rest end QA. */
@@ -233,14 +294,25 @@ export async function runQa(deps: ExecuteDeps, task: StudioTask): Promise<void> 
   const userId = BigInt(t.user_id)
   const ctx = await loadContext(deps, task.projectId, kind, t.owner_id)
 
-  const stored = await deps.pool.query<{ output: { text?: string } }>(
+  const stored = await deps.pool.query<{ output: StoredAnswer }>(
     'SELECT output FROM studio_step_results WHERE request_id = $1',
     [task.execRequestId],
   )
-  let answer = typeof stored.rows[0]?.output?.text === 'string' ? stored.rows[0].output.text : null
+  const out = stored.rows[0]?.output
+  let answer = typeof out?.text === 'string' ? out.text : null
+  if (answer !== null && out?.requestId && out.usage && deps.grokResettle) {
+    // An earlier holder got (and stored) the answer; its settle may not have happened (code r1
+    // P1). Settling again under the id it billed is idempotent.
+    try {
+      await deps.grokResettle({ userId, requestId: out.requestId, usage: out.usage })
+    } catch (err) {
+      throw new MediaProviderError('QA_BILLING', true, (err as Error)?.message ?? 'resettle failed')
+    }
+  }
   if (answer === null) {
     if (!deps.grok)
       throw new MediaProviderError('QA_UNAVAILABLE', false, 'the QA judge is not configured')
+    const attempt = await billingAttempt(deps, task)
     const [cands, refs] = await Promise.all([
       candidates(deps, task, t, ctx, userId),
       Promise.all(ctx.refShas.map((sha) => readBlob(deps, userId, sha))),
@@ -251,7 +323,7 @@ export async function runQa(deps: ExecuteDeps, task: StudioTask): Promise<void> 
         userId,
         containerId: null,
         requestId: task.execRequestId,
-        attempt: Math.max(0, task.attempts - 1),
+        attempt,
         prompt: buildQaPrompt({
           target,
           ...(ctx.assetKind ? { assetKind: ctx.assetKind } : {}),
@@ -271,7 +343,12 @@ export async function runQa(deps: ExecuteDeps, task: StudioTask): Promise<void> 
               task.execRequestId,
               t.user_id,
               task.id,
-              JSON.stringify({ text: r.text, model: r.model }),
+              JSON.stringify({
+                text: r.text,
+                model: r.model,
+                usage: r.usage,
+                requestId: r.requestId,
+              } satisfies StoredAnswer),
             ],
           )
         },
@@ -289,8 +366,10 @@ export async function runQa(deps: ExecuteDeps, task: StudioTask): Promise<void> 
     if (!(err instanceof QaParseError)) throw err
     if (task.attempts < 2) {
       // One more answer (the next attempt id); a second bad answer counts as "unsure".
+      // A deliberate second call: the next billing attempt (this one was answered and paid).
       await withLease(deps.pool, task, async (c) => {
         await c.query('DELETE FROM studio_step_results WHERE request_id = $1', [task.execRequestId])
+        await setAttempt(c, task, attemptOf(task) + 1)
         await retryStudioTask(c, task, { delaySeconds: 2, error: err.message.slice(0, 500) })
       })
       return
@@ -372,7 +451,10 @@ async function settle(
   await withLease(deps.pool, task, async (c) => {
     const wrote = await c.query(
       'UPDATE studio_takes SET qa = $2::jsonb WHERE id = $1 AND qa IS NULL',
-      [t.id, JSON.stringify({ ...qa, costCredits: charged.toString() })],
+      [
+        t.id,
+        JSON.stringify({ ...qa, costCredits: charged.toString(), at: new Date().toISOString() }),
+      ],
     )
     await bookTaskCharge(c, task, charged, { release: true })
     if (wrote.rowCount)

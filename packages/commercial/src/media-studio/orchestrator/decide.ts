@@ -248,7 +248,10 @@ export function decide(s: DState): Action[] {
     const videos = ownerTakes(s, 'shot_video', shot.id)
     if (frames.some(live) || videos.some(live)) continue
     // A2-1b-1: a finished frame / video is judged before anything is built on it.
-    const waiting = [...frames, ...videos].filter((t) => awaitingQa(s, t))
+    // The user's picked frame is theirs: never judged (code r1 P1).
+    const waiting = [...frames, ...videos].filter(
+      (t) => awaitingQa(s, t) && t.id !== shot.frameTakeId,
+    )
     if (waiting.length) {
       if (waiting.map(judge).some(Boolean) && shot.status !== 'qa')
         actions.push({ type: 'shot_status', shotId: shot.id, status: 'qa' })

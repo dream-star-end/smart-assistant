@@ -667,6 +667,7 @@ import {
   GROK_VISION_PATH,
   grokRunMaxCost,
   makeGrokRunner,
+  resettleGrokRun,
   makeGrokVisionHandler,
   type GrokVisionHandler,
 } from "./grok/visionProxy.js";
@@ -2545,6 +2546,12 @@ export async function registerCommercial(
           }),
           // OCV5-591 A2-1b-1: visual QA reserves one run's worst case against the project budget.
           grokMaxCost: () => grokRunMaxCost(studioGrokCatalog),
+          // A stored QA answer whose settle may not have happened is settled again (idempotent).
+          grokResettle: (i) =>
+            resettleGrokRun(
+              { getPool, preCheckRedis, pricing },
+              { ...i, containerId: null, durationMs: 0 },
+            ),
         })?.stop;
       }
       // /internal/v3/codex-relay — 平台管控的 codex api_relay 流式转发。

@@ -12,6 +12,7 @@ import { resolveMiniMaxMediaKey } from '../../minimax/mediaKey.js'
 import { SystemVoiceCache } from '../../minimax/voices.js'
 import type { MuseBridgeHub } from '../../muse/hub.js'
 import type { StudioHttpDeps } from '../http.js'
+import type { ExecuteDeps } from './execute.js'
 import type { PlanVoice } from './plan.js'
 import { startStudioEventPump } from './push.js'
 import { qaConfigFromEnv } from './qa.js'
@@ -28,6 +29,8 @@ export function startStudioOrchestrator(input: {
   push?: (userId: bigint, frame: unknown) => void
   /** OCV5-591 A2-1b-1: worst-case credits of one user-billed Grok call (catalog price). */
   grokMaxCost?: () => Promise<bigint | null>
+  /** Settle a stored Grok answer again after a crash between answer and settle (idempotent). */
+  grokResettle?: ExecuteDeps['grokResettle']
 }): { stop: () => Promise<void> } | undefined {
   const { studio } = input
   if (!studio.providers) return undefined
@@ -46,6 +49,7 @@ export function startStudioOrchestrator(input: {
   }
   const worker = new StudioWorker({
     qa,
+    ...(input.grokResettle ? { grokResettle: input.grokResettle } : {}),
     pool: input.pool,
     blobs: studio.blobs,
     providers: studio.providers,

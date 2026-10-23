@@ -247,6 +247,16 @@ describe('decide with QA (A2-1b-1)', () => {
     ])
   })
 
+  it("the user's picked frame is never judged, even before it has a verdict (code r1 P1)", () => {
+    const s = state({
+      shots: [
+        { id: 's0', ordinal: 0, status: 'generating', activeTakeId: null, frameTakeId: 'f1' },
+      ],
+      takes: [take({ id: 'f1', qa: null })],
+    })
+    assert.deepEqual(kinds(s), ['dispatch:shot_video'])
+  })
+
   it("the user's picked frame skips QA", () => {
     const s = state({
       shots: [

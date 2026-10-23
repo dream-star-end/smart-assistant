@@ -339,25 +339,38 @@ export async function dispatchRequest(
 
 /**
  * One QA call for a finished take (A2-1b-1): reserve its worst case against the project budget
- * (skipped when the catalog cannot price it; the call's own precheck still guards the user's
- * credits, and the real charge is booked afterwards) and enqueue it once per take.
+ * and enqueue it once per take. A call the catalog cannot price now is not dispatched at all
+ * (code r1 P1: a zero reservation would let it spend past the budget); the next pass tries again.
  */
 async function dispatchQa(
   client: PoolClient,
   deps: AdvanceDeps,
   projectId: string,
   takeId: string,
-): Promise<'queued' | 'budget' | 'exists'> {
-  const est = (await deps.qa?.maxCost?.().catch(() => null)) ?? null
-  if (est !== null && !(await reserveBudget(client, projectId, est))) return 'budget'
+): Promise<'queued' | 'budget' | 'exists' | 'unpriced'> {
+  const est = deps.qa?.maxCost ? await deps.qa.maxCost().catch(() => null) : 0n
+  if (est === null) {
+    const noted = await client.query(
+      `UPDATE studio_projects SET settings = settings || '{"qaUnpricedNoted":true}'::jsonb
+        WHERE id = $1 AND NOT (settings ? 'qaUnpricedNoted') RETURNING id`,
+      [projectId],
+    )
+    if (noted.rowCount) {
+      await appendStudioEvent(client, projectId, 'qa.waiting', {
+        message: '质检暂时没法估价（模型目录不可用），恢复后自动继续。',
+      })
+    }
+    return 'unpriced'
+  }
+  if (!(await reserveBudget(client, projectId, est))) return 'budget'
   const r = await enqueueStudioTask(client, {
     projectId,
     kind: 'qa',
     idempotencyKey: `qa:${takeId}`,
     payload: { takeId, booked: '0' },
-    reservedCredits: est ?? 0n,
+    reservedCredits: est,
   })
-  if (!r.created && est !== null) {
+  if (!r.created) {
     // Already judged or judging: give the reservation back.
     await client.query(
       'UPDATE studio_projects SET reserved_credits = GREATEST(0, reserved_credits - $2) WHERE id = $1',

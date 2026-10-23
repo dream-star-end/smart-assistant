@@ -6,7 +6,7 @@
 import { readFile } from 'node:fs/promises'
 import type { Pool, PoolClient } from 'pg'
 
-import type { GrokRunner } from '../../grok/visionProxy.js'
+import type { GrokRunner, GrokVisionUsage } from '../../grok/visionProxy.js'
 import type { StudioBlobStore } from '../blobs.js'
 import type { ProviderRegistry } from '../providers/registry.js'
 import { MediaProviderError, type MediaRequest, type MediaResult } from '../providers/types.js'
@@ -44,6 +44,12 @@ export interface ExecuteDeps {
   compose?: ComposeRunnerLike
   /** OCV5-591 A2-1b-1: visual QA (absent → takes are used as they come). */
   qa?: StudioQaDeps
+  /** Settle a stored user-billed Grok answer again (idempotent; resettleGrokRun). */
+  grokResettle?: (input: {
+    userId: bigint
+    requestId: string
+    usage: GrokVisionUsage
+  }) => Promise<void>
 }
 
 async function projectOf(pool: Pool, projectId: string) {

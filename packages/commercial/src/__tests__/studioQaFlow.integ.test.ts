@@ -491,4 +491,124 @@ describe('studio visual QA (OCV5-591 A2-1b-1)', () => {
       assert.equal(ev.rowCount, 1)
     }
   })
+
+  test('a stored answer is settled again under the id it billed (code r1 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    const f = await s.take('shot_frame', s.shot)
+    const resettled: Array<{ requestId: string }> = []
+    const exec: ExecuteDeps = {
+      ...s.exec,
+      grokResettle: async (i) => {
+        resettled.push({ requestId: i.requestId })
+      },
+    }
+    await advanceProject(s.advanceDeps, s.p.id)
+    const exe = (
+      await query<{ exec: string }>(
+        `SELECT exec_request_id AS exec FROM studio_tasks WHERE project_id = $1 AND kind = 'qa'`,
+        [s.p.id],
+      )
+    ).rows[0]!.exec
+    await query(
+      'INSERT INTO studio_step_results(request_id, user_id, output) VALUES ($1, $2, $3::jsonb)',
+      [
+        exe,
+        s.uid,
+        JSON.stringify({ text: answer(), usage: { input_tokens: 1 }, requestId: `${exe}~1` }),
+      ],
+    )
+    await runOne(exec)
+    assert.deepEqual(resettled, [{ requestId: `${exe}~1` }])
+    assert.equal(s.grok.calls.length, 0)
+    assert.equal((await takeQa(f.id))?.passed, true)
+  })
+
+  test('a call still in flight under this billing id is waited for; a dead id moves on (code r1 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    const f = await s.take('shot_frame', s.shot)
+    await advanceProject(s.advanceDeps, s.p.id)
+    const exe = (
+      await query<{ exec: string }>(
+        `SELECT exec_request_id AS exec FROM studio_tasks WHERE project_id = $1 AND kind = 'qa'`,
+        [s.p.id],
+      )
+    ).rows[0]!.exec
+    // Another holder admitted this id and is still calling.
+    await query(
+      `INSERT INTO request_finalize_journal(request_id, user_id, state, ctx, precheck_credits)
+       VALUES ($1, $2, 'inflight', '{}'::jsonb, 10)`,
+      [exe, s.uid],
+    )
+    await runOne(s.exec)
+    assert.equal(s.grok.calls.length, 0, 'never a second concurrent call')
+    assert.equal(await takeQa(f.id), null)
+    // It died without an answer: the id is spent, the next call bills under ~1.
+    await query(`UPDATE request_finalize_journal SET state = 'aborted' WHERE request_id = $1`, [
+      exe,
+    ])
+    await query('UPDATE studio_tasks SET run_after = NOW() WHERE project_id = $1', [s.p.id])
+    await runOne(s.exec)
+    assert.equal(s.grok.calls.length, 1)
+    assert.equal(s.grok.calls[0]!.attempt, 1)
+    assert.equal((await takeQa(f.id))?.passed, true)
+  })
+
+  test('two candidates: a sibling of a handed-off round keeps the redo cap (code r1 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup({ candidates: 2 })
+    const a = randomUUID()
+    await query(
+      `INSERT INTO studio_assets(id, project_id, user_id, kind, name, descriptor, locked)
+       VALUES ($1, $2, $3, 'character', '小狐狸', '橙红色毛', FALSE)`,
+      [a, s.p.id, s.uid],
+    )
+    const redo = (score: number) => ({
+      passed: false,
+      next: 'redo',
+      score,
+      reason: 'below_threshold',
+    })
+    for (const [i, score] of [0.5, 0.52, 0.54, 0.56].entries())
+      await s.take('bible', a, { version: i + 1, qa: redo(score) })
+    // v6 is already on its way when v5 (same round) hands over.
+    const v6 = await s.take('bible', a, { version: 6 })
+    await s.take('bible', a, {
+      version: 5,
+      qa: {
+        passed: false,
+        next: 'handoff',
+        score: 0.58,
+        reason: 'retries_exhausted',
+        at: new Date(Date.now() + 60_000).toISOString(),
+      },
+    })
+    s.grok.answers.push(answer({ character: 0.6 }))
+    await advanceProject(s.advanceDeps, s.p.id)
+    await runOne(s.exec)
+    const qa = await takeQa(v6.id)
+    assert.deepEqual([qa?.next, qa?.reason], ['handoff', 'retries_exhausted'])
+  })
+
+  test('a call the catalog cannot price is not dispatched (code r1 P1)', async (t) => {
+    if (skip(t)) return
+    const s = await setup()
+    await s.take('shot_frame', s.shot)
+    const deps: AdvanceDeps = {
+      ...s.advanceDeps,
+      qa: { ...s.advanceDeps.qa!, maxCost: async () => null },
+    }
+    await advanceProject(deps, s.p.id)
+    const tasks = await query(`SELECT 1 FROM studio_tasks WHERE project_id = $1 AND kind = 'qa'`, [
+      s.p.id,
+    ])
+    assert.equal(tasks.rowCount, 0)
+    assert.equal((await projectRow(s.p.id)).reserved, '0')
+    const ev = await query(
+      `SELECT 1 FROM studio_events WHERE project_id = $1 AND type = 'qa.waiting'`,
+      [s.p.id],
+    )
+    assert.equal(ev.rowCount, 1)
+  })
 })
